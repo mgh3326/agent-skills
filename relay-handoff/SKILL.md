@@ -35,6 +35,11 @@ description: 다른 세션/에이전트(orch·캡틴·워커)에 작업·분석�
 라벨/기억으로 라우팅 금지. 주입 전 `herdr agent list`로 pane_id·cwd 확인 +
 `herdr agent read <target> --lines 15`로 직전 작업 내용(KR/US/crypto·역할)을 실판별.
 
+**대상 부재 시(agent list에 없음 — 세션 사망·herdr 재시작)**: 자동 재생성은 없다 — 릴레이를
+**실패로 보고하고 운영자 에스컬레이션**. orch/캡틴을 임의 재스폰하지 않는다(재생성은 운영자
+결정. 새 orch는 같은 cwd에서 `claude --continue`+auto-memory+Linear+inbox로 상태 복원 가능 —
+상태 정본이 세션 밖에 있는 이유).
+
 ## 3. herdr 주입 + 제출 검증 (생략 절대 금지)
 
 ```bash
