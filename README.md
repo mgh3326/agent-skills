@@ -30,6 +30,12 @@
 
 새 머신 설치: 이 repo를 `~/.agents/skills`로 clone 후 `./install.sh` (심링크 생성 + 의존성 검사).
 
+## 동봉 도구 (bin/ — install.sh가 ~/.local/bin에 심링크)
+
+| 도구 | 용도 |
+|---|---|
+| `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
+
 ## 의존 도구
 
 | 도구 | 용도 | 폴백 |

@@ -27,6 +27,13 @@ if [ "$REPO_DIR" != "$HOME/.agents/skills" ]; then
   echo "⚠️  이 repo는 ~/.agents/skills 에 있어야 codex가 직접 스캔한다. 현재: $REPO_DIR" >&2
 fi
 
+echo "== bin/ 도구 심링크 =="
+mkdir -p "$HOME/.local/bin"
+for tool in "$REPO_DIR"/bin/*; do
+  [ -x "$tool" ] && ln -sfn "$tool" "$HOME/.local/bin/$(basename "$tool")" \
+    && echo "  ~/.local/bin/$(basename "$tool") -> $tool"
+done
+
 echo "== 심링크 생성 =="
 for target in "${LINK_TARGETS[@]}"; do
   mkdir -p "$target"
