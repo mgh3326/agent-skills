@@ -35,6 +35,7 @@
 | 도구 | 용도 |
 |---|---|
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
+| `herdr-name-sync` | 탭 라벨→agent 이름 동기화 — 스킬 타겟 검색은 agent 이름 기준인데 탭 라벨만 짓는 실수 방지(07-29 2회 실사고). 무인자=미리보기 · `--apply`=전체(잡라벨 가드) · `<라벨>`=지정 적용 |
 
 ## 의존 도구
 
