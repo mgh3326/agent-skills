@@ -1,0 +1,70 @@
+#!/bin/bash
+# herdr-name-sync — 탭 라벨을 agent 이름으로 동기화
+#
+# 배경: 탭은 생성 시 라벨을 넣을 수 있지만 agent 이름은 pane_id를 찾아 별도 rename해야 한다.
+#       스킬(ask-session/relay-handoff)의 타겟 검색은 agent 이름 기준이라, 라벨만 있고 이름이
+#       비면 세션을 못 찾는다(07-29 kiro-mock·codex-mock 2회 실사고).
+#
+# 사용:
+#   herdr-name-sync                # 미리보기: 동기화 후보(이름 없는 agent + 라벨 있는 탭) 표시
+#   herdr-name-sync --apply        # 안전 후보 전부 적용
+#   herdr-name-sync <라벨> [...]   # 지정 라벨의 탭만 적용
+set -u
+H=~/.local/bin/herdr
+
+MODE=preview; LABELS=()
+for a in "$@"; do
+  case "$a" in --apply) MODE=apply;; *) MODE=apply; LABELS+=("$a");; esac
+done
+
+python3 - "$MODE" "${LABELS[@]:-}" <<'EOF'
+import json, subprocess, sys
+H = __import__('os').path.expanduser('~/.local/bin/herdr')
+mode = sys.argv[1]; want = [w for w in sys.argv[2:] if w]
+
+def run(*args):
+    out = subprocess.run([H,*args], capture_output=True, text=True).stdout
+    return json.loads(out)['result']
+
+# 탭 라벨 맵 (전 워크스페이스)
+labels = {}
+for ws in run('workspace','list').get('workspaces', []):
+    for t in run('tab','list','--workspace', ws['workspace_id']).get('tabs', []):
+        if t.get('label'): labels[t['tab_id']] = t['label']
+
+agents = run('agent','list')['agents']
+taken = {a['name'] for a in agents if a.get('name')}
+by_tab = {}
+for a in agents: by_tab.setdefault(a.get('tab_id'), []).append(a)
+
+acted = skipped = 0
+for tab, lbl in sorted(labels.items()):
+    if want and lbl not in want: continue
+    members = by_tab.get(tab, [])
+    unnamed = [a for a in members if not a.get('name')]
+    if not unnamed: continue
+    if len(members) > 1:
+        print(f"  △ SKIP  {tab} '{lbl}' — 탭에 agent {len(members)}개(모호). 수동: herdr agent rename <pane> <이름>")
+        skipped += 1; continue
+    a = unnamed[0]
+    if lbl in taken:
+        print(f"  △ SKIP  {tab} '{lbl}' — 이름 이미 사용 중(agent_name_taken)")
+        skipped += 1; continue
+    # 전체 적용 모드에서 잡라벨(숫자·3자 미만) 가드 — 명시 지정 시엔 허용
+    if not want and (lbl.isdigit() or len(lbl) < 3):
+        print(f"  △ SKIP  {tab} '{lbl}' — 잡라벨 추정(숫자/3자 미만). 원하면 라벨 명시 지정으로")
+        skipped += 1; continue
+    if mode == 'apply':
+        r = subprocess.run([H,'agent','rename', a['pane_id'], lbl], capture_output=True, text=True)
+        ok = '"agent_info"' in r.stdout or 'agent_info' in r.stdout
+        print(f"  {'✓' if ok else '✗'} {a['pane_id']} ({a['agent']}) → name '{lbl}'")
+        taken.add(lbl); acted += 1
+    else:
+        print(f"  · 후보  {a['pane_id']} ({a['agent']}, 이름 없음) → '{lbl}'")
+        acted += 1
+
+if mode == 'preview':
+    print(f"\n후보 {acted}건, 스킵 {skipped}건 — 적용: herdr-name-sync --apply (또는 라벨 지정)")
+else:
+    print(f"\n적용 {acted}건, 스킵 {skipped}건")
+EOF
