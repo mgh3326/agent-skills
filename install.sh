@@ -5,7 +5,7 @@
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-LINK_TARGETS=("$HOME/.claude/skills" "$HOME/.kiro/skills" "$HOME/.gemini/skills")
+LINK_TARGETS=("$HOME/.claude/skills" "$HOME/.kiro/skills" "$HOME/.gemini/skills" "$HOME/.config/opencode/skills")
 
 check_deps() {
   local ok=0

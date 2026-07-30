@@ -27,6 +27,7 @@
 | claude | `~/.claude/skills/` | 심링크 |
 | kiro | `~/.kiro/skills/` | 심링크 |
 | agy | `~/.gemini/skills/` | 심링크 |
+| opencode | `~/.config/opencode/skills/` | 심링크 (07-30 추가 — 4스킬 인식 실측) |
 
 새 머신 설치: 이 repo를 `~/.agents/skills`로 clone 후 `./install.sh` (심링크 생성 + 의존성 검사).
 
