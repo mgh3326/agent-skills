@@ -36,7 +36,8 @@ description: herdr로 워커/검증자 세션을 스폰(생성·기동·브리�
   잔량·pace·reset을 본다.
 - **claude weekly는 use-it-or-lose-it** — 사용률 ≤85%면 claude 우선, 초과·WARN이면 **같은
   티어의 codex 계열로 전환** (워커: sonnet↔codex-med · 검증: opus↔sol-high · 강모델:
-  codex-max). `herdr-spawn -m auto-worker|auto-verify`가 이 라우팅을 자동화한다.
+  codex-max). **모델은 항상 명시 지정** — herdr-spawn에 `auto` 분기는 없다(07-30 운영자
+  결정: 도입 보류. 미정의 모델명은 `claude --model <그이름>`으로 조용히 오라우팅되는 함정).
 - **kiro(월 크레딧)·agy는 독립 풀** — claude·codex 압박 시 우회 레인. agy는 그룹 확인 필수
   (3p 소진이어도 gemini 그룹은 별개).
 - **동티어 후보가 여러 풀에 있으면 scopefuel 여유율(pace 감안)이 가장 큰 풀 우선.**
