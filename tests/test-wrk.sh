@@ -59,6 +59,7 @@ canonical_out="$(spawn_base codex-terra --effort max)"
 grep -q 'codex-terra-max' "$TMP/scopefuel.log"
 grep -q -- '-m gpt-5.6-terra' "$TMP/herdr.log"
 grep -q 'model_reasoning_effort=max' "$TMP/herdr.log"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 grep -q 'model=codex-terra' <<<"$canonical_out"
 
 profiles=(
@@ -107,6 +108,15 @@ grep -q 'send-keys w:p1 return' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base claudex >/dev/null
 grep -q '/usr/bin/env' "$TMP/herdr.log"
+
+: >"$TMP/herdr.log"
+once_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=prompt-wait-fails WRK_FIXTURE_LOG="$TMP/herdr.log" \
+  WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" "$WRK" spawn \
+  -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture 2>&1)"
+grep -q 'model=codex-terra' <<<"$once_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
+[[ "$(grep -c 'agent send-keys w:p1 return' "$TMP/herdr.log")" -eq 1 ]]
 
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"

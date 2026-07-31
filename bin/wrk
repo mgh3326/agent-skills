@@ -260,8 +260,14 @@ spawn_cmd() {
     sleep_for 2
     "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
   else
-    "$HERDR" agent prompt "$PANE" "$(<"$PROMPT")" --wait --until working --timeout 40000 >/dev/null 2>&1 ||
-      "$HERDR" agent prompt "$PANE" "$(<"$PROMPT")" --wait --until working --timeout 40000 >/dev/null 2>&1
+    PROMPT_PAYLOAD="$(<"$PROMPT")"
+    if ! "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
+      --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
+      # The payload was already submitted. A return may settle a still-open
+      # composer, but the payload must never be sent again after an ambiguous
+      # wait result.
+      "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
+    fi
   fi
   STATUS="unknown"
   if STATUS=$("$HERDR" agent list | python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent_status","unknown") for x in a if x.get("pane_id")==p),"unknown"))' "$PANE"); then :; fi
