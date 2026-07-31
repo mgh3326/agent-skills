@@ -34,8 +34,14 @@ case "${1:-}" in
       rename)
         printf '%s\n' '{"result":{"agent_info":{"name":"renamed"}}}'
         ;;
-      start|prompt|send-keys)
+      start|send-keys)
         printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
+        ;;
+      prompt)
+        printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
+        if [[ "$scenario" == prompt-wait-fails && "${5:-}" == --wait ]]; then
+          exit 7
+        fi
         ;;
       *) printf '%s\n' '{"result":{}}' ;;
     esac
