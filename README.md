@@ -36,7 +36,7 @@
 | 도구 | 용도 |
 |---|---|
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
-| `herdr-name-sync` | 탭 라벨→agent 이름 동기화 — 스킬 타겟 검색은 agent 이름 기준인데 탭 라벨만 짓는 실수 방지(07-29 2회 실사고). 무인자=미리보기 · `--apply`=전체(잡라벨 가드) · `<라벨>`=지정 적용 |
+| `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정). `wrk --help` 로 전체 확인 |
 | `wrk` | `spawn`·`find`·`name-sync` 통합 CLI — 명시 모델 스폰, 이름/라벨 조회, 탭 라벨 동기화 |
 
 ## 의존 도구
@@ -44,9 +44,9 @@
 | 도구 | 용도 | 폴백 |
 |---|---|---|
 | `herdr` (`~/.local/bin/herdr`) | 세션 스폰·주입·감시 — **하드 의존** | 없음 (스킬 자체가 herdr 체계용) |
-| `scopefuel` | 스폰 전 쿼타·pace 확인 | `~/bin/ai-quota` |
+| `scopefuel` | 스폰 전 쿼타·pace 확인, 급별 후보 추천(`--recommend`), 스폰 게이트(`gate`) | 없음(정본) |
 | `wt` (worktrunk) | worktree 생성 + .env 자동 연결 | raw `git worktree add` + 수동 .env 심링크 |
-| `~/bin/herdr-spawn` | worktree+탭+기동+주입 원샷, auto 쿼타 라우팅 | `herdr agent start` 수동 시퀀스 |
+| `~/bin/herdr-spawn` | **deprecated** — `wrk spawn` 으로 위임하는 shim(옛 경로 호환용) | `wrk spawn` |
 
 ## `wrk` 사용법
 

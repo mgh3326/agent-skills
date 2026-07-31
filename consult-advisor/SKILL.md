@@ -14,13 +14,19 @@ description: 판단이 어려운 문제(설계 분기, 검증 판정 불일치, 
 
 ## 1. 자문처 결정
 
-- **세션 이름 지정 시**: `herdr agent list`로 상존 확인 → 있으면 **ask-session 스킬 절차**로
-  질의. 없으면 아래 티어 경로로.
-- **티어 지정(기본)**: 판단급 동급표에서 scopefuel 여유율로 계열 선택(spawn-worker §2 규칙):
-  `fable ↔ opus(high~max effort) ↔ codex sol(xhigh~ultra) ↔ kiro-opus`
-- **fable 스폰 허용(자문 한정, 07-29 운영자 결정)**: 자문 목적의 fable pane 스폰은 가능하다.
-  단 스폰 전 scopefuel로 fable 잔량 확인은 동일 적용 — 티어 유지 불변식과 별개로, fable
-  풀이 WARN이면 동급표의 다른 계열(opus-max/sol-ultra/kiro-opus)로.
+- **세션 이름 지정 시**: `wrk find <이름>`으로 상존·화면 확인 → 있으면 **ask-session 스킬
+  절차**로 질의. 없으면 아래 경로로.
+- **급 지정(기본)**: `scopefuel --recommend S+`로 후보를 뽑는다(모델명을 이 문서에 적지 말 것
+  — 정본은 scopefuel).
+- 🔴 **자문자는 질문자와 다른 계열이어야 한다.** 자문의 가치는 **높이가 아니라 독립성**에서
+  온다. 같은 계열·같은 모델에 물으면 대체로 자기 자신과 동의한다 — spawn-worker의 "같은 세션
+  자체검증은 무효"와 같은 논리다. 예: 질문자가 `codex-sol ultra`면 자문은 Anthropic 계열
+  (`kiro-opus`)로. 계열이 겹치는 후보밖에 없으면 **한 급 아래라도 다른 계열**을 택한다.
+- **`fable`은 승급 후보다(gate=escalation)** — Opus 5 대비 2배 가격이라 아래 조건 중 하나를
+  충족할 때만 쓰고 **근거를 이슈에 기록**한다: ①2시간 이상 자율 실행 예상 ②Opus 5로 이미
+  실패했거나 결과가 불안정 ③반드시 한 번에 끝내야 하는 고위험 ④서브에이전트 다수 병렬.
+  그 외에는 Opus 5 계열이 기본이다. (자문 목적의 fable pane 스폰 자체는 07-29 운영자 승인 —
+  조건은 위 gate.)
 
 ## 2. 질문 패킷 (자족성 체크리스트)
 
@@ -32,13 +38,13 @@ description: 판단이 어려운 문제(설계 분기, 검증 판정 불일치, 
 
 ```bash
 # 이름: consult-<주제> (전역 유일). cwd = 질의 대상 자료가 있는 repo/디렉토리
-herdr agent start consult-<주제> --workspace <ws> --cwd <dir> --no-focus -- claude --model opus
-# 또는 herdr-spawn 매핑 사용 (codex-max/ultra·kiro-opus·fable)
+wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<주제> [--effort <레벨>]
+# 프로필은 `scopefuel --recommend S+` 결과에서 고른다(질문자와 다른 계열)
 ```
 
 - 주입·제출검증 = **relay-handoff §3**, 답변 회수 = **ask-session §3**(답변 파일 계약+폴링).
 - 자문 세션은 답변 후 **바로 정리하지 않는다** — 운영자 맥락 검토·후속 재질의용으로 유지,
-  정리는 운영자/정기 청소(zj-clean) 몫.
+  정리는 운영자 몫(자문 pane은 회수 후 종료).
 - 자문 난도가 높으면 **2계열 교차 자문**(예: opus + sol)으로 판정 일치 여부까지 확인 —
   불일치면 그 자체가 "운영자 표면화" 신호다.
 - **상존 세션 질의가 나은 경우**: 그 세션의 컨텍스트가 자산일 때(예: orch의 전황, 분석을
