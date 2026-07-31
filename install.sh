@@ -11,7 +11,7 @@ check_deps() {
   local ok=0
   echo "== 의존성 검사 =="
   for tool in "herdr:$HOME/.local/bin/herdr" "scopefuel:$(command -v scopefuel || true)" \
-              "ai-quota(폴백):$HOME/bin/ai-quota" "herdr-spawn:$HOME/bin/herdr-spawn"; do
+              "wrk:$HOME/.local/bin/wrk"; do
     name="${tool%%:*}"; path="${tool#*:}"
     if [ -n "$path" ] && [ -x "$path" ]; then echo "  ✓ $name ($path)"
     else echo "  ✗ $name — 미설치 (스킬 내 폴백 절차 참조)"; ok=1; fi
