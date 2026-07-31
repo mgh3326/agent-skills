@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == gate && "${2:-}" == --help ]]; then
+  case "${WRK_GATE_MODE:-ok}" in
+    unsupported) echo 'error: unknown command: gate' >&2; exit 2 ;;
+    broken) echo 'scopefuel: internal probe failure' >&2; exit 7 ;;
+    *) echo 'usage: scopefuel gate -m PROFILE'; exit 0 ;;
+  esac
+fi
+
+if [[ "${1:-}" != gate || "${2:-}" != -m ]]; then
+  echo 'fixture scopefuel: unexpected arguments' >&2
+  exit 2
+fi
+profile="${3:-}"
+if [[ -n "${WRK_SCOPEFUEL_LOG:-}" ]]; then
+  printf '%s\n' "$profile" >>"$WRK_SCOPEFUEL_LOG"
+fi
+case "${WRK_GATE_MODE:-ok}" in
+  3) echo "gate blocked profile=$profile alternative=fixture-alt" >&2; exit 3 ;;
+  4) echo "gate measurement unavailable profile=$profile alternative=fixture-alt" >&2; exit 4 ;;
+  9) echo "gate internal failure profile=$profile" >&2; exit 9 ;;
+esac
+echo "gate allowed profile=$profile"

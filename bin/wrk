@@ -1,0 +1,416 @@
+#!/usr/bin/env bash
+# wrk — herdr spawn/find/name-sync entrypoint.
+set -euo pipefail
+
+HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
+SCOPEFUEL="${SCOPEFUEL_BIN:-}"
+
+usage() {
+  cat <<'USAGE'
+Usage: wrk <spawn|find|name-sync> [options]
+
+  wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL [-L live|mock] [--effort LEVEL]
+  wrk find <name-or-label> [--pane-only]
+  wrk name-sync [--apply|<label>...]
+
+Run 'wrk <command> --help' for command-specific usage.
+USAGE
+}
+
+spawn_help() {
+  cat <<'USAGE'
+Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL [-L live|mock] [--effort LEVEL]
+
+Options:
+  -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
+  -L live|mock       select lane; mock requires MOCK_MCP_PROFILE
+  --effort LEVEL     override codex/Kiro/Grok profile effort
+  -h, --help         show this usage
+
+Canonical codex profiles: codex-terra, codex-luna, codex-sol.
+Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
+codex-luna-ultra, codex-max, codex-terra-max, codex-ultra.
+Retired TUI agy profiles are rejected. Emergency headless backup:
+  agy -p "$(cat PROMPT_FILE)"
+USAGE
+}
+
+find_help() {
+  cat <<'USAGE'
+Usage: wrk find <name-or-label> [--pane-only]
+
+Name is matched exactly first. If absent, the exact tab label is used.
+Candidates include pane_id and the last five screen lines.
+  --pane-only  print pane_id only when exactly one candidate matches
+  -h, --help   show this usage
+USAGE
+}
+
+name_sync_help() {
+  cat <<'USAGE'
+Usage: wrk name-sync [--apply|<label>...]
+
+No arguments preview safe matches. --apply applies all safe matches.
+Labels apply only the named labels; numeric/short labels stay guarded.
+USAGE
+}
+
+die() { echo "wrk: $*" >&2; exit 2; }
+warn() { echo "wrk: warning: $*" >&2; }
+sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
+
+quota_gate() {
+  if [[ -z "$SCOPEFUEL" ]]; then
+    SCOPEFUEL="$(command -v scopefuel 2>/dev/null || true)"
+  fi
+  if [[ -z "$SCOPEFUEL" || ! -e "$SCOPEFUEL" ]]; then
+    warn "scopefuel unavailable; quota gate skipped during installation transition"
+    return 0
+  fi
+  if [[ ! -x "$SCOPEFUEL" ]]; then
+    echo "wrk: scopefuel exists but is not executable: $SCOPEFUEL" >&2
+    return 126
+  fi
+  local probe probe_rc
+  set +e
+  probe="$("$SCOPEFUEL" gate --help 2>&1)"
+  probe_rc=$?
+  set -e
+  if [[ "$probe_rc" -ne 0 ]]; then
+    if grep -Eiq "(unknown (command|subcommand).*gate|invalid choice.*gate|no such command.*gate|unrecognized.*gate|not a valid command.*gate)" <<<"$probe"; then
+      warn "installed scopefuel has no gate subcommand; quota gate skipped during installation transition"
+      return 0
+    fi
+    [[ -z "$probe" ]] || printf '%s\n' "$probe" >&2
+    return "$probe_rc"
+  fi
+  set +e
+  "$SCOPEFUEL" gate -m "$GATE_PROFILE"
+  local rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    3|4) exit "$rc" ;;
+    *) echo "wrk: scopefuel gate failed (exit $rc)" >&2; return "$rc" ;;
+  esac
+}
+
+resolve_profile() {
+  PROFILE_KIND=""
+  PROFILE_MODEL=""
+  DEFAULT_EFFORT=""
+  EFFORT_SUPPORTED=0
+  ARGS=()
+
+  case "$MODEL" in
+    opus) PROFILE_KIND=claude; ARGS=(--model opus --dangerously-skip-permissions) ;;
+    sonnet|sonnet-med) PROFILE_KIND=claude; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
+    fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
+    claudex) PROFILE_KIND=claude; ARGS=(--model gpt-5.6-sol --dangerously-skip-permissions) ;;
+
+    codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
+    codex-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    codex-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
+    codex-luna-hi) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    codex-luna-ultra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=ultra; EFFORT_SUPPORTED=1 ;;
+    codex|codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    codex-ultra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=ultra; EFFORT_SUPPORTED=1 ;;
+
+    kiro) PROFILE_KIND=kiro; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-opus) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-sonnet) PROFILE_KIND=kiro; PROFILE_MODEL=claude-sonnet-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-sol) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-luna) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
+    kiro-cheap) PROFILE_KIND=kiro; PROFILE_MODEL=qwen3-coder-next; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
+    kiro-glm) PROFILE_KIND=kiro; PROFILE_MODEL=glm-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-deepseek) PROFILE_KIND=kiro; PROFILE_MODEL=deepseek-v3.2; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-minimax) PROFILE_KIND=kiro; PROFILE_MODEL=minimax-m2.5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-minimax21) PROFILE_KIND=kiro; PROFILE_MODEL=minimax-m2.1; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
+    kiro-haiku) PROFILE_KIND=kiro; PROFILE_MODEL=claude-haiku-4.5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-opus-xhigh) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
+    kiro-opus-max) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    kiro-sol-xhigh) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
+    kiro-sol-max) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+
+    oc-kimi-code) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k2.7-code) ;;
+    oc-glm) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/glm-5.2) ;;
+    oc-kimi-k3) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k3) ;;
+    oc-dsflash) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/deepseek-v4-flash) ;;
+    oc-gflash) PROFILE_KIND=opencode; ARGS=(--auto --model cliproxy/gemini-3.6-flash-high) ;;
+    oc-sonnet46) PROFILE_KIND=opencode; ARGS=(--auto --model cliproxy/claude-sonnet-4-6) ;;
+    oc-oss) PROFILE_KIND=opencode; ARGS=(--auto --model cliproxy/gpt-oss-120b-medium) ;;
+
+    grok|grok-hi) PROFILE_KIND=grok; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    grok-med) PROFILE_KIND=grok; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
+
+    agy|agy-flash|agy-flash-med|agy-pro|agy-sonnet|agy-opus|agy-oss)
+      die "profile '$MODEL' is retired" ;;
+    *) die "unknown model profile '$MODEL'; see 'wrk spawn --help'" ;;
+  esac
+
+  # GATE_PROFILE is only scopefuel's accepted profile spelling. Pool/class/
+  # usage policy remains solely in scopefuel; runtime MODEL and effort stay
+  # exactly as requested.
+  case "$MODEL" in
+    opus) GATE_PROFILE=opus ;;
+    sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
+    fable) GATE_PROFILE=fable ;;
+    claudex|codex|codex-sol|codex-max|codex-ultra) GATE_PROFILE=codex-max ;;
+    codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
+    codex-luna|codex-luna-hi|codex-luna-ultra) GATE_PROFILE=codex-luna-ultra ;;
+    kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
+    kiro-sonnet) GATE_PROFILE=kiro-sonnet ;;
+    kiro-cheap) GATE_PROFILE=kiro-cheap ;;
+    kiro-haiku) GATE_PROFILE=kiro-haiku ;;
+    kiro|kiro-sol|kiro-luna|kiro-glm|kiro-deepseek|kiro-minimax|kiro-minimax21|kiro-sol-xhigh|kiro-sol-max)
+      GATE_PROFILE=kiro-sol ;;
+    oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss)
+      GATE_PROFILE="$MODEL" ;;
+    grok|grok-hi|grok-med) GATE_PROFILE=grok-hi ;;
+  esac
+
+  if [[ -n "$EFFORT" ]]; then
+    case "$EFFORT" in low|medium|high|xhigh|max|ultra) ;; *) die "unknown effort '$EFFORT'" ;; esac
+    [[ "$PROFILE_KIND" != kiro || "$EFFORT" != ultra ]] || die "Kiro does not support --effort ultra"
+    [[ "$EFFORT_SUPPORTED" -eq 1 ]] || die "--effort is unsupported for profile '$MODEL'"
+    EFFECTIVE_EFFORT="$EFFORT"
+  else
+    EFFECTIVE_EFFORT="$DEFAULT_EFFORT"
+  fi
+
+  case "$PROFILE_KIND" in
+    codex) ARGS=(--yolo -m "$PROFILE_MODEL" -c "model_reasoning_effort=$EFFECTIVE_EFFORT") ;;
+    kiro)
+      ARGS=(chat --v3 --trust-all-tools --require-mcp-startup)
+      [[ -z "$PROFILE_MODEL" ]] || ARGS+=(--model "$PROFILE_MODEL")
+      ARGS+=(--effort "$EFFECTIVE_EFFORT")
+      ;;
+    grok) ARGS=(--always-approve -m grok-4.5 --effort "$EFFECTIVE_EFFORT") ;;
+  esac
+}
+
+spawn_cmd() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) spawn_help; return 0 ;;
+      -c|-m|-p|-w|-l|-L|--effort)
+        [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
+        case "$1" in
+          -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
+          -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
+        esac
+        shift 2 ;;
+      -*) die "unknown option '$1'" ;;
+      *) die "unexpected argument '$1'" ;;
+    esac
+  done
+  [[ -n "$CWD" ]] || die "-c CWD is required"
+  [[ -n "$MODEL" ]] || die "-m MODEL is required"
+  [[ -n "$PROMPT" ]] || die "-p PROMPT_FILE is required"
+  [[ -n "$WS" ]] || die "-w WORKSPACE is required"
+  [[ -n "$LABEL" ]] || die "-l LABEL is required"
+  [[ -r "$PROMPT" ]] || die "prompt file is not readable: $PROMPT"
+
+  resolve_profile
+  LANE_ENV=()
+  if [[ -n "$LANE" ]]; then
+    case "$LANE" in
+      live|mock)
+        if [[ -d "$CWD/$LANE" ]]; then CWD="$CWD/$LANE";
+        else warn "-L $LANE: $CWD/$LANE absent; cwd unchanged"; fi ;;
+      *) die "-L accepts only live or mock" ;;
+    esac
+    if [[ "$LANE" == mock ]]; then
+      [[ -n "${MOCK_MCP_PROFILE:-}" ]] || die "-L mock requires MOCK_MCP_PROFILE"
+      LANE_ENV+=(--env "MCP_PROFILE=$MOCK_MCP_PROFILE")
+    fi
+  fi
+
+  quota_gate
+  [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
+  if [[ "${#LANE_ENV[@]}" -gt 0 ]]; then
+    PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${LANE_ENV[@]}" |
+      python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+  else
+    PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus |
+      python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+  fi
+  sleep_for 5
+  START_TIMEOUT=30000; BOOT_SETTLE=12
+  [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
+
+  if [[ "$MODEL" == claudex ]]; then
+    "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- /usr/bin/env \
+      ANTHROPIC_BASE_URL=http://127.0.0.1:8317 CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol \
+      CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=3 ENABLE_TOOL_SEARCH=false \
+      /Users/mgh3326/.local/bin/claude "${ARGS[@]}" >/dev/null
+  else
+    "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
+  fi
+  sleep_for "$BOOT_SETTLE"
+  if [[ "$PROFILE_KIND" == kiro ]]; then
+    "$HERDR" agent prompt "$PANE" "/effort $EFFECTIVE_EFFORT" >/dev/null 2>&1
+    sleep_for 2
+  fi
+  if [[ "$PROFILE_KIND" == opencode ]]; then
+    "$HERDR" agent prompt "$PANE" "$(<"$PROMPT")" >/dev/null 2>&1
+    sleep_for 2
+    "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
+  else
+    "$HERDR" agent prompt "$PANE" "$(<"$PROMPT")" --wait --until working --timeout 40000 >/dev/null 2>&1 ||
+      "$HERDR" agent prompt "$PANE" "$(<"$PROMPT")" --wait --until working --timeout 40000 >/dev/null 2>&1
+  fi
+  STATUS="unknown"
+  if STATUS=$("$HERDR" agent list | python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent_status","unknown") for x in a if x.get("pane_id")==p),"unknown"))' "$PANE"); then :; fi
+  echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS"
+}
+
+find_cmd() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { find_help; return 0; }
+  local target="" pane_only=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) find_help; return 0 ;;
+      --pane-only) pane_only=1 ;;
+      -*) die "unknown option '$1'" ;;
+      *) [[ -z "$target" ]] || die "find accepts exactly one target"; target="$1" ;;
+    esac
+    shift
+  done
+  [[ -n "$target" ]] || die "find requires a name or label"
+  [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
+  local af tf rc
+  af="$(mktemp)"; tf="$(mktemp)"
+  "$HERDR" agent list >"$af"
+  "$HERDR" tab list >"$tf"
+  set +e
+  python3 - "$target" "$pane_only" "$HERDR" "$af" "$tf" <<'PY'
+import json, subprocess, sys
+target, pane_only, herdr, af, tf = sys.argv[1:]
+def load(path, key):
+    with open(path, encoding="utf-8") as f:
+        p = json.load(f)
+    r = p.get("result", p)
+    v = r.get(key) if isinstance(r, dict) else None
+    if not isinstance(v, list):
+        raise ValueError("invalid herdr JSON: " + key)
+    return v
+agents, tabs = load(af, "agents"), load(tf, "tabs")
+labels = {t.get("tab_id"): t.get("label") for t in tabs}
+def unique(items):
+    out, seen = [], set()
+    for item in items:
+        pane = item.get("pane_id")
+        if pane and pane not in seen:
+            out.append(item); seen.add(pane)
+    return out
+matches = unique([a for a in agents if a.get("name") == target])
+kind = "name"
+if not matches:
+    ids = {t.get("tab_id") for t in tabs if t.get("label") == target}
+    matches = unique([a for a in agents if a.get("tab_id") in ids])
+    kind = "label"
+if not matches:
+    print("wrk find: no exact name or label match: " + target, file=sys.stderr)
+    raise SystemExit(1)
+def desc(a):
+    return ("pane_id=" + a.get("pane_id","?") + " name=" + (a.get("name") or "-") +
+            " label=" + (labels.get(a.get("tab_id")) or "-") +
+            " agent=" + a.get("agent","-") + " status=" + a.get("agent_status","-"))
+if pane_only == "1":
+    if len(matches) != 1:
+        print("wrk find: ambiguous " + str(len(matches)) + " " + kind + " matches", file=sys.stderr)
+        raise SystemExit(1)
+    print(matches[0].get("pane_id",""))
+    raise SystemExit(0)
+print("match=" + kind + " target=" + repr(target) + " candidates=" + str(len(matches)))
+read_failed = False
+for a in matches:
+    print(desc(a))
+    p = subprocess.run([herdr, "pane", "read", a["pane_id"], "--source", "recent",
+                        "--lines", "5", "--format", "text"], capture_output=True, text=True)
+    lines = p.stdout.rstrip("\n").splitlines()[-5:] if p.returncode == 0 else ["(pane read failed)"]
+    for line in lines or ["(no screen output)"]:
+        print("  " + line)
+    read_failed = read_failed or p.returncode != 0
+if len(matches) != 1:
+    print("wrk find: multiple panes matched; refusing automatic selection", file=sys.stderr)
+    raise SystemExit(1)
+raise SystemExit(1 if read_failed else 0)
+PY
+  rc=$?
+  set -e
+  rm -f "$af" "$tf"
+  return "$rc"
+}
+
+name_sync_cmd() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { name_sync_help; return 0; }
+  local mode=preview labels=() arg
+  while [[ $# -gt 0 ]]; do
+    arg="$1"
+    case "$arg" in
+      -h|--help) name_sync_help; return 0 ;;
+      --apply) mode=apply ;;
+      --*) die "unknown option '$arg'" ;;
+      *) mode=apply; labels+=("$arg") ;;
+    esac
+    shift
+  done
+  HERDR_BIN="$HERDR" python3 - "$mode" "${labels[@]:-}" <<'PY'
+import json, os, subprocess, sys
+H = os.environ["HERDR_BIN"]
+mode = sys.argv[1]
+want = [x for x in sys.argv[2:] if x]
+def run(*args):
+    return json.loads(subprocess.run([H, *args], capture_output=True, text=True).stdout)["result"]
+labels = {}
+for ws in run("workspace", "list").get("workspaces", []):
+    for t in run("tab", "list", "--workspace", ws["workspace_id"]).get("tabs", []):
+        if t.get("label"): labels[t["tab_id"]] = t["label"]
+agents = run("agent", "list")["agents"]
+taken = {a["name"] for a in agents if a.get("name")}
+by_tab = {}
+for a in agents: by_tab.setdefault(a.get("tab_id"), []).append(a)
+acted = skipped = 0
+for tab, label in sorted(labels.items()):
+    if want and label not in want: continue
+    members = by_tab.get(tab, [])
+    unnamed = [a for a in members if not a.get("name")]
+    if not unnamed: continue
+    if len(members) > 1:
+        print(f"  △ SKIP  {tab} '{label}' — 탭에 agent {len(members)}개(모호). 수동: herdr agent rename <pane> <이름>")
+        skipped += 1; continue
+    a = unnamed[0]
+    if label in taken:
+        print(f"  △ SKIP  {tab} '{label}' — 이름 이미 사용 중(agent_name_taken)")
+        skipped += 1; continue
+    if not want and (label.isdigit() or len(label) < 3):
+        print(f"  △ SKIP  {tab} '{label}' — 잡라벨 추정(숫자/3자 미만). 원하면 라벨 명시 지정으로")
+        skipped += 1; continue
+    if mode == "apply":
+        r = subprocess.run([H, "agent", "rename", a["pane_id"], label], capture_output=True, text=True)
+        ok = '"agent_info"' in r.stdout or "agent_info" in r.stdout
+        print(f"  {'✓' if ok else '✗'} {a['pane_id']} ({a['agent']}) → name '{label}'")
+        taken.add(label); acted += 1
+    else:
+        print(f"  · 후보  {a['pane_id']} ({a['agent']}, 이름 없음) → '{label}'")
+        acted += 1
+if mode == "preview":
+    print(f"\n후보 {acted}건, 스킵 {skipped}건 — 적용: herdr-name-sync --apply (또는 라벨 지정)")
+else:
+    print(f"\n적용 {acted}건, 스킵 {skipped}건")
+PY
+}
+
+case "${1:-}" in
+  -h|--help) usage ;;
+  spawn) shift; spawn_cmd "$@" ;;
+  find) shift; find_cmd "$@" ;;
+  name-sync) shift; name_sync_cmd "$@" ;;
+  "") usage >&2; exit 2 ;;
+  *) die "unknown command '$1' (see 'wrk --help')" ;;
+esac
