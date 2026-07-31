@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+scenario="${WRK_FIXTURE_SCENARIO:-spawn}"
+if [[ -n "${WRK_FIXTURE_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$WRK_FIXTURE_LOG"
+fi
+
+case "${1:-}" in
+  agent)
+    case "${2:-}" in
+      list)
+        case "$scenario" in
+          find-name)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"orch","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"kiro","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"}]}}'
+            ;;
+          name-priority)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"target","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"kiro","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"}]}}'
+            ;;
+          find-label)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"other","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"}]}}'
+            ;;
+          find-multi)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"},{"agent":"kiro","agent_status":"working","name":"","pane_id":"w:p3","tab_id":"w:t3","workspace_id":"w"}]}}'
+            ;;
+          name-sync)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"orch","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p3","tab_id":"w:t3","workspace_id":"w"}]}}'
+            ;;
+          *)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+        esac
+        ;;
+      rename)
+        printf '%s\n' '{"result":{"agent_info":{"name":"renamed"}}}'
+        ;;
+      start|prompt|send-keys)
+        printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
+        ;;
+      *) printf '%s\n' '{"result":{}}' ;;
+    esac
+    ;;
+  tab)
+    case "${2:-}" in
+      create) printf '%s\n' '{"result":{"root_pane":{"pane_id":"w:p1"}}}' ;;
+      list)
+        case "$scenario" in
+          find-name)
+            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w:t1","label":"different","workspace_id":"w"},{"tab_id":"w:t2","label":"other","workspace_id":"w"}]}}'
+            ;;
+          find-label)
+            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w:t2","label":"target","workspace_id":"w"}]}}'
+            ;;
+          find-multi)
+            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w:t2","label":"target","workspace_id":"w"},{"tab_id":"w:t3","label":"target","workspace_id":"w"}]}}'
+            ;;
+          name-priority)
+            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w:t1","label":"other","workspace_id":"w"},{"tab_id":"w:t2","label":"target","workspace_id":"w"}]}}'
+            ;;
+          name-sync)
+            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w:t1","label":"orch","workspace_id":"w"},{"tab_id":"w:t2","label":"2","workspace_id":"w"},{"tab_id":"w:t3","label":"build","workspace_id":"w"}]}}'
+            ;;
+          *) printf '%s\n' '{"result":{"tabs":[]}}' ;;
+        esac
+        ;;
+    esac
+    ;;
+  workspace)
+    printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w"}]}}'
+    ;;
+  pane)
+    printf 'fixture pane %s\nACTUAL SCREEN LAST LINE\n' "${3:-unknown}"
+    ;;
+esac

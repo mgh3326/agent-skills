@@ -37,6 +37,7 @@
 |---|---|
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
 | `herdr-name-sync` | 탭 라벨→agent 이름 동기화 — 스킬 타겟 검색은 agent 이름 기준인데 탭 라벨만 짓는 실수 방지(07-29 2회 실사고). 무인자=미리보기 · `--apply`=전체(잡라벨 가드) · `<라벨>`=지정 적용 |
+| `wrk` | `spawn`·`find`·`name-sync` 통합 CLI — 명시 모델 스폰, 이름/라벨 조회, 탭 라벨 동기화 |
 
 ## 의존 도구
 
@@ -46,6 +47,19 @@
 | `scopefuel` | 스폰 전 쿼타·pace 확인 | `~/bin/ai-quota` |
 | `wt` (worktrunk) | worktree 생성 + .env 자동 연결 | raw `git worktree add` + 수동 .env 심링크 |
 | `~/bin/herdr-spawn` | worktree+탭+기동+주입 원샷, auto 쿼타 라우팅 | `herdr agent start` 수동 시퀀스 |
+
+## `wrk` 사용법
+
+```text
+wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL [-L live|mock] [--effort LEVEL]
+wrk find <이름|라벨> [--pane-only]
+wrk name-sync [--apply|<라벨>...]
+```
+
+`-m`은 필수이며 `codex-terra`, `codex-luna`, `codex-sol`처럼 모델을 드러내는
+canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은 설치된
+`scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
+`agy -p "$(cat PROMPT_FILE)"`이다.
 
 ## 설계 원칙
 
