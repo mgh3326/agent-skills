@@ -72,9 +72,10 @@ Options:
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
-the job and leases its quota pool from arbiter. arbiter resolves the pool from
-scopefuel's own output — wrk holds no pool mapping. Lease refusal denies the
-spawn (exit 3); a failed spawn releases the lease. There is no bypass flag.
+the job and records its quota-pool execution in arbiter. arbiter resolves the
+pool from scopefuel's own output — wrk holds no pool mapping. A quota-pool
+record failure is warned and does not deny the spawn; a failed spawn releases
+the record. The scopefuel gate and arbiter claim remain fail-closed.
 
 Canonical codex profiles: codex-terra, codex-luna, codex-sol.
 Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
@@ -160,14 +161,13 @@ arbiter_release_held() {
   ARBITER_HELD=0
   local rc
   set +e
-  "$ARBITER" release --job "$JOB_ID" --resource "$ARBITER_RESOURCE" --kind quota_pool \
-    --token "$ARBITER_TOKEN" >/dev/null 2>&1
+  "$ARBITER" release --job "$JOB_ID" --resource "$ARBITER_RESOURCE" --kind quota_pool >/dev/null 2>&1
   rc=$?
   set -e
   if [[ "$rc" -ne 0 ]]; then
-    echo "wrk: arbiter lease release failed (exit $rc): $ARBITER_RESOURCE/quota_pool job=$JOB_ID" >&2
+    echo "wrk: arbiter quota-pool record release failed (exit $rc): $ARBITER_RESOURCE job=$JOB_ID" >&2
   else
-    echo "wrk: arbiter lease released after spawn failure: $ARBITER_RESOURCE/quota_pool" >&2
+    echo "wrk: arbiter quota-pool record released after spawn failure: $ARBITER_RESOURCE job=$JOB_ID" >&2
   fi
 }
 
@@ -200,7 +200,7 @@ arbiter_admit() {
   if [[ "$GATE_READY" -ne 1 ]]; then
     # No scopefuel result means no authoritative pool. Leasing a guessed pool would
     # be worse than not leasing — the same installation-transition exception applies.
-    warn "scopefuel gate did not run; arbiter quota-pool lease skipped during installation transition"
+    warn "scopefuel gate did not run; arbiter quota-pool record skipped during installation transition"
     return 0
   fi
 
@@ -211,41 +211,45 @@ arbiter_admit() {
   set -e
   case "$claim_rc" in
     0) ;;
-    # A duplicate claim is not an admission decision; the lease below still is.
-    4) warn "arbiter job '$JOB_ID' is already claimed; the lease still governs admission" ;;
+    # A duplicate claim is not an admission decision; the quota record below is independent.
+    4) warn "arbiter job '$JOB_ID' is already claimed; the quota record still proceeds" ;;
     *) echo "wrk: arbiter claim failed (exit $claim_rc); spawn denied" >&2; exit 3 ;;
   esac
 
-  local gate_file lease_json lease_rc parsed rc
+  local gate_file record_json record_rc parsed rc
   gate_file="$(mktemp)"
   printf '%s\n' "$GATE_OUTPUT" >"$gate_file"
   set +e
-  lease_json="$(SCOPEFUEL_BIN="$SCOPEFUEL" "$ARBITER" lease --job "$JOB_ID" --kind quota_pool \
+  record_json="$(SCOPEFUEL_BIN="$SCOPEFUEL" "$ARBITER" lease --job "$JOB_ID" --kind quota_pool \
     --profile "$GATE_PROFILE" --gate-output "$gate_file" --json)"
-  lease_rc=$?
+  record_rc=$?
   set -e
   rm -f "$gate_file"
-  if [[ "$lease_rc" -ne 0 ]]; then
-    echo "wrk: arbiter lease refused (exit $lease_rc); spawn denied" >&2
-    exit 3
+  if [[ "$record_rc" -ne 0 ]]; then
+    warn "arbiter quota-pool record failed (exit $record_rc); continuing spawn"
+    return 0
   fi
   set +e
-  parsed="$(printf '%s' "$lease_json" |
-    python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["resource"]); print(d["token"])')"
+  parsed="$(printf '%s' "$record_json" |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["pool"]); print(d["profile"]); print(d["started_at"])')"
   rc=$?
   set -e
   if [[ "$rc" -ne 0 ]]; then
-    echo "wrk: arbiter lease output unreadable; spawn denied" >&2
-    exit 3
+    warn "arbiter quota-pool record output unreadable; continuing spawn"
+    return 0
   fi
-  { IFS= read -r ARBITER_RESOURCE; IFS= read -r ARBITER_TOKEN; } <<<"$parsed"
-  if [[ -z "$ARBITER_RESOURCE" || -z "$ARBITER_TOKEN" ]]; then
-    echo "wrk: arbiter lease returned no resource/token; spawn denied" >&2
-    exit 3
+  {
+    IFS= read -r ARBITER_RESOURCE
+    IFS= read -r ARBITER_PROFILE
+    IFS= read -r ARBITER_STARTED_AT
+  } <<<"$parsed"
+  if [[ -z "$ARBITER_RESOURCE" || -z "$ARBITER_PROFILE" || -z "$ARBITER_STARTED_AT" ]]; then
+    warn "arbiter quota-pool record returned incomplete fields; continuing spawn"
+    return 0
   fi
   ARBITER_HELD=1
   trap 'arbiter_release_held' EXIT
-  echo "wrk: arbiter lease held resource=$ARBITER_RESOURCE kind=quota_pool job=$JOB_ID" >&2
+  echo "wrk: arbiter quota-pool record pool=$ARBITER_RESOURCE profile=$ARBITER_PROFILE job=$JOB_ID" >&2
 }
 
 resolve_profile() {
@@ -359,7 +363,7 @@ resolve_profile() {
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T=""
-  ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" GATE_OUTPUT="" GATE_READY=0
+  ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
@@ -414,9 +418,10 @@ spawn_cmd() {
   TAB_ENV=()
   if [[ "${#LANE_ENV[@]}" -gt 0 ]]; then TAB_ENV+=("${LANE_ENV[@]}"); fi
   if [[ "$ARBITER_HELD" -eq 1 ]]; then
-    # The worker needs its own lease identity to release or prove it later.
+    # The worker needs its own record identity to release or prove it later.
     TAB_ENV+=(--env "ARBITER_JOB=$JOB_ID" --env "ARBITER_RESOURCE=$ARBITER_RESOURCE"
-              --env "ARBITER_KIND=quota_pool" --env "ARBITER_TOKEN=$ARBITER_TOKEN")
+              --env "ARBITER_KIND=quota_pool" --env "ARBITER_PROFILE=$ARBITER_PROFILE"
+              --env "ARBITER_STARTED_AT=$ARBITER_STARTED_AT")
   fi
   if [[ "${#TAB_ENV[@]}" -gt 0 ]]; then
     PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}" |
@@ -458,11 +463,10 @@ spawn_cmd() {
   fi
   STATUS="unknown"
   if STATUS=$("$HERDR" agent list | python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent_status","unknown") for x in a if x.get("pane_id")==p),"unknown"))' "$PANE"); then :; fi
-  # The spawn stands; the lease now belongs to the worker, not to this process.
-  # The token itself stays out of stdout — the worker already has it in its env.
+  # The spawn stands; the execution record now belongs to the worker, not to this process.
   ARBITER_HELD=0
   if [[ -n "$ARBITER_RESOURCE" ]]; then
-    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS job=$JOB_ID lease=$ARBITER_RESOURCE/quota_pool"
+    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
   else
     echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS"
   fi

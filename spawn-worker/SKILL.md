@@ -156,6 +156,9 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
             [-L live|mock] [--effort <레벨>]
   wrk --help          # 서브커맨드·옵션 전체
   ```
+  신규 workspace 규약: workers(herdr workspace w16)는 worker/verifier 신규 세션에,
+  orchs는 orch류 신규 상주 세션에 사용한다. 기존 세션은 이동하지 않으며,
+  이슈별 -w 값을 생략하거나 추측하지 않는다.
   `-m` 은 **필수**다(기본값 없음 — 오타가 조용히 Claude 워커를 띄우던 결함을 제거했다).
   모르는 인자는 무시되지 않고 에러가 난다. 수동 기동은 `herdr agent start <유일이름>
   --workspace <ws> --cwd <worktree> --no-focus -- <argv>`.

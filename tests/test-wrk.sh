@@ -242,7 +242,7 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$TMP/non-executable-scopefuel" WR
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1
 
 # ---------------------------------------------------------------------------
-# ROB-1199: arbiter admission control. wrk holds no pool mapping — arbiter reads
+# ROB-1199/ROB-1201: arbiter admission control. wrk holds no pool mapping — arbiter reads
 # the pool out of scopefuel's own gate output and validates it against
 # `scopefuel --json`. There is no bypass flag; only an absent/too-old arbiter is
 # tolerated, and only with a warning.
@@ -273,76 +273,84 @@ expect_exit 3 spawn_base codex-terra
 [[ ! -e "$TMP/herdr.log" ]]
 unset TEST_ARBITER_BIN
 
-# ⑥ acquire: the gate passes, arbiter leases the pool scopefuel resolved, and the
-# worker is handed its own job/resource/token.
+# ⑥ record: the gate passes, arbiter records the pool scopefuel resolved, and the
+# worker is handed its own job/resource/profile identity.
 export TEST_ARBITER_BIN="$ARBITER"
 rm -f "$TMP/herdr.log"
 admit_out="$(spawn_base codex-terra --job arb-ok --t T2 2>&1)"
-grep -q 'lease=codex/quota_pool' <<<"$admit_out"
+grep -q 'quota_record=codex/quota_pool' <<<"$admit_out"
 grep -q 'job=arb-ok' <<<"$admit_out"
 grep -q 'ARBITER_JOB=arb-ok' "$TMP/herdr.log"
 grep -q 'ARBITER_RESOURCE=codex' "$TMP/herdr.log"
 grep -q 'ARBITER_KIND=quota_pool' "$TMP/herdr.log"
-grep -q 'ARBITER_TOKEN=' "$TMP/herdr.log"
-# The raw token never reaches wrk's own stdout.
-token="$(arb status --job arb-ok --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["token"])')"
-[[ "$token" == *"…" ]]
-python3 - "$TMP/herdr.log" <<'PY'
-import re, sys
-log = open(sys.argv[1], encoding="utf-8").read()
-raw = re.search(r"ARBITER_TOKEN=(\S+)", log).group(1)
-assert re.fullmatch(r"\d+-[0-9a-f]{16}", raw), raw
-PY
+grep -q 'ARBITER_PROFILE=codex-terra-max' "$TMP/herdr.log"
+grep -q 'ARBITER_STARTED_AT=' "$TMP/herdr.log"
 arb status --job arb-ok --json |
-  python3 -c 'import json,sys; d=json.load(sys.stdin); l=d["leases"]; assert len(l)==1 and l[0]["resource"]=="codex" and l[0]["kind"]=="quota_pool" and not l[0]["expired"], d'
+  python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["quota_pool_records"]; assert len(r)==1 and r[0]["pool"]=="codex" and r[0]["profile"]=="codex-terra-max", d'
 arb status --job arb-ok --json |
   python3 -c 'import json,sys; j=json.load(sys.stdin)["jobs"]; assert len(j)==1 and j[0]["t_level"]=="T2" and j[0]["owner_lane"]=="default", j'
 
-# ⑥ the pool is now occupied: another job asking for the same pool is denied and
-# nothing is spawned (exit 3, the scopefuel gate's own code for a refusal).
+# ⑥ the pool is a record, not a mutex: another job asking for the same pool
+# succeeds and both records remain visible.
 rm -f "$TMP/herdr.log"
-expect_exit 3 spawn_base codex-terra --job arb-denied --t T2
-[[ ! -e "$TMP/herdr.log" ]]
-arb status --job arb-denied --json |
-  python3 -c 'import json,sys; assert json.load(sys.stdin)["leases"] == []'
+second_out="$(spawn_base codex-terra --job arb-second --t T2 2>&1)"
+grep -q 'quota_record=codex/quota_pool' <<<"$second_out"
+arb status --json |
+  python3 -c 'import json,sys; d=json.load(sys.stdin); r=[x for x in d["quota_pool_records"] if x["pool"]=="codex"]; assert {x["job_id"] for x in r} >= {"arb-ok","arb-second"}, d'
 
 # A different profile mapping to a different pool is unaffected by that denial.
 rm -f "$TMP/herdr.log"
 other_out="$(spawn_base kiro-sol --job arb-other --t T1 2>&1)"
-grep -q 'lease=kiro/quota_pool' <<<"$other_out"
+grep -q 'quota_record=kiro/quota_pool' <<<"$other_out"
 
-# ⑥ spawn failure releases the lease instead of leaking it.
+# ⑥ spawn failure releases the record instead of leaking it.
 rm -f "$TMP/herdr.log"
 export TEST_FIXTURE_SCENARIO=tab-create-fails
 rollback_out="$(spawn_base opus --job arb-rollback --t T2 2>&1 || true)"
 unset TEST_FIXTURE_SCENARIO
-grep -q 'arbiter lease released after spawn failure: claude/quota_pool' <<<"$rollback_out"
+grep -q 'arbiter quota-pool record released after spawn failure: claude job=arb-rollback' <<<"$rollback_out"
 arb status --json | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-assert not [l for l in d["leases"] if l["resource"] == "claude"], d["leases"]
-released = [h for h in d["history"] if h["resource"] == "claude" and h["state"] == "released"]
-assert released and released[0]["job"] == "arb-rollback", d["history"]
+assert not [r for r in d["quota_pool_records"] if r["pool"] == "claude"], d["quota_pool_records"]
+events = __import__("pathlib").Path(__import__("os").environ["ARBITER_INBOX_ROOT"], "arb-rollback", "events")
+assert any(__import__("json").loads(p.read_text())["kind"] == "quota_pool.release" for p in events.glob("*.json")), events
 '
-# The released pool can be leased again right away.
+# The released pool can be recorded again right away.
 rm -f "$TMP/herdr.log"
 retry_out="$(spawn_base opus --job arb-retry --t T2 2>&1)"
-grep -q 'lease=claude/quota_pool' <<<"$retry_out"
+grep -q 'quota_record=claude/quota_pool' <<<"$retry_out"
 
-# A duplicate claim does not block a spawn — the lease is what governs admission.
-arb release --job arb-retry --resource claude --kind quota_pool \
-  --token "$(python3 -c '
-import json, re, sys
-log = open(sys.argv[1], encoding="utf-8").read()
-print(re.findall(r"ARBITER_TOKEN=(\S+)", log)[-1])
-' "$TMP/herdr.log")" >/dev/null
+# A duplicate claim does not block a spawn — quota records are independent.
+arb release --job arb-retry --resource claude --kind quota_pool >/dev/null
 rm -f "$TMP/herdr.log"
 dup_out="$(spawn_base opus --job arb-retry --t T2 2>&1)"
 grep -q "already claimed" <<<"$dup_out"
-grep -q 'lease=claude/quota_pool' <<<"$dup_out"
+grep -q 'quota_record=claude/quota_pool' <<<"$dup_out"
+
+# ⑥ quota_pool record failure warns and still spawns; this is not a quota gate.
+cat >"$TMP/quota-record-failing-arbiter" <<EOF
+#!/usr/bin/env bash
+if [[ "\${1:-}" == "lease" && "\$*" == *"quota_pool"* ]]; then
+  echo "fixture: quota record unavailable" >&2
+  exit 7
+fi
+exec "$ARBITER" "\$@"
+EOF
+chmod +x "$TMP/quota-record-failing-arbiter"
+rm -f "$TMP/herdr.log"
+export TEST_ARBITER_BIN="$TMP/quota-record-failing-arbiter"
+record_failed_out="$(spawn_base codex-terra --job arb-record-fail --t T1 2>&1)"
+grep -q 'arbiter quota-pool record failed' <<<"$record_failed_out"
+grep -q 'model=codex-terra' <<<"$record_failed_out"
+[[ -e "$TMP/herdr.log" ]]
+arb status --job arb-record-fail --json |
+  python3 -c 'import json,sys; assert json.load(sys.stdin)["quota_pool_records"] == [], sys.stdin'
+unset TEST_ARBITER_BIN
 
 # ⑤ a broken state db denies the spawn instead of waving it through.
 rm -f "$TMP/herdr.log"
+export TEST_ARBITER_BIN="$ARBITER"
 printf 'not a database\n' >"$TMP/xdg/arbiter/state.db"
 rm -f "$TMP/xdg/arbiter/state.db-wal" "$TMP/xdg/arbiter/state.db-shm"
 expect_exit 3 spawn_base grok --job arb-broken --t T1
