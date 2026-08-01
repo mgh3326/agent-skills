@@ -5,10 +5,18 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
+ARBITER="$ROOT/bin/arbiter"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 PROMPT="$TMP/prompt.md"
 printf '%s\n' 'fixture prompt' >"$PROMPT"
+
+# ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
+# ARBITER_BIN points at nothing by default, so every pre-existing case keeps
+# exercising the installation-transition path; the arbiter section below opts in.
+export ARBITER_BIN="$TMP/absent-arbiter"
+export XDG_DATA_HOME="$TMP/xdg"
+export ARBITER_INBOX_ROOT="$TMP/inbox"
 
 run_fail() {
   if "$@" >/dev/null 2>&1; then
@@ -17,12 +25,32 @@ run_fail() {
   fi
 }
 
-spawn_base() {
-  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
-    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
-    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" "$WRK" spawn \
-    -c "$ROOT" -m "$1" -p "$PROMPT" -w w -l fixture "${@:2}"
+expect_exit() {
+  local want="$1"; shift
+  local rc=0
+  set +e
+  "$@" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -ne "$want" ]]; then
+    echo "expected exit $want, got $rc: $*" >&2
+    exit 1
+  fi
 }
+
+# --t is required by wrk; supply one unless the case under test provides its own.
+spawn_base() {
+  local model="$1"; shift
+  local extra=("$@")
+  case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
+    WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" "$WRK" spawn \
+    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
+}
+
+arb() { "$ARBITER" "$@"; }
 
 "$WRK" --help >/dev/null
 "$WRK" spawn --help >/dev/null
@@ -185,7 +213,7 @@ grep -q '/usr/bin/env' "$TMP/herdr.log"
 once_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=prompt-wait-fails WRK_FIXTURE_LOG="$TMP/herdr.log" \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" "$WRK" spawn \
-  -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture 2>&1)"
+  -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
 grep -q 'model=codex-terra' <<<"$once_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 [[ "$(grep -c 'agent send-keys w:p1 return' "$TMP/herdr.log")" -eq 1 ]]
@@ -204,13 +232,151 @@ grep -q 'no gate subcommand' <<<"$unsupported"
 rm -f "$TMP/herdr.log"
 run_fail env WRK_GATE_MODE=broken HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture
+  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1
 SCOPEFUEL_BIN="$TMP/missing-scopefuel" HERDR_BIN="$HERDR" WRK_NO_SLEEP=1 \
-  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture >/dev/null
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
+  --t T1 >/dev/null
 cp "$SCOPEFUEL" "$TMP/non-executable-scopefuel"
 chmod -x "$TMP/non-executable-scopefuel"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$TMP/non-executable-scopefuel" WRK_NO_SLEEP=1 \
-  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1
+
+# ---------------------------------------------------------------------------
+# ROB-1199: arbiter admission control. wrk holds no pool mapping — arbiter reads
+# the pool out of scopefuel's own gate output and validates it against
+# `scopefuel --json`. There is no bypass flag; only an absent/too-old arbiter is
+# tolerated, and only with a warning.
+# ---------------------------------------------------------------------------
+
+# ⑦ arbiter not installed at all → warn, spawn proceeds (installation transition).
+rm -f "$TMP/herdr.log"
+absent_out="$(spawn_base codex-terra 2>&1)"
+grep -q 'arbiter unavailable' <<<"$absent_out"
+grep -q 'model=codex-terra' <<<"$absent_out"
+[[ -e "$TMP/herdr.log" ]]
+
+# ⑦ installed arbiter that predates the lease subcommand → warn, spawn proceeds.
+rm -f "$TMP/herdr.log"
+export TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-legacy"
+legacy_out="$(spawn_base codex-terra 2>&1)"
+grep -q 'no lease subcommand' <<<"$legacy_out"
+grep -q 'model=codex-terra' <<<"$legacy_out"
+[[ -e "$TMP/herdr.log" ]]
+unset TEST_ARBITER_BIN
+
+# arbiter present but not executable → fail-closed, nothing is spawned.
+cp "$ARBITER" "$TMP/non-executable-arbiter"
+chmod -x "$TMP/non-executable-arbiter"
+rm -f "$TMP/herdr.log"
+export TEST_ARBITER_BIN="$TMP/non-executable-arbiter"
+expect_exit 3 spawn_base codex-terra
+[[ ! -e "$TMP/herdr.log" ]]
+unset TEST_ARBITER_BIN
+
+# ⑥ acquire: the gate passes, arbiter leases the pool scopefuel resolved, and the
+# worker is handed its own job/resource/token.
+export TEST_ARBITER_BIN="$ARBITER"
+rm -f "$TMP/herdr.log"
+admit_out="$(spawn_base codex-terra --job arb-ok --t T2 2>&1)"
+grep -q 'lease=codex/quota_pool' <<<"$admit_out"
+grep -q 'job=arb-ok' <<<"$admit_out"
+grep -q 'ARBITER_JOB=arb-ok' "$TMP/herdr.log"
+grep -q 'ARBITER_RESOURCE=codex' "$TMP/herdr.log"
+grep -q 'ARBITER_KIND=quota_pool' "$TMP/herdr.log"
+grep -q 'ARBITER_TOKEN=' "$TMP/herdr.log"
+# The raw token never reaches wrk's own stdout.
+token="$(arb status --job arb-ok --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["leases"][0]["token"])')"
+[[ "$token" == *"…" ]]
+python3 - "$TMP/herdr.log" <<'PY'
+import re, sys
+log = open(sys.argv[1], encoding="utf-8").read()
+raw = re.search(r"ARBITER_TOKEN=(\S+)", log).group(1)
+assert re.fullmatch(r"\d+-[0-9a-f]{16}", raw), raw
+PY
+arb status --job arb-ok --json |
+  python3 -c 'import json,sys; d=json.load(sys.stdin); l=d["leases"]; assert len(l)==1 and l[0]["resource"]=="codex" and l[0]["kind"]=="quota_pool" and not l[0]["expired"], d'
+arb status --job arb-ok --json |
+  python3 -c 'import json,sys; j=json.load(sys.stdin)["jobs"]; assert len(j)==1 and j[0]["t_level"]=="T2" and j[0]["owner_lane"]=="default", j'
+
+# ⑥ the pool is now occupied: another job asking for the same pool is denied and
+# nothing is spawned (exit 3, the scopefuel gate's own code for a refusal).
+rm -f "$TMP/herdr.log"
+expect_exit 3 spawn_base codex-terra --job arb-denied --t T2
+[[ ! -e "$TMP/herdr.log" ]]
+arb status --job arb-denied --json |
+  python3 -c 'import json,sys; assert json.load(sys.stdin)["leases"] == []'
+
+# A different profile mapping to a different pool is unaffected by that denial.
+rm -f "$TMP/herdr.log"
+other_out="$(spawn_base kiro-sol --job arb-other --t T1 2>&1)"
+grep -q 'lease=kiro/quota_pool' <<<"$other_out"
+
+# ⑥ spawn failure releases the lease instead of leaking it.
+rm -f "$TMP/herdr.log"
+export TEST_FIXTURE_SCENARIO=tab-create-fails
+rollback_out="$(spawn_base opus --job arb-rollback --t T2 2>&1 || true)"
+unset TEST_FIXTURE_SCENARIO
+grep -q 'arbiter lease released after spawn failure: claude/quota_pool' <<<"$rollback_out"
+arb status --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert not [l for l in d["leases"] if l["resource"] == "claude"], d["leases"]
+released = [h for h in d["history"] if h["resource"] == "claude" and h["state"] == "released"]
+assert released and released[0]["job"] == "arb-rollback", d["history"]
+'
+# The released pool can be leased again right away.
+rm -f "$TMP/herdr.log"
+retry_out="$(spawn_base opus --job arb-retry --t T2 2>&1)"
+grep -q 'lease=claude/quota_pool' <<<"$retry_out"
+
+# A duplicate claim does not block a spawn — the lease is what governs admission.
+arb release --job arb-retry --resource claude --kind quota_pool \
+  --token "$(python3 -c '
+import json, re, sys
+log = open(sys.argv[1], encoding="utf-8").read()
+print(re.findall(r"ARBITER_TOKEN=(\S+)", log)[-1])
+' "$TMP/herdr.log")" >/dev/null
+rm -f "$TMP/herdr.log"
+dup_out="$(spawn_base opus --job arb-retry --t T2 2>&1)"
+grep -q "already claimed" <<<"$dup_out"
+grep -q 'lease=claude/quota_pool' <<<"$dup_out"
+
+# ⑤ a broken state db denies the spawn instead of waving it through.
+rm -f "$TMP/herdr.log"
+printf 'not a database\n' >"$TMP/xdg/arbiter/state.db"
+rm -f "$TMP/xdg/arbiter/state.db-wal" "$TMP/xdg/arbiter/state.db-shm"
+expect_exit 3 spawn_base grok --job arb-broken --t T1
+[[ ! -e "$TMP/herdr.log" ]]
+rm -rf "$TMP/xdg/arbiter"
+unset TEST_ARBITER_BIN
+
+# ROB-1198 §③: an unclassified job is refused outright — no default T, and the
+# refusal happens before the gate, the claim and the spawn.
+spawn_untyped() {
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture "$@"
+}
+rm -f "$TMP/herdr.log" "$TMP/scopefuel.log"
+export TEST_ARBITER_BIN="$ARBITER"
+untyped_out="$(spawn_untyped 2>&1 || true)"
+grep -q 'NEEDS_CLASSIFICATION' <<<"$untyped_out"
+! grep -q '^OK ' <<<"$untyped_out"
+expect_exit 2 spawn_untyped
+[[ ! -e "$TMP/herdr.log" ]]                      # nothing spawned
+[[ ! -e "$TMP/scopefuel.log" ]]                  # gate not even consulted
+expect_exit 2 spawn_untyped --t T9
+expect_exit 2 spawn_untyped --t ""
+[[ ! -e "$TMP/herdr.log" ]]
+[[ ! -e "$TMP/scopefuel.log" ]]
+# A classified job goes through, and the classification is what gets recorded.
+expect_exit 0 spawn_untyped --job arb-typed --t T3
+arb status --job arb-typed --json |
+  python3 -c 'import json,sys; j=json.load(sys.stdin)["jobs"]; assert j[0]["t_level"]=="T3", j'
+arb status --json |
+  python3 -c 'import json,sys; assert not [j for j in json.load(sys.stdin)["jobs"] if j["job"]=="fixture"], "an unclassified job was claimed"'
+unset TEST_ARBITER_BIN
 
 grep -q 'for tool in "$REPO_DIR"/bin/\*' "$ROOT/install.sh"
 

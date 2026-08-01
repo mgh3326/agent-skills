@@ -1,6 +1,32 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# ROB-1199: pool 정본. 실제 scopefuel 의 recommend.profile_pool() 과 같은 갈래만 흉내낸다
+# (fixture 전용 — 프로덕션 매핑은 scopefuel 하나가 소유한다).
+pool_for() {
+  case "$1" in
+    opus|sonnet|fable|haiku) echo claude ;;
+    claudex|codex*) echo codex ;;
+    kiro*) echo kiro ;;
+    oc-gflash|oc-sonnet46|oc-oss) echo agy ;;
+    oc-omni) echo omniroute ;;
+    oc-*) echo clinepass ;;
+    grok|grok-hi|grok-med) echo grok ;;
+    *) echo "" ;;
+  esac
+}
+
+if [[ "${1:-}" == --json ]]; then
+  case "${WRK_SCOPEFUEL_JSON_MODE:-ok}" in
+    broken) echo 'scopefuel: json fetch failed' >&2; exit 7 ;;
+    garbage) echo 'not json at all'; exit 0 ;;
+    drift) providers='[{"id":"claude"},{"id":"kiro"}]' ;;
+    *) providers='[{"id":"claude"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"}]' ;;
+  esac
+  printf '{"schema":"scopefuel.v1","generated_at":"2026-08-01T00:00:00+00:00","summary":{"mark":"ok","usage_mark":"ok"},"providers":%s}\n' "$providers"
+  exit 0
+fi
+
 if [[ "${1:-}" == gate && "${2:-}" == --help ]]; then
   case "${WRK_GATE_MODE:-ok}" in
     unsupported) echo 'error: unknown command: gate' >&2; exit 2 ;;
@@ -22,4 +48,10 @@ case "${WRK_GATE_MODE:-ok}" in
   4) echo "gate measurement unavailable profile=$profile alternative=fixture-alt" >&2; exit 4 ;;
   9) echo "gate internal failure profile=$profile" >&2; exit 9 ;;
 esac
+pool="$(pool_for "$profile")"
+if [[ "${WRK_GATE_POOL_MODE:-ok}" == missing ]]; then
+  echo "gate allowed profile=$profile"
+  exit 0
+fi
+echo "profile=$profile pool=$pool used_pct=12.5 class=preserve"
 echo "gate allowed profile=$profile"

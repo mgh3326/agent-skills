@@ -1,0 +1,927 @@
+#!/usr/bin/env python3
+"""arbiter — 작업 조정(admission control) 도구.
+
+도메인 경계(운영자 결정, ROB-1199): `wrk → arbiter → scopefuel --json`.
+- scopefuel : 쿼타·급·정책 ("얼마 남았나")  — arbiter 가 읽는 입력원. 역방향 의존 금지.
+- wrk       : 세션 수명주기 ("어떻게 띄우나") — arbiter 를 호출하는 쪽.
+- arbiter   : 작업 조정 ("누가 점유했나")   — 이 파일.
+
+저장소는 `$XDG_DATA_HOME/arbiter/state.db` 로 scopefuel 의 bench.db 와 완전히 분리한다.
+
+fail-closed 가 핵심 요구사항이다. lease 획득 실패·DB 접근 실패·스키마 불일치는 전부
+비-0 exit 이며, "일단 통과"하는 경로는 존재하지 않는다(우회 플래그도 만들지 않는다).
+도구 자체가 설치되지 않은 과도기만 호출자(`wrk`)가 경고 후 진행한다.
+
+exit code
+  0  성공
+  2  사용법 오류
+  3  admission 거부(lease 점유 중 / job 미등록 / scopefuel gate 거부)
+  4  중복(claim 중복 job_id, event 중복 (job_id, seq))
+  5  fencing 위반(stale owner·token 불일치 release)
+  6  저장소·증거 결함(DB 없음·스키마 불일치·권한 오류·pool 해석 불가) — fail-closed
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import re
+import secrets
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PROG = "arbiter"
+
+# 스키마 버전. 저장된 값과 다르면 모든 명령이 fail-closed 로 거부한다(추측 마이그레이션 금지).
+SCHEMA_VERSION = 1
+
+# kind 별 기본 TTL(분) — 운영자 정본 고정값.
+DEFAULT_TTL_MIN = {"quota_pool": 90, "path": 90, "linear_permit": 30}
+KINDS = tuple(DEFAULT_TTL_MIN)
+T_LEVELS = ("T0", "T1", "T2", "T3")
+
+BUSY_TIMEOUT_MS = 10000
+
+EXIT_OK = 0
+EXIT_USAGE = 2
+EXIT_DENIED = 3
+EXIT_DUPLICATE = 4
+EXIT_FENCING = 5
+EXIT_STORAGE = 6
+
+
+class ArbiterError(Exception):
+    """비-0 exit 로 끝나는 모든 실패. 조용한 통과는 없다."""
+
+    def __init__(self, code: int, message: str, **detail: object) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.detail = detail
+
+
+# ---------------------------------------------------------------- paths / time
+
+
+def data_home() -> Path:
+    raw = os.environ.get("XDG_DATA_HOME") or ""
+    return Path(raw) if raw else Path.home() / ".local" / "share"
+
+
+def db_path() -> Path:
+    return data_home() / PROG / "state.db"
+
+
+def inbox_root() -> Path:
+    """신규 job 의 event artifact 루트. 기존 flat inbox 파일은 건드리지 않는다."""
+    raw = os.environ.get("ARBITER_INBOX_ROOT") or ""
+    return Path(raw) if raw else Path.home() / "work" / "herdr-inbox" / "jobs"
+
+
+def now_dt() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
+
+
+def iso(moment: dt.datetime) -> str:
+    return moment.isoformat()
+
+
+def parse_iso(value: str) -> dt.datetime:
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ArbiterError(EXIT_STORAGE, f"저장된 시각을 해석할 수 없다: {value!r}") from exc
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def mask_token(token: str) -> str:
+    """fencing 시퀀스만 남기고 비밀부는 가린다(status·감사 출력용)."""
+    head = token.split("-", 1)[0]
+    return f"{head}-…"
+
+
+# --------------------------------------------------------------------- sqlite
+
+DDL = (
+    """
+    CREATE TABLE meta (
+        id             INTEGER PRIMARY KEY CHECK (id = 1),
+        schema_version INTEGER NOT NULL,
+        token_seq      INTEGER NOT NULL,
+        created_at     TEXT    NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE jobs (
+        job_id     TEXT PRIMARY KEY,
+        owner_lane TEXT NOT NULL,
+        state      TEXT NOT NULL,
+        t_level    TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE leases (
+        resource    TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        job_id      TEXT NOT NULL,
+        token       TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        PRIMARY KEY (resource, kind)
+    )
+    """,
+    """
+    CREATE TABLE lease_history (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        resource    TEXT NOT NULL,
+        kind        TEXT NOT NULL,
+        job_id      TEXT NOT NULL,
+        token       TEXT NOT NULL,
+        acquired_at TEXT NOT NULL,
+        expires_at  TEXT NOT NULL,
+        state       TEXT NOT NULL,
+        recorded_at TEXT NOT NULL,
+        UNIQUE (resource, kind, token, state)
+    )
+    """,
+    """
+    CREATE TABLE events (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        job_id     TEXT    NOT NULL,
+        seq        INTEGER NOT NULL,
+        kind       TEXT    NOT NULL,
+        payload    TEXT    NOT NULL,
+        created_at TEXT    NOT NULL,
+        UNIQUE (job_id, seq)
+    )
+    """,
+)
+
+
+def _uri(path: Path, mode: str) -> str:
+    # 경로에 ? 나 # 이 있어도 안전하도록 최소 인용만 한다.
+    text = str(path).replace("?", "%3f").replace("#", "%23")
+    return f"file:{text}?mode={mode}"
+
+
+def _tune(con: sqlite3.Connection, *, writable: bool) -> None:
+    con.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
+    if writable:
+        con.execute("PRAGMA journal_mode=WAL")
+    else:
+        # 읽기 경로가 파일을 건드리면 추적이 불가능해진다(scopefuel 에서 배운 것).
+        con.execute("PRAGMA query_only=1")
+
+
+def connect_rw(*, bootstrap: bool = False) -> sqlite3.Connection:
+    path = db_path()
+    fresh = not path.exists()
+    if fresh:
+        if not bootstrap:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                f"state db 가 없다: {path} — 'arbiter claim' 이 유일한 초기화 경로다",
+            )
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise ArbiterError(EXIT_STORAGE, f"state db 디렉터리를 만들 수 없다: {exc}") from exc
+    try:
+        con = sqlite3.connect(
+            _uri(path, "rwc" if bootstrap else "rw"),
+            uri=True,
+            timeout=BUSY_TIMEOUT_MS / 1000,
+            isolation_level=None,
+        )
+        _tune(con, writable=True)
+    except sqlite3.Error as exc:
+        raise ArbiterError(EXIT_STORAGE, f"state db 를 열 수 없다: {path}: {exc}") from exc
+    if fresh:
+        _create_schema(con)
+        print(f"{PROG}: initialized new state db at {path}", file=sys.stderr)
+    _check_schema(con)
+    return con
+
+
+def _wal_clean(path: Path) -> bool:
+    """WAL 에 미반영 프레임이 없고 WAL 인덱스도 없는가."""
+    shm = Path(f"{path}-shm")
+    wal = Path(f"{path}-wal")
+    if shm.exists():
+        return False
+    try:
+        return not wal.exists() or wal.stat().st_size == 0
+    except OSError:
+        return False
+
+
+def _open_ro(uri: str) -> sqlite3.Connection:
+    con = sqlite3.connect(uri, uri=True, timeout=BUSY_TIMEOUT_MS / 1000, isolation_level=None)
+    _tune(con, writable=False)
+    con.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone()
+    return con
+
+
+def connect_ro() -> sqlite3.Connection:
+    path = db_path()
+    if not path.exists():
+        raise ArbiterError(EXIT_STORAGE, f"state db 가 없다: {path}")
+    uri = _uri(path, "ro")
+    try:
+        con = _open_ro(uri)
+    except sqlite3.Error as first:
+        # WAL 인덱스(-shm)가 없으면 read-only 연결은 그것을 만들 수 없다. WAL 에 미반영
+        # 프레임이 없을 때만 immutable 읽기로 대체한다 — 프레임이 있으면 일관된 읽기가
+        # 불가능하므로 추측하지 말고 거부한다.
+        if not _wal_clean(path):
+            raise ArbiterError(
+                EXIT_STORAGE, f"state db 를 읽을 수 없다: {path}: {first}"
+            ) from first
+        try:
+            con = _open_ro(f"{uri}&immutable=1")
+        except sqlite3.Error as exc:
+            raise ArbiterError(EXIT_STORAGE, f"state db 를 읽을 수 없다: {path}: {exc}") from exc
+    _check_schema(con)
+    return con
+
+
+def _create_schema(con: sqlite3.Connection) -> None:
+    con.execute("BEGIN IMMEDIATE")
+    for statement in DDL:
+        con.execute(statement)
+    con.execute(
+        "INSERT INTO meta (id, schema_version, token_seq, created_at) VALUES (1, ?, 0, ?)",
+        (SCHEMA_VERSION, iso(now_dt())),
+    )
+    con.execute("COMMIT")
+
+
+def _check_schema(con: sqlite3.Connection) -> None:
+    try:
+        row = con.execute("SELECT schema_version FROM meta WHERE id = 1").fetchone()
+    except sqlite3.Error as exc:
+        raise ArbiterError(EXIT_STORAGE, f"schema 확인 실패(불일치로 간주): {exc}") from exc
+    if row is None:
+        raise ArbiterError(EXIT_STORAGE, "meta 행이 없다 — schema mismatch")
+    if int(row[0]) != SCHEMA_VERSION:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            f"schema mismatch: db={row[0]} expected={SCHEMA_VERSION}",
+        )
+
+
+def next_token(con: sqlite3.Connection) -> str:
+    """매 acquire 마다 새 값. 앞자리는 단조 증가 fencing 시퀀스."""
+    con.execute("UPDATE meta SET token_seq = token_seq + 1 WHERE id = 1")
+    seq = con.execute("SELECT token_seq FROM meta WHERE id = 1").fetchone()[0]
+    return f"{seq}-{secrets.token_hex(8)}"
+
+
+# --------------------------------------------------------------------- events
+
+
+def record_event(
+    con: sqlite3.Connection, job_id: str, kind: str, payload: dict, *, seq: int | None = None
+) -> int:
+    """events 행 + 인박스 artifact 를 한 트랜잭션 안에서 남긴다.
+
+    artifact 는 임시 파일에 쓴 뒤 atomic rename 으로 제출한다(부분 쓰기 소비 금지).
+    중복 소비는 DB 의 UNIQUE(job_id, seq) 가 막는다 — rename 은 그 뒤에만 일어난다.
+    """
+    if seq is None:
+        row = con.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        seq = int(row[0])
+    created_at = iso(now_dt())
+    body = json.dumps(
+        {"job_id": job_id, "seq": seq, "kind": kind, "payload": payload, "created_at": created_at},
+        ensure_ascii=False,
+        sort_keys=True,
+    )
+    try:
+        con.execute(
+            "INSERT INTO events (job_id, seq, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+            (job_id, seq, kind, body, created_at),
+        )
+    except sqlite3.IntegrityError as exc:
+        raise ArbiterError(
+            EXIT_DUPLICATE,
+            f"event 중복: job_id={job_id} seq={seq} 는 이미 존재한다",
+            job_id=job_id,
+            seq=seq,
+        ) from exc
+    _write_artifact(job_id, seq, kind, body)
+    return seq
+
+
+def _write_artifact(job_id: str, seq: int, kind: str, body: str) -> Path:
+    directory = inbox_root() / job_id / "events"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        safe_kind = re.sub(r"[^A-Za-z0-9._-]", "_", kind)
+        final = directory / f"{seq:05d}-{safe_kind}.json"
+        handle = tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=directory, prefix=".tmp-", suffix=".json", delete=False
+        )
+        try:
+            with handle:
+                handle.write(body + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(handle.name, final)
+        except BaseException:
+            try:
+                os.unlink(handle.name)
+            except OSError:
+                pass
+            raise
+        fd = os.open(directory, os.O_RDONLY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    except OSError as exc:
+        raise ArbiterError(EXIT_STORAGE, f"event artifact 를 제출할 수 없다: {exc}") from exc
+    return final
+
+
+# ------------------------------------------------------------------ scopefuel
+
+
+def scopefuel_bin() -> str:
+    explicit = os.environ.get("SCOPEFUEL_BIN") or ""
+    if explicit:
+        return explicit
+    found = shutil.which("scopefuel")
+    if not found:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            "scopefuel 을 찾을 수 없다 — quota pool 정본이 없으면 lease 를 발급하지 않는다",
+        )
+    return found
+
+
+def _run(argv: list[str]) -> subprocess.CompletedProcess:
+    try:
+        return subprocess.run(argv, capture_output=True, text=True)
+    except OSError as exc:
+        raise ArbiterError(EXIT_STORAGE, f"실행할 수 없다: {argv[0]}: {exc}") from exc
+
+
+def known_pools() -> set[str]:
+    """`scopefuel --json`(schema=scopefuel.v1) 이 pool 목록의 정본이다."""
+    proc = _run([scopefuel_bin(), "--json"])
+    if proc.returncode != 0:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            f"scopefuel --json 실패(exit {proc.returncode}): {proc.stderr.strip()}",
+        )
+    try:
+        payload = json.loads(proc.stdout)
+        providers = payload["providers"]
+        pools = {str(p["id"]) for p in providers}
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ArbiterError(EXIT_STORAGE, f"scopefuel --json 을 해석할 수 없다: {exc}") from exc
+    if not pools:
+        raise ArbiterError(EXIT_STORAGE, "scopefuel --json 에 provider 가 없다")
+    return pools
+
+
+def resolve_pool(profile: str, gate_output: str | None) -> str:
+    """profile → quota pool. 매핑 정본은 scopefuel 이며 arbiter 는 그것을 해석만 한다.
+
+    호출자(`wrk`)는 방금 통과한 `scopefuel gate` 의 stdout 을 `--gate-output` 으로 넘긴다
+    (게이트 재실행 없음). 직접 호출 시에는 arbiter 가 gate 를 한 번 실행해 같은 정본을 읽는다.
+    어느 경우든 wrk 에는 pool 매핑이 존재하지 않는다.
+    """
+    if gate_output is not None:
+        try:
+            text = sys.stdin.read() if gate_output == "-" else Path(gate_output).read_text("utf-8")
+        except OSError as exc:
+            raise ArbiterError(EXIT_STORAGE, f"gate output 을 읽을 수 없다: {exc}") from exc
+    else:
+        proc = _run([scopefuel_bin(), "gate", "-m", profile])
+        if proc.returncode != 0:
+            raise ArbiterError(
+                EXIT_DENIED,
+                f"scopefuel gate 거부(exit {proc.returncode}): {proc.stderr.strip()}",
+            )
+        text = proc.stdout
+
+    seen_profile = re.search(r"\bprofile=(\S+)", text)
+    if seen_profile and seen_profile.group(1) != profile:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            f"gate output 의 profile 이 다르다: {seen_profile.group(1)!r} != {profile!r}",
+        )
+    match = re.search(r"\bpool=(\S+)", text)
+    if not match:
+        raise ArbiterError(
+            EXIT_STORAGE, f"gate output 에서 pool 을 찾을 수 없다 (profile={profile})"
+        )
+    pool = match.group(1)
+    pools = known_pools()
+    if pool not in pools:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            f"pool {pool!r} 이 scopefuel --json 의 provider 목록에 없다 — 매핑 드리프트",
+        )
+    return pool
+
+
+# ---------------------------------------------------------------------- lease
+
+
+def _lease_row(con: sqlite3.Connection, resource: str, kind: str):
+    return con.execute(
+        "SELECT resource, kind, job_id, token, acquired_at, expires_at"
+        " FROM leases WHERE resource = ? AND kind = ?",
+        (resource, kind),
+    ).fetchone()
+
+
+def _archive(con: sqlite3.Connection, row, state: str, moment: dt.datetime) -> bool:
+    cur = con.execute(
+        "INSERT OR IGNORE INTO lease_history"
+        " (resource, kind, job_id, token, acquired_at, expires_at, state, recorded_at)"
+        " VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (row[0], row[1], row[2], row[3], row[4], row[5], state, iso(moment)),
+    )
+    return cur.rowcount > 0
+
+
+def _require_job(con: sqlite3.Connection, job_id: str) -> None:
+    row = con.execute("SELECT job_id FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if row is None:
+        raise ArbiterError(EXIT_DENIED, f"job 이 등록되지 않았다: {job_id} — 먼저 claim 하라")
+
+
+# ------------------------------------------------------------------- commands
+
+
+def cmd_claim(args: argparse.Namespace) -> dict:
+    con = connect_rw(bootstrap=True)
+    moment = now_dt()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        row = con.execute(
+            "SELECT owner_lane, state, t_level, created_at FROM jobs WHERE job_id = ?",
+            (args.job,),
+        ).fetchone()
+        if row is not None:
+            raise ArbiterError(
+                EXIT_DUPLICATE,
+                f"job 중복: {args.job} 은 이미 등록됐다"
+                f" (lane={row[0]} state={row[1]} t={row[2]} created_at={row[3]})",
+                job=args.job,
+                owner_lane=row[0],
+                state=row[1],
+                t_level=row[2],
+                created_at=row[3],
+            )
+        con.execute(
+            "INSERT INTO jobs (job_id, owner_lane, state, t_level, created_at, updated_at)"
+            " VALUES (?, ?, 'claimed', ?, ?, ?)",
+            (args.job, args.lane, args.t, iso(moment), iso(moment)),
+        )
+        seq = record_event(
+            con,
+            args.job,
+            "job.claim",
+            {"owner_lane": args.lane, "t_level": args.t},
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    return {
+        "ok": True,
+        "job": args.job,
+        "owner_lane": args.lane,
+        "t_level": args.t,
+        "state": "claimed",
+        "created_at": iso(moment),
+        "event_seq": seq,
+    }
+
+
+def cmd_lease(args: argparse.Namespace) -> dict:
+    if (args.resource is None) == (args.profile is None):
+        raise ArbiterError(EXIT_USAGE, "--resource 와 --profile 중 정확히 하나가 필요하다")
+    if args.profile is not None and args.kind != "quota_pool":
+        raise ArbiterError(EXIT_USAGE, "--profile 은 --kind quota_pool 에서만 쓴다")
+    if args.gate_output is not None and args.profile is None:
+        raise ArbiterError(EXIT_USAGE, "--gate-output 은 --profile 과 함께 쓴다")
+
+    resource = args.resource
+    resolved_from = "resource"
+    if args.profile is not None:
+        resource = resolve_pool(args.profile, args.gate_output)
+        resolved_from = f"scopefuel:{args.profile}"
+
+    ttl_min = DEFAULT_TTL_MIN[args.kind] if args.ttl_min is None else args.ttl_min
+    con = connect_rw()
+    moment = now_dt()
+    expires = moment + dt.timedelta(minutes=ttl_min)
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        _require_job(con, args.job)
+        held = _lease_row(con, resource, args.kind)
+        if held is not None and parse_iso(held[5]) > moment:
+            raise ArbiterError(
+                EXIT_DENIED,
+                f"lease 점유 중: {resource}/{args.kind} 는 job={held[2]} 가"
+                f" {held[5]} 까지 보유한다",
+                resource=resource,
+                kind=args.kind,
+                held_by=held[2],
+                expires_at=held[5],
+            )
+        if held is not None:
+            # 만료 세대는 감사 증거로 lease_history 에 보존한 뒤에만 덮어쓴다.
+            _archive(con, held, "superseded", moment)
+            con.execute("DELETE FROM leases WHERE resource = ? AND kind = ?", (resource, args.kind))
+        token = next_token(con)
+        con.execute(
+            "INSERT INTO leases (resource, kind, job_id, token, acquired_at, expires_at)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            (resource, args.kind, args.job, token, iso(moment), iso(expires)),
+        )
+        con.execute(
+            "UPDATE jobs SET state = 'leased', updated_at = ? WHERE job_id = ?",
+            (iso(moment), args.job),
+        )
+        seq = record_event(
+            con,
+            args.job,
+            "lease.acquire",
+            {
+                "resource": resource,
+                "kind": args.kind,
+                "resolved_from": resolved_from,
+                "token": mask_token(token),
+                "expires_at": iso(expires),
+                "superseded": None if held is None else held[2],
+            },
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    return {
+        "ok": True,
+        "job": args.job,
+        "resource": resource,
+        "kind": args.kind,
+        "resolved_from": resolved_from,
+        "token": token,
+        "acquired_at": iso(moment),
+        "expires_at": iso(expires),
+        "ttl_min": ttl_min,
+        "event_seq": seq,
+    }
+
+
+def cmd_release(args: argparse.Namespace) -> dict:
+    con = connect_rw()
+    moment = now_dt()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        if args.kind is not None:
+            rows = [r for r in [_lease_row(con, args.resource, args.kind)] if r is not None]
+        else:
+            rows = con.execute(
+                "SELECT resource, kind, job_id, token, acquired_at, expires_at"
+                " FROM leases WHERE resource = ?",
+                (args.resource,),
+            ).fetchall()
+        if not rows:
+            raise ArbiterError(
+                EXIT_FENCING,
+                f"반납할 lease 가 없다: {args.resource}"
+                + ("" if args.kind is None else f"/{args.kind}"),
+            )
+        if len(rows) > 1:
+            raise ArbiterError(
+                EXIT_USAGE,
+                f"{args.resource} 에 kind 가 {len(rows)}개다 — --kind 로 지정하라",
+            )
+        row = rows[0]
+        if row[2] != args.job or row[3] != args.token:
+            raise ArbiterError(
+                EXIT_FENCING,
+                f"stale owner 거부: {args.resource}/{row[1]} 의 현 소유자는"
+                f" job={row[2]} token={mask_token(row[3])} 이다",
+                resource=args.resource,
+                kind=row[1],
+                held_by=row[2],
+                held_token=mask_token(row[3]),
+            )
+        _archive(con, row, "released", moment)
+        con.execute("DELETE FROM leases WHERE resource = ? AND kind = ?", (row[0], row[1]))
+        con.execute(
+            "UPDATE jobs SET state = 'released', updated_at = ? WHERE job_id = ?",
+            (iso(moment), args.job),
+        )
+        seq = record_event(
+            con,
+            args.job,
+            "lease.release",
+            {"resource": row[0], "kind": row[1], "token": mask_token(row[3])},
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    return {
+        "ok": True,
+        "job": args.job,
+        "resource": row[0],
+        "kind": row[1],
+        "released_at": iso(moment),
+        "event_seq": seq,
+    }
+
+
+def cmd_gc(args: argparse.Namespace) -> dict:
+    con = connect_rw()
+    moment = now_dt()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        rows = con.execute(
+            "SELECT resource, kind, job_id, token, acquired_at, expires_at FROM leases"
+        ).fetchall()
+        expired = [r for r in rows if parse_iso(r[5]) <= moment]
+        transitions = []
+        for row in expired:
+            # 행을 지우지 않는다. 만료는 상태 전이(감사)로만 기록한다.
+            if _archive(con, row, "expired", moment):
+                record_event(
+                    con,
+                    row[2],
+                    "lease.expire",
+                    {"resource": row[0], "kind": row[1], "expires_at": row[5]},
+                )
+                transitions.append(
+                    {"resource": row[0], "kind": row[1], "job": row[2], "expires_at": row[5]}
+                )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    return {
+        "ok": True,
+        "checked": len(rows),
+        "expired": len(expired),
+        "transitioned": transitions,
+        "retained": len(rows),
+    }
+
+
+def cmd_status(args: argparse.Namespace) -> dict:
+    if args.job is not None and args.lane is not None:
+        raise ArbiterError(EXIT_USAGE, "--job 과 --lane 은 함께 쓸 수 없다")
+    con = connect_ro()
+    moment = now_dt()
+    if args.job is not None:
+        jobs = con.execute(
+            "SELECT job_id, owner_lane, state, t_level, created_at, updated_at"
+            " FROM jobs WHERE job_id = ? ORDER BY job_id",
+            (args.job,),
+        ).fetchall()
+    elif args.lane is not None:
+        jobs = con.execute(
+            "SELECT job_id, owner_lane, state, t_level, created_at, updated_at"
+            " FROM jobs WHERE owner_lane = ? ORDER BY job_id",
+            (args.lane,),
+        ).fetchall()
+    else:
+        jobs = con.execute(
+            "SELECT job_id, owner_lane, state, t_level, created_at, updated_at"
+            " FROM jobs ORDER BY job_id"
+        ).fetchall()
+    job_ids = {r[0] for r in jobs}
+    leases = con.execute(
+        "SELECT resource, kind, job_id, token, acquired_at, expires_at"
+        " FROM leases ORDER BY resource, kind"
+    ).fetchall()
+    history = con.execute(
+        "SELECT resource, kind, job_id, token, acquired_at, expires_at, state, recorded_at"
+        " FROM lease_history ORDER BY id"
+    ).fetchall()
+    scoped = args.job is not None or args.lane is not None
+    if scoped:
+        leases = [r for r in leases if r[2] in job_ids]
+        history = [r for r in history if r[2] in job_ids]
+    return {
+        "ok": True,
+        "now": iso(moment),
+        "db": str(db_path()),
+        "jobs": [
+            {
+                "job": r[0],
+                "owner_lane": r[1],
+                "state": r[2],
+                "t_level": r[3],
+                "created_at": r[4],
+                "updated_at": r[5],
+            }
+            for r in jobs
+        ],
+        "leases": [
+            {
+                "resource": r[0],
+                "kind": r[1],
+                "job": r[2],
+                "token": mask_token(r[3]),
+                "acquired_at": r[4],
+                "expires_at": r[5],
+                "expired": parse_iso(r[5]) <= moment,
+            }
+            for r in leases
+        ],
+        "history": [
+            {
+                "resource": r[0],
+                "kind": r[1],
+                "job": r[2],
+                "token": mask_token(r[3]),
+                "acquired_at": r[4],
+                "expires_at": r[5],
+                "state": r[6],
+                "recorded_at": r[7],
+            }
+            for r in history
+        ],
+    }
+
+
+def cmd_event(args: argparse.Namespace) -> dict:
+    con = connect_rw()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        _require_job(con, args.job)
+        payload = {"note": args.payload} if args.payload is not None else {}
+        seq = record_event(con, args.job, args.kind, payload, seq=args.seq)
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    return {
+        "ok": True,
+        "job": args.job,
+        "seq": seq,
+        "kind": args.kind,
+        "artifact": str(inbox_root() / args.job / "events"),
+    }
+
+
+# ------------------------------------------------------------------- rendering
+
+
+def render_text(command: str, result: dict) -> str:
+    if command == "status":
+        lines = [f"now={result['now']} db={result['db']}"]
+        lines.append(f"jobs={len(result['jobs'])}")
+        for job in result["jobs"]:
+            lines.append(
+                f"  job={job['job']} lane={job['owner_lane']} state={job['state']}"
+                f" t={job['t_level']} updated_at={job['updated_at']}"
+            )
+        lines.append(f"leases={len(result['leases'])}")
+        for lease in result["leases"]:
+            flag = "expired" if lease["expired"] else "active"
+            lines.append(
+                f"  {lease['resource']}/{lease['kind']} job={lease['job']}"
+                f" token={lease['token']} expires_at={lease['expires_at']} [{flag}]"
+            )
+        lines.append(f"history={len(result['history'])}")
+        for item in result["history"]:
+            lines.append(
+                f"  {item['resource']}/{item['kind']} job={item['job']}"
+                f" token={item['token']} state={item['state']} recorded_at={item['recorded_at']}"
+            )
+        return "\n".join(lines)
+    if command == "gc":
+        lines = [
+            f"checked={result['checked']} expired={result['expired']}"
+            f" transitioned={len(result['transitioned'])} retained={result['retained']}"
+        ]
+        for item in result["transitioned"]:
+            lines.append(
+                f"  {item['resource']}/{item['kind']} job={item['job']}"
+                f" expires_at={item['expires_at']} -> expired"
+            )
+        return "\n".join(lines)
+    return " ".join(f"{k}={v}" for k, v in result.items() if k != "ok")
+
+
+# ------------------------------------------------------------------------ cli
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="job admission control — 누가 무엇을 점유했나 (wrk → arbiter → scopefuel)",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="기계 판독 JSON 출력")
+
+    claim = sub.add_parser("claim", parents=[common], help="job 등록(중복이면 거부). 유일한 DB 초기화 경로")
+    claim.add_argument("--job", required=True, help="job id")
+    claim.add_argument("--lane", required=True, help="owner lane")
+    claim.add_argument("--t", required=True, choices=T_LEVELS, help="규모 등급")
+
+    lease = sub.add_parser("lease", parents=[common], help="원자적 lease 획득. 성공 시 token 출력")
+    lease.add_argument("--job", required=True, help="job id")
+    lease.add_argument("--resource", help="자원 이름 (--profile 과 택일)")
+    lease.add_argument(
+        "--profile", help="scopefuel 프로필 — quota pool 을 scopefuel 정본으로 해석한다"
+    )
+    lease.add_argument(
+        "--gate-output",
+        help="이미 통과한 `scopefuel gate` stdout 파일('-' 는 stdin). 게이트를 재실행하지 않는다",
+    )
+    lease.add_argument("--kind", required=True, choices=KINDS, help="lease 종류")
+    lease.add_argument(
+        "--ttl-min",
+        type=int,
+        help=f"TTL(분). 기본: {', '.join(f'{k}={v}' for k, v in DEFAULT_TTL_MIN.items())}",
+    )
+
+    release = sub.add_parser("release", parents=[common], help="lease 반납. token 불일치면 거부")
+    release.add_argument("--job", required=True, help="job id")
+    release.add_argument("--resource", required=True, help="자원 이름")
+    release.add_argument("--token", required=True, help="획득 시 발급된 fencing token")
+    release.add_argument("--kind", choices=KINDS, help="같은 resource 에 kind 가 여럿일 때만 필요")
+
+    status = sub.add_parser("status", parents=[common], help="현황(읽기 전용, mode=ro)")
+    status.add_argument("--job", help="job 으로 좁히기")
+    status.add_argument("--lane", help="lane 으로 좁히기")
+
+    sub.add_parser("gc", parents=[common], help="만료 lease 상태 전이(삭제하지 않는다)")
+
+    event = sub.add_parser("event", parents=[common], help="job event 제출(atomic rename)")
+    event.add_argument("--job", required=True, help="job id")
+    event.add_argument("--kind", required=True, help="event 종류")
+    event.add_argument("--payload", help="자유 텍스트 payload")
+    event.add_argument("--seq", type=int, help="명시 seq — 중복이면 거부된다")
+
+    return parser
+
+
+HANDLERS = {
+    "claim": cmd_claim,
+    "lease": cmd_lease,
+    "release": cmd_release,
+    "status": cmd_status,
+    "gc": cmd_gc,
+    "event": cmd_event,
+}
+
+
+def main(argv: list[str]) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    as_json = bool(getattr(args, "json", False))
+    try:
+        if getattr(args, "ttl_min", None) is not None and args.ttl_min < 0:
+            raise ArbiterError(EXIT_USAGE, "--ttl-min 은 0 이상이어야 한다")
+        result = HANDLERS[args.command](args)
+    except ArbiterError as exc:
+        if as_json:
+            print(
+                json.dumps(
+                    {"ok": False, "code": exc.code, "error": exc.message, **exc.detail},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+        print(f"{PROG}: {exc.message}", file=sys.stderr)
+        return exc.code
+    except sqlite3.Error as exc:
+        print(f"{PROG}: sqlite 오류(fail-closed): {exc}", file=sys.stderr)
+        return EXIT_STORAGE
+    except OSError as exc:
+        print(f"{PROG}: 저장소 접근 오류(fail-closed): {exc}", file=sys.stderr)
+        return EXIT_STORAGE
+    if as_json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print(render_text(args.command, result))
+    return EXIT_OK
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

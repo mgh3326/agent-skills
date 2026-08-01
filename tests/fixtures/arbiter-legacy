@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# ROB-1199 fixture: an arbiter old enough to predate the lease subcommand.
+# Stands in for the installation transition wrk must tolerate with a warning.
+set -euo pipefail
+
+case "${1:-}" in
+  claim|status)
+    echo '{"ok":true}'
+    ;;
+  *)
+    echo "usage: arbiter [-h] {claim,status} ..." >&2
+    echo "arbiter: error: argument command: invalid choice: '${1:-}' (choose from 'claim', 'status')" >&2
+    exit 2
+    ;;
+esac
