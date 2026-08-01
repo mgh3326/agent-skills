@@ -39,6 +39,9 @@ rob-lookup --count          # 쿼타 미터 = active(non-archived) 카운트
    ledger·journal·approval·preflight·reconciliation·watch·TradingAgents·Decision Session·mock·
    canary·audit·Prefect`
 6. **recency frontier 미만** — 최근 완료분은 보드에 잠깐 유지
+   🔴 **stale backlog 를 Canceled 로 닫은 건은 예외다.** 닫는 순간 `updatedAt` 이 지금으로
+   갱신돼 60일 방치분도 "최근 것"으로 잡힌다(2026-08-01 실측). 이 경우 **닫기 전의 방치
+   기간**으로 판정하라 — 선별을 닫기 **전에** 끝내고 ID 목록을 고정한 뒤 닫는 것이 안전하다.
 
 **제외 대상**: 모든 open 상태(Backlog·Todo·In Progress·In Review), 자식 가진 parent/epic/
 roadmap/sprint anchor, active PR 참조 중인 것.
@@ -98,3 +101,7 @@ ERROR 처리 후 계속한다. 키는 스크립트가 `~/.config/linear/api-key`
 - **2026-07-17**: 43/43 삭제, 240→197 정확 일치. canary=ROB-800.
 - **2026-07-29**: ROB-383(06-16 삭제분)이 Linear 에서 **purge 확인** → "delete 도 복구 가능"은
   30일 한정. Obsidian export 가 유일 영구 소스임이 확정됨.
+- **2026-08-01 (이 스킬 첫 실전)**: 257(한도 초과) → 닫힌 이슈가 30건뿐이고 그중 18건이 당일
+  작업분이라 후보 3건에 그침 → **압박 원인이 닫힌 이슈가 아니라 30일+ 방치 Backlog 26건**임을
+  확인. 15건을 Canceled 로 닫고 기존 4건과 함께 19건 export → canary(ROB-331) → 삭제.
+  **257 → 238.** 이때 §2-6 의 `updatedAt` 함정이 드러났다(닫자마자 전부 recency 에 걸림).
