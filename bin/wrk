@@ -5,13 +5,51 @@ set -euo pipefail
 HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
 SCOPEFUEL="${SCOPEFUEL_BIN:-}"
 
+# 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
+# scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
+ALL_PROFILES=(
+  opus sonnet sonnet-med fable claudex
+  codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
+  codex codex-sol codex-max
+  kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
+  kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
+  kiro-sol-xhigh kiro-sol-max
+  oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-gflash oc-sonnet46 oc-oss oc-omni
+  grok grok-hi grok-med
+)
+
+profiles_help() {
+  cat <<'USAGE'
+Usage: wrk profiles
+
+Print every model profile name resolve_profile() accepts, one per line
+(machine-readable; excludes retired agy-* aliases). Used for
+scopefuel-vs-wrk cross-validation (every scopefuel-recommended profile
+must be spawnable here).
+  -h, --help   show this usage
+USAGE
+}
+
+profiles_cmd() {
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+      [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+      profiles_help
+      return 0
+    fi
+    die "unexpected argument '$1'"
+  fi
+  printf '%s\n' "${ALL_PROFILES[@]}"
+}
+
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|find|name-sync> [options]
+Usage: wrk <spawn|find|name-sync|profiles> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL [-L live|mock] [--effort LEVEL]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
+  wrk profiles
 
 Run 'wrk <command> --help' for command-specific usage.
 USAGE
@@ -29,7 +67,7 @@ Options:
 
 Canonical codex profiles: codex-terra, codex-luna, codex-sol.
 Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
-codex-luna-ultra, codex-max, codex-terra-max, codex-ultra.
+codex-luna-max, codex-max, codex-terra-max.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
 USAGE
@@ -112,13 +150,12 @@ resolve_profile() {
     codex-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
     codex-luna-hi) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    codex-luna-ultra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=ultra; EFFORT_SUPPORTED=1 ;;
+    codex-luna-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex|codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    codex-ultra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=ultra; EFFORT_SUPPORTED=1 ;;
 
     kiro) PROFILE_KIND=kiro; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    kiro-opus) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    kiro-opus) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
     kiro-sonnet) PROFILE_KIND=kiro; PROFILE_MODEL=claude-sonnet-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     kiro-sol) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     kiro-luna) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
@@ -140,6 +177,7 @@ resolve_profile() {
     oc-gflash) PROFILE_KIND=opencode; ARGS=(--auto --model cliproxy/gemini-3.6-flash-high) ;;
     oc-sonnet46) PROFILE_KIND=opencode; ARGS=(--auto --model cliproxy/claude-sonnet-4-6) ;;
     oc-oss) PROFILE_KIND=opencode; ARGS=(--auto --model cliproxy/gpt-oss-120b-medium) ;;
+    oc-omni) PROFILE_KIND=opencode; ARGS=(--auto --model omniroute/auto/coding) ;;
 
     grok|grok-hi) PROFILE_KIND=grok; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     grok-med) PROFILE_KIND=grok; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
@@ -156,16 +194,16 @@ resolve_profile() {
     opus) GATE_PROFILE=opus ;;
     sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
     fable) GATE_PROFILE=fable ;;
-    claudex|codex|codex-sol|codex-max|codex-ultra) GATE_PROFILE=codex-max ;;
+    claudex|codex|codex-sol|codex-max) GATE_PROFILE=codex-max ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
-    codex-luna|codex-luna-hi|codex-luna-ultra) GATE_PROFILE=codex-luna-ultra ;;
+    codex-luna|codex-luna-hi|codex-luna-max) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
     kiro-sonnet) GATE_PROFILE=kiro-sonnet ;;
     kiro-cheap) GATE_PROFILE=kiro-cheap ;;
     kiro-haiku) GATE_PROFILE=kiro-haiku ;;
     kiro|kiro-sol|kiro-luna|kiro-glm|kiro-deepseek|kiro-minimax|kiro-minimax21|kiro-sol-xhigh|kiro-sol-max)
       GATE_PROFILE=kiro-sol ;;
-    oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss)
+    oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni)
       GATE_PROFILE="$MODEL" ;;
     grok|grok-hi|grok-med) GATE_PROFILE=grok-hi ;;
   esac
@@ -417,6 +455,7 @@ case "${1:-}" in
   spawn) shift; spawn_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
+  profiles) shift; profiles_cmd "$@" ;;
   "") usage >&2; exit 2 ;;
   *) die "unknown command '$1' (see 'wrk --help')" ;;
 esac

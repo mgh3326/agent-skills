@@ -28,9 +28,19 @@ spawn_base() {
 "$WRK" spawn --help >/dev/null
 "$WRK" find --help >/dev/null
 "$WRK" name-sync --help >/dev/null
+"$WRK" profiles --help >/dev/null
+run_fail "$WRK" profiles --bogus
 run_fail "$WRK" spawn -c "$ROOT" -p "$PROMPT" -w w -l fixture
 run_fail "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --bogus
 run_fail "$WRK" nope
+
+# ROB-1190 ④-2: wrk profiles — 기계 판독 가능한 프로필 목록. oc-omni 가 포함돼야 한다
+# (드리프트 방지: scopefuel 이 추천하는데 wrk 가 못 띄우는 상태 방지).
+profiles_out="$("$WRK" profiles)"
+grep -qx 'oc-omni' <<<"$profiles_out"
+grep -qx 'codex-terra-max' <<<"$profiles_out"
+! grep -qx 'codex-ultra' <<<"$profiles_out"
+! grep -qx 'codex-luna-ultra' <<<"$profiles_out"
 
 name_out="$(WRK_FIXTURE_SCENARIO=find-name HERDR_BIN="$HERDR" "$WRK" find orch)"
 grep -q 'pane_id=w:p1' <<<"$name_out"
@@ -65,9 +75,9 @@ grep -q 'model=codex-terra' <<<"$canonical_out"
 profiles=(
   "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "fable:fable" "claudex:codex-max"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
-  "codex-luna:codex-luna-ultra" "codex-luna-hi:codex-luna-ultra"
-  "codex-max:codex-max" "codex-ultra:codex-max" "codex-terra:codex-terra-max"
-  "codex-terra-max:codex-terra-max" "codex-luna-ultra:codex-luna-ultra"
+  "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
+  "codex-max:codex-max" "codex-terra:codex-terra-max"
+  "codex-terra-max:codex-terra-max" "codex-luna-max:codex-luna-max"
   "kiro:kiro-sol" "kiro-opus:kiro-opus" "kiro-sonnet:kiro-sonnet"
   "kiro-sol:kiro-sol" "kiro-luna:kiro-sol" "kiro-cheap:kiro-cheap"
   "kiro-glm:kiro-sol" "kiro-deepseek:kiro-sol" "kiro-minimax:kiro-sol"
@@ -76,7 +86,7 @@ profiles=(
   "kiro-sol-xhigh:kiro-sol" "kiro-sol-max:kiro-sol"
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
-  "oc-oss:oc-oss" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi"
+  "oc-oss:oc-oss" "oc-omni:oc-omni" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi"
 )
 for pair in "${profiles[@]}"; do
   runtime="${pair%%:*}"
@@ -89,6 +99,14 @@ done
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
+
+# ROB-1188/ROB-1190 ③-1: ultra 폐기 — codex-ultra/codex-luna-ultra 는 이제 unknown profile.
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  "$WRK" spawn -c "$ROOT" -m codex-ultra -p "$PROMPT" -w w -l fixture
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  "$WRK" spawn -c "$ROOT" -m codex-luna-ultra -p "$PROMPT" -w w -l fixture
 
 : >"$TMP/herdr.log"
 spawn_base codex-med >/dev/null
@@ -104,6 +122,10 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kiro-sol -p "$PROMPT" -w w -l fixture --effort ultra
 : >"$TMP/herdr.log"
 spawn_base oc-kimi-code >/dev/null
+grep -q 'send-keys w:p1 return' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base oc-omni >/dev/null
+grep -q -- '--model omniroute/auto/coding' "$TMP/herdr.log"
 grep -q 'send-keys w:p1 return' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base claudex >/dev/null
@@ -141,4 +163,25 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$TMP/non-executable-scopefuel" WR
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture
 
 grep -q 'for tool in "$REPO_DIR"/bin/\*' "$ROOT/install.sh"
+
+# ROB-1190 ④-3: scopefuel 이 추천하는 모든 프로필 ⊆ wrk 가 띄울 수 있는 프로필.
+# WRK_TEST_SCOPEFUEL_SRC 로 scopefuel worktree 경로를 주면 uv run 으로 실제 GRADE_TABLE 을
+# 조회해 대조한다(둘 다 로컬에 있을 때만 — 없으면 스킵, CI 이식성 유지).
+if [[ -n "${WRK_TEST_SCOPEFUEL_SRC:-}" ]] && command -v uv >/dev/null 2>&1; then
+  scopefuel_profiles="$(cd "$WRK_TEST_SCOPEFUEL_SRC" && uv run scopefuel --list-recommend-profiles 2>/dev/null)"
+  wrk_profiles="$("$WRK" profiles)"
+  missing=0
+  while IFS= read -r p; do
+    [[ -z "$p" ]] && continue
+    if ! grep -qx "$p" <<<"$wrk_profiles"; then
+      echo "cross-check FAIL: scopefuel recommends '$p' but wrk cannot spawn it" >&2
+      missing=1
+    fi
+  done <<<"$scopefuel_profiles"
+  [[ "$missing" -eq 0 ]]
+  echo "PASS scopefuel-recommends-subset-of-wrk-profiles"
+else
+  echo "SKIP scopefuel⊆wrk cross-check (set WRK_TEST_SCOPEFUEL_SRC + uv to enable)"
+fi
+
 echo 'PASS test-wrk'
