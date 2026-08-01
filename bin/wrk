@@ -62,12 +62,14 @@ Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL [-L live|m
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
   -L live|mock       select lane; mock requires MOCK_MCP_PROFILE
-  --effort LEVEL     override codex/Kiro/Grok profile effort
+  --effort LEVEL     override codex/Kiro/Grok/Claude(opus,sonnet) profile effort
   -h, --help         show this usage
 
 Canonical codex profiles: codex-terra, codex-luna, codex-sol.
 Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
 codex-luna-max, codex-max, codex-terra-max.
+Claude effort wiring (ROB-1191): opus default=xhigh, sonnet/sonnet-med default=high.
+fable/claudex do not accept --effort in this scope.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
 USAGE
@@ -141,8 +143,10 @@ resolve_profile() {
   ARGS=()
 
   case "$MODEL" in
-    opus) PROFILE_KIND=claude; ARGS=(--model opus --dangerously-skip-permissions) ;;
-    sonnet|sonnet-med) PROFILE_KIND=claude; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
+    # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
+    # Defaults align with scopefuel Profile.benchmark_effort (opus=xhigh, sonnet=high).
+    opus) PROFILE_KIND=claude; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
+    sonnet|sonnet-med) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
     claudex) PROFILE_KIND=claude; ARGS=(--model gpt-5.6-sol --dangerously-skip-permissions) ;;
 
@@ -225,6 +229,12 @@ resolve_profile() {
       ARGS+=(--effort "$EFFECTIVE_EFFORT")
       ;;
     grok) ARGS=(--always-approve -m grok-4.5 --effort "$EFFECTIVE_EFFORT") ;;
+    claude)
+      # Append only for effort-capable Claude profiles (opus/sonnet). fable/claudex stay bare.
+      if [[ "$EFFORT_SUPPORTED" -eq 1 && -n "$EFFECTIVE_EFFORT" ]]; then
+        ARGS+=(--effort "$EFFECTIVE_EFFORT")
+      fi
+      ;;
   esac
 }
 

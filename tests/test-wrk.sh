@@ -120,6 +120,38 @@ grep -q -- '--effort low' "$TMP/herdr.log"
 grep -q '/effort low' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kiro-sol -p "$PROMPT" -w w -l fixture --effort ultra
+
+# ROB-1191 ⑥: Claude opus/sonnet effort wiring via CLI argv (settings.json never written).
+SETTINGS_PATH="${HOME}/.claude/settings.json"
+if [[ -f "$SETTINGS_PATH" ]]; then
+  SETTINGS_SHA_BEFORE="$(shasum -a 256 "$SETTINGS_PATH" | awk '{print $1}')"
+else
+  SETTINGS_SHA_BEFORE=""
+fi
+: >"$TMP/herdr.log"
+spawn_base opus --effort xhigh >/dev/null
+grep -q -- '--effort xhigh' "$TMP/herdr.log"
+grep -q -- '--model opus' "$TMP/herdr.log"
+# Default effort for opus is xhigh even without override.
+: >"$TMP/herdr.log"
+spawn_base opus >/dev/null
+grep -q -- '--effort xhigh' "$TMP/herdr.log"
+# sonnet default=high; override works; fable/claudex still reject --effort
+: >"$TMP/herdr.log"
+spawn_base sonnet >/dev/null
+grep -q -- '--effort high' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base sonnet --effort medium >/dev/null
+grep -q -- '--effort medium' "$TMP/herdr.log"
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m fable -p "$PROMPT" -w w -l fixture --effort high
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m claudex -p "$PROMPT" -w w -l fixture --effort high
+if [[ -n "$SETTINGS_SHA_BEFORE" ]]; then
+  SETTINGS_SHA_AFTER="$(shasum -a 256 "$SETTINGS_PATH" | awk '{print $1}')"
+  [[ "$SETTINGS_SHA_BEFORE" == "$SETTINGS_SHA_AFTER" ]]
+fi
+
 : >"$TMP/herdr.log"
 spawn_base oc-kimi-code >/dev/null
 grep -q 'send-keys w:p1 return' "$TMP/herdr.log"
