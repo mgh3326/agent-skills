@@ -38,7 +38,7 @@
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
 | `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정). `wrk --help` 로 전체 확인 |
 | `wrk` | `spawn`·`find`·`name-sync` 통합 CLI — 명시 모델 스폰, 이름/라벨 조회, 탭 라벨 동기화 |
-| `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(fencing token 붙은 원자적 점유·반납) · `status`(읽기 전용) · `gc`(만료 상태 전이) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
+| `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(path·linear_permit의 fencing lease + quota_pool의 비배타 실행 기록) · `status`(읽기 전용) · `gc`(배타 lease 만료 전이 + herdr 목록 대조 stale 기록 정리) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
 
 ## 의존 도구
 
@@ -76,11 +76,12 @@ arbiter     작업 조정        "누가 점유했나"
 ```
 
 호출 방향은 `wrk → arbiter → scopefuel --json` 한 방향이다. `wrk spawn`은 `scopefuel gate`
-통과 직후 arbiter로 job을 claim하고 quota pool을 lease한다 — **pool 매핑은 wrk에 없다.**
+통과 직후 arbiter로 job을 claim하고 quota pool 실행 기록을 남긴다 — **pool 매핑은 wrk에 없다.**
 arbiter가 scopefuel이 내놓은 gate 출력에서 pool을 읽고 `scopefuel --json`의 provider 목록과
-대조한다. 획득 실패는 스폰 거부(exit 3), 스폰 실패는 lease 반납이다. arbiter가 아예 없거나
-`lease` 서브커맨드를 모르는 **설치 과도기만** 경고 후 진행하고, 그 밖의 오류(실행 불가·DB·
-스키마·lease)는 전부 fail-closed다. 우회 플래그는 만들지 않는다.
+대조한다. 배타 lease 획득 실패는 스폰 거부(exit 3)이고, quota_pool 기록 실패는 경고 후
+진행한다. 스폰 실패 시 quota_pool 기록은 반납한다. arbiter가 아예 없거나 `lease`
+서브커맨드를 모르는 **설치 과도기만** 경고 후 진행하고, 그 밖의 오류(실행 불가·DB·
+스키마·배타 lease)는 전부 fail-closed다. 우회 플래그는 만들지 않는다.
 
 ## 설계 원칙
 

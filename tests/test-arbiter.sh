@@ -14,6 +14,7 @@ export XDG_DATA_HOME="$TMP/xdg"
 export ARBITER_INBOX_ROOT="$TMP/inbox"
 export SCOPEFUEL_BIN="$SCOPEFUEL"
 DB="$XDG_DATA_HOME/arbiter/state.db"
+"$SCOPEFUEL" gate -m codex-max >"$TMP/gate.out"
 
 pass() { echo "PASS $*"; }
 fail() { echo "FAIL $*" >&2; exit 1; }
@@ -48,7 +49,7 @@ restore_db() { cp "$TMP/good.db" "$DB"; rm -f "$DB-wal" "$DB-shm"; }
 # ---------------------------------------------------------------- ⑤ fail-closed
 # DB 없음: bootstrap 이 허용된 claim 을 뺀 모든 경로는 비-0 로 거부한다.
 expect_rc 6 status
-expect_rc 6 lease --job j --resource pool --kind quota_pool
+expect_rc 6 lease --job j --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 expect_rc 6 gc
 expect_rc 6 release --job j --resource pool --token t
 expect_rc 6 event --job j --kind note
@@ -160,10 +161,9 @@ assert delta == dt.timedelta(minutes=want), (d, delta)
 assert d["ttl_min"] == want, d
 PY
 }
-check_ttl quota_pool 90
 check_ttl path 90
 check_ttl linear_permit 30
-pass "default TTL: quota_pool=90m, path=90m, linear_permit=30m"
+pass "default TTL: path=90m, linear_permit=30m; quota_pool has no TTL"
 
 # ------------------------------------------------- ⑨ event artifact + duplicate
 "$ARBITER" claim --job ev --lane live --t T1 >/dev/null
@@ -190,11 +190,37 @@ pass "⑨ events for an unclaimed job are refused"
 "$SCOPEFUEL" gate -m codex-max >"$TMP/gate.out"
 run lease --job pool-a --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out" --json
 [[ "$RC" -eq 0 ]] || fail "profile lease failed: $ERR"
-[[ "$(jget resource <<<"$OUT")" == "codex" ]] || fail "profile did not resolve to the scopefuel pool"
+[[ "$(jget pool <<<"$OUT")" == "codex" ]] || fail "profile did not resolve to the scopefuel pool"
+[[ "$(jget profile <<<"$OUT")" == "codex-max" ]] || fail "profile was not recorded"
 [[ "$(jget resolved_from <<<"$OUT")" == "scopefuel:codex-max" ]] || fail "resolution provenance missing"
 pass "quota pool resolved from scopefuel output, not from a wrk-side mapping"
 
 "$ARBITER" claim --job pool-b --lane live --t T1 >/dev/null
+expect_rc 0 lease --job pool-b --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+pycheck "$("$ARBITER" status --json)" <<'PY' || fail "same quota pool did not record two jobs"
+import json, sys
+d = json.load(sys.stdin)
+rows = [r for r in d["quota_pool_records"] if r["pool"] == "codex"]
+assert {r["job_id"] for r in rows} >= {"pool-a", "pool-b"}, d
+assert all(set(r) == {"job_id", "pool", "profile", "started_at"} for r in rows), rows
+PY
+pass "quota_pool is non-exclusive: two jobs record the same pool successfully"
+
+"$ARBITER" claim --job pool-c --lane live --t T1 >/dev/null
+"$ARBITER" claim --job pool-d --lane live --t T1 >/dev/null
+for job in pool-c pool-d; do
+  (
+    set +e
+    "$ARBITER" lease --job "$job" --kind quota_pool --profile codex-max \
+      --gate-output "$TMP/gate.out" --json >"$TMP/$job.out" 2>&1
+    echo $? >"$TMP/$job.rc"
+  ) &
+done
+wait
+[[ "$(cat "$TMP/pool-c.rc")" -eq 0 && "$(cat "$TMP/pool-d.rc")" -eq 0 ]] \
+  || fail "concurrent quota_pool records did not both succeed"
+pass "concurrent jobs can both record the same quota_pool"
+
 printf 'gate allowed profile=codex-max\n' >"$TMP/nopool.out"
 expect_rc 6 lease --job pool-b --kind quota_pool --profile codex-max --gate-output "$TMP/nopool.out"
 "$SCOPEFUEL" gate -m opus >"$TMP/other.out"
@@ -212,6 +238,41 @@ expect_rc 2 lease --job pool-b --kind path --profile codex-max
 expect_rc 2 lease --job pool-b --kind quota_pool
 expect_rc 2 lease --job pool-b --kind quota_pool --resource codex --profile codex-max
 pass "lease usage errors are rejected (exit 2), never guessed"
+
+# ------------------------------------------------------ quota record lifecycle
+"$ARBITER" claim --job quota-live --lane live --t T1 >/dev/null
+"$ARBITER" claim --job quota-dead --lane live --t T1 >/dev/null
+expect_rc 0 lease --job quota-live --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+expect_rc 0 lease --job quota-dead --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+printf '%s\n' '{"result":{"agents":[{"name":"pool-a","agent_status":"working"},{"name":"pool-b","agent_status":"working"},{"name":"pool-c","agent_status":"working"},{"name":"pool-d","agent_status":"working"},{"name":"quota-live","agent_status":"working"}]}}' >"$TMP/agents.json"
+run gc --herdr-agent-list "$TMP/agents.json" --json
+[[ "$RC" -eq 0 ]] || fail "stale quota cleanup failed: $ERR"
+pycheck "$OUT" <<'PY' || fail "stale cleanup did not report the dead job"
+import json, sys
+d = json.load(sys.stdin)
+assert [r["job_id"] for r in d["stale_quota_pool"]] == ["quota-dead"], d
+PY
+pycheck "$("$ARBITER" status --json)" <<'PY' || fail "stale quota record remains"
+import json, sys
+d = json.load(sys.stdin)
+assert {r["job_id"] for r in d["quota_pool_records"]} >= {"pool-a", "pool-b", "quota-live"}, d
+assert "quota-dead" not in {r["job_id"] for r in d["quota_pool_records"]}, d
+PY
+[[ -f "$ARBITER_INBOX_ROOT/quota-dead/events/00003-quota_pool.stale_cleanup.json" ]] \
+  || fail "stale cleanup event artifact missing"
+expect_rc 0 release --job quota-live --resource codex --kind quota_pool
+pass "normal quota release and herdr-list stale cleanup leave event evidence"
+
+# ------------------------------------------------------------ ⑤ forced release
+"$ARBITER" claim --job force --lane live --t T1 >/dev/null
+force_token="$("$ARBITER" lease --job force --resource forced --kind path --json | jget token)"
+run release --force --job force --resource forced --kind path --json
+[[ "$RC" -eq 0 ]] || fail "forced release failed: $ERR"
+[[ "$(jget forced <<<"$OUT")" == "True" ]] || fail "forced release did not report forced=true"
+[[ -f "$ARBITER_INBOX_ROOT/force/events/00003-lease.release.force.json" ]] \
+  || fail "forced release event artifact missing"
+expect_rc 5 release --job force --resource forced --kind path --token "$force_token"
+pass "release --force bypasses fencing only with a force event"
 
 # ------------------------------------------------------- ⑧ read-only status
 "$ARBITER" status >/dev/null

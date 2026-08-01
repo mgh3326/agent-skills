@@ -8,14 +8,16 @@
 
 저장소는 `$XDG_DATA_HOME/arbiter/state.db` 로 scopefuel 의 bench.db 와 완전히 분리한다.
 
-fail-closed 가 핵심 요구사항이다. lease 획득 실패·DB 접근 실패·스키마 불일치는 전부
-비-0 exit 이며, "일단 통과"하는 경로는 존재하지 않는다(우회 플래그도 만들지 않는다).
+fail-closed 가 핵심 요구사항이다. 배타 lease 획득 실패·quota_pool 기록 실패·DB 접근 실패·
+스키마 불일치는 전부 비-0 exit 이며, "일단 통과"하는 경로는 존재하지 않는다(우회 플래그도
+만들지 않는다). quota_pool 기록 실패를 경고 후 진행할지는 호출자인 wrk의 설치/수명주기
+정책이다.
 도구 자체가 설치되지 않은 과도기만 호출자(`wrk`)가 경고 후 진행한다.
 
 exit code
   0  성공
   2  사용법 오류
-  3  admission 거부(lease 점유 중 / job 미등록 / scopefuel gate 거부)
+  3  admission 거부(배타 lease 점유 중 / job 미등록 / scopefuel gate 거부)
   4  중복(claim 중복 job_id, event 중복 (job_id, seq))
   5  fencing 위반(stale owner·token 불일치 release)
   6  저장소·증거 결함(DB 없음·스키마 불일치·권한 오류·pool 해석 불가) — fail-closed
@@ -39,11 +41,11 @@ from pathlib import Path
 PROG = "arbiter"
 
 # 스키마 버전. 저장된 값과 다르면 모든 명령이 fail-closed 로 거부한다(추측 마이그레이션 금지).
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
-# kind 별 기본 TTL(분) — 운영자 정본 고정값.
-DEFAULT_TTL_MIN = {"quota_pool": 90, "path": 90, "linear_permit": 30}
-KINDS = tuple(DEFAULT_TTL_MIN)
+# quota_pool은 실행 기록이므로 TTL/fencing 대상이 아니다. TTL은 실제 배타 자원에만 둔다.
+DEFAULT_TTL_MIN = {"path": 90, "linear_permit": 30}
+KINDS = ("quota_pool", "path", "linear_permit")
 T_LEVELS = ("T0", "T1", "T2", "T3")
 
 BUSY_TIMEOUT_MS = 10000
@@ -125,6 +127,15 @@ DDL = (
         t_level    TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE quota_pool_records (
+        job_id    TEXT NOT NULL,
+        pool      TEXT NOT NULL,
+        profile   TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        PRIMARY KEY (job_id, pool)
     )
     """,
     """
@@ -449,6 +460,14 @@ def _lease_row(con: sqlite3.Connection, resource: str, kind: str):
     ).fetchone()
 
 
+def _quota_pool_row(con: sqlite3.Connection, job_id: str, pool: str):
+    return con.execute(
+        "SELECT job_id, pool, profile, started_at"
+        " FROM quota_pool_records WHERE job_id = ? AND pool = ?",
+        (job_id, pool),
+    ).fetchone()
+
+
 def _archive(con: sqlite3.Connection, row, state: str, moment: dt.datetime) -> bool:
     cur = con.execute(
         "INSERT OR IGNORE INTO lease_history"
@@ -521,6 +540,14 @@ def cmd_lease(args: argparse.Namespace) -> dict:
         raise ArbiterError(EXIT_USAGE, "--profile 은 --kind quota_pool 에서만 쓴다")
     if args.gate_output is not None and args.profile is None:
         raise ArbiterError(EXIT_USAGE, "--gate-output 은 --profile 과 함께 쓴다")
+    if args.kind == "quota_pool":
+        if args.profile is None:
+            raise ArbiterError(
+                EXIT_USAGE,
+                "quota_pool 기록은 --profile 이 필요하다 — pool 매핑을 추측하지 않는다",
+            )
+        if args.ttl_min is not None:
+            raise ArbiterError(EXIT_USAGE, "quota_pool 기록에는 TTL을 지정하지 않는다")
 
     resource = args.resource
     resolved_from = "resource"
@@ -528,9 +555,57 @@ def cmd_lease(args: argparse.Namespace) -> dict:
         resource = resolve_pool(args.profile, args.gate_output)
         resolved_from = f"scopefuel:{args.profile}"
 
-    ttl_min = DEFAULT_TTL_MIN[args.kind] if args.ttl_min is None else args.ttl_min
     con = connect_rw()
     moment = now_dt()
+
+    if args.kind == "quota_pool":
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            _require_job(con, args.job)
+            try:
+                con.execute(
+                    "INSERT INTO quota_pool_records (job_id, pool, profile, started_at)"
+                    " VALUES (?, ?, ?, ?)",
+                    (args.job, resource, args.profile, iso(moment)),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ArbiterError(
+                    EXIT_DUPLICATE,
+                    f"quota_pool 기록 중복: job={args.job} pool={resource}",
+                    job=args.job,
+                    pool=resource,
+                    profile=args.profile,
+                ) from exc
+            con.execute(
+                "UPDATE jobs SET state = 'leased', updated_at = ? WHERE job_id = ?",
+                (iso(moment), args.job),
+            )
+            seq = record_event(
+                con,
+                args.job,
+                "quota_pool.record",
+                {
+                    "job_id": args.job,
+                    "pool": resource,
+                    "profile": args.profile,
+                    "started_at": iso(moment),
+                },
+            )
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+        return {
+            "ok": True,
+            "job_id": args.job,
+            "pool": resource,
+            "profile": args.profile,
+            "started_at": iso(moment),
+            "resolved_from": resolved_from,
+            "event_seq": seq,
+        }
+
+    ttl_min = DEFAULT_TTL_MIN[args.kind] if args.ttl_min is None else args.ttl_min
     expires = moment + dt.timedelta(minutes=ttl_min)
     con.execute("BEGIN IMMEDIATE")
     try:
@@ -596,6 +671,46 @@ def cmd_release(args: argparse.Namespace) -> dict:
     moment = now_dt()
     con.execute("BEGIN IMMEDIATE")
     try:
+        if args.kind == "quota_pool":
+            row = _quota_pool_row(con, args.job, args.resource)
+            if row is None:
+                raise ArbiterError(
+                    EXIT_FENCING,
+                    f"반납할 quota_pool 기록이 없다: job={args.job} pool={args.resource}",
+                )
+            forced = bool(args.force)
+            con.execute(
+                "DELETE FROM quota_pool_records WHERE job_id = ? AND pool = ?",
+                (row[0], row[1]),
+            )
+            con.execute(
+                "UPDATE jobs SET state = 'released', updated_at = ? WHERE job_id = ?",
+                (iso(moment), row[0]),
+            )
+            seq = record_event(
+                con,
+                row[0],
+                "quota_pool.release.force" if forced else "quota_pool.release",
+                {
+                    "job_id": row[0],
+                    "pool": row[1],
+                    "profile": row[2],
+                    "started_at": row[3],
+                    "forced": forced,
+                },
+            )
+            con.execute("COMMIT")
+            return {
+                "ok": True,
+                "job_id": row[0],
+                "pool": row[1],
+                "profile": row[2],
+                "started_at": row[3],
+                "released_at": iso(moment),
+                "forced": forced,
+                "event_seq": seq,
+            }
+
         if args.kind is not None:
             rows = [r for r in [_lease_row(con, args.resource, args.kind)] if r is not None]
         else:
@@ -616,7 +731,9 @@ def cmd_release(args: argparse.Namespace) -> dict:
                 f"{args.resource} 에 kind 가 {len(rows)}개다 — --kind 로 지정하라",
             )
         row = rows[0]
-        if row[2] != args.job or row[3] != args.token:
+        if not args.force and not args.token:
+            raise ArbiterError(EXIT_USAGE, "일반 lease 반납에는 --token 이 필요하다(--force 는 예외)")
+        if not args.force and (row[2] != args.job or row[3] != args.token):
             raise ArbiterError(
                 EXIT_FENCING,
                 f"stale owner 거부: {args.resource}/{row[1]} 의 현 소유자는"
@@ -626,17 +743,23 @@ def cmd_release(args: argparse.Namespace) -> dict:
                 held_by=row[2],
                 held_token=mask_token(row[3]),
             )
-        _archive(con, row, "released", moment)
+        forced = bool(args.force)
+        _archive(con, row, "force-released" if forced else "released", moment)
         con.execute("DELETE FROM leases WHERE resource = ? AND kind = ?", (row[0], row[1]))
         con.execute(
             "UPDATE jobs SET state = 'released', updated_at = ? WHERE job_id = ?",
-            (iso(moment), args.job),
+            (iso(moment), row[2]),
         )
         seq = record_event(
             con,
-            args.job,
-            "lease.release",
-            {"resource": row[0], "kind": row[1], "token": mask_token(row[3])},
+            row[2],
+            "lease.release.force" if forced else "lease.release",
+            {
+                "resource": row[0],
+                "kind": row[1],
+                "token": mask_token(row[3]),
+                "forced": forced,
+            },
         )
         con.execute("COMMIT")
     except BaseException:
@@ -648,17 +771,58 @@ def cmd_release(args: argparse.Namespace) -> dict:
         "resource": row[0],
         "kind": row[1],
         "released_at": iso(moment),
+        "forced": forced,
         "event_seq": seq,
     }
 
 
+def _live_job_ids(source: str | None) -> set[str]:
+    """Read the authoritative herdr agent list before deleting quota records."""
+    if source:
+        try:
+            text = Path(source).read_text(encoding="utf-8")
+        except OSError as exc:
+            raise ArbiterError(EXIT_STORAGE, f"herdr agent list 를 읽을 수 없다: {exc}") from exc
+    else:
+        herdr = os.environ.get("HERDR_BIN") or shutil.which("herdr")
+        if not herdr:
+            raise ArbiterError(EXIT_STORAGE, "herdr agent list 를 실행할 수 없다: herdr 없음")
+        proc = _run([herdr, "agent", "list"])
+        if proc.returncode != 0:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                f"herdr agent list 실패(exit {proc.returncode}): {proc.stderr.strip()}",
+            )
+        text = proc.stdout
+    try:
+        payload = json.loads(text)
+        result = payload.get("result", payload)
+        agents = result["agents"]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ArbiterError(EXIT_STORAGE, f"herdr agent list JSON 을 해석할 수 없다: {exc}") from exc
+    if not isinstance(agents, list):
+        raise ArbiterError(EXIT_STORAGE, "herdr agent list 의 agents 가 목록이 아니다")
+
+    live: set[str] = set()
+    for agent in agents:
+        if not isinstance(agent, dict):
+            continue
+        for key in ("job_id", "name"):
+            value = agent.get(key)
+            if isinstance(value, str) and value:
+                live.add(value)
+    return live
+
+
 def cmd_gc(args: argparse.Namespace) -> dict:
+    live_jobs = _live_job_ids(args.herdr_agent_list) if args.herdr_agent_list is not None else None
     con = connect_rw()
     moment = now_dt()
     con.execute("BEGIN IMMEDIATE")
     try:
         rows = con.execute(
-            "SELECT resource, kind, job_id, token, acquired_at, expires_at FROM leases"
+            "SELECT resource, kind, job_id, token, acquired_at, expires_at"
+            " FROM leases WHERE kind IN ('path', 'linear_permit')"
         ).fetchall()
         expired = [r for r in rows if parse_iso(r[5]) <= moment]
         transitions = []
@@ -674,6 +838,39 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                 transitions.append(
                     {"resource": row[0], "kind": row[1], "job": row[2], "expires_at": row[5]}
                 )
+        stale_quota_pool = []
+        if live_jobs is not None:
+            quota_rows = con.execute(
+                "SELECT job_id, pool, profile, started_at"
+                " FROM quota_pool_records ORDER BY job_id, pool"
+            ).fetchall()
+            for row in quota_rows:
+                if row[0] in live_jobs:
+                    continue
+                con.execute(
+                    "DELETE FROM quota_pool_records WHERE job_id = ? AND pool = ?",
+                    (row[0], row[1]),
+                )
+                record_event(
+                    con,
+                    row[0],
+                    "quota_pool.stale_cleanup",
+                    {
+                        "job_id": row[0],
+                        "pool": row[1],
+                        "profile": row[2],
+                        "started_at": row[3],
+                        "reason": "job absent from herdr agent list",
+                    },
+                )
+                stale_quota_pool.append(
+                    {
+                        "job_id": row[0],
+                        "pool": row[1],
+                        "profile": row[2],
+                        "started_at": row[3],
+                    }
+                )
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
@@ -684,6 +881,8 @@ def cmd_gc(args: argparse.Namespace) -> dict:
         "expired": len(expired),
         "transitioned": transitions,
         "retained": len(rows),
+        "stale_quota_pool": stale_quota_pool,
+        "live_jobs": None if live_jobs is None else len(live_jobs),
     }
 
 
@@ -714,6 +913,10 @@ def cmd_status(args: argparse.Namespace) -> dict:
         "SELECT resource, kind, job_id, token, acquired_at, expires_at"
         " FROM leases ORDER BY resource, kind"
     ).fetchall()
+    quota_pool_records = con.execute(
+        "SELECT job_id, pool, profile, started_at"
+        " FROM quota_pool_records ORDER BY job_id, pool"
+    ).fetchall()
     history = con.execute(
         "SELECT resource, kind, job_id, token, acquired_at, expires_at, state, recorded_at"
         " FROM lease_history ORDER BY id"
@@ -721,6 +924,7 @@ def cmd_status(args: argparse.Namespace) -> dict:
     scoped = args.job is not None or args.lane is not None
     if scoped:
         leases = [r for r in leases if r[2] in job_ids]
+        quota_pool_records = [r for r in quota_pool_records if r[0] in job_ids]
         history = [r for r in history if r[2] in job_ids]
     return {
         "ok": True,
@@ -748,6 +952,15 @@ def cmd_status(args: argparse.Namespace) -> dict:
                 "expired": parse_iso(r[5]) <= moment,
             }
             for r in leases
+        ],
+        "quota_pool_records": [
+            {
+                "job_id": r[0],
+                "pool": r[1],
+                "profile": r[2],
+                "started_at": r[3],
+            }
+            for r in quota_pool_records
         ],
         "history": [
             {
@@ -804,6 +1017,12 @@ def render_text(command: str, result: dict) -> str:
                 f"  {lease['resource']}/{lease['kind']} job={lease['job']}"
                 f" token={lease['token']} expires_at={lease['expires_at']} [{flag}]"
             )
+        lines.append(f"quota_pool_records={len(result['quota_pool_records'])}")
+        for record in result["quota_pool_records"]:
+            lines.append(
+                f"  job_id={record['job_id']} pool={record['pool']}"
+                f" profile={record['profile']} started_at={record['started_at']}"
+            )
         lines.append(f"history={len(result['history'])}")
         for item in result["history"]:
             lines.append(
@@ -820,6 +1039,11 @@ def render_text(command: str, result: dict) -> str:
             lines.append(
                 f"  {item['resource']}/{item['kind']} job={item['job']}"
                 f" expires_at={item['expires_at']} -> expired"
+            )
+        for item in result.get("stale_quota_pool", []):
+            lines.append(
+                f"  job_id={item['job_id']} pool={item['pool']} profile={item['profile']}"
+                f" started_at={item['started_at']} -> stale-cleaned"
             )
         return "\n".join(lines)
     return " ".join(f"{k}={v}" for k, v in result.items() if k != "ok")
@@ -860,17 +1084,31 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"TTL(분). 기본: {', '.join(f'{k}={v}' for k, v in DEFAULT_TTL_MIN.items())}",
     )
 
-    release = sub.add_parser("release", parents=[common], help="lease 반납. token 불일치면 거부")
+    release = sub.add_parser(
+        "release", parents=[common], help="lease/실행 기록 반납. --force 는 운영자 강제 반납"
+    )
     release.add_argument("--job", required=True, help="job id")
     release.add_argument("--resource", required=True, help="자원 이름")
-    release.add_argument("--token", required=True, help="획득 시 발급된 fencing token")
+    release.add_argument("--token", help="획득 시 발급된 fencing token (배타 lease 일반 반납용)")
     release.add_argument("--kind", choices=KINDS, help="같은 resource 에 kind 가 여럿일 때만 필요")
+    release.add_argument(
+        "--force",
+        action="store_true",
+        help="fencing token 없이 운영자 강제 반납하고 force event 를 남긴다",
+    )
 
     status = sub.add_parser("status", parents=[common], help="현황(읽기 전용, mode=ro)")
     status.add_argument("--job", help="job 으로 좁히기")
     status.add_argument("--lane", help="lane 으로 좁히기")
 
-    sub.add_parser("gc", parents=[common], help="만료 lease 상태 전이(삭제하지 않는다)")
+    gc = sub.add_parser("gc", parents=[common], help="만료 lease 전이 + 명시적 stale 기록 정리")
+    gc.add_argument(
+        "--herdr-agent-list",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="herdr agent list JSON 경로(생략 시 HERDR_BIN herdr agent list 실행); 죽은 job만 정리",
+    )
 
     event = sub.add_parser("event", parents=[common], help="job event 제출(atomic rename)")
     event.add_argument("--job", required=True, help="job id")
