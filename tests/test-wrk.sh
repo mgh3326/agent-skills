@@ -73,7 +73,7 @@ grep -q 'model_reasoning_effort=max' "$TMP/herdr.log"
 grep -q 'model=codex-terra' <<<"$canonical_out"
 
 profiles=(
-  "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "fable:fable" "claudex:codex-max"
+  "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku" "fable:fable" "claudex:codex-max"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
@@ -86,7 +86,8 @@ profiles=(
   "kiro-sol-xhigh:kiro-sol" "kiro-sol-max:kiro-sol"
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
-  "oc-oss:oc-oss" "oc-omni:oc-omni" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi"
+  "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
+  "oc-minimax-m3:oc-minimax-m3" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi"
 )
 for pair in "${profiles[@]}"; do
   runtime="${pair%%:*}"
@@ -114,6 +115,9 @@ grep -q 'model_reasoning_effort=medium' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base codex-med --effort high >/dev/null
 grep -q 'model_reasoning_effort=high' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base codex-sol >/dev/null
+grep -q 'model_reasoning_effort=max' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base kiro-sol --effort low >/dev/null
 grep -q -- '--effort low' "$TMP/herdr.log"
@@ -143,6 +147,14 @@ grep -q -- '--effort high' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base sonnet --effort medium >/dev/null
 grep -q -- '--effort medium' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base haiku >/dev/null
+grep -q -- '--model haiku' "$TMP/herdr.log"
+grep -q -- '--effort low' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base haiku --effort low >/dev/null
+grep -q -- '--model haiku' "$TMP/herdr.log"
+grep -q -- '--effort low' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m fable -p "$PROMPT" -w w -l fixture --effort high
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
@@ -159,6 +171,12 @@ grep -q 'send-keys w:p1 return' "$TMP/herdr.log"
 spawn_base oc-omni >/dev/null
 grep -q -- '--model omniroute/auto/coding' "$TMP/herdr.log"
 grep -q 'send-keys w:p1 return' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base oc-qwen37-max >/dev/null
+grep -q -- '--model cline-pass/cline-pass/qwen3.7-max' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base oc-minimax-m3 >/dev/null
+grep -q -- '--model cline-pass/cline-pass/minimax-m3' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base claudex >/dev/null
 grep -q '/usr/bin/env' "$TMP/herdr.log"
