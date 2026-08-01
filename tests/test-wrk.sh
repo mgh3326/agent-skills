@@ -29,6 +29,7 @@ spawn_base() {
 "$WRK" find --help >/dev/null
 "$WRK" name-sync --help >/dev/null
 "$WRK" profiles --help >/dev/null
+run_fail "$WRK" profiles --bogus
 run_fail "$WRK" spawn -c "$ROOT" -p "$PROMPT" -w w -l fixture
 run_fail "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --bogus
 run_fail "$WRK" nope

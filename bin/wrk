@@ -31,7 +31,14 @@ USAGE
 }
 
 profiles_cmd() {
-  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { profiles_help; return 0; }
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+      [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+      profiles_help
+      return 0
+    fi
+    die "unexpected argument '$1'"
+  fi
   printf '%s\n' "${ALL_PROFILES[@]}"
 }
 
