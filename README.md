@@ -38,6 +38,7 @@
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
 | `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정). `wrk --help` 로 전체 확인 |
 | `wrk` | `spawn`·`find`·`name-sync` 통합 CLI — 명시 모델 스폰, 이름/라벨 조회, 탭 라벨 동기화 |
+| `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(fencing token 붙은 원자적 점유·반납) · `status`(읽기 전용) · `gc`(만료 상태 전이) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
 
 ## 의존 도구
 
@@ -51,7 +52,8 @@
 ## `wrk` 사용법
 
 ```text
-wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL [-L live|mock] [--effort LEVEL]
+wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
+          [-L live|mock] [--effort LEVEL] [--job ID]
 wrk find <이름|라벨> [--pane-only]
 wrk name-sync [--apply|<라벨>...]
 ```
@@ -60,6 +62,25 @@ wrk name-sync [--apply|<라벨>...]
 canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은 설치된
 `scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
 `agy -p "$(cat PROMPT_FILE)"`이다.
+
+`--t`는 **필수**다(ROB-1198 §③). 빠지면 게이트·claim·스폰 어느 것도 하지 않고
+`NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
+사실로 기록되기 때문이다. `--job`은 생략하면 `-l LABEL`을 쓴다.
+
+## 도메인 경계 (ROB-1199 — 위반 금지)
+
+```text
+scopefuel   쿼타·급·정책     "얼마 남았나"    ← arbiter 가 읽는 입력원
+wrk         세션 수명주기    "어떻게 띄우나"
+arbiter     작업 조정        "누가 점유했나"
+```
+
+호출 방향은 `wrk → arbiter → scopefuel --json` 한 방향이다. `wrk spawn`은 `scopefuel gate`
+통과 직후 arbiter로 job을 claim하고 quota pool을 lease한다 — **pool 매핑은 wrk에 없다.**
+arbiter가 scopefuel이 내놓은 gate 출력에서 pool을 읽고 `scopefuel --json`의 provider 목록과
+대조한다. 획득 실패는 스폰 거부(exit 3), 스폰 실패는 lease 반납이다. arbiter가 아예 없거나
+`lease` 서브커맨드를 모르는 **설치 과도기만** 경고 후 진행하고, 그 밖의 오류(실행 불가·DB·
+스키마·lease)는 전부 fail-closed다. 우회 플래그는 만들지 않는다.
 
 ## 설계 원칙
 

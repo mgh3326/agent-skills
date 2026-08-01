@@ -4,6 +4,7 @@ set -euo pipefail
 
 HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
 SCOPEFUEL="${SCOPEFUEL_BIN:-}"
+ARBITER="${ARBITER_BIN:-}"
 
 # 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
@@ -47,7 +48,8 @@ usage() {
   cat <<'USAGE'
 Usage: wrk <spawn|find|name-sync|profiles> [options]
 
-  wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL [-L live|mock] [--effort LEVEL]
+  wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
+            [-L live|mock] [--effort LEVEL] [--job ID]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -58,13 +60,21 @@ USAGE
 
 spawn_help() {
   cat <<'USAGE'
-Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL [-L live|mock] [--effort LEVEL]
+Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
+                 [-L live|mock] [--effort LEVEL] [--job ID]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
+  --t T0..T3         job scale; required — an unclassified job is not spawned
   -L live|mock       select lane; mock requires MOCK_MCP_PROFILE
   --effort LEVEL     override codex/Kiro/Grok/Claude(opus,sonnet) profile effort
+  --job ID           arbiter job id (default: LABEL)
   -h, --help         show this usage
+
+Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
+the job and leases its quota pool from arbiter. arbiter resolves the pool from
+scopefuel's own output — wrk holds no pool mapping. Lease refusal denies the
+spawn (exit 3); a failed spawn releases the lease. There is no bypass flag.
 
 Canonical codex profiles: codex-terra, codex-luna, codex-sol.
 Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
@@ -102,6 +112,8 @@ warn() { echo "wrk: warning: $*" >&2; }
 sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
 
 quota_gate() {
+  GATE_OUTPUT=""
+  GATE_READY=0
   if [[ -z "$SCOPEFUEL" ]]; then
     SCOPEFUEL="$(command -v scopefuel 2>/dev/null || true)"
   fi
@@ -126,15 +138,114 @@ quota_gate() {
     [[ -z "$probe" ]] || printf '%s\n' "$probe" >&2
     return "$probe_rc"
   fi
+  # stdout is captured (not swallowed) so arbiter can read the pool that scopefuel
+  # itself resolved for this profile. It is re-printed verbatim; stderr is untouched.
+  local out rc
   set +e
-  "$SCOPEFUEL" gate -m "$GATE_PROFILE"
-  local rc=$?
+  out="$("$SCOPEFUEL" gate -m "$GATE_PROFILE")"
+  rc=$?
   set -e
+  [[ -z "$out" ]] || printf '%s\n' "$out"
   case "$rc" in
-    0) return 0 ;;
+    0) GATE_OUTPUT="$out"; GATE_READY=1; return 0 ;;
     3|4) exit "$rc" ;;
     *) echo "wrk: scopefuel gate failed (exit $rc)" >&2; return "$rc" ;;
   esac
+}
+
+# ROB-1199: admission control. The quota gate answers "how much is left"; arbiter
+# answers "who holds it". fail-closed everywhere except a genuinely absent tool.
+arbiter_release_held() {
+  [[ "${ARBITER_HELD:-0}" -eq 1 ]] || return 0
+  ARBITER_HELD=0
+  local rc
+  set +e
+  "$ARBITER" release --job "$JOB_ID" --resource "$ARBITER_RESOURCE" --kind quota_pool \
+    --token "$ARBITER_TOKEN" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: arbiter lease release failed (exit $rc): $ARBITER_RESOURCE/quota_pool job=$JOB_ID" >&2
+  else
+    echo "wrk: arbiter lease released after spawn failure: $ARBITER_RESOURCE/quota_pool" >&2
+  fi
+}
+
+arbiter_admit() {
+  if [[ -z "$ARBITER" ]]; then
+    ARBITER="$(command -v arbiter 2>/dev/null || true)"
+  fi
+  if [[ -z "$ARBITER" || ! -e "$ARBITER" ]]; then
+    warn "arbiter unavailable; admission control skipped during installation transition"
+    return 0
+  fi
+  if [[ ! -x "$ARBITER" ]]; then
+    echo "wrk: arbiter exists but is not executable: $ARBITER" >&2
+    exit 3
+  fi
+  local probe probe_rc
+  set +e
+  probe="$("$ARBITER" lease --help 2>&1)"
+  probe_rc=$?
+  set -e
+  if [[ "$probe_rc" -ne 0 ]]; then
+    if grep -Eiq "(unknown (command|subcommand).*lease|invalid choice.*lease|no such command.*lease|unrecognized.*lease|not a valid command.*lease)" <<<"$probe"; then
+      warn "installed arbiter has no lease subcommand; admission control skipped during installation transition"
+      return 0
+    fi
+    [[ -z "$probe" ]] || printf '%s\n' "$probe" >&2
+    echo "wrk: arbiter probe failed (exit $probe_rc)" >&2
+    exit 3
+  fi
+  if [[ "$GATE_READY" -ne 1 ]]; then
+    # No scopefuel result means no authoritative pool. Leasing a guessed pool would
+    # be worse than not leasing — the same installation-transition exception applies.
+    warn "scopefuel gate did not run; arbiter quota-pool lease skipped during installation transition"
+    return 0
+  fi
+
+  local claim_rc
+  set +e
+  "$ARBITER" claim --job "$JOB_ID" --lane "$JOB_LANE" --t "$JOB_T" >/dev/null
+  claim_rc=$?
+  set -e
+  case "$claim_rc" in
+    0) ;;
+    # A duplicate claim is not an admission decision; the lease below still is.
+    4) warn "arbiter job '$JOB_ID' is already claimed; the lease still governs admission" ;;
+    *) echo "wrk: arbiter claim failed (exit $claim_rc); spawn denied" >&2; exit 3 ;;
+  esac
+
+  local gate_file lease_json lease_rc parsed rc
+  gate_file="$(mktemp)"
+  printf '%s\n' "$GATE_OUTPUT" >"$gate_file"
+  set +e
+  lease_json="$(SCOPEFUEL_BIN="$SCOPEFUEL" "$ARBITER" lease --job "$JOB_ID" --kind quota_pool \
+    --profile "$GATE_PROFILE" --gate-output "$gate_file" --json)"
+  lease_rc=$?
+  set -e
+  rm -f "$gate_file"
+  if [[ "$lease_rc" -ne 0 ]]; then
+    echo "wrk: arbiter lease refused (exit $lease_rc); spawn denied" >&2
+    exit 3
+  fi
+  set +e
+  parsed="$(printf '%s' "$lease_json" |
+    python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["resource"]); print(d["token"])')"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: arbiter lease output unreadable; spawn denied" >&2
+    exit 3
+  fi
+  { IFS= read -r ARBITER_RESOURCE; IFS= read -r ARBITER_TOKEN; } <<<"$parsed"
+  if [[ -z "$ARBITER_RESOURCE" || -z "$ARBITER_TOKEN" ]]; then
+    echo "wrk: arbiter lease returned no resource/token; spawn denied" >&2
+    exit 3
+  fi
+  ARBITER_HELD=1
+  trap 'arbiter_release_held' EXIT
+  echo "wrk: arbiter lease held resource=$ARBITER_RESOURCE kind=quota_pool job=$JOB_ID" >&2
 }
 
 resolve_profile() {
@@ -247,15 +358,17 @@ resolve_profile() {
 
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT=""
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T=""
+  ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" GATE_OUTPUT="" GATE_READY=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t)
         [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
+          --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;;
         esac
         shift 2 ;;
       -*) die "unknown option '$1'" ;;
@@ -268,6 +381,8 @@ spawn_cmd() {
   [[ -n "$WS" ]] || die "-w WORKSPACE is required"
   [[ -n "$LABEL" ]] || die "-l LABEL is required"
   [[ -r "$PROMPT" ]] || die "prompt file is not readable: $PROMPT"
+
+  [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
 
   resolve_profile
   LANE_ENV=()
@@ -283,11 +398,28 @@ spawn_cmd() {
       LANE_ENV+=(--env "MCP_PROFILE=$MOCK_MCP_PROFILE")
     fi
   fi
+  JOB_LANE="${LANE:-default}"
+
+  # ROB-1198 §③ / ROB-1199 claim contract: an unclassified job is not spawned.
+  # There is no default T — a blank one would be recorded as fact by arbiter.
+  # Checked before the quota gate, so nothing is measured, claimed or spawned.
+  [[ -n "$JOB_T" ]] ||
+    die "NEEDS_CLASSIFICATION: --t T0..T3 is required (job '$JOB_ID'); classify it, do not guess"
+  case "$JOB_T" in T0|T1|T2|T3) ;; *) die "--t accepts only T0, T1, T2 or T3" ;; esac
 
   quota_gate
+  arbiter_admit
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
-  if [[ "${#LANE_ENV[@]}" -gt 0 ]]; then
-    PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${LANE_ENV[@]}" |
+
+  TAB_ENV=()
+  if [[ "${#LANE_ENV[@]}" -gt 0 ]]; then TAB_ENV+=("${LANE_ENV[@]}"); fi
+  if [[ "$ARBITER_HELD" -eq 1 ]]; then
+    # The worker needs its own lease identity to release or prove it later.
+    TAB_ENV+=(--env "ARBITER_JOB=$JOB_ID" --env "ARBITER_RESOURCE=$ARBITER_RESOURCE"
+              --env "ARBITER_KIND=quota_pool" --env "ARBITER_TOKEN=$ARBITER_TOKEN")
+  fi
+  if [[ "${#TAB_ENV[@]}" -gt 0 ]]; then
+    PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}" |
       python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
   else
     PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus |
@@ -326,7 +458,14 @@ spawn_cmd() {
   fi
   STATUS="unknown"
   if STATUS=$("$HERDR" agent list | python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent_status","unknown") for x in a if x.get("pane_id")==p),"unknown"))' "$PANE"); then :; fi
-  echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS"
+  # The spawn stands; the lease now belongs to the worker, not to this process.
+  # The token itself stays out of stdout — the worker already has it in its env.
+  ARBITER_HELD=0
+  if [[ -n "$ARBITER_RESOURCE" ]]; then
+    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS job=$JOB_ID lease=$ARBITER_RESOURCE/quota_pool"
+  else
+    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS"
+  fi
 }
 
 find_cmd() {

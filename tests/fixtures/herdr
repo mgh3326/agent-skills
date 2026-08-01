@@ -48,7 +48,13 @@ case "${1:-}" in
     ;;
   tab)
     case "${2:-}" in
-      create) printf '%s\n' '{"result":{"root_pane":{"pane_id":"w:p1"}}}' ;;
+      create)
+        if [[ "$scenario" == tab-create-fails ]]; then
+          echo 'fixture herdr: tab create failed' >&2
+          exit 9
+        fi
+        printf '%s\n' '{"result":{"root_pane":{"pane_id":"w:p1"}}}'
+        ;;
       list)
         case "$scenario" in
           find-name)
