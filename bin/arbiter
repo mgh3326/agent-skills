@@ -47,6 +47,8 @@ SCHEMA_VERSION = 2
 DEFAULT_TTL_MIN = {"path": 90, "linear_permit": 30}
 KINDS = ("quota_pool", "path", "linear_permit")
 T_LEVELS = ("T0", "T1", "T2", "T3")
+HERDR_AGENT_STATUSES = frozenset(("idle", "working", "blocked", "done", "unknown"))
+HERDR_LIVE_STATUS = "working"
 
 BUSY_TIMEOUT_MS = 10000
 
@@ -275,17 +277,39 @@ def _create_schema(con: sqlite3.Connection) -> None:
     con.execute("COMMIT")
 
 
+def _schema_mismatch_message(observed: object, detail: str | None = None) -> str:
+    suffix = f"; {detail}" if detail else ""
+    return (
+        f"schema mismatch: db_path={db_path()} observed_version={observed}"
+        f" expected_version={SCHEMA_VERSION} (db={observed} expected={SCHEMA_VERSION})"
+        "; action: back up the existing DB, then recreate it"
+        "; no automatic migration, deletion, or rollback is performed"
+        f"{suffix}"
+    )
+
+
 def _check_schema(con: sqlite3.Connection) -> None:
     try:
         row = con.execute("SELECT schema_version FROM meta WHERE id = 1").fetchone()
     except sqlite3.Error as exc:
-        raise ArbiterError(EXIT_STORAGE, f"schema 확인 실패(불일치로 간주): {exc}") from exc
-    if row is None:
-        raise ArbiterError(EXIT_STORAGE, "meta 행이 없다 — schema mismatch")
-    if int(row[0]) != SCHEMA_VERSION:
         raise ArbiterError(
             EXIT_STORAGE,
-            f"schema mismatch: db={row[0]} expected={SCHEMA_VERSION}",
+            _schema_mismatch_message("unreadable", f"schema check failed: {exc}"),
+        ) from exc
+    if row is None:
+        raise ArbiterError(EXIT_STORAGE, _schema_mismatch_message("missing-meta-row"))
+    observed = row[0]
+    try:
+        observed_version = int(observed)
+    except (TypeError, ValueError) as exc:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            _schema_mismatch_message(observed, "schema_version is not an integer"),
+        ) from exc
+    if observed_version != SCHEMA_VERSION:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            _schema_mismatch_message(observed_version),
         )
 
 
@@ -516,7 +540,14 @@ def cmd_claim(args: argparse.Namespace) -> dict:
             con,
             args.job,
             "job.claim",
-            {"owner_lane": args.lane, "t_level": args.t},
+            {
+                "owner_lane": args.lane,
+                "t_level": args.t,
+                # Herdr does not expose ARBITER_JOB.  Persist the exact
+                # agent identity in the existing claim event instead of
+                # adding a schema column or guessing from a prefix.
+                "agent_label": args.agent_label or args.job,
+            },
         )
         con.execute("COMMIT")
     except BaseException:
@@ -528,6 +559,7 @@ def cmd_claim(args: argparse.Namespace) -> dict:
         "owner_lane": args.lane,
         "t_level": args.t,
         "state": "claimed",
+        "agent_label": args.agent_label or args.job,
         "created_at": iso(moment),
         "event_seq": seq,
     }
@@ -776,18 +808,28 @@ def cmd_release(args: argparse.Namespace) -> dict:
     }
 
 
-def _live_job_ids(source: str | None) -> set[str]:
-    """Read the authoritative herdr agent list before deleting quota records."""
+def _herdr_agents(source: str | None) -> list[dict[str, object]]:
+    """Read and normalize Herdr's authoritative agent list.
+
+    The list has no ARBITER_JOB field today, so callers must match a persisted
+    exact label/name identity.  This function deliberately keeps identities
+    fielded rather than flattening them into a fuzzy set.
+    """
     if source:
         try:
             text = Path(source).read_text(encoding="utf-8")
-        except OSError as exc:
+        except (OSError, UnicodeError) as exc:
             raise ArbiterError(EXIT_STORAGE, f"herdr agent list 를 읽을 수 없다: {exc}") from exc
     else:
         herdr = os.environ.get("HERDR_BIN") or shutil.which("herdr")
         if not herdr:
             raise ArbiterError(EXIT_STORAGE, "herdr agent list 를 실행할 수 없다: herdr 없음")
-        proc = _run([herdr, "agent", "list"])
+        try:
+            proc = _run([herdr, "agent", "list"])
+        except ArbiterError as exc:
+            raise ArbiterError(
+                EXIT_STORAGE, f"herdr agent list 를 실행할 수 없다: {exc.message}"
+            ) from exc
         if proc.returncode != 0:
             raise ArbiterError(
                 EXIT_STORAGE,
@@ -798,24 +840,107 @@ def _live_job_ids(source: str | None) -> set[str]:
         payload = json.loads(text)
         result = payload.get("result", payload)
         agents = result["agents"]
-    except (ValueError, KeyError, TypeError) as exc:
+    except (AttributeError, ValueError, KeyError, TypeError) as exc:
         raise ArbiterError(EXIT_STORAGE, f"herdr agent list JSON 을 해석할 수 없다: {exc}") from exc
     if not isinstance(agents, list):
         raise ArbiterError(EXIT_STORAGE, "herdr agent list 의 agents 가 목록이 아니다")
 
-    live: set[str] = set()
+    normalized: list[dict[str, object]] = []
     for agent in agents:
         if not isinstance(agent, dict):
-            continue
-        for key in ("job_id", "name"):
+            raise ArbiterError(EXIT_STORAGE, "herdr agent list 의 agent 항목이 객체가 아니다")
+        status = agent.get("agent_status")
+        if not isinstance(status, str) or status not in HERDR_AGENT_STATUSES:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                f"herdr agent list 의 agent_status 를 해석할 수 없다: {status!r}"
+                f" (expected one of {sorted(HERDR_AGENT_STATUSES)})",
+            )
+        identities: dict[str, str] = {}
+        for key in ("job_id", "name", "label"):
             value = agent.get(key)
-            if isinstance(value, str) and value:
-                live.add(value)
-    return live
+            if value is None:
+                continue
+            if not isinstance(value, str):
+                raise ArbiterError(
+                    EXIT_STORAGE,
+                    f"herdr agent list 의 {key} 가 문자열이 아니다: {value!r}",
+                )
+            if value:
+                identities[key] = value
+        normalized.append({"status": status, "identities": identities})
+    return normalized
+
+
+def _claim_agent_label(con: sqlite3.Connection, job_id: str) -> str | None:
+    """Read the exact Herdr identity persisted in the v2 claim event.
+
+    Older v2 claim events predate the optional mapping and therefore return
+    ``None``.  GC must refuse those records rather than infer a label from a
+    job-id prefix or from the number/order of agents.
+    """
+    rows = con.execute(
+        "SELECT kind, payload FROM events WHERE job_id = ? AND kind = 'job.claim' ORDER BY seq",
+        (job_id,),
+    ).fetchall()
+    labels: set[str] = set()
+    for kind, body in rows:
+        try:
+            event = json.loads(body)
+        except (TypeError, ValueError) as exc:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                f"job.claim event 를 해석할 수 없다: job={job_id} kind={kind}: {exc}",
+            ) from exc
+        payload = event.get("payload") if isinstance(event, dict) else None
+        if not isinstance(payload, dict):
+            continue
+        label = payload.get("agent_label")
+        if label is None:
+            continue
+        if not isinstance(label, str) or not label:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                f"job.claim event 의 agent_label 이 유효하지 않다: job={job_id}",
+            )
+        labels.add(label)
+    if len(labels) > 1:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            f"job.claim event 의 agent_label 이 모호하다: job={job_id} labels={sorted(labels)}",
+        )
+    return next(iter(labels), None)
+
+
+def _matched_agent_statuses(
+    agents: list[dict[str, object]], *, job_id: str, agent_label: str
+) -> tuple[set[str], bool]:
+    """Return statuses for agents matching the exact persisted identity.
+
+    ``agent_label`` is matched only against Herdr's name/label fields.  A
+    future Herdr ``job_id`` field is accepted only when the persisted identity
+    itself is that exact job id (the default claim mapping), never by prefix.
+    """
+    statuses: set[str] = set()
+    matched = False
+    for agent in agents:
+        identities = agent["identities"]
+        status = agent["status"]
+        if not isinstance(identities, dict) or not isinstance(status, str):
+            raise ArbiterError(EXIT_STORAGE, "internal Herdr agent normalization error")
+        name_match = agent_label in {identities.get("name"), identities.get("label")}
+        job_id_match = agent_label == job_id and identities.get("job_id") == job_id
+        if name_match or job_id_match:
+            matched = True
+            statuses.add(status)
+    return statuses, matched
 
 
 def cmd_gc(args: argparse.Namespace) -> dict:
-    live_jobs = _live_job_ids(args.herdr_agent_list) if args.herdr_agent_list is not None else None
+    # GC always reconciles quota_pool_records against a current Herdr list.
+    # ``--herdr-agent-list PATH`` is the hermetic fixture seam; omitting PATH
+    # uses the installed HERDR_BIN/`herdr` command.
+    herdr_agents = _herdr_agents(args.herdr_agent_list)
     con = connect_rw()
     moment = now_dt()
     con.execute("BEGIN IMMEDIATE")
@@ -838,39 +963,93 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                 transitions.append(
                     {"resource": row[0], "kind": row[1], "job": row[2], "expires_at": row[5]}
                 )
-        stale_quota_pool = []
-        if live_jobs is not None:
-            quota_rows = con.execute(
-                "SELECT job_id, pool, profile, started_at"
-                " FROM quota_pool_records ORDER BY job_id, pool"
-            ).fetchall()
-            for row in quota_rows:
-                if row[0] in live_jobs:
-                    continue
-                con.execute(
-                    "DELETE FROM quota_pool_records WHERE job_id = ? AND pool = ?",
-                    (row[0], row[1]),
-                )
-                record_event(
-                    con,
-                    row[0],
-                    "quota_pool.stale_cleanup",
+        quota_rows = con.execute(
+            "SELECT job_id, pool, profile, started_at"
+            " FROM quota_pool_records ORDER BY job_id, pool"
+        ).fetchall()
+        stale_decisions = []
+        unresolved_quota_pool = []
+        unsafe_quota_pool = []
+        for row in quota_rows:
+            agent_label = _claim_agent_label(con, row[0])
+            if agent_label is None:
+                unresolved_quota_pool.append(
                     {
                         "job_id": row[0],
                         "pool": row[1],
-                        "profile": row[2],
-                        "started_at": row[3],
-                        "reason": "job absent from herdr agent list",
-                    },
-                )
-                stale_quota_pool.append(
-                    {
-                        "job_id": row[0],
-                        "pool": row[1],
-                        "profile": row[2],
-                        "started_at": row[3],
+                        "reason": "job.claim has no exact agent_label mapping",
                     }
                 )
+                continue
+            statuses, matched = _matched_agent_statuses(
+                herdr_agents, job_id=row[0], agent_label=agent_label
+            )
+            if HERDR_LIVE_STATUS in statuses:
+                continue
+            if "unknown" in statuses:
+                unsafe_quota_pool.append(
+                    {
+                        "job_id": row[0],
+                        "pool": row[1],
+                        "agent_label": agent_label,
+                        "herdr_status": sorted(statuses),
+                        "reason": "herdr agent status=unknown is not stale evidence",
+                    }
+                )
+                continue
+            stale_decisions.append((row, agent_label, sorted(statuses), matched))
+
+        if unresolved_quota_pool or unsafe_quota_pool:
+            details = []
+            if unresolved_quota_pool:
+                details.append(
+                    "unmapped=" + ",".join(item["job_id"] for item in unresolved_quota_pool)
+                )
+            if unsafe_quota_pool:
+                details.append(
+                    "unknown=" + ",".join(item["job_id"] for item in unsafe_quota_pool)
+                )
+            raise ArbiterError(
+                EXIT_STORAGE,
+                "gc identity reconciliation refused; no quota_pool records were deleted"
+                f" ({'; '.join(details)})",
+            )
+
+        stale_quota_pool = []
+        for row, agent_label, statuses, matched in stale_decisions:
+            reason = (
+                "job absent from herdr agent list"
+                if not matched
+                else f"herdr agent status={','.join(statuses)}"
+            )
+            con.execute(
+                "DELETE FROM quota_pool_records WHERE job_id = ? AND pool = ?",
+                (row[0], row[1]),
+            )
+            record_event(
+                con,
+                row[0],
+                "quota_pool.stale_cleanup",
+                {
+                    "job_id": row[0],
+                    "pool": row[1],
+                    "profile": row[2],
+                    "started_at": row[3],
+                    "agent_label": agent_label,
+                    "reason": reason,
+                    "herdr_status": statuses,
+                },
+            )
+            stale_quota_pool.append(
+                {
+                    "job_id": row[0],
+                    "pool": row[1],
+                    "profile": row[2],
+                    "started_at": row[3],
+                    "agent_label": agent_label,
+                    "herdr_status": statuses,
+                }
+            )
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
@@ -882,7 +1061,12 @@ def cmd_gc(args: argparse.Namespace) -> dict:
         "transitioned": transitions,
         "retained": len(rows),
         "stale_quota_pool": stale_quota_pool,
-        "live_jobs": None if live_jobs is None else len(live_jobs),
+        "unresolved_quota_pool": unresolved_quota_pool,
+        "unsafe_quota_pool": unsafe_quota_pool,
+        "live_agents": sum(
+            1 for agent in herdr_agents if agent["status"] == HERDR_LIVE_STATUS
+        ),
+        "herdr_agents": len(herdr_agents),
     }
 
 
@@ -1043,7 +1227,17 @@ def render_text(command: str, result: dict) -> str:
         for item in result.get("stale_quota_pool", []):
             lines.append(
                 f"  job_id={item['job_id']} pool={item['pool']} profile={item['profile']}"
+                f" label={item['agent_label']} status={','.join(item['herdr_status']) or 'absent'}"
                 f" started_at={item['started_at']} -> stale-cleaned"
+            )
+        for item in result.get("unresolved_quota_pool", []):
+            lines.append(
+                f"  job_id={item['job_id']} pool={item['pool']} -> retained ({item['reason']})"
+            )
+        for item in result.get("unsafe_quota_pool", []):
+            lines.append(
+                f"  job_id={item['job_id']} pool={item['pool']} label={item['agent_label']}"
+                f" status={','.join(item['herdr_status'])} -> retained ({item['reason']})"
             )
         return "\n".join(lines)
     return " ".join(f"{k}={v}" for k, v in result.items() if k != "ok")
@@ -1066,6 +1260,10 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("--job", required=True, help="job id")
     claim.add_argument("--lane", required=True, help="owner lane")
     claim.add_argument("--t", required=True, choices=T_LEVELS, help="규모 등급")
+    claim.add_argument(
+        "--agent-label",
+        help="exact Herdr agent name/label for this job (defaults to --job; persisted in job.claim)",
+    )
 
     lease = sub.add_parser("lease", parents=[common], help="원자적 lease 획득. 성공 시 token 출력")
     lease.add_argument("--job", required=True, help="job id")
@@ -1107,7 +1305,7 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         const="",
         metavar="PATH",
-        help="herdr agent list JSON 경로(생략 시 HERDR_BIN herdr agent list 실행); 죽은 job만 정리",
+        help="herdr agent list JSON 경로(생략 시 설치된 HERDR_BIN/`herdr agent list` 실행)",
     )
 
     event = sub.add_parser("event", parents=[common], help="job event 제출(atomic rename)")
