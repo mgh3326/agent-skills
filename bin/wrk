@@ -74,8 +74,9 @@ Options:
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
 the job and records its quota-pool execution in arbiter. arbiter resolves the
 pool from scopefuel's own output — wrk holds no pool mapping. A quota-pool
-record failure is warned and does not deny the spawn; a failed spawn releases
-the record. The scopefuel gate and arbiter claim remain fail-closed.
+claim/record or preparation failure is warned and does not deny the spawn; a
+failed spawn releases a successfully created record. The scopefuel gate remains
+fail-closed, while exclusive arbiter leases retain their own fail-closed rules.
 
 Canonical codex profiles: codex-terra, codex-luna, codex-sol.
 Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
@@ -180,8 +181,8 @@ arbiter_admit() {
     return 0
   fi
   if [[ ! -x "$ARBITER" ]]; then
-    echo "wrk: arbiter exists but is not executable: $ARBITER" >&2
-    exit 3
+    warn "arbiter quota-pool record unavailable (not executable: $ARBITER); continuing spawn"
+    return 0
   fi
   local probe probe_rc
   set +e
@@ -193,9 +194,8 @@ arbiter_admit() {
       warn "installed arbiter has no lease subcommand; admission control skipped during installation transition"
       return 0
     fi
-    [[ -z "$probe" ]] || printf '%s\n' "$probe" >&2
-    echo "wrk: arbiter probe failed (exit $probe_rc)" >&2
-    exit 3
+    warn "arbiter quota-pool record probe failed (exit $probe_rc); continuing spawn"
+    return 0
   fi
   if [[ "$GATE_READY" -ne 1 ]]; then
     # No scopefuel result means no authoritative pool. Leasing a guessed pool would
@@ -206,25 +206,36 @@ arbiter_admit() {
 
   local claim_rc
   set +e
-  "$ARBITER" claim --job "$JOB_ID" --lane "$JOB_LANE" --t "$JOB_T" >/dev/null
+  "$ARBITER" claim --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" >/dev/null
   claim_rc=$?
   set -e
   case "$claim_rc" in
     0) ;;
     # A duplicate claim is not an admission decision; the quota record below is independent.
     4) warn "arbiter job '$JOB_ID' is already claimed; the quota record still proceeds" ;;
-    *) echo "wrk: arbiter claim failed (exit $claim_rc); spawn denied" >&2; exit 3 ;;
+    *) warn "arbiter quota-pool claim failed (exit $claim_rc); continuing spawn"; return 0 ;;
   esac
 
-  local gate_file record_json record_rc parsed rc
+  local gate_file gate_rc record_json record_rc parsed rc
+  set +e
   gate_file="$(mktemp)"
-  printf '%s\n' "$GATE_OUTPUT" >"$gate_file"
+  gate_rc=$?
+  set -e
+  if [[ "$gate_rc" -ne 0 || -z "$gate_file" ]]; then
+    warn "arbiter quota-pool record preparation failed (temporary file); continuing spawn"
+    return 0
+  fi
+  if ! printf '%s\n' "$GATE_OUTPUT" >"$gate_file"; then
+    rm -f "$gate_file" || true
+    warn "arbiter quota-pool record preparation failed (gate output); continuing spawn"
+    return 0
+  fi
   set +e
   record_json="$(SCOPEFUEL_BIN="$SCOPEFUEL" "$ARBITER" lease --job "$JOB_ID" --kind quota_pool \
     --profile "$GATE_PROFILE" --gate-output "$gate_file" --json)"
   record_rc=$?
   set -e
-  rm -f "$gate_file"
+  rm -f "$gate_file" || true
   if [[ "$record_rc" -ne 0 ]]; then
     warn "arbiter quota-pool record failed (exit $record_rc); continuing spawn"
     return 0

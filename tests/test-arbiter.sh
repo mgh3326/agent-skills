@@ -13,6 +13,7 @@ trap 'chmod -R u+rwX "$TMP" 2>/dev/null || true; rm -rf "$TMP"' EXIT
 export XDG_DATA_HOME="$TMP/xdg"
 export ARBITER_INBOX_ROOT="$TMP/inbox"
 export SCOPEFUEL_BIN="$SCOPEFUEL"
+export HERDR_BIN="$ROOT/tests/fixtures/herdr"
 DB="$XDG_DATA_HOME/arbiter/state.db"
 "$SCOPEFUEL" gate -m codex-max >"$TMP/gate.out"
 
@@ -93,6 +94,13 @@ pass "② concurrent lease: exactly one acquire wins, the other is denied (exit 
 "$ARBITER" claim --job race-c --lane live --t T2 >/dev/null
 expect_rc 3 lease --job race-c --resource contended --kind path
 pass "② a held lease keeps refusing further acquires"
+
+# The quota-pool fail-open path must not weaken exclusive permit admission.
+"$ARBITER" claim --job linear-a --lane live --t T1 >/dev/null
+"$ARBITER" claim --job linear-b --lane live --t T1 >/dev/null
+expect_rc 0 lease --job linear-a --resource linear-exclusive --kind linear_permit
+expect_rc 3 lease --job linear-b --resource linear-exclusive --kind linear_permit
+pass "② linear_permit contention remains fail-closed at the arbiter boundary (exit 3)"
 
 # ------------------------------------------------------------- ③ fencing token
 "$ARBITER" claim --job fence --lane live --t T1 >/dev/null
@@ -242,26 +250,59 @@ pass "lease usage errors are rejected (exit 2), never guessed"
 # ------------------------------------------------------ quota record lifecycle
 "$ARBITER" claim --job quota-live --lane live --t T1 >/dev/null
 "$ARBITER" claim --job quota-dead --lane live --t T1 >/dev/null
+"$ARBITER" claim --job quota-idle --lane live --t T1 >/dev/null
+"$ARBITER" claim --job quota-done --lane live --t T1 >/dev/null
+"$ARBITER" claim --job quota-blocked --lane live --t T1 >/dev/null
+"$ARBITER" claim --job quota-custom-job --agent-label quota-custom-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job quota-live --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 expect_rc 0 lease --job quota-dead --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
-printf '%s\n' '{"result":{"agents":[{"name":"pool-a","agent_status":"working"},{"name":"pool-b","agent_status":"working"},{"name":"pool-c","agent_status":"working"},{"name":"pool-d","agent_status":"working"},{"name":"quota-live","agent_status":"working"}]}}' >"$TMP/agents.json"
+expect_rc 0 lease --job quota-idle --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+expect_rc 0 lease --job quota-done --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+expect_rc 0 lease --job quota-blocked --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+expect_rc 0 lease --job quota-custom-job --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+printf '%s\n' '{"result":{"agents":[{"name":"pool-a","agent_status":"working"},{"name":"pool-b","agent_status":"working"},{"name":"pool-c","agent_status":"working"},{"name":"pool-d","agent_status":"working"},{"name":"quota-live","agent_status":"working"},{"name":"quota-custom-agent","agent_status":"working"},{"name":"quota-idle","agent_status":"idle"},{"name":"quota-done","agent_status":"done"},{"name":"quota-blocked","agent_status":"blocked"}]}}' >"$TMP/agents.json"
 run gc --herdr-agent-list "$TMP/agents.json" --json
 [[ "$RC" -eq 0 ]] || fail "stale quota cleanup failed: $ERR"
 pycheck "$OUT" <<'PY' || fail "stale cleanup did not report the dead job"
 import json, sys
 d = json.load(sys.stdin)
-assert [r["job_id"] for r in d["stale_quota_pool"]] == ["quota-dead"], d
+assert [r["job_id"] for r in d["stale_quota_pool"]] == ["quota-blocked", "quota-dead", "quota-done", "quota-idle"], d
+assert {tuple(r["herdr_status"]) for r in d["stale_quota_pool"]} == {(), ("blocked",), ("done",), ("idle",)}, d
 PY
 pycheck "$("$ARBITER" status --json)" <<'PY' || fail "stale quota record remains"
 import json, sys
 d = json.load(sys.stdin)
-assert {r["job_id"] for r in d["quota_pool_records"]} >= {"pool-a", "pool-b", "quota-live"}, d
+assert {r["job_id"] for r in d["quota_pool_records"]} >= {"pool-a", "pool-b", "quota-live", "quota-custom-job"}, d
 assert "quota-dead" not in {r["job_id"] for r in d["quota_pool_records"]}, d
+assert not {"quota-blocked", "quota-done", "quota-idle"} & {r["job_id"] for r in d["quota_pool_records"]}, d
 PY
-[[ -f "$ARBITER_INBOX_ROOT/quota-dead/events/00003-quota_pool.stale_cleanup.json" ]] \
-  || fail "stale cleanup event artifact missing"
+for stale_job in quota-blocked quota-dead quota-done quota-idle; do
+  [[ -f "$ARBITER_INBOX_ROOT/$stale_job/events/00003-quota_pool.stale_cleanup.json" ]] \
+    || fail "stale cleanup event artifact missing for $stale_job"
+done
 expect_rc 0 release --job quota-live --resource codex --kind quota_pool
 pass "normal quota release and herdr-list stale cleanup leave event evidence"
+
+# Herdr acquisition/parsing failures are fail-closed and never guess at cleanup.
+expect_rc 6 gc --herdr-agent-list "$TMP/no-such-agents.json"
+printf '%s\n' '{"result":{"agents":"not-a-list"}}' >"$TMP/malformed-agents.json"
+expect_rc 6 gc --herdr-agent-list "$TMP/malformed-agents.json"
+pass "gc refuses missing or malformed Herdr lists without guessing"
+
+# Herdr's valid `unknown` startup/detection state is not stale evidence.
+"$ARBITER" claim --job quota-unknown --agent-label quota-unknown-agent --lane live --t T1 >/dev/null
+expect_rc 0 lease --job quota-unknown --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+printf '%s\n' '{"result":{"agents":[{"name":"quota-unknown-agent","agent_status":"unknown"}]}}' >"$TMP/unknown-agents.json"
+run gc --herdr-agent-list "$TMP/unknown-agents.json" --json
+[[ "$RC" -eq 6 ]] || fail "gc guessed that unknown status was stale: rc=$RC out=$OUT err=$ERR"
+grep -q 'unknown' <<<"$ERR" || fail "unknown status refusal was not explained: $ERR"
+pycheck "$("$ARBITER" status --job quota-unknown --json)" <<'PY' || fail "unknown status record was deleted"
+import json, sys
+d = json.load(sys.stdin)
+assert len(d["quota_pool_records"]) == 1, d
+assert d["quota_pool_records"][0]["job_id"] == "quota-unknown", d
+PY
+pass "gc preserves a quota record matched to Herdr's valid unknown status"
 
 # ------------------------------------------------------------ ⑤ forced release
 "$ARBITER" claim --job force --lane live --t T1 >/dev/null
@@ -295,12 +336,20 @@ cp "$DB" "$TMP/good.db"
 python3 - "$DB" <<'PY'
 import sqlite3, sys
 con = sqlite3.connect(sys.argv[1])
-con.execute("UPDATE meta SET schema_version = 99 WHERE id = 1")
+# Reproduce the installed v1 shape: schema version 1 and no v2 quota table.
+con.execute("DROP TABLE quota_pool_records")
+con.execute("UPDATE meta SET schema_version = 1 WHERE id = 1")
 con.commit()
 con.close()
 PY
 expect_rc 6 status
 grep -q 'schema mismatch' <<<"$ERR" || fail "schema mismatch not reported: $ERR"
+grep -q "db_path=$DB" <<<"$ERR" || fail "schema mismatch omitted the DB path: $ERR"
+grep -q 'observed_version=1' <<<"$ERR" || fail "schema mismatch omitted observed version: $ERR"
+grep -q 'expected_version=2' <<<"$ERR" || fail "schema mismatch omitted expected version: $ERR"
+grep -q 'back up' <<<"$ERR" || fail "schema mismatch omitted backup action: $ERR"
+grep -q 'recreate' <<<"$ERR" || fail "schema mismatch omitted recreate action: $ERR"
+grep -q 'no automatic migration' <<<"$ERR" || fail "schema mismatch promised no migration: $ERR"
 expect_rc 6 claim --job after-mismatch --lane live --t T1
 expect_rc 6 lease --job j1 --resource anything --kind path
 pass "⑤ schema mismatch is fail-closed on every command, including claim"

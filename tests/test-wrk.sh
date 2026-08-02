@@ -264,13 +264,15 @@ grep -q 'model=codex-terra' <<<"$legacy_out"
 [[ -e "$TMP/herdr.log" ]]
 unset TEST_ARBITER_BIN
 
-# arbiter present but not executable → fail-closed, nothing is spawned.
+# An arbiter command failure is observational for quota_pool; spawning continues.
 cp "$ARBITER" "$TMP/non-executable-arbiter"
 chmod -x "$TMP/non-executable-arbiter"
 rm -f "$TMP/herdr.log"
 export TEST_ARBITER_BIN="$TMP/non-executable-arbiter"
-expect_exit 3 spawn_base codex-terra
-[[ ! -e "$TMP/herdr.log" ]]
+nonexec_out="$(spawn_base codex-terra 2>&1)"
+grep -q 'quota-pool record unavailable' <<<"$nonexec_out"
+grep -q 'model=codex-terra' <<<"$nonexec_out"
+[[ -e "$TMP/herdr.log" ]]
 unset TEST_ARBITER_BIN
 
 # ⑥ record: the gate passes, arbiter records the pool scopefuel resolved, and the
@@ -289,6 +291,11 @@ arb status --job arb-ok --json |
   python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["quota_pool_records"]; assert len(r)==1 and r[0]["pool"]=="codex" and r[0]["profile"]=="codex-terra-max", d'
 arb status --job arb-ok --json |
   python3 -c 'import json,sys; j=json.load(sys.stdin)["jobs"]; assert len(j)==1 and j[0]["t_level"]=="T2" and j[0]["owner_lane"]=="default", j'
+python3 - "$ARBITER_INBOX_ROOT/arb-ok/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["agent_label"] == "fixture", event
+PY
 
 # ⑥ the pool is a record, not a mutex: another job asking for the same pool
 # succeeds and both records remain visible.
@@ -348,13 +355,15 @@ arb status --job arb-record-fail --json |
   python3 -c 'import json,sys; assert json.load(sys.stdin)["quota_pool_records"] == [], sys.stdin'
 unset TEST_ARBITER_BIN
 
-# ⑤ a broken state db denies the spawn instead of waving it through.
+# ⑤ a broken state db is a quota-record failure: warn and still spawn.
 rm -f "$TMP/herdr.log"
 export TEST_ARBITER_BIN="$ARBITER"
 printf 'not a database\n' >"$TMP/xdg/arbiter/state.db"
 rm -f "$TMP/xdg/arbiter/state.db-wal" "$TMP/xdg/arbiter/state.db-shm"
-expect_exit 3 spawn_base grok --job arb-broken --t T1
-[[ ! -e "$TMP/herdr.log" ]]
+schema_failed_out="$(spawn_base grok --job arb-broken --t T1 2>&1)"
+grep -q 'arbiter quota-pool claim failed' <<<"$schema_failed_out"
+grep -q 'continuing spawn' <<<"$schema_failed_out"
+[[ -e "$TMP/herdr.log" ]]
 rm -rf "$TMP/xdg/arbiter"
 unset TEST_ARBITER_BIN
 
