@@ -61,7 +61,7 @@ USAGE
 spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-                 [-L live|mock] [--effort LEVEL] [--job ID]
+                 [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -69,6 +69,9 @@ Options:
   -L live|mock       select lane; mock requires MOCK_MCP_PROFILE
   --effort LEVEL     override codex/Kiro/Grok/Claude(opus,sonnet) profile effort
   --job ID           arbiter job id (default: LABEL)
+  --owner NAME       spawning session name, recorded as the arbiter owner_lane
+                     (default: default). Lets that session later run
+                     `arbiter status --lane NAME` to find and reclaim its workers.
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
@@ -373,17 +376,17 @@ resolve_profile() {
 
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T=""
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER=""
   ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner)
         [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
-          --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;;
+          --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
         esac
         shift 2 ;;
       -*) die "unknown option '$1'" ;;
@@ -413,7 +416,11 @@ spawn_cmd() {
       LANE_ENV+=(--env "MCP_PROFILE=$MOCK_MCP_PROFILE")
     fi
   fi
-  JOB_LANE="${LANE:-default}"
+  # ROB-1206: arbiter owner_lane is *who spawned this*, not the execution lane.
+  # Conflating them made every record `default` (or `mock`), so an orch could not
+  # query `arbiter status --lane <itself>` to find and reclaim its own workers.
+  # -L live|mock stays the execution lane; --owner names the spawning session.
+  JOB_LANE="${OWNER:-default}"
 
   # ROB-1198 §③ / ROB-1199 claim contract: an unclassified job is not spawned.
   # There is no default T — a blank one would be recorded as fact by arbiter.
