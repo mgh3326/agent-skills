@@ -33,7 +33,7 @@ rob-lookup --count          # 쿼타 미터 = active(non-archived) 카운트
 1. **닫힌 상태만** (Done / Canceled / Duplicate). ⚠️ `linear-delete.sh` 는 Duplicate 를 closed 로
    안 쳐서 SKIP 한다 → `save_issue` 로 Canceled 로 바꾼 뒤 삭제.
 2. **leaf** — active 자식 0
-3. **active parent 없음**
+3. **active parent 없음** — 단, **역참조 코멘트를 남기면 예외로 통과**한다(아래 §2-1).
 4. **Obsidian 에 이미 preserved** (export 선행)
 5. **safety/broker 민감 키워드 미해당** — denylist: `order·broker·KIS·Alpaca·paper·execution·
    ledger·journal·approval·preflight·reconciliation·watch·TradingAgents·Decision Session·mock·
@@ -50,6 +50,26 @@ roadmap/sprint anchor, active PR 참조 중인 것.
 한다(별개 작업).
 
 **순서**: child → parent. 부모는 자식 삭제 후 다음 pass 에서 leaf 가 된다(2-pass 필요할 수 있음).
+
+### 2-1. active parent 예외 — 부모에 역참조를 남기면 자식을 지울 수 있다
+
+조건 3 이 "부모가 살아 있으면 자식도 못 지운다"로 읽히지만, **그건 Linear 안에서만 볼 때다.**
+아카이브 배치 파일은 **본문 전문 + 부모/자식 관계 + 원본 URL** 을 보존한다(2026-08-01 배치
+실측: 19건 1,205줄, 각 항목에 `- 자식: ROB-xxx` 와 `### 본문` 전문). 그러므로 자식을 지워도
+내용은 읽을 수 있다.
+
+**빠진 것은 방향 하나뿐이다** — 아카이브→원본(URL)은 있는데 **부모→아카이브 역참조가 없다.**
+부모를 열었을 때 자식이 어디로 갔는지 Linear 안에서 알 길이 없다.
+
+🔴 **그래서 active parent 를 가진 자식을 지울 때는, 삭제 전에 부모에 코멘트를 남긴다:**
+```
+ROB-525·526·527·528 은 2026-08-03 에 Canceled 후 아카이브됨(사유: <한 줄>).
+전문: <vault>/auto_trader/linear-archive/2026-08-03-<batch>.md
+```
+- 코멘트는 **삭제 전에** 남긴다. 삭제 후에는 어떤 ID 였는지 재구성이 어렵다.
+- 이 코멘트가 없으면 조건 3 은 통과하지 못한다 — 없는 채로 지우면 부모가 **추적 불가능한
+  고아 계획**을 갖게 된다.
+- 부모가 여러 자식을 잃으면 **한 코멘트에 모아서** 남긴다(코멘트 폭주 방지).
 
 ## 3. 실행 순서 (항상 이 순서)
 
