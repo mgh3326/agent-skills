@@ -11,11 +11,18 @@ description: ROB Linear 이슈를 Obsidian으로 아카이브하고 Linear에서
 
 ## 0. 용어 (운영자 정본)
 
-- **아카이브** = Obsidian 으로 옮기기(durable 기록)
-- **삭제(`issueDelete`)** = Linear 에서 빼기. hard-destroy 가 아니라 soft-archive(`archivedAt` 세팅)
-  이지만 **30일 후 purge** 되고 내용검색은 즉시 불가.
-- ⚠️ **native archive 로 바꾸라고 권하지 말 것** — 운영자가 단순성을 위해 delete 를 택했고,
-  recall 은 Obsidian grep 이 담당한다.
+- **native archive(`issueArchive`)** = 🔴 **기본 수단(2026-08-03 운영자 결정).** 쿼타 미터에서
+  빠지고(실측: issueCount 250→249), 내용은 Linear 에 그대로 남으며(제목·본문·상태 identifier
+  직접 조회 가능 실측), `issueUnarchive` 로 **같은 번호로 복원**된다. purge 없음(단, 장기
+  retention 은 미관측 — 아래 보험 참조).
+- **Obsidian export** = durable 이중화. archive 경로에서는 **보험(권장)**, delete 경로에서는
+  **필수**다.
+- **삭제(`issueDelete`)** = **노이즈 전용 최후수단.** soft-archive 후 **30일 purge**, 내용검색
+  즉시 불가. 진짜 무가치한 것(스팸·중복 생성 실수)에만.
+- ~~⚠️ native archive 로 바꾸라고 권하지 말 것~~ — **2026-08-03 폐기.** 과거 운영자가 단순성을
+  위해 delete 를 택했으나, 같은 운영자가 실측(archive 가 쿼타를 비우면서 내용·번호·복원성을
+  보존) 후 archive-first 로 전환을 결정했다. delete 의 유일한 장점이었던 "단순성"은 되돌릴 수
+  없다는 비용과 교환할 값이 아니었다.
 
 ## 1. 언제 하나 — reactive-at-cap (주기 실행 아님)
 
@@ -27,8 +34,30 @@ rob-lookup --count          # 쿼타 미터 = active(non-archived) 카운트
 - **cron 이나 주기 폴링을 걸지 말 것.** 매 배치의 선별 기준이 달라 판단이 필요하다
   (배치 이름이 매번 다른 이유: `closed-leaf-frontier`·`recency-hold`·`aggressive-cleanup`).
 - 파이프라인이 이슈를 양산하면 하루 +26 까지 증가한 기록이 있다. 한도 근접이 곧 재발한다.
+- **icebox(2026-08-03 신설)**: 닫힌 이슈만이 아니라 **미착수 Backlog** 도 대상이다.
+  "일이 유효한가"와 "Linear 에 있어야 하는가"는 별개다 — 수주 내 착수 예정이 아니면
+  archive 로 내리고, 착수 시 `issueUnarchive` 로 같은 번호로 되살린다.
+  ⚠️ 단, **브리프·계약·메모리가 번호로 참조하는 앵커 이슈**(레인 정책·봉인 계약류)는 제외.
 
-## 2. 무엇을 고르나 — 6개 조건 전부 통과해야 삭제 후보
+## 2. 무엇을 고르나 — 트랙별 조건
+
+### Track A — `issueArchive` (기본)
+
+내용이 Linear 에 남고 가역이므로 조건이 가볍다. **전부 통과해야 후보**:
+
+1. **닫힌 이슈** (Done/Canceled/Duplicate) 이고 종료 후 **5~7일 경과**(보드 가시성 hold —
+   구 2주에서 단축, 2026-08-03), **또는** 미착수 Backlog 로 **수주 내 착수 예정 없음**(icebox).
+2. **앵커 아님** — 브리프·계약·메모리가 번호로 상시 참조하는 이슈가 아님.
+3. **active PR 이 참조 중 아님.**
+4. **active parent 가 있으면 §2-1 역참조 코멘트 선행**(UI 에서 archived 자식이 숨을 수 있음).
+5. 🔴 **운영자 승인** — exact ID 목록. 특히 icebox 는 "안 할 일" 판정이 아니라
+   "지금 안 볼 일" 판정이지만, 그래도 목록 승인은 생략 불가.
+
+denylist(order·broker·mock…)는 **Track A 에 적용하지 않는다** — 금지의 근거가 "증거 소실"
+이었는데 archive 는 아무것도 소실하지 않는다. Obsidian export 는 보험으로 권장(특히
+retention 장기 관측 전까지 trading-evidence 류).
+
+### Track B — `issueDelete` (노이즈 전용) — 6개 조건 전부 통과해야
 
 1. **닫힌 상태만** (Done / Canceled / Duplicate). ⚠️ `linear-delete.sh` 는 Duplicate 를 closed 로
    안 쳐서 SKIP 한다 → `save_issue` 로 Canceled 로 바꾼 뒤 삭제.
@@ -73,17 +102,24 @@ ROB-525·526·527·528 은 2026-08-03 에 Canceled 후 아카이브됨(사유: <
 
 ## 3. 실행 순서 (항상 이 순서)
 
+**Track A (`issueArchive`, 기본)**
 ```
 ① 쿼타 스냅샷        rob-lookup --count
-② 후보 선별          §2 의 6조건. 5-check preflight 를 삭제 시점에 재확인
-③ Obsidian export    배치 md(full context) + manifest json
+② 후보 선별          §2 Track A 조건
+③ 역참조 코멘트      active parent 가 있는 자식만 (§2-1)
 ④ 🔴 운영자 승인      exact ID 목록 제시 → 명시적 승인 대기
-⑤ 승인된 ID 만 삭제   ~/bin/linear-delete.sh --confirm (또는 --canary 로 1건 선행)
-⑥ 사후 검증          trashed=true + active count 재확인
+⑤ 승인된 ID 만       GraphQL issueArchive (1건 canary → 나머지)
+⑥ 사후 검증          issueCount 감소 + 표본 1건 identifier 재조회(내용 보존 확인)
+⑦ 배치 기록          아카이브 배치 md 에 ID·사유·일자 기록 (Obsidian export 는 보험 — 권장)
 ```
+- ②까지 무승인 진행 가능. ④ 없이 ⑤ 금지.
+- 복원 = `issueUnarchive(id)` — 같은 번호로 돌아온다. 착수 결정이 나면 즉시.
 
-- **③까지는 무승인 진행 가능**(부작용 0). ④ 없이 ⑤로 넘어가지 말 것.
-- **canary 권장**: 첫 1건을 `--canary` 로 삭제하고 soft-archive 동작을 확인한 뒤 나머지.
+**Track B (`issueDelete`, 노이즈 전용)** — 구 절차 유지:
+```
+① 스냅샷 → ② 6조건 선별 → ③ 🔴 Obsidian export(필수) → ④ 🔴 운영자 승인
+→ ⑤ linear-delete.sh --confirm (--canary 선행) → ⑥ trashed=true + count 재확인
+```
 
 ## 4. 경로·도구
 
@@ -104,14 +140,22 @@ ERROR 처리 후 계속한다. 키는 스크립트가 `~/.config/linear/api-key`
 
 ## 5. 하지 말 것
 
-- **export 없이 삭제** — 30일 후 영구 소실
-- **승인 없이 삭제** — ④는 생략 불가
-- **Backlog·open 이슈 삭제** — 대상이 아니다
+- **승인 없이 archive/delete** — ④는 두 트랙 모두 생략 불가
+- **export 없이 delete** — 30일 후 영구 소실 (Track B 한정. Track A 는 보험 권장)
+- **In Progress·In Review·앵커 이슈 archive** — 활성 작업은 대상이 아니다.
+  Backlog 는 **icebox 조건 충족 + 승인 시에만** Track A 대상(delete 는 여전히 금지)
 - **주기 실행 자동화** — reactive-at-cap 이 정책이다
+- **unarchive 남발** — 되살리면 쿼타를 다시 먹는다. 착수 확정 시에만
 - **vault 데이터를 이 repo 로 옮기기** — agent-skills 는 public repo 다. 이슈 본문에 무엇이
   있을지 모른다. 경로만 참조할 것.
 
 ## 실사례 근거
+
+- **2026-08-03 (archive-first 전환 실측)**: `issueArchive(ROB-1152)` → issueCount 250→249,
+  기본 issues 쿼리에서 제외, **identifier 직접 조회로 제목·본문 1,488자·상태 전부 보존 확인.**
+  같은 날 방치 Backlog 13건 전수 조사(rob1208)에서 CANCEL 1·KEEP 7·NEEDS_OPERATOR 5 —
+  "방치 = 무효"가 아니라 "유효하지만 미착수"가 대부분임이 확인돼 icebox(가역 archive)가
+  cancel/delete 보다 정확한 수단으로 판정됨.
 
 - **2026-07-04**: 53건 선별 → 52건 삭제, active 181→134. dry-run 이 일부 `parentId` 를 null 로
   놓쳐 오분류 → 스크립트의 live children 재확인이 커버(2-pass 필요했음).
