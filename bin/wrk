@@ -234,8 +234,16 @@ arbiter_admit() {
     return 0
   fi
   set +e
+  # ROB-1213: --profile stays the gate-normalized name — arbiter cross-checks it
+  # against the gate output (fail-closed, keep). The *actual* launch goes in
+  # --launch-profile: GATE_PROFILE collapses effort variants (codex-luna|-hi|-max
+  # all gate as codex-luna-max), and recording only that made the ledger lie —
+  # 2026-08-04: T3 jobs ran gpt-5.6-luna at *medium* (B, 42) while every record
+  # claimed codex-luna-max (A+, 59). Only `ps` told the truth; finished jobs
+  # became unauditable.
+  local launch_profile="$MODEL${EFFECTIVE_EFFORT:+@$EFFECTIVE_EFFORT}"
   record_json="$(SCOPEFUEL_BIN="$SCOPEFUEL" "$ARBITER" lease --job "$JOB_ID" --kind quota_pool \
-    --profile "$GATE_PROFILE" --gate-output "$gate_file" --json)"
+    --profile "$GATE_PROFILE" --launch-profile "$launch_profile" --gate-output "$gate_file" --json)"
   record_rc=$?
   set -e
   rm -f "$gate_file" || true

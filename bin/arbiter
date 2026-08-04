@@ -620,6 +620,11 @@ def cmd_lease(args: argparse.Namespace) -> dict:
                     "job_id": args.job,
                     "pool": resource,
                     "profile": args.profile,
+                    **(
+                        {"launch_profile": args.launch_profile}
+                        if getattr(args, "launch_profile", None)
+                        else {}
+                    ),
                     "started_at": iso(moment),
                 },
             )
@@ -1270,6 +1275,12 @@ def build_parser() -> argparse.ArgumentParser:
     lease.add_argument("--resource", help="자원 이름 (--profile 과 택일)")
     lease.add_argument(
         "--profile", help="scopefuel 프로필 — quota pool 을 scopefuel 정본으로 해석한다"
+    )
+    lease.add_argument(
+        "--launch-profile",
+        help="실제 기동 프로필(모델@effort). --profile 은 gate 교차검증용 정규화 이름이라 "
+        "effort 변형을 뭉갠다(ROB-1213: T3 job 이 luna medium 으로 돌았는데 기록은 "
+        "codex-luna-max). 감사용 정보 필드 — 검증에 쓰지 않는다",
     )
     lease.add_argument(
         "--gate-output",
