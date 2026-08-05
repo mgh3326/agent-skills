@@ -203,6 +203,28 @@ ROB-1150 실주문 4건. **5건 중 5건이 명세 단계 결함이고 실행 �
   **`herdr pane wait-output <pane> --match <텍스트> --timeout <ms>`** 를 써라(기존 출력에도
   즉시 매치). 에이전트 이름/라벨은 **`[a-z][a-z0-9_-]{0,31}`** — wrk 가 스폰 전에 검증한다.
 
+### 4-1. ACP headless 워커 경로 (`acp-runner`) — TUI 스폰의 대안
+
+**언제**: T1 비거래·단발 구현/수정, 특히 브로커 표면이 없는 레포(도구·앱 레인). 구조화된
+완료 신호가 필요하거나 herdr TUI 경로의 스크래핑 비용(주입 검증·상태 플랩·깨우기)을 피하고
+싶을 때. 현재 에이전트는 **junie 만**(검증 완료 — JetBrains 쿼타, 모델 29종).
+
+```bash
+acp-runner --job <job_id> -c <worktree> -p brief.md   --model gemini-3.6-flash --timeout 1800
+# 재작업 라운드: --resume <jobs/<id>/meta.json 의 sessionId>
+# exit: 0=end_turn / 3=에이전트 오류 / 4=타임아웃 / 5=프로토콜
+```
+- 산출물: `jobs/<id>/progress.log`(실시간 스트림) · `result.md` · `meta.json`.
+- **pane 이 없다** — §6 회수 대상이 아니다(subprocess 가 완료와 함께 끝난다).
+- 🔴 **stopReason=end_turn 을 완료 증거로 쓰되 산출물 검증을 생략하지 마라.**
+  2026-08-05 실측: resume 라운드가 4초 만에 end_turn 을 반환했는데 파일은 불변이었다
+  (ACP session/load 의 대화 재생을 새 작업으로 오인한 가짜 성공 — 러너가 드레인으로
+  고쳤지만, 신호와 산출물 대조 원칙은 프로토콜이 바뀌어도 유지된다).
+- 🔴 **게이트 밖이다**: junie 는 scopefuel 미편입(JetBrains 쿼타 잔량 조회 경로 없음) —
+  `--recommend` 로 뽑히지 않는 **지정 배정**이고, 비용은 junie 의 `llmUsage`(작업당 실비용)
+  로 기록·비교한다. 급은 미측정(harness=junie AA 미측정) — 보수 B급 취급, reps 로 측정.
+- 무인 셸 실행이 가능하므로 **worktree 격리 필수·브로커/계좌 표면 금지**는 동일 적용.
+
 ## 5. 검증 루프 (스폰의 후반전)
 
 **강도는 §2-1의 T가 정한다.** T0=스폰 없음 / T1=자체검증 / T2=적대검증 1라운드 /
