@@ -27,6 +27,31 @@ def log(fh, msg):
     line = f"[{time.strftime('%H:%M:%S')}] {msg}"
     fh.write(line + "\n"); fh.flush()
 
+def cleanup_process_group(proc, process_group_id):
+    """Terminate the ACP process and every descendant in its private session."""
+    if process_group_id is None:
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
+    try:
+        os.killpg(process_group_id, 0)
+    except ProcessLookupError:
+        return
+    try:
+        os.killpg(process_group_id, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--job", required=True)
@@ -63,7 +88,9 @@ def main():
         if a.model:  cmd += ["--model", a.model]
         if a.effort: cmd += ["--effort", a.effort]
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+                            start_new_session=True)
+    process_group_id = os.getpgid(proc.pid)
     prog = open(out / "progress.log", "a")
     log(prog, f"start job={a.job} agent={a.agent} model={a.model or 'default'} cwd={cwd}")
 
@@ -190,10 +217,7 @@ def main():
             "stopReason": stop_reason, "elapsed_s": round(time.time()-t0, 1),
             "cwd": cwd}, ensure_ascii=False, indent=1))
         prog.close()
-        try:
-            proc.terminate(); proc.wait(timeout=10)
-        except Exception:
-            proc.kill()
+        cleanup_process_group(proc, process_group_id)
     print(f"acp-runner: job={a.job} stopReason={stop_reason} session={session_id} out={out}")
     return rc
 
