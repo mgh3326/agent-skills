@@ -83,7 +83,17 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
   추가·은퇴할 때마다 두 곳이 어긋난다 — 07-31 `oc-*→clinepass` 오매핑 사고의 원인).
 - **승급 후보(`⚠`)** 는 조건 충족 시에만 쓰고 **근거를 이슈에 기록**한다(예: `fable`은
   Opus 5 대비 2배 가격 → 2h+ 자율·Opus 5 실패 후·고위험 1회성·서브에이전트 다수일 때만).
+  승급 후보는 **인접 1급만** 본다(ROB-1218) — C 작업에 S+/S 프로필을 "대안"으로 올리지 않는다.
 - **비상 후보**(정책 제외분)는 다른 후보가 전부 소진·측정불가일 때만, 역시 근거 기록.
+
+🔴 **effort 별 실사용 통계 조회 — `launch_profile` 이 정본 (ROB-1213 / ROB-1218)**
+
+**`quota_pool_records.profile` 로 effort 별 실사용을 세지 마라.** 그 컬럼은 게이트 정규화
+이름이라 effort 변형을 뭉갠다(`grok` · `grok-hi` · `grok-med` → 전부 `grok-hi`). 정본은
+`events` 의 `quota_pool.record` payload 안 **`launch_profile`**(`모델@effort`, ROB-1213).
+2026-08-06 에 fable 이 낡은 컬럼으로 조회해 "grok medium 실사용 0건"으로 오판했고, 실제로는
+`grok@medium` 1건이 돌고 있었다. 급 적합성·reps 집계·실사용 카운트는 항상 `launch_profile`
+(또는 `scopefuel reps`) 으로 확인한다.
 
 ### 2-3. 하네스 서브에이전트 vs herdr 워커 (경계)
 
@@ -191,6 +201,8 @@ ROB-1150 실주문 4건. **5건 중 5건이 명세 단계 결함이고 실행 �
   --workspace <ws> --cwd <worktree> --no-focus -- <argv>`.
 - **effort 는 인자로 준다** — 같은 모델도 effort 로 급이 바뀐다(실측: Luna Light 42 → Ultra 75).
   프로필 이름에 effort 를 박지 말고 `--effort` 를 쓴다.
+  🔴 effort 별 실사용 건수는 `quota_pool_records.profile` 이 아니라 events payload 의
+  **`launch_profile`** 으로 센다(§2-2, ROB-1213). 정규화 컬럼은 effort 를 뭉갠다.
 - `~/bin/herdr-spawn` 은 `wrk spawn` 으로 위임하는 shim 이다(옛 경로 호환용, 신규 사용 금지).
 - 브리프 주입과 제출 검증은 **relay-handoff 스킬 절차**를 따른다(제출 검증 생략 금지,
   접수 확인 도구 1회 지시 포함).
