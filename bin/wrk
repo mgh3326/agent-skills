@@ -128,6 +128,44 @@ die() { echo "wrk: $*" >&2; exit 2; }
 warn() { echo "wrk: warning: $*" >&2; }
 sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
 
+# Pre-spawn advisory: if -c points at a *canonical* checkout (not a linked worktree)
+# that is off its remote default branch, warn. Does not fail the spawn — operators
+# sometimes work on canonical on purpose. Worktrees and non-git paths stay silent.
+# Default branch is never hard-coded: origin/HEAD; if unresolved, skip (false positives
+# would drown real warnings).
+warn_if_canonical_off_default() {
+  local path="$1"
+  [[ -n "$path" && -d "$path" ]] || return 0
+
+  local git_dir common_dir
+  # path-format=absolute: relative .git vs absolute common-dir would false-positive.
+  if ! git_dir="$(git -C "$path" rev-parse --path-format=absolute --git-dir 2>/dev/null)"; then
+    return 0
+  fi
+  if ! common_dir="$(git -C "$path" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    return 0
+  fi
+  # Linked worktree: git-dir is .../.git/worktrees/<name>, common-dir is the main .git.
+  # Canonical main checkout: both resolve to the same directory.
+  [[ "$git_dir" == "$common_dir" ]] || return 0
+
+  local origin_head default_branch current_branch
+  if ! origin_head="$(git -C "$path" symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null)"; then
+    return 0
+  fi
+  default_branch="${origin_head#refs/remotes/origin/}"
+  [[ -n "$default_branch" && "$default_branch" != "$origin_head" ]] || return 0
+
+  current_branch="$(git -C "$path" branch --show-current 2>/dev/null || true)"
+  # Detached HEAD or empty name: treat as off-default so the operator sees it.
+  if [[ -n "$current_branch" && "$current_branch" == "$default_branch" ]]; then
+    return 0
+  fi
+
+  local shown="${current_branch:-DETACHED}"
+  warn "canonical checkout is not on default branch: path=$path current=$shown default=$default_branch — recover: git -C $(printf '%q' "$path") switch $(printf '%q' "$default_branch")"
+}
+
 quota_gate() {
   GATE_OUTPUT=""
   GATE_READY=0
@@ -478,6 +516,9 @@ spawn_cmd() {
   [[ -n "$JOB_T" ]] ||
     die "NEEDS_CLASSIFICATION: --t T0..T3 is required (job '$JOB_ID'); classify it, do not guess"
   case "$JOB_T" in T0|T1|T2|T3) ;; *) die "--t accepts only T0, T1, T2 or T3" ;; esac
+
+  # Advisory only (never fails spawn). After -L may have rewritten CWD.
+  warn_if_canonical_off_default "$CWD"
 
   quota_gate
   arbiter_admit
