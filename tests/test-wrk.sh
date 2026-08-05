@@ -429,6 +429,75 @@ arb status --json |
   python3 -c 'import json,sys; assert not [j for j in json.load(sys.stdin)["jobs"] if j["job"]=="fixture"], "an unclassified job was claimed"'
 unset TEST_ARBITER_BIN
 
+# Canonical checkout off default branch → warn on stderr, spawn still proceeds (exit 0).
+# Worktree / on-default / unresolved origin/HEAD → silent. No hard-coded "main".
+canon_guard_spawn() {
+  local cwd="$1"
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    ARBITER_BIN="$TMP/absent-arbiter" WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+    "$WRK" spawn -c "$cwd" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1
+}
+setup_temp_repo() {
+  # $1 = dest dir. Creates a bare origin + clone with origin/HEAD = master (not main)
+  # so the guard cannot be cheating with a hard-coded "main" string compare.
+  local dest="$1" bare="$TMP/canon-guard-origin.git"
+  rm -rf "$bare" "$dest"
+  mkdir -p "$dest"
+  git init -q -b master --bare "$bare"
+  git -C "$dest" init -q -b master
+  git -C "$dest" config user.email "wrk-test@example.com"
+  git -C "$dest" config user.name "wrk-test"
+  printf 'x\n' >"$dest/README"
+  git -C "$dest" add README
+  git -C "$dest" commit -q -m init
+  git -C "$dest" remote add origin "$bare"
+  git -C "$dest" push -q -u origin master
+  git -C "$dest" remote set-head origin master
+}
+CG_REPO="$TMP/canon-guard-repo"
+setup_temp_repo "$CG_REPO"
+# 1) canonical off default → warning + spawn continues
+git -C "$CG_REPO" switch -q -c feature/off-default
+: >"$TMP/herdr.log"
+set +e
+off_out="$(canon_guard_spawn "$CG_REPO" 2>&1)"
+off_rc=$?
+set -e
+[[ "$off_rc" -eq 0 ]]
+grep -q 'canonical checkout is not on default branch' <<<"$off_out"
+grep -q "path=$CG_REPO" <<<"$off_out"
+grep -q 'current=feature/off-default' <<<"$off_out"
+grep -q 'default=master' <<<"$off_out"
+grep -q "recover: git -C" <<<"$off_out"
+grep -q 'switch' <<<"$off_out"
+grep -q '^OK ' <<<"$off_out"
+# 2) canonical on default → no canonical warning
+git -C "$CG_REPO" switch -q master
+: >"$TMP/herdr.log"
+on_out="$(canon_guard_spawn "$CG_REPO" 2>&1)"
+! grep -q 'canonical checkout is not on default branch' <<<"$on_out"
+grep -q '^OK ' <<<"$on_out"
+# 3) linked worktree off default at worktree path → silent (path is not canonical)
+CG_WT="$TMP/canon-guard-wt"
+rm -rf "$CG_WT"
+git -C "$CG_REPO" worktree add -q -b feature/wt-branch "$CG_WT"
+: >"$TMP/herdr.log"
+wt_out="$(canon_guard_spawn "$CG_WT" 2>&1)"
+! grep -q 'canonical checkout is not on default branch' <<<"$wt_out"
+grep -q '^OK ' <<<"$wt_out"
+# 4) origin/HEAD missing → quiet skip even if off default (no false positive)
+git -C "$CG_REPO" switch -q -c feature/no-origin-head
+git -C "$CG_REPO" remote remove origin
+: >"$TMP/herdr.log"
+skip_out="$(canon_guard_spawn "$CG_REPO" 2>&1)"
+! grep -q 'canonical checkout is not on default branch' <<<"$skip_out"
+grep -q '^OK ' <<<"$skip_out"
+# Guard must not hard-code main: the warn path used default=master above.
+! grep -q "default=main" <<<"$off_out"
+git -C "$CG_REPO" worktree remove -f "$CG_WT" 2>/dev/null || rm -rf "$CG_WT"
+echo "PASS canonical-checkout-guard"
+
 grep -q 'for tool in "$REPO_DIR"/bin/\*' "$ROOT/install.sh"
 
 # ROB-1190 ④-3: scopefuel 이 추천하는 모든 프로필 ⊆ wrk 가 띄울 수 있는 프로필.
