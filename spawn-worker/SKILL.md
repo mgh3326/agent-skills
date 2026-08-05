@@ -197,6 +197,11 @@ ROB-1150 실주문 4건. **5건 중 5건이 명세 단계 결함이고 실행 �
 - 감시는 `agent_status` **전이 기반**(working→비working 2분 지속 시 확인). kiro/agy는 status
   플랩(작업 중 idle/done 오표시) — 완료 판정은 상태가 아니라 **산출물/화면 마커**(PR URL·
   최종보고·inbox 파일)로. 스폰 후 5분 내 실 툴호출 없으면 stuck 판정→재스폰.
+- herdr 공식 시맨틱(0.8 번들 스킬, `herdr --skill` 이 정본): **`done` = 미열람 idle**
+  (백그라운드 완료 후 아직 UI 에서 안 봄; CLI read 는 seen 처리 안 함) — done/idle 은 같은
+  비-working 상태다. 특정 문자열 대기는 sleep+read 루프 대신
+  **`herdr pane wait-output <pane> --match <텍스트> --timeout <ms>`** 를 써라(기존 출력에도
+  즉시 매치). 에이전트 이름/라벨은 **`[a-z][a-z0-9_-]{0,31}`** — wrk 가 스폰 전에 검증한다.
 
 ## 5. 검증 루프 (스폰의 후반전)
 
