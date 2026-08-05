@@ -68,6 +68,7 @@ profiles_out="$("$WRK" profiles)"
 grep -qx 'oc-omni' <<<"$profiles_out"
 grep -qx 'kimi-k3' <<<"$profiles_out"
 grep -qx 'kimi-k27' <<<"$profiles_out"
+grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
 ! grep -qx 'codex-ultra' <<<"$profiles_out"
 ! grep -qx 'codex-luna-ultra' <<<"$profiles_out"
@@ -114,7 +115,7 @@ profiles=(
   "kiro-minimax21:kiro-sol" "kiro-haiku:kiro-haiku"
   "kiro-opus-xhigh:kiro-opus" "kiro-opus-max:kiro-opus"
   "kiro-sol-xhigh:kiro-sol" "kiro-sol-max:kiro-sol"
-  "kimi-k3:kimi-k3" "kimi-k27:kimi-k27"
+  "kimi-k3:kimi-k3" "kimi-k27:kimi-k27" "kimi-k3-low:kimi-k3-low"
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
@@ -167,6 +168,24 @@ grep -q -- '--kind kimi' "$TMP/herdr.log"
 grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3 -p "$PROMPT" -w w -l fixture --effort high
+
+# kimi-k3-low: same argv as kimi-k3, but KIMI_CODE_HOME must be injected via the
+# tab-create --env mechanism (LANE_ENV/TAB_ENV precedent), scoped to only this
+# profile — kimi-k3/kimi-k27 must NOT get KIMI_CODE_HOME.
+: >"$TMP/herdr.log"
+spawn_base kimi-k3-low >/dev/null
+grep -q -- '--kind kimi' "$TMP/herdr.log"
+grep -q -- '--auto' "$TMP/herdr.log"
+grep -q -- '-m kimi-for-coding/k3' "$TMP/herdr.log"
+grep -q -- '--env KIMI_CODE_HOME=' "$TMP/herdr.log"
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3-low -p "$PROMPT" -w w -l fixture --effort high
+: >"$TMP/herdr.log"
+spawn_base kimi-k3 >/dev/null
+! grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base kimi-k27 >/dev/null
+! grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"
 
 # ROB-1191 ⑥: Claude opus/sonnet effort wiring via CLI argv (settings.json never written).
 SETTINGS_PATH="${HOME}/.claude/settings.json"
