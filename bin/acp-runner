@@ -1,0 +1,189 @@
+#!/usr/bin/env python3
+"""acp-runner — drive an ACP agent (junie) as an observable headless worker.
+
+ROB-1216 pilot. The caller (an orch session or operator) runs this like any CLI;
+it spawns the agent as a subprocess and speaks Agent Client Protocol (JSON-RPC
+over stdio, newline-delimited). Everything the TUI path had to scrape off a
+screen is a structured message here: delivery is a request/response, progress is
+a session/update stream, permissions arrive as requests we answer by policy, and
+completion is the prompt response itself (stopReason) — no chip detection, no
+status flapping, no wake-up problem.
+
+Usage:
+  acp-runner --job ID -c CWD -p PROMPT_FILE [--agent junie] [--model M]
+             [--effort low|medium|high] [--timeout SECONDS] [--out DIR]
+             [--resume SESSION_ID]
+
+Outputs under --out (default ~/work/herdr-inbox/jobs/<job>/):
+  progress.log   human-readable update stream (tool calls, permissions, text)
+  result.md      final agent message
+  meta.json      sessionId, stopReason, timings — sessionId feeds --resume rounds
+
+Exit codes: 0 stopReason=end_turn · 3 agent error/refusal · 4 timeout · 5 protocol
+"""
+import argparse, json, os, pathlib, select, signal, subprocess, sys, time
+
+def log(fh, msg):
+    line = f"[{time.strftime('%H:%M:%S')}] {msg}"
+    fh.write(line + "\n"); fh.flush()
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--job", required=True)
+    ap.add_argument("-c", "--cwd", required=True)
+    ap.add_argument("-p", "--prompt-file", required=True)
+    ap.add_argument("--agent", default="junie", choices=["junie"])
+    ap.add_argument("--model")
+    ap.add_argument("--effort", choices=["low", "medium", "high"])
+    ap.add_argument("--timeout", type=int, default=1800)
+    ap.add_argument("--out")
+    ap.add_argument("--resume", help="ACP sessionId from a prior run (round 2+)")
+    a = ap.parse_args()
+
+    cwd = os.path.abspath(a.cwd)
+    if not os.path.isdir(cwd):
+        print(f"acp-runner: cwd not found: {cwd}", file=sys.stderr); return 5
+    prompt = pathlib.Path(a.prompt_file).read_text()
+    out = pathlib.Path(a.out or os.path.expanduser(f"~/work/herdr-inbox/jobs/{a.job}"))
+    out.mkdir(parents=True, exist_ok=True)
+
+    cmd = [a.agent, "--acp", "true", "--skip-update-check"]
+    if a.model:  cmd += ["--model", a.model]
+    if a.effort: cmd += ["--effort", a.effort]
+    proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    prog = open(out / "progress.log", "a")
+    log(prog, f"start job={a.job} agent={a.agent} model={a.model or 'default'} cwd={cwd}")
+
+    rpc_id = 0
+    pending = {}
+    def send(method, params, notify=False):
+        nonlocal rpc_id
+        msg = {"jsonrpc": "2.0", "method": method, "params": params}
+        if not notify:
+            rpc_id += 1; msg["id"] = rpc_id; pending[rpc_id] = method
+        proc.stdin.write(json.dumps(msg) + "\n"); proc.stdin.flush()
+        return None if notify else rpc_id
+
+    def reply(msg_id, result):
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": msg_id, "result": result}) + "\n")
+        proc.stdin.flush()
+
+    deadline = time.time() + a.timeout
+    answer = {}          # rpc_id -> response
+    chunks = []          # agent message text
+    session_id = a.resume
+    stop_reason = None
+
+    def pump(until_id):
+        """Read lines until response for until_id arrives or deadline."""
+        nonlocal session_id, stop_reason
+        while time.time() < deadline:
+            r, _, _ = select.select([proc.stdout], [], [], 2)
+            if not r:
+                if proc.poll() is not None:
+                    raise RuntimeError(f"agent exited early (rc={proc.returncode})")
+                continue
+            line = proc.stdout.readline()
+            if not line:
+                raise RuntimeError("agent stdout closed")
+            line = line.strip()
+            if not line: continue
+            try: m = json.loads(line)
+            except json.JSONDecodeError:
+                log(prog, f"non-json: {line[:200]}"); continue
+            if "id" in m and ("result" in m or "error" in m) and m["id"] in pending:
+                answer[m["id"]] = m; pending.pop(m["id"], None)
+                if m["id"] == until_id: return m
+                continue
+            meth = m.get("method", "")
+            if meth == "session/update":
+                u = (m.get("params") or {}).get("update") or {}
+                kind = u.get("sessionUpdate", "?")
+                if kind == "agent_message_chunk":
+                    t = ((u.get("content") or {}).get("text")) or ""
+                    chunks.append(t)
+                    if t.strip(): log(prog, f"say: {t.strip()[:300]}")
+                elif kind in ("tool_call", "tool_call_update"):
+                    log(prog, f"tool[{u.get('status','?')}]: {u.get('title') or u.get('toolCallId','?')}")
+                elif kind == "plan":
+                    log(prog, f"plan: {json.dumps(u.get('entries', []), ensure_ascii=False)[:300]}")
+                else:
+                    log(prog, f"update[{kind}]")
+            elif meth == "session/request_permission" and "id" in m:
+                p = m.get("params") or {}
+                title = ((p.get("toolCall") or {}).get("title")) or "?"
+                opts = p.get("options") or []
+                pick = next((o for o in opts if o.get("kind") == "allow_once"), None) \
+                    or next((o for o in opts if str(o.get("kind","")).startswith("allow")), None)
+                if pick is None:
+                    log(prog, f"permission[REJECT—no allow option]: {title}")
+                    reply(m["id"], {"outcome": {"outcome": "cancelled"}})
+                else:
+                    log(prog, f"permission[{pick.get('kind')}]: {title}")
+                    reply(m["id"], {"outcome": {"outcome": "selected", "optionId": pick.get("optionId")}})
+            elif "id" in m and meth:   # other agent->client requests (fs etc. — declared unsupported)
+                log(prog, f"unsupported request {meth} — error reply")
+                proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": m["id"],
+                    "error": {"code": -32601, "message": "unsupported"}}) + "\n")
+                proc.stdin.flush()
+        raise TimeoutError()
+
+    t0 = time.time()
+    try:
+        i = send("initialize", {"protocolVersion": 1, "clientCapabilities":
+                                {"fs": {"readTextFile": False, "writeTextFile": False}}})
+        r = pump(i)
+        if "error" in r: raise RuntimeError(f"initialize: {r['error']}")
+        if session_id:
+            i = send("session/load", {"sessionId": session_id, "cwd": cwd, "mcpServers": []})
+            r = pump(i)
+            if "error" in r: raise RuntimeError(f"session/load: {r['error']}")
+            log(prog, f"resumed session {session_id} — draining history replay")
+            # ACP session/load replays the whole conversation as session/update
+            # notifications. Drain them (quiet 3s) and drop replayed text so the
+            # new round's result.md is not polluted by round 1's transcript.
+            quiet = time.time() + 3
+            while time.time() < quiet:
+                r2, _, _ = select.select([proc.stdout], [], [], 0.5)
+                if not r2: continue
+                line = proc.stdout.readline()
+                if line.strip(): quiet = time.time() + 3
+            chunks.clear()
+        else:
+            i = send("session/new", {"cwd": cwd, "mcpServers": []})
+            r = pump(i)
+            if "error" in r: raise RuntimeError(f"session/new: {r['error']}")
+            session_id = (r.get("result") or {}).get("sessionId")
+            log(prog, f"session {session_id}")
+        i = send("session/prompt", {"sessionId": session_id,
+                                    "prompt": [{"type": "text", "text": prompt}]})
+        r = pump(i)
+        if "error" in r: raise RuntimeError(f"session/prompt: {r['error']}")
+        stop_reason = (r.get("result") or {}).get("stopReason")
+        log(prog, f"done stopReason={stop_reason} elapsed={time.time()-t0:.0f}s")
+        rc = 0 if stop_reason == "end_turn" else 3
+    except TimeoutError:
+        log(prog, f"TIMEOUT after {a.timeout}s — cancelling")
+        try: send("session/cancel", {"sessionId": session_id}, notify=True)
+        except Exception: pass
+        stop_reason = "timeout"; rc = 4
+    except (RuntimeError, BrokenPipeError) as e:
+        log(prog, f"PROTOCOL/AGENT ERROR: {e}")
+        stop_reason = "error"; rc = 5
+    finally:
+        (out / "result.md").write_text("".join(chunks) or "(no agent message)")
+        (out / "meta.json").write_text(json.dumps({
+            "job": a.job, "agent": a.agent, "model": a.model, "sessionId": session_id,
+            "stopReason": stop_reason, "elapsed_s": round(time.time()-t0, 1),
+            "cwd": cwd}, ensure_ascii=False, indent=1))
+        prog.close()
+        try:
+            proc.terminate(); proc.wait(timeout=10)
+        except Exception:
+            proc.kill()
+    print(f"acp-runner: job={a.job} stopReason={stop_reason} session={session_id} out={out}")
+    return rc
+
+if __name__ == "__main__":
+    sys.exit(main())
