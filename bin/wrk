@@ -160,6 +160,17 @@ quota_gate() {
 
 # ROB-1199: admission control. The quota gate answers "how much is left"; arbiter
 # answers "who holds it". fail-closed everywhere except a genuinely absent tool.
+# ROB-1214: a failed spawn must not leave its tab behind. Every retry used to
+# stack another dead tab in the workspace (measured 2026-08-05: 11 shell-only
+# panes in w16, krb0-v alone retried into 3 tabs) — invisible to agent-list
+# based sweeps because the agent process is gone. Armed after tab create,
+# disarmed at the success line alongside ARBITER_HELD=0.
+spawn_pane_cleanup() {
+  [[ "${SPAWN_PANE_OPEN:-0}" -eq 1 && -n "${PANE:-}" ]] || return 0
+  SPAWN_PANE_OPEN=0
+  "$HERDR" pane close "$PANE" >/dev/null 2>&1     && echo "wrk: closed leftover pane $PANE after spawn failure" >&2     || echo "wrk: failed to close leftover pane $PANE — close it manually" >&2
+}
+
 arbiter_release_held() {
   [[ "${ARBITER_HELD:-0}" -eq 1 ]] || return 0
   ARBITER_HELD=0
@@ -270,7 +281,7 @@ arbiter_admit() {
     return 0
   fi
   ARBITER_HELD=1
-  trap 'arbiter_release_held' EXIT
+  trap 'spawn_pane_cleanup; arbiter_release_held' EXIT
   echo "wrk: arbiter quota-pool record pool=$ARBITER_RESOURCE profile=$ARBITER_PROFILE job=$JOB_ID" >&2
 }
 
@@ -456,6 +467,7 @@ spawn_cmd() {
     PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus |
       python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
   fi
+  SPAWN_PANE_OPEN=1   # ROB-1214: disarmed only at the success line
   sleep_for 5
   START_TIMEOUT=30000; BOOT_SETTLE=12
   [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
@@ -490,6 +502,7 @@ spawn_cmd() {
   STATUS="unknown"
   if STATUS=$("$HERDR" agent list | python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent_status","unknown") for x in a if x.get("pane_id")==p),"unknown"))' "$PANE"); then :; fi
   # The spawn stands; the execution record now belongs to the worker, not to this process.
+  SPAWN_PANE_OPEN=0
   ARBITER_HELD=0
   if [[ -n "$ARBITER_RESOURCE" ]]; then
     echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
