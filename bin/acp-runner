@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""acp-runner — drive an ACP agent (junie) as an observable headless worker.
+"""acp-runner — drive an ACP agent as an observable headless worker.
 
 ROB-1216 pilot. The caller (an orch session or operator) runs this like any CLI;
 it spawns the agent as a subprocess and speaks Agent Client Protocol (JSON-RPC
@@ -10,7 +10,7 @@ completion is the prompt response itself (stopReason) — no chip detection, no
 status flapping, no wake-up problem.
 
 Usage:
-  acp-runner --job ID -c CWD -p PROMPT_FILE [--agent junie] [--model M]
+  acp-runner --job ID -c CWD -p PROMPT_FILE [--agent junie|kimi] [--model M]
              [--effort low|medium|high] [--timeout SECONDS] [--out DIR]
              [--resume SESSION_ID]
 
@@ -32,13 +32,16 @@ def main():
     ap.add_argument("--job", required=True)
     ap.add_argument("-c", "--cwd", required=True)
     ap.add_argument("-p", "--prompt-file", required=True)
-    ap.add_argument("--agent", default="junie", choices=["junie"])
+    ap.add_argument("--agent", default="junie", choices=["junie", "kimi"])
     ap.add_argument("--model")
     ap.add_argument("--effort", choices=["low", "medium", "high"])
     ap.add_argument("--timeout", type=int, default=1800)
     ap.add_argument("--out")
     ap.add_argument("--resume", help="ACP sessionId from a prior run (round 2+)")
     a = ap.parse_args()
+
+    if a.agent == "kimi" and a.effort:
+        ap.error("--effort is unsupported for agent 'kimi' (kimi CLI has no effort flag)")
 
     cwd = os.path.abspath(a.cwd)
     if not os.path.isdir(cwd):
@@ -47,9 +50,18 @@ def main():
     out = pathlib.Path(a.out or os.path.expanduser(f"~/work/herdr-inbox/jobs/{a.job}"))
     out.mkdir(parents=True, exist_ok=True)
 
-    cmd = [a.agent, "--acp", "true", "--skip-update-check"]
-    if a.model:  cmd += ["--model", a.model]
-    if a.effort: cmd += ["--effort", a.effort]
+    if a.agent == "kimi":
+        # Kimi's ACP transport is a subcommand.  KIMI_BIN keeps smoke tests and
+        # installations with a non-default CLI path explicit; production uses
+        # the PATH entry named `kimi`.
+        cmd = [os.environ.get("KIMI_BIN", "kimi")]
+        if a.model:
+            cmd += ["-m", a.model]
+        cmd += ["acp"]
+    else:
+        cmd = [a.agent, "--acp", "true", "--skip-update-check"]
+        if a.model:  cmd += ["--model", a.model]
+        if a.effort: cmd += ["--effort", a.effort]
     proc = subprocess.Popen(cmd, cwd=cwd, stdin=subprocess.PIPE,
                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
     prog = open(out / "progress.log", "a")
