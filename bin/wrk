@@ -5,6 +5,10 @@ set -euo pipefail
 HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
 SCOPEFUEL="${SCOPEFUEL_BIN:-}"
 ARBITER="${ARBITER_BIN:-}"
+# kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
+# bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
+# untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
+KIMI_CODE_LOW_HOME="${KIMI_CODE_LOW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low}"
 
 # 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
@@ -15,7 +19,7 @@ ALL_PROFILES=(
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
-  kimi-k3 kimi-k27
+  kimi-k3 kimi-k27 kimi-k3-low
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-gflash oc-sonnet46 oc-oss oc-omni
   oc-qwen37-max oc-minimax-m3
   grok grok-hi grok-med
@@ -89,6 +93,11 @@ Claude effort wiring (ROB-1191/ROB-1193): opus default=xhigh, sonnet/sonnet-med 
 haiku default=low; all support an explicit --effort override.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-for-coding/k3`; kimi-k27 uses
 `kimi --auto -m kimi-for-coding/kimi-for-coding`; the CLI has no --effort option.
+kimi-k3-low uses the same argv as kimi-k3 but injects KIMI_CODE_HOME pointing at
+the low-thinking-effort clone home from `bin/kimi-clone-home` ([thinking]
+effort="low" in that clone's config.toml — kimi has no CLI --effort flag, so this
+is the only way to change its thinking effort). Refresh the clone with
+`bin/kimi-clone-home` any time the real ~/.kimi-code credentials rotate.
 fable/claudex do not accept --effort in this scope.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
@@ -294,6 +303,7 @@ resolve_profile() {
   DEFAULT_EFFORT=""
   EFFORT_SUPPORTED=0
   ARGS=()
+  PROFILE_ENV=()
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
@@ -329,8 +339,17 @@ resolve_profile() {
     kiro-sol-xhigh) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
     kiro-sol-max) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
 
+    # EFFORT_SUPPORTED=0 for every kimi-* profile: the kimi CLI takes no --effort
+    # argv. Thinking effort is config-file-only ([thinking] effort in config.toml,
+    # see bin/kimi-clone-home) — do not confuse this with the codex/Kiro/Claude
+    # CLI --effort wiring above (ROB-1213 covered those; kimi is a different path).
     kimi-k3) PROFILE_KIND=kimi; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3) ;;
     kimi-k27) PROFILE_KIND=kimi; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/kimi-for-coding) ;;
+    # kimi-k3-low: same model argv as kimi-k3 — the differentiator is KIMI_CODE_HOME
+    # (below), pointed at the low-thinking-effort clone home, not the CLI model arg.
+    kimi-k3-low)
+      PROFILE_KIND=kimi; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3)
+      PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_LOW_HOME") ;;
 
     oc-kimi-code) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k2.7-code) ;;
     oc-glm) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/glm-5.2) ;;
@@ -368,7 +387,7 @@ resolve_profile() {
     kiro-haiku) GATE_PROFILE=kiro-haiku ;;
     kiro|kiro-sol|kiro-luna|kiro-glm|kiro-deepseek|kiro-minimax|kiro-minimax21|kiro-sol-xhigh|kiro-sol-max)
       GATE_PROFILE=kiro-sol ;;
-    kimi-k3|kimi-k27) GATE_PROFILE="$MODEL" ;;
+    kimi-k3|kimi-k27|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
       GATE_PROFILE="$MODEL" ;;
     grok|grok-hi|grok-med) GATE_PROFILE=grok-hi ;;
@@ -466,6 +485,7 @@ spawn_cmd() {
 
   TAB_ENV=()
   if [[ "${#LANE_ENV[@]}" -gt 0 ]]; then TAB_ENV+=("${LANE_ENV[@]}"); fi
+  if [[ "${#PROFILE_ENV[@]}" -gt 0 ]]; then TAB_ENV+=("${PROFILE_ENV[@]}"); fi
   if [[ "$ARBITER_HELD" -eq 1 ]]; then
     # The worker needs its own record identity to release or prove it later.
     TAB_ENV+=(--env "ARBITER_JOB=$JOB_ID" --env "ARBITER_RESOURCE=$ARBITER_RESOURCE"
@@ -483,6 +503,7 @@ spawn_cmd() {
   sleep_for 5
   START_TIMEOUT=30000; BOOT_SETTLE=12
   [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
+  [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
 
   if [[ "$MODEL" == claudex ]]; then
     "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- /usr/bin/env \

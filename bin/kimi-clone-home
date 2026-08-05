@@ -1,0 +1,105 @@
+#!/usr/bin/env bash
+# kimi-clone-home — refresh an isolated, low-thinking-effort clone of ~/.kimi-code.
+#
+# Purpose: `wrk`'s kimi-k3-low profile needs a Kimi CLI home (KIMI_CODE_HOME) whose
+# config.toml has [thinking] effort = "low", without touching the real ~/.kimi-code
+# (which stays at effort = "high" for kimi-k3/kimi-k27). This script clones only the
+# state the kimi CLI needs to authenticate and run — never sessions, logs, history,
+# or binaries — into a persistent directory outside /tmp, then patches the effort
+# line in the clone only.
+#
+# Usage: kimi-clone-home [-h|--help]
+#
+# Env overrides (mainly for tests):
+#   KIMI_CODE_SRC       source home to clone from (default: $HOME/.kimi-code)
+#   KIMI_CODE_LOW_HOME  destination clone path
+#                        (default: ${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low)
+#
+# Behavior:
+#   - Read-only against KIMI_CODE_SRC, full stop. Never writes, touches mtimes, or
+#     even opens the source for writing.
+#   - Copies only: config.toml, credentials/, oauth/, device_id, workspace-trust/,
+#     mcp.json. Everything else in the source (bin/, hooks/, logs/, search-index/,
+#     session_index.jsonl, sessions/, telemetry/, tui.toml, updates/, user-history/,
+#     workspaces.json, migrations-effort.json, ...) is deliberately excluded.
+#   - Rewrites [thinking] effort in the CLONED config.toml to "low"; every other
+#     byte of config.toml is left identical to the source.
+#   - chmod go-rwx on the whole clone directory after each run.
+#   - Idempotent: re-running fully re-copies from the current source, so credential
+#     rotation/expiry on the real ~/.kimi-code is picked up by just running this
+#     again. This is a resync, not an incremental merge.
+set -euo pipefail
+
+SRC="${KIMI_CODE_SRC:-$HOME/.kimi-code}"
+DEST="${KIMI_CODE_LOW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low}"
+
+usage() {
+  cat <<'USAGE'
+Usage: kimi-clone-home [-h|--help]
+
+Refreshes a persistent, low-thinking-effort clone of ~/.kimi-code (or
+$KIMI_CODE_SRC) at $KIMI_CODE_LOW_HOME (default:
+${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low), for use as
+KIMI_CODE_HOME by wrk's kimi-k3-low profile.
+
+Clones only: config.toml, credentials/, oauth/, device_id,
+workspace-trust/, mcp.json. Rewrites [thinking] effort = "low" in the
+clone's config.toml; every other byte of config.toml is untouched.
+The source directory is never written to. Re-run any time to resync
+(e.g. after the real ~/.kimi-code's credentials rotate).
+USAGE
+}
+
+[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
+[[ $# -eq 0 ]] || { echo "kimi-clone-home: unexpected argument '$1'" >&2; exit 2; }
+
+[[ -d "$SRC" ]] || { echo "kimi-clone-home: source not found: $SRC" >&2; exit 1; }
+[[ -r "$SRC/config.toml" ]] || { echo "kimi-clone-home: source config.toml unreadable: $SRC/config.toml" >&2; exit 1; }
+
+mkdir -p "$DEST"
+
+ITEMS=(config.toml credentials oauth device_id workspace-trust mcp.json)
+for item in "${ITEMS[@]}"; do
+  if [[ -e "$SRC/$item" ]]; then
+    rm -rf "$DEST/$item"
+    cp -R "$SRC/$item" "$DEST/$item"
+  else
+    echo "kimi-clone-home: warning: source missing '$item', skipping" >&2
+    rm -rf "$DEST/$item"
+  fi
+done
+
+# Rewrite only the effort line inside [thinking]; every other byte of
+# config.toml is left byte-identical to the source.
+python3 - "$DEST/config.toml" <<'PY'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as f:
+    text = f.read()
+
+lines = text.split("\n")
+out = []
+in_thinking = False
+changed = False
+for line in lines:
+    stripped = line.strip()
+    if stripped.startswith("[") and stripped.endswith("]"):
+        in_thinking = stripped == "[thinking]"
+    if in_thinking and re.match(r'^effort\s*=', stripped):
+        line = re.sub(r'"[^"]*"', '"low"', line, count=1)
+        changed = True
+    out.append(line)
+
+if not changed:
+    print("kimi-clone-home: warning: no [thinking] effort line found to rewrite", file=sys.stderr)
+
+with open(path, "w", encoding="utf-8") as f:
+    f.write("\n".join(out))
+PY
+
+chmod go-rwx "$DEST"
+find "$DEST" -mindepth 1 -exec chmod go-rwx {} +
+
+echo "kimi-clone-home: refreshed $DEST from $SRC"
