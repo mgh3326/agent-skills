@@ -108,8 +108,17 @@ wrk find <이름|라벨> --pane-only  # 스크립트용
 
 # 2) 제출 검증 — 정상 JSON(agent_prompted)이 와도 믿지 마라
 ~/.local/bin/herdr agent read <target> --lines 10
-#    입력창(❯) 뒤 텍스트 또는 "[Pasted text #N +M lines]" 칩 잔존 = 미제출
+#    🔴 "❯ 뒤 텍스트"는 미제출 증거가 아니다 — Claude Code 는 idle 에서 "다음에 이걸
+#       쓰실래요?" 제안을 같은 자리에 렌더하고, 실입력과의 차이는 색뿐인데 agent read 는
+#       색을 버린다(2026-08-02 실측: 이 기준으로 멀쩡한 세션에 2회 불필요 재주입 — 워커
+#       pane 조차 "❯ orch에 검증 완료 보고 릴레이해줘" 제안을 달고 있었다).
+#    ✅ 미제출의 확실한 증거 둘뿐: ① "[Pasted text #N +M lines]" 칩 잔존
+#       ② 방금 주입한 원문이 컴포저에 그대로 보임(짧은 텍스트는 칩 없이 정착— 2026-08-04 실측)
+#    ✅ 평시 판정은 상태 전이(idle→working). 대상이 이미 working 이면 전이 무증거 —
+#       추측 재주입 말고 수신측 산출물을 기다려라.
 #    "Press up to edit queued messages" + 칩 없음 = 제출됨(큐 대기) → return 보내지 마라(중복 위험)
+#    (읽기 소스: 빈 recent 는 --source visible 재시도, 전사 회수는 herdr 0.8+
+#     --source recent-unwrapped 권장)
 
 # 3) 미제출일 때만:
 ~/.local/bin/herdr agent send-keys <pane_id> return   # 키 이름은 return (cr은 invalid)

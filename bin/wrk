@@ -417,6 +417,11 @@ spawn_cmd() {
   [[ -n "$PROMPT" ]] || die "-p PROMPT_FILE is required"
   [[ -n "$WS" ]] || die "-w WORKSPACE is required"
   [[ -n "$LABEL" ]] || die "-l LABEL is required"
+  # ROB-1215 (herdr 0.8 bundled skill): agent names must match [a-z][a-z0-9_-]{0,31}
+  # — lowercase, ≤32 chars, unique among live agents. herdr rejects violations late
+  # and cryptically; retries then mutate the label (2026-08-03: legA-kiwoom-live vs
+  # lega-kiwoom — one job forked into two ids over the uppercase 'A'). Fail early.
+  [[ "$LABEL" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die "invalid label '$LABEL' — herdr agent names must match [a-z][a-z0-9_-]{0,31} (lowercase, ≤32 chars)"
   [[ -r "$PROMPT" ]] || die "prompt file is not readable: $PROMPT"
 
   [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
