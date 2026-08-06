@@ -20,8 +20,9 @@ ALL_PROFILES=(
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
   kimi-k3 kimi-k27 kimi-k3-low
-  oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-gflash oc-sonnet46 oc-oss oc-omni
+  oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
   oc-qwen37-max oc-minimax-m3
+  agy-flash
   grok grok-hi grok-med
 )
 
@@ -403,7 +404,11 @@ resolve_profile() {
     grok|grok-hi) PROFILE_KIND=grok; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     grok-med) PROFILE_KIND=grok; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
 
-    agy|agy-flash|agy-flash-med|agy-pro|agy-sonnet|agy-opus|agy-oss)
+    # ROB-1222: agy-flash는 은퇴 목록에서 제외 — agy 네이티브로 실행.
+    # 멘리: effort는 모델명에 인코딩(-high). --dangerously-skip-permissions 필수.
+    agy-flash) PROFILE_KIND=agy; ARGS=(--model gemini-3.6-flash-high --dangerously-skip-permissions) ;;
+
+    agy|agy-flash-med|agy-pro|agy-sonnet|agy-opus|agy-oss)
       die "profile '$MODEL' is retired" ;;
     *) die "unknown model profile '$MODEL'; see 'wrk spawn --help'" ;;
   esac
@@ -428,6 +433,7 @@ resolve_profile() {
     kimi-k3|kimi-k27|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
       GATE_PROFILE="$MODEL" ;;
+    agy-flash) GATE_PROFILE="agy-flash" ;;
     grok|grok-hi|grok-med) GATE_PROFILE=grok-hi ;;
   esac
 
