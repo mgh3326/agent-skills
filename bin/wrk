@@ -129,6 +129,57 @@ die() { echo "wrk: $*" >&2; exit 2; }
 warn() { echo "wrk: warning: $*" >&2; }
 sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
 
+# Kimi opens a folder-trust modal for an unregistered CWD. Seed only the
+# workspace-trust entry it needs, before the agent starts. This is deliberately
+# fail-open: trust seeding is a convenience and must never deny a Kimi spawn.
+kimi_seed_workspace_trust() {
+  local cwd="$1" kimi_home="$2" abs_cwd basename_path digest trust_dir trust_file trust_json
+
+  if ! abs_cwd="$(cd -- "$cwd" 2>/dev/null && pwd -P)"; then
+    warn "Kimi workspace trust seed skipped: cannot resolve absolute CWD: $cwd"
+    return 0
+  fi
+  basename_path="${abs_cwd##*/}"
+  if ! digest="$(printf '%s' "$abs_cwd" | shasum -a 256 2>/dev/null | awk '{print $1}')" || [[ ${#digest} -lt 12 ]]; then
+    warn "Kimi workspace trust seed skipped: cannot hash absolute CWD: $abs_cwd"
+    return 0
+  fi
+
+  trust_dir="$kimi_home/workspace-trust"
+  trust_file="$trust_dir/wd_${basename_path}_${digest:0:12}"
+  if [[ -e "$trust_file" ]]; then
+    echo "wrk: Kimi workspace trust exists: $trust_file" >&2
+    return 0
+  fi
+  if ! mkdir -p -- "$trust_dir" 2>/dev/null; then
+    warn "Kimi workspace trust seed skipped: cannot create $trust_dir"
+    return 0
+  fi
+  if ! trust_json="$(python3 - "$abs_cwd" <<'PY'
+import json
+import sys
+import time
+
+print(json.dumps({"root": sys.argv[1], "trustedAt": int(time.time() * 1000)}, separators=(",", ":")))
+PY
+)"; then
+    warn "Kimi workspace trust seed skipped: cannot encode $trust_file"
+    return 0
+  fi
+
+  # noclobber keeps an existing entry immutable even if another spawn races
+  # between the existence check and this write.
+  if ! (umask 077; set -C; printf '%s\n' "$trust_json" >"$trust_file") 2>/dev/null; then
+    if [[ -e "$trust_file" ]]; then
+      echo "wrk: Kimi workspace trust exists: $trust_file" >&2
+    else
+      warn "Kimi workspace trust seed skipped: cannot write $trust_file"
+    fi
+    return 0
+  fi
+  echo "wrk: Kimi workspace trust seeded: $trust_file" >&2
+}
+
 # Pre-spawn advisory: if -c points at a *canonical* checkout (not a linked worktree)
 # that is off its remote default branch, warn. Does not fail the spawn — operators
 # sometimes work on canonical on purpose. Worktrees and non-git paths stay silent.
@@ -343,6 +394,7 @@ resolve_profile() {
   EFFORT_SUPPORTED=0
   ARGS=()
   PROFILE_ENV=()
+  KIMI_TRUST_HOME=""
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
@@ -382,12 +434,12 @@ resolve_profile() {
     # argv. Thinking effort is config-file-only ([thinking] effort in config.toml,
     # see bin/kimi-clone-home) — do not confuse this with the codex/Kiro/Claude
     # CLI --effort wiring above (ROB-1213 covered those; kimi is a different path).
-    kimi-k3) PROFILE_KIND=kimi; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3) ;;
-    kimi-k27) PROFILE_KIND=kimi; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/kimi-for-coding) ;;
+    kimi-k3) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3) ;;
+    kimi-k27) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/kimi-for-coding) ;;
     # kimi-k3-low: same model argv as kimi-k3 — the differentiator is KIMI_CODE_HOME
     # (below), pointed at the low-thinking-effort clone home, not the CLI model arg.
     kimi-k3-low)
-      PROFILE_KIND=kimi; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3)
+      PROFILE_KIND=kimi; KIMI_TRUST_HOME="$KIMI_CODE_LOW_HOME"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3)
       PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_LOW_HOME") ;;
 
     oc-kimi-code) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k2.7-code) ;;
@@ -530,6 +582,13 @@ spawn_cmd() {
   arbiter_admit
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
 
+  if [[ "$PROFILE_KIND" == kimi ]]; then
+    if ! CWD="$(cd -- "$CWD" 2>/dev/null && pwd -P)"; then
+      die "cannot resolve Kimi CWD to an absolute path: $CWD"
+    fi
+    kimi_seed_workspace_trust "$CWD" "$KIMI_TRUST_HOME"
+  fi
+
   TAB_ENV=()
   if [[ "${#LANE_ENV[@]}" -gt 0 ]]; then TAB_ENV+=("${LANE_ENV[@]}"); fi
   if [[ "${#PROFILE_ENV[@]}" -gt 0 ]]; then TAB_ENV+=("${PROFILE_ENV[@]}"); fi
@@ -561,6 +620,13 @@ spawn_cmd() {
     "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
   fi
   sleep_for "$BOOT_SETTLE"
+  if [[ "$PROFILE_KIND" == kimi ]]; then
+    VISIBLE_SCREEN=""
+    VISIBLE_SCREEN="$($HERDR agent read "$PANE" --lines 40 --source visible 2>/dev/null || true)"
+    if grep -Fq "Trust this folder?" <<<"$VISIBLE_SCREEN"; then
+      warn "KIMI TRUST WARNING: workspace trust seeding may have been neutralized — format change suspected; 'Trust this folder?' remains visible. Spawn continues."
+    fi
+  fi
   if [[ "$PROFILE_KIND" == kiro ]]; then
     "$HERDR" agent prompt "$PANE" "/effort $EFFECTIVE_EFFORT" >/dev/null 2>&1
     sleep_for 2
