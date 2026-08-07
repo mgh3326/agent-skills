@@ -58,9 +58,9 @@ rob-lookup --count          # 쿼타 미터 = active(non-archived) 카운트
 5. 🔴 **운영자 승인** — exact ID 목록. 특히 icebox 는 "안 할 일" 판정이 아니라
    "지금 안 볼 일" 판정이지만, 그래도 목록 승인은 생략 불가.
 
-denylist(order·broker·mock…)는 **Track A 에 적용하지 않는다** — 금지의 근거가 "증거 소실"
-이었는데 archive 는 아무것도 소실하지 않는다. Obsidian export 는 보험으로 권장(특히
-retention 장기 관측 전까지 trading-evidence 류).
+denylist 는 **Track A 에 적용하지 않는다** — 금지의 근거가 "증거 소실"이었는데 archive 는
+아무것도 소실하지 않는다. Obsidian export 는 보험으로 권장(특히 retention 장기 관측 전까지
+증거성 이슈 류).
 
 ### Track B — `issueDelete` (노이즈 전용) — 6개 조건 전부 통과해야
 
