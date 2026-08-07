@@ -10,8 +10,10 @@
 #       full-context 검색은 Obsidian linear-archive가 담당. 이 도구가 두 소스를 묶는다.
 set -u
 
-VAULT="/Users/mgh3326/shared/obsidian/robin-vault/auto_trader/linear-archive"
-KEY_FILE="$HOME/.config/linear/api-key"
+# 아카이브 vault 경로는 기기마다 다르다. ROB_VAULT 로 주입하고, 없으면 조회는
+# Linear API 만으로 계속 동작한다(전문 검색만 불가) — 다른 맥북에서 죽지 않게 한다.
+VAULT="${ROB_VAULT:-}"
+KEY_FILE="${LINEAR_API_KEY_FILE:-$HOME/.config/linear/api-key}"
 API="https://api.linear.app/graphql"
 
 gql() {  # $1 = query json
@@ -32,6 +34,7 @@ print(f"TOTAL {total}/275 ({total*100//275}%)")'
     ;;
   --search)
     TERM="${2:?검색어 필요}"
+    [ -n "$VAULT" ] || { echo "rob-lookup: 전문 검색에는 ROB_VAULT 가 필요하다 (아카이브 vault 경로)" >&2; exit 2; }
     echo "== Obsidian 아카이브 검색: '$TERM' =="
     grep -rin --include="*.md" -l "$TERM" "$VAULT" 2>/dev/null | sort | while read -r f; do
       echo "--- ${f#$VAULT/}"
@@ -74,6 +77,11 @@ if desc:
     if len(lines)>30: print(f"  ... (+{len(lines)-30}줄 — 전문은 Obsidian 아카이브/Linear)")'
 
 echo
+if [ -z "$VAULT" ]; then
+  echo "== Obsidian 아카이브 =="
+  echo "  (건너뜀 — ROB_VAULT 미설정. Linear API 조회는 위에서 이미 끝났다)"
+  exit 0
+fi
 echo "== Obsidian 아카이브 =="
 # 1) 이슈당 개별 파일
 for f in "$VAULT"/issues/${ID}-*.md; do

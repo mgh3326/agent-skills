@@ -13,7 +13,7 @@ KIMI_CODE_LOW_HOME="${KIMI_CODE_LOW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/k
 # 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
 ALL_PROFILES=(
-  opus sonnet sonnet-med haiku fable claudex
+  opus sonnet sonnet-med haiku fable
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
@@ -99,7 +99,7 @@ the low-thinking-effort clone home from `bin/kimi-clone-home` ([thinking]
 effort="low" in that clone's config.toml — kimi has no CLI --effort flag, so this
 is the only way to change its thinking effort). Refresh the clone with
 `bin/kimi-clone-home` any time the real ~/.kimi-code credentials rotate.
-fable/claudex do not accept --effort in this scope.
+fable does not accept --effort in this scope.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
 USAGE
@@ -474,7 +474,6 @@ resolve_profile() {
     sonnet|sonnet-med) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
-    claudex) PROFILE_KIND=claude; ARGS=(--model gpt-5.6-sol --dangerously-skip-permissions) ;;
 
     codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
     codex-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
@@ -544,7 +543,7 @@ resolve_profile() {
     sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
-    claudex|codex|codex-sol|codex-max) GATE_PROFILE=codex-max ;;
+    codex|codex-sol|codex-max) GATE_PROFILE=codex-max ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
     codex-luna|codex-luna-hi|codex-luna-max) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
@@ -578,7 +577,7 @@ resolve_profile() {
       ;;
     grok) ARGS=(--always-approve -m grok-4.5 --effort "$EFFECTIVE_EFFORT") ;;
     claude)
-      # Append only for effort-capable Claude profiles (opus/sonnet). fable/claudex stay bare.
+      # Append only for effort-capable Claude profiles (opus/sonnet). fable stays bare.
       if [[ "$EFFORT_SUPPORTED" -eq 1 && -n "$EFFECTIVE_EFFORT" ]]; then
         ARGS+=(--effort "$EFFECTIVE_EFFORT")
       fi
@@ -682,14 +681,7 @@ spawn_cmd() {
   [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
 
-  if [[ "$MODEL" == claudex ]]; then
-    "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- /usr/bin/env \
-      ANTHROPIC_BASE_URL=http://127.0.0.1:8317 CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-sol \
-      CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY=3 ENABLE_TOOL_SEARCH=false \
-      /Users/mgh3326/.local/bin/claude "${ARGS[@]}" >/dev/null
-  else
-    "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
-  fi
+  "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
   sleep_for "$BOOT_SETTLE"
   if [[ "$PROFILE_KIND" == kimi ]]; then
     VISIBLE_SCREEN=""
