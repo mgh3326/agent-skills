@@ -35,6 +35,27 @@ if [[ "${1:-}" == gate && "${2:-}" == --help ]]; then
   esac
 fi
 
+if [[ "${1:-}" == refresh ]]; then
+  pool="${2:-}"
+  [[ "${3:-}" == --background ]] || { echo 'fixture scopefuel: refresh requires --background' >&2; exit 2; }
+  case "${WRK_REFRESH_MODE:-ok}" in
+    fail)
+      echo "fixture scopefuel: refresh failed for pool=$pool" >&2
+      exit 23
+      ;;
+    hang)
+      if [[ -n "${WRK_REFRESH_PID_LOG:-}" ]]; then
+        printf '%s\n' "$$" >>"$WRK_REFRESH_PID_LOG"
+      fi
+      exec sleep "${WRK_REFRESH_DELAY:-2}"
+      ;;
+  esac
+  if [[ -n "${WRK_REFRESH_LOG:-}" ]]; then
+    printf 'refresh %s %s\n' "$pool" "$3" >>"$WRK_REFRESH_LOG"
+  fi
+  exit 0
+fi
+
 if [[ "${1:-}" != gate || "${2:-}" != -m ]]; then
   echo 'fixture scopefuel: unexpected arguments' >&2
   exit 2

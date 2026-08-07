@@ -46,7 +46,9 @@ spawn_base() {
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
-    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" "$WRK" spawn \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S="${WRK_REFRESH_TIMEOUT_S:-5}" \
+    "$WRK" spawn \
     -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
 }
 
@@ -269,7 +271,40 @@ run_fail env WRK_GATE_MODE=broken HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" 
   "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1
 SCOPEFUEL_BIN="$TMP/missing-scopefuel" HERDR_BIN="$HERDR" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
-  --t T1 >/dev/null
+  --t T1 >"$TMP/missing.out" 2>&1
+grep -q 'scopefuel unavailable; quota gate skipped' "$TMP/missing.out"
+grep -q 'scopefuel refresh skipped; gate/arbiter did not provide a pool' "$TMP/missing.out"
+grep -q 'model=codex-terra' "$TMP/missing.out"
+
+# ROB-1227 D4: refresh is detached, uses the gate-provided pool, and exposes
+# failure/timeout warnings without changing the successful spawn.
+: >"$TMP/refresh.log"
+start_ns="$(python3 -c 'import time; print(time.time_ns())')"
+success_out="$(spawn_base codex-terra 2>&1)"
+elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - start_ns) / 1000000 ))"
+grep -q 'model=codex-terra' <<<"$success_out"
+[[ "$elapsed_ms" -lt 1000 ]]
+for _ in {1..20}; do
+  grep -q '^refresh codex --background$' "$TMP/refresh.log" && break
+  sleep 0.05
+done
+grep -q '^refresh codex --background$' "$TMP/refresh.log"
+
+failed_out="$(WRK_REFRESH_MODE=fail spawn_base codex-terra 2>&1)"
+grep -q 'scopefuel refresh failed for pool=codex; spawn already succeeded' <<<"$failed_out"
+grep -q 'model=codex-terra' <<<"$failed_out"
+
+timeout_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
+: >"$TMP/refresh.pids"
+timeout_out="$(WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=2 WRK_REFRESH_TIMEOUT_S=0.2 spawn_base codex-terra 2>&1)"
+timeout_elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - timeout_start_ns) / 1000000 ))"
+[[ "$timeout_elapsed_ms" -lt 1000 ]]
+grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' <<<"$timeout_out"
+grep -q 'model=codex-terra' <<<"$timeout_out"
+while IFS= read -r refresh_pid; do
+  [[ -z "$refresh_pid" ]] || ! ps -p "$refresh_pid" -o pid= | grep -q '[0-9]'
+done <"$TMP/refresh.pids"
+
 cp "$SCOPEFUEL" "$TMP/non-executable-scopefuel"
 chmod -x "$TMP/non-executable-scopefuel"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$TMP/non-executable-scopefuel" WRK_NO_SLEEP=1 \
