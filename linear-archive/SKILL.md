@@ -5,6 +5,11 @@ description: ROB Linear 이슈를 Obsidian으로 아카이브하고 Linear에서
 
 # linear-archive — ROB Linear 아카이브·삭제 표준 절차
 
+> ROB-NNN 은 비공개 이슈 트래커 참조이며, 각 규칙 옆 본문이 근거를 자립 설명한다.
+
+🔴 도메인 오버레이: $AGENT_SKILLS_DOMAIN/linear-archive.md 가 존재하면 이 스킬을 적용하기
+전에 반드시 먼저 읽어라. 없으면 아래 추상 규칙만 적용한다.
+
 **원칙 1: export 없이 삭제 금지.** 삭제분은 30일 후 Linear 에서 실제 purge 된다(ROB-383 실측:
 07-04 조회 가능 → 07-29 소멸). **Obsidian export 가 유일한 영구 소스**다.
 **원칙 2: 삭제는 항상 운영자 승인 게이트.** export·선별은 무승인(부작용 0), 삭제만 승인 필요.
@@ -64,9 +69,10 @@ retention 장기 관측 전까지 trading-evidence 류).
 2. **leaf** — active 자식 0
 3. **active parent 없음** — 단, **역참조 코멘트를 남기면 예외로 통과**한다(아래 §2-1).
 4. **Obsidian 에 이미 preserved** (export 선행)
-5. **safety/broker 민감 키워드 미해당** — denylist: `order·broker·KIS·Alpaca·paper·execution·
-   ledger·journal·approval·preflight·reconciliation·watch·TradingAgents·Decision Session·mock·
-   canary·audit·Prefect`
+5. **안전 민감 키워드 미해당** — denylist는 `$AGENT_SKILLS_DOMAIN/linear-archive-denylist.txt`
+   에서 읽는다(형식은 `linear-archive/denylist.txt.example` 참조 — 한 줄에 한 항목, `#` 주석
+   허용). 🔴 **파일이 없으면 Track B(delete) 전체를 차단한다** — denylist 부재를
+   "제한 없음"으로 해석하지 않는다(안전 기본값 = no-delete).
 6. **recency frontier 미만** — 최근 완료분은 보드에 잠깐 유지
    🔴 **stale backlog 를 Canceled 로 닫은 건은 예외다.** 닫는 순간 `updatedAt` 이 지금으로
    갱신돼 60일 방치분도 "최근 것"으로 잡힌다(2026-08-01 실측). 이 경우 **닫기 전의 방치
@@ -124,7 +130,7 @@ ROB-525·526·527·528 은 2026-08-03 에 Canceled 후 아카이브됨(사유: <
 ## 4. 경로·도구
 
 ```
-Obsidian vault  /Users/mgh3326/shared/obsidian/robin-vault/auto_trader/linear-archive/
+Obsidian vault  $ROB_VAULT/auto_trader/linear-archive/  (경로는 `bin/rob-lookup`과 동일 규약)
   배치 파일       YYYY-MM-DD-rob-linear-<kind>-batch-N.md   (사람용 full context)
   manifest        같은 이름의 .manifest.json / .ids.json     (기계 판독용)
   개별 이슈       issues/ROB-NNN-*.md                        (YAML frontmatter)
