@@ -1,8 +1,17 @@
 # agent-skills — 크로스에이전트 오케스트레이션 스킬 정본
 
-멀티에이전트 오케스트레이션(herdr 대장-워커 체계)의 반복 절차를 SKILL.md 포맷으로 표준화한
-묶음. **이 디렉토리(`~/.agents/skills/`)가 정본**이고, 각 에이전트는 심링크 또는 직접 스캔으로
-동일 내용을 로드한다.
+멀티에이전트 오케스트레이션(herdr 대장-워커 체계)에서 반복되는 절차를 SKILL.md 포맷으로
+표준화하고, 스폰 게이트(`wrk`)와 admission control(`arbiter`)까지 도구로 구현한 묶음이다.
+기반 도구는 [herdr](https://github.com/herdrdev/herdr)(세션 스폰·주입·감시),
+[worktrunk](https://github.com/max-sixty/worktrunk)(worktree 관리),
+[scopefuel](https://github.com/mgh3326/scopefuel)(쿼타·급 판단) — 전부 공개 repo다.
+`arbiter`는 SQLite 기반 fencing lease + admission control이며, `tests/test-arbiter.sh`가
+fencing token 단조성·stale/replay release 거부·GC가 `unknown` 기록을 추측 않고 거부하는
+것까지 인수 테스트로 검증한다.
+
+**이 디렉토리(`~/.agents/skills/`)가 정본**이고, 각 에이전트는 심링크 또는 직접 스캔으로
+동일 내용을 로드한다 — codex는 이 경로를 직접 스캔하므로 `install.sh`도 repo가
+`~/.agents/skills`에 있음을 전제한다(다른 경로면 `install.sh` 실행 시 경고).
 
 > ROB-NNN 은 비공개 이슈 트래커 참조이며, 각 규칙 옆 본문이 근거를 자립 설명한다.
 

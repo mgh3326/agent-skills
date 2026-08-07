@@ -1,0 +1,12 @@
+# OS/editor 잡파일 — worktree마다 생기지만 내용에 의미 없음
+.DS_Store
+*.swp
+
+# 워커가 repo 안에 남기는 브리프 잔재 (실사고: worker-brief.rob1227.md 가 untracked로 커밋 직전까지 남았던 사고)
+worker-brief*.md
+
+# 로컬 전용 설정 실체 — .example만 커밋 대상, 실체는 기기별 값
+*.local
+
+# 실제 denylist는 개인 값(비공개 이슈 ID 등)이라 repo에는 .example만 둔다
+linear-archive/denylist.txt
