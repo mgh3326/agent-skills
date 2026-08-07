@@ -106,7 +106,7 @@ grep -q 'model_reasoning_effort=max' "$TMP/herdr.log"
 grep -q 'model=codex-terra' <<<"$canonical_out"
 
 profiles=(
-  "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku" "fable:fable" "claudex:codex-max"
+  "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku" "fable:fable"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
@@ -204,7 +204,7 @@ grep -q -- '--model opus' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base opus >/dev/null
 grep -q -- '--effort xhigh' "$TMP/herdr.log"
-# sonnet default=high; override works; fable/claudex still reject --effort
+# sonnet default=high; override works; fable still rejects --effort
 : >"$TMP/herdr.log"
 spawn_base sonnet >/dev/null
 grep -q -- '--effort high' "$TMP/herdr.log"
@@ -221,8 +221,6 @@ grep -q -- '--model haiku' "$TMP/herdr.log"
 grep -q -- '--effort low' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m fable -p "$PROMPT" -w w -l fixture --effort high
-run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
-  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m claudex -p "$PROMPT" -w w -l fixture --effort high
 if [[ -n "$SETTINGS_SHA_BEFORE" ]]; then
   SETTINGS_SHA_AFTER="$(shasum -a 256 "$SETTINGS_PATH" | awk '{print $1}')"
   [[ "$SETTINGS_SHA_BEFORE" == "$SETTINGS_SHA_AFTER" ]]
@@ -241,10 +239,6 @@ grep -q -- '--model cline-pass/cline-pass/qwen3.7-max' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base oc-minimax-m3 >/dev/null
 grep -q -- '--model cline-pass/cline-pass/minimax-m3' "$TMP/herdr.log"
-: >"$TMP/herdr.log"
-spawn_base claudex >/dev/null
-grep -q '/usr/bin/env' "$TMP/herdr.log"
-
 : >"$TMP/herdr.log"
 once_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=prompt-wait-fails WRK_FIXTURE_LOG="$TMP/herdr.log" \

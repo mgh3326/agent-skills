@@ -6,7 +6,7 @@ set -euo pipefail
 pool_for() {
   case "$1" in
     opus|sonnet|fable|haiku) echo claude ;;
-    claudex|codex*) echo codex ;;
+    codex*) echo codex ;;
     kiro*) echo kiro ;;
     oc-gflash|oc-sonnet46|oc-oss) echo agy ;;
     oc-omni) echo omniroute ;;
