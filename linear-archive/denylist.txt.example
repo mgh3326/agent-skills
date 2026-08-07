@@ -1,0 +1,9 @@
+# linear-archive Track B(issueDelete) denylist — 형식 예시 (실제 값 아님)
+#
+# 실제 파일: $AGENT_SKILLS_DOMAIN/linear-archive-denylist.txt
+# 한 줄에 한 항목(대소문자 무시, 부분 일치). '#'로 시작하는 줄은 주석.
+#
+# 이 파일이 보여주는 것은 "형식"뿐이다 — 실제 안전 민감 키워드 목록은 이 repo(public)에
+# 두지 않는다. AGENT_SKILLS_DOMAIN 아래 개인 경로에 실제 파일을 만들어 채워라.
+example-term-1
+example-term-2

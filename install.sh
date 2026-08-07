@@ -18,6 +18,11 @@ check_deps() {
   done
   command -v wt >/dev/null 2>&1 || type wt >/dev/null 2>&1 \
     && echo "  ✓ wt" || echo "  △ wt — 셸 함수라 비로그인 셸에선 안 보일 수 있음 (폴백: git worktree add + 수동 .env)"
+  if [ -n "${AGENT_SKILLS_DOMAIN:-}" ] && [ -d "$AGENT_SKILLS_DOMAIN" ]; then
+    echo "  ✓ 도메인 오버레이: 있음 ($AGENT_SKILLS_DOMAIN)"
+  else
+    echo "  · 도메인 오버레이: 없음 (미설정 — 정상, 추상 규칙만 적용)"
+  fi
   return $ok
 }
 
