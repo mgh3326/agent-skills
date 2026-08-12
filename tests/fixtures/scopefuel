@@ -17,14 +17,23 @@ pool_for() {
 }
 
 if [[ "${1:-}" == --json ]]; then
+  json_rc=0
+  schema_value=scopefuel.v1
+  providers='[{"id":"claude"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"}]'
   case "${WRK_SCOPEFUEL_JSON_MODE:-ok}" in
     broken) echo 'scopefuel: json fetch failed' >&2; exit 7 ;;
     garbage) echo 'not json at all'; exit 0 ;;
+    # degraded: 한 풀이 측정 불가면 scopefuel 은 exit 1 을 내지만 JSON 은 온전하다.
+    # arbiter known_pools() 는 이 경우에도 pool 목록을 신뢰해야 한다 (실사고: agy 비컨
+    # 사망 → 무관한 codex 스폰의 quota 기록이 조용히 누락).
+    degraded) json_rc=1 ;;
     drift) providers='[{"id":"claude"},{"id":"kiro"}]' ;;
-    *) providers='[{"id":"claude"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"}]' ;;
+    empty) providers='[]' ;;
+    schema) schema_value=scopefuel.v0 ;;
+    *) : ;;
   esac
-  printf '{"schema":"scopefuel.v1","generated_at":"2026-08-01T00:00:00+00:00","summary":{"mark":"ok","usage_mark":"ok"},"providers":%s}\n' "$providers"
-  exit 0
+  printf '{"schema":"%s","generated_at":"2026-08-01T00:00:00+00:00","summary":{"mark":"ok","usage_mark":"ok"},"providers":%s}\n' "$schema_value" "$providers"
+  exit "$json_rc"
 fi
 
 if [[ "${1:-}" == gate && "${2:-}" == --help ]]; then
