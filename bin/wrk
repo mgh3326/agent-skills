@@ -16,9 +16,6 @@ ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max
-  kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
-  kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
-  kiro-sol-xhigh kiro-sol-max
   kimi-k3 kimi-k27 kimi-k3-low
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
   oc-qwen37-max oc-minimax-m3
@@ -73,7 +70,7 @@ Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
   --t T0..T3         job scale; required — an unclassified job is not spawned
   -L live|mock       select lane; mock requires MOCK_MCP_PROFILE
-  --effort LEVEL     override codex/Kiro/Grok/Claude(opus,sonnet) profile effort
+  --effort LEVEL     override codex/Grok/Claude(opus,sonnet) profile effort
   --job ID           arbiter job id (default: LABEL)
   --owner NAME       spawning session name, recorded as the arbiter owner_lane
                      (default: default). Lets that session later run
@@ -484,25 +481,10 @@ resolve_profile() {
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
 
-    kiro) PROFILE_KIND=kiro; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    kiro-opus) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
-    kiro-sonnet) PROFILE_KIND=kiro; PROFILE_MODEL=claude-sonnet-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    kiro-sol) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    kiro-luna) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
-    kiro-cheap) PROFILE_KIND=kiro; PROFILE_MODEL=qwen3-coder-next; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
-    kiro-glm) PROFILE_KIND=kiro; PROFILE_MODEL=glm-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    kiro-deepseek) PROFILE_KIND=kiro; PROFILE_MODEL=deepseek-v3.2; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    kiro-minimax) PROFILE_KIND=kiro; PROFILE_MODEL=minimax-m2.5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    kiro-minimax21) PROFILE_KIND=kiro; PROFILE_MODEL=minimax-m2.1; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
-    kiro-haiku) PROFILE_KIND=kiro; PROFILE_MODEL=claude-haiku-4.5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    kiro-opus-xhigh) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
-    kiro-opus-max) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    kiro-sol-xhigh) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
-    kiro-sol-max) PROFILE_KIND=kiro; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
 
     # EFFORT_SUPPORTED=0 for every kimi-* profile: the kimi CLI takes no --effort
     # argv. Thinking effort is config-file-only ([thinking] effort in config.toml,
-    # see bin/kimi-clone-home) — do not confuse this with the codex/Kiro/Claude
+    # see bin/kimi-clone-home) — do not confuse this with the codex/Claude
     # CLI --effort wiring above (ROB-1213 covered those; kimi is a different path).
     kimi-k3) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3) ;;
     kimi-k27) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/kimi-for-coding) ;;
@@ -546,12 +528,6 @@ resolve_profile() {
     codex|codex-sol|codex-max) GATE_PROFILE=codex-max ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
     codex-luna|codex-luna-hi|codex-luna-max) GATE_PROFILE=codex-luna-max ;;
-    kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
-    kiro-sonnet) GATE_PROFILE=kiro-sonnet ;;
-    kiro-cheap) GATE_PROFILE=kiro-cheap ;;
-    kiro-haiku) GATE_PROFILE=kiro-haiku ;;
-    kiro|kiro-sol|kiro-luna|kiro-glm|kiro-deepseek|kiro-minimax|kiro-minimax21|kiro-sol-xhigh|kiro-sol-max)
-      GATE_PROFILE=kiro-sol ;;
     kimi-k3|kimi-k27|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
       GATE_PROFILE="$MODEL" ;;
@@ -561,7 +537,6 @@ resolve_profile() {
 
   if [[ -n "$EFFORT" ]]; then
     case "$EFFORT" in low|medium|high|xhigh|max|ultra) ;; *) die "unknown effort '$EFFORT'" ;; esac
-    [[ "$PROFILE_KIND" != kiro || "$EFFORT" != ultra ]] || die "Kiro does not support --effort ultra"
     [[ "$EFFORT_SUPPORTED" -eq 1 ]] || die "--effort is unsupported for profile '$MODEL'"
     EFFECTIVE_EFFORT="$EFFORT"
   else
@@ -570,11 +545,6 @@ resolve_profile() {
 
   case "$PROFILE_KIND" in
     codex) ARGS=(--yolo -m "$PROFILE_MODEL" -c "model_reasoning_effort=$EFFECTIVE_EFFORT") ;;
-    kiro)
-      ARGS=(chat --v3 --trust-all-tools --require-mcp-startup)
-      [[ -z "$PROFILE_MODEL" ]] || ARGS+=(--model "$PROFILE_MODEL")
-      ARGS+=(--effort "$EFFECTIVE_EFFORT")
-      ;;
     grok) ARGS=(--always-approve -m grok-4.5 --effort "$EFFECTIVE_EFFORT") ;;
     claude)
       # Append only for effort-capable Claude profiles (opus/sonnet). fable stays bare.
@@ -678,7 +648,6 @@ spawn_cmd() {
   SPAWN_PANE_OPEN=1   # ROB-1214: disarmed only at the success line
   sleep_for 5
   START_TIMEOUT=30000; BOOT_SETTLE=12
-  [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
 
   "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
@@ -689,10 +658,6 @@ spawn_cmd() {
     if grep -Fq "Trust this folder?" <<<"$VISIBLE_SCREEN"; then
       warn "KIMI TRUST WARNING: workspace trust seeding may have been neutralized — format change suspected; 'Trust this folder?' remains visible. Spawn continues."
     fi
-  fi
-  if [[ "$PROFILE_KIND" == kiro ]]; then
-    "$HERDR" agent prompt "$PANE" "/effort $EFFECTIVE_EFFORT" >/dev/null 2>&1
-    sleep_for 2
   fi
   if [[ "$PROFILE_KIND" == opencode ]]; then
     "$HERDR" agent prompt "$PANE" "$(<"$PROMPT")" >/dev/null 2>&1

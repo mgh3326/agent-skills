@@ -7,7 +7,6 @@ pool_for() {
   case "$1" in
     opus|sonnet|fable|haiku) echo claude ;;
     codex*) echo codex ;;
-    kiro*) echo kiro ;;
     oc-gflash|oc-sonnet46|oc-oss) echo agy ;;
     oc-omni) echo omniroute ;;
     oc-*) echo clinepass ;;
@@ -17,14 +16,20 @@ pool_for() {
 }
 
 if [[ "${1:-}" == --json ]]; then
+  json_rc=0
+  schema_value=scopefuel.v1
+  providers='[{"id":"claude"},{"id":"codex"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"}]'
   case "${WRK_SCOPEFUEL_JSON_MODE:-ok}" in
     broken) echo 'scopefuel: json fetch failed' >&2; exit 7 ;;
     garbage) echo 'not json at all'; exit 0 ;;
-    drift) providers='[{"id":"claude"},{"id":"kiro"}]' ;;
-    *) providers='[{"id":"claude"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"}]' ;;
+    degraded) json_rc=1 ;;
+    drift) providers='[{"id":"claude"}]' ;;
+    empty) providers='[]' ;;
+    schema) schema_value=scopefuel.v0 ;;
+    *) : ;;
   esac
-  printf '{"schema":"scopefuel.v1","generated_at":"2026-08-01T00:00:00+00:00","summary":{"mark":"ok","usage_mark":"ok"},"providers":%s}\n' "$providers"
-  exit 0
+  printf '{"schema":"%s","generated_at":"2026-08-01T00:00:00+00:00","summary":{"mark":"ok","usage_mark":"ok"},"providers":%s}\n' "$schema_value" "$providers"
+  exit "$json_rc"
 fi
 
 if [[ "${1:-}" == gate && "${2:-}" == --help ]]; then

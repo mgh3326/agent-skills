@@ -49,7 +49,6 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 |---|---|---|
 | codex | `~/.agents/skills/` | **직접 스캔** (심링크 불요) |
 | claude | `~/.claude/skills/` | 심링크 |
-| kiro | `~/.kiro/skills/` | 심링크 |
 | agy | `~/.gemini/skills/` | 심링크 |
 | opencode | `~/.config/opencode/skills/` | 심링크 (07-30 추가 — 4스킬 인식 실측) |
 

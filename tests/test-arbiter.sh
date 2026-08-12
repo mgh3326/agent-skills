@@ -235,7 +235,14 @@ expect_rc 6 lease --job pool-b --kind quota_pool --profile codex-max --gate-outp
 expect_rc 6 lease --job pool-b --kind quota_pool --profile codex-max --gate-output "$TMP/other.out"
 pass "gate output without a pool, or for another profile, is refused (exit 6)"
 
-for mode in drift broken garbage; do
+export WRK_SCOPEFUEL_JSON_MODE=degraded
+"$ARBITER" claim --job pool-degraded --lane live --t T1 >/dev/null
+expect_rc 0 lease --job pool-degraded --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+expect_rc 0 release --job pool-degraded --resource codex --kind quota_pool
+unset WRK_SCOPEFUEL_JSON_MODE
+pass "scopefuel exit 1 with valid scopefuel.v1 JSON still resolves the pool"
+
+for mode in drift broken garbage empty schema; do
   export WRK_SCOPEFUEL_JSON_MODE="$mode"
   expect_rc 6 lease --job pool-b --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
   unset WRK_SCOPEFUEL_JSON_MODE

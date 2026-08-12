@@ -74,6 +74,8 @@ grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
 ! grep -qx 'codex-ultra' <<<"$profiles_out"
 ! grep -qx 'codex-luna-ultra' <<<"$profiles_out"
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kiro-sol -p "$PROMPT" -w w -l fixture
 
 name_out="$(WRK_FIXTURE_SCENARIO=find-name HERDR_BIN="$HERDR" "$WRK" find orch)"
 grep -q 'pane_id=w:p1' <<<"$name_out"
@@ -111,12 +113,6 @@ profiles=(
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
   "codex-terra-max:codex-terra-max" "codex-luna-max:codex-luna-max"
-  "kiro:kiro-sol" "kiro-opus:kiro-opus" "kiro-sonnet:kiro-sonnet"
-  "kiro-sol:kiro-sol" "kiro-luna:kiro-sol" "kiro-cheap:kiro-cheap"
-  "kiro-glm:kiro-sol" "kiro-deepseek:kiro-sol" "kiro-minimax:kiro-sol"
-  "kiro-minimax21:kiro-sol" "kiro-haiku:kiro-haiku"
-  "kiro-opus-xhigh:kiro-opus" "kiro-opus-max:kiro-opus"
-  "kiro-sol-xhigh:kiro-sol" "kiro-sol-max:kiro-sol"
   "kimi-k3:kimi-k3" "kimi-k27:kimi-k27" "kimi-k3-low:kimi-k3-low"
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
@@ -152,13 +148,6 @@ grep -q 'model_reasoning_effort=high' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base codex-sol >/dev/null
 grep -q 'model_reasoning_effort=max' "$TMP/herdr.log"
-: >"$TMP/herdr.log"
-spawn_base kiro-sol --effort low >/dev/null
-grep -q -- '--effort low' "$TMP/herdr.log"
-grep -q '/effort low' "$TMP/herdr.log"
-run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
-  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kiro-sol -p "$PROMPT" -w w -l fixture --effort ultra
-
 : >"$TMP/herdr.log"
 spawn_base kimi-k3 >/dev/null
 grep -q -- '--kind kimi' "$TMP/herdr.log"
@@ -370,8 +359,8 @@ arb status --json |
 
 # A different profile mapping to a different pool is unaffected by that denial.
 rm -f "$TMP/herdr.log"
-other_out="$(spawn_base kiro-sol --job arb-other --t T1 2>&1)"
-grep -q 'quota_record=kiro/quota_pool' <<<"$other_out"
+other_out="$(spawn_base codex-sol --job arb-other --t T1 2>&1)"
+grep -q 'quota_record=codex/quota_pool' <<<"$other_out"
 
 # ⑥ spawn failure releases the record instead of leaking it.
 rm -f "$TMP/herdr.log"

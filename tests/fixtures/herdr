@@ -12,16 +12,16 @@ case "${1:-}" in
       list)
         case "$scenario" in
           find-name)
-            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"orch","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"kiro","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"}]}}'
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"orch","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"grok","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"}]}}'
             ;;
           name-priority)
-            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"target","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"kiro","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"}]}}'
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"target","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"grok","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"}]}}'
             ;;
           find-label)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"other","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"}]}}'
             ;;
           find-multi)
-            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"},{"agent":"kiro","agent_status":"working","name":"","pane_id":"w:p3","tab_id":"w:t3","workspace_id":"w"}]}}'
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"},{"agent":"grok","agent_status":"working","name":"","pane_id":"w:p3","tab_id":"w:t3","workspace_id":"w"}]}}'
             ;;
           name-sync)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"orch","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p3","tab_id":"w:t3","workspace_id":"w"}]}}'

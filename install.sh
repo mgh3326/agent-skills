@@ -5,7 +5,7 @@
 set -u
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
-LINK_TARGETS=("$HOME/.claude/skills" "$HOME/.kiro/skills" "$HOME/.gemini/skills" "$HOME/.config/opencode/skills")
+LINK_TARGETS=("$HOME/.claude/skills" "$HOME/.gemini/skills" "$HOME/.config/opencode/skills")
 
 run_scopefuel() {
   local timeout_s="$1"
