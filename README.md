@@ -23,7 +23,10 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 개인/사설 저장소에 있다. `$AGENT_SKILLS_DOMAIN` 환경변수가 가리키는 디렉토리에
 `<skill-name>.md` 파일이 있으면 각 스킬은 적용 전에 그 파일을 먼저 읽는다.
 `AGENT_SKILLS_DOMAIN` 미설정이나 해당 디렉토리 부재는 정상 상태다(추상 규칙만 적용) —
-경고 없음. `./install.sh --check`가 오버레이 설정 여부를 한 줄로 보여준다.
+경고 없음. `./install.sh --check`가 오버레이 설정 여부를 한 줄로 보여준다. 같은
+검사에서 `bin/wrk`의 `PROFILE_KIND`에서 에이전트 CLI를 파생해 설치 여부를 표시하고,
+`scopefuel`의 캐시된 풀별 인증·쿼타 요약도 보여준다. 캐시가 없으면 빠르게 미측정으로
+넘어가며, 실측이 필요할 때만 `./install.sh --check --probe`를 사용한다.
 
 ## 스킬 목록
 
