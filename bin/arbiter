@@ -415,17 +415,25 @@ def _run(argv: list[str]) -> subprocess.CompletedProcess:
 def known_pools() -> set[str]:
     """`scopefuel --json`(schema=scopefuel.v1) 이 pool 목록의 정본이다."""
     proc = _run([scopefuel_bin(), "--json"])
-    if proc.returncode != 0:
-        raise ArbiterError(
-            EXIT_STORAGE,
-            f"scopefuel --json 실패(exit {proc.returncode}): {proc.stderr.strip()}",
-        )
     try:
         payload = json.loads(proc.stdout)
-        providers = payload["providers"]
-        pools = {str(p["id"]) for p in providers}
+        if not isinstance(payload, dict) or payload.get("schema") != "scopefuel.v1":
+            raise ValueError("schema 가 scopefuel.v1 이 아니다")
+        providers = payload.get("providers")
+        if not isinstance(providers, list):
+            raise ValueError("providers 가 목록이 아니다")
+        pools: set[str] = set()
+        for provider in providers:
+            if not isinstance(provider, dict) or not isinstance(provider.get("id"), str):
+                raise ValueError("provider id 가 문자열이 아니다")
+            if provider["id"]:
+                pools.add(provider["id"])
     except (ValueError, KeyError, TypeError) as exc:
-        raise ArbiterError(EXIT_STORAGE, f"scopefuel --json 을 해석할 수 없다: {exc}") from exc
+        stderr = proc.stderr.strip()
+        detail = f"exit {proc.returncode}"
+        if stderr:
+            detail += f": {stderr}"
+        raise ArbiterError(EXIT_STORAGE, f"scopefuel --json 을 해석할 수 없다 ({detail}): {exc}") from exc
     if not pools:
         raise ArbiterError(EXIT_STORAGE, "scopefuel --json 에 provider 가 없다")
     return pools
