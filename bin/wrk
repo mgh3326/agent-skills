@@ -23,7 +23,7 @@ ALL_PROFILES=(
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
   oc-qwen37-max oc-minimax-m3
   agy-flash
-  grok grok-hi grok-med
+  grok grok-hi grok-med grok46 grok46-med
 )
 
 profiles_help() {
@@ -466,6 +466,7 @@ resolve_profile() {
   ARGS=()
   PROFILE_ENV=()
   KIMI_TRUST_HOME=""
+  PROFILE_MODEL_ARG=""
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
@@ -525,6 +526,10 @@ resolve_profile() {
 
     grok|grok-hi) PROFILE_KIND=grok; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     grok-med) PROFILE_KIND=grok; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
+    # grok46*: 4.6 지정 스폰용 별칭. 급표 미등재(추천에 안 뜸) — 주간 한도 차감이 4.5 와
+    # 다른지 실험 중이라 지정 스폰으로만 태운다. 같은 grok 풀을 소모하므로 게이트는 grok-hi.
+    grok46) PROFILE_KIND=grok; PROFILE_MODEL_ARG=grok-4.6; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    grok46-med) PROFILE_KIND=grok; PROFILE_MODEL_ARG=grok-4.6; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
 
     # ROB-1222: agy-flash는 은퇴 목록에서 제외 — agy 네이티브로 실행.
     # 멘리: effort는 모델명에 인코딩(-high). --dangerously-skip-permissions 필수.
@@ -556,7 +561,7 @@ resolve_profile() {
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
       GATE_PROFILE="$MODEL" ;;
     agy-flash) GATE_PROFILE="agy-flash" ;;
-    grok|grok-hi|grok-med) GATE_PROFILE=grok-hi ;;
+    grok|grok-hi|grok-med|grok46|grok46-med) GATE_PROFILE=grok-hi ;;
   esac
 
   if [[ -n "$EFFORT" ]]; then
@@ -575,7 +580,7 @@ resolve_profile() {
       [[ -z "$PROFILE_MODEL" ]] || ARGS+=(--model "$PROFILE_MODEL")
       ARGS+=(--effort "$EFFECTIVE_EFFORT")
       ;;
-    grok) ARGS=(--always-approve -m grok-4.5 --effort "$EFFECTIVE_EFFORT") ;;
+    grok) ARGS=(--always-approve -m "${PROFILE_MODEL_ARG:-grok-4.5}" --effort "$EFFECTIVE_EFFORT") ;;
     claude)
       # Append only for effort-capable Claude profiles (opus/sonnet). fable stays bare.
       if [[ "$EFFORT_SUPPORTED" -eq 1 && -n "$EFFECTIVE_EFFORT" ]]; then
