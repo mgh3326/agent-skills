@@ -121,7 +121,7 @@ profiles=(
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
-  "oc-minimax-m3:oc-minimax-m3" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
+  "oc-minimax-m3:oc-minimax-m3" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
 )
 for pair in "${profiles[@]}"; do
   runtime="${pair%%:*}"
@@ -240,13 +240,16 @@ grep -q -- '--model cline-pass/cline-pass/qwen3.7-max' "$TMP/herdr.log"
 spawn_base oc-minimax-m3 >/dev/null
 grep -q -- '--model cline-pass/cline-pass/minimax-m3' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
-# grok46 별칭: 4.6 모델 인자 + 기존 grok 프로필은 4.5 유지 (실험 기간 공존)
-spawn_base grok46 >/dev/null
+# ROB-1244: 기본 grok = 4.6, grok45 는 명시 롤백 별칭, grok46 은 동의어
+spawn_base grok >/dev/null
 grep -q -- '-m grok-4.6' "$TMP/herdr.log"
 grep -q -- '--effort high' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
-spawn_base grok >/dev/null
+spawn_base grok45 >/dev/null
 grep -q -- '-m grok-4.5' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base grok46 >/dev/null
+grep -q -- '-m grok-4.6' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 once_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=prompt-wait-fails WRK_FIXTURE_LOG="$TMP/herdr.log" \
