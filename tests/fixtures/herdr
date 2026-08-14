@@ -43,7 +43,7 @@ case "${1:-}" in
           name-sync)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"orch","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p3","tab_id":"w:t3","workspace_id":"w"}]}}'
             ;;
-          landing-marker|landing-retry|landing-no|landing-pasted|opencode-retry|opencode-no)
+          landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           landing-working-scrollout)
@@ -55,6 +55,10 @@ case "${1:-}" in
         esac
         ;;
       read)
+        if [[ "$scenario" == landing-observation-fails ]]; then
+          echo 'fixture: visible read unavailable' >&2
+          exit 9
+        fi
         if fixture_brief_landed; then
           printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
         elif [[ "$scenario" == landing-pasted ]]; then

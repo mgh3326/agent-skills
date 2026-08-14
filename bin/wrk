@@ -150,12 +150,15 @@ agent_status_for_pane() {
   local pane="$1"
   "$HERDR" agent list 2>/dev/null |
     python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent_status","unknown") for x in a if x.get("pane_id")==p),"unknown"))' "$pane" \
-    2>/dev/null || true
+    2>/dev/null
 }
 
 landing_check_once() {
   local pane="$1" marker="$2" visible status
-  visible="$("$HERDR" agent read "$pane" --lines 40 --source visible 2>/dev/null || true)"
+  if ! visible="$("$HERDR" agent read "$pane" --lines 40 --source visible 2>/dev/null)"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    return 1
+  fi
 
   # Signal priority is intentional: a visible marker is direct evidence, then
   # working proves the brief may have scrolled away, and finally the UI chip
@@ -165,7 +168,10 @@ landing_check_once() {
     LANDING_SIGNAL=marker
     return 0
   fi
-  status="$(agent_status_for_pane "$pane")"
+  if ! status="$(agent_status_for_pane "$pane")"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    return 1
+  fi
   if [[ "$status" == working ]]; then
     LANDING_SIGNAL=working
     return 0
@@ -179,8 +185,11 @@ landing_check_once() {
 
 landing_check() {
   local pane="$1" marker="$2" tick
+  LANDING_CHECK_CONFIRMED=0
+  LANDING_CHECK_AMBIGUOUS=0
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     if landing_check_once "$pane" "$marker"; then return 0; fi
+    [[ "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]] && LANDING_CHECK_CONFIRMED=1
     [[ "$tick" -lt $((LANDING_CHECK_TIMEOUT_TICKS - 1)) ]] && sleep_for 0.1
   done
   return 1
@@ -783,7 +792,7 @@ spawn_cmd() {
   fi
   if landing_check "$PANE" "$PROMPT_MARKER"; then
     LANDING=yes
-  elif [[ "$PROMPT_SUBMITTED" -eq 1 ]]; then
+  elif [[ "$PROMPT_SUBMITTED" -eq 1 && "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
     # The first submission completed, but bounded screen/status measurement
     # proves it did not land. This is confirmed non-landing, not an ambiguous
     # wait result, so exactly one re-injection is allowed.
@@ -804,7 +813,7 @@ spawn_cmd() {
     fi
   fi
   STATUS="unknown"
-  STATUS="$(agent_status_for_pane "$PANE")"
+  if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   SPAWN_PANE_OPEN=0
   refresh_quota_pool

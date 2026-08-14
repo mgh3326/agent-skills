@@ -305,6 +305,12 @@ grep -q 'landed=retry' <<<"$opencode_retry_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
 echo "PASS opencode-landing-retry: $opencode_retry_out"
 
+: >"$TMP/herdr.log"
+observation_fail_out="$(TEST_FIXTURE_SCENARIO=landing-observation-fails spawn_base codex-terra 2>&1)"
+grep -q 'landed=no' <<<"$observation_fail_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
+echo "PASS ambiguous-observation-no-retry: $observation_fail_out"
+
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"
 grep -q 'gate blocked' <<<"$blocked3"
