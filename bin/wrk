@@ -22,7 +22,7 @@ ALL_PROFILES=(
   kimi-k3 kimi-k27 kimi-k3-low
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
   oc-qwen37-max oc-minimax-m3
-  agy-flash
+  agy-flash agy-flash37
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med
 )
 
@@ -602,6 +602,9 @@ resolve_profile() {
     # ROB-1222: agy-flash는 은퇴 목록에서 제외 — agy 네이티브로 실행.
     # 멘리: effort는 모델명에 인코딩(-high). --dangerously-skip-permissions 필수.
     agy-flash) PROFILE_KIND=agy; ARGS=(--model gemini-3.6-flash-high --dangerously-skip-permissions) ;;
+    # agy-flash37: 3.7 상방 시험용 지정 별칭 — 내삽(58.7, A+ 범위)이 3.6 실측 경험상
+    # 과대평가일 수 있어 급표 미등재. reps 상방 기록 축적 후 배치 판단. 게이트는 agy-flash.
+    agy-flash37) PROFILE_KIND=agy; ARGS=(--model gemini-3.7-flash-high --dangerously-skip-permissions) ;;
 
     agy|agy-flash-med|agy-pro|agy-sonnet|agy-opus|agy-oss)
       die "profile '$MODEL' is retired" ;;
@@ -628,7 +631,7 @@ resolve_profile() {
     kimi-k3|kimi-k27|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
       GATE_PROFILE="$MODEL" ;;
-    agy-flash) GATE_PROFILE="agy-flash" ;;
+    agy-flash|agy-flash37) GATE_PROFILE="agy-flash" ;;
     grok|grok-hi|grok-med|grok45|grok45-med|grok46|grok46-med) GATE_PROFILE=grok-hi ;;
   esac
 
