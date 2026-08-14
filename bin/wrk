@@ -129,6 +129,72 @@ die() { echo "wrk: $*" >&2; exit 2; }
 warn() { echo "wrk: warning: $*" >&2; }
 sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
 
+# Landing is a bounded observation, not a second boot wait. The prompt command
+# already owns its normal wait (when supported); this extra two-second window
+# only covers the hand-off race where the command returns before the visible
+# screen/status has caught up. Keeping the cap here prevents cold-start fixes
+# from turning every spawn into an unbounded wait.
+LANDING_CHECK_TIMEOUT_TICKS=20
+
+prompt_marker() {
+  local prompt_file="$1" line
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -n "${line//[[:space:]]/}" ]] || continue
+    printf '%s' "${line:0:40}"
+    return 0
+  done <"$prompt_file"
+  return 0
+}
+
+agent_status_for_pane() {
+  local pane="$1"
+  "$HERDR" agent list 2>/dev/null |
+    python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent_status","unknown") for x in a if x.get("pane_id")==p),"unknown"))' "$pane" \
+    2>/dev/null
+}
+
+landing_check_once() {
+  local pane="$1" marker="$2" visible status
+  if ! visible="$("$HERDR" agent read "$pane" --lines 40 --source visible 2>/dev/null)"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    return 1
+  fi
+
+  # Signal priority is intentional: a visible marker is direct evidence, then
+  # working proves the brief may have scrolled away, and finally the UI chip
+  # proves that the payload is queued. The working check is the key guard
+  # against re-sending a landed brief whose marker has already scrolled out.
+  if [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$visible"; then
+    LANDING_SIGNAL=marker
+    return 0
+  fi
+  if ! status="$(agent_status_for_pane "$pane")"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    return 1
+  fi
+  if [[ "$status" == working ]]; then
+    LANDING_SIGNAL=working
+    return 0
+  fi
+  if grep -Fq -- "Pasted text" <<<"$visible"; then
+    LANDING_SIGNAL=pasted
+    return 0
+  fi
+  return 1
+}
+
+landing_check() {
+  local pane="$1" marker="$2" tick
+  LANDING_CHECK_CONFIRMED=0
+  LANDING_CHECK_AMBIGUOUS=0
+  for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
+    if landing_check_once "$pane" "$marker"; then return 0; fi
+    [[ "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]] && LANDING_CHECK_CONFIRMED=1
+    [[ "$tick" -lt $((LANDING_CHECK_TIMEOUT_TICKS - 1)) ]] && sleep_for 0.1
+  done
+  return 1
+}
+
 # Kimi opens a folder-trust modal for an unregistered CWD. Seed only the
 # workspace-trust entry it needs, before the agent starts. This is deliberately
 # fail-open: trust seeding is a convenience and must never deny a Kimi spawn.
@@ -701,30 +767,64 @@ spawn_cmd() {
     "$HERDR" agent prompt "$PANE" "/effort $EFFECTIVE_EFFORT" >/dev/null 2>&1
     sleep_for 2
   fi
+  PROMPT_PAYLOAD="$(<"$PROMPT")"
+  PROMPT_MARKER="$(prompt_marker "$PROMPT")"
+  PROMPT_SUBMITTED=0
+  LANDING="no"
   if [[ "$PROFILE_KIND" == opencode ]]; then
-    "$HERDR" agent prompt "$PANE" "$(<"$PROMPT")" >/dev/null 2>&1
+    "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
+    PROMPT_SUBMITTED=1
     sleep_for 2
     "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
   else
-    PROMPT_PAYLOAD="$(<"$PROMPT")"
     if ! "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
       --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
       # The payload was already submitted. A return may settle a still-open
       # composer, but the payload must never be sent again after an ambiguous
-      # wait result.
+      # wait result. A later screen/status observation is different: only a
+      # successful prompt command followed by confirmed non-landing may use
+      # the one retry below. This preserves ROB-1186's at-most-once rule while
+      # making the safety boundary at-most-once landing.
       "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
+    else
+      PROMPT_SUBMITTED=1
+    fi
+  fi
+  if landing_check "$PANE" "$PROMPT_MARKER"; then
+    LANDING=yes
+  elif [[ "$PROMPT_SUBMITTED" -eq 1 && "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
+    # The first submission completed, but bounded screen/status measurement
+    # proves it did not land. This is confirmed non-landing, not an ambiguous
+    # wait result, so exactly one re-injection is allowed.
+    if [[ "$PROFILE_KIND" == opencode ]]; then
+      "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
+      sleep_for 2
+      "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
+    elif "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
+      --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
+      :
+    else
+      # The retry itself is also at most once; do not turn its ambiguous wait
+      # result into another payload submission.
+      "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
+    fi
+    if landing_check "$PANE" "$PROMPT_MARKER"; then
+      LANDING=retry
     fi
   fi
   STATUS="unknown"
-  if STATUS=$("$HERDR" agent list | python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent_status","unknown") for x in a if x.get("pane_id")==p),"unknown"))' "$PANE"); then :; fi
+  if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   SPAWN_PANE_OPEN=0
   refresh_quota_pool
   ARBITER_HELD=0
   if [[ -n "$ARBITER_RESOURCE" ]]; then
-    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
+    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
   else
-    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS"
+    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING"
+  fi
+  if [[ "$LANDING" == no ]]; then
+    warn "spawn succeeded but brief landed=no; pane=$PANE remains valid"
   fi
 }
 

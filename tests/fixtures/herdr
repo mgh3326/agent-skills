@@ -6,6 +6,23 @@ if [[ -n "${WRK_FIXTURE_LOG:-}" ]]; then
   printf '%s\n' "$*" >>"$WRK_FIXTURE_LOG"
 fi
 
+fixture_prompt_count() {
+  [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]] || { printf '0\n'; return; }
+  grep -c '^agent prompt ' "$WRK_FIXTURE_LOG" 2>/dev/null || true
+}
+
+fixture_brief_landed() {
+  local prompts
+  prompts="$(fixture_prompt_count)"
+  case "$scenario" in
+    landing-marker) return 0 ;;
+    landing-retry|opencode-retry)
+      if (( prompts >= 2 )); then return 0; fi
+      ;;
+  esac
+  return 1
+}
+
 case "${1:-}" in
   agent)
     case "${2:-}" in
@@ -26,10 +43,29 @@ case "${1:-}" in
           name-sync)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"orch","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p3","tab_id":"w:t3","workspace_id":"w"}]}}'
             ;;
+          landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          landing-working-scrollout)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
           *)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
         esac
+        ;;
+      read)
+        if [[ "$scenario" == landing-observation-fails ]]; then
+          echo 'fixture: visible read unavailable' >&2
+          exit 9
+        fi
+        if fixture_brief_landed; then
+          printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
+        elif [[ "$scenario" == landing-pasted ]]; then
+          printf 'Pasted text\n'
+        else
+          printf 'fixture welcome screen\n'
+        fi
         ;;
       rename)
         printf '%s\n' '{"result":{"agent_info":{"name":"renamed"}}}'
