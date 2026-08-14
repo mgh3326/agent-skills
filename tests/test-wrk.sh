@@ -46,6 +46,7 @@ spawn_base() {
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
+    WRK_FIXTURE_MARKER="${WRK_FIXTURE_MARKER:-}" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S="${WRK_REFRESH_TIMEOUT_S:-5}" \
     "$WRK" spawn \
@@ -256,8 +257,53 @@ once_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" "$WRK" spawn \
   -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
 grep -q 'model=codex-terra' <<<"$once_out"
+grep -q 'landed=yes' <<<"$once_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 [[ "$(grep -c 'agent send-keys w:p1 return' "$TMP/herdr.log")" -eq 1 ]]
+
+# ROB-1246 landing acceptance fixtures. Retry is allowed only after a
+# successful prompt plus measured non-landing.
+marker_prompt="$TMP/landing-marker.md"
+marker_first_line='marker-source-0123456789012345678901234567890123456789'
+marker_expected="${marker_first_line:0:40}"
+printf '\n%s\nsecond line\n' "$marker_first_line" >"$marker_prompt"
+PROMPT="$marker_prompt"
+: >"$TMP/herdr.log"
+marker_out="$(TEST_FIXTURE_SCENARIO=landing-marker WRK_FIXTURE_MARKER="$marker_expected" spawn_base codex-terra 2>&1)"
+grep -q 'landed=yes' <<<"$marker_out"
+grep -q "$marker_first_line" "$TMP/herdr.log"
+[[ "$(grep -c '^agent prompt ' "$TMP/herdr.log")" -eq 1 ]]
+echo "PASS ac1-marker-landed: $marker_out"
+
+PROMPT="$TMP/prompt.md"
+: >"$TMP/herdr.log"
+retry_out="$(TEST_FIXTURE_SCENARIO=landing-retry spawn_base codex-terra 2>&1)"
+grep -q 'landed=retry' <<<"$retry_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
+echo "PASS ac2-swallowed-then-retry: $retry_out"
+
+: >"$TMP/herdr.log"
+set +e
+no_landing_out="$(TEST_FIXTURE_SCENARIO=landing-no spawn_base codex-terra 2>&1)"
+no_landing_rc=$?
+set -e
+[[ "$no_landing_rc" -eq 0 ]]
+grep -q 'landed=no' <<<"$no_landing_out"
+grep -q 'spawn succeeded but brief landed=no' <<<"$no_landing_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
+echo "PASS ac3-swallowed-twice-spawn-success exit=$no_landing_rc: $no_landing_out"
+
+: >"$TMP/herdr.log"
+scrollout_out="$(TEST_FIXTURE_SCENARIO=landing-working-scrollout spawn_base codex-terra 2>&1)"
+grep -q 'landed=yes' <<<"$scrollout_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
+echo "PASS ac5-working-scrollout-no-duplicate: $scrollout_out"
+
+: >"$TMP/herdr.log"
+opencode_retry_out="$(TEST_FIXTURE_SCENARIO=opencode-retry spawn_base oc-omni 2>&1)"
+grep -q 'landed=retry' <<<"$opencode_retry_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
+echo "PASS opencode-landing-retry: $opencode_retry_out"
 
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"
