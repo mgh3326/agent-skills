@@ -32,12 +32,14 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 
 | 스킬 | 용도 |
 |---|---|
+| `orchestrate` | 완성된 설계·운영자 결정을 받아 워커 스폰~완료 검증까지 전체 루프 구동 — spawn-worker 위층 진입점 |
 | `relay-handoff` | 세션 간 작업·분석·지시 전달 — 핸드오프 5요소 템플릿 + herdr 주입·제출검증 |
 | `spawn-worker` | 워커/검증자 스폰 전 과정 — worktree 준비, 쿼타 확인·계열 라우팅, 티어맵, 브리프, 적대검증 루프, ls-remote 대조 |
 | `ask-session` | 상존 세션에 질문 보내고 답변 회수(왕복) — 답변 파일 계약 + 타임아웃·무응답 처리 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
 
-스킬 간 관계: `relay-handoff`(단방향 전달) ⊂ `ask-session`(답변 계약 붙은 왕복) ⊂
+스킬 간 관계: `orchestrate`(설계+결정 → 루프 전체 구동) 는 `spawn-worker`(스폰 기계학)를
+호출한다. `relay-handoff`(단방향 전달) ⊂ `ask-session`(답변 계약 붙은 왕복) ⊂
 `consult-advisor`(자문처 해석+headless 폴백). `spawn-worker`는 주입 단계에서 relay-handoff를
 참조. **대상 세션 부재 시 공통 규칙: 자동 재생성 없음 — 실패 보고 + 운영자 에스컬레이션**
 (orch/캡틴 재생성은 운영자 결정; 새 세션은 같은 cwd `claude --continue`+메모리+Linear+inbox로
