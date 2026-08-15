@@ -129,7 +129,7 @@ profiles=(
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
   "oc-minimax-m3:oc-minimax-m3" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
   "cc-qwen38:cc-qwen38" "cc-glm:cc-glm"
-  "cc-dsflash:cc-dsflash" "cc-dspro:cc-dspro" "cc-glm53:cc-glm53"
+  "cc-dsflash:cc-qwen38" "cc-dspro:cc-qwen38" "cc-glm53:cc-qwen38"
 )
 for pair in "${profiles[@]}"; do
   runtime="${pair%%:*}"

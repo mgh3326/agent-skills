@@ -664,7 +664,10 @@ resolve_profile() {
     grok|grok-hi|grok-med|grok45|grok45-med|grok46|grok46-med) GATE_PROFILE=grok-hi ;;
     # ROB-1252 / ROB-1253: clinepass 쿼타 풀로 귀속 — PROFILE_KIND=claude(구독 OAuth) 풀과
     # 완전 분리해야 admission/쿼타 집계가 섞이지 않는다.
-    cc-qwen38|cc-glm|cc-dsflash|cc-dspro|cc-glm53) GATE_PROFILE="$MODEL" ;;
+    # 실험 지정 별칭(cc-dsflash/cc-dspro/cc-glm53)은 reps 축적 전까지 급표 미등재이므로
+    # 동일 clinepass 풀의 대표 프로필(cc-qwen38)로 게이트 매핑.
+    cc-qwen38|cc-glm) GATE_PROFILE="$MODEL" ;;
+    cc-dsflash|cc-dspro|cc-glm53) GATE_PROFILE="cc-qwen38" ;;
   esac
 
   if [[ -n "$EFFORT" ]]; then
