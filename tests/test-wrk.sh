@@ -11,6 +11,11 @@ trap 'rm -rf "$TMP"' EXIT
 PROMPT="$TMP/prompt.md"
 printf '%s\n' 'fixture prompt' >"$PROMPT"
 
+# ROB-1252: cc-qwen38/cc-glm read the clinepass gate key from this file at
+# spawn time (never from ~/.claude/); point it at a harmless fixture value.
+export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
+printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
+
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
@@ -123,6 +128,7 @@ profiles=(
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
   "oc-minimax-m3:oc-minimax-m3" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
+  "cc-qwen38:cc-qwen38" "cc-glm:cc-glm"
 )
 for pair in "${profiles[@]}"; do
   runtime="${pair%%:*}"
@@ -135,6 +141,13 @@ done
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
+
+# ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
+# file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
+run_fail env CLINEPASS_GATE_KEY_FILE="$TMP/nonexistent-gate-key.txt" \
+  HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  "$WRK" spawn -c "$ROOT" -m cc-qwen38 -p "$PROMPT" -w w -l fixture --t T1
 
 # ROB-1188/ROB-1190 ③-1: ultra 폐기 — codex-ultra/codex-luna-ultra 는 이제 unknown profile.
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
