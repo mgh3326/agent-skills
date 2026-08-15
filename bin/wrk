@@ -567,7 +567,19 @@ resolve_profile() {
       CLINEPASS_GATE_KEY="${CLINEPASS_GATE_KEY//$'\n'/}"
       [[ -n "$CLINEPASS_GATE_KEY" ]] || die "clinepass gate key file is empty: $CLINEPASS_GATE_KEY_FILE"
       ARGS=(--model "$MODEL" --dangerously-skip-permissions)
-      PROFILE_ENV=(--env "ANTHROPIC_BASE_URL=$CLINEPASS_GATE_URL" --env "ANTHROPIC_AUTH_TOKEN=$CLINEPASS_GATE_KEY")
+      # Claude Code 는 이 별칭들을 모르는 모델로 보고 컨텍스트 창을 200k 로 가정한다
+      # (경고: "not a model this version of Claude Code recognizes"). 그러면 1M 짜리
+      # 모델인데 200k 에서 auto-compact 가 돌아 창의 80% 를 버린다.
+      # 실측 출처: models.dev 카탈로그 — cline-pass/{deepseek-v4-flash,deepseek-v4-pro,
+      # glm-5.2} = 1,000,000. glm-5.3·qwen3.8-max 는 cline-pass 항목이 아직 없어
+      # 원 제공자(zai-coding-plan / alibaba) 항목으로 교차 확인 = 동일 1,000,000.
+      # 🔴 과소가정은 조기 compact 뿐이지만 과대가정은 작업 중 API 에러다 — 값을 올릴 때는
+      # 반드시 카탈로그 실측 근거를 확인할 것.
+      PROFILE_ENV=(
+        --env "ANTHROPIC_BASE_URL=$CLINEPASS_GATE_URL"
+        --env "ANTHROPIC_AUTH_TOKEN=$CLINEPASS_GATE_KEY"
+        --env "CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000"
+      )
       ;;
 
     codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
