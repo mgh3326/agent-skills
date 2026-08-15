@@ -34,7 +34,7 @@ ALL_PROFILES=(
   oc-qwen37-max oc-minimax-m3
   agy-flash agy-flash36 agy-flash37
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med
-  cc-qwen38 cc-glm
+  cc-qwen38 cc-glm cc-dsflash cc-dspro cc-glm53
 )
 
 profiles_help() {
@@ -553,17 +553,33 @@ resolve_profile() {
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
 
-    # cc-qwen38/cc-glm: Claude Code CLI harness, model traffic redirected via
-    # env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass. See CLINEPASS_GATE_*
-    # comment above for the wiring rationale (ROB-1252).
-    cc-qwen38|cc-glm)
+    # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
+    # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
+    # See CLINEPASS_GATE_* comment above for the wiring rationale (ROB-1252/ROB-1253).
+    #
+    # 실험 지정 별칭 — reps 축적 전까지 급표 미등재. cc-dspro=V4-Pro 0813(TB 87.9·AA int max 53.2,
+    # 단 TB 는 벤더 자체보고), cc-glm53=GLM-5.3(TB 88.2 벤더 자체보고, GLM-5.2 베이스 상방 후보).
+    # cc-dsflash=oc-dsflash 의 하네스 A/B 짝.
+    cc-qwen38|cc-glm|cc-dsflash|cc-dspro|cc-glm53)
       PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1
       [[ -r "$CLINEPASS_GATE_KEY_FILE" ]] || die "clinepass gate key file not found/readable: $CLINEPASS_GATE_KEY_FILE"
       CLINEPASS_GATE_KEY="$(<"$CLINEPASS_GATE_KEY_FILE")"
       CLINEPASS_GATE_KEY="${CLINEPASS_GATE_KEY//$'\n'/}"
       [[ -n "$CLINEPASS_GATE_KEY" ]] || die "clinepass gate key file is empty: $CLINEPASS_GATE_KEY_FILE"
       ARGS=(--model "$MODEL" --dangerously-skip-permissions)
-      PROFILE_ENV=(--env "ANTHROPIC_BASE_URL=$CLINEPASS_GATE_URL" --env "ANTHROPIC_AUTH_TOKEN=$CLINEPASS_GATE_KEY")
+      # Claude Code 는 이 별칭들을 모르는 모델로 보고 컨텍스트 창을 200k 로 가정한다
+      # (경고: "not a model this version of Claude Code recognizes"). 그러면 1M 짜리
+      # 모델인데 200k 에서 auto-compact 가 돌아 창의 80% 를 버린다.
+      # 실측 출처: models.dev 카탈로그 — cline-pass/{deepseek-v4-flash,deepseek-v4-pro,
+      # glm-5.2} = 1,000,000. glm-5.3·qwen3.8-max 는 cline-pass 항목이 아직 없어
+      # 원 제공자(zai-coding-plan / alibaba) 항목으로 교차 확인 = 동일 1,000,000.
+      # 🔴 과소가정은 조기 compact 뿐이지만 과대가정은 작업 중 API 에러다 — 값을 올릴 때는
+      # 반드시 카탈로그 실측 근거를 확인할 것.
+      PROFILE_ENV=(
+        --env "ANTHROPIC_BASE_URL=$CLINEPASS_GATE_URL"
+        --env "ANTHROPIC_AUTH_TOKEN=$CLINEPASS_GATE_KEY"
+        --env "CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000"
+      )
       ;;
 
     codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
@@ -658,9 +674,12 @@ resolve_profile() {
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
     grok|grok-hi|grok-med|grok45|grok45-med|grok46|grok46-med) GATE_PROFILE=grok-hi ;;
-    # ROB-1252: clinepass 쿼타 풀로 귀속 — PROFILE_KIND=claude(구독 OAuth) 풀과
+    # ROB-1252 / ROB-1253: clinepass 쿼타 풀로 귀속 — PROFILE_KIND=claude(구독 OAuth) 풀과
     # 완전 분리해야 admission/쿼타 집계가 섞이지 않는다.
+    # 실험 지정 별칭(cc-dsflash/cc-dspro/cc-glm53)은 reps 축적 전까지 급표 미등재이므로
+    # 동일 clinepass 풀의 대표 프로필(cc-qwen38)로 게이트 매핑.
     cc-qwen38|cc-glm) GATE_PROFILE="$MODEL" ;;
+    cc-dsflash|cc-dspro|cc-glm53) GATE_PROFILE="cc-qwen38" ;;
   esac
 
   if [[ -n "$EFFORT" ]]; then
