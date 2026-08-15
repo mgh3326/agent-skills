@@ -34,7 +34,7 @@ ALL_PROFILES=(
   oc-qwen37-max oc-minimax-m3
   agy-flash agy-flash36 agy-flash37
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med
-  cc-qwen38 cc-glm
+  cc-qwen38 cc-glm cc-dsflash cc-dspro cc-glm53
 )
 
 profiles_help() {
@@ -553,10 +553,14 @@ resolve_profile() {
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
 
-    # cc-qwen38/cc-glm: Claude Code CLI harness, model traffic redirected via
-    # env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass. See CLINEPASS_GATE_*
-    # comment above for the wiring rationale (ROB-1252).
-    cc-qwen38|cc-glm)
+    # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
+    # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
+    # See CLINEPASS_GATE_* comment above for the wiring rationale (ROB-1252/ROB-1253).
+    #
+    # 실험 지정 별칭 — reps 축적 전까지 급표 미등재. cc-dspro=V4-Pro 0813(TB 87.9·AA int max 53.2,
+    # 단 TB 는 벤더 자체보고), cc-glm53=GLM-5.3(TB 88.2 벤더 자체보고, GLM-5.2 베이스 상방 후보).
+    # cc-dsflash=oc-dsflash 의 하네스 A/B 짝.
+    cc-qwen38|cc-glm|cc-dsflash|cc-dspro|cc-glm53)
       PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1
       [[ -r "$CLINEPASS_GATE_KEY_FILE" ]] || die "clinepass gate key file not found/readable: $CLINEPASS_GATE_KEY_FILE"
       CLINEPASS_GATE_KEY="$(<"$CLINEPASS_GATE_KEY_FILE")"
@@ -658,9 +662,9 @@ resolve_profile() {
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
     grok|grok-hi|grok-med|grok45|grok45-med|grok46|grok46-med) GATE_PROFILE=grok-hi ;;
-    # ROB-1252: clinepass 쿼타 풀로 귀속 — PROFILE_KIND=claude(구독 OAuth) 풀과
+    # ROB-1252 / ROB-1253: clinepass 쿼타 풀로 귀속 — PROFILE_KIND=claude(구독 OAuth) 풀과
     # 완전 분리해야 admission/쿼타 집계가 섞이지 않는다.
-    cc-qwen38|cc-glm) GATE_PROFILE="$MODEL" ;;
+    cc-qwen38|cc-glm|cc-dsflash|cc-dspro|cc-glm53) GATE_PROFILE="$MODEL" ;;
   esac
 
   if [[ -n "$EFFORT" ]]; then
