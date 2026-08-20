@@ -217,6 +217,17 @@ kimi_seed_workspace_trust() {
     return 0
   fi
   basename_path="${abs_cwd##*/}"
+  # ROB-1307: kimi(0.37.2 실측 2건으로 역공학)는 trust 파일명을
+  # wd_<sanitized>_<sha256(abs)[:12]> 로 조회하며, sanitized = basename 소문자화
+  # → 앞 40자 절단 → 꼬리의 비영숫자 제거(절단이 '-' 등 구분자에서 끊긴 경우).
+  # 원형 basename 으로 시딩하면 대문자/40자 초과 이름에서 미신뢰 판정 → Trust
+  # 다이얼로그(기본 Don't trust=종료)가 브리프 주입 Enter 에 눌려 스폰이 죽는다.
+  # (미지 문자 처리 규칙은 미관측 — worktree 이름은 [A-Za-z0-9._-] 라 이 범위로 충분)
+  basename_path="$(printf '%s' "$basename_path" | tr '[:upper:]' '[:lower:]')"
+  basename_path="${basename_path:0:40}"
+  while [[ -n "$basename_path" && ! "${basename_path: -1}" =~ [a-z0-9] ]]; do
+    basename_path="${basename_path%?}"
+  done
   if ! digest="$(printf '%s' "$abs_cwd" | shasum -a 256 2>/dev/null | awk '{print $1}')" || [[ ${#digest} -lt 12 ]]; then
     warn "Kimi workspace trust seed skipped: cannot hash absolute CWD: $abs_cwd"
     return 0
