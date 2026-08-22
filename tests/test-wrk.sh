@@ -19,7 +19,8 @@ printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 # ROB-1313: oc-ox 는 OpenRouter 키를 파일에서 읽는다 — suite 전체가 실파일 대신 fixture 사용
 # (실키 값이 herdr.log 로 새는 것도 방지).
 export OX_OPENROUTER_KEY_FILE="$TMP/ai-keys-fixture.env"
-printf 'export OPENROUTER_API_KEY=fixture-openrouter-key\n' >"$OX_OPENROUTER_KEY_FILE"
+# 실파일 형식 미러: export + 따옴표 + 인라인 주석(ROB-1313 실사고 회귀 가드)
+printf 'export OPENROUTER_API_KEY="fixture-openrouter-key"  # https://openrouter.ai/keys\n' >"$OX_OPENROUTER_KEY_FILE"
 
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps

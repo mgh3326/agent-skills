@@ -659,8 +659,12 @@ resolve_profile() {
       PROFILE_KIND=opencode
       OX_KEY_FILE="${OX_OPENROUTER_KEY_FILE:-$HOME/.config/ai-keys.env}"
       [[ -r "$OX_KEY_FILE" ]] || die "openrouter key file not found/readable: $OX_KEY_FILE"
-      OX_KEY="$(sed -n -e 's/^export OPENROUTER_API_KEY=//p' -e 's/^OPENROUTER_API_KEY=//p' "$OX_KEY_FILE" | head -1)"
-      OX_KEY="${OX_KEY//\"/}"
+      # ai-keys.env 는 `export KEY="value"  # 주석` 형식(따옴표·인라인 주석 有). 순진한 sed 는
+      # 주석까지 값에 넣어 Authorization 헤더를 깨뜨리고, opencode 가 그 에러를 키째로 화면에
+      # 출력한다(ROB-1313 실사고). 파일의 문법대로 서브셸 source 로 정확히 추출한다 —
+      # 이 파일은 우리 소유 키 보관소이고 애초에 source 되도록 export 로 작성돼 있다.
+      OX_KEY="$(set -a; . "$OX_KEY_FILE" >/dev/null 2>&1; printf '%s' "${OPENROUTER_API_KEY:-}")"
+      OX_KEY="${OX_KEY%%[[:space:]]*}"  # 값 안에 공백 없음 — 남은 꼬리(주석 등) 방어 절단
       [[ -n "$OX_KEY" ]] || die "OPENROUTER_API_KEY not found in $OX_KEY_FILE"
       ARGS=(--auto --model openrouter/stealth/ox-alpha)
       PROFILE_ENV=(--env "OPENROUTER_API_KEY=$OX_KEY")
