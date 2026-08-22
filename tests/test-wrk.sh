@@ -16,6 +16,11 @@ printf '%s\n' 'fixture prompt' >"$PROMPT"
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 
+# ROB-1313: oc-ox 는 OpenRouter 키를 파일에서 읽는다 — suite 전체가 실파일 대신 fixture 사용
+# (실키 값이 herdr.log 로 새는 것도 방지).
+export OX_OPENROUTER_KEY_FILE="$TMP/ai-keys-fixture.env"
+printf 'export OPENROUTER_API_KEY=fixture-openrouter-key\n' >"$OX_OPENROUTER_KEY_FILE"
+
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
@@ -130,6 +135,7 @@ profiles=(
   "oc-minimax-m3:oc-minimax-m3" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
   "cc-qwen38:cc-qwen38" "cc-glm:cc-glm"
   "cc-dsflash:cc-qwen38" "cc-dspro:cc-qwen38" "cc-glm53:cc-qwen38"
+  "oc-ox:oc-glm"
 )
 for pair in "${profiles[@]}"; do
   runtime="${pair%%:*}"
@@ -185,6 +191,12 @@ grep -q -- '--kind kimi' "$TMP/herdr.log"
 grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3 -p "$PROMPT" -w w -l fixture --effort high
+
+: >"$TMP/herdr.log"
+spawn_base oc-ox >/dev/null
+grep -q -- '--model openrouter/stealth/ox-alpha' "$TMP/herdr.log"
+grep -q -- '--env OPENROUTER_API_KEY=fixture-openrouter-key' "$TMP/herdr.log"
+echo "PASS oc-ox-openrouter-env"
 
 # ROB-1307: kimi(0.37.2)는 trust 파일명을 basename 소문자화 + 앞 40자로 정규화해
 # 조회한다. 대문자·40자 초과 worktree 이름에서 시딩이 어긋나 Trust 다이얼로그가 스폰을

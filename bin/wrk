@@ -30,7 +30,7 @@ ALL_PROFILES=(
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
   kimi-k3 kimi-k27 kimi-k3-low
-  oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
+  oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni oc-ox
   oc-qwen37-max oc-minimax-m3
   agy-flash agy-flash36 agy-flash37
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med
@@ -651,6 +651,20 @@ resolve_profile() {
     oc-sonnet46) PROFILE_KIND=opencode; ARGS=(--auto --model cliproxy/claude-sonnet-4-6) ;;
     oc-oss) PROFILE_KIND=opencode; ARGS=(--auto --model cliproxy/gpt-oss-120b-medium) ;;
     oc-omni) PROFILE_KIND=opencode; ARGS=(--auto --model omniroute/auto/coding) ;;
+    # ROB-1313: ox-alpha 스텔스 실험 별칭 — 급표 미등재(reps 후 판정). OpenRouter 경유
+    # (Zen 은 잔고 차단). 무료($0)·1M ctx·~08-27 프로모. 키는 스폰 시점에 파일에서 읽고
+    # pane env 로만 주입. 게이트는 등록 프로필(oc-glm) 피기백 — 실소비 0이라 clinepass
+    # 귀속 오염은 프로모 주간 한정 수용(ROB-1313), 정체 공개 시 정리.
+    oc-ox)
+      PROFILE_KIND=opencode
+      OX_KEY_FILE="${OX_OPENROUTER_KEY_FILE:-$HOME/.config/ai-keys.env}"
+      [[ -r "$OX_KEY_FILE" ]] || die "openrouter key file not found/readable: $OX_KEY_FILE"
+      OX_KEY="$(sed -n -e 's/^export OPENROUTER_API_KEY=//p' -e 's/^OPENROUTER_API_KEY=//p' "$OX_KEY_FILE" | head -1)"
+      OX_KEY="${OX_KEY//\"/}"
+      [[ -n "$OX_KEY" ]] || die "OPENROUTER_API_KEY not found in $OX_KEY_FILE"
+      ARGS=(--auto --model openrouter/stealth/ox-alpha)
+      PROFILE_ENV=(--env "OPENROUTER_API_KEY=$OX_KEY")
+      ;;
     oc-qwen37-max) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/qwen3.7-max) ;;
     oc-minimax-m3) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/minimax-m3) ;;
 
@@ -694,6 +708,8 @@ resolve_profile() {
     kiro|kiro-sol|kiro-luna|kiro-glm|kiro-deepseek|kiro-minimax|kiro-minimax21|kiro-sol-xhigh|kiro-sol-max)
       GATE_PROFILE=kiro-sol ;;
     kimi-k3|kimi-k27|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
+    # ROB-1313: oc-ox 는 미등재 실험 별칭 — 등록 프로필로 게이트 피기백(cc-dsflash 전례)
+    oc-ox) GATE_PROFILE="oc-glm" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
