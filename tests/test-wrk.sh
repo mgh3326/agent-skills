@@ -136,7 +136,7 @@ profiles=(
   "oc-minimax-m3:oc-minimax-m3" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
   "cc-qwen38:cc-qwen38" "cc-glm:cc-glm"
   "cc-dsflash:cc-qwen38" "cc-dspro:cc-qwen38" "cc-glm53:cc-qwen38"
-  "oc-ox:oc-glm"
+  "oc-ox:oc-glm" "oc-oxz:oc-glm"
 )
 for pair in "${profiles[@]}"; do
   runtime="${pair%%:*}"
@@ -192,6 +192,13 @@ grep -q -- '--kind kimi' "$TMP/herdr.log"
 grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3 -p "$PROMPT" -w w -l fixture --effort high
+
+: >"$TMP/herdr.log"
+spawn_base oc-oxz >/dev/null
+# ROB-1314: Zen 경로는 키 주입 없이 위장 슬러그로 뜬다 (OpenRouter 경로와 독립 인그레스).
+grep -q -- '--model opencode/x-preview-f-free' "$TMP/herdr.log"
+! grep -q -- '--env OPENROUTER_API_KEY=' "$TMP/herdr.log"
+echo "PASS oc-oxz-zen-no-key"
 
 : >"$TMP/herdr.log"
 spawn_base oc-ox >/dev/null
