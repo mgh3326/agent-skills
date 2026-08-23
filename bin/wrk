@@ -30,7 +30,7 @@ ALL_PROFILES=(
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
   kimi-k3 kimi-k27 kimi-k3-low
-  oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni oc-ox
+  oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni oc-ox oc-oxz
   oc-qwen37-max oc-minimax-m3
   agy-flash agy-flash36 agy-flash37
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med
@@ -655,6 +655,11 @@ resolve_profile() {
     # (Zen 은 잔고 차단). 무료($0)·1M ctx·~08-27 프로모. 키는 스폰 시점에 파일에서 읽고
     # pane env 로만 주입. 게이트는 등록 프로필(oc-glm) 피기백 — 실소비 0이라 clinepass
     # 귀속 오염은 프로모 주간 한정 수용(ROB-1313), 정체 공개 시 정리.
+    # ROB-1314: 같은 ox-alpha 를 OpenCode Zen 으로도 서빙 — 무료·무인증(결제 불요) 실측.
+    # 🔴 Zen 의 모델 ID 는 위장 슬러그 `x-preview-f-free` 다(표시명만 "Ox Alpha Free
+    # (Unlimited)"). 이름으로 검색하면 안 잡히니 카탈로그 표시명으로 확인할 것.
+    # oc-ox(OpenRouter)와 별개 인그레스라 rate limit 이 독립 — 병렬 부하 분산용.
+    oc-oxz) PROFILE_KIND=opencode; ARGS=(--auto --model opencode/x-preview-f-free) ;;
     oc-ox)
       PROFILE_KIND=opencode
       OX_KEY_FILE="${OX_OPENROUTER_KEY_FILE:-$HOME/.config/ai-keys.env}"
@@ -713,7 +718,7 @@ resolve_profile() {
       GATE_PROFILE=kiro-sol ;;
     kimi-k3|kimi-k27|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
     # ROB-1313: oc-ox 는 미등재 실험 별칭 — 등록 프로필로 게이트 피기백(cc-dsflash 전례)
-    oc-ox) GATE_PROFILE="oc-glm" ;;
+    oc-ox|oc-oxz) GATE_PROFILE="oc-glm" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
