@@ -852,6 +852,7 @@ spawn_cmd() {
   START_TIMEOUT=30000; BOOT_SETTLE=12
   [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
+  [[ "$PROFILE_KIND" == codex ]] && START_TIMEOUT=120000 && BOOT_SETTLE=20
 
   "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
   sleep_for "$BOOT_SETTLE"
