@@ -21,6 +21,7 @@ exit code
   4  중복(claim 중복 job_id, event 중복 (job_id, seq))
   5  fencing 위반(stale owner·token 불일치 release)
   6  저장소·증거 결함(DB 없음·스키마 불일치·권한 오류·pool 해석 불가) — fail-closed
+  7  job-get 대상 job_id 없음(명시적 not-found)
 """
 
 from __future__ import annotations
@@ -58,6 +59,7 @@ EXIT_DENIED = 3
 EXIT_DUPLICATE = 4
 EXIT_FENCING = 5
 EXIT_STORAGE = 6
+EXIT_NOT_FOUND = 7
 
 
 class ArbiterError(Exception):
@@ -522,6 +524,9 @@ def _require_job(con: sqlite3.Connection, job_id: str) -> None:
 def cmd_claim(args: argparse.Namespace) -> dict:
     con = connect_rw(bootstrap=True)
     moment = now_dt()
+    claimed_at = iso(moment)
+    reclaimed = False
+    previous_created_at: str | None = None
     con.execute("BEGIN IMMEDIATE")
     try:
         row = con.execute(
@@ -529,48 +534,77 @@ def cmd_claim(args: argparse.Namespace) -> dict:
             (args.job,),
         ).fetchone()
         if row is not None:
-            raise ArbiterError(
-                EXIT_DUPLICATE,
-                f"job 중복: {args.job} 은 이미 등록됐다"
-                f" (lane={row[0]} state={row[1]} t={row[2]} created_at={row[3]})",
-                job=args.job,
-                owner_lane=row[0],
-                state=row[1],
-                t_level=row[2],
-                created_at=row[3],
+            if not args.reclaim_released or row[1] != "released":
+                raise ArbiterError(
+                    EXIT_DUPLICATE,
+                    f"job 중복: {args.job} 은 이미 등록됐다"
+                    f" (lane={row[0]} state={row[1]} t={row[2]} created_at={row[3]})",
+                    job=args.job,
+                    owner_lane=row[0],
+                    state=row[1],
+                    t_level=row[2],
+                    created_at=row[3],
+                )
+            # The row is evidence, not a disposable reservation. BEGIN
+            # IMMEDIATE makes the released -> claimed test/update atomic.
+            reclaimed = True
+            previous_created_at = row[3]
+            claimed_at = row[3]
+            con.execute(
+                "UPDATE jobs SET owner_lane = ?, state = 'claimed', t_level = ?, updated_at = ?"
+                " WHERE job_id = ?",
+                (args.lane, args.t, iso(moment), args.job),
             )
-        con.execute(
-            "INSERT INTO jobs (job_id, owner_lane, state, t_level, created_at, updated_at)"
-            " VALUES (?, ?, 'claimed', ?, ?, ?)",
-            (args.job, args.lane, args.t, iso(moment), iso(moment)),
-        )
-        seq = record_event(
-            con,
-            args.job,
-            "job.claim",
-            {
-                "owner_lane": args.lane,
-                "t_level": args.t,
-                # Herdr does not expose ARBITER_JOB.  Persist the exact
-                # agent identity in the existing claim event instead of
-                # adding a schema column or guessing from a prefix.
-                "agent_label": args.agent_label or args.job,
-            },
-        )
+            seq = record_event(
+                con,
+                args.job,
+                "job.reclaim",
+                {
+                    "owner_lane": args.lane,
+                    "t_level": args.t,
+                    "previous_created_at": row[3],
+                    "previous_owner_lane": row[0],
+                    "agent_label": args.agent_label or args.job,
+                },
+            )
+        else:
+            con.execute(
+                "INSERT INTO jobs (job_id, owner_lane, state, t_level, created_at, updated_at)"
+                " VALUES (?, ?, 'claimed', ?, ?, ?)",
+                (args.job, args.lane, args.t, iso(moment), iso(moment)),
+            )
+            seq = record_event(
+                con,
+                args.job,
+                "job.claim",
+                {
+                    "owner_lane": args.lane,
+                    "t_level": args.t,
+                    # Herdr does not expose ARBITER_JOB. Persist the exact
+                    # agent identity in the existing claim event instead of
+                    # adding a schema column or guessing from a prefix.
+                    "agent_label": args.agent_label or args.job,
+                },
+            )
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
         raise
-    return {
+    result = {
         "ok": True,
         "job": args.job,
         "owner_lane": args.lane,
         "t_level": args.t,
         "state": "claimed",
         "agent_label": args.agent_label or args.job,
-        "created_at": iso(moment),
+        "created_at": claimed_at,
+        "updated_at": iso(moment),
         "event_seq": seq,
     }
+    if reclaimed:
+        result["reclaimed"] = True
+        result["previous_created_at"] = previous_created_at
+    return result
 
 
 def cmd_lease(args: argparse.Namespace) -> dict:
@@ -886,24 +920,26 @@ def _herdr_agents(source: str | None) -> list[dict[str, object]]:
 
 
 def _claim_agent_label(con: sqlite3.Connection, job_id: str) -> str | None:
-    """Read the exact Herdr identity persisted in the v2 claim event.
+    """Read the current exact Herdr identity from claim/reclaim evidence.
 
     Older v2 claim events predate the optional mapping and therefore return
     ``None``.  GC must refuse those records rather than infer a label from a
     job-id prefix or from the number/order of agents.
     """
     rows = con.execute(
-        "SELECT kind, payload FROM events WHERE job_id = ? AND kind = 'job.claim' ORDER BY seq",
+        "SELECT kind, payload FROM events WHERE job_id = ?"
+        " AND kind IN ('job.claim', 'job.reclaim') ORDER BY seq",
         (job_id,),
     ).fetchall()
-    labels: set[str] = set()
+    label_at_latest_claim: str | None = None
+    original_claim_labels: set[str] = set()
     for kind, body in rows:
         try:
             event = json.loads(body)
         except (TypeError, ValueError) as exc:
             raise ArbiterError(
                 EXIT_STORAGE,
-                f"job.claim event 를 해석할 수 없다: job={job_id} kind={kind}: {exc}",
+                f"job claim/reclaim event 를 해석할 수 없다: job={job_id} kind={kind}: {exc}",
             ) from exc
         payload = event.get("payload") if isinstance(event, dict) else None
         if not isinstance(payload, dict):
@@ -914,15 +950,21 @@ def _claim_agent_label(con: sqlite3.Connection, job_id: str) -> str | None:
         if not isinstance(label, str) or not label:
             raise ArbiterError(
                 EXIT_STORAGE,
-                f"job.claim event 의 agent_label 이 유효하지 않다: job={job_id}",
+                f"job claim/reclaim event 의 agent_label 이 유효하지 않다: job={job_id}",
             )
-        labels.add(label)
-    if len(labels) > 1:
+        # A reclaim intentionally changes the current worker identity while
+        # retaining the old claim event for audit.
+        if kind == "job.claim":
+            original_claim_labels.add(label)
+        label_at_latest_claim = label
+    # Preserve the old corruption guard for the original claim evidence.
+    # Reclaim labels may intentionally differ, so they do not enter this set.
+    if len(original_claim_labels) > 1:
         raise ArbiterError(
             EXIT_STORAGE,
-            f"job.claim event 의 agent_label 이 모호하다: job={job_id} labels={sorted(labels)}",
+            f"job.claim event 의 agent_label 이 모호하다: job={job_id} labels={sorted(original_claim_labels)}",
         )
-    return next(iter(labels), None)
+    return label_at_latest_claim
 
 
 def _matched_agent_statuses(
@@ -1175,12 +1217,84 @@ def cmd_status(args: argparse.Namespace) -> dict:
     }
 
 
+def _spawn_receipt(con: sqlite3.Connection, job_id: str) -> dict | str:
+    """Return the newest durable spawn receipt, or an explicit absence marker."""
+    row = con.execute(
+        "SELECT payload, created_at FROM events WHERE job_id = ? AND kind = 'job.spawned'"
+        " ORDER BY seq DESC LIMIT 1",
+        (job_id,),
+    ).fetchone()
+    if row is None:
+        return "absent"
+    try:
+        event = json.loads(row[0])
+    except (TypeError, ValueError) as exc:
+        raise ArbiterError(
+            EXIT_STORAGE, f"job.spawned event 를 해석할 수 없다: job={job_id}: {exc}"
+        ) from exc
+    payload = event.get("payload") if isinstance(event, dict) else None
+    if not isinstance(payload, dict):
+        raise ArbiterError(EXIT_STORAGE, f"job.spawned event payload 가 객체가 아니다: job={job_id}")
+    pane_id = payload.get("pane_id")
+    if not isinstance(pane_id, str) or not pane_id:
+        raise ArbiterError(EXIT_STORAGE, f"job.spawned event pane_id 가 유효하지 않다: job={job_id}")
+    receipt: dict[str, str] = {"pane_id": pane_id, "spawned_at": row[1]}
+    for key in ("label", "profile", "workspace"):
+        value = payload.get(key)
+        if value is None:
+            continue
+        if not isinstance(value, str):
+            raise ArbiterError(
+                EXIT_STORAGE, f"job.spawned event {key} 가 문자열이 아니다: job={job_id}"
+            )
+        receipt[key] = value
+    return receipt
+
+
+def cmd_job_get(args: argparse.Namespace) -> dict:
+    """One read-only durable recovery view for an exact job id."""
+    con = connect_ro()
+    row = con.execute(
+        "SELECT job_id, owner_lane, state, t_level, created_at, updated_at"
+        " FROM jobs WHERE job_id = ?",
+        (args.job,),
+    ).fetchone()
+    if row is None:
+        raise ArbiterError(EXIT_NOT_FOUND, f"job not found: {args.job}", job_id=args.job)
+    recent = con.execute(
+        "SELECT kind FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 10",
+        (args.job,),
+    ).fetchall()
+    return {
+        "ok": True,
+        "job_id": row[0],
+        "owner_lane": row[1],
+        "state": row[2],
+        "t_level": row[3],
+        "created_at": row[4],
+        "updated_at": row[5],
+        "agent_label": _claim_agent_label(con, args.job),
+        "receipt": _spawn_receipt(con, args.job),
+        # Return the retained window in chronological order for consumers that
+        # need to tell a reclaim from a first claim without replaying artifacts.
+        "recent_event_kinds": [item[0] for item in reversed(recent)],
+    }
+
+
 def cmd_event(args: argparse.Namespace) -> dict:
     con = connect_rw()
     con.execute("BEGIN IMMEDIATE")
     try:
         _require_job(con, args.job)
-        payload = {"note": args.payload} if args.payload is not None else {}
+        if args.payload_json is not None:
+            try:
+                payload = json.loads(args.payload_json)
+            except (TypeError, ValueError) as exc:
+                raise ArbiterError(EXIT_USAGE, f"--payload-json 은 JSON 객체여야 한다: {exc}") from exc
+            if not isinstance(payload, dict):
+                raise ArbiterError(EXIT_USAGE, "--payload-json 은 JSON 객체여야 한다")
+        else:
+            payload = {"note": args.payload} if args.payload is not None else {}
         seq = record_event(con, args.job, args.kind, payload, seq=args.seq)
         con.execute("COMMIT")
     except BaseException:
@@ -1274,6 +1388,11 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("--lane", required=True, help="owner lane")
     claim.add_argument("--t", required=True, choices=T_LEVELS, help="규모 등급")
     claim.add_argument(
+        "--reclaim-released",
+        action="store_true",
+        help="기존 released job만 원자적으로 claimed 로 재전이한다(활성 job은 여전히 중복 거부)",
+    )
+    claim.add_argument(
         "--agent-label",
         help="exact Herdr agent name/label for this job (defaults to --job; persisted in job.claim)",
     )
@@ -1318,6 +1437,9 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--job", help="job 으로 좁히기")
     status.add_argument("--lane", help="lane 으로 좁히기")
 
+    job_get = sub.add_parser("job-get", parents=[common], help="단건 durable job 수신증 조회(읽기 전용, mode=ro)")
+    job_get.add_argument("--job", required=True, help="exact job id")
+
     gc = sub.add_parser("gc", parents=[common], help="만료 lease 전이 + 명시적 stale 기록 정리")
     gc.add_argument(
         "--herdr-agent-list",
@@ -1330,7 +1452,9 @@ def build_parser() -> argparse.ArgumentParser:
     event = sub.add_parser("event", parents=[common], help="job event 제출(atomic rename)")
     event.add_argument("--job", required=True, help="job id")
     event.add_argument("--kind", required=True, help="event 종류")
-    event.add_argument("--payload", help="자유 텍스트 payload")
+    event_payload = event.add_mutually_exclusive_group()
+    event_payload.add_argument("--payload", help="자유 텍스트 payload")
+    event_payload.add_argument("--payload-json", help="구조화 JSON 객체 payload")
     event.add_argument("--seq", type=int, help="명시 seq — 중복이면 거부된다")
 
     return parser
@@ -1341,6 +1465,7 @@ HANDLERS = {
     "lease": cmd_lease,
     "release": cmd_release,
     "status": cmd_status,
+    "job-get": cmd_job_get,
     "gc": cmd_gc,
     "event": cmd_event,
 }
