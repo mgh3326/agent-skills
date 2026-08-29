@@ -338,6 +338,88 @@ pass "⑧ repeated read-only status leaves the db mtime unchanged"
 expect_rc 2 status --job j1 --lane live
 pass "status refuses contradictory scoping"
 
+# ------------------------------------------------ ROB-1326 job recovery receipt
+# C3: the recovery reader receives one durable, read-only job view.  A receipt
+# is explicitly absent until wrk records job.spawned; absence is not a blank
+# success response that callers could mistake for a delivery.
+"$ARBITER" claim --job receipt-query --agent-label receipt-agent --lane receipt-lane --t T2 >/dev/null
+job_get_mtime_before="$(mtime "$DB")"
+run job-get --job receipt-query --json
+[[ "$RC" -eq 0 ]] || fail "job-get failed for an existing job: $ERR"
+[[ "$job_get_mtime_before" == "$(mtime "$DB")" ]] || fail "job-get wrote to the state db"
+pycheck "$OUT" <<'PY' || fail "job-get omitted the durable recovery fields"
+import json, sys
+d = json.load(sys.stdin)
+required = {
+    "job_id", "state", "owner_lane", "t_level", "created_at", "updated_at",
+    "agent_label", "receipt", "recent_event_kinds",
+}
+assert required <= set(d), d
+assert d["job_id"] == "receipt-query", d
+assert d["state"] == "claimed", d
+assert d["owner_lane"] == "receipt-lane", d
+assert d["t_level"] == "T2", d
+assert d["agent_label"] == "receipt-agent", d
+assert d["receipt"] == "absent", d
+assert d["recent_event_kinds"] == ["job.claim"], d
+PY
+expect_rc 7 job-get --job receipt-missing --json
+grep -q 'not found' <<<"$ERR" || fail "job-get not-found error was unclear: $ERR"
+pass "ROB-1326 C3: job-get is JSON read-only and has a dedicated not-found exit"
+
+# event --payload-json carries a structured spawn receipt without a schema
+# migration.  job-get surfaces its pane_id and the durable event timestamp.
+expect_rc 0 event --job receipt-query --kind job.spawned \
+  --payload-json '{"pane_id":"w:p99","label":"receipt-agent","profile":"codex-terra","workspace":"fixture"}'
+run job-get --job receipt-query --json
+[[ "$RC" -eq 0 ]] || fail "job-get failed after recording receipt: $ERR"
+pycheck "$OUT" <<'PY' || fail "job-get did not expose the spawn receipt"
+import json, sys
+d = json.load(sys.stdin)
+r = d["receipt"]
+assert r["pane_id"] == "w:p99", d
+assert r["spawned_at"], d
+assert r["label"] == "receipt-agent", d
+assert r["profile"] == "codex-terra", d
+assert r["workspace"] == "fixture", d
+assert d["recent_event_kinds"][-1] == "job.spawned", d
+PY
+pass "ROB-1326 C3: structured spawn receipt is durable in job-get"
+
+# C2/C4: ordinary claim remains fail-closed for every existing row, while the
+# explicit released-only path atomically reuses that row and keeps its history.
+"$ARBITER" claim --job reclaimable --agent-label old-agent --lane old-lane --t T1 >/dev/null
+before_reclaim="$("$ARBITER" job-get --job reclaimable --json)"
+before_created="$(python3 -c 'import json,sys; print(json.load(sys.stdin)["created_at"])' <<<"$before_reclaim")"
+expect_rc 0 lease --job reclaimable --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+expect_rc 0 release --job reclaimable --resource codex --kind quota_pool
+expect_rc 4 claim --job reclaimable --agent-label wrong-path --lane new-lane --t T3
+run claim --reclaim-released --job reclaimable --agent-label new-agent --lane new-lane --t T3 --json
+[[ "$RC" -eq 0 ]] || fail "released job did not reclaim: $ERR"
+pycheck "$OUT" "$before_created" <<'PY' || fail "reclaim did not preserve the existing row/history"
+import json, sys
+d = json.load(sys.stdin)
+assert d["state"] == "claimed", d
+assert d["created_at"] == sys.argv[1], d
+assert d["reclaimed"] is True, d
+PY
+run job-get --job reclaimable --json
+[[ "$RC" -eq 0 ]] || fail "job-get failed after reclaim: $ERR"
+pycheck "$OUT" "$before_created" <<'PY' || fail "reclaimed job view is incomplete or wrong"
+import json, sys
+d = json.load(sys.stdin)
+assert d["state"] == "claimed", d
+assert d["owner_lane"] == "new-lane", d
+assert d["t_level"] == "T3", d
+assert d["created_at"] == sys.argv[1], d
+assert d["agent_label"] == "new-agent", d
+assert d["recent_event_kinds"].count("job.reclaim") == 1, d
+PY
+# An active job never enters this special path: it is still exit 4 rather than
+# silently being overwritten by a second claimant.
+expect_rc 4 claim --reclaim-released --job reclaimable --agent-label third-agent --lane third-lane --t T0
+pass "ROB-1326 C2/C4: released -> claimed reuses history; active reclaim remains duplicate exit 4"
+
 # ------------------------------------------- ⑤ schema mismatch / permission
 cp "$DB" "$TMP/good.db"
 python3 - "$DB" <<'PY'

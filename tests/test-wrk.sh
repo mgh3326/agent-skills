@@ -477,6 +477,103 @@ rm -f "$TMP/herdr.log"
 other_out="$(spawn_base kiro-sol --job arb-other --t T1 2>&1)"
 grep -q 'quota_record=kiro/quota_pool' <<<"$other_out"
 
+# ---------------------------------------------------------------------------
+# ROB-1326: a duplicate arbiter job is an exact-once boundary, not an advisory.
+# All cases use the existing fixture Herdr and this suite's temporary arbiter DB.
+# ---------------------------------------------------------------------------
+
+# AC1: an active row stops before tab creation, with a stable dedicated exit and
+# enough evidence for the owner to investigate.
+arb claim --job idem-active --agent-label incumbent --lane incumbent-lane --t T2 >/dev/null
+rm -f "$TMP/herdr.log"
+set +e
+active_dup_out="$(spawn_base codex-terra --job idem-active --t T2 2>&1)"
+active_dup_rc=$?
+set -e
+[[ "$active_dup_rc" -eq 74 ]] || { echo "expected active duplicate exit 74, got $active_dup_rc: $active_dup_out" >&2; exit 1; }
+grep -q 'job_id=idem-active' <<<"$active_dup_out"
+grep -q 'state=claimed' <<<"$active_dup_out"
+grep -q 'owner_lane=incumbent-lane' <<<"$active_dup_out"
+[[ ! -e "$TMP/herdr.log" ]] || { echo "active duplicate reached Herdr spawn" >&2; exit 1; }
+echo "PASS ROB-1326 AC1 active duplicate fail-closed: $active_dup_out"
+
+# AC2: a released row gets the explicit reclaim transition, then spawns once.
+arb claim --job idem-released --agent-label released-old --lane released-old-lane --t T1 >/dev/null
+arb lease --job idem-released --kind quota_pool --profile codex-terra-max --gate-output <("$SCOPEFUEL" gate -m codex-terra-max) >/dev/null
+arb release --job idem-released --resource codex --kind quota_pool >/dev/null
+rm -f "$TMP/herdr.log"
+released_dup_out="$(spawn_base codex-terra --job idem-released --t T3 2>&1)"
+grep -q '^OK ' <<<"$released_dup_out"
+[[ -e "$TMP/herdr.log" ]] || { echo "released job did not reach fixture spawn" >&2; exit 1; }
+arb job-get --job idem-released --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["state"] == "leased", d
+assert d["recent_event_kinds"].count("job.reclaim") == 1, d
+'
+echo "PASS ROB-1326 AC2 released duplicate reclaimed then spawned: $released_dup_out"
+
+# AC3: once a live arbiter reported duplicate, an unreadable state is itself a
+# fail-closed condition.  The proxy fails only the actual lookup, not --help.
+arb claim --job idem-unknown --agent-label unknown-owner --lane unknown-lane --t T1 >/dev/null
+export REAL_ARBITER="$ARBITER"
+export WRK_ARBITER_PROXY_MODE=job-get-fails
+export TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-proxy"
+rm -f "$TMP/herdr.log"
+set +e
+unknown_dup_out="$(spawn_base codex-terra --job idem-unknown --t T1 2>&1)"
+unknown_dup_rc=$?
+set -e
+[[ "$unknown_dup_rc" -eq 75 ]] || { echo "expected unreadable-state exit 75, got $unknown_dup_rc: $unknown_dup_out" >&2; exit 1; }
+grep -q 'state lookup failed' <<<"$unknown_dup_out"
+[[ ! -e "$TMP/herdr.log" ]] || { echo "unknown duplicate state reached Herdr spawn" >&2; exit 1; }
+unset WRK_ARBITER_PROXY_MODE TEST_ARBITER_BIN REAL_ARBITER
+echo "PASS ROB-1326 AC3 duplicate lookup failure is fail-closed: $unknown_dup_out"
+
+# AC8: the only active-duplicate escape hatch is explicit and auditable.
+export TEST_ARBITER_BIN="$ARBITER"
+arb claim --job idem-override --agent-label override-owner --lane override-lane --t T1 >/dev/null
+rm -f "$TMP/herdr.log"
+override_out="$(spawn_base codex-terra --job idem-override --t T1 --job-dup-ok 2>&1)"
+grep -q '^OK ' <<<"$override_out"
+grep -q 'job-dup-ok override' <<<"$override_out"
+grep -q 'state=claimed' <<<"$override_out"
+[[ -e "$TMP/herdr.log" ]] || { echo "explicit duplicate override did not reach Herdr spawn" >&2; exit 1; }
+echo "PASS ROB-1326 AC8 explicit active duplicate override: $override_out"
+
+# AC6: a successful fixture spawn writes a queryable receipt.  Its recording
+# failure is non-transactional: the pane remains successful but job-get says
+# receipt=absent, and wrk emits a warning.
+rm -f "$TMP/herdr.log"
+receipt_out="$(spawn_base codex-terra --job idem-receipt --t T1 2>&1)"
+grep -q '^OK pane=w:p1' <<<"$receipt_out"
+arb job-get --job idem-receipt --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+r = d["receipt"]
+assert r["pane_id"] == "w:p1", d
+assert r["spawned_at"], d
+assert r["label"] == "fixture", d
+assert r["profile"] == "codex-terra", d
+assert r["workspace"] == "w", d
+assert "job.spawned" in d["recent_event_kinds"], d
+'
+export REAL_ARBITER="$ARBITER"
+export WRK_ARBITER_PROXY_MODE=spawn-receipt-fails
+export TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-proxy"
+rm -f "$TMP/herdr.log"
+receipt_fail_out="$(spawn_base codex-terra --job idem-receipt-fail --t T1 2>&1)"
+grep -q '^OK pane=w:p1' <<<"$receipt_fail_out"
+grep -q 'job.spawned receipt failed' <<<"$receipt_fail_out"
+[[ -e "$TMP/herdr.log" ]] || { echo "receipt failure stopped successful fixture spawn" >&2; exit 1; }
+arb job-get --job idem-receipt-fail --json | python3 -c '
+import json, sys
+assert json.load(sys.stdin)["receipt"] == "absent"
+'
+unset WRK_ARBITER_PROXY_MODE TEST_ARBITER_BIN REAL_ARBITER
+export TEST_ARBITER_BIN="$ARBITER"
+echo "PASS ROB-1326 AC6 spawn receipt success and non-transactional receipt failure"
+
 # ⑥ spawn failure releases the record instead of leaking it.
 rm -f "$TMP/herdr.log"
 export TEST_FIXTURE_SCENARIO=tab-create-fails
@@ -495,12 +592,14 @@ rm -f "$TMP/herdr.log"
 retry_out="$(spawn_base opus --job arb-retry --t T2 2>&1)"
 grep -q 'quota_record=claude/quota_pool' <<<"$retry_out"
 
-# A duplicate claim does not block a spawn — quota records are independent.
+# A released duplicate reclaims the existing row and then records the pool;
+# ordinary duplicate claim still never deletes its original history.
 arb release --job arb-retry --resource claude --kind quota_pool >/dev/null
 rm -f "$TMP/herdr.log"
 dup_out="$(spawn_base opus --job arb-retry --t T2 2>&1)"
-grep -q "already claimed" <<<"$dup_out"
+grep -q "reclaimed" <<<"$dup_out"
 grep -q 'quota_record=claude/quota_pool' <<<"$dup_out"
+arb job-get --job arb-retry --json | python3 -c 'import json,sys; assert json.load(sys.stdin)["recent_event_kinds"].count("job.reclaim") == 1'
 
 # ⑥ quota_pool record failure warns and still spawns; this is not a quota gate.
 cat >"$TMP/quota-record-failing-arbiter" <<EOF

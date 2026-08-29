@@ -5,6 +5,11 @@ set -euo pipefail
 HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
 SCOPEFUEL="${SCOPEFUEL_BIN:-}"
 ARBITER="${ARBITER_BIN:-}"
+# A live duplicate is an exact-once violation, distinct from generic CLI
+# misuse (2) and the arbiter's own duplicate result (4).  75 means that an
+# arbiter duplicate was observed but its state could not be proven safely.
+WRK_EXIT_ACTIVE_JOB_DUPLICATE=74
+WRK_EXIT_JOB_STATE_UNREADABLE=75
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -66,7 +71,7 @@ usage() {
 Usage: wrk <spawn|find|name-sync|profiles> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-            [-L live|mock] [--effort LEVEL] [--job ID]
+            [-L live|mock] [--effort LEVEL] [--job ID] [--job-dup-ok]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -78,7 +83,7 @@ USAGE
 spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-                 [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME]
+                 [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--job-dup-ok]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -89,6 +94,8 @@ Options:
   --owner NAME       spawning session name, recorded as the arbiter owner_lane
                      (default: default). Lets that session later run
                      `arbiter status --lane NAME` to find and reclaim its workers.
+  --job-dup-ok       explicit operator override: permit an active duplicate job
+                     after an auditable warning. Automation/panewire must not use it.
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
@@ -376,6 +383,124 @@ arbiter_release_held() {
   fi
 }
 
+arbiter_get_duplicate_state() {
+  # Query the durable receipt surface rather than parsing localized stderr from
+  # claim.  The parser rejects malformed/non-string fields, because accepting
+  # an ambiguous state would recreate the exact-once failure we are fixing.
+  local lookup lookup_rc parsed parse_rc lookup_job lookup_state lookup_owner lookup_created
+  set +e
+  lookup="$("$ARBITER" job-get --job "$JOB_ID" --json 2>/dev/null)"
+  lookup_rc=$?
+  set -e
+  [[ "$lookup_rc" -eq 0 ]] || return 1
+  set +e
+  parsed="$(printf '%s' "$lookup" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+keys = ("job_id", "state", "owner_lane", "created_at")
+values = []
+for key in keys:
+    value = d.get(key)
+    if not isinstance(value, str) or not value or "\t" in value or "\n" in value:
+        raise ValueError("invalid job-get field: " + key)
+    values.append(value)
+print("\t".join(values))
+')"
+  parse_rc=$?
+  set -e
+  [[ "$parse_rc" -eq 0 ]] || return 1
+  IFS=$'\t' read -r lookup_job lookup_state lookup_owner lookup_created <<<"$parsed"
+  [[ "$lookup_job" == "$JOB_ID" && -n "$lookup_state" && -n "$lookup_owner" && -n "$lookup_created" ]] || return 1
+  ARBITER_DUP_STATE="$lookup_state"
+  ARBITER_DUP_OWNER_LANE="$lookup_owner"
+  ARBITER_DUP_CREATED_AT="$lookup_created"
+  return 0
+}
+
+arbiter_handle_duplicate_claim() {
+  # $1 is set only for the one state re-check allowed after a reclaim race.
+  # A second released observation is not a license to spin/retry indefinitely.
+  local after_reclaim_race="${1:-0}" reclaim_rc
+  if ! arbiter_get_duplicate_state; then
+    warn "arbiter duplicate job state lookup failed; refusing spawn (fail-closed): job_id=$JOB_ID"
+    return "$WRK_EXIT_JOB_STATE_UNREADABLE"
+  fi
+  case "$ARBITER_DUP_STATE" in
+    claimed|leased)
+      if [[ "${JOB_DUP_OK:-0}" -eq 1 ]]; then
+        warn "active arbiter job duplicate proceeding only because --job-dup-ok override was supplied: job_id=$JOB_ID state=$ARBITER_DUP_STATE owner_lane=$ARBITER_DUP_OWNER_LANE created_at=$ARBITER_DUP_CREATED_AT"
+        # The row belongs to this exact job id already, so a later successful
+        # spawn receipt can still be written even if its quota record is old.
+        ARBITER_JOB_REGISTERED=1
+        return 0
+      fi
+      warn "active arbiter job duplicate refused (fail-closed): job_id=$JOB_ID state=$ARBITER_DUP_STATE owner_lane=$ARBITER_DUP_OWNER_LANE created_at=$ARBITER_DUP_CREATED_AT"
+      return "$WRK_EXIT_ACTIVE_JOB_DUPLICATE"
+      ;;
+    released)
+      if [[ "$after_reclaim_race" -eq 1 ]]; then
+        warn "arbiter duplicate job changed during released reclaim; refusing spawn (fail-closed): job_id=$JOB_ID state=$ARBITER_DUP_STATE owner_lane=$ARBITER_DUP_OWNER_LANE created_at=$ARBITER_DUP_CREATED_AT"
+        return "$WRK_EXIT_JOB_STATE_UNREADABLE"
+      fi
+      set +e
+      "$ARBITER" claim --reclaim-released --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" >/dev/null
+      reclaim_rc=$?
+      set -e
+      case "$reclaim_rc" in
+        0)
+          ARBITER_JOB_REGISTERED=1
+          warn "arbiter released job reclaimed: job_id=$JOB_ID owner_lane=$JOB_LANE"
+          return 0
+          ;;
+        4)
+          # Another recovery caller may have won between our read and update.
+          # Re-observe once; it will fail-closed unless an explicit override is
+          # present for the now-active owner.
+          arbiter_handle_duplicate_claim 1
+          return $?
+          ;;
+        *)
+          warn "arbiter released job reclaim failed (exit $reclaim_rc); refusing spawn (fail-closed): job_id=$JOB_ID"
+          return "$WRK_EXIT_JOB_STATE_UNREADABLE"
+          ;;
+      esac
+      ;;
+    *)
+      warn "arbiter duplicate job has unsupported state; refusing spawn (fail-closed): job_id=$JOB_ID state=$ARBITER_DUP_STATE owner_lane=$ARBITER_DUP_OWNER_LANE created_at=$ARBITER_DUP_CREATED_AT"
+      return "$WRK_EXIT_JOB_STATE_UNREADABLE"
+      ;;
+  esac
+}
+
+arbiter_record_spawn_receipt() {
+  # A pane cannot be rolled back once its agent start/prompt succeeded.  This
+  # evidence write is therefore deliberately warning-only; job-get renders its
+  # absence explicitly for downstream recovery rather than pretending success.
+  [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
+  local payload receipt_rc
+  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" <<'PY'
+import json, sys
+pane_id, label, profile, workspace = sys.argv[1:]
+print(json.dumps({
+    "pane_id": pane_id,
+    "label": label,
+    "profile": profile,
+    "workspace": workspace,
+}, ensure_ascii=False, separators=(",", ":")))
+PY
+)"; then
+    warn "arbiter job.spawned receipt preparation failed; spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
+    return 0
+  fi
+  set +e
+  "$ARBITER" event --job "$JOB_ID" --kind job.spawned --payload-json "$payload" >/dev/null
+  receipt_rc=$?
+  set -e
+  if [[ "$receipt_rc" -ne 0 ]]; then
+    warn "arbiter job.spawned receipt failed (exit $receipt_rc); spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
+  fi
+}
+
 arbiter_admit() {
   if [[ -z "$ARBITER" ]]; then
     ARBITER="$(command -v arbiter 2>/dev/null || true)"
@@ -388,7 +513,7 @@ arbiter_admit() {
     warn "arbiter quota-pool record unavailable (not executable: $ARBITER); continuing spawn"
     return 0
   fi
-  local probe probe_rc
+  local probe probe_rc job_get_probe job_get_probe_rc
   set +e
   probe="$("$ARBITER" lease --help 2>&1)"
   probe_rc=$?
@@ -401,6 +526,23 @@ arbiter_admit() {
     warn "arbiter quota-pool record probe failed (exit $probe_rc); continuing spawn"
     return 0
   fi
+  # An arbiter predating the durable lookup is an installation-transition
+  # version. Preserve the existing warn+continue contract rather than treating
+  # it as a current arbiter that reported an uninspectable duplicate.
+  set +e
+  job_get_probe="$("$ARBITER" job-get --help 2>&1)"
+  job_get_probe_rc=$?
+  set -e
+  if [[ "$job_get_probe_rc" -ne 0 ]]; then
+    if grep -Eiq "(unknown (command|subcommand).*job-get|invalid choice.*job-get|no such command.*job-get|unrecognized.*job-get|not a valid command.*job-get)" <<<"$job_get_probe"; then
+      warn "installed arbiter has no job-get subcommand; admission control skipped during installation transition"
+      return 0
+    fi
+    # Keep the pre-existing no-duplicate path observational, but do not skip
+    # claim: if this live arbiter subsequently reports a duplicate, the actual
+    # lookup failure below must remain fail-closed.
+    warn "arbiter job-get probe failed (exit $job_get_probe_rc); duplicate state will fail-closed if observed"
+  fi
   if [[ "$GATE_READY" -ne 1 ]]; then
     # No scopefuel result means no authoritative pool. Leasing a guessed pool would
     # be worse than not leasing — the same installation-transition exception applies.
@@ -408,15 +550,20 @@ arbiter_admit() {
     return 0
   fi
 
-  local claim_rc
+  local claim_rc duplicate_rc
   set +e
   "$ARBITER" claim --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" >/dev/null
   claim_rc=$?
   set -e
   case "$claim_rc" in
-    0) ;;
-    # A duplicate claim is not an admission decision; the quota record below is independent.
-    4) warn "arbiter job '$JOB_ID' is already claimed; the quota record still proceeds" ;;
+    0) ARBITER_JOB_REGISTERED=1 ;;
+    4)
+      set +e
+      arbiter_handle_duplicate_claim
+      duplicate_rc=$?
+      set -e
+      [[ "$duplicate_rc" -eq 0 ]] || return "$duplicate_rc"
+      ;;
     *) warn "arbiter quota-pool claim failed (exit $claim_rc); continuing spawn"; return 0 ;;
   esac
 
@@ -738,8 +885,8 @@ resolve_profile() {
 
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER=""
-  ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" JOB_DUP_OK=0
+  ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
@@ -751,6 +898,7 @@ spawn_cmd() {
           --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
         esac
         shift 2 ;;
+      --job-dup-ok) JOB_DUP_OK=1; shift ;;
       -*) die "unknown option '$1'" ;;
       *) die "unexpected argument '$1'" ;;
     esac
@@ -894,6 +1042,7 @@ spawn_cmd() {
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # The spawn stands; the execution record now belongs to the worker, not to this process.
+  arbiter_record_spawn_receipt
   SPAWN_PANE_OPEN=0
   refresh_quota_pool
   ARBITER_HELD=0

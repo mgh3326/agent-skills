@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# ROB-1326: test-only proxy.  It delegates to the real arbiter except for one
+# deliberately injected observation/receipt failure; no test needs a real pane.
+set -euo pipefail
+
+real_arbiter="${REAL_ARBITER:?REAL_ARBITER is required}"
+mode="${WRK_ARBITER_PROXY_MODE:-}"
+
+if [[ "$mode" == "job-get-fails" && "${1:-}" == "job-get" && "${2:-}" != "--help" ]]; then
+  echo 'fixture: job-get unavailable' >&2
+  exit 6
+fi
+
+if [[ "$mode" == "spawn-receipt-fails" && "${1:-}" == "event" && " $* " == *" --kind job.spawned "* ]]; then
+  echo 'fixture: job.spawned receipt unavailable' >&2
+  exit 6
+fi
+
+exec "$real_arbiter" "$@"
