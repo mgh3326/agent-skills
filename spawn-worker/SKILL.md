@@ -284,9 +284,13 @@ acp-runner --job <job_id> -c <worktree> -p brief.md   --model gemini-3.6-flash -
 
 ### 4-2. 🔴 착지 검증 — 스폰 직후 필수
 
-스폰 명령이 정상 반환됐다고 해서 워커가 브리프를 실제로 받은 것은 아니다. 스폰 직후
-`herdr agent read <pane> --lines 10 --source visible`로 브리프 텍스트가 화면에 실제로
-보이는지 확인한다. 보이지 않으면(미착지) 재주입 후 다시 확인한다.
+스폰 명령이 정상 반환됐다고 해서 워커가 브리프를 실제로 받은 것은 아니다. `wrk`는
+`herdr agent read <pane> --source recent-unwrapped --lines 200`의 브리프 marker를 정본으로
+확인한다(visible 화면에서 밀려나도 transcript에는 남는다). visible의 `Pasted text` 칩도
+queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오므로 착지 증거가 아니다.
+일반 프로필은 30초, codex는 60초 창에서 0.5→2초로 backoff 관찰하고, 양성 증거가 없을
+때만 최대 한 번 재주입한다. 자동화는 `--landing-strict`로 pane의 OK 행은 보존한 채
+미착지를 exit 76으로 받을 수 있다.
 
 **`wrk`의 `OK status=done`도, herdr의 정상 JSON 응답도 둘 다 착지 증거가 아니다** —
 콜드 스타트 실측 4회 중 3회 유실(자동 응답은 정상이었지만 실제 화면에는 브리프가
