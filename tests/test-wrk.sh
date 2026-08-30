@@ -61,7 +61,8 @@ spawn_base() {
 arb() { "$ARBITER" "$@"; }
 
 "$WRK" --help >/dev/null
-"$WRK" spawn --help >/dev/null
+spawn_help_out="$("$WRK" spawn --help)"
+grep -q -- '--landing-strict' <<<"$spawn_help_out"
 "$WRK" find --help >/dev/null
 "$WRK" name-sync --help >/dev/null
 "$WRK" profiles --help >/dev/null
@@ -300,8 +301,9 @@ grep -q 'landed=yes' <<<"$once_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 [[ "$(grep -c 'agent send-keys w:p1 return' "$TMP/herdr.log")" -eq 1 ]]
 
-# ROB-1246 landing acceptance fixtures. Retry is allowed only after a
-# successful prompt plus measured non-landing.
+# ROB-1321 landing acceptance fixtures. `working` is only a reason to keep
+# observing: marker (recent-unwrapped scrollback) or the visible Pasted text
+# chip is required before the brief may be called landed.
 marker_prompt="$TMP/landing-marker.md"
 marker_first_line='marker-source-0123456789012345678901234567890123456789'
 marker_expected="${marker_first_line:0:40}"
@@ -312,14 +314,32 @@ marker_out="$(TEST_FIXTURE_SCENARIO=landing-marker WRK_FIXTURE_MARKER="$marker_e
 grep -q 'landed=yes' <<<"$marker_out"
 grep -q "$marker_first_line" "$TMP/herdr.log"
 [[ "$(grep -c '^agent prompt ' "$TMP/herdr.log")" -eq 1 ]]
-echo "PASS ac1-marker-landed: $marker_out"
+echo "PASS marker-positive-landed: $marker_out"
 
 PROMPT="$TMP/prompt.md"
+: >"$TMP/herdr.log"
+# AC1 RED before ROB-1321: the old implementation emits landed=yes here
+# solely because the freshly booted agent reports working. A complete first
+# observation window must instead re-inject once and then report landed=no.
+working_no_marker_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base codex-terra 2>&1)"
+grep -q 'landed=no' <<<"$working_no_marker_out"
+grep -q 'action=reinject-once' <<<"$working_no_marker_out"
+grep -q 'last_status=working' <<<"$working_no_marker_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
+echo "PASS ac1-working-without-marker-retries-then-no: $working_no_marker_out"
+
+: >"$TMP/herdr.log"
+delayed_marker_out="$(TEST_FIXTURE_SCENARIO=landing-delayed-marker spawn_base codex-terra 2>&1)"
+grep -q 'landed=yes' <<<"$delayed_marker_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
+[[ "$(grep -c -- '--source recent-unwrapped' "$TMP/herdr.log")" -ge 3 ]]
+echo "PASS ac2-delayed-marker-no-retry: $delayed_marker_out"
+
 : >"$TMP/herdr.log"
 retry_out="$(TEST_FIXTURE_SCENARIO=landing-retry spawn_base codex-terra 2>&1)"
 grep -q 'landed=retry' <<<"$retry_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
-echo "PASS ac2-swallowed-then-retry: $retry_out"
+echo "PASS ac3-swallowed-then-retry: $retry_out"
 
 : >"$TMP/herdr.log"
 set +e
@@ -330,13 +350,32 @@ set -e
 grep -q 'landed=no' <<<"$no_landing_out"
 grep -q 'spawn succeeded but brief landed=no' <<<"$no_landing_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
-echo "PASS ac3-swallowed-twice-spawn-success exit=$no_landing_rc: $no_landing_out"
+echo "PASS landed-no-default-exit=$no_landing_rc: $no_landing_out"
 
 : >"$TMP/herdr.log"
-scrollout_out="$(TEST_FIXTURE_SCENARIO=landing-working-scrollout spawn_base codex-terra 2>&1)"
+set +e
+strict_no_landing_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base codex-terra --landing-strict 2>&1)"
+strict_no_landing_rc=$?
+set -e
+[[ "$strict_no_landing_rc" -eq 76 ]]
+grep -q '^OK pane=w:p1 .*landed=no' <<<"$strict_no_landing_out"
+grep -q 'spawn succeeded but brief landed=no' <<<"$strict_no_landing_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
+echo "PASS ac4-landing-strict exit=$strict_no_landing_rc: $strict_no_landing_out"
+
+: >"$TMP/herdr.log"
+scrollout_out="$(TEST_FIXTURE_SCENARIO=landing-scrollback-marker spawn_base codex-terra 2>&1)"
 grep -q 'landed=yes' <<<"$scrollout_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
-echo "PASS ac5-working-scrollout-no-duplicate: $scrollout_out"
+grep -q 'agent read w:p1 --source recent-unwrapped --lines 200' "$TMP/herdr.log"
+echo "PASS ac5-scrollback-marker-no-duplicate: $scrollout_out"
+
+: >"$TMP/herdr.log"
+pasted_out="$(TEST_FIXTURE_SCENARIO=landing-pasted spawn_base codex-terra 2>&1)"
+grep -q 'landed=yes' <<<"$pasted_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
+grep -q 'agent read w:p1 --source visible --lines 40' "$TMP/herdr.log"
+echo "PASS pasted-chip-queued: $pasted_out"
 
 : >"$TMP/herdr.log"
 opencode_retry_out="$(TEST_FIXTURE_SCENARIO=opencode-retry spawn_base oc-omni 2>&1)"

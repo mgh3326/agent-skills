@@ -10,6 +10,10 @@ ARBITER="${ARBITER_BIN:-}"
 # arbiter duplicate was observed but its state could not be proven safely.
 WRK_EXIT_ACTIVE_JOB_DUPLICATE=74
 WRK_EXIT_JOB_STATE_UNREADABLE=75
+# A pane may be valid even when the submitted brief cannot be positively
+# observed. Automation opts into 76 to distinguish that outcome from the
+# ROB-1326 duplicate-job contracts above.
+WRK_EXIT_LANDING_UNCONFIRMED=76
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -71,7 +75,7 @@ usage() {
 Usage: wrk <spawn|find|name-sync|profiles> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-            [-L live|mock] [--effort LEVEL] [--job ID] [--job-dup-ok]
+            [-L live|mock] [--effort LEVEL] [--job ID] [--job-dup-ok] [--landing-strict]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -84,6 +88,7 @@ spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--job-dup-ok]
+                 [--landing-strict]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -96,6 +101,9 @@ Options:
                      `arbiter status --lane NAME` to find and reclaim its workers.
   --job-dup-ok       explicit operator override: permit an active duplicate job
                      after an auditable warning. Automation/panewire must not use it.
+  --landing-strict   automation opt-in: preserve the OK line, then exit 76 if
+                     no marker/Pasted-text landing evidence appears. Without it,
+                     landed=no remains a successful spawn with a warning.
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
@@ -147,12 +155,47 @@ die() { echo "wrk: $*" >&2; exit 2; }
 warn() { echo "wrk: warning: $*" >&2; }
 sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
 
-# Landing is a bounded observation, not a second boot wait. The prompt command
-# already owns its normal wait (when supported); this extra two-second window
-# only covers the hand-off race where the command returns before the visible
-# screen/status has caught up. Keeping the cap here prevents cold-start fixes
-# from turning every spawn into an unbounded wait.
-LANDING_CHECK_TIMEOUT_TICKS=20
+# Landing is a bounded positive-evidence observation, not a second boot wait.
+# The prompt command already owns its normal wait when supported. A 30-second
+# window covers the normal hand-off; codex gets 60 seconds because its cold
+# boot is explicitly allowed to settle for 20 seconds above and may still take
+# tens of seconds before the submitted transcript is readable. Sampling backs
+# off from 0.5 to 2 seconds and stops immediately on evidence.
+LANDING_CHECK_DEFAULT_WINDOW_SECONDS=30
+LANDING_CHECK_CODEX_WINDOW_SECONDS=60
+LANDING_CHECK_INITIAL_DELAY_SECONDS=0.5
+LANDING_CHECK_SECOND_DELAY_SECONDS=1
+LANDING_CHECK_MAX_DELAY_SECONDS=2
+
+configure_landing_check() {
+  local profile_kind="$1"
+  LANDING_CHECK_WINDOW_SECONDS="$LANDING_CHECK_DEFAULT_WINDOW_SECONDS"
+  # 18 samples: 0.5 + 1 + (14 * 2) + 0.5 = 30 seconds.
+  LANDING_CHECK_TIMEOUT_TICKS=18
+  if [[ "$profile_kind" == codex ]]; then
+    LANDING_CHECK_WINDOW_SECONDS="$LANDING_CHECK_CODEX_WINDOW_SECONDS"
+    # 33 samples: 0.5 + 1 + (29 * 2) + 0.5 = 60 seconds.
+    LANDING_CHECK_TIMEOUT_TICKS=33
+  fi
+}
+
+landing_check_delay() {
+  local tick="$1"
+  if (( tick == 0 || tick == LANDING_CHECK_TIMEOUT_TICKS - 2 )); then
+    printf '%s' "$LANDING_CHECK_INITIAL_DELAY_SECONDS"
+  elif (( tick == 1 )); then
+    printf '%s' "$LANDING_CHECK_SECOND_DELAY_SECONDS"
+  else
+    printf '%s' "$LANDING_CHECK_MAX_DELAY_SECONDS"
+  fi
+}
+
+landing_check_detail() {
+  printf 'window=%ss checks=%s last_evidence=%s last_status=%s reason=%s' \
+    "$LANDING_CHECK_WINDOW_SECONDS" "$LANDING_CHECK_ATTEMPTS" \
+    "$LANDING_CHECK_LAST_EVIDENCE" "$LANDING_CHECK_LAST_STATUS" \
+    "$LANDING_CHECK_LAST_REASON"
+}
 
 prompt_marker() {
   local prompt_file="$1" line
@@ -172,43 +215,72 @@ agent_status_for_pane() {
 }
 
 landing_check_once() {
-  local pane="$1" marker="$2" visible status
-  if ! visible="$("$HERDR" agent read "$pane" --lines 40 --source visible 2>/dev/null)"; then
+  local pane="$1" marker="$2" recent visible status
+  LANDING_CHECK_LAST_EVIDENCE=none
+  if ! recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_STATUS=unknown
+    LANDING_CHECK_LAST_REASON=recent-unwrapped-read-failed
     return 1
   fi
 
-  # Signal priority is intentional: a visible marker is direct evidence, then
-  # working proves the brief may have scrolled away, and finally the UI chip
-  # proves that the payload is queued. The working check is the key guard
-  # against re-sending a landed brief whose marker has already scrolled out.
-  if [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$visible"; then
+  # The prompt transcript is the source of truth. Unlike the 40-line visible
+  # screen, recent-unwrapped survives subsequent output scrolling the marker
+  # away. `working` below is deliberately not evidence: a cold codex boot
+  # reports working before the composer has received the payload.
+  if [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$recent"; then
     LANDING_SIGNAL=marker
+    LANDING_CHECK_LAST_EVIDENCE=marker
+    LANDING_CHECK_LAST_REASON=marker-in-recent-unwrapped
+    return 0
+  fi
+  if ! visible="$("$HERDR" agent read "$pane" --source visible --lines 40 2>/dev/null)"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_STATUS=unknown
+    LANDING_CHECK_LAST_REASON=visible-read-failed
+    return 1
+  fi
+
+  # The UI chip is an independent positive observation that the payload is
+  # queued; keep it as the fallback for prompts whose transcript is delayed.
+  if grep -Fq -- "Pasted text" <<<"$visible"; then
+    LANDING_SIGNAL=pasted
+    LANDING_CHECK_LAST_EVIDENCE=pasted
+    LANDING_CHECK_LAST_REASON=pasted-text-chip
     return 0
   fi
   if ! status="$(agent_status_for_pane "$pane")"; then
     LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_STATUS=unknown
+    LANDING_CHECK_LAST_REASON=status-read-failed
     return 1
   fi
+  LANDING_CHECK_LAST_STATUS="$status"
   if [[ "$status" == working ]]; then
-    LANDING_SIGNAL=working
-    return 0
-  fi
-  if grep -Fq -- "Pasted text" <<<"$visible"; then
-    LANDING_SIGNAL=pasted
-    return 0
+    LANDING_CHECK_LAST_REASON=working-without-positive-evidence
+  else
+    LANDING_CHECK_LAST_REASON="status-${status}-without-positive-evidence"
   fi
   return 1
 }
 
 landing_check() {
-  local pane="$1" marker="$2" tick
+  local pane="$1" marker="$2" tick delay
   LANDING_CHECK_CONFIRMED=0
   LANDING_CHECK_AMBIGUOUS=0
+  LANDING_CHECK_ATTEMPTS=0
+  LANDING_CHECK_LAST_EVIDENCE=none
+  LANDING_CHECK_LAST_STATUS=unknown
+  LANDING_CHECK_LAST_REASON=not-observed
+  LANDING_SIGNAL=none
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
+    LANDING_CHECK_ATTEMPTS=$((tick + 1))
     if landing_check_once "$pane" "$marker"; then return 0; fi
     [[ "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]] && LANDING_CHECK_CONFIRMED=1
-    [[ "$tick" -lt $((LANDING_CHECK_TIMEOUT_TICKS - 1)) ]] && sleep_for 0.1
+    if [[ "$tick" -lt $((LANDING_CHECK_TIMEOUT_TICKS - 1)) ]]; then
+      delay="$(landing_check_delay "$tick")"
+      sleep_for "$delay"
+    fi
   done
   return 1
 }
@@ -884,8 +956,9 @@ resolve_profile() {
 }
 
 spawn_cmd() {
+  local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" JOB_DUP_OK=0
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
   ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -899,6 +972,7 @@ spawn_cmd() {
         esac
         shift 2 ;;
       --job-dup-ok) JOB_DUP_OK=1; shift ;;
+      --landing-strict) LANDING_STRICT=1; shift ;;
       -*) die "unknown option '$1'" ;;
       *) die "unexpected argument '$1'" ;;
     esac
@@ -918,6 +992,7 @@ spawn_cmd() {
   [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
 
   resolve_profile
+  configure_landing_check "$PROFILE_KIND"
   LANE_ENV=()
   if [[ -n "$LANE" ]]; then
     case "$LANE" in
@@ -1019,24 +1094,40 @@ spawn_cmd() {
   fi
   if landing_check "$PANE" "$PROMPT_MARKER"; then
     LANDING=yes
-  elif [[ "$PROMPT_SUBMITTED" -eq 1 && "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
-    # The first submission completed, but bounded screen/status measurement
-    # proves it did not land. This is confirmed non-landing, not an ambiguous
-    # wait result, so exactly one re-injection is allowed.
-    if [[ "$PROFILE_KIND" == opencode ]]; then
-      "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
-      sleep_for 2
-      "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
-    elif "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
-      --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
-      :
+  else
+    landing_detail="$(landing_check_detail)"
+    if [[ "$PROMPT_SUBMITTED" -eq 1 && "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
+      # The first submission completed, and the entire evidence window found
+      # no marker or queued-chip. This is confirmed non-landing, so exactly
+      # one re-injection is allowed; no status value can add another retry.
+      warn "landing window expired; pane=$PANE phase=initial $landing_detail action=reinject-once"
+      if [[ "$PROFILE_KIND" == opencode ]]; then
+        "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
+        sleep_for 2
+        "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
+      elif "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
+        --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
+        :
+      else
+        # The retry itself is also at most once; do not turn its ambiguous wait
+        # result into another payload submission.
+        "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
+      fi
+      if landing_check "$PANE" "$PROMPT_MARKER"; then
+        LANDING=retry
+      else
+        landing_detail="$(landing_check_detail)"
+        LANDING_NO_DETAIL="phase=retry $landing_detail action=landed-no"
+      fi
     else
-      # The retry itself is also at most once; do not turn its ambiguous wait
-      # result into another payload submission.
-      "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
-    fi
-    if landing_check "$PANE" "$PROMPT_MARKER"; then
-      LANDING=retry
+      if [[ "$PROMPT_SUBMITTED" -ne 1 ]]; then
+        retry_skip_reason=prompt-submission-unconfirmed
+      elif [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 ]]; then
+        retry_skip_reason=ambiguous-observation
+      else
+        retry_skip_reason=non-landing-not-confirmed
+      fi
+      LANDING_NO_DETAIL="phase=initial $landing_detail action=landed-no retry=skipped reason=$retry_skip_reason"
     fi
   fi
   STATUS="unknown"
@@ -1052,7 +1143,11 @@ spawn_cmd() {
     echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING"
   fi
   if [[ "$LANDING" == no ]]; then
-    warn "spawn succeeded but brief landed=no; pane=$PANE remains valid"
+    if [[ "$LANDING_STRICT" -eq 1 ]]; then
+      warn "spawn succeeded but brief landed=no; pane=$PANE remains valid; $LANDING_NO_DETAIL strict_exit=$WRK_EXIT_LANDING_UNCONFIRMED"
+      return "$WRK_EXIT_LANDING_UNCONFIRMED"
+    fi
+    warn "spawn succeeded but brief landed=no; pane=$PANE remains valid; $LANDING_NO_DETAIL"
   fi
 }
 

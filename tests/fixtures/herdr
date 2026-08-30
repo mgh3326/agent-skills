@@ -11,13 +11,26 @@ fixture_prompt_count() {
   grep -c '^agent prompt ' "$WRK_FIXTURE_LOG" 2>/dev/null || true
 }
 
+fixture_recent_read_count() {
+  [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]] || { printf '0\n'; return; }
+  grep -c -- '--source recent-unwrapped' "$WRK_FIXTURE_LOG" 2>/dev/null || true
+}
+
+fixture_is_recent_unwrapped_read() {
+  [[ " $* " == *" --source recent-unwrapped "* ]]
+}
+
 fixture_brief_landed() {
-  local prompts
+  local prompts recent_reads
   prompts="$(fixture_prompt_count)"
+  recent_reads="$(fixture_recent_read_count)"
   case "$scenario" in
-    landing-marker) return 0 ;;
+    spawn|landing-marker|prompt-wait-fails) return 0 ;;
     landing-retry|opencode-retry)
       if (( prompts >= 2 )); then return 0; fi
+      ;;
+    landing-delayed-marker)
+      if (( recent_reads >= 3 )); then return 0; fi
       ;;
   esac
   return 1
@@ -46,7 +59,7 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          landing-working-scrollout)
+          landing-working-no-marker|landing-delayed-marker|landing-scrollback-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           *)
@@ -59,10 +72,16 @@ case "${1:-}" in
           echo 'fixture: visible read unavailable' >&2
           exit 9
         fi
-        if fixture_brief_landed; then
-          printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
-        elif [[ "$scenario" == landing-pasted ]]; then
+        if [[ "$scenario" == landing-scrollback-marker ]]; then
+          if fixture_is_recent_unwrapped_read "$@"; then
+            printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
+          else
+            printf 'fixture output after prompt scrolled out\n'
+          fi
+        elif [[ "$scenario" == landing-pasted ]] && ! fixture_is_recent_unwrapped_read "$@"; then
           printf 'Pasted text\n'
+        elif fixture_brief_landed; then
+          printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
         else
           printf 'fixture welcome screen\n'
         fi
