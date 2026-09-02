@@ -298,23 +298,31 @@ queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오�
 `wrk` 자동화가 향후 착지를 보증하게 되더라도 별개로 유지할 가치가 있다 — 자동화 자체가
 실패하거나 우회되는 경로는 항상 남는다.
 
-### 4.x 원격 호스트 워커 (NCP·RPi·데스크탑·M1) — herdr-mirror 채택(2026-09-02)
+### 4.x 원격 호스트 워커 (NCP·RPi·데스크탑·M1) — panewire stage‑2(2026-09-02)
 
-- **스폰**은 원격 herdr 서버에서 현지 `wrk` 로 한다(패턴 고정):
+- **스폰은 반드시 게이트를 통과한다.** SSH·scp·원격 `herdr agent start`로 직접 띄우지 말고:
   ```bash
-  ssh <host> 'export PATH=$HOME/.local/bin:$PATH HERDR_SESSION=worker; wrk spawn -c <path> -m <프로필> -p <프롬프트파일> -w w1 -l <라벨> --t <T> --owner <내 세션> --job <id>'
+  wrk spawn -c <수신 정책 레포 cwd> -m <프로필> -p <brief.md> -w workers -l <label> \
+    --t <T> --owner <내 세션> --job <id> --to <machine_id>
   ```
-  호스트별 세션명: ncp=`operator`, rpi/desktop/m1=`worker`. 프롬프트 파일은 먼저 `scp` 로 올린다.
-- **확인·조작**은 로컬 사이드바의 미러 워크스페이스(`ncp: sessions`, `rpi: ~`, `m1: ~` …)에서
-  한다 — herdr-mirror(nikok6) 가 원격 pane 을 라이브 스트림하고 agent 상태를 실제값으로
-  보고한다. `herdr-mirror status` 로 데몬/호스트 상태 확인, 설정 정본
-  `~/.config/herdr-mirror/hosts.toml`. M1 은 사람이 쓰는 기기라 `always_control=false`(읽기 전용).
-- 🔴 미러 pane 은 **원격의 진짜 pane** 이다 — 거기에 타이핑하면 원격 세션에 들어간다. 제출
-  검증(relay-handoff §3)은 동일하게 적용된다.
-- 🔴 같은 machine_id 의 panewire 노드를 두 번 띄우면 hub 가 거부하고 "hub unavailable" 로만
-  보인다 — 노드 상태는 hub `/v1/nodes`(NCP operator 토큰) 또는 hub `/ui` 가 정본이다.
-- 호스트 다운(뚜껑 닫힘·WoL 실패)은 미러 데몬이 재시도 루프로 표시할 뿐이다 — 스폰 전
-  `ssh -o BatchMode=yes <host> true` 로 도달 확인.
+  `wrk`가 hub 노드 표(`/v1/nodes`와 동등한 `panewire nodes`)에서 대상의
+  **connected+accepting**을 먼저 확인하고, `panewire submit --to <machine_id>
+  --path jobs/<job>/brief.md --kind job.spawn`만 보낸다. 수신측의 현지 `wrk` 게이트가
+  worktree·pane을 만든다. 이는 수신 머신의 쿼터·정책·wrk 게이트를 우회하지 않는 경계다.
+- 원격 브리프 첫머리에는 자동으로 다음 두 규약이 붙는다: **수신자가** `wt switch --create
+  <branch>`로 worktree를 만들 것(수신 정책 cwd가 레포 루트), 그리고 **30분마다 및 위험 단계 전**
+  `wip:` 커밋을 push할 것. 원격은 T 제한이 없다. 간헐 노드는 실패 시 재시도 스폰 대신 아래
+  redispatch가 표준이며, WIP push 규약은 항상 필수다.
+- 귀환 claim을 bounded 대기한 `OK node=<id> pane=<remote-pane> job=<id>`만 스폰 성공이다.
+  대상이 비접속/비수용이면 후보 노드 상태를 출력하고 거부한다. 허브/노드 불능을 SSH로
+  우회하지 않는다.
+- **재배치**: `wrk redispatch <job_id> --to <machine_id>`는 먼저 `panewire jobs reassign`
+  (epoch+1)을 호출하고, 원 브리프에 브랜치·마지막 SHA resume hint를 붙여 다시 stage‑2
+  제출한다.
+- **완료·취소**: 수신 워커는 `report.md` 작성 뒤 `wrk completion --job <id> --to <발신
+  machine_id>`로 `workflow.completion`을 보낸다. 발신 inbox의 `jobs/<id>/report.md`가 정본이다.
+  `wrk revoked-watch`는 `job.revoked.json`을 감시해 해당 pane에 `[REVOKED] 즉시 중단·push 금지`를
+  주입하고 relay-handoff §3 제출 검증을 수행한다.
 
 ## 5. 검증 루프 (스폰의 후반전)
 
