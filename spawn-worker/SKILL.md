@@ -298,6 +298,24 @@ queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오�
 `wrk` 자동화가 향후 착지를 보증하게 되더라도 별개로 유지할 가치가 있다 — 자동화 자체가
 실패하거나 우회되는 경로는 항상 남는다.
 
+### 4.x 원격 호스트 워커 (NCP·RPi·데스크탑·M1) — herdr-mirror 채택(2026-09-02)
+
+- **스폰**은 원격 herdr 서버에서 현지 `wrk` 로 한다(패턴 고정):
+  ```bash
+  ssh <host> 'export PATH=$HOME/.local/bin:$PATH HERDR_SESSION=worker; wrk spawn -c <path> -m <프로필> -p <프롬프트파일> -w w1 -l <라벨> --t <T> --owner <내 세션> --job <id>'
+  ```
+  호스트별 세션명: ncp=`operator`, rpi/desktop/m1=`worker`. 프롬프트 파일은 먼저 `scp` 로 올린다.
+- **확인·조작**은 로컬 사이드바의 미러 워크스페이스(`ncp: sessions`, `rpi: ~`, `m1: ~` …)에서
+  한다 — herdr-mirror(nikok6) 가 원격 pane 을 라이브 스트림하고 agent 상태를 실제값으로
+  보고한다. `herdr-mirror status` 로 데몬/호스트 상태 확인, 설정 정본
+  `~/.config/herdr-mirror/hosts.toml`. M1 은 사람이 쓰는 기기라 `always_control=false`(읽기 전용).
+- 🔴 미러 pane 은 **원격의 진짜 pane** 이다 — 거기에 타이핑하면 원격 세션에 들어간다. 제출
+  검증(relay-handoff §3)은 동일하게 적용된다.
+- 🔴 같은 machine_id 의 panewire 노드를 두 번 띄우면 hub 가 거부하고 "hub unavailable" 로만
+  보인다 — 노드 상태는 hub `/v1/nodes`(NCP operator 토큰) 또는 hub `/ui` 가 정본이다.
+- 호스트 다운(뚜껑 닫힘·WoL 실패)은 미러 데몬이 재시도 루프로 표시할 뿐이다 — 스폰 전
+  `ssh -o BatchMode=yes <host> true` 로 도달 확인.
+
 ## 5. 검증 루프 (스폰의 후반전)
 
 **강도는 §2-1의 T가 정한다.** T0=스폰 없음 / T1=자체검증 / T2=적대검증 1라운드 /

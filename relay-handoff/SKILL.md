@@ -105,6 +105,13 @@ wrk find <이름|라벨> --pane-only  # 스크립트용
 이름이 유실돼도 `wrk find`가 찾고 `wrk name-sync --apply`로 일괄 복구된다. 이름이 좋아도
 화면 실판별은 생략 금지.
 
+### 2.x 원격 호스트 세션 (herdr-mirror, 2026-09-02)
+
+원격 herdr(NCP/RPi/M1/데스크탑)의 세션에 릴레이할 때는 로컬 사이드바의 미러 워크스페이스
+(`<host>: <name>`)에 있는 **미러 pane 의 로컬 pane_id** 로 §3 을 그대로 수행한다(주입·
+`agent read` 검증 동일). 미러가 없으면(호스트 다운·데몬 미기동) `herdr-mirror status` 로
+먼저 확인하고, 폴백은 `ssh <host> 'herdr --session <s> agent prompt <원격 pane> ...'`.
+
 ## 3. herdr 주입 + 제출 검증 (생략 절대 금지)
 
 ```bash
