@@ -771,6 +771,106 @@ echo "PASS canonical-checkout-guard"
 
 grep -q 'for tool in "$REPO_DIR"/bin/\*' "$ROOT/install.sh"
 
+# Remote stage-2: the sender consults hub state, submits only through panewire,
+# and waits for a durable remote claim.  The fixture never offers SSH, making a
+# future direct-spawn mutant observable here rather than on a real receiver.
+PANEWIRE="$ROOT/tests/fixtures/panewire"
+REMOTE_ROOT="$TMP/remote-stage2"
+mkdir -p "$REMOTE_ROOT"
+REMOTE_PROMPT="$TMP/remote-brief.md"
+printf '%s\n' 'remote fixture task' >"$REMOTE_PROMPT"
+remote_spawn() {
+  (
+    cd "$REMOTE_ROOT"
+    env PANEWIRE_BIN="$PANEWIRE" WRK_PANEWIRE_SCENARIO="${1:-claim}" \
+      WRK_PANEWIRE_LOG="$TMP/panewire.log" WRK_MACHINE_ID=sender WRK_JOBS_DIR=jobs WRK_NO_SLEEP=1 \
+      "$WRK" spawn -c "$ROOT" -m codex-terra -p "$REMOTE_PROMPT" -w workers -l remotefix \
+        --t T1 --job sk-wrkto-20260902-1500 --to remote
+  )
+}
+rm -f "$TMP/panewire.log"
+remote_out="$(remote_spawn claim)"
+grep -q '^OK node=remote pane=remote:p7 job=sk-wrkto-20260902-1500$' <<<"$remote_out"
+grep -qx 'nodes --json' <(head -n 1 "$TMP/panewire.log")
+grep -qx 'submit --to remote --path jobs/sk-wrkto-20260902-1500/brief.md --kind job.spawn' <(tail -n 1 "$TMP/panewire.log")
+grep -q 'wt switch --create' "$REMOTE_ROOT/jobs/sk-wrkto-20260902-1500/brief.md"
+grep -q '30분마다/위험 단계 전 `wip:` 커밋 push' "$REMOTE_ROOT/jobs/sk-wrkto-20260902-1500/brief.md"
+! rg -q '\bssh\b|agent start|tab create' "$TMP/panewire.log"
+# Mutation guard: an SSH fallback would make the target's wrk gate optional.
+! rg -q '\bssh\b' "$ROOT/bin/wrk"
+echo "PASS remote-stage2-gate-submit-claim"
+
+# Reject a connected-but-non-accepting node before any submit (candidate state
+# remains actionable for the operator).
+rm -f "$TMP/panewire.log"
+set +e
+reject_out="$(remote_spawn rejecting 2>&1)"
+reject_rc=$?
+set -e
+[[ "$reject_rc" -ne 0 ]]
+grep -q "remote node 'remote' is not connected+accepting" <<<"$reject_out"
+grep -q 'remote(connected=yes,accepting=no)' <<<"$reject_out"
+[[ "$(wc -l <"$TMP/panewire.log")" -eq 1 ]]
+
+# A submission without its event is a bounded, non-success outcome.
+rm -f "$TMP/panewire.log"
+set +e
+timeout_out="$(
+  cd "$REMOTE_ROOT"
+  env PANEWIRE_BIN="$PANEWIRE" WRK_PANEWIRE_SCENARIO=accepting WRK_PANEWIRE_LOG="$TMP/panewire.log" \
+    WRK_MACHINE_ID=sender WRK_JOBS_DIR=jobs WRK_REMOTE_CLAIM_TIMEOUT_SECONDS=0 WRK_NO_SLEEP=1 \
+    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$REMOTE_PROMPT" -w workers -l remotetimeout \
+      --t T1 --job sk-wrkto-timeout --to remote 2>&1
+)"
+timeout_rc=$?
+set -e
+[[ "$timeout_rc" -eq 77 ]]
+grep -q 'remote claim timeout node=remote job=sk-wrkto-timeout' <<<"$timeout_out"
+
+# Worker completion returns the report only via workflow.completion; panewire
+# owns landing it in the sender inbox.
+mkdir -p "$REMOTE_ROOT/jobs/sk-wrkto-20260902-1500"
+printf '%s\n' 'remote report' >"$REMOTE_ROOT/jobs/sk-wrkto-20260902-1500/report.md"
+rm -f "$TMP/panewire.log"
+completion_out="$(
+  cd "$REMOTE_ROOT"
+  env PANEWIRE_BIN="$PANEWIRE" WRK_PANEWIRE_SCENARIO=accepting WRK_PANEWIRE_LOG="$TMP/panewire.log" WRK_JOBS_DIR=jobs \
+    WRK_PANEWIRE_INBOX="$TMP/sender-inbox" \
+    "$WRK" completion --job sk-wrkto-20260902-1500 --to sender
+)"
+grep -q '^OK completion node=sender job=sk-wrkto-20260902-1500 path=jobs/sk-wrkto-20260902-1500/report.md$' <<<"$completion_out"
+grep -qx 'submit --to sender --path jobs/sk-wrkto-20260902-1500/report.md --kind workflow.completion' "$TMP/panewire.log"
+cmp -s "$REMOTE_ROOT/jobs/sk-wrkto-20260902-1500/report.md" "$TMP/sender-inbox/jobs/sk-wrkto-20260902-1500/report.md"
+
+# redispatch first increments hub ownership epoch, then reuses the brief plus a
+# resume hint; it never invents a second local spawn route.
+rm -f "$TMP/panewire.log"
+redispatch_out="$(
+  cd "$REMOTE_ROOT"
+  env PANEWIRE_BIN="$PANEWIRE" WRK_PANEWIRE_SCENARIO=claim WRK_PANEWIRE_LOG="$TMP/panewire.log" \
+    WRK_MACHINE_ID=sender WRK_JOBS_DIR=jobs WRK_NO_SLEEP=1 "$WRK" redispatch sk-wrkto-20260902-1500 --to remote
+)"
+grep -q '^OK node=remote pane=remote:p7 job=sk-wrkto-20260902-1500$' <<<"$redispatch_out"
+grep -qx 'jobs reassign --job sk-wrkto-20260902-1500 --to remote' <(head -n 1 "$TMP/panewire.log")
+grep -q 'resume hint: branch=' "$REMOTE_ROOT/jobs/sk-wrkto-20260902-1500/brief.md"
+
+# Revocation has a durable event gate and uses the relay-handoff injection
+# sequence against the fake herdr; an absent pane is deliberately not guessed.
+REVOKE_ROOT="$TMP/revoked"
+mkdir -p "$REVOKE_ROOT/jobs/sk-wrkto-20260902-1500/events"
+printf '%s\n' '{"pane_id":"w:p1"}' >"$REVOKE_ROOT/jobs/sk-wrkto-20260902-1500/events/00001-job.revoked.json"
+rm -f "$TMP/herdr.log"
+revoke_out="$(
+  cd "$REVOKE_ROOT"
+  env HERDR_BIN="$HERDR" WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_JOBS_DIR=jobs \
+    "$WRK" revoked-watch --once
+)"
+grep -q '^OK revoked pane=w:p1 ' <<<"$revoke_out"
+grep -Fq 'agent prompt w:p1 [REVOKED] 즉시 중단·push 금지' "$TMP/herdr.log"
+grep -q -- '--source visible' "$TMP/herdr.log"
+[[ -f "$REVOKE_ROOT/jobs/sk-wrkto-20260902-1500/events/00001-job.revoked.injected" ]]
+echo "PASS remote-completion-redispatch-revocation"
+
 # ROB-1190 ④-3: scopefuel 이 추천하는 모든 프로필 ⊆ wrk 가 띄울 수 있는 프로필.
 # WRK_TEST_SCOPEFUEL_SRC 로 scopefuel worktree 경로를 주면 uv run 으로 실제 GRADE_TABLE 을
 # 조회해 대조한다(둘 다 로컬에 있을 때만 — 없으면 스킵, CI 이식성 유지).

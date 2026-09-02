@@ -3,6 +3,7 @@
 set -euo pipefail
 
 HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
+PANEWIRE="${PANEWIRE_BIN:-$HOME/.local/bin/panewire}"
 SCOPEFUEL="${SCOPEFUEL_BIN:-}"
 ARBITER="${ARBITER_BIN:-}"
 # A live duplicate is an exact-once violation, distinct from generic CLI
@@ -14,6 +15,11 @@ WRK_EXIT_JOB_STATE_UNREADABLE=75
 # observed. Automation opts into 76 to distinguish that outcome from the
 # ROB-1326 duplicate-job contracts above.
 WRK_EXIT_LANDING_UNCONFIRMED=76
+# Remote submission was accepted but the receiving wrk gate never made a
+# durable claim visible to us.  This is deliberately distinct from a local
+# spawn failure: retrying it blindly can create a second remote worker.
+WRK_EXIT_REMOTE_CLAIM_TIMEOUT=77
+WRK_JOBS_DIR="${WRK_JOBS_DIR:-jobs}"
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -72,10 +78,13 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|find|name-sync|profiles> [options]
+Usage: wrk <spawn|redispatch|completion|revoked-watch|find|name-sync|profiles> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-            [-L live|mock] [--effort LEVEL] [--job ID] [--job-dup-ok] [--landing-strict]
+            [-L live|mock] [--effort LEVEL] [--job ID] [--to MACHINE_ID] [--job-dup-ok] [--landing-strict]
+  wrk redispatch JOB_ID --to MACHINE_ID
+  wrk completion --job JOB_ID --to MACHINE_ID [--path REPORT_PATH]
+  wrk revoked-watch [--once]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -88,7 +97,7 @@ spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--job-dup-ok]
-                 [--landing-strict]
+                 [--landing-strict] [--to MACHINE_ID]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -104,6 +113,10 @@ Options:
   --landing-strict   automation opt-in: preserve the OK line, then exit 76 if
                      no marker/Pasted-text landing evidence appears. Without it,
                      landed=no remains a successful spawn with a warning.
+  --to MACHINE_ID    submit a stage-2 job.spawn through panewire. The receiving
+                     machine's wrk gate (not SSH) creates its worktree and pane.
+  --return-to NODE   internal receiving-gate option: return report.md to NODE on
+                     worker completion. It is intentionally not used for local spawns.
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
@@ -131,6 +144,35 @@ Retired TUI agy profiles are rejected. Emergency headless backup:
 USAGE
 }
 
+redispatch_help() {
+  cat <<'USAGE'
+Usage: wrk redispatch JOB_ID --to MACHINE_ID
+
+Calls `panewire jobs reassign` first, then submits the original brief with a
+branch/HEAD resume hint. The target must pass the normal connected+accepting
+node gate; a failed target is not bypassed with SSH.
+USAGE
+}
+
+completion_help() {
+  cat <<'USAGE'
+Usage: wrk completion --job JOB_ID --to MACHINE_ID [--path REPORT_PATH]
+
+Submits REPORT_PATH (default: jobs/JOB_ID/report.md) as workflow.completion.
+This is the receiving worker's --job completion hook and fails closed when the
+report or panewire is unavailable.
+USAGE
+}
+
+revoked_watch_help() {
+  cat <<'USAGE'
+Usage: wrk revoked-watch [--once]
+
+Watches jobs/*/events/*job.revoked.json and injects a verified stop notice into
+the pane named by each event. --once scans the current events and exits.
+USAGE
+}
+
 find_help() {
   cat <<'USAGE'
 Usage: wrk find <name-or-label> [--pane-only]
@@ -154,6 +196,270 @@ USAGE
 die() { echo "wrk: $*" >&2; exit 2; }
 warn() { echo "wrk: warning: $*" >&2; }
 sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
+
+job_id_is_safe() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$ ]]
+}
+
+require_panewire() {
+  [[ -x "$PANEWIRE" ]] || die "panewire unavailable: $PANEWIRE (remote operations fail closed)"
+}
+
+# Hub state is the only admission authority for a remote spawn.  In
+# particular, do not add an SSH fallback here: that would bypass the receiver's
+# local wrk gate and permit a stale/offline node to create an untracked pane.
+panewire_node_gate() {
+  local node="$1" raw parsed rc
+  require_panewire
+  set +e
+  raw="$("$PANEWIRE" nodes --json 2>&1)"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: panewire nodes failed (exit $rc): $raw" >&2
+    return "$rc"
+  fi
+  set +e
+  parsed="$(python3 -c '
+import json, sys
+target = sys.argv[1]
+doc = json.load(sys.stdin)
+if isinstance(doc, dict):
+    doc = doc.get("result", doc)
+    nodes = doc.get("nodes", []) if isinstance(doc, dict) else []
+elif isinstance(doc, list):
+    nodes = doc
+else:
+    nodes = []
+if not isinstance(nodes, list): raise ValueError("nodes is not a list")
+def ident(n): return n.get("machine_id") or n.get("node_id") or n.get("id") or n.get("name")
+def connected(n):
+    value = n.get("connected", n.get("status", n.get("state")))
+    return value is True or str(value).lower() in {"connected", "online", "ready"}
+def accepting(n):
+    value = n.get("accepting", n.get("accepting_jobs", n.get("accepts_jobs")))
+    return value is True or str(value).lower() in {"accepting", "true", "yes"}
+rows, selected = [], None
+for n in nodes:
+    if not isinstance(n, dict): continue
+    i = ident(n)
+    if not isinstance(i, str) or not i: continue
+    rows.append(f"{i}(connected={'"'"'yes'"'"' if connected(n) else '"'"'no'"'"'},accepting={'"'"'yes'"'"' if accepting(n) else '"'"'no'"'"'})")
+    if i == target: selected = (connected(n), accepting(n))
+if selected == (True, True): print("ACCEPT")
+else:
+    print("REJECT")
+    print("candidates=" + (", ".join(rows) if rows else "none"))
+' "$node" <<<"$raw")"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: panewire nodes returned invalid JSON; remote spawn refused" >&2
+    return "$rc"
+  fi
+  if [[ "${parsed%%$'\n'*}" != ACCEPT ]]; then
+    echo "wrk: remote node '$node' is not connected+accepting; ${parsed#*$'\n'}" >&2
+    return 1
+  fi
+}
+
+panewire_local_node() {
+  # Deployments should set WRK_MACHINE_ID.  The JSON fallback makes the CLI
+  # usable with hubs that mark their local row rather than exposing a separate
+  # identity endpoint; guessing from hostname would misroute completions.
+  [[ -n "${WRK_MACHINE_ID:-}" ]] && { printf '%s' "$WRK_MACHINE_ID"; return 0; }
+  local raw
+  raw="$("$PANEWIRE" nodes --json 2>/dev/null || true)"
+  printf '%s' "$raw" | python3 -c '
+import json, sys
+try:
+    d = json.load(sys.stdin)
+except Exception:
+    raise SystemExit(1)
+if isinstance(d, dict):
+    d = d.get("result", d)
+nodes = d.get("nodes", []) if isinstance(d, dict) else (d if isinstance(d, list) else [])
+for n in nodes:
+    if isinstance(n, dict) and n.get("local") is True:
+        i = n.get("machine_id") or n.get("node_id") or n.get("id")
+        if isinstance(i, str) and i:
+            print(i)
+            raise SystemExit(0)
+raise SystemExit(1)
+'
+}
+
+remote_brief_path() { printf '%s/%s/brief.md' "$WRK_JOBS_DIR" "$1"; }
+remote_report_path() { printf '%s/%s/report.md' "$WRK_JOBS_DIR" "$1"; }
+
+write_remote_brief() {
+  local job="$1" source="$2" origin="$3" resume_hint="${4:-}" target="$5" brief body
+  brief="$(remote_brief_path "$job")"
+  body="$(<"$source")"
+  mkdir -p "${brief%/*}"
+  {
+    printf '%s\n' 'worktree 는 네가 `wt switch --create <branch>` 로 만든다(레포 루트=수신 정책 cwd).'
+    printf '%s\n' '30분마다/위험 단계 전 `wip:` 커밋 push.'
+    printf '%s\n' "원격 발신 머신: $origin"
+    printf '%s\n' "완료 시: wrk completion --job $job --to $origin --path $(remote_report_path "$job")"
+    printf '%s\n' "수신 wrk 게이트는 이 job을 시작할 때 --return-to $origin 을 보존해야 한다."
+    printf '%s\n' "원격 대상: $target"
+    [[ -z "$resume_hint" ]] || printf '%s\n' "$resume_hint"
+    printf '\n'
+    printf '%s\n' "$body"
+  } >"$brief"
+  printf '%s' "$brief"
+}
+
+remote_claim_wait() {
+  local job="$1" node="$2" timeout="${WRK_REMOTE_CLAIM_TIMEOUT_SECONDS:-60}" event pane started now
+  [[ "$timeout" =~ ^[0-9]+$ ]] || die "WRK_REMOTE_CLAIM_TIMEOUT_SECONDS must be a non-negative integer"
+  started="$(date +%s)"
+  while :; do
+    event="$(find "$WRK_JOBS_DIR/$job/events" -maxdepth 1 -type f -name '*job.claim.json' -print 2>/dev/null | sort | tail -n 1 || true)"
+    if [[ -n "$event" ]]; then
+      pane="$(python3 - "$event" <<'PY'
+import json, sys
+try:
+    d = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(1)
+for key in ("remote_pane", "pane_id", "pane"):
+    v = d.get(key)
+    if isinstance(v, str) and v:
+        print(v)
+        raise SystemExit(0)
+payload = d.get("payload")
+if isinstance(payload, dict):
+    for key in ("remote_pane", "pane_id", "pane"):
+        v = payload.get(key)
+        if isinstance(v, str) and v:
+            print(v)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+)" || pane=""
+      if [[ -n "$pane" ]]; then
+        echo "OK node=$node pane=$pane job=$job"
+        return 0
+      fi
+      warn "remote claim event is unreadable or has no pane: $event"
+    fi
+    now="$(date +%s)"
+    if (( now - started >= timeout )); then
+      echo "wrk: remote claim timeout node=$node job=$job timeout=${timeout}s; do not retry blindly — inspect panewire jobs then use wrk redispatch" >&2
+      return "$WRK_EXIT_REMOTE_CLAIM_TIMEOUT"
+    fi
+    sleep_for 1
+  done
+}
+
+remote_submit() {
+  local job="$1" node="$2" source="$3" resume_hint="${4:-}" origin brief
+  job_id_is_safe "$job" || die "invalid job id '$job' for remote operation"
+  panewire_node_gate "$node"
+  origin="$(panewire_local_node)" || die "cannot determine local machine id; set WRK_MACHINE_ID before remote spawn"
+  brief="$(write_remote_brief "$job" "$source" "$origin" "$resume_hint" "$node")"
+  "$PANEWIRE" submit --to "$node" --path "$brief" --kind job.spawn
+  remote_claim_wait "$job" "$node"
+}
+
+completion_cmd() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { completion_help; return 0; }
+  local job="" node="" path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --job|--to|--path)
+        [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
+        case "$1" in --job) job="$2" ;; --to) node="$2" ;; --path) path="$2" ;; esac
+        shift 2 ;;
+      -*) die "unknown option '$1'" ;;
+      *) die "unexpected argument '$1'" ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "completion requires --job"
+  [[ -n "$node" ]] || die "completion requires --to"
+  job_id_is_safe "$job" || die "invalid job id '$job' for completion"
+  [[ -n "$path" ]] || path="$(remote_report_path "$job")"
+  [[ -r "$path" ]] || die "completion report is not readable: $path"
+  require_panewire
+  "$PANEWIRE" submit --to "$node" --path "$path" --kind workflow.completion
+  echo "OK completion node=$node job=$job path=$path"
+}
+
+completion_watch_start() {
+  local job="$1" node="$2" report="$3"
+  # This is only armed by the receiving-gate option. Existing local spawn has
+  # no watcher and therefore preserves its prior behavior.
+  (
+    local elapsed=0 limit="${WRK_COMPLETION_WATCH_SECONDS:-1800}"
+    while (( elapsed <= limit )); do
+      if [[ -r "$report" ]]; then
+        "$0" completion --job "$job" --to "$node" --path "$report" ||
+          warn "completion return failed job=$job node=$node; report retained at $report"
+        return 0
+      fi
+      sleep 5
+      elapsed=$((elapsed + 5))
+    done
+    warn "completion hook expired without report job=$job path=$report"
+  ) </dev/null >/dev/null 2>&1 &
+}
+
+revoke_pane_from_event() {
+  local event="$1" pane visible marker
+  pane="$(python3 - "$event" <<'PY'
+import json, sys
+d = json.load(open(sys.argv[1], encoding="utf-8"))
+for key in ("pane_id", "pane", "remote_pane"):
+    v = d.get(key)
+    if isinstance(v, str) and v:
+        print(v); raise SystemExit(0)
+payload = d.get("payload")
+if isinstance(payload, dict):
+    for key in ("pane_id", "pane", "remote_pane"):
+        v = payload.get(key)
+        if isinstance(v, str) and v:
+            print(v); raise SystemExit(0)
+raise SystemExit(1)
+PY
+)" || {
+    warn "revoked event has no unambiguous pane; fail closed: $event"
+    return 1
+  }
+  [[ -x "$HERDR" ]] || { warn "herdr unavailable for revoked event: $event"; return 1; }
+  marker='[REVOKED] 즉시 중단·push 금지'
+  "$HERDR" agent prompt "$pane" "$marker" >/dev/null
+  # relay-handoff §3: command success alone is not evidence. Only a visible
+  # queued/composer payload gets a single return key; otherwise never retry.
+  visible="$($HERDR agent read "$pane" --source visible --lines 10 2>/dev/null || true)"
+  if grep -Fq 'Pasted text' <<<"$visible" || grep -Fq "$marker" <<<"$visible"; then
+    "$HERDR" agent send-keys "$pane" return >/dev/null 2>&1 || true
+    "$HERDR" agent read "$pane" --source visible --lines 10 >/dev/null 2>&1 || true
+  fi
+  echo "OK revoked pane=$pane event=$event"
+}
+
+revoked_watch_cmd() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { revoked_watch_help; return 0; }
+  local once=0 event marker
+  while [[ $# -gt 0 ]]; do
+    case "$1" in --once) once=1 ;; -*) die "unknown option '$1'" ;; *) die "unexpected argument '$1'" ;; esac
+    shift
+  done
+  while :; do
+    while IFS= read -r event; do
+      [[ -n "$event" ]] || continue
+      marker="${event%.json}.injected"
+      [[ -e "$marker" ]] && continue
+      if revoke_pane_from_event "$event"; then
+        : >"$marker"
+      fi
+    done < <(find "$WRK_JOBS_DIR" -type f -name '*job.revoked.json' -print 2>/dev/null | sort)
+    [[ "$once" -eq 1 ]] && return 0
+    sleep_for 2
+  done
+}
 
 # Landing is a bounded positive-evidence observation, not a second boot wait.
 # The prompt command already owns its normal wait when supported. A 30-second
@@ -958,17 +1264,18 @@ resolve_profile() {
 spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" REMOTE_TO="" RETURN_TO="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
   ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--to|--return-to)
         [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
           --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
+          --to) REMOTE_TO="$2" ;; --return-to) RETURN_TO="$2" ;;
         esac
         shift 2 ;;
       --job-dup-ok) JOB_DUP_OK=1; shift ;;
@@ -990,6 +1297,15 @@ spawn_cmd() {
   [[ -r "$PROMPT" ]] || die "prompt file is not readable: $PROMPT"
 
   [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
+
+  # Stage 2 is intentionally before local quota/arbiter/herdr work. The
+  # receiving machine's wrk gate owns all of those decisions and is the only
+  # component allowed to create its pane/worktree.
+  if [[ -n "$REMOTE_TO" ]]; then
+    [[ -z "$RETURN_TO" ]] || die "--to and --return-to cannot be combined"
+    remote_submit "$JOB_ID" "$REMOTE_TO" "$PROMPT"
+    return 0
+  fi
 
   resolve_profile
   configure_landing_check "$PROFILE_KIND"
@@ -1041,6 +1357,10 @@ spawn_cmd() {
     TAB_ENV+=(--env "ARBITER_JOB=$JOB_ID" --env "ARBITER_RESOURCE=$ARBITER_RESOURCE"
               --env "ARBITER_KIND=quota_pool" --env "ARBITER_PROFILE=$ARBITER_PROFILE"
               --env "ARBITER_STARTED_AT=$ARBITER_STARTED_AT")
+  fi
+  if [[ -n "$RETURN_TO" ]]; then
+    TAB_ENV+=(--env "WRK_JOB_ID=$JOB_ID" --env "WRK_COMPLETION_TO=$RETURN_TO"
+              --env "WRK_COMPLETION_REPORT_PATH=$(remote_report_path "$JOB_ID")")
   fi
   if [[ "${#TAB_ENV[@]}" -gt 0 ]]; then
     PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}" |
@@ -1137,6 +1457,9 @@ spawn_cmd() {
   SPAWN_PANE_OPEN=0
   refresh_quota_pool
   ARBITER_HELD=0
+  if [[ -n "$RETURN_TO" ]]; then
+    completion_watch_start "$JOB_ID" "$RETURN_TO" "$(remote_report_path "$JOB_ID")"
+  fi
   if [[ -n "$ARBITER_RESOURCE" ]]; then
     echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
   else
@@ -1289,9 +1612,37 @@ else:
 PY
 }
 
+redispatch_cmd() {
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { redispatch_help; return 0; }
+  local job="" node="" brief branch sha hint
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --to) [[ $# -ge 2 && -n "$2" ]] || die "--to requires a value"; node="$2"; shift 2 ;;
+      -*) die "unknown option '$1'" ;;
+      *) [[ -z "$job" ]] || die "redispatch accepts exactly one JOB_ID"; job="$1"; shift ;;
+    esac
+  done
+  [[ -n "$job" ]] || die "redispatch requires JOB_ID"
+  [[ -n "$node" ]] || die "redispatch requires --to MACHINE_ID"
+  job_id_is_safe "$job" || die "invalid job id '$job' for redispatch"
+  brief="$(remote_brief_path "$job")"
+  [[ -r "$brief" ]] || die "original brief is not readable: $brief"
+  require_panewire
+  # Reassignment is owned by the hub. Its epoch increment is a precondition to
+  # delivery, so a missing/operator-old CLI does not silently submit a stale job.
+  "$PANEWIRE" jobs reassign --job "$job" --to "$node"
+  branch="$(git branch --show-current 2>/dev/null || true)"
+  sha="$(git rev-parse HEAD 2>/dev/null || true)"
+  hint="resume hint: branch=${branch:-unknown} last_sha=${sha:-unknown}; inspect the existing remote worktree before continuing."
+  remote_submit "$job" "$node" "$brief" "$hint"
+}
+
 case "${1:-}" in
   -h|--help) usage ;;
   spawn) shift; spawn_cmd "$@" ;;
+  redispatch) shift; redispatch_cmd "$@" ;;
+  completion) shift; completion_cmd "$@" ;;
+  revoked-watch) shift; revoked_watch_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;

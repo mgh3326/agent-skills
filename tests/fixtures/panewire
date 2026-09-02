@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${WRK_PANEWIRE_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$WRK_PANEWIRE_LOG"
+fi
+
+scenario="${WRK_PANEWIRE_SCENARIO:-accepting}"
+jobs_dir="${WRK_JOBS_DIR:-jobs}"
+
+case "${1:-}" in
+  nodes)
+    case "$scenario" in
+      rejecting)
+        printf '%s\n' '{"nodes":[{"machine_id":"sender","connected":true,"accepting":true,"local":true},{"machine_id":"remote","connected":true,"accepting":false},{"machine_id":"offline","connected":false,"accepting":true}]}'
+        ;;
+      *)
+        printf '%s\n' '{"nodes":[{"machine_id":"sender","connected":true,"accepting":true,"local":true},{"machine_id":"remote","connected":true,"accepting":true},{"machine_id":"sleepy","connected":true,"accepting":false}]}'
+        ;;
+    esac
+    ;;
+  submit)
+    [[ "${2:-}" == --to && "${4:-}" == --path && "${6:-}" == --kind ]] || { echo "bad submit contract: $*" >&2; exit 9; }
+    to="$3"; path="$5"; kind="$7"
+    [[ -r "$path" ]] || { echo "path unreadable: $path" >&2; exit 9; }
+    if [[ "$scenario" == claim && "$kind" == job.spawn ]]; then
+      job="$(basename "$(dirname "$path")")"
+      mkdir -p "$jobs_dir/$job/events"
+      printf '%s\n' '{"pane_id":"remote:p7"}' >"$jobs_dir/$job/events/00001-job.claim.json"
+    fi
+    if [[ "$kind" == workflow.completion && -n "${WRK_PANEWIRE_INBOX:-}" ]]; then
+      job="$(basename "$(dirname "$path")")"
+      mkdir -p "$WRK_PANEWIRE_INBOX/jobs/$job"
+      cp "$path" "$WRK_PANEWIRE_INBOX/jobs/$job/report.md"
+    fi
+    printf '%s\n' "accepted to=$to kind=$kind"
+    ;;
+  jobs)
+    [[ "${2:-}" == reassign && "${3:-}" == --job && "${5:-}" == --to ]] || { echo "bad reassign contract: $*" >&2; exit 9; }
+    printf '%s\n' '{"epoch":2}'
+    ;;
+  *) echo "unsupported panewire fixture command: $*" >&2; exit 9 ;;
+esac
