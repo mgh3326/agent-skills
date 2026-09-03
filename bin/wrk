@@ -233,7 +233,7 @@ landing_check_once() {
   if ! recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown
-    LANDING_CHECK_LAST_REASON=recent-unwrapped-read-failed
+    LANDING_CHECK_LAST_REASON="recent-unwrapped-read-failed"
     return 1
   fi
 
@@ -242,35 +242,33 @@ landing_check_once() {
   # away. `working` below is deliberately not evidence: a cold codex boot
   # reports working before the composer has received the payload.
   if [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$recent"; then
-    LANDING_SIGNAL=marker
     LANDING_CHECK_LAST_EVIDENCE=marker
-    LANDING_CHECK_LAST_REASON=marker-in-recent-unwrapped
+    LANDING_CHECK_LAST_REASON="marker-in-recent-unwrapped"
     return 0
   fi
   if ! visible="$("$HERDR" agent read "$pane" --source visible --lines 40 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown
-    LANDING_CHECK_LAST_REASON=visible-read-failed
+    LANDING_CHECK_LAST_REASON="visible-read-failed"
     return 1
   fi
 
   # The UI chip is an independent positive observation that the payload is
   # queued; keep it as the fallback for prompts whose transcript is delayed.
   if grep -Fq -- "Pasted text" <<<"$visible"; then
-    LANDING_SIGNAL=pasted
     LANDING_CHECK_LAST_EVIDENCE=pasted
-    LANDING_CHECK_LAST_REASON=pasted-text-chip
+    LANDING_CHECK_LAST_REASON="pasted-text-chip"
     return 0
   fi
   if ! status="$(agent_status_for_pane "$pane")"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown
-    LANDING_CHECK_LAST_REASON=status-read-failed
+    LANDING_CHECK_LAST_REASON="status-read-failed"
     return 1
   fi
   LANDING_CHECK_LAST_STATUS="$status"
   if [[ "$status" == working ]]; then
-    LANDING_CHECK_LAST_REASON=working-without-positive-evidence
+    LANDING_CHECK_LAST_REASON="working-without-positive-evidence"
   else
     LANDING_CHECK_LAST_REASON="status-${status}-without-positive-evidence"
   fi
@@ -284,8 +282,7 @@ landing_check() {
   LANDING_CHECK_ATTEMPTS=0
   LANDING_CHECK_LAST_EVIDENCE=none
   LANDING_CHECK_LAST_STATUS=unknown
-  LANDING_CHECK_LAST_REASON=not-observed
-  LANDING_SIGNAL=none
+  LANDING_CHECK_LAST_REASON="not-observed"
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
     if landing_check_once "$pane" "$marker"; then return 0; fi
@@ -1210,6 +1207,7 @@ spillover_remote_spawn() {
     echo "wrk: remote host '$host' has no cwd_map entry for '$cwd'; use --host local or configure hosts.toml" >&2
     return 2
   fi
+  # shellcheck disable=SC2016 # ${TMPDIR} must expand on the selected remote host.
   if ! remote_prompt="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'umask 077; mktemp "${TMPDIR:-/tmp}/wrk-spillover.XXXXXX.md"' 2>/dev/null)"; then
     echo "wrk: remote host '$host' is unreachable; use --host local or retry after it is available" >&2
     return 1
@@ -1366,7 +1364,7 @@ spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
-  ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
+  ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
@@ -1487,7 +1485,7 @@ spawn_cmd() {
     "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
   else
     if ! "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
-      --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
+      --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
       # The payload was already submitted. A return may settle a still-open
       # composer, but the payload must never be sent again after an ambiguous
       # wait result. A later screen/status observation is different: only a
@@ -1513,7 +1511,7 @@ spawn_cmd() {
         sleep_for 2
         "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
       elif "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
-        --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
+        --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
         :
       else
         # The retry itself is also at most once; do not turn its ambiguous wait
@@ -1528,7 +1526,7 @@ spawn_cmd() {
       fi
     else
       if [[ "$PROMPT_SUBMITTED" -ne 1 ]]; then
-        retry_skip_reason=prompt-submission-unconfirmed
+        retry_skip_reason="prompt-submission-unconfirmed"
       elif [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 ]]; then
         retry_skip_reason=ambiguous-observation
       else
