@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == place ]]; then
+  case "${WRK_PLACE_SCENARIO:-unavailable}" in
+    unavailable) exit 1 ;;
+    local) printf '%s\n' '{"decision":"local","candidates":[],"reason":"hub healthy","source":"hub"}' ;;
+    desktop) printf '%s\n' '{"decision":"desktop","candidates":["desktop"],"reason":"hub spill","source":"hub"}' ;;
+    invalid) printf '%s\n' '{"decision":{},"candidates":[],"reason":"broken"}' ;;
+  esac
+  exit 0
+fi
+
+printf '%s\n' "$*" >>"${WRK_WAKE_LOG:?}"

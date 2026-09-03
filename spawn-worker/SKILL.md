@@ -316,6 +316,49 @@ queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오�
 - 호스트 다운(뚜껑 닫힘·WoL 실패)은 미러 데몬이 재시도 루프로 표시할 뿐이다 — 스폰 전
   `ssh -o BatchMode=yes <host> true` 로 도달 확인.
 
+### 4.x-1 `wrk` spill-over — hub placement 우선, 로컬 압력은 폴백
+
+`wrk spawn`의 기본 `--host auto`는 **정책을 자체 결정하지 않는다.** 먼저
+`panewire place --class worker --cwd <key>`를 호출해 JSON의 `decision`·`candidates`·`reason`을
+받고, 그 선택을 실행한다. hub가 명시적으로 `local`을 주면 로컬이 과부하여도 그대로 따른다.
+hub 호출 자체가 실패했을 때만 아래의 로컬 폴백 측정(load5/ncpu·`working` agent 수·macOS
+`CPU_Speed_Limit`)으로 후보를 고른다. 잘못된 hub JSON은 로컬 폴백하지 않고 fail-closed다.
+
+호스트별 경로·세션·workspace는 공개 코드가 아니라 로컬 설정
+`~/.config/wrk/hosts.toml`에 둔다(테스트/이식용 경로는 `WRK_HOSTS_CONFIG`). 값은 반드시 각
+환경에 맞춘 자리표시자를 바꿔 넣는다.
+
+```toml
+[local]
+max_load_ratio = 0.5       # hub unavailable 때만 사용
+max_active = 4             # hub unavailable 때만 사용
+
+[hosts.<remote-name>]
+ssh = "<ssh-alias>"
+herdr_session = "worker"
+workspace = "<remote-workspace>"
+cwd_map = {"<local-worktree>"="<remote-worktree>"}
+capacity = 3               # hub unavailable 때의 후보 실측 한도
+# 선택적 wake: 기본 off. 값·URL·토큰은 모두 환경/설정에만 둔다.
+wake = "panewire"
+wake_token_env = "<token-env-name>"
+wake_url_env = "<hub-url-env-name>"
+```
+
+- 원격 선택 시 브리프를 권한 `0600` 임시 파일로 `scp`하고,
+  `ssh <alias> 'HERDR_SESSION=<session> wrk spawn ... --host local'`로 현지 `wrk`에 위임한다.
+  그러므로 원격에서도 quota gate·pane 착지 검증이 동일하게 수행된다. 원격 `-w`는 설정의
+  `workspace`가 기본값이며 호출자가 명시하면 그 값을 유지한다.
+- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. 로컬로 조용히 되돌리지 말고
+  `--host local` 또는 설정 추가를 안내한다. worktree 생성/동기화는 이 범위 밖이다.
+- hub가 꺼져 폴백 중 원격 후보가 닿지 않으면 다음 후보를 본다. `wake = "panewire"`일 때만
+  `panewire burst request --target <name> --hold <N>m`을 best-effort로 시도하며, wake 실패도
+  다음 후보 탐색을 막지 않는다.
+- `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
+  `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
+- `--host local`은 운영자 강제 로컬, `--host <remote-name>`은 강제 원격이다. 둘 다 hub 판정을
+  우회하므로 장애 대응·진단에만 쓴다.
+
 ## 5. 검증 루프 (스폰의 후반전)
 
 **강도는 §2-1의 T가 정한다.** T0=스폰 없음 / T1=자체검증 / T2=적대검증 1라운드 /

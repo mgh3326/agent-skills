@@ -392,10 +392,10 @@ echo "PASS ambiguous-observation-no-retry: $observation_fail_out"
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"
 grep -q 'gate blocked' <<<"$blocked3"
-[[ ! -e "$TMP/herdr.log" ]]
+! grep -q '^tab create ' "$TMP/herdr.log"   # placement fallback may read agent list; no pane was created
 blocked4="$(WRK_GATE_MODE=4 spawn_base codex-terra 2>&1 || true)"
 grep -q 'measurement unavailable' <<<"$blocked4"
-[[ ! -e "$TMP/herdr.log" ]]
+! grep -q '^tab create ' "$TMP/herdr.log"
 rm -f "$TMP/herdr.log"
 unsupported="$(WRK_GATE_MODE=unsupported spawn_base codex-terra 2>&1)"
 grep -q 'no gate subcommand' <<<"$unsupported"
@@ -533,7 +533,7 @@ set -e
 grep -q 'job_id=idem-active' <<<"$active_dup_out"
 grep -q 'state=claimed' <<<"$active_dup_out"
 grep -q 'owner_lane=incumbent-lane' <<<"$active_dup_out"
-[[ ! -e "$TMP/herdr.log" ]] || { echo "active duplicate reached Herdr spawn" >&2; exit 1; }
+! grep -q '^tab create ' "$TMP/herdr.log" || { echo "active duplicate reached Herdr spawn" >&2; exit 1; }
 echo "PASS ROB-1326 AC1 active duplicate fail-closed: $active_dup_out"
 
 # AC2: a released row gets the explicit reclaim transition, then spawns once.
@@ -565,7 +565,7 @@ unknown_dup_rc=$?
 set -e
 [[ "$unknown_dup_rc" -eq 75 ]] || { echo "expected unreadable-state exit 75, got $unknown_dup_rc: $unknown_dup_out" >&2; exit 1; }
 grep -q 'state lookup failed' <<<"$unknown_dup_out"
-[[ ! -e "$TMP/herdr.log" ]] || { echo "unknown duplicate state reached Herdr spawn" >&2; exit 1; }
+! grep -q '^tab create ' "$TMP/herdr.log" || { echo "unknown duplicate state reached Herdr spawn" >&2; exit 1; }
 unset WRK_ARBITER_PROXY_MODE TEST_ARBITER_BIN REAL_ARBITER
 echo "PASS ROB-1326 AC3 duplicate lookup failure is fail-closed: $unknown_dup_out"
 

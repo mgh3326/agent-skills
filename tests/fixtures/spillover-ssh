@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+printf '%s\n' "$*" >>"${WRK_SSH_LOG:?}"
+remote="${*: -1}"
+host=""
+for arg in "$@"; do
+  [[ "$arg" == desktop || "$arg" == backup ]] && host="$arg"
+done
+if [[ "$remote" == *'uptime; herdr agent list'* ]]; then
+  if [[ "$host" == desktop && "${WRK_SSH_SCENARIO:-ok}" == desktop-down ]]; then exit 255; fi
+  if [[ "$host" == backup && "${WRK_SSH_SCENARIO:-ok}" == backup-down ]]; then exit 255; fi
+  printf '%s\n' ' 10:00 up 1 day,  load average: 0.10, 0.10, 0.10'
+  printf '%s\n' '{"result":{"agents":[]}}'
+  exit 0
+fi
+if [[ "$remote" == *mktemp* ]]; then
+  printf '%s\n' "/tmp/${host}-brief.md"
+  exit 0
+fi
+printf '%s\n' "OK pane=${host}:p7 model=codex-terra label=fixture status=working landed=yes"

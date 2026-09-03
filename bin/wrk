@@ -72,13 +72,14 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|find|name-sync|profiles> [options]
+Usage: wrk <spawn|find|name-sync|profiles|hosts> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--job-dup-ok] [--landing-strict]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
+  wrk hosts
 
 Run 'wrk <command> --help' for command-specific usage.
 USAGE
@@ -88,7 +89,7 @@ spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--job-dup-ok]
-                 [--landing-strict]
+                 [--landing-strict] [--host auto|local|NAME]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -104,6 +105,9 @@ Options:
   --landing-strict   automation opt-in: preserve the OK line, then exit 76 if
                      no marker/Pasted-text landing evidence appears. Without it,
                      landed=no remains a successful spawn with a warning.
+  --host TARGET      placement policy: auto (default), local, or a configured
+                     host from ~/.config/wrk/hosts.toml. auto spills over only
+                     after local pressure crosses its configured limits.
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
@@ -128,6 +132,15 @@ is the only way to change its thinking effort). Refresh the clone with
 fable does not accept --effort in this scope.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
+USAGE
+}
+
+hosts_help() {
+  cat <<'USAGE'
+Usage: wrk hosts
+
+Print the local pressure measurement and configured spill-over candidates.
+Configuration is read from ~/.config/wrk/hosts.toml (or WRK_HOSTS_CONFIG).
 USAGE
 }
 
@@ -955,6 +968,400 @@ resolve_profile() {
   esac
 }
 
+# Spill-over placement is intentionally implemented outside spawn_cmd(): once a
+# remote host is selected, its own wrk instance owns quota admission, pane
+# creation, and landing verification. Keeping that boundary avoids duplicating
+# the scopefuel/arbiter protocol across machines.
+spillover_config() {
+  printf '%s' "${WRK_HOSTS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/wrk/hosts.toml}"
+}
+
+spillover_trim() {
+  local value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  printf '%s' "$value"
+}
+
+# This deliberately supports the small, documented hosts.toml surface rather
+# than pretending to be a general TOML interpreter. Unknown keys remain future
+# compatible and quoted values keep paths/SSH aliases free of shell evaluation.
+spillover_value() {
+  local section="$1" key="$2" config line current="" value=""
+  config="$(spillover_config)"
+  [[ -r "$config" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(spillover_trim "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" =~ ^\[([^]]+)\]$ ]]; then
+      current="${BASH_REMATCH[1]}"
+      continue
+    fi
+    [[ "$current" == "$section" && "$line" =~ ^${key}[[:space:]]*=[[:space:]]*(.*)$ ]] || continue
+    value="${BASH_REMATCH[1]}"
+    value="${value%%#*}"
+    value="$(spillover_trim "$value")"
+    if [[ "$value" == \"*\" && "$value" == *\" ]]; then value="${value:1:${#value}-2}"; fi
+    printf '%s' "$value"
+    return 0
+  done <"$config"
+  return 1
+}
+
+spillover_hosts() {
+  local config line
+  config="$(spillover_config)"
+  [[ -r "$config" ]] || return 0
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line="$(spillover_trim "$line")"
+    if [[ "$line" =~ ^\[hosts\.([A-Za-z0-9_-]+)\]$ ]]; then
+      printf '%s\n' "${BASH_REMATCH[1]}"
+    fi
+  done <"$config"
+}
+
+spillover_cwd_map() {
+  local host="$1" cwd="$2" raw mapped
+  raw="$(spillover_value "hosts.$host" cwd_map 2>/dev/null || true)"
+  [[ -n "$raw" ]] || return 1
+  mapped="$(python3 - "$cwd" "$raw" <<'PY'
+import re, sys
+cwd, raw = sys.argv[1:]
+for local, remote in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw):
+    if local.replace(r'\\"', '"').replace(r'\\\\', '\\') == cwd:
+        print(remote.replace(r'\\"', '"').replace(r'\\\\', '\\'))
+        break
+PY
+)"
+  [[ -n "$mapped" ]] || return 1
+  printf '%s' "$mapped"
+}
+
+spillover_load5() {
+  local proc="${WRK_PROC_LOADAVG:-/proc/loadavg}" load
+  if [[ -r "$proc" ]]; then
+    awk '{print $2}' "$proc"
+    return 0
+  fi
+  if command -v sysctl >/dev/null 2>&1; then
+    load="$(sysctl -n vm.loadavg 2>/dev/null || true)"
+    awk '{gsub(/[{}]/, ""); print $2}' <<<"$load"
+    return 0
+  fi
+  return 1
+}
+
+spillover_ncpu() {
+  if [[ -n "${WRK_TEST_NCPU:-}" ]]; then printf '%s' "$WRK_TEST_NCPU"; return 0; fi
+  if [[ -r /proc/cpuinfo ]]; then
+    getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || true
+  else
+    sysctl -n hw.ncpu 2>/dev/null || true
+  fi
+}
+
+spillover_active_workers() {
+  local output
+  if ! output="$("$HERDR" agent list 2>/dev/null)"; then return 1; fi
+  python3 -c 'import json,sys; d=json.load(sys.stdin); a=d.get("result",d).get("agents",[]); print(sum(x.get("agent_status")=="working" for x in a))' <<<"$output" 2>/dev/null
+}
+
+spillover_throttled() {
+  local therm limit
+  command -v pmset >/dev/null 2>&1 || return 1
+  therm="$(pmset -g therm 2>/dev/null || true)"
+  limit="$(sed -nE 's/.*CPU_Speed_Limit[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' <<<"$therm" | head -1)"
+  [[ "$limit" =~ ^[0-9]+$ && "$limit" -lt 100 ]]
+}
+
+spillover_local_measure() {
+  SPILL_LOAD="$(spillover_load5 2>/dev/null || true)"
+  SPILL_NCPU="$(spillover_ncpu 2>/dev/null || true)"
+  SPILL_ACTIVE="$(spillover_active_workers 2>/dev/null || true)"
+  SPILL_RATIO="unknown"
+  if [[ "$SPILL_LOAD" =~ ^[0-9]+([.][0-9]+)?$ && "$SPILL_NCPU" =~ ^[1-9][0-9]*$ ]]; then
+    SPILL_RATIO="$(awk -v l="$SPILL_LOAD" -v n="$SPILL_NCPU" 'BEGIN { printf "%.3f", l/n }')"
+  fi
+}
+
+spillover_local_is_pressured() {
+  local max_ratio max_active
+  spillover_local_measure
+  SPILL_REASON="local-healthy"
+  max_ratio="$(spillover_value local max_load_ratio 2>/dev/null || true)"
+  max_active="$(spillover_value local max_active 2>/dev/null || true)"
+  if [[ "$max_ratio" =~ ^[0-9]+([.][0-9]+)?$ && "$SPILL_RATIO" != unknown ]] &&
+    awk -v actual="$SPILL_RATIO" -v max="$max_ratio" 'BEGIN { exit !(actual >= max) }'; then
+    SPILL_REASON="load-ratio=${SPILL_RATIO}>=${max_ratio}"
+    return 0
+  fi
+  if [[ "$max_active" =~ ^[0-9]+$ && "$SPILL_ACTIVE" =~ ^[0-9]+$ && "$SPILL_ACTIVE" -ge "$max_active" ]]; then
+    SPILL_REASON="active=${SPILL_ACTIVE}>=${max_active}"
+    return 0
+  fi
+  if spillover_throttled; then
+    SPILL_REASON="cpu-throttled"
+    return 0
+  fi
+  return 1
+}
+
+spillover_log() {
+  local host="$1" reason="$2" log
+  log="${WRK_SPILLOVER_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/wrk/spillover.log}"
+  mkdir -p "$(dirname "$log")" 2>/dev/null || { warn "spill-over log directory unavailable: $log"; return 0; }
+  printf '%s source=%s load5=%s ncpu=%s ratio=%s active=%s host=%s reason=%s\n' \
+    "$(date -Iseconds)" "${SPILL_DECISION_SOURCE:-unknown}" "${SPILL_LOAD:-unknown}" "${SPILL_NCPU:-unknown}" \
+    "${SPILL_RATIO:-unknown}" "${SPILL_ACTIVE:-unknown}" "$host" "$reason" >>"$log" 2>/dev/null ||
+    warn "spill-over log unavailable: $log"
+}
+
+# The hub owns placement policy. This adapter is deliberately narrow because
+# its contract lives with panewire: wrk consumes only decision/candidates/reason
+# from `panewire place`, then performs the selected spawn. No URL, token, IP,
+# or machine name is embedded in this public CLI.
+spillover_hub_placement() {
+  local reply parsed panewire
+  SPILL_HUB_STATUS=unavailable
+  panewire="${PANEWIRE_BIN:-panewire}"
+  if ! reply="$("$panewire" place --class worker --cwd "$1" 2>/dev/null)"; then
+    return 1
+  fi
+  if ! parsed="$(python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+decision = d.get("decision", d)
+reason = d.get("reason", "")
+host = ""
+if isinstance(decision, str):
+    host = decision
+elif isinstance(decision, dict):
+    host = decision.get("host") or decision.get("target") or decision.get("decision") or ""
+    reason = decision.get("reason", reason)
+if not host:
+    candidates = d.get("candidates", [])
+    if candidates:
+        first = candidates[0]
+        host = first if isinstance(first, str) else (first.get("host") or first.get("target") or "")
+if not isinstance(host, str) or not host:
+    raise ValueError("placement response has no decision host")
+print(host)
+print(str(reason).replace("\n", " "))
+' <<<"$reply")"; then
+    SPILL_HUB_STATUS=invalid
+    return 1
+  fi
+  {
+    IFS= read -r SPILL_HUB_HOST
+    IFS= read -r SPILL_HUB_REASON || true
+  } <<<"$parsed"
+  SPILL_HUB_STATUS=ok
+  return 0
+}
+
+spillover_probe_host() {
+  local host="$1" ssh_name output capacity load
+  ssh_name="$(spillover_value "hosts.$host" ssh 2>/dev/null || true)"
+  [[ -n "$ssh_name" ]] || ssh_name="$host"
+  if ! output="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'uptime; herdr agent list' 2>/dev/null)"; then
+    SPILL_PROBE_REASON="ssh-unreachable"
+    return 1
+  fi
+  SPILL_REMOTE_LOAD="$(sed -nE 's/.*load averages?:[[:space:]]*([0-9.]+).*/\1/p' <<<"$output" | head -1)"
+  SPILL_REMOTE_ACTIVE="$(python3 -c 'import json,re,sys; s=sys.stdin.read(); m=re.search(r"\{.*\}",s,re.S); d=json.loads(m.group(0)); a=d.get("result",d).get("agents",[]); print(sum(x.get("agent_status")=="working" for x in a))' <<<"$output" 2>/dev/null || true)"
+  capacity="$(spillover_value "hosts.$host" capacity 2>/dev/null || true)"
+  [[ "$capacity" =~ ^[1-9][0-9]*$ ]] || capacity=1
+  if [[ "$SPILL_REMOTE_ACTIVE" =~ ^[0-9]+$ && "$SPILL_REMOTE_ACTIVE" -lt "$capacity" ]]; then
+    SPILL_PROBE_REASON="remote-active=${SPILL_REMOTE_ACTIVE}<${capacity}"
+    return 0
+  fi
+  SPILL_PROBE_REASON="remote-full active=${SPILL_REMOTE_ACTIVE:-unknown} capacity=${capacity} load5=${SPILL_REMOTE_LOAD:-unknown}"
+  return 1
+}
+
+spillover_wake() {
+  local host="$1" wake token_env url_env hold panewire
+  wake="$(spillover_value "hosts.$host" wake 2>/dev/null || true)"
+  [[ "$wake" == panewire ]] || return 0
+  token_env="$(spillover_value "hosts.$host" wake_token_env 2>/dev/null || true)"
+  url_env="$(spillover_value "hosts.$host" wake_url_env 2>/dev/null || true)"
+  [[ -n "$token_env" && -n "${!token_env:-}" ]] || { warn "spill-over wake skipped host=$host: wake token env is unset"; return 0; }
+  [[ -z "$url_env" || -n "${!url_env:-}" ]] || { warn "spill-over wake skipped host=$host: wake URL env is unset"; return 0; }
+  hold="${WRK_WAKE_HOLD_MINUTES:-10}"
+  [[ "$hold" =~ ^[1-9][0-9]*$ ]] || { warn "spill-over wake skipped host=$host: invalid hold"; return 0; }
+  panewire="${PANEWIRE_BIN:-panewire}"
+  if ! "$panewire" burst request --target "$host" --hold "${hold}m" >/dev/null 2>&1; then
+    warn "spill-over wake skipped host=$host: panewire request failed"
+  fi
+}
+
+spillover_emit_host() {
+  local host="$1" file="$2"
+  awk -v host="$host" '/^OK pane=/ { sub(/^OK pane=[^ ]+/, "& host=" host) } { print }' "$file"
+}
+
+spillover_remote_spawn() {
+  local host="$1" cwd="$2" prompt="$3"; shift 3
+  local ssh_name session remote_prompt remote_cwd workspace remote_cmd rc out
+  ssh_name="$(spillover_value "hosts.$host" ssh 2>/dev/null || true)"; [[ -n "$ssh_name" ]] || ssh_name="$host"
+  session="$(spillover_value "hosts.$host" herdr_session 2>/dev/null || true)"; [[ -n "$session" ]] || session=worker
+  workspace="$(spillover_value "hosts.$host" workspace 2>/dev/null || true)"; [[ -n "$workspace" ]] || workspace=worker
+  if ! remote_cwd="$(spillover_cwd_map "$host" "$cwd")"; then
+    echo "wrk: remote host '$host' has no cwd_map entry for '$cwd'; use --host local or configure hosts.toml" >&2
+    return 2
+  fi
+  if ! remote_prompt="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'umask 077; mktemp "${TMPDIR:-/tmp}/wrk-spillover.XXXXXX.md"' 2>/dev/null)"; then
+    echo "wrk: remote host '$host' is unreachable; use --host local or retry after it is available" >&2
+    return 1
+  fi
+  if ! "${WRK_SCP_BIN:-scp}" "$prompt" "$ssh_name:$remote_prompt"; then
+    echo "wrk: failed to copy brief to remote host '$host'" >&2
+    return 1
+  fi
+  local remote_args=(env "HERDR_SESSION=$session" wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
+  local arg saw_workspace=0 i=0 args=("$@")
+  while [[ "$i" -lt "${#args[@]}" ]]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      -c|-p|--host)
+        # The remote path and copied brief above are authoritative.  Removing
+        # both their values prevents a duplicate option from overriding them.
+        ((i+=1))
+        ;;
+      -w)
+        ((i+=1))
+        [[ "$i" -lt "${#args[@]}" ]] || die "-w requires a value"
+        remote_args+=(-w "${args[$i]}")
+        saw_workspace=1
+        ;;
+      *) remote_args+=("$arg") ;;
+    esac
+    ((i+=1))
+  done
+  # The normal argument loop preserves an explicit -w; remote defaults come
+  # from hosts.toml when callers omit it.
+  if [[ "$saw_workspace" -eq 0 ]]; then remote_args+=(-w "$workspace"); fi
+  printf -v remote_cmd '%q ' "${remote_args[@]}"
+  out="$(mktemp)"
+  set +e
+  "${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" "$remote_cmd; rc=\$?; rm -f -- $(printf '%q' "$remote_prompt"); exit \$rc" >"$out"
+  rc=$?
+  set -e
+  spillover_emit_host "$host" "$out"
+  rm -f "$out"
+  return "$rc"
+}
+
+spawn_router_cmd() {
+  local requested=auto cwd="" prompt="" selected="" arg next=0 out rc host
+  for arg in "$@"; do
+    if [[ "$next" -eq 1 ]]; then cwd="$arg"; next=0; continue; fi
+    if [[ "$next" -eq 2 ]]; then prompt="$arg"; next=0; continue; fi
+    case "$arg" in
+      -c) next=1 ;; -p) next=2 ;;
+    esac
+  done
+  local filtered=() i=0 args=("$@")
+  while [[ "$i" -lt "${#args[@]}" ]]; do
+    arg="${args[$i]}"
+    if [[ "$arg" == --host ]]; then
+      ((i+=1)); [[ "$i" -lt "${#args[@]}" ]] || die "--host requires a value"
+      requested="${args[$i]}"
+    else
+      filtered+=("$arg")
+    fi
+    ((i+=1))
+  done
+  # Classification is an admission invariant, not placement work. Preserve the
+  # existing fail-closed boundary before asking hub/local telemetry anything.
+  local has_t=0 t_value=""
+  for ((i=0; i<${#filtered[@]}; i++)); do
+    if [[ "${filtered[$i]}" == --t ]]; then
+      has_t=1
+      t_value="${filtered[$((i + 1))]:-}"
+      break
+    fi
+  done
+  if [[ "$has_t" -eq 0 || ! "$t_value" =~ ^T[0-3]$ ]]; then
+    spawn_cmd "${filtered[@]}"
+    return $?
+  fi
+  case "$requested" in
+    local)
+      spillover_local_measure; selected=local; SPILL_REASON=forced-local; SPILL_DECISION_SOURCE=forced
+      ;;
+    auto)
+      if spillover_hub_placement "$cwd"; then
+        SPILL_DECISION_SOURCE=hub
+        selected="$SPILL_HUB_HOST"
+        SPILL_REASON="${SPILL_HUB_REASON:-hub-decision}"
+        [[ "$selected" == local ]] || grep -qx "$selected" <<<"$(spillover_hosts)" || {
+          spillover_log none "hub-unconfigured-host=${selected};${SPILL_REASON}"
+          echo "wrk: hub selected unconfigured host '$selected'; configure hosts.toml or use --host local" >&2
+          return 2
+        }
+      elif [[ "$SPILL_HUB_STATUS" == invalid ]]; then
+        spillover_local_measure
+        SPILL_DECISION_SOURCE=hub
+        spillover_log none "hub-invalid-response"
+        echo "wrk: panewire placement response is invalid; refusing local fallback" >&2
+        return 2
+      else
+        SPILL_DECISION_SOURCE=local-fallback
+        if spillover_local_is_pressured; then
+          for host in $(spillover_hosts); do
+            if spillover_probe_host "$host"; then selected="$host"; break; fi
+            [[ "$SPILL_PROBE_REASON" == ssh-unreachable ]] && spillover_wake "$host"
+          done
+          [[ -n "$selected" ]] || { spillover_log none "${SPILL_REASON};no-remote-capacity"; echo "wrk: spill-over required (${SPILL_REASON}) but no configured remote host has capacity; use --host local to override" >&2; return 1; }
+        else
+          selected=local
+        fi
+      fi
+      ;;
+    *)
+      if ! spillover_value "hosts.$requested" ssh >/dev/null 2>&1 && ! grep -qx "$requested" <<<"$(spillover_hosts)"; then
+        die "unknown spill-over host '$requested'; use wrk hosts"
+      fi
+      spillover_local_measure; selected="$requested"; SPILL_REASON=forced-remote; SPILL_DECISION_SOURCE=forced
+      ;;
+  esac
+  spillover_log "$selected" "$SPILL_REASON"
+  if [[ "$selected" == local ]]; then
+    out="$(mktemp)"
+    # Keep spawn_cmd's errexit semantics (notably a blocked quota gate) in an
+    # isolated shell, while retaining strict landing's exit 76 and its emitted
+    # OK pane line for host annotation.
+    set +e
+    ( set -e; spawn_cmd "${filtered[@]}" ) >"$out"
+    rc=$?
+    set -e
+    spillover_emit_host local "$out"
+    rm -f "$out"
+    return "$rc"
+  fi
+  [[ -n "$cwd" && -n "$prompt" ]] || die "-c CWD and -p PROMPT_FILE are required"
+  spillover_remote_spawn "$selected" "$cwd" "$prompt" "${filtered[@]}"
+}
+
+hosts_cmd() {
+  local host config
+  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { hosts_help; return 0; }
+  [[ $# -eq 0 ]] || die "hosts accepts no arguments"
+  config="$(spillover_config)"
+  spillover_local_measure
+  printf 'config=%s\n' "$config"
+  printf 'local load5=%s ncpu=%s ratio=%s active=%s\n' "${SPILL_LOAD:-unknown}" "${SPILL_NCPU:-unknown}" "${SPILL_RATIO:-unknown}" "${SPILL_ACTIVE:-unknown}"
+  printf 'host\tstatus\tload5\tactive\n'
+  for host in $(spillover_hosts); do
+    if spillover_probe_host "$host"; then
+      printf '%s\tavailable\t%s\t%s\n' "$host" "${SPILL_REMOTE_LOAD:-unknown}" "${SPILL_REMOTE_ACTIVE:-unknown}"
+    else
+      printf '%s\t%s\t%s\t%s\n' "$host" "$SPILL_PROBE_REASON" "${SPILL_REMOTE_LOAD:-unknown}" "${SPILL_REMOTE_ACTIVE:-unknown}"
+    fi
+  done
+}
+
 spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
@@ -1291,10 +1698,11 @@ PY
 
 case "${1:-}" in
   -h|--help) usage ;;
-  spawn) shift; spawn_cmd "$@" ;;
+  spawn) shift; spawn_router_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;
+  hosts) shift; hosts_cmd "$@" ;;
   "") usage >&2; exit 2 ;;
   *) die "unknown command '$1' (see 'wrk --help')" ;;
 esac
