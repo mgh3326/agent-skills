@@ -32,9 +32,9 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 # 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
 ALL_PROFILES=(
-  opus sonnet sonnet-med haiku fable
+  opus sonnet sonnet-med haiku fable captain-opus
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
-  codex codex-sol codex-max
+  codex codex-sol codex-max captain-sol
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
@@ -72,14 +72,16 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|find|name-sync|profiles|hosts> [options]
+Usage: wrk <spawn|done|escalate|joined|find|name-sync|profiles|hosts> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-            [-L live|mock] [--effort LEVEL] [--job ID] [--job-dup-ok] [--landing-strict]
+            [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
+  wrk done JOB [--report PATH]
+  wrk escalate JOB --question TEXT
+  wrk joined JOB --pr URL --head SHA --report PATH
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
-  wrk hosts
 
 Run 'wrk <command> --help' for command-specific usage.
 USAGE
@@ -88,8 +90,8 @@ USAGE
 spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-                 [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--job-dup-ok]
-                 [--landing-strict] [--host auto|local|NAME]
+                 [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
+                 [--landing-strict] [--role captain --lane CAPTAIN_LANE --parent PARENT_LANE] [--host auto|local|NAME]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -100,14 +102,19 @@ Options:
   --owner NAME       spawning session name, recorded as the arbiter owner_lane
                      (default: default). Lets that session later run
                      `arbiter status --lane NAME` to find and reclaim its workers.
+  --role worker|captain
+                     captain requires --lane and --parent, and accepts only
+                     captain-opus or captain-sol profiles.
+  --lane NAME        captain's own lane; recorded as the claim owner_lane.
+                     (The execution lane remains -L live|mock.)
+  --parent NAME      parent lane for a captain; completion/escalation events
+                     are routed to this lane.
+  --report PATH      report acceptance-criterion path watched by the completion sentinel
   --job-dup-ok       explicit operator override: permit an active duplicate job
                      after an auditable warning. Automation/panewire must not use it.
   --landing-strict   automation opt-in: preserve the OK line, then exit 76 if
                      no marker/Pasted-text landing evidence appears. Without it,
                      landed=no remains a successful spawn with a warning.
-  --host TARGET      placement policy: auto (default), local, or a configured
-                     host from ~/.config/wrk/hosts.toml. auto spills over only
-                     after local pressure crosses its configured limits.
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
@@ -122,6 +129,7 @@ Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
 codex-luna-max, codex-max, codex-terra-max.
 Claude effort wiring (ROB-1191/ROB-1193): opus default=xhigh, sonnet/sonnet-med default=high,
 haiku default=low; all support an explicit --effort override.
+Captain profiles: captain-opus = Claude Opus at effort high; captain-sol = codex-sol.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-for-coding/k3`; kimi-k27 uses
 `kimi --auto -m kimi-for-coding/kimi-for-coding`; the CLI has no --effort option.
 kimi-k3-low uses the same argv as kimi-k3 but injects KIMI_CODE_HOME pointing at
@@ -132,15 +140,6 @@ is the only way to change its thinking effort). Refresh the clone with
 fable does not accept --effort in this scope.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
-USAGE
-}
-
-hosts_help() {
-  cat <<'USAGE'
-Usage: wrk hosts
-
-Print the local pressure measurement and configured spill-over candidates.
-Configuration is read from ~/.config/wrk/hosts.toml (or WRK_HOSTS_CONFIG).
 USAGE
 }
 
@@ -257,7 +256,7 @@ landing_check_once() {
   # queued; keep it as the fallback for prompts whose transcript is delayed.
   if grep -Fq -- "Pasted text" <<<"$visible"; then
     LANDING_CHECK_LAST_EVIDENCE=pasted
-    LANDING_CHECK_LAST_REASON="pasted-text-chip"
+    LANDING_CHECK_LAST_REASON=pasted-text-chip
     return 0
   fi
   if ! status="$(agent_status_for_pane "$pane")"; then
@@ -268,7 +267,7 @@ landing_check_once() {
   fi
   LANDING_CHECK_LAST_STATUS="$status"
   if [[ "$status" == working ]]; then
-    LANDING_CHECK_LAST_REASON="working-without-positive-evidence"
+    LANDING_CHECK_LAST_REASON=working-without-positive-evidence
   else
     LANDING_CHECK_LAST_REASON="status-${status}-without-positive-evidence"
   fi
@@ -282,7 +281,7 @@ landing_check() {
   LANDING_CHECK_ATTEMPTS=0
   LANDING_CHECK_LAST_EVIDENCE=none
   LANDING_CHECK_LAST_STATUS=unknown
-  LANDING_CHECK_LAST_REASON="not-observed"
+  LANDING_CHECK_LAST_REASON=not-observed
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
     if landing_check_once "$pane" "$marker"; then return 0; fi
@@ -525,7 +524,7 @@ arbiter_handle_duplicate_claim() {
         return "$WRK_EXIT_JOB_STATE_UNREADABLE"
       fi
       set +e
-      "$ARBITER" claim --reclaim-released --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" >/dev/null
+      "$ARBITER" claim --reclaim-released --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" >/dev/null
       reclaim_rc=$?
       set -e
       case "$reclaim_rc" in
@@ -634,7 +633,7 @@ arbiter_admit() {
 
   local claim_rc duplicate_rc
   set +e
-  "$ARBITER" claim --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" >/dev/null
+  "$ARBITER" claim --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" >/dev/null
   claim_rc=$?
   set -e
   case "$claim_rc" in
@@ -789,6 +788,7 @@ resolve_profile() {
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
     # Defaults align with scopefuel Profile.benchmark_effort (opus=xhigh, sonnet=high).
     opus) PROFILE_KIND=claude; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
+    captain-opus) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
     sonnet|sonnet-med) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
@@ -843,6 +843,7 @@ resolve_profile() {
     codex) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
 
     kiro) PROFILE_KIND=kiro; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     kiro-opus) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
@@ -913,11 +914,11 @@ resolve_profile() {
   # usage policy remains solely in scopefuel; runtime MODEL and effort stay
   # exactly as requested.
   case "$MODEL" in
-    opus) GATE_PROFILE=opus ;;
+    opus|captain-opus) GATE_PROFILE=opus ;;
     sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
-    codex|codex-sol|codex-max) GATE_PROFILE=codex-max ;;
+    codex|codex-sol|codex-max|captain-sol) GATE_PROFILE=codex-max ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
     codex-luna|codex-luna-hi|codex-luna-max) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
@@ -963,6 +964,251 @@ resolve_profile() {
       fi
       ;;
   esac
+}
+
+completion_event() {
+  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}"
+  local events host last
+  events="$(wrk_jobs_root)/$job/events"
+  host="${HOSTNAME:-unknown}"
+  mkdir -p "$events"
+  if [[ -n "$report" && -f "$report" ]]; then
+    last="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240)"
+  else
+    last=""
+  fi
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" <<'PY'
+import json, os, sys, tempfile, time
+events, job, owner, label, pane, host, report, last, kind = sys.argv[1:]
+highest = 0
+for name in os.listdir(events):
+    try: highest = max(highest, int(name.split('-', 1)[0]))
+    except (ValueError, IndexError): pass
+record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
+          "pane_id": pane, "host": host, "report_path": report,
+          "report_last_line": last, "epoch": 1}
+fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(record, f, separators=(',', ':'))
+        f.write('\n')
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PY
+}
+
+# Keep this exactly aligned with arbiter.inbox_root(): ARBITER_INBOX_ROOT is
+# the jobs directory, rather than its parent.
+wrk_jobs_root() {
+  printf '%s\n' "${ARBITER_INBOX_ROOT:-$HOME/work/herdr-inbox/jobs}"
+}
+
+completion_metadata() {
+  local job="$1"
+  python3 - "$(wrk_jobs_root)/$job/events" <<'PY'
+import json, os, sys
+owner=label=pane=parent=role=''
+try: names=sorted(os.listdir(sys.argv[1]))
+except OSError: raise SystemExit(1)
+for name in names:
+    try: o=json.load(open(os.path.join(sys.argv[1],name), encoding='utf-8'))
+    except (OSError,json.JSONDecodeError): continue
+    p=o.get('payload',o)
+    # Claim/reclaim establishes ownership.  Keep the newest one: a released
+    # job can be reclaimed by a different captain and parent.
+    if o.get('kind') in ('job.claim', 'job.reclaim'):
+        owner=p.get('owner_lane') if isinstance(p.get('owner_lane'), str) else ''
+        candidate=p.get('label', p.get('agent_label'))
+        label=candidate if isinstance(candidate, str) else ''
+        parent=p.get('parent_lane') if isinstance(p.get('parent_lane'), str) else ''
+        role=p.get('role') if isinstance(p.get('role'), str) else ''
+    pane=p.get('pane_id') if isinstance(p.get('pane_id'), str) else pane
+if owner and label and pane: print(owner, label, pane, parent, role, sep='\t')
+else: raise SystemExit(1)
+PY
+}
+
+# Python is already a hard dependency for durable event creation above. Use it
+# for report discovery and identity so this works on both GNU and BSD userlands
+# (find -printf and stat -c are GNU-only). The identity includes nanosecond
+# mtime and size, so an updated report at the same path is a new observation.
+find_latest_report() {
+  local directory="$1"
+  python3 - "$directory" <<'PY'
+import glob, os, sys
+paths = []
+try:
+    for path in glob.glob(os.path.join(sys.argv[1], "report*.md")):
+        if os.path.isfile(path):
+            paths.append(path)
+except OSError:
+    pass
+if paths:
+    print(max(paths, key=os.path.getmtime))
+PY
+}
+
+report_observation_key() {
+  local report="$1"
+  python3 - "$report" <<'PY'
+import os, sys
+try:
+    info = os.stat(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+print(f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}")
+PY
+}
+
+done_cmd() {
+  local job="${1:-}" report=""
+  [[ -n "$job" && "$job" != -* ]] || die "done requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --report) [[ $# -ge 2 && -n "$2" ]] || die "--report requires a path"; report="$2"; shift 2 ;;
+      *) die "unknown done option '$1'" ;;
+    esac
+  done
+  local metadata owner label pane jobs_root
+  metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
+  IFS=$'\t' read -r owner label pane <<<"$metadata"
+  jobs_root="$(wrk_jobs_root)"
+  if [[ -z "$report" ]]; then
+    report="$(find_latest_report "$jobs_root/$job")"
+  fi
+  [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
+  completion_event "$job" "$owner" "$label" "$pane" "$report"
+  echo "OK job=$job report=$report"
+}
+
+captain_flat_event() {
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}"
+  local events host="${HOSTNAME:-unknown}" last
+  events="$(wrk_jobs_root)/$job/events"
+  mkdir -p "$events"
+  if [[ -n "$report" && -f "$report" ]]; then
+    last="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240)"
+  else
+    last=""
+  fi
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
+import json, os, sys, tempfile
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
+highest = 0
+for name in os.listdir(events):
+    try: highest = max(highest, int(name.split('-', 1)[0]))
+    except (ValueError, IndexError): pass
+record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
+          "pane_id": pane, "host": host, "report_path": report,
+          "report_last_line": last, "reason": reason, "parent_lane": parent, "epoch": 1}
+if question: record["question"] = question
+if pr: record["pr"] = pr
+if head: record["head"] = head
+fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(record, f, separators=(',', ':'))
+        f.write('\n')
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PY
+}
+
+captain_metadata() {
+  local job="$1" metadata owner label pane parent role
+  metadata="$(completion_metadata "$job")" || die "cannot find job.claim/job.spawned metadata: $job"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  [[ "$role" == captain && -n "$parent" ]] || die "$job is not a captain claim with a parent lane"
+  # owner_lane is the captain's own lane. parent_lane is informational only;
+  # panewire resolves the parent relationship from lanes.json.
+  printf '%s\t%s\t%s\t%s\n' "$owner" "$label" "$pane" "$parent"
+}
+
+escalate_cmd() {
+  local job="${1:-}" question="" metadata owner label pane parent
+  [[ -n "$job" && "$job" != -* ]] || die "escalate requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --question) [[ $# -ge 2 && -n "$2" ]] || die "--question requires text"; question="$2"; shift 2 ;;
+      *) die "unknown escalate option '$1'" ;;
+    esac
+  done
+  [[ -n "$question" ]] || die "escalate requires --question"
+  metadata="$(captain_metadata "$job")"
+  IFS=$'\t' read -r owner label pane parent <<<"$metadata"
+  captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "" "captain escalation" "$question" "" ""
+  echo "OK job=$job owner_lane=$owner kind=job.escalate"
+}
+
+joined_cmd() {
+  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent
+  [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pr) [[ $# -ge 2 && -n "$2" ]] || die "--pr requires a URL"; pr="$2"; shift 2 ;;
+      --head) [[ $# -ge 2 && -n "$2" ]] || die "--head requires a SHA"; head="$2"; shift 2 ;;
+      --report) [[ $# -ge 2 && -n "$2" ]] || die "--report requires a path"; report="$2"; shift 2 ;;
+      *) die "unknown joined option '$1'" ;;
+    esac
+  done
+  [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
+  metadata="$(captain_metadata "$job")"
+  IFS=$'\t' read -r owner label pane parent <<<"$metadata"
+  captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "captain joined PR" "" "$pr" "$head"
+  echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
+}
+
+sentinel_cmd() {
+  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}" timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
+  [[ -n "$job" && -n "$owner" && -n "$label" && -n "$pane" ]] || exit 2
+  local started seen
+  started="$(date +%s)"
+  seen=""
+  while :; do
+    local now status candidate key
+    now="$(date +%s)"
+    if (( now - started >= timeout )); then
+      completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost
+      exit 0
+    fi
+    status="$($HERDR agent get "$pane" 2>/dev/null | python3 -c 'import json,sys; o=json.load(sys.stdin); print(o.get("result",o).get("agent_status", ""))' 2>/dev/null || true)"
+    if [[ -z "$status" ]]; then
+      completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost
+      exit 0
+    fi
+    candidate="$report"
+    if [[ -z "$candidate" || ! -f "$candidate" ]]; then
+      candidate="$(find_latest_report "$(wrk_jobs_root)/$job")"
+    fi
+    key="$(report_observation_key "$candidate" 2>/dev/null || true)"
+    if [[ ( "$status" == "done" || "$status" == "idle" ) && -f "$candidate" && -n "$key" && "$key" != "$seen" ]]; then
+      completion_event "$job" "$owner" "$label" "$pane" "$candidate"
+      seen="$key"
+      [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
+    fi
+    sleep "${WRK_COMPLETION_INTERVAL_S:-30}"
+  done
+}
+
+start_completion_sentinel() {
+  local pidfile="$1"; shift
+  mkdir -p "$(dirname "$pidfile")"
+  local existing=""
+  if [[ -s "$pidfile" ]]; then
+    read -r existing <"$pidfile" || existing=""
+    if [[ "$existing" =~ ^[0-9]+$ ]] && kill -0 "$existing" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  rm -f "$pidfile"
+  ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
 }
 
 # Spill-over placement is intentionally implemented outside spawn_cmd(): once a
@@ -1137,27 +1383,33 @@ spillover_hub_placement() {
   if ! parsed="$(python3 -c '
 import json, sys
 d = json.load(sys.stdin)
-decision = d.get("decision", d)
+decision = d.get("decision")
 reason = d.get("reason", "")
-host = ""
-if isinstance(decision, str):
-    host = decision
-elif isinstance(decision, dict):
-    host = decision.get("host") or decision.get("target") or decision.get("decision") or ""
-    reason = decision.get("reason", reason)
-if not host:
-    candidates = d.get("candidates", [])
-    if candidates:
-        first = candidates[0]
-        host = first if isinstance(first, str) else (first.get("host") or first.get("target") or "")
-if not isinstance(host, str) or not host:
-    raise ValueError("placement response has no decision host")
-print(host)
-print(str(reason).replace("\n", " "))
+decision_host = decision if isinstance(decision, str) else (
+    decision.get("machine") or decision.get("host") or decision.get("target") or ""
+    if isinstance(decision, dict) else "")
+if isinstance(decision, dict): reason = decision.get("reason", reason)
+eligible = []
 for candidate in d.get("candidates", []):
-    value = candidate if isinstance(candidate, str) else (candidate.get("host") or candidate.get("target") or "")
-    if isinstance(value, str) and value and value != host:
-        print(value)
+    if isinstance(candidate, str):
+        value, candidate_reason, connected = candidate, "", True
+    elif isinstance(candidate, dict):
+        # PlacementCandidate canonical key is machine.  host/target remain
+        # accepted only for backward-compatible hub fixtures/responses.
+        value = candidate.get("machine") or candidate.get("host") or candidate.get("target") or ""
+        candidate_reason = candidate.get("reason", "")
+        connected = candidate.get("connected", True)
+    else:
+        continue
+    if not isinstance(value, str) or not value or connected is False or "not_accepting" in str(candidate_reason):
+        continue
+    if value not in eligible: eligible.append(value)
+if isinstance(decision_host, str) and decision_host and decision_host in eligible:
+    eligible.remove(decision_host)
+    eligible.insert(0, decision_host)
+print(eligible[0] if eligible else "")
+print(str(reason).replace("\n", " "))
+print(*eligible[1:], sep="\n")
 ' <<<"$reply")"; then
     SPILL_HUB_STATUS=invalid
     return 1
@@ -1168,6 +1420,11 @@ for candidate in d.get("candidates", []):
   } <<<"$parsed"
   SPILL_HUB_CANDIDATES=()
   while IFS= read -r candidate; do [[ -z "$candidate" ]] || SPILL_HUB_CANDIDATES+=("$candidate"); done < <(tail -n +3 <<<"$parsed")
+  # Fixture-only observability: lets the contract test assert the exact hub
+  # ordering after eligibility filtering without contacting a live hub.
+  if [[ -n "${WRK_SPILLOVER_CANDIDATES_LOG:-}" ]]; then
+    printf '%s\n' "$SPILL_HUB_HOST" "${SPILL_HUB_CANDIDATES[@]}" >"$WRK_SPILLOVER_CANDIDATES_LOG"
+  fi
   SPILL_HUB_STATUS=ok
   return 0
 }
@@ -1309,6 +1566,13 @@ spawn_router_cmd() {
         SPILL_DECISION_SOURCE=hub
         selected="$SPILL_HUB_HOST"
         SPILL_REASON="${SPILL_HUB_REASON:-hub-decision}"
+        # A valid placement reply may deliberately contain no eligible
+        # candidates (for example every machine is disconnected or
+        # not_accepting).  That is safe to fail open only to this local spawn.
+        if [[ -z "$selected" ]]; then
+          selected=local
+          SPILL_REASON="${SPILL_REASON};no-eligible-candidates"
+        fi
         [[ "$selected" == local ]] || grep -qx "$selected" <<<"$(spillover_hosts)" || {
           spillover_log none "hub-unconfigured-host=${selected};${SPILL_REASON}"
           echo "wrk: hub selected unconfigured host '$selected'; configure hosts.toml or use --host local" >&2
@@ -1369,8 +1633,15 @@ spawn_router_cmd() {
     [[ "$last_rc" -ne 2 ]] || return 2  # cwd mapping is fail-closed, never spill elsewhere.
     warn "spill-over remote spawn failed host=$candidate exit=$last_rc; trying next candidate"
   done
-  echo "wrk: no remote spill-over candidate completed; use --host local to override" >&2
-  return "$last_rc"
+  warn "no remote spill-over candidate completed; falling back to local"
+  out="$(mktemp)"
+  set +e
+  ( set -e; spawn_cmd "${filtered[@]}" ) >"$out"
+  rc=$?
+  set -e
+  spillover_emit_host local "$out"
+  rm -f "$out"
+  return "$rc"
 }
 
 hosts_cmd() {
@@ -1391,20 +1662,23 @@ hosts_cmd() {
   done
 }
 
+
 spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" CAPTAIN_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report)
         [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
           --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
+          --role) ROLE="$2" ;; --lane) CAPTAIN_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
+          --report) REPORT_PATH="$2" ;;
         esac
         shift 2 ;;
       --job-dup-ok) JOB_DUP_OK=1; shift ;;
@@ -1427,6 +1701,18 @@ spawn_cmd() {
 
   [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
 
+  case "$ROLE" in worker|captain) ;; *) die "--role accepts only worker or captain" ;; esac
+  if [[ "$ROLE" == captain ]]; then
+    [[ -n "$CAPTAIN_LANE" ]] || die "--role captain requires --lane CAPTAIN_LANE"
+    [[ -n "$PARENT_LANE" ]] || die "--role captain requires --parent PARENT_LANE"
+    [[ -z "$OWNER" ]] || die "--role captain uses --lane; do not combine it with --owner"
+    case "$MODEL" in captain-opus|captain-sol) ;; *) die "--role captain accepts only captain-opus or captain-sol (terra/luna are worker-only)" ;; esac
+    [[ "$MODEL" != captain-opus || -z "$EFFORT" || "$EFFORT" == high ]] || die "captain-opus requires effort high"
+  else
+    [[ -z "$CAPTAIN_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role captain"
+    case "$MODEL" in captain-opus|captain-sol) die "captain profiles require --role captain" ;; esac
+  fi
+
   resolve_profile
   configure_landing_check "$PROFILE_KIND"
   LANE_ENV=()
@@ -1446,7 +1732,11 @@ spawn_cmd() {
   # Conflating them made every record `default` (or `mock`), so an orch could not
   # query `arbiter status --lane <itself>` to find and reclaim its own workers.
   # -L live|mock stays the execution lane; --owner names the spawning session.
-  JOB_LANE="${OWNER:-default}"
+  JOB_LANE="${CAPTAIN_LANE:-${OWNER:-default}}"
+  ARBITER_CLAIM_ROLE_ARGS=(--role "$ROLE")
+  if [[ "$ROLE" == captain ]]; then
+    ARBITER_CLAIM_ROLE_ARGS+=(--parent-lane "$PARENT_LANE")
+  fi
 
   # ROB-1198 §③ / ROB-1199 claim contract: an unclassified job is not spawned.
   # There is no default T — a blank one would be recorded as fact by arbiter.
@@ -1557,7 +1847,7 @@ spawn_cmd() {
       fi
     else
       if [[ "$PROMPT_SUBMITTED" -ne 1 ]]; then
-        retry_skip_reason="prompt-submission-unconfirmed"
+        retry_skip_reason=prompt-submission-unconfirmed
       elif [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 ]]; then
         retry_skip_reason=ambiguous-observation
       else
@@ -1570,6 +1860,11 @@ spawn_cmd() {
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   arbiter_record_spawn_receipt
+  # A sentinel requires the durable claim/spawn metadata it later reads. During
+  # an installation transition the old fail-open spawn contract remains intact.
+  if [[ "$ARBITER_JOB_REGISTERED" -eq 1 ]]; then
+    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
+  fi
   SPAWN_PANE_OPEN=0
   refresh_quota_pool
   ARBITER_HELD=0
@@ -1728,6 +2023,10 @@ PY
 case "${1:-}" in
   -h|--help) usage ;;
   spawn) shift; spawn_router_cmd "$@" ;;
+  done) shift; done_cmd "$@" ;;
+  escalate) shift; escalate_cmd "$@" ;;
+  joined) shift; joined_cmd "$@" ;;
+  sentinel) shift; sentinel_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;

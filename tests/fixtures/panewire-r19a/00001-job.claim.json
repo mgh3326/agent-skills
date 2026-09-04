@@ -1,0 +1,1 @@
+{"created_at": "2026-09-04T07:00:00+00:00", "job_id": "captain-fixture", "kind": "job.claim", "payload": {"agent_label": "captain-fixture", "owner_lane": "lane-a", "parent_lane": "parent-a", "role": "captain", "t_level": "T1"}, "seq": 1}

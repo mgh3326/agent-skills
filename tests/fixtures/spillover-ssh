@@ -2,14 +2,21 @@
 set -euo pipefail
 
 printf '%s\n' "$*" >>"${WRK_SSH_LOG:?}"
+if [[ -n "${WRK_SSH_CALL_COUNT_FILE:-}" ]]; then
+  call=0
+  [[ ! -f "$WRK_SSH_CALL_COUNT_FILE" ]] || call="$(cat "$WRK_SSH_CALL_COUNT_FILE")"
+  call=$((call + 1))
+  printf '%s\n' "$call" >"$WRK_SSH_CALL_COUNT_FILE"
+  if [[ ",${WRK_SSH_FAIL_CALLS:-}," == *",$call,"* ]]; then exit 42; fi
+fi
 remote="${*: -1}"
 host=""
 for arg in "$@"; do
-  [[ "$arg" == example-primary || "$arg" == example-backup ]] && host="$arg"
+  [[ "$arg" == desktop || "$arg" == mac-work ]] && host="$arg"
 done
 if [[ "$remote" == *'uptime; herdr agent list'* ]]; then
-  if [[ "$host" == example-primary && "${WRK_SSH_SCENARIO:-ok}" == primary-down ]]; then exit 255; fi
-  if [[ "$host" == example-backup && "${WRK_SSH_SCENARIO:-ok}" == backup-down ]]; then exit 255; fi
+  if [[ "$host" == desktop && "${WRK_SSH_SCENARIO:-ok}" == desktop-down ]]; then exit 255; fi
+  if [[ "$host" == mac-work && "${WRK_SSH_SCENARIO:-ok}" == backup-down ]]; then exit 255; fi
   printf '%s\n' ' 10:00 up 1 day,  load average: 0.10, 0.10, 0.10'
   printf '%s\n' '{"result":{"agents":[]}}'
   exit 0
@@ -18,5 +25,5 @@ if [[ "$remote" == *mktemp* ]]; then
   printf '%s\n' "/tmp/${host}-brief.md"
   exit 0
 fi
-if [[ "$host" == example-primary && "${WRK_SSH_SCENARIO:-ok}" == primary-spawn-fails ]]; then exit 42; fi
+if [[ "$host" == desktop && "${WRK_SSH_SCENARIO:-ok}" == desktop-spawn-fails ]]; then exit 42; fi
 printf '%s\n' "OK pane=${host}:p7 host=local model=codex-terra label=fixture status=working landed=yes"
