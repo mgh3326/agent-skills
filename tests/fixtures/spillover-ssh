@@ -5,11 +5,11 @@ printf '%s\n' "$*" >>"${WRK_SSH_LOG:?}"
 remote="${*: -1}"
 host=""
 for arg in "$@"; do
-  [[ "$arg" == desktop || "$arg" == backup ]] && host="$arg"
+  [[ "$arg" == example-primary || "$arg" == example-backup ]] && host="$arg"
 done
 if [[ "$remote" == *'uptime; herdr agent list'* ]]; then
-  if [[ "$host" == desktop && "${WRK_SSH_SCENARIO:-ok}" == desktop-down ]]; then exit 255; fi
-  if [[ "$host" == backup && "${WRK_SSH_SCENARIO:-ok}" == backup-down ]]; then exit 255; fi
+  if [[ "$host" == example-primary && "${WRK_SSH_SCENARIO:-ok}" == primary-down ]]; then exit 255; fi
+  if [[ "$host" == example-backup && "${WRK_SSH_SCENARIO:-ok}" == backup-down ]]; then exit 255; fi
   printf '%s\n' ' 10:00 up 1 day,  load average: 0.10, 0.10, 0.10'
   printf '%s\n' '{"result":{"agents":[]}}'
   exit 0
@@ -18,4 +18,4 @@ if [[ "$remote" == *mktemp* ]]; then
   printf '%s\n' "/tmp/${host}-brief.md"
   exit 0
 fi
-printf '%s\n' "OK pane=${host}:p7 model=codex-terra label=fixture status=working landed=yes"
+printf '%s\n' "OK pane=${host}:p7 host=local model=codex-terra label=fixture status=working landed=yes"

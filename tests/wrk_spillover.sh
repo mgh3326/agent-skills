@@ -10,9 +10,10 @@ LOAD="$TMP/loadavg"
 printf '%s\n' 'spillover fixture brief' >"$PROMPT"
 printf '%s\n' '0.20 0.10 0.10 1/1 1' >"$LOAD"
 printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
-  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  '[hub]' 'hub_url = "https://example.invalid"' 'hub_token_env = "/tmp/example-token.env"' 'hub_cf_env = "/tmp/example-cf.env"' '' \
+  '[hosts.example-primary]' 'ssh = "example-primary"' 'herdr_session = "worker"' 'workspace = "workers"' \
   "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' '' \
-  '[hosts.backup]' 'ssh = "backup"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  '[hosts.example-backup]' 'ssh = "example-backup"' 'herdr_session = "worker"' 'workspace = "workers"' \
   "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >"$CONFIG"
 
 run_wrk() {
@@ -37,7 +38,7 @@ hosts_out="$(env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" WRK_TEST_ACTIV
   WRK_HOSTS_CONFIG="$CONFIG" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
   WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SSH_LOG="$TMP/ssh.log" \
   "$ROOT/bin/wrk" hosts)"
-grep -q '^desktop[[:space:]]available' <<<"$hosts_out"
+grep -q '^example-primary[[:space:]]available' <<<"$hosts_out"
 
 # Hub is authoritative: high local pressure remains local when hub says so.
 printf '%s\n' '9.00 0.10 0.10 1/1 1' >"$LOAD"
@@ -48,22 +49,22 @@ grep -q 'source=hub' "$TMP/spillover.log"
 # Hub failure plus high pressure spills to the first measured remote host.
 : >"$TMP/ssh.log"
 remote_out="$(WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" 2>&1)"
-grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$remote_out"
+grep -q '^OK pane=example-primary:p7 host=example-primary ' <<<"$remote_out"
 grep -q -- 'HERDR_SESSION=worker' "$TMP/ssh.log"
 grep -q -- '/remote/agent-skills' "$TMP/ssh.log"
 grep -q -- ' -w workers' "$TMP/ssh.log"
 
 # An unreachable candidate is skipped and the next configured candidate is used.
 : >"$TMP/ssh.log"
-backup_out="$(WRK_PLACE_SCENARIO=unavailable WRK_SSH_SCENARIO=desktop-down WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" 2>&1)"
-grep -q '^OK pane=backup:p7 host=backup ' <<<"$backup_out"
-grep -q 'desktop.*uptime; herdr agent list' "$TMP/ssh.log"
-grep -q 'backup.*uptime; herdr agent list' "$TMP/ssh.log"
+backup_out="$(WRK_PLACE_SCENARIO=unavailable WRK_SSH_SCENARIO=primary-down WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" 2>&1)"
+grep -q '^OK pane=example-backup:p7 host=example-backup ' <<<"$backup_out"
+grep -q 'example-primary.*uptime; herdr agent list' "$TMP/ssh.log"
+grep -q 'example-backup.*uptime; herdr agent list' "$TMP/ssh.log"
 
 # A hub-selected remote host without a cwd mapping fails closed; no local pane.
 sed -i '0,/cwd_map =/s|cwd_map =.*|cwd_map = {"/not-the-current-cwd"="/remote/missing"}|' "$CONFIG"
 set +e
-unmapped_out="$(WRK_PLACE_SCENARIO=desktop WRK_TEST_ACTIVE=0 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+unmapped_out="$(WRK_PLACE_SCENARIO=primary WRK_TEST_ACTIVE=0 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
 unmapped_rc=$?
 set -e
 [[ "$unmapped_rc" -ne 0 ]]
@@ -73,7 +74,7 @@ grep -q 'has no cwd_map entry' <<<"$unmapped_out"
 # Restore the mapping and prove --host local overrides hub placement.
 sed -i "0,/cwd_map =/s|cwd_map =.*|cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}|" "$CONFIG"
 : >"$TMP/ssh.log"
-forced_out="$(WRK_PLACE_SCENARIO=desktop WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" -w local --host local 2>&1)"
+forced_out="$(WRK_PLACE_SCENARIO=primary WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" -w local --host local 2>&1)"
 grep -q '^OK pane=w:p1 host=local ' <<<"$forced_out"
 [[ ! -s "$TMP/ssh.log" ]]
 
@@ -81,14 +82,14 @@ grep -q '^OK pane=w:p1 host=local ' <<<"$forced_out"
 MUT_PRESSURE="$TMP/wrk-no-pressure"
 cp "$ROOT/bin/wrk" "$MUT_PRESSURE"
 sed -i 's/if spillover_local_is_pressured; then/if false; then/' "$MUT_PRESSURE"
-if WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 run_wrk "$MUT_PRESSURE" 2>&1 | grep -q 'host=desktop'; then
+if WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 run_wrk "$MUT_PRESSURE" 2>&1 | grep -q 'host=example-primary'; then
   echo 'pressure mutant survived' >&2; exit 1
 fi
 MUT_MAP="$TMP/wrk-no-cwd-map"
 cp "$ROOT/bin/wrk" "$MUT_MAP"
 sed -i 's/if ! remote_cwd="$(spillover_cwd_map "\$host" "\$cwd")"; then/if false; then/' "$MUT_MAP"
 sed -i '0,/cwd_map =/s|cwd_map =.*|cwd_map = {"/not-the-current-cwd"="/remote/missing"}|' "$CONFIG"
-if WRK_PLACE_SCENARIO=desktop WRK_TEST_ACTIVE=0 run_wrk "$MUT_MAP" -w local 2>&1 | grep -q 'has no cwd_map entry'; then
+if WRK_PLACE_SCENARIO=primary WRK_TEST_ACTIVE=0 run_wrk "$MUT_MAP" -w local 2>&1 | grep -q 'has no cwd_map entry'; then
   echo 'cwd-map mutant survived' >&2; exit 1
 fi
 

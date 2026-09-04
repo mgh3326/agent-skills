@@ -1118,10 +1118,16 @@ spillover_log() {
 # from `panewire place`, then performs the selected spawn. No URL, token, IP,
 # or machine name is embedded in this public CLI.
 spillover_hub_placement() {
-  local reply parsed panewire
+  local reply parsed panewire hub_url token_env cf_env args
   SPILL_HUB_STATUS=unavailable
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  [[ -n "$hub_url" && -n "$token_env" ]] || return 1
   panewire="${PANEWIRE_BIN:-panewire}"
-  if ! reply="$("$panewire" place --class worker --cwd "$1" 2>/dev/null)"; then
+  args=(place --class worker --cwd "$1" --hub-url "$hub_url" --hub-token-env "$token_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  if ! reply="$("$panewire" "${args[@]}" 2>/dev/null)"; then
     return 1
   fi
   if ! parsed="$(python3 -c '
@@ -1144,6 +1150,10 @@ if not isinstance(host, str) or not host:
     raise ValueError("placement response has no decision host")
 print(host)
 print(str(reason).replace("\n", " "))
+for candidate in d.get("candidates", []):
+    value = candidate if isinstance(candidate, str) else (candidate.get("host") or candidate.get("target") or "")
+    if isinstance(value, str) and value and value != host:
+        print(value)
 ' <<<"$reply")"; then
     SPILL_HUB_STATUS=invalid
     return 1
@@ -1152,6 +1162,8 @@ print(str(reason).replace("\n", " "))
     IFS= read -r SPILL_HUB_HOST
     IFS= read -r SPILL_HUB_REASON || true
   } <<<"$parsed"
+  SPILL_HUB_CANDIDATES=()
+  while IFS= read -r candidate; do [[ -z "$candidate" ]] || SPILL_HUB_CANDIDATES+=("$candidate"); done < <(tail -n +3 <<<"$parsed")
   SPILL_HUB_STATUS=ok
   return 0
 }
@@ -1177,24 +1189,24 @@ spillover_probe_host() {
 }
 
 spillover_wake() {
-  local host="$1" wake token_env url_env hold panewire
+  local host="$1" wake hold panewire hub_url token_env cf_env args
   wake="$(spillover_value "hosts.$host" wake 2>/dev/null || true)"
   [[ "$wake" == panewire ]] || return 0
-  token_env="$(spillover_value "hosts.$host" wake_token_env 2>/dev/null || true)"
-  url_env="$(spillover_value "hosts.$host" wake_url_env 2>/dev/null || true)"
-  [[ -n "$token_env" && -n "${!token_env:-}" ]] || { warn "spill-over wake skipped host=$host: wake token env is unset"; return 0; }
-  [[ -z "$url_env" || -n "${!url_env:-}" ]] || { warn "spill-over wake skipped host=$host: wake URL env is unset"; return 0; }
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"; token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"; cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  [[ -n "$hub_url" && -n "$token_env" ]] || { warn "spill-over wake skipped host=$host: hub config is unset"; return 0; }
   hold="${WRK_WAKE_HOLD_MINUTES:-10}"
   [[ "$hold" =~ ^[1-9][0-9]*$ ]] || { warn "spill-over wake skipped host=$host: invalid hold"; return 0; }
   panewire="${PANEWIRE_BIN:-panewire}"
-  if ! "$panewire" burst request --target "$host" --hold "${hold}m" >/dev/null 2>&1; then
+  args=(burst request --target "$host" --hold "${hold}m" --reason "wrk spill-over remote unavailable" --hub-url "$hub_url" --hub-token-env "$token_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  if ! "$panewire" "${args[@]}" >/dev/null 2>&1; then
     warn "spill-over wake skipped host=$host: panewire request failed"
   fi
 }
 
 spillover_emit_host() {
   local host="$1" file="$2"
-  awk -v host="$host" '/^OK pane=/ { sub(/^OK pane=[^ ]+/, "& host=" host) } { print }' "$file"
+  awk -v host="$host" '/^OK pane=/ { sub(/ host=[^ ]+/, ""); sub(/^OK pane=[^ ]+/, "& host=" host) } { print }' "$file"
 }
 
 spillover_remote_spawn() {
@@ -1307,10 +1319,8 @@ spawn_router_cmd() {
       else
         SPILL_DECISION_SOURCE=local-fallback
         if spillover_local_is_pressured; then
-          for host in $(spillover_hosts); do
-            if spillover_probe_host "$host"; then selected="$host"; break; fi
-            [[ "$SPILL_PROBE_REASON" == ssh-unreachable ]] && spillover_wake "$host"
-          done
+          SPILL_HUB_CANDIDATES=($(spillover_hosts))
+          selected="${SPILL_HUB_CANDIDATES[0]:-}"
           [[ -n "$selected" ]] || { spillover_log none "${SPILL_REASON};no-remote-capacity"; echo "wrk: spill-over required (${SPILL_REASON}) but no configured remote host has capacity; use --host local to override" >&2; return 1; }
         else
           selected=local
@@ -1339,7 +1349,21 @@ spawn_router_cmd() {
     return "$rc"
   fi
   [[ -n "$cwd" && -n "$prompt" ]] || die "-c CWD and -p PROMPT_FILE are required"
-  spillover_remote_spawn "$selected" "$cwd" "$prompt" "${filtered[@]}"
+  local candidates=("$selected") candidate last_rc=1 seen_candidates=""
+  if [[ "$requested" == auto ]]; then candidates+=("${SPILL_HUB_CANDIDATES[@]:-}"); fi
+  for candidate in "${candidates[@]}"; do
+    [[ " $seen_candidates " == *" $candidate "* ]] && continue
+    seen_candidates+=" $candidate"
+    if ! spillover_probe_host "$candidate"; then
+      [[ "$SPILL_PROBE_REASON" == ssh-unreachable ]] && spillover_wake "$candidate"
+      continue
+    fi
+    if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "${filtered[@]}"; then return 0; else last_rc=$?; fi
+    [[ "$last_rc" -ne 2 ]] || return 2  # cwd mapping is fail-closed, never spill elsewhere.
+    warn "spill-over remote spawn failed host=$candidate exit=$last_rc; trying next candidate"
+  done
+  echo "wrk: no remote spill-over candidate completed; use --host local to override" >&2
+  return "$last_rc"
 }
 
 hosts_cmd() {

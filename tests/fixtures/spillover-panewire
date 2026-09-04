@@ -5,7 +5,7 @@ if [[ "${1:-}" == place ]]; then
   case "${WRK_PLACE_SCENARIO:-unavailable}" in
     unavailable) exit 1 ;;
     local) printf '%s\n' '{"decision":"local","candidates":[],"reason":"hub healthy","source":"hub"}' ;;
-    desktop) printf '%s\n' '{"decision":"desktop","candidates":["desktop"],"reason":"hub spill","source":"hub"}' ;;
+    primary) printf '%s\n' '{"decision":"example-primary","candidates":["example-primary","example-backup"],"reason":"hub spill","source":"hub"}' ;;
     invalid) printf '%s\n' '{"decision":{},"candidates":[],"reason":"broken"}' ;;
   esac
   exit 0
