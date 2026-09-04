@@ -966,22 +966,11 @@ resolve_profile() {
   esac
 }
 
-job_directory() {
-  local job="$1" inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox/jobs}"
-  # arbiter's root is already the job container. Older completion-sentinel
-  # callers used <root>/jobs/<job>; retain that layout only when it exists and
-  # no real arbiter job directory does.
-  if [[ -d "$inbox/$job" || ! -d "$inbox/jobs/$job" ]]; then
-    printf '%s\n' "$inbox/$job"
-  else
-    printf '%s\n' "$inbox/jobs/$job"
-  fi
-}
-
 completion_event() {
   local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}"
-  local events host="${HOSTNAME:-unknown}" last
-  events="$(job_directory "$job")/events"
+  local events host last
+  events="$(wrk_jobs_root)/$job/events"
+  host="${HOSTNAME:-unknown}"
   mkdir -p "$events"
   if [[ -n "$report" && -f "$report" ]]; then
     last="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240)"
@@ -1000,7 +989,9 @@ record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
           "report_last_line": last, "epoch": 1}
 fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
 try:
-    with os.fdopen(fd, 'w', encoding='utf-8') as f: json.dump(record, f, separators=(',', ':'))
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(record, f, separators=(',', ':'))
+        f.write('\n')
     os.chmod(temporary, 0o600)
     os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
 finally:
@@ -1008,10 +999,15 @@ finally:
 PY
 }
 
+# Keep this exactly aligned with arbiter.inbox_root(): ARBITER_INBOX_ROOT is
+# the jobs directory, rather than its parent.
+wrk_jobs_root() {
+  printf '%s\n' "${ARBITER_INBOX_ROOT:-$HOME/work/herdr-inbox/jobs}"
+}
+
 completion_metadata() {
-  local job="$1" directory
-  directory="$(job_directory "$job")"
-  python3 - "$directory/events" <<'PY'
+  local job="$1"
+  python3 - "$(wrk_jobs_root)/$job/events" <<'PY'
 import json, os, sys
 owner=label=pane=parent=role=''
 try: names=sorted(os.listdir(sys.argv[1]))
@@ -1020,12 +1016,15 @@ for name in names:
     try: o=json.load(open(os.path.join(sys.argv[1],name), encoding='utf-8'))
     except (OSError,json.JSONDecodeError): continue
     p=o.get('payload',o)
-    owner=owner or (p.get('owner_lane') if isinstance(p.get('owner_lane'), str) else '')
-    candidate=p.get('label', p.get('agent_label'))
-    label=label or (candidate if isinstance(candidate, str) else '')
+    # Claim/reclaim establishes ownership.  Keep the newest one: a released
+    # job can be reclaimed by a different captain and parent.
+    if o.get('kind') in ('job.claim', 'job.reclaim'):
+        owner=p.get('owner_lane') if isinstance(p.get('owner_lane'), str) else ''
+        candidate=p.get('label', p.get('agent_label'))
+        label=candidate if isinstance(candidate, str) else ''
+        parent=p.get('parent_lane') if isinstance(p.get('parent_lane'), str) else ''
+        role=p.get('role') if isinstance(p.get('role'), str) else ''
     pane=p.get('pane_id') if isinstance(p.get('pane_id'), str) else pane
-    parent=parent or (p.get('parent_lane') if isinstance(p.get('parent_lane'), str) else '')
-    role=role or (p.get('role') if isinstance(p.get('role'), str) else '')
 if owner and label and pane: print(owner, label, pane, parent, role, sep='\t')
 else: raise SystemExit(1)
 PY
@@ -1073,14 +1072,12 @@ done_cmd() {
       *) die "unknown done option '$1'" ;;
     esac
   done
-  local metadata owner label pane parent role inbox
+  local metadata owner label pane jobs_root
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
-  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  # Captains report upward: parent_lane, not the captain's own claim lane, is
-  # the panewire delivery target. Ordinary worker claims have no parent.
-  [[ -z "$parent" ]] || owner="$parent"
+  IFS=$'\t' read -r owner label pane <<<"$metadata"
+  jobs_root="$(wrk_jobs_root)"
   if [[ -z "$report" ]]; then
-    report="$(find_latest_report "$(job_directory "$job")")"
+    report="$(find_latest_report "$jobs_root/$job")"
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
   completion_event "$job" "$owner" "$label" "$pane" "$report"
@@ -1088,31 +1085,33 @@ done_cmd() {
 }
 
 captain_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" kind="$5" report="$6" reason="$7" question="$8" pr="$9" head="${10}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}"
   local events host="${HOSTNAME:-unknown}" last
-  events="$(job_directory "$job")/events"
+  events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
   if [[ -n "$report" && -f "$report" ]]; then
     last="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240)"
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
 import json, os, sys, tempfile
-events, job, owner, label, pane, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
 highest = 0
 for name in os.listdir(events):
     try: highest = max(highest, int(name.split('-', 1)[0]))
     except (ValueError, IndexError): pass
 record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
           "pane_id": pane, "host": host, "report_path": report,
-          "report_last_line": last, "reason": reason, "epoch": 1}
+          "report_last_line": last, "reason": reason, "parent_lane": parent, "epoch": 1}
 if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
 fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
 try:
-    with os.fdopen(fd, 'w', encoding='utf-8') as f: json.dump(record, f, separators=(',', ':'))
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(record, f, separators=(',', ':'))
+        f.write('\n')
     os.chmod(temporary, 0o600)
     os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
 finally:
@@ -1125,11 +1124,13 @@ captain_metadata() {
   metadata="$(completion_metadata "$job")" || die "cannot find job.claim/job.spawned metadata: $job"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   [[ "$role" == captain && -n "$parent" ]] || die "$job is not a captain claim with a parent lane"
-  printf '%s\t%s\t%s\n' "$parent" "$label" "$pane"
+  # owner_lane is the captain's own lane. parent_lane is informational only;
+  # panewire resolves the parent relationship from lanes.json.
+  printf '%s\t%s\t%s\t%s\n' "$owner" "$label" "$pane" "$parent"
 }
 
 escalate_cmd() {
-  local job="${1:-}" question="" metadata owner label pane
+  local job="${1:-}" question="" metadata owner label pane parent
   [[ -n "$job" && "$job" != -* ]] || die "escalate requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -1140,13 +1141,13 @@ escalate_cmd() {
   done
   [[ -n "$question" ]] || die "escalate requires --question"
   metadata="$(captain_metadata "$job")"
-  IFS=$'\t' read -r owner label pane <<<"$metadata"
-  captain_flat_event "$job" "$owner" "$label" "$pane" job.escalate "" "captain escalation" "$question" "" ""
+  IFS=$'\t' read -r owner label pane parent <<<"$metadata"
+  captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "" "captain escalation" "$question" "" ""
   echo "OK job=$job owner_lane=$owner kind=job.escalate"
 }
 
 joined_cmd() {
-  local job="${1:-}" pr="" head="" report="" metadata owner label pane
+  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent
   [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -1159,8 +1160,8 @@ joined_cmd() {
   done
   [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
   metadata="$(captain_metadata "$job")"
-  IFS=$'\t' read -r owner label pane <<<"$metadata"
-  captain_flat_event "$job" "$owner" "$label" "$pane" job.joined "$report" "captain joined PR" "" "$pr" "$head"
+  IFS=$'\t' read -r owner label pane parent <<<"$metadata"
+  captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "captain joined PR" "" "$pr" "$head"
   echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
 }
 
@@ -1184,7 +1185,7 @@ sentinel_cmd() {
     fi
     candidate="$report"
     if [[ -z "$candidate" || ! -f "$candidate" ]]; then
-      candidate="$(find_latest_report "$(job_directory "$job")")"
+      candidate="$(find_latest_report "$(wrk_jobs_root)/$job")"
     fi
     key="$(report_observation_key "$candidate" 2>/dev/null || true)"
     if [[ ( "$status" == "done" || "$status" == "idle" ) && -f "$candidate" && -n "$key" && "$key" != "$seen" ]]; then
@@ -1410,7 +1411,7 @@ spawn_cmd() {
   # A sentinel requires the durable claim/spawn metadata it later reads. During
   # an installation transition the old fail-open spawn contract remains intact.
   if [[ "$ARBITER_JOB_REGISTERED" -eq 1 ]]; then
-    start_completion_sentinel "$(job_directory "$JOB_ID")/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
+    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
   fi
   SPAWN_PANE_OPEN=0
   refresh_quota_pool

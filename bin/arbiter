@@ -91,6 +91,15 @@ def inbox_root() -> Path:
 
 
 def now_dt() -> dt.datetime:
+    # Fixtures can make the real artifact writer deterministic without a mock.
+    # This is deliberately opt-in and only affects callers that set the test
+    # clock explicitly.
+    fixed = os.environ.get("ARBITER_TEST_NOW") or ""
+    if fixed:
+        parsed = dt.datetime.fromisoformat(fixed)
+        if parsed.tzinfo is None:
+            raise ValueError("ARBITER_TEST_NOW must include a timezone")
+        return parsed.replace(microsecond=0)
     return dt.datetime.now(dt.timezone.utc).replace(microsecond=0)
 
 

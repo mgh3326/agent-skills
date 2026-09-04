@@ -40,8 +40,9 @@ panewire R19a 계약은 두 종류의 이벤트를 같이 소비한다.
 - arbiter 산출물은 envelope이다: `job_id`, `seq`, `kind`, `payload`, `created_at`. 캡틴 claim의
   `payload.parent_lane`이 상위 목적지다.
 - `wrk done`, `wrk escalate`, `wrk joined` 산출물은 events 디렉터리의 평면 레코드다.
-  캡틴 job의 `owner_lane`은 반드시 parent 레인이다. R19a는 `job.escalate`와 `job.joined`를 그
-  parent pane으로 주입한다.
+  캡틴의 `job.escalate`와 `job.joined`는 `owner_lane`에 반드시 **캡틴 자신의 레인**을 기록하고,
+  정보용 `parent_lane`도 함께 기록한다. `parent_lane`은 라우팅 근거가 아니다. R19a는
+  panewire의 `lanes.json`으로 owner 레인의 parent를 해석해 상위 pane으로 주입한다.
 
 `tests/fixtures/panewire-r19a/`의 claim fixture는 실제 `arbiter claim` artifact와 같은 envelope
 shape다. 소비자는 flat completion event를 arbiter envelope이라고 가정하면 안 된다.
@@ -55,6 +56,10 @@ shape다. 소비자는 flat completion event를 arbiter envelope이라고 가정
 3. BLOCKER fix가 3라운드를 초과할 때
 4. 시크릿·배포·브로커 접촉이 필요한 때
 5. JOIN 판정이 불확실할 때
+6. 뮤턴트 RED는 assertion 실패일 때만 인정한다. 예외 또는 `IndexError`로 끝난 실행은 유효한
+   뮤턴트 검증이 아니다.
+7. 캡틴은 머지하지 않는다. 머지는 parent의 권한이며 캡틴은 `wrk joined`로 JOIN 후보와 증거만
+   기록한다.
 
 막힘은 `wrk escalate <job> --question "<text>"`으로 기록한 뒤 **대기**한다. 상위 결정을
 추측해 계속 진행하지 않는다.
