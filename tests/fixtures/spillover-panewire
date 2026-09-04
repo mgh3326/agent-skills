@@ -2,6 +2,8 @@
 set -euo pipefail
 
 if [[ "${1:-}" == place ]]; then
+  [[ -z "${WRK_PLACE_LOG:-}" ]] || printf '%s\n' "$*" >>"$WRK_PLACE_LOG"
+  if [[ "${WRK_REQUIRE_HUB_ARGS:-0}" == 1 ]] && [[ " $* " != *' --hub-url '* || " $* " != *' --hub-token-env '* ]]; then exit 2; fi
   case "${WRK_PLACE_SCENARIO:-unavailable}" in
     unavailable) exit 1 ;;
     local) printf '%s\n' '{"decision":"local","candidates":[],"reason":"hub healthy","source":"hub"}' ;;

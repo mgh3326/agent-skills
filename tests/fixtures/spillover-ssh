@@ -18,4 +18,5 @@ if [[ "$remote" == *mktemp* ]]; then
   printf '%s\n' "/tmp/${host}-brief.md"
   exit 0
 fi
+if [[ "$host" == example-primary && "${WRK_SSH_SCENARIO:-ok}" == primary-spawn-fails ]]; then exit 42; fi
 printf '%s\n' "OK pane=${host}:p7 host=local model=codex-terra label=fixture status=working landed=yes"

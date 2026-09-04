@@ -24,6 +24,7 @@ run_wrk() {
     WRK_SPILLOVER_LOG="$TMP/spillover.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" \
     WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
     WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" \
+    WRK_PLACE_LOG="$TMP/place.log" \
     "$binary" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -l fixture --t T1 "$@"
 }
 
@@ -61,6 +62,13 @@ grep -q '^OK pane=example-backup:p7 host=example-backup ' <<<"$backup_out"
 grep -q 'example-primary.*uptime; herdr agent list' "$TMP/ssh.log"
 grep -q 'example-backup.*uptime; herdr agent list' "$TMP/ssh.log"
 
+# A post-probe spawn failure also advances to the next candidate.
+: >"$TMP/ssh.log"
+spawn_failover_out="$(WRK_PLACE_SCENARIO=primary WRK_SSH_SCENARIO=primary-spawn-fails run_wrk "$ROOT/bin/wrk" 2>&1)"
+grep -q '^OK pane=example-backup:p7 host=example-backup ' <<<"$spawn_failover_out"
+[[ "$(grep '^OK ' <<<"$spawn_failover_out" | grep -o 'host=' | wc -l)" -eq 1 ]]
+grep -q -- '--hub-url https://example.invalid --hub-token-env /tmp/example-token.env' "$TMP/place.log"
+
 # A hub-selected remote host without a cwd mapping fails closed; no local pane.
 sed -i '0,/cwd_map =/s|cwd_map =.*|cwd_map = {"/not-the-current-cwd"="/remote/missing"}|' "$CONFIG"
 set +e
@@ -93,4 +101,14 @@ if WRK_PLACE_SCENARIO=primary WRK_TEST_ACTIVE=0 run_wrk "$MUT_MAP" -w local 2>&1
   echo 'cwd-map mutant survived' >&2; exit 1
 fi
 
-echo 'PASS wrk-spillover mutants-red=2/2'
+MUT_CANDIDATES="$TMP/wrk-no-candidates"; cp "$ROOT/bin/wrk" "$MUT_CANDIDATES"
+sed -i 's/candidates+=("${SPILL_HUB_CANDIDATES\[@\]:-}")/true/' "$MUT_CANDIDATES"
+if WRK_PLACE_SCENARIO=primary WRK_SSH_SCENARIO=primary-spawn-fails run_wrk "$MUT_CANDIDATES" 2>&1 | grep -q 'host=example-backup'; then echo 'candidate mutant survived' >&2; exit 1; fi
+MUT_HOST="$TMP/wrk-duplicate-host"; cp "$ROOT/bin/wrk" "$MUT_HOST"
+sed -i 's/sub(\/ host=\[\^ \]\+\/, "")/# host replacement removed/' "$MUT_HOST"
+if WRK_PLACE_SCENARIO=primary run_wrk "$MUT_HOST" 2>&1 | awk 'BEGIN{ok=0} /^OK/{n=gsub(/host=/,"&"); if(n==1) ok=1} END{exit !ok}'; then echo 'host mutant survived' >&2; exit 1; fi
+MUT_HUB="$TMP/wrk-no-hub-token"; cp "$ROOT/bin/wrk" "$MUT_HUB"
+sed -i 's/ --hub-token-env "\$token_env"//' "$MUT_HUB"
+if WRK_PLACE_SCENARIO=primary WRK_REQUIRE_HUB_ARGS=1 run_wrk "$MUT_HUB" 2>&1 | grep -q 'source=hub'; then echo 'hub-args mutant survived' >&2; exit 1; fi
+
+echo 'PASS wrk-spillover mutants-red=5/5'
