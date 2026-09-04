@@ -553,6 +553,28 @@ arbiter_handle_duplicate_claim() {
   esac
 }
 
+arbiter_preflight_active_duplicate() {
+  # Router placement is allowed to inspect neither Herdr nor the hub for a job
+  # that the durable arbiter receipt already proves is actively owned.  This is
+  # deliberately a read-only look-up: normal admission below still owns the
+  # claim/reclaim transition and its installation-transition handling.
+  local job_id="$1" job_dup_ok="$2"
+  [[ -n "$ARBITER" ]] || ARBITER="$(command -v arbiter 2>/dev/null || true)"
+  [[ -n "$ARBITER" && -x "$ARBITER" ]] || return 0
+  JOB_ID="$job_id"
+  if ! arbiter_get_duplicate_state; then
+    return 0
+  fi
+  case "$ARBITER_DUP_STATE" in
+    claimed|leased)
+      [[ "$job_dup_ok" -eq 1 ]] && return 0
+      warn "active arbiter job duplicate refused (fail-closed): job_id=$JOB_ID state=$ARBITER_DUP_STATE owner_lane=$ARBITER_DUP_OWNER_LANE created_at=$ARBITER_DUP_CREATED_AT"
+      return "$WRK_EXIT_ACTIVE_JOB_DUPLICATE"
+      ;;
+  esac
+  return 0
+}
+
 arbiter_record_spawn_receipt() {
   # A pane cannot be rolled back once its agent start/prompt succeeded.  This
   # evidence write is therefore deliberately warning-only; job-get renders its
@@ -1543,17 +1565,32 @@ spawn_router_cmd() {
     fi
     ((i+=1))
   done
-  # Classification is an admission invariant, not placement work. Preserve the
-  # existing fail-closed boundary before asking hub/local telemetry anything.
-  local has_t=0 t_value=""
+  # Classification and an active durable duplicate are admission invariants,
+  # not placement work. Preserve their fail-closed boundary before asking
+  # hub/local telemetry anything.
+  local has_t=0 t_value="" job_id="" label="" job_dup_ok=0
   for ((i=0; i<${#filtered[@]}; i++)); do
-    if [[ "${filtered[$i]}" == --t ]]; then
-      has_t=1
-      t_value="${filtered[$((i + 1))]:-}"
-      break
-    fi
+    case "${filtered[$i]}" in
+      --t) has_t=1; t_value="${filtered[$((i + 1))]:-}" ;;
+      --job) job_id="${filtered[$((i + 1))]:-}" ;;
+      -l) label="${filtered[$((i + 1))]:-}" ;;
+      --job-dup-ok) job_dup_ok=1 ;;
+    esac
   done
   if [[ "$has_t" -eq 0 || ! "$t_value" =~ ^T[0-3]$ ]]; then
+    spawn_cmd "${filtered[@]}"
+    return $?
+  fi
+  [[ -n "$job_id" ]] || job_id="$label"
+  if arbiter_preflight_active_duplicate "$job_id" "$job_dup_ok"; then
+    :
+  else
+    return $?
+  fi
+  # Without spill-over configuration, retain the ordinary local spawn path.
+  # Besides avoiding pointless telemetry, this keeps spawn_cmd's quota gate as
+  # the first side-effecting boundary for installations that have not opted in.
+  if [[ "$requested" == auto && ! -r "$(spillover_config)" ]]; then
     spawn_cmd "${filtered[@]}"
     return $?
   fi
