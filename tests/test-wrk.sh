@@ -769,6 +769,42 @@ if grep -q "default=main" <<<"$off_out"; then exit 1; fi
 git -C "$CG_REPO" worktree remove -f "$CG_WT" 2>/dev/null || rm -rf "$CG_WT"
 echo "PASS canonical-checkout-guard"
 
+# `wrk done` must consume artifacts produced by the real arbiter, not a
+# hand-written fixture. Exercise both arbiter's default root and its explicit
+# ARBITER_INBOX_ROOT override; completed stays a flat record with top-level epoch.
+real_done_case() (
+  local mode="$1" job="wrk-done-$1" case_home="$TMP/home-$1" jobs_root report
+  export HOME="$case_home" XDG_DATA_HOME="$TMP/xdg-$1"
+  mkdir -p "$HOME"
+  case "$mode" in
+    default)
+      unset ARBITER_INBOX_ROOT
+      jobs_root="$HOME/work/herdr-inbox/jobs"
+      ;;
+    configured)
+      export ARBITER_INBOX_ROOT="$TMP/configured-jobs"
+      jobs_root="$ARBITER_INBOX_ROOT"
+      ;;
+    *) return 2 ;;
+  esac
+  "$ARBITER" claim --job "$job" --lane test-lane --agent-label test-label --t T1 >/dev/null
+  "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json '{"owner_lane":"test-lane","label":"test-label","pane_id":"test:pane"}' >/dev/null
+  report="$TMP/$job-report.md"
+  printf 'completion report\n' >"$report"
+  "$WRK" 'done' "$job" --report "$report" >/dev/null
+  python3 - "$jobs_root/$job/events/00003-job.completed.json" "$job" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert set(event) == {"kind", "job_id", "owner_lane", "label", "pane_id", "host", "report_path", "report_last_line", "epoch"}, event
+assert event["kind"] == "job.completed" and event["job_id"] == sys.argv[2], event
+assert event["epoch"] == 1, event
+PY
+)
+real_done_case default
+real_done_case configured
+echo "PASS wrk-done-uses-arbiter-inbox-root-default-and-override"
+
 # R18 completion sentinel: a report alone is never completion evidence. A
 # worker still working must time out/lost rather than emit job.completed.
 SENTINEL_REPORT="$TMP/sentinel-report.md"
@@ -781,27 +817,32 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
 sentinel_working_rc=$?
 set -e
 [[ "$sentinel_working_rc" -eq 0 ]]
-if find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.completed.json' | grep -q .; then
+if find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.completed.json' | grep -q .; then
   echo "working agent incorrectly emitted job.completed" >&2
   exit 1
 fi
-find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.lost.json' | grep -q .
+find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.lost.json' | grep -q .
 echo "PASS r18-sentinel-requires-terminal-status"
 
 # Automatic discovery must work on macOS too, and the observation key must be
 # stable for an unchanged report but advance when that same report is updated.
 SENTINEL_INBOX="$TMP/sentinel-dedupe-inbox"
-mkdir -p "$SENTINEL_INBOX/jobs/sentinel-idle"
-cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/jobs/sentinel-idle/report.md"
+env ARBITER_INBOX_ROOT="$SENTINEL_INBOX" "$ARBITER" claim \
+  --job sentinel-idle --lane test-lane --agent-label test-label --t T1 >/dev/null
+env ARBITER_INBOX_ROOT="$SENTINEL_INBOX" "$ARBITER" event --job sentinel-idle \
+  --kind job.spawned --payload-json '{"owner_lane":"test-lane","label":"test-label","pane_id":"test:pane"}' >/dev/null
 env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
-printf 'updated report line\n' >>"$SENTINEL_INBOX/jobs/sentinel-idle/report.md"
+[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 0 ]]
+cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/sentinel-idle/report.md"
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 2 ]]
+[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+printf 'updated report line\n' >>"$SENTINEL_INBOX/sentinel-idle/report.md"
+sleep 2
+[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 2 ]]
 kill "$sentinel_idle_pid" 2>/dev/null || true
 wait "$sentinel_idle_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-portable-discovery-and-dedupe"
@@ -814,7 +855,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   "$WRK" sentinel sentinel-done lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
 sentinel_done_pid=$!
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-done/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+[[ "$(find "$SENTINEL_INBOX/sentinel-done/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
 kill "$sentinel_done_pid" 2>/dev/null || true
 wait "$sentinel_done_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-accepts-done-status"
