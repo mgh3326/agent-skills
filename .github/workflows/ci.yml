@@ -27,6 +27,8 @@ jobs:
       - name: ShellCheck
         run: shellcheck bin/wrk tests/fixtures/herdr tests/test-wrk.sh
       - name: Bash tests
+        env:
+          SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
         run: |
           bash tests/test-wrk.sh
           bash tests/test-arbiter.sh
