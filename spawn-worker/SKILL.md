@@ -319,8 +319,9 @@ queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오�
 ### 4.x-1 `wrk` spill-over — hub placement 우선, 로컬 압력은 폴백
 
 `wrk spawn`의 기본 `--host auto`는 **정책을 자체 결정하지 않는다.** 먼저
-`panewire place --class worker --cwd <key>`를 호출해 JSON의 `decision`·`candidates`·`reason`을
-받고, 그 선택을 실행한다. hub가 명시적으로 `local`을 주면 로컬이 과부하여도 그대로 따른다.
+`panewire place --class worker --cwd <key> --hub-url wss://… --hub-token-env <file>
+[--hub-cf-env <file>]`를 호출해 JSON의 `decision`·`candidates`·`reason`을 받고, 그 선택을
+실행한다. hub가 명시적으로 `local`을 주면 로컬이 과부하여도 그대로 따른다.
 hub 호출 자체가 실패했을 때만 아래의 로컬 폴백 측정(load5/ncpu·`working` agent 수·macOS
 `CPU_Speed_Limit`)으로 후보를 고른다. 잘못된 hub JSON은 로컬 폴백하지 않고 fail-closed다.
 
@@ -333,16 +334,19 @@ hub 호출 자체가 실패했을 때만 아래의 로컬 폴백 측정(load5/nc
 max_load_ratio = 0.5       # hub unavailable 때만 사용
 max_active = 4             # hub unavailable 때만 사용
 
+[hub]
+hub_url = "wss://<hub-host>"
+hub_token_env = "<path-to-token-env-file>"
+hub_cf_env = "<path-to-cf-env-file>"   # 선택 사항
+
 [hosts.<remote-name>]
 ssh = "<ssh-alias>"
 herdr_session = "worker"
 workspace = "<remote-workspace>"
 cwd_map = {"<local-worktree>"="<remote-worktree>"}
 capacity = 3               # hub unavailable 때의 후보 실측 한도
-# 선택적 wake: 기본 off. 값·URL·토큰은 모두 환경/설정에만 둔다.
+# 선택적 wake: 기본 off. hub 설정의 URL·env 파일을 사용한다.
 wake = "panewire"
-wake_token_env = "<token-env-name>"
-wake_url_env = "<hub-url-env-name>"
 ```
 
 - 원격 선택 시 브리프를 권한 `0600` 임시 파일로 `scp`하고,

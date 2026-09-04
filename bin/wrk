@@ -1065,6 +1065,10 @@ spillover_active_workers() {
 
 spillover_throttled() {
   local therm limit
+  if [[ -n "${WRK_TEST_THROTTLED:-}" ]]; then
+    [[ "$WRK_TEST_THROTTLED" == 1 ]]
+    return
+  fi
   command -v pmset >/dev/null 2>&1 || return 1
   therm="$(pmset -g therm 2>/dev/null || true)"
   limit="$(sed -nE 's/.*CPU_Speed_Limit[[:space:]]*=[[:space:]]*([0-9]+).*/\1/p' <<<"$therm" | head -1)"
@@ -1319,7 +1323,10 @@ spawn_router_cmd() {
       else
         SPILL_DECISION_SOURCE=local-fallback
         if spillover_local_is_pressured; then
-          SPILL_HUB_CANDIDATES=($(spillover_hosts))
+          SPILL_HUB_CANDIDATES=()
+          while IFS= read -r candidate; do
+            [[ -z "$candidate" ]] || SPILL_HUB_CANDIDATES+=("$candidate")
+          done < <(spillover_hosts)
           selected="${SPILL_HUB_CANDIDATES[0]:-}"
           [[ -n "$selected" ]] || { spillover_log none "${SPILL_REASON};no-remote-capacity"; echo "wrk: spill-over required (${SPILL_REASON}) but no configured remote host has capacity; use --host local to override" >&2; return 1; }
         else

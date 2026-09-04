@@ -55,7 +55,7 @@ spawn_base() {
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S="${WRK_REFRESH_TIMEOUT_S:-5}" \
     "$WRK" spawn \
-    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
+    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --host local "${extra[@]}"
 }
 
 arb() { "$ARBITER" "$@"; }
@@ -79,8 +79,8 @@ grep -qx 'kimi-k3' <<<"$profiles_out"
 grep -qx 'kimi-k27' <<<"$profiles_out"
 grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
-! grep -qx 'codex-ultra' <<<"$profiles_out"
-! grep -qx 'codex-luna-ultra' <<<"$profiles_out"
+grep -qx 'codex-ultra' <<<"$profiles_out" && { echo 'retired profile codex-ultra is present' >&2; exit 1; }
+grep -qx 'codex-luna-ultra' <<<"$profiles_out" && { echo 'retired profile codex-luna-ultra is present' >&2; exit 1; }
 
 name_out="$(WRK_FIXTURE_SCENARIO=find-name HERDR_BIN="$HERDR" "$WRK" find orch)"
 grep -q 'pane_id=w:p1' <<<"$name_out"
@@ -93,7 +93,7 @@ run_fail env WRK_FIXTURE_SCENARIO=find-multi HERDR_BIN="$HERDR" "$WRK" find targ
 run_fail env WRK_FIXTURE_SCENARIO=find-multi HERDR_BIN="$HERDR" "$WRK" find target --pane-only
 priority_out="$(WRK_FIXTURE_SCENARIO=name-priority HERDR_BIN="$HERDR" "$WRK" find target)"
 grep -q 'pane_id=w:p1' <<<"$priority_out"
-! grep -q 'pane_id=w:p2' <<<"$priority_out"
+grep -q 'pane_id=w:p2' <<<"$priority_out" && { echo 'name lookup did not take precedence' >&2; exit 1; }
 
 mkdir -p "$TMP/home-old/.local/bin"
 ln -s "$HERDR" "$TMP/home-old/.local/bin/herdr"
@@ -225,10 +225,10 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3-low -p "$PROMPT" -w w -l fixture --effort high
 : >"$TMP/herdr.log"
 spawn_base kimi-k3 >/dev/null
-! grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"
+grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log" && { echo 'kimi-k3 unexpectedly received KIMI_CODE_HOME' >&2; exit 1; }
 : >"$TMP/herdr.log"
 spawn_base kimi-k27 >/dev/null
-! grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"
+grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log" && { echo 'kimi-k27 unexpectedly received KIMI_CODE_HOME' >&2; exit 1; }
 
 # ROB-1191 ⑥: Claude opus/sonnet effort wiring via CLI argv (settings.json never written).
 SETTINGS_PATH="${HOME}/.claude/settings.json"
@@ -392,10 +392,10 @@ echo "PASS ambiguous-observation-no-retry: $observation_fail_out"
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"
 grep -q 'gate blocked' <<<"$blocked3"
-! grep -q '^tab create ' "$TMP/herdr.log"   # placement fallback may read agent list; no pane was created
+grep -q '^tab create ' "$TMP/herdr.log" && { echo 'blocked gate created a pane' >&2; exit 1; }
 blocked4="$(WRK_GATE_MODE=4 spawn_base codex-terra 2>&1 || true)"
 grep -q 'measurement unavailable' <<<"$blocked4"
-! grep -q '^tab create ' "$TMP/herdr.log"
+grep -q '^tab create ' "$TMP/herdr.log" && { echo 'unavailable measurement created a pane' >&2; exit 1; }
 rm -f "$TMP/herdr.log"
 unsupported="$(WRK_GATE_MODE=unsupported spawn_base codex-terra 2>&1)"
 grep -q 'no gate subcommand' <<<"$unsupported"
@@ -674,6 +674,7 @@ unset TEST_ARBITER_BIN
 
 # ROB-1198 §③: an unclassified job is refused outright — no default T, and the
 # refusal happens before the gate, the claim and the spawn.
+# shellcheck disable=SC2120 # expect_exit invokes this helper indirectly with its arguments.
 spawn_untyped() {
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" WRK_FIXTURE_SCENARIO=spawn \
@@ -682,9 +683,10 @@ spawn_untyped() {
 }
 rm -f "$TMP/herdr.log" "$TMP/scopefuel.log"
 export TEST_ARBITER_BIN="$ARBITER"
+# shellcheck disable=SC2119 # This call intentionally verifies the untyped case.
 untyped_out="$(spawn_untyped 2>&1 || true)"
 grep -q 'NEEDS_CLASSIFICATION' <<<"$untyped_out"
-! grep -q '^OK ' <<<"$untyped_out"
+grep -q '^OK ' <<<"$untyped_out" && { echo 'untyped spawn unexpectedly succeeded' >&2; exit 1; }
 expect_exit 2 spawn_untyped
 [[ ! -e "$TMP/herdr.log" ]]                      # nothing spawned
 [[ ! -e "$TMP/scopefuel.log" ]]                  # gate not even consulted
@@ -747,7 +749,7 @@ grep -q '^OK ' <<<"$off_out"
 git -C "$CG_REPO" switch -q master
 : >"$TMP/herdr.log"
 on_out="$(canon_guard_spawn "$CG_REPO" 2>&1)"
-! grep -q 'canonical checkout is not on default branch' <<<"$on_out"
+grep -q 'canonical checkout is not on default branch' <<<"$on_out" && { echo 'default canonical checkout warned' >&2; exit 1; }
 grep -q '^OK ' <<<"$on_out"
 # 3) linked worktree off default at worktree path → silent (path is not canonical)
 CG_WT="$TMP/canon-guard-wt"
@@ -755,21 +757,21 @@ rm -rf "$CG_WT"
 git -C "$CG_REPO" worktree add -q -b feature/wt-branch "$CG_WT"
 : >"$TMP/herdr.log"
 wt_out="$(canon_guard_spawn "$CG_WT" 2>&1)"
-! grep -q 'canonical checkout is not on default branch' <<<"$wt_out"
+grep -q 'canonical checkout is not on default branch' <<<"$wt_out" && { echo 'linked worktree warned as canonical' >&2; exit 1; }
 grep -q '^OK ' <<<"$wt_out"
 # 4) origin/HEAD missing → quiet skip even if off default (no false positive)
 git -C "$CG_REPO" switch -q -c feature/no-origin-head
 git -C "$CG_REPO" remote remove origin
 : >"$TMP/herdr.log"
 skip_out="$(canon_guard_spawn "$CG_REPO" 2>&1)"
-! grep -q 'canonical checkout is not on default branch' <<<"$skip_out"
+grep -q 'canonical checkout is not on default branch' <<<"$skip_out" && { echo 'missing origin/HEAD warned' >&2; exit 1; }
 grep -q '^OK ' <<<"$skip_out"
 # Guard must not hard-code main: the warn path used default=master above.
-! grep -q "default=main" <<<"$off_out"
+grep -q "default=main" <<<"$off_out" && { echo 'canonical guard hard-coded main' >&2; exit 1; }
 git -C "$CG_REPO" worktree remove -f "$CG_WT" 2>/dev/null || rm -rf "$CG_WT"
 echo "PASS canonical-checkout-guard"
 
-grep -q 'for tool in "$REPO_DIR"/bin/\*' "$ROOT/install.sh"
+grep -Fq "for tool in \"\$REPO_DIR\"/bin/*" "$ROOT/install.sh"
 
 # ROB-1190 ④-3: scopefuel 이 추천하는 모든 프로필 ⊆ wrk 가 띄울 수 있는 프로필.
 # WRK_TEST_SCOPEFUEL_SRC 로 scopefuel worktree 경로를 주면 uv run 으로 실제 GRADE_TABLE 을
