@@ -562,6 +562,8 @@ def cmd_claim(args: argparse.Namespace) -> dict:
                 {
                     "owner_lane": args.lane,
                     "t_level": args.t,
+                    "role": args.role,
+                    "parent_lane": args.parent_lane,
                     "previous_created_at": row[3],
                     "previous_owner_lane": row[0],
                     "agent_label": args.agent_label or args.job,
@@ -580,6 +582,8 @@ def cmd_claim(args: argparse.Namespace) -> dict:
                 {
                     "owner_lane": args.lane,
                     "t_level": args.t,
+                    "role": args.role,
+                    "parent_lane": args.parent_lane,
                     # Herdr does not expose ARBITER_JOB. Persist the exact
                     # agent identity in the existing claim event instead of
                     # adding a schema column or guessing from a prefix.
@@ -597,6 +601,8 @@ def cmd_claim(args: argparse.Namespace) -> dict:
         "t_level": args.t,
         "state": "claimed",
         "agent_label": args.agent_label or args.job,
+        "role": args.role,
+        "parent_lane": args.parent_lane,
         "created_at": claimed_at,
         "updated_at": iso(moment),
         "event_seq": seq,
@@ -1388,6 +1394,11 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("--lane", required=True, help="owner lane")
     claim.add_argument("--t", required=True, choices=T_LEVELS, help="규모 등급")
     claim.add_argument(
+        "--role", choices=("worker", "captain"), default="worker",
+        help="job 역할(기본 worker); captain 은 parent lane 을 반드시 기록한다",
+    )
+    claim.add_argument("--parent-lane", help="captain 의 상위 레인")
+    claim.add_argument(
         "--reclaim-released",
         action="store_true",
         help="기존 released job만 원자적으로 claimed 로 재전이한다(활성 job은 여전히 중복 거부)",
@@ -1476,6 +1487,11 @@ def main(argv: list[str]) -> int:
     args = parser.parse_args(argv)
     as_json = bool(getattr(args, "json", False))
     try:
+        if args.command == "claim":
+            if args.role == "captain" and not args.parent_lane:
+                raise ArbiterError(EXIT_USAGE, "captain claim 은 --parent-lane 이 필요하다")
+            if args.role != "captain" and args.parent_lane is not None:
+                raise ArbiterError(EXIT_USAGE, "--parent-lane 은 --role captain 에서만 쓴다")
         if getattr(args, "ttl_min", None) is not None and args.ttl_min < 0:
             raise ArbiterError(EXIT_USAGE, "--ttl-min 은 0 이상이어야 한다")
         result = HANDLERS[args.command](args)

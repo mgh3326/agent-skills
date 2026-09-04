@@ -79,6 +79,8 @@ grep -qx 'kimi-k3' <<<"$profiles_out"
 grep -qx 'kimi-k27' <<<"$profiles_out"
 grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
+grep -qx 'captain-opus' <<<"$profiles_out"
+grep -qx 'captain-sol' <<<"$profiles_out"
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -660,6 +662,56 @@ arb status --job arb-record-fail --json |
   python3 -c 'import json,sys; assert json.load(sys.stdin)["quota_pool_records"] == [], sys.stdin'
 unset TEST_ARBITER_BIN
 
+# Captain contract: the real arbiter claim artifact remains an envelope while
+# wrk's upward-facing events stay flat. The parent lane, never the captain
+# lane, is the panewire target for escalation and JOIN.
+export TEST_ARBITER_BIN="$ARBITER"
+CAPTAIN_REPORT="$TMP/captain-report.md"
+printf 'captain report terminal line\n' >"$CAPTAIN_REPORT"
+: >"$TMP/herdr.log"
+captain_opus_out="$(spawn_base captain-opus --role captain --lane captain-lane --parent parent-lane --job captain-opus-job --t T1 2>&1)"
+grep -q 'model=captain-opus' <<<"$captain_opus_out"
+grep -q -- '--model opus' "$TMP/herdr.log"
+grep -q -- '--effort high' "$TMP/herdr.log"
+python3 - "$ARBITER_INBOX_ROOT/captain-opus-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
+assert event["kind"] == "job.claim", event
+assert event["payload"] == {
+    "agent_label": "fixture", "owner_lane": "captain-lane", "parent_lane": "parent-lane",
+    "role": "captain", "t_level": "T1",
+}, event
+PY
+env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
+  "$WRK" escalate captain-opus-job --question 'need parent decision' >/dev/null
+env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
+  "$WRK" joined captain-opus-job --pr https://example.invalid/pr/1 --head deadbeef --report "$CAPTAIN_REPORT" >/dev/null
+python3 - "$ARBITER_INBOX_ROOT/captain-opus-job/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+escalate = next(e for e in events if e["kind"] == "job.escalate")
+joined = next(e for e in events if e["kind"] == "job.joined")
+assert escalate["owner_lane"] == joined["owner_lane"] == "parent-lane", events
+assert escalate["reason"] == "captain escalation" and escalate["question"] == "need parent decision", escalate
+assert joined["reason"] == "captain joined PR" and joined["pr"].endswith("/1") and joined["head"] == "deadbeef", joined
+assert "payload" not in escalate and "payload" not in joined, events
+PY
+: >"$TMP/herdr.log"
+captain_sol_out="$(spawn_base captain-sol --role captain --lane captain-sol-lane --parent parent-lane --job captain-sol-job --t T1 2>&1)"
+grep -q 'model=captain-sol' <<<"$captain_sol_out"
+grep -q -- '-m gpt-5.6-sol' "$TMP/herdr.log"
+
+# Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
+# must all stop before gate/claim/tab creation.
+expect_exit 2 spawn_base codex-terra --role captain --lane captain-lane --parent parent-lane --job captain-terra-mutant
+expect_exit 2 spawn_base codex-luna --role captain --lane captain-lane --parent parent-lane --job captain-luna-mutant
+expect_exit 2 spawn_base captain-opus --role captain --lane captain-lane --job captain-parent-mutant
+expect_exit 2 spawn_base captain-opus --role captain --lane captain-lane --parent parent-lane --effort max --job captain-effort-mutant
+if grep -q 'captain-.*-mutant' "$ARBITER_INBOX_ROOT"/*/events/* 2>/dev/null; then exit 1; fi
+unset TEST_ARBITER_BIN
+echo "PASS captain profiles, parent claim, flat escalation/JOIN, and fail-closed mutants"
+
 # ⑤ a broken state db is a quota-record failure: warn and still spawn.
 rm -f "$TMP/herdr.log"
 export TEST_ARBITER_BIN="$ARBITER"
@@ -781,27 +833,27 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
 sentinel_working_rc=$?
 set -e
 [[ "$sentinel_working_rc" -eq 0 ]]
-if find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.completed.json' | grep -q .; then
+if find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.completed.json' | grep -q .; then
   echo "working agent incorrectly emitted job.completed" >&2
   exit 1
 fi
-find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.lost.json' | grep -q .
+find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.lost.json' | grep -q .
 echo "PASS r18-sentinel-requires-terminal-status"
 
 # Automatic discovery must work on macOS too, and the observation key must be
 # stable for an unchanged report but advance when that same report is updated.
 SENTINEL_INBOX="$TMP/sentinel-dedupe-inbox"
-mkdir -p "$SENTINEL_INBOX/jobs/sentinel-idle"
-cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/jobs/sentinel-idle/report.md"
+mkdir -p "$SENTINEL_INBOX/sentinel-idle"
+cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/sentinel-idle/report.md"
 env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
-printf 'updated report line\n' >>"$SENTINEL_INBOX/jobs/sentinel-idle/report.md"
+[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+printf 'updated report line\n' >>"$SENTINEL_INBOX/sentinel-idle/report.md"
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 2 ]]
+[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 2 ]]
 kill "$sentinel_idle_pid" 2>/dev/null || true
 wait "$sentinel_idle_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-portable-discovery-and-dedupe"
@@ -814,7 +866,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   "$WRK" sentinel sentinel-done lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
 sentinel_done_pid=$!
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-done/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+[[ "$(find "$SENTINEL_INBOX/sentinel-done/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
 kill "$sentinel_done_pid" 2>/dev/null || true
 wait "$sentinel_done_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-accepts-done-status"

@@ -35,6 +35,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `orchestrate` | 완성된 설계·운영자 결정을 받아 워커 스폰~완료 검증까지 전체 루프 구동 — spawn-worker 위층 진입점 |
 | `relay-handoff` | 세션 간 작업·분석·지시 전달 — 핸드오프 5요소 템플릿 + herdr 주입·제출검증 |
 | `spawn-worker` | 워커/검증자 스폰 전 과정 — worktree 준비, 쿼타 확인·계열 라우팅, 티어맵, 브리프, 적대검증 루프, ls-remote 대조 |
+| `captain` | PR 한 건의 워커 브리프→검증→fix→JOIN 루프 소유 — 상위 레인 에스컬레이션과 parent-pane 이벤트 계약 포함 |
 | `ask-session` | 상존 세션에 질문 보내고 답변 회수(왕복) — 답변 파일 계약 + 타임아웃·무응답 처리 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
 
@@ -80,6 +81,9 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 ```text
 wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
           [-L live|mock] [--effort LEVEL] [--job ID]
+wrk spawn --role captain --lane CAPTAIN_LANE --parent PARENT_LANE ... -m captain-opus|captain-sol
+wrk escalate JOB --question TEXT
+wrk joined JOB --pr URL --head SHA --report PATH
 wrk find <이름|라벨> [--pane-only]
 wrk name-sync [--apply|<라벨>...]
 ```
@@ -92,6 +96,11 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 `--t`는 **필수**다(ROB-1198 §③). 빠지면 게이트·claim·스폰 어느 것도 하지 않고
 `NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
 사실로 기록되기 때문이다. `--job`은 생략하면 `-l LABEL`을 쓴다.
+
+캡틴은 `captain-opus`(Opus effort high) 또는 `captain-sol`만 쓴다. 캡틴 spawn의 `--lane`은
+arbiter claim의 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와
+`wrk joined`는 완료 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 그 parent 레인으로
+설정한다. panewire R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
 
 ## 도메인 경계 (ROB-1199 — 위반 금지)
 
