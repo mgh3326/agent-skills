@@ -769,6 +769,35 @@ grep -q '^OK ' <<<"$skip_out"
 git -C "$CG_REPO" worktree remove -f "$CG_WT" 2>/dev/null || rm -rf "$CG_WT"
 echo "PASS canonical-checkout-guard"
 
+# R18 completion sentinel: a report alone is never completion evidence. A
+# worker still working must time out/lost rather than emit job.completed.
+SENTINEL_REPORT="$TMP/sentinel-report.md"
+printf 'sentinel final line\n' >"$SENTINEL_REPORT"
+SENTINEL_INBOX="$TMP/sentinel-inbox"
+set +e
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+  WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
+  "$WRK" sentinel sentinel-working lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1
+sentinel_working_rc=$?
+set -e
+[[ "$sentinel_working_rc" -eq 0 ]]
+! find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.completed.json' | grep -q .
+find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.lost.json' | grep -q .
+echo "PASS r18-sentinel-requires-terminal-status"
+
+# The same report observation is idempotent. Keep the fixture alive across
+# multiple polls and assert one, not one-per-poll, completion event.
+SENTINEL_INBOX="$TMP/sentinel-dedupe-inbox"
+set +e
+timeout 3s env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+  WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
+  "$WRK" sentinel sentinel-idle lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1
+sentinel_idle_rc=$?
+set -e
+[[ "$sentinel_idle_rc" -eq 124 ]]
+[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+echo "PASS r18-sentinel-dedupes-report-observation"
+
 grep -q 'for tool in "$REPO_DIR"/bin/\*' "$ROOT/install.sh"
 
 # ROB-1190 ④-3: scopefuel 이 추천하는 모든 프로필 ⊆ wrk 가 띄울 수 있는 프로필.
