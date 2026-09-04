@@ -71,6 +71,7 @@ case "${1:-}" in
         case "$scenario" in
           sentinel-working) printf '%s\n' '{"result":{"agent_status":"working"}}' ;;
           sentinel-idle) printf '%s\n' '{"result":{"agent_status":"idle"}}' ;;
+          sentinel-done) printf '%s\n' '{"result":{"agent_status":"done"}}' ;;
           *) printf '%s\n' '{"result":{"agent_status":"working"}}' ;;
         esac
         ;;

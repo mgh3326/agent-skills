@@ -79,8 +79,8 @@ grep -qx 'kimi-k3' <<<"$profiles_out"
 grep -qx 'kimi-k27' <<<"$profiles_out"
 grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
-! grep -qx 'codex-ultra' <<<"$profiles_out"
-! grep -qx 'codex-luna-ultra' <<<"$profiles_out"
+if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
+if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
 name_out="$(WRK_FIXTURE_SCENARIO=find-name HERDR_BIN="$HERDR" "$WRK" find orch)"
 grep -q 'pane_id=w:p1' <<<"$name_out"
@@ -93,7 +93,7 @@ run_fail env WRK_FIXTURE_SCENARIO=find-multi HERDR_BIN="$HERDR" "$WRK" find targ
 run_fail env WRK_FIXTURE_SCENARIO=find-multi HERDR_BIN="$HERDR" "$WRK" find target --pane-only
 priority_out="$(WRK_FIXTURE_SCENARIO=name-priority HERDR_BIN="$HERDR" "$WRK" find target)"
 grep -q 'pane_id=w:p1' <<<"$priority_out"
-! grep -q 'pane_id=w:p2' <<<"$priority_out"
+if grep -q 'pane_id=w:p2' <<<"$priority_out"; then exit 1; fi
 
 mkdir -p "$TMP/home-old/.local/bin"
 ln -s "$HERDR" "$TMP/home-old/.local/bin/herdr"
@@ -225,10 +225,10 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3-low -p "$PROMPT" -w w -l fixture --effort high
 : >"$TMP/herdr.log"
 spawn_base kimi-k3 >/dev/null
-! grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"
+if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
 : >"$TMP/herdr.log"
 spawn_base kimi-k27 >/dev/null
-! grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"
+if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
 
 # ROB-1191 ⑥: Claude opus/sonnet effort wiring via CLI argv (settings.json never written).
 SETTINGS_PATH="${HOME}/.claude/settings.json"
@@ -682,9 +682,9 @@ spawn_untyped() {
 }
 rm -f "$TMP/herdr.log" "$TMP/scopefuel.log"
 export TEST_ARBITER_BIN="$ARBITER"
-untyped_out="$(spawn_untyped 2>&1 || true)"
+untyped_out="$(spawn_untyped "$@" 2>&1 || true)"
 grep -q 'NEEDS_CLASSIFICATION' <<<"$untyped_out"
-! grep -q '^OK ' <<<"$untyped_out"
+if grep -q '^OK ' <<<"$untyped_out"; then exit 1; fi
 expect_exit 2 spawn_untyped
 [[ ! -e "$TMP/herdr.log" ]]                      # nothing spawned
 [[ ! -e "$TMP/scopefuel.log" ]]                  # gate not even consulted
@@ -747,7 +747,7 @@ grep -q '^OK ' <<<"$off_out"
 git -C "$CG_REPO" switch -q master
 : >"$TMP/herdr.log"
 on_out="$(canon_guard_spawn "$CG_REPO" 2>&1)"
-! grep -q 'canonical checkout is not on default branch' <<<"$on_out"
+if grep -q 'canonical checkout is not on default branch' <<<"$on_out"; then exit 1; fi
 grep -q '^OK ' <<<"$on_out"
 # 3) linked worktree off default at worktree path → silent (path is not canonical)
 CG_WT="$TMP/canon-guard-wt"
@@ -755,17 +755,17 @@ rm -rf "$CG_WT"
 git -C "$CG_REPO" worktree add -q -b feature/wt-branch "$CG_WT"
 : >"$TMP/herdr.log"
 wt_out="$(canon_guard_spawn "$CG_WT" 2>&1)"
-! grep -q 'canonical checkout is not on default branch' <<<"$wt_out"
+if grep -q 'canonical checkout is not on default branch' <<<"$wt_out"; then exit 1; fi
 grep -q '^OK ' <<<"$wt_out"
 # 4) origin/HEAD missing → quiet skip even if off default (no false positive)
 git -C "$CG_REPO" switch -q -c feature/no-origin-head
 git -C "$CG_REPO" remote remove origin
 : >"$TMP/herdr.log"
 skip_out="$(canon_guard_spawn "$CG_REPO" 2>&1)"
-! grep -q 'canonical checkout is not on default branch' <<<"$skip_out"
+if grep -q 'canonical checkout is not on default branch' <<<"$skip_out"; then exit 1; fi
 grep -q '^OK ' <<<"$skip_out"
 # Guard must not hard-code main: the warn path used default=master above.
-! grep -q "default=main" <<<"$off_out"
+if grep -q "default=main" <<<"$off_out"; then exit 1; fi
 git -C "$CG_REPO" worktree remove -f "$CG_WT" 2>/dev/null || rm -rf "$CG_WT"
 echo "PASS canonical-checkout-guard"
 
@@ -781,24 +781,45 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
 sentinel_working_rc=$?
 set -e
 [[ "$sentinel_working_rc" -eq 0 ]]
-! find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.completed.json' | grep -q .
+if find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.completed.json' | grep -q .; then
+  echo "working agent incorrectly emitted job.completed" >&2
+  exit 1
+fi
 find "$SENTINEL_INBOX/jobs/sentinel-working/events" -name '*job.lost.json' | grep -q .
 echo "PASS r18-sentinel-requires-terminal-status"
 
-# The same report observation is idempotent. Keep the fixture alive across
-# multiple polls and assert one, not one-per-poll, completion event.
+# Automatic discovery must work on macOS too, and the observation key must be
+# stable for an unchanged report but advance when that same report is updated.
 SENTINEL_INBOX="$TMP/sentinel-dedupe-inbox"
-set +e
-timeout 3s env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+mkdir -p "$SENTINEL_INBOX/jobs/sentinel-idle"
+cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/jobs/sentinel-idle/report.md"
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
-  "$WRK" sentinel sentinel-idle lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1
-sentinel_idle_rc=$?
-set -e
-[[ "$sentinel_idle_rc" -eq 124 ]]
+  "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
+sentinel_idle_pid=$!
+sleep 2
 [[ "$(find "$SENTINEL_INBOX/jobs/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
-echo "PASS r18-sentinel-dedupes-report-observation"
+printf 'updated report line\n' >>"$SENTINEL_INBOX/jobs/sentinel-idle/report.md"
+sleep 2
+[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 2 ]]
+kill "$sentinel_idle_pid" 2>/dev/null || true
+wait "$sentinel_idle_pid" 2>/dev/null || true
+echo "PASS r18-sentinel-portable-discovery-and-dedupe"
 
-grep -q 'for tool in "$REPO_DIR"/bin/\*' "$ROOT/install.sh"
+# Both terminal statuses are accepted; `done` is tested separately so this is
+# an explicit status-set contract rather than an idle-only implementation.
+SENTINEL_INBOX="$TMP/sentinel-done-inbox"
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+  WRK_FIXTURE_SCENARIO=sentinel-done WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
+  "$WRK" sentinel sentinel-done lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
+sentinel_done_pid=$!
+sleep 2
+[[ "$(find "$SENTINEL_INBOX/jobs/sentinel-done/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+kill "$sentinel_done_pid" 2>/dev/null || true
+wait "$sentinel_done_pid" 2>/dev/null || true
+echo "PASS r18-sentinel-accepts-done-status"
+
+grep -q "for tool in \"\$REPO_DIR\"/bin/\\*" "$ROOT/install.sh"
 
 # ROB-1190 ④-3: scopefuel 이 추천하는 모든 프로필 ⊆ wrk 가 띄울 수 있는 프로필.
 # WRK_TEST_SCOPEFUEL_SRC 로 scopefuel worktree 경로를 주면 uv run 으로 실제 GRADE_TABLE 을

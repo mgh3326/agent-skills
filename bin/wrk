@@ -222,7 +222,7 @@ landing_check_once() {
   if ! recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown
-    LANDING_CHECK_LAST_REASON=recent-unwrapped-read-failed
+    LANDING_CHECK_LAST_REASON="recent-unwrapped-read-failed"
     return 1
   fi
 
@@ -231,22 +231,20 @@ landing_check_once() {
   # away. `working` below is deliberately not evidence: a cold codex boot
   # reports working before the composer has received the payload.
   if [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$recent"; then
-    LANDING_SIGNAL=marker
     LANDING_CHECK_LAST_EVIDENCE=marker
-    LANDING_CHECK_LAST_REASON=marker-in-recent-unwrapped
+    LANDING_CHECK_LAST_REASON="marker-in-recent-unwrapped"
     return 0
   fi
   if ! visible="$("$HERDR" agent read "$pane" --source visible --lines 40 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown
-    LANDING_CHECK_LAST_REASON=visible-read-failed
+    LANDING_CHECK_LAST_REASON="visible-read-failed"
     return 1
   fi
 
   # The UI chip is an independent positive observation that the payload is
   # queued; keep it as the fallback for prompts whose transcript is delayed.
   if grep -Fq -- "Pasted text" <<<"$visible"; then
-    LANDING_SIGNAL=pasted
     LANDING_CHECK_LAST_EVIDENCE=pasted
     LANDING_CHECK_LAST_REASON=pasted-text-chip
     return 0
@@ -254,7 +252,7 @@ landing_check_once() {
   if ! status="$(agent_status_for_pane "$pane")"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown
-    LANDING_CHECK_LAST_REASON=status-read-failed
+    LANDING_CHECK_LAST_REASON="status-read-failed"
     return 1
   fi
   LANDING_CHECK_LAST_STATUS="$status"
@@ -274,7 +272,6 @@ landing_check() {
   LANDING_CHECK_LAST_EVIDENCE=none
   LANDING_CHECK_LAST_STATUS=unknown
   LANDING_CHECK_LAST_REASON=not-observed
-  LANDING_SIGNAL=none
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
     if landing_check_once "$pane" "$marker"; then return 0; fi
@@ -1002,6 +999,38 @@ else: raise SystemExit(1)
 PY
 }
 
+# Python is already a hard dependency for durable event creation above. Use it
+# for report discovery and identity so this works on both GNU and BSD userlands
+# (find -printf and stat -c are GNU-only). The identity includes nanosecond
+# mtime and size, so an updated report at the same path is a new observation.
+find_latest_report() {
+  local directory="$1"
+  python3 - "$directory" <<'PY'
+import glob, os, sys
+paths = []
+try:
+    for path in glob.glob(os.path.join(sys.argv[1], "report*.md")):
+        if os.path.isfile(path):
+            paths.append(path)
+except OSError:
+    pass
+if paths:
+    print(max(paths, key=os.path.getmtime))
+PY
+}
+
+report_observation_key() {
+  local report="$1"
+  python3 - "$report" <<'PY'
+import os, sys
+try:
+    info = os.stat(sys.argv[1])
+except OSError:
+    raise SystemExit(1)
+print(f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}")
+PY
+}
+
 done_cmd() {
   local job="${1:-}" report=""
   [[ -n "$job" && "$job" != -* ]] || die "done requires a job id"
@@ -1016,7 +1045,9 @@ done_cmd() {
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
   IFS=$'\t' read -r owner label pane <<<"$metadata"
   inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
-  if [[ -z "$report" ]]; then report="$(find "$inbox/jobs/$job" -maxdepth 1 -type f -name 'report*.md' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"; fi
+  if [[ -z "$report" ]]; then
+    report="$(find_latest_report "$inbox/jobs/$job")"
+  fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
   completion_event "$job" "$owner" "$label" "$pane" "$report"
   echo "OK job=$job report=$report"
@@ -1025,7 +1056,9 @@ done_cmd() {
 sentinel_cmd() {
   local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}" timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
   [[ -n "$job" && -n "$owner" && -n "$label" && -n "$pane" ]] || exit 2
-  local started="$(date +%s)" seen=""
+  local started seen
+  started="$(date +%s)"
+  seen=""
   while :; do
     local now status candidate key
     now="$(date +%s)"
@@ -1041,10 +1074,10 @@ sentinel_cmd() {
     candidate="$report"
     if [[ -z "$candidate" || ! -f "$candidate" ]]; then
       local inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
-      candidate="$(find "$inbox/jobs/$job" -maxdepth 1 -type f -name 'report*.md' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+      candidate="$(find_latest_report "$inbox/jobs/$job")"
     fi
-    key="$candidate:$(stat -c %Y "$candidate" 2>/dev/null || true)"
-    if [[ ( "$status" == done || "$status" == idle ) && -f "$candidate" && "$key" != "$seen" ]]; then
+    key="$(report_observation_key "$candidate" 2>/dev/null || true)"
+    if [[ ( "$status" == "done" || "$status" == "idle" ) && -f "$candidate" && -n "$key" && "$key" != "$seen" ]]; then
       completion_event "$job" "$owner" "$label" "$pane" "$candidate"
       seen="$key"
       [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
@@ -1056,6 +1089,14 @@ sentinel_cmd() {
 start_completion_sentinel() {
   local pidfile="$1"; shift
   mkdir -p "$(dirname "$pidfile")"
+  local existing=""
+  if [[ -s "$pidfile" ]]; then
+    read -r existing <"$pidfile" || existing=""
+    if [[ "$existing" =~ ^[0-9]+$ ]] && kill -0 "$existing" 2>/dev/null; then
+      return 0
+    fi
+  fi
+  rm -f "$pidfile"
   ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
 }
 
@@ -1063,7 +1104,7 @@ spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
-  ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
+  ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
@@ -1184,7 +1225,7 @@ spawn_cmd() {
     "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
   else
     if ! "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
-      --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
+      --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
       # The payload was already submitted. A return may settle a still-open
       # composer, but the payload must never be sent again after an ambiguous
       # wait result. A later screen/status observation is different: only a
@@ -1210,7 +1251,7 @@ spawn_cmd() {
         sleep_for 2
         "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
       elif "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
-        --until working --until idle --until done --until blocked --timeout 40000 >/dev/null 2>&1; then
+        --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
         :
       else
         # The retry itself is also at most once; do not turn its ambiguous wait

@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  shell-and-bash-tests:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install ShellCheck
+        shell: bash
+        run: |
+          if command -v shellcheck >/dev/null 2>&1; then exit 0; fi
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y shellcheck
+          else
+            brew install shellcheck
+          fi
+      - name: ShellCheck
+        run: shellcheck bin/wrk tests/fixtures/herdr tests/test-wrk.sh
+      - name: Bash tests
+        run: |
+          bash tests/test-wrk.sh
+          bash tests/test-arbiter.sh
+          bash tests/test-acp-runner-process-group.sh
