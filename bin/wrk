@@ -956,8 +956,9 @@ resolve_profile() {
 
 completion_event() {
   local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}"
-  local inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
-  local events="$inbox/jobs/$job/events" host="${HOSTNAME:-unknown}" last
+  local events host last
+  events="$(wrk_jobs_root)/$job/events"
+  host="${HOSTNAME:-unknown}"
   mkdir -p "$events"
   last="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240)"
   python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" <<'PY'
@@ -980,9 +981,15 @@ finally:
 PY
 }
 
+# Keep this exactly aligned with arbiter.inbox_root(): ARBITER_INBOX_ROOT is
+# the jobs directory, rather than its parent.
+wrk_jobs_root() {
+  printf '%s\n' "${ARBITER_INBOX_ROOT:-$HOME/work/herdr-inbox/jobs}"
+}
+
 completion_metadata() {
-  local job="$1" inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
-  python3 - "$inbox/jobs/$job/events" <<'PY'
+  local job="$1"
+  python3 - "$(wrk_jobs_root)/$job/events" <<'PY'
 import json, os, sys
 owner=label=pane=''
 try: names=sorted(os.listdir(sys.argv[1]))
@@ -1041,12 +1048,12 @@ done_cmd() {
       *) die "unknown done option '$1'" ;;
     esac
   done
-  local metadata owner label pane inbox
+  local metadata owner label pane jobs_root
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
   IFS=$'\t' read -r owner label pane <<<"$metadata"
-  inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
+  jobs_root="$(wrk_jobs_root)"
   if [[ -z "$report" ]]; then
-    report="$(find_latest_report "$inbox/jobs/$job")"
+    report="$(find_latest_report "$jobs_root/$job")"
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
   completion_event "$job" "$owner" "$label" "$pane" "$report"
@@ -1073,8 +1080,7 @@ sentinel_cmd() {
     fi
     candidate="$report"
     if [[ -z "$candidate" || ! -f "$candidate" ]]; then
-      local inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
-      candidate="$(find_latest_report "$inbox/jobs/$job")"
+      candidate="$(find_latest_report "$(wrk_jobs_root)/$job")"
     fi
     key="$(report_observation_key "$candidate" 2>/dev/null || true)"
     if [[ ( "$status" == "done" || "$status" == "idle" ) && -f "$candidate" && -n "$key" && "$key" != "$seen" ]]; then
@@ -1282,7 +1288,7 @@ spawn_cmd() {
   # A sentinel requires the durable claim/spawn metadata it later reads. During
   # an installation transition the old fail-open spawn contract remains intact.
   if [[ "$ARBITER_JOB_REGISTERED" -eq 1 ]]; then
-    start_completion_sentinel "${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}/jobs/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
+    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
   fi
   SPAWN_PANE_OPEN=0
   refresh_quota_pool
