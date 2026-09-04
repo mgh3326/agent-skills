@@ -79,6 +79,8 @@ grep -qx 'kimi-k3' <<<"$profiles_out"
 grep -qx 'kimi-k27' <<<"$profiles_out"
 grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
+grep -qx 'captain-opus' <<<"$profiles_out"
+grep -qx 'captain-sol' <<<"$profiles_out"
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -659,6 +661,98 @@ grep -q 'model=codex-terra' <<<"$record_failed_out"
 arb status --job arb-record-fail --json |
   python3 -c 'import json,sys; assert json.load(sys.stdin)["quota_pool_records"] == [], sys.stdin'
 unset TEST_ARBITER_BIN
+
+# Captain contract: the real arbiter claim artifact remains an envelope while
+# wrk's upward-facing events stay flat. owner_lane is always the captain's own
+# lane; parent_lane is recorded as information, while panewire resolves parent
+# routing from lanes.json.
+export TEST_ARBITER_BIN="$ARBITER"
+CAPTAIN_REPORT="$TMP/captain-report.md"
+printf 'captain report terminal line\n' >"$CAPTAIN_REPORT"
+: >"$TMP/herdr.log"
+captain_opus_out="$(spawn_base captain-opus --role captain --lane captain-lane --parent parent-lane --job captain-opus-job --t T1 2>&1)"
+grep -q 'model=captain-opus' <<<"$captain_opus_out"
+grep -q -- '--model opus' "$TMP/herdr.log"
+grep -q -- '--effort high' "$TMP/herdr.log"
+python3 - "$ARBITER_INBOX_ROOT/captain-opus-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
+assert event["kind"] == "job.claim", event
+assert event["payload"] == {
+    "agent_label": "fixture", "owner_lane": "captain-lane", "parent_lane": "parent-lane",
+    "role": "captain", "t_level": "T1",
+}, event
+PY
+env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
+  "$WRK" escalate captain-opus-job --question 'need parent decision' >/dev/null
+env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
+  "$WRK" joined captain-opus-job --pr https://example.invalid/pr/1 --head deadbeef --report "$CAPTAIN_REPORT" >/dev/null
+python3 - "$ARBITER_INBOX_ROOT/captain-opus-job/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+escalate = next(e for e in events if e["kind"] == "job.escalate")
+joined = next(e for e in events if e["kind"] == "job.joined")
+assert escalate["owner_lane"] == joined["owner_lane"] == "captain-lane", events
+assert escalate["parent_lane"] == joined["parent_lane"] == "parent-lane", events
+assert escalate["reason"] == "captain escalation" and escalate["question"] == "need parent decision", escalate
+assert joined["reason"] == "captain joined PR" and joined["pr"].endswith("/1") and joined["head"] == "deadbeef", joined
+for event in (escalate, joined):
+    assert {"pane_id", "report_path", "report_last_line"} <= set(event), event
+assert "payload" not in escalate and "payload" not in joined, events
+PY
+
+# Reclaim must replace completion metadata, not retain the first claim. First
+# reclaim a worker as a captain, then reclaim again under a different parent.
+arb claim --job captain-reclaim-job --lane worker-lane --agent-label worker-label --t T1 >/dev/null
+arb lease --job captain-reclaim-job --resource captain-reclaim-resource --kind path >/dev/null
+arb release --job captain-reclaim-job --resource captain-reclaim-resource --kind path --force >/dev/null
+arb claim --job captain-reclaim-job --lane captain-old-lane --agent-label captain-old-label --t T1 \
+  --role captain --parent-lane parent-old --reclaim-released >/dev/null
+arb event --job captain-reclaim-job --kind job.spawned \
+  --payload-json '{"owner_lane":"captain-old-lane","label":"captain-old-label","pane_id":"w1:p1"}' >/dev/null
+env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
+  "$WRK" escalate captain-reclaim-job --question 'first reclaim is captain' >/dev/null
+arb lease --job captain-reclaim-job --resource captain-reclaim-resource-2 --kind path >/dev/null
+arb release --job captain-reclaim-job --resource captain-reclaim-resource-2 --kind path --force >/dev/null
+arb claim --job captain-reclaim-job --lane captain-new-lane --agent-label captain-new-label --t T1 \
+  --role captain --parent-lane parent-new --reclaim-released >/dev/null
+env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
+  "$WRK" joined captain-reclaim-job --pr https://example.invalid/pr/2 --head feedface --report "$CAPTAIN_REPORT" >/dev/null
+python3 - "$ARBITER_INBOX_ROOT/captain-reclaim-job/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+escalate = next(e for e in events if e["kind"] == "job.escalate")
+joined = next(e for e in events if e["kind"] == "job.joined")
+assert escalate["owner_lane"] == "captain-old-lane", escalate
+assert joined["owner_lane"] == "captain-new-lane", joined
+assert joined["parent_lane"] == "parent-new", joined
+PY
+: >"$TMP/herdr.log"
+captain_sol_out="$(spawn_base captain-sol --role captain --lane captain-sol-lane --parent parent-lane --job captain-sol-job --t T1 2>&1)"
+grep -q 'model=captain-sol' <<<"$captain_sol_out"
+grep -q -- '-m gpt-5.6-sol' "$TMP/herdr.log"
+
+# Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
+# must all stop before gate/claim/tab creation.
+expect_exit 2 spawn_base codex-terra --role captain --lane captain-lane --parent parent-lane --job captain-terra-mutant
+expect_exit 2 spawn_base codex-luna --role captain --lane captain-lane --parent parent-lane --job captain-luna-mutant
+expect_exit 2 spawn_base captain-opus --role captain --lane captain-lane --job captain-parent-mutant
+expect_exit 2 spawn_base captain-opus --role captain --lane captain-lane --parent parent-lane --effort max --job captain-effort-mutant
+if grep -q 'captain-.*-mutant' "$ARBITER_INBOX_ROOT"/*/events/* 2>/dev/null; then exit 1; fi
+
+# R19a fixtures must be the exact bytes emitted by the production arbiter and
+# wrk writers (claim -> spawned -> escalate -> joined), never hand-maintained
+# lookalikes.
+PANEVIRE_FIXTURE="$ROOT/tests/fixtures/panewire-r19a"
+PANEVIRE_OUTPUT="$TMP/panewire-r19a-output"
+"$PANEVIRE_FIXTURE/regen.sh" "$PANEVIRE_OUTPUT"
+for fixture in "$PANEVIRE_FIXTURE"/*.json; do
+  cmp "$fixture" "$PANEVIRE_OUTPUT/$(basename "$fixture")"
+done
+[[ "$(find "$PANEVIRE_OUTPUT" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" -eq 4 ]]
+unset TEST_ARBITER_BIN
+echo "PASS captain profiles, own-lane escalation/JOIN, reclaim metadata, fixture bytes, and fail-closed mutants"
 
 # ⑤ a broken state db is a quota-record failure: warn and still spawn.
 rm -f "$TMP/herdr.log"

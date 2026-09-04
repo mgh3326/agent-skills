@@ -70,6 +70,22 @@ pass "① duplicate claim rejected (exit 4); a different lane/t does not launder
 expect_rc 2 claim --job j2 --lane live --t T9
 pass "claim rejects a t level outside T0..T3"
 
+# Captain claims carry hierarchy only in the durable event envelope; no schema
+# column is invented and a missing parent is fail-closed.
+expect_rc 2 claim --job captain-no-parent --lane captain-lane --t T1 --role captain
+expect_rc 2 claim --job worker-parent --lane worker-lane --t T1 --parent-lane parent-lane
+expect_rc 0 claim --job captain-claim --lane captain-lane --t T1 --role captain --parent-lane parent-lane --agent-label captain
+python3 - "$ARBITER_INBOX_ROOT/captain-claim/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
+assert event["payload"] == {
+    "agent_label": "captain", "owner_lane": "captain-lane", "parent_lane": "parent-lane",
+    "role": "captain", "t_level": "T1",
+}, event
+PY
+pass "captain claim requires parent_lane and preserves role hierarchy in the envelope"
+
 # ------------------------------------------------------- ② concurrent contention
 "$ARBITER" claim --job race-a --lane live --t T2 >/dev/null
 "$ARBITER" claim --job race-b --lane live --t T2 >/dev/null

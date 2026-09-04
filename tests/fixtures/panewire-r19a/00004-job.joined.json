@@ -1,0 +1,1 @@
+{"kind":"job.joined","job_id":"captain-fixture","owner_lane":"lane-a","label":"captain-fixture","pane_id":"w1:p1","host":"fixture-host","report_path":"report.md","report_last_line":"fixture report terminal line ","reason":"captain joined PR","parent_lane":"parent-a","epoch":1,"pr":"https://example.invalid/pr/1","head":"deadbeef"}
