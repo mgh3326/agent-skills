@@ -72,10 +72,11 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|find|name-sync|profiles> [options]
+Usage: wrk <spawn|done|find|name-sync|profiles> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-            [-L live|mock] [--effort LEVEL] [--job ID] [--job-dup-ok] [--landing-strict]
+            [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
+  wrk done JOB [--report PATH]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -87,7 +88,7 @@ USAGE
 spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-                 [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--job-dup-ok]
+                 [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict]
 
 Options:
@@ -99,6 +100,7 @@ Options:
   --owner NAME       spawning session name, recorded as the arbiter owner_lane
                      (default: default). Lets that session later run
                      `arbiter status --lane NAME` to find and reclaim its workers.
+  --report PATH      report acceptance-criterion path watched by the completion sentinel
   --job-dup-ok       explicit operator override: permit an active duplicate job
                      after an auditable warning. Automation/panewire must not use it.
   --landing-strict   automation opt-in: preserve the OK line, then exit 76 if
@@ -955,20 +957,122 @@ resolve_profile() {
   esac
 }
 
+completion_event() {
+  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}"
+  local inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
+  local events="$inbox/jobs/$job/events" host="${HOSTNAME:-unknown}" last
+  mkdir -p "$events"
+  last="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240)"
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" <<'PY'
+import json, os, sys, tempfile, time
+events, job, owner, label, pane, host, report, last, kind = sys.argv[1:]
+highest = 0
+for name in os.listdir(events):
+    try: highest = max(highest, int(name.split('-', 1)[0]))
+    except (ValueError, IndexError): pass
+record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
+          "pane_id": pane, "host": host, "report_path": report,
+          "report_last_line": last, "epoch": 1}
+fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f: json.dump(record, f, separators=(',', ':'))
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PY
+}
+
+completion_metadata() {
+  local job="$1" inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
+  python3 - "$inbox/jobs/$job/events" <<'PY'
+import json, os, sys
+owner=label=pane=''
+try: names=sorted(os.listdir(sys.argv[1]))
+except OSError: raise SystemExit(1)
+for name in names:
+    try: o=json.load(open(os.path.join(sys.argv[1],name), encoding='utf-8'))
+    except (OSError,json.JSONDecodeError): continue
+    p=o.get('payload',o)
+    owner=owner or str(p.get('owner_lane',''))
+    label=label or str(p.get('label',p.get('agent_label','')))
+    pane=p.get('pane_id',pane)
+if owner and label and pane: print(owner, label, pane, sep='\t')
+else: raise SystemExit(1)
+PY
+}
+
+done_cmd() {
+  local job="${1:-}" report=""
+  [[ -n "$job" && "$job" != -* ]] || die "done requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --report) [[ $# -ge 2 && -n "$2" ]] || die "--report requires a path"; report="$2"; shift 2 ;;
+      *) die "unknown done option '$1'" ;;
+    esac
+  done
+  local metadata owner label pane inbox
+  metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
+  IFS=$'\t' read -r owner label pane <<<"$metadata"
+  inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
+  if [[ -z "$report" ]]; then report="$(find "$inbox/jobs/$job" -maxdepth 1 -type f -name 'report*.md' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"; fi
+  [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
+  completion_event "$job" "$owner" "$label" "$pane" "$report"
+  echo "OK job=$job report=$report"
+}
+
+sentinel_cmd() {
+  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}" timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
+  [[ -n "$job" && -n "$owner" && -n "$label" && -n "$pane" ]] || exit 2
+  local started="$(date +%s)" seen=""
+  while :; do
+    local now status candidate key
+    now="$(date +%s)"
+    if (( now - started >= timeout )); then
+      completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost
+      exit 0
+    fi
+    status="$($HERDR agent get "$pane" 2>/dev/null | python3 -c 'import json,sys; o=json.load(sys.stdin); print(o.get("result",o).get("agent_status", ""))' 2>/dev/null || true)"
+    if [[ -z "$status" ]]; then
+      completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost
+      exit 0
+    fi
+    candidate="$report"
+    if [[ -z "$candidate" || ! -f "$candidate" ]]; then
+      local inbox="${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}"
+      candidate="$(find "$inbox/jobs/$job" -maxdepth 1 -type f -name 'report*.md' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -1 | cut -d' ' -f2-)"
+    fi
+    key="$candidate:$(stat -c %Y "$candidate" 2>/dev/null || true)"
+    if [[ ( "$status" == done || "$status" == idle ) && -f "$candidate" && "$key" != "$seen" ]]; then
+      completion_event "$job" "$owner" "$label" "$pane" "$candidate"
+      seen="$key"
+      [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
+    fi
+    sleep "${WRK_COMPLETION_INTERVAL_S:-30}"
+  done
+}
+
+start_completion_sentinel() {
+  local pidfile="$1"; shift
+  mkdir -p "$(dirname "$pidfile")"
+  ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
+}
+
 spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
   ARBITER_HELD=0 ARBITER_TOKEN="" ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--report)
         [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
-          --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
+          --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;; --report) REPORT_PATH="$2" ;;
         esac
         shift 2 ;;
       --job-dup-ok) JOB_DUP_OK=1; shift ;;
@@ -1134,6 +1238,11 @@ spawn_cmd() {
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   arbiter_record_spawn_receipt
+  # A sentinel requires the durable claim/spawn metadata it later reads. During
+  # an installation transition the old fail-open spawn contract remains intact.
+  if [[ "$ARBITER_JOB_REGISTERED" -eq 1 ]]; then
+    start_completion_sentinel "${ARBITER_INBOX_ROOT:-${XDG_DATA_HOME:-$HOME/.local/share}/herdr-inbox}/jobs/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
+  fi
   SPAWN_PANE_OPEN=0
   refresh_quota_pool
   ARBITER_HELD=0
@@ -1292,6 +1401,8 @@ PY
 case "${1:-}" in
   -h|--help) usage ;;
   spawn) shift; spawn_cmd "$@" ;;
+  done) shift; done_cmd "$@" ;;
+  sentinel) shift; sentinel_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;
