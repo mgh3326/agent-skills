@@ -1847,11 +1847,11 @@ spawn_cmd() {
       fi
     else
       if [[ "$PROMPT_SUBMITTED" -ne 1 ]]; then
-        retry_skip_reason=prompt-submission-unconfirmed
+        retry_skip_reason='prompt-submission-unconfirmed'
       elif [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 ]]; then
-        retry_skip_reason=ambiguous-observation
+        retry_skip_reason='ambiguous-observation'
       else
-        retry_skip_reason=non-landing-not-confirmed
+        retry_skip_reason='non-landing-not-confirmed'
       fi
       LANDING_NO_DETAIL="phase=initial $landing_detail action=landed-no retry=skipped reason=$retry_skip_reason"
     fi
