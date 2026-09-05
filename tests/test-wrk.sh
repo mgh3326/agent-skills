@@ -7,7 +7,17 @@ HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 ARBITER="$ROOT/bin/arbiter"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# spawn 이 띄운 센티널은 nohup 으로 분리되어 있다 — 스위트가 끝나면 함께 거둔다.
+cleanup() {
+  local pidfile pid
+  while IFS= read -r pidfile; do
+    [[ -s "$pidfile" ]] || continue
+    read -r pid <"$pidfile" || continue
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then kill "$pid" 2>/dev/null || true; fi
+  done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
 printf '%s\n' 'fixture prompt' >"$PROMPT"
 
@@ -49,13 +59,48 @@ expect_exit() {
   fi
 }
 
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+event_count() {
+  find "$1" -name "*$2.json" 2>/dev/null | wc -l | tr -d ' '
+}
+
+wait_until() {
+  local limit="$1"; shift
+  local deadline=$(( $(date +%s) + limit ))
+  while (( $(date +%s) <= deadline )); do
+    if "$@"; then return 0; fi
+    sleep 0.2
+  done
+  return 1
+}
+
+event_count_is() {
+  [[ "$(event_count "$1" "$2")" -eq "$3" ]]
+}
+
+sentinel_lost_reason() {
+  python3 - "$1" <<'PY'
+import glob, json, sys
+for path in sorted(glob.glob(sys.argv[1] + "/*job.lost.json")):
+    print(json.load(open(path)).get("reason", ""))
+PY
+}
+
 # --t is required by wrk; supply one unless the case under test provides its own.
 spawn_base() {
   local model="$1"; shift
   local extra=("$@")
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
+  # A registered job leaves a detached sentinel behind, and that sentinel keeps
+  # calling the fixture herdr — which appends every invocation to the shared
+  # WRK_FIXTURE_LOG. At the default 30s interval one of those probes lands, about
+  # once in three runs, between a case's `rm -f "$TMP/herdr.log"` and its
+  # `[[ ! -e "$TMP/herdr.log" ]]`, and the suite dies there with no message.
+  # Park the probes past the end of the run instead.
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
+    WRK_COMPLETION_INTERVAL_S="${WRK_COMPLETION_INTERVAL_S:-3600}" \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
     WRK_FIXTURE_MARKER="${WRK_FIXTURE_MARKER:-}" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
@@ -904,6 +949,9 @@ import json, sys
 event = json.load(open(sys.argv[1]))
 assert set(event) == {"kind", "job_id", "owner_lane", "label", "pane_id", "host", "report_path", "report_last_line", "epoch"}, event
 assert event["kind"] == "job.completed" and event["job_id"] == sys.argv[2], event
+assert event["pane_id"] == "test:pane", (
+    "pane_id is what panewire routes on; it must be the pane alone, not the rest of the metadata row: %r"
+    % event["pane_id"])
 assert event["epoch"] == 1, event
 PY
 )
@@ -1115,6 +1163,7 @@ R20_LOST_INBOX="$TMP/r20-lost-inbox"
 set +e
 env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$R20_LOST_INBOX" WRK_PANEWIRE_LOG="$R20_LOST_LOG" \
   WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
+  WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel r20-lost lane-a wrk-a w1:p1 "$R20_REPORT" >/dev/null 2>&1
 r20_lost_rc=$?
 set -e
@@ -1141,6 +1190,7 @@ SENTINEL_INBOX="$TMP/sentinel-inbox"
 set +e
 env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
+  WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel sentinel-working lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1
 sentinel_working_rc=$?
 set -e
@@ -1150,6 +1200,12 @@ if find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.completed.json' | 
   exit 1
 fi
 find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.lost.json' | grep -q .
+python3 - "$SENTINEL_INBOX/sentinel-working/events" <<'PY'
+import glob, json, sys
+lost = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.lost.json"))]
+assert lost and lost[0].get("reason") == "timeout", (
+    "an expired watch window is job.lost with reason=timeout, got %r" % lost)
+PY
 echo "PASS r18-sentinel-requires-terminal-status"
 
 # Automatic discovery must work on macOS too, and the observation key must be
@@ -1164,13 +1220,16 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 0 ]]
+event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 0 ||
+  fail "a job with no report is not complete, whatever the pane status says (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/sentinel-idle/report.md"
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 1 ||
+  fail "an idle pane plus a fresh report is exactly one job.completed (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 printf 'updated report line\n' >>"$SENTINEL_INBOX/sentinel-idle/report.md"
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 2 ]]
+event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 2 ||
+  fail "an updated report at the same path is a new observation, so a second job.completed follows (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 kill "$sentinel_idle_pid" 2>/dev/null || true
 wait "$sentinel_idle_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-portable-discovery-and-dedupe"
@@ -1187,6 +1246,314 @@ sleep 2
 kill "$sentinel_done_pid" 2>/dev/null || true
 wait "$sentinel_done_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-accepts-done-status"
+
+# ---------------------------------------------------------------------------
+# 센티널 판정: 빈 값은 소멸의 증거가 아니다 (job.lost 오탐 수정)
+# ---------------------------------------------------------------------------
+
+# (a) 빈 출력·exit 1·JSON 파싱 실패·소켓 에러가 연속 임계 미만이면 소멸이 아니다.
+# 그 뒤 정상 상태가 오면 판정은 completed 여야 하고 job.lost 는 하나도 없어야 한다.
+TRANSIENT_INBOX="$TMP/sentinel-transient-inbox"
+TRANSIENT_SEQ="$TMP/sentinel-transient.seq"
+printf '%s\n' empty exit1 garbage socket working idle >"$TRANSIENT_SEQ"
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$TRANSIENT_INBOX" \
+  WRK_FIXTURE_GET_SEQUENCE="$TRANSIENT_SEQ" \
+  WRK_COMPLETION_TIMEOUT_S=120 WRK_COMPLETION_INTERVAL_S=1 \
+  WRK_SENTINEL_TRANSIENT_MAX=10 WRK_SENTINEL_LOST_GRACE=0 \
+  "$WRK" sentinel sentinel-transient lane-a worker w1:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
+transient_pid=$!
+TRANSIENT_EVENTS="$TRANSIENT_INBOX/sentinel-transient/events"
+wait_until 30 event_count_is "$TRANSIENT_EVENTS" job.completed 1 ||
+  fail "transient herdr failures below WRK_SENTINEL_TRANSIENT_MAX must still reach job.completed (got $(event_count "$TRANSIENT_EVENTS" job.completed))"
+kill "$transient_pid" 2>/dev/null || true
+wait "$transient_pid" 2>/dev/null || true
+[[ "$(event_count "$TRANSIENT_EVENTS" job.lost)" -eq 0 ]] ||
+  fail "empty/failed 'agent get' output is not pane loss: job.lost written with reason=$(sentinel_lost_reason "$TRANSIENT_EVENTS")"
+transient_log="$TRANSIENT_INBOX/sentinel-transient/completion-sentinel.log"
+[[ -s "$transient_log" ]] || fail "completion-sentinel.log must record one line per decision, but it is empty"
+transient_seen="$(awk '{print $2, $3, $4}' "$transient_log" | head -6)"
+transient_want='status=empty transient=1 action=none
+status=err:exit1 transient=2 action=none
+status=err:parse transient=3 action=none
+status=err:transport_unavailable transient=4 action=none
+status=working transient=0 action=none
+status=idle transient=0 action=completed'
+[[ "$transient_seen" == "$transient_want" ]] ||
+  fail "sentinel decision log must classify each observation; want:
+$transient_want
+got:
+$transient_seen"
+echo "PASS sentinel-tolerates-transient-herdr-failures"
+
+# (a') 연속 실패가 임계를 넘으면 herdr_unreachable 로 lost 하되, 유예 동안 계속
+# 감시해 report + 종료 상태가 나타나면 completed 를 추가로 쓴다.
+GRACE_INBOX="$TMP/sentinel-grace-inbox"
+GRACE_SEQ="$TMP/sentinel-grace.seq"
+printf '%s\n' empty empty empty empty idle >"$GRACE_SEQ"
+GRACE_REPORT="$TMP/sentinel-grace-report.md"
+rm -f "$GRACE_REPORT"
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$GRACE_INBOX" \
+  WRK_FIXTURE_GET_SEQUENCE="$GRACE_SEQ" \
+  WRK_COMPLETION_TIMEOUT_S=300 WRK_COMPLETION_INTERVAL_S=1 \
+  WRK_SENTINEL_TRANSIENT_MAX=3 WRK_SENTINEL_LOST_GRACE=120 \
+  "$WRK" sentinel sentinel-grace lane-a worker w1:p1 "$GRACE_REPORT" >/dev/null 2>&1 &
+grace_pid=$!
+GRACE_EVENTS="$GRACE_INBOX/sentinel-grace/events"
+wait_until 30 event_count_is "$GRACE_EVENTS" job.lost 1 ||
+  fail "more than WRK_SENTINEL_TRANSIENT_MAX consecutive unreachable observations must end in job.lost"
+[[ "$(sentinel_lost_reason "$GRACE_EVENTS")" == "herdr_unreachable" ]] ||
+  fail "job.lost from consecutive observation failures must carry reason=herdr_unreachable, got '$(sentinel_lost_reason "$GRACE_EVENTS")'"
+[[ "$(event_count "$GRACE_EVENTS" job.completed)" -eq 0 ]] ||
+  fail "no report existed yet, so nothing may be completed at this point"
+printf 'grace report line\n' >"$GRACE_REPORT"
+wait_until 30 event_count_is "$GRACE_EVENTS" job.completed 1 ||
+  fail "a report that appears within WRK_SENTINEL_LOST_GRACE must still produce job.completed after job.lost"
+wait_until 15 bash -c "! kill -0 $grace_pid 2>/dev/null" ||
+  fail "the sentinel must exit once it has completed a job it had already reported lost"
+wait "$grace_pid" 2>/dev/null || true
+grace_log="$GRACE_INBOX/sentinel-grace/completion-sentinel.log"
+grace_lines="$(awk 'END{print NR}' "$grace_log")"
+grace_calls="$(awk 'END{print NR}' "$GRACE_SEQ.calls")"
+[[ "$grace_lines" -eq "$grace_calls" ]] ||
+  fail "completion-sentinel.log must hold exactly one line per decision: $grace_lines lines for $grace_calls observations"
+grep -q 'action=lost:herdr_unreachable' "$grace_log" ||
+  fail "the decision log must name the lost reason it wrote (action=lost:herdr_unreachable)"
+grep -q 'action=completed' "$grace_log" ||
+  fail "the decision log must record the post-lost completion"
+echo "PASS sentinel-lost-grace-still-completes"
+
+# (b) 확정 소멸 코드는 즉시 lost 다 — 여기서만 재시도가 없다.
+GONE_INBOX="$TMP/sentinel-gone-inbox"
+GONE_SEQ="$TMP/sentinel-gone.seq"
+printf '%s\n' not-found >"$GONE_SEQ"
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$GONE_INBOX" \
+  WRK_FIXTURE_GET_SEQUENCE="$GONE_SEQ" \
+  WRK_COMPLETION_TIMEOUT_S=300 WRK_COMPLETION_INTERVAL_S=1 \
+  WRK_SENTINEL_TRANSIENT_MAX=10 WRK_SENTINEL_LOST_GRACE=0 \
+  "$WRK" sentinel sentinel-gone lane-a worker w1:p1 "$SENTINEL_REPORT" >/dev/null 2>&1
+GONE_EVENTS="$GONE_INBOX/sentinel-gone/events"
+[[ "$(event_count "$GONE_EVENTS" job.lost)" -eq 1 ]] ||
+  fail "an explicit agent_not_found is confirmed pane loss and must be reported at once"
+[[ "$(sentinel_lost_reason "$GONE_EVENTS")" == "agent_not_found" ]] ||
+  fail "job.lost must carry reason=agent_not_found, got '$(sentinel_lost_reason "$GONE_EVENTS")'"
+gone_log="$GONE_INBOX/sentinel-gone/completion-sentinel.log"
+[[ "$(awk 'END{print NR}' "$gone_log")" -eq 1 ]] ||
+  fail "one observation is one decision is one log line"
+grep -q 'status=err:agent_not_found transient=0 action=lost:agent_not_found' "$gone_log" ||
+  fail "the decision log must show the error code that proved the loss"
+echo "PASS sentinel-agent-not-found-is-immediate-loss"
+
+# 분리된 센티널은 wrk 가 쓰던 herdr 세션을 명시적으로 물려받아야 한다. 상속에
+# 기대면 비기본 세션 호스트에서 기본 소켓을 물어 영원히 빈 값을 본다.
+ENV_INBOX="$TMP/sentinel-env-inbox"
+ENV_LOG="$TMP/sentinel-env.log"
+: >"$ENV_LOG"
+env -u HERDR_SESSION -u HERDR_SOCKET_PATH \
+  HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
+  ARBITER_INBOX_ROOT="$ENV_INBOX" WRK_NO_SLEEP=1 WRK_FIXTURE_SCENARIO=spawn \
+  WRK_FIXTURE_LOG="$TMP/sentinel-env-herdr.log" WRK_FIXTURE_ENV_LOG="$ENV_LOG" \
+  WRK_SENTINEL_HERDR_SESSION=host-a WRK_SENTINEL_HERDR_SOCKET=/tmp/host-a.sock \
+  WRK_COMPLETION_INTERVAL_S=1 WRK_SENTINEL_LOST_GRACE=0 \
+  WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
+  --t T1 --job sentinel-env --owner lane-a >/dev/null
+ENV_PIDFILE="$ENV_INBOX/sentinel-env/completion-sentinel.pid"
+[[ -s "$ENV_PIDFILE" ]] || fail "spawn must start a completion sentinel once the job is registered"
+wait_until 30 grep -q 'HERDR_SESSION=host-a' "$ENV_LOG" ||
+  fail "the sentinel must query herdr with the session wrk pinned into it (HERDR_SESSION=host-a), saw: $(tr '\n' '|' <"$ENV_LOG")"
+grep -q 'HERDR_SOCKET_PATH=/tmp/host-a.sock' "$ENV_LOG" ||
+  fail "the sentinel must query herdr through the socket wrk pinned into it"
+kill "$(cat "$ENV_PIDFILE")" 2>/dev/null || true
+python3 - "$ENV_INBOX/sentinel-env/events" <<'PY'
+import glob, json, sys
+spawned = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.spawned.json"))]
+assert spawned, "spawn must record a job.spawned receipt"
+payload = spawned[-1].get("payload", spawned[-1])
+assert payload.get("tab_id") == "w:t1", (
+    "job.spawned must record the tab_id `wrk reap` later closes, got %r" % payload.get("tab_id"))
+PY
+echo "PASS sentinel-inherits-pinned-herdr-session"
+
+# ---------------------------------------------------------------------------
+# wrk reap: 끝난 pane 회수
+# ---------------------------------------------------------------------------
+REAP_INBOX="$TMP/reap-inbox"
+REAP_LOG="$TMP/reap-herdr.log"
+# 종료 이벤트를 한 시간 전으로 새겨 --grace 를 양방향으로 시험한다(ARBITER_TEST_NOW
+# 는 arbiter 가 제공하는 주입 지점이다 — 손으로 쓴 이벤트가 아니다).
+REAP_TEST_NOW="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).replace(microsecond=0).isoformat())')"
+reap_job() {
+  local job="$1" pane="$2" tab="$3" lane="$4" terminal="$5"; shift 5
+  local spawned="{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}"
+  # tab="" builds the pre-PR shape: a job.spawned receipt with no tab_id at all.
+  if [[ -n "$tab" ]]; then
+    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}"
+  fi
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 "$@" >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "$spawned" >/dev/null
+  if [[ -n "$terminal" ]]; then
+    env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind "$terminal" \
+      --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  fi
+  unset ARBITER_TEST_NOW
+}
+
+# A captain job that was released and then reclaimed without --role: the reclaim
+# payload carries the default role=worker, so a last-writer-wins role would strip
+# the captain marking and hand a live captain pane to reap.
+reap_captain_reclaimed_job() {
+  local job="$1" pane="$2" lane="$3"
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 \
+    --role captain --parent-lane lane-p >/dev/null
+  # release is what moves a job to `released`; take the exclusive-lease route so
+  # the reclaim below is the real arbiter transition, not a hand-written event.
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" lease \
+    --job "$job" --resource "$TMP/reap-$job" --kind path >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" release \
+    --job "$job" --resource "$TMP/reap-$job" --kind path --force >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim --reclaim-released \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"w1:t7\"}" >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.joined \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
+reap_job reap-ready w1:p1 w1:t1 lane-a job.completed
+reap_job reap-working w1:p2 w1:t2 lane-a job.completed
+reap_job reap-open w1:p3 w1:t3 lane-a ''
+# The captain sits in the lane under test on purpose: with it in another lane the
+# role guard is never reached, because --lane already filtered the job out.
+reap_job reap-captain w1:p1 w1:t1 lane-a job.joined --role captain --parent-lane lane-p
+reap_job reap-other-lane w1:p1 w1:t1 lane-b job.completed
+reap_job reap-shared w1:p4 w1:t4 lane-a job.completed
+# Pre-PR shape: no tab_id in job.spawned. The tab has to come from `agent get`,
+# and the shared-tab guard must still see it.
+reap_job reap-no-tab w1:p5 '' lane-a job.completed
+reap_job reap-no-tab-shared w1:p4 '' lane-a job.completed
+reap_job reap-lost-only w1:p6 w1:t6 lane-a job.lost
+reap_captain_reclaimed_job reap-captain-reclaimed w1:p7 lane-a
+
+# The `wrk done` that shipped before be4dad1 glued parent_lane and role onto
+# pane_id with tabs, and 23 such records sit in the live inbox. The spawn receipt
+# stays the source of truth, and no candidate field may carry whitespace.
+reap_poisoned_job() {
+  local job="$1" spawn_pane="$2"
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane lane-a --agent-label "$job" --t T1 >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"$job\",\"pane_id\":\"$spawn_pane\"}" >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json '{"owner_lane":"lane-a","label":"poisoned","pane_id":"w1:p1\t\tworker"}' >/dev/null
+  unset ARBITER_TEST_NOW
+}
+reap_poisoned_job reap-poisoned w1:p8
+reap_poisoned_job reap-poisoned-spawn 'w1:p8\t\tworker'
+
+reap_run() {
+  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$REAP_INBOX" \
+    WRK_FIXTURE_SCENARIO=reap WRK_FIXTURE_LOG="$REAP_LOG" "$WRK" reap "$@"
+}
+
+: >"$REAP_LOG"
+dry_out="$(reap_run --lane lane-a)"
+grep -q '^would-close job=reap-ready pane=w1:p1 tab=w1:t1 status=idle age=[0-9][0-9]*s$' <<<"$dry_out" ||
+  fail "a terminal job whose pane is idle past the grace must be a reap candidate, with its tab and age in their own fields: $dry_out"
+# A job.spawned with no tab_id must resolve its tab from `agent get`, and the age
+# must never land in the tab field: `herdr tab close <seconds>` closes whatever
+# tab happens to carry that number.
+grep -q '^would-close job=reap-no-tab pane=w1:p5 tab=w1:t5 status=idle age=[0-9][0-9]*s$' <<<"$dry_out" ||
+  fail "a job spawned before tab_id was recorded must resolve its tab through 'agent get', and its age must stay out of the tab field: $dry_out"
+grep -q '^would-close job=reap-poisoned pane=w1:p8 tab=w1:t8 status=idle age=[0-9][0-9]*s$' <<<"$dry_out" ||
+  fail "the spawn receipt is the source of truth for pane and tab; a completion record poisoned by the old done bug must not reach the candidate row: $dry_out"
+grep -q 'tab=worker' <<<"$dry_out" &&
+  fail "a value glued onto pane_id by tabs must never be read as a tab id: $dry_out"
+grep -q '^skip job=reap-poisoned-spawn reason=malformed-record$' <<<"$dry_out" ||
+  fail "when the spawn receipt itself carries whitespace in pane_id the evidence is broken and reap must skip, not guess: $dry_out"
+[[ "$(grep -c '^would-close ' <<<"$dry_out")" -eq 3 ]] ||
+  fail "only the finished, idle, past-grace jobs may be listed: $dry_out"
+grep -q 'reason=status=working' <<<"$dry_out" ||
+  fail "a still-working pane must be skipped explicitly, never closed: $dry_out"
+grep -q 'reap-open' <<<"$dry_out" &&
+  fail "a job with no terminal event must not appear in reap output at all: $dry_out"
+grep -q 'reap-lost-only' <<<"$dry_out" &&
+  fail "job.lost is not a terminal event: a job the old sentinel wrongly declared lost must never be reaped: $dry_out"
+grep -q 'reap-captain' <<<"$dry_out" &&
+  fail "a captain pane in the lane under test must still be excluded without --include-captains: $dry_out"
+grep -q 'reap-other-lane' <<<"$dry_out" &&
+  fail "--lane must filter by the claim owner_lane: $dry_out"
+grep -q 'job=reap-shared .*reason=tab-shared' <<<"$dry_out" ||
+  fail "a tab that still holds another pane must be skipped, not closed (closing it kills the sibling pane): $dry_out"
+grep -q 'job=reap-no-tab-shared pane=w1:p4 tab=w1:t4 reason=tab-shared' <<<"$dry_out" ||
+  fail "the shared-tab guard must also cover a tab resolved through 'agent get', not just one recorded at spawn: $dry_out"
+grep -q '^tab close' "$REAP_LOG" &&
+  fail "the default run is a dry run: no tab may be closed without --apply"
+[[ "$(event_count "$REAP_INBOX/reap-ready/events" job.reaped)" -eq 0 ]] ||
+  fail "a dry run must not record job.reaped"
+echo "PASS reap-dry-run-lists-only-finished-idle-panes"
+
+grep -q 'reap: 0 candidate' <<<"$(reap_run --lane lane-a --grace 2h)" ||
+  fail "a terminal event younger than --grace is not yet reapable"
+if reap_run --lane lane-a --grace 10min >/dev/null 2>&1; then
+  fail "an unparsable --grace must fail loudly; falling back to 0 would reap with no grace at all"
+fi
+captain_out="$(reap_run --lane lane-a --include-captains)"
+grep -q 'would-close job=reap-captain ' <<<"$captain_out" ||
+  fail "--include-captains must let a finished captain pane in this lane be reaped: $captain_out"
+grep -q 'would-close job=reap-captain-reclaimed ' <<<"$captain_out" ||
+  fail "--include-captains must reach the reclaimed captain too: $captain_out"
+echo "PASS reap-grace-and-captain-filters"
+
+: >"$REAP_LOG"
+apply_out="$(reap_run --lane lane-a --apply)"
+grep -q '^closed job=reap-ready pane=w1:p1 tab=w1:t1 status=idle' <<<"$apply_out" ||
+  fail "--apply must close the candidate tab: $apply_out"
+grep -q '^closed job=reap-no-tab pane=w1:p5 tab=w1:t5 status=idle' <<<"$apply_out" ||
+  fail "--apply must close the tab it resolved through 'agent get', by tab id: $apply_out"
+grep -q '^closed job=reap-poisoned pane=w1:p8 tab=w1:t8 status=idle' <<<"$apply_out" ||
+  fail "--apply must close the tab from the spawn receipt, not one read out of a poisoned record: $apply_out"
+[[ "$(grep -c '^tab close ' "$REAP_LOG")" -eq 3 ]] ||
+  fail "only the three candidates' tabs may be closed: $(cat "$REAP_LOG")"
+grep -q 'tab close worker' "$REAP_LOG" &&
+  fail "reap must never pass a role name to herdr tab close: $(cat "$REAP_LOG")"
+grep -q '^tab close w1:t1$' "$REAP_LOG" ||
+  fail "reap must close the tab_id recorded at spawn: $(cat "$REAP_LOG")"
+grep -q '^tab close w1:t5$' "$REAP_LOG" ||
+  fail "reap must close a resolved tab by its id, never by an age or a number: $(cat "$REAP_LOG")"
+grep -qE '^tab close [0-9]+$' "$REAP_LOG" &&
+  fail "a bare number is never a tab id; that is a live tab's number: $(cat "$REAP_LOG")"
+grep -q 'tab close w1:t7' "$REAP_LOG" &&
+  fail "a captain tab must never be closed by a plain --apply run: $(cat "$REAP_LOG")"
+[[ "$(event_count "$REAP_INBOX/reap-captain-reclaimed/events" job.reaped)" -eq 0 ]] ||
+  fail "a captain that was released and reclaimed without --role keeps its captain marking"
+[[ "$(event_count "$REAP_INBOX/reap-captain/events" job.reaped)" -eq 0 ]] ||
+  fail "a captain job in the reaped lane must not be reaped without --include-captains"
+python3 - "$REAP_INBOX/reap-no-tab/events" <<'PY'
+import glob, json, sys
+event = json.load(open(sorted(glob.glob(sys.argv[1] + "/*job.reaped.json"))[0]))
+assert event.get("tab_id") == "w1:t5", (
+    "job.reaped must record the tab id that was actually closed, not an age: %r" % event)
+PY
+python3 - "$REAP_INBOX/reap-ready/events" <<'PY'
+import glob, json, sys
+paths = sorted(glob.glob(sys.argv[1] + "/*job.reaped.json"))
+assert len(paths) == 1, "a closed job records exactly one flat job.reaped event, got %d" % len(paths)
+event = json.load(open(paths[0]))
+assert event.get("kind") == "job.reaped", event
+assert event.get("pane_id") == "w1:p1", "job.reaped must record the reaped pane_id: %r" % event
+assert event.get("tab_id") == "w1:t1", "job.reaped must record the closed tab_id: %r" % event
+assert event.get("at"), "job.reaped must record when the tab was closed: %r" % event
+PY
+grep -q 'reap: 0 candidate' <<<"$(reap_run --lane lane-a)" ||
+  fail "an already reaped job must never be offered again"
+echo "PASS reap-apply-closes-tab-and-records-job-reaped"
 
 grep -q "for tool in \"\$REPO_DIR\"/bin/\\*" "$ROOT/install.sh"
 

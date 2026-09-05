@@ -63,8 +63,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | 도구 | 용도 |
 |---|---|
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
-| `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정). `wrk --help` 로 전체 확인 |
-| `wrk` | `spawn`·`find`·`name-sync` 통합 CLI — 명시 모델 스폰, 이름/라벨 조회, 탭 라벨 동기화 |
+| `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `reap`(끝난 pane 회수, 기본 dry-run) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정). `wrk --help` 로 전체 확인 |
 | `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(path·linear_permit의 fencing lease + quota_pool의 비배타 실행 기록) · `status`(읽기 전용) · `gc`(배타 lease 만료 전이 + 설치된 `herdr agent list`와 대조해 stale 기록 정리; JSON 경로 fixture도 지원) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
 
 ## 의존 도구
@@ -84,6 +83,7 @@ wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
 wrk spawn --role captain --lane CAPTAIN_LANE --parent PARENT_LANE ... -m captain-opus|captain-sol
 wrk escalate JOB --question TEXT
 wrk joined JOB --pr URL --head SHA --report PATH
+wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-captains]
 wrk find <이름|라벨> [--pane-only]
 wrk name-sync [--apply|<라벨>...]
 ```
@@ -101,6 +101,61 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 arbiter claim의 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와
 `wrk joined`는 완료 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 그 parent 레인으로
 설정한다. panewire R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
+
+## 완료 센티널 판정표
+
+`wrk spawn`은 job이 arbiter에 등록되면 완료 센티널을 분리 기동한다. 센티널은
+`herdr agent get <pane>` 관측을 **3분류**하고, 판정 1건마다 잡 디렉토리의
+`completion-sentinel.log`에 한 줄씩 남긴다
+(`<ts> status=<상태|empty|err:code> transient=<n> action=<none|completed|lost:reason>`).
+
+| 관측 | 분류 | 판정 |
+|---|---|---|
+| `agent_not_found` 등 pane/terminal 부재 에러 코드 | 확정 소멸 | 즉시 `job.lost` (`reason=agent_not_found`) |
+| 빈 출력 · 비정상 종료 · JSON 파싱 실패 · 소켓 에러 | 일시 장애 | `WRK_COMPLETION_INTERVAL_S`(기본 30s) 간격 재시도. **연속** `WRK_SENTINEL_TRANSIENT_MAX`(기본 10회 ≈5분) 초과 시에만 `job.lost` (`reason=herdr_unreachable`) |
+| 정상 상태(`working`/`idle`/`done`) | 관측 성공 | 일시 장애 카운터 리셋. `idle`·`done` + 새 report면 `job.completed` |
+| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과 | 감시 창 만료 | `job.lost` (`reason=timeout`) |
+
+**빈 값은 소멸의 증거가 아니다.** 2026-09-04 소켓 일시 정지와 비기본 herdr 세션
+때문에 그날 스폰한 거의 모든 잡이 스폰 30초 뒤 `job.lost`로 찍혔고, 센티널이 죽어
+워커가 정상 완료해도 `job.completed`를 아무도 쓰지 못했다(수동 전달 3회).
+
+`job.lost`를 쓴 뒤에도 센티널은 즉시 끝나지 않는다. `WRK_SENTINEL_LOST_GRACE`
+(기본 1800초) 동안 계속 감시해 그 사이 report가 생기고 상태가 `done`/`idle`이 되면
+`job.completed`를 **추가로** 쓰고 종료한다(panewire가 completed를 relay한다).
+
+분리된 센티널은 터미널에서 유도되는 herdr 세션 컨텍스트를 잃는다. 그래서 wrk는
+스폰 시점의 `HERDR_SESSION`·`HERDR_SOCKET_PATH`·`HERDR_BIN(_PATH)`를 센티널 환경에
+명시적으로 박아 넣는다. 서버가 비기본 세션에 사는 호스트에서는
+`WRK_SENTINEL_HERDR_SESSION`/`WRK_SENTINEL_HERDR_SOCKET`로 스폰 측이 직접 지정한다.
+
+```bash
+WRK_SENTINEL_HERDR_SESSION=worker wrk spawn -c ... -m ... --job <id>
+```
+
+## `wrk reap` — 끝난 pane 회수
+
+워커·검증자가 끝나도 pane은 herdr에 남아 하루 40~60개가 쌓이고, 그만큼 herdr 서버
+부하(fd·구독)가 된다. `wrk reap`은 인박스를 읽어 **끝난 것이 증명된** 잡의 탭만 닫는다.
+
+```bash
+wrk reap --lane lane-a              # dry-run: 닫을 목록만 출력
+wrk reap --lane lane-a --apply      # 실제로 herdr tab close
+```
+
+회수 조건(**전부** 충족해야 후보):
+
+- terminal 이벤트(`job.completed`·`job.joined`·`job.revoked`)가 있다
+- 그 terminal 이벤트가 `--grace`(기본 10m)보다 오래됐다
+- `job.spawned`의 `pane_id`가 herdr에 살아 있고 상태가 `idle`·`done`이다
+- 아직 회수된 적이 없다(`job.reaped` 이벤트 없음)
+
+`working`/`blocked` pane, terminal 이벤트 없는 잡, herdr가 해석하지 못하는 pane은
+건드리지 않는다(해석 실패는 소켓 문제일 수 있고, 확인 못한 탭을 닫는 편이 더 나쁘다).
+캡틴 pane(claim `role: captain`)은 `--include-captains` 없이는 제외한다. 기본은
+**dry-run**이며, `--apply`로 닫은 잡에만 평면 `job.reaped` 이벤트(`pane_id`·`tab_id`·`at`)를
+남긴다. `wrk spawn`은 이를 위해 `job.spawned` payload에 `tab_id`를 함께 기록한다
+(기존 필드는 그대로 — 구형 herdr로 만들어져 `tab_id`가 없는 잡은 `agent get`으로 해석한다).
 
 ## 도메인 경계 (ROB-1199 — 위반 금지)
 
