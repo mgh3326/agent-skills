@@ -203,7 +203,7 @@ case "${1:-}" in
             ;;
           reap)
             # w1:t4 는 pane 이 분할된 탭이다 — 닫으면 옆 pane 이 함께 죽는다.
-            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","label":"reap-ready","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t2","label":"reap-working","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t4","label":"reap-shared","pane_count":2,"workspace_id":"w1"}]}}'
+            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","label":"reap-ready","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t2","label":"reap-working","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t4","label":"reap-shared","pane_count":2,"workspace_id":"w1"},{"tab_id":"w1:t5","label":"reap-no-tab","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t6","label":"reap-lost-only","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t7","label":"reap-captain-reclaimed","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t8","label":"reap-poisoned","pane_count":1,"workspace_id":"w1"}]}}'
             ;;
           *) printf '%s\n' '{"result":{"tabs":[]}}' ;;
         esac

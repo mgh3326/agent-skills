@@ -1187,8 +1187,8 @@ done_cmd() {
   local metadata owner label pane jobs_root
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
   # completion_metadata prints five tab-separated fields; reading into three
-  # lets pane_id swallow parent_lane and role ("w16:p1KQ\t\tworker" was
-  # recorded on 2026-09-05), which is also what panewire routes on.
+  # lets pane_id swallow parent_lane and role ("w1:p1\t\tworker" was recorded
+  # on 2026-09-05), which is also what panewire routes on.
   IFS=$'\t' read -r owner label pane _ <<<"$metadata"
   jobs_root="$(wrk_jobs_root)"
   if [[ -z "$report" ]]; then
@@ -2253,6 +2253,11 @@ PY
 
 # 회수 후보를 "job<TAB>owner<TAB>pane<TAB>tab<TAB>age_s" 로 출력한다. herdr 는
 # 여기서 묻지 않는다 — 인박스만 읽는 순수 판정이다.
+#
+# 🔴 빈 필드는 자리표시자 "-" 로 낸다. 탭은 IFS 공백류라서 `IFS=$'\t' read` 가 연속
+# 구분자를 하나로 접고, 그러면 뒤 필드가 앞으로 당겨진다. tab_id 없는 잡(이 PR 이전
+# 스폰 전량)에서 age(초)가 tab_id 자리에 들어가 `herdr tab close <초>` 가 될 뻔했다
+# (2026-09-05 검증 실증: `would-close … tab=1928`).
 reap_candidates() {
   local root="$1" lane="$2" grace="$3" include_captains="$4"
   python3 - "$root" "$lane" "$grace" "$include_captains" <<'PY'
@@ -2288,6 +2293,7 @@ for job in jobs:
     if not os.path.isdir(events_dir):
         continue
     owner = pane = tab = role = ""
+    spawned_pane = spawned_tab = ""
     terminal_at = None
     reaped = False
     try:
@@ -2310,15 +2316,23 @@ for job in jobs:
             payload = {}
         kind = document.get("kind")
         if kind in ("job.claim", "job.reclaim"):
+            # 소유는 최신 claim 이 정한다(released 된 잡을 다른 레인이 다시 잡는다).
             owner = payload.get("owner_lane") if isinstance(payload.get("owner_lane"), str) else ""
-            role = payload.get("role") if isinstance(payload.get("role"), str) else ""
+            # 역할은 누적이다: `--role` 없는 reclaim 은 기본값 worker 를 payload 에
+            # 남기므로, 덮어쓰면 재클레임 한 번에 캡틴 표식이 지워진다.
+            if payload.get("role") == "captain":
+                role = "captain"
         for key in ("pane_id", "tab_id"):
             value = payload.get(key)
             if isinstance(value, str) and value:
                 if key == "pane_id":
                     pane = value
+                    if kind == "job.spawned":
+                        spawned_pane = value
                 else:
                     tab = value
+                    if kind == "job.spawned":
+                        spawned_tab = value
         if kind == "job.reaped":
             reaped = True
         if kind in TERMINAL:
@@ -2327,6 +2341,11 @@ for job in jobs:
             except OSError:
                 fallback = now
             terminal_at = moment_of(document.get("created_at") or payload.get("at"), fallback)
+    # 스폰 영수증이 pane/tab 의 정본이다. 완료 이벤트의 pane_id 를 그대로 믿으면
+    # be4dad1 이전 `wrk done` 이 남긴 오염 레코드("w1:p1\t\tworker")를 집는다 —
+    # 실 인박스에 23건 남아 있다.
+    pane = spawned_pane or pane
+    tab = spawned_tab or tab
     if reaped or terminal_at is None or not pane:
         continue
     if lane and owner != lane:
@@ -2336,7 +2355,12 @@ for job in jobs:
     age = int(now - terminal_at)
     if age < grace:
         continue
-    print(job, owner, pane, tab, age, sep="\t")
+    # 어떤 필드에도 공백이 있어서는 안 된다. 있으면 그 잡의 증거가 깨진 것이고,
+    # 회수는 추측하지 않는다 — pane 을 자리표시자로 내보내 skip 으로 남긴다.
+    if any(any(c.isspace() for c in value) for value in (job, owner, pane, tab)):
+        print(job.split()[0] if job.split() else job, "-", "-", "-", age, sep="\t")
+        continue
+    print(job, owner or "-", pane, tab or "-", age, sep="\t")
 PY
 }
 
@@ -2411,6 +2435,13 @@ reap_cmd() {
   local job owner pane tab age probe class token probe_tab panes acted=0
   while IFS=$'\t' read -r job owner pane tab age; do
     [[ -n "$job" ]] || continue
+    # 자리표시자를 되돌린다(위 reap_candidates 주석 참고).
+    [[ "$owner" != - ]] || owner=""
+    [[ "$tab" != - ]] || tab=""
+    if [[ "$pane" == - ]]; then
+      echo "skip job=$job reason=malformed-record"
+      continue
+    fi
     probe="$(herdr_agent_probe "$pane")"
     IFS=$'\t' read -r class token probe_tab <<<"$probe"
     if [[ "$class" != ok ]]; then

@@ -92,8 +92,15 @@ spawn_base() {
   local model="$1"; shift
   local extra=("$@")
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
+  # A registered job leaves a detached sentinel behind, and that sentinel keeps
+  # calling the fixture herdr — which appends every invocation to the shared
+  # WRK_FIXTURE_LOG. At the default 30s interval one of those probes lands, about
+  # once in three runs, between a case's `rm -f "$TMP/herdr.log"` and its
+  # `[[ ! -e "$TMP/herdr.log" ]]`, and the suite dies there with no message.
+  # Park the probes past the end of the run instead.
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
+    WRK_COMPLETION_INTERVAL_S="${WRK_COMPLETION_INTERVAL_S:-3600}" \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
     WRK_FIXTURE_MARKER="${WRK_FIXTURE_MARKER:-}" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
@@ -1344,7 +1351,7 @@ ENV_LOG="$TMP/sentinel-env.log"
 env -u HERDR_SESSION -u HERDR_SOCKET_PATH \
   HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
   ARBITER_INBOX_ROOT="$ENV_INBOX" WRK_NO_SLEEP=1 WRK_FIXTURE_SCENARIO=spawn \
-  WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_FIXTURE_ENV_LOG="$ENV_LOG" \
+  WRK_FIXTURE_LOG="$TMP/sentinel-env-herdr.log" WRK_FIXTURE_ENV_LOG="$ENV_LOG" \
   WRK_SENTINEL_HERDR_SESSION=host-a WRK_SENTINEL_HERDR_SOCKET=/tmp/host-a.sock \
   WRK_COMPLETION_INTERVAL_S=1 WRK_SENTINEL_LOST_GRACE=0 \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
@@ -1378,23 +1385,77 @@ REAP_LOG="$TMP/reap-herdr.log"
 REAP_TEST_NOW="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).replace(microsecond=0).isoformat())')"
 reap_job() {
   local job="$1" pane="$2" tab="$3" lane="$4" terminal="$5"; shift 5
+  local spawned="{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}"
+  # tab="" builds the pre-PR shape: a job.spawned receipt with no tab_id at all.
+  if [[ -n "$tab" ]]; then
+    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}"
+  fi
   export ARBITER_TEST_NOW="$REAP_TEST_NOW"
   env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
     --job "$job" --lane "$lane" --agent-label "$job" --t T1 "$@" >/dev/null
   env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
-    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}" >/dev/null
+    --payload-json "$spawned" >/dev/null
   if [[ -n "$terminal" ]]; then
     env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind "$terminal" \
       --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
   fi
   unset ARBITER_TEST_NOW
 }
+
+# A captain job that was released and then reclaimed without --role: the reclaim
+# payload carries the default role=worker, so a last-writer-wins role would strip
+# the captain marking and hand a live captain pane to reap.
+reap_captain_reclaimed_job() {
+  local job="$1" pane="$2" lane="$3"
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 \
+    --role captain --parent-lane lane-p >/dev/null
+  # release is what moves a job to `released`; take the exclusive-lease route so
+  # the reclaim below is the real arbiter transition, not a hand-written event.
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" lease \
+    --job "$job" --resource "$TMP/reap-$job" --kind path >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" release \
+    --job "$job" --resource "$TMP/reap-$job" --kind path --force >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim --reclaim-released \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"w1:t7\"}" >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.joined \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
 reap_job reap-ready w1:p1 w1:t1 lane-a job.completed
 reap_job reap-working w1:p2 w1:t2 lane-a job.completed
 reap_job reap-open w1:p3 w1:t3 lane-a ''
-reap_job reap-captain w1:p1 w1:t1 lane-b job.joined --role captain --parent-lane lane-a
+# The captain sits in the lane under test on purpose: with it in another lane the
+# role guard is never reached, because --lane already filtered the job out.
+reap_job reap-captain w1:p1 w1:t1 lane-a job.joined --role captain --parent-lane lane-p
 reap_job reap-other-lane w1:p1 w1:t1 lane-b job.completed
 reap_job reap-shared w1:p4 w1:t4 lane-a job.completed
+# Pre-PR shape: no tab_id in job.spawned. The tab has to come from `agent get`,
+# and the shared-tab guard must still see it.
+reap_job reap-no-tab w1:p5 '' lane-a job.completed
+reap_job reap-no-tab-shared w1:p4 '' lane-a job.completed
+reap_job reap-lost-only w1:p6 w1:t6 lane-a job.lost
+reap_captain_reclaimed_job reap-captain-reclaimed w1:p7 lane-a
+
+# The `wrk done` that shipped before be4dad1 glued parent_lane and role onto
+# pane_id with tabs, and 23 such records sit in the live inbox. The spawn receipt
+# stays the source of truth, and no candidate field may carry whitespace.
+reap_poisoned_job() {
+  local job="$1" spawn_pane="$2"
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane lane-a --agent-label "$job" --t T1 >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"$job\",\"pane_id\":\"$spawn_pane\"}" >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json '{"owner_lane":"lane-a","label":"poisoned","pane_id":"w1:p1\t\tworker"}' >/dev/null
+  unset ARBITER_TEST_NOW
+}
+reap_poisoned_job reap-poisoned w1:p8
+reap_poisoned_job reap-poisoned-spawn 'w1:p8\t\tworker'
 
 reap_run() {
   env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$REAP_INBOX" \
@@ -1403,20 +1464,35 @@ reap_run() {
 
 : >"$REAP_LOG"
 dry_out="$(reap_run --lane lane-a)"
-grep -q '^would-close job=reap-ready pane=w1:p1 tab=w1:t1 status=idle' <<<"$dry_out" ||
-  fail "a terminal job whose pane is idle past the grace must be a reap candidate: $dry_out"
-[[ "$(grep -c '^would-close ' <<<"$dry_out")" -eq 1 ]] ||
-  fail "only the finished, idle, past-grace job may be listed: $dry_out"
+grep -q '^would-close job=reap-ready pane=w1:p1 tab=w1:t1 status=idle age=[0-9][0-9]*s$' <<<"$dry_out" ||
+  fail "a terminal job whose pane is idle past the grace must be a reap candidate, with its tab and age in their own fields: $dry_out"
+# A job.spawned with no tab_id must resolve its tab from `agent get`, and the age
+# must never land in the tab field: `herdr tab close <seconds>` closes whatever
+# tab happens to carry that number.
+grep -q '^would-close job=reap-no-tab pane=w1:p5 tab=w1:t5 status=idle age=[0-9][0-9]*s$' <<<"$dry_out" ||
+  fail "a job spawned before tab_id was recorded must resolve its tab through 'agent get', and its age must stay out of the tab field: $dry_out"
+grep -q '^would-close job=reap-poisoned pane=w1:p8 tab=w1:t8 status=idle age=[0-9][0-9]*s$' <<<"$dry_out" ||
+  fail "the spawn receipt is the source of truth for pane and tab; a completion record poisoned by the old done bug must not reach the candidate row: $dry_out"
+grep -q 'tab=worker' <<<"$dry_out" &&
+  fail "a value glued onto pane_id by tabs must never be read as a tab id: $dry_out"
+grep -q '^skip job=reap-poisoned-spawn reason=malformed-record$' <<<"$dry_out" ||
+  fail "when the spawn receipt itself carries whitespace in pane_id the evidence is broken and reap must skip, not guess: $dry_out"
+[[ "$(grep -c '^would-close ' <<<"$dry_out")" -eq 3 ]] ||
+  fail "only the finished, idle, past-grace jobs may be listed: $dry_out"
 grep -q 'reason=status=working' <<<"$dry_out" ||
   fail "a still-working pane must be skipped explicitly, never closed: $dry_out"
 grep -q 'reap-open' <<<"$dry_out" &&
   fail "a job with no terminal event must not appear in reap output at all: $dry_out"
+grep -q 'reap-lost-only' <<<"$dry_out" &&
+  fail "job.lost is not a terminal event: a job the old sentinel wrongly declared lost must never be reaped: $dry_out"
 grep -q 'reap-captain' <<<"$dry_out" &&
-  fail "captain panes are excluded without --include-captains: $dry_out"
+  fail "a captain pane in the lane under test must still be excluded without --include-captains: $dry_out"
 grep -q 'reap-other-lane' <<<"$dry_out" &&
   fail "--lane must filter by the claim owner_lane: $dry_out"
 grep -q 'job=reap-shared .*reason=tab-shared' <<<"$dry_out" ||
   fail "a tab that still holds another pane must be skipped, not closed (closing it kills the sibling pane): $dry_out"
+grep -q 'job=reap-no-tab-shared pane=w1:p4 tab=w1:t4 reason=tab-shared' <<<"$dry_out" ||
+  fail "the shared-tab guard must also cover a tab resolved through 'agent get', not just one recorded at spawn: $dry_out"
 grep -q '^tab close' "$REAP_LOG" &&
   fail "the default run is a dry run: no tab may be closed without --apply"
 [[ "$(event_count "$REAP_INBOX/reap-ready/events" job.reaped)" -eq 0 ]] ||
@@ -1425,18 +1501,46 @@ echo "PASS reap-dry-run-lists-only-finished-idle-panes"
 
 grep -q 'reap: 0 candidate' <<<"$(reap_run --lane lane-a --grace 2h)" ||
   fail "a terminal event younger than --grace is not yet reapable"
-grep -q 'would-close job=reap-captain' <<<"$(reap_run --lane lane-b --include-captains)" ||
-  fail "--include-captains must let a finished captain pane be reaped"
+if reap_run --lane lane-a --grace 10min >/dev/null 2>&1; then
+  fail "an unparsable --grace must fail loudly; falling back to 0 would reap with no grace at all"
+fi
+captain_out="$(reap_run --lane lane-a --include-captains)"
+grep -q 'would-close job=reap-captain ' <<<"$captain_out" ||
+  fail "--include-captains must let a finished captain pane in this lane be reaped: $captain_out"
+grep -q 'would-close job=reap-captain-reclaimed ' <<<"$captain_out" ||
+  fail "--include-captains must reach the reclaimed captain too: $captain_out"
 echo "PASS reap-grace-and-captain-filters"
 
 : >"$REAP_LOG"
 apply_out="$(reap_run --lane lane-a --apply)"
 grep -q '^closed job=reap-ready pane=w1:p1 tab=w1:t1 status=idle' <<<"$apply_out" ||
   fail "--apply must close the candidate tab: $apply_out"
-[[ "$(grep -c '^tab close ' "$REAP_LOG")" -eq 1 ]] ||
-  fail "exactly one tab must be closed, and only the candidate's: $(cat "$REAP_LOG")"
+grep -q '^closed job=reap-no-tab pane=w1:p5 tab=w1:t5 status=idle' <<<"$apply_out" ||
+  fail "--apply must close the tab it resolved through 'agent get', by tab id: $apply_out"
+grep -q '^closed job=reap-poisoned pane=w1:p8 tab=w1:t8 status=idle' <<<"$apply_out" ||
+  fail "--apply must close the tab from the spawn receipt, not one read out of a poisoned record: $apply_out"
+[[ "$(grep -c '^tab close ' "$REAP_LOG")" -eq 3 ]] ||
+  fail "only the three candidates' tabs may be closed: $(cat "$REAP_LOG")"
+grep -q 'tab close worker' "$REAP_LOG" &&
+  fail "reap must never pass a role name to herdr tab close: $(cat "$REAP_LOG")"
 grep -q '^tab close w1:t1$' "$REAP_LOG" ||
   fail "reap must close the tab_id recorded at spawn: $(cat "$REAP_LOG")"
+grep -q '^tab close w1:t5$' "$REAP_LOG" ||
+  fail "reap must close a resolved tab by its id, never by an age or a number: $(cat "$REAP_LOG")"
+grep -qE '^tab close [0-9]+$' "$REAP_LOG" &&
+  fail "a bare number is never a tab id; that is a live tab's number: $(cat "$REAP_LOG")"
+grep -q 'tab close w1:t7' "$REAP_LOG" &&
+  fail "a captain tab must never be closed by a plain --apply run: $(cat "$REAP_LOG")"
+[[ "$(event_count "$REAP_INBOX/reap-captain-reclaimed/events" job.reaped)" -eq 0 ]] ||
+  fail "a captain that was released and reclaimed without --role keeps its captain marking"
+[[ "$(event_count "$REAP_INBOX/reap-captain/events" job.reaped)" -eq 0 ]] ||
+  fail "a captain job in the reaped lane must not be reaped without --include-captains"
+python3 - "$REAP_INBOX/reap-no-tab/events" <<'PY'
+import glob, json, sys
+event = json.load(open(sorted(glob.glob(sys.argv[1] + "/*job.reaped.json"))[0]))
+assert event.get("tab_id") == "w1:t5", (
+    "job.reaped must record the tab id that was actually closed, not an age: %r" % event)
+PY
 python3 - "$REAP_INBOX/reap-ready/events" <<'PY'
 import glob, json, sys
 paths = sorted(glob.glob(sys.argv[1] + "/*job.reaped.json"))
