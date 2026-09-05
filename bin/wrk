@@ -1186,7 +1186,10 @@ done_cmd() {
   done
   local metadata owner label pane jobs_root
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
-  IFS=$'\t' read -r owner label pane <<<"$metadata"
+  # completion_metadata prints five tab-separated fields; reading into three
+  # lets pane_id swallow parent_lane and role ("w16:p1KQ\t\tworker" was
+  # recorded on 2026-09-05), which is also what panewire routes on.
+  IFS=$'\t' read -r owner label pane _ <<<"$metadata"
   jobs_root="$(wrk_jobs_root)"
   if [[ -z "$report" ]]; then
     report="$(find_latest_report "$jobs_root/$job")"

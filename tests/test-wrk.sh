@@ -942,6 +942,9 @@ import json, sys
 event = json.load(open(sys.argv[1]))
 assert set(event) == {"kind", "job_id", "owner_lane", "label", "pane_id", "host", "report_path", "report_last_line", "epoch"}, event
 assert event["kind"] == "job.completed" and event["job_id"] == sys.argv[2], event
+assert event["pane_id"] == "test:pane", (
+    "pane_id is what panewire routes on; it must be the pane alone, not the rest of the metadata row: %r"
+    % event["pane_id"])
 assert event["epoch"] == 1, event
 PY
 )
