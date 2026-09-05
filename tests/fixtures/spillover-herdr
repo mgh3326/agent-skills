@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == agent && "${2:-}" == list ]]; then
+  active="${WRK_TEST_ACTIVE:-0}"
+  printf '{"result":{"agents":['
+  for ((i=0; i<active; i++)); do
+    ((i)) && printf ','
+    printf '{"agent_status":"working"}'
+  done
+  printf ']}}\n'
+  exit 0
+fi
+
+exec "$(dirname "$0")/herdr" "$@"
