@@ -117,6 +117,24 @@ forced_out="$(WRK_PLACE_SCENARIO=advance WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wr
 grep -q '^OK pane=w:p1 host=local ' <<<"$forced_out"
 [[ ! -s "$TMP/ssh.log" ]]
 
+# A readable active duplicate remains terminal before either local telemetry or
+# hub/SSH work, for both automatic and explicitly local routing.
+for route in auto local; do
+  active_job="spillover-active-$route"
+  XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job "$active_job" --agent-label owner --lane owner --t T1 >/dev/null
+  : >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
+  set +e
+  if [[ "$route" == auto ]]; then
+    active_out="$(WRK_TEST_JOB="$active_job" WRK_PLACE_SCENARIO=advance run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+  else
+    active_out="$(WRK_TEST_JOB="$active_job" WRK_PLACE_SCENARIO=advance run_wrk "$ROOT/bin/wrk" -w local --host local 2>&1)"
+  fi
+  active_rc=$?
+  set -e
+  [[ "$active_rc" -eq 74 ]] || { echo "ASSERT P5 active duplicate expected exit 74, got $active_rc" >&2; exit 1; }
+  [[ ! -s "$TMP/ssh.log" && ! -s "$TMP/place.log" && ! -s "$TMP/herdr.log" ]] || { echo 'ASSERT P5 active duplicate made placement calls' >&2; exit 1; }
+done
+
 # P5: an unreadable or absent arbiter may use the ordinary local path, but is
 # never enough evidence to call the hub or route remotely.
 : >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
