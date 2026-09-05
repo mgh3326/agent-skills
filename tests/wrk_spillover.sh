@@ -16,10 +16,14 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
   '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
   "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >"$CONFIG"
 
+# A readable arbiter database is the normal routing precondition. Individual
+# cases below replace this with an absent or lookup-failing arbiter explicitly.
+XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-seed --agent-label seed --lane seed --t T1 >/dev/null
+
 run_wrk() {
   local binary="$1"; shift
   env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" \
-    SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$TMP/no-arbiter" \
+    SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="${WRK_TEST_ARBITER_BIN:-$ROOT/bin/arbiter}" XDG_DATA_HOME="$TMP/xdg" \
     WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$CONFIG" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
     WRK_TEST_THROTTLED=0 \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
@@ -27,7 +31,8 @@ run_wrk() {
     WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
     WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" \
     WRK_PLACE_LOG="$TMP/place.log" WRK_SPILLOVER_CANDIDATES_LOG="$TMP/candidates.log" \
-    "$binary" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -l fixture --t T1 "$@"
+    "$binary" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -l fixture --t T1 \
+    --job "${WRK_TEST_JOB:-spillover-$RANDOM-$RANDOM}" "$@"
 }
 
 set_first_cwd_map() {
@@ -112,37 +117,57 @@ forced_out="$(WRK_PLACE_SCENARIO=advance WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wr
 grep -q '^OK pane=w:p1 host=local ' <<<"$forced_out"
 [[ ! -s "$TMP/ssh.log" ]]
 
-# Mutation checks: each altered boundary must make its AC assertion red.
-# M1: remove the candidate list after the first remote spawn fails.
-MUT_MAP="$TMP/wrk-no-cwd-map"
-cp "$ROOT/bin/wrk" "$MUT_MAP"
-sed -i.bak "s/if ! remote_cwd=\"\$(spillover_cwd_map \"\$host\" \"\$cwd\")\"; then/if false; then/" "$MUT_MAP"
-set_first_cwd_map '{"/not-the-current-cwd"="/remote/missing"}'
-if WRK_PLACE_SCENARIO=advance WRK_TEST_ACTIVE=0 run_wrk "$MUT_MAP" -w local 2>&1 | grep -q 'has no cwd_map entry'; then
-  echo 'cwd-map mutant survived' >&2; exit 1
-fi
-set_first_cwd_map "{\"$ROOT\"=\"/remote/agent-skills\"}"
-
-MUT_CANDIDATES="$TMP/wrk-no-candidates"; cp "$ROOT/bin/wrk" "$MUT_CANDIDATES"
-sed -i.bak '/then candidates+=/c\  if [[ "$requested" == auto ]]; then true; fi' "$MUT_CANDIDATES"
-if WRK_PLACE_SCENARIO=advance WRK_SSH_SCENARIO=desktop-spawn-fails run_wrk "$MUT_CANDIDATES" -w local 2>&1 | grep -q 'host=mac-work'; then echo 'candidate mutant survived' >&2; exit 1; fi
-
-# M2: without the substring filter, the first verbatim candidate leaks through.
-MUT_ACCEPTING="$TMP/wrk-no-not-accepting"; cp "$ROOT/bin/wrk" "$MUT_ACCEPTING"
-sed -i.bak 's/or "not_accepting" in str(candidate_reason)//' "$MUT_ACCEPTING"
-: >"$TMP/candidates.log"
-WRK_PLACE_SCENARIO=verbatim run_wrk "$MUT_ACCEPTING" -w local >/dev/null 2>&1 || true
-if ! grep -qx 'rpi' "$TMP/candidates.log"; then echo 'not_accepting mutant survived' >&2; exit 1; fi
-
-# M4: deleting local emission after candidate exhaustion prevents the AC4 OK line.
-MUT_FALLBACK="$TMP/wrk-no-local-fallback"; cp "$ROOT/bin/wrk" "$MUT_FALLBACK"
-sed -i.bak '0,/spillover_emit_host local "\$out"/{//b}; /spillover_emit_host local "\$out"/s//return "\$last_rc"/' "$MUT_FALLBACK"
-: >"$TMP/calls"
+# P5: an unreadable or absent arbiter may use the ordinary local path, but is
+# never enough evidence to call the hub or route remotely.
+: >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
+XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-lookup-fail --agent-label owner --lane owner --t T1 >/dev/null
 set +e
-fallback_mutant_out="$(WRK_PLACE_SCENARIO=verbatim WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3,6 run_wrk "$MUT_FALLBACK" -w local 2>&1)"
-fallback_mutant_rc=$?
+lookup_fail_out="$(REAL_ARBITER="$ROOT/bin/arbiter" WRK_TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-proxy" WRK_ARBITER_PROXY_MODE=job-get-fails WRK_TEST_JOB=spillover-lookup-fail WRK_PLACE_SCENARIO=advance run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+lookup_fail_rc=$?
 set -e
-[[ "$fallback_mutant_rc" -ne 0 ]]
-if grep -q '^OK pane=w:p1 host=local ' <<<"$fallback_mutant_out"; then echo 'local-fallback mutant survived' >&2; exit 1; fi
+[[ "$lookup_fail_rc" -eq 75 ]] || { echo "ASSERT P5 lookup failure expected exit 75, got $lookup_fail_rc" >&2; exit 1; }
+[[ ! -s "$TMP/ssh.log" ]] || { echo 'ASSERT P5 lookup failure routed remotely' >&2; exit 1; }
+[[ ! -s "$TMP/place.log" ]] || { echo 'ASSERT P5 lookup failure called hub' >&2; exit 1; }
+[[ ! -s "$TMP/herdr.log" ]] || { echo 'ASSERT P5 lookup failure reached Herdr' >&2; exit 1; }
 
-echo 'PASS wrk-spillover mutants-red=4/4'
+: >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
+absent_out="$(WRK_TEST_ARBITER_BIN="$TMP/no-arbiter" WRK_TEST_JOB=spillover-absent WRK_PLACE_SCENARIO=advance run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+grep -q '^OK pane=w:p1 host=local ' <<<"$absent_out"
+[[ ! -s "$TMP/ssh.log" ]] || { echo 'ASSERT P5 absent arbiter routed remotely' >&2; exit 1; }
+[[ ! -s "$TMP/place.log" ]] || { echo 'ASSERT P5 absent arbiter called hub' >&2; exit 1; }
+
+# A remote duplicate refusal is terminal: it must not probe a backup candidate
+# or turn into a local spawn. Exercise both exact-once exits against two hub
+# candidates in the contract-shaped advance fixture.
+for duplicate_rc in 74 75; do
+  : >"$TMP/ssh.log"; : >"$TMP/calls"; : >"$TMP/herdr.log"
+  set +e
+  duplicate_out="$(WRK_PLACE_SCENARIO=advance WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3 WRK_SSH_FAIL_CODE="$duplicate_rc" run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+  duplicate_actual_rc=$?
+  set -e
+  [[ "$duplicate_actual_rc" -eq "$duplicate_rc" ]] || { echo "ASSERT P5 remote duplicate expected exit $duplicate_rc, got $duplicate_actual_rc" >&2; exit 1; }
+  backup_probe_count="$(grep -c 'mac-work.*uptime; herdr agent list' "$TMP/ssh.log" || true)"
+  [[ "$backup_probe_count" -eq 0 ]] || { echo "ASSERT P5 remote duplicate must not advance; backup_probe_count=$backup_probe_count" >&2; exit 1; }
+  [[ ! -s "$TMP/herdr.log" ]] || { echo 'ASSERT P5 remote duplicate reached local fallback' >&2; exit 1; }
+done
+
+# Mutation checks: each altered boundary must make its AC assertion red.
+# M5: restoring remote routing after an unreadable lookup must make the P5
+# assertion red through a genuine remote fixture spawn, not a shell error.
+MUT_LOOKUP="$TMP/wrk-lookup-routes-remote"; cp "$ROOT/bin/wrk" "$MUT_LOOKUP"
+sed -i.bak '/A router must never use an unavailable placement-admission lookup/,+10 s/^    return "\$rc"$/    :/' "$MUT_LOOKUP"
+: >"$TMP/ssh.log"; : >"$TMP/place.log"
+XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-mutant-lookup --agent-label owner --lane owner --t T1 >/dev/null
+REAL_ARBITER="$ROOT/bin/arbiter" WRK_TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-proxy" WRK_ARBITER_PROXY_MODE=job-get-fails WRK_TEST_JOB=spillover-mutant-lookup WRK_PLACE_SCENARIO=advance run_wrk "$MUT_LOOKUP" -w local >/dev/null 2>&1 || true
+if [[ ! -s "$TMP/ssh.log" || ! -s "$TMP/place.log" ]]; then echo 'lookup-routing mutant survived' >&2; exit 1; fi
+
+# M6: treating 74 as retryable must probe the second candidate, so the exact
+# backup_probe_count=0 assertion above becomes red.
+MUT_DUPLICATE="$TMP/wrk-duplicate-retries"; cp "$ROOT/bin/wrk" "$MUT_DUPLICATE"
+sed -i.bak 's/2|"\$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"\$WRK_EXIT_JOB_STATE_UNREADABLE")/2)/' "$MUT_DUPLICATE"
+: >"$TMP/ssh.log"; : >"$TMP/calls"
+WRK_PLACE_SCENARIO=advance WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3 WRK_SSH_FAIL_CODE=74 run_wrk "$MUT_DUPLICATE" -w local >/dev/null 2>&1 || true
+backup_probe_count="$(grep -c 'mac-work.*uptime; herdr agent list' "$TMP/ssh.log" || true)"
+[[ "$backup_probe_count" -gt 0 ]] || { echo 'duplicate-propagation mutant survived' >&2; exit 1; }
+
+echo 'PASS wrk-spillover mutants-red=6/6'

@@ -7,7 +7,7 @@ if [[ -n "${WRK_SSH_CALL_COUNT_FILE:-}" ]]; then
   [[ ! -f "$WRK_SSH_CALL_COUNT_FILE" ]] || call="$(cat "$WRK_SSH_CALL_COUNT_FILE")"
   call=$((call + 1))
   printf '%s\n' "$call" >"$WRK_SSH_CALL_COUNT_FILE"
-  if [[ ",${WRK_SSH_FAIL_CALLS:-}," == *",$call,"* ]]; then exit 42; fi
+  if [[ ",${WRK_SSH_FAIL_CALLS:-}," == *",$call,"* ]]; then exit "${WRK_SSH_FAIL_CODE:-42}"; fi
 fi
 remote="${*: -1}"
 host=""

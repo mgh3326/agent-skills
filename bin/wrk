@@ -473,7 +473,9 @@ arbiter_get_duplicate_state() {
   lookup="$("$ARBITER" job-get --job "$JOB_ID" --json 2>/dev/null)"
   lookup_rc=$?
   set -e
-  [[ "$lookup_rc" -eq 0 ]] || return 1
+  # job-get's dedicated not-found result is a readable admission answer, not
+  # an unavailable arbiter.  Keep it distinct for router preflight.
+  [[ "$lookup_rc" -eq 0 ]] || { [[ "$lookup_rc" -eq 7 ]] && return 2; return 1; }
   set +e
   parsed="$(printf '%s' "$lookup" | python3 -c '
 import json, sys
@@ -560,10 +562,17 @@ arbiter_preflight_active_duplicate() {
   # claim/reclaim transition and its installation-transition handling.
   local job_id="$1" job_dup_ok="$2"
   [[ -n "$ARBITER" ]] || ARBITER="$(command -v arbiter 2>/dev/null || true)"
-  [[ -n "$ARBITER" && -x "$ARBITER" ]] || return 0
+  # Placement is safe to continue only after a durable lookup was actually
+  # readable. An absent/unreadable arbiter remains an installation transition
+  # for the local spawn path, but it is never permission to route remotely.
+  [[ -n "$ARBITER" && -x "$ARBITER" ]] || return "$WRK_EXIT_JOB_STATE_UNREADABLE"
   JOB_ID="$job_id"
-  if ! arbiter_get_duplicate_state; then
-    return 0
+  if arbiter_get_duplicate_state; then
+    :
+  else
+    local lookup_rc=$?
+    [[ "$lookup_rc" -eq 2 ]] && return 0
+    return "$WRK_EXIT_JOB_STATE_UNREADABLE"
   fi
   case "$ARBITER_DUP_STATE" in
     claimed|leased)
@@ -1407,10 +1416,9 @@ import json, sys
 d = json.load(sys.stdin)
 decision = d.get("decision")
 reason = d.get("reason", "")
-decision_host = decision if isinstance(decision, str) else (
-    decision.get("machine") or decision.get("host") or decision.get("target") or ""
-    if isinstance(decision, dict) else "")
-if isinstance(decision, dict): reason = decision.get("reason", reason)
+if decision is not None and not isinstance(decision, str):
+    raise ValueError("invalid placement decision")
+decision_host = decision or ""
 eligible = []
 for candidate in d.get("candidates", []):
     if isinstance(candidate, str):
@@ -1585,7 +1593,18 @@ spawn_router_cmd() {
   if arbiter_preflight_active_duplicate "$job_id" "$job_dup_ok"; then
     :
   else
-    return $?
+    rc=$?
+    # A router must never use an unavailable placement-admission lookup to
+    # launch remotely. Let the local spawn own the final admission outcome.
+    [[ "$rc" -eq "$WRK_EXIT_ACTIVE_JOB_DUPLICATE" ]] && return "$rc"
+    out="$(mktemp)"
+    set +e
+    ( set -e; spawn_cmd "${filtered[@]}" ) >"$out"
+    rc=$?
+    set -e
+    spillover_emit_host local "$out"
+    rm -f "$out"
+    return "$rc"
   fi
   # Without spill-over configuration, retain the ordinary local spawn path.
   # Besides avoiding pointless telemetry, this keeps spawn_cmd's quota gate as
@@ -1667,7 +1686,10 @@ spawn_router_cmd() {
       continue
     fi
     if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "${filtered[@]}"; then return 0; else last_rc=$?; fi
-    [[ "$last_rc" -ne 2 ]] || return 2  # cwd mapping is fail-closed, never spill elsewhere.
+    case "$last_rc" in
+      2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE")
+        return "$last_rc" ;; # Admission and cwd mapping are fail-closed.
+    esac
     warn "spill-over remote spawn failed host=$candidate exit=$last_rc; trying next candidate"
   done
   warn "no remote spill-over candidate completed; falling back to local"
