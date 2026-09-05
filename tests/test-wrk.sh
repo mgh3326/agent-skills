@@ -39,6 +39,10 @@ export ARBITER_INBOX_ROOT="$TMP/inbox"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 export PANEWIRE_BIN="$PANEWIRE"
 
+# Document uploads are also opt-in below. Keep pre-existing cases away from a
+# real handoffkeep installation while preserving their historical records.
+export HANDOFFKEEP_BIN="$TMP/absent-handoffkeep"
+
 run_fail() {
   if "$@" >/dev/null 2>&1; then
     echo "expected failure: $*" >&2
@@ -1105,8 +1109,8 @@ assert "--question" not in joined, joined
 PY
 echo "PASS r20-emit-argv-matches-escalate-and-joined-records"
 
-# TW4 — no panewire on the box: exit 0, the record is still written, exactly
-# one warning on stderr, stdout untouched.
+# TW4 — no panewire on the box: exit 0, the record is still written and both
+# independently optional relays warn without changing stdout.
 R20_ABSENT_ERR="$TMP/r20-absent.err"
 r20_claim r20-absent
 set +e
@@ -1117,8 +1121,9 @@ set -e
 [[ "$r20_absent_rc" -eq 0 ]]
 [[ -f "$R20_INBOX/r20-absent/events/00003-job.completed.json" ]]
 grep -qxF "OK job=r20-absent report=$R20_REPORT" <<<"$r20_absent_out"
+grep -qxF 'wrk: warning: handoffkeep not found; report document not uploaded (job=r20-absent)' "$R20_ABSENT_ERR"
 grep -qxF 'wrk: warning: panewire not found; relay event left as file only (job=r20-absent kind=job.completed)' "$R20_ABSENT_ERR"
-[[ "$(wc -l <"$R20_ABSENT_ERR" | tr -d ' ')" -eq 1 ]]
+[[ "$(wc -l <"$R20_ABSENT_ERR" | tr -d ' ')" -eq 2 ]]
 echo "PASS r20-missing-panewire-warns-without-changing-exit-or-stdout"
 
 # TW5 — emit fails: exit 0, the record is still written, the warning quotes rc.
@@ -1132,8 +1137,9 @@ set -e
 [[ "$r20_fail_rc" -eq 0 ]]
 [[ -f "$R20_INBOX/r20-fail/events/00003-job.completed.json" ]]
 grep -qxF "OK job=r20-fail report=$R20_REPORT" <<<"$r20_fail_out"
+grep -qxF 'wrk: warning: handoffkeep not found; report document not uploaded (job=r20-fail)' "$R20_FAIL_ERR"
 grep -qxF 'wrk: warning: panewire emit failed (rc=3 job=r20-fail kind=job.completed); relay event left as file only' "$R20_FAIL_ERR"
-[[ "$(wc -l <"$R20_FAIL_ERR" | tr -d ' ')" -eq 1 ]]
+[[ "$(wc -l <"$R20_FAIL_ERR" | tr -d ' ')" -eq 2 ]]
 echo "PASS r20-failed-emit-warns-with-rc-without-changing-exit"
 
 # TW6 — a wedged emit must not stall wrk: `wrk joined` runs inside the captain
@@ -1181,6 +1187,270 @@ grep -qxF "OK job=r20-done report=$R20_REPORT" <<<"$r20_done_out"
 grep -qxF 'OK job=r20-captain owner_lane=lane-a kind=job.escalate' <<<"$r20_escalate_out"
 grep -qxF "OK job=r20-captain owner_lane=lane-a kind=job.joined pr=https://example.invalid/pr/1 head=deadbeef report=$R20_REPORT" <<<"$r20_joined_out"
 echo "PASS r20-stdout-contract-unchanged"
+
+# ── R21: report documents are optional handoffkeep uploads ──────────────────
+# Keep the capture shape identical to R20: a fixture collects every argv
+# element, and real arbiter claim/spawned envelopes provide the command input.
+R21_HANDOFFKEEP="$TMP/handoffkeep"
+cat >"$R21_HANDOFFKEEP" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ -n "${WRK_HANDOFFKEEP_LOG:-}" ]]; then
+  {
+    for argument in "$@"; do printf '%s\n' "$argument"; done
+    printf -- '--\n'
+  } >>"$WRK_HANDOFFKEEP_LOG"
+fi
+
+[[ -z "${WRK_HANDOFFKEEP_SLEEP:-}" ]] || sleep "$WRK_HANDOFFKEEP_SLEEP"
+exit "${WRK_HANDOFFKEEP_RC:-0}"
+SH
+chmod +x "$R21_HANDOFFKEEP"
+
+R21_INBOX="$TMP/r21-inbox"
+r21_arb() { env ARBITER_INBOX_ROOT="$R21_INBOX" XDG_DATA_HOME="$TMP/xdg-r21" "$ARBITER" "$@"; }
+r21_claim() {
+  r21_arb claim --job "$1" --lane lane-a --agent-label wrk-a --t T1 "${@:2}" >/dev/null
+  r21_arb event --job "$1" --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+}
+r21_report() {
+  local job="$1" name="$2" line="$3"
+  local path="$R21_INBOX/$job/$name"
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$line" >"$path"
+  printf '%s\n' "$path"
+}
+
+# T1/T2/T9 — exact document argv, one call, and the same doc-suffixed last
+# line in both the durable record and captured panewire argv. The fixture token
+# proves that wrk neither reads nor prints the credential passed to the CLI.
+R21_DONE_JOB="r21-done"
+R21_DONE_REPORT="$(r21_report "$R21_DONE_JOB" report.md 'document terminal line')"
+R21_DONE_HK_LOG="$TMP/r21-done-handoffkeep.log"
+R21_DONE_PW_LOG="$TMP/r21-done-panewire.log"
+R21_DONE_ERR="$TMP/r21-done.err"
+r21_claim "$R21_DONE_JOB"
+r21_done_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" HANDOFFKEEP_TOKEN=fixture-token \
+  WRK_HANDOFFKEEP_LOG="$R21_DONE_HK_LOG" WRK_PANEWIRE_LOG="$R21_DONE_PW_LOG" \
+  "$WRK" 'done' "$R21_DONE_JOB" --report "$R21_DONE_REPORT" 2>"$R21_DONE_ERR")"
+PYTHONPATH="$TMP" python3 - "$R21_DONE_HK_LOG" "$R21_DONE_PW_LOG" "$R21_INBOX/$R21_DONE_JOB/events" "$R21_DONE_REPORT" <<'PY'
+import sys
+import r20_emit as helper
+
+handoff, panewire, events, report = sys.argv[1:]
+expected = ["doc", "put", "--key", "reports/r21-done/report.md", "--kind", "report",
+            "--job", "r21-done", "--file", report]
+assert helper.calls(handoff) == [expected], helper.calls(handoff)
+event = helper.record(events, "job.completed")
+call = helper.calls(panewire)
+assert len(call) == 1, call
+got = helper.assert_matches_record(call[0], event)
+assert event["report_last_line"] == got["--report-last-line"], (event, got)
+assert event["report_last_line"].endswith(" doc:reports/r21-done/report.md"), event
+PY
+grep -qxF "OK job=$R21_DONE_JOB report=$R21_DONE_REPORT" <<<"$r21_done_out"
+[[ ! -s "$R21_DONE_ERR" ]]
+if grep -qF 'fixture-token' "$R21_DONE_HK_LOG" || grep -qF 'fixture-token' <<<"$r21_done_out" \
+  || grep -qF 'fixture-token' "$R21_DONE_ERR"; then
+  fail "handoffkeep token leaked to an argv capture or wrk output"
+fi
+echo "PASS r21-done-document-argv-record-wire-and-token-hygiene"
+
+# T3 — reserve space for the complete document suffix before truncating the
+# original terminal line; a broken link is worse than a shortened summary.
+R21_LONG_JOB="r21-long"
+R21_LONG_REPORT="$R21_INBOX/$R21_LONG_JOB/report-long.md"
+mkdir -p "$(dirname "$R21_LONG_REPORT")"
+python3 -c 'print("x" * 300)' >"$R21_LONG_REPORT"
+r21_claim "$R21_LONG_JOB"
+env ARBITER_INBOX_ROOT="$R21_INBOX" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+  "$WRK" 'done' "$R21_LONG_JOB" --report "$R21_LONG_REPORT" >/dev/null
+PYTHONPATH="$TMP" python3 - "$R21_INBOX/$R21_LONG_JOB/events" <<'PY'
+import sys
+import r20_emit as helper
+
+last = helper.record(sys.argv[1], "job.completed")["report_last_line"]
+suffix = " doc:reports/r21-long/report-long.md"
+assert len(last) <= 240, len(last)
+assert last.endswith(suffix), last
+assert len(last) == 240, len(last)
+PY
+echo "PASS r21-document-suffix-survives-240-character-cap"
+
+# T4 — a failed upload is one warning only; it must not alter the OK line,
+# prevent the durable record/emit, or attach a document suffix.
+R21_FAIL_JOB="r21-upload-fail"
+R21_FAIL_REPORT="$(r21_report "$R21_FAIL_JOB" report.md 'upload failure terminal line')"
+R21_FAIL_PW_LOG="$TMP/r21-fail-panewire.log"
+R21_FAIL_ERR="$TMP/r21-fail.err"
+r21_claim "$R21_FAIL_JOB"
+set +e
+r21_fail_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_RC=1 \
+  WRK_PANEWIRE_LOG="$R21_FAIL_PW_LOG" "$WRK" 'done' "$R21_FAIL_JOB" \
+  --report "$R21_FAIL_REPORT" 2>"$R21_FAIL_ERR")"
+r21_fail_rc=$?
+set -e
+[[ "$r21_fail_rc" -eq 0 ]]
+grep -qxF "OK job=$R21_FAIL_JOB report=$R21_FAIL_REPORT" <<<"$r21_fail_out"
+grep -qxF 'wrk: warning: handoffkeep document upload failed (rc=1 job=r21-upload-fail); continuing without document link' "$R21_FAIL_ERR"
+[[ "$(wc -l <"$R21_FAIL_ERR" | tr -d ' ')" -eq 1 ]]
+PYTHONPATH="$TMP" python3 - "$R21_FAIL_PW_LOG" "$R21_INBOX/$R21_FAIL_JOB/events" <<'PY'
+import sys
+import r20_emit as helper
+
+event = helper.record(sys.argv[2], "job.completed")
+call = helper.calls(sys.argv[1])
+assert len(call) == 1, call
+helper.assert_matches_record(call[0], event)
+assert " doc:" not in event["report_last_line"], event
+PY
+echo "PASS r21-failed-document-upload-warns-and-continues"
+
+# T5 — resolving no CLI at all has the same non-fatal, no-document result.
+R21_ABSENT_JOB="r21-handoffkeep-absent"
+R21_ABSENT_REPORT="$(r21_report "$R21_ABSENT_JOB" report.md 'absent terminal line')"
+R21_ABSENT_PW_LOG="$TMP/r21-absent-panewire.log"
+R21_ABSENT_ERR="$TMP/r21-absent.err"
+r21_claim "$R21_ABSENT_JOB"
+set +e
+r21_absent_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$TMP/no-handoffkeep" WRK_PANEWIRE_LOG="$R21_ABSENT_PW_LOG" \
+  "$WRK" 'done' "$R21_ABSENT_JOB" --report "$R21_ABSENT_REPORT" 2>"$R21_ABSENT_ERR")"
+r21_absent_rc=$?
+set -e
+[[ "$r21_absent_rc" -eq 0 ]]
+grep -qxF "OK job=$R21_ABSENT_JOB report=$R21_ABSENT_REPORT" <<<"$r21_absent_out"
+grep -qxF 'wrk: warning: handoffkeep not found; report document not uploaded (job=r21-handoffkeep-absent)' "$R21_ABSENT_ERR"
+[[ "$(wc -l <"$R21_ABSENT_ERR" | tr -d ' ')" -eq 1 ]]
+PYTHONPATH="$TMP" python3 - "$R21_ABSENT_PW_LOG" "$R21_INBOX/$R21_ABSENT_JOB/events" <<'PY'
+import sys
+import r20_emit as helper
+
+event = helper.record(sys.argv[2], "job.completed")
+call = helper.calls(sys.argv[1])
+assert len(call) == 1, call
+helper.assert_matches_record(call[0], event)
+assert " doc:" not in event["report_last_line"], event
+PY
+echo "PASS r21-missing-handoffkeep-warns-and-continues"
+
+# T6 — a stalled CLI is bounded by the three-second guard and otherwise has
+# the T4 behavior. Its 30-second fixture delay must never escape the guard.
+R21_SLOW_JOB="r21-handoffkeep-slow"
+R21_SLOW_REPORT="$(r21_report "$R21_SLOW_JOB" report.md 'slow terminal line')"
+R21_SLOW_PW_LOG="$TMP/r21-slow-panewire.log"
+R21_SLOW_ERR="$TMP/r21-slow.err"
+r21_claim "$R21_SLOW_JOB"
+r21_slow_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
+set +e
+r21_slow_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_SLEEP=30 \
+  WRK_PANEWIRE_LOG="$R21_SLOW_PW_LOG" "$WRK" 'done' "$R21_SLOW_JOB" \
+  --report "$R21_SLOW_REPORT" 2>"$R21_SLOW_ERR")"
+r21_slow_rc=$?
+set -e
+r21_slow_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - r21_slow_start_ns) / 1000000 ))"
+[[ "$r21_slow_rc" -eq 0 ]]
+[[ "$r21_slow_ms" -lt 10000 ]]
+grep -qxF "OK job=$R21_SLOW_JOB report=$R21_SLOW_REPORT" <<<"$r21_slow_out"
+grep -q 'handoffkeep document upload failed' "$R21_SLOW_ERR"
+[[ "$(wc -l <"$R21_SLOW_ERR" | tr -d ' ')" -eq 1 ]]
+PYTHONPATH="$TMP" python3 - "$R21_SLOW_PW_LOG" "$R21_INBOX/$R21_SLOW_JOB/events" <<'PY'
+import sys
+import r20_emit as helper
+
+event = helper.record(sys.argv[2], "job.completed")
+call = helper.calls(sys.argv[1])
+assert len(call) == 1, call
+helper.assert_matches_record(call[0], event)
+assert " doc:" not in event["report_last_line"], event
+PY
+echo "PASS r21-stalled-handoffkeep-is-bounded-by-three-second-guard elapsed_ms=$r21_slow_ms"
+
+# T7 — joined follows the same upload and suffix rules, using the captain's
+# own job id in the document command.
+R21_JOINED_JOB="r21-joined"
+R21_JOINED_REPORT="$(r21_report "$R21_JOINED_JOB" joined-report.md 'joined terminal line')"
+R21_JOINED_HK_LOG="$TMP/r21-joined-handoffkeep.log"
+R21_JOINED_PW_LOG="$TMP/r21-joined-panewire.log"
+r21_claim "$R21_JOINED_JOB" --role captain --parent-lane parent-a
+env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+  WRK_HANDOFFKEEP_LOG="$R21_JOINED_HK_LOG" WRK_PANEWIRE_LOG="$R21_JOINED_PW_LOG" \
+  "$WRK" joined "$R21_JOINED_JOB" --pr https://example.invalid/pr/21 --head deadbeef \
+  --report "$R21_JOINED_REPORT" >/dev/null
+PYTHONPATH="$TMP" python3 - "$R21_JOINED_HK_LOG" "$R21_JOINED_PW_LOG" "$R21_INBOX/$R21_JOINED_JOB/events" "$R21_JOINED_REPORT" <<'PY'
+import sys
+import r20_emit as helper
+
+handoff, panewire, events, report = sys.argv[1:]
+call = helper.calls(handoff)
+assert len(call) == 1 and call[0][7] == "r21-joined", call
+event = helper.record(events, "job.joined")
+relay = helper.calls(panewire)
+assert len(relay) == 1, relay
+helper.assert_matches_record(relay[0], event)
+assert event["report_last_line"].endswith(" doc:reports/r21-joined/joined-report.md"), event
+PY
+echo "PASS r21-joined-uploads-and-relays-document-link"
+
+# T8 — escalation accepts an optional report; without it it retains the old
+# empty report fields and makes no handoffkeep call. A missing report is fatal.
+R21_ESC_JOB="r21-escalate-report"
+R21_ESC_REPORT="$(r21_report "$R21_ESC_JOB" escalation.md 'escalation terminal line')"
+R21_ESC_HK_LOG="$TMP/r21-escalate-handoffkeep.log"
+R21_ESC_PW_LOG="$TMP/r21-escalate-panewire.log"
+r21_claim "$R21_ESC_JOB" --role captain --parent-lane parent-a
+env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+  WRK_HANDOFFKEEP_LOG="$R21_ESC_HK_LOG" WRK_PANEWIRE_LOG="$R21_ESC_PW_LOG" \
+  "$WRK" escalate "$R21_ESC_JOB" --question 'need a decision' --report "$R21_ESC_REPORT" >/dev/null
+PYTHONPATH="$TMP" python3 - "$R21_ESC_HK_LOG" "$R21_ESC_PW_LOG" "$R21_INBOX/$R21_ESC_JOB/events" <<'PY'
+import sys
+import r20_emit as helper
+
+handoff, panewire, events = sys.argv[1:]
+assert len(helper.calls(handoff)) == 1, helper.calls(handoff)
+event = helper.record(events, "job.escalate")
+relay = helper.calls(panewire)
+assert len(relay) == 1, relay
+helper.assert_matches_record(relay[0], event)
+assert event["report_path"].endswith("/escalation.md"), event
+assert event["report_last_line"].endswith(" doc:reports/r21-escalate-report/escalation.md"), event
+PY
+R21_ESC_EMPTY_JOB="r21-escalate-empty"
+R21_ESC_EMPTY_HK_LOG="$TMP/r21-escalate-empty-handoffkeep.log"
+R21_ESC_EMPTY_PW_LOG="$TMP/r21-escalate-empty-panewire.log"
+r21_claim "$R21_ESC_EMPTY_JOB" --role captain --parent-lane parent-a
+env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+  WRK_HANDOFFKEEP_LOG="$R21_ESC_EMPTY_HK_LOG" WRK_PANEWIRE_LOG="$R21_ESC_EMPTY_PW_LOG" \
+  "$WRK" escalate "$R21_ESC_EMPTY_JOB" --question 'need a decision' >/dev/null
+[[ ! -s "$R21_ESC_EMPTY_HK_LOG" ]]
+PYTHONPATH="$TMP" python3 - "$R21_ESC_EMPTY_PW_LOG" "$R21_INBOX/$R21_ESC_EMPTY_JOB/events" <<'PY'
+import sys
+import r20_emit as helper
+
+event = helper.record(sys.argv[2], "job.escalate")
+relay = helper.calls(sys.argv[1])
+assert len(relay) == 1, relay
+helper.assert_matches_record(relay[0], event)
+assert event["report_path"] == event["report_last_line"] == "", event
+PY
+R21_ESC_MISSING_JOB="r21-escalate-missing"
+R21_ESC_MISSING_HK_LOG="$TMP/r21-escalate-missing-handoffkeep.log"
+r21_claim "$R21_ESC_MISSING_JOB" --role captain --parent-lane parent-a
+: >"$R21_ESC_MISSING_HK_LOG"
+set +e
+env ARBITER_INBOX_ROOT="$R21_INBOX" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+  WRK_HANDOFFKEEP_LOG="$R21_ESC_MISSING_HK_LOG" "$WRK" escalate "$R21_ESC_MISSING_JOB" \
+  --question 'need a decision' --report "$TMP/no-such-report.md" >/dev/null 2>&1
+r21_esc_missing_rc=$?
+set -e
+[[ "$r21_esc_missing_rc" -ne 0 ]]
+[[ ! -s "$R21_ESC_MISSING_HK_LOG" ]]
+echo "PASS r21-escalate-report-optional-and-missing-path-is-fatal"
 
 # R18 completion sentinel: a report alone is never completion evidence. A
 # worker still working must time out/lost rather than emit job.completed.

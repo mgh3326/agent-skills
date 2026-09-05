@@ -81,7 +81,8 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
           [-L live|mock] [--effort LEVEL] [--job ID]
 wrk spawn --role captain --lane CAPTAIN_LANE --parent PARENT_LANE ... -m captain-opus|captain-sol
-wrk escalate JOB --question TEXT
+wrk done JOB [--report PATH]
+wrk escalate JOB --question TEXT [--report PATH]
 wrk joined JOB --pr URL --head SHA --report PATH
 wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-captains]
 wrk find <이름|라벨> [--pane-only]
@@ -101,6 +102,12 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 arbiter claim의 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와
 `wrk joined`는 완료 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 그 parent 레인으로
 설정한다. panewire R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
+
+`wrk done`, `wrk joined`, 그리고 보고서가 지정된 `wrk escalate`는 보고서를
+`reports/<job>/<basename>` 키로 handoffkeep CLI에 올린다. CLI는
+`HANDOFFKEEP_URL`/`HANDOFFKEEP_TOKEN` 또는 `~/.config/handoffkeep/config.env`에서 자격증명을
+읽으며, 업로드 실패는 경고만 남기고 완료 레코드는 계속 쓴다. 성공 시 마지막 줄의
+`doc:<key>` 접미를 웹 콘솔이 문서 링크로 연다.
 
 ## 완료 센티널 판정표
 
