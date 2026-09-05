@@ -16,6 +16,56 @@ fixture_recent_read_count() {
   grep -c -- '--source recent-unwrapped' "$WRK_FIXTURE_LOG" 2>/dev/null || true
 }
 
+# The sentinel resolves herdr through the environment wrk pinned into it; record
+# what actually arrived so a test can assert the forwarding rather than the
+# spawner's intention.
+fixture_log_env() {
+  [[ -n "${WRK_FIXTURE_ENV_LOG:-}" ]] || return 0
+  printf 'HERDR_SESSION=%s HERDR_SOCKET_PATH=%s\n' \
+    "${HERDR_SESSION:-}" "${HERDR_SOCKET_PATH:-}" >>"$WRK_FIXTURE_ENV_LOG"
+}
+
+fixture_tab_of_pane() {
+  printf '%s\n' "${1//:p/:t}"
+}
+
+# 실 herdr 응답 모양 그대로: 상태와 tab_id 는 result.agent 아래에 있다
+# (2026-09-05 실측 — 옛 픽스처는 result 바로 아래에 뒀고, 그래서 잘못된 파서가
+# 테스트를 통과한 채 프로덕션에서 항상 빈 상태를 봤다).
+fixture_agent_get_result() {
+  local pane="$1" status="$2"
+  printf '{"id":"cli:agent:get","result":{"agent":{"agent":"codex","agent_status":"%s","pane_id":"%s","tab_id":"%s","workspace_id":"w"},"type":"agent_info"}}\n' \
+    "$status" "$pane" "$(fixture_tab_of_pane "$pane")"
+}
+
+# 에러 봉투는 stderr 로 나가고 종료 코드는 1 이다 — 실 herdr 와 같다.
+fixture_agent_get_error() {
+  printf '{"error":{"code":"%s","message":"fixture %s"},"id":"cli:agent:get"}\n' "$1" "$1" >&2
+  exit 1
+}
+
+# WRK_FIXTURE_GET_SEQUENCE 는 `agent get` 응답을 호출 순서대로 적은 파일이다.
+# 한 줄에 하나: empty | exit1 | socket | not-found | garbage | <상태이름>.
+# 줄이 소진되면 마지막 줄을 계속 반환한다.
+fixture_get_sequence_step() {
+  local pane="$1" calls index total token
+  calls="${WRK_FIXTURE_GET_SEQUENCE}.calls"
+  printf 'get\n' >>"$calls"
+  index="$(awk 'END{print NR}' "$calls")"
+  total="$(awk 'END{print NR}' "$WRK_FIXTURE_GET_SEQUENCE")"
+  if [[ "$total" -eq 0 ]]; then return 0; fi
+  if [[ "$index" -gt "$total" ]]; then index="$total"; fi
+  token="$(awk -v n="$index" 'NR==n{print; exit}' "$WRK_FIXTURE_GET_SEQUENCE")"
+  case "$token" in
+    empty) : ;;
+    exit1) exit 1 ;;
+    socket) fixture_agent_get_error transport_unavailable ;;
+    not-found) fixture_agent_get_error agent_not_found ;;
+    garbage) printf '%s\n' 'fixture herdr: not json at all' ;;
+    *) fixture_agent_get_result "$pane" "$token" ;;
+  esac
+}
+
 fixture_is_recent_unwrapped_read() {
   [[ " $* " == *" --source recent-unwrapped "* ]]
 }
@@ -68,11 +118,24 @@ case "${1:-}" in
         esac
         ;;
       get)
+        fixture_log_env
+        if [[ -n "${WRK_FIXTURE_GET_SEQUENCE:-}" && -f "${WRK_FIXTURE_GET_SEQUENCE}" ]]; then
+          fixture_get_sequence_step "${3:-w:p1}"
+          exit 0
+        fi
         case "$scenario" in
-          sentinel-working) printf '%s\n' '{"result":{"agent_status":"working"}}' ;;
-          sentinel-idle) printf '%s\n' '{"result":{"agent_status":"idle"}}' ;;
-          sentinel-done) printf '%s\n' '{"result":{"agent_status":"done"}}' ;;
-          *) printf '%s\n' '{"result":{"agent_status":"working"}}' ;;
+          sentinel-working) fixture_agent_get_result "${3:-w:p1}" working ;;
+          sentinel-idle) fixture_agent_get_result "${3:-w:p1}" idle ;;
+          sentinel-done) fixture_agent_get_result "${3:-w:p1}" "done" ;;
+          reap)
+            # w:p2 는 아직 일하는 pane 이다. 나머지는 회수 가능한 상태.
+            case "${3:-}" in
+              w1:p2) fixture_agent_get_result "${3:-}" working ;;
+              w1:p9) fixture_agent_get_error transport_unavailable ;;
+              *) fixture_agent_get_result "${3:-w1:p1}" idle ;;
+            esac
+            ;;
+          *) fixture_agent_get_result "${3:-w:p1}" working ;;
         esac
         ;;
       read)
@@ -116,7 +179,10 @@ case "${1:-}" in
           echo 'fixture herdr: tab create failed' >&2
           exit 9
         fi
-        printf '%s\n' '{"result":{"root_pane":{"pane_id":"w:p1"}}}'
+        printf '%s\n' '{"result":{"tab_id":"w:t1","root_pane":{"pane_id":"w:p1"}}}'
+        ;;
+      close)
+        printf '%s\n' '{"result":{"closed":"'"${3:-}"'"}}'
         ;;
       list)
         case "$scenario" in
@@ -134,6 +200,10 @@ case "${1:-}" in
             ;;
           name-sync)
             printf '%s\n' '{"result":{"tabs":[{"tab_id":"w:t1","label":"orch","workspace_id":"w"},{"tab_id":"w:t2","label":"2","workspace_id":"w"},{"tab_id":"w:t3","label":"build","workspace_id":"w"}]}}'
+            ;;
+          reap)
+            # w1:t4 는 pane 이 분할된 탭이다 — 닫으면 옆 pane 이 함께 죽는다.
+            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","label":"reap-ready","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t2","label":"reap-working","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t4","label":"reap-shared","pane_count":2,"workspace_id":"w1"}]}}'
             ;;
           *) printf '%s\n' '{"result":{"tabs":[]}}' ;;
         esac

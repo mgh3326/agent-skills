@@ -254,6 +254,17 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
 - `~/bin/herdr-spawn` 은 `wrk spawn` 으로 위임하는 shim 이다(옛 경로 호환용, 신규 사용 금지).
 - 브리프 주입과 제출 검증은 **relay-handoff 스킬 절차**를 따른다(제출 검증 생략 금지,
   접수 확인 도구 1회 지시 포함).
+- **완료 센티널**: job 이 arbiter 에 등록되면 `wrk spawn` 이 감시자를 분리 기동한다. 판정표와
+  환경변수(`WRK_SENTINEL_TRANSIENT_MAX`·`WRK_SENTINEL_LOST_GRACE`·`WRK_SENTINEL_HERDR_SESSION`)는
+  README "완료 센티널 판정표" 가 정본이다. 요지: **빈 `agent get` 응답은 pane 소멸의 증거가
+  아니다**(소켓 일시 정지·비기본 herdr 세션). 확정 소멸 에러 코드만 즉시 `job.lost` 이고,
+  일시 장애는 연속 10회(≈5분) 넘겨야 `job.lost(herdr_unreachable)` 이며, 그 뒤에도 30분
+  유예 동안 감시해 report 가 나오면 `job.completed` 를 추가로 쓴다. 판정은 잡 디렉토리
+  `completion-sentinel.log` 에 한 줄씩 남으니 "캡틴이 무한 대기" 를 의심할 땐 그 파일부터 봐라.
+  🔴 원격/데스크톱처럼 herdr 서버가 비기본 세션에 사는 호스트에서는 스폰 시
+  `HERDR_SESSION`(또는 `WRK_SENTINEL_HERDR_SESSION`)을 반드시 넘겨라 — 2026-09-04 에 이 값이
+  센티널에 닿지 않아 그날 스폰한 거의 모든 잡이 30초 만에 오탐 `job.lost` 로 찍혔고, 워커가
+  정상 완료해도 아무도 `job.completed` 를 쓰지 못해 사람이 3회 손으로 전달했다.
 - 감시는 `agent_status` **전이 기반**(working→비working 2분 지속 시 확인). kiro/agy는 status
   플랩(작업 중 idle/done 오표시) — 완료 판정은 상태가 아니라 **산출물/화면 마커**(PR URL·
   최종보고·inbox 파일)로. 스폰 후 5분 내 실 툴호출 없으면 stuck 판정→재스폰.
@@ -451,7 +462,33 @@ herdr pane list → 해당 workspace pane 전수
 (ROB-1214 로 wrk 가 스폰 실패 시 자기 pane 을 닫게 됐으므로 신규 누수는 줄지만,
 비정상 종료·수동 스폰 잔해는 계속 생긴다 — 스윕은 여전히 필요하다.)
 
-### 6-6. 백스톱
+### 6-6. `wrk reap` — 끝난 pane 일괄 회수
+
+수동 회수는 놓친다. 2026-09-04 하루에 40~60개 pane 이 쌓였고 ~50개를 사람이 손으로
+닫았다(pane 누적은 herdr 서버 fd·구독 부하로 직결된다). `wrk reap` 은 **인박스가
+증명한 것만** 닫는다 — 세션 기억도, `agent list` 추측도 아니다.
+
+```bash
+wrk reap --lane <내 세션 이름>              # dry-run: 닫을 목록만
+wrk reap --lane <내 세션 이름> --apply      # 실제 회수
+```
+
+후보 조건(전부 충족): terminal 이벤트(`job.completed`·`job.joined`·`job.revoked`)가 있고,
+그 이벤트가 `--grace`(기본 10m)보다 오래됐고, `job.spawned` 의 pane 이 herdr 에 살아 있고
+상태가 `idle`·`done` 이고, 아직 `job.reaped` 가 없을 것. `working`·`blocked` pane, terminal
+이벤트 없는 잡, herdr 가 해석 못 하는 pane 은 건드리지 않는다. 캡틴 pane 은
+`--include-captains` 없이는 제외한다. 닫은 잡에는 `job.reaped`(`pane_id`·`tab_id`·`at`)를 남긴다.
+
+🔴 `wrk reap` 은 §6-4 의 예외가 아니라 그 규칙이 적용되는 좁은 경로다. 닫는 대상은
+`wrk spawn` 이 **그 잡을 위해 직접 만든 탭**(`job.spawned` 의 `tab_id`)뿐이다 — 손으로
+스폰했거나 사람이 pane 을 분할해 붙인 탭은 `job.spawned` 기록이 없어 후보가 되지 않는다.
+수동 회수는 여전히 `pane close` 다.
+
+🔴 `wrk reap` 은 §6-2 의 **1번(job 이 terminal 인가)을 대신 판단하지 않는다.** terminal
+이벤트를 쓰는 것은 여전히 너의 판단이고, reap 은 그 판단이 파일로 남은 잡만 거둔다.
+결정을 기다리며 idle 인 세션(§6-3)에는 terminal 이벤트가 없으므로 자동으로 제외된다.
+
+### 6-7. 백스톱
 
 회수를 놓친 잔여는 계속 생긴다(세션 사망·compact·`--owner` 미지정 이력).
 **운영자 요청 시 스윕**은 이 규칙과 별개로 유지한다 — 자동화가 아니라 이중화다.

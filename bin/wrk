@@ -72,13 +72,14 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|find|name-sync|profiles|hosts> [options]
+Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT
   wrk joined JOB --pr URL --head SHA --report PATH
+  wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-captains]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -590,15 +591,19 @@ arbiter_record_spawn_receipt() {
   # absence explicitly for downstream recovery rather than pretending success.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc
-  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" <<'PY'
+  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" <<'PY'
 import json, sys
-pane_id, label, profile, workspace = sys.argv[1:]
-print(json.dumps({
+pane_id, label, profile, workspace, tab_id = sys.argv[1:]
+receipt = {
     "pane_id": pane_id,
     "label": label,
     "profile": profile,
     "workspace": workspace,
-}, ensure_ascii=False, separators=(",", ":")))
+}
+# Additive and optional: existing consumers keep reading the four fields above.
+if tab_id:
+    receipt["tab_id"] = tab_id
+print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
 PY
 )"; then
     warn "arbiter job.spawned receipt preparation failed; spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
@@ -1000,7 +1005,7 @@ resolve_profile() {
 }
 
 completion_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}"
+  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}" reason="${7:-}"
   local events host last
   events="$(wrk_jobs_root)/$job/events"
   host="${HOSTNAME:-unknown}"
@@ -1010,9 +1015,9 @@ completion_event() {
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" <<'PY'
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" <<'PY'
 import json, os, sys, tempfile, time
-events, job, owner, label, pane, host, report, last, kind = sys.argv[1:]
+events, job, owner, label, pane, host, report, last, kind, reason = sys.argv[1:]
 highest = 0
 for name in os.listdir(events):
     try: highest = max(highest, int(name.split('-', 1)[0]))
@@ -1020,6 +1025,9 @@ for name in os.listdir(events):
 record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
           "pane_id": pane, "host": host, "report_path": report,
           "report_last_line": last, "epoch": 1}
+# job.lost always states why. Downstream recovery treats agent_not_found as a
+# vanished pane and herdr_unreachable/timeout as an observation gap.
+if reason: record["reason"] = reason
 fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
 try:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1277,36 +1285,186 @@ joined_cmd() {
   echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
 }
 
+# herdr 관측 3분류. 확정 소멸(gone)만 job.lost 로 이어지고, 나머지 장애는 일시
+# 장애(transient)로 재시도한다. 빈 출력은 소멸의 증거가 아니다 — 소켓 일시 정지,
+# 서버가 다른 세션에 있는 호스트, 타임아웃 모두 빈 출력을 낸다(2026-09-04: 그날
+# 스폰한 거의 모든 잡이 30초 만에 job.lost 로 찍히고 센티널이 죽어, 워커가 정상
+# 완료해도 job.completed 를 아무도 쓰지 못했다).
+SENTINEL_GONE_CODES="agent_not_found pane_not_found tab_not_found terminal_not_found no_such_agent no_such_pane"
+
+# "<class><TAB><token><TAB><tab_id>" 를 출력한다.
+#   class ∈ ok|transient|gone
+#   token = 로그의 status 필드(상태 이름 | empty | err:<code>)
+herdr_agent_probe() {
+  local pane="$1" out="" rc=0
+  set +e
+  # 🔴 두 스트림을 함께 읽는다. herdr 는 에러 봉투를 **stderr** 로 내보내고 1 로
+  # 끝낸다(2026-09-05 실측: `{"error":{"code":"agent_not_found",…}}` 가 stderr).
+  # stdout 만 보면 확정 소멸이 영원히 "빈 값" 으로 보인다.
+  out="$("$HERDR" agent get "$pane" 2>&1)"
+  rc=$?
+  set -e
+  python3 - "$rc" "$SENTINEL_GONE_CODES" "$out" <<'PY' 2>/dev/null || printf 'transient\terr:probe\t\n'
+import json, sys
+
+rc, gone_codes, raw = sys.argv[1], set(sys.argv[2].split()), sys.argv[3].strip()
+
+
+def emit(kind, token, tab=""):
+    print(kind, token, tab, sep="\t")
+    raise SystemExit(0)
+
+
+def documents(text):
+    """봉투가 로그 줄과 섞여 와도 JSON 만 골라낸다."""
+    try:
+        yield json.loads(text)
+        return
+    except ValueError:
+        pass
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            yield json.loads(line)
+        except ValueError:
+            continue
+
+
+def status_and_tab(document):
+    # 실 herdr: {"result":{"agent":{"agent_status":…,"tab_id":…}}}.
+    # 옛 응답(result 바로 아래)과 agent_info 변형도 함께 받는다.
+    result = document.get("result", document)
+    if not isinstance(result, dict):
+        return "", ""
+    scopes = [result]
+    for key in ("agent", "agent_info", "pane"):
+        value = result.get(key)
+        if isinstance(value, dict):
+            scopes.append(value)
+    for scope in scopes:
+        status = scope.get("agent_status")
+        if isinstance(status, str) and status.strip():
+            tab = scope.get("tab_id") or result.get("tab_id") or ""
+            return status.strip(), tab if isinstance(tab, str) else ""
+    return "", ""
+
+
+if not raw:
+    emit("transient", "empty" if rc == "0" else "err:exit%s" % rc)
+for document in documents(raw):
+    if not isinstance(document, dict):
+        continue
+    error = document.get("error")
+    if isinstance(error, str):
+        error = {"code": error}
+    if isinstance(error, dict):
+        code = error.get("code") or error.get("message") or "unknown"
+        code = "_".join(str(code).split())[:64]
+        emit("gone" if code in gone_codes else "transient", "err:%s" % code)
+    status, tab = status_and_tab(document)
+    if status:
+        emit("ok", status, tab)
+emit("transient", "err:parse")
+PY
+}
+
+# 판정 1건 = 로그 1줄. 회전은 없다(잡 디렉토리 수명과 같다).
+sentinel_log() {
+  local logfile="$1" token="$2" transient="$3" action="$4"
+  printf '%s status=%s transient=%s action=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$token" "$transient" "$action" >>"$logfile" 2>/dev/null || true
+}
+
 sentinel_cmd() {
-  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}" timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
+  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}"
+  local timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
+  local interval="${WRK_COMPLETION_INTERVAL_S:-30}"
+  local transient_max="${WRK_SENTINEL_TRANSIENT_MAX:-10}"
+  local lost_grace="${WRK_SENTINEL_LOST_GRACE:-1800}"
   [[ -n "$job" && -n "$owner" && -n "$label" && -n "$pane" ]] || exit 2
-  local started seen
+  local jobdir logfile started seen transient lost lost_at
+  jobdir="$(wrk_jobs_root)/$job"
+  mkdir -p "$jobdir"
+  logfile="$jobdir/completion-sentinel.log"
   started="$(date +%s)"
   seen=""
+  transient=0
+  lost=0
+  lost_at=0
   while :; do
-    local now status candidate key
+    local now probe class token candidate key action
     now="$(date +%s)"
-    if (( now - started >= timeout )); then
-      completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost
+    probe="$(herdr_agent_probe "$pane")"
+    IFS=$'\t' read -r class token _ <<<"$probe"
+    action=none
+    candidate=""
+    key=""
+    case "$class" in
+      gone)
+        transient=0
+        if [[ "$lost" -eq 0 ]]; then action="lost:agent_not_found"; fi
+        ;;
+      ok)
+        transient=0
+        candidate="$report"
+        if [[ -z "$candidate" || ! -f "$candidate" ]]; then
+          candidate="$(find_latest_report "$jobdir")"
+        fi
+        key="$(report_observation_key "$candidate" 2>/dev/null || true)"
+        if [[ ( "$token" == "done" || "$token" == "idle" ) && -n "$candidate" && -f "$candidate" && -n "$key" && "$key" != "$seen" ]]; then
+          action=completed
+        fi
+        ;;
+      *)
+        # 일시 장애. 연속 관측 실패가 임계를 넘을 때에만 소멸로 판정한다.
+        transient=$(( transient + 1 ))
+        if [[ "$lost" -eq 0 ]] && (( transient > transient_max )); then
+          action="lost:herdr_unreachable"
+        fi
+        ;;
+    esac
+    if [[ "$action" == none && "$lost" -eq 0 ]] && (( now - started >= timeout )); then
+      action="lost:timeout"
+    fi
+    sentinel_log "$logfile" "$token" "$transient" "$action"
+    case "$action" in
+      completed)
+        completion_event "$job" "$owner" "$label" "$pane" "$candidate"
+        seen="$key"
+        [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
+        # lost 뒤의 completed 는 유효하다(panewire 가 completed 를 relay 한다).
+        # 유예 감시의 목적을 달성했으므로 여기서 끝낸다.
+        if [[ "$lost" -eq 1 ]]; then exit 0; fi
+        ;;
+      lost:*)
+        completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}"
+        lost=1
+        lost_at="$now"
+        ;;
+    esac
+    if [[ "$lost" -eq 1 ]] && (( now - lost_at >= lost_grace )); then
       exit 0
     fi
-    status="$($HERDR agent get "$pane" 2>/dev/null | python3 -c 'import json,sys; o=json.load(sys.stdin); print(o.get("result",o).get("agent_status", ""))' 2>/dev/null || true)"
-    if [[ -z "$status" ]]; then
-      completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost
-      exit 0
-    fi
-    candidate="$report"
-    if [[ -z "$candidate" || ! -f "$candidate" ]]; then
-      candidate="$(find_latest_report "$(wrk_jobs_root)/$job")"
-    fi
-    key="$(report_observation_key "$candidate" 2>/dev/null || true)"
-    if [[ ( "$status" == "done" || "$status" == "idle" ) && -f "$candidate" && -n "$key" && "$key" != "$seen" ]]; then
-      completion_event "$job" "$owner" "$label" "$pane" "$candidate"
-      seen="$key"
-      [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
-    fi
-    sleep "${WRK_COMPLETION_INTERVAL_S:-30}"
+    sleep "$interval"
   done
+}
+
+# 스폰 시점의 herdr 컨텍스트를 센티널 환경에 명시적으로 박아 넣는다. 분리된
+# 센티널은 터미널에서 유도되는 세션 컨텍스트를 잃고, 서버가 비기본 세션에 있는
+# 호스트에서는 기본 소켓을 물어 `agent get` 이 항상 빈 값을 냈다.
+# WRK_SENTINEL_HERDR_SESSION/WRK_SENTINEL_HERDR_SOCKET 로 스폰 측이 명시 지정할
+# 수 있고, 없으면 wrk 자신이 쓰던 값을 그대로 물려준다.
+build_sentinel_env() {
+  SENTINEL_ENV=()
+  local session socket
+  session="${WRK_SENTINEL_HERDR_SESSION:-${HERDR_SESSION:-}}"
+  socket="${WRK_SENTINEL_HERDR_SOCKET:-${HERDR_SOCKET_PATH:-}}"
+  [[ -z "$session" ]] || SENTINEL_ENV+=("HERDR_SESSION=$session")
+  [[ -z "$socket" ]] || SENTINEL_ENV+=("HERDR_SOCKET_PATH=$socket")
+  [[ -z "${HERDR_BIN_PATH:-}" ]] || SENTINEL_ENV+=("HERDR_BIN_PATH=$HERDR_BIN_PATH")
+  [[ -z "$HERDR" ]] || SENTINEL_ENV+=("HERDR_BIN=$HERDR")
 }
 
 start_completion_sentinel() {
@@ -1320,7 +1478,12 @@ start_completion_sentinel() {
     fi
   fi
   rm -f "$pidfile"
-  ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
+  build_sentinel_env
+  if [[ "${#SENTINEL_ENV[@]}" -gt 0 ]]; then
+    ( nohup env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
+  else
+    ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
+  fi
 }
 
 # Spill-over placement is intentionally implemented outside spawn_cmd(): once a
@@ -1808,6 +1971,7 @@ spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" CAPTAIN_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
+  TAB_CREATE_JSON="" TAB_ID=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
@@ -1909,12 +2073,26 @@ spawn_cmd() {
               --env "ARBITER_STARTED_AT=$ARBITER_STARTED_AT")
   fi
   if [[ "${#TAB_ENV[@]}" -gt 0 ]]; then
-    PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}" |
-      python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+    TAB_CREATE_JSON=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}")
   else
-    PANE=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus |
-      python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+    TAB_CREATE_JSON=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus)
   fi
+  PANE=$(printf '%s' "$TAB_CREATE_JSON" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["root_pane"]["pane_id"])')
+  # tab_id is what `wrk reap` later closes. It is recorded as evidence, never as
+  # a requirement: an older herdr that omits it leaves reap to resolve the tab
+  # from `agent get` instead.
+  TAB_ID=$(printf '%s' "$TAB_CREATE_JSON" | python3 -c '
+import json, sys
+try:
+    result = json.load(sys.stdin).get("result", {})
+except (ValueError, AttributeError):
+    raise SystemExit(0)
+pane = result.get("root_pane") if isinstance(result.get("root_pane"), dict) else {}
+tab = result.get("tab") if isinstance(result.get("tab"), dict) else {}
+value = result.get("tab_id") or tab.get("tab_id") or pane.get("tab_id") or ""
+print(value if isinstance(value, str) else "")
+' 2>/dev/null || true)
   SPAWN_PANE_OPEN=1   # ROB-1214: disarmed only at the success line
   sleep_for 5
   START_TIMEOUT=30000; BOOT_SETTLE=12
@@ -1998,6 +2176,10 @@ spawn_cmd() {
   fi
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
+  # An older herdr may not report the tab in `tab create`; the agent knows it.
+  if [[ -z "$TAB_ID" ]]; then
+    IFS=$'\t' read -r _ _ TAB_ID <<<"$(herdr_agent_probe "$PANE")" || TAB_ID=""
+  fi
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   arbiter_record_spawn_receipt
   # A sentinel requires the durable claim/spawn metadata it later reads. During
@@ -2019,6 +2201,253 @@ spawn_cmd() {
       return "$WRK_EXIT_LANDING_UNCONFIRMED"
     fi
     warn "spawn succeeded but brief landed=no; pane=$PANE remains valid; $LANDING_NO_DETAIL"
+  fi
+}
+
+reap_help() {
+  cat <<'USAGE'
+Usage: wrk reap [--lane LANE] [--grace DURATION] [--apply] [--include-captains]
+
+Close the herdr tabs of jobs that already reported a terminal event, so that
+finished worker/verifier panes stop accumulating on the herdr server.
+
+A job is a candidate only when all of these hold:
+  · it has a terminal event (job.completed, job.joined or job.revoked)
+  · that terminal event is older than --grace (default 10m)
+  · its recorded pane still exists in herdr and its status is idle or done
+  · it has not been reaped before (no job.reaped event)
+
+working/blocked panes, jobs without a terminal event and jobs whose pane herdr
+cannot resolve are never touched. Captain panes (claim role=captain) are
+excluded unless --include-captains is given.
+
+Options:
+  --lane LANE        only jobs whose claim owner_lane is LANE
+  --grace DURATION   minimum age of the terminal event (10m, 600s, 2h, 600)
+  --apply            actually close the tabs; without it reap only lists them
+  --include-captains also reap captain panes
+  -h, --help         show this usage
+
+The default is a dry run: nothing is closed and no event is written. Each
+closed job records a flat job.reaped event (pane_id, tab_id, at).
+USAGE
+}
+
+# 10m / 600s / 2h / 600 → 초. 알 수 없는 형식은 실패한다(조용히 0 으로 떨어지면
+# grace 없는 회수가 되어버린다).
+parse_duration_s() {
+  local value="$1"
+  python3 - "$value" <<'PY'
+import re, sys
+text = sys.argv[1].strip()
+match = re.fullmatch(r"(\d+)([smhd]?)", text)
+if not match:
+    raise SystemExit(1)
+scale = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2)]
+print(int(match.group(1)) * scale)
+PY
+}
+
+# 회수 후보를 "job<TAB>owner<TAB>pane<TAB>tab<TAB>age_s" 로 출력한다. herdr 는
+# 여기서 묻지 않는다 — 인박스만 읽는 순수 판정이다.
+reap_candidates() {
+  local root="$1" lane="$2" grace="$3" include_captains="$4"
+  python3 - "$root" "$lane" "$grace" "$include_captains" <<'PY'
+import datetime, json, os, sys, time
+
+root, lane, grace, include_captains = sys.argv[1:5]
+grace = int(grace)
+include_captains = include_captains == "1"
+TERMINAL = {"job.completed", "job.joined", "job.revoked"}
+now = time.time()
+
+
+def moment_of(value, fallback):
+    if not isinstance(value, str) or not value.strip():
+        return fallback
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return fallback
+    if parsed.tzinfo is None:
+        parsed = parsed.astimezone()
+    return parsed.timestamp()
+
+
+try:
+    jobs = sorted(os.listdir(root))
+except OSError:
+    raise SystemExit(0)
+
+for job in jobs:
+    events_dir = os.path.join(root, job, "events")
+    if not os.path.isdir(events_dir):
+        continue
+    owner = pane = tab = role = ""
+    terminal_at = None
+    reaped = False
+    try:
+        names = sorted(os.listdir(events_dir))
+    except OSError:
+        continue
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(events_dir, name)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                document = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(document, dict):
+            continue
+        payload = document.get("payload", document)
+        if not isinstance(payload, dict):
+            payload = {}
+        kind = document.get("kind")
+        if kind in ("job.claim", "job.reclaim"):
+            owner = payload.get("owner_lane") if isinstance(payload.get("owner_lane"), str) else ""
+            role = payload.get("role") if isinstance(payload.get("role"), str) else ""
+        for key in ("pane_id", "tab_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value:
+                if key == "pane_id":
+                    pane = value
+                else:
+                    tab = value
+        if kind == "job.reaped":
+            reaped = True
+        if kind in TERMINAL:
+            try:
+                fallback = os.path.getmtime(path)
+            except OSError:
+                fallback = now
+            terminal_at = moment_of(document.get("created_at") or payload.get("at"), fallback)
+    if reaped or terminal_at is None or not pane:
+        continue
+    if lane and owner != lane:
+        continue
+    if role == "captain" and not include_captains:
+        continue
+    age = int(now - terminal_at)
+    if age < grace:
+        continue
+    print(job, owner, pane, tab, age, sep="\t")
+PY
+}
+
+# "tab_id<TAB>pane_count" 목록. 회수는 잡의 탭만 닫아야 하고, pane 이 분할된 탭을
+# 닫으면 옆 pane 이 함께 죽는다(2026-07-20 실사고: 수동 스폰한 캡틴 pane 동반 사망).
+reap_tab_pane_counts() {
+  "$HERDR" tab list 2>/dev/null | python3 -c '
+import json, sys
+try:
+    tabs = json.load(sys.stdin).get("result", {}).get("tabs", [])
+except (ValueError, AttributeError):
+    raise SystemExit(0)
+for tab in tabs:
+    if isinstance(tab, dict) and isinstance(tab.get("tab_id"), str):
+        count = tab.get("pane_count")
+        print(tab["tab_id"], count if isinstance(count, int) else 1, sep="\t")
+' 2>/dev/null || true
+}
+
+reap_event() {
+  local job="$1" owner="$2" pane="$3" tab="$4"
+  local events
+  events="$(wrk_jobs_root)/$job/events"
+  mkdir -p "$events"
+  python3 - "$events" "$job" "$owner" "$pane" "$tab" "${HOSTNAME:-unknown}" <<'PY'
+import datetime, json, os, sys, tempfile
+events, job, owner, pane, tab, host = sys.argv[1:]
+highest = 0
+for name in os.listdir(events):
+    try: highest = max(highest, int(name.split('-', 1)[0]))
+    except (ValueError, IndexError): pass
+record = {"kind": "job.reaped", "job_id": job, "owner_lane": owner,
+          "pane_id": pane, "tab_id": tab, "host": host,
+          "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
+          "epoch": 1}
+fd, temporary = tempfile.mkstemp(prefix='.reaped-', dir=events)
+try:
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        json.dump(record, f, separators=(',', ':'))
+        f.write('\n')
+    os.chmod(temporary, 0o600)
+    os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-job.reaped.json'))
+finally:
+    if os.path.exists(temporary): os.unlink(temporary)
+PY
+}
+
+reap_cmd() {
+  local lane="" grace="10m" apply=0 include_captains=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) reap_help; return 0 ;;
+      --lane) [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a value"; lane="$2"; shift 2 ;;
+      --grace) [[ $# -ge 2 && -n "$2" ]] || die "--grace requires a value"; grace="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      --include-captains) include_captains=1; shift ;;
+      -*) die "unknown reap option '$1'" ;;
+      *) die "unexpected argument '$1'" ;;
+    esac
+  done
+  local grace_s jobs_root candidates
+  grace_s="$(parse_duration_s "$grace")" || die "invalid --grace '$grace' (use 600, 600s, 10m, 2h or 1d)"
+  jobs_root="$(wrk_jobs_root)"
+  if [[ ! -d "$jobs_root" ]]; then
+    echo "reap: no job inbox at $jobs_root"
+    return 0
+  fi
+  [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
+  candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_captains")"
+  local tab_counts
+  tab_counts="$(reap_tab_pane_counts)"
+  local job owner pane tab age probe class token probe_tab panes acted=0
+  while IFS=$'\t' read -r job owner pane tab age; do
+    [[ -n "$job" ]] || continue
+    probe="$(herdr_agent_probe "$pane")"
+    IFS=$'\t' read -r class token probe_tab <<<"$probe"
+    if [[ "$class" != ok ]]; then
+      # An unresolvable pane is not a reapable pane: it may be a paused socket
+      # rather than a closed tab, and closing a tab id nobody confirmed is worse
+      # than leaving it. `wrk reap` never guesses.
+      echo "skip job=$job pane=$pane reason=pane-unresolved($token)"
+      continue
+    fi
+    case "$token" in
+      idle|done) ;;
+      *) echo "skip job=$job pane=$pane reason=status=$token"; continue ;;
+    esac
+    [[ -n "$tab" ]] || tab="$probe_tab"
+    if [[ -z "$tab" ]]; then
+      echo "skip job=$job pane=$pane reason=tab-unresolved"
+      continue
+    fi
+    panes="$(awk -v want="$tab" -F'\t' '$1==want{print $2; exit}' <<<"$tab_counts")"
+    if [[ -n "$panes" && "$panes" -gt 1 ]]; then
+      echo "skip job=$job pane=$pane tab=$tab reason=tab-shared(panes=$panes)"
+      continue
+    fi
+    if [[ "$apply" -eq 1 ]]; then
+      if "$HERDR" tab close "$tab" >/dev/null 2>&1; then
+        reap_event "$job" "$owner" "$pane" "$tab"
+        echo "closed job=$job pane=$pane tab=$tab status=$token age=${age}s"
+        acted=$(( acted + 1 ))
+      else
+        echo "skip job=$job pane=$pane tab=$tab reason=tab-close-failed"
+      fi
+    else
+      echo "would-close job=$job pane=$pane tab=$tab status=$token age=${age}s"
+      acted=$(( acted + 1 ))
+    fi
+  done <<<"$candidates"
+  if [[ "$apply" -eq 1 ]]; then
+    echo "reap: closed $acted tab(s)"
+  else
+    echo "reap: $acted candidate(s) (dry-run; re-run with --apply to close)"
   fi
 }
 
@@ -2167,6 +2596,7 @@ case "${1:-}" in
   escalate) shift; escalate_cmd "$@" ;;
   joined) shift; joined_cmd "$@" ;;
   sentinel) shift; sentinel_cmd "$@" ;;
+  reap) shift; reap_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;
