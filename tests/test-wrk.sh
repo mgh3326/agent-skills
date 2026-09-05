@@ -59,6 +59,34 @@ expect_exit() {
   fi
 }
 
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+event_count() {
+  find "$1" -name "*$2.json" 2>/dev/null | wc -l | tr -d ' '
+}
+
+wait_until() {
+  local limit="$1"; shift
+  local deadline=$(( $(date +%s) + limit ))
+  while (( $(date +%s) <= deadline )); do
+    if "$@"; then return 0; fi
+    sleep 0.2
+  done
+  return 1
+}
+
+event_count_is() {
+  [[ "$(event_count "$1" "$2")" -eq "$3" ]]
+}
+
+sentinel_lost_reason() {
+  python3 - "$1" <<'PY'
+import glob, json, sys
+for path in sorted(glob.glob(sys.argv[1] + "/*job.lost.json")):
+    print(json.load(open(path)).get("reason", ""))
+PY
+}
+
 # --t is required by wrk; supply one unless the case under test provides its own.
 spawn_base() {
   local model="$1"; shift
@@ -1181,13 +1209,16 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 0 ]]
+event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 0 ||
+  fail "a job with no report is not complete, whatever the pane status says (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/sentinel-idle/report.md"
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 1 ||
+  fail "an idle pane plus a fresh report is exactly one job.completed (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 printf 'updated report line\n' >>"$SENTINEL_INBOX/sentinel-idle/report.md"
 sleep 2
-[[ "$(find "$SENTINEL_INBOX/sentinel-idle/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 2 ]]
+event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 2 ||
+  fail "an updated report at the same path is a new observation, so a second job.completed follows (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 kill "$sentinel_idle_pid" 2>/dev/null || true
 wait "$sentinel_idle_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-portable-discovery-and-dedupe"
@@ -1208,34 +1239,6 @@ echo "PASS r18-sentinel-accepts-done-status"
 # ---------------------------------------------------------------------------
 # 센티널 판정: 빈 값은 소멸의 증거가 아니다 (job.lost 오탐 수정)
 # ---------------------------------------------------------------------------
-
-fail() { echo "FAIL: $*" >&2; exit 1; }
-
-event_count() {
-  find "$1" -name "*$2.json" 2>/dev/null | wc -l | tr -d ' '
-}
-
-wait_until() {
-  local limit="$1"; shift
-  local deadline=$(( $(date +%s) + limit ))
-  while (( $(date +%s) <= deadline )); do
-    if "$@"; then return 0; fi
-    sleep 0.2
-  done
-  return 1
-}
-
-event_count_is() {
-  [[ "$(event_count "$1" "$2")" -eq "$3" ]]
-}
-
-sentinel_lost_reason() {
-  python3 - "$1" <<'PY'
-import glob, json, sys
-for path in sorted(glob.glob(sys.argv[1] + "/*job.lost.json")):
-    print(json.load(open(path)).get("reason", ""))
-PY
-}
 
 # (a) 빈 출력·exit 1·JSON 파싱 실패·소켓 에러가 연속 임계 미만이면 소멸이 아니다.
 # 그 뒤 정상 상태가 오면 판정은 completed 여야 하고 job.lost 는 하나도 없어야 한다.
