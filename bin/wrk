@@ -1001,6 +1001,77 @@ finally:
 PY
 }
 
+# R20 T3: the record files written above stay the durable contract — the node
+# still finds them by rescanning the directory, and the panewire outbox picks
+# up anything a live emit missed. `panewire emit` is only an extra, immediate
+# notification that removes that rescan delay, so it must never change what
+# `wrk` writes, prints, or exits with.
+#
+# `tr` turns the report's final newline into a trailing space, which plain
+# command substitution would then eat along with the newline `cut` appends. The
+# record files keep that space, so the value travels through a variable and
+# only the trailing newlines are dropped — anything else and the emit payload
+# stops being byte-identical to the record file the node also reads.
+EMIT_REPORT_LAST_LINE=""
+set_report_last_line() {
+  local report="${1:-}"
+  EMIT_REPORT_LAST_LINE=""
+  [[ -n "$report" && -f "$report" ]] || return 0
+  EMIT_REPORT_LAST_LINE="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240; printf x)"
+  EMIT_REPORT_LAST_LINE="${EMIT_REPORT_LAST_LINE%x}"
+  while [[ "$EMIT_REPORT_LAST_LINE" == *$'\n' ]]; do
+    EMIT_REPORT_LAST_LINE="${EMIT_REPORT_LAST_LINE%$'\n'}"
+  done
+}
+
+# emit_relay_event KIND JOB OWNER LABEL PANE HOST REPORT LAST REASON QUESTION PR HEAD
+#
+# Called only after the record file landed, and only for the three kinds
+# panewire accepts (job.completed / job.escalate / job.joined). job.lost is not
+# one of them, so the sentinel deliberately does not come through here.
+# Always returns 0: a missing, failing or wedged panewire is a warning on
+# stderr and nothing else.
+emit_relay_event() {
+  local kind="$1" job="$2" owner="$3" label="$4" pane="$5" host="$6" report="$7"
+  local last="$8" reason="$9" question="${10}" pr="${11}" head="${12}"
+  local panewire rc=0
+  panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
+  if [[ -z "$panewire" ]]; then
+    warn "panewire not found; relay event left as file only (job=$job kind=$kind)"
+    return 0
+  fi
+  # A wedged socket must not stall `wrk joined`; that call sits in the captain
+  # loop, so a hang there stops the fleet. `timeout` is GNU coreutils and a
+  # stock macOS has neither it nor gtimeout, so python3 — already a hard
+  # dependency above — carries the same guard there.
+  local guard=(timeout 5)
+  if ! command -v timeout >/dev/null 2>&1; then
+    if command -v gtimeout >/dev/null 2>&1; then
+      guard=(gtimeout 5)
+    else
+      guard=(python3 -c 'import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)' 5)
+    fi
+  fi
+  local command=("${guard[@]}" "$panewire" emit --kind "$kind" --job "$job" --report "$report"
+    --owner-lane "$owner" --epoch 1 --label "$label" --host "$host" --pane "$pane"
+    --report-last-line "$last")
+  # Empty optionals are omitted rather than passed as empty strings.
+  [[ -z "$reason" ]] || command+=(--reason "$reason")
+  [[ -z "$question" ]] || command+=(--question "$question")
+  [[ -z "$pr" ]] || command+=(--pr "$pr")
+  [[ -z "$head" ]] || command+=(--head "$head")
+  # `|| rc=$?` keeps a non-zero emit from tripping `set -e`; stdout is swallowed
+  # so the caller's single OK line stays the only thing on it.
+  "${command[@]}" >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -eq 0 ]] ||
+    warn "panewire emit failed (rc=$rc job=$job kind=$kind); relay event left as file only"
+  return 0
+}
+
 # Keep this exactly aligned with arbiter.inbox_root(): ARBITER_INBOX_ROOT is
 # the jobs directory, rather than its parent.
 wrk_jobs_root() {
@@ -1083,6 +1154,9 @@ done_cmd() {
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
   completion_event "$job" "$owner" "$label" "$pane" "$report"
+  set_report_last_line "$report"
+  emit_relay_event job.completed "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
+    "$report" "$EMIT_REPORT_LAST_LINE" "" "" "" ""
   echo "OK job=$job report=$report"
 }
 
@@ -1145,6 +1219,8 @@ escalate_cmd() {
   metadata="$(captain_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent <<<"$metadata"
   captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "" "captain escalation" "$question" "" ""
+  emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
+    "" "" "captain escalation" "$question" "" ""
   echo "OK job=$job owner_lane=$owner kind=job.escalate"
 }
 
@@ -1164,6 +1240,9 @@ joined_cmd() {
   metadata="$(captain_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent <<<"$metadata"
   captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "captain joined PR" "" "$pr" "$head"
+  set_report_last_line "$report"
+  emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
+    "$report" "$EMIT_REPORT_LAST_LINE" "captain joined PR" "" "$pr" "$head"
   echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
 }
 

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Stand-in for `panewire` so the suite never reaches a real socket, daemon or
+# hub. Silent and successful by default; the R20 cases opt into capture and
+# failure through the environment.
+#
+#   WRK_PANEWIRE_LOG    append one argv element per line, then a `--` separator
+#   WRK_PANEWIRE_RC     exit code to return (default 0)
+#   WRK_PANEWIRE_SLEEP  seconds to stall before returning, to exercise timeouts
+set -euo pipefail
+
+if [[ -n "${WRK_PANEWIRE_LOG:-}" ]]; then
+  {
+    for argument in "$@"; do printf '%s\n' "$argument"; done
+    printf -- '--\n'
+  } >>"$WRK_PANEWIRE_LOG"
+fi
+
+[[ -z "${WRK_PANEWIRE_SLEEP:-}" ]] || sleep "$WRK_PANEWIRE_SLEEP"
+
+exit "${WRK_PANEWIRE_RC:-0}"

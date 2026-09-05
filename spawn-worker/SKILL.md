@@ -222,8 +222,11 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
 - kiro 워커: "Linear는 읽기만, 이슈·코멘트 변경 금지" 필수(kiro Linear MCP는 write 가능).
 - 무인 워커는 승인 우회 플래그 필요(codex `--yolo`, agy `--dangerously-skip-permissions`) —
   `wrk spawn` 프로필 매핑에 내장. mock 레인은 `-L mock` + `MOCK_MCP_PROFILE` 필수.
-- **스폰 = Linear 기록 의무**: 착수 시 이슈 등록/코멘트(이슈번호 명시). 태스크 상태는 세션
-  기억이 아니라 Linear가 정본 — 놓침 방지의 근간.
+- **스폰 = handoffkeep tasks 기록 의무**: 스폰과 매 라운드를 tasks 큐에 기록한다
+  (`claim` · `transition` · `refs`(`--pr`/`--head-sha`/`--report-path`/`--job-id`)). 태스크
+  상태의 정본은 세션 기억이 아니라 **tasks 큐**다 — 놓침 방지의 근간. Linear는 **캡틴급
+  태스크(PR 1건 루프) 중 진행 중인 것만** fable이 1:1 이슈로 관리한다. **워커·검증자 단위
+  이슈는 만들지 않는다.**
 
 ## 4. 기동·주입·감시
 

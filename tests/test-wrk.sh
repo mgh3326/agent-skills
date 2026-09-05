@@ -23,6 +23,12 @@ export ARBITER_BIN="$TMP/absent-arbiter"
 export XDG_DATA_HOME="$TMP/xdg"
 export ARBITER_INBOX_ROOT="$TMP/inbox"
 
+# R20: `wrk done/escalate/joined` now notify panewire. The suite must never
+# reach a real one, so every case runs against the silent fixture below; the
+# R20 section opts into capture, failure and stalling through its environment.
+PANEWIRE="$ROOT/tests/fixtures/panewire"
+export PANEWIRE_BIN="$PANEWIRE"
+
 run_fail() {
   if "$@" >/dev/null 2>&1; then
     echo "expected failure: $*" >&2
@@ -904,6 +910,228 @@ PY
 real_done_case default
 real_done_case configured
 echo "PASS wrk-done-uses-arbiter-inbox-root-default-and-override"
+
+# ── R20 T3: wrk notifies panewire once the record file has landed ────────────
+# The event file stays the durable contract and the offline fallback; emit is
+# only an extra notification that saves the node a directory rescan. It must
+# never change wrk's stdout, its exit code, or how long wrk takes to return.
+R20_HELPER="$TMP/r20_emit.py"
+cat >"$R20_HELPER" <<'PY'
+import json
+import pathlib
+
+
+def calls(log):
+    """One list of argv elements per captured `panewire` invocation."""
+    out, current = [], []
+    for line in pathlib.Path(log).read_text(encoding="utf-8").split("\n")[:-1]:
+        if line == "--":
+            out.append(current)
+            current = []
+        else:
+            current.append(line)
+    assert not current, current
+    return out
+
+
+def flags(call):
+    assert call[0] == "emit", call
+    assert len(call) % 2 == 1, call
+    return {call[i]: call[i + 1] for i in range(1, len(call), 2)}
+
+
+def record(events, kind):
+    for path in sorted(pathlib.Path(events).glob("*.json")):
+        event = json.loads(path.read_text(encoding="utf-8"))
+        if event.get("kind") == kind:
+            return event
+    raise AssertionError(f"no {kind} record under {events}")
+
+
+def assert_matches_record(call, event):
+    """Every field the two relay paths share must carry the record's value."""
+    got = flags(call)
+    assert got["--kind"] == event["kind"], (got, event)
+    assert got["--job"] == event["job_id"], (got, event)
+    assert got["--epoch"] == str(event["epoch"]) == "1", (got, event)
+    assert got["--owner-lane"] == event["owner_lane"], (got, event)
+    assert got["--label"] == event["label"], (got, event)
+    assert got["--pane"] == event["pane_id"], (got, event)
+    assert got["--host"] == event["host"], (got, event)
+    assert got["--report"] == event["report_path"], (got, event)
+    assert got["--report-last-line"] == event["report_last_line"], (got, event)
+    for option, field in (
+        ("--reason", "reason"), ("--question", "question"), ("--pr", "pr"), ("--head", "head")
+    ):
+        assert got.get(option, "") == event.get(field, ""), (option, got, event)
+    return got
+PY
+
+R20_INBOX="$TMP/r20-inbox"
+R20_REPORT="$TMP/r20-report.md"
+printf 'R20 report terminal line\n' >"$R20_REPORT"
+r20_arb() { env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" "$ARBITER" "$@"; }
+r20_claim() {  # a spawned worker job the completion commands can read back
+  r20_arb claim --job "$1" --lane lane-a --agent-label wrk-a --t T1 "${@:2}" >/dev/null
+  r20_arb event --job "$1" --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+}
+
+# TW1 — the exact artifacts the production arbiter and wrk writers emit. The
+# record files must stay byte-identical to the committed R19a fixture (no
+# regression), and only then is the emit call examined.
+R20_FIXTURE="$ROOT/tests/fixtures/panewire-r19a"
+R20_FIXTURE_INBOX="$TMP/r20-fixture-inbox"
+R20_FIXTURE_LOG="$TMP/r20-fixture-emit.log"
+mkdir -p "$R20_FIXTURE_INBOX/captain-fixture/events"
+cp "$R20_FIXTURE/00001-job.claim.json" "$R20_FIXTURE/00002-job.spawned.json" \
+  "$R20_FIXTURE_INBOX/captain-fixture/events/"
+(
+  cd "$R20_FIXTURE"
+  env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
+    WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" escalate captain-fixture \
+    --question 'need parent decision' >/dev/null
+  env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
+    WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" joined captain-fixture \
+    --pr https://example.invalid/pr/1 --head deadbeef --report report.md >/dev/null
+)
+cmp "$R20_FIXTURE/00003-job.escalate.json" \
+  "$R20_FIXTURE_INBOX/captain-fixture/events/00003-job.escalate.json"
+cmp "$R20_FIXTURE/00004-job.joined.json" \
+  "$R20_FIXTURE_INBOX/captain-fixture/events/00004-job.joined.json"
+PYTHONPATH="$TMP" python3 - "$R20_FIXTURE_LOG" "$R20_FIXTURE_INBOX/captain-fixture/events" <<'PY'
+import sys
+import r20_emit as helper
+log, events = sys.argv[1:]
+captured = helper.calls(log)
+assert len(captured) == 2, captured
+for call, kind in zip(captured, ("job.escalate", "job.joined")):
+    helper.assert_matches_record(call, helper.record(events, kind))
+PY
+echo "PASS r20-emit-on-real-arbiter-fixture-artifacts"
+
+# TW2 — `wrk done` emits job.completed carrying the record's own values.
+R20_DONE_LOG="$TMP/r20-done-emit.log"
+r20_claim r20-done
+r20_done_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+  WRK_PANEWIRE_LOG="$R20_DONE_LOG" "$WRK" 'done' r20-done --report "$R20_REPORT")"
+PYTHONPATH="$TMP" python3 - "$R20_DONE_LOG" "$R20_INBOX/r20-done/events" <<'PY'
+import sys
+import r20_emit as helper
+log, events = sys.argv[1:]
+captured = helper.calls(log)
+assert len(captured) == 1, captured
+got = helper.assert_matches_record(captured[0], helper.record(events, "job.completed"))
+assert got["--kind"] == "job.completed" and got["--job"] == "r20-done", got
+assert got["--report-last-line"] == "R20 report terminal line ", got
+# `done` carries no reason/question/pr/head, so those options are left out
+# entirely rather than passed as empty strings.
+assert not {"--reason", "--question", "--pr", "--head"} & set(got), got
+PY
+grep -qxF "OK job=r20-done report=$R20_REPORT" <<<"$r20_done_out"
+echo "PASS r20-emit-argv-matches-done-record"
+
+# TW3 — escalate carries --question, joined carries --pr/--head, and both carry
+# the record's reason verbatim.
+R20_CAPTAIN_LOG="$TMP/r20-captain-emit.log"
+r20_claim r20-captain --role captain --parent-lane parent-a
+r20_escalate_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+  WRK_PANEWIRE_LOG="$R20_CAPTAIN_LOG" "$WRK" escalate r20-captain \
+  --question 'need parent decision')"
+r20_joined_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+  WRK_PANEWIRE_LOG="$R20_CAPTAIN_LOG" "$WRK" joined r20-captain \
+  --pr https://example.invalid/pr/1 --head deadbeef --report "$R20_REPORT")"
+PYTHONPATH="$TMP" python3 - "$R20_CAPTAIN_LOG" "$R20_INBOX/r20-captain/events" <<'PY'
+import sys
+import r20_emit as helper
+log, events = sys.argv[1:]
+escalate_call, joined_call = helper.calls(log)
+escalate = helper.assert_matches_record(escalate_call, helper.record(events, "job.escalate"))
+joined = helper.assert_matches_record(joined_call, helper.record(events, "job.joined"))
+assert escalate["--reason"] == "captain escalation", escalate
+assert escalate["--question"] == "need parent decision", escalate
+assert not {"--pr", "--head"} & set(escalate), escalate
+assert joined["--reason"] == "captain joined PR", joined
+assert joined["--pr"].endswith("/pr/1") and joined["--head"] == "deadbeef", joined
+assert "--question" not in joined, joined
+PY
+echo "PASS r20-emit-argv-matches-escalate-and-joined-records"
+
+# TW4 — no panewire on the box: exit 0, the record is still written, exactly
+# one warning on stderr, stdout untouched.
+R20_ABSENT_ERR="$TMP/r20-absent.err"
+r20_claim r20-absent
+set +e
+r20_absent_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" PANEWIRE_BIN="$TMP/absent-panewire" \
+  "$WRK" 'done' r20-absent --report "$R20_REPORT" 2>"$R20_ABSENT_ERR")"
+r20_absent_rc=$?
+set -e
+[[ "$r20_absent_rc" -eq 0 ]]
+[[ -f "$R20_INBOX/r20-absent/events/00003-job.completed.json" ]]
+grep -qxF "OK job=r20-absent report=$R20_REPORT" <<<"$r20_absent_out"
+grep -qxF 'wrk: warning: panewire not found; relay event left as file only (job=r20-absent kind=job.completed)' "$R20_ABSENT_ERR"
+[[ "$(wc -l <"$R20_ABSENT_ERR" | tr -d ' ')" -eq 1 ]]
+echo "PASS r20-missing-panewire-warns-without-changing-exit-or-stdout"
+
+# TW5 — emit fails: exit 0, the record is still written, the warning quotes rc.
+R20_FAIL_ERR="$TMP/r20-fail.err"
+r20_claim r20-fail
+set +e
+r20_fail_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" WRK_PANEWIRE_RC=3 \
+  "$WRK" 'done' r20-fail --report "$R20_REPORT" 2>"$R20_FAIL_ERR")"
+r20_fail_rc=$?
+set -e
+[[ "$r20_fail_rc" -eq 0 ]]
+[[ -f "$R20_INBOX/r20-fail/events/00003-job.completed.json" ]]
+grep -qxF "OK job=r20-fail report=$R20_REPORT" <<<"$r20_fail_out"
+grep -qxF 'wrk: warning: panewire emit failed (rc=3 job=r20-fail kind=job.completed); relay event left as file only' "$R20_FAIL_ERR"
+[[ "$(wc -l <"$R20_FAIL_ERR" | tr -d ' ')" -eq 1 ]]
+echo "PASS r20-failed-emit-warns-with-rc-without-changing-exit"
+
+# TW6 — a wedged emit must not stall wrk: `wrk joined` runs inside the captain
+# loop, so a hang there would stop the fleet. The 5s guard returns long before
+# the fixture's 30s stall would.
+R20_SLOW_ERR="$TMP/r20-slow.err"
+r20_claim r20-slow
+r20_slow_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
+set +e
+r20_slow_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" WRK_PANEWIRE_SLEEP=30 \
+  "$WRK" 'done' r20-slow --report "$R20_REPORT" 2>"$R20_SLOW_ERR")"
+r20_slow_rc=$?
+set -e
+r20_slow_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - r20_slow_start_ns) / 1000000 ))"
+echo "r20 wedged-emit: elapsed_ms=$r20_slow_ms rc=$r20_slow_rc"
+[[ "$r20_slow_rc" -eq 0 ]]
+[[ "$r20_slow_ms" -lt 10000 ]]
+[[ -f "$R20_INBOX/r20-slow/events/00003-job.completed.json" ]]
+grep -qxF "OK job=r20-slow report=$R20_REPORT" <<<"$r20_slow_out"
+grep -q 'panewire emit failed' "$R20_SLOW_ERR"
+echo "PASS r20-wedged-emit-is-bounded-by-the-timeout-guard"
+
+# TW7 — job.lost is not one of panewire's relay kinds, so the sentinel path
+# must not emit at all; passing it would only pile up usage warnings.
+R20_LOST_LOG="$TMP/r20-lost-emit.log"
+R20_LOST_INBOX="$TMP/r20-lost-inbox"
+set +e
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$R20_LOST_INBOX" WRK_PANEWIRE_LOG="$R20_LOST_LOG" \
+  WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
+  "$WRK" sentinel r20-lost lane-a wrk-a w1:p1 "$R20_REPORT" >/dev/null 2>&1
+r20_lost_rc=$?
+set -e
+[[ "$r20_lost_rc" -eq 0 ]]
+find "$R20_LOST_INBOX/r20-lost/events" -name '*job.lost.json' | grep -q .
+[[ ! -e "$R20_LOST_LOG" ]]
+echo "PASS r20-job-lost-is-never-emitted"
+
+# TW8 — the stdout contract is exactly what it was before emit existed: one
+# line, in the pre-R20 format, for each of the three commands.
+[[ "$(wc -l <<<"$r20_done_out" | tr -d ' ')" -eq 1 ]]
+[[ "$(wc -l <<<"$r20_escalate_out" | tr -d ' ')" -eq 1 ]]
+[[ "$(wc -l <<<"$r20_joined_out" | tr -d ' ')" -eq 1 ]]
+grep -qxF "OK job=r20-done report=$R20_REPORT" <<<"$r20_done_out"
+grep -qxF 'OK job=r20-captain owner_lane=lane-a kind=job.escalate' <<<"$r20_escalate_out"
+grep -qxF "OK job=r20-captain owner_lane=lane-a kind=job.joined pr=https://example.invalid/pr/1 head=deadbeef report=$R20_REPORT" <<<"$r20_joined_out"
+echo "PASS r20-stdout-contract-unchanged"
 
 # R18 completion sentinel: a report alone is never completion evidence. A
 # worker still working must time out/lost rather than emit job.completed.
