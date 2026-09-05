@@ -6,7 +6,7 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 # captain — PR 루프 소유자
 
 캡틴은 PR 한 건의 실행 루프를 소유한다. 캡틴 프로필은 `captain-opus`(Opus, effort high) 또는
-`captain-sol`(codex-sol)만 쓴다. `codex-terra`와 `codex-luna`는 워커 전용이다.
+`captain-sol`(codex-sol)·`captain-astra`(gpt-6-astra)만 쓴다. `codex-terra`와 `codex-luna`는 워커 전용이다.
 
 ## 시작과 브리프
 
@@ -14,7 +14,7 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
    따른다. 브리프 형식도 재사용한다: 작업/AC, worktree·branch, 불변 제약, 완료 증거, 금지사항,
    파일 인박스 보고 경로, 그리고 모든 지시와 AC의 1:1 대응을 명시한다.
 2. `wrk spawn --role captain --lane <captain-lane> --parent <parent-lane>`으로 캡틴 job을
-   등록한다. captain role은 `captain-opus` 또는 `captain-sol`만 허용되며 parent 레인은 필수다.
+   등록한다. captain role은 `captain-opus`·`captain-sol`·`captain-astra`만 허용되며 parent 레인은 필수다.
    arbiter의 `job.claim` envelope payload에는 `owner_lane`, `role: "captain"`, `parent_lane`이
    남는다.
 3. 워커와 검증자는 캡틴이 스폰한다. 검증자의 급은 반드시 워커 이상이며, 독립 세션으로 AC 반증,
