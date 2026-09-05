@@ -1153,6 +1153,7 @@ R20_LOST_INBOX="$TMP/r20-lost-inbox"
 set +e
 env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$R20_LOST_INBOX" WRK_PANEWIRE_LOG="$R20_LOST_LOG" \
   WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
+  WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel r20-lost lane-a wrk-a w1:p1 "$R20_REPORT" >/dev/null 2>&1
 r20_lost_rc=$?
 set -e
