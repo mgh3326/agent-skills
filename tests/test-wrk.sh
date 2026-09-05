@@ -13,7 +13,7 @@ cleanup() {
   while IFS= read -r pidfile; do
     [[ -s "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
-    [[ "$pid" =~ ^[0-9]+$ ]] && kill "$pid" 2>/dev/null || true
+    if [[ "$pid" =~ ^[0-9]+$ ]]; then kill "$pid" 2>/dev/null || true; fi
   done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
   rm -rf "$TMP"
 }
