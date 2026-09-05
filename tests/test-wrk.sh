@@ -81,6 +81,8 @@ grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
+grep -qx 'captain-astra' <<<"$profiles_out"
+grep -qx 'codex-astra' <<<"$profiles_out"
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -732,6 +734,10 @@ PY
 captain_sol_out="$(spawn_base captain-sol --role captain --lane captain-sol-lane --parent parent-lane --job captain-sol-job --t T1 2>&1)"
 grep -q 'model=captain-sol' <<<"$captain_sol_out"
 grep -q -- '-m gpt-5.6-sol' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+captain_astra_out="$(spawn_base captain-astra --role captain --lane captain-astra-lane --parent parent-lane --job captain-astra-job --t T1 2>&1)"
+grep -q 'model=captain-astra' <<<"$captain_astra_out"
+grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
 
 # Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
 # must all stop before gate/claim/tab creation.

@@ -34,7 +34,7 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable captain-opus
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
-  codex codex-sol codex-max captain-sol
+  codex codex-sol codex-max captain-sol codex-astra captain-astra
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
@@ -104,7 +104,7 @@ Options:
                      `arbiter status --lane NAME` to find and reclaim its workers.
   --role worker|captain
                      captain requires --lane and --parent, and accepts only
-                     captain-opus or captain-sol profiles.
+                     captain-opus, captain-sol or captain-astra profiles.
   --lane NAME        captain's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      parent lane for a captain; completion/escalation events
@@ -129,7 +129,7 @@ Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
 codex-luna-max, codex-max, codex-terra-max.
 Claude effort wiring (ROB-1191/ROB-1193): opus default=xhigh, sonnet/sonnet-med default=high,
 haiku default=low; all support an explicit --effort override.
-Captain profiles: captain-opus = Claude Opus at effort high; captain-sol = codex-sol.
+Captain profiles: captain-opus = Claude Opus at effort high; captain-sol = codex-sol; captain-astra = gpt-6-astra.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-for-coding/k3`; kimi-k27 uses
 `kimi --auto -m kimi-for-coding/kimi-for-coding`; the CLI has no --effort option.
 kimi-k3-low uses the same argv as kimi-k3 but injects KIMI_CODE_HOME pointing at
@@ -844,6 +844,8 @@ resolve_profile() {
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    codex-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    captain-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
 
     kiro) PROFILE_KIND=kiro; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     kiro-opus) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
@@ -918,7 +920,7 @@ resolve_profile() {
     sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
-    codex|codex-sol|codex-max|captain-sol) GATE_PROFILE=codex-max ;;
+    codex|codex-sol|codex-max|captain-sol|codex-astra|captain-astra) GATE_PROFILE=codex-max ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
     codex-luna|codex-luna-hi|codex-luna-max) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
@@ -1254,7 +1256,7 @@ spawn_cmd() {
     [[ -n "$CAPTAIN_LANE" ]] || die "--role captain requires --lane CAPTAIN_LANE"
     [[ -n "$PARENT_LANE" ]] || die "--role captain requires --parent PARENT_LANE"
     [[ -z "$OWNER" ]] || die "--role captain uses --lane; do not combine it with --owner"
-    case "$MODEL" in captain-opus|captain-sol) ;; *) die "--role captain accepts only captain-opus or captain-sol (terra/luna are worker-only)" ;; esac
+    case "$MODEL" in captain-opus|captain-sol|captain-astra) ;; *) die "--role captain accepts only captain-opus, captain-sol or captain-astra (terra/luna are worker-only)" ;; esac
     [[ "$MODEL" != captain-opus || -z "$EFFORT" || "$EFFORT" == high ]] || die "captain-opus requires effort high"
   else
     [[ -z "$CAPTAIN_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role captain"
