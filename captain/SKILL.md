@@ -22,6 +22,8 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
    직접 확인하는 규칙을 생략하지 않는다. `gh pr checks`가 조회 불가하거나 녹색을 직접 확인할 수
    없으면 성공으로 추정하지 않는다.
 4. BLOCKER만 fix 라운드를 연다. 3라운드를 넘기지 않는다.
+5. **워커·검증자 배치는 `wrk spawn`(hub placement)이 정한다.** 캡틴 자신의 머신이 기본값이
+   아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
 
 ## 큐와 상위 레인 보고
 
