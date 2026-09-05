@@ -72,6 +72,12 @@ shape다. 소비자는 flat completion event를 arbiter envelope이라고 가정
 막힘은 `wrk escalate <job> --question "<text>"`으로 기록한 뒤 **대기**한다. 상위 결정을
 추측해 계속 진행하지 않는다.
 
+**JOIN 직전 base 신선도 검사(필수).** `git fetch origin && git rev-list --count <head>..origin/<base>`가 0이
+아니면 `wrk joined`를 실행하지 않는다. 먼저 `git merge origin/<base>`(rebase·force-push 금지)로 합류하고,
+새 head에서 required CI 초록을 직접 확인한 뒤 검증자에게 head 갱신 확인(라운드 한정)을 받고 나서
+JOIN한다. 부관(flag)은 base 전진을 BOUNCE로 되돌릴 뿐 브랜치를 갱신할 권한이 없다 — 같은 레포에서
+캡틴 여럿이 순차 머지되는 날엔 이 검사 없이는 매 JOIN이 한 번씩 튕긴다(09-05 실측 2건).
+
 PR, head SHA, 보고서가 확정되고 JOIN 판정이 명확할 때만 다음으로 완료를 기록한다.
 
 ```bash
