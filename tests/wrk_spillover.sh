@@ -328,6 +328,11 @@ grep -qF -- 'pending-pane' "$MUT_PENDING" || {
 }
 source_must_stay_unchanged M4
 
+# Every hub invocation above starts its completion sentinel through the normal
+ # spawn path. Reap only the test-owned sentinels before returning to the
+ # legacy routing cases, whose fixture logs are intentionally reset below.
+stop_test_sentinels
+
 echo 'PASS wrk-spillover hub-mutants-red=4/4'
 )
 
