@@ -305,10 +305,10 @@ source_must_stay_unchanged M1
 
 MUT_AUTH="$TMP/wrk-hub-auth"
 cp "$ROOT/bin/wrk" "$MUT_AUTH"
-sed -i.bak 's|--header "@$headers_file"|--header "@/dev/null"|' "$MUT_AUTH" || true
+sed -i.bak 's|--header "@$headers_file"|--header "Content-Type: application/json"|g' "$MUT_AUTH" || true
 chmod +x "$MUT_AUTH"
 mutation_must_change M2 "$MUT_AUTH"
-grep -qF -- '--header "@/dev/null"' "$MUT_AUTH" || {
+grep -qF -- '--header "Content-Type: application/json"' "$MUT_AUTH" || {
   echo 'M2 mutation did not replace the header-file argument' >&2
   exit 1
 }
