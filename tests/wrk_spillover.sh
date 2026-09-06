@@ -53,6 +53,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
+spillover_test_error() {
+  local rc=$?
+  printf 'FAIL: wrk-spillover line=%s command=%s rc=%s\n' "$LINENO" "$BASH_COMMAND" "$rc" >&2
+  exit "$rc"
+}
+trap spillover_test_error ERR
+
 PROMPT="$TMP/brief.md"
 CONFIG="$TMP/hosts.toml"
 LOAD="$TMP/loadavg"
