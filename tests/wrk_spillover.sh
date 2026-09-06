@@ -52,12 +52,6 @@ cleanup() {
   exit "$rc"
 }
 trap cleanup EXIT
-
-spillover_test_error() {
-  local rc=$?
-  printf 'FAIL: wrk-spillover line=%s command=%s rc=%s\n' "$LINENO" "$BASH_COMMAND" "$rc" >&2
-  exit "$rc"
-}
 PROMPT="$TMP/brief.md"
 CONFIG="$TMP/hosts.toml"
 LOAD="$TMP/loadavg"
@@ -359,15 +353,15 @@ grep -q 'ARBITER_INBOX_ROOT is not isolated' <<<"$b5_out"
 }
 printf '%s\n' 'PASS wrk-spillover seed-isolation-guard'
 
-# Every expected non-zero hub path above is handled explicitly. From here on,
-# retain the failing command in CI output while diagnosing legacy assertions.
-trap spillover_test_error ERR
-
 printf '%s\n' 'spillover fixture brief' >"$PROMPT"
 
 # Below threshold stays local after the hub is unavailable.
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/wake.log"
+set +e
 low_out="$(WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=0 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+low_rc=$?
+set -e
+[[ "$low_rc" -eq 0 ]] || { echo "low-pressure local spawn failed rc=$low_rc: $low_out" >&2; exit 1; }
 grep -q '^OK pane=w:p1 host=local ' <<<"$low_out"
 grep -q 'source=local-fallback' "$TMP/spillover.log"
 [[ ! -s "$TMP/ssh.log" ]]
