@@ -1641,6 +1641,68 @@ PY
   printf '%s' "$mapped"
 }
 
+spillover_cwd_key() {
+  local host="$1" cwd="$2" raw mapped
+  raw="$(spillover_value "hosts.$host" cwd_keys 2>/dev/null || true)"
+  [[ -n "$raw" ]] || return 1
+  mapped="$(python3 - "$cwd" "$raw" <<'PY'
+import re, sys
+cwd, raw = sys.argv[1:]
+for local, key in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw):
+    if local.replace(r'\\"', '"').replace(r'\\\\', '\\') == cwd:
+        print(key.replace(r'\\"', '"').replace(r'\\\\', '\\'))
+        break
+PY
+)"
+  [[ -n "$mapped" ]] || return 1
+  printf '%s' "$mapped"
+}
+
+spillover_host_via() {
+  local host="$1" via
+  via="$(spillover_value "hosts.$host" via 2>/dev/null || true)"
+  case "${via:-ssh}" in
+    ssh|hub) printf '%s' "${via:-ssh}" ;;
+    *) return 1 ;;
+  esac
+}
+
+# Read precisely one shell-style assignment without sourcing an env file.  The
+# host configuration points at operator-managed files, so neither arbitrary
+# expansion nor their contents may reach this process's logs.
+spillover_env_key() {
+  local file="$1" key="$2"
+  [[ -r "$file" ]] || return 1
+  python3 - "$file" "$key" <<'PY'
+import re, sys
+
+path, key = sys.argv[1:]
+assignment = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=\s*(.*?)\s*$")
+with open(path, encoding="utf-8") as env_file:
+    for line in env_file:
+        match = assignment.match(line)
+        if not match:
+            continue
+        value = match.group(1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            print(value)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+spillover_hub_http_base() {
+  local hub_url="$1"
+  case "$hub_url" in
+    wss://*) printf 'https://%s' "${hub_url#wss://}" ;;
+    ws://*) printf 'http://%s' "${hub_url#ws://}" ;;
+    https://*|http://*) printf '%s' "$hub_url" ;;
+    *) return 1 ;;
+  esac
+}
+
 spillover_load5() {
   local proc="${WRK_PROC_LOADAVG:-/proc/loadavg}" load
   if [[ -r "$proc" ]]; then
@@ -1783,7 +1845,12 @@ print(*eligible[1:], sep="\n")
   # Fixture-only observability: lets the contract test assert the exact hub
   # ordering after eligibility filtering without contacting a live hub.
   if [[ -n "${WRK_SPILLOVER_CANDIDATES_LOG:-}" ]]; then
-    printf '%s\n' "$SPILL_HUB_HOST" "${SPILL_HUB_CANDIDATES[@]}" >"$WRK_SPILLOVER_CANDIDATES_LOG"
+    {
+      printf '%s\n' "$SPILL_HUB_HOST"
+      for candidate in "${SPILL_HUB_CANDIDATES[@]:-}"; do
+        [[ -z "$candidate" ]] || printf '%s\n' "$candidate"
+      done
+    } >"$WRK_SPILLOVER_CANDIDATES_LOG"
   fi
   SPILL_HUB_STATUS=ok
   return 0
@@ -1824,6 +1891,270 @@ spillover_wake() {
     warn "spill-over wake skipped host=$host: panewire request failed"
   fi
 }
+
+# The hub endpoint accepts only spawn metadata. In particular, the local cwd
+# and brief path are translated to cwd_key and brief.inline, and duplicate-job
+# overrides are deliberately not representable on this boundary.
+spillover_hub_args() {
+  SPILL_HUB_ARGS=()
+  local arg i=0 args=("$@")
+  while [[ "$i" -lt "${#args[@]}" ]]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      -c|-p)
+        i=$((i + 1))
+        [[ "$i" -lt "${#args[@]}" ]] || { echo "wrk: $arg requires a value" >&2; return 2; }
+        ;;
+      --job-dup-ok)
+        echo "wrk: --job-dup-ok is not permitted for a hub spawn" >&2; return 2 ;;
+      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L)
+        i=$((i + 1))
+        [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] || { echo "wrk: $arg requires a value" >&2; return 2; }
+        SPILL_HUB_ARGS+=("$arg" "${args[$i]}")
+        ;;
+      *)
+        echo "wrk: option '$arg' is not permitted for a hub spawn" >&2; return 2 ;;
+    esac
+    i=$((i + 1))
+  done
+}
+
+spillover_hub_emit_ok() {
+  local host="$1" pane="$2" job_id="$3" status="$4" landed="$5"; shift 5
+  local model=unknown label=unknown arg i=0 args=("$@")
+  while [[ "$i" -lt "${#args[@]}" ]]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      -m) model="${args[$((i + 1))]:-unknown}" ;;
+      -l) label="${args[$((i + 1))]:-unknown}" ;;
+    esac
+    i=$((i + 1))
+  done
+  printf 'OK pane=%s host=%s model=%s label=%s status=%s landed=%s job=%s\n' \
+    "$pane" "$host" "$model" "$label" "$status" "$landed" "$job_id"
+}
+
+spillover_hub_curl_run() {
+  local method="$1" url="$2" request_body="$3" operator_token="$4" cf_client_id="$5" cf_client_secret="$6" response_file="$7"
+  local curl_bin headers_file request_file=""
+
+  (
+    umask 077
+    headers_file="$(mktemp)" || exit 1
+    trap 'rm -f "$headers_file" "$request_file"' EXIT HUP INT TERM
+    if ! {
+      printf 'Authorization: Bearer %s\n' "$operator_token"
+      printf 'CF-Access-Client-Id: %s\n' "$cf_client_id"
+      printf 'CF-Access-Client-Secret: %s\n' "$cf_client_secret"
+      printf '%s\n' 'Content-Type: application/json'
+    } >"$headers_file"; then
+      exit 1
+    fi
+    curl_bin="${WRK_CURL_BIN:-curl}"
+    if [[ "$method" == POST ]]; then
+      request_file="$(mktemp)" || exit 1
+      printf '%s' "$request_body" >"$request_file" || exit 1
+      "$curl_bin" --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+        --request POST "$url" --header "@$headers_file" --data-binary "@$request_file"
+    else
+      "$curl_bin" --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+        --request GET "$url" --header "@$headers_file"
+    fi
+  )
+}
+
+spillover_hub_http_request() {
+  local method="$1" url="$2" request_body="$3" operator_token="$4" cf_client_id="$5" cf_client_secret="$6"
+  local response_file old_umask curl_rc
+
+  old_umask="$(umask)"
+  umask 077
+  response_file="$(mktemp)" || { umask "$old_umask"; return 1; }
+  umask "$old_umask"
+  set +e
+  SPILL_HUB_HTTP_CODE="$(spillover_hub_curl_run "$method" "$url" "$request_body" "$operator_token" "$cf_client_id" "$cf_client_secret" "$response_file")"
+  curl_rc=$?
+  set -e
+  if [[ -r "$response_file" ]]; then
+    SPILL_HUB_HTTP_BODY="$(<"$response_file")"
+  else
+    SPILL_HUB_HTTP_BODY=""
+  fi
+  rm -f "$response_file" || true
+  [[ "$curl_rc" -eq 0 && "$SPILL_HUB_HTTP_CODE" =~ ^[0-9]{3}$ ]]
+}
+
+spillover_hub_response_state() {
+  local body="$1" request_id="$2"
+  python3 -c '
+import json, sys
+request_id = sys.argv[1]
+d = json.load(sys.stdin)
+if d.get("request_id") != request_id:
+    raise SystemExit(1)
+state = d.get("status")
+if not isinstance(state, str):
+    raise SystemExit(1)
+print(state)
+' "$request_id" <<<"$body"
+}
+
+spillover_hub_result() {
+  local body="$1" request_id="$2" host="$3"
+  python3 -c '
+import json, sys
+request_id, host = sys.argv[1:]
+d = json.load(sys.stdin)
+if d.get("request_id") != request_id or d.get("machine") != host or d.get("rc") != 0:
+    raise SystemExit(1)
+pane, job_id = d.get("pane"), d.get("job_id")
+if not isinstance(pane, str) or not pane or not isinstance(job_id, str) or not job_id:
+    raise SystemExit(1)
+status, landed = "unknown", "no"
+tail = d.get("stdout_tail")
+if isinstance(tail, str):
+    ok_lines = [line for line in tail.splitlines() if line.startswith("OK pane=")]
+    if ok_lines:
+        fields = dict(part.split("=", 1) for part in ok_lines[-1].split() if "=" in part)
+        status = fields.get("status", status)
+        landed = fields.get("landed", landed)
+print(pane)
+print(job_id)
+print(status)
+print(landed)
+' "$request_id" "$host" <<<"$body"
+}
+
+spillover_hub_http_error() {
+  local host="$1" status="$2"
+  case "$status" in
+    400) echo "wrk: hub spawn rejected for host '$host' (400 invalid request)" >&2 ;;
+    401) echo "wrk: hub spawn authentication failed for host '$host' (401)" >&2 ;;
+    409) echo "wrk: hub spawn conflicts with an existing request for host '$host' (409)" >&2 ;;
+    503) echo "wrk: hub spawn unavailable for host '$host' (503); use --host local or retry" >&2 ;;
+    *) echo "wrk: hub spawn returned unexpected HTTP status $status for host '$host'" >&2 ;;
+  esac
+}
+
+spillover_hub_poll() {
+  local base="$1" request_id="$2" host="$3" operator_token="$4" cf_client_id="$5" cf_client_secret="$6"; shift 6
+  local limit interval elapsed=0 state parsed
+  limit="${WRK_HUB_POLL_MAX_SECONDS:-3600}"
+  interval="${WRK_HUB_POLL_INTERVAL_SECONDS:-2}"
+  [[ "$limit" =~ ^[1-9][0-9]*$ && "$interval" =~ ^[1-9][0-9]*$ ]] || {
+    echo "wrk: invalid hub polling limit or interval" >&2; return 2;
+  }
+  while [[ "$elapsed" -lt "$limit" ]]; do
+    if ! spillover_hub_http_request GET "${base%/}/v1/spawn/$request_id" '' "$operator_token" "$cf_client_id" "$cf_client_secret"; then
+      echo "wrk: hub spawn poll failed for host '$host'; no local fallback" >&2
+      return 1
+    fi
+    case "$SPILL_HUB_HTTP_CODE" in
+      200)
+        state="$(spillover_hub_response_state "$SPILL_HUB_HTTP_BODY" "$request_id" 2>/dev/null || true)"
+        if [[ "$state" == lost ]]; then
+          echo "wrk: hub spawn lost for host '$host'; no local fallback" >&2
+          return 1
+        fi
+        if parsed="$(spillover_hub_result "$SPILL_HUB_HTTP_BODY" "$request_id" "$host" 2>/dev/null)"; then
+          local pane job_id status landed
+          pane="$(sed -n '1p' <<<"$parsed")"; job_id="$(sed -n '2p' <<<"$parsed")"
+          status="$(sed -n '3p' <<<"$parsed")"; landed="$(sed -n '4p' <<<"$parsed")"
+          spillover_hub_emit_ok "$host" "$pane" "$job_id" "$status" "$landed" "$@"
+          return 0
+        fi
+        [[ "$state" == pending ]] || { echo "wrk: hub spawn returned an invalid poll response for host '$host'" >&2; return 1; }
+        ;;
+      504)
+        state="$(spillover_hub_response_state "$SPILL_HUB_HTTP_BODY" "$request_id" 2>/dev/null || true)"
+        [[ "$state" == pending ]] || { echo "wrk: hub spawn returned an invalid pending response for host '$host'" >&2; return 1; }
+        ;;
+      *) spillover_hub_http_error "$host" "$SPILL_HUB_HTTP_CODE"; return 1 ;;
+    esac
+    sleep_for "$interval"
+    elapsed=$((elapsed + interval))
+  done
+  echo "wrk: hub spawn poll timed out for host '$host'; no local fallback" >&2
+  return 1
+}
+
+spillover_hub_spawn() {
+  local host="$1" cwd="$2" prompt="$3"; shift 3
+  local cwd_key operator_env cf_env operator_token cf_client_id cf_client_secret hub_url base request_id request_body state parsed
+  if ! cwd_key="$(spillover_cwd_key "$host" "$cwd")"; then
+    echo "wrk: remote host '$host' has no cwd_keys entry for '$cwd'; use --host local or configure hosts.toml" >&2
+    return 2
+  fi
+  local hub_args_rc
+  if spillover_hub_args "$@"; then :; else
+    hub_args_rc=$?
+    return "$hub_args_rc"
+  fi
+  [[ -r "$prompt" ]] || { echo "wrk: hub spawn brief is not readable: $prompt" >&2; return 2; }
+  [[ "$(wc -c <"$prompt")" -le 65536 ]] || { echo "wrk: hub spawn brief exceeds 65536 UTF-8 bytes" >&2; return 2; }
+  operator_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  [[ -n "$operator_env" ]] || { echo "wrk: hub spawn requires hub.operator_token_env; use --host local or configure hosts.toml" >&2; return 2; }
+  if ! operator_token="$(spillover_env_key "$operator_env" PANEWIRE_OPERATOR_TOKEN 2>/dev/null)"; then
+    echo "wrk: hub spawn operator token is unavailable; use --host local or configure hosts.toml" >&2
+    return 2
+  fi
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  if ! cf_client_id="$(spillover_env_key "$cf_env" CF_ACCESS_CLIENT_ID 2>/dev/null)" ||
+     ! cf_client_secret="$(spillover_env_key "$cf_env" CF_ACCESS_CLIENT_SECRET 2>/dev/null)"; then
+    echo "wrk: hub spawn CF service token is unavailable; use --host local or configure hosts.toml" >&2
+    return 2
+  fi
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  if ! base="$(spillover_hub_http_base "$hub_url")"; then
+    echo "wrk: hub spawn has an invalid hub_url; use --host local or configure hosts.toml" >&2
+    return 2
+  fi
+  request_id="$(python3 -c 'import uuid; print(uuid.uuid4())')"
+  if ! request_body="$(python3 - "$request_id" "$host" "$cwd_key" "$prompt" "${SPILL_HUB_ARGS[@]}" <<'PY'
+import json, sys
+request_id, machine, cwd_key, prompt, *args = sys.argv[1:]
+with open(prompt, "rb") as brief_file:
+    brief = brief_file.read()
+if len(brief) > 65536:
+    raise SystemExit(1)
+inline = brief.decode("utf-8")
+print(json.dumps({
+    "request_id": request_id,
+    "machine": machine,
+    "cwd_key": cwd_key,
+    "brief": {"inline": inline},
+    "args": args,
+    "wait_seconds": 120,
+}, ensure_ascii=False, separators=(",", ":")))
+PY
+)"; then
+    echo "wrk: hub spawn brief must be UTF-8 and at most 65536 bytes" >&2
+    return 2
+  fi
+  if ! spillover_hub_http_request POST "${base%/}/v1/spawn" "$request_body" "$operator_token" "$cf_client_id" "$cf_client_secret"; then
+    echo "wrk: hub spawn request failed for host '$host'; no local fallback" >&2
+    return 1
+  fi
+  case "$SPILL_HUB_HTTP_CODE" in
+    200)
+      if ! parsed="$(spillover_hub_result "$SPILL_HUB_HTTP_BODY" "$request_id" "$host" 2>/dev/null)"; then
+        echo "wrk: hub spawn returned an invalid success response for host '$host'" >&2
+        return 1
+      fi
+      local pane job_id status landed
+      pane="$(sed -n '1p' <<<"$parsed")"; job_id="$(sed -n '2p' <<<"$parsed")"
+      status="$(sed -n '3p' <<<"$parsed")"; landed="$(sed -n '4p' <<<"$parsed")"
+      spillover_hub_emit_ok "$host" "$pane" "$job_id" "$status" "$landed" "${SPILL_HUB_ARGS[@]}"
+      ;;
+    504)
+      state="$(spillover_hub_response_state "$SPILL_HUB_HTTP_BODY" "$request_id" 2>/dev/null || true)"
+      [[ "$state" == pending ]] || { echo "wrk: hub spawn returned an invalid pending response for host '$host'" >&2; return 1; }
+      spillover_hub_poll "$base" "$request_id" "$host" "$operator_token" "$cf_client_id" "$cf_client_secret" "${SPILL_HUB_ARGS[@]}"
+      ;;
+    *) spillover_hub_http_error "$host" "$SPILL_HUB_HTTP_CODE"; return 1 ;;
+  esac
+}
+
 
 spillover_emit_host() {
   local host="$1" file="$2"
@@ -1991,7 +2322,11 @@ spawn_router_cmd() {
       spillover_local_measure; selected="$requested"; SPILL_REASON=forced-remote; SPILL_DECISION_SOURCE=forced
       ;;
   esac
-  spillover_log "$selected" "$SPILL_REASON"
+  if [[ "$selected" != local && "$(spillover_host_via "$selected" 2>/dev/null || true)" == hub ]]; then
+    spillover_log "$selected" "${SPILL_REASON};via=hub"
+  else
+    spillover_log "$selected" "$SPILL_REASON"
+  fi
   if [[ "$selected" == local ]]; then
     out="$(mktemp)"
     # Keep spawn_cmd's errexit semantics (notably a blocked quota gate) in an
@@ -2006,11 +2341,20 @@ spawn_router_cmd() {
     return "$rc"
   fi
   [[ -n "$cwd" && -n "$prompt" ]] || die "-c CWD and -p PROMPT_FILE are required"
-  local candidates=("$selected") candidate last_rc=1 seen_candidates=""
+  local candidates=("$selected") candidate candidate_via last_rc=1 seen_candidates=""
   if [[ "$requested" == auto ]]; then candidates+=("${SPILL_HUB_CANDIDATES[@]:-}"); fi
   for candidate in "${candidates[@]}"; do
     [[ " $seen_candidates " == *" $candidate "* ]] && continue
     seen_candidates+=" $candidate"
+    if ! candidate_via="$(spillover_host_via "$candidate")"; then
+      echo "wrk: remote host '$candidate' has invalid via setting; use ssh or hub" >&2
+      return 2
+    fi
+    if [[ "$candidate_via" == hub ]]; then
+      [[ "$candidate" == "$selected" ]] || spillover_log "$candidate" "${SPILL_REASON};via=hub"
+      spillover_hub_spawn "$candidate" "$cwd" "$prompt" "${filtered[@]}"
+      return $?
+    fi
     if ! spillover_probe_host "$candidate"; then
       [[ "$SPILL_PROBE_REASON" == ssh-unreachable ]] && spillover_wake "$candidate"
       continue
