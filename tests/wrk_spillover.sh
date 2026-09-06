@@ -367,6 +367,7 @@ grep -q 'source=local-fallback' "$TMP/spillover.log"
 [[ ! -s "$TMP/ssh.log" ]]
 printf '%s\n' 'STAGE wrk-spillover legacy-low'
 
+set -x
 set +e
 hosts_out="$(env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" WRK_TEST_ACTIVE=0 \
   WRK_HOSTS_CONFIG="$CONFIG" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
@@ -379,6 +380,7 @@ grep -q '^desktop[[:space:]]available' <<<"$hosts_out" || {
   echo "hosts output did not show desktop available: $hosts_out" >&2
   exit 1
 }
+set +x
 
 # Hub is authoritative: high local pressure remains local when hub says so.
 printf '%s\n' '9.00 0.10 0.10 1/1 1' >"$LOAD"
