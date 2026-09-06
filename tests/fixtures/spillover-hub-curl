@@ -1,0 +1,76 @@
+#!/usr/bin/env bash
+# Fake curl endpoint for spill-over hub contract tests. It is deliberately a
+# command-line fixture, so no listener or external network is involved.
+set -euo pipefail
+
+output=""
+method=GET
+url=""
+data=""
+headers=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --silent|--show-error) shift ;;
+    --output|-o) output="$2"; shift 2 ;;
+    --write-out|-w) shift 2 ;;
+    --request|-X) method="$2"; shift 2 ;;
+    --header|-H) headers+=("$2"); shift 2 ;;
+    --data-binary) data="$2"; shift 2 ;;
+    http://*|https://*) url="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+
+[[ -n "$url" && -n "$output" ]] || exit 64
+if [[ -n "${WRK_HUB_CURL_LOG:-}" ]]; then
+  python3 - "${WRK_HUB_CURL_LOG}" "$method" "$url" "$data" "${headers[@]}" <<'PY'
+import json, sys
+path, method, url, body, *headers = sys.argv[1:]
+with open(path, "a", encoding="utf-8") as log:
+    log.write(json.dumps({
+        "method": method,
+        "url": url,
+        "headers": headers,
+        "body": body,
+    }, ensure_ascii=False, separators=(",", ":")) + "\n")
+PY
+fi
+
+response="$(python3 - "${WRK_HUB_SCENARIO:-hub200}" "$method" "$url" "$data" <<'PY'
+import json, sys
+scenario, method, url, body = sys.argv[1:]
+request = json.loads(body) if body else {}
+request_id = request.get("request_id") or url.rsplit("/", 1)[-1]
+machine = request.get("machine", "machine-a")
+success = {
+    "request_id": request_id,
+    "machine": machine,
+    "rc": 0,
+    "job_id": "job-a",
+    "pane": "pane-a",
+    "stdout_tail": "fixture",
+    "completed_at": "2026-09-07T00:00:00Z",
+}
+if scenario == "pending":
+    status, result = (504, {"request_id": request_id, "status": "pending"}) if method == "POST" else (200, success)
+elif scenario == "lost":
+    status, result = (504, {"request_id": request_id, "status": "pending"}) if method == "POST" else (200, {"request_id": request_id, "status": "lost"})
+elif scenario == "hub503":
+    status, result = 503, {"error": "node_unavailable", "state": "offline"}
+elif scenario == "hub401":
+    status, result = 401, {"error": "unauthorized"}
+elif scenario == "hub409":
+    status, result = 409, {"error": "duplicate", "job_id": "job-a", "pane": "pane-a"}
+elif scenario == "hub400":
+    status, result = 400, {"error": "invalid_request"}
+else:
+    status, result = 200, success
+print(status)
+print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+PY
+)"
+status="${response%%$'\n'*}"
+body="${response#*$'\n'}"
+printf '%s' "$body" >"$output"
+printf '%s' "$status"
