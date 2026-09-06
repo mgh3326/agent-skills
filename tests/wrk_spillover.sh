@@ -286,7 +286,7 @@ printf '%s\n' 'PASS wrk-spillover hub-args-baseline'
 
 MUT_ARGS="$TMP/wrk-hub-args"
 cp "$ROOT/bin/wrk" "$MUT_ARGS"
-sed -i.bak 's/echo \"wrk: --job-dup-ok is not permitted for a hub spawn\" >&2; return 2/SPILL_HUB_ARGS+=(--job-dup-ok)/' "$MUT_ARGS"
+sed -i.bak 's/echo \"wrk: --job-dup-ok is not permitted for a hub spawn\" >&2; return 2/SPILL_HUB_ARGS+=(--job-dup-ok)/' "$MUT_ARGS" || true
 chmod +x "$MUT_ARGS"
 mutation_must_change M1 "$MUT_ARGS"
 : >"$TMP/hub.log"
@@ -301,7 +301,7 @@ source_must_stay_unchanged M1
 
 MUT_AUTH="$TMP/wrk-hub-auth"
 cp "$ROOT/bin/wrk" "$MUT_AUTH"
-sed -i.bak 's|--header "@$headers_file"|--header "@/dev/null"|' "$MUT_AUTH"
+sed -i.bak 's|--header "@$headers_file"|--header "@/dev/null"|' "$MUT_AUTH" || true
 chmod +x "$MUT_AUTH"
 mutation_must_change M2 "$MUT_AUTH"
 : >"$TMP/hub.log"
@@ -315,7 +315,7 @@ source_must_stay_unchanged M2
 
 MUT_CWD="$TMP/wrk-hub-cwd"
 cp "$ROOT/bin/wrk" "$MUT_CWD"
-sed -i.bak '/has no cwd_keys entry/{n;s/return 2/spawn_cmd \"$@\"; return $?/;}' "$MUT_CWD"
+sed -i.bak '/has no cwd_keys entry/{n;s/return 2/spawn_cmd \"$@\"; return $?/;}' "$MUT_CWD" || true
 chmod +x "$MUT_CWD"
 mutation_must_change M3 "$MUT_CWD"
 : >"$TMP/hub.log"; : >"$TMP/herdr.log"
@@ -325,7 +325,7 @@ source_must_stay_unchanged M3
 
 MUT_PENDING="$TMP/wrk-hub-pending"
 cp "$ROOT/bin/wrk" "$MUT_PENDING"
-sed -i.bak 's|spillover_hub_poll \"$base\".*|spillover_hub_emit_ok \"$host\" \"pending-pane\" \"pending-job\" \"unknown\" \"no\" \"${SPILL_HUB_ARGS[@]}\"|' "$MUT_PENDING"
+sed -i.bak 's|spillover_hub_poll \"$base\".*|spillover_hub_emit_ok \"$host\" \"pending-pane\" \"pending-job\" \"unknown\" \"no\" \"${SPILL_HUB_ARGS[@]}\"|' "$MUT_PENDING" || true
 chmod +x "$MUT_PENDING"
 mutation_must_change M4 "$MUT_PENDING"
 : >"$TMP/hub.log"
