@@ -357,43 +357,22 @@ printf '%s\n' 'spillover fixture brief' >"$PROMPT"
 
 # Below threshold stays local after the hub is unavailable.
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/wake.log"
-set +e
 low_out="$(WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=0 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
-low_rc=$?
-set -e
-[[ "$low_rc" -eq 0 ]] || { echo "low-pressure local spawn failed rc=$low_rc: $low_out" >&2; exit 1; }
 grep -q '^OK pane=w:p1 host=local ' <<<"$low_out"
 grep -q 'source=local-fallback' "$TMP/spillover.log"
 [[ ! -s "$TMP/ssh.log" ]]
-printf '%s\n' 'STAGE wrk-spillover legacy-low'
 
-set -x
-set +e
 hosts_out="$(env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" WRK_TEST_ACTIVE=0 \
   WRK_HOSTS_CONFIG="$CONFIG" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
   WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SSH_LOG="$TMP/ssh.log" \
   "$ROOT/bin/wrk" hosts)"
-hosts_rc=$?
-set -e
-[[ "$hosts_rc" -eq 0 ]] || { echo "hosts command failed rc=$hosts_rc: $hosts_out" >&2; exit 1; }
-grep -q '^desktop[[:space:]]available' <<<"$hosts_out" || {
-  echo "hosts output did not show desktop available: $hosts_out" >&2
-  exit 1
-}
-set +x
+grep -q '^desktop[[:space:]]available' <<<"$hosts_out"
 
 # Hub is authoritative: high local pressure remains local when hub says so.
 printf '%s\n' '9.00 0.10 0.10 1/1 1' >"$LOAD"
-set -x
-set +e
 hub_local_out="$(WRK_PLACE_SCENARIO=local WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
-hub_local_rc=$?
-set -e
-[[ "$hub_local_rc" -eq 0 ]] || { echo "hub-local spawn failed rc=$hub_local_rc: $hub_local_out" >&2; exit 1; }
 grep -q '^OK pane=w:p1 host=local ' <<<"$hub_local_out"
 grep -q 'source=hub' "$TMP/spillover.log"
-set +x
-printf '%s\n' 'STAGE wrk-spillover legacy-hub-local'
 
 # Hub failure plus high pressure spills to the first measured remote host.
 : >"$TMP/ssh.log"
@@ -402,7 +381,6 @@ grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$remote_out"
 grep -q -- 'HERDR_SESSION=worker' "$TMP/ssh.log"
 grep -q -- '/remote/agent-skills' "$TMP/ssh.log"
 grep -q -- ' -w workers' "$TMP/ssh.log"
-printf '%s\n' 'STAGE wrk-spillover legacy-remote'
 
 # An unreachable candidate is skipped and the next configured candidate is used.
 : >"$TMP/ssh.log"
@@ -410,7 +388,6 @@ backup_out="$(WRK_PLACE_SCENARIO=unavailable WRK_SSH_SCENARIO=desktop-down WRK_T
 grep -q '^OK pane=mac-work:p7 host=mac-work ' <<<"$backup_out"
 grep -q 'desktop.*uptime; herdr agent list' "$TMP/ssh.log"
 grep -q 'mac-work.*uptime; herdr agent list' "$TMP/ssh.log"
-printf '%s\n' 'STAGE wrk-spillover legacy-backup'
 
 # A post-probe spawn failure also advances to the next candidate.
 : >"$TMP/ssh.log"
@@ -422,7 +399,6 @@ backup_probe_count="$(grep -c 'mac-work.*uptime; herdr agent list' "$TMP/ssh.log
 grep -qx 'desktop' "$TMP/candidates.log"
 grep -qx 'mac-work' "$TMP/candidates.log"
 grep -q -- '--hub-url https://example.invalid --hub-token-env /tmp/example-token.env' "$TMP/place.log"
-printf '%s\n' 'STAGE wrk-spillover legacy-spawn-failover'
 
 # The verbatim hub fixture filters the three not_accepting candidates while
 # preserving the eligible machine order.  If both remote spawns fail, only the
@@ -433,7 +409,6 @@ grep -qx 'desktop' "$TMP/candidates.log"
 grep -qx 'mac-work' "$TMP/candidates.log"
 [[ "$(grep '^OK ' <<<"$verbatim_out" | grep -o 'host=' | wc -l)" -eq 1 ]]
 grep -q '^OK pane=w:p1 host=local ' <<<"$verbatim_out"
-printf '%s\n' 'STAGE wrk-spillover legacy-verbatim'
 
 # A hub-selected remote host without a cwd mapping fails closed; no local pane.
 set_first_cwd_map '{"/not-the-current-cwd"="/remote/missing"}'

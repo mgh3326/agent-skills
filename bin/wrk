@@ -1762,7 +1762,12 @@ print(*eligible[1:], sep="\n")
   # Fixture-only observability: lets the contract test assert the exact hub
   # ordering after eligibility filtering without contacting a live hub.
   if [[ -n "${WRK_SPILLOVER_CANDIDATES_LOG:-}" ]]; then
-    printf '%s\n' "$SPILL_HUB_HOST" "${SPILL_HUB_CANDIDATES[@]}" >"$WRK_SPILLOVER_CANDIDATES_LOG"
+    {
+      printf '%s\n' "$SPILL_HUB_HOST"
+      for candidate in "${SPILL_HUB_CANDIDATES[@]:-}"; do
+        [[ -z "$candidate" ]] || printf '%s\n' "$candidate"
+      done
+    } >"$WRK_SPILLOVER_CANDIDATES_LOG"
   fi
   SPILL_HUB_STATUS=ok
   return 0
