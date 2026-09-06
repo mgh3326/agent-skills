@@ -262,6 +262,15 @@ mutation_must_change() {
   fi
 }
 
+source_must_stay_unchanged() {
+  local name="$1"
+  if ! cmp -s "$ROOT/bin/wrk" "$HUB_ORIGINAL"; then
+    echo "${name} mutation changed bin/wrk source" >&2
+    diff -u "$HUB_ORIGINAL" "$ROOT/bin/wrk" >&2 || true
+    exit 1
+  fi
+}
+
 # Positive control: the deployed binary itself must reject the forbidden flag.
 : >"$TMP/hub.log"
 set +e
@@ -287,7 +296,7 @@ records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if l
 assert records and "--job-dup-ok" in json.loads(records[-1]["body"])["args"]
 PY
 [[ "$M1_out" == *'OK pane=pane-a'* ]] || { echo 'hub args allowlist mutant survived' >&2; exit 1; }
-cmp -s "$ROOT/bin/wrk" "$HUB_ORIGINAL"
+source_must_stay_unchanged M1
 
 MUT_AUTH="$TMP/wrk-hub-auth"
 cp "$ROOT/bin/wrk" "$MUT_AUTH"
@@ -300,7 +309,7 @@ import json, sys
 headers = [header for record in (json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()) for header in record["headers"]]
 assert not any(header.startswith("Authorization:") for header in headers)
 PY
-cmp -s "$ROOT/bin/wrk" "$HUB_ORIGINAL"
+source_must_stay_unchanged M2
 
 MUT_CWD="$TMP/wrk-hub-cwd"
 cp "$ROOT/bin/wrk" "$MUT_CWD"
@@ -309,7 +318,7 @@ mutation_must_change M3 "$MUT_CWD"
 : >"$TMP/hub.log"; : >"$TMP/herdr.log"
 WRK_HUB_SCENARIO=hub200 run_hub "$MUT_CWD" "$HUB_NO_CWD" >/dev/null 2>&1 || true
 [[ ! -s "$TMP/hub.log" && -s "$TMP/herdr.log" ]] || { echo 'hub cwd fail-closed mutant survived' >&2; exit 1; }
-cmp -s "$ROOT/bin/wrk" "$HUB_ORIGINAL"
+source_must_stay_unchanged M3
 
 MUT_PENDING="$TMP/wrk-hub-pending"
 cp "$ROOT/bin/wrk" "$MUT_PENDING"
@@ -323,7 +332,7 @@ records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if l
 assert [record["method"] for record in records] == ["POST"]
 PY
 [[ "$M4_out" == *'OK pane=pending-pane'* ]] || { echo 'hub pending-poll mutant survived' >&2; exit 1; }
-cmp -s "$ROOT/bin/wrk" "$HUB_ORIGINAL"
+source_must_stay_unchanged M4
 
 echo 'PASS wrk-spillover hub-mutants-red=4/4'
 )
