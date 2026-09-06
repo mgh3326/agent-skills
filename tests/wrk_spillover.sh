@@ -1,10 +1,53 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2034,SC2016
+# shellcheck disable=SC2034,SC2016,SC2030,SC2031
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+ARBITER_INBOX_ROOT="$TMP/inbox/jobs"
+mkdir -p "$TMP/inbox/jobs"
+export ARBITER_INBOX_ROOT
+REAL_JOBS_ROOT="$HOME/work/herdr-inbox/jobs"
+
+real_jobs_count() {
+  find "$REAL_JOBS_ROOT" -mindepth 1 -maxdepth 1 -print 2>/dev/null | wc -l | tr -d ' '
+}
+
+REAL_JOBS_BEFORE="$(real_jobs_count)"
+
+stop_test_sentinels() {
+  local pidfile pid
+
+  while IFS= read -r pidfile; do
+    [[ -r "$pidfile" ]] || continue
+    read -r pid <"$pidfile" || continue
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill "$pid" 2>/dev/null || true
+  done < <(find "$ARBITER_INBOX_ROOT" -type f -name completion-sentinel.pid -print 2>/dev/null)
+}
+
+cleanup() {
+  local rc=$?
+  local after
+
+  stop_test_sentinels
+  after="$(real_jobs_count)"
+  rm -rf "$TMP"
+  if [[ "$after" != "$REAL_JOBS_BEFORE" ]]; then
+    echo "FAIL: real inbox mutated ${REAL_JOBS_BEFORE} -> ${after}" >&2
+    exit 1
+  fi
+  exit "$rc"
+}
+trap cleanup EXIT
+
+hub_require_isolation() {
+  [[ -n "${ARBITER_INBOX_ROOT:-}" && "$ARBITER_INBOX_ROOT" == "$TMP"/* ]] || {
+    echo "FAIL: ARBITER_INBOX_ROOT is not isolated under \$TMP" >&2
+    exit 1
+  }
+}
+
 PROMPT="$TMP/brief.md"
 CONFIG="$TMP/hosts.toml"
 LOAD="$TMP/loadavg"
@@ -22,8 +65,9 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
 XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-seed --agent-label seed --lane seed --t T1 >/dev/null
 
 run_wrk() {
+  hub_require_isolation
   local binary="$1"; shift
-  env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" \
+  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" \
     SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="${WRK_TEST_ARBITER_BIN:-$ROOT/bin/arbiter}" XDG_DATA_HOME="$TMP/xdg" \
     WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$CONFIG" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
     WRK_TEST_THROTTLED=0 \
@@ -35,6 +79,22 @@ run_wrk() {
     "$binary" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -l fixture --t T1 \
     --job "${WRK_TEST_JOB:-spillover-$RANDOM-$RANDOM}" "$@"
 }
+
+set +e
+isolation_guard_output="$(
+  (ARBITER_INBOX_ROOT=; run_wrk "$ROOT/bin/wrk") 2>&1
+)"
+isolation_guard_rc=$?
+set -e
+[[ "$isolation_guard_rc" -ne 0 ]] || {
+  echo "FAIL: unset ARBITER_INBOX_ROOT passed the isolation guard" >&2
+  exit 1
+}
+[[ "$isolation_guard_output" == *'ARBITER_INBOX_ROOT is not isolated under $TMP'* ]] || {
+  echo "FAIL: isolation guard error was not distinct" >&2
+  exit 1
+}
+printf '%s\n' "PASS wrk-spillover isolation-guard (unset -> FAIL: ARBITER_INBOX_ROOT is not isolated under \$TMP)"
 
 set_first_cwd_map() {
   local map="$1" tmp
@@ -58,8 +118,9 @@ printf '%s\n' '[hub]' 'hub_url = "wss://hub.fixture.invalid"' 'hub_token_env = "
 printf '%s\n' 'hub fixture brief body' >"$PROMPT"
 
 run_hub() {
+  hub_require_isolation
   local binary="$1" config="$2"; shift 2
-  env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "$@"
+  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "$@"
 }
 
 # Unset via remains SSH, and an explicit ssh value takes the same path; neither
@@ -311,6 +372,7 @@ done
 
 # P5: an unreadable or absent arbiter may use the ordinary local path, but is
 # never enough evidence to call the hub or route remotely.
+stop_test_sentinels
 : >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
 XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-lookup-fail --agent-label owner --lane owner --t T1 >/dev/null
 set +e
