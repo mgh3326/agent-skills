@@ -16,12 +16,14 @@ real_jobs_count() {
 REAL_JOBS_BEFORE="$(real_jobs_count)"
 
 stop_test_sentinels() {
-  local pidfile pid
+  local pidfile pid command_line
 
   while IFS= read -r pidfile; do
     [[ -r "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+    [[ "$command_line" == *"$ROOT/bin/wrk sentinel "* || "$command_line" == *"$TMP/"*' sentinel '* ]] || continue
     kill "$pid" 2>/dev/null || true
   done < <(find "$ARBITER_INBOX_ROOT" -type f -name completion-sentinel.pid -print 2>/dev/null)
 }
@@ -354,6 +356,7 @@ grep -q '^OK pane=w:p1 host=local ' <<<"$forced_out"
 
 # A readable active duplicate remains terminal before either local telemetry or
 # hub/SSH work, for both automatic and explicitly local routing.
+stop_test_sentinels
 for route in auto local; do
   active_job="spillover-active-$route"
   XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job "$active_job" --agent-label owner --lane owner --t T1 >/dev/null
