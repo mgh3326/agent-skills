@@ -1959,7 +1959,11 @@ spillover_hub_spawn() {
     echo "wrk: remote host '$host' has no cwd_keys entry for '$cwd'; use --host local or configure hosts.toml" >&2
     return 2
   fi
-  if spillover_hub_args "$@"; then :; else return $?; fi
+  local hub_args_rc
+  if spillover_hub_args "$@"; then :; else
+    hub_args_rc=$?
+    return "$hub_args_rc"
+  fi
   [[ -r "$prompt" ]] || { echo "wrk: hub spawn brief is not readable: $prompt" >&2; return 2; }
   [[ "$(wc -c <"$prompt")" -le 65536 ]] || { echo "wrk: hub spawn brief exceeds 65536 UTF-8 bytes" >&2; return 2; }
   operator_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
