@@ -292,6 +292,15 @@ grep -qF 'SPILL_HUB_ARGS+=(--job-dup-ok)' "$MUT_ARGS" || {
   echo 'M1 mutation did not replace the forbidden-flag rejection' >&2
   exit 1
 }
+# The baseline above expects rc=2 and no request; this must make it RED.
+: >"$TMP/hub.log"
+M1_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$MUT_ARGS" "$HUB_CONFIG" --job-dup-ok 2>&1 || true)"
+python3 - "$TMP/hub.log" <<'PY'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert records and "--job-dup-ok" in json.loads(records[-1]["body"])["args"]
+PY
+[[ "$M1_out" == *'OK pane=pane-a'* ]] || { echo 'hub args allowlist mutant survived' >&2; exit 1; }
 source_must_stay_unchanged M1
 
 MUT_AUTH="$TMP/wrk-hub-auth"
@@ -303,6 +312,13 @@ grep -qF -- '--header "@/dev/null"' "$MUT_AUTH" || {
   echo 'M2 mutation did not replace the header-file argument' >&2
   exit 1
 }
+: >"$TMP/hub.log"
+WRK_HUB_SCENARIO=hub200 run_hub "$MUT_AUTH" "$HUB_CONFIG" >/dev/null 2>&1
+python3 - "$TMP/hub.log" <<'PY'
+import json, sys
+headers = [header for record in (json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()) for header in record["headers"]]
+assert not any(header.startswith("Authorization:") for header in headers)
+PY
 source_must_stay_unchanged M2
 
 MUT_CWD="$TMP/wrk-hub-cwd"
@@ -314,6 +330,9 @@ grep -qF -- 'spawn_cmd "$@"; return $?' "$MUT_CWD" || {
   echo 'M3 mutation did not replace the cwd-key rejection' >&2
   exit 1
 }
+: >"$TMP/hub.log"; : >"$TMP/herdr.log"
+WRK_HUB_SCENARIO=hub200 run_hub "$MUT_CWD" "$HUB_NO_CWD" >/dev/null 2>&1 || true
+[[ ! -s "$TMP/hub.log" && -s "$TMP/herdr.log" ]] || { echo 'hub cwd fail-closed mutant survived' >&2; exit 1; }
 source_must_stay_unchanged M3
 
 MUT_PENDING="$TMP/wrk-hub-pending"
@@ -325,11 +344,19 @@ grep -qF -- 'pending-pane' "$MUT_PENDING" || {
   echo 'M4 mutation did not replace pending polling' >&2
   exit 1
 }
+: >"$TMP/hub.log"
+M4_out="$(WRK_HUB_SCENARIO=pending run_hub "$MUT_PENDING" "$HUB_CONFIG" 2>&1)"
+python3 - "$TMP/hub.log" <<'PY'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert [record["method"] for record in records] == ["POST"]
+PY
+[[ "$M4_out" == *'OK pane=pending-pane'* ]] || { echo 'hub pending-poll mutant survived' >&2; exit 1; }
 source_must_stay_unchanged M4
 
 # Every hub invocation above starts its completion sentinel through the normal
- # spawn path. Reap only the test-owned sentinels before returning to the
- # legacy routing cases, whose fixture logs are intentionally reset below.
+# spawn path. Reap only the test-owned sentinels before returning to the
+# legacy routing cases, whose fixture logs are intentionally reset below.
 stop_test_sentinels
 
 echo 'PASS wrk-spillover hub-mutants-red=4/4'
