@@ -375,7 +375,10 @@ hosts_out="$(env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" WRK_TEST_ACTIV
 hosts_rc=$?
 set -e
 [[ "$hosts_rc" -eq 0 ]] || { echo "hosts command failed rc=$hosts_rc: $hosts_out" >&2; exit 1; }
-grep -q '^desktop[[:space:]]available' <<<"$hosts_out"
+grep -q '^desktop[[:space:]]available' <<<"$hosts_out" || {
+  echo "hosts output did not show desktop available: $hosts_out" >&2
+  exit 1
+}
 
 # Hub is authoritative: high local pressure remains local when hub says so.
 printf '%s\n' '9.00 0.10 0.10 1/1 1' >"$LOAD"
