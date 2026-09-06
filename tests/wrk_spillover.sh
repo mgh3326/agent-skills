@@ -384,9 +384,15 @@ set +x
 
 # Hub is authoritative: high local pressure remains local when hub says so.
 printf '%s\n' '9.00 0.10 0.10 1/1 1' >"$LOAD"
+set -x
+set +e
 hub_local_out="$(WRK_PLACE_SCENARIO=local WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+hub_local_rc=$?
+set -e
+[[ "$hub_local_rc" -eq 0 ]] || { echo "hub-local spawn failed rc=$hub_local_rc: $hub_local_out" >&2; exit 1; }
 grep -q '^OK pane=w:p1 host=local ' <<<"$hub_local_out"
 grep -q 'source=hub' "$TMP/spillover.log"
+set +x
 printf '%s\n' 'STAGE wrk-spillover legacy-hub-local'
 
 # Hub failure plus high pressure spills to the first measured remote host.
