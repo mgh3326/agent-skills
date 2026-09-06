@@ -367,10 +367,14 @@ grep -q 'source=local-fallback' "$TMP/spillover.log"
 [[ ! -s "$TMP/ssh.log" ]]
 printf '%s\n' 'STAGE wrk-spillover legacy-low'
 
+set +e
 hosts_out="$(env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" WRK_TEST_ACTIVE=0 \
   WRK_HOSTS_CONFIG="$CONFIG" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
   WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SSH_LOG="$TMP/ssh.log" \
   "$ROOT/bin/wrk" hosts)"
+hosts_rc=$?
+set -e
+[[ "$hosts_rc" -eq 0 ]] || { echo "hosts command failed rc=$hosts_rc: $hosts_out" >&2; exit 1; }
 grep -q '^desktop[[:space:]]available' <<<"$hosts_out"
 
 # Hub is authoritative: high local pressure remains local when hub says so.
