@@ -58,8 +58,6 @@ spillover_test_error() {
   printf 'FAIL: wrk-spillover line=%s command=%s rc=%s\n' "$LINENO" "$BASH_COMMAND" "$rc" >&2
   exit "$rc"
 }
-trap spillover_test_error ERR
-
 PROMPT="$TMP/brief.md"
 CONFIG="$TMP/hosts.toml"
 LOAD="$TMP/loadavg"
@@ -360,6 +358,10 @@ grep -q 'ARBITER_INBOX_ROOT is not isolated' <<<"$b5_out"
   exit 1
 }
 printf '%s\n' 'PASS wrk-spillover seed-isolation-guard'
+
+# Every expected non-zero hub path above is handled explicitly. From here on,
+# retain the failing command in CI output while diagnosing legacy assertions.
+trap spillover_test_error ERR
 
 printf '%s\n' 'spillover fixture brief' >"$PROMPT"
 
