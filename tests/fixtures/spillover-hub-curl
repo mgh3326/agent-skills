@@ -8,6 +8,27 @@ method=GET
 url=""
 data=""
 headers=()
+argv="$(ps -ww -p "$$" -o command= 2>/dev/null || true)"
+
+read_headers() {
+  local value="$1" line
+  if [[ "$value" == @* ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      headers+=("$line")
+    done <"${value#@}"
+  else
+    headers+=("$value")
+  fi
+}
+
+read_data() {
+  local value="$1"
+  if [[ "$value" == @* ]]; then
+    data="$(<"${value#@}")"
+  else
+    data="$value"
+  fi
+}
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -15,8 +36,8 @@ while [[ $# -gt 0 ]]; do
     --output|-o) output="$2"; shift 2 ;;
     --write-out|-w) shift 2 ;;
     --request|-X) method="$2"; shift 2 ;;
-    --header|-H) headers+=("$2"); shift 2 ;;
-    --data-binary) data="$2"; shift 2 ;;
+    --header|-H) read_headers "$2"; shift 2 ;;
+    --data-binary) read_data "$2"; shift 2 ;;
     http://*|https://*) url="$1"; shift ;;
     *) shift ;;
   esac
@@ -24,15 +45,16 @@ done
 
 [[ -n "$url" && -n "$output" ]] || exit 64
 if [[ -n "${WRK_HUB_CURL_LOG:-}" ]]; then
-  python3 - "${WRK_HUB_CURL_LOG}" "$method" "$url" "$data" "${headers[@]}" <<'PY'
+  python3 - "${WRK_HUB_CURL_LOG}" "$method" "$url" "$data" "$argv" "${headers[@]}" <<'PY'
 import json, sys
-path, method, url, body, *headers = sys.argv[1:]
+path, method, url, body, argv, *headers = sys.argv[1:]
 with open(path, "a", encoding="utf-8") as log:
     log.write(json.dumps({
         "method": method,
         "url": url,
         "headers": headers,
         "body": body,
+        "argv": argv,
     }, ensure_ascii=False, separators=(",", ":")) + "\n")
 PY
 fi
@@ -49,7 +71,7 @@ success = {
     "rc": 0,
     "job_id": "job-a",
     "pane": "pane-a",
-    "stdout_tail": "fixture",
+    "stdout_tail": "OK pane=pane-a host=local model=codex-terra label=fixture status=working landed=yes job=job-a",
     "completed_at": "2026-09-07T00:00:00Z",
 }
 if scenario == "pending":
@@ -63,7 +85,10 @@ elif scenario == "hub401":
 elif scenario == "hub409":
     status, result = 409, {"error": "duplicate", "job_id": "job-a", "pane": "pane-a"}
 elif scenario == "hub400":
-    status, result = 400, {"error": "invalid_request"}
+  status, result = 400, {"error": "invalid_request"}
+elif scenario == "landed_no":
+    success["stdout_tail"] = "OK pane=pane-a host=local model=codex-terra label=fixture status=idle landed=no job=job-a"
+    status, result = 200, success
 else:
     status, result = 200, success
 print(status)
