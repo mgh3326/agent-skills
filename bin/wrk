@@ -77,7 +77,7 @@ Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [opti
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
   wrk done JOB [--report PATH]
-  wrk escalate JOB --question TEXT
+  wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
   wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-captains]
   wrk find <name-or-label> [--pane-only]
@@ -85,6 +85,19 @@ Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [opti
   wrk profiles
 
 Run 'wrk <command> --help' for command-specific usage.
+USAGE
+}
+
+escalate_help() {
+  cat <<'USAGE'
+Usage: wrk escalate JOB --question TEXT [--report PATH]
+
+Write a captain escalation record and relay it to the parent lane.
+
+Options:
+  --question TEXT    required escalation question
+  --report PATH      optional existing report to attach and upload as a document
+  -h, --help         show this usage
 USAGE
 }
 
@@ -1012,6 +1025,7 @@ completion_event() {
   mkdir -p "$events"
   if [[ -n "$report" && -f "$report" ]]; then
     last="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240)"
+    last="$(append_document_suffix "$last")"
   else
     last=""
   fi
@@ -1061,6 +1075,63 @@ set_report_last_line() {
   while [[ "$EMIT_REPORT_LAST_LINE" == *$'\n' ]]; do
     EMIT_REPORT_LAST_LINE="${EMIT_REPORT_LAST_LINE%$'\n'}"
   done
+  EMIT_REPORT_LAST_LINE="$(append_document_suffix "$EMIT_REPORT_LAST_LINE")"
+}
+
+# Set only by upload_report_document for the current completion command. The
+# same suffix is applied independently to the durable record and relay value,
+# preserving their byte-identical report_last_line contract.
+REPORT_DOCUMENT_SUFFIX=""
+append_document_suffix() {
+  local last="$1" limit shortened
+  [[ -n "$REPORT_DOCUMENT_SUFFIX" ]] || { printf '%s' "$last"; return 0; }
+  limit=$((240 - ${#REPORT_DOCUMENT_SUFFIX}))
+  if (( limit > 0 )); then
+    shortened="$(printf '%s' "$last" | cut -c1-"$limit")"
+    printf '%s' "$shortened"
+  fi
+  printf '%s' "$REPORT_DOCUMENT_SUFFIX"
+}
+
+# Upload a report opportunistically. Its result is deliberately settled before
+# the durable record: that lets the record and wire value be written once with
+# the same document suffix, rather than rewriting a landed record. The bounded
+# (three-second) delay is the trade-off for that consistency.
+upload_report_document() {
+  local job="$1" report="$2" handoffkeep key base rc=0
+  local guard=(timeout 3)
+  REPORT_DOCUMENT_SUFFIX=""
+  handoffkeep="$(command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true)"
+  if [[ -z "$handoffkeep" ]]; then
+    warn "handoffkeep not found; report document not uploaded (job=$job)"
+    return 0
+  fi
+  base="$(basename "$report")"
+  key="reports/$job/$base"
+  if ! command -v timeout >/dev/null 2>&1; then
+    if command -v gtimeout >/dev/null 2>&1; then
+      guard=(gtimeout 3)
+    else
+      guard=(python3 -c 'import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)' 3)
+    fi
+  fi
+  local command=("${guard[@]}" "$handoffkeep" doc put --key "$key" --kind report --job "$job" --file "$report")
+  # Keep handoffkeep output out of wrk's one-line stdout contract; failures
+  # below intentionally become one warning and never affect the exit status.
+  "${command[@]}" >/dev/null 2>&1 || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    warn "handoffkeep document upload failed (rc=$rc job=$job); continuing without document link"
+    return 0
+  fi
+  REPORT_DOCUMENT_SUFFIX=" doc:$key"
+  if (( ${#REPORT_DOCUMENT_SUFFIX} > 240 )); then
+    warn "handoffkeep document key is too long for report link (job=$job)"
+    REPORT_DOCUMENT_SUFFIX=""
+  fi
 }
 
 # emit_relay_event KIND JOB OWNER LABEL PANE HOST REPORT LAST REASON QUESTION PR HEAD
@@ -1195,6 +1266,7 @@ done_cmd() {
     report="$(find_latest_report "$jobs_root/$job")"
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
+  upload_report_document "$job" "$report"
   completion_event "$job" "$owner" "$label" "$pane" "$report"
   set_report_last_line "$report"
   emit_relay_event job.completed "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
@@ -1209,6 +1281,7 @@ captain_flat_event() {
   mkdir -p "$events"
   if [[ -n "$report" && -f "$report" ]]; then
     last="$(tail -n 1 "$report" 2>/dev/null | tr '\r\n' ' ' | cut -c1-240)"
+    last="$(append_document_suffix "$last")"
   else
     last=""
   fi
@@ -1248,21 +1321,30 @@ captain_metadata() {
 }
 
 escalate_cmd() {
-  local job="${1:-}" question="" metadata owner label pane parent
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+    escalate_help
+    return 0
+  fi
+  local job="${1:-}" question="" report="" metadata owner label pane parent
   [[ -n "$job" && "$job" != -* ]] || die "escalate requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --question) [[ $# -ge 2 && -n "$2" ]] || die "--question requires text"; question="$2"; shift 2 ;;
+      --report) [[ $# -ge 2 && -n "$2" ]] || die "--report requires a path"; report="$2"; shift 2 ;;
       *) die "unknown escalate option '$1'" ;;
     esac
   done
   [[ -n "$question" ]] || die "escalate requires --question"
+  [[ -z "$report" || -f "$report" ]] || die "escalate requires an existing --report"
   metadata="$(captain_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent <<<"$metadata"
-  captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "" "captain escalation" "$question" "" ""
+  [[ -z "$report" ]] || upload_report_document "$job" "$report"
+  captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "$report" "captain escalation" "$question" "" ""
+  set_report_last_line "$report"
   emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
-    "" "" "captain escalation" "$question" "" ""
+    "$report" "$EMIT_REPORT_LAST_LINE" "captain escalation" "$question" "" ""
   echo "OK job=$job owner_lane=$owner kind=job.escalate"
 }
 
@@ -1281,6 +1363,7 @@ joined_cmd() {
   [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
   metadata="$(captain_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent <<<"$metadata"
+  upload_report_document "$job" "$report"
   captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "captain joined PR" "" "$pr" "$head"
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
