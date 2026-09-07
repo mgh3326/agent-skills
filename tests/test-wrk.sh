@@ -806,19 +806,35 @@ echo "PASS builder-accepts-canonical-and-legacy-profile-aliases"
 role_must_fail() {
   local rejected_role="$1" job="$2" output rc
   set +e
-  output="$(spawn_base builder-opus --role "$rejected_role" --lane builder-lane --parent parent-lane --job "$job" --t T1 2>&1)"
+  output="$(spawn_base codex-terra --role "$rejected_role" --job "$job" --t T1 2>&1)"
   rc=$?
   set -e
   python3 - "$rc" "$rejected_role" "$output" <<'PY'
 import sys
 assert int(sys.argv[1]) == 2, "unknown --role %r must be a usage error, rc=%s output=%s" % (sys.argv[2], sys.argv[1], sys.argv[3])
 PY
-  grep -q -- '--role' <<<"$output" || fail "unknown --role '$rejected_role' must explain usage: $output"
+  grep -Fqx -- 'wrk: --role accepts only worker or builder (legacy alias: captain)' <<<"$output" ||
+    fail "unknown --role '$rejected_role' must hit role validation: $output"
   [[ ! -e "$ARBITER_INBOX_ROOT/$job/events/00001-job.claim.json" ]] || fail "unknown role must not claim $job"
 }
 role_must_fail admiral role-unknown-admiral
 role_must_fail tester role-unknown-tester
-role_must_fail '' role-unknown-empty
+
+role_must_require_value() {
+  local job="$1" output rc
+  set +e
+  output="$(spawn_base codex-terra --role '' --job "$job" --t T1 2>&1)"
+  rc=$?
+  set -e
+  python3 - "$rc" "$output" <<'PY'
+import sys
+assert int(sys.argv[1]) == 2, "empty --role value must be a usage error, rc=%s output=%s" % (sys.argv[1], sys.argv[2])
+PY
+  grep -Fqx -- 'wrk: --role requires a value' <<<"$output" ||
+    fail "empty --role value must hit the value guard: $output"
+  [[ ! -e "$ARBITER_INBOX_ROOT/$job/events/00001-job.claim.json" ]] || fail "empty role must not claim $job"
+}
+role_must_require_value role-unknown-empty
 echo "PASS role-unknown-values-are-usage-errors"
 
 expect_exit 2 spawn_base builder-opus --role builder --parent parent-lane --job builder-missing-lane
