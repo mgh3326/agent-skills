@@ -69,6 +69,12 @@ shape다. 소비자는 flat completion event를 arbiter envelope이라고 가정
    하한과 라운드 캡이 없으면 적대검증자는 항상 무언가를 더 찾아내고 수렴이 무한히 늦어진다
    (07-31 실측: 4과제 16라운드).
 
+9. **자동 리뷰어(CodeRabbit 등)는 참고 자료이지 게이트가 아니다.** 검증자는 PR의 자동 리뷰
+   inline 지적 중 Major 이상을 보고서 RISKS에 한 줄씩 나열하고 각각 수용/기각과 이유를 적는다
+   (`CR: <path>:<line> <카테고리> — 수용/기각: <이유>`). 자동 리뷰가 pending·skipped·rate-limited
+   인 것은 JOIN을 막지 않으며, 지적 0건이면 `CR: none`으로 표기해 읽었음을 남긴다. 검증자 자신의
+   적대 검증을 자동 리뷰로 대체하지 않는다.
+
 막힘은 `wrk escalate <job> --question "<text>"`으로 기록한 뒤 **대기**한다. 상위 결정을
 추측해 계속 진행하지 않는다.
 
