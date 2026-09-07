@@ -12,8 +12,17 @@ if [[ -n "$(find "$output" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
   exit 2
 fi
 
-# A fixed test clock makes this byte-for-byte, while still exercising bin/arbiter
-# and its atomic serializer rather than a hand-written JSON substitute.
+# The captain-role artifacts are durable pre-rename regression evidence. Current
+# arbiter normalizes direct `--role captain` input to builder, so preserve the
+# old envelope bytes as a fixture input while generating the canonical builder
+# claim through the production artifact writer below.
+for legacy in "$fixture_dir"/0000[1-4]-*.json; do
+  cp "$legacy" "$output/"
+done
+
+# A fixed test clock makes the new builder artifact byte-for-byte stable while
+# still exercising bin/arbiter and its atomic serializer rather than a
+# hand-written JSON substitute.
 fixture_env=(
   ARBITER_INBOX_ROOT="$output/.work"
   XDG_DATA_HOME="$output/.work/xdg"
@@ -22,15 +31,8 @@ fixture_env=(
 )
 
 env "${fixture_env[@]}" "$root/bin/arbiter" claim \
-  --job captain-fixture --lane lane-a --agent-label captain-fixture --t T1 \
-  --role captain --parent-lane parent-a >/dev/null
-env "${fixture_env[@]}" "$root/bin/arbiter" event --job captain-fixture --kind job.spawned \
-  --payload-json '{"owner_lane":"lane-a","label":"captain-fixture","pane_id":"w1:p1"}' >/dev/null
-(
-  cd "$fixture_dir"
-  env "${fixture_env[@]}" "$root/bin/wrk" escalate captain-fixture --question 'need parent decision' >/dev/null
-  env "${fixture_env[@]}" "$root/bin/wrk" joined captain-fixture \
-    --pr https://example.invalid/pr/1 --head deadbeef --report report.md >/dev/null
-)
-mv "$output/.work/captain-fixture/events/"*.json "$output/"
+  --job builder-fixture --lane builder-lane --agent-label builder-fixture --t T1 \
+  --role builder --parent-lane parent-lane >/dev/null
+mv "$output/.work/builder-fixture/events/00001-job.claim.json" \
+  "$output/00005-builder-job.claim.json"
 rm -rf "$output/.work"

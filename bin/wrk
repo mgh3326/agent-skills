@@ -32,9 +32,9 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 # 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
 ALL_PROFILES=(
-  opus sonnet sonnet-med haiku fable captain-opus
+  opus sonnet sonnet-med haiku fable builder-opus captain-opus
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
-  codex codex-sol codex-max captain-sol codex-astra captain-astra
+  codex codex-sol codex-max builder-sol captain-sol codex-astra builder-astra captain-astra
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
@@ -79,7 +79,7 @@ Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [opti
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
-  wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-captains]
+  wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -92,7 +92,7 @@ escalate_help() {
   cat <<'USAGE'
 Usage: wrk escalate JOB --question TEXT [--report PATH]
 
-Write a captain escalation record and relay it to the parent lane.
+Write a builder escalation record and relay it to the parent lane.
 
 Options:
   --question TEXT    required escalation question
@@ -105,7 +105,7 @@ spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
-                 [--landing-strict] [--role captain --lane CAPTAIN_LANE --parent PARENT_LANE] [--host auto|local|NAME]
+                 [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -116,12 +116,13 @@ Options:
   --owner NAME       spawning session name, recorded as the arbiter owner_lane
                      (default: default). Lets that session later run
                      `arbiter status --lane NAME` to find and reclaim its workers.
-  --role worker|captain
-                     captain requires --lane and --parent, and accepts only
-                     captain-opus, captain-sol or captain-astra profiles.
-  --lane NAME        captain's own lane; recorded as the claim owner_lane.
+  --role worker|builder (legacy alias: captain)
+                     builder requires --lane and --parent, and accepts only
+                     builder-opus, builder-sol or builder-astra profiles;
+                     captain-* profile aliases remain accepted.
+  --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
-  --parent NAME      parent lane for a captain; completion/escalation events
+  --parent NAME      parent lane for a builder; completion/escalation events
                      are routed to this lane.
   --report PATH      report acceptance-criterion path watched by the completion sentinel
   --job-dup-ok       explicit operator override: permit an active duplicate job
@@ -143,7 +144,8 @@ Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
 codex-luna-max, codex-max, codex-terra-max.
 Claude effort wiring (ROB-1191/ROB-1193): opus default=xhigh, sonnet/sonnet-med default=high,
 haiku default=low; all support an explicit --effort override.
-Captain profiles: captain-opus = Claude Opus at effort high; captain-sol = codex-sol; captain-astra = gpt-6-astra.
+Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol; builder-astra = gpt-6-astra.
+Legacy profile aliases captain-opus, captain-sol and captain-astra have the same meaning.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-for-coding/k3`; kimi-k27 uses
 `kimi --auto -m kimi-for-coding/kimi-for-coding`; the CLI has no --effort option.
 kimi-k3-low uses the same argv as kimi-k3 but injects KIMI_CODE_HOME pointing at
@@ -837,7 +839,7 @@ resolve_profile() {
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
     # Defaults align with scopefuel Profile.benchmark_effort (opus=xhigh, sonnet=high).
     opus) PROFILE_KIND=claude; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
-    captain-opus) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
+    builder-opus|captain-opus) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
     sonnet|sonnet-med) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
@@ -892,9 +894,9 @@ resolve_profile() {
     codex) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    captain-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    builder-astra|captain-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
 
     kiro) PROFILE_KIND=kiro; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     kiro-opus) PROFILE_KIND=kiro; PROFILE_MODEL=claude-opus-5; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
@@ -965,11 +967,11 @@ resolve_profile() {
   # usage policy remains solely in scopefuel; runtime MODEL and effort stay
   # exactly as requested.
   case "$MODEL" in
-    opus|captain-opus) GATE_PROFILE=opus ;;
+    opus|builder-opus|captain-opus) GATE_PROFILE=opus ;;
     sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
-    codex|codex-sol|codex-max|captain-sol|codex-astra|captain-astra) GATE_PROFILE=codex-max ;;
+    codex|codex-sol|codex-max|builder-sol|captain-sol|codex-astra|builder-astra|captain-astra) GATE_PROFILE=codex-max ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
     codex-luna|codex-luna-hi|codex-luna-max) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
@@ -1150,7 +1152,7 @@ emit_relay_event() {
     warn "panewire not found; relay event left as file only (job=$job kind=$kind)"
     return 0
   fi
-  # A wedged socket must not stall `wrk joined`; that call sits in the captain
+  # A wedged socket must not stall `wrk joined`; that call sits in the builder
   # loop, so a hang there stops the fleet. `timeout` is GNU coreutils and a
   # stock macOS has neither it nor gtimeout, so python3 — already a hard
   # dependency above — carries the same guard there.
@@ -1200,7 +1202,7 @@ for name in names:
     except (OSError,json.JSONDecodeError): continue
     p=o.get('payload',o)
     # Claim/reclaim establishes ownership.  Keep the newest one: a released
-    # job can be reclaimed by a different captain and parent.
+    # job can be reclaimed by a different builder and parent.
     if o.get('kind') in ('job.claim', 'job.reclaim'):
         owner=p.get('owner_lane') if isinstance(p.get('owner_lane'), str) else ''
         candidate=p.get('label', p.get('agent_label'))
@@ -1274,7 +1276,7 @@ done_cmd() {
   echo "OK job=$job report=$report"
 }
 
-captain_flat_event() {
+builder_flat_event() {
   local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
@@ -1310,14 +1312,15 @@ finally:
 PY
 }
 
-captain_metadata() {
+builder_metadata() {
   local job="$1" metadata owner label pane parent role
   metadata="$(completion_metadata "$job")" || die "cannot find job.claim/job.spawned metadata: $job"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  [[ "$role" == captain && -n "$parent" ]] || die "$job is not a captain claim with a parent lane"
-  # owner_lane is the captain's own lane. parent_lane is informational only;
+  case "$role" in builder|captain) ;; *) die "$job is not a builder claim with a parent lane (legacy captain alias is accepted)" ;; esac
+  [[ -n "$parent" ]] || die "$job is not a builder claim with a parent lane (legacy captain alias is accepted)"
+  # owner_lane is the builder's own lane. parent_lane is informational only;
   # panewire resolves the parent relationship from lanes.json.
-  printf '%s\t%s\t%s\t%s\n' "$owner" "$label" "$pane" "$parent"
+  printf '%s\t%s\t%s\t%s\t%s\n' "$owner" "$label" "$pane" "$parent" "$role"
 }
 
 escalate_cmd() {
@@ -1326,7 +1329,7 @@ escalate_cmd() {
     escalate_help
     return 0
   fi
-  local job="${1:-}" question="" report="" metadata owner label pane parent
+  local job="${1:-}" question="" report="" metadata owner label pane parent role reason
   [[ -n "$job" && "$job" != -* ]] || die "escalate requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -1338,18 +1341,20 @@ escalate_cmd() {
   done
   [[ -n "$question" ]] || die "escalate requires --question"
   [[ -z "$report" || -f "$report" ]] || die "escalate requires an existing --report"
-  metadata="$(captain_metadata "$job")"
-  IFS=$'\t' read -r owner label pane parent <<<"$metadata"
+  metadata="$(builder_metadata "$job")"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  reason="builder escalation"
+  [[ "$role" == captain ]] && reason="captain escalation"
   [[ -z "$report" ]] || upload_report_document "$job" "$report"
-  captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "$report" "captain escalation" "$question" "" ""
+  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "$report" "$reason" "$question" "" ""
   set_report_last_line "$report"
   emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
-    "$report" "$EMIT_REPORT_LAST_LINE" "captain escalation" "$question" "" ""
+    "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "$question" "" ""
   echo "OK job=$job owner_lane=$owner kind=job.escalate"
 }
 
 joined_cmd() {
-  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent
+  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent role reason
   [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -1361,13 +1366,15 @@ joined_cmd() {
     esac
   done
   [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
-  metadata="$(captain_metadata "$job")"
-  IFS=$'\t' read -r owner label pane parent <<<"$metadata"
+  metadata="$(builder_metadata "$job")"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  reason="builder joined PR"
+  [[ "$role" == captain ]] && reason="captain joined PR"
   upload_report_document "$job" "$report"
-  captain_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "captain joined PR" "" "$pr" "$head"
+  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head"
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
-    "$report" "$EMIT_REPORT_LAST_LINE" "captain joined PR" "" "$pr" "$head"
+    "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "" "$pr" "$head"
   echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
 }
 
@@ -2399,7 +2406,7 @@ hosts_cmd() {
 spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" CAPTAIN_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
   while [[ $# -gt 0 ]]; do
@@ -2411,7 +2418,7 @@ spawn_cmd() {
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
           --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
-          --role) ROLE="$2" ;; --lane) CAPTAIN_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
+          --role) ROLE="$2" ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
           --report) REPORT_PATH="$2" ;;
         esac
         shift 2 ;;
@@ -2435,16 +2442,38 @@ spawn_cmd() {
 
   [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
 
-  case "$ROLE" in worker|captain) ;; *) die "--role accepts only worker or captain" ;; esac
-  if [[ "$ROLE" == captain ]]; then
-    [[ -n "$CAPTAIN_LANE" ]] || die "--role captain requires --lane CAPTAIN_LANE"
-    [[ -n "$PARENT_LANE" ]] || die "--role captain requires --parent PARENT_LANE"
-    [[ -z "$OWNER" ]] || die "--role captain uses --lane; do not combine it with --owner"
-    case "$MODEL" in captain-opus|captain-sol|captain-astra) ;; *) die "--role captain accepts only captain-opus, captain-sol or captain-astra (terra/luna are worker-only)" ;; esac
-    [[ "$MODEL" != captain-opus || -z "$EFFORT" || "$EFFORT" == high ]] || die "captain-opus requires effort high"
+  case "$ROLE" in
+    worker|builder) ;;
+    captain)
+      warn "--role captain is deprecated; use --role builder"
+      ROLE="builder"
+      ;;
+    *) die "--role accepts only worker or builder (legacy alias: captain)" ;;
+  esac
+  case "$BUILDER_LANE" in
+    director-*|admiral-*) die "--lane '$BUILDER_LANE' is reserved for director lanes; --role builder/worker cannot claim it" ;;
+  esac
+  if [[ "$ROLE" == builder ]]; then
+    [[ -n "$BUILDER_LANE" ]] || die "--role builder requires --lane BUILDER_LANE (legacy alias: captain)"
+    [[ -n "$PARENT_LANE" ]] || die "--role builder requires --parent PARENT_LANE (legacy alias: captain)"
+    [[ -z "$OWNER" ]] || die "--role builder uses --lane; do not combine it with --owner"
+    [[ "$BUILDER_LANE" != "$PARENT_LANE" ]] || die "--role builder forbids --lane and --parent being the same (self parent)"
+    case "$MODEL" in
+      builder-opus|builder-sol|builder-astra|captain-opus|captain-sol|captain-astra) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol or builder-astra (legacy captain-* aliases accepted; terra/luna are worker-only)" ;;
+    esac
+    case "$MODEL" in
+      builder-opus|captain-opus)
+        [[ -z "$EFFORT" || "$EFFORT" == high ]] || die "builder-opus (legacy captain-opus alias) requires effort high"
+        ;;
+    esac
   else
-    [[ -z "$CAPTAIN_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role captain"
-    case "$MODEL" in captain-opus|captain-sol) die "captain profiles require --role captain" ;; esac
+    [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
+    case "$MODEL" in
+      builder-opus|builder-sol|builder-astra|captain-opus|captain-sol|captain-astra)
+        die "builder profiles (legacy captain-* aliases accepted) require --role builder"
+        ;;
+    esac
   fi
 
   resolve_profile
@@ -2466,9 +2495,9 @@ spawn_cmd() {
   # Conflating them made every record `default` (or `mock`), so an orch could not
   # query `arbiter status --lane <itself>` to find and reclaim its own workers.
   # -L live|mock stays the execution lane; --owner names the spawning session.
-  JOB_LANE="${CAPTAIN_LANE:-${OWNER:-default}}"
+  JOB_LANE="${BUILDER_LANE:-${OWNER:-default}}"
   ARBITER_CLAIM_ROLE_ARGS=(--role "$ROLE")
-  if [[ "$ROLE" == captain ]]; then
+  if [[ "$ROLE" == builder ]]; then
     ARBITER_CLAIM_ROLE_ARGS+=(--parent-lane "$PARENT_LANE")
   fi
 
@@ -2636,10 +2665,10 @@ print(value if isinstance(value, str) else "")
 
 reap_help() {
   cat <<'USAGE'
-Usage: wrk reap [--lane LANE] [--grace DURATION] [--apply] [--include-captains]
+Usage: wrk reap [--lane LANE] [--grace DURATION] [--apply] [--include-builders|--include-captains]
 
 Close the herdr tabs of jobs that already reported a terminal event, so that
-finished worker/verifier panes stop accumulating on the herdr server.
+finished worker/tester panes stop accumulating on the herdr server.
 
 A job is a candidate only when all of these hold:
   · it has a terminal event (job.completed, job.joined or job.revoked)
@@ -2648,14 +2677,15 @@ A job is a candidate only when all of these hold:
   · it has not been reaped before (no job.reaped event)
 
 working/blocked panes, jobs without a terminal event and jobs whose pane herdr
-cannot resolve are never touched. Captain panes (claim role=captain) are
-excluded unless --include-captains is given.
+cannot resolve are never touched. Builder panes (claim role=builder, or legacy
+role=captain) are excluded unless --include-builders is given.
 
 Options:
   --lane LANE        only jobs whose claim owner_lane is LANE
   --grace DURATION   minimum age of the terminal event (10m, 600s, 2h, 600)
   --apply            actually close the tabs; without it reap only lists them
-  --include-captains also reap captain panes
+  --include-builders also reap builder panes (canonical)
+  --include-captains legacy alias for --include-builders
   -h, --help         show this usage
 
 The default is a dry run: nothing is closed and no event is written. Each
@@ -2686,13 +2716,13 @@ PY
 # 스폰 전량)에서 age(초)가 tab_id 자리에 들어가 `herdr tab close <초>` 가 될 뻔했다
 # (2026-09-05 검증 실증: `would-close … tab=1928`).
 reap_candidates() {
-  local root="$1" lane="$2" grace="$3" include_captains="$4"
-  python3 - "$root" "$lane" "$grace" "$include_captains" <<'PY'
+  local root="$1" lane="$2" grace="$3" include_builders="$4"
+  python3 - "$root" "$lane" "$grace" "$include_builders" <<'PY'
 import datetime, json, os, sys, time
 
-root, lane, grace, include_captains = sys.argv[1:5]
+root, lane, grace, include_builders = sys.argv[1:5]
 grace = int(grace)
-include_captains = include_captains == "1"
+include_builders = include_builders == "1"
 TERMINAL = {"job.completed", "job.joined", "job.revoked"}
 now = time.time()
 
@@ -2746,9 +2776,10 @@ for job in jobs:
             # 소유는 최신 claim 이 정한다(released 된 잡을 다른 레인이 다시 잡는다).
             owner = payload.get("owner_lane") if isinstance(payload.get("owner_lane"), str) else ""
             # 역할은 누적이다: `--role` 없는 reclaim 은 기본값 worker 를 payload 에
-            # 남기므로, 덮어쓰면 재클레임 한 번에 캡틴 표식이 지워진다.
-            if payload.get("role") == "captain":
-                role = "captain"
+            # 남기므로, 덮어쓰면 재클레임 한 번에 빌더 표식이 지워진다. 디스크에
+            # 남은 legacy captain claim도 동일한 builder 급 pane으로 보호한다.
+            if payload.get("role") in ("builder", "captain"):
+                role = "builder"
         for key in ("pane_id", "tab_id"):
             value = payload.get(key)
             if isinstance(value, str) and value:
@@ -2777,7 +2808,7 @@ for job in jobs:
         continue
     if lane and owner != lane:
         continue
-    if role == "captain" and not include_captains:
+    if role == "builder" and not include_builders:
         continue
     age = int(now - terminal_at)
     if age < grace:
@@ -2836,14 +2867,14 @@ PY
 }
 
 reap_cmd() {
-  local lane="" grace="10m" apply=0 include_captains=0
+  local lane="" grace="10m" apply=0 include_builders=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) reap_help; return 0 ;;
       --lane) [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a value"; lane="$2"; shift 2 ;;
       --grace) [[ $# -ge 2 && -n "$2" ]] || die "--grace requires a value"; grace="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
-      --include-captains) include_captains=1; shift ;;
+      --include-builders|--include-captains) include_builders=1; shift ;;
       -*) die "unknown reap option '$1'" ;;
       *) die "unexpected argument '$1'" ;;
     esac
@@ -2856,7 +2887,7 @@ reap_cmd() {
     return 0
   fi
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
-  candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_captains")"
+  candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
   tab_counts="$(reap_tab_pane_counts)"
   local job owner pane tab age probe class token probe_tab panes acted=0
