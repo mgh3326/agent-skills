@@ -1,6 +1,6 @@
 ---
 name: spawn-worker
-description: herdr로 워커/검증자 세션을 스폰(생성·기동·브리프 주입)할 때 반드시 사용. worktree 준비, 규모(T0~T3)·급(S+~C) 배정, 브리프 형식, 심각도 기반 검증 루프, 완료 보고 검증(ls-remote)까지 스폰 전 과정의 표준. 트리거 - "워커 띄워/스폰해", "검증자 붙여", "작업 시켜", wrk spawn·herdr agent start 사용 전.
+description: herdr로 워커/tester 세션을 스폰(생성·기동·브리프 주입)할 때 반드시 사용. worktree 준비, 규모(T0~T3)·급(S+~C) 배정, 브리프 형식, 심각도 기반 검증 루프, 완료 보고 검증(ls-remote)까지 스폰 전 과정의 표준. 트리거 - "워커 띄워/스폰해", "tester 붙여", "작업 시켜", wrk spawn·herdr agent start 사용 전.
 ---
 
 # spawn-worker — 워커 스폰 표준 절차
@@ -33,7 +33,7 @@ description: herdr로 워커/검증자 세션을 스폰(생성·기동·브리�
 | T | 대상 | 검증 강도 |
 |---|---|---|
 | **T0** | 로컬 스크립트·설정, 30줄 이하, 되돌리기=파일 복사 | **스폰하지 않는다.** 직접 처리 + 명령 1회 확인 |
-| **T1** | 도구 레포(scopefuel·agent-skills 등), 런타임 무관 | 워커 1명, **자체검증**. 적대검증자 없음 |
+| **T1** | 도구 레포(scopefuel·agent-skills 등), 런타임 무관 | 워커 1명, **자체검증**. 적대tester 없음 |
 | **T2** | auto_trader 비거래 경로 | 워커 + **적대검증 1라운드** |
 | **T3** | 되돌릴 수 없는 외부 mutation·배포·안전가드 | 수렴형 풀코스(§5) — **여기서만** |
 
@@ -65,8 +65,8 @@ T3 floor 대상 아님.
 |---|---|
 | T0 | no-spawn(직접 처리) |
 | T1 | herdr worker 1명 + 자체검증 |
-| T2 | herdr worker + 독립 verifier 1라운드 |
-| T3 | herdr worker + 독립 verifier(**다른 provider family 필수** — §2-4) |
+| T2 | herdr worker + 독립 tester 1라운드 |
+| T3 | herdr worker + 독립 tester(**다른 provider family 필수** — §2-4) |
 
 - **분류 불가 시 실행하지 않고 `NEEDS_CLASSIFICATION`으로 반환한다.** 빈칸으로 두면 ROB-1196처럼
   orch가 기본 도구(하네스 서브에이전트)로 처리해 §2-3 경계가 우회된다.
@@ -137,7 +137,7 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
   **agy 세션 1개를 idle 쿼타 비컨으로 띄우는 것**이 조치이지 force가 아니다).
 - **"스스로 검증하라" 지시 금지** → 시도 목록 열거 + 하한 명시(예: "테스트 X·Y 실행,
   전수 grep 후에만 부재 단정").
-- **T3 verifier는 다른 provider family가 필수다**(claude/openai/xai/moonshot 등) — 다른
+- **T3 tester는 다른 provider family가 필수다**(claude/openai/xai/moonshot 등) — 다른
   **모델명**만으로는 부족하다(§2-3의 "다른 세션·다른 계열"을 T3에서는 '우선'이 아니라
   '필수'로 올린 것). **self-check(자체검증)는 제출 증거일 뿐 독립 검증으로 세지 않는다.**
 
@@ -224,8 +224,8 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
   `wrk spawn` 프로필 매핑에 내장. mock 레인은 `-L mock` + `MOCK_MCP_PROFILE` 필수.
 - **스폰 = handoffkeep tasks 기록 의무**: 스폰과 매 라운드를 tasks 큐에 기록한다
   (`claim` · `transition` · `refs`(`--pr`/`--head-sha`/`--report-path`/`--job-id`)). 태스크
-  상태의 정본은 세션 기억이 아니라 **tasks 큐**다 — 놓침 방지의 근간. Linear는 **캡틴급
-  태스크(PR 1건 루프) 중 진행 중인 것만** fable이 1:1 이슈로 관리한다. **워커·검증자 단위
+  상태의 정본은 세션 기억이 아니라 **tasks 큐**다 — 놓침 방지의 근간. Linear는 **빌더급
+  태스크(PR 1건 루프) 중 진행 중인 것만** fable이 1:1 이슈로 관리한다. **워커·tester 단위
   이슈는 만들지 않는다.**
 
 ## 4. 기동·주입·감시
@@ -236,7 +236,7 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
             --t <T0..T3> --owner <내 세션 이름> [-L live|mock] [--effort <레벨>] [--job <id>]
   wrk --help          # 서브커맨드·옵션 전체
   ```
-  신규 workspace 규약: workers(herdr workspace w16)는 worker/verifier 신규 세션에,
+  신규 workspace 규약: workers(herdr workspace w16)는 worker/tester 신규 세션에,
   orchs는 orch류 신규 상주 세션에 사용한다. 기존 세션은 이동하지 않으며,
   이슈별 -w 값을 생략하거나 추측하지 않는다.
   `-m` 은 **필수**다(기본값 없음 — 오타가 조용히 Claude 워커를 띄우던 결함을 제거했다).
@@ -260,7 +260,7 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
   아니다**(소켓 일시 정지·비기본 herdr 세션). 확정 소멸 에러 코드만 즉시 `job.lost` 이고,
   일시 장애는 연속 10회(≈5분) 넘겨야 `job.lost(herdr_unreachable)` 이며, 그 뒤에도 30분
   유예 동안 감시해 report 가 나오면 `job.completed` 를 추가로 쓴다. 판정은 잡 디렉토리
-  `completion-sentinel.log` 에 한 줄씩 남으니 "캡틴이 무한 대기" 를 의심할 땐 그 파일부터 봐라.
+  `completion-sentinel.log` 에 한 줄씩 남으니 "빌더가 무한 대기" 를 의심할 땐 그 파일부터 봐라.
   🔴 원격/데스크톱처럼 herdr 서버가 비기본 세션에 사는 호스트에서는 스폰 시
   `HERDR_SESSION`(또는 `WRK_SENTINEL_HERDR_SESSION`)을 반드시 넘겨라 — 2026-09-04 에 이 값이
   센티널에 닿지 않아 그날 스폰한 거의 모든 잡이 30초 만에 오탐 `job.lost` 로 찍혔고, 워커가
@@ -384,9 +384,9 @@ T3=아래 수렴형.
 
 1. 워커 "완료" 보고 → **`git ls-remote`로 push SHA 실재 대조**(머지·배포·후속 스폰 전 필수).
 2. **기계적 확인은 검증 라운드의 소재가 아니다.** 테스트·lint·format·CI green·SHA 일치는
-   **워커의 제출 전 체크리스트**이고 증거(원문 출력)를 브리프에 첨부하게 한다. 검증자는
+   **워커의 제출 전 체크리스트**이고 증거(원문 출력)를 브리프에 첨부하게 한다. tester는
    의미론·계약·실패모드에만 추론을 쓴다.
-3. **적대검증자 스폰**(T2·T3만): 새 세션(같은 worktree 가능·수정/커밋 금지), 입력=이슈
+3. **적대tester 스폰**(T2·T3만): 새 세션(같은 worktree 가능·수정/커밋 금지), 입력=이슈
    AC+PR+경로만. "틀렸다고 가정하고 반증": 독립 테스트 재실행, false-green 탐지(assert
    뒤집기), AC 대조, merge-base 기준 스코프 확인.
    템플릿=`~/work/herdr-templates/VERIFY-TEMPLATE.txt`.
@@ -396,7 +396,7 @@ T3=아래 수렴형.
      **머지를 막지 않는다.**
    - **하드 캡 3라운드.** 초과하면 코드가 아니라 설계가 불명확하다는 신호다 — 루프를 계속
      돌리지 말고 운영자에게 에스컬레이션한다.
-   - 심각도 하한이 없으면 적대검증자는 항상 무언가를 찾아내고 수렴이 무한히 늦어진다
+   - 심각도 하한이 없으면 적대tester는 항상 무언가를 찾아내고 수렴이 무한히 늦어진다
      (07-31 실측: 개선 제안 하나가 풀 라운드를 트리거해 4과제 16라운드).
 5. 부재/미완 단정("테스트 없음"·"미배선")은 전수 탐색 후에만 보고에 인용.
 
@@ -437,7 +437,7 @@ herdr pane close <pane_id>                      # 회수
 ### 6-4. `pane close` 만 쓴다
 
 `herdr tab close` 는 쓰지 마라 — 같은 탭에 분할된 다른 pane 이 함께 죽는다
-(2026-07-20 실사고: 수동 스폰한 캡틴 pane 동반 사망). `pane close` 는 그 pane 만 닫는다.
+(2026-07-20 실사고: 수동 스폰한 캡틴 pane 동반 사망; 당시 캡틴 = 현 빌더). `pane close` 는 그 pane 만 닫는다.
 
 ### 6-5. 죽은 탭 스윕 — `agent list` 로는 안 보인다
 
@@ -476,8 +476,8 @@ wrk reap --lane <내 세션 이름> --apply      # 실제 회수
 후보 조건(전부 충족): terminal 이벤트(`job.completed`·`job.joined`·`job.revoked`)가 있고,
 그 이벤트가 `--grace`(기본 10m)보다 오래됐고, `job.spawned` 의 pane 이 herdr 에 살아 있고
 상태가 `idle`·`done` 이고, 아직 `job.reaped` 가 없을 것. `working`·`blocked` pane, terminal
-이벤트 없는 잡, herdr 가 해석 못 하는 pane 은 건드리지 않는다. 캡틴 pane 은
-`--include-captains` 없이는 제외한다. 닫은 잡에는 `job.reaped`(`pane_id`·`tab_id`·`at`)를 남긴다.
+이벤트 없는 잡, herdr 가 해석 못 하는 pane 은 건드리지 않는다. 빌더 pane(legacy captain payload 포함)은
+`--include-builders` 없이는 제외한다(`--include-captains`는 legacy 별칭). 닫은 잡에는 `job.reaped`(`pane_id`·`tab_id`·`at`)를 남긴다.
 
 🔴 `wrk reap` 은 §6-4 의 예외가 아니라 그 규칙이 적용되는 좁은 경로다. 닫는 대상은
 `wrk spawn` 이 **그 잡을 위해 직접 만든 탭**(`job.spawned` 의 `tab_id`)뿐이다 — 손으로

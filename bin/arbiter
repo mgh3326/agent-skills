@@ -1403,10 +1403,10 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument("--lane", required=True, help="owner lane")
     claim.add_argument("--t", required=True, choices=T_LEVELS, help="규모 등급")
     claim.add_argument(
-        "--role", choices=("worker", "captain"), default="worker",
-        help="job 역할(기본 worker); captain 은 parent lane 을 반드시 기록한다",
+        "--role", choices=("worker", "builder", "captain"), default="worker",
+        help="job 역할(기본 worker); builder 는 parent lane 을 반드시 기록한다 (captain 은 legacy alias)",
     )
-    claim.add_argument("--parent-lane", help="captain 의 상위 레인")
+    claim.add_argument("--parent-lane", help="builder 의 상위 레인 (captain 은 legacy alias)")
     claim.add_argument(
         "--reclaim-released",
         action="store_true",
@@ -1497,10 +1497,12 @@ def main(argv: list[str]) -> int:
     as_json = bool(getattr(args, "json", False))
     try:
         if args.command == "claim":
-            if args.role == "captain" and not args.parent_lane:
-                raise ArbiterError(EXIT_USAGE, "captain claim 은 --parent-lane 이 필요하다")
-            if args.role != "captain" and args.parent_lane is not None:
-                raise ArbiterError(EXIT_USAGE, "--parent-lane 은 --role captain 에서만 쓴다")
+            if args.role == "captain":
+                args.role = "builder"
+            if args.role == "builder" and not args.parent_lane:
+                raise ArbiterError(EXIT_USAGE, "builder claim 은 --parent-lane 이 필요하다 (captain 은 legacy alias)")
+            if args.role != "builder" and args.parent_lane is not None:
+                raise ArbiterError(EXIT_USAGE, "--parent-lane 은 --role builder 에서만 쓴다 (captain 은 legacy alias)")
         if getattr(args, "ttl_min", None) is not None and args.ttl_min < 0:
             raise ArbiterError(EXIT_USAGE, "--ttl-min 은 0 이상이어야 한다")
         result = HANDLERS[args.command](args)

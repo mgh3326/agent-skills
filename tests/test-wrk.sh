@@ -118,6 +118,11 @@ arb() { "$ARBITER" "$@"; }
 "$WRK" --help >/dev/null
 spawn_help_out="$("$WRK" spawn --help)"
 grep -q -- '--landing-strict' <<<"$spawn_help_out"
+grep -q -- '--role worker|builder (legacy alias: captain)' <<<"$spawn_help_out"
+grep -q -- 'builder-opus' <<<"$spawn_help_out"
+reap_help_out="$("$WRK" reap --help)"
+grep -q -- '--include-builders' <<<"$reap_help_out"
+grep -q -- '--include-captains legacy alias' <<<"$reap_help_out"
 "$WRK" find --help >/dev/null
 "$WRK" name-sync --help >/dev/null
 "$WRK" profiles --help >/dev/null
@@ -134,6 +139,9 @@ grep -qx 'kimi-k3' <<<"$profiles_out"
 grep -qx 'kimi-k27' <<<"$profiles_out"
 grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
+grep -qx 'builder-opus' <<<"$profiles_out"
+grep -qx 'builder-sol' <<<"$profiles_out"
+grep -qx 'builder-astra' <<<"$profiles_out"
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'captain-astra' <<<"$profiles_out"
@@ -719,101 +727,193 @@ arb status --job arb-record-fail --json |
   python3 -c 'import json,sys; assert json.load(sys.stdin)["quota_pool_records"] == [], sys.stdin'
 unset TEST_ARBITER_BIN
 
-# Captain contract: the real arbiter claim artifact remains an envelope while
-# wrk's upward-facing events stay flat. owner_lane is always the captain's own
+# Builder contract: the real arbiter claim artifact remains an envelope while
+# wrk's upward-facing events stay flat. owner_lane is always the builder's own
 # lane; parent_lane is recorded as information, while panewire resolves parent
-# routing from lanes.json.
+# routing from lanes.json. `captain` remains a deprecated input alias only.
 export TEST_ARBITER_BIN="$ARBITER"
-CAPTAIN_REPORT="$TMP/captain-report.md"
-printf 'captain report terminal line\n' >"$CAPTAIN_REPORT"
+BUILDER_REPORT="$TMP/builder-report.md"
+printf 'builder report terminal line\n' >"$BUILDER_REPORT"
 : >"$TMP/herdr.log"
-captain_opus_out="$(spawn_base captain-opus --role captain --lane captain-lane --parent parent-lane --job captain-opus-job --t T1 2>&1)"
-grep -q 'model=captain-opus' <<<"$captain_opus_out"
+builder_opus_out="$(spawn_base builder-opus --role builder --lane builder-lane --parent parent-lane --job builder-opus-job --t T1 2>&1)"
+grep -q 'model=builder-opus' <<<"$builder_opus_out"
 grep -q -- '--model opus' "$TMP/herdr.log"
 grep -q -- '--effort high' "$TMP/herdr.log"
-python3 - "$ARBITER_INBOX_ROOT/captain-opus-job/events/00001-job.claim.json" <<'PY'
+python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events/00001-job.claim.json" <<'PY'
 import json, sys
 event = json.load(open(sys.argv[1]))
 assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
 assert event["kind"] == "job.claim", event
 assert event["payload"] == {
-    "agent_label": "fixture", "owner_lane": "captain-lane", "parent_lane": "parent-lane",
-    "role": "captain", "t_level": "T1",
+    "agent_label": "fixture", "owner_lane": "builder-lane", "parent_lane": "parent-lane",
+    "role": "builder", "t_level": "T1",
 }, event
 PY
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
-  "$WRK" escalate captain-opus-job --question 'need parent decision' >/dev/null
+  "$WRK" escalate builder-opus-job --question 'need parent decision' >/dev/null
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
-  "$WRK" joined captain-opus-job --pr https://example.invalid/pr/1 --head deadbeef --report "$CAPTAIN_REPORT" >/dev/null
-python3 - "$ARBITER_INBOX_ROOT/captain-opus-job/events" <<'PY'
+  "$WRK" joined builder-opus-job --pr https://example.invalid/pr/1 --head deadbeef --report "$BUILDER_REPORT" >/dev/null
+python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events" <<'PY'
 import json, pathlib, sys
 events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
 escalate = next(e for e in events if e["kind"] == "job.escalate")
 joined = next(e for e in events if e["kind"] == "job.joined")
-assert escalate["owner_lane"] == joined["owner_lane"] == "captain-lane", events
+assert escalate["owner_lane"] == joined["owner_lane"] == "builder-lane", events
 assert escalate["parent_lane"] == joined["parent_lane"] == "parent-lane", events
-assert escalate["reason"] == "captain escalation" and escalate["question"] == "need parent decision", escalate
-assert joined["reason"] == "captain joined PR" and joined["pr"].endswith("/1") and joined["head"] == "deadbeef", joined
+assert escalate["reason"] == "builder escalation" and escalate["question"] == "need parent decision", escalate
+assert joined["reason"] == "builder joined PR" and joined["pr"].endswith("/1") and joined["head"] == "deadbeef", joined
 for event in (escalate, joined):
     assert {"pane_id", "report_path", "report_last_line"} <= set(event), event
 assert "payload" not in escalate and "payload" not in joined, events
 PY
+echo "PASS role-builder-spawn-claim-payload-parent"
+
+# The legacy role must hit the same real spawn/claim path, emit one warning,
+# and persist only canonical builder in its claim artifact.
+: >"$TMP/herdr.log"
+captain_alias_err="$TMP/captain-alias.err"
+captain_alias_out="$(spawn_base captain-opus --role captain --lane legacy-builder-lane --parent parent-lane --job captain-alias-job --t T1 2>"$captain_alias_err")"
+grep -qx 'wrk: warning: --role captain is deprecated; use --role builder' "$captain_alias_err" ||
+  fail "legacy captain role must emit its deprecation warning on stderr: $(<"$captain_alias_err")"
+[[ "$(grep -c 'deprecated; use --role builder' "$captain_alias_err")" -eq 1 ]] ||
+  fail "legacy captain role must emit exactly one deprecation warning: $(<"$captain_alias_err")"
+grep -q 'model=captain-opus' <<<"$captain_alias_out"
+python3 - "$ARBITER_INBOX_ROOT/captain-alias-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+echo "PASS role-captain-alias-normalizes-to-builder"
+
+# Every builder profile spelling, including all three legacy captain spellings,
+# must traverse the actual spawn/claim path under canonical --role builder.
+builder_profile_index=0
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra captain-astra; do
+  builder_profile_index=$((builder_profile_index + 1))
+  spawn_base "$builder_profile" --role builder --lane "builder-profile-$builder_profile_index" \
+    --parent parent-lane --job "builder-profile-$builder_profile_index" --t T1 >/dev/null
+done
+python3 - "$ARBITER_INBOX_ROOT" <<'PY'
+import json, pathlib, sys
+root = pathlib.Path(sys.argv[1])
+for index in range(1, 7):
+    event = json.loads((root / f"builder-profile-{index}" / "events" / "00001-job.claim.json").read_text())
+    assert event["payload"]["role"] == "builder", event
+PY
+echo "PASS builder-accepts-canonical-and-legacy-profile-aliases"
+
+role_must_fail() {
+  local rejected_role="$1" job="$2" output rc
+  set +e
+  output="$(spawn_base builder-opus --role "$rejected_role" --lane builder-lane --parent parent-lane --job "$job" --t T1 2>&1)"
+  rc=$?
+  set -e
+  python3 - "$rc" "$rejected_role" "$output" <<'PY'
+import sys
+assert int(sys.argv[1]) == 2, "unknown --role %r must be a usage error, rc=%s output=%s" % (sys.argv[2], sys.argv[1], sys.argv[3])
+PY
+  grep -q -- '--role' <<<"$output" || fail "unknown --role '$rejected_role' must explain usage: $output"
+  [[ ! -e "$ARBITER_INBOX_ROOT/$job/events/00001-job.claim.json" ]] || fail "unknown role must not claim $job"
+}
+role_must_fail admiral role-unknown-admiral
+role_must_fail tester role-unknown-tester
+role_must_fail '' role-unknown-empty
+echo "PASS role-unknown-values-are-usage-errors"
+
+expect_exit 2 spawn_base builder-opus --role builder --parent parent-lane --job builder-missing-lane
+expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --job builder-missing-parent
+expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --parent parent-lane --owner owner-lane --job builder-owner-conflict
+expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --parent builder-lane --job builder-self-parent
+expect_exit 2 spawn_base builder-opus --role builder --lane director-9 --parent parent-lane --job builder-director-lane
+expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent parent-lane --job builder-admiral-lane
+expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
+echo "PASS builder-parent-and-director-lane-guards"
+
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra captain-astra; do
+  expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
+done
+echo "PASS worker-rejects-all-builder-profile-aliases"
+
+# A legacy/canonical role pair must not create two role-distinct claims for the
+# same job: the second real spawn remains an active duplicate and the first
+# artifact is canonical builder.
+spawn_base builder-opus --role builder --lane collision-lane --parent parent-lane --job role-alias-collision --t T1 >/dev/null
+set +e
+collision_out="$(spawn_base captain-opus --role captain --lane collision-lane --parent parent-lane --job role-alias-collision --t T1 2>&1)"
+collision_rc=$?
+set -e
+[[ "$collision_rc" -ne 0 ]] || fail "captain alias must not create a second claim for builder's job"
+grep -q 'active arbiter job duplicate' <<<"$collision_out" || fail "role alias collision did not fail as an active duplicate: $collision_out"
+python3 - "$ARBITER_INBOX_ROOT/role-alias-collision/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+PY
+echo "PASS role-builder-captain-alias-collision"
 
 # Reclaim must replace completion metadata, not retain the first claim. First
-# reclaim a worker as a captain, then reclaim again under a different parent.
-arb claim --job captain-reclaim-job --lane worker-lane --agent-label worker-label --t T1 >/dev/null
-arb lease --job captain-reclaim-job --resource captain-reclaim-resource --kind path >/dev/null
-arb release --job captain-reclaim-job --resource captain-reclaim-resource --kind path --force >/dev/null
-arb claim --job captain-reclaim-job --lane captain-old-lane --agent-label captain-old-label --t T1 \
-  --role captain --parent-lane parent-old --reclaim-released >/dev/null
-arb event --job captain-reclaim-job --kind job.spawned \
-  --payload-json '{"owner_lane":"captain-old-lane","label":"captain-old-label","pane_id":"w1:p1"}' >/dev/null
+# reclaim a worker as a builder, then reclaim again under a different parent.
+arb claim --job builder-reclaim-job --lane worker-lane --agent-label worker-label --t T1 >/dev/null
+arb lease --job builder-reclaim-job --resource builder-reclaim-resource --kind path >/dev/null
+arb release --job builder-reclaim-job --resource builder-reclaim-resource --kind path --force >/dev/null
+arb claim --job builder-reclaim-job --lane builder-old-lane --agent-label builder-old-label --t T1 \
+  --role builder --parent-lane parent-old --reclaim-released >/dev/null
+arb event --job builder-reclaim-job --kind job.spawned \
+  --payload-json '{"owner_lane":"builder-old-lane","label":"builder-old-label","pane_id":"w1:p1"}' >/dev/null
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
-  "$WRK" escalate captain-reclaim-job --question 'first reclaim is captain' >/dev/null
-arb lease --job captain-reclaim-job --resource captain-reclaim-resource-2 --kind path >/dev/null
-arb release --job captain-reclaim-job --resource captain-reclaim-resource-2 --kind path --force >/dev/null
-arb claim --job captain-reclaim-job --lane captain-new-lane --agent-label captain-new-label --t T1 \
-  --role captain --parent-lane parent-new --reclaim-released >/dev/null
+  "$WRK" escalate builder-reclaim-job --question 'first reclaim is builder' >/dev/null
+arb lease --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind path >/dev/null
+arb release --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind path --force >/dev/null
+arb claim --job builder-reclaim-job --lane builder-new-lane --agent-label builder-new-label --t T1 \
+  --role builder --parent-lane parent-new --reclaim-released >/dev/null
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
-  "$WRK" joined captain-reclaim-job --pr https://example.invalid/pr/2 --head feedface --report "$CAPTAIN_REPORT" >/dev/null
-python3 - "$ARBITER_INBOX_ROOT/captain-reclaim-job/events" <<'PY'
+  "$WRK" joined builder-reclaim-job --pr https://example.invalid/pr/2 --head feedface --report "$BUILDER_REPORT" >/dev/null
+python3 - "$ARBITER_INBOX_ROOT/builder-reclaim-job/events" <<'PY'
 import json, pathlib, sys
 events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
 escalate = next(e for e in events if e["kind"] == "job.escalate")
 joined = next(e for e in events if e["kind"] == "job.joined")
-assert escalate["owner_lane"] == "captain-old-lane", escalate
-assert joined["owner_lane"] == "captain-new-lane", joined
+assert escalate["owner_lane"] == "builder-old-lane", escalate
+assert joined["owner_lane"] == "builder-new-lane", joined
 assert joined["parent_lane"] == "parent-new", joined
 PY
 : >"$TMP/herdr.log"
-captain_sol_out="$(spawn_base captain-sol --role captain --lane captain-sol-lane --parent parent-lane --job captain-sol-job --t T1 2>&1)"
-grep -q 'model=captain-sol' <<<"$captain_sol_out"
+builder_sol_out="$(spawn_base builder-sol --role builder --lane builder-sol-lane --parent parent-lane --job builder-sol-job --t T1 2>&1)"
+grep -q 'model=builder-sol' <<<"$builder_sol_out"
 grep -q -- '-m gpt-5.6-sol' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
-captain_astra_out="$(spawn_base captain-astra --role captain --lane captain-astra-lane --parent parent-lane --job captain-astra-job --t T1 2>&1)"
-grep -q 'model=captain-astra' <<<"$captain_astra_out"
+builder_astra_out="$(spawn_base builder-astra --role builder --lane builder-astra-lane --parent parent-lane --job builder-astra-job --t T1 2>&1)"
+grep -q 'model=builder-astra' <<<"$builder_astra_out"
 grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
 
 # Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
 # must all stop before gate/claim/tab creation.
-expect_exit 2 spawn_base codex-terra --role captain --lane captain-lane --parent parent-lane --job captain-terra-mutant
-expect_exit 2 spawn_base codex-luna --role captain --lane captain-lane --parent parent-lane --job captain-luna-mutant
-expect_exit 2 spawn_base captain-opus --role captain --lane captain-lane --job captain-parent-mutant
-expect_exit 2 spawn_base captain-opus --role captain --lane captain-lane --parent parent-lane --effort max --job captain-effort-mutant
-if grep -q 'captain-.*-mutant' "$ARBITER_INBOX_ROOT"/*/events/* 2>/dev/null; then exit 1; fi
+expect_exit 2 spawn_base codex-terra --role builder --lane builder-lane --parent parent-lane --job builder-terra-mutant
+expect_exit 2 spawn_base codex-luna --role builder --lane builder-lane --parent parent-lane --job builder-luna-mutant
+expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --job builder-parent-mutant
+expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --parent parent-lane --effort max --job builder-effort-mutant
+if grep -q 'builder-.*-mutant' "$ARBITER_INBOX_ROOT"/*/events/* 2>/dev/null; then exit 1; fi
 
-# R19a fixtures must be the exact bytes emitted by the production arbiter and
-# wrk writers (claim -> spawned -> escalate -> joined), never hand-maintained
-# lookalikes.
+# R19a keeps the historical captain payload as an inbox-consumer regression
+# input, while the new builder claim must be the exact bytes emitted by the
+# production arbiter writer (never a hand-maintained lookalike).
 PANEVIRE_FIXTURE="$ROOT/tests/fixtures/panewire-r19a"
 PANEVIRE_OUTPUT="$TMP/panewire-r19a-output"
 "$PANEVIRE_FIXTURE/regen.sh" "$PANEVIRE_OUTPUT"
 for fixture in "$PANEVIRE_FIXTURE"/*.json; do
   cmp "$fixture" "$PANEVIRE_OUTPUT/$(basename "$fixture")"
 done
-[[ "$(find "$PANEVIRE_OUTPUT" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" -eq 4 ]]
+[[ "$(find "$PANEVIRE_OUTPUT" -maxdepth 1 -name '*.json' | wc -l | tr -d ' ')" -eq 5 ]]
+python3 - "$PANEVIRE_OUTPUT/00005-builder-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
 unset TEST_ARBITER_BIN
-echo "PASS captain profiles, own-lane escalation/JOIN, reclaim metadata, fixture bytes, and fail-closed mutants"
+echo "PASS builder profiles, own-lane escalation/JOIN, reclaim metadata, fixture bytes, and fail-closed mutants"
 
 # ⑤ a broken state db is a quota-record failure: warn and still spawn.
 rm -f "$TMP/herdr.log"
@@ -1083,31 +1183,31 @@ PY
 grep -qxF "OK job=r20-done report=$R20_REPORT" <<<"$r20_done_out"
 echo "PASS r20-emit-argv-matches-done-record"
 
-# TW3 — escalate carries --question, joined carries --pr/--head, and both carry
+# TW3 — builder escalation carries --question, joined carries --pr/--head, and both carry
 # the record's reason verbatim.
-R20_CAPTAIN_LOG="$TMP/r20-captain-emit.log"
-r20_claim r20-captain --role captain --parent-lane parent-a
+R20_BUILDER_LOG="$TMP/r20-builder-emit.log"
+r20_claim r20-builder --role builder --parent-lane parent-a
 r20_escalate_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
-  WRK_PANEWIRE_LOG="$R20_CAPTAIN_LOG" "$WRK" escalate r20-captain \
+  WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" escalate r20-builder \
   --question 'need parent decision')"
 r20_joined_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
-  WRK_PANEWIRE_LOG="$R20_CAPTAIN_LOG" "$WRK" joined r20-captain \
+  WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" joined r20-builder \
   --pr https://example.invalid/pr/1 --head deadbeef --report "$R20_REPORT")"
-PYTHONPATH="$TMP" python3 - "$R20_CAPTAIN_LOG" "$R20_INBOX/r20-captain/events" <<'PY'
+PYTHONPATH="$TMP" python3 - "$R20_BUILDER_LOG" "$R20_INBOX/r20-builder/events" <<'PY'
 import sys
 import r20_emit as helper
 log, events = sys.argv[1:]
 escalate_call, joined_call = helper.calls(log)
 escalate = helper.assert_matches_record(escalate_call, helper.record(events, "job.escalate"))
 joined = helper.assert_matches_record(joined_call, helper.record(events, "job.joined"))
-assert escalate["--reason"] == "captain escalation", escalate
+assert escalate["--reason"] == "builder escalation", escalate
 assert escalate["--question"] == "need parent decision", escalate
 assert not {"--pr", "--head"} & set(escalate), escalate
-assert joined["--reason"] == "captain joined PR", joined
+assert joined["--reason"] == "builder joined PR", joined
 assert joined["--pr"].endswith("/pr/1") and joined["--head"] == "deadbeef", joined
 assert "--question" not in joined, joined
 PY
-echo "PASS r20-emit-argv-matches-escalate-and-joined-records"
+echo "PASS r20-emit-argv-matches-builder-escalate-and-joined-records"
 
 # TW4 — no panewire on the box: exit 0, the record is still written and both
 # independently optional relays warn without changing stdout.
@@ -1184,8 +1284,8 @@ echo "PASS r20-job-lost-is-never-emitted"
 [[ "$(wc -l <<<"$r20_escalate_out" | tr -d ' ')" -eq 1 ]]
 [[ "$(wc -l <<<"$r20_joined_out" | tr -d ' ')" -eq 1 ]]
 grep -qxF "OK job=r20-done report=$R20_REPORT" <<<"$r20_done_out"
-grep -qxF 'OK job=r20-captain owner_lane=lane-a kind=job.escalate' <<<"$r20_escalate_out"
-grep -qxF "OK job=r20-captain owner_lane=lane-a kind=job.joined pr=https://example.invalid/pr/1 head=deadbeef report=$R20_REPORT" <<<"$r20_joined_out"
+grep -qxF 'OK job=r20-builder owner_lane=lane-a kind=job.escalate' <<<"$r20_escalate_out"
+grep -qxF "OK job=r20-builder owner_lane=lane-a kind=job.joined pr=https://example.invalid/pr/1 head=deadbeef report=$R20_REPORT" <<<"$r20_joined_out"
 echo "PASS r20-stdout-contract-unchanged"
 
 # ── R21: report documents are optional handoffkeep uploads ──────────────────
@@ -1371,13 +1471,13 @@ assert " doc:" not in event["report_last_line"], event
 PY
 echo "PASS r21-stalled-handoffkeep-is-bounded-by-three-second-guard elapsed_ms=$r21_slow_ms"
 
-# T7 — joined follows the same upload and suffix rules, using the captain's
+# T7 — joined follows the same upload and suffix rules, using the builder's
 # own job id in the document command.
 R21_JOINED_JOB="r21-joined"
 R21_JOINED_REPORT="$(r21_report "$R21_JOINED_JOB" joined-report.md 'joined terminal line')"
 R21_JOINED_HK_LOG="$TMP/r21-joined-handoffkeep.log"
 R21_JOINED_PW_LOG="$TMP/r21-joined-panewire.log"
-r21_claim "$R21_JOINED_JOB" --role captain --parent-lane parent-a
+r21_claim "$R21_JOINED_JOB" --role builder --parent-lane parent-a
 env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_JOINED_HK_LOG" WRK_PANEWIRE_LOG="$R21_JOINED_PW_LOG" \
   "$WRK" joined "$R21_JOINED_JOB" --pr https://example.invalid/pr/21 --head deadbeef \
@@ -1403,7 +1503,7 @@ R21_ESC_JOB="r21-escalate-report"
 R21_ESC_REPORT="$(r21_report "$R21_ESC_JOB" escalation.md 'escalation terminal line')"
 R21_ESC_HK_LOG="$TMP/r21-escalate-handoffkeep.log"
 R21_ESC_PW_LOG="$TMP/r21-escalate-panewire.log"
-r21_claim "$R21_ESC_JOB" --role captain --parent-lane parent-a
+r21_claim "$R21_ESC_JOB" --role builder --parent-lane parent-a
 env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_ESC_HK_LOG" WRK_PANEWIRE_LOG="$R21_ESC_PW_LOG" \
   "$WRK" escalate "$R21_ESC_JOB" --question 'need a decision' --report "$R21_ESC_REPORT" >/dev/null
@@ -1423,7 +1523,7 @@ PY
 R21_ESC_EMPTY_JOB="r21-escalate-empty"
 R21_ESC_EMPTY_HK_LOG="$TMP/r21-escalate-empty-handoffkeep.log"
 R21_ESC_EMPTY_PW_LOG="$TMP/r21-escalate-empty-panewire.log"
-r21_claim "$R21_ESC_EMPTY_JOB" --role captain --parent-lane parent-a
+r21_claim "$R21_ESC_EMPTY_JOB" --role builder --parent-lane parent-a
 env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_ESC_EMPTY_HK_LOG" WRK_PANEWIRE_LOG="$R21_ESC_EMPTY_PW_LOG" \
   "$WRK" escalate "$R21_ESC_EMPTY_JOB" --question 'need a decision' >/dev/null
@@ -1440,7 +1540,7 @@ assert event["report_path"] == event["report_last_line"] == "", event
 PY
 R21_ESC_MISSING_JOB="r21-escalate-missing"
 R21_ESC_MISSING_HK_LOG="$TMP/r21-escalate-missing-handoffkeep.log"
-r21_claim "$R21_ESC_MISSING_JOB" --role captain --parent-lane parent-a
+r21_claim "$R21_ESC_MISSING_JOB" --role builder --parent-lane parent-a
 : >"$R21_ESC_MISSING_HK_LOG"
 set +e
 env ARBITER_INBOX_ROOT="$R21_INBOX" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
@@ -1672,15 +1772,15 @@ reap_job() {
   unset ARBITER_TEST_NOW
 }
 
-# A captain job that was released and then reclaimed without --role: the reclaim
+# A builder job that was released and then reclaimed without --role: the reclaim
 # payload carries the default role=worker, so a last-writer-wins role would strip
-# the captain marking and hand a live captain pane to reap.
-reap_captain_reclaimed_job() {
+# the builder marking and hand a live builder pane to reap.
+reap_builder_reclaimed_job() {
   local job="$1" pane="$2" lane="$3"
   export ARBITER_TEST_NOW="$REAP_TEST_NOW"
   env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
     --job "$job" --lane "$lane" --agent-label "$job" --t T1 \
-    --role captain --parent-lane lane-p >/dev/null
+    --role builder --parent-lane lane-p >/dev/null
   # release is what moves a job to `released`; take the exclusive-lease route so
   # the reclaim below is the real arbiter transition, not a hand-written event.
   env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" lease \
@@ -1698,9 +1798,9 @@ reap_captain_reclaimed_job() {
 reap_job reap-ready w1:p1 w1:t1 lane-a job.completed
 reap_job reap-working w1:p2 w1:t2 lane-a job.completed
 reap_job reap-open w1:p3 w1:t3 lane-a ''
-# The captain sits in the lane under test on purpose: with it in another lane the
+# The builder sits in the lane under test on purpose: with it in another lane the
 # role guard is never reached, because --lane already filtered the job out.
-reap_job reap-captain w1:p1 w1:t1 lane-a job.joined --role captain --parent-lane lane-p
+reap_job reap-builder w1:p1 w1:t1 lane-a job.joined --role builder --parent-lane lane-p
 reap_job reap-other-lane w1:p1 w1:t1 lane-b job.completed
 reap_job reap-shared w1:p4 w1:t4 lane-a job.completed
 # Pre-PR shape: no tab_id in job.spawned. The tab has to come from `agent get`,
@@ -1708,7 +1808,33 @@ reap_job reap-shared w1:p4 w1:t4 lane-a job.completed
 reap_job reap-no-tab w1:p5 '' lane-a job.completed
 reap_job reap-no-tab-shared w1:p4 '' lane-a job.completed
 reap_job reap-lost-only w1:p6 w1:t6 lane-a job.lost
-reap_captain_reclaimed_job reap-captain-reclaimed w1:p7 lane-a
+reap_builder_reclaimed_job reap-builder-reclaimed w1:p7 lane-a
+
+# Existing inboxes can contain a durable captain payload written before role
+# normalization. Reap must protect it exactly like a new builder payload.
+reap_legacy_captain_job() {
+  local job="$1" pane="$2" lane="$3"
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 >/dev/null
+  python3 - "$REAP_INBOX/$job/events/00001-job.claim.json" <<'PY'
+import json, sys
+path = sys.argv[1]
+event = json.load(open(path))
+assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
+event["payload"]["role"] = "captain"
+event["payload"]["parent_lane"] = "parent-lane"
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(event, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"w1:t1\"}" >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.joined \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
+reap_legacy_captain_job reap-captain-legacy w1:p1 lane-a
 
 # The `wrk done` that shipped before be4dad1 glued parent_lane and role onto
 # pane_id with tabs, and 23 such records sit in the live inbox. The spawn receipt
@@ -1755,8 +1881,10 @@ grep -q 'reap-open' <<<"$dry_out" &&
   fail "a job with no terminal event must not appear in reap output at all: $dry_out"
 grep -q 'reap-lost-only' <<<"$dry_out" &&
   fail "job.lost is not a terminal event: a job the old sentinel wrongly declared lost must never be reaped: $dry_out"
-grep -q 'reap-captain' <<<"$dry_out" &&
-  fail "a captain pane in the lane under test must still be excluded without --include-captains: $dry_out"
+grep -q 'reap-builder' <<<"$dry_out" &&
+  fail "a builder pane in the lane under test must still be excluded without --include-builders: $dry_out"
+grep -q 'reap-captain-legacy' <<<"$dry_out" &&
+  fail "a legacy captain payload must still be excluded without --include-builders: $dry_out"
 grep -q 'reap-other-lane' <<<"$dry_out" &&
   fail "--lane must filter by the claim owner_lane: $dry_out"
 grep -q 'job=reap-shared .*reason=tab-shared' <<<"$dry_out" ||
@@ -1774,12 +1902,24 @@ grep -q 'reap: 0 candidate' <<<"$(reap_run --lane lane-a --grace 2h)" ||
 if reap_run --lane lane-a --grace 10min >/dev/null 2>&1; then
   fail "an unparsable --grace must fail loudly; falling back to 0 would reap with no grace at all"
 fi
+builder_out="$(reap_run --lane lane-a --include-builders)"
+python3 - "$builder_out" <<'PY'
+import sys
+assert "would-close job=reap-builder " in sys.argv[1], sys.argv[1]
+assert "would-close job=reap-captain-legacy " in sys.argv[1], sys.argv[1]
+PY
+grep -q 'would-close job=reap-builder ' <<<"$builder_out" ||
+  fail "--include-builders must let a finished builder pane in this lane be reaped: $builder_out"
+grep -q 'would-close job=reap-builder-reclaimed ' <<<"$builder_out" ||
+  fail "--include-builders must reach the reclaimed builder too: $builder_out"
+grep -q 'would-close job=reap-captain-legacy ' <<<"$builder_out" ||
+  fail "--include-builders must include a legacy captain payload: $builder_out"
 captain_out="$(reap_run --lane lane-a --include-captains)"
-grep -q 'would-close job=reap-captain ' <<<"$captain_out" ||
-  fail "--include-captains must let a finished captain pane in this lane be reaped: $captain_out"
-grep -q 'would-close job=reap-captain-reclaimed ' <<<"$captain_out" ||
-  fail "--include-captains must reach the reclaimed captain too: $captain_out"
-echo "PASS reap-grace-and-captain-filters"
+grep -q 'would-close job=reap-builder ' <<<"$captain_out" ||
+  fail "--include-captains must remain an alias for --include-builders: $captain_out"
+grep -q 'would-close job=reap-captain-legacy ' <<<"$captain_out" ||
+  fail "--include-captains must include a legacy captain payload: $captain_out"
+echo "PASS reap-builder-and-captain-alias-filters"
 
 : >"$REAP_LOG"
 apply_out="$(reap_run --lane lane-a --apply)"
@@ -1800,11 +1940,13 @@ grep -q '^tab close w1:t5$' "$REAP_LOG" ||
 grep -qE '^tab close [0-9]+$' "$REAP_LOG" &&
   fail "a bare number is never a tab id; that is a live tab's number: $(cat "$REAP_LOG")"
 grep -q 'tab close w1:t7' "$REAP_LOG" &&
-  fail "a captain tab must never be closed by a plain --apply run: $(cat "$REAP_LOG")"
-[[ "$(event_count "$REAP_INBOX/reap-captain-reclaimed/events" job.reaped)" -eq 0 ]] ||
-  fail "a captain that was released and reclaimed without --role keeps its captain marking"
-[[ "$(event_count "$REAP_INBOX/reap-captain/events" job.reaped)" -eq 0 ]] ||
-  fail "a captain job in the reaped lane must not be reaped without --include-captains"
+  fail "a builder tab must never be closed by a plain --apply run: $(cat "$REAP_LOG")"
+[[ "$(event_count "$REAP_INBOX/reap-builder-reclaimed/events" job.reaped)" -eq 0 ]] ||
+  fail "a builder that was released and reclaimed without --role keeps its builder marking"
+[[ "$(event_count "$REAP_INBOX/reap-builder/events" job.reaped)" -eq 0 ]] ||
+  fail "a builder job in the reaped lane must not be reaped without --include-builders"
+[[ "$(event_count "$REAP_INBOX/reap-captain-legacy/events" job.reaped)" -eq 0 ]] ||
+  fail "a legacy captain payload in the reaped lane must not be reaped without --include-builders"
 python3 - "$REAP_INBOX/reap-no-tab/events" <<'PY'
 import glob, json, sys
 event = json.load(open(sorted(glob.glob(sys.argv[1] + "/*job.reaped.json"))[0]))

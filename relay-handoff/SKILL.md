@@ -1,6 +1,6 @@
 ---
 name: relay-handoff
-description: 다른 세션/에이전트(orch·캡틴·워커)에 작업·분석·지시를 전달(릴레이·핸드오프)하거나 herdr로 프롬프트를 주입할 때 반드시 사용. 핸드오프 프롬프트 5요소 템플릿 + herdr 주입·제출검증 레시피. 트리거 - "orch에 전달/넘겨줘", "세션에 릴레이", "워커에게 회신", "herdr로 보내", herdr agent prompt 사용 전.
+description: 다른 세션/에이전트(orch·빌더·워커)에 작업·분석·지시를 전달(릴레이·핸드오프)하거나 herdr로 프롬프트를 주입할 때 반드시 사용. 핸드오프 프롬프트 5요소 템플릿 + herdr 주입·제출검증 레시피. 트리거 - "orch에 전달/넘겨줘", "세션에 릴레이", "워커에게 회신", "herdr로 보내", herdr agent prompt 사용 전.
 ---
 
 # relay-handoff — 세션 간 핸드오프·릴레이 표준 절차
@@ -54,7 +54,7 @@ description: 다른 세션/에이전트(orch·캡틴·워커)에 작업·분석�
 | 주체 | 결정·기록하는 것 | 결정하면 안 되는 것 |
 |---|---|---|
 | 상류 분석 세션 | 문제·AC, 근거와 exact ref, 운영자 승인 범위, 모름, 예상 변경 표면, mutation 가능성, `T 제안`과 근거 | 최종 grade, quota pool, worker 모델, merge 권한 |
-| lane orch | authoritative T 재판정, grade와 근거, `scopefuel` 후보, spawn mode, worktree·정지점·verifier | 다른 lane job 동시 소유 |
+| lane orch | authoritative T 재판정, grade와 근거, `scopefuel` 후보, spawn mode, worktree·정지점·tester | 다른 lane job 동시 소유 |
 | 운영자 | 정책 예외, destructive/live/deploy | 일상적 배정 |
 
 - **상류의 T는 제안일 뿐이다** — 위 항목 5에는 반드시 `T 제안: Tn (근거: …)` 형식으로 쓰고,
@@ -91,7 +91,7 @@ wrk find <이름|라벨> --pane-only  # 스크립트용
 **화면이 기대와 다를 수 있다**(같은 실측에서 이름은 `orch`인데 화면은 권한 오류 상태였다).
 
 **대상 부재 시(이름·라벨 모두 없음 — 세션 사망·herdr 재시작)**: 자동 재생성은 없다 — 릴레이를
-**실패로 보고하고 운영자 에스컬레이션**. orch/캡틴을 임의 재스폰하지 않는다(재생성은 운영자
+**실패로 보고하고 운영자 에스컬레이션**. orch/빌더를 임의 재스폰하지 않는다(재생성은 운영자
 결정. 새 orch는 같은 cwd에서 `claude --continue`+auto-memory+Linear+inbox로 상태 복원 가능 —
 상태 정본이 세션 밖에 있는 이유).
 
@@ -101,7 +101,7 @@ wrk find <이름|라벨> --pane-only  # 스크립트용
 
 **타겟 네이밍 관례**: 1순위 타겟은 **agent 이름**(`herdr agent rename <pane> <이름>`), 폴백은
 탭 라벨이다. 관례: 허브=`orch` / 운영자 대화 세션=`<도구>-<용도>`(예 `kiro-mock`) /
-캡틴=`<도메인>-captain` / 워커=`<이슈>-<역할>`. **탭 생성 시 라벨을 같은 이름으로 넣어두면**
+빌더=`<도메인>-builder` / 워커=`<이슈>-<역할>`. **탭 생성 시 라벨을 같은 이름으로 넣어두면**
 이름이 유실돼도 `wrk find`가 찾고 `wrk name-sync --apply`로 일괄 복구된다. 이름이 좋아도
 화면 실판별은 생략 금지.
 

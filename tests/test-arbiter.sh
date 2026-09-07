@@ -70,21 +70,34 @@ pass "① duplicate claim rejected (exit 4); a different lane/t does not launder
 expect_rc 2 claim --job j2 --lane live --t T9
 pass "claim rejects a t level outside T0..T3"
 
-# Captain claims carry hierarchy only in the durable event envelope; no schema
-# column is invented and a missing parent is fail-closed.
-expect_rc 2 claim --job captain-no-parent --lane captain-lane --t T1 --role captain
+# Builder claims carry hierarchy only in the durable event envelope; no schema
+# column is invented and a missing parent is fail-closed. `captain` remains an
+# input alias, but every new durable payload is canonical `builder`.
+expect_rc 2 claim --job builder-no-parent --lane builder-lane --t T1 --role builder
+expect_rc 2 claim --job captain-no-parent --lane builder-lane --t T1 --role captain
 expect_rc 2 claim --job worker-parent --lane worker-lane --t T1 --parent-lane parent-lane
-expect_rc 0 claim --job captain-claim --lane captain-lane --t T1 --role captain --parent-lane parent-lane --agent-label captain
-python3 - "$ARBITER_INBOX_ROOT/captain-claim/events/00001-job.claim.json" <<'PY'
+for rejected_role in admiral tester ''; do
+  expect_rc 2 claim --job "role-reject-${rejected_role:-empty}" --lane worker-lane --t T1 --role "$rejected_role"
+  grep -q -- '--role' <<<"$ERR" || fail "unknown role must show argparse usage: $ERR"
+done
+expect_rc 0 claim --job builder-claim --lane builder-lane --t T1 --role builder --parent-lane parent-lane --agent-label builder
+python3 - "$ARBITER_INBOX_ROOT/builder-claim/events/00001-job.claim.json" <<'PY'
 import json, sys
 event = json.load(open(sys.argv[1]))
 assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
 assert event["payload"] == {
-    "agent_label": "captain", "owner_lane": "captain-lane", "parent_lane": "parent-lane",
-    "role": "captain", "t_level": "T1",
+    "agent_label": "builder", "owner_lane": "builder-lane", "parent_lane": "parent-lane",
+    "role": "builder", "t_level": "T1",
 }, event
 PY
-pass "captain claim requires parent_lane and preserves role hierarchy in the envelope"
+expect_rc 0 claim --job captain-alias-claim --lane builder-lane --t T1 --role captain --parent-lane parent-lane --agent-label captain-alias
+python3 - "$ARBITER_INBOX_ROOT/captain-alias-claim/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+pass "builder claim requires parent_lane and captain alias normalizes to builder in the envelope"
 
 # ------------------------------------------------------- ② concurrent contention
 "$ARBITER" claim --job race-a --lane live --t T2 >/dev/null

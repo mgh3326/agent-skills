@@ -34,17 +34,23 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 |---|---|
 | `orchestrate` | 완성된 설계·운영자 결정을 받아 워커 스폰~완료 검증까지 전체 루프 구동 — spawn-worker 위층 진입점 |
 | `relay-handoff` | 세션 간 작업·분석·지시 전달 — 핸드오프 5요소 템플릿 + herdr 주입·제출검증 |
-| `spawn-worker` | 워커/검증자 스폰 전 과정 — worktree 준비, 쿼타 확인·계열 라우팅, 티어맵, 브리프, 적대검증 루프, ls-remote 대조 |
-| `captain` | PR 한 건의 워커 브리프→검증→fix→JOIN 루프 소유 — 상위 레인 에스컬레이션과 parent-pane 이벤트 계약 포함 |
+| `spawn-worker` | 워커/tester 스폰 전 과정 — worktree 준비, 쿼타 확인·계열 라우팅, 티어맵, 브리프, 적대검증 루프, ls-remote 대조 |
+| `director` | 운영자 직속 최상위 역할 — 머지·배포·큐 권한, 빌더 브리프·스폰·독립 검증 판정 |
+| `checker` | director 보좌·사전 머지 검사 역할 — 릴레이 수신, 셀 수 있는 게이트·큐·레인 정리 |
+| `builder` | PR 한 건의 워커 브리프→검증→fix→JOIN 루프 소유 — 상위 레인 에스컬레이션과 parent-pane 이벤트 계약 포함 |
+| `architect` | director 자문 역할 — 읽기 전용 독립 의견과 shadow ruling |
+| `planner` | 상류 분석 상주 역할 — 판단을 durable하게 기록하고 실행에는 제안만 전달 |
 | `ask-session` | 상존 세션에 질문 보내고 답변 회수(왕복) — 답변 파일 계약 + 타임아웃·무응답 처리 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
-| `bosun` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — flag 게이트 레인 하위, 고정 8단계 절차·판단 없음 |
+| `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — checker 게이트 레인 하위, 고정 8단계 절차·판단 없음 |
+
+구 이름 `admiral`·`flag`·`captain`·`counsel`·`strategist`·`bosun`은 별칭 stub으로 남아 있으며 정본은 각각 새 이름이다. 제거는 별도 태스크다.
 
 스킬 간 관계: `orchestrate`(설계+결정 → 루프 전체 구동) 는 `spawn-worker`(스폰 기계학)를
 호출한다. `relay-handoff`(단방향 전달) ⊂ `ask-session`(답변 계약 붙은 왕복) ⊂
 `consult-advisor`(자문처 해석+headless 폴백). `spawn-worker`는 주입 단계에서 relay-handoff를
 참조. **대상 세션 부재 시 공통 규칙: 자동 재생성 없음 — 실패 보고 + 운영자 에스컬레이션**
-(orch/캡틴 재생성은 운영자 결정; 새 세션은 같은 cwd `claude --continue`+메모리+Linear+inbox로
+(orch/빌더 재생성은 운영자 결정; 새 세션은 같은 cwd `claude --continue`+메모리+Linear+inbox로
 상태 복원).
 
 ## 로드 경로 (2026-07-29 실측)
@@ -81,11 +87,11 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 ```text
 wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
           [-L live|mock] [--effort LEVEL] [--job ID]
-wrk spawn --role captain --lane CAPTAIN_LANE --parent PARENT_LANE ... -m captain-opus|captain-sol
+wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE ... -m builder-opus|builder-sol|builder-astra
 wrk done JOB [--report PATH]
 wrk escalate JOB --question TEXT [--report PATH]
 wrk joined JOB --pr URL --head SHA --report PATH
-wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-captains]
+wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders]
 wrk find <이름|라벨> [--pane-only]
 wrk name-sync [--apply|<라벨>...]
 ```
@@ -99,10 +105,12 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 `NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
 사실로 기록되기 때문이다. `--job`은 생략하면 `-l LABEL`을 쓴다.
 
-캡틴은 `captain-opus`(Opus effort high) 또는 `captain-sol`만 쓴다. 캡틴 spawn의 `--lane`은
-arbiter claim의 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와
-`wrk joined`는 완료 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 그 parent 레인으로
-설정한다. panewire R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
+빌더는 `builder-opus`(Opus effort high)·`builder-sol`·`builder-astra`를 쓴다. `captain-opus`·
+`captain-sol`·`captain-astra`는 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
+경고 후 builder로 정규화되는 legacy 별칭이다. 빌더 spawn의 `--lane`은 arbiter claim의
+`owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
+이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire
+R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
 
 `wrk done`, `wrk joined`, 그리고 보고서가 지정된 `wrk escalate`는 보고서를
 `reports/<job>/<basename>` 키로 handoffkeep CLI에 올린다. CLI는
@@ -143,12 +151,12 @@ WRK_SENTINEL_HERDR_SESSION=worker wrk spawn -c ... -m ... --job <id>
 
 ## `wrk reap` — 끝난 pane 회수
 
-워커·검증자가 끝나도 pane은 herdr에 남아 하루 40~60개가 쌓이고, 그만큼 herdr 서버
+워커·tester가 끝나도 pane은 herdr에 남아 하루 40~60개가 쌓이고, 그만큼 herdr 서버
 부하(fd·구독)가 된다. `wrk reap`은 인박스를 읽어 **끝난 것이 증명된** 잡의 탭만 닫는다.
 
 ```bash
-wrk reap --lane lane-a              # dry-run: 닫을 목록만 출력
-wrk reap --lane lane-a --apply      # 실제로 herdr tab close
+wrk reap --lane REAP_LANE              # dry-run: 닫을 목록만 출력
+wrk reap --lane REAP_LANE --apply      # 실제로 herdr tab close
 ```
 
 회수 조건(**전부** 충족해야 후보):
@@ -160,8 +168,8 @@ wrk reap --lane lane-a --apply      # 실제로 herdr tab close
 
 `working`/`blocked` pane, terminal 이벤트 없는 잡, herdr가 해석하지 못하는 pane은
 건드리지 않는다(해석 실패는 소켓 문제일 수 있고, 확인 못한 탭을 닫는 편이 더 나쁘다).
-캡틴 pane(claim `role: captain`)은 `--include-captains` 없이는 제외한다. 기본은
-**dry-run**이며, `--apply`로 닫은 잡에만 평면 `job.reaped` 이벤트(`pane_id`·`tab_id`·`at`)를
+빌더 pane(claim `role: builder` 또는 legacy `captain`)은 `--include-builders` 없이는 제외한다.
+`--include-captains`는 같은 동작의 legacy 별칭이다. 기본은 **dry-run**이며, `--apply`로 닫은 잡에만 평면 `job.reaped` 이벤트(`pane_id`·`tab_id`·`at`)를
 남긴다. `wrk spawn`은 이를 위해 `job.spawned` payload에 `tab_id`를 함께 기록한다
 (기존 필드는 그대로 — 구형 herdr로 만들어져 `tab_id`가 없는 잡은 `agent get`으로 해석한다).
 
