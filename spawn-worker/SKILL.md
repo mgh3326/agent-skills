@@ -377,6 +377,35 @@ wake = "panewire"
 - `--host local`은 운영자 강제 로컬, `--host <remote-name>`은 강제 원격이다. 둘 다 hub 판정을
   우회하므로 장애 대응·진단에만 쓴다.
 
+### 4.x-2 `via = "hub"` — hub가 직접 원격 spawn을 실행할 때
+
+노드가 hub의 `/v1/spawn` 계약을 제공하면, 대상 호스트에 `via = "hub"`를 설정하고
+`wrk spawn ... --host machine-a`로 호출한다. 이 경로는 operator Bearer 토큰과 CF 서비스
+토큰을 hub에만 보내므로 tailnet·SSH·scp가 필요 없다. SSH 기반 원격 spawn은 `via`가 없거나
+`via = "ssh"`일 때의 기존 경로다.
+
+```toml
+[hub]
+hub_url = "wss://<hub-host>"
+hub_token_env = "<node-token-env>"
+hub_cf_env = "<cf-access-env>"
+operator_token_env = "<operator-env>"
+
+[hosts.machine-a]
+via = "hub"
+cwd_keys = {"<local-worktree>"="repo-a"}
+```
+
+- `hub_url`은 `wss://`/`ws://`에서 HTTPS/HTTP base URL로 변환된다. `operator_token_env`와
+  `hub_cf_env`의 파일은 source하지 않고 필요한 키만 읽으며, 값은 출력이나 spill-over 로그에
+  남기지 않는다.
+- hub 요청에는 `cwd_keys`의 현재 cwd 키와 UTF-8 brief inline, 허용된 spawn 인자만 들어간다.
+  응답이 pending이면 최대 1시간 동안 조회하고, 완료 결과의 pane·job으로 기존 원격 spawn과
+  같은 `OK pane=... host=machine-a ... job=...` 행을 출력한다.
+- `cwd_keys`에 현재 cwd가 없거나 `operator_token_env`가 없으면 **fail-closed**다. 로컬 또는
+  SSH로 조용히 되돌리지 않으며, `--host local` 또는 hosts.toml 보완을 안내한다. lost·인증
+  실패·hub 오류도 같은 원칙으로 종료한다.
+
 ## 5. 검증 루프 (스폰의 후반전)
 
 **강도는 §2-1의 T가 정한다.** T0=스폰 없음 / T1=자체검증 / T2=적대검증 1라운드 /
