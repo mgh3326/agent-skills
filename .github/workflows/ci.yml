@@ -25,11 +25,14 @@ jobs:
             brew install shellcheck
           fi
       - name: ShellCheck
-        run: shellcheck bin/wrk tests/fixtures/herdr tests/test-wrk.sh
+        run: |
+          shellcheck bin/wrk tests/test-wrk.sh tests/wrk_spillover.sh \
+            $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
       - name: Bash tests
         env:
           SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
         run: |
           bash tests/test-wrk.sh
+          bash tests/wrk_spillover.sh
           bash tests/test-arbiter.sh
           bash tests/test-acp-runner-process-group.sh
