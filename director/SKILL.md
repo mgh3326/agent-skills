@@ -42,6 +42,17 @@ director는 함대의 최상위 역할이다. 운영자와 직접 대화하고, 
    완료 증거, 금지사항, 보고 절대경로. **픽스처는 실제 모양 · 뮤턴트 RED는 assertion만 · 운영
    경로 테스트 · CI 매니페스트 등록 · `gh pr checks` 직접 확인 · 자기보고 초록 불인정**을
    빠뜨리지 않는다. 빌더가 자기 자신에 대한 스폰 지시로 읽을 메타데이터를 브리프에 넣지 않는다.
+   브리프에 `[wake]` 소비 계약도 포함한다: `[wake]`는 완료 판정이 아닌 회수 요청이며,
+   수신 owner는 동일 wake id당 `harvest-before-dispatch`를 정확히 1회 실행하며 중복 소비는 0회다. task/job/
+   pane/current seq/report/head/terminal 최신 상태를 회수한 뒤 다음 발주·검증 인계·park
+   사유 중 정확히 하나를 처분으로 선택하고 canonical doc/queue ref를 기록한다. task terminal과
+   이름이 명시된 cleanup gate가 모두 충족될 때만 checker에게 lane 회수를 요청하며, 아니면
+   보존 사유를 기록한다. 보고서 미도착은 완료가 아니며(완료 판정 0), wake 발신 정당성·출처를 확인한다.
+   wake는 자동 reap·spawn·merge 권한을 신설하지 않으며 #113, `WORKING`, 미push 원본 보존
+   guard를 유지한다.
+   임시 관측 `panewire wait --agent NAME --status idle --settle 60s`는 bounded timeout과
+   함께 쓰고 신규 `wrk` sentinel과 구분한다. wait 종료는 보고서 검증이 아니며, `done`은 도구가
+   실제 지원하는 계약을 확인한 경우에만 별도 처리하고 지원하지 않는 인자를 발명하지 않는다.
 2. `wrk spawn --role builder --lane BUILDER_LANE --parent DIRECTOR_LANE`으로 스폰한다.
 3. **스폰 직후 relay 라우트에 빌더 레인을 등록**하고 왕복을 확인한다. 미등록 레인의
    escalate/joined는 조용히 유실된다 — 빌더가 오래 조용하면 모델보다 전달 경로를 먼저 의심한다

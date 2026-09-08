@@ -26,6 +26,28 @@ legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`
 5. **워커·tester 배치는 `wrk spawn`(hub placement)이 정한다.** 빌더 자신의 머신이 기본값이
    아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
 
+### `[wake]` 소비 계약
+
+`[wake]`는 완료 판정이 아니라 회수 요청이다. 수신 owner는 동일 wake id마다
+`harvest-before-dispatch`를 정확히 1회 실행한다. 회수는 다음 순서로 기록한다.
+동일 wake id의 중복 소비는 0회여야 한다.
+
+1. task/job/pane/current seq/report/head/terminal의 최신 상태를 회수한다.
+2. 다음 발주, 검증 인계, park 사유 중 정확히 하나를 처분으로 고르고 canonical 문서 또는
+   queue ref를 기록한다.
+3. task terminal과 이름이 명시된 cleanup gate가 모두 충족될 때만 checker에게 해당 lane
+   회수를 요청하고, 아니면 보존 사유를 기록한다.
+
+보고서가 아직 도착하지 않은 것은 완료가 아니다(완료 판정 0). wake 발신의 정당성과 출처를 확인하고,
+실제 역할 권한 범위 안에서만 처리한다. wake는 자동 reap·spawn·merge 권한을 신설하지
+않으며, #113 guard, `WORKING` 보존, 미push 원본 보존 guard를 유지한다.
+
+임시 재프롬프트 관측은 bounded timeout과 함께
+`panewire wait --agent NAME --status idle --settle 60s`를 사용한다. 이는 신규 `wrk`
+completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 아니다. `done` 상태는
+도구가 실제로 지원하는 계약을 확인한 경우에만 별도로 다룬다; 지원하지 않는 인자를
+발명하지 않는다.
+
 ## 큐와 상위 레인 보고
 
 다음 작업 선택과 상태 전이는 우선 다음 인터페이스를 사용한다.
