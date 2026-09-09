@@ -38,7 +38,7 @@ ALL_PROFILES=(
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
-  kimi-k3 kimi-k27 kimi-k3-low
+  kimi-k3 kimi-k27 kimi-k27-code kimi-k3-low
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
   oc-qwen37-max oc-minimax-m3
   agy-flash agy-flash36 agy-flash37
@@ -119,7 +119,7 @@ Options:
   --role worker|builder (legacy alias: captain)
                      builder requires --lane and --parent, and accepts only
                      builder-opus, builder-sol or builder-astra profiles;
-                     captain-* profile aliases remain accepted.
+                     codex-astra and captain-* profile aliases remain accepted.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      parent lane for a builder; completion/escalation events
@@ -146,8 +146,9 @@ Claude effort wiring (ROB-1191/ROB-1193): opus default=xhigh, sonnet/sonnet-med 
 haiku default=low; all support an explicit --effort override.
 Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol; builder-astra = gpt-6-astra.
 Legacy profile aliases captain-opus, captain-sol and captain-astra have the same meaning.
-Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-for-coding/k3`; kimi-k27 uses
-`kimi --auto -m kimi-for-coding/kimi-for-coding`; the CLI has no --effort option.
+Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-for-coding/k3`; kimi-k27 and
+kimi-k27-code use `kimi --auto -m kimi-for-coding/kimi-for-coding`; the CLI has
+no --effort option.
 kimi-k3-low uses the same argv as kimi-k3 but injects KIMI_CODE_HOME pointing at
 the low-thinking-effort clone home from `bin/kimi-clone-home` ([thinking]
 effort="low" in that clone's config.toml — kimi has no CLI --effort flag, so this
@@ -987,7 +988,7 @@ resolve_profile() {
     # see bin/kimi-clone-home) — do not confuse this with the codex/Kiro/Claude
     # CLI --effort wiring above (ROB-1213 covered those; kimi is a different path).
     kimi-k3) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3) ;;
-    kimi-k27) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/kimi-for-coding) ;;
+    kimi-k27|kimi-k27-code) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/kimi-for-coding) ;;
     # kimi-k3-low: same model argv as kimi-k3 — the differentiator is KIMI_CODE_HOME
     # (below), pointed at the low-thinking-effort clone home, not the CLI model arg.
     kimi-k3-low)
@@ -1039,7 +1040,8 @@ resolve_profile() {
     sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
-    codex|codex-sol|codex-max|builder-sol|captain-sol|codex-astra|builder-astra|captain-astra) GATE_PROFILE=codex-max ;;
+    codex|codex-sol|codex-max|builder-sol|captain-sol) GATE_PROFILE=codex-max ;;
+    codex-astra|builder-astra|captain-astra) GATE_PROFILE="$MODEL" ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
     codex-luna|codex-luna-hi|codex-luna-max) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
@@ -1048,7 +1050,7 @@ resolve_profile() {
     kiro-haiku) GATE_PROFILE=kiro-haiku ;;
     kiro|kiro-sol|kiro-luna|kiro-glm|kiro-deepseek|kiro-minimax|kiro-minimax21|kiro-sol-xhigh|kiro-sol-max)
       GATE_PROFILE=kiro-sol ;;
-    kimi-k3|kimi-k27|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
+    kimi-k3|kimi-k27|kimi-k27-code|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
@@ -2527,8 +2529,8 @@ spawn_cmd() {
     [[ -z "$OWNER" ]] || die "--role builder uses --lane; do not combine it with --owner"
     [[ "$BUILDER_LANE" != "$PARENT_LANE" ]] || die "--role builder forbids --lane and --parent being the same (self parent)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-astra|captain-opus|captain-sol|captain-astra) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol or builder-astra (legacy captain-* aliases accepted; terra/luna are worker-only)" ;;
+      builder-opus|builder-sol|builder-astra|codex-astra|captain-opus|captain-sol|captain-astra) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol or builder-astra (codex-astra and legacy captain-* aliases accepted; terra/luna are worker-only)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -2538,7 +2540,7 @@ spawn_cmd() {
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-astra|captain-opus|captain-sol|captain-astra)
+      builder-opus|builder-sol|builder-astra|codex-astra|captain-opus|captain-sol|captain-astra)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
