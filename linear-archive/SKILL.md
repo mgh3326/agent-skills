@@ -1,18 +1,21 @@
 ---
 name: linear-archive
-description: ROB Linear 이슈를 Obsidian으로 아카이브하고 Linear에서 삭제해 쿼타 슬롯을 확보하는 절차. 쿼타(~250) 근접 시 또는 닫힌 이슈가 쌓였을 때 사용. 트리거 - "linear 아카이브", "이슈 정리해", "쿼타 찼어", "닫힌 이슈 치워", rob-lookup --count 가 220 초과.
+description: ROB Linear 이슈를 handoffkeep 문서로 보존하고 native archive로 쿼타 슬롯을 확보하는 archive-only 절차. 쿼타(~250) 근접 시 또는 닫힌 이슈가 쌓였을 때 사용. 트리거 - "linear 아카이브", "이슈 정리해", "쿼타 찼어", "닫힌 이슈 치워", rob-lookup --count 가 220 초과.
 ---
 
-# linear-archive — ROB Linear 아카이브·삭제 표준 절차
+# linear-archive — ROB Linear 보존·아카이브 표준 절차
 
 > ROB-NNN 은 비공개 이슈 트래커 참조이며, 각 규칙 옆 본문이 근거를 자립 설명한다.
 
 🔴 도메인 오버레이: $AGENT_SKILLS_DOMAIN/linear-archive.md 가 존재하면 이 스킬을 적용하기
 전에 반드시 먼저 읽어라. 없으면 아래 추상 규칙만 적용한다.
 
-**원칙 1: export 없이 삭제 금지.** 삭제분은 30일 후 Linear 에서 실제 purge 된다(ROB-383 실측:
-07-04 조회 가능 → 07-29 소멸). **Obsidian export 가 유일한 영구 소스**다.
-**원칙 2: 삭제는 항상 운영자 승인 게이트.** export·선별은 무승인(부작용 0), 삭제만 승인 필요.
+**원칙 1: handoffkeep 보존 후 native archive만 허용.** 개별 이슈는
+`linear/ROB-NNNN`(kind `note`)에 보존하고, 승인된 ID와 manifest를 포함한 배치 기록은
+`report/linear/archive/YYYY-MM-DD/<batch>`(kind `report`)에 보존한다.
+**원칙 2: archive는 항상 운영자 승인 게이트.** 보존·선별은 무승인(Linear 부작용 0),
+archive만 승인 필요다. Obsidian은 운영자 개인 노트 전용이며 이 절차의 1차 저장소나 실행
+전제 조건이 아니다.
 
 ## 0. 용어 (운영자 정본)
 
@@ -20,10 +23,10 @@ description: ROB Linear 이슈를 Obsidian으로 아카이브하고 Linear에서
   빠지고(실측: issueCount 250→249), 내용은 Linear 에 그대로 남으며(제목·본문·상태 identifier
   직접 조회 가능 실측), `issueUnarchive` 로 **같은 번호로 복원**된다. purge 없음(단, 장기
   retention 은 미관측 — 아래 보험 참조).
-- **Obsidian export** = durable 이중화. archive 경로에서는 **보험(권장)**, delete 경로에서는
-  **필수**다.
-- **삭제(`issueDelete`)** = **노이즈 전용 최후수단.** soft-archive 후 **30일 purge**, 내용검색
-  즉시 불가. 진짜 무가치한 것(스팸·중복 생성 실수)에만.
+- **handoffkeep 보존** = durable 정본. 개별 이슈 문서와 배치 보고서의 SHA를 대조한 뒤
+  archive한다. Obsidian 사본은 운영자 개인 노트일 뿐 정본이 아니다.
+- **삭제(`issueDelete`)** = 🔴 **은퇴(retired) 경로. 신규 사용 금지.** 과거에는 노이즈 전용
+  최후수단이었으나 soft-delete 후 30일 purge와 비가역성 때문에 archive-only로 봉인됐다.
 - ~~⚠️ native archive 로 바꾸라고 권하지 말 것~~ — **2026-08-03 폐기.** 과거 운영자가 단순성을
   위해 delete 를 택했으나, 같은 운영자가 실측(archive 가 쿼타를 비우면서 내용·번호·복원성을
   보존) 후 archive-first 로 전환을 결정했다. delete 의 유일한 장점이었던 "단순성"은 되돌릴 수
@@ -59,16 +62,21 @@ rob-lookup --count          # 쿼타 미터 = active(non-archived) 카운트
    "지금 안 볼 일" 판정이지만, 그래도 목록 승인은 생략 불가.
 
 denylist 는 **Track A 에 적용하지 않는다** — 금지의 근거가 "증거 소실"이었는데 archive 는
-아무것도 소실하지 않는다. Obsidian export 는 보험으로 권장(특히 retention 장기 관측 전까지
-증거성 이슈 류).
+아무것도 소실하지 않는다. 대신 handoffkeep 개별 이슈 문서와 배치 보고서를 먼저 기록하고
+SHA를 대조한다.
 
-### Track B — `issueDelete` (노이즈 전용) — 6개 조건 전부 통과해야
+### Track B — `issueDelete` — 은퇴(retired), 신규 사용 금지
 
-1. **닫힌 상태만** (Done / Canceled / Duplicate). ⚠️ `linear-delete.sh` 는 Duplicate 를 closed 로
+아래 조건과 사례는 과거 삭제 판단의 근거를 보존하기 위한 **이력**이다. 신규 후보 선별이나
+실행 절차로 사용하지 말고, 어떤 조건을 충족해도 `issueDelete`를 호출하지 않는다.
+과거 Track B 자료를 재기록할 때도 개별 이슈는 `linear/ROB-NNNN`(kind `note`), 배치와
+manifest는 `report/linear/archive/YYYY-MM-DD/<batch>`(kind `report`)를 사용한다.
+
+1. **과거 조건: 닫힌 상태만** (Done / Canceled / Duplicate). ⚠️ `linear-delete.sh` 는 Duplicate 를 closed 로
    안 쳐서 SKIP 한다 → `save_issue` 로 Canceled 로 바꾼 뒤 삭제.
 2. **leaf** — active 자식 0
 3. **active parent 없음** — 단, **역참조 코멘트를 남기면 예외로 통과**한다(아래 §2-1).
-4. **Obsidian 에 이미 preserved** (export 선행)
+4. **과거 조건: 보존본 선행** (당시에는 Obsidian export를 사용)
 5. **안전 민감 키워드 미해당** — denylist는 `$AGENT_SKILLS_DOMAIN/linear-archive-denylist.txt`
    에서 읽는다(형식은 `linear-archive/denylist.txt.example` 참조 — 한 줄에 한 항목, `#` 주석
    허용). 🔴 **파일이 없으면 Track B(delete) 전체를 차단한다** — denylist 부재를
@@ -84,9 +92,11 @@ roadmap/sprint anchor, active PR 참조 중인 것.
 ⚠️ **Backlog 는 아카이브 대상이 아니다** — 닫힌 게 아니라 손 안 댄 것이다. 줄이려면 먼저 닫아야
 한다(별개 작업).
 
-**순서**: child → parent. 부모는 자식 삭제 후 다음 pass 에서 leaf 가 된다(2-pass 필요할 수 있음).
+**과거 순서**: child → parent. 부모는 자식 삭제 후 다음 pass 에서 leaf 가 됐다(2-pass가 필요할 수 있었음).
 
-### 2-1. active parent 예외 — 부모에 역참조를 남기면 자식을 지울 수 있다
+### 2-1. 과거 active parent 예외 — 삭제 이력 보존용
+
+이 절은 retired Track B가 사용되던 당시의 역참조 근거다. 신규 삭제 허가로 해석하지 않는다.
 
 조건 3 이 "부모가 살아 있으면 자식도 못 지운다"로 읽히지만, **그건 Linear 안에서만 볼 때다.**
 아카이브 배치 파일은 **본문 전문 + 부모/자식 관계 + 원본 URL** 을 보존한다(2026-08-01 배치
@@ -96,15 +106,15 @@ roadmap/sprint anchor, active PR 참조 중인 것.
 **빠진 것은 방향 하나뿐이다** — 아카이브→원본(URL)은 있는데 **부모→아카이브 역참조가 없다.**
 부모를 열었을 때 자식이 어디로 갔는지 Linear 안에서 알 길이 없다.
 
-🔴 **그래서 active parent 를 가진 자식을 지울 때는, 삭제 전에 부모에 코멘트를 남긴다:**
+🔴 **과거에는 active parent를 가진 자식을 지울 때 삭제 전에 부모에 코멘트를 남겼다:**
 ```
 ROB-525·526·527·528 은 2026-08-03 에 Canceled 후 아카이브됨(사유: <한 줄>).
 전문: <vault>/auto_trader/linear-archive/2026-08-03-<batch>.md
 ```
-- 코멘트는 **삭제 전에** 남긴다. 삭제 후에는 어떤 ID 였는지 재구성이 어렵다.
-- 이 코멘트가 없으면 조건 3 은 통과하지 못한다 — 없는 채로 지우면 부모가 **추적 불가능한
-  고아 계획**을 갖게 된다.
-- 부모가 여러 자식을 잃으면 **한 코멘트에 모아서** 남긴다(코멘트 폭주 방지).
+- 코멘트는 **삭제 전에** 남겼다. 삭제 후에는 어떤 ID였는지 재구성이 어려웠기 때문이다.
+- 이 코멘트가 없으면 과거 조건 3을 통과하지 못했다. 없는 채로 지우면 부모가 **추적 불가능한
+  고아 계획**을 갖게 됐기 때문이다.
+- 부모가 여러 자식을 잃으면 **한 코멘트에 모아서** 남겼다(코멘트 폭주 방지).
 
 ## 3. 실행 순서 (항상 이 순서)
 
@@ -113,41 +123,40 @@ ROB-525·526·527·528 은 2026-08-03 에 Canceled 후 아카이브됨(사유: <
 ① 쿼타 스냅샷        rob-lookup --count
 ② 후보 선별          §2 Track A 조건
 ③ 역참조 코멘트      active parent 가 있는 자식만 (§2-1)
-④ 🔴 운영자 승인      exact ID 목록 제시 → 명시적 승인 대기
-⑤ 승인된 ID 만       GraphQL issueArchive (1건 canary → 나머지)
-⑥ 사후 검증          issueCount 감소 + 표본 1건 identifier 재조회(내용 보존 확인)
-⑦ 배치 기록          아카이브 배치 md 에 ID·사유·일자 기록 (Obsidian export 는 보험 — 권장)
+④ handoffkeep 보존   개별 note + 후보 manifest 배치 report 기록, 소스 SHA 대조
+⑤ 🔴 운영자 승인      exact ID 목록 제시 → 명시적 승인 대기
+⑥ 승인된 ID 만       GraphQL issueArchive (1건 canary → 나머지)
+⑦ 사후 검증          issueCount 감소 + 표본 1건 identifier 재조회(내용 보존 확인)
+⑧ 배치 기록 확정     handoffkeep report에 승인 ID·결과·사유·일자·SHA 기록
 ```
-- ②까지 무승인 진행 가능. ④ 없이 ⑤ 금지.
+- ④까지 Linear mutation 없이 진행 가능. ⑤ 없이 ⑥ 금지.
 - 복원 = `issueUnarchive(id)` — 같은 번호로 돌아온다. 착수 결정이 나면 즉시.
 
-**Track B (`issueDelete`, 노이즈 전용)** — 구 절차 유지:
+**Track B (`issueDelete`) — retired 이력, 신규 실행 금지:**
 ```
-① 스냅샷 → ② 6조건 선별 → ③ 🔴 Obsidian export(필수) → ④ 🔴 운영자 승인
-→ ⑤ linear-delete.sh --confirm (--canary 선행) → ⑥ trashed=true + count 재확인
+# 과거 절차 기록일 뿐 실행 명령이 아니다.
+① 스냅샷 → ② 6조건 선별 → ③ 보존본 생성 → ④ 운영자 승인
+→ ⑤ 삭제 canary/배치 → ⑥ trashed=true + count 재확인
 ```
 
 ## 4. 경로·도구
 
 ```
-Obsidian vault  $ROB_VAULT/auto_trader/linear-archive/  (경로는 `bin/rob-lookup`과 동일 규약)
-  배치 파일       YYYY-MM-DD-rob-linear-<kind>-batch-N.md   (사람용 full context)
-  manifest        같은 이름의 .manifest.json / .ids.json     (기계 판독용)
-  개별 이슈       issues/ROB-NNN-*.md                        (YAML frontmatter)
-정책 문서        …/auto_trader/linear-cleanup-policy.md      (canonical v2, 2026-07-04)
-삭제 스크립트    ~/bin/linear-delete.sh ROB-a ROB-b …
-                 dry-run 기본 · --confirm 실삭제 · --canary 1건 · --file
-조회 도구        rob-lookup ROB-NNN | --search <키워드> | --count
+handoffkeep 개별 이슈  linear/ROB-NNNN                              kind note
+handoffkeep 배치 기록  report/linear/archive/YYYY-MM-DD/<batch>      kind report
+  본문                  승인 ID·사유·일자·개별 문서 SHA·manifest
+조회 도구               rob-lookup ROB-NNN | --search <키워드> | --count
+운영자 개인 노트        $ROB_VAULT 아래 선택적 사본(1차 저장소 아님)
 ```
 
-`linear-delete.sh` 안전가드: closed+leaf 만 삭제하고, 레이트리밋 등 비-JSON 응답은 그 건만
-ERROR 처리 후 계속한다. 키는 스크립트가 `~/.config/linear/api-key`(chmod 600)에서 직접 읽으므로
-**명령줄에 credential 이 노출되지 않는다**.
+과거 `linear-delete.sh`의 closed+leaf 안전가드와 credential 비노출 방식은 아래 실사례의
+해석 근거로만 보존한다. 스크립트와 `issueDelete`는 신규 실행하지 않는다.
 
 ## 5. 하지 말 것
 
-- **승인 없이 archive/delete** — ④는 두 트랙 모두 생략 불가
-- **export 없이 delete** — 30일 후 영구 소실 (Track B 한정. Track A 는 보험 권장)
+- **승인 없이 archive** — exact ID 목록 승인 게이트는 생략 불가
+- **`issueDelete`, delete mutation, 삭제 스크립트 신규 실행** — Track B는 retired이며 이 절차는 archive-only다
+- **handoffkeep 보존·SHA 대조 없이 archive** — 개별 note와 배치 report가 먼저다
 - **In Progress·In Review·앵커 이슈 archive** — 활성 작업은 대상이 아니다.
   Backlog 는 **icebox 조건 충족 + 승인 시에만** Track A 대상(delete 는 여전히 금지)
 - **주기 실행 자동화** — reactive-at-cap 이 정책이다
