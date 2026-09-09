@@ -23,8 +23,10 @@ archive만 승인 필요다. Obsidian은 운영자 개인 노트 전용이며 �
   빠지고(실측: issueCount 250→249), 내용은 Linear 에 그대로 남으며(제목·본문·상태 identifier
   직접 조회 가능 실측), `issueUnarchive` 로 **같은 번호로 복원**된다. purge 없음(단, 장기
   retention 은 미관측 — 아래 보험 참조).
-- **handoffkeep 보존** = durable 정본. 개별 이슈 문서와 배치 보고서의 SHA를 대조한 뒤
-  archive한다. Obsidian 사본은 운영자 개인 노트일 뿐 정본이 아니다.
+- **handoffkeep 보존** = durable 정본. SHA는 소스 파일의 **정확한 바이트**(UTF-8 재인코딩,
+  개행 변환, front matter 정규화 전)에 대한 SHA-256 lowercase hex다. manifest의 `sha256`과
+  import 직전 재계산값을 대조하고, 통과한 개별 이슈 문서와 배치 보고서만 archive 게이트에
+  올린다. Obsidian 사본은 운영자 개인 노트일 뿐 정본이 아니다.
 - **삭제(`issueDelete`)** = 🔴 **은퇴(retired) 경로. 신규 사용 금지.** 과거에는 노이즈 전용
   최후수단이었으나 soft-delete 후 30일 purge와 비가역성 때문에 archive-only로 봉인됐다.
 - ~~⚠️ native archive 로 바꾸라고 권하지 말 것~~ — **2026-08-03 폐기.** 과거 운영자가 단순성을
@@ -65,6 +67,20 @@ denylist 는 **Track A 에 적용하지 않는다** — 금지의 근거가 "증
 아무것도 소실하지 않는다. 대신 handoffkeep 개별 이슈 문서와 배치 보고서를 먼저 기록하고
 SHA를 대조한다.
 
+### 2-1. Track A active parent 역참조 — 현재 절차
+
+archive된 자식은 부모 UI에서 숨을 수 있으므로, active parent가 있는 **승인된** 자식은 native
+archive 직전에 부모에 아래 형식의 코멘트를 남긴다. 코멘트 본문도 exact ID 승인 목록과 함께
+승인받으며, 여러 자식은 한 코멘트로 묶는다.
+
+```
+ROB-NNNN[, ROB-NNNN...]은 <YYYY-MM-DD>에 native archive됨(사유: <한 줄>).
+handoffkeep: linear/ROB-NNNN (kind note)
+batch: report/linear/archive/YYYY-MM-DD/<batch> (kind report)
+```
+
+코멘트에는 비밀·로컬 경로·이슈 본문을 복사하지 않는다. handoffkeep key만 역참조로 남긴다.
+
 ### Track B — `issueDelete` — 은퇴(retired), 신규 사용 금지
 
 아래 조건과 사례는 과거 삭제 판단의 근거를 보존하기 위한 **이력**이다. 신규 후보 선별이나
@@ -75,7 +91,7 @@ manifest는 `report/linear/archive/YYYY-MM-DD/<batch>`(kind `report`)를 사용�
 1. **과거 조건: 닫힌 상태만** (Done / Canceled / Duplicate). ⚠️ `linear-delete.sh` 는 Duplicate 를 closed 로
    안 쳐서 SKIP 한다 → `save_issue` 로 Canceled 로 바꾼 뒤 삭제.
 2. **leaf** — active 자식 0
-3. **active parent 없음** — 단, **역참조 코멘트를 남기면 예외로 통과**한다(아래 §2-1).
+3. **active parent 없음** — 단, **역참조 코멘트를 남기면 예외로 통과**했다(아래 §2-2).
 4. **과거 조건: 보존본 선행** (당시에는 Obsidian export를 사용)
 5. **안전 민감 키워드 미해당** — denylist는 `$AGENT_SKILLS_DOMAIN/linear-archive-denylist.txt`
    에서 읽는다(형식은 `linear-archive/denylist.txt.example` 참조 — 한 줄에 한 항목, `#` 주석
@@ -94,7 +110,7 @@ roadmap/sprint anchor, active PR 참조 중인 것.
 
 **과거 순서**: child → parent. 부모는 자식 삭제 후 다음 pass 에서 leaf 가 됐다(2-pass가 필요할 수 있었음).
 
-### 2-1. 과거 active parent 예외 — 삭제 이력 보존용
+### 2-2. 과거 active parent 예외 — 삭제 이력 보존용
 
 이 절은 retired Track B가 사용되던 당시의 역참조 근거다. 신규 삭제 허가로 해석하지 않는다.
 
@@ -122,14 +138,15 @@ ROB-525·526·527·528 은 2026-08-03 에 Canceled 후 아카이브됨(사유: <
 ```
 ① 쿼타 스냅샷        rob-lookup --count
 ② 후보 선별          §2 Track A 조건
-③ 역참조 코멘트      active parent 가 있는 자식만 (§2-1)
-④ handoffkeep 보존   개별 note + 후보 manifest 배치 report 기록, 소스 SHA 대조
-⑤ 🔴 운영자 승인      exact ID 목록 제시 → 명시적 승인 대기
+③ handoffkeep 보존   개별 note + 후보 manifest 배치 report 기록, 소스 SHA-256 대조
+④ 🔴 운영자 승인      exact ID 목록·부모 코멘트 본문 제시 → 명시적 승인 대기
+⑤ 역참조 코멘트      승인된 active-parent 자식만 (§2-1)
 ⑥ 승인된 ID 만       GraphQL issueArchive (1건 canary → 나머지)
-⑦ 사후 검증          issueCount 감소 + 표본 1건 identifier 재조회(내용 보존 확인)
+⑦ 사후 검증          승인 ID 전건 identifier 재조회 + archivedAt 확인, issueCount 감소 대조
 ⑧ 배치 기록 확정     handoffkeep report에 승인 ID·결과·사유·일자·SHA 기록
 ```
-- ④까지 Linear mutation 없이 진행 가능. ⑤ 없이 ⑥ 금지.
+- ③까지 Linear mutation 없이 진행 가능. ④ 없이 ⑤·⑥ 금지. 전건 검증이 끝나지 않으면 ⑧을
+  확정하지 않고 미확인 ID를 그대로 보고한다.
 - 복원 = `issueUnarchive(id)` — 같은 번호로 돌아온다. 착수 결정이 나면 즉시.
 
 **Track B (`issueDelete`) — retired 이력, 신규 실행 금지:**
@@ -148,6 +165,11 @@ handoffkeep 배치 기록  report/linear/archive/YYYY-MM-DD/<batch>      kind re
 조회 도구               rob-lookup ROB-NNN | --search <키워드> | --count
 운영자 개인 노트        $ROB_VAULT 아래 선택적 사본(1차 저장소 아님)
 ```
+
+위 두 handoffkeep 키는 `doc import --manifest`(개별 `linear/ROB-NNNN` note)와 문서 put
+(배치 report)으로 직접 만든다. 일반 작업 보고서 uploader의 다른 key 규칙은 이 archive
+manifest·개별 이슈 보존을 대신하지 않는다. importer는 manifest SHA-256을 소스의 정확한
+바이트로 재계산해 일치한 항목만 put하고, 충돌·불일치는 archive 전에 보고한다.
 
 과거 `linear-delete.sh`의 closed+leaf 안전가드와 credential 비노출 방식은 아래 실사례의
 해석 근거로만 보존한다. 스크립트와 `issueDelete`는 신규 실행하지 않는다.
