@@ -125,7 +125,8 @@ hub_quota_run_case() {
   : >"$HUB_QUOTA_SPILLOVER_LOG"
   set +e
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
-    ARBITER_BIN="$TMP/absent-arbiter" WRK_NO_SLEEP=1 \
+    ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/hub-quota-xdg-$name" \
+    ARBITER_INBOX_ROOT="$TMP/hub-quota-inbox-$name" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
     WRK_FIXTURE_LOG="$HUB_QUOTA_HERDR_LOG" WRK_SCOPEFUEL_LOG="$TMP/hub-quota-scopefuel.log" \
     WRK_REFRESH_LOG="$TMP/hub-quota-refresh.log" WRK_REFRESH_PID_LOG="$TMP/hub-quota-refresh.pids" \
