@@ -452,6 +452,74 @@ quota_gate() {
   esac
 }
 
+# The local scopefuel gate remains the only profile-to-pool authority. This
+# second gate adds hub-owned placement policy only after scopefuel allowed the
+# profile and exposed its pool in the stable first stdout line. The panewire
+# CLI owns transport/auth/response classification: only exit 4 is eligible for
+# the approved local-only fallback.
+quota_hub_policy_gate() {
+  # P5: a durable arbiter registration is the only evidence that permits hub
+  # contact. Absent/transitional arbiter keeps the pre-existing local-only path.
+  [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
+  [[ "${GATE_READY:-0}" -eq 1 ]] || return 0
+
+  local hub_url token_env cf_env first_line field pool="" panewire rc
+  local gate_fields=() args=()
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+
+  # No hub keys means this installation has not opted in. Preserve the exact
+  # pre-hub local-only path. A partial configuration is different: silently
+  # treating it as absent would turn an operator error into permissive policy.
+  if [[ -z "$hub_url" && -z "$token_env" && -z "$cf_env" ]]; then
+    return 0
+  fi
+  if [[ -z "$hub_url" || -z "$token_env" ]]; then
+    echo "wrk: hub quota gate configuration is incomplete; refusing local fallback" >&2
+    return 70
+  fi
+
+  IFS= read -r first_line <<<"$GATE_OUTPUT" || true
+  read -r -a gate_fields <<<"$first_line"
+  for field in "${gate_fields[@]}"; do
+    case "$field" in
+      pool=*) pool="${field#pool=}"; break ;;
+    esac
+  done
+  if [[ ! "$pool" =~ ^[a-z][a-z0-9._-]{0,63}$ ]]; then
+    echo "wrk: scopefuel gate output has no valid pool; hub quota gate failed closed" >&2
+    return 70
+  fi
+
+  panewire="${PANEWIRE_BIN:-panewire}"
+  if [[ "$panewire" == */* ]]; then
+    [[ -x "$panewire" ]] || {
+      echo "wrk: panewire quota gate is unavailable; refusing local fallback" >&2
+      return 70
+    }
+  elif ! command -v "$panewire" >/dev/null 2>&1; then
+    echo "wrk: panewire quota gate is unavailable; refusing local fallback" >&2
+    return 70
+  fi
+
+  args=(place --class worker --cwd "$CWD" --pool "$pool" --hub-url "$hub_url" --hub-token-env "$token_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  set +e
+  "$panewire" "${args[@]}" >/dev/null 2>&1
+  rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    4) warn "hub quota policy unavailable; using local scopefuel result"; return 0 ;;
+    5) echo "wrk: hub quota policy denied" >&2; return 5 ;;
+    6) echo "wrk: hub quota policy authentication failed" >&2; return 6 ;;
+    70) echo "wrk: hub quota policy response rejected" >&2; return 70 ;;
+    2) echo "wrk: hub quota policy invocation rejected" >&2; return 2 ;;
+    *) echo "wrk: hub quota policy failed closed (panewire exit $rc)" >&2; return 70 ;;
+  esac
+}
+
 # ROB-1199: admission control. The quota gate answers "how much is left"; arbiter
 # answers "who holds it". fail-closed everywhere except a genuinely absent tool.
 # ROB-1214: a failed spawn must not leave its tab behind. Every retry used to
@@ -2513,6 +2581,7 @@ spawn_cmd() {
 
   quota_gate
   arbiter_admit
+  quota_hub_policy_gate
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
 
   if [[ "$PROFILE_KIND" == kimi ]]; then

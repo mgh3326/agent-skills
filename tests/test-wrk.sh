@@ -113,6 +113,189 @@ spawn_base() {
     -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
 }
 
+hub_quota_run_case() {
+  local name="$1" hub_rc="$2" gate_mode="$3" config="$4"
+  HUB_QUOTA_OUT="$TMP/hub-quota-$name.out"
+  HUB_QUOTA_ERR="$TMP/hub-quota-$name.err"
+  HUB_QUOTA_PANEWIRE_LOG="$TMP/hub-quota-$name-panewire.log"
+  HUB_QUOTA_HERDR_LOG="$TMP/hub-quota-$name-herdr.log"
+  HUB_QUOTA_SPILLOVER_LOG="$TMP/hub-quota-$name-spillover.log"
+  : >"$HUB_QUOTA_PANEWIRE_LOG"
+  : >"$HUB_QUOTA_HERDR_LOG"
+  : >"$HUB_QUOTA_SPILLOVER_LOG"
+  set +e
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
+    ARBITER_BIN="$TMP/absent-arbiter" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$HUB_QUOTA_HERDR_LOG" WRK_SCOPEFUEL_LOG="$TMP/hub-quota-scopefuel.log" \
+    WRK_REFRESH_LOG="$TMP/hub-quota-refresh.log" WRK_REFRESH_PID_LOG="$TMP/hub-quota-refresh.pids" \
+    WRK_REFRESH_TIMEOUT_S=5 WRK_HOSTS_CONFIG="$config" \
+    WRK_SPILLOVER_LOG="$HUB_QUOTA_SPILLOVER_LOG" \
+    WRK_PANEWIRE_LOG="$HUB_QUOTA_PANEWIRE_LOG" WRK_PANEWIRE_RC="$hub_rc" \
+    WRK_GATE_MODE="$gate_mode" \
+    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 --host local \
+    >"$HUB_QUOTA_OUT" 2>"$HUB_QUOTA_ERR"
+  HUB_QUOTA_RC=$?
+  set -e
+}
+
+hub_quota_expect_rc() {
+  local name="$1" want="$2"
+  [[ "$HUB_QUOTA_RC" -eq "$want" ]] ||
+    fail "hub quota combination $name expected exit $want, got $HUB_QUOTA_RC"
+}
+
+hub_quota_expect_spawn() {
+  local name="$1" want="$2"
+  if [[ "$want" -eq 1 ]]; then
+    [[ -s "$HUB_QUOTA_HERDR_LOG" ]] ||
+      fail "hub quota combination $name expected spawn"
+  elif [[ -s "$HUB_QUOTA_HERDR_LOG" ]]; then
+    fail "hub quota combination $name unexpectedly spawned"
+  fi
+}
+
+run_hub_quota_gate_tests() {
+  local configured="$TMP/hub-quota-hosts.toml"
+  local unconfigured="$TMP/hub-quota-no-hub.toml"
+  local token_file="$TMP/hub-quota-operator.env"
+  local cf_file="$TMP/hub-quota-cf.env"
+  local token_value="fixture-quota-token-must-not-leak"
+  printf 'HUB_TOKEN=%s\n' "$token_value" >"$token_file"
+  printf 'CF_ACCESS_CLIENT_ID=fixture\nCF_ACCESS_CLIENT_SECRET=fixture\n' >"$cf_file"
+  printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nhub_cf_env = "%s"\n' \
+    "$token_file" "$cf_file" >"$configured"
+  printf '[local]\nmax_load_ratio = 1.0\n' >"$unconfigured"
+
+  # W1 isolates the original scopefuel exit contract with no [hub] section.
+  # These assertions intentionally precede the policy-combination table so a
+  # broad relaxation of `3|4) exit "$rc"` fails at the legacy boundary.
+  hub_quota_run_case local-contract-3 0 3 "$unconfigured"
+  hub_quota_expect_rc local-contract-3 3
+  hub_quota_expect_spawn local-contract-3 0
+  grep -q 'gate blocked profile=codex-terra-max' "$HUB_QUOTA_ERR" ||
+    fail "W1 scopefuel exit 3 stderr was not preserved"
+  echo "PASS hub-quota-local-contract exit-3=deny"
+
+  hub_quota_run_case local-contract-4 0 4 "$unconfigured"
+  hub_quota_expect_rc local-contract-4 4
+  hub_quota_expect_spawn local-contract-4 0
+  grep -q 'gate measurement unavailable profile=codex-terra-max' "$HUB_QUOTA_ERR" ||
+    fail "W1 scopefuel exit 4 stderr was not preserved"
+  echo "PASS hub-quota-local-contract exit-4=unknown"
+
+  # The scopefuel success payload remains the exact two-line prefix consumed by
+  # arbiter. The hub call receives only the pool emitted by scopefuel.
+  hub_quota_run_case allow-local-0 0 ok "$configured"
+  hub_quota_expect_rc allow/local-0 0
+  hub_quota_expect_spawn allow/local-0 1
+  [[ "$(sed -n '1p' "$HUB_QUOTA_OUT")" == 'profile=codex-terra-max pool=codex used_pct=12.5 class=preserve' ]] ||
+    fail "scopefuel gate stdout line 1 was not reprinted verbatim"
+  [[ "$(sed -n '2p' "$HUB_QUOTA_OUT")" == 'gate allowed profile=codex-terra-max' ]] ||
+    fail "scopefuel gate stdout line 2 was not reprinted verbatim"
+  python3 - "$HUB_QUOTA_PANEWIRE_LOG" "$ROOT" "$token_file" "$cf_file" <<'PY' ||
+import sys
+got = open(sys.argv[1], encoding="utf-8").read().splitlines()
+want = [
+    "place", "--class", "worker", "--cwd", sys.argv[2], "--pool", "codex",
+    "--hub-url", "https://hub.invalid", "--hub-token-env", sys.argv[3],
+    "--hub-cf-env", sys.argv[4], "--",
+]
+if got != want:
+    raise SystemExit(f"hub quota argv mismatch: got={got!r} want={want!r}")
+PY
+    fail "hub quota allow invocation did not preserve the panewire contract"
+  echo "PASS hub-quota-combination allow/0=allow"
+
+  # Local denial/unknown terminates before hub policy can override it. The fake
+  # hub is configured to allow, and non-invocation is part of the assertion.
+  hub_quota_run_case allow-local-3 0 3 "$configured"
+  hub_quota_expect_rc allow/local-3 3
+  hub_quota_expect_spawn allow/local-3 0
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "hub allow was consulted after local exit 3"
+  grep -q 'gate blocked profile=codex-terra-max' "$HUB_QUOTA_ERR" ||
+    fail "scopefuel exit 3 stderr was not preserved"
+  echo "PASS hub-quota-combination allow/3=deny"
+
+  hub_quota_run_case allow-local-4 0 4 "$configured"
+  hub_quota_expect_rc allow/local-4 4
+  hub_quota_expect_spawn allow/local-4 0
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "hub allow was consulted after local exit 4"
+  grep -q 'gate measurement unavailable profile=codex-terra-max' "$HUB_QUOTA_ERR" ||
+    fail "scopefuel exit 4 stderr was not preserved"
+  echo "PASS hub-quota-combination allow/4=unknown"
+
+  hub_quota_run_case deny-local-0 5 ok "$configured"
+  hub_quota_expect_rc deny/local-0 5
+  hub_quota_expect_spawn deny/local-0 0
+  grep -q 'hub quota policy denied' "$HUB_QUOTA_ERR" ||
+    fail "hub exit 5 was not classified as deny"
+  echo "PASS hub-quota-combination deny/0=deny"
+
+  hub_quota_run_case unavailable-local-0 4 ok "$configured"
+  hub_quota_expect_rc unavailable/local-0 0
+  hub_quota_expect_spawn unavailable/local-0 1
+  grep -q 'hub quota policy unavailable; using local scopefuel result' "$HUB_QUOTA_ERR" ||
+    fail "hub exit 4 did not take the approved fallback"
+  echo "PASS hub-quota-combination unavailable/0=allow"
+
+  hub_quota_run_case unavailable-local-3 4 3 "$configured"
+  hub_quota_expect_rc unavailable/local-3 3
+  hub_quota_expect_spawn unavailable/local-3 0
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "unavailable hub was consulted after local exit 3"
+  echo "PASS hub-quota-combination unavailable/3=deny"
+
+  hub_quota_run_case authentication-local-0 6 ok "$configured"
+  hub_quota_expect_rc authentication_error/local-0 6
+  hub_quota_expect_spawn authentication_error/local-0 0
+  grep -q 'hub quota policy authentication failed' "$HUB_QUOTA_ERR" ||
+    fail "hub exit 6 was not classified as authentication error"
+  echo "PASS hub-quota-combination authentication_error/0=authentication_error"
+
+  hub_quota_run_case malformed-local-0 70 ok "$configured"
+  hub_quota_expect_rc fail_closed/local-0 70
+  hub_quota_expect_spawn fail_closed/local-0 0
+  grep -q 'hub quota policy response rejected' "$HUB_QUOTA_ERR" ||
+    fail "hub exit 70 was not classified fail-closed"
+  echo "PASS hub-quota-combination fail_closed/0=fail_closed"
+
+  # Usage is also fail-closed. Of panewire's nonzero outcomes, only 4 spawns.
+  hub_quota_run_case usage-local-0 2 ok "$configured"
+  hub_quota_expect_rc usage/local-0 2
+  hub_quota_expect_spawn usage/local-0 0
+  grep -q 'hub quota policy invocation rejected' "$HUB_QUOTA_ERR" ||
+    fail "hub exit 2 did not fail closed"
+  echo "PASS hub-quota-only-exit-4-falls-back"
+
+  # A readable hosts.toml without [hub] is the original local-only path.
+  hub_quota_run_case unconfigured-local-0 70 ok "$unconfigured"
+  hub_quota_expect_rc unconfigured/local-0 0
+  hub_quota_expect_spawn unconfigured/local-0 1
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "hub-unconfigured local-only path invoked panewire"
+  [[ "$(sed -n '1p' "$HUB_QUOTA_OUT")" == 'profile=codex-terra-max pool=codex used_pct=12.5 class=preserve' ]] ||
+    fail "hub-unconfigured path changed local gate stdout"
+  echo "PASS hub-quota-unconfigured-preserves-local-only"
+
+  # The credential files are passed by path only. Neither their contents nor
+  # panewire output can enter wrk's stdout, stderr, or spill-over audit log.
+  for output in "$TMP"/hub-quota-*.out "$TMP"/hub-quota-*.err "$TMP"/hub-quota-*-spillover.log; do
+    if grep -Fq "$token_value" "$output"; then
+      fail "hub token leaked into ${output##*/}"
+    fi
+  done
+  echo "PASS hub-quota-token-redaction"
+}
+
+if [[ "${WRK_TEST_ONLY_HUB_QUOTA:-0}" -eq 1 ]]; then
+  run_hub_quota_gate_tests
+  exit 0
+fi
+run_hub_quota_gate_tests
+
 arb() { "$ARBITER" "$@"; }
 
 "$WRK" --help >/dev/null
