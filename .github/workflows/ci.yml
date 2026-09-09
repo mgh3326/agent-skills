@@ -35,4 +35,5 @@ jobs:
           bash tests/test-wrk.sh
           bash tests/wrk_spillover.sh
           bash tests/test-arbiter.sh
+          bash tests/wrk_spillover.sh
           bash tests/test-acp-runner-process-group.sh
