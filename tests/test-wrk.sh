@@ -137,6 +137,7 @@ profiles_out="$("$WRK" profiles)"
 grep -qx 'oc-omni' <<<"$profiles_out"
 grep -qx 'kimi-k3' <<<"$profiles_out"
 grep -qx 'kimi-k27' <<<"$profiles_out"
+grep -qx 'kimi-k27-code' <<<"$profiles_out"
 grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
 grep -qx 'builder-opus' <<<"$profiles_out"
@@ -191,7 +192,7 @@ profiles=(
   "kiro-minimax21:kiro-sol" "kiro-haiku:kiro-haiku"
   "kiro-opus-xhigh:kiro-opus" "kiro-opus-max:kiro-opus"
   "kiro-sol-xhigh:kiro-sol" "kiro-sol-max:kiro-sol"
-  "kimi-k3:kimi-k3" "kimi-k27:kimi-k27" "kimi-k3-low:kimi-k3-low"
+  "kimi-k3:kimi-k3" "kimi-k27:kimi-k27" "kimi-k27-code:kimi-k27-code" "kimi-k3-low:kimi-k3-low"
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
@@ -251,8 +252,14 @@ grep -q -- '-m kimi-for-coding/k3' "$TMP/herdr.log"
 spawn_base kimi-k27 >/dev/null
 grep -q -- '--kind kimi' "$TMP/herdr.log"
 grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+spawn_base kimi-k27-code >/dev/null
+grep -q -- '--kind kimi' "$TMP/herdr.log"
+grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3 -p "$PROMPT" -w w -l fixture --effort high
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k27-code -p "$PROMPT" -w w -l fixture --effort high
 
 # ROB-1307: kimi(0.37.2)는 trust 파일명을 basename 소문자화 + 앞 40자로 정규화해
 # 조회한다. 대문자·40자 초과 worktree 이름에서 시딩이 어긋나 Trust 다이얼로그가 스폰을
@@ -295,6 +302,9 @@ spawn_base kimi-k3 >/dev/null
 if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
 : >"$TMP/herdr.log"
 spawn_base kimi-k27 >/dev/null
+if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
+: >"$TMP/herdr.log"
+spawn_base kimi-k27-code >/dev/null
 if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
 
 # ROB-1191 ⑥: Claude opus/sonnet effort wiring via CLI argv (settings.json never written).
@@ -789,7 +799,7 @@ echo "PASS role-captain-alias-normalizes-to-builder"
 # Every builder profile spelling, including all three legacy captain spellings,
 # must traverse the actual spawn/claim path under canonical --role builder.
 builder_profile_index=0
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra captain-astra; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra codex-astra captain-astra; do
   builder_profile_index=$((builder_profile_index + 1))
   spawn_base "$builder_profile" --role builder --lane "builder-profile-$builder_profile_index" \
     --parent parent-lane --job "builder-profile-$builder_profile_index" --t T1 >/dev/null
@@ -797,7 +807,7 @@ done
 python3 - "$ARBITER_INBOX_ROOT" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
-for index in range(1, 7):
+for index in range(1, 8):
     event = json.loads((root / f"builder-profile-{index}" / "events" / "00001-job.claim.json").read_text())
     assert event["payload"]["role"] == "builder", event
 PY
@@ -846,7 +856,7 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra captain-astra; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra codex-astra captain-astra; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -898,10 +908,22 @@ PY
 builder_sol_out="$(spawn_base builder-sol --role builder --lane builder-sol-lane --parent parent-lane --job builder-sol-job --t T1 2>&1)"
 grep -q 'model=builder-sol' <<<"$builder_sol_out"
 grep -q -- '-m gpt-5.6-sol' "$TMP/herdr.log"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
 : >"$TMP/herdr.log"
 builder_astra_out="$(spawn_base builder-astra --role builder --lane builder-astra-lane --parent parent-lane --job builder-astra-job --t T1 2>&1)"
 grep -q 'model=builder-astra' <<<"$builder_astra_out"
 grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "builder-astra" ]]
+: >"$TMP/herdr.log"
+codex_astra_out="$(spawn_base codex-astra --role builder --lane codex-astra-lane --parent parent-lane --job codex-astra-job --t T1 2>&1)"
+grep -q 'model=codex-astra' <<<"$codex_astra_out"
+grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-astra" ]]
+: >"$TMP/herdr.log"
+captain_astra_out="$(spawn_base captain-astra --role captain --lane captain-astra-lane --parent parent-lane --job captain-astra-job --t T1 2>&1)"
+grep -q 'model=captain-astra' <<<"$captain_astra_out"
+grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "captain-astra" ]]
 
 # Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
 # must all stop before gate/claim/tab creation.
