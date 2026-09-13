@@ -399,8 +399,10 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
 
 # Task 201: devin-swe2 resolves only as a worker. The fixture log is an argv
-# snapshot: Herdr gets its built-in `--kind devin` path and no prompt/privilege/
-# effort mutation is smuggled into the Devin process.
+# snapshot: Herdr gets its built-in `--kind devin` path and no prompt/effort
+# mutation is smuggled into the Devin process. Permission mode is intentionally
+# unattended (`--permission-mode dangerous`): accept-edits prompts on every
+# shell command in a pane and stalls (task201).
 : >"$TMP/herdr.log"
 devin_idle_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
 grep -q 'model=devin-swe2' <<<"$devin_idle_out"
@@ -408,11 +410,20 @@ grep -q 'status=idle' <<<"$devin_idle_out"
 grep -q 'landed=yes' <<<"$devin_idle_out"
 [[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 devin_start_line="$(grep '^agent start ' "$TMP/herdr.log")"
-[[ "$devin_start_line" == 'agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model swe-2 --permission-mode accept-edits --respect-workspace-trust false' ]] ||
+[[ "$devin_start_line" == 'agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
   fail "devin start argv snapshot mismatch: $devin_start_line"
 [[ " $devin_start_line " != *' -p '* ]] || fail "devin start argv must not contain -p"
-[[ " $devin_start_line " != *' --dangerously-skip-permissions '* ]] || fail "devin start argv must not contain dangerous permissions"
+[[ " $devin_start_line " != *' --dangerously-skip-permissions '* ]] || fail "devin start argv must not contain Claude-only --dangerously-skip-permissions"
 [[ " $devin_start_line " != *' --effort '* ]] || fail "devin start argv must not contain effort"
+# Pin README's documented argv to the live snapshot. Read README; do not
+# hardcode a second expected string (that would just grow the drift surface).
+# shellcheck disable=SC2016  # the backtick is literal markdown, not a substitution
+readme_devin_argv="$(sed -n 's/.*`--kind devin -- \(--model swe-2 .* --respect-workspace-trust false\)`.*/\1/p' "$ROOT/README.md")"
+[[ -n "$readme_devin_argv" && "$(grep -c . <<<"$readme_devin_argv")" -eq 1 ]] ||
+  fail "README.md has no unique documented devin argv to pin against the snapshot"
+devin_snapshot_argv="${devin_start_line##* -- }"
+[[ "$readme_devin_argv" == "$devin_snapshot_argv" ]] ||
+  fail "README.md argv drifted from wrk snapshot: readme='$readme_devin_argv' snapshot='$devin_snapshot_argv'"
 expect_exit 2 spawn_base devin-swe2 --effort high
 expect_exit 2 spawn_base devin-swe2 --role builder --lane devin-builder-lane --parent parent-lane
 echo "PASS devin-swe2 worker-only kind/argv/no-effort snapshot"
