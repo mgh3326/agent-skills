@@ -319,6 +319,7 @@ run_fail "$WRK" nope
 # (드리프트 방지: scopefuel 이 추천하는데 wrk 가 못 띄우는 상태 방지).
 profiles_out="$("$WRK" profiles)"
 grep -qx 'oc-omni' <<<"$profiles_out"
+grep -qx 'oc-solar4' <<<"$profiles_out"
 grep -qx 'kimi-k3' <<<"$profiles_out"
 grep -qx 'kimi-k27' <<<"$profiles_out"
 grep -qx 'kimi-k27-code' <<<"$profiles_out"
@@ -382,7 +383,7 @@ profiles=(
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
-  "oc-minimax-m3:oc-minimax-m3" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
+  "oc-minimax-m3:oc-minimax-m3" "oc-solar4:oc-solar4" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
   "cc-qwen38:cc-qwen38" "cc-glm:cc-glm"
   "cc-dsflash:cc-qwen38" "cc-dspro:cc-qwen38" "cc-glm53:cc-qwen38"
   )
@@ -573,6 +574,15 @@ grep -q -- '--model cline-pass/cline-pass/qwen3.7-max' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base oc-minimax-m3 >/dev/null
 grep -q -- '--model cline-pass/cline-pass/minimax-m3' "$TMP/herdr.log"
+: >"$TMP/herdr.log"
+# Task 210: oc-solar4 kind+args snapshot. A model/kind drift must fail this
+# exact-string assertion (not an exception during spawn).
+oc_solar4_out="$(spawn_base oc-solar4 2>&1)"
+grep -q 'model=oc-solar4' <<<"$oc_solar4_out"
+oc_solar4_start_line="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$oc_solar4_start_line" == 'agent start fixture --kind opencode --pane w:p1 --timeout 30000 -- --auto --model upstage/solar-pro4' ]] ||
+  fail "oc-solar4 start argv snapshot mismatch: $oc_solar4_start_line"
+echo "PASS oc-solar4 kind/args snapshot"
 : >"$TMP/herdr.log"
 # ROB-1244: 기본 grok = 4.6, grok45 는 명시 롤백 별칭, grok46 은 동의어
 spawn_base grok >/dev/null

@@ -41,7 +41,7 @@ ALL_PROFILES=(
   kiro-sol-xhigh kiro-sol-max
   kimi-k3 kimi-k27 kimi-k27-code kimi-k3-low
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
-  oc-qwen37-max oc-minimax-m3
+  oc-qwen37-max oc-minimax-m3 oc-solar4
   agy-flash agy-flash36 agy-flash37
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med
   cc-qwen38 cc-glm cc-dsflash cc-dspro cc-glm53
@@ -1022,6 +1022,7 @@ resolve_profile() {
     # 잔존하며, 정식 서빙(ClinePass 등)이 생기면 새 이름으로 재배선한다. 상세=메모리 ox-alpha-lane.
     oc-qwen37-max) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/qwen3.7-max) ;;
     oc-minimax-m3) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/minimax-m3) ;;
+    oc-solar4) PROFILE_KIND=opencode; ARGS=(--auto --model upstage/solar-pro4) ;;
 
     grok|grok-hi) PROFILE_KIND=grok; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     grok-med) PROFILE_KIND=grok; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
@@ -1065,7 +1066,7 @@ resolve_profile() {
     kiro|kiro-sol|kiro-luna|kiro-glm|kiro-deepseek|kiro-minimax|kiro-minimax21|kiro-sol-xhigh|kiro-sol-max)
       GATE_PROFILE=kiro-sol ;;
     kimi-k3|kimi-k27|kimi-k27-code|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
-    oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3)
+    oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3|oc-solar4)
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
     grok|grok-hi|grok-med|grok45|grok45-med|grok46|grok46-med) GATE_PROFILE=grok-hi ;;
