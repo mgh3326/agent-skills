@@ -102,7 +102,7 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 `agy -p "$(cat PROMPT_FILE)"`이다.
 
 `devin-swe2`는 worker 전용 Devin 프로필이다. `wrk`는 `herdr agent start`에
-`--kind devin -- --model swe-2 --permission-mode accept-edits --respect-workspace-trust false`를
+`--kind devin -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false`를
 정확히 전달하며, effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로
 `devin-swe2`로 넘기고 pool 결정·기록은 scopefuel 출력과 arbiter가 소유한다.
 
