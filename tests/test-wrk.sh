@@ -399,8 +399,10 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
 
 # Task 201: devin-swe2 resolves only as a worker. The fixture log is an argv
-# snapshot: Herdr gets its built-in `--kind devin` path and no prompt/privilege/
-# effort mutation is smuggled into the Devin process.
+# snapshot: Herdr gets its built-in `--kind devin` path and no prompt/effort
+# mutation is smuggled into the Devin process. Permission mode is intentionally
+# unattended (`--permission-mode dangerous`): accept-edits prompts on every
+# shell command in a pane and stalls (task201).
 : >"$TMP/herdr.log"
 devin_idle_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
 grep -q 'model=devin-swe2' <<<"$devin_idle_out"
@@ -408,10 +410,10 @@ grep -q 'status=idle' <<<"$devin_idle_out"
 grep -q 'landed=yes' <<<"$devin_idle_out"
 [[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 devin_start_line="$(grep '^agent start ' "$TMP/herdr.log")"
-[[ "$devin_start_line" == 'agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model swe-2 --permission-mode accept-edits --respect-workspace-trust false' ]] ||
+[[ "$devin_start_line" == 'agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
   fail "devin start argv snapshot mismatch: $devin_start_line"
 [[ " $devin_start_line " != *' -p '* ]] || fail "devin start argv must not contain -p"
-[[ " $devin_start_line " != *' --dangerously-skip-permissions '* ]] || fail "devin start argv must not contain dangerous permissions"
+[[ " $devin_start_line " != *' --dangerously-skip-permissions '* ]] || fail "devin start argv must not contain Claude-only --dangerously-skip-permissions"
 [[ " $devin_start_line " != *' --effort '* ]] || fail "devin start argv must not contain effort"
 expect_exit 2 spawn_base devin-swe2 --effort high
 expect_exit 2 spawn_base devin-swe2 --role builder --lane devin-builder-lane --parent parent-lane
