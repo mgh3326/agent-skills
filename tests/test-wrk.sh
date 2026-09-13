@@ -331,6 +331,7 @@ grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'captain-astra' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
+[[ "$(grep -xc 'devin-swe2' <<<"$profiles_out")" -eq 1 ]]
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -366,6 +367,7 @@ grep -q 'model=codex-terra' <<<"$canonical_out"
 
 profiles=(
   "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku" "fable:fable"
+  "devin-swe2:devin-swe2"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
@@ -395,6 +397,25 @@ done
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
+
+# Task 201: devin-swe2 resolves only as a worker. The fixture log is an argv
+# snapshot: Herdr gets its built-in `--kind devin` path and no prompt/privilege/
+# effort mutation is smuggled into the Devin process.
+: >"$TMP/herdr.log"
+devin_idle_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
+grep -q 'model=devin-swe2' <<<"$devin_idle_out"
+grep -q 'status=idle' <<<"$devin_idle_out"
+grep -q 'landed=yes' <<<"$devin_idle_out"
+[[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
+devin_start_line="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$devin_start_line" == 'agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model swe-2 --permission-mode accept-edits --respect-workspace-trust false' ]] ||
+  fail "devin start argv snapshot mismatch: $devin_start_line"
+[[ " $devin_start_line " != *' -p '* ]] || fail "devin start argv must not contain -p"
+[[ " $devin_start_line " != *' --dangerously-skip-permissions '* ]] || fail "devin start argv must not contain dangerous permissions"
+[[ " $devin_start_line " != *' --effort '* ]] || fail "devin start argv must not contain effort"
+expect_exit 2 spawn_base devin-swe2 --effort high
+expect_exit 2 spawn_base devin-swe2 --role builder --lane devin-builder-lane --parent parent-lane
+echo "PASS devin-swe2 worker-only kind/argv/no-effort snapshot"
 
 # ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
 # file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
@@ -763,6 +784,24 @@ import json, sys
 event = json.load(open(sys.argv[1]))
 assert event["payload"]["agent_label"] == "fixture", event
 PY
+
+# Task 201: scopefuel, not wrk, is the sole Devin-pool authority. The fixture's
+# stable first line must arrive unchanged at arbiter, while the receipt keeps
+# the profile spelling the worker actually launched.
+rm -f "$TMP/herdr.log" "$TMP/scopefuel.log"
+devin_admit_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 --job arb-devin --t T1 2>&1)"
+grep -qx 'profile=devin-swe2 pool=devin used_pct=0 class=spend' <<<"$devin_admit_out"
+grep -q 'quota_record=devin/quota_pool' <<<"$devin_admit_out"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == 'devin-swe2' ]]
+arb status --job arb-devin --json |
+  python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["quota_pool_records"]; assert len(r)==1 and r[0]["pool"]=="devin" and r[0]["profile"]=="devin-swe2", d'
+python3 - "$ARBITER_INBOX_ROOT/arb-devin/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
+spawned = next(event for event in events if event["kind"] == "job.spawned")
+assert spawned["payload"]["profile"] == "devin-swe2", spawned
+PY
+echo "PASS devin-swe2 scopefuel-gate-to-arbiter-pool-and-spawn-receipt"
 
 # ⑥ the pool is a record, not a mutex: another job asking for the same pool
 # succeeds and both records remain visible.

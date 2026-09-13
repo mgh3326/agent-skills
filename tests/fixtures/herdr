@@ -106,8 +106,14 @@ case "${1:-}" in
           name-sync)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"orch","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p2","tab_id":"w:t2","workspace_id":"w"},{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p3","tab_id":"w:t3","workspace_id":"w"}]}}'
             ;;
-          landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no)
+          landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          devin-idle)
+            printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          devin-done)
+            printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"done","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           landing-working-no-marker|landing-delayed-marker|landing-scrollback-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
