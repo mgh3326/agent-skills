@@ -6,6 +6,8 @@
 #   WRK_PANEWIRE_LOG    append one argv element per line, then a `--` separator
 #   WRK_PANEWIRE_RC     exit code to return (default 0)
 #   WRK_PANEWIRE_SLEEP  seconds to stall before returning, to exercise timeouts
+#   WRK_PANEWIRE_REQUIRE_INBOX_ROOT  exit 2 when argv lacks --inbox-root,
+#                       reproducing the real emit's missing-root failure
 set -euo pipefail
 
 if [[ -n "${WRK_PANEWIRE_LOG:-}" ]]; then
@@ -13,6 +15,19 @@ if [[ -n "${WRK_PANEWIRE_LOG:-}" ]]; then
     for argument in "$@"; do printf '%s\n' "$argument"; done
     printf -- '--\n'
   } >>"$WRK_PANEWIRE_LOG"
+fi
+
+if [[ -n "${WRK_PANEWIRE_REQUIRE_INBOX_ROOT:-}" ]]; then
+  has_inbox_root=0
+  for argument in "$@"; do
+    if [[ "$argument" == "--inbox-root" ]]; then
+      has_inbox_root=1
+      break
+    fi
+  done
+  if [[ "$has_inbox_root" -eq 0 ]]; then
+    exit 2
+  fi
 fi
 
 [[ -z "${WRK_PANEWIRE_SLEEP:-}" ]] || sleep "$WRK_PANEWIRE_SLEEP"

@@ -1559,6 +1559,46 @@ grep -qxF 'OK job=r20-builder owner_lane=lane-a kind=job.escalate' <<<"$r20_esca
 grep -qxF "OK job=r20-builder owner_lane=lane-a kind=job.joined pr=https://example.invalid/pr/1 head=deadbeef report=$R20_REPORT" <<<"$r20_joined_out"
 echo "PASS r20-stdout-contract-unchanged"
 
+# TW9 — emit must always name --inbox-root: panewire wants the root containing
+# jobs/<job>/events, which is the parent of wrk_jobs_root() (ARBITER_INBOX_ROOT
+# is the jobs directory itself). Without the flag the emit lands on the
+# daemon's default root and the relay is lost; the fixture's opt-in
+# WRK_PANEWIRE_REQUIRE_INBOX_ROOT turns that into the observed rc=2, which must
+# therefore never reach the warning path for any of the three kinds.
+R20_ROOT_LOG="$TMP/r20-inbox-root-emit.log"
+R20_ROOT_ERR="$TMP/r20-inbox-root.err"
+r20_claim r20-root-done
+r20_claim r20-root-builder --role builder --parent-lane parent-a
+env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+  WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
+  "$WRK" 'done' r20-root-done --report "$R20_REPORT" 2>"$R20_ROOT_ERR" >/dev/null
+env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+  WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
+  "$WRK" escalate r20-root-builder --question 'need parent decision' \
+  2>>"$R20_ROOT_ERR" >/dev/null
+env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+  WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
+  "$WRK" joined r20-root-builder --pr https://example.invalid/pr/1 \
+  --head deadbeef --report "$R20_REPORT" 2>>"$R20_ROOT_ERR" >/dev/null
+if grep -q 'panewire' "$R20_ROOT_ERR"; then
+  fail "emit without --inbox-root is rc=2; the warning proves it was not passed: $(cat "$R20_ROOT_ERR")"
+fi
+PYTHONPATH="$TMP" python3 - "$R20_ROOT_LOG" "$(dirname "$R20_INBOX")" <<'PY'
+import sys
+import r20_emit as helper
+
+log, inbox_root = sys.argv[1:]
+captured = helper.calls(log)
+assert len(captured) == 3, captured
+kinds = []
+for call in captured:
+    got = helper.flags(call)
+    assert got.get("--inbox-root") == inbox_root, got
+    kinds.append(got["--kind"])
+assert kinds == ["job.completed", "job.escalate", "job.joined"], kinds
+PY
+echo "PASS r20-emit-passes-inbox-root-parent-of-jobs-dir"
+
 # ── R21: report documents are optional handoffkeep uploads ──────────────────
 # Keep the capture shape identical to R20: a fixture collects every argv
 # element, and real arbiter claim/spawned envelopes provide the command input.
