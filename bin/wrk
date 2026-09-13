@@ -1251,9 +1251,15 @@ except subprocess.TimeoutExpired:
     sys.exit(124)' 5)
     fi
   fi
+  # panewire wants the root containing jobs/<job>/events — the parent of
+  # wrk_jobs_root(), since ARBITER_INBOX_ROOT names the jobs directory itself.
+  # Without it emit falls back to the daemon's default root and the relay
+  # misses the record file wrk just wrote.
+  local inbox_root
+  inbox_root="$(dirname "$(wrk_jobs_root)")"
   local command=("${guard[@]}" "$panewire" emit --kind "$kind" --job "$job" --report "$report"
     --owner-lane "$owner" --epoch 1 --label "$label" --host "$host" --pane "$pane"
-    --report-last-line "$last")
+    --report-last-line "$last" --inbox-root "$inbox_root")
   # Empty optionals are omitted rather than passed as empty strings.
   [[ -z "$reason" ]] || command+=(--reason "$reason")
   [[ -z "$question" ]] || command+=(--question "$question")
