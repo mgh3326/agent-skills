@@ -417,10 +417,8 @@ devin_start_line="$(grep '^agent start ' "$TMP/herdr.log")"
 [[ " $devin_start_line " != *' --effort '* ]] || fail "devin start argv must not contain effort"
 # Pin README's documented argv to the live snapshot. Read README; do not
 # hardcode a second expected string (that would just grow the drift surface).
-readme_devin_argv="$(
-  grep -F -- '--kind devin -- --model swe-2' "$ROOT/README.md" \
-    | sed -n 's/.*--kind devin -- \(--model swe-2 .* --respect-workspace-trust false\).*/\1/p'
-)"
+# shellcheck disable=SC2016  # the backtick is literal markdown, not a substitution
+readme_devin_argv="$(sed -n 's/.*`--kind devin -- \(--model swe-2 .* --respect-workspace-trust false\)`.*/\1/p' "$ROOT/README.md")"
 [[ -n "$readme_devin_argv" && "$(grep -c . <<<"$readme_devin_argv")" -eq 1 ]] ||
   fail "README.md has no unique documented devin argv to pin against the snapshot"
 devin_snapshot_argv="${devin_start_line##* -- }"
