@@ -922,8 +922,9 @@ resolve_profile() {
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
     # Worker-only Devin profile. Herdr owns detection through --kind devin;
-    # keep its launch argv exact and do not add a prompt, effort, or privilege flag.
-    devin-swe2) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2 --permission-mode accept-edits --respect-workspace-trust false) ;;
+    # keep its launch argv exact and do not add a prompt or effort flag.
+    # Unattended pane: accept-edits prompts on every shell command and stalls (task201).
+    devin-swe2) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2 --permission-mode dangerous --respect-workspace-trust false) ;;
 
     # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
     # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
