@@ -287,7 +287,7 @@ landing_check_once() {
   # Herdr's built-in Devin detector exposes a post-prompt idle/done state after
   # it has accepted the brief. That detector result is profile-specific positive
   # evidence; generic agents still require a transcript marker or Pasted text.
-  if [[ "$profile_kind" == devin && ( "$status" == idle || "$status" == done ) ]]; then
+  if [[ "$profile_kind" == devin && "$status" =~ ^(idle|done)$ ]]; then
     LANDING_CHECK_LAST_EVIDENCE=devin-status
     LANDING_CHECK_LAST_REASON="devin-post-prompt-status-${status}"
     return 0
