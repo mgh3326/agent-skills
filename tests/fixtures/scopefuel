@@ -6,6 +6,7 @@ set -euo pipefail
 pool_for() {
   case "$1" in
     opus|sonnet|fable|haiku) echo claude ;;
+    devin-swe2) echo devin ;;
     codex*) echo codex ;;
     kiro*) echo kiro ;;
     oc-gflash|oc-sonnet46|oc-oss) echo agy ;;
@@ -19,7 +20,7 @@ pool_for() {
 if [[ "${1:-}" == --json ]]; then
   json_rc=0
   schema_value=scopefuel.v1
-  providers='[{"id":"claude"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"}]'
+  providers='[{"id":"claude"},{"id":"devin"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"}]'
   case "${WRK_SCOPEFUEL_JSON_MODE:-ok}" in
     broken) echo 'scopefuel: json fetch failed' >&2; exit 7 ;;
     garbage) echo 'not json at all'; exit 0 ;;
@@ -83,5 +84,11 @@ if [[ "${WRK_GATE_POOL_MODE:-ok}" == missing ]]; then
   echo "gate allowed profile=$profile"
   exit 0
 fi
-echo "profile=$profile pool=$pool used_pct=12.5 class=preserve"
+if [[ "$profile" == devin-swe2 ]]; then
+  # The fixture models scopefuel's authoritative output; wrk must pass this
+  # profile through unchanged and let arbiter derive the pool from this line.
+  echo 'profile=devin-swe2 pool=devin used_pct=0 class=spend'
+else
+  echo "profile=$profile pool=$pool used_pct=12.5 class=preserve"
+fi
 echo "gate allowed profile=$profile"

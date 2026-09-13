@@ -33,6 +33,7 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
 ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable builder-opus captain-opus
+  devin-swe2
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max builder-sol captain-sol codex-astra builder-astra captain-astra
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
@@ -244,7 +245,7 @@ agent_status_for_pane() {
 }
 
 landing_check_once() {
-  local pane="$1" marker="$2" recent visible status
+  local pane="$1" marker="$2" profile_kind="$3" recent visible status
   LANDING_CHECK_LAST_EVIDENCE=none
   if ! recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
@@ -283,6 +284,14 @@ landing_check_once() {
     return 1
   fi
   LANDING_CHECK_LAST_STATUS="$status"
+  # Herdr's built-in Devin detector exposes a post-prompt idle/done state after
+  # it has accepted the brief. That detector result is profile-specific positive
+  # evidence; generic agents still require a transcript marker or Pasted text.
+  if [[ "$profile_kind" == devin && "$status" =~ ^(idle|done)$ ]]; then
+    LANDING_CHECK_LAST_EVIDENCE=devin-status
+    LANDING_CHECK_LAST_REASON="devin-post-prompt-status-${status}"
+    return 0
+  fi
   if [[ "$status" == working ]]; then
     LANDING_CHECK_LAST_REASON=working-without-positive-evidence
   else
@@ -292,7 +301,7 @@ landing_check_once() {
 }
 
 landing_check() {
-  local pane="$1" marker="$2" tick delay
+  local pane="$1" marker="$2" profile_kind="$3" tick delay
   LANDING_CHECK_CONFIRMED=0
   LANDING_CHECK_AMBIGUOUS=0
   LANDING_CHECK_ATTEMPTS=0
@@ -301,7 +310,7 @@ landing_check() {
   LANDING_CHECK_LAST_REASON=not-observed
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
-    if landing_check_once "$pane" "$marker"; then return 0; fi
+    if landing_check_once "$pane" "$marker" "$profile_kind"; then return 0; fi
     [[ "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]] && LANDING_CHECK_CONFIRMED=1
     if [[ "$tick" -lt $((LANDING_CHECK_TIMEOUT_TICKS - 1)) ]]; then
       delay="$(landing_check_delay "$tick")"
@@ -912,6 +921,9 @@ resolve_profile() {
     sonnet|sonnet-med) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5 --dangerously-skip-permissions) ;;
+    # Worker-only Devin profile. Herdr owns detection through --kind devin;
+    # keep its launch argv exact and do not add a prompt, effort, or privilege flag.
+    devin-swe2) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2 --permission-mode accept-edits --respect-workspace-trust false) ;;
 
     # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
     # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
@@ -1040,6 +1052,7 @@ resolve_profile() {
     sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
+    devin-swe2) GATE_PROFILE="$MODEL" ;;
     codex|codex-sol|codex-max|builder-sol|captain-sol) GATE_PROFILE=codex-max ;;
     codex-astra|builder-astra|captain-astra) GATE_PROFILE="$MODEL" ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
@@ -2666,7 +2679,7 @@ print(value if isinstance(value, str) else "")
       PROMPT_SUBMITTED=1
     fi
   fi
-  if landing_check "$PANE" "$PROMPT_MARKER"; then
+  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
     LANDING=yes
   else
     landing_detail="$(landing_check_detail)"
@@ -2687,7 +2700,7 @@ print(value if isinstance(value, str) else "")
         # result into another payload submission.
         "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
       fi
-      if landing_check "$PANE" "$PROMPT_MARKER"; then
+      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
         LANDING=retry
       else
         landing_detail="$(landing_check_detail)"
