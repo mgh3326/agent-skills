@@ -8,6 +8,9 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 빌더는 PR 한 건의 실행 루프를 소유한다. canonical 빌더 프로필은 `builder-opus`(Opus, effort high) 또는
 `builder-sol`(codex-sol)·`builder-astra`(gpt-6-astra)다. `captain-opus`·`captain-sol`·`captain-astra`는
 legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
+운영자 결정(2026-09-14)으로 `builder-devin`·`builder-grok`·`builder-kimi`가 파일럿 빌더로 열려 있다
+(각각 devin-swe2·grok 4.6 xhigh·kimi-k3 argv 재사용; 워커 철자 `devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도
+`--role builder`를 받는다). 정식 등재는 파일럿 통과 후다.
 
 ## 시작과 브리프
 
