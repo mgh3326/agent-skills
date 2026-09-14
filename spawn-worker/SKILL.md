@@ -66,7 +66,7 @@ T3 floor 대상 아님.
 | T0 | no-spawn(직접 처리) |
 | T1 | herdr worker 1명 + 자체검증 |
 | T2 | herdr worker + 독립 tester 1라운드 |
-| T3 | herdr worker + 독립 tester(**다른 provider family 필수** — §2-4) |
+| T3 | herdr worker + 독립 tester(**다른 provider family 필수**, 조건부 동일 계열 예외 — §2-4) |
 
 - **분류 불가 시 실행하지 않고 `NEEDS_CLASSIFICATION`으로 반환한다.** 빈칸으로 두면 ROB-1196처럼
   orch가 기본 도구(하네스 서브에이전트)로 처리해 §2-3 경계가 우회된다.
@@ -84,12 +84,11 @@ T3 floor 대상 아님.
 
 | 프로필 | 급·운용 제한 |
 |---|---|
-| `devin-swe2` | **A+** 실측 확정(reps `id=681`·`682`·`688`: 3/3 완료·워커귀책 재작업 0·BLOCKER 0). reps 3건 전 잠정 `T1`/`T2` 제한은 해제한다. `S` 이상은 **S 미측정**이라 제외(3건 모두 A+ 이하). 장기 다단계 작업도 미측정이므로 제외한다. 무인 운용에는 `--permission-mode dangerous` 가 필수(`accept-edits` 는 pane 에서 셸 명령마다 프롬프트로 정지). tester는 **타사 provider family**로 배정한다. 장기 정본과 등급 조정은 scopefuel을 따른다. |
-| `builder-devin` | **조건부 T1 빌더**(2026-09-14 운영자 결정, 파일럿 1건 통과). 워커 프로필 `devin-swe2`의 argv·kind를 재사용한다. 조건: **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family · T2 이상과 배포·안전가드 표면 제외**. 무료 풀이라 여유율 규칙상 **우선 배정** 후보다. 정식 등재와 T2 확대는 **빌더 역할 표본 3**에서 재판단하며, 라운드 상한 초과나 게이트 BOUNCE 2회면 워커 전용으로 되돌린다. |
-| `builder-grok` | **조건부 T1 빌더**(2026-09-14 운영자 결정, 파일럿 1건 통과). grok 4.6 argv를 effort `xhigh`로 재사용한다 — 🔴 워커 철자 `grok`/`grok-hi`로 빌더를 띄우면 기본 effort가 `high`라 조용히 달라지므로, 빌더는 `builder-grok`을 쓰거나 `--effort xhigh`를 명시한다. 조건: **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family · T2 이상과 배포·안전가드 표면 제외**. 배정은 codex·claude 풀이 빠듯할 때. 정식 등재와 T2 확대는 **빌더 역할 표본 3**에서 재판단하며, 라운드 상한 초과나 게이트 BOUNCE 2회면 워커 전용으로 되돌린다. |
+| `devin-swe2` | **A+** 실측 확정(reps `id=681`·`682`·`688`: 3/3 완료·워커귀책 재작업 0·BLOCKER 0). reps 3건 전 잠정 `T1`/`T2` 제한은 해제한다. `S` 이상은 **S 미측정**이라 제외(3건 모두 A+ 이하). 장기 다단계 작업도 미측정이므로 제외한다. 무인 운용에는 `--permission-mode dangerous` 가 필수(`accept-edits` 는 pane 에서 셸 명령마다 프롬프트로 정지). tester는 **타사 provider family**로 배정한다(타사 풀 물리적 소진 시 §2-4 동일 계열 예외). 장기 정본과 등급 조정은 scopefuel을 따른다. |
+| `builder-devin` | **조건부 T1 빌더**(2026-09-14 운영자 결정, 파일럿 1건 통과). 워커 프로필 `devin-swe2`의 argv·kind를 재사용한다. 조건: **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(§2-4 동일 계열 예외 적용) · T2 이상과 배포·안전가드 표면 제외**. 무료 풀이라 여유율 규칙상 **우선 배정** 후보다. 정식 등재와 T2 확대는 **빌더 역할 표본 3**에서 재판단하며, 라운드 상한 초과나 게이트 BOUNCE 2회면 워커 전용으로 되돌린다. |
+| `builder-grok` | **조건부 T1 빌더**(2026-09-14 운영자 결정, 파일럿 1건 통과). grok 4.6 argv를 effort `xhigh`로 재사용한다 — 🔴 워커 철자 `grok`/`grok-hi`로 빌더를 띄우면 기본 effort가 `high`라 조용히 달라지므로, 빌더는 `builder-grok`을 쓰거나 `--effort xhigh`를 명시한다. 조건: **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(§2-4 동일 계열 예외 적용) · T2 이상과 배포·안전가드 표면 제외**. 배정은 codex·claude 풀이 빠듯할 때. 정식 등재와 T2 확대는 **빌더 역할 표본 3**에서 재판단하며, 라운드 상한 초과나 게이트 BOUNCE 2회면 워커 전용으로 되돌린다. |
 | `oc-solar4` | **B** 실측 확정(reps `id=699`·`700`·`702`: 구조·닫힌 어휘 위반 0, 원문 충실도는 1패스 실패·반복 개정으로 도달, 판단·의미는 3건 모두 약함). `T1` 한정·tester 금지를 유지한다. **산출물 자체가 판단인 과업은 배정하지 않는다**(감사 결론·리스크 분류·채택 여부 판정 등) — 검토가 뒤따르는 기계 검증 가능한 변환·태깅·형식화는 허용한다. 운용은 기계 검사 가능한 규칙 + 자력 개정 허용이 최적이며, **1패스 산출은 신뢰하지 않는다**. 브리프에 '승인 대기 없이 완주'를 명시한다(승인 대기 정지 1회 실측). 브리프에는 §3의 **rate limit 대응 절**(429·rate limit 시 지수 백오프, 막히면 중단·보고)도 반드시 포함한다. 상시 배정은 하지 않는다. 장기 정본과 등급 조정은 scopefuel을 따른다. |
-| `devin-glm52` | **미측정 → T1** (무료). devin-swe2 와 동일한 무인 argv(`--kind devin`, 모델명만 `glm-5-2`). SWE-2 대체·2계열 교차용. reps 3건으로 급 확정(devin-swe2 와 동일 5축·타사 tester). scopefuel `devin` 풀 공유. |
-| `devin-swe17` | **미측정 → T1** (무료). devin-swe2 와 동일한 무인 argv(모델명만 `swe-1-7`). reps 3건으로 급 확정. scopefuel `devin` 풀 공유. |
+| `devin-glm52`·`devin-swe17` | **등재 보류** — 사유: SWE-2 대비 우위 없음(구세대·전세대이고 컨텍스트도 작다). 프로필은 이미 있으니 필요해지면 reps 만 돌리면 된다 — 배제가 아니라 **측정 비용의 우선순위** 문제다. devin-swe2 와 동일한 무인 argv(모델명만 `glm-5-2`·`swe-1-7`). scopefuel `devin` 풀 공유. |
 | `devin-ds41` | **미측정 → T1/T2** (유료 $0.22/1M in, 벤치 TB2.1 90.6). devin-swe2 와 동일한 무인 argv(모델명만 `deepseek-v4-1-flash-high`). reps 3건으로 급 확정. scopefuel `devin` 풀 공유 — 유료 사용 시 태스크 note 에 모델·급을 남긴다(사후 비용 귀속). |
 
 급표 각주 (2026-09-14 운영자 결정 `free-lane-aggressive-use-3`·`devin-pro-paid-models`):
@@ -160,6 +159,27 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
 - **T3 tester는 다른 provider family가 필수다**(claude/openai/xai/moonshot 등) — 다른
   **모델명**만으로는 부족하다(§2-3의 "다른 세션·다른 계열"을 T3에서는 '우선'이 아니라
   '필수'로 올린 것). **self-check(자체검증)는 제출 증거일 뿐 독립 검증으로 세지 않는다.**
+- **타사 판정급이 물리적으로 불가하면 동일 계열로 1차 검증을 할 수 있다(조건부·지연 적용).**
+  **허용 조건(전부 충족)**: ①타사 풀 전부 소진을 `scopefuel --no-cache` **원문**으로 제시
+  ②**다른 세션·다른 worktree**(같은 pane 재사용 금지) ③구현자와 **다른 급 또는 effort**
+  ④보고서에 **"동일 계열 검증"** 명시.
+  **보완(면제 아님)**: 타사 풀 복구 시 **2차 검증 1라운드 필수**.
+  🔴 **2차가 BLOCKER 를 내면 1차 PASS 는 취소된다.**
+  🔴 **배포·안전가드·비가역 변경은 2차 완료 전 머지 금지.** 가역 T1·T2 는 1차 PASS 로
+  머지하고 2차를 사후에 붙일 수 있다.
+  **강도 표기 — 🔴 2단계가 아니라 3단계다**(09-14 빌더가 찾아낸 구멍):
+
+  | 현 head 의 검증 상태 | 표기 |
+  |---|---|
+  | **완료된 tester 검증 0건** | **`현 head 미검증`** |
+  | 동일 계열 1차만 완료 | `검증 강도 = 동일 계열 1회` |
+  | 타사 검증 완료 | `교차 검증 완료` |
+
+  🔴 **세 상태를 같은 말로 쓰지 않는다.** "앞 head 에서 PASS 가 있었지만 현 head 에는
+  아무 검증도 없는" 상태가 자주 생긴다(FIX 라운드가 head 를 바꾸면 항상 그렇다) — 그때
+  `동일 계열 1회` 라고 쓰면 **없는 검증을 있다고 쓰는 것**이다.
+  🔴 **검증은 head 단위로 성립한다.** 앞 head 의 PASS 를 현 head 통과로 계산하지 마라.
+  VOID 처리된 측정은 판정이 아니므로 어느 칸에도 넣지 않는다.
 
 ### 2-5. 미측정 프로필 실측(reps) 절차
 
@@ -446,9 +466,19 @@ T3=아래 수렴형.
 2. **기계적 확인은 검증 라운드의 소재가 아니다.** 테스트·lint·format·CI green·SHA 일치는
    **워커의 제출 전 체크리스트**이고 증거(원문 출력)를 브리프에 첨부하게 한다. tester는
    의미론·계약·실패모드에만 추론을 쓴다.
-3. **적대tester 스폰**(T2·T3만): 새 세션(같은 worktree 가능·수정/커밋 금지), 입력=이슈
-   AC+PR+경로만. "틀렸다고 가정하고 반증": 독립 테스트 재실행, false-green 탐지(assert
-   뒤집기), AC 대조, merge-base 기준 스코프 확인.
+3. **적대tester 스폰**(T2·T3만): 새 세션. tester 는 **검증할 SHA 에 detached verify
+   worktree 를 새로 만들어 거기서 돌린다**:
+   ```bash
+   git -C <repo> worktree add --detach ../<repo>.v<PR번호> <검증할 SHA>
+   ```
+   이유 2가지:
+   ① tester 의 뮤턴트 원복(`git checkout -- .`)이 **워커의 미커밋 편집을 통째로 지운다**
+      (2026-09-14 실측 — 워커가 5파일을 미커밋으로 고치는 동안 tester 가 뮤턴트를 돌리고
+      있었고, tester 가 멈춰 있어서 안 터졌다. **오염이 아니라 데이터 손실 경로다**).
+   ② 검증 SHA 가 고정돼 **라운드 중 트리 동결이 구조로 성립**한다.
+   verify worktree 에서도 tester 의 수정·커밋은 금지. 입력=이슈 AC+PR+경로만.
+   "틀렸다고 가정하고 반증": 독립 테스트 재실행, false-green 탐지(assert 뒤집기),
+   AC 대조, merge-base 기준 스코프 확인.
    템플릿=`~/work/herdr-templates/VERIFY-TEMPLATE.txt`.
 4. **지적은 심각도를 붙여 보고하게 한다** — `BLOCKER`(동작 안 함·기존 기능 회귀·데이터 손상·
    계약 위반) / `SHOULD` / `NICE`.
