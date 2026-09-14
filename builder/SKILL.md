@@ -9,7 +9,8 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 `builder-sol`(codex-sol)·`builder-astra`(gpt-6-astra)다. `captain-opus`·`captain-sol`·`captain-astra`는
 legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
 `builder-devin`·`builder-grok`은 파일럿 1건씩을 통과해 **조건부 T1 빌더**로 등재됐다(2026-09-14
-운영자 결정). 조건은 **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family · T2 이상과
+운영자 결정). 조건은 **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(타사 풀
+물리적 소진 시 `spawn-worker` §2-4 동일 계열 예외) · T2 이상과
 배포·안전가드 표면 제외**다. `builder-kimi`는 아직 파일럿 전이라 열려만 있다. 세 프로필 모두
 각각 devin-swe2·grok 4.6 xhigh·kimi-k3의 argv를 재사용하며, 워커 철자
 `devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. **정식 등재와 T2 확대는
@@ -32,6 +33,26 @@ legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`
 4. BLOCKER만 fix 라운드를 연다. 3라운드를 넘기지 않는다.
 5. **워커·tester 배치는 `wrk spawn`(hub placement)이 정한다.** 빌더 자신의 머신이 기본값이
    아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
+
+🔴 **가드를 추가하라고 지시할 때는 어디에 놓을지까지 적는다.**
+
+**선행조건 순서 자체가 계약인 표면**(멱등 endpoint · 상태기계 전이 · 락 구간)에서는
+**위치가 정확성의 일부**다. "정확히 일치해야 한다"만 적으면 구현자는 **가장 이른 곳**에
+놓는다 — 방어적으로 보이기 때문이다. 그런데 가장 이른 곳이 대개 **멱등·replay 경로보다도
+앞**이다.
+
+수정 지시에 **세 가지를 같이** 적는다:
+① **무엇**을 검사하는가 ② **어디에** 놓는가(앞/뒤 기준점을 이름으로)
+③ **무엇보다 앞에 놓으면 안 되는가**.
+
+**기존 주석·문서가 불변을 설명하고 있으면 그것을 지시에 인용한다.** 구현자가 그 주석을
+읽을 이유가 없다 — 편집 대상 함수 **밖**에 있기 때문이다.
+
+근거(2026-09-14 실측): 한 계통에서 나간 수정 지시 3건 중 **2건**이 다른 계약 속성을
+깼고 **둘 다 위치 미명시가 원인**이었다. 한 건은 같은 파일 주석이 그 불변을 이미
+문서화하고 있었는데도 새 가드가 그 함수 **바깥 상류**에 붙어 밖에서 깼다. 이건
+"수용조건에 '동작한다' 금지"와 같은 계열이다 — 둘 다 명세 미달이고, 검증이 아니라
+**지시 단계**에서 샌다.
 
 ### `[wake]` 소비 계약
 
