@@ -261,6 +261,10 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
 - `~/bin/herdr-spawn` 은 `wrk spawn` 으로 위임하는 shim 이다(옛 경로 호환용, 신규 사용 금지).
 - 브리프 주입과 제출 검증은 **relay-handoff 스킬 절차**를 따른다(제출 검증 생략 금지,
   접수 확인 도구 1회 지시 포함).
+- pane kind별 지시·중단·답변 통지 분기와 매트릭스·측정 조건·예외 삭제 조건은
+  **relay-handoff §3-1 정본**을 참조한다. 비-claude pane에는 `herdr agent prompt`를,
+  claude pane에만 `lane.event`를 사용한다. `panewire emit` 의 `rc=0` 은 전달 증거가
+  아니며, 보낸 쪽은 `herdr agent read <pane>`로 도착을 확인한다.
 - **완료 센티널**: job 이 arbiter 에 등록되면 `wrk spawn` 이 감시자를 분리 기동한다. 판정표와
   환경변수(`WRK_SENTINEL_TRANSIENT_MAX`·`WRK_SENTINEL_LOST_GRACE`·`WRK_SENTINEL_HERDR_SESSION`)는
   README "완료 센티널 판정표" 가 정본이다. 요지: **빈 `agent get` 응답은 pane 소멸의 증거가
@@ -277,7 +281,7 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
   최종보고·inbox 파일)로. 스폰 후 5분 내 실 툴호출 없으면 stuck 판정→재스폰.
 - herdr 공식 시맨틱(0.8 번들 스킬, `herdr --skill` 이 정본): **`done` = 미열람 idle**
   (백그라운드 완료 후 아직 UI 에서 안 봄; CLI read 는 seen 처리 안 함) — done/idle 은 같은
-  비-working 상태다. 특정 문자열 대기는 sleep+read 루프 대신
+  비-working 상태다. 특정 문자열 대기는 반복적인 read 루프 대신
   **`herdr pane wait-output <pane> --match <텍스트> --timeout <ms>`** 를 써라(기존 출력에도
   즉시 매치). 에이전트 이름/라벨은 **`[a-z][a-z0-9_-]{0,31}`** — wrk 가 스폰 전에 검증한다.
 
@@ -306,9 +310,11 @@ acp-runner --job <job_id> -c <worktree> -p brief.md   --model gemini-3.6-flash -
 ### 4-2. 🔴 착지 검증 — 스폰 직후 필수
 
 스폰 명령이 정상 반환됐다고 해서 워커가 브리프를 실제로 받은 것은 아니다. `wrk`는
-`herdr agent read <pane> --source recent-unwrapped --lines 200`의 브리프 marker를 정본으로
-확인한다(visible 화면에서 밀려나도 transcript에는 남는다). visible의 `Pasted text` 칩도
-queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오므로 착지 증거가 아니다.
+**relay-handoff §3-1 정본에 따라** visible 큐 표시와
+`herdr agent read <pane> --source recent-unwrapped --lines 200`의 브리프 marker를 둘 다
+확인한다. visible 화면에서 밀려나도 transcript에는 남고, 큐 대기 중 주입은
+`recent-unwrapped`에 아직 안 보이므로 한쪽만 보면 미착지로 오판한다. visible의 `Pasted text`
+칩도 queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오므로 착지 증거가 아니다.
 일반 프로필은 30초, codex는 60초 창에서 0.5→2초로 backoff 관찰하고, 양성 증거가 없을
 때만 최대 한 번 재주입한다. 자동화는 `--landing-strict`로 pane의 OK 행은 보존한 채
 미착지를 exit 76으로 받을 수 있다.
@@ -444,7 +450,7 @@ job 맥락을 가진 스폰 주체뿐이다. orch 뿐 아니라 **직접 스폰�
 ### 6-1. 트리거 — 깨어날 때마다 1회
 
 **orch 는 워커 완료를 자동으로 알지 못한다**(2026-08-02 실측: 워커를 스폰한 뒤 1분 45초 만에
-턴을 반환하고, 워커 둘이 도는 중에 `done→idle` 로 내려갔다. 폴링하지 않는다).
+턴을 반환하고, 워커 둘이 도는 중에 `done→idle` 로 내려갔다. 주기적으로 상태를 조회하지 않는다).
 따라서 회수는 **깨어난 순간에 확인해서** 한다 — 새 릴레이를 받았을 때, terminal 을 선언할 때,
 운영자가 깨웠을 때. 확인 비용은 몇 초이고 그때 너는 이미 깨어 있다.
 

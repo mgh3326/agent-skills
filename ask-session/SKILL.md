@@ -19,7 +19,8 @@ description: 다른 세션(orch·빌더·워커)에 질문·상태 확인을 보
   ```bash
   panewire emit --kind lane.event --lane <요청자 레인> --event-id <고유id> --text '[consult-done] <1줄 요지> | <답변 파일 경로>'
   ```
-- 수신자가 비-claude pane이면 #252 수리 전까지 위 `lane.event` 대신 아래 직접 주입을 사용한다:
+- pane kind별 통지 경로의 정본은 **relay-handoff §3-1**이다. 질문 패킷에는 그 정본에 따른
+  claude 기본 통지와 비-claude 대체 통지를 함께 적는다:
 
   ```bash
   herdr agent prompt <pane>
@@ -29,7 +30,7 @@ description: 다른 세션(orch·빌더·워커)에 질문·상태 확인을 보
 ## 2. 주입 — relay-handoff 절차 재사용
 
 - 질의 전 요청자 레인이 hub에 등록되어 있는지 확인한다. 미등록 레인의 emit은 조용히 유실된다.
-- **relay-handoff 스킬의 §2(대상 검증)·§3(주입+제출 검증)을 그대로 따른다.**
+- **relay-handoff 스킬의 §2(대상 검증)·§3(주입+제출 검증)·§3-1(완료 통지·pane kind 분기 정본)을 그대로 따른다.**
 - 대상 해석은 **`wrk find <이름|라벨>`** 로 한다(이름 유실 시 라벨 폴백 + 화면 미리보기).
 - 대상이 이름·라벨 모두로 안 잡히면(세션 사망·재시작) **실패로 보고하고 운영자
   에스컬레이션** — 질문자가 임의로 대상 세션을 재스폰하지 않는다(orch/빌더 재생성은
@@ -42,26 +43,24 @@ description: 다른 세션(orch·빌더·워커)에 질문·상태 확인을 보
   ```bash
   panewire emit --kind lane.event --lane <요청자 레인> --event-id <고유id> --text '[consult-done] <1줄 요지> | <답변 파일 경로>'
   ```
-- 자문자는 수신자가 비-claude pane이면 #252 수리 전까지 아래 직접 주입을 사용하며,
-  `lane.event`는 사용하지 않는다:
+- pane kind별 통지·대기·기한 후 확인·착지 확인 분기는 **relay-handoff §3-1 정본**을 따른다.
+  비-claude 수신자용 대체 통지는 그 정본에 따라 아래 직접 주입을 사용한다:
 
   ```bash
   herdr agent prompt <pane>
   ```
-- claude pane 질의자는 `lane.event`를 기다리며 현재 턴을 양보한다. 기한 전 답변 파일
-  확인은 하지 않으며, 이벤트를 받으면 이벤트에 적힌 답변 파일을 1회 확인한다.
-- 비-claude pane 질의자는 `lane.event` 대신 직접 주입 경로를 사용하고, 패킷에 명시한
-  기한 도달 시 답변 파일을 1회 의무적으로 확인한다. 두 경우 모두 파일이 없으면
-  ①`herdr agent read <target> --lines 40`으로 답변이 화면에만 있는지 확인 — 있으면
-  "파일 미작성, 화면 전사본" 명시 ②없으면 "무응답 (기한 N분 경과)"으로 보고하고
-  운영자에게 표면화한다. 재질의는 1회까지, 헤더에 `[재질의 — 이전 질의 무응답]`을
-  명시한다.
-- `herdr agent wait --status idle`은 보조 상태 신호일 뿐이며 완료 통지는 `lane.event`로
-  받는다. kiro/agy는 작업 중에도 idle/done 오표시(status 플랩), claude는 다른 작업으로
-  working일 수 있다.
-- `panewire emit` 의 `rc=0` 은 hub 가 요청을 접수했다는 뜻일 뿐 배달 증거가 아니다.
+- 이벤트 수신 또는 비-claude 기한 확인 뒤 파일이 없으면 ①`herdr agent read <target> --lines 40`으로
+  답변이 화면에만 있는지 확인 — 있으면 "파일 미작성, 화면 전사본" 명시 ②없으면
+  "무응답 (기한 N분 경과)"으로 보고하고 운영자에게 표면화한다. 재질의는 1회까지, 헤더에
+  `[재질의 — 이전 질의 무응답]`을 명시한다.
+- `herdr agent wait --status idle`은 보조 상태 신호일 뿐이며 완료 통지는 relay-handoff §3-1
+  정본의 경로로 받는다. kiro/agy는 작업 중에도 idle/done 오표시(status 플랩), claude는
+  다른 작업으로 working일 수 있다.
+- `panewire emit` 의 `rc=0` 은 hub 가 요청을 접수했다는 뜻일 뿐 배달 증거가 아니다. 이를
+  전달 증거로 쓰지 않으며, 보낸 쪽은 relay-handoff §3-1 정본에 따라 `herdr agent read <pane>`로
+  도착을 확인한다.
 - 등록은 필요조건이지 충분조건이 아니다. 2026-09-14 실측에서 hub 등록이 완료되고 `emit` 이 rc=0 을 반환했는데도 비-claude pane(당시 grok·devin·codex)에서 `lane.event` 가 도착하지 않았다 (관측 가능한 부작용을 요구하는 프로브가 120~150초 동안 실행되지 않았고, 그동안 그 pane 은 정상 작업 중이었다). claude 계열 pane 에서는 정상 배달됐다. 원인 수리 전까지, 통지가 오지 않는 것이 곧 답변이 없다는 뜻은 아니다.
-- #252 가 수리되면 이 예외를 삭제한다. 이 예외에는 비-claude 수신자용 직접 주입 경로도 포함된다.
+- #252 가 수리되면 이 예외를 삭제한다. 예외 삭제 조건은 relay-handoff §3-1 정본을 따른다.
 
 ## 4. 보고 형식
 
