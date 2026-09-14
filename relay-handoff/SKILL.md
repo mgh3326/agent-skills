@@ -114,6 +114,35 @@ wrk find <이름|라벨> --pane-only  # 스크립트용
 
 ## 3. herdr 주입 + 제출 검증 (생략 절대 금지)
 
+### 3-1. 완료 통지·pane kind 분기 정본
+
+비-claude pane 대상의 지시·중단·답변은 `herdr agent prompt` 직접주입을 기본으로 하고,
+`lane.event`는 claude pane에만 사용한다. 아래 표·측정 조건·예외 삭제 조건이 이 분기의
+정본이다.
+
+| pane kind | `lane.event` | `herdr agent prompt` 직접주입 |
+|---|---|---|
+| claude | ✅ | ✅ |
+| codex | ❌ | ✅ |
+| grok | ❌ | ✅ |
+| devin | ❌ | ✅ |
+
+측정 조건: *등록 완료·`emit` rc=0·pane 정상 작업 중 상태에서 관측 가능한 부작용 프로브 120~150초 관측(2026-09-14)*.
+
+- **claude pane 질의자**: 이벤트를 기다린다. **폴링 0. 기한 전 파일 확인 0.**
+- **비-claude pane 질의자(grok·devin·codex)**: `lane.event` 대신 직접 주입 경로를 사용하며,
+  기한 도달 시 답변 파일 확인 **1회 의무**(폴링이 아니라 기한 1회)다.
+- 두 경우 모두 기한 경과 후에도 파일이 없으면 기존 무응답 처리(화면 전사 폴백 → 무응답
+  보고 → 재질의 1회)를 따른다.
+- 주기 폴링 루프(`until [ -f ... ]; do sleep N; done`)는 금지한다.
+- `panewire emit` 의 `rc=0` 을 전달 증거로 쓰지 않는다. 보낸 쪽은 `herdr agent read <pane>`로
+  도착을 확인한다.
+- 착지 확인은 visible 큐 표시와 `recent-unwrapped` 를 둘 다 본다. 큐 대기 중 주입은
+  `recent-unwrapped` 에 아직 안 보이므로 한쪽만 보면 큐잉을 미착지로 오판한다.
+- 등록은 필요조건이지 충분조건이 아니다. 2026-09-14 실측에서 hub 등록이 완료되고 `emit` 이 rc=0 을 반환했는데도 비-claude pane(당시 grok·devin·codex)에서 `lane.event` 가 도착하지 않았다 (관측 가능한 부작용을 요구하는 프로브가 120~150초 동안 실행되지 않았고, 그동안 그 pane 은 정상 작업 중이었다). claude 계열 pane 에서는 정상 배달됐다. 원인 수리 전까지, 통지가 오지 않는 것이 곧 답변이 없다는 뜻은 아니다.
+- `#252 가 수리되면 이 예외를 삭제한다.` 실제 삭제는 `#264` 수리 후 4종 재측정이 전부 ✅임을
+  확인한 뒤에만 한다. 이 예외에는 비-claude 수신자용 직접 주입 경로가 포함된다.
+
 ```bash
 # 1) 긴 프롬프트는 반드시 파일로 (인라인은 셸 이스케이프로 깨짐)
 ~/.local/bin/herdr agent prompt <target> "$(cat prompt.txt)"
