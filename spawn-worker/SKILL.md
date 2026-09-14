@@ -156,7 +156,8 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
   **agy 세션 1개를 idle 쿼타 비컨으로 띄우는 것**이 조치이지 force가 아니다).
 - **"스스로 검증하라" 지시 금지** → 시도 목록 열거 + 하한 명시(예: "테스트 X·Y 실행,
   전수 grep 후에만 부재 단정").
-- **T3 tester는 다른 provider family가 필수다**(claude/openai/xai/moonshot 등) — 다른
+- **T3 tester는 다른 provider family가 필수다**(claude/openai/xai/moonshot 등, 타사 풀
+  물리적 소진 시 아래 조건부 동일 계열 예외) — 다른
   **모델명**만으로는 부족하다(§2-3의 "다른 세션·다른 계열"을 T3에서는 '우선'이 아니라
   '필수'로 올린 것). **self-check(자체검증)는 제출 증거일 뿐 독립 검증으로 세지 않는다.**
 - **타사 판정급이 물리적으로 불가하면 동일 계열로 1차 검증을 할 수 있다(조건부·지연 적용).**
