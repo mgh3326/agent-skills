@@ -336,6 +336,9 @@ grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'captain-astra' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
 [[ "$(grep -xc 'devin-swe2' <<<"$profiles_out")" -eq 1 ]]
+grep -qx 'devin-glm52' <<<"$profiles_out"
+grep -qx 'devin-swe17' <<<"$profiles_out"
+grep -qx 'devin-ds41' <<<"$profiles_out"
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -372,6 +375,7 @@ grep -q 'model=codex-terra' <<<"$canonical_out"
 profiles=(
   "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku" "fable:fable"
   "devin-swe2:devin-swe2"
+  "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
@@ -444,6 +448,27 @@ grep -q 'model=devin-swe2' <<<"$devin_builder_out" ||
 grep -q '^OK ' <<<"$devin_builder_out" ||
   fail "devin-swe2 builder spawn did not reach the OK line: $devin_builder_out"
 echo "PASS devin-swe2 worker kind/argv/no-effort snapshot + builder-pilot admission"
+
+# Task 281 (operator decision 2026-09-14 devin-pro-paid-models): the three
+# additional Devin model profiles reuse the identical unattended argv — only
+# the --model name differs — and reject --effort like devin-swe2.
+for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepseek-v4-1-flash-high"; do
+  devin_profile="${devin_pair%%:*}"
+  devin_model="${devin_pair#*:}"
+  : >"$TMP/herdr.log"
+  devin_variant_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base "$devin_profile" 2>&1)"
+  grep -q "model=$devin_profile" <<<"$devin_variant_out" ||
+    fail "$devin_profile spawn output lost its model: $devin_variant_out"
+  grep -q 'status=idle' <<<"$devin_variant_out" ||
+    fail "$devin_profile did not reach idle landing: $devin_variant_out"
+  devin_variant_start="$(grep '^agent start ' "$TMP/herdr.log")"
+  [[ "$devin_variant_start" == "agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model $devin_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
+    fail "$devin_profile start argv snapshot mismatch: $devin_variant_start"
+  [[ " $devin_variant_start " != *' --effort '* ]] ||
+    fail "$devin_profile start argv must not contain effort"
+  expect_exit 2 spawn_base "$devin_profile" --effort high
+done
+echo "PASS devin-glm52/devin-swe17/devin-ds41 worker kind/argv/no-effort snapshots"
 
 # ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
 # file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
@@ -839,6 +864,24 @@ spawned = next(event for event in events if event["kind"] == "job.spawned")
 assert spawned["payload"]["profile"] == "devin-swe2", spawned
 PY
 echo "PASS devin-swe2 scopefuel-gate-to-arbiter-pool-and-spawn-receipt"
+
+# Task 281: the new devin model variants share scopefuel's single `devin` pool
+# — the gate call uses the only devin spelling installed scopefuel accepts
+# (devin-swe2), while the spawn receipt keeps the actual launch profile.
+rm -f "$TMP/herdr.log" "$TMP/scopefuel.log"
+ds41_admit_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-ds41 --job arb-devin-ds41 --t T1 2>&1)"
+grep -qx 'profile=devin-swe2 pool=devin used_pct=0 class=spend' <<<"$ds41_admit_out"
+grep -q 'quota_record=devin/quota_pool' <<<"$ds41_admit_out"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == 'devin-swe2' ]]
+arb status --job arb-devin-ds41 --json |
+  python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["quota_pool_records"]; assert len(r)==1 and r[0]["pool"]=="devin" and r[0]["profile"]=="devin-swe2", d'
+python3 - "$ARBITER_INBOX_ROOT/arb-devin-ds41/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
+spawned = next(event for event in events if event["kind"] == "job.spawned")
+assert spawned["payload"]["profile"] == "devin-ds41", spawned
+PY
+echo "PASS devin-ds41 shares the devin-swe2 gate spelling and devin quota pool"
 
 # ⑥ the pool is a record, not a mutex: another job asking for the same pool
 # succeeds and both records remain visible.
@@ -1293,15 +1336,16 @@ done
 echo "PASS builder-pilot-admits-worker-spellings"
 
 # Profiles outside the allowlist are still refused before the gate, and the
-# refusal enumerates the three pilot profiles by name.
-for rejected in codex-terra codex-luna oc-solar4; do
+# refusal enumerates the three pilot profiles by name plus the worker-only
+# devin model variants (task 281).
+for rejected in codex-terra codex-luna oc-solar4 devin-ds41; do
   set +e
   rejected_out="$(spawn_base "$rejected" --role builder --lane builder-lane --parent parent-lane --job "builder-reject-$rejected" --t T1 2>&1)"
   rejected_rc=$?
   set -e
   [[ "$rejected_rc" -eq 2 ]] ||
     fail "--role builder must still reject $rejected with exit 2, got $rejected_rc: $rejected_out"
-  for named in builder-devin builder-grok builder-kimi; do
+  for named in builder-devin builder-grok builder-kimi devin-glm52 devin-swe17 devin-ds41; do
     grep -q "$named" <<<"$rejected_out" ||
       fail "the --role builder refusal must list $named: $rejected_out"
   done
