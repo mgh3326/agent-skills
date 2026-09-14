@@ -108,6 +108,11 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 빌더 파일럿 기간에는 `builder-devin`(동일 argv)과 `devin-swe2` 모두
 `--role builder`로 쓸 수 있다.
 
+`devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
+프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). 셋 모두 scopefuel의
+`devin` 풀 하나를 공유하고 worker 전용이다. 급은 미측정 — `devin-glm52`·`devin-swe17`은
+T1, `devin-ds41`은 T1/T2로 시작하며 reps 3건으로 확정한다. `devin-ds41`만 유료다.
+
 `--t`는 **필수**다(ROB-1198 §③). 빠지면 게이트·claim·스폰 어느 것도 하지 않고
 `NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
 사실로 기록되기 때문이다. `--job`은 생략하면 `-l LABEL`을 쓴다.

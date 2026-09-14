@@ -33,7 +33,7 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
 ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable builder-opus captain-opus
-  devin-swe2 builder-devin
+  devin-swe2 builder-devin devin-glm52 devin-swe17 devin-ds41
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max builder-sol captain-sol codex-astra builder-astra captain-astra
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
@@ -149,6 +149,9 @@ Claude effort wiring (ROB-1191/ROB-1193): opus default=xhigh, sonnet/sonnet-med 
 haiku default=low; all support an explicit --effort override.
 Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol; builder-astra = gpt-6-astra.
 Pilot builders (task 240): builder-devin = devin-swe2 argv; builder-grok = grok 4.6 at effort xhigh; builder-kimi = kimi-k3 argv.
+Devin model variants (task 281): devin-glm52, devin-swe17 and devin-ds41 run
+the same unattended devin argv with only the model name changed — worker-only,
+sharing scopefuel's single `devin` pool (devin-ds41 is the paid spelling).
 Legacy profile aliases captain-opus, captain-sol and captain-astra have the same meaning.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-for-coding/k3`; kimi-k27 and
 kimi-k27-code use `kimi --auto -m kimi-for-coding/kimi-for-coding`; the CLI has
@@ -930,6 +933,15 @@ resolve_profile() {
     # Task 240 pilot: builder-devin is the same profile admitted under
     # --role builder (operator decision 2026-09-14 §3) — identical argv.
     devin-swe2|builder-devin) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2 --permission-mode dangerous --respect-workspace-trust false) ;;
+    # Operator decision 2026-09-14 (devin-pro-paid-models): three more Devin
+    # model profiles — identical unattended argv, only the --model name
+    # differs. glm-5-2 and swe-1-7 are free-pool; deepseek-v4-1-flash-high is
+    # the only paid spelling ($0.22/1M in). High-priced Devin models
+    # (Opus/Fable/Astra/Sonnet/Kimi) are deliberately not listed — they would
+    # duplicate the claude/codex subscription spend.
+    devin-glm52) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model glm-5-2 --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-swe17) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-1-7 --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-ds41) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-high --permission-mode dangerous --respect-workspace-trust false) ;;
 
     # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
     # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
@@ -1065,6 +1077,12 @@ resolve_profile() {
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
     devin-swe2|builder-devin) GATE_PROFILE=devin-swe2 ;;
+    # All devin-* model profiles share one gate spelling: `devin-swe2` is the
+    # only devin profile installed scopefuel accepts (any other spelling is
+    # argparse-rejected, rc=2 fail-closed). Per-model attribution survives in
+    # the job.spawned payload `profile` and the quota_pool.record
+    # `launch_profile`, so reps stay separated per model.
+    devin-glm52|devin-swe17|devin-ds41) GATE_PROFILE=devin-swe2 ;;
     codex|codex-sol|codex-max|builder-sol|captain-sol) GATE_PROFILE=codex-max ;;
     codex-astra|builder-astra|captain-astra) GATE_PROFILE="$MODEL" ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
@@ -2562,7 +2580,7 @@ spawn_cmd() {
     [[ "$BUILDER_LANE" != "$PARENT_LANE" ]] || die "--role builder forbids --lane and --parent being the same (self parent)"
     case "$MODEL" in
       builder-opus|builder-sol|builder-astra|builder-devin|builder-grok|builder-kimi|codex-astra|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol|captain-astra) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-astra, builder-devin, builder-grok or builder-kimi (pilot worker spellings devin-swe2, grok/grok-hi, kimi-k3, codex-astra and legacy captain-* aliases accepted; terra/luna are worker-only)" ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-astra, builder-devin, builder-grok or builder-kimi (pilot worker spellings devin-swe2, grok/grok-hi, kimi-k3, codex-astra and legacy captain-* aliases accepted; terra/luna and devin-glm52/devin-swe17/devin-ds41 are worker-only)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
