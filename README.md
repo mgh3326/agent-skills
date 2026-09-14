@@ -87,7 +87,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 ```text
 wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
           [-L live|mock] [--effort LEVEL] [--job ID]
-wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE ... -m builder-opus|builder-sol|builder-astra
+wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE ... -m builder-opus|builder-sol|builder-astra|builder-devin|builder-grok|builder-kimi
 wrk done JOB [--report PATH]
 wrk escalate JOB --question TEXT [--report PATH]
 wrk joined JOB --pr URL --head SHA --report PATH
@@ -101,10 +101,12 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 `scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
 `agy -p "$(cat PROMPT_FILE)"`이다.
 
-`devin-swe2`는 worker 전용 Devin 프로필이다. `wrk`는 `herdr agent start`에
+`devin-swe2`는 Devin 프로필이다. `wrk`는 `herdr agent start`에
 `--kind devin -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false`를
 정확히 전달하며, effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로
 `devin-swe2`로 넘기고 pool 결정·기록은 scopefuel 출력과 arbiter가 소유한다.
+빌더 파일럿 기간에는 `builder-devin`(동일 argv)과 `devin-swe2` 모두
+`--role builder`로 쓸 수 있다.
 
 `--t`는 **필수**다(ROB-1198 §③). 빠지면 게이트·claim·스폰 어느 것도 하지 않고
 `NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
@@ -112,7 +114,9 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 
 빌더는 `builder-opus`(Opus effort high)·`builder-sol`·`builder-astra`를 쓴다. `captain-opus`·
 `captain-sol`·`captain-astra`는 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
-경고 후 builder로 정규화되는 legacy 별칭이다. 빌더 spawn의 `--lane`은 arbiter claim의
+경고 후 builder로 정규화되는 legacy 별칭이다. 빌더 파일럿으로 `builder-devin`(devin-swe2
+argv)·`builder-grok`(grok 4.6, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
+파일럿이 지목한 워커 철자 `devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire
 R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.

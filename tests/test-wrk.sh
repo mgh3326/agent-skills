@@ -328,6 +328,9 @@ grep -qx 'codex-terra-max' <<<"$profiles_out"
 grep -qx 'builder-opus' <<<"$profiles_out"
 grep -qx 'builder-sol' <<<"$profiles_out"
 grep -qx 'builder-astra' <<<"$profiles_out"
+grep -qx 'builder-devin' <<<"$profiles_out"
+grep -qx 'builder-grok' <<<"$profiles_out"
+grep -qx 'builder-kimi' <<<"$profiles_out"
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'captain-astra' <<<"$profiles_out"
@@ -399,11 +402,12 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
 
-# Task 201: devin-swe2 resolves only as a worker. The fixture log is an argv
-# snapshot: Herdr gets its built-in `--kind devin` path and no prompt/effort
-# mutation is smuggled into the Devin process. Permission mode is intentionally
+# Task 201: the devin profile resolves through Herdr's built-in `--kind devin`
+# path — the fixture log is an argv snapshot and no prompt/effort mutation is
+# smuggled into the Devin process. Permission mode is intentionally
 # unattended (`--permission-mode dangerous`): accept-edits prompts on every
-# shell command in a pane and stalls (task201).
+# shell command in a pane and stalls (task201). Task 240 later admitted the
+# same profile under --role builder (pilot) without changing this argv.
 : >"$TMP/herdr.log"
 devin_idle_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
 grep -q 'model=devin-swe2' <<<"$devin_idle_out"
@@ -426,8 +430,20 @@ devin_snapshot_argv="${devin_start_line##* -- }"
 [[ "$readme_devin_argv" == "$devin_snapshot_argv" ]] ||
   fail "README.md argv drifted from wrk snapshot: readme='$readme_devin_argv' snapshot='$devin_snapshot_argv'"
 expect_exit 2 spawn_base devin-swe2 --effort high
-expect_exit 2 spawn_base devin-swe2 --role builder --lane devin-builder-lane --parent parent-lane
-echo "PASS devin-swe2 worker-only kind/argv/no-effort snapshot"
+# Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker
+# spelling is now admitted under --role builder too — this acceptance replaces
+# the pre-pilot `expect_exit 2` refusal that pinned devin as worker-only.
+set +e
+devin_builder_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 --role builder --lane devin-builder-lane --parent parent-lane --job devin-worker-builder-job 2>&1)"
+devin_builder_rc=$?
+set -e
+[[ "$devin_builder_rc" -eq 0 ]] ||
+  fail "devin-swe2 must be admitted under --role builder (rc=$devin_builder_rc): $devin_builder_out"
+grep -q 'model=devin-swe2' <<<"$devin_builder_out" ||
+  fail "devin-swe2 builder spawn output lost its model: $devin_builder_out"
+grep -q '^OK ' <<<"$devin_builder_out" ||
+  fail "devin-swe2 builder spawn did not reach the OK line: $devin_builder_out"
+echo "PASS devin-swe2 worker kind/argv/no-effort snapshot + builder-pilot admission"
 
 # ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
 # file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
@@ -1100,7 +1116,7 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra codex-astra captain-astra; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra codex-astra captain-astra builder-devin builder-grok builder-kimi; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -1176,6 +1192,121 @@ expect_exit 2 spawn_base codex-luna --role builder --lane builder-lane --parent 
 expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --job builder-parent-mutant
 expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --parent parent-lane --effort max --job builder-effort-mutant
 if grep -q 'builder-.*-mutant' "$ARBITER_INBOX_ROOT"/*/events/* 2>/dev/null; then exit 1; fi
+
+# Task 240 builder pilot (operator decision 2026-09-14
+# codex-usage-and-builder-profiles §3 devin · §4 grok · §5 kimi): each pilot
+# profile reuses its worker profile's kind/argv verbatim, gates as the
+# scopefuel-known worker spelling, and rides the same claim path
+# (role=builder, parent recorded).
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+set +e
+builder_devin_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base builder-devin --role builder --lane builder-devin-lane --parent parent-lane --job builder-devin-job --t T1 2>&1)"
+builder_devin_rc=$?
+set -e
+[[ "$builder_devin_rc" -eq 0 ]] ||
+  fail "builder-devin must be admitted under --role builder (rc=$builder_devin_rc): $builder_devin_out"
+grep -q 'model=builder-devin' <<<"$builder_devin_out" ||
+  fail "builder-devin spawn output lost its model: $builder_devin_out"
+builder_devin_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_devin_start" == 'agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
+  fail "builder-devin must reuse the devin-swe2 worker argv verbatim: $builder_devin_start"
+[[ " $builder_devin_start " != *' --effort '* ]] || fail "builder-devin must not gain an effort flag"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "devin-swe2" ]] ||
+  fail "builder-devin must gate as the scopefuel-known devin-swe2 spelling"
+python3 - "$ARBITER_INBOX_ROOT/builder-devin-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["owner_lane"] == "builder-devin-lane", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+expect_exit 2 spawn_base builder-devin --role builder --lane builder-devin-lane --parent parent-lane --effort high --job builder-devin-effort-mutant
+echo "PASS builder-devin pilot profile reuses devin-swe2 kind/argv"
+
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+set +e
+builder_grok_out="$(spawn_base builder-grok --role builder --lane builder-grok-lane --parent parent-lane --job builder-grok-job --t T1 2>&1)"
+builder_grok_rc=$?
+set -e
+[[ "$builder_grok_rc" -eq 0 ]] ||
+  fail "builder-grok must be admitted under --role builder (rc=$builder_grok_rc): $builder_grok_out"
+grep -q 'model=builder-grok' <<<"$builder_grok_out" ||
+  fail "builder-grok spawn output lost its model: $builder_grok_out"
+builder_grok_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_grok_start" == 'agent start fixture --kind grok --pane w:p1 --timeout 30000 -- --always-approve -m grok-4.6 --effort xhigh' ]] ||
+  fail "builder-grok must reuse the grok worker argv at effort xhigh: $builder_grok_start"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "grok-hi" ]] ||
+  fail "builder-grok must gate as the scopefuel-known grok-hi spelling"
+python3 - "$ARBITER_INBOX_ROOT/builder-grok-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["owner_lane"] == "builder-grok-lane", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+echo "PASS builder-grok pilot profile reuses grok kind/argv at xhigh"
+
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+set +e
+builder_kimi_out="$(KIMI_CODE_HOME="$TMP/kimi-builder-home" spawn_base builder-kimi --role builder --lane builder-kimi-lane --parent parent-lane --job builder-kimi-job --t T1 2>&1)"
+builder_kimi_rc=$?
+set -e
+[[ "$builder_kimi_rc" -eq 0 ]] ||
+  fail "builder-kimi must be admitted under --role builder (rc=$builder_kimi_rc): $builder_kimi_out"
+grep -q 'model=builder-kimi' <<<"$builder_kimi_out" ||
+  fail "builder-kimi spawn output lost its model: $builder_kimi_out"
+builder_kimi_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_kimi_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-for-coding/k3' ]] ||
+  fail "builder-kimi must reuse the kimi-k3 worker argv verbatim: $builder_kimi_start"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "kimi-k3" ]] ||
+  fail "builder-kimi must gate as the scopefuel-known kimi-k3 spelling"
+python3 - "$ARBITER_INBOX_ROOT/builder-kimi-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["owner_lane"] == "builder-kimi-lane", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+( KIMI_CODE_HOME="$TMP/kimi-builder-home" \
+  expect_exit 2 spawn_base builder-kimi --role builder --lane builder-kimi-lane --parent parent-lane --effort high --job builder-kimi-effort-mutant )
+echo "PASS builder-kimi pilot profile reuses kimi-k3 kind/argv"
+
+# The worker spellings the decision names for the pilot are admissible as
+# builders too, and keep their ordinary worker meaning.
+for pilot_alias in grok grok-hi kimi-k3; do
+  set +e
+  pilot_alias_out="$(KIMI_CODE_HOME="$TMP/kimi-builder-home" spawn_base "$pilot_alias" --role builder --lane "pilot-${pilot_alias}-lane" --parent parent-lane --job "pilot-${pilot_alias}-job" --t T1 2>&1)"
+  pilot_alias_rc=$?
+  set -e
+  [[ "$pilot_alias_rc" -eq 0 ]] ||
+    fail "pilot worker spelling '$pilot_alias' must be admitted under --role builder: $pilot_alias_out"
+  grep -q "model=$pilot_alias" <<<"$pilot_alias_out" ||
+    fail "pilot worker spelling '$pilot_alias' spawn output lost its model: $pilot_alias_out"
+  python3 - "$ARBITER_INBOX_ROOT/pilot-${pilot_alias}-job/events/00001-job.claim.json" "$pilot_alias" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+assert event["payload"]["owner_lane"] == "pilot-%s-lane" % sys.argv[2], event
+PY
+done
+echo "PASS builder-pilot-admits-worker-spellings"
+
+# Profiles outside the allowlist are still refused before the gate, and the
+# refusal enumerates the three pilot profiles by name.
+for rejected in codex-terra codex-luna oc-solar4; do
+  set +e
+  rejected_out="$(spawn_base "$rejected" --role builder --lane builder-lane --parent parent-lane --job "builder-reject-$rejected" --t T1 2>&1)"
+  rejected_rc=$?
+  set -e
+  [[ "$rejected_rc" -eq 2 ]] ||
+    fail "--role builder must still reject $rejected with exit 2, got $rejected_rc: $rejected_out"
+  for named in builder-devin builder-grok builder-kimi; do
+    grep -q "$named" <<<"$rejected_out" ||
+      fail "the --role builder refusal must list $named: $rejected_out"
+  done
+done
+echo "PASS builder-pilot-allowlist-rejects-outsiders-with-named-message"
 
 # R19a keeps the historical captain payload as an inbox-consumer regression
 # input, while the new builder claim must be the exact bytes emitted by the
