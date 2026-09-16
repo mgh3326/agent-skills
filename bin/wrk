@@ -116,7 +116,12 @@ Options:
   --job ID           arbiter job id (default: LABEL)
   --owner NAME       spawning session name, recorded as the arbiter owner_lane
                      (default: default). Lets that session later run
-                     `arbiter status --lane NAME` to find and reclaim its workers.
+                     `arbiter status --lane NAME` to find and reclaim its workers,
+                     and (--role worker only) is where that worker's own
+                     job.completed is delivered directly. It is reclaim/direct-
+                     completion only — it does NOT route job.escalate or
+                     job.joined; see --parent for that, and note --role builder
+                     rejects --owner outright (use --lane instead).
   --role worker|builder (legacy alias: captain)
                      builder requires --lane and --parent, and accepts only
                      builder-opus, builder-sol, builder-astra, builder-devin,
@@ -125,8 +130,15 @@ Options:
                      devin-swe2, grok/grok-hi and kimi-k3 remain accepted.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
-  --parent NAME      parent lane for a builder; completion/escalation events
-                     are routed to this lane.
+  --parent NAME      required for --role builder (spawn dies without it).
+                     A builder's job.escalate and job.joined (PR-submitted)
+                     events are routed to this lane, and ONLY this lane — not
+                     --owner, which builders cannot even set. If a builder's
+                     parent lane isn't registered when the event fires, the
+                     notice has nowhere to go and the parent is never told;
+                     see also the idle-wake suppression reasons in panewire
+                     (parentless_lane, unknown_owner) for the same failure
+                     mode on the idle-detection path.
   --report PATH      report acceptance-criterion path watched by the completion sentinel
   --job-dup-ok       explicit operator override: permit an active duplicate job
                      after an auditable warning. Automation/panewire must not use it.
@@ -1264,6 +1276,7 @@ emit_relay_event() {
   panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
   if [[ -z "$panewire" ]]; then
     warn "panewire not found; relay event left as file only (job=$job kind=$kind)"
+    record_emit_failure "$job" "$kind" "not_found"
     return 0
   fi
   # A wedged socket must not stall `wrk joined`; that call sits in the builder
@@ -1299,8 +1312,28 @@ except subprocess.TimeoutExpired:
   # `|| rc=$?` keeps a non-zero emit from tripping `set -e`; stdout is swallowed
   # so the caller's single OK line stays the only thing on it.
   "${command[@]}" >/dev/null 2>&1 || rc=$?
-  [[ "$rc" -eq 0 ]] ||
+  if [[ "$rc" -ne 0 ]]; then
     warn "panewire emit failed (rc=$rc job=$job kind=$kind); relay event left as file only"
+    record_emit_failure "$job" "$kind" "$rc"
+  fi
+  return 0
+}
+
+# record_emit_failure JOB KIND RC
+#
+# The record file already landed (emit_relay_event is only ever called after
+# that); this durably marks that its *broadcast* to panewire did not, so
+# "how many completions never got relayed" is answerable later from files
+# alone, without touching panewire's own state. Append-only and best-effort:
+# it must never be the thing that makes a fail-open path fail closed, so a
+# write failure here is itself swallowed. Zero effect on the success path —
+# nothing is written when rc=0.
+record_emit_failure() {
+  local job="$1" kind="$2" rc="$3" dir
+  dir="$(wrk_jobs_root)/$job"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s kind=%s rc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$kind" "$rc" \
+    >>"$dir/emit-failures.log" 2>/dev/null || true
   return 0
 }
 

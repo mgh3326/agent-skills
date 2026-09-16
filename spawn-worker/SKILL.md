@@ -293,6 +293,16 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
   `-L live|mock` 은 **실행 레인**이고 `--owner` 는 **스폰 주체**다 — 축이 다르니 섞지 마라.
   모르는 인자는 무시되지 않고 에러가 난다. 수동 기동은 `herdr agent start <유일이름>
   --workspace <ws> --cwd <worktree> --no-focus -- <argv>`.
+  🔴 **`--owner` 는 회수용이지 완료 알림 라우팅이 아니다.** `--owner` 는 §6 조회 키와
+  (`--role worker` 한정) 그 워커 자신의 `job.completed` 직접 전달에만 쓰인다.
+  `job.escalate`·`job.joined`(PR 제출) 는 `--owner` 로 라우팅되지 않는다 — 그건
+  `--role builder --parent PARENT_LANE` 의 `--parent` 몫이고, builder 는 `--owner` 를
+  아예 받지 않는다(`wrk spawn --help` 참조). **`--parent` 없이/틀리게 스폰한 builder 는
+  PR 을 올려도 오케스트레이터가 알 방법이 없다** — 2026-09-16 사고(빌더가 11:01 에 push
+  하고 PR 을 올렸는데 오케스트레이터는 2시간 동안 몰랐다)가 정확히 이 경로였다. `--owner`
+  체크리스트만 따라가면 builder 스폰에서 이 사고가 재현된다: 완료 알림이 필요하면
+  네가 스폰하는 게 worker 인지 builder 인지부터 확인하고, worker 는 `--owner`,
+  builder 는 `--lane`+`--parent` 를 맞춰라.
 - **effort 는 인자로 준다** — 같은 모델도 effort 로 급이 바뀐다(실측: Luna Light 42 → Ultra 75).
   프로필 이름에 effort 를 박지 말고 `--effort` 를 쓴다.
   🔴 effort 별 실사용 건수는 `quota_pool_records.profile` 이 아니라 events payload 의
