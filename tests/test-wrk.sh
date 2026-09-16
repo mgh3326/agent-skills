@@ -1638,6 +1638,8 @@ assert got["--report-last-line"] == "R20 report terminal line ", got
 assert not {"--reason", "--question", "--pr", "--head"} & set(got), got
 PY
 grep -qxF "OK job=r20-done report=$R20_REPORT" <<<"$r20_done_out"
+# A19 — a successful emit must leave zero trace in the failure marker.
+[[ ! -e "$R20_INBOX/r20-done/emit-failures.log" ]]
 echo "PASS r20-emit-argv-matches-done-record"
 
 # TW3 — builder escalation carries --question, joined carries --pr/--head, and both carry
@@ -1681,6 +1683,10 @@ grep -qxF "OK job=r20-absent report=$R20_REPORT" <<<"$r20_absent_out"
 grep -qxF 'wrk: warning: handoffkeep not found; report document not uploaded (job=r20-absent)' "$R20_ABSENT_ERR"
 grep -qxF 'wrk: warning: panewire not found; relay event left as file only (job=r20-absent kind=job.completed)' "$R20_ABSENT_ERR"
 [[ "$(wc -l <"$R20_ABSENT_ERR" | tr -d ' ')" -eq 2 ]]
+# A19 — a warning on stderr is not durable; the failure to relay must be
+# discoverable later from files alone, without re-reading logs.
+[[ -f "$R20_INBOX/r20-absent/emit-failures.log" ]]
+grep -q 'kind=job.completed rc=not_found' "$R20_INBOX/r20-absent/emit-failures.log"
 echo "PASS r20-missing-panewire-warns-without-changing-exit-or-stdout"
 
 # TW5 — emit fails: exit 0, the record is still written, the warning quotes rc.
@@ -1697,6 +1703,10 @@ grep -qxF "OK job=r20-fail report=$R20_REPORT" <<<"$r20_fail_out"
 grep -qxF 'wrk: warning: handoffkeep not found; report document not uploaded (job=r20-fail)' "$R20_FAIL_ERR"
 grep -qxF 'wrk: warning: panewire emit failed (rc=3 job=r20-fail kind=job.completed); relay event left as file only' "$R20_FAIL_ERR"
 [[ "$(wc -l <"$R20_FAIL_ERR" | tr -d ' ')" -eq 2 ]]
+# A19 — same durable-failure trace as TW4, this time for a non-zero rc rather
+# than a missing binary.
+[[ -f "$R20_INBOX/r20-fail/emit-failures.log" ]]
+grep -q 'kind=job.completed rc=3' "$R20_INBOX/r20-fail/emit-failures.log"
 echo "PASS r20-failed-emit-warns-with-rc-without-changing-exit"
 
 # TW6 — a wedged emit must not stall wrk: `wrk joined` runs inside the captain
@@ -1733,6 +1743,9 @@ set -e
 [[ "$r20_lost_rc" -eq 0 ]]
 find "$R20_LOST_INBOX/r20-lost/events" -name '*job.lost.json' | grep -q .
 [[ ! -e "$R20_LOST_LOG" ]]
+# A19 — emit_relay_event is never called for job.lost, so no failure marker
+# either.
+[[ ! -e "$R20_LOST_INBOX/r20-lost/emit-failures.log" ]]
 echo "PASS r20-job-lost-is-never-emitted"
 
 # TW8 — the stdout contract is exactly what it was before emit existed: one
