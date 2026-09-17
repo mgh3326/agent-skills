@@ -30,7 +30,17 @@ class H(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        if self.path == "/split" and auth:
+            # Flush through the middle of the credential so it straddles a
+            # downstream read boundary — the scrubber must still redact it.
+            import time
+            cut = body.find(auth.encode()) + len(auth) // 2
+            self.wfile.write(body[:cut])
+            self.wfile.flush()
+            time.sleep(0.05)
+            self.wfile.write(body[cut:])
+        else:
+            self.wfile.write(body)
 
     do_GET = do_POST = _h
 

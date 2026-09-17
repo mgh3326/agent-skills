@@ -441,6 +441,59 @@ if grep -q 'fixture-openrouter-key' "$UNION_AUTH"; then
 fi
 echo "PASS oc-union-openrouter-config"
 
+# T-a 구조적 경계(Darwin): pane 에 sandbox alias 가 심어지고, 생성된 SBPL 이
+# 홈 아래 읽기를 allowlist 외 전면 거부하는지 실제 커널에 물어본다. 프로브 대상은
+# 합성 canary 뿐 — 실키 파일을 테스트에서 절대 건드리지 않는다.
+if [[ "$(uname -s)" == Darwin ]] && command -v sandbox-exec >/dev/null 2>&1; then
+  grep -q 'pane send-text .*alias opencode=.*sandbox-exec -f' "$TMP/herdr.log" || {
+    echo "FAIL oc-union: sandbox alias not planted in pane"; exit 1; }
+  OCU_SB=""
+  for _f in "$TMP"/oc-union.*/opencode.sb; do [[ -f "$_f" ]] && OCU_SB="$_f"; done
+  unset _f
+  [[ -s "$OCU_SB" ]] || { echo "FAIL oc-union: sandbox profile not generated"; exit 1; }
+  # canary 는 키 저장소와 같은 디렉터리($HOME/.config) 아래에 둔다 — 그래야
+  # "저장소 파일이 어떤 표기로도 안 읽힌다"는 증명이 그대로 적용된다.
+  OCU_CANARY="$HOME/.config/oc-union-sbtest-canary-$$.txt"
+  OCU_CANARY_BASE="oc-union-sbtest-canary-$$.txt"
+  printf 'CANARY\n' >"$OCU_CANARY"
+  # ④ 허용 루트(worktree) 안에 만든 심링크 — 문자열 매칭 엔진이라면 이 우회가
+  # 통과한다. 커널 해석 기반이면 목표 경로가 deny 되어 막혀야 한다.
+  OCU_WT_LINK="$ROOT/.oc-union-sbtest-link-$$"
+  ln -sf "$OCU_CANARY" "$OCU_WT_LINK"
+  ocu_sandbox_cleanup() { rm -f "$OCU_CANARY" "$OCU_WT_LINK" "$TMP/ocu-canary-hl"; }
+  for probe in \
+    "$OCU_CANARY" \
+    "$OCU_WT_LINK" \
+    "$HOME/.config/./$OCU_CANARY_BASE" \
+    "$HOME/.config/../.config/$OCU_CANARY_BASE" \
+    "$(printf '%s' "$OCU_CANARY" | tr '[:upper:]' '[:lower:]')" \
+    "/System/Volumes/Data$OCU_CANARY"
+  do
+    if sandbox-exec -f "$OCU_SB" /bin/cat "$probe" >/dev/null 2>&1; then
+      echo "FAIL oc-union sandbox: canary readable via $probe"; ocu_sandbox_cleanup; exit 1
+    fi
+  done
+  # ⑤ 샌드박스 안에서의 하드링크 생성 자체가 막혀야 한다(소스 lookup 거부)
+  if sandbox-exec -f "$OCU_SB" /bin/ln "$OCU_CANARY" "$TMP/ocu-canary-hl" >/dev/null 2>&1; then
+    echo "FAIL oc-union sandbox: hardlink to canary created"; ocu_sandbox_cleanup; exit 1
+  fi
+  # 허용 루트는 살아 있어야 한다 — worktree(실행 CWD) 읽기 확인
+  sandbox-exec -f "$OCU_SB" /bin/ls "$ROOT" >/dev/null 2>&1 || {
+    echo "FAIL oc-union sandbox: allowlisted worktree unreadable"; ocu_sandbox_cleanup; exit 1; }
+  # 뮤턴트 검증 — ~/.config 를 허용한 프로필로는 같은 canary 가 읽혀야 한다.
+  # 이게 읽히지 않으면 위 거부들이 아무것도 재지 않은 것이다.
+  OCU_SB_MUTANT="$TMP/ocu-mutant.sb"
+  sed "s|^  ))|    (require-not (subpath \"$HOME/.config\"))\\
+  ))|" "$OCU_SB" >"$OCU_SB_MUTANT"
+  if ! sandbox-exec -f "$OCU_SB_MUTANT" /bin/cat "$OCU_CANARY" >/dev/null 2>&1; then
+    echo "FAIL oc-union sandbox: mutant profile (allow ~/.config) did not read canary — probes measure nothing"
+    ocu_sandbox_cleanup; exit 1
+  fi
+  ocu_sandbox_cleanup
+  rm -f "$OCU_SB_MUTANT"
+  echo "PASS oc-union-sandbox-deny"
+fi
+
 # fail-closed at spawn — 키 파일이 없으면 프록시는 뜨지 않고 스폰도 죽는다
 if ( UNION_OPENROUTER_KEY_FILE="$TMP/absent-keys.env" spawn_base oc-union ) >/dev/null 2>&1; then
   echo "FAIL oc-union: spawn succeeded with unreadable key file"; exit 1
@@ -525,6 +578,32 @@ if grep -q 'fx-proxy-secret-DONOTLEAK' <<<"$ocu_body"; then
   echo "FAIL oc-union proxy: upstream-echoed key reached the lane"; exit 1; fi
 grep -q '<redacted>' <<<"$ocu_body" || {
   echo "FAIL oc-union proxy: reflected key not scrubbed"; exit 1; }
+# 청크 경계에 걸친 시크릿도 스크럽돼야 한다 — 스텁 /split 은 자격 문자열
+# 한가운데서 두 번에 나눠 쓴다.
+ocu_body="$(curl -s -X POST \
+  -H 'Authorization: Bearer fx-lane-token-7f3a' \
+  "http://127.0.0.1:$OCU_PORT/split" -d '{}')"
+if grep -q 'fx-proxy-secret-DONOTLEAK\|fx-lane-token' <<<"$ocu_body"; then
+  echo "FAIL oc-union proxy: chunk-split secret reached the lane"; exit 1; fi
+grep -q '<redacted>' <<<"$ocu_body" || {
+  echo "FAIL oc-union proxy: split secret not scrubbed"; exit 1; }
+# T-b 상한 — 레인 토큰이 있어도 허용 모델 외 요청은 프록시가 403 으로 거부하고
+# upstream 에 닿지 않는다.
+ocu_seen_before="$(wc -l <"$OCU_STUB_STATE/seen.jsonl" | tr -d ' ')"
+ocu_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Authorization: Bearer fx-lane-token-7f3a' \
+  "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" \
+  -d '{"model":"some-other-model"}')"
+[[ "$ocu_code" == "403" ]] || {
+  echo "FAIL oc-union proxy: non-allowlisted model got $ocu_code"; exit 1; }
+[[ "$(wc -l <"$OCU_STUB_STATE/seen.jsonl" | tr -d ' ')" == "$ocu_seen_before" ]] || {
+  echo "FAIL oc-union proxy: blocked-model request reached upstream"; exit 1; }
+ocu_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Authorization: Bearer fx-lane-token-7f3a' \
+  "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" \
+  -d '{"model":"stealth/union-alpha"}')"
+[[ "$ocu_code" == "200" ]] || {
+  echo "FAIL oc-union proxy: allowlisted model got $ocu_code"; exit 1; }
 # ③ 오류 경로 포함 키·토큰 무기록 — upstream 죽인 뒤의 502 응답·stderr·stdout 전부
 kill "$OCU_STUB_PID" 2>/dev/null || true
 wait "$OCU_STUB_PID" 2>/dev/null || true
@@ -543,6 +622,15 @@ if curl -s -m 3 -o /dev/null -X POST -H 'Authorization: Bearer fx-lane-token-7f3
   echo "FAIL oc-union proxy: request succeeded after proxy death"; exit 1
 fi
 echo "PASS oc-union-proxy-lane-gate"
+
+# spawn 테스트가 띄운 lane 프록시(합성키 보유)를 pidfile 로 거둔다 — 스위트가
+# 키-보유 프로세스를 흘리고 가면 안 된다.
+for _p in "$TMP"/oc-union.*/proxy.pid; do
+  [[ -s "$_p" ]] || continue
+  read -r _pid <"$_p" || true
+  [[ "$_pid" =~ ^[0-9]+$ ]] && kill "$_pid" 2>/dev/null || true
+done
+unset _p _pid
 
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \

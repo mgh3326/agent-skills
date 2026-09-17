@@ -1239,6 +1239,9 @@ opts = cfg.setdefault("provider", {}).setdefault("openrouter", {}) \
     .setdefault("options", {})
 opts["apiKey"] = "{env:OC_UNION_PROXY_TOKEN}"
 opts["baseURL"] = "http://127.0.0.1:%s/api/v1" % port
+# Title/summary agents pick a "small" model — pin it to the allowlisted one so
+# those calls pass the proxy's model gate instead of bouncing as 403 noise.
+cfg["small_model"] = "openrouter/stealth/union-alpha"
 json.dump(cfg, sys.stdout, indent=2)
 PY
     then
@@ -1265,7 +1268,14 @@ PY
     warn "oc-union: no sandbox-exec on $(uname -s) — lane runs without the read sandbox (proxy+token boundary only)"
   fi
 
-  PROFILE_ENV=(--env "OPENCODE_CONFIG=$UNION_OC_CONFIG" --env "OC_UNION_PROXY_TOKEN=$token")
+  # XDG roots move into the lane state dir: opencode mkdirs its config dir at
+  # boot (a denied $HOME stat makes that crash), and per-lane data/state keeps
+  # this lane's sessions out of — and other lanes' sessions away from — the
+  # operator's shared opencode stores.
+  PROFILE_ENV=(--env "OPENCODE_CONFIG=$UNION_OC_CONFIG" --env "OC_UNION_PROXY_TOKEN=$token"
+    --env "XDG_CONFIG_HOME=$OC_UNION_PROXY_STATE/xdg-config"
+    --env "XDG_DATA_HOME=$OC_UNION_PROXY_STATE/xdg-data"
+    --env "XDG_STATE_HOME=$OC_UNION_PROXY_STATE/xdg-state")
   unset token
 }
 
@@ -1278,7 +1288,7 @@ oc_union_write_sandbox() {
   resolved_cwd="$(cd "$cwd" 2>/dev/null && pwd -P || printf '%s' "$cwd")"
   {
     printf '(version 1)\n(allow default)\n'
-    printf ';; oc-union lane: deny every read under $HOME except the allowlist.\n'
+    printf ';; oc-union lane: deny every read under the user home except the allowlist.\n'
     printf ';; Paths below are evaluated after kernel resolution — aliases do not exist.\n'
     printf '(deny file-read*\n  (require-all\n    (subpath "%s")\n' "$HOME"
     local p
