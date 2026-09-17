@@ -26,6 +26,12 @@ printf '%s\n' 'fixture prompt' >"$PROMPT"
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 
+# oc-union: OpenRouter 키는 스폰 시점에 파일에서 읽는다 — suite 전체가 실파일 대신
+# fixture 사용(실키 값이 herdr.log 로 새는 것도 방지). oc-ox 전례와 같은 형식.
+export UNION_OPENROUTER_KEY_FILE="$TMP/ai-keys-fixture.env"
+# 실파일 형식 미러: export + 따옴표 + 인라인 주석(ROB-1313 실사고 회귀 가드)
+printf 'export OPENROUTER_API_KEY="fixture-openrouter-key"  # https://openrouter.ai/keys\n' >"$UNION_OPENROUTER_KEY_FILE"
+
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
@@ -390,7 +396,7 @@ profiles=(
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
-  "oc-minimax-m3:oc-minimax-m3" "oc-solar4:oc-solar4" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
+  "oc-minimax-m3:oc-minimax-m3" "oc-solar4:oc-solar4" "oc-union:oc-glm" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
   "cc-qwen38:cc-qwen38" "cc-glm:cc-glm"
   "cc-dsflash:cc-qwen38" "cc-dspro:cc-qwen38" "cc-glm53:cc-qwen38"
   )
@@ -402,6 +408,14 @@ for pair in "${profiles[@]}"; do
   spawn_base "$runtime" >/dev/null
   [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "$expected" ]]
 done
+: >"$TMP/herdr.log"
+spawn_base oc-union >/dev/null
+grep -q -- '--model openrouter/stealth/union-alpha' "$TMP/herdr.log"
+grep -q -- '--env OPENROUTER_API_KEY=fixture-openrouter-key' "$TMP/herdr.log"
+grep -q -- '--env OPENCODE_CONFIG=' "$TMP/herdr.log"
+grep -q -- 'oc-union.secret-path-deny.json' "$TMP/herdr.log"
+echo "PASS oc-union-openrouter-env"
+
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
