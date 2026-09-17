@@ -27,8 +27,11 @@ export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 
 # oc-union: OpenRouter 키는 스폰 시점에 파일에서 읽는다 — suite 전체가 실파일 대신
-# fixture 사용(실키 값이 herdr.log 로 새는 것도 방지). oc-ox 전례와 같은 형식.
+# fixture 사용(실키 값이 herdr.log 로 새는 것도 방지). 키는 pane env 가 아니라
+# 생성된 0600 레인 config(auth.json)의 provider.options.apiKey 로만 나간다 —
+# 도구 자식 env 상속으로 모델이 볼 수 있는 경로를 닫기 위함.
 export UNION_OPENROUTER_KEY_FILE="$TMP/ai-keys-fixture.env"
+export UNION_OC_CONFIG_DIR="$TMP/oc-union-conf"
 # 실파일 형식 미러: export + 따옴표 + 인라인 주석(ROB-1313 실사고 회귀 가드)
 printf 'export OPENROUTER_API_KEY="fixture-openrouter-key"  # https://openrouter.ai/keys\n' >"$UNION_OPENROUTER_KEY_FILE"
 
@@ -409,12 +412,44 @@ for pair in "${profiles[@]}"; do
   [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "$expected" ]]
 done
 : >"$TMP/herdr.log"
+rm -rf "$UNION_OC_CONFIG_DIR"
 spawn_base oc-union >/dev/null
 grep -q -- '--model openrouter/stealth/union-alpha' "$TMP/herdr.log"
-grep -q -- '--env OPENROUTER_API_KEY=fixture-openrouter-key' "$TMP/herdr.log"
 grep -q -- '--env OPENCODE_CONFIG=' "$TMP/herdr.log"
-grep -q -- 'oc-union.secret-path-deny.json' "$TMP/herdr.log"
-echo "PASS oc-union-openrouter-env"
+grep -q -- 'oc-union' "$TMP/herdr.log"
+# 키는 pane env 가 아니라 생성 config 로만 나간다 — herdr.log 에 env 주입이 없어야 함
+if grep -q -- 'OPENROUTER_API_KEY' "$TMP/herdr.log"; then
+  echo "FAIL oc-union: key leaked into pane env argv"
+  exit 1
+fi
+UNION_AUTH="$UNION_OC_CONFIG_DIR/auth.json"
+[[ -f "$UNION_AUTH" ]] || { echo "FAIL oc-union: generated config missing"; exit 1; }
+# 0600 — stat -f(BSD)/-c(GNU) 양쪽 대응
+[[ "$(stat -f%Lp "$UNION_AUTH" 2>/dev/null || stat -c%a "$UNION_AUTH")" == "600" ]] || {
+  echo "FAIL oc-union: generated config not 0600"; exit 1; }
+grep -q '"apiKey": "fixture-openrouter-key"' "$UNION_AUTH"
+echo "PASS oc-union-openrouter-config"
+
+# oc-union 키 추출 — 토큰 파일 source 금지 하드룰(2026-09-07 실사고)의 텍스트 추출을
+# 검증한다. 4종+1 합성 픽스처(인라인 주석·따옴표·export 접두·앞뒤 공백·공백없는 주석)
+# 각각에서 정확히 키 값만 추출돼야 한다. 실키는 절대 쓰지 않는다.
+union_key_fixture() {
+  printf '%s\n' "$1" >"$UNION_OPENROUTER_KEY_FILE"
+  rm -rf "$UNION_OC_CONFIG_DIR"
+  : >"$TMP/herdr.log"
+  spawn_base oc-union >/dev/null
+  grep -q -- "\"apiKey\": \"$2\"" "$UNION_OC_CONFIG_DIR/auth.json" || {
+    echo "FAIL oc-union key extract: [$1] want [$2]"
+    exit 1
+  }
+}
+union_key_fixture 'export OPENROUTER_API_KEY="fx-union-a1"  # https://openrouter.ai/keys' 'fx-union-a1'
+union_key_fixture "OPENROUTER_API_KEY='fx-union-b2'" 'fx-union-b2'
+union_key_fixture 'export OPENROUTER_API_KEY=fx-union-c3' 'fx-union-c3'
+union_key_fixture '   export   OPENROUTER_API_KEY   =   "fx-union-d4"   ' 'fx-union-d4'
+union_key_fixture 'OPENROUTER_API_KEY=fx-union-e5 # tail without space' 'fx-union-e5'
+printf 'export OPENROUTER_API_KEY="fixture-openrouter-key"  # https://openrouter.ai/keys\n' >"$UNION_OPENROUTER_KEY_FILE"
+echo "PASS oc-union-key-extract-variants"
 
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
