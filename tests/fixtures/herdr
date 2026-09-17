@@ -220,6 +220,13 @@ case "${1:-}" in
     printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w"}]}}'
     ;;
   pane)
+    # oc-union: wrk 가 send-text 로 심는 sandbox alias 는 실행 전에 마커 파일을
+    # 만든다. 실 pane 셸이 그 alias 를 실행했다고 가정해 마커를 재현한다 —
+    # 이래야 spawn_cmd 의 sandbox-armed fail-closed 검사가 fixture 에서도 의미를 갖는다.
+    if [[ "${2:-}" == send-text ]]; then
+      _mk="$(printf '%s' "${4:-}" | sed -n 's/.*touch "\([^"]*\)".*/\1/p')"
+      if [[ -n "$_mk" ]]; then mkdir -p "$(dirname "$_mk")" && touch "$_mk"; fi
+    fi
     printf 'fixture pane %s\nACTUAL SCREEN LAST LINE\n' "${3:-unknown}"
     ;;
 esac

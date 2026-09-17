@@ -542,14 +542,15 @@ OCU_STUB_STATE="$TMP/ocu-stub-state"; mkdir -p "$OCU_STUB_STATE"
 printf 'export OPENROUTER_API_KEY="fx-proxy-secret-DONOTLEAK"\n' >"$TMP/ocu-keys.env"
 python3 "$OCU_STUB_FIXTURE" "$OCU_STUB_STATE" &
 OCU_STUB_PID=$!
-for _ in $(seq 100); do [[ -s "$OCU_STUB_STATE/stub.port" ]] && break; sleep 0.05; done
+for _ in $(seq 200); do [[ -s "$OCU_STUB_STATE/stub.port" ]] && break; sleep 0.05; done
+[[ -s "$OCU_STUB_STATE/stub.port" ]] || { echo "FAIL oc-union stub: no portfile"; exit 1; }
 OCU_SPORT="$(cat "$OCU_STUB_STATE/stub.port")"
 OC_UNION_PROXY_TOKEN="fx-lane-token-7f3a" python3 "$OCU_PROXY" \
   --key-file "$TMP/ocu-keys.env" --state-dir "$OCU_STATE" \
   --upstream "127.0.0.1:$OCU_SPORT" --upstream-http \
   >"$OCU_STATE/proxy.out" 2>"$OCU_STATE/proxy.err" &
 OCU_PROXY_PID=$!
-for _ in $(seq 100); do [[ -s "$OCU_STATE/proxy.port" ]] && break; sleep 0.05; done
+for _ in $(seq 200); do [[ -s "$OCU_STATE/proxy.port" ]] && break; sleep 0.05; done
 [[ -s "$OCU_STATE/proxy.port" ]] || { echo "FAIL oc-union proxy: no portfile"; exit 1; }
 OCU_PORT="$(awk '{print $1; exit}' "$OCU_STATE/proxy.port")"
 [[ "$(curl -s "http://127.0.0.1:$OCU_PORT/healthz")" == "ok" ]] || {

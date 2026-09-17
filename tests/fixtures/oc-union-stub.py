@@ -7,10 +7,20 @@ Not executable on purpose: CI shellcheck scans only executable fixtures.
 """
 import json
 import os
+import socketserver
 import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 state = sys.argv[1]
+
+
+class S(HTTPServer):
+    # HTTPServer.server_bind does getfqdn() on the bind address — a reverse-DNS
+    # lookup that stalls on hosts without a PTR answer (CI runners). Skip it.
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = "localhost"
+        self.server_port = self.server_address[1]
 
 
 class H(BaseHTTPRequestHandler):
@@ -48,7 +58,7 @@ class H(BaseHTTPRequestHandler):
         pass
 
 
-srv = HTTPServer(("127.0.0.1", 0), H)
+srv = S(("127.0.0.1", 0), H)
 with open(os.path.join(state, "stub.port"), "w") as f:
     f.write(str(srv.server_address[1]))
 srv.serve_forever()

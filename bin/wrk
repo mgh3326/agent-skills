@@ -2921,7 +2921,7 @@ print(value if isinstance(value, str) else "")
   # alias cannot be planted the spawn must die rather than run unsandboxed.
   if [[ -n "${OC_UNION_SB_PROFILE:-}" ]]; then
     "$HERDR" pane send-text "$PANE" \
-      "alias opencode='sandbox-exec -f \"$OC_UNION_SB_PROFILE\" \"$OC_UNION_OPENCODE_BIN\"'" >/dev/null \
+      "alias opencode='touch \"$OC_UNION_PROXY_STATE/sandbox-armed\"; sandbox-exec -f \"$OC_UNION_SB_PROFILE\" \"$OC_UNION_OPENCODE_BIN\"'" >/dev/null \
       || die "oc-union: failed to plant sandbox alias in pane $PANE"
     "$HERDR" pane send-keys "$PANE" return >/dev/null \
       || die "oc-union: failed to plant sandbox alias in pane $PANE"
@@ -2929,6 +2929,12 @@ print(value if isinstance(value, str) else "")
   fi
 
   "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
+  # The alias leaves a marker before exec — if a future herdr invokes opencode
+  # in a way that skips alias expansion (`command opencode`, absolute path),
+  # the lane would run unsandboxed: die instead of opening T-a back up.
+  if [[ -n "${OC_UNION_SB_PROFILE:-}" && ! -f "$OC_UNION_PROXY_STATE/sandbox-armed" ]]; then
+    die "oc-union: sandbox alias did not fire (pane $PANE) — refusing an unsandboxed lane"
+  fi
   sleep_for "$BOOT_SETTLE"
   if [[ "$PROFILE_KIND" == kimi ]]; then
     VISIBLE_SCREEN=""
