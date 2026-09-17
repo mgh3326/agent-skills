@@ -1182,7 +1182,9 @@ oc_union_setup() {
   OC_UNION_PROXY_STATE="${OC_UNION_PROXY_STATE:-$(mktemp -d "${OC_UNION_STATE_ROOT:-${TMPDIR:-/tmp}}/oc-union.XXXXXX")}"
   chmod 700 "$OC_UNION_PROXY_STATE" 2>/dev/null || true
   local token
-  token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+    || die "oc-union: lane token generation failed"
+  [[ -n "$token" ]] || die "oc-union: lane token generation produced empty token"
   # The token travels through env on both sides — never argv (ps) or disk.
   OC_UNION_PROXY_TOKEN="$token" python3 "$proxy_bin" \
     --key-file "$UNION_KEY_FILE" --state-dir "$OC_UNION_PROXY_STATE" \
@@ -1198,13 +1200,16 @@ oc_union_setup() {
       [[ "$port" =~ ^[0-9]+$ ]] && break
       port=""
     fi
-    if ! kill -0 "$UNION_PROXY_PID" 2>/dev/null; then
-      die "oc-union proxy exited during startup — see $OC_UNION_PROXY_STATE/proxy.log"
+    # kill -0 reports zombies as alive — check the process state too, and on
+    # death surface the scrubbed proxy log tail so CI failures are diagnosable.
+    if ! kill -0 "$UNION_PROXY_PID" 2>/dev/null \
+      || ps -o stat= -p "$UNION_PROXY_PID" 2>/dev/null | grep -q '^Z'; then
+      die "oc-union proxy exited during startup — $(tail -3 "$OC_UNION_PROXY_STATE/proxy.log" 2>/dev/null || printf 'no proxy.log')"
     fi
     sleep 0.1
     tries=$((tries + 1))
   done
-  [[ -n "$port" ]] || die "oc-union proxy did not publish $OC_UNION_PROXY_STATE/proxy.port"
+  [[ -n "$port" ]] || die "oc-union proxy did not publish $OC_UNION_PROXY_STATE/proxy.port — $(tail -3 "$OC_UNION_PROXY_STATE/proxy.log" 2>/dev/null || printf 'no proxy.log')"
   # Lane config lives in the proxy state dir (TMPDIR, outside $HOME) — never in
   # ~/.config/oc-union, which already holds an auth.json with a real key.
   # apiKey is a literal {env:} placeholder; baseURL points at the proxy. The

@@ -34,6 +34,7 @@ import http.client
 import json
 import os
 import re
+import socketserver
 import sys
 import threading
 import time
@@ -78,6 +79,19 @@ def extract_key(key_file: str) -> str:
             if token:
                 return token
     raise SystemExit(f"OPENROUTER_API_KEY not found in {key_file}")
+
+
+class _Server(ThreadingHTTPServer):
+    """HTTPServer.server_bind does a reverse-DNS getfqdn on the bind address —
+    that can stall for many seconds on hosts with no PTR answer (seen on CI
+    runners, where the proxy looked alive but never published its port file).
+    Loopback needs no name resolution."""
+
+    def server_bind(self):
+        socketserver.TCPServer.server_bind(self)
+        host, port = self.server_address[:2]
+        self.server_name = "localhost"
+        self.server_port = port
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -263,7 +277,7 @@ def main() -> int:
 
     state = Path(args.state_dir)
     state.mkdir(parents=True, exist_ok=True)
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server = _Server(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     (state / "proxy.port").write_text(f"{port} {os.getpid()}\n")
     (state / "proxy.pid").write_text(f"{os.getpid()}\n")

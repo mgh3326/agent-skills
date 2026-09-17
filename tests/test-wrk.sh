@@ -628,7 +628,7 @@ echo "PASS oc-union-proxy-lane-gate"
 for _p in "$TMP"/oc-union.*/proxy.pid; do
   [[ -s "$_p" ]] || continue
   read -r _pid <"$_p" || true
-  [[ "$_pid" =~ ^[0-9]+$ ]] && kill "$_pid" 2>/dev/null || true
+  if [[ "$_pid" =~ ^[0-9]+$ ]]; then kill "$_pid" 2>/dev/null || true; fi
 done
 unset _p _pid
 
