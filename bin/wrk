@@ -1083,8 +1083,10 @@ resolve_profile() {
       unset _union_line
       [[ -n "$UNION_KEY" ]] || die "OPENROUTER_API_KEY not found in $UNION_KEY_FILE"
       # 키를 pane env 로 넘기지 않고 생성 config(apiKey 필드)로만 넘긴다. 파일은
-      # umask 077 로 만들어 mv 로 원자적 게시하고, 생성 디렉터리(~ 및 절대경로 양형태)를
-      # read·edit·bash deny 에 추가해 모델이 도구로 읽는 경로도 닫는다.
+      # umask 077 로 만들어 mv 로 원자적 게시하고, 생성 디렉터리를 read·edit·bash
+      # deny 에 추가해 모델이 도구로 읽는 경로도 닫는다. deny 패턴은 절대·`~`·
+      # 상대(프로젝트 안쪽 표기) 세 표기를 모두 덮는다 — read 권한은 cwd 안의
+      # 경로를 상대 형태로 매칭하므로 basename·`**` 형태 없이는 우회된다(실측).
       UNION_OC_CONFIG_DIR="${UNION_OC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/oc-union}"
       UNION_OC_CONFIG="$UNION_OC_CONFIG_DIR/auth.json"
       (
@@ -1097,11 +1099,14 @@ resolve_profile() {
 import json, os, sys
 cfg = json.load(open(sys.argv[1]))
 d = sys.argv[2]
-pats = [d + "*", d + "/*"]
+base = os.path.basename(d.rstrip("/"))
+pats = [d, d + "/*", d + "/**",
+        "**/" + base, "**/" + base + "/*", "**/" + base + "/**",
+        base, base + "/*", base + "/**"]
 home = os.path.expanduser("~")
 if d.startswith(home + "/"):
     t = "~/" + d[len(home) + 1:]
-    pats += [t + "*", t + "/*"]
+    pats += [t, t + "/*", t + "/**"]
 for sect in ("read", "edit", "bash"):
     cfg["permission"].setdefault(sect, {})
     for p in pats:
