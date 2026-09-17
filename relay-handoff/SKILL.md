@@ -186,6 +186,34 @@ auto-compact 직후/resume 상태 세션은 주입을 조용히 삼킴 — 유�
 `[재주입 — 이전 미션 유실]` 명시. 에이전트→orch 방향 보고는 send 금지(사용자 타이핑과
 충돌) — 파일 인박스 `~/work/herdr-inbox/` 사용.
 
+### 3-2. 하네스별 제출 마커 표 (측정한 것만)
+
+🔴 **안전 제약은 '소비됨'까지 확인한다. 대기만으로 착지라 하지 마라.**
+제출됨(대기열) ≠ 소비됨(모델이 읽음) — 일반 지시는 대기로 충분하지만 안전 제약은
+턴이 끝나 모델이 읽을 때까지 효력이 없다(2026-09-17 실사고: devin 워커의 `○` 대기
+문장을 화면에 보인다는 이유로 착지로 판정 → 긴 턴 중이라 모델에 10분간 미도달,
+Enter 제출 후 `❭`로 전이).
+🔴 **금지·안전 제약은 초기 브리프에 넣는다. 진행 중 주입은 소비될 때까지 효력이
+없다** — 긴 턴 중에는 수십 분 미도달이 실측됐다(09-17: 금지 10분·정정 24분·57분
+단일 턴).
+
+위 bash 주석의 제출 검증 문구(`[Pasted text #N]` 칩·`Press up to edit queued
+messages`·상태 전이)는 **claude 행**의 내용이다. 다른 하네스는 아래 표를 본다.
+각 칸은 pane 기록(`herdr agent read --source recent-unwrapped`)에서 실제 관측된
+원문만 적는다 — 관측된 적 없는 칸은 `미측정`이며 문서·기억·추정으로 채우지 않는다.
+**착지·완료 판정은 `agent_status` 등 상태 문자열이 아니라 화면(`--source visible`
+또는 recent-unwrapped 의 진행 표시)으로 한다** — 상태 문자열은 아래 '상태 문자열
+신뢰도' 열의 성질을 본다.
+
+| 하네스 | 미제출(컴포저에 남음) | 제출됨·대기(미소비) | 소비됨 | 대기 중 즉시 제출 방법 · 중복 위험 | 상태 문자열 신뢰도 | 근거(하네스·시각·마커 원문) |
+|---|---|---|---|---|---|---|
+| claude | ① `[Pasted text #N +M lines]` 칩 잔존 ② 주입 원문이 컴포저에 그대로(`❯ <텍스트>` — idle 제안도 같은 자리에 렌더되고 agent read는 색을 버려 구분 불가) | `Press up to edit queued messages` + 칩 없음 | 전사에 `❯ <메시지>` 줄로 남고 ⏺ 응답이 이어짐 / idle→working 전이 | 대기 중 return 재전송 금지(중복 위험 — 기존 §3 주석). 즉시 제출 키·중복 소비 실측: 미측정 | 진행 표시(스피너·`⎿ Running…`)는 `visible`에만 있고 `recent-unwrapped`에는 없음 | 미제출·대기: 기존 §3 주석의 실측 기록(2026-08-02·08-04) — 09-17 현재 pane 미관측. 미제출 추가: claude pane 20:51 컴포저 `❯ <메시지>`(done 상태). 소비: claude pane 전사 `❯ <메시지>` + ⏺ 응답(09-17) |
+| devin | 미측정(관측된 빈 컴포저 placeholder: `❭ Ask Devin to build features, fix bugs, or work on your code` / `❭ Guide Devin while it works`) | `── N queued ── ↑ edit · ↵ send now` + `○ <메시지>` + 컴포저 `❭ Press Enter to send queued messages now` | 전사에 `❭ <메시지>` 줄로 남음 | 대기 중 Enter → 즉시 제출(힌트 문구 자체가 지시). 같은 메시지 두 번 소비 증거: 미측정 | 긴 단일 턴 중 `agent_status=done`/`idle` 오표시 — 실측: `Thinking 56m52s` 중 done·`Writing …` 중 done(09-17 20:59~21:04) | 대기: devin pane 20:51·20:52 `○ <메시지>` + `── 1 queued ── ↑ edit · ↵ send now` + `❭ Press Enter to send queued messages now`. 소비: devin pane 전사 `❭ <메시지>` 다수(09-17) |
+| codex | 미측정(관측된 빈 컴포저: `› Ask Codex to do anything`) | `• Messages to be submitted after next tool call (press esc to interrupt and send immediately)` + `↳ <메시지>` | 전사에 `› <메시지>` 줄로 남고 응답이 이어짐 | 대기 중 esc → 즉시 제출(힌트 문구). 같은 메시지 두 번 소비 증거: 미측정 | 오표시 미관측 — 20:51·21:04 `agent list`↔화면 일치(idle 3건·working 2건) | 대기: codex pane 20:52 `↳ <메시지>` + `• Messages to be submitted after next tool call (press esc to interrupt and send immediately)`. 소비: codex pane 전사 `› <메시지>` → 응답(09-17, 2pane) |
+| kiro | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 현재 pane 없음 — `herdr agent list` 20:51 kiro 0건 |
+| opencode(oc-*) | 미측정(관측된 빈 컴포저: 좌측 `┃` 입력란) | 미측정 | 전사 좌측에 `┃ <메시지>` + 응답 | 미측정 | `idle`↔idle 화면 일치 관측(21:04) — 진행 중 상태는 미측정 | 소비: opencode pane 20:52 전사 `┃ <메시지>` → 응답 |
+| kimi | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 현재 pane 없음 — `herdr agent list` 20:51 kimi 0건 |
+
 ## 4. 완료 보고 형식
 
 - 저장 파일 경로 + 줄 수 (원문 보존 증거)
