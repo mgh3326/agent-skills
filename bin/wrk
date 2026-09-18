@@ -243,6 +243,11 @@ landing_check_detail() {
     "$LANDING_CHECK_WINDOW_SECONDS" "$LANDING_CHECK_ATTEMPTS" \
     "$LANDING_CHECK_LAST_EVIDENCE" "$LANDING_CHECK_LAST_STATUS" \
     "$LANDING_CHECK_LAST_REASON"
+  # A transient ambiguous observation (e.g. a grok queue chip that disappears
+  # again) still suppresses re-injection; keep its origin visible in the final
+  # report instead of letting a later tick's reason overwrite it.
+  [[ -z "${LANDING_CHECK_AMBIGUOUS_REASON:-}" ]] ||
+    printf ' first_ambiguous_reason=%s' "$LANDING_CHECK_AMBIGUOUS_REASON"
 }
 
 prompt_marker() {
@@ -337,6 +342,7 @@ landing_check() {
   local pane="$1" marker="$2" profile_kind="$3" tick delay
   LANDING_CHECK_CONFIRMED=0
   LANDING_CHECK_AMBIGUOUS=0
+  LANDING_CHECK_AMBIGUOUS_REASON=""
   LANDING_CHECK_ATTEMPTS=0
   LANDING_CHECK_LAST_EVIDENCE=none
   LANDING_CHECK_LAST_STATUS=unknown
@@ -344,6 +350,9 @@ landing_check() {
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
     if landing_check_once "$pane" "$marker" "$profile_kind"; then return 0; fi
+    if [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 && -z "$LANDING_CHECK_AMBIGUOUS_REASON" ]]; then
+      LANDING_CHECK_AMBIGUOUS_REASON="$LANDING_CHECK_LAST_REASON"
+    fi
     [[ "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]] && LANDING_CHECK_CONFIRMED=1
     if [[ "$tick" -lt $((LANDING_CHECK_TIMEOUT_TICKS - 1)) ]]; then
       delay="$(landing_check_delay "$tick")"

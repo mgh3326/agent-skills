@@ -215,7 +215,7 @@ messages`·상태 전이)는 **claude 행**의 내용이다. 다른 하네스는
 | kimi | 미측정 | 미측정 | 미측정 | 미측정 | 미측정 | 현재 pane 없음 — `herdr agent list` 20:51 kimi 0건 |
 | grok | 미측정(관측된 빈 컴포저: `❯` 입력란 + `Grok 4.6 (high) · always-approve` 푸터) | `○ 1 command still running · 1 queued, Enter to send now`(`──` 머리 없음) | 전사에 `❯ <메시지>` 줄(시각 표기)로 남고 `◆ Thought for …`/`◆ Run …` 응답이 이어짐 | `herdr agent send-keys <pane> return` → 즉시 제출·소비 확인(푸터 `Enter to send now` 가 지시). 중복 위험은 claude 와 동일 — 대기 중 페이로드 재주입 금지 | `working` ↔ `⠧ Waiting for response…` 진행 표시 일치 관측 — 그 외 상태 미측정 | 대기·즉시제출: grok 4.6 pane, 2026-09-18, director 실측(#406). 소비·빈 컴포저: grok pane 읽기 전용 관측(09-18, w16:p26Z·p27D·p27E·p27F). 상태: `agent list`=working ↔ 화면 `⠧ Waiting for response… 4.2s`(09-18 20:16, w16:p27M) |
 
-grok 의 대기 상태(`N queued, Enter to send now`)는 공유 화면에서 페이로드 귀속이 불가능하므로 착지 증거가 아니다 — "무언가 대기 중" 이라는 모호 신호로만 읽고, 착지 주장은 전사 마커로만 한다 (#406, 2026-09-18).
+grok 의 대기 상태(`N queued, Enter to send now`)는 공유 화면에서 페이로드 귀속이 불가능하므로 착지 증거가 아니다 — "무언가 대기 중" 이라는 모호 신호로만 읽고, 이 queued 푸터로는 착지를 주장하지 않는다 (#406, 2026-09-18).
 
 ## 4. 완료 보고 형식
 
