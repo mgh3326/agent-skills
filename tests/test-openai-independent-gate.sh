@@ -65,16 +65,20 @@ checker_text = checker_path.read_text(encoding="utf-8")
 director_block, checker_block = assert_contracts(director_text, checker_text)
 print("PASS contract-block byte-equality=1 canonical=1")
 
-aliases = {name: "OpenAI" for name in ("OpenAI", "Sol", "Astra", "Terra", "Luna")}
+openai_family_labels = ("OpenAI", "Sol", "Astra", "Terra", "Luna", "Codex")
+aliases = {name: "OpenAI" for name in openai_family_labels}
 
 
 def normalize(family: str) -> str:
     return aliases.get(family, family)
 
 
-for model_name in ("Sol", "Astra", "Terra", "Luna"):
+for model_name in openai_family_labels:
     assert normalize(model_name) == "OpenAI"
-print("PASS family-normalization cases=4/4")
+print(
+    "PASS family-normalization "
+    f"cases={len(openai_family_labels)}/{len(openai_family_labels)}"
+)
 
 
 def merge_verdict(
@@ -98,25 +102,57 @@ def merge_verdict(
     return "READY"
 
 
-def dispatch_verdict(new_codex=True, reservation=True):
-    if new_codex and not reservation:
+def dispatch_verdict(
+    new_codex=True,
+    independent_tester=True,
+    reservation=True,
+    require_independent_tester=True,
+):
+    independent_tester_missing = require_independent_tester and not independent_tester
+    if new_codex and (independent_tester_missing or not reservation):
         return "HOLD(no_independent_reviewer)"
     return "DISPATCH"
 
 
-outcome_cases = [
+merge_cases = [
     (merge_verdict({"OpenAI"}, "OpenAI"), "BOUNCE", "same-family"),
+    (merge_verdict({"OpenAI"}, "Codex"), "BOUNCE", "codex-same-family"),
     (merge_verdict({"OpenAI"}, "xAI"), "READY", "independent-exact-head"),
     (merge_verdict({"OpenAI", "unknown"}, "xAI"), "BOUNCE", "contributor-unknown"),
     (merge_verdict({"OpenAI"}, "unknown"), "BOUNCE", "tester-unknown"),
     (merge_verdict({"OpenAI"}, "xAI", tested_sha="old"), "BOUNCE", "head-mismatch"),
     (merge_verdict({"OpenAI"}, "xAI", other_gates_pass=False), "BOUNCE", "other-gate-fail"),
     (merge_verdict({"OpenAI"}, "xAI", independence_proven=False), "BOUNCE", "unproven"),
-    (dispatch_verdict(reservation=False), "HOLD(no_independent_reviewer)", "no-reservation"),
 ]
-for actual, expected, label in outcome_cases:
+for actual, expected, label in merge_cases:
     assert actual == expected, f"{label}: expected {expected}, got {actual}"
-print(f"PASS gate-outcomes cases={len(outcome_cases)}/{len(outcome_cases)}")
+print(f"PASS merge-outcomes cases={len(merge_cases)}/{len(merge_cases)}")
+
+dispatch_cases = [
+    (
+        dispatch_verdict(independent_tester=False, reservation=False),
+        "HOLD(no_independent_reviewer)",
+        "no-independent-tester-or-reservation",
+    ),
+    (
+        dispatch_verdict(independent_tester=False, reservation=True),
+        "HOLD(no_independent_reviewer)",
+        "no-independent-tester",
+    ),
+    (
+        dispatch_verdict(independent_tester=True, reservation=False),
+        "HOLD(no_independent_reviewer)",
+        "no-reservation",
+    ),
+    (
+        dispatch_verdict(independent_tester=True, reservation=True),
+        "DISPATCH",
+        "tester-and-reservation",
+    ),
+]
+for actual, expected, label in dispatch_cases:
+    assert actual == expected, f"{label}: expected {expected}, got {actual}"
+print(f"PASS dispatch-outcomes cases={len(dispatch_cases)}/{len(dispatch_cases)}")
 
 director_merge_section = director_text.split("## 머지 게이트(전부 충족해야 머지)", 1)[1].split(
     "## 배포", 1
@@ -185,16 +221,32 @@ def expect_assertion(label, callback):
 drifted_director = director_text.replace(
     "초안·수리·처방을 낸 모든 계열", "초안·수리를 낸 모든 계열", 1
 )
-expect_assertion("contract-drift", lambda: assert_contracts(drifted_director, checker_text))
-
-
 def assert_same_family_bounces(allow_same_family=False):
     assert merge_verdict(
         {"OpenAI"}, "OpenAI", allow_same_family=allow_same_family
     ) == "BOUNCE"
 
 
-expect_assertion("same-family-outcome", lambda: assert_same_family_bounces(True))
-print("PASS mutants assertion-red=2/2")
-print("PASS test-openai-independent-gate cases=36/36")
+def assert_dispatch_requires_independent_tester(require_independent_tester=True):
+    assert dispatch_verdict(
+        independent_tester=False,
+        reservation=True,
+        require_independent_tester=require_independent_tester,
+    ) == "HOLD(no_independent_reviewer)"
+
+
+assertion_red_mutants = [
+    ("contract-drift", lambda: assert_contracts(drifted_director, checker_text)),
+    ("same-family-outcome", lambda: assert_same_family_bounces(True)),
+    (
+        "dispatch-independent-tester",
+        lambda: assert_dispatch_requires_independent_tester(False),
+    ),
+]
+for label, callback in assertion_red_mutants:
+    expect_assertion(label, callback)
+print(
+    "PASS mutants assertion-red="
+    f"{len(assertion_red_mutants)}/{len(assertion_red_mutants)}"
+)
 PY
