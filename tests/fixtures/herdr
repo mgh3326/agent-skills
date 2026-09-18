@@ -115,7 +115,7 @@ case "${1:-}" in
           devin-done)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"done","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          landing-working-no-marker|landing-delayed-marker|landing-scrollback-marker)
+          landing-working-no-marker|landing-delayed-marker|landing-scrollback-marker|grok-queued)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           *)
@@ -157,6 +157,8 @@ case "${1:-}" in
           fi
         elif [[ "$scenario" == landing-pasted ]] && ! fixture_is_recent_unwrapped_read "$@"; then
           printf 'Pasted text\n'
+        elif [[ "$scenario" == grok-queued ]] && ! fixture_is_recent_unwrapped_read "$@"; then
+          printf '○ 1 command still running · 1 queued, Enter to send now\n'
         elif fixture_brief_landed; then
           printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
         else

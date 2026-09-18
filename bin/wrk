@@ -295,6 +295,14 @@ landing_check_once() {
     LANDING_CHECK_LAST_REASON=pasted-text-chip
     return 0
   fi
+  # Grok's queued payload is likewise positive evidence, but its footer has no
+  # `──` head the way devin's chip does: the observed shape is
+  # `○ 1 command still running · 1 queued, Enter to send now` (2026-09-18).
+  if [[ "$profile_kind" == grok ]] && grep -Eq -- '[0-9]+ queued, Enter to send now' <<<"$visible"; then
+    LANDING_CHECK_LAST_EVIDENCE=grok-queued
+    LANDING_CHECK_LAST_REASON=grok-queued-chip
+    return 0
+  fi
   if ! status="$(agent_status_for_pane "$pane")"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown

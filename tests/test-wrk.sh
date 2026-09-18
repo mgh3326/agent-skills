@@ -721,6 +721,32 @@ grep -q 'landed=yes' <<<"$pasted_out"
 grep -q 'agent read w:p1 --source visible --lines 40' "$TMP/herdr.log"
 echo "PASS pasted-chip-queued: $pasted_out"
 
+# task406: a queued grok payload renders as a `N queued, Enter to send now`
+# footer with no `──` head, so the claude/devin evidence set returned a false
+# landed=no on real panes (director 실측 2건, 2026-09-18). The footer is
+# grok-only positive evidence; other harnesses must keep ignoring it.
+: >"$TMP/herdr.log"
+grok_queued_out="$(TEST_FIXTURE_SCENARIO=grok-queued spawn_base grok 2>&1)"
+grep -q 'landed=yes' <<<"$grok_queued_out" ||
+  fail "grok queued footer must count as landed: $grok_queued_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "grok queued footer triggered a re-injection: $grok_queued_out"
+echo "PASS grok-queued-chip-landed: $grok_queued_out"
+
+: >"$TMP/herdr.log"
+grok_no_chip_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_no_chip_out" ||
+  fail "grok without the queued footer must stay landed=no: $grok_no_chip_out"
+grep -q 'action=reinject-once' <<<"$grok_no_chip_out" ||
+  fail "grok negative path lost the reinject-once action: $grok_no_chip_out"
+echo "PASS grok-no-chip-negative: $grok_no_chip_out"
+
+: >"$TMP/herdr.log"
+claude_grok_chip_out="$(TEST_FIXTURE_SCENARIO=grok-queued spawn_base sonnet 2>&1)"
+grep -q 'landed=no' <<<"$claude_grok_chip_out" ||
+  fail "claude pane must not treat the grok footer as evidence: $claude_grok_chip_out"
+echo "PASS claude-ignores-grok-queued-chip: $claude_grok_chip_out"
+
 : >"$TMP/herdr.log"
 opencode_retry_out="$(TEST_FIXTURE_SCENARIO=opencode-retry spawn_base oc-omni 2>&1)"
 grep -q 'landed=retry' <<<"$opencode_retry_out"
