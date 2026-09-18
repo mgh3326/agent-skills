@@ -28,6 +28,8 @@ KIMI_CODE_LOW_HOME="${KIMI_CODE_LOW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/k
 # solely into the spawned pane's env — never into ~/.claude/ config.
 CLINEPASS_GATE_URL="http://127.0.0.1:8317"
 CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-key.txt}"
+# oc-union 레인 자산(opencode secret-path-deny 설정)은 이 스크립트 옆에 둔다.
+WRK_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
 # 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
@@ -41,7 +43,7 @@ ALL_PROFILES=(
   kiro-sol-xhigh kiro-sol-max
   kimi-k3 kimi-k27 kimi-k27-code kimi-k3-low builder-kimi
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
-  oc-qwen37-max oc-minimax-m3 oc-solar4
+  oc-qwen37-max oc-minimax-m3 oc-solar4 oc-union
   agy-flash agy-flash36 agy-flash37
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med builder-grok
   cc-qwen38 cc-glm cc-dsflash cc-dspro cc-glm53
@@ -952,6 +954,7 @@ resolve_profile() {
   EFFORT_SUPPORTED=0
   ARGS=()
   PROFILE_ENV=()
+  PROFILE_SETUP=""
   KIMI_TRUST_HOME=""
   PROFILE_MODEL_ARG=""
 
@@ -1075,6 +1078,24 @@ resolve_profile() {
     # (OpenRouter 목록 제거·Zen 에러 실측). 정체 = GLM-5.3-Flash(Zhipu, 08-26 공개).
     # 별칭은 죽은 pane 양산을 막기 위해 제거 — reps(oc-ox/oc-oxz)는 GLM-5.3-Flash 실적으로
     # 잔존하며, 정식 서빙(ClinePass 등)이 생기면 새 이름으로 재배선한다. 상세=메모리 ox-alpha-lane.
+    # oc-union: union-alpha 스텔스 실험 별칭 — 급표 미등재(reps 후 판정). OpenRouter 경유
+    # (무료 $0·ctx 262144·out 131072, 제공자 "Stealth" 단일 — Zen 인그레스 없음).
+    # 라운드4 재설계: 실키는 어떤 파일·pane env 에도 두지 않는다. deny glob 은 문자열
+    # 매칭이라 심링크·간접 표기로 우회됨이 실증됐고(2026-09-17 canary 재현), 생성 config
+    # 의 apiKey 에 실키를 쓰는 것 자체가 모델 도달 가능한 키 저장소를 만드는 설계
+    # 오류였다. 실키는 스폰 시 뜨는 bin/oc-union-proxy.py 프로세스의 메모리에만 존재
+    # 한다 — 레인 opencode config 는 baseURL=127.0.0.1 프록시 + apiKey={env:…}
+    # placeholder 만 담고(0600), 실제 Authorization 은 프록시가 주입한다. 프록시는
+    # 레인당 일회용 토큰을 요구해 다른 로컬 프로세스의 무단 사용을 막고(토큰은 pane
+    # env 와 프록시 env 로만 전달 — 파일·argv 무기록), 센티널이 pane 소멸 시 kill
+    # 한다(미등재 잡은 프록시 자체 idle-timeout 이 백스톱). 실제 기동은 quota 게이트
+    # 이후로 미룬다(oc_union_setup) — 거부된 스폰이 키를 쥔 프로세스를 남기지 않게.
+    # 게이트는 등록 프로필(oc-glm) 피기백 — 실소비 0이라 clinepass 귀속 오염은 프로모
+    # 주간 한정 수용(oc-ox 전례), 정체 공개 시 정리.
+    oc-union)
+      PROFILE_KIND=opencode
+      PROFILE_SETUP=oc_union_setup
+      ARGS=(--auto --model openrouter/stealth/union-alpha) ;;
     oc-qwen37-max) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/qwen3.7-max) ;;
     oc-minimax-m3) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/minimax-m3) ;;
     oc-solar4) PROFILE_KIND=opencode; ARGS=(--auto --model upstage/solar-pro4) ;;
@@ -1131,6 +1152,8 @@ resolve_profile() {
       GATE_PROFILE=kiro-sol ;;
     kimi-k3|kimi-k27|kimi-k27-code|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
     builder-kimi) GATE_PROFILE=kimi-k3 ;;
+    # oc-union 은 미등재 실험 별칭 — 등록 프로필로 게이트 피기백(oc-ox 전례)
+    oc-union) GATE_PROFILE="oc-glm" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3|oc-solar4)
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
@@ -1167,6 +1190,174 @@ resolve_profile() {
       fi
       ;;
   esac
+}
+
+# oc-union lane bootstrap — runs inside spawn_cmd after quota admission (see the
+# oc-union case in resolve_profile for the design). Starts the auth-injecting
+# proxy — the only process holding the real key, in memory only — and writes the
+# lane opencode config: baseURL -> the proxy, apiKey -> a {env:} placeholder.
+# The per-lane token reaches the pane and the proxy through env only; nothing
+# secret is ever written to a file the lane can read.
+oc_union_setup() {
+  UNION_KEY_FILE="${UNION_OPENROUTER_KEY_FILE:-$HOME/.config/ai-keys.env}"
+  [[ -r "$UNION_KEY_FILE" ]] || die "openrouter key file not found/readable: $UNION_KEY_FILE"
+  local proxy_bin="${OC_UNION_PROXY_BIN:-$WRK_DIR/oc-union-proxy.py}"
+  [[ -f "$proxy_bin" ]] || die "oc-union proxy script not found: $proxy_bin"
+  OC_UNION_PROXY_STATE="${OC_UNION_PROXY_STATE:-$(mktemp -d "${OC_UNION_STATE_ROOT:-${TMPDIR:-/tmp}}/oc-union.XXXXXX")}"
+  chmod 700 "$OC_UNION_PROXY_STATE" 2>/dev/null || true
+  local token
+  token="$(python3 -c 'import secrets; print(secrets.token_hex(32))')" \
+    || die "oc-union: lane token generation failed"
+  [[ -n "$token" ]] || die "oc-union: lane token generation produced empty token"
+  # The token travels through env on both sides — never argv (ps) or disk.
+  OC_UNION_PROXY_TOKEN="$token" python3 "$proxy_bin" \
+    --key-file "$UNION_KEY_FILE" --state-dir "$OC_UNION_PROXY_STATE" \
+    >>"$OC_UNION_PROXY_STATE/proxy.log" 2>&1 &
+  UNION_PROXY_PID=$!
+  # Any exit before the lane owns the proxy must not leave a key-holding
+  # process behind; disarmed at the success line alongside SPAWN_PANE_OPEN.
+  trap 'union_proxy_cleanup; spawn_pane_cleanup; arbiter_release_held' EXIT
+  local tries=0 port=""
+  while (( tries < 100 )); do
+    if [[ -s "$OC_UNION_PROXY_STATE/proxy.port" ]]; then
+      port="$(awk '{print $1; exit}' "$OC_UNION_PROXY_STATE/proxy.port")"
+      [[ "$port" =~ ^[0-9]+$ ]] && break
+      port=""
+    fi
+    # kill -0 reports zombies as alive — check the process state too, and on
+    # death surface the scrubbed proxy log tail so CI failures are diagnosable.
+    if ! kill -0 "$UNION_PROXY_PID" 2>/dev/null \
+      || ps -o stat= -p "$UNION_PROXY_PID" 2>/dev/null | grep -q '^Z'; then
+      die "oc-union proxy exited during startup — $(tail -3 "$OC_UNION_PROXY_STATE/proxy.log" 2>/dev/null || printf 'no proxy.log')"
+    fi
+    sleep 0.1
+    tries=$((tries + 1))
+  done
+  [[ -n "$port" ]] || die "oc-union proxy did not publish $OC_UNION_PROXY_STATE/proxy.port — $(tail -3 "$OC_UNION_PROXY_STATE/proxy.log" 2>/dev/null || printf 'no proxy.log')"
+  # Lane config lives in the proxy state dir (TMPDIR, outside $HOME) — never in
+  # ~/.config/oc-union, which already holds an auth.json with a real key.
+  # apiKey is a literal {env:} placeholder; baseURL points at the proxy. The
+  # static deny set stays as a seatbelt (it is a string-matching layer, proven
+  # bypassable — the boundary is that no reachable file holds the key).
+  UNION_OC_CONFIG_DIR="${UNION_OC_CONFIG_DIR:-$OC_UNION_PROXY_STATE/oc-config}"
+  UNION_OC_CONFIG="$UNION_OC_CONFIG_DIR/auth.json"
+  (
+    umask 077
+    set -e
+    mkdir -p "$UNION_OC_CONFIG_DIR"
+    _union_tmp="$(mktemp "$UNION_OC_CONFIG_DIR/.gen.XXXXXX")"
+    if ! python3 - \
+      "$WRK_DIR/oc-union.secret-path-deny.json" "$UNION_OC_CONFIG_DIR" "$port" >"$_union_tmp" <<'PY'
+import json, os, sys
+cfg = json.load(open(sys.argv[1]))
+d = sys.argv[2]
+port = sys.argv[3]
+base = os.path.basename(d.rstrip("/"))
+pats = [d, d + "/*", d + "/**",
+        "**/" + base, "**/" + base + "/*", "**/" + base + "/**",
+        base, base + "/*", base + "/**"]
+home = os.path.expanduser("~")
+if d.startswith(home + "/"):
+    t = "~/" + d[len(home) + 1:]
+    pats += [t, t + "/*", t + "/**"]
+for sect in ("read", "edit", "bash"):
+    cfg["permission"].setdefault(sect, {})
+    for p in pats:
+        cfg["permission"][sect][p] = "deny"
+opts = cfg.setdefault("provider", {}).setdefault("openrouter", {}) \
+    .setdefault("options", {})
+opts["apiKey"] = "{env:OC_UNION_PROXY_TOKEN}"
+opts["baseURL"] = "http://127.0.0.1:%s/api/v1" % port
+# Title/summary agents pick a "small" model — pin it to the allowlisted one so
+# those calls pass the proxy's model gate instead of bouncing as 403 noise.
+cfg["small_model"] = "openrouter/stealth/union-alpha"
+json.dump(cfg, sys.stdout, indent=2)
+PY
+    then
+      rm -f "$_union_tmp"
+      exit 1
+    fi
+    mv -f "$_union_tmp" "$UNION_OC_CONFIG"
+  ) || die "failed to write oc-union opencode config: $UNION_OC_CONFIG"
+
+  # T-a structural boundary: run the lane's opencode under seatbelt so every
+  # read under $HOME is denied except an explicit allowlist. SBPL matches the
+  # kernel-resolved path — symlinks, "..", case variants and firmlink spellings
+  # all collapse to the real inode, so the notation tricks that beat the
+  # glob-based deny cannot reach the key file here. spawn_cmd plants the
+  # `alias opencode=...` in the pane before `agent start` types the command.
+  OC_UNION_SB_PROFILE=""
+  if [[ "$(uname -s)" == Darwin ]]; then
+    command -v sandbox-exec >/dev/null 2>&1 \
+      || die "oc-union requires sandbox-exec on Darwin — refusing to run unsandboxed"
+    OC_UNION_SB_PROFILE="$OC_UNION_PROXY_STATE/opencode.sb"
+    oc_union_write_sandbox "$OC_UNION_SB_PROFILE" "$CWD"
+    OC_UNION_OPENCODE_BIN="$(command -v opencode 2>/dev/null || printf '%s' "$HOME/.opencode/bin/opencode")"
+  else
+    warn "oc-union: no sandbox-exec on $(uname -s) — lane runs without the read sandbox (proxy+token boundary only)"
+  fi
+
+  # XDG roots move into the lane state dir: opencode mkdirs its config dir at
+  # boot (a denied $HOME stat makes that crash), and per-lane data/state keeps
+  # this lane's sessions out of — and other lanes' sessions away from — the
+  # operator's shared opencode stores.
+  PROFILE_ENV=(--env "OPENCODE_CONFIG=$UNION_OC_CONFIG" --env "OC_UNION_PROXY_TOKEN=$token"
+    --env "XDG_CONFIG_HOME=$OC_UNION_PROXY_STATE/xdg-config"
+    --env "XDG_DATA_HOME=$OC_UNION_PROXY_STATE/xdg-data"
+    --env "XDG_STATE_HOME=$OC_UNION_PROXY_STATE/xdg-state")
+  unset token
+}
+
+# Write the per-lane seatbelt profile: allow default, but file-read* under
+# $HOME is denied except the roots the lane legitimately needs. deny always
+# beats allow in SBPL, so exceptions must live inside the deny via
+# require-all/require-not — an allow-after-deny never re-opens a path.
+oc_union_write_sandbox() {
+  local profile="$1" cwd="$2" resolved_cwd
+  resolved_cwd="$(cd "$cwd" 2>/dev/null && pwd -P || printf '%s' "$cwd")"
+  {
+    printf '(version 1)\n(allow default)\n'
+    printf ';; oc-union lane: deny every read under the user home except the allowlist.\n'
+    printf ';; Paths below are evaluated after kernel resolution — aliases do not exist.\n'
+    printf '(deny file-read*\n  (require-all\n    (subpath "%s")\n' "$HOME"
+    local p
+    for p in \
+      "$resolved_cwd" \
+      "$OC_UNION_PROXY_STATE" \
+      "$HOME/.opencode" \
+      "$HOME/.local/bin" \
+      "$HOME/.local/share/opencode" \
+      "$HOME/.local/state/opencode" \
+      "$HOME/.cache/opencode" \
+      ${OC_UNION_EXTRA_READ:-}
+    do
+      printf '    (require-not (subpath "%s"))\n' "$p"
+    done
+    printf '    (require-not (literal "%s"))\n' "$HOME/.gitconfig"
+    printf '    (require-not (subpath "%s"))\n' "$HOME/.config/git"
+    printf '  ))\n'
+  } >"$profile"
+  chmod 600 "$profile"
+}
+
+# Spawn-side guard: if spawn fails after the proxy started, do not leave a
+# key-holding process behind. UNION_PROXY_PID is cleared at the success line,
+# where ownership passes to the completion sentinel (union_proxy_reap).
+union_proxy_cleanup() {
+  [[ -n "${UNION_PROXY_PID:-}" ]] || return 0
+  kill "$UNION_PROXY_PID" 2>/dev/null || true
+  UNION_PROXY_PID=""
+}
+
+# Sentinel-side teardown: when the lane's pane is gone the proxy — the only
+# key holder — dies with it. Reads the pidfile the proxy published; also runs
+# on sentinel exit so a timed-out watch never orphans it.
+union_proxy_reap() {
+  local statedir="${OC_UNION_PROXY_STATE:-}" pid=""
+  [[ -n "$statedir" && -s "$statedir/proxy.pid" ]] || return 0
+  read -r pid <"$statedir/proxy.pid" || return 0
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  kill "$pid" 2>/dev/null || true
 }
 
 completion_event() {
@@ -1654,6 +1845,9 @@ sentinel_cmd() {
   local transient_max="${WRK_SENTINEL_TRANSIENT_MAX:-10}"
   local lost_grace="${WRK_SENTINEL_LOST_GRACE:-1800}"
   [[ -n "$job" && -n "$owner" && -n "$label" && -n "$pane" ]] || exit 2
+  # oc-union: the key-holding proxy must not outlive this watch — reap it on any
+  # sentinel exit and immediately when the pane is confirmed gone (lost:*).
+  [[ -z "${OC_UNION_PROXY_STATE:-}" ]] || trap 'union_proxy_reap' EXIT
   local jobdir logfile started seen transient lost lost_at
   jobdir="$(wrk_jobs_root)/$job"
   mkdir -p "$jobdir"
@@ -1712,6 +1906,7 @@ sentinel_cmd() {
         completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}"
         lost=1
         lost_at="$now"
+        union_proxy_reap
         ;;
     esac
     if [[ "$lost" -eq 1 ]] && (( now - lost_at >= lost_grace )); then
@@ -1735,6 +1930,9 @@ build_sentinel_env() {
   [[ -z "$socket" ]] || SENTINEL_ENV+=("HERDR_SOCKET_PATH=$socket")
   [[ -z "${HERDR_BIN_PATH:-}" ]] || SENTINEL_ENV+=("HERDR_BIN_PATH=$HERDR_BIN_PATH")
   [[ -z "$HERDR" ]] || SENTINEL_ENV+=("HERDR_BIN=$HERDR")
+  # oc-union: the sentinel inherits the proxy state dir so it can kill the
+  # key-holding proxy the moment the lane's pane is gone (union_proxy_reap).
+  [[ -z "${OC_UNION_PROXY_STATE:-}" ]] || SENTINEL_ENV+=("OC_UNION_PROXY_STATE=$OC_UNION_PROXY_STATE")
 }
 
 start_completion_sentinel() {
@@ -2700,6 +2898,10 @@ spawn_cmd() {
     kimi_seed_workspace_trust "$CWD" "$KIMI_TRUST_HOME"
   fi
 
+  # Deferred per-profile lane setup (oc-union starts its key-holding proxy here —
+  # after quota admission, so a denied spawn never leaves the process behind).
+  [[ -z "${PROFILE_SETUP:-}" ]] || "$PROFILE_SETUP"
+
   TAB_ENV=()
   if [[ "${#LANE_ENV[@]}" -gt 0 ]]; then TAB_ENV+=("${LANE_ENV[@]}"); fi
   if [[ "${#PROFILE_ENV[@]}" -gt 0 ]]; then TAB_ENV+=("${PROFILE_ENV[@]}"); fi
@@ -2737,7 +2939,26 @@ print(value if isinstance(value, str) else "")
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
   [[ "$PROFILE_KIND" == codex ]] && START_TIMEOUT=120000 && BOOT_SETTLE=20
 
+  # oc-union T-a boundary: `agent start` types a bare `opencode` into the pane
+  # shell, so a session alias is the injection point — the pane env is already
+  # fixed at tab create and PATH shims lose to rc-file PATH rebuilds. If the
+  # alias cannot be planted the spawn must die rather than run unsandboxed.
+  if [[ -n "${OC_UNION_SB_PROFILE:-}" ]]; then
+    "$HERDR" pane send-text "$PANE" \
+      "alias opencode='touch \"$OC_UNION_PROXY_STATE/sandbox-armed\"; sandbox-exec -f \"$OC_UNION_SB_PROFILE\" \"$OC_UNION_OPENCODE_BIN\"'" >/dev/null \
+      || die "oc-union: failed to plant sandbox alias in pane $PANE"
+    "$HERDR" pane send-keys "$PANE" return >/dev/null \
+      || die "oc-union: failed to plant sandbox alias in pane $PANE"
+    sleep_for 1
+  fi
+
   "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
+  # The alias leaves a marker before exec — if a future herdr invokes opencode
+  # in a way that skips alias expansion (`command opencode`, absolute path),
+  # the lane would run unsandboxed: die instead of opening T-a back up.
+  if [[ -n "${OC_UNION_SB_PROFILE:-}" && ! -f "$OC_UNION_PROXY_STATE/sandbox-armed" ]]; then
+    die "oc-union: sandbox alias did not fire (pane $PANE) — refusing an unsandboxed lane"
+  fi
   sleep_for "$BOOT_SETTLE"
   if [[ "$PROFILE_KIND" == kimi ]]; then
     VISIBLE_SCREEN=""
@@ -2825,6 +3046,7 @@ print(value if isinstance(value, str) else "")
     start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
   fi
   SPAWN_PANE_OPEN=0
+  UNION_PROXY_PID=""   # ownership passes to the completion sentinel
   refresh_quota_pool
   ARBITER_HELD=0
   if [[ -n "$ARBITER_RESOURCE" ]]; then

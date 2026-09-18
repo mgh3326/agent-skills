@@ -14,7 +14,7 @@ cleanup() {
     [[ -s "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
     if [[ "$pid" =~ ^[0-9]+$ ]]; then kill "$pid" 2>/dev/null || true; fi
-  done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
+  done < <(find "$TMP" -name 'completion-sentinel.pid' -o -name 'proxy.pid' 2>/dev/null)
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -25,6 +25,17 @@ printf '%s\n' 'fixture prompt' >"$PROMPT"
 # spawn time (never from ~/.claude/); point it at a harmless fixture value.
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
+
+# oc-union: OpenRouter 키는 스폰 시 뜨는 lane 프록시 프로세스가 파일에서 직접 읽어
+# 메모리에만 보유한다 — suite 전체가 실파일 대신 fixture 사용(실키 값이 herdr.log 로
+# 새는 것도 방지). 레인 config(auth.json)에는 apiKey={env:…} placeholder 와
+# baseURL=프록시만 들어간다 — 어떤 파일에도 실키가 기록되지 않는다. 프록시 state
+# 디렉터리는 TMP 아래에 두어 cleanup 이 pidfile 로 거둔다.
+export UNION_OPENROUTER_KEY_FILE="$TMP/ai-keys-fixture.env"
+export UNION_OC_CONFIG_DIR="$TMP/oc-union-conf"
+export OC_UNION_STATE_ROOT="$TMP"
+# 실파일 형식 미러: export + 따옴표 + 인라인 주석(ROB-1313 실사고 회귀 가드)
+printf 'export OPENROUTER_API_KEY="fixture-openrouter-key"  # https://openrouter.ai/keys\n' >"$UNION_OPENROUTER_KEY_FILE"
 
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
@@ -390,7 +401,7 @@ profiles=(
   "oc-kimi-code:oc-kimi-code" "oc-glm:oc-glm" "oc-kimi-k3:oc-kimi-k3"
   "oc-dsflash:oc-dsflash" "oc-gflash:oc-gflash" "oc-sonnet46:oc-sonnet46"
   "oc-oss:oc-oss" "oc-omni:oc-omni" "oc-qwen37-max:oc-qwen37-max"
-  "oc-minimax-m3:oc-minimax-m3" "oc-solar4:oc-solar4" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
+  "oc-minimax-m3:oc-minimax-m3" "oc-solar4:oc-solar4" "oc-union:oc-glm" "grok:grok-hi" "grok-hi:grok-hi" "grok-med:grok-hi" "grok45:grok-hi" "grok45-med:grok-hi" "grok46:grok-hi" "grok46-med:grok-hi"
   "cc-qwen38:cc-qwen38" "cc-glm:cc-glm"
   "cc-dsflash:cc-qwen38" "cc-dspro:cc-qwen38" "cc-glm53:cc-qwen38"
   )
@@ -402,6 +413,226 @@ for pair in "${profiles[@]}"; do
   spawn_base "$runtime" >/dev/null
   [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "$expected" ]]
 done
+: >"$TMP/herdr.log"
+rm -rf "$UNION_OC_CONFIG_DIR"
+spawn_base oc-union >/dev/null
+grep -q -- '--model openrouter/stealth/union-alpha' "$TMP/herdr.log"
+grep -q -- '--env OPENCODE_CONFIG=' "$TMP/herdr.log"
+grep -q -- '--env OC_UNION_PROXY_TOKEN=' "$TMP/herdr.log"
+grep -q -- 'oc-union' "$TMP/herdr.log"
+# 실키는 pane env 로 가지 않는다 — herdr.log argv 에 키 변수 주입이 없어야 함
+if grep -q -- 'OPENROUTER_API_KEY' "$TMP/herdr.log"; then
+  echo "FAIL oc-union: key leaked into pane env argv"
+  exit 1
+fi
+UNION_AUTH="$UNION_OC_CONFIG_DIR/auth.json"
+[[ -f "$UNION_AUTH" ]] || { echo "FAIL oc-union: generated config missing"; exit 1; }
+# 0600 — stat -f(BSD)/-c(GNU) 양쪽 대응
+[[ "$(stat -f%Lp "$UNION_AUTH" 2>/dev/null || stat -c%a "$UNION_AUTH")" == "600" ]] || {
+  echo "FAIL oc-union: generated config not 0600"; exit 1; }
+# 라운드4: apiKey 는 placeholder, baseURL 은 lane 프록시 — 실키는 어떤 파일에도 없다
+grep -q '"apiKey": "{env:OC_UNION_PROXY_TOKEN}"' "$UNION_AUTH" || {
+  echo "FAIL oc-union: apiKey is not the {env:} placeholder"; exit 1; }
+grep -Eq '"baseURL": "http://127\.0\.0\.1:[0-9]+/api/v1"' "$UNION_AUTH" || {
+  echo "FAIL oc-union: baseURL does not point at the lane proxy"; exit 1; }
+if grep -q 'fixture-openrouter-key' "$UNION_AUTH"; then
+  echo "FAIL oc-union: real key material at rest in generated config"
+  exit 1
+fi
+echo "PASS oc-union-openrouter-config"
+
+# T-a 구조적 경계(Darwin): pane 에 sandbox alias 가 심어지고, 생성된 SBPL 이
+# 홈 아래 읽기를 allowlist 외 전면 거부하는지 실제 커널에 물어본다. 프로브 대상은
+# 합성 canary 뿐 — 실키 파일을 테스트에서 절대 건드리지 않는다.
+if [[ "$(uname -s)" == Darwin ]] && command -v sandbox-exec >/dev/null 2>&1; then
+  grep -q 'pane send-text .*alias opencode=.*sandbox-exec -f' "$TMP/herdr.log" || {
+    echo "FAIL oc-union: sandbox alias not planted in pane"; exit 1; }
+  OCU_SB=""
+  for _f in "$TMP"/oc-union.*/opencode.sb; do [[ -f "$_f" ]] && OCU_SB="$_f"; done
+  unset _f
+  [[ -s "$OCU_SB" ]] || { echo "FAIL oc-union: sandbox profile not generated"; exit 1; }
+  # canary 는 키 저장소와 같은 디렉터리($HOME/.config) 아래에 둔다 — 그래야
+  # "저장소 파일이 어떤 표기로도 안 읽힌다"는 증명이 그대로 적용된다.
+  OCU_CANARY="$HOME/.config/oc-union-sbtest-canary-$$.txt"
+  OCU_CANARY_BASE="oc-union-sbtest-canary-$$.txt"
+  printf 'CANARY\n' >"$OCU_CANARY"
+  # ④ 허용 루트(worktree) 안에 만든 심링크 — 문자열 매칭 엔진이라면 이 우회가
+  # 통과한다. 커널 해석 기반이면 목표 경로가 deny 되어 막혀야 한다.
+  OCU_WT_LINK="$ROOT/.oc-union-sbtest-link-$$"
+  ln -sf "$OCU_CANARY" "$OCU_WT_LINK"
+  ocu_sandbox_cleanup() { rm -f "$OCU_CANARY" "$OCU_WT_LINK" "$TMP/ocu-canary-hl"; }
+  for probe in \
+    "$OCU_CANARY" \
+    "$OCU_WT_LINK" \
+    "$HOME/.config/./$OCU_CANARY_BASE" \
+    "$HOME/.config/../.config/$OCU_CANARY_BASE" \
+    "$(printf '%s' "$OCU_CANARY" | tr '[:upper:]' '[:lower:]')" \
+    "/System/Volumes/Data$OCU_CANARY"
+  do
+    if sandbox-exec -f "$OCU_SB" /bin/cat "$probe" >/dev/null 2>&1; then
+      echo "FAIL oc-union sandbox: canary readable via $probe"; ocu_sandbox_cleanup; exit 1
+    fi
+  done
+  # ⑤ 샌드박스 안에서의 하드링크 생성 자체가 막혀야 한다(소스 lookup 거부)
+  if sandbox-exec -f "$OCU_SB" /bin/ln "$OCU_CANARY" "$TMP/ocu-canary-hl" >/dev/null 2>&1; then
+    echo "FAIL oc-union sandbox: hardlink to canary created"; ocu_sandbox_cleanup; exit 1
+  fi
+  # 허용 루트는 살아 있어야 한다 — worktree(실행 CWD) 읽기 확인
+  sandbox-exec -f "$OCU_SB" /bin/ls "$ROOT" >/dev/null 2>&1 || {
+    echo "FAIL oc-union sandbox: allowlisted worktree unreadable"; ocu_sandbox_cleanup; exit 1; }
+  # 뮤턴트 검증 — ~/.config 를 허용한 프로필로는 같은 canary 가 읽혀야 한다.
+  # 이게 읽히지 않으면 위 거부들이 아무것도 재지 않은 것이다.
+  OCU_SB_MUTANT="$TMP/ocu-mutant.sb"
+  sed "s|^  ))|    (require-not (subpath \"$HOME/.config\"))\\
+  ))|" "$OCU_SB" >"$OCU_SB_MUTANT"
+  if ! sandbox-exec -f "$OCU_SB_MUTANT" /bin/cat "$OCU_CANARY" >/dev/null 2>&1; then
+    echo "FAIL oc-union sandbox: mutant profile (allow ~/.config) did not read canary — probes measure nothing"
+    ocu_sandbox_cleanup; exit 1
+  fi
+  ocu_sandbox_cleanup
+  rm -f "$OCU_SB_MUTANT"
+  echo "PASS oc-union-sandbox-deny"
+fi
+
+# fail-closed at spawn — 키 파일이 없으면 프록시는 뜨지 않고 스폰도 죽는다
+if ( UNION_OPENROUTER_KEY_FILE="$TMP/absent-keys.env" spawn_base oc-union ) >/dev/null 2>&1; then
+  echo "FAIL oc-union: spawn succeeded with unreadable key file"; exit 1
+fi
+
+# oc-union 키 추출 — 토큰 파일 source 금지 하드룰(2026-09-07 실사고)의 텍스트 추출을
+# 검증한다. 라운드4부터 추출 주체는 프록시(bin/oc-union-proxy.py extract_key)다 —
+# 실제 코드 경로를 importlib 로 적재해 같은 규칙을 시험한다.
+# 4종+1 합성 픽스처(인라인 주석·따옴표·export 접두·앞뒤 공백·공백없는 주석)
+# 각각에서 정확히 키 값만 추출돼야 한다. 실키는 절대 쓰지 않는다.
+union_extract() {
+  python3 - "$ROOT/bin/oc-union-proxy.py" "$UNION_OPENROUTER_KEY_FILE" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("oc_union_proxy", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+print(mod.extract_key(sys.argv[2]))
+PY
+}
+union_key_fixture() {
+  printf '%s\n' "$1" >"$UNION_OPENROUTER_KEY_FILE"
+  local got
+  got="$(union_extract)" || { echo "FAIL oc-union key extract raised: [$1]"; exit 1; }
+  [[ "$got" == "$2" ]] || {
+    echo "FAIL oc-union key extract: [$1] got [$got] want [$2]"
+    exit 1
+  }
+}
+union_key_fixture 'export OPENROUTER_API_KEY="fx-union-a1"  # https://openrouter.ai/keys' 'fx-union-a1'
+union_key_fixture "OPENROUTER_API_KEY='fx-union-b2'" 'fx-union-b2'
+union_key_fixture 'export OPENROUTER_API_KEY=fx-union-c3' 'fx-union-c3'
+union_key_fixture '   export   OPENROUTER_API_KEY   =   "fx-union-d4"   ' 'fx-union-d4'
+union_key_fixture 'OPENROUTER_API_KEY=fx-union-e5 # tail without space' 'fx-union-e5'
+printf 'export OPENROUTER_API_KEY="fixture-openrouter-key"  # https://openrouter.ai/keys\n' >"$UNION_OPENROUTER_KEY_FILE"
+echo "PASS oc-union-key-extract-variants"
+
+# oc-union 프록시 기능 시험 — 합성 키·토큰만 사용(실키 절대 아님).
+# 증명 항목: ①토큰 없는 로컬 요청은 401 로 거부되고 upstream 에 닿지 않는다
+# ②레인 토큰 요청은 통과하며 upstream 이 실제 Bearer 키를 받는다
+# ③키·토큰은 프록시 로그·에러 응답 어디에도 남지 않는다(오류 경로 포함)
+# ④프록시가 죽으면 연결 자체가 실패한다 — fail-closed, 우회 경로 없음.
+OCU_PROXY="$ROOT/bin/oc-union-proxy.py"
+OCU_STUB_FIXTURE="$ROOT/tests/fixtures/oc-union-stub.py"
+OCU_STATE="$TMP/ocu-proxy-state"; mkdir -p "$OCU_STATE"
+OCU_STUB_STATE="$TMP/ocu-stub-state"; mkdir -p "$OCU_STUB_STATE"
+printf 'export OPENROUTER_API_KEY="fx-proxy-secret-DONOTLEAK"\n' >"$TMP/ocu-keys.env"
+python3 "$OCU_STUB_FIXTURE" "$OCU_STUB_STATE" &
+OCU_STUB_PID=$!
+for _ in $(seq 200); do [[ -s "$OCU_STUB_STATE/stub.port" ]] && break; sleep 0.05; done
+[[ -s "$OCU_STUB_STATE/stub.port" ]] || { echo "FAIL oc-union stub: no portfile"; exit 1; }
+OCU_SPORT="$(cat "$OCU_STUB_STATE/stub.port")"
+OC_UNION_PROXY_TOKEN="fx-lane-token-7f3a" python3 "$OCU_PROXY" \
+  --key-file "$TMP/ocu-keys.env" --state-dir "$OCU_STATE" \
+  --upstream "127.0.0.1:$OCU_SPORT" --upstream-http \
+  >"$OCU_STATE/proxy.out" 2>"$OCU_STATE/proxy.err" &
+OCU_PROXY_PID=$!
+for _ in $(seq 200); do [[ -s "$OCU_STATE/proxy.port" ]] && break; sleep 0.05; done
+[[ -s "$OCU_STATE/proxy.port" ]] || { echo "FAIL oc-union proxy: no portfile"; exit 1; }
+OCU_PORT="$(awk '{print $1; exit}' "$OCU_STATE/proxy.port")"
+[[ "$(curl -s "http://127.0.0.1:$OCU_PORT/healthz")" == "ok" ]] || {
+  echo "FAIL oc-union proxy: healthz"; exit 1; }
+# ① 레인 밖 프로세스 — 토큰 없음/오기재 요청은 거부되고 upstream 에 도달하지 않는다
+ocu_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" -d '{}')"
+[[ "$ocu_code" == "401" ]] || { echo "FAIL oc-union proxy: no-token got $ocu_code"; exit 1; }
+ocu_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Authorization: Bearer wrong-token' \
+  "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" -d '{}')"
+[[ "$ocu_code" == "401" ]] || { echo "FAIL oc-union proxy: bad-token got $ocu_code"; exit 1; }
+[[ ! -s "$OCU_STUB_STATE/seen.jsonl" ]] || {
+  echo "FAIL oc-union proxy: unauthorized request reached upstream"; exit 1; }
+# ② 레인 요청 — 토큰 일치 시 전달되고 upstream 은 실키 Bearer 를 받는다.
+# 스텁은 받은 자격을 응답 본문에 에코한다 — upstream 이 우리가 보낸 키를
+# 반사하는 경우에도 레인 쪽으로는 <redacted> 만 새야 한다(응답 측 스크럽 증명).
+ocu_body="$(curl -s -X POST \
+  -H 'Authorization: Bearer fx-lane-token-7f3a' \
+  "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" -d '{}')"
+grep -q '"ok": true' <<<"$ocu_body" || {
+  echo "FAIL oc-union proxy: lane request failed"; exit 1; }
+grep -q '"authorization": "Bearer fx-proxy-secret-DONOTLEAK"' "$OCU_STUB_STATE/seen.jsonl" || {
+  echo "FAIL oc-union proxy: upstream did not receive injected key"; exit 1; }
+if grep -q 'fx-proxy-secret-DONOTLEAK' <<<"$ocu_body"; then
+  echo "FAIL oc-union proxy: upstream-echoed key reached the lane"; exit 1; fi
+grep -q '<redacted>' <<<"$ocu_body" || {
+  echo "FAIL oc-union proxy: reflected key not scrubbed"; exit 1; }
+# 청크 경계에 걸친 시크릿도 스크럽돼야 한다 — 스텁 /split 은 자격 문자열
+# 한가운데서 두 번에 나눠 쓴다.
+ocu_body="$(curl -s -X POST \
+  -H 'Authorization: Bearer fx-lane-token-7f3a' \
+  "http://127.0.0.1:$OCU_PORT/split" -d '{}')"
+if grep -q 'fx-proxy-secret-DONOTLEAK\|fx-lane-token' <<<"$ocu_body"; then
+  echo "FAIL oc-union proxy: chunk-split secret reached the lane"; exit 1; fi
+grep -q '<redacted>' <<<"$ocu_body" || {
+  echo "FAIL oc-union proxy: split secret not scrubbed"; exit 1; }
+# T-b 상한 — 레인 토큰이 있어도 허용 모델 외 요청은 프록시가 403 으로 거부하고
+# upstream 에 닿지 않는다.
+ocu_seen_before="$(wc -l <"$OCU_STUB_STATE/seen.jsonl" | tr -d ' ')"
+ocu_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Authorization: Bearer fx-lane-token-7f3a' \
+  "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" \
+  -d '{"model":"some-other-model"}')"
+[[ "$ocu_code" == "403" ]] || {
+  echo "FAIL oc-union proxy: non-allowlisted model got $ocu_code"; exit 1; }
+[[ "$(wc -l <"$OCU_STUB_STATE/seen.jsonl" | tr -d ' ')" == "$ocu_seen_before" ]] || {
+  echo "FAIL oc-union proxy: blocked-model request reached upstream"; exit 1; }
+ocu_code="$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+  -H 'Authorization: Bearer fx-lane-token-7f3a' \
+  "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" \
+  -d '{"model":"stealth/union-alpha"}')"
+[[ "$ocu_code" == "200" ]] || {
+  echo "FAIL oc-union proxy: allowlisted model got $ocu_code"; exit 1; }
+# ③ 오류 경로 포함 키·토큰 무기록 — upstream 죽인 뒤의 502 응답·stderr·stdout 전부
+kill "$OCU_STUB_PID" 2>/dev/null || true
+wait "$OCU_STUB_PID" 2>/dev/null || true
+ocu_502="$(curl -s -X POST -H 'Authorization: Bearer fx-lane-token-7f3a' \
+  "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" -d '{}')"
+[[ "$ocu_502" == *'"error"'* ]] || { echo "FAIL oc-union proxy: 502 body malformed"; exit 1; }
+if grep -q 'fx-proxy-secret-DONOTLEAK\|fx-lane-token-7f3a' <<<"$ocu_502"; then
+  echo "FAIL oc-union proxy: secret material in error response"; exit 1; fi
+if grep -q 'fx-proxy-secret-DONOTLEAK\|fx-lane-token-7f3a' "$OCU_STATE/proxy.out" "$OCU_STATE/proxy.err"; then
+  echo "FAIL oc-union proxy: secret material in proxy logs"; exit 1; fi
+# ④ fail-closed — 프록시 사망 후에는 연결 자체가 안 된다(다른 경로로 새지 않음)
+kill "$OCU_PROXY_PID" 2>/dev/null || true
+wait "$OCU_PROXY_PID" 2>/dev/null || true
+if curl -s -m 3 -o /dev/null -X POST -H 'Authorization: Bearer fx-lane-token-7f3a' \
+    "http://127.0.0.1:$OCU_PORT/api/v1/chat/completions" -d '{}' 2>/dev/null; then
+  echo "FAIL oc-union proxy: request succeeded after proxy death"; exit 1
+fi
+echo "PASS oc-union-proxy-lane-gate"
+
+# spawn 테스트가 띄운 lane 프록시(합성키 보유)를 pidfile 로 거둔다 — 스위트가
+# 키-보유 프로세스를 흘리고 가면 안 된다.
+for _p in "$TMP"/oc-union.*/proxy.pid; do
+  [[ -s "$_p" ]] || continue
+  read -r _pid <"$_p" || true
+  if [[ "$_pid" =~ ^[0-9]+$ ]]; then kill "$_pid" 2>/dev/null || true; fi
+done
+unset _p _pid
+
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
