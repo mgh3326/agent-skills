@@ -86,12 +86,28 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(tasks, handle)
 PY
 
+HK_SERVER_ERR="$TMP/hkserver.err"
 env HK_FIXTURE_TASKS="$HK_TASKS" HK_FIXTURE_LOG="$HK_LOG" \
   HK_FIXTURE_STATE="$HK_STATE" HK_FIXTURE_PORT_FILE="$HK_PORT_FILE" \
-  HK_FIXTURE_TOKEN="$HK_TOKEN" python3 "$HKSERVER" &
+  HK_FIXTURE_TOKEN="$HK_TOKEN" python3 "$HKSERVER" 2>"$HK_SERVER_ERR" &
 HK_PID=$!
-for _ in $(seq 1 50); do [[ -s "$HK_PORT_FILE" ]] && break; sleep 0.1; done
-[[ -s "$HK_PORT_FILE" ]] || fail "fixture handoffkeep server did not start"
+# Bounded readiness wait (30s — macOS runners can take seconds to reach a
+# fresh python interpreter), with child-liveness checks so a crashed server
+# fails fast and its stderr is shown instead of a bare timeout.
+hk_ready=0
+for _ in $(seq 1 300); do
+  [[ -s "$HK_PORT_FILE" ]] && { hk_ready=1; break; }
+  kill -0 "$HK_PID" 2>/dev/null || break
+  sleep 0.1
+done
+if [[ "$hk_ready" -ne 1 ]]; then
+  echo "fixture handoffkeep server did not start" >&2
+  hk_rc=0
+  wait "$HK_PID" 2>/dev/null || hk_rc=$?
+  echo "fixture server exit rc=$hk_rc" >&2
+  [[ -s "$HK_SERVER_ERR" ]] && cat "$HK_SERVER_ERR" >&2
+  exit 1
+fi
 HK_PORT="$(<"$HK_PORT_FILE")"
 HK_URL="http://127.0.0.1:$HK_PORT"
 
