@@ -64,6 +64,30 @@ director는 함대의 최상위 역할이다. 운영자와 직접 대화하고, 
 
 ## 머지 게이트(전부 충족해야 머지)
 
+<!-- openai-independent-verification:start -->
+**OpenAI 계열 독립검증 계약**
+
+OpenAI 기여가 있는 PR은 contributor 계열 합집합 밖의 검증된 tester가 최종 head에 PASS하지 않으면 머지하지 않는다. Sol·Astra·Terra·Luna는 모델명이 달라도 서로 독립 검증이 아니다.
+
+기여 계열은 합집합이다 — 최종 커미터만 보지 않고 초안·수리·처방을 낸 모든 계열. 계열 unknown이면 독립성 불통과.
+
+신규 Codex 구현은 독립 tester와 reservation이 발주 전에 확보될 때만 발주한다. 없으면 HOLD(no_independent_reviewer).
+
+09-14 동일계열 지연검증 예외는 Sol director 재임 중 OpenAI contributor PR에는 적용하지 않는다.
+
+checker 파생 판정:
+
+- 위 독립성 조건 중 하나라도 충족하지 않으면 BOUNCE
+- 적격 반대계열 tester의 exact-head PASS와 나머지 gate PASS가 모두 있으면 READY
+
+입력·증거:
+
+- contributor family union과 각 기여의 근거(초안/수리/처방 포함)
+- tester provider family, exact tested SHA, PASS 증거
+- family가 unknown이거나 contributor union 밖임을 증명하지 못하면 fail-closed
+- 최종 PR head와 tested SHA가 다르면 BOUNCE
+<!-- openai-independent-verification:end -->
+
 1. 독립 검증 보고의 `VERDICT: JOIN` — tester 급은 워커 이상, 검증 head == PR head.
 2. required CI가 **exact head**에서 초록. `gh pr checks`는 탭으로 파싱한다(공백 split은
    false-green). draft는 CI가 안 돌 수 있다.
