@@ -35,6 +35,30 @@ checker는 director와 builder 사이의 **통신·서무** 역할이다. 빌더
 | G7 | RISKS | 보고의 `RISKS:` 절을 그대로 인용(축약 금지), 개수 |
 | G8 | 큐 | 해당 task가 `join`인지. 아니면 `tasks transition <id> --to join --by CHECKER_LANE` |
 
+<!-- openai-independent-verification:start -->
+**OpenAI 계열 독립검증 계약**
+
+OpenAI 기여가 있는 PR은 contributor 계열 합집합 밖의 검증된 tester가 최종 head에 PASS하지 않으면 머지하지 않는다. Sol·Astra·Terra·Luna는 모델명이 달라도 서로 독립 검증이 아니다.
+
+기여 계열은 합집합이다 — 최종 커미터만 보지 않고 초안·수리·처방을 낸 모든 계열. 계열 unknown이면 독립성 불통과.
+
+신규 Codex 구현은 독립 tester와 reservation이 발주 전에 확보될 때만 발주한다. 없으면 HOLD(no_independent_reviewer).
+
+09-14 동일계열 지연검증 예외는 Sol director 재임 중 OpenAI contributor PR에는 적용하지 않는다.
+
+checker 파생 판정:
+
+- 위 독립성 조건 중 하나라도 충족하지 않으면 BOUNCE
+- 적격 반대계열 tester의 exact-head PASS와 나머지 gate PASS가 모두 있으면 READY
+
+입력·증거:
+
+- contributor family union과 각 기여의 근거(초안/수리/처방 포함)
+- tester provider family, exact tested SHA, PASS 증거
+- family가 unknown이거나 contributor union 밖임을 증명하지 못하면 fail-closed
+- 최종 PR head와 tested SHA가 다르면 BOUNCE
+<!-- openai-independent-verification:end -->
+
 결과: 다이제스트 파일(사이트 정본이 정한 디렉터리) + director에게 relay 한 줄(≤200자):
 `READY <repo>#<n> @<sha7> G1-8 PASS RISKS <k> MIG <y/n> → <digest>` 또는
 `BOUNCE <repo>#<n> @<sha7> G<i> FAIL: <근거> → <digest>`. BOUNCE는 빌더에게도 파일로 알린다.
