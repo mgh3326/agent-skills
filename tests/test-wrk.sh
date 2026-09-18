@@ -724,7 +724,9 @@ echo "PASS pasted-chip-queued: $pasted_out"
 # task406: a queued grok payload renders as a `N queued, Enter to send now`
 # footer with no `──` head, so the claude/devin evidence set returned a false
 # landed=no on real panes (director 실측 2건, 2026-09-18). The footer is
-# grok-only positive evidence; other harnesses must keep ignoring it.
+# grok-only positive evidence, and only when it grew past the pre-prompt
+# baseline — a stale footer, the brief's own echoed text and `0 queued` must
+# not land (r2 tester BLOCKER). Other harnesses must keep ignoring it.
 : >"$TMP/herdr.log"
 grok_queued_out="$(TEST_FIXTURE_SCENARIO=grok-queued spawn_base grok 2>&1)"
 grep -q 'landed=yes' <<<"$grok_queued_out" ||
@@ -732,6 +734,30 @@ grep -q 'landed=yes' <<<"$grok_queued_out" ||
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
   fail "grok queued footer triggered a re-injection: $grok_queued_out"
 echo "PASS grok-queued-chip-landed: $grok_queued_out"
+
+: >"$TMP/herdr.log"
+grok_stale_out="$(TEST_FIXTURE_SCENARIO=grok-stale spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_stale_out" ||
+  fail "stale grok footer must not land the new prompt: $grok_stale_out"
+echo "PASS grok-stale-footer-no-land: $grok_stale_out"
+
+: >"$TMP/herdr.log"
+grok_echo_out="$(TEST_FIXTURE_SCENARIO=grok-echo spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_echo_out" ||
+  fail "brief text echo must not land as a grok queue chip: $grok_echo_out"
+echo "PASS grok-self-echo-no-land: $grok_echo_out"
+
+: >"$TMP/herdr.log"
+grok_zero_out="$(TEST_FIXTURE_SCENARIO=grok-zero spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_zero_out" ||
+  fail "0 queued must not land: $grok_zero_out"
+echo "PASS grok-zero-queued-no-land: $grok_zero_out"
+
+: >"$TMP/herdr.log"
+grok_basefail_out="$(TEST_FIXTURE_SCENARIO=grok-baseline-fail spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_basefail_out" ||
+  fail "a failed baseline read must disable the grok chip: $grok_basefail_out"
+echo "PASS grok-baseline-read-fail-no-chip: $grok_basefail_out"
 
 : >"$TMP/herdr.log"
 grok_no_chip_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base grok 2>&1)"
