@@ -70,12 +70,64 @@ fixture_is_recent_unwrapped_read() {
   [[ " $* " == *" --source recent-unwrapped "* ]]
 }
 
+fixture_prompt_injected() {
+  (( $(fixture_prompt_count) >= 1 ))
+}
+
+fixture_visible_read_count() {
+  [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]] || { printf '0\n'; return; }
+  grep -c -- '--source visible' "$WRK_FIXTURE_LOG" 2>/dev/null || true
+}
+
+# grok landing scenarios: the pre-injection screen (no `agent prompt` in the
+# log yet) and the post-injection screen are modeled separately, because the
+# false positives a queued footer can cause all depend on that difference —
+# the pane is shared, so a chip cannot be attributed to this injection.
+# Returns 1 for non-grok scenarios so the generic chain continues.
+fixture_grok_visible_screen() {
+  case "$scenario" in
+    grok-queued|grok-stale|grok-echo|grok-or-count|grok-toctou|grok-transient|grok-zero|grok-marker) ;;
+    *) return 1 ;;
+  esac
+  if ! fixture_prompt_injected; then
+    case "$scenario" in
+      # Footer mid-repaint: a pre-existing queue is waiting but the `N queued`
+      # suffix has not been painted into this read.
+      grok-stale) printf '○ 1 command still running\n' ;;
+      # Another sender's payload was already waiting, five deep on one line.
+      grok-or-count) printf '○ 1 command still running · 5 queued, Enter to send now\n' ;;
+      *) printf 'fixture welcome screen\n' ;;
+    esac
+  else
+    case "$scenario" in
+      # Self-echo: the pane renders whatever THIS injection actually
+      # delivered, recorded from the `agent prompt` argument. The screen is a
+      # function of the payload, never a canned string.
+      grok-echo) printf 'echo of injection: %s\n' "$(cat "${WRK_FIXTURE_LOG}.payload" 2>/dev/null || true)" ;;
+      # The queue actually shrank (5 → 1) yet chip lines grew 1 → 2.
+      grok-or-count) printf '○ 1 queued, Enter to send now\n○ 1 queued, Enter to send now\n' ;;
+      # The chip shows only on the first post-prompt visible read; later
+      # reads render the same footer without the queued suffix.
+      grok-transient)
+        if (( $(fixture_visible_read_count) == 1 )); then
+          printf '○ 1 command still running · 1 queued, Enter to send now\n'
+        else
+          printf '○ 1 command still running\n'
+        fi ;;
+      grok-zero) printf '○ 1 command still running · 0 queued, Enter to send now\n' ;;
+      # grok-toctou: a different sender queued between the pre-prompt screen
+      # and this injection — observably identical to our own queued chip.
+      *) printf '○ 1 command still running · 1 queued, Enter to send now\n' ;;
+    esac
+  fi
+}
+
 fixture_brief_landed() {
   local prompts recent_reads
   prompts="$(fixture_prompt_count)"
   recent_reads="$(fixture_recent_read_count)"
   case "$scenario" in
-    spawn|landing-marker|prompt-wait-fails) return 0 ;;
+    spawn|landing-marker|prompt-wait-fails|grok-marker) return 0 ;;
     landing-retry|opencode-retry)
       if (( prompts >= 2 )); then return 0; fi
       ;;
@@ -115,7 +167,7 @@ case "${1:-}" in
           devin-done)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"done","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          landing-working-no-marker|landing-delayed-marker|landing-scrollback-marker)
+          landing-working-no-marker|landing-delayed-marker|landing-scrollback-marker|grok-queued|grok-stale|grok-echo|grok-or-count|grok-toctou|grok-transient|grok-zero|grok-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           *)
@@ -157,6 +209,8 @@ case "${1:-}" in
           fi
         elif [[ "$scenario" == landing-pasted ]] && ! fixture_is_recent_unwrapped_read "$@"; then
           printf 'Pasted text\n'
+        elif ! fixture_is_recent_unwrapped_read "$@" && fixture_grok_visible_screen; then
+          :
         elif fixture_brief_landed; then
           printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
         else
@@ -171,6 +225,9 @@ case "${1:-}" in
         ;;
       prompt)
         printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
+        # Record the delivered payload ($4: after `agent prompt <pane>`) so a
+        # scenario can render the pane's self-echo of THIS injection.
+        [[ -z "${WRK_FIXTURE_LOG:-}" ]] || printf '%s' "${4:-}" >"${WRK_FIXTURE_LOG}.payload" 2>/dev/null || true
         if [[ "$scenario" == prompt-wait-fails && "${5:-}" == --wait ]]; then
           exit 7
         fi

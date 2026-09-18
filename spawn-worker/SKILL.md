@@ -364,6 +364,7 @@ acp-runner --job <job_id> -c <worktree> -p brief.md   --model gemini-3.6-flash -
 확인한다. visible 화면에서 밀려나도 transcript에는 남고, 큐 대기 중 주입은
 `recent-unwrapped`에 아직 안 보이므로 한쪽만 보면 미착지로 오판한다. visible의 `Pasted text`
 칩도 queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오므로 착지 증거가 아니다.
+큐 표시 원문은 하네스마다 다르다 — 하네스별 칩·푸터의 정본은 relay-handoff §3-2 표다.
 일반 프로필은 30초, codex는 60초 창에서 0.5→2초로 backoff 관찰하고, 양성 증거가 없을
 때만 최대 한 번 재주입한다. 자동화는 `--landing-strict`로 pane의 OK 행은 보존한 채
 미착지를 exit 76으로 받을 수 있다.

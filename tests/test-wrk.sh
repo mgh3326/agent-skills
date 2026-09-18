@@ -721,6 +721,120 @@ grep -q 'landed=yes' <<<"$pasted_out"
 grep -q 'agent read w:p1 --source visible --lines 40' "$TMP/herdr.log"
 echo "PASS pasted-chip-queued: $pasted_out"
 
+# task406: a queued grok payload renders as a `N queued, Enter to send now`
+# footer with no `──` head. On a shared screen that chip cannot be attributed
+# to THIS injection — the r3 tester showed every "grew past baseline" variant
+# is still a false positive (self-echo, missed baseline, count growth, another
+# sender). The chip is therefore an ambiguous signal, never landed evidence:
+# it only suppresses re-injection so a possibly queued payload is not
+# duplicated. The transcript marker stays the only positive evidence, and
+# other harnesses must keep ignoring the footer.
+: >"$TMP/herdr.log"
+grok_queued_out="$(TEST_FIXTURE_SCENARIO=grok-queued spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_queued_out" ||
+  fail "grok queued footer is ambiguous, not landed evidence: $grok_queued_out"
+grep -q 'grok-queue-chip-unattributable' <<<"$grok_queued_out" ||
+  fail "grok chip landed=no must name the unattributable reason: $grok_queued_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "grok queued chip triggered a re-injection: $grok_queued_out"
+echo "PASS grok-queued-chip-ambiguous: $grok_queued_out"
+
+# Self-echo with a payload that itself quotes the chip text: the fixture
+# echoes the actual injected payload, so this screen genuinely is this
+# brief's own echo — and it still must not land.
+echo_prompt="$TMP/grok-echo-prompt.md"
+printf 'brief literal: 1 queued, Enter to send now (quoted contract text)\n' >"$echo_prompt"
+PROMPT="$echo_prompt"
+: >"$TMP/herdr.log"
+grok_echo_out="$(TEST_FIXTURE_SCENARIO=grok-echo spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_echo_out" ||
+  fail "brief self-echo must not land as a grok queue chip: $grok_echo_out"
+[[ "$(grep -c '^agent prompt ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "grok self-echo chip triggered a re-injection: $grok_echo_out"
+echo "PASS grok-self-echo-no-land: $grok_echo_out"
+
+# Derivation proof: a payload without the chip text must render a different
+# post-injection screen, so the normal retry path comes back. A fixture that
+# hardcodes the echo would keep showing the chip and fail this case.
+echo_prompt_b="$TMP/grok-echo-prompt-b.md"
+printf 'brief without the queued contract phrase\n' >"$echo_prompt_b"
+PROMPT="$echo_prompt_b"
+: >"$TMP/herdr.log"
+grok_echo_b_out="$(TEST_FIXTURE_SCENARIO=grok-echo spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_echo_b_out" ||
+  fail "payload-derived echo screen changed the verdict path: $grok_echo_b_out"
+grep -q 'action=reinject-once' <<<"$grok_echo_b_out" ||
+  fail "echo screen must be derived from the actual payload: $grok_echo_b_out"
+[[ "$(grep -c '^agent prompt ' "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "payload-derived echo suppressed the re-injection: $grok_echo_b_out"
+echo "PASS grok-echo-screen-from-payload: $grok_echo_b_out"
+PROMPT="$TMP/prompt.md"
+
+: >"$TMP/herdr.log"
+grok_stale_out="$(TEST_FIXTURE_SCENARIO=grok-stale spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_stale_out" ||
+  fail "a footer the transitional pre-prompt screen missed must not land: $grok_stale_out"
+echo "PASS grok-missed-footer-no-land: $grok_stale_out"
+
+: >"$TMP/herdr.log"
+grok_or_out="$(TEST_FIXTURE_SCENARIO=grok-or-count spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_or_out" ||
+  fail "chip-line growth while the queue shrank must not land: $grok_or_out"
+echo "PASS grok-or-count-no-land: $grok_or_out"
+
+: >"$TMP/herdr.log"
+grok_toctou_out="$(TEST_FIXTURE_SCENARIO=grok-toctou spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_toctou_out" ||
+  fail "another sender's queued payload must not land this injection: $grok_toctou_out"
+echo "PASS grok-toctou-no-land: $grok_toctou_out"
+
+: >"$TMP/herdr.log"
+grok_zero_out="$(TEST_FIXTURE_SCENARIO=grok-zero spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_zero_out" ||
+  fail "0 queued must not land: $grok_zero_out"
+grep -q 'action=reinject-once' <<<"$grok_zero_out" ||
+  fail "0 queued is not a chip — the normal retry must still run: $grok_zero_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "0 queued suppressed the re-injection: $grok_zero_out"
+echo "PASS grok-zero-queued-no-land: $grok_zero_out"
+
+# A chip visible only on the first observation still suppresses re-injection,
+# and the final warning must keep WHY: the last ticks see no chip, so without
+# provenance the reason would decay to working-without-positive-evidence.
+: >"$TMP/herdr.log"
+grok_transient_out="$(TEST_FIXTURE_SCENARIO=grok-transient spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_transient_out" ||
+  fail "transient grok chip must not land: $grok_transient_out"
+grep -q 'first_ambiguous_reason=grok-queue-chip-unattributable' <<<"$grok_transient_out" ||
+  fail "transient chip lost its ambiguity provenance: $grok_transient_out"
+grep -q 'retry=skipped reason=ambiguous-observation' <<<"$grok_transient_out" ||
+  fail "transient chip must still suppress re-injection: $grok_transient_out"
+[[ "$(grep -c '^agent prompt ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "transient chip triggered a re-injection: $grok_transient_out"
+echo "PASS grok-transient-chip-provenance: $grok_transient_out"
+
+: >"$TMP/herdr.log"
+grok_marker_out="$(TEST_FIXTURE_SCENARIO=grok-marker spawn_base grok 2>&1)"
+grep -q 'landed=yes' <<<"$grok_marker_out" ||
+  fail "transcript marker must stay priority-1 evidence for grok: $grok_marker_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "grok marker path triggered a re-injection: $grok_marker_out"
+echo "PASS grok-marker-priority-landed: $grok_marker_out"
+
+: >"$TMP/herdr.log"
+grok_no_chip_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_no_chip_out" ||
+  fail "grok without the queued footer must stay landed=no: $grok_no_chip_out"
+grep -q 'action=reinject-once' <<<"$grok_no_chip_out" ||
+  fail "grok negative path lost the reinject-once action: $grok_no_chip_out"
+echo "PASS grok-no-chip-negative: $grok_no_chip_out"
+
+: >"$TMP/herdr.log"
+claude_grok_chip_out="$(TEST_FIXTURE_SCENARIO=grok-queued spawn_base sonnet 2>&1)"
+grep -q 'landed=no' <<<"$claude_grok_chip_out" ||
+  fail "claude pane must not treat the grok footer as evidence: $claude_grok_chip_out"
+echo "PASS claude-ignores-grok-queued-chip: $claude_grok_chip_out"
+
 : >"$TMP/herdr.log"
 opencode_retry_out="$(TEST_FIXTURE_SCENARIO=opencode-retry spawn_base oc-omni 2>&1)"
 grep -q 'landed=retry' <<<"$opencode_retry_out"
