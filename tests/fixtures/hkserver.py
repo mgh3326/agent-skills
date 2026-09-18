@@ -37,6 +37,22 @@ CLIENT = "fixture-client"
 LOCK = threading.Lock()
 
 
+def load_redirect_map():
+    # {"GET /v1/tasks/446": "http://localhost:P2/v1/tasks/446"} — the key is
+    # matched on the exact "METHOD path" pair after auth, and the request is
+    # answered 302 with the given Location. Used to prove wrk refuses to
+    # follow redirects instead of forwarding the bearer to a second hop.
+    try:
+        with open(os.environ.get("HK_FIXTURE_REDIRECT_MAP", ""),
+                  encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, ValueError):
+        return {}
+
+
+REDIRECT_MAP = load_redirect_map()
+
+
 def load_tasks():
     try:
         with open(TASKS_FILE, encoding="utf-8") as handle:
@@ -60,11 +76,14 @@ def save_state(state):
     os.replace(tmp, STATE_FILE)
 
 
-def log_request(method, path):
+def log_request(method, path, authorized):
     if not LOG_FILE:
         return
+    # auth=present/absent records header presence only — the token value is
+    # never logged, so a credential cannot leak through the fixture log.
     with open(LOG_FILE, "a", encoding="utf-8") as handle:
-        handle.write("%s %s\n" % (method, path))
+        handle.write("%s %s auth=%s\n"
+                     % (method, path, "present" if authorized else "absent"))
 
 
 TASKS = load_tasks()
@@ -155,9 +174,17 @@ class Handler(BaseHTTPRequestHandler):
 
     def _dispatch(self, method):
         path = urlsplit(self.path).path
-        log_request(method, path)
-        if not self._authorized():
+        authorized = self._authorized()
+        log_request(method, path, authorized)
+        if not authorized:
             self._send(401, {"error": "unauthorized"})
+            return
+        redirect = REDIRECT_MAP.get("%s %s" % (method, path))
+        if redirect:
+            self.send_response(302)
+            self.send_header("Location", redirect)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
             return
         if path in ("/v1/bench/scores", "/v1/bench/grades"):
             self._send(405, {"error": "method_not_allowed"})

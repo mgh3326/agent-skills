@@ -13,15 +13,20 @@ PANEWIRE="$ROOT/tests/fixtures/panewire"
 HKSERVER="$ROOT/tests/fixtures/hkserver.py"
 TMP="$(mktemp -d)"
 
-HK_PID=""
 cleanup() {
-  local pidfile pid
+  local pidfile pid server_pid
   while IFS= read -r pidfile; do
     [[ -s "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
     if [[ "$pid" =~ ^[0-9]+$ ]]; then kill "$pid" 2>/dev/null || true; fi
   done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
-  [[ -z "$HK_PID" ]] || kill "$HK_PID" 2>/dev/null || true
+  # Fixture servers are registered in a pid file because start_hk runs in a
+  # command substitution — an array update there would never survive.
+  if [[ -f "$TMP/hk-server.pids" ]]; then
+    while IFS= read -r server_pid; do
+      if [[ "$server_pid" =~ ^[0-9]+$ ]]; then kill "$server_pid" 2>/dev/null || true; fi
+    done <"$TMP/hk-server.pids"
+  fi
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -38,10 +43,7 @@ export HANDOFFKEEP_BIN="$TMP/absent-handoffkeep"
 
 JOBS="$ARBITER_INBOX_ROOT"
 HK_TOKEN="fixture-token-445-must-not-leak"
-HK_LOG="$TMP/hk-requests.log"
-HK_STATE="$TMP/hk-state.json"
 HK_TASKS="$TMP/hk-tasks.json"
-HK_PORT_FILE="$TMP/hk-port"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -86,30 +88,79 @@ with open(sys.argv[1], "w", encoding="utf-8") as handle:
     json.dump(tasks, handle)
 PY
 
-HK_SERVER_ERR="$TMP/hkserver.err"
-env HK_FIXTURE_TASKS="$HK_TASKS" HK_FIXTURE_LOG="$HK_LOG" \
-  HK_FIXTURE_STATE="$HK_STATE" HK_FIXTURE_PORT_FILE="$HK_PORT_FILE" \
-  HK_FIXTURE_TOKEN="$HK_TOKEN" python3 "$HKSERVER" 2>"$HK_SERVER_ERR" &
-HK_PID=$!
-# Bounded readiness wait (30s — macOS runners can take seconds to reach a
-# fresh python interpreter), with child-liveness checks so a crashed server
-# fails fast and its stderr is shown instead of a bare timeout.
-hk_ready=0
-for _ in $(seq 1 300); do
-  [[ -s "$HK_PORT_FILE" ]] && { hk_ready=1; break; }
-  kill -0 "$HK_PID" 2>/dev/null || break
-  sleep 0.1
-done
-if [[ "$hk_ready" -ne 1 ]]; then
-  echo "fixture handoffkeep server did not start" >&2
-  hk_rc=0
-  wait "$HK_PID" 2>/dev/null || hk_rc=$?
-  echo "fixture server exit rc=$hk_rc" >&2
-  [[ -s "$HK_SERVER_ERR" ]] && cat "$HK_SERVER_ERR" >&2
-  exit 1
-fi
-HK_PORT="$(<"$HK_PORT_FILE")"
+# Start one fixture server. Args: name tasks-file redirect-map-file.
+# Prints the bound port. The server runs for the whole suite, so BOTH of
+# its stdio streams must go to files: leaving stdout attached to the
+# command substitution's pipe would keep $(start_hk ...) waiting on the
+# server forever. The wait is bounded (30s — macOS runners can take
+# seconds to reach a fresh python interpreter) with child-liveness checks
+# so a crashed server fails fast and its output is shown, not a bare
+# timeout; a live-but-deaf child is killed before `wait` so the
+# diagnostic path itself can never block.
+start_hk() {
+  local name="$1" tasks_file="$2" rmap_file="$3"
+  local port_file="$TMP/hk-$name.port" err_file="$TMP/hk-$name.err"
+  local pid ready=0 rc
+  env HK_FIXTURE_TASKS="$tasks_file" HK_FIXTURE_LOG="$TMP/hk-$name.log" \
+    HK_FIXTURE_STATE="$TMP/hk-$name.state.json" \
+    HK_FIXTURE_PORT_FILE="$port_file" HK_FIXTURE_REDIRECT_MAP="$rmap_file" \
+    HK_FIXTURE_TOKEN="$HK_TOKEN" python3 "$HKSERVER" >"$err_file" 2>&1 &
+  pid=$!
+  printf '%s\n' "$pid" >>"$TMP/hk-server.pids"
+  for _ in $(seq 1 300); do
+    [[ -s "$port_file" ]] && { ready=1; break; }
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.1
+  done
+  if [[ "$ready" -ne 1 ]]; then
+    echo "fixture handoffkeep server '$name' did not start" >&2
+    if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; fi
+    rc=0
+    wait "$pid" 2>/dev/null || rc=$?
+    echo "fixture server exit rc=$rc" >&2
+    [[ -s "$err_file" ]] && cat "$err_file" >&2
+    exit 1
+  fi
+  cat "$port_file"
+}
+
+# hop3: pure sink — only logs whether a forwarded Authorization arrived.
+echo '{}' >"$TMP/hk-hop3-tasks.json"
+echo '{}' >"$TMP/hk-empty-map.json"
+HOP3_PORT="$(start_hk hop3 "$TMP/hk-hop3-tasks.json" "$TMP/hk-empty-map.json")"
+
+# hop2: serves task 446 normally (the redirect target for hop1) and 302s
+# every reps PUT to hop3 (the redirect source for the export test).
+python3 - "$TMP/hk-hop2-tasks.json" <<'PY'
+import json, sys
+tasks = {"446": {"id": 446, "state": "in_progress", "lane": "x",
+                 "claimed_by": "", "refs": {}, "events": []}}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(tasks, handle)
+PY
+python3 - "$TMP/hk-hop2-map.json" "$HOP3_PORT" <<'PY'
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({"PUT /v1/bench/reps":
+               "http://localhost:%s/v1/bench/reps" % sys.argv[2]}, handle)
+PY
+HOP2_PORT="$(start_hk hop2 "$TMP/hk-hop2-tasks.json" "$TMP/hk-hop2-map.json")"
+
+# hop1 (main): serves tasks 445/395 normally, 302s GET /v1/tasks/446 to
+# hop2. PUT stays normal — the export tests need it.
+python3 - "$TMP/hk-hop1-map.json" "$HOP2_PORT" <<'PY'
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({"GET /v1/tasks/446":
+               "http://localhost:%s/v1/tasks/446" % sys.argv[2]}, handle)
+PY
+HK_PORT="$(start_hk hop1 "$HK_TASKS" "$TMP/hk-hop1-map.json")"
 HK_URL="http://127.0.0.1:$HK_PORT"
+# The per-hop logs the tests assert on.
+HK_LOG="$TMP/hk-hop1.log"
+HOP2_LOG="$TMP/hk-hop2.log"
+HOP3_LOG="$TMP/hk-hop3.log"
+HK_STATE="$TMP/hk-hop1.state.json"
 
 # Spawn against fixture herdr. $1=model $2=job; rest = extra wrk args.
 spawn_t() {
@@ -313,13 +364,24 @@ PY
 echo "PASS telemetry-rep-exported-readback"
 
 # T8 — same terminal event and repeated reconcile: same origin_id, zero
-# additional reps rows (deterministic idempotency).
+# additional reps rows AND zero additional export attempts — a replayed
+# terminal receipt must not flip exported evidence back to pending_export
+# or trigger a second PUT.
 before="$(reps_count)"
+puts_before="$(grep -c 'PUT /v1/bench/reps' "$HK_LOG")"
 wrk_hk 'done' t445-done --report "$report" >/dev/null
 wrk_hk reconcile >/dev/null
 wrk_hk reconcile --job t445-done >/dev/null
 [[ "$(reps_count)" -eq "$before" ]] ||
   fail "repeated terminal/reconcile minted new reps rows"
+[[ "$(grep -c 'PUT /v1/bench/reps' "$HK_LOG")" -eq "$puts_before" ]] ||
+  fail "replayed terminal receipt triggered a second export"
+python3 - "$term_receipt" <<'PY'
+import json, sys
+receipt = json.load(open(sys.argv[1], encoding="utf-8"))
+assert receipt["projection"]["state"] == "exported", receipt["projection"]
+assert receipt["projection"]["attempts"] == 1, receipt["projection"]
+PY
 echo "PASS telemetry-idempotent-export"
 
 # T9 — externally produced terminal kinds reach receipts through reconcile:
@@ -508,5 +570,89 @@ echo "PASS telemetry-hk395-honest-state-dwell"
   fail "wrk called a score/grade endpoint: $(grep 'bench/' "$HK_LOG")"
 grep -q 'PUT /v1/bench/reps' "$HK_LOG" || fail "no reps PUT reached the server"
 echo "PASS telemetry-reps-only-export"
+
+# T17 — a 302 from the validated origin is refused before it is followed:
+# the bind fails closed (no binding, no pane, no OK) and the second hop is
+# never contacted with credentials. urllib's default redirect handler
+# would forward the Authorization bearer — this is the xAI BOUNCE case.
+rm -f "$TMP/herdr.log"
+run_fail spawn_t codex t445-redir --task-id 446
+[[ ! -e "$JOBS/t445-redir/telemetry/binding.json" ]] ||
+  fail "redirected task was bound anyway"
+if [[ -f "$TMP/herdr.log" ]]; then
+  ! grep -q 'tab create' "$TMP/herdr.log" ||
+    fail "pane created for an unverifiable (redirected) binding"
+fi
+! grep -q 'auth=present' "$HOP2_LOG" 2>/dev/null ||
+  fail "bearer forwarded across redirect: $(cat "$HOP2_LOG")"
+echo "PASS telemetry-redirect-refused-bind"
+
+# T18 — the same refusal on the reps PUT path: a 302 drain target leaves
+# the receipt pending_export (fail-closed, never dropped) and the second
+# hop sees no Authorization; reconciling against the real origin then
+# exports normally.
+spawn_bound codex t445-redirput 445 >/dev/null
+mk_events t445-redirput
+redirput_report="$(mk_report t445-redirput)"
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER_BIN" \
+  WRK_HANDOFFKEEP_URL="http://127.0.0.1:$HOP2_PORT" \
+  WRK_HANDOFFKEEP_TOKEN="$HK_TOKEN" \
+  WRK_PANEWIRE_LOG="$TMP/panewire.log" \
+  "$WRK" 'done' t445-redirput --report "$redirput_report" >/dev/null 2>&1
+python3 - "$JOBS/t445-redirput/telemetry" <<'PY'
+import json, os, sys
+telemetry = sys.argv[1]
+names = [n for n in os.listdir(os.path.join(telemetry, "receipts"))
+         if n.startswith("terminal-")]
+assert len(names) == 1, names
+receipt = json.load(open(os.path.join(telemetry, "receipts", names[0])))
+projection = receipt["projection"]
+assert projection["state"] == "pending_export", projection
+assert str(projection["last_error"]).startswith("http_3"), projection
+PY
+! grep -q 'auth=present' "$HOP3_LOG" 2>/dev/null ||
+  fail "bearer forwarded across reps-PUT redirect: $(cat "$HOP3_LOG")"
+wrk_hk reconcile --job t445-redirput >/dev/null
+python3 - "$JOBS/t445-redirput/telemetry" <<'PY'
+import json, os, sys
+telemetry = sys.argv[1]
+names = [n for n in os.listdir(os.path.join(telemetry, "receipts"))
+         if n.startswith("terminal-")]
+receipt = json.load(open(os.path.join(telemetry, "receipts", names[0])))
+assert receipt["projection"]["state"] == "exported", receipt["projection"]
+PY
+echo "PASS telemetry-redirect-refused-export"
+
+# T19 — mutant sensitivity: restoring urllib's default redirect handling
+# makes the T17/T18 assertions go RED. Run a mutant copy that re-enables
+# redirect following; the bind then "succeeds" only because the bearer was
+# forwarded to the second hop — the hop2 log records auth=present, which
+# is exactly what T17 asserts must never happen.
+cp "$WRK" "$TMP/wrk-mutant"
+python3 - "$TMP/wrk-mutant" <<'PY'
+import sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+needle = "build_opener(_RefuseRedirect)"
+assert src.count(needle) == 2, src.count(needle)
+open(path, "w", encoding="utf-8").write(src.replace(needle, "build_opener()"))
+PY
+env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  ARBITER_BIN="$ARBITER_BIN" WRK_COMPLETION_INTERVAL_S=3600 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr-mutant.log" \
+  WRK_HANDOFFKEEP_URL="$HK_URL" WRK_HANDOFFKEEP_TOKEN="$HK_TOKEN" \
+  "$TMP/wrk-mutant" spawn -c "$ROOT" -m codex -p "$PROMPT" -w w -l fixture \
+  --job t445-mutant --task-id 446 --t T1 >/dev/null 2>&1 || true
+grep -q 'GET /v1/tasks/446 auth=present' "$HOP2_LOG" ||
+  fail "mutant did not forward the bearer — T17 assertion is not sensitive"
+[[ -e "$JOBS/t445-mutant/telemetry/binding.json" ]] ||
+  fail "mutant did not bind through the redirect — test is not sensitive"
+if [[ -f "$JOBS/t445-mutant/completion-sentinel.pid" ]]; then
+  mutant_sentinel=""
+  read -r mutant_sentinel <"$JOBS/t445-mutant/completion-sentinel.pid" || true
+  if [[ "$mutant_sentinel" =~ ^[0-9]+$ ]]; then kill "$mutant_sentinel" 2>/dev/null || true; fi
+fi
+rm -rf "$JOBS/t445-mutant"
+echo "PASS telemetry-redirect-mutant-red"
 
 echo "PASS all telemetry tests"

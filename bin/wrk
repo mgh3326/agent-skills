@@ -1504,6 +1504,8 @@ if parsed.scheme != "https" and not (
 ):
     sys.stderr.write("hk: handoffkeep URL must be https (http only to localhost)\n")
     sys.exit(2)
+origin = (parsed.scheme, (parsed.hostname or "").lower(),
+          parsed.port or (443 if parsed.scheme == "https" else 80))
 body = None
 if body_file:
     try:
@@ -1516,8 +1518,29 @@ request = urllib.request.Request(url.rstrip("/") + path, data=body, method=metho
 request.add_header("Authorization", "Bearer " + token)
 if body is not None:
     request.add_header("Content-Type", "application/json")
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    # The only request ever sent is to the exact configured, validated
+    # origin above. urllib's default handler would follow a 3xx and
+    # forward the bearer header to the new location — returning None
+    # turns the redirect into an HTTPError so the caller fails closed
+    # instead of leaking credentials or trusting a second hop.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+opener = urllib.request.build_opener(_RefuseRedirect)
+# Immediately before the credential goes on the wire, the request target
+# must still be the exact configured origin — scheme, host, and port.
+sending = urlsplit(request.full_url)
+actual = (sending.scheme, (sending.hostname or "").lower(),
+          sending.port or (443 if sending.scheme == "https" else 80))
+if actual != origin:
+    sys.stderr.write("hk: refusing to send credentials to a non-configured origin\n")
+    sys.exit(2)
 try:
-    with urllib.request.urlopen(
+    with opener.open(
         request, timeout=float(os.environ.get("WRK_HK_TIMEOUT_S", "3"))
     ) as response:
         sys.stdout.write(response.read().decode("utf-8", "replace"))
@@ -2007,6 +2030,27 @@ if not mine:
     fail("no participant segment on record for terminal evidence")
 segment = mine[-1]
 info = attempts[attempt]
+path = os.path.join(out_dir, "receipts",
+                    "terminal-%s-%s-%s.json" % (attempt, segment["seg"], kind))
+existing = load(path, None)
+if (isinstance(existing, dict) and existing.get("phase") == "terminal"
+        and not existing.get("budget_exceeded")):
+    # Replay of the same (attempt, segment, kind): the first durable
+    # terminal observation stands. An exported receipt is never rewritten
+    # back to pending_export and never triggers a second export — only
+    # the attempt bookkeeping is reconciled if it was lost.
+    if info.get("status") != "terminal":
+        info["status"] = "terminal"
+        info["closed_at"] = now_s
+        info["terminal_kind"] = kind
+        atomic(os.path.join(out_dir, "attempts.json"), attempts)
+    intent = load(os.path.join(out_dir, "intent.json"), None)
+    if isinstance(intent, dict) and intent.get("attempt_id") == attempt \
+            and intent.get("status") != "terminal":
+        intent["status"] = "terminal"
+        atomic(os.path.join(out_dir, "intent.json"), intent)
+    print("%s\t%s\t%s" % (attempt, segment["seg"], segment["origin_id"]))
+    sys.exit(0)
 opened_at = parse_at(info.get("opened_at"))
 ended_at = parse_at(now_s)
 duration = None
@@ -2052,8 +2096,6 @@ if task_link:
     receipt["evidence"]["task_refs_job_id"] = task_link
 if os.environ.get("WRK_TELEMETRY_FAIL_STORE", "") in ("terminal", "all"):
     fail("injected store failure (WRK_TELEMETRY_FAIL_STORE)")
-path = os.path.join(out_dir, "receipts",
-                    "terminal-%s-%s-%s.json" % (attempt, segment["seg"], kind))
 if not atomic(path, receipt, limit=max_bytes):
     stub = {"kind": "telemetry_receipt", "schema_version": 1, "phase": "terminal",
             "task_ref": binding["task_ref"], "job_id": job, "attempt_id": attempt,
@@ -2194,18 +2236,36 @@ def rep_for(receipt):
     }
 
 
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    # Same rule as hk_request: the bearer may only go to the exact
+    # configured, validated origin. A 3xx becomes an HTTPError and the
+    # receipt stays pending_export — never silently forwarded.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
 def put_reps(reps):
     parsed = urlsplit(url)
     if parsed.scheme != "https" and not (
         parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1", "::1")
     ):
         return "config"
+    origin = (parsed.scheme, (parsed.hostname or "").lower(),
+              parsed.port or (443 if parsed.scheme == "https" else 80))
     body = json.dumps({"reps": reps}).encode("utf-8")
     request = urllib.request.Request(url.rstrip("/") + "/v1/bench/reps", data=body, method="PUT")
     request.add_header("Authorization", "Bearer " + token)
     request.add_header("Content-Type", "application/json")
+    opener = urllib.request.build_opener(_RefuseRedirect)
+    # Same contract as hk_request: re-verify the exact configured origin
+    # (scheme/host/port) immediately before the credential leaves.
+    sending = urlsplit(request.full_url)
+    actual = (sending.scheme, (sending.hostname or "").lower(),
+              sending.port or (443 if sending.scheme == "https" else 80))
+    if actual != origin:
+        return "origin_changed"
     try:
-        with urllib.request.urlopen(
+        with opener.open(
             request, timeout=float(os.environ.get("WRK_HK_TIMEOUT_S", "3"))
         ) as response:
             payload = json.loads(response.read().decode("utf-8", "replace"))
@@ -2383,7 +2443,8 @@ for job_name in job_names:
         # covers every flat event of that kind for the segment, so a
         # repeated event or reconcile never rewrites it or mints a row.
         existing = load(os.path.join(receipts_dir, rname), None)
-        if isinstance(existing, dict) and existing.get("phase") == "terminal":
+        if (isinstance(existing, dict) and existing.get("phase") == "terminal"
+                and not existing.get("budget_exceeded")):
             continue
         event = load(os.path.join(events_dir, name), {})
         info = attempts[attempt]
