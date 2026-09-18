@@ -74,25 +74,34 @@ fixture_prompt_injected() {
   (( $(fixture_prompt_count) >= 1 ))
 }
 
-# grok landing scenarios: the baseline visible read happens before `agent
-# prompt` (no prompt in the log yet); later reads see the post-injection
-# screen. Returns 1 for non-grok scenarios so the generic chain continues.
+# grok landing scenarios: the pre-injection screen (no `agent prompt` in the
+# log yet) and the post-injection screen are modeled separately, because the
+# false positives a queued footer can cause all depend on that difference —
+# the pane is shared, so a chip cannot be attributed to this injection.
+# Returns 1 for non-grok scenarios so the generic chain continues.
 fixture_grok_visible_screen() {
   case "$scenario" in
-    grok-queued|grok-stale|grok-echo|grok-zero|grok-baseline-fail) ;;
+    grok-queued|grok-stale|grok-echo|grok-or-count|grok-toctou|grok-zero|grok-marker) ;;
     *) return 1 ;;
   esac
   if ! fixture_prompt_injected; then
     case "$scenario" in
-      grok-stale) printf '○ 1 command still running · 1 queued, Enter to send now\n' ;;
-      grok-echo) printf 'brief literal: 1 queued, Enter to send now (quoted contract text)\n' ;;
-      grok-baseline-fail) echo 'fixture: baseline visible read unavailable' >&2; exit 9 ;;
+      # Footer mid-repaint: a pre-existing queue is waiting but the `N queued`
+      # suffix has not been painted into this read.
+      grok-stale) printf '○ 1 command still running\n' ;;
+      # Another sender's payload was already waiting, five deep on one line.
+      grok-or-count) printf '○ 1 command still running · 5 queued, Enter to send now\n' ;;
       *) printf 'fixture welcome screen\n' ;;
     esac
   else
     case "$scenario" in
-      grok-echo) printf 'brief literal: 1 queued, Enter to send now (quoted contract text)\n7 queued\n' ;;
+      # The brief itself quotes the contract text; only its echo is visible.
+      grok-echo) printf 'brief literal: 1 queued, Enter to send now (quoted contract text)\n' ;;
+      # The queue actually shrank (5 → 1) yet chip lines grew 1 → 2.
+      grok-or-count) printf '○ 1 queued, Enter to send now\n○ 1 queued, Enter to send now\n' ;;
       grok-zero) printf '○ 1 command still running · 0 queued, Enter to send now\n' ;;
+      # grok-toctou: a different sender queued between the pre-prompt screen
+      # and this injection — observably identical to our own queued chip.
       *) printf '○ 1 command still running · 1 queued, Enter to send now\n' ;;
     esac
   fi
@@ -103,7 +112,7 @@ fixture_brief_landed() {
   prompts="$(fixture_prompt_count)"
   recent_reads="$(fixture_recent_read_count)"
   case "$scenario" in
-    spawn|landing-marker|prompt-wait-fails) return 0 ;;
+    spawn|landing-marker|prompt-wait-fails|grok-marker) return 0 ;;
     landing-retry|opencode-retry)
       if (( prompts >= 2 )); then return 0; fi
       ;;
@@ -143,7 +152,7 @@ case "${1:-}" in
           devin-done)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"done","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          landing-working-no-marker|landing-delayed-marker|landing-scrollback-marker|grok-queued|grok-stale|grok-echo|grok-zero|grok-baseline-fail)
+          landing-working-no-marker|landing-delayed-marker|landing-scrollback-marker|grok-queued|grok-stale|grok-echo|grok-or-count|grok-toctou|grok-zero|grok-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           *)

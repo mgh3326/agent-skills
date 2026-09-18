@@ -722,42 +722,66 @@ grep -q 'agent read w:p1 --source visible --lines 40' "$TMP/herdr.log"
 echo "PASS pasted-chip-queued: $pasted_out"
 
 # task406: a queued grok payload renders as a `N queued, Enter to send now`
-# footer with no `──` head, so the claude/devin evidence set returned a false
-# landed=no on real panes (director 실측 2건, 2026-09-18). The footer is
-# grok-only positive evidence, and only when it grew past the pre-prompt
-# baseline — a stale footer, the brief's own echoed text and `0 queued` must
-# not land (r2 tester BLOCKER). Other harnesses must keep ignoring it.
+# footer with no `──` head. On a shared screen that chip cannot be attributed
+# to THIS injection — the r3 tester showed every "grew past baseline" variant
+# is still a false positive (self-echo, missed baseline, count growth, another
+# sender). The chip is therefore an ambiguous signal, never landed evidence:
+# it only suppresses re-injection so a possibly queued payload is not
+# duplicated. The transcript marker stays the only positive evidence, and
+# other harnesses must keep ignoring the footer.
 : >"$TMP/herdr.log"
 grok_queued_out="$(TEST_FIXTURE_SCENARIO=grok-queued spawn_base grok 2>&1)"
-grep -q 'landed=yes' <<<"$grok_queued_out" ||
-  fail "grok queued footer must count as landed: $grok_queued_out"
+grep -q 'landed=no' <<<"$grok_queued_out" ||
+  fail "grok queued footer is ambiguous, not landed evidence: $grok_queued_out"
+grep -q 'grok-queue-chip-unattributable' <<<"$grok_queued_out" ||
+  fail "grok chip landed=no must name the unattributable reason: $grok_queued_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
-  fail "grok queued footer triggered a re-injection: $grok_queued_out"
-echo "PASS grok-queued-chip-landed: $grok_queued_out"
-
-: >"$TMP/herdr.log"
-grok_stale_out="$(TEST_FIXTURE_SCENARIO=grok-stale spawn_base grok 2>&1)"
-grep -q 'landed=no' <<<"$grok_stale_out" ||
-  fail "stale grok footer must not land the new prompt: $grok_stale_out"
-echo "PASS grok-stale-footer-no-land: $grok_stale_out"
+  fail "grok queued chip triggered a re-injection: $grok_queued_out"
+echo "PASS grok-queued-chip-ambiguous: $grok_queued_out"
 
 : >"$TMP/herdr.log"
 grok_echo_out="$(TEST_FIXTURE_SCENARIO=grok-echo spawn_base grok 2>&1)"
 grep -q 'landed=no' <<<"$grok_echo_out" ||
-  fail "brief text echo must not land as a grok queue chip: $grok_echo_out"
+  fail "brief self-echo must not land as a grok queue chip: $grok_echo_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "grok self-echo chip triggered a re-injection: $grok_echo_out"
 echo "PASS grok-self-echo-no-land: $grok_echo_out"
+
+: >"$TMP/herdr.log"
+grok_stale_out="$(TEST_FIXTURE_SCENARIO=grok-stale spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_stale_out" ||
+  fail "a footer the transitional pre-prompt screen missed must not land: $grok_stale_out"
+echo "PASS grok-missed-footer-no-land: $grok_stale_out"
+
+: >"$TMP/herdr.log"
+grok_or_out="$(TEST_FIXTURE_SCENARIO=grok-or-count spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_or_out" ||
+  fail "chip-line growth while the queue shrank must not land: $grok_or_out"
+echo "PASS grok-or-count-no-land: $grok_or_out"
+
+: >"$TMP/herdr.log"
+grok_toctou_out="$(TEST_FIXTURE_SCENARIO=grok-toctou spawn_base grok 2>&1)"
+grep -q 'landed=no' <<<"$grok_toctou_out" ||
+  fail "another sender's queued payload must not land this injection: $grok_toctou_out"
+echo "PASS grok-toctou-no-land: $grok_toctou_out"
 
 : >"$TMP/herdr.log"
 grok_zero_out="$(TEST_FIXTURE_SCENARIO=grok-zero spawn_base grok 2>&1)"
 grep -q 'landed=no' <<<"$grok_zero_out" ||
   fail "0 queued must not land: $grok_zero_out"
+grep -q 'action=reinject-once' <<<"$grok_zero_out" ||
+  fail "0 queued is not a chip — the normal retry must still run: $grok_zero_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "0 queued suppressed the re-injection: $grok_zero_out"
 echo "PASS grok-zero-queued-no-land: $grok_zero_out"
 
 : >"$TMP/herdr.log"
-grok_basefail_out="$(TEST_FIXTURE_SCENARIO=grok-baseline-fail spawn_base grok 2>&1)"
-grep -q 'landed=no' <<<"$grok_basefail_out" ||
-  fail "a failed baseline read must disable the grok chip: $grok_basefail_out"
-echo "PASS grok-baseline-read-fail-no-chip: $grok_basefail_out"
+grok_marker_out="$(TEST_FIXTURE_SCENARIO=grok-marker spawn_base grok 2>&1)"
+grep -q 'landed=yes' <<<"$grok_marker_out" ||
+  fail "transcript marker must stay priority-1 evidence for grok: $grok_marker_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "grok marker path triggered a re-injection: $grok_marker_out"
+echo "PASS grok-marker-priority-landed: $grok_marker_out"
 
 : >"$TMP/herdr.log"
 grok_no_chip_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base grok 2>&1)"

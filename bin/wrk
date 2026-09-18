@@ -245,13 +245,6 @@ landing_check_detail() {
     "$LANDING_CHECK_LAST_REASON"
 }
 
-grok_queue_chip_metrics() {
-  # stdin: a pane screen. Prints "<chip-lines> <max-N>" for lines matching
-  # `N queued, Enter to send now`. `0 queued` is not a queue chip.
-  { grep -Eo '[1-9][0-9]* queued, Enter to send now' || true; } |
-    awk '{c++; if ($1+0 > m) m=$1+0} END{print c+0, m+0}'
-}
-
 prompt_marker() {
   local prompt_file="$1" line
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -302,21 +295,20 @@ landing_check_once() {
     LANDING_CHECK_LAST_REASON=pasted-text-chip
     return 0
   fi
-  # Grok's queued payload is likewise positive evidence, but its footer has no
-  # `──` head the way devin's chip does: the observed shape is
-  # `○ 1 command still running · 1 queued, Enter to send now` (2026-09-18).
-  # The chip proves THIS injection only when it grew past the pre-prompt
-  # baseline: a stale footer, the brief's own echoed text, and `0 queued` all
-  # stay negative. A missing baseline (read failure) disables the chip.
-  if [[ "$profile_kind" == grok && -n "$LANDING_GROK_BASELINE" ]]; then
-    local base_lines base_n cur_lines cur_n
-    read -r base_lines base_n <<<"$LANDING_GROK_BASELINE"
-    read -r cur_lines cur_n <<<"$(grok_queue_chip_metrics <<<"$visible")"
-    if (( cur_lines > base_lines || cur_n > base_n )); then
-      LANDING_CHECK_LAST_EVIDENCE=grok-queued
-      LANDING_CHECK_LAST_REASON="grok-queued-chip-${base_n}-to-${cur_n}"
-      return 0
-    fi
+  # Grok's queued footer has no `──` head the way devin's chip does: the
+  # observed shape is `○ 1 command still running · 1 queued, Enter to send
+  # now` (2026-09-18). On a shared screen the chip cannot be attributed to
+  # THIS injection — a stale footer, the brief's own echoed text, and another
+  # sender's payload all render identically (task406 verify2). It is an
+  # ambiguous signal, never positive evidence: marking ambiguous suppresses
+  # the re-injection so a possibly queued payload is not duplicated. The
+  # transcript marker above stays the only positive evidence. `0 queued` is
+  # not a chip.
+  if [[ "$profile_kind" == grok ]] && grep -Eq '[1-9][0-9]* queued, Enter to send now' <<<"$visible"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_EVIDENCE=grok-queued
+    LANDING_CHECK_LAST_REASON="grok-queue-chip-unattributable"
+    return 1
   fi
   if ! status="$(agent_status_for_pane "$pane")"; then
     LANDING_CHECK_AMBIGUOUS=1
@@ -2753,15 +2745,6 @@ print(value if isinstance(value, str) else "")
   PROMPT_MARKER="$(prompt_marker "$PROMPT")"
   PROMPT_SUBMITTED=0
   LANDING="no"
-  LANDING_GROK_BASELINE=""
-  if [[ "$PROFILE_KIND" == grok ]]; then
-    # The queue chip only counts for this injection when it grew past the
-    # pane's pre-prompt baseline. A failed baseline read leaves it empty,
-    # which disables the chip rather than guessing.
-    if grok_baseline_screen="$("$HERDR" agent read "$PANE" --source visible --lines 40 2>/dev/null)"; then
-      LANDING_GROK_BASELINE="$(grok_queue_chip_metrics <<<"$grok_baseline_screen")"
-    fi
-  fi
   if [[ "$PROFILE_KIND" == opencode ]]; then
     "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
     PROMPT_SUBMITTED=1
