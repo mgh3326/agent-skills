@@ -66,9 +66,9 @@ def check_director(text: str) -> None:
     assert re.search(
         r"director 가 스폰하는 것은 builder 와 installer 뿐이다", sec
     ), "§빌더 운용 must state director spawns only builder and installer"
-    assert re.search(r"worker·tester 직접 스폰", sec) and "override" in sec, (
-        "direct worker/tester spawn must be gated on operator override"
-    )
+    assert re.search(
+        r"worker·tester 직접 스폰은?\s*\**운영자 override 가 있을 때만", sec
+    ), "direct worker/tester spawn must be gated on operator override"
     assert "decision ref" in sec and "큐" in sec, (
         "override must leave its decision ref in the queue"
     )
@@ -165,6 +165,11 @@ solo_removed = re.sub(
 )
 assert solo_removed != builder_text, "fixture: solo section not found to remove"
 
+override_gate_removed = director_text.replace("있을 때만", "있으면", 1)
+assert override_gate_removed != director_text, (
+    "fixture: override gate clause not found to weaken"
+)
+
 assertion_red_mutants = [
     (
         "spawn-worker-caller-section-removed",
@@ -173,6 +178,10 @@ assertion_red_mutants = [
     (
         "director-spawn-scope-removed",
         lambda: check_director(scope_line_removed),
+    ),
+    (
+        "director-override-gate-weakened",
+        lambda: check_director(override_gate_removed),
     ),
     ("builder-solo-section-removed", lambda: check_builder(solo_removed)),
 ]
