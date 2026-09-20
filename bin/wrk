@@ -77,6 +77,7 @@ Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [opti
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
+            [--operator-request REF] [--requested-by NAME]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
@@ -107,6 +108,7 @@ spawn_help() {
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
+                 [--operator-request REF] [--requested-by NAME]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -145,6 +147,16 @@ Options:
   --landing-strict   automation opt-in: preserve the OK line, then exit 76 if
                      no marker/Pasted-text landing evidence appears. Without it,
                      landed=no remains a successful spawn with a warning.
+  --operator-request REF
+                     escalation-profile operator request reference passed
+                     verbatim to `scopefuel gate` (the gate accepts only
+                     hk:doc/<key> or hk:task/<int>). wrk never validates the
+                     REF itself — acceptance, format refusal and the
+                     non-escalation-profile refusal are all the gate's own
+                     fail-closed decisions, and its rc is propagated.
+  --requested-by NAME
+                     self-reported requester name accompanying
+                     --operator-request, passed verbatim to `scopefuel gate`.
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
@@ -491,9 +503,15 @@ quota_gate() {
   fi
   # stdout is captured (not swallowed) so arbiter can read the pool that scopefuel
   # itself resolved for this profile. It is re-printed verbatim; stderr is untouched.
+  # --operator-request/--requested-by are forwarded verbatim when given — wrk holds
+  # no REF format or profile-applicability judgement; the gate's fail-closed
+  # refusal exits (0/3/4 vocabulary) are propagated unchanged below.
+  local gate_args=(gate -m "$GATE_PROFILE")
+  [[ -z "${OPERATOR_REQUEST:-}" ]] || gate_args+=(--operator-request "$OPERATOR_REQUEST")
+  [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   local out rc
   set +e
-  out="$("$SCOPEFUEL" gate -m "$GATE_PROFILE")"
+  out="$("$SCOPEFUEL" "${gate_args[@]}")"
   rc=$?
   set -e
   [[ -z "$out" ]] || printf '%s\n' "$out"
@@ -2076,6 +2094,18 @@ spillover_wake() {
   fi
 }
 
+# A value-taking spawn option must not silently swallow the next option token:
+# `--operator-request --requested-by` used to store "--requested-by" as the
+# REF, skipping the missing-value rc=2 and forwarding the mangled pair
+# downstream. Only spellings wrk itself recognizes count — "-operator" is not
+# a flag and remains a perfectly valid --requested-by value.
+wrk_option_token() {
+  case "$1" in
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--job-dup-ok|--landing-strict|--host|-h|--help) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # The hub endpoint accepts only spawn metadata. In particular, the local cwd
 # and brief path are translated to cwd_key and brief.inline, and duplicate-job
 # overrides are deliberately not representable on this boundary.
@@ -2087,13 +2117,15 @@ spillover_hub_args() {
     case "$arg" in
       -c|-p)
         i=$((i + 1))
-        [[ "$i" -lt "${#args[@]}" ]] || { echo "wrk: $arg requires a value" >&2; return 2; }
+        { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
+          { echo "wrk: $arg requires a value" >&2; return 2; }
         ;;
       --job-dup-ok)
         echo "wrk: --job-dup-ok is not permitted for a hub spawn" >&2; return 2 ;;
-      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L)
+      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--requested-by)
         i=$((i + 1))
-        [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] || { echo "wrk: $arg requires a value" >&2; return 2; }
+        { [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] && ! wrk_option_token "${args[$i]}"; } ||
+          { echo "wrk: $arg requires a value" >&2; return 2; }
         SPILL_HUB_ARGS+=("$arg" "${args[$i]}")
         ;;
       *)
@@ -2373,10 +2405,13 @@ spillover_remote_spawn() {
         # The remote path and copied brief above are authoritative.  Removing
         # both their values prevents a duplicate option from overriding them.
         ((i+=1))
+        { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
+          die "$arg requires a value"
         ;;
       -w)
         ((i+=1))
-        [[ "$i" -lt "${#args[@]}" ]] || die "-w requires a value"
+        { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
+          die "-w requires a value"
         remote_args+=(-w "${args[$i]}")
         saw_workspace=1
         ;;
@@ -2411,7 +2446,9 @@ spawn_router_cmd() {
   while [[ "$i" -lt "${#args[@]}" ]]; do
     arg="${args[$i]}"
     if [[ "$arg" == --host ]]; then
-      ((i+=1)); [[ "$i" -lt "${#args[@]}" ]] || die "--host requires a value"
+      ((i+=1))
+      { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
+        die "--host requires a value"
       requested="${args[$i]}"
     else
       filtered+=("$arg")
@@ -2584,19 +2621,21 @@ spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
+  OPERATOR_REQUEST="" REQUESTED_BY=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report)
-        [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by)
+        { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
           --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
           --role) ROLE="$2" ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
           --report) REPORT_PATH="$2" ;;
+          --operator-request) OPERATOR_REQUEST="$2" ;; --requested-by) REQUESTED_BY="$2" ;;
         esac
         shift 2 ;;
       --job-dup-ok) JOB_DUP_OK=1; shift ;;

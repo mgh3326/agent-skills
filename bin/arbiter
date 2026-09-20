@@ -450,34 +450,38 @@ def known_pools() -> set[str]:
     return pools
 
 
-def resolve_pool(profile: str, gate_output: str | None) -> str:
-    """profile → quota pool. 매핑 정본은 scopefuel 이며 arbiter 는 그것을 해석만 한다.
+def read_gate_output(profile: str, gate_output: str | None) -> str:
+    """`scopefuel gate` stdout 정본을 한 번 읽어 돌려준다.
 
     호출자(`wrk`)는 방금 통과한 `scopefuel gate` 의 stdout 을 `--gate-output` 으로 넘긴다
     (게이트 재실행 없음). 직접 호출 시에는 arbiter 가 gate 를 한 번 실행해 같은 정본을 읽는다.
-    어느 경우든 wrk 에는 pool 매핑이 존재하지 않는다.
     """
     if gate_output is not None:
         try:
-            text = sys.stdin.read() if gate_output == "-" else Path(gate_output).read_text("utf-8")
+            return sys.stdin.read() if gate_output == "-" else Path(gate_output).read_text("utf-8")
         except OSError as exc:
             raise ArbiterError(EXIT_STORAGE, f"gate output 을 읽을 수 없다: {exc}") from exc
-    else:
-        proc = _run([scopefuel_bin(), "gate", "-m", profile])
-        if proc.returncode != 0:
-            raise ArbiterError(
-                EXIT_DENIED,
-                f"scopefuel gate 거부(exit {proc.returncode}): {proc.stderr.strip()}",
-            )
-        text = proc.stdout
+    proc = _run([scopefuel_bin(), "gate", "-m", profile])
+    if proc.returncode != 0:
+        raise ArbiterError(
+            EXIT_DENIED,
+            f"scopefuel gate 거부(exit {proc.returncode}): {proc.stderr.strip()}",
+        )
+    return proc.stdout
 
-    seen_profile = re.search(r"\bprofile=(\S+)", text)
+
+def resolve_pool(profile: str, gate_text: str) -> str:
+    """profile → quota pool. 매핑 정본은 scopefuel 이며 arbiter 는 그것을 해석만 한다.
+
+    어느 경우든 wrk 에는 pool 매핑이 존재하지 않는다.
+    """
+    seen_profile = re.search(r"\bprofile=(\S+)", gate_text)
     if seen_profile and seen_profile.group(1) != profile:
         raise ArbiterError(
             EXIT_STORAGE,
             f"gate output 의 profile 이 다르다: {seen_profile.group(1)!r} != {profile!r}",
         )
-    match = re.search(r"\bpool=(\S+)", text)
+    match = re.search(r"\bpool=(\S+)", gate_text)
     if not match:
         raise ArbiterError(
             EXIT_STORAGE, f"gate output 에서 pool 을 찾을 수 없다 (profile={profile})"
@@ -490,6 +494,38 @@ def resolve_pool(profile: str, gate_output: str | None) -> str:
             f"pool {pool!r} 이 scopefuel --json 의 provider 목록에 없다 — 매핑 드리프트",
         )
     return pool
+
+
+# gate stdout 에만 나타나는 선택 감사 필드. 값은 게이트가 출력한 토큰을 그대로 옮긴다 —
+# 특히 ref_resolution 은 "기록된 주장이며 신원·동의 증명이 아니다"라는 게이트 자체
+# 라벨이므로 요약·정규화·생략하면 unverified 주장이 검증된 동의로 승격된다.
+GATE_AUDIT_KEYS = (
+    "escalation_override",
+    "operator_request_ref",
+    "requested_by",
+    "ref_resolution",
+)
+
+
+def gate_audit_fields(gate_text: str) -> dict:
+    """감사 키를 게이트 출력에서 그대로 옮긴다 — 단, 서로 다른 값이 공존하면 거부.
+
+    정상 게이트 출력은 같은 키=값 쌍을 주석 줄에서 한 번 더 반복할 수 있으므로
+    값이 동일한 반복은 허용한다. 그러나 REF 값에 `ref_resolution=verified` 같은
+    토큰이 밀려 들어와 게이트 자체 라벨과 다른 값이 공존하면 어느 쪽을 골라도
+    기록이 위조된다 — 첫 매치를 받는 대신 기록 자체를 거부한다(fail-closed).
+    """
+    fields = {}
+    for key in GATE_AUDIT_KEYS:
+        values = set(re.findall(rf"\b{key}=(\S+)", gate_text))
+        if len(values) > 1:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                f"gate output 의 {key} 값이 서로 다르다 {sorted(values)} — 주입된 감사 토큰을 기록하지 않는다",
+            )
+        if values:
+            fields[key] = values.pop()
+    return fields
 
 
 # ---------------------------------------------------------------------- lease
@@ -640,9 +676,12 @@ def cmd_lease(args: argparse.Namespace) -> dict:
 
     resource = args.resource
     resolved_from = "resource"
+    gate_fields: dict = {}
     if args.profile is not None:
-        resource = resolve_pool(args.profile, args.gate_output)
+        gate_text = read_gate_output(args.profile, args.gate_output)
+        resource = resolve_pool(args.profile, gate_text)
         resolved_from = f"scopefuel:{args.profile}"
+        gate_fields = gate_audit_fields(gate_text)
 
     con = connect_rw()
     moment = now_dt()
@@ -682,6 +721,9 @@ def cmd_lease(args: argparse.Namespace) -> dict:
                         if getattr(args, "launch_profile", None)
                         else {}
                     ),
+                    # 게이트가 출력한 선택 감사 필드를 그대로 잔존시킨다 —
+                    # wrk/arbiter 어느 쪽도 값을 재판정하지 않는다.
+                    **gate_fields,
                     "started_at": iso(moment),
                 },
             )
