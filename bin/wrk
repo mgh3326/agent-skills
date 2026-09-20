@@ -2094,6 +2094,18 @@ spillover_wake() {
   fi
 }
 
+# A value-taking spawn option must not silently swallow the next option token:
+# `--operator-request --requested-by` used to store "--requested-by" as the
+# REF, skipping the missing-value rc=2 and forwarding the mangled pair
+# downstream. Only spellings wrk itself recognizes count — "-operator" is not
+# a flag and remains a perfectly valid --requested-by value.
+wrk_option_token() {
+  case "$1" in
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--job-dup-ok|--landing-strict|--host|-h|--help) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # The hub endpoint accepts only spawn metadata. In particular, the local cwd
 # and brief path are translated to cwd_key and brief.inline, and duplicate-job
 # overrides are deliberately not representable on this boundary.
@@ -2105,13 +2117,15 @@ spillover_hub_args() {
     case "$arg" in
       -c|-p)
         i=$((i + 1))
-        [[ "$i" -lt "${#args[@]}" ]] || { echo "wrk: $arg requires a value" >&2; return 2; }
+        { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
+          { echo "wrk: $arg requires a value" >&2; return 2; }
         ;;
       --job-dup-ok)
         echo "wrk: --job-dup-ok is not permitted for a hub spawn" >&2; return 2 ;;
       -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--requested-by)
         i=$((i + 1))
-        [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] || { echo "wrk: $arg requires a value" >&2; return 2; }
+        { [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] && ! wrk_option_token "${args[$i]}"; } ||
+          { echo "wrk: $arg requires a value" >&2; return 2; }
         SPILL_HUB_ARGS+=("$arg" "${args[$i]}")
         ;;
       *)
@@ -2391,10 +2405,13 @@ spillover_remote_spawn() {
         # The remote path and copied brief above are authoritative.  Removing
         # both their values prevents a duplicate option from overriding them.
         ((i+=1))
+        { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
+          die "$arg requires a value"
         ;;
       -w)
         ((i+=1))
-        [[ "$i" -lt "${#args[@]}" ]] || die "-w requires a value"
+        { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
+          die "-w requires a value"
         remote_args+=(-w "${args[$i]}")
         saw_workspace=1
         ;;
@@ -2429,7 +2446,9 @@ spawn_router_cmd() {
   while [[ "$i" -lt "${#args[@]}" ]]; do
     arg="${args[$i]}"
     if [[ "$arg" == --host ]]; then
-      ((i+=1)); [[ "$i" -lt "${#args[@]}" ]] || die "--host requires a value"
+      ((i+=1))
+      { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
+        die "--host requires a value"
       requested="${args[$i]}"
     else
       filtered+=("$arg")
@@ -2609,7 +2628,7 @@ spawn_cmd() {
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
       -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by)
-        [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
+        { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;

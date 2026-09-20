@@ -104,11 +104,16 @@ esac
 # re-judges them. Ordering matches the real gate (ref format before profile
 # applicability; an orphan --requested-by is its own refusal).
 if [[ -n "$operator_request" ]]; then
-  if [[ ! "$operator_request" =~ ^hk:doc/.+ && ! "$operator_request" =~ ^hk:task/[0-9]+$ ]]; then
+  # Charset mirrors the installed gate (probed against the real binary): doc
+  # keys are lowercase-alnum-led segments of [a-z0-9._-] joined by '/', task
+  # refs are digits only. Whitespace, '=', ':' and empty segments are refused
+  # here — a REF smuggling "key=value" must never be emitted raw into the
+  # gate line, or the injected token could forge an audit field downstream.
+  if [[ ! "$operator_request" =~ ^hk:doc/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ && ! "$operator_request" =~ ^hk:task/[0-9]+$ ]]; then
     echo "operator_request_ref_invalid: '$operator_request' — hk:doc/<key> 또는 hk:task/<정수> 만 허용" >&2
     exit 3
   fi
-  if [[ "$requested_by_seen" -eq 1 && "$requested_by" =~ [[:space:]] ]]; then
+  if [[ "$requested_by_seen" -eq 1 && ( "$requested_by" =~ [[:space:]] || ${#requested_by} -gt 64 ) ]]; then
     echo "requested_by_invalid: '$requested_by' — 공백 없는 단일 토큰, 64자 이하" >&2
     exit 3
   fi

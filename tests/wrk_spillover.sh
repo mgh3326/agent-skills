@@ -283,6 +283,48 @@ set -e
 grep -q -- '--job-dup-ok is not permitted' <<<"$original_args_out"
 printf '%s\n' 'PASS wrk-spillover hub-args-baseline'
 
+# task483 AC-14: a value-taking option must not swallow the next option token
+# on the hub boundary either — rc=2 with the missing-value message, and the
+# mangled pair never enters the /v1/spawn request args.
+: >"$TMP/hub.log"
+set +e
+hub_swallow_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+  --operator-request --requested-by 2>&1)"
+hub_swallow_rc=$?
+set -e
+[[ "$hub_swallow_rc" -eq 2 && ! -s "$TMP/hub.log" ]] || {
+  echo 'hub args did not reject a swallowed option token' >&2
+  exit 1
+}
+grep -q 'requires a value' <<<"$hub_swallow_out" || {
+  echo 'hub missing-value error lost its message' >&2
+  exit 1
+}
+printf '%s\n' 'PASS wrk-spillover hub-args-option-token-value'
+
+# Same guard on the ssh boundary: the remote arg filter must reject
+# "-w --job" before the remote wrk command is ever assembled (the mktemp/scp
+# legs already ran, so the observable is rc=2, the message, and no remote
+# `wrk spawn` reaching the ssh fixture).
+: >"$TMP/ssh.log"
+set +e
+ssh_swallow_out="$(run_wrk "$ROOT/bin/wrk" --host desktop -w --job swallowed 2>&1)"
+ssh_swallow_rc=$?
+set -e
+[[ "$ssh_swallow_rc" -eq 2 ]] || {
+  echo "remote arg filter did not reject a swallowed option token (rc=$ssh_swallow_rc)" >&2
+  exit 1
+}
+grep -q 'requires a value' <<<"$ssh_swallow_out" || {
+  echo 'remote missing-value error lost its message' >&2
+  exit 1
+}
+! grep -q 'wrk spawn' "$TMP/ssh.log" || {
+  echo 'a swallowed option token reached the remote wrk command' >&2
+  exit 1
+}
+printf '%s\n' 'PASS wrk-spillover ssh-args-option-token-value'
+
 MUT_ARGS="$TMP/wrk-hub-args"
 cp "$ROOT/bin/wrk" "$MUT_ARGS"
 sed -i.bak 's/echo \"wrk: --job-dup-ok is not permitted for a hub spawn\" >&2; return 2/SPILL_HUB_ARGS+=(--job-dup-ok)/' "$MUT_ARGS" || true

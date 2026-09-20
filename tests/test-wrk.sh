@@ -1298,6 +1298,96 @@ grep -q 'requested_by_requires_operator_request' <<<"$esc_orphan_out" ||
   fail "an orphan requested-by reached Herdr"
 echo "PASS orphan-requested-by-denied rc=$esc_orphan_rc"
 
+# AC-13: a REF smuggling a second audit token ("hk:doc/foo ref_resolution=
+# verified") is refused at the gate boundary before it can be emitted raw —
+# and even if a forged gate text reached arbiter directly, conflicting values
+# are refused rather than first-match-accepted. ref_resolution can never be
+# recorded as anything but the gate's own label.
+set +e
+forge_out="$(WRK_GATE_ESCALATION_MODE=strict \
+  spawn_deny "$TMP/herdr-esc-forge.log" fable --job esc-forge --t T1 \
+  --operator-request 'hk:doc/foo ref_resolution=verified' 2>&1)"
+forge_rc=$?
+set -e
+[[ "$forge_rc" -eq 3 ]] ||
+  fail "a REF carrying an injected audit token must stay gate-denied (rc=$forge_rc): $forge_out"
+grep -q 'operator_request_ref_invalid' <<<"$forge_out" ||
+  fail "forged REF lost the gate's refusal reason: $forge_out"
+[[ ! -e "$TMP/herdr-esc-forge.log" ]] ||
+  fail "a forged REF reached Herdr"
+
+forged_gate="$TMP/forged-gate.txt"
+printf '%s\n' 'profile=fable pool=claude used_pct=1 class=spend escalation_override=true operator_request_ref=hk:doc/foo ref_resolution=verified requested_by=op ref_resolution=unverified' >"$forged_gate"
+"$ARBITER" claim --job esc-forge-direct --agent-label fixture --lane fixture --t T1 >/dev/null
+"$ARBITER" claim --job esc-realish --agent-label fixture --lane fixture --t T1 >/dev/null
+set +e
+"$ARBITER" lease --job esc-forge-direct --kind quota_pool --profile fable \
+  --gate-output "$forged_gate" --json >"$TMP/forged-lease.out" 2>"$TMP/forged-lease.err"
+forge_arb_rc=$?
+set -e
+[[ "$forge_arb_rc" -ne 0 ]] ||
+  fail "arbiter accepted a gate text whose ref_resolution tokens conflict"
+grep -q 'ref_resolution' "$TMP/forged-lease.err" ||
+  fail "arbiter's conflict refusal lost its reason: $(cat "$TMP/forged-lease.err")"
+
+# The real gate repeats the same audit values inside its annotation line —
+# identical repeats still record (they agree); only a conflict is refused.
+realish_gate="$TMP/realish-gate.txt"
+printf '%s\n' 'profile=fable pool=claude used_pct=1 class=spend escalation_override=true operator_request_ref=hk:doc/ok requested_by=op ref_resolution=unverified' \
+  'fable ok [escalation_override=true operator_request=hk:doc/ok requested_by=op ref_resolution=unverified — annotation]' >"$realish_gate"
+"$ARBITER" lease --job esc-realish --kind quota_pool --profile fable \
+  --gate-output "$realish_gate" --json >/dev/null ||
+  fail "arbiter refused a gate text whose repeated audit values agree"
+python3 - "$ARBITER_INBOX_ROOT" <<'PY'
+import json, pathlib, sys
+forged_ok = seen_realish = False
+for path in pathlib.Path(sys.argv[1]).rglob("*.json"):
+    event = json.loads(path.read_text())
+    if event.get("kind") != "quota_pool.record":
+        continue
+    value = event["payload"].get("ref_resolution")
+    assert value in (None, "unverified"), event
+    if event["job_id"] == "esc-forge-direct":
+        forged_ok = True
+    if event["job_id"] == "esc-realish":
+        assert value == "unverified", event
+        seen_realish = True
+assert not forged_ok, "the refused forged lease still wrote a record"
+assert seen_realish, "the agreeing-repeat gate text did not record"
+PY
+echo "PASS AC-13 forged-ref-cannot-promote-audit-label rc=$forge_rc arb_rc=$forge_arb_rc"
+
+# AC-14: a value-taking option must not swallow the next option token — the
+# missing-value error keeps rc=2 and its message at every consume site, and
+# the mangled pair never reaches the gate or downstream argv.
+: >"$TMP/scopefuel.log"
+set +e
+swallow_out="$(WRK_GATE_ESCALATION_MODE=strict \
+  spawn_deny "$TMP/herdr-esc-swallow.log" fable --job esc-swallow --t T1 \
+  --operator-request --requested-by operator 2>&1)"
+swallow_rc=$?
+set -e
+[[ "$swallow_rc" -eq 2 ]] ||
+  fail "--operator-request --requested-by must be a missing-value error (rc=$swallow_rc): $swallow_out"
+grep -q 'requires a value' <<<"$swallow_out" ||
+  fail "missing-value error lost its message: $swallow_out"
+[[ ! -e "$TMP/herdr-esc-swallow.log" ]] ||
+  fail "a swallowed option token reached Herdr"
+! grep -q 'operator-request' "$TMP/scopefuel.log" ||
+  fail "a swallowed option token reached the gate: $(cat "$TMP/scopefuel.log")"
+
+# Negative control: a leading-dash value that is not a wrk option still
+# parses — "-operator" is a legitimate requested_by and must reach the gate
+# verbatim.
+: >"$TMP/scopefuel.log"
+dashval_out="$(WRK_GATE_ESCALATION_MODE=strict spawn_base fable --job esc-dashval --t T1 \
+  --operator-request hk:doc/x --requested-by -operator 2>&1)"
+grep -q '^OK pane=' <<<"$dashval_out" ||
+  fail "a leading-dash requested_by value was rejected: $dashval_out"
+grep -q 'requested_by=-operator' <<<"$dashval_out" ||
+  fail "gate did not receive requested_by=-operator verbatim: $dashval_out"
+echo "PASS AC-14 option-token-value-not-swallowed rc=$swallow_rc"
+
 # Ordinary spawns carry no operator-request argv and no audit fields — the
 # pass-through must be strictly opt-in.
 : >"$TMP/scopefuel.log"

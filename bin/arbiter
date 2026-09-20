@@ -508,11 +508,23 @@ GATE_AUDIT_KEYS = (
 
 
 def gate_audit_fields(gate_text: str) -> dict:
+    """감사 키를 게이트 출력에서 그대로 옮긴다 — 단, 서로 다른 값이 공존하면 거부.
+
+    정상 게이트 출력은 같은 키=값 쌍을 주석 줄에서 한 번 더 반복할 수 있으므로
+    값이 동일한 반복은 허용한다. 그러나 REF 값에 `ref_resolution=verified` 같은
+    토큰이 밀려 들어와 게이트 자체 라벨과 다른 값이 공존하면 어느 쪽을 골라도
+    기록이 위조된다 — 첫 매치를 받는 대신 기록 자체를 거부한다(fail-closed).
+    """
     fields = {}
     for key in GATE_AUDIT_KEYS:
-        match = re.search(rf"\b{key}=(\S+)", gate_text)
-        if match:
-            fields[key] = match.group(1)
+        values = set(re.findall(rf"\b{key}=(\S+)", gate_text))
+        if len(values) > 1:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                f"gate output 의 {key} 값이 서로 다르다 {sorted(values)} — 주입된 감사 토큰을 기록하지 않는다",
+            )
+        if values:
+            fields[key] = values.pop()
     return fields
 
 
