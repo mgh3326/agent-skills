@@ -38,6 +38,10 @@ director는 함대의 최상위 역할이다. 운영자와 직접 대화하고, 
 
 ## 빌더 운용
 
+**director 가 스폰하는 것은 builder 와 installer 뿐이다.** worker·tester 는 builder 가 스폰한다
+(`builder` 스킬 §시작과 브리프, `spawn-worker` §2-1 호출자 절). director 의 worker·tester
+직접 스폰은 **운영자 override 가 있을 때만**이고, 그 **decision ref 를 큐에 남긴다.**
+
 1. 브리프는 `builder` 스킬이 요구하는 형식으로 쓴다: 작업/AC 1:1, worktree·branch, 불변 제약,
    완료 증거, 금지사항, 보고 절대경로. **픽스처는 실제 모양 · 뮤턴트 RED는 assertion만 · 운영
    경로 테스트 · CI 매니페스트 등록 · `gh pr checks` 직접 확인 · 자기보고 초록 불인정**을

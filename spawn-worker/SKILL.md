@@ -59,6 +59,12 @@ T3 floor 대상 아님.
 - **하향은 거부한다.** 상류가 T1을 제안해도 표면이 비가역 mutation 이면 T3다(ROB-1189가
   이 규칙으로 막혔을 사례). **상향은 자유**(판단이 필요하면 올린다).
 
+**호출자는 builder 다 — 이 표는 leaf(worker·tester) 구성표다.** `spawn_mode` 행이 말하는
+`herdr worker` 스폰의 주체는 builder(`builder` 스킬 §시작과 브리프)다. 🔴 **director 는 이 표로
+워커를 직접 띄우지 않는다 — director 는 `director` 스킬 §빌더 운용에 따라 builder 를 스폰한다.**
+builder 가 워커·tester 스폰 없이 직접 구현하는 **단독 모드**의 조건은 `builder` 스킬 §단독 모드를
+본다.
+
 **`spawn_mode` 자동 파생(빈칸 금지)**: T에서 자동으로 정하고 릴레이·브리프에 비워두지 않는다.
 
 | T | spawn_mode |
