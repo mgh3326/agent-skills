@@ -14,6 +14,22 @@ WRK_EXIT_JOB_STATE_UNREADABLE=75
 # observed. Automation opts into 76 to distinguish that outcome from the
 # ROB-1326 duplicate-job contracts above.
 WRK_EXIT_LANDING_UNCONFIRMED=76
+# task445 phase A: a durable telemetry receipt/outbox write failure is not a
+# normal ACK and not CLI misuse either. 77 keeps it distinct from the
+# duplicate (74), unreadable-state (75) and landing-unconfirmed (76) codes.
+WRK_EXIT_TELEMETRY_STORE=77
+# Receipt metadata stays under 8KiB; a violation is recorded explicitly
+# (export_error), never silently truncated away.
+TELEMETRY_METADATA_MAX_BYTES=8192
+# Per-invocation export drain bound — a wedged server can never stall an
+# admission/terminal command longer than this many receipts x the request
+# timeout.
+TELEMETRY_DRAIN_MAX="${WRK_TELEMETRY_DRAIN_MAX:-8}"
+# wrk-owned origin_id band. bench_reps idempotency is UNIQUE(created_by,
+# origin_id) and scopefuel allocates low dense ids in the same space, so wrk
+# draws from a disjoint positive band. Ids are never hash-derived or
+# truncated; retry/restart reuses the durably mapped value.
+TELEMETRY_ORIGIN_BASE="${WRK_TELEMETRY_ORIGIN_BASE:-9000000000000}"
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -73,14 +89,16 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [options]
+Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts|reconcile|telemetry-status> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-            [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
+            [-L live|mock] [--effort LEVEL] [--job ID] [--task-id N] [--report PATH] [--job-dup-ok] [--landing-strict]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
   wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
+  wrk reconcile [--job ID]      export pending telemetry receipts to handoffkeep bench_reps
+  wrk telemetry-status [--json] coverage-gap and pending-export-age counters
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -105,12 +123,18 @@ USAGE
 spawn_help() {
   cat <<'USAGE'
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
-                 [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
+                 [-L live|mock] [--effort LEVEL] [--job ID] [--task-id N] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
   --t T0..T3         job scale; required — an unclassified job is not spawned
+  --task-id N        managed telemetry binding: a positive handoffkeep task id,
+                     validated through the configured handoffkeep API
+                     (GET /v1/tasks/N) before the job is treated as bound. A
+                     failed validation refuses the spawn — job-name digits are
+                     never a join. Unmanaged spawns (no --task-id) keep the
+                     historical path and are reported uncovered, never bound.
   -L live|mock       select lane; mock requires MOCK_MCP_PROFILE
   --effort LEVEL     override codex/Kiro/Grok/Claude(opus,sonnet) profile effort
   --job ID           arbiter job id (default: LABEL)
@@ -1170,7 +1194,7 @@ resolve_profile() {
 }
 
 completion_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}" reason="${7:-}"
+  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}" reason="${7:-}" attempt="${8:-}"
   local events host last
   events="$(wrk_jobs_root)/$job/events"
   host="${HOSTNAME:-unknown}"
@@ -1181,9 +1205,9 @@ completion_event() {
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" <<'PY'
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" "$attempt" <<'PY'
 import json, os, sys, tempfile, time
-events, job, owner, label, pane, host, report, last, kind, reason = sys.argv[1:]
+events, job, owner, label, pane, host, report, last, kind, reason, attempt = sys.argv[1:]
 highest = 0
 for name in os.listdir(events):
     try: highest = max(highest, int(name.split('-', 1)[0]))
@@ -1194,6 +1218,9 @@ record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
 # job.lost always states why. Downstream recovery treats agent_not_found as a
 # vanished pane and herdr_unreachable/timeout as an observation gap.
 if reason: record["reason"] = reason
+# task445: a managed terminal event carries the attempt it was observed for —
+# without it reconcile could never tell a stale event from a live attempt's.
+if attempt: record["attempt_id"] = attempt
 fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
 try:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1424,6 +1451,1323 @@ print(f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}")
 PY
 }
 
+# ======================================================================
+# task445 phase A — lifecycle telemetry receipts + bench_reps exporter
+#
+# One observation = task <-> execution attempt <-> participant segment. A
+# bound spawn (wrk spawn --task-id N, validated through the configured
+# handoffkeep API) persists a `telemetry_receipt` to the job-local durable
+# outbox before any normal ACK line prints. Terminal participant segments
+# are projected to `PUT /v1/bench/reps` with a durable
+# (job_id, attempt_id, participant_segment, task_binding) -> origin_id
+# mapping; server-authenticated created_by stays authoritative and only
+# the reps endpoint is ever called — this file has no bench_scores or
+# bench_grades write path. A failed export leaves the receipt in explicit
+# `pending_export` (never `bench_written`) and drains on the next
+# spawn/terminal command or `wrk reconcile`; no scheduler is registered.
+# Unmanaged spawns (no --task-id) keep the historical path and are
+# reported uncovered by `wrk telemetry-status`, never silently bound.
+#
+# Participant-terminal semantics: `wrk done` records work_done and
+# `wrk joined` records pr_submitted — joined means a PR was submitted for
+# this participant segment, never a claim of global task completion.
+# Externally produced terminal events are projected by `wrk reconcile`:
+# job.lost -> failed, job.revoked -> revoked, job.cancelled -> cancelled.
+# Attribution is by the event's own attempt_id only: an event whose identity
+# is missing, malformed, or names no recorded attempt/segment is counted
+# unattributed — it can never close or cover a different, still-open attempt.
+# ======================================================================
+
+telemetry_dir() {
+  printf '%s/%s/telemetry' "$(wrk_jobs_root)" "$1"
+}
+
+telemetry_bound() {
+  [[ -f "$(telemetry_dir "$1")/binding.json" ]]
+}
+
+# One authenticated handoffkeep API call. stdout = response body; stderr is a
+# token-free one-line error; rc!=0 on any failure. The bearer token is read
+# from env only (WRK_HANDOFFKEEP_TOKEN, then HANDOFFKEEP_TOKEN) and is never
+# printed, logged, or written to a file wrk owns.
+hk_request() {
+  local method="$1" path="$2" body_file="${3:-}"
+  python3 - "$method" "$path" "$body_file" <<'PY'
+import os, sys, urllib.error, urllib.request
+from urllib.parse import urlsplit
+
+method, path, body_file = sys.argv[1], sys.argv[2], sys.argv[3]
+url = os.environ.get("WRK_HANDOFFKEEP_URL") or os.environ.get("HANDOFFKEEP_URL") or ""
+token = os.environ.get("WRK_HANDOFFKEEP_TOKEN") or os.environ.get("HANDOFFKEEP_TOKEN") or ""
+if not url or not token:
+    sys.stderr.write("hk: handoffkeep URL/token not configured\n")
+    sys.exit(2)
+parsed = urlsplit(url)
+# CWE-319 (same boundary as scopefuel): the bearer token may only leave the
+# process over https, or plaintext to a loopback test fixture.
+if parsed.scheme != "https" and not (
+    parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1", "::1")
+):
+    sys.stderr.write("hk: handoffkeep URL must be https (http only to localhost)\n")
+    sys.exit(2)
+origin = (parsed.scheme, (parsed.hostname or "").lower(),
+          parsed.port or (443 if parsed.scheme == "https" else 80))
+body = None
+if body_file:
+    try:
+        with open(body_file, "rb") as handle:
+            body = handle.read()
+    except OSError:
+        sys.stderr.write("hk: request body unreadable\n")
+        sys.exit(2)
+request = urllib.request.Request(url.rstrip("/") + path, data=body, method=method)
+request.add_header("Authorization", "Bearer " + token)
+if body is not None:
+    request.add_header("Content-Type", "application/json")
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    # The only request ever sent is to the exact configured, validated
+    # origin above. urllib's default handler would follow a 3xx and
+    # forward the bearer header to the new location — returning None
+    # turns the redirect into an HTTPError so the caller fails closed
+    # instead of leaking credentials or trusting a second hop.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+opener = urllib.request.build_opener(_RefuseRedirect)
+# Immediately before the credential goes on the wire, the request target
+# must still be the exact configured origin — scheme, host, and port.
+sending = urlsplit(request.full_url)
+actual = (sending.scheme, (sending.hostname or "").lower(),
+          sending.port or (443 if sending.scheme == "https" else 80))
+if actual != origin:
+    sys.stderr.write("hk: refusing to send credentials to a non-configured origin\n")
+    sys.exit(2)
+try:
+    with opener.open(
+        request, timeout=float(os.environ.get("WRK_HK_TIMEOUT_S", "3"))
+    ) as response:
+        sys.stdout.write(response.read().decode("utf-8", "replace"))
+except urllib.error.HTTPError as exc:
+    sys.stderr.write("hk: http %d %s %s\n" % (exc.code, method, path))
+    sys.exit(1)
+except (OSError, ValueError) as exc:
+    sys.stderr.write("hk: request failed %s %s: %s\n" % (method, path, type(exc).__name__))
+    sys.exit(1)
+PY
+}
+
+# Validate the exact task through the configured handoffkeep API and persist
+# the verified binding durably (0600, atomic) before it may be treated as
+# bound. Also reconstructs state dwell from task events: claimed dwell that
+# resolves into in_progress is start/status-report lag, never model time;
+# the actual model stays "unknown" until observed (task445 AC, #395 fixture).
+telemetry_bind() {
+  local job="$1" task_id="$2" dir body
+  dir="$(telemetry_dir "$job")"
+  mkdir -p "$dir/receipts" || return 1
+  body="$(hk_request GET "/v1/tasks/$task_id")" || return 1
+  HK_JSON="$body" python3 - "$dir" "$job" "$task_id" <<'PY'
+import json, os, sys, tempfile
+from datetime import datetime, timezone
+
+out_dir, job, task_id = sys.argv[1], sys.argv[2], int(sys.argv[3])
+try:
+    task = json.loads(os.environ["HK_JSON"])
+except (KeyError, json.JSONDecodeError):
+    sys.stderr.write("telemetry: task validation response was not JSON\n")
+    sys.exit(1)
+if task.get("id") != task_id:
+    sys.stderr.write("telemetry: task validation returned a different id\n")
+    sys.exit(1)
+
+
+def parse_at(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+now = os.environ.get("WRK_TELEMETRY_NOW") or datetime.now(timezone.utc).isoformat()
+points = []
+for event in task.get("events") or []:
+    if not isinstance(event, dict):
+        continue
+    at = parse_at(event.get("at"))
+    to = event.get("to")
+    if at is not None and isinstance(to, str) and to:
+        points.append((at, to))
+points.sort(key=lambda item: item[0])
+dwell, implementation, verification = [], 0.0, 0.0
+for index, (at, to) in enumerate(points):
+    if index + 1 >= len(points):
+        continue
+    seconds = (points[index + 1][0] - at).total_seconds()
+    following = points[index + 1][1]
+    cls = {"in_progress": "implementation", "verifying": "verification"}.get(to)
+    if cls is None:
+        cls = "start_lag" if (to == "claimed" and following == "in_progress") else "other"
+    dwell.append({"state": to, "dwell_s": round(seconds, 3), "class": cls})
+    if cls == "implementation":
+        implementation += seconds
+    elif cls == "verification":
+        verification += seconds
+binding = {
+    "kind": "telemetry_binding", "schema_version": 1, "job_id": job,
+    "task_id": task_id, "task_ref": "hk:task/%d" % task_id,
+    "verified_at": now, "task_state": task.get("state") or "",
+    "task_lane": task.get("lane") or "", "claimed_by": task.get("claimed_by") or "",
+    "state_dwell": dwell,
+    "v_over_i": round(verification / implementation, 3) if implementation > 0 else None,
+    "observed_model": "unknown",
+}
+final = os.path.join(out_dir, "binding.json")
+fd, tmp = tempfile.mkstemp(dir=out_dir, prefix=".bind-")
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(binding, handle, separators=(",", ":"), sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, final)
+except BaseException:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+    raise
+PY
+}
+
+telemetry_intent_fields() {
+  python3 - "$(telemetry_dir "$1")" <<'PY'
+import json, os, sys
+try:
+    with open(os.path.join(sys.argv[1], "intent.json"), encoding="utf-8") as handle:
+        data = json.load(handle)
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(0)
+print(data.get("attempt_id", ""), data.get("status", ""), data.get("pane_id", ""),
+      data.get("tab_id", ""), sep="\t")
+PY
+}
+
+telemetry_finalize_attempt() {
+  python3 - "$(telemetry_dir "$1")" "$2" "$3" "${4:-}" <<'PY'
+import json, os, sys, tempfile
+from datetime import datetime, timezone
+
+out_dir, attempt, status, reason = sys.argv[1:5]
+now = os.environ.get("WRK_TELEMETRY_NOW") or datetime.now(timezone.utc).isoformat()
+
+
+def load(name, default):
+    try:
+        with open(os.path.join(out_dir, name), encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def atomic(name, obj):
+    fd, tmp = tempfile.mkstemp(dir=out_dir, prefix=".tel-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, os.path.join(out_dir, name))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+attempts = load("attempts.json", {})
+if attempt in attempts:
+    attempts[attempt]["status"] = status
+    attempts[attempt]["closed_at"] = now
+    if reason:
+        attempts[attempt]["close_reason"] = reason
+    atomic("attempts.json", attempts)
+intent = load("intent.json", None)
+if isinstance(intent, dict) and intent.get("attempt_id") == attempt:
+    intent["status"] = status
+    atomic("intent.json", intent)
+PY
+}
+
+telemetry_new_attempt() {
+  python3 - "$(telemetry_dir "$1")" "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+import json, os, sys, tempfile
+from datetime import datetime, timezone
+
+out_dir, job, label, model, effort, role, t_level = sys.argv[1:8]
+now = os.environ.get("WRK_TELEMETRY_NOW") or datetime.now(timezone.utc).isoformat()
+
+
+def load(name, default):
+    try:
+        with open(os.path.join(out_dir, name), encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def atomic(name, obj):
+    fd, tmp = tempfile.mkstemp(dir=out_dir, prefix=".tel-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, os.path.join(out_dir, name))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+attempts = load("attempts.json", {})
+seq = 1
+for aid in attempts:
+    if aid.startswith("a") and aid[1:].isdigit():
+        seq = max(seq, int(aid[1:]) + 1)
+attempt_id = "a%d" % seq
+attempts[attempt_id] = {"attempt_id": attempt_id, "status": "open",
+                        "opened_at": now, "pane_id": "", "tab_id": "",
+                        "t_level": t_level}
+atomic("attempts.json", attempts)
+atomic("intent.json",
+       {"kind": "telemetry_intent", "schema_version": 1, "job_id": job,
+        "attempt_id": attempt_id, "status": "open", "label": label,
+        "model": model, "effort": effort, "role": role, "t_level": t_level,
+        "opened_at": now, "pane_id": "", "tab_id": ""})
+print(attempt_id)
+PY
+}
+
+telemetry_attempt_set_pane() {
+  python3 - "$(telemetry_dir "$1")" "$2" "$3" "${4:-}" <<'PY'
+import json, os, sys, tempfile
+
+out_dir, attempt, pane, tab = sys.argv[1:5]
+
+
+def load(name, default):
+    try:
+        with open(os.path.join(out_dir, name), encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def atomic(name, obj):
+    fd, tmp = tempfile.mkstemp(dir=out_dir, prefix=".tel-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, os.path.join(out_dir, name))
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+intent = load("intent.json", None)
+if isinstance(intent, dict) and intent.get("attempt_id") == attempt:
+    intent["pane_id"] = pane
+    intent["tab_id"] = tab
+    atomic("intent.json", intent)
+attempts = load("attempts.json", {})
+if attempt in attempts:
+    attempts[attempt]["pane_id"] = pane
+    attempts[attempt]["tab_id"] = tab
+    atomic("attempts.json", attempts)
+PY
+}
+
+# Persist the spawn intent before any pane exists. Retry semantics:
+#   open intent, no pane recorded     -> same attempt (died before tab create)
+#   open intent, pane provably live   -> adopt the pane; never duplicate it
+#   open intent, pane confirmed dead  -> abandon attempt, open a fresh one
+#   pane state unprovable             -> rc 2, fail closed (no duplicate risk)
+telemetry_prepare_attempt() {
+  local job="$1" label="$2" model="$3" effort="$4" role="$5" t_level="$6"
+  local dir existing attempt status pane tab probe klass token ptab
+  dir="$(telemetry_dir "$job")"
+  mkdir -p "$dir/receipts" || return 1
+  ATTEMPT_ID=""; ADOPT_PANE=""; ADOPT_TAB=""; ADOPT_STATUS=""
+  existing="$(telemetry_intent_fields "$job")"
+  attempt=""; status=""; pane=""; tab=""
+  if [[ -n "$existing" ]]; then
+    IFS=$'\t' read -r attempt status pane tab <<<"$existing"
+  fi
+  if [[ "$status" == "open" && -n "$pane" ]]; then
+    probe="$(herdr_agent_probe "$pane" || true)"
+    klass="$(cut -f1 <<<"$probe")"
+    token="$(cut -f2 <<<"$probe")"
+    ptab="$(cut -f3 <<<"$probe")"
+    case "$klass" in
+      ok)
+        ATTEMPT_ID="$attempt"; ADOPT_PANE="$pane"
+        ADOPT_TAB="${ptab:-$tab}"; ADOPT_STATUS="$token"
+        return 0 ;;
+      gone)
+        telemetry_finalize_attempt "$job" "$attempt" abandoned "pane_gone:$token" || return 1 ;;
+      *)
+        warn "cannot prove state of prior pane $pane (probe=$token); refusing to risk a duplicate worker: job=$job"
+        return 2 ;;
+    esac
+  elif [[ "$status" == "open" && -n "$attempt" ]]; then
+    ATTEMPT_ID="$attempt"
+    return 0
+  fi
+  ATTEMPT_ID="$(telemetry_new_attempt "$job" "$label" "$model" "$effort" "$role" "$t_level")" || return 1
+  [[ -n "$ATTEMPT_ID" ]]
+}
+
+# Persist the start telemetry_receipt plus the durable
+# (job_id, attempt_id, participant_segment, task_binding) -> origin_id
+# mapping before the spawn ACK. A model/profile/effort/role/harness change
+# inside an attempt opens a new segment. The launch profile is declared
+# intent; the observed response model stays "unknown" until seen — it is
+# never inferred from the launcher.
+telemetry_record_start() {
+  local job="$1" attempt="$2" pane="$3" tab="$4" label="$5" model="$6" effort="$7"
+  local harness="$8" pool="$9" role="${10}" t_level="${11}" report="${12:-}"
+  python3 - "$(telemetry_dir "$job")" "$(wrk_jobs_root)" "$job" "$attempt" "$pane" "$tab" \
+    "$label" "$model" "$effort" "$harness" "$pool" "$role" "$t_level" "$report" \
+    "$TELEMETRY_ORIGIN_BASE" "$TELEMETRY_METADATA_MAX_BYTES" <<'PY'
+import fcntl, json, os, sys, tempfile
+from datetime import datetime, timezone
+
+(out_dir, jobs_root, job, attempt, pane, tab, label, model, effort,
+ harness, pool, role, t_level, report, origin_base, max_bytes) = sys.argv[1:17]
+max_bytes = int(max_bytes)
+now = os.environ.get("WRK_TELEMETRY_NOW") or datetime.now(timezone.utc).isoformat()
+
+
+def fail(message):
+    sys.stderr.write("telemetry: %s\n" % message)
+    sys.exit(1)
+
+
+def atomic(path, obj, limit=None):
+    body = json.dumps(obj, separators=(",", ":"), sort_keys=True) + "\n"
+    if limit is not None and len(body.encode("utf-8")) > limit:
+        return False
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tel-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return True
+
+
+def load(path, default):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def alloc_origin():
+    shared = os.path.join(jobs_root, "_telemetry")
+    os.makedirs(shared, exist_ok=True)
+    path = os.path.join(shared, "origin-seq")
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        raw = os.read(fd, 64).decode().strip()
+        current = int(raw) if raw.isdigit() else 0
+        nxt = max(current, int(origin_base)) + 1
+        os.lseek(fd, 0, os.SEEK_SET)
+        os.ftruncate(fd, 0)
+        os.write(fd, str(nxt).encode())
+        os.fsync(fd)
+        return nxt
+    finally:
+        os.close(fd)
+
+
+binding = load(os.path.join(out_dir, "binding.json"), None)
+if not binding:
+    fail("binding.json missing for managed job")
+identity = {"role": role, "profile": model, "effort": effort,
+            "harness": harness, "pool": pool}
+seg_path = os.path.join(out_dir, "segments.json")
+segments = load(seg_path, {})
+mine = segments.setdefault(attempt, [])
+segment = next((s for s in mine if s.get("identity") == identity), None)
+if segment is None:
+    segment = {"seg": "s%d" % (len(mine) + 1), "identity": identity,
+               "origin_id": alloc_origin(), "opened_at": now}
+    mine.append(segment)
+    atomic(seg_path, segments)
+    origin_map = load(os.path.join(out_dir, "origins.json"), {})
+    key = "|".join([job, attempt, segment["seg"], binding["task_ref"]])
+    origin_map[key] = segment["origin_id"]
+    atomic(os.path.join(out_dir, "origins.json"), origin_map)
+refs = []
+events_dir = os.path.join(os.path.dirname(out_dir), "events")
+try:
+    for name in sorted(os.listdir(events_dir)):
+        if name.endswith(".json") and not name.startswith("."):
+            refs.append("events/" + name)
+except OSError:
+    pass
+receipt = {
+    "kind": "telemetry_receipt", "schema_version": 1, "phase": "start",
+    "task_id": binding["task_id"], "task_ref": binding["task_ref"],
+    "job_id": job, "attempt_id": attempt,
+    "participant_segment": segment["seg"],
+    "role": role, "t_level": t_level,
+    "launch": {"profile": model, "effort": effort, "harness": harness, "pool": pool},
+    "observed": {"model": binding.get("observed_model") or "unknown"},
+    "recorded_at": now,
+    "evidence": {"pane_id": pane, "tab_id": tab, "label": label, "refs": refs},
+}
+if report:
+    receipt["evidence"]["report_path"] = report
+if os.environ.get("WRK_TELEMETRY_FAIL_STORE", "") in ("start", "all"):
+    fail("injected store failure (WRK_TELEMETRY_FAIL_STORE)")
+path = os.path.join(out_dir, "receipts", "start-%s-%s.json" % (attempt, segment["seg"]))
+if not atomic(path, receipt, limit=max_bytes):
+    stub = {"kind": "telemetry_receipt", "schema_version": 1, "phase": "start",
+            "task_ref": binding["task_ref"], "job_id": job, "attempt_id": attempt,
+            "participant_segment": segment["seg"], "recorded_at": now,
+            "budget_exceeded": True}
+    if not atomic(path, stub):
+        fail("start receipt exceeds the %d-byte metadata budget and the stub failed" % max_bytes)
+    fail("start receipt exceeds the %d-byte metadata budget" % max_bytes)
+print("%s\t%s" % (segment["seg"], segment["origin_id"]))
+PY
+}
+
+# Persist a terminal telemetry_receipt (projection pending_export) before the
+# terminal ACK and mark the attempt closed. participant_semantics:
+#   work_done      — wrk done observed a finished worker attempt
+#   pr_submitted   — wrk joined: a PR was submitted for this participant
+#                    segment; never a claim of global task completion
+#   event_observed — reconcile attributed an external terminal event
+telemetry_record_terminal() {
+  local job="$1" kind="$2" semantics="$3" report="${4:-}" reason="${5:-}"
+  local pr="${6:-}" head="${7:-}" event_file="${8:-}" task_link="${9:-}"
+  python3 - "$(telemetry_dir "$job")" "$job" "$kind" "$semantics" "$report" "$reason" \
+    "$pr" "$head" "$event_file" "$task_link" "$TELEMETRY_METADATA_MAX_BYTES" <<'PY'
+import hashlib, json, os, sys, tempfile
+from datetime import datetime, timezone
+
+(out_dir, job, kind, semantics, report, reason, pr, head,
+ event_file, task_link, max_bytes) = sys.argv[1:12]
+max_bytes = int(max_bytes)
+now_s = os.environ.get("WRK_TELEMETRY_NOW") or datetime.now(timezone.utc).isoformat()
+
+
+def fail(message):
+    sys.stderr.write("telemetry: %s\n" % message)
+    sys.exit(1)
+
+
+def atomic(path, obj, limit=None):
+    body = json.dumps(obj, separators=(",", ":"), sort_keys=True) + "\n"
+    if limit is not None and len(body.encode("utf-8")) > limit:
+        return False
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tel-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(body)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+    return True
+
+
+def load(path, default):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def parse_at(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def attempt_num(aid):
+    # Attempt ids are a<N>; ordering is the numeric suffix, never lexical
+    # (a10 > a9). A malformed id has no number and is never selected.
+    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+        return int(aid[1:])
+    return None
+
+
+binding = load(os.path.join(out_dir, "binding.json"), None)
+if not binding:
+    fail("binding.json missing for managed job")
+attempts = load(os.path.join(out_dir, "attempts.json"), {})
+known = [a for a in attempts if attempt_num(a) is not None]
+if not known:
+    fail("no well-formed attempt on record for terminal evidence")
+open_attempts = [a for a in known if attempts[a].get("status") == "open"]
+attempt = max(open_attempts or known, key=attempt_num)
+segments = load(os.path.join(out_dir, "segments.json"), {})
+mine = segments.get(attempt) or []
+if not mine:
+    fail("no participant segment on record for terminal evidence")
+segment = mine[-1]
+info = attempts[attempt]
+path = os.path.join(out_dir, "receipts",
+                    "terminal-%s-%s-%s.json" % (attempt, segment["seg"], kind))
+existing = load(path, None)
+if (isinstance(existing, dict) and existing.get("phase") == "terminal"
+        and not existing.get("budget_exceeded")):
+    # Replay of the same (attempt, segment, kind): the first durable
+    # terminal observation stands. An exported receipt is never rewritten
+    # back to pending_export and never triggers a second export — only
+    # the attempt bookkeeping is reconciled if it was lost.
+    if info.get("status") != "terminal":
+        info["status"] = "terminal"
+        info["closed_at"] = now_s
+        info["terminal_kind"] = kind
+        atomic(os.path.join(out_dir, "attempts.json"), attempts)
+    intent = load(os.path.join(out_dir, "intent.json"), None)
+    if isinstance(intent, dict) and intent.get("attempt_id") == attempt \
+            and intent.get("status") != "terminal":
+        intent["status"] = "terminal"
+        atomic(os.path.join(out_dir, "intent.json"), intent)
+    print("%s\t%s\t%s" % (attempt, segment["seg"], segment["origin_id"]))
+    sys.exit(0)
+opened_at = parse_at(info.get("opened_at"))
+ended_at = parse_at(now_s)
+duration = None
+if opened_at is not None and ended_at is not None:
+    duration = round((ended_at - opened_at).total_seconds(), 3)
+report_sha = ""
+if report and os.path.isfile(report):
+    digest = hashlib.sha256()
+    with open(report, "rb") as handle:
+        for chunk in iter(lambda: handle.read(65536), b""):
+            digest.update(chunk)
+    report_sha = digest.hexdigest()
+receipt = {
+    "kind": "telemetry_receipt", "schema_version": 1, "phase": "terminal",
+    "task_id": binding["task_id"], "task_ref": binding["task_ref"],
+    "job_id": job, "attempt_id": attempt,
+    "participant_segment": segment["seg"],
+    "role": segment["identity"].get("role") or "",
+    "t_level": info.get("t_level") or "",
+    "launch": dict(segment["identity"]),
+    "observed": {"model": binding.get("observed_model") or "unknown"},
+    "recorded_at": now_s, "attempt_opened_at": info.get("opened_at") or "",
+    "ended_at": now_s, "duration_s": duration,
+    "terminal": {"status": kind, "participant_semantics": semantics,
+                 "reason": reason or "unknown", "rounds": None},
+    "evidence": {"pane_id": info.get("pane_id") or "", "tab_id": info.get("tab_id") or ""},
+    "state_dwell": binding.get("state_dwell") or [],
+    "v_over_i": binding.get("v_over_i"),
+    "projection": {"state": "pending_export", "origin_id": segment["origin_id"],
+                   "attempts": 0, "exported_at": None, "last_error": None},
+}
+if report:
+    receipt["evidence"]["report_path"] = report
+if report_sha:
+    receipt["evidence"]["report_sha256"] = report_sha
+if event_file:
+    receipt["evidence"]["event_file"] = event_file
+if pr:
+    receipt["evidence"]["pr"] = pr
+if head:
+    receipt["evidence"]["head"] = head
+if task_link:
+    receipt["evidence"]["task_refs_job_id"] = task_link
+if os.environ.get("WRK_TELEMETRY_FAIL_STORE", "") in ("terminal", "all"):
+    fail("injected store failure (WRK_TELEMETRY_FAIL_STORE)")
+if not atomic(path, receipt, limit=max_bytes):
+    stub = {"kind": "telemetry_receipt", "schema_version": 1, "phase": "terminal",
+            "task_ref": binding["task_ref"], "job_id": job, "attempt_id": attempt,
+            "participant_segment": segment["seg"], "recorded_at": now_s,
+            "terminal": {"status": kind, "participant_semantics": semantics},
+            "budget_exceeded": True,
+            "projection": {"state": "export_error", "origin_id": segment["origin_id"],
+                           "attempts": 0, "exported_at": None,
+                           "last_error": "metadata_budget_exceeded"}}
+    if not atomic(path, stub):
+        fail("terminal receipt exceeds the %d-byte metadata budget and the stub failed" % max_bytes)
+    fail("terminal receipt exceeds the %d-byte metadata budget" % max_bytes)
+info["status"] = "terminal"
+info["closed_at"] = now_s
+info["terminal_kind"] = kind
+atomic(os.path.join(out_dir, "attempts.json"), attempts)
+intent = load(os.path.join(out_dir, "intent.json"), None)
+if isinstance(intent, dict) and intent.get("attempt_id") == attempt:
+    intent["status"] = "terminal"
+    atomic(os.path.join(out_dir, "intent.json"), intent)
+print("%s\t%s\t%s" % (attempt, segment["seg"], segment["origin_id"]))
+PY
+}
+
+# The attempt a wrk-owned terminal observation belongs to: the same selection
+# telemetry_record_terminal makes (latest open a<N> by numeric suffix, else the
+# latest recorded one; malformed ids are never selected). Prints "" when no
+# well-formed attempt exists — the flat event then stays explicit legacy and
+# reconcile will report it unattributed rather than guess.
+telemetry_current_attempt() {
+  python3 - "$(telemetry_dir "$1")" <<'PY'
+import json, os, sys
+try:
+    with open(os.path.join(sys.argv[1], "attempts.json"), encoding="utf-8") as handle:
+        attempts = json.load(handle)
+except (OSError, json.JSONDecodeError):
+    attempts = {}
+if not isinstance(attempts, dict):
+    attempts = {}
+
+
+def num(aid):
+    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+        return int(aid[1:])
+    return None
+
+
+known = [a for a in attempts if num(a) is not None]
+open_attempts = [a for a in known if attempts[a].get("status") == "open"]
+pool = open_attempts or known
+print(max(pool, key=num) if pool else "")
+PY
+}
+
+# Write refs.job_id through the only authority contract that exists: a legal
+# task transition. The typed refs field rides along on the in_progress->join
+# transition only when the task's current state permits it — this never
+# forces a state, never smuggles an unsupported refs key, and never
+# overwrites a job_id bound to a different job. Prints an outcome token;
+# always returns 0 (the outcome is recorded in the terminal receipt).
+telemetry_task_link() {
+  local job="$1" pr="$2" head="$3" report="$4" dir task_id task_body
+  dir="$(telemetry_dir "$job")"
+  task_id="$(python3 - "$dir/binding.json" <<'PY'
+import json, sys
+print(json.load(open(sys.argv[1], encoding="utf-8"))["task_id"])
+PY
+)" || { echo "error_binding"; return 0; }
+  task_body="$(hk_request GET "/v1/tasks/$task_id")" || { echo "error_get"; return 0; }
+  local verdict tmp_body
+  verdict="$(HK_JSON="$task_body" python3 - "$job" <<'PY'
+import json, os, sys
+
+job = sys.argv[1]
+task = json.loads(os.environ["HK_JSON"])
+state = task.get("state") or ""
+refs = task.get("refs") or {}
+existing = refs.get("job_id") or ""
+if existing and existing != job:
+    print("skipped_foreign_job_id")
+elif state != "in_progress":
+    print("skipped_state_%s" % (state or "unknown"))
+else:
+    print("linkable")
+PY
+)" || { echo "error_parse"; return 0; }
+  if [[ "$verdict" != "linkable" ]]; then
+    echo "$verdict"
+    return 0
+  fi
+  tmp_body="$(mktemp)" || { echo "error_tmpfile"; return 0; }
+  python3 - "$job" "$pr" "$head" "$report" "$tmp_body" <<'PY'
+import json, sys
+
+job, pr, head, report, path = sys.argv[1:6]
+body = {"to": "join", "note": "builder joined PR for job %s" % job,
+        "refs": {"job_id": job, "pr": pr, "head_sha": head, "report_path": report}}
+with open(path, "w", encoding="utf-8") as handle:
+    json.dump(body, handle)
+PY
+  if hk_request POST "/v1/tasks/$task_id/transition" "$tmp_body" >/dev/null; then
+    echo "linked"
+  else
+    echo "error_transition"
+  fi
+  rm -f "$tmp_body" || true
+}
+
+# Best-effort export of pending_export receipts, bounded so a wedged server
+# can never stall a lifecycle command. Only PUT /v1/bench/reps exists —
+# there is deliberately no scores/grades path to call. Prints
+# "exported=N pending=N errors=N"; lifecycle callers redirect to stderr.
+telemetry_drain() {
+  python3 - "$(wrk_jobs_root)" "$TELEMETRY_DRAIN_MAX" <<'PY'
+import json, os, sys, tempfile, urllib.error, urllib.request
+from datetime import datetime, timezone
+from urllib.parse import urlsplit
+
+jobs_root, drain_max = sys.argv[1], int(sys.argv[2])
+url = os.environ.get("WRK_HANDOFFKEEP_URL") or os.environ.get("HANDOFFKEEP_URL") or ""
+token = os.environ.get("WRK_HANDOFFKEEP_TOKEN") or os.environ.get("HANDOFFKEEP_TOKEN") or ""
+exported = pending = errors = 0
+now = os.environ.get("WRK_TELEMETRY_NOW") or datetime.now(timezone.utc).isoformat()
+
+
+def atomic(path, obj):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tel-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def rep_for(receipt):
+    launch = receipt.get("launch") or {}
+    terminal = receipt.get("terminal") or {}
+    role = {"worker": "impl", "builder": "orch"}.get(receipt.get("role"), "impl")
+    observed = (receipt.get("observed") or {}).get("model")
+    model_id = None if observed in (None, "", "unknown") else observed
+    return {
+        "origin_id": receipt["projection"]["origin_id"],
+        "profile": launch.get("profile") or receipt.get("role") or "unknown",
+        "model_id": model_id,
+        "task_ref": receipt.get("task_ref"),
+        "tier": receipt.get("t_level") or None,
+        "role": role,
+        "rounds": terminal.get("rounds"),
+        "blockers_found": None,
+        "completed": 1 if terminal.get("status") == "completed" else 0,
+        "input_tokens": None,
+        "output_tokens": None,
+        "notes": "job=%s attempt=%s seg=%s status=%s sem=%s" % (
+            receipt.get("job_id"), receipt.get("attempt_id"),
+            receipt.get("participant_segment"),
+            terminal.get("status"), terminal.get("participant_semantics")),
+        "recorded_at": receipt.get("ended_at") or receipt.get("recorded_at"),
+        "effort": launch.get("effort") or None,
+        "grade": None,
+        "table_grade": None,
+    }
+
+
+class _RefuseRedirect(urllib.request.HTTPRedirectHandler):
+    # Same rule as hk_request: the bearer may only go to the exact
+    # configured, validated origin. A 3xx becomes an HTTPError and the
+    # receipt stays pending_export — never silently forwarded.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def put_reps(reps):
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" and not (
+        parsed.scheme == "http" and parsed.hostname in ("localhost", "127.0.0.1", "::1")
+    ):
+        return "config"
+    origin = (parsed.scheme, (parsed.hostname or "").lower(),
+              parsed.port or (443 if parsed.scheme == "https" else 80))
+    body = json.dumps({"reps": reps}).encode("utf-8")
+    request = urllib.request.Request(url.rstrip("/") + "/v1/bench/reps", data=body, method="PUT")
+    request.add_header("Authorization", "Bearer " + token)
+    request.add_header("Content-Type", "application/json")
+    opener = urllib.request.build_opener(_RefuseRedirect)
+    # Same contract as hk_request: re-verify the exact configured origin
+    # (scheme/host/port) immediately before the credential leaves.
+    sending = urlsplit(request.full_url)
+    actual = (sending.scheme, (sending.hostname or "").lower(),
+              sending.port or (443 if sending.scheme == "https" else 80))
+    if actual != origin:
+        return "origin_changed"
+    try:
+        with opener.open(
+            request, timeout=float(os.environ.get("WRK_HK_TIMEOUT_S", "3"))
+        ) as response:
+            payload = json.loads(response.read().decode("utf-8", "replace"))
+        if payload.get("upserted") == len(reps):
+            return ""
+        return "rejected"
+    except urllib.error.HTTPError as exc:
+        return "http_%d" % exc.code
+    except (OSError, ValueError):
+        return "transport"
+
+
+# Collect pending receipts (oldest first), one rep per origin_id — the first
+# terminal receipt for a segment wins, later terminal receipts for the same
+# segment stay local evidence and never mint a second row.
+candidates = []
+try:
+    job_names = sorted(os.listdir(jobs_root))
+except OSError:
+    job_names = []
+for job_name in job_names:
+    receipts_dir = os.path.join(jobs_root, job_name, "telemetry", "receipts")
+    if not os.path.isdir(receipts_dir):
+        continue
+    try:
+        names = sorted(os.listdir(receipts_dir))
+    except OSError:
+        continue
+    for name in names:
+        if not name.startswith("terminal-") or not name.endswith(".json"):
+            continue
+        path = os.path.join(receipts_dir, name)
+        try:
+            with open(path, encoding="utf-8") as handle:
+                receipt = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            continue
+        projection = receipt.get("projection")
+        if not isinstance(projection, dict) or projection.get("state") != "pending_export":
+            continue
+        candidates.append((path, receipt))
+seen_origins = set()
+pending_receipts = []
+for path, receipt in candidates:
+    origin = receipt["projection"]["origin_id"]
+    if origin in seen_origins:
+        receipt["projection"]["state"] = "duplicate_suppressed"
+        atomic(path, receipt)
+        continue
+    seen_origins.add(origin)
+    pending_receipts.append((path, receipt))
+del candidates
+batch = pending_receipts[:drain_max]
+skipped = len(pending_receipts) - len(batch)
+configured = bool(url and token)
+for path, receipt in batch:
+    if not configured:
+        receipt["projection"]["attempts"] = receipt["projection"].get("attempts", 0) + 1
+        receipt["projection"]["last_error"] = "handoffkeep_not_configured"
+        atomic(path, receipt)
+        pending += 1
+        continue
+    error = put_reps([rep_for(receipt)])
+    receipt["projection"]["attempts"] = receipt["projection"].get("attempts", 0) + 1
+    if error:
+        receipt["projection"]["last_error"] = error
+        atomic(path, receipt)
+        pending += 1
+        errors += 1
+    else:
+        receipt["projection"]["state"] = "exported"
+        receipt["projection"]["exported_at"] = now
+        receipt["projection"]["last_error"] = None
+        atomic(path, receipt)
+        exported += 1
+pending += skipped
+# Silence means there was nothing to drain: lifecycle commands relay this
+# to stderr, and a zero-work summary must never alter their stderr shape.
+if exported or pending or errors:
+    print("exported=%d pending=%d errors=%d" % (exported, pending, errors))
+PY
+}
+
+# Scan bound jobs for terminal flat events that no terminal receipt covers
+# yet, persist the missing receipts, then drain. This is the only recovery
+# path for externally produced terminal kinds (lost/revoked/cancelled) and
+# for a restart that lost the export after the receipt landed.
+telemetry_reconcile_scan() {
+  python3 - "$(wrk_jobs_root)" "${1:-}" <<'PY'
+import hashlib, json, os, sys, tempfile
+from datetime import datetime, timezone
+
+jobs_root, only_job = sys.argv[1], sys.argv[2]
+now = os.environ.get("WRK_TELEMETRY_NOW") or datetime.now(timezone.utc).isoformat()
+KIND_MAP = {"job.completed": ("completed", "work_done"),
+            "job.joined": ("completed", "pr_submitted"),
+            "job.lost": ("failed", "event_observed"),
+            "job.failed": ("failed", "event_observed"),
+            "job.revoked": ("revoked", "event_observed"),
+            "job.cancelled": ("cancelled", "event_observed")}
+
+
+def fail(message):
+    sys.stderr.write("telemetry: %s\n" % message)
+    sys.exit(1)
+
+
+def load(path, default):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def atomic(path, obj):
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tel-")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(obj, handle, separators=(",", ":"), sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
+        raise
+
+
+def parse_at(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def attempt_num(aid):
+    # a<N> ordering is the numeric suffix; a malformed identity is never a
+    # recorded attempt and stays unattributed rather than being reinterpreted.
+    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+        return int(aid[1:])
+    return None
+
+
+scanned = created = unattributed = 0
+try:
+    job_names = sorted(os.listdir(jobs_root))
+except OSError:
+    job_names = []
+for job_name in job_names:
+    if only_job and job_name != only_job:
+        continue
+    job_dir = os.path.join(jobs_root, job_name)
+    telemetry = os.path.join(job_dir, "telemetry")
+    binding = load(os.path.join(telemetry, "binding.json"), None)
+    if not binding:
+        continue
+    events_dir = os.path.join(job_dir, "events")
+    try:
+        names = sorted(os.listdir(events_dir))
+    except OSError:
+        continue
+    receipts_dir = os.path.join(telemetry, "receipts")
+    attempts = load(os.path.join(telemetry, "attempts.json"), {})
+    segments = load(os.path.join(telemetry, "segments.json"), {})
+    for name in names:
+        matched = next((kind for kind in KIND_MAP if name.endswith("-" + kind + ".json")), None)
+        if matched is None:
+            continue
+        scanned += 1
+        kind, semantics = KIND_MAP[matched]
+        event = load(os.path.join(events_dir, name), {})
+        event_attempt = event.get("attempt_id")
+        if not isinstance(event_attempt, str):
+            payload = event.get("payload")
+            event_attempt = payload.get("attempt_id") if isinstance(payload, dict) else None
+        # Attribution requires the event's own explicit attempt identity to
+        # name a recorded attempt holding a participant segment for this job.
+        # A retained, malformed, or foreign event is reported unattributed —
+        # it can never close or mint coverage for a different attempt that
+        # merely happens to be open.
+        if (not isinstance(event_attempt, str)
+                or attempt_num(event_attempt) is None
+                or event_attempt not in attempts
+                or not segments.get(event_attempt)):
+            unattributed += 1
+            continue
+        attempt = event_attempt
+        segment = segments[attempt][-1]
+        rname = "terminal-%s-%s-%s.json" % (attempt, segment["seg"], kind)
+        # Coverage is the (attempt, segment, terminal kind) triple, not the
+        # event file: a terminal receipt produced by done/joined already
+        # covers every flat event of that kind for the segment, so a
+        # repeated event or reconcile never rewrites it or mints a row.
+        existing = load(os.path.join(receipts_dir, rname), None)
+        if (isinstance(existing, dict) and existing.get("phase") == "terminal"
+                and not existing.get("budget_exceeded")):
+            continue
+        info = attempts[attempt]
+        opened_at = parse_at(info.get("opened_at"))
+        ended_at = parse_at(now)
+        duration = round((ended_at - opened_at).total_seconds(), 3) if opened_at and ended_at else None
+        report = event.get("report_path") or ""
+        report_sha = ""
+        if report and os.path.isfile(report):
+            digest = hashlib.sha256()
+            with open(report, "rb") as handle:
+                for chunk in iter(lambda: handle.read(65536), b""):
+                    digest.update(chunk)
+            report_sha = digest.hexdigest()
+        receipt = {
+            "kind": "telemetry_receipt", "schema_version": 1, "phase": "terminal",
+            "task_id": binding["task_id"], "task_ref": binding["task_ref"],
+            "job_id": job_name, "attempt_id": attempt,
+            "participant_segment": segment["seg"],
+            "role": segment["identity"].get("role") or "",
+            "t_level": info.get("t_level") or "",
+            "launch": dict(segment["identity"]),
+            "observed": {"model": binding.get("observed_model") or "unknown"},
+            "recorded_at": now, "attempt_opened_at": info.get("opened_at") or "",
+            "ended_at": now, "duration_s": duration,
+            "terminal": {"status": kind, "participant_semantics": semantics,
+                         "reason": event.get("reason") or "unknown", "rounds": None},
+            "evidence": {"pane_id": info.get("pane_id") or "",
+                         "tab_id": info.get("tab_id") or "", "event_file": name},
+            "state_dwell": binding.get("state_dwell") or [],
+            "v_over_i": binding.get("v_over_i"),
+            "projection": {"state": "pending_export",
+                           "origin_id": segment["origin_id"], "attempts": 0,
+                           "exported_at": None, "last_error": None},
+        }
+        if report:
+            receipt["evidence"]["report_path"] = report
+        if report_sha:
+            receipt["evidence"]["report_sha256"] = report_sha
+        if event.get("pr"):
+            receipt["evidence"]["pr"] = event["pr"]
+        if event.get("head"):
+            receipt["evidence"]["head"] = event["head"]
+        if os.environ.get("WRK_TELEMETRY_FAIL_STORE", "") in ("terminal", "all"):
+            fail("injected store failure (WRK_TELEMETRY_FAIL_STORE)")
+        atomic(os.path.join(receipts_dir, rname), receipt)
+        info["status"] = "terminal"
+        info["closed_at"] = now
+        info["terminal_kind"] = kind
+        atomic(os.path.join(telemetry, "attempts.json"), attempts)
+        intent = load(os.path.join(telemetry, "intent.json"), None)
+        if isinstance(intent, dict) and intent.get("attempt_id") == attempt:
+            intent["status"] = "terminal"
+            atomic(os.path.join(telemetry, "intent.json"), intent)
+        created += 1
+print("jobs_scanned_events=%d receipts_created=%d unattributed=%d" % (scanned, created, unattributed))
+PY
+}
+
+reconcile_help() {
+  cat <<'USAGE'
+Usage: wrk reconcile [--job ID]
+
+Manual export path for telemetry receipts (task445). For every bound job,
+attributes terminal events lacking a receipt — only when the event's own
+attempt_id names a recorded attempt with a participant segment for that
+job — persists pending_export receipts, then drains the outbox through
+PUT /v1/bench/reps only. Repeat runs are idempotent: the durable origin_id
+mapping means the reps row count increases by 0 for an already exported
+terminal segment.
+USAGE
+}
+
+reconcile_cmd() {
+  local only_job="" scanned drain
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) reconcile_help; return 0 ;;
+      --job) [[ $# -ge 2 && -n "$2" ]] || die "--job requires a value"; only_job="$2"; shift 2 ;;
+      *) die "unknown reconcile option '$1'" ;;
+    esac
+  done
+  scanned="$(telemetry_reconcile_scan "$only_job")" || die "reconcile scan failed"
+  drain="$(telemetry_drain)"
+  echo "OK reconcile $scanned${drain:+ $drain}"
+}
+
+telemetry_status_help() {
+  cat <<'USAGE'
+Usage: wrk telemetry-status [--job ID] [--json]
+
+Countable telemetry coverage counters (task445):
+  expected_terminal_attempts       bound attempts with terminal evidence expected
+  receipts_with_terminal_evidence  bound attempts holding a terminal receipt
+  coverage_gap                     expected - receipts (uncovered terminals)
+  pending_export                   receipts awaiting bench_reps export
+  pending_export_age_s             age of the oldest pending receipt
+  unmanaged_jobs                   jobs without a verified binding (uncovered,
+                                   never silently bound or counted above)
+USAGE
+}
+
+telemetry_status_cmd() {
+  local only_job="" as_json=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) telemetry_status_help; return 0 ;;
+      --job) [[ $# -ge 2 && -n "$2" ]] || die "--job requires a value"; only_job="$2"; shift 2 ;;
+      --json) as_json=1; shift ;;
+      *) die "unknown telemetry-status option '$1'" ;;
+    esac
+  done
+  python3 - "$(wrk_jobs_root)" "$only_job" "$as_json" <<'PY'
+import json, os, sys
+from datetime import datetime, timezone
+
+jobs_root, only_job, as_json = sys.argv[1], sys.argv[2], sys.argv[3] == "1"
+now_override = os.environ.get("WRK_TELEMETRY_NOW")
+
+
+def parse_at(value):
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+now_dt = parse_at(now_override) if now_override else None
+if now_dt is None:
+    if now_override and now_override.isdigit():
+        now_dt = datetime.fromtimestamp(int(now_override), timezone.utc)
+    else:
+        now_dt = datetime.now(timezone.utc)
+TERMINAL_KINDS = ("job.completed", "job.joined", "job.lost",
+                  "job.failed", "job.revoked", "job.cancelled")
+
+
+def load(path, default):
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def attempt_num(aid):
+    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+        return int(aid[1:])
+    return None
+
+
+def event_attempt_id(event):
+    aid = event.get("attempt_id")
+    if not isinstance(aid, str):
+        payload = event.get("payload")
+        aid = payload.get("attempt_id") if isinstance(payload, dict) else None
+    return aid if isinstance(aid, str) and aid else None
+
+
+expected = covered = pending = unmanaged = 0
+oldest_pending = None
+jobs_out = []
+unmanaged_out = []
+try:
+    names = sorted(os.listdir(jobs_root))
+except OSError:
+    names = []
+for name in names:
+    if name == "_telemetry" or (only_job and name != only_job):
+        continue
+    job_dir = os.path.join(jobs_root, name)
+    if not os.path.isdir(job_dir):
+        continue
+    telemetry = os.path.join(job_dir, "telemetry")
+    binding = load(os.path.join(telemetry, "binding.json"), None)
+    events_dir = os.path.join(job_dir, "events")
+    try:
+        event_names = [n for n in os.listdir(events_dir) if n.endswith(".json")]
+    except OSError:
+        event_names = []
+    if not binding:
+        if event_names:
+            unmanaged += 1
+            unmanaged_out.append(name)
+        continue
+    attempts = load(os.path.join(telemetry, "attempts.json"), {})
+    receipts_dir = os.path.join(telemetry, "receipts")
+    receipt_attempts = set()
+    try:
+        receipt_names = sorted(os.listdir(receipts_dir))
+    except OSError:
+        receipt_names = []
+    for rname in receipt_names:
+        if not rname.startswith("terminal-") or not rname.endswith(".json"):
+            continue
+        receipt = load(os.path.join(receipts_dir, rname), None)
+        if not isinstance(receipt, dict) or receipt.get("phase") != "terminal":
+            continue
+        if receipt.get("evidence"):
+            receipt_attempts.add(receipt.get("attempt_id"))
+        projection = receipt.get("projection") or {}
+        if projection.get("state") == "pending_export":
+            pending += 1
+            recorded = parse_at(receipt.get("recorded_at"))
+            if recorded is not None and (oldest_pending is None or recorded < oldest_pending):
+                oldest_pending = recorded
+    expected_job = sum(1 for a in attempts.values() if a.get("status") == "terminal")
+    segments = load(os.path.join(telemetry, "segments.json"), {})
+    open_ids = {a for a, v in attempts.items()
+                if v.get("status") == "open" and attempt_num(a) is not None}
+    # A terminal flat event is expected evidence for an open attempt only
+    # when the event's own explicit attempt identity names that open attempt
+    # and the attempt holds a participant segment. A stale event retained
+    # from a previous attempt never counts toward the open one.
+    expected_open = set()
+    if open_ids:
+        for n in event_names:
+            if not any(n.endswith("-" + kind + ".json") for kind in TERMINAL_KINDS):
+                continue
+            aid = event_attempt_id(load(os.path.join(events_dir, n), {}))
+            if aid in open_ids and segments.get(aid):
+                expected_open.add(aid)
+    if expected_open:
+        # A terminal flat event landed for a still-open attempt but no
+        # receipt covers it yet — exactly the gap reconcile closes.
+        expected_job += len(expected_open)
+    expected += expected_job
+    covered += len(receipt_attempts & set(attempts))
+    jobs_out.append({
+        "job_id": name, "bound": True,
+        "attempts": {a: {"status": v.get("status"), "pane_id": v.get("pane_id")}
+                     for a, v in attempts.items()},
+        "expected_terminal": expected_job,
+        "covered": len(receipt_attempts & set(attempts)),
+        "task_ref": binding.get("task_ref"), "v_over_i": binding.get("v_over_i"),
+    })
+age_s = 0
+if oldest_pending is not None:
+    age_s = max(0, int((now_dt - oldest_pending).total_seconds()))
+gap = expected - covered
+if as_json:
+    print(json.dumps({
+        "expected_terminal_attempts": expected,
+        "receipts_with_terminal_evidence": covered,
+        "coverage_gap": gap, "pending_export": pending,
+        "pending_export_age_s": age_s, "unmanaged_jobs": unmanaged,
+        "jobs": jobs_out, "unmanaged": unmanaged_out}, sort_keys=True))
+else:
+    print("expected_terminal_attempts=%d" % expected)
+    print("receipts_with_terminal_evidence=%d" % covered)
+    print("coverage_gap=%d" % gap)
+    print("pending_export=%d" % pending)
+    print("pending_export_age_s=%d" % age_s)
+    print("unmanaged_jobs=%d" % unmanaged)
+    for name in unmanaged_out:
+        print("unmanaged job=%s" % name)
+PY
+}
+
 done_cmd() {
   local job="${1:-}" report=""
   [[ -n "$job" && "$job" != -* ]] || die "done requires a job id"
@@ -1446,15 +2790,29 @@ done_cmd() {
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
   upload_report_document "$job" "$report"
-  completion_event "$job" "$owner" "$label" "$pane" "$report"
+  # The flat event must carry the attempt this completion belongs to — the
+  # same attempt telemetry_record_terminal binds below — so a retained event
+  # can never be attributed to a later, still-open attempt.
+  local done_attempt=""
+  if telemetry_bound "$job"; then
+    done_attempt="$(telemetry_current_attempt "$job" || true)"
+  fi
+  completion_event "$job" "$owner" "$label" "$pane" "$report" job.completed "" "$done_attempt"
+  if telemetry_bound "$job"; then
+    if ! telemetry_record_terminal "$job" completed work_done "$report" ""; then
+      warn "terminal telemetry receipt could not be stored durably; done ACK withheld: job=$job"
+      return "$WRK_EXIT_TELEMETRY_STORE"
+    fi
+  fi
   set_report_last_line "$report"
   emit_relay_event job.completed "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "" "" "" ""
+  telemetry_drain >&2 || true
   echo "OK job=$job report=$report"
 }
 
 builder_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" attempt="${12:-}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
@@ -1464,9 +2822,9 @@ builder_flat_event() {
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$attempt" <<'PY'
 import json, os, sys, tempfile
-events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, attempt = sys.argv[1:]
 highest = 0
 for name in os.listdir(events):
     try: highest = max(highest, int(name.split('-', 1)[0]))
@@ -1477,6 +2835,9 @@ record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
 if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
+# task445: terminal builder events (job.joined) carry their attempt identity so
+# reconcile can never attribute them to a different, still-open attempt.
+if attempt: record["attempt_id"] = attempt
 fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
 try:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1523,7 +2884,7 @@ escalate_cmd() {
   reason="builder escalation"
   [[ "$role" == captain ]] && reason="captain escalation"
   [[ -z "$report" ]] || upload_report_document "$job" "$report"
-  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "$report" "$reason" "$question" "" ""
+  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "$report" "$reason" "$question" "" "" ""
   set_report_last_line "$report"
   emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "$question" "" ""
@@ -1531,7 +2892,7 @@ escalate_cmd() {
 }
 
 joined_cmd() {
-  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent role reason
+  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent role reason task_link=""
   [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -1548,10 +2909,25 @@ joined_cmd() {
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
   upload_report_document "$job" "$report"
-  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head"
+  local joined_attempt=""
+  if telemetry_bound "$job"; then
+    joined_attempt="$(telemetry_current_attempt "$job" || true)"
+  fi
+  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$joined_attempt"
+  if telemetry_bound "$job"; then
+    # The typed refs.job_id field is attached to a legal task transition
+    # only; the outcome lands in the receipt as evidence and never blocks
+    # or forces the join itself.
+    task_link="$(telemetry_task_link "$job" "$pr" "$head" "$report")"
+    if ! telemetry_record_terminal "$job" completed pr_submitted "$report" "$reason" "$pr" "$head" "" "$task_link"; then
+      warn "terminal telemetry receipt could not be stored durably; joined ACK withheld: job=$job"
+      return "$WRK_EXIT_TELEMETRY_STORE"
+    fi
+  fi
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "" "$pr" "$head"
+  telemetry_drain >&2 || true
   echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
 }
 
@@ -1648,7 +3024,7 @@ sentinel_log() {
 }
 
 sentinel_cmd() {
-  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}"
+  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}" attempt="${7:-}"
   local timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
   local interval="${WRK_COMPLETION_INTERVAL_S:-30}"
   local transient_max="${WRK_SENTINEL_TRANSIENT_MAX:-10}"
@@ -1701,7 +3077,7 @@ sentinel_cmd() {
     sentinel_log "$logfile" "$token" "$transient" "$action"
     case "$action" in
       completed)
-        completion_event "$job" "$owner" "$label" "$pane" "$candidate"
+        completion_event "$job" "$owner" "$label" "$pane" "$candidate" job.completed "" "$attempt"
         seen="$key"
         [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
         # lost 뒤의 completed 는 유효하다(panewire 가 completed 를 relay 한다).
@@ -1709,7 +3085,7 @@ sentinel_cmd() {
         if [[ "$lost" -eq 1 ]]; then exit 0; fi
         ;;
       lost:*)
-        completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}"
+        completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}" "$attempt"
         lost=1
         lost_at="$now"
         ;;
@@ -2583,18 +3959,18 @@ hosts_cmd() {
 spawn_cmd() {
   local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" TASK_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--task-id|--t|--owner|--role|--lane|--parent|--report)
         [[ $# -ge 2 && -n "$2" ]] || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
-          --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
+          --job) JOB_ID="$2" ;; --task-id) TASK_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
           --role) ROLE="$2" ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
           --report) REPORT_PATH="$2" ;;
         esac
@@ -2685,6 +4061,17 @@ spawn_cmd() {
     die "NEEDS_CLASSIFICATION: --t T0..T3 is required (job '$JOB_ID'); classify it, do not guess"
   case "$JOB_T" in T0|T1|T2|T3) ;; *) die "--t accepts only T0, T1, T2 or T3" ;; esac
 
+  # task445: --task-id binds this job to an exact handoffkeep task. The
+  # binding is verified through the configured API before any admission
+  # side effect; an unverifiable binding refuses the spawn rather than
+  # silently degrading into an unmanaged job that would misclaim coverage.
+  TELEMETRY_BOUND=0
+  if [[ -n "$TASK_ID" ]]; then
+    [[ "$TASK_ID" =~ ^[1-9][0-9]*$ ]] || die "--task-id must be a positive handoffkeep task id (got '$TASK_ID')"
+    telemetry_bind "$JOB_ID" "$TASK_ID" || die "task binding could not be verified through handoffkeep: hk:task/$TASK_ID job=$JOB_ID"
+    TELEMETRY_BOUND=1
+  fi
+
   # Advisory only (never fails spawn). After -L may have rewritten CWD.
   warn_if_canonical_off_default "$CWD"
 
@@ -2693,6 +4080,25 @@ spawn_cmd() {
   quota_hub_policy_gate
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
 
+  # task445: the durable spawn intent precedes pane creation — a store
+  # failure here can never orphan a worker, and a post-pane failure is
+  # re-driven by adopting the recorded pane instead of spawning a second
+  # one (WRK_EXIT_TELEMETRY_STORE: no normal ACK on a store failure).
+  ATTEMPT_ID="" ADOPT_PANE="" ADOPT_TAB="" ADOPT_STATUS=""
+  if [[ "$TELEMETRY_BOUND" -eq 1 ]]; then
+    set +e
+    telemetry_prepare_attempt "$JOB_ID" "$LABEL" "$MODEL" "$EFFECTIVE_EFFORT" "$ROLE" "$JOB_T"
+    prep_rc=$?
+    set -e
+    case "$prep_rc" in
+      0) ;;
+      2) die "cannot prove prior pane state; refusing a possible duplicate worker: job=$JOB_ID" ;;
+      *) warn "telemetry spawn intent could not be persisted durably: job=$JOB_ID"
+         return "$WRK_EXIT_TELEMETRY_STORE" ;;
+    esac
+  fi
+
+  if [[ -z "$ADOPT_PANE" ]]; then
   if [[ "$PROFILE_KIND" == kimi ]]; then
     if ! CWD="$(cd -- "$CWD" 2>/dev/null && pwd -P)"; then
       die "cannot resolve Kimi CWD to an absolute path: $CWD"
@@ -2730,6 +4136,15 @@ tab = result.get("tab") if isinstance(result.get("tab"), dict) else {}
 value = result.get("tab_id") or tab.get("tab_id") or pane.get("tab_id") or ""
 print(value if isinstance(value, str) else "")
 ' 2>/dev/null || true)
+  if [[ "$TELEMETRY_BOUND" -eq 1 ]]; then
+    # The pane cannot be adopted on retry unless it is durably recorded —
+    # closing the not-yet-started pane is the only no-duplicate outcome.
+    if ! telemetry_attempt_set_pane "$JOB_ID" "$ATTEMPT_ID" "$PANE" "${TAB_ID:-}"; then
+      "$HERDR" pane close "$PANE" >/dev/null 2>&1 || true
+      warn "telemetry pane binding could not be stored durably; pane closed, spawn ACK withheld: job=$JOB_ID pane=$PANE"
+      return "$WRK_EXIT_TELEMETRY_STORE"
+    fi
+  fi
   SPAWN_PANE_OPEN=1   # ROB-1214: disarmed only at the success line
   sleep_for 5
   START_TIMEOUT=30000; BOOT_SETTLE=12
@@ -2817,16 +4232,40 @@ print(value if isinstance(value, str) else "")
   if [[ -z "$TAB_ID" ]]; then
     IFS=$'\t' read -r _ _ TAB_ID <<<"$(herdr_agent_probe "$PANE")" || TAB_ID=""
   fi
+  else
+    # task445 adoption: a previous invocation created this worker but never
+    # reached its ACK (receipt store failed). The recorded pane is reused —
+    # respawning here would silently duplicate the worker.
+    PANE="$ADOPT_PANE"; TAB_ID="${ADOPT_TAB:-}"
+    STATUS="${ADOPT_STATUS:-adopted}"; LANDING="adopted"
+  fi
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   arbiter_record_spawn_receipt
+  if [[ "$TELEMETRY_BOUND" -eq 1 ]]; then
+    if ! telemetry_record_start "$JOB_ID" "$ATTEMPT_ID" "$PANE" "${TAB_ID:-}" "$LABEL" \
+        "$MODEL" "$EFFECTIVE_EFFORT" "$PROFILE_KIND" "${ARBITER_RESOURCE:-}" "$ROLE" "$JOB_T" "$REPORT_PATH"; then
+      # The live worker stays recorded in the durable intent for adoption —
+      # closing or duplicating it is exactly what the receipt discipline
+      # exists to prevent. No normal ACK is printed.
+      SPAWN_PANE_OPEN=0
+      warn "telemetry start receipt could not be stored durably; spawn ACK withheld: job=$JOB_ID pane=$PANE attempt=$ATTEMPT_ID"
+      return "$WRK_EXIT_TELEMETRY_STORE"
+    fi
+  fi
   # A sentinel requires the durable claim/spawn metadata it later reads. During
   # an installation transition the old fail-open spawn contract remains intact.
   if [[ "$ARBITER_JOB_REGISTERED" -eq 1 ]]; then
-    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
+    # The sentinel stamps its terminal events with the attempt it was spawned
+    # to watch ("" when unmanaged) so a retained event can never be reconciled
+    # onto a different, still-open attempt.
+    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE" "$ATTEMPT_ID"
   fi
   SPAWN_PANE_OPEN=0
   refresh_quota_pool
   ARBITER_HELD=0
+  # task445: bounded best-effort outbox drain — an export failure stays
+  # pending_export and never changes the ACK line.
+  telemetry_drain >&2 || true
   if [[ -n "$ARBITER_RESOURCE" ]]; then
     echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
   else
@@ -3267,6 +4706,8 @@ case "${1:-}" in
   joined) shift; joined_cmd "$@" ;;
   sentinel) shift; sentinel_cmd "$@" ;;
   reap) shift; reap_cmd "$@" ;;
+  reconcile) shift; reconcile_cmd "$@" ;;
+  telemetry-status) shift; telemetry_status_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;
