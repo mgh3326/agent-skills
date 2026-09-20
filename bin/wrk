@@ -1194,7 +1194,7 @@ resolve_profile() {
 }
 
 completion_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}" reason="${7:-}"
+  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}" reason="${7:-}" attempt="${8:-}"
   local events host last
   events="$(wrk_jobs_root)/$job/events"
   host="${HOSTNAME:-unknown}"
@@ -1205,9 +1205,9 @@ completion_event() {
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" <<'PY'
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" "$attempt" <<'PY'
 import json, os, sys, tempfile, time
-events, job, owner, label, pane, host, report, last, kind, reason = sys.argv[1:]
+events, job, owner, label, pane, host, report, last, kind, reason, attempt = sys.argv[1:]
 highest = 0
 for name in os.listdir(events):
     try: highest = max(highest, int(name.split('-', 1)[0]))
@@ -1218,6 +1218,9 @@ record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
 # job.lost always states why. Downstream recovery treats agent_not_found as a
 # vanished pane and herdr_unreachable/timeout as an observation gap.
 if reason: record["reason"] = reason
+# task445: a managed terminal event carries the attempt it was observed for —
+# without it reconcile could never tell a stale event from a live attempt's.
+if attempt: record["attempt_id"] = attempt
 fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
 try:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -1470,6 +1473,9 @@ PY
 # this participant segment, never a claim of global task completion.
 # Externally produced terminal events are projected by `wrk reconcile`:
 # job.lost -> failed, job.revoked -> revoked, job.cancelled -> cancelled.
+# Attribution is by the event's own attempt_id only: an event whose identity
+# is missing, malformed, or names no recorded attempt/segment is counted
+# unattributed — it can never close or cover a different, still-open attempt.
 # ======================================================================
 
 telemetry_dir() {
@@ -2016,14 +2022,23 @@ def parse_at(value):
         return None
 
 
+def attempt_num(aid):
+    # Attempt ids are a<N>; ordering is the numeric suffix, never lexical
+    # (a10 > a9). A malformed id has no number and is never selected.
+    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+        return int(aid[1:])
+    return None
+
+
 binding = load(os.path.join(out_dir, "binding.json"), None)
 if not binding:
     fail("binding.json missing for managed job")
 attempts = load(os.path.join(out_dir, "attempts.json"), {})
-if not attempts:
-    fail("no attempt on record for terminal evidence")
-open_attempts = sorted(a for a in attempts if attempts[a].get("status") == "open")
-attempt = open_attempts[-1] if open_attempts else sorted(attempts)[-1]
+known = [a for a in attempts if attempt_num(a) is not None]
+if not known:
+    fail("no well-formed attempt on record for terminal evidence")
+open_attempts = [a for a in known if attempts[a].get("status") == "open"]
+attempt = max(open_attempts or known, key=attempt_num)
 segments = load(os.path.join(out_dir, "segments.json"), {})
 mine = segments.get(attempt) or []
 if not mine:
@@ -2117,6 +2132,36 @@ if isinstance(intent, dict) and intent.get("attempt_id") == attempt:
     intent["status"] = "terminal"
     atomic(os.path.join(out_dir, "intent.json"), intent)
 print("%s\t%s\t%s" % (attempt, segment["seg"], segment["origin_id"]))
+PY
+}
+
+# The attempt a wrk-owned terminal observation belongs to: the same selection
+# telemetry_record_terminal makes (latest open a<N> by numeric suffix, else the
+# latest recorded one; malformed ids are never selected). Prints "" when no
+# well-formed attempt exists — the flat event then stays explicit legacy and
+# reconcile will report it unattributed rather than guess.
+telemetry_current_attempt() {
+  python3 - "$(telemetry_dir "$1")" <<'PY'
+import json, os, sys
+try:
+    with open(os.path.join(sys.argv[1], "attempts.json"), encoding="utf-8") as handle:
+        attempts = json.load(handle)
+except (OSError, json.JSONDecodeError):
+    attempts = {}
+if not isinstance(attempts, dict):
+    attempts = {}
+
+
+def num(aid):
+    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+        return int(aid[1:])
+    return None
+
+
+known = [a for a in attempts if num(a) is not None]
+open_attempts = [a for a in known if attempts[a].get("status") == "open"]
+pool = open_attempts or known
+print(max(pool, key=num) if pool else "")
 PY
 }
 
@@ -2404,6 +2449,14 @@ def parse_at(value):
         return None
 
 
+def attempt_num(aid):
+    # a<N> ordering is the numeric suffix; a malformed identity is never a
+    # recorded attempt and stays unattributed rather than being reinterpreted.
+    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+        return int(aid[1:])
+    return None
+
+
 scanned = created = unattributed = 0
 try:
     job_names = sorted(os.listdir(jobs_root))
@@ -2425,17 +2478,29 @@ for job_name in job_names:
     receipts_dir = os.path.join(telemetry, "receipts")
     attempts = load(os.path.join(telemetry, "attempts.json"), {})
     segments = load(os.path.join(telemetry, "segments.json"), {})
-    open_attempts = sorted(a for a in attempts if attempts[a].get("status") == "open")
-    attempt = open_attempts[-1] if open_attempts else (sorted(attempts)[-1] if attempts else "")
     for name in names:
         matched = next((kind for kind in KIND_MAP if name.endswith("-" + kind + ".json")), None)
         if matched is None:
             continue
         scanned += 1
         kind, semantics = KIND_MAP[matched]
-        if not attempt or not segments.get(attempt):
+        event = load(os.path.join(events_dir, name), {})
+        event_attempt = event.get("attempt_id")
+        if not isinstance(event_attempt, str):
+            payload = event.get("payload")
+            event_attempt = payload.get("attempt_id") if isinstance(payload, dict) else None
+        # Attribution requires the event's own explicit attempt identity to
+        # name a recorded attempt holding a participant segment for this job.
+        # A retained, malformed, or foreign event is reported unattributed —
+        # it can never close or mint coverage for a different attempt that
+        # merely happens to be open.
+        if (not isinstance(event_attempt, str)
+                or attempt_num(event_attempt) is None
+                or event_attempt not in attempts
+                or not segments.get(event_attempt)):
             unattributed += 1
             continue
+        attempt = event_attempt
         segment = segments[attempt][-1]
         rname = "terminal-%s-%s-%s.json" % (attempt, segment["seg"], kind)
         # Coverage is the (attempt, segment, terminal kind) triple, not the
@@ -2446,7 +2511,6 @@ for job_name in job_names:
         if (isinstance(existing, dict) and existing.get("phase") == "terminal"
                 and not existing.get("budget_exceeded")):
             continue
-        event = load(os.path.join(events_dir, name), {})
         info = attempts[attempt]
         opened_at = parse_at(info.get("opened_at"))
         ended_at = parse_at(now)
@@ -2509,10 +2573,12 @@ reconcile_help() {
 Usage: wrk reconcile [--job ID]
 
 Manual export path for telemetry receipts (task445). For every bound job,
-attributes terminal events lacking a receipt, persists pending_export
-receipts, then drains the outbox through PUT /v1/bench/reps only. Repeat
-runs are idempotent: the durable origin_id mapping means the reps row
-count increases by 0 for an already exported terminal segment.
+attributes terminal events lacking a receipt — only when the event's own
+attempt_id names a recorded attempt with a participant segment for that
+job — persists pending_export receipts, then drains the outbox through
+PUT /v1/bench/reps only. Repeat runs are idempotent: the durable origin_id
+mapping means the reps row count increases by 0 for an already exported
+terminal segment.
 USAGE
 }
 
@@ -2588,6 +2654,20 @@ def load(path, default):
         return default
 
 
+def attempt_num(aid):
+    if isinstance(aid, str) and aid.startswith("a") and aid[1:].isdigit():
+        return int(aid[1:])
+    return None
+
+
+def event_attempt_id(event):
+    aid = event.get("attempt_id")
+    if not isinstance(aid, str):
+        payload = event.get("payload")
+        aid = payload.get("attempt_id") if isinstance(payload, dict) else None
+    return aid if isinstance(aid, str) and aid else None
+
+
 expected = covered = pending = unmanaged = 0
 oldest_pending = None
 jobs_out = []
@@ -2636,14 +2716,25 @@ for name in names:
             if recorded is not None and (oldest_pending is None or recorded < oldest_pending):
                 oldest_pending = recorded
     expected_job = sum(1 for a in attempts.values() if a.get("status") == "terminal")
-    open_attempts = [a for a in attempts.values() if a.get("status") == "open"]
-    has_terminal_event = any(
-        any(n.endswith("-" + kind + ".json") for kind in TERMINAL_KINDS)
-        for n in event_names)
-    if open_attempts and has_terminal_event:
+    segments = load(os.path.join(telemetry, "segments.json"), {})
+    open_ids = {a for a, v in attempts.items()
+                if v.get("status") == "open" and attempt_num(a) is not None}
+    # A terminal flat event is expected evidence for an open attempt only
+    # when the event's own explicit attempt identity names that open attempt
+    # and the attempt holds a participant segment. A stale event retained
+    # from a previous attempt never counts toward the open one.
+    expected_open = set()
+    if open_ids:
+        for n in event_names:
+            if not any(n.endswith("-" + kind + ".json") for kind in TERMINAL_KINDS):
+                continue
+            aid = event_attempt_id(load(os.path.join(events_dir, n), {}))
+            if aid in open_ids and segments.get(aid):
+                expected_open.add(aid)
+    if expected_open:
         # A terminal flat event landed for a still-open attempt but no
         # receipt covers it yet — exactly the gap reconcile closes.
-        expected_job += 1
+        expected_job += len(expected_open)
     expected += expected_job
     covered += len(receipt_attempts & set(attempts))
     jobs_out.append({
@@ -2699,7 +2790,14 @@ done_cmd() {
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
   upload_report_document "$job" "$report"
-  completion_event "$job" "$owner" "$label" "$pane" "$report"
+  # The flat event must carry the attempt this completion belongs to — the
+  # same attempt telemetry_record_terminal binds below — so a retained event
+  # can never be attributed to a later, still-open attempt.
+  local done_attempt=""
+  if telemetry_bound "$job"; then
+    done_attempt="$(telemetry_current_attempt "$job" || true)"
+  fi
+  completion_event "$job" "$owner" "$label" "$pane" "$report" job.completed "" "$done_attempt"
   if telemetry_bound "$job"; then
     if ! telemetry_record_terminal "$job" completed work_done "$report" ""; then
       warn "terminal telemetry receipt could not be stored durably; done ACK withheld: job=$job"
@@ -2714,7 +2812,7 @@ done_cmd() {
 }
 
 builder_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" attempt="${12:-}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
@@ -2724,9 +2822,9 @@ builder_flat_event() {
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$attempt" <<'PY'
 import json, os, sys, tempfile
-events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, attempt = sys.argv[1:]
 highest = 0
 for name in os.listdir(events):
     try: highest = max(highest, int(name.split('-', 1)[0]))
@@ -2737,6 +2835,9 @@ record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
 if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
+# task445: terminal builder events (job.joined) carry their attempt identity so
+# reconcile can never attribute them to a different, still-open attempt.
+if attempt: record["attempt_id"] = attempt
 fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
 try:
     with os.fdopen(fd, 'w', encoding='utf-8') as f:
@@ -2783,7 +2884,7 @@ escalate_cmd() {
   reason="builder escalation"
   [[ "$role" == captain ]] && reason="captain escalation"
   [[ -z "$report" ]] || upload_report_document "$job" "$report"
-  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "$report" "$reason" "$question" "" ""
+  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.escalate "$report" "$reason" "$question" "" "" ""
   set_report_last_line "$report"
   emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "$question" "" ""
@@ -2808,7 +2909,11 @@ joined_cmd() {
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
   upload_report_document "$job" "$report"
-  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head"
+  local joined_attempt=""
+  if telemetry_bound "$job"; then
+    joined_attempt="$(telemetry_current_attempt "$job" || true)"
+  fi
+  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$joined_attempt"
   if telemetry_bound "$job"; then
     # The typed refs.job_id field is attached to a legal task transition
     # only; the outcome lands in the receipt as evidence and never blocks
@@ -2919,7 +3024,7 @@ sentinel_log() {
 }
 
 sentinel_cmd() {
-  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}"
+  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}" attempt="${7:-}"
   local timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
   local interval="${WRK_COMPLETION_INTERVAL_S:-30}"
   local transient_max="${WRK_SENTINEL_TRANSIENT_MAX:-10}"
@@ -2972,7 +3077,7 @@ sentinel_cmd() {
     sentinel_log "$logfile" "$token" "$transient" "$action"
     case "$action" in
       completed)
-        completion_event "$job" "$owner" "$label" "$pane" "$candidate"
+        completion_event "$job" "$owner" "$label" "$pane" "$candidate" job.completed "" "$attempt"
         seen="$key"
         [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
         # lost 뒤의 completed 는 유효하다(panewire 가 completed 를 relay 한다).
@@ -2980,7 +3085,7 @@ sentinel_cmd() {
         if [[ "$lost" -eq 1 ]]; then exit 0; fi
         ;;
       lost:*)
-        completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}"
+        completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}" "$attempt"
         lost=1
         lost_at="$now"
         ;;
@@ -4150,7 +4255,10 @@ print(value if isinstance(value, str) else "")
   # A sentinel requires the durable claim/spawn metadata it later reads. During
   # an installation transition the old fail-open spawn contract remains intact.
   if [[ "$ARBITER_JOB_REGISTERED" -eq 1 ]]; then
-    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
+    # The sentinel stamps its terminal events with the attempt it was spawned
+    # to watch ("" when unmanaged) so a retained event can never be reconciled
+    # onto a different, still-open attempt.
+    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE" "$ATTEMPT_ID"
   fi
   SPAWN_PANE_OPEN=0
   refresh_quota_pool

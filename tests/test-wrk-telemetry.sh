@@ -385,7 +385,8 @@ PY
 echo "PASS telemetry-idempotent-export"
 
 # T9 — externally produced terminal kinds reach receipts through reconcile:
-# revoked, cancelled and lost never look completed.
+# revoked, cancelled and lost never look completed. The events carry their
+# explicit attempt_id — reconcile attributes only on that identity.
 for case in "t445-revoked job.revoked revoked" \
             "t445-cancelled job.cancelled cancelled" \
             "t445-lost job.lost failed"; do
@@ -400,7 +401,7 @@ seq = max(int(n.split("-", 1)[0]) for n in names) + 1
 record = {"kind": kind, "job_id": job, "owner_lane": "lane-t",
           "label": "fixture", "pane_id": "w:p1", "host": "fixture",
           "report_path": "", "report_last_line": "", "reason": "fixture",
-          "epoch": 1}
+          "attempt_id": "a1", "epoch": 1}
 with open(os.path.join(events, "%05d-%s.json" % (seq, kind)), "w",
           encoding="utf-8") as handle:
     json.dump(record, handle)
@@ -654,5 +655,375 @@ if [[ -f "$JOBS/t445-mutant/completion-sentinel.pid" ]]; then
 fi
 rm -rf "$JOBS/t445-mutant"
 echo "PASS telemetry-redirect-mutant-red"
+
+# ---------------------------------------------------------------- repairs
+# task445 phase A repair: terminal event <-> attempt correlation.
+# The '# >>>' markers delimit each regression block so a pre-fix RED harness
+# can slice out everything but one block and prove that block alone fails
+# on the starting head.
+
+# Shared setup for the stale-event tests: a1 completes (its flat terminal
+# event is retained in the durable inbox), then a2 opens and stays open.
+spawn_bound codex t445-stale 445 >/dev/null
+mk_events t445-stale
+wrk_hk 'done' t445-stale --report "$(mk_report t445-stale)" >/dev/null
+spawn_bound codex t445-stale 445 >/dev/null
+
+# >>> t445-red:stale-status
+# T20 — telemetry-status must not count the retained a1 event as expected
+# terminal evidence for the still-open a2, and nothing covered for a2.
+status="$(wrk_hk telemetry-status --job t445-stale)"
+grep -qx 'expected_terminal_attempts=1' <<<"$status" ||
+  fail "a retained a1 event inflated expected coverage for open a2: $status"
+grep -qx 'receipts_with_terminal_evidence=1' <<<"$status" || fail "$status"
+grep -qx 'coverage_gap=0' <<<"$status" || fail "$status"
+echo "PASS telemetry-status-stale-event-not-expected"
+# >>> end stale-status
+
+# >>> t445-red:stale-reconcile
+# T21 — reconcile must not let the retained a1 event close or mint a
+# receipt/rep for the open a2; the a1 event is attributable-but-covered.
+reconcile_out="$(wrk_hk reconcile --job t445-stale)"
+grep -q 'receipts_created=0' <<<"$reconcile_out" ||
+  fail "reconcile minted a receipt for the open attempt: $reconcile_out"
+grep -q 'unattributed=0' <<<"$reconcile_out" ||
+  fail "the a1 event is attributable to a1, not unattributed: $reconcile_out"
+python3 - "$JOBS/t445-stale" <<'PY'
+import glob, json, os, sys
+job_dir = sys.argv[1]
+telemetry = os.path.join(job_dir, "telemetry")
+attempts = json.load(open(os.path.join(telemetry, "attempts.json")))
+assert attempts["a1"]["status"] == "terminal", attempts
+assert attempts["a2"]["status"] == "open", \
+    "a retained a1 event closed the still-open a2: %r" % attempts
+names = [n for n in os.listdir(os.path.join(telemetry, "receipts"))
+         if n.startswith("terminal-")]
+assert all("-a2-" not in n for n in names), names
+events = sorted(glob.glob(os.path.join(job_dir, "events", "*job.completed.json")))
+event = json.load(open(events[-1], encoding="utf-8"))
+assert event.get("attempt_id") == "a1", \
+    "the wrk-owned terminal event must carry its originating attempt: %r" % event
+PY
+python3 - "$HK_STATE" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1], encoding="utf-8"))
+a2_reps = [r for r in state["reps"]
+           if "job=t445-stale" in (r.get("notes") or "")
+           and "attempt=a2" in r["notes"]]
+assert not a2_reps, "a stale event exported a rep for the open a2: %r" % a2_reps
+PY
+echo "PASS telemetry-stale-event-never-closes-open-attempt"
+# >>> end stale-reconcile
+
+# >>> t445-red:attempt-ordering
+# T22 — a<N> ordering is numeric. With a9 and a10 both open, `wrk done` must
+# bind the terminal receipt and stamp the flat event with a10 — lexical
+# ordering would pick a9.
+mk_events t445-order
+python3 - "$JOBS/t445-order/telemetry" <<'PY'
+import json, os, sys
+telemetry = sys.argv[1]
+os.makedirs(os.path.join(telemetry, "receipts"), exist_ok=True)
+
+
+def put(name, obj):
+    with open(os.path.join(telemetry, name), "w", encoding="utf-8") as handle:
+        json.dump(obj, handle)
+        handle.write("\n")
+
+
+put("binding.json", {
+    "kind": "telemetry_binding", "schema_version": 1, "job_id": "t445-order",
+    "task_id": 445, "task_ref": "hk:task/445",
+    "verified_at": "2026-09-20T00:00:00+00:00", "task_state": "in_progress",
+    "task_lane": "lane-t", "claimed_by": "", "state_dwell": [],
+    "v_over_i": None, "observed_model": "unknown"})
+attempts, segments = {}, {}
+for i in range(1, 11):
+    aid = "a%d" % i
+    attempts[aid] = {
+        "attempt_id": aid,
+        "status": "open" if i >= 9 else "terminal",
+        "opened_at": "2026-09-20T00:%02d:00+00:00" % i,
+        "pane_id": "w:p1", "tab_id": "", "t_level": "T1"}
+    if i < 9:
+        attempts[aid]["closed_at"] = "2026-09-20T01:%02d:00+00:00" % i
+        attempts[aid]["terminal_kind"] = "completed"
+    segments[aid] = [{
+        "seg": "s1",
+        "identity": {"role": "worker", "profile": "codex", "effort": "",
+                     "harness": "fixture", "pool": ""},
+        "origin_id": 9000000990000 + i,
+        "opened_at": "2026-09-20T00:%02d:00+00:00" % i}]
+put("attempts.json", attempts)
+put("segments.json", segments)
+put("intent.json", {
+    "kind": "telemetry_intent", "schema_version": 1, "job_id": "t445-order",
+    "attempt_id": "a10", "status": "open", "label": "fixture",
+    "model": "codex", "effort": "", "role": "worker", "t_level": "T1",
+    "opened_at": "2026-09-20T00:10:00+00:00", "pane_id": "w:p1", "tab_id": ""})
+PY
+wrk_hk 'done' t445-order --report "$(mk_report t445-order)" >/dev/null
+python3 - "$JOBS/t445-order" <<'PY'
+import glob, json, os, sys
+job_dir = sys.argv[1]
+receipts_dir = os.path.join(job_dir, "telemetry", "receipts")
+assert os.path.isfile(
+    os.path.join(receipts_dir, "terminal-a10-s1-completed.json")), \
+    "the latest attempt a10 must receive the terminal receipt: %r" \
+    % os.listdir(receipts_dir)
+attempts = json.load(open(os.path.join(job_dir, "telemetry", "attempts.json")))
+assert attempts["a10"]["status"] == "terminal", attempts["a10"]
+assert attempts["a9"]["status"] == "open", \
+    "lexical ordering closed a9 instead of a10: %r" % attempts["a9"]
+events = sorted(glob.glob(os.path.join(job_dir, "events", "*job.completed.json")))
+event = json.load(open(events[-1], encoding="utf-8"))
+assert event.get("attempt_id") == "a10", \
+    "the flat terminal event must carry attempt a10: %r" % event
+PY
+echo "PASS telemetry-attempt-numeric-ordering"
+# >>> end attempt-ordering
+
+# >>> t445-red:unattributed-identities
+# T23 — a terminal event is attributable only through its own explicit
+# attempt_id: missing, malformed, unrecorded, and segment-less identities
+# are all counted unattributed and never touch the open attempt.
+spawn_bound codex t445-unattr 445 >/dev/null
+mk_events t445-unattr
+python3 - "$JOBS/t445-unattr" <<'PY'
+import json, os, sys
+job_dir = sys.argv[1]
+telemetry = os.path.join(job_dir, "telemetry")
+attempts_path = os.path.join(telemetry, "attempts.json")
+attempts = json.load(open(attempts_path, encoding="utf-8"))
+# a2 is recorded but closed and holds no participant segment: an event naming
+# it still cannot be attributed (no segment), and a1 stays the open attempt
+# the old code would have blamed everything on.
+attempts["a2"] = {"attempt_id": "a2", "status": "abandoned",
+                  "opened_at": "2026-09-20T00:00:00+00:00",
+                  "closed_at": "2026-09-20T00:30:00+00:00",
+                  "pane_id": "w:p9", "tab_id": "", "t_level": "T1"}
+with open(attempts_path, "w", encoding="utf-8") as handle:
+    json.dump(attempts, handle)
+events = os.path.join(job_dir, "events")
+records = [
+    (3, "job.lost", {}),                      # missing identity (legacy event)
+    (4, "job.revoked", {"attempt_id": "a99"}),   # recorded nowhere
+    (5, "job.cancelled", {"attempt_id": "bogus"}),  # malformed
+    (6, "job.failed", {"attempt_id": "a2"}),     # no participant segment
+]
+for seq, kind, extra in records:
+    record = {"kind": kind, "job_id": "t445-unattr", "owner_lane": "lane-t",
+              "label": "fixture", "pane_id": "w:p1", "host": "fixture",
+              "report_path": "", "report_last_line": "", "reason": "fixture",
+              "epoch": 1}
+    record.update(extra)
+    with open(os.path.join(events, "%05d-%s.json" % (seq, kind)), "w",
+              encoding="utf-8") as handle:
+        json.dump(record, handle)
+PY
+reconcile_out="$(wrk_hk reconcile --job t445-unattr)"
+grep -q 'receipts_created=0' <<<"$reconcile_out" ||
+  fail "unattributable events minted receipts: $reconcile_out"
+grep -q 'unattributed=4' <<<"$reconcile_out" ||
+  fail "unattributable events were not counted honestly: $reconcile_out"
+python3 - "$JOBS/t445-unattr/telemetry" <<'PY'
+import json, os, sys
+telemetry = sys.argv[1]
+names = [n for n in os.listdir(os.path.join(telemetry, "receipts"))
+         if n.startswith("terminal-")]
+assert not names, names
+attempts = json.load(open(os.path.join(telemetry, "attempts.json")))
+assert attempts["a1"]["status"] == "open", attempts
+assert attempts["a2"]["status"] == "abandoned", attempts
+PY
+echo "PASS telemetry-unattributed-event-identities"
+# >>> end unattributed-identities
+
+# >>> t445-red:sentinel-attempt
+# T24 — a sentinel-produced terminal event carries the attempt the sentinel
+# was spawned to watch, and reconcile attributes it end-to-end.
+spawn_bound codex t445-sentin 445 >/dev/null
+mk_events t445-sentin
+sent_report="$TMP/t445-sentin-report.md"
+printf 'sentinel observed done\n' >"$sent_report"
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER_BIN" \
+  WRK_FIXTURE_SCENARIO=sentinel-done \
+  WRK_COMPLETION_INTERVAL_S=1 WRK_COMPLETION_TIMEOUT_S=3600 \
+  WRK_SENTINEL_LOST_GRACE=3600 ARBITER_INBOX_ROOT="$JOBS" \
+  "$WRK" sentinel t445-sentin lane-t fixture w:p1 "$sent_report" "" a1 \
+  >/dev/null 2>&1 &
+sentinel_pid=$!
+for _ in $(seq 1 100); do
+  compgen -G "$JOBS/t445-sentin/events/*-job.completed.json" >/dev/null && break
+  sleep 0.1
+done
+kill "$sentinel_pid" 2>/dev/null || true
+wait "$sentinel_pid" 2>/dev/null || true
+python3 - "$JOBS/t445-sentin" <<'PY'
+import glob, json, os, sys
+job_dir = sys.argv[1]
+events = sorted(glob.glob(os.path.join(job_dir, "events", "*job.completed.json")))
+assert events, "sentinel produced no job.completed event"
+event = json.load(open(events[-1], encoding="utf-8"))
+assert event.get("attempt_id") == "a1", \
+    "a sentinel terminal event must carry the watched attempt: %r" % event
+PY
+wrk_hk reconcile --job t445-sentin >/dev/null
+[[ -f "$JOBS/t445-sentin/telemetry/receipts/terminal-a1-s1-completed.json" ]] ||
+  fail "reconcile did not attribute the sentinel event to a1"
+echo "PASS telemetry-sentinel-event-attempt-identity"
+# >>> end sentinel-attempt
+
+# >>> t445-red:origin-guard
+# T25 — the pre-send (scheme, host, port) origin comparison is pinned
+# semantically. The embedded hk_request/telemetry_drain bodies are extracted
+# and executed with urllib.request.Request forged so the constructed
+# request's send target resolves to a different origin — the exact failure
+# the guard exists for. The real code must refuse before the bearer leaves;
+# a mutant with the comparison deleted must be observed sending it, which is
+# the observable difference that turns these assertions RED.
+
+# Extract the first embedded <<'PY' body of function $2 in wrk copy $1 -> $3.
+extract_wrk_py() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+start = src.index("\n%s() {" % sys.argv[2])
+block = re.search(r"<<'PY'\n(.*?)\nPY\n", src[start:], re.S)
+assert block, "no embedded python in %s" % sys.argv[2]
+with open(sys.argv[3], "w", encoding="utf-8") as handle:
+    handle.write(block.group(1) + "\n")
+PY
+}
+
+hop3_count() {
+  local n
+  n="$(grep -c "$1" "$HOP3_LOG" 2>/dev/null || true)"
+  echo "${n:-0}"
+}
+
+# Run an extracted hk_request body ($1) as "METHOD PATH" with the request
+# retargeted to $4 — a different origin than the configured handoffkeep URL.
+run_guard_probe() {
+  GUARD_MUTANT_URL="$4" \
+  WRK_HANDOFFKEEP_URL="$HK_URL" WRK_HANDOFFKEEP_TOKEN="$HK_TOKEN" \
+  python3 - "$1" "$2" "$3" <<'PY'
+import os, sys, urllib.request
+snippet, method, path = sys.argv[1:4]
+mutant_url = os.environ["GUARD_MUTANT_URL"]
+_real_request = urllib.request.Request
+
+
+def forged_request(*args, **kwargs):
+    request = _real_request(*args, **kwargs)
+    request.full_url = mutant_url
+    return request
+
+
+urllib.request.Request = forged_request
+sys.argv = ["guard-probe", method, path, ""]
+exec(compile(open(snippet, encoding="utf-8").read(), snippet, "exec"))
+PY
+}
+
+# Same forgery for an extracted telemetry_drain body ($1) over jobs_root $2.
+run_drain_probe() {
+  GUARD_MUTANT_URL="$3" \
+  WRK_HANDOFFKEEP_URL="$HK_URL" WRK_HANDOFFKEEP_TOKEN="$HK_TOKEN" \
+  python3 - "$1" "$2" <<'PY'
+import os, sys, urllib.request
+snippet, jobs_root = sys.argv[1:3]
+mutant_url = os.environ["GUARD_MUTANT_URL"]
+_real_request = urllib.request.Request
+
+
+def forged_request(*args, **kwargs):
+    request = _real_request(*args, **kwargs)
+    request.full_url = mutant_url
+    return request
+
+
+urllib.request.Request = forged_request
+sys.argv = ["drain-probe", jobs_root, "8"]
+exec(compile(open(snippet, encoding="utf-8").read(), snippet, "exec"))
+PY
+}
+
+extract_wrk_py "$WRK" hk_request "$TMP/guard-hk_request.py"
+hop3_gets_before="$(hop3_count 'GET /v1/tasks/445')"
+set +e
+guard_out="$(run_guard_probe "$TMP/guard-hk_request.py" GET /v1/tasks/445 \
+  "http://127.0.0.1:$HOP3_PORT/v1/tasks/445" 2>&1)"
+guard_rc=$?
+set -e
+[[ "$guard_rc" -eq 2 ]] ||
+  fail "origin guard did not fail closed on a retargeted request (rc=$guard_rc): $guard_out"
+grep -q 'refusing to send credentials to a non-configured origin' <<<"$guard_out" ||
+  fail "origin refusal message missing: $guard_out"
+[[ "$(hop3_count 'GET /v1/tasks/445')" -eq "$hop3_gets_before" ]] ||
+  fail "a retargeted bind request reached a non-configured origin"
+
+# Mutant: deleting the comparison must flip the assertions above — the
+# forged target receives the bearer, which hop3 records as auth=present.
+cp "$WRK" "$TMP/wrk-noguard"
+python3 - "$TMP/wrk-noguard" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+needle = "if actual != origin:"
+assert src.count(needle) == 2, \
+    "expected both origin comparisons, got %d" % src.count(needle)
+open(sys.argv[1], "w", encoding="utf-8").write(
+    src.replace(needle, "if False:"))
+PY
+extract_wrk_py "$TMP/wrk-noguard" hk_request "$TMP/guard-hk_request-mutant.py"
+run_guard_probe "$TMP/guard-hk_request-mutant.py" GET /v1/tasks/445 \
+  "http://127.0.0.1:$HOP3_PORT/v1/tasks/445" >/dev/null 2>&1 || true
+grep -q 'GET /v1/tasks/445 auth=present' "$HOP3_LOG" ||
+  fail "guard-deleted mutant never sent the bearer — the refusal assertion is not sensitive"
+
+# The same pin on the reps export path: a retargeted PUT must leave the
+# receipt pending_export with last_error=origin_changed and hop3 untouched.
+GUARD_JOBS="$TMP/guard-jobs"
+mkdir -p "$GUARD_JOBS/g1/telemetry/receipts"
+python3 - "$GUARD_JOBS/g1/telemetry/receipts/terminal-a1-s1-completed.json" <<'PY'
+import json, sys
+receipt = {
+    "kind": "telemetry_receipt", "schema_version": 1, "phase": "terminal",
+    "task_id": 445, "task_ref": "hk:task/445", "job_id": "g1",
+    "attempt_id": "a1", "participant_segment": "s1",
+    "role": "worker", "t_level": "T1",
+    "launch": {"role": "worker", "profile": "codex", "effort": "",
+               "harness": "fixture", "pool": ""},
+    "observed": {"model": "unknown"},
+    "recorded_at": "2026-09-20T00:00:00+00:00",
+    "ended_at": "2026-09-20T01:00:00+00:00",
+    "terminal": {"status": "completed", "participant_semantics": "work_done",
+                 "reason": "fixture", "rounds": None},
+    "projection": {"state": "pending_export", "origin_id": 9000000999001,
+                   "attempts": 0, "exported_at": None, "last_error": None},
+}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(receipt, handle)
+PY
+extract_wrk_py "$WRK" telemetry_drain "$TMP/guard-drain.py"
+hop3_puts_before="$(hop3_count 'PUT /v1/bench/reps')"
+run_drain_probe "$TMP/guard-drain.py" "$GUARD_JOBS" \
+  "http://127.0.0.1:$HOP3_PORT/v1/bench/reps" >/dev/null
+python3 - "$GUARD_JOBS/g1/telemetry/receipts/terminal-a1-s1-completed.json" <<'PY'
+import json, sys
+projection = json.load(open(sys.argv[1], encoding="utf-8"))["projection"]
+assert projection["state"] == "pending_export", projection
+assert projection["last_error"] == "origin_changed", projection
+PY
+[[ "$(hop3_count 'PUT /v1/bench/reps')" -eq "$hop3_puts_before" ]] ||
+  fail "a retargeted reps PUT reached a non-configured origin"
+extract_wrk_py "$TMP/wrk-noguard" telemetry_drain "$TMP/guard-drain-mutant.py"
+run_drain_probe "$TMP/guard-drain-mutant.py" "$GUARD_JOBS" \
+  "http://127.0.0.1:$HOP3_PORT/v1/bench/reps" >/dev/null
+grep -q 'PUT /v1/bench/reps auth=present' "$HOP3_LOG" ||
+  fail "guard-deleted drain mutant never sent the bearer — not sensitive"
+echo "PASS telemetry-origin-guard-pinned"
+# >>> end origin-guard
 
 echo "PASS all telemetry tests"
