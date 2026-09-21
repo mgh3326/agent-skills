@@ -145,8 +145,15 @@ Options:
   --job-dup-ok       explicit operator override: permit an active duplicate job
                      after an auditable warning. Automation/panewire must not use it.
   --landing-strict   automation opt-in: preserve the OK line, then exit 76 if
-                     no marker/Pasted-text landing evidence appears. Without it,
-                     landed=no remains a successful spawn with a warning.
+                     no landing evidence appears (panewire prompt proof, else a
+                     read-only marker/Pasted-text/devin-status observation).
+                     Without it, landed=no remains a successful spawn with a
+                     warning.
+
+The brief is delivered with `panewire prompt` (no uptake; first line
+`expect: name=LABEL cwd=CWD`). Only when panewire cannot reach its daemon
+(rc 4) or is not installed does wrk inject once directly through herdr; the OK
+line then ends with via=herdr-fallback.
   --operator-request REF
                      escalation-profile operator request reference passed
                      verbatim to `scopefuel gate` (the gate accepts only
@@ -372,6 +379,237 @@ landing_check() {
     fi
   done
   return 1
+}
+
+# #498: the spawn brief reaches the pane only through `panewire prompt`; the
+# landing verdict is panewire's first. landing_check above stays as a
+# read-only corroboration for what panewire cannot prove (its submission
+# classifier only knows claude and codex, and its CLI returns an rc, not the
+# delivery record). Corroboration never injects. The one exception to "only
+# panewire" is rc 4: the CLI could not reach its daemon socket, so nothing was
+# sent and a single direct herdr injection cannot duplicate the brief
+# (hk decision/2026-09-21/task498-esc-landing-unify).
+PANEWIRE_EXIT_TIMEOUT=3
+PANEWIRE_EXIT_DAEMON_UNAVAILABLE=4
+PANEWIRE_EXIT_CONDITION_INVALID=5
+PANEWIRE_EXIT_DELIVERY_FAILURE=6
+
+# spawn_expect_cwd CWD PANE
+#
+# panewire compares expect cwd with herdr's cwd string for the pane, byte for
+# byte. The pane may report the logical path it was created with or its
+# physical one (/tmp vs /private/tmp, a symlinked worktree), so the expect line
+# uses herdr's own spelling when it names the same physical directory, and the
+# physical path otherwise — a pane that is really somewhere else then fails
+# panewire's preflight instead of receiving the brief.
+spawn_expect_cwd() {
+  local cwd="$1" pane="$2" physical reported reported_physical
+  physical="$(cd -- "$cwd" 2>/dev/null && pwd -P)" || physical=""
+  reported="$("$HERDR" agent list 2>/dev/null |
+    python3 -c 'import json,sys; p=sys.argv[1]; a=json.load(sys.stdin)["result"]["agents"]; v=next((x.get("cwd") for x in a if x.get("pane_id")==p),""); print(v if isinstance(v,str) else "")' "$pane" \
+    2>/dev/null)" || reported=""
+  if [[ -n "$reported" && -n "$physical" ]]; then
+    reported_physical="$(cd -- "$reported" 2>/dev/null && pwd -P)" || reported_physical=""
+    if [[ "$reported_physical" == "$physical" ]]; then
+      printf '%s' "$reported"
+      return 0
+    fi
+  fi
+  printf '%s' "$physical"
+}
+
+# spawn_prompt_file ATTEMPT
+#
+# panewire keys a delivery on sender, target, file path, body hash and uptake,
+# and answers a repeated key from its cache without sending again. Every
+# attempt therefore gets a fresh absolute path: the one re-injection below must
+# be a new delivery, and a re-spawn of the same job must not be served the old
+# delivery's cached verdict.
+spawn_prompt_file() {
+  local attempt="$1" dir file
+  dir="$(wrk_jobs_root)/$JOB_ID"
+  if ! mkdir -p "$dir" 2>/dev/null || ! dir="$(cd -- "$dir" && pwd -P)" ||
+    ! file="$(mktemp "$dir/spawn-brief-$attempt.XXXXXX" 2>/dev/null)"; then
+    file="$(mktemp "${TMPDIR:-/tmp}/wrk-spawn-brief-$attempt.XXXXXX")" || return 1
+  fi
+  {
+    if [[ -n "$SPAWN_EXPECT_CWD" ]]; then
+      printf 'expect: name=%s cwd=%s\n\n' "$LABEL" "$SPAWN_EXPECT_CWD"
+    else
+      printf 'expect: name=%s\n\n' "$LABEL"
+    fi
+    cat -- "$PROMPT"
+  } >"$file" || return 1
+  printf '%s' "$file"
+}
+
+# spawn_panewire_prompt ATTEMPT
+#
+# One `panewire prompt` delivery. No --uptake: both uptake modes refuse a
+# target that is already `working`, and a cold-booting pane can report working
+# before its composer is ready. Sets SPAWN_SUBMIT to one of
+#   proven       rc 0 — panewire observed the submission
+#   accepted     rc 6 after herdr took the prompt (submission unproven or still
+#                in the composer): sent; only corroboration may say more
+#   unconfirmed  rc 3, 6 (herdr rejected), 124 guard, anything unknown: it may
+#                or may not have been sent, so it is never sent again
+#   unsent       rc 2 or 5: panewire refused before the send boundary
+#   daemon       rc 4 or no panewire binary: nothing was sent
+spawn_panewire_prompt() {
+  local attempt="$1" panewire file err rc=0 seconds
+  SPAWN_SUBMIT=daemon
+  SPAWN_PANEWIRE_RC=""
+  SPAWN_PANEWIRE_ERR=""
+  panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
+  if [[ -z "$panewire" ]]; then
+    SPAWN_PANEWIRE_RC=missing
+    SPAWN_PANEWIRE_ERR="panewire-not-found"
+    return 0
+  fi
+  if ! file="$(spawn_prompt_file "$attempt")"; then
+    SPAWN_SUBMIT=unsent
+    SPAWN_PANEWIRE_RC="file"
+    SPAWN_PANEWIRE_ERR="prompt-file-unwritable"
+    return 0
+  fi
+  SPAWN_PROMPT_FILES+=("$file")
+  seconds="$LANDING_CHECK_WINDOW_SECONDS"
+  # The daemon enforces --timeout itself; the outer guard only covers a wedged
+  # socket, which would otherwise hang the spawn with the gates already held.
+  local guard=(timeout $((seconds + 15)))
+  if ! command -v timeout >/dev/null 2>&1; then
+    if command -v gtimeout >/dev/null 2>&1; then
+      guard=(gtimeout $((seconds + 15)))
+    else
+      guard=(python3 -c 'import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)' $((seconds + 15)))
+    fi
+  fi
+  err="$("${guard[@]}" "$panewire" prompt --from "wrk-spawn:$JOB_ID" --to "$LABEL" \
+    --file "$file" --timeout "${seconds}s" 2>&1 >/dev/null)" || rc=$?
+  SPAWN_PANEWIRE_RC="$rc"
+  SPAWN_PANEWIRE_ERR="$(printf '%s' "$err" | tr -s '[:space:]' ' ' | cut -c1-160)"
+  case "$rc" in
+    0) SPAWN_SUBMIT=proven ;;
+    "$PANEWIRE_EXIT_DAEMON_UNAVAILABLE") SPAWN_SUBMIT=daemon ;;
+    2|"$PANEWIRE_EXIT_CONDITION_INVALID") SPAWN_SUBMIT=unsent ;;
+    # A timeout may fall on either side of the send boundary.
+    "$PANEWIRE_EXIT_TIMEOUT") SPAWN_SUBMIT=unconfirmed ;;
+    "$PANEWIRE_EXIT_DELIVERY_FAILURE")
+      # These two messages are only produced after herdr accepted agent.prompt
+      # (prompt.go: pollSubmission result), so the brief did leave wrk.
+      if grep -Eq 'submission evidence unproven|prompt remains in composer' <<<"$err"; then
+        SPAWN_SUBMIT=accepted
+      else
+        SPAWN_SUBMIT=unconfirmed
+      fi
+      ;;
+    *) SPAWN_SUBMIT=unconfirmed ;;
+  esac
+  return 0
+}
+
+# opencode needs a separate return after the paste to submit (pre-#498
+# behavior, kept verbatim). Only after a delivery that may have been pasted.
+spawn_opencode_submit() {
+  [[ "$PROFILE_KIND" == opencode ]] || return 0
+  case "$SPAWN_SUBMIT" in proven|accepted|unconfirmed) ;; *) return 0 ;; esac
+  sleep_for 2
+  "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
+}
+
+# spawn_herdr_fallback — the rc 4 path, entered at most once per spawn. It is
+# the pre-#498 direct injection, without its re-injection: a second direct
+# send would be a second fallback.
+spawn_herdr_fallback() {
+  SPAWN_VIA=herdr-fallback
+  SPAWN_FALLBACKS=$((SPAWN_FALLBACKS + 1))
+  if [[ "$PROFILE_KIND" == opencode ]]; then
+    "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1 || true
+    sleep_for 2
+    "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
+  elif ! "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
+    --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
+    "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
+  fi
+}
+
+# spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not
+# landed, LANDING_NO_DETAIL.
+spawn_deliver_brief() {
+  local detail retry_skip_reason
+  SPAWN_VIA=panewire
+  SPAWN_FALLBACKS=0
+  SPAWN_PROMPT_FILES=()
+  LANDING=no
+  PROMPT_PAYLOAD="$(<"$PROMPT")"
+  PROMPT_MARKER="$(prompt_marker "$PROMPT")"
+  SPAWN_EXPECT_CWD="$(spawn_expect_cwd "$CWD" "$PANE")"
+
+  spawn_panewire_prompt 1
+  spawn_opencode_submit
+  local first="panewire_rc=$SPAWN_PANEWIRE_RC submit=$SPAWN_SUBMIT"
+  [[ -z "$SPAWN_PANEWIRE_ERR" ]] || first="$first panewire_err=\"$SPAWN_PANEWIRE_ERR\""
+  case "$SPAWN_SUBMIT" in
+    proven)
+      LANDING=yes
+      return 0
+      ;;
+    unsent)
+      LANDING_NO_DETAIL="phase=initial $first action=landed-no retry=skipped reason=panewire-refused-before-send"
+      return 0
+      ;;
+    daemon)
+      spawn_herdr_fallback
+      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+        LANDING=yes
+      else
+        detail="$(landing_check_detail)"
+        LANDING_NO_DETAIL="phase=initial $first via=herdr-fallback $detail action=landed-no retry=skipped reason=fallback-once"
+      fi
+      return 0
+      ;;
+  esac
+
+  # accepted | unconfirmed: panewire could not prove it. Observe only.
+  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+    LANDING=yes
+    return 0
+  fi
+  detail="$(landing_check_detail)"
+  if [[ "$SPAWN_SUBMIT" == accepted && "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
+    # herdr took the first delivery and the whole window found no marker and
+    # no queued chip: confirmed non-landing. Exactly one re-injection, again
+    # through panewire, as a new delivery.
+    warn "landing window expired; pane=$PANE phase=initial $first $detail action=reinject-once"
+    spawn_panewire_prompt 2
+    spawn_opencode_submit
+    local second="panewire_rc=$SPAWN_PANEWIRE_RC submit=$SPAWN_SUBMIT"
+    [[ -z "$SPAWN_PANEWIRE_ERR" ]] || second="$second panewire_err=\"$SPAWN_PANEWIRE_ERR\""
+    case "$SPAWN_SUBMIT" in
+      proven) LANDING=retry; return 0 ;;
+      accepted|unconfirmed)
+        if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+          LANDING=retry
+          return 0
+        fi
+        detail="$(landing_check_detail)"
+        ;;
+    esac
+    LANDING_NO_DETAIL="phase=retry $second $detail action=landed-no"
+    return 0
+  fi
+  if [[ "$SPAWN_SUBMIT" != accepted ]]; then
+    retry_skip_reason='prompt-submission-unconfirmed'
+  elif [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 ]]; then
+    retry_skip_reason='ambiguous-observation'
+  else
+    retry_skip_reason='non-landing-not-confirmed'
+  fi
+  LANDING_NO_DETAIL="phase=initial $first $detail action=landed-no retry=skipped reason=$retry_skip_reason"
 }
 
 # Kimi opens a folder-trust modal for an unregistered CWD. Seed only the
@@ -2693,7 +2931,6 @@ hosts_cmd() {
 
 
 spawn_cmd() {
-  local landing_detail="" retry_skip_reason=""
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
   OPERATOR_REQUEST="" REQUESTED_BY=""
@@ -2864,67 +3101,9 @@ print(value if isinstance(value, str) else "")
     "$HERDR" agent prompt "$PANE" "/effort $EFFECTIVE_EFFORT" >/dev/null 2>&1
     sleep_for 2
   fi
-  PROMPT_PAYLOAD="$(<"$PROMPT")"
-  PROMPT_MARKER="$(prompt_marker "$PROMPT")"
-  PROMPT_SUBMITTED=0
-  LANDING="no"
-  if [[ "$PROFILE_KIND" == opencode ]]; then
-    "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
-    PROMPT_SUBMITTED=1
-    sleep_for 2
-    "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
-  else
-    if ! "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
-      --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
-      # The payload was already submitted. A return may settle a still-open
-      # composer, but the payload must never be sent again after an ambiguous
-      # wait result. A later screen/status observation is different: only a
-      # successful prompt command followed by confirmed non-landing may use
-      # the one retry below. This preserves ROB-1186's at-most-once rule while
-      # making the safety boundary at-most-once landing.
-      "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
-    else
-      PROMPT_SUBMITTED=1
-    fi
-  fi
-  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
-    LANDING=yes
-  else
-    landing_detail="$(landing_check_detail)"
-    if [[ "$PROMPT_SUBMITTED" -eq 1 && "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
-      # The first submission completed, and the entire evidence window found
-      # no marker or queued-chip. This is confirmed non-landing, so exactly
-      # one re-injection is allowed; no status value can add another retry.
-      warn "landing window expired; pane=$PANE phase=initial $landing_detail action=reinject-once"
-      if [[ "$PROFILE_KIND" == opencode ]]; then
-        "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
-        sleep_for 2
-        "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1
-      elif "$HERDR" agent prompt "$PANE" "$PROMPT_PAYLOAD" --wait \
-        --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
-        :
-      else
-        # The retry itself is also at most once; do not turn its ambiguous wait
-        # result into another payload submission.
-        "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
-      fi
-      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
-        LANDING=retry
-      else
-        landing_detail="$(landing_check_detail)"
-        LANDING_NO_DETAIL="phase=retry $landing_detail action=landed-no"
-      fi
-    else
-      if [[ "$PROMPT_SUBMITTED" -ne 1 ]]; then
-        retry_skip_reason='prompt-submission-unconfirmed'
-      elif [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 ]]; then
-        retry_skip_reason='ambiguous-observation'
-      else
-        retry_skip_reason='non-landing-not-confirmed'
-      fi
-      LANDING_NO_DETAIL="phase=initial $landing_detail action=landed-no retry=skipped reason=$retry_skip_reason"
-    fi
-  fi
+  # #498: injection happens only here — after every gate above, tab create and
+  # agent start. Nothing about it may move ahead of quota_gate/arbiter_admit.
+  spawn_deliver_brief
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # An older herdr may not report the tab in `tab create`; the agent knows it.
@@ -2942,10 +3121,13 @@ print(value if isinstance(value, str) else "")
   refresh_quota_pool
   ARBITER_HELD=0
   if [[ -n "$ARBITER_RESOURCE" ]]; then
-    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
+    OK_LINE="OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
   else
-    echo "OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING"
+    OK_LINE="OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING"
   fi
+  # Appended, never inserted: OK-line parsers read key=value pairs.
+  [[ "$SPAWN_VIA" != herdr-fallback ]] || OK_LINE="$OK_LINE via=herdr-fallback"
+  echo "$OK_LINE"
   if [[ "$LANDING" == no ]]; then
     if [[ "$LANDING_STRICT" -eq 1 ]]; then
       warn "spawn succeeded but brief landed=no; pane=$PANE remains valid; $LANDING_NO_DETAIL strict_exit=$WRK_EXIT_LANDING_UNCONFIRMED"
