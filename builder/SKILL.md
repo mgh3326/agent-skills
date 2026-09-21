@@ -100,6 +100,42 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
 도구가 실제로 지원하는 계약을 확인한 경우에만 별도로 다룬다; 지원하지 않는 인자를
 발명하지 않는다.
 
+## 후속 라운드·보충 지시의 주입
+
+이미 떠 있는 워커·tester pane 에 **후속 라운드·보충 지시**를 보낼 때의 주입 경로는
+이 절이 정본이다(초기 브리프 주입은 `spawn-worker` §4·relay-handoff §3 절차,
+완료 통지의 pane kind 분기는 relay-handoff §3-1).
+
+- 후속 라운드·보충 지시의 주입은 **`panewire prompt --uptake status-transition`**
+  으로 한다. `herdr pane send-text` 와 `send-keys` 는 **본문 주입 수단으로는 복구
+  목적 외에 금지**한다 — 두 명령은 컴포저에 글자만 넣을 뿐 제출도 제출 확인도
+  하지 않아, 미제출 브리프가 컴포저에서 이어 붙는다(2026-09-21 실사고: send-text
+  후속 주입 2건이 미제출로 병합). 큐에 적재된 payload 를 넘기는 제출 키
+  (`send-keys <pane> return`)는 주입이 아니라 제출 동작이라 이 금지와 무관하다.
+- 명령 형태: `panewire prompt --from <내 레인> --to <에이전트 이름> --file <파일>
+  --uptake status-transition --timeout 60s`. `--from`·`--to`·`--file` 은 필수이고
+  `--to` 는 에이전트 이름이다. `--timeout` 기본값 2s 는 status-transition 대기에
+  부족하다 — uptake 미관측 타임아웃은 rc=3 으로 나온다.
+- 프롬프트 파일의 첫 비어 있지 않은 줄은 `expect:` 지정이어야 하고 `name=` 또는
+  `cwd=` 가 필수다(수신자 고정). `--uptake` 는 이미 `working` 인 대상을 거부한다
+  (rc=6) — working 중인 pane 에는 전이가 끝난 뒤에 보낸다. 단 이 가드는 herdr
+  상태 문자열에 의존한다 — devin 처럼 긴 턴 중 `done` 오표시가 실측된 하네스에서는
+  새어 나갈 수 있으므로(relay-handoff §3-2) 아래 화면 확인 규칙이 받친다.
+- **rc≠0 이면 재전송 전에 화면을 확인한다.** 같은 발신자·대상·파일·본문·uptake
+  모드의 재전송은 correlation id dedup 에 걸리지만, `--uptake` 를 바꾸거나 빼면
+  새 주입이 되고, `unproven` 인 채 실제로 착지한 경우도 있어(2026-09-21 실측)
+  화면 확인 없는 재작성·재전송은 이중 지시가 된다.
+- **하네스 차이 — 제출 증명은 claude·codex 에서만 나온다**
+  (`harnessHasSubmissionEvidence`). 미제출이면 rc≠0 + `composer_residue`,
+  제출·작업 시작이면 `confirmed` 다. devin·grok·kimi 등 그 외 하네스는 착지해도
+  `unproven` 만 나오므로(rc≠0) **visible pane 의 queued 배너로 판정**한다.
+  배너가 있으면 `send-keys <pane> return`(Enter)으로 명시 제출하되, **툴 실행
+  중에는 Enter 를 보내지 않는다** — Enter 가 실행 중 툴 호출을 취소한다. grok 의
+  queued 배너는 `command still running` 을 동반하므로 배너에 실행 중 표시가 있으면
+  그 표시가 사라진 뒤에만 제출한다. 🔴 grok 의 queued 푸터는 공유 화면에서
+  페이로드 귀속이 불가하므로 착지 주장은 배너가 아니라 소비 마커로 한다 — 배너·
+  소비 마커 원문의 정본은 relay-handoff §3-2 하네스별 제출 마커 표다.
+
 ## 큐와 상위 레인 보고
 
 다음 작업 선택과 상태 전이는 우선 다음 인터페이스를 사용한다.
