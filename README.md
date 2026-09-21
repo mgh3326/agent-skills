@@ -137,14 +137,20 @@ R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
 `wrk spawn`은 job이 arbiter에 등록되면 완료 센티널을 분리 기동한다. 센티널은
 `herdr agent get <pane>` 관측을 **3분류**하고, 판정 1건마다 잡 디렉토리의
 `completion-sentinel.log`에 한 줄씩 남긴다
-(`<ts> status=<상태|empty|err:code> transient=<n> action=<none|completed|lost:reason>`).
+(`<ts> status=<상태|empty|err:code> transient=<n> action=<none|pending|completed|lost:reason>`).
 
 | 관측 | 분류 | 판정 |
 |---|---|---|
 | `agent_not_found` 등 pane/terminal 부재 에러 코드 | 확정 소멸 | 즉시 `job.lost` (`reason=agent_not_found`) |
 | 빈 출력 · 비정상 종료 · JSON 파싱 실패 · 소켓 에러 | 일시 장애 | `WRK_COMPLETION_INTERVAL_S`(기본 30s) 간격 재시도. **연속** `WRK_SENTINEL_TRANSIENT_MAX`(기본 10회 ≈5분) 초과 시에만 `job.lost` (`reason=herdr_unreachable`) |
-| 정상 상태(`working`/`idle`/`done`) | 관측 성공 | 일시 장애 카운터 리셋. `idle`·`done` + 새 report면 `job.completed` |
+| 정상 상태(`working`/`idle`/`done`) | 관측 성공 | 일시 장애 카운터 리셋. `idle`·`done` + 새 report면 `job.completed` — 단 report의 관측 키가 한 interval 동안 그대로일 때만(첫 관측은 `action=pending`). 부분 작성 중인 파일로 먼저 나가지 않기 위함이다 |
 | `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과 | 감시 창 만료 | `job.lost` (`reason=timeout`) |
+
+`job.completed` 레코드는 report 본문의 sha256(`report_sha256` 필드)으로 라운드를
+식별한다. 같은 내용의 report에 대한 완료 기록이 이미 있으면 `wrk done`·센티널 어느
+쪽이든 두 번째 레코드와 통지를 억제하고 `completion-suppressed.log`에 한 줄 남긴다
+— 억제는 건수가 아니라 "이 report artifact의 완료가 이미 기록됐는가"의 멤버십 판정이다.
+내용이 바뀐 report는 새 라운드로 별개 레코드가 된다.
 
 **빈 값은 소멸의 증거가 아니다.** 2026-09-04 소켓 일시 정지와 비기본 herdr 세션
 때문에 그날 스폰한 거의 모든 잡이 스폰 30초 뒤 `job.lost`로 찍혔고, 센티널이 죽어

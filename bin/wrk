@@ -1200,28 +1200,83 @@ completion_event() {
     last=""
   fi
   python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" <<'PY'
-import json, os, sys, tempfile, time
+import fcntl, hashlib, json, os, sys, tempfile, time
 events, job, owner, label, pane, host, report, last, kind, reason = sys.argv[1:]
-highest = 0
-for name in os.listdir(events):
-    try: highest = max(highest, int(name.split('-', 1)[0]))
-    except (ValueError, IndexError): pass
-record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
-          "pane_id": pane, "host": host, "report_path": report,
-          "report_last_line": last, "epoch": 1}
-# job.lost always states why. Downstream recovery treats agent_not_found as a
-# vanished pane and herdr_unreachable/timeout as an observation gap.
-if reason: record["reason"] = reason
-fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
-try:
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(record, f, separators=(',', ':'))
-        f.write('\n')
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
-finally:
-    if os.path.exists(temporary): os.unlink(temporary)
+
+
+def digest_of(path):
+    try:
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except OSError:
+        return None
+
+
+# A completed round is identified by the report artifact's content, not by an
+# invocation count or epoch (a constant today). `wrk done` and the completion
+# sentinel are separate processes racing on this directory, so the membership
+# check and the record write run inside one lock; the lockfile lives next to
+# events/ because the directory is also a consumer-facing record stream.
+digest = digest_of(report) if kind == "job.completed" else None
+lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
+with open(lock_path, "w", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    if digest is not None:
+        for name in sorted(os.listdir(events)):
+            if not name.endswith("-job.completed.json"):
+                continue
+            try:
+                with open(os.path.join(events, name), encoding="utf-8") as f:
+                    prior = json.load(f)
+            except (OSError, ValueError):
+                continue
+            if prior.get("kind") != "job.completed":
+                continue
+            prior_digest = prior.get("report_sha256")
+            # A legacy record carries no content identity, and no filesystem
+            # proxy can reconstruct it — a rewritten file can keep an old
+            # mtime (touch, cp -p, rsync -a). Absent proof of identity a record
+            # can never be a suppression basis: fail toward writing, never
+            # toward eating a new round.
+            if prior_digest is None:
+                continue
+            if prior_digest == digest:
+                print("duplicate")
+                sys.exit(0)
+    highest = 0
+    for name in os.listdir(events):
+        try: highest = max(highest, int(name.split('-', 1)[0]))
+        except (ValueError, IndexError): pass
+    record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
+              "pane_id": pane, "host": host, "report_path": report,
+              "report_last_line": last, "epoch": 1}
+    if digest is not None:
+        record["report_sha256"] = digest
+    # job.lost always states why. Downstream recovery treats agent_not_found as
+    # a vanished pane and herdr_unreachable/timeout as an observation gap.
+    if reason: record["reason"] = reason
+    fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            json.dump(record, f, separators=(',', ':'))
+            f.write('\n')
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
+    finally:
+        if os.path.exists(temporary): os.unlink(temporary)
+print("created")
 PY
+}
+
+# A same-report re-completion is a no-op for the record stream but must not be
+# silent: leave one durable line per suppressed write, next to the sentinel log.
+note_duplicate_completion() {
+  local job="$1" report="$2" jobdir
+  jobdir="$(wrk_jobs_root)/$job"
+  mkdir -p "$jobdir" 2>/dev/null || return 0
+  printf '%s suppressed-duplicate report=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$report" >>"$jobdir/completion-suppressed.log" 2>/dev/null || true
+  return 0
 }
 
 # R20 T3: the record files written above stay the durable contract — the node
@@ -1464,7 +1519,14 @@ done_cmd() {
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
   upload_report_document "$job" "$report"
-  completion_event "$job" "$owner" "$label" "$pane" "$report"
+  local completion_status
+  completion_status="$(completion_event "$job" "$owner" "$label" "$pane" "$report")"
+  if [[ "$completion_status" == duplicate ]]; then
+    note_duplicate_completion "$job" "$report"
+    warn "job.completed already recorded for this report; suppressed duplicate (job=$job)"
+    echo "OK job=$job report=$report"
+    return 0
+  fi
   set_report_last_line "$report"
   emit_relay_event job.completed "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "" "" "" ""
@@ -1672,12 +1734,13 @@ sentinel_cmd() {
   local transient_max="${WRK_SENTINEL_TRANSIENT_MAX:-10}"
   local lost_grace="${WRK_SENTINEL_LOST_GRACE:-1800}"
   [[ -n "$job" && -n "$owner" && -n "$label" && -n "$pane" ]] || exit 2
-  local jobdir logfile started seen transient lost lost_at
+  local jobdir logfile started seen pending transient lost lost_at
   jobdir="$(wrk_jobs_root)/$job"
   mkdir -p "$jobdir"
   logfile="$jobdir/completion-sentinel.log"
   started="$(date +%s)"
   seen=""
+  pending=""
   transient=0
   lost=0
   lost_at=0
@@ -1702,7 +1765,14 @@ sentinel_cmd() {
         fi
         key="$(report_observation_key "$candidate" 2>/dev/null || true)"
         if [[ ( "$token" == "done" || "$token" == "idle" ) && -n "$candidate" && -f "$candidate" && -n "$key" && "$key" != "$seen" ]]; then
-          action=completed
+          # 부분 작성된 report 로 먼저 나가지 않는다: observation key 가 한
+          # interval 동안 그대로일 때만 완료로 판정한다. 첫 관측은 pending.
+          if [[ "$key" == "$pending" ]]; then
+            action=completed
+          else
+            pending="$key"
+            action=pending
+          fi
         fi
         ;;
       *)
@@ -1719,15 +1789,20 @@ sentinel_cmd() {
     sentinel_log "$logfile" "$token" "$transient" "$action"
     case "$action" in
       completed)
-        completion_event "$job" "$owner" "$label" "$pane" "$candidate"
+        local completion_status
+        completion_status="$(completion_event "$job" "$owner" "$label" "$pane" "$candidate")"
         seen="$key"
+        if [[ "$completion_status" == duplicate ]]; then
+          note_duplicate_completion "$job" "$candidate"
+          warn "job.completed already recorded for this report; suppressed duplicate (job=$job)"
+        fi
         [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
         # lost 뒤의 completed 는 유효하다(panewire 가 completed 를 relay 한다).
         # 유예 감시의 목적을 달성했으므로 여기서 끝낸다.
         if [[ "$lost" -eq 1 ]]; then exit 0; fi
         ;;
       lost:*)
-        completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}"
+        completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}" >/dev/null
         lost=1
         lost_at="$now"
         ;;
