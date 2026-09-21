@@ -331,14 +331,16 @@ grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-terra-max' <<<"$profiles_out"
 grep -qx 'builder-opus' <<<"$profiles_out"
 grep -qx 'builder-sol' <<<"$profiles_out"
-grep -qx 'builder-astra' <<<"$profiles_out"
 grep -qx 'builder-devin' <<<"$profiles_out"
 grep -qx 'builder-grok' <<<"$profiles_out"
 grep -qx 'builder-kimi' <<<"$profiles_out"
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
-grep -qx 'captain-astra' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
+# task #526: the astra builder spellings were removed — astra is counsel-only
+# (hk:doc decision/2026-09-21/astra-allowed-purposes-approved).
+if grep -qx 'builder-astra' <<<"$profiles_out"; then exit 1; fi
+if grep -qx 'captain-astra' <<<"$profiles_out"; then exit 1; fi
 [[ "$(grep -xc 'devin-swe2' <<<"$profiles_out")" -eq 1 ]]
 grep -qx 'devin-glm52' <<<"$profiles_out"
 grep -qx 'devin-swe17' <<<"$profiles_out"
@@ -1633,10 +1635,10 @@ assert event["payload"]["parent_lane"] == "parent-lane", event
 PY
 echo "PASS role-captain-alias-normalizes-to-builder"
 
-# Every builder profile spelling, including all three legacy captain spellings,
+# Every builder profile spelling, including both legacy captain spellings,
 # must traverse the actual spawn/claim path under canonical --role builder.
 builder_profile_index=0
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra codex-astra captain-astra; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol; do
   builder_profile_index=$((builder_profile_index + 1))
   spawn_base "$builder_profile" --role builder --lane "builder-profile-$builder_profile_index" \
     --parent parent-lane --job "builder-profile-$builder_profile_index" --t T1 >/dev/null
@@ -1644,11 +1646,35 @@ done
 python3 - "$ARBITER_INBOX_ROOT" <<'PY'
 import json, pathlib, sys
 root = pathlib.Path(sys.argv[1])
-for index in range(1, 8):
+for index in range(1, 5):
     event = json.loads((root / f"builder-profile-{index}" / "events" / "00001-job.claim.json").read_text())
     assert event["payload"]["role"] == "builder", event
 PY
 echo "PASS builder-accepts-canonical-and-legacy-profile-aliases"
+
+# task #526: --role builder rejects every astra spelling before claim/gate/tab,
+# and the refusal names the operator decision. The captain role alias must not
+# smuggle captain-astra past the same gate.
+builder_reject_astra() {
+  local model="$1" tag="$2"; shift 2
+  local job="builder-astra-reject-${model}-${tag}" output rc
+  set +e
+  output="$(spawn_base "$model" "$@" --job "$job" --t T1 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 2 ]] || fail "--role builder must reject $model (rc=$rc): $output"
+  grep -q "rejects astra profile '$model'" <<<"$output" ||
+    fail "astra rejection must name the profile: $output"
+  grep -q 'hk:doc decision/2026-09-21/astra-allowed-purposes-approved' <<<"$output" ||
+    fail "astra rejection must cite the operator decision: $output"
+  [[ ! -e "$ARBITER_INBOX_ROOT/$job/events/00001-job.claim.json" ]] ||
+    fail "rejected astra builder must not claim $job"
+}
+builder_reject_astra builder-astra b --role builder --lane astra-b-lane --parent parent-lane
+builder_reject_astra codex-astra c --role builder --lane astra-c-lane --parent parent-lane
+builder_reject_astra captain-astra k --role builder --lane astra-k-lane --parent parent-lane
+builder_reject_astra captain-astra kalias --role captain --lane astra-k-alias-lane --parent parent-lane
+echo "PASS role-builder-rejects-astra-spellings"
 
 role_must_fail() {
   local rejected_role="$1" job="$2" output rc
@@ -1693,10 +1719,49 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-astra codex-astra captain-astra builder-devin builder-grok builder-kimi; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
+
+# task #526: the removed astra builder spellings die on the tombstone under the
+# default role too — they are gone from ALL_PROFILES and resolve_profile, so no
+# role can spawn them.
+for removed_profile in builder-astra captain-astra; do
+  set +e
+  removed_out="$(spawn_base "$removed_profile" --job "removed-${removed_profile}" --t T1 2>&1)"
+  removed_rc=$?
+  set -e
+  [[ "$removed_rc" -eq 2 ]] || fail "removed profile $removed_profile must fail (rc=$removed_rc): $removed_out"
+  grep -q "profile '$removed_profile' was removed" <<<"$removed_out" ||
+    fail "removed profile $removed_profile must hit the tombstone: $removed_out"
+  grep -q 'hk:doc decision/2026-09-21/astra-allowed-purposes-approved' <<<"$removed_out" ||
+    fail "removed profile $removed_profile tombstone must cite the decision: $removed_out"
+done
+expect_exit 2 spawn_base gpt-6-astra --job removed-gpt-6-astra --t T1
+echo "PASS removed-astra-builder-spellings-hit-tombstone"
+
+# task #526 AC4: the three builder surfaces must name the same profile set —
+# builder/SKILL.md, the `wrk spawn --help` --role paragraph and the --role
+# builder accept list. Fixing only one side must turn this RED (that read-order
+# dependence is what #505 removed). The literal accept-line pin also makes
+# re-adding an astra spelling to the list alone go RED.
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+[[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
+[[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
+  fail "accept-list pattern is not unique: $accept_line"
+builder_tokens() { grep -oE '(builder|captain)-[a-z]+' | grep -vx 'builder-level' | sort -u; }
+accept_set="$(builder_tokens <<<"$accept_line")"
+help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
+help_set="$(builder_tokens <<<"$help_block")"
+skill_set="$(builder_tokens <"$ROOT/builder/SKILL.md")"
+[[ "$accept_set" == "$help_set" ]] ||
+  fail "builder profile set drift (accept vs help): $(diff <(echo "$accept_set") <(echo "$help_set"))"
+[[ "$accept_set" == "$skill_set" ]] ||
+  fail "builder profile set drift (accept vs SKILL.md): $(diff <(echo "$accept_set") <(echo "$skill_set"))"
+if grep -iq 'astra' <<<"$help_block"; then fail "--role help paragraph still names astra"; fi
+if grep -iq 'astra' "$ROOT/builder/SKILL.md"; then fail "builder/SKILL.md still names astra"; fi
+echo "PASS builder-profile-set-three-source-consistency"
 
 # A legacy/canonical role pair must not create two role-distinct claims for the
 # same job: the second real spawn remains an active duplicate and the first
@@ -1746,21 +1811,15 @@ builder_sol_out="$(spawn_base builder-sol --role builder --lane builder-sol-lane
 grep -q 'model=builder-sol' <<<"$builder_sol_out"
 grep -q -- '-m gpt-5.6-sol' "$TMP/herdr.log"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
+# task #526 AC2: the counsel path must not regress — `wrk spawn -m codex-astra`
+# under the default role (the ARCHITECT.md spawn shape, no --role) still
+# resolves to gpt-6-astra and still gates as the codex-astra spelling so the
+# scopefuel gate remains the single purpose check.
 : >"$TMP/herdr.log"
-builder_astra_out="$(spawn_base builder-astra --role builder --lane builder-astra-lane --parent parent-lane --job builder-astra-job --t T1 2>&1)"
-grep -q 'model=builder-astra' <<<"$builder_astra_out"
-grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
-[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "builder-astra" ]]
-: >"$TMP/herdr.log"
-codex_astra_out="$(spawn_base codex-astra --role builder --lane codex-astra-lane --parent parent-lane --job codex-astra-job --t T1 2>&1)"
+codex_astra_out="$(spawn_base codex-astra --job codex-astra-counsel-job --t T0 2>&1)"
 grep -q 'model=codex-astra' <<<"$codex_astra_out"
 grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-astra" ]]
-: >"$TMP/herdr.log"
-captain_astra_out="$(spawn_base captain-astra --role captain --lane captain-astra-lane --parent parent-lane --job captain-astra-job --t T1 2>&1)"
-grep -q 'model=captain-astra' <<<"$captain_astra_out"
-grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
-[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "captain-astra" ]]
 
 # Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
 # must all stop before gate/claim/tab creation.
