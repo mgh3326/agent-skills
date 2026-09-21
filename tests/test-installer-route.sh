@@ -16,10 +16,12 @@ checklist_path = Path(
     os.environ.get("INSTALLER_CHECKLIST", root / "installer/CHECKLIST.md")
 )
 director_path = Path(os.environ.get("DIRECTOR_SKILL", root / "director/SKILL.md"))
+readme_path = Path(os.environ.get("README_FILE", root / "README.md"))
 
 installer_text = installer_path.read_text(encoding="utf-8")
 checklist_text = checklist_path.read_text(encoding="utf-8")
 director_text = director_path.read_text(encoding="utf-8")
+readme_text = readme_path.read_text(encoding="utf-8")
 
 RECIPIENT = "director"
 
@@ -53,6 +55,11 @@ CHECKLIST_SLOTS = (
     ("checklist-step8", None, r"(?m)^- \[ \] 8\. JOIN 보고 — 증거: `<(\S+?)로 전달한 경로/시각,"),
 )
 
+README_SLOTS = (
+    ("readme-installer-row", None,
+     r"(?m)^\| `installer` \| [^|\n]*? — (\S+?) 직속\(스폰·보고 모두 director\), 고정 8단계 절차·판단 없음 \|$"),
+)
+
 # R3's fixed procedure: count and order are an invariant of the skill itself.
 R3_STEPS = [
     "대상 확정",
@@ -65,15 +72,18 @@ R3_STEPS = [
     "JOIN 보고",
 ]
 
-# The only lines in the installer files allowed to mention checker/flag-1:
-# historical notes, compared by exact equality (not substring).
+# The only lines in the installer files allowed to mention the abolished
+# checker seat: historical notes, compared by exact equality (not substring).
+# Site lane names are deliberately not spelled in this public repo; the
+# private site doc carries its own lane-name sweep, and the recipient slots
+# above reject any token other than "director".
 HISTORY_LINES = {
     "installer": {
         "(이력: 역할 구조 변경 전에는 checker 계열 게이트 레인이 parent였고 지시·보고가 그 레인을 거쳤다. 그 좌석은 폐지됐다.)",
     },
     "checklist": set(),
 }
-FORBIDDEN = re.compile(r"(?i)checker|flag-1")
+FORBIDDEN = re.compile(r"(?i)checker")
 
 
 def check_slots(text: str, slots) -> None:
@@ -90,7 +100,7 @@ def check_history_only(text: str, allowed: set, label: str) -> None:
     for n, line in enumerate(text.splitlines(), 1):
         if FORBIDDEN.search(line):
             assert line.strip() in allowed, (
-                f"{label}:{n}: checker/flag-1 outside the history allowlist: {line.strip()}"
+                f"{label}:{n}: checker outside the history allowlist: {line.strip()}"
             )
 
 
@@ -114,6 +124,13 @@ def check_installer(text: str) -> None:
 def check_checklist(text: str) -> None:
     check_slots(text, CHECKLIST_SLOTS)
     check_history_only(text, HISTORY_LINES["checklist"], "installer/CHECKLIST.md")
+
+
+def check_readme(text: str) -> None:
+    check_slots(text, README_SLOTS)
+    row = [line for line in text.splitlines() if line.startswith("| `installer` |")]
+    assert len(row) == 1, f"README installer row count {len(row)} != 1"
+    assert not FORBIDDEN.search(row[0]), f"README installer row mentions checker: {row[0]}"
 
 
 def check_director(text: str) -> None:
@@ -146,6 +163,8 @@ print(
 )
 check_checklist(checklist_text)
 print(f"PASS installer checklist slots={len(CHECKLIST_SLOTS)}/{len(CHECKLIST_SLOTS)}")
+check_readme(readme_text)
+print(f"PASS readme installer-row slots={len(README_SLOTS)}/{len(README_SLOTS)}")
 check_director(director_text)
 print("PASS director deploy=order+judge executor=installer route=direct")
 
@@ -185,9 +204,9 @@ esc_heading = "## R9. escalate 트리거 (7개 전부)\n"
 
 installer_mutants = [
     ("step8->checker", mutate(installer_text, step8, step8.replace("director", "checker"))),
-    ("step8->flag-1", mutate(installer_text, step8, step8.replace("director", "flag-1"))),
+    ("step8->gate-lane", mutate(installer_text, step8, step8.replace("director", "gate-lane"))),
     ("r1-parent->checker", mutate(installer_text, r1_parent, "parent는 **checker**다.")),
-    ("r1-results->flag-1", mutate(installer_text, r1_results, r1_results.replace("director", "flag-1"))),
+    ("r1-results->gate-lane", mutate(installer_text, r1_results, r1_results.replace("director", "gate-lane"))),
     ("r10->checker", mutate(installer_text, r10, "checker로의 보고 경로.")),
     ("r11->checker", mutate(installer_text, r11, r11.replace("director", "checker"))),
     ("description->checker", mutate(installer_text, desc, "reporting only to the checker —")),
@@ -213,6 +232,11 @@ checklist_line = "`<director로 전달한 경로/시각,"
 checklist_mutants = [
     ("checklist->checker", mutate(checklist_text, checklist_line, checklist_line.replace("director", "checker"))),
 ]
+readme_row = "— director 직속(스폰·보고 모두 director),"
+readme_mutants = [
+    ("readme-row-reverted", mutate(readme_text, readme_row, "— checker 게이트 레인 하위,")),
+    ("readme-row-checker-appended", mutate(readme_text, readme_row, "— director 직속(스폰·보고 모두 director, JOIN은 checker 경유),")),
+]
 director_mutants = [
     ("director-intro-executor-restored", mutate(
         director_text,
@@ -233,8 +257,13 @@ for label, text in installer_mutants:
     expect_assertion(label, lambda text=text: check_installer(text))
 for label, text in checklist_mutants:
     expect_assertion(label, lambda text=text: check_checklist(text))
+for label, text in readme_mutants:
+    expect_assertion(label, lambda text=text: check_readme(text))
 for label, text in director_mutants:
     expect_assertion(label, lambda text=text: check_director(text))
-total = len(installer_mutants) + len(checklist_mutants) + len(director_mutants)
+total = (
+    len(installer_mutants) + len(checklist_mutants)
+    + len(readme_mutants) + len(director_mutants)
+)
 print(f"PASS mutants assertion-red={total}/{total}")
 PY
