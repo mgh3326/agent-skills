@@ -1234,7 +1234,19 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                 continue
             prior_digest = prior.get("report_sha256")
             if prior_digest is None:
-                prior_digest = digest_of(prior.get("report_path") or "")
+                # Legacy record without a stored digest: a digest recomputed
+                # from the current file is only the digest the record saw if
+                # the file predates the record itself. A same-path report
+                # rewritten for a new round must not be eaten as a duplicate.
+                prior_path = prior.get("report_path") or ""
+                try:
+                    unchanged = bool(prior_path) and \
+                        os.stat(prior_path).st_mtime_ns <= \
+                        os.stat(os.path.join(events, name)).st_mtime_ns
+                except OSError:
+                    unchanged = False
+                if unchanged:
+                    prior_digest = digest_of(prior_path)
             if prior_digest == digest:
                 print("duplicate")
                 sys.exit(0)
