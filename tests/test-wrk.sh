@@ -1750,7 +1750,11 @@ accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|bui
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
-builder_tokens() { grep -oE '(builder|captain)-[a-z]+' | grep -vx 'builder-level' | sort -u; }
+# Token pattern covers the whole accept set: builder-*/captain-* spellings plus
+# the pilot worker spellings. Bare 'grok' is not extracted (it also matches
+# inside builder-grok); grok-hi presence covers it, and the literal accept-line
+# pin above guards the list itself.
+builder_tokens() { grep -oE '(builder|captain)-[a-z]+|devin-swe2|grok-hi|kimi-k3' | grep -vx 'builder-level' | sort -u; }
 accept_set="$(builder_tokens <<<"$accept_line")"
 help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
 help_set="$(builder_tokens <<<"$help_block")"
