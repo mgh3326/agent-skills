@@ -100,6 +100,32 @@ if [[ "${1:-}" == prompt ]]; then
   fixture_prompt "$@"
 fi
 
+# `panewire job` (#499). By default this fixture is a panewire older than the
+# job command: the real binary answers an unknown subcommand with rc 2 and no
+# output, which is what wrk must read as "keep your own path". Handled before
+# WRK_PANEWIRE_LOG so the emit log of every other case stays exactly as it was.
+#
+#   WRK_PANEWIRE_JOB      absent (default) | present | garbage | hang
+#   WRK_PANEWIRE_JOB_LOG  one line per delegated call: HOSTNAME, then argv
+#   WRK_PANEWIRE_JOB_RC   exit code of a delegated call (default 0)
+if [[ "${1:-}" == job ]]; then
+  shift
+  case "${WRK_PANEWIRE_JOB:-absent}" in
+    absent) exit 2 ;;
+    garbage) [[ "${1:-}" != probe ]] || echo "panewire-job/2"; exit 0 ;;
+    hang) sleep 30; exit 0 ;;
+  esac
+  if [[ "${1:-}" == probe ]]; then
+    echo "panewire-job/1"
+    exit 0
+  fi
+  if [[ -n "${WRK_PANEWIRE_JOB_LOG:-}" ]]; then
+    { printf 'HOSTNAME=%s' "${HOSTNAME-<unset>}"; printf ' [%s]' "$@"; printf '\n'; } >>"$WRK_PANEWIRE_JOB_LOG"
+  fi
+  echo "fixture job $*"
+  exit "${WRK_PANEWIRE_JOB_RC:-0}"
+fi
+
 if [[ -n "${WRK_PANEWIRE_LOG:-}" ]]; then
   {
     for argument in "$@"; do printf '%s\n' "$argument"; done

@@ -3404,6 +3404,110 @@ grep -q 'reap: 0 candidate' <<<"$(reap_run --lane lane-a)" ||
   fail "an already reaped job must never be offered again"
 echo "PASS reap-apply-closes-tab-and-records-job-reaped"
 
+# ── #499: done/escalate/joined hand over to `panewire job` only when it exists ──
+# Deployment order must not matter: with a panewire that lacks the command (or
+# no panewire at all) wrk behaves exactly as before, and whichever path runs,
+# each event is written once — never zero times, never twice.
+J499_INBOX="$TMP/j499-inbox"
+J499_REPORT="$TMP/j499-report.md"
+printf 'j499 report line\n' >"$J499_REPORT"
+j499_claim() {
+  env ARBITER_INBOX_ROOT="$J499_INBOX" XDG_DATA_HOME="$TMP/xdg-j499" "$ARBITER" claim \
+    --job "$1" --lane lane-a --agent-label wrk-a --t T1 "${@:2}" >/dev/null
+  env ARBITER_INBOX_ROOT="$J499_INBOX" XDG_DATA_HOME="$TMP/xdg-j499" "$ARBITER" event \
+    --job "$1" --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+}
+j499_run() {  # j499_run DELEGATE JOB_MODE TAG wrk-args...
+  local delegate="$1" mode="$2" tag="$3"
+  shift 3
+  env WRK_JOB_DELEGATE="$delegate" ARBITER_INBOX_ROOT="$J499_INBOX" HOSTNAME=fixture-host \
+    WRK_PANEWIRE_JOB="$mode" WRK_PANEWIRE_LOG="$TMP/j499-$tag-emit.log" \
+    WRK_PANEWIRE_JOB_LOG="$TMP/j499-$tag-job.log" "$WRK" "$@"
+}
+j499_lines() { if [[ -f "$1" ]]; then wc -l <"$1" | tr -d ' '; else echo 0; fi; }
+j499_calls() { if [[ -f "$1" ]]; then grep -cx -- '--' "$1" || true; else echo 0; fi; }
+
+# present: wrk hands the exact arguments over and writes nothing of its own.
+j499_claim j499-worker
+j499_claim j499-builder --role builder --parent-lane parent-a
+out="$(j499_run 1 present present 'done' j499-worker --report "$J499_REPORT")"
+[[ "$out" == "fixture job done j499-worker --report $J499_REPORT" ]] ||
+  fail "delegated done must pass panewire's stdout through: $out"
+j499_run 1 present present escalate j499-builder --question 'two  spaces "and" quotes' >/dev/null
+j499_run 1 present present joined j499-builder --pr https://example.invalid/pr/9 --head beef \
+  --report "$J499_REPORT" >/dev/null
+diff "$TMP/j499-present-job.log" <(printf '%s\n' \
+  "HOSTNAME=fixture-host [done] [j499-worker] [--report] [$J499_REPORT]" \
+  'HOSTNAME=fixture-host [escalate] [j499-builder] [--question] [two  spaces "and" quotes]' \
+  "HOSTNAME=fixture-host [joined] [j499-builder] [--pr] [https://example.invalid/pr/9] [--head] [beef] [--report] [$J499_REPORT]") ||
+  fail "delegation must hand panewire job the unmodified arguments"
+[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 0 ]] ||
+  fail "delegated done must not also write wrk's record"
+[[ "$(event_count "$J499_INBOX/j499-builder/events" job.escalate)" == 0 ]] ||
+  fail "delegated escalate must not also write wrk's record"
+[[ "$(event_count "$J499_INBOX/j499-builder/events" job.joined)" == 0 ]] ||
+  fail "delegated joined must not also write wrk's record"
+[[ "$(j499_calls "$TMP/j499-present-emit.log")" == 0 ]] ||
+  fail "delegated commands must not also run wrk's emit"
+# A failing delegated call surfaces its own status and wrk does not retry it.
+rc=0
+WRK_PANEWIRE_JOB_RC=7 j499_run 1 present rc 'done' j499-worker --report "$J499_REPORT" >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 7 ]] || fail "a failing panewire job must surface its own status, got rc=$rc"
+[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 0 &&
+   "$(j499_calls "$TMP/j499-rc-emit.log")" == 0 ]] ||
+  fail "a failing panewire job must not fall back to a second write"
+# Help stays wrk's own even when panewire has the command.
+j499_run 1 present help escalate --help | grep -q '^Usage: wrk escalate JOB' ||
+  fail "escalate --help must stay local"
+[[ "$(j499_lines "$TMP/j499-help-job.log")" == 0 ]] || fail "escalate --help must not delegate"
+echo "PASS j499-delegates-once-to-panewire-job"
+
+# absent / garbage / hang / forced off: wrk's own path, exactly one record and
+# one emit per command, zero delegated calls.
+for mode in absent garbage hang off; do
+  job_mode="$mode" delegate=1
+  if [[ "$mode" == off ]]; then job_mode=present delegate=0; fi
+  worker="j499-$mode-worker" builder="j499-$mode-builder"
+  j499_claim "$worker"
+  j499_claim "$builder" --role builder --parent-lane parent-a
+  out="$(j499_run "$delegate" "$job_mode" "$mode" 'done' "$worker" --report "$J499_REPORT")"
+  [[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "$mode: done output changed: $out"
+  out="$(j499_run "$delegate" "$job_mode" "$mode" escalate "$builder" --question 'fallback question')"
+  [[ "$out" == "OK job=$builder owner_lane=lane-a kind=job.escalate" ]] || fail "$mode: escalate output changed: $out"
+  out="$(j499_run "$delegate" "$job_mode" "$mode" joined "$builder" --pr https://example.invalid/pr/8 \
+    --head f00d --report "$J499_REPORT")"
+  [[ "$out" == "OK job=$builder owner_lane=lane-a kind=job.joined pr=https://example.invalid/pr/8 head=f00d report=$J499_REPORT" ]] ||
+    fail "$mode: joined output changed: $out"
+  [[ "$(event_count "$J499_INBOX/$worker/events" job.completed)" == 1 ]] || fail "$mode: done must write exactly one record"
+  [[ "$(event_count "$J499_INBOX/$builder/events" job.escalate)" == 1 ]] || fail "$mode: escalate must write exactly one record"
+  [[ "$(event_count "$J499_INBOX/$builder/events" job.joined)" == 1 ]] || fail "$mode: joined must write exactly one record"
+  [[ "$(j499_calls "$TMP/j499-$mode-emit.log")" == 3 ]] || fail "$mode: each command must emit exactly once"
+  [[ "$(j499_lines "$TMP/j499-$mode-job.log")" == 0 ]] || fail "$mode: nothing may be delegated"
+  [[ ! -e "$J499_INBOX/$worker/emit-failures.log" ]] || fail "$mode: a clean fallback must leave no emit failure"
+  PYTHONPATH="$TMP" python3 - "$TMP/j499-$mode-emit.log" "$J499_INBOX/$worker/events" "$J499_INBOX/$builder/events" <<'PY'
+import sys
+import r20_emit as helper
+log, worker, builder = sys.argv[1:]
+done_call, escalate_call, joined_call = helper.calls(log)
+helper.assert_matches_record(done_call, helper.record(worker, "job.completed"))
+helper.assert_matches_record(escalate_call, helper.record(builder, "job.escalate"))
+helper.assert_matches_record(joined_call, helper.record(builder, "job.joined"))
+PY
+done
+echo "PASS j499-falls-back-to-own-path-without-panewire-job"
+
+# no binary: wrk's own record, and the missing emit is marked exactly as before.
+j499_claim j499-nobin-worker
+out="$(env ARBITER_INBOX_ROOT="$J499_INBOX" HOSTNAME=fixture-host PANEWIRE_BIN="$TMP/no-such-panewire" \
+  "$WRK" 'done' j499-nobin-worker --report "$J499_REPORT" 2>/dev/null)"
+[[ "$out" == "OK job=j499-nobin-worker report=$J499_REPORT" ]] || fail "no panewire: done output changed: $out"
+[[ "$(event_count "$J499_INBOX/j499-nobin-worker/events" job.completed)" == 1 ]] ||
+  fail "no panewire: done must write exactly one record"
+grep -Eq '^[0-9TZ:-]+ kind=job.completed rc=not_found$' "$J499_INBOX/j499-nobin-worker/emit-failures.log" ||
+  fail "no panewire: the missing emit must still be marked"
+echo "PASS j499-no-panewire-binary-keeps-own-path"
+
 grep -q "for tool in \"\$REPO_DIR\"/bin/\\*" "$ROOT/install.sh"
 
 # ROB-1190 ④-3: scopefuel 이 추천하는 모든 프로필 ⊆ wrk 가 띄울 수 있는 프로필.

@@ -1741,7 +1741,44 @@ print(f"{info.st_dev}:{info.st_ino}:{info.st_mtime_ns}:{info.st_size}")
 PY
 }
 
+# #499: `panewire job done|escalate|joined` is the Go form of the three
+# commands below and leaves byte-identical records, socket requests and output
+# (pinned by panewire testdata/job_golden). wrk hands the call over only when
+# the installed panewire proves it has that command: `panewire job probe` must
+# print exactly the token below. A missing binary, an older panewire (rc 2, no
+# output), any other output, or a probe that hangs keeps wrk's own path — the
+# probe has no side effects, so falling back after it can never duplicate an
+# event. Once handed over, wrk execs and runs nothing further of its own, so
+# the event is written by exactly one of the two paths. WRK_JOB_DELEGATE=0
+# forces wrk's own path (golden regeneration, rollback).
+JOB_PROBE_TOKEN="panewire-job/1"
+delegate_job_cmd() {
+  local sub="$1" panewire probe
+  shift
+  [[ "${WRK_JOB_DELEGATE:-1}" != 0 ]] || return 0
+  panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
+  [[ -n "$panewire" ]] || return 0
+  local guard=(timeout 5)
+  if ! command -v timeout >/dev/null 2>&1; then
+    if command -v gtimeout >/dev/null 2>&1; then
+      guard=(gtimeout 5)
+    else
+      guard=(python3 -c 'import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)' 5)
+    fi
+  fi
+  probe="$("${guard[@]}" "$panewire" job probe 2>/dev/null </dev/null)" || return 0
+  [[ "$probe" == "$JOB_PROBE_TOKEN" ]] || return 0
+  # HOSTNAME is a shell variable bash does not necessarily export; the records
+  # carry wrk's value, so hand it over explicitly.
+  HOSTNAME="${HOSTNAME:-unknown}" exec "$panewire" job "$sub" "$@"
+}
+
 done_cmd() {
+  delegate_job_cmd 'done' "$@"
   local job="${1:-}" report=""
   [[ -n "$job" && "$job" != -* ]] || die "done requires a job id"
   shift || true
@@ -1830,6 +1867,7 @@ escalate_cmd() {
     escalate_help
     return 0
   fi
+  delegate_job_cmd escalate "$@"
   local job="${1:-}" question="" report="" metadata owner label pane parent role reason
   [[ -n "$job" && "$job" != -* ]] || die "escalate requires a job id"
   shift || true
@@ -1855,6 +1893,7 @@ escalate_cmd() {
 }
 
 joined_cmd() {
+  delegate_job_cmd joined "$@"
   local job="${1:-}" pr="" head="" report="" metadata owner label pane parent role reason
   [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
   shift || true

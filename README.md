@@ -132,6 +132,14 @@ R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
 읽으며, 업로드 실패는 경고만 남기고 완료 레코드는 계속 쓴다. 성공 시 마지막 줄의
 `doc:<key>` 접미를 웹 콘솔이 문서 링크로 연다.
 
+`wrk done|escalate|joined`는 설치된 panewire가 `panewire job probe`에 정확히
+`panewire-job/1`로 답할 때만 같은 인자를 `panewire job <명령>`에 넘긴다(#499). 그 경로는
+레코드·소켓 요청·업로드·출력을 wrk와 바이트 단위로 같게 남긴다(panewire
+`testdata/job_golden`). 바이너리가 없거나, `job`을 모르는 구 panewire이거나, 답이 다르거나,
+probe가 5초 안에 끝나지 않으면 지금까지의 wrk 경로를 그대로 쓴다. 넘긴 뒤에는 wrk가 아무것도
+더 하지 않으므로(`exec`) 한 이벤트는 두 경로 중 한 곳에서만 쓰인다. `WRK_JOB_DELEGATE=0`은
+wrk 경로를 강제한다(golden 재생성·롤백용).
+
 ## 완료 센티널 판정표
 
 `wrk spawn`은 job이 arbiter에 등록되면 완료 센티널을 분리 기동한다. 센티널은
