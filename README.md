@@ -182,9 +182,18 @@ wrk reap --lane REAP_LANE --apply      # 실제로 herdr tab close
 회수 조건(**전부** 충족해야 후보):
 
 - terminal 이벤트(`job.completed`·`job.joined`·`job.revoked`)가 있다
+- 가장 늦은 terminal 이벤트 **뒤에** `job.claim`·`job.reclaim`·`job.spawned`(·`job.reprompted`)가
+  없다 — 끝난 뒤 다시 잡힌 잡은 살아 있는 작업이다(`skip … reason=reclaimed-after-terminal`).
+  `job.lost`·`quota_pool.*`는 되살림이 아니다
 - 그 terminal 이벤트가 `--grace`(기본 10m)보다 오래됐다
 - `job.spawned`의 `pane_id`가 herdr에 살아 있고 상태가 `idle`·`done`이다
+- `herdr tab list`가 그 탭의 `pane_count`를 **정확히 1로 확인**한다. 조회 실패·JSON 파손·목록에 없음·
+  `pane_count` 부재/비정수(bool 포함)·중복 항목은 "공유일 수 있음"으로 보고 닫지 않는다
+  (`skip … reason=tab-count-unknown`, fail-closed). 2 이상은 기존대로 `tab-shared`
 - 아직 회수된 적이 없다(`job.reaped` 이벤트 없음)
+
+`--apply`는 `--lane` 없이 거부된다(nonzero, 아무것도 조회·종료하지 않음). 전역 회수 우회
+플래그는 없다 — 레인마다 따로 돌린다. dry-run은 lane 없이도 된다.
 
 `working`/`blocked` pane, terminal 이벤트 없는 잡, herdr가 해석하지 못하는 pane은
 건드리지 않는다(해석 실패는 소켓 문제일 수 있고, 확인 못한 탭을 닫는 편이 더 나쁘다).

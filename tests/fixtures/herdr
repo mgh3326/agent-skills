@@ -265,8 +265,21 @@ case "${1:-}" in
             printf '%s\n' '{"result":{"tabs":[{"tab_id":"w:t1","label":"orch","workspace_id":"w"},{"tab_id":"w:t2","label":"2","workspace_id":"w"},{"tab_id":"w:t3","label":"build","workspace_id":"w"}]}}'
             ;;
           reap)
+            # WRK_FIXTURE_REAP_TABS 는 탭 목록이 믿을 수 없는 날을 흉내 낸다. 어느 경우든
+            # reap 은 "공유일 수 있음" 으로 보고 닫지 않아야 한다(fail-closed).
+            case "${WRK_FIXTURE_REAP_TABS:-}" in
+              fail) echo '{"error":{"code":"transport_unavailable","message":"fixture tab list"}}' >&2; exit 1 ;;
+              garbage) printf 'not json at all\n'; exit 0 ;;
+              no-result) printf '%s\n' '{"error":null}'; exit 0 ;;
+              missing) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t4","pane_count":2,"workspace_id":"w1"}]}}'; exit 0 ;;
+              no-count) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","workspace_id":"w1"}]}}'; exit 0 ;;
+              string-count) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":"1","workspace_id":"w1"}]}}'; exit 0 ;;
+              bool-count) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":true,"workspace_id":"w1"}]}}'; exit 0 ;;
+              zero-count) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":0,"workspace_id":"w1"}]}}'; exit 0 ;;
+              duplicate) printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t1","pane_count":2,"workspace_id":"w1"}]}}'; exit 0 ;;
+            esac
             # w1:t4 는 pane 이 분할된 탭이다 — 닫으면 옆 pane 이 함께 죽는다.
-            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t1","label":"reap-ready","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t2","label":"reap-working","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t4","label":"reap-shared","pane_count":2,"workspace_id":"w1"},{"tab_id":"w1:t5","label":"reap-no-tab","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t6","label":"reap-lost-only","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t7","label":"reap-captain-reclaimed","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t8","label":"reap-poisoned","pane_count":1,"workspace_id":"w1"}]}}'
+            printf '%s\n' '{"result":{"tabs":[{"tab_id":"w1:t10","label":"reap-revived","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t11","label":"reap-revived-spawn","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t12","label":"reap-revived-done","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t13","label":"reap-b505-shape","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t1","label":"reap-ready","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t2","label":"reap-working","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t4","label":"reap-shared","pane_count":2,"workspace_id":"w1"},{"tab_id":"w1:t5","label":"reap-no-tab","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t6","label":"reap-lost-only","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t7","label":"reap-captain-reclaimed","pane_count":1,"workspace_id":"w1"},{"tab_id":"w1:t8","label":"reap-poisoned","pane_count":1,"workspace_id":"w1"}]}}'
             ;;
           *) printf '%s\n' '{"result":{"tabs":[]}}' ;;
         esac

@@ -2827,6 +2827,62 @@ reap_job reap-no-tab-shared w1:p4 '' lane-a job.completed
 reap_job reap-lost-only w1:p6 w1:t6 lane-a job.lost
 reap_builder_reclaimed_job reap-builder-reclaimed w1:p7 lane-a
 
+# #508 A-1: a job that finished and was then picked up again is live work, even if
+# its pane reads idle for a moment (devin/claude panes misreport idle|done during
+# long turns). Every event comes from the real arbiter transition.
+reap_revived_job() {
+  local job="$1" pane="$2" tab="$3" how="$4"
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane lane-a --agent-label "$job" --t T1 >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}" >/dev/null
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  case "$how" in
+    reclaim)
+      env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" lease \
+        --job "$job" --resource "$TMP/reap-$job" --kind path >/dev/null
+      env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" release \
+        --job "$job" --resource "$TMP/reap-$job" --kind path --force >/dev/null
+      env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim --reclaim-released \
+        --job "$job" --lane lane-a --agent-label "$job" --t T1 >/dev/null
+      ;;
+    respawn|respawn-done)
+      env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+        --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}" >/dev/null
+      ;;
+  esac
+  if [[ "$how" == respawn-done ]]; then
+    env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+      --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  fi
+  unset ARBITER_TEST_NOW
+}
+reap_revived_job reap-revived w1:p10 w1:t10 reclaim
+reap_revived_job reap-revived-spawn w1:p11 w1:t11 respawn
+# Picked up again and then finished again: the latest terminal event wins, so
+# this one is reapable — the revive guard must not over-refuse.
+reap_revived_job reap-revived-done w1:p12 w1:t12 respawn-done
+
+# #508 A-4: the shape of today's normally finished builder jobs (b505/b448/b449 in
+# the live inbox): builder claim → spawned → completed* → joined → completed →
+# job.lost. job.lost and quota_pool.* are not revivals; with --include-builders
+# in the builder's own lane this job must stay a candidate.
+export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+  --job reap-b505-shape --lane b505-lane --agent-label reap-b505-shape --t T2 \
+  --role builder --parent-lane director-x >/dev/null
+env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job reap-b505-shape --kind quota_pool.record \
+  --payload-json '{"pool":"claude"}' >/dev/null
+env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job reap-b505-shape --kind job.spawned \
+  --payload-json '{"owner_lane":"b505-lane","label":"reap-b505-shape","pane_id":"w1:p13","tab_id":"w1:t13"}' >/dev/null
+for kind in job.completed job.joined job.completed job.lost; do
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job reap-b505-shape --kind "$kind" \
+    --payload-json '{"owner_lane":"b505-lane","parent_lane":"director-x","pane_id":"w1:p13"}' >/dev/null
+done
+unset ARBITER_TEST_NOW
+
 # Existing inboxes can contain a durable captain payload written before role
 # normalization. Reap must protect it exactly like a new builder payload.
 reap_legacy_captain_job() {
@@ -2890,8 +2946,16 @@ grep -q 'tab=worker' <<<"$dry_out" &&
   fail "a value glued onto pane_id by tabs must never be read as a tab id: $dry_out"
 grep -q '^skip job=reap-poisoned-spawn reason=malformed-record$' <<<"$dry_out" ||
   fail "when the spawn receipt itself carries whitespace in pane_id the evidence is broken and reap must skip, not guess: $dry_out"
-[[ "$(grep -c '^would-close ' <<<"$dry_out")" -eq 3 ]] ||
+[[ "$(grep -c '^would-close ' <<<"$dry_out")" -eq 4 ]] ||
   fail "only the finished, idle, past-grace jobs may be listed: $dry_out"
+grep -q '^skip job=reap-revived reason=reclaimed-after-terminal$' <<<"$dry_out" ||
+  fail "#508 A-1: a job reclaimed after its terminal event is live work and must be skipped with its reason: $dry_out"
+grep -q '^skip job=reap-revived-spawn reason=reclaimed-after-terminal$' <<<"$dry_out" ||
+  fail "#508 A-1: a job spawned again after its terminal event is live work and must be skipped with its reason: $dry_out"
+grep -qE '^would-close job=reap-revived(-spawn)? ' <<<"$dry_out" &&
+  fail "#508 A-1: a job picked up again after it finished must never be a reap candidate: $dry_out"
+grep -q '^would-close job=reap-revived-done pane=w1:p12 tab=w1:t12 status=idle' <<<"$dry_out" ||
+  fail "#508 A-4: a job that was picked up again and then finished again is reapable (the latest terminal wins): $dry_out"
 grep -q 'reason=status=working' <<<"$dry_out" ||
   fail "a still-working pane must be skipped explicitly, never closed: $dry_out"
 grep -q 'reap-open' <<<"$dry_out" &&
@@ -2913,6 +2977,63 @@ grep -q '^tab close' "$REAP_LOG" &&
 [[ "$(event_count "$REAP_INBOX/reap-ready/events" job.reaped)" -eq 0 ]] ||
   fail "a dry run must not record job.reaped"
 echo "PASS reap-dry-run-lists-only-finished-idle-panes"
+
+# #508 A-2: the shared-tab guard is fail-closed. A tab list that failed, did not
+# parse, lacks the tab, or gives a pane_count that is not a confirmed 1 means
+# "maybe shared" — never close. Both dry run and --apply must agree.
+for mode in fail garbage no-result missing no-count string-count bool-count zero-count duplicate; do
+  : >"$REAP_LOG"
+  mode_out="$(WRK_FIXTURE_REAP_TABS="$mode" reap_run --lane lane-a)"
+  grep -q '^would-close ' <<<"$mode_out" &&
+    fail "#508 A-2 ($mode): an unconfirmed pane_count must not produce a candidate: $mode_out"
+  grep -q '^skip job=reap-ready pane=w1:p1 tab=w1:t1 reason=tab-count-unknown$' <<<"$mode_out" ||
+    fail "#508 A-2 ($mode): an unconfirmed tab must be skipped as tab-count-unknown: $mode_out"
+  mode_apply="$(WRK_FIXTURE_REAP_TABS="$mode" reap_run --lane lane-a --apply)"
+  grep -q '^tab close' "$REAP_LOG" &&
+    fail "#508 A-2 ($mode): --apply must not close any tab when the tab list cannot confirm a single pane: $(cat "$REAP_LOG") / $mode_apply"
+  grep -q 'reap: closed 0 tab(s)' <<<"$mode_apply" ||
+    fail "#508 A-2 ($mode): --apply must report zero closed tabs: $mode_apply"
+done
+[[ "$(event_count "$REAP_INBOX/reap-ready/events" job.reaped)" -eq 0 ]] ||
+  fail "#508 A-2: no job.reaped may be written while the tab list is untrustworthy"
+echo "PASS reap-shared-tab-guard-fails-closed"
+
+# #508 A-3: a lane-less --apply is refused before anything is looked at or closed.
+: >"$REAP_LOG"
+if nolane_out="$(reap_run --apply 2>&1)"; then
+  fail "#508 A-3: --apply without --lane must exit nonzero: $nolane_out"
+fi
+grep -q -- '--apply requires --lane' <<<"$nolane_out" ||
+  fail "#508 A-3: the refusal must say --lane is required: $nolane_out"
+[[ ! -s "$REAP_LOG" ]] ||
+  fail "#508 A-3: a refused lane-less --apply must not even call herdr: $(cat "$REAP_LOG")"
+if find "$REAP_INBOX" -name '*job.reaped.json' | grep -q .; then
+  fail "#508 A-3: a refused lane-less --apply must not record job.reaped"
+fi
+if nolane_builder_out="$(reap_run --apply --include-builders 2>&1)"; then
+  fail "#508 A-3: --include-builders must not open a lane-less --apply: $nolane_builder_out"
+fi
+nolane_dry="$(reap_run)" ||
+  fail "#508 A-3: a lane-less dry run is still allowed"
+grep -q '^would-close job=reap-ready ' <<<"$nolane_dry" ||
+  fail "#508 A-3: a lane-less dry run must still list candidates: $nolane_dry"
+grep -q 'Requires --lane' <<<"$("$WRK" reap --help)" ||
+  fail "#508: reap --help must document that --apply requires --lane"
+grep -q 'reclaimed-after-terminal' <<<"$("$WRK" reap --help)" ||
+  fail "#508: reap --help must document the reclaimed-after-terminal rule"
+grep -q 'tab-count-unknown' <<<"$("$WRK" reap --help)" ||
+  fail "#508: reap --help must document the fail-closed tab rule"
+echo "PASS reap-apply-requires-lane"
+
+# #508 A-4: the normally finished builder shape stays reapable (no over-refusal),
+# and without --include-builders it stays excluded exactly as before.
+b505_default="$(reap_run --lane b505-lane)"
+grep -q 'reap-b505-shape' <<<"$b505_default" &&
+  fail "#508 A-4: a builder job must still be excluded without --include-builders: $b505_default"
+b505_out="$(reap_run --lane b505-lane --include-builders)"
+grep -q '^would-close job=reap-b505-shape pane=w1:p13 tab=w1:t13 status=idle' <<<"$b505_out" ||
+  fail "#508 A-4: a normally finished builder (… joined → completed → lost) must stay a candidate with --include-builders: $b505_out"
+echo "PASS reap-normal-builder-shape-still-reapable"
 
 grep -q 'reap: 0 candidate' <<<"$(reap_run --lane lane-a --grace 2h)" ||
   fail "a terminal event younger than --grace is not yet reapable"
@@ -2946,8 +3067,12 @@ grep -q '^closed job=reap-no-tab pane=w1:p5 tab=w1:t5 status=idle' <<<"$apply_ou
   fail "--apply must close the tab it resolved through 'agent get', by tab id: $apply_out"
 grep -q '^closed job=reap-poisoned pane=w1:p8 tab=w1:t8 status=idle' <<<"$apply_out" ||
   fail "--apply must close the tab from the spawn receipt, not one read out of a poisoned record: $apply_out"
-[[ "$(grep -c '^tab close ' "$REAP_LOG")" -eq 3 ]] ||
-  fail "only the three candidates' tabs may be closed: $(cat "$REAP_LOG")"
+[[ "$(grep -c '^tab close ' "$REAP_LOG")" -eq 4 ]] ||
+  fail "only the four candidates' tabs may be closed: $(cat "$REAP_LOG")"
+grep -qE '^tab close w1:t1[01]$' "$REAP_LOG" &&
+  fail "#508 A-1: --apply must never close the tab of a job picked up again after it finished: $(cat "$REAP_LOG")"
+[[ "$(event_count "$REAP_INBOX/reap-revived/events" job.reaped)" -eq 0 ]] ||
+  fail "#508 A-1: a reclaimed-after-terminal job must not be recorded as reaped"
 grep -q 'tab close worker' "$REAP_LOG" &&
   fail "reap must never pass a role name to herdr tab close: $(cat "$REAP_LOG")"
 grep -q '^tab close w1:t1$' "$REAP_LOG" ||

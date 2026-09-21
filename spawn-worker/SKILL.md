@@ -582,8 +582,12 @@ wrk reap --lane <내 세션 이름> --apply      # 실제 회수
 ```
 
 후보 조건(전부 충족): terminal 이벤트(`job.completed`·`job.joined`·`job.revoked`)가 있고,
-그 이벤트가 `--grace`(기본 10m)보다 오래됐고, `job.spawned` 의 pane 이 herdr 에 살아 있고
-상태가 `idle`·`done` 이고, 아직 `job.reaped` 가 없을 것. `working`·`blocked` pane, terminal
+그 **뒤에** `job.claim`·`job.reclaim`·`job.spawned` 가 없고(끝난 뒤 다시 잡힌 잡은 살아 있는
+작업 — `reason=reclaimed-after-terminal`), 그 이벤트가 `--grace`(기본 10m)보다 오래됐고,
+`job.spawned` 의 pane 이 herdr 에 살아 있고 상태가 `idle`·`done` 이고, `herdr tab list` 가
+그 탭의 pane 을 **정확히 1개로 확인**하고(조회 실패·파싱 실패·탭 누락·비정수는 닫지 않는다 —
+`reason=tab-count-unknown`), 아직 `job.reaped` 가 없을 것. 🔴 `--apply` 는 `--lane` 없이
+거부된다(전역 회수 금지). `working`·`blocked` pane, terminal
 이벤트 없는 잡, herdr 가 해석 못 하는 pane 은 건드리지 않는다. 빌더 pane(legacy captain payload 포함)은
 `--include-builders` 없이는 제외한다(`--include-captains`는 legacy 별칭). 닫은 잡에는 `job.reaped`(`pane_id`·`tab_id`·`at`)를 남긴다.
 
