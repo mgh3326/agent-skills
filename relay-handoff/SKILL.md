@@ -133,6 +133,12 @@ v1 의 요지: **완료를 아는 쪽(답변자·워커)이 요청자 레인으�
 `lane.event`는 claude pane에만 사용한다. 아래 표·측정 조건·예외 삭제 조건이 이 분기의
 정본이다.
 
+🔴 **예외 — 후속 라운드·보충 지시(이미 떠 있는 워커·tester 에 대한 재지시)는
+`herdr agent prompt` 가 아니라 `panewire prompt --uptake status-transition` 이다.**
+정본은 `builder` 스킬 §후속 라운드·보충 지시의 주입(하네스별 제출 증명 차이·rc≠0
+처리 포함)이며, `herdr pane send-text`·`send-keys` 는 복구 목적 외에 금지한다.
+이 절의 `herdr agent prompt` 직접주입은 초기 브리프 주입과 통지·질의에만 해당한다.
+
 | pane kind | `lane.event` | `herdr agent prompt` 직접주입 |
 |---|---|---|
 | claude | ✅ | ✅ |
@@ -216,6 +222,11 @@ messages`·상태 전이)는 **claude 행**의 내용이다. 다른 하네스는
 | grok | 미측정(관측된 빈 컴포저: `❯` 입력란 + `Grok 4.6 (high) · always-approve` 푸터) | `○ 1 command still running · 1 queued, Enter to send now`(`──` 머리 없음) | 전사에 `❯ <메시지>` 줄(시각 표기)로 남고 `◆ Thought for …`/`◆ Run …` 응답이 이어짐 | `herdr agent send-keys <pane> return` → 즉시 제출·소비 확인(푸터 `Enter to send now` 가 지시). 중복 위험은 claude 와 동일 — 대기 중 페이로드 재주입 금지 | `working` ↔ `⠧ Waiting for response…` 진행 표시 일치 관측 — 그 외 상태 미측정 | 대기·즉시제출: grok 4.6 pane, 2026-09-18, director 실측(#406). 소비·빈 컴포저: grok pane 읽기 전용 관측 4건(09-18). 상태: `agent list`=working ↔ 화면 `⠧ Waiting for response… 4.2s`(09-18 20:16, grok pane 1건) |
 
 grok 의 대기 상태(`N queued, Enter to send now`)는 공유 화면에서 페이로드 귀속이 불가능하므로 착지 증거가 아니다 — "무언가 대기 중" 이라는 모호 신호로만 읽고, 이 queued 푸터로는 착지를 주장하지 않는다 (#406, 2026-09-18).
+
+🔴 이 표의 "대기 중 즉시 제출 방법" 열은 하네스가 제공하는 수단의 관측 기록이다.
+후속·보충 지시의 제출 타이밍(queued 배너 확인 후 명시 제출, 툴 실행 중 Enter 금지)은
+`builder` 스킬 §후속 라운드·보충 지시의 주입이 정본이다 — #406 의 grok Enter
+실측은 제출이 동작함을 보일 뿐, 실행 중이던 명령의 무사를 보증하지 않는다.
 
 ## 4. 완료 보고 형식
 
