@@ -32,6 +32,10 @@ printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 export ARBITER_BIN="$TMP/absent-arbiter"
 export XDG_DATA_HOME="$TMP/xdg"
 export ARBITER_INBOX_ROOT="$TMP/inbox"
+# Nor the operator's real spill-over config: under host load it moved fixture
+# spawns onto a real remote host (or died with rc 2 on its cwd_map). Cases
+# that exercise spill-over pass their own WRK_HOSTS_CONFIG.
+export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 
 # R20: `wrk done/escalate/joined` now notify panewire. The suite must never
 # reach a real one, so every case runs against the silent fixture below; the
@@ -636,12 +640,16 @@ grep -q -- '-m grok-4.5' "$TMP/herdr.log"
 spawn_base grok46 >/dev/null
 grep -q -- '-m grok-4.6' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
+# ROB-1186 at-most-once, now on the #498 rc 4 fallback: the direct herdr
+# injection whose --wait fails gets one return and is never sent again.
 once_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=prompt-wait-fails WRK_FIXTURE_LOG="$TMP/herdr.log" \
+  WRK_PANEWIRE_PROMPT=daemon-down \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" "$WRK" spawn \
   -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
 grep -q 'model=codex-terra' <<<"$once_out"
 grep -q 'landed=yes' <<<"$once_out"
+grep -q ' via=herdr-fallback$' <<<"$once_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 [[ "$(grep -c 'agent send-keys w:p1 return' "$TMP/herdr.log")" -eq 1 ]]
 
@@ -846,6 +854,165 @@ observation_fail_out="$(TEST_FIXTURE_SCENARIO=landing-observation-fails spawn_ba
 grep -q 'landed=no' <<<"$observation_fail_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 echo "PASS ambiguous-observation-no-retry: $observation_fail_out"
+
+# ---------------------------------------------------------------------------
+# #498: the spawn brief goes through `panewire prompt` only (hk decision
+# 2026-09-21/task498-esc-landing-unify). The panewire fixture models the
+# daemon: expect preflight, send through the herdr fixture (so herdr.log still
+# counts every injection), submission proof only for claude/codex.
+PW_LOG="$TMP/panewire-prompt.log"
+pw_reset() { rm -f "$PW_LOG" "$PW_LOG".* "$TMP/herdr.log"; }
+pw_calls() { if [[ -f "$PW_LOG" ]]; then grep -c '^prompt ' "$PW_LOG"; else echo 0; fi; }
+herdr_briefs() { if [[ -f "$TMP/herdr.log" ]]; then grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log" || true; else echo 0; fi; }
+pw_spawn() { WRK_PANEWIRE_PROMPT_LOG="$PW_LOG" spawn_base "$@"; }
+
+# A-7: expect line, agent-name target, absolute fresh file, no uptake.
+pw_reset
+pw_out="$(pw_spawn codex-terra 2>&1)"
+grep -q 'landed=yes' <<<"$pw_out" || fail "498 baseline spawn must land: $pw_out"
+[[ "$(pw_calls)" -eq 1 ]] || fail "498 one panewire prompt call expected"
+[[ "$(herdr_briefs)" -eq 1 ]] || fail "498 exactly one brief injection expected"
+grep -q "^prompt from=wrk-spawn:fixture to=fixture file=/.* timeout=60s uptake=\$" "$PW_LOG" ||
+  fail "498 panewire prompt argv (name target, absolute file, codex 60s, no uptake): $(cat "$PW_LOG")"
+root_physical="$(cd "$ROOT" && pwd -P)"
+[[ "$(head -n1 "$PW_LOG.1")" == "expect: name=fixture cwd=$root_physical" ]] ||
+  fail "498 expect line: $(head -n1 "$PW_LOG.1")"
+diff <(sed '1,2d' "$PW_LOG.1") "$PROMPT" >/dev/null || fail "498 brief body must follow the expect line verbatim"
+grep -q ' via=' <<<"$pw_out" && fail "498 panewire path must not annotate via=: $pw_out"
+grep -q 'agent prompt w:p1 fixture prompt' "$TMP/herdr.log" || fail "498 brief must reach the pane"
+echo "PASS 498-a7-expect-name-cwd-no-uptake"
+
+# C4: injection only after tab create and agent start.
+tab_line="$(grep -n '^tab create' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"
+start_line="$(grep -n '^agent start' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"
+brief_line="$(grep -n '^agent prompt .*fixture prompt' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"
+(( tab_line < start_line && start_line < brief_line )) ||
+  fail "498 order must be tab create < agent start < brief: $tab_line $start_line $brief_line"
+echo "PASS 498-c4-injection-after-start"
+
+# A-3: every refusing gate means zero panewire calls and zero injections.
+for gate_mode in 3 4 broken; do
+  pw_reset
+  WRK_GATE_MODE="$gate_mode" pw_spawn codex-terra >/dev/null 2>&1 && fail "498 gate $gate_mode must refuse"
+  [[ "$(pw_calls)" -eq 0 && "$(herdr_briefs)" -eq 0 ]] || fail "498 gate $gate_mode refusal still prompted"
+done
+pw_reset
+TEST_FIXTURE_SCENARIO=tab-create-fails pw_spawn codex-terra >/dev/null 2>&1 && fail "498 tab create failure must fail the spawn"
+[[ "$(pw_calls)" -eq 0 ]] || fail "498 no prompt without a pane"
+echo "PASS 498-a3-gate-refusal-no-prompt"
+
+# C3: the cwd reaches panewire in herdr's spelling when it names the same
+# physical directory, else physical. $TMP is under /var/folders, itself a
+# symlink to /private/var/folders on macOS; a symlinked worktree adds one more.
+pw_cwd_real="$TMP/pw-cwd-real"; mkdir -p "$pw_cwd_real"
+ln -sfn "$pw_cwd_real" "$TMP/pw-cwd-link"
+pw_cwd_physical="$(cd "$pw_cwd_real" && pwd -P)"
+cwd_case() {
+  local reported="$1" pane_cwd="$2" out
+  pw_reset
+  out="$(WRK_PANEWIRE_PROMPT_LOG="$PW_LOG" WRK_FIXTURE_AGENT_CWD="$reported" WRK_PANEWIRE_PANE_CWD="$pane_cwd" \
+    env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+    "$WRK" spawn -c "$TMP/pw-cwd-link" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
+  grep -q 'landed=yes' <<<"$out" || fail "498 cwd case reported=$reported pane=$pane_cwd: $out $(head -n1 "$PW_LOG.1" 2>/dev/null)"
+  [[ "$(head -n1 "$PW_LOG.1")" == "expect: name=fixture cwd=$pane_cwd" ]] || fail "498 cwd spelling: $(head -n1 "$PW_LOG.1")"
+}
+cwd_case "" "$pw_cwd_physical"                       # herdr gives no cwd: physical
+cwd_case "$pw_cwd_physical" "$pw_cwd_physical"       # herdr reports physical
+cwd_case "$TMP/pw-cwd-link" "$TMP/pw-cwd-link"       # herdr reports the logical spelling
+# herdr says the pane is somewhere else: wrk must not adopt that spelling;
+# panewire's preflight then refuses (rc 5) and nothing is injected.
+pw_reset
+elsewhere_out="$(WRK_PANEWIRE_PROMPT_LOG="$PW_LOG" WRK_FIXTURE_AGENT_CWD=/ WRK_PANEWIRE_PANE_CWD=/ \
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  "$WRK" spawn -c "$TMP/pw-cwd-link" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
+[[ "$(head -n1 "$PW_LOG.1")" == "expect: name=fixture cwd=$pw_cwd_physical" ]] || fail "498 foreign cwd adopted"
+grep -q 'landed=no' <<<"$elsewhere_out" || fail "498 cwd mismatch must be landed=no: $elsewhere_out"
+grep -q 'panewire_rc=5 submit=unsent' <<<"$elsewhere_out" || fail "498 cwd mismatch detail: $elsewhere_out"
+[[ "$(herdr_briefs)" -eq 0 ]] || fail "498 cwd mismatch must not inject (no fallback on rc 5)"
+echo "PASS 498-c3-cwd-normalized"
+
+# A-6 ①: no uptake mode — a cold-booting pane that already reports working
+# still gets the brief (the fixture refuses working targets when uptake is
+# set, as prompt.go does).
+pw_reset
+working_out="$(TEST_FIXTURE_SCENARIO=landing-scrollback-marker pw_spawn codex-terra 2>&1)"
+[[ "$(herdr_briefs)" -eq 1 ]] || fail "498 working target must still receive the brief: $working_out"
+grep -q 'landed=yes' <<<"$working_out" || fail "498 working target landing: $working_out"
+echo "PASS 498-a6-working-target-injected"
+
+# A-6 ②: panewire's negative verdict on a brief that did land (claude/codex
+# rc 6 "submission evidence unproven", transcript shows the brief) is
+# corrected by read-only corroboration — landed=yes and no second brief.
+for pw_mode in unproven composer; do
+  pw_reset
+  fn_out="$(WRK_PANEWIRE_PROMPT="$pw_mode" pw_spawn codex-terra 2>&1)"
+  grep -q 'landed=yes' <<<"$fn_out" || fail "498 false negative ($pw_mode) must land: $fn_out"
+  [[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 false negative ($pw_mode) re-injected"
+  grep -q 'reinject' <<<"$fn_out" && fail "498 false negative ($pw_mode) announced a reinject: $fn_out"
+done
+echo "PASS 498-a6-false-negative-no-duplicate"
+
+# I2: confirmed non-landing re-injects once, through panewire, as a new file.
+pw_reset
+pw_retry_out="$(TEST_FIXTURE_SCENARIO=landing-retry pw_spawn codex-terra 2>&1)"
+grep -q 'landed=retry' <<<"$pw_retry_out" || fail "498 retry: $pw_retry_out"
+[[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] || fail "498 retry must be one extra panewire delivery"
+first_file="$(sed -n '1s/.* file=\([^ ]*\) .*/\1/p' "$PW_LOG")"
+second_file="$(sed -n '2s/.* file=\([^ ]*\) .*/\1/p' "$PW_LOG")"
+[[ -n "$first_file" && "$first_file" != "$second_file" ]] || fail "498 re-injection must use a new file path"
+[[ "$first_file" == "$TMP/inbox/fixture/"* || "$first_file" == "$(cd "$TMP" && pwd -P)/inbox/fixture/"* ]] ||
+  fail "498 prompt file must live in the (fixture) job dir: $first_file"
+pw_reset
+pw_never_out="$(TEST_FIXTURE_SCENARIO=landing-no pw_spawn codex-terra 2>&1)"
+grep -q 'landed=no' <<<"$pw_never_out" || fail "498 never-lands: $pw_never_out"
+[[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] || fail "498 at most one re-injection"
+echo "PASS 498-i2-reinject-once-new-file"
+
+# A-5: rc 4 (no daemon socket = guaranteed unsent) and only rc 4 falls back to
+# one direct herdr injection, visible on the OK line; never twice.
+pw_reset
+fb_out="$(WRK_PANEWIRE_PROMPT=daemon-down pw_spawn codex-terra 2>&1)"
+grep -q '^OK pane=w:p1 .*landed=yes.* via=herdr-fallback$' <<<"$fb_out" || fail "498 fallback OK line: $fb_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 fallback must inject exactly once"
+pw_reset
+set +e
+fb_no_out="$(WRK_PANEWIRE_PROMPT=daemon-down TEST_FIXTURE_SCENARIO=landing-working-no-marker pw_spawn codex-terra --landing-strict 2>&1)"
+fb_no_rc=$?
+set -e
+[[ "$fb_no_rc" -eq 76 ]] || fail "498 fallback landed=no strict exit: $fb_no_rc"
+grep -q '^OK pane=w:p1 .*landed=no.* via=herdr-fallback$' <<<"$fb_no_out" || fail "498 fallback no OK line: $fb_no_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 fallback must never repeat: $(herdr_briefs)"
+grep -q 'reason=fallback-once' <<<"$fb_no_out" || fail "498 fallback no-retry reason: $fb_no_out"
+pw_reset
+missing_out="$(PANEWIRE_BIN="$TMP/absent-panewire" pw_spawn codex-terra 2>&1)"
+grep -q 'landed=yes.* via=herdr-fallback$' <<<"$missing_out" || fail "498 missing panewire binary: $missing_out"
+[[ "$(herdr_briefs)" -eq 1 ]] || fail "498 missing panewire: one injection"
+# rc 3, rc 5 and both rc 6 flavors never fall back.
+for pw_mode in timeout expect-fail rejected-unsent rejected; do
+  pw_reset
+  set +e
+  nf_out="$(WRK_PANEWIRE_PROMPT="$pw_mode" TEST_FIXTURE_SCENARIO=landing-no pw_spawn codex-terra --landing-strict 2>&1)"
+  nf_rc=$?
+  set -e
+  grep -q 'via=herdr-fallback' <<<"$nf_out" && fail "498 $pw_mode must not fall back: $nf_out"
+  [[ "$nf_rc" -eq 76 ]] || fail "498 $pw_mode unlanded strict exit: $nf_rc"
+  grep -q '^OK pane=w:p1 .*landed=no' <<<"$nf_out" || fail "498 $pw_mode OK line: $nf_out"
+  [[ "$(pw_calls)" -eq 1 ]] || fail "498 $pw_mode must not re-deliver"
+  want=0; [[ "$pw_mode" == rejected ]] && want=1
+  [[ "$(herdr_briefs)" -eq "$want" ]] || fail "498 $pw_mode injections: $(herdr_briefs) want $want"
+done
+echo "PASS 498-a5-fallback-rc4-only-once"
+
+# A-4: harnesses panewire cannot prove (devin here) keep the pre-#498 verdict
+# through corroboration: devin idle after the brief is landed, one brief.
+pw_reset
+devin_pw_out="$(TEST_FIXTURE_SCENARIO=devin-idle pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=yes' <<<"$devin_pw_out" || fail "498 devin landing regressed: $devin_pw_out"
+grep -q 'panewire_rc' <<<"$devin_pw_out" && fail "498 devin landed must not carry a failure detail: $devin_pw_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 devin one delivery"
+echo "PASS 498-a4-devin-corroborated"
 
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"

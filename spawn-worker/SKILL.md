@@ -364,15 +364,20 @@ acp-runner --job <job_id> -c <worktree> -p brief.md   --model gemini-3.6-flash -
 
 ### 4-2. 🔴 착지 검증 — 스폰 직후 필수
 
-스폰 명령이 정상 반환됐다고 해서 워커가 브리프를 실제로 받은 것은 아니다. `wrk`는
-**relay-handoff §3-1 정본에 따라** visible 큐 표시와
+스폰 명령이 정상 반환됐다고 해서 워커가 브리프를 실제로 받은 것은 아니다. `wrk spawn`은
+브리프를 **`panewire prompt` 한 경로**로 주입하고(uptake 없음 — working 콜드 부트 pane 도
+받는다), panewire 가 제출을 증명하면(rc 0) 그대로 착지다. panewire 데몬 소켓이 없을 때(rc 4 =
+보장된 미전송)만 herdr 직접 주입 1회로 폴백하고 OK 행 끝에 `via=herdr-fallback` 을 붙인다.
+panewire 가 증명하지 못한 경우(claude·codex 외 하네스, 또는 실제 착지했는데 rc 6)에만 `wrk`는
+**relay-handoff §3-1 정본에 따라** 읽기 전용으로 visible 큐 표시와
 `herdr agent read <pane> --source recent-unwrapped --lines 200`의 브리프 marker를 둘 다
 확인한다. visible 화면에서 밀려나도 transcript에는 남고, 큐 대기 중 주입은
 `recent-unwrapped`에 아직 안 보이므로 한쪽만 보면 미착지로 오판한다. visible의 `Pasted text`
 칩도 queued 양성 증거지만, `working` 단독은 콜드 부트 중에도 나오므로 착지 증거가 아니다.
 큐 표시 원문은 하네스마다 다르다 — 하네스별 칩·푸터의 정본은 relay-handoff §3-2 표다.
 일반 프로필은 30초, codex는 60초 창에서 0.5→2초로 backoff 관찰하고, 양성 증거가 없을
-때만 최대 한 번 재주입한다. 자동화는 `--landing-strict`로 pane의 OK 행은 보존한 채
+때만 새 prompt 파일로 panewire 를 통해 최대 한 번 재주입한다(panewire 의 rc 6 단독은 재주입 사유가
+아니다 — 확인 관찰이 확정 음성이어야 한다). 자동화는 `--landing-strict`로 pane의 OK 행은 보존한 채
 미착지를 exit 76으로 받을 수 있다.
 
 **`wrk`의 `OK status=done`도, herdr의 정상 JSON 응답도 둘 다 착지 증거가 아니다** —

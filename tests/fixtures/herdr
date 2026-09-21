@@ -138,6 +138,14 @@ fixture_brief_landed() {
   return 1
 }
 
+# WRK_FIXTURE_AGENT_CWD adds herdr's `cwd` to every agent in `agent list`, in
+# whatever spelling the test gives (logical or physical), as real herdr does.
+if [[ "${1:-} ${2:-}" == "agent list" && -n "${WRK_FIXTURE_AGENT_CWD:-}" && -z "${WRK_FIXTURE_CWD_PASS:-}" ]]; then
+  WRK_FIXTURE_CWD_PASS=1 WRK_FIXTURE_LOG="" "$0" "$@" |
+    python3 -c 'import json,sys,os; d=json.load(sys.stdin); [a.__setitem__("cwd", os.environ["WRK_FIXTURE_AGENT_CWD"]) for a in d["result"]["agents"]]; print(json.dumps(d))'
+  exit 0
+fi
+
 case "${1:-}" in
   agent)
     case "${2:-}" in

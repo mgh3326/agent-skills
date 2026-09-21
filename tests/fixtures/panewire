@@ -10,6 +10,96 @@
 #                       reproducing the real emit's missing-root failure
 set -euo pipefail
 
+# `panewire prompt` (#498 spawn brief delivery) models the real daemon closely
+# enough for wrk's rc handling: prompt.go parses the expect line, refuses a
+# name/cwd mismatch before sending (rc 5), sends through herdr (here: the
+# herdr fixture, so its log counts the injection exactly like a direct
+# `agent prompt`), and proves submission only for claude/codex by finding the
+# first 24 characters of the body in the transcript; otherwise rc 6.
+#
+#   WRK_PANEWIRE_PROMPT       comma list, one mode per call (last repeats):
+#                             classify (default) | ok | unproven | composer |
+#                             rejected | rejected-unsent | daemon-down |
+#                             expect-fail | timeout
+#   WRK_PANEWIRE_PROMPT_LOG   one line per call: from/to/file/timeout/uptake;
+#                             the file as received is copied to LOG.<n>
+#   WRK_PANEWIRE_PANE_CWD     herdr's cwd for the pane; when set, expect cwd
+#                             must equal it byte for byte (as prompt.go does)
+fixture_prompt() {
+  local from="" to="" file="" timeout="" uptake="" calls mode body first name="" cwd="" token
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --from) from="$2"; shift 2 ;;
+      --to) to="$2"; shift 2 ;;
+      --file) file="$2"; shift 2 ;;
+      --timeout) timeout="$2"; shift 2 ;;
+      --uptake) uptake="$2"; shift 2 ;;
+      *) echo "fixture panewire: unknown prompt flag $1" >&2; exit 2 ;;
+    esac
+  done
+  calls=1
+  if [[ -n "${WRK_PANEWIRE_PROMPT_LOG:-}" ]]; then
+    printf 'prompt from=%s to=%s file=%s timeout=%s uptake=%s\n' "$from" "$to" "$file" "$timeout" "$uptake" >>"$WRK_PANEWIRE_PROMPT_LOG"
+    calls="$(grep -c '^prompt ' "$WRK_PANEWIRE_PROMPT_LOG")"
+    cp "$file" "$WRK_PANEWIRE_PROMPT_LOG.$calls" 2>/dev/null || true
+  fi
+  IFS=, read -r -a modes <<<"${WRK_PANEWIRE_PROMPT:-classify}"
+  if (( calls > ${#modes[@]} )); then mode="${modes[${#modes[@]}-1]}"; else mode="${modes[$((calls-1))]}"; fi
+  if [[ "$mode" == daemon-down ]]; then
+    echo "panewired unavailable: /fixture/panewire.sock" >&2
+    exit 4
+  fi
+  [[ -n "$from" && -n "$to" && "$file" == /* && -r "$file" && -n "$timeout" ]] || exit 5
+  [[ "$uptake" == "" || "$uptake" == tool || "$uptake" == status-transition ]] || exit 5
+  first="$(grep -m1 -v '^[[:space:]]*$' "$file" || true)"
+  [[ "$first" == expect:* ]] || { echo "prompt file must begin with expect metadata" >&2; exit 5; }
+  for token in ${first#expect:}; do
+    case "$token" in
+      name=*) name="${token#name=}" ;;
+      cwd=*) cwd="${token#cwd=}" ;;
+    esac
+  done
+  body="$(awk 'found { print; next } /^expect:/ { found = 1 }' "$file" | sed '/./,$!d')"
+  if [[ "$mode" == expect-fail || "$name" != "$to" ||
+        ( -n "${WRK_PANEWIRE_PANE_CWD:-}" && "$cwd" != "$WRK_PANEWIRE_PANE_CWD" ) ]]; then
+    echo "recipient identity does not match expect" >&2
+    exit 5
+  fi
+  if [[ "$mode" == timeout ]]; then
+    echo "timeout resolving target" >&2
+    exit 3
+  fi
+  if [[ "$uptake" != "" ]] && "$HERDR_BIN" agent list 2>/dev/null | grep -q '"agent_status":"working"'; then
+    echo "uptake_unproven: target is already working" >&2
+    exit 6
+  fi
+  if [[ "$mode" == rejected-unsent ]]; then
+    echo "herdr prompt rejected: fixture" >&2
+    exit 6
+  fi
+  "$HERDR_BIN" agent prompt w:p1 "$body" >/dev/null 2>&1 || true
+  case "$mode" in
+    ok) exit 0 ;;
+    unproven) echo "submission evidence unproven" >&2; exit 6 ;;
+    composer) echo "prompt remains in composer" >&2; exit 6 ;;
+    rejected) echo "herdr prompt rejected: fixture" >&2; exit 6 ;;
+  esac
+  local harness screen marker
+  harness="$("$HERDR_BIN" agent list 2>/dev/null | python3 -c 'import json,sys; a=json.load(sys.stdin)["result"]["agents"]; print(next((x.get("agent","") for x in a if x.get("pane_id")=="w:p1"),""))' 2>/dev/null || true)"
+  screen="$("$HERDR_BIN" agent read w:p1 --source recent-unwrapped --lines 200 2>/dev/null || true)"
+  marker="$(printf '%s' "$body" | python3 -c 'import sys; print(sys.stdin.read().strip()[:24], end="")')"
+  if [[ "$harness" == claude || "$harness" == codex ]] && [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$screen"; then
+    exit 0
+  fi
+  echo "submission evidence unproven" >&2
+  exit 6
+}
+
+if [[ "${1:-}" == prompt ]]; then
+  shift
+  fixture_prompt "$@"
+fi
+
 if [[ -n "${WRK_PANEWIRE_LOG:-}" ]]; then
   {
     for argument in "$@"; do printf '%s\n' "$argument"; done
