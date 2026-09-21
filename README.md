@@ -87,7 +87,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 ```text
 wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
           [-L live|mock] [--effort LEVEL] [--job ID]
-wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE ... -m builder-opus|builder-sol|builder-astra|builder-devin|builder-grok|builder-kimi
+wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE ... -m builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi
 wrk done JOB [--report PATH]
 wrk escalate JOB --question TEXT [--report PATH]
 wrk joined JOB --pr URL --head SHA --report PATH
@@ -117,8 +117,8 @@ T1, `devin-ds41`은 T1/T2로 시작하며 reps 3건으로 확정한다. `devin-d
 `NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
 사실로 기록되기 때문이다. `--job`은 생략하면 `-l LABEL`을 쓴다.
 
-빌더는 `builder-opus`(Opus effort high)·`builder-sol`·`builder-astra`를 쓴다. `captain-opus`·
-`captain-sol`·`captain-astra`는 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
+빌더는 `builder-opus`(Opus effort high)·`builder-sol`을 쓴다. `captain-opus`·
+`captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
 경고 후 builder로 정규화되는 legacy 별칭이다. 빌더 파일럿으로 `builder-devin`(devin-swe2
 argv)·`builder-grok`(grok 4.6, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
 파일럿이 지목한 워커 철자 `devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의

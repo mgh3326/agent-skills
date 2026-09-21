@@ -6,7 +6,7 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 # builder — PR 루프 소유자
 
 빌더는 PR 한 건의 실행 루프를 소유한다. canonical 빌더 프로필은 `builder-opus`(Opus, effort high) 또는
-`builder-sol`(codex-sol)·`builder-astra`(gpt-6-astra)다. `captain-opus`·`captain-sol`·`captain-astra`는
+`builder-sol`(codex-sol)이다. `captain-opus`·`captain-sol`은
 legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
 `builder-devin`·`builder-grok`은 파일럿 1건씩을 통과해 **조건부 T1 빌더**로 등재됐다(2026-09-14
 운영자 결정). 조건은 **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(타사 풀
