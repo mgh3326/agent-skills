@@ -366,8 +366,8 @@ acp-runner --job <job_id> -c <worktree> -p brief.md   --model gemini-3.6-flash -
 
 스폰 명령이 정상 반환됐다고 해서 워커가 브리프를 실제로 받은 것은 아니다. `wrk spawn`은
 브리프를 **`panewire prompt` 한 경로**로 주입하고(uptake 없음 — working 콜드 부트 pane 도
-받는다), panewire 가 제출을 증명하면(rc 0) 그대로 착지다. panewire 데몬 소켓이 없을 때(rc 4 =
-보장된 미전송)만 herdr 직접 주입 1회로 폴백하고 OK 행 끝에 `via=herdr-fallback` 을 붙인다.
+받는다), panewire 가 제출을 증명하면(rc 0) 그대로 착지다. panewire 데몬 소켓이 없을 때(rc 4) 또는 panewire 가
+설치되지 않았을 때(둘 다 보장된 미전송)만 herdr 직접 주입 1회로 폴백하고 OK 행 끝에 `via=herdr-fallback` 을 붙인다.
 panewire 가 증명하지 못한 경우(claude·codex 외 하네스, 또는 실제 착지했는데 rc 6)에만 `wrk`는
 **relay-handoff §3-1 정본에 따라** 읽기 전용으로 visible 큐 표시와
 `herdr agent read <pane> --source recent-unwrapped --lines 200`의 브리프 marker를 둘 다
