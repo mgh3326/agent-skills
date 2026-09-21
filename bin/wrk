@@ -2968,10 +2968,15 @@ A job is a candidate only when all of these hold:
     terminal event (a job picked up again after it finished is live work;
     skip reason=reclaimed-after-terminal)
   · that terminal event is older than --grace (default 10m)
-  · its recorded pane still exists in herdr and its status is idle or done
-  · herdr tab list confirms its tab holds exactly one pane. A failed or
-    unparsable tab list, a tab missing from it, or a pane_count that is not an
-    integer is treated as possibly shared (skip reason=tab-count-unknown)
+  · the pane of its newest job.spawned receipt still exists in herdr and its
+    status is idle or done (pane and tab come from that one receipt as a unit;
+    a malformed newest receipt is skipped, never patched from older ones)
+  · the tab herdr reports for that pane is the recorded tab
+    (skip reason=tab-mismatch otherwise)
+  · herdr tab list, read again right before the close, confirms its tab holds
+    exactly one pane. A failed or unparsable tab list, a tab missing from it,
+    or a pane_count that is not an integer is treated as possibly shared
+    (skip reason=tab-count-unknown)
   · it has not been reaped before (no job.reaped event)
 
 working/blocked panes, jobs without a terminal event and jobs whose pane herdr
@@ -3058,6 +3063,7 @@ for job in jobs:
         continue
     owner = pane = tab = role = ""
     spawned_pane = spawned_tab = ""
+    saw_spawn = False
     terminal_at = None
     revived = False
     reaped = False
@@ -3093,12 +3099,15 @@ for job in jobs:
             if isinstance(value, str) and value:
                 if key == "pane_id":
                     pane = value
-                    if kind == "job.spawned":
-                        spawned_pane = value
                 else:
                     tab = value
-                    if kind == "job.spawned":
-                        spawned_tab = value
+        if kind == "job.spawned":
+            # 가장 늦은 스폰 영수증이 pane·tab 을 **한 벌로** 정한다. 필드별로 마지막
+            # 값을 남기면 재스폰 영수증(tab_id 없음)의 pane 과 이전 스폰의 tab 이 섞여
+            # 엉뚱한 탭을 닫는다(#508 tester 실증: pane=w1:p9 인데 tab close w1:t1).
+            saw_spawn = True
+            spawned_pane = payload.get("pane_id") if isinstance(payload.get("pane_id"), str) else ""
+            spawned_tab = payload.get("tab_id") if isinstance(payload.get("tab_id"), str) else ""
         if kind == "job.reaped":
             reaped = True
         if kind in REVIVE and terminal_at is not None:
@@ -3114,9 +3123,13 @@ for job in jobs:
     # 스폰 영수증이 pane/tab 의 정본이다. 완료 이벤트의 pane_id 를 그대로 믿으면
     # be4dad1 이전 `wrk done` 이 남긴 오염 레코드("w1:p1\t\tworker")를 집는다 —
     # 실 인박스에 23건 남아 있다.
-    pane = spawned_pane or pane
-    tab = spawned_tab or tab
-    if reaped or not pane:
+    # 영수증이 하나라도 있으면 가장 늦은 영수증만 믿는다 — 그 영수증이 깨졌으면 앞선
+    # 영수증이나 완료 이벤트의 값으로 되돌아가지 않고 malformed 로 건너뛴다.
+    malformed_receipt = False
+    if saw_spawn:
+        pane, tab = spawned_pane, spawned_tab
+        malformed_receipt = not pane
+    if reaped or (not pane and not malformed_receipt):
         continue
     if lane and owner != lane:
         continue
@@ -3133,7 +3146,7 @@ for job in jobs:
         continue
     # 어떤 필드에도 공백이 있어서는 안 된다. 있으면 그 잡의 증거가 깨진 것이고,
     # 회수는 추측하지 않는다 — pane 을 자리표시자로 내보내 skip 으로 남긴다.
-    if any(any(c.isspace() for c in value) for value in (job, owner, pane, tab)):
+    if malformed_receipt or any(any(c.isspace() for c in value) for value in (job, owner, pane, tab)):
         print(job.split()[0] if job.split() else job, "-", "-", "-", age, "-", sep="\t")
         continue
     print(job, owner or "-", pane, tab or "-", age, "-", sep="\t")
@@ -3238,7 +3251,6 @@ reap_cmd() {
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
   candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
-  tab_counts="$(reap_tab_pane_counts)"
   local job owner pane tab age note probe class token probe_tab verdict acted=0
   while IFS=$'\t' read -r job owner pane tab age note; do
     [[ -n "$job" ]] || continue
@@ -3271,6 +3283,16 @@ reap_cmd() {
       echo "skip job=$job pane=$pane reason=tab-unresolved"
       continue
     fi
+    # 기록된 탭과 herdr 가 지금 말하는 pane 의 탭이 다르면(pane 이동·tab id 재사용)
+    # 기록된 탭은 이 pane 의 탭이 아니다. 어느 쪽도 닫지 않는다.
+    if [[ -n "$probe_tab" && "$probe_tab" != "$tab" ]]; then
+      echo "skip job=$job pane=$pane tab=$tab reason=tab-mismatch(pane-in=$probe_tab)"
+      continue
+    fi
+    # 탭 목록은 후보마다, pane 상태를 본 **뒤** close 직전에 새로 읽는다. 루프 앞에서
+    # 한 번 찍은 스냅숏은 그 사이 합류한 pane 을 못 본다(#508 tester 실증: snapshot=1
+    # → 합류 → tab close). herdr 에 조건부 close 가 없어 창을 0 으로 만들지는 못한다.
+    tab_counts="$(reap_tab_pane_counts)"
     verdict="$(reap_tab_verdict "$tab" "$tab_counts")"
     case "$verdict" in
       single) ;;

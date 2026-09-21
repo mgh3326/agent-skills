@@ -186,8 +186,11 @@ wrk reap --lane REAP_LANE --apply      # 실제로 herdr tab close
   없다 — 끝난 뒤 다시 잡힌 잡은 살아 있는 작업이다(`skip … reason=reclaimed-after-terminal`).
   `job.lost`·`quota_pool.*`는 되살림이 아니다
 - 그 terminal 이벤트가 `--grace`(기본 10m)보다 오래됐다
-- `job.spawned`의 `pane_id`가 herdr에 살아 있고 상태가 `idle`·`done`이다
-- `herdr tab list`가 그 탭의 `pane_count`를 **정확히 1로 확인**한다. 조회 실패·JSON 파손·목록에 없음·
+- **가장 늦은** `job.spawned` 영수증의 `pane_id`가 herdr에 살아 있고 상태가 `idle`·`done`이다.
+  pane·tab은 그 영수증 하나에서 **한 벌로** 읽는다(앞선 영수증의 tab과 섞지 않고, 깨진 최신
+  영수증은 `malformed-record`로 건너뛴다)
+- herdr가 말하는 그 pane의 탭이 기록된 탭과 같다(다르면 `skip … reason=tab-mismatch`)
+- close **직전에 다시 읽은** `herdr tab list`가 그 탭의 `pane_count`를 **정확히 1로 확인**한다. 조회 실패·JSON 파손·목록에 없음·
   `pane_count` 부재/비정수(bool 포함)·중복 항목은 "공유일 수 있음"으로 보고 닫지 않는다
   (`skip … reason=tab-count-unknown`, fail-closed). 2 이상은 기존대로 `tab-shared`
 - 아직 회수된 적이 없다(`job.reaped` 이벤트 없음)

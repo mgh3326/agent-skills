@@ -2883,6 +2883,39 @@ for kind in job.completed job.joined job.completed job.lost; do
 done
 unset ARBITER_TEST_NOW
 
+# #508 tester BLOCKER 1: pane and tab come from the newest job.spawned receipt as a
+# unit. A respawn receipt without tab_id must not inherit the previous spawn's tab
+# (that closed w1:t1 while the live pane was w1:p9), and a malformed newest receipt
+# must not fall back to an older one.
+reap_receipts_job() {
+  local lane="$1" job="$2"; shift 2
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 >/dev/null
+  local receipt
+  for receipt in "$@"; do
+    env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+      --payload-json "$receipt" >/dev/null
+  done
+  env ARBITER_INBOX_ROOT="$REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"$lane\",\"pane_id\":\"w1:p1\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
+reap_receipts_job receipt-lane reap-mixed-receipt \
+  '{"owner_lane":"receipt-lane","pane_id":"w1:p14","tab_id":"w1:t14"}' \
+  '{"owner_lane":"receipt-lane","pane_id":"w1:p15"}'
+reap_receipts_job receipt-lane reap-broken-newest \
+  '{"owner_lane":"receipt-lane","pane_id":"w1:p14","tab_id":"w1:t14"}' \
+  '{"owner_lane":"receipt-lane","tab_id":"w1:t14"}'
+# The recorded tab is not the tab herdr says the pane lives in (pane moved or the
+# tab id was reused): neither tab may be closed.
+reap_receipts_job receipt-lane reap-moved \
+  '{"owner_lane":"receipt-lane","pane_id":"w1:p16","tab_id":"w1:t17"}'
+# #508 tester BLOCKER 2: a pane joins the tab between reap's status probe and the
+# close. The tab list must be read after the probe, right before the close.
+reap_receipts_job race-lane reap-race \
+  '{"owner_lane":"race-lane","pane_id":"w1:p18","tab_id":"w1:t18"}'
+
 # Existing inboxes can contain a durable captain payload written before role
 # normalization. Reap must protect it exactly like a new builder payload.
 reap_legacy_captain_job() {
@@ -3034,6 +3067,38 @@ b505_out="$(reap_run --lane b505-lane --include-builders)"
 grep -q '^would-close job=reap-b505-shape pane=w1:p13 tab=w1:t13 status=idle' <<<"$b505_out" ||
   fail "#508 A-4: a normally finished builder (… joined → completed → lost) must stay a candidate with --include-builders: $b505_out"
 echo "PASS reap-normal-builder-shape-still-reapable"
+
+: >"$REAP_LOG"
+receipt_out="$(reap_run --lane receipt-lane --apply)"
+grep -q '^closed job=reap-mixed-receipt pane=w1:p15 tab=w1:t15 ' <<<"$receipt_out" ||
+  fail "#508 R1: a respawn receipt without tab_id must resolve the live pane's own tab, not inherit the older spawn's tab: $receipt_out"
+grep -q '^tab close w1:t14$' "$REAP_LOG" &&
+  fail "#508 R1: the previous spawn's tab (w1:t14) must never be closed for a newer pane: $(cat "$REAP_LOG")"
+grep -q '^skip job=reap-broken-newest reason=malformed-record$' <<<"$receipt_out" ||
+  fail "#508 R1: a malformed newest receipt must be skipped, never patched from an older receipt: $receipt_out"
+grep -q '^skip job=reap-moved pane=w1:p16 tab=w1:t17 reason=tab-mismatch(pane-in=w1:t16)$' <<<"$receipt_out" ||
+  fail "#508 R1: a recorded tab that is not the pane's current tab must be skipped as tab-mismatch: $receipt_out"
+grep -qE '^tab close w1:t1[67]$' "$REAP_LOG" &&
+  fail "#508 R1: neither the recorded nor the actual tab of a moved pane may be closed: $(cat "$REAP_LOG")"
+[[ "$(grep -c '^tab close ' "$REAP_LOG")" -eq 1 ]] ||
+  fail "#508 R1: only the mixed-receipt job's own tab may be closed: $(cat "$REAP_LOG")"
+echo "PASS reap-newest-receipt-and-tab-mismatch"
+
+: >"$REAP_LOG"
+race_out="$(WRK_FIXTURE_REAP_TABS=race reap_run --lane race-lane --apply)"
+grep -q '^tab close' "$REAP_LOG" &&
+  fail "#508 R1: a pane that joined the tab after the status probe must stop the close: $(cat "$REAP_LOG") / $race_out"
+grep -q '^skip job=reap-race pane=w1:p18 tab=w1:t18 reason=tab-shared(panes=2)$' <<<"$race_out" ||
+  fail "#508 R1: the tab list read right before the close must see the joined pane: $race_out"
+python3 - "$REAP_LOG" <<'PY'
+import sys
+lines = [line.strip() for line in open(sys.argv[1])]
+probe = lines.index("agent get w1:p18")
+listing = [i for i, line in enumerate(lines) if line == "tab list"]
+assert listing and max(listing) > probe, (
+    "#508 R1: the tab list deciding the close must be read after the pane probe: %r" % lines)
+PY
+echo "PASS reap-tab-list-reread-before-close"
 
 grep -q 'reap: 0 candidate' <<<"$(reap_run --lane lane-a --grace 2h)" ||
   fail "a terminal event younger than --grace is not yet reapable"
