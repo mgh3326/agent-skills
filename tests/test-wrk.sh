@@ -2738,30 +2738,29 @@ kill "$idem_partial_pid" 2>/dev/null || true
 wait "$idem_partial_pid" 2>/dev/null || true
 echo "PASS completion-sentinel-waits-for-report-to-settle"
 
-# IDEM-5 — 구버전 레코드(report_sha256 없음)와의 상호작용. digest 를 저장하지
-# 않은 레코드는 report_path 를 "지금" 읽어 재계산할 수밖에 없는데, 파일이 레코드
-# 이후 다시 쓰였다면 재계산값은 새 내용의 것이다 — 새 round 를 삼키면 안 된다.
-# 파일이 레코드보다 오래됐을 때만 재계산을 신뢰한다(전이 기간 dedupe 유지).
+# IDEM-5 — 구버전 레코드(report_sha256 없음)는 억제 근거가 되지 않는다.
+# identity 부재는 "중복" 이 아니라 "증명 불가" 다 — 어떤 파일시스템 proxy
+# (mtime·touch 롤백·cp -p·rsync -a 보존 복사 포함)로도 과거 본문을 증명할 수
+# 없으므로 기록 쪽으로 fail-open 한다. 그리고 그 새 형식 레코드는 이후 재호출을
+# 정상 억제한다.
 idem_claim idem-legacy
 IDEM_LEGACY_REPORT="$TMP/idem-legacy-report.md"
 printf 'legacy verdict line\n' >"$IDEM_LEGACY_REPORT"
 mkdir -p "$IDEM_INBOX/idem-legacy/events"
 printf '%s\n' "{\"kind\":\"job.completed\",\"job_id\":\"idem-legacy\",\"owner_lane\":\"lane-a\",\"label\":\"wrk-a\",\"pane_id\":\"w1:p1\",\"host\":\"h\",\"report_path\":\"$IDEM_LEGACY_REPORT\",\"report_last_line\":\"legacy verdict line\",\"epoch\":1}" \
   >"$IDEM_INBOX/idem-legacy/events/00001-job.completed.json"
-# report 가 레코드보다 오래됐다 = 레코드가 본 내용 그대로 → 재호출은 억제된다.
-touch -d '2000-01-01 00:00:00' "$IDEM_LEGACY_REPORT"
-env ARBITER_INBOX_ROOT="$IDEM_INBOX" "$WRK" 'done' idem-legacy --report "$IDEM_LEGACY_REPORT" >/dev/null 2>&1
-event_count_is "$IDEM_INBOX/idem-legacy/events" job.completed 1 ||
-  fail "an unchanged legacy report must still dedupe across the digest transition (got $(event_count "$IDEM_INBOX/idem-legacy/events" job.completed))"
-grep -q 'suppressed-duplicate' "$IDEM_INBOX/idem-legacy/completion-suppressed.log" ||
-  fail "the suppressed legacy recall must leave a durable note"
-# report 가 레코드 이후 다시 쓰였다 = 새 round → 억제 금지(505 판정 근거).
-sleep 1
+# mtime 보존 덮어쓰기(tester 의 cp -p/rsync -a 재현 모양)로도 억제되지 않아야 한다.
 printf 'new round verdict line\n' >"$IDEM_LEGACY_REPORT"
+touch -t 200001010000.00 "$IDEM_LEGACY_REPORT"
 env ARBITER_INBOX_ROOT="$IDEM_INBOX" "$WRK" 'done' idem-legacy --report "$IDEM_LEGACY_REPORT" >/dev/null 2>&1
 event_count_is "$IDEM_INBOX/idem-legacy/events" job.completed 2 ||
-  fail "a report rewritten after a legacy record is a new round and must record (got $(event_count "$IDEM_INBOX/idem-legacy/events" job.completed))"
-echo "PASS completion-legacy-record-mtime-gated"
+  fail "a rewritten report must record even when its mtime is rolled back below a legacy record (got $(event_count "$IDEM_INBOX/idem-legacy/events" job.completed))"
+env ARBITER_INBOX_ROOT="$IDEM_INBOX" "$WRK" 'done' idem-legacy --report "$IDEM_LEGACY_REPORT" >/dev/null 2>&1
+event_count_is "$IDEM_INBOX/idem-legacy/events" job.completed 2 ||
+  fail "the new-format record must still suppress a same-report recall (got $(event_count "$IDEM_INBOX/idem-legacy/events" job.completed))"
+grep -q 'suppressed-duplicate' "$IDEM_INBOX/idem-legacy/completion-suppressed.log" ||
+  fail "the suppressed recall on a new-format record must leave a durable note"
+echo "PASS completion-legacy-record-never-suppresses"
 
 # ---------------------------------------------------------------------------
 # wrk reap: 끝난 pane 회수
