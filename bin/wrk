@@ -468,7 +468,7 @@ spawn_panewire_prompt() {
   fi
   if ! file="$(spawn_prompt_file "$attempt")"; then
     SPAWN_SUBMIT=unsent
-    SPAWN_PANEWIRE_RC=file
+    SPAWN_PANEWIRE_RC="file"
     SPAWN_PANEWIRE_ERR="prompt-file-unwritable"
     return 0
   fi
@@ -496,6 +496,8 @@ except subprocess.TimeoutExpired:
     0) SPAWN_SUBMIT=proven ;;
     "$PANEWIRE_EXIT_DAEMON_UNAVAILABLE") SPAWN_SUBMIT=daemon ;;
     2|"$PANEWIRE_EXIT_CONDITION_INVALID") SPAWN_SUBMIT=unsent ;;
+    # A timeout may fall on either side of the send boundary.
+    "$PANEWIRE_EXIT_TIMEOUT") SPAWN_SUBMIT=unconfirmed ;;
     "$PANEWIRE_EXIT_DELIVERY_FAILURE")
       # These two messages are only produced after herdr accepted agent.prompt
       # (prompt.go: pollSubmission result), so the brief did leave wrk.
