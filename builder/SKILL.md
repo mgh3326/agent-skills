@@ -100,6 +100,30 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
 도구가 실제로 지원하는 계약을 확인한 경우에만 별도로 다룬다; 지원하지 않는 인자를
 발명하지 않는다.
 
+## 후속 라운드·보충 지시의 주입
+
+이미 떠 있는 워커·tester pane 에 **후속 라운드·보충 지시**를 보낼 때의 주입 경로는
+이 절이 정본이다(초기 브리프 주입은 `spawn-worker` §4·relay-handoff §3 절차,
+완료 통지의 pane kind 분기는 relay-handoff §3-1).
+
+- 후속 라운드·보충 지시의 주입은 **`panewire prompt --uptake status-transition`**
+  으로 한다. `herdr pane send-text` 와 `send-keys` 는 **복구 목적 외에 금지**한다 —
+  두 명령은 컴포저에 글자만 넣을 뿐 제출도 제출 확인도 하지 않아, 미제출 브리프가
+  컴포저에서 이어 붙는다(2026-09-21 실사고: send-text 후속 주입 2건이 미제출로 병합).
+- 프롬프트 파일 첫 줄은 `expect: name=… cwd=…` 가 필수다(name·cwd 로 수신자를
+  고정). `--to` 는 에이전트 이름이다. `--uptake` 는 이미 `working` 인 대상을
+  거부한다(rc=6) — working 중인 pane 에는 전이가 끝난 뒤에 보낸다.
+- **rc≠0 이면 재전송 전에 화면을 확인한다.** 같은 발신자·대상·파일·본문의 재전송은
+  correlation id dedup 에 걸리지만, `unproven` 인 채 실제로 착지한 경우가 있어
+  (2026-09-21 실측) 화면 확인 없는 재작성·재전송은 이중 지시가 된다.
+- **하네스 차이 — 제출 증명은 claude·codex 에서만 나온다**
+  (`harnessHasSubmissionEvidence`). 미제출이면 rc≠0 + `composer_residue`,
+  제출·작업 시작이면 `confirmed` 다. devin·grok·kimi 는 착지해도 `unproven` 만
+  나오므로(rc≠0) 그 하네스에서는 **visible pane 의 queued 배너로 판정**한다 —
+  배너가 있으면 명시 제출하고, **툴 실행 중에는 Enter 를 보내지 않는다**
+  (Enter 가 실행 중 툴 호출을 취소한다). 배너 원문의 정본은 relay-handoff §3-2
+  하네스별 제출 마커 표다.
+
 ## 큐와 상위 레인 보고
 
 다음 작업 선택과 상태 전이는 우선 다음 인터페이스를 사용한다.

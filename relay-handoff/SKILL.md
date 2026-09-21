@@ -133,6 +133,12 @@ v1 의 요지: **완료를 아는 쪽(답변자·워커)이 요청자 레인으�
 `lane.event`는 claude pane에만 사용한다. 아래 표·측정 조건·예외 삭제 조건이 이 분기의
 정본이다.
 
+🔴 **예외 — 후속 라운드·보충 지시(이미 떠 있는 워커·tester 에 대한 재지시)는
+`herdr agent prompt` 가 아니라 `panewire prompt --uptake status-transition` 이다.**
+정본은 `builder` 스킬 §후속 라운드·보충 지시의 주입(하네스별 제출 증명 차이·rc≠0
+처리 포함)이며, `herdr pane send-text`·`send-keys` 는 복구 목적 외에 금지한다.
+이 절의 `herdr agent prompt` 직접주입은 초기 브리프 주입과 통지·질의에만 해당한다.
+
 | pane kind | `lane.event` | `herdr agent prompt` 직접주입 |
 |---|---|---|
 | claude | ✅ | ✅ |

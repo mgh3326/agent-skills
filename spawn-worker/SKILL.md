@@ -317,9 +317,14 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
 - 브리프 주입과 제출 검증은 **relay-handoff 스킬 절차**를 따른다(제출 검증 생략 금지,
   접수 확인 도구 1회 지시 포함).
 - pane kind별 지시·중단·답변 통지 분기와 매트릭스·측정 조건·예외 삭제 조건은
-  **relay-handoff §3-1 정본**을 참조한다. 비-claude pane에는 `herdr agent prompt`를,
-  claude pane에만 `lane.event`를 사용한다. `panewire emit` 의 `rc=0` 은 전달 증거가
-  아니며, 보낸 쪽은 `herdr agent read <pane>`로 도착을 확인한다.
+  **relay-handoff §3-1 정본**을 참조한다. claude pane 통지에는 `lane.event`를
+  사용한다. **후속 라운드·보충 지시의 주입은 `panewire prompt --uptake
+  status-transition` 으로 한다** — `builder` 스킬 §후속 라운드·보충 지시의 주입이
+  정본이고, 하네스별 제출 증명 차이(claude·codex 만 증명 가능, devin·grok·kimi 는
+  `unproven`)와 rc≠0 처리도 그 절을 따른다. `herdr pane send-text`·`send-keys`는
+  복구 목적 외에 금지한다 — 제출도 제출 확인도 없이 컴포저 적재만 한다.
+  `panewire emit` 의 `rc=0` 은 전달 증거가 아니며, 보낸 쪽은
+  `herdr agent read <pane>`로 도착을 확인한다.
 - **완료 센티널**: job 이 arbiter 에 등록되면 `wrk spawn` 이 감시자를 분리 기동한다. 판정표와
   환경변수(`WRK_SENTINEL_TRANSIENT_MAX`·`WRK_SENTINEL_LOST_GRACE`·`WRK_SENTINEL_HERDR_SESSION`)는
   README "완료 센티널 판정표" 가 정본이다. 요지: **빈 `agent get` 응답은 pane 소멸의 증거가
