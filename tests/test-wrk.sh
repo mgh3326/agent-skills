@@ -1875,12 +1875,13 @@ real_done_case() (
   python3 - "$jobs_root/$job/events/00003-job.completed.json" "$job" <<'PY'
 import json, sys
 event = json.load(open(sys.argv[1]))
-assert set(event) == {"kind", "job_id", "owner_lane", "label", "pane_id", "host", "report_path", "report_last_line", "epoch"}, event
+assert set(event) == {"kind", "job_id", "owner_lane", "label", "pane_id", "host", "report_path", "report_last_line", "epoch", "report_sha256"}, event
 assert event["kind"] == "job.completed" and event["job_id"] == sys.argv[2], event
 assert event["pane_id"] == "test:pane", (
     "pane_id is what panewire routes on; it must be the pane alone, not the rest of the metadata row: %r"
     % event["pane_id"])
 assert event["epoch"] == 1, event
+assert len(event["report_sha256"]) == 64, event
 PY
 )
 real_done_case default
@@ -2470,13 +2471,13 @@ sleep 2
 event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 0 ||
   fail "a job with no report is not complete, whatever the pane status says (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/sentinel-idle/report.md"
-sleep 2
-event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 1 ||
-  fail "an idle pane plus a fresh report is exactly one job.completed (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
+# the report must sit unchanged for one interval before it counts as final —
+# the first sighting only logs action=pending.
+wait_until 30 event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 1 ||
+  fail "an idle pane plus a settled report is exactly one job.completed (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 printf 'updated report line\n' >>"$SENTINEL_INBOX/sentinel-idle/report.md"
-sleep 2
-event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 2 ||
-  fail "an updated report at the same path is a new observation, so a second job.completed follows (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
+wait_until 30 event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 2 ||
+  fail "an updated report at the same path is a new round, so a second job.completed follows (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 kill "$sentinel_idle_pid" 2>/dev/null || true
 wait "$sentinel_idle_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-portable-discovery-and-dedupe"
@@ -2488,8 +2489,8 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-done WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel sentinel-done lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
 sentinel_done_pid=$!
-sleep 2
-[[ "$(find "$SENTINEL_INBOX/sentinel-done/events" -name '*job.completed.json' | wc -l | tr -d ' ')" -eq 1 ]]
+wait_until 30 event_count_is "$SENTINEL_INBOX/sentinel-done/events" job.completed 1 ||
+  fail "a done pane plus a settled report is exactly one job.completed (got $(event_count "$SENTINEL_INBOX/sentinel-done/events" job.completed))"
 kill "$sentinel_done_pid" 2>/dev/null || true
 wait "$sentinel_done_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-accepts-done-status"
@@ -2518,12 +2519,13 @@ wait "$transient_pid" 2>/dev/null || true
   fail "empty/failed 'agent get' output is not pane loss: job.lost written with reason=$(sentinel_lost_reason "$TRANSIENT_EVENTS")"
 transient_log="$TRANSIENT_INBOX/sentinel-transient/completion-sentinel.log"
 [[ -s "$transient_log" ]] || fail "completion-sentinel.log must record one line per decision, but it is empty"
-transient_seen="$(awk '{print $2, $3, $4}' "$transient_log" | head -6)"
+transient_seen="$(awk '{print $2, $3, $4}' "$transient_log" | head -7)"
 transient_want='status=empty transient=1 action=none
 status=err:exit1 transient=2 action=none
 status=err:parse transient=3 action=none
 status=err:transport_unavailable transient=4 action=none
 status=working transient=0 action=none
+status=idle transient=0 action=pending
 status=idle transient=0 action=completed'
 [[ "$transient_seen" == "$transient_want" ]] ||
   fail "sentinel decision log must classify each observation; want:
@@ -2621,6 +2623,120 @@ assert payload.get("tab_id") == "w:t1", (
     "job.spawned must record the tab_id `wrk reap` later closes, got %r" % payload.get("tab_id"))
 PY
 echo "PASS sentinel-inherits-pinned-herdr-session"
+
+# ---------------------------------------------------------------------------
+# completion idempotency: 같은 report artifact = 같은 round = 레코드 1건
+# ---------------------------------------------------------------------------
+# 445 재현: `wrk done` 이 쓴 뒤 센티널이 같은 report 를 독립 관측해 두 번째
+# job.completed 를 썼다. 억제는 "이 report 내용의 canonical 완료가 이미 있는가"
+# (멤버십) 판정이며 건수·임계값이 아니다.
+IDEM_INBOX="$TMP/idem-inbox"
+idem_arb() { env ARBITER_INBOX_ROOT="$IDEM_INBOX" XDG_DATA_HOME="$TMP/xdg-idem" "$ARBITER" "$@"; }
+idem_claim() {
+  idem_arb claim --job "$1" --lane lane-a --agent-label wrk-a --t T1 >/dev/null
+  idem_arb event --job "$1" --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+}
+panewire_call_count() { grep -cx -- '--' "$1" 2>/dev/null || true; }
+sentinel_log_has() { [[ -f "$1" ]] && grep -q "$2" "$1"; }
+
+# IDEM-1 — `wrk done` 재호출은 no-op 이다: 레코드 1건, emit 1회, 두 번째 호출은
+# rc=0 + stderr 경고 + 지속 억제 로그. 세 번째 호출도 같다(멤버십, 카운트 아님).
+idem_claim idem-double
+IDEM_REPORT="$TMP/idem-report.md"
+printf 'idem verdict line\n' >"$IDEM_REPORT"
+IDEM_PW_LOG="$TMP/idem-panewire.log"
+: >"$IDEM_PW_LOG"
+env ARBITER_INBOX_ROOT="$IDEM_INBOX" WRK_PANEWIRE_LOG="$IDEM_PW_LOG" \
+  "$WRK" 'done' idem-double --report "$IDEM_REPORT" >/dev/null 2>&1
+env ARBITER_INBOX_ROOT="$IDEM_INBOX" WRK_PANEWIRE_LOG="$IDEM_PW_LOG" \
+  "$WRK" 'done' idem-double --report "$IDEM_REPORT" >"$TMP/idem-dup.out" 2>"$TMP/idem-dup.err"
+env ARBITER_INBOX_ROOT="$IDEM_INBOX" WRK_PANEWIRE_LOG="$IDEM_PW_LOG" \
+  "$WRK" 'done' idem-double --report "$IDEM_REPORT" >/dev/null 2>&1
+event_count_is "$IDEM_INBOX/idem-double/events" job.completed 1 ||
+  fail "a same-report re-completion must not write a second record (got $(event_count "$IDEM_INBOX/idem-double/events" job.completed))"
+grep -qxF "OK job=idem-double report=$IDEM_REPORT" "$TMP/idem-dup.out" ||
+  fail "a suppressed duplicate still reports the completion as done: $(cat "$TMP/idem-dup.out")"
+grep -q 'suppressed duplicate' "$TMP/idem-dup.err" ||
+  fail "a suppressed duplicate must warn on stderr: $(cat "$TMP/idem-dup.err")"
+grep -q 'suppressed-duplicate' "$IDEM_INBOX/idem-double/completion-suppressed.log" ||
+  fail "a suppressed duplicate must leave a durable note in the job directory"
+[[ "$(panewire_call_count "$IDEM_PW_LOG")" -eq 1 ]] ||
+  fail "the owner lane is notified exactly once per canonical completion (got $(panewire_call_count "$IDEM_PW_LOG") emits)"
+echo "PASS completion-done-recall-is-idempotent"
+
+# IDEM-2 — 관측된 445 모양: `wrk done` 가 먼저 쓰고 센티널이 같은 report 를
+# 나중에 관측한다. 센티널 판정은 completed 로 기록되지만 쓰기는 억제된다.
+idem_claim idem-race
+IDEM_RACE_REPORT="$TMP/idem-race-report.md"
+printf 'race verdict line\n' >"$IDEM_RACE_REPORT"
+env ARBITER_INBOX_ROOT="$IDEM_INBOX" "$WRK" 'done' idem-race --report "$IDEM_RACE_REPORT" >/dev/null 2>&1
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_INBOX" \
+  WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=30 WRK_COMPLETION_INTERVAL_S=1 \
+  "$WRK" sentinel idem-race lane-a wrk-a w1:p1 "$IDEM_RACE_REPORT" >/dev/null 2>&1 &
+idem_race_pid=$!
+wait_until 30 sentinel_log_has "$IDEM_INBOX/idem-race/completion-sentinel.log" 'action=completed' ||
+  fail "the sentinel must still judge the settled report as completed"
+sleep 1
+event_count_is "$IDEM_INBOX/idem-race/events" job.completed 1 ||
+  fail "the sentinel's observation of an already-completed report must be suppressed (got $(event_count "$IDEM_INBOX/idem-race/events" job.completed))"
+grep -q 'suppressed-duplicate' "$IDEM_INBOX/idem-race/completion-suppressed.log" ||
+  fail "the suppressed sentinel write must leave a durable note"
+kill "$idem_race_pid" 2>/dev/null || true
+wait "$idem_race_pid" 2>/dev/null || true
+echo "PASS completion-sentinel-observation-after-done-is-suppressed"
+
+# IDEM-3 — 후속 round 는 별개 1건: report 내용이 바뀌면 새 레코드가 쓰이고 두
+# 레코드는 report_sha256 으로 서로 식별된다.
+idem_claim idem-rounds
+IDEM_ROUNDS_REPORT="$TMP/idem-rounds-report.md"
+printf 'round one verdict\n' >"$IDEM_ROUNDS_REPORT"
+env ARBITER_INBOX_ROOT="$IDEM_INBOX" "$WRK" 'done' idem-rounds --report "$IDEM_ROUNDS_REPORT" >/dev/null 2>&1
+printf 'round two verdict\n' >"$IDEM_ROUNDS_REPORT"
+env ARBITER_INBOX_ROOT="$IDEM_INBOX" "$WRK" 'done' idem-rounds --report "$IDEM_ROUNDS_REPORT" >/dev/null 2>&1
+event_count_is "$IDEM_INBOX/idem-rounds/events" job.completed 2 ||
+  fail "a new report artifact is a new round and must produce its own record (got $(event_count "$IDEM_INBOX/idem-rounds/events" job.completed))"
+python3 - "$IDEM_INBOX/idem-rounds/events" <<'PY'
+import glob, hashlib, json, sys
+records = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.completed.json"))]
+assert len(records) == 2, records
+digests = {r.get("report_sha256") for r in records}
+assert len(digests) == 2, "the two rounds must carry distinct identities: %r" % records
+assert digests == {
+    hashlib.sha256(b"round one verdict\n").hexdigest(),
+    hashlib.sha256(b"round two verdict\n").hexdigest(),
+}, digests
+PY
+echo "PASS completion-distinct-rounds-are-distinct-records"
+
+# IDEM-4 — 센티널은 부분 작성된 report 로 먼저 나가지 않는다: 첫 관측은 pending
+# 이고, settle 전에 내용이 바뀌면 최종본만 canonical 이 된다.
+IDEM_PARTIAL_INBOX="$TMP/idem-partial-inbox"
+IDEM_PARTIAL_REPORT="$TMP/idem-partial-report.md"
+printf 'partial draft\n' >"$IDEM_PARTIAL_REPORT"
+# The 3s interval leaves a whole settle window between the pending sighting and
+# the completion decision — enough to swap in the final content deterministically.
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_PARTIAL_INBOX" \
+  WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=60 WRK_COMPLETION_INTERVAL_S=3 \
+  "$WRK" sentinel idem-partial lane-a wrk-a w1:p1 "$IDEM_PARTIAL_REPORT" >/dev/null 2>&1 &
+idem_partial_pid=$!
+wait_until 30 sentinel_log_has "$IDEM_PARTIAL_INBOX/idem-partial/completion-sentinel.log" 'action=pending' ||
+  fail "the first sighting of a report must be a pending observation, not a completion"
+event_count_is "$IDEM_PARTIAL_INBOX/idem-partial/events" job.completed 0 ||
+  fail "a report observed only once is not yet final and must not be completed"
+printf 'partial draft\nfinal verdict line\n' >"$IDEM_PARTIAL_REPORT"
+wait_until 30 event_count_is "$IDEM_PARTIAL_INBOX/idem-partial/events" job.completed 1 ||
+  fail "once the report settles the sentinel completes exactly once (got $(event_count "$IDEM_PARTIAL_INBOX/idem-partial/events" job.completed))"
+python3 - "$IDEM_PARTIAL_INBOX/idem-partial/events" <<'PY'
+import glob, hashlib, json, sys
+records = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.completed.json"))]
+assert len(records) == 1, records
+assert records[0]["report_sha256"] == hashlib.sha256(b"partial draft\nfinal verdict line\n").hexdigest(), records[0]
+assert records[0]["report_last_line"].startswith("final verdict line"), records[0]
+PY
+kill "$idem_partial_pid" 2>/dev/null || true
+wait "$idem_partial_pid" 2>/dev/null || true
+echo "PASS completion-sentinel-waits-for-report-to-settle"
 
 # ---------------------------------------------------------------------------
 # wrk reap: 끝난 pane 회수
