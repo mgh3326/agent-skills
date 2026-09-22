@@ -146,6 +146,24 @@ if [[ "${1:-} ${2:-}" == "agent list" && -n "${WRK_FIXTURE_AGENT_CWD:-}" && -z "
   exit 0
 fi
 
+# Task 577 FIX: herdr has not yet detected a freshly `pane run` Devin as an
+# agent, so get/wait/explain all answer agent_not_found (real envelope from
+# devin-spawn-probe2 spawn.out and the 2026-09-22 disposable-pane poll).
+# devin-late-detect detects the pane after WRK_FIXTURE_DEVIN_NOT_FOUND_COUNT
+# (default 3) `agent get` calls; devin-never-detect never does.
+if [[ "${1:-}" == agent && "${2:-}" =~ ^(get|wait|explain)$ &&
+      "$scenario" =~ ^devin-(late|never)-detect$ ]]; then
+  devin_gets=0
+  if [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]]; then
+    devin_gets="$(grep -c '^agent get ' "$WRK_FIXTURE_LOG" || true)"
+  fi
+  if [[ "$scenario" == devin-never-detect ||
+        "$devin_gets" -le "${WRK_FIXTURE_DEVIN_NOT_FOUND_COUNT:-3}" ]]; then
+    printf '{"error":{"code":"agent_not_found","message":"agent target %s not found"},"id":"cli:agent:%s"}\n' "${3:-}" "$2" >&2
+    exit 1
+  fi
+fi
+
 case "${1:-}" in
   agent)
     case "${2:-}" in
@@ -169,7 +187,7 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          devin-idle|devin-wrong-rule|devin-wait-timeout)
+          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           devin-wrong-agent)
@@ -188,6 +206,9 @@ case "${1:-}" in
         ;;
       get)
         fixture_log_env
+        if [[ "$scenario" == devin-get-error ]]; then
+          fixture_agent_get_error transport_unavailable
+        fi
         if [[ -n "${WRK_FIXTURE_GET_SEQUENCE:-}" && -f "${WRK_FIXTURE_GET_SEQUENCE}" ]]; then
           fixture_get_sequence_step "${3:-w:p1}"
           exit 0
@@ -229,6 +250,10 @@ case "${1:-}" in
         fi
         ;;
       rename)
+        if [[ "$scenario" == devin-rename-fail ]]; then
+          printf '%s\n' '{"error":{"code":"name_taken","message":"fixture rename failure"}}' >&2
+          exit 6
+        fi
         printf '%s\n' '{"result":{"agent_info":{"name":"renamed"}}}'
         ;;
       wait)
@@ -240,6 +265,13 @@ case "${1:-}" in
         ;;
       explain)
         case "$scenario" in
+          devin-explain-fail)
+            printf '%s\n' '{"error":{"code":"transport_unavailable","message":"fixture explain failure"}}' >&2
+            exit 4
+            ;;
+          devin-explain-garbage)
+            printf '%s\n' 'not json at all'
+            ;;
           devin-wrong-agent)
             printf '%s\n' '{"agent":"codex","matched_rule":{"id":"welcome_prompt_footer","priority":120,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
             ;;
@@ -332,6 +364,10 @@ case "${1:-}" in
     printf '%s\n' '{"result":{"workspaces":[{"workspace_id":"w"}]}}'
     ;;
   pane)
+    if [[ "${2:-}" == run && "$scenario" == devin-run-fail ]]; then
+      printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture pane run failure"}}' >&2
+      exit 5
+    fi
     printf 'fixture pane %s\nACTUAL SCREEN LAST LINE\n' "${3:-unknown}"
     ;;
 esac

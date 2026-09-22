@@ -860,9 +860,43 @@ devin_spawn_diagnostics() {
     warn "Devin pane process-info failed for pane=$PANE"
 }
 
+# `agent wait` does not wait for a pane herdr has not yet detected as an agent:
+# it fails at once with agent_not_found (2026-09-22 16:44, spawn.out of
+# devin-spawn-probe2). Inside the START_TIMEOUT window that code only means "not
+# detected yet", so `agent get` is polled until the pane is detected. Measured
+# on a disposable 3000.11.1 pane: agent_not_found at 0.07s, detected by
+# `agent get` at 0.42s. Any other get failure, or the window running out,
+# fails closed before rename. The attempt cap keeps the loop bounded even
+# when sleep is disabled.
+DEVIN_DETECT_POLL_SECONDS=0.25
+DEVIN_DETECT_POLL_MS=250
+devin_wait_detected() {
+  local started_at="$1" attempts=0 max_attempts get_out get_rc
+  max_attempts=$(( START_TIMEOUT / DEVIN_DETECT_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    set +e
+    get_out="$("$HERDR" agent get "$PANE" 2>&1)"
+    get_rc=$?
+    set -e
+    [[ "$get_rc" -eq 0 ]] && return 0
+    if [[ "$get_out" != *'"code":"agent_not_found"'* ]]; then
+      devin_spawn_diagnostics "agent get exited $get_rc before detection"
+      return 1
+    fi
+    if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= START_TIMEOUT )); then
+      devin_spawn_diagnostics "agent not detected within ${START_TIMEOUT}ms (agent_not_found x$attempts)"
+      return 1
+    fi
+    sleep_for "$DEVIN_DETECT_POLL_SECONDS"
+  done
+}
+
 devin_start_in_pane() {
   local run_rc wait_rc explain_rc parse_rc rename_rc explain_json identity detected_agent matched_rule
+  local started_at remaining_ms
 
+  started_at="$(date +%s)"
   set +e
   "$HERDR" pane run "$PANE" devin "${ARGS[@]}" >/dev/null
   run_rc=$?
@@ -873,11 +907,18 @@ devin_start_in_pane() {
     return "$run_rc"
   fi
 
-  # The 3000.11.1 welcome banner was measured at about 5.3 seconds. Retaining
-  # wrk's existing 30-second START_TIMEOUT gives cold starts ample margin while
-  # keeping ownership/readiness failure bounded.
+  if ! devin_wait_detected "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
+
+  # The 3000.11.1 welcome banner was measured at about 5.3 seconds. Detection
+  # and the idle wait share wrk's existing 30-second START_TIMEOUT window, which
+  # gives cold starts ample margin while keeping readiness failure bounded.
+  # devin_wait_detected returned inside the window, so at least 1000ms remain.
+  remaining_ms=$(( START_TIMEOUT - ($(date +%s) - started_at) * 1000 ))
   set +e
-  "$HERDR" agent wait "$PANE" --until idle --timeout "$START_TIMEOUT" >/dev/null
+  "$HERDR" agent wait "$PANE" --until idle --timeout "$remaining_ms" >/dev/null
   wait_rc=$?
   set -e
   if [[ "$wait_rc" -ne 0 ]]; then
