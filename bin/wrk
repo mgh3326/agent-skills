@@ -915,8 +915,14 @@ devin_start_in_pane() {
   # The 3000.11.1 welcome banner was measured at about 5.3 seconds. Detection
   # and the idle wait share wrk's existing 30-second START_TIMEOUT window, which
   # gives cold starts ample margin while keeping readiness failure bounded.
-  # devin_wait_detected returned inside the window, so at least 1000ms remain.
+  # Detection can land on the window edge; never hand agent wait a zero or
+  # negative timeout (it must not turn into an unbounded or undefined wait).
   remaining_ms=$(( START_TIMEOUT - ($(date +%s) - started_at) * 1000 ))
+  if (( remaining_ms <= 0 )); then
+    devin_spawn_diagnostics "agent detected after the ${START_TIMEOUT}ms window"
+    spawn_pane_cleanup
+    return 1
+  fi
   set +e
   "$HERDR" agent wait "$PANE" --until idle --timeout "$remaining_ms" >/dev/null
   wait_rc=$?

@@ -531,6 +531,34 @@ if grep -q '^agent wait \|^agent explain ' "$TMP/herdr.log"; then
   fail "never-detected Devin waited or explained an undetected pane"
 fi
 
+# Detection on the window edge: a fake clock (only `date +%s` is faked) puts
+# every reading after the first 31s past pane run. Detection succeeds on the
+# first get, but no time is left, so wrk must fail before agent wait instead of
+# handing it a zero or negative timeout.
+mkdir -p "$TMP/fakeclock"
+cat >"$TMP/fakeclock/date" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == +%s ]]; then
+  if [[ -e "$FAKECLOCK_STATE" ]]; then echo 1031; else : >"$FAKECLOCK_STATE"; echo 1000; fi
+  exit 0
+fi
+exec /bin/date "$@"
+SH
+chmod +x "$TMP/fakeclock/date"
+: >"$TMP/herdr.log"
+rm -f "$TMP/fakeclock.state"
+set +e
+devin_edge_out="$(PATH="$TMP/fakeclock:$PATH" FAKECLOCK_STATE="$TMP/fakeclock.state" TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
+devin_edge_rc=$?
+set -e
+[[ "$devin_edge_rc" -eq 1 ]] || fail "window-edge Devin detection expected rc=1, got $devin_edge_rc: $devin_edge_out"
+grep -q 'Devin pane startup failed: agent detected after the 30000ms window' <<<"$devin_edge_out" ||
+  fail "window-edge Devin detection lost its diagnostic: $devin_edge_out"
+if grep -q '^agent wait \|^agent rename \|^agent prompt ' "$TMP/herdr.log"; then
+  fail "window-edge Devin detection waited, renamed or delivered past the window"
+fi
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "window-edge Devin detection leaked its pane"
+
 # SHOULD-1 (first-round tester): a rename failure must record diagnostics for
 # the renamed pane and deliver nothing.
 : >"$TMP/herdr.log"
