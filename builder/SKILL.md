@@ -21,7 +21,9 @@ legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`
 
 1. `spawn-worker`를 먼저 읽고, 그 스킬의 규모 분류·worktree·브리프·착지·회수 규칙을 그대로
    따른다. 브리프 형식도 재사용한다: 작업/AC, worktree·branch, 불변 제약, 완료 증거, 금지사항,
-   파일 인박스 보고 경로, 그리고 모든 지시와 AC의 1:1 대응을 명시한다.
+   파일 인박스 보고 경로, 그리고 모든 지시와 AC의 1:1 대응을 명시한다. 🔴 보고서 경로는 항상
+   worktree 밖이고, 브리프에 "이 경로는 worktree 밖이라 `git status` 에 영향이 없다 — 지우지
+   마라" 를 명시한다(`spawn-worker` §3). 빌더 자신의 보고서도 같은 규칙이다.
 2. `wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE`으로 빌더 job을
    등록한다. builder role은 canonical `builder-*`와 legacy `captain-*` 프로필을 모두 허용하며 parent 레인은 필수다.
    `captain` role 별칭은 deprecation 경고 후 builder로 정규화되고, arbiter의 `job.claim` envelope
