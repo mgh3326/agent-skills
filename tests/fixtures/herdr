@@ -169,8 +169,11 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          devin-idle)
+          devin-idle|devin-wrong-rule|devin-wait-timeout)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          devin-wrong-agent)
+            printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           devin-done)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"done","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
@@ -227,6 +230,28 @@ case "${1:-}" in
         ;;
       rename)
         printf '%s\n' '{"result":{"agent_info":{"name":"renamed"}}}'
+        ;;
+      wait)
+        if [[ "$scenario" == devin-wait-timeout ]]; then
+          printf '%s\n' '{"error":{"code":"timeout","message":"fixture devin welcome timeout"}}' >&2
+          exit 7
+        fi
+        fixture_agent_get_result "${3:-w:p1}" idle
+        ;;
+      explain)
+        case "$scenario" in
+          devin-wrong-agent)
+            printf '%s\n' '{"agent":"codex","matched_rule":{"id":"welcome_prompt_footer","priority":120,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
+            ;;
+          devin-wrong-rule)
+            printf '%s\n' '{"agent":"devin","matched_rule":{"id":"live_prompt_footer","priority":100,"region":"bottom_non_empty_lines(6)","state":"idle"},"state":"idle"}'
+            ;;
+          *)
+            # Real `herdr agent explain <pane> --format json` envelope shape,
+            # sampled from a live Devin 3000.11.1 welcome screen on 2026-09-22.
+            printf '%s\n' '{"agent":"devin","matched_rule":{"id":"welcome_prompt_footer","priority":120,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
+            ;;
+        esac
         ;;
       start|send-keys)
         printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
