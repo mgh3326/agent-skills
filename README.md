@@ -101,10 +101,21 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 `scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
 `agy -p "$(cat PROMPT_FILE)"`이다.
 
-`devin-swe2`는 Devin 프로필이다. `wrk`는 `herdr agent start`에
-`--kind devin -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false`를
-정확히 전달하며, effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로
-`devin-swe2`로 넘기고 pool 결정·기록은 scopefuel 출력과 arbiter가 소유한다.
+`devin-swe2`는 Devin 프로필이다. 현재 `wrk`는
+`herdr pane run <pane_id> devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false`로
+기동하고, 최대 30초 안에 `agent explain --format json`이 `agent=devin`과
+`matched_rule.id=welcome_prompt_footer`를 함께 보고한 뒤에만 그 pane id를 agent 이름으로
+rename한다. effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로 `devin-swe2`로
+넘기고 pool 결정·기록은 scopefuel 출력과 arbiter가 소유한다.
+
+이 분기는 herdr 0.9.1의 `agent start` 소유권 검사가 Devin 3000.11.1에서 실패하는 동안의
+임시 우회다. herdr가 고쳐지면 걷어낸다. 해제 조건은 운영자가 만든 disposable pane에서
+아래 명령이 Devin 3000.11.1을 대상으로 rc=0을 재현하는 것이다(`PANE_ID`는 그 pane id).
+
+```bash
+herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false
+```
+
 빌더 파일럿 기간에는 `builder-devin`(동일 argv)과 `devin-swe2` 모두
 `--role builder`로 쓸 수 있다.
 

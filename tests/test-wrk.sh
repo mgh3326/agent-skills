@@ -412,9 +412,10 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
 
-# Task 201: the devin profile resolves through Herdr's built-in `--kind devin`
-# path — the fixture log is an argv snapshot and no prompt/effort mutation is
-# smuggled into the Devin process. Permission mode is intentionally
+# Task 577: Devin temporarily bypasses Herdr 0.9.1's failing agent-start
+# ownership check. The fixture pins the exact pane-id run -> bounded welcome
+# wait -> explain identity -> pane-id rename sequence, and no prompt/effort
+# mutation is smuggled into the Devin process. Permission mode is intentionally
 # unattended (`--permission-mode dangerous`): accept-edits prompts on every
 # shell command in a pane and stalls (task201). Task 240 later admitted the
 # same profile under --role builder (pilot) without changing this argv.
@@ -424,21 +425,86 @@ grep -q 'model=devin-swe2' <<<"$devin_idle_out"
 grep -q 'status=idle' <<<"$devin_idle_out"
 grep -q 'landed=yes' <<<"$devin_idle_out"
 [[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
-devin_start_line="$(grep '^agent start ' "$TMP/herdr.log")"
-[[ "$devin_start_line" == 'agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
-  fail "devin start argv snapshot mismatch: $devin_start_line"
-[[ " $devin_start_line " != *' -p '* ]] || fail "devin start argv must not contain -p"
-[[ " $devin_start_line " != *' --dangerously-skip-permissions '* ]] || fail "devin start argv must not contain Claude-only --dangerously-skip-permissions"
-[[ " $devin_start_line " != *' --effort '* ]] || fail "devin start argv must not contain effort"
+devin_run_line="$(grep '^pane run ' "$TMP/herdr.log")"
+[[ "$devin_run_line" == 'pane run w:p1 devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
+  fail "devin pane-run argv snapshot mismatch: $devin_run_line"
+grep -qx 'agent wait w:p1 --until idle --timeout 30000' "$TMP/herdr.log" ||
+  fail "devin welcome wait argv drifted"
+grep -qx 'agent explain w:p1 --format json' "$TMP/herdr.log" ||
+  fail "devin explain argv drifted"
+grep -qx 'agent rename w:p1 fixture' "$TMP/herdr.log" ||
+  fail "devin rename must target tab-create pane id, never a name lookup"
+if grep -q '^agent start .*--kind devin' "$TMP/herdr.log"; then
+  fail "devin workaround must not call agent start"
+fi
+devin_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+devin_wait_no="$(grep -n '^agent wait ' "$TMP/herdr.log" | cut -d: -f1)"
+devin_explain_no="$(grep -n '^agent explain ' "$TMP/herdr.log" | cut -d: -f1)"
+devin_rename_no="$(grep -n '^agent rename ' "$TMP/herdr.log" | cut -d: -f1)"
+devin_prompt_no="$(grep -n '^agent prompt .*fixture prompt' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"
+(( devin_run_no < devin_wait_no && devin_wait_no < devin_explain_no &&
+   devin_explain_no < devin_rename_no && devin_rename_no < devin_prompt_no )) ||
+  fail "devin startup order must be run < wait < explain < rename < brief"
+[[ " $devin_run_line " != *' -p '* ]] || fail "devin run argv must not contain -p"
+[[ " $devin_run_line " != *' --dangerously-skip-permissions '* ]] || fail "devin run argv must not contain Claude-only --dangerously-skip-permissions"
+[[ " $devin_run_line " != *' --effort '* ]] || fail "devin run argv must not contain effort"
 # Pin README's documented argv to the live snapshot. Read README; do not
 # hardcode a second expected string (that would just grow the drift surface).
 # shellcheck disable=SC2016  # the backtick is literal markdown, not a substitution
-readme_devin_argv="$(sed -n 's/.*`--kind devin -- \(--model swe-2 .* --respect-workspace-trust false\)`.*/\1/p' "$ROOT/README.md")"
+readme_devin_argv="$(sed -n 's/.*`herdr pane run <pane_id> devin \(--model swe-2 .* --respect-workspace-trust false\)`.*/\1/p' "$ROOT/README.md")"
 [[ -n "$readme_devin_argv" && "$(grep -c . <<<"$readme_devin_argv")" -eq 1 ]] ||
   fail "README.md has no unique documented devin argv to pin against the snapshot"
-devin_snapshot_argv="${devin_start_line##* -- }"
+devin_snapshot_argv="${devin_run_line#pane run w:p1 devin }"
 [[ "$readme_devin_argv" == "$devin_snapshot_argv" ]] ||
   fail "README.md argv drifted from wrk snapshot: readme='$readme_devin_argv' snapshot='$devin_snapshot_argv'"
+
+# Mutants for the ownership substitute: skipping the bounded wait/explain,
+# accepting another detected agent/rule, or renaming after timeout must all be
+# red. Every failure records process-info and lets the existing pane cleanup run.
+devin_readiness_failure_case() {
+  local scenario="$1" want_rc="$2" out rc
+  : >"$TMP/herdr.log"
+  set +e
+  out="$(TEST_FIXTURE_SCENARIO="$scenario" spawn_base devin-swe2 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq "$want_rc" ]] ||
+    fail "$scenario expected rc=$want_rc, got rc=$rc: $out"
+  grep -qx 'pane run w:p1 devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' "$TMP/herdr.log" ||
+    fail "$scenario did not use the created pane id"
+  if grep -q '^agent rename ' "$TMP/herdr.log"; then
+    fail "$scenario renamed an unowned/unready pane"
+  fi
+  if grep -q '^agent prompt ' "$TMP/herdr.log"; then
+    fail "$scenario delivered a brief before ownership/readiness"
+  fi
+  grep -qx 'pane process-info --pane w:p1' "$TMP/herdr.log" ||
+    fail "$scenario omitted failure process diagnostics"
+  grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+    fail "$scenario leaked the failed pane"
+}
+devin_readiness_failure_case devin-wait-timeout 7
+devin_readiness_failure_case devin-wrong-agent 1
+devin_readiness_failure_case devin-wrong-rule 1
+
+# The devin branch remains behind the unchanged gate. A refusal preserves the
+# gate rc and reaches neither tab creation nor pane run.
+rm -f "$TMP/herdr.log"
+set +e
+devin_gate_out="$(WRK_GATE_MODE=3 spawn_base devin-swe2 2>&1)"
+devin_gate_rc=$?
+set -e
+[[ "$devin_gate_rc" -eq 3 ]] ||
+  fail "devin gate refusal rc drifted (rc=$devin_gate_rc): $devin_gate_out"
+[[ ! -e "$TMP/herdr.log" ]] || fail "devin gate refusal reached Herdr"
+
+# Every other kind keeps the generic `agent start` path exactly.
+: >"$TMP/herdr.log"
+spawn_base codex-terra >/dev/null
+grep -qx 'agent start fixture --kind codex --pane w:p1 --timeout 120000 -- --yolo -m gpt-5.6-terra -c model_reasoning_effort=medium' "$TMP/herdr.log" ||
+  fail "non-Devin agent-start path drifted"
+if grep -q '^pane run ' "$TMP/herdr.log"; then fail "non-Devin kind reached pane run"; fi
+
 expect_exit 2 spawn_base devin-swe2 --effort high
 # Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker
 # spelling is now admitted under --role builder too — this acceptance replaces
@@ -467,11 +533,11 @@ for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepse
     fail "$devin_profile spawn output lost its model: $devin_variant_out"
   grep -q 'status=idle' <<<"$devin_variant_out" ||
     fail "$devin_profile did not reach idle landing: $devin_variant_out"
-  devin_variant_start="$(grep '^agent start ' "$TMP/herdr.log")"
-  [[ "$devin_variant_start" == "agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model $devin_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
-    fail "$devin_profile start argv snapshot mismatch: $devin_variant_start"
-  [[ " $devin_variant_start " != *' --effort '* ]] ||
-    fail "$devin_profile start argv must not contain effort"
+  devin_variant_run="$(grep '^pane run ' "$TMP/herdr.log")"
+  [[ "$devin_variant_run" == "pane run w:p1 devin --model $devin_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
+    fail "$devin_profile run argv snapshot mismatch: $devin_variant_run"
+  [[ " $devin_variant_run " != *' --effort '* ]] ||
+    fail "$devin_profile run argv must not contain effort"
   expect_exit 2 spawn_base "$devin_profile" --effort high
 done
 echo "PASS devin-glm52/devin-swe17/devin-ds41 worker kind/argv/no-effort snapshots"
@@ -1147,6 +1213,40 @@ spawned = next(event for event in events if event["kind"] == "job.spawned")
 assert spawned["payload"]["profile"] == "devin-swe2", spawned
 PY
 echo "PASS devin-swe2 scopefuel-gate-to-arbiter-pool-and-spawn-receipt"
+
+# Task 577 failure cleanup: a bounded welcome timeout occurs after the Devin
+# quota record and pane exist. It must emit process diagnostics, close that
+# pane, and release this job's arbiter record without touching another Devin
+# job's record.
+rm -f "$TMP/herdr.log"
+set +e
+devin_timeout_out="$(TEST_FIXTURE_SCENARIO=devin-wait-timeout spawn_base devin-swe2 --job arb-devin-timeout --t T2 2>&1)"
+devin_timeout_rc=$?
+set -e
+[[ "$devin_timeout_rc" -eq 7 ]] ||
+  fail "arbiter-backed Devin timeout expected rc=7, got $devin_timeout_rc: $devin_timeout_out"
+grep -q 'Devin pane startup failed: welcome_prompt_footer wait exited 7' <<<"$devin_timeout_out" ||
+  fail "Devin timeout lost its readiness diagnostic"
+grep -qx 'pane process-info --pane w:p1' "$TMP/herdr.log" ||
+  fail "Devin timeout omitted process-info"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+  fail "Devin timeout leaked its pane"
+arb status --job arb-devin-timeout --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["quota_pool_records"] == [], d
+'
+python3 - "$ARBITER_INBOX_ROOT/arb-devin-timeout/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
+assert any(event.get("kind") == "quota_pool.release" for event in events), events
+PY
+arb status --job arb-devin --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert len(d["quota_pool_records"]) == 1 and d["quota_pool_records"][0]["job_id"] == "arb-devin", d
+'
+echo "PASS task577 Devin timeout closes pane and releases only its arbiter record"
 
 # Task 281: the new devin model variants share scopefuel's single `devin` pool
 # — the gate call uses the only devin spelling installed scopefuel accepts
@@ -1847,10 +1947,10 @@ set -e
   fail "builder-devin must be admitted under --role builder (rc=$builder_devin_rc): $builder_devin_out"
 grep -q 'model=builder-devin' <<<"$builder_devin_out" ||
   fail "builder-devin spawn output lost its model: $builder_devin_out"
-builder_devin_start="$(grep '^agent start ' "$TMP/herdr.log")"
-[[ "$builder_devin_start" == 'agent start fixture --kind devin --pane w:p1 --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
-  fail "builder-devin must reuse the devin-swe2 worker argv verbatim: $builder_devin_start"
-[[ " $builder_devin_start " != *' --effort '* ]] || fail "builder-devin must not gain an effort flag"
+builder_devin_run="$(grep '^pane run ' "$TMP/herdr.log")"
+[[ "$builder_devin_run" == 'pane run w:p1 devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
+  fail "builder-devin must reuse the devin-swe2 worker argv verbatim: $builder_devin_run"
+[[ " $builder_devin_run " != *' --effort '* ]] || fail "builder-devin must not gain an effort flag"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "devin-swe2" ]] ||
   fail "builder-devin must gate as the scopefuel-known devin-swe2 spelling"
 python3 - "$ARBITER_INBOX_ROOT/builder-devin-job/events/00001-job.claim.json" <<'PY'
