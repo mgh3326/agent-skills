@@ -428,8 +428,15 @@ grep -q 'landed=yes' <<<"$devin_idle_out"
 devin_run_line="$(grep '^pane run ' "$TMP/herdr.log")"
 [[ "$devin_run_line" == 'pane run w:p1 devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
   fail "devin pane-run argv snapshot mismatch: $devin_run_line"
-grep -qx 'agent wait w:p1 --until idle --timeout 30000' "$TMP/herdr.log" ||
-  fail "devin welcome wait argv drifted"
+# Detection and the idle wait share one 30s window, so the wait gets what is
+# left of it (whole seconds; never more than 30000ms).
+devin_wait_line="$(grep '^agent wait ' "$TMP/herdr.log")"
+if ! [[ "$devin_wait_line" =~ ^agent\ wait\ w:p1\ --until\ idle\ --timeout\ ([0-9]+)$ ]] ||
+   (( BASH_REMATCH[1] < 29000 || BASH_REMATCH[1] > 30000 )); then
+  fail "devin welcome wait argv drifted: $devin_wait_line"
+fi
+grep -qx 'agent get w:p1' "$TMP/herdr.log" ||
+  fail "devin detection poll must query the tab-create pane id"
 grep -qx 'agent explain w:p1 --format json' "$TMP/herdr.log" ||
   fail "devin explain argv drifted"
 grep -qx 'agent rename w:p1 fixture' "$TMP/herdr.log" ||
@@ -438,6 +445,8 @@ if grep -q '^agent start .*--kind devin' "$TMP/herdr.log"; then
   fail "devin workaround must not call agent start"
 fi
 devin_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+devin_get_no="$(grep -n '^agent get ' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"
+(( devin_run_no < devin_get_no )) || fail "devin detection poll must follow pane run"
 devin_wait_no="$(grep -n '^agent wait ' "$TMP/herdr.log" | cut -d: -f1)"
 devin_explain_no="$(grep -n '^agent explain ' "$TMP/herdr.log" | cut -d: -f1)"
 devin_rename_no="$(grep -n '^agent rename ' "$TMP/herdr.log" | cut -d: -f1)"
@@ -457,6 +466,24 @@ readme_devin_argv="$(sed -n 's/.*`herdr pane run <pane_id> devin \(--model swe-2
 devin_snapshot_argv="${devin_run_line#pane run w:p1 devin }"
 [[ "$readme_devin_argv" == "$devin_snapshot_argv" ]] ||
   fail "README.md argv drifted from wrk snapshot: readme='$readme_devin_argv' snapshot='$devin_snapshot_argv'"
+
+# Task 577 FIX: right after `pane run` herdr has not yet detected the pane, so
+# agent get/wait/explain answer agent_not_found (16:44 probe2). Inside the
+# window that is "not detected yet": poll `agent get` on the created pane id,
+# and only after detection wait for idle, check identity and rename. Reverting
+# agent_not_found to an immediate failure turns this case red.
+: >"$TMP/herdr.log"
+devin_late_out="$(TEST_FIXTURE_SCENARIO=devin-late-detect spawn_base devin-swe2 2>&1)" ||
+  fail "Devin detected on the fourth poll must still spawn: $devin_late_out"
+grep -q 'landed=yes' <<<"$devin_late_out" || fail "late-detected Devin did not land: $devin_late_out"
+devin_late_first_wait="$(grep -n '^agent wait ' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"
+[[ "$(head -n "$devin_late_first_wait" "$TMP/herdr.log" | grep -c '^agent get w:p1$')" -eq 4 ]] ||
+  fail "late-detected Devin must poll get until detection before waiting"
+grep -qx 'agent rename w:p1 fixture' "$TMP/herdr.log" ||
+  fail "late-detected Devin must rename the tab-create pane id"
+[[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "late-detected Devin must receive exactly one brief"
+if grep -q '^pane close ' "$TMP/herdr.log"; then fail "late-detected Devin pane was closed"; fi
 
 # Mutants for the ownership substitute: skipping the bounded wait/explain,
 # accepting another detected agent/rule, or renaming after timeout must all be
@@ -482,10 +509,97 @@ devin_readiness_failure_case() {
     fail "$scenario omitted failure process diagnostics"
   grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
     fail "$scenario leaked the failed pane"
+  DEVIN_CASE_OUT="$out"
 }
 devin_readiness_failure_case devin-wait-timeout 7
 devin_readiness_failure_case devin-wrong-agent 1
 devin_readiness_failure_case devin-wrong-rule 1
+# Task 577 SHOULD (first-round tester): every remaining diagnostic branch is
+# pinned by its own fixture failure.
+devin_readiness_failure_case devin-run-fail 5
+devin_readiness_failure_case devin-get-error 1
+grep -q 'agent get exited 1 before detection' <<<"$DEVIN_CASE_OUT" ||
+  fail "non-agent_not_found get error lost its diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent get w:p1$' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "non-agent_not_found get error must fail on the first get, not be retried"
+devin_readiness_failure_case devin-explain-fail 4
+devin_readiness_failure_case devin-explain-garbage 1
+grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
+  fail "malformed explain JSON lost its diagnostic: $DEVIN_CASE_OUT"
+devin_readiness_failure_case devin-never-detect 1
+grep -q "Devin pane startup failed: agent not detected within 30000ms (agent_not_found x120)" <<<"$DEVIN_CASE_OUT" ||
+  fail "never-detected Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent get w:p1$' "$TMP/herdr.log")" -eq 120 ]] ||
+  fail "never-detected Devin must poll exactly the 30000/250 attempt cap"
+if grep -q '^agent wait \|^agent explain ' "$TMP/herdr.log"; then
+  fail "never-detected Devin waited or explained an undetected pane"
+fi
+
+# Detection on the window edge: a fake clock (only `date +%s` is faked) puts
+# every reading after the first 31s past pane run. Detection succeeds on the
+# first get, but no time is left, so wrk must fail before agent wait instead of
+# handing it a zero or negative timeout.
+mkdir -p "$TMP/fakeclock"
+cat >"$TMP/fakeclock/date" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == +%s ]]; then
+  if [[ -e "$FAKECLOCK_STATE" ]]; then echo 1031; else : >"$FAKECLOCK_STATE"; echo 1000; fi
+  exit 0
+fi
+exec /bin/date "$@"
+SH
+chmod +x "$TMP/fakeclock/date"
+: >"$TMP/herdr.log"
+rm -f "$TMP/fakeclock.state"
+set +e
+devin_edge_out="$(PATH="$TMP/fakeclock:$PATH" FAKECLOCK_STATE="$TMP/fakeclock.state" TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
+devin_edge_rc=$?
+set -e
+[[ "$devin_edge_rc" -eq 1 ]] || fail "window-edge Devin detection expected rc=1, got $devin_edge_rc: $devin_edge_out"
+grep -q 'Devin pane startup failed: agent detected after the 30000ms window' <<<"$devin_edge_out" ||
+  fail "window-edge Devin detection lost its diagnostic: $devin_edge_out"
+if grep -q '^agent wait \|^agent rename \|^agent prompt ' "$TMP/herdr.log"; then
+  fail "window-edge Devin detection waited, renamed or delivered past the window"
+fi
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "window-edge Devin detection leaked its pane"
+
+# The wall clock, not the attempt cap, is what bounds the window in
+# production (verify1 E1: 97 gets in 30s). With the same fake clock, the first
+# agent_not_found is already past the window: wrk must stop after that one get,
+# long before the 120-attempt cap, and never wait or rename.
+: >"$TMP/herdr.log"
+rm -f "$TMP/fakeclock.state"
+set +e
+devin_clock_out="$(PATH="$TMP/fakeclock:$PATH" FAKECLOCK_STATE="$TMP/fakeclock.state" TEST_FIXTURE_SCENARIO=devin-never-detect spawn_base devin-swe2 2>&1)"
+devin_clock_rc=$?
+set -e
+[[ "$devin_clock_rc" -eq 1 ]] || fail "wall-clock-bounded Devin detection expected rc=1, got $devin_clock_rc: $devin_clock_out"
+grep -q 'agent not detected within 30000ms (agent_not_found x1)' <<<"$devin_clock_out" ||
+  fail "wall-clock bound did not stop the detection poll: $devin_clock_out"
+[[ "$(grep -c '^agent get w:p1$' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "wall-clock bound must stop polling at the first get past the window"
+if grep -q '^agent wait \|^agent rename \|^agent prompt ' "$TMP/herdr.log"; then
+  fail "wall-clock-bounded Devin detection waited, renamed or delivered"
+fi
+
+# SHOULD-1 (first-round tester): a rename failure must record diagnostics for
+# the renamed pane and deliver nothing.
+: >"$TMP/herdr.log"
+set +e
+devin_rename_out="$(TEST_FIXTURE_SCENARIO=devin-rename-fail spawn_base devin-swe2 2>&1)"
+devin_rename_rc=$?
+set -e
+[[ "$devin_rename_rc" -eq 6 ]] || fail "devin rename failure expected rc=6, got $devin_rename_rc: $devin_rename_out"
+grep -q 'Devin pane startup failed: agent rename exited 6; pane=w:p1' <<<"$devin_rename_out" ||
+  fail "devin rename failure lost its diagnostic: $devin_rename_out"
+devin_rename_no="$(grep -n '^agent rename w:p1 fixture$' "$TMP/herdr.log" | cut -d: -f1)"
+devin_info_no="$(grep -n '^pane process-info --pane w:p1$' "$TMP/herdr.log" | cut -d: -f1)"
+if [[ -z "$devin_rename_no" || -z "$devin_info_no" ]] || (( devin_rename_no > devin_info_no )); then
+  fail "devin rename failure must record process-info after the failed rename"
+fi
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "devin rename failure leaked its pane"
+if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "devin rename failure delivered a brief"; fi
+echo "PASS task577 Devin detection poll, bounded window and failure diagnostics"
 
 # The devin branch remains behind the unchanged gate. A refusal preserves the
 # gate rc and reaches neither tab creation nor pane run.
@@ -1247,6 +1361,29 @@ d = json.load(sys.stdin)
 assert len(d["quota_pool_records"]) == 1 and d["quota_pool_records"][0]["job_id"] == "arb-devin", d
 '
 echo "PASS task577 Devin timeout closes pane and releases only its arbiter record"
+
+# Task 577 FIX: a pane never detected inside the window fails the same way —
+# no rename, pane closed, only this job's arbiter record released.
+rm -f "$TMP/herdr.log"
+set +e
+devin_undetected_out="$(TEST_FIXTURE_SCENARIO=devin-never-detect spawn_base devin-swe2 --job arb-devin-undetected --t T2 2>&1)"
+devin_undetected_rc=$?
+set -e
+[[ "$devin_undetected_rc" -eq 1 ]] ||
+  fail "arbiter-backed undetected Devin expected rc=1, got $devin_undetected_rc: $devin_undetected_out"
+if grep -q '^agent rename ' "$TMP/herdr.log"; then fail "undetected Devin was renamed"; fi
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "undetected Devin leaked its pane"
+arb status --job arb-devin-undetected --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["quota_pool_records"] == [], d
+'
+arb status --job arb-devin --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert len(d["quota_pool_records"]) == 1 and d["quota_pool_records"][0]["job_id"] == "arb-devin", d
+'
+echo "PASS task577 undetected Devin closes pane and releases only its arbiter record"
 
 # Task 281: the new devin model variants share scopefuel's single `devin` pool
 # — the gate call uses the only devin spelling installed scopefuel accepts

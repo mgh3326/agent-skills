@@ -103,7 +103,10 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 
 `devin-swe2`는 Devin 프로필이다. 현재 `wrk`는
 `herdr pane run <pane_id> devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false`로
-기동하고, 최대 30초 안에 `agent explain --format json`이 `agent=devin`과
+기동하고, 최대 30초 창 안에서 herdr가 그 pane을 agent로 검출할 때까지 `agent get`을
+0.25초 간격으로 재조회한다(`pane run` 직후의 `agent_not_found`는 "아직 검출 전"이다;
+실측 검출 0.42초). 검출 뒤 같은 창의 남은 시간 안에 idle을 기다리고,
+`agent explain --format json`이 `agent=devin`과
 `matched_rule.id=welcome_prompt_footer`를 함께 보고한 뒤에만 그 pane id를 agent 이름으로
 rename한다. effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로 `devin-swe2`로
 넘기고 pool 결정·기록은 scopefuel 출력과 arbiter가 소유한다.
