@@ -518,6 +518,10 @@ devin_readiness_failure_case devin-wrong-rule 1
 # pinned by its own fixture failure.
 devin_readiness_failure_case devin-run-fail 5
 devin_readiness_failure_case devin-get-error 1
+grep -q 'agent get exited 1 before detection' <<<"$DEVIN_CASE_OUT" ||
+  fail "non-agent_not_found get error lost its diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent get w:p1$' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "non-agent_not_found get error must fail on the first get, not be retried"
 devin_readiness_failure_case devin-explain-fail 4
 devin_readiness_failure_case devin-explain-garbage 1
 grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
@@ -558,6 +562,25 @@ if grep -q '^agent wait \|^agent rename \|^agent prompt ' "$TMP/herdr.log"; then
   fail "window-edge Devin detection waited, renamed or delivered past the window"
 fi
 grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "window-edge Devin detection leaked its pane"
+
+# The wall clock, not the attempt cap, is what bounds the window in
+# production (verify1 E1: 97 gets in 30s). With the same fake clock, the first
+# agent_not_found is already past the window: wrk must stop after that one get,
+# long before the 120-attempt cap, and never wait or rename.
+: >"$TMP/herdr.log"
+rm -f "$TMP/fakeclock.state"
+set +e
+devin_clock_out="$(PATH="$TMP/fakeclock:$PATH" FAKECLOCK_STATE="$TMP/fakeclock.state" TEST_FIXTURE_SCENARIO=devin-never-detect spawn_base devin-swe2 2>&1)"
+devin_clock_rc=$?
+set -e
+[[ "$devin_clock_rc" -eq 1 ]] || fail "wall-clock-bounded Devin detection expected rc=1, got $devin_clock_rc: $devin_clock_out"
+grep -q 'agent not detected within 30000ms (agent_not_found x1)' <<<"$devin_clock_out" ||
+  fail "wall-clock bound did not stop the detection poll: $devin_clock_out"
+[[ "$(grep -c '^agent get w:p1$' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "wall-clock bound must stop polling at the first get past the window"
+if grep -q '^agent wait \|^agent rename \|^agent prompt ' "$TMP/herdr.log"; then
+  fail "wall-clock-bounded Devin detection waited, renamed or delivered"
+fi
 
 # SHOULD-1 (first-round tester): a rename failure must record diagnostics for
 # the renamed pane and deliver nothing.
