@@ -25,5 +25,17 @@ if [[ "$remote" == *mktemp* ]]; then
   printf '%s\n' "/tmp/${host}-brief.md"
   exit 0
 fi
+# Remote worktree preparation arrives as "VAR=<remote-path> ... sh -s" with the
+# script on stdin.  With WRK_FAKE_REMOTE set, replay it against a local fake
+# root so tests exercise real git worktree semantics without touching a host.
+if [[ "$remote" == *'sh -s'* ]]; then
+  [[ -n "${WRK_FAKE_REMOTE:-}" ]] || { echo "fixture: sh -s without WRK_FAKE_REMOTE" >&2; exit 3; }
+  eval "${remote% sh -s*}"
+  [[ -z "${BASE:-}" ]] || BASE="${WRK_FAKE_REMOTE}${BASE}"
+  [[ -z "${TARGET:-}" ]] || TARGET="${WRK_FAKE_REMOTE}${TARGET}"
+  script="$(cat)"
+  env BASE="${BASE:-}" TARGET="${TARGET:-}" BRANCH="${BRANCH:-}" SHA="${SHA:-}" bash -c "$script"
+  exit $?
+fi
 if [[ "$host" == desktop && "${WRK_SSH_SCENARIO:-ok}" == desktop-spawn-fails ]]; then exit 42; fi
 printf '%s\n' "OK pane=${host}:p7 host=local model=codex-terra label=fixture status=working landed=yes"
