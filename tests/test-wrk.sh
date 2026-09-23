@@ -878,15 +878,15 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
 spawn_base kimi-k3 >/dev/null
 grep -q -- '--kind kimi' "$TMP/herdr.log"
 grep -q -- '--auto' "$TMP/herdr.log"
-grep -q -- '-m kimi-for-coding/k3' "$TMP/herdr.log"
+grep -q -- '-m kimi-code/k3' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base kimi-k27 >/dev/null
 grep -q -- '--kind kimi' "$TMP/herdr.log"
-grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
+grep -q -- '-m kimi-code/kimi-for-coding' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base kimi-k27-code >/dev/null
 grep -q -- '--kind kimi' "$TMP/herdr.log"
-grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
+grep -q -- '-m kimi-code/kimi-for-coding' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3 -p "$PROMPT" -w w -l fixture --effort high
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
@@ -924,7 +924,7 @@ echo "PASS kimi-trust-canonical-filename"
 spawn_base kimi-k3-low >/dev/null
 grep -q -- '--kind kimi' "$TMP/herdr.log"
 grep -q -- '--auto' "$TMP/herdr.log"
-grep -q -- '-m kimi-for-coding/k3' "$TMP/herdr.log"
+grep -q -- '-m kimi-code/k3' "$TMP/herdr.log"
 grep -q -- '--env KIMI_CODE_HOME=' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3-low -p "$PROMPT" -w w -l fixture --effort high
@@ -937,6 +937,41 @@ if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
 : >"$TMP/herdr.log"
 spawn_base kimi-k27-code >/dev/null
 if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
+
+# Task 612: kimi-clone-home must carry kimi-code/ namespace config into the clone
+# byte-identically (a fresh kimi 2.0.2 install — e.g. desktop — has only
+# `kimi-code/*` model entries, and the clone is what kimi-k3-low runs against).
+CLONE_SRC="$TMP/kimi-src-home"
+CLONE_DEST="$TMP/kimi-low-home"
+mkdir -p "$CLONE_SRC"
+cat >"$CLONE_SRC/config.toml" <<'EOF'
+default_model = "kimi-code/k3"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+model = "kimi-for-coding"
+
+[thinking]
+effort = "high"
+EOF
+printf 'fixture-device-id\n' >"$CLONE_SRC/device_id"
+env KIMI_CODE_SRC="$CLONE_SRC" KIMI_CODE_LOW_HOME="$CLONE_DEST" \
+  "$ROOT/bin/kimi-clone-home" >/dev/null
+grep -q 'default_model = "kimi-code/k3"' "$CLONE_DEST/config.toml"
+grep -q 'models."kimi-code/k3"' "$CLONE_DEST/config.toml"
+grep -q 'models."kimi-code/kimi-for-coding"' "$CLONE_DEST/config.toml"
+grep -q 'effort = "low"' "$CLONE_DEST/config.toml"
+# The clone rewrite must not touch the source home.
+grep -q 'effort = "high"' "$CLONE_SRC/config.toml"
+echo "PASS kimi-clone-home copies kimi-code/ namespace entries verbatim"
 
 # ROB-1191 ⑥: Claude opus/sonnet effort wiring via CLI argv (settings.json never written).
 SETTINGS_PATH="${HOME}/.claude/settings.json"
@@ -2436,7 +2471,7 @@ set -e
 grep -q 'model=builder-kimi' <<<"$builder_kimi_out" ||
   fail "builder-kimi spawn output lost its model: $builder_kimi_out"
 builder_kimi_start="$(grep '^agent start ' "$TMP/herdr.log")"
-[[ "$builder_kimi_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-for-coding/k3' ]] ||
+[[ "$builder_kimi_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-code/k3' ]] ||
   fail "builder-kimi must reuse the kimi-k3 worker argv verbatim: $builder_kimi_start"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "kimi-k3" ]] ||
   fail "builder-kimi must gate as the scopefuel-known kimi-k3 spelling"
