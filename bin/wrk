@@ -2462,38 +2462,54 @@ spillover_hosts() {
   done <"$config"
 }
 
-spillover_cwd_map() {
-  local host="$1" cwd="$2" raw mapped
-  raw="$(spillover_value "hosts.$host" cwd_map 2>/dev/null || true)"
-  [[ -n "$raw" ]] || return 1
-  mapped="$(python3 - "$cwd" "$raw" <<'PY'
+# cwd_map and cwd_keys share one matcher.  A cwd equal to a key maps to the
+# value; a sibling-worktree cwd <key>.<suffix> (suffix is [A-Za-z0-9._-]+) maps
+# to <value>.<suffix>; a subpath cwd <key>/<rest> maps to <value>/<rest>.  A
+# boundary-less prefix such as <key>foo never matches, and the longest
+# matching key wins so nested keys stay reachable.
+spillover_prefix_lookup() {
+  python3 - "$1" "$2" <<'PY'
 import re, sys
 cwd, raw = sys.argv[1:]
+def unq(s):
+    return s.replace(r'\"', '"').replace(r'\\', '\\')
+best = None
 for local, remote in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw):
-    if local.replace(r'\\"', '"').replace(r'\\\\', '\\') == cwd:
-        print(remote.replace(r'\\"', '"').replace(r'\\\\', '\\'))
-        break
+    local, remote = unq(local), unq(remote)
+    if cwd == local:
+        kind, mapped = "exact", remote
+    elif cwd.startswith(local + ".") and re.fullmatch(r"[A-Za-z0-9._-]+", cwd[len(local) + 1:]):
+        kind, mapped = "suffix", remote + cwd[len(local):]
+    elif cwd.startswith(local + "/"):
+        kind, mapped = "subpath", remote + cwd[len(local):]
+    else:
+        continue
+    if best is None or len(local) > best[0]:
+        best = (len(local), kind, remote, mapped)
+if best:
+    print("\t".join(best[1:]))
 PY
-)"
-  [[ -n "$mapped" ]] || return 1
-  printf '%s' "$mapped"
+}
+
+# Sets SPILL_CWD_KIND (exact|suffix|subpath), SPILL_CWD_BASE (the matched
+# key's remote value) and SPILL_CWD_REMOTE (the derived remote path).
+spillover_cwd_map() {
+  local host="$1" cwd="$2" raw parsed
+  SPILL_CWD_KIND="" SPILL_CWD_BASE="" SPILL_CWD_REMOTE=""
+  raw="$(spillover_value "hosts.$host" cwd_map 2>/dev/null || true)"
+  [[ -n "$raw" ]] || return 1
+  parsed="$(spillover_prefix_lookup "$cwd" "$raw")"
+  [[ -n "$parsed" ]] || return 1
+  IFS=$'\t' read -r SPILL_CWD_KIND SPILL_CWD_BASE SPILL_CWD_REMOTE <<<"$parsed"
 }
 
 spillover_cwd_key() {
-  local host="$1" cwd="$2" raw mapped
+  local host="$1" cwd="$2" raw parsed
   raw="$(spillover_value "hosts.$host" cwd_keys 2>/dev/null || true)"
   [[ -n "$raw" ]] || return 1
-  mapped="$(python3 - "$cwd" "$raw" <<'PY'
-import re, sys
-cwd, raw = sys.argv[1:]
-for local, key in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw):
-    if local.replace(r'\\"', '"').replace(r'\\\\', '\\') == cwd:
-        print(key.replace(r'\\"', '"').replace(r'\\\\', '\\'))
-        break
-PY
-)"
-  [[ -n "$mapped" ]] || return 1
-  printf '%s' "$mapped"
+  parsed="$(spillover_prefix_lookup "$cwd" "$raw")"
+  [[ -n "$parsed" ]] || return 1
+  printf '%s' "${parsed##*$'\t'}"
 }
 
 spillover_host_via() {
@@ -3013,16 +3029,137 @@ spillover_emit_host() {
   awk -v host="$host" '/^OK pane=/ { sub(/ host=[^ ]+/, ""); sub(/^OK pane=[^ ]+/, "& host=" host) } { print }' "$file"
 }
 
+# Creates the derived remote worktree on the selected host.  Local-only
+# branches and commits that origin does not have are terminal: the remote
+# side can only check out what its own origin fetch can see, so spawning
+# anyway would silently run different code.
+spillover_remote_worktree_create() {
+  local host="$1" ssh_name="$2" cwd="$3" remote_cwd="$4" remote_base="$5" branch="$6" sha="$7"
+  if [[ -n "$branch" ]]; then
+    if ! git -C "$cwd" rev-parse --verify --quiet "refs/remotes/origin/$branch" >/dev/null; then
+      echo "wrk: local branch '$branch' is not pushed to origin; push it before spawning on '$host'" >&2
+      return 2
+    fi
+    if [[ "$(git -C "$cwd" rev-parse "origin/$branch")" != "$sha" ]]; then
+      echo "wrk: local HEAD of '$branch' differs from origin/$branch; push or pull before spawning on '$host'" >&2
+      return 2
+    fi
+  elif ! git -C "$cwd" branch -r --contains "$sha" 2>/dev/null | grep -q 'origin/'; then
+    echo "wrk: detached HEAD $sha of '$cwd' is not reachable from origin; push it before spawning on '$host'" >&2
+    return 2
+  fi
+  local out rc
+  set +e
+  out="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" \
+    "BASE=$(printf '%q' "$remote_base") TARGET=$(printf '%q' "$remote_cwd") BRANCH=$(printf '%q' "$branch") SHA=$(printf '%q' "$sha") sh -s" <<'PREP' 2>&1
+git -C "$BASE" rev-parse --git-dir >/dev/null 2>&1 || { echo "no git repo at $BASE" >&2; exit 3; }
+if [ -n "$BRANCH" ]; then
+  git -C "$BASE" fetch origin "$BRANCH" || exit 4
+  if git -C "$BASE" show-ref --verify --quiet "refs/heads/$BRANCH"; then
+    cur=$(git -C "$BASE" rev-parse "refs/heads/$BRANCH")
+    [ "$cur" = "$SHA" ] || { echo "remote branch $BRANCH is at $cur" >&2; exit 5; }
+    git -C "$BASE" worktree add "$TARGET" "$BRANCH" || exit 6
+  else
+    git -C "$BASE" worktree add -b "$BRANCH" "$TARGET" "origin/$BRANCH" || exit 6
+  fi
+else
+  git -C "$BASE" fetch origin || exit 4
+  git -C "$BASE" worktree add --detach "$TARGET" "$SHA" || exit 6
+fi
+s=$(git -C "$TARGET" rev-parse HEAD 2>/dev/null) || { git -C "$BASE" worktree remove --force "$TARGET" 2>/dev/null; exit 7; }
+[ "$s" = "$SHA" ] || { git -C "$BASE" worktree remove --force "$TARGET"; echo "created worktree HEAD $s" >&2; exit 8; }
+PREP
+)"
+  rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    3) echo "wrk: remote repo '$remote_base' on '$host' is missing or not a git repo; create it first" >&2 ;;
+    *) echo "wrk: remote worktree preparation failed on '$host' (rc=$rc): $(tail -n 1 <<<"$out")" >&2 ;;
+  esac
+  return 2
+}
+
+# A derived remote path (sibling-worktree or subpath mapping) must name the
+# same commit as the local cwd before the spawn is delegated.  Missing
+# worktrees are created remotely; an existing directory whose branch or HEAD
+# disagrees is terminal — never overwrite or force a remote checkout.  Exact
+# repo-root mappings keep the historical pass-through contract.
+spillover_remote_prepare() {
+  local host="$1" ssh_name="$2" cwd="$3" remote_cwd="$4" remote_base="$5" kind="$6"
+  [[ "$kind" == exact ]] && return 0
+  local branch="" sha="" has_git=0
+  if branch="$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null)" &&
+     sha="$(git -C "$cwd" rev-parse HEAD 2>/dev/null)"; then
+    has_git=1
+    [[ "$branch" == HEAD ]] && branch=""
+  fi
+  local out rc
+  set +e
+  out="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" \
+    "TARGET=$(printf '%q' "$remote_cwd") sh -s" <<'PREP' 2>/dev/null
+if [ -d "$TARGET" ]; then
+  b=$(git -C "$TARGET" rev-parse --abbrev-ref HEAD 2>/dev/null) &&
+    s=$(git -C "$TARGET" rev-parse HEAD 2>/dev/null) &&
+    printf 'EXISTS\n%s\n%s\n' "$b" "$s" || echo NOTGIT
+else
+  echo MISSING
+fi
+PREP
+)"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: remote host '$host' is unreachable during worktree check; retry when it is available" >&2
+    return 1
+  fi
+  case "$out" in
+    MISSING)
+      if [[ "$has_git" -eq 0 ]]; then
+        echo "wrk: remote path '$remote_cwd' is missing on '$host' and '$cwd' is not a git worktree; create it first" >&2
+        return 2
+      fi
+      [[ "$kind" == suffix ]] || {
+        echo "wrk: remote path '$remote_cwd' is missing on '$host'; sync the remote repository first" >&2
+        return 2
+      }
+      spillover_remote_worktree_create "$host" "$ssh_name" "$cwd" "$remote_cwd" "$remote_base" "$branch" "$sha"
+      ;;
+    NOTGIT)
+      [[ "$has_git" -eq 0 ]] && return 0
+      echo "wrk: remote path '$remote_cwd' on '$host' is not a git worktree; refusing to use it" >&2
+      return 2
+      ;;
+    EXISTS*)
+      [[ "$has_git" -eq 1 ]] || return 0
+      local remote_branch remote_sha
+      remote_branch="$(sed -n '2p' <<<"$out")"
+      remote_sha="$(sed -n '3p' <<<"$out")"
+      if [[ "$remote_branch" != "${branch:-HEAD}" || "$remote_sha" != "$sha" ]]; then
+        echo "wrk: remote path '$remote_cwd' on '$host' is at ${remote_branch}@${remote_sha} but local '$cwd' is at ${branch:-HEAD}@${sha}; refusing to overwrite — align or remove it" >&2
+        return 2
+      fi
+      return 0
+      ;;
+    *)
+      echo "wrk: remote worktree check on '$host' returned an unexpected result" >&2
+      return 1
+      ;;
+  esac
+}
+
 spillover_remote_spawn() {
   local host="$1" cwd="$2" prompt="$3"; shift 3
   local ssh_name session remote_prompt remote_cwd workspace remote_cmd rc out
   ssh_name="$(spillover_value "hosts.$host" ssh 2>/dev/null || true)"; [[ -n "$ssh_name" ]] || ssh_name="$host"
   session="$(spillover_value "hosts.$host" herdr_session 2>/dev/null || true)"; [[ -n "$session" ]] || session=worker
   workspace="$(spillover_value "hosts.$host" workspace 2>/dev/null || true)"; [[ -n "$workspace" ]] || workspace=worker
-  if ! remote_cwd="$(spillover_cwd_map "$host" "$cwd")"; then
+  if ! spillover_cwd_map "$host" "$cwd"; then
     echo "wrk: remote host '$host' has no cwd_map entry for '$cwd'; use --host local or configure hosts.toml" >&2
     return 2
   fi
+  remote_cwd="$SPILL_CWD_REMOTE"
+  spillover_remote_prepare "$host" "$ssh_name" "$cwd" "$remote_cwd" "$SPILL_CWD_BASE" "$SPILL_CWD_KIND" || return
   # shellcheck disable=SC2016 # ${TMPDIR} must expand on the selected remote host.
   if ! remote_prompt="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'umask 077; mktemp "${TMPDIR:-/tmp}/wrk-spillover.XXXXXX.md"' 2>/dev/null)"; then
     echo "wrk: remote host '$host' is unreachable; use --host local or retry after it is available" >&2
@@ -3223,6 +3360,13 @@ spawn_router_cmd() {
     esac
     warn "spill-over remote spawn failed host=$candidate exit=$last_rc; trying next candidate"
   done
+  # An explicit --host NAME is an operator forcing one remote: propagate the
+  # remote exit instead of quietly landing the pane locally (#571).  The local
+  # fallback below exists for --host auto only.
+  if [[ "$requested" != auto ]]; then
+    echo "wrk: remote spawn on explicit host '$requested' failed (rc=$last_rc); no local fallback — fix the remote or use --host local" >&2
+    return "$last_rc"
+  fi
   warn "no remote spill-over candidate completed; falling back to local"
   out="$(mktemp)"
   set +e
