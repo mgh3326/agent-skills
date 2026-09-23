@@ -78,7 +78,7 @@ Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [opti
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
-            [--operator-request REF] [--requested-by NAME]
+            [--operator-request REF] [--requested-by NAME] [--keep]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
@@ -109,7 +109,7 @@ spawn_help() {
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
-                 [--operator-request REF] [--requested-by NAME]
+                 [--operator-request REF] [--requested-by NAME] [--keep]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -143,6 +143,13 @@ Options:
                      (parentless_lane, unknown_owner) for the same failure
                      mode on the idle-detection path.
   --report PATH      report acceptance-criterion path watched by the completion sentinel
+  --keep             protection marker: record "keep": true on the job.spawned
+                     receipt so no session cleanup ever closes this pane — use it
+                     for resident, director, installer and consult sessions.
+                     `wrk reap` skips a kept job (reason=protected) and the
+                     panewire session-reap report never lists it as a candidate.
+                     Without --keep the receipt is byte-identical to before.
+                     Local and ssh spawns only; a hub spill-over refuses it.
   --job-dup-ok       explicit operator override: permit an active duplicate job
                      after an auditable warning. Automation/panewire must not use it.
   --landing-strict   automation opt-in: preserve the OK line, then exit 76 if
@@ -1124,9 +1131,9 @@ arbiter_record_spawn_receipt() {
   # absence explicitly for downstream recovery rather than pretending success.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc
-  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" <<'PY'
+  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" <<'PY'
 import json, sys
-pane_id, label, profile, workspace, tab_id = sys.argv[1:]
+pane_id, label, profile, workspace, tab_id, keep = sys.argv[1:]
 receipt = {
     "pane_id": pane_id,
     "label": label,
@@ -1136,6 +1143,10 @@ receipt = {
 # Additive and optional: existing consumers keep reading the four fields above.
 if tab_id:
     receipt["tab_id"] = tab_id
+# Protection marker (#603). Present only for `--keep`, so an ordinary spawn's
+# receipt stays byte-identical; its readers accept only the JSON literal true.
+if keep == "1":
+    receipt["keep"] = True
 print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
 PY
 )"; then
@@ -2605,7 +2616,7 @@ spillover_wake() {
 # a flag and remains a perfectly valid --requested-by value.
 wrk_option_token() {
   case "$1" in
-    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--job-dup-ok|--landing-strict|--host|-h|--help) return 0 ;;
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -3123,7 +3134,7 @@ hosts_cmd() {
 
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL=""
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
   OPERATOR_REQUEST="" REQUESTED_BY=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
@@ -3143,6 +3154,7 @@ spawn_cmd() {
         shift 2 ;;
       --job-dup-ok) JOB_DUP_OK=1; shift ;;
       --landing-strict) LANDING_STRICT=1; shift ;;
+      --keep) KEEP=1; shift ;;
       -*) die "unknown option '$1'" ;;
       *) die "unexpected argument '$1'" ;;
     esac
@@ -3358,6 +3370,8 @@ A job is a candidate only when all of these hold:
     or a pane_count that is not an integer is treated as possibly shared
     (skip reason=tab-count-unknown)
   · it has not been reaped before (no job.reaped event)
+  · it is not protected: no claim, reclaim or job.spawned receipt carries
+    "keep": true (`wrk spawn --keep`; skip reason=protected)
 
 working/blocked panes, jobs without a terminal event and jobs whose pane herdr
 cannot resolve are never touched. Builder panes (claim role=builder, or legacy
@@ -3447,6 +3461,7 @@ for job in jobs:
     terminal_at = None
     revived = False
     reaped = False
+    keep = False
     try:
         names = sorted(os.listdir(events_dir))
     except OSError:
@@ -3490,6 +3505,10 @@ for job in jobs:
             spawned_tab = payload.get("tab_id") if isinstance(payload.get("tab_id"), str) else ""
         if kind == "job.reaped":
             reaped = True
+        # 보호 표시(`wrk spawn --keep`, #603)는 누적이다: claim·reclaim·spawn 영수증 중
+        # 하나라도 JSON true 를 남겼으면 그 잡의 pane 은 닫지 않는다.
+        if kind in ("job.claim", "job.reclaim", "job.spawned") and payload.get("keep") is True:
+            keep = True
         if kind in REVIVE and terminal_at is not None:
             terminal_at = None
             revived = True
@@ -3523,6 +3542,11 @@ for job in jobs:
         continue
     age = int(now - terminal_at)
     if age < grace:
+        continue
+    # 보호된 잡은 유예를 넘겨 원래라면 닫혔을 때만 이유를 남기고 건너뛴다. 유예 안이거나
+    # 종료 전인 잡은 위에서 지금처럼 조용히 빠진다.
+    if keep:
+        print(job.split()[0] if job.split() else job, "-", "-", "-", age, "protected", sep="\t")
         continue
     # 어떤 필드에도 공백이 있어서는 안 된다. 있으면 그 잡의 증거가 깨진 것이고,
     # 회수는 추측하지 않는다 — pane 을 자리표시자로 내보내 skip 으로 남긴다.

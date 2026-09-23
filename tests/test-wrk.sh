@@ -3095,6 +3095,43 @@ assert payload.get("tab_id") == "w:t1", (
 PY
 echo "PASS sentinel-inherits-pinned-herdr-session"
 
+# #603: `--keep` puts "keep": true on the job.spawned receipt, and a spawn
+# without it writes the exact receipt payload it always did (no keep key, no
+# other change).
+for keep_case in kept plain; do
+  keep_inbox="$TMP/spawn-keep-$keep_case"
+  keep_args=()
+  [[ "$keep_case" == kept ]] && keep_args=(--keep)
+  env -u HERDR_SESSION -u HERDR_SOCKET_PATH \
+    HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$keep_inbox" WRK_NO_SLEEP=1 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$TMP/spawn-keep-herdr.log" WRK_COMPLETION_INTERVAL_S=1 \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
+    --t T1 --job "spawn-keep-$keep_case" --owner lane-a "${keep_args[@]}" >/dev/null ||
+    fail "#603: spawn ($keep_case) must succeed"
+  kill "$(cat "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null)" 2>/dev/null || true
+done
+python3 - "$TMP/spawn-keep-kept/spawn-keep-kept/events" "$TMP/spawn-keep-plain/spawn-keep-plain/events" <<'PY'
+import glob, json, sys
+def receipt(directory):
+    paths = sorted(glob.glob(directory + "/*job.spawned.json"))
+    assert len(paths) == 1, "exactly one job.spawned receipt, got %r" % paths
+    return json.load(open(paths[0]))["payload"]
+kept, plain = receipt(sys.argv[1]), receipt(sys.argv[2])
+base = {"pane_id": "w:p1", "label": "fixture", "profile": "codex-terra", "workspace": "w", "tab_id": "w:t1"}
+assert plain == base, "a spawn without --keep must write the unchanged receipt, got %r" % plain
+assert kept == dict(base, keep=True), "--keep must record keep: true on the receipt, got %r" % kept
+assert kept["keep"] is True, "the marker must be the JSON literal true"
+PY
+grep -q -- '--keep' <<<"$("$WRK" spawn --help)" || fail "#603: spawn --help must document --keep"
+spill_keep_err="$(bash -c 'source <(sed -n "/^wrk_option_token()/,/^}/p;/^spillover_hub_args()/,/^}/p" "$1"); spillover_hub_args -m codex-terra -l fixture --keep' _ "$WRK" 2>&1)" &&
+  fail "#603: a hub spill-over must refuse --keep rather than silently drop the marker"
+grep -q "option '--keep' is not permitted for a hub spawn" <<<"$spill_keep_err" ||
+  fail "#603: the hub spill-over refusal must name --keep: $spill_keep_err"
+echo "PASS spawn-keep-marks-receipt"
+
 # ---------------------------------------------------------------------------
 # completion idempotency: 같은 report artifact = 같은 round = 레코드 1건
 # ---------------------------------------------------------------------------
@@ -3644,6 +3681,53 @@ PY
 grep -q 'reap: 0 candidate' <<<"$(reap_run --lane lane-a)" ||
   fail "an already reaped job must never be offered again"
 echo "PASS reap-apply-closes-tab-and-records-job-reaped"
+
+# #603: a protected job (`wrk spawn --keep` → "keep": true on its job.spawned
+# receipt) is never closed. It is reported once it would otherwise have been a
+# candidate, and only a JSON true counts. The unprotected control shares the
+# lane, pane state and age, so the skip is caused by the marker alone.
+KEEP_REAP_INBOX="$TMP/reap-keep-inbox"
+reap_keep_job() {
+  local job="$1" pane="$2" tab="$3" receipt_extra="$4" now="$5"
+  export ARBITER_TEST_NOW="$now"
+  env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane keep-lane --agent-label "$job" --t T1 >/dev/null
+  env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"keep-lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"$receipt_extra}" >/dev/null
+  env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"keep-lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
+KEEP_FRESH_NOW="$(python3 -c 'import datetime; print(datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0).isoformat())')"
+reap_keep_job reap-kept w1:p1 w1:t1 ',"keep":true' "$REAP_TEST_NOW"
+reap_keep_job reap-kept-string w1:p5 w1:t5 ',"keep":"true"' "$REAP_TEST_NOW"
+reap_keep_job reap-kept-fresh w1:p3 w1:t3 ',"keep":true' "$KEEP_FRESH_NOW"
+reap_keep_job reap-unkept w1:p6 w1:t6 '' "$REAP_TEST_NOW"
+keep_reap_run() {
+  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" \
+    WRK_FIXTURE_SCENARIO=reap WRK_FIXTURE_LOG="$REAP_LOG" "$WRK" reap "$@"
+}
+: >"$REAP_LOG"
+keep_out="$(keep_reap_run --lane keep-lane)"
+grep -q '^skip job=reap-kept reason=protected$' <<<"$keep_out" ||
+  fail "#603: a kept job past its grace must be skipped with reason=protected: $keep_out"
+grep -q '^would-close job=reap-kept ' <<<"$keep_out" &&
+  fail "#603: a kept job must never be a reap candidate: $keep_out"
+grep -q '^would-close job=reap-unkept pane=w1:p6 tab=w1:t6 status=idle' <<<"$keep_out" ||
+  fail "#603: the unprotected control in the same lane must stay a candidate: $keep_out"
+grep -q '^would-close job=reap-kept-string pane=w1:p5 tab=w1:t5 status=idle' <<<"$keep_out" ||
+  fail "#603: only a JSON true protects; the string \"true\" is not a marker: $keep_out"
+grep -q 'reap-kept-fresh' <<<"$keep_out" &&
+  fail "#603: a kept job still inside its grace stays silent like any other: $keep_out"
+: >"$REAP_LOG"
+keep_apply_out="$(keep_reap_run --lane keep-lane --apply)"
+grep -q '^tab close w1:t1$' "$REAP_LOG" &&
+  fail "#603: --apply must never close a kept job's tab: $(cat "$REAP_LOG")"
+[[ "$(event_count "$KEEP_REAP_INBOX/reap-kept/events" job.reaped)" -eq 0 ]] ||
+  fail "#603: a kept job must not be recorded as reaped"
+grep -q '^closed job=reap-unkept ' <<<"$keep_apply_out" ||
+  fail "#603: --apply must still close the unprotected control: $keep_apply_out"
+echo "PASS reap-skips-kept-jobs"
 
 # ── #499: done/escalate/joined hand over to `panewire job` only when it exists ──
 # Deployment order must not matter: with a panewire that lacks the command (or
