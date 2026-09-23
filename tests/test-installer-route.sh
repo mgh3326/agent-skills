@@ -46,7 +46,7 @@ INSTALLER_SLOTS = (
     ("R1-parent", "## R1. 정체", r"parent는 \*\*([^*\s]+)\*\*다\."),
     ("R1-orders", "## R1. 정체", r"지시는 (\S+?)에게서 받고"),
     ("R1-results", "## R1. 정체", r"결과\(JOIN/ESC\)도 (\S+?)에게 올린다"),
-    ("R3-step8", "## R3. 고정 절차 (8단계, 순서 불변)",
+    ("R3-step8", "## R3. 고정 절차 (9단계, 순서 불변)",
      r"(?m)^8\. \*\*JOIN 보고\*\* — (\S+?) 레인에 R11의 JOIN 템플릿으로 보고한다\.$"),
     ("R10-route", "## R10. 사이트 정본 분리", r"디제스트/체크포인트 디렉터리, (\S+?)로의 보고 경로\."),
     ("R11-join-line8", "## R11. 보고 형식", r"(?m)^8\. JOIN 보고 — 증거: <(\S+?)로 전달한 경로/시각>$"),
@@ -57,7 +57,7 @@ CHECKLIST_SLOTS = (
 
 README_SLOTS = (
     ("readme-installer-row", None,
-     r"(?m)^\| `installer` \| [^|\n]*? — (\S+?) 직속\(스폰·보고 모두 director\), 고정 8단계 절차·판단 없음 \|$"),
+     r"(?m)^\| `installer` \| [^|\n]*? — (\S+?) 직속\(스폰·보고 모두 director\), 고정 9단계 절차\(마지막 = 배포 기록\)·판단 없음 \|$"),
 )
 
 # R3's fixed procedure: count and order are an invariant of the skill itself.
@@ -70,6 +70,7 @@ R3_STEPS = [
     "사후 검증",
     "체크포인트 기록",
     "JOIN 보고",
+    "배포 기록",
 ]
 
 # The only lines in the installer files allowed to mention the abolished
@@ -105,9 +106,9 @@ def check_history_only(text: str, allowed: set, label: str) -> None:
 
 
 def check_r3(text: str) -> None:
-    sec = section(text, "## R3. 고정 절차 (8단계, 순서 불변)")
+    sec = section(text, "## R3. 고정 절차 (9단계, 순서 불변)")
     steps = re.findall(r"(?m)^(\d+)\. \*\*(.+?)\*\*", sec)
-    assert [int(n) for n, _ in steps] == list(range(1, 9)), (
+    assert [int(n) for n, _ in steps] == list(range(1, 10)), (
         f"R3 numbering changed: {[n for n, _ in steps]}"
     )
     assert [title for _, title in steps] == R3_STEPS, (
@@ -159,7 +160,7 @@ check_installer(installer_text)
 print(
     f"PASS installer route slots={len(INSTALLER_SLOTS)}/{len(INSTALLER_SLOTS)} "
     f"recipient={RECIPIENT} history-allowlisted={len(HISTORY_LINES['installer'])} "
-    f"r3-steps={len(R3_STEPS)}/8"
+    f"r3-steps={len(R3_STEPS)}/9"
 )
 check_checklist(checklist_text)
 print(f"PASS installer checklist slots={len(CHECKLIST_SLOTS)}/{len(CHECKLIST_SLOTS)}")
@@ -200,7 +201,7 @@ r10 = "director로의 보고 경로."
 r11 = "8. JOIN 보고 — 증거: <director로 전달한 경로/시각>"
 desc = "reporting only to the director —"
 history = next(iter(HISTORY_LINES["installer"]))
-esc_heading = "## R9. escalate 트리거 (7개 전부)\n"
+esc_heading = "## R9. escalate 트리거 (8개 전부)\n"
 
 installer_mutants = [
     ("step8->checker", mutate(installer_text, step8, step8.replace("director", "checker"))),

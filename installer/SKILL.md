@@ -1,6 +1,6 @@
 ---
 name: installer
-description: Execute one deploy as a non-resident, single-session role spawned by and reporting only to the director — run the fixed 8-step procedure with pass/fail gates at every step, escalate on any ambiguity or failure, and never judge.
+description: Execute one deploy as a non-resident, single-session role spawned by and reporting only to the director — run the fixed 9-step procedure with pass/fail gates at every step, escalate on any ambiguity or failure, record every attempt (success, failure or escalation) as one append-only deploy record, and never judge.
 ---
 
 # installer — 배포 전담(비상주), 판단 없음
@@ -26,9 +26,10 @@ parent는 **director**다. 지시는 director에게서 받고, 결과(JOIN/ESC)�
 
 **하나라도 비면 시작하지 않고 즉시 escalate한다.** 누락분을 추측하거나 기본값을 만들지 않는다.
 
-## R3. 고정 절차 (8단계, 순서 불변)
+## R3. 고정 절차 (9단계, 순서 불변)
 
-1. **대상 확정** — 입력 3종을 확인하고 배포 대상(SHA·PR 목록)을 고정한다.
+1. **대상 확정** — 입력 3종을 확인하고 배포 대상(SHA·PR 목록)을 고정한다. 사이트 정본의 현재
+   배포본 확인 명령으로 배포 전 판을 실측한다(R12 `previous_ref`).
 2. **이미지/아티팩트 존재 확인** — 배포할 이미지·아티팩트가 실제로 존재하는지 확인한다.
 3. **DB 마이그레이션 판정** — 아래 R4의 정의에 따라 additive 여부를 판정한다.
 4. **additive 일 때만 선적용** — 판정이 additive일 때만 마이그레이션을 먼저 적용한다.
@@ -36,9 +37,13 @@ parent는 **director**다. 지시는 director에게서 받고, 결과(JOIN/ESC)�
 6. **사후 검증** — R6의 6개 항목을 전부 확인한다.
 7. **체크포인트 기록** — 단계별 진행 상태를 기록한다.
 8. **JOIN 보고** — director 레인에 R11의 JOIN 템플릿으로 보고한다.
+9. **배포 기록** — R12의 배포 기록 1건을 새 키로 남긴다. 절차의 마지막 단계다.
 
 이 순서는 바뀌지 않는다. 어떤 단계에서든 escalate 조건에 걸리면 그 단계에서 즉시 멈추고
-이후 단계는 실행하지 않는다.
+이후 단계는 실행하지 않는다 — **단 단계 9(배포 기록)는 예외다.** escalate로 멈춘 경우에도
+R11의 ESC 보고서를 올린 뒤 단계 9를 반드시 실행한다(result는 R12 규칙대로 `failed` 또는
+`rolled_back`). 성공·실패·escalate 중 어느 경로로 끝나든 마지막 단계는 단계 9다(단계 9 자체가
+실패하면 그 뒤에 R9 트리거 8의 ESC만 추가로 올린다).
 
 ## R4. 단계 3 — additive 정의 (운영자 확정 목록, 의미 변경 금지)
 
@@ -80,6 +85,7 @@ parent는 **director**다. 지시는 director에게서 받고, 결과(JOIN/ESC)�
 
 R11의 JOIN 템플릿으로 단계별 증거 **8줄**을 남긴다. 배포 중 발견한 "활성화 필요 항목"
 (예: 기능 게이트)은 **수행하지 않고 목록만** 남긴다 — installer의 범위 밖이다(R8).
+단계 9(배포 기록)는 이 보고 **뒤**에 실행하므로 JOIN 보고서에는 증거 줄 대신 기록 키만 적는다.
 
 ## R8. 범위 밖 (명시적 금지)
 
@@ -92,7 +98,7 @@ R11의 JOIN 템플릿으로 단계별 증거 **8줄**을 남긴다. 배포 중 �
 - 롤백 결정 — 스크립트가 자동 롤백을 수행한 경우 그 결과는 **보고만** 하고 installer가 추가로
   롤백을 결정하지 않는다.
 
-## R9. escalate 트리거 (7개 전부)
+## R9. escalate 트리거 (8개 전부)
 
 1. 비additive 마이그레이션(R4)
 2. 아티팩트 미존재(사이트 정본의 대기 상한 경과 후에도)
@@ -101,12 +107,15 @@ R11의 JOIN 템플릿으로 단계별 증거 **8줄**을 남긴다. 배포 중 �
 5. 배포창 밖 + 운영자 승인 부재
 6. head 불일치
 7. 큐 접근 불가
+8. 배포 기록 실패(R12) — 기록 키 누락·형식 불일치, 키가 이미 존재, 쓰기 exit≠0, 쓰기 후
+   덮어쓰기 관측. 이 ESC 보고서에는 쓰려던 기록 본문을 **원문 그대로** 붙인다.
 
 ## R10. 사이트 정본 분리
 
 실제 호스트·경로·배포 명령·배포창 시간·대기 상한 수치는 이 스킬에 두지 않는다.
 시작 시 **사이트 정본(비공개)의 installer 절을 읽는다** — 호스트·경로, 배포 명령, 배포창 시간,
 대기 상한, 디제스트/체크포인트 디렉터리, director로의 보고 경로.
+배포 기록(R12)의 service 이름·target·현재 배포본 확인 명령·기록 읽기/쓰기 명령도 이 절에서 얻는다.
 단계 2(아티팩트 대기)와 단계 5(배포 명령)는 이 절에서 얻은 값만 쓴다.
 
 ## R11. 보고 형식
@@ -123,6 +132,7 @@ JOIN installer · <배포 대상 SHA> · <ISO time>
 6. 사후 검증 — 증거: <6항 결과 요약>
 7. 체크포인트 기록 — 증거: <체크포인트 경로>
 8. JOIN 보고 — 증거: <director로 전달한 경로/시각>
+배포 기록 키: <스폰 입력의 기록 키> (단계 9에서 result=success 로 기록 — 이 보고 뒤)
 활성화 필요 항목: <목록 또는 "없음"> (수행하지 않음)
 소요 시간: <시:분:초>
 ```
@@ -132,11 +142,65 @@ JOIN installer · <배포 대상 SHA> · <ISO time>
 ```
 ESC installer · 단계 <n> · <ISO time>
 원문 출력: <실행한 명령/검증의 원문 출력 그대로>
+배포 기록 키: <스폰 입력의 기록 키> (단계 9에서 result=<failed|rolled_back>, failed_step=<n> 로 기록 — 이 보고 뒤)
 취한 조치 없음.
 ```
+
+트리거 8(배포 기록 실패)의 ESC는 위 형식에 `기록 본문: <쓰려던 JSON 원문>` 한 줄을 더한다.
+
+## R12. 단계 9 — 배포 기록 (append-only, 실패·escalate 포함)
+
+목적: "지금 무엇이 배포돼 있고, 마지막에 무엇을 시도했다가 실패했는가"를 산문이 아니라 기계가
+읽는 기록으로 남긴다. 배포 시도 1회 = 기록 1건 = 새 키 1개다.
+
+**키** — `deploy/<service>/<UTC 시각>`. 시각 형식은 `YYYYMMDDTHHMMSSZ`(UTC, 콜론 없음) 하나다.
+기록 키는 **스폰 입력으로 받는다** — installer는 키를 만들거나 바꾸지 않는다(명령 권한이 배포별
+정확 문자열이라 키가 세션 전에 정해져야 한다). 키가 없거나 형식이 다르면 시작하지 않고 R9 트리거
+8로 escalate한다.
+
+**본문**(JSON 1개, 필드 전부 필수 — 모르는 값은 `null`, 추측으로 채우지 않는다):
+
+| 필드 | 값 |
+|---|---|
+| `schema` | `deploy-record/v0` |
+| `service` | 사이트 정본의 service 이름(키의 `<service>`와 같음) |
+| `target` | 사이트 정본의 배포 대상 머신/환경 |
+| `head_sha` | 이 시도의 대상 커밋 — R2 입력 1번 원문. 입력이 없었으면 `null` |
+| `deployed_ref` | 단계 5 배포 명령이 올린 판 — 사이트 정본이 그 서비스에 정한 ref 형식(커밋 SHA 또는 이미지 다이제스트)과 출처로. 단계 5가 exit 0으로 끝나지 않았으면 `null` |
+| `previous_ref` | 단계 1에서 사이트 정본의 현재 배포본 확인 명령으로 실측한 값(`deployed_ref`와 같은 형식). 실측 못 했으면 `null` |
+| `deployed_at` | 단계 5 배포 명령이 끝난 UTC 시각(ISO 8601). 단계 5에 닿지 않았으면 `null` |
+| `result` | `success` · `failed` · `rolled_back` 중 하나(아래 규칙) |
+| `failed_step` | escalate한 단계 번호(시작 전 escalate는 `0`). `success`면 `null` |
+| `job_id` | 이 배포 세션의 job id |
+| `approval_ref` | R2 입력 3번(운영자 승인 문구의 hk ref 또는 배포창 판정 근거) 원문. 입력이 없었으면 `null` |
+| `included_prs` | R2 입력 2번(이전 배포 이후 머지된 PR 목록)을 그대로 — 배열. 입력이 없었으면 `null` |
+| `source` | `installer`(소급 기록은 `backfill`) |
+
+**result 규칙**(installer가 고르지 않는다): 단계 8까지 escalate 없이 왔으면 `success`.
+escalate로 멈췄으면 `failed` — 단, 사이트 정본이 그 서비스의 **자동 롤백 완료 표시 원문**을
+정의해 두었고 단계 5 출력에 그 원문이 있을 때만 `rolled_back`. 표시 원문이 정의되지 않은
+서비스는 롤백이 있었어도 `failed`로 적고 원문 출력은 ESC 보고서에 남긴다(해석 금지).
+
+**읽는 쪽 규칙**: 시도한 커밋은 `head_sha`, 배포 명령이 실제로 올린 판은 `deployed_ref`다. 현재 서빙
+중인 판은 `result=success`인 가장 최근 기록의 `deployed_ref`다. `failed_step`이 6 이상인 `failed`
+기록은 배포 명령은 성공했고(`deployed_ref` 있음) 사후 검증에서 멈춘 시도다 — 서빙 판이 이미
+바뀌었을 수 있다.
+
+**절차**(순서 불변, 재시도 없음):
+
+1. 부재 확인 — 사이트 정본의 기록 읽기 명령으로 그 키를 읽는다. "없음" 응답일 때만 진행한다.
+   키가 이미 있으면 **쓰지 않고** 트리거 8. 읽기 자체가 실패하면(없음 외의 오류) 트리거 8.
+2. 쓰기 — 사이트 정본의 기록 쓰기 명령 1개로 그 키에 본문을 쓴다. exit≠0이면 재시도 없이 트리거 8.
+3. 새로 만들어졌는지 확인 — 쓰기 결과가 "새 문서 생성"(생성 시각 = 갱신 시각)이 아니면 덮어쓰기가
+   일어난 것이다 → 트리거 8. 기록 저장소에 CAS가 없어 1→2 사이 경쟁은 막지 못하고 여기서
+   탐지만 한다.
+
+기존 `deploy/` 키를 수정·삭제하는 명령은 어떤 경우에도 실행하지 않는다(정정도 새 키로).
+단계 9가 실패해도 이미 올린 JOIN/ESC는 그대로 두고, 트리거 8 ESC를 추가로 올린다.
 
 ## 시작
 
 1. 사이트 정본(비공개)의 installer 절을 읽는다 — R10.
-2. R2의 입력 3종을 확인한다. 하나라도 없으면 즉시 escalate하고 절차를 시작하지 않는다.
-3. R3의 8단계를 순서대로 실행한다.
+2. R2의 입력 3종과 R12의 기록 키를 확인한다. 하나라도 없으면 즉시 escalate하고 절차를 시작하지
+   않는다 — 이때도 기록 키가 있으면 단계 9를 실행한다(`failed_step` = `0`).
+3. R3의 9단계를 순서대로 실행한다.

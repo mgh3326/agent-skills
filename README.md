@@ -42,7 +42,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `planner` | 상류 분석 상주 역할 — 판단을 durable하게 기록하고 실행에는 제안만 전달 |
 | `ask-session` | 상존 세션에 질문 보내고 답변 회수(왕복) — 답변 파일 계약 + 타임아웃·무응답 처리 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
-| `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — director 직속(스폰·보고 모두 director), 고정 8단계 절차·판단 없음 |
+| `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — director 직속(스폰·보고 모두 director), 고정 9단계 절차(마지막 = 배포 기록)·판단 없음 |
 
 구 이름 `admiral`·`flag`·`captain`·`counsel`·`strategist`·`bosun`은 별칭 stub으로 남아 있으며 정본은 각각 새 이름이다. 제거는 별도 태스크다.
 
