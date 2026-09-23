@@ -892,11 +892,110 @@ devin_wait_detected() {
   done
 }
 
+# #606: a fresh pane's shell may still be starting when wrk reaches the agent
+# start. herdr treats a pane as an available shell when the shell itself holds
+# the foreground with no foreground command (measured 2026-09-23 on herdr 0.9.0:
+# `agent start` was accepted 0.07s after tab create, before any prompt). While
+# rc files run subprocesses (git rev-parse, git config ... observed) it answers
+# agent_pane_busy; under load 13 that lasted most of a 7-13s zsh start. Inside
+# the START_TIMEOUT window that code only means "shell not ready yet", so it is
+# retried with the Devin detection poll cadence. Every other failure keeps
+# failing at once. herdr refuses a start timeout of 3000ms or less, so a window
+# with no more than that left fails closed instead of being handed to herdr.
+SHELL_READY_POLL_SECONDS=0.25
+SHELL_READY_POLL_MS=250
+AGENT_START_MIN_TIMEOUT_MS=3000
+
+agent_start_in_pane() {
+  local started_at attempts=0 max_attempts remaining_ms start_err start_rc
+  started_at="$(date +%s)"
+  max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    remaining_ms=$(( START_TIMEOUT - ($(date +%s) - started_at) * 1000 ))
+    if (( remaining_ms <= AGENT_START_MIN_TIMEOUT_MS )); then
+      echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (agent_pane_busy x$(( attempts - 1 ))); pane=$PANE" >&2
+      spawn_pane_cleanup
+      return 1
+    fi
+    set +e
+    start_err="$("$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$remaining_ms" -- "${ARGS[@]}" 2>&1 >/dev/null)"
+    start_rc=$?
+    set -e
+    [[ "$start_rc" -eq 0 ]] && return 0
+    [[ -z "$start_err" ]] || printf '%s\n' "$start_err" >&2
+    if [[ "$start_err" != *'"code":"agent_pane_busy"'* ]]; then
+      spawn_pane_cleanup
+      return "$start_rc"
+    fi
+    # The wall clock is checked at the top of the loop; the cap bounds it
+    # when sleep is disabled.
+    if (( attempts >= max_attempts )); then
+      echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (agent_pane_busy x$attempts); pane=$PANE" >&2
+      spawn_pane_cleanup
+      return "$start_rc"
+    fi
+    sleep_for "$SHELL_READY_POLL_SECONDS"
+  done
+}
+
+# `pane run` has no availability check: it types into whatever holds the
+# terminal. Before running Devin, poll process-info until herdr's own
+# available-shell rule holds (the shell is the foreground process group and the
+# only foreground process). A process-info failure or an envelope that cannot
+# be read fails closed at once; only "not ready yet" is polled, inside the same
+# window that detection and the idle wait then share.
+devin_wait_shell_ready() {
+  local started_at="$1" attempts=0 max_attempts info_out info_rc ready
+  max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    set +e
+    info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
+    info_rc=$?
+    set -e
+    if [[ "$info_rc" -ne 0 ]]; then
+      devin_spawn_diagnostics "pane process-info exited $info_rc before pane run"
+      return 1
+    fi
+    set +e
+    ready="$(printf '%s' "$info_out" | python3 -c '
+import json, sys
+info = json.load(sys.stdin)["result"]["process_info"]
+shell = info["shell_pid"]
+group = info["foreground_process_group_id"]
+procs = info["foreground_processes"]
+if type(shell) is not int or type(group) is not int or not isinstance(procs, list):
+    raise SystemExit(1)
+pids = [p["pid"] for p in procs]
+if any(type(pid) is not int for pid in pids):
+    raise SystemExit(1)
+print("yes" if group == shell and pids and all(pid == shell for pid in pids) else "no")
+' 2>/dev/null)"
+    info_rc=$?
+    set -e
+    if [[ "$info_rc" -ne 0 ]]; then
+      devin_spawn_diagnostics "pane process-info returned an invalid envelope before pane run"
+      return 1
+    fi
+    [[ "$ready" == yes ]] && return 0
+    if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= START_TIMEOUT )); then
+      devin_spawn_diagnostics "shell not ready within ${START_TIMEOUT}ms (foreground busy x$attempts)"
+      return 1
+    fi
+    sleep_for "$SHELL_READY_POLL_SECONDS"
+  done
+}
+
 devin_start_in_pane() {
   local run_rc wait_rc explain_rc parse_rc rename_rc explain_json identity detected_agent matched_rule
   local started_at remaining_ms
 
   started_at="$(date +%s)"
+  if ! devin_wait_shell_ready "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
   set +e
   "$HERDR" pane run "$PANE" devin "${ARGS[@]}" >/dev/null
   run_rc=$?
@@ -3274,7 +3373,7 @@ print(value if isinstance(value, str) else "")
   if [[ "$PROFILE_KIND" == devin ]]; then
     devin_start_in_pane
   else
-    "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
+    agent_start_in_pane
   fi
   sleep_for "$BOOT_SETTLE"
   if [[ "$PROFILE_KIND" == kimi ]]; then

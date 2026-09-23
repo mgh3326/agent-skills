@@ -101,6 +101,15 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 `scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
 `agy -p "$(cat PROMPT_FILE)"`이다.
 
+새 탭의 셸이 아직 rc 파일을 실행 중이면(부하가 높을 때 수 초) herdr는 `agent start`를
+`agent_pane_busy`로 거부한다. `wrk`는 그 코드에 한해 프로필의 start 창(기본 30초, codex
+120초 등) 안에서 0.25초 간격으로 재시도하고, 매 시도에 창의 남은 시간을 `--timeout`으로
+넘긴다. 남은 시간이 herdr 하한(3000ms) 이하이거나 시도 상한(창/250ms)에 닿으면 빈 pane을
+닫고 쿼터 기록을 해제하는 기존 fail-closed로 끝난다. 다른 오류 코드는 재시도하지 않는다.
+Devin은 `pane run`이 셸 상태를 확인하지 않으므로, 그 전에 `pane process-info`를 같은
+간격으로 조회해 셸이 foreground를 혼자 가진 상태(herdr의 available-shell 규칙)를 기다린다.
+이 대기는 뒤의 검출·idle 대기와 같은 30초 창을 나눠 쓴다.
+
 `devin-swe2`는 Devin 프로필이다. 현재 `wrk`는
 `herdr pane run <pane_id> devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false`로
 기동하고, 최대 30초 창 안에서 herdr가 그 pane을 agent로 검출할 때까지 `agent get`을
