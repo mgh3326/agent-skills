@@ -74,14 +74,14 @@ run_wrk() {
   local binary="$1"; shift
   env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" \
     SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="${WRK_TEST_ARBITER_BIN:-$ROOT/bin/arbiter}" XDG_DATA_HOME="$TMP/xdg" \
-    WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$CONFIG" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
+    WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="${WRK_TEST_HOSTS_CONFIG:-$CONFIG}" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
     WRK_TEST_THROTTLED=0 \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
     WRK_SPILLOVER_LOG="$TMP/spillover.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" \
     WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
     WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" \
     WRK_PLACE_LOG="$TMP/place.log" WRK_SPILLOVER_CANDIDATES_LOG="$TMP/candidates.log" \
-    "$binary" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -l fixture --t T1 \
+    "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" -l fixture --t T1 \
     --job "${WRK_TEST_JOB:-spillover-$RANDOM-$RANDOM}" "$@"
 }
 
@@ -125,7 +125,7 @@ printf '%s\n' 'BRIEF-CANARY-hub-fixture' >"$PROMPT"
 run_hub() {
   hub_require_isolation
   local binary="$1" config="$2"; shift 2
-  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "$@"
+  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "$@"
 }
 
 assert_no_hub_leak() {
@@ -396,6 +396,18 @@ PY
 [[ "$M4_out" == *'OK pane=pending-pane'* ]] || { echo 'hub pending-poll mutant survived' >&2; exit 1; }
 source_must_stay_unchanged M4
 
+# task611: cwd_keys shares the prefix rule — a sibling-worktree cwd maps to
+# the derived key <key>.<suffix> instead of failing closed on an exact miss.
+: >"$TMP/hub.log"
+key_prefix_out="$(WRK_HUB_SCENARIO=hub200 WRK_TEST_CWD="$ROOT.v99" run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+grep -q '^OK pane=pane-a host=machine-a ' <<<"$key_prefix_out"
+python3 - "$TMP/hub.log" <<'PY'
+import json, sys
+records = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+assert json.loads(records[-1]["body"])["cwd_key"] == "repo-a.v99", records
+PY
+printf '%s\n' 'PASS wrk-spillover hub-cwd-keys-prefix'
+
 # Every hub invocation above starts its completion sentinel through the normal
 # spawn path. Reap only the test-owned sentinels before returning to the
 # legacy routing cases, whose fixture logs are intentionally reset below.
@@ -570,3 +582,324 @@ backup_probe_count="$(grep -c 'mac-work.*uptime; herdr agent list' "$TMP/ssh.log
 [[ "$backup_probe_count" -gt 0 ]] || { echo 'duplicate-propagation mutant survived' >&2; exit 1; }
 
 echo 'PASS wrk-spillover mutants-red=6/6'
+
+# task611: sibling-worktree prefix mapping, fail-closed remote worktree
+# preparation, and the explicit --host no-fallback rule (#571).  The fake
+# remote is a real directory tree so the ssh fixture replays the preparation
+# script against real git repos.
+(
+REMOTE_HOME="$TMP/fake-remote"
+LOCAL_REPO="$TMP/local/repo"
+ORIGIN="$TMP/origin.git"
+git init --bare "$ORIGIN" >/dev/null
+git -C "$ORIGIN" symbolic-ref HEAD refs/heads/main
+git clone -q "$ORIGIN" "$LOCAL_REPO" 2>/dev/null
+git -C "$LOCAL_REPO" checkout -q -b main
+git -C "$LOCAL_REPO" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m base
+git -C "$LOCAL_REPO" push -q origin main
+mkdir -p "$REMOTE_HOME/remote"
+git clone -q "$ORIGIN" "$REMOTE_HOME/remote/repo" 2>/dev/null
+
+new_branch_wt() {
+  local branch="$1" suffix="$2"
+  git -C "$LOCAL_REPO" checkout -q -b "$branch" main
+  git -C "$LOCAL_REPO" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m "$branch"
+  git -C "$LOCAL_REPO" push -q origin "$branch"
+  git -C "$LOCAL_REPO" checkout -q main
+  git -C "$LOCAL_REPO" worktree add -q "$TMP/local/repo.$suffix" "$branch"
+}
+new_branch_wt feat-611 v611
+new_branch_wt feat-612 v612
+new_branch_wt feat-613 v613
+
+WT_CONFIG="$TMP/wt-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$LOCAL_REPO\"=\"/remote/repo\"}" 'capacity = 3' >"$WT_CONFIG"
+
+# Missing remote worktree is created via fetch + worktree add on the remote
+# repo root, and the delegated spawn receives the derived remote path.
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"
+create_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$create_out"
+[[ -d "$REMOTE_HOME/remote/repo.v611" ]]
+[[ "$(git -C "$REMOTE_HOME/remote/repo.v611" rev-parse HEAD)" == "$(git -C "$TMP/local/repo.v611" rev-parse HEAD)" ]]
+[[ "$(git -C "$REMOTE_HOME/remote/repo.v611" rev-parse --abbrev-ref HEAD)" == feat-611 ]]
+grep -q -- 'TARGET=/remote/repo.v611 sh -s' "$TMP/ssh.log"
+grep -q -- 'BASE=/remote/repo .*TARGET=/remote/repo.v611' "$TMP/ssh.log"
+grep -q -- ' -c /remote/repo.v611 ' "$TMP/ssh.log"
+printf '%s\n' 'PASS wrk-spillover remote-worktree-create'
+
+# An existing remote worktree at the same branch and HEAD is reused; the
+# create leg must not run.
+git -C "$REMOTE_HOME/remote/repo" fetch -q origin feat-612
+git -C "$REMOTE_HOME/remote/repo" worktree add -q -b feat-612 "$REMOTE_HOME/remote/repo.v612" origin/feat-612
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"
+reuse_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v612" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$reuse_out"
+grep -q -- 'TARGET=/remote/repo.v612 sh -s' "$TMP/ssh.log"
+grep -q -- 'BASE=' "$TMP/ssh.log" && { echo 'reuse case unexpectedly ran worktree create' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover remote-worktree-reuse'
+
+# An existing remote directory at a different branch/HEAD is terminal: no
+# spawn reaches the remote and nothing is overwritten.
+git -C "$REMOTE_HOME/remote/repo" worktree add -q --detach "$REMOTE_HOME/remote/repo.v613" origin/main
+mismatch_sha_before="$(git -C "$REMOTE_HOME/remote/repo.v613" rev-parse HEAD)"
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/herdr.log"
+set +e
+mismatch_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v613" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+mismatch_rc=$?
+set -e
+[[ "$mismatch_rc" -eq 2 ]]
+grep -q 'refusing to overwrite' <<<"$mismatch_out"
+grep -q 'wrk spawn' "$TMP/ssh.log" && { echo 'mismatch case reached the remote spawn' >&2; exit 1; }
+[[ ! -s "$TMP/scp.log" ]]
+[[ "$(git -C "$REMOTE_HOME/remote/repo.v613" rev-parse HEAD)" == "$mismatch_sha_before" ]]
+printf '%s\n' 'PASS wrk-spillover remote-worktree-mismatch'
+
+# Same branch, different HEAD: the remote worktree was created for an older
+# commit of feat-616, then the branch advanced.  Reusing it would silently
+# verify stale code — the sha half of the EXISTS comparison is what stops it.
+new_branch_wt feat-616 v616
+git -C "$REMOTE_HOME/remote/repo" fetch -q origin feat-616
+git -C "$REMOTE_HOME/remote/repo" worktree add -q -b feat-616 "$REMOTE_HOME/remote/repo.v616" origin/feat-616
+git -C "$TMP/local/repo.v616" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m advance
+git -C "$TMP/local/repo.v616" push -q origin feat-616
+remote_v616_sha_before="$(git -C "$REMOTE_HOME/remote/repo.v616" rev-parse HEAD)"
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"
+set +e
+stale_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v616" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+stale_rc=$?
+set -e
+[[ "$stale_rc" -eq 2 ]]
+grep -q 'refusing to overwrite' <<<"$stale_out"
+grep -q 'wrk spawn' "$TMP/ssh.log" && { echo 'stale-head case reached the remote spawn' >&2; exit 1; }
+[[ "$(git -C "$REMOTE_HOME/remote/repo.v616" rev-parse HEAD)" == "$remote_v616_sha_before" ]]
+printf '%s\n' 'PASS wrk-spillover remote-worktree-stale-head'
+
+# Same HEAD, different branch: two branches point at one commit, the remote
+# worktree is on the other one.  Only the branch half of the EXISTS
+# comparison catches this.
+git -C "$LOCAL_REPO" branch -q feat-617a main
+git -C "$LOCAL_REPO" branch -q feat-617b main
+git -C "$LOCAL_REPO" push -q origin feat-617a feat-617b
+git -C "$LOCAL_REPO" worktree add -q "$TMP/local/repo.v617" feat-617a
+git -C "$REMOTE_HOME/remote/repo" fetch -q origin feat-617b:feat-617b
+git -C "$REMOTE_HOME/remote/repo" worktree add -q "$REMOTE_HOME/remote/repo.v617" feat-617b
+[[ "$(git -C "$TMP/local/repo.v617" rev-parse HEAD)" == "$(git -C "$REMOTE_HOME/remote/repo.v617" rev-parse HEAD)" ]]
+set +e
+brmis_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v617" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+brmis_rc=$?
+set -e
+[[ "$brmis_rc" -eq 2 ]]
+grep -q 'refusing to overwrite' <<<"$brmis_out"
+printf '%s\n' 'PASS wrk-spillover remote-worktree-branch-mismatch'
+
+# A plain (non-git) remote directory where a git worktree is expected is
+# refuse-and-preserve, never adopt-or-wipe.
+new_branch_wt feat-618 v618
+mkdir -p "$REMOTE_HOME/remote/repo.v618"
+: >"$TMP/ssh.log"
+set +e
+notgit_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v618" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+notgit_rc=$?
+set -e
+[[ "$notgit_rc" -eq 2 ]]
+grep -q 'not a git worktree; refusing' <<<"$notgit_out"
+[[ -d "$REMOTE_HOME/remote/repo.v618" ]]
+grep -q 'wrk spawn' "$TMP/ssh.log" && { echo 'notgit case reached the remote spawn' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover remote-worktree-notgit'
+
+# A branch pushed earlier but now ahead of origin locally is fail-closed:
+# the remote can only check out what origin advertises.
+new_branch_wt feat-619 v619
+git -C "$TMP/local/repo.v619" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m ahead
+set +e
+ahead_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v619" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+ahead_rc=$?
+set -e
+[[ "$ahead_rc" -eq 2 ]]
+grep -q "differs from origin/feat-619" <<<"$ahead_out"
+[[ ! -d "$REMOTE_HOME/remote/repo.v619" ]]
+printf '%s\n' 'PASS wrk-spillover remote-worktree-ahead-origin'
+
+# An unpushed local branch can never produce the right remote checkout.
+git -C "$LOCAL_REPO" checkout -q -b feat-nopush main
+git -C "$LOCAL_REPO" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m nopush
+git -C "$LOCAL_REPO" checkout -q main
+git -C "$LOCAL_REPO" worktree add -q "$TMP/local/repo.v614" feat-nopush
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"
+set +e
+nopush_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v614" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+nopush_rc=$?
+set -e
+[[ "$nopush_rc" -eq 2 ]]
+grep -q "branch 'feat-nopush' is not pushed to origin" <<<"$nopush_out"
+[[ ! -d "$REMOTE_HOME/remote/repo.v614" ]]
+grep -q 'wrk spawn' "$TMP/ssh.log" && { echo 'unpushed case reached the remote spawn' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover remote-worktree-unpushed'
+
+# A detached local worktree whose commit is not on any origin ref is equally
+# terminal.
+git -C "$LOCAL_REPO" checkout -q -b feat-detached main
+git -C "$LOCAL_REPO" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m detached
+detached_sha="$(git -C "$LOCAL_REPO" rev-parse HEAD)"
+git -C "$LOCAL_REPO" checkout -q main
+git -C "$LOCAL_REPO" branch -q -D feat-detached
+git -C "$LOCAL_REPO" worktree add -q --detach "$TMP/local/repo.v615" "$detached_sha"
+: >"$TMP/ssh.log"
+set +e
+detached_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v615" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+detached_rc=$?
+set -e
+[[ "$detached_rc" -eq 2 ]]
+grep -q 'not reachable from origin' <<<"$detached_out"
+[[ ! -d "$REMOTE_HOME/remote/repo.v615" ]]
+printf '%s\n' 'PASS wrk-spillover remote-worktree-detached-unpushed'
+
+# Boundary-less prefixes must not map: <key>foo is a different directory, and
+# a subdirectory of a sibling worktree is neither a suffix nor a subpath of
+# the key.
+set +e
+boundary_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="${LOCAL_REPO}foo" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+boundary_rc=$?
+set -e
+[[ "$boundary_rc" -eq 2 ]]
+grep -q 'has no cwd_map entry' <<<"$boundary_out"
+mkdir -p "$TMP/local/repo.v611/subdir"
+set +e
+nested_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611/subdir" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+nested_rc=$?
+set -e
+[[ "$nested_rc" -eq 2 ]]
+grep -q 'has no cwd_map entry' <<<"$nested_out"
+printf '%s\n' 'PASS wrk-spillover prefix-boundary-negative'
+
+# The longest matching key wins: <repo>.v611.wt matches both <repo> (suffix
+# "v611.wt") and <repo>.v611 (suffix "wt"); the longer key's value is the base.
+LONG_CONFIG="$TMP/wt-long-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$LOCAL_REPO\"=\"/remote/short\" \"$TMP/local/repo.v611\"=\"/remote/long\"}" 'capacity = 3' >"$LONG_CONFIG"
+mkdir -p "$REMOTE_HOME/remote/long.wt"
+: >"$TMP/ssh.log"
+long_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611.wt" \
+  WRK_TEST_HOSTS_CONFIG="$LONG_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$long_out"
+grep -q -- ' -c /remote/long.wt ' "$TMP/ssh.log"
+grep -q -- '/remote/short' "$TMP/ssh.log" && { echo 'longest-key rule lost to the shorter key' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover prefix-longest-key'
+
+# Key order must not matter: with the longer key first, "last match wins"
+# would pick the short key — the longest-key rule still picks /remote/long.
+LONG_FIRST_CONFIG="$TMP/wt-long-first-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$TMP/local/repo.v611\"=\"/remote/long\" \"$LOCAL_REPO\"=\"/remote/short\"}" 'capacity = 3' >"$LONG_FIRST_CONFIG"
+: >"$TMP/ssh.log"
+longfirst_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611.wt" \
+  WRK_TEST_HOSTS_CONFIG="$LONG_FIRST_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$longfirst_out"
+grep -q -- ' -c /remote/long.wt ' "$TMP/ssh.log"
+grep -q -- '/remote/short' "$TMP/ssh.log" && { echo 'key order decided the match, not key length' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover prefix-longest-key-order'
+
+# Subpath mapping: an existing remote subdir passes through; a missing one is
+# fail-closed (it is inside a checkout, not a creatable worktree).
+mkdir -p "$LOCAL_REPO/subdir" "$REMOTE_HOME/remote/repo/subdir"
+: >"$TMP/ssh.log"
+subpath_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$LOCAL_REPO/subdir" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$subpath_out"
+grep -q -- ' -c /remote/repo/subdir ' "$TMP/ssh.log"
+mkdir -p "$LOCAL_REPO/submissing"
+set +e
+submiss_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$LOCAL_REPO/submissing" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+submiss_rc=$?
+set -e
+[[ "$submiss_rc" -eq 2 ]]
+grep -q 'sync the remote repository' <<<"$submiss_out"
+printf '%s\n' 'PASS wrk-spillover prefix-subpath'
+
+# Exact mappings keep the pass-through contract: no preparation probe runs.
+: >"$TMP/ssh.log"
+exact_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$LOCAL_REPO" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$exact_out"
+grep -q -- ' -c /remote/repo ' "$TMP/ssh.log"
+grep -q 'sh -s' "$TMP/ssh.log" && { echo 'exact mapping ran a worktree probe' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover exact-mapping-no-prepare'
+
+# #571: an explicit --host never falls back to a quiet local spawn — the
+# remote rc propagates whether the spawn itself failed or the host was
+# unreachable.
+: >"$TMP/ssh.log"; : >"$TMP/herdr.log"
+set +e
+explicit_out="$(WRK_SSH_SCENARIO=desktop-spawn-fails run_wrk "$ROOT/bin/wrk" -w local --host desktop 2>&1)"
+explicit_rc=$?
+set -e
+[[ "$explicit_rc" -eq 42 ]]
+grep -q 'no local fallback' <<<"$explicit_out"
+grep -q 'host=local' <<<"$explicit_out" && { echo 'explicit host spawn failure fell back to local' >&2; exit 1; }
+[[ ! -s "$TMP/herdr.log" ]]
+: >"$TMP/ssh.log"
+set +e
+down_out="$(WRK_SSH_SCENARIO=desktop-down run_wrk "$ROOT/bin/wrk" -w local --host desktop 2>&1)"
+down_rc=$?
+set -e
+[[ "$down_rc" -ne 0 ]]
+grep -q 'no local fallback' <<<"$down_out"
+grep -q 'host=local' <<<"$down_out" && { echo 'unreachable explicit host fell back to local' >&2; exit 1; }
+[[ ! -s "$TMP/herdr.log" ]]
+printf '%s\n' 'PASS wrk-spillover explicit-host-no-fallback'
+
+# Mutants: each weakening must turn its matching assertion red.
+MUT_BOUNDARY="$TMP/wrk-prefix-boundary"; cp "$ROOT/bin/wrk" "$MUT_BOUNDARY"
+sed -i.bak 's/cwd\.startswith(local + "\.")/cwd.startswith(local)/' "$MUT_BOUNDARY"
+chmod +x "$MUT_BOUNDARY"
+grep -qF 'cwd.startswith(local)' "$MUT_BOUNDARY" || { echo 'boundary mutant did not apply' >&2; exit 1; }
+mkdir -p "$REMOTE_HOME/remote/repofoo"
+boundary_mut_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="${LOCAL_REPO}foo" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$MUT_BOUNDARY" -w w1 --host desktop 2>&1 || true)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$boundary_mut_out" || { echo 'prefix-boundary mutant survived' >&2; exit 1; }
+
+MUT_FALLBACK="$TMP/wrk-explicit-fallback"; cp "$ROOT/bin/wrk" "$MUT_FALLBACK"
+sed -i.bak 's/\[\[ "\$requested" != auto \]\]/[[ "$requested" == never ]]/' "$MUT_FALLBACK"
+chmod +x "$MUT_FALLBACK"
+grep -qF '[[ "$requested" == never ]]' "$MUT_FALLBACK" || { echo 'fallback mutant did not apply' >&2; exit 1; }
+set +e
+fallback_mut_out="$(WRK_SSH_SCENARIO=desktop-spawn-fails run_wrk "$MUT_FALLBACK" -w local --host desktop 2>&1)"
+set -e
+grep -q 'host=local' <<<"$fallback_mut_out" || { echo 'explicit-fallback mutant survived' >&2; exit 1; }
+
+MUT_PREPARE="$TMP/wrk-prepare-skip"; cp "$ROOT/bin/wrk" "$MUT_PREPARE"
+sed -i.bak 's/\[\[ "\$kind" == exact \]\] && return 0/return 0/' "$MUT_PREPARE"
+chmod +x "$MUT_PREPARE"
+grep -qF '  return 0' "$MUT_PREPARE" || { echo 'prepare mutant did not apply' >&2; exit 1; }
+prepare_mut_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v613" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$MUT_PREPARE" -w w1 --host desktop 2>&1 || true)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$prepare_mut_out" || { echo 'prepare-skip mutant survived' >&2; exit 1; }
+
+# Removing the HEAD half of the EXISTS comparison must turn the stale-head
+# case green — the remote worktree would be silently reused at the old sha.
+MUT_SHA="$TMP/wrk-no-sha-compare"; cp "$ROOT/bin/wrk" "$MUT_SHA"
+sed -i.bak 's/ || "\$remote_sha" != "\$sha"//' "$MUT_SHA"
+chmod +x "$MUT_SHA"
+grep -qF '"$remote_branch" != "${branch:-HEAD}" ]]' "$MUT_SHA" || { echo 'sha-compare mutant did not apply' >&2; exit 1; }
+sha_mut_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v616" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$MUT_SHA" -w w1 --host desktop 2>&1 || true)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$sha_mut_out" || { echo 'sha-compare mutant survived' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover task611 mutants-red=4/4'
+)
