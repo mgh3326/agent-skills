@@ -456,8 +456,9 @@ wake = "panewire"
 - `cwd_map`은 접두 매핑이다: cwd가 키와 같거나 `<키>.<suffix>`(형제 worktree, suffix는
   `[A-Za-z0-9._-]+`)이면 `<값>`·`<값>.<suffix>`로, `<키>/<하위경로>`이면 `<값>/<하위경로>`로
   매핑한다. 가장 긴 키가 이기고 `<키>foo`처럼 경계가 아닌 접두는 매칭하지 않는다.
-- 유도된 경로(suffix·subpath 매핑)는 원격에서 준비한다: 없으면 원격 레포 루트에서
-  `git fetch` + `git worktree add`로 만들고, 이미 있으면 branch·HEAD가 로컬과 같은지
+- 유도된 경로(suffix·subpath 매핑)는 원격에서 확인한다: 형제 worktree(suffix)가 없으면
+  원격 레포 루트에서 `git fetch` + `git worktree add`로 만들고, 없는 subpath는 만들지
+  않고 fail-closed다(원격 레포를 먼저 동기화). 이미 있으면 branch·HEAD가 로컬과 같은지
   확인한다. 로컬 브랜치가 origin에 push되지 않았거나 원격이 다른 커밋이면 덮어쓰지 않고
   fail-closed다 — push·정렬·수동 생성 중 무엇을 하면 되는지 메시지가 나온다. 정확히
   일치하는 리포 루트 매핑은 기존처럼 통과한다.
