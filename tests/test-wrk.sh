@@ -308,6 +308,15 @@ spawn_help_out="$("$WRK" spawn --help)"
 grep -q -- '--landing-strict' <<<"$spawn_help_out"
 grep -q -- '--role worker|builder (legacy alias: captain)' <<<"$spawn_help_out"
 grep -q -- 'builder-opus' <<<"$spawn_help_out"
+# Task 612: the help text must document the kimi-code/ namespace and must not
+# carry the retired kimi-for-coding/ prefix.
+grep -q -- 'kimi --auto -m kimi-code/k3' <<<"$spawn_help_out" ||
+  fail "spawn --help must document kimi-code/k3"
+grep -q -- 'kimi --auto -m kimi-code/kimi-for-coding' <<<"$spawn_help_out" ||
+  fail "spawn --help must document kimi-code/kimi-for-coding"
+if grep -q 'kimi-for-coding/' <<<"$spawn_help_out"; then
+  fail "spawn --help still carries the old kimi-for-coding/ namespace"
+fi
 reap_help_out="$("$WRK" reap --help)"
 grep -q -- '--include-builders' <<<"$reap_help_out"
 grep -q -- '--include-captains legacy alias' <<<"$reap_help_out"
@@ -438,7 +447,23 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
 # shell command in a pane and stalls (task201). Task 240 later admitted the
 # same profile under --role builder (pilot) without changing this argv.
 : >"$TMP/herdr.log"
-devin_idle_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
+# The fake clock below answers every `date +%s` with 1000 until the first
+# herdr call matching FAKECLOCK_AFTER is logged, then 1000+FAKECLOCK_JUMP
+# (#606).
+# With FAKECLOCK_JUMP=0 it is frozen, so the attempt cap — not how fast this
+# host runs 120 fixture calls — is what ends a never-ready poll.
+mkdir -p "$TMP/jumpclock"
+cat >"$TMP/jumpclock/date" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == +%s ]]; then
+  seen="$(grep -c "^$FAKECLOCK_AFTER" "$WRK_FIXTURE_LOG" 2>/dev/null || true)"
+  if (( ${seen:-0} >= 1 )); then echo $(( 1000 + FAKECLOCK_JUMP )); else echo 1000; fi
+  exit 0
+fi
+exec /bin/date "$@"
+SH
+chmod +x "$TMP/jumpclock/date"
+devin_idle_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
 grep -q 'model=devin-swe2' <<<"$devin_idle_out"
 grep -q 'status=idle' <<<"$devin_idle_out"
 grep -q 'landed=yes' <<<"$devin_idle_out"
@@ -447,10 +472,12 @@ devin_run_line="$(grep '^pane run ' "$TMP/herdr.log")"
 [[ "$devin_run_line" == 'pane run w:p1 devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
   fail "devin pane-run argv snapshot mismatch: $devin_run_line"
 # Detection and the idle wait share one 30s window, so the wait gets what is
-# left of it (whole seconds; never more than 30000ms).
+# left of it (whole seconds; never more than 30000ms). The clock is frozen so
+# host speed cannot move the value (#606: the shell-ready poll now also runs
+# inside the window, and on a loaded host 2-3s had already passed).
 devin_wait_line="$(grep '^agent wait ' "$TMP/herdr.log")"
 if ! [[ "$devin_wait_line" =~ ^agent\ wait\ w:p1\ --until\ idle\ --timeout\ ([0-9]+)$ ]] ||
-   (( BASH_REMATCH[1] < 29000 || BASH_REMATCH[1] > 30000 )); then
+   (( BASH_REMATCH[1] != 30000 )); then
   fail "devin welcome wait argv drifted: $devin_wait_line"
 fi
 grep -qx 'agent get w:p1' "$TMP/herdr.log" ||
@@ -510,7 +537,8 @@ devin_readiness_failure_case() {
   local scenario="$1" want_rc="$2" out rc
   : >"$TMP/herdr.log"
   set +e
-  out="$(TEST_FIXTURE_SCENARIO="$scenario" spawn_base devin-swe2 2>&1)"
+  # Frozen clock (#606): the attempt cap, not host speed, ends never-detect.
+  out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO="$scenario" spawn_base devin-swe2 2>&1)"
   rc=$?
   set -e
   [[ "$rc" -eq "$want_rc" ]] ||
@@ -523,7 +551,7 @@ devin_readiness_failure_case() {
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then
     fail "$scenario delivered a brief before ownership/readiness"
   fi
-  grep -qx 'pane process-info --pane w:p1' "$TMP/herdr.log" ||
+  sed -n '/^pane run /,$p' "$TMP/herdr.log" | grep -qx 'pane process-info --pane w:p1' ||
     fail "$scenario omitted failure process diagnostics"
   grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
     fail "$scenario leaked the failed pane"
@@ -611,7 +639,7 @@ set -e
 grep -q 'Devin pane startup failed: agent rename exited 6; pane=w:p1' <<<"$devin_rename_out" ||
   fail "devin rename failure lost its diagnostic: $devin_rename_out"
 devin_rename_no="$(grep -n '^agent rename w:p1 fixture$' "$TMP/herdr.log" | cut -d: -f1)"
-devin_info_no="$(grep -n '^pane process-info --pane w:p1$' "$TMP/herdr.log" | cut -d: -f1)"
+devin_info_no="$(grep -n '^pane process-info --pane w:p1$' "$TMP/herdr.log" | tail -n1 | cut -d: -f1)"
 if [[ -z "$devin_rename_no" || -z "$devin_info_no" ]] || (( devin_rename_no > devin_info_no )); then
   fail "devin rename failure must record process-info after the failed rename"
 fi
@@ -636,6 +664,170 @@ spawn_base codex-terra >/dev/null
 grep -qx 'agent start fixture --kind codex --pane w:p1 --timeout 120000 -- --yolo -m gpt-5.6-terra -c model_reasoning_effort=medium' "$TMP/herdr.log" ||
   fail "non-Devin agent-start path drifted"
 if grep -q '^pane run ' "$TMP/herdr.log"; then fail "non-Devin kind reached pane run"; fi
+
+# #606: a fresh pane whose shell is still running rc subprocesses answers
+# `agent start` with agent_pane_busy (real herdr 0.9.0 envelope, stderr, rc=1).
+# Inside the START_TIMEOUT window that is retried with the 250ms poll; every
+# other start failure still fails at once. Removing the retry turns the
+# shell-busy cases red; retrying every error turns the non-busy cases red.
+for shell_busy_pair in "opus:claude" "codex-terra:codex"; do
+  shell_busy_model="${shell_busy_pair%%:*}"
+  shell_busy_kind="${shell_busy_pair#*:}"
+  : >"$TMP/herdr.log"
+  shell_busy_out="$(TEST_FIXTURE_SCENARIO=shell-busy spawn_base "$shell_busy_model" 2>&1)" ||
+    fail "$shell_busy_model: shell ready on the fourth start must still spawn: $shell_busy_out"
+  grep -q '^OK pane=w:p1' <<<"$shell_busy_out" ||
+    fail "$shell_busy_model: late shell did not reach the OK line: $shell_busy_out"
+  grep -q 'landed=yes' <<<"$shell_busy_out" ||
+    fail "$shell_busy_model: late shell brief did not land: $shell_busy_out"
+  [[ "$(grep -c "^agent start fixture --kind $shell_busy_kind --pane w:p1 " "$TMP/herdr.log")" -eq 4 ]] ||
+    fail "$shell_busy_model: agent_pane_busy x3 must be retried on the tab-create pane until accepted"
+  [[ "$(grep -c '"code":"agent_pane_busy"' <<<"$shell_busy_out")" -eq 3 ]] ||
+    fail "$shell_busy_model: each busy refusal must stay visible on stderr: $shell_busy_out"
+  [[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+    fail "$shell_busy_model: late shell must receive exactly one brief"
+  first_prompt_no="$(grep -n '^agent prompt ' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"
+  last_start_no="$(grep -n '^agent start ' "$TMP/herdr.log" | tail -n1 | cut -d: -f1)"
+  (( last_start_no < first_prompt_no )) || fail "$shell_busy_model: brief delivered before the accepted start"
+  if grep -q '^pane close ' "$TMP/herdr.log"; then fail "$shell_busy_model: late-shell pane was closed"; fi
+done
+
+# A shell that never frees the foreground fails closed at the window: the
+# attempt cap bounds the loop when sleep is disabled (30000/250 for Claude),
+# the pane is closed and no brief is delivered.
+: >"$TMP/herdr.log"
+set +e
+shell_never_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO=shell-never-ready spawn_base opus 2>&1)"
+shell_never_rc=$?
+set -e
+[[ "$shell_never_rc" -eq 1 ]] || fail "never-ready shell expected rc=1, got $shell_never_rc: $shell_never_out"
+grep -q 'agent start failed: shell not ready within the 30000ms window (agent_pane_busy x120); pane=w:p1' <<<"$shell_never_out" ||
+  fail "never-ready shell lost its bounded-window diagnostic: $shell_never_out"
+[[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 120 ]] ||
+  fail "never-ready shell must stop at the 30000/250 attempt cap"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "never-ready shell leaked its pane"
+if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "never-ready shell delivered a brief"; fi
+
+# Non-busy start failures keep failing on the first attempt with herdr's rc.
+for shell_err_pair in "start-not-ready:1:agent_not_ready" "start-pane-unavailable:3:agent_pane_unavailable"; do
+  IFS=: read -r shell_err_scenario shell_err_rc shell_err_code <<<"$shell_err_pair"
+  : >"$TMP/herdr.log"
+  set +e
+  shell_err_out="$(TEST_FIXTURE_SCENARIO="$shell_err_scenario" spawn_base opus 2>&1)"
+  shell_err_got=$?
+  set -e
+  [[ "$shell_err_got" -eq "$shell_err_rc" ]] ||
+    fail "$shell_err_scenario expected rc=$shell_err_rc, got $shell_err_got: $shell_err_out"
+  [[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 1 ]] ||
+    fail "$shell_err_scenario must not be retried"
+  grep -q "\"code\":\"$shell_err_code\"" <<<"$shell_err_out" ||
+    fail "$shell_err_scenario lost herdr's error envelope: $shell_err_out"
+  grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "$shell_err_scenario leaked its pane"
+  if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "$shell_err_scenario delivered a brief"; fi
+done
+
+# Window boundaries on a fake clock: every `date +%s` after the first agent
+# start (or, for Devin, the first process-info) reads FAKECLOCK_JUMP seconds
+# later. Each retry hands herdr only what is left of the window, and herdr
+# refuses a start timeout of 3000ms or less, so Claude's 30s window accepts a
+# retry at 26s (4000ms left) and fails closed at 27s, 30s and 31s. Codex's
+# 120s window still retries at 31s.
+shell_window_case() {
+  local model="$1" scenario="$2" after="$3" jump="$4"
+  : >"$TMP/herdr.log"
+  set +e
+  SHELL_WINDOW_OUT="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER="$after" FAKECLOCK_JUMP="$jump" \
+    WRK_FIXTURE_SHELL_BUSY_COUNT=1 TEST_FIXTURE_SCENARIO="$scenario" spawn_base "$model" 2>&1)"
+  SHELL_WINDOW_RC=$?
+  set -e
+}
+shell_window_case opus shell-busy 'agent start ' 26
+[[ "$SHELL_WINDOW_RC" -eq 0 ]] || fail "retry at 26s of 30s must spawn: $SHELL_WINDOW_OUT"
+grep -q '^agent start fixture --kind claude --pane w:p1 --timeout 4000 -- ' "$TMP/herdr.log" ||
+  fail "retry at 26s must hand herdr only the 4000ms left of the window"
+for shell_window_jump in 27 29 30 31; do
+  shell_window_case opus shell-busy 'agent start ' "$shell_window_jump"
+  [[ "$SHELL_WINDOW_RC" -eq 1 ]] ||
+    fail "retry at ${shell_window_jump}s of 30s expected rc=1, got $SHELL_WINDOW_RC: $SHELL_WINDOW_OUT"
+  grep -q 'shell not ready within the 30000ms window (agent_pane_busy x1); pane=w:p1' <<<"$SHELL_WINDOW_OUT" ||
+    fail "retry at ${shell_window_jump}s lost its window diagnostic: $SHELL_WINDOW_OUT"
+  [[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 1 ]] ||
+    fail "retry at ${shell_window_jump}s must not start again past the window"
+  grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "retry at ${shell_window_jump}s leaked its pane"
+  if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "retry at ${shell_window_jump}s delivered a brief"; fi
+done
+# A second ticking over between the window's start reading and the first
+# attempt must not shorten a first-attempt success: it keeps the pre-#606
+# argv (tester R1 repro: `date +%s` 1000 then 1001 gave --timeout 29000).
+mkdir -p "$TMP/tickclock"
+cat >"$TMP/tickclock/date" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == +%s ]]; then
+  if [[ -e "$FAKECLOCK_STATE" ]]; then echo 1001; else : >"$FAKECLOCK_STATE"; echo 1000; fi
+  exit 0
+fi
+exec /bin/date "$@"
+SH
+chmod +x "$TMP/tickclock/date"
+: >"$TMP/herdr.log"
+rm -f "$TMP/tickclock.state"
+tick_out="$(PATH="$TMP/tickclock:$PATH" FAKECLOCK_STATE="$TMP/tickclock.state" spawn_base opus 2>&1)" ||
+  fail "first-attempt start across a second tick must spawn: $tick_out"
+[[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "first-attempt start across a second tick must start once"
+grep -q '^agent start fixture --kind claude --pane w:p1 --timeout 30000 -- ' "$TMP/herdr.log" ||
+  fail "first-attempt start must keep --timeout 30000 across a second tick: $(grep '^agent start ' "$TMP/herdr.log")"
+shell_window_case codex-terra shell-busy 'agent start ' 31
+[[ "$SHELL_WINDOW_RC" -eq 0 ]] || fail "codex retry at 31s of 120s must spawn: $SHELL_WINDOW_OUT"
+grep -q '^agent start fixture --kind codex --pane w:p1 --timeout 89000 -- ' "$TMP/herdr.log" ||
+  fail "codex retry at 31s must hand herdr the 89000ms left of its window"
+
+# Devin types through `pane run`, which checks nothing, so wrk polls
+# process-info before it until the shell holds the foreground alone. The same
+# window then covers detection and the idle wait.
+: >"$TMP/herdr.log"
+devin_shell_out="$(TEST_FIXTURE_SCENARIO=devin-shell-busy spawn_base devin-swe2 2>&1)" ||
+  fail "Devin with a shell ready on the fourth poll must still spawn: $devin_shell_out"
+grep -q 'landed=yes' <<<"$devin_shell_out" || fail "late-shell Devin did not land: $devin_shell_out"
+devin_shell_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+[[ "$(head -n "$devin_shell_run_no" "$TMP/herdr.log" | grep -c '^pane process-info --pane w:p1$')" -eq 4 ]] ||
+  fail "late-shell Devin must poll process-info on the tab-create pane until ready, then pane run"
+if grep -q '^pane close ' "$TMP/herdr.log"; then fail "late-shell Devin pane was closed"; fi
+devin_shell_failure_case() {
+  local scenario="$1" diag="$2" out rc
+  : >"$TMP/herdr.log"
+  set +e
+  out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO="$scenario" spawn_base devin-swe2 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 1 ]] || fail "$scenario expected rc=1, got rc=$rc: $out"
+  grep -q "Devin pane startup failed: $diag; pane=w:p1" <<<"$out" || fail "$scenario lost its diagnostic: $out"
+  if grep -q '^pane run \|^agent rename \|^agent prompt ' "$TMP/herdr.log"; then
+    fail "$scenario ran Devin, renamed or delivered into an unready shell"
+  fi
+  grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "$scenario leaked its pane"
+}
+devin_shell_failure_case devin-shell-never-ready 'shell not ready within 30000ms (foreground busy x120)'
+devin_shell_failure_case devin-process-info-fail 'pane process-info exited 3 before pane run'
+[[ "$(grep -c '^pane process-info ' "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "a failed process-info must not be polled again (one check + one diagnostic)"
+devin_shell_failure_case devin-process-info-garbage 'pane process-info returned an invalid envelope before pane run'
+[[ "$(grep -c '^pane process-info ' "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "an unreadable process-info must not be polled again (one check + one diagnostic)"
+shell_window_case devin-swe2 devin-shell-busy 'pane process-info ' 29
+[[ "$SHELL_WINDOW_RC" -eq 0 ]] || fail "Devin shell ready at 29s of 30s must spawn: $SHELL_WINDOW_OUT"
+grep -qx 'agent wait w:p1 --until idle --timeout 1000' "$TMP/herdr.log" ||
+  fail "Devin shell ready at 29s must leave the idle wait only the 1000ms left"
+for shell_window_jump in 30 31; do
+  shell_window_case devin-swe2 devin-shell-busy 'pane process-info ' "$shell_window_jump"
+  [[ "$SHELL_WINDOW_RC" -eq 1 ]] ||
+    fail "Devin shell at ${shell_window_jump}s expected rc=1, got $SHELL_WINDOW_RC: $SHELL_WINDOW_OUT"
+  grep -q 'shell not ready within 30000ms (foreground busy x1)' <<<"$SHELL_WINDOW_OUT" ||
+    fail "Devin shell at ${shell_window_jump}s lost its window diagnostic: $SHELL_WINDOW_OUT"
+  if grep -q '^pane run ' "$TMP/herdr.log"; then fail "Devin shell at ${shell_window_jump}s ran past the window"; fi
+  grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "Devin shell at ${shell_window_jump}s leaked its pane"
+done
+echo "PASS task606 shell-ready wait: agent_pane_busy retry, Devin process-info poll, window bound, fail-closed"
 
 expect_exit 2 spawn_base devin-swe2 --effort high
 # Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker
@@ -707,17 +899,19 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
 
 : >"$TMP/herdr.log"
 spawn_base kimi-k3 >/dev/null
-grep -q -- '--kind kimi' "$TMP/herdr.log"
-grep -q -- '--auto' "$TMP/herdr.log"
-grep -q -- '-m kimi-for-coding/k3' "$TMP/herdr.log"
+kimi_k3_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$kimi_k3_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-code/k3' ]] ||
+  fail "kimi-k3 start argv snapshot mismatch: $kimi_k3_start"
 : >"$TMP/herdr.log"
 spawn_base kimi-k27 >/dev/null
-grep -q -- '--kind kimi' "$TMP/herdr.log"
-grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
+kimi_k27_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$kimi_k27_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-code/kimi-for-coding' ]] ||
+  fail "kimi-k27 start argv snapshot mismatch: $kimi_k27_start"
 : >"$TMP/herdr.log"
 spawn_base kimi-k27-code >/dev/null
-grep -q -- '--kind kimi' "$TMP/herdr.log"
-grep -q -- '-m kimi-for-coding/kimi-for-coding' "$TMP/herdr.log"
+kimi_k27_code_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$kimi_k27_code_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-code/kimi-for-coding' ]] ||
+  fail "kimi-k27-code start argv snapshot mismatch: $kimi_k27_code_start"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3 -p "$PROMPT" -w w -l fixture --effort high
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
@@ -753,9 +947,9 @@ echo "PASS kimi-trust-canonical-filename"
 # profile — kimi-k3/kimi-k27 must NOT get KIMI_CODE_HOME.
 : >"$TMP/herdr.log"
 spawn_base kimi-k3-low >/dev/null
-grep -q -- '--kind kimi' "$TMP/herdr.log"
-grep -q -- '--auto' "$TMP/herdr.log"
-grep -q -- '-m kimi-for-coding/k3' "$TMP/herdr.log"
+kimi_low_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$kimi_low_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-code/k3' ]] ||
+  fail "kimi-k3-low start argv snapshot mismatch: $kimi_low_start"
 grep -q -- '--env KIMI_CODE_HOME=' "$TMP/herdr.log"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m kimi-k3-low -p "$PROMPT" -w w -l fixture --effort high
@@ -768,6 +962,78 @@ if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
 : >"$TMP/herdr.log"
 spawn_base kimi-k27-code >/dev/null
 if grep -q -- 'KIMI_CODE_HOME' "$TMP/herdr.log"; then exit 1; fi
+
+# Task 612: kimi-clone-home must carry kimi-code/ namespace config into the clone
+# byte-identically (a fresh kimi 2.0.2 install — e.g. desktop — has only
+# `kimi-code/*` model entries, and the clone is what kimi-k3-low runs against).
+CLONE_SRC="$TMP/kimi-src-home"
+CLONE_DEST="$TMP/kimi-low-home"
+mkdir -p "$CLONE_SRC/credentials" "$CLONE_SRC/oauth" "$CLONE_SRC/sessions" "$CLONE_SRC/logs"
+cat >"$CLONE_SRC/config.toml" <<'EOF'
+default_model = "kimi-code/k3"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+
+[providers."managed:kimi-code".oauth]
+storage = "file"
+key = "oauth/kimi-code"
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+model = "kimi-for-coding"
+
+[thinking]
+effort = "high"
+EOF
+printf 'fixture-credential\n' >"$CLONE_SRC/credentials/kimi-code.json"
+printf 'fixture-oauth\n' >"$CLONE_SRC/oauth/kimi-code"
+printf 'fixture-device-id\n' >"$CLONE_SRC/device_id"
+printf 'fixture-session\n' >"$CLONE_SRC/sessions/s1.jsonl"
+printf 'fixture-log\n' >"$CLONE_SRC/logs/l1.log"
+env KIMI_CODE_SRC="$CLONE_SRC" KIMI_CODE_LOW_HOME="$CLONE_DEST" \
+  "$ROOT/bin/kimi-clone-home" >/dev/null
+# The clone config must equal the source byte-for-byte except the [thinking]
+# effort rewrite to "low" — compare against a literal expected file so a
+# lossy clone (dropped lines, missing entries) fails here.
+cat >"$TMP/config-expected.toml" <<'EOF'
+default_model = "kimi-code/k3"
+
+[providers."managed:kimi-code"]
+type = "kimi"
+base_url = "https://api.kimi.com/coding/v1"
+
+[providers."managed:kimi-code".oauth]
+storage = "file"
+key = "oauth/kimi-code"
+
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+model = "k3"
+
+[models."kimi-code/kimi-for-coding"]
+provider = "managed:kimi-code"
+model = "kimi-for-coding"
+
+[thinking]
+effort = "low"
+EOF
+cmp "$TMP/config-expected.toml" "$CLONE_DEST/config.toml" ||
+  fail "clone config.toml must equal source except [thinking] effort=low"
+[[ -f "$CLONE_DEST/credentials/kimi-code.json" ]] || fail "clone must carry credentials/"
+[[ -f "$CLONE_DEST/oauth/kimi-code" ]] || fail "clone must carry oauth/"
+[[ -f "$CLONE_DEST/device_id" ]] || fail "clone must carry device_id"
+[[ ! -e "$CLONE_DEST/sessions" ]] || fail "clone must not carry sessions/"
+[[ ! -e "$CLONE_DEST/logs" ]] || fail "clone must not carry logs/"
+# The clone rewrite must not touch the source home.
+grep -q 'effort = "high"' "$CLONE_SRC/config.toml" ||
+  fail "source config.toml must stay untouched"
+echo "PASS kimi-clone-home copies kimi-code/ namespace entries verbatim"
 
 # ROB-1191 ⑥: Claude opus/sonnet effort wiring via CLI argv (settings.json never written).
 SETTINGS_PATH="${HOME}/.claude/settings.json"
@@ -1359,7 +1625,7 @@ set -e
   fail "arbiter-backed Devin timeout expected rc=7, got $devin_timeout_rc: $devin_timeout_out"
 grep -q 'Devin pane startup failed: welcome_prompt_footer wait exited 7' <<<"$devin_timeout_out" ||
   fail "Devin timeout lost its readiness diagnostic"
-grep -qx 'pane process-info --pane w:p1' "$TMP/herdr.log" ||
+sed -n '/^agent wait /,$p' "$TMP/herdr.log" | grep -qx 'pane process-info --pane w:p1' ||
   fail "Devin timeout omitted process-info"
 grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
   fail "Devin timeout leaked its pane"
@@ -1402,6 +1668,35 @@ d = json.load(sys.stdin)
 assert len(d["quota_pool_records"]) == 1 and d["quota_pool_records"][0]["job_id"] == "arb-devin", d
 '
 echo "PASS task577 undetected Devin closes pane and releases only its arbiter record"
+
+# #606 AC3: a shell that never frees the foreground inside the window fails
+# closed exactly like any other start failure after the record exists — pane
+# closed, this job's quota record released (release event written), and no
+# brief delivered. Dropping the release turns this red.
+rm -f "$TMP/herdr.log"
+set +e
+shell_arb_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO=shell-never-ready spawn_base opus --job arb-shell-busy --t T2 2>&1)"
+shell_arb_rc=$?
+set -e
+[[ "$shell_arb_rc" -eq 1 ]] ||
+  fail "arbiter-backed never-ready shell expected rc=1, got $shell_arb_rc: $shell_arb_out"
+grep -q 'agent start failed: shell not ready within the 30000ms window' <<<"$shell_arb_out" ||
+  fail "arbiter-backed never-ready shell lost its diagnostic: $shell_arb_out"
+grep -q 'arbiter quota-pool record released after spawn failure: claude job=arb-shell-busy' <<<"$shell_arb_out" ||
+  fail "arbiter-backed never-ready shell did not release its quota record: $shell_arb_out"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "arbiter-backed never-ready shell leaked its pane"
+if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "arbiter-backed never-ready shell delivered a brief"; fi
+arb status --job arb-shell-busy --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["quota_pool_records"] == [], d
+'
+python3 - "$ARBITER_INBOX_ROOT/arb-shell-busy/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
+assert any(event.get("kind") == "quota_pool.release" for event in events), events
+PY
+echo "PASS task606 never-ready shell closes pane and releases its arbiter record"
 
 # Task 281: the new devin model variants share scopefuel's single `devin` pool
 # — the gate call uses the only devin spelling installed scopefuel accepts
@@ -1831,6 +2126,93 @@ PY
 echo "PASS plain-spawn-carries-no-operator-request"
 unset TEST_ARBITER_BIN
 
+# ---------------------------------------------------------------------------
+# task #527: --purpose is forwarded verbatim to `scopefuel gate`, the astra
+# counsel path defaults it to `architect`, and a role denial (gate rc 5 → wrk
+# exit 77) is caller-visibly distinct from a quota denial (rc 3) AND from the
+# pre-existing hub quota-policy denial (wrk exit 5).
+# ---------------------------------------------------------------------------
+
+grep -q -- '--purpose' <<<"$spawn_help_out" ||
+  fail "spawn --help lost --purpose"
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 --purpose
+
+# The architect counsel path injects --purpose architect on its own: a plain
+# `-m codex-astra` spawn must reach the gate with the purpose attached.
+: >"$TMP/scopefuel.log"
+rm -f "$TMP/herdr.log"
+astra_ok_out="$(spawn_base codex-astra --job astra-purpose --t T1 2>&1)"
+grep -q '^OK pane=' <<<"$astra_ok_out" ||
+  fail "codex-astra counsel spawn did not pass the gate: $astra_ok_out"
+grep -q -- '--purpose architect' "$TMP/scopefuel.log" ||
+  fail "gate argv log lost --purpose architect: $(cat "$TMP/scopefuel.log")"
+grep -q 'model_reasoning_effort=xhigh' "$TMP/herdr.log" ||
+  fail "codex-astra default effort drifted from xhigh: $(cat "$TMP/herdr.log")"
+echo "PASS 527-astra-counsel-spawn-passes-purpose-architect"
+
+# An explicit allowed purpose still wins over the architect default.
+: >"$TMP/scopefuel.log"
+rm -f "$TMP/herdr.log"
+astra_dir_out="$(spawn_base codex-astra --job astra-purpose-director --t T1 --purpose director 2>&1)"
+grep -q '^OK pane=' <<<"$astra_dir_out" ||
+  fail "codex-astra --purpose director did not spawn: $astra_dir_out"
+grep -q -- '--purpose director' "$TMP/scopefuel.log" ||
+  fail "explicit --purpose director was overridden: $(cat "$TMP/scopefuel.log")"
+echo "PASS 527-explicit-purpose-overrides-architect-default"
+
+# Role denial: a disallowed purpose is refused by the gate with rc 5, which
+# wrk remaps to exit 77 — exit 5 is already quota_hub_policy_gate's
+# hub-quota-policy denial, so sharing it would let a caller misread a role
+# denial as a quota stop.
+set +e
+role_denied_out="$(spawn_deny "$TMP/herdr-astra-role.log" codex-astra --job astra-role --t T1 \
+  --purpose worker 2>&1)"
+role_denied_rc=$?
+set -e
+[[ "$role_denied_rc" -eq 77 ]] ||
+  fail "disallowed purpose must role-deny with wrk rc=77 (rc=$role_denied_rc): $role_denied_out"
+grep -q 'role_restricted' <<<"$role_denied_out" ||
+  fail "role denial lost the gate's reason: $role_denied_out"
+grep -q 'role-denied' <<<"$role_denied_out" ||
+  fail "wrk did not label the role denial: $role_denied_out"
+[[ ! -e "$TMP/herdr-astra-role.log" ]] ||
+  fail "a role-denied astra spawn reached Herdr"
+echo "PASS 527-astra-disallowed-purpose-role-denied rc=$role_denied_rc"
+
+# Quota denial: the same profile with an allowed purpose hits the quota path
+# and is refused with rc 3 — exactly distinct from the role denial above.
+set +e
+quota_denied_out="$(WRK_GATE_MODE=3 \
+  spawn_deny "$TMP/herdr-astra-quota.log" codex-astra --job astra-quota --t T1 2>&1)"
+quota_denied_rc=$?
+set -e
+[[ "$quota_denied_rc" -eq 3 ]] ||
+  fail "quota refusal must keep rc=3 (rc=$quota_denied_rc): $quota_denied_out"
+grep -q 'gate blocked' <<<"$quota_denied_out" ||
+  fail "quota refusal lost its reason: $quota_denied_out"
+if grep -q 'role_restricted\|role-denied' <<<"$quota_denied_out"; then
+  fail "quota refusal was mislabeled as a role denial: $quota_denied_out"
+fi
+[[ "$role_denied_rc" -ne "$quota_denied_rc" ]] ||
+  fail "role and quota denials share an exit code — callers cannot tell them apart"
+# …and neither may collide with the pre-existing hub quota-policy denial (5).
+[[ "$role_denied_rc" -ne 5 && "$quota_denied_rc" -ne 5 ]] ||
+  fail "a denial rc collided with hub quota-policy denial (exit 5)"
+[[ ! -e "$TMP/herdr-astra-quota.log" ]] ||
+  fail "a quota-denied astra spawn reached Herdr"
+echo "PASS 527-astra-quota-denial-distinct rc=$quota_denied_rc"
+
+# --purpose is audit metadata for non-astra profiles: it is forwarded but the
+# spawn outcome is unchanged.
+: >"$TMP/scopefuel.log"
+plain_purpose_out="$(spawn_base codex-terra --job plain-purpose --t T1 --purpose builder 2>&1)"
+grep -q '^OK pane=' <<<"$plain_purpose_out" ||
+  fail "non-astra spawn with --purpose was refused: $plain_purpose_out"
+grep -q -- '--purpose builder' "$TMP/scopefuel.log" ||
+  fail "gate argv log lost --purpose for non-astra: $(cat "$TMP/scopefuel.log")"
+echo "PASS 527-non-astra-purpose-is-audit-only"
+
 # Builder contract: the real arbiter claim artifact remains an envelope while
 # wrk's upward-facing events stay flat. owner_lane is always the builder's own
 # lane; parent_lane is recorded as information, while panewire resolves parent
@@ -2161,7 +2543,7 @@ set -e
 grep -q 'model=builder-kimi' <<<"$builder_kimi_out" ||
   fail "builder-kimi spawn output lost its model: $builder_kimi_out"
 builder_kimi_start="$(grep '^agent start ' "$TMP/herdr.log")"
-[[ "$builder_kimi_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-for-coding/k3' ]] ||
+[[ "$builder_kimi_start" == 'agent start fixture --kind kimi --pane w:p1 --timeout 90000 -- --auto -m kimi-code/k3' ]] ||
   fail "builder-kimi must reuse the kimi-k3 worker argv verbatim: $builder_kimi_start"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "kimi-k3" ]] ||
   fail "builder-kimi must gate as the scopefuel-known kimi-k3 spelling"

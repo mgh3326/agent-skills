@@ -172,15 +172,16 @@ if [[ "${1:-}" != gate ]]; then
   exit 2
 fi
 shift
-profile="" operator_request="" requested_by="" requested_by_seen=0
+profile="" operator_request="" requested_by="" requested_by_seen=0 purpose=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -m|--operator-request|--requested-by)
+    -m|--operator-request|--requested-by|--purpose)
       [[ $# -ge 2 ]] || { echo 'fixture scopefuel: unexpected arguments' >&2; exit 2; }
       case "$1" in
         -m) profile="$2" ;;
         --operator-request) operator_request="$2" ;;
         --requested-by) requested_by="$2"; requested_by_seen=1 ;;
+        --purpose) purpose="$2" ;;
       esac
       shift 2 ;;
     *) echo 'fixture scopefuel: unexpected arguments' >&2; exit 2 ;;
@@ -193,8 +194,25 @@ if [[ -n "${WRK_SCOPEFUEL_LOG:-}" ]]; then
   printf 'gate -m %s' "$profile" >>"$WRK_SCOPEFUEL_LOG"
   [[ -z "$operator_request" ]] || printf ' --operator-request %s' "$operator_request" >>"$WRK_SCOPEFUEL_LOG"
   [[ "$requested_by_seen" -eq 0 ]] || printf ' --requested-by %s' "$requested_by" >>"$WRK_SCOPEFUEL_LOG"
+  [[ -z "$purpose" ]] || printf ' --purpose %s' "$purpose" >>"$WRK_SCOPEFUEL_LOG"
   printf '\n%s\n' "$profile" >>"$WRK_SCOPEFUEL_LOG"
 fi
+# task #527: mirror the real gate's astra role denial — ASTRA_ROLE_PROFILES
+# membership (model identity, not a name substring) plus a purpose whitelist.
+# Role denial runs BEFORE the operator-request checks and exits 5, distinct
+# from the 3/4 refusal vocabulary.
+case "$profile" in
+  codex-astra|builder-astra|captain-astra|gpt-6-astra)
+    # Normalization mirrors the real gate: strip() + casefold() — edges only.
+    normalized_purpose="$(printf '%s' "$purpose" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+    case "$normalized_purpose" in
+      director|architect|operator-request) : ;;
+      *)
+        shown="$purpose"; [[ -n "$shown" ]] || shown="미지정"
+        echo "role_restricted: $profile — astra 는 허용 용도 전용 (architect, director, operator-request); purpose=$shown" >&2
+        exit 5 ;;
+    esac ;;
+esac
 case "${WRK_GATE_MODE:-ok}" in
   3) echo "gate blocked profile=$profile alternative=fixture-alt" >&2; exit 3 ;;
   4) echo "gate measurement unavailable profile=$profile alternative=fixture-alt" >&2; exit 4 ;;
