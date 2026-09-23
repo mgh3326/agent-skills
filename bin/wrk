@@ -1438,7 +1438,10 @@ apply_catalog() {
   set -e
 
   if [[ "$rc" -eq 3 ]]; then
-    CATALOG_SOURCE=refused
+    # The canon answered and refused (consult_only without an operator request).
+    # Not stale — the quota gate below re-runs that judgement and is what stops
+    # the spawn, so the launcher keeps its literal values rather than mislabelling
+    # a refusal as an unreachable canon.
     return 0
   fi
   if [[ "$rc" -ne 0 || -z "$out" ]]; then
@@ -1472,9 +1475,8 @@ print("\n".join([
     return 0
   fi
 
-  local model_id effort source stale
-  { read -r model_id; read -r effort; read -r source; read -r stale; } <<<"$parsed"
-  CATALOG_SOURCE="${source:-unknown}"
+  local model_id effort _source stale
+  { read -r model_id; read -r effort; read -r _source; read -r stale; } <<<"$parsed"
   [[ "$stale" != "1" ]] || CATALOG_STALE=1
 
   # Only the kinds whose CLI argument *is* the model id consume it. For the
@@ -1503,7 +1505,6 @@ resolve_profile() {
   CATALOG_PROFILE=""
   CATALOG_EFFORT_PIN=""
   CATALOG_STALE=0
-  CATALOG_SOURCE=literal
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
