@@ -250,4 +250,38 @@ grep -q 'catalog=stale' <<<"$header" ||
   fail "a missing scopefuel must still mark the brief catalog=stale; got: $header"
 echo "PASS a missing scopefuel marks the brief catalog=stale (never a silent fallback)"
 
+# --- the case table itself is part of the contract --------------------------
+# Verified in #593 round 2: nothing failed if a new catalog-consuming spelling
+# was added here without updating the two guard dictionaries. The cross-repo
+# halves stay plain snapshots on purpose, but within this repo the real case
+# table can be diffed against a checked-in list, so an added or removed spelling
+# has to be acknowledged in the same commit.
+WRK_CATALOG_SPELLINGS_SNAPSHOT="$(printf '%s\n' \
+  builder-grok builder-opus builder-sol captain-opus captain-sol \
+  cc-glm cc-qwen38 codex codex-astra codex-luna codex-luna-hi codex-luna-max \
+  codex-max codex-med codex-sol codex-terra codex-terra-max fable grok grok-hi \
+  grok-med haiku kiro-cheap kiro-haiku kiro-opus kiro-opus-max kiro-opus-xhigh \
+  kiro-sol kiro-sol-max kiro-sol-xhigh kiro-sonnet opus sonnet sonnet-med | sort)"
+
+# Parse resolve_catalog_profile()'s case labels out of the real script.
+WRK_CATALOG_SPELLINGS_ACTUAL="$(awk '
+  /^resolve_catalog_profile\(\) \{/ { inside = 1; next }
+  inside && /^\}/ { exit }
+  inside && /CATALOG_PROFILE=/ {
+    line = $0
+    sub(/\).*/, "", line)
+    gsub(/^[ \t]+/, "", line)
+    n = split(line, parts, "|")
+    for (i = 1; i <= n; i++) print parts[i]
+  }
+' "$WRK" | sort)"
+
+if [[ "$WRK_CATALOG_SPELLINGS_SNAPSHOT" != "$WRK_CATALOG_SPELLINGS_ACTUAL" ]]; then
+  echo "resolve_catalog_profile() drifted from the checked-in contract:" >&2
+  diff <(printf '%s\n' "$WRK_CATALOG_SPELLINGS_SNAPSHOT") \
+       <(printf '%s\n' "$WRK_CATALOG_SPELLINGS_ACTUAL") >&2 || true
+  fail "update this snapshot AND scopefuel's WRK_CATALOG_SPELLINGS in the same PR"
+fi
+echo "PASS resolve_catalog_profile() matches the checked-in spelling contract ($(wc -l <<<"$WRK_CATALOG_SPELLINGS_ACTUAL") spellings)"
+
 echo "PASS test-model-contract-guard: bin/wrk consumes the canonical catalog"
