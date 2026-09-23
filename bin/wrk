@@ -3053,6 +3053,7 @@ spillover_remote_worktree_create() {
   out="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" \
     "BASE=$(printf '%q' "$remote_base") TARGET=$(printf '%q' "$remote_cwd") BRANCH=$(printf '%q' "$branch") SHA=$(printf '%q' "$sha") sh -s" <<'PREP' 2>&1
 git -C "$BASE" rev-parse --git-dir >/dev/null 2>&1 || { echo "no git repo at $BASE" >&2; exit 3; }
+created_branch=0
 if [ -n "$BRANCH" ]; then
   git -C "$BASE" fetch origin "$BRANCH" || exit 4
   if git -C "$BASE" show-ref --verify --quiet "refs/heads/$BRANCH"; then
@@ -3061,13 +3062,14 @@ if [ -n "$BRANCH" ]; then
     git -C "$BASE" worktree add "$TARGET" "$BRANCH" || exit 6
   else
     git -C "$BASE" worktree add -b "$BRANCH" "$TARGET" "origin/$BRANCH" || exit 6
+    created_branch=1
   fi
 else
   git -C "$BASE" fetch origin || exit 4
   git -C "$BASE" worktree add --detach "$TARGET" "$SHA" || exit 6
 fi
-s=$(git -C "$TARGET" rev-parse HEAD 2>/dev/null) || { git -C "$BASE" worktree remove --force "$TARGET" 2>/dev/null; exit 7; }
-[ "$s" = "$SHA" ] || { git -C "$BASE" worktree remove --force "$TARGET"; echo "created worktree HEAD $s" >&2; exit 8; }
+s=$(git -C "$TARGET" rev-parse HEAD 2>/dev/null) || { git -C "$BASE" worktree remove --force "$TARGET" 2>/dev/null; [ "$created_branch" = 1 ] && git -C "$BASE" branch -D "$BRANCH" >/dev/null 2>&1; exit 7; }
+[ "$s" = "$SHA" ] || { git -C "$BASE" worktree remove --force "$TARGET"; [ "$created_branch" = 1 ] && git -C "$BASE" branch -D "$BRANCH" >/dev/null 2>&1; echo "created worktree HEAD $s" >&2; exit 8; }
 PREP
 )"
   rc=$?
@@ -3358,7 +3360,9 @@ spawn_router_cmd() {
       2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE")
         return "$last_rc" ;; # Admission and cwd mapping are fail-closed.
     esac
-    warn "spill-over remote spawn failed host=$candidate exit=$last_rc; trying next candidate"
+    # The "next candidate" phrasing is honest only under --host auto; an
+    # explicit --host exits right after this with the no-fallback error.
+    [[ "$requested" == auto ]] && warn "spill-over remote spawn failed host=$candidate exit=$last_rc; trying next candidate"
   done
   # An explicit --host NAME is an operator forcing one remote: propagate the
   # remote exit instead of quietly landing the pane locally (#571).  The local

@@ -660,6 +660,75 @@ grep -q 'wrk spawn' "$TMP/ssh.log" && { echo 'mismatch case reached the remote s
 [[ "$(git -C "$REMOTE_HOME/remote/repo.v613" rev-parse HEAD)" == "$mismatch_sha_before" ]]
 printf '%s\n' 'PASS wrk-spillover remote-worktree-mismatch'
 
+# Same branch, different HEAD: the remote worktree was created for an older
+# commit of feat-616, then the branch advanced.  Reusing it would silently
+# verify stale code — the sha half of the EXISTS comparison is what stops it.
+new_branch_wt feat-616 v616
+git -C "$REMOTE_HOME/remote/repo" fetch -q origin feat-616
+git -C "$REMOTE_HOME/remote/repo" worktree add -q -b feat-616 "$REMOTE_HOME/remote/repo.v616" origin/feat-616
+git -C "$TMP/local/repo.v616" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m advance
+git -C "$TMP/local/repo.v616" push -q origin feat-616
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"
+set +e
+stale_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v616" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+stale_rc=$?
+set -e
+[[ "$stale_rc" -eq 2 ]]
+grep -q 'refusing to overwrite' <<<"$stale_out"
+grep -q 'wrk spawn' "$TMP/ssh.log" && { echo 'stale-head case reached the remote spawn' >&2; exit 1; }
+[[ "$(git -C "$REMOTE_HOME/remote/repo.v616" rev-parse HEAD)" == "$(git -C "$REMOTE_HOME/remote/repo" rev-parse feat-616)" ]]
+printf '%s\n' 'PASS wrk-spillover remote-worktree-stale-head'
+
+# Same HEAD, different branch: two branches point at one commit, the remote
+# worktree is on the other one.  Only the branch half of the EXISTS
+# comparison catches this.
+git -C "$LOCAL_REPO" branch -q feat-617a main
+git -C "$LOCAL_REPO" branch -q feat-617b main
+git -C "$LOCAL_REPO" push -q origin feat-617a feat-617b
+git -C "$LOCAL_REPO" worktree add -q "$TMP/local/repo.v617" feat-617a
+git -C "$REMOTE_HOME/remote/repo" fetch -q origin feat-617b:feat-617b
+git -C "$REMOTE_HOME/remote/repo" worktree add -q "$REMOTE_HOME/remote/repo.v617" feat-617b
+[[ "$(git -C "$TMP/local/repo.v617" rev-parse HEAD)" == "$(git -C "$REMOTE_HOME/remote/repo.v617" rev-parse HEAD)" ]]
+set +e
+brmis_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v617" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+brmis_rc=$?
+set -e
+[[ "$brmis_rc" -eq 2 ]]
+grep -q 'refusing to overwrite' <<<"$brmis_out"
+printf '%s\n' 'PASS wrk-spillover remote-worktree-branch-mismatch'
+
+# A plain (non-git) remote directory where a git worktree is expected is
+# refuse-and-preserve, never adopt-or-wipe.
+new_branch_wt feat-618 v618
+mkdir -p "$REMOTE_HOME/remote/repo.v618"
+: >"$TMP/ssh.log"
+set +e
+notgit_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v618" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+notgit_rc=$?
+set -e
+[[ "$notgit_rc" -eq 2 ]]
+grep -q 'not a git worktree; refusing' <<<"$notgit_out"
+[[ -d "$REMOTE_HOME/remote/repo.v618" ]]
+grep -q 'wrk spawn' "$TMP/ssh.log" && { echo 'notgit case reached the remote spawn' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover remote-worktree-notgit'
+
+# A branch pushed earlier but now ahead of origin locally is fail-closed:
+# the remote can only check out what origin advertises.
+new_branch_wt feat-619 v619
+git -C "$TMP/local/repo.v619" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m ahead
+set +e
+ahead_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v619" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+ahead_rc=$?
+set -e
+[[ "$ahead_rc" -eq 2 ]]
+grep -q "differs from origin/feat-619" <<<"$ahead_out"
+[[ ! -d "$REMOTE_HOME/remote/repo.v619" ]]
+printf '%s\n' 'PASS wrk-spillover remote-worktree-ahead-origin'
+
 # An unpushed local branch can never produce the right remote checkout.
 git -C "$LOCAL_REPO" checkout -q -b feat-nopush main
 git -C "$LOCAL_REPO" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m nopush
@@ -730,6 +799,20 @@ grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$long_out"
 grep -q -- ' -c /remote/long.wt ' "$TMP/ssh.log"
 grep -q -- '/remote/short' "$TMP/ssh.log" && { echo 'longest-key rule lost to the shorter key' >&2; exit 1; }
 printf '%s\n' 'PASS wrk-spillover prefix-longest-key'
+
+# Key order must not matter: with the longer key first, "last match wins"
+# would pick the short key — the longest-key rule still picks /remote/long.
+LONG_FIRST_CONFIG="$TMP/wt-long-first-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$TMP/local/repo.v611\"=\"/remote/long\" \"$LOCAL_REPO\"=\"/remote/short\"}" 'capacity = 3' >"$LONG_FIRST_CONFIG"
+: >"$TMP/ssh.log"
+longfirst_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611.wt" \
+  WRK_TEST_HOSTS_CONFIG="$LONG_FIRST_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$longfirst_out"
+grep -q -- ' -c /remote/long.wt ' "$TMP/ssh.log"
+grep -q -- '/remote/short' "$TMP/ssh.log" && { echo 'key order decided the match, not key length' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover prefix-longest-key-order'
 
 # Subpath mapping: an existing remote subdir passes through; a missing one is
 # fail-closed (it is inside a checkout, not a creatable worktree).
@@ -807,5 +890,15 @@ grep -qF '  return 0' "$MUT_PREPARE" || { echo 'prepare mutant did not apply' >&
 prepare_mut_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v613" \
   WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$MUT_PREPARE" -w w1 --host desktop 2>&1 || true)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$prepare_mut_out" || { echo 'prepare-skip mutant survived' >&2; exit 1; }
-printf '%s\n' 'PASS wrk-spillover task611 mutants-red=3/3'
+
+# Removing the HEAD half of the EXISTS comparison must turn the stale-head
+# case green — the remote worktree would be silently reused at the old sha.
+MUT_SHA="$TMP/wrk-no-sha-compare"; cp "$ROOT/bin/wrk" "$MUT_SHA"
+sed -i.bak 's/ || "\$remote_sha" != "\$sha"//' "$MUT_SHA"
+chmod +x "$MUT_SHA"
+grep -qF '"$remote_branch" != "${branch:-HEAD}" ]]' "$MUT_SHA" || { echo 'sha-compare mutant did not apply' >&2; exit 1; }
+sha_mut_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v616" \
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$MUT_SHA" -w w1 --host desktop 2>&1 || true)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$sha_mut_out" || { echo 'sha-compare mutant survived' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-spillover task611 mutants-red=4/4'
 )
