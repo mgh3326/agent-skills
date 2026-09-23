@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
-# ROB-591 / AC3+AC6: bidirectional drift guard, agent-skills side.
+# #593 (was ROB-591): cross-repo drift guard, agent-skills side.
 #
-# Exercises the REAL bin/wrk resolve_profile() model-ID/effort resolution and
-# asserts it against a checked-in snapshot of the scopefuel catalog contract
-# (src/scopefuel/recommend.py GRADE_TABLE, ROB-591 catalog-refresh rows). This
-# is a plain snapshot, not a live cross-repo read — scopefuel has its own
-# mirror-image guard (tests/test_wrk_contract_guard.py) asserting the real
-# GRADE_TABLE against a snapshot of these same bin/wrk rows.
+# ROB-591 guarded a duplicated table: bin/wrk carried its own Sol/Luna/Grok
+# model IDs and this file asserted them against a checked-in snapshot of
+# scopefuel's GRADE_TABLE. #593 removes the duplication — resolve_profile() now
+# takes model ids and default efforts from `scopefuel policy launch` — so the
+# guard's subject moves with it:
 #
-# Update discipline: whenever the Sol/Luna/Opus/Grok catalog IDs in
-# scopefuel's GRADE_TABLE change, update the CONTRACT_* values below in the
-# same commit/PR — this guard's whole purpose is to fail loudly when the two
-# repos drift apart, so it must never be "fixed" by relaxing an assertion
-# without a matching scopefuel-side change.
+#   1. the migration is value-preserving: every ID ROB-591 pinned still comes
+#      out of the launcher (the PASS lines below, unchanged);
+#   2. those values genuinely come from the canon, not from a leftover literal
+#      — served a model id that appears nowhere in bin/wrk, the argv follows it;
+#   3. the catalog-exempt spellings (rollback pins) do NOT follow the canon;
+#   4. every path that fails to reach the canon marks the spawn brief
+#      `catalog=stale`, including the tolerant ones (scopefuel absent, too old
+#      to have the subcommand, request failed).
+#
+# scopefuel has the mirror-image guard (tests/test_wrk_contract_guard.py).
+# Update both in one PR — this guard exists to fail loudly on drift, so it must
+# never be "fixed" by relaxing an assertion without a matching scopefuel change.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -31,6 +37,7 @@ export ARBITER_INBOX_ROOT="$TMP/inbox"
 export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 export PANEWIRE_BIN="$ROOT/tests/fixtures/panewire"
 export HANDOFFKEEP_BIN="$TMP/absent-handoffkeep"
+export WRK_LAUNCH_LOG="$TMP/launch.log"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -111,3 +118,90 @@ assert_argv_has fable "--model $CONTRACT_FABLE_MODEL_ID "
 echo "PASS fable explicit consult launch runs $CONTRACT_FABLE_MODEL_ID"
 
 echo "PASS test-model-contract-guard: bin/wrk matches the checked-in scopefuel catalog contract"
+
+
+# --- #593: the values come from the canon, not from a literal ---------------
+# Serve a model id that exists nowhere in bin/wrk. If the launcher still emits
+# the old literal, it never consulted the catalog.
+canon_argv() {
+  local model="$1" override="$2"; shift 2
+  : >"$TMP/herdr.log"
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_LAUNCH_MODEL_OVERRIDE="$override" \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 "$@" >/dev/null
+  cat "$TMP/herdr.log"
+}
+
+argv="$(canon_argv codex-sol gpt-7-sol-canary)"
+grep -qF -- "-m gpt-7-sol-canary" <<<"$argv" ||
+  fail "codex-sol did not follow the catalog's model id; got: $argv"
+echo "PASS codex-sol argv follows the canonical model id (not a bin/wrk literal)"
+
+argv="$(canon_argv grok grok-9.9-canary)"
+grep -qF -- "-m grok-9.9-canary" <<<"$argv" ||
+  fail "grok did not follow the catalog's model id; got: $argv"
+echo "PASS grok argv follows the canonical model id"
+
+argv="$(canon_argv kiro-opus canary-opus-99)"
+grep -qF -- "--model canary-opus-99" <<<"$argv" ||
+  fail "kiro-opus did not follow the catalog's model id; got: $argv"
+echo "PASS kiro-opus argv follows the canonical model id"
+
+# --- the exempt spellings must NOT follow the canon -------------------------
+# A rollback pin that follows the server is a rollback lever that does nothing.
+for pinned in codex-sol56 codex-luna56 grok46; do
+  argv="$(canon_argv "$pinned" should-never-appear)"
+  grep -qF -- "should-never-appear" <<<"$argv" &&
+    fail "rollback spelling '$pinned' followed the catalog; it must stay pinned"
+done
+grep -qF -- "-m gpt-5.6-sol" <<<"$(canon_argv codex-sol56 should-never-appear)" ||
+  fail "codex-sol56 lost its pinned model id"
+echo "PASS rollback spellings (codex-sol56, codex-luna56, grok46) ignore the catalog"
+
+# --- #527 overlap: codex-astra's default effort ----------------------------
+# codex-astra is consult_only, so a full spawn is refused at the gate before an
+# argv exists. What this side has to guarantee is that bin/wrk does not *pin* an
+# effort for it — the canon's xhigh (asserted in scopefuel's own suite) only
+# applies if the launcher leaves the rung to the catalog. The old literal
+# DEFAULT_EFFORT=max must be gone.
+grep -qE '^\s*codex-astra\) CATALOG_PROFILE=codex-astra ;;\s*$' "$WRK" ||
+  fail "codex-astra must map to the catalog with no pinned effort (task #527)"
+grep -qE 'codex-astra\).*DEFAULT_EFFORT=max' "$WRK" &&
+  fail "codex-astra still pins DEFAULT_EFFORT=max; task #527 moves the default to xhigh via the catalog"
+echo "PASS codex-astra takes its default effort from the catalog (no max pin)"
+
+# --- every unreachable-canon path marks the brief catalog=stale -------------
+brief_header() {
+  local mode="$1" scopefuel_bin="$2" model="${3:-codex-sol}"
+  rm -rf "$TMP/inbox"
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$scopefuel_bin" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_LAUNCH_MODE="$mode" \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 >/dev/null 2>&1 || true
+  head -n 1 "$(find "$TMP/inbox" -name 'spawn-brief-*' -type f | head -n 1)" 2>/dev/null
+}
+
+header="$(brief_header ok "$SCOPEFUEL")"
+grep -q 'catalog=stale' <<<"$header" &&
+  fail "a healthy catalog must not mark the brief stale; got: $header"
+echo "PASS a healthy catalog leaves the brief header unmarked"
+
+for mode in stale unsupported broken; do
+  header="$(brief_header "$mode" "$SCOPEFUEL")"
+  grep -q 'catalog=stale' <<<"$header" ||
+    fail "WRK_LAUNCH_MODE=$mode did not mark the brief catalog=stale; got: $header"
+done
+echo "PASS stale / missing-subcommand / failed-request all mark the brief catalog=stale"
+
+# The tolerant path that used to be silent: scopefuel absent entirely.
+header="$(brief_header ok "$TMP/absent-scopefuel")"
+grep -q 'catalog=stale' <<<"$header" ||
+  fail "a missing scopefuel must still mark the brief catalog=stale; got: $header"
+echo "PASS a missing scopefuel marks the brief catalog=stale (never a silent fallback)"
+
+echo "PASS test-model-contract-guard: bin/wrk consumes the canonical catalog"

@@ -439,10 +439,15 @@ spawn_prompt_file() {
     file="$(mktemp "${TMPDIR:-/tmp}/wrk-spawn-brief-$attempt.XXXXXX")" || return 1
   fi
   {
+    # The catalog marker rides on the expect line so it reaches the spawned
+    # agent itself, not only wrk's stderr: a brief produced from the launcher's
+    # own table instead of the canon has to say so where the work is read.
+    local catalog_marker=""
+    [[ "${CATALOG_STALE:-0}" -ne 1 ]] || catalog_marker=" catalog=stale"
     if [[ -n "$SPAWN_EXPECT_CWD" ]]; then
-      printf 'expect: name=%s cwd=%s\n\n' "$LABEL" "$SPAWN_EXPECT_CWD"
+      printf 'expect: name=%s cwd=%s%s\n\n' "$LABEL" "$SPAWN_EXPECT_CWD" "$catalog_marker"
     else
-      printf 'expect: name=%s\n\n' "$LABEL"
+      printf 'expect: name=%s%s\n\n' "$LABEL" "$catalog_marker"
     fi
     cat -- "$PROMPT"
   } >"$file" || return 1
@@ -1343,6 +1348,149 @@ PY
   ) </dev/null >/dev/null &
 }
 
+# resolve_catalog_profile
+#
+# Maps a launcher spelling to its canonical catalog profile, and to the effort
+# rung the spelling pins (empty = take the catalog's default rung). A spelling
+# left out of this table keeps its literal model id and effort — that is the
+# fail-safe direction, and it is where the deliberate exceptions live:
+#
+#   * rollback spellings (codex-sol56, codex-luna56, grok45*, grok46*,
+#     agy-flash36) exist precisely to pin a superseded model. An explicit pin
+#     outranks the canon, or the rollback lever does nothing.
+#   * profiles the catalog does not carry (oc-*, kimi-*, devin-*, the ungraded
+#     kiro-* experiments, cc-dsflash/cc-dspro/cc-glm53) keep their literal argv.
+#   * profiles whose CLI argument is not the model id (agy encodes the effort
+#     into the model name; opus/sonnet/haiku pass a CLI alias) take only the
+#     effort from the catalog — the alias itself is argv skeleton and stays here.
+#
+# The GATE_PROFILE table above is a different mapping and must not be reused:
+# kiro-glm gates as kiro-sol but must never launch Sol's model id.
+resolve_catalog_profile() {
+  case "$MODEL" in
+    opus|builder-opus|captain-opus) CATALOG_PROFILE=opus ;;
+    sonnet|sonnet-med) CATALOG_PROFILE=sonnet ;;
+    haiku) CATALOG_PROFILE=haiku ;;
+    fable) CATALOG_PROFILE=fable ;;
+
+    codex) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high ;;
+    codex-sol|codex-max|builder-sol|captain-sol) CATALOG_PROFILE=codex-sol ;;
+    codex-terra|codex-med) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;
+    codex-terra-max) CATALOG_PROFILE=codex-terra-max ;;
+    codex-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=medium ;;
+    codex-luna-hi) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=high ;;
+    codex-luna-max) CATALOG_PROFILE=codex-luna-max ;;
+    codex-astra) CATALOG_PROFILE=codex-astra ;;
+
+    kiro-opus) CATALOG_PROFILE=kiro-opus ;;
+    kiro-opus-xhigh) CATALOG_PROFILE=kiro-opus; CATALOG_EFFORT_PIN=xhigh ;;
+    kiro-opus-max) CATALOG_PROFILE=kiro-opus; CATALOG_EFFORT_PIN=max ;;
+    kiro-sonnet) CATALOG_PROFILE=kiro-sonnet ;;
+    kiro-sol) CATALOG_PROFILE=kiro-sol ;;
+    kiro-sol-xhigh) CATALOG_PROFILE=kiro-sol; CATALOG_EFFORT_PIN=xhigh ;;
+    kiro-sol-max) CATALOG_PROFILE=kiro-sol; CATALOG_EFFORT_PIN=max ;;
+    kiro-cheap) CATALOG_PROFILE=kiro-cheap ;;
+    kiro-haiku) CATALOG_PROFILE=kiro-haiku ;;
+
+    grok|grok-hi) CATALOG_PROFILE=grok-hi ;;
+    grok-med) CATALOG_PROFILE=grok; CATALOG_EFFORT_PIN=medium ;;
+    builder-grok) CATALOG_PROFILE=grok-hi; CATALOG_EFFORT_PIN=xhigh ;;
+
+    cc-qwen38) CATALOG_PROFILE=cc-qwen38 ;;
+    cc-glm) CATALOG_PROFILE=cc-glm ;;
+  esac
+}
+
+# apply_catalog
+#
+# Replaces this spelling's model id and default effort with the canonical values
+# from `scopefuel policy launch`. Every path that does *not* end in a canonical
+# answer sets CATALOG_STALE=1, which the spawn brief header carries as
+# `catalog=stale` — including the ones that look like ordinary tolerance
+# (scopefuel absent, too old to have the subcommand, request failed). "We could
+# not confirm the canon" is one fact, and a launch that quietly used its own
+# table while claiming nothing is exactly the silence this change removes.
+#
+# rc 3 is the one non-zero rc that is not stale: the canon answered and refused
+# (consult_only without an operator request). The quota gate below re-runs that
+# judgement and is the thing that stops the spawn, so the launcher keeps its
+# literal values and does not mislabel a refusal as a missing canon.
+apply_catalog() {
+  [[ -n "$CATALOG_PROFILE" ]] || return 0
+
+  if [[ -z "${SCOPEFUEL:-}" ]]; then
+    SCOPEFUEL="$(command -v "${SCOPEFUEL_BIN:-scopefuel}" 2>/dev/null || true)"
+  fi
+  if [[ -z "$SCOPEFUEL" || ! -x "$SCOPEFUEL" ]]; then
+    CATALOG_STALE=1
+    warn "scopefuel unavailable; launch catalog not consulted (catalog=stale)"
+    return 0
+  fi
+
+  local launch_args=(policy launch "$CATALOG_PROFILE" --json)
+  [[ -z "$CATALOG_EFFORT_PIN" ]] || launch_args+=(--effort "$CATALOG_EFFORT_PIN")
+  [[ -z "${OPERATOR_REQUEST:-}" ]] || launch_args+=(--operator-request)
+
+  local out rc=0
+  set +e
+  out="$("$SCOPEFUEL" "${launch_args[@]}" 2>/dev/null)"
+  rc=$?
+  set -e
+
+  if [[ "$rc" -eq 3 ]]; then
+    CATALOG_SOURCE=refused
+    return 0
+  fi
+  if [[ "$rc" -ne 0 || -z "$out" ]]; then
+    CATALOG_STALE=1
+    warn "scopefuel policy launch failed (rc=$rc); using the launcher's own values (catalog=stale)"
+    return 0
+  fi
+
+  local parsed
+  if ! parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+
+try:
+    payload = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+catalog = payload.get("catalog") or {}
+# One field per line, not a tab-joined record: tab is IFS whitespace, so bash
+# collapses a leading empty field and every later field shifts up by one. An
+# empty model_id is normal (sonnet/haiku launch by CLI alias), and the shift
+# silently turned the effort into the catalog source.
+print("\n".join([
+    str(payload.get("model_id") or ""),
+    str(payload.get("effort") or ""),
+    str(catalog.get("source") or ""),
+    "1" if catalog.get("stale") else "0",
+]))
+' 2>/dev/null)"; then
+    CATALOG_STALE=1
+    warn "scopefuel policy launch returned unreadable JSON; using the launcher's own values (catalog=stale)"
+    return 0
+  fi
+
+  local model_id effort source stale
+  { read -r model_id; read -r effort; read -r source; read -r stale; } <<<"$parsed"
+  CATALOG_SOURCE="${source:-unknown}"
+  [[ "$stale" != "1" ]] || CATALOG_STALE=1
+
+  # Only the kinds whose CLI argument *is* the model id consume it. For the
+  # Claude CLI the argument is an alias ("--model opus"), which stays argv
+  # skeleton; fable is the one Claude profile launched by literal model id.
+  if [[ -n "$model_id" ]]; then
+    case "$PROFILE_KIND" in
+      codex|kiro) PROFILE_MODEL="$model_id" ;;
+      grok) PROFILE_MODEL_ARG="$model_id" ;;
+      claude)
+        [[ "$MODEL" != fable ]] || ARGS=(--model "$model_id" --dangerously-skip-permissions) ;;
+    esac
+  fi
+  [[ -z "$effort" || "$EFFORT_SUPPORTED" -ne 1 ]] || DEFAULT_EFFORT="$effort"
+}
+
 resolve_profile() {
   PROFILE_KIND=""
   PROFILE_MODEL=""
@@ -1352,6 +1500,10 @@ resolve_profile() {
   PROFILE_ENV=()
   KIMI_TRUST_HOME=""
   PROFILE_MODEL_ARG=""
+  CATALOG_PROFILE=""
+  CATALOG_EFFORT_PIN=""
+  CATALOG_STALE=0
+  CATALOG_SOURCE=literal
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
@@ -1428,7 +1580,8 @@ resolve_profile() {
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    codex-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    # task #527: the default rung moves to xhigh and is owned by the catalog, not pinned here.
+    codex-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
     # ROB-591 rollback spellings: explicit opt-out back to the pre-refresh gpt-5.6-*
     # IDs, same case-block style as grok46 below. codex-sol56/codex-luna56 keep the
     # same efforts as their current default spellings.
@@ -1550,6 +1703,9 @@ resolve_profile() {
     cc-qwen38|cc-glm) GATE_PROFILE="$MODEL" ;;
     cc-dsflash|cc-dspro|cc-glm53) GATE_PROFILE="cc-qwen38" ;;
   esac
+
+  resolve_catalog_profile
+  apply_catalog
 
   if [[ -n "$EFFORT" ]]; then
     case "$EFFORT" in low|medium|high|xhigh|max|ultra) ;; *) die "unknown effort '$EFFORT'" ;; esac
