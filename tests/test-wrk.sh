@@ -4004,6 +4004,41 @@ reap_keep_job reap-kept w1:p1 w1:t1 ',"keep":true' "$REAP_TEST_NOW"
 reap_keep_job reap-kept-string w1:p5 w1:t5 ',"keep":"true"' "$REAP_TEST_NOW"
 reap_keep_job reap-kept-fresh w1:p3 w1:t3 ',"keep":true' "$KEEP_FRESH_NOW"
 reap_keep_job reap-unkept w1:p6 w1:t6 '' "$REAP_TEST_NOW"
+# The marker is sticky on claims and reclaims too. arbiter never writes it
+# there, so the fixture edits the real claim/reclaim event, like the legacy
+# captain case above.
+reap_keep_marked_event_job() {
+  local job="$1" pane="$2" tab="$3" marked_kind="$4"
+  export ARBITER_TEST_NOW="$REAP_TEST_NOW"
+  env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane keep-lane --agent-label "$job" --t T1 >/dev/null
+  if [[ "$marked_kind" == job.reclaim ]]; then
+    env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" lease \
+      --job "$job" --resource "$TMP/reap-$job" --kind path >/dev/null
+    env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" release \
+      --job "$job" --resource "$TMP/reap-$job" --kind path --force >/dev/null
+    env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" claim --reclaim-released \
+      --job "$job" --lane keep-lane --agent-label "$job" --t T1 >/dev/null
+  fi
+  python3 - "$KEEP_REAP_INBOX/$job/events" "$marked_kind" <<'PY'
+import glob, json, sys
+events, kind = sys.argv[1:3]
+paths = sorted(glob.glob(events + "/*-" + kind + ".json"))
+assert len(paths) == 1, (kind, paths)
+event = json.load(open(paths[0]))
+event["payload"]["keep"] = True
+with open(paths[0], "w", encoding="utf-8") as handle:
+    json.dump(event, handle, separators=(",", ":"))
+    handle.write("\n")
+PY
+  env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"keep-lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}" >/dev/null
+  env ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"keep-lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
+reap_keep_marked_event_job reap-kept-claim w1:p7 w1:t7 job.claim
+reap_keep_marked_event_job reap-kept-reclaim w1:p8 w1:t8 job.reclaim
 keep_reap_run() {
   env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$KEEP_REAP_INBOX" \
     WRK_FIXTURE_SCENARIO=reap WRK_FIXTURE_LOG="$REAP_LOG" "$WRK" reap "$@"
@@ -4020,12 +4055,20 @@ grep -q '^would-close job=reap-kept-string pane=w1:p5 tab=w1:t5 status=idle' <<<
   fail "#603: only a JSON true protects; the string \"true\" is not a marker: $keep_out"
 grep -q 'reap-kept-fresh' <<<"$keep_out" &&
   fail "#603: a kept job still inside its grace stays silent like any other: $keep_out"
+for kept_job in reap-kept-claim reap-kept-reclaim; do
+  grep -q "^skip job=$kept_job reason=protected$" <<<"$keep_out" ||
+    fail "#603: keep on a claim or reclaim protects the job too ($kept_job): $keep_out"
+done
 : >"$REAP_LOG"
 keep_apply_out="$(keep_reap_run --lane keep-lane --apply)"
 grep -q '^tab close w1:t1$' "$REAP_LOG" &&
   fail "#603: --apply must never close a kept job's tab: $(cat "$REAP_LOG")"
-[[ "$(event_count "$KEEP_REAP_INBOX/reap-kept/events" job.reaped)" -eq 0 ]] ||
-  fail "#603: a kept job must not be recorded as reaped"
+for kept_job in reap-kept reap-kept-claim reap-kept-reclaim; do
+  [[ "$(event_count "$KEEP_REAP_INBOX/$kept_job/events" job.reaped)" -eq 0 ]] ||
+    fail "#603: a kept job must not be recorded as reaped ($kept_job)"
+done
+grep -qE '^tab close w1:t[78]$' "$REAP_LOG" &&
+  fail "#603: --apply must never close a tab whose job was kept by its claim or reclaim: $(cat "$REAP_LOG")"
 grep -q '^closed job=reap-unkept ' <<<"$keep_apply_out" ||
   fail "#603: --apply must still close the unprotected control: $keep_apply_out"
 echo "PASS reap-skips-kept-jobs"
