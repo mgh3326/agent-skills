@@ -3408,7 +3408,7 @@ for keep_case in kept plain; do
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
     "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
-    --t T1 --job "spawn-keep-$keep_case" --owner lane-a "${keep_args[@]}" >/dev/null ||
+    --t T1 --job "spawn-keep-$keep_case" --owner lane-a ${keep_args[@]+"${keep_args[@]}"} >/dev/null ||
     fail "#603: spawn ($keep_case) must succeed"
   kill "$(cat "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null)" 2>/dev/null || true
 done
@@ -3425,7 +3425,9 @@ assert kept == dict(base, keep=True), "--keep must record keep: true on the rece
 assert kept["keep"] is True, "the marker must be the JSON literal true"
 PY
 grep -q -- '--keep' <<<"$("$WRK" spawn --help)" || fail "#603: spawn --help must document --keep"
-spill_keep_err="$(bash -c 'source <(sed -n "/^wrk_option_token()/,/^}/p;/^spillover_hub_args()/,/^}/p" "$1"); spillover_hub_args -m codex-terra -l fixture --keep' _ "$WRK" 2>&1)" &&
+# bash 3.2 cannot `source <(...)`, so the two functions go through a file.
+sed -n '/^wrk_option_token()/,/^}/p;/^spillover_hub_args()/,/^}/p' "$WRK" >"$TMP/spill-keep-funcs.sh"
+spill_keep_err="$(bash -c '. "$1"; spillover_hub_args -m codex-terra -l fixture --keep' _ "$TMP/spill-keep-funcs.sh" 2>&1)" &&
   fail "#603: a hub spill-over must refuse --keep rather than silently drop the marker"
 grep -q "option '--keep' is not permitted for a hub spawn" <<<"$spill_keep_err" ||
   fail "#603: the hub spill-over refusal must name --keep: $spill_keep_err"

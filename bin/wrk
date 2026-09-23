@@ -1269,8 +1269,9 @@ receipt = {
 # Additive and optional: existing consumers keep reading the four fields above.
 if tab_id:
     receipt["tab_id"] = tab_id
-# Protection marker (#603). Present only for `--keep`, so an ordinary spawn's
+# Protection marker, task 603: present only with --keep, so an ordinary spawn
 # receipt stays byte-identical; its readers accept only the JSON literal true.
+# Keep this heredoc free of quote characters: bash 3.2 misparses them in a command substitution.
 if keep == "1":
     receipt["keep"] = True
 print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
