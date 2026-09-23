@@ -1817,6 +1817,87 @@ PY
 echo "PASS plain-spawn-carries-no-operator-request"
 unset TEST_ARBITER_BIN
 
+# ---------------------------------------------------------------------------
+# task #527: --purpose is forwarded verbatim to `scopefuel gate`, the astra
+# counsel path defaults it to `architect`, and a role denial (rc 5) is
+# caller-visibly distinct from a quota denial (rc 3).
+# ---------------------------------------------------------------------------
+
+grep -q -- '--purpose' <<<"$spawn_help_out" ||
+  fail "spawn --help lost --purpose"
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 --purpose
+
+# The architect counsel path injects --purpose architect on its own: a plain
+# `-m codex-astra` spawn must reach the gate with the purpose attached.
+: >"$TMP/scopefuel.log"
+rm -f "$TMP/herdr.log"
+astra_ok_out="$(spawn_base codex-astra --job astra-purpose --t T1 2>&1)"
+grep -q '^OK pane=' <<<"$astra_ok_out" ||
+  fail "codex-astra counsel spawn did not pass the gate: $astra_ok_out"
+grep -q -- '--purpose architect' "$TMP/scopefuel.log" ||
+  fail "gate argv log lost --purpose architect: $(cat "$TMP/scopefuel.log")"
+grep -q 'model_reasoning_effort=xhigh' "$TMP/herdr.log" ||
+  fail "codex-astra default effort drifted from xhigh: $(cat "$TMP/herdr.log")"
+echo "PASS 527-astra-counsel-spawn-passes-purpose-architect"
+
+# An explicit allowed purpose still wins over the architect default.
+: >"$TMP/scopefuel.log"
+rm -f "$TMP/herdr.log"
+astra_dir_out="$(spawn_base codex-astra --job astra-purpose-director --t T1 --purpose director 2>&1)"
+grep -q '^OK pane=' <<<"$astra_dir_out" ||
+  fail "codex-astra --purpose director did not spawn: $astra_dir_out"
+grep -q -- '--purpose director' "$TMP/scopefuel.log" ||
+  fail "explicit --purpose director was overridden: $(cat "$TMP/scopefuel.log")"
+echo "PASS 527-explicit-purpose-overrides-architect-default"
+
+# Role denial: a disallowed purpose is refused by the gate with rc 5 and must
+# surface as a role denial — never a quota stop.
+set +e
+role_denied_out="$(spawn_deny "$TMP/herdr-astra-role.log" codex-astra --job astra-role --t T1 \
+  --purpose worker 2>&1)"
+role_denied_rc=$?
+set -e
+[[ "$role_denied_rc" -eq 5 ]] ||
+  fail "disallowed purpose must role-deny with rc=5 (rc=$role_denied_rc): $role_denied_out"
+grep -q 'role_restricted' <<<"$role_denied_out" ||
+  fail "role denial lost the gate's reason: $role_denied_out"
+grep -q 'role-denied' <<<"$role_denied_out" ||
+  fail "wrk did not label the role denial: $role_denied_out"
+[[ ! -e "$TMP/herdr-astra-role.log" ]] ||
+  fail "a role-denied astra spawn reached Herdr"
+echo "PASS 527-astra-disallowed-purpose-role-denied rc=$role_denied_rc"
+
+# Quota denial: the same profile with an allowed purpose hits the quota path
+# and is refused with rc 3 — exactly distinct from the role denial above.
+set +e
+quota_denied_out="$(WRK_GATE_MODE=3 \
+  spawn_deny "$TMP/herdr-astra-quota.log" codex-astra --job astra-quota --t T1 2>&1)"
+quota_denied_rc=$?
+set -e
+[[ "$quota_denied_rc" -eq 3 ]] ||
+  fail "quota refusal must keep rc=3 (rc=$quota_denied_rc): $quota_denied_out"
+grep -q 'gate blocked' <<<"$quota_denied_out" ||
+  fail "quota refusal lost its reason: $quota_denied_out"
+if grep -q 'role_restricted\|role-denied' <<<"$quota_denied_out"; then
+  fail "quota refusal was mislabeled as a role denial: $quota_denied_out"
+fi
+[[ "$role_denied_rc" -ne "$quota_denied_rc" ]] ||
+  fail "role and quota denials share an exit code — callers cannot tell them apart"
+[[ ! -e "$TMP/herdr-astra-quota.log" ]] ||
+  fail "a quota-denied astra spawn reached Herdr"
+echo "PASS 527-astra-quota-denial-distinct rc=$quota_denied_rc"
+
+# --purpose is audit metadata for non-astra profiles: it is forwarded but the
+# spawn outcome is unchanged.
+: >"$TMP/scopefuel.log"
+plain_purpose_out="$(spawn_base codex-terra --job plain-purpose --t T1 --purpose builder 2>&1)"
+grep -q '^OK pane=' <<<"$plain_purpose_out" ||
+  fail "non-astra spawn with --purpose was refused: $plain_purpose_out"
+grep -q -- '--purpose builder' "$TMP/scopefuel.log" ||
+  fail "gate argv log lost --purpose for non-astra: $(cat "$TMP/scopefuel.log")"
+echo "PASS 527-non-astra-purpose-is-audit-only"
+
 # Builder contract: the real arbiter claim artifact remains an envelope while
 # wrk's upward-facing events stay flat. owner_lane is always the builder's own
 # lane; parent_lane is recorded as information, while panewire resolves parent
