@@ -119,8 +119,8 @@ rename한다. effort 변형은 지원하지 않는다. quota gate에는 이름�
 herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false
 ```
 
-빌더 파일럿 기간에는 `builder-devin`(동일 argv)과 `devin-swe2` 모두
-`--role builder`로 쓸 수 있다.
+`builder-devin`(동일 argv)과 워커 철자 `devin-swe2` 모두 `--role builder`로 쓸 수 있다.
+빌더 운용 범위(A+ 급 작업의 T1·T2)의 정본은 `spawn-worker/SKILL.md` §2-2 급표의 `builder-devin` 행이다.
 
 `devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
 프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). 셋 모두 scopefuel의
@@ -133,8 +133,8 @@ T1, `devin-ds41`은 T1/T2로 시작하며 reps 3건으로 확정한다. `devin-d
 
 빌더는 `builder-opus`(Opus effort high)·`builder-sol`을 쓴다. `captain-opus`·
 `captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
-경고 후 builder로 정규화되는 legacy 별칭이다. 빌더 파일럿으로 `builder-devin`(devin-swe2
-argv)·`builder-grok`(grok 4.6, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
+경고 후 builder로 정규화되는 legacy 별칭이다. `builder-devin`(devin-swe2
+argv, A+ 급 작업의 T1·T2 빌더 — `spawn-worker` 급표 행이 정본)과 빌더 파일럿으로 `builder-grok`(grok 4.6, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
 파일럿이 지목한 워커 철자 `devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire
