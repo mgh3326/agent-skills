@@ -668,6 +668,7 @@ git -C "$REMOTE_HOME/remote/repo" fetch -q origin feat-616
 git -C "$REMOTE_HOME/remote/repo" worktree add -q -b feat-616 "$REMOTE_HOME/remote/repo.v616" origin/feat-616
 git -C "$TMP/local/repo.v616" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m advance
 git -C "$TMP/local/repo.v616" push -q origin feat-616
+remote_v616_sha_before="$(git -C "$REMOTE_HOME/remote/repo.v616" rev-parse HEAD)"
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"
 set +e
 stale_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v616" \
@@ -677,7 +678,7 @@ set -e
 [[ "$stale_rc" -eq 2 ]]
 grep -q 'refusing to overwrite' <<<"$stale_out"
 grep -q 'wrk spawn' "$TMP/ssh.log" && { echo 'stale-head case reached the remote spawn' >&2; exit 1; }
-[[ "$(git -C "$REMOTE_HOME/remote/repo.v616" rev-parse HEAD)" == "$(git -C "$REMOTE_HOME/remote/repo" rev-parse feat-616)" ]]
+[[ "$(git -C "$REMOTE_HOME/remote/repo.v616" rev-parse HEAD)" == "$remote_v616_sha_before" ]]
 printf '%s\n' 'PASS wrk-spillover remote-worktree-stale-head'
 
 # Same HEAD, different branch: two branches point at one commit, the remote
