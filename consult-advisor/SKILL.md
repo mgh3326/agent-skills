@@ -55,8 +55,9 @@ herdr agent prompt <pane>
 
 ```bash
 # 이름: consult-<주제> (전역 유일). cwd = 질의 대상 자료가 있는 repo/디렉토리
-wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<주제> --keep [--effort <레벨>]
+wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<주제> --t T0 --keep [--effort <레벨>]
 # 프로필은 `scopefuel --recommend S+` 결과에서 고른다(질문자와 다른 계열)
+# --t 는 필수다(규모 미분류 job 은 스폰되지 않는다). 자문은 코드 변경이 없어 T0.
 ```
 
 - 자문 `--effort` 의 기본값은 **xhigh** 다 — `bin/wrk` 의 codex-astra
