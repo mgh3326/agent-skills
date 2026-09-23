@@ -58,6 +58,7 @@ catalog_effort_for() {
 
 if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   case "${WRK_LAUNCH_MODE:-ok}" in
+    # An installed scopefuel too old to have the subcommand at all.
     unsupported) echo "error: argument command: invalid choice: 'policy launch'" >&2; exit 2 ;;
     broken) echo 'scopefuel: policy launch failed' >&2; exit 2 ;;
   esac
@@ -92,6 +93,20 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   [[ -n "$launch_model" || "$launch_profile" == sonnet || "$launch_profile" == haiku ]] || {
     echo "error: profile '$launch_profile' is not in the catalog" >&2; exit 3; }
   [[ -n "$launch_effort" ]] || launch_effort="$(catalog_effort_for "$launch_profile")"
+  if [[ "${WRK_LAUNCH_MODE:-ok}" == route-404 ]]; then
+    # scopefuel is current; the *deployment* has no catalog route (production
+    # handoffkeep predates it). A working answer from the snapshot, not stale.
+    printf '{"catalog":{"age_s":null,"source":"unsupported","stale":false},"effort":"%s","gate":"default","grade":"S+","model_id":"%s","pool":"%s","profile":"%s"}\n' \
+      "$launch_effort" "$launch_model" "$(pool_for "$launch_profile")" "$launch_profile"
+    exit 0
+  fi
+  if [[ "${WRK_LAUNCH_MODE:-ok}" == no-provenance ]]; then
+    # rc 0 with values but no `catalog` block — an older build, a proxy, or a
+    # truncated write. The launcher must not treat these values as canonical.
+    printf '{"effort":"%s","model_id":"%s","profile":"%s"}\n' \
+      "$launch_effort" "$launch_model" "$launch_profile"
+    exit 0
+  fi
   launch_stale=false
   if [[ "${WRK_LAUNCH_MODE:-ok}" == stale ]]; then
     launch_stale=true

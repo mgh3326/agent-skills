@@ -382,7 +382,7 @@ grep -q 'model_reasoning_effort=max' "$TMP/herdr.log"
 grep -q 'model=codex-terra' <<<"$canonical_out"
 
 profiles=(
-  "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku" "fable:fable"
+  "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku"
   "devin-swe2:devin-swe2"
   "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
@@ -412,6 +412,20 @@ for pair in "${profiles[@]}"; do
   spawn_base "$runtime" >/dev/null
   [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "$expected" ]]
 done
+# #593: fable is consult_only in the catalog, so it is no longer a plain entry
+# in the table above — a bare spawn is refused even when the quota gate allows
+# it. Its gate spelling is still part of the contract, asserted with the
+# operator request that makes the launch legal.
+: >"$TMP/scopefuel.log"
+: >"$TMP/herdr.log"
+spawn_base fable --operator-request hk:doc/decision/2026-09-21/astra-allowed-purposes-approved \
+  --requested-by operator >/dev/null
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == fable ]]
+: >"$TMP/herdr.log"
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  "$WRK" spawn -c "$ROOT" -m fable -p "$PROMPT" -w w -l fixture --t T1
+
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
@@ -2061,10 +2075,20 @@ grep -q -- '-m gpt-6-sol' "$TMP/herdr.log"
 # resolves to gpt-6-astra and still gates as the codex-astra spelling so the
 # scopefuel gate remains the single purpose check.
 : >"$TMP/herdr.log"
-codex_astra_out="$(spawn_base codex-astra --job codex-astra-counsel-job --t T0 2>&1)"
-grep -q 'model=codex-astra' <<<"$codex_astra_out"
-grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
+# #593: the catalog marks codex-astra consult_only, so a bare counsel spawn is
+# refused after the gate has had its say. This removes no real capability — the
+# installed scopefuel gate already refuses codex-astra unconditionally ("역할
+# 제한 — Astra는 director 판정 전용", with or without --operator-request); only
+# this fixture was more permissive. Task #527 owns astra's admission design, so
+# what is pinned here is the parts #593 touches: the gate spelling and the
+# resolved model id still reach the gate before the refusal.
+codex_astra_out="$(spawn_base codex-astra --job codex-astra-counsel-job --t T0 2>&1 || true)"
+grep -q 'policy launch refused' <<<"$codex_astra_out" ||
+  { echo "codex-astra must be refused as consult_only: $codex_astra_out" >&2; exit 1; }
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-astra" ]]
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  "$WRK" spawn -c "$ROOT" -m codex-astra -p "$PROMPT" -w w -l fixture --t T0
 
 # Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
 # must all stop before gate/claim/tab creation.

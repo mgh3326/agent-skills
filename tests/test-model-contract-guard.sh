@@ -113,9 +113,25 @@ grep -qF -- "--effort high" <<<"$opus_argv" ||
   fail "profile 'opus': expected default --effort high (ROB-591); got: $opus_argv"
 echo "PASS opus alias argv unchanged (--model opus, default --effort high) — scopefuel side maps this to $CONTRACT_OPUS_MODEL_ID"
 
-# --- Fable: explicit consult-only launch keeps the literal 5.1 model ID ------
-assert_argv_has fable "--model $CONTRACT_FABLE_MODEL_ID "
-echo "PASS fable explicit consult launch runs $CONTRACT_FABLE_MODEL_ID"
+# --- Fable: consult-only, and the launcher enforces it ----------------------
+# Before #593 a bare `wrk -m fable` reached the launcher and only the quota gate
+# stood between it and a spawn. The catalog now answers consult_only (rc 3) and
+# the launcher refuses on that answer, so the bare form must not start anything.
+# spawn_argv() ends in `cat`, so its status cannot carry wrk's — invoke wrk directly.
+if env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
+  WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$ROOT" -m fable -p "$PROMPT" -w w -l fixture --t T1 >/dev/null 2>&1; then
+  fail "bare 'wrk -m fable' must be refused — the catalog answers consult_only"
+fi
+echo "PASS bare fable launch is refused (consult_only)"
+
+# With the operator request it launches, on the literal 5.1 model ID.
+assert_argv_has fable "--model $CONTRACT_FABLE_MODEL_ID " \
+  --operator-request hk:doc/decision/2026-09-23/task593-dispatch-ac4-absorbed \
+  --requested-by operator
+echo "PASS operator-requested fable launch runs $CONTRACT_FABLE_MODEL_ID"
 
 echo "PASS test-model-contract-guard: bin/wrk matches the checked-in scopefuel catalog contract"
 
@@ -191,12 +207,42 @@ grep -q 'catalog=stale' <<<"$header" &&
   fail "a healthy catalog must not mark the brief stale; got: $header"
 echo "PASS a healthy catalog leaves the brief header unmarked"
 
-for mode in stale unsupported broken; do
+for mode in stale broken unsupported no-provenance; do
   header="$(brief_header "$mode" "$SCOPEFUEL")"
   grep -q 'catalog=stale' <<<"$header" ||
     fail "WRK_LAUNCH_MODE=$mode did not mark the brief catalog=stale; got: $header"
 done
-echo "PASS stale / missing-subcommand / failed-request all mark the brief catalog=stale"
+echo "PASS stale / failed-request / missing-subcommand / missing-provenance all mark the brief catalog=stale"
+
+# A deployment with no catalog route is not stale: production handoffkeep
+# predates it, and branding every spawn during the rollout would make the marker
+# meaningless before it ever mattered.
+header="$(brief_header route-404 "$SCOPEFUEL")"
+grep -q 'catalog=stale' <<<"$header" &&
+  fail "a 404 catalog route must not mark the brief stale; got: $header"
+echo "PASS a server without the catalog route does not mark the brief stale"
+
+# A refusal from the canon stops the spawn here. Deferring to the quota gate let
+# a permissive gate launch a profile the catalog had just declined.
+refusal="$TMP/refusing-scopefuel"
+cat >"$refusal" <<'REFUSE'
+#!/bin/sh
+if [ "$1" = policy ] && [ "$2" = launch ]; then
+  echo "error: profile is consult_only; pass --operator-request" >&2
+  exit 3
+fi
+exec "$SCOPEFUEL_FIXTURE" "$@"
+REFUSE
+chmod +x "$refusal"
+rm -rf "$TMP/inbox"
+if env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$refusal" SCOPEFUEL_FIXTURE="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
+  WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$ROOT" -m codex-sol -p "$PROMPT" -w w -l fixture --t T1 >/dev/null 2>&1; then
+  fail "a policy launch refusal (rc 3) must stop the spawn, not fall through to the gate"
+fi
+echo "PASS a catalog refusal (rc 3) stops the spawn"
 
 # The tolerant path that used to be silent: scopefuel absent entirely.
 header="$(brief_header ok "$TMP/absent-scopefuel")"
