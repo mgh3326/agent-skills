@@ -337,6 +337,9 @@ grep -qx 'builder-kimi' <<<"$profiles_out"
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
+# ROB-591 rollback spellings (gpt-5.6-sol/gpt-5.6-luna) must remain spawnable.
+grep -qx 'codex-sol56' <<<"$profiles_out"
+grep -qx 'codex-luna56' <<<"$profiles_out"
 # task #526: the astra builder spellings were removed — astra is counsel-only
 # (hk:doc decision/2026-09-21/astra-allowed-purposes-approved).
 if grep -qx 'builder-astra' <<<"$profiles_out"; then exit 1; fi
@@ -386,6 +389,7 @@ profiles=(
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
   "codex-terra-max:codex-terra-max" "codex-luna-max:codex-luna-max"
+  "codex-sol56:codex-max" "codex-luna56:codex-luna-max"
   "kiro:kiro-sol" "kiro-opus:kiro-opus" "kiro-sonnet:kiro-sonnet"
   "kiro-sol:kiro-sol" "kiro-luna:kiro-sol" "kiro-cheap:kiro-cheap"
   "kiro-glm:kiro-sol" "kiro-deepseek:kiro-sol" "kiro-minimax:kiro-sol"
@@ -762,10 +766,10 @@ fi
 spawn_base opus --effort xhigh >/dev/null
 grep -q -- '--effort xhigh' "$TMP/herdr.log"
 grep -q -- '--model opus' "$TMP/herdr.log"
-# Default effort for opus is xhigh even without override.
+# Default effort for opus is high even without override (ROB-591).
 : >"$TMP/herdr.log"
 spawn_base opus >/dev/null
-grep -q -- '--effort xhigh' "$TMP/herdr.log"
+grep -q -- '--effort high' "$TMP/herdr.log"
 # sonnet default=high; override works; fable still rejects --effort
 : >"$TMP/herdr.log"
 spawn_base sonnet >/dev/null
@@ -811,9 +815,9 @@ oc_solar4_start_line="$(grep '^agent start ' "$TMP/herdr.log")"
   fail "oc-solar4 start argv snapshot mismatch: $oc_solar4_start_line"
 echo "PASS oc-solar4 kind/args snapshot"
 : >"$TMP/herdr.log"
-# ROB-1244: 기본 grok = 4.6, grok45 는 명시 롤백 별칭, grok46 은 동의어
+# ROB-591: 기본 grok = 4.7, grok45/grok46 은 둘 다 즉시 롤백용 명시 별칭
 spawn_base grok >/dev/null
-grep -q -- '-m grok-4.6' "$TMP/herdr.log"
+grep -q -- '-m grok-4.7' "$TMP/herdr.log"
 grep -q -- '--effort high' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base grok45 >/dev/null
@@ -2050,7 +2054,7 @@ PY
 : >"$TMP/herdr.log"
 builder_sol_out="$(spawn_base builder-sol --role builder --lane builder-sol-lane --parent parent-lane --job builder-sol-job --t T1 2>&1)"
 grep -q 'model=builder-sol' <<<"$builder_sol_out"
-grep -q -- '-m gpt-5.6-sol' "$TMP/herdr.log"
+grep -q -- '-m gpt-6-sol' "$TMP/herdr.log"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
 # task #526 AC2: the counsel path must not regress — `wrk spawn -m codex-astra`
 # under the default role (the ARCHITECT.md spawn shape, no --role) still
@@ -2110,7 +2114,7 @@ set -e
 grep -q 'model=builder-grok' <<<"$builder_grok_out" ||
   fail "builder-grok spawn output lost its model: $builder_grok_out"
 builder_grok_start="$(grep '^agent start ' "$TMP/herdr.log")"
-[[ "$builder_grok_start" == 'agent start fixture --kind grok --pane w:p1 --timeout 30000 -- --always-approve -m grok-4.6 --effort xhigh' ]] ||
+[[ "$builder_grok_start" == 'agent start fixture --kind grok --pane w:p1 --timeout 30000 -- --always-approve -m grok-4.7 --effort xhigh' ]] ||
   fail "builder-grok must reuse the grok worker argv at effort xhigh: $builder_grok_start"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "grok-hi" ]] ||
   fail "builder-grok must gate as the scopefuel-known grok-hi spelling"
