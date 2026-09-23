@@ -47,14 +47,18 @@ CONTRACT_OPUS_MODEL_ID="claude-opus-5-5"
 
 spawn_argv() {
   local model="$1"; shift
-  local extra=("$@")
+  # No intermediate array: an empty "extra=("$@")" array expanded with
+  # "${extra[@]}" throws "unbound variable" under `set -u` on Bash 3.2
+  # (macOS's default /bin/bash) even though the array itself was declared —
+  # bash 3.2 treats a zero-element array as unset for that expansion. "$@"
+  # alone has no such quirk in any bash version, empty or not.
   : >"$TMP/herdr.log"
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
-    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 "${extra[@]}" >/dev/null
+    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 "$@" >/dev/null
   cat "$TMP/herdr.log"
 }
 
