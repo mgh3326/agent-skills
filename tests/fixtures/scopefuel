@@ -17,6 +17,119 @@ pool_for() {
   esac
 }
 
+# #593: `scopefuel policy launch <profile> [--effort E] --json [--operator-request]`
+# — the canonical model id / default effort the launcher consumes. The fixture
+# mirrors the installed command's contract, not its implementation:
+#   rc 0 -> JSON on stdout
+#   rc 3 -> the canon answered and refused (consult_only, unknown profile)
+#   rc 2 -> scopefuel could not answer
+# WRK_LAUNCH_MODE: ok | stale | unsupported | broken | refused
+catalog_model_for() {
+  case "$1" in
+    opus) echo claude-opus-5-5 ;;
+    sonnet|haiku) echo "" ;;
+    fable) echo claude-fable-5-1 ;;
+    codex-sol) echo gpt-6-sol ;;
+    codex-terra|codex-terra-max) echo gpt-5.6-terra ;;
+    codex-luna|codex-luna-max) echo gpt-6-luna ;;
+    codex-astra) echo gpt-6-astra ;;
+    kiro-opus) echo claude-opus-5 ;;
+    kiro-sonnet) echo claude-sonnet-5 ;;
+    kiro-sol) echo gpt-5.6-sol ;;
+    kiro-cheap) echo qwen3-coder-next ;;
+    kiro-haiku) echo claude-haiku-4.5 ;;
+    grok|grok-hi) echo grok-4.7 ;;
+    cc-qwen38) echo qwen3.8-max ;;
+    cc-glm) echo glm-5.2 ;;
+    *) echo "" ;;
+  esac
+}
+
+catalog_effort_for() {
+  case "$1" in
+    opus|sonnet|kiro-sonnet|kiro-sol|kiro-haiku|cc-qwen38|cc-glm|grok-hi) echo high ;;
+    haiku) echo low ;;
+    codex-sol|codex-terra-max|codex-luna-max) echo max ;;
+    codex-terra|codex-luna|grok) echo medium ;;
+    codex-astra|kiro-opus) echo xhigh ;;
+    *) echo "" ;;
+  esac
+}
+
+if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
+  case "${WRK_LAUNCH_MODE:-ok}" in
+    # An installed scopefuel too old to have the subcommand at all.
+    unsupported) echo "error: argument command: invalid choice: 'policy launch'" >&2; exit 2 ;;
+    broken) echo 'scopefuel: policy launch failed' >&2; exit 2 ;;
+  esac
+  shift 2
+  launch_profile="${1:-}"; shift || true
+  launch_effort="" launch_operator=0 launch_purpose=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) shift ;;
+      --operator-request) launch_operator=1; shift ;;
+      --purpose) launch_purpose="${2:-}"; shift 2 ;;
+      --effort) launch_effort="${2:-}"; shift 2 ;;
+      *) echo "fixture scopefuel: unexpected policy launch argument '$1'" >&2; exit 2 ;;
+    esac
+  done
+  [[ -n "$launch_profile" ]] || { echo 'fixture scopefuel: policy launch needs a profile' >&2; exit 2; }
+  if [[ -n "${WRK_LAUNCH_LOG:-}" ]]; then
+    printf 'policy launch %s effort=%s operator=%s\n' \
+      "$launch_profile" "${launch_effort:-}" "$launch_operator" >>"$WRK_LAUNCH_LOG"
+  fi
+  # consult_only: an operator request always satisfies it; for an astra identity
+  # only, an allowed --purpose does too (task #527 vocabulary). fable is never
+  # satisfied by a purpose — mirrors the installed command.
+  launch_allowed=0
+  [[ "$launch_operator" -ne 1 ]] || launch_allowed=1
+  case "$launch_profile" in
+    codex-astra)
+      case "$(printf '%s' "${launch_purpose:-}" | tr '[:upper:]' '[:lower:]')" in
+        director|architect|operator-request) launch_allowed=1 ;;
+      esac ;;
+  esac
+  case "$launch_profile" in
+    fable|codex-astra)
+      if [[ "$launch_allowed" -ne 1 || "${WRK_LAUNCH_MODE:-ok}" == refused ]]; then
+        echo "error: profile '$launch_profile' is consult_only; pass --operator-request" >&2
+        exit 3
+      fi ;;
+  esac
+  launch_model="$(catalog_model_for "$launch_profile")"
+  # Lets a test prove the launcher really reads the canon: serve a model id that
+  # exists nowhere in bin/wrk and assert the argv carries it.
+  [[ -z "${WRK_LAUNCH_MODEL_OVERRIDE:-}" ]] || launch_model="$WRK_LAUNCH_MODEL_OVERRIDE"
+  [[ -z "${WRK_LAUNCH_EFFORT_OVERRIDE:-}" ]] || launch_effort="$WRK_LAUNCH_EFFORT_OVERRIDE"
+  [[ -n "$launch_model" || "$launch_profile" == sonnet || "$launch_profile" == haiku ]] || {
+    echo "error: profile '$launch_profile' is not in the catalog" >&2; exit 3; }
+  [[ -n "$launch_effort" ]] || launch_effort="$(catalog_effort_for "$launch_profile")"
+  if [[ "${WRK_LAUNCH_MODE:-ok}" == route-404 ]]; then
+    # scopefuel is current; the *deployment* has no catalog route (production
+    # handoffkeep predates it). A working answer from the snapshot, not stale.
+    printf '{"catalog":{"age_s":null,"source":"unsupported","stale":false},"effort":"%s","gate":"default","grade":"S+","model_id":"%s","pool":"%s","profile":"%s"}\n' \
+      "$launch_effort" "$launch_model" "$(pool_for "$launch_profile")" "$launch_profile"
+    exit 0
+  fi
+  if [[ "${WRK_LAUNCH_MODE:-ok}" == no-provenance ]]; then
+    # rc 0 with values but no `catalog` block — an older build, a proxy, or a
+    # truncated write. The launcher must not treat these values as canonical.
+    printf '{"effort":"%s","model_id":"%s","profile":"%s"}\n' \
+      "$launch_effort" "$launch_model" "$launch_profile"
+    exit 0
+  fi
+  launch_stale=false
+  if [[ "${WRK_LAUNCH_MODE:-ok}" == stale ]]; then
+    launch_stale=true
+    echo 'warning: catalog=stale — resolved from the bundled snapshot, not the server' >&2
+  fi
+  printf '{"catalog":{"age_s":null,"source":"%s","stale":%s},"effort":"%s","gate":"default","grade":"S+","model_id":"%s","pool":"%s","profile":"%s"}\n' \
+    "$([[ "$launch_stale" == true ]] && echo snapshot || echo server)" \
+    "$launch_stale" "$launch_effort" "$launch_model" "$(pool_for "$launch_profile")" "$launch_profile"
+  exit 0
+fi
+
 if [[ "${1:-}" == --json ]]; then
   json_rc=0
   schema_value=scopefuel.v1

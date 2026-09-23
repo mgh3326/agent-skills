@@ -391,7 +391,7 @@ grep -q 'model_reasoning_effort=max' "$TMP/herdr.log"
 grep -q 'model=codex-terra' <<<"$canonical_out"
 
 profiles=(
-  "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku" "fable:fable"
+  "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku"
   "devin-swe2:devin-swe2"
   "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
@@ -421,6 +421,20 @@ for pair in "${profiles[@]}"; do
   spawn_base "$runtime" >/dev/null
   [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "$expected" ]]
 done
+# #593: fable is consult_only in the catalog, so it is no longer a plain entry
+# in the table above — a bare spawn is refused even when the quota gate allows
+# it. Its gate spelling is still part of the contract, asserted with the
+# operator request that makes the launch legal.
+: >"$TMP/scopefuel.log"
+: >"$TMP/herdr.log"
+spawn_base fable --operator-request hk:doc/decision/2026-09-21/astra-allowed-purposes-approved \
+  --requested-by operator >/dev/null
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == fable ]]
+: >"$TMP/herdr.log"
+run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  "$WRK" spawn -c "$ROOT" -m fable -p "$PROMPT" -w w -l fixture --t T1
+
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m agy -p "$PROMPT" -w w -l fixture
@@ -2443,10 +2457,32 @@ grep -q -- '-m gpt-6-sol' "$TMP/herdr.log"
 # resolves to gpt-6-astra and still gates as the codex-astra spelling so the
 # scopefuel gate remains the single purpose check.
 : >"$TMP/herdr.log"
+# #527 + #593 combined. The catalog marks codex-astra consult_only and the gate
+# role-gates it by declared purpose. These are two spellings of one restriction,
+# and requiring both would break the approved counsel path: a bare
+# `-m codex-astra` defaults PURPOSE=architect, the gate admits it, and the
+# catalog must admit it too. The purpose reaches BOTH — wrk forwards it verbatim
+# and scopefuel decides, applying the rule to astra only.
 codex_astra_out="$(spawn_base codex-astra --job codex-astra-counsel-job --t T0 2>&1)"
-grep -q 'model=codex-astra' <<<"$codex_astra_out"
-grep -q -- '-m gpt-6-astra' "$TMP/herdr.log"
+grep -q '^OK pane=' <<<"$codex_astra_out" ||
+  fail "the architect counsel spawn must proceed (purpose satisfies consult_only): $codex_astra_out"
+grep -q -- '--purpose architect' "$TMP/scopefuel.log" ||
+  fail "gate argv lost --purpose architect: $(cat "$TMP/scopefuel.log")"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-astra" ]]
+echo "PASS 593-astra-counsel-purpose-satisfies-consult-only"
+
+# A purpose outside #527's list is refused, and the ROLE denial speaks first:
+# gate exit 5 surfaces as wrk exit 77, which must not be flattened into the
+# catalog refusal's exit 2 — a caller reading 2 would look for a quota problem.
+expect_exit 77 spawn_base codex-astra --purpose builder --job astra-bad-purpose --t T0
+echo "PASS 593-astra-disallowed-purpose-role-denied-77"
+
+# 🔴 fable is NOT astra: #527 AC⑤ forbids relaxing its escalation gate, so a
+# purpose must never become a second key to it. Only --operator-request opens it.
+fable_purpose_out="$(spawn_base fable --purpose architect --job fable-purpose --t T1 2>&1 || true)"
+grep -q 'policy launch refused' <<<"$fable_purpose_out" ||
+  fail "a purpose must not satisfy fable's consult_only: $fable_purpose_out"
+echo "PASS 593-fable-not-unlocked-by-purpose"
 
 # Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
 # must all stop before gate/claim/tab creation.
