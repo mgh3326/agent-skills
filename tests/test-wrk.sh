@@ -514,7 +514,8 @@ devin_readiness_failure_case() {
   local scenario="$1" want_rc="$2" out rc
   : >"$TMP/herdr.log"
   set +e
-  out="$(TEST_FIXTURE_SCENARIO="$scenario" spawn_base devin-swe2 2>&1)"
+  # Frozen clock (#606): the attempt cap, not host speed, ends never-detect.
+  out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO="$scenario" spawn_base devin-swe2 2>&1)"
   rc=$?
   set -e
   [[ "$rc" -eq "$want_rc" ]] ||
@@ -732,6 +733,27 @@ for shell_window_jump in 27 29 30 31; do
   grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "retry at ${shell_window_jump}s leaked its pane"
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "retry at ${shell_window_jump}s delivered a brief"; fi
 done
+# A second ticking over between the window's start reading and the first
+# attempt must not shorten a first-attempt success: it keeps the pre-#606
+# argv (tester R1 repro: `date +%s` 1000 then 1001 gave --timeout 29000).
+mkdir -p "$TMP/tickclock"
+cat >"$TMP/tickclock/date" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == +%s ]]; then
+  if [[ -e "$FAKECLOCK_STATE" ]]; then echo 1001; else : >"$FAKECLOCK_STATE"; echo 1000; fi
+  exit 0
+fi
+exec /bin/date "$@"
+SH
+chmod +x "$TMP/tickclock/date"
+: >"$TMP/herdr.log"
+rm -f "$TMP/tickclock.state"
+tick_out="$(PATH="$TMP/tickclock:$PATH" FAKECLOCK_STATE="$TMP/tickclock.state" spawn_base opus 2>&1)" ||
+  fail "first-attempt start across a second tick must spawn: $tick_out"
+[[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "first-attempt start across a second tick must start once"
+grep -q '^agent start fixture --kind claude --pane w:p1 --timeout 30000 -- ' "$TMP/herdr.log" ||
+  fail "first-attempt start must keep --timeout 30000 across a second tick: $(grep '^agent start ' "$TMP/herdr.log")"
 shell_window_case codex-terra shell-busy 'agent start ' 31
 [[ "$SHELL_WINDOW_RC" -eq 0 ]] || fail "codex retry at 31s of 120s must spawn: $SHELL_WINDOW_OUT"
 grep -q '^agent start fixture --kind codex --pane w:p1 --timeout 89000 -- ' "$TMP/herdr.log" ||

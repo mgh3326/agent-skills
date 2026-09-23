@@ -911,12 +911,15 @@ SHELL_READY_POLL_MS=250
 AGENT_START_MIN_TIMEOUT_MS=3000
 
 agent_start_in_pane() {
-  local started_at attempts=0 max_attempts remaining_ms start_err start_rc
+  local started_at now attempts=0 max_attempts remaining_ms start_err start_rc
+  # The first attempt reuses the start reading, so it always hands herdr the
+  # full window (the pre-#606 argv) even when a second ticks over here.
   started_at="$(date +%s)"
+  now="$started_at"
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
   while :; do
     attempts=$(( attempts + 1 ))
-    remaining_ms=$(( START_TIMEOUT - ($(date +%s) - started_at) * 1000 ))
+    remaining_ms=$(( START_TIMEOUT - (now - started_at) * 1000 ))
     if (( remaining_ms <= AGENT_START_MIN_TIMEOUT_MS )); then
       echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (agent_pane_busy x$(( attempts - 1 ))); pane=$PANE" >&2
       spawn_pane_cleanup
@@ -940,6 +943,7 @@ agent_start_in_pane() {
       return "$start_rc"
     fi
     sleep_for "$SHELL_READY_POLL_SECONDS"
+    now="$(date +%s)"
   done
 }
 
