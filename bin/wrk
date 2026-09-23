@@ -201,8 +201,8 @@ Devin model variants (task 281): devin-glm52, devin-swe17 and devin-ds41 run
 the same unattended devin argv with only the model name changed — worker-only,
 sharing scopefuel's single `devin` pool (devin-ds41 is the paid spelling).
 Legacy profile aliases captain-opus and captain-sol have the same meaning.
-Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-for-coding/k3`; kimi-k27 and
-kimi-k27-code use `kimi --auto -m kimi-for-coding/kimi-for-coding`; the CLI has
+Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-code/k3`; kimi-k27 and
+kimi-k27-code use `kimi --auto -m kimi-code/kimi-for-coding`; the CLI has
 no --effort option.
 kimi-k3-low uses the same argv as kimi-k3 but injects KIMI_CODE_HOME pointing at
 the low-thinking-effort clone home from `bin/kimi-clone-home` ([thinking]
@@ -1591,12 +1591,12 @@ resolve_profile() {
     # CLI --effort wiring above (ROB-1213 covered those; kimi is a different path).
     # Task 240 pilot: builder-kimi is kimi-k3 admitted under --role builder
     # (operator decision 2026-09-14 §5) — identical argv, still no --effort.
-    kimi-k3|builder-kimi) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3) ;;
-    kimi-k27|kimi-k27-code) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/kimi-for-coding) ;;
+    kimi-k3|builder-kimi) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/k3) ;;
+    kimi-k27|kimi-k27-code) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/kimi-for-coding) ;;
     # kimi-k3-low: same model argv as kimi-k3 — the differentiator is KIMI_CODE_HOME
     # (below), pointed at the low-thinking-effort clone home, not the CLI model arg.
     kimi-k3-low)
-      PROFILE_KIND=kimi; KIMI_TRUST_HOME="$KIMI_CODE_LOW_HOME"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-for-coding/k3)
+      PROFILE_KIND=kimi; KIMI_TRUST_HOME="$KIMI_CODE_LOW_HOME"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/k3)
       PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_LOW_HOME") ;;
 
     oc-kimi-code) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k2.7-code) ;;
