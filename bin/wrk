@@ -78,7 +78,7 @@ Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [opti
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
-            [--operator-request REF] [--requested-by NAME] [--keep]
+            [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--keep]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
@@ -109,7 +109,7 @@ spawn_help() {
 Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
-                 [--operator-request REF] [--requested-by NAME] [--keep]
+                 [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--keep]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -172,6 +172,14 @@ line then ends with via=herdr-fallback.
   --requested-by NAME
                      self-reported requester name accompanying
                      --operator-request, passed verbatim to `scopefuel gate`.
+  --purpose PURPOSE  caller-declared spawn purpose passed verbatim to
+                     `scopefuel gate` (task #527). For the astra profiles the
+                     gate role-denies (gate exit 5; wrk exits 77) unless
+                     PURPOSE is director, architect or operator-request; for
+                     every other profile it is audit metadata only and never
+                     changes the decision.
+                     This is a purpose axis, distinct from the
+                     --operator-request REF format gate above.
   -h, --help         show this usage
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
@@ -192,6 +200,9 @@ haiku default=low; all support an explicit --effort override.
 Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol.
 codex-astra = gpt-6-astra is a counsel-only profile for director/architect/operator-requested
 advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved); --role builder rejects it.
+It defaults to --effort xhigh and requires --purpose director|architect|operator-request,
+which the gate enforces as role denial (gate exit 5, surfaced by wrk as exit 77) when
+missing or wrong.
 Pilot builders (task 240): builder-devin = devin-swe2 argv; builder-grok = grok 4.7 at effort xhigh; builder-kimi = kimi-k3 argv.
 Devin model variants (task 281): devin-glm52, devin-swe17 and devin-ds41 run
 the same unattended devin argv with only the model name changed — worker-only,
@@ -756,10 +767,15 @@ quota_gate() {
   # itself resolved for this profile. It is re-printed verbatim; stderr is untouched.
   # --operator-request/--requested-by are forwarded verbatim when given — wrk holds
   # no REF format or profile-applicability judgement; the gate's fail-closed
-  # refusal exits (0/3/4 vocabulary) are propagated unchanged below.
+  # refusal exits (0/3/4 vocabulary; 5 = role denial per task #527, remapped
+  # to wrk exit 77) are propagated below.
+  # --purpose is forwarded verbatim too: it is the gate's role input for the
+  # astra profiles (task #527) — without it the gate role-denies them (gate
+  # rc 5, surfaced by wrk as exit 77).
   local gate_args=(gate -m "$GATE_PROFILE")
   [[ -z "${OPERATOR_REQUEST:-}" ]] || gate_args+=(--operator-request "$OPERATOR_REQUEST")
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
+  [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
   local out rc
   set +e
   out="$("$SCOPEFUEL" "${gate_args[@]}")"
@@ -768,6 +784,13 @@ quota_gate() {
   [[ -z "$out" ]] || printf '%s\n' "$out"
   case "$rc" in
     0) GATE_OUTPUT="$out"; GATE_READY=1; return 0 ;;
+    # task #527: gate rc 5 is a ROLE denial (e.g. astra without an allowed
+    # --purpose) — not a quota refusal; it must never be read as "quota
+    # exhausted, retry after reset" (the ARCHITECT.md:6 misread). wrk remaps
+    # it to exit 77: exit 5 already belongs to quota_hub_policy_gate's
+    # hub-quota-policy denial, and sharing it would let a caller read a role
+    # denial as a quota denial — the exact confusion this change exists to end.
+    5) echo "wrk: scopefuel gate role-denied (gate exit 5 → wrk exit 77) — purpose not allowed or missing; NOT a quota refusal" >&2; exit 77 ;;
     3|4) exit "$rc" ;;
     *) echo "wrk: scopefuel gate failed (exit $rc)" >&2; return "$rc" ;;
   esac
@@ -903,11 +926,114 @@ devin_wait_detected() {
   done
 }
 
+# #606: a fresh pane's shell may still be starting when wrk reaches the agent
+# start. herdr treats a pane as an available shell when the shell itself holds
+# the foreground with no foreground command (measured 2026-09-23 on herdr 0.9.0:
+# `agent start` was accepted 0.07s after tab create, before any prompt). While
+# rc files run subprocesses (git rev-parse, git config ... observed) it answers
+# agent_pane_busy; under load 13 that lasted most of a 7-13s zsh start. Inside
+# the START_TIMEOUT window that code only means "shell not ready yet", so it is
+# retried with the Devin detection poll cadence. Every other failure keeps
+# failing at once. herdr refuses a start timeout of 3000ms or less, so a window
+# with no more than that left fails closed instead of being handed to herdr.
+SHELL_READY_POLL_SECONDS=0.25
+SHELL_READY_POLL_MS=250
+AGENT_START_MIN_TIMEOUT_MS=3000
+
+agent_start_in_pane() {
+  local started_at now attempts=0 max_attempts remaining_ms start_err start_rc
+  # The first attempt reuses the start reading, so it always hands herdr the
+  # full window (the pre-#606 argv) even when a second ticks over here.
+  started_at="$(date +%s)"
+  now="$started_at"
+  max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    remaining_ms=$(( START_TIMEOUT - (now - started_at) * 1000 ))
+    if (( remaining_ms <= AGENT_START_MIN_TIMEOUT_MS )); then
+      echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (agent_pane_busy x$(( attempts - 1 ))); pane=$PANE" >&2
+      spawn_pane_cleanup
+      return 1
+    fi
+    set +e
+    start_err="$("$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$remaining_ms" -- "${ARGS[@]}" 2>&1 >/dev/null)"
+    start_rc=$?
+    set -e
+    [[ "$start_rc" -eq 0 ]] && return 0
+    [[ -z "$start_err" ]] || printf '%s\n' "$start_err" >&2
+    if [[ "$start_err" != *'"code":"agent_pane_busy"'* ]]; then
+      spawn_pane_cleanup
+      return "$start_rc"
+    fi
+    # The wall clock is checked at the top of the loop; the cap bounds it
+    # when sleep is disabled.
+    if (( attempts >= max_attempts )); then
+      echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (agent_pane_busy x$attempts); pane=$PANE" >&2
+      spawn_pane_cleanup
+      return "$start_rc"
+    fi
+    sleep_for "$SHELL_READY_POLL_SECONDS"
+    now="$(date +%s)"
+  done
+}
+
+# `pane run` has no availability check: it types into whatever holds the
+# terminal. Before running Devin, poll process-info until herdr's own
+# available-shell rule holds (the shell is the foreground process group and the
+# only foreground process). A process-info failure or an envelope that cannot
+# be read fails closed at once; only "not ready yet" is polled, inside the same
+# window that detection and the idle wait then share.
+devin_wait_shell_ready() {
+  local started_at="$1" attempts=0 max_attempts info_out info_rc ready
+  max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    set +e
+    info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
+    info_rc=$?
+    set -e
+    if [[ "$info_rc" -ne 0 ]]; then
+      devin_spawn_diagnostics "pane process-info exited $info_rc before pane run"
+      return 1
+    fi
+    set +e
+    ready="$(printf '%s' "$info_out" | python3 -c '
+import json, sys
+info = json.load(sys.stdin)["result"]["process_info"]
+shell = info["shell_pid"]
+group = info["foreground_process_group_id"]
+procs = info["foreground_processes"]
+if type(shell) is not int or type(group) is not int or not isinstance(procs, list):
+    raise SystemExit(1)
+pids = [p["pid"] for p in procs]
+if any(type(pid) is not int for pid in pids):
+    raise SystemExit(1)
+print("yes" if group == shell and pids and all(pid == shell for pid in pids) else "no")
+' 2>/dev/null)"
+    info_rc=$?
+    set -e
+    if [[ "$info_rc" -ne 0 ]]; then
+      devin_spawn_diagnostics "pane process-info returned an invalid envelope before pane run"
+      return 1
+    fi
+    [[ "$ready" == yes ]] && return 0
+    if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= START_TIMEOUT )); then
+      devin_spawn_diagnostics "shell not ready within ${START_TIMEOUT}ms (foreground busy x$attempts)"
+      return 1
+    fi
+    sleep_for "$SHELL_READY_POLL_SECONDS"
+  done
+}
+
 devin_start_in_pane() {
   local run_rc wait_rc explain_rc parse_rc rename_rc explain_json identity detected_agent matched_rule
   local started_at remaining_ms
 
   started_at="$(date +%s)"
+  if ! devin_wait_shell_ready "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
   set +e
   "$HERDR" pane run "$PANE" devin "${ARGS[@]}" >/dev/null
   run_rc=$?
@@ -1439,7 +1565,10 @@ resolve_profile() {
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    codex-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    # task #527 요건 ⑦: codex-astra default effort is xhigh, unified with
+    # ARCHITECT.md's spawn command and the consult-advisor SKILL.md note
+    # (hk:doc note/2026-09-22/task527-astra-effort-alignment).
+    codex-astra) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-astra; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
     # ROB-591 rollback spellings: explicit opt-out back to the pre-refresh gpt-5.6-*
     # IDs, same case-block style as grok46 below. codex-sol56/codex-luna56 keep the
     # same efforts as their current default spellings.
@@ -1539,7 +1668,10 @@ resolve_profile() {
     # `launch_profile`, so reps stay separated per model.
     devin-glm52|devin-swe17|devin-ds41) GATE_PROFILE=devin-swe2 ;;
     codex|codex-sol|codex-max|builder-sol|captain-sol|codex-sol56) GATE_PROFILE=codex-max ;;
-    codex-astra) GATE_PROFILE=codex-astra ;;
+    # task #527: the gate role-denies astra without an allowed --purpose, so the
+    # counsel spawn path defaults it to `architect` (the wrk-side counsel use).
+    # An explicit --purpose director|operator-request still wins.
+    codex-astra) GATE_PROFILE=codex-astra; [[ -n "${PURPOSE:-}" ]] || PURPOSE=architect ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
     codex-luna|codex-luna-hi|codex-luna-max|codex-luna56) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
@@ -2616,7 +2748,7 @@ spillover_wake() {
 # a flag and remains a perfectly valid --requested-by value.
 wrk_option_token() {
   case "$1" in
-    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -2637,7 +2769,7 @@ spillover_hub_args() {
         ;;
       --job-dup-ok)
         echo "wrk: --job-dup-ok is not permitted for a hub spawn" >&2; return 2 ;;
-      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--requested-by)
+      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--requested-by|--purpose)
         i=$((i + 1))
         { [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] && ! wrk_option_token "${args[$i]}"; } ||
           { echo "wrk: $arg requires a value" >&2; return 2; }
@@ -3135,13 +3267,13 @@ hosts_cmd() {
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" REQUESTED_BY=""
+  OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
@@ -3150,6 +3282,7 @@ spawn_cmd() {
           --role) ROLE="$2" ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
           --report) REPORT_PATH="$2" ;;
           --operator-request) OPERATOR_REQUEST="$2" ;; --requested-by) REQUESTED_BY="$2" ;;
+          --purpose) PURPOSE="$2" ;;
         esac
         shift 2 ;;
       --job-dup-ok) JOB_DUP_OK=1; shift ;;
@@ -3296,7 +3429,7 @@ print(value if isinstance(value, str) else "")
   if [[ "$PROFILE_KIND" == devin ]]; then
     devin_start_in_pane
   else
-    "$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$START_TIMEOUT" -- "${ARGS[@]}" >/dev/null
+    agent_start_in_pane
   fi
   sleep_for "$BOOT_SETTLE"
   if [[ "$PROFILE_KIND" == kimi ]]; then
