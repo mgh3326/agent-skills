@@ -424,7 +424,23 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
 # shell command in a pane and stalls (task201). Task 240 later admitted the
 # same profile under --role builder (pilot) without changing this argv.
 : >"$TMP/herdr.log"
-devin_idle_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
+# The fake clock below answers every `date +%s` with 1000 until the first
+# herdr call matching FAKECLOCK_AFTER is logged, then 1000+FAKECLOCK_JUMP
+# (#606).
+# With FAKECLOCK_JUMP=0 it is frozen, so the attempt cap — not how fast this
+# host runs 120 fixture calls — is what ends a never-ready poll.
+mkdir -p "$TMP/jumpclock"
+cat >"$TMP/jumpclock/date" <<'SH'
+#!/usr/bin/env bash
+if [[ "$*" == +%s ]]; then
+  seen="$(grep -c "^$FAKECLOCK_AFTER" "$WRK_FIXTURE_LOG" 2>/dev/null || true)"
+  if (( ${seen:-0} >= 1 )); then echo $(( 1000 + FAKECLOCK_JUMP )); else echo 1000; fi
+  exit 0
+fi
+exec /bin/date "$@"
+SH
+chmod +x "$TMP/jumpclock/date"
+devin_idle_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
 grep -q 'model=devin-swe2' <<<"$devin_idle_out"
 grep -q 'status=idle' <<<"$devin_idle_out"
 grep -q 'landed=yes' <<<"$devin_idle_out"
@@ -433,10 +449,12 @@ devin_run_line="$(grep '^pane run ' "$TMP/herdr.log")"
 [[ "$devin_run_line" == 'pane run w:p1 devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
   fail "devin pane-run argv snapshot mismatch: $devin_run_line"
 # Detection and the idle wait share one 30s window, so the wait gets what is
-# left of it (whole seconds; never more than 30000ms).
+# left of it (whole seconds; never more than 30000ms). The clock is frozen so
+# host speed cannot move the value (#606: the shell-ready poll now also runs
+# inside the window, and on a loaded host 2-3s had already passed).
 devin_wait_line="$(grep '^agent wait ' "$TMP/herdr.log")"
 if ! [[ "$devin_wait_line" =~ ^agent\ wait\ w:p1\ --until\ idle\ --timeout\ ([0-9]+)$ ]] ||
-   (( BASH_REMATCH[1] < 29000 || BASH_REMATCH[1] > 30000 )); then
+   (( BASH_REMATCH[1] != 30000 )); then
   fail "devin welcome wait argv drifted: $devin_wait_line"
 fi
 grep -qx 'agent get w:p1' "$TMP/herdr.log" ||
@@ -628,21 +646,6 @@ if grep -q '^pane run ' "$TMP/herdr.log"; then fail "non-Devin kind reached pane
 # Inside the START_TIMEOUT window that is retried with the 250ms poll; every
 # other start failure still fails at once. Removing the retry turns the
 # shell-busy cases red; retrying every error turns the non-busy cases red.
-# The fake clock below answers every `date +%s` with 1000 until the first
-# herdr call matching FAKECLOCK_AFTER is logged, then 1000+FAKECLOCK_JUMP.
-# With FAKECLOCK_JUMP=0 it is frozen, so the attempt cap — not how fast this
-# host runs 120 fixture calls — is what ends a never-ready poll.
-mkdir -p "$TMP/jumpclock"
-cat >"$TMP/jumpclock/date" <<'SH'
-#!/usr/bin/env bash
-if [[ "$*" == +%s ]]; then
-  seen="$(grep -c "^$FAKECLOCK_AFTER" "$WRK_FIXTURE_LOG" 2>/dev/null || true)"
-  if (( ${seen:-0} >= 1 )); then echo $(( 1000 + FAKECLOCK_JUMP )); else echo 1000; fi
-  exit 0
-fi
-exec /bin/date "$@"
-SH
-chmod +x "$TMP/jumpclock/date"
 for shell_busy_pair in "opus:claude" "codex-terra:codex"; do
   shell_busy_model="${shell_busy_pair%%:*}"
   shell_busy_kind="${shell_busy_pair#*:}"
