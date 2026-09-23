@@ -453,15 +453,25 @@ wake = "panewire"
   `ssh <alias> 'HERDR_SESSION=<session> wrk spawn ... --host local'`로 현지 `wrk`에 위임한다.
   그러므로 원격에서도 quota gate·pane 착지 검증이 동일하게 수행된다. 원격 `-w`는 설정의
   `workspace`가 기본값이며 호출자가 명시하면 그 값을 유지한다.
+- `cwd_map`은 접두 매핑이다: cwd가 키와 같거나 `<키>.<suffix>`(형제 worktree, suffix는
+  `[A-Za-z0-9._-]+`)이면 `<값>`·`<값>.<suffix>`로, `<키>/<하위경로>`이면 `<값>/<하위경로>`로
+  매핑한다. 가장 긴 키가 이기고 `<키>foo`처럼 경계가 아닌 접두는 매칭하지 않는다.
+- 유도된 경로(suffix·subpath 매핑)는 원격에서 확인한다: 형제 worktree(suffix)가 없으면
+  원격 레포 루트에서 `git fetch` + `git worktree add`로 만들고, 없는 subpath는 만들지
+  않고 fail-closed다(원격 레포를 먼저 동기화). 이미 있으면 branch·HEAD가 로컬과 같은지
+  확인한다. 로컬 브랜치가 origin에 push되지 않았거나 원격이 다른 커밋이면 덮어쓰지 않고
+  fail-closed다 — push·정렬·수동 생성 중 무엇을 하면 되는지 메시지가 나온다. 정확히
+  일치하는 리포 루트 매핑은 기존처럼 통과한다.
 - 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. 로컬로 조용히 되돌리지 말고
-  `--host local` 또는 설정 추가를 안내한다. worktree 생성/동기화는 이 범위 밖이다.
+  `--host local` 또는 설정 추가를 안내한다.
 - hub가 꺼져 폴백 중 원격 후보가 닿지 않으면 다음 후보를 본다. `wake = "panewire"`일 때만
   `panewire burst request --target <name> --hold <N>m`을 best-effort로 시도하며, wake 실패도
   다음 후보 탐색을 막지 않는다.
 - `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
 - `--host local`은 운영자 강제 로컬, `--host <remote-name>`은 강제 원격이다. 둘 다 hub 판정을
-  우회하므로 장애 대응·진단에만 쓴다.
+  우회하므로 장애 대응·진단에만 쓴다. 강제 원격은 실패해도 로컬로 폴백하지 않고 원격의
+  exit code를 그대로 전파한다 — 로컬 폴백은 `--host auto`에서만 일어난다.
 
 ### 4.x-2 `via = "hub"` — hub가 직접 원격 spawn을 실행할 때
 
@@ -488,6 +498,8 @@ cwd_keys = {"<local-worktree>"="repo-a"}
 - hub 요청에는 `cwd_keys`의 현재 cwd 키와 UTF-8 brief inline, 허용된 spawn 인자만 들어간다.
   응답이 pending이면 최대 1시간 동안 조회하고, 완료 결과의 pane·job으로 기존 원격 spawn과
   같은 `OK pane=... host=machine-a ... job=...` 행을 출력한다.
+- `cwd_keys`도 `cwd_map`과 같은 접두 규칙으로 매핑한다 — 형제 worktree cwd는 `<키>.<suffix>`
+  키로 유도된다. hub가 유도된 키를 모르면 기존과 같이 fail-closed다.
 - `cwd_keys`에 현재 cwd가 없거나 `operator_token_env`가 없으면 **fail-closed**다. 로컬 또는
   SSH로 조용히 되돌리지 않으며, `--host local` 또는 hosts.toml 보완을 안내한다. lost·인증
   실패·hub 오류도 같은 원칙으로 종료한다.
