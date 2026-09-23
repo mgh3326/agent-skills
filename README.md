@@ -42,7 +42,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `planner` | 상류 분석 상주 역할 — 판단을 durable하게 기록하고 실행에는 제안만 전달 |
 | `ask-session` | 상존 세션에 질문 보내고 답변 회수(왕복) — 답변 파일 계약 + 타임아웃·무응답 처리 |
 | `consult-advisor` | 강모델 자문 — 티어로 자문처 지정, headless 1회성 우선, 교차 자문. 자문=참고 의견(승인 아님) |
-| `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — director 직속(스폰·보고 모두 director), 고정 8단계 절차·판단 없음 |
+| `installer` | 배포 1건 전담(비상주, 배포 1회=세션 1개) — director 직속(스폰·보고 모두 director), 고정 9단계 절차(마지막 = 배포 기록)·판단 없음 |
 
 구 이름 `admiral`·`flag`·`captain`·`counsel`·`strategist`·`bosun`은 별칭 stub으로 남아 있으며 정본은 각각 새 이름이다. 제거는 별도 태스크다.
 
@@ -119,8 +119,8 @@ rename한다. effort 변형은 지원하지 않는다. quota gate에는 이름�
 herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false
 ```
 
-빌더 파일럿 기간에는 `builder-devin`(동일 argv)과 `devin-swe2` 모두
-`--role builder`로 쓸 수 있다.
+`builder-devin`(동일 argv)과 워커 철자 `devin-swe2` 모두 `--role builder`로 쓸 수 있다.
+빌더 운용 범위(A+ 급 작업의 T1·T2)의 정본은 `spawn-worker/SKILL.md` §2-2 급표의 `builder-devin` 행이다.
 
 `devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
 프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). 셋 모두 scopefuel의
@@ -133,8 +133,8 @@ T1, `devin-ds41`은 T1/T2로 시작하며 reps 3건으로 확정한다. `devin-d
 
 빌더는 `builder-opus`(Opus effort high)·`builder-sol`을 쓴다. `captain-opus`·
 `captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
-경고 후 builder로 정규화되는 legacy 별칭이다. 빌더 파일럿으로 `builder-devin`(devin-swe2
-argv)·`builder-grok`(grok 4.6, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
+경고 후 builder로 정규화되는 legacy 별칭이다. `builder-devin`(devin-swe2
+argv, A+ 급 작업의 T1·T2 빌더 — `spawn-worker` 급표 행이 정본)과 빌더 파일럿으로 `builder-grok`(grok 4.6, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
 파일럿이 지목한 워커 철자 `devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire

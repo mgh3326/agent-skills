@@ -8,14 +8,18 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 빌더는 PR 한 건의 실행 루프를 소유한다. canonical 빌더 프로필은 `builder-opus`(Opus, effort high) 또는
 `builder-sol`(codex-sol)이다. `captain-opus`·`captain-sol`은
 legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
-`builder-devin`·`builder-grok`은 파일럿 1건씩을 통과해 **조건부 T1 빌더**로 등재됐다(2026-09-14
+`builder-grok`은 파일럿 1건을 통과해 **조건부 T1 빌더**로 등재됐다(2026-09-14
 운영자 결정). 조건은 **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(타사 풀
 물리적 소진 시 `spawn-worker` §2-4 동일 계열 예외) · T2 이상과
-배포·안전가드 표면 제외**다. `builder-kimi`는 아직 파일럿 전이라 열려만 있다. 세 프로필 모두
-각각 devin-swe2·grok 4.6 xhigh·kimi-k3의 argv를 재사용하며, 워커 철자
-`devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. **정식 등재와 T2 확대는
-프로필당 표본 3(빌더 역할 reps)에서 재판단**하며, 라운드 상한 초과나 게이트 BOUNCE 2회면 워커
-전용으로 되돌린다.
+배포·안전가드 표면 제외**다. `builder-devin`은 같은 파일럿에서 출발해 2026-09-23 운영자 결정으로
+**A+ 급 작업의 T1·T2 빌더**가 됐다 — 조건 **급 A+ 이하 작업(`S` 이상 제외) · 가역 T1·T2 한정(T3
+제외) · 라운드 상한 3 · 독립 tester는 타사 provider family(§2-4 동일 계열 예외 적용) · 배포·라이브
+매매 표면 제외**, 되돌리기 조건, 결정 기록과 다음 재판단의 **정본은 `spawn-worker` §2-2 급표의
+`builder-devin` 행**이다(두 문서가 어긋나면 그 행을 따른다). `builder-kimi`는 아직 파일럿 전이라
+열려만 있다. 세 프로필 모두 각각 devin-swe2·grok 4.6 xhigh·kimi-k3의 argv를 재사용하며, 워커 철자
+`devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. `builder-grok`·`builder-kimi`의
+**정식 등재와 T2 확대는 프로필당 표본 3(빌더 역할 reps)에서 재판단**하며, 라운드 상한 초과나 게이트
+BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌리기 조건이다).
 
 ## 시작과 브리프
 
