@@ -35,6 +35,7 @@ jobs:
             tests/test-followup-injection.sh \
             tests/test-report-outside-worktree.sh \
             tests/test-model-contract-guard.sh \
+            tests/test-installer-route.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
       - name: Bash tests
         env:
@@ -49,3 +50,4 @@ jobs:
           bash tests/test-followup-injection.sh
           bash tests/test-report-outside-worktree.sh
           bash tests/test-model-contract-guard.sh
+          bash tests/test-installer-route.sh
