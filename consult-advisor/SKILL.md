@@ -55,13 +55,17 @@ herdr agent prompt <pane>
 
 ```bash
 # 이름: consult-<주제> (전역 유일). cwd = 질의 대상 자료가 있는 repo/디렉토리
-wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<주제> [--effort <레벨>]
+wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<주제> --t T0 --keep [--effort <레벨>]
 # 프로필은 `scopefuel --recommend S+` 결과에서 고른다(질문자와 다른 계열)
+# --t 는 필수다(규모 미분류 job 은 스폰되지 않는다). 자문은 코드 변경이 없어 T0.
 ```
 
 - 자문 `--effort` 의 기본값은 **xhigh** 다 — `bin/wrk` 의 codex-astra
   DEFAULT_EFFORT 및 admiral ARCHITECT.md 의 스폰 명령과 같은 값이어야 한다
   (task #527 요건 ⑦). **max 는 운영자가 명시할 때만** 쓴다.
+- `--keep` 은 보호 표시다(#603): 자문 세션은 답변 뒤에도 후속 질의를 받으므로 세션 정리
+  (`wrk reap`, panewire 세션 회수 보고)가 후보로 올리지 않는다. 다 쓴 자문 pane 은 요청자가
+  직접 닫는다.
 - 주입·제출검증 = **relay-handoff §3**, pane kind별 통지·대기·착지 확인의 정본과
   답변 회수 분기는 **relay-handoff §3-1** 및 **ask-session §3**(답변 파일 계약)를 따른다.
 - 자문자는 수신자가 claude pane인 기본 경로에서 답변 파일을 작성한 직후 아래 통지를 반드시 실행한다:
