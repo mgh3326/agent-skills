@@ -1819,8 +1819,9 @@ unset TEST_ARBITER_BIN
 
 # ---------------------------------------------------------------------------
 # task #527: --purpose is forwarded verbatim to `scopefuel gate`, the astra
-# counsel path defaults it to `architect`, and a role denial (rc 5) is
-# caller-visibly distinct from a quota denial (rc 3).
+# counsel path defaults it to `architect`, and a role denial (gate rc 5 → wrk
+# exit 77) is caller-visibly distinct from a quota denial (rc 3) AND from the
+# pre-existing hub quota-policy denial (wrk exit 5).
 # ---------------------------------------------------------------------------
 
 grep -q -- '--purpose' <<<"$spawn_help_out" ||
@@ -1851,15 +1852,17 @@ grep -q -- '--purpose director' "$TMP/scopefuel.log" ||
   fail "explicit --purpose director was overridden: $(cat "$TMP/scopefuel.log")"
 echo "PASS 527-explicit-purpose-overrides-architect-default"
 
-# Role denial: a disallowed purpose is refused by the gate with rc 5 and must
-# surface as a role denial — never a quota stop.
+# Role denial: a disallowed purpose is refused by the gate with rc 5, which
+# wrk remaps to exit 77 — exit 5 is already quota_hub_policy_gate's
+# hub-quota-policy denial, so sharing it would let a caller misread a role
+# denial as a quota stop.
 set +e
 role_denied_out="$(spawn_deny "$TMP/herdr-astra-role.log" codex-astra --job astra-role --t T1 \
   --purpose worker 2>&1)"
 role_denied_rc=$?
 set -e
-[[ "$role_denied_rc" -eq 5 ]] ||
-  fail "disallowed purpose must role-deny with rc=5 (rc=$role_denied_rc): $role_denied_out"
+[[ "$role_denied_rc" -eq 77 ]] ||
+  fail "disallowed purpose must role-deny with wrk rc=77 (rc=$role_denied_rc): $role_denied_out"
 grep -q 'role_restricted' <<<"$role_denied_out" ||
   fail "role denial lost the gate's reason: $role_denied_out"
 grep -q 'role-denied' <<<"$role_denied_out" ||
@@ -1884,6 +1887,9 @@ if grep -q 'role_restricted\|role-denied' <<<"$quota_denied_out"; then
 fi
 [[ "$role_denied_rc" -ne "$quota_denied_rc" ]] ||
   fail "role and quota denials share an exit code — callers cannot tell them apart"
+# …and neither may collide with the pre-existing hub quota-policy denial (5).
+[[ "$role_denied_rc" -ne 5 && "$quota_denied_rc" -ne 5 ]] ||
+  fail "a denial rc collided with hub quota-policy denial (exit 5)"
 [[ ! -e "$TMP/herdr-astra-quota.log" ]] ||
   fail "a quota-denied astra spawn reached Herdr"
 echo "PASS 527-astra-quota-denial-distinct rc=$quota_denied_rc"

@@ -167,9 +167,10 @@ line then ends with via=herdr-fallback.
                      --operator-request, passed verbatim to `scopefuel gate`.
   --purpose PURPOSE  caller-declared spawn purpose passed verbatim to
                      `scopefuel gate` (task #527). For the astra profiles the
-                     gate role-denies (exit 5) unless PURPOSE is director,
-                     architect or operator-request; for every other profile it
-                     is audit metadata only and never changes the decision.
+                     gate role-denies (gate exit 5; wrk exits 77) unless
+                     PURPOSE is director, architect or operator-request; for
+                     every other profile it is audit metadata only and never
+                     changes the decision.
                      This is a purpose axis, distinct from the
                      --operator-request REF format gate above.
   -h, --help         show this usage
@@ -193,7 +194,8 @@ Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex
 codex-astra = gpt-6-astra is a counsel-only profile for director/architect/operator-requested
 advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved); --role builder rejects it.
 It defaults to --effort xhigh and requires --purpose director|architect|operator-request,
-which the gate enforces as role denial (exit 5) when missing or wrong.
+which the gate enforces as role denial (gate exit 5, surfaced by wrk as exit 77) when
+missing or wrong.
 Pilot builders (task 240): builder-devin = devin-swe2 argv; builder-grok = grok 4.7 at effort xhigh; builder-kimi = kimi-k3 argv.
 Devin model variants (task 281): devin-glm52, devin-swe17 and devin-ds41 run
 the same unattended devin argv with only the model name changed — worker-only,
@@ -758,10 +760,11 @@ quota_gate() {
   # itself resolved for this profile. It is re-printed verbatim; stderr is untouched.
   # --operator-request/--requested-by are forwarded verbatim when given — wrk holds
   # no REF format or profile-applicability judgement; the gate's fail-closed
-  # refusal exits (0/3/4 vocabulary; 5 = role denial per task #527) are
-  # propagated below.
+  # refusal exits (0/3/4 vocabulary; 5 = role denial per task #527, remapped
+  # to wrk exit 77) are propagated below.
   # --purpose is forwarded verbatim too: it is the gate's role input for the
-  # astra profiles (task #527) — without it the gate role-denies them (rc 5).
+  # astra profiles (task #527) — without it the gate role-denies them (gate
+  # rc 5, surfaced by wrk as exit 77).
   local gate_args=(gate -m "$GATE_PROFILE")
   [[ -z "${OPERATOR_REQUEST:-}" ]] || gate_args+=(--operator-request "$OPERATOR_REQUEST")
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
@@ -774,10 +777,13 @@ quota_gate() {
   [[ -z "$out" ]] || printf '%s\n' "$out"
   case "$rc" in
     0) GATE_OUTPUT="$out"; GATE_READY=1; return 0 ;;
-    # task #527: rc 5 is a ROLE denial (e.g. astra without an allowed
+    # task #527: gate rc 5 is a ROLE denial (e.g. astra without an allowed
     # --purpose) — not a quota refusal; it must never be read as "quota
-    # exhausted, retry after reset" (the ARCHITECT.md:6 misread).
-    5) echo "wrk: scopefuel gate role-denied (exit 5) — purpose not allowed or missing; NOT a quota refusal" >&2; exit 5 ;;
+    # exhausted, retry after reset" (the ARCHITECT.md:6 misread). wrk remaps
+    # it to exit 77: exit 5 already belongs to quota_hub_policy_gate's
+    # hub-quota-policy denial, and sharing it would let a caller read a role
+    # denial as a quota denial — the exact confusion this change exists to end.
+    5) echo "wrk: scopefuel gate role-denied (gate exit 5 → wrk exit 77) — purpose not allowed or missing; NOT a quota refusal" >&2; exit 77 ;;
     3|4) exit "$rc" ;;
     *) echo "wrk: scopefuel gate failed (exit $rc)" >&2; return "$rc" ;;
   esac
