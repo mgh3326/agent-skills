@@ -1431,19 +1431,32 @@ apply_catalog() {
   [[ -z "$CATALOG_EFFORT_PIN" ]] || launch_args+=(--effort "$CATALOG_EFFORT_PIN")
   [[ -z "${OPERATOR_REQUEST:-}" ]] || launch_args+=(--operator-request)
 
-  local out rc=0
+  # Keep stderr: rc 3 has several distinct reasons (consult_only, a retired rung,
+  # an unknown profile, a gate a stale catalog may not widen) and only scopefuel
+  # knows which one applies. Discarding it and hard-coding one remedy sent the
+  # operator after --operator-request for refusals that flag cannot fix.
+  local out err_file rc=0
+  err_file="$(mktemp "${TMPDIR:-/tmp}/wrk-policy-launch.XXXXXX")" || err_file=""
   set +e
-  out="$("$SCOPEFUEL" "${launch_args[@]}" 2>/dev/null)"
+  if [[ -n "$err_file" ]]; then
+    out="$("$SCOPEFUEL" "${launch_args[@]}" 2>"$err_file")"
+  else
+    out="$("$SCOPEFUEL" "${launch_args[@]}" 2>/dev/null)"
+  fi
   rc=$?
   set -e
+  CATALOG_REFUSE_REASON=""
+  if [[ -n "$err_file" ]]; then
+    CATALOG_REFUSE_REASON="$(tr -s '[:space:]' ' ' <"$err_file" | cut -c1-240)"
+    rm -f "$err_file"
+  fi
 
   if [[ "$rc" -eq 3 ]]; then
-    # The canon answered and refused: consult_only without --operator-request, a
-    # retired rung, or a gate a stale catalog may not widen. Recorded, not acted
-    # on yet — the quota gate runs first because its refusal carries alternatives
-    # ("대안(S+): …") that this one cannot. If the gate lets the spawn through,
-    # the refusal below stops it: the gate judges quota and escalation, not
-    # catalog gates, so a permissive gate must not launch what the canon declined.
+    # The canon answered and refused. Recorded, not acted on yet — the quota gate
+    # runs first because its refusal carries alternatives ("대안(S+): …") that
+    # this one cannot. If the gate lets the spawn through, the refusal below
+    # stops it: the gate judges quota and escalation, not catalog gates, so a
+    # permissive gate must not launch what the canon declined.
     CATALOG_REFUSED=1
     return 0
   fi
@@ -1514,6 +1527,7 @@ resolve_profile() {
   CATALOG_EFFORT_PIN=""
   CATALOG_STALE=0
   CATALOG_REFUSED=0
+  CATALOG_REFUSE_REASON=""
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
@@ -3401,7 +3415,7 @@ spawn_cmd() {
   quota_gate
   # The catalog's own refusal, held back so the quota gate could speak first.
   [[ "${CATALOG_REFUSED:-0}" -ne 1 ]] ||
-    die "scopefuel policy launch refused profile '$MODEL' (catalog profile '$CATALOG_PROFILE') — pass --operator-request if this launch is operator-approved"
+    die "scopefuel policy launch refused profile '$MODEL' (catalog profile '$CATALOG_PROFILE'): ${CATALOG_REFUSE_REASON:-no reason reported}"
   arbiter_admit
   quota_hub_policy_gate
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"

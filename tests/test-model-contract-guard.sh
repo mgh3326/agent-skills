@@ -202,7 +202,17 @@ brief_header() {
   head -n 1 "$(find "$TMP/inbox" -name 'spawn-brief-*' -type f | head -n 1)" 2>/dev/null
 }
 
+# A negative assertion on a header that may not exist passes for the wrong
+# reason: brief_header swallows the spawn status, so a regression that refused
+# the healthy spawn outright would print PASS. Require a real header first.
+assert_header_present() {
+  local what="$1" header="$2"
+  [[ "$header" == expect:* ]] ||
+    fail "$what: expected a spawn brief header, got: ${header:-<none>}"
+}
+
 header="$(brief_header ok "$SCOPEFUEL")"
+assert_header_present "healthy catalog" "$header"
 grep -q 'catalog=stale' <<<"$header" &&
   fail "a healthy catalog must not mark the brief stale; got: $header"
 echo "PASS a healthy catalog leaves the brief header unmarked"
@@ -218,6 +228,7 @@ echo "PASS stale / failed-request / missing-subcommand / missing-provenance all 
 # predates it, and branding every spawn during the rollout would make the marker
 # meaningless before it ever mattered.
 header="$(brief_header route-404 "$SCOPEFUEL")"
+assert_header_present "route-404" "$header"
 grep -q 'catalog=stale' <<<"$header" &&
   fail "a 404 catalog route must not mark the brief stale; got: $header"
 echo "PASS a server without the catalog route does not mark the brief stale"
