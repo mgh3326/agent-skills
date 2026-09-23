@@ -2457,20 +2457,32 @@ grep -q -- '-m gpt-6-sol' "$TMP/herdr.log"
 # resolves to gpt-6-astra and still gates as the codex-astra spelling so the
 # scopefuel gate remains the single purpose check.
 : >"$TMP/herdr.log"
-# #593: the catalog marks codex-astra consult_only, so a bare counsel spawn is
-# refused after the gate has had its say. This removes no real capability — the
-# installed scopefuel gate already refuses codex-astra unconditionally ("역할
-# 제한 — Astra는 director 판정 전용", with or without --operator-request); only
-# this fixture was more permissive. Task #527 owns astra's admission design, so
-# what is pinned here is the parts #593 touches: the gate spelling and the
-# resolved model id still reach the gate before the refusal.
-codex_astra_out="$(spawn_base codex-astra --job codex-astra-counsel-job --t T0 2>&1 || true)"
-grep -q 'policy launch refused' <<<"$codex_astra_out" ||
-  { echo "codex-astra must be refused as consult_only: $codex_astra_out" >&2; exit 1; }
+# #527 + #593 combined. The catalog marks codex-astra consult_only and the gate
+# role-gates it by declared purpose. These are two spellings of one restriction,
+# and requiring both would break the approved counsel path: a bare
+# `-m codex-astra` defaults PURPOSE=architect, the gate admits it, and the
+# catalog must admit it too. The purpose reaches BOTH — wrk forwards it verbatim
+# and scopefuel decides, applying the rule to astra only.
+codex_astra_out="$(spawn_base codex-astra --job codex-astra-counsel-job --t T0 2>&1)"
+grep -q '^OK pane=' <<<"$codex_astra_out" ||
+  fail "the architect counsel spawn must proceed (purpose satisfies consult_only): $codex_astra_out"
+grep -q -- '--purpose architect' "$TMP/scopefuel.log" ||
+  fail "gate argv lost --purpose architect: $(cat "$TMP/scopefuel.log")"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-astra" ]]
-run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
-  WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-  "$WRK" spawn -c "$ROOT" -m codex-astra -p "$PROMPT" -w w -l fixture --t T0
+echo "PASS 593-astra-counsel-purpose-satisfies-consult-only"
+
+# A purpose outside #527's list is refused, and the ROLE denial speaks first:
+# gate exit 5 surfaces as wrk exit 77, which must not be flattened into the
+# catalog refusal's exit 2 — a caller reading 2 would look for a quota problem.
+expect_exit 77 spawn_base codex-astra --purpose builder --job astra-bad-purpose --t T0
+echo "PASS 593-astra-disallowed-purpose-role-denied-77"
+
+# 🔴 fable is NOT astra: #527 AC⑤ forbids relaxing its escalation gate, so a
+# purpose must never become a second key to it. Only --operator-request opens it.
+fable_purpose_out="$(spawn_base fable --purpose architect --job fable-purpose --t T1 2>&1 || true)"
+grep -q 'policy launch refused' <<<"$fable_purpose_out" ||
+  fail "a purpose must not satisfy fable's consult_only: $fable_purpose_out"
+echo "PASS 593-fable-not-unlocked-by-purpose"
 
 # Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
 # must all stop before gate/claim/tab creation.

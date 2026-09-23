@@ -64,11 +64,12 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   esac
   shift 2
   launch_profile="${1:-}"; shift || true
-  launch_effort="" launch_operator=0
+  launch_effort="" launch_operator=0 launch_purpose=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) shift ;;
       --operator-request) launch_operator=1; shift ;;
+      --purpose) launch_purpose="${2:-}"; shift 2 ;;
       --effort) launch_effort="${2:-}"; shift 2 ;;
       *) echo "fixture scopefuel: unexpected policy launch argument '$1'" >&2; exit 2 ;;
     esac
@@ -78,9 +79,20 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
     printf 'policy launch %s effort=%s operator=%s\n' \
       "$launch_profile" "${launch_effort:-}" "$launch_operator" >>"$WRK_LAUNCH_LOG"
   fi
+  # consult_only: an operator request always satisfies it; for an astra identity
+  # only, an allowed --purpose does too (task #527 vocabulary). fable is never
+  # satisfied by a purpose — mirrors the installed command.
+  launch_allowed=0
+  [[ "$launch_operator" -ne 1 ]] || launch_allowed=1
+  case "$launch_profile" in
+    codex-astra)
+      case "$(printf '%s' "${launch_purpose:-}" | tr '[:upper:]' '[:lower:]')" in
+        director|architect|operator-request) launch_allowed=1 ;;
+      esac ;;
+  esac
   case "$launch_profile" in
     fable|codex-astra)
-      if [[ "$launch_operator" -ne 1 || "${WRK_LAUNCH_MODE:-ok}" == refused ]]; then
+      if [[ "$launch_allowed" -ne 1 || "${WRK_LAUNCH_MODE:-ok}" == refused ]]; then
         echo "error: profile '$launch_profile' is consult_only; pass --operator-request" >&2
         exit 3
       fi ;;

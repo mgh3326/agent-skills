@@ -1556,6 +1556,14 @@ apply_catalog() {
   local launch_args=(policy launch "$CATALOG_PROFILE" --json)
   [[ -z "$CATALOG_EFFORT_PIN" ]] || launch_args+=(--effort "$CATALOG_EFFORT_PIN")
   [[ -z "${OPERATOR_REQUEST:-}" ]] || launch_args+=(--operator-request)
+  # task #527 + #593: the declared purpose reaches the catalog too, not only the
+  # quota gate. A bare `-m codex-astra` is the architect counsel path (PURPOSE is
+  # defaulted to architect above), the gate admits it, and the catalog marks astra
+  # consult_only — without forwarding this, the two restrictions became cumulative
+  # and an approved invocation died between them. Forwarded verbatim: which
+  # purposes count is scopefuel's judgement, not wrk's, and it applies the rule to
+  # astra only.
+  [[ -z "${PURPOSE:-}" ]] || launch_args+=(--purpose "$PURPOSE")
 
   # Keep stderr: rc 3 has several distinct reasons (consult_only, a retired rung,
   # an unknown profile, a gate a stale catalog may not widen) and only scopefuel
