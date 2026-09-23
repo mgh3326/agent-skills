@@ -44,6 +44,9 @@ CONTRACT_GROK_MODEL_ID="grok-4.7"
 # alias to the real ID, recorded here only so a reader can find both halves.
 CONTRACT_OPUS_ALIAS="opus"
 CONTRACT_OPUS_MODEL_ID="claude-opus-5-5"
+# fable is absent from GRADE_TABLE (scopefuel CONSULT_ONLY_PROFILES) but its
+# explicit launch ID is still part of the contract: bin/wrk passes it literally.
+CONTRACT_FABLE_MODEL_ID="claude-fable-5-1"
 
 spawn_argv() {
   local model="$1"; shift
@@ -102,5 +105,9 @@ grep -qF -- "--model $CONTRACT_OPUS_ALIAS" <<<"$opus_argv" ||
 grep -qF -- "--effort high" <<<"$opus_argv" ||
   fail "profile 'opus': expected default --effort high (ROB-591); got: $opus_argv"
 echo "PASS opus alias argv unchanged (--model opus, default --effort high) — scopefuel side maps this to $CONTRACT_OPUS_MODEL_ID"
+
+# --- Fable: explicit consult-only launch keeps the literal 5.1 model ID ------
+assert_argv_has fable "--model $CONTRACT_FABLE_MODEL_ID "
+echo "PASS fable explicit consult launch runs $CONTRACT_FABLE_MODEL_ID"
 
 echo "PASS test-model-contract-guard: bin/wrk matches the checked-in scopefuel catalog contract"
