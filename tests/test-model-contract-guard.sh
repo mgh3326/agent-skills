@@ -255,6 +255,33 @@ if env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$refusal" SCOPEFUEL_FIXTURE="$SCOPEFUEL
 fi
 echo "PASS a catalog refusal (rc 3) stops the spawn"
 
+# The refusal must carry scopefuel's own reason. rc 3 covers consult_only, a
+# retired rung, an unknown profile and a stale-gated one; hard-coding the
+# --operator-request remedy sent the operator after a flag that cannot fix most
+# of them. Found as a coverage gap in the #593 verify round: reverting the
+# passthrough left every test green.
+reason_bin="$TMP/reason-scopefuel"
+cat >"$reason_bin" <<'REASON'
+#!/bin/sh
+if [ "$1" = policy ] && [ "$2" = launch ]; then
+  echo "error: profile 'codex-sol' rung 'max' is retired in the catalog" >&2
+  exit 3
+fi
+exec "$SCOPEFUEL_FIXTURE" "$@"
+REASON
+chmod +x "$reason_bin"
+refusal_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$reason_bin" SCOPEFUEL_FIXTURE="$SCOPEFUEL" \
+  WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+  WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+  WRK_REFRESH_LOG="$TMP/refresh.log" WRK_REFRESH_PID_LOG="$TMP/refresh.pids" \
+  WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$ROOT" -m codex-sol -p "$PROMPT" -w w -l fixture --t T1 2>&1 || true)"
+grep -qF -- "rung 'max' is retired in the catalog" <<<"$refusal_out" ||
+  fail "the refusal must report scopefuel's reason verbatim; got: $refusal_out"
+grep -q -- "--operator-request if this launch is operator-approved" <<<"$refusal_out" &&
+  fail "the refusal must not hard-code the --operator-request remedy; got: $refusal_out"
+echo "PASS a catalog refusal reports scopefuel's own reason"
+
 # The tolerant path that used to be silent: scopefuel absent entirely.
 header="$(brief_header ok "$TMP/absent-scopefuel")"
 grep -q 'catalog=stale' <<<"$header" ||
