@@ -110,6 +110,10 @@ checker 파생 판정:
 
 - 배포 **실행**은 installer가 한다(운영자 결정 #115). director는 installer를 스폰해 발주하고, 그 JOIN/ESC를
   중간 경유 레인 없이 직접 받아 판정한다.
+- installer의 JOIN/ESC를 받아도 그 보고서의 배포 기록 키(`deploy/<service>/<UTC 시각>`)로 기록 1건이
+  생긴 것을 확인하기 전에는 installer 세션을 회수하지 않는다 — 기록(installer 단계 9)은 보고 **뒤**에
+  실행된다. 기록 실패 ESC를 받으면 그 본문으로 **새 키**에 대신 기록하고, 기존 `deploy/` 키는 덮어쓰지
+  않는다. 기록 키는 installer 스폰 입력으로 director가 정한다(시각 = 스폰 시각, UTC `YYYYMMDDTHHMMSSZ`).
 - 배포 창과 절차는 비공개 플레이북을 따른다. 창 밖 배포는 운영자 명시 승인만.
 - 마이그레이션은 코드보다 먼저. 배포 후 서빙 SHA·헬스·게이트 env(기본 off)를 실측해 회신한다.
 - 관측성 기능은 배포가 완료가 아니다 — 실행 흔적 1행이 완료 조건이다.
