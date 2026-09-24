@@ -955,6 +955,25 @@ grep -q 'landed=yes' <<<"$fg_late_out" ||
 if grep -q '^pane close ' "$TMP/herdr.log"; then fail "late-foreground pane was closed"; fi
 echo "PASS task609 pre-injection foreground-agent check"
 
+# Regression: the kind's herdr --kind name is not always its pane argv0.
+# Measured on live panes 2026-09-24 — kimi lands as argv0 "kimi-code", codex
+# as a node leader plus a native "codex" child — so the fixture emits those
+# real values and every kind below must still be admitted (the #609 follow-up
+# hotfix: matching only the kind string fail-closed every real kimi spawn).
+for fg_kind_pair in opus:claude codex-terra:codex devin-swe2:devin kimi-k3:kimi grok:grok kiro:kiro oc-glm:opencode agy-flash:agy; do
+  fg_model="${fg_kind_pair%%:*}"; fg_kind="${fg_kind_pair##*:}"
+  : >"$TMP/herdr.log"
+  set +e
+  fg_real_out="$(KIMI_CODE_HOME="$TMP/kimi-$fg_model-home" TEST_FIXTURE_SCENARIO=spawn spawn_base "$fg_model" 2>&1)"
+  fg_real_rc=$?
+  set -e
+  [[ "$fg_real_rc" -eq 0 ]] ||
+    fail "$fg_model (kind $fg_kind) must spawn under its real argv0 (rc=$fg_real_rc): $fg_real_out"
+  grep -q 'landed=yes' <<<"$fg_real_out" ||
+    fail "$fg_model (kind $fg_kind) was not admitted under its real argv0: $fg_real_out"
+done
+echo "PASS foreground check admits every kind under its real argv0"
+
 # Window boundaries on a fake clock: every `date +%s` after the first agent
 # start (or, for Devin, the first process-info) reads FAKECLOCK_JUMP seconds
 # later. Each retry hands herdr only what is left of the window, and herdr

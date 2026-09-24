@@ -1142,12 +1142,38 @@ agent_start_in_pane() {
 # PATH that lacked it, zsh printed "command not found", and wrk still wrote
 # job.spawned and typed the brief into the bare shell. Before any prompt is
 # injected, poll process-info until the agent itself holds the foreground:
-# some foreground process whose argv0 is the kind's canonical executable
-# (herdr's `--kind` IS the executable name — measured 2026-09-24 on live
-# panes: claude -> argv0 "claude", devin -> "devin"). The shell alone, a shell
-# child, or an unrelated foreground process all mean "not ours yet"; the agent
-# is polled inside a bounded window, anything else fails closed so the pane is
-# closed and the quota record released instead of a brief landing in zsh.
+# some foreground process whose argv0 is one of the kind's canonical
+# executable names. herdr's `--kind` is NOT always the executable name —
+# measured 2026-09-24 on live panes of this Mac (pane process-info argv0,
+# `name` in parentheses):
+#   claude   -> "claude"        (name is the version, e.g. "2.1.281")
+#   codex    -> node-script leader plus a native child argv0 "codex"
+#   devin    -> "devin"         (name "devin")
+#   grok     -> "grok"          (native binary ~/.grok/bin/grok)
+#   kimi     -> "kimi-code"     (name "kimi"; the ~/.kimi-code/bin/kimi
+#               launcher hands the pane to the kimi-code TUI — matching only
+#               "kimi" fail-closed every real kimi spawn, the #609 follow-up
+#               this table fixes)
+#   kiro     -> unmeasured on this host (binary absent); herdr's detector
+#               lists the alias "kiro-cli", so both spellings are accepted.
+# The other detector aliases herdr knows (claude-code, devin-cli, grok-build,
+# open-code, antigravity) are accepted for the same reason. The shell alone, a
+# shell child, or an unrelated foreground process all mean "not ours yet"; the
+# agent is polled inside a bounded window, anything else fails closed so the
+# pane is closed and the quota record released instead of a brief landing in
+# zsh.
+agent_foreground_exes() {
+  case "$1" in
+    claude)   echo "claude claude-code" ;;
+    devin)    echo "devin devin-cli" ;;
+    grok)     echo "grok grok-build" ;;
+    kimi)     echo "kimi-code kimi" ;;
+    kiro)     echo "kiro-cli kiro" ;;
+    opencode) echo "open-code opencode" ;;
+    agy)      echo "antigravity agy" ;;
+    *)        echo "$1" ;;
+  esac
+}
 AGENT_FOREGROUND_TIMEOUT_MS=10000
 agent_foreground_diagnostics() {
   local reason="$1"
@@ -1184,6 +1210,7 @@ if not isinstance(info, dict):
 procs = info.get("foreground_processes")
 if not isinstance(procs, list):
     raise SystemExit(1)
+want = set(sys.argv[1].split())
 for p in procs:
     if not isinstance(p, dict):
         continue
@@ -1191,12 +1218,12 @@ for p in procs:
     cmd = str(p.get("cmdline") or "").split()
     if cmd:
         names.append(os.path.basename(cmd[0]))
-    if sys.argv[1] in names:
+    if want.intersection(names):
         print("yes")
         break
 else:
     print("no")
-' "$PROFILE_KIND" 2>/dev/null)"
+' "$(agent_foreground_exes "$PROFILE_KIND")" 2>/dev/null)"
     info_rc=$?
     set -e
     if [[ "$info_rc" -ne 0 ]]; then
