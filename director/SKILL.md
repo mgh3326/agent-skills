@@ -89,16 +89,19 @@ installer다(운영자 결정 #115). 이 스킬은 **모델 무관 계약**이�
   루프다.
   - **수단은 호스트 범위를 맞춰 고른다.** 같은 호스트의 워커는 `herdr agent
     list`(로컬 herdr 소켓 1대분 — 다른 호스트의 워커는 보이지 않는다), 다른
-    호스트는 `ssh <host> herdr agent list`. operator 토큰이 있는 호스트라면
+    호스트는 `ssh <host> herdr agent list`. operator 자격이 있는 호스트라면
     `panewire jobs jobs|orphaned --hub-url <허브> --hub-token-env <operator
     env>`·허브 `GET /v1/jobs/orphaned`로 fleet 조회가 된다(둘 다 operator
-    인증 필요). ssh 도 operator 토큰도 안 되는 호스트의 소실은 감시 공백으로
-    남겨 두고 보고한다 — 폴링으로 메우지 않는다.
+    인증 필요 — 허브 앞단의 Cloudflare Access 자격도 별도로 필요하다,
+    `--hub-cf-env`). ssh 도 operator 자격도 안 되는 호스트의 소실은 감시
+    공백으로 남겨 두고 보고한다 — 폴링으로 메우지 않는다.
   - **판정 기준:** 소실 = 내가 띄운 잡의 pane/agent 가 목록에 없고 완료
     이벤트도 없음(목록은 살아 있는 것만 보이므로, 내 잡 목록과의 대조가
-    필요하다). 정체 = 직전 조회 대비 last event·`revision` 변화 없음이 수 분
-    이상 — 단발 1회로는 판별이 안 되므로 직전 조회 결과를 남겨 다음 단발
-    조회가 비교한다.
+    필요하다). 정체 = `working`인데 `herdr pane read` 화면 tail 이 직전
+    조회 이후 수 분째 그대로 — `revision`·last event 는 일하는 동안에도 안
+    변하므로 비교 대상이 아니다(#66 stall detector 도 pane read 기반). 단발
+    1회로는 판별이 안 되므로 직전 조회 결과를 남겨 다음 단발 조회가
+    비교한다. 정체로 판정해도 통지만 하고 reap·재스폰은 하지 않는다.
   - 잡별 루프가 아니므로 상한 0을 깨지 않고, 위 동시 상한 안에 센다.
     #80·#66 배포로 push 가 생기면 이 임시 수단은 걷어낸다.
 - **임시 대기·관측은 동시 3개 이하.** 근거: 세션-붙은 감시는 수가 잡 수에 비례해

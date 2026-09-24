@@ -85,6 +85,11 @@ def check_director(text: str) -> None:
     assert "판정 기준" in sec, (
         "loss/stall judgement criteria missing from the gap-signal prescription"
     )
+    # 정체 판정의 비교 대상은 pane 출력이다 — revision/last-event 비교는
+    # 일하는 워커를 전부 정체로 잘못 잡는다(테스터 RR1).
+    assert "pane read" in sec, (
+        "stall criterion must compare pane-read output, not revision counters"
+    )
 
 
 def check_builder(text: str) -> None:
@@ -284,6 +289,11 @@ assert director_gap_judgement_lost != director_text, (
     "fixture: director judgement-criteria wording not found"
 )
 
+director_stall_basis_lied = director_text.replace("pane read", "revision")
+assert director_stall_basis_lied != director_text, (
+    "fixture: director pane-read basis not found"
+)
+
 builder_gap_pointer_lost = builder_text.replace('"공백 신호" 규칙', "규칙", 1)
 assert builder_gap_pointer_lost != builder_text, (
     "fixture: builder gap-signal pointer not found"
@@ -368,6 +378,10 @@ mutants = [
     (
         "director-gap-judgement-removed",
         lambda: check_director(director_gap_judgement_lost),
+    ),
+    (
+        "director-stall-basis-lied",
+        lambda: check_director(director_stall_basis_lied),
     ),
     (
         "builder-gap-pointer-removed",
