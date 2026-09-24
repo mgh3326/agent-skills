@@ -1276,8 +1276,110 @@ print("yes" if ready else "no")
   done
 }
 
+# #649: a slow host (m1b) reaches the identity check before devin's TUI is
+# painted — the pane still shows only the typed command and every identity
+# rule reports unmatched, so a single `agent explain` used to fail the spawn
+# with "invalid identity envelope" while the agent was merely starting. Inside
+# the START_TIMEOUT window an envelope with no matched rule is "not identified
+# yet": explain is re-polled with backoff (the same window that shell
+# readiness, detection and the idle wait share). A matched non-welcome rule —
+# trust dialog, permission prompt, error screen — is a terminal state and is
+# judged at once, as is a non-devin agent or an unreadable envelope. On window
+# expiry the failure is the existing fail-closed path plus #604's evidence
+# preservation, and the reason names which unmatched shape never resolved.
+DEVIN_IDENTITY_POLL_MS=250
+DEVIN_IDENTITY_POLL_MAX_MS=2000
+
+# Prints the identity verdict for one `agent explain` envelope, one of:
+#   ready                    agent=devin and matched_rule.id=welcome_prompt_footer
+#   decided<TAB>agent<TAB>rule  a non-welcome rule matched, or the detected
+#                            agent is not devin — judged immediately either way
+#   starting                 no rule matched and the evaluated screen region is
+#                            only the `devin …` command line wrk typed
+#   unmatched                no rule matched but the screen shows something
+#                            else (mid-render, or a genuinely unexpected pane)
+# Exit 1 = the envelope itself could not be read (the #604 "invalid identity
+# envelope" case — never retried, a malformed answer is not startup).
+devin_classify_identity() {
+  WRK_DEVIN_CMD="devin ${ARGS[*]}" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+agent = d.get("agent")
+matched = d.get("matched_rule")
+if not isinstance(agent, str):
+    sys.exit(1)
+if matched is None:
+    rule = None
+elif isinstance(matched, dict) and isinstance(matched.get("id"), str):
+    rule = matched["id"]
+else:
+    sys.exit(1)
+if agent == "devin" and rule == "welcome_prompt_footer":
+    print("ready")
+elif agent != "devin" or rule is not None:
+    print("decided\t%s\t%s" % (agent, rule or ""))
+else:
+    cmd = "".join(os.environ.get("WRK_DEVIN_CMD", "").split())
+    previews = [
+        ev["region_preview"]
+        for r in d.get("evaluated_rules") or []
+        if isinstance(r, dict)
+        for ev in [r.get("evidence")]
+        if isinstance(ev, dict) and isinstance(ev.get("region_preview"), str)
+    ]
+    flat = "".join((max(previews, key=len) if previews else "").split())
+    idx = flat.rfind(cmd) if cmd else -1
+    # A cursor glyph may trail the command; nothing else may.
+    print("starting" if idx >= 0 and len(flat) - idx - len(cmd) <= 2 else "unmatched")
+'
+}
+
+devin_wait_identity() {
+  local started_at="$1" attempts=0 max_attempts explain_json explain_rc verdict class_rc
+  local detected_agent matched_rule poll_ms="$DEVIN_IDENTITY_POLL_MS"
+  max_attempts=$(( START_TIMEOUT / DEVIN_IDENTITY_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    set +e
+    explain_json="$("$HERDR" agent explain "$PANE" --format json 2>/dev/null)"
+    explain_rc=$?
+    set -e
+    if [[ "$explain_rc" -ne 0 ]]; then
+      devin_spawn_diagnostics "agent explain exited $explain_rc" 1 "$explain_rc" "$explain_json"
+      return "$explain_rc"
+    fi
+    set +e
+    verdict="$(printf '%s' "$explain_json" | devin_classify_identity)"
+    class_rc=$?
+    set -e
+    if [[ "$class_rc" -ne 0 ]]; then
+      devin_spawn_diagnostics "agent explain returned an invalid identity envelope" 1 "$explain_rc" "$explain_json"
+      return 1
+    fi
+    case "$verdict" in
+      ready) return 0 ;;
+      decided*)
+        IFS=$'\t' read -r _ detected_agent matched_rule <<<"$verdict"
+        devin_spawn_diagnostics "expected agent=devin rule=welcome_prompt_footer, got agent=$detected_agent rule=$matched_rule" 1 "$explain_rc" "$explain_json"
+        return 1 ;;
+      starting|unmatched)
+        if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= START_TIMEOUT )); then
+          if [[ "$verdict" == starting ]]; then
+            devin_spawn_diagnostics "agent explain still starting within ${START_TIMEOUT}ms (command-line-only screen x$attempts)" 1 "$explain_rc" "$explain_json"
+          else
+            devin_spawn_diagnostics "agent explain matched no identity rule within ${START_TIMEOUT}ms (unmatched screen x$attempts)" 1 "$explain_rc" "$explain_json"
+          fi
+          return 1
+        fi
+        sleep_for "$(awk -v ms="$poll_ms" 'BEGIN{printf "%.3f", ms/1000}')"
+        (( poll_ms < DEVIN_IDENTITY_POLL_MAX_MS )) && poll_ms=$(( poll_ms * 2 ))
+        ;;
+    esac
+  done
+}
+
 devin_start_in_pane() {
-  local run_rc wait_rc explain_rc parse_rc rename_rc explain_json identity detected_agent matched_rule
+  local run_rc wait_rc identity_rc=0 rename_rc
   local started_at remaining_ms
 
   started_at="$(date +%s)"
@@ -1321,39 +1423,17 @@ devin_start_in_pane() {
     return "$wait_rc"
   fi
 
-  set +e
-  explain_json="$("$HERDR" agent explain "$PANE" --format json 2>/dev/null)"
-  explain_rc=$?
-  set -e
-  if [[ "$explain_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "agent explain exited $explain_rc" 1 "$explain_rc" "$explain_json"
+  # #649: the identity check used to be one shot, which mistook a slow TUI
+  # (m1b, MCP servers still starting) for a spawn failure.  Poll explain until
+  # a rule matches, the envelope is decided, or the START_TIMEOUT window
+  # closes; the preserved rc distinguishes the sub-failures for callers. The
+  # `||` capture keeps errexit off through the call — the wait re-enables it
+  # internally, so a plain `set +e` bracket would still abort before the rc
+  # could be read (the sibling waits get the same shield from `if !`).
+  devin_wait_identity "$started_at" || identity_rc=$?
+  if [[ "$identity_rc" -ne 0 ]]; then
     spawn_pane_cleanup
-    return "$explain_rc"
-  fi
-
-  set +e
-  identity="$(printf '%s' "$explain_json" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-agent = d.get("agent")
-matched = d.get("matched_rule")
-rule = matched.get("id") if isinstance(matched, dict) else None
-if not isinstance(agent, str) or not isinstance(rule, str):
-    raise SystemExit(1)
-print(agent + "\t" + rule)
-')"
-  parse_rc=$?
-  set -e
-  if [[ "$parse_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "agent explain returned an invalid identity envelope" 1 "$explain_rc" "$explain_json"
-    spawn_pane_cleanup
-    return 1
-  fi
-  IFS=$'\t' read -r detected_agent matched_rule <<<"$identity"
-  if [[ "$detected_agent" != devin || "$matched_rule" != welcome_prompt_footer ]]; then
-    devin_spawn_diagnostics "expected agent=devin rule=welcome_prompt_footer, got agent=$detected_agent rule=$matched_rule" 1 "$explain_rc" "$explain_json"
-    spawn_pane_cleanup
-    return 1
+    return "$identity_rc"
   fi
 
   set +e
