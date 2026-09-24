@@ -115,13 +115,16 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
 함께 죽고, 턴 비용은 확인할 때마다 든다).
 
 - 허용되는 유일한 능동 대기는 **bounded timeout 있는 블로킹 명령 1개**
-  (`panewire wait --agent <이름> --status idle --settle …` 등)다. 그 종료는
-  완료 증거가 아니라 깨어남 신호다 — wait 종료 후의 판정은 언제나 산출물이다.
+  (`panewire wait --agent <이름> --status idle --settle 60s --timeout <한계>`
+  등 — `--timeout` 은 필수 인자다)다. 그 종료는 완료 증거가 아니라 깨어남
+  신호다 — wait 종료 후의 판정은 언제나 산출물이다. `panewire wait --agent`는
+  로컬 herdr 소켓만 본다 — 원격 배치 워커에는 쓸 수 없다.
 - 기다리는 동안 턴을 소비하지 않는다. 확인이 필요하면 블로킹 명령으로 묶거나,
   이벤트가 올 때까지 둔다.
 - 배포 판에서 push 되지 않는 신호(예: job.lost·revoked·정체)가 필요하면 그
-  부재를 브리프·보고서에 명시하고, 커버 범위는 `director/panewire-events.md`
-  표를 따른다.
+  공백을 브리프·보고서에 명시하고, 임시 수단은 director 스킬 §감시 정책의
+  "공백 신호" 규칙(단발 조회, 잡별 루프 금지)을 따른다. 커버 범위는
+  `director/panewire-events.md` 표가 정본이다.
 
 ## 후속 라운드·보충 지시의 주입
 

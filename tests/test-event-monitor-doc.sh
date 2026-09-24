@@ -64,8 +64,16 @@ def check_director(text: str) -> None:
     assert re.search(r"동시 3개 이하|3개 이하", sec), (
         "concurrency cap number (3) missing"
     )
-    assert "256" in flat(text), "cap rationale must cite the 96h/256 measured count"
+    assert re.search(r"3개 이하.{0,400}256", sec), (
+        "cap rationale must cite the 96h/256 measured count next to the cap"
+    )
     assert "panewire-events.md" in sec, "section must point at the event table"
+    # 미배포 유실 신호(pane 소실·정체)는 걷어내지 않고 잡별 루프가 아닌 단발
+    # 조회로 커버한다는 처방이 §감시 정책 안에 있어야 한다 — 없으면 "예외 없음"
+    # 과 표의 미배포 행이 모순된다(테스터 B1).
+    assert re.search(r"공백 신호는 걷어내지 않는다.{0,300}단발", sec), (
+        "gap-signal prescription (미배포 유실 신호 → 단발 조회) missing"
+    )
 
 
 def check_builder(text: str) -> None:
@@ -81,7 +89,14 @@ def check_builder(text: str) -> None:
     assert re.search(r"블로킹 명령 1개", sec) and "panewire wait" in sec, (
         "single bounded blocking-wait exception missing"
     )
+    assert "bounded timeout" in sec, (
+        "the blocking wait must be bounded (timeout required)"
+    )
     assert "panewire-events.md" in sec, "builder must point at the event table"
+
+
+def table_rows(text: str) -> list:
+    return [line for line in text.splitlines() if line.startswith("|")]
 
 
 def check_events_doc(text: str) -> None:
@@ -96,11 +111,20 @@ def check_events_doc(text: str) -> None:
     )
     assert "미배포" in text, "source-only rows must be marked 미배포"
     assert "**있음**" in text, "deployed-available rows must be marked 있음"
-    assert re.search(r"job\.lost.*미배포|미배포.*job\.lost", flat(text), re.S) or (
-        "job.lost" in text and "미배포" in text
-    ), "job.lost/revoked must be marked 미배포 (source-only, #80)"
-    assert re.search(r"CI.{0,10}대기 결론|짧게 기다린다", flat(text)), (
-        "CI wait conclusion (scope 4) missing"
+    # 행 단위 계약 — 배포 칸은 표 안 어딘가가 아니라 "그 행"에 있어야 한다.
+    rows = table_rows(text)
+    lost_rows = [r for r in rows if "job.lost" in r]
+    assert lost_rows and any("미배포" in r for r in lost_rows), (
+        "the job.lost row itself must be marked 미배포 (source-only, #80)"
+    )
+    stall_rows = [r for r in rows if "정체" in r]
+    assert stall_rows and any("미배포" in r for r in stall_rows), (
+        "the stall row itself must be marked 미배포 (source-only, #66)"
+    )
+    # CI 결론은 문서 어딘가가 아니라 §5 안에 있어야 한다.
+    sec5 = section(text, "## 5. CI·PR 대기 결론")
+    assert "짧게 기다린다" in sec5 and "허브" in sec5, (
+        "CI wait conclusion (director bounded wait over hub polling) must live in §5"
     )
     assert "task/2026-09-24/director-monitors-to-panewire" in text, (
         "canonical requirement ref missing"
@@ -165,6 +189,53 @@ assert events_category_removed != events_text, (
     "fixture: events doc CI category heading not found"
 )
 
+# 행 단위 플립 — 전체 미배포→있음이 아니라 그 행 하나만 바꿔도 잡혀야 한다.
+def flip_row(marker):
+    row = next(
+        r for r in events_text.splitlines()
+        if r.startswith("|") and marker in r and "미배포" in r
+    )
+    return events_text.replace(row, row.replace("미배포", "있음"), 1)
+
+
+events_lost_row_flipped = flip_row("job.lost")
+assert events_lost_row_flipped != events_text, (
+    "fixture: job.lost 미배포 row not found to flip"
+)
+
+events_stall_row_flipped = flip_row("정체")
+assert events_stall_row_flipped != events_text, (
+    "fixture: stall 미배포 row not found to flip"
+)
+
+events_conclusion_removed = re.sub(
+    r"(?s)## 5\. CI·PR 대기 결론.*?(?=\n## |\Z)", "", events_text, count=1
+)
+assert events_conclusion_removed != events_text, (
+    "fixture: events doc §5 conclusion not found to remove"
+)
+
+director_gap_rule_removed = re.sub(
+    r"(?s)- \*\*공백 신호는.*?(?=\n- )", "", director_text, count=1
+)
+assert director_gap_rule_removed != director_text, (
+    "fixture: director gap-signal bullet not found to remove"
+)
+
+director_rationale_removed = director_text.replace(
+    "실측 96h에 256건", "관측된 사례", 1
+)
+assert director_rationale_removed != director_text, (
+    "fixture: director 256건 rationale not found to remove"
+)
+
+builder_bounded_removed = builder_text.replace(
+    "**bounded timeout 있는 블로킹 명령 1개**", "블로킹 명령 1개", 1
+)
+assert builder_bounded_removed != builder_text, (
+    "fixture: builder bounded-timeout wording not found to remove"
+)
+
 mutants = [
     ("director-section-removed", lambda: check_director(director_section_removed)),
     ("director-cap-weakened", lambda: check_director(director_cap_removed)),
@@ -172,12 +243,36 @@ mutants = [
         "director-missing-event-task-rule-removed",
         lambda: check_director(director_task_rule_removed),
     ),
+    (
+        "director-gap-signal-rule-removed",
+        lambda: check_director(director_gap_rule_removed),
+    ),
+    (
+        "director-cap-rationale-removed",
+        lambda: check_director(director_rationale_removed),
+    ),
     ("builder-section-removed", lambda: check_builder(builder_section_removed)),
+    (
+        "builder-bounded-timeout-removed",
+        lambda: check_builder(builder_bounded_removed),
+    ),
     (
         "events-deployed-source-split-removed",
         lambda: check_events_doc(events_deployed_split_removed),
     ),
     ("events-ci-category-renamed", lambda: check_events_doc(events_category_removed)),
+    (
+        "events-job-lost-row-flipped",
+        lambda: check_events_doc(events_lost_row_flipped),
+    ),
+    (
+        "events-stall-row-flipped",
+        lambda: check_events_doc(events_stall_row_flipped),
+    ),
+    (
+        "events-ci-conclusion-section-removed",
+        lambda: check_events_doc(events_conclusion_removed),
+    ),
 ]
 for label, callback in mutants:
     expect_assertion(label, callback)
