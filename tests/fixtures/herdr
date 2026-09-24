@@ -254,11 +254,13 @@ case "${1:-}" in
           else
             printf 'devin composer\n'
           fi
-        # #568 adversarial: the same two words separated by a UI tab on one
-        # line. No line break participated, so this is not a folded marker.
+        # #568 adversarial: the marker's words in unrelated UI text — split by
+        # a tab on one line, across a line break without indent, and across an
+        # indented break mid-line. None reproduce devin's submitted-prompt
+        # wrap shape (`❭ <text>` + indented continuation at line start).
         elif [[ "$scenario" == devin-fold-collision ]]; then
           if fixture_is_recent_unwrapped_read "$@"; then
-            printf 'unrelated UI label: fixture\tprompt settings\n'
+            printf 'unrelated UI label: fixture\tprompt settings\nmore UI: fixture\nprompt settings\nlast UI: fixture\n    prompt settings\n'
           else
             printf 'devin composer\n'
           fi

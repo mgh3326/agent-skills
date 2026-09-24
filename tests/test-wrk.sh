@@ -1535,9 +1535,11 @@ grep -q 'landed=no' <<<"$devin_unconf_out" ||
   fail "568 unconfirmed+working must not inject: $(pw_calls)/$(herdr_briefs)"
 echo "PASS 568-devin-unconfirmed-working-not-landed"
 
-# #568 round-2 (tester blocker): the same two words separated by a UI tab on
-# one line are not a folded marker — no line break participated. With no
-# other evidence this is confirmed non-landing: exactly one re-injection.
+# #568 round-2/3 (tester blockers): the marker's words in unrelated UI text are
+# not a folded marker — a UI tab on one line (no line break), a line break
+# without indent (no wrap continuation), and an indented break mid-line (not
+# after `❭`/line start). With no other evidence this is confirmed non-landing:
+# exactly one re-injection.
 pw_reset
 devin_coll_out="$(TEST_FIXTURE_SCENARIO=devin-fold-collision pw_spawn devin-swe2 2>&1)"
 grep -q 'landed=no' <<<"$devin_coll_out" ||
