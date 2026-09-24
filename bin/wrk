@@ -1927,6 +1927,93 @@ resolve_profile() {
   esac
 }
 
+# #637: a pane's env and argv die with it — after a reboot herdr restores the
+# pane as bare `claude --resume <id>` (hk:doc
+# task/2026-09-24/resume-loses-worker-env). For claude-kind workers the durable
+# copy of the prompt-suggestion toggle and the launch permission mode lives in
+# the worker worktree's own .claude/settings.local.json, which Claude Code
+# re-reads on every launch, resume included (verified: env values from a linked
+# worktree's local file reach the session's process env).
+#
+# Merge, never clobber: an existing file keeps every unrelated key, and only
+# our two keys are written. A file that is not a JSON object (or whose `env` /
+# `permissions` are not objects) aborts the spawn rather than being silently
+# overwritten — that state needs a human, not a rewrite.
+write_claude_local_settings() {
+  local cwd="$1" mode="$2"
+  python3 - "$cwd" "$mode" <<'PY'
+import json, os, sys, tempfile
+
+cwd, mode = sys.argv[1], sys.argv[2]
+path = os.path.join(cwd, ".claude", "settings.local.json")
+
+data = {}
+existed = os.path.exists(path)
+if existed:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print("wrk: %s exists but is not valid JSON; refusing to modify it (%s)" % (path, e), file=sys.stderr)
+        sys.exit(3)
+    if not isinstance(data, dict):
+        print("wrk: %s is not a JSON object; refusing to modify it" % path, file=sys.stderr)
+        sys.exit(3)
+
+for key in ("env", "permissions"):
+    node = data.get(key)
+    if node is None:
+        node = data[key] = {}
+    if not isinstance(node, dict):
+        print("wrk: %s: '%s' is not a JSON object; refusing to modify it" % (path, key), file=sys.stderr)
+        sys.exit(3)
+
+data["env"]["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
+if mode:
+    data["permissions"]["defaultMode"] = mode
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".settings.local.json.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    if existed:
+        os.chmod(tmp, os.stat(path).st_mode & 0o777)
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+# The worker's local settings must never enter a commit. Claude Code itself
+# keeps the file out of git via the user's global excludes; a repo that already
+# ignores it needs nothing. When the worker repo does not, the pattern goes to
+# the repository's own .git/info/exclude (resolved through --git-common-dir so
+# linked worktrees share it) — a tracked file is never touched. A cwd outside
+# git, or an exclude write that fails, is a warning, not a failed spawn: the
+# file is already on disk and the spawn stands.
+ensure_settings_local_ignored() {
+  local cwd="$1" common
+  git -C "$cwd" rev-parse --git-common-dir >/dev/null 2>&1 || {
+    warn "$cwd is not a git worktree; cannot verify .claude/settings.local.json is git-ignored (nothing can commit it there)"
+    return 0
+  }
+  git -C "$cwd" check-ignore -q -- .claude/settings.local.json && return 0
+  common="$(git -C "$cwd" rev-parse --git-common-dir)"
+  # --git-common-dir is relative for a main checkout (".git"); anchor it to the
+  # worktree cwd or the mkdir/append below would land in wrk's own directory.
+  [[ "$common" == /* ]] || common="$cwd/$common"
+  mkdir -p "$common/info" ||
+    { warn "cannot create $common/info; $cwd/.claude/settings.local.json is not git-ignored — do not commit it"; return 0; }
+  grep -qxF '**/.claude/settings.local.json' "$common/info/exclude" 2>/dev/null ||
+    printf '%s\n' '**/.claude/settings.local.json' >>"$common/info/exclude" ||
+    { warn "cannot append to $common/info/exclude; $cwd/.claude/settings.local.json is not git-ignored — do not commit it"; return 0; }
+  git -C "$cwd" check-ignore -q -- .claude/settings.local.json ||
+    warn "$cwd/.claude/settings.local.json is still not git-ignored after updating info/exclude — do not commit it"
+}
+
 completion_event() {
   local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}" reason="${7:-}"
   local events host last
@@ -3745,6 +3832,22 @@ spawn_cmd() {
       die "cannot resolve Kimi CWD to an absolute path: $CWD"
     fi
     kimi_seed_workspace_trust "$CWD" "$KIMI_TRUST_HOME"
+  fi
+
+  # #637: persist what the pane would otherwise lose on a herdr reboot restore
+  # (bare `claude --resume <id>`): the prompt-suggestion-off env and the launch
+  # permission mode, in the worker worktree's .claude/settings.local.json.
+  # Runs after every gate and before tab create, so a malformed existing file
+  # fails the spawn closed with no pane left behind. Same resident carve-out as
+  # the pane env: --purpose director is left as is.
+  if [[ "$PROFILE_KIND" == claude && "${PURPOSE:-}" != director ]]; then
+    claude_perm_mode=""
+    for arg in ${ARGS[@]+"${ARGS[@]}"}; do
+      [[ "$arg" == "--dangerously-skip-permissions" ]] && claude_perm_mode="bypassPermissions"
+    done
+    write_claude_local_settings "$CWD" "$claude_perm_mode" ||
+      die "claude worker local settings not written for $CWD; spawn aborted before any pane (nothing was clobbered)"
+    ensure_settings_local_ignored "$CWD"
   fi
 
   TAB_ENV=()
