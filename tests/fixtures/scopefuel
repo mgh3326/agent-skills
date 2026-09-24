@@ -237,32 +237,42 @@ esac
 if [[ -n "$operator_request" ]]; then
   # Charset mirrors the installed gate (probed against the real binary): doc
   # keys are lowercase-alnum-led segments of [a-z0-9._-] joined by '/', task
-  # refs are digits only. Whitespace, '=', ':' and empty segments are refused
-  # here — a REF smuggling "key=value" must never be emitted raw into the
-  # gate line, or the injected token could forge an audit field downstream.
-  if [[ ! "$operator_request" =~ ^hk:doc/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ && ! "$operator_request" =~ ^hk:task/[0-9]+$ ]]; then
+  # refs are 1-10 digits, and the whole REF is capped at 128 chars. Whitespace,
+  # '=', ':' and empty segments are refused here — a REF smuggling "key=value"
+  # must never be emitted raw into the gate line, or the injected token could
+  # forge an audit field downstream.
+  if [[ ${#operator_request} -gt 128 ]] ||
+    { [[ ! "$operator_request" =~ ^hk:doc/[a-z0-9][a-z0-9._-]*(/[a-z0-9][a-z0-9._-]*)*$ ]] &&
+      [[ ! "$operator_request" =~ ^hk:task/[0-9]{1,10}$ ]]; }; then
     echo "operator_request_ref_invalid: '$operator_request' — hk:doc/<key> 또는 hk:task/<정수> 만 허용" >&2
     exit 3
   fi
-  if [[ "$requested_by_seen" -eq 1 && ( "$requested_by" =~ [[:space:]] || ${#requested_by} -gt 64 ) ]]; then
+  # Mirrors _requested_by_valid: strip edge whitespace first, then require a
+  # non-empty whitespace-free token of at most 64 chars.
+  rb_stripped="$(printf '%s' "$requested_by" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  if [[ "$requested_by_seen" -eq 1 && ( -z "$rb_stripped" || "$rb_stripped" =~ [[:space:]] || ${#rb_stripped} -gt 64 ) ]]; then
     echo "requested_by_invalid: '$requested_by' — 공백 없는 단일 토큰, 64자 이하" >&2
     exit 3
   fi
-  if [[ "$profile" != fable ]]; then
-    echo "operator_request_not_applicable: $profile 은 escalation 프로필이 아니다" >&2
-    exit 3
-  fi
+  # task #625: the request applies to escalation profiles (oc-omni) and the
+  # consult_only identity (fable) — every other profile is not_applicable,
+  # exactly the installed gate's vocabulary.
+  case "$profile" in
+    fable|oc-omni) : ;;
+    *)
+      echo "operator_request_not_applicable: $profile 은 escalation/consult_only 프로필이 아니다" >&2
+      exit 3 ;;
+  esac
 elif [[ "$requested_by_seen" -eq 1 ]]; then
   echo "requested_by_requires_operator_request — --requested-by 는 --operator-request 와 함께만 쓴다" >&2
   exit 3
 fi
-# WRK_GATE_ESCALATION_MODE=strict mirrors the installed gate's real fable
-# denial: with no operator request the escalation profile is refused while
-# same-grade candidates remain. Default stays open so the profile table keeps
-# exercising the plain allow path.
-if [[ "${WRK_GATE_ESCALATION_MODE:-open}" == strict && "$profile" == fable && -z "$operator_request" ]]; then
-  echo "fable 은 escalation 후보 — 다른 S+ 후보가 아직 가용하므로 사용 불가" >&2
-  echo "대안(S+): codex-sol, opus" >&2
+# task #625: the installed gate refuses a bare fable unconditionally — it is
+# consult_only and only a valid operator request satisfies that (the same key
+# `policy launch` demands). The denial no longer depends on same-grade
+# candidates, so the old WRK_GATE_ESCALATION_MODE knob is gone.
+if [[ "$profile" == fable && -z "$operator_request" ]]; then
+  echo "consult_only: fable — 운영자 명시 요청 없이 스폰 불가 (--operator-request hk:doc/<key> 또는 hk:task/<정수> 필요)" >&2
   exit 3
 fi
 pool="$(pool_for "$profile")"
@@ -272,7 +282,13 @@ if [[ "${WRK_GATE_POOL_MODE:-ok}" == missing ]]; then
 fi
 extra=""
 if [[ -n "$operator_request" ]]; then
-  extra=" escalation_override=true operator_request_ref=$operator_request requested_by=${requested_by:-unknown} ref_resolution=unverified"
+  # The override flag is true only for a real escalation profile whose
+  # "alternatives available" denial the request overrode (this fixture's
+  # all-healthy world always has alternatives). For fable the request satisfies
+  # consult_only — it overrode no alternative denial, so false (task #625).
+  override=false
+  [[ "$profile" != oc-omni ]] || override=true
+  extra=" escalation_override=$override operator_request_ref=$operator_request requested_by=${rb_stripped:-unknown} ref_resolution=unverified"
 fi
 if [[ "$profile" == devin-swe2 ]]; then
   # The fixture models scopefuel's authoritative output; wrk must pass this
