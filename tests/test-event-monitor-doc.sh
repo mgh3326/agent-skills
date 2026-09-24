@@ -74,6 +74,17 @@ def check_director(text: str) -> None:
     assert re.search(r"공백 신호는 걷어내지 않는다.{0,300}단발", sec), (
         "gap-signal prescription (미배포 유실 신호 → 단발 조회) missing"
     )
+    # 처방의 수단·판정 기준도 계약이다 — herdr 는 로컬 소켓 1대분이고, 원격은
+    # ssh 또는 operator 토큰 경로며, 소실·정체 판정 기준이 있어야 실행 가능하다.
+    assert re.search(r"herdr agent list.{0,80}로컬", sec), (
+        "gap-signal means must mark herdr agent list as local-socket only"
+    )
+    assert re.search(r"ssh.{0,20}herdr agent list", sec) and "operator" in sec, (
+        "gap-signal means must cover remote hosts (ssh) and operator-token hub queries"
+    )
+    assert "판정 기준" in sec, (
+        "loss/stall judgement criteria missing from the gap-signal prescription"
+    )
 
 
 def check_builder(text: str) -> None:
@@ -93,6 +104,9 @@ def check_builder(text: str) -> None:
         "the blocking wait must be bounded (timeout required)"
     )
     assert "panewire-events.md" in sec, "builder must point at the event table"
+    assert "공백 신호" in sec, (
+        "builder must point at the director gap-signal rule for undeployed signals"
+    )
 
 
 def table_rows(text: str) -> list:
@@ -120,6 +134,20 @@ def check_events_doc(text: str) -> None:
     stall_rows = [r for r in rows if "정체" in r]
     assert stall_rows and any("미배포" in r for r in stall_rows), (
         "the stall row itself must be marked 미배포 (source-only, #66)"
+    )
+    hub_rows = [r for r in rows if "orphaned" in r]
+    assert hub_rows and any("있음" in r for r in hub_rows), (
+        "hub-side job-state row (orphaned/recovered/reassigned/revoked) must "
+        "exist and be marked 있음 (deployed at pw-e401923)"
+    )
+    claim_rows = [r for r in rows if "claim" in r]
+    assert claim_rows and any("풀" in r for r in claim_rows), (
+        "the claim row must be marked pull — heartbeat registration, no lane push"
+    )
+    spawned_rows = [r for r in rows if "spawned" in r]
+    assert spawned_rows and any("없음" in r for r in spawned_rows), (
+        "the job.spawned/reaped/reclaim row must be marked 없음 — absent even "
+        "at origin/main, not merely undeployed"
     )
     # CI 결론은 문서 어딘가가 아니라 §5 안에 있어야 한다.
     sec5 = section(text, "## 5. CI·PR 대기 결론")
@@ -236,6 +264,62 @@ assert builder_bounded_removed != builder_text, (
     "fixture: builder bounded-timeout wording not found to remove"
 )
 
+# 처방 수단·판정 기준 약화 — 문구가 남아도 의미가 무너지면 RED 여야 한다.
+director_gap_local_lost = director_text.replace(
+    "로컬 herdr 소켓 1대분", "fleet 조회", 1
+)
+assert director_gap_local_lost != director_text, (
+    "fixture: director herdr local-scope wording not found"
+)
+
+director_gap_remote_lost = director_text.replace(
+    "`ssh <host> herdr agent list`", "", 1
+)
+assert director_gap_remote_lost != director_text, (
+    "fixture: director ssh fallback wording not found"
+)
+
+director_gap_judgement_lost = director_text.replace("**판정 기준:**", "", 1)
+assert director_gap_judgement_lost != director_text, (
+    "fixture: director judgement-criteria wording not found"
+)
+
+builder_gap_pointer_lost = builder_text.replace('"공백 신호" 규칙', "규칙", 1)
+assert builder_gap_pointer_lost != builder_text, (
+    "fixture: builder gap-signal pointer not found"
+)
+
+hub_row = next(
+    r for r in events_text.splitlines()
+    if r.startswith("|") and "orphaned" in r
+)
+events_hub_row_removed = events_text.replace(hub_row + "\n", "", 1)
+assert events_hub_row_removed != events_text, (
+    "fixture: hub-side job-state row not found to remove"
+)
+
+claim_row = next(
+    r for r in events_text.splitlines()
+    if r.startswith("|") and "job.claim" in r
+)
+events_claim_push_lied = events_text.replace(
+    claim_row, claim_row.replace("있음 — 풀**", "있음**"), 1
+)
+assert events_claim_push_lied != events_text, (
+    "fixture: claim row pull marking not found to weaken"
+)
+
+spawned_row = next(
+    r for r in events_text.splitlines()
+    if r.startswith("|") and "spawned" in r
+)
+events_spawned_row_flipped = events_text.replace(
+    spawned_row, spawned_row.replace("없음", "미배포"), 1
+)
+assert events_spawned_row_flipped != events_text, (
+    "fixture: spawned row 없음 marking not found to flip"
+)
+
 mutants = [
     ("director-section-removed", lambda: check_director(director_section_removed)),
     ("director-cap-weakened", lambda: check_director(director_cap_removed)),
@@ -272,6 +356,34 @@ mutants = [
     (
         "events-ci-conclusion-section-removed",
         lambda: check_events_doc(events_conclusion_removed),
+    ),
+    (
+        "director-gap-local-scope-lied",
+        lambda: check_director(director_gap_local_lost),
+    ),
+    (
+        "director-gap-remote-means-removed",
+        lambda: check_director(director_gap_remote_lost),
+    ),
+    (
+        "director-gap-judgement-removed",
+        lambda: check_director(director_gap_judgement_lost),
+    ),
+    (
+        "builder-gap-pointer-removed",
+        lambda: check_builder(builder_gap_pointer_lost),
+    ),
+    (
+        "events-hub-row-removed",
+        lambda: check_events_doc(events_hub_row_removed),
+    ),
+    (
+        "events-claim-row-flipped",
+        lambda: check_events_doc(events_claim_push_lied),
+    ),
+    (
+        "events-spawned-row-flipped",
+        lambda: check_events_doc(events_spawned_row_flipped),
     ),
 ]
 for label, callback in mutants:
