@@ -575,11 +575,16 @@ grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OU
 
 # #604: the 2026-09-23 incident shape — explain answers a well-formed envelope
 # whose matched_rule is absent because no identity rule claimed the screen
-# (first-open trust prompt hypothesis). The spawn still fails, but the pane's
-# screen, transcript, explain JSON and process-info must survive the pane.
+# (first-open trust prompt hypothesis). Since #649 this bare envelope carries
+# no evaluated_rules proving the screen is just the command line, so it is an
+# "unmatched" screen: polled to the window, then the spawn still fails and
+# the pane's screen, transcript, explain JSON and process-info must survive
+# the pane.
 devin_readiness_failure_case devin-explain-no-rule 1
-grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
-  fail "no-rule explain lost the incident diagnostic: $DEVIN_CASE_OUT"
+grep -q 'agent explain matched no identity rule within 30000ms (unmatched screen x120)' <<<"$DEVIN_CASE_OUT" ||
+  fail "no-rule explain lost the bounded-window diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 120 ]] ||
+  fail "no-rule explain must poll to the 30000/250 attempt cap"
 grep -q 'Devin spawn failure artifacts preserved under ' <<<"$DEVIN_CASE_OUT" ||
   fail "604 failure artifacts were not announced: $DEVIN_CASE_OUT"
 artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
@@ -587,7 +592,7 @@ artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)
 [[ "$artifact_dir" == "$TMP/inbox/fixture/devin-spawn-failure-"* ||
    "$artifact_dir" == "$(cd "$TMP" && pwd -P)/inbox/fixture/devin-spawn-failure-"* ]] ||
   fail "604 artifacts must live in the job dir: $artifact_dir"
-grep -q 'reason=agent explain returned an invalid identity envelope' "$artifact_dir/reason.txt" ||
+grep -q 'reason=agent explain matched no identity rule within 30000ms' "$artifact_dir/reason.txt" ||
   fail "604 reason.txt lost the failure reason"
 grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
   fail "604 the explain envelope that failed was not preserved"
@@ -611,6 +616,10 @@ echo "PASS 604-explain-no-rule-artifacts-preserved"
 devin_readiness_failure_case devin-trust-screen 1
 grep -q 'expected agent=devin rule=welcome_prompt_footer, got agent=devin rule=trust_directory' <<<"$DEVIN_CASE_OUT" ||
   fail "trust-screen explain lost its rule diagnostic: $DEVIN_CASE_OUT"
+# #649: a matched non-welcome rule is a terminal state — judged on the first
+# explain, never polled (a mutant that retries matched rules turns this red).
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "trust-screen must be judged on the first explain, not polled"
 artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
 [[ -d "$artifact_dir" ]] || fail "604 trust-screen artifact dir missing"
 grep -q 'trust_directory' "$artifact_dir/explain.out" ||
@@ -683,6 +692,50 @@ artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)
 [[ -d "$artifact_dir" ]] || fail "604 never-detect artifact dir missing: $DEVIN_CASE_OUT"
 grep -qx 'rc=skipped' "$artifact_dir/explain.rc" ||
   fail "604 never-detect must record explain rc=skipped: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+
+# #649 (m1b): a slow devin reaches the identity check before its TUI is
+# painted — explain answers a well-formed envelope with every rule unmatched
+# and the evaluated region still holds only the typed command line. That is
+# "still starting", not a spawn failure: explain is re-polled with backoff
+# inside the same START_TIMEOUT window. A mutant that fails on the first
+# unmatched envelope turns the success assertion red.
+: >"$TMP/herdr.log"
+devin_starting_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO=devin-explain-starting spawn_base devin-swe2 2>&1)" ||
+  fail "still-starting Devin must spawn once the welcome footer appears: $devin_starting_out"
+grep -q 'landed=yes' <<<"$devin_starting_out" ||
+  fail "still-starting Devin did not land: $devin_starting_out"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 4 ]] ||
+  fail "starting Devin must poll explain until a rule matches: $(grep -c '^agent explain ' "$TMP/herdr.log")"
+grep -qx 'agent rename w:p1 fixture' "$TMP/herdr.log" ||
+  fail "still-starting Devin must rename the tab-create pane id"
+[[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "still-starting Devin must receive exactly one brief"
+echo "PASS 649-starting-polls-then-succeeds"
+
+# The same command-line-only screen that never resolves: the window closes
+# and the spawn fails closed with the #604 artifact set and a reason naming
+# the still-starting shape — "on timeout, the existing fail-closed path".
+devin_readiness_failure_case devin-explain-starting-stuck 1
+grep -q 'Devin pane startup failed: agent explain still starting within 30000ms (command-line-only screen x120)' <<<"$DEVIN_CASE_OUT" ||
+  fail "never-starting Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 120 ]] ||
+  fail "never-starting Devin must poll explain exactly the 30000/250 attempt cap"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "649 starting-stuck artifact dir missing: $artifact_dir"
+grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
+  fail "649 starting-stuck must preserve the last explain envelope"
+echo "PASS 649-starting-window-fails-closed"
+
+# Unknown screen — unmatched rules AND the evaluated region is not the
+# command line: also rides the window out, then fails ("fail after the
+# window"), distinct from a matched dialog's immediate judgement. A mutant
+# that fails it on the first explain turns the poll-count assertion red.
+devin_readiness_failure_case devin-explain-unknown 1
+grep -q 'Devin pane startup failed: agent explain matched no identity rule within 30000ms (unmatched screen x120)' <<<"$DEVIN_CASE_OUT" ||
+  fail "unknown-screen Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 120 ]] ||
+  fail "unknown-screen Devin must poll explain exactly the 30000/250 attempt cap"
+echo "PASS 649-unknown-screen-window-fails-closed"
 
 # Detection on the window edge: a fake clock (only `date +%s` is faked) puts
 # every reading after the first 31s past pane run. Detection succeeds on the

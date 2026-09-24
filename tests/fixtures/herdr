@@ -187,7 +187,7 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-shell-busy-m1b|devin-shell-never-ready-m1b|devin-explain-no-rule|devin-explain-empty|devin-trust-screen|devin-read-fail)
+          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-shell-busy-m1b|devin-shell-never-ready-m1b|devin-explain-no-rule|devin-explain-empty|devin-trust-screen|devin-read-fail|devin-explain-starting|devin-explain-starting-stuck|devin-explain-unknown)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           # #568 incident shape: the brief landed and devin is working on it,
@@ -327,10 +327,34 @@ case "${1:-}" in
             ;;
           # #604: the 2026-09-23 incident shape — a well-formed envelope whose
           # matched_rule is absent because no identity rule claimed the screen
-          # (first-open trust prompt hypothesis). wrk reads this as an invalid
-          # identity envelope.
+          # (first-open trust prompt hypothesis). Since #649 this bare envelope
+          # carries no evaluated_rules to prove the screen is just the command
+          # line, so it classifies "unmatched" and is polled to the window.
           devin-explain-no-rule|devin-read-fail)
             printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle"}'
+            ;;
+          # #649 (m1b): devin's TUI is still painting — every identity rule is
+          # unmatched and the evaluated region holds only the typed command
+          # line (the exact argv wrk runs for devin-swe2). The first
+          # WRK_FIXTURE_DEVIN_STARTING_COUNT (default 3) explains answer that
+          # shape, then the welcome footer appears.
+          devin-explain-starting)
+            explains="$(grep -c '^agent explain ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
+            if [[ "$explains" -le "${WRK_FIXTURE_DEVIN_STARTING_COUNT:-3}" ]]; then
+              printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle","evaluated_rules":[{"id":"welcome_prompt_footer","matched":false,"priority":120,"region":"bottom_non_empty_lines(8)","state":"idle","evidence":{"region_bytes":110,"region_preview":"~ % devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false"}}]}'
+            else
+              printf '%s\n' '{"agent":"devin","matched_rule":{"id":"welcome_prompt_footer","priority":120,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
+            fi
+            ;;
+          # The same command-line-only screen, but it never resolves — the
+          # window must close and the spawn must fail closed.
+          devin-explain-starting-stuck)
+            printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle","evaluated_rules":[{"id":"welcome_prompt_footer","matched":false,"priority":120,"region":"bottom_non_empty_lines(8)","state":"idle","evidence":{"region_bytes":110,"region_preview":"~ % devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false"}}]}'
+            ;;
+          # Unmatched rules AND the evaluated region is not the command line —
+          # a genuinely unexpected pane. Also polled to the window, then fails.
+          devin-explain-unknown)
+            printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle","evaluated_rules":[{"id":"welcome_prompt_footer","matched":false,"priority":120,"region":"bottom_non_empty_lines(8)","state":"idle","evidence":{"region_bytes":512,"region_preview":"some unexpected screen the rules do not know"}}]}'
             ;;
           # #604 hypothesis variant: a rule did match — the trust prompt — so
           # the identity check fails on the rule id, and only the preserved

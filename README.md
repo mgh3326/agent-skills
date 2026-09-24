@@ -117,7 +117,12 @@ Devin은 `pane run`이 셸 상태를 확인하지 않으므로, 그 전에 `pane
 실측 검출 0.42초). 검출 뒤 같은 창의 남은 시간 안에 idle을 기다리고,
 `agent explain --format json`이 `agent=devin`과
 `matched_rule.id=welcome_prompt_footer`를 함께 보고한 뒤에만 그 pane id를 agent 이름으로
-rename한다. effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로 `devin-swe2`로
+rename한다. 첫 explain이 어떤 규칙에도 매치되지 않고 평가된 화면 영역이 방금
+타이핑한 `devin …` 명령 줄뿐이면(m1b처럼 TUI가 아직 안 그려진 시작 중 상태)
+같은 창 안에서 백오프로 재조회한다; 매치된 규칙(신뢰 다이얼로그·권한
+프롬프트·오류 화면)이나 다른 agent, 읽을 수 없는 envelope은 즉시 판정하고,
+창이 닫히면 기존 fail-closed 경로와 진단 아티팩트 보존이 그대로 적용된다.
+effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로 `devin-swe2`로
 넘기고 pool 결정·기록은 scopefuel 출력과 arbiter가 소유한다.
 
 이 분기는 herdr 0.9.1의 `agent start` 소유권 검사가 Devin 3000.11.1에서 실패하는 동안의
