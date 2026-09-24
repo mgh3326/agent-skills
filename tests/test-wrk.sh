@@ -1480,6 +1480,48 @@ grep -q 'panewire_rc' <<<"$devin_pw_out" && fail "498 devin landed must not carr
 [[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 devin one delivery"
 echo "PASS 498-a4-devin-corroborated"
 
+# #568: the 2026-09-22 t502-verify duplicate — panewire rc 6 "submission
+# evidence unproven" while devin had already consumed the brief. The
+# transcript holds the marker folded across a line break and devin reports
+# working; neither must trigger a second delivery.
+pw_reset
+devin_wrapped_out="$(TEST_FIXTURE_SCENARIO=devin-wrapped-marker pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=yes' <<<"$devin_wrapped_out" || fail "568 folded-marker devin must land: $devin_wrapped_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 folded-marker devin was re-injected"
+if grep -q 'reinject' <<<"$devin_wrapped_out"; then fail "568 folded-marker devin announced a reinject: $devin_wrapped_out"; fi
+echo "PASS 568-devin-folded-marker-no-duplicate"
+
+# #568 auxiliary evidence: marker absent entirely, devin working after an
+# accepted submit — the pane was verified idle before injection, so working
+# means it consumed the brief.
+pw_reset
+devin_working_out="$(TEST_FIXTURE_SCENARIO=devin-working-no-marker pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=yes' <<<"$devin_working_out" || fail "568 devin working must land: $devin_working_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 devin working was re-injected"
+echo "PASS 568-devin-working-status-lands"
+
+# #568: a devin queued banner is unattributable (grok-chip precedent) —
+# ambiguous evidence suppresses the re-injection without claiming landed.
+pw_reset
+devin_queued_out="$(TEST_FIXTURE_SCENARIO=devin-queued pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_queued_out" || fail "568 devin queued must not claim landed: $devin_queued_out"
+grep -q 'reason=ambiguous-observation' <<<"$devin_queued_out" ||
+  fail "568 devin queued must be ambiguous: $devin_queued_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 devin queued was re-injected"
+echo "PASS 568-devin-queued-ambiguous-no-reinject"
+
+# #568 negative direction: a devin pane with no evidence at all (status
+# unknown — absent from agent list) still gets exactly one re-injection and
+# then stops.
+pw_reset
+devin_none_out="$(TEST_FIXTURE_SCENARIO=devin-no-landing pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_none_out" || fail "568 devin no-landing: $devin_none_out"
+grep -q 'action=reinject-once' <<<"$devin_none_out" ||
+  fail "568 devin no-landing lost the re-injection: $devin_none_out"
+[[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] ||
+  fail "568 devin no-landing must re-inject exactly once: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-confirmed-nonlanding-reinject-once"
+
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"
 grep -q 'gate blocked' <<<"$blocked3"

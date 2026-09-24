@@ -190,6 +190,16 @@ case "${1:-}" in
           devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
+          # #568 incident shape: the brief landed and devin is working on it,
+          # but panewire's classifier cannot prove devin submissions (rc 6).
+          devin-wrapped-marker|devin-working-no-marker|devin-queued)
+            printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          # #568 negative direction: the pane is absent from agent list, so
+          # its status reads unknown — no positive evidence of any kind.
+          devin-no-landing)
+            printf '%s\n' '{"result":{"agents":[]}}'
+            ;;
           devin-wrong-agent)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
@@ -233,7 +243,23 @@ case "${1:-}" in
           echo 'fixture: visible read unavailable' >&2
           exit 9
         fi
-        if [[ "$scenario" == landing-scrollback-marker ]]; then
+        # #568: the incident transcript — devin rendered the brief folded
+        # across a line break, so a raw substring search never matches it.
+        if [[ "$scenario" == devin-wrapped-marker ]]; then
+          if fixture_is_recent_unwrapped_read "$@"; then
+            printf '❭ fixture\n    prompt\n'
+          else
+            printf 'devin composer\n'
+          fi
+        elif [[ "$scenario" == devin-queued ]]; then
+          if fixture_is_recent_unwrapped_read "$@"; then
+            printf 'devin transcript without the brief\n'
+          else
+            printf '── 1 queued ── ↑ edit · ↵ send now\n○ fixture brief body\n❭ Press Enter to send queued messages now\n'
+          fi
+        elif [[ "$scenario" == devin-working-no-marker || "$scenario" == devin-no-landing ]]; then
+          printf 'devin working…\n'
+        elif [[ "$scenario" == landing-scrollback-marker ]]; then
           if fixture_is_recent_unwrapped_read "$@"; then
             printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
           else

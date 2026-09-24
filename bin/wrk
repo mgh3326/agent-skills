@@ -329,6 +329,18 @@ landing_check_once() {
     LANDING_CHECK_LAST_REASON="marker-in-recent-unwrapped"
     return 0
   fi
+  # #568: Devin folds long lines at its render width, so the transcript's copy
+  # of the marker can carry a line break or indent the raw substring never
+  # matches (the 2026-09-22 t502-verify duplicate: rc 6, status=working,
+  # marker present but folded → reinjected into a working tester). Compare
+  # with all whitespace stripped — devin only; every other kind keeps the raw
+  # substring contract.
+  if [[ "$profile_kind" == devin && -n "$marker" ]] &&
+     grep -Fq -- "${marker//[[:space:]]/}" <<<"${recent//[[:space:]]/}"; then
+    LANDING_CHECK_LAST_EVIDENCE=devin-marker-folded
+    LANDING_CHECK_LAST_REASON="folded-marker-in-recent-unwrapped"
+    return 0
+  fi
   if ! visible="$("$HERDR" agent read "$pane" --source visible --lines 40 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown
@@ -352,6 +364,18 @@ landing_check_once() {
   # the re-injection so a possibly queued payload is not duplicated. The
   # transcript marker above stays the only positive evidence. `0 queued` is
   # not a chip.
+  # #568: Devin's queued banner (`── N queued ──` / `○ msg` /
+  # `Press Enter to send queued messages now`, relay-handoff §3-2) means a
+  # payload is sitting in Devin's queue. Like grok's chip it cannot be
+  # attributed to THIS injection, so it is ambiguous evidence that suppresses
+  # re-injection — never positive.
+  if [[ "$profile_kind" == devin ]] &&
+     grep -Eq '── [0-9]+ queued ──|Press Enter to send queued messages now' <<<"$visible"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_EVIDENCE=devin-queued
+    LANDING_CHECK_LAST_REASON="devin-queue-banner-unattributable"
+    return 1
+  fi
   if [[ "$profile_kind" == grok ]] && grep -Eq '[1-9][0-9]* queued, Enter to send now' <<<"$visible"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_EVIDENCE=grok-queued
@@ -368,7 +392,11 @@ landing_check_once() {
   # Herdr's built-in Devin detector exposes a post-prompt idle/done state after
   # it has accepted the brief. That detector result is profile-specific positive
   # evidence; generic agents still require a transcript marker or Pasted text.
-  if [[ "$profile_kind" == devin && "$status" =~ ^(idle|done)$ ]]; then
+  # #568: delivery only runs after `agent wait --until idle` already saw the
+  # pane idle, so a Devin pane reporting working has consumed the submitted
+  # brief — nothing else was ever sent. `working` is positive evidence for
+  # devin alone; the cold-boot caveat keeps it non-evidence for other kinds.
+  if [[ "$profile_kind" == devin && "$status" =~ ^(idle|done|working)$ ]]; then
     LANDING_CHECK_LAST_EVIDENCE=devin-status
     LANDING_CHECK_LAST_REASON="devin-post-prompt-status-${status}"
     return 0
