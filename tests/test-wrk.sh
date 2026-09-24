@@ -1536,9 +1536,11 @@ grep -q 'landed=no' <<<"$devin_unconf_out" ||
 echo "PASS 568-devin-unconfirmed-working-not-landed"
 
 # #568 round-2/3 (tester blockers): the marker's words in unrelated UI text are
-# not a folded marker — a UI tab on one line (no line break), a line break
-# without indent (no wrap continuation), and an indented break mid-line (not
-# after `❭`/line start). With no other evidence this is confirmed non-landing:
+# not a folded marker — an unindented break mid-line, an unindented break at a
+# line start, a UI tab on one line (no line break), and an indented break
+# mid-line (not after `❭`/line start). A leftmost-match matcher returns on the
+# first variant, so ordering is part of the test: every discriminating variant
+# must be evaluated. With no other evidence this is confirmed non-landing:
 # exactly one re-injection.
 pw_reset
 devin_coll_out="$(TEST_FIXTURE_SCENARIO=devin-fold-collision pw_spawn devin-swe2 2>&1)"

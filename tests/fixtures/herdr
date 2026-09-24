@@ -254,13 +254,16 @@ case "${1:-}" in
           else
             printf 'devin composer\n'
           fi
-        # #568 adversarial: the marker's words in unrelated UI text — split by
-        # a tab on one line, across a line break without indent, and across an
-        # indented break mid-line. None reproduce devin's submitted-prompt
-        # wrap shape (`❭ <text>` + indented continuation at line start).
+        # #568 adversarial: the marker's words in unrelated UI text — a line
+        # break without indent mid-line, the same break at a line start, a UI
+        # tab on one line, and an indented break mid-line. None reproduce
+        # devin's submitted-prompt wrap shape (`❭ <text>` + indented
+        # continuation at line start). Order matters: the old leftmost-match
+        # matcher must hit a break-bearing variant first, or it returns before
+        # ever evaluating the variants that distinguish it.
         elif [[ "$scenario" == devin-fold-collision ]]; then
           if fixture_is_recent_unwrapped_read "$@"; then
-            printf 'unrelated UI label: fixture\tprompt settings\nmore UI: fixture\nprompt settings\nlast UI: fixture\n    prompt settings\n'
+            printf 'more UI: fixture\nprompt settings\nfixture\nprompt settings\nfixture\tprompt settings\nlast UI: fixture\n    prompt settings\n'
           else
             printf 'devin composer\n'
           fi

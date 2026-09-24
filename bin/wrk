@@ -318,8 +318,9 @@ agent_status_for_pane() {
 # #568: a folded-marker match must reproduce devin's observed submitted-prompt
 # rendering, not just the marker's characters scattered over a transcript.
 # The match must (a) contain a wrapped continuation — a newline followed by
-# indent, the shape measured on the incident transcript `❭ fixture\n    prompt`
-# — and (b) start at a line boundary or right after devin's `❭` prompt glyph.
+# indent, the shape observed in devin's submitted-prompt rendering
+# (`❭ <marker start>` + indented continuation) — and (b) start at a line
+# boundary or right after devin's `❭` prompt glyph.
 # Whitespace-only variants that never wrapped (a UI column tab between the
 # same words) and unrelated text carrying the words across a line break are
 # not folded markers and must not count as positive evidence.
