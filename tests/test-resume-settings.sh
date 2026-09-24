@@ -54,9 +54,13 @@ export KIMI_CODE_HOME="$TMP/kimi-home"
 # Isolate git's global ignore machinery: on a machine where Claude Code already
 # wrote **/.claude/settings.local.json into the user excludes, check-ignore
 # would pass without our info/exclude fallback and the mutant below could not
-# go RED. An empty GIT_CONFIG_GLOBAL keeps this test's verdicts local.
+# go RED. An empty GIT_CONFIG_GLOBAL alone is not enough — the default
+# excludesfile ($XDG_CONFIG_HOME/git/ignore) is not config-scoped, so isolate
+# the XDG config dir and the system config too.
 printf '' >"$TMP/gitconfig"
 export GIT_CONFIG_GLOBAL="$TMP/gitconfig"
+export GIT_CONFIG_NOSYSTEM=1
+export XDG_CONFIG_HOME="$TMP/xdg-config-home"
 
 WRK="$ROOT/bin/wrk"
 SETTINGS='.claude/settings.local.json'
@@ -221,6 +225,22 @@ git -C "$d" check-ignore -q -- "$SETTINGS" ||
 ! grep -qxF '**/.claude/settings.local.json' "$d/.git/info/exclude" ||
   { echo "RED: AC4b: info/exclude touched though .gitignore already covered it" >&2; exit 1; }
 echo "PASS AC4b: existing .gitignore honored, info/exclude untouched"
+
+# A global excludes file that already covers the path (the Claude Code default
+# on machines that have run it) means wrk adds nothing to info/exclude and
+# check-ignore still passes — coverage comes from the user's excludes.
+d="$(mkrepo ac4c)"
+printf '[core]\n\texcludesFile = %s\n' "$TMP/global-excludes" >"$TMP/gitconfig-global-excl"
+printf '%s\n' '**/.claude/settings.local.json' >"$TMP/global-excludes"
+GIT_CONFIG_GLOBAL="$TMP/gitconfig-global-excl" spawn_in "$WRK" "$d" opus ||
+  fail "AC4c spawn failed: $(tail -n 3 "$TMP/wrk.stderr")"
+GIT_CONFIG_GLOBAL="$TMP/gitconfig-global-excl" git -C "$d" check-ignore -q -- "$SETTINGS" ||
+  { echo "RED: AC4c: $SETTINGS not ignored despite global excludes" >&2; exit 1; }
+! grep -qxF '**/.claude/settings.local.json' "$d/.git/info/exclude" ||
+  { echo "RED: AC4c: info/exclude touched though global excludes covered it" >&2; exit 1; }
+[[ -z "$(GIT_CONFIG_GLOBAL="$TMP/gitconfig-global-excl" git -C "$d" status --porcelain)" ]] ||
+  { echo "RED: AC4c: git status is not clean under the user's excludes" >&2; exit 1; }
+echo "PASS AC4c: global excludes honored, info/exclude untouched, status clean"
 
 # AC5 — non-claude kinds and the resident opt-out write nothing.
 d="$(mkrepo ac5-devin)"
