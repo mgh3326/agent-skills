@@ -6,6 +6,16 @@ if [[ -n "${WRK_FIXTURE_LOG:-}" ]]; then
   printf '%s\n' "$*" >>"$WRK_FIXTURE_LOG"
 fi
 
+# #609: which executable holds the pane foreground is the fixture's own
+# state, not a function of the diagnostic call log — real herdr answers
+# `pane process-info` from the pane whether or not a log exists, and
+# plenty of spawn call sites set no WRK_FIXTURE_LOG. `agent start` and
+# `pane run` record the foregrounded kind here; `pane process-info`
+# reports it. Keyed by WRK_RUN_ID (one wrk process = one spawn attempt).
+fixture_foreground_file="${TMPDIR:-/tmp}/wrk-fixture-fg-${WRK_RUN_ID:-standalone}"
+fixture_set_foreground() { printf '%s\n' "$1" >"$fixture_foreground_file"; }
+fixture_foreground() { cat "$fixture_foreground_file" 2>/dev/null || true; }
+
 fixture_prompt_count() {
   [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]] || { printf '0\n'; return; }
   grep -c '^agent prompt ' "$WRK_FIXTURE_LOG" 2>/dev/null || true
@@ -308,6 +318,10 @@ case "${1:-}" in
             exit 3
             ;;
         esac
+        # A successful start foregrounds the agent's own executable — the
+        # canonical --kind (herdr's kind IS the binary name).
+        start_kind="$(sed -n 's/.* --kind \([^ ]*\).*/\1/p' <<<" $*")"
+        [[ -z "$start_kind" ]] || fixture_set_foreground "$start_kind"
         printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
         ;;
       send-keys)
@@ -332,6 +346,9 @@ case "${1:-}" in
           echo 'fixture herdr: tab create failed' >&2
           exit 9
         fi
+        # A fresh tab holds a fresh shell — clear any foreground state a
+        # same-PID predecessor run left behind.
+        rm -f "$fixture_foreground_file"
         printf '%s\n' '{"result":{"tab_id":"w:t1","root_pane":{"pane_id":"w:p1"}}}'
         ;;
       close)
@@ -427,17 +444,8 @@ case "${1:-}" in
         printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
         exit 0
       fi
-      if grep -q '^pane run ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null; then
-        printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["devin","--model","swe-2"],"argv0":"devin","cmdline":"devin --model swe-2","cwd":"/tmp","name":"devin","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
-        exit 0
-      fi
-      agent_kind="$(sed -n 's/^agent start .*--kind \([^ ]*\).*/\1/p' \
-        "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null | tail -n1)"
-      agent_starts="$(grep -c '^agent start ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
-      if [[ -n "$agent_kind" ]] && [[ "$scenario" != shell-busy ||
-            "$agent_starts" -gt "${WRK_FIXTURE_SHELL_BUSY_COUNT:-3}" ]] &&
-         [[ "$scenario" != shell-never-ready && "$scenario" != start-not-ready &&
-            "$scenario" != start-pane-unavailable ]]; then
+      agent_kind="$(fixture_foreground)"
+      if [[ -n "$agent_kind" ]]; then
         printf '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["%s"],"argv0":"%s","cmdline":"%s","cwd":"/tmp","name":"%s","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}\n' \
           "$agent_kind" "$agent_kind" "$agent_kind" "$agent_kind"
         exit 0
@@ -454,6 +462,9 @@ case "${1:-}" in
       printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture pane run failure"}}' >&2
       exit 5
     fi
+    # A successful `pane run` is how the devin agent reaches the pane — it
+    # foregrounds the devin executable.
+    if [[ "${2:-}" == run ]]; then fixture_set_foreground devin; fi
     printf 'fixture pane %s\nACTUAL SCREEN LAST LINE\n' "${3:-unknown}"
     ;;
 esac

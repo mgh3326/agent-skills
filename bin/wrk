@@ -5,6 +5,10 @@ set -euo pipefail
 HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
 SCOPEFUEL="${SCOPEFUEL_BIN:-}"
 ARBITER="${ARBITER_BIN:-}"
+# #609: one wrk process is one spawn attempt; fixture herdr keys its pane
+# foreground state on this so process-info does not depend on a call log.
+# Real herdr never reads it.
+export WRK_RUN_ID="${WRK_RUN_ID:-$$}"
 # A live duplicate is an exact-once violation, distinct from generic CLI
 # misuse (2) and the arbiter's own duplicate result (4).  75 means that an
 # arbiter duplicate was observed but its state could not be proven safely.
