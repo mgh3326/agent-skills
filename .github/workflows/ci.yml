@@ -41,6 +41,7 @@ jobs:
             tests/test-untagged-operator-evidence.sh \
             tests/test-event-monitor-doc.sh \
             tests/test-input-line-not-evidence.sh \
+            tests/test-tester-family-policy.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
       - name: Bash tests
         env:
@@ -61,3 +62,4 @@ jobs:
           bash tests/test-untagged-operator-evidence.sh
           bash tests/test-event-monitor-doc.sh
           bash tests/test-input-line-not-evidence.sh
+          bash tests/test-tester-family-policy.sh
