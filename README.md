@@ -117,7 +117,14 @@ Devin은 `pane run`이 셸 상태를 확인하지 않으므로, 그 전에 `pane
 실측 검출 0.42초). 검출 뒤 같은 창의 남은 시간 안에 idle을 기다리고,
 `agent explain --format json`이 `agent=devin`과
 `matched_rule.id=welcome_prompt_footer`를 함께 보고한 뒤에만 그 pane id를 agent 이름으로
-rename한다. Devin에는 `--effort` 플래그가 없고 effort가 모델 id 안에 들어 있으므로,
+rename한다. 첫 explain이 어떤 규칙에도 매치되지 않고 평가된 화면 영역이 방금
+타이핑한 `devin …` 명령 줄뿐이면(m1b처럼 TUI가 아직 안 그려진 시작 중 상태)
+같은 창 안에서 백오프로 재조회한다. 명령 줄이 아닌 다른 내용이 보여도 매치된
+규칙이 없으면 마찬가지로 창이 닫힐 때까지 재조회한 뒤 실패한다; 매치된
+규칙(신뢰 다이얼로그·권한
+프롬프트·오류 화면)이나 다른 agent, 읽을 수 없는 envelope은 즉시 판정하고,
+창이 닫히면 기존 fail-closed 경로와 진단 아티팩트 보존이 그대로 적용된다.
+Devin에는 `--effort` 플래그가 없고 effort가 모델 id 안에 들어 있으므로,
 effort 런그는 별도 프로필이다(#635): `devin-swe2-medium`(`--model swe-2-medium`)과
 `devin-swe2-max`(`--model swe-2-max`)는 무료이고, `devin-ds41-max`
 (`--model deepseek-v4-1-flash-max`)는 유료다. `devin-swe2`는 high 기본값을 유지한다.
