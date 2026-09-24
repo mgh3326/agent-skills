@@ -228,15 +228,18 @@ hub_log() {
   # such as `agent get` may still land in its log).
   ! grep -Eq '^(tab create|agent start) ' "$TMP/hub-local-herdr.log" ||
     { echo "ERROR: hub spawn created a local pane" >&2; return 99; }
-  local -a node_args=()
-  mapfile -t node_args < <(python3 - "$TMP/hub.log" <<'PY2'
+  # The args go through a file, not mapfile (absent from macOS's Bash 3.2)
+  # or a process substitution (its exit status is lost).
+  python3 - "$TMP/hub.log" >"$TMP/hub-args" <<'PY2' || return 99
 import json, sys
 posts = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")
          if line.strip() and json.loads(line)["method"] == "POST"]
 assert len(posts) == 1, posts
 print("\n".join(json.loads(posts[0]["body"])["args"]))
 PY2
-  ) || return 99
+  local arg
+  local -a node_args=()
+  while IFS= read -r arg; do node_args+=("$arg"); done <"$TMP/hub-args"
   [[ " ${node_args[*]} " == *" -m $model "* ]] || { echo "ERROR: hub args lost -m $model: ${node_args[*]}" >&2; return 99; }
   env HERDR_BIN="$HERDR" HERDR_SESSION=worker SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 \
