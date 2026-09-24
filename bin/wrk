@@ -2318,13 +2318,22 @@ resolve_profile() {
 # our env key is written. A file that is not a JSON object (or whose `env` is
 # not an object — `null` included), or one already tracked by the repo, aborts
 # the spawn rather than being silently overwritten — that state needs a human,
-# not a rewrite.
+# not a rewrite. A symlinked .claude directory or settings file (dangling
+# included) is left alone with a warning: writing through it could modify a
+# location wrk does not own, and os.replace would destroy a leaf symlink to
+# shared settings (CodeRabbit CR2/CR4) — the spawn proceeds without persisted
+# settings.
 write_claude_local_settings() {
   local cwd="$1"
   # A tracked settings.local.json belongs to the repo; wrk must never modify a
   # target repo's tracked files.
   git -C "$cwd" ls-files --error-unmatch -- .claude/settings.local.json >/dev/null 2>&1 &&
     { printf 'wrk: %s/.claude/settings.local.json is tracked in the repo; refusing to modify a tracked file\n' "$cwd" >&2; return 3; }
+  # -L sees the link itself, so a dangling symlink is refused too.
+  if [[ -L "$cwd/.claude" || -L "$cwd/.claude/settings.local.json" ]]; then
+    warn "$cwd: .claude or .claude/settings.local.json is a symlink; leaving it alone (no local settings written)"
+    return 0
+  fi
   python3 - "$cwd" <<'PY'
 import json, os, sys, tempfile
 
@@ -2388,6 +2397,12 @@ ensure_settings_local_ignored() {
   [[ "$common" == /* ]] || common="$cwd/$common"
   mkdir -p "$common/info" ||
     { warn "cannot create $common/info; $cwd/.claude/settings.local.json is not git-ignored — do not commit it"; return 0; }
+  # A file with no final newline would glue our pattern onto its last line,
+  # un-ignoring whatever that rule named (CodeRabbit CR3).
+  if [[ -s "$common/info/exclude" ]] && [[ -n "$(tail -c 1 "$common/info/exclude" 2>/dev/null)" ]]; then
+    printf '\n' >>"$common/info/exclude" ||
+      { warn "cannot append to $common/info/exclude; $cwd/.claude/settings.local.json is not git-ignored — do not commit it"; return 0; }
+  fi
   grep -qxF '**/.claude/settings.local.json' "$common/info/exclude" 2>/dev/null ||
     printf '%s\n' '**/.claude/settings.local.json' >>"$common/info/exclude" ||
     { warn "cannot append to $common/info/exclude; $cwd/.claude/settings.local.json is not git-ignored — do not commit it"; return 0; }
