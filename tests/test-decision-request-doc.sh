@@ -44,6 +44,11 @@ def check(text: str) -> None:
         assert flag in sec, f"CLI line must carry {flag}"
     assert re.search(r"기록 먼저.{0,40}request_id", sec), "record-first-then-notify-with-request_id rule missing (A6)"
     assert re.search(r"NOT recorded.{0,80}통지하지 않는다", sec), "no console-visibility claim on a failed record (A6)"
+    # M2 (#48): an unconfirmable write is UNKNOWN — check tasks show before
+    # notifying, and claim neither recorded nor not recorded.
+    assert re.search(r"UNKNOWN.{0,200}handoffkeep tasks show", sec), "UNKNOWN outcome must send the director to tasks show first"
+    assert re.search(r"알리기 전에.{0,120}tasks show", sec), "tasks show must come before any notification"
+    assert re.search(r"\"기록됐다\"도\s*\"기록 안 됐다\"도 말하지 않는다", sec), "UNKNOWN must forbid both recorded and not-recorded claims"
     assert re.search(r"권고와 무응답 동작은 별개", sec), "recommendation/default separation missing (A2)"
     assert re.search(r"기한 경과는 적용이 아니다", sec) and "--receipt" in sec, "deadline != applied / receipt rule missing (A3)"
     assert re.search(r"120바이트.{0,40}120자가 아니다", sec), "120-byte (not character) label limit missing (A7)"
@@ -71,6 +76,9 @@ mutants = [
     ("deadline-means-applied", director_text.replace("기한 경과는 적용이 아니다", "기한이 지나면 적용된 것으로 본다")),
     ("label-120-chars", director_text.replace("120바이트**(한글 120자가 아니다", "120자**(")),
     ("section-removed", director_text.replace(HEADING, "## 기타")),
+    ("unknown-line-removed", re.sub(r"(?m)^- \*\*결과 미확인.*?(?=^- \*\*권고와)", "", director_text, flags=re.S)),
+    ("unknown-claims-not-recorded", director_text.replace("\"기록됐다\"도\n  \"기록 안 됐다\"도 말하지 않는다", "\"기록 안 됐다\"고 알린다")),
+    ("unknown-notify-first", director_text.replace("누구에게도 알리기 전에", "알린 뒤에")),
 ]
 for label, text in mutants:
     assert text != director_text, f"{label} mutant did not change the text"
