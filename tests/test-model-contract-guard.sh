@@ -295,7 +295,7 @@ echo "PASS a missing scopefuel marks the brief catalog=stale (never a silent fal
 # table can be diffed against a checked-in list, so an added or removed spelling
 # has to be acknowledged in the same commit.
 WRK_CATALOG_SPELLINGS_SNAPSHOT="$(printf '%s\n' \
-  builder-grok builder-opus builder-sol captain-opus captain-sol \
+  builder-grok builder-luna builder-opus builder-sol captain-opus captain-sol \
   cc-glm cc-qwen38 codex codex-astra codex-luna codex-luna-hi codex-luna-max \
   codex-max codex-med codex-sol codex-terra codex-terra-max fable grok grok-hi \
   grok-med haiku kiro-cheap kiro-haiku kiro-opus kiro-opus-max kiro-opus-xhigh \

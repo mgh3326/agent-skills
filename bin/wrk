@@ -39,7 +39,7 @@ ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable builder-opus captain-opus
   devin-swe2 builder-devin devin-glm52 devin-swe17 devin-ds41
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
-  codex codex-sol codex-max builder-sol captain-sol codex-astra
+  codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
   codex-sol56 codex-luna56
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
@@ -131,8 +131,9 @@ Options:
                      rejects --owner outright (use --lane instead).
   --role worker|builder (legacy alias: captain)
                      builder requires --lane and --parent, and accepts only
-                     builder-opus, builder-sol, builder-devin, builder-grok or
-                     builder-kimi profiles; legacy captain-opus and captain-sol
+                     builder-opus, builder-sol, builder-devin, builder-grok,
+                     builder-kimi or builder-luna profiles; legacy captain-opus
+                     and captain-sol
                      aliases and the pilot worker spellings devin-swe2,
                      grok/grok-hi and kimi-k3 remain accepted.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
@@ -213,6 +214,9 @@ It defaults to --effort xhigh and requires --purpose director|architect|operator
 which the gate enforces as role denial (gate exit 5, surfaced by wrk as exit 77) when
 missing or wrong.
 Pilot builders (task 240): builder-devin = devin-swe2 argv; builder-grok = grok 4.7 at effort xhigh; builder-kimi = kimi-k3 argv.
+builder-luna (task #633) = codex-luna (gpt-6-luna) at effort xhigh — the #594 E3
+sample spelling; --effort is pinned to xhigh because the catalog grades
+codex-luna per effort (medium=B, max=A+).
 Devin model variants (task 281): devin-glm52, devin-swe17 and devin-ds41 run
 the same unattended devin argv with only the model name changed — worker-only,
 sharing scopefuel's single `devin` pool (devin-ds41 is the paid spelling).
@@ -1867,6 +1871,10 @@ resolve_catalog_profile() {
     codex-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=medium ;;
     codex-luna-hi) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=high ;;
     codex-luna-max) CATALOG_PROFILE=codex-luna-max ;;
+    # #633: builder-luna is codex-luna admitted under --role builder at the
+    # #594 E3 effort (xhigh) — pinned so the catalog is consulted at the same
+    # effort the grade ceiling was rated at.
+    builder-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=xhigh ;;
     codex-astra) CATALOG_PROFILE=codex-astra ;;
 
     kiro-opus) CATALOG_PROFILE=kiro-opus ;;
@@ -2099,6 +2107,10 @@ resolve_profile() {
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    # task #633 (#594 E3): builder-luna is codex-luna under --role builder at
+    # xhigh. The literal is the catalog-unreachable fallback; #593 wiring lets
+    # `policy launch` replace both fields.
+    builder-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
     # task #527 요건 ⑦: codex-astra default effort is xhigh, unified with
     # ARCHITECT.md's spawn command and the consult-advisor SKILL.md note
     # (hk:doc note/2026-09-22/task527-astra-effort-alignment).
@@ -2210,7 +2222,7 @@ resolve_profile() {
     # An explicit --purpose director|operator-request still wins.
     codex-astra) GATE_PROFILE=codex-astra; [[ -n "${PURPOSE:-}" ]] || PURPOSE=architect ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
-    codex-luna|codex-luna-hi|codex-luna-max|codex-luna56) GATE_PROFILE=codex-luna-max ;;
+    codex-luna|codex-luna-hi|codex-luna-max|codex-luna56|builder-luna) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
     kiro-sonnet) GATE_PROFILE=kiro-sonnet ;;
     kiro-cheap) GATE_PROFILE=kiro-cheap ;;
@@ -4024,18 +4036,25 @@ spawn_cmd() {
     case "$MODEL" in
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
-      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-grok or builder-kimi (pilot worker spellings devin-swe2, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; terra/luna and devin-glm52/devin-swe17/devin-ds41 are worker-only)" ;;
+      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|builder-luna|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-grok, builder-kimi or builder-luna (pilot worker spellings devin-swe2, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41 are worker-only)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
         [[ -z "$EFFORT" || "$EFFORT" == high ]] || die "builder-opus (legacy captain-opus alias) requires effort high"
         ;;
+      # #633: the catalog grades codex-luna per effort (medium=B, max=A+). The
+      # E3 sample is defined at xhigh only — a lower or higher --effort would
+      # move the rung the ceiling was rated at, so the guard reuses the
+      # builder-opus pin and refuses rather than silently relaunch.
+      builder-luna)
+        [[ -z "$EFFORT" || "$EFFORT" == xhigh ]] || die "builder-luna requires effort xhigh (#594 E3 sample profile)"
+        ;;
     esac
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|builder-luna|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac

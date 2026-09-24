@@ -343,6 +343,7 @@ grep -qx 'builder-sol' <<<"$profiles_out"
 grep -qx 'builder-devin' <<<"$profiles_out"
 grep -qx 'builder-grok' <<<"$profiles_out"
 grep -qx 'builder-kimi' <<<"$profiles_out"
+grep -qx 'builder-luna' <<<"$profiles_out"
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
@@ -2694,7 +2695,7 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -2721,7 +2722,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|builder-luna|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -2911,6 +2912,40 @@ PY
   expect_exit 2 spawn_base builder-kimi --role builder --lane builder-kimi-lane --parent parent-lane --effort high --job builder-kimi-effort-mutant )
 echo "PASS builder-kimi pilot profile reuses kimi-k3 kind/argv"
 
+# #633 (#594 E3): builder-luna is codex-luna under --role builder, launched at
+# the E3 effort (xhigh) and gated as the scopefuel-known codex-luna-max
+# spelling like every other luna variant.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+set +e
+builder_luna_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --job builder-luna-job --t T1 2>&1)"
+builder_luna_rc=$?
+set -e
+[[ "$builder_luna_rc" -eq 0 ]] ||
+  fail "builder-luna must be admitted under --role builder (rc=$builder_luna_rc): $builder_luna_out"
+grep -q 'model=builder-luna' <<<"$builder_luna_out" ||
+  fail "builder-luna spawn output lost its model: $builder_luna_out"
+builder_luna_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_luna_start" == 'agent start fixture --kind codex --pane w:p1 --timeout 120000 -- --yolo -m gpt-6-luna -c model_reasoning_effort=xhigh' ]] ||
+  fail "builder-luna must launch the codex-luna argv at effort xhigh: $builder_luna_start"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-luna-max" ]] ||
+  fail "builder-luna must gate as the scopefuel-known codex-luna-max spelling"
+grep -q 'policy launch codex-luna effort=xhigh' "$TMP/launch.log" ||
+  fail "builder-luna must consult the catalog for codex-luna at effort xhigh"
+python3 - "$ARBITER_INBOX_ROOT/builder-luna-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["owner_lane"] == "builder-luna-lane", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+# 급 가드 (grade guard): the catalog grades codex-luna per effort
+# (medium=B, max=A+) and the E3 sample is rated at xhigh, so any other
+# --effort is refused before gate/claim, exactly like builder-opus@high.
+expect_exit 2 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --effort max --job builder-luna-effort-mutant
+expect_exit 2 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --effort medium --job builder-luna-effort-low-mutant
+expect_exit 2 spawn_base builder-luna --job builder-luna-role-mutant --t T1
+echo "PASS builder-luna E3 profile launches codex-luna argv at xhigh"
+
 # The worker spellings the decision names for the pilot are admissible as
 # builders too, and keep their ordinary worker meaning.
 for pilot_alias in grok grok-hi kimi-k3; do
@@ -2942,7 +2977,7 @@ for rejected in codex-terra codex-luna oc-solar4 devin-ds41; do
   set -e
   [[ "$rejected_rc" -eq 2 ]] ||
     fail "--role builder must still reject $rejected with exit 2, got $rejected_rc: $rejected_out"
-  for named in builder-devin builder-grok builder-kimi devin-glm52 devin-swe17 devin-ds41; do
+  for named in builder-devin builder-grok builder-kimi builder-luna devin-glm52 devin-swe17 devin-ds41; do
     grep -q "$named" <<<"$rejected_out" ||
       fail "the --role builder refusal must list $named: $rejected_out"
   done
