@@ -572,6 +572,58 @@ devin_readiness_failure_case devin-explain-fail 4
 devin_readiness_failure_case devin-explain-garbage 1
 grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
   fail "malformed explain JSON lost its diagnostic: $DEVIN_CASE_OUT"
+
+# #604: the 2026-09-23 incident shape — explain answers a well-formed envelope
+# whose matched_rule is absent because no identity rule claimed the screen
+# (first-open trust prompt hypothesis). The spawn still fails, but the pane's
+# screen, transcript, explain JSON and process-info must survive the pane.
+devin_readiness_failure_case devin-explain-no-rule 1
+grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
+  fail "no-rule explain lost the incident diagnostic: $DEVIN_CASE_OUT"
+grep -q 'Devin spawn failure artifacts preserved under ' <<<"$DEVIN_CASE_OUT" ||
+  fail "604 failure artifacts were not announced: $DEVIN_CASE_OUT"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 artifact dir missing: $artifact_dir"
+[[ "$artifact_dir" == "$TMP/inbox/fixture/devin-spawn-failure-"* ||
+   "$artifact_dir" == "$(cd "$TMP" && pwd -P)/inbox/fixture/devin-spawn-failure-"* ]] ||
+  fail "604 artifacts must live in the job dir: $artifact_dir"
+grep -q 'reason=agent explain returned an invalid identity envelope' "$artifact_dir/reason.txt" ||
+  fail "604 reason.txt lost the failure reason"
+grep -q '"matched_rule":null' "$artifact_dir/explain.json" ||
+  fail "604 the explain envelope that failed was not preserved"
+grep -q 'fixture welcome screen' "$artifact_dir/screen-visible.txt" ||
+  fail "604 visible screen was not preserved"
+grep -q 'fixture welcome screen' "$artifact_dir/transcript.txt" ||
+  fail "604 transcript was not preserved"
+grep -q 'pane_id' "$artifact_dir/process-info.json" ||
+  fail "604 process-info was not preserved"
+echo "PASS 604-explain-no-rule-artifacts-preserved"
+
+# #604 hypothesis variant: a rule did match — the trust prompt — so the spawn
+# fails on the rule id, and the preserved visible screen carries the actual
+# cause the pane was showing.
+devin_readiness_failure_case devin-trust-screen 1
+grep -q 'expected agent=devin rule=welcome_prompt_footer, got agent=devin rule=trust_directory' <<<"$DEVIN_CASE_OUT" ||
+  fail "trust-screen explain lost its rule diagnostic: $DEVIN_CASE_OUT"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 trust-screen artifact dir missing"
+grep -q 'trust_directory' "$artifact_dir/explain.json" ||
+  fail "604 trust-screen explain.json was not preserved"
+grep -q 'Do you trust the contents of this directory?' "$artifact_dir/screen-visible.txt" ||
+  fail "604 trust-screen visible capture lost the prompt"
+echo "PASS 604-trust-screen-artifacts-preserved"
+
+# #604: preservation also covers the non-explain failures, and a failed
+# capture must never mask the spawn failure it documents. explain-fail leaves
+# explain.rc=4 instead of a stolen success.
+devin_readiness_failure_case devin-explain-fail 4
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" && -f "$artifact_dir/explain.rc" ]] ||
+  fail "604 explain-fail must still leave an artifact dir: $DEVIN_CASE_OUT"
+grep -qx 'rc=4' "$artifact_dir/explain.rc" ||
+  fail "604 explain-fail must record the explain rc: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+echo "PASS 604-explain-fail-artifacts-preserved"
+
 devin_readiness_failure_case devin-never-detect 1
 grep -q "Devin pane startup failed: agent not detected within 30000ms (agent_not_found x120)" <<<"$DEVIN_CASE_OUT" ||
   fail "never-detected Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"

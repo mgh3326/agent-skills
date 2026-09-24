@@ -187,7 +187,7 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy)
+          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-explain-no-rule|devin-trust-screen)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           devin-wrong-agent)
@@ -271,6 +271,19 @@ case "${1:-}" in
             ;;
           devin-explain-garbage)
             printf '%s\n' 'not json at all'
+            ;;
+          # #604: the 2026-09-23 incident shape — a well-formed envelope whose
+          # matched_rule is absent because no identity rule claimed the screen
+          # (first-open trust prompt hypothesis). wrk reads this as an invalid
+          # identity envelope.
+          devin-explain-no-rule)
+            printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle"}'
+            ;;
+          # #604 hypothesis variant: a rule did match — the trust prompt — so
+          # the identity check fails on the rule id, and only the preserved
+          # screen shows what the pane was actually asking.
+          devin-trust-screen)
+            printf '%s\n' '{"agent":"devin","matched_rule":{"id":"trust_directory","priority":130,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
             ;;
           devin-wrong-agent)
             printf '%s\n' '{"agent":"codex","matched_rule":{"id":"welcome_prompt_footer","priority":120,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
@@ -412,6 +425,14 @@ case "${1:-}" in
       else
         printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
       fi
+      exit 0
+    fi
+    if [[ "${2:-}" == read ]]; then
+      case "$scenario" in
+        devin-trust-screen) printf 'Do you trust the contents of this directory?\n' ;;
+        *) printf 'fixture welcome screen\n' ;;
+      esac
+      printf 'ACTUAL SCREEN LAST LINE\n'
       exit 0
     fi
     if [[ "${2:-}" == run && "$scenario" == devin-run-fail ]]; then
