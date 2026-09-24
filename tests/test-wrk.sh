@@ -829,6 +829,78 @@ for shell_err_pair in "start-not-ready:1:agent_not_ready" "start-pane-unavailabl
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "$shell_err_scenario delivered a brief"; fi
 done
 
+# #609: an accepted `agent start` whose binary never reaches the pane
+# foreground — the m1b shape, zsh answered "command not found: codex" — must
+# not receive a brief. Before any injection wrk polls process-info until a
+# foreground process's argv0 is the kind's canonical executable; the shell
+# alone, a shell child or an unrelated process are all "not the agent", and
+# the bounded window ends in fail-closed: pane closed, zero injections through
+# either path (panewire prompt or a direct agent prompt/send-keys).
+FG_PW_LOG="$TMP/foreground-panewire.log"
+fg_failure_case() {
+  local model="$1" scenario="$2" want_rc="$3" out rc
+  : >"$TMP/herdr.log"
+  rm -f "$FG_PW_LOG" "$FG_PW_LOG".*
+  set +e
+  out="$(WRK_PANEWIRE_PROMPT_LOG="$FG_PW_LOG" TEST_FIXTURE_SCENARIO="$scenario" spawn_base "$model" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq "$want_rc" ]] ||
+    fail "$model/$scenario expected rc=$want_rc, got rc=$rc: $out"
+  grep -q 'agent foreground check failed:' <<<"$out" ||
+    fail "$model/$scenario lost its foreground diagnostic: $out"
+  grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+    fail "$model/$scenario leaked the agent-less pane"
+  if grep -q '^agent prompt \|^agent send-keys \|^pane run .*-p\b' "$TMP/herdr.log"; then
+    fail "$model/$scenario injected into a pane without its agent"
+  fi
+  [[ ! -e "$FG_PW_LOG" ]] ||
+    fail "$model/$scenario delivered a panewire prompt without its agent"
+  FG_CASE_OUT="$out"
+}
+
+# The bare shell in the foreground is the incident shape, for a start-path
+# kind and for Devin's pane-run path alike.
+fg_failure_case opus agent-never-foreground 1
+grep -q 'agent not foreground within 10000ms (not-foreground x40)' <<<"$FG_CASE_OUT" ||
+  fail "never-foreground claude lost its bounded-window diagnostic: $FG_CASE_OUT"
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 41 ]] ||
+  fail "never-foreground claude must stop at the 10000/250 cap plus one diagnostic"
+fg_failure_case codex-terra agent-never-foreground 1
+fg_failure_case devin-swe2 agent-never-foreground 1
+# kiro's pre-brief /effort prompt is also an injection; the gate precedes it.
+# (`agent start` argv legitimately carries `--effort`, so assert on the prompt
+# verb, not the word.)
+fg_failure_case kiro agent-never-foreground 1
+if grep -q '^agent prompt w:p1 /effort' "$TMP/herdr.log"; then
+  fail "kiro /effort prompt reached a pane whose agent never foregrounded"
+fi
+# An unrelated process holding the foreground is not the agent either.
+fg_failure_case opus agent-foreground-other 1
+# Unreadable answers fail closed at once, like the Devin pre-run check.
+fg_failure_case opus agent-foreground-info-fail 1
+grep -q 'pane process-info exited 3 before brief injection' <<<"$FG_CASE_OUT" ||
+  fail "process-info failure lost its diagnostic: $FG_CASE_OUT"
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "process-info rc failure must fail on the first check, not be retried"
+fg_failure_case opus agent-foreground-garbage 1
+grep -q 'pane process-info returned an invalid envelope before brief injection' <<<"$FG_CASE_OUT" ||
+  fail "invalid foreground envelope lost its diagnostic: $FG_CASE_OUT"
+
+# The poll is real: a pane that foregrounds the agent two reads late still
+# spawns and lands exactly one brief.
+: >"$TMP/herdr.log"
+fg_late_out="$(TEST_FIXTURE_SCENARIO=agent-late-foreground spawn_base opus 2>&1)" ||
+  fail "late-foreground agent must still spawn: $fg_late_out"
+grep -q 'landed=yes' <<<"$fg_late_out" ||
+  fail "late-foreground agent did not land: $fg_late_out"
+[[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "late-foreground agent must receive exactly one brief"
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 3 ]] ||
+  fail "late-foreground agent must be admitted on the third process-info read"
+if grep -q '^pane close ' "$TMP/herdr.log"; then fail "late-foreground pane was closed"; fi
+echo "PASS task609 pre-injection foreground-agent check"
+
 # Window boundaries on a fake clock: every `date +%s` after the first agent
 # start (or, for Devin, the first process-info) reads FAKECLOCK_JUMP seconds
 # later. Each retry hands herdr only what is left of the window, and herdr

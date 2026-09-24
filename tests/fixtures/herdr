@@ -6,6 +6,16 @@ if [[ -n "${WRK_FIXTURE_LOG:-}" ]]; then
   printf '%s\n' "$*" >>"$WRK_FIXTURE_LOG"
 fi
 
+# #609: which executable holds the pane foreground is the fixture's own
+# state, not a function of the diagnostic call log — real herdr answers
+# `pane process-info` from the pane whether or not a log exists, and
+# plenty of spawn call sites set no WRK_FIXTURE_LOG. `agent start` and
+# `pane run` record the foregrounded kind here; `pane process-info`
+# reports it. Keyed by WRK_RUN_ID (one wrk process = one spawn attempt).
+fixture_foreground_file="${TMPDIR:-/tmp}/wrk-fixture-fg-${WRK_RUN_ID:-standalone}"
+fixture_set_foreground() { printf '%s\n' "$1" >"$fixture_foreground_file"; }
+fixture_foreground() { cat "$fixture_foreground_file" 2>/dev/null || true; }
+
 fixture_prompt_count() {
   [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]] || { printf '0\n'; return; }
   grep -c '^agent prompt ' "$WRK_FIXTURE_LOG" 2>/dev/null || true
@@ -127,7 +137,7 @@ fixture_brief_landed() {
   prompts="$(fixture_prompt_count)"
   recent_reads="$(fixture_recent_read_count)"
   case "$scenario" in
-    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy) return 0 ;;
+    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy|agent-late-foreground) return 0 ;;
     landing-retry|opencode-retry)
       if (( prompts >= 2 )); then return 0; fi
       ;;
@@ -374,6 +384,10 @@ case "${1:-}" in
             exit 3
             ;;
         esac
+        # A successful start foregrounds the agent's own executable — the
+        # canonical --kind (herdr's kind IS the binary name).
+        start_kind="$(sed -n 's/.* --kind \([^ ]*\).*/\1/p' <<<" $*")"
+        [[ -z "$start_kind" ]] || fixture_set_foreground "$start_kind"
         printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
         ;;
       send-keys)
@@ -398,9 +412,13 @@ case "${1:-}" in
           echo 'fixture herdr: tab create failed' >&2
           exit 9
         fi
+        # A fresh tab holds a fresh shell — clear any foreground state a
+        # same-PID predecessor run left behind.
+        rm -f "$fixture_foreground_file"
         printf '%s\n' '{"result":{"tab_id":"w:t1","root_pane":{"pane_id":"w:p1"}}}'
         ;;
       close)
+        rm -f "$fixture_foreground_file"
         printf '%s\n' '{"result":{"closed":"'"${3:-}"'"}}'
         ;;
       list)
@@ -460,24 +478,54 @@ case "${1:-}" in
     # devin-shell-busy shows an rc subprocess in the foreground for the first
     # WRK_FIXTURE_SHELL_BUSY_COUNT (default 3) calls; devin-shell-never-ready
     # always does.
+    # #609: once this spawn's own `pane run`/`agent start` was accepted, the
+    # pane foreground is the agent (real 0.9.1 shape measured 2026-09-24:
+    # argv0 is the canonical executable, the group leader is the agent pid).
+    # agent-never-foreground keeps answering shell-alone after an accepted
+    # start (the m1b "zsh: command not found: codex" shape); agent-late-
+    # foreground answers shell-alone for WRK_FIXTURE_FOREGROUND_DELAY (2)
+    # calls first; agent-foreground-other keeps an unrelated process in the
+    # foreground.
     if [[ "${2:-}" == process-info ]]; then
       case "$scenario" in
-        devin-process-info-fail)
+        devin-process-info-fail|agent-foreground-info-fail)
           printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture process-info failure"},"id":"cli:pane:process_info"}' >&2
           exit 3
           ;;
-        devin-process-info-garbage)
+        devin-process-info-garbage|agent-foreground-garbage)
           printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"pane_id":"w:p1","shell_pid":"4242"}}}'
+          exit 0
+          ;;
+        agent-never-foreground)
+          printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+          exit 0
+          ;;
+        agent-foreground-other)
+          printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["vim","notes.txt"],"argv0":"vim","cmdline":"vim notes.txt","cwd":"/tmp","name":"vim","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
           exit 0
           ;;
       esac
       infos="$(grep -c '^pane process-info ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
+      if [[ "$scenario" == agent-late-foreground &&
+            "$infos" -le "${WRK_FIXTURE_FOREGROUND_DELAY:-2}" ]]; then
+        printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+        exit 0
+      fi
       busy=0
       case "$scenario" in
         devin-shell-never-ready|devin-shell-never-ready-m1b) busy=1 ;;
         devin-shell-busy|devin-shell-busy-m1b)
           [[ "$infos" -le "${WRK_FIXTURE_SHELL_BUSY_COUNT:-3}" ]] && busy=1 ;;
       esac
+      agent_kind="$(fixture_foreground)"
+      if [[ -n "$agent_kind" ]]; then
+        # name is the agent's version string on a real pane (live 0.9.1:
+        # claude -> name "2.1.281"), never the kind — so a matcher that
+        # reads name instead of argv0/cmdline is caught by the tests.
+        printf '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["%s"],"argv0":"%s","cmdline":"%s","cwd":"/tmp","name":"9.9.9","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}\n' \
+          "$agent_kind" "$agent_kind" "$agent_kind"
+        exit 0
+      fi
       if [[ "$scenario" == *-m1b ]]; then
         # #604/m1b (hk:doc evidence/2026-09-24/task604-m1b-repro): the m1b
         # herdr 0.9.0 reply has no "result" wrapper and no
@@ -496,6 +544,9 @@ case "${1:-}" in
       fi
       exit 0
     fi
+    if [[ "${2:-}" == close ]]; then
+      rm -f "$fixture_foreground_file"
+    fi
     if [[ "${2:-}" == read ]]; then
       if [[ "$scenario" == devin-read-fail ]]; then
         printf 'fixture: pane read unavailable\n' >&2
@@ -512,6 +563,9 @@ case "${1:-}" in
       printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture pane run failure"}}' >&2
       exit 5
     fi
+    # A successful `pane run` is how the devin agent reaches the pane — it
+    # foregrounds the devin executable.
+    if [[ "${2:-}" == run ]]; then fixture_set_foreground devin; fi
     printf 'fixture pane %s\nACTUAL SCREEN LAST LINE\n' "${3:-unknown}"
     ;;
 esac

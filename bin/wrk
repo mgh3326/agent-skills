@@ -5,6 +5,10 @@ set -euo pipefail
 HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
 SCOPEFUEL="${SCOPEFUEL_BIN:-}"
 ARBITER="${ARBITER_BIN:-}"
+# #609: one wrk process is one spawn attempt; fixture herdr keys its pane
+# foreground state on this so process-info does not depend on a call log.
+# Real herdr never reads it.
+export WRK_RUN_ID="${WRK_RUN_ID:-$$}"
 # A live duplicate is an exact-once violation, distinct from generic CLI
 # misuse (2) and the arbiter's own duplicate result (4).  75 means that an
 # arbiter duplicate was observed but its state could not be proven safely.
@@ -1126,6 +1130,81 @@ agent_start_in_pane() {
     fi
     sleep_for "$SHELL_READY_POLL_SECONDS"
     now="$(date +%s)"
+  done
+}
+
+# #609: `agent start` (and Devin's `pane run`) can be accepted while the agent
+# binary never reaches the pane foreground — the m1b spawn ran `codex` on a
+# PATH that lacked it, zsh printed "command not found", and wrk still wrote
+# job.spawned and typed the brief into the bare shell. Before any prompt is
+# injected, poll process-info until the agent itself holds the foreground:
+# some foreground process whose argv0 is the kind's canonical executable
+# (herdr's `--kind` IS the executable name — measured 2026-09-24 on live
+# panes: claude -> argv0 "claude", devin -> "devin"). The shell alone, a shell
+# child, or an unrelated foreground process all mean "not ours yet"; the agent
+# is polled inside a bounded window, anything else fails closed so the pane is
+# closed and the quota record released instead of a brief landing in zsh.
+AGENT_FOREGROUND_TIMEOUT_MS=10000
+agent_foreground_diagnostics() {
+  local reason="$1"
+  echo "wrk: agent foreground check failed: $reason; pane=$PANE kind=$PROFILE_KIND" >&2
+  "$HERDR" pane process-info --pane "$PANE" >&2 ||
+    warn "agent foreground process-info failed for pane=$PANE"
+}
+
+agent_wait_foreground() {
+  local started_at attempts=0 max_attempts info_out info_rc ready
+  started_at="$(date +%s)"
+  max_attempts=$(( AGENT_FOREGROUND_TIMEOUT_MS / SHELL_READY_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    set +e
+    info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
+    info_rc=$?
+    set -e
+    if [[ "$info_rc" -ne 0 ]]; then
+      agent_foreground_diagnostics "pane process-info exited $info_rc before brief injection"
+      return 1
+    fi
+    set +e
+    ready="$(printf '%s' "$info_out" | python3 -c '
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(1)
+info = d.get("result") or {}
+info = info.get("process_info") or d.get("process_info")
+if not isinstance(info, dict):
+    raise SystemExit(1)
+procs = info.get("foreground_processes")
+if not isinstance(procs, list):
+    raise SystemExit(1)
+for p in procs:
+    if not isinstance(p, dict):
+        continue
+    names = [os.path.basename(str(p.get("argv0") or ""))]
+    cmd = str(p.get("cmdline") or "").split()
+    if cmd:
+        names.append(os.path.basename(cmd[0]))
+    if sys.argv[1] in names:
+        print("yes")
+        break
+else:
+    print("no")
+' "$PROFILE_KIND" 2>/dev/null)"
+    info_rc=$?
+    set -e
+    if [[ "$info_rc" -ne 0 ]]; then
+      agent_foreground_diagnostics "pane process-info returned an invalid envelope before brief injection"
+      return 1
+    fi
+    [[ "$ready" == yes ]] && return 0
+    if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= AGENT_FOREGROUND_TIMEOUT_MS )); then
+      agent_foreground_diagnostics "agent not foreground within ${AGENT_FOREGROUND_TIMEOUT_MS}ms (not-foreground x$attempts)"
+      return 1
+    fi
+    sleep_for "$SHELL_READY_POLL_SECONDS"
   done
 }
 
@@ -4059,6 +4138,13 @@ print(value if isinstance(value, str) else "")
     agent_start_in_pane
   fi
   sleep_for "$BOOT_SETTLE"
+  # #609: no prompt reaches the pane until the agent itself is observed in the
+  # foreground — an accepted start whose binary never ran (command not found)
+  # must close the pane, not receive a brief at the shell.
+  if ! agent_wait_foreground; then
+    spawn_pane_cleanup
+    return 1
+  fi
   if [[ "$PROFILE_KIND" == kimi ]]; then
     VISIBLE_SCREEN=""
     VISIBLE_SCREEN="$($HERDR agent read "$PANE" --lines 40 --source visible 2>/dev/null || true)"
