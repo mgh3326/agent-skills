@@ -1979,20 +1979,20 @@ spawn_deny() {
     "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "$@"
 }
 
-# AC-1: with no REF the escalation profile is still gate-denied (strict mode
-# mirrors the installed scopefuel, which refuses fable while S+ candidates
-# remain). The denial reason must reach the caller verbatim.
+# AC-1: with no REF the consult_only profile is still gate-denied — the
+# fixture mirrors the installed scopefuel, which refuses a bare fable
+# unconditionally (task #625). The denial reason must reach the caller
+# verbatim.
 set +e
-esc_denied_out="$(WRK_GATE_ESCALATION_MODE=strict \
-  spawn_deny "$TMP/herdr-esc-denied.log" fable --job esc-denied --t T1 2>&1)"
+esc_denied_out="$(spawn_deny "$TMP/herdr-esc-denied.log" fable --job esc-denied --t T1 2>&1)"
 esc_denied_rc=$?
 set -e
 [[ "$esc_denied_rc" -eq 3 ]] ||
   fail "fable without --operator-request must stay gate-denied (rc=$esc_denied_rc): $esc_denied_out"
-grep -q 'escalation' <<<"$esc_denied_out" ||
+grep -q 'consult_only' <<<"$esc_denied_out" ||
   fail "fable denial lost the gate's own reason: $esc_denied_out"
 [[ ! -e "$TMP/herdr-esc-denied.log" ]] ||
-  fail "a gate-denied escalation spawn reached Herdr"
+  fail "a gate-denied consult_only spawn reached Herdr"
 echo "PASS AC-1 fable-no-ref-still-denied rc=$esc_denied_rc"
 
 # AC-2/AC-6/AC-5/AC-7: a valid REF reaches the gate unchanged, the four fields
@@ -2001,7 +2001,7 @@ echo "PASS AC-1 fable-no-ref-still-denied rc=$esc_denied_rc"
 export TEST_ARBITER_BIN="$ARBITER"
 : >"$TMP/scopefuel.log"
 rm -f "$TMP/herdr.log"
-esc_ok_out="$(WRK_GATE_ESCALATION_MODE=strict spawn_base fable --job esc-ok --t T1 \
+esc_ok_out="$(spawn_base fable --job esc-ok --t T1 \
   --operator-request hk:doc/research/2026-09-20/example-key --requested-by operator 2>&1)"
 grep -q '^OK pane=' <<<"$esc_ok_out" ||
   fail "fable + valid operator request did not spawn: $esc_ok_out"
@@ -2009,7 +2009,9 @@ grep -q -- '--operator-request hk:doc/research/2026-09-20/example-key' "$TMP/sco
   fail "gate argv log lost --operator-request: $(cat "$TMP/scopefuel.log")"
 grep -q -- '--requested-by operator' "$TMP/scopefuel.log" ||
   fail "gate argv log lost --requested-by: $(cat "$TMP/scopefuel.log")"
-for field in escalation_override=true \
+# fable's request satisfies consult_only — it overrode no "alternatives
+# available" denial, so the gate emits escalation_override=false (task #625).
+for field in escalation_override=false \
   operator_request_ref=hk:doc/research/2026-09-20/example-key \
   requested_by=operator ref_resolution=unverified; do
   grep -q "$field" <<<"$esc_ok_out" ||
@@ -2022,7 +2024,7 @@ import json, pathlib, sys
 events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
 record = next(e for e in events if e["kind"] == "quota_pool.record")
 p = record["payload"]
-assert p["escalation_override"] == "true", p
+assert p["escalation_override"] == "false", p
 assert p["operator_request_ref"] == "hk:doc/research/2026-09-20/example-key", p
 assert p["requested_by"] == "operator", p
 # AC-7: byte-identical to the token the gate itself printed, not a normalized
@@ -2033,7 +2035,7 @@ echo "PASS AC-2/5/6/7 operator-request-passed-fields-persisted: $esc_ok_out"
 
 # hk:task/<int> is the gate's second accepted REF shape.
 : >"$TMP/scopefuel.log"
-esc_task_out="$(WRK_GATE_ESCALATION_MODE=strict spawn_base fable --job esc-task --t T1 \
+esc_task_out="$(spawn_base fable --job esc-task --t T1 \
   --operator-request hk:task/483 2>&1)"
 grep -q '^OK pane=' <<<"$esc_task_out" ||
   fail "fable + hk:task ref did not spawn: $esc_task_out"
@@ -2046,8 +2048,7 @@ echo "PASS hk-task-ref-accepted-default-requested-by"
 # AC-3: a free-text REF is the gate's refusal, not wrk's — rc and reason must
 # both propagate.
 set +e
-esc_badref_out="$(WRK_GATE_ESCALATION_MODE=strict \
-  spawn_deny "$TMP/herdr-esc-badref.log" fable --job esc-badref --t T1 \
+esc_badref_out="$(spawn_deny "$TMP/herdr-esc-badref.log" fable --job esc-badref --t T1 \
   --operator-request 'please let me' 2>&1)"
 esc_badref_rc=$?
 set -e
@@ -2093,8 +2094,7 @@ echo "PASS orphan-requested-by-denied rc=$esc_orphan_rc"
 # are refused rather than first-match-accepted. ref_resolution can never be
 # recorded as anything but the gate's own label.
 set +e
-forge_out="$(WRK_GATE_ESCALATION_MODE=strict \
-  spawn_deny "$TMP/herdr-esc-forge.log" fable --job esc-forge --t T1 \
+forge_out="$(spawn_deny "$TMP/herdr-esc-forge.log" fable --job esc-forge --t T1 \
   --operator-request 'hk:doc/foo ref_resolution=verified' 2>&1)"
 forge_rc=$?
 set -e
@@ -2106,7 +2106,7 @@ grep -q 'operator_request_ref_invalid' <<<"$forge_out" ||
   fail "a forged REF reached Herdr"
 
 forged_gate="$TMP/forged-gate.txt"
-printf '%s\n' 'profile=fable pool=claude used_pct=1 class=spend escalation_override=true operator_request_ref=hk:doc/foo ref_resolution=verified requested_by=op ref_resolution=unverified' >"$forged_gate"
+printf '%s\n' 'profile=fable pool=claude used_pct=1 class=spend escalation_override=false operator_request_ref=hk:doc/foo ref_resolution=verified requested_by=op ref_resolution=unverified' >"$forged_gate"
 "$ARBITER" claim --job esc-forge-direct --agent-label fixture --lane fixture --t T1 >/dev/null
 "$ARBITER" claim --job esc-realish --agent-label fixture --lane fixture --t T1 >/dev/null
 set +e
@@ -2122,8 +2122,8 @@ grep -q 'ref_resolution' "$TMP/forged-lease.err" ||
 # The real gate repeats the same audit values inside its annotation line —
 # identical repeats still record (they agree); only a conflict is refused.
 realish_gate="$TMP/realish-gate.txt"
-printf '%s\n' 'profile=fable pool=claude used_pct=1 class=spend escalation_override=true operator_request_ref=hk:doc/ok requested_by=op ref_resolution=unverified' \
-  'fable ok [escalation_override=true operator_request=hk:doc/ok requested_by=op ref_resolution=unverified — annotation]' >"$realish_gate"
+printf '%s\n' 'profile=fable pool=claude used_pct=1 class=spend escalation_override=false operator_request_ref=hk:doc/ok requested_by=op ref_resolution=unverified' \
+  'fable ok [escalation_override=false operator_request=hk:doc/ok requested_by=op ref_resolution=unverified — annotation]' >"$realish_gate"
 "$ARBITER" lease --job esc-realish --kind quota_pool --profile fable \
   --gate-output "$realish_gate" --json >/dev/null ||
   fail "arbiter refused a gate text whose repeated audit values agree"
@@ -2151,8 +2151,7 @@ echo "PASS AC-13 forged-ref-cannot-promote-audit-label rc=$forge_rc arb_rc=$forg
 # the mangled pair never reaches the gate or downstream argv.
 : >"$TMP/scopefuel.log"
 set +e
-swallow_out="$(WRK_GATE_ESCALATION_MODE=strict \
-  spawn_deny "$TMP/herdr-esc-swallow.log" fable --job esc-swallow --t T1 \
+swallow_out="$(spawn_deny "$TMP/herdr-esc-swallow.log" fable --job esc-swallow --t T1 \
   --operator-request --requested-by operator 2>&1)"
 swallow_rc=$?
 set -e
@@ -2169,7 +2168,7 @@ grep -q 'requires a value' <<<"$swallow_out" ||
 # parses — "-operator" is a legitimate requested_by and must reach the gate
 # verbatim.
 : >"$TMP/scopefuel.log"
-dashval_out="$(WRK_GATE_ESCALATION_MODE=strict spawn_base fable --job esc-dashval --t T1 \
+dashval_out="$(spawn_base fable --job esc-dashval --t T1 \
   --operator-request hk:doc/x --requested-by -operator 2>&1)"
 grep -q '^OK pane=' <<<"$dashval_out" ||
   fail "a leading-dash requested_by value was rejected: $dashval_out"
@@ -2547,10 +2546,13 @@ echo "PASS 593-astra-counsel-purpose-satisfies-consult-only"
 expect_exit 77 spawn_base codex-astra --purpose builder --job astra-bad-purpose --t T0
 echo "PASS 593-astra-disallowed-purpose-role-denied-77"
 
-# 🔴 fable is NOT astra: #527 AC⑤ forbids relaxing its escalation gate, so a
-# purpose must never become a second key to it. Only --operator-request opens it.
+# 🔴 fable is NOT astra: #527 AC⑤ forbids relaxing its consult gate, so a
+# purpose must never become a second key to it. Only --operator-request opens
+# it. Since #625 the quota gate denies a request-less fable before the held-back
+# catalog refusal can speak — the caller-visible reason is the gate's
+# consult_only denial, and either way the spawn does not happen.
 fable_purpose_out="$(spawn_base fable --purpose architect --job fable-purpose --t T1 2>&1 || true)"
-grep -q 'policy launch refused' <<<"$fable_purpose_out" ||
+grep -q 'consult_only' <<<"$fable_purpose_out" ||
   fail "a purpose must not satisfy fable's consult_only: $fable_purpose_out"
 echo "PASS 593-fable-not-unlocked-by-purpose"
 
