@@ -7,15 +7,51 @@ HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 ARBITER="$ROOT/bin/arbiter"
 TMP="$(mktemp -d)"
-# spawn 이 띄운 센티널은 nohup 으로 분리되어 있다 — 스위트가 끝나면 함께 거둔다.
+# 이 스위트가 띄운 sleep 은 환경(ARBITER_INBOX_ROOT 등)에 $TMP 를 달고 있다 —
+# run 소속을 정확히 식별하므로 다른 스위트의 sleep 은 절대 매치되지 않는다.
+suite_sleep_orphans() {
+  local pid
+  while IFS= read -r pid; do
+    if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qF -- "$TMP"; then
+      printf '%s\n' "$pid"
+    fi
+  done < <(pgrep -x sleep 2>/dev/null || true)
+}
+# spawn 이 띄운 센티널은 nohup 으로 분리되어 있다 — 스위트가 끝나면 그 자식
+# (interval 동안 살아남는 sleep)과 함께 거둔다. 센티널만 죽이면 sleep 이 orphan
+# 으로 남아 잡 디렉토리의 flock fd 를 interval 내내 잡고 있는다(#637, #682).
 cleanup() {
-  local pidfile pid
+  local pidfile pid child orphan escaped deadline
   while IFS= read -r pidfile; do
     [[ -s "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then kill "$pid" 2>/dev/null || true; fi
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    # STOP 으로 얼려 자식 목록과 kill 사이에 새 sleep 을 fork 하지 못하게 하고,
+    # 자식은 pid 로만 죽인다 — 이름 기반 pkill 은 타 스위트 프로세스를 친다.
+    kill -STOP "$pid" 2>/dev/null || true
+    while IFS= read -r child; do
+      kill "$child" 2>/dev/null || true
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+    kill "$pid" 2>/dev/null || true
+    kill -CONT "$pid" 2>/dev/null || true
   done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
+  # 실행 중간에 센티널이 먼저 죽은 경우 sleep 은 이미 init 아래로 reparent 됐다 —
+  # 환경 태그로 여전히 우리 것임을 식별해 거둔다.
+  deadline=$(( $(date +%s) + 5 ))
+  while :; do
+    escaped="$(suite_sleep_orphans)"
+    if [[ -z "$escaped" ]]; then break; fi
+    for orphan in $escaped; do kill "$orphan" 2>/dev/null || true; done
+    if (( $(date +%s) >= deadline )); then break; fi
+    sleep 0.2
+  done
   rm -rf "$TMP"
+  # 회귀 게이트: teardown 이 센티널 자식을 놓치면 조용히 새는 게 아니라 스위트가
+  # 실패해야 한다.
+  if [[ -n "$escaped" ]]; then
+    echo "FAIL: sentinel sleep children survived teardown: $escaped" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
