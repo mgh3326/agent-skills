@@ -319,8 +319,33 @@ agent_status_for_pane() {
     2>/dev/null
 }
 
+# #568: a folded-marker match must reproduce devin's observed submitted-prompt
+# rendering, not just the marker's characters scattered over a transcript.
+# The match must (a) contain a wrapped continuation — a newline followed by
+# indent, the shape observed in devin's submitted-prompt rendering
+# (`❭ <marker start>` + indented continuation) — and (b) start at a line
+# boundary or right after devin's `❭` prompt glyph.
+# Whitespace-only variants that never wrapped (a UI column tab between the
+# same words) and unrelated text carrying the words across a line break are
+# not folded markers and must not count as positive evidence.
+devin_folded_marker_present() {
+  local marker="$1"
+  python3 -c '
+import re, sys
+marker, recent = sys.argv[1], sys.stdin.read()
+pat = r"\s*".join(re.escape(c) for c in marker if not c.isspace())
+for m in re.finditer(pat, recent):
+    if not re.search(r"\n[ \t]", m.group(0)):
+        continue
+    line_start = recent.rfind("\n", 0, m.start()) + 1
+    if recent[line_start:m.start()].strip() in ("", "❭"):
+        sys.exit(0)
+sys.exit(1)
+' "$marker"
+}
+
 landing_check_once() {
-  local pane="$1" marker="$2" profile_kind="$3" recent visible status
+  local pane="$1" marker="$2" profile_kind="$3" submit="${4:-}" recent visible status
   LANDING_CHECK_LAST_EVIDENCE=none
   if ! recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
@@ -336,6 +361,17 @@ landing_check_once() {
   if [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$recent"; then
     LANDING_CHECK_LAST_EVIDENCE=marker
     LANDING_CHECK_LAST_REASON="marker-in-recent-unwrapped"
+    return 0
+  fi
+  # #568: Devin folds long lines at its render width, so the transcript's copy
+  # of the marker can carry a line break or indent the raw substring never
+  # matches (the 2026-09-22 t502-verify duplicate: rc 6, status=working,
+  # marker present but folded → reinjected into a working tester). Devin
+  # only; every other kind keeps the raw substring contract.
+  if [[ "$profile_kind" == devin && -n "$marker" && "$recent" == *$'\n'* ]] &&
+     devin_folded_marker_present "$marker" <<<"$recent"; then
+    LANDING_CHECK_LAST_EVIDENCE=devin-marker-folded
+    LANDING_CHECK_LAST_REASON="folded-marker-in-recent-unwrapped"
     return 0
   fi
   if ! visible="$("$HERDR" agent read "$pane" --source visible --lines 40 2>/dev/null)"; then
@@ -361,6 +397,18 @@ landing_check_once() {
   # the re-injection so a possibly queued payload is not duplicated. The
   # transcript marker above stays the only positive evidence. `0 queued` is
   # not a chip.
+  # #568: Devin's queued banner (`── N queued ──` / `○ msg` /
+  # `Press Enter to send queued messages now`, relay-handoff §3-2) means a
+  # payload is sitting in Devin's queue. Like grok's chip it cannot be
+  # attributed to THIS injection, so it is ambiguous evidence that suppresses
+  # re-injection — never positive.
+  if [[ "$profile_kind" == devin ]] &&
+     grep -Eq '── [0-9]+ queued ──|Press Enter to send queued messages now' <<<"$visible"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_EVIDENCE=devin-queued
+    LANDING_CHECK_LAST_REASON="devin-queue-banner-unattributable"
+    return 1
+  fi
   if [[ "$profile_kind" == grok ]] && grep -Eq '[1-9][0-9]* queued, Enter to send now' <<<"$visible"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_EVIDENCE=grok-queued
@@ -382,6 +430,25 @@ landing_check_once() {
     LANDING_CHECK_LAST_REASON="devin-post-prompt-status-${status}"
     return 0
   fi
+  # #568: delivery only runs after `agent wait --until idle` already saw the
+  # pane idle, so a Devin pane reporting working has consumed the submitted
+  # brief — nothing else was ever sent. `working` is positive evidence only
+  # for an accepted submit: after an unconfirmed one (a timeout can fall on
+  # either side of the send boundary) working cannot be attributed to this
+  # brief, so it is ambiguous — landed stays no and the possibly delivered
+  # brief is not duplicated. For other kinds the cold-boot caveat keeps
+  # `working` non-evidence.
+  if [[ "$profile_kind" == devin && "$status" == working ]]; then
+    if [[ "$submit" == accepted ]]; then
+      LANDING_CHECK_LAST_EVIDENCE=devin-status
+      LANDING_CHECK_LAST_REASON=devin-post-prompt-status-working
+      return 0
+    fi
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_EVIDENCE=devin-status-working
+    LANDING_CHECK_LAST_REASON="devin-working-unattributable-submit-${submit:-unknown}"
+    return 1
+  fi
   if [[ "$status" == working ]]; then
     LANDING_CHECK_LAST_REASON=working-without-positive-evidence
   else
@@ -391,7 +458,7 @@ landing_check_once() {
 }
 
 landing_check() {
-  local pane="$1" marker="$2" profile_kind="$3" tick delay
+  local pane="$1" marker="$2" profile_kind="$3" submit="${4:-}" tick delay
   LANDING_CHECK_CONFIRMED=0
   LANDING_CHECK_AMBIGUOUS=0
   LANDING_CHECK_AMBIGUOUS_REASON=""
@@ -401,7 +468,7 @@ landing_check() {
   LANDING_CHECK_LAST_REASON=not-observed
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
-    if landing_check_once "$pane" "$marker" "$profile_kind"; then return 0; fi
+    if landing_check_once "$pane" "$marker" "$profile_kind" "$submit"; then return 0; fi
     if [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 && -z "$LANDING_CHECK_AMBIGUOUS_REASON" ]]; then
       LANDING_CHECK_AMBIGUOUS_REASON="$LANDING_CHECK_LAST_REASON"
     fi
@@ -602,7 +669,9 @@ spawn_deliver_brief() {
       ;;
     daemon)
       spawn_herdr_fallback
-      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+      # The fallback injected through herdr directly, so a post-injection
+      # observation attaches to a delivery that definitely happened.
+      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" accepted; then
         LANDING=yes
       else
         detail="$(landing_check_detail)"
@@ -613,7 +682,7 @@ spawn_deliver_brief() {
   esac
 
   # accepted | unconfirmed: panewire could not prove it. Observe only.
-  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
     LANDING=yes
     return 0
   fi
@@ -630,7 +699,7 @@ spawn_deliver_brief() {
     case "$SPAWN_SUBMIT" in
       proven) LANDING=retry; return 0 ;;
       accepted|unconfirmed)
-        if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+        if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
           LANDING=retry
           return 0
         fi
@@ -901,11 +970,84 @@ spawn_pane_cleanup() {
 # bounded idle wait replaces agent-start's readiness wait, while the observed
 # explain envelope (`agent=devin`, `matched_rule.id=welcome_prompt_footer`)
 # replaces its agent_kind_mismatch ownership check.
+# #604: a failed Devin spawn used to leave one stderr line and a closed pane,
+# so the 2026-09-23 'invalid identity envelope' failures could not be diagnosed
+# after the fact (hypothesis: a first-open trust screen matched no identity
+# rule — unverifiable because nothing was preserved). Before the caller's
+# cleanup closes the pane, capture what it still shows into the job directory.
+# Every capture is best-effort and read-only: a preservation failure must not
+# mask, replace or worsen the spawn failure it documents. Raw captures use the
+# .out/.err/.rc extensions, never .json — the jobs root is scanned for event
+# envelopes with rglob("*.json"), and a capture holding 'not json at all' would
+# break those scans (CI, 2026-09-24).
+# explain_rc non-empty means the caller already ran `agent explain` and is
+# handing over THAT response — possibly empty stdout — as the response that
+# failed. It is preserved verbatim and never re-queried: a second explain
+# would capture a later, different response and the artifact would no longer
+# show what actually failed (CodeRabbit #122). explain_rc empty means the
+# caller never ran explain; detected=1 then re-queries, detected=0 records an
+# explicit skip so the absence does not read as "preservation forgot it".
+devin_preserve_failure_artifacts() {
+  local reason="$1" detected="${2:-0}" explain_rc="${3:-}" explain_json="${4:-}"
+  local dir out cap_rc
+  dir="$(wrk_jobs_root)/$JOB_ID"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/wrk-devin-failure.XXXXXX" 2>/dev/null)" || {
+      warn "Devin failure artifact preservation unavailable (job dir and tmpdir both unwritable)"
+      return 0
+    }
+  fi
+  out="$(mktemp -d "$dir/devin-spawn-failure-XXXXXXXX" 2>/dev/null)" || {
+    warn "Devin failure artifact dir could not be created under $dir"
+    return 0
+  }
+  {
+    printf 'reason=%s\n' "$reason"
+    printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'pane=%s\nlabel=%s\ncwd=%s\nmodel=%s\n' "$PANE" "$LABEL" "$CWD" "$MODEL"
+  } >"$out/reason.txt" 2>/dev/null ||
+    warn "Devin failure reason.txt could not be written under $out"
+  if [[ -n "$explain_rc" ]]; then
+    printf '%s' "$explain_json" >"$out/explain.out" 2>/dev/null ||
+      warn "Devin failure explain.out could not be written under $out"
+    printf 'rc=%s\n' "$explain_rc" >"$out/explain.rc" 2>/dev/null || true
+  elif [[ "$detected" -eq 1 ]]; then
+    set +e
+    "$HERDR" agent explain "$PANE" --format json >"$out/explain.out" 2>"$out/explain.err"
+    cap_rc=$?
+    set -e
+    printf 'rc=%s\n' "$cap_rc" >"$out/explain.rc" 2>/dev/null || true
+  else
+    printf 'rc=skipped\nreason=agent-not-detected\n' >"$out/explain.rc" 2>/dev/null || true
+  fi
+  # `pane read`/`pane process-info` do not require herdr to have detected an
+  # agent, so they also work for pre-detection and shell-only failures.
+  set +e
+  "$HERDR" pane read "$PANE" --source visible --lines 60 >"$out/screen-visible.txt" 2>"$out/screen-visible.err"
+  printf 'rc=%s\n' "$?" >"$out/screen-visible.rc"
+  "$HERDR" pane read "$PANE" --source recent-unwrapped --lines 200 >"$out/transcript.txt" 2>"$out/transcript.err"
+  printf 'rc=%s\n' "$?" >"$out/transcript.rc"
+  "$HERDR" pane process-info --pane "$PANE" >"$out/process-info.out" 2>"$out/process-info.err"
+  printf 'rc=%s\n' "$?" >"$out/process-info.rc"
+  set -e
+  echo "wrk: Devin spawn failure artifacts preserved under $out" >&2
+  printf '%s\n' "$out"
+}
+
 devin_spawn_diagnostics() {
-  local reason="$1"
+  local reason="$1" detected="${2:-0}" explain_rc="${3:-}" explain_json="${4:-}" out
   echo "wrk: Devin pane startup failed: $reason; pane=$PANE" >&2
-  "$HERDR" pane process-info --pane "$PANE" >&2 ||
-    warn "Devin pane process-info failed for pane=$PANE"
+  out="$(devin_preserve_failure_artifacts "$reason" "$detected" "$explain_rc" "$explain_json")"
+  # The operator-facing process-info dump replays the capture preservation just
+  # made: a second live call would change the pane-touch count the readiness
+  # failure contract pins (one check + one diagnostic).
+  if [[ -n "$out" && -d "$out" ]]; then
+    [[ ! -s "$out/process-info.out" ]] || cat "$out/process-info.out" >&2
+    [[ ! -s "$out/process-info.err" ]] || cat "$out/process-info.err" >&2
+  else
+    "$HERDR" pane process-info --pane "$PANE" >&2 ||
+      warn "Devin pane process-info failed for pane=$PANE"
+  fi
 }
 
 # `agent wait` does not wait for a pane herdr has not yet detected as an agent:
@@ -1072,6 +1214,15 @@ else:
 # only foreground process). A process-info failure or an envelope that cannot
 # be read fails closed at once; only "not ready yet" is polled, inside the same
 # window that detection and the idle wait then share.
+# #604/m1b: herdr's process-info shape is not identical everywhere — the m1b
+# 0.9.0 reply (hk:doc evidence/2026-09-24/task604-m1b-repro) carries
+# process_info without the "result" wrapper and without
+# foreground_process_group_id, but still names shell_pid and the foreground
+# list. That is a readable "not ready yet" (an rc-file subprocess like
+# compinit's grep holding the foreground), not an invalid envelope: readiness
+# is judged from shell_pid + foreground pids alone, the group id checked only
+# when present. What stays invalid — and fails closed at once — is an envelope
+# whose shell_pid/foreground list cannot be read at all.
 devin_wait_shell_ready() {
   local started_at="$1" attempts=0 max_attempts info_out info_rc ready
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
@@ -1088,16 +1239,23 @@ devin_wait_shell_ready() {
     set +e
     ready="$(printf '%s' "$info_out" | python3 -c '
 import json, sys
-info = json.load(sys.stdin)["result"]["process_info"]
-shell = info["shell_pid"]
-group = info["foreground_process_group_id"]
-procs = info["foreground_processes"]
-if type(shell) is not int or type(group) is not int or not isinstance(procs, list):
+d = json.load(sys.stdin)
+res = d.get("result")
+info = res.get("process_info") if isinstance(res, dict) else d.get("process_info")
+if not isinstance(info, dict):
     raise SystemExit(1)
-pids = [p["pid"] for p in procs]
-if any(type(pid) is not int for pid in pids):
+shell = info.get("shell_pid")
+group = info.get("foreground_process_group_id")
+procs = info.get("foreground_processes")
+if type(shell) is not int or not isinstance(procs, list):
     raise SystemExit(1)
-print("yes" if group == shell and pids and all(pid == shell for pid in pids) else "no")
+if group is not None and type(group) is not int:
+    raise SystemExit(1)
+pids = [p.get("pid") if isinstance(p, dict) else None for p in procs]
+ready = bool(pids) and all(pid == shell for pid in pids)
+if group is not None:
+    ready = ready and group == shell
+print("yes" if ready else "no")
 ' 2>/dev/null)"
     info_rc=$?
     set -e
@@ -1145,7 +1303,7 @@ devin_start_in_pane() {
   # negative timeout (it must not turn into an unbounded or undefined wait).
   remaining_ms=$(( START_TIMEOUT - ($(date +%s) - started_at) * 1000 ))
   if (( remaining_ms <= 0 )); then
-    devin_spawn_diagnostics "agent detected after the ${START_TIMEOUT}ms window"
+    devin_spawn_diagnostics "agent detected after the ${START_TIMEOUT}ms window" 1
     spawn_pane_cleanup
     return 1
   fi
@@ -1154,7 +1312,7 @@ devin_start_in_pane() {
   wait_rc=$?
   set -e
   if [[ "$wait_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "welcome_prompt_footer wait exited $wait_rc"
+    devin_spawn_diagnostics "welcome_prompt_footer wait exited $wait_rc" 1
     spawn_pane_cleanup
     return "$wait_rc"
   fi
@@ -1164,7 +1322,7 @@ devin_start_in_pane() {
   explain_rc=$?
   set -e
   if [[ "$explain_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "agent explain exited $explain_rc"
+    devin_spawn_diagnostics "agent explain exited $explain_rc" 1 "$explain_rc" "$explain_json"
     spawn_pane_cleanup
     return "$explain_rc"
   fi
@@ -1183,13 +1341,13 @@ print(agent + "\t" + rule)
   parse_rc=$?
   set -e
   if [[ "$parse_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "agent explain returned an invalid identity envelope"
+    devin_spawn_diagnostics "agent explain returned an invalid identity envelope" 1 "$explain_rc" "$explain_json"
     spawn_pane_cleanup
     return 1
   fi
   IFS=$'\t' read -r detected_agent matched_rule <<<"$identity"
   if [[ "$detected_agent" != devin || "$matched_rule" != welcome_prompt_footer ]]; then
-    devin_spawn_diagnostics "expected agent=devin rule=welcome_prompt_footer, got agent=$detected_agent rule=$matched_rule"
+    devin_spawn_diagnostics "expected agent=devin rule=welcome_prompt_footer, got agent=$detected_agent rule=$matched_rule" 1 "$explain_rc" "$explain_json"
     spawn_pane_cleanup
     return 1
   fi
@@ -1199,7 +1357,7 @@ print(agent + "\t" + rule)
   rename_rc=$?
   set -e
   if [[ "$rename_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "agent rename exited $rename_rc"
+    devin_spawn_diagnostics "agent rename exited $rename_rc" 1
     spawn_pane_cleanup
     return "$rename_rc"
   fi
