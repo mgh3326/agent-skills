@@ -2,8 +2,10 @@
 # #646: builder's follow-up injection section says what decides a suspected
 # unsubmitted prompt — the delivery row and the receiver's transcript, not
 # text on the input line — before any resend or Enter. Mutants: the bullet
-# removed, its verdict inverted, and the resend/Enter ordering dropped must
-# each turn the check RED by assertion.
+# removed, its verdict inverted, the resend/Enter ordering dropped, the
+# transcript message no longer tied to the delivery, and the zero-return basis
+# no longer scoped to herdr's API log must each turn the check RED by
+# assertion.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -38,6 +40,12 @@ def check(doc: str) -> None:
     )
     assert "panewire deliveries show" in sec, "deliveries read command missing"
     assert "transcript" in sec, "receiver transcript comparison missing"
+    assert re.search(r"그 delivery 의 시각·본문과\s*일치하는 user 메시지", sec), (
+        "transcript message must be identified by the delivery's time and text"
+    )
+    assert re.search(r"herdr API 로그에.{0,40}`send_keys`", sec) and re.search(
+        r"터미널에 붙은 사람의 키 입력은 그 로그에 남지 않는다", sec
+    ), "zero-return basis must be scoped to herdr's API log"
 
 
 check(text)
@@ -48,7 +56,15 @@ inverted = text.replace(
     "입력줄에 보이는 글은 미제출 증거가 아니다", "입력줄에 보이는 글은 미제출 증거다", 1
 )
 unordered = text.replace("재전송·Enter\n  전에 그 호출의", "나중에 그 호출의", 1)
-mutants = {"bullet-removed": removed, "verdict-inverted": inverted, "order-dropped": unordered}
+last_message = text.replace("그 delivery 의 시각·본문과\n  일치하는 user 메시지", "마지막 user 메시지", 1)
+unscoped = text.replace("(터미널에 붙은 사람의 키 입력은 그 로그에 남지 않는다)", "", 1)
+mutants = {
+    "bullet-removed": removed,
+    "verdict-inverted": inverted,
+    "order-dropped": unordered,
+    "transcript-last-message": last_message,
+    "return-count-unscoped": unscoped,
+}
 for name, doc in mutants.items():
     assert doc != text, f"fixture: mutant {name} did not change the text"
     try:
