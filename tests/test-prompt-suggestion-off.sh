@@ -14,8 +14,9 @@
 # wrk carries it in the pane env (herdr `tab create --env`), so these cases read
 # the fixture herdr log: the env is on every Claude profile's tab, on no other
 # kind's, the `agent start` argv is unchanged, and `--purpose director` (a
-# resident session — the operator's call) is left alone. The remote case runs
-# the ssh-forwarded `wrk spawn --host local` for real against the same fixture.
+# resident session — the operator's call) is left alone. The ssh case runs the
+# forwarded `wrk spawn --host local` for real against the same fixture; the hub
+# case replays the /v1/spawn args as the receiving node's command line.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -197,6 +198,64 @@ tab_has_setting "remote opus" "$log" || exit 1
 log="$(remote_log codex-sol)"
 tab_lacks_setting "remote codex-sol" "$log" || exit 1
 echo "PASS remote-ssh spawn remote-side tab-env=CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false (codex unset)"
+
+# Hub spawn: the local side POSTs /v1/spawn with the forwarded args; the
+# receiving node runs `wrk spawn -c <cwd> -p <brief> --host local -w <ws>
+# <args>` (panewire hub_spawn_node.go runHubSpawnCommand, origin/main 20d9567).
+# The request below comes from the real local wrk through the curl fixture;
+# its args are then replayed exactly as that node command line, so the
+# node-side resolve_profile is the one under test.
+printf '%s\n' 'PANEWIRE_OPERATOR_TOKEN=fixture-operator' >"$TMP/operator.env"
+printf '%s\n' 'CF_ACCESS_CLIENT_ID=fixture-id' 'CF_ACCESS_CLIENT_SECRET=fixture-secret' >"$TMP/cf.env"
+printf '%s\n' '[hub]' 'hub_url = "wss://hub.fixture.invalid"' 'hub_token_env = "/tmp/node-token.env"' \
+  "hub_cf_env = \"$TMP/cf.env\"" "operator_token_env = \"$TMP/operator.env\"" '' \
+  '[hosts.machine-a]' 'via = "hub"' 'ssh = "machine-a"' 'herdr_session = "worker"' 'workspace = "worker"' \
+  "cwd_map = {\"$ROOT\"=\"$REMOTE_CWD\"}" "cwd_keys = {\"$ROOT\"=\"repo-a\"}" 'capacity = 3' >"$TMP/hub-hosts.toml"
+hub_log() {
+  local model="$1"; shift
+  : >"$TMP/hub.log"; : >"$TMP/hub-local-herdr.log"; : >"$TMP/hub-node-herdr.log"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ROOT/bin/arbiter" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_HOSTS_CONFIG="$TMP/hub-hosts.toml" \
+    WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" WRK_HUB_SCENARIO=hub200 \
+    WRK_SPILLOVER_LOG="$TMP/spillover.log" \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/hub-local-herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$model-$RANDOM" --host machine-a "$@" \
+    >/dev/null 2>>"$TMP/wrk.stderr" ||
+    { echo "ERROR: hub spawn -m $model exited non-zero: $(tail -n 3 "$TMP/wrk.stderr")" >&2; return 99; }
+  # The local side must not have spawned anything itself (a sentinel probe
+  # such as `agent get` may still land in its log).
+  ! grep -Eq '^(tab create|agent start) ' "$TMP/hub-local-herdr.log" ||
+    { echo "ERROR: hub spawn created a local pane" >&2; return 99; }
+  local -a node_args=()
+  mapfile -t node_args < <(python3 - "$TMP/hub.log" <<'PY2'
+import json, sys
+posts = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")
+         if line.strip() and json.loads(line)["method"] == "POST"]
+assert len(posts) == 1, posts
+print("\n".join(json.loads(posts[0]["body"])["args"]))
+PY2
+  ) || return 99
+  [[ " ${node_args[*]} " == *" -m $model "* ]] || { echo "ERROR: hub args lost -m $model: ${node_args[*]}" >&2; return 99; }
+  env HERDR_BIN="$HERDR" HERDR_SESSION=worker SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/hub-node-herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+    "$WRK" spawn -c "$REMOTE_CWD" -p "$PROMPT" --host local -w worker "${node_args[@]}" >/dev/null 2>>"$TMP/wrk.stderr" ||
+    { echo "ERROR: node-side replay exited non-zero: $(tail -n 3 "$TMP/wrk.stderr")" >&2; return 99; }
+  cat "$TMP/hub-node-herdr.log"
+}
+log="$(hub_log opus)"
+grep -q "^tab create --workspace worker --cwd $REMOTE_CWD " <<<"$log" ||
+  fail "hub node replay did not reach tab create: $log"
+tab_has_setting "hub opus" "$log" || exit 1
+log="$(hub_log opus --purpose director)"
+tab_lacks_setting "hub opus --purpose director" "$log" || exit 1
+log="$(hub_log codex-sol)"
+tab_lacks_setting "hub codex-sol" "$log" || exit 1
+echo "PASS hub spawn node-side tab-env=CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false (director, codex unset)"
 
 # Mutants: each must go RED through an assertion (rc 1), not an error.
 expect_red() {

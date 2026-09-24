@@ -48,11 +48,17 @@ EXPECTED_BLOCK = """<!-- untagged-operator-confirmation:start -->
 - 문서 가드: agent-skills 레포에서 `VERDICT_DOC=<verdict 경로> bash tests/test-untagged-operator-evidence.sh` 가 RED 면 그 verdict 는 쓰지 않는다.
 <!-- untagged-operator-confirmation:end -->"""
 
-# An operator confirmation claim: 운영자/operator followed closely by a
-# confirm/approve/report word, in either language.
-OPERATOR_CLAIM = re.compile(
-    r"(운영자|operator)[^\n]{0,12}?"
-    r"(확인|승인|보고|컨펌|오케이|\bOK\b|confirm|approv|verif|report)",
+# An operator confirmation claim. Korean: 운영자 and a confirm/approve/report
+# word on the same line — not adjacent: a real verdict wrote "운영자가 NCP 워커
+# env 에 두 키가 있음을 확인". English: "operator" and a whole-word confirm verb
+# in the same clause, since "operator" is also an auth role in these docs
+# ("operator bearer auth …; verified against"). The operator-desk and
+# operator-request identifiers are not the operator speaking.
+KO_OPERATOR = re.compile(r"운영자")
+KO_CLAIM = re.compile(r"확인|승인|보고|컨펌|오케이|전달|\bOK\b", re.I)
+EN_CLAIM = re.compile(
+    r"\boperator\b(?!-desk|-request)[^.;\n]{0,30}?"
+    r"\b(?:confirm(?:ed|s)?|approv(?:ed|es|al)|verified|said|told|reported|OK)\b",
     re.I,
 )
 # The two accepted provenance tags (contract block): an operator-desk relay
@@ -67,17 +73,53 @@ REJECTION = re.compile(r"증거\s*아님|증거가\s*아니|not\s+evidence", re.
 # record, not a verdict.
 VERDICT_LABEL = re.compile(r"(?:\b(?:verdict|result)\b|판정|결론)[\s*_`]*[:=：](.*)", re.I)
 STRUCK = re.compile(r"~~.*?~~")
+# A switch to PASS stated without a label: an "… → PASS" line, or a heading
+# that names the switch ("# PASS 전환"). Prose mentioning a switch ("PASS 로
+# 전환하지 않음", "PASS 전환 조건") is not one, nor is a condition or an
+# invalidation.
+ARROW_PASS = re.compile(r"→\s*[*_`]*PASS\b", re.I)
+HEADING_PASS = re.compile(r"\bPASS\s*(?:로|으로)?\s*전환", re.I)
+NOT_A_SWITCH = re.compile(r"가능|조건|무효|취소|않|\bVOID\b|invalid", re.I)
+# A voided section keeps the old record for audit; its heading is struck
+# through or marked VOID. An invalidation section ("# PASS 전환 무효 …") is
+# not void — it holds the live verdict, so what follows it is still read.
+VOID_HEADING = re.compile(r"~~|\bVOID\b", re.I)
+HEADING = re.compile(r"^(#{1,6})\s")
 
 
-def declares_pass(verdict_text: str) -> bool:
+def live_lines(verdict_text: str, void_scope: bool = True) -> list[str]:
+    """Lines outside voided sections (a void heading covers its subsections)."""
+    lines, void_level = [], None
     for line in verdict_text.splitlines():
-        match = VERDICT_LABEL.search(STRUCK.sub("", line))
-        if not match:
-            continue
-        value = match.group(1).split("(", 1)[0].strip(" *_`>")
-        if re.match(r"PASS\b", value) or re.search(r"→\s*[*_`]*PASS\b", value):
+        heading = HEADING.match(line)
+        if heading:
+            level = len(heading.group(1))
+            if void_level is not None and level <= void_level:
+                void_level = None
+            if void_scope and void_level is None and VOID_HEADING.search(line):
+                void_level = level
+        if void_level is None:
+            lines.append(line)
+    return lines
+
+
+def declares_pass(lines: list[str], switches: bool = True) -> bool:
+    for line in lines:
+        live = STRUCK.sub("", line)
+        match = VERDICT_LABEL.search(live)
+        if match:
+            value = match.group(1).split("(", 1)[0].strip(" *_`>")
+            if re.match(r"PASS\b", value) or re.search(r"→\s*[*_`]*PASS\b", value):
+                return True
+        if switches and not NOT_A_SWITCH.search(live) and (
+            ARROW_PASS.search(live) or (HEADING.match(live) and HEADING_PASS.search(live))
+        ):
             return True
     return False
+
+
+def is_operator_claim(line: str) -> bool:
+    return bool((KO_OPERATOR.search(line) and KO_CLAIM.search(line)) or EN_CLAIM.search(line))
 
 
 def extract_block(text: str) -> str:
@@ -94,15 +136,27 @@ def assert_contracts(builder_text: str, spawn_worker_text: str) -> None:
     assert builder_block == EXPECTED_BLOCK, "contract block differs from canonical text"
 
 
-def untagged_operator_basis(verdict_text: str) -> list[str]:
-    """Lines a PASS verdict grounds on an untagged operator confirmation."""
-    if not declares_pass(verdict_text):
+def untagged_operator_basis(
+    verdict_text: str,
+    *,
+    claim=is_operator_claim,
+    void_scope: bool = True,
+    switches: bool = True,
+    pass_scope: bool = True,
+    tag: bool = True,
+) -> list[str]:
+    """Lines a PASS verdict grounds on an untagged operator confirmation.
+
+    The keyword arguments exist for the mutants below; callers use defaults.
+    """
+    lines = live_lines(verdict_text, void_scope)
+    if pass_scope and not declares_pass(lines, switches):
         return []
     return [
         line.strip()
-        for line in verdict_text.splitlines()
-        if OPERATOR_CLAIM.search(line)
-        and not PROVENANCE_TAG.search(line)
+        for line in lines
+        if claim(line)
+        and not (tag and PROVENANCE_TAG.search(line))
         and not REJECTION.search(line)
     ]
 
@@ -136,6 +190,9 @@ INCIDENT_SUBMITTED_TEXT = """판정: PASS
 ENGLISH = """Verdict: PASS
 - env keys present — operator confirmed both keys on the node
 """
+ENGLISH_HYPHEN = """Verdict: PASS
+- deploy step allowed (operator-approved one-off exception)
+"""
 TAG_ELSEWHERE = """판정: PASS
 - 참고 문서: hk:doc task/2026-09-24/phantom-suggestion-submitted
 - AC3: 운영자 승인 받음
@@ -155,11 +212,33 @@ REAL_SWITCH = """# PASS 전환 — 라운드 2 head `9e3f7cb` (2026-09-24)
 
 - 배포 env: 이번 운영자 확인으로 충족됨.
 """
+# Round-1 tester repros: the claim word far from 운영자, a heading-only
+# switch, and a label-less switch line.
+FAR_CLAIM = """판정: PASS
+| 운영자가 NCP 워커 env 에 두 키가 있음을 확인 | ✅ | 두 키 모두 non-empty |
+"""
+HEADING_SWITCH = """# PASS 전환 — head `9e3f7cb`
+
+| 운영자 보고: 두 키 모두 non-empty | ✅ |
+"""
+SWITCH_LINE = """- AC3 워커 env: 운영자 확인됨 → PASS
+"""
+# A PASS appended after an invalidation section is still read.
+AFTER_INVALIDATION = """# PASS 전환 무효 — head `9e3f7cb` 판정 = FAIL (OPS-HOLD) 복귀
+
+판정: PASS
+- AC3: 운영자 확인 완료
+"""
 red_cases = {
     "real-t312-pass-switch": REAL_SWITCH,
+    "claim-word-far-from-operator": FAR_CLAIM,
+    "heading-only-switch": HEADING_SWITCH,
+    "label-less-switch-line": SWITCH_LINE,
+    "pass-after-invalidation-section": AFTER_INVALIDATION,
     "incident-shape": INCIDENT,
     "incident-submitted-text": INCIDENT_SUBMITTED_TEXT,
     "english": ENGLISH,
+    "english-operator-approved": ENGLISH_HYPHEN,
     "tag-on-another-line": TAG_ELSEWHERE,
 }
 
@@ -191,12 +270,48 @@ REAL_RESTORED = """# t312-verify — 독립 검증 판정
 
 - ~~**verdict: PASS**~~ → 무효
 
+## 전환 근거
+
 | 운영자가 노드 워커 env 에 두 키가 있음을 확인 | ✅ | 운영자 보고: 두 키 모두 non-empty |
 
 # PASS 전환 무효 — head `9e3f7cb` 판정 = FAIL (OPS-HOLD) 복귀
 """
+# A new head's PASS in a file that keeps a voided switch as history: the void
+# heading covers its subsections, and the next same-level heading ends it.
+PASS_WITH_VOID_HISTORY = """판정: PASS — head `def5678` (코드·테스트 근거)
+
+# ~~PASS 전환~~ [VOID] — head `9e3f7cb`
+
+## 전환 근거
+
+| 운영자 보고: 두 키 모두 non-empty | ✅ |
+
+# 라운드 3
+
+- AC1~AC3 테스트 원문 확인
+"""
+CONDITION_ONLY = """## 판정: FAIL
+- PASS 전환 조건: 운영자 확인 hk 기록 필요
+"""
+# Prose from the real t312 round 2 (FAIL): mentions of a switch that did not
+# happen are not PASS declarations.
+SWITCH_PROSE = """## 판정: FAIL (OPS-HOLD)
+  - B1 의 운영 전제 1건만 미확인이어서 PASS 로 전환하지 않음.
+**사전 승인된 PASS 전환 (head 가 그대로일 때):**
+1. 운영자가 노드 워커 env 에 두 키가 있음을 확인
+- scopefuel: PASS 전환 때는 rep 을 기록하지 않았음.
+"""
+# Real PASS reports where "operator" is a role, not a confirmation.
+ENGLISH_ROLE = """Verdict: PASS
+- `GET /v1/placement/slots`: operator bearer auth (401 unauthenticated; verified against the fixture)
+RISKS: the operator's advertised `relay test` is a stub, so routing/delivery can be reported read-only
+"""
 green_cases = {
     "real-t312-restored": REAL_RESTORED,
+    "english-operator-role": ENGLISH_ROLE,
+    "pass-with-voided-history": PASS_WITH_VOID_HISTORY,
+    "condition-not-switch": CONDITION_ONLY,
+    "real-t312-switch-prose": SWITCH_PROSE,
     "hk-tagged": HK_TAGGED,
     "relay-tagged": RELAY_TAGGED,
     "rejected": REJECTED,
@@ -226,21 +341,13 @@ def expect_assertion(label, callback):
     raise AssertionError(f"{label} mutant did not go RED")
 
 
-def lint_guard_removed(_text):
-    return []
+ADJACENT_ONLY = re.compile(
+    r"(운영자|operator)[^\n]{0,12}?(확인|승인|보고|컨펌|오케이|\bOK\b|confirm|approv|verif|report)", re.I
+)
 
 
-def lint_tag_ignored(text):
-    if not declares_pass(text):
-        return []
-    return [l for l in text.splitlines() if OPERATOR_CLAIM.search(l) and not REJECTION.search(l)]
-
-
-def lint_pass_ignored(text):
-    return [
-        l for l in text.splitlines()
-        if OPERATOR_CLAIM.search(l) and not PROVENANCE_TAG.search(l) and not REJECTION.search(l)
-    ]
+def lint_variant(**overrides):
+    return lambda text: untagged_operator_basis(text, **overrides)
 
 
 drifted_builder = builder_text.replace("hk 기록으로만", "hk 기록으로", 1).replace(
@@ -251,9 +358,13 @@ mutants = [
     ("contract-drift", lambda: assert_contracts(drifted_builder, spawn_worker_text)),
     ("contract-removed", lambda: assert_contracts(
         builder_text.replace(extract_block(builder_text), ""), spawn_worker_text)),
-    ("guard-removed", lambda: assert_verdict_cases(lint_guard_removed)),
-    ("tag-check-removed", lambda: assert_verdict_cases(lint_tag_ignored)),
-    ("pass-scope-removed", lambda: assert_verdict_cases(lint_pass_ignored)),
+    ("guard-removed", lambda: assert_verdict_cases(lambda _text: [])),
+    ("tag-check-removed", lambda: assert_verdict_cases(lint_variant(tag=False))),
+    ("pass-scope-removed", lambda: assert_verdict_cases(lint_variant(pass_scope=False))),
+    ("void-scope-removed", lambda: assert_verdict_cases(lint_variant(void_scope=False))),
+    ("switch-detection-removed", lambda: assert_verdict_cases(lint_variant(switches=False))),
+    ("adjacent-claim-only", lambda: assert_verdict_cases(
+        lint_variant(claim=lambda line: bool(ADJACENT_ONLY.search(line))))),
 ]
 for label, callback in mutants:
     expect_assertion(label, callback)
