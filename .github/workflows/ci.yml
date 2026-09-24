@@ -38,6 +38,7 @@ jobs:
             tests/test-installer-route.sh \
             tests/test-installer-deploy-record.sh \
             tests/test-prompt-suggestion-off.sh \
+            tests/test-resume-settings.sh \
             tests/test-untagged-operator-evidence.sh \
             tests/test-event-monitor-doc.sh \
             tests/test-decision-request-doc.sh \
@@ -59,6 +60,7 @@ jobs:
           bash tests/test-installer-route.sh
           bash tests/test-installer-deploy-record.sh
           bash tests/test-prompt-suggestion-off.sh
+          bash tests/test-resume-settings.sh
           bash tests/test-untagged-operator-evidence.sh
           bash tests/test-event-monitor-doc.sh
           bash tests/test-decision-request-doc.sh

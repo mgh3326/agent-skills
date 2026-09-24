@@ -10,3 +10,8 @@ worker-brief*.md
 
 # 실제 denylist는 개인 값(비공개 이슈 ID 등)이라 repo에는 .example만 둔다
 linear-archive/denylist.txt
+
+# #637: wrk writes a claude worker's per-worktree local settings here so a
+# herdr reboot restore (`claude --resume`) re-reads them; per-worker state,
+# never committed.
+.claude/settings.local.json
