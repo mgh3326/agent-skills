@@ -16,7 +16,10 @@ legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`
 제외) · 라운드 상한 3 · 독립 tester는 타사 provider family(§2-4 동일 계열 예외 적용) · 배포·라이브
 매매 표면 제외**, 되돌리기 조건, 결정 기록과 다음 재판단의 **정본은 `spawn-worker` §2-2 급표의
 `builder-devin` 행**이다(두 문서가 어긋나면 그 행을 따른다). `builder-kimi`는 아직 파일럿 전이라
-열려만 있다. 세 프로필 모두 각각 devin-swe2·grok 4.7 xhigh·kimi-k3의 argv를 재사용하며, 워커 철자
+열려만 있다. `builder-luna`는 #594 E3 실험 표본용으로 열려 있으며 codex-luna(gpt-6-luna)의 argv를
+effort `xhigh`로 고정 재사용한다(그 외 `--effort`는 wrk가 거부; 급 상한은 카탈로그가 xhigh에 매기는
+급 — `spawn-worker` §2-2 급표의 `builder-luna` 행을 따르고, 브리프에 `exp=E3` 태그·reps 기록이
+의무다). 세 프로필 모두 각각 devin-swe2·grok 4.7 xhigh·kimi-k3의 argv를 재사용하며, 워커 철자
 `devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. `builder-grok`·`builder-kimi`의
 **정식 등재와 T2 확대는 프로필당 표본 3(빌더 역할 reps)에서 재판단**하며, 라운드 상한 초과나 게이트
 BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌리기 조건이다).
