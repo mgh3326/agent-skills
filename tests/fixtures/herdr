@@ -187,7 +187,7 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-explain-no-rule|devin-trust-screen)
+          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-explain-no-rule|devin-trust-screen|devin-read-fail)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           devin-wrong-agent)
@@ -276,7 +276,7 @@ case "${1:-}" in
           # matched_rule is absent because no identity rule claimed the screen
           # (first-open trust prompt hypothesis). wrk reads this as an invalid
           # identity envelope.
-          devin-explain-no-rule)
+          devin-explain-no-rule|devin-read-fail)
             printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle"}'
             ;;
           # #604 hypothesis variant: a rule did match — the trust prompt — so
@@ -428,6 +428,10 @@ case "${1:-}" in
       exit 0
     fi
     if [[ "${2:-}" == read ]]; then
+      if [[ "$scenario" == devin-read-fail ]]; then
+        printf 'fixture: pane read unavailable\n' >&2
+        exit 9
+      fi
       case "$scenario" in
         devin-trust-screen) printf 'Do you trust the contents of this directory?\n' ;;
         *) printf 'fixture welcome screen\n' ;;

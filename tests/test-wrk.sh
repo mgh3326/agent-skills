@@ -630,6 +630,28 @@ grep -qx 'rc=4' "$artifact_dir/explain.rc" ||
   fail "604 explain-fail must record the explain rc: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
 echo "PASS 604-explain-fail-artifacts-preserved"
 
+# #604 (tester round 1): a pre-detection failure must not query agent
+# endpoints, but it still owes the artifact set an explicit explain outcome —
+# rc=skipped, not an absent file that reads as "preservation forgot it".
+devin_readiness_failure_case devin-get-error 1
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 get-error artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=skipped' "$artifact_dir/explain.rc" ||
+  fail "604 pre-detection failure must record explain rc=skipped: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+echo "PASS 604-pre-detection-explain-skip-recorded"
+
+# #604 (tester round 1, minor): a failed pane-read capture must not mask,
+# replace or worsen the spawn failure it documents — rc stays 1 and the rest
+# of the artifact set is still written.
+devin_readiness_failure_case devin-read-fail 1
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 read-fail artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=9' "$artifact_dir/screen-visible.rc" ||
+  fail "604 read-fail must record the capture rc: $(cat "$artifact_dir/screen-visible.rc" 2>/dev/null)"
+grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
+  fail "604 read-fail must still preserve the explain envelope"
+echo "PASS 604-capture-failure-does-not-mask-spawn-rc"
+
 devin_readiness_failure_case devin-never-detect 1
 grep -q "Devin pane startup failed: agent not detected within 30000ms (agent_not_found x120)" <<<"$DEVIN_CASE_OUT" ||
   fail "never-detected Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"
@@ -638,6 +660,10 @@ grep -q "Devin pane startup failed: agent not detected within 30000ms (agent_not
 if grep -q '^agent wait \|^agent explain ' "$TMP/herdr.log"; then
   fail "never-detected Devin waited or explained an undetected pane"
 fi
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 never-detect artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=skipped' "$artifact_dir/explain.rc" ||
+  fail "604 never-detect must record explain rc=skipped: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
 
 # Detection on the window edge: a fake clock (only `date +%s` is faked) puts
 # every reading after the first 31s past pane run. Detection succeeds on the

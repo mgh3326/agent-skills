@@ -930,6 +930,11 @@ devin_preserve_failure_artifacts() {
     cap_rc=$?
     set -e
     printf 'rc=%s\n' "$cap_rc" >"$out/explain.rc" 2>/dev/null || true
+  else
+    # Pre-detection failures must not query agent endpoints, but the artifact
+    # set still records the explain outcome explicitly rather than leaving an
+    # absence that reads as "preservation forgot it".
+    printf 'rc=skipped\nreason=agent-not-detected\n' >"$out/explain.rc" 2>/dev/null || true
   fi
   # `pane read`/`pane process-info` do not require herdr to have detected an
   # agent, so they also work for pre-detection and shell-only failures.
