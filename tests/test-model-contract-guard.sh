@@ -190,6 +190,11 @@ grep -qE 'codex-astra\).*DEFAULT_EFFORT=max' "$WRK" &&
 echo "PASS codex-astra takes its default effort from the catalog (no max pin)"
 
 # --- every unreachable-canon path marks the brief catalog=stale -------------
+# The marker is a `wrk-note:` line right after the expect: header (#667) —
+# deployed panewire accepts only name/label/cwd/title~/recent~ there and
+# refuses anything else with rc=5 before the send boundary, which silently
+# dropped the whole brief when the marker rode on expect:. Two lines are read
+# so the marker is visible either way.
 brief_header() {
   local mode="$1" scopefuel_bin="$2" model="${3:-codex-sol}"
   rm -rf "$TMP/inbox"
@@ -199,7 +204,7 @@ brief_header() {
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
     "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 >/dev/null 2>&1 || true
-  head -n 1 "$(find "$TMP/inbox" -name 'spawn-brief-*' -type f | head -n 1)" 2>/dev/null
+  head -n 2 "$(find "$TMP/inbox" -name 'spawn-brief-*' -type f | head -n 1)" 2>/dev/null
 }
 
 # A negative assertion on a header that may not exist passes for the wrong
@@ -232,6 +237,38 @@ assert_header_present "route-404" "$header"
 grep -q 'catalog=stale' <<<"$header" &&
   fail "a 404 catalog route must not mark the brief stale; got: $header"
 echo "PASS a server without the catalog route does not mark the brief stale"
+
+# --- #667: the marker must survive a strict expect parser -------------------
+# Deployed panewire (pw-6d0562e, parsePromptFile) accepts only
+# name/label/cwd/title~/recent~ on the expect: line and refuses an unknown
+# field with rc=5 — before the send boundary, so the whole brief was silently
+# dropped when `catalog=stale` rode on that line. The marker now travels as a
+# `wrk-note:` body line: visible to the spawned agent and still recorded in
+# the job-dir brief. A mutant that puts the marker back on expect: turns this
+# block RED (strict fixture refuses → zero deliveries).
+rm -rf "$TMP/inbox" "$TMP/pw-strict.log"
+: >"$TMP/herdr.log"
+env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  WRK_COMPLETION_INTERVAL_S=3600 WRK_LAUNCH_MODE=stale \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
+  WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  WRK_PANEWIRE_STRICT_EXPECT=1 WRK_PANEWIRE_PROMPT_LOG="$TMP/pw-strict.log" \
+  "$WRK" spawn -c "$ROOT" -m codex-sol -p "$PROMPT" -w w -l fixture --t T1 >/dev/null 2>&1 || true
+brief="$(find "$TMP/inbox" -name 'spawn-brief-*' -type f | head -n 1)"
+[[ -n "$brief" && -f "$brief" ]] || fail "#667 no spawn brief written under a stale catalog"
+head -n 1 "$brief" | grep -q 'catalog=' &&
+  fail "#667 catalog marker must not ride on the expect: line: $(head -n 1 "$brief")"
+[[ "$(sed -n 2p "$brief")" == 'wrk-note: catalog=stale' ]] ||
+  fail "#667 stale brief must carry 'wrk-note: catalog=stale' on the line after expect:; got: $(sed -n 2p "$brief")"
+[[ -s "$TMP/pw-strict.log" ]] ||
+  fail "#667 strict panewire was never invoked (brief unsent at the boundary)"
+delivered="$(grep -c '^agent prompt ' "$TMP/herdr.log" 2>/dev/null || true)"
+[[ "$delivered" -ge 1 ]] ||
+  fail "#667 strict panewire refused or skipped the stale brief — 0 agent prompt calls"
+grep -q 'wrk-note: catalog=stale' "$TMP/herdr.log.payload" 2>/dev/null ||
+  fail "#667 the delivered body lost the catalog marker"
+echo "PASS #667 catalog=stale rides a wrk-note body line; strict panewire still delivers"
 
 # A refusal from the canon stops the spawn here. Deferring to the quota gate let
 # a permissive gate launch a profile the catalog had just declined.
