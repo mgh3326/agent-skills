@@ -163,12 +163,14 @@ The brief is delivered with `panewire prompt` (no uptake; first line
 (rc 4) or is not installed does wrk inject once directly through herdr; the OK
 line then ends with via=herdr-fallback.
   --operator-request REF
-                     escalation-profile operator request reference passed
-                     verbatim to `scopefuel gate` (the gate accepts only
-                     hk:doc/<key> or hk:task/<int>). wrk never validates the
-                     REF itself — acceptance, format refusal and the
-                     non-escalation-profile refusal are all the gate's own
-                     fail-closed decisions, and its rc is propagated.
+                     operator request reference passed verbatim to
+                     `scopefuel gate` (the gate accepts only hk:doc/<key>
+                     or hk:task/<int>, and only on escalation or
+                     consult_only profiles — fable needs it to spawn at
+                     all). wrk never validates the REF itself — acceptance,
+                     format refusal and the not-applicable refusal are all
+                     the gate's own fail-closed decisions, and its rc is
+                     propagated.
   --requested-by NAME
                      self-reported requester name accompanying
                      --operator-request, passed verbatim to `scopefuel gate`.

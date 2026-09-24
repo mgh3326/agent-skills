@@ -32,6 +32,12 @@ description: 판단이 어려운 문제(설계 분기, 검증 판정 불일치, 
   나타나지 않는다. 자문 목적의 명시 스폰(`wrk spawn -m fable`, `-m codex-astra`)은 계속
   허용된다(자문 목적 fable pane 스폰은 07-29 운영자 승인). 필요·근거는 자문 패킷 자체에
   적는다 — 급표의 gate_reason 문구에 기대지 않는다.
+- **`fable` 스폰에는 운영자 명시 요청 참조가 필수다(task #625)** — `policy launch` 와
+  quota gate 둘 다 같은 키를 요구한다:
+  `wrk spawn -m fable ... --operator-request hk:doc/<승인-문서-키>` (또는 `hk:task/<정수>`).
+  요청 없는 fable 스폰은 gate 가 `consult_only` 로 거부한다. `astra` 는 다르다 — 요청이
+  아니라 `--purpose director|architect|operator-request` 가 자격이다(astra 에 요청을 붙이면
+  gate 가 `operator_request_not_applicable` 로 거부한다).
 
 ## 2. 질문 패킷 (자족성 체크리스트)
 
