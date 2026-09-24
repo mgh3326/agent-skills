@@ -38,7 +38,9 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable builder-opus captain-opus
   devin-swe2 devin-swe2-medium devin-swe2-max builder-devin
+  builder-devin-medium builder-devin-max
   devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
+  builder-ds41 builder-ds41-max
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
   codex-sol56 codex-luna56
@@ -132,9 +134,10 @@ Options:
                      rejects --owner outright (use --lane instead).
   --role worker|builder (legacy alias: captain)
                      builder requires --lane and --parent, and accepts only
-                     builder-opus, builder-sol, builder-devin, builder-grok,
-                     builder-kimi or builder-luna profiles; legacy captain-opus
-                     and captain-sol
+                     builder-opus, builder-sol, builder-devin,
+                     builder-devin-medium, builder-devin-max, builder-ds41,
+                     builder-ds41-max, builder-grok, builder-kimi or
+                     builder-luna profiles; legacy captain-opus and captain-sol
                      aliases and the pilot worker spellings devin-swe2,
                      devin-swe2-medium, devin-swe2-max, grok/grok-hi and kimi-k3
                      remain accepted.
@@ -220,13 +223,19 @@ builder-luna (task #633) = codex-luna (gpt-6-luna) at effort xhigh — the #594 
 sample spelling; --effort is pinned to xhigh because the catalog grades
 codex-luna per effort (medium=B, max=A+).
 Devin model variants (task 281): devin-glm52, devin-swe17 and devin-ds41 run
-the same unattended devin argv with only the model name changed — worker-only,
-sharing scopefuel's single `devin` pool (devin-ds41 is the paid spelling).
+the same unattended devin argv with only the model name changed — worker-only
+spellings, sharing scopefuel's single `devin` pool (devin-ds41 is the paid
+spelling).
 Devin effort variants (#635): effort is encoded in the devin model id — there
 is no --effort flag — so each rung is its own profile: devin-swe2-medium
 (--model swe-2-medium) and devin-swe2-max (--model swe-2-max), both free, and
 the paid devin-ds41-max (--model deepseek-v4-1-flash-max). devin-swe2 stays the
 high default; the swe-2 effort spellings are also accepted under --role builder.
+Devin builder variants (#666): the same rungs exist as builder spellings —
+builder-devin-medium and builder-devin-max (the free swe-2 rungs), plus
+builder-ds41 and builder-ds41-max for the paid ds41 rung per the operator's
+ds41-builder policy. Each reuses its worker variant's argv verbatim; the ds41
+worker spellings themselves stay worker-only under --role builder.
 Legacy profile aliases captain-opus and captain-sol have the same meaning.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-code/k3`; kimi-k27 and
 kimi-k27-code use `kimi --auto -m kimi-code/kimi-for-coding`; the CLI has
@@ -544,15 +553,19 @@ spawn_prompt_file() {
     file="$(mktemp "${TMPDIR:-/tmp}/wrk-spawn-brief-$attempt.XXXXXX")" || return 1
   fi
   {
-    # The catalog marker rides on the expect line so it reaches the spawned
-    # agent itself, not only wrk's stderr: a brief produced from the launcher's
-    # own table instead of the canon has to say so where the work is read.
-    local catalog_marker=""
-    [[ "${CATALOG_STALE:-0}" -ne 1 ]] || catalog_marker=" catalog=stale"
+    # The catalog marker must reach the spawned agent itself, not only wrk's
+    # stderr: a brief produced from the launcher's own table instead of the
+    # canon has to say so where the work is read. It rides on a `wrk-note:`
+    # line in the body, NOT on the expect: header — panewire's parsePromptFile
+    # (prompt.go, deployed pw-6d0562e) accepts only name/label/cwd/title~/recent~
+    # and rejects an unknown field with rc=5 before the send boundary, which
+    # silently dropped the whole brief (#667).
+    local catalog_note=""
+    [[ "${CATALOG_STALE:-0}" -ne 1 ]] || catalog_note="wrk-note: catalog=stale"$'\n'
     if [[ -n "$SPAWN_EXPECT_CWD" ]]; then
-      printf 'expect: name=%s cwd=%s%s\n\n' "$LABEL" "$SPAWN_EXPECT_CWD" "$catalog_marker"
+      printf 'expect: name=%s cwd=%s\n%s\n' "$LABEL" "$SPAWN_EXPECT_CWD" "$catalog_note"
     else
-      printf 'expect: name=%s%s\n\n' "$LABEL" "$catalog_marker"
+      printf 'expect: name=%s\n%s\n' "$LABEL" "$catalog_note"
     fi
     cat -- "$PROMPT"
   } >"$file" || return 1
@@ -1907,8 +1920,8 @@ resolve_catalog_profile() {
 #
 # Replaces this spelling's model id and default effort with the canonical values
 # from `scopefuel policy launch`. Every path that does *not* end in a canonical
-# answer sets CATALOG_STALE=1, which the spawn brief header carries as
-# `catalog=stale` — including the ones that look like ordinary tolerance
+# answer sets CATALOG_STALE=1, which the spawn brief carries as a
+# `wrk-note: catalog=stale` line — including the ones that look like ordinary tolerance
 # (scopefuel absent, too old to have the subcommand, request failed). "We could
 # not confirm the canon" is one fact, and a launch that quietly used its own
 # table while claiming nothing is exactly the silence this change removes.
@@ -2061,15 +2074,20 @@ resolve_profile() {
     # duplicate the claude/codex subscription spend.
     devin-glm52) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model glm-5-2 --permission-mode dangerous --respect-workspace-trust false) ;;
     devin-swe17) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-1-7 --permission-mode dangerous --respect-workspace-trust false) ;;
-    devin-ds41) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-high --permission-mode dangerous --respect-workspace-trust false) ;;
+    # #666: builder-ds41 admits the paid ds41 rung under --role builder with
+    # the identical argv (the operator's ds41-builder policy); the devin-ds41
+    # worker spelling itself stays worker-only there.
+    devin-ds41|builder-ds41) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-high --permission-mode dangerous --respect-workspace-trust false) ;;
     # Task #635: devin effort lives inside the model id — there is no --effort
     # flag — so each rung is a named profile on the same unattended argv.
     # devin-swe2 stays the high default; swe-2-medium/max are the free rungs,
     # ds41-max the paid max rung. The swe-2 effort spellings are also admitted
-    # under --role builder (that is the builder-devin effort path).
-    devin-swe2-medium) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
-    devin-swe2-max) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2-max --permission-mode dangerous --respect-workspace-trust false) ;;
-    devin-ds41-max) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-max --permission-mode dangerous --respect-workspace-trust false) ;;
+    # under --role builder (that is the builder-devin effort path), and #666
+    # adds the named builder spellings builder-devin-medium/-max and
+    # builder-ds41-max — same argv as the worker variants.
+    devin-swe2-medium|builder-devin-medium) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-swe2-max|builder-devin-max) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2-max --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-ds41-max|builder-ds41-max) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-max --permission-mode dangerous --respect-workspace-trust false) ;;
 
     # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
     # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
@@ -2230,7 +2248,7 @@ resolve_profile() {
     # argparse-rejected, rc=2 fail-closed). Per-model attribution survives in
     # the job.spawned payload `profile` and the quota_pool.record
     # `launch_profile`, so reps stay separated per model.
-    devin-glm52|devin-swe17|devin-ds41|devin-swe2-medium|devin-swe2-max|devin-ds41-max) GATE_PROFILE=devin-swe2 ;;
+    devin-glm52|devin-swe17|devin-ds41|devin-swe2-medium|devin-swe2-max|devin-ds41-max|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max) GATE_PROFILE=devin-swe2 ;;
     codex|codex-sol|codex-max|builder-sol|captain-sol|codex-sol56) GATE_PROFILE=codex-max ;;
     # task #527: the gate role-denies astra without an allowed --purpose, so the
     # counsel spawn path defaults it to `architect` (the wrk-side counsel use).
@@ -4163,8 +4181,8 @@ spawn_cmd() {
     case "$MODEL" in
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
-      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|builder-luna|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-grok, builder-kimi or builder-luna (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only)" ;;
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi or builder-luna (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -4181,7 +4199,7 @@ spawn_cmd() {
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|builder-luna|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
