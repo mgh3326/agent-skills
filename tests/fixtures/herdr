@@ -6,6 +6,16 @@ if [[ -n "${WRK_FIXTURE_LOG:-}" ]]; then
   printf '%s\n' "$*" >>"$WRK_FIXTURE_LOG"
 fi
 
+# #609: which executable holds the pane foreground is the fixture's own
+# state, not a function of the diagnostic call log — real herdr answers
+# `pane process-info` from the pane whether or not a log exists, and
+# plenty of spawn call sites set no WRK_FIXTURE_LOG. `agent start` and
+# `pane run` record the foregrounded kind here; `pane process-info`
+# reports it. Keyed by WRK_RUN_ID (one wrk process = one spawn attempt).
+fixture_foreground_file="${TMPDIR:-/tmp}/wrk-fixture-fg-${WRK_RUN_ID:-standalone}"
+fixture_set_foreground() { printf '%s\n' "$1" >"$fixture_foreground_file"; }
+fixture_foreground() { cat "$fixture_foreground_file" 2>/dev/null || true; }
+
 fixture_prompt_count() {
   [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]] || { printf '0\n'; return; }
   grep -c '^agent prompt ' "$WRK_FIXTURE_LOG" 2>/dev/null || true
@@ -127,7 +137,7 @@ fixture_brief_landed() {
   prompts="$(fixture_prompt_count)"
   recent_reads="$(fixture_recent_read_count)"
   case "$scenario" in
-    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy) return 0 ;;
+    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy|agent-late-foreground) return 0 ;;
     landing-retry|opencode-retry)
       if (( prompts >= 2 )); then return 0; fi
       ;;
@@ -187,8 +197,21 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy)
+          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-shell-busy-m1b|devin-shell-never-ready-m1b|devin-explain-no-rule|devin-explain-empty|devin-trust-screen|devin-read-fail|devin-explain-starting|devin-explain-starting-stuck|devin-explain-unknown)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          # #568 incident shape: the brief landed and devin is working on it,
+          # but panewire's classifier cannot prove devin submissions (rc 6).
+          devin-working-no-marker|devin-queued)
+            printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"working","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          # #568 negative direction: the pane is absent from agent list, so
+          # its status reads unknown — no positive evidence of any kind.
+          # devin-wrapped-marker and devin-fold-collision share it so the
+          # marker tests can only land via the marker itself, never via the
+          # devin-status branch.
+          devin-no-landing|devin-wrapped-marker|devin-fold-collision)
+            printf '%s\n' '{"result":{"agents":[]}}'
             ;;
           devin-wrong-agent)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
@@ -233,7 +256,36 @@ case "${1:-}" in
           echo 'fixture: visible read unavailable' >&2
           exit 9
         fi
-        if [[ "$scenario" == landing-scrollback-marker ]]; then
+        # #568: the incident transcript — devin rendered the brief folded
+        # across a line break, so a raw substring search never matches it.
+        if [[ "$scenario" == devin-wrapped-marker ]]; then
+          if fixture_is_recent_unwrapped_read "$@"; then
+            printf '❭ fixture\n    prompt\n'
+          else
+            printf 'devin composer\n'
+          fi
+        # #568 adversarial: the marker's words in unrelated UI text — a line
+        # break without indent mid-line, the same break at a line start, a UI
+        # tab on one line, and an indented break mid-line. None reproduce
+        # devin's submitted-prompt wrap shape (`❭ <text>` + indented
+        # continuation at line start). Order matters: the old leftmost-match
+        # matcher must hit a break-bearing variant first, or it returns before
+        # ever evaluating the variants that distinguish it.
+        elif [[ "$scenario" == devin-fold-collision ]]; then
+          if fixture_is_recent_unwrapped_read "$@"; then
+            printf 'more UI: fixture\nprompt settings\nfixture\nprompt settings\nfixture\tprompt settings\nlast UI: fixture\n    prompt settings\n'
+          else
+            printf 'devin composer\n'
+          fi
+        elif [[ "$scenario" == devin-queued ]]; then
+          if fixture_is_recent_unwrapped_read "$@"; then
+            printf 'devin transcript without the brief\n'
+          else
+            printf '── 1 queued ── ↑ edit · ↵ send now\n○ fixture brief body\n❭ Press Enter to send queued messages now\n'
+          fi
+        elif [[ "$scenario" == devin-working-no-marker || "$scenario" == devin-no-landing ]]; then
+          printf 'devin working…\n'
+        elif [[ "$scenario" == landing-scrollback-marker ]]; then
           if fixture_is_recent_unwrapped_read "$@"; then
             printf '%s\n' "${WRK_FIXTURE_MARKER:-fixture prompt}"
           else
@@ -272,6 +324,54 @@ case "${1:-}" in
           devin-explain-garbage)
             printf '%s\n' 'not json at all'
             ;;
+          # #604 (CodeRabbit #122): explain can exit 0 with EMPTY stdout — a
+          # supplied failing response, not an absent one. The first call prints
+          # nothing; if a preservation keyed on "nonempty" re-queries, the
+          # second call answers a well-formed envelope so the overwrite shows
+          # up in the artifact.
+          devin-explain-empty)
+            explains="$(grep -c '^agent explain ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
+            if [[ "$explains" -gt 1 ]]; then
+              printf '%s\n' '{"agent":"devin","matched_rule":{"id":"welcome_prompt_footer","priority":120,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
+            fi
+            ;;
+          # #604: the 2026-09-23 incident shape — a well-formed envelope whose
+          # matched_rule is absent because no identity rule claimed the screen
+          # (first-open trust prompt hypothesis). Since #649 this bare envelope
+          # carries no evaluated_rules to prove the screen is just the command
+          # line, so it classifies "unmatched" and is polled to the window.
+          devin-explain-no-rule|devin-read-fail)
+            printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle"}'
+            ;;
+          # #649 (m1b): devin's TUI is still painting — every identity rule is
+          # unmatched and the evaluated region holds only the typed command
+          # line (the exact argv wrk runs for devin-swe2). The first
+          # WRK_FIXTURE_DEVIN_STARTING_COUNT (default 3) explains answer that
+          # shape, then the welcome footer appears.
+          devin-explain-starting)
+            explains="$(grep -c '^agent explain ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
+            if [[ "$explains" -le "${WRK_FIXTURE_DEVIN_STARTING_COUNT:-3}" ]]; then
+              printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle","evaluated_rules":[{"id":"welcome_prompt_footer","matched":false,"priority":120,"region":"bottom_non_empty_lines(8)","state":"idle","evidence":{"region_bytes":110,"region_preview":"~ % devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false"}}]}'
+            else
+              printf '%s\n' '{"agent":"devin","matched_rule":{"id":"welcome_prompt_footer","priority":120,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
+            fi
+            ;;
+          # The same command-line-only screen, but it never resolves — the
+          # window must close and the spawn must fail closed.
+          devin-explain-starting-stuck)
+            printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle","evaluated_rules":[{"id":"welcome_prompt_footer","matched":false,"priority":120,"region":"bottom_non_empty_lines(8)","state":"idle","evidence":{"region_bytes":110,"region_preview":"~ % devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false"}}]}'
+            ;;
+          # Unmatched rules AND the evaluated region is not the command line —
+          # a genuinely unexpected pane. Also polled to the window, then fails.
+          devin-explain-unknown)
+            printf '%s\n' '{"agent":"devin","matched_rule":null,"state":"idle","evaluated_rules":[{"id":"welcome_prompt_footer","matched":false,"priority":120,"region":"bottom_non_empty_lines(8)","state":"idle","evidence":{"region_bytes":512,"region_preview":"some unexpected screen the rules do not know"}}]}'
+            ;;
+          # #604 hypothesis variant: a rule did match — the trust prompt — so
+          # the identity check fails on the rule id, and only the preserved
+          # screen shows what the pane was actually asking.
+          devin-trust-screen)
+            printf '%s\n' '{"agent":"devin","matched_rule":{"id":"trust_directory","priority":130,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
+            ;;
           devin-wrong-agent)
             printf '%s\n' '{"agent":"codex","matched_rule":{"id":"welcome_prompt_footer","priority":120,"region":"bottom_non_empty_lines(8)","state":"idle"},"state":"idle"}'
             ;;
@@ -308,6 +408,10 @@ case "${1:-}" in
             exit 3
             ;;
         esac
+        # A successful start foregrounds the agent's own executable — the
+        # canonical --kind (herdr's kind IS the binary name).
+        start_kind="$(sed -n 's/.* --kind \([^ ]*\).*/\1/p' <<<" $*")"
+        [[ -z "$start_kind" ]] || fixture_set_foreground "$start_kind"
         printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
         ;;
       send-keys)
@@ -332,9 +436,13 @@ case "${1:-}" in
           echo 'fixture herdr: tab create failed' >&2
           exit 9
         fi
+        # A fresh tab holds a fresh shell — clear any foreground state a
+        # same-PID predecessor run left behind.
+        rm -f "$fixture_foreground_file"
         printf '%s\n' '{"result":{"tab_id":"w:t1","root_pane":{"pane_id":"w:p1"}}}'
         ;;
       close)
+        rm -f "$fixture_foreground_file"
         printf '%s\n' '{"result":{"closed":"'"${3:-}"'"}}'
         ;;
       list)
@@ -394,30 +502,106 @@ case "${1:-}" in
     # devin-shell-busy shows an rc subprocess in the foreground for the first
     # WRK_FIXTURE_SHELL_BUSY_COUNT (default 3) calls; devin-shell-never-ready
     # always does.
+    # #609: once this spawn's own `pane run`/`agent start` was accepted, the
+    # pane foreground is the agent (real 0.9.1 shape measured 2026-09-24:
+    # argv0 is the canonical executable, the group leader is the agent pid).
+    # agent-never-foreground keeps answering shell-alone after an accepted
+    # start (the m1b "zsh: command not found: codex" shape); agent-late-
+    # foreground answers shell-alone for WRK_FIXTURE_FOREGROUND_DELAY (2)
+    # calls first; agent-foreground-other keeps an unrelated process in the
+    # foreground.
     if [[ "${2:-}" == process-info ]]; then
       case "$scenario" in
-        devin-process-info-fail)
+        devin-process-info-fail|agent-foreground-info-fail)
           printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture process-info failure"},"id":"cli:pane:process_info"}' >&2
           exit 3
           ;;
-        devin-process-info-garbage)
+        devin-process-info-garbage|agent-foreground-garbage)
           printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"pane_id":"w:p1","shell_pid":"4242"}}}'
+          exit 0
+          ;;
+        agent-never-foreground)
+          printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+          exit 0
+          ;;
+        agent-foreground-other)
+          printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["vim","notes.txt"],"argv0":"vim","cmdline":"vim notes.txt","cwd":"/tmp","name":"vim","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
           exit 0
           ;;
       esac
       infos="$(grep -c '^pane process-info ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
-      if [[ "$scenario" == devin-shell-never-ready ||
-            ( "$scenario" == devin-shell-busy && "$infos" -le "${WRK_FIXTURE_SHELL_BUSY_COUNT:-3}" ) ]]; then
+      if [[ "$scenario" == agent-late-foreground &&
+            "$infos" -le "${WRK_FIXTURE_FOREGROUND_DELAY:-2}" ]]; then
+        printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+        exit 0
+      fi
+      busy=0
+      case "$scenario" in
+        devin-shell-never-ready|devin-shell-never-ready-m1b) busy=1 ;;
+        devin-shell-busy|devin-shell-busy-m1b)
+          [[ "$infos" -le "${WRK_FIXTURE_SHELL_BUSY_COUNT:-3}" ]] && busy=1 ;;
+      esac
+      agent_kind="$(fixture_foreground)"
+      if [[ -n "$agent_kind" ]]; then
+        # argv0 is the REAL executable the kind lands on the pane with,
+        # measured 2026-09-24 on live panes (kimi -> "kimi-code", codex -> a
+        # node leader plus a native "codex" child); `name` is the agent's
+        # version string on a real pane (live 0.9.1: claude -> "2.1.281"),
+        # never the kind — so a matcher that reads name instead of
+        # argv0/cmdline is caught by the tests.
+        if [[ "$agent_kind" == codex ]]; then
+          printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["node","/opt/codex/bin/codex.js"],"argv0":"node","cmdline":"node /opt/codex/bin/codex.js","cwd":"/tmp","name":"node","pid":4300},{"argv":["/opt/codex/codex"],"argv0":"codex","cmdline":"/opt/codex/codex","cwd":"/tmp","name":"9.9.9","pid":4301}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+          exit 0
+        fi
+        case "$agent_kind" in
+          kimi) fg_argv0=kimi-code ;;
+          kiro) fg_argv0=kiro-cli ;;
+          *)    fg_argv0="$agent_kind" ;;
+        esac
+        printf '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["%s"],"argv0":"%s","cmdline":"%s","cwd":"/tmp","name":"9.9.9","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}\n' \
+          "$fg_argv0" "$fg_argv0" "$fg_argv0"
+        exit 0
+      fi
+      if [[ "$scenario" == *-m1b ]]; then
+        # #604/m1b (hk:doc evidence/2026-09-24/task604-m1b-repro): the m1b
+        # herdr 0.9.0 reply has no "result" wrapper and no
+        # foreground_process_group_id — but still names shell_pid and the
+        # foreground list. While the foreground is an rc-file subprocess
+        # (oh-my-zsh compinit's .zcompdump grep) the shell is not ready.
+        if [[ "$busy" -eq 1 ]]; then
+          printf '%s\n' '{"process_info":{"foreground_processes":[{"argv":["grep","-q","-Fx","#omz fpath: /Users/operator/.zcompdump"],"argv0":"grep","cmdline":"grep -q -Fx #omz fpath: /Users/operator/.zcompdump","cwd":"/Users/operator","name":"grep","pid":4250}],"shell_pid":4242}}'
+        else
+          printf '%s\n' '{"process_info":{"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/Users/operator","name":"zsh","pid":4242}],"shell_pid":4242}}'
+        fi
+      elif [[ "$busy" -eq 1 ]]; then
         printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4250,"foreground_processes":[{"argv":["git","rev-parse","--show-toplevel"],"argv0":"git","cmdline":"git rev-parse --show-toplevel","cwd":"/tmp","name":"git","pid":4250}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
       else
         printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
       fi
       exit 0
     fi
+    if [[ "${2:-}" == close ]]; then
+      rm -f "$fixture_foreground_file"
+    fi
+    if [[ "${2:-}" == read ]]; then
+      if [[ "$scenario" == devin-read-fail ]]; then
+        printf 'fixture: pane read unavailable\n' >&2
+        exit 9
+      fi
+      case "$scenario" in
+        devin-trust-screen) printf 'Do you trust the contents of this directory?\n' ;;
+        *) printf 'fixture welcome screen\n' ;;
+      esac
+      printf 'ACTUAL SCREEN LAST LINE\n'
+      exit 0
+    fi
     if [[ "${2:-}" == run && "$scenario" == devin-run-fail ]]; then
       printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture pane run failure"}}' >&2
       exit 5
     fi
+    # A successful `pane run` is how the devin agent reaches the pane — it
+    # foregrounds the devin executable.
+    if [[ "${2:-}" == run ]]; then fixture_set_foreground devin; fi
     printf 'fixture pane %s\nACTUAL SCREEN LAST LINE\n' "${3:-unknown}"
     ;;
 esac

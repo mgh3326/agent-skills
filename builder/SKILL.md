@@ -16,8 +16,12 @@ legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`
 제외) · 라운드 상한 3 · 독립 tester는 타사 provider family(§2-4 동일 계열 예외 적용) · 배포·라이브
 매매 표면 제외**, 되돌리기 조건, 결정 기록과 다음 재판단의 **정본은 `spawn-worker` §2-2 급표의
 `builder-devin` 행**이다(두 문서가 어긋나면 그 행을 따른다). `builder-kimi`는 아직 파일럿 전이라
-열려만 있다. 세 프로필 모두 각각 devin-swe2·grok 4.7 xhigh·kimi-k3의 argv를 재사용하며, 워커 철자
-`devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. `builder-grok`·`builder-kimi`의
+열려만 있다. `builder-luna`는 #594 E3 실험 표본용으로 열려 있으며 codex-luna(gpt-6-luna)의 argv를
+effort `xhigh`로 고정 재사용한다(그 외 `--effort`는 wrk가 거부; 급 상한은 카탈로그가 xhigh에 매기는
+급 — `spawn-worker` §2-2 급표의 `builder-luna` 행을 따르고, 브리프에 `exp=E3` 태그·reps 기록이
+의무다). 세 프로필 모두 각각 devin-swe2·grok 4.7 xhigh·kimi-k3의 argv를 재사용하며, 워커 철자
+`devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다
+(devin 의 effort 는 모델 id 안에 있으므로 swe-2 effort 런그가 builder-devin 의 effort 경로다). `builder-grok`·`builder-kimi`의
 **정식 등재와 T2 확대는 프로필당 표본 3(빌더 역할 reps)에서 재판단**하며, 라운드 상한 초과나 게이트
 BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌리기 조건이다).
 
@@ -151,6 +155,15 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
   모드의 재전송은 correlation id dedup 에 걸리지만, `--uptake` 를 바꾸거나 빼면
   새 주입이 되고, `unproven` 인 채 실제로 착지한 경우도 있어(2026-09-21 실측)
   화면 확인 없는 재작성·재전송은 이중 지시가 된다.
+- **입력줄에 보이는 글은 미제출 증거가 아니다(#646).** 미제출이 의심되면 재전송·Enter
+  전에 그 호출의 deliveries 행(`panewire deliveries show <id>`, 그 명령이 없는 설치판은
+  panewire DB 의 `deliveries` 표)과, 수신 세션 transcript 에서 그 delivery 의 시각·본문과
+  일치하는 user 메시지를 대조한다. 입력줄 글에는 Claude Code 제안 프롬프트나 다른
+  발신자의 글이 섞일 수 있고 `herdr agent read` 도 그것을 사람이 친 글과 똑같이 읽는다.
+  근거: 2026-09-24 t623 델타는 "입력줄에 남아 미제출" 로 보고됐지만 deliveries 행은
+  `marker_observed`·`status-transition`·`confirmed`, 수신 transcript 는 2초 뒤 같은 본문의
+  제출과 작업 시작을 기록했고, 그 뒤 herdr API 로그에 그 pane 으로 간 `send_keys` 는
+  0건이었다(터미널에 붙은 사람의 키 입력은 그 로그에 남지 않는다).
 - **하네스 차이 — 제출 증명은 claude·codex 에서만 나온다**
   (`harnessHasSubmissionEvidence`). 미제출이면 rc≠0 + `composer_residue`,
   제출·작업 시작이면 `confirmed` 다. devin·grok·kimi 등 그 외 하네스는 착지해도

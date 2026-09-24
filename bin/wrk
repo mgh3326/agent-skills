@@ -5,6 +5,10 @@ set -euo pipefail
 HERDR="${HERDR_BIN:-$HOME/.local/bin/herdr}"
 SCOPEFUEL="${SCOPEFUEL_BIN:-}"
 ARBITER="${ARBITER_BIN:-}"
+# #609: one wrk process is one spawn attempt; fixture herdr keys its pane
+# foreground state on this so process-info does not depend on a call log.
+# Real herdr never reads it.
+export WRK_RUN_ID="${WRK_RUN_ID:-$$}"
 # A live duplicate is an exact-once violation, distinct from generic CLI
 # misuse (2) and the arbiter's own duplicate result (4).  75 means that an
 # arbiter duplicate was observed but its state could not be proven safely.
@@ -33,9 +37,10 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
 ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable builder-opus captain-opus
-  devin-swe2 builder-devin devin-glm52 devin-swe17 devin-ds41
+  devin-swe2 devin-swe2-medium devin-swe2-max builder-devin
+  devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
-  codex codex-sol codex-max builder-sol captain-sol codex-astra
+  codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
   codex-sol56 codex-luna56
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
@@ -127,10 +132,12 @@ Options:
                      rejects --owner outright (use --lane instead).
   --role worker|builder (legacy alias: captain)
                      builder requires --lane and --parent, and accepts only
-                     builder-opus, builder-sol, builder-devin, builder-grok or
-                     builder-kimi profiles; legacy captain-opus and captain-sol
+                     builder-opus, builder-sol, builder-devin, builder-grok,
+                     builder-kimi or builder-luna profiles; legacy captain-opus
+                     and captain-sol
                      aliases and the pilot worker spellings devin-swe2,
-                     grok/grok-hi and kimi-k3 remain accepted.
+                     devin-swe2-medium, devin-swe2-max, grok/grok-hi and kimi-k3
+                     remain accepted.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      required for --role builder (spawn dies without it).
@@ -209,9 +216,17 @@ It defaults to --effort xhigh and requires --purpose director|architect|operator
 which the gate enforces as role denial (gate exit 5, surfaced by wrk as exit 77) when
 missing or wrong.
 Pilot builders (task 240): builder-devin = devin-swe2 argv; builder-grok = grok 4.7 at effort xhigh; builder-kimi = kimi-k3 argv.
+builder-luna (task #633) = codex-luna (gpt-6-luna) at effort xhigh — the #594 E3
+sample spelling; --effort is pinned to xhigh because the catalog grades
+codex-luna per effort (medium=B, max=A+).
 Devin model variants (task 281): devin-glm52, devin-swe17 and devin-ds41 run
 the same unattended devin argv with only the model name changed — worker-only,
 sharing scopefuel's single `devin` pool (devin-ds41 is the paid spelling).
+Devin effort variants (#635): effort is encoded in the devin model id — there
+is no --effort flag — so each rung is its own profile: devin-swe2-medium
+(--model swe-2-medium) and devin-swe2-max (--model swe-2-max), both free, and
+the paid devin-ds41-max (--model deepseek-v4-1-flash-max). devin-swe2 stays the
+high default; the swe-2 effort spellings are also accepted under --role builder.
 Legacy profile aliases captain-opus and captain-sol have the same meaning.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-code/k3`; kimi-k27 and
 kimi-k27-code use `kimi --auto -m kimi-code/kimi-for-coding`; the CLI has
@@ -315,8 +330,33 @@ agent_status_for_pane() {
     2>/dev/null
 }
 
+# #568: a folded-marker match must reproduce devin's observed submitted-prompt
+# rendering, not just the marker's characters scattered over a transcript.
+# The match must (a) contain a wrapped continuation — a newline followed by
+# indent, the shape observed in devin's submitted-prompt rendering
+# (`❭ <marker start>` + indented continuation) — and (b) start at a line
+# boundary or right after devin's `❭` prompt glyph.
+# Whitespace-only variants that never wrapped (a UI column tab between the
+# same words) and unrelated text carrying the words across a line break are
+# not folded markers and must not count as positive evidence.
+devin_folded_marker_present() {
+  local marker="$1"
+  python3 -c '
+import re, sys
+marker, recent = sys.argv[1], sys.stdin.read()
+pat = r"\s*".join(re.escape(c) for c in marker if not c.isspace())
+for m in re.finditer(pat, recent):
+    if not re.search(r"\n[ \t]", m.group(0)):
+        continue
+    line_start = recent.rfind("\n", 0, m.start()) + 1
+    if recent[line_start:m.start()].strip() in ("", "❭"):
+        sys.exit(0)
+sys.exit(1)
+' "$marker"
+}
+
 landing_check_once() {
-  local pane="$1" marker="$2" profile_kind="$3" recent visible status
+  local pane="$1" marker="$2" profile_kind="$3" submit="${4:-}" recent visible status
   LANDING_CHECK_LAST_EVIDENCE=none
   if ! recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
@@ -332,6 +372,17 @@ landing_check_once() {
   if [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$recent"; then
     LANDING_CHECK_LAST_EVIDENCE=marker
     LANDING_CHECK_LAST_REASON="marker-in-recent-unwrapped"
+    return 0
+  fi
+  # #568: Devin folds long lines at its render width, so the transcript's copy
+  # of the marker can carry a line break or indent the raw substring never
+  # matches (the 2026-09-22 t502-verify duplicate: rc 6, status=working,
+  # marker present but folded → reinjected into a working tester). Devin
+  # only; every other kind keeps the raw substring contract.
+  if [[ "$profile_kind" == devin && -n "$marker" && "$recent" == *$'\n'* ]] &&
+     devin_folded_marker_present "$marker" <<<"$recent"; then
+    LANDING_CHECK_LAST_EVIDENCE=devin-marker-folded
+    LANDING_CHECK_LAST_REASON="folded-marker-in-recent-unwrapped"
     return 0
   fi
   if ! visible="$("$HERDR" agent read "$pane" --source visible --lines 40 2>/dev/null)"; then
@@ -357,6 +408,18 @@ landing_check_once() {
   # the re-injection so a possibly queued payload is not duplicated. The
   # transcript marker above stays the only positive evidence. `0 queued` is
   # not a chip.
+  # #568: Devin's queued banner (`── N queued ──` / `○ msg` /
+  # `Press Enter to send queued messages now`, relay-handoff §3-2) means a
+  # payload is sitting in Devin's queue. Like grok's chip it cannot be
+  # attributed to THIS injection, so it is ambiguous evidence that suppresses
+  # re-injection — never positive.
+  if [[ "$profile_kind" == devin ]] &&
+     grep -Eq '── [0-9]+ queued ──|Press Enter to send queued messages now' <<<"$visible"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_EVIDENCE=devin-queued
+    LANDING_CHECK_LAST_REASON="devin-queue-banner-unattributable"
+    return 1
+  fi
   if [[ "$profile_kind" == grok ]] && grep -Eq '[1-9][0-9]* queued, Enter to send now' <<<"$visible"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_EVIDENCE=grok-queued
@@ -378,6 +441,25 @@ landing_check_once() {
     LANDING_CHECK_LAST_REASON="devin-post-prompt-status-${status}"
     return 0
   fi
+  # #568: delivery only runs after `agent wait --until idle` already saw the
+  # pane idle, so a Devin pane reporting working has consumed the submitted
+  # brief — nothing else was ever sent. `working` is positive evidence only
+  # for an accepted submit: after an unconfirmed one (a timeout can fall on
+  # either side of the send boundary) working cannot be attributed to this
+  # brief, so it is ambiguous — landed stays no and the possibly delivered
+  # brief is not duplicated. For other kinds the cold-boot caveat keeps
+  # `working` non-evidence.
+  if [[ "$profile_kind" == devin && "$status" == working ]]; then
+    if [[ "$submit" == accepted ]]; then
+      LANDING_CHECK_LAST_EVIDENCE=devin-status
+      LANDING_CHECK_LAST_REASON=devin-post-prompt-status-working
+      return 0
+    fi
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_EVIDENCE=devin-status-working
+    LANDING_CHECK_LAST_REASON="devin-working-unattributable-submit-${submit:-unknown}"
+    return 1
+  fi
   if [[ "$status" == working ]]; then
     LANDING_CHECK_LAST_REASON=working-without-positive-evidence
   else
@@ -387,7 +469,7 @@ landing_check_once() {
 }
 
 landing_check() {
-  local pane="$1" marker="$2" profile_kind="$3" tick delay
+  local pane="$1" marker="$2" profile_kind="$3" submit="${4:-}" tick delay
   LANDING_CHECK_CONFIRMED=0
   LANDING_CHECK_AMBIGUOUS=0
   LANDING_CHECK_AMBIGUOUS_REASON=""
@@ -397,7 +479,7 @@ landing_check() {
   LANDING_CHECK_LAST_REASON=not-observed
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
-    if landing_check_once "$pane" "$marker" "$profile_kind"; then return 0; fi
+    if landing_check_once "$pane" "$marker" "$profile_kind" "$submit"; then return 0; fi
     if [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 && -z "$LANDING_CHECK_AMBIGUOUS_REASON" ]]; then
       LANDING_CHECK_AMBIGUOUS_REASON="$LANDING_CHECK_LAST_REASON"
     fi
@@ -598,7 +680,9 @@ spawn_deliver_brief() {
       ;;
     daemon)
       spawn_herdr_fallback
-      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+      # The fallback injected through herdr directly, so a post-injection
+      # observation attaches to a delivery that definitely happened.
+      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" accepted; then
         LANDING=yes
       else
         detail="$(landing_check_detail)"
@@ -609,7 +693,7 @@ spawn_deliver_brief() {
   esac
 
   # accepted | unconfirmed: panewire could not prove it. Observe only.
-  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
     LANDING=yes
     return 0
   fi
@@ -626,7 +710,7 @@ spawn_deliver_brief() {
     case "$SPAWN_SUBMIT" in
       proven) LANDING=retry; return 0 ;;
       accepted|unconfirmed)
-        if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+        if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
           LANDING=retry
           return 0
         fi
@@ -897,11 +981,84 @@ spawn_pane_cleanup() {
 # bounded idle wait replaces agent-start's readiness wait, while the observed
 # explain envelope (`agent=devin`, `matched_rule.id=welcome_prompt_footer`)
 # replaces its agent_kind_mismatch ownership check.
+# #604: a failed Devin spawn used to leave one stderr line and a closed pane,
+# so the 2026-09-23 'invalid identity envelope' failures could not be diagnosed
+# after the fact (hypothesis: a first-open trust screen matched no identity
+# rule — unverifiable because nothing was preserved). Before the caller's
+# cleanup closes the pane, capture what it still shows into the job directory.
+# Every capture is best-effort and read-only: a preservation failure must not
+# mask, replace or worsen the spawn failure it documents. Raw captures use the
+# .out/.err/.rc extensions, never .json — the jobs root is scanned for event
+# envelopes with rglob("*.json"), and a capture holding 'not json at all' would
+# break those scans (CI, 2026-09-24).
+# explain_rc non-empty means the caller already ran `agent explain` and is
+# handing over THAT response — possibly empty stdout — as the response that
+# failed. It is preserved verbatim and never re-queried: a second explain
+# would capture a later, different response and the artifact would no longer
+# show what actually failed (CodeRabbit #122). explain_rc empty means the
+# caller never ran explain; detected=1 then re-queries, detected=0 records an
+# explicit skip so the absence does not read as "preservation forgot it".
+devin_preserve_failure_artifacts() {
+  local reason="$1" detected="${2:-0}" explain_rc="${3:-}" explain_json="${4:-}"
+  local dir out cap_rc
+  dir="$(wrk_jobs_root)/$JOB_ID"
+  if ! mkdir -p "$dir" 2>/dev/null; then
+    dir="$(mktemp -d "${TMPDIR:-/tmp}/wrk-devin-failure.XXXXXX" 2>/dev/null)" || {
+      warn "Devin failure artifact preservation unavailable (job dir and tmpdir both unwritable)"
+      return 0
+    }
+  fi
+  out="$(mktemp -d "$dir/devin-spawn-failure-XXXXXXXX" 2>/dev/null)" || {
+    warn "Devin failure artifact dir could not be created under $dir"
+    return 0
+  }
+  {
+    printf 'reason=%s\n' "$reason"
+    printf 'at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'pane=%s\nlabel=%s\ncwd=%s\nmodel=%s\n' "$PANE" "$LABEL" "$CWD" "$MODEL"
+  } >"$out/reason.txt" 2>/dev/null ||
+    warn "Devin failure reason.txt could not be written under $out"
+  if [[ -n "$explain_rc" ]]; then
+    printf '%s' "$explain_json" >"$out/explain.out" 2>/dev/null ||
+      warn "Devin failure explain.out could not be written under $out"
+    printf 'rc=%s\n' "$explain_rc" >"$out/explain.rc" 2>/dev/null || true
+  elif [[ "$detected" -eq 1 ]]; then
+    set +e
+    "$HERDR" agent explain "$PANE" --format json >"$out/explain.out" 2>"$out/explain.err"
+    cap_rc=$?
+    set -e
+    printf 'rc=%s\n' "$cap_rc" >"$out/explain.rc" 2>/dev/null || true
+  else
+    printf 'rc=skipped\nreason=agent-not-detected\n' >"$out/explain.rc" 2>/dev/null || true
+  fi
+  # `pane read`/`pane process-info` do not require herdr to have detected an
+  # agent, so they also work for pre-detection and shell-only failures.
+  set +e
+  "$HERDR" pane read "$PANE" --source visible --lines 60 >"$out/screen-visible.txt" 2>"$out/screen-visible.err"
+  printf 'rc=%s\n' "$?" >"$out/screen-visible.rc"
+  "$HERDR" pane read "$PANE" --source recent-unwrapped --lines 200 >"$out/transcript.txt" 2>"$out/transcript.err"
+  printf 'rc=%s\n' "$?" >"$out/transcript.rc"
+  "$HERDR" pane process-info --pane "$PANE" >"$out/process-info.out" 2>"$out/process-info.err"
+  printf 'rc=%s\n' "$?" >"$out/process-info.rc"
+  set -e
+  echo "wrk: Devin spawn failure artifacts preserved under $out" >&2
+  printf '%s\n' "$out"
+}
+
 devin_spawn_diagnostics() {
-  local reason="$1"
+  local reason="$1" detected="${2:-0}" explain_rc="${3:-}" explain_json="${4:-}" out
   echo "wrk: Devin pane startup failed: $reason; pane=$PANE" >&2
-  "$HERDR" pane process-info --pane "$PANE" >&2 ||
-    warn "Devin pane process-info failed for pane=$PANE"
+  out="$(devin_preserve_failure_artifacts "$reason" "$detected" "$explain_rc" "$explain_json")"
+  # The operator-facing process-info dump replays the capture preservation just
+  # made: a second live call would change the pane-touch count the readiness
+  # failure contract pins (one check + one diagnostic).
+  if [[ -n "$out" && -d "$out" ]]; then
+    [[ ! -s "$out/process-info.out" ]] || cat "$out/process-info.out" >&2
+    [[ ! -s "$out/process-info.err" ]] || cat "$out/process-info.err" >&2
+  else
+    "$HERDR" pane process-info --pane "$PANE" >&2 ||
+      warn "Devin pane process-info failed for pane=$PANE"
+  fi
 }
 
 # `agent wait` does not wait for a pane herdr has not yet detected as an agent:
@@ -987,12 +1144,123 @@ agent_start_in_pane() {
   done
 }
 
+# #609: `agent start` (and Devin's `pane run`) can be accepted while the agent
+# binary never reaches the pane foreground — the m1b spawn ran `codex` on a
+# PATH that lacked it, zsh printed "command not found", and wrk still wrote
+# job.spawned and typed the brief into the bare shell. Before any prompt is
+# injected, poll process-info until the agent itself holds the foreground:
+# some foreground process whose argv0 is one of the kind's canonical
+# executable names. herdr's `--kind` is NOT always the executable name —
+# measured 2026-09-24 on live panes of this Mac (pane process-info argv0,
+# `name` in parentheses):
+#   claude   -> "claude"        (name is the version, e.g. "2.1.281")
+#   codex    -> node-script leader plus a native child argv0 "codex"
+#   devin    -> "devin"         (name "devin")
+#   grok     -> "grok"          (native binary ~/.grok/bin/grok)
+#   kimi     -> "kimi-code"     (name "kimi"; the ~/.kimi-code/bin/kimi
+#               launcher hands the pane to the kimi-code TUI — matching only
+#               "kimi" fail-closed every real kimi spawn, the #609 follow-up
+#               this table fixes)
+#   kiro     -> unmeasured on this host (binary absent); herdr's detector
+#               lists the alias "kiro-cli", so both spellings are accepted.
+# The other detector aliases herdr knows (claude-code, devin-cli, grok-build,
+# open-code, antigravity) are accepted for the same reason. The shell alone, a
+# shell child, or an unrelated foreground process all mean "not ours yet"; the
+# agent is polled inside a bounded window, anything else fails closed so the
+# pane is closed and the quota record released instead of a brief landing in
+# zsh.
+agent_foreground_exes() {
+  case "$1" in
+    claude)   echo "claude claude-code" ;;
+    devin)    echo "devin devin-cli" ;;
+    grok)     echo "grok grok-build" ;;
+    kimi)     echo "kimi-code kimi" ;;
+    kiro)     echo "kiro-cli kiro" ;;
+    opencode) echo "open-code opencode" ;;
+    agy)      echo "antigravity agy" ;;
+    *)        echo "$1" ;;
+  esac
+}
+AGENT_FOREGROUND_TIMEOUT_MS=10000
+agent_foreground_diagnostics() {
+  local reason="$1"
+  echo "wrk: agent foreground check failed: $reason; pane=$PANE kind=$PROFILE_KIND" >&2
+  "$HERDR" pane process-info --pane "$PANE" >&2 ||
+    warn "agent foreground process-info failed for pane=$PANE"
+}
+
+agent_wait_foreground() {
+  local started_at attempts=0 max_attempts info_out info_rc ready
+  started_at="$(date +%s)"
+  max_attempts=$(( AGENT_FOREGROUND_TIMEOUT_MS / SHELL_READY_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    set +e
+    info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
+    info_rc=$?
+    set -e
+    if [[ "$info_rc" -ne 0 ]]; then
+      agent_foreground_diagnostics "pane process-info exited $info_rc before brief injection"
+      return 1
+    fi
+    set +e
+    ready="$(printf '%s' "$info_out" | python3 -c '
+import json, os, sys
+try:
+    d = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(1)
+info = d.get("result") or {}
+info = info.get("process_info") or d.get("process_info")
+if not isinstance(info, dict):
+    raise SystemExit(1)
+procs = info.get("foreground_processes")
+if not isinstance(procs, list):
+    raise SystemExit(1)
+want = set(sys.argv[1].split())
+for p in procs:
+    if not isinstance(p, dict):
+        continue
+    names = [os.path.basename(str(p.get("argv0") or ""))]
+    cmd = str(p.get("cmdline") or "").split()
+    if cmd:
+        names.append(os.path.basename(cmd[0]))
+    if want.intersection(names):
+        print("yes")
+        break
+else:
+    print("no")
+' "$(agent_foreground_exes "$PROFILE_KIND")" 2>/dev/null)"
+    info_rc=$?
+    set -e
+    if [[ "$info_rc" -ne 0 ]]; then
+      agent_foreground_diagnostics "pane process-info returned an invalid envelope before brief injection"
+      return 1
+    fi
+    [[ "$ready" == yes ]] && return 0
+    if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= AGENT_FOREGROUND_TIMEOUT_MS )); then
+      agent_foreground_diagnostics "agent not foreground within ${AGENT_FOREGROUND_TIMEOUT_MS}ms (not-foreground x$attempts)"
+      return 1
+    fi
+    sleep_for "$SHELL_READY_POLL_SECONDS"
+  done
+}
+
 # `pane run` has no availability check: it types into whatever holds the
 # terminal. Before running Devin, poll process-info until herdr's own
 # available-shell rule holds (the shell is the foreground process group and the
 # only foreground process). A process-info failure or an envelope that cannot
 # be read fails closed at once; only "not ready yet" is polled, inside the same
 # window that detection and the idle wait then share.
+# #604/m1b: herdr's process-info shape is not identical everywhere — the m1b
+# 0.9.0 reply (hk:doc evidence/2026-09-24/task604-m1b-repro) carries
+# process_info without the "result" wrapper and without
+# foreground_process_group_id, but still names shell_pid and the foreground
+# list. That is a readable "not ready yet" (an rc-file subprocess like
+# compinit's grep holding the foreground), not an invalid envelope: readiness
+# is judged from shell_pid + foreground pids alone, the group id checked only
+# when present. What stays invalid — and fails closed at once — is an envelope
+# whose shell_pid/foreground list cannot be read at all.
 devin_wait_shell_ready() {
   local started_at="$1" attempts=0 max_attempts info_out info_rc ready
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
@@ -1009,16 +1277,23 @@ devin_wait_shell_ready() {
     set +e
     ready="$(printf '%s' "$info_out" | python3 -c '
 import json, sys
-info = json.load(sys.stdin)["result"]["process_info"]
-shell = info["shell_pid"]
-group = info["foreground_process_group_id"]
-procs = info["foreground_processes"]
-if type(shell) is not int or type(group) is not int or not isinstance(procs, list):
+d = json.load(sys.stdin)
+res = d.get("result")
+info = res.get("process_info") if isinstance(res, dict) else d.get("process_info")
+if not isinstance(info, dict):
     raise SystemExit(1)
-pids = [p["pid"] for p in procs]
-if any(type(pid) is not int for pid in pids):
+shell = info.get("shell_pid")
+group = info.get("foreground_process_group_id")
+procs = info.get("foreground_processes")
+if type(shell) is not int or not isinstance(procs, list):
     raise SystemExit(1)
-print("yes" if group == shell and pids and all(pid == shell for pid in pids) else "no")
+if group is not None and type(group) is not int:
+    raise SystemExit(1)
+pids = [p.get("pid") if isinstance(p, dict) else None for p in procs]
+ready = bool(pids) and all(pid == shell for pid in pids)
+if group is not None:
+    ready = ready and group == shell
+print("yes" if ready else "no")
 ' 2>/dev/null)"
     info_rc=$?
     set -e
@@ -1035,8 +1310,110 @@ print("yes" if group == shell and pids and all(pid == shell for pid in pids) els
   done
 }
 
+# #649: a slow host (m1b) reaches the identity check before devin's TUI is
+# painted — the pane still shows only the typed command and every identity
+# rule reports unmatched, so a single `agent explain` used to fail the spawn
+# with "invalid identity envelope" while the agent was merely starting. Inside
+# the START_TIMEOUT window an envelope with no matched rule is "not identified
+# yet": explain is re-polled with backoff (the same window that shell
+# readiness, detection and the idle wait share). A matched non-welcome rule —
+# trust dialog, permission prompt, error screen — is a terminal state and is
+# judged at once, as is a non-devin agent or an unreadable envelope. On window
+# expiry the failure is the existing fail-closed path plus #604's evidence
+# preservation, and the reason names which unmatched shape never resolved.
+DEVIN_IDENTITY_POLL_MS=250
+DEVIN_IDENTITY_POLL_MAX_MS=2000
+
+# Prints the identity verdict for one `agent explain` envelope, one of:
+#   ready                    agent=devin and matched_rule.id=welcome_prompt_footer
+#   decided<TAB>agent<TAB>rule  a non-welcome rule matched, or the detected
+#                            agent is not devin — judged immediately either way
+#   starting                 no rule matched and the evaluated screen region is
+#                            only the `devin …` command line wrk typed
+#   unmatched                no rule matched but the screen shows something
+#                            else (mid-render, or a genuinely unexpected pane)
+# Exit 1 = the envelope itself could not be read (the #604 "invalid identity
+# envelope" case — never retried, a malformed answer is not startup).
+devin_classify_identity() {
+  WRK_DEVIN_CMD="devin ${ARGS[*]}" python3 -c '
+import json, os, sys
+d = json.load(sys.stdin)
+agent = d.get("agent")
+matched = d.get("matched_rule")
+if not isinstance(agent, str):
+    sys.exit(1)
+if matched is None:
+    rule = None
+elif isinstance(matched, dict) and isinstance(matched.get("id"), str):
+    rule = matched["id"]
+else:
+    sys.exit(1)
+if agent == "devin" and rule == "welcome_prompt_footer":
+    print("ready")
+elif agent != "devin" or rule is not None:
+    print("decided\t%s\t%s" % (agent, rule or ""))
+else:
+    cmd = "".join(os.environ.get("WRK_DEVIN_CMD", "").split())
+    previews = [
+        ev["region_preview"]
+        for r in d.get("evaluated_rules") or []
+        if isinstance(r, dict)
+        for ev in [r.get("evidence")]
+        if isinstance(ev, dict) and isinstance(ev.get("region_preview"), str)
+    ]
+    flat = "".join((max(previews, key=len) if previews else "").split())
+    idx = flat.rfind(cmd) if cmd else -1
+    # A cursor glyph may trail the command; nothing else may.
+    print("starting" if idx >= 0 and len(flat) - idx - len(cmd) <= 2 else "unmatched")
+'
+}
+
+devin_wait_identity() {
+  local started_at="$1" attempts=0 max_attempts explain_json explain_rc verdict class_rc
+  local detected_agent matched_rule poll_ms="$DEVIN_IDENTITY_POLL_MS"
+  max_attempts=$(( START_TIMEOUT / DEVIN_IDENTITY_POLL_MS ))
+  while :; do
+    attempts=$(( attempts + 1 ))
+    set +e
+    explain_json="$("$HERDR" agent explain "$PANE" --format json 2>/dev/null)"
+    explain_rc=$?
+    set -e
+    if [[ "$explain_rc" -ne 0 ]]; then
+      devin_spawn_diagnostics "agent explain exited $explain_rc" 1 "$explain_rc" "$explain_json"
+      return "$explain_rc"
+    fi
+    set +e
+    verdict="$(printf '%s' "$explain_json" | devin_classify_identity)"
+    class_rc=$?
+    set -e
+    if [[ "$class_rc" -ne 0 ]]; then
+      devin_spawn_diagnostics "agent explain returned an invalid identity envelope" 1 "$explain_rc" "$explain_json"
+      return 1
+    fi
+    case "$verdict" in
+      ready) return 0 ;;
+      decided*)
+        IFS=$'\t' read -r _ detected_agent matched_rule <<<"$verdict"
+        devin_spawn_diagnostics "expected agent=devin rule=welcome_prompt_footer, got agent=$detected_agent rule=$matched_rule" 1 "$explain_rc" "$explain_json"
+        return 1 ;;
+      starting|unmatched)
+        if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= START_TIMEOUT )); then
+          if [[ "$verdict" == starting ]]; then
+            devin_spawn_diagnostics "agent explain still starting within ${START_TIMEOUT}ms (command-line-only screen x$attempts)" 1 "$explain_rc" "$explain_json"
+          else
+            devin_spawn_diagnostics "agent explain matched no identity rule within ${START_TIMEOUT}ms (unmatched screen x$attempts)" 1 "$explain_rc" "$explain_json"
+          fi
+          return 1
+        fi
+        sleep_for "$(awk -v ms="$poll_ms" 'BEGIN{printf "%.3f", ms/1000}')"
+        (( poll_ms < DEVIN_IDENTITY_POLL_MAX_MS )) && poll_ms=$(( poll_ms * 2 ))
+        ;;
+    esac
+  done
+}
+
 devin_start_in_pane() {
-  local run_rc wait_rc explain_rc parse_rc rename_rc explain_json identity detected_agent matched_rule
+  local run_rc wait_rc identity_rc=0 rename_rc
   local started_at remaining_ms
 
   started_at="$(date +%s)"
@@ -1066,7 +1443,7 @@ devin_start_in_pane() {
   # negative timeout (it must not turn into an unbounded or undefined wait).
   remaining_ms=$(( START_TIMEOUT - ($(date +%s) - started_at) * 1000 ))
   if (( remaining_ms <= 0 )); then
-    devin_spawn_diagnostics "agent detected after the ${START_TIMEOUT}ms window"
+    devin_spawn_diagnostics "agent detected after the ${START_TIMEOUT}ms window" 1
     spawn_pane_cleanup
     return 1
   fi
@@ -1075,44 +1452,22 @@ devin_start_in_pane() {
   wait_rc=$?
   set -e
   if [[ "$wait_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "welcome_prompt_footer wait exited $wait_rc"
+    devin_spawn_diagnostics "welcome_prompt_footer wait exited $wait_rc" 1
     spawn_pane_cleanup
     return "$wait_rc"
   fi
 
-  set +e
-  explain_json="$("$HERDR" agent explain "$PANE" --format json 2>/dev/null)"
-  explain_rc=$?
-  set -e
-  if [[ "$explain_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "agent explain exited $explain_rc"
+  # #649: the identity check used to be one shot, which mistook a slow TUI
+  # (m1b, MCP servers still starting) for a spawn failure.  Poll explain until
+  # a rule matches, the envelope is decided, or the START_TIMEOUT window
+  # closes; the preserved rc distinguishes the sub-failures for callers. The
+  # `||` capture keeps errexit off through the call — the wait re-enables it
+  # internally, so a plain `set +e` bracket would still abort before the rc
+  # could be read (the sibling waits get the same shield from `if !`).
+  devin_wait_identity "$started_at" || identity_rc=$?
+  if [[ "$identity_rc" -ne 0 ]]; then
     spawn_pane_cleanup
-    return "$explain_rc"
-  fi
-
-  set +e
-  identity="$(printf '%s' "$explain_json" | python3 -c '
-import json, sys
-d = json.load(sys.stdin)
-agent = d.get("agent")
-matched = d.get("matched_rule")
-rule = matched.get("id") if isinstance(matched, dict) else None
-if not isinstance(agent, str) or not isinstance(rule, str):
-    raise SystemExit(1)
-print(agent + "\t" + rule)
-')"
-  parse_rc=$?
-  set -e
-  if [[ "$parse_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "agent explain returned an invalid identity envelope"
-    spawn_pane_cleanup
-    return 1
-  fi
-  IFS=$'\t' read -r detected_agent matched_rule <<<"$identity"
-  if [[ "$detected_agent" != devin || "$matched_rule" != welcome_prompt_footer ]]; then
-    devin_spawn_diagnostics "expected agent=devin rule=welcome_prompt_footer, got agent=$detected_agent rule=$matched_rule"
-    spawn_pane_cleanup
-    return 1
+    return "$identity_rc"
   fi
 
   set +e
@@ -1120,7 +1475,7 @@ print(agent + "\t" + rule)
   rename_rc=$?
   set -e
   if [[ "$rename_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "agent rename exited $rename_rc"
+    devin_spawn_diagnostics "agent rename exited $rename_rc" 1
     spawn_pane_cleanup
     return "$rename_rc"
   fi
@@ -1523,6 +1878,10 @@ resolve_catalog_profile() {
     codex-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=medium ;;
     codex-luna-hi) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=high ;;
     codex-luna-max) CATALOG_PROFILE=codex-luna-max ;;
+    # #633: builder-luna is codex-luna admitted under --role builder at the
+    # #594 E3 effort (xhigh) — pinned so the catalog is consulted at the same
+    # effort the grade ceiling was rated at.
+    builder-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=xhigh ;;
     codex-astra) CATALOG_PROFILE=codex-astra ;;
 
     kiro-opus) CATALOG_PROFILE=kiro-opus ;;
@@ -1703,6 +2062,14 @@ resolve_profile() {
     devin-glm52) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model glm-5-2 --permission-mode dangerous --respect-workspace-trust false) ;;
     devin-swe17) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-1-7 --permission-mode dangerous --respect-workspace-trust false) ;;
     devin-ds41) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-high --permission-mode dangerous --respect-workspace-trust false) ;;
+    # Task #635: devin effort lives inside the model id — there is no --effort
+    # flag — so each rung is a named profile on the same unattended argv.
+    # devin-swe2 stays the high default; swe-2-medium/max are the free rungs,
+    # ds41-max the paid max rung. The swe-2 effort spellings are also admitted
+    # under --role builder (that is the builder-devin effort path).
+    devin-swe2-medium) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-swe2-max) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2-max --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-ds41-max) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-max --permission-mode dangerous --respect-workspace-trust false) ;;
 
     # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
     # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
@@ -1755,6 +2122,10 @@ resolve_profile() {
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    # task #633 (#594 E3): builder-luna is codex-luna under --role builder at
+    # xhigh. The literal is the catalog-unreachable fallback; #593 wiring lets
+    # `policy launch` replace both fields.
+    builder-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
     # task #527 요건 ⑦: codex-astra default effort is xhigh, unified with
     # ARCHITECT.md's spawn command and the consult-advisor SKILL.md note
     # (hk:doc note/2026-09-22/task527-astra-effort-alignment).
@@ -1859,14 +2230,14 @@ resolve_profile() {
     # argparse-rejected, rc=2 fail-closed). Per-model attribution survives in
     # the job.spawned payload `profile` and the quota_pool.record
     # `launch_profile`, so reps stay separated per model.
-    devin-glm52|devin-swe17|devin-ds41) GATE_PROFILE=devin-swe2 ;;
+    devin-glm52|devin-swe17|devin-ds41|devin-swe2-medium|devin-swe2-max|devin-ds41-max) GATE_PROFILE=devin-swe2 ;;
     codex|codex-sol|codex-max|builder-sol|captain-sol|codex-sol56) GATE_PROFILE=codex-max ;;
     # task #527: the gate role-denies astra without an allowed --purpose, so the
     # counsel spawn path defaults it to `architect` (the wrk-side counsel use).
     # An explicit --purpose director|operator-request still wins.
     codex-astra) GATE_PROFILE=codex-astra; [[ -n "${PURPOSE:-}" ]] || PURPOSE=architect ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
-    codex-luna|codex-luna-hi|codex-luna-max|codex-luna56) GATE_PROFILE=codex-luna-max ;;
+    codex-luna|codex-luna-hi|codex-luna-max|codex-luna56|builder-luna) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
     kiro-sonnet) GATE_PROFILE=kiro-sonnet ;;
     kiro-cheap) GATE_PROFILE=kiro-cheap ;;
@@ -3680,18 +4051,25 @@ spawn_cmd() {
     case "$MODEL" in
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
-      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-grok or builder-kimi (pilot worker spellings devin-swe2, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; terra/luna and devin-glm52/devin-swe17/devin-ds41 are worker-only)" ;;
+      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|builder-luna|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-grok, builder-kimi or builder-luna (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
         [[ -z "$EFFORT" || "$EFFORT" == high ]] || die "builder-opus (legacy captain-opus alias) requires effort high"
         ;;
+      # #633: the catalog grades codex-luna per effort (medium=B, max=A+). The
+      # E3 sample is defined at xhigh only — a lower or higher --effort would
+      # move the rung the ceiling was rated at, so the guard reuses the
+      # builder-opus pin and refuses rather than silently relaunch.
+      builder-luna)
+        [[ -z "$EFFORT" || "$EFFORT" == xhigh ]] || die "builder-luna requires effort xhigh (#594 E3 sample profile)"
+        ;;
     esac
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|builder-luna|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
@@ -3790,6 +4168,13 @@ print(value if isinstance(value, str) else "")
     agent_start_in_pane
   fi
   sleep_for "$BOOT_SETTLE"
+  # #609: no prompt reaches the pane until the agent itself is observed in the
+  # foreground — an accepted start whose binary never ran (command not found)
+  # must close the pane, not receive a brief at the shell.
+  if ! agent_wait_foreground; then
+    spawn_pane_cleanup
+    return 1
+  fi
   if [[ "$PROFILE_KIND" == kimi ]]; then
     VISIBLE_SCREEN=""
     VISIBLE_SCREEN="$($HERDR agent read "$PANE" --lines 40 --source visible 2>/dev/null || true)"

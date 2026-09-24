@@ -343,6 +343,7 @@ grep -qx 'builder-sol' <<<"$profiles_out"
 grep -qx 'builder-devin' <<<"$profiles_out"
 grep -qx 'builder-grok' <<<"$profiles_out"
 grep -qx 'builder-kimi' <<<"$profiles_out"
+grep -qx 'builder-luna' <<<"$profiles_out"
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
@@ -357,6 +358,12 @@ if grep -qx 'captain-astra' <<<"$profiles_out"; then exit 1; fi
 grep -qx 'devin-glm52' <<<"$profiles_out"
 grep -qx 'devin-swe17' <<<"$profiles_out"
 grep -qx 'devin-ds41' <<<"$profiles_out"
+# #635: the devin effort rungs are named profiles (effort sits inside the
+# devin model id — no --effort flag exists). The scopefuel catalog lists all
+# three, so the wrk⊇scopefuel cross-check needs them here.
+grep -qx 'devin-swe2-medium' <<<"$profiles_out"
+grep -qx 'devin-swe2-max' <<<"$profiles_out"
+grep -qx 'devin-ds41-max' <<<"$profiles_out"
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -394,6 +401,7 @@ profiles=(
   "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku"
   "devin-swe2:devin-swe2"
   "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
+  "devin-swe2-medium:devin-swe2" "devin-swe2-max:devin-swe2" "devin-ds41-max:devin-swe2"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
@@ -572,6 +580,114 @@ devin_readiness_failure_case devin-explain-fail 4
 devin_readiness_failure_case devin-explain-garbage 1
 grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
   fail "malformed explain JSON lost its diagnostic: $DEVIN_CASE_OUT"
+
+# #604: the 2026-09-23 incident shape — explain answers a well-formed envelope
+# whose matched_rule is absent because no identity rule claimed the screen
+# (first-open trust prompt hypothesis). Since #649 this bare envelope carries
+# no evaluated_rules proving the screen is just the command line, so it is an
+# "unmatched" screen: polled to the window, then the spawn still fails and
+# the pane's screen, transcript, explain JSON and process-info must survive
+# the pane.
+devin_readiness_failure_case devin-explain-no-rule 1
+grep -q 'agent explain matched no identity rule within 30000ms (unmatched screen x120)' <<<"$DEVIN_CASE_OUT" ||
+  fail "no-rule explain lost the bounded-window diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 120 ]] ||
+  fail "no-rule explain must poll to the 30000/250 attempt cap"
+grep -q 'Devin spawn failure artifacts preserved under ' <<<"$DEVIN_CASE_OUT" ||
+  fail "604 failure artifacts were not announced: $DEVIN_CASE_OUT"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 artifact dir missing: $artifact_dir"
+[[ "$artifact_dir" == "$TMP/inbox/fixture/devin-spawn-failure-"* ||
+   "$artifact_dir" == "$(cd "$TMP" && pwd -P)/inbox/fixture/devin-spawn-failure-"* ]] ||
+  fail "604 artifacts must live in the job dir: $artifact_dir"
+grep -q 'reason=agent explain matched no identity rule within 30000ms' "$artifact_dir/reason.txt" ||
+  fail "604 reason.txt lost the failure reason"
+grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
+  fail "604 the explain envelope that failed was not preserved"
+grep -q 'fixture welcome screen' "$artifact_dir/screen-visible.txt" ||
+  fail "604 visible screen was not preserved"
+grep -q 'fixture welcome screen' "$artifact_dir/transcript.txt" ||
+  fail "604 transcript was not preserved"
+grep -q 'pane_id' "$artifact_dir/process-info.out" ||
+  fail "604 process-info was not preserved"
+# The jobs root is scanned for event envelopes with rglob("*.json"); a raw
+# capture that is not an event envelope must not carry the .json extension
+# (a 'not json at all' explain.out broke exactly that scan on CI 2026-09-24).
+if find "$artifact_dir" -name '*.json' | grep -q .; then
+  fail "604 artifact dir must not contain .json files: $artifact_dir"
+fi
+echo "PASS 604-explain-no-rule-artifacts-preserved"
+
+# #604 hypothesis variant: a rule did match — the trust prompt — so the spawn
+# fails on the rule id, and the preserved visible screen carries the actual
+# cause the pane was showing.
+devin_readiness_failure_case devin-trust-screen 1
+grep -q 'expected agent=devin rule=welcome_prompt_footer, got agent=devin rule=trust_directory' <<<"$DEVIN_CASE_OUT" ||
+  fail "trust-screen explain lost its rule diagnostic: $DEVIN_CASE_OUT"
+# #649: a matched non-welcome rule is a terminal state — judged on the first
+# explain, never polled (a mutant that retries matched rules turns this red).
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "trust-screen must be judged on the first explain, not polled"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 trust-screen artifact dir missing"
+grep -q 'trust_directory' "$artifact_dir/explain.out" ||
+  fail "604 trust-screen explain.out was not preserved"
+grep -q 'Do you trust the contents of this directory?' "$artifact_dir/screen-visible.txt" ||
+  fail "604 trust-screen visible capture lost the prompt"
+echo "PASS 604-trust-screen-artifacts-preserved"
+
+# #604: preservation also covers the non-explain failures, and a failed
+# capture must never mask the spawn failure it documents. explain-fail leaves
+# explain.rc=4 instead of a stolen success.
+devin_readiness_failure_case devin-explain-fail 4
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" && -f "$artifact_dir/explain.rc" ]] ||
+  fail "604 explain-fail must still leave an artifact dir: $DEVIN_CASE_OUT"
+grep -qx 'rc=4' "$artifact_dir/explain.rc" ||
+  fail "604 explain-fail must record the explain rc: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+echo "PASS 604-explain-fail-artifacts-preserved"
+
+# #604 (CodeRabbit major on PR #122): explain answering rc=0 with EMPTY stdout
+# is a supplied failing response, not an absent one. Preservation must save
+# that response verbatim (a 0-byte explain.out plus an explicit rc=0) and must
+# not re-query — a second explain would overwrite the artifact with a later,
+# different response (the fixture answers a valid envelope from call 2 on, so
+# a re-querying mutant turns this red).
+devin_readiness_failure_case devin-explain-empty 1
+grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
+  fail "empty explain response lost the invalid-envelope diagnostic: $DEVIN_CASE_OUT"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 explain-empty artifact dir missing: $DEVIN_CASE_OUT"
+[[ -f "$artifact_dir/explain.out" && ! -s "$artifact_dir/explain.out" ]] ||
+  fail "604 explain-empty must preserve the empty response verbatim: $(ls -l "$artifact_dir" 2>/dev/null)"
+grep -qx 'rc=0' "$artifact_dir/explain.rc" ||
+  fail "604 explain-empty must record the supplied explain rc=0: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "604 explain-empty must not re-query explain over the failing response"
+echo "PASS 604-explain-empty-response-preserved"
+
+# #604 (tester round 1): a pre-detection failure must not query agent
+# endpoints, but it still owes the artifact set an explicit explain outcome —
+# rc=skipped, not an absent file that reads as "preservation forgot it".
+devin_readiness_failure_case devin-get-error 1
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 get-error artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=skipped' "$artifact_dir/explain.rc" ||
+  fail "604 pre-detection failure must record explain rc=skipped: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+echo "PASS 604-pre-detection-explain-skip-recorded"
+
+# #604 (tester round 1, minor): a failed pane-read capture must not mask,
+# replace or worsen the spawn failure it documents — rc stays 1 and the rest
+# of the artifact set is still written.
+devin_readiness_failure_case devin-read-fail 1
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 read-fail artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=9' "$artifact_dir/screen-visible.rc" ||
+  fail "604 read-fail must record the capture rc: $(cat "$artifact_dir/screen-visible.rc" 2>/dev/null)"
+grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
+  fail "604 read-fail must still preserve the explain envelope"
+echo "PASS 604-capture-failure-does-not-mask-spawn-rc"
+
 devin_readiness_failure_case devin-never-detect 1
 grep -q "Devin pane startup failed: agent not detected within 30000ms (agent_not_found x120)" <<<"$DEVIN_CASE_OUT" ||
   fail "never-detected Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"
@@ -580,6 +696,54 @@ grep -q "Devin pane startup failed: agent not detected within 30000ms (agent_not
 if grep -q '^agent wait \|^agent explain ' "$TMP/herdr.log"; then
   fail "never-detected Devin waited or explained an undetected pane"
 fi
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 never-detect artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=skipped' "$artifact_dir/explain.rc" ||
+  fail "604 never-detect must record explain rc=skipped: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+
+# #649 (m1b): a slow devin reaches the identity check before its TUI is
+# painted — explain answers a well-formed envelope with every rule unmatched
+# and the evaluated region still holds only the typed command line. That is
+# "still starting", not a spawn failure: explain is re-polled with backoff
+# inside the same START_TIMEOUT window. A mutant that fails on the first
+# unmatched envelope turns the success assertion red.
+: >"$TMP/herdr.log"
+devin_starting_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO=devin-explain-starting spawn_base devin-swe2 2>&1)" ||
+  fail "still-starting Devin must spawn once the welcome footer appears: $devin_starting_out"
+grep -q 'landed=yes' <<<"$devin_starting_out" ||
+  fail "still-starting Devin did not land: $devin_starting_out"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 4 ]] ||
+  fail "starting Devin must poll explain until a rule matches: $(grep -c '^agent explain ' "$TMP/herdr.log")"
+grep -qx 'agent rename w:p1 fixture' "$TMP/herdr.log" ||
+  fail "still-starting Devin must rename the tab-create pane id"
+[[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "still-starting Devin must receive exactly one brief"
+echo "PASS 649-starting-polls-then-succeeds"
+
+# The same command-line-only screen that never resolves: the window closes
+# and the spawn fails closed with the #604 artifact set and a reason naming
+# the still-starting shape — "on timeout, the existing fail-closed path".
+devin_readiness_failure_case devin-explain-starting-stuck 1
+grep -q 'Devin pane startup failed: agent explain still starting within 30000ms (command-line-only screen x120)' <<<"$DEVIN_CASE_OUT" ||
+  fail "never-starting Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 120 ]] ||
+  fail "never-starting Devin must poll explain exactly the 30000/250 attempt cap"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "649 starting-stuck artifact dir missing: $artifact_dir"
+grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
+  fail "649 starting-stuck must preserve the last explain envelope"
+echo "PASS 649-starting-window-fails-closed"
+
+# Unknown screen — unmatched rules AND the evaluated region is not the
+# command line: also rides the window out, then fails ("fail after the
+# window"), distinct from a matched dialog's immediate judgement. A mutant
+# that fails it on the first explain turns the poll-count assertion red.
+devin_readiness_failure_case devin-explain-unknown 1
+grep -q 'Devin pane startup failed: agent explain matched no identity rule within 30000ms (unmatched screen x120)' <<<"$DEVIN_CASE_OUT" ||
+  fail "unknown-screen Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 120 ]] ||
+  fail "unknown-screen Devin must poll explain exactly the 30000/250 attempt cap"
+echo "PASS 649-unknown-screen-window-fails-closed"
 
 # Detection on the window edge: a fake clock (only `date +%s` is faked) puts
 # every reading after the first 31s past pane run. Detection succeeds on the
@@ -726,6 +890,97 @@ for shell_err_pair in "start-not-ready:1:agent_not_ready" "start-pane-unavailabl
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "$shell_err_scenario delivered a brief"; fi
 done
 
+# #609: an accepted `agent start` whose binary never reaches the pane
+# foreground — the m1b shape, zsh answered "command not found: codex" — must
+# not receive a brief. Before any injection wrk polls process-info until a
+# foreground process's argv0 is the kind's canonical executable; the shell
+# alone, a shell child or an unrelated process are all "not the agent", and
+# the bounded window ends in fail-closed: pane closed, zero injections through
+# either path (panewire prompt or a direct agent prompt/send-keys).
+FG_PW_LOG="$TMP/foreground-panewire.log"
+fg_failure_case() {
+  local model="$1" scenario="$2" want_rc="$3" out rc
+  : >"$TMP/herdr.log"
+  rm -f "$FG_PW_LOG" "$FG_PW_LOG".*
+  set +e
+  out="$(WRK_PANEWIRE_PROMPT_LOG="$FG_PW_LOG" TEST_FIXTURE_SCENARIO="$scenario" spawn_base "$model" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq "$want_rc" ]] ||
+    fail "$model/$scenario expected rc=$want_rc, got rc=$rc: $out"
+  grep -q 'agent foreground check failed:' <<<"$out" ||
+    fail "$model/$scenario lost its foreground diagnostic: $out"
+  grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+    fail "$model/$scenario leaked the agent-less pane"
+  if grep -q '^agent prompt \|^agent send-keys \|^pane run .*-p\b' "$TMP/herdr.log"; then
+    fail "$model/$scenario injected into a pane without its agent"
+  fi
+  [[ ! -e "$FG_PW_LOG" ]] ||
+    fail "$model/$scenario delivered a panewire prompt without its agent"
+  FG_CASE_OUT="$out"
+}
+
+# The bare shell in the foreground is the incident shape, for a start-path
+# kind and for Devin's pane-run path alike.
+fg_failure_case opus agent-never-foreground 1
+grep -q 'agent not foreground within 10000ms (not-foreground x40)' <<<"$FG_CASE_OUT" ||
+  fail "never-foreground claude lost its bounded-window diagnostic: $FG_CASE_OUT"
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 41 ]] ||
+  fail "never-foreground claude must stop at the 10000/250 cap plus one diagnostic"
+fg_failure_case codex-terra agent-never-foreground 1
+fg_failure_case devin-swe2 agent-never-foreground 1
+# kiro's pre-brief /effort prompt is also an injection; the gate precedes it.
+# (`agent start` argv legitimately carries `--effort`, so assert on the prompt
+# verb, not the word.)
+fg_failure_case kiro agent-never-foreground 1
+if grep -q '^agent prompt w:p1 /effort' "$TMP/herdr.log"; then
+  fail "kiro /effort prompt reached a pane whose agent never foregrounded"
+fi
+# An unrelated process holding the foreground is not the agent either.
+fg_failure_case opus agent-foreground-other 1
+# Unreadable answers fail closed at once, like the Devin pre-run check.
+fg_failure_case opus agent-foreground-info-fail 1
+grep -q 'pane process-info exited 3 before brief injection' <<<"$FG_CASE_OUT" ||
+  fail "process-info failure lost its diagnostic: $FG_CASE_OUT"
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "process-info rc failure must fail on the first check, not be retried"
+fg_failure_case opus agent-foreground-garbage 1
+grep -q 'pane process-info returned an invalid envelope before brief injection' <<<"$FG_CASE_OUT" ||
+  fail "invalid foreground envelope lost its diagnostic: $FG_CASE_OUT"
+
+# The poll is real: a pane that foregrounds the agent two reads late still
+# spawns and lands exactly one brief.
+: >"$TMP/herdr.log"
+fg_late_out="$(TEST_FIXTURE_SCENARIO=agent-late-foreground spawn_base opus 2>&1)" ||
+  fail "late-foreground agent must still spawn: $fg_late_out"
+grep -q 'landed=yes' <<<"$fg_late_out" ||
+  fail "late-foreground agent did not land: $fg_late_out"
+[[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "late-foreground agent must receive exactly one brief"
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 3 ]] ||
+  fail "late-foreground agent must be admitted on the third process-info read"
+if grep -q '^pane close ' "$TMP/herdr.log"; then fail "late-foreground pane was closed"; fi
+echo "PASS task609 pre-injection foreground-agent check"
+
+# Regression: the kind's herdr --kind name is not always its pane argv0.
+# Measured on live panes 2026-09-24 — kimi lands as argv0 "kimi-code", codex
+# as a node leader plus a native "codex" child — so the fixture emits those
+# real values and every kind below must still be admitted (the #609 follow-up
+# hotfix: matching only the kind string fail-closed every real kimi spawn).
+for fg_kind_pair in opus:claude codex-terra:codex devin-swe2:devin kimi-k3:kimi grok:grok kiro:kiro oc-glm:opencode agy-flash:agy; do
+  fg_model="${fg_kind_pair%%:*}"; fg_kind="${fg_kind_pair##*:}"
+  : >"$TMP/herdr.log"
+  set +e
+  fg_real_out="$(KIMI_CODE_HOME="$TMP/kimi-$fg_model-home" TEST_FIXTURE_SCENARIO=spawn spawn_base "$fg_model" 2>&1)"
+  fg_real_rc=$?
+  set -e
+  [[ "$fg_real_rc" -eq 0 ]] ||
+    fail "$fg_model (kind $fg_kind) must spawn under its real argv0 (rc=$fg_real_rc): $fg_real_out"
+  grep -q 'landed=yes' <<<"$fg_real_out" ||
+    fail "$fg_model (kind $fg_kind) was not admitted under its real argv0: $fg_real_out"
+done
+echo "PASS foreground check admits every kind under its real argv0"
+
 # Window boundaries on a fake clock: every `date +%s` after the first agent
 # start (or, for Devin, the first process-info) reads FAKECLOCK_JUMP seconds
 # later. Each retry hands herdr only what is left of the window, and herdr
@@ -829,6 +1084,26 @@ for shell_window_jump in 30 31; do
 done
 echo "PASS task606 shell-ready wait: agent_pane_busy retry, Devin process-info poll, window bound, fail-closed"
 
+# #604/m1b (hk:doc evidence/2026-09-24/task604-m1b-repro): the m1b herdr 0.9.0
+# process-info reply has no "result" wrapper and no foreground_process_group_id
+# but still names shell_pid and the foreground list. While the foreground is
+# an rc-file subprocess (compinit's grep) the answer is "not ready yet" and
+# must be polled inside the window — the observed m1b failure was this
+# readable reply being classified as an invalid envelope after one check.
+# Mutant: removing the wait types the devin argv into the busy shell (pane run
+# fires on poll 1), and strict-parsing the envelope fails the spawn outright.
+: >"$TMP/herdr.log"
+devin_m1b_out="$(TEST_FIXTURE_SCENARIO=devin-shell-busy-m1b spawn_base devin-swe2 2>&1)" ||
+  fail "m1b-shape shell ready on the fourth poll must still spawn: $devin_m1b_out"
+grep -q 'landed=yes' <<<"$devin_m1b_out" ||
+  fail "m1b-shape late-shell Devin did not land: $devin_m1b_out"
+devin_m1b_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+[[ "$(head -n "$devin_m1b_run_no" "$TMP/herdr.log" | grep -c '^pane process-info --pane w:p1$')" -eq 4 ]] ||
+  fail "m1b-shape Devin must poll process-info until the shell is alone in the foreground"
+if grep -q '^pane close ' "$TMP/herdr.log"; then fail "m1b-shape late-shell Devin pane was closed"; fi
+devin_shell_failure_case devin-shell-never-ready-m1b 'shell not ready within 30000ms (foreground busy x120)'
+echo "PASS 604-m1b-envelope: unwrapped process-info polls shell-busy foreground, fail-closed at window"
+
 expect_exit 2 spawn_base devin-swe2 --effort high
 # Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker
 # spelling is now admitted under --role builder too — this acceptance replaces
@@ -847,8 +1122,11 @@ echo "PASS devin-swe2 worker kind/argv/no-effort snapshot + builder-pilot admiss
 
 # Task 281 (operator decision 2026-09-14 devin-pro-paid-models): the three
 # additional Devin model profiles reuse the identical unattended argv — only
-# the --model name differs — and reject --effort like devin-swe2.
-for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepseek-v4-1-flash-high"; do
+# the --model name differs — and reject --effort like devin-swe2. #635 adds
+# the effort rungs as named profiles (effort lives inside the model id), same
+# argv skeleton and same --effort rejection.
+for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepseek-v4-1-flash-high" \
+  "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2-max" "devin-ds41-max:deepseek-v4-1-flash-max"; do
   devin_profile="${devin_pair%%:*}"
   devin_model="${devin_pair#*:}"
   : >"$TMP/herdr.log"
@@ -864,7 +1142,12 @@ for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepse
     fail "$devin_profile run argv must not contain effort"
   expect_exit 2 spawn_base "$devin_profile" --effort high
 done
-echo "PASS devin-glm52/devin-swe17/devin-ds41 worker kind/argv/no-effort snapshots"
+echo "PASS devin-glm52/devin-swe17/devin-ds41 + #635 effort-variant worker kind/argv/no-effort snapshots"
+
+# #635 AC2: an unknown effort token is still refused on the new spellings —
+# the generic unknown-effort die fires before the devin no-effort guard.
+expect_exit 2 spawn_base devin-swe2-max --effort bogus
+expect_exit 2 spawn_base devin-ds41-max --effort medium
 
 # ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
 # file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
@@ -1479,6 +1762,78 @@ grep -q 'landed=yes' <<<"$devin_pw_out" || fail "498 devin landing regressed: $d
 grep -q 'panewire_rc' <<<"$devin_pw_out" && fail "498 devin landed must not carry a failure detail: $devin_pw_out"
 [[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 devin one delivery"
 echo "PASS 498-a4-devin-corroborated"
+
+# #568: the 2026-09-22 t502-verify duplicate — panewire rc 6 "submission
+# evidence unproven" while devin had already consumed the brief. The
+# transcript holds the marker folded across a line break and devin reports
+# working; neither must trigger a second delivery.
+pw_reset
+devin_wrapped_out="$(TEST_FIXTURE_SCENARIO=devin-wrapped-marker pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=yes' <<<"$devin_wrapped_out" || fail "568 folded-marker devin must land: $devin_wrapped_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 folded-marker devin was re-injected"
+if grep -q 'reinject' <<<"$devin_wrapped_out"; then fail "568 folded-marker devin announced a reinject: $devin_wrapped_out"; fi
+echo "PASS 568-devin-folded-marker-no-duplicate"
+
+# #568 auxiliary evidence: marker absent entirely, devin working after an
+# accepted submit — the pane was verified idle before injection, so working
+# means it consumed the brief.
+pw_reset
+devin_working_out="$(TEST_FIXTURE_SCENARIO=devin-working-no-marker pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=yes' <<<"$devin_working_out" || fail "568 devin working must land: $devin_working_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 devin working was re-injected"
+echo "PASS 568-devin-working-status-lands"
+
+# #568: a devin queued banner is unattributable (grok-chip precedent) —
+# ambiguous evidence suppresses the re-injection without claiming landed.
+pw_reset
+devin_queued_out="$(TEST_FIXTURE_SCENARIO=devin-queued pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_queued_out" || fail "568 devin queued must not claim landed: $devin_queued_out"
+grep -q 'reason=ambiguous-observation' <<<"$devin_queued_out" ||
+  fail "568 devin queued must be ambiguous: $devin_queued_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 devin queued was re-injected"
+echo "PASS 568-devin-queued-ambiguous-no-reinject"
+
+# #568 negative direction: a devin pane with no evidence at all (status
+# unknown — absent from agent list) still gets exactly one re-injection and
+# then stops.
+pw_reset
+devin_none_out="$(TEST_FIXTURE_SCENARIO=devin-no-landing pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_none_out" || fail "568 devin no-landing: $devin_none_out"
+grep -q 'action=reinject-once' <<<"$devin_none_out" ||
+  fail "568 devin no-landing lost the re-injection: $devin_none_out"
+[[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] ||
+  fail "568 devin no-landing must re-inject exactly once: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-confirmed-nonlanding-reinject-once"
+
+# #568 round-2 (tester blocker): an unconfirmed submit — panewire timed out,
+# possibly before anything was sent — must not be upgraded to landed by a
+# merely-working devin. The timeout fixture exits before `agent prompt`, so
+# herdr_briefs=0 proves nothing was ever injected.
+pw_reset
+devin_unconf_out="$(TEST_FIXTURE_SCENARIO=devin-working-no-marker WRK_PANEWIRE_PROMPT=timeout \
+  pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_unconf_out" ||
+  fail "568 unconfirmed+working must not claim landed: $devin_unconf_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 0 ]] ||
+  fail "568 unconfirmed+working must not inject: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-unconfirmed-working-not-landed"
+
+# #568 round-2/3 (tester blockers): the marker's words in unrelated UI text are
+# not a folded marker — an unindented break mid-line, an unindented break at a
+# line start, a UI tab on one line (no line break), and an indented break
+# mid-line (not after `❭`/line start). A leftmost-match matcher returns on the
+# first variant, so ordering is part of the test: every discriminating variant
+# must be evaluated. With no other evidence this is confirmed non-landing:
+# exactly one re-injection.
+pw_reset
+devin_coll_out="$(TEST_FIXTURE_SCENARIO=devin-fold-collision pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_coll_out" ||
+  fail "568 fold-collision must not claim landed: $devin_coll_out"
+grep -q 'action=reinject-once' <<<"$devin_coll_out" ||
+  fail "568 fold-collision lost the re-injection: $devin_coll_out"
+[[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] ||
+  fail "568 fold-collision must re-inject exactly once: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-fold-collision-not-marker"
 
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"
@@ -2355,7 +2710,7 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -2382,7 +2737,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|builder-luna|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -2390,7 +2745,7 @@ accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|bui
 # the pilot worker spellings. Bare 'grok' is not extracted (it also matches
 # inside builder-grok); grok-hi presence covers it, and the literal accept-line
 # pin above guards the list itself.
-builder_tokens() { grep -oE '(builder|captain)-[a-z]+|devin-swe2|grok-hi|kimi-k3' | grep -vx 'builder-level' | sort -u; }
+builder_tokens() { grep -oE '(builder|captain)-[a-z]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vx 'builder-level' | sort -u; }
 accept_set="$(builder_tokens <<<"$accept_line")"
 help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
 help_set="$(builder_tokens <<<"$help_block")"
@@ -2524,6 +2879,37 @@ PY
 expect_exit 2 spawn_base builder-devin --role builder --lane builder-devin-lane --parent parent-lane --effort high --job builder-devin-effort-mutant
 echo "PASS builder-devin pilot profile reuses devin-swe2 kind/argv"
 
+# #635: devin effort is inside the model id, so "builder-devin takes the
+# effort too" lands as the swe-2 effort spellings admitted under --role
+# builder — same admission mechanism as the devin-swe2 pilot spelling.
+for devin_builder_pair in "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2-max"; do
+  devin_builder_profile="${devin_builder_pair%%:*}"
+  devin_builder_model="${devin_builder_pair#*:}"
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  set +e
+  devin_variant_builder_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base "$devin_builder_profile" --role builder --lane "builder-${devin_builder_profile}-lane" --parent parent-lane --job "builder-${devin_builder_profile}-job" --t T1 2>&1)"
+  devin_variant_builder_rc=$?
+  set -e
+  [[ "$devin_variant_builder_rc" -eq 0 ]] ||
+    fail "$devin_builder_profile must be admitted under --role builder (rc=$devin_variant_builder_rc): $devin_variant_builder_out"
+  grep -q "model=$devin_builder_profile" <<<"$devin_variant_builder_out" ||
+    fail "$devin_builder_profile builder spawn output lost its model: $devin_variant_builder_out"
+  devin_variant_builder_run="$(grep '^pane run ' "$TMP/herdr.log")"
+  [[ "$devin_variant_builder_run" == "pane run w:p1 devin --model $devin_builder_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
+    fail "$devin_builder_profile builder argv mismatch: $devin_variant_builder_run"
+  [[ " $devin_variant_builder_run " != *' --effort '* ]] ||
+    fail "$devin_builder_profile builder argv must not gain an effort flag"
+  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "devin-swe2" ]] ||
+    fail "$devin_builder_profile must gate as the scopefuel-known devin-swe2 spelling"
+  python3 - "$ARBITER_INBOX_ROOT/builder-${devin_builder_profile}-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+done
+echo "PASS devin-swe2 effort spellings admitted under --role builder (#635)"
+
 : >"$TMP/herdr.log" "$TMP/scopefuel.log"
 set +e
 builder_grok_out="$(spawn_base builder-grok --role builder --lane builder-grok-lane --parent parent-lane --job builder-grok-job --t T1 2>&1)"
@@ -2572,6 +2958,40 @@ PY
   expect_exit 2 spawn_base builder-kimi --role builder --lane builder-kimi-lane --parent parent-lane --effort high --job builder-kimi-effort-mutant )
 echo "PASS builder-kimi pilot profile reuses kimi-k3 kind/argv"
 
+# #633 (#594 E3): builder-luna is codex-luna under --role builder, launched at
+# the E3 effort (xhigh) and gated as the scopefuel-known codex-luna-max
+# spelling like every other luna variant.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+set +e
+builder_luna_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --job builder-luna-job --t T1 2>&1)"
+builder_luna_rc=$?
+set -e
+[[ "$builder_luna_rc" -eq 0 ]] ||
+  fail "builder-luna must be admitted under --role builder (rc=$builder_luna_rc): $builder_luna_out"
+grep -q 'model=builder-luna' <<<"$builder_luna_out" ||
+  fail "builder-luna spawn output lost its model: $builder_luna_out"
+builder_luna_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_luna_start" == 'agent start fixture --kind codex --pane w:p1 --timeout 120000 -- --yolo -m gpt-6-luna -c model_reasoning_effort=xhigh' ]] ||
+  fail "builder-luna must launch the codex-luna argv at effort xhigh: $builder_luna_start"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-luna-max" ]] ||
+  fail "builder-luna must gate as the scopefuel-known codex-luna-max spelling"
+grep -q 'policy launch codex-luna effort=xhigh' "$TMP/launch.log" ||
+  fail "builder-luna must consult the catalog for codex-luna at effort xhigh"
+python3 - "$ARBITER_INBOX_ROOT/builder-luna-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["owner_lane"] == "builder-luna-lane", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+# 급 가드 (grade guard): the catalog grades codex-luna per effort
+# (medium=B, max=A+) and the E3 sample is rated at xhigh, so any other
+# --effort is refused before gate/claim, exactly like builder-opus@high.
+expect_exit 2 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --effort max --job builder-luna-effort-mutant
+expect_exit 2 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --effort medium --job builder-luna-effort-low-mutant
+expect_exit 2 spawn_base builder-luna --job builder-luna-role-mutant --t T1
+echo "PASS builder-luna E3 profile launches codex-luna argv at xhigh"
+
 # The worker spellings the decision names for the pilot are admissible as
 # builders too, and keep their ordinary worker meaning.
 for pilot_alias in grok grok-hi kimi-k3; do
@@ -2595,15 +3015,15 @@ echo "PASS builder-pilot-admits-worker-spellings"
 
 # Profiles outside the allowlist are still refused before the gate, and the
 # refusal enumerates the three pilot profiles by name plus the worker-only
-# devin model variants (task 281).
-for rejected in codex-terra codex-luna oc-solar4 devin-ds41; do
+# devin model variants (task 281, #635 ds41-max).
+for rejected in codex-terra codex-luna oc-solar4 devin-ds41 devin-ds41-max; do
   set +e
   rejected_out="$(spawn_base "$rejected" --role builder --lane builder-lane --parent parent-lane --job "builder-reject-$rejected" --t T1 2>&1)"
   rejected_rc=$?
   set -e
   [[ "$rejected_rc" -eq 2 ]] ||
     fail "--role builder must still reject $rejected with exit 2, got $rejected_rc: $rejected_out"
-  for named in builder-devin builder-grok builder-kimi devin-glm52 devin-swe17 devin-ds41; do
+  for named in builder-devin builder-grok builder-kimi builder-luna devin-glm52 devin-swe17 devin-ds41 devin-ds41-max; do
     grep -q "$named" <<<"$rejected_out" ||
       fail "the --role builder refusal must list $named: $rejected_out"
   done
