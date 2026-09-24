@@ -589,14 +589,20 @@ artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)
   fail "604 artifacts must live in the job dir: $artifact_dir"
 grep -q 'reason=agent explain returned an invalid identity envelope' "$artifact_dir/reason.txt" ||
   fail "604 reason.txt lost the failure reason"
-grep -q '"matched_rule":null' "$artifact_dir/explain.json" ||
+grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
   fail "604 the explain envelope that failed was not preserved"
 grep -q 'fixture welcome screen' "$artifact_dir/screen-visible.txt" ||
   fail "604 visible screen was not preserved"
 grep -q 'fixture welcome screen' "$artifact_dir/transcript.txt" ||
   fail "604 transcript was not preserved"
-grep -q 'pane_id' "$artifact_dir/process-info.json" ||
+grep -q 'pane_id' "$artifact_dir/process-info.out" ||
   fail "604 process-info was not preserved"
+# The jobs root is scanned for event envelopes with rglob("*.json"); a raw
+# capture that is not an event envelope must not carry the .json extension
+# (a 'not json at all' explain.out broke exactly that scan on CI 2026-09-24).
+if find "$artifact_dir" -name '*.json' | grep -q .; then
+  fail "604 artifact dir must not contain .json files: $artifact_dir"
+fi
 echo "PASS 604-explain-no-rule-artifacts-preserved"
 
 # #604 hypothesis variant: a rule did match — the trust prompt — so the spawn
@@ -607,8 +613,8 @@ grep -q 'expected agent=devin rule=welcome_prompt_footer, got agent=devin rule=t
   fail "trust-screen explain lost its rule diagnostic: $DEVIN_CASE_OUT"
 artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
 [[ -d "$artifact_dir" ]] || fail "604 trust-screen artifact dir missing"
-grep -q 'trust_directory' "$artifact_dir/explain.json" ||
-  fail "604 trust-screen explain.json was not preserved"
+grep -q 'trust_directory' "$artifact_dir/explain.out" ||
+  fail "604 trust-screen explain.out was not preserved"
 grep -q 'Do you trust the contents of this directory?' "$artifact_dir/screen-visible.txt" ||
   fail "604 trust-screen visible capture lost the prompt"
 echo "PASS 604-trust-screen-artifacts-preserved"

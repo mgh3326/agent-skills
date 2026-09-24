@@ -898,7 +898,10 @@ spawn_pane_cleanup() {
 # rule — unverifiable because nothing was preserved). Before the caller's
 # cleanup closes the pane, capture what it still shows into the job directory.
 # Every capture is best-effort and read-only: a preservation failure must not
-# mask, replace or worsen the spawn failure it documents.
+# mask, replace or worsen the spawn failure it documents. Raw captures use the
+# .out/.err/.rc extensions, never .json — the jobs root is scanned for event
+# envelopes with rglob("*.json"), and a capture holding 'not json at all' would
+# break those scans (CI, 2026-09-24).
 devin_preserve_failure_artifacts() {
   local reason="$1" explain_json="${2:-}" detected="${3:-0}" dir out cap_rc
   dir="$(wrk_jobs_root)/$JOB_ID"
@@ -919,11 +922,11 @@ devin_preserve_failure_artifacts() {
   } >"$out/reason.txt" 2>/dev/null ||
     warn "Devin failure reason.txt could not be written under $out"
   if [[ -n "$explain_json" ]]; then
-    printf '%s\n' "$explain_json" >"$out/explain.json" 2>/dev/null ||
-      warn "Devin failure explain.json could not be written under $out"
+    printf '%s\n' "$explain_json" >"$out/explain.out" 2>/dev/null ||
+      warn "Devin failure explain.out could not be written under $out"
   elif [[ "$detected" -eq 1 ]]; then
     set +e
-    "$HERDR" agent explain "$PANE" --format json >"$out/explain.json" 2>"$out/explain.err"
+    "$HERDR" agent explain "$PANE" --format json >"$out/explain.out" 2>"$out/explain.err"
     cap_rc=$?
     set -e
     printf 'rc=%s\n' "$cap_rc" >"$out/explain.rc" 2>/dev/null || true
@@ -935,7 +938,7 @@ devin_preserve_failure_artifacts() {
   printf 'rc=%s\n' "$?" >"$out/screen-visible.rc"
   "$HERDR" pane read "$PANE" --source recent-unwrapped --lines 200 >"$out/transcript.txt" 2>"$out/transcript.err"
   printf 'rc=%s\n' "$?" >"$out/transcript.rc"
-  "$HERDR" pane process-info --pane "$PANE" >"$out/process-info.json" 2>"$out/process-info.err"
+  "$HERDR" pane process-info --pane "$PANE" >"$out/process-info.out" 2>"$out/process-info.err"
   printf 'rc=%s\n' "$?" >"$out/process-info.rc"
   set -e
   echo "wrk: Devin spawn failure artifacts preserved under $out" >&2
@@ -950,7 +953,7 @@ devin_spawn_diagnostics() {
   # made: a second live call would change the pane-touch count the readiness
   # failure contract pins (one check + one diagnostic).
   if [[ -n "$out" && -d "$out" ]]; then
-    [[ ! -s "$out/process-info.json" ]] || cat "$out/process-info.json" >&2
+    [[ ! -s "$out/process-info.out" ]] || cat "$out/process-info.out" >&2
     [[ ! -s "$out/process-info.err" ]] || cat "$out/process-info.err" >&2
   else
     "$HERDR" pane process-info --pane "$PANE" >&2 ||
