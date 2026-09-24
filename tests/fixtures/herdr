@@ -127,7 +127,7 @@ fixture_brief_landed() {
   prompts="$(fixture_prompt_count)"
   recent_reads="$(fixture_recent_read_count)"
   case "$scenario" in
-    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy) return 0 ;;
+    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy|agent-late-foreground) return 0 ;;
     landing-retry|opencode-retry)
       if (( prompts >= 2 )); then return 0; fi
       ;;
@@ -394,18 +394,54 @@ case "${1:-}" in
     # devin-shell-busy shows an rc subprocess in the foreground for the first
     # WRK_FIXTURE_SHELL_BUSY_COUNT (default 3) calls; devin-shell-never-ready
     # always does.
+    # #609: once this spawn's own `pane run`/`agent start` was accepted, the
+    # pane foreground is the agent (real 0.9.1 shape measured 2026-09-24:
+    # argv0 is the canonical executable, the group leader is the agent pid).
+    # agent-never-foreground keeps answering shell-alone after an accepted
+    # start (the m1b "zsh: command not found: codex" shape); agent-late-
+    # foreground answers shell-alone for WRK_FIXTURE_FOREGROUND_DELAY (2)
+    # calls first; agent-foreground-other keeps an unrelated process in the
+    # foreground.
     if [[ "${2:-}" == process-info ]]; then
       case "$scenario" in
-        devin-process-info-fail)
+        devin-process-info-fail|agent-foreground-info-fail)
           printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture process-info failure"},"id":"cli:pane:process_info"}' >&2
           exit 3
           ;;
-        devin-process-info-garbage)
+        devin-process-info-garbage|agent-foreground-garbage)
           printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"pane_id":"w:p1","shell_pid":"4242"}}}'
+          exit 0
+          ;;
+        agent-never-foreground)
+          printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+          exit 0
+          ;;
+        agent-foreground-other)
+          printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["vim","notes.txt"],"argv0":"vim","cmdline":"vim notes.txt","cwd":"/tmp","name":"vim","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
           exit 0
           ;;
       esac
       infos="$(grep -c '^pane process-info ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
+      if [[ "$scenario" == agent-late-foreground &&
+            "$infos" -le "${WRK_FIXTURE_FOREGROUND_DELAY:-2}" ]]; then
+        printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+        exit 0
+      fi
+      if grep -q '^pane run ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null; then
+        printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["devin","--model","swe-2"],"argv0":"devin","cmdline":"devin --model swe-2","cwd":"/tmp","name":"devin","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+        exit 0
+      fi
+      agent_kind="$(sed -n 's/^agent start .*--kind \([^ ]*\).*/\1/p' \
+        "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null | tail -n1)"
+      agent_starts="$(grep -c '^agent start ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
+      if [[ -n "$agent_kind" ]] && [[ "$scenario" != shell-busy ||
+            "$agent_starts" -gt "${WRK_FIXTURE_SHELL_BUSY_COUNT:-3}" ]] &&
+         [[ "$scenario" != shell-never-ready && "$scenario" != start-not-ready &&
+            "$scenario" != start-pane-unavailable ]]; then
+        printf '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["%s"],"argv0":"%s","cmdline":"%s","cwd":"/tmp","name":"%s","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}\n' \
+          "$agent_kind" "$agent_kind" "$agent_kind" "$agent_kind"
+        exit 0
+      fi
       if [[ "$scenario" == devin-shell-never-ready ||
             ( "$scenario" == devin-shell-busy && "$infos" -le "${WRK_FIXTURE_SHELL_BUSY_COUNT:-3}" ) ]]; then
         printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4250,"foreground_processes":[{"argv":["git","rev-parse","--show-toplevel"],"argv0":"git","cmdline":"git rev-parse --show-toplevel","cwd":"/tmp","name":"git","pid":4250}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
