@@ -357,6 +357,12 @@ if grep -qx 'captain-astra' <<<"$profiles_out"; then exit 1; fi
 grep -qx 'devin-glm52' <<<"$profiles_out"
 grep -qx 'devin-swe17' <<<"$profiles_out"
 grep -qx 'devin-ds41' <<<"$profiles_out"
+# #635: the devin effort rungs are named profiles (effort sits inside the
+# devin model id — no --effort flag exists). The scopefuel catalog lists all
+# three, so the wrk⊇scopefuel cross-check needs them here.
+grep -qx 'devin-swe2-medium' <<<"$profiles_out"
+grep -qx 'devin-swe2-max' <<<"$profiles_out"
+grep -qx 'devin-ds41-max' <<<"$profiles_out"
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -394,6 +400,7 @@ profiles=(
   "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku"
   "devin-swe2:devin-swe2"
   "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
+  "devin-swe2-medium:devin-swe2" "devin-swe2-max:devin-swe2" "devin-ds41-max:devin-swe2"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
@@ -1042,8 +1049,11 @@ echo "PASS devin-swe2 worker kind/argv/no-effort snapshot + builder-pilot admiss
 
 # Task 281 (operator decision 2026-09-14 devin-pro-paid-models): the three
 # additional Devin model profiles reuse the identical unattended argv — only
-# the --model name differs — and reject --effort like devin-swe2.
-for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepseek-v4-1-flash-high"; do
+# the --model name differs — and reject --effort like devin-swe2. #635 adds
+# the effort rungs as named profiles (effort lives inside the model id), same
+# argv skeleton and same --effort rejection.
+for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepseek-v4-1-flash-high" \
+  "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2-max" "devin-ds41-max:deepseek-v4-1-flash-max"; do
   devin_profile="${devin_pair%%:*}"
   devin_model="${devin_pair#*:}"
   : >"$TMP/herdr.log"
@@ -1059,7 +1069,12 @@ for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepse
     fail "$devin_profile run argv must not contain effort"
   expect_exit 2 spawn_base "$devin_profile" --effort high
 done
-echo "PASS devin-glm52/devin-swe17/devin-ds41 worker kind/argv/no-effort snapshots"
+echo "PASS devin-glm52/devin-swe17/devin-ds41 + #635 effort-variant worker kind/argv/no-effort snapshots"
+
+# #635 AC2: an unknown effort token is still refused on the new spellings —
+# the generic unknown-effort die fires before the devin no-effort guard.
+expect_exit 2 spawn_base devin-swe2-max --effort bogus
+expect_exit 2 spawn_base devin-ds41-max --effort medium
 
 # ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
 # file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
@@ -2649,7 +2664,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -2657,7 +2672,7 @@ accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|bui
 # the pilot worker spellings. Bare 'grok' is not extracted (it also matches
 # inside builder-grok); grok-hi presence covers it, and the literal accept-line
 # pin above guards the list itself.
-builder_tokens() { grep -oE '(builder|captain)-[a-z]+|devin-swe2|grok-hi|kimi-k3' | grep -vx 'builder-level' | sort -u; }
+builder_tokens() { grep -oE '(builder|captain)-[a-z]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vx 'builder-level' | sort -u; }
 accept_set="$(builder_tokens <<<"$accept_line")"
 help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
 help_set="$(builder_tokens <<<"$help_block")"
@@ -2791,6 +2806,37 @@ PY
 expect_exit 2 spawn_base builder-devin --role builder --lane builder-devin-lane --parent parent-lane --effort high --job builder-devin-effort-mutant
 echo "PASS builder-devin pilot profile reuses devin-swe2 kind/argv"
 
+# #635: devin effort is inside the model id, so "builder-devin takes the
+# effort too" lands as the swe-2 effort spellings admitted under --role
+# builder — same admission mechanism as the devin-swe2 pilot spelling.
+for devin_builder_pair in "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2-max"; do
+  devin_builder_profile="${devin_builder_pair%%:*}"
+  devin_builder_model="${devin_builder_pair#*:}"
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  set +e
+  devin_variant_builder_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base "$devin_builder_profile" --role builder --lane "builder-${devin_builder_profile}-lane" --parent parent-lane --job "builder-${devin_builder_profile}-job" --t T1 2>&1)"
+  devin_variant_builder_rc=$?
+  set -e
+  [[ "$devin_variant_builder_rc" -eq 0 ]] ||
+    fail "$devin_builder_profile must be admitted under --role builder (rc=$devin_variant_builder_rc): $devin_variant_builder_out"
+  grep -q "model=$devin_builder_profile" <<<"$devin_variant_builder_out" ||
+    fail "$devin_builder_profile builder spawn output lost its model: $devin_variant_builder_out"
+  devin_variant_builder_run="$(grep '^pane run ' "$TMP/herdr.log")"
+  [[ "$devin_variant_builder_run" == "pane run w:p1 devin --model $devin_builder_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
+    fail "$devin_builder_profile builder argv mismatch: $devin_variant_builder_run"
+  [[ " $devin_variant_builder_run " != *' --effort '* ]] ||
+    fail "$devin_builder_profile builder argv must not gain an effort flag"
+  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "devin-swe2" ]] ||
+    fail "$devin_builder_profile must gate as the scopefuel-known devin-swe2 spelling"
+  python3 - "$ARBITER_INBOX_ROOT/builder-${devin_builder_profile}-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+done
+echo "PASS devin-swe2 effort spellings admitted under --role builder (#635)"
+
 : >"$TMP/herdr.log" "$TMP/scopefuel.log"
 set +e
 builder_grok_out="$(spawn_base builder-grok --role builder --lane builder-grok-lane --parent parent-lane --job builder-grok-job --t T1 2>&1)"
@@ -2862,15 +2908,15 @@ echo "PASS builder-pilot-admits-worker-spellings"
 
 # Profiles outside the allowlist are still refused before the gate, and the
 # refusal enumerates the three pilot profiles by name plus the worker-only
-# devin model variants (task 281).
-for rejected in codex-terra codex-luna oc-solar4 devin-ds41; do
+# devin model variants (task 281, #635 ds41-max).
+for rejected in codex-terra codex-luna oc-solar4 devin-ds41 devin-ds41-max; do
   set +e
   rejected_out="$(spawn_base "$rejected" --role builder --lane builder-lane --parent parent-lane --job "builder-reject-$rejected" --t T1 2>&1)"
   rejected_rc=$?
   set -e
   [[ "$rejected_rc" -eq 2 ]] ||
     fail "--role builder must still reject $rejected with exit 2, got $rejected_rc: $rejected_out"
-  for named in builder-devin builder-grok builder-kimi devin-glm52 devin-swe17 devin-ds41; do
+  for named in builder-devin builder-grok builder-kimi devin-glm52 devin-swe17 devin-ds41 devin-ds41-max; do
     grep -q "$named" <<<"$rejected_out" ||
       fail "the --role builder refusal must list $named: $rejected_out"
   done

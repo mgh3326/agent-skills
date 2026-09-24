@@ -17,7 +17,8 @@ legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`
 매매 표면 제외**, 되돌리기 조건, 결정 기록과 다음 재판단의 **정본은 `spawn-worker` §2-2 급표의
 `builder-devin` 행**이다(두 문서가 어긋나면 그 행을 따른다). `builder-kimi`는 아직 파일럿 전이라
 열려만 있다. 세 프로필 모두 각각 devin-swe2·grok 4.7 xhigh·kimi-k3의 argv를 재사용하며, 워커 철자
-`devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. `builder-grok`·`builder-kimi`의
+`devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다
+(devin 의 effort 는 모델 id 안에 있으므로 swe-2 effort 런그가 builder-devin 의 effort 경로다). `builder-grok`·`builder-kimi`의
 **정식 등재와 T2 확대는 프로필당 표본 3(빌더 역할 reps)에서 재판단**하며, 라운드 상한 초과나 게이트
 BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌리기 조건이다).
 
