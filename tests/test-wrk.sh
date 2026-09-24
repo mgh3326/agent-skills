@@ -630,6 +630,25 @@ grep -qx 'rc=4' "$artifact_dir/explain.rc" ||
   fail "604 explain-fail must record the explain rc: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
 echo "PASS 604-explain-fail-artifacts-preserved"
 
+# #604 (CodeRabbit major on PR #122): explain answering rc=0 with EMPTY stdout
+# is a supplied failing response, not an absent one. Preservation must save
+# that response verbatim (a 0-byte explain.out plus an explicit rc=0) and must
+# not re-query — a second explain would overwrite the artifact with a later,
+# different response (the fixture answers a valid envelope from call 2 on, so
+# a re-querying mutant turns this red).
+devin_readiness_failure_case devin-explain-empty 1
+grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
+  fail "empty explain response lost the invalid-envelope diagnostic: $DEVIN_CASE_OUT"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 explain-empty artifact dir missing: $DEVIN_CASE_OUT"
+[[ -f "$artifact_dir/explain.out" && ! -s "$artifact_dir/explain.out" ]] ||
+  fail "604 explain-empty must preserve the empty response verbatim: $(ls -l "$artifact_dir" 2>/dev/null)"
+grep -qx 'rc=0' "$artifact_dir/explain.rc" ||
+  fail "604 explain-empty must record the supplied explain rc=0: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "604 explain-empty must not re-query explain over the failing response"
+echo "PASS 604-explain-empty-response-preserved"
+
 # #604 (tester round 1): a pre-detection failure must not query agent
 # endpoints, but it still owes the artifact set an explicit explain outcome —
 # rc=skipped, not an absent file that reads as "preservation forgot it".
@@ -912,6 +931,26 @@ for shell_window_jump in 30 31; do
   grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "Devin shell at ${shell_window_jump}s leaked its pane"
 done
 echo "PASS task606 shell-ready wait: agent_pane_busy retry, Devin process-info poll, window bound, fail-closed"
+
+# #604/m1b (hk:doc evidence/2026-09-24/task604-m1b-repro): the m1b herdr 0.9.0
+# process-info reply has no "result" wrapper and no foreground_process_group_id
+# but still names shell_pid and the foreground list. While the foreground is
+# an rc-file subprocess (compinit's grep) the answer is "not ready yet" and
+# must be polled inside the window — the observed m1b failure was this
+# readable reply being classified as an invalid envelope after one check.
+# Mutant: removing the wait types the devin argv into the busy shell (pane run
+# fires on poll 1), and strict-parsing the envelope fails the spawn outright.
+: >"$TMP/herdr.log"
+devin_m1b_out="$(TEST_FIXTURE_SCENARIO=devin-shell-busy-m1b spawn_base devin-swe2 2>&1)" ||
+  fail "m1b-shape shell ready on the fourth poll must still spawn: $devin_m1b_out"
+grep -q 'landed=yes' <<<"$devin_m1b_out" ||
+  fail "m1b-shape late-shell Devin did not land: $devin_m1b_out"
+devin_m1b_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+[[ "$(head -n "$devin_m1b_run_no" "$TMP/herdr.log" | grep -c '^pane process-info --pane w:p1$')" -eq 4 ]] ||
+  fail "m1b-shape Devin must poll process-info until the shell is alone in the foreground"
+if grep -q '^pane close ' "$TMP/herdr.log"; then fail "m1b-shape late-shell Devin pane was closed"; fi
+devin_shell_failure_case devin-shell-never-ready-m1b 'shell not ready within 30000ms (foreground busy x120)'
+echo "PASS 604-m1b-envelope: unwrapped process-info polls shell-busy foreground, fail-closed at window"
 
 expect_exit 2 spawn_base devin-swe2 --effort high
 # Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker
