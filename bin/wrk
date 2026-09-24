@@ -178,6 +178,9 @@ line then ends with via=herdr-fallback.
                      PURPOSE is director, architect or operator-request; for
                      every other profile it is audit metadata only and never
                      changes the decision.
+                     Claude profiles spawn with prompt suggestions off
+                     (CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false in the pane
+                     env, #626); PURPOSE director leaves them as configured.
                      This is a purpose axis, distinct from the
                      --operator-request REF format gate above.
   -h, --help         show this usage
@@ -1995,6 +1998,17 @@ resolve_profile() {
       # Append only for effort-capable Claude profiles (opus/sonnet). fable stays bare.
       if [[ "$EFFORT_SUPPORTED" -eq 1 && -n "$EFFECTIVE_EFFORT" ]]; then
         ARGS+=(--effort "$EFFECTIVE_EFFORT")
+      fi
+      # #626 AC2: prompt suggestions prefill the composer with a predicted next
+      # prompt; one submitted in a tester pane became a fake operator
+      # confirmation (hk:doc task/2026-09-24/phantom-suggestion-submitted).
+      # Documented off switch (code.claude.com/docs/en/env-vars): "Set to
+      # `false` to turn off prompt suggestions … Takes precedence over the
+      # `promptSuggestionEnabled` setting". Pane env only — argv and the
+      # user's settings.json stay untouched. A resident session spawned with
+      # --purpose director is the operator's call and is left as is.
+      if [[ "${PURPOSE:-}" != director ]]; then
+        PROFILE_ENV+=(--env "CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false")
       fi
       ;;
   esac
