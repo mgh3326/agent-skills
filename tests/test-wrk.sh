@@ -572,6 +572,105 @@ devin_readiness_failure_case devin-explain-fail 4
 devin_readiness_failure_case devin-explain-garbage 1
 grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
   fail "malformed explain JSON lost its diagnostic: $DEVIN_CASE_OUT"
+
+# #604: the 2026-09-23 incident shape — explain answers a well-formed envelope
+# whose matched_rule is absent because no identity rule claimed the screen
+# (first-open trust prompt hypothesis). The spawn still fails, but the pane's
+# screen, transcript, explain JSON and process-info must survive the pane.
+devin_readiness_failure_case devin-explain-no-rule 1
+grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
+  fail "no-rule explain lost the incident diagnostic: $DEVIN_CASE_OUT"
+grep -q 'Devin spawn failure artifacts preserved under ' <<<"$DEVIN_CASE_OUT" ||
+  fail "604 failure artifacts were not announced: $DEVIN_CASE_OUT"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 artifact dir missing: $artifact_dir"
+[[ "$artifact_dir" == "$TMP/inbox/fixture/devin-spawn-failure-"* ||
+   "$artifact_dir" == "$(cd "$TMP" && pwd -P)/inbox/fixture/devin-spawn-failure-"* ]] ||
+  fail "604 artifacts must live in the job dir: $artifact_dir"
+grep -q 'reason=agent explain returned an invalid identity envelope' "$artifact_dir/reason.txt" ||
+  fail "604 reason.txt lost the failure reason"
+grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
+  fail "604 the explain envelope that failed was not preserved"
+grep -q 'fixture welcome screen' "$artifact_dir/screen-visible.txt" ||
+  fail "604 visible screen was not preserved"
+grep -q 'fixture welcome screen' "$artifact_dir/transcript.txt" ||
+  fail "604 transcript was not preserved"
+grep -q 'pane_id' "$artifact_dir/process-info.out" ||
+  fail "604 process-info was not preserved"
+# The jobs root is scanned for event envelopes with rglob("*.json"); a raw
+# capture that is not an event envelope must not carry the .json extension
+# (a 'not json at all' explain.out broke exactly that scan on CI 2026-09-24).
+if find "$artifact_dir" -name '*.json' | grep -q .; then
+  fail "604 artifact dir must not contain .json files: $artifact_dir"
+fi
+echo "PASS 604-explain-no-rule-artifacts-preserved"
+
+# #604 hypothesis variant: a rule did match — the trust prompt — so the spawn
+# fails on the rule id, and the preserved visible screen carries the actual
+# cause the pane was showing.
+devin_readiness_failure_case devin-trust-screen 1
+grep -q 'expected agent=devin rule=welcome_prompt_footer, got agent=devin rule=trust_directory' <<<"$DEVIN_CASE_OUT" ||
+  fail "trust-screen explain lost its rule diagnostic: $DEVIN_CASE_OUT"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 trust-screen artifact dir missing"
+grep -q 'trust_directory' "$artifact_dir/explain.out" ||
+  fail "604 trust-screen explain.out was not preserved"
+grep -q 'Do you trust the contents of this directory?' "$artifact_dir/screen-visible.txt" ||
+  fail "604 trust-screen visible capture lost the prompt"
+echo "PASS 604-trust-screen-artifacts-preserved"
+
+# #604: preservation also covers the non-explain failures, and a failed
+# capture must never mask the spawn failure it documents. explain-fail leaves
+# explain.rc=4 instead of a stolen success.
+devin_readiness_failure_case devin-explain-fail 4
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" && -f "$artifact_dir/explain.rc" ]] ||
+  fail "604 explain-fail must still leave an artifact dir: $DEVIN_CASE_OUT"
+grep -qx 'rc=4' "$artifact_dir/explain.rc" ||
+  fail "604 explain-fail must record the explain rc: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+echo "PASS 604-explain-fail-artifacts-preserved"
+
+# #604 (CodeRabbit major on PR #122): explain answering rc=0 with EMPTY stdout
+# is a supplied failing response, not an absent one. Preservation must save
+# that response verbatim (a 0-byte explain.out plus an explicit rc=0) and must
+# not re-query — a second explain would overwrite the artifact with a later,
+# different response (the fixture answers a valid envelope from call 2 on, so
+# a re-querying mutant turns this red).
+devin_readiness_failure_case devin-explain-empty 1
+grep -q 'agent explain returned an invalid identity envelope' <<<"$DEVIN_CASE_OUT" ||
+  fail "empty explain response lost the invalid-envelope diagnostic: $DEVIN_CASE_OUT"
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 explain-empty artifact dir missing: $DEVIN_CASE_OUT"
+[[ -f "$artifact_dir/explain.out" && ! -s "$artifact_dir/explain.out" ]] ||
+  fail "604 explain-empty must preserve the empty response verbatim: $(ls -l "$artifact_dir" 2>/dev/null)"
+grep -qx 'rc=0' "$artifact_dir/explain.rc" ||
+  fail "604 explain-empty must record the supplied explain rc=0: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+[[ "$(grep -c '^agent explain ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "604 explain-empty must not re-query explain over the failing response"
+echo "PASS 604-explain-empty-response-preserved"
+
+# #604 (tester round 1): a pre-detection failure must not query agent
+# endpoints, but it still owes the artifact set an explicit explain outcome —
+# rc=skipped, not an absent file that reads as "preservation forgot it".
+devin_readiness_failure_case devin-get-error 1
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 get-error artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=skipped' "$artifact_dir/explain.rc" ||
+  fail "604 pre-detection failure must record explain rc=skipped: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
+echo "PASS 604-pre-detection-explain-skip-recorded"
+
+# #604 (tester round 1, minor): a failed pane-read capture must not mask,
+# replace or worsen the spawn failure it documents — rc stays 1 and the rest
+# of the artifact set is still written.
+devin_readiness_failure_case devin-read-fail 1
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 read-fail artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=9' "$artifact_dir/screen-visible.rc" ||
+  fail "604 read-fail must record the capture rc: $(cat "$artifact_dir/screen-visible.rc" 2>/dev/null)"
+grep -q '"matched_rule":null' "$artifact_dir/explain.out" ||
+  fail "604 read-fail must still preserve the explain envelope"
+echo "PASS 604-capture-failure-does-not-mask-spawn-rc"
+
 devin_readiness_failure_case devin-never-detect 1
 grep -q "Devin pane startup failed: agent not detected within 30000ms (agent_not_found x120)" <<<"$DEVIN_CASE_OUT" ||
   fail "never-detected Devin lost its bounded-window diagnostic: $DEVIN_CASE_OUT"
@@ -580,6 +679,10 @@ grep -q "Devin pane startup failed: agent not detected within 30000ms (agent_not
 if grep -q '^agent wait \|^agent explain ' "$TMP/herdr.log"; then
   fail "never-detected Devin waited or explained an undetected pane"
 fi
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -d "$artifact_dir" ]] || fail "604 never-detect artifact dir missing: $DEVIN_CASE_OUT"
+grep -qx 'rc=skipped' "$artifact_dir/explain.rc" ||
+  fail "604 never-detect must record explain rc=skipped: $(cat "$artifact_dir/explain.rc" 2>/dev/null)"
 
 # Detection on the window edge: a fake clock (only `date +%s` is faked) puts
 # every reading after the first 31s past pane run. Detection succeeds on the
@@ -828,6 +931,26 @@ for shell_window_jump in 30 31; do
   grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "Devin shell at ${shell_window_jump}s leaked its pane"
 done
 echo "PASS task606 shell-ready wait: agent_pane_busy retry, Devin process-info poll, window bound, fail-closed"
+
+# #604/m1b (hk:doc evidence/2026-09-24/task604-m1b-repro): the m1b herdr 0.9.0
+# process-info reply has no "result" wrapper and no foreground_process_group_id
+# but still names shell_pid and the foreground list. While the foreground is
+# an rc-file subprocess (compinit's grep) the answer is "not ready yet" and
+# must be polled inside the window — the observed m1b failure was this
+# readable reply being classified as an invalid envelope after one check.
+# Mutant: removing the wait types the devin argv into the busy shell (pane run
+# fires on poll 1), and strict-parsing the envelope fails the spawn outright.
+: >"$TMP/herdr.log"
+devin_m1b_out="$(TEST_FIXTURE_SCENARIO=devin-shell-busy-m1b spawn_base devin-swe2 2>&1)" ||
+  fail "m1b-shape shell ready on the fourth poll must still spawn: $devin_m1b_out"
+grep -q 'landed=yes' <<<"$devin_m1b_out" ||
+  fail "m1b-shape late-shell Devin did not land: $devin_m1b_out"
+devin_m1b_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+[[ "$(head -n "$devin_m1b_run_no" "$TMP/herdr.log" | grep -c '^pane process-info --pane w:p1$')" -eq 4 ]] ||
+  fail "m1b-shape Devin must poll process-info until the shell is alone in the foreground"
+if grep -q '^pane close ' "$TMP/herdr.log"; then fail "m1b-shape late-shell Devin pane was closed"; fi
+devin_shell_failure_case devin-shell-never-ready-m1b 'shell not ready within 30000ms (foreground busy x120)'
+echo "PASS 604-m1b-envelope: unwrapped process-info polls shell-busy foreground, fail-closed at window"
 
 expect_exit 2 spawn_base devin-swe2 --effort high
 # Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker
@@ -1479,6 +1602,78 @@ grep -q 'landed=yes' <<<"$devin_pw_out" || fail "498 devin landing regressed: $d
 grep -q 'panewire_rc' <<<"$devin_pw_out" && fail "498 devin landed must not carry a failure detail: $devin_pw_out"
 [[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 devin one delivery"
 echo "PASS 498-a4-devin-corroborated"
+
+# #568: the 2026-09-22 t502-verify duplicate — panewire rc 6 "submission
+# evidence unproven" while devin had already consumed the brief. The
+# transcript holds the marker folded across a line break and devin reports
+# working; neither must trigger a second delivery.
+pw_reset
+devin_wrapped_out="$(TEST_FIXTURE_SCENARIO=devin-wrapped-marker pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=yes' <<<"$devin_wrapped_out" || fail "568 folded-marker devin must land: $devin_wrapped_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 folded-marker devin was re-injected"
+if grep -q 'reinject' <<<"$devin_wrapped_out"; then fail "568 folded-marker devin announced a reinject: $devin_wrapped_out"; fi
+echo "PASS 568-devin-folded-marker-no-duplicate"
+
+# #568 auxiliary evidence: marker absent entirely, devin working after an
+# accepted submit — the pane was verified idle before injection, so working
+# means it consumed the brief.
+pw_reset
+devin_working_out="$(TEST_FIXTURE_SCENARIO=devin-working-no-marker pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=yes' <<<"$devin_working_out" || fail "568 devin working must land: $devin_working_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 devin working was re-injected"
+echo "PASS 568-devin-working-status-lands"
+
+# #568: a devin queued banner is unattributable (grok-chip precedent) —
+# ambiguous evidence suppresses the re-injection without claiming landed.
+pw_reset
+devin_queued_out="$(TEST_FIXTURE_SCENARIO=devin-queued pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_queued_out" || fail "568 devin queued must not claim landed: $devin_queued_out"
+grep -q 'reason=ambiguous-observation' <<<"$devin_queued_out" ||
+  fail "568 devin queued must be ambiguous: $devin_queued_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "568 devin queued was re-injected"
+echo "PASS 568-devin-queued-ambiguous-no-reinject"
+
+# #568 negative direction: a devin pane with no evidence at all (status
+# unknown — absent from agent list) still gets exactly one re-injection and
+# then stops.
+pw_reset
+devin_none_out="$(TEST_FIXTURE_SCENARIO=devin-no-landing pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_none_out" || fail "568 devin no-landing: $devin_none_out"
+grep -q 'action=reinject-once' <<<"$devin_none_out" ||
+  fail "568 devin no-landing lost the re-injection: $devin_none_out"
+[[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] ||
+  fail "568 devin no-landing must re-inject exactly once: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-confirmed-nonlanding-reinject-once"
+
+# #568 round-2 (tester blocker): an unconfirmed submit — panewire timed out,
+# possibly before anything was sent — must not be upgraded to landed by a
+# merely-working devin. The timeout fixture exits before `agent prompt`, so
+# herdr_briefs=0 proves nothing was ever injected.
+pw_reset
+devin_unconf_out="$(TEST_FIXTURE_SCENARIO=devin-working-no-marker WRK_PANEWIRE_PROMPT=timeout \
+  pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_unconf_out" ||
+  fail "568 unconfirmed+working must not claim landed: $devin_unconf_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 0 ]] ||
+  fail "568 unconfirmed+working must not inject: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-unconfirmed-working-not-landed"
+
+# #568 round-2/3 (tester blockers): the marker's words in unrelated UI text are
+# not a folded marker — an unindented break mid-line, an unindented break at a
+# line start, a UI tab on one line (no line break), and an indented break
+# mid-line (not after `❭`/line start). A leftmost-match matcher returns on the
+# first variant, so ordering is part of the test: every discriminating variant
+# must be evaluated. With no other evidence this is confirmed non-landing:
+# exactly one re-injection.
+pw_reset
+devin_coll_out="$(TEST_FIXTURE_SCENARIO=devin-fold-collision pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_coll_out" ||
+  fail "568 fold-collision must not claim landed: $devin_coll_out"
+grep -q 'action=reinject-once' <<<"$devin_coll_out" ||
+  fail "568 fold-collision lost the re-injection: $devin_coll_out"
+[[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] ||
+  fail "568 fold-collision must re-inject exactly once: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-fold-collision-not-marker"
 
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"

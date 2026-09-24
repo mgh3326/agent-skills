@@ -106,6 +106,26 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
 도구가 실제로 지원하는 계약을 확인한 경우에만 별도로 다룬다; 지원하지 않는 인자를
 발명하지 않는다.
 
+### 스폰 후 대기 — 유휴와 이벤트 기상
+
+워커·tester를 스폰하고 착지를 확인한 뒤 builder 는 **유휴로 대기하고, 완료
+알림으로 깨어난다**. 완료·에스컬레이션·settled idle 전이는 panewire 가
+`job.*`·`lane.event`·`idle-wake` 로 owner 레인에 push 한다 — 턴마다 pane·잡
+디렉터리·report 파일을 확인하는 폴링 반복은 금지다(#636: 감시 루프는 세션과
+함께 죽고, 턴 비용은 확인할 때마다 든다).
+
+- 허용되는 유일한 능동 대기는 **bounded timeout 있는 블로킹 명령 1개**
+  (`panewire wait --agent <이름> --status idle --settle 60s --timeout <한계>`
+  등 — `--timeout` 은 필수 인자다)다. 그 종료는 완료 증거가 아니라 깨어남
+  신호다 — wait 종료 후의 판정은 언제나 산출물이다. `panewire wait --agent`는
+  로컬 herdr 소켓만 본다 — 원격 배치 워커에는 쓸 수 없다.
+- 기다리는 동안 턴을 소비하지 않는다. 확인이 필요하면 블로킹 명령으로 묶거나,
+  이벤트가 올 때까지 둔다.
+- 배포 판에서 push 되지 않는 신호(예: job.lost·revoked·정체)가 필요하면 그
+  공백을 브리프·보고서에 명시하고, 임시 수단은 director 스킬 §감시 정책의
+  "공백 신호" 규칙(단발 조회, 잡별 루프 금지)을 따른다. 커버 범위는
+  `director/panewire-events.md` 표가 정본이다.
+
 ## 후속 라운드·보충 지시의 주입
 
 이미 떠 있는 워커·tester pane 에 **후속 라운드·보충 지시**를 보낼 때의 주입 경로는
@@ -131,6 +151,15 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
   모드의 재전송은 correlation id dedup 에 걸리지만, `--uptake` 를 바꾸거나 빼면
   새 주입이 되고, `unproven` 인 채 실제로 착지한 경우도 있어(2026-09-21 실측)
   화면 확인 없는 재작성·재전송은 이중 지시가 된다.
+- **입력줄에 보이는 글은 미제출 증거가 아니다(#646).** 미제출이 의심되면 재전송·Enter
+  전에 그 호출의 deliveries 행(`panewire deliveries show <id>`, 그 명령이 없는 설치판은
+  panewire DB 의 `deliveries` 표)과, 수신 세션 transcript 에서 그 delivery 의 시각·본문과
+  일치하는 user 메시지를 대조한다. 입력줄 글에는 Claude Code 제안 프롬프트나 다른
+  발신자의 글이 섞일 수 있고 `herdr agent read` 도 그것을 사람이 친 글과 똑같이 읽는다.
+  근거: 2026-09-24 t623 델타는 "입력줄에 남아 미제출" 로 보고됐지만 deliveries 행은
+  `marker_observed`·`status-transition`·`confirmed`, 수신 transcript 는 2초 뒤 같은 본문의
+  제출과 작업 시작을 기록했고, 그 뒤 herdr API 로그에 그 pane 으로 간 `send_keys` 는
+  0건이었다(터미널에 붙은 사람의 키 입력은 그 로그에 남지 않는다).
 - **하네스 차이 — 제출 증명은 claude·codex 에서만 나온다**
   (`harnessHasSubmissionEvidence`). 미제출이면 rc≠0 + `composer_residue`,
   제출·작업 시작이면 `confirmed` 다. devin·grok·kimi 등 그 외 하네스는 착지해도

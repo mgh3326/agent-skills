@@ -40,6 +40,8 @@ jobs:
             tests/test-prompt-suggestion-off.sh \
             tests/test-resume-settings.sh \
             tests/test-untagged-operator-evidence.sh \
+            tests/test-event-monitor-doc.sh \
+            tests/test-input-line-not-evidence.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
       - name: Bash tests
         env:
@@ -59,3 +61,5 @@ jobs:
           bash tests/test-prompt-suggestion-off.sh
           bash tests/test-resume-settings.sh
           bash tests/test-untagged-operator-evidence.sh
+          bash tests/test-event-monitor-doc.sh
+          bash tests/test-input-line-not-evidence.sh
