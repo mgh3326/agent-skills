@@ -31,9 +31,10 @@ cleanup() {
   # A detached wrk refresh supervisor can still be appending refresh.log while
   # rm walks the tree; BSD rm then exits "Directory not empty" (seen on macOS
   # CI). Retry briefly so the tail of a successful run cannot flake the suite.
-  local i
-  for i in $(seq 10); do
+  local i=0
+  while ((i < 10)); do
     rm -rf "$TMP" 2>/dev/null && return 0
+    i=$((i + 1))
     sleep 0.3
   done
   rm -rf "$TMP"
