@@ -310,8 +310,24 @@ agent_status_for_pane() {
     2>/dev/null
 }
 
+# #568: a folded-marker match must span a real line break. Compare the marker
+# with every non-whitespace character kept in order and any amount of
+# whitespace allowed between them — then require the matched span to contain
+# a newline. Single-line whitespace variants (a UI column tab between the same
+# words) are not a folded marker and must not count as positive evidence.
+devin_folded_marker_present() {
+  local marker="$1"
+  python3 -c '
+import re, sys
+marker, recent = sys.argv[1], sys.stdin.read()
+pat = r"\s*".join(re.escape(c) for c in marker if not c.isspace())
+m = re.search(pat, recent)
+sys.exit(0 if m is not None and "\n" in m.group(0) else 1)
+' "$marker"
+}
+
 landing_check_once() {
-  local pane="$1" marker="$2" profile_kind="$3" recent visible status
+  local pane="$1" marker="$2" profile_kind="$3" submit="${4:-}" recent visible status
   LANDING_CHECK_LAST_EVIDENCE=none
   if ! recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
     LANDING_CHECK_AMBIGUOUS=1
@@ -332,11 +348,10 @@ landing_check_once() {
   # #568: Devin folds long lines at its render width, so the transcript's copy
   # of the marker can carry a line break or indent the raw substring never
   # matches (the 2026-09-22 t502-verify duplicate: rc 6, status=working,
-  # marker present but folded → reinjected into a working tester). Compare
-  # with all whitespace stripped — devin only; every other kind keeps the raw
-  # substring contract.
-  if [[ "$profile_kind" == devin && -n "$marker" ]] &&
-     grep -Fq -- "${marker//[[:space:]]/}" <<<"${recent//[[:space:]]/}"; then
+  # marker present but folded → reinjected into a working tester). Devin
+  # only; every other kind keeps the raw substring contract.
+  if [[ "$profile_kind" == devin && -n "$marker" && "$recent" == *$'\n'* ]] &&
+     devin_folded_marker_present "$marker" <<<"$recent"; then
     LANDING_CHECK_LAST_EVIDENCE=devin-marker-folded
     LANDING_CHECK_LAST_REASON="folded-marker-in-recent-unwrapped"
     return 0
@@ -392,14 +407,29 @@ landing_check_once() {
   # Herdr's built-in Devin detector exposes a post-prompt idle/done state after
   # it has accepted the brief. That detector result is profile-specific positive
   # evidence; generic agents still require a transcript marker or Pasted text.
-  # #568: delivery only runs after `agent wait --until idle` already saw the
-  # pane idle, so a Devin pane reporting working has consumed the submitted
-  # brief — nothing else was ever sent. `working` is positive evidence for
-  # devin alone; the cold-boot caveat keeps it non-evidence for other kinds.
-  if [[ "$profile_kind" == devin && "$status" =~ ^(idle|done|working)$ ]]; then
+  if [[ "$profile_kind" == devin && "$status" =~ ^(idle|done)$ ]]; then
     LANDING_CHECK_LAST_EVIDENCE=devin-status
     LANDING_CHECK_LAST_REASON="devin-post-prompt-status-${status}"
     return 0
+  fi
+  # #568: delivery only runs after `agent wait --until idle` already saw the
+  # pane idle, so a Devin pane reporting working has consumed the submitted
+  # brief — nothing else was ever sent. `working` is positive evidence only
+  # for an accepted submit: after an unconfirmed one (a timeout can fall on
+  # either side of the send boundary) working cannot be attributed to this
+  # brief, so it is ambiguous — landed stays no and the possibly delivered
+  # brief is not duplicated. For other kinds the cold-boot caveat keeps
+  # `working` non-evidence.
+  if [[ "$profile_kind" == devin && "$status" == working ]]; then
+    if [[ "$submit" == accepted ]]; then
+      LANDING_CHECK_LAST_EVIDENCE=devin-status
+      LANDING_CHECK_LAST_REASON=devin-post-prompt-status-working
+      return 0
+    fi
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_EVIDENCE=devin-status-working
+    LANDING_CHECK_LAST_REASON="devin-working-unattributable-submit-${submit:-unknown}"
+    return 1
   fi
   if [[ "$status" == working ]]; then
     LANDING_CHECK_LAST_REASON=working-without-positive-evidence
@@ -410,7 +440,7 @@ landing_check_once() {
 }
 
 landing_check() {
-  local pane="$1" marker="$2" profile_kind="$3" tick delay
+  local pane="$1" marker="$2" profile_kind="$3" submit="${4:-}" tick delay
   LANDING_CHECK_CONFIRMED=0
   LANDING_CHECK_AMBIGUOUS=0
   LANDING_CHECK_AMBIGUOUS_REASON=""
@@ -420,7 +450,7 @@ landing_check() {
   LANDING_CHECK_LAST_REASON=not-observed
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
-    if landing_check_once "$pane" "$marker" "$profile_kind"; then return 0; fi
+    if landing_check_once "$pane" "$marker" "$profile_kind" "$submit"; then return 0; fi
     if [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 && -z "$LANDING_CHECK_AMBIGUOUS_REASON" ]]; then
       LANDING_CHECK_AMBIGUOUS_REASON="$LANDING_CHECK_LAST_REASON"
     fi
@@ -621,7 +651,9 @@ spawn_deliver_brief() {
       ;;
     daemon)
       spawn_herdr_fallback
-      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+      # The fallback injected through herdr directly, so a post-injection
+      # observation attaches to a delivery that definitely happened.
+      if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" accepted; then
         LANDING=yes
       else
         detail="$(landing_check_detail)"
@@ -632,7 +664,7 @@ spawn_deliver_brief() {
   esac
 
   # accepted | unconfirmed: panewire could not prove it. Observe only.
-  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+  if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
     LANDING=yes
     return 0
   fi
@@ -649,7 +681,7 @@ spawn_deliver_brief() {
     case "$SPAWN_SUBMIT" in
       proven) LANDING=retry; return 0 ;;
       accepted|unconfirmed)
-        if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND"; then
+        if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
           LANDING=retry
           return 0
         fi

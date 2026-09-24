@@ -197,9 +197,10 @@ case "${1:-}" in
             ;;
           # #568 negative direction: the pane is absent from agent list, so
           # its status reads unknown — no positive evidence of any kind.
-          # devin-wrapped-marker shares it so the folded-marker test can only
-          # land via the marker itself, never via the devin-status branch.
-          devin-no-landing|devin-wrapped-marker)
+          # devin-wrapped-marker and devin-fold-collision share it so the
+          # marker tests can only land via the marker itself, never via the
+          # devin-status branch.
+          devin-no-landing|devin-wrapped-marker|devin-fold-collision)
             printf '%s\n' '{"result":{"agents":[]}}'
             ;;
           devin-wrong-agent)
@@ -250,6 +251,14 @@ case "${1:-}" in
         if [[ "$scenario" == devin-wrapped-marker ]]; then
           if fixture_is_recent_unwrapped_read "$@"; then
             printf '❭ fixture\n    prompt\n'
+          else
+            printf 'devin composer\n'
+          fi
+        # #568 adversarial: the same two words separated by a UI tab on one
+        # line. No line break participated, so this is not a folded marker.
+        elif [[ "$scenario" == devin-fold-collision ]]; then
+          if fixture_is_recent_unwrapped_read "$@"; then
+            printf 'unrelated UI label: fixture\tprompt settings\n'
           else
             printf 'devin composer\n'
           fi

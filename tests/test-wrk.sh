@@ -1522,6 +1522,32 @@ grep -q 'action=reinject-once' <<<"$devin_none_out" ||
   fail "568 devin no-landing must re-inject exactly once: $(pw_calls)/$(herdr_briefs)"
 echo "PASS 568-devin-confirmed-nonlanding-reinject-once"
 
+# #568 round-2 (tester blocker): an unconfirmed submit — panewire timed out,
+# possibly before anything was sent — must not be upgraded to landed by a
+# merely-working devin. The timeout fixture exits before `agent prompt`, so
+# herdr_briefs=0 proves nothing was ever injected.
+pw_reset
+devin_unconf_out="$(TEST_FIXTURE_SCENARIO=devin-working-no-marker WRK_PANEWIRE_PROMPT=timeout \
+  pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_unconf_out" ||
+  fail "568 unconfirmed+working must not claim landed: $devin_unconf_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 0 ]] ||
+  fail "568 unconfirmed+working must not inject: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-unconfirmed-working-not-landed"
+
+# #568 round-2 (tester blocker): the same two words separated by a UI tab on
+# one line are not a folded marker — no line break participated. With no
+# other evidence this is confirmed non-landing: exactly one re-injection.
+pw_reset
+devin_coll_out="$(TEST_FIXTURE_SCENARIO=devin-fold-collision pw_spawn devin-swe2 2>&1)"
+grep -q 'landed=no' <<<"$devin_coll_out" ||
+  fail "568 fold-collision must not claim landed: $devin_coll_out"
+grep -q 'action=reinject-once' <<<"$devin_coll_out" ||
+  fail "568 fold-collision lost the re-injection: $devin_coll_out"
+[[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] ||
+  fail "568 fold-collision must re-inject exactly once: $(pw_calls)/$(herdr_briefs)"
+echo "PASS 568-devin-fold-collision-not-marker"
+
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"
 grep -q 'gate blocked' <<<"$blocked3"
