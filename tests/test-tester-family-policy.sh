@@ -63,7 +63,9 @@ def rules(spawn: str) -> dict:
         "t3_forbidden": "T3 불가" in c1,
         "excluded": set(surfaces),
         "fresh_session": "새 세션 + 별도 detached worktree" in c3,
-        "strong_tester": "`opus` `xhigh` 급" in c4 and "reps 실측" in c4,
+        "strong_tester": "`opus` `xhigh` 급" in c4
+        and "reps 실측" in c4
+        and "지시형 브리프를 받은 원 tester 급 이상" in c4,
         "effort_only_rejected": re.search(r"effort 만 올린 tester.*충족하지 않는다", c4)
         is not None,
         "directed_brief": "지시형 공격 표면" in c5 and "`file:line`" in c5,
@@ -145,6 +147,23 @@ def check(d: dict) -> None:
     )
     assert "8건 중 각각 0건·1건" in flat(block(d["spawn"])), "E7 result numbers missing"
     assert "외삽하지 않는다" in flat(block(d["spawn"])), "no-extrapolation caveat missing"
+    blk = flat(block(d["spawn"]))
+    assert (
+        "아래 조건을 **전부** 충족할 때만 contributor 계열과 같은 계열 tester 의 PASS 가 "
+        "머지 게이트의 독립 검증이 된다" in blk
+    ), "grant sentence must stay conditional on every item"
+    assert "AC 의미 변경·같은 표면 반복 회귀가 있으면 교차 검증 또는 설계 재검토로 간다" in blk, (
+        "escalation to cross verification / design review missing"
+    )
+    assert re.search(r"계열 합집합 밖 tester 가 같은 SHA 를 블라인드로 재검토한다", blk), (
+        "pilot blind re-review missing"
+    )
+    assert (
+        "`동일 계열 독립 세션 검증` 표기만으로는 머지 가능 상태가 아니다" in spawn
+        and "`동일 계열 독립 세션 검증 (2차 대기 · 머지 불가)`" in spawn
+    ), "same-family label must not by itself mean merge-eligible"
+    for name in ("spawn", "builder"):
+        assert "§2-4 동일 계열 예외" not in d[name], f"{name}: retired term '§2-4 동일 계열 예외'"
     for name in ("builder", "director"):
         text = flat(d[name])
         assert re.search(r"계열과 무관하게 항상 지시형 공격 표면", text), f"{name}: directed-surface rule missing"
@@ -187,6 +206,13 @@ mutants = {
     "builder-directed-dropped": mutate("builder", "계열과 무관하게 항상 지시형 공격 표면을", "필요하면 공격 표면을"),
     "director-directed-dropped": mutate("director", "계열과 무관하게 항상 지시형 공격 표면이", "가능하면 공격 표면이"),
     "director-t3-carveout-dropped": mutate("director", "T3와 제외 표면은 예외 없이 합집합 밖 PASS가 필요하다. ", ""),
+    "grant-neutralized": mutate("spawn", "계열 tester 의 PASS 가 머지 게이트의 독립 검증이 된다.", "계열 tester 의 PASS 도 참고한다."),
+    "all-dropped": mutate("spawn", "아래 조건을 **전부** 충족할 때만", "아래 조건을 충족할 때만"),
+    "original-tester-dropped": mutate("spawn", "지시형 브리프를 받은 원 tester 급 이상", "적격"),
+    "escalation-dropped": mutate("spawn", "AC 의미 변경·같은 표면 반복 회귀가 있으면 교차 검증 또는 설계 재검토로 간다", "다시 본다"),
+    "blind-rereview-dropped": mutate("spawn", "블라인드로 재검토한다", "재검토한다"),
+    "label-eligibility-dropped": mutate("spawn", "`동일 계열 독립 세션 검증` 표기만으로는 머지 가능 상태가 아니다", "표기는 참고용이다"),
+    "retired-term-back": mutate("spawn", "(§2-4 조건부 동일 계열 검증·소진 시 지연 검증).", "(타사 풀 물리적 소진 시 §2-4 동일 계열 예외)."),
 }
 for name, doc in mutants.items():
     try:
