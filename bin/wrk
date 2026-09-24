@@ -1930,21 +1930,34 @@ resolve_profile() {
 # #637: a pane's env and argv die with it — after a reboot herdr restores the
 # pane as bare `claude --resume <id>` (hk:doc
 # task/2026-09-24/resume-loses-worker-env). For claude-kind workers the durable
-# copy of the prompt-suggestion toggle and the launch permission mode lives in
-# the worker worktree's own .claude/settings.local.json, which Claude Code
-# re-reads on every launch, resume included (verified: env values from a linked
-# worktree's local file reach the session's process env).
+# copy of the prompt-suggestion toggle lives in the worker worktree's own
+# .claude/settings.local.json, which Claude Code re-reads on every launch,
+# resume included (verified: env values from a linked worktree's local file
+# reach the session's process env).
+#
+# The launch permission mode is deliberately NOT written. Per
+# settings-reference, "`auto` and `bypassPermissions` don't take effect from
+# project or local settings"; the local source is still highest-priority, so
+# the session then "starts in Manual mode" — writing bypassPermissions here
+# would pin every flagless claude launch in the worktree (a herdr restore
+# included) to Manual, overriding user settings and the built-in default.
+# Restoring bypass needs the launch flag, or user/--settings/managed scope.
 #
 # Merge, never clobber: an existing file keeps every unrelated key, and only
-# our two keys are written. A file that is not a JSON object (or whose `env` /
-# `permissions` are not objects) aborts the spawn rather than being silently
-# overwritten — that state needs a human, not a rewrite.
+# our env key is written. A file that is not a JSON object (or whose `env` is
+# not an object — `null` included), or one already tracked by the repo, aborts
+# the spawn rather than being silently overwritten — that state needs a human,
+# not a rewrite.
 write_claude_local_settings() {
-  local cwd="$1" mode="$2"
-  python3 - "$cwd" "$mode" <<'PY'
+  local cwd="$1"
+  # A tracked settings.local.json belongs to the repo; wrk must never modify a
+  # target repo's tracked files.
+  git -C "$cwd" ls-files --error-unmatch -- .claude/settings.local.json >/dev/null 2>&1 &&
+    { printf 'wrk: %s/.claude/settings.local.json is tracked in the repo; refusing to modify a tracked file\n' "$cwd" >&2; return 3; }
+  python3 - "$cwd" <<'PY'
 import json, os, sys, tempfile
 
-cwd, mode = sys.argv[1], sys.argv[2]
+cwd = sys.argv[1]
 path = os.path.join(cwd, ".claude", "settings.local.json")
 
 data = {}
@@ -1960,17 +1973,14 @@ if existed:
         print("wrk: %s is not a JSON object; refusing to modify it" % path, file=sys.stderr)
         sys.exit(3)
 
-for key in ("env", "permissions"):
-    node = data.get(key)
-    if node is None:
-        node = data[key] = {}
-    if not isinstance(node, dict):
-        print("wrk: %s: '%s' is not a JSON object; refusing to modify it" % (path, key), file=sys.stderr)
+if "env" in data:
+    if not isinstance(data["env"], dict):
+        print("wrk: %s: 'env' is not a JSON object; refusing to modify it" % path, file=sys.stderr)
         sys.exit(3)
+else:
+    data["env"] = {}
 
 data["env"]["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
-if mode:
-    data["permissions"]["defaultMode"] = mode
 
 os.makedirs(os.path.dirname(path), exist_ok=True)
 fd, tmp = tempfile.mkstemp(prefix=".settings.local.json.", dir=os.path.dirname(path))
@@ -3835,17 +3845,15 @@ spawn_cmd() {
   fi
 
   # #637: persist what the pane would otherwise lose on a herdr reboot restore
-  # (bare `claude --resume <id>`): the prompt-suggestion-off env and the launch
-  # permission mode, in the worker worktree's .claude/settings.local.json.
-  # Runs after every gate and before tab create, so a malformed existing file
-  # fails the spawn closed with no pane left behind. Same resident carve-out as
-  # the pane env: --purpose director is left as is.
+  # (bare `claude --resume <id>`): the prompt-suggestion-off env, in the worker
+  # worktree's .claude/settings.local.json. The permission mode is not
+  # persisted — local-file bypassPermissions cannot take effect (settings-ref)
+  # and would force Manual on every flagless launch in the worktree. Runs after
+  # every gate and before tab create, so a malformed or tracked existing file
+  # fails the spawn closed with no pane left behind. Same resident carve-out
+  # as the pane env: --purpose director is left as is.
   if [[ "$PROFILE_KIND" == claude && "${PURPOSE:-}" != director ]]; then
-    claude_perm_mode=""
-    for arg in ${ARGS[@]+"${ARGS[@]}"}; do
-      [[ "$arg" == "--dangerously-skip-permissions" ]] && claude_perm_mode="bypassPermissions"
-    done
-    write_claude_local_settings "$CWD" "$claude_perm_mode" ||
+    write_claude_local_settings "$CWD" ||
       die "claude worker local settings not written for $CWD; spawn aborted before any pane (nothing was clobbered)"
     ensure_settings_local_ignored "$CWD"
   fi

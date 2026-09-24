@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # #637: when wrk spawns a claude-kind worker it must persist the launch-time
-# env toggle and permission mode into the worker worktree's own
-# .claude/settings.local.json — the file a bare `claude --resume <id>`
-# (herdr's reboot restore) re-reads on the next launch.
+# env toggle into the worker worktree's own .claude/settings.local.json — the
+# file a bare `claude --resume <id>` (herdr's reboot restore) re-reads on the
+# next launch. The permission mode is deliberately not persisted: a local-file
+# bypassPermissions cannot take effect on claude >= 2.1.257 and would force
+# Manual mode on every flagless launch in the worktree (settings-reference).
 #
 # Covered here:
-#   AC1  absent file  -> created with exactly our env key + defaultMode
-#   AC2  existing file -> merged; unrelated keys preserved, our two overwritten
+#   AC1  absent file  -> created with exactly our env key
+#   AC2  existing file -> merged; unrelated keys preserved, our env overwritten
 #   AC3  malformed file -> spawn fails closed, file untouched, no pane
+#        (also: non-object JSON, env:null, and a tracked file all fail closed)
 #   AC4  file is git-ignored (repo info/exclude fallback); git status clean
 #   AC5  non-claude kinds and --purpose director write nothing
 # Mutants at the end: merge removed / ignore step removed / non-claude write —
@@ -25,6 +28,14 @@ cleanup() {
     read -r pid <"$pidfile" || continue
     if [[ "$pid" =~ ^[0-9]+$ ]]; then kill "$pid" 2>/dev/null || true; fi
   done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
+  # A detached wrk refresh supervisor can still be appending refresh.log while
+  # rm walks the tree; BSD rm then exits "Directory not empty" (seen on macOS
+  # CI). Retry briefly so the tail of a successful run cannot flake the suite.
+  local i
+  for i in $(seq 10); do
+    rm -rf "$TMP" 2>/dev/null && return 0
+    sleep 0.3
+  done
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -93,16 +104,16 @@ if actual != expected:
 PY
 }
 
-# AC1 — file absent -> created with exactly our two keys.
+# AC1 — file absent -> created with exactly our env key.
 d="$(mkrepo ac1)"
 spawn_in "$WRK" "$d" opus ||
   fail "AC1 spawn failed: $(tail -n 3 "$TMP/wrk.stderr")"
 assert_settings "AC1 opus" "$d/$SETTINGS" \
-  '{"env":{"CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION":"false"},"permissions":{"defaultMode":"bypassPermissions"}}' ||
+  '{"env":{"CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION":"false"}}' ||
   exit 1
-echo "PASS AC1 create: env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false + permissions.defaultMode=bypassPermissions, nothing else"
+echo "PASS AC1 create: env.CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false, nothing else (no defaultMode — cannot express bypass from a local file)"
 
-# AC2 — existing file merges: unrelated keys preserved, our two overwritten.
+# AC2 — existing file merges: unrelated keys preserved, our env overwritten.
 d="$(mkrepo ac2)"
 mkdir -p "$d/.claude"
 printf '%s\n' '{"model":"claude-opus-5-5","env":{"OTHER_VAR":"keep","CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION":"true"},"permissions":{"allow":["Bash(npm run *)"],"defaultMode":"plan"},"extra":{"nested":[1,2]}}' \
@@ -110,9 +121,9 @@ printf '%s\n' '{"model":"claude-opus-5-5","env":{"OTHER_VAR":"keep","CLAUDE_CODE
 spawn_in "$WRK" "$d" sonnet ||
   fail "AC2 spawn failed: $(tail -n 3 "$TMP/wrk.stderr")"
 assert_settings "AC2 merge" "$d/$SETTINGS" \
-  '{"model":"claude-opus-5-5","env":{"OTHER_VAR":"keep","CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION":"false"},"permissions":{"allow":["Bash(npm run *)"],"defaultMode":"bypassPermissions"},"extra":{"nested":[1,2]}}' ||
+  '{"model":"claude-opus-5-5","env":{"OTHER_VAR":"keep","CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION":"false"},"permissions":{"allow":["Bash(npm run *)"],"defaultMode":"plan"},"extra":{"nested":[1,2]}}' ||
   exit 1
-echo "PASS AC2 merge: unrelated keys preserved (allow list, other env var, model, nested), our two overwritten"
+echo "PASS AC2 merge: unrelated keys preserved (allow list, other env var, model, nested, existing defaultMode=plan), our env overwritten"
 
 # AC3 — malformed existing file: fail closed, never clobber, no pane.
 d="$(mkrepo ac3)"
@@ -139,6 +150,35 @@ spawn_in "$WRK" "$d" opus || rc=$?
 grep -q "not a JSON object" "$TMP/wrk.stderr" ||
   { echo "RED: AC3b: no clear message: $(tail -n 3 "$TMP/wrk.stderr")" >&2; exit 1; }
 echo "PASS AC3b non-object: spawn rc=$rc fail-closed"
+
+# A present-but-non-object env node (null included) fails closed — it is an
+# existing key we do not own, not "missing".
+d="$(mkrepo ac3c)"
+mkdir -p "$d/.claude"
+printf '%s\n' '{"env":null}' >"$d/$SETTINGS"
+rc=0
+spawn_in "$WRK" "$d" opus || rc=$?
+[[ "$rc" -ne 0 ]] || { echo "RED: AC3c: spawn succeeded over env:null $SETTINGS" >&2; exit 1; }
+printf '%s\n' '{"env":null}' | cmp -s - "$d/$SETTINGS" ||
+  { echo "RED: AC3c: env:null file was modified" >&2; exit 1; }
+echo "PASS AC3c env-null: spawn rc=$rc fail-closed, file untouched"
+
+# A tracked settings.local.json belongs to the repo — wrk must never modify a
+# target repo's tracked files, so the spawn fails closed.
+d="$(mkrepo ac3d)"
+mkdir -p "$d/.claude"
+printf '%s\n' '{"env":{"OTHER_VAR":"keep"}}' >"$d/$SETTINGS"
+git -C "$d" add -f "$SETTINGS"
+rc=0
+spawn_in "$WRK" "$d" opus || rc=$?
+[[ "$rc" -ne 0 ]] || { echo "RED: AC3d: spawn succeeded over a tracked $SETTINGS" >&2; exit 1; }
+grep -q "tracked in the repo" "$TMP/wrk.stderr" ||
+  { echo "RED: AC3d: no clear tracked-file message: $(tail -n 3 "$TMP/wrk.stderr")" >&2; exit 1; }
+printf '%s\n' '{"env":{"OTHER_VAR":"keep"}}' | cmp -s - "$d/$SETTINGS" ||
+  { echo "RED: AC3d: tracked file was modified" >&2; exit 1; }
+! grep -q '^tab create ' "$TMP/herdr.log" ||
+  { echo "RED: AC3d: a pane was created despite the tracked file" >&2; exit 1; }
+echo "PASS AC3d tracked: spawn rc=$rc fail-closed, tracked file untouched, no pane"
 
 # AC4 — git ignores the file. The scratch repos carry no .gitignore rule, so
 # coverage must come from the repo's info/exclude fallback.
