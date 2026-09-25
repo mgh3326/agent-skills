@@ -150,8 +150,11 @@ fixture_brief_landed() {
     # #701: grok echoes the brief 1-2 minutes after injection — past the
     # default 18-tick window but inside grok's extended one (the panewire
     # classify read counts as read 1, so the marker lands on a late tick).
+    # #717: 60 reads lands on tick ~58 (~114s in), past codex's whole 33-tick
+    # window too — a mutant that shrinks grok's ticks below ~59 loses the
+    # landing.
     grok-slow-marker)
-      if (( recent_reads >= 30 )); then return 0; fi
+      if (( recent_reads >= 60 )); then return 0; fi
       ;;
   esac
   return 1
