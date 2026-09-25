@@ -63,6 +63,23 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
 5. **워커·tester 배치는 `wrk spawn`(hub placement)이 정한다.** 빌더 자신의 머신이 기본값이
    아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
 
+<!-- ci-canonical-full-suite:start -->
+**CI-covered full-suite canonical rule.** 변경 표면이 director/gate_policy.json에 등록된 그
+저장소 자체 CI test/build jobs로 완전히 덮일 때만, director/merge_precheck.py의 G3와
+director/ci_canonical.py가 PASS로 묶은 H/B/M 증거가 local full-suite rerun을 대체한다. H는
+현재 PR head, B는 current base, M은 CI가 실제 실행한 merge commit이며, tester의 detached
+verification SHA도 H다. 각 required check는 run ID, attempt, job ID, H, B, M에 결속돼야 하며
+목록은 gate_policy.json만이 가진다. tester does not rerun a local full suite for that CI-covered
+surface; CI는 independent counterexample, targeted contract test, 또는 mutant를 대체하지 않는다.
+
+Tester는 근거를 기록해 affected surface를 넓힐 수 있다. surviving mutant는 unproven이며,
+소비자·계약 테스트나 반례를 넓혀도 죽이지 못하면 해당 주장은 통과가 아니다. CI or collection
+configuration을 바꾸는 PR은 separately judged하고 이 shortcut을 쓰지 않는다. T3는 local에서
+관련 safety-guard 파일 전체, independent counterexample, mutant RED then restored GREEN, 그리고
+environment differences를 최소로 유지한다. outside CI surface는 CI에 등록되어 실제 실행됨이
+확인될 때까지 local run이 필요하다. red rerun이면 verification is not met다.
+<!-- ci-canonical-full-suite:end -->
+
 ### 단독 모드 — 6조건을 전부 충족할 때만 워커 없이 직접 구현
 
 위 3번(워커와 tester는 빌더가 스폰한다)이 기본 규칙이고, 이 절은 그 **유일한 조건부 예외**다.

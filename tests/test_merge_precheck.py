@@ -272,6 +272,38 @@ class MergePrecheckTests(unittest.TestCase):
         s["ci_jobs"][10][0]["conclusion"] = "failure"
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
 
+    def test_ci_red_rerun_is_not_met_with_assertion_red_mutant(self) -> None:
+        s = snapshot()
+        rerun = copy.deepcopy(s["ci_runs"][0])
+        rerun.update({"id": 11, "created_at": "2026-09-25T07:05:00Z", "conclusion": "failure"})
+        s["ci_runs"].append(rerun)
+        s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
+        for job in s["ci_jobs"][11]:
+            job["run_id"] = 11
+            job["conclusion"] = "failure"
+        assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        selector = "selected = selected[-1:] if selected else []"
+        self.assertEqual(1, source.count(selector))
+        namespace: dict = {"__name__": "ci_rerun_red_mutant"}
+        exec(source.replace(selector, "selected = selected[:1] if selected else []"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_FAILED", mutant["reason_code"])
+
+    def test_ci_per_check_identity_binding_has_assertion_red_mutant(self) -> None:
+        s = snapshot()
+        s["ci_jobs"][10][0]["id"] = "not-an-action-job-id"
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = "if not _has_bound_identity(run, job, H):"
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_identity_binding_mutant"}
+        exec(source.replace(guard, "if False:"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+
     def test_required_test_step_must_execute(self) -> None:
         s = snapshot()
         s["ci_jobs"][10][0]["steps"] = [

@@ -28,7 +28,7 @@ checker는 director와 builder 사이의 **통신·서무** 역할이다. 빌더
 |---|---|---|
 | G1 | 검증 보고 | `<report>` 존재, 마지막 줄 `VERDICT: JOIN`, 보고의 검증 head == `<sha>` |
 | G2 | PR head | `gh pr view <n> --json headRefOid` == `<sha>`(빌더가 올린 값과 현재 head 일치) |
-| G3 | CI exact-head | `gh pr checks <n>`를 **탭으로** 파싱, 사이트 정본의 required 집합 전부 `pass`, run의 `head_sha` == `<sha>` |
+| G3 | CI canonical | director/merge_precheck.py의 G3를 호출한다. 내부 director/ci_canonical.py 판정이 site policy의 required 집합, run/attempt/job/H/B/M 결속, 실제 test/build step 실행을 PASS로 낸다. checker는 별도 CI parser를 만들거나 gh pr checks 출력만으로 PASS를 추정하지 않는다. |
 | G4 | base 전진 | `git rev-list --count <sha>..origin/<base>` == 0. 아니면 `gh pr update-branch` 후 CI 재대기(내용 변경 아님, 허용) |
 | G5 | leak 스캔 | `gh pr diff` 에 내부 주소·실 pane id·레인명·토큰·시크릿 패턴 0. 공개 레포면 민감 운영 문언도 0 |
 | G6 | 마이그레이션·설정 | 마이그레이션·시크릿·정책 파일 변경 유무를 **표시**(판단 아님) |
@@ -37,6 +37,23 @@ checker는 director와 builder 사이의 **통신·서무** 역할이다. 빌더
 
 자동 리뷰어(CodeRabbit 등)의 'Changes requested' 리뷰 상태(`reviewDecision`)는 게이트가
 아니다 — checker 는 이를 BOUNCE 사유로 쓰지 않는다(builder §9 정본과 같은 문장).
+
+<!-- ci-canonical-full-suite:start -->
+**CI-covered full-suite canonical rule.** 변경 표면이 director/gate_policy.json에 등록된 그
+저장소 자체 CI test/build jobs로 완전히 덮일 때만, director/merge_precheck.py의 G3와
+director/ci_canonical.py가 PASS로 묶은 H/B/M 증거가 local full-suite rerun을 대체한다. H는
+현재 PR head, B는 current base, M은 CI가 실제 실행한 merge commit이며, tester의 detached
+verification SHA도 H다. 각 required check는 run ID, attempt, job ID, H, B, M에 결속돼야 하며
+목록은 gate_policy.json만이 가진다. tester does not rerun a local full suite for that CI-covered
+surface; CI는 independent counterexample, targeted contract test, 또는 mutant를 대체하지 않는다.
+
+Tester는 근거를 기록해 affected surface를 넓힐 수 있다. surviving mutant는 unproven이며,
+소비자·계약 테스트나 반례를 넓혀도 죽이지 못하면 해당 주장은 통과가 아니다. CI or collection
+configuration을 바꾸는 PR은 separately judged하고 이 shortcut을 쓰지 않는다. T3는 local에서
+관련 safety-guard 파일 전체, independent counterexample, mutant RED then restored GREEN, 그리고
+environment differences를 최소로 유지한다. outside CI surface는 CI에 등록되어 실제 실행됨이
+확인될 때까지 local run이 필요하다. red rerun이면 verification is not met다.
+<!-- ci-canonical-full-suite:end -->
 
 <!-- openai-independent-verification:start -->
 **OpenAI 계열 독립검증 계약**

@@ -564,6 +564,23 @@ macOS 에는 `flock` 명령이 없으므로 **브리프에 셸 `flock` 문구를
 **강도는 §2-1의 T가 정한다.** T0=스폰 없음 / T1=자체검증 / T2=적대검증 1라운드 /
 T3=아래 수렴형.
 
+<!-- ci-canonical-full-suite:start -->
+**CI-covered full-suite canonical rule.** 변경 표면이 director/gate_policy.json에 등록된 그
+저장소 자체 CI test/build jobs로 완전히 덮일 때만, director/merge_precheck.py의 G3와
+director/ci_canonical.py가 PASS로 묶은 H/B/M 증거가 local full-suite rerun을 대체한다. H는
+현재 PR head, B는 current base, M은 CI가 실제 실행한 merge commit이며, tester의 detached
+verification SHA도 H다. 각 required check는 run ID, attempt, job ID, H, B, M에 결속돼야 하며
+목록은 gate_policy.json만이 가진다. tester does not rerun a local full suite for that CI-covered
+surface; CI는 independent counterexample, targeted contract test, 또는 mutant를 대체하지 않는다.
+
+Tester는 근거를 기록해 affected surface를 넓힐 수 있다. surviving mutant는 unproven이며,
+소비자·계약 테스트나 반례를 넓혀도 죽이지 못하면 해당 주장은 통과가 아니다. CI or collection
+configuration을 바꾸는 PR은 separately judged하고 이 shortcut을 쓰지 않는다. T3는 local에서
+관련 safety-guard 파일 전체, independent counterexample, mutant RED then restored GREEN, 그리고
+environment differences를 최소로 유지한다. outside CI surface는 CI에 등록되어 실제 실행됨이
+확인될 때까지 local run이 필요하다. red rerun이면 verification is not met다.
+<!-- ci-canonical-full-suite:end -->
+
 1. 워커 "완료" 보고 → **`git ls-remote`로 push SHA 실재 대조**(머지·배포·후속 스폰 전 필수).
 2. **기계적 확인은 검증 라운드의 소재가 아니다.** 테스트·lint·format·CI green·SHA 일치는
    **워커의 제출 전 체크리스트**이고 증거(원문 출력)를 브리프에 첨부하게 한다. tester는
