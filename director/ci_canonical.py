@@ -34,14 +34,30 @@ def _run_time(run: dict[str, Any]) -> datetime:
     return instant
 
 
-def _has_duplicate_attempt_listing(candidates: list[dict[str, Any]]) -> bool:
-    seen: set[tuple[int, int]] = set()
-    for run in candidates:
-        key = (run["id"], run["run_attempt"])
-        if key in seen:
-            return True
-        seen.add(key)
-    return False
+def _candidate_listing_problem(
+    all_runs: list[dict[str, Any]], candidates: list[dict[str, Any]],
+) -> str | None:
+    """Reject duplicate or conflicting rows for any run selected as a candidate."""
+    candidate_ids = {run["id"] for run in candidates}
+    seen_attempts: set[tuple[int, int]] = set()
+    bindings: dict[int, tuple[Any, Any, Any]] = {}
+    for run in all_runs:
+        run_id = run.get("id")
+        if type(run_id) is not int or run_id not in candidate_ids:
+            continue
+        attempt = run.get("run_attempt")
+        if type(attempt) is not int or attempt <= 0:
+            return "CI_RUN_IDENTITY_INVALID"
+        binding = (run.get("head_sha"), run.get("event"), run.get("path"))
+        previous_binding = bindings.get(run_id)
+        if previous_binding is not None and binding != previous_binding:
+            return "CI_RUN_IDENTITY_INVALID"
+        bindings[run_id] = binding
+        identity = (run_id, attempt)
+        if identity in seen_attempts:
+            return "CI_RUN_AMBIGUOUS"
+        seen_attempts.add(identity)
+    return None
 
 
 def _latest_attempts_by_run_id(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -126,8 +142,9 @@ def evaluate_required_ci(
                or type(run.get("run_attempt")) is not int or run.get("run_attempt") <= 0
                for run in candidates):
             return _result("UNVERIFIED", "CI_RUN_IDENTITY_INVALID", jobs=observations)
-        if _has_duplicate_attempt_listing(candidates):
-            return _result("UNVERIFIED", "CI_RUN_AMBIGUOUS", jobs=observations)
+        listing_problem = _candidate_listing_problem(runs, candidates)
+        if listing_problem is not None:
+            return _result("UNVERIFIED", listing_problem, jobs=observations)
         try:
             order = {id(run): _run_time(run) for run in candidates}
         except (ValueError, TypeError):

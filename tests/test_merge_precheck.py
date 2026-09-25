@@ -328,6 +328,8 @@ class MergePrecheckTests(unittest.TestCase):
 
         green_tie = canonical_run(12, 2)
         red_tie = canonical_run(13, 1)
+        tied = evaluate_canonical_ci(repo, [green_tie, red_tie])
+        self.assertEqual(expected, (tied["status"], tied["reason_code"]))
         tie_evaluator = canonical_ci_mutant([
             ("if _has_cross_run_tie(latest_attempts, order):",
              "if False and _has_cross_run_tie(latest_attempts, order):")])
@@ -343,6 +345,8 @@ class MergePrecheckTests(unittest.TestCase):
         expected = ("PASS", "CI_ALL_REQUIRED_SUCCEEDED")
         actual = evaluate_canonical_ci(repo, [failed_attempt, successful_retry])
         self.assertEqual(expected, (actual["status"], actual["reason_code"]))
+        reverse = evaluate_canonical_ci(repo, [successful_retry, failed_attempt])
+        self.assertEqual(expected, (reverse["status"], reverse["reason_code"]))
 
         retry_evaluator = canonical_ci_mutant([
             ("if previous is None or attempt > previous[\"run_attempt\"]:",
@@ -361,14 +365,45 @@ class MergePrecheckTests(unittest.TestCase):
         self.assertEqual(expected, (actual["status"], actual["reason_code"]))
 
         duplicate_evaluator = canonical_ci_mutant([
-            ("if _has_duplicate_attempt_listing(candidates):",
-             "if False and _has_duplicate_attempt_listing(candidates):")])
+            ("listing_problem = _candidate_listing_problem(runs, candidates)",
+             "listing_problem = None")])
         with self.assertRaises(AssertionError):
             duplicate = evaluate_canonical_ci(repo, runs, duplicate_evaluator)
             self.assertEqual(expected, (duplicate["status"], duplicate["reason_code"]))
 
         reverse = evaluate_canonical_ci(repo, list(reversed(runs)))
         self.assertEqual(expected, (reverse["status"], reverse["reason_code"]))
+
+    def test_same_run_id_with_conflicting_immutable_fields_is_unverified(self) -> None:
+        repo = "mgh3326/agent-skills"
+        green = canonical_run(21, 1)
+        conflicting_rows = []
+        for field, value in (("head_sha", OTHER), ("event", "push"),
+                             ("path", ".github/workflows/other.yml")):
+            conflict = copy.deepcopy(green)
+            conflict["conclusion"] = "failure"
+            conflict[field] = value
+            conflicting_rows.append((field, [green, conflict]))
+        other_path_retry = canonical_run(21, 2, conclusion="failure",
+                                         started_at="2026-09-25T07:01:00Z",
+                                         created_at="2026-09-25T07:00:00Z",
+                                         path=".github/workflows/other.yml")
+        conflicting_rows.append(("retry_path", [green, other_path_retry]))
+
+        expected = ("UNVERIFIED", "CI_RUN_IDENTITY_INVALID")
+        for name, runs in conflicting_rows:
+            with self.subTest(conflict=name):
+                actual = evaluate_canonical_ci(repo, runs)
+                self.assertEqual(expected, (actual["status"], actual["reason_code"]))
+
+        conflict = copy.deepcopy(green)
+        conflict["head_sha"] = OTHER
+        conflicting_evaluator = canonical_ci_mutant([
+            ("listing_problem = _candidate_listing_problem(runs, candidates)",
+             "listing_problem = None")])
+        with self.assertRaises(AssertionError):
+            hidden = evaluate_canonical_ci(repo, [green, conflict], conflicting_evaluator)
+            self.assertEqual(expected, (hidden["status"], hidden["reason_code"]))
 
     def test_empty_run_started_at_does_not_fall_back_to_created_at(self) -> None:
         repo = "mgh3326/agent-skills"
