@@ -292,15 +292,28 @@ LANDING_CHECK_INITIAL_DELAY_SECONDS=0.5
 LANDING_CHECK_SECOND_DELAY_SECONDS=1
 LANDING_CHECK_MAX_DELAY_SECONDS=2
 
+# #717: `panewire prompt --timeout` is a budget of its own, decoupled from the
+# landing window above. It bounds how long the daemon polls for submission
+# evidence, and its classifier only knows claude and codex (prompt.go
+# classifySubmission) — for every other kind the poll can never succeed, so a
+# window-length timeout is dead wait before wrk's own observation even starts
+# (grok blocked the full 150s under #701). Codex keeps 60 seconds: its
+# cold-booted transcript can take tens of seconds to become readable, and a
+# proven result skips the entire landing check.
+PANEWIRE_PROMPT_DEFAULT_TIMEOUT_SECONDS=30
+PANEWIRE_PROMPT_CODEX_TIMEOUT_SECONDS=60
+
 configure_landing_check() {
   local profile_kind="$1"
   LANDING_CHECK_WINDOW_SECONDS="$LANDING_CHECK_DEFAULT_WINDOW_SECONDS"
   # 18 samples: 0.5 + 1 + (14 * 2) + 0.5 = 30 seconds.
   LANDING_CHECK_TIMEOUT_TICKS=18
+  SPAWN_PANEWIRE_TIMEOUT_SECONDS="$PANEWIRE_PROMPT_DEFAULT_TIMEOUT_SECONDS"
   if [[ "$profile_kind" == codex ]]; then
     LANDING_CHECK_WINDOW_SECONDS="$LANDING_CHECK_CODEX_WINDOW_SECONDS"
     # 33 samples: 0.5 + 1 + (29 * 2) + 0.5 = 60 seconds.
     LANDING_CHECK_TIMEOUT_TICKS=33
+    SPAWN_PANEWIRE_TIMEOUT_SECONDS="$PANEWIRE_PROMPT_CODEX_TIMEOUT_SECONDS"
   elif [[ "$profile_kind" == grok ]]; then
     LANDING_CHECK_WINDOW_SECONDS="$LANDING_CHECK_GROK_WINDOW_SECONDS"
     # 78 samples: 0.5 + 1 + (74 * 2) + 0.5 = 150 seconds.
@@ -611,7 +624,7 @@ spawn_panewire_prompt() {
     return 0
   fi
   SPAWN_PROMPT_FILES+=("$file")
-  seconds="$LANDING_CHECK_WINDOW_SECONDS"
+  seconds="$SPAWN_PANEWIRE_TIMEOUT_SECONDS"
   # The daemon enforces --timeout itself; the outer guard only covers a wedged
   # socket, which would otherwise hang the spawn with the gates already held.
   local guard=(timeout $((seconds + 15)))
