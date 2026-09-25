@@ -13,6 +13,7 @@ pool_for() {
     oc-omni) echo omniroute ;;
     oc-*) echo clinepass ;;
     grok|grok-hi|grok-med) echo grok ;;
+    kimi-*) echo kimi ;;
     *) echo "" ;;
   esac
 }
@@ -133,7 +134,7 @@ fi
 if [[ "${1:-}" == --json ]]; then
   json_rc=0
   schema_value=scopefuel.v1
-  providers='[{"id":"claude"},{"id":"devin"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"}]'
+  providers='[{"id":"claude"},{"id":"devin"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"},{"id":"kimi"}]'
   case "${WRK_SCOPEFUEL_JSON_MODE:-ok}" in
     broken) echo 'scopefuel: json fetch failed' >&2; exit 7 ;;
     garbage) echo 'not json at all'; exit 0 ;;
@@ -154,7 +155,7 @@ if [[ "${1:-}" == gate && "${2:-}" == --help ]]; then
   case "${WRK_GATE_MODE:-ok}" in
     unsupported) echo 'error: unknown command: gate' >&2; exit 2 ;;
     broken) echo 'scopefuel: internal probe failure' >&2; exit 7 ;;
-    *) echo 'usage: scopefuel gate -m PROFILE [--operator-request REF] [--requested-by NAME]'; exit 0 ;;
+    *) echo 'usage: scopefuel gate -m PROFILE [--effort E] [--operator-request REF] [--requested-by NAME]'; exit 0 ;;
   esac
 fi
 
@@ -184,16 +185,17 @@ if [[ "${1:-}" != gate ]]; then
   exit 2
 fi
 shift
-profile="" operator_request="" requested_by="" requested_by_seen=0 purpose=""
+profile="" operator_request="" requested_by="" requested_by_seen=0 purpose="" effort=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -m|--operator-request|--requested-by|--purpose)
+    -m|--operator-request|--requested-by|--purpose|--effort)
       [[ $# -ge 2 ]] || { echo 'fixture scopefuel: unexpected arguments' >&2; exit 2; }
       case "$1" in
         -m) profile="$2" ;;
         --operator-request) operator_request="$2" ;;
         --requested-by) requested_by="$2"; requested_by_seen=1 ;;
         --purpose) purpose="$2" ;;
+        --effort) effort="$2" ;;
       esac
       shift 2 ;;
     *) echo 'fixture scopefuel: unexpected arguments' >&2; exit 2 ;;
@@ -204,6 +206,7 @@ if [[ -n "${WRK_SCOPEFUEL_LOG:-}" ]]; then
   # Full argv first (so a pass-through is observable), bare profile last —
   # the profile table asserts on `tail -n 1`.
   printf 'gate -m %s' "$profile" >>"$WRK_SCOPEFUEL_LOG"
+  [[ -z "$effort" ]] || printf ' --effort %s' "$effort" >>"$WRK_SCOPEFUEL_LOG"
   [[ -z "$operator_request" ]] || printf ' --operator-request %s' "$operator_request" >>"$WRK_SCOPEFUEL_LOG"
   [[ "$requested_by_seen" -eq 0 ]] || printf ' --requested-by %s' "$requested_by" >>"$WRK_SCOPEFUEL_LOG"
   [[ -z "$purpose" ]] || printf ' --purpose %s' "$purpose" >>"$WRK_SCOPEFUEL_LOG"
@@ -254,14 +257,18 @@ if [[ -n "$operator_request" ]]; then
     echo "requested_by_invalid: '$requested_by' — 공백 없는 단일 토큰, 64자 이하" >&2
     exit 3
   fi
-  # task #625: the request applies to escalation profiles (oc-omni) and the
-  # consult_only identity (fable) — every other profile is not_applicable,
-  # exactly the installed gate's vocabulary.
-  case "$profile" in
-    fable|oc-omni) : ;;
-    *)
-      echo "operator_request_not_applicable: $profile 은 escalation/consult_only 프로필이 아니다" >&2
-      exit 3 ;;
+  # task #625: the request applies to escalation profiles (oc-omni, and per
+  # #704 the rung-scoped escalations the installed gate marks: opus@low,
+  # opus@max, sonnet@xhigh) and the consult_only identity (fable) — every other
+  # profile@effort is not_applicable, exactly the installed gate's vocabulary.
+  case "$profile@$effort" in
+    opus@low|opus@max|sonnet@xhigh) : ;;
+    *) case "$profile" in
+      fable|oc-omni) : ;;
+      *)
+        echo "operator_request_not_applicable: $profile 은 escalation/consult_only 프로필이 아니다" >&2
+        exit 3 ;;
+    esac ;;
   esac
 elif [[ "$requested_by_seen" -eq 1 ]]; then
   echo "requested_by_requires_operator_request — --requested-by 는 --operator-request 와 함께만 쓴다" >&2
@@ -275,6 +282,24 @@ if [[ "$profile" == fable && -z "$operator_request" ]]; then
   echo "consult_only: fable — 운영자 명시 요청 없이 스폰 불가 (--operator-request hk:doc/<key> 또는 hk:task/<정수> 필요)" >&2
   exit 3
 fi
+# #692/#704: the unmeasured E6 rungs open only for an exact
+# SCOPEFUEL_E6_ARM=<profile>@<effort> marker — a marker for a different rung
+# does not widen admission (verified against the installed gate).
+case "$profile@$effort" in
+  sonnet@max|codex-sol@high|kimi-k3@high|kimi-k3@max|grok-hi@xhigh)
+    if [[ "${SCOPEFUEL_E6_ARM:-}" != "$profile@$effort" ]]; then
+      echo "e6_arm_required: $profile@$effort 은 미측정 E6 측정 런그다 (#594) — SCOPEFUEL_E6_ARM=$profile@$effort 표식이 있어야 연다" >&2
+      exit 3
+    fi ;;
+esac
+# The rung-scoped escalations deny without a valid operator request.
+case "$profile@$effort" in
+  opus@low|opus@max|sonnet@xhigh)
+    if [[ -z "$operator_request" ]]; then
+      echo "$profile 은 escalation 후보 — $profile@$effort 는 --operator-request REF 필요 (fixture)" >&2
+      exit 3
+    fi ;;
+esac
 pool="$(pool_for "$profile")"
 if [[ "${WRK_GATE_POOL_MODE:-ok}" == missing ]]; then
   echo "gate allowed profile=$profile"
@@ -287,7 +312,9 @@ if [[ -n "$operator_request" ]]; then
   # all-healthy world always has alternatives). For fable the request satisfies
   # consult_only — it overrode no alternative denial, so false (task #625).
   override=false
-  [[ "$profile" != oc-omni ]] || override=true
+  case "$profile@$effort" in
+    oc-omni@|opus@low|opus@max|sonnet@xhigh) override=true ;;
+  esac
   extra=" escalation_override=$override operator_request_ref=$operator_request requested_by=${rb_stripped:-unknown} ref_resolution=unverified"
 fi
 if [[ "$profile" == devin-swe2 ]]; then
