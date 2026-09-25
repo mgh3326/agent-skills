@@ -190,6 +190,26 @@ def _ci_binding(evidence: dict) -> dict:
     return result("PASS", "CI_BOUND", "task:723", run_id=ci["run_id"], attempt=ci["attempt"])
 
 
+def _read_pane(pane: str) -> str | None:
+    try:
+        proc = subprocess.run(["herdr", "agent", "read", pane, "--source", "visible", "--lines", "15"],
+                              text=True, capture_output=True, check=False, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
+    display = {
+        "grok-4.7": "Grok 4.7", "gpt-6-sol": "GPT-6-Sol", "gpt-6-luna": "GPT-6-Luna",
+        "gpt-5.6-terra": "GPT-5.6-Terra", "claude-opus-5-5": "Opus 5.5",
+        "claude-sonnet-5": "Sonnet 5",
+    }.get(model, model)
+    suffix = rf"\s*(?:\(\s*{re.escape(effort)}\s*\)|{re.escape(effort)})\s*·" if effort else r"\s*·"
+    pattern = re.compile(rf"\b{re.escape(display)}{suffix}", re.IGNORECASE)
+    return any(pattern.search(line) for line in snapshot.splitlines()[-3:])
+
+
 def _actual_observation(evidence: dict) -> dict:
     """Bind actual profile/effort to wrk events and model to a pane observation."""
     tester = evidence.get("tester") or {}
@@ -224,9 +244,15 @@ def _actual_observation(evidence: dict) -> dict:
             observed.get("job") != evidence.get("job") or observed.get("model") != tester.get("actual_model") or
             observed.get("effort") != tester.get("actual_effort")):
             return result("UNVERIFIED", "MODEL_OBSERVATION_MISMATCH", "decision:3231")
+        snapshot = _read_pane(pane)
+        if snapshot is None:
+            return result("UNVERIFIED", "PANE_UNREADABLE", "decision:3231")
+        if not _pane_model_matches(snapshot, tester["actual_model"], tester["actual_effort"]):
+            return result("UNVERIFIED", "PANE_MODEL_UNVERIFIED", "decision:3231")
         return result("PASS", "ACTUAL_PROFILE_OBSERVED", "bin/wrk+pane",
                       job_record_dir=str(record_dir), pane=pane, model_observation_path=str(path),
-                      model_observation_sha256=observation_sha)
+                      model_observation_sha256=observation_sha,
+                      pane_snapshot_sha256=hashlib.sha256(snapshot.encode()).hexdigest())
     except (OSError, ValueError, KeyError, TypeError):
         return result("UNVERIFIED", "ACTUAL_SOURCE_UNREADABLE", "bin/wrk+pane")
 

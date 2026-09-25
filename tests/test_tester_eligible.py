@@ -75,7 +75,8 @@ class EligibilityFixtures(unittest.TestCase):
 
     def check(self, evidence: dict, stage: str = "pre-spawn") -> dict:
         evidence.setdefault("policy_sha256", common.sha256_file(common.DEFAULT_POLICY))
-        checks, _ = eligible.evaluate(evidence, stage, self.policy, self.policy_check)
+        with mock.patch.object(eligible, "_read_pane", return_value=evidence.get("_pane_snapshot")):
+            checks, _ = eligible.evaluate(evidence, stage, self.policy, self.policy_check)
         return checks
 
     def assert_case(self, checks: dict, name: str, status: str, reason: str) -> None:
@@ -126,6 +127,7 @@ class EligibilityFixtures(unittest.TestCase):
                                            "effort": tester["actual_effort"]}))
         tester["model_observation_path"] = str(observation)
         tester["model_observation_sha256"] = common.sha256_file(observation)
+        evidence["_pane_snapshot"] = "Grok 4.7 (xhigh) · always-approve"
 
     def test_normal_pass_and_hash_incident_boundary(self) -> None:
         evidence = self.evidence(self.make_head())
@@ -244,6 +246,15 @@ class EligibilityFixtures(unittest.TestCase):
         evidence["tester"]["actual_model"] = "grok-4.7"
         Path(evidence["tester"]["model_observation_path"]).write_text("{}")
         self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED", "MODEL_OBSERVATION_HASH_MISMATCH")
+        self.add_actual_source(evidence)
+        evidence["_pane_snapshot"] = "Grok 4.6 (xhigh) · always-approve"
+        self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED", "PANE_MODEL_UNVERIFIED")
+
+    def test_pane_footer_requires_model_and_effort(self) -> None:
+        self.assertTrue(eligible._pane_model_matches("Grok 4.7 (xhigh) · always-approve", "grok-4.7", "xhigh"))
+        self.assertTrue(eligible._pane_model_matches("GPT-6-Sol max · worktree", "gpt-6-sol", "max"))
+        self.assertFalse(eligible._pane_model_matches("Grok 4.7 (high) · always-approve", "grok-4.7", "xhigh"))
+        self.assertFalse(eligible._pane_model_matches("Grok 4.6 (xhigh) · always-approve", "grok-4.7", "xhigh"))
 
     def test_new_contributor_invalidates_prior_receipt(self) -> None:
         evidence = self.landed(self.evidence(self.make_head()))

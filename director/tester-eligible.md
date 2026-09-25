@@ -36,6 +36,7 @@ need actual_profile, actual_model, actual_effort, session, worktree, pane,
 job_record_dir, model_observation_path, and model_observation_sha256. The job
 directory contains wrk job.spawned and quota_pool.record events. The model
 observation is a retained JSON record with source=pane, job, pane, model, and
+effort. The command also reads the live pane footer and compares its model and
 effort. If actual provenance cannot be established, the result is UNVERIFIED.
 
 For same-family verification, same_family contains reversible,
