@@ -41,13 +41,16 @@ job_record_dir, model_observation_path, and model_observation_sha256. The job
 directory contains wrk job.spawned and quota_pool.record events. The model
 observation is a retained JSON record with source=pane, job, pane, model, and
 effort. The command also reads the live pane footer and compares its model and
-effort. If actual provenance cannot be established, the result is UNVERIFIED.
+effort. The quota launch model must match the resolved tester model, and its
+profile must permit tester use on the declared surface. If actual provenance
+cannot be established, the result is UNVERIFIED.
 
 For same-family verification, same_family contains reversible,
 excluded_surface, directed_brief_ref, independent_counterexample_ref,
 qualification_ref, ci_run_id, ci_attempt, ci_status=success, and report_phrase. T3 has no
 same-family exception. Missing exclusion proof is UNVERIFIED; a gate or
-delivery path is excluded even when the evidence claims otherwise.
+delivery path is excluded even when the evidence claims otherwise. The
+required grade and actual implementation grade must both be A+ or below.
 
 At pre-merge the tester provides report_path and report_sha256. The report
 includes exact lines TASK, JOB, REPO, TESTED_HEAD, and TESTER_SESSION matching
@@ -66,8 +69,9 @@ binary hash incident requires an independent build or delivery receipt.
 Audit compares gh merged PRs and wrk job.spawned events with receipts. It
 counts actions without receipts, receipts later than actions, and reused
 action IDs. The merged PR head and repository must match the receipt. A spawn
-event without a repository is matched only if its job directory contains a
-same-job eligibility evidence file; otherwise it counts as missing. Use
+event without a repository or head is matched only if its job directory
+contains a same-job eligibility evidence file that supplies the missing
+identity; otherwise it counts as missing. Use
 --jobs-dir and --receipt-dir for other snapshots. Older wrk spawn events do
 not identify tester roles, so the spawn count includes all jobs in the chosen
 window and is an upper bound on tester bypasses.

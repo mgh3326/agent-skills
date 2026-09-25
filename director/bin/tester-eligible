@@ -74,10 +74,12 @@ def diff_surface(evidence: dict, policy: dict) -> tuple[dict | None, dict]:
                  for prefix in rules["t3_paths"]) or
              any(fnmatch.fnmatch(path, pattern.lower()) or fnmatch.fnmatch(Path(path).name, pattern.lower())
                  for pattern in rules["t3_names"]) or
-             re.search(r"(^|[/_-])(safety|guard|broker|orders?|trading|execution|live|deploy)([/_.-]|$)", path)
+             re.search(r"(^|[/_-])(safety|guards?|broker|orders?|trading|execution|live|deploy(?:ment|ments|er|ers)?)([/_.-]|$)", path)
              for path in names_lower)
     flags = sorted({"gate_or_delivery" for path in names_lower
                     if any(path.startswith(prefix.lower()) for prefix in rules["gate_paths"])})
+    if t3:
+        flags.append("live_deploy_safety")
     if t3:
         floor = 3
     elif declared_repo in rules["auto_trader_repos"]:
@@ -181,15 +183,21 @@ def _report(evidence: dict) -> dict:
         if actual_hash != expected_hash:
             return result("UNVERIFIED", "REPORT_HASH_MISMATCH", "checker:G1", path=str(path), sha256=actual_hash)
         lines = path.read_text().splitlines()
-        fence = False
+        fence_char = None
+        fence_width = 0
         last = ""
         last_inside_fence = False
         for line in lines:
-            if re.match(r"^\s*(```|~~~)", line):
-                fence = not fence
+            marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+            if marker:
+                run, tail = marker.groups()
+                if fence_char is None:
+                    fence_char, fence_width = run[0], len(run)
+                elif run[0] == fence_char and len(run) >= fence_width and not tail.strip():
+                    fence_char, fence_width = None, 0
             if line.strip():
                 last = line
-                last_inside_fence = fence
+                last_inside_fence = fence_char is not None
         if last_inside_fence:
             return result("UNVERIFIED", "VERDICT_QUOTED", "checker:G1", path=str(path), sha256=actual_hash)
         found = VERDICT.fullmatch(last)
@@ -279,10 +287,11 @@ def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
         "claude-sonnet-5": "Sonnet 5",
     }.get(model, model)
     suffix = rf"\s*(?:\(\s*{re.escape(effort)}\s*\)|{re.escape(effort)})\s*·" if effort else r"\s*·"
-    pattern = re.compile(rf"\b{re.escape(display)}{suffix}", re.IGNORECASE)
+    pattern = re.compile(rf"^\s*[│┃╭╰─\s]*{re.escape(display)}{suffix}", re.IGNORECASE)
     footer_lines = [line for line in snapshot.splitlines()[-5:]
-                    if " · " in line and re.search(r"\b(?:Grok|GPT-|Opus|Sonnet|Haiku|Kimi|Devin|Deepseek)", line,
-                                                   re.IGNORECASE)]
+                    if " · " in line and re.match(
+                        r"^\s*[│┃╭╰─\s]*(?:Grok|GPT-|Opus|Sonnet|Haiku|Kimi|Devin|Deepseek)",
+                        line, re.IGNORECASE)]
     return bool(footer_lines) and bool(pattern.search(footer_lines[-1]))
 
 
@@ -316,6 +325,10 @@ def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | Non
         if (launch_spec.get("family") != tester_profile["family"] or
             model_family(str(launch_spec.get("model", ""))) != tester_profile["family"]):
             return result("UNVERIFIED", "ACTUAL_LAUNCH_FAMILY_MISMATCH", "bin/wrk:quota_pool.record")
+        if launch_spec.get("model") != tester_profile["model"]:
+            return result("UNVERIFIED", "ACTUAL_LAUNCH_MODEL_MISMATCH", "bin/wrk:quota_pool.record")
+        if "tester" not in launch_spec.get("roles", []) or evidence.get("declared_t") not in launch_spec.get("surfaces", []):
+            return result("UNVERIFIED", "ACTUAL_LAUNCH_PROFILE_DENIED", "bin/wrk:quota_pool.record")
         if observed_effort != tester.get("actual_effort"):
             return result("UNVERIFIED", "ACTUAL_EFFORT_MISMATCH", "bin/wrk:quota_pool.record")
         path = Path(observation_path)
@@ -455,7 +468,9 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
             checks["independence"] = result("FAIL", "SAME_FAMILY_EXCLUDED_SURFACE", "spawn-worker:2-4")
         elif same.get("excluded_surface") is True:
             checks["independence"] = result("FAIL", "SAME_FAMILY_EXCLUDED_SURFACE", "spawn-worker:2-4")
-        elif required in GRADES and GRADES.index(required) > GRADES.index("A+"):
+        elif required not in GRADES or assigned not in GRADES:
+            checks["independence"] = result("UNVERIFIED", "GRADE_INPUT_MISSING", "spawn-worker:2-4")
+        elif max(GRADES.index(required), GRADES.index(assigned)) > GRADES.index("A+"):
             checks["independence"] = result("FAIL", "SAME_FAMILY_GRADE_EXCLUDED", "spawn-worker:2-4")
         elif same.get("reversible") is False:
             checks["independence"] = result("FAIL", "SAME_FAMILY_NON_REVERSIBLE", "spawn-worker:2-4")
@@ -468,7 +483,8 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
             checks["independence"] = result("FAIL", "SAME_GRADE_EFFORT", "spawn-worker:2-4")
         else:
             conditions = [
-            required in GRADES,
+            required in GRADES and assigned in GRADES and
+                max(GRADES.index(required), GRADES.index(assigned)) <= GRADES.index("A+"),
             same.get("reversible") is True and same.get("excluded_surface") is False,
             bool(tester.get("session")) and tester.get("session") not in prior_sessions,
             bool(tester.get("worktree")) and tester.get("worktree") not in prior_worktrees,
@@ -506,6 +522,10 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
     return checks, bound
 
 
+def _audit_head_matches(receipt: dict, head: object) -> bool:
+    return isinstance(head, str) and bool(SHA.fullmatch(head)) and receipt.get("head") == head
+
+
 def audit(receipt_dir: Path, repos: list[str], jobs_dir: Path, since: str | None = None) -> int:
     receipts = []
     for path in receipt_dir.glob("*.json"):
@@ -538,12 +558,12 @@ def audit(receipt_dir: Path, repos: list[str], jobs_dir: Path, since: str | None
             if at:
                 repo = record.get("repo", "")
                 head = record.get("head")
-                if not repo:
+                if not repo or not head:
                     evidence_path = path.parents[1] / "eligibility-evidence.json"
                     try:
                         linked = json.loads(evidence_path.read_text())
                         if linked.get("job") == job:
-                            repo = linked.get("repo", "")
+                            repo = repo or linked.get("repo", "")
                             head = head or linked.get("head")
                     except (OSError, ValueError):
                         pass
@@ -572,7 +592,7 @@ def audit(receipt_dir: Path, repos: list[str], jobs_dir: Path, since: str | None
         matches = [r for r in receipts if r.get("kind") == kind and
                    repo_matches(r.get("repo"), repo) and
                    str(r.get("job" if kind == "spawn" else "pr")) == key and
-                   (head is None or r.get("head") == head) and
+                   _audit_head_matches(r, head) and
                    r.get("stage") == ("pre-spawn" if kind == "spawn" else "pre-merge")]
         if not matches:
             missing += 1

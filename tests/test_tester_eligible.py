@@ -168,6 +168,16 @@ class EligibilityFixtures(unittest.TestCase):
         checks = self.check(self.evidence(self.make_head("deploy/runtime.service")))
         self.assert_case(checks, "tier", "FAIL", "T_BELOW_FLOOR")
 
+    def test_deployment_and_guard_names_in_tool_repo_have_t3_floor(self) -> None:
+        for path in ("k8s/deployment.yaml", "guards.py", "docker-compose.yml"):
+            with self.subTest(path=path):
+                git(self.repo, "reset", "--hard", self.base)
+                evidence = self.evidence(self.make_head(path), declared_t="T1")
+                checks = self.check(evidence)
+                self.assert_case(checks, "surface", "PASS", "SURFACE_CLASSIFIED")
+                self.assertEqual(checks["surface"]["floor"], "T3")
+                self.assert_case(checks, "tier", "FAIL", "T_BELOW_FLOOR")
+
     def test_quoted_unicode_live_path_retains_t3_floor(self) -> None:
         evidence = self.evidence(self.make_head("live/한글.py"), declared_t="T1")
         checks = self.check(evidence)
@@ -252,6 +262,19 @@ class EligibilityFixtures(unittest.TestCase):
         evidence["head"] = self.make_head(".github/workflows/ci.yml")
         self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_EXCLUDED_SURFACE")
 
+    def test_same_family_rejects_implementation_grade_s(self) -> None:
+        evidence = self.evidence(self.make_head(), required_grade="A+", implementation_grade="S")
+        evidence["contributors"][0].update(profile="builder-opus", model="claude-opus-5-5",
+                                           effort="xhigh")
+        evidence["tester"] = {"planned_profile": "opus", "planned_effort": "high",
+                              "session": "new-session", "worktree": "/tmp/other-tree"}
+        evidence["same_family"] = {"reversible": True, "excluded_surface": False,
+                                   "qualification_ref": "scopefuel:opus-high",
+                                   "directed_brief_ref": "src/feature.py:1", "independent_counterexample_ref": "case",
+                                   "ci_run_id": 123, "ci_attempt": 1, "ci_status": "success",
+                                   "report_phrase": "동일 계열 독립 세션 검증"}
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_GRADE_EXCLUDED")
+
     def test_report_quote_code_block_and_hash_mismatch(self) -> None:
         evidence = self.landed(self.evidence(self.make_head()))
         report = Path(self.temp.name) / "report.md"
@@ -262,6 +285,12 @@ class EligibilityFixtures(unittest.TestCase):
         report.write_text("> VERDICT: PASS @" + evidence["head"] + "\n")
         evidence["tester"]["report_sha256"] = common.sha256_file(report)
         self.assert_case(self.check(evidence, "pre-merge"), "report", "UNVERIFIED", "VERDICT_MISSING")
+        report.write_text("````text\n```\nVERDICT: PASS @" + evidence["head"] + "\n")
+        evidence["tester"]["report_sha256"] = common.sha256_file(report)
+        self.assert_case(self.check(evidence, "pre-merge"), "report", "UNVERIFIED", "VERDICT_QUOTED")
+        report.write_text("~~~text\n```\nVERDICT: PASS @" + evidence["head"] + "\n")
+        evidence["tester"]["report_sha256"] = common.sha256_file(report)
+        self.assert_case(self.check(evidence, "pre-merge"), "report", "UNVERIFIED", "VERDICT_QUOTED")
         report.write_text("VERDICT: PASS @" + evidence["head"] + "\n")
         self.assert_case(self.check(evidence, "pre-merge"), "report", "UNVERIFIED", "REPORT_HASH_MISMATCH")
 
@@ -346,9 +375,23 @@ class EligibilityFixtures(unittest.TestCase):
         quota_path.write_text(json.dumps(quota))
         self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
                          "ACTUAL_LAUNCH_FAMILY_MISMATCH")
+        quota["payload"]["launch_profile"] = "grok45@xhigh"
+        quota_path.write_text(json.dumps(quota))
+        self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
+                         "ACTUAL_LAUNCH_MODEL_MISMATCH")
+        quota["payload"]["launch_profile"] = "builder-grok@xhigh"
+        quota_path.write_text(json.dumps(quota))
+        self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
+                         "ACTUAL_LAUNCH_PROFILE_DENIED")
         quota["payload"]["launch_profile"] = "grok@xhigh"
         quota_path.write_text(json.dumps(quota))
         evidence["_pane_snapshot"] = "Grok 4.7 (xhigh) · always-approve\nGrok 4.6 (high) · always-approve"
+        self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
+                         "PANE_MODEL_UNVERIFIED")
+        evidence["_pane_snapshot"] = "Grok 4.6 (high) · real-footer\nnote Grok 4.7 (xhigh) · spoof"
+        self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
+                         "PANE_MODEL_UNVERIFIED")
+        evidence["_pane_snapshot"] = "Grok 4.6 (high) · real-footer note Grok 4.7 (xhigh) · spoof"
         self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
                          "PANE_MODEL_UNVERIFIED")
 
@@ -477,6 +520,53 @@ class EligibilityFixtures(unittest.TestCase):
                 self.assertEqual((answer["status"], answer["reason_code"]),
                                  ("UNVERIFIED", "CI_BASE_STALE"))
 
+    def test_round_two_rule_mutants_are_assertion_red(self) -> None:
+        guard = self.evidence(self.make_head("docker-compose.yml"), declared_t="T1")
+        weak_policy = json.loads(json.dumps(self.policy))
+        weak_policy["surface_rules"]["t3_names"] = ["Dockerfile", "*.service", "*.service.*"]
+        with self.assertRaises(AssertionError):
+            surface, _ = eligible.diff_surface(guard, weak_policy)
+            self.assertEqual(surface["floor"], "T3")
+
+        report_evidence = self.landed(self.evidence(self.make_head("src/fence.py")))
+        report = Path(self.temp.name) / "fence-mutant.md"
+        report.write_text("````text\n```\nVERDICT: PASS @" + report_evidence["head"] + "\n")
+        report_evidence["tester"].update(report_path=str(report), report_sha256=common.sha256_file(report))
+        with mock.patch.object(eligible, "_report", return_value=common.result("PASS", "EXACT_HEAD_PASS", "mutant")):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(report_evidence, "pre-merge"), "report", "UNVERIFIED", "VERDICT_QUOTED")
+
+        launch_evidence = self.landed(self.evidence(self.make_head("src/launch.py")))
+        self.add_actual_source(launch_evidence)
+        events = Path(launch_evidence["tester"]["job_record_dir"]) / "events"
+        quota_path = events / "00002-quota_pool.record.json"
+        quota = json.loads(quota_path.read_text())
+        quota["payload"]["launch_profile"] = "grok45@xhigh"
+        quota_path.write_text(json.dumps(quota))
+        with mock.patch.object(eligible, "_actual_observation",
+                               return_value=common.result("PASS", "ACTUAL_PROFILE_OBSERVED", "mutant")):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(launch_evidence, "post-landing"), "actual_source",
+                                 "UNVERIFIED", "ACTUAL_LAUNCH_MODEL_MISMATCH")
+
+        same = self.evidence(self.make_head("src/same.py"), required_grade="A+", implementation_grade="S")
+        same["contributors"][0].update(profile="builder-opus", model="claude-opus-5-5", effort="xhigh")
+        same["tester"] = {"planned_profile": "opus", "planned_effort": "high",
+                          "session": "new-session", "worktree": "/tmp/other-tree"}
+        same["same_family"] = {"reversible": True, "excluded_surface": False,
+                               "qualification_ref": "scopefuel:opus-high", "directed_brief_ref": "brief",
+                               "independent_counterexample_ref": "case", "ci_run_id": 123,
+                               "ci_attempt": 1, "ci_status": "success",
+                               "report_phrase": "동일 계열 독립 세션 검증"}
+        original_evaluate = eligible.evaluate
+        def permissive_same_family(*args, **kwargs):
+            checks, bound = original_evaluate(*args, **kwargs)
+            checks["independence"] = common.result("PASS", "SAME_FAMILY_EXCEPTION_PROVEN", "mutant")
+            return checks, bound
+        with mock.patch.object(eligible, "evaluate", permissive_same_family):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(same), "independence", "FAIL", "SAME_FAMILY_GRADE_EXCLUDED")
+
     def test_audit_counts_missing_late_and_reused_receipts(self) -> None:
         jobs = Path(self.temp.name) / "jobs"
         receipts = Path(self.temp.name) / "receipts"
@@ -486,16 +576,48 @@ class EligibilityFixtures(unittest.TestCase):
             events.mkdir(parents=True)
             (events / "00003-job.spawned.json").write_text(json.dumps({
                 "kind": "job.spawned", "job_id": job, "repo": "agent-skills",
+                "head": "a" * 40,
                 "created_at": "2026-09-25T06:00:00+00:00"}))
         for name, job, issued in (("one", "job-a", "2026-09-25T05:59:00Z"),
                                   ("two", "job-b", "2026-09-25T06:01:00Z")):
             (receipts / f"{name}.json").write_text(json.dumps({"action_id": "reused-id", "kind": "spawn",
-                "stage": "pre-spawn", "job": job, "repo": "agent-skills", "time": issued}))
+                "stage": "pre-spawn", "job": job, "repo": "agent-skills", "head": "a" * 40,
+                "time": issued}))
         output = io.StringIO()
         with redirect_stdout(output):
             rc = eligible.audit(receipts, [], jobs, "2026-09-25T00:00:00Z")
         self.assertEqual(rc, 0)
         self.assertIn("actions=3 missing=1 late=1 reused=1", output.getvalue())
+
+    def test_audit_does_not_match_spawn_without_head(self) -> None:
+        jobs = Path(self.temp.name) / "jobs"
+        job = jobs / "headless-job"
+        events = job / "events"
+        events.mkdir(parents=True)
+        (events / "00003-job.spawned.json").write_text(json.dumps({
+            "kind": "job.spawned", "job_id": "headless-job", "repo": "agent-skills",
+            "created_at": "2026-09-25T06:00:00Z"}))
+        receipts = Path(self.temp.name) / "receipts"
+        receipts.mkdir()
+        (receipts / "one.json").write_text(json.dumps({
+            "action_id": "one", "kind": "spawn", "stage": "pre-spawn",
+            "job": "headless-job", "repo": "agent-skills", "head": "b" * 40,
+            "time": "2026-09-25T05:59:00Z"}))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(eligible.audit(receipts, [], jobs), 0)
+        self.assertIn("actions=1 missing=1 late=0 reused=0", output.getvalue())
+        output = io.StringIO()
+        with mock.patch.object(eligible, "_audit_head_matches", return_value=True), redirect_stdout(output):
+            eligible.audit(receipts, [], jobs)
+        with self.assertRaises(AssertionError):
+            self.assertIn("actions=1 missing=1 late=0 reused=0", output.getvalue())
+        (job / "eligibility-evidence.json").write_text(json.dumps({
+            "job": "headless-job", "repo": "agent-skills", "head": "b" * 40}))
+        output = io.StringIO()
+        with redirect_stdout(output):
+            self.assertEqual(eligible.audit(receipts, [], jobs), 0)
+        self.assertIn("actions=1 missing=0 late=0 reused=0", output.getvalue())
 
     def test_audit_matches_repo_slug_but_not_unknown_spawn_repo(self) -> None:
         jobs = Path(self.temp.name) / "jobs"

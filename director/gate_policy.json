@@ -1507,7 +1507,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-09-25.7",
+  "revision": "2026-09-25.8",
   "schema": 1,
   "sources": {
     ".github/workflows/ci.yml": {
@@ -1573,12 +1573,22 @@
     ],
     "t3_names": [
       "Dockerfile",
+      "*deploy*",
+      "*guard*",
+      "docker-compose*.yml",
+      "docker-compose*.yaml",
+      "compose*.yml",
+      "compose*.yaml",
       "*.service",
       "*.service.*"
     ],
     "t3_paths": [
       "live/",
       "deploy/",
+      "k8s/",
+      "kubernetes/",
+      "helm/",
+      "charts/",
       "broker/",
       "orders/",
       "safety/",
