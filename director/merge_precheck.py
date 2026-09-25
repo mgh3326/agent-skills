@@ -26,7 +26,7 @@ from typing import Any
 from urllib.parse import quote
 
 from ci_canonical import evaluate_required_ci
-from gate_common import POLICY_PATH, PolicyError, file_ref, load_policy, write_receipt
+from gate_common import POLICY_PATH, PolicyError, file_ref, load_policy, sha256_bytes, write_receipt
 
 
 VERSION = "merge-precheck/1.0.0"
@@ -35,7 +35,7 @@ SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})\s*$")
 META = re.compile(r"^(TASK|REPO|PR|TESTER_JOB|TESTER_SESSION|HEAD|OWNER|JOIN):\s*(.+?)\s*$")
 DISPOSITION = re.compile(r"\bdisposition(?:_ref)?:\s*([^\s,;]+)", re.I)
-ISSUE = re.compile(r"^\s*(?:[-*]\s*)?(BLOCKER|RISK)(?:[- ]\d+)?:\s*(.*)$", re.I)
+ISSUE = re.compile(r"^\s*(?:[-*]\s*)?(?:\*\*)?(BLOCKER|RISK)(?:\*\*)?(?:[- ]\d+)?\s*(?::|[—–-])\s*(.*)$", re.I)
 ARTIFACT_SHA = re.compile(r"(?i)\b(?:artifact|binary|image|deploy|sha256)\b[^\n]{0,100}\b([0-9a-f]{64})\b")
 SENSITIVE = {
     "private_address": re.compile(r"\b(?:10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.(?:\d{1,3}\.)\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})\b"),
@@ -96,10 +96,12 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
     if not path:
         return {"error": "REPORT_MISSING"}
     try:
-        ref = file_ref(path)
+        source = Path(path).expanduser().resolve()
+        raw = source.read_bytes()
+        ref = {"path": str(source), "sha256": sha256_bytes(raw)}
         if expected_hash and ref["sha256"] != expected_hash:
             return {"error": "REPORT_HASH_MISMATCH", "ref": ref}
-        content = Path(path).expanduser().read_text(encoding="utf-8")
+        content = raw.decode("utf-8")
     except (OSError, UnicodeError):
         return {"error": "REPORT_UNREADABLE"}
     try:
@@ -109,8 +111,14 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
     if isinstance(structured, dict) and structured.get("kind") == "tester-verdict":
         verdict = structured.get("verdict")
         H = structured.get("H")
+        issues = structured.get("issues", [])
+        if verdict not in {"PASS", "BLOCKER"} or not isinstance(H, str) or not SHA.fullmatch(H) or not isinstance(issues, list) or any(
+            not isinstance(issue, dict) or issue.get("class") not in {"BLOCKER", "RISK"} or not isinstance(issue.get("disposition_ref", ""), str)
+            for issue in issues
+        ):
+            return {"error": "REPORT_SCHEMA_INVALID", "ref": ref}
         metadata = {key: structured.get(key.lower()) for key in ("TASK", "REPO", "PR", "TESTER_JOB", "TESTER_SESSION")}
-        return {"ref": ref, "verdict": verdict, "H": H, "metadata": metadata, "issues": structured.get("issues", []), "text": content}
+        return {"ref": ref, "verdict": verdict, "H": H, "metadata": metadata, "issues": issues, "text": content}
     fence: tuple[str, int] | None = None
     html_comment = False
     brief_level: int | None = None
@@ -143,6 +151,11 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
             if re.search(r"\b(?:brief|prompt|instructions|quoted report)\b", heading.group(2), re.I):
                 brief_level = level
             risks_section = bool(re.match(r"^RISKS\b", heading.group(2).strip(), re.I))
+            if brief_level is None:
+                issue = ISSUE.match(heading.group(2))
+                if issue:
+                    ref_match = DISPOSITION.search(issue.group(2))
+                    issues.append({"class": issue.group(1).upper(), "disposition_ref": ref_match.group(1) if ref_match else ""})
             continue
         if re.match(r"^\s*(?:brief|prompt|instructions):\s*$", line, re.I):
             brief_level = 0
@@ -423,8 +436,10 @@ def read_json_receipt(path: str | None) -> dict[str, Any] | None:
     if not path:
         return None
     try:
-        ref = file_ref(path)
-        data = json.loads(Path(path).expanduser().read_text(encoding="utf-8"))
+        source = Path(path).expanduser().resolve()
+        raw = source.read_bytes()
+        ref = {"path": str(source), "sha256": sha256_bytes(raw)}
+        data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("object required")
         return {"ref": ref, "data": data}
@@ -440,9 +455,12 @@ def scan_patches(files: list[dict[str, Any]], B: str, H: str) -> dict[str, Any]:
     for file in files:
         patch = file.get("patch")
         path = file.get("filename")
-        if not isinstance(patch, str) or not isinstance(path, str):
+        additions, deletions = file.get("additions"), file.get("deletions")
+        if not isinstance(patch, str) or not isinstance(path, str) or not isinstance(additions, int) or not isinstance(deletions, int):
             return {"complete": False, "H": H, "B": B, "scanner": "gitleaks", "version": None, "exit_code": None, "hits": []}
         new_line = 0
+        patch_additions = 0
+        patch_deletions = 0
         for line in patch.splitlines():
             if line.startswith("@@"):
                 m = re.search(r"\+(\d+)", line)
@@ -454,12 +472,17 @@ def scan_patches(files: list[dict[str, Any]], B: str, H: str) -> dict[str, Any]:
                 location = f"{path}:{new_line}"
                 lines.append(added)
                 locations.append(location)
+                patch_additions += 1
                 for name, pattern in SENSITIVE.items():
                     if pattern.search(added):
                         hits.append({"location": location, "class": name})
                 new_line += 1
+            elif line.startswith("-") and not line.startswith("---"):
+                patch_deletions += 1
             elif not line.startswith("-") and not line.startswith("\\"):
                 new_line += 1
+        if (patch_additions, patch_deletions) != (additions, deletions):
+            return {"complete": False, "H": H, "B": B, "scanner": "gitleaks", "version": None, "exit_code": None, "hits": []}
     try:
         version = subprocess.run(["gitleaks", "version"], capture_output=True, text=True, timeout=10, check=False)
         if version.returncode:

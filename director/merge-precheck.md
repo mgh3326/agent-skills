@@ -1,6 +1,6 @@
 # Shadow merge precheck
 
-Run from this repository with Python 3.9 or newer:
+Run from this repository with Python 3.10 or newer (tested with 3.14):
 
     python3 director/merge_precheck.py mgh3326/agent-skills 144 --task 727 \
       --job 727-merge-precheck-20260925-1545 \
@@ -87,8 +87,8 @@ branch. The director must re-read H and B immediately before merging; a base
 advance after the receipt can still race that merge path.
 
 G5 scans every GitHub compare patch with gitleaks and local location-only
-patterns, and flags newly added build artifacts. Failed commands, omitted
-patches, or the 300-file API ceiling are UNVERIFIED. Hit output contains only
+patterns, and flags newly added build artifacts. Failed commands, omitted or
+line-count-truncated patches, or the 300-file API ceiling are UNVERIFIED. Hit output contains only
 file:line and class. Zero hits are not proof of no secrets.
 
 ## Bypass audit

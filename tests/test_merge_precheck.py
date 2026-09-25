@@ -49,7 +49,7 @@ def snapshot() -> dict:
             "H": H, "B": B, "M": M, "expected_H": H, "head_ref_sha": H, "base_ref_sha": B,
             "head_to_base": {"ahead_by": 0}, "merge_parents": [B, H], "pr_url": url, "pr_body": "", "deploy_note": "",
             "tester_report": tester, "builder_report": builder, "eligibility_receipt": None,
-            "tester_events": [{"job_id": "task727-tester", "kind": "job.spawned", "payload": {"label": "tester-grok", "pane_id": "w1Q:pAA"}},
+            "tester_events": [{"job_id": "task727-tester", "kind": "job.spawned", "payload": {"label": "tester-grok", "pane_id": "synthetic-pane"}},
                               {"job_id": "task727-tester", "kind": "job.completed", "payload": {"report_path": "/tmp/tester-report.md"}}],
             "runtime_receipt": None, "hash_receipt": None, "ci_runs": [run], "ci_jobs": {10: jobs},
             "protection_contexts": None, "files": [{"filename": "README.md", "status": "modified", "patch": "@@ -1 +1 @@\n+hello"}],
@@ -272,7 +272,7 @@ class MergePrecheckTests(unittest.TestCase):
     def test_flat_wrk_events_bind_report_and_join(self) -> None:
         s = snapshot()
         s["tester_events"] = [
-            {"kind": "job.spawned", "job_id": "task727-tester", "label": "tester-grok", "pane_id": "w1Q:pAA"},
+            {"kind": "job.spawned", "job_id": "task727-tester", "label": "tester-grok", "pane_id": "synthetic-pane"},
             {"kind": "job.completed", "job_id": "task727-tester", "report_path": "/tmp/tester-report.md", "report_sha256": "e" * 64}]
         s["job_events"][1] = {"kind": "job.joined", "pr": s["pr_url"], "head": H, "report_path": "/tmp/task727-builder-report.md"}
         assert_check(self, s, "G1", "PASS", "TESTER_PASS_BOUND")
@@ -291,6 +291,14 @@ class MergePrecheckTests(unittest.TestCase):
         s["tester_report"]["issues"] = [{"class": "BLOCKER", "disposition_ref": ""}]
         assert_check(self, s, "G7", "FAIL", "BLOCKER_UNDISPOSED")
 
+    def test_truncated_patch_is_unverified_before_scanning(self) -> None:
+        files = [{"filename": "src/example.py", "patch": "@@ -0,0 +1 @@\n+safe", "additions": 2, "deletions": 0}]
+        scan = gate.scan_patches(files, B, H)
+        self.assertFalse(scan["complete"])
+        s = snapshot()
+        s["files"], s["scan"] = files, scan
+        assert_check(self, s, "G5", "UNVERIFIED", "DIFF_TRUNCATED_OR_UNBOUND")
+
     def test_risks_section_and_surface_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "builder.md"
@@ -305,6 +313,32 @@ class MergePrecheckTests(unittest.TestCase):
         s["files"] = [{"filename": "runner.py", "status": "modified", "patch": "@@ -1 +1 @@\n+ExecStart=/usr/bin/python3.11"}]
         s["surface_class"] = "policy_or_config"
         assert_check(self, s, "G6", "UNVERIFIED", "SURFACE_CLASS_UNBOUND")
+
+    def test_markdown_blocker_heading_requires_disposition(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tester.md"
+            path.write_text(f"HEAD: {H}\n## BLOCKER — unresolved defect\n")
+            s = snapshot()
+            s["tester_report"] = gate.parse_report(str(path))
+            assert_check(self, s, "G7", "FAIL", "BLOCKER_UNDISPOSED")
+            path.write_text(f"HEAD: {H}\n## BLOCKER — resolved defect disposition_ref: fix-123\n")
+            s["tester_report"] = gate.parse_report(str(path))
+            assert_check(self, s, "G7", "PASS", "ISSUES_DISPOSED")
+
+    def test_structured_verdict_rejects_malformed_issue_list(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tester.json"
+            path.write_text(json.dumps({"kind": "tester-verdict", "verdict": "PASS", "H": H, "issues": "BLOCKER"}))
+            s = snapshot()
+            s["tester_report"] = gate.parse_report(str(path))
+            assert_check(self, s, "G1", "UNVERIFIED", "REPORT_SCHEMA_INVALID")
+            assert_check(self, s, "G7", "UNVERIFIED", "ISSUE_REPORT_MISSING")
+            path.write_text(json.dumps({"kind": "tester-verdict", "verdict": "PASS", "H": H, "issues": [],
+                                        "task": 727, "repo": "mgh3326/agent-skills", "pr": 999,
+                                        "tester_job": "task727-tester", "tester_session": "tester-grok"}))
+            s["tester_report"] = gate.parse_report(str(path))
+            s["tester_events"][1]["payload"]["report_path"] = str(path.resolve())
+            assert_check(self, s, "G1", "PASS", "TESTER_PASS_BOUND")
 
     def test_stale_policy_still_writes_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -324,12 +358,39 @@ class MergePrecheckTests(unittest.TestCase):
         source = json.loads((ROOT / "tests/fixtures/merge-precheck-replays.json").read_text())
         self.assertEqual(3, len(source["replays"]))
         self.assertEqual({"mgh3326/scopefuel", "mgh3326/panewire", "mgh3326/auto_trader"}, {r["repo"] for r in source["replays"]})
+        expected = {
+            "mgh3326/auto_trader": ("UNVERIFIED", {
+                "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
+                "G3": ("UNVERIFIED", "CI_BASE_UNBOUND"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
+                "G5": ("PASS", "SCAN_NO_HITS"), "G6": ("UNVERIFIED", "SURFACE_CLASS_UNBOUND"),
+                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
+                "G9": ("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),
+            }),
+            "mgh3326/panewire": ("FAIL", {
+                "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
+                "G3": ("UNVERIFIED", "CI_BASE_UNBOUND"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
+                "G5": ("FAIL", "LEAK_PATTERN_HIT"), "G6": ("PASS", "SURFACE_FLAGS_RECORDED"),
+                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
+                "G9": ("N/A", "RUNTIME_SURFACE_ABSENT"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),
+            }),
+            "mgh3326/scopefuel": ("UNVERIFIED", {
+                "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
+                "G3": ("UNVERIFIED", "CI_BASE_UNBOUND"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
+                "G5": ("PASS", "SCAN_NO_HITS"), "G6": ("PASS", "SURFACE_FLAGS_RECORDED"),
+                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
+                "G9": ("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),
+            }),
+        }
         for replay in source["replays"]:
             with self.subTest(repo=replay["repo"]):
                 self.assertEqual("MERGED", replay["actual_gate"])
-                self.assertIn(replay["tool_result"], {"FAIL", "UNVERIFIED"})
-                self.assertEqual("REPORT_MISSING", replay["tool_checks"]["G1"]["reason_code"])
-                self.assertIn(replay["tool_checks"]["G3"]["reason_code"], {"CI_BASE_UNBOUND", "CI_BASE_MOVED"})
+                overall, checks = expected[replay["repo"]]
+                self.assertEqual(overall, replay["tool_result"])
+                self.assertEqual(set(checks), set(replay["tool_checks"]))
+                for key, (status, code) in checks.items():
+                    self.assertEqual((status, code),
+                                     (replay["tool_checks"][key]["status"], replay["tool_checks"][key]["reason_code"]),
+                                     f"{replay['repo']} {key}")
 
     def test_each_gate_rule_has_assertion_red_mutant(self) -> None:
         cases = []
