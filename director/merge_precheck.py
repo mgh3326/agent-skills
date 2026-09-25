@@ -27,7 +27,7 @@ from typing import Any
 from urllib.parse import quote
 
 from ci_canonical import evaluate_required_ci
-from gate_common import DEFAULT_POLICY as POLICY_PATH, file_ref, load_policy, sha256_bytes, write_receipt
+from gate_common import DEFAULT_POLICY as POLICY_PATH, file_ref, load_policy, parse_time, sha256_bytes, write_receipt
 
 
 VERSION = "merge-precheck/1.2.0"
@@ -51,13 +51,6 @@ def result(status: str, reason_code: str, **details: Any) -> dict[str, Any]:
 
 def iso_now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
-
-
-def parse_time(value: str) -> datetime:
-    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    if dt.tzinfo is None:
-        raise ValueError("timezone required")
-    return dt.astimezone(timezone.utc)
 
 
 def run_json(argv: list[str], timeout: int = 30) -> Any:

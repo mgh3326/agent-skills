@@ -370,6 +370,26 @@ class MergePrecheckTests(unittest.TestCase):
         s["runtime_receipt"]["data"]["lock_ref"] = ["uv.lock@" + H]
         assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
 
+    def test_nonstring_observation_and_ledger_time_fail_closed(self) -> None:
+        s = snapshot()
+        s["repo"] = "mgh3326/auto_trader-operator"
+        s["files"] = [{"filename": "runners/h1.py", "status": "modified", "patch": "@@ -1 +1 @@\n+changed"}]
+        s["runtime_receipt"] = {"ref": {"path": "/tmp/host.json", "sha256": "1" * 64}, "data": {
+            "kind": "host-runtime", "repo": s["repo"], "PR": s["PR"], "H": H, "target": "NCP",
+            "service": "ncp-operator-runners", "interpreter": "/usr/bin/python3.11",
+            "issuer": "independent", "observed_at": None}}
+        assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_TIME_INVALID")
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            events = home / "work/herdr-inbox/jobs/task/events"
+            events.mkdir(parents=True)
+            (events / "00003-job.spawned.json").write_text(json.dumps({"created_at": None, "job_id": "task"}))
+            receipts = home / "receipts"
+            receipts.mkdir()
+            with patch.object(gate.Path, "home", return_value=home), patch.object(gate, "gh_api", return_value={"total_count": 0}), patch.object(gate, "gh_pages", return_value=[]):
+                result = gate.audit(receipts, {"ci": {"mgh3326/agent-skills": {"ci": ["test"]}}}, "2026-09-25T06:00:00Z")
+            self.assertEqual(("UNVERIFIED", "AUDIT_LEDGER_LOOKUP_FAILED"), (result["status"], result["reason_code"]))
+
     def test_runtime_policy_globs_cover_dependency_and_shell_script(self) -> None:
         for path in ("requirements.txt", "scripts/start.sh"):
             with self.subTest(path=path):
