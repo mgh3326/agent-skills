@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Shadow tester eligibility check. Reads repository/evidence; writes one receipt."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from gate_common import (  # noqa: E402
+    DEFAULT_POLICY, DEFAULT_RECEIPTS, GRADES, TOOL_VERSION, iso_time,
+    load_policy, new_action_id, overall, parse_time, resolve_profile, result, run_git,
+    sha256_file, utc_now, write_receipt,
+)
+
+SHA = re.compile(r"^[0-9a-f]{40}$")
+VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})$")
+STAGES = ("pre-spawn", "post-landing", "pre-merge")
+
+
+def _digest(value: object) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def diff_surface(evidence: dict, policy: dict) -> tuple[dict | None, dict]:
+    repo = Path(evidence.get("repo_path", ""))
+    head, base = evidence.get("head", ""), evidence.get("base", "")
+    if not repo.is_dir() or not SHA.fullmatch(head) or not SHA.fullmatch(base):
+        return None, result("UNVERIFIED", "DIFF_INPUT_MISSING", "spawn-worker:2-1")
+    top = run_git(repo, "rev-parse", "--show-toplevel")
+    if top.returncode or Path(top.stdout.strip()).resolve() != repo.resolve():
+        return None, result("UNVERIFIED", "REPO_UNVERIFIED", "spawn-worker:2-1")
+    for ref in (base, head):
+        if run_git(repo, "cat-file", "-e", f"{ref}^{{commit}}").returncode:
+            return None, result("UNVERIFIED", "DIFF_REF_MISSING", "spawn-worker:2-1")
+    names = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-only", base, head)
+    nums = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "--numstat", base, head)
+    if names.returncode or nums.returncode:
+        return None, result("UNVERIFIED", "DIFF_READ_FAILED", "spawn-worker:2-1")
+    paths = [line for line in names.stdout.splitlines() if line]
+    if not paths:
+        return None, result("UNVERIFIED", "DIFF_EMPTY", "spawn-worker:2-1")
+    if any("\n" in path or path.startswith("-") for path in paths):
+        return None, result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1")
+    lines = 0
+    for row in nums.stdout.splitlines():
+        fields = row.split("\t", 2)
+        if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
+            return None, result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1")
+        lines += int(fields[0]) + int(fields[1])
+    rules = policy["surface_rules"]
+    names_lower = [name.lower() for name in paths]
+    t3 = any(any(path.startswith(prefix.lower()) or f"/{prefix.lower()}" in path
+                 for prefix in rules["t3_paths"]) or
+             path.endswith((".service", ".service.d")) or Path(path).name == "dockerfile"
+             for path in names_lower)
+    flags = sorted({"gate_or_delivery" for path in names_lower
+                    if any(path.startswith(prefix.lower()) for prefix in rules["gate_paths"])})
+    repo_name = str(evidence.get("repo", "")).split("/")[-1]
+    if t3:
+        floor = 3
+    elif repo_name in rules["auto_trader_repos"]:
+        floor = 2
+    elif repo_name in rules["tool_repos"]:
+        floor = 1
+    elif lines <= 30 and all(Path(path).suffix in {".py", ".sh", ".json", ".toml", ".yaml", ".yml"}
+                               for path in paths):
+        floor = 0
+    else:
+        return None, result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1",
+                            paths=paths, flags=flags)
+    surface = {"floor": f"T{floor}", "paths": paths, "changed_lines": lines,
+               "flags": flags, "diff_sha256": _digest({"names": names.stdout, "numstat": nums.stdout})}
+    return surface, result("PASS", "SURFACE_CLASSIFIED", "spawn-worker:2-1", **surface)
+
+
+def _read_previous(path_text: str | None, required_stage: str, evidence: dict,
+                   policy_revision: str, policy_sha256: str) -> tuple[dict | None, dict]:
+    if not path_text:
+        return None, result("UNVERIFIED", "PREVIOUS_RECEIPT_MISSING", "decision:3231")
+    path = Path(path_text)
+    try:
+        previous = json.loads(path.read_text())
+        if previous["stage"] != required_stage or previous["overall"] != "PASS":
+            return None, result("UNVERIFIED", "PREVIOUS_RECEIPT_INVALID", "decision:3231")
+        for key in ("task", "contract_revision", "repo", "head", "base", "diff_sha256", "contributors_digest"):
+            if previous.get(key) != evidence.get(key):
+                reason = "HEAD_CHANGED" if key == "head" else "BASE_CHANGED" if key == "base" else "EVIDENCE_CHANGED"
+                return None, result("UNVERIFIED", reason, "decision:3231", field=key)
+        tester = evidence.get("tester") or {}
+        if (previous.get("planned_tester_profile") != tester.get("planned_profile") or
+            previous.get("planned_tester_effort") != tester.get("planned_effort")):
+            return None, result("UNVERIFIED", "TESTER_PLAN_CHANGED", "decision:3231")
+        if required_stage == "post-landing" and any(previous.get(key) != tester.get(field)
+            for key, field in (("actual_tester_profile", "actual_profile"),
+                               ("actual_model", "actual_model"), ("actual_effort", "actual_effort"))):
+            return None, result("UNVERIFIED", "ACTUAL_PROFILE_CHANGED", "decision:3231")
+        if ((previous.get("policy") or {}).get("revision") != policy_revision or
+            (previous.get("policy") or {}).get("sha256") != policy_sha256):
+            return None, result("UNVERIFIED", "POLICY_CHANGED", "decision:3231")
+        return previous, result("PASS", "PREVIOUS_RECEIPT_BOUND", "decision:3231",
+                                path=str(path), sha256=sha256_file(path), action_id=previous["action_id"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None, result("UNVERIFIED", "PREVIOUS_RECEIPT_INVALID", "decision:3231")
+
+
+def _current_pr(evidence: dict) -> dict:
+    if not evidence.get("pr"):
+        return result("UNVERIFIED", "PR_MISSING", "decision:3231")
+    repo = Path(evidence["repo_path"])
+    proc = subprocess.run(["gh", "pr", "view", str(evidence["pr"]), "--json", "headRefOid,baseRefName"],
+                          cwd=repo, text=True, capture_output=True, check=False)
+    if proc.returncode:
+        return result("UNVERIFIED", "PR_LOOKUP_FAILED", "checker:G2")
+    try:
+        pr = json.loads(proc.stdout)
+        if pr["headRefOid"] != evidence["head"]:
+            return result("UNVERIFIED", "HEAD_CHANGED", "checker:G2")
+        base_name = pr["baseRefName"]
+        remote = run_git(repo, "ls-remote", "origin", f"refs/heads/{base_name}")
+        if remote.returncode or not remote.stdout.strip():
+            return result("UNVERIFIED", "BASE_LOOKUP_FAILED", "checker:G4")
+        remote_base = remote.stdout.split()[0]
+        if remote_base != evidence["base"]:
+            return result("UNVERIFIED", "BASE_CHANGED", "checker:G4")
+        return result("PASS", "PR_REFS_CURRENT", "checker:G2+G4", head=pr["headRefOid"], base=remote_base)
+    except (ValueError, KeyError, IndexError):
+        return result("UNVERIFIED", "PR_LOOKUP_FAILED", "checker:G2")
+
+
+def _report(evidence: dict) -> dict:
+    tester = evidence.get("tester", {})
+    path_text = tester.get("report_path")
+    expected_hash = tester.get("report_sha256")
+    if not path_text or not expected_hash:
+        return result("UNVERIFIED", "REPORT_MISSING", "checker:G1")
+    path = Path(path_text)
+    try:
+        actual_hash = sha256_file(path)
+        if actual_hash != expected_hash:
+            return result("UNVERIFIED", "REPORT_HASH_MISMATCH", "checker:G1", path=str(path), sha256=actual_hash)
+        lines = path.read_text().splitlines()
+        fence = False
+        last = ""
+        last_inside_fence = False
+        for line in lines:
+            if re.match(r"^\s*(```|~~~)", line):
+                fence = not fence
+            if line.strip():
+                last = line
+                last_inside_fence = fence
+        if last_inside_fence:
+            return result("UNVERIFIED", "VERDICT_QUOTED", "checker:G1", path=str(path), sha256=actual_hash)
+        found = VERDICT.fullmatch(last)
+        if not found:
+            return result("UNVERIFIED", "VERDICT_MISSING", "checker:G1", path=str(path), sha256=actual_hash)
+        if found.group(2) != evidence.get("head"):
+            return result("UNVERIFIED", "VERDICT_HEAD_STALE", "checker:G1", path=str(path), sha256=actual_hash)
+        if found.group(1) != "PASS":
+            return result("FAIL", "TESTER_BLOCKER", "checker:G1", path=str(path), sha256=actual_hash)
+        expected_lines = {f"TASK: {evidence.get('task')}", f"JOB: {evidence.get('job')}",
+                          f"REPO: {evidence.get('repo')}", f"TESTED_HEAD: {evidence.get('head')}",
+                          f"TESTER_SESSION: {tester.get('session')}"}
+        if not expected_lines.issubset(set(lines)):
+            return result("UNVERIFIED", "REPORT_IDENTITY_MISSING", "checker:G1", path=str(path), sha256=actual_hash)
+        return result("PASS", "EXACT_HEAD_PASS", "checker:G1", path=str(path), sha256=actual_hash)
+    except (OSError, UnicodeError):
+        return result("UNVERIFIED", "REPORT_UNREADABLE", "checker:G1")
+
+
+def _ci_binding(evidence: dict) -> dict:
+    ci = evidence.get("ci")
+    if not isinstance(ci, dict) or not ci.get("run_id") or not ci.get("attempt"):
+        return result("UNVERIFIED", "CI_JOB_MISSING", "task:723")
+    if ci.get("status") == "skipped":
+        return result("UNVERIFIED", "CI_JOB_SKIPPED", "task:723")
+    if ci.get("status") != "success":
+        return result("UNVERIFIED", "CI_NOT_GREEN", "task:723")
+    if ci.get("head") != evidence.get("head"):
+        return result("UNVERIFIED", "CI_HEAD_STALE", "task:723")
+    if ci.get("base") != evidence.get("base"):
+        return result("UNVERIFIED", "CI_BASE_STALE", "task:723")
+    if evidence.get("trial_merge_tree") and ci.get("trial_merge_tree") != evidence["trial_merge_tree"]:
+        return result("UNVERIFIED", "CI_MERGE_TREE_STALE", "task:723")
+    return result("PASS", "CI_BOUND", "task:723", run_id=ci["run_id"], attempt=ci["attempt"])
+
+
+def _actual_observation(evidence: dict) -> dict:
+    """Bind actual profile/effort to wrk events and model to a pane observation."""
+    tester = evidence.get("tester") or {}
+    record_dir = tester.get("job_record_dir")
+    observation_path = tester.get("model_observation_path")
+    observation_sha = tester.get("model_observation_sha256")
+    pane = tester.get("pane")
+    if not record_dir or not pane or not observation_path or not observation_sha:
+        return result("UNVERIFIED", "ACTUAL_SOURCE_MISSING", "decision:3231")
+    try:
+        events = Path(record_dir) / "events"
+        spawn_paths = sorted(events.glob("*job.spawned.json"))
+        quota_paths = sorted(events.glob("*quota_pool.record.json"))
+        if not spawn_paths or not quota_paths:
+            return result("UNVERIFIED", "ACTUAL_SOURCE_MISSING", "bin/wrk:job-record")
+        spawned = json.loads(spawn_paths[-1].read_text())
+        quota = json.loads(quota_paths[-1].read_text())
+        if (spawned.get("kind") != "job.spawned" or quota.get("kind") != "quota_pool.record" or
+            spawned.get("job_id") != evidence.get("job") or quota.get("job_id") != evidence.get("job") or
+            spawned["payload"].get("profile") != tester.get("actual_profile") or
+            spawned["payload"].get("pane_id") != pane):
+            return result("UNVERIFIED", "JOB_RECORD_MISMATCH", "bin/wrk:job-record")
+        launch = quota["payload"].get("launch_profile", "")
+        observed_effort = launch.rsplit("@", 1)[1] if "@" in launch else ""
+        if observed_effort != tester.get("actual_effort"):
+            return result("UNVERIFIED", "ACTUAL_EFFORT_MISMATCH", "bin/wrk:quota_pool.record")
+        path = Path(observation_path)
+        if sha256_file(path) != observation_sha:
+            return result("UNVERIFIED", "MODEL_OBSERVATION_HASH_MISMATCH", "decision:3231")
+        observed = json.loads(path.read_text())
+        if (observed.get("source") != "pane" or observed.get("pane") != pane or
+            observed.get("job") != evidence.get("job") or observed.get("model") != tester.get("actual_model") or
+            observed.get("effort") != tester.get("actual_effort")):
+            return result("UNVERIFIED", "MODEL_OBSERVATION_MISMATCH", "decision:3231")
+        return result("PASS", "ACTUAL_PROFILE_OBSERVED", "bin/wrk+pane",
+                      job_record_dir=str(record_dir), pane=pane, model_observation_path=str(path),
+                      model_observation_sha256=observation_sha)
+    except (OSError, ValueError, KeyError, TypeError):
+        return result("UNVERIFIED", "ACTUAL_SOURCE_UNREADABLE", "bin/wrk+pane")
+
+
+def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
+             *, root: Path | None = None) -> tuple[dict, dict]:
+    checks: dict[str, dict] = {"policy": policy_check}
+    identity_keys = ("task", "contract_revision", "job", "repo", "repo_path", "issuer", "head", "base")
+    checks["identity"] = (result("PASS", "IDENTITY_BOUND", "decision:3231")
+                          if all(evidence.get(key) for key in identity_keys)
+                          else result("UNVERIFIED", "IDENTITY_MISSING", "decision:3231"))
+    surface = None
+    if policy_check["status"] == "PASS":
+        try:
+            surface, checks["surface"] = diff_surface(evidence, policy)
+        except (KeyError, TypeError):
+            checks["surface"] = result("UNVERIFIED", "POLICY_CONFLICT", "policy:surface_rules")
+    else:
+        checks["surface"] = result("UNVERIFIED", "POLICY_UNAVAILABLE", "decision:3231")
+    declared = evidence.get("declared_t")
+    if not re.fullmatch(r"T[0-3]", str(declared)):
+        checks["tier"] = result("UNVERIFIED", "T_MISSING", "spawn-worker:2-1")
+    elif surface is None:
+        checks["tier"] = result("UNVERIFIED", "T_FLOOR_UNKNOWN", "spawn-worker:2-1")
+    elif int(declared[1]) < int(surface["floor"][1]):
+        checks["tier"] = result("FAIL", "T_BELOW_FLOOR", "spawn-worker:2-1",
+                                declared=declared, floor=surface["floor"])
+    else:
+        checks["tier"] = result("PASS", "T_MEETS_FLOOR", "spawn-worker:2-1",
+                                declared=declared, floor=surface["floor"])
+
+    root = root or Path(__file__).resolve().parents[2]
+    contributor_profiles = []
+    contributors = evidence.get("contributors")
+    if not isinstance(contributors, list) or not contributors:
+        checks["contributors"] = result("UNVERIFIED", "CONTRIBUTORS_MISSING", "decision:2227")
+    else:
+        failures = []
+        for item in contributors:
+            if (not isinstance(item, dict) or not item.get("session") or not item.get("worktree") or
+                item.get("kind") not in {"initial", "fix", "prescription"}):
+                failures.append("CONTRIBUTOR_PROVENANCE_MISSING")
+                continue
+            resolved, check = resolve_profile(item.get("profile", ""), policy, actual_model=item.get("model"),
+                                              actual_effort=item.get("effort"), role=item.get("role", "builder"), root=root)
+            if check["status"] != "PASS":
+                failures.append(check["reason_code"])
+            else:
+                contributor_profiles.append(resolved)
+        checks["contributors"] = (result("UNVERIFIED", failures[0], "decision:2227") if failures else
+                                  result("PASS", "CONTRIBUTOR_UNION_RESOLVED", "decision:2227",
+                                         families=sorted({p["family"] for p in contributor_profiles})))
+
+    tester = evidence.get("tester") if isinstance(evidence.get("tester"), dict) else {}
+    planned_alias = tester.get("planned_profile")
+    planned_effort = tester.get("planned_effort")
+    actual_alias = tester.get("actual_profile") if stage != "pre-spawn" else None
+    if stage != "pre-spawn" and (not actual_alias or not tester.get("actual_model") or
+                                  "actual_effort" not in tester or not tester.get("session") or not tester.get("worktree")):
+        checks["tester"] = result("UNVERIFIED", "ACTUAL_TESTER_MISSING", "decision:3231")
+        tester_profile = None
+    elif not planned_alias or "planned_effort" not in tester:
+        checks["tester"] = result("UNVERIFIED", "TESTER_PLAN_MISSING", "decision:3231")
+        tester_profile = None
+    else:
+        alias = actual_alias or planned_alias
+        effort = tester.get("actual_effort") if actual_alias else planned_effort
+        tester_profile, checks["tester"] = resolve_profile(alias, policy,
+            actual_model=tester.get("actual_model") if actual_alias else None,
+            actual_effort=effort, role="tester", root=root)
+        if actual_alias and (actual_alias != planned_alias or effort != planned_effort):
+            checks["tester"] = result("FAIL", "ACTUAL_PROFILE_CHANGED", "decision:3231")
+            tester_profile = None
+    checks["actual_source"] = (result("N/A", "PRE_SPAWN_PLAN", "decision:3231") if stage == "pre-spawn"
+                               else _actual_observation(evidence))
+
+    if tester_profile and declared and declared not in tester_profile["surfaces"]:
+        checks["surface_permission"] = result("FAIL", "PROFILE_SURFACE_DENIED", "policy:profiles")
+    elif tester_profile:
+        checks["surface_permission"] = result("PASS", "PROFILE_SURFACE_ALLOWED", "policy:profiles")
+    else:
+        checks["surface_permission"] = result("UNVERIFIED", "PROFILE_UNRESOLVED", "policy:profiles")
+
+    required = evidence.get("required_grade")
+    assigned = evidence.get("implementation_grade")
+    if required not in GRADES or assigned not in GRADES:
+        checks["grade"] = result("UNVERIFIED", "GRADE_INPUT_MISSING", "spawn-worker:2-2")
+    elif tester_profile is None or checks["contributors"]["status"] != "PASS":
+        checks["grade"] = result("UNVERIFIED", "GRADE_UNRESOLVED", "spawn-worker:2-4")
+    elif any(GRADES.index(p["grade"]) < GRADES.index(assigned) for p in contributor_profiles):
+        checks["grade"] = result("FAIL", "IMPLEMENTER_GRADE_LOW", "spawn-worker:2-2")
+    elif GRADES.index(tester_profile["grade"]) < max(GRADES.index(required), GRADES.index(assigned)):
+        checks["grade"] = result("FAIL", "TESTER_GRADE_LOW", "spawn-worker:2-4",
+                                 tester_grade=tester_profile["grade"], implementation_grade=assigned)
+    else:
+        checks["grade"] = result("PASS", "GRADE_SUFFICIENT", "spawn-worker:2-4",
+                                 tester_grade=tester_profile["grade"], implementation_grade=assigned)
+
+    families = {p["family"] for p in contributor_profiles}
+    if not tester_profile or checks["contributors"]["status"] != "PASS":
+        checks["independence"] = result("UNVERIFIED", "FAMILY_UNKNOWN", "decision:2227")
+    elif declared == "T3" and tester_profile["alias"] in {"devin-ds41", "devin-ds41-max"}:
+        checks["independence"] = result("FAIL", "DS41_T3_SOLE_TESTER", "decision:2227")
+    elif tester_profile["family"] not in families:
+        checks["independence"] = result("PASS", "CROSS_FAMILY", "spawn-worker:2-4", families=sorted(families))
+    elif declared == "T3" or (surface and surface["floor"] == "T3"):
+        checks["independence"] = result("FAIL", "SAME_FAMILY_T3", "spawn-worker:2-4")
+    else:
+        same = evidence.get("same_family") or {}
+        prior_sessions = {item.get("session") for item in contributors if isinstance(item, dict)}
+        prior_worktrees = {item.get("worktree") for item in contributors if isinstance(item, dict)}
+        ci_status = same.get("ci_status")
+        if required in GRADES and GRADES.index(required) > GRADES.index("A+"):
+            checks["independence"] = result("FAIL", "SAME_FAMILY_GRADE_EXCLUDED", "spawn-worker:2-4")
+        else:
+            conditions = [
+            required in GRADES,
+            bool(same.get("reversible")) and not same.get("excluded_surface"),
+            bool(tester.get("session")) and tester.get("session") not in prior_sessions,
+            bool(tester.get("worktree")) and tester.get("worktree") not in prior_worktrees,
+            all(tester_profile["effort"] != p["effort"] or tester_profile["grade"] != p["grade"] for p in contributor_profiles),
+            bool(same.get("qualification_ref")) and GRADES.index(tester_profile["grade"]) >= GRADES.index("S+"),
+            bool(same.get("directed_brief_ref")) and bool(same.get("independent_counterexample_ref")),
+            bool(same.get("ci_run_id")) and bool(same.get("ci_attempt")) and ci_status == "success",
+            bool(same.get("report_phrase")) and same["report_phrase"] in {"동일 계열 독립 세션 검증", "동일 계열 독립 세션 검증 (2차 대기)"},
+            ]
+            if not same.get("ci_run_id") or not same.get("ci_attempt"):
+                reason = "CI_JOB_MISSING"
+            elif ci_status == "skipped":
+                reason = "CI_JOB_SKIPPED"
+            else:
+                reason = "SAME_FAMILY_PROOF_MISSING"
+            checks["independence"] = (result("PASS", "SAME_FAMILY_EXCEPTION_PROVEN", "spawn-worker:2-4") if all(conditions)
+                                      else result("UNVERIFIED", reason, "spawn-worker:2-4"))
+
+    bound = {**evidence,
+             "diff_sha256": surface["diff_sha256"] if surface else None,
+             "contributors_digest": _digest(contributors)}
+    if stage == "pre-spawn":
+        checks["prior"] = result("N/A", "FIRST_CALL_POINT", "decision:3231")
+        checks["report"] = result("N/A", "TESTER_NOT_SPAWNED", "decision:3231")
+        checks["current_pr"] = result("N/A", "PRE_SPAWN", "decision:3231")
+    else:
+        required_stage = "pre-spawn" if stage == "post-landing" else "post-landing"
+        _, checks["prior"] = _read_previous(evidence.get("previous_receipt"), required_stage, bound,
+                                            policy.get("revision", ""), bound.get("policy_sha256", ""))
+        checks["report"] = result("N/A", "TESTER_IN_PROGRESS", "decision:3231") if stage == "post-landing" else _report(evidence)
+        checks["current_pr"] = result("N/A", "POST_LANDING", "decision:3231") if stage == "post-landing" else _current_pr(evidence)
+    checks["ci_binding"] = (result("N/A", "BEFORE_CI", "decision:3231") if stage != "pre-merge"
+                            else _ci_binding(evidence))
+    checks["artifact_hash"] = result("N/A", "POST_MERGE_ARTIFACT", "advice:astra-Q3")
+    return checks, bound
+
+
+def audit(receipt_dir: Path, repos: list[str], jobs_dir: Path, since: str | None = None) -> int:
+    receipts = []
+    for path in receipt_dir.glob("*.json"):
+        try:
+            receipts.append(json.loads(path.read_text()))
+        except (OSError, ValueError):
+            continue
+    actions = []
+    for repo in repos:
+        proc = subprocess.run(["gh", "pr", "list", "--repo", repo, "--state", "merged", "--limit", "1000",
+                               "--json", "number,headRefOid,mergedAt,url"], text=True, capture_output=True, check=False)
+        if proc.returncode:
+            print(f"AUDIT UNVERIFIED repo={repo} gh lookup failed")
+            return 2
+        try:
+            fetched = json.loads(proc.stdout)
+            if len(fetched) == 1000:
+                print(f"AUDIT UNVERIFIED repo={repo} merged PR window truncated")
+                return 2
+            for pr in fetched:
+                actions.append(("merge", repo, str(pr["number"]), pr["mergedAt"]))
+        except (ValueError, KeyError):
+            print(f"AUDIT UNVERIFIED repo={repo} malformed ledger")
+            return 2
+    for path in jobs_dir.glob("*/events/*job.spawned.json"):
+        try:
+            record = json.loads(path.read_text())
+            job = record.get("job_id") or path.parents[1].name
+            at = record.get("created_at") or record.get("at")
+            if at:
+                actions.append(("spawn", str(record.get("repo", "")), str(job), at))
+        except (OSError, ValueError):
+            continue
+    if since:
+        try:
+            cutoff = parse_time(since)
+            actions = [row for row in actions if parse_time(row[3]) >= cutoff]
+        except ValueError:
+            print("AUDIT UNVERIFIED invalid time in ledger or --since")
+            return 2
+    missing = late = reused = 0
+    used = {}
+    for kind, repo, key, when in actions:
+        matches = [r for r in receipts if r.get("kind") == kind and
+                   (r.get("repo") == repo or not repo) and
+                   str(r.get("job" if kind == "spawn" else "pr")) == key and
+                   r.get("stage") == ("pre-spawn" if kind == "spawn" else "pre-merge")]
+        if not matches:
+            missing += 1
+            continue
+        selected = min(matches, key=lambda r: r.get("time", ""))
+        try:
+            if parse_time(selected["time"]) > parse_time(when):
+                late += 1
+        except (KeyError, ValueError):
+            late += 1
+        used[selected.get("action_id")] = used.get(selected.get("action_id"), 0) + 1
+    receipt_ids = {}
+    for item in receipts:
+        receipt_ids[item.get("action_id")] = receipt_ids.get(item.get("action_id"), 0) + 1
+    reused = sum(max(used.get(action, 0), count) - 1 for action, count in receipt_ids.items()
+                 if action and max(used.get(action, 0), count) > 1)
+    print(f"AUDIT actions={len(actions)} missing={missing} late={late} reused={reused}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+    check = sub.add_parser("check")
+    check.add_argument("--stage", choices=STAGES, required=True)
+    check.add_argument("--evidence", type=Path, required=True)
+    check.add_argument("--policy", type=Path, default=DEFAULT_POLICY)
+    check.add_argument("--receipt-dir", type=Path, default=DEFAULT_RECEIPTS)
+    audit_parser = sub.add_parser("audit")
+    audit_parser.add_argument("--repo", action="append", default=[])
+    audit_parser.add_argument("--receipt-dir", type=Path, default=DEFAULT_RECEIPTS)
+    audit_parser.add_argument("--jobs-dir", type=Path, default=Path.home() / "work/herdr-inbox/jobs")
+    audit_parser.add_argument("--since", help="UTC timestamp starting the audited shadow window")
+    args = parser.parse_args()
+    if args.command == "audit":
+        return audit(args.receipt_dir, args.repo, args.jobs_dir, args.since)
+    try:
+        evidence_bytes = args.evidence.read_bytes()
+        evidence = json.loads(evidence_bytes)
+    except (OSError, ValueError):
+        evidence_bytes = b""
+        evidence = {}
+    policy, policy_check = load_policy(args.policy)
+    evidence["policy_sha256"] = sha256_file(args.policy) if args.policy.is_file() else None
+    checks, bound = evaluate(evidence, args.stage, policy or {}, policy_check)
+    now = utc_now()
+    receipt = {"schema": 1, "action_id": new_action_id(), "kind": "merge" if args.stage == "pre-merge" else "spawn",
+               "stage": args.stage, "task": evidence.get("task"), "contract_revision": evidence.get("contract_revision"),
+               "job": evidence.get("job"), "repo": evidence.get("repo"), "pr": evidence.get("pr"),
+               "repo_path": evidence.get("repo_path"), "evidence_path": str(args.evidence),
+               "evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest() if evidence_bytes else None,
+               "head": evidence.get("head"), "base": evidence.get("base"), "trial_merge_tree": evidence.get("trial_merge_tree"),
+               "diff_sha256": bound.get("diff_sha256"), "contributors_digest": bound.get("contributors_digest"),
+               "planned_tester_profile": (evidence.get("tester") or {}).get("planned_profile"),
+               "planned_tester_effort": (evidence.get("tester") or {}).get("planned_effort"),
+               "actual_tester_profile": (evidence.get("tester") or {}).get("actual_profile"),
+               "actual_model": (evidence.get("tester") or {}).get("actual_model"),
+               "actual_effort": (evidence.get("tester") or {}).get("actual_effort"),
+               "policy": {"path": str(args.policy), "revision": (policy or {}).get("revision"),
+                          "sha256": sha256_file(args.policy) if args.policy.is_file() else None},
+               "tool_version": TOOL_VERSION, "issuer": evidence.get("issuer"), "time": iso_time(now),
+               "evidence_refs": {"report_path": (evidence.get("tester") or {}).get("report_path"),
+                                 "report_sha256": (evidence.get("tester") or {}).get("report_sha256"),
+                                 "ci_run_id": (evidence.get("ci") or {}).get("run_id"),
+                                 "ci_attempt": (evidence.get("ci") or {}).get("attempt"),
+                                 "job_record_dir": (evidence.get("tester") or {}).get("job_record_dir"),
+                                 "model_observation_path": (evidence.get("tester") or {}).get("model_observation_path"),
+                                 "model_observation_sha256": (evidence.get("tester") or {}).get("model_observation_sha256"),
+                                 "previous_receipt": evidence.get("previous_receipt")},
+               "checks": checks, "overall": overall(checks)}
+    receipt["H"], receipt["B"], receipt["M"] = receipt["head"], receipt["base"], receipt["trial_merge_tree"]
+    path = write_receipt(receipt, args.receipt_dir)
+    reasons = ",".join(f"{name}:{item['reason_code']}" for name, item in checks.items() if item["status"] in {"FAIL", "UNVERIFIED"})
+    print(f"TESTER_ELIGIBLE {receipt['overall']} stage={args.stage} task={receipt['task']} head={str(receipt['head'])[:12]} receipt={path} {reasons}")
+    return 0 if receipt["overall"] == "PASS" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

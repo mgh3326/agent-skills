@@ -1,0 +1,1347 @@
+{
+  "effective_at": "2026-09-25T00:00:00Z",
+  "expires_at": "2026-10-03T00:00:00Z",
+  "local_sources": {
+    "bin/wrk": "cd227ea38cd8e2aea217fa7370172958e60deefa816a708f452d0d77ba77a054",
+    "checker/SKILL.md": "491f114b014ed0c871585dac4789842bf74084ecce0cfe9c0d07d473f0438b66",
+    "director/SKILL.md": "e2f5b951c013df681534ba2f47d3560a404eea665db0acf8c3fb0fffc171df72",
+    "spawn-worker/SKILL.md": "89d8bc60d51174d204a92e93167e35eeb2e23624106ed52c196374f9b4cec3fd"
+  },
+  "profiles": {
+    "agy-flash": {
+      "default_effort": "",
+      "family": "google",
+      "grades": {
+        "": "A+"
+      },
+      "launcher": "agy",
+      "launcher_model_token": "--model gemini-3.7-flash-high",
+      "model": "gemini-3.7-flash",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "agy-flash36": {
+      "default_effort": "",
+      "family": "google",
+      "grades": {
+        "": null
+      },
+      "launcher": "agy",
+      "launcher_model_token": "--model gemini-3.6-flash-high",
+      "model": "gemini-3.6-flash-high",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "agy-flash37": {
+      "default_effort": "",
+      "family": "google",
+      "grades": {
+        "": null
+      },
+      "launcher": "agy",
+      "launcher_model_token": "--model gemini-3.7-flash-high",
+      "model": "gemini-3.7-flash-high",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "builder-devin": {
+      "default_effort": "",
+      "family": "cognition",
+      "grades": {
+        "": "A+"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model swe-2",
+      "model": "swe-2",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-devin-max": {
+      "default_effort": "",
+      "family": "cognition",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model swe-2-max",
+      "model": "swe-2-max",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-devin-medium": {
+      "default_effort": "",
+      "family": "cognition",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model swe-2-medium",
+      "model": "swe-2-medium",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-ds41": {
+      "default_effort": "",
+      "family": "deepseek",
+      "grades": {
+        "": "A+"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model deepseek-v4-1-flash-high",
+      "model": "deepseek-v4-1-flash-high",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-ds41-max": {
+      "default_effort": "",
+      "family": "deepseek",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model deepseek-v4-1-flash-max",
+      "model": "deepseek-v4-1-flash-max",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-grok": {
+      "default_effort": "xhigh",
+      "family": "xai",
+      "grades": {
+        "high": "S",
+        "xhigh": "S"
+      },
+      "launcher": "grok",
+      "launcher_model_token": "",
+      "model": "grok-4.7",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1"
+      ]
+    },
+    "builder-kimi": {
+      "default_effort": "",
+      "family": "moonshot",
+      "grades": {
+        "": "S"
+      },
+      "launcher": "kimi",
+      "launcher_model_token": "kimi-code/k3",
+      "model": "kimi-k3",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "builder-luna": {
+      "default_effort": "xhigh",
+      "family": "openai",
+      "grades": {
+        "xhigh": "A+"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
+      "model": "gpt-6-luna",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-opus": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": "S+",
+        "xhigh": "S+"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model opus",
+      "model": "claude-opus-5-5",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "builder-sol": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "high": "S+",
+        "max": "S+",
+        "xhigh": "S+"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
+      "model": "gpt-6-sol",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "captain-opus": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": "S+",
+        "xhigh": "S+"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model opus",
+      "model": "claude-opus-5-5",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "captain-sol": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "high": "S+",
+        "max": "S+",
+        "xhigh": "S+"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
+      "model": "gpt-6-sol",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "cc-dsflash": {
+      "default_effort": "high",
+      "family": "unknown",
+      "grades": {
+        "high": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "",
+      "model": "unknown",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "cc-dspro": {
+      "default_effort": "high",
+      "family": "unknown",
+      "grades": {
+        "high": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "",
+      "model": "unknown",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "cc-glm": {
+      "default_effort": "high",
+      "family": "zhipu",
+      "grades": {
+        "high": "B"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "",
+      "model": "glm-5.2",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "cc-glm53": {
+      "default_effort": "high",
+      "family": "unknown",
+      "grades": {
+        "high": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "",
+      "model": "unknown",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "cc-qwen38": {
+      "default_effort": "high",
+      "family": "alibaba",
+      "grades": {
+        "high": "A+"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "",
+      "model": "qwen3.8-max",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "codex": {
+      "default_effort": "high",
+      "family": "openai",
+      "grades": {
+        "high": "S+",
+        "max": "S+",
+        "xhigh": "S+"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
+      "model": "gpt-6-sol",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "codex-astra": {
+      "default_effort": "xhigh",
+      "family": "openai",
+      "grades": {
+        "xhigh": "S+"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-astra",
+      "model": "gpt-6-astra",
+      "roles": [
+        "counsel"
+      ],
+      "surfaces": []
+    },
+    "codex-luna": {
+      "default_effort": "medium",
+      "family": "openai",
+      "grades": {
+        "medium": "B"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
+      "model": "gpt-6-luna",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "codex-luna-hi": {
+      "default_effort": "high",
+      "family": "openai",
+      "grades": {
+        "high": "A"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
+      "model": "gpt-6-luna",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "codex-luna-max": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "max": "A+"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
+      "model": "gpt-6-luna",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "codex-luna56": {
+      "default_effort": "medium",
+      "family": "openai",
+      "grades": {
+        "medium": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-luna",
+      "model": "gpt-5.6-luna",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "codex-max": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "high": "S+",
+        "max": "S+",
+        "xhigh": "S+"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
+      "model": "gpt-6-sol",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "codex-med": {
+      "default_effort": "medium",
+      "family": "openai",
+      "grades": {
+        "medium": "A"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
+      "model": "gpt-5.6-terra",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "codex-sol": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "high": "S+",
+        "max": "S+",
+        "xhigh": "S+"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
+      "model": "gpt-6-sol",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "codex-sol56": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "max": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-sol",
+      "model": "gpt-5.6-sol",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "codex-terra": {
+      "default_effort": "medium",
+      "family": "openai",
+      "grades": {
+        "medium": "A"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
+      "model": "gpt-5.6-terra",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "codex-terra-max": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "max": "S"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
+      "model": "gpt-5.6-terra",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "devin-ds41": {
+      "default_effort": "",
+      "family": "deepseek",
+      "grades": {
+        "": "A+"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model deepseek-v4-1-flash-high",
+      "model": "deepseek-v4-1-flash-high",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "devin-ds41-max": {
+      "default_effort": "",
+      "family": "deepseek",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model deepseek-v4-1-flash-max",
+      "model": "deepseek-v4-1-flash-max",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "devin-glm52": {
+      "default_effort": "",
+      "family": "zhipu",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model glm-5-2",
+      "model": "glm-5-2",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "devin-swe17": {
+      "default_effort": "",
+      "family": "cognition",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model swe-1-7",
+      "model": "swe-1-7",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "devin-swe2": {
+      "default_effort": "",
+      "family": "cognition",
+      "grades": {
+        "": "A+"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model swe-2",
+      "model": "swe-2",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "devin-swe2-max": {
+      "default_effort": "",
+      "family": "cognition",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model swe-2-max",
+      "model": "swe-2-max",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "devin-swe2-medium": {
+      "default_effort": "",
+      "family": "cognition",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model swe-2-medium",
+      "model": "swe-2-medium",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "fable": {
+      "default_effort": "",
+      "family": "anthropic",
+      "grades": {
+        "": "S+"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model claude-fable-5-1",
+      "model": "claude-fable-5-1",
+      "roles": [
+        "counsel"
+      ],
+      "surfaces": []
+    },
+    "grok": {
+      "default_effort": "high",
+      "family": "xai",
+      "grades": {
+        "high": "S",
+        "xhigh": "S"
+      },
+      "launcher": "grok",
+      "launcher_model_token": "",
+      "model": "grok-4.7",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "grok-hi": {
+      "default_effort": "high",
+      "family": "xai",
+      "grades": {
+        "high": "S",
+        "xhigh": "S"
+      },
+      "launcher": "grok",
+      "launcher_model_token": "",
+      "model": "grok-4.7",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "grok-med": {
+      "default_effort": "medium",
+      "family": "xai",
+      "grades": {
+        "medium": "A+"
+      },
+      "launcher": "grok",
+      "launcher_model_token": "",
+      "model": "grok-4.7",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "grok45": {
+      "default_effort": "high",
+      "family": "xai",
+      "grades": {
+        "high": null
+      },
+      "launcher": "grok",
+      "launcher_model_token": "PROFILE_MODEL_ARG=grok-4.5",
+      "model": "grok-4.5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "grok45-med": {
+      "default_effort": "medium",
+      "family": "xai",
+      "grades": {
+        "medium": null
+      },
+      "launcher": "grok",
+      "launcher_model_token": "PROFILE_MODEL_ARG=grok-4.5",
+      "model": "grok-4.5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "grok46": {
+      "default_effort": "high",
+      "family": "xai",
+      "grades": {
+        "high": null
+      },
+      "launcher": "grok",
+      "launcher_model_token": "PROFILE_MODEL_ARG=grok-4.6",
+      "model": "grok-4.6",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "grok46-med": {
+      "default_effort": "medium",
+      "family": "xai",
+      "grades": {
+        "medium": null
+      },
+      "launcher": "grok",
+      "launcher_model_token": "PROFILE_MODEL_ARG=grok-4.6",
+      "model": "grok-4.6",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "haiku": {
+      "default_effort": "low",
+      "family": "anthropic",
+      "grades": {
+        "low": "C"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kimi-k27": {
+      "default_effort": "",
+      "family": "moonshot",
+      "grades": {
+        "": null
+      },
+      "launcher": "kimi",
+      "launcher_model_token": "-m kimi-code/kimi-for-coding",
+      "model": "kimi-for-coding",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kimi-k27-code": {
+      "default_effort": "",
+      "family": "moonshot",
+      "grades": {
+        "": "A"
+      },
+      "launcher": "kimi",
+      "launcher_model_token": "-m kimi-code/kimi-for-coding",
+      "model": "kimi-k2-7-code",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kimi-k3": {
+      "default_effort": "",
+      "family": "moonshot",
+      "grades": {
+        "": "S"
+      },
+      "launcher": "kimi",
+      "launcher_model_token": "kimi-code/k3",
+      "model": "kimi-k3",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "kimi-k3-low": {
+      "default_effort": "",
+      "family": "moonshot",
+      "grades": {
+        "": "A"
+      },
+      "launcher": "kimi",
+      "launcher_model_token": "-m kimi-code/k3",
+      "model": "kimi-k3",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro": {
+      "default_effort": "high",
+      "family": "unknown",
+      "grades": {
+        "high": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "",
+      "model": "unknown",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-cheap": {
+      "default_effort": "medium",
+      "family": "alibaba",
+      "grades": {
+        "medium": "C"
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=qwen3-coder-next",
+      "model": "qwen3-coder-next",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-deepseek": {
+      "default_effort": "high",
+      "family": "deepseek",
+      "grades": {
+        "high": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=deepseek-v3.2",
+      "model": "deepseek-v3.2",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-glm": {
+      "default_effort": "high",
+      "family": "zhipu",
+      "grades": {
+        "high": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=glm-5",
+      "model": "glm-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-haiku": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": "B"
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=claude-haiku-4.5",
+      "model": "claude-haiku-4.5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-luna": {
+      "default_effort": "medium",
+      "family": "openai",
+      "grades": {
+        "medium": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-luna",
+      "model": "gpt-5.6-luna",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-minimax": {
+      "default_effort": "high",
+      "family": "minimax",
+      "grades": {
+        "high": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=minimax-m2.5",
+      "model": "minimax-m2.5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-minimax21": {
+      "default_effort": "medium",
+      "family": "minimax",
+      "grades": {
+        "medium": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=minimax-m2.1",
+      "model": "minimax-m2.1",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-opus": {
+      "default_effort": "xhigh",
+      "family": "anthropic",
+      "grades": {
+        "xhigh": "S+"
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=claude-opus-5",
+      "model": "claude-opus-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-opus-max": {
+      "default_effort": "max",
+      "family": "anthropic",
+      "grades": {
+        "max": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=claude-opus-5",
+      "model": "claude-opus-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-opus-xhigh": {
+      "default_effort": "xhigh",
+      "family": "anthropic",
+      "grades": {
+        "xhigh": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=claude-opus-5",
+      "model": "claude-opus-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-sol": {
+      "default_effort": "high",
+      "family": "openai",
+      "grades": {
+        "high": "S+"
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-sol",
+      "model": "gpt-5.6-sol",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-sol-max": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "max": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-sol",
+      "model": "gpt-5.6-sol",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-sol-xhigh": {
+      "default_effort": "xhigh",
+      "family": "openai",
+      "grades": {
+        "xhigh": null
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-sol",
+      "model": "gpt-5.6-sol",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "kiro-sonnet": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": "A+"
+      },
+      "launcher": "kiro",
+      "launcher_model_token": "PROFILE_MODEL=claude-sonnet-5",
+      "model": "claude-sonnet-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-dsflash": {
+      "default_effort": "",
+      "family": "deepseek",
+      "grades": {
+        "": "A"
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model cline-pass/cline-pass/deepseek-v4-flash",
+      "model": "deepseek-v4-flash",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-glm": {
+      "default_effort": "",
+      "family": "zhipu",
+      "grades": {
+        "": "B"
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model cline-pass/cline-pass/glm-5.2",
+      "model": "glm-5.2",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-kimi-code": {
+      "default_effort": "",
+      "family": "moonshot",
+      "grades": {
+        "": null
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model cline-pass/cline-pass/kimi-k2.7-code",
+      "model": "kimi-k2.7-code",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-kimi-k3": {
+      "default_effort": "",
+      "family": "moonshot",
+      "grades": {
+        "": null
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model cline-pass/cline-pass/kimi-k3",
+      "model": "kimi-k3",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-minimax-m3": {
+      "default_effort": "",
+      "family": "minimax",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model cline-pass/cline-pass/minimax-m3",
+      "model": "minimax-m3",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-omni": {
+      "default_effort": "",
+      "family": "unknown",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model omniroute/auto/coding",
+      "model": "omniroute/auto/coding",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-oss": {
+      "default_effort": "",
+      "family": "openai",
+      "grades": {
+        "": null
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model cliproxy/gpt-oss-120b-medium",
+      "model": "gpt-oss-120b-medium",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-qwen37-max": {
+      "default_effort": "",
+      "family": "alibaba",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model cline-pass/cline-pass/qwen3.7-max",
+      "model": "qwen3.7-max",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-solar4": {
+      "default_effort": "",
+      "family": "upstage",
+      "grades": {
+        "": "B"
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model upstage/solar-pro4",
+      "model": "solar-pro4",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "oc-sonnet46": {
+      "default_effort": "",
+      "family": "anthropic",
+      "grades": {
+        "": "C"
+      },
+      "launcher": "opencode",
+      "launcher_model_token": "--model cliproxy/claude-sonnet-4-6",
+      "model": "claude-sonnet-4.6",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "opus": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": "S+",
+        "xhigh": "S+"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model opus",
+      "model": "claude-opus-5-5",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "sonnet": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": "A+"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model sonnet",
+      "model": "claude-sonnet-5",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "sonnet-med": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": "A+"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model sonnet",
+      "model": "claude-sonnet-5",
+      "roles": [
+        "builder",
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    }
+  },
+  "revision": "2026-09-25.1",
+  "schema": 1,
+  "sources": {
+    "bin/wrk": {
+      "id": "resolve_profile",
+      "scope": "launcher and fixed model definitions"
+    },
+    "checker/SKILL.md": {
+      "id": "G1-G8",
+      "scope": "merge evidence"
+    },
+    "decision/2026-09-20/provider-family-and-ds41-grade": {
+      "id": 2227,
+      "scope": "family provenance and A+ reversible T1/T2 only"
+    },
+    "decision/2026-09-25/director-throughput-adopted": {
+      "id": 3231,
+      "scope": "shadow receipts and three eligibility call points"
+    },
+    "scopefuel/policy-launch-snapshot": {
+      "id": "2026-09-25T06:40Z",
+      "scope": "model and per-effort grade snapshot; expires with artifact"
+    },
+    "spawn-worker/SKILL.md": {
+      "id": "section 2-1,2-2,2-4",
+      "scope": "T floor, grade, family rules"
+    },
+    "task/723": {
+      "id": 723,
+      "scope": "required CI action/revision binding; pending implementation"
+    }
+  },
+  "surface_rules": {
+    "auto_trader_repos": [
+      "auto_trader",
+      "auto-trader",
+      "auto_trader-operator"
+    ],
+    "gate_paths": [
+      "director/bin/",
+      "director/gate_",
+      "bin/wrk",
+      "checker/",
+      "spawn-worker/"
+    ],
+    "t3_names": [
+      "Dockerfile",
+      "*.service",
+      "*.service.*"
+    ],
+    "t3_paths": [
+      "live/",
+      "deploy/",
+      "broker/",
+      "orders/",
+      "safety/",
+      "guards/",
+      "installer/",
+      "operator_contract.yaml",
+      "bin/wrk",
+      "director/SKILL.md",
+      "checker/SKILL.md",
+      "spawn-worker/SKILL.md"
+    ],
+    "tool_repos": [
+      "agent-skills",
+      "scopefuel",
+      "handoffkeep",
+      "panewire",
+      "herdr"
+    ]
+  }
+}
