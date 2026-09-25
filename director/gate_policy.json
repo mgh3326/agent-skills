@@ -2,10 +2,10 @@
   "effective_at": "2026-09-25T00:00:00Z",
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
-    "bin/wrk": "fb4b25a550464a4e6b2e34f4d6db0423172b8c53acd8ab079e5e55640b43d95e",
-    "checker/SKILL.md": "491f114b014ed0c871585dac4789842bf74084ecce0cfe9c0d07d473f0438b66",
-    "director/SKILL.md": "e2f5b951c013df681534ba2f47d3560a404eea665db0acf8c3fb0fffc171df72",
-    "spawn-worker/SKILL.md": "bd08cdda27c7f2dc8c0034b3c96117eae5c9617a0159c0febfb0bcb82503dd12"
+    "bin/wrk": "842c5b499f321d6371533c79e266767967751ef26862bccb3ec62c35b11d916f",
+    "checker/SKILL.md": "bf0046ccb21b96cf6562e32c47013694f1f08f16a3271ef363557fb3e204b573",
+    "director/SKILL.md": "41003d23c2cc77b9d45fdb6058b0c48fa94ccd0f5ea408e43929abc02648e574",
+    "spawn-worker/SKILL.md": "db09e51e3ff807b0808524713d8ef89c29ae4a550d025570bd0f2ef941842c55"
   },
   "profiles": {
     "agy-flash": {
@@ -1476,7 +1476,7 @@
       ]
     }
   },
-  "revision": "2026-09-25.4",
+  "revision": "2026-09-25.5",
   "schema": 1,
   "sources": {
     "bin/wrk": {
@@ -1506,6 +1506,10 @@
     "task/704": {
       "id": 704,
       "scope": "E6 builder effort variants and launch role; source pinned by bin/wrk hash"
+    },
+    "task/721": {
+      "id": 721,
+      "scope": "single heavy full-suite run per head and host lock"
     },
     "task/723": {
       "id": 723,
