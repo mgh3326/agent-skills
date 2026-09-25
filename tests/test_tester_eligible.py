@@ -86,9 +86,15 @@ class EligibilityFixtures(unittest.TestCase):
     def previous(self, evidence: dict, stage: str) -> Path:
         surface, _ = eligible.diff_surface(evidence, self.policy)
         path = Path(self.temp.name) / f"{stage}.json"
-        payload = {"stage": stage, "overall": "PASS", "action_id": "first-action",
+        payload = {"stage": stage, "kind": "spawn", "overall": "PASS", "action_id": "first-action",
                                     "task": evidence["task"], "contract_revision": evidence["contract_revision"],
-                                    "repo": evidence["repo"], "head": evidence["head"], "base": evidence["base"],
+                                    "job": evidence["job"], "repo": evidence["repo"],
+                                    "repo_path": evidence["repo_path"], "issuer": evidence["issuer"],
+                                    "pr": evidence.get("pr"), "head": evidence["head"], "base": evidence["base"],
+                                    "trial_merge_tree": evidence.get("trial_merge_tree"),
+                                    "declared_t": evidence["declared_t"],
+                                    "required_grade": evidence["required_grade"],
+                                    "implementation_grade": evidence["implementation_grade"],
                                     "diff_sha256": surface["diff_sha256"],
                                     "contributors_digest": eligible._digest(evidence["contributors"]),
                                     "planned_tester_profile": evidence["tester"]["planned_profile"],
@@ -98,7 +104,10 @@ class EligibilityFixtures(unittest.TestCase):
         if stage == "post-landing":
             payload.update(actual_tester_profile=evidence["tester"]["actual_profile"],
                            actual_model=evidence["tester"]["actual_model"],
-                           actual_effort=evidence["tester"]["actual_effort"])
+                           actual_effort=evidence["tester"]["actual_effort"],
+                           actual_tester_session=evidence["tester"]["session"],
+                           actual_tester_worktree=evidence["tester"]["worktree"],
+                           actual_tester_pane=evidence["tester"].get("pane"))
         path.write_text(json.dumps(payload) + "\n")
         return path
 
@@ -282,6 +291,22 @@ class EligibilityFixtures(unittest.TestCase):
         evidence["contributors"].append({"profile": "opus", "model": "claude-opus-5-5", "effort": "high",
                                          "role": "worker", "kind": "prescription", "session": "advisor-session"})
         self.assert_case(self.check(evidence, "post-landing"), "prior", "UNVERIFIED", "EVIDENCE_CHANGED")
+
+    def test_prior_receipt_replay_changes_job_pr_merge_tree_or_tester(self) -> None:
+        evidence = self.landed(self.evidence(self.make_head(), pr=99, trial_merge_tree="a" * 40))
+        evidence["previous_receipt"] = str(self.previous(evidence, "pre-spawn"))
+        changed = json.loads(json.dumps(evidence))
+        changed["job"] = "another-job"
+        self.assert_case(self.check(changed, "post-landing"), "prior", "UNVERIFIED", "EVIDENCE_CHANGED")
+        changed = json.loads(json.dumps(evidence))
+        changed["pr"] = 100
+        self.assert_case(self.check(changed, "post-landing"), "prior", "UNVERIFIED", "EVIDENCE_CHANGED")
+        changed = json.loads(json.dumps(evidence))
+        changed["trial_merge_tree"] = "b" * 40
+        self.assert_case(self.check(changed, "post-landing"), "prior", "UNVERIFIED", "MERGE_TREE_CHANGED")
+        evidence["previous_receipt"] = str(self.previous(evidence, "post-landing"))
+        evidence["tester"]["session"] = "different-session"
+        self.assert_case(self.check(evidence, "pre-merge"), "prior", "UNVERIFIED", "ACTUAL_TESTER_CHANGED")
 
     def test_verdict_head_stale(self) -> None:
         evidence = self.landed(self.evidence(self.make_head()))

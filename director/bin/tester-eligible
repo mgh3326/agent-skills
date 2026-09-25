@@ -99,12 +99,20 @@ def _read_previous(path_text: str | None, required_stage: str, evidence: dict,
     path = Path(path_text)
     try:
         previous = json.loads(path.read_text())
-        if previous["stage"] != required_stage or previous["overall"] != "PASS":
+        if (previous["stage"] != required_stage or previous["overall"] != "PASS" or
+            previous.get("kind") != "spawn"):
             return None, result("UNVERIFIED", "PREVIOUS_RECEIPT_INVALID", "decision:3231")
-        for key in ("task", "contract_revision", "repo", "head", "base", "diff_sha256", "contributors_digest"):
+        for key in ("task", "contract_revision", "job", "repo", "repo_path", "issuer",
+                    "head", "base", "diff_sha256", "contributors_digest", "declared_t",
+                    "required_grade", "implementation_grade"):
             if previous.get(key) != evidence.get(key):
                 reason = "HEAD_CHANGED" if key == "head" else "BASE_CHANGED" if key == "base" else "EVIDENCE_CHANGED"
                 return None, result("UNVERIFIED", reason, "decision:3231", field=key)
+        if previous.get("pr") is not None and previous["pr"] != evidence.get("pr"):
+            return None, result("UNVERIFIED", "EVIDENCE_CHANGED", "decision:3231", field="pr")
+        if (previous.get("trial_merge_tree") is not None and
+            previous["trial_merge_tree"] != evidence.get("trial_merge_tree")):
+            return None, result("UNVERIFIED", "MERGE_TREE_CHANGED", "decision:3231")
         tester = evidence.get("tester") or {}
         if (previous.get("planned_tester_profile") != tester.get("planned_profile") or
             previous.get("planned_tester_effort") != tester.get("planned_effort")):
@@ -113,6 +121,11 @@ def _read_previous(path_text: str | None, required_stage: str, evidence: dict,
             for key, field in (("actual_tester_profile", "actual_profile"),
                                ("actual_model", "actual_model"), ("actual_effort", "actual_effort"))):
             return None, result("UNVERIFIED", "ACTUAL_PROFILE_CHANGED", "decision:3231")
+        if required_stage == "post-landing" and any(previous.get(key) != tester.get(field)
+            for key, field in (("actual_tester_session", "session"),
+                               ("actual_tester_worktree", "worktree"),
+                               ("actual_tester_pane", "pane"))):
+            return None, result("UNVERIFIED", "ACTUAL_TESTER_CHANGED", "decision:3231")
         if ((previous.get("policy") or {}).get("revision") != policy_revision or
             (previous.get("policy") or {}).get("sha256") != policy_sha256):
             return None, result("UNVERIFIED", "POLICY_CHANGED", "decision:3231")
@@ -518,12 +531,17 @@ def main() -> int:
                "repo_path": evidence.get("repo_path"), "evidence_path": str(args.evidence),
                "evidence_sha256": hashlib.sha256(evidence_bytes).hexdigest() if evidence_bytes else None,
                "head": evidence.get("head"), "base": evidence.get("base"), "trial_merge_tree": evidence.get("trial_merge_tree"),
+               "declared_t": evidence.get("declared_t"), "required_grade": evidence.get("required_grade"),
+               "implementation_grade": evidence.get("implementation_grade"),
                "diff_sha256": bound.get("diff_sha256"), "contributors_digest": bound.get("contributors_digest"),
                "planned_tester_profile": (evidence.get("tester") or {}).get("planned_profile"),
                "planned_tester_effort": (evidence.get("tester") or {}).get("planned_effort"),
                "actual_tester_profile": (evidence.get("tester") or {}).get("actual_profile"),
                "actual_model": (evidence.get("tester") or {}).get("actual_model"),
                "actual_effort": (evidence.get("tester") or {}).get("actual_effort"),
+               "actual_tester_session": (evidence.get("tester") or {}).get("session"),
+               "actual_tester_worktree": (evidence.get("tester") or {}).get("worktree"),
+               "actual_tester_pane": (evidence.get("tester") or {}).get("pane"),
                "policy": {"path": str(args.policy), "revision": (policy or {}).get("revision"),
                           "sha256": sha256_file(args.policy) if args.policy.is_file() else None},
                "tool_version": TOOL_VERSION, "issuer": evidence.get("issuer"), "time": iso_time(now),
