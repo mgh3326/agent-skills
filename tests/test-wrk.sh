@@ -1473,6 +1473,10 @@ working_no_marker_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_b
 grep -q 'landed=no' <<<"$working_no_marker_out"
 grep -q 'action=reinject-once' <<<"$working_no_marker_out"
 grep -q 'last_status=working' <<<"$working_no_marker_out"
+# #717: pin the codex window itself, not just the verdict path — a ticks-only
+# mutant (33 -> 18) or a window mutant (60 -> 30) must both fail here.
+grep -q 'window=60s checks=33' <<<"$working_no_marker_out" ||
+  fail "codex landing window must stay 60s/33 ticks: $working_no_marker_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
 echo "PASS ac1-working-without-marker-retries-then-no: $working_no_marker_out"
 
@@ -1639,8 +1643,8 @@ grep -q 'action=reinject-once' <<<"$grok_no_chip_out" &&
   fail "grok negative path must not re-inject: $grok_no_chip_out"
 grep -q 'retry=skipped reason=grok-never-reinjected' <<<"$grok_no_chip_out" ||
   fail "grok negative path lost its skip reason: $grok_no_chip_out"
-grep -q 'window=150s' <<<"$grok_no_chip_out" ||
-  fail "grok must use the extended landing window: $grok_no_chip_out"
+grep -q 'window=150s checks=78' <<<"$grok_no_chip_out" ||
+  fail "grok must keep the extended 150s/78-tick landing window: $grok_no_chip_out"
 grep -q 're-check the pane after 2 minutes' <<<"$grok_no_chip_out" ||
   fail "grok landed=no must print the re-check hint: $grok_no_chip_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
@@ -1655,7 +1659,7 @@ grep -q 'landed=yes' <<<"$grok_slow_out" ||
   fail "grok echo inside the extended window must land: $grok_slow_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
   fail "grok slow-marker triggered a re-injection: $grok_slow_out"
-[[ "$(grep -c -- '--source recent-unwrapped' "$TMP/herdr.log")" -ge 30 ]] ||
+[[ "$(grep -c -- '--source recent-unwrapped' "$TMP/herdr.log")" -ge 60 ]] ||
   fail "grok slow-marker landed before its late echo: $grok_slow_out"
 echo "PASS grok-slow-echo-landed: $grok_slow_out"
 
@@ -1663,6 +1667,9 @@ echo "PASS grok-slow-echo-landed: $grok_slow_out"
 claude_grok_chip_out="$(TEST_FIXTURE_SCENARIO=grok-queued spawn_base sonnet 2>&1)"
 grep -q 'landed=no' <<<"$claude_grok_chip_out" ||
   fail "claude pane must not treat the grok footer as evidence: $claude_grok_chip_out"
+# #717: pin the default window on a non-codex non-grok kind.
+grep -q 'window=30s checks=18' <<<"$claude_grok_chip_out" ||
+  fail "default landing window must stay 30s/18 ticks: $claude_grok_chip_out"
 echo "PASS claude-ignores-grok-queued-chip: $claude_grok_chip_out"
 
 : >"$TMP/herdr.log"
@@ -1703,6 +1710,23 @@ diff <(sed '1,2d' "$PW_LOG.1") "$PROMPT" >/dev/null || fail "498 brief body must
 grep -q ' via=' <<<"$pw_out" && fail "498 panewire path must not annotate via=: $pw_out"
 grep -q 'agent prompt w:p1 fixture prompt' "$TMP/herdr.log" || fail "498 brief must reach the pane"
 echo "PASS 498-a7-expect-name-cwd-no-uptake"
+
+# #717: the panewire --timeout is a budget of its own, decoupled from the
+# landing window — the daemon only proves claude/codex submissions, so for
+# every other kind a window-length timeout is dead polling before wrk's own
+# observation starts. Pin it per kind: codex 60s (asserted above), grok and
+# the default both 30s even though grok's landing window is 150s. The grok
+# pin is what kills a re-coupling mutant — codex's timeout equals its window
+# either way.
+pw_reset
+pw_spawn grok >/dev/null 2>&1
+grep -q ' timeout=30s ' "$PW_LOG" ||
+  fail "grok panewire timeout must be the 30s default, not its 150s window: $(cat "$PW_LOG")"
+pw_reset
+pw_spawn sonnet >/dev/null 2>&1
+grep -q ' timeout=30s ' "$PW_LOG" ||
+  fail "default-kind panewire timeout must be 30s: $(cat "$PW_LOG")"
+echo "PASS 717-panewire-timeout-decoupled"
 
 # C4: injection only after tab create and agent start.
 tab_line="$(grep -n '^tab create' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"

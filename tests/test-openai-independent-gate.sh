@@ -22,23 +22,25 @@ END = "<!-- openai-independent-verification:end -->"
 EXPECTED_BLOCK = """<!-- openai-independent-verification:start -->
 **OpenAI 계열 독립검증 계약**
 
-OpenAI 기여가 있는 PR은 contributor 계열 합집합 밖의 검증된 tester가 최종 head에 PASS하지 않으면 머지하지 않는다. Sol·Astra·Terra·Luna는 모델명이 달라도 서로 독립 검증이 아니다.
+OpenAI 기여가 있는 PR은 contributor 계열 합집합 밖의 검증된 tester가 최종 head에 PASS하지 않으면 머지하지 않는다. 유일한 예외는 `spawn-worker` §2-4 조건부 동일 계열 검증의 조건을 전부 충족한 경우다(A+ 이하 · 가역 T1/T2 · 제외 표면 아님 · 새 세션+detached worktree · opus xhigh 급 이상 tester · 지시형 공격 표면 브리프 · 독립 반례 · 최종 SHA required CI). 그 PASS는 "동일 계열 독립 세션 검증"으로 표기하고 "교차 검증 완료"와 구분한다. 계열만으로는 자격이 되지 않는다. T3와 제외 표면은 예외 없이 합집합 밖 PASS가 필요하다. Sol·Astra·Terra·Luna는 모델명이 달라도 서로 독립 검증이 아니다.
 
 기여 계열은 합집합이다 — 최종 커미터만 보지 않고 초안·수리·처방을 낸 모든 계열. 계열 unknown이면 독립성 불통과.
 
 신규 Codex 구현은 독립 tester와 reservation이 발주 전에 확보될 때만 발주한다. 없으면 HOLD(no_independent_reviewer).
 
-09-14 동일계열 지연검증 예외는 Sol director 재임 중 OpenAI contributor PR에는 적용하지 않는다.
+Sol director 재임 중 OpenAI contributor PR에는 동일 계열 경로(§2-4 조건부 동일 계열 검증과 09-14 동일계열 지연검증 예외)를 적용하지 않는다.
 
 checker 파생 판정:
 
 - 위 독립성 조건 중 하나라도 충족하지 않으면 BOUNCE
-- 적격 반대계열 tester의 exact-head PASS와 나머지 gate PASS가 모두 있으면 READY
+- 적격 반대계열 tester의 exact-head PASS와 나머지 gate PASS가 모두 있으면 READY(교차 검증 완료)
+- §2-4 조건부 동일 계열 검증 조건을 전부 증거로 충족한 동일 계열 tester의 exact-head PASS와 나머지 gate PASS가 모두 있으면 READY(동일 계열 독립 세션 검증)
 
 입력·증거:
 
 - contributor family union과 각 기여의 근거(초안/수리/처방 포함)
 - tester provider family, exact tested SHA, PASS 증거
+- 동일 계열 경로면 조건별 증거: 급·T·가역성, 제외 표면 아님, 새 세션·worktree, tester 모델·effort, 브리프의 지시형 공격 표면(file:line), 독립 반례, 최종 SHA required CI — 하나라도 없으면 BOUNCE
 - family가 unknown이거나 contributor union 밖임을 증명하지 못하면 fail-closed
 - 최종 PR head와 tested SHA가 다르면 BOUNCE
 <!-- openai-independent-verification:end -->"""
@@ -89,7 +91,8 @@ def merge_verdict(
     tester_pass=True,
     other_gates_pass=True,
     independence_proven=True,
-    allow_same_family=False,
+    same_family_evidence_complete=False,
+    director_family="Anthropic",
 ):
     union = {normalize(family) for family in contributor_families}
     tester = normalize(tester_family)
@@ -97,8 +100,11 @@ def merge_verdict(
         return "BOUNCE"
     if tested_sha != pr_head or not tester_pass or not other_gates_pass:
         return "BOUNCE"
-    if "OpenAI" in union and tester in union and not allow_same_family:
-        return "BOUNCE"
+    if "OpenAI" in union and tester in union:
+        # #643: the same-family route needs every spawn-worker §2-4 condition
+        # proven, and never applies under a Sol (OpenAI) director.
+        if not same_family_evidence_complete or normalize(director_family) == "OpenAI":
+            return "BOUNCE"
     return "READY"
 
 
@@ -123,6 +129,18 @@ merge_cases = [
     (merge_verdict({"OpenAI"}, "xAI", tested_sha="old"), "BOUNCE", "head-mismatch"),
     (merge_verdict({"OpenAI"}, "xAI", other_gates_pass=False), "BOUNCE", "other-gate-fail"),
     (merge_verdict({"OpenAI"}, "xAI", independence_proven=False), "BOUNCE", "unproven"),
+    (
+        merge_verdict({"OpenAI"}, "OpenAI", same_family_evidence_complete=True),
+        "READY",
+        "same-family-all-conditions",
+    ),
+    (
+        merge_verdict(
+            {"OpenAI"}, "Sol", same_family_evidence_complete=True, director_family="Sol"
+        ),
+        "BOUNCE",
+        "same-family-under-sol-director",
+    ),
 ]
 for actual, expected, label in merge_cases:
     assert actual == expected, f"{label}: expected {expected}, got {actual}"
@@ -221,9 +239,9 @@ def expect_assertion(label, callback):
 drifted_director = director_text.replace(
     "초안·수리·처방을 낸 모든 계열", "초안·수리를 낸 모든 계열", 1
 )
-def assert_same_family_bounces(allow_same_family=False):
+def assert_same_family_bounces(evidence_complete=False):
     assert merge_verdict(
-        {"OpenAI"}, "OpenAI", allow_same_family=allow_same_family
+        {"OpenAI"}, "OpenAI", same_family_evidence_complete=evidence_complete
     ) == "BOUNCE"
 
 
