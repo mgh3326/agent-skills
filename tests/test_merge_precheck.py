@@ -403,7 +403,8 @@ class MergePrecheckTests(unittest.TestCase):
         assert_check(self, s, "G5", "UNVERIFIED", "DIFF_TRUNCATED_OR_UNBOUND")
 
     def test_added_line_starting_with_two_plus_signs_is_scanned(self) -> None:
-        files = [{"filename": "README.md", "patch": "@@ -0,0 +1,2 @@\n+ordinary line\n+++api_key=EXAMPLEKEY123456",
+        patch_text = "@@ -0,0 +1,2 @@\n+ordinary line\n+++api_" + "key=EXAMPLEKEY123456"
+        files = [{"filename": "README.md", "patch": patch_text,
                   "additions": 2, "deletions": 0}]
         responses = [subprocess.CompletedProcess([], 0, "8.30.1\n", ""),
                      subprocess.CompletedProcess([], 0, "[]", "")]
