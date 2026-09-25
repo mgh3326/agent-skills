@@ -9,11 +9,11 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 `builder-sol`(codex-sol)이다. `captain-opus`·`captain-sol`은
 legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
 `builder-grok`은 파일럿 1건을 통과해 **조건부 T1 빌더**로 등재됐다(2026-09-14
-운영자 결정). 조건은 **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(타사 풀
-물리적 소진 시 `spawn-worker` §2-4 동일 계열 예외) · T2 이상과
+운영자 결정). 조건은 **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(`spawn-worker` §2-4
+조건부 동일 계열 검증·소진 시 지연 검증) · T2 이상과
 배포·안전가드 표면 제외**다. `builder-devin`은 같은 파일럿에서 출발해 2026-09-23 운영자 결정으로
 **A+ 급 작업의 T1·T2 빌더**가 됐다 — 조건 **급 A+ 이하 작업(`S` 이상 제외) · 가역 T1·T2 한정(T3
-제외) · 라운드 상한 3 · 독립 tester는 타사 provider family(§2-4 동일 계열 예외 적용) · 배포·라이브
+제외) · 라운드 상한 3 · 독립 tester는 타사 provider family(§2-4 조건부 동일 계열 검증·소진 시 지연 검증 적용) · 배포·라이브
 매매 표면 제외**, 되돌리기 조건, 결정 기록과 다음 재판단의 **정본은 `spawn-worker` §2-2 급표의
 `builder-devin` 행**이다(두 문서가 어긋나면 그 행을 따른다). `builder-kimi`는 아직 파일럿 전이라
 열려만 있다. `builder-luna`는 #594 E3 실험 표본용으로 열려 있으며 codex-luna(gpt-6-luna)의 argv를
@@ -44,6 +44,11 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
    직접 확인하는 규칙을 생략하지 않는다. `gh pr checks`가 조회 불가하거나 녹색을 직접 확인할 수
    없으면 성공으로 추정하지 않는다. 단, 아래 §단독 모드의 6조건이 **전부** 충족되면 워커·tester
    스폰 없이 빌더가 직접 구현한다.
+   🔴 **tester 브리프에는 계열과 무관하게 항상 지시형 공격 표면을 넣는다** — 이 변경이 새로
+   들인 것(새 분기·상태·외부 호출·바뀐 계약)을 `file:line` 으로 이름 붙인다. 중립 브리프
+   ("AC 대비 이 head 를 검증하라")만 받은 tester 는 결함 대부분을 놓친다(E7: 확인된 결함 8건 중
+   동일 계열 0건·교차 계열 1건 검출). 결함 가설이나 정답을 알려 주라는 뜻은 아니다.
+   동일 계열 tester 의 조건은 `spawn-worker` §2-4 조건부 동일 계열 검증이 정본이다.
 4. BLOCKER만 fix 라운드를 연다. 3라운드를 넘기지 않는다.
 5. **워커·tester 배치는 `wrk spawn`(hub placement)이 정한다.** 빌더 자신의 머신이 기본값이
    아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
@@ -60,7 +65,9 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
    띄운다 — "예상 2라운드"라고 적었다고 실제 4라운드를 단독으로 끌지 않는다.
 3. **검증은 기존 `spawn_mode`(`spawn-worker` §2-1)를 따른다.** T1 자체검증 허용. 🔴 **T2
    이상은 독립 tester 필수 — builder 는 자기 구현의 tester 가 될 수 없다.** T3 는 다른
-   provider family. 단독 모드에서 builder 는 **기여자**이므로 최종 tester 는 builder 계열 밖.
+   provider family(동일 계열 경로 없음). 단독 모드에서 builder 는 **기여자**이므로 최종 tester 는 builder 계열 밖이
+   기본이다 — 단 가역 T1/T2 는 `spawn-worker` §2-4 조건부 동일 계열 검증의 조건을 **전부** 충족한 새 세션의
+   동일 계열 tester 도 된다(T3·제외 표면은 예외 없이 계열 밖).
 4. builder 는 구현·발주 **전에** AC 검토 ref 를 남긴다(목적 / 불변식 / 각 AC 가 목적을
    보증하는가 / 전부 통과하면서 목적을 망치는 반례). 브리프를 그대로 전달한 것은 검토가 아니다.
 5. AC 의 **의미**를 바꿔야 하면 고치지 말고 director 에 ESC. AC 는 hash 로 고정하고 의미가
