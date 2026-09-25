@@ -247,7 +247,9 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
 ## 3. 브리프 작성 (자족적일 것)
 
 포함: ①작업 정의+AC ②worktree 경로·브랜치 ③제약(하드 인바리언트 불변, 게이트 완화 금지,
-직접 머지 금지 — **정지점=PR까지**) ④완료 기준+보고 형식(실행한 테스트 원문, push SHA)
+직접 머지 금지 — **정지점=PR까지**) ④완료 기준+보고 형식(실행한 테스트 원문, push SHA,
+**1분 넘는 테스트·빌드는 `wrk heavy -- <cmd>` 로만 — 같은 head 에서 세션당 최대 1회**;
+`flock` 명령은 브리프에 직접 쓰지 않는다 — macOS 에는 없다, §4.x-3)
 ⑤금지사항 ⑥보고 채널=**파일 인박스**(orch에 send 금지 — 타이핑 충돌). 신규 job부터
 `~/work/herdr-inbox/jobs/<job_id>/`를 쓰고 `job_id=<이슈>-<단계>-<YYYYMMDD-HHMM>` 형식으로
 정확한 보고 경로를 브리프에 명시한다(추측하게 두지 말 것). **기존 루트의 flat 파일은
@@ -539,6 +541,24 @@ cwd_keys = {"<local-worktree>"="repo-a"}
   SSH로 조용히 되돌리지 않으며, `--host local` 또는 hosts.toml 보완을 안내한다. lost·인증
   실패·hub 오류도 같은 원칙으로 종료한다.
 
+### 4.x-3 무거운 로컬 실행 (호스트당 1개 — `wrk heavy`)
+
+"무거운 실행" = **1분 넘게 도는 어떤 테스트·빌드**(auto_trader·scopefuel full pytest, hk
+`go test -race`·vitest, panewire `go test ./...`, agent-skills `test-wrk.sh` — scopefuel 도
+포함이다). 반드시 `wrk heavy -- <cmd>` 로 감싼다 — 호스트당 락 1개(`fcntl.flock`, mac·Linux
+동일), **같은 head 에서 세션(역할)당 최대 1회**(워커의 실행과 tester 의 독립 재실행은
+별개다), 대기 상한 20분(초과 시 rc=75 로 실패하고 보고서에 "heavy 대기
+초과" 기록, 락 없이 임의로 돌리지 않는다), `nice -n 10`, 시작 전 load5/ncpu ≥ 1.0 이면 대기.
+보유자·대기열은 `wrk heavy status` 로 본다.
+
+macOS 에는 `flock` 명령이 없으므로 **브리프에 셸 `flock` 문구를 직접 쓰지 않는다.** 09-24
+수동 규약(`flock /tmp/desktop-heavy-test.lock`)은 `wrk heavy` 로 대체됐다 — 그 파일을 직접
+잡는 브리프 문구는 `wrk heavy --` 호출로 읽는다(호환 메모: 파일 경로만 달라지고 직렬화
+의미는 같다. 단 전환기에는 옛 파일을 직접 잡는 진행 중 잡과 `wrk heavy` 가 서로를 배제하지
+못한다 — 새 브리프부터 갈음한다). 그 규약은 브리프 15건에서 누락됐고 `-o` 누락으로 락이
+1시간 새는 사고(v637)가 났다 — `wrk heavy` 는 락 fd 가 자식에 상속되지 않아 고아가 락을
+잡지 못한다.
+
 ## 5. 검증 루프 (스폰의 후반전)
 
 **강도는 §2-1의 T가 정한다.** T0=스폰 없음 / T1=자체검증 / T2=적대검증 1라운드 /
@@ -561,6 +581,10 @@ T3=아래 수렴형.
    verify worktree 에서도 tester 의 수정·커밋은 금지. 입력=이슈 AC+PR+경로만.
    "틀렸다고 가정하고 반증": 독립 테스트 재실행, false-green 탐지(assert 뒤집기),
    AC 대조, merge-base 기준 스코프 확인.
+   🔴 **뮤턴트는 커버 파일만 돌린다.** 뮤턴트마다 전체 스위트를 돌리지 않는다 — 뮤턴트 RED 는
+   커버 테스트의 assertion 실패로 증명한다(전체 스위트가 붉어져도 어느 assert 인지 못 읽으면
+   무효인 규칙과 같다). 같은 라운드 안에서 같은 전체 스위트를 두 번 돌리지 않는다.
+   scopefuel 의 3.11/3.13/3.14 매트릭스는 CI(6 job)가 돌리므로 로컬 실행은 파이썬 한 버전만.
    템플릿=`~/work/herdr-templates/VERIFY-TEMPLATE.txt`.
 4. **지적은 심각도를 붙여 보고하게 한다** — `BLOCKER`(동작 안 함·기존 기능 회귀·데이터 손상·
    계약 위반) / `SHOULD` / `NICE`.

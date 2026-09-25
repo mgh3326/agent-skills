@@ -70,7 +70,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | 도구 | 용도 |
 |---|---|
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
-| `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `reap`(끝난 pane 회수, 기본 dry-run) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정). `wrk --help` 로 전체 확인 |
+| `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `reap`(끝난 pane 회수, 기본 dry-run) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정) · `heavy`(>1분 로컬 실행의 호스트 직렬화 락, `-- <cmd>`·`status`). `wrk --help` 로 전체 확인 |
 | `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(path·linear_permit의 fencing lease + quota_pool의 비배타 실행 기록) · `status`(읽기 전용) · `gc`(배타 lease 만료 전이 + 설치된 `herdr agent list`와 대조해 stale 기록 정리; JSON 경로 fixture도 지원) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
 
 ## 의존 도구
@@ -94,6 +94,8 @@ wrk joined JOB --pr URL --head SHA --report PATH
 wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders]
 wrk find <이름|라벨> [--pane-only]
 wrk name-sync [--apply|<라벨>...]
+wrk heavy -- <cmd>     # 호스트당 1개, 대기 상한 20분(rc 75), nice -n 10, load5/ncpu<1.0 게이트
+wrk heavy status       # 보유자·대기열
 ```
 
 `-m`은 필수이며 `codex-terra`, `codex-luna`, `codex-sol`처럼 모델을 드러내는
