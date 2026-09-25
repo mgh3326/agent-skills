@@ -4969,18 +4969,33 @@ expect_exit 0 "$WRK" heavy status
 expect_exit 1 "$WRK" heavy -- false
 expect_exit 127 "$WRK" heavy -- definitely-not-a-real-binary-721
 
-# the default lock path really is the per-host /tmp file.
+# the default lock path resolves to the per-host /tmp file — asserted
+# through `wrk heavy status` output only. Never rm the real lock file or
+# its .waiters dir: other sessions serialize on that inode, and unlinking
+# it mid-hold splits the host queue (r2 finding N1).
 default_lock="$(python3 -c 'import socket; print("/tmp/wrk-heavy-%s.lock" % socket.gethostname())')"
-env -u WRK_HEAVY_LOCK "$WRK" heavy -- true || fail "default-path run failed"
-[[ -f "$default_lock" ]] || fail "default lock path not used: $default_lock"
-rm -f "$default_lock"; rm -rf "$default_lock.waiters"
+env -u WRK_HEAVY_LOCK "$WRK" heavy status | grep -qF "lock $default_lock" ||
+  fail "default lock path not used"
 
-# the command runs under nice -n 10 (10 or deeper when the suite itself is
-# already niced by an outer wrk heavy).
-"$WRK" heavy -- bash "$TMP/nice.sh" || fail "nice check run failed"
-read -r nice_val <"$TMP/heavy-nice.val"
-[[ "$nice_val" =~ ^[0-9]+$ && "$nice_val" -ge 10 ]] ||
-  fail "command did not run under nice -n 10 (nice=$nice_val)"
+# the command runs under nice -n 10 — asserted relative to this suite's own
+# nice value so the check still has teeth when the suite itself is already
+# niced by an outer wrk heavy (dogfood run). The probe gates hosts where
+# nice is inert (some CI macOS images report 0 for a niced child).
+suite_nice="$(ps -o nice= -p "$$" | tr -d ' ')"
+nice_probe="$(nice -n 10 sh -c 'ps -o nice= -p $$' 2>/dev/null | tr -d ' ')"
+nice_ceiling="$(nice -n 40 sh -c 'ps -o nice= -p $$' 2>/dev/null | tr -d ' ')"
+if [[ "$suite_nice" =~ ^[0-9]+$ && "$nice_probe" =~ ^[0-9]+$ &&
+      "$nice_ceiling" =~ ^[0-9]+$ && "$nice_probe" -gt "$suite_nice" ]]; then
+  expected=$(( suite_nice + 10 ))
+  (( expected > nice_ceiling )) && expected="$nice_ceiling"
+  "$WRK" heavy -- bash "$TMP/nice.sh" || fail "nice check run failed"
+  nice_val=""
+  read -r nice_val <"$TMP/heavy-nice.val" || true
+  [[ "$nice_val" =~ ^[0-9]+$ && "$nice_val" -ge "$expected" ]] ||
+    fail "command not under nice -n 10 (suite=$suite_nice got=$nice_val want>=$expected)"
+else
+  echo "SKIP nice assertion: nice(1) has no observable effect here"
+fi
 
 # a released lock leaves no stale holder record behind.
 [[ ! -s "$HEAVY_LOCK" ]] || fail "released lock file still carries holder info"
@@ -5019,6 +5034,23 @@ out="$(WRK_HEAVY_WAIT_CAP=5 "$WRK" heavy -- "$WRK" heavy -- true 2>&1)" || rc=$?
 [[ "$rc" == 0 ]] || fail "nested wrk heavy must not block to the cap, got rc=$rc"
 grep -q 'already holding' <<<"$out" || fail "nested run must say it skipped the lock: $out"
 echo "PASS heavy-nested-run-does-not-deadlock"
+
+# a stale or forged WRK_HEAVY_HELD must not bypass the lock — bypass needs a
+# pid that is alive AND recorded as the holder in the lock file (an orphan
+# that outlives its holder still carries the env var).
+out="$(WRK_HEAVY_HELD="$HEAVY_LOCK:999999" "$WRK" heavy -- true 2>&1)"
+if grep -q 'already holding' <<<"$out"; then
+  fail "dead-pid WRK_HEAVY_HELD bypassed the lock"
+fi
+out="$(WRK_HEAVY_HELD="$HEAVY_LOCK:$$" "$WRK" heavy -- true 2>&1)"
+if grep -q 'already holding' <<<"$out"; then
+  fail "live non-holder WRK_HEAVY_HELD bypassed the lock"
+fi
+echo "PASS heavy-held-env-needs-live-holder"
+
+# a command killed by a signal maps to 128+sig (TERM → 143).
+expect_exit 143 "$WRK" heavy -- sh -c 'kill -TERM $$'
+echo "PASS heavy-signal-exit-mapped"
 
 # wait cap: a waiter gives up with rc 75 once the cap is exceeded, without
 # running its command.

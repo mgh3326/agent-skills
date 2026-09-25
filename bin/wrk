@@ -4951,16 +4951,19 @@ minutes; on expiry the command is NOT run and wrk exits 75 (EX_TEMPFAIL).
 The lock fd is never inherited by the command, so an orphaned child cannot
 keep the lock held (the desktop flock -o leak, v637).
 
-`wrk heavy status` prints the current holder and queued waiters (the holder
-pid is the wrk heavy python process; killing it releases the lock even while
-the command's orphaned children keep running).
+`wrk heavy status` prints the lock path, the current holder, and queued
+waiters (the holder pid is the wrk heavy python process; killing it releases
+the lock even while the command's orphaned children keep running).
 
 Notes: the command's own exit 75 is indistinguishable from a wait-cap 75 —
 check stderr. stdin is not forwarded (the command sees EOF). A nested
 `wrk heavy` on the same lock is detected and run directly under nice — the
 outer invocation already serializes the host, so nesting never deadlocks.
 
-Environment overrides (tests only):
+Environment:
+  WRK_HEAVY_HELD        <lock path>:<holder pid>, set by wrk heavy for its
+                        command so a nested wrk heavy is detected; ignored
+                        unless the pid is alive and is the recorded holder
   WRK_HEAVY_LOCK        lock file path
                         (default /tmp/wrk-heavy-<hostname>.lock)
   WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
@@ -5014,6 +5017,7 @@ waiters_dir = lock_path + ".waiters"
 if args[0] == "status":
     if len(args) != 1:
         fail("status takes no arguments", 2)
+    print("lock " + lock_path)
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
     try:
         try:
@@ -5087,10 +5091,22 @@ def load_ratio():
         return None
 
 
+def holder_pid():
+    info = read_text(lock_path)
+    first = info.split(None, 1)[0] if info else ""
+    if first.startswith("pid="):
+        try:
+            return int(first[4:])
+        except ValueError:
+            pass
+    return -1
+
+
 def run_command():
     try:
         env = dict(os.environ)
-        env["WRK_HEAVY_HELD"] = os.path.abspath(lock_path)
+        env["WRK_HEAVY_HELD"] = "%s:%d" % (
+            os.path.abspath(lock_path), os.getpid())
         rc = subprocess.call(["nice", "-n", "10"] + cmd, env=env)
         if rc < 0:
             rc = 128 - rc
@@ -5103,8 +5119,14 @@ def run_command():
 
 # A nested `wrk heavy` on the same lock would deadlock against itself for the
 # full cap — the outer invocation already serializes this host, so run the
-# inner command directly (still under nice).
-if os.environ.get("WRK_HEAVY_HELD") == os.path.abspath(lock_path):
+# inner command directly (still under nice). The env value alone is not proof
+# (an orphan can outlive its holder and still carry it): the named holder pid
+# must be alive AND be the pid recorded in the lock file.
+held_env = os.environ.get("WRK_HEAVY_HELD", "")
+held_path, sep, held_pid = held_env.rpartition(":")
+if (sep and held_pid.isdigit()
+        and os.path.realpath(held_path) == os.path.realpath(lock_path)
+        and int(held_pid) == holder_pid() and alive(int(held_pid))):
     print("wrk heavy: already holding %s in this process tree -- "
           "running nested command without re-locking" % lock_path,
           file=sys.stderr)
@@ -5131,6 +5153,9 @@ try:
                 fail("wait cap %.0fs exceeded waiting for the host lock %s "
                      "-- command not run" % (cap, lock_path), EXIT_WAIT_CAP)
             time.sleep(0.5)
+        except KeyboardInterrupt:
+            fail("interrupted while waiting for the host lock %s "
+                 "-- command not run" % lock_path, 130)
     try:
         os.remove(me)
     except OSError:
@@ -5138,13 +5163,17 @@ try:
     os.ftruncate(fd, 0)
     os.write(fd, (info + "\n").encode())
     while True:
-        ratio = load_ratio()
-        if ratio is None or ratio < 1.0:
-            break
-        if time.monotonic() >= deadline:
-            fail("wait cap %.0fs exceeded waiting for load5/ncpu %.2f < 1.0 "
-                 "-- command not run" % (cap, ratio), EXIT_WAIT_CAP)
-        time.sleep(1)
+        try:
+            ratio = load_ratio()
+            if ratio is None or ratio < 1.0:
+                break
+            if time.monotonic() >= deadline:
+                fail("wait cap %.0fs exceeded waiting for load5/ncpu %.2f "
+                     "< 1.0 -- command not run" % (cap, ratio), EXIT_WAIT_CAP)
+            time.sleep(1)
+        except KeyboardInterrupt:
+            fail("interrupted while waiting for load to drop "
+                 "-- command not run", 130)
     raise SystemExit(run_command())
 finally:
     try:
