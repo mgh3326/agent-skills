@@ -4938,7 +4938,14 @@ minutes; on expiry the command is NOT run and wrk exits 75 (EX_TEMPFAIL).
 The lock fd is never inherited by the command, so an orphaned child cannot
 keep the lock held (the desktop flock -o leak, v637).
 
-`wrk heavy status` prints the current holder and queued waiters.
+`wrk heavy status` prints the current holder and queued waiters (the holder
+pid is the wrk heavy python process; killing it releases the lock even while
+the command's orphaned children keep running).
+
+Notes: the command's own exit 75 is indistinguishable from a wait-cap 75 —
+check stderr. stdin is not forwarded (the command sees EOF). A nested
+`wrk heavy` on the same lock is detected and run directly under nice — the
+outer invocation already serializes the host, so nesting never deadlocks.
 
 Environment overrides (tests only):
   WRK_HEAVY_LOCK        lock file path
@@ -5015,13 +5022,16 @@ if args[0] == "status":
     for name in names:
         path = os.path.join(waiters_dir, name)
         info = read_text(path)
+        # The pid is the first field of the record we write — never scan
+        # later fields, or a `pid=` token inside the command text would make
+        # a live waiter look dead here.
         pid = -1
-        for field in info.split():
-            if field.startswith("pid="):
-                try:
-                    pid = int(field[4:])
-                except ValueError:
-                    pass
+        first = info.split(None, 1)[0] if info else ""
+        if first.startswith("pid="):
+            try:
+                pid = int(first[4:])
+            except ValueError:
+                pass
         if pid > 0 and not alive(pid):
             try:
                 os.remove(path)
@@ -5064,12 +5074,36 @@ def load_ratio():
         return None
 
 
+def run_command():
+    try:
+        env = dict(os.environ)
+        env["WRK_HEAVY_HELD"] = os.path.abspath(lock_path)
+        rc = subprocess.call(["nice", "-n", "10"] + cmd, env=env)
+        if rc < 0:
+            rc = 128 - rc
+        return rc
+    except FileNotFoundError as e:
+        fail("cannot run command: %s" % e, 127)
+    except KeyboardInterrupt:
+        return 130
+
+
+# A nested `wrk heavy` on the same lock would deadlock against itself for the
+# full cap — the outer invocation already serializes this host, so run the
+# inner command directly (still under nice).
+if os.environ.get("WRK_HEAVY_HELD") == os.path.abspath(lock_path):
+    print("wrk heavy: already holding %s in this process tree -- "
+          "running nested command without re-locking" % lock_path,
+          file=sys.stderr)
+    raise SystemExit(run_command())
+
 os.makedirs(waiters_dir, exist_ok=True)
 me = os.path.join(waiters_dir, str(os.getpid()))
 held = False
 # PEP 446: os.open returns a non-inheritable fd, so the command's process
-# tree never holds the lock — killing wrk heavy (or the command exiting)
-# releases it even while orphaned children keep running.
+# tree never holds the lock — when this python process (the pid shown by
+# `wrk heavy status`) dies or the command exits, the lock is released even
+# while orphaned children keep running.
 fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
 try:
     with open(me, "w", encoding="utf-8") as f:
@@ -5098,13 +5132,7 @@ try:
             fail("wait cap %.0fs exceeded waiting for load5/ncpu %.2f < 1.0 "
                  "-- command not run" % (cap, ratio), EXIT_WAIT_CAP)
         time.sleep(1)
-    try:
-        rc = subprocess.call(["nice", "-n", "10"] + cmd)
-        if rc < 0:
-            rc = 128 - rc
-    except FileNotFoundError as e:
-        fail("cannot run command: %s" % e, 127)
-    raise SystemExit(rc)
+    raise SystemExit(run_command())
 finally:
     try:
         os.remove(me)
