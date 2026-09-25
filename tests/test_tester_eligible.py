@@ -177,6 +177,12 @@ class EligibilityFixtures(unittest.TestCase):
         self.assertEqual(set(names), set(self.policy["profiles"]))
         for name in names:
             self.assertIsNotNone(common._wrk_clause((ROOT / "bin/wrk").read_text(), name), name)
+            spec = self.policy["profiles"][name]
+            if spec.get("roles") and spec["grades"].get(spec["default_effort"]) in common.GRADES:
+                _, check = common.resolve_profile(name, self.policy,
+                                                  actual_effort=spec["default_effort"],
+                                                  role=spec["roles"][0])
+                self.assertEqual(check["status"], "PASS", name)
 
     def test_same_family_missing_and_skipped_ci(self) -> None:
         evidence = self.evidence(self.make_head(), required_grade="A+", implementation_grade="A+")
