@@ -130,7 +130,10 @@ def resolve_profile(alias: str, policy: dict, *, actual_model: str | None = None
         if token and token not in clause:
             return None, result("UNVERIFIED", "POLICY_CONFLICT", "bin/wrk:resolve_profile")
         default_match = re.search(r"DEFAULT_EFFORT=([a-z]+)", clause)
-        default = default_match.group(1) if default_match else spec.get("default_effort", "")
+        if 'DEFAULT_EFFORT="${MODEL##*-}"' in clause:
+            default = alias.rsplit("-", 1)[-1]
+        else:
+            default = default_match.group(1) if default_match else spec.get("default_effort", "")
         if default != spec.get("default_effort", ""):
             return None, result("UNVERIFIED", "POLICY_CONFLICT", "bin/wrk:resolve_profile")
         effort = actual_effort if actual_effort is not None else default

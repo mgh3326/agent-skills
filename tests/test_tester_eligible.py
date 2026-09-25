@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import tempfile
@@ -285,6 +286,33 @@ class EligibilityFixtures(unittest.TestCase):
         with mock.patch.object(eligible, "resolve_profile", wrong_family):
             with self.assertRaises(AssertionError):
                 self.assert_case(self.check(same_family), "independence", "FAIL", "SAME_FAMILY_T3")
+
+        low_grade = self.evidence(same_family["head"], required_grade="A+", implementation_grade="A+")
+        low_grade["tester"] = {"planned_profile": "devin-ds41-max", "planned_effort": ""}
+        def inherited_grade(alias, policy, **kwargs):
+            profile, check = original_resolve(alias, policy, **kwargs)
+            if alias == "devin-ds41-max" and profile:
+                profile["grade"] = "A+"
+            return profile, check
+        with mock.patch.object(eligible, "resolve_profile", inherited_grade):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(low_grade), "grade", "FAIL", "TESTER_GRADE_LOW")
+
+        quoted = self.landed(self.evidence(self.make_head("src/third.py")))
+        quoted_report = Path(self.temp.name) / "quoted.md"
+        quoted_report.write_text("> VERDICT: PASS @" + quoted["head"] + "\n")
+        quoted["tester"].update(report_path=str(quoted_report), report_sha256=common.sha256_file(quoted_report))
+        with mock.patch.object(eligible, "VERDICT", re.compile(r"^> ?VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})$")):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(quoted, "pre-merge"), "report", "UNVERIFIED", "VERDICT_MISSING")
+
+        stale = self.landed(self.evidence(self.make_head("src/fourth.py")))
+        def reused_receipt(*args):
+            return ({}, common.result("PASS", "PREVIOUS_RECEIPT_BOUND", "mutant"))
+        stale["head"] = self.make_head("src/fifth.py")
+        with mock.patch.object(eligible, "_read_previous", reused_receipt):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(stale, "post-landing"), "prior", "UNVERIFIED", "HEAD_CHANGED")
 
     def test_audit_counts_missing_late_and_reused_receipts(self) -> None:
         jobs = Path(self.temp.name) / "jobs"

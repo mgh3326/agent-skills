@@ -73,6 +73,8 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `reap`(끝난 pane 회수, 기본 dry-run) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정). `wrk --help` 로 전체 확인 |
 | `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(path·linear_permit의 fencing lease + quota_pool의 비배타 실행 기록) · `status`(읽기 전용) · `gc`(배타 lease 만료 전이 + 설치된 `herdr agent list`와 대조해 stale 기록 정리; JSON 경로 fixture도 지원) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
 
+Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and writes a receipt. Usage and audit: [director/tester-eligible.md](director/tester-eligible.md).
+
 ## 의존 도구
 
 | 도구 | 용도 | 폴백 |
