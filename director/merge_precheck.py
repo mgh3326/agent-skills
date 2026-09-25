@@ -27,17 +27,17 @@ from typing import Any
 from urllib.parse import quote
 
 from ci_canonical import evaluate_required_ci
-from gate_common import POLICY_PATH, PolicyError, file_ref, load_policy, sha256_bytes, write_receipt
+from gate_common import DEFAULT_POLICY as POLICY_PATH, file_ref, load_policy, sha256_bytes, write_receipt
 
 
-VERSION = "merge-precheck/1.1.3"
+VERSION = "merge-precheck/1.2.0"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})\s*$")
 META = re.compile(r"^(TASK|REPO|PR|TESTER_JOB|TESTER_SESSION|HEAD|OWNER|JOIN):\s*(.+?)\s*$")
 DISPOSITION = re.compile(r"\bdisposition(?:_ref)?:\s*([^\s,;]+)", re.I)
 ISSUE = re.compile(r"^\s*(?:[-*]\s*)?(?:\*\*)?(BLOCKER|RISK)(?:\*\*)?(?:[- ]\d+)?\s*(?::|[—–-])\s*(.*)$", re.I)
-ARTIFACT_SHA = re.compile(r"(?i)\b(?:artifact|binary|image|deploy|sha256)\b[^\n]{0,100}\b([0-9a-f]{64})\b")
+ARTIFACT_SHA = re.compile(r"(?i)(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])")
 SENSITIVE = {
     "private_address": re.compile(r"\b(?:10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.(?:\d{1,3}\.)\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})\b"),
     "pane_identifier": re.compile(r"\bw[A-Za-z0-9]+:p[A-Za-z0-9]+\b"),
@@ -182,7 +182,7 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
                 fence = None
             continue
         if quote_open:
-            if stripped and not marker and not re.match(r"^#{1,6}\s+", line):
+            if stripped and not marker and not re.match(r"^ {0,3}#{1,6}[ \t]+", line):
                 continue
             quote_open = False
         if re.match(r"^\s*>", line):
@@ -198,7 +198,7 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
         if "<!--" in line:
             html_comment = "-->" not in line.split("<!--", 1)[1]
             continue
-        heading = re.match(r"^(#{1,6})\s+(.+)$", line)
+        heading = re.match(r"^ {0,3}(#{1,6})[ \t]+(.+)$", line)
         if heading:
             level = len(heading.group(1))
             if brief_level is not None and (brief_level == 0 or level <= brief_level):
@@ -325,7 +325,7 @@ def classify_surface(files: list[dict[str, Any]], repo: str, policy: dict[str, A
     for file in files:
         path = file.get("filename", "")
         low = path.lower()
-        if "migration" in low or low.startswith("alembic/"):
+        if "migration" in low or "/migrate/" in "/" + low or low.startswith("alembic/"):
             flags.append("migration")
         if low.startswith(("config/", "deploy/", ".github/")) or any(word in low for word in ("settings", "config", "requirements")) or low in {"pyproject.toml", "uv.lock", "dockerfile"} or low.endswith((".service", ".service.example", ".toml", ".yaml", ".yml")):
             flags.append("config")
@@ -349,7 +349,7 @@ def check_diff(snapshot: dict[str, Any], policy: dict[str, Any]) -> tuple[dict[s
         return result("UNVERIFIED", "SCANNER_FAILED"), surface
     for f in files:
         path = f.get("filename", "")
-        if f.get("status") == "added" and any(fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, "*/" + pattern) for pattern in policy.get("artifact_paths", [])):
+        if f.get("status") == "added" and any(fnmatch.fnmatch(path.lower(), pattern.lower()) or fnmatch.fnmatch(path.lower(), "*/" + pattern.lower()) for pattern in policy.get("artifact_paths", [])):
             return result("FAIL", "BUILD_ARTIFACT_ADDED", hits=[{"location": path, "class": "build_artifact"}], scanner=scan["scanner"], version=scan["version"]), surface
     hits = scan.get("hits", [])
     if hits:
@@ -416,9 +416,11 @@ def check_runtime(snapshot: dict[str, Any], policy: dict[str, Any]) -> dict[str,
     if len(matched) > 1:
         return result("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN")
     if not matched:
-        relevant = [p for p in paths if p.lower().endswith((".py", ".service", ".service.example", "dockerfile", "pyproject.toml", "uv.lock"))
+        relevant = [p for p in paths if p.lower().endswith((".py", ".service", ".service.example", "dockerfile", "pyproject.toml", "uv.lock", "poetry.lock", "pipfile.lock"))
                     or fnmatch.fnmatch(Path(p).name.lower(), "requirements*.txt")
-                    or p.lower().startswith(("runners/", "deploy/", "scripts/"))]
+                    or p.lower().startswith(("runners/", "deploy/", "scripts/"))
+                    or "/scripts/" in "/" + p.lower() or "/migrate/" in "/" + p.lower()
+                    or "migration" in p.lower()]
         if relevant:
             return result("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN")
         return result("N/A", "RUNTIME_SURFACE_ABSENT", policy_ref="runtime")
@@ -768,28 +770,28 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--policy", default=str(POLICY_PATH))
     parser.add_argument("--since")
     args = parser.parse_args(argv)
-    try:
-        policy, policy_ref = load_policy(args.policy)
-    except PolicyError as exc:
+    policy, policy_check = load_policy(Path(args.policy), merge_required=True)
+    if policy_check["status"] != "PASS":
         if args.repo == "audit":
-            print(json.dumps({"status": "UNVERIFIED", "reason_code": exc.code}, sort_keys=True))
+            print(json.dumps({"status": "UNVERIFIED", "reason_code": policy_check["reason_code"]}, sort_keys=True))
             return 2
         try:
             ref = file_ref(args.policy)
         except OSError:
             ref = {"path": str(Path(args.policy).expanduser().resolve()), "sha256": None}
-        checks = {f"G{number}": result("UNVERIFIED", exc.code) for number in range(1, 11)}
+        checks = {f"G{number}": result("UNVERIFIED", policy_check["reason_code"]) for number in range(1, 11)}
         receipt = {"action_id": uuid.uuid4().hex, "kind": "merge", "task": args.task, "job": args.job,
                    "repo": args.repo, "PR": args.pr, "H": None, "B": None, "M": None,
-                   "policy": {**ref, "revision": None}, "tool_version": VERSION,
+                   "policy": {**ref, "revision": policy.get("revision") if isinstance(policy, dict) else None}, "tool_version": VERSION,
                    "issuer": args.issuer, "time": iso_now(), "evidence": {}, "checks": checks}
         try:
             path = write_receipt(receipt, args.receipt_dir)
         except (OSError, ValueError):
             print("merge-precheck UNVERIFIED RECEIPT_WRITE_FAILED")
             return 2
-        print(f"merge-precheck UNVERIFIED {exc.code} receipt={path}")
+        print(f"merge-precheck UNVERIFIED {policy_check['reason_code']} receipt={path}")
         return 1
+    policy_ref = {**file_ref(args.policy), "revision": policy["revision"]}
     if args.repo == "audit":
         finding = audit(Path(args.receipt_dir), policy, args.since or policy["effective_at"])
         print(json.dumps(finding, sort_keys=True))

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import sys
 import tempfile
 import unittest
@@ -17,7 +18,7 @@ sys.path.insert(0, str(ROOT / "director"))
 
 import merge_precheck as gate
 import ci_canonical
-from gate_common import PolicyError, load_policy, resolve_profile
+from gate_common import load_policy, resolve_profile, write_receipt
 
 
 H = "a" * 40
@@ -27,7 +28,10 @@ OTHER = "d" * 40
 
 
 def policy() -> dict:
-    return load_policy(ROOT / "director/gate-policy.v1.json", datetime(2026, 9, 26, tzinfo=timezone.utc))[0]
+    loaded, check = load_policy(ROOT / "director/gate_policy.json", now=datetime(2026, 9, 26, tzinfo=timezone.utc), merge_required=True)
+    if check["status"] != "PASS":
+        raise AssertionError(check)
+    return loaded
 
 
 def snapshot() -> dict:
@@ -165,33 +169,30 @@ class MergePrecheckTests(unittest.TestCase):
         assert_check(self, s, "G1", "FAIL", "ELIGIBILITY_NOT_PASS")
         s["eligibility_receipt"]["data"]["checks"] = {"family": {"status": "FAIL", "reason_code": "T3_SAME_FAMILY"}}
         assert_check(self, s, "G1", "FAIL", "ELIGIBILITY_NOT_PASS")
-        self.assertEqual("A+ reversible T1/T2 verification only", policy()["sources"]["provider_grade"]["scope"])
+        self.assertIn("A+ reversible T1/T2", policy()["sources"]["decision/2026-09-20/provider-family-and-ds41-grade"]["scope"])
 
     def test_policy_unknown_stale_conflict(self) -> None:
-        path = ROOT / "director/gate-policy.v1.json"
-        with self.assertRaisesRegex(PolicyError, "POLICY_STALE"):
-            load_policy(path, datetime(2026, 10, 3, tzinfo=timezone.utc))
+        path = ROOT / "director/gate_policy.json"
+        self.assertEqual("POLICY_STALE", load_policy(path, now=datetime(2026, 10, 3, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
         with tempfile.TemporaryDirectory() as directory:
             p = json.loads(path.read_text())
             p["conflicts"] = ["test conflict"]
             target = Path(directory) / "policy.json"
             target.write_text(json.dumps(p))
-            with self.assertRaisesRegex(PolicyError, "POLICY_CONFLICT"):
-                load_policy(target, datetime(2026, 9, 26, tzinfo=timezone.utc))
+            self.assertEqual("POLICY_CONFLICT", load_policy(target, now=datetime(2026, 9, 26, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
             p["conflicts"] = []
             del p["ci"]["mgh3326/agent-skills"]
             target.write_text(json.dumps(p))
-            loaded = load_policy(target, datetime(2026, 9, 26, tzinfo=timezone.utc))[0]
-            self.assertEqual("CI_POLICY_UNKNOWN", gate.evaluate(snapshot(), loaded)["G3"]["reason_code"])
+            self.assertEqual("POLICY_CI_EXECUTION_UNKNOWN", load_policy(target, now=datetime(2026, 9, 26, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
+            self.assertEqual("CI_POLICY_UNKNOWN", gate.evaluate(snapshot(), p)["G3"]["reason_code"])
             for field, value, reason in (("runtime", [], "POLICY_RUNTIME_UNKNOWN"),
                                          ("artifact_paths", [], "POLICY_ARTIFACT_PATHS_UNKNOWN"),
                                          ("ci_execution_steps", {}, "POLICY_CI_EXECUTION_UNKNOWN"),
-                                         ("effective_at", {}, "POLICY_TIME_INVALID")):
+                                         ("effective_at", {}, "POLICY_CONFLICT")):
                 invalid = json.loads(path.read_text())
                 invalid[field] = value
                 target.write_text(json.dumps(invalid))
-                with self.assertRaisesRegex(PolicyError, reason):
-                    load_policy(target, datetime(2026, 9, 26, tzinfo=timezone.utc))
+                self.assertEqual(reason, load_policy(target, now=datetime(2026, 9, 26, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
 
     def test_ci_missing_skipped_and_later_red(self) -> None:
         s = snapshot()
@@ -232,6 +233,36 @@ class MergePrecheckTests(unittest.TestCase):
         mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_REQUIRED_STEP_MISSING", mutant["reason_code"])
+
+    def test_setup_step_cannot_stand_in_for_tests_and_run_time_is_chronological(self) -> None:
+        s = snapshot()
+        s["ci_jobs"][10][0]["steps"] = [{"name": "Setup Bash tests", "status": "completed", "conclusion": "success"}]
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_REQUIRED_STEP_MISSING")
+        with patch.object(ci_canonical, "_step_matches", side_effect=lambda marker, name: marker.casefold() in name.casefold()):
+            with self.assertRaises(AssertionError):
+                assert_check(self, s, "G3", "UNVERIFIED", "CI_REQUIRED_STEP_MISSING")
+        s = snapshot()
+        later = copy.deepcopy(s["ci_runs"][0])
+        later["id"] = 11
+        later["created_at"] = "2026-09-25T07:00:00.100Z"
+        later["conclusion"] = "failure"
+        s["ci_runs"].append(later)
+        s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
+        for job in s["ci_jobs"][11]:
+            job["run_id"] = 11
+            job["conclusion"] = "failure"
+        assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+        s["ci_runs"][1]["created_at"] = "unknown"
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_TIME_INVALID")
+
+    def test_receipt_writer_rejects_reuse_of_action_id(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            receipt = {"action_id": "fixed-id", "kind": "merge", "checks": {}}
+            path = write_receipt(receipt, Path(directory))
+            original = path.read_bytes()
+            with self.assertRaises(FileExistsError):
+                write_receipt({**receipt, "checks": {"G1": {"status": "PASS"}}}, Path(directory))
+            self.assertEqual(original, path.read_bytes())
 
     def test_ci_checkout_provenance_ignores_mutable_pr_base(self) -> None:
         s = snapshot()
@@ -296,13 +327,12 @@ class MergePrecheckTests(unittest.TestCase):
         assert_check(self, s, "G4", "UNVERIFIED", "CI_MERGE_TREE_MISMATCH")
 
     def test_actual_profile_differs_from_plan(self) -> None:
-        catalog = {"grok": {"provider": "xai", "model": "grok-4.7", "effort": "xhigh", "grade": "S"}}
-        with self.assertRaisesRegex(PolicyError, "PROFILE_ACTUAL_MISMATCH"):
-            resolve_profile("grok", catalog, {"provider": "xai", "model": "grok-4.7", "effort": "high"})
-        with self.assertRaisesRegex(PolicyError, "PROFILE_ACTUAL_MISMATCH"):
-            resolve_profile("grok", catalog, {"provider": "xai", "model": "grok-4.7", "effort": "xhigh", "grade": "A+"})
-        with self.assertRaisesRegex(PolicyError, "PROFILE_ACTUAL_MISMATCH"):
-            resolve_profile("grok", catalog, {"provider": "xai", "model": "grok-4.7", "effort": "xhigh"})
+        _, check = resolve_profile("grok", policy(), actual_model="grok-4.6", actual_effort="xhigh")
+        self.assertEqual("ACTUAL_MODEL_MISMATCH", check["reason_code"])
+        _, check = resolve_profile("grok", policy(), actual_model="grok-4.7", actual_effort="medium")
+        self.assertEqual("PROFILE_EFFORT_UNKNOWN", check["reason_code"])
+        resolved, check = resolve_profile("grok", policy(), actual_model="grok-4.7", actual_effort="xhigh")
+        self.assertEqual(("PASS", "S", "xhigh"), (check["status"], resolved["grade"], resolved["effort"]))
 
     def test_runtime_only_change_and_host_receipt(self) -> None:
         s = snapshot()
@@ -482,6 +512,53 @@ class MergePrecheckTests(unittest.TestCase):
             s["tester_report"] = gate.parse_report(str(path))
             assert_check(self, s, "G7", "PASS", "ISSUES_DISPOSED")
 
+    def test_indented_atx_brief_blocker_and_risks_are_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tester.md"
+            common = (f"TASK: 727\nREPO: mgh3326/agent-skills\nPR: 999\n"
+                      f"TESTER_JOB: task727-tester\nTESTER_SESSION: tester-grok\n")
+            path.write_text(common + f"VERDICT: BLOCKER @{H}\n # Brief\nVERDICT: PASS @{H}\n")
+            s = snapshot()
+            s["tester_report"] = gate.parse_report(str(path))
+            assert_check(self, s, "G1", "FAIL", "TESTER_BLOCKER")
+            source = (ROOT / "director/merge_precheck.py").read_text()
+            heading = r"^ {0,3}(#{1,6})[ \t]+(.+)$"
+            self.assertEqual(1, source.count(heading))
+            namespace: dict = {"__name__": "merge_precheck_heading_mutant"}
+            exec(source.replace(heading, r"^(#{1,6})[ \t]+(.+)$"), namespace)
+            mutant = namespace["parse_report"](str(path))
+            with self.assertRaises(AssertionError):
+                self.assertEqual("BLOCKER", mutant["verdict"])
+            for indent in (" ", "   "):
+                path.write_text(common + f"VERDICT: PASS @{H}\n{indent}# BLOCKER — unresolved defect\n")
+                s["tester_report"] = gate.parse_report(str(path))
+                assert_check(self, s, "G7", "FAIL", "BLOCKER_UNDISPOSED")
+                path.write_text(common + f"VERDICT: PASS @{H}\n{indent}# RISKS\n- host version unknown\n")
+                s["tester_report"] = gate.parse_report(str(path))
+                assert_check(self, s, "G7", "UNVERIFIED", "RISK_UNDISPOSED")
+
+    def test_sha256_spellings_and_line_break_require_receipt(self) -> None:
+        for body in ("SHA-256: ", "sha256sum ", "sha256:\n", ""):
+            with self.subTest(body=body):
+                s = snapshot()
+                s["pr_body"] = body + "e" * 64
+                assert_check(self, s, "G10", "UNVERIFIED", "ARTIFACT_HASH_RECEIPT_MISSING")
+                with patch.object(gate, "ARTIFACT_SHA", re.compile(r"(?i)\b(?:artifact|sha256)\b[^\n]{0,100}([0-9a-f]{64})")):
+                    with self.assertRaises(AssertionError):
+                        assert_check(self, s, "G10", "UNVERIFIED", "ARTIFACT_HASH_RECEIPT_MISSING")
+
+    def test_migration_runtime_and_casefolded_artifact(self) -> None:
+        s = snapshot()
+        s["files"] = [{"filename": "db/migrate/001_init.sql", "status": "modified", "patch": "@@ -1 +1 @@\n+changed"}]
+        assert_check(self, s, "G6", "UNVERIFIED", "SURFACE_CLASS_UNBOUND")
+        for path in ("foo/scripts/start.sh", "poetry.lock", "db/migrate/001_init.sql"):
+            s = snapshot()
+            s["files"] = [{"filename": path, "status": "modified", "patch": "@@ -1 +1 @@\n+changed"}]
+            assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_TARGET_UNKNOWN")
+        s = snapshot()
+        s["files"] = [{"filename": "build/Foo.PYC", "status": "added", "patch": "@@ -0,0 +1 @@\n+changed"}]
+        assert_check(self, s, "G5", "FAIL", "BUILD_ARTIFACT_ADDED")
+
     def test_structured_verdict_rejects_malformed_issue_list(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "tester.json"
@@ -505,7 +582,7 @@ class MergePrecheckTests(unittest.TestCase):
 
     def test_stale_policy_still_writes_receipt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            raw = json.loads((ROOT / "director/gate-policy.v1.json").read_text())
+            raw = json.loads((ROOT / "director/gate_policy.json").read_text())
             raw["expires_at"] = "2026-09-25T06:18:00Z"
             policy_path = Path(directory) / "policy.json"
             policy_path.write_text(json.dumps(raw))

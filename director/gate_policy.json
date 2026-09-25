@@ -1,8 +1,161 @@
 {
+  "artifact_paths": [
+    "*.pyc",
+    "*.class",
+    "*.o",
+    "*.a",
+    "*.so",
+    "*.dylib",
+    "*.exe",
+    "*.whl",
+    "*.tar.gz",
+    "*.zip",
+    "dist/**",
+    "build/**",
+    "target/**",
+    "node_modules/**",
+    "__pycache__/**"
+  ],
+  "ci": {
+    "mgh3326/agent-skills": {
+      ".github/workflows/ci.yml": [
+        "ubuntu-latest",
+        "macos-latest"
+      ]
+    },
+    "mgh3326/auto_trader": {
+      "branch_protection": [
+        "lint",
+        "taskiq-smoke",
+        "test (3.13, 1)",
+        "test (3.13, 2)",
+        "test (3.13, 3)",
+        "test (3.13, 4)"
+      ]
+    },
+    "mgh3326/auto_trader-operator": {
+      ".github/workflows/test.yml": [
+        "test"
+      ]
+    },
+    "mgh3326/handoffkeep": {
+      ".github/workflows/ci.yml": [
+        "test",
+        "vitest",
+        "build (darwin, arm64)",
+        "build (linux, amd64)",
+        "build (linux, arm64)"
+      ],
+      ".github/workflows/image.yml": [
+        "image"
+      ]
+    },
+    "mgh3326/panewire": {
+      ".github/workflows/ci.yml": [
+        "test (macos-latest)",
+        "test (ubuntu-latest)"
+      ]
+    },
+    "mgh3326/scopefuel": {
+      ".github/workflows/ci.yml": [
+        "test (macos-latest, 3.11)",
+        "test (macos-latest, 3.13)",
+        "test (macos-latest, 3.14)",
+        "test (ubuntu-latest, 3.11)",
+        "test (ubuntu-latest, 3.13)",
+        "test (ubuntu-latest, 3.14)"
+      ]
+    }
+  },
+  "ci_execution_steps": {
+    "mgh3326/agent-skills": {
+      "macos-latest": [
+        "Bash tests"
+      ],
+      "ubuntu-latest": [
+        "Bash tests"
+      ]
+    },
+    "mgh3326/auto_trader": {
+      "lint": [
+        "Run Ruff linter"
+      ],
+      "taskiq-smoke": [
+        "TaskIQ worker smoke test",
+        "TaskIQ scheduler smoke test"
+      ],
+      "test (3.13, 1)": [
+        "Run tests"
+      ],
+      "test (3.13, 2)": [
+        "Run tests"
+      ],
+      "test (3.13, 3)": [
+        "Run tests"
+      ],
+      "test (3.13, 4)": [
+        "Run tests"
+      ]
+    },
+    "mgh3326/auto_trader-operator": {
+      "test": [
+        "Run tests"
+      ]
+    },
+    "mgh3326/handoffkeep": {
+      "build (darwin, arm64)": [
+        "go build"
+      ],
+      "build (linux, amd64)": [
+        "go build"
+      ],
+      "build (linux, arm64)": [
+        "go build"
+      ],
+      "image": [
+        "Smoke test image"
+      ],
+      "test": [
+        "go test -race"
+      ],
+      "vitest": [
+        "npm test"
+      ]
+    },
+    "mgh3326/panewire": {
+      "test (macos-latest)": [
+        "go test"
+      ],
+      "test (ubuntu-latest)": [
+        "go test"
+      ]
+    },
+    "mgh3326/scopefuel": {
+      "test (macos-latest, 3.11)": [
+        "Test"
+      ],
+      "test (macos-latest, 3.13)": [
+        "Test"
+      ],
+      "test (macos-latest, 3.14)": [
+        "Test"
+      ],
+      "test (ubuntu-latest, 3.11)": [
+        "Test"
+      ],
+      "test (ubuntu-latest, 3.13)": [
+        "Test"
+      ],
+      "test (ubuntu-latest, 3.14)": [
+        "Test"
+      ]
+    }
+  },
+  "conflicts": [],
   "effective_at": "2026-09-25T00:00:00Z",
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "05613adab8b1178d1314c58f84fccad45e7f159332fb02645e81073cd74f2f1b",
+    ".github/workflows/ci.yml": "c8858121ad0610a61daad9b86ba62263aee3435a9210c90855f3ef8e47b14388",
     "bin/wrk": "842c5b499f321d6371533c79e266767967751ef26862bccb3ec62c35b11d916f",
     "checker/SKILL.md": "bf0046ccb21b96cf6562e32c47013694f1f08f16a3271ef363557fb3e204b573",
     "director/SKILL.md": "41003d23c2cc77b9d45fdb6058b0c48fa94ccd0f5ea408e43929abc02648e574",
@@ -1507,12 +1660,44 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-09-25.8",
+  "revision": "2026-09-25.9",
+  "runtime": {
+    "mgh3326/auto_trader-operator": [
+      {
+        "code_globs": [
+          "runners/**",
+          "deploy/**",
+          "scripts/**"
+        ],
+        "dependency_globs": [
+          "pyproject.toml",
+          "uv.lock",
+          "requirements*.txt"
+        ],
+        "interpreter": "/usr/bin/python3.11",
+        "service": "ncp-operator-runners",
+        "source": "runtime_fix",
+        "target": "NCP",
+        "version_prefix": "3.11."
+      }
+    ]
+  },
+  "runtime_unknown_repositories": [
+    "mgh3326/auto_trader",
+    "mgh3326/handoffkeep",
+    "mgh3326/scopefuel",
+    "mgh3326/panewire",
+    "mgh3326/agent-skills"
+  ],
   "schema": 1,
   "sources": {
     ".github/workflows/ci.yml": {
       "id": "shell-and-bash-tests",
       "scope": "required CI matrix job names"
+    },
+    "advice/2026-09-25/director-throughput-astra": {
+      "id": 3243,
+      "scope": "Q3 shadow merge precheck contract"
     },
     "bin/wrk": {
       "id": "resolve_profile",
@@ -1538,9 +1723,21 @@
       "id": "section 2-1,2-2,2-4",
       "scope": "T floor, grade, family rules"
     },
+    "task/660": {
+      "id": 660,
+      "scope": "independent artifact hash receipt"
+    },
+    "task/695": {
+      "id": 695,
+      "scope": "NCP operator Python 3.11 entrypoints"
+    },
     "task/704": {
       "id": 704,
       "scope": "E6 builder effort variants and launch role; source pinned by bin/wrk hash"
+    },
+    "task/712": {
+      "id": 712,
+      "scope": "gate evidence and surface rules"
     },
     "task/721": {
       "id": 721,
@@ -1548,7 +1745,7 @@
     },
     "task/723": {
       "id": 723,
-      "scope": "CI head/base/attempt evidence; required-check policy decision pending"
+      "scope": "canonical required repository CI jobs and execution steps at H, B and M"
     }
   },
   "surface_rules": {

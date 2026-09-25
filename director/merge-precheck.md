@@ -29,7 +29,7 @@ arguments detect a report changed after its earlier handoff.
 Required CI is evaluated by the importable entry point
 `director/ci_canonical.py:evaluate_required_ci(policy, repo, H, B, runs,
 jobs_by_run, protection_contexts)`. Task #723 should import that entry point.
-The required set is in `director/gate-policy.v1.json`; it contains only the
+The required set is in `director/gate_policy.json`; it contains only the
 repository's own test and build jobs. Every entry must have an actually run,
 successful GitHub Actions job at H with a run ID, attempt, and tested base SHA.
 The policy also names execution-step markers for each required job. Every
@@ -45,12 +45,13 @@ Missing branch protection is UNVERIFIED, not an empty required set. A skipped
 job is FAIL. A later red run supersedes older green evidence.
 
 The versioned policy artifact is loaded by `director/gate_common.py`, which
-also provides `write_receipt` and `resolve_profile` for task #726. Its source
+also provides `write_receipt` and `resolve_profile` for task #726. The merge
+caller requests merge-specific validation from the same loader. Its source
 references include decision 3231, advice 3243, the task #723 CI decision,
 and decision 2227. Decision 2227 only supports A+ reversible T1/T2 verification;
 it does not authorize T3, deployment, or safety work. An unknown, conflicting,
-or expired policy is UNVERIFIED. The sibling task should rebase and reuse this
-module and policy artifact, not copy them into a second loader.
+or expired policy is UNVERIFIED. This repository has one shared policy artifact
+and one shared loader for both shadow commands.
 
 ## Runtime receipt
 
@@ -83,6 +84,8 @@ JSON receipt with kind `artifact-hash`, repo, PR, H, issuer, sha256, and
 artifact_ref for each cited hash. Pass --hash-receipt more than once for
 multiple receipts, or use an artifacts array in one receipt. The issuer must be independent. This gate does not verify
 post-merge binary hashes.
+Any standalone 64-hex digest is conservatively treated as a cited SHA256,
+including SHA-256, sha256sum, and digest-on-next-line forms.
 
 ## Remote head and base race
 

@@ -42,6 +42,15 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def file_ref(path: str | Path) -> dict[str, str]:
+    source = Path(path).expanduser().resolve()
+    return {"path": str(source), "sha256": sha256_file(source)}
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -51,6 +60,8 @@ def iso_time(value: datetime) -> str:
 
 
 def parse_time(value: str) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("timestamp required")
     parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if parsed.tzinfo is None:
         raise ValueError("timezone required")
@@ -73,7 +84,8 @@ def overall(checks: dict) -> str:
 
 
 def load_policy(path: Path = DEFAULT_POLICY, *, now: datetime | None = None,
-                root: Path = ROOT) -> tuple[dict | None, dict]:
+                root: Path = ROOT, merge_required: bool = False) -> tuple[dict | None, dict]:
+    path = Path(path).expanduser().resolve()
     try:
         raw = path.read_bytes()
         policy = json.loads(raw)
@@ -96,6 +108,37 @@ def load_policy(path: Path = DEFAULT_POLICY, *, now: datetime | None = None,
             source = root / rel
             if not source.is_file() or sha256_file(source) != expected:
                 return policy, result("UNVERIFIED", "POLICY_STALE", rel)
+        if merge_required:
+            if policy.get("conflicts") != []:
+                return policy, result("UNVERIFIED", "POLICY_CONFLICT", "decision:3231")
+            for key, doc_id in (("advice/2026-09-25/director-throughput-astra", 3243),
+                                ("task/723", 723), ("task/695", 695), ("task/660", 660)):
+                if policy["sources"].get(key, {}).get("id") != doc_id:
+                    return policy, result("UNVERIFIED", "POLICY_CONFLICT", key)
+            ci = policy.get("ci")
+            if not isinstance(ci, dict) or not ci or any(not isinstance(jobs, list) or not jobs or
+                any(not isinstance(name, str) or not name for name in jobs)
+                for workflows in ci.values() if isinstance(workflows, dict) for jobs in workflows.values()) or any(
+                    not isinstance(workflows, dict) or not workflows for workflows in ci.values()):
+                return policy, result("UNVERIFIED", "POLICY_CI_UNKNOWN", "task:723")
+            steps = policy.get("ci_execution_steps")
+            if not isinstance(steps, dict) or set(steps) != set(ci) or any(
+                not isinstance(steps[repo], dict) or set(steps[repo]) != {name for names in workflows.values() for name in names} or
+                any(not isinstance(markers, list) or not markers or any(not isinstance(marker, str) or not marker for marker in markers) for markers in steps[repo].values())
+                for repo, workflows in ci.items()):
+                return policy, result("UNVERIFIED", "POLICY_CI_EXECUTION_UNKNOWN", "task:723")
+            if set(policy.get("required_ci_jobs_by_repo", {}).get("agent-skills", [])) != set(
+                ci.get("mgh3326/agent-skills", {}).get(".github/workflows/ci.yml", [])):
+                return policy, result("UNVERIFIED", "POLICY_CONFLICT", "task:723")
+            runtime = policy.get("runtime")
+            if not isinstance(runtime, dict) or not runtime or any(not isinstance(entries, list) or
+                any(not isinstance(entry, dict) or any(not entry.get(field) for field in
+                    ("service", "target", "interpreter", "version_prefix", "code_globs", "dependency_globs"))
+                    for entry in entries) for entries in runtime.values()) or not isinstance(policy.get("runtime_unknown_repositories"), list):
+                return policy, result("UNVERIFIED", "POLICY_RUNTIME_UNKNOWN", "task:695")
+            if not isinstance(policy.get("artifact_paths"), list) or not policy["artifact_paths"] or any(
+                not isinstance(pattern, str) or not pattern for pattern in policy["artifact_paths"]):
+                return policy, result("UNVERIFIED", "POLICY_ARTIFACT_PATHS_UNKNOWN", "task:660")
         return policy, result("PASS", "POLICY_CURRENT", "decision:3231")
     except (KeyError, TypeError, ValueError):
         return policy, result("UNVERIFIED", "POLICY_CONFLICT", "decision:3231")
@@ -209,8 +252,12 @@ def resolve_profile(alias: str, policy: dict, *, actual_model: str | None = None
 
 
 def write_receipt(receipt: dict, directory: Path) -> Path:
+    directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    name = f'{receipt["action_id"]}.json'
+    action_id = receipt["action_id"]
+    if not isinstance(action_id, str) or not re.fullmatch(r"[A-Za-z0-9_-]+", action_id):
+        raise ValueError("invalid action ID")
+    name = f'{action_id}.json'
     target = directory / name
     payload = (json.dumps(receipt, sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode()
     fd, temp_name = tempfile.mkstemp(prefix=".receipt-", dir=directory)
@@ -220,7 +267,7 @@ def write_receipt(receipt: dict, directory: Path) -> Path:
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temp_name, 0o600)
-        os.replace(temp_name, target)
+        os.link(temp_name, target)
     finally:
         if os.path.exists(temp_name):
             os.unlink(temp_name)

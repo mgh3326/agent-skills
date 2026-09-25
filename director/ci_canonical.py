@@ -9,6 +9,7 @@ as a successful repository CI job.
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 
@@ -17,6 +18,22 @@ EXCLUDED = ("CodeRabbit", "CommitCheck", "qlty", "AccessLint", "WIP", "GitGuardi
 
 def _result(status: str, code: str, **extra: Any) -> dict[str, Any]:
     return {"status": status, "reason_code": code, **extra}
+
+
+def _run_time(run: dict[str, Any]) -> datetime:
+    raw = run.get("created_at")
+    if not isinstance(raw, str):
+        raise ValueError("run timestamp missing")
+    instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if instant.tzinfo is None:
+        raise ValueError("run timestamp has no timezone")
+    return instant
+
+
+def _step_matches(marker: str, name: str) -> bool:
+    expected = marker.casefold().strip()
+    actual = name.casefold().strip()
+    return actual == expected or actual.startswith(expected + " ")
 
 
 def evaluate_required_ci(
@@ -54,6 +71,10 @@ def evaluate_required_ci(
     for workflow, expected in workflows.items():
         candidates = [run for run in runs if run.get("head_sha") == H and run.get("event") == "pull_request"
                       and (workflow == "branch_protection" or run.get("path") == workflow)]
+        try:
+            order = {id(run): _run_time(run) for run in candidates}
+        except (ValueError, TypeError):
+            return _result("UNVERIFIED", "CI_RUN_TIME_INVALID", jobs=observations)
         if workflow == "branch_protection":
             # The six protection contexts may live in several workflows. Jobs
             # are resolved by their actual workflow run, never status names alone.
@@ -61,11 +82,11 @@ def evaluate_required_ci(
             for run in candidates:
                 path = run.get("path")
                 old = latest_by_path.get(path)
-                if old is None or (run.get("created_at", ""), int(run.get("run_attempt") or 0)) > (old.get("created_at", ""), int(old.get("run_attempt") or 0)):
+                if old is None or (order[id(run)], int(run.get("run_attempt") or 0)) > (order[id(old)], int(old.get("run_attempt") or 0)):
                     latest_by_path[path] = run
             selected = list(latest_by_path.values())
         else:
-            selected = sorted(candidates, key=lambda r: (r.get("created_at", ""), int(r.get("run_attempt") or 0)))
+            selected = sorted(candidates, key=lambda r: (order[id(r)], int(r.get("run_attempt") or 0)))
             selected = selected[-1:] if selected else []
         if not selected:
             problems.extend((name, "CI_RUN_MISSING") for name in expected)
@@ -110,7 +131,7 @@ def evaluate_required_ci(
                 step_problem = None
                 for marker in execution[name]:
                     matched = [step for step in steps if isinstance(step, dict) and isinstance(step.get("name"), str)
-                               and marker.casefold() in step["name"].casefold()]
+                               and _step_matches(marker, step["name"])]
                     if len(matched) != 1:
                         step_problem = "CI_REQUIRED_STEP_MISSING" if not matched else "CI_STEP_AMBIGUOUS"
                         break
