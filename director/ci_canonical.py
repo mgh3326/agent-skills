@@ -19,12 +19,6 @@ def _result(status: str, code: str, **extra: Any) -> dict[str, Any]:
     return {"status": status, "reason_code": code, **extra}
 
 
-def _run_base(run: dict[str, Any]) -> str | None:
-    bases = {entry.get("base", {}).get("sha") for entry in (run.get("pull_requests") or []) if isinstance(entry, dict)}
-    bases.discard(None)
-    return next(iter(bases)) if len(bases) == 1 else None
-
-
 def evaluate_required_ci(
     policy: dict[str, Any], repo: str, H: str, B: str,
     runs: list[dict[str, Any]], jobs_by_run: dict[int, list[dict[str, Any]]],
@@ -33,8 +27,8 @@ def evaluate_required_ci(
     """Return PASS/FAIL/UNVERIFIED and exact run/job evidence for every R job.
 
     A whole workflow attempt is chosen. Rerunning one failed job cannot hide a
-    later red attempt. An event payload without its tested base SHA cannot
-    establish the re-CI rule and is UNVERIFIED.
+    later red attempt. The tested base comes from the checkout merge commit
+    recorded in an immutable job log, never the mutable pull_requests array.
     """
     workflows = policy.get("ci", {}).get(repo)
     if not isinstance(workflows, dict) or not workflows:
@@ -79,10 +73,17 @@ def evaluate_required_ci(
             if not possible:
                 problems.append((name, "CI_JOB_MISSING"))
                 continue
-            run, job = max(possible, key=lambda item: (item[0].get("created_at", ""), int(item[0].get("run_attempt") or 0)))
+            if len(possible) != 1:
+                conclusions = {job.get("conclusion") for _, job in possible}
+                code = "CI_SKIPPED" if "skipped" in conclusions else ("CI_FAILED" if any(value not in ("success", None) for value in conclusions) else "CI_JOB_AMBIGUOUS")
+                problems.append((name, code))
+                continue
+            run, job = possible[0]
             item = {"workflow": run.get("path"), "name": name, "run_id": run.get("id"),
                     "attempt": run.get("run_attempt"), "job_id": job.get("id"),
-                    "head_sha": run.get("head_sha"), "base_sha": _run_base(run),
+                    "head_sha": run.get("head_sha"), "base_sha": job.get("tested_base_sha"),
+                    "tested_merge_sha": job.get("tested_merge_sha"), "merge_tree": job.get("tested_merge_tree"),
+                    "base_source": "checkout_job_log_and_merge_parents" if job.get("tested_base_sha") else None,
                     "run_conclusion": run.get("conclusion"), "job_conclusion": job.get("conclusion")}
             observations.append(item)
             if run.get("head_sha") != H or job.get("head_sha") != H or job.get("run_id") != run.get("id"):
@@ -96,7 +97,7 @@ def evaluate_required_ci(
             elif not any(step.get("status") == "completed" and step.get("conclusion") == "success"
                          and step.get("name") not in {"Set up job", "Complete job"} for step in (job.get("steps") or [])):
                 problems.append((name, "CI_NOT_EXECUTED"))
-            elif item["base_sha"] is None:
+            elif not item["base_sha"] or not item["tested_merge_sha"] or not item["merge_tree"]:
                 problems.append((name, "CI_BASE_UNBOUND"))
             elif item["base_sha"] != B:
                 problems.append((name, "CI_BASE_MOVED"))

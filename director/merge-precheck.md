@@ -21,7 +21,8 @@ status and reason code, report path/SHA256, and CI run ID/attempt/job ID. A
 named report is read in full. A standalone `VERDICT: PASS @<full H>` after any
 brief/prompt section is accepted; quoted and fenced lines are ignored. The
 report must also name TASK, REPO, PR, TESTER_JOB, and TESTER_SESSION. A builder
-JOIN is not a tester PASS. A supplied `--eligibility-receipt` is bound to the
+JOIN is not a tester PASS. The tester completion record must contain the same
+report path and SHA256 as the bytes parsed by this command. A supplied `--eligibility-receipt` is bound to the
 same identifiers and its PASS/N/A checks. The optional expected report SHA256
 arguments detect a report changed after its earlier handoff.
 
@@ -31,6 +32,12 @@ jobs_by_run, protection_contexts)`. Task #723 should import that entry point.
 The required set is in `director/gate-policy.v1.json`; it contains only the
 repository's own test and build jobs. Every entry must have an actually run,
 successful GitHub Actions job at H with a run ID, attempt, and tested base SHA.
+For base provenance, the collector reads the immutable checkout commit from
+each successful job log, fetches that Git commit through the GitHub API, and
+uses its two parents and tree. The mutable pull_requests array on a workflow
+run is never evidence of the base tested by that run. If the log or commit
+lookup fails, the base is UNVERIFIED. G4 also requires the tested merge tree
+to equal the current trial merge tree.
 Missing branch protection is UNVERIFIED, not an empty required set. A skipped
 job is FAIL. A later red run supersedes older green evidence.
 
@@ -57,13 +64,14 @@ task #695. This tool does not contact NCP. A receipt has this shape:
       "observed_at": "2026-09-25T08:00:00Z",
       "exec_start": "/usr/bin/python3.11 /srv/auto-trader-operator/runners/h1_pilot_runner.py",
       "interpreter": "/usr/bin/python3.11", "version": "3.11.9",
-      "os": "linux", "arch": "x86_64", "lock_ref": "uv.lock@H",
-      "dependencies_ref": "pyproject.toml@H", "proof_ref": "host-observation/ID"
+      "os": "linux", "arch": "x86_64", "lock_ref": "uv.lock@FULL_40_HEX_SHA",
+      "dependencies_ref": "pyproject.toml@FULL_40_HEX_SHA", "proof_ref": "host-observation/ID"
     }
 
 The receipt is accepted only at the same H/PR/service/target, when observed
 within 24 hours by an issuer other than the precheck issuer, and when its
-ExecStart contains the mapped absolute interpreter. A PATH-based `python3
+ExecStart starts with the mapped absolute interpreter. Lock and dependency
+refs must end with the exact H. A PATH-based `python3
 --version` observation alone is never proof of the service interpreter.
 Installers still need a fresh predeployment comparison.
 

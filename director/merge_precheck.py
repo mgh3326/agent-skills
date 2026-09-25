@@ -17,6 +17,7 @@ import fnmatch
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import uuid
@@ -29,7 +30,7 @@ from ci_canonical import evaluate_required_ci
 from gate_common import POLICY_PATH, PolicyError, file_ref, load_policy, sha256_bytes, write_receipt
 
 
-VERSION = "merge-precheck/1.0.0"
+VERSION = "merge-precheck/1.1.0"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})\s*$")
@@ -61,6 +62,13 @@ def parse_time(value: str) -> datetime:
 
 def run_json(argv: list[str], timeout: int = 30) -> Any:
     try:
+        return json.loads(run_text(argv, timeout))
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("LOOKUP_INVALID_JSON") from exc
+
+
+def run_text(argv: list[str], timeout: int = 30) -> str:
+    try:
         completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError("LOOKUP_TIMEOUT") from exc
@@ -68,14 +76,45 @@ def run_json(argv: list[str], timeout: int = 30) -> Any:
         raise RuntimeError("LOOKUP_UNAVAILABLE") from exc
     if completed.returncode:
         raise RuntimeError("LOOKUP_FAILED")
-    try:
-        return json.loads(completed.stdout)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("LOOKUP_INVALID_JSON") from exc
+    return completed.stdout
 
 
 def gh_api(endpoint: str) -> Any:
     return run_json(["gh", "api", endpoint])
+
+
+def checkout_merge_sha(log: str) -> str | None:
+    """Extract one full checkout commit from an immutable Actions job log."""
+    candidates: list[str] = []
+    lines = log.splitlines()
+    for index, line in enumerate(lines[:-1]):
+        if "[command]" not in line or "git log -1 --format=%H" not in line:
+            continue
+        following = lines[index + 1]
+        match = re.search(r"\b([0-9a-f]{40})\s*$", following)
+        if not match:
+            return None
+        short = match.group(1)[:7]
+        if not any(re.search(r"HEAD is now at " + re.escape(short) + r"\b", previous) for previous in lines[max(0, index - 20):index]):
+            return None
+        candidates.append(match.group(1))
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def checkout_provenance(repo: str, run_id: int, job_id: int, H: str) -> dict[str, str]:
+    log = run_text(["gh", "run", "view", str(run_id), "-R", repo, "--job", str(job_id), "--log"], timeout=90)
+    merge_sha = checkout_merge_sha(log)
+    if not merge_sha:
+        return {}
+    commit = gh_api(f"repos/{repo}/git/commits/{merge_sha}")
+    parents = [parent.get("sha") for parent in commit.get("parents", [])]
+    tree = commit.get("tree", {}).get("sha")
+    if len(parents) != 2 or len(set(parents)) != 2 or H not in parents or not isinstance(tree, str) or not SHA.fullmatch(tree):
+        return {}
+    base = next(parent for parent in parents if parent != H)
+    if not isinstance(base, str) or not SHA.fullmatch(base):
+        return {}
+    return {"tested_base_sha": base, "tested_merge_sha": merge_sha, "tested_merge_tree": tree}
 
 
 def gh_pages(endpoint: str, key: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
@@ -120,6 +159,7 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
         metadata = {key: structured.get(key.lower()) for key in ("TASK", "REPO", "PR", "TESTER_JOB", "TESTER_SESSION")}
         return {"ref": ref, "verdict": verdict, "H": H, "metadata": metadata, "issues": issues, "text": content}
     fence: tuple[str, int] | None = None
+    quote_open = False
     html_comment = False
     brief_level: int | None = None
     last = None
@@ -132,6 +172,13 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
         if fence is not None:
             if marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= fence[1] and not marker.group(2).strip():
                 fence = None
+            continue
+        if quote_open:
+            if stripped and not marker and not re.match(r"^#{1,6}\s+", line):
+                continue
+            quote_open = False
+        if re.match(r"^\s*>", line):
+            quote_open = True
             continue
         if marker:
             fence = (marker.group(1)[0], len(marker.group(1)))
@@ -161,8 +208,6 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
             brief_level = 0
             continue
         if brief_level is not None:
-            continue
-        if re.match(r"^\s*>", line):
             continue
         match = VERDICT.fullmatch(line)
         if match:
@@ -214,7 +259,7 @@ def check_reports(snapshot: dict[str, Any]) -> dict[str, Any]:
         return result("UNVERIFIED", "TESTER_SESSION_MISMATCH")
     if not completed or completed[-1].get("report_path") != report.get("ref", {}).get("path"):
         return result("UNVERIFIED", "TESTER_JOB_INCOMPLETE")
-    if completed[-1].get("report_sha256") and completed[-1]["report_sha256"] != report.get("ref", {}).get("sha256"):
+    if not completed[-1].get("report_sha256") or completed[-1]["report_sha256"] != report.get("ref", {}).get("sha256"):
         return result("UNVERIFIED", "TESTER_REPORT_CHANGED_AFTER_COMPLETION")
     eligible = snapshot.get("eligibility_receipt")
     if snapshot.get("tier") == "T3" and not eligible:
@@ -252,10 +297,13 @@ def check_base(snapshot: dict[str, Any], ci: dict[str, Any]) -> dict[str, Any]:
     if compare["ahead_by"] > 0:
         return result("UNVERIFIED", "BASE_BEHIND", behind=compare["ahead_by"])
     M = snapshot.get("M")
-    if not isinstance(M, str) or not SHA.fullmatch(M) or set(snapshot.get("merge_parents", [])) != {B, H}:
+    parents = snapshot.get("merge_parents", [])
+    if not isinstance(M, str) or not SHA.fullmatch(M) or len(parents) != 2 or set(parents) != {B, H}:
         return result("UNVERIFIED", "TRIAL_MERGE_UNBOUND")
     if any(job.get("base_sha") != B for job in ci.get("jobs", [])):
         return result("UNVERIFIED", "BASE_AFTER_CI_UNKNOWN")
+    if any(job.get("merge_tree") != M for job in ci.get("jobs", [])):
+        return result("UNVERIFIED", "CI_MERGE_TREE_MISMATCH")
     if ci.get("status") != "PASS" or not ci.get("jobs"):
         return result("UNVERIFIED", "CI_BASE_UNPROVEN")
     return result("PASS", "BASE_AND_MERGE_CURRENT", behind=0, M=M,
@@ -358,7 +406,9 @@ def check_runtime(snapshot: dict[str, Any], policy: dict[str, Any]) -> dict[str,
     if len(matched) > 1:
         return result("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN")
     if not matched:
-        relevant = [p for p in paths if p.endswith((".py", ".service", ".service.example", "Dockerfile", "pyproject.toml", "uv.lock")) or fnmatch.fnmatch(p, "requirements*.txt") or p.startswith(("runners/", "deploy/", "scripts/"))]
+        relevant = [p for p in paths if p.lower().endswith((".py", ".service", ".service.example", "dockerfile", "pyproject.toml", "uv.lock"))
+                    or fnmatch.fnmatch(Path(p).name.lower(), "requirements*.txt")
+                    or p.lower().startswith(("runners/", "deploy/", "scripts/"))]
         if relevant:
             return result("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN")
         return result("N/A", "RUNTIME_SURFACE_ABSENT", policy_ref="runtime")
@@ -381,7 +431,16 @@ def check_runtime(snapshot: dict[str, Any], policy: dict[str, Any]) -> dict[str,
         return result("UNVERIFIED", "RUNTIME_OBSERVATION_STALE")
     if not str(data.get("version", "")).startswith(entry["version_prefix"]) or not os.path.isabs(str(data.get("interpreter", ""))):
         return result("UNVERIFIED", "RUNTIME_INTERPRETER_MISMATCH")
-    if entry["interpreter"] not in str(data.get("exec_start", "")) or not all(data.get(key) for key in ("os", "arch", "lock_ref", "dependencies_ref", "proof_ref")):
+    command = str(data.get("exec_start", "")).strip()
+    if command.startswith("ExecStart="):
+        command = command[len("ExecStart="):].strip()
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        argv = []
+    if not argv or argv[0] != entry["interpreter"] or any(str(data.get(key, "")).strip().lower() in ("", "unknown", "none") for key in ("os", "arch", "proof_ref")):
+        return result("UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
+    if any(not str(data.get(key, "")).endswith("@" + snapshot["H"]) for key in ("lock_ref", "dependencies_ref")):
         return result("UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
     return result("PASS", "RUNTIME_HOST_OBSERVED", receipt=receipt["ref"], target=entry["target"], service=entry["service"])
 
@@ -467,7 +526,7 @@ def scan_patches(files: list[dict[str, Any]], B: str, H: str) -> dict[str, Any]:
                 if not m:
                     return {"complete": False, "H": H, "B": B, "scanner": "gitleaks", "version": None, "exit_code": None, "hits": []}
                 new_line = int(m.group(1))
-            elif line.startswith("+") and not line.startswith("+++"):
+            elif line.startswith("+"):
                 added = line[1:]
                 location = f"{path}:{new_line}"
                 lines.append(added)
@@ -477,7 +536,7 @@ def scan_patches(files: list[dict[str, Any]], B: str, H: str) -> dict[str, Any]:
                     if pattern.search(added):
                         hits.append({"location": location, "class": name})
                 new_line += 1
-            elif line.startswith("-") and not line.startswith("---"):
+            elif line.startswith("-"):
                 patch_deletions += 1
             elif not line.startswith("-") and not line.startswith("\\"):
                 new_line += 1
@@ -552,10 +611,19 @@ def gather_live(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str, A
         try:
             runs = gh_pages(f"repos/{repo}/actions/runs?head_sha={H}&event=pull_request", key="workflow_runs")
             snapshot["ci_runs"] = runs
+            required_names = {name for names in policy.get("ci", {}).get(repo, {}).values() for name in names}
             for run in runs:
                 run_id = run.get("id")
                 if isinstance(run_id, int):
-                    snapshot["ci_jobs"][run_id] = gh_pages(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=all", key="jobs")
+                    jobs = gh_pages(f"repos/{repo}/actions/runs/{run_id}/jobs?filter=all", key="jobs")
+                    snapshot["ci_jobs"][run_id] = jobs
+                    for job in jobs:
+                        if job.get("name") not in required_names or job.get("status") != "completed" or job.get("conclusion") != "success" or not isinstance(job.get("id"), int):
+                            continue
+                        try:
+                            job.update(checkout_provenance(repo, run_id, job["id"], H))
+                        except (RuntimeError, KeyError, TypeError, ValueError):
+                            pass
         except (RuntimeError, KeyError, TypeError):
             snapshot["ci_runs"] = []
             snapshot["ci_jobs"] = {}

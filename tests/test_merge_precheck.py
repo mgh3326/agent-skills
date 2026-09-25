@@ -40,7 +40,8 @@ def snapshot() -> dict:
            "created_at": "2026-09-25T07:00:00Z", "run_attempt": 1, "status": "completed", "conclusion": "success",
            "pull_requests": [{"base": {"sha": B}}]}
     jobs = [{"id": i, "name": name, "run_id": 10, "run_attempt": 1, "head_sha": H, "status": "completed",
-             "conclusion": "success", "steps": [{"name": "Bash tests", "status": "completed", "conclusion": "success"}]}
+             "conclusion": "success", "tested_base_sha": B, "tested_merge_sha": "e" * 40, "tested_merge_tree": M,
+             "steps": [{"name": "Bash tests", "status": "completed", "conclusion": "success"}]}
             for i, name in enumerate(("ubuntu-latest", "macos-latest"), 1)]
     tester = {"ref": {"path": "/tmp/tester-report.md", "sha256": "e" * 64}, "verdict": "PASS", "H": H,
               "metadata": {"TASK": "727", "REPO": repo, "PR": str(pr), "TESTER_JOB": "task727-tester", "TESTER_SESSION": "tester-grok"}, "issues": [], "text": ""}
@@ -50,7 +51,7 @@ def snapshot() -> dict:
             "head_to_base": {"ahead_by": 0}, "merge_parents": [B, H], "pr_url": url, "pr_body": "", "deploy_note": "",
             "tester_report": tester, "builder_report": builder, "eligibility_receipt": None,
             "tester_events": [{"job_id": "task727-tester", "kind": "job.spawned", "payload": {"label": "tester-grok", "pane_id": "synthetic-pane"}},
-                              {"job_id": "task727-tester", "kind": "job.completed", "payload": {"report_path": "/tmp/tester-report.md"}}],
+                              {"job_id": "task727-tester", "kind": "job.completed", "payload": {"report_path": "/tmp/tester-report.md", "report_sha256": "e" * 64}}],
             "runtime_receipt": None, "hash_receipt": None, "ci_runs": [run], "ci_jobs": {10: jobs},
             "protection_contexts": None, "files": [{"filename": "README.md", "status": "modified", "patch": "@@ -1 +1 @@\n+hello"}],
             "scan": {"complete": True, "B": B, "H": H, "scanner": "gitleaks+patterns", "version": "8.30.1", "exit_code": 0, "hits": []},
@@ -81,6 +82,7 @@ class MergePrecheckTests(unittest.TestCase):
             assert_check(self, s, "G1", "UNVERIFIED", "TESTER_VERDICT_MISSING")
             path.write_text(path.read_text() + f"VERDICT: PASS @{H}\n")
             s["tester_report"] = gate.parse_report(str(path))
+            s["tester_events"][1]["payload"]["report_sha256"] = s["tester_report"]["ref"]["sha256"]
             assert_check(self, s, "G1", "PASS", "TESTER_PASS_BOUND")
 
     def test_long_fence_and_html_comment_cannot_override_blocker(self) -> None:
@@ -94,6 +96,24 @@ class MergePrecheckTests(unittest.TestCase):
                     s = snapshot()
                     s["tester_report"] = gate.parse_report(str(path))
                     assert_check(self, s, "G1", "FAIL", "TESTER_BLOCKER")
+
+    def test_lazy_quote_continuation_cannot_override_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "tester.md"
+            path.write_text(f"VERDICT: BLOCKER @{H}\n> quoted sample\nVERDICT: PASS @{H}\n")
+            s = snapshot()
+            s["tester_report"] = gate.parse_report(str(path))
+            assert_check(self, s, "G1", "FAIL", "TESTER_BLOCKER")
+            source = (ROOT / "director/merge_precheck.py").read_text()
+            guard = "quote_open = True\n            continue"
+            self.assertEqual(1, source.count(guard))
+            namespace: dict = {"__name__": "merge_precheck_quote_mutant"}
+            exec(source.replace(guard, "quote_open = False\n            continue"), namespace)
+            with self.assertRaises(AssertionError):
+                self.assertEqual("BLOCKER", namespace["parse_report"](str(path))["verdict"])
+            path.write_text(path.read_text() + f"\nVERDICT: PASS @{H}\n")
+            s["tester_report"] = gate.parse_report(str(path))
+            self.assertEqual("PASS", s["tester_report"]["verdict"])
 
     def test_incident_660_hash_citation_requires_independent_receipt(self) -> None:
         s = snapshot()
@@ -166,6 +186,35 @@ class MergePrecheckTests(unittest.TestCase):
         s["ci_jobs"][10][0]["conclusion"] = "failure"
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
 
+    def test_ci_checkout_provenance_ignores_mutable_pr_base(self) -> None:
+        s = snapshot()
+        s["ci_runs"][0]["pull_requests"][0]["base"]["sha"] = OTHER
+        assert_check(self, s, "G3", "PASS", "CI_ALL_REQUIRED_SUCCEEDED")
+        s["ci_jobs"][10][0]["tested_base_sha"] = OTHER
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_BASE_MOVED")
+        s = snapshot()
+        duplicate = copy.deepcopy(s["ci_jobs"][10][0])
+        duplicate["id"] = 99
+        duplicate["conclusion"] = "failure"
+        s["ci_jobs"][10].append(duplicate)
+        assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+        duplicate["conclusion"] = "success"
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_JOB_AMBIGUOUS")
+        duplicate["conclusion"] = "skipped"
+        assert_check(self, s, "G3", "FAIL", "CI_SKIPPED")
+
+    def test_checkout_job_log_binds_trial_merge_parents(self) -> None:
+        checkout_sha = "e" * 40
+        log = (f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:00Z HEAD is now at {checkout_sha[:7]} Merge H into B\n"
+               "ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:00Z "
+               "[command]/usr/bin/git log -1 --format=%H\n"
+               f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {checkout_sha}\n")
+        with patch.object(gate, "run_text", return_value=log), patch.object(gate, "gh_api", return_value={
+            "parents": [{"sha": B}, {"sha": H}], "tree": {"sha": M}}):
+            self.assertEqual({"tested_base_sha": B, "tested_merge_sha": checkout_sha, "tested_merge_tree": M},
+                             gate.checkout_provenance("mgh3326/agent-skills", 10, 1, H))
+        self.assertIsNone(gate.checkout_merge_sha(log.replace(checkout_sha, "short-sha")))
+
     def test_missing_branch_protection_source_mutant_is_red(self) -> None:
         required = policy()
         actual = ci_canonical.evaluate_required_ci(required, "mgh3326/auto_trader", H, B, [], {}, None)
@@ -195,6 +244,9 @@ class MergePrecheckTests(unittest.TestCase):
         s["ci_runs"] = []
         s["ci_jobs"] = {}
         assert_check(self, s, "G4", "UNVERIFIED", "CI_BASE_UNPROVEN")
+        s = snapshot()
+        s["ci_jobs"][10][0]["tested_merge_tree"] = OTHER
+        assert_check(self, s, "G4", "UNVERIFIED", "CI_MERGE_TREE_MISMATCH")
 
     def test_actual_profile_differs_from_plan(self) -> None:
         catalog = {"grok": {"provider": "xai", "model": "grok-4.7", "effort": "xhigh", "grade": "S"}}
@@ -202,6 +254,8 @@ class MergePrecheckTests(unittest.TestCase):
             resolve_profile("grok", catalog, {"provider": "xai", "model": "grok-4.7", "effort": "high"})
         with self.assertRaisesRegex(PolicyError, "PROFILE_ACTUAL_MISMATCH"):
             resolve_profile("grok", catalog, {"provider": "xai", "model": "grok-4.7", "effort": "xhigh", "grade": "A+"})
+        with self.assertRaisesRegex(PolicyError, "PROFILE_ACTUAL_MISMATCH"):
+            resolve_profile("grok", catalog, {"provider": "xai", "model": "grok-4.7", "effort": "xhigh"})
 
     def test_runtime_only_change_and_host_receipt(self) -> None:
         s = snapshot()
@@ -212,8 +266,24 @@ class MergePrecheckTests(unittest.TestCase):
             "kind": "host-runtime", "repo": s["repo"], "PR": 999, "H": H, "target": "NCP", "service": "ncp-operator-runners",
             "interpreter": "/usr/bin/python3.11", "version": "3.11.9", "exec_start": "/usr/bin/python3.11 /srv/auto-trader-operator/runners/h1_pilot_runner.py",
             "issuer": "operator-desk", "observed_at": "2026-09-25T07:30:00Z", "os": "linux", "arch": "x86_64",
-            "lock_ref": "uv.lock@a", "dependencies_ref": "pyproject.toml@a", "proof_ref": "host-observation/1"}}
+            "lock_ref": "uv.lock@" + H, "dependencies_ref": "pyproject.toml@" + H, "proof_ref": "host-observation/1"}}
         assert_check(self, s, "G9", "PASS", "RUNTIME_HOST_OBSERVED")
+        s["runtime_receipt"]["data"]["issuer"] = s["issuer"]
+        assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_NOT_INDEPENDENT")
+        source = (ROOT / "director/merge_precheck.py").read_text()
+        guard = 'if data.get("issuer") in (None, "", snapshot.get("issuer")):'
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "merge_precheck_issuer_mutant"}
+        exec(source.replace(guard, "if False:"), namespace)
+        with self.assertRaises(AssertionError):
+            self.assertEqual("UNVERIFIED", namespace["check_runtime"](s, policy())["status"])
+        s["runtime_receipt"]["data"]["issuer"] = "operator-desk"
+        s["runtime_receipt"]["data"]["exec_start"] = "echo /usr/bin/python3.11"
+        assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
+        s["runtime_receipt"]["data"]["exec_start"] = "/usr/bin/python3.11 /srv/auto-trader-operator/runners/h1_pilot_runner.py"
+        s["runtime_receipt"]["data"]["lock_ref"] = "uv.lock@old"
+        assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
+        s["runtime_receipt"]["data"]["lock_ref"] = "uv.lock@" + H
         s["runtime_receipt"]["data"]["exec_start"] = "python3 --version"
         assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
 
@@ -224,6 +294,12 @@ class MergePrecheckTests(unittest.TestCase):
                 s["repo"] = "mgh3326/auto_trader-operator"
                 s["files"] = [{"filename": path, "status": "modified", "patch": "@@ -1 +1 @@\n+changed"}]
                 assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_RECEIPT_MISSING")
+        for path in ("Scripts/start.sh", "lib/requirements.txt"):
+            with self.subTest(unknown_path=path):
+                s = snapshot()
+                s["repo"] = "mgh3326/auto_trader-operator"
+                s["files"] = [{"filename": path, "status": "modified", "patch": "@@ -1 +1 @@\n+changed"}]
+                assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_TARGET_UNKNOWN")
 
     def test_lookup_process_failures_become_unverified_inputs(self) -> None:
         for failure in (subprocess.TimeoutExpired(["gh"], 1), FileNotFoundError("gh")):
@@ -279,6 +355,8 @@ class MergePrecheckTests(unittest.TestCase):
         assert_check(self, s, "G8", "PASS", "QUEUE_JOIN_CONSISTENT")
         s["tester_events"][1]["report_sha256"] = "0" * 64
         assert_check(self, s, "G1", "UNVERIFIED", "TESTER_REPORT_CHANGED_AFTER_COMPLETION")
+        del s["tester_events"][1]["report_sha256"]
+        assert_check(self, s, "G1", "UNVERIFIED", "TESTER_REPORT_CHANGED_AFTER_COMPLETION")
 
     def test_scan_failure_artifact_and_undisposed_blocker(self) -> None:
         s = snapshot()
@@ -298,6 +376,27 @@ class MergePrecheckTests(unittest.TestCase):
         s = snapshot()
         s["files"], s["scan"] = files, scan
         assert_check(self, s, "G5", "UNVERIFIED", "DIFF_TRUNCATED_OR_UNBOUND")
+
+    def test_added_line_starting_with_two_plus_signs_is_scanned(self) -> None:
+        files = [{"filename": "README.md", "patch": "@@ -0,0 +1,2 @@\n+ordinary line\n+++api_key=EXAMPLEKEY123456",
+                  "additions": 2, "deletions": 0}]
+        responses = [subprocess.CompletedProcess([], 0, "8.30.1\n", ""),
+                     subprocess.CompletedProcess([], 0, "[]", "")]
+        with patch.object(gate.subprocess, "run", side_effect=responses):
+            scan = gate.scan_patches(files, B, H)
+        self.assertTrue(scan["complete"])
+        self.assertIn({"location": "README.md:2", "class": "credential_assignment"}, scan["hits"])
+        source = (ROOT / "director/merge_precheck.py").read_text()
+        guard = 'elif line.startswith("+"):'
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "merge_precheck_scan_mutant"}
+        exec(source.replace(guard, 'elif line.startswith("+") and not line.startswith("+++"):'), namespace)
+        with self.assertRaises(AssertionError):
+            self.assertIn({"location": "README.md:2", "class": "credential_assignment"},
+                          namespace["scan_patches"](files, B, H)["hits"])
+        s = snapshot()
+        s["files"], s["scan"] = files, scan
+        assert_check(self, s, "G5", "FAIL", "LEAK_PATTERN_HIT")
 
     def test_risks_section_and_surface_content(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -338,6 +437,7 @@ class MergePrecheckTests(unittest.TestCase):
                                         "tester_job": "task727-tester", "tester_session": "tester-grok"}))
             s["tester_report"] = gate.parse_report(str(path))
             s["tester_events"][1]["payload"]["report_path"] = str(path.resolve())
+            s["tester_events"][1]["payload"]["report_sha256"] = s["tester_report"]["ref"]["sha256"]
             assert_check(self, s, "G1", "PASS", "TESTER_PASS_BOUND")
 
     def test_stale_policy_still_writes_receipt(self) -> None:
