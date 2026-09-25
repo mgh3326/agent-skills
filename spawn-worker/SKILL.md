@@ -93,9 +93,11 @@ builder 가 워커·tester 스폰 없이 직접 구현하는 **단독 모드**�
 | `devin-swe2` | **A+** 실측 확정(reps `id=681`·`682`·`688`: 3/3 완료·워커귀책 재작업 0·BLOCKER 0). reps 3건 전 잠정 `T1`/`T2` 제한은 해제한다. `S` 이상은 **S 미측정**이라 제외(3건 모두 A+ 이하). 장기 다단계 작업도 미측정이므로 제외한다. 무인 운용에는 `--permission-mode dangerous` 가 필수(`accept-edits` 는 pane 에서 셸 명령마다 프롬프트로 정지). tester는 **타사 provider family**로 배정한다(§2-4 조건부 동일 계열 검증·소진 시 지연 검증). 장기 정본과 등급 조정은 scopefuel을 따른다. |
 | `builder-devin` | **A+ 급 작업의 T1·T2 빌더**(2026-09-14 파일럿 1건 통과로 T1 한정 등재 → 2026-09-23 운영자 결정으로 T2 확대). 워커 프로필 `devin-swe2`의 argv·kind를 재사용한다. 조건: **급 A+ 이하 작업(`S` 이상 제외) · 가역 T1·T2 한정(T3 제외) · 라운드 상한 3 · 독립 tester는 타사 provider family(§2-4 조건부 동일 계열 검증·소진 시 지연 검증 적용) · 배포·라이브 매매 표면 제외**. 무료 풀이라 여유율 규칙상 **우선 배정** 후보다. 결정 기록: 2026-09-23 운영자 결정(receipt `decision/2026-09-23/operator-batch-1100`, 근거 본문 `task/2026-09-23/spawn-worker-builder-devin-t2`) — 09-21 이후 빌더 역할 표본 7건 전부 머지, 되돌리기 조건 발동 0. 다음 재판단: `S` 급 확대는 S 급 빌더 reps 를 측정한 뒤에 한다. 라운드 상한 초과나 게이트 BOUNCE 2회면 워커 전용으로 되돌린다. |
 | `builder-grok` | **조건부 T1 빌더**(2026-09-14 운영자 결정, 파일럿 1건 통과). grok 4.7 argv(ROB-591 전 파일럿 당시 4.6)를 effort `xhigh`로 재사용한다 — 🔴 워커 철자 `grok`/`grok-hi`로 빌더를 띄우면 기본 effort가 `high`라 조용히 달라지므로, 빌더는 `builder-grok`을 쓰거나 `--effort xhigh`를 명시한다. 조건: **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(§2-4 조건부 동일 계열 검증·소진 시 지연 검증 적용) · T2 이상과 배포·안전가드 표면 제외**. 배정은 codex·claude 풀이 빠듯할 때. 정식 등재와 T2 확대는 **빌더 역할 표본 3**에서 재판단하며, 라운드 상한 초과나 게이트 BOUNCE 2회면 워커 전용으로 되돌린다. |
+| `builder-luna` | **#594 E3 실험 표본용 codex-luna 빌더**(task #633). 워커 프로필 `codex-luna`(gpt-6-luna)의 argv를 effort `xhigh`로 재사용한다 — `--effort`는 xhigh로 고정(wrk가 그 외를 거부). 카탈로그상 codex-luna는 medium=B · max=A+ 이므로 이 프로필의 과제 급 상한은 카탈로그가 xhigh에 매기는 급과 같다 — 급 미달 과제에는 배정하지 않는다. E3 표본이므로 브리프에 `exp=E3`를 태그하고 reps 기록이 의무다(#594 운영 문서). |
 | `oc-solar4` | **B** 실측 확정(reps `id=699`·`700`·`702`: 구조·닫힌 어휘 위반 0, 원문 충실도는 1패스 실패·반복 개정으로 도달, 판단·의미는 3건 모두 약함). `T1` 한정·tester 금지를 유지한다. **산출물 자체가 판단인 과업은 배정하지 않는다**(감사 결론·리스크 분류·채택 여부 판정 등) — 검토가 뒤따르는 기계 검증 가능한 변환·태깅·형식화는 허용한다. 운용은 기계 검사 가능한 규칙 + 자력 개정 허용이 최적이며, **1패스 산출은 신뢰하지 않는다**. 브리프에 '승인 대기 없이 완주'를 명시한다(승인 대기 정지 1회 실측). 브리프에는 §3의 **rate limit 대응 절**(429·rate limit 시 지수 백오프, 막히면 중단·보고)도 반드시 포함한다. 상시 배정은 하지 않는다. 장기 정본과 등급 조정은 scopefuel을 따른다. |
 | `devin-glm52`·`devin-swe17` | **등재 보류** — 사유: SWE-2 대비 우위 없음(구세대·전세대이고 컨텍스트도 작다). 프로필은 이미 있으니 필요해지면 reps 만 돌리면 된다 — 배제가 아니라 **측정 비용의 우선순위** 문제다. devin-swe2 와 동일한 무인 argv(모델명만 `glm-5-2`·`swe-1-7`). scopefuel `devin` 풀 공유. |
 | `devin-ds41` | **미측정 → T1/T2** (유료 $0.22/1M in, 벤치 TB2.1 90.6). devin-swe2 와 동일한 무인 argv(모델명만 `deepseek-v4-1-flash-high`). reps 3건으로 급 확정. scopefuel `devin` 풀 공유 — 유료 사용 시 태스크 note 에 모델·급을 남긴다(사후 비용 귀속). |
+| `devin-swe2-medium`·`devin-swe2-max`·`devin-ds41-max` | **미측정(C) → T1/T2** (#635 effort 변형 — devin 에서 effort 는 모델 id 안에 있고 `--effort` 플래그는 없다. 런그별 별도 프로필, high 런그의 A+ 는 상속하지 않는다). devin-swe2 와 동일한 무인 argv에 모델명만 `swe-2-medium`·`swe-2-max`·`deepseek-v4-1-flash-max`. **swe-2 medium·max 는 무료** — #594 급 측정의 기본 런그. `devin-swe2-medium`·`devin-swe2-max` 는 `--role builder` 도 받는다(builder-devin 의 effort 경로). #666 부터 런그별 빌더 철자도 있다 — `builder-devin-medium`·`builder-devin-max`(동일 argv)와 유료 `builder-ds41`·`builder-ds41-max`(운영자 ds41-builder 정책; `devin-ds41`·`devin-ds41-max` 철자는 계속 worker 전용). scopefuel `devin` 풀 공유, reps 로 급 확정. |
 
 급표 각주 (2026-09-14 운영자 결정 `free-lane-aggressive-use-3`·`devin-pro-paid-models`):
 
@@ -239,7 +241,7 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
    - **실패도 데이터다**: `completed=0` 을 숨기지 마라. 라운드가 3번 돌았으면 `rounds=3` 이다. 좋아 보이려고 반올림하거나 축소 기록하는 순간 급표가 오염된다.
 4. **재배치는 비자동**: `reps` 데이터는 관측 근거일 뿐, 프로필의 급 이동은 운영자의 판단이다. 표본 1건 성공만으로 급을 즉시 올리지 마라(추정 프로필은 한 단계 보수적 적용 원칙 유지).
 5. **effort 별 통계 연동**: effort 별 실사용 및 실측 데이터는 §2-2와 같이 `events` payload의 `launch_profile` 및 `scopefuel reps` 규칙(ROB-1218)을 상호 참조하여 집계·확인한다.
-6. **devin 계열 reps 는 프로필별 분리 기록**: `devin-swe2`·`devin-glm52`·`devin-swe17`·`devin-ds41` — 같은 `devin` 풀을 공유해도 모델별로 남긴다.
+6. **devin 계열 reps 는 프로필별 분리 기록**: `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`devin-glm52`·`devin-swe17`·`devin-ds41`·`devin-ds41-max` — 같은 `devin` 풀을 공유해도 모델·effort 런그별로 남긴다.
 
 ## 3. 브리프 작성 (자족적일 것)
 

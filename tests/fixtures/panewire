@@ -25,6 +25,11 @@ set -euo pipefail
 #                             the file as received is copied to LOG.<n>
 #   WRK_PANEWIRE_PANE_CWD     herdr's cwd for the pane; when set, expect cwd
 #                             must equal it byte for byte (as prompt.go does)
+#   WRK_PANEWIRE_STRICT_EXPECT  when 1, reject expect tokens outside the real
+#                             parser's field set (name/label/cwd/title~/recent~)
+#                             with rc 5 — parsePromptFile does the same, and a
+#                             stray field there means the brief is never sent
+#                             (#667: wrk once put `catalog=stale` on that line)
 fixture_prompt() {
   local from="" to="" file="" timeout="" uptake="" calls mode body first name="" cwd="" token
   while [[ $# -gt 0 ]]; do
@@ -57,6 +62,11 @@ fixture_prompt() {
     case "$token" in
       name=*) name="${token#name=}" ;;
       cwd=*) cwd="${token#cwd=}" ;;
+      label=*|title~=*|recent~=*) ;;
+      *) if [[ "${WRK_PANEWIRE_STRICT_EXPECT:-0}" == 1 ]]; then
+           echo "unknown expect field: ${token%%=*}" >&2
+           exit 5
+         fi ;;
     esac
   done
   body="$(awk 'found { print; next } /^expect:/ { found = 1 }' "$file" | sed '/./,$!d')"

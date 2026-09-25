@@ -37,9 +37,12 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
 ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable builder-opus captain-opus
-  devin-swe2 builder-devin devin-glm52 devin-swe17 devin-ds41
+  devin-swe2 devin-swe2-medium devin-swe2-max builder-devin
+  builder-devin-medium builder-devin-max
+  devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
+  builder-ds41 builder-ds41-max
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
-  codex codex-sol codex-max builder-sol captain-sol codex-astra
+  codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
   codex-sol56 codex-luna56
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
@@ -131,10 +134,13 @@ Options:
                      rejects --owner outright (use --lane instead).
   --role worker|builder (legacy alias: captain)
                      builder requires --lane and --parent, and accepts only
-                     builder-opus, builder-sol, builder-devin, builder-grok or
-                     builder-kimi profiles; legacy captain-opus and captain-sol
+                     builder-opus, builder-sol, builder-devin,
+                     builder-devin-medium, builder-devin-max, builder-ds41,
+                     builder-ds41-max, builder-grok, builder-kimi or
+                     builder-luna profiles; legacy captain-opus and captain-sol
                      aliases and the pilot worker spellings devin-swe2,
-                     grok/grok-hi and kimi-k3 remain accepted.
+                     devin-swe2-medium, devin-swe2-max, grok/grok-hi and kimi-k3
+                     remain accepted.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      required for --role builder (spawn dies without it).
@@ -213,9 +219,23 @@ It defaults to --effort xhigh and requires --purpose director|architect|operator
 which the gate enforces as role denial (gate exit 5, surfaced by wrk as exit 77) when
 missing or wrong.
 Pilot builders (task 240): builder-devin = devin-swe2 argv; builder-grok = grok 4.7 at effort xhigh; builder-kimi = kimi-k3 argv.
+builder-luna (task #633) = codex-luna (gpt-6-luna) at effort xhigh — the #594 E3
+sample spelling; --effort is pinned to xhigh because the catalog grades
+codex-luna per effort (medium=B, max=A+).
 Devin model variants (task 281): devin-glm52, devin-swe17 and devin-ds41 run
-the same unattended devin argv with only the model name changed — worker-only,
-sharing scopefuel's single `devin` pool (devin-ds41 is the paid spelling).
+the same unattended devin argv with only the model name changed — worker-only
+spellings, sharing scopefuel's single `devin` pool (devin-ds41 is the paid
+spelling).
+Devin effort variants (#635): effort is encoded in the devin model id — there
+is no --effort flag — so each rung is its own profile: devin-swe2-medium
+(--model swe-2-medium) and devin-swe2-max (--model swe-2-max), both free, and
+the paid devin-ds41-max (--model deepseek-v4-1-flash-max). devin-swe2 stays the
+high default; the swe-2 effort spellings are also accepted under --role builder.
+Devin builder variants (#666): the same rungs exist as builder spellings —
+builder-devin-medium and builder-devin-max (the free swe-2 rungs), plus
+builder-ds41 and builder-ds41-max for the paid ds41 rung per the operator's
+ds41-builder policy. Each reuses its worker variant's argv verbatim; the ds41
+worker spellings themselves stay worker-only under --role builder.
 Legacy profile aliases captain-opus and captain-sol have the same meaning.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-code/k3`; kimi-k27 and
 kimi-k27-code use `kimi --auto -m kimi-code/kimi-for-coding`; the CLI has
@@ -533,15 +553,19 @@ spawn_prompt_file() {
     file="$(mktemp "${TMPDIR:-/tmp}/wrk-spawn-brief-$attempt.XXXXXX")" || return 1
   fi
   {
-    # The catalog marker rides on the expect line so it reaches the spawned
-    # agent itself, not only wrk's stderr: a brief produced from the launcher's
-    # own table instead of the canon has to say so where the work is read.
-    local catalog_marker=""
-    [[ "${CATALOG_STALE:-0}" -ne 1 ]] || catalog_marker=" catalog=stale"
+    # The catalog marker must reach the spawned agent itself, not only wrk's
+    # stderr: a brief produced from the launcher's own table instead of the
+    # canon has to say so where the work is read. It rides on a `wrk-note:`
+    # line in the body, NOT on the expect: header — panewire's parsePromptFile
+    # (prompt.go, deployed pw-6d0562e) accepts only name/label/cwd/title~/recent~
+    # and rejects an unknown field with rc=5 before the send boundary, which
+    # silently dropped the whole brief (#667).
+    local catalog_note=""
+    [[ "${CATALOG_STALE:-0}" -ne 1 ]] || catalog_note="wrk-note: catalog=stale"$'\n'
     if [[ -n "$SPAWN_EXPECT_CWD" ]]; then
-      printf 'expect: name=%s cwd=%s%s\n\n' "$LABEL" "$SPAWN_EXPECT_CWD" "$catalog_marker"
+      printf 'expect: name=%s cwd=%s\n%s\n' "$LABEL" "$SPAWN_EXPECT_CWD" "$catalog_note"
     else
-      printf 'expect: name=%s%s\n\n' "$LABEL" "$catalog_marker"
+      printf 'expect: name=%s\n%s\n' "$LABEL" "$catalog_note"
     fi
     cat -- "$PROMPT"
   } >"$file" || return 1
@@ -1731,7 +1755,23 @@ arbiter_admit() {
   # 2026-08-04: T3 jobs ran gpt-5.6-luna at *medium* (B, 42) while every record
   # claimed codex-luna-max (A+, 59). Only `ps` told the truth; finished jobs
   # became unauditable.
-  local launch_profile="$MODEL${EFFECTIVE_EFFORT:+@$EFFECTIVE_EFFORT}"
+  #
+  # task #677: the launch name is the canonical catalog profile, not the launcher
+  # spelling. codex-sol/codex-max/codex/builder-sol/captain-sol all run gpt-6-sol
+  # — the catalog profile is codex-sol (scopefuel PROFILE_ALIASES: codex-max ->
+  # codex-sol), and scopefuel only knows the canonical name (`policy launch
+  # builder-sol` is not in the catalog at all). Recording the raw spelling split
+  # reps/usage attribution across names the grade table cannot read (2026-09-25:
+  # a builder-sol xhigh spawn recorded launch_profile=builder-sol@xhigh while its
+  # pane ran gpt-6-sol xhigh). Scoped to codex-kind profiles: every other pool
+  # keeps its literal spelling@effort, so no other pool's records change.
+  # Rollback spellings (codex-sol56) stay literal by design — pinning the
+  # superseded model is the point, and the canon does not carry them.
+  local launch_name="$MODEL"
+  if [[ "$PROFILE_KIND" == codex && -n "$CATALOG_PROFILE" ]]; then
+    launch_name="$CATALOG_PROFILE"
+  fi
+  local launch_profile="$launch_name${EFFECTIVE_EFFORT:+@$EFFECTIVE_EFFORT}"
   record_json="$(SCOPEFUEL_BIN="$SCOPEFUEL" "$ARBITER" lease --job "$JOB_ID" --kind quota_pool \
     --profile "$GATE_PROFILE" --launch-profile "$launch_profile" --gate-output "$gate_file" --json)"
   record_rc=$?
@@ -1761,7 +1801,10 @@ arbiter_admit() {
   fi
   ARBITER_HELD=1
   trap 'spawn_pane_cleanup; arbiter_release_held' EXIT
-  echo "wrk: arbiter quota-pool record pool=$ARBITER_RESOURCE profile=$ARBITER_PROFILE job=$JOB_ID" >&2
+  # task #677: show the launch name next to the gate-normalized profile — the
+  # observed line said profile=codex-max while the pane ran gpt-6-sol, and the
+  # launch identity was only in the event payload.
+  echo "wrk: arbiter quota-pool record pool=$ARBITER_RESOURCE profile=$ARBITER_PROFILE launch_profile=$launch_profile job=$JOB_ID" >&2
 }
 
 # ROB-1227: a successful spawn is a quota-use event. The pool is already
@@ -1867,6 +1910,10 @@ resolve_catalog_profile() {
     codex-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=medium ;;
     codex-luna-hi) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=high ;;
     codex-luna-max) CATALOG_PROFILE=codex-luna-max ;;
+    # #633: builder-luna is codex-luna admitted under --role builder at the
+    # #594 E3 effort (xhigh) — pinned so the catalog is consulted at the same
+    # effort the grade ceiling was rated at.
+    builder-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=xhigh ;;
     codex-astra) CATALOG_PROFILE=codex-astra ;;
 
     kiro-opus) CATALOG_PROFILE=kiro-opus ;;
@@ -1892,8 +1939,8 @@ resolve_catalog_profile() {
 #
 # Replaces this spelling's model id and default effort with the canonical values
 # from `scopefuel policy launch`. Every path that does *not* end in a canonical
-# answer sets CATALOG_STALE=1, which the spawn brief header carries as
-# `catalog=stale` — including the ones that look like ordinary tolerance
+# answer sets CATALOG_STALE=1, which the spawn brief carries as a
+# `wrk-note: catalog=stale` line — including the ones that look like ordinary tolerance
 # (scopefuel absent, too old to have the subcommand, request failed). "We could
 # not confirm the canon" is one fact, and a launch that quietly used its own
 # table while claiming nothing is exactly the silence this change removes.
@@ -2046,7 +2093,20 @@ resolve_profile() {
     # duplicate the claude/codex subscription spend.
     devin-glm52) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model glm-5-2 --permission-mode dangerous --respect-workspace-trust false) ;;
     devin-swe17) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-1-7 --permission-mode dangerous --respect-workspace-trust false) ;;
-    devin-ds41) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-high --permission-mode dangerous --respect-workspace-trust false) ;;
+    # #666: builder-ds41 admits the paid ds41 rung under --role builder with
+    # the identical argv (the operator's ds41-builder policy); the devin-ds41
+    # worker spelling itself stays worker-only there.
+    devin-ds41|builder-ds41) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-high --permission-mode dangerous --respect-workspace-trust false) ;;
+    # Task #635: devin effort lives inside the model id — there is no --effort
+    # flag — so each rung is a named profile on the same unattended argv.
+    # devin-swe2 stays the high default; swe-2-medium/max are the free rungs,
+    # ds41-max the paid max rung. The swe-2 effort spellings are also admitted
+    # under --role builder (that is the builder-devin effort path), and #666
+    # adds the named builder spellings builder-devin-medium/-max and
+    # builder-ds41-max — same argv as the worker variants.
+    devin-swe2-medium|builder-devin-medium) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-swe2-max|builder-devin-max) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model swe-2-max --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-ds41-max|builder-ds41-max) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model deepseek-v4-1-flash-max --permission-mode dangerous --respect-workspace-trust false) ;;
 
     # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
     # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
@@ -2099,6 +2159,10 @@ resolve_profile() {
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    # task #633 (#594 E3): builder-luna is codex-luna under --role builder at
+    # xhigh. The literal is the catalog-unreachable fallback; #593 wiring lets
+    # `policy launch` replace both fields.
+    builder-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
     # task #527 요건 ⑦: codex-astra default effort is xhigh, unified with
     # ARCHITECT.md's spawn command and the consult-advisor SKILL.md note
     # (hk:doc note/2026-09-22/task527-astra-effort-alignment).
@@ -2203,14 +2267,14 @@ resolve_profile() {
     # argparse-rejected, rc=2 fail-closed). Per-model attribution survives in
     # the job.spawned payload `profile` and the quota_pool.record
     # `launch_profile`, so reps stay separated per model.
-    devin-glm52|devin-swe17|devin-ds41) GATE_PROFILE=devin-swe2 ;;
+    devin-glm52|devin-swe17|devin-ds41|devin-swe2-medium|devin-swe2-max|devin-ds41-max|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max) GATE_PROFILE=devin-swe2 ;;
     codex|codex-sol|codex-max|builder-sol|captain-sol|codex-sol56) GATE_PROFILE=codex-max ;;
     # task #527: the gate role-denies astra without an allowed --purpose, so the
     # counsel spawn path defaults it to `architect` (the wrk-side counsel use).
     # An explicit --purpose director|operator-request still wins.
     codex-astra) GATE_PROFILE=codex-astra; [[ -n "${PURPOSE:-}" ]] || PURPOSE=architect ;;
     codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;
-    codex-luna|codex-luna-hi|codex-luna-max|codex-luna56) GATE_PROFILE=codex-luna-max ;;
+    codex-luna|codex-luna-hi|codex-luna-max|codex-luna56|builder-luna) GATE_PROFILE=codex-luna-max ;;
     kiro-opus|kiro-opus-xhigh|kiro-opus-max) GATE_PROFILE=kiro-opus ;;
     kiro-sonnet) GATE_PROFILE=kiro-sonnet ;;
     kiro-cheap) GATE_PROFILE=kiro-cheap ;;
@@ -2269,6 +2333,118 @@ resolve_profile() {
       fi
       ;;
   esac
+}
+
+# #637: a pane's env and argv die with it — after a reboot herdr restores the
+# pane as bare `claude --resume <id>` (hk:doc
+# task/2026-09-24/resume-loses-worker-env). For claude-kind workers the durable
+# copy of the prompt-suggestion toggle lives in the worker worktree's own
+# .claude/settings.local.json, which Claude Code re-reads on every launch,
+# resume included (verified: env values from a linked worktree's local file
+# reach the session's process env).
+#
+# The launch permission mode is deliberately NOT written. Per
+# settings-reference, "`auto` and `bypassPermissions` don't take effect from
+# project or local settings"; the local source is still highest-priority, so
+# the session then "starts in Manual mode" — writing bypassPermissions here
+# would pin every flagless claude launch in the worktree (a herdr restore
+# included) to Manual, overriding user settings and the built-in default.
+# Restoring bypass needs the launch flag, or user/--settings/managed scope.
+#
+# Merge, never clobber: an existing file keeps every unrelated key, and only
+# our env key is written. A file that is not a JSON object (or whose `env` is
+# not an object — `null` included), or one already tracked by the repo, aborts
+# the spawn rather than being silently overwritten — that state needs a human,
+# not a rewrite. A symlinked .claude directory or settings file (dangling
+# included) is left alone with a warning: writing through it could modify a
+# location wrk does not own, and os.replace would destroy a leaf symlink to
+# shared settings (CodeRabbit CR2/CR4) — the spawn proceeds without persisted
+# settings.
+write_claude_local_settings() {
+  local cwd="$1"
+  # A tracked settings.local.json belongs to the repo; wrk must never modify a
+  # target repo's tracked files.
+  git -C "$cwd" ls-files --error-unmatch -- .claude/settings.local.json >/dev/null 2>&1 &&
+    { printf 'wrk: %s/.claude/settings.local.json is tracked in the repo; refusing to modify a tracked file\n' "$cwd" >&2; return 3; }
+  # -L sees the link itself, so a dangling symlink is refused too.
+  if [[ -L "$cwd/.claude" || -L "$cwd/.claude/settings.local.json" ]]; then
+    warn "$cwd: .claude or .claude/settings.local.json is a symlink; leaving it alone (no local settings written)"
+    return 0
+  fi
+  python3 - "$cwd" <<'PY'
+import json, os, sys, tempfile
+
+cwd = sys.argv[1]
+path = os.path.join(cwd, ".claude", "settings.local.json")
+
+data = {}
+existed = os.path.exists(path)
+if existed:
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        print("wrk: %s exists but is not valid JSON; refusing to modify it (%s)" % (path, e), file=sys.stderr)
+        sys.exit(3)
+    if not isinstance(data, dict):
+        print("wrk: %s is not a JSON object; refusing to modify it" % path, file=sys.stderr)
+        sys.exit(3)
+
+if "env" in data:
+    if not isinstance(data["env"], dict):
+        print("wrk: %s: 'env' is not a JSON object; refusing to modify it" % path, file=sys.stderr)
+        sys.exit(3)
+else:
+    data["env"] = {}
+
+data["env"]["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
+
+os.makedirs(os.path.dirname(path), exist_ok=True)
+fd, tmp = tempfile.mkstemp(prefix=".settings.local.json.", dir=os.path.dirname(path))
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+    if existed:
+        os.chmod(tmp, os.stat(path).st_mode & 0o777)
+    os.replace(tmp, path)
+finally:
+    if os.path.exists(tmp):
+        os.unlink(tmp)
+PY
+}
+
+# The worker's local settings must never enter a commit. Claude Code itself
+# keeps the file out of git via the user's global excludes; a repo that already
+# ignores it needs nothing. When the worker repo does not, the pattern goes to
+# the repository's own .git/info/exclude (resolved through --git-common-dir so
+# linked worktrees share it) — a tracked file is never touched. A cwd outside
+# git, or an exclude write that fails, is a warning, not a failed spawn: the
+# file is already on disk and the spawn stands.
+ensure_settings_local_ignored() {
+  local cwd="$1" common
+  git -C "$cwd" rev-parse --git-common-dir >/dev/null 2>&1 || {
+    warn "$cwd is not a git worktree; cannot verify .claude/settings.local.json is git-ignored (nothing can commit it there)"
+    return 0
+  }
+  git -C "$cwd" check-ignore -q -- .claude/settings.local.json && return 0
+  common="$(git -C "$cwd" rev-parse --git-common-dir)"
+  # --git-common-dir is relative for a main checkout (".git"); anchor it to the
+  # worktree cwd or the mkdir/append below would land in wrk's own directory.
+  [[ "$common" == /* ]] || common="$cwd/$common"
+  mkdir -p "$common/info" ||
+    { warn "cannot create $common/info; $cwd/.claude/settings.local.json is not git-ignored — do not commit it"; return 0; }
+  # A file with no final newline would glue our pattern onto its last line,
+  # un-ignoring whatever that rule named (CodeRabbit CR3).
+  if [[ -s "$common/info/exclude" ]] && [[ -n "$(tail -c 1 "$common/info/exclude" 2>/dev/null)" ]]; then
+    printf '\n' >>"$common/info/exclude" ||
+      { warn "cannot append to $common/info/exclude; $cwd/.claude/settings.local.json is not git-ignored — do not commit it"; return 0; }
+  fi
+  grep -qxF '**/.claude/settings.local.json' "$common/info/exclude" 2>/dev/null ||
+    printf '%s\n' '**/.claude/settings.local.json' >>"$common/info/exclude" ||
+    { warn "cannot append to $common/info/exclude; $cwd/.claude/settings.local.json is not git-ignored — do not commit it"; return 0; }
+  git -C "$cwd" check-ignore -q -- .claude/settings.local.json ||
+    warn "$cwd/.claude/settings.local.json is still not git-ignored after updating info/exclude — do not commit it"
 }
 
 completion_event() {
@@ -4024,18 +4200,25 @@ spawn_cmd() {
     case "$MODEL" in
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
-      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-grok or builder-kimi (pilot worker spellings devin-swe2, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; terra/luna and devin-glm52/devin-swe17/devin-ds41 are worker-only)" ;;
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi or builder-luna (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
         [[ -z "$EFFORT" || "$EFFORT" == high ]] || die "builder-opus (legacy captain-opus alias) requires effort high"
         ;;
+      # #633: the catalog grades codex-luna per effort (medium=B, max=A+). The
+      # E3 sample is defined at xhigh only — a lower or higher --effort would
+      # move the rung the ceiling was rated at, so the guard reuses the
+      # builder-opus pin and refuses rather than silently relaunch.
+      builder-luna)
+        [[ -z "$EFFORT" || "$EFFORT" == xhigh ]] || die "builder-luna requires effort xhigh (#594 E3 sample profile)"
+        ;;
     esac
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
@@ -4089,6 +4272,20 @@ spawn_cmd() {
       die "cannot resolve Kimi CWD to an absolute path: $CWD"
     fi
     kimi_seed_workspace_trust "$CWD" "$KIMI_TRUST_HOME"
+  fi
+
+  # #637: persist what the pane would otherwise lose on a herdr reboot restore
+  # (bare `claude --resume <id>`): the prompt-suggestion-off env, in the worker
+  # worktree's .claude/settings.local.json. The permission mode is not
+  # persisted — local-file bypassPermissions cannot take effect (settings-ref)
+  # and would force Manual on every flagless launch in the worktree. Runs after
+  # every gate and before tab create, so a malformed or tracked existing file
+  # fails the spawn closed with no pane left behind. Same resident carve-out
+  # as the pane env: --purpose director is left as is.
+  if [[ "$PROFILE_KIND" == claude && "${PURPOSE:-}" != director ]]; then
+    write_claude_local_settings "$CWD" ||
+      die "claude worker local settings not written for $CWD; spawn aborted before any pane (nothing was clobbered)"
+    ensure_settings_local_ignored "$CWD"
   fi
 
   TAB_ENV=()

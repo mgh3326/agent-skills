@@ -7,15 +7,51 @@ HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 ARBITER="$ROOT/bin/arbiter"
 TMP="$(mktemp -d)"
-# spawn 이 띄운 센티널은 nohup 으로 분리되어 있다 — 스위트가 끝나면 함께 거둔다.
+# 이 스위트가 띄운 sleep 은 환경(ARBITER_INBOX_ROOT 등)에 $TMP 를 달고 있다 —
+# run 소속을 정확히 식별하므로 다른 스위트의 sleep 은 절대 매치되지 않는다.
+suite_sleep_orphans() {
+  local pid
+  while IFS= read -r pid; do
+    if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qF -- "$TMP"; then
+      printf '%s\n' "$pid"
+    fi
+  done < <(pgrep -x sleep 2>/dev/null || true)
+}
+# spawn 이 띄운 센티널은 nohup 으로 분리되어 있다 — 스위트가 끝나면 그 자식
+# (interval 동안 살아남는 sleep)과 함께 거둔다. 센티널만 죽이면 sleep 이 orphan
+# 으로 남아 잡 디렉토리의 flock fd 를 interval 내내 잡고 있는다(#637, #682).
 cleanup() {
-  local pidfile pid
+  local pidfile pid child orphan escaped deadline
   while IFS= read -r pidfile; do
     [[ -s "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then kill "$pid" 2>/dev/null || true; fi
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    # STOP 으로 얼려 자식 목록과 kill 사이에 새 sleep 을 fork 하지 못하게 하고,
+    # 자식은 pid 로만 죽인다 — 이름 기반 pkill 은 타 스위트 프로세스를 친다.
+    kill -STOP "$pid" 2>/dev/null || true
+    while IFS= read -r child; do
+      kill "$child" 2>/dev/null || true
+    done < <(pgrep -P "$pid" 2>/dev/null || true)
+    kill "$pid" 2>/dev/null || true
+    kill -CONT "$pid" 2>/dev/null || true
   done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
+  # 실행 중간에 센티널이 먼저 죽은 경우 sleep 은 이미 init 아래로 reparent 됐다 —
+  # 환경 태그로 여전히 우리 것임을 식별해 거둔다.
+  deadline=$(( $(date +%s) + 5 ))
+  while :; do
+    escaped="$(suite_sleep_orphans)"
+    if [[ -z "$escaped" ]]; then break; fi
+    for orphan in $escaped; do kill "$orphan" 2>/dev/null || true; done
+    if (( $(date +%s) >= deadline )); then break; fi
+    sleep 0.2
+  done
   rm -rf "$TMP"
+  # 회귀 게이트: teardown 이 센티널 자식을 놓치면 조용히 새는 게 아니라 스위트가
+  # 실패해야 한다.
+  if [[ -n "$escaped" ]]; then
+    echo "FAIL: sentinel sleep children survived teardown: $escaped" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
@@ -341,8 +377,13 @@ grep -qx 'codex-terra-max' <<<"$profiles_out"
 grep -qx 'builder-opus' <<<"$profiles_out"
 grep -qx 'builder-sol' <<<"$profiles_out"
 grep -qx 'builder-devin' <<<"$profiles_out"
+grep -qx 'builder-devin-medium' <<<"$profiles_out"
+grep -qx 'builder-devin-max' <<<"$profiles_out"
+grep -qx 'builder-ds41' <<<"$profiles_out"
+grep -qx 'builder-ds41-max' <<<"$profiles_out"
 grep -qx 'builder-grok' <<<"$profiles_out"
 grep -qx 'builder-kimi' <<<"$profiles_out"
+grep -qx 'builder-luna' <<<"$profiles_out"
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
@@ -357,6 +398,12 @@ if grep -qx 'captain-astra' <<<"$profiles_out"; then exit 1; fi
 grep -qx 'devin-glm52' <<<"$profiles_out"
 grep -qx 'devin-swe17' <<<"$profiles_out"
 grep -qx 'devin-ds41' <<<"$profiles_out"
+# #635: the devin effort rungs are named profiles (effort sits inside the
+# devin model id — no --effort flag exists). The scopefuel catalog lists all
+# three, so the wrk⊇scopefuel cross-check needs them here.
+grep -qx 'devin-swe2-medium' <<<"$profiles_out"
+grep -qx 'devin-swe2-max' <<<"$profiles_out"
+grep -qx 'devin-ds41-max' <<<"$profiles_out"
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -394,6 +441,7 @@ profiles=(
   "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku"
   "devin-swe2:devin-swe2"
   "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
+  "devin-swe2-medium:devin-swe2" "devin-swe2-max:devin-swe2" "devin-ds41-max:devin-swe2"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
@@ -1114,8 +1162,11 @@ echo "PASS devin-swe2 worker kind/argv/no-effort snapshot + builder-pilot admiss
 
 # Task 281 (operator decision 2026-09-14 devin-pro-paid-models): the three
 # additional Devin model profiles reuse the identical unattended argv — only
-# the --model name differs — and reject --effort like devin-swe2.
-for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepseek-v4-1-flash-high"; do
+# the --model name differs — and reject --effort like devin-swe2. #635 adds
+# the effort rungs as named profiles (effort lives inside the model id), same
+# argv skeleton and same --effort rejection.
+for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepseek-v4-1-flash-high" \
+  "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2-max" "devin-ds41-max:deepseek-v4-1-flash-max"; do
   devin_profile="${devin_pair%%:*}"
   devin_model="${devin_pair#*:}"
   : >"$TMP/herdr.log"
@@ -1131,7 +1182,12 @@ for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepse
     fail "$devin_profile run argv must not contain effort"
   expect_exit 2 spawn_base "$devin_profile" --effort high
 done
-echo "PASS devin-glm52/devin-swe17/devin-ds41 worker kind/argv/no-effort snapshots"
+echo "PASS devin-glm52/devin-swe17/devin-ds41 + #635 effort-variant worker kind/argv/no-effort snapshots"
+
+# #635 AC2: an unknown effort token is still refused on the new spellings —
+# the generic unknown-effort die fires before the devin no-effort guard.
+expect_exit 2 spawn_base devin-swe2-max --effort bogus
+expect_exit 2 spawn_base devin-ds41-max --effort medium
 
 # ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
 # file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
@@ -1951,6 +2007,69 @@ assert spawned["payload"]["profile"] == "devin-swe2", spawned
 PY
 echo "PASS devin-swe2 scopefuel-gate-to-arbiter-pool-and-spawn-receipt"
 
+# ---------------------------------------------------------------------------
+# task #677: the quota_pool.record launch_profile must carry the canonical
+# catalog profile, not the launcher spelling. codex-sol/codex-max/codex/
+# builder-sol/captain-sol all run gpt-6-sol, whose catalog profile is codex-sol
+# (scopefuel PROFILE_ALIASES: codex-max -> codex-sol; `policy launch builder-sol`
+# is not in the catalog at all). Recording the raw spelling split reps/usage
+# attribution across names the grade table cannot read — 2026-09-25: a
+# builder-sol xhigh spawn recorded launch_profile=builder-sol@xhigh and
+# profile=codex-max while its pane ran gpt-6-sol xhigh. The ROB-1213
+# cross-checked fields stay put (pool from scopefuel, profile gate-normalized);
+# non-codex pools keep their literal spelling@effort, so no other pool's records
+# change; rollback spellings (codex-sol56) stay literal by design.
+# Mutant: revert the canonical-name mapping in arbiter_admit -> these go RED.
+# ---------------------------------------------------------------------------
+# Own arbiter state (like the R20/R21/idempotency sections): these successful
+# spawns leave durable quota records behind, and the shared suite inbox later
+# asserts on the exact record set (e.g. no claude records after a released
+# spawn). Records written here must not leak into that set.
+T677_INBOX="$TMP/inbox-677"
+T677_XDG="$TMP/xdg-677"
+launch_profile_case() {
+  local model="$1" job="$2" expected="$3"; shift 3
+  ARBITER_INBOX_ROOT="$T677_INBOX" XDG_DATA_HOME="$T677_XDG" \
+    spawn_base "$model" --job "$job" --t T1 "$@" >/dev/null
+  python3 - "$T677_INBOX/$job/events" "$expected" "$model" <<'PY'
+import json, pathlib, sys
+events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(event for event in events if event["kind"] == "quota_pool.record")
+got = record["payload"]["launch_profile"]
+assert got == sys.argv[2], f"{sys.argv[3]}: launch_profile={got!r} expected {sys.argv[2]!r}"
+PY
+}
+# Every codex spelling: the raw aliases collapse onto the canonical catalog
+# profile, the spellings that already are canonical stay put, and the ROB-591
+# rollback spellings stay literal (they pin the superseded model).
+launch_profile_case codex-sol codex-sol-xhigh 'codex-sol@xhigh' --effort xhigh
+launch_profile_case builder-sol builder-sol-canon 'codex-sol@max' --role builder --lane builder-sol-lane --parent parent-lane
+launch_profile_case captain-sol captain-sol-canon 'codex-sol@max' --role builder --lane captain-sol-lane --parent parent-lane
+launch_profile_case codex-max codex-max-canon 'codex-sol@max'
+launch_profile_case codex codex-canon 'codex-sol@high'
+launch_profile_case codex-sol56 codex-sol56-rollback 'codex-sol56@max'
+launch_profile_case codex-terra codex-terra-canon 'codex-terra@medium'
+launch_profile_case codex-med codex-med-canon 'codex-terra@medium'
+launch_profile_case codex-terra-max codex-terra-max-canon 'codex-terra-max@max'
+launch_profile_case codex-luna codex-luna-canon 'codex-luna@medium'
+launch_profile_case codex-luna-hi codex-luna-hi-canon 'codex-luna@high'
+launch_profile_case codex-luna-max codex-luna-max-canon 'codex-luna-max@max'
+launch_profile_case codex-luna56 codex-luna56-rollback 'codex-luna56@medium'
+launch_profile_case builder-luna builder-luna-canon 'codex-luna@xhigh' --role builder --lane builder-luna-lane --parent parent-lane
+launch_profile_case codex-astra codex-astra-canon 'codex-astra@xhigh'
+# Other pools keep their literal spelling@effort — no other pool's record moves.
+launch_profile_case devin-swe2 devin-launch-literal 'devin-swe2'
+launch_profile_case builder-opus builder-opus-launch-literal 'builder-opus@high' --role builder --lane builder-opus-lane --parent parent-lane
+launch_profile_case grok grok-launch-literal 'grok@high'
+python3 - "$T677_INBOX/codex-sol-xhigh/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(event for event in events if event["kind"] == "quota_pool.record")
+assert record["payload"]["pool"] == "codex", record
+assert record["payload"]["profile"] == "codex-max", record
+PY
+echo "PASS 677 launch_profile carries the canonical catalog profile for codex aliases"
+
 # Task 577 failure cleanup: a bounded welcome timeout occurs after the Devin
 # quota record and pane exist. It must emit process diagnostics, close that
 # pane, and release this job's arbiter record without touching another Devin
@@ -2694,7 +2813,7 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -2721,15 +2840,16 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi|devin-swe2|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
 # Token pattern covers the whole accept set: builder-*/captain-* spellings plus
 # the pilot worker spellings. Bare 'grok' is not extracted (it also matches
 # inside builder-grok); grok-hi presence covers it, and the literal accept-line
-# pin above guards the list itself.
-builder_tokens() { grep -oE '(builder|captain)-[a-z]+|devin-swe2|grok-hi|kimi-k3' | grep -vx 'builder-level' | sort -u; }
+# pin above guards the list itself. `builder-level` is prose, `captain-NN` is a
+# session name in SKILL.md — neither is a profile.
+builder_tokens() { grep -oE '(builder|captain)-[a-z0-9-]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vxE 'builder-level|captain-[0-9]+' | sort -u; }
 accept_set="$(builder_tokens <<<"$accept_line")"
 help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
 help_set="$(builder_tokens <<<"$help_block")"
@@ -2863,6 +2983,37 @@ PY
 expect_exit 2 spawn_base builder-devin --role builder --lane builder-devin-lane --parent parent-lane --effort high --job builder-devin-effort-mutant
 echo "PASS builder-devin pilot profile reuses devin-swe2 kind/argv"
 
+# #635: devin effort is inside the model id, so "builder-devin takes the
+# effort too" lands as the swe-2 effort spellings admitted under --role
+# builder — same admission mechanism as the devin-swe2 pilot spelling.
+for devin_builder_pair in "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2-max"; do
+  devin_builder_profile="${devin_builder_pair%%:*}"
+  devin_builder_model="${devin_builder_pair#*:}"
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  set +e
+  devin_variant_builder_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base "$devin_builder_profile" --role builder --lane "builder-${devin_builder_profile}-lane" --parent parent-lane --job "builder-${devin_builder_profile}-job" --t T1 2>&1)"
+  devin_variant_builder_rc=$?
+  set -e
+  [[ "$devin_variant_builder_rc" -eq 0 ]] ||
+    fail "$devin_builder_profile must be admitted under --role builder (rc=$devin_variant_builder_rc): $devin_variant_builder_out"
+  grep -q "model=$devin_builder_profile" <<<"$devin_variant_builder_out" ||
+    fail "$devin_builder_profile builder spawn output lost its model: $devin_variant_builder_out"
+  devin_variant_builder_run="$(grep '^pane run ' "$TMP/herdr.log")"
+  [[ "$devin_variant_builder_run" == "pane run w:p1 devin --model $devin_builder_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
+    fail "$devin_builder_profile builder argv mismatch: $devin_variant_builder_run"
+  [[ " $devin_variant_builder_run " != *' --effort '* ]] ||
+    fail "$devin_builder_profile builder argv must not gain an effort flag"
+  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "devin-swe2" ]] ||
+    fail "$devin_builder_profile must gate as the scopefuel-known devin-swe2 spelling"
+  python3 - "$ARBITER_INBOX_ROOT/builder-${devin_builder_profile}-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+done
+echo "PASS devin-swe2 effort spellings admitted under --role builder (#635)"
+
 : >"$TMP/herdr.log" "$TMP/scopefuel.log"
 set +e
 builder_grok_out="$(spawn_base builder-grok --role builder --lane builder-grok-lane --parent parent-lane --job builder-grok-job --t T1 2>&1)"
@@ -2911,6 +3062,77 @@ PY
   expect_exit 2 spawn_base builder-kimi --role builder --lane builder-kimi-lane --parent parent-lane --effort high --job builder-kimi-effort-mutant )
 echo "PASS builder-kimi pilot profile reuses kimi-k3 kind/argv"
 
+# #633 (#594 E3): builder-luna is codex-luna under --role builder, launched at
+# the E3 effort (xhigh) and gated as the scopefuel-known codex-luna-max
+# spelling like every other luna variant.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+set +e
+builder_luna_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --job builder-luna-job --t T1 2>&1)"
+builder_luna_rc=$?
+set -e
+[[ "$builder_luna_rc" -eq 0 ]] ||
+  fail "builder-luna must be admitted under --role builder (rc=$builder_luna_rc): $builder_luna_out"
+grep -q 'model=builder-luna' <<<"$builder_luna_out" ||
+  fail "builder-luna spawn output lost its model: $builder_luna_out"
+builder_luna_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_luna_start" == 'agent start fixture --kind codex --pane w:p1 --timeout 120000 -- --yolo -m gpt-6-luna -c model_reasoning_effort=xhigh' ]] ||
+  fail "builder-luna must launch the codex-luna argv at effort xhigh: $builder_luna_start"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-luna-max" ]] ||
+  fail "builder-luna must gate as the scopefuel-known codex-luna-max spelling"
+grep -q 'policy launch codex-luna effort=xhigh' "$TMP/launch.log" ||
+  fail "builder-luna must consult the catalog for codex-luna at effort xhigh"
+python3 - "$ARBITER_INBOX_ROOT/builder-luna-job/events/00001-job.claim.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["owner_lane"] == "builder-luna-lane", event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+# 급 가드 (grade guard): the catalog grades codex-luna per effort
+# (medium=B, max=A+) and the E3 sample is rated at xhigh, so any other
+# --effort is refused before gate/claim, exactly like builder-opus@high.
+expect_exit 2 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --effort max --job builder-luna-effort-mutant
+expect_exit 2 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --effort medium --job builder-luna-effort-low-mutant
+expect_exit 2 spawn_base builder-luna --job builder-luna-role-mutant --t T1
+echo "PASS builder-luna E3 profile launches codex-luna argv at xhigh"
+
+# #666: the devin effort rungs exist as named builder spellings — same
+# unattended argv as the worker variants, gated as devin-swe2 like every
+# devin-* profile, and refused without --role builder. builder-ds41[-max] is
+# the paid rung admitted per the operator's ds41-builder policy; the ds41
+# worker spellings stay worker-only (the refusal loop below pins that).
+for devin_builder_pair in "builder-devin-medium:swe-2-medium" "builder-devin-max:swe-2-max" \
+  "builder-ds41:deepseek-v4-1-flash-high" "builder-ds41-max:deepseek-v4-1-flash-max"; do
+  devin_builder_profile="${devin_builder_pair%%:*}"
+  devin_builder_model="${devin_builder_pair#*:}"
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  set +e
+  devin_builder_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base "$devin_builder_profile" --role builder --lane "$devin_builder_profile-lane" --parent parent-lane --job "$devin_builder_profile-job" --t T1 2>&1)"
+  devin_builder_rc=$?
+  set -e
+  [[ "$devin_builder_rc" -eq 0 ]] ||
+    fail "$devin_builder_profile must be admitted under --role builder (rc=$devin_builder_rc): $devin_builder_out"
+  grep -q "model=$devin_builder_profile" <<<"$devin_builder_out" ||
+    fail "$devin_builder_profile spawn output lost its model: $devin_builder_out"
+  devin_builder_run="$(grep '^pane run ' "$TMP/herdr.log")"
+  [[ "$devin_builder_run" == "pane run w:p1 devin --model $devin_builder_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
+    fail "$devin_builder_profile must reuse the worker variant's argv verbatim: $devin_builder_run"
+  [[ " $devin_builder_run " != *' --effort '* ]] ||
+    fail "$devin_builder_run run argv must not contain effort"
+  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "devin-swe2" ]] ||
+    fail "$devin_builder_profile must gate as the scopefuel-known devin-swe2 spelling"
+  python3 - "$ARBITER_INBOX_ROOT/$devin_builder_profile-job/events/00001-job.claim.json" "$devin_builder_profile" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1]))
+assert event["payload"]["role"] == "builder", event
+assert event["payload"]["owner_lane"] == "%s-lane" % sys.argv[2], event
+assert event["payload"]["parent_lane"] == "parent-lane", event
+PY
+  expect_exit 2 spawn_base "$devin_builder_profile" --role builder --lane "$devin_builder_profile-lane" --parent parent-lane --effort high --job "$devin_builder_profile-effort-mutant"
+  expect_exit 2 spawn_base "$devin_builder_profile" --job "$devin_builder_profile-role-mutant" --t T1
+done
+echo "PASS #666 devin builder variants reuse the worker argv and need --role builder"
+
 # The worker spellings the decision names for the pilot are admissible as
 # builders too, and keep their ordinary worker meaning.
 for pilot_alias in grok grok-hi kimi-k3; do
@@ -2933,16 +3155,17 @@ done
 echo "PASS builder-pilot-admits-worker-spellings"
 
 # Profiles outside the allowlist are still refused before the gate, and the
-# refusal enumerates the three pilot profiles by name plus the worker-only
-# devin model variants (task 281).
-for rejected in codex-terra codex-luna oc-solar4 devin-ds41; do
+# refusal enumerates the builder profiles by name plus the worker-only
+# devin model variants (task 281, #635 ds41-max, #666 builder spellings —
+# the ds41 worker spellings stay refused under --role builder).
+for rejected in codex-terra codex-luna oc-solar4 devin-ds41 devin-ds41-max; do
   set +e
   rejected_out="$(spawn_base "$rejected" --role builder --lane builder-lane --parent parent-lane --job "builder-reject-$rejected" --t T1 2>&1)"
   rejected_rc=$?
   set -e
   [[ "$rejected_rc" -eq 2 ]] ||
     fail "--role builder must still reject $rejected with exit 2, got $rejected_rc: $rejected_out"
-  for named in builder-devin builder-grok builder-kimi devin-glm52 devin-swe17 devin-ds41; do
+  for named in builder-devin builder-devin-medium builder-devin-max builder-ds41 builder-ds41-max builder-grok builder-kimi builder-luna devin-glm52 devin-swe17 devin-ds41 devin-ds41-max; do
     grep -q "$named" <<<"$rejected_out" ||
       fail "the --role builder refusal must list $named: $rejected_out"
   done

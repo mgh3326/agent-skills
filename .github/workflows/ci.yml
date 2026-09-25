@@ -38,8 +38,10 @@ jobs:
             tests/test-installer-route.sh \
             tests/test-installer-deploy-record.sh \
             tests/test-prompt-suggestion-off.sh \
+            tests/test-resume-settings.sh \
             tests/test-untagged-operator-evidence.sh \
             tests/test-event-monitor-doc.sh \
+            tests/test-decision-request-doc.sh \
             tests/test-input-line-not-evidence.sh \
             tests/test-tester-family-policy.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
@@ -59,7 +61,9 @@ jobs:
           bash tests/test-installer-route.sh
           bash tests/test-installer-deploy-record.sh
           bash tests/test-prompt-suggestion-off.sh
+          bash tests/test-resume-settings.sh
           bash tests/test-untagged-operator-evidence.sh
           bash tests/test-event-monitor-doc.sh
+          bash tests/test-decision-request-doc.sh
           bash tests/test-input-line-not-evidence.sh
           bash tests/test-tester-family-policy.sh

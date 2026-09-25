@@ -124,7 +124,11 @@ rename한다. 첫 explain이 어떤 규칙에도 매치되지 않고 평가된 �
 규칙(신뢰 다이얼로그·권한
 프롬프트·오류 화면)이나 다른 agent, 읽을 수 없는 envelope은 즉시 판정하고,
 창이 닫히면 기존 fail-closed 경로와 진단 아티팩트 보존이 그대로 적용된다.
-effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로 `devin-swe2`로
+Devin에는 `--effort` 플래그가 없고 effort가 모델 id 안에 들어 있으므로,
+effort 런그는 별도 프로필이다(#635): `devin-swe2-medium`(`--model swe-2-medium`)과
+`devin-swe2-max`(`--model swe-2-max`)는 무료이고, `devin-ds41-max`
+(`--model deepseek-v4-1-flash-max`)는 유료다. `devin-swe2`는 high 기본값을 유지한다.
+quota gate에는 이름을 그대로 `devin-swe2`로
 넘기고 pool 결정·기록은 scopefuel 출력과 arbiter가 소유한다.
 
 이 분기는 herdr 0.9.1의 `agent start` 소유권 검사가 Devin 3000.11.1에서 실패하는 동안의
@@ -135,13 +139,19 @@ effort 변형은 지원하지 않는다. quota gate에는 이름을 그대로 `d
 herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000 -- --model swe-2 --permission-mode dangerous --respect-workspace-trust false
 ```
 
-`builder-devin`(동일 argv)과 워커 철자 `devin-swe2` 모두 `--role builder`로 쓸 수 있다.
+`builder-devin`(동일 argv)과 워커 철자 `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`
+모두 `--role builder`로 쓸 수 있다. #666 부터 런그별 빌더 철자도 열려 있다 —
+`builder-devin-medium`·`builder-devin-max`(무료 swe-2 런그, 워커 변형과 동일 argv)와
+유료 ds41 런그의 `builder-ds41`·`builder-ds41-max`(운영자 ds41-builder 정책)다.
 빌더 운용 범위(A+ 급 작업의 T1·T2)의 정본은 `spawn-worker/SKILL.md` §2-2 급표의 `builder-devin` 행이다.
 
 `devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
-프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). 셋 모두 scopefuel의
-`devin` 풀 하나를 공유하고 worker 전용이다. 급은 미측정 — `devin-glm52`·`devin-swe17`은
-T1, `devin-ds41`은 T1/T2로 시작하며 reps 3건으로 확정한다. `devin-ds41`만 유료다.
+프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). `devin-ds41-max`도
+같은 argv에 모델명만 `deepseek-v4-1-flash-max`인 worker 전용 유료 변형이다. 넷 모두
+scopefuel의 `devin` 풀 하나를 공유하고 worker 전용이다 — 유료 ds41 런그의 빌더
+경로는 `builder-ds41`·`builder-ds41-max` 철자뿐이다. 급은 미측정 —
+`devin-glm52`·`devin-swe17`은 T1, `devin-ds41`·`devin-ds41-max`는 T1/T2로 시작하며
+reps 3건으로 확정한다. `devin-ds41`·`devin-ds41-max`만 유료다.
 
 `--t`는 **필수**다(ROB-1198 §③). 빠지면 게이트·claim·스폰 어느 것도 하지 않고
 `NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
@@ -150,8 +160,9 @@ T1, `devin-ds41`은 T1/T2로 시작하며 reps 3건으로 확정한다. `devin-d
 빌더는 `builder-opus`(Opus effort high)·`builder-sol`을 쓴다. `captain-opus`·
 `captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
 경고 후 builder로 정규화되는 legacy 별칭이다. `builder-devin`(devin-swe2
-argv, A+ 급 작업의 T1·T2 빌더 — `spawn-worker` 급표 행이 정본)과 빌더 파일럿으로 `builder-grok`(grok 4.7, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
-파일럿이 지목한 워커 철자 `devin-swe2`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
+argv, A+ 급 작업의 T1·T2 빌더 — `spawn-worker` 급표 행이 정본)와 빌더 파일럿으로 `builder-grok`(grok 4.7, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
+#666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)도 `--role builder`를 받는다.
+파일럿이 지목한 워커 철자 `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire
 R19a는 `job.escalate`·`job.joined`를 parent pane으로 전달한다.
