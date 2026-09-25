@@ -4,6 +4,7 @@ set -euo pipefail
 root="$(cd "$(dirname "$0")/.." && pwd)"
 
 python3 - "$root" <<'PY'
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -18,6 +19,8 @@ files = {
 }
 texts = {name: path.read_text(encoding="utf-8") for name, path in files.items()}
 policy = json.loads((root / "director/gate_policy.json").read_text(encoding="utf-8"))
+RULE_IDS = [f"CI-CANONICAL-{number}" for number in range(1, 8)]
+STRUCTURAL_BLOCK_SHA256 = "59bdbd9fd2736bb37a6304ad32ce38ff54ba089919922976a2cb165f5ec0c6ff"
 
 
 def contract(text: str) -> str:
@@ -32,6 +35,11 @@ def contract(text: str) -> str:
 def check_contracts(subjects: dict[str, str]) -> None:
     for name, text in subjects.items():
         body = contract(text)
+        actual_ids = re.findall(r"(?m)^- \[(CI-CANONICAL-[1-7])\]", body)
+        assert actual_ids == RULE_IDS, f"{name}: canonical structural rule IDs changed"
+        assert hashlib.sha256(body.encode("utf-8")).hexdigest() == STRUCTURAL_BLOCK_SHA256, (
+            f"{name}: canonical structural rule block changed"
+        )
         normalized = re.sub(r"\s+", " ", body).casefold()
         for required in (
             "director/gate_policy.json",
@@ -73,7 +81,7 @@ def check_contracts(subjects: dict[str, str]) -> None:
             (r"outside ci surface.{0,160}local run.{0,80}(?:선택|optional)", "outside-CI local run weakened"),
             (r"red rerun.{0,160}verification is met", "red rerun was treated as met"),
             (r"surviving mutant.{0,160}(?:참고|passes|통과를 막지)", "surviving mutant was excused"),
-            (r"ci(?: or collection)? configuration.{0,160}shortcut.{0,80}(?:쓴다|use)", "CI configuration shortcut restored"),
+            (r"(?:ci(?: or collection)? configuration|ci 설정).{0,160}shortcut.{0,80}(?:쓴다|use|사용)", "CI configuration shortcut restored"),
         ):
             assert not re.search(forbidden, all_normalized), f"{name}: {label}"
 
@@ -88,7 +96,7 @@ def expect_assertion(label: str, callback) -> None:
 
 
 check_contracts(texts)
-print("PASS ci-canonical prose contracts=4/4 policy-list-copies=0 tester-full-suite-mandates=0")
+print("PASS ci-canonical structural-contracts=4/4 rule-ids=7 policy-list-smoke=0 tester-full-suite-smoke=0")
 
 
 def mutate_builder(old: str, new: str) -> dict[str, str]:
@@ -132,6 +140,7 @@ for label, text in (
     ("red-rerun-override", "다만 red rerun 뒤 green rerun이면 verification is met다."),
     ("surviving-mutant-override", "단 surviving mutant는 참고용이며 통과를 막지 않는다."),
     ("configuration-shortcut-override", "CI or collection configuration PR도 CI가 green이면 shortcut을 쓴다."),
+    ("configuration-korean-p10", "CI 설정 변경 PR도 CI가 green이면 shortcut을 쓴다."),
 ):
     expect_assertion(label, lambda text=text: check_contracts(append_builder(text)))
 
@@ -142,4 +151,7 @@ expect_assertion("required-job-list-copy", lambda: check_contracts(list_mutant))
 runner_list_mutant = dict(texts)
 runner_list_mutant["director"] += "\n(ubuntu-latest, macos-latest)\n"
 expect_assertion("required-runner-list-copy", lambda: check_contracts(runner_list_mutant))
+
+structural_id_mutant = mutate_builder("CI-CANONICAL-5", "CI-CANONICAL-X")
+expect_assertion("structural-rule-id", lambda: check_contracts(structural_id_mutant))
 PY
