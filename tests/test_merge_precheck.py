@@ -524,21 +524,21 @@ class MergePrecheckTests(unittest.TestCase):
         expected = {
             "mgh3326/auto_trader": ("UNVERIFIED", {
                 "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
-                "G3": ("UNVERIFIED", "CI_BASE_UNBOUND"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
+                "G3": ("UNVERIFIED", "CI_BASE_MOVED"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
                 "G5": ("PASS", "SCAN_NO_HITS"), "G6": ("UNVERIFIED", "SURFACE_CLASS_UNBOUND"),
                 "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
                 "G9": ("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),
             }),
             "mgh3326/panewire": ("FAIL", {
                 "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
-                "G3": ("UNVERIFIED", "CI_BASE_UNBOUND"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
+                "G3": ("UNVERIFIED", "CI_BASE_MOVED"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
                 "G5": ("FAIL", "LEAK_PATTERN_HIT"), "G6": ("PASS", "SURFACE_FLAGS_RECORDED"),
                 "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
                 "G9": ("N/A", "RUNTIME_SURFACE_ABSENT"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),
             }),
             "mgh3326/scopefuel": ("UNVERIFIED", {
                 "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
-                "G3": ("UNVERIFIED", "CI_BASE_UNBOUND"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
+                "G3": ("UNVERIFIED", "CI_BASE_MOVED"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
                 "G5": ("PASS", "SCAN_NO_HITS"), "G6": ("PASS", "SURFACE_FLAGS_RECORDED"),
                 "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
                 "G9": ("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),

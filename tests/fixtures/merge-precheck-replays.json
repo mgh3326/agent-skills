@@ -24,7 +24,7 @@
         },
         "G3": {
           "status": "UNVERIFIED",
-          "reason_code": "CI_BASE_UNBOUND"
+          "reason_code": "CI_BASE_MOVED"
         },
         "G4": {
           "status": "UNVERIFIED",
@@ -76,7 +76,7 @@
         },
         "G3": {
           "status": "UNVERIFIED",
-          "reason_code": "CI_BASE_UNBOUND"
+          "reason_code": "CI_BASE_MOVED"
         },
         "G4": {
           "status": "UNVERIFIED",
@@ -128,7 +128,7 @@
         },
         "G3": {
           "status": "UNVERIFIED",
-          "reason_code": "CI_BASE_UNBOUND"
+          "reason_code": "CI_BASE_MOVED"
         },
         "G4": {
           "status": "UNVERIFIED",
