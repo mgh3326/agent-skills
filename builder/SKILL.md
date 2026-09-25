@@ -65,7 +65,9 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
    띄운다 — "예상 2라운드"라고 적었다고 실제 4라운드를 단독으로 끌지 않는다.
 3. **검증은 기존 `spawn_mode`(`spawn-worker` §2-1)를 따른다.** T1 자체검증 허용. 🔴 **T2
    이상은 독립 tester 필수 — builder 는 자기 구현의 tester 가 될 수 없다.** T3 는 다른
-   provider family(동일 계열 경로 없음). 단독 모드에서 builder 는 **기여자**이므로 최종 tester 는 builder 계열 밖.
+   provider family(동일 계열 경로 없음). 단독 모드에서 builder 는 **기여자**이므로 최종 tester 는 builder 계열 밖이
+   기본이다 — 단 가역 T1/T2 는 `spawn-worker` §2-4 조건부 동일 계열 검증의 조건을 **전부** 충족한 새 세션의
+   동일 계열 tester 도 된다(T3·제외 표면은 예외 없이 계열 밖).
 4. builder 는 구현·발주 **전에** AC 검토 ref 를 남긴다(목적 / 불변식 / 각 AC 가 목적을
    보증하는가 / 전부 통과하면서 목적을 망치는 반례). 브리프를 그대로 전달한 것은 검토가 아니다.
 5. AC 의 **의미**를 바꿔야 하면 고치지 말고 director 에 ESC. AC 는 hash 로 고정하고 의미가

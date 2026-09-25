@@ -164,6 +164,15 @@ def check(d: dict) -> None:
     ), "same-family label must not by itself mean merge-eligible"
     for name in ("spawn", "builder"):
         assert "§2-4 동일 계열 예외" not in d[name], f"{name}: retired term '§2-4 동일 계열 예외'"
+    builder = flat(d["builder"])
+    assert re.search(
+        r"최종 tester 는 builder 계열 밖이 기본이다 — 단 가역 T1/T2 는 `spawn-worker` §2-4 조건부 동일 계열 검증의 "
+        r"조건을 \*\*전부\*\* 충족한 새 세션의 동일 계열 tester 도 된다\(T3·제외 표면은 예외 없이 계열 밖\)",
+        builder,
+    ), "builder solo mode must admit the §2-4 route for T1/T2 and keep T3/excluded out of family"
+    assert "| 검증 독립성 | 다른 세션·다른 계열(동일 계열은 §2-4 조건부 동일 계열 검증만) |" in d["spawn"], (
+        "§2-3 independence row must point at the §2-4 route"
+    )
     for name in ("builder", "director"):
         text = flat(d[name])
         assert re.search(r"계열과 무관하게 항상 지시형 공격 표면", text), f"{name}: directed-surface rule missing"
@@ -212,6 +221,9 @@ mutants = {
     "escalation-dropped": mutate("spawn", "AC 의미 변경·같은 표면 반복 회귀가 있으면 교차 검증 또는 설계 재검토로 간다", "다시 본다"),
     "blind-rereview-dropped": mutate("spawn", "블라인드로 재검토한다", "재검토한다"),
     "label-eligibility-dropped": mutate("spawn", "`동일 계열 독립 세션 검증` 표기만으로는 머지 가능 상태가 아니다", "표기는 참고용이다"),
+    "solo-mode-categorical": mutate("builder", "계열 밖이\n   기본이다 — 단 가역 T1/T2 는", "계열 밖.\n   가역 T1/T2 도"),
+    "solo-mode-t3-leak": mutate("builder", "(T3·제외 표면은 예외 없이 계열 밖)", "(T3 포함)"),
+    "independence-row-categorical": mutate("spawn", "다른 세션·다른 계열(동일 계열은 §2-4 조건부 동일 계열 검증만)", "다른 세션·다른 계열"),
     "retired-term-back": mutate("spawn", "(§2-4 조건부 동일 계열 검증·소진 시 지연 검증).", "(타사 풀 물리적 소진 시 §2-4 동일 계열 예외)."),
 }
 for name, doc in mutants.items():
