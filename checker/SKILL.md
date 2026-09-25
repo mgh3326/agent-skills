@@ -35,6 +35,9 @@ checker는 director와 builder 사이의 **통신·서무** 역할이다. 빌더
 | G7 | RISKS | 보고의 `RISKS:` 절을 그대로 인용(축약 금지), 개수 |
 | G8 | 큐 | 해당 task가 `join`인지. 아니면 `tasks transition <id> --to join --by CHECKER_LANE` |
 
+자동 리뷰어(CodeRabbit 등)의 'Changes requested' 리뷰 상태(`reviewDecision`)는 게이트가
+아니다 — checker 는 이를 BOUNCE 사유로 쓰지 않는다(builder §9 정본과 같은 문장).
+
 <!-- openai-independent-verification:start -->
 **OpenAI 계열 독립검증 계약**
 

@@ -5154,4 +5154,170 @@ else
   echo "SKIP scopefuel⊆wrk cross-check (set WRK_TEST_SCOPEFUEL_SRC + uv to enable)"
 fi
 
+# ---------------------------------------------------------------------------
+# wrk heavy — per-host serialization lock for >1min local runs (#721)
+# ---------------------------------------------------------------------------
+HEAVY_LOCK="$TMP/heavy.lock"
+HEAVY_LOAD="$TMP/heavy-load"
+printf '0\n' >"$HEAVY_LOAD"
+export WRK_HEAVY_LOCK="$HEAVY_LOCK" WRK_HEAVY_LOAD_FILE="$HEAVY_LOAD"
+
+heavy_status_has_waiter() { "$WRK" heavy status | grep -q 'waiter pid='; }
+pid_dead() { ! kill -0 "$1" 2>/dev/null; }
+heavy_dead() { wait_until 10 pid_dead "$1"; }
+heavy_touch() { printf 'touch "%s"\n' "$1" >"$2"; }
+
+# Small command scripts stand in for real suites (sleep marks the "hold").
+# held-start is touched only after the holder has the lock and its command
+# has started — waiting on it removes the launch race (no sleep-N guessing).
+printf 'touch "%s"\nsleep 2\ntouch "%s"\n' "$TMP/heavy-held-start" "$TMP/heavy-holder-done" >"$TMP/holder2.sh"
+printf 'touch "%s"\nsleep 6\n' "$TMP/heavy-stat-held" >"$TMP/holder6.sh"
+printf 'touch "%s"\nsleep 8\n' "$TMP/heavy-cap-held" >"$TMP/holder8.sh"
+printf 'sleep 60 &\necho $! > "%s"\n' "$TMP/heavy-orphan.pid" >"$TMP/orphan.sh"
+printf 'ps -o nice= -p $$ | tr -d " " > "%s"\n' "$TMP/heavy-nice.val" >"$TMP/nice.sh"
+heavy_touch "$TMP/heavy-cap-ran" "$TMP/touch-cap.sh"
+heavy_touch "$TMP/heavy-load-ran" "$TMP/touch-load.sh"
+heavy_touch "$TMP/heavy-load-ran2" "$TMP/touch-load2.sh"
+heavy_touch "$TMP/heavy-load-ran3" "$TMP/touch-load3.sh"
+
+expect_exit 0 "$WRK" heavy --help
+expect_exit 2 "$WRK" heavy
+expect_exit 2 "$WRK" heavy no-double-dash
+expect_exit 2 "$WRK" heavy --
+expect_exit 2 "$WRK" heavy status extra
+expect_exit 0 "$WRK" heavy status
+"$WRK" heavy status | grep -q 'holder none' || fail "free lock must report 'holder none'"
+"$WRK" heavy -- true || fail "simple run must succeed"
+expect_exit 1 "$WRK" heavy -- false
+expect_exit 127 "$WRK" heavy -- definitely-not-a-real-binary-721
+
+# the default lock path resolves to the per-host /tmp file — asserted
+# through `wrk heavy status` output only. Never rm the real lock file or
+# its .waiters dir: other sessions serialize on that inode, and unlinking
+# it mid-hold splits the host queue (r2 finding N1).
+default_lock="$(python3 -c 'import socket; print("/tmp/wrk-heavy-%s.lock" % socket.gethostname())')"
+env -u WRK_HEAVY_LOCK "$WRK" heavy status | grep -qF "lock $default_lock" ||
+  fail "default lock path not used"
+
+# the command runs under nice -n 10 — asserted relative to this suite's own
+# nice value so the check still has teeth when the suite itself is already
+# niced by an outer wrk heavy (dogfood run). The probe gates hosts where
+# nice is inert (some CI macOS images report 0 for a niced child).
+suite_nice="$(ps -o nice= -p "$$" | tr -d ' ')"
+nice_probe="$(nice -n 10 sh -c 'ps -o nice= -p $$' 2>/dev/null | tr -d ' ')"
+nice_ceiling="$(nice -n 40 sh -c 'ps -o nice= -p $$' 2>/dev/null | tr -d ' ')"
+if [[ "$suite_nice" =~ ^[0-9]+$ && "$nice_probe" =~ ^[0-9]+$ &&
+      "$nice_ceiling" =~ ^[0-9]+$ && "$nice_probe" -gt "$suite_nice" ]]; then
+  expected=$(( suite_nice + 10 ))
+  (( expected > nice_ceiling )) && expected="$nice_ceiling"
+  "$WRK" heavy -- bash "$TMP/nice.sh" || fail "nice check run failed"
+  nice_val=""
+  read -r nice_val <"$TMP/heavy-nice.val" || true
+  [[ "$nice_val" =~ ^[0-9]+$ && "$nice_val" -ge "$expected" ]] ||
+    fail "command not under nice -n 10 (suite=$suite_nice got=$nice_val want>=$expected)"
+else
+  echo "SKIP nice assertion: nice(1) has no observable effect here"
+fi
+
+# a released lock leaves no stale holder record behind.
+[[ ! -s "$HEAVY_LOCK" ]] || fail "released lock file still carries holder info"
+echo "PASS heavy-basic-contract"
+
+# holder + waiter: the waiter's command runs only after the holder releases.
+"$WRK" heavy -- bash "$TMP/holder2.sh" &
+holder_job=$!
+wait_until 10 test -f "$TMP/heavy-held-start" || fail "holder never took the lock"
+"$WRK" heavy -- test -f "$TMP/heavy-holder-done" ||
+  fail "waiter ran before the holder released the lock"
+wait "$holder_job" || fail "holder run failed"
+echo "PASS heavy-serializes-holder-and-waiter"
+
+# status shows the holder and the queued waiters — including a waiter whose
+# own command text contains a pid= token (must not be mistaken for dead).
+"$WRK" heavy -- bash "$TMP/holder6.sh" &
+holder_job=$!
+wait_until 10 test -f "$TMP/heavy-stat-held" || fail "status holder never started"
+out="$("$WRK" heavy status)"
+grep -q 'holder pid=' <<<"$out" || fail "status must show the holder: $out"
+grep -q 'cmd=' <<<"$out" || fail "status must show the holder command: $out"
+"$WRK" heavy -- env pid=999999 true &
+waiter_job=$!
+wait_until 10 heavy_status_has_waiter || fail "status never showed the waiter"
+wait "$waiter_job" || fail "queued waiter never ran"
+wait "$holder_job" || fail "holder run failed"
+out="$("$WRK" heavy status)"
+grep -q 'holder none' <<<"$out" || fail "status must show a free lock after release: $out"
+echo "PASS heavy-status-shows-holder-and-waiters"
+
+# a nested wrk heavy on the same lock must not deadlock against itself — it
+# runs the inner command directly (the outer already serializes the host).
+rc=0
+out="$(WRK_HEAVY_WAIT_CAP=5 "$WRK" heavy -- "$WRK" heavy -- true 2>&1)" || rc=$?
+[[ "$rc" == 0 ]] || fail "nested wrk heavy must not block to the cap, got rc=$rc"
+grep -q 'already holding' <<<"$out" || fail "nested run must say it skipped the lock: $out"
+echo "PASS heavy-nested-run-does-not-deadlock"
+
+# a stale or forged WRK_HEAVY_HELD must not bypass the lock — bypass needs a
+# pid that is alive AND recorded as the holder in the lock file (an orphan
+# that outlives its holder still carries the env var).
+out="$(WRK_HEAVY_HELD="$HEAVY_LOCK:999999" "$WRK" heavy -- true 2>&1)"
+if grep -q 'already holding' <<<"$out"; then
+  fail "dead-pid WRK_HEAVY_HELD bypassed the lock"
+fi
+out="$(WRK_HEAVY_HELD="$HEAVY_LOCK:$$" "$WRK" heavy -- true 2>&1)"
+if grep -q 'already holding' <<<"$out"; then
+  fail "live non-holder WRK_HEAVY_HELD bypassed the lock"
+fi
+echo "PASS heavy-held-env-needs-live-holder"
+
+# a command killed by a signal maps to 128+sig (TERM → 143).
+expect_exit 143 "$WRK" heavy -- sh -c 'kill -TERM $$'
+echo "PASS heavy-signal-exit-mapped"
+
+# wait cap: a waiter gives up with rc 75 once the cap is exceeded, without
+# running its command.
+"$WRK" heavy -- bash "$TMP/holder8.sh" &
+holder_job=$!
+wait_until 10 test -f "$TMP/heavy-cap-held" || fail "cap holder never started"
+rc=0
+out="$(WRK_HEAVY_WAIT_CAP=3 "$WRK" heavy -- bash "$TMP/touch-cap.sh" 2>&1)" || rc=$?
+[[ "$rc" == 75 ]] || fail "wait cap must exit 75, got rc=$rc"
+grep -q 'wait cap' <<<"$out" || fail "cap expiry must say why: $out"
+[[ ! -e "$TMP/heavy-cap-ran" ]] || fail "command ran despite the wait cap"
+wait "$holder_job" || fail "cap holder run failed"
+echo "PASS heavy-wait-cap-exits-75"
+
+# the lock fd is not inherited: an orphaned child must not keep the lock.
+"$WRK" heavy -- bash "$TMP/orphan.sh" || fail "orphan-spawning run failed"
+read -r orphan_pid <"$TMP/heavy-orphan.pid"
+kill -0 "$orphan_pid" 2>/dev/null || fail "orphan did not survive its parent"
+WRK_HEAVY_WAIT_CAP=5 "$WRK" heavy -- true ||
+  fail "orphaned child still holds the heavy lock (fd inherited)"
+kill "$orphan_pid" 2>/dev/null || true
+heavy_dead "$orphan_pid" || fail "orphan sleep did not die"
+echo "PASS heavy-orphan-does-not-keep-the-lock"
+
+# load gate: load5/ncpu >= 1.0 blocks the start and is bounded by the same cap.
+# The boundary is exact: a ratio of precisely 1.0 still blocks (the gate is
+# "wait while >= 1.0", not ">").
+printf '9.9\n' >"$HEAVY_LOAD"
+rc=0
+out="$(WRK_HEAVY_WAIT_CAP=3 "$WRK" heavy -- bash "$TMP/touch-load.sh" 2>&1)" || rc=$?
+[[ "$rc" == 75 ]] || fail "load gate must exit 75 at the cap, got rc=$rc"
+grep -q 'load5/ncpu' <<<"$out" || fail "load-gate expiry must say why: $out"
+[[ ! -e "$TMP/heavy-load-ran" ]] || fail "command ran despite the load gate"
+printf '1.0\n' >"$HEAVY_LOAD"
+rc=0
+out="$(WRK_HEAVY_WAIT_CAP=3 "$WRK" heavy -- bash "$TMP/touch-load3.sh" 2>&1)" || rc=$?
+[[ "$rc" == 75 ]] || fail "load ratio 1.0 must still block, got rc=$rc"
+[[ ! -e "$TMP/heavy-load-ran3" ]] || fail "command ran at the 1.0 boundary"
+printf '9.9\n' >"$HEAVY_LOAD"
+"$WRK" heavy -- bash "$TMP/touch-load2.sh" &
+waiter_job=$!
+sleep 2
+printf '0\n' >"$HEAVY_LOAD"
+wait "$waiter_job" || fail "run did not start after the load gate opened"
+[[ -e "$TMP/heavy-load-ran2" ]] || fail "load-gated run never executed"
+echo "PASS heavy-load-gate-bounds-the-start"
+
 echo 'PASS test-wrk'
