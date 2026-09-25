@@ -34,7 +34,11 @@ def _run_time(run: dict[str, Any]) -> datetime:
 def _step_matches(marker: str, name: str) -> bool:
     expected = marker.casefold().strip()
     actual = name.casefold().strip()
-    return actual == expected or (expected in COMMAND_STEP_MARKERS and actual.startswith(expected + " "))
+    if actual == expected:
+        return True
+    if expected not in COMMAND_STEP_MARKERS:
+        return False
+    return actual.startswith(expected + " ") or actual == "run " + expected or actual.startswith("run " + expected + " ")
 
 
 def evaluate_required_ci(

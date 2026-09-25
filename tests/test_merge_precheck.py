@@ -235,6 +235,9 @@ class MergePrecheckTests(unittest.TestCase):
             self.assertEqual("CI_REQUIRED_STEP_MISSING", mutant["reason_code"])
 
     def test_setup_step_cannot_stand_in_for_tests_and_run_time_is_chronological(self) -> None:
+        self.assertTrue(ci_canonical._step_matches("go test", "Run go test ./..."))
+        self.assertFalse(ci_canonical._step_matches("go test", "Setup go test ./..."))
+        self.assertFalse(ci_canonical._step_matches("Bash tests", "Bash tests extra"))
         s = snapshot()
         s["ci_jobs"][10][0]["steps"] = [{"name": "Setup Bash tests", "status": "completed", "conclusion": "success"}]
         assert_check(self, s, "G3", "UNVERIFIED", "CI_REQUIRED_STEP_MISSING")
@@ -628,21 +631,21 @@ class MergePrecheckTests(unittest.TestCase):
                 "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
                 "G3": ("UNVERIFIED", "CI_BASE_MOVED"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
                 "G5": ("PASS", "SCAN_NO_HITS"), "G6": ("UNVERIFIED", "SURFACE_CLASS_UNBOUND"),
-                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
+                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "TASK_STATE_MISMATCH"),
                 "G9": ("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),
             }),
             "mgh3326/panewire": ("FAIL", {
                 "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
                 "G3": ("UNVERIFIED", "CI_BASE_MOVED"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
                 "G5": ("FAIL", "LEAK_PATTERN_HIT"), "G6": ("PASS", "SURFACE_FLAGS_RECORDED"),
-                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
+                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "TASK_STATE_MISMATCH"),
                 "G9": ("N/A", "RUNTIME_SURFACE_ABSENT"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),
             }),
             "mgh3326/scopefuel": ("UNVERIFIED", {
                 "G1": ("UNVERIFIED", "REPORT_MISSING"), "G2": ("PASS", "PR_HEAD_CURRENT"),
                 "G3": ("UNVERIFIED", "CI_BASE_MOVED"), "G4": ("UNVERIFIED", "BASE_BEHIND"),
                 "G5": ("PASS", "SCAN_NO_HITS"), "G6": ("PASS", "SURFACE_FLAGS_RECORDED"),
-                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "QUEUE_LOOKUP_FAILED"),
+                "G7": ("UNVERIFIED", "ISSUE_REPORT_MISSING"), "G8": ("UNVERIFIED", "TASK_STATE_MISMATCH"),
                 "G9": ("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN"), "G10": ("N/A", "ARTIFACT_HASH_NOT_CITED"),
             }),
         }

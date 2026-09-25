@@ -1,5 +1,5 @@
 {
-  "observed_at": "2026-09-25",
+  "observed_at": "2026-09-25T11:59:00Z",
   "replays": [
     {
       "repo": "mgh3326/auto_trader",
@@ -44,7 +44,7 @@
         },
         "G8": {
           "status": "UNVERIFIED",
-          "reason_code": "QUEUE_LOOKUP_FAILED"
+          "reason_code": "TASK_STATE_MISMATCH"
         },
         "G9": {
           "status": "UNVERIFIED",
@@ -96,7 +96,7 @@
         },
         "G8": {
           "status": "UNVERIFIED",
-          "reason_code": "QUEUE_LOOKUP_FAILED"
+          "reason_code": "TASK_STATE_MISMATCH"
         },
         "G9": {
           "status": "N/A",
@@ -148,7 +148,7 @@
         },
         "G8": {
           "status": "UNVERIFIED",
-          "reason_code": "QUEUE_LOOKUP_FAILED"
+          "reason_code": "TASK_STATE_MISMATCH"
         },
         "G9": {
           "status": "UNVERIFIED",
