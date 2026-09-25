@@ -148,6 +148,14 @@ class MergePrecheckTests(unittest.TestCase):
             "kind": "artifact-hash", "repo": s["repo"], "PR": s["PR"], "H": H,
             "issuer": "independent-builder", "sha256": None, "artifact_ref": "artifact/one"}}]
         assert_check(self, s, "G10", "UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
+        s["hash_receipts"][0]["data"].update(sha256="e" * 64, artifact_ref=["artifact/one"])
+        assert_check(self, s, "G10", "UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
+        s = snapshot()
+        s["task_record"]["refs"] = None
+        assert_check(self, s, "G8", "UNVERIFIED", "QUEUE_LOOKUP_FAILED")
+        s["files"] = [None]
+        assert_check(self, s, "G5", "UNVERIFIED", "DIFF_LOOKUP_FAILED")
+        assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_DIFF_UNKNOWN")
 
     def test_incident_t3_misassignment_and_same_family_t3(self) -> None:
         s = snapshot()
@@ -292,7 +300,7 @@ class MergePrecheckTests(unittest.TestCase):
         s["runtime_receipt"]["data"]["issuer"] = s["issuer"]
         assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_NOT_INDEPENDENT")
         source = (ROOT / "director/merge_precheck.py").read_text()
-        guard = 'if data.get("issuer") in (None, "", snapshot.get("issuer")):'
+        guard = 'if not isinstance(data.get("issuer"), str) or data.get("issuer") in (None, "", snapshot.get("issuer")):'
         self.assertEqual(1, source.count(guard))
         namespace: dict = {"__name__": "merge_precheck_issuer_mutant"}
         exec(source.replace(guard, "if False:"), namespace)
@@ -306,6 +314,12 @@ class MergePrecheckTests(unittest.TestCase):
         assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
         s["runtime_receipt"]["data"]["lock_ref"] = "uv.lock@" + H
         s["runtime_receipt"]["data"]["exec_start"] = "python3 --version"
+        assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
+        s["runtime_receipt"]["data"]["issuer"] = ["operator-desk"]
+        assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_NOT_INDEPENDENT")
+        s["runtime_receipt"]["data"]["issuer"] = "operator-desk"
+        s["runtime_receipt"]["data"]["exec_start"] = "/usr/bin/python3.11 /srv/auto-trader-operator/runners/h1_pilot_runner.py"
+        s["runtime_receipt"]["data"]["lock_ref"] = ["uv.lock@" + H]
         assert_check(self, s, "G9", "UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
 
     def test_runtime_policy_globs_cover_dependency_and_shell_script(self) -> None:
@@ -458,6 +472,11 @@ class MergePrecheckTests(unittest.TestCase):
             s["tester_report"] = gate.parse_report(str(path))
             assert_check(self, s, "G1", "UNVERIFIED", "REPORT_SCHEMA_INVALID")
             assert_check(self, s, "G7", "UNVERIFIED", "ISSUE_REPORT_MISSING")
+            path.write_text(json.dumps({"kind": "tester-verdict", "verdict": "PASS", "H": H, "issues": [],
+                                        "task": 727, "repo": "mgh3326/agent-skills", "pr": 999,
+                                        "tester_job": "task727-tester", "tester_session": ["tester-grok"]}))
+            s["tester_report"] = gate.parse_report(str(path))
+            assert_check(self, s, "G1", "UNVERIFIED", "REPORT_SCHEMA_INVALID")
             path.write_text(json.dumps({"kind": "tester-verdict", "verdict": "PASS", "H": H, "issues": [],
                                         "task": 727, "repo": "mgh3326/agent-skills", "pr": 999,
                                         "tester_job": "task727-tester", "tester_session": "tester-grok"}))

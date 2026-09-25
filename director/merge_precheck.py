@@ -30,7 +30,7 @@ from ci_canonical import evaluate_required_ci
 from gate_common import POLICY_PATH, PolicyError, file_ref, load_policy, sha256_bytes, write_receipt
 
 
-VERSION = "merge-precheck/1.1.1"
+VERSION = "merge-precheck/1.1.2"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})\s*$")
@@ -156,7 +156,15 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
             for issue in issues
         ):
             return {"error": "REPORT_SCHEMA_INVALID", "ref": ref}
-        metadata = {key: structured.get(key.lower()) for key in ("TASK", "REPO", "PR", "TESTER_JOB", "TESTER_SESSION")}
+        metadata: dict[str, str] = {}
+        for key in ("TASK", "REPO", "PR", "TESTER_JOB", "TESTER_SESSION"):
+            value = structured.get(key.lower())
+            if key in {"TASK", "PR"} and isinstance(value, (str, int)) and not isinstance(value, bool):
+                metadata[key] = str(value)
+            elif key not in {"TASK", "PR"} and isinstance(value, str) and value:
+                metadata[key] = value
+            else:
+                return {"error": "REPORT_SCHEMA_INVALID", "ref": ref}
         return {"ref": ref, "verdict": verdict, "H": H, "metadata": metadata, "issues": issues, "text": content}
     fence: tuple[str, int] | None = None
     quote_open = False
@@ -332,7 +340,7 @@ def classify_surface(files: list[dict[str, Any]], repo: str, policy: dict[str, A
 def check_diff(snapshot: dict[str, Any], policy: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
     files = snapshot.get("files")
     scan = snapshot.get("scan")
-    if not isinstance(files, list) or not isinstance(scan, dict):
+    if not isinstance(files, list) or any(not isinstance(file, dict) or not isinstance(file.get("filename"), str) for file in files) or not isinstance(scan, dict):
         return result("UNVERIFIED", "DIFF_LOOKUP_FAILED"), {"flags": [], "surface_class": "unknown"}
     surface = classify_surface(files, snapshot["repo"], policy)
     if len(files) >= 300 or not scan.get("complete") or scan.get("H") != snapshot.get("H") or scan.get("B") != snapshot.get("B"):
@@ -379,7 +387,7 @@ def check_issues(snapshot: dict[str, Any]) -> dict[str, Any]:
 def check_queue(snapshot: dict[str, Any]) -> dict[str, Any]:
     task = snapshot.get("task_record")
     events = snapshot.get("job_events")
-    if not isinstance(task, dict) or not isinstance(events, list):
+    if not isinstance(task, dict) or not isinstance(task.get("refs", {}), dict) or not isinstance(events, list) or any(not isinstance(event, dict) for event in events):
         return result("UNVERIFIED", "QUEUE_LOOKUP_FAILED")
     if task.get("id") != snapshot.get("task") or task.get("state") not in {"in_progress", "verifying", "join"}:
         return result("UNVERIFIED", "TASK_STATE_MISMATCH")
@@ -399,7 +407,7 @@ def check_queue(snapshot: dict[str, Any]) -> dict[str, Any]:
 
 
 def check_runtime(snapshot: dict[str, Any], policy: dict[str, Any]) -> dict[str, Any]:
-    if not isinstance(snapshot.get("files"), list):
+    if not isinstance(snapshot.get("files"), list) or any(not isinstance(file, dict) or not isinstance(file.get("filename"), str) for file in snapshot["files"]):
         return result("UNVERIFIED", "RUNTIME_DIFF_UNKNOWN")
     paths = [f.get("filename", "") for f in snapshot["files"]]
     repo = snapshot["repo"]
@@ -416,13 +424,15 @@ def check_runtime(snapshot: dict[str, Any], policy: dict[str, Any]) -> dict[str,
         return result("N/A", "RUNTIME_SURFACE_ABSENT", policy_ref="runtime")
     entry = matched[0]
     receipt = snapshot.get("runtime_receipt")
-    if not receipt or receipt.get("error"):
+    if not isinstance(receipt, dict) or receipt.get("error"):
         return result("UNVERIFIED", "RUNTIME_RECEIPT_MISSING", service=entry["service"])
     data = receipt.get("data", {})
+    if not isinstance(data, dict):
+        return result("UNVERIFIED", "RUNTIME_RECEIPT_MISMATCH")
     required = {"kind": "host-runtime", "repo": repo, "PR": snapshot["PR"], "H": snapshot["H"], "target": entry["target"], "service": entry["service"], "interpreter": entry["interpreter"]}
     if any(data.get(key) != value for key, value in required.items()):
         return result("UNVERIFIED", "RUNTIME_RECEIPT_MISMATCH")
-    if data.get("issuer") in (None, "", snapshot.get("issuer")):
+    if not isinstance(data.get("issuer"), str) or data.get("issuer") in (None, "", snapshot.get("issuer")):
         return result("UNVERIFIED", "RUNTIME_NOT_INDEPENDENT")
     try:
         observed = parse_time(data["observed_at"])
@@ -431,18 +441,20 @@ def check_runtime(snapshot: dict[str, Any], policy: dict[str, Any]) -> dict[str,
         return result("UNVERIFIED", "RUNTIME_TIME_INVALID")
     if observed > now or now - observed > timedelta(hours=24):
         return result("UNVERIFIED", "RUNTIME_OBSERVATION_STALE")
-    if not str(data.get("version", "")).startswith(entry["version_prefix"]) or not os.path.isabs(str(data.get("interpreter", ""))):
+    if not isinstance(data.get("version"), str) or not data["version"].startswith(entry["version_prefix"]) or not os.path.isabs(data["interpreter"]):
         return result("UNVERIFIED", "RUNTIME_INTERPRETER_MISMATCH")
-    command = str(data.get("exec_start", "")).strip()
+    if not isinstance(data.get("exec_start"), str):
+        return result("UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
+    command = data["exec_start"].strip()
     if command.startswith("ExecStart="):
         command = command[len("ExecStart="):].strip()
     try:
         argv = shlex.split(command)
     except ValueError:
         argv = []
-    if not argv or argv[0] != entry["interpreter"] or any(str(data.get(key, "")).strip().lower() in ("", "unknown", "none") for key in ("os", "arch", "proof_ref")):
+    if not argv or argv[0] != entry["interpreter"] or any(not isinstance(data.get(key), str) or data[key].strip().lower() in ("", "unknown", "none") for key in ("os", "arch", "proof_ref")):
         return result("UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
-    if any(not str(data.get(key, "")).endswith("@" + snapshot["H"]) for key in ("lock_ref", "dependencies_ref")):
+    if any(not isinstance(data.get(key), str) or not data[key].endswith("@" + snapshot["H"]) for key in ("lock_ref", "dependencies_ref")):
         return result("UNVERIFIED", "RUNTIME_OBSERVATION_INCOMPLETE")
     return result("PASS", "RUNTIME_HOST_OBSERVED", receipt=receipt["ref"], target=entry["target"], service=entry["service"])
 
@@ -455,12 +467,12 @@ def check_hash(snapshot: dict[str, Any]) -> dict[str, Any]:
     receipts = snapshot.get("hash_receipts")
     if receipts is None:
         receipts = [snapshot["hash_receipt"]] if snapshot.get("hash_receipt") else []
-    if not receipts or any(not receipt or receipt.get("error") for receipt in receipts):
+    if not isinstance(receipts, list) or not receipts or any(not isinstance(receipt, dict) or receipt.get("error") for receipt in receipts):
         return result("UNVERIFIED", "ARTIFACT_HASH_RECEIPT_MISSING", cited_count=len(cited))
     bound: set[str] = set()
     for receipt in receipts:
         data = receipt.get("data", {})
-        if data.get("kind") != "artifact-hash" or data.get("H") != snapshot["H"] or data.get("repo") != snapshot["repo"] or data.get("PR") != snapshot["PR"] or data.get("issuer") in (None, "", snapshot.get("issuer")):
+        if not isinstance(data, dict) or data.get("kind") != "artifact-hash" or data.get("H") != snapshot["H"] or data.get("repo") != snapshot["repo"] or data.get("PR") != snapshot["PR"] or not isinstance(data.get("issuer"), str) or data.get("issuer") in ("", snapshot.get("issuer")):
             return result("UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
         artifacts = data.get("artifacts") or [{"sha256": data.get("sha256"), "artifact_ref": data.get("artifact_ref")}]
         if not isinstance(artifacts, list) or not artifacts:
@@ -468,7 +480,7 @@ def check_hash(snapshot: dict[str, Any]) -> dict[str, Any]:
         for artifact in artifacts:
             raw_sha = artifact.get("sha256") if isinstance(artifact, dict) else None
             sha = raw_sha.lower() if isinstance(raw_sha, str) else ""
-            if not SHA256.fullmatch(sha) or sha not in cited or not artifact.get("artifact_ref"):
+            if not SHA256.fullmatch(sha) or sha not in cited or not isinstance(artifact.get("artifact_ref"), str) or not artifact["artifact_ref"]:
                 return result("UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
             bound.add(sha)
     if bound != cited:
