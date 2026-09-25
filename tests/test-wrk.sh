@@ -1558,8 +1558,9 @@ grep -q 'landed=no' <<<"$grok_echo_out" ||
 echo "PASS grok-self-echo-no-land: $grok_echo_out"
 
 # Derivation proof: a payload without the chip text must render a different
-# post-injection screen, so the normal retry path comes back. A fixture that
-# hardcodes the echo would keep showing the chip and fail this case.
+# post-injection screen, so the observation is a confirmed non-landing rather
+# than an ambiguous chip. A fixture that hardcodes the echo would keep showing
+# the chip and fail this case. Even then grok is never re-injected (#701).
 echo_prompt_b="$TMP/grok-echo-prompt-b.md"
 printf 'brief without the queued contract phrase\n' >"$echo_prompt_b"
 PROMPT="$echo_prompt_b"
@@ -1567,10 +1568,12 @@ PROMPT="$echo_prompt_b"
 grok_echo_b_out="$(TEST_FIXTURE_SCENARIO=grok-echo spawn_base grok 2>&1)"
 grep -q 'landed=no' <<<"$grok_echo_b_out" ||
   fail "payload-derived echo screen changed the verdict path: $grok_echo_b_out"
-grep -q 'action=reinject-once' <<<"$grok_echo_b_out" ||
-  fail "echo screen must be derived from the actual payload: $grok_echo_b_out"
-[[ "$(grep -c '^agent prompt ' "$TMP/herdr.log")" -eq 2 ]] ||
-  fail "payload-derived echo suppressed the re-injection: $grok_echo_b_out"
+grep -q 'action=reinject-once' <<<"$grok_echo_b_out" &&
+  fail "grok must never re-inject: $grok_echo_b_out"
+grep -q 'retry=skipped reason=grok-never-reinjected' <<<"$grok_echo_b_out" ||
+  fail "grok skip must name its reason: $grok_echo_b_out"
+[[ "$(grep -c '^agent prompt ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "payload-derived echo triggered a re-injection: $grok_echo_b_out"
 echo "PASS grok-echo-screen-from-payload: $grok_echo_b_out"
 PROMPT="$TMP/prompt.md"
 
@@ -1596,10 +1599,10 @@ echo "PASS grok-toctou-no-land: $grok_toctou_out"
 grok_zero_out="$(TEST_FIXTURE_SCENARIO=grok-zero spawn_base grok 2>&1)"
 grep -q 'landed=no' <<<"$grok_zero_out" ||
   fail "0 queued must not land: $grok_zero_out"
-grep -q 'action=reinject-once' <<<"$grok_zero_out" ||
-  fail "0 queued is not a chip — the normal retry must still run: $grok_zero_out"
-[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]] ||
-  fail "0 queued suppressed the re-injection: $grok_zero_out"
+grep -q 'action=reinject-once' <<<"$grok_zero_out" &&
+  fail "0 queued is not a chip, but grok is still never re-injected: $grok_zero_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "0 queued triggered a grok re-injection: $grok_zero_out"
 echo "PASS grok-zero-queued-no-land: $grok_zero_out"
 
 # A chip visible only on the first observation still suppresses re-injection,
@@ -1626,12 +1629,35 @@ grep -q 'landed=yes' <<<"$grok_marker_out" ||
 echo "PASS grok-marker-priority-landed: $grok_marker_out"
 
 : >"$TMP/herdr.log"
+# #701: grok's echo outlives even its extended window, so a confirmed-looking
+# non-landing stays landed=no, is never re-injected, and tells the operator to
+# re-check the pane after 2 minutes.
 grok_no_chip_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base grok 2>&1)"
 grep -q 'landed=no' <<<"$grok_no_chip_out" ||
   fail "grok without the queued footer must stay landed=no: $grok_no_chip_out"
-grep -q 'action=reinject-once' <<<"$grok_no_chip_out" ||
-  fail "grok negative path lost the reinject-once action: $grok_no_chip_out"
+grep -q 'action=reinject-once' <<<"$grok_no_chip_out" &&
+  fail "grok negative path must not re-inject: $grok_no_chip_out"
+grep -q 'retry=skipped reason=grok-never-reinjected' <<<"$grok_no_chip_out" ||
+  fail "grok negative path lost its skip reason: $grok_no_chip_out"
+grep -q 'window=150s' <<<"$grok_no_chip_out" ||
+  fail "grok must use the extended landing window: $grok_no_chip_out"
+grep -q 're-check the pane after 2 minutes' <<<"$grok_no_chip_out" ||
+  fail "grok landed=no must print the re-check hint: $grok_no_chip_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "grok negative path triggered a re-injection: $grok_no_chip_out"
 echo "PASS grok-no-chip-negative: $grok_no_chip_out"
+
+# #701: a grok echo that lands past the default 30s/18-tick window but inside
+# grok's 150s/78-tick window is positive evidence — landed=yes, one injection.
+: >"$TMP/herdr.log"
+grok_slow_out="$(TEST_FIXTURE_SCENARIO=grok-slow-marker spawn_base grok 2>&1)"
+grep -q 'landed=yes' <<<"$grok_slow_out" ||
+  fail "grok echo inside the extended window must land: $grok_slow_out"
+[[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "grok slow-marker triggered a re-injection: $grok_slow_out"
+[[ "$(grep -c -- '--source recent-unwrapped' "$TMP/herdr.log")" -ge 30 ]] ||
+  fail "grok slow-marker landed before its late echo: $grok_slow_out"
+echo "PASS grok-slow-echo-landed: $grok_slow_out"
 
 : >"$TMP/herdr.log"
 claude_grok_chip_out="$(TEST_FIXTURE_SCENARIO=grok-queued spawn_base sonnet 2>&1)"

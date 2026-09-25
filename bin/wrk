@@ -308,10 +308,15 @@ sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
 # The prompt command already owns its normal wait when supported. A 30-second
 # window covers the normal hand-off; codex gets 60 seconds because its cold
 # boot is explicitly allowed to settle for 20 seconds above and may still take
-# tens of seconds before the submitted transcript is readable. Sampling backs
-# off from 0.5 to 2 seconds and stops immediately on evidence.
+# tens of seconds before the submitted transcript is readable. Grok gets 150
+# seconds: measured on 2026-09-25 (grok 1.0.41) the pane only echoes or reacts
+# to the brief 1-2 minutes after injection, so the 30-second window reported
+# landed=no for briefs that did land (b685/b699/b700) — a false negative that
+# invites a duplicate re-injection. Sampling backs off from 0.5 to 2 seconds
+# and stops immediately on evidence.
 LANDING_CHECK_DEFAULT_WINDOW_SECONDS=30
 LANDING_CHECK_CODEX_WINDOW_SECONDS=60
+LANDING_CHECK_GROK_WINDOW_SECONDS=150
 LANDING_CHECK_INITIAL_DELAY_SECONDS=0.5
 LANDING_CHECK_SECOND_DELAY_SECONDS=1
 LANDING_CHECK_MAX_DELAY_SECONDS=2
@@ -325,6 +330,10 @@ configure_landing_check() {
     LANDING_CHECK_WINDOW_SECONDS="$LANDING_CHECK_CODEX_WINDOW_SECONDS"
     # 33 samples: 0.5 + 1 + (29 * 2) + 0.5 = 60 seconds.
     LANDING_CHECK_TIMEOUT_TICKS=33
+  elif [[ "$profile_kind" == grok ]]; then
+    LANDING_CHECK_WINDOW_SECONDS="$LANDING_CHECK_GROK_WINDOW_SECONDS"
+    # 78 samples: 0.5 + 1 + (74 * 2) + 0.5 = 150 seconds.
+    LANDING_CHECK_TIMEOUT_TICKS=78
   fi
 }
 
@@ -740,7 +749,11 @@ spawn_deliver_brief() {
     return 0
   fi
   detail="$(landing_check_detail)"
-  if [[ "$SPAWN_SUBMIT" == accepted && "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
+  # Grok is never re-injected: its echo can outlive even the extended window,
+  # so a confirmed-looking non-landing can still be a brief in flight, and a
+  # second injection is the duplicate-brief risk this lane exists to avoid.
+  if [[ "$SPAWN_SUBMIT" == accepted && "$PROFILE_KIND" != grok &&
+        "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
     # herdr took the first delivery and the whole window found no marker and
     # no queued chip: confirmed non-landing. Exactly one re-injection, again
     # through panewire, as a new delivery.
@@ -766,6 +779,8 @@ spawn_deliver_brief() {
     retry_skip_reason='prompt-submission-unconfirmed'
   elif [[ "$LANDING_CHECK_AMBIGUOUS" -ne 0 ]]; then
     retry_skip_reason='ambiguous-observation'
+  elif [[ "$PROFILE_KIND" == grok ]]; then
+    retry_skip_reason='grok-never-reinjected'
   else
     retry_skip_reason='non-landing-not-confirmed'
   fi
@@ -4509,6 +4524,10 @@ print(value if isinstance(value, str) else "")
   [[ "$SPAWN_VIA" != herdr-fallback ]] || OK_LINE="$OK_LINE via=herdr-fallback"
   echo "$OK_LINE"
   if [[ "$LANDING" == no ]]; then
+    # Grok's echo can arrive 1-2 minutes after injection — past even its
+    # extended window — so an unproven landing is not proof of non-delivery.
+    [[ "$PROFILE_KIND" == grok ]] &&
+      LANDING_NO_DETAIL="$LANDING_NO_DETAIL hint=\"re-check the pane after 2 minutes\""
     if [[ "$LANDING_STRICT" -eq 1 ]]; then
       warn "spawn succeeded but brief landed=no; pane=$PANE remains valid; $LANDING_NO_DETAIL strict_exit=$WRK_EXIT_LANDING_UNCONFIRMED"
       return "$WRK_EXIT_LANDING_UNCONFIRMED"
