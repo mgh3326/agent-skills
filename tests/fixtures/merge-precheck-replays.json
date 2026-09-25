@@ -1,0 +1,161 @@
+{
+  "observed_at": "2026-09-25T11:59:00Z",
+  "replays": [
+    {
+      "repo": "mgh3326/auto_trader",
+      "PR": 2099,
+      "task": 691,
+      "H": "bb8e49e2652c6fe77610abf48f00dde97ae54e0a",
+      "merged_at": "2026-09-25T03:27:42Z",
+      "actual_gate": "MERGED",
+      "tool_result": "UNVERIFIED",
+      "tool_checks": {
+        "G1": {
+          "status": "UNVERIFIED",
+          "reason_code": "REPORT_MISSING"
+        },
+        "G10": {
+          "status": "N/A",
+          "reason_code": "ARTIFACT_HASH_NOT_CITED"
+        },
+        "G2": {
+          "status": "PASS",
+          "reason_code": "PR_HEAD_CURRENT"
+        },
+        "G3": {
+          "status": "UNVERIFIED",
+          "reason_code": "CI_BASE_MOVED"
+        },
+        "G4": {
+          "status": "UNVERIFIED",
+          "reason_code": "BASE_BEHIND"
+        },
+        "G5": {
+          "status": "PASS",
+          "reason_code": "SCAN_NO_HITS"
+        },
+        "G6": {
+          "status": "UNVERIFIED",
+          "reason_code": "SURFACE_CLASS_UNBOUND"
+        },
+        "G7": {
+          "status": "UNVERIFIED",
+          "reason_code": "ISSUE_REPORT_MISSING"
+        },
+        "G8": {
+          "status": "UNVERIFIED",
+          "reason_code": "TASK_STATE_MISMATCH"
+        },
+        "G9": {
+          "status": "UNVERIFIED",
+          "reason_code": "RUNTIME_TARGET_UNKNOWN"
+        }
+      },
+      "source": "gh pr list --state merged and gh pr view; merge-precheck live replay after merge"
+    },
+    {
+      "repo": "mgh3326/panewire",
+      "PR": 87,
+      "task": 687,
+      "H": "97542155a9455512c90f7726bfdf10841a3223cc",
+      "merged_at": "2026-09-25T02:24:22Z",
+      "actual_gate": "MERGED",
+      "tool_result": "FAIL",
+      "tool_checks": {
+        "G1": {
+          "status": "UNVERIFIED",
+          "reason_code": "REPORT_MISSING"
+        },
+        "G10": {
+          "status": "N/A",
+          "reason_code": "ARTIFACT_HASH_NOT_CITED"
+        },
+        "G2": {
+          "status": "PASS",
+          "reason_code": "PR_HEAD_CURRENT"
+        },
+        "G3": {
+          "status": "UNVERIFIED",
+          "reason_code": "CI_BASE_MOVED"
+        },
+        "G4": {
+          "status": "UNVERIFIED",
+          "reason_code": "BASE_BEHIND"
+        },
+        "G5": {
+          "status": "FAIL",
+          "reason_code": "LEAK_PATTERN_HIT"
+        },
+        "G6": {
+          "status": "PASS",
+          "reason_code": "SURFACE_FLAGS_RECORDED"
+        },
+        "G7": {
+          "status": "UNVERIFIED",
+          "reason_code": "ISSUE_REPORT_MISSING"
+        },
+        "G8": {
+          "status": "UNVERIFIED",
+          "reason_code": "TASK_STATE_MISMATCH"
+        },
+        "G9": {
+          "status": "N/A",
+          "reason_code": "RUNTIME_SURFACE_ABSENT"
+        }
+      },
+      "source": "gh pr list --state merged and gh pr view; merge-precheck live replay after merge"
+    },
+    {
+      "repo": "mgh3326/scopefuel",
+      "PR": 94,
+      "task": 713,
+      "H": "ddb502e61b990b4b1a24cb587dd750b282bc17c6",
+      "merged_at": "2026-09-25T06:16:35Z",
+      "actual_gate": "MERGED",
+      "tool_result": "UNVERIFIED",
+      "tool_checks": {
+        "G1": {
+          "status": "UNVERIFIED",
+          "reason_code": "REPORT_MISSING"
+        },
+        "G10": {
+          "status": "N/A",
+          "reason_code": "ARTIFACT_HASH_NOT_CITED"
+        },
+        "G2": {
+          "status": "PASS",
+          "reason_code": "PR_HEAD_CURRENT"
+        },
+        "G3": {
+          "status": "UNVERIFIED",
+          "reason_code": "CI_BASE_MOVED"
+        },
+        "G4": {
+          "status": "UNVERIFIED",
+          "reason_code": "BASE_BEHIND"
+        },
+        "G5": {
+          "status": "PASS",
+          "reason_code": "SCAN_NO_HITS"
+        },
+        "G6": {
+          "status": "PASS",
+          "reason_code": "SURFACE_FLAGS_RECORDED"
+        },
+        "G7": {
+          "status": "UNVERIFIED",
+          "reason_code": "ISSUE_REPORT_MISSING"
+        },
+        "G8": {
+          "status": "UNVERIFIED",
+          "reason_code": "TASK_STATE_MISMATCH"
+        },
+        "G9": {
+          "status": "UNVERIFIED",
+          "reason_code": "RUNTIME_TARGET_UNKNOWN"
+        }
+      },
+      "source": "gh pr list --state merged and gh pr view; merge-precheck live replay after merge"
+    }
+  ]
+}
