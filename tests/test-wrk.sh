@@ -2007,6 +2007,69 @@ assert spawned["payload"]["profile"] == "devin-swe2", spawned
 PY
 echo "PASS devin-swe2 scopefuel-gate-to-arbiter-pool-and-spawn-receipt"
 
+# ---------------------------------------------------------------------------
+# task #677: the quota_pool.record launch_profile must carry the canonical
+# catalog profile, not the launcher spelling. codex-sol/codex-max/codex/
+# builder-sol/captain-sol all run gpt-6-sol, whose catalog profile is codex-sol
+# (scopefuel PROFILE_ALIASES: codex-max -> codex-sol; `policy launch builder-sol`
+# is not in the catalog at all). Recording the raw spelling split reps/usage
+# attribution across names the grade table cannot read — 2026-09-25: a
+# builder-sol xhigh spawn recorded launch_profile=builder-sol@xhigh and
+# profile=codex-max while its pane ran gpt-6-sol xhigh. The ROB-1213
+# cross-checked fields stay put (pool from scopefuel, profile gate-normalized);
+# non-codex pools keep their literal spelling@effort, so no other pool's records
+# change; rollback spellings (codex-sol56) stay literal by design.
+# Mutant: revert the canonical-name mapping in arbiter_admit -> these go RED.
+# ---------------------------------------------------------------------------
+# Own arbiter state (like the R20/R21/idempotency sections): these successful
+# spawns leave durable quota records behind, and the shared suite inbox later
+# asserts on the exact record set (e.g. no claude records after a released
+# spawn). Records written here must not leak into that set.
+T677_INBOX="$TMP/inbox-677"
+T677_XDG="$TMP/xdg-677"
+launch_profile_case() {
+  local model="$1" job="$2" expected="$3"; shift 3
+  ARBITER_INBOX_ROOT="$T677_INBOX" XDG_DATA_HOME="$T677_XDG" \
+    spawn_base "$model" --job "$job" --t T1 "$@" >/dev/null
+  python3 - "$T677_INBOX/$job/events" "$expected" "$model" <<'PY'
+import json, pathlib, sys
+events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(event for event in events if event["kind"] == "quota_pool.record")
+got = record["payload"]["launch_profile"]
+assert got == sys.argv[2], f"{sys.argv[3]}: launch_profile={got!r} expected {sys.argv[2]!r}"
+PY
+}
+# Every codex spelling: the raw aliases collapse onto the canonical catalog
+# profile, the spellings that already are canonical stay put, and the ROB-591
+# rollback spellings stay literal (they pin the superseded model).
+launch_profile_case codex-sol codex-sol-xhigh 'codex-sol@xhigh' --effort xhigh
+launch_profile_case builder-sol builder-sol-canon 'codex-sol@max' --role builder --lane builder-sol-lane --parent parent-lane
+launch_profile_case captain-sol captain-sol-canon 'codex-sol@max' --role builder --lane captain-sol-lane --parent parent-lane
+launch_profile_case codex-max codex-max-canon 'codex-sol@max'
+launch_profile_case codex codex-canon 'codex-sol@high'
+launch_profile_case codex-sol56 codex-sol56-rollback 'codex-sol56@max'
+launch_profile_case codex-terra codex-terra-canon 'codex-terra@medium'
+launch_profile_case codex-med codex-med-canon 'codex-terra@medium'
+launch_profile_case codex-terra-max codex-terra-max-canon 'codex-terra-max@max'
+launch_profile_case codex-luna codex-luna-canon 'codex-luna@medium'
+launch_profile_case codex-luna-hi codex-luna-hi-canon 'codex-luna@high'
+launch_profile_case codex-luna-max codex-luna-max-canon 'codex-luna-max@max'
+launch_profile_case codex-luna56 codex-luna56-rollback 'codex-luna56@medium'
+launch_profile_case builder-luna builder-luna-canon 'codex-luna@xhigh' --role builder --lane builder-luna-lane --parent parent-lane
+launch_profile_case codex-astra codex-astra-canon 'codex-astra@xhigh'
+# Other pools keep their literal spelling@effort — no other pool's record moves.
+launch_profile_case devin-swe2 devin-launch-literal 'devin-swe2'
+launch_profile_case builder-opus builder-opus-launch-literal 'builder-opus@high' --role builder --lane builder-opus-lane --parent parent-lane
+launch_profile_case grok grok-launch-literal 'grok@high'
+python3 - "$T677_INBOX/codex-sol-xhigh/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(event for event in events if event["kind"] == "quota_pool.record")
+assert record["payload"]["pool"] == "codex", record
+assert record["payload"]["profile"] == "codex-max", record
+PY
+echo "PASS 677 launch_profile carries the canonical catalog profile for codex aliases"
+
 # Task 577 failure cleanup: a bounded welcome timeout occurs after the Devin
 # quota record and pane exist. It must emit process diagnostics, close that
 # pane, and release this job's arbiter record without touching another Devin

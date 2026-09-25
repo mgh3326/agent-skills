@@ -1755,7 +1755,23 @@ arbiter_admit() {
   # 2026-08-04: T3 jobs ran gpt-5.6-luna at *medium* (B, 42) while every record
   # claimed codex-luna-max (A+, 59). Only `ps` told the truth; finished jobs
   # became unauditable.
-  local launch_profile="$MODEL${EFFECTIVE_EFFORT:+@$EFFECTIVE_EFFORT}"
+  #
+  # task #677: the launch name is the canonical catalog profile, not the launcher
+  # spelling. codex-sol/codex-max/codex/builder-sol/captain-sol all run gpt-6-sol
+  # — the catalog profile is codex-sol (scopefuel PROFILE_ALIASES: codex-max ->
+  # codex-sol), and scopefuel only knows the canonical name (`policy launch
+  # builder-sol` is not in the catalog at all). Recording the raw spelling split
+  # reps/usage attribution across names the grade table cannot read (2026-09-25:
+  # a builder-sol xhigh spawn recorded launch_profile=builder-sol@xhigh while its
+  # pane ran gpt-6-sol xhigh). Scoped to codex-kind profiles: every other pool
+  # keeps its literal spelling@effort, so no other pool's records change.
+  # Rollback spellings (codex-sol56) stay literal by design — pinning the
+  # superseded model is the point, and the canon does not carry them.
+  local launch_name="$MODEL"
+  if [[ "$PROFILE_KIND" == codex && -n "$CATALOG_PROFILE" ]]; then
+    launch_name="$CATALOG_PROFILE"
+  fi
+  local launch_profile="$launch_name${EFFECTIVE_EFFORT:+@$EFFECTIVE_EFFORT}"
   record_json="$(SCOPEFUEL_BIN="$SCOPEFUEL" "$ARBITER" lease --job "$JOB_ID" --kind quota_pool \
     --profile "$GATE_PROFILE" --launch-profile "$launch_profile" --gate-output "$gate_file" --json)"
   record_rc=$?
@@ -1785,7 +1801,10 @@ arbiter_admit() {
   fi
   ARBITER_HELD=1
   trap 'spawn_pane_cleanup; arbiter_release_held' EXIT
-  echo "wrk: arbiter quota-pool record pool=$ARBITER_RESOURCE profile=$ARBITER_PROFILE job=$JOB_ID" >&2
+  # task #677: show the launch name next to the gate-normalized profile — the
+  # observed line said profile=codex-max while the pane ran gpt-6-sol, and the
+  # launch identity was only in the event payload.
+  echo "wrk: arbiter quota-pool record pool=$ARBITER_RESOURCE profile=$ARBITER_PROFILE launch_profile=$launch_profile job=$JOB_ID" >&2
 }
 
 # ROB-1227: a successful spawn is a quota-use event. The pool is already
