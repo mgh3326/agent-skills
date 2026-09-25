@@ -50,9 +50,9 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
    `captain` role 별칭은 deprecation 경고 후 builder로 정규화되고, arbiter의 `job.claim` envelope
    payload에는 `owner_lane`, `role: "builder"`, `parent_lane`이 남는다.
 3. 워커와 tester는 빌더가 스폰한다. tester의 급은 반드시 워커 이상이며, 독립 세션으로 AC 반증,
-   변경 범위, 실패 경로를 확인한다. `spawn-worker`의 뮤턴트, 실모양 fixture, `gh pr checks`를
-   직접 확인하는 규칙을 생략하지 않는다. `gh pr checks`가 조회 불가하거나 녹색을 직접 확인할 수
-   없으면 성공으로 추정하지 않는다. 단, 아래 §단독 모드의 6조건이 **전부** 충족되면 워커·tester
+   변경 범위, 실패 경로를 확인한다. `spawn-worker`의 뮤턴트, 실모양 fixture, G3
+   `merge_precheck`/`ci_canonical` 판정을 생략하지 않는다. `gh pr checks` 조회만으로 녹색을
+   추정하지 않으며 G3 근거가 없으면 성공으로 추정하지 않는다. 단, 아래 §단독 모드의 6조건이 **전부** 충족되면 워커·tester
    스폰 없이 빌더가 직접 구현한다.
    🔴 **tester 브리프에는 계열과 무관하게 항상 지시형 공격 표면을 넣는다** — 이 변경이 새로
    들인 것(새 분기·상태·외부 호출·바뀐 계약)을 `file:line` 으로 이름 붙인다. 중립 브리프
@@ -76,7 +76,7 @@ Tester는 근거를 기록해 affected surface를 넓힐 수 있다. surviving m
 소비자·계약 테스트나 반례를 넓혀도 죽이지 못하면 해당 주장은 통과가 아니다. CI or collection
 configuration을 바꾸는 PR은 separately judged하고 이 shortcut을 쓰지 않는다. T3는 local에서
 관련 safety-guard 파일 전체, independent counterexample, mutant RED then restored GREEN, 그리고
-environment differences를 최소로 유지한다. outside CI surface는 CI에 등록되어 실제 실행됨이
+environment-difference checks를 최소한 유지한다. outside CI surface는 CI에 등록되어 실제 실행됨이
 확인될 때까지 local run이 필요하다. red rerun이면 verification is not met다.
 <!-- ci-canonical-full-suite:end -->
 

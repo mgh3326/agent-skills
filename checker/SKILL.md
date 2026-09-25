@@ -51,7 +51,7 @@ Tester는 근거를 기록해 affected surface를 넓힐 수 있다. surviving m
 소비자·계약 테스트나 반례를 넓혀도 죽이지 못하면 해당 주장은 통과가 아니다. CI or collection
 configuration을 바꾸는 PR은 separately judged하고 이 shortcut을 쓰지 않는다. T3는 local에서
 관련 safety-guard 파일 전체, independent counterexample, mutant RED then restored GREEN, 그리고
-environment differences를 최소로 유지한다. outside CI surface는 CI에 등록되어 실제 실행됨이
+environment-difference checks를 최소한 유지한다. outside CI surface는 CI에 등록되어 실제 실행됨이
 확인될 때까지 local run이 필요하다. red rerun이면 verification is not met다.
 <!-- ci-canonical-full-suite:end -->
 

@@ -118,6 +118,18 @@ def _has_bound_identity(run: dict[str, Any], job: dict[str, Any], H: str) -> boo
     )
 
 
+def _job_attempt_is_invalid_for_selected_run(run: dict[str, Any], job: dict[str, Any]) -> bool:
+    """Reject a collection race instead of silently accepting its older green job."""
+    run_id = run.get("id")
+    attempt = run.get("run_attempt")
+    job_attempt = job.get("run_attempt")
+    if type(run_id) is not int or type(job.get("run_id")) is not int or job.get("run_id") != run_id:
+        return True
+    if type(attempt) is not int or type(job_attempt) is not int:
+        return True
+    return job_attempt > attempt
+
+
 def evaluate_required_ci(
     policy: dict[str, Any], repo: str, H: str, B: str,
     runs: list[dict[str, Any]], jobs_by_run: dict[int, list[dict[str, Any]]],
@@ -198,6 +210,9 @@ def evaluate_required_ci(
                 run_id = run.get("id")
                 for job in jobs_by_run.get(run_id, []):
                     if job.get("name") != name:
+                        continue
+                    if _job_attempt_is_invalid_for_selected_run(run, job):
+                        binding_invalid = True
                         continue
                     if job.get("run_attempt") != run.get("run_attempt"):
                         continue

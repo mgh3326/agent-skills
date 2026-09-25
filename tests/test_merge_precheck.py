@@ -41,7 +41,7 @@ def snapshot() -> dict:
     job = "task727-builder"
     report_path = "/tmp/task727-builder-report.md"
     run = {"id": 10, "path": ".github/workflows/ci.yml", "head_sha": H, "event": "pull_request",
-           "created_at": "2026-09-25T07:00:00Z", "run_attempt": 1, "status": "completed", "conclusion": "success",
+           "created_at": "2026-09-25T07:00:00Z", "run_started_at": "2026-09-25T07:00:00Z", "run_attempt": 1, "status": "completed", "conclusion": "success",
            "pull_requests": [{"base": {"sha": B}}]}
     jobs = [{"id": i, "name": name, "run_id": 10, "run_attempt": 1, "head_sha": H, "status": "completed",
              "conclusion": "success", "tested_base_sha": B, "tested_merge_sha": "e" * 40, "tested_merge_tree": M,
@@ -260,6 +260,7 @@ class MergePrecheckTests(unittest.TestCase):
         late = copy.deepcopy(s["ci_runs"][0])
         late["id"] = 11
         late["created_at"] = "2026-09-25T07:05:00Z"
+        late["run_started_at"] = "2026-09-25T07:05:00Z"
         late["conclusion"] = "failure"
         s["ci_runs"].append(late)
         s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
@@ -274,19 +275,60 @@ class MergePrecheckTests(unittest.TestCase):
 
     def test_ci_red_rerun_is_not_met_with_assertion_red_mutant(self) -> None:
         s = snapshot()
-        rerun = copy.deepcopy(s["ci_runs"][0])
-        rerun.update({"id": 11, "created_at": "2026-09-25T07:05:00Z", "conclusion": "failure"})
-        s["ci_runs"].append(rerun)
-        s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
+        s["ci_runs"][0].update({"run_attempt": 2, "run_started_at": "2026-09-25T07:30:00Z", "conclusion": "failure"})
+        for job in s["ci_jobs"][10]:
+            job["run_attempt"] = 2
+            job["conclusion"] = "failure"
+        newer_green = copy.deepcopy(snapshot()["ci_runs"][0])
+        newer_green.update({"id": 11, "created_at": "2026-09-25T07:05:00Z", "run_started_at": "2026-09-25T07:05:00Z"})
+        s["ci_runs"].append(newer_green)
+        s["ci_jobs"][11] = copy.deepcopy(snapshot()["ci_jobs"][10])
         for job in s["ci_jobs"][11]:
             job["run_id"] = 11
-            job["conclusion"] = "failure"
+            job["id"] += 100
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
         source = (ROOT / "director/ci_canonical.py").read_text()
-        selector = "selected = selected[-1:] if selected else []"
+        selector = 'raw = run.get("run_started_at")'
         self.assertEqual(1, source.count(selector))
         namespace: dict = {"__name__": "ci_rerun_red_mutant"}
-        exec(source.replace(selector, "selected = selected[:1] if selected else []"), namespace)
+        exec(source.replace(selector, 'raw = run.get("created_at")'), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_FAILED", mutant["reason_code"])
+
+    def test_ci_collector_race_with_newer_job_attempt_is_not_met(self) -> None:
+        for status, conclusion in (("completed", "failure"), ("in_progress", None)):
+            with self.subTest(status=status):
+                s = snapshot()
+                s["ci_jobs"][10] += [
+                    {**copy.deepcopy(job), "id": job["id"] + 100, "run_attempt": 2,
+                     "status": status, "conclusion": conclusion}
+                    for job in s["ci_jobs"][10]
+                ]
+                assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = "if _job_attempt_is_invalid_for_selected_run(run, job):"
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_collector_race_mutant"}
+        exec(source.replace(guard, "if False:"), namespace)
+        s = snapshot()
+        s["ci_jobs"][10] += [
+            {**copy.deepcopy(job), "id": job["id"] + 100, "run_attempt": 2, "conclusion": "failure"}
+            for job in s["ci_jobs"][10]
+        ]
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+
+    def test_selected_red_workflow_cannot_count_as_green_ci(self) -> None:
+        s = snapshot()
+        s["ci_runs"][0]["conclusion"] = "failure"
+        assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = 'elif run.get("conclusion") != "success":'
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_red_run_mutant"}
+        exec(source.replace(guard, "elif False:"), namespace)
         mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_FAILED", mutant["reason_code"])
@@ -337,6 +379,7 @@ class MergePrecheckTests(unittest.TestCase):
         later = copy.deepcopy(s["ci_runs"][0])
         later["id"] = 11
         later["created_at"] = "2026-09-25T07:00:00.100Z"
+        later["run_started_at"] = "2026-09-25T07:00:00.100Z"
         later["conclusion"] = "failure"
         s["ci_runs"].append(later)
         s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
@@ -344,9 +387,9 @@ class MergePrecheckTests(unittest.TestCase):
             job["run_id"] = 11
             job["conclusion"] = "failure"
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
-        s["ci_runs"][1]["created_at"] = "unknown"
+        s["ci_runs"][1]["run_started_at"] = "unknown"
         assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_TIME_INVALID")
-        s["ci_runs"][1]["created_at"] = s["ci_runs"][0]["created_at"]
+        s["ci_runs"][1]["run_started_at"] = s["ci_runs"][0]["run_started_at"]
         assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_AMBIGUOUS")
 
     def test_branch_protection_same_second_runs_with_different_attempts_are_ambiguous(self) -> None:
