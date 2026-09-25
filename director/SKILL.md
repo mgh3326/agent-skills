@@ -186,6 +186,8 @@ checker 파생 판정:
 4. diff leak 스캔: 시크릿, 내부 주소, 실 pane id·레인명, 트레이딩 문언이 공개 레포에 들어가지
    않는다. 빌드 산출물 커밋 0.
 5. RISKS 항목은 배포 대상 환경에서 **실측**으로 무해함을 확인하거나 후속 태스크로 큐에 넣는다.
+   자동 리뷰어(CodeRabbit 등)의 'Changes requested' 리뷰 상태(`reviewDecision`)는 게이트
+   항목이 아니다 — checker 도 이를 BOUNCE 사유로 쓰지 않는다.
 6. 머지 후: 큐 전이, 체크포인트, 빌더 통지, worktree·pane 회수. 🔴 보고서는 worktree 밖
    (`~/work/herdr-inbox/jobs/<job_id>/`)에 두고 지우지 않는다 — 지정 경로에 보고가 없으면
    pane을 닫기 전에 먼저 회수한다(닫으면 영구 소실). worktree 정리는 별도 판단이며,

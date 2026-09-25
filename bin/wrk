@@ -81,7 +81,7 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [options]
+Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts|heavy> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
@@ -93,6 +93,8 @@ Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts> [opti
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
+  wrk heavy -- <command> [args...]
+  wrk heavy status
 
 Run 'wrk <command> --help' for command-specific usage.
 USAGE
@@ -4923,6 +4925,197 @@ else:
 PY
 }
 
+heavy_help() {
+  cat <<'USAGE'
+Usage: wrk heavy -- <command> [args...]
+       wrk heavy status
+
+Serialize heavy (>1 minute) local test/build runs: one holder per host via
+fcntl.flock on a per-host lock file (works the same on macOS and Linux —
+macOS has no `flock` command). The command runs under `nice -n 10` and only
+starts once load5/ncpu < 1.0. Total wait (lock + load) is capped at 20
+minutes; on expiry the command is NOT run and wrk exits 75 (EX_TEMPFAIL).
+The lock fd is never inherited by the command, so an orphaned child cannot
+keep the lock held (the desktop flock -o leak, v637).
+
+`wrk heavy status` prints the current holder and queued waiters.
+
+Environment overrides (tests only):
+  WRK_HEAVY_LOCK        lock file path
+                        (default /tmp/wrk-heavy-<hostname>.lock)
+  WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
+  WRK_HEAVY_LOAD_FILE   file re-read each poll whose first field is used as
+                        load5/ncpu (default: os.getloadavg()[1]/cpu_count)
+  -h, --help            show this usage
+USAGE
+}
+
+heavy_cmd() {
+  case "${1:-}" in
+    -h|--help) heavy_help; return 0 ;;
+  esac
+  python3 - "$@" <<'PY'
+import datetime, fcntl, os, socket, subprocess, sys, time
+
+EXIT_WAIT_CAP = 75  # EX_TEMPFAIL: transient, worth reporting and retrying later
+
+
+def fail(msg, rc):
+    print("wrk heavy: " + msg, file=sys.stderr)
+    raise SystemExit(rc)
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+args = sys.argv[1:]
+if not args:
+    fail("usage: wrk heavy -- <command> [args...] | wrk heavy status", 2)
+
+lock_path = os.environ.get("WRK_HEAVY_LOCK") or (
+    "/tmp/wrk-heavy-%s.lock" % socket.gethostname())
+waiters_dir = lock_path + ".waiters"
+
+if args[0] == "status":
+    if len(args) != 1:
+        fail("status takes no arguments", 2)
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held = False
+        except BlockingIOError:
+            held = True
+    finally:
+        os.close(fd)
+    if held:
+        print("holder " + (read_text(lock_path) or "(info unreadable)"))
+    else:
+        print("holder none")
+    waiters = []
+    try:
+        names = sorted(os.listdir(waiters_dir))
+    except OSError:
+        names = []
+    for name in names:
+        path = os.path.join(waiters_dir, name)
+        info = read_text(path)
+        pid = -1
+        for field in info.split():
+            if field.startswith("pid="):
+                try:
+                    pid = int(field[4:])
+                except ValueError:
+                    pass
+        if pid > 0 and not alive(pid):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            continue
+        waiters.append(info or name)
+    for w in waiters:
+        print("waiter " + w)
+    if not waiters:
+        print("waiters none")
+    raise SystemExit(0)
+
+if args[0] != "--":
+    fail("expected '--' before the command (see 'wrk heavy --help')", 2)
+cmd = args[1:]
+if not cmd:
+    fail("no command after '--'", 2)
+
+try:
+    cap = float(os.environ.get("WRK_HEAVY_WAIT_CAP", "1200"))
+except ValueError:
+    fail("WRK_HEAVY_WAIT_CAP is not a number", 2)
+deadline = time.monotonic() + cap
+info = "pid=%d since=%s cmd=%s" % (
+    os.getpid(), datetime.datetime.now().isoformat(timespec="seconds"),
+    " ".join(cmd))
+
+
+def load_ratio():
+    load_file = os.environ.get("WRK_HEAVY_LOAD_FILE")
+    if load_file:
+        try:
+            return float(read_text(load_file).split()[0])
+        except (ValueError, IndexError):
+            return None
+    try:
+        return os.getloadavg()[1] / (os.cpu_count() or 1)
+    except OSError:
+        return None
+
+
+os.makedirs(waiters_dir, exist_ok=True)
+me = os.path.join(waiters_dir, str(os.getpid()))
+held = False
+# PEP 446: os.open returns a non-inheritable fd, so the command's process
+# tree never holds the lock — killing wrk heavy (or the command exiting)
+# releases it even while orphaned children keep running.
+fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+try:
+    with open(me, "w", encoding="utf-8") as f:
+        f.write(info)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            held = True
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                fail("wait cap %.0fs exceeded waiting for the host lock %s "
+                     "-- command not run" % (cap, lock_path), EXIT_WAIT_CAP)
+            time.sleep(0.5)
+    try:
+        os.remove(me)
+    except OSError:
+        pass
+    os.ftruncate(fd, 0)
+    os.write(fd, (info + "\n").encode())
+    while True:
+        ratio = load_ratio()
+        if ratio is None or ratio < 1.0:
+            break
+        if time.monotonic() >= deadline:
+            fail("wait cap %.0fs exceeded waiting for load5/ncpu %.2f < 1.0 "
+                 "-- command not run" % (cap, ratio), EXIT_WAIT_CAP)
+        time.sleep(1)
+    try:
+        rc = subprocess.call(["nice", "-n", "10"] + cmd)
+        if rc < 0:
+            rc = 128 - rc
+    except FileNotFoundError as e:
+        fail("cannot run command: %s" % e, 127)
+    raise SystemExit(rc)
+finally:
+    try:
+        os.remove(me)
+    except OSError:
+        pass
+    if held:
+        os.ftruncate(fd, 0)
+    os.close(fd)
+PY
+}
+
 case "${1:-}" in
   -h|--help) usage ;;
   spawn) shift; spawn_router_cmd "$@" ;;
@@ -4935,6 +5128,7 @@ case "${1:-}" in
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;
   hosts) shift; hosts_cmd "$@" ;;
+  heavy) shift; heavy_cmd "$@" ;;
   "") usage >&2; exit 2 ;;
   *) die "unknown command '$1' (see 'wrk --help')" ;;
 esac

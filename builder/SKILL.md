@@ -257,6 +257,14 @@ shape다. 소비자는 flat completion event를 arbiter envelope이라고 가정
    (`CR: <path>:<line> <카테고리> — 수용/기각: <이유>`). 자동 리뷰가 pending·skipped·rate-limited
    인 것은 JOIN을 막지 않으며, 지적 0건이면 `CR: none`으로 표기해 읽었음을 남긴다. 검증자 자신의
    적대 검증을 자동 리뷰로 대체하지 않는다.
+   🔴 **CR 지적은 라운드 사유도, head 이동 사유도 아니다.** ① CR Major 는 tester 입력이다 —
+   tester 가 **독립 재현**해 BLOCKER 로 올렸을 때만 fix 라운드를 연다(재현 못 하면 RISKS 에
+   `CR … 기각/미재현`). ② CR Minor·재현 안 된 Major 는 **tester PASS 이후 push 하지 않는다**
+   — 후속 태스크로 큐에 넣거나, 다음 *실제* BLOCKER fix 커밋에 묶는다. tester PASS 뒤 CR 만을
+   위한 push 는 exact-head 검증을 무효화해 라운드를 하나 더 만든다(09-20 이후 14 PR 실측:
+   hk#43·pw#84·sf#83·at#2091 …). ③ CR 의 'Changes requested' 리뷰 상태(`reviewDecision`)는
+   게이트가 아니다 — checker 는 이를 BOUNCE 사유로 쓰지 않는다. ④ CR 재리뷰 대기·재트리거
+   (`@coderabbitai review`) 금지.
 
 10. **pane에 확인 질문을 쓰지 않는다.** "진행할까요?"·"이대로 갈까요?" 류 확인 질문을
     pane에 쓰는 것을 금지한다 — pane 질문은 아무도 읽지 않는다. 근거는 captain-20이 확인
