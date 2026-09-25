@@ -22,6 +22,11 @@ WRK_EXIT_LANDING_UNCONFIRMED=76
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
 KIMI_CODE_LOW_HOME="${KIMI_CODE_LOW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low}"
+# #704 (#594 E6): the kimi builder rungs take their effort from pinned clone
+# homes the same way (bin/kimi-clone-home --effort high|max) — the kimi CLI
+# has no --effort flag, so the clone's [thinking] effort is the only lever.
+KIMI_CODE_HIGH_HOME="${KIMI_CODE_HIGH_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-high}"
+KIMI_CODE_MAX_HOME="${KIMI_CODE_MAX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-max}"
 # ROB-1252: cc-qwen38/cc-glm route the Claude Code CLI itself through the
 # CLIProxyAPI instance at 127.0.0.1:8317 (openai-compatibility provider
 # "cline-pass" registered in ~/.cli-proxy-api/config.yaml, aliases
@@ -44,10 +49,14 @@ ALL_PROFILES=(
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
   codex-sol56 codex-luna56
+  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max
+  builder-sol-high builder-sol-max builder-luna-max
+  builder-terra-high builder-terra-xhigh builder-terra-max
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
   kimi-k3 kimi-k27 kimi-k27-code kimi-k3-low builder-kimi
+  builder-kimi-high builder-kimi-max
   oc-kimi-code oc-glm oc-kimi-k3 oc-dsflash oc-sonnet46 oc-oss oc-omni
   oc-qwen37-max oc-minimax-m3 oc-solar4
   agy-flash agy-flash36 agy-flash37
@@ -136,11 +145,15 @@ Options:
                      builder requires --lane and --parent, and accepts only
                      builder-opus, builder-sol, builder-devin,
                      builder-devin-medium, builder-devin-max, builder-ds41,
-                     builder-ds41-max, builder-grok, builder-kimi or
-                     builder-luna profiles; legacy captain-opus and captain-sol
-                     aliases and the pilot worker spellings devin-swe2,
-                     devin-swe2-medium, devin-swe2-max, grok/grok-hi and kimi-k3
-                     remain accepted.
+                     builder-ds41-max, builder-grok, builder-kimi,
+                     builder-luna, builder-opus-low, builder-opus-medium,
+                     builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high,
+                     builder-sol-max, builder-luna-max, builder-terra-high,
+                     builder-terra-xhigh, builder-terra-max, builder-kimi-high
+                     or builder-kimi-max profiles; legacy captain-opus and
+                     captain-sol aliases and the pilot worker spellings
+                     devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi
+                     and kimi-k3 remain accepted.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      required for --role builder (spawn dies without it).
@@ -236,6 +249,22 @@ builder-devin-medium and builder-devin-max (the free swe-2 rungs), plus
 builder-ds41 and builder-ds41-max for the paid ds41 rung per the operator's
 ds41-builder policy. Each reuses its worker variant's argv verbatim; the ds41
 worker spellings themselves stay worker-only under --role builder.
+E6 measurement builders (#704, #594): builder-opus-low, builder-opus-medium,
+builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max,
+builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max,
+builder-kimi-high and builder-kimi-max each pin exactly one effort rung (the
+suffix IS the rung; --effort is refused off-rung, allowed spelled the same).
+They exist only to measure that rung, so they refuse to spawn without
+SCOPEFUEL_E6_ARM=<gate profile>@<effort> naming exactly it — e.g.
+SCOPEFUEL_E6_ARM=codex-terra@high for builder-terra-high. For these profiles
+wrk passes the pinned rung as `scopefuel gate --effort` so the gate judges
+that rung's row, and the marker (forwarded through the environment) is what
+opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
+kimi-k3@max). Rungs the gate marks escalation (opus@low, sonnet@xhigh)
+additionally need --operator-request REF. The kimi pair takes its effort from
+the pinned clone homes KIMI_CODE_HIGH_HOME/KIMI_CODE_MAX_HOME (refresh with
+`bin/kimi-clone-home --effort high|max`); everything else carries the effort
+in its argv.
 Legacy profile aliases captain-opus and captain-sol have the same meaning.
 Kimi profiles: kimi-k3 uses `kimi --auto -m kimi-code/k3`; kimi-k27 and
 kimi-k27-code use `kimi --auto -m kimi-code/kimi-for-coding`; the CLI has
@@ -743,6 +772,16 @@ spawn_deliver_brief() {
   LANDING_NO_DETAIL="phase=initial $first $detail action=landed-no retry=skipped reason=$retry_skip_reason"
 }
 
+# Print the [thinking] effort value of a Kimi CLI home's config.toml (empty
+# when absent/unparseable). Used by the #704 E6 kimi rungs to prove the pinned
+# clone home actually runs the requested effort — the kimi CLI has no
+# --effort flag, so the clone config is the only place the rung exists.
+kimi_clone_thinking_effort() {
+  local cfg="$1"
+  [[ -r "$cfg" ]] || return 0
+  awk -F'"' '/^\[/{in_thinking=($0 ~ /^\[thinking\]/)} in_thinking && /^[[:space:]]*effort[[:space:]]*=/ {print $2; exit}' "$cfg"
+}
+
 # Kimi opens a folder-trust modal for an unregistered CWD. Seed only the
 # workspace-trust entry it needs, before the agent starts. This is deliberately
 # fail-open: trust seeding is a convenience and must never deny a Kimi spawn.
@@ -880,6 +919,11 @@ quota_gate() {
   # astra profiles (task #527) — without it the gate role-denies them (gate
   # rc 5, surfaced by wrk as exit 77).
   local gate_args=(gate -m "$GATE_PROFILE")
+  # #704: only the E6 per-rung builder spellings set GATE_EFFORT_PIN — for them
+  # the gate must judge that rung's row (scopefuel #692 --effort), which the
+  # matching SCOPEFUEL_E6_ARM marker (enforced in resolve_profile) then opens.
+  # Every other profile keeps the exact pre-existing gate argv.
+  [[ -z "${GATE_EFFORT_PIN:-}" ]] || gate_args+=(--effort "$GATE_EFFORT_PIN")
   [[ -z "${OPERATOR_REQUEST:-}" ]] || gate_args+=(--operator-request "$OPERATOR_REQUEST")
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
@@ -1768,7 +1812,13 @@ arbiter_admit() {
   # Rollback spellings (codex-sol56) stay literal by design — pinning the
   # superseded model is the point, and the canon does not carry them.
   local launch_name="$MODEL"
-  if [[ "$PROFILE_KIND" == codex && -n "$CATALOG_PROFILE" ]]; then
+  if [[ -n "${GATE_EFFORT_PIN:-}" ]]; then
+    # #704: the E6 rung spellings are measurement aliases — record the canonical
+    # rung (opus@low, kimi-k3@max, codex-terra@high) so reps attribute to the
+    # profile@effort the gate judged, not a launcher-only name the grade table
+    # cannot read (the same failure #677 fixed inside the codex pool).
+    launch_name="$GATE_PROFILE"
+  elif [[ "$PROFILE_KIND" == codex && -n "$CATALOG_PROFILE" ]]; then
     launch_name="$CATALOG_PROFILE"
   fi
   local launch_profile="$launch_name${EFFECTIVE_EFFORT:+@$EFFECTIVE_EFFORT}"
@@ -1900,6 +1950,10 @@ resolve_catalog_profile() {
   case "$MODEL" in
     opus|builder-opus|captain-opus) CATALOG_PROFILE=opus ;;
     sonnet|sonnet-med) CATALOG_PROFILE=sonnet ;;
+    # #704 (#594 E6): the per-rung builder spellings consult the catalog at the
+    # rung they pin — the suffix is the rung by construction.
+    builder-opus-low|builder-opus-medium) CATALOG_PROFILE=opus; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
+    builder-sonnet-xhigh|builder-sonnet-max) CATALOG_PROFILE=sonnet; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     haiku) CATALOG_PROFILE=haiku ;;
     fable) CATALOG_PROFILE=fable ;;
 
@@ -1914,6 +1968,12 @@ resolve_catalog_profile() {
     # #594 E3 effort (xhigh) — pinned so the catalog is consulted at the same
     # effort the grade ceiling was rated at.
     builder-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=xhigh ;;
+    # #704: the E6 codex rungs resolve against the canonical catalog profile at
+    # their pinned effort, so the quota record's launch_profile is the exact
+    # catalog rung (codex-terra@high, codex-luna@max, codex-sol@high ...).
+    builder-sol-high|builder-sol-max) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
+    builder-luna-max) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=max ;;
+    builder-terra-high|builder-terra-xhigh|builder-terra-max) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     codex-astra) CATALOG_PROFILE=codex-astra ;;
 
     kiro-opus) CATALOG_PROFILE=kiro-opus ;;
@@ -2070,12 +2130,19 @@ resolve_profile() {
   CATALOG_STALE=0
   CATALOG_REFUSED=0
   CATALOG_REFUSE_REASON=""
+  GATE_EFFORT_PIN=""
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
     # Defaults align with scopefuel Profile.benchmark_effort (opus=high, sonnet=high).
     opus) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
     builder-opus|captain-opus) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
+    # #704 (#594 E6): per-rung builder spellings — the name's last segment IS
+    # the pinned rung, and spawn refuses both an off-rung --effort and a
+    # missing/mismatched SCOPEFUEL_E6_ARM=<gate profile>@<rung> marker (the
+    # marker is the only channel that tells the gate which rung to judge).
+    builder-opus-low|builder-opus-medium) PROFILE_KIND=claude; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
+    builder-sonnet-xhigh|builder-sonnet-max) PROFILE_KIND=claude; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     sonnet|sonnet-med) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5-1 --dangerously-skip-permissions) ;;
@@ -2163,6 +2230,12 @@ resolve_profile() {
     # xhigh. The literal is the catalog-unreachable fallback; #593 wiring lets
     # `policy launch` replace both fields.
     builder-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
+    # #704 (#594 E6): per-rung codex builder spellings. PROFILE_MODEL is the
+    # catalog-unreachable literal; apply_catalog replaces it with the canon's
+    # model id for that rung (codex-terra@high etc.).
+    builder-sol-high|builder-sol-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
+    builder-luna-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    builder-terra-high|builder-terra-xhigh|builder-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     # task #527 요건 ⑦: codex-astra default effort is xhigh, unified with
     # ARCHITECT.md's spawn command and the consult-advisor SKILL.md note
     # (hk:doc note/2026-09-22/task527-astra-effort-alignment).
@@ -2205,6 +2278,17 @@ resolve_profile() {
     # (operator decision 2026-09-14 §5) — identical argv, still no --effort.
     kimi-k3|builder-kimi) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/k3) ;;
     kimi-k27|kimi-k27-code) PROFILE_KIND=kimi; KIMI_TRUST_HOME="${KIMI_CODE_HOME:-$HOME/.kimi-code}"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/kimi-for-coding) ;;
+    # #704 (#594 E6): the kimi E6 rungs follow the kimi-k3-low pattern — same
+    # argv, differentiator is the pinned clone home (bin/kimi-clone-home
+    # --effort high|max writes [thinking] effort = "<rung>"). The name's last
+    # segment is the rung; spawn verifies the clone config matches before
+    # admitting (no silent fallback).
+    builder-kimi-high)
+      PROFILE_KIND=kimi; KIMI_TRUST_HOME="$KIMI_CODE_HIGH_HOME"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/k3); DEFAULT_EFFORT=high
+      PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_HIGH_HOME") ;;
+    builder-kimi-max)
+      PROFILE_KIND=kimi; KIMI_TRUST_HOME="$KIMI_CODE_MAX_HOME"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/k3); DEFAULT_EFFORT=max
+      PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_MAX_HOME") ;;
     # kimi-k3-low: same model argv as kimi-k3 — the differentiator is KIMI_CODE_HOME
     # (below), pointed at the low-thinking-effort clone home, not the CLI model arg.
     kimi-k3-low)
@@ -2259,6 +2343,11 @@ resolve_profile() {
   case "$MODEL" in
     opus|builder-opus|captain-opus) GATE_PROFILE=opus ;;
     sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
+    # #704: E6 rungs gate at their own rung (GATE_EFFORT_PIN) — quota_gate
+    # forwards it as `scopefuel gate --effort`, and spawn enforces
+    # SCOPEFUEL_E6_ARM naming exactly GATE_PROFILE@GATE_EFFORT_PIN.
+    builder-opus-low|builder-opus-medium) GATE_PROFILE=opus; GATE_EFFORT_PIN="${MODEL##*-}" ;;
+    builder-sonnet-xhigh|builder-sonnet-max) GATE_PROFILE=sonnet; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
     devin-swe2|builder-devin) GATE_PROFILE=devin-swe2 ;;
@@ -2269,6 +2358,13 @@ resolve_profile() {
     # `launch_profile`, so reps stay separated per model.
     devin-glm52|devin-swe17|devin-ds41|devin-swe2-medium|devin-swe2-max|devin-ds41-max|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max) GATE_PROFILE=devin-swe2 ;;
     codex|codex-sol|codex-max|builder-sol|captain-sol|codex-sol56) GATE_PROFILE=codex-max ;;
+    # #704: E6 codex rungs are judged at the canonical catalog profile + pinned
+    # effort rung (codex-sol@high, codex-luna@max, codex-terra@*) — not the
+    # flat codex-max/codex-luna-max/codex-terra-max spellings the old builders
+    # use, because scopefuel #692's E6 marker is profile@effort-exact.
+    builder-sol-high|builder-sol-max) GATE_PROFILE=codex-sol; GATE_EFFORT_PIN="${MODEL##*-}" ;;
+    builder-luna-max) GATE_PROFILE=codex-luna; GATE_EFFORT_PIN=max ;;
+    builder-terra-high|builder-terra-xhigh|builder-terra-max) GATE_PROFILE=codex-terra; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     # task #527: the gate role-denies astra without an allowed --purpose, so the
     # counsel spawn path defaults it to `architect` (the wrk-side counsel use).
     # An explicit --purpose director|operator-request still wins.
@@ -2283,6 +2379,11 @@ resolve_profile() {
       GATE_PROFILE=kiro-sol ;;
     kimi-k3|kimi-k27|kimi-k27-code|kimi-k3-low) GATE_PROFILE="$MODEL" ;;
     builder-kimi) GATE_PROFILE=kimi-k3 ;;
+    # #704: the kimi E6 rungs gate at their pinned rung like the rest (the
+    # --effort goes to `scopefuel gate`, not the kimi CLI — that one takes the
+    # rung from its clone home). Both rungs are unmeasured C rows under #692,
+    # so without SCOPEFUEL_E6_ARM=kimi-k3@<rung> the gate refuses.
+    builder-kimi-high|builder-kimi-max) GATE_PROFILE=kimi-k3; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     oc-kimi-code|oc-glm|oc-kimi-k3|oc-dsflash|oc-gflash|oc-sonnet46|oc-oss|oc-omni|oc-qwen37-max|oc-minimax-m3|oc-solar4)
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
@@ -2305,6 +2406,29 @@ resolve_profile() {
     EFFECTIVE_EFFORT="$EFFORT"
   else
     EFFECTIVE_EFFORT="$DEFAULT_EFFORT"
+  fi
+
+  # #704 (#594 E6): the per-rung builder spellings carry GATE_EFFORT_PIN. The
+  # rung is pinned by the profile name — an explicit --effort may only restate
+  # it (the kimi pair has EFFORT_SUPPORTED=0, so --effort is already refused
+  # above). They exist to measure exactly that rung, so spawn is refused
+  # unless SCOPEFUEL_E6_ARM names GATE_PROFILE@<rung> verbatim: scopefuel #692
+  # opens the unmeasured C rungs only for that marker, and pinning it here
+  # keeps an unlabeled or mislabeled launch out of the E6 sample.
+  if [[ -n "$GATE_EFFORT_PIN" ]]; then
+    [[ "$EFFECTIVE_EFFORT" == "$GATE_EFFORT_PIN" ]] ||
+      die "$MODEL is pinned to effort $GATE_EFFORT_PIN (#594 E6 rung); --effort $EFFECTIVE_EFFORT is a different rung"
+    [[ "${SCOPEFUEL_E6_ARM:-}" == "$GATE_PROFILE@$GATE_EFFORT_PIN" ]] ||
+      die "$MODEL is an E6 measurement profile (#594): spawn requires SCOPEFUEL_E6_ARM=$GATE_PROFILE@$GATE_EFFORT_PIN (got '${SCOPEFUEL_E6_ARM:-<unset>}')"
+    if [[ "$PROFILE_KIND" == kimi ]]; then
+      # The kimi CLI has no --effort flag: the pinned clone home's
+      # [thinking] effort is the only place this rung exists, so a missing or
+      # mismatched clone would silently launch the wrong rung. Fail closed.
+      local local_clone_effort
+      local_clone_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"
+      [[ "$local_clone_effort" == "$GATE_EFFORT_PIN" ]] ||
+        die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (found '${local_clone_effort:-<none>}'); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"
+    fi
   fi
 
   case "$PROFILE_KIND" in
@@ -4200,8 +4324,8 @@ spawn_cmd() {
     case "$MODEL" in
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
-      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi or builder-luna (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max)" ;;
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna or the #704 E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -4214,11 +4338,18 @@ spawn_cmd() {
       builder-luna)
         [[ -z "$EFFORT" || "$EFFORT" == xhigh ]] || die "builder-luna requires effort xhigh (#594 E3 sample profile)"
         ;;
+      # #704: the E6 rungs pin their effort in the name's last segment.
+      # resolve_profile repeats the check against GATE_EFFORT_PIN and enforces
+      # the SCOPEFUEL_E6_ARM marker; refusing here too keeps the failure on the
+      # same die path the other pinned builders use.
+      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max)
+        [[ -z "$EFFORT" || "$EFFORT" == "${MODEL##*-}" ]] || die "$MODEL is pinned to effort ${MODEL##*-} (#594 E6 rung)"
+        ;;
     esac
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac

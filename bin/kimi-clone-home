@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-# kimi-clone-home — refresh an isolated, low-thinking-effort clone of ~/.kimi-code.
+# kimi-clone-home — refresh an isolated, fixed-thinking-effort clone of ~/.kimi-code.
 #
-# Purpose: `wrk`'s kimi-k3-low profile needs a Kimi CLI home (KIMI_CODE_HOME) whose
-# config.toml has [thinking] effort = "low", without touching the real ~/.kimi-code
-# (which stays at effort = "high" for kimi-k3/kimi-k27). This script clones only the
-# state the kimi CLI needs to authenticate and run — never sessions, logs, history,
-# or binaries — into a persistent directory outside /tmp, then patches the effort
-# line in the clone only.
+# Purpose: `wrk`'s pinned-effort kimi profiles (kimi-k3-low and the #704 E6
+# rungs builder-kimi-high / builder-kimi-max) need a Kimi CLI home
+# (KIMI_CODE_HOME) whose config.toml has [thinking] effort = "<rung>", without
+# touching the real ~/.kimi-code (which stays at effort = "high" for
+# kimi-k3/kimi-k27). The kimi CLI has no --effort flag, so the clone's config
+# is the only lever. This script clones only the state the kimi CLI needs to
+# authenticate and run — never sessions, logs, history, or binaries — into a
+# persistent directory outside /tmp, then patches the effort line in the clone
+# only.
 #
-# Usage: kimi-clone-home [-h|--help]
+# Usage: kimi-clone-home [-h|--help] [--effort low|high|max]
 #
 # Env overrides (mainly for tests):
-#   KIMI_CODE_SRC       source home to clone from (default: $HOME/.kimi-code)
-#   KIMI_CODE_LOW_HOME  destination clone path
-#                        (default: ${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low)
+#   KIMI_CODE_SRC        source home to clone from (default: $HOME/.kimi-code)
+#   KIMI_CODE_LOW_HOME   destination clone path for --effort low
+#   KIMI_CODE_HIGH_HOME  destination clone path for --effort high
+#   KIMI_CODE_MAX_HOME   destination clone path for --effort max
+#                          (defaults: ${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-<effort>)
 #
 # Behavior:
 #   - Read-only against KIMI_CODE_SRC, full stop. Never writes, touches mtimes, or
@@ -22,8 +27,8 @@
 #     mcp.json. Everything else in the source (bin/, hooks/, logs/, search-index/,
 #     session_index.jsonl, sessions/, telemetry/, tui.toml, updates/, user-history/,
 #     workspaces.json, migrations-effort.json, ...) is deliberately excluded.
-#   - Rewrites [thinking] effort in the CLONED config.toml to "low"; every other
-#     byte of config.toml is left identical to the source.
+#   - Rewrites [thinking] effort in the CLONED config.toml to the requested rung;
+#     every other byte of config.toml is left identical to the source.
 #   - chmod go-rwx on the whole clone directory after each run.
 #   - Idempotent: re-running fully re-copies from the current source, so credential
 #     rotation/expiry on the real ~/.kimi-code is picked up by just running this
@@ -31,27 +36,44 @@
 set -euo pipefail
 
 SRC="${KIMI_CODE_SRC:-$HOME/.kimi-code}"
-DEST="${KIMI_CODE_LOW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low}"
+EFFORT=low
 
 usage() {
   cat <<'USAGE'
-Usage: kimi-clone-home [-h|--help]
+Usage: kimi-clone-home [-h|--help] [--effort low|high|max]
 
-Refreshes a persistent, low-thinking-effort clone of ~/.kimi-code (or
-$KIMI_CODE_SRC) at $KIMI_CODE_LOW_HOME (default:
-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low), for use as
-KIMI_CODE_HOME by wrk's kimi-k3-low profile.
+Refreshes a persistent, fixed-thinking-effort clone of ~/.kimi-code (or
+$KIMI_CODE_SRC) at the effort's clone home (default:
+${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-<effort>, overridable via
+KIMI_CODE_<EFFORT>_HOME), for use as KIMI_CODE_HOME by wrk's pinned-effort
+kimi profiles: --effort low serves kimi-k3-low; --effort high and --effort
+max serve the #704 E6 rungs builder-kimi-high and builder-kimi-max.
 
 Clones only: config.toml, credentials/, oauth/, device_id,
-workspace-trust/, mcp.json. Rewrites [thinking] effort = "low" in the
+workspace-trust/, mcp.json. Rewrites [thinking] effort = "<effort>" in the
 clone's config.toml; every other byte of config.toml is untouched.
 The source directory is never written to. Re-run any time to resync
 (e.g. after the real ~/.kimi-code's credentials rotate).
 USAGE
 }
 
-[[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { usage; exit 0; }
-[[ $# -eq 0 ]] || { echo "kimi-clone-home: unexpected argument '$1'" >&2; exit 2; }
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    --effort)
+      [[ $# -ge 2 ]] || { echo "kimi-clone-home: --effort requires a value" >&2; exit 2; }
+      EFFORT="$2"; shift 2 ;;
+    --effort=*) EFFORT="${1#*=}"; shift ;;
+    *) echo "kimi-clone-home: unexpected argument '$1'" >&2; exit 2 ;;
+  esac
+done
+
+case "$EFFORT" in
+  low)  DEST="${KIMI_CODE_LOW_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-low}" ;;
+  high) DEST="${KIMI_CODE_HIGH_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-high}" ;;
+  max)  DEST="${KIMI_CODE_MAX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/kimi-code-max}" ;;
+  *) echo "kimi-clone-home: --effort accepts only low, high or max (got '$EFFORT')" >&2; exit 2 ;;
+esac
 
 [[ -d "$SRC" ]] || { echo "kimi-clone-home: source not found: $SRC" >&2; exit 1; }
 [[ -r "$SRC/config.toml" ]] || { echo "kimi-clone-home: source config.toml unreadable: $SRC/config.toml" >&2; exit 1; }
@@ -71,11 +93,12 @@ done
 
 # Rewrite only the effort line inside [thinking]; every other byte of
 # config.toml is left byte-identical to the source.
-python3 - "$DEST/config.toml" <<'PY'
+python3 - "$DEST/config.toml" "$EFFORT" <<'PY'
 import re
 import sys
 
 path = sys.argv[1]
+effort = sys.argv[2]
 with open(path, encoding="utf-8") as f:
     text = f.read()
 
@@ -88,7 +111,7 @@ for line in lines:
     if stripped.startswith("[") and stripped.endswith("]"):
         in_thinking = stripped == "[thinking]"
     if in_thinking and re.match(r'^effort\s*=', stripped):
-        line = re.sub(r'"[^"]*"', '"low"', line, count=1)
+        line = re.sub(r'"[^"]*"', f'"{effort}"', line, count=1)
         changed = True
     out.append(line)
 
@@ -102,4 +125,4 @@ PY
 chmod go-rwx "$DEST"
 find "$DEST" -mindepth 1 -exec chmod go-rwx {} +
 
-echo "kimi-clone-home: refreshed $DEST from $SRC"
+echo "kimi-clone-home: refreshed $DEST from $SRC (effort $EFFORT)"

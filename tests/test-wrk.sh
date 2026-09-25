@@ -384,6 +384,13 @@ grep -qx 'builder-ds41-max' <<<"$profiles_out"
 grep -qx 'builder-grok' <<<"$profiles_out"
 grep -qx 'builder-kimi' <<<"$profiles_out"
 grep -qx 'builder-luna' <<<"$profiles_out"
+# #704 (#594 E6): the twelve per-rung builder spellings.
+for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
+  builder-sol-high builder-sol-max builder-luna-max \
+  builder-terra-high builder-terra-xhigh builder-terra-max \
+  builder-kimi-high builder-kimi-max; do
+  grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
+done
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
@@ -2813,7 +2820,9 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna; do
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna \
+  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max \
+  builder-luna-max builder-terra-high builder-terra-xhigh builder-terra-max builder-kimi-high builder-kimi-max; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -2840,7 +2849,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -3133,8 +3142,221 @@ PY
 done
 echo "PASS #666 devin builder variants reuse the worker argv and need --role builder"
 
-# The worker spellings the decision names for the pilot are admissible as
-# builders too, and keep their ordinary worker meaning.
+# ---------------------------------------------------------------------------
+# #704 (#594 E6): twelve per-rung builder spellings — the name's last segment
+# IS the pinned rung. Each must launch the exact model argv at that effort,
+# ask the gate about <gate profile>@<rung> (wrk forwards --effort to the gate
+# for these profiles only), record launch_profile=<canonical>@<rung> (#677),
+# and spawn only when SCOPEFUEL_E6_ARM names that exact rung. The gate-marked
+# escalation rungs (opus@low, sonnet@xhigh) also need --operator-request; the
+# kimi pair takes its rung from the pinned clone home (kimi has no --effort).
+# Mutants: dropping GATE_EFFORT_PIN, the marker check, the clone-effort check,
+# the canonical launch_name, or the gate's --effort forward turns this RED.
+# ---------------------------------------------------------------------------
+
+# The kimi rungs read their effort from clone homes (bin/kimi-clone-home
+# --effort). Build both from the fixture source the kimi-k3-low block used;
+# the clone script itself rejects an unknown effort spelling.
+E6_KIMI_HIGH_HOME="$TMP/kimi-e6-high-home"
+E6_KIMI_MAX_HOME="$TMP/kimi-e6-max-home"
+env KIMI_CODE_SRC="$CLONE_SRC" KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
+  "$ROOT/bin/kimi-clone-home" --effort high >/dev/null
+env KIMI_CODE_SRC="$CLONE_SRC" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
+  "$ROOT/bin/kimi-clone-home" --effort max >/dev/null
+grep -q 'effort = "high"' "$E6_KIMI_HIGH_HOME/config.toml" ||
+  fail "kimi-clone-home --effort high must pin the clone to high"
+grep -q 'effort = "max"' "$E6_KIMI_MAX_HOME/config.toml" ||
+  fail "kimi-clone-home --effort max must pin the clone to max"
+run_fail env KIMI_CODE_SRC="$CLONE_SRC" "$ROOT/bin/kimi-clone-home" --effort ultra
+run_fail env KIMI_CODE_SRC="$CLONE_SRC" "$ROOT/bin/kimi-clone-home" --bogus-flag
+
+# Own inbox: the measurement records stay out of the shared suite inbox.
+E6_INBOX="$TMP/inbox-e6"
+E6_XDG="$TMP/xdg-e6"
+
+e6_builder_case() {
+  local model="$1" gate="$2" rung="$3" argv_tail="$4"; shift 4
+  local job="e6-${model}-job" out rc start
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  set +e
+  out="$(SCOPEFUEL_E6_ARM="$gate@$rung" \
+    KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
+    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    spawn_base "$model" --role builder --lane "$model-lane" --parent parent-lane \
+    --job "$job" --t T1 "$@" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || fail "$model must be admitted under --role builder (rc=$rc): $out"
+  grep -q "model=$model" <<<"$out" || fail "$model spawn output lost its model: $out"
+  start="$(grep '^agent start ' "$TMP/herdr.log")"
+  # The exact argv tail pins model + effort — no silent default is possible:
+  # for claude/codex the rung is in argv; for kimi it is the clone home.
+  [[ "$start" == *" -- $argv_tail" ]] ||
+    fail "$model must launch the exact $rung rung argv: $start"
+  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "$gate" ]] ||
+    fail "$model must gate as $gate: $(cat "$TMP/scopefuel.log")"
+  grep -qF "gate -m $gate --effort $rung" "$TMP/scopefuel.log" ||
+    fail "$model must ask the gate about the $rung rung: $(cat "$TMP/scopefuel.log")"
+  if [[ "$model" == builder-kimi-* ]]; then
+    local want_home
+    case "$rung" in
+      high) want_home="$E6_KIMI_HIGH_HOME" ;;
+      max) want_home="$E6_KIMI_MAX_HOME" ;;
+    esac
+    grep -qF -- "--env KIMI_CODE_HOME=$want_home" "$TMP/herdr.log" ||
+      fail "$model must pin KIMI_CODE_HOME to the $rung clone: $(cat "$TMP/herdr.log")"
+  fi
+  python3 - "$E6_INBOX/$job/events" "$gate@$rung" "$model" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+claim = next(e for e in events if e["kind"] == "job.claim")
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert claim["payload"]["role"] == "builder", claim
+assert claim["payload"]["parent_lane"] == "parent-lane", claim
+assert record["payload"]["launch_profile"] == sys.argv[2], (sys.argv[3], record)
+PY
+}
+
+e6_builder_case builder-opus-low     opus        low    '--model opus --dangerously-skip-permissions --effort low'     --operator-request hk:task/704
+e6_builder_case builder-opus-medium  opus        medium '--model opus --dangerously-skip-permissions --effort medium'
+e6_builder_case builder-sonnet-xhigh sonnet      xhigh  '--model sonnet --dangerously-skip-permissions --effort xhigh' --operator-request hk:task/704
+e6_builder_case builder-sonnet-max   sonnet      max    '--model sonnet --dangerously-skip-permissions --effort max'
+e6_builder_case builder-sol-high     codex-sol   high   '--yolo -m gpt-6-sol -c model_reasoning_effort=high'
+e6_builder_case builder-sol-max      codex-sol   max    '--yolo -m gpt-6-sol -c model_reasoning_effort=max'
+e6_builder_case builder-luna-max     codex-luna  max    '--yolo -m gpt-6-luna -c model_reasoning_effort=max'
+e6_builder_case builder-terra-high   codex-terra high   '--yolo -m gpt-5.6-terra -c model_reasoning_effort=high'
+e6_builder_case builder-terra-xhigh  codex-terra xhigh  '--yolo -m gpt-5.6-terra -c model_reasoning_effort=xhigh'
+e6_builder_case builder-terra-max    codex-terra max    '--yolo -m gpt-5.6-terra -c model_reasoning_effort=max'
+e6_builder_case builder-kimi-high    kimi-k3     high   '--auto -m kimi-code/k3'
+e6_builder_case builder-kimi-max     kimi-k3     max    '--auto -m kimi-code/k3'
+echo "PASS 704 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
+
+# Marker mutants: no marker, and a marker naming a different rung, both die on
+# wrk's own guard (rc 2, before the gate is asked) — the installed gate then
+# fail-closes the unmeasured C rungs a second time for good measure.
+for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
+  builder-sol-high builder-sol-max builder-luna-max builder-terra-high builder-terra-xhigh \
+  builder-terra-max builder-kimi-high builder-kimi-max; do
+  set +e
+  e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
+    KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
+    spawn_base "$e6_model" --role builder --lane "$e6_model-lane" --parent parent-lane \
+    --job "e6-nomarker-$e6_model" --t T1 2>&1)"
+  e6_missing_rc=$?
+  set -e
+  [[ "$e6_missing_rc" -eq 2 ]] ||
+    fail "$e6_model without SCOPEFUEL_E6_ARM must die rc 2 (rc=$e6_missing_rc): $e6_missing_out"
+  grep -q 'E6 measurement profile' <<<"$e6_missing_out" ||
+    fail "$e6_model missing-marker refusal must name the marker: $e6_missing_out"
+done
+set +e
+e6_wrong_out="$(SCOPEFUEL_E6_ARM=kimi-k3@max \
+  spawn_base builder-sonnet-max --role builder --lane e6-wrong-lane --parent parent-lane \
+  --job e6-wrong-marker --t T1 2>&1)"
+e6_wrong_rc=$?
+set -e
+[[ "$e6_wrong_rc" -eq 2 ]] ||
+  fail "builder-sonnet-max with a mismatched marker must die rc 2 (rc=$e6_wrong_rc): $e6_wrong_out"
+grep -q 'SCOPEFUEL_E6_ARM=sonnet@max' <<<"$e6_wrong_out" ||
+  fail "wrong-marker refusal must name the required marker: $e6_wrong_out"
+# A correct marker for a different rung of the same gate profile also refuses.
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
+  spawn_base builder-kimi-max --role builder --lane e6-wrong-rung-lane --parent parent-lane \
+  --job e6-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-kimi-max with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+echo "PASS 704 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
+
+# Escalation rung: the marker alone does not open opus@low — the gate still
+# demands --operator-request, and its rc 3 propagates.
+set +e
+e6_esc_out="$(SCOPEFUEL_E6_ARM=opus@low \
+  spawn_base builder-opus-low --role builder --lane e6-esc-lane --parent parent-lane \
+  --job e6-esc-noopreq --t T1 2>&1)"
+e6_esc_rc=$?
+set -e
+[[ "$e6_esc_rc" -eq 3 ]] ||
+  fail "opus@low without --operator-request must hit the gate escalation refusal (rc=$e6_esc_rc): $e6_esc_out"
+grep -q 'escalation' <<<"$e6_esc_out" ||
+  fail "opus@low refusal must be the escalation denial: $e6_esc_out"
+echo "PASS 704 E6 escalation rung still requires --operator-request"
+
+# Effort mutants: off-rung --effort is refused on the pin; the same rung
+# spelled out is accepted; kimi refuses --effort outright (no CLI flag); a
+# clone home at the wrong effort — or missing entirely — fails closed.
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=opus@medium \
+  spawn_base builder-opus-low --role builder --lane e6-eff-lane --parent parent-lane \
+  --effort medium --operator-request hk:task/704 --job e6-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-opus-low --effort medium must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-terra@max \
+  spawn_base builder-terra-high --role builder --lane e6-eff2-lane --parent parent-lane \
+  --effort max --job e6-eff2-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-terra-high --effort max must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
+  spawn_base builder-kimi-high --role builder --lane e6-kimi-eff-lane --parent parent-lane \
+  --effort high --job e6-kimi-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-kimi-high --effort must die rc 2 — kimi has no CLI effort flag (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_clone_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$E6_KIMI_MAX_HOME" \
+  spawn_base builder-kimi-high --role builder --lane e6-clone-lane --parent parent-lane \
+  --job e6-clone-mutant --t T1 2>&1)"
+e6_clone_rc=$?
+set -e
+[[ "$e6_clone_rc" -eq 2 ]] ||
+  fail "builder-kimi-high on a max clone must die rc 2 (rc=$e6_clone_rc): $e6_clone_out"
+grep -q 'kimi-clone-home --effort high' <<<"$e6_clone_out" ||
+  fail "clone-mismatch refusal must name the fix: $e6_clone_out"
+set +e
+e6_clone_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$TMP/kimi-no-such-home" \
+  spawn_base builder-kimi-high --role builder --lane e6-clone2-lane --parent parent-lane \
+  --job e6-clone-missing --t T1 2>&1)"
+e6_clone_rc=$?
+set -e
+[[ "$e6_clone_rc" -eq 2 ]] ||
+  fail "builder-kimi-high with a missing clone home must die rc 2 (rc=$e6_clone_rc): $e6_clone_out"
+# The pinned rung spelled out explicitly is allowed.
+: >"$TMP/herdr.log"
+set +e
+e6_same_out="$(SCOPEFUEL_E6_ARM=codex-terra@high \
+  spawn_base builder-terra-high --role builder --lane e6-same-lane --parent parent-lane \
+  --effort high --job e6-same-effort --t T1 2>&1)"
+e6_same_rc=$?
+set -e
+[[ "$e6_same_rc" -eq 0 ]] ||
+  fail "builder-terra-high --effort high (the pinned rung) must be admitted (rc=$e6_same_rc): $e6_same_out"
+grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
+  fail "builder-terra-high --effort high must keep the pinned rung: $e6_same_out"
+# Role/hierarchy mutants for the new spellings.
+set +e
+e6_hier_out="$(SCOPEFUEL_E6_ARM=codex-sol@high \
+  spawn_base builder-sol-high --role builder --lane e6-noparent-lane --job e6-noparent --t T1 2>&1)"
+e6_hier_rc=$?
+set -e
+[[ "$e6_hier_rc" -eq 2 ]] ||
+  fail "builder-sol-high --role builder without --parent must die rc 2 (rc=$e6_hier_rc): $e6_hier_out"
+set +e
+e6_hier_out="$(SCOPEFUEL_E6_ARM=sonnet@max \
+  spawn_base builder-sonnet-max --job e6-worker-role --t T1 2>&1)"
+e6_hier_rc=$?
+set -e
+[[ "$e6_hier_rc" -eq 2 ]] ||
+  fail "builder-sonnet-max without --role builder must die rc 2 (rc=$e6_hier_rc): $e6_hier_out"
+echo "PASS 704 E6 effort pin, clone-home, and hierarchy mutants"
 for pilot_alias in grok grok-hi kimi-k3; do
   set +e
   pilot_alias_out="$(KIMI_CODE_HOME="$TMP/kimi-builder-home" spawn_base "$pilot_alias" --role builder --lane "pilot-${pilot_alias}-lane" --parent parent-lane --job "pilot-${pilot_alias}-job" --t T1 2>&1)"
