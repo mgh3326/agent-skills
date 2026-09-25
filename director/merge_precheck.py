@@ -30,7 +30,7 @@ from ci_canonical import evaluate_required_ci
 from gate_common import POLICY_PATH, PolicyError, file_ref, load_policy, sha256_bytes, write_receipt
 
 
-VERSION = "merge-precheck/1.1.2"
+VERSION = "merge-precheck/1.1.3"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})\s*$")

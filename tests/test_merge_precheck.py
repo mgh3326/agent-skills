@@ -185,6 +185,7 @@ class MergePrecheckTests(unittest.TestCase):
             self.assertEqual("CI_POLICY_UNKNOWN", gate.evaluate(snapshot(), loaded)["G3"]["reason_code"])
             for field, value, reason in (("runtime", [], "POLICY_RUNTIME_UNKNOWN"),
                                          ("artifact_paths", [], "POLICY_ARTIFACT_PATHS_UNKNOWN"),
+                                         ("ci_execution_steps", {}, "POLICY_CI_EXECUTION_UNKNOWN"),
                                          ("effective_at", {}, "POLICY_TIME_INVALID")):
                 invalid = json.loads(path.read_text())
                 invalid[field] = value
@@ -214,6 +215,23 @@ class MergePrecheckTests(unittest.TestCase):
         s["ci_jobs"][10] = s["ci_jobs"][10][:1]
         s["ci_jobs"][10][0]["conclusion"] = "failure"
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+
+    def test_required_test_step_must_execute(self) -> None:
+        s = snapshot()
+        s["ci_jobs"][10][0]["steps"] = [
+            {"name": "Run actions/checkout@v4", "status": "completed", "conclusion": "success"},
+            {"name": "Bash tests", "status": "completed", "conclusion": "skipped"}]
+        assert_check(self, s, "G3", "FAIL", "CI_SKIPPED")
+        s["ci_jobs"][10][0]["steps"].pop()
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_REQUIRED_STEP_MISSING")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = 'for marker in execution[name]:'
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_step_mutant"}
+        exec(source.replace(guard, 'for marker in []:'), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_REQUIRED_STEP_MISSING", mutant["reason_code"])
 
     def test_ci_checkout_provenance_ignores_mutable_pr_base(self) -> None:
         s = snapshot()

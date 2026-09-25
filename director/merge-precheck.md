@@ -32,6 +32,9 @@ jobs_by_run, protection_contexts)`. Task #723 should import that entry point.
 The required set is in `director/gate-policy.v1.json`; it contains only the
 repository's own test and build jobs. Every entry must have an actually run,
 successful GitHub Actions job at H with a run ID, attempt, and tested base SHA.
+The policy also names execution-step markers for each required job. Every
+named test or build step must have run and succeeded; a successful setup step
+cannot stand in for a skipped test or build step.
 For base provenance, the collector reads the immutable checkout commit from
 each successful job log, fetches that Git commit through the GitHub API, and
 uses its two parents and tree. The mutable pull_requests array on a workflow

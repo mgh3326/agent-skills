@@ -36,6 +36,13 @@ def evaluate_required_ci(
     required = [(workflow, name) for workflow, names in workflows.items() for name in names]
     if not required or any(not name or name.startswith(EXCLUDED) for _, name in required):
         return _result("UNVERIFIED", "CI_REQUIRED_SET_INVALID", jobs=[])
+    execution_by_repo = policy.get("ci_execution_steps")
+    execution = execution_by_repo.get(repo) if isinstance(execution_by_repo, dict) else None
+    if not isinstance(execution, dict) or set(execution) != {name for _, name in required} or any(
+        not isinstance(markers, list) or not markers or any(not isinstance(marker, str) or not marker for marker in markers)
+        for markers in execution.values()
+    ):
+        return _result("UNVERIFIED", "CI_EXECUTION_POLICY_UNKNOWN", jobs=[])
     if "branch_protection" in workflows:
         if protection_contexts is None:
             return _result("UNVERIFIED", "CI_BRANCH_PROTECTION_MISSING", jobs=[])
@@ -84,7 +91,8 @@ def evaluate_required_ci(
                     "head_sha": run.get("head_sha"), "base_sha": job.get("tested_base_sha"),
                     "tested_merge_sha": job.get("tested_merge_sha"), "merge_tree": job.get("tested_merge_tree"),
                     "base_source": "checkout_job_log_and_merge_parents" if job.get("tested_base_sha") else None,
-                    "run_conclusion": run.get("conclusion"), "job_conclusion": job.get("conclusion")}
+                    "run_conclusion": run.get("conclusion"), "job_conclusion": job.get("conclusion"),
+                    "execution_steps": []}
             observations.append(item)
             if run.get("head_sha") != H or job.get("head_sha") != H or job.get("run_id") != run.get("id"):
                 problems.append((name, "CI_HEAD_MISMATCH"))
@@ -94,13 +102,35 @@ def evaluate_required_ci(
                 problems.append((name, "CI_SKIPPED"))
             elif job.get("conclusion") != "success":
                 problems.append((name, "CI_FAILED"))
-            elif not any(step.get("status") == "completed" and step.get("conclusion") == "success"
-                         and step.get("name") not in {"Set up job", "Complete job"} for step in (job.get("steps") or [])):
-                problems.append((name, "CI_NOT_EXECUTED"))
-            elif not item["base_sha"] or not item["tested_merge_sha"] or not item["merge_tree"]:
-                problems.append((name, "CI_BASE_UNBOUND"))
-            elif item["base_sha"] != B:
-                problems.append((name, "CI_BASE_MOVED"))
+            else:
+                steps = job.get("steps")
+                if not isinstance(steps, list):
+                    problems.append((name, "CI_REQUIRED_STEP_MISSING"))
+                    continue
+                step_problem = None
+                for marker in execution[name]:
+                    matched = [step for step in steps if isinstance(step, dict) and isinstance(step.get("name"), str)
+                               and marker.casefold() in step["name"].casefold()]
+                    if len(matched) != 1:
+                        step_problem = "CI_REQUIRED_STEP_MISSING" if not matched else "CI_STEP_AMBIGUOUS"
+                        break
+                    step = matched[0]
+                    item["execution_steps"].append({"name": step["name"], "status": step.get("status"), "conclusion": step.get("conclusion")})
+                    if step.get("status") != "completed":
+                        step_problem = "CI_PENDING"
+                        break
+                    if step.get("conclusion") == "skipped":
+                        step_problem = "CI_SKIPPED"
+                        break
+                    if step.get("conclusion") != "success":
+                        step_problem = "CI_FAILED"
+                        break
+                if step_problem:
+                    problems.append((name, step_problem))
+                elif not item["base_sha"] or not item["tested_merge_sha"] or not item["merge_tree"]:
+                    problems.append((name, "CI_BASE_UNBOUND"))
+                elif item["base_sha"] != B:
+                    problems.append((name, "CI_BASE_MOVED"))
     if problems:
         failures = {"CI_FAILED", "CI_SKIPPED", "CI_HEAD_MISMATCH"}
         name, code = next(((name, code) for name, code in problems if code in failures), problems[0])

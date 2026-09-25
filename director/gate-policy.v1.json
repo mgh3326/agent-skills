@@ -1,6 +1,6 @@
 {
   "schema": 1,
-  "revision": "2026-09-25.1",
+  "revision": "2026-09-25.2",
   "effective_at": "2026-09-25T06:17:38Z",
   "expires_at": "2026-10-02T06:17:38Z",
   "conflicts": [],
@@ -33,6 +33,43 @@
     },
     "mgh3326/auto_trader-operator": {
       ".github/workflows/test.yml": ["test"]
+    }
+  },
+  "ci_execution_steps": {
+    "mgh3326/agent-skills": {
+      "ubuntu-latest": ["Bash tests"],
+      "macos-latest": ["Bash tests"]
+    },
+    "mgh3326/handoffkeep": {
+      "test": ["go test -race"],
+      "vitest": ["npm test"],
+      "build (darwin, arm64)": ["go build"],
+      "build (linux, amd64)": ["go build"],
+      "build (linux, arm64)": ["go build"],
+      "image": ["Smoke test image"]
+    },
+    "mgh3326/panewire": {
+      "test (macos-latest)": ["go test"],
+      "test (ubuntu-latest)": ["go test"]
+    },
+    "mgh3326/scopefuel": {
+      "test (macos-latest, 3.11)": ["Test"],
+      "test (macos-latest, 3.13)": ["Test"],
+      "test (macos-latest, 3.14)": ["Test"],
+      "test (ubuntu-latest, 3.11)": ["Test"],
+      "test (ubuntu-latest, 3.13)": ["Test"],
+      "test (ubuntu-latest, 3.14)": ["Test"]
+    },
+    "mgh3326/auto_trader": {
+      "lint": ["Run Ruff linter"],
+      "taskiq-smoke": ["TaskIQ worker smoke test", "TaskIQ scheduler smoke test"],
+      "test (3.13, 1)": ["Run tests"],
+      "test (3.13, 2)": ["Run tests"],
+      "test (3.13, 3)": ["Run tests"],
+      "test (3.13, 4)": ["Run tests"]
+    },
+    "mgh3326/auto_trader-operator": {
+      "test": ["Run tests"]
     }
   },
   "runtime": {
