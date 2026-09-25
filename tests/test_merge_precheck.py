@@ -41,7 +41,7 @@ def snapshot() -> dict:
     job = "task727-builder"
     report_path = "/tmp/task727-builder-report.md"
     run = {"id": 10, "path": ".github/workflows/ci.yml", "head_sha": H, "event": "pull_request",
-           "created_at": "2026-09-25T07:00:00Z", "run_attempt": 1, "status": "completed", "conclusion": "success",
+           "created_at": "2026-09-25T07:00:00Z", "run_started_at": "2026-09-25T07:00:00Z", "run_attempt": 1, "status": "completed", "conclusion": "success",
            "pull_requests": [{"base": {"sha": B}}]}
     jobs = [{"id": i, "name": name, "run_id": 10, "run_attempt": 1, "head_sha": H, "status": "completed",
              "conclusion": "success", "tested_base_sha": B, "tested_merge_sha": "e" * 40, "tested_merge_tree": M,
@@ -260,6 +260,7 @@ class MergePrecheckTests(unittest.TestCase):
         late = copy.deepcopy(s["ci_runs"][0])
         late["id"] = 11
         late["created_at"] = "2026-09-25T07:05:00Z"
+        late["run_started_at"] = "2026-09-25T07:05:00Z"
         late["conclusion"] = "failure"
         s["ci_runs"].append(late)
         s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
@@ -271,6 +272,161 @@ class MergePrecheckTests(unittest.TestCase):
         s["ci_jobs"][10] = s["ci_jobs"][10][:1]
         s["ci_jobs"][10][0]["conclusion"] = "failure"
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+
+    def test_ci_red_rerun_is_not_met_with_assertion_red_mutant(self) -> None:
+        s = snapshot()
+        s["ci_runs"][0].update({"run_attempt": 2, "conclusion": "failure"})
+        for job in s["ci_jobs"][10]:
+            job["run_attempt"] = 2
+            job["conclusion"] = "failure"
+        newer_green = copy.deepcopy(snapshot()["ci_runs"][0])
+        newer_green.update({"id": 11, "created_at": "2026-09-25T07:05:00Z", "run_started_at": "2026-09-25T07:05:00Z"})
+        s["ci_runs"].append(newer_green)
+        s["ci_jobs"][11] = copy.deepcopy(snapshot()["ci_jobs"][10])
+        for job in s["ci_jobs"][11]:
+            job["run_id"] = 11
+            job["id"] += 100
+        assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = "run_problem = _run_attempt_problem(run)"
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_rerun_red_mutant"}
+        exec(source.replace(guard, "run_problem = None"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_FAILED", mutant["reason_code"])
+
+    def test_ci_retry_without_a_start_time_fails_closed_after_identity_validation(self) -> None:
+        def retry_without_start(attempt: object) -> dict:
+            s = snapshot()
+            red = copy.deepcopy(s["ci_runs"][0])
+            red.update({"run_attempt": attempt, "conclusion": "failure"})
+            red.pop("run_started_at")
+            green = copy.deepcopy(s["ci_runs"][0])
+            green.update({"id": 11, "created_at": "2026-09-25T07:05:00Z", "run_started_at": "2026-09-25T07:05:00Z"})
+            s["ci_runs"] = [red, green]
+            s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
+            for job in s["ci_jobs"][11]:
+                job["id"] += 100
+                job["run_id"] = 11
+            return s
+
+        # #732 rejects malformed attempt identities before timestamp selection.
+        # The valid retry below still proves that a missing start time fails closed.
+        for attempt, expected_code in (
+            (2, "CI_RUN_TIME_INVALID"),
+            ("2", "CI_RUN_IDENTITY_INVALID"),
+            (None, "CI_RUN_IDENTITY_INVALID"),
+            (True, "CI_RUN_IDENTITY_INVALID"),
+            (2.0, "CI_RUN_IDENTITY_INVALID"),
+            (0, "CI_RUN_IDENTITY_INVALID"),
+            (-1, "CI_RUN_IDENTITY_INVALID"),
+        ):
+            with self.subTest(attempt=attempt):
+                s = retry_without_start(attempt)
+                assert_check(self, s, "G3", "UNVERIFIED", expected_code)
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        fallback = "if raw is None and type(attempt) is int and attempt == 1:"
+        self.assertEqual(1, source.count(fallback))
+        s = retry_without_start(2)
+        namespace: dict = {"__name__": "ci_retry_time_mutant"}
+        exec(source.replace(fallback, "if raw is None:"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_RUN_TIME_INVALID", mutant["reason_code"])
+
+    def test_ci_collector_race_with_newer_job_attempt_is_not_met(self) -> None:
+        for status, conclusion in (("completed", "failure"), ("in_progress", None)):
+            with self.subTest(status=status):
+                s = snapshot()
+                s["ci_jobs"][10] += [
+                    {**copy.deepcopy(job), "id": job["id"] + 100, "run_attempt": 2,
+                     "status": status, "conclusion": conclusion}
+                    for job in s["ci_jobs"][10]
+                ]
+                assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = "if _job_attempt_is_invalid_for_selected_run(run, job):"
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_collector_race_mutant"}
+        exec(source.replace(guard, "if False:"), namespace)
+        s = snapshot()
+        s["ci_jobs"][10] += [
+            {**copy.deepcopy(job), "id": job["id"] + 100, "run_attempt": 2, "conclusion": "failure"}
+            for job in s["ci_jobs"][10]
+        ]
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+        source_guard = "if type(run_id) is not int or type(job.get(\"run_id\")) is not int or job.get(\"run_id\") != run_id:"
+        self.assertEqual(1, source.count(source_guard))
+        s = snapshot()
+        s["ci_jobs"][10] += [
+            {**copy.deepcopy(job), "id": job["id"] + 200, "run_id": 9, "run_attempt": 0}
+            for job in s["ci_jobs"][10]
+        ]
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
+        namespace = {"__name__": "ci_foreign_job_mutant"}
+        exec(source.replace(source_guard, "if False:"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+
+    def test_selected_non_success_workflow_cannot_count_as_green_ci(self) -> None:
+        for conclusion in ("failure", "cancelled", "timed_out", "startup_failure"):
+            with self.subTest(conclusion=conclusion):
+                s = snapshot()
+                s["ci_runs"][0]["conclusion"] = conclusion
+                assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = "run_problem = _run_attempt_problem(run)"
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_red_run_mutant"}
+        exec(source.replace(guard, "run_problem = None"), namespace)
+        s = snapshot()
+        s["ci_runs"][0]["conclusion"] = "cancelled"
+        green = copy.deepcopy(snapshot()["ci_runs"][0])
+        green.update({"id": 11, "created_at": "2026-09-25T07:05:00Z", "run_started_at": "2026-09-25T07:05:00Z"})
+        s["ci_runs"].append(green)
+        s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
+        for job in s["ci_jobs"][11]:
+            job.update({"id": job["id"] + 100, "run_id": 11})
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_FAILED", mutant["reason_code"])
+
+    def test_ci_per_check_identity_binding_has_assertion_red_mutant(self) -> None:
+        s = snapshot()
+        s["ci_jobs"][10][0]["id"] = "not-an-action-job-id"
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = "if not _has_bound_identity(run, job, H):"
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_identity_binding_mutant"}
+        exec(source.replace(guard, "if False:"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+    def test_ci_equal_start_times_from_different_runs_are_ambiguous(self) -> None:
+        s = snapshot()
+        s["ci_runs"][0].update({"run_attempt": 2, "conclusion": "failure"})
+        for job in s["ci_jobs"][10]:
+            job.update({"run_attempt": 2, "conclusion": "failure"})
+        green = copy.deepcopy(snapshot()["ci_runs"][0])
+        green["id"] = 11
+        s["ci_runs"].append(green)
+        s["ci_jobs"][11] = copy.deepcopy(snapshot()["ci_jobs"][10])
+        for job in s["ci_jobs"][11]:
+            job.update({"id": job["id"] + 100, "run_id": 11})
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_AMBIGUOUS")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = "if _has_cross_run_tie(latest_attempts, order):"
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_equal_time_mutant"}
+        exec(source.replace(guard, "if False:"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_RUN_AMBIGUOUS", mutant["reason_code"])
 
     def test_required_test_step_must_execute(self) -> None:
         s = snapshot()
@@ -305,6 +461,7 @@ class MergePrecheckTests(unittest.TestCase):
         later = copy.deepcopy(s["ci_runs"][0])
         later["id"] = 11
         later["created_at"] = "2026-09-25T07:00:00.100Z"
+        later["run_started_at"] = "2026-09-25T07:00:00.100Z"
         later["conclusion"] = "failure"
         s["ci_runs"].append(later)
         s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
@@ -312,9 +469,9 @@ class MergePrecheckTests(unittest.TestCase):
             job["run_id"] = 11
             job["conclusion"] = "failure"
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
-        s["ci_runs"][1]["created_at"] = "unknown"
+        s["ci_runs"][1]["run_started_at"] = "unknown"
         assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_TIME_INVALID")
-        s["ci_runs"][1]["created_at"] = s["ci_runs"][0]["created_at"]
+        s["ci_runs"][1]["run_started_at"] = s["ci_runs"][0]["run_started_at"]
         assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_AMBIGUOUS")
 
     def test_branch_protection_same_second_runs_with_different_attempts_are_ambiguous(self) -> None:

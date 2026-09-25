@@ -102,6 +102,34 @@ def _step_matches(marker: str, name: str) -> bool:
     return actual.startswith(expected + " ") or actual == "run " + expected or actual.startswith("run " + expected + " ")
 
 
+def _has_bound_identity(run: dict[str, Any], job: dict[str, Any], H: str) -> bool:
+    """Require immutable per-check run, attempt, job, and PR-head bindings."""
+    run_id = run.get("id")
+    attempt = run.get("run_attempt")
+    job_id = job.get("id")
+    return (
+        type(run_id) is int and run_id > 0
+        and type(attempt) is int and attempt > 0
+        and type(job_id) is int and job_id > 0
+        and type(job.get("run_id")) is int and job.get("run_id") == run_id
+        and type(job.get("run_attempt")) is int and job.get("run_attempt") == attempt
+        and run.get("head_sha") == H
+        and job.get("head_sha") == H
+    )
+
+
+def _job_attempt_is_invalid_for_selected_run(run: dict[str, Any], job: dict[str, Any]) -> bool:
+    """Reject a collection race instead of silently accepting its older green job."""
+    run_id = run.get("id")
+    attempt = run.get("run_attempt")
+    job_attempt = job.get("run_attempt")
+    if type(run_id) is not int or type(job.get("run_id")) is not int or job.get("run_id") != run_id:
+        return True
+    if type(attempt) is not int or type(job_attempt) is not int:
+        return True
+    return job_attempt > attempt
+
+
 def evaluate_required_ci(
     policy: dict[str, Any], repo: str, H: str, B: str,
     runs: list[dict[str, Any]], jobs_by_run: dict[int, list[dict[str, Any]]],
@@ -177,11 +205,24 @@ def evaluate_required_ci(
             continue
         for name in expected:
             possible: list[tuple[dict[str, Any], dict[str, Any]]] = []
+            binding_invalid = False
             for run in selected:
                 run_id = run.get("id")
                 for job in jobs_by_run.get(run_id, []):
-                    if job.get("name") == name and job.get("run_attempt") == run.get("run_attempt"):
-                        possible.append((run, job))
+                    if job.get("name") != name:
+                        continue
+                    if _job_attempt_is_invalid_for_selected_run(run, job):
+                        binding_invalid = True
+                        continue
+                    if job.get("run_attempt") != run.get("run_attempt"):
+                        continue
+                    if not _has_bound_identity(run, job, H):
+                        binding_invalid = True
+                        continue
+                    possible.append((run, job))
+            if binding_invalid:
+                problems.append((name, "CI_EVIDENCE_BINDING_INVALID"))
+                continue
             if not possible:
                 problems.append((name, "CI_JOB_MISSING"))
                 continue
@@ -193,7 +234,8 @@ def evaluate_required_ci(
             run, job = possible[0]
             item = {"workflow": run.get("path"), "name": name, "run_id": run.get("id"),
                     "attempt": run.get("run_attempt"), "job_id": job.get("id"),
-                    "head_sha": run.get("head_sha"), "base_sha": job.get("tested_base_sha"),
+                    "head_sha": run.get("head_sha"), "job_head_sha": job.get("head_sha"),
+                    "base_sha": job.get("tested_base_sha"),
                     "tested_merge_sha": job.get("tested_merge_sha"), "merge_tree": job.get("tested_merge_tree"),
                     "base_source": "checkout_job_log_and_merge_parents" if job.get("tested_base_sha") else None,
                     "run_conclusion": run.get("conclusion"), "job_conclusion": job.get("conclusion"),
