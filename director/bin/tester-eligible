@@ -331,6 +331,13 @@ def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | Non
             return result("UNVERIFIED", "ACTUAL_LAUNCH_PROFILE_DENIED", "bin/wrk:quota_pool.record")
         if observed_effort != tester.get("actual_effort"):
             return result("UNVERIFIED", "ACTUAL_EFFORT_MISMATCH", "bin/wrk:quota_pool.record")
+        resolved_launch, launch_check = resolve_profile(
+            launch_prefix, policy, actual_model=tester_profile["model"],
+            actual_effort=observed_effort, role="tester")
+        if launch_check["status"] != "PASS" or resolved_launch is None:
+            return result("UNVERIFIED", "ACTUAL_LAUNCH_PROFILE_UNVERIFIED", "bin/wrk+policy:profiles")
+        if resolved_launch["grade"] != tester_profile["grade"]:
+            return result("UNVERIFIED", "ACTUAL_LAUNCH_PROFILE_CHANGED", "bin/wrk+policy:profiles")
         path = Path(observation_path)
         if sha256_file(path) != observation_sha:
             return result("UNVERIFIED", "MODEL_OBSERVATION_HASH_MISMATCH", "decision:3231")

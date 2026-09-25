@@ -383,6 +383,10 @@ class EligibilityFixtures(unittest.TestCase):
         quota_path.write_text(json.dumps(quota))
         self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
                          "ACTUAL_LAUNCH_PROFILE_DENIED")
+        quota["payload"]["launch_profile"] = "grok-med@xhigh"
+        quota_path.write_text(json.dumps(quota))
+        self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
+                         "ACTUAL_LAUNCH_PROFILE_UNVERIFIED")
         quota["payload"]["launch_profile"] = "grok@xhigh"
         quota_path.write_text(json.dumps(quota))
         evidence["_pane_snapshot"] = "Grok 4.7 (xhigh) · always-approve\nGrok 4.6 (high) · always-approve"

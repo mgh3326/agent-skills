@@ -41,8 +41,8 @@ job_record_dir, model_observation_path, and model_observation_sha256. The job
 directory contains wrk job.spawned and quota_pool.record events. The model
 observation is a retained JSON record with source=pane, job, pane, model, and
 effort. The command also reads the live pane footer and compares its model and
-effort. The quota launch model must match the resolved tester model, and its
-profile must permit tester use on the declared surface. If actual provenance
+effort. The quota launch model and grade must match the resolved tester, and
+its profile must permit tester use on the declared surface. If actual provenance
 cannot be established, the result is UNVERIFIED.
 
 For same-family verification, same_family contains reversible,
