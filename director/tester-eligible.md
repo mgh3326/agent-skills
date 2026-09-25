@@ -27,7 +27,9 @@ and tester. repo_path is the absolute checkout; head and base are full commit
 SHAs. The command derives a floor from their diff. Empty or unclassifiable
 diffs are UNVERIFIED. The optional fields pr, trial_merge_tree, and ci are
 preserved in the receipt. Pre-merge requires pr and checks the current GitHub
-head and remote base.
+head and remote base. The declared repo name must match origin. An auto_trader
+diff gets T2 only when every path is on the versioned nontrading path list;
+unknown paths are UNVERIFIED. T0 additionally requires local_only=true.
 
 Contributors is an array of initial, fix, and prescription contributors. Each
 entry includes profile, model, effort, role, kind, session, and worktree. The

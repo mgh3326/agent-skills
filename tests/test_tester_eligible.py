@@ -42,6 +42,7 @@ class EligibilityFixtures(unittest.TestCase):
         git(self.repo, "init", "-q")
         git(self.repo, "config", "user.email", "fixture@example.test")
         git(self.repo, "config", "user.name", "Fixture")
+        git(self.repo, "remote", "add", "origin", "https://github.com/fixture/agent-skills.git")
         (self.repo / "base.txt").write_text("base\n")
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-qm", "base")
@@ -157,6 +158,20 @@ class EligibilityFixtures(unittest.TestCase):
     def test_runtime_only_change_has_t3_floor(self) -> None:
         checks = self.check(self.evidence(self.make_head("deploy/runtime.service")))
         self.assert_case(checks, "tier", "FAIL", "T_BELOW_FLOOR")
+
+    def test_repo_identity_and_auto_trader_nontrading_floor(self) -> None:
+        strategy_head = self.make_head("strategy/runner.py")
+        evidence = self.evidence(strategy_head, repo="auto_trader")
+        self.assert_case(self.check(evidence), "surface", "UNVERIFIED", "REPO_ID_MISMATCH")
+        git(self.repo, "remote", "set-url", "origin", "https://github.com/fixture/auto_trader.git")
+        self.assert_case(self.check(evidence), "surface", "UNVERIFIED", "DIFF_UNCLASSIFIABLE")
+        safe_head = self.make_head("docs/readme.md")
+        evidence = self.evidence(safe_head, repo="auto_trader", base=strategy_head)
+        self.assert_case(self.check(evidence), "tier", "PASS", "T_MEETS_FLOOR")
+        self.assertEqual(self.check(evidence)["surface"]["floor"], "T2")
+        live_head = self.make_head("mock/order.py")
+        evidence = self.evidence(live_head, repo="auto_trader", base=safe_head)
+        self.assert_case(self.check(evidence), "tier", "FAIL", "T_BELOW_FLOOR")
 
     def test_unknown_and_stale_policy(self) -> None:
         evidence = self.evidence(self.make_head())
@@ -330,6 +345,21 @@ class EligibilityFixtures(unittest.TestCase):
         with mock.patch.object(eligible, "_read_previous", reused_receipt):
             with self.assertRaises(AssertionError):
                 self.assert_case(self.check(stale, "post-landing"), "prior", "UNVERIFIED", "HEAD_CHANGED")
+
+        stale_ci = self.evidence(stale["head"])
+        stale_ci["ci"] = {"run_id": 1, "attempt": 1, "status": "success",
+                          "head": stale_ci["head"], "base": self.base}
+        stale_ci["base"] = self.make_head("src/sixth.py")
+        original_ci = eligible._ci_binding
+        def accepted_old_base(item):
+            altered = json.loads(json.dumps(item))
+            altered["ci"]["base"] = altered["base"]
+            return original_ci(altered)
+        with mock.patch.object(eligible, "_ci_binding", accepted_old_base):
+            with self.assertRaises(AssertionError):
+                answer = eligible._ci_binding(stale_ci)
+                self.assertEqual((answer["status"], answer["reason_code"]),
+                                 ("UNVERIFIED", "CI_BASE_STALE"))
 
     def test_audit_counts_missing_late_and_reused_receipts(self) -> None:
         jobs = Path(self.temp.name) / "jobs"

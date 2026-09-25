@@ -1476,7 +1476,7 @@
       ]
     }
   },
-  "revision": "2026-09-25.3",
+  "revision": "2026-09-25.4",
   "schema": 1,
   "sources": {
     "bin/wrk": {
@@ -1513,6 +1513,12 @@
     }
   },
   "surface_rules": {
+    "auto_trader_nontrading_paths": [
+      "docs/",
+      "tests/",
+      "research/",
+      "analysis/"
+    ],
     "auto_trader_repos": [
       "auto_trader",
       "auto-trader",
@@ -1542,7 +1548,8 @@
       "bin/wrk",
       "director/SKILL.md",
       "checker/SKILL.md",
-      "spawn-worker/SKILL.md"
+      "spawn-worker/SKILL.md",
+      "mock/"
     ],
     "tool_repos": [
       "agent-skills",

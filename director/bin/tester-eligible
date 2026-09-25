@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 from pathlib import Path
@@ -35,6 +36,13 @@ def diff_surface(evidence: dict, policy: dict) -> tuple[dict | None, dict]:
     top = run_git(repo, "rev-parse", "--show-toplevel")
     if top.returncode or Path(top.stdout.strip()).resolve() != repo.resolve():
         return None, result("UNVERIFIED", "REPO_UNVERIFIED", "spawn-worker:2-1")
+    remote = run_git(repo, "remote", "get-url", "origin")
+    declared_repo = str(evidence.get("repo", "")).split("/")[-1]
+    actual_repo = Path(remote.stdout.strip().rstrip("/")).name.removesuffix(".git") if remote.returncode == 0 else ""
+    if not declared_repo or not actual_repo:
+        return None, result("UNVERIFIED", "REPO_REMOTE_UNKNOWN", "spawn-worker:2-1")
+    if declared_repo != actual_repo:
+        return None, result("UNVERIFIED", "REPO_ID_MISMATCH", "spawn-worker:2-1")
     for ref in (base, head):
         if run_git(repo, "cat-file", "-e", f"{ref}^{{commit}}").returncode:
             return None, result("UNVERIFIED", "DIFF_REF_MISSING", "spawn-worker:2-1")
@@ -57,18 +65,23 @@ def diff_surface(evidence: dict, policy: dict) -> tuple[dict | None, dict]:
     names_lower = [name.lower() for name in paths]
     t3 = any(any(path.startswith(prefix.lower()) or f"/{prefix.lower()}" in path
                  for prefix in rules["t3_paths"]) or
-             path.endswith((".service", ".service.d")) or Path(path).name == "dockerfile"
+             any(fnmatch.fnmatch(path, pattern.lower()) or fnmatch.fnmatch(Path(path).name, pattern.lower())
+                 for pattern in rules["t3_names"]) or
+             re.search(r"(^|[/_-])(safety|guard|broker|orders?|trading|execution|live|deploy)([/_.-]|$)", path)
              for path in names_lower)
     flags = sorted({"gate_or_delivery" for path in names_lower
                     if any(path.startswith(prefix.lower()) for prefix in rules["gate_paths"])})
-    repo_name = str(evidence.get("repo", "")).split("/")[-1]
     if t3:
         floor = 3
-    elif repo_name in rules["auto_trader_repos"]:
+    elif declared_repo in rules["auto_trader_repos"]:
+        if not all(any(path.startswith(prefix.lower()) for prefix in rules["auto_trader_nontrading_paths"])
+                   for path in names_lower):
+            return None, result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1",
+                                paths=paths, flags=flags)
         floor = 2
-    elif repo_name in rules["tool_repos"]:
+    elif declared_repo in rules["tool_repos"]:
         floor = 1
-    elif lines <= 30 and all(Path(path).suffix in {".py", ".sh", ".json", ".toml", ".yaml", ".yml"}
+    elif evidence.get("local_only") is True and lines <= 30 and all(Path(path).suffix in {".py", ".sh", ".json", ".toml", ".yaml", ".yml"}
                                for path in paths):
         floor = 0
     else:
