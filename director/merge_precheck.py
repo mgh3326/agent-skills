@@ -30,7 +30,7 @@ from ci_canonical import evaluate_required_ci
 from gate_common import POLICY_PATH, PolicyError, file_ref, load_policy, sha256_bytes, write_receipt
 
 
-VERSION = "merge-precheck/1.1.0"
+VERSION = "merge-precheck/1.1.1"
 SHA = re.compile(r"^[0-9a-f]{40}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})\s*$")
@@ -271,6 +271,8 @@ def check_reports(snapshot: dict[str, Any]) -> dict[str, Any]:
         if data.get("kind") != "spawn" or data.get("task") != snapshot.get("task") or data.get("repo") != snapshot.get("repo") or data.get("PR") != snapshot.get("PR") or data.get("H") != H or data.get("tester_job") != metadata["TESTER_JOB"]:
             return result("UNVERIFIED", "ELIGIBILITY_BINDING_MISMATCH")
         eligible_checks = data.get("checks", {})
+        if not isinstance(eligible_checks, dict) or any(not isinstance(check, dict) for check in eligible_checks.values()):
+            return result("UNVERIFIED", "ELIGIBILITY_NOT_PASS")
         if not eligible_checks or any(check.get("status") not in ("PASS", "N/A") for check in eligible_checks.values()):
             return result("FAIL" if any(check.get("status") == "FAIL" for check in eligible_checks.values()) else "UNVERIFIED", "ELIGIBILITY_NOT_PASS")
     return result("PASS", "TESTER_PASS_BOUND", report=report["ref"], tester_job=metadata["TESTER_JOB"], tester_session=metadata["TESTER_SESSION"], eligibility=eligible.get("ref") if eligible else None)
@@ -464,7 +466,8 @@ def check_hash(snapshot: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(artifacts, list) or not artifacts:
             return result("UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
         for artifact in artifacts:
-            sha = artifact.get("sha256", "").lower() if isinstance(artifact, dict) else ""
+            raw_sha = artifact.get("sha256") if isinstance(artifact, dict) else None
+            sha = raw_sha.lower() if isinstance(raw_sha, str) else ""
             if not SHA256.fullmatch(sha) or sha not in cited or not artifact.get("artifact_ref"):
                 return result("UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
             bound.add(sha)
@@ -673,8 +676,13 @@ def audit(receipt_dir: Path, policy: dict[str, Any], since: str) -> dict[str, An
     try:
         for path in receipt_dir.expanduser().glob("*.json"):
             item = json.loads(path.read_text(encoding="utf-8"))
-            if isinstance(item, dict):
-                receipts.append(item)
+            if not isinstance(item, dict) or not isinstance(item.get("action_id"), str) or not item["action_id"] or item.get("kind") not in {"merge", "spawn"} or not isinstance(item.get("time"), str):
+                return {"status": "UNVERIFIED", "reason_code": "AUDIT_RECEIPT_INVALID"}
+            if item["kind"] == "merge" and (not isinstance(item.get("repo"), str) or not isinstance(item.get("PR"), int) or not isinstance(item.get("H"), str)):
+                return {"status": "UNVERIFIED", "reason_code": "AUDIT_RECEIPT_INVALID"}
+            if item["kind"] == "spawn" and not isinstance(item.get("job"), str):
+                return {"status": "UNVERIFIED", "reason_code": "AUDIT_RECEIPT_INVALID"}
+            receipts.append(item)
     except (OSError, ValueError):
         return {"status": "UNVERIFIED", "reason_code": "AUDIT_RECEIPT_LOOKUP_FAILED"}
     actions: list[dict[str, Any]] = []

@@ -136,6 +136,19 @@ class MergePrecheckTests(unittest.TestCase):
         s["hash_receipts"].append(second)
         assert_check(self, s, "G10", "PASS", "ARTIFACT_HASH_INDEPENDENT")
 
+    def test_malformed_nested_receipts_are_unverified(self) -> None:
+        s = snapshot()
+        s["eligibility_receipt"] = {"ref": {"path": "/tmp/eligible.json", "sha256": "1" * 64}, "data": {
+            "kind": "spawn", "task": 727, "repo": s["repo"], "PR": s["PR"], "H": H,
+            "tester_job": "task727-tester", "checks": ["PASS"]}}
+        assert_check(self, s, "G1", "UNVERIFIED", "ELIGIBILITY_NOT_PASS")
+        s = snapshot()
+        s["pr_body"] = "Artifact sha256 " + "e" * 64
+        s["hash_receipts"] = [{"ref": {"path": "/tmp/hash.json", "sha256": "1" * 64}, "data": {
+            "kind": "artifact-hash", "repo": s["repo"], "PR": s["PR"], "H": H,
+            "issuer": "independent-builder", "sha256": None, "artifact_ref": "artifact/one"}}]
+        assert_check(self, s, "G10", "UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
+
     def test_incident_t3_misassignment_and_same_family_t3(self) -> None:
         s = snapshot()
         s["eligibility_receipt"] = {"ref": {"path": "/tmp/eligible.json", "sha256": "0" * 64},
@@ -162,6 +175,14 @@ class MergePrecheckTests(unittest.TestCase):
             target.write_text(json.dumps(p))
             loaded = load_policy(target, datetime(2026, 9, 26, tzinfo=timezone.utc))[0]
             self.assertEqual("CI_POLICY_UNKNOWN", gate.evaluate(snapshot(), loaded)["G3"]["reason_code"])
+            for field, value, reason in (("runtime", [], "POLICY_RUNTIME_UNKNOWN"),
+                                         ("artifact_paths", [], "POLICY_ARTIFACT_PATHS_UNKNOWN"),
+                                         ("effective_at", {}, "POLICY_TIME_INVALID")):
+                invalid = json.loads(path.read_text())
+                invalid[field] = value
+                target.write_text(json.dumps(invalid))
+                with self.assertRaisesRegex(PolicyError, reason):
+                    load_policy(target, datetime(2026, 9, 26, tzinfo=timezone.utc))
 
     def test_ci_missing_skipped_and_later_red(self) -> None:
         s = snapshot()
@@ -334,6 +355,10 @@ class MergePrecheckTests(unittest.TestCase):
                 receipt["time"] = "2026-09-25T09:00:00Z"
                 target.write_text(json.dumps(receipt))
                 self.assertEqual(1, audited()["receipt_after_action"])
+                del receipt["action_id"]
+                target.write_text(json.dumps(receipt))
+                self.assertEqual(("UNVERIFIED", "AUDIT_RECEIPT_INVALID"),
+                                 (audited()["status"], audited()["reason_code"]))
                 target.unlink()
                 self.assertEqual(("FAIL", 1), (audited()["status"], audited()["no_receipt"]))
 
