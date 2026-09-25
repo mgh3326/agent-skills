@@ -69,6 +69,61 @@ def assert_check(test: unittest.TestCase, s: dict, key: str, status: str, code: 
     test.assertEqual((status, code), (actual["status"], actual["reason_code"]))
 
 
+def canonical_run(
+    run_id: int, attempt: int, *, conclusion: str | None = "success",
+    started_at: str | None = "2026-09-25T07:00:00Z",
+    created_at: str = "2026-09-25T07:00:00Z",
+    path: str = ".github/workflows/ci.yml",
+) -> dict:
+    return {"id": run_id, "path": path, "head_sha": H, "event": "pull_request",
+            "created_at": created_at, "run_started_at": started_at, "run_attempt": attempt,
+            "status": "completed", "conclusion": conclusion}
+
+
+def canonical_jobs(repo: str, run: dict, conclusion: str = "success") -> list[dict]:
+    loaded = policy()
+    workflows = loaded["ci"][repo]
+    execution = loaded["ci_execution_steps"][repo]
+    names = [name for workflow_names in workflows.values() for name in workflow_names]
+    return [{"id": run["id"] * 100 + run["run_attempt"] * 10 + index, "name": name,
+             "run_id": run["id"], "run_attempt": run["run_attempt"], "head_sha": H,
+             "status": "completed", "conclusion": conclusion, "tested_base_sha": B,
+             "tested_merge_sha": M, "tested_merge_tree": "e" * 40,
+             "steps": [{"name": marker, "status": "completed", "conclusion": "success"}
+                       for marker in execution[name]]}
+            for index, name in enumerate(names, 1)]
+
+
+def canonical_jobs_by_run(repo: str, runs: list[dict]) -> dict[int, list[dict]]:
+    jobs: dict[int, list[dict]] = {}
+    seen_attempts: set[tuple[int, int]] = set()
+    for run in runs:
+        identity = (run["id"], run["run_attempt"])
+        if identity in seen_attempts:
+            continue
+        seen_attempts.add(identity)
+        jobs.setdefault(run["id"], []).extend(canonical_jobs(repo, run))
+    return jobs
+
+
+def evaluate_canonical_ci(repo: str, runs: list[dict], evaluator=None) -> dict:
+    loaded = policy()
+    protection = loaded["ci"][repo].get("branch_protection")
+    return (evaluator or ci_canonical.evaluate_required_ci)(
+        loaded, repo, H, B, runs, canonical_jobs_by_run(repo, runs), protection)
+
+
+def canonical_ci_mutant(replacements: list[tuple[str, str]]):
+    source = (ROOT / "director/ci_canonical.py").read_text()
+    for old, new in replacements:
+        if source.count(old) != 1:
+            raise AssertionError(f"expected one mutation target: {old!r}")
+        source = source.replace(old, new)
+    namespace: dict = {"__name__": "ci_canonical_assertion_red_mutant"}
+    exec(compile(source, "director/ci_canonical.py", "exec"), namespace)
+    return namespace["evaluate_required_ci"]
+
+
 class MergePrecheckTests(unittest.TestCase):
     def test_normal_pass(self) -> None:
         checks = gate.evaluate(snapshot(), policy())
@@ -261,6 +316,96 @@ class MergePrecheckTests(unittest.TestCase):
         assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_TIME_INVALID")
         s["ci_runs"][1]["created_at"] = s["ci_runs"][0]["created_at"]
         assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_AMBIGUOUS")
+
+    def test_branch_protection_same_second_runs_with_different_attempts_are_ambiguous(self) -> None:
+        repo = "mgh3326/auto_trader"
+        green = canonical_run(10, 2)
+        red = canonical_run(11, 1, conclusion="failure")
+        runs = [green, red]
+        expected = ("UNVERIFIED", "CI_RUN_AMBIGUOUS")
+        actual = evaluate_canonical_ci(repo, runs)
+        self.assertEqual(expected, (actual["status"], actual["reason_code"]))
+
+        green_tie = canonical_run(12, 2)
+        red_tie = canonical_run(13, 1)
+        tie_evaluator = canonical_ci_mutant([
+            ("if _has_cross_run_tie(latest_attempts, order):",
+             "if False and _has_cross_run_tie(latest_attempts, order):")])
+        with self.assertRaises(AssertionError):
+            tied = evaluate_canonical_ci(repo, [green_tie, red_tie], tie_evaluator)
+            self.assertEqual(expected, (tied["status"], tied["reason_code"]))
+
+    def test_attempts_are_compared_within_the_same_run_id(self) -> None:
+        repo = "mgh3326/auto_trader"
+        failed_attempt = canonical_run(14, 1, conclusion="failure")
+        successful_retry = canonical_run(14, 2, started_at="2026-09-25T07:01:00Z",
+                                         created_at="2026-09-25T07:00:00Z")
+        expected = ("PASS", "CI_ALL_REQUIRED_SUCCEEDED")
+        actual = evaluate_canonical_ci(repo, [failed_attempt, successful_retry])
+        self.assertEqual(expected, (actual["status"], actual["reason_code"]))
+
+        retry_evaluator = canonical_ci_mutant([
+            ("if previous is None or attempt > previous[\"run_attempt\"]:",
+             "if previous is None:")])
+        with self.assertRaises(AssertionError):
+            regressed = evaluate_canonical_ci(repo, [failed_attempt, successful_retry], retry_evaluator)
+            self.assertEqual(expected, (regressed["status"], regressed["reason_code"]))
+
+    def test_duplicate_run_attempt_listings_are_ambiguous(self) -> None:
+        repo = "mgh3326/agent-skills"
+        green_listing = canonical_run(20, 1, created_at="2026-09-25T07:01:00Z")
+        red_listing = canonical_run(20, 1, conclusion="failure", created_at="2026-09-25T07:00:00Z")
+        runs = [green_listing, red_listing]
+        expected = ("UNVERIFIED", "CI_RUN_AMBIGUOUS")
+        actual = evaluate_canonical_ci(repo, runs)
+        self.assertEqual(expected, (actual["status"], actual["reason_code"]))
+
+        duplicate_evaluator = canonical_ci_mutant([
+            ("if _has_duplicate_attempt_listing(candidates):",
+             "if False and _has_duplicate_attempt_listing(candidates):")])
+        with self.assertRaises(AssertionError):
+            duplicate = evaluate_canonical_ci(repo, runs, duplicate_evaluator)
+            self.assertEqual(expected, (duplicate["status"], duplicate["reason_code"]))
+
+        reverse = evaluate_canonical_ci(repo, list(reversed(runs)))
+        self.assertEqual(expected, (reverse["status"], reverse["reason_code"]))
+
+    def test_empty_run_started_at_does_not_fall_back_to_created_at(self) -> None:
+        repo = "mgh3326/agent-skills"
+        run = canonical_run(30, 1, started_at="", created_at="2026-09-25T07:00:00Z")
+        expected = ("UNVERIFIED", "CI_RUN_TIME_INVALID")
+        actual = evaluate_canonical_ci(repo, [run])
+        self.assertEqual(expected, (actual["status"], actual["reason_code"]))
+
+        timestamp_evaluator = canonical_ci_mutant([
+            ("if raw is None and type(attempt) is int and attempt == 1:",
+             "if (raw is None or raw == \"\") and type(attempt) is int and attempt == 1:")])
+        with self.assertRaises(AssertionError):
+            fallback = evaluate_canonical_ci(repo, [run], timestamp_evaluator)
+            self.assertEqual(expected, (fallback["status"], fallback["reason_code"]))
+
+        missing_retry_time = canonical_run(31, 2, started_at=None, created_at="2026-09-25T07:00:00Z")
+        missing = evaluate_canonical_ci(repo, [missing_retry_time])
+        self.assertEqual(expected, (missing["status"], missing["reason_code"]))
+
+    def test_non_success_candidate_runs_never_hide_behind_a_newer_green_run(self) -> None:
+        repo = "mgh3326/auto_trader"
+        for conclusion in ("failure", "cancelled", "timed_out", "startup_failure"):
+            with self.subTest(conclusion=conclusion):
+                red = canonical_run(40, 1, conclusion=conclusion)
+                green = canonical_run(41, 1, started_at="2026-09-25T07:01:00Z",
+                                      created_at="2026-09-25T07:01:00Z")
+                actual = evaluate_canonical_ci(repo, [red, green])
+                self.assertEqual(("FAIL", "CI_FAILED"), (actual["status"], actual["reason_code"]))
+
+        red = canonical_run(42, 1, conclusion="failure")
+        green = canonical_run(43, 1, started_at="2026-09-25T07:01:00Z",
+                              created_at="2026-09-25T07:01:00Z")
+        failure_evaluator = canonical_ci_mutant([
+            ("run_problem = _run_attempt_problem(run)", "run_problem = None")])
+        with self.assertRaises(AssertionError):
+            hidden = evaluate_canonical_ci(repo, [red, green], failure_evaluator)
+            self.assertEqual(("FAIL", "CI_FAILED"), (hidden["status"], hidden["reason_code"]))
 
     def test_receipt_writer_rejects_reuse_of_action_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

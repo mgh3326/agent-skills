@@ -22,13 +22,58 @@ def _result(status: str, code: str, **extra: Any) -> dict[str, Any]:
 
 
 def _run_time(run: dict[str, Any]) -> datetime:
-    raw = run.get("created_at")
+    attempt = run.get("run_attempt")
+    raw = run.get("run_started_at")
+    if raw is None and type(attempt) is int and attempt == 1:
+        raw = run.get("created_at")
     if not isinstance(raw, str):
         raise ValueError("run timestamp missing")
     instant = datetime.fromisoformat(raw.replace("Z", "+00:00"))
     if instant.tzinfo is None:
         raise ValueError("run timestamp has no timezone")
     return instant
+
+
+def _has_duplicate_attempt_listing(candidates: list[dict[str, Any]]) -> bool:
+    seen: set[tuple[int, int]] = set()
+    for run in candidates:
+        key = (run["id"], run["run_attempt"])
+        if key in seen:
+            return True
+        seen.add(key)
+    return False
+
+
+def _latest_attempts_by_run_id(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest: dict[int, dict[str, Any]] = {}
+    for run in candidates:
+        run_id = run.get("id")
+        attempt = run.get("run_attempt")
+        if type(run_id) is not int or run_id <= 0 or type(attempt) is not int or attempt <= 0:
+            raise ValueError("run identity invalid")
+        previous = latest.get(run_id)
+        if previous is None or attempt > previous["run_attempt"]:
+            latest[run_id] = run
+    return list(latest.values())
+
+
+def _has_cross_run_tie(candidates: list[dict[str, Any]], order: dict[int, datetime]) -> bool:
+    run_ids_by_path_and_time: dict[tuple[str, datetime], set[int]] = {}
+    for run in candidates:
+        path = run.get("path")
+        if not isinstance(path, str) or not path:
+            raise ValueError("run workflow path missing")
+        key = (path, order[id(run)])
+        run_ids_by_path_and_time.setdefault(key, set()).add(run["id"])
+    return any(len(run_ids) > 1 for run_ids in run_ids_by_path_and_time.values())
+
+
+def _run_attempt_problem(run: dict[str, Any]) -> str | None:
+    if run.get("status") != "completed":
+        return "CI_PENDING"
+    if run.get("conclusion") != "success":
+        return "CI_FAILED"
+    return None
 
 
 def _step_matches(marker: str, name: str) -> bool:
@@ -48,8 +93,9 @@ def evaluate_required_ci(
 ) -> dict[str, Any]:
     """Return PASS/FAIL/UNVERIFIED and exact run/job evidence for every R job.
 
-    A whole workflow attempt is chosen. Rerunning one failed job cannot hide a
-    later red attempt. The tested base comes from the checkout merge commit
+    Attempts are compared within a run id, while distinct runs must have
+    unambiguous start times. No non-success candidate attempt can be hidden by
+    a different run. The tested base comes from the checkout merge commit
     recorded in an immutable job log, never the mutable pull_requests array.
     """
     workflows = policy.get("ci", {}).get(repo)
@@ -76,31 +122,39 @@ def evaluate_required_ci(
     for workflow, expected in workflows.items():
         candidates = [run for run in runs if run.get("head_sha") == H and run.get("event") == "pull_request"
                       and (workflow == "branch_protection" or run.get("path") == workflow)]
+        if any(type(run.get("id")) is not int or run.get("id") <= 0
+               or type(run.get("run_attempt")) is not int or run.get("run_attempt") <= 0
+               for run in candidates):
+            return _result("UNVERIFIED", "CI_RUN_IDENTITY_INVALID", jobs=observations)
+        if _has_duplicate_attempt_listing(candidates):
+            return _result("UNVERIFIED", "CI_RUN_AMBIGUOUS", jobs=observations)
         try:
             order = {id(run): _run_time(run) for run in candidates}
         except (ValueError, TypeError):
             return _result("UNVERIFIED", "CI_RUN_TIME_INVALID", jobs=observations)
+        try:
+            latest_attempts = _latest_attempts_by_run_id(candidates)
+            if _has_cross_run_tie(latest_attempts, order):
+                return _result("UNVERIFIED", "CI_RUN_AMBIGUOUS", jobs=observations)
+        except (ValueError, TypeError):
+            return _result("UNVERIFIED", "CI_RUN_IDENTITY_INVALID", jobs=observations)
+        for run in latest_attempts:
+            run_problem = _run_attempt_problem(run)
+            if run_problem is not None:
+                status = "FAIL" if run_problem == "CI_FAILED" else "UNVERIFIED"
+                return _result(status, run_problem, jobs=observations)
         if workflow == "branch_protection":
             # The six protection contexts may live in several workflows. Jobs
             # are resolved by their actual workflow run, never status names alone.
             latest_by_path: dict[str, dict[str, Any]] = {}
-            for run in candidates:
+            for run in latest_attempts:
                 path = run.get("path")
                 old = latest_by_path.get(path)
-                if old is None or (order[id(run)], int(run.get("run_attempt") or 0)) > (order[id(old)], int(old.get("run_attempt") or 0)):
+                if old is None or order[id(run)] > order[id(old)]:
                     latest_by_path[path] = run
-            if any(sum((order[id(candidate)], int(candidate.get("run_attempt") or 0)) ==
-                       (order[id(chosen)], int(chosen.get("run_attempt") or 0))
-                       for candidate in candidates if candidate.get("path") == path) > 1
-                   for path, chosen in latest_by_path.items()):
-                return _result("UNVERIFIED", "CI_RUN_AMBIGUOUS", jobs=observations)
             selected = list(latest_by_path.values())
         else:
-            selected = sorted(candidates, key=lambda r: (order[id(r)], int(r.get("run_attempt") or 0)))
-            if len(selected) > 1 and (order[id(selected[-1])], int(selected[-1].get("run_attempt") or 0)) == (
-                order[id(selected[-2])], int(selected[-2].get("run_attempt") or 0)):
-                return _result("UNVERIFIED", "CI_RUN_AMBIGUOUS", jobs=observations)
-            selected = selected[-1:] if selected else []
+            selected = [max(latest_attempts, key=lambda run: order[id(run)])] if latest_attempts else []
         if not selected:
             problems.extend((name, "CI_RUN_MISSING") for name in expected)
             continue
@@ -132,6 +186,8 @@ def evaluate_required_ci(
                 problems.append((name, "CI_HEAD_MISMATCH"))
             elif run.get("status") != "completed" or job.get("status") != "completed":
                 problems.append((name, "CI_PENDING"))
+            elif run.get("conclusion") != "success":
+                problems.append((name, "CI_FAILED"))
             elif job.get("conclusion") == "skipped":
                 problems.append((name, "CI_SKIPPED"))
             elif job.get("conclusion") != "success":
