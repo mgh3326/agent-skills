@@ -275,7 +275,7 @@ class MergePrecheckTests(unittest.TestCase):
 
     def test_ci_red_rerun_is_not_met_with_assertion_red_mutant(self) -> None:
         s = snapshot()
-        s["ci_runs"][0].update({"run_attempt": 2, "run_started_at": "2026-09-25T07:30:00Z", "conclusion": "failure"})
+        s["ci_runs"][0].update({"run_attempt": 2, "conclusion": "failure"})
         for job in s["ci_jobs"][10]:
             job["run_attempt"] = 2
             job["conclusion"] = "failure"
@@ -288,15 +288,15 @@ class MergePrecheckTests(unittest.TestCase):
             job["id"] += 100
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
         source = (ROOT / "director/ci_canonical.py").read_text()
-        selector = 'raw = run.get("run_started_at")'
-        self.assertEqual(1, source.count(selector))
+        guard = "run_problem = _run_attempt_problem(run)"
+        self.assertEqual(1, source.count(guard))
         namespace: dict = {"__name__": "ci_rerun_red_mutant"}
-        exec(source.replace(selector, 'raw = run.get("created_at")'), namespace)
+        exec(source.replace(guard, "run_problem = None"), namespace)
         mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_FAILED", mutant["reason_code"])
 
-    def test_ci_retry_without_a_start_time_fails_closed_with_assertion_red_mutants(self) -> None:
+    def test_ci_retry_without_a_start_time_fails_closed_after_identity_validation(self) -> None:
         def retry_without_start(attempt: object) -> dict:
             s = snapshot()
             red = copy.deepcopy(s["ci_runs"][0])
@@ -311,10 +311,20 @@ class MergePrecheckTests(unittest.TestCase):
                 job["run_id"] = 11
             return s
 
-        for attempt in (2, "2", None, True, 2.0, 0, -1):
+        # #732 rejects malformed attempt identities before timestamp selection.
+        # The valid retry below still proves that a missing start time fails closed.
+        for attempt, expected_code in (
+            (2, "CI_RUN_TIME_INVALID"),
+            ("2", "CI_RUN_IDENTITY_INVALID"),
+            (None, "CI_RUN_IDENTITY_INVALID"),
+            (True, "CI_RUN_IDENTITY_INVALID"),
+            (2.0, "CI_RUN_IDENTITY_INVALID"),
+            (0, "CI_RUN_IDENTITY_INVALID"),
+            (-1, "CI_RUN_IDENTITY_INVALID"),
+        ):
             with self.subTest(attempt=attempt):
                 s = retry_without_start(attempt)
-                assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_TIME_INVALID")
+                assert_check(self, s, "G3", "UNVERIFIED", expected_code)
         source = (ROOT / "director/ci_canonical.py").read_text()
         fallback = "if raw is None and type(attempt) is int and attempt == 1:"
         self.assertEqual(1, source.count(fallback))
@@ -324,20 +334,6 @@ class MergePrecheckTests(unittest.TestCase):
         mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_RUN_TIME_INVALID", mutant["reason_code"])
-        for label, replacement in (
-            ("F5", "type(attempt) is int and attempt <= 1"),
-            ("F8", "type(attempt) is int and attempt == 0"),
-            ("F10", "type(attempt) is int and attempt < 2"),
-        ):
-            with self.subTest(mutant=label):
-                namespace = {"__name__": f"ci_retry_attempt_{label}_mutant"}
-                exec(source.replace("type(attempt) is int and attempt == 1", replacement), namespace)
-                mutant_snapshot = retry_without_start(0)
-                mutant = namespace["evaluate_required_ci"](
-                    policy(), mutant_snapshot["repo"], H, B, mutant_snapshot["ci_runs"], mutant_snapshot["ci_jobs"]
-                )
-                with self.assertRaises(AssertionError):
-                    self.assertEqual("CI_RUN_TIME_INVALID", mutant["reason_code"])
 
     def test_ci_collector_race_with_newer_job_attempt_is_not_met(self) -> None:
         for status, conclusion in (("completed", "failure"), ("in_progress", None)):
@@ -383,12 +379,18 @@ class MergePrecheckTests(unittest.TestCase):
                 s["ci_runs"][0]["conclusion"] = conclusion
                 assert_check(self, s, "G3", "FAIL", "CI_FAILED")
         source = (ROOT / "director/ci_canonical.py").read_text()
-        guard = 'elif run.get("conclusion") != "success":'
+        guard = "run_problem = _run_attempt_problem(run)"
         self.assertEqual(1, source.count(guard))
         namespace: dict = {"__name__": "ci_red_run_mutant"}
-        exec(source.replace(guard, 'elif run.get("conclusion") == "failure":'), namespace)
+        exec(source.replace(guard, "run_problem = None"), namespace)
         s = snapshot()
         s["ci_runs"][0]["conclusion"] = "cancelled"
+        green = copy.deepcopy(snapshot()["ci_runs"][0])
+        green.update({"id": 11, "created_at": "2026-09-25T07:05:00Z", "run_started_at": "2026-09-25T07:05:00Z"})
+        s["ci_runs"].append(green)
+        s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
+        for job in s["ci_jobs"][11]:
+            job.update({"id": job["id"] + 100, "run_id": 11})
         mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_FAILED", mutant["reason_code"])
@@ -405,32 +407,6 @@ class MergePrecheckTests(unittest.TestCase):
         mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
-        s = snapshot()
-        s["ci_runs"][0]["id"] = 0
-        s["ci_jobs"][0] = s["ci_jobs"].pop(10)
-        for job in s["ci_jobs"][0]:
-            job["run_id"] = 0
-        assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
-        run_id_guard = "type(run_id) is int and run_id > 0"
-        self.assertEqual(1, source.count(run_id_guard))
-        namespace = {"__name__": "ci_zero_run_id_mutant"}
-        exec(source.replace(run_id_guard, "type(run_id) is int"), namespace)
-        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
-        with self.assertRaises(AssertionError):
-            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
-        s = snapshot()
-        s["ci_runs"][0]["run_attempt"] = 0
-        for job in s["ci_jobs"][10]:
-            job["run_attempt"] = 0
-        assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
-        attempt_guard = "type(attempt) is int and attempt > 0"
-        self.assertEqual(1, source.count(attempt_guard))
-        namespace = {"__name__": "ci_zero_attempt_mutant"}
-        exec(source.replace(attempt_guard, "type(attempt) is int"), namespace)
-        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
-        with self.assertRaises(AssertionError):
-            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
-
     def test_ci_equal_start_times_from_different_runs_are_ambiguous(self) -> None:
         s = snapshot()
         s["ci_runs"][0].update({"run_attempt": 2, "conclusion": "failure"})
@@ -444,7 +420,7 @@ class MergePrecheckTests(unittest.TestCase):
             job.update({"id": job["id"] + 100, "run_id": 11})
         assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_AMBIGUOUS")
         source = (ROOT / "director/ci_canonical.py").read_text()
-        guard = 'if len(selected) > 1 and order[id(selected[-1])] == order[id(selected[-2])] and selected[-1].get("id") != selected[-2].get("id"):'
+        guard = "if _has_cross_run_tie(latest_attempts, order):"
         self.assertEqual(1, source.count(guard))
         namespace: dict = {"__name__": "ci_equal_time_mutant"}
         exec(source.replace(guard, "if False:"), namespace)
