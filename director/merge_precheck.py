@@ -318,7 +318,8 @@ def classify_surface(files: list[dict[str, Any]], repo: str, policy: dict[str, A
     for file in files:
         path = file.get("filename", "")
         low = path.lower()
-        if "migration" in low or "/migrate/" in "/" + low or low.startswith("alembic/"):
+        parts = low.split("/")
+        if "migration" in low or "alembic" in parts or any(part.startswith("migrate") for part in parts):
             flags.append("migration")
         if low.startswith(("config/", "deploy/", ".github/")) or any(word in low for word in ("settings", "config", "requirements")) or low in {"pyproject.toml", "uv.lock", "dockerfile"} or low.endswith((".service", ".service.example", ".toml", ".yaml", ".yml")):
             flags.append("config")

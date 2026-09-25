@@ -14,6 +14,7 @@ from typing import Any
 
 
 EXCLUDED = ("CodeRabbit", "CommitCheck", "qlty", "AccessLint", "WIP", "GitGuardian", "Codecov")
+COMMAND_STEP_MARKERS = {"go test", "go test -race", "go build", "npm test"}
 
 
 def _result(status: str, code: str, **extra: Any) -> dict[str, Any]:
@@ -33,7 +34,7 @@ def _run_time(run: dict[str, Any]) -> datetime:
 def _step_matches(marker: str, name: str) -> bool:
     expected = marker.casefold().strip()
     actual = name.casefold().strip()
-    return actual == expected or actual.startswith(expected + " ")
+    return actual == expected or (expected in COMMAND_STEP_MARKERS and actual.startswith(expected + " "))
 
 
 def evaluate_required_ci(
@@ -84,9 +85,17 @@ def evaluate_required_ci(
                 old = latest_by_path.get(path)
                 if old is None or (order[id(run)], int(run.get("run_attempt") or 0)) > (order[id(old)], int(old.get("run_attempt") or 0)):
                     latest_by_path[path] = run
+            if any(sum((order[id(candidate)], int(candidate.get("run_attempt") or 0)) ==
+                       (order[id(chosen)], int(chosen.get("run_attempt") or 0))
+                       for candidate in candidates if candidate.get("path") == path) > 1
+                   for path, chosen in latest_by_path.items()):
+                return _result("UNVERIFIED", "CI_RUN_AMBIGUOUS", jobs=observations)
             selected = list(latest_by_path.values())
         else:
             selected = sorted(candidates, key=lambda r: (order[id(r)], int(r.get("run_attempt") or 0)))
+            if len(selected) > 1 and (order[id(selected[-1])], int(selected[-1].get("run_attempt") or 0)) == (
+                order[id(selected[-2])], int(selected[-2].get("run_attempt") or 0)):
+                return _result("UNVERIFIED", "CI_RUN_AMBIGUOUS", jobs=observations)
             selected = selected[-1:] if selected else []
         if not selected:
             problems.extend((name, "CI_RUN_MISSING") for name in expected)

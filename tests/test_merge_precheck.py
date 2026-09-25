@@ -241,6 +241,8 @@ class MergePrecheckTests(unittest.TestCase):
         with patch.object(ci_canonical, "_step_matches", side_effect=lambda marker, name: marker.casefold() in name.casefold()):
             with self.assertRaises(AssertionError):
                 assert_check(self, s, "G3", "UNVERIFIED", "CI_REQUIRED_STEP_MISSING")
+        s["ci_jobs"][10][0]["steps"][0]["name"] = "Bash tests extra"
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_REQUIRED_STEP_MISSING")
         s = snapshot()
         later = copy.deepcopy(s["ci_runs"][0])
         later["id"] = 11
@@ -254,6 +256,8 @@ class MergePrecheckTests(unittest.TestCase):
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
         s["ci_runs"][1]["created_at"] = "unknown"
         assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_TIME_INVALID")
+        s["ci_runs"][1]["created_at"] = s["ci_runs"][0]["created_at"]
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_AMBIGUOUS")
 
     def test_receipt_writer_rejects_reuse_of_action_id(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -568,9 +572,10 @@ class MergePrecheckTests(unittest.TestCase):
                         assert_check(self, s, "G10", "UNVERIFIED", "ARTIFACT_HASH_RECEIPT_MISSING")
 
     def test_migration_runtime_and_casefolded_artifact(self) -> None:
-        s = snapshot()
-        s["files"] = [{"filename": "db/migrate/001_init.sql", "status": "modified", "patch": "@@ -1 +1 @@\n+changed"}]
-        assert_check(self, s, "G6", "UNVERIFIED", "SURFACE_CLASS_UNBOUND")
+        for path in ("db/migrate/001_init.sql", "db/migrate.sql", "foo/alembic/x.sql"):
+            s = snapshot()
+            s["files"] = [{"filename": path, "status": "modified", "patch": "@@ -1 +1 @@\n+changed"}]
+            assert_check(self, s, "G6", "UNVERIFIED", "SURFACE_CLASS_UNBOUND")
         for path in ("foo/scripts/start.sh", "poetry.lock", "db/migrate/001_init.sql"):
             s = snapshot()
             s["files"] = [{"filename": path, "status": "modified", "patch": "@@ -1 +1 @@\n+changed"}]
