@@ -2,6 +2,7 @@
   "effective_at": "2026-09-25T00:00:00Z",
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
+    ".github/workflows/ci.yml": "05613adab8b1178d1314c58f84fccad45e7f159332fb02645e81073cd74f2f1b",
     "bin/wrk": "842c5b499f321d6371533c79e266767967751ef26862bccb3ec62c35b11d916f",
     "checker/SKILL.md": "bf0046ccb21b96cf6562e32c47013694f1f08f16a3271ef363557fb3e204b573",
     "director/SKILL.md": "41003d23c2cc77b9d45fdb6058b0c48fa94ccd0f5ea408e43929abc02648e574",
@@ -170,8 +171,10 @@
     "builder-kimi-high": {
       "default_effort": "high",
       "family": "moonshot",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "high": "S"
+        "high": null
       },
       "launcher": "kimi",
       "launcher_model_token": "-m kimi-code/k3",
@@ -187,8 +190,10 @@
     "builder-kimi-max": {
       "default_effort": "max",
       "family": "moonshot",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "max": "S"
+        "max": null
       },
       "launcher": "kimi",
       "launcher_model_token": "-m kimi-code/k3",
@@ -221,8 +226,10 @@
     "builder-luna-max": {
       "default_effort": "max",
       "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "max": "A+"
+        "max": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
@@ -259,8 +266,10 @@
     "builder-opus-low": {
       "default_effort": "low",
       "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "low": "S"
+        "low": null
       },
       "launcher": "claude",
       "launcher_model_token": "--model opus",
@@ -276,8 +285,10 @@
     "builder-opus-medium": {
       "default_effort": "medium",
       "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "medium": "S+"
+        "medium": null
       },
       "launcher": "claude",
       "launcher_model_token": "--model opus",
@@ -315,8 +326,10 @@
     "builder-sol-high": {
       "default_effort": "high",
       "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "high": "S+"
+        "high": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
@@ -332,8 +345,10 @@
     "builder-sol-max": {
       "default_effort": "max",
       "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "max": "S+"
+        "max": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
@@ -349,8 +364,10 @@
     "builder-sonnet-max": {
       "default_effort": "max",
       "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "max": "A+"
+        "max": null
       },
       "launcher": "claude",
       "launcher_model_token": "--model sonnet",
@@ -366,8 +383,10 @@
     "builder-sonnet-xhigh": {
       "default_effort": "xhigh",
       "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "xhigh": "A+"
+        "xhigh": null
       },
       "launcher": "claude",
       "launcher_model_token": "--model sonnet",
@@ -383,8 +402,10 @@
     "builder-terra-high": {
       "default_effort": "high",
       "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "high": "S"
+        "high": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
@@ -400,8 +421,10 @@
     "builder-terra-max": {
       "default_effort": "max",
       "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "max": "S"
+        "max": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
@@ -417,8 +440,10 @@
     "builder-terra-xhigh": {
       "default_effort": "xhigh",
       "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
       "grades": {
-        "xhigh": "S"
+        "xhigh": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
@@ -1476,9 +1501,19 @@
       ]
     }
   },
-  "revision": "2026-09-25.5",
+  "required_ci_jobs_by_repo": {
+    "agent-skills": [
+      "ubuntu-latest",
+      "macos-latest"
+    ]
+  },
+  "revision": "2026-09-25.7",
   "schema": 1,
   "sources": {
+    ".github/workflows/ci.yml": {
+      "id": "shell-and-bash-tests",
+      "scope": "required CI matrix job names"
+    },
     "bin/wrk": {
       "id": "resolve_profile",
       "scope": "launcher and fixed model definitions"
@@ -1513,7 +1548,7 @@
     },
     "task/723": {
       "id": 723,
-      "scope": "required CI action/revision binding; pending implementation"
+      "scope": "CI head/base/attempt evidence; required-check policy decision pending"
     }
   },
   "surface_rules": {
@@ -1533,7 +1568,8 @@
       "director/gate_",
       "bin/wrk",
       "checker/",
-      "spawn-worker/"
+      "spawn-worker/",
+      ".github/workflows/"
     ],
     "t3_names": [
       "Dockerfile",

@@ -168,6 +168,12 @@ class EligibilityFixtures(unittest.TestCase):
         checks = self.check(self.evidence(self.make_head("deploy/runtime.service")))
         self.assert_case(checks, "tier", "FAIL", "T_BELOW_FLOOR")
 
+    def test_quoted_unicode_live_path_retains_t3_floor(self) -> None:
+        evidence = self.evidence(self.make_head("live/한글.py"), declared_t="T1")
+        checks = self.check(evidence)
+        self.assert_case(checks, "surface", "PASS", "SURFACE_CLASSIFIED")
+        self.assert_case(checks, "tier", "FAIL", "T_BELOW_FLOOR")
+
     def test_repo_identity_and_auto_trader_nontrading_floor(self) -> None:
         strategy_head = self.make_head("strategy/runner.py")
         evidence = self.evidence(strategy_head, repo="auto_trader")
@@ -219,6 +225,33 @@ class EligibilityFixtures(unittest.TestCase):
         evidence["same_family"].update(ci_run_id="run-1", ci_attempt=1, ci_status="skipped")
         self.assert_case(self.check(evidence), "independence", "UNVERIFIED", "CI_JOB_SKIPPED")
 
+    def test_same_family_requires_exclusion_proof_and_rejects_gate_surface(self) -> None:
+        evidence = self.evidence(self.make_head(), required_grade="A+", implementation_grade="A+")
+        evidence["tester"] = {"planned_profile": "codex-sol", "planned_effort": "high",
+                              "session": "new-session", "worktree": "/tmp/other-tree"}
+        evidence["same_family"] = {"reversible": True, "qualification_ref": "scopefuel:opus-xhigh",
+                                   "directed_brief_ref": "src/feature.py:1", "independent_counterexample_ref": "counterexample",
+                                   "ci_run_id": 123, "ci_attempt": 1, "ci_status": "success",
+                                   "report_phrase": "동일 계열 독립 세션 검증"}
+        self.assert_case(self.check(evidence), "independence", "UNVERIFIED", "SAME_FAMILY_PROOF_MISSING")
+        evidence["same_family"]["excluded_surface"] = False
+        evidence["same_family"]["reversible"] = False
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_NON_REVERSIBLE")
+        evidence["same_family"]["reversible"] = True
+        evidence["tester"]["session"] = "builder-session"
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_TESTER_SESSION")
+        evidence["tester"]["session"] = "new-session"
+        evidence["tester"]["worktree"] = "/tmp/builder-worktree"
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_TESTER_WORKTREE")
+        evidence["tester"]["worktree"] = "/tmp/other-tree"
+        evidence["tester"]["planned_effort"] = "max"
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_GRADE_EFFORT")
+        evidence["tester"]["planned_effort"] = "high"
+        evidence["head"] = self.make_head("director/bin/gate-helper")
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_EXCLUDED_SURFACE")
+        evidence["head"] = self.make_head(".github/workflows/ci.yml")
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_EXCLUDED_SURFACE")
+
     def test_report_quote_code_block_and_hash_mismatch(self) -> None:
         evidence = self.landed(self.evidence(self.make_head()))
         report = Path(self.temp.name) / "report.md"
@@ -246,6 +279,7 @@ class EligibilityFixtures(unittest.TestCase):
 
     def test_post_landing_and_pre_merge_pass_with_bound_records(self) -> None:
         evidence = self.landed(self.evidence(self.make_head()))
+        evidence["trial_merge_tree"] = git(self.repo, "merge-tree", "--write-tree", evidence["base"], evidence["head"])
         self.add_actual_source(evidence)
         checks = self.check(evidence, "post-landing")
         self.assertEqual(eligible.overall(checks), "PASS")
@@ -259,13 +293,35 @@ class EligibilityFixtures(unittest.TestCase):
                                     f"VERDICT: PASS @{evidence['head']}")) + "\n")
         evidence["tester"].update(report_path=str(report), report_sha256=common.sha256_file(report))
         evidence["ci"] = {"run_id": 123, "attempt": 1, "status": "success",
-                          "head": evidence["head"], "base": evidence["base"]}
-        with mock.patch.object(eligible, "_current_pr", return_value=common.result("PASS", "PR_REFS_CURRENT", "checker:G2+G4")):
+                          "head": evidence["head"], "base": evidence["base"],
+                          "trial_merge_tree": evidence["trial_merge_tree"]}
+        live_run = {"id": 123, "run_attempt": 1, "event": "pull_request", "head_sha": evidence["head"],
+                    "status": "completed", "conclusion": "success", "pull_requests": [
+                        {"number": 99, "head": {"sha": evidence["head"]}, "base": {"sha": evidence["base"]}}]}
+        live_jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"}
+                              for name in ("ubuntu-latest", "macos-latest")]}
+        live_check = common.result("PASS", "CI_ATTEMPT_READ", "task:723")
+        with mock.patch.object(eligible, "_current_pr", return_value=common.result("PASS", "PR_REFS_CURRENT", "checker:G2+G4")), \
+             mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, live_jobs, live_check)):
             checks = self.check(evidence, "pre-merge")
         self.assertEqual(eligible.overall(checks), "PASS")
         self.assert_case(checks, "report", "PASS", "EXACT_HEAD_PASS")
+        with mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, {"jobs": live_jobs["jobs"][:1]}, live_check)):
+            self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_JOB_MISSING")
+        missing_run = common.result("UNVERIFIED", "CI_LOOKUP_FAILED", "task:723")
+        with mock.patch.object(eligible, "read_ci_attempt", return_value=(None, None, missing_run)):
+            self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_LOOKUP_FAILED")
+        skipped_jobs = json.loads(json.dumps(live_jobs))
+        skipped_jobs["jobs"][1]["conclusion"] = "skipped"
+        with mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, skipped_jobs, live_check)):
+            self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_JOB_SKIPPED")
+        stale_run = json.loads(json.dumps(live_run))
+        stale_run["pull_requests"][0]["base"]["sha"] = "0" * 40
+        with mock.patch.object(eligible, "read_ci_attempt", return_value=(stale_run, live_jobs, live_check)):
+            self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_BASE_STALE")
         evidence["ci"]["base"] = self.make_head("src/base_advance.py")
-        with mock.patch.object(eligible, "_current_pr", return_value=common.result("PASS", "PR_REFS_CURRENT", "checker:G2+G4")):
+        with mock.patch.object(eligible, "_current_pr", return_value=common.result("PASS", "PR_REFS_CURRENT", "checker:G2+G4")), \
+             mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, live_jobs, live_check)):
             self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_BASE_STALE")
 
     def test_actual_model_fallback_and_observation_hash(self) -> None:
@@ -279,6 +335,22 @@ class EligibilityFixtures(unittest.TestCase):
         self.add_actual_source(evidence)
         evidence["_pane_snapshot"] = "Grok 4.6 (xhigh) · always-approve"
         self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED", "PANE_MODEL_UNVERIFIED")
+
+    def test_actual_launch_family_and_latest_pane_footer(self) -> None:
+        evidence = self.landed(self.evidence(self.make_head()))
+        self.add_actual_source(evidence)
+        events = Path(evidence["tester"]["job_record_dir"]) / "events"
+        quota_path = events / "00002-quota_pool.record.json"
+        quota = json.loads(quota_path.read_text())
+        quota["payload"]["launch_profile"] = "codex-sol@xhigh"
+        quota_path.write_text(json.dumps(quota))
+        self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
+                         "ACTUAL_LAUNCH_FAMILY_MISMATCH")
+        quota["payload"]["launch_profile"] = "grok@xhigh"
+        quota_path.write_text(json.dumps(quota))
+        evidence["_pane_snapshot"] = "Grok 4.7 (xhigh) · always-approve\nGrok 4.6 (high) · always-approve"
+        self.assert_case(self.check(evidence, "post-landing"), "actual_source", "UNVERIFIED",
+                         "PANE_MODEL_UNVERIFIED")
 
     def test_pane_footer_requires_model_and_effort(self) -> None:
         self.assertTrue(eligible._pane_model_matches("Grok 4.7 (xhigh) · always-approve", "grok-4.7", "xhigh"))
@@ -319,6 +391,25 @@ class EligibilityFixtures(unittest.TestCase):
         evidence = self.evidence(self.make_head(), required_grade="A+", implementation_grade="A+")
         evidence["tester"] = {"planned_profile": "devin-ds41-max", "planned_effort": ""}
         self.assert_case(self.check(evidence), "grade", "FAIL", "TESTER_GRADE_LOW")
+
+    def test_e6_builder_grades_conflict_and_grok_model_must_match_wrk(self) -> None:
+        variants = ("builder-opus-low", "builder-opus-medium", "builder-sonnet-xhigh", "builder-sonnet-max",
+                    "builder-sol-high", "builder-sol-max", "builder-luna-max", "builder-terra-high",
+                    "builder-terra-xhigh", "builder-terra-max", "builder-kimi-high", "builder-kimi-max")
+        for alias in variants:
+            spec = self.policy["profiles"][alias]
+            _, check = common.resolve_profile(alias, self.policy, actual_effort=spec["default_effort"],
+                                              role="builder")
+            self.assertEqual((check["status"], check["reason_code"]),
+                             ("UNVERIFIED", "PROFILE_GRADE_CONFLICT"), alias)
+        changed = json.loads(json.dumps(self.policy))
+        changed["profiles"]["grok"]["model"] = "not-the-wrk-model"
+        _, check = common.resolve_profile("grok", changed, actual_effort="xhigh", role="tester")
+        self.assertEqual((check["status"], check["reason_code"]), ("UNVERIFIED", "POLICY_CONFLICT"))
+        changed = json.loads(json.dumps(self.policy))
+        changed["profiles"]["codex-sol"]["family"] = "xai"
+        _, check = common.resolve_profile("codex-sol", changed, actual_effort="max", role="tester")
+        self.assertEqual((check["status"], check["reason_code"]), ("UNVERIFIED", "PROFILE_FAMILY_CONFLICT"))
 
     def test_mutants_are_assertion_red(self) -> None:
         evidence = self.evidence(self.make_head("deploy/runtime.service"))
@@ -394,7 +485,8 @@ class EligibilityFixtures(unittest.TestCase):
             events = jobs / job / "events"
             events.mkdir(parents=True)
             (events / "00003-job.spawned.json").write_text(json.dumps({
-                "kind": "job.spawned", "job_id": job, "created_at": "2026-09-25T06:00:00+00:00"}))
+                "kind": "job.spawned", "job_id": job, "repo": "agent-skills",
+                "created_at": "2026-09-25T06:00:00+00:00"}))
         for name, job, issued in (("one", "job-a", "2026-09-25T05:59:00Z"),
                                   ("two", "job-b", "2026-09-25T06:01:00Z")):
             (receipts / f"{name}.json").write_text(json.dumps({"action_id": "reused-id", "kind": "spawn",
@@ -404,6 +496,39 @@ class EligibilityFixtures(unittest.TestCase):
             rc = eligible.audit(receipts, [], jobs, "2026-09-25T00:00:00Z")
         self.assertEqual(rc, 0)
         self.assertIn("actions=3 missing=1 late=1 reused=1", output.getvalue())
+
+    def test_audit_matches_repo_slug_but_not_unknown_spawn_repo(self) -> None:
+        jobs = Path(self.temp.name) / "jobs"
+        events = jobs / "unknown-job" / "events"
+        events.mkdir(parents=True)
+        (events / "00003-job.spawned.json").write_text(json.dumps({
+            "kind": "job.spawned", "job_id": "unknown-job", "created_at": "2026-09-25T06:00:00Z"}))
+        receipts = Path(self.temp.name) / "receipts"
+        receipts.mkdir()
+        for name, kind, key, repo in (("merge", "merge", "144", "agent-skills"),
+                                      ("spawn", "spawn", "unknown-job", "other-repo")):
+            (receipts / f"{name}.json").write_text(json.dumps({
+                "action_id": name, "kind": kind, "stage": "pre-merge" if kind == "merge" else "pre-spawn",
+                "pr": int(key) if kind == "merge" else None,
+                "job": key if kind == "spawn" else None,
+                "head": "a" * 40 if kind == "merge" else None,
+                "repo": repo, "time": "2026-09-25T05:59:00Z"}))
+        gh_response = subprocess.CompletedProcess(args=[], returncode=0,
+            stdout=json.dumps([{"number": 144, "headRefOid": "a" * 40,
+                                "mergedAt": "2026-09-25T06:00:00Z", "url": "https://example.test/144"}]), stderr="")
+        output = io.StringIO()
+        with mock.patch.object(eligible.subprocess, "run", return_value=gh_response), redirect_stdout(output):
+            rc = eligible.audit(receipts, ["mgh3326/agent-skills"], jobs, "2026-09-25T00:00:00Z")
+        self.assertEqual(rc, 0)
+        self.assertIn("actions=2 missing=1 late=0 reused=0", output.getvalue())
+        merge_receipt = receipts / "merge.json"
+        changed = json.loads(merge_receipt.read_text())
+        changed["head"] = "b" * 40
+        merge_receipt.write_text(json.dumps(changed))
+        output = io.StringIO()
+        with mock.patch.object(eligible.subprocess, "run", return_value=gh_response), redirect_stdout(output):
+            eligible.audit(receipts, ["mgh3326/agent-skills"], jobs, "2026-09-25T00:00:00Z")
+        self.assertIn("actions=2 missing=2 late=0 reused=0", output.getvalue())
 
 
 if __name__ == "__main__":

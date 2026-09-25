@@ -20,7 +20,18 @@ ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_POLICY = ROOT / "director" / "gate_policy.json"
 DEFAULT_RECEIPTS = Path.home() / "work/herdr-inbox/receipts"
 GRADES = ("C", "B", "A", "A+", "S", "S+")
-TOOL_VERSION = "tester-eligible/1.0"
+COMMON_VERSION = "gate-common/1.1"
+MODEL_FAMILY_PREFIXES = (
+    ("claude-", "anthropic"), ("gpt-", "openai"), ("grok-", "xai"),
+    ("kimi-", "moonshot"), ("deepseek-", "deepseek"), ("swe-", "cognition"),
+    ("gemini-", "google"), ("glm-", "zhipu"), ("qwen", "alibaba"),
+    ("solar-", "upstage"), ("minimax-", "minimax"),
+)
+
+
+def model_family(model: str) -> str | None:
+    return next((family for prefix, family in MODEL_FAMILY_PREFIXES
+                 if model.startswith(prefix)), None)
 
 
 def sha256_file(path: Path) -> str:
@@ -95,6 +106,35 @@ def run_git(repo: Path, *args: str) -> subprocess.CompletedProcess[str]:
                           capture_output=True, check=False)
 
 
+def read_ci_attempt(repo: Path, run_id: object, attempt: object) -> tuple[dict | None, dict | None, dict]:
+    """Read one GitHub Actions attempt and its jobs from the repository origin."""
+    if (type(run_id) is not int or run_id <= 0 or
+        type(attempt) is not int or attempt <= 0):
+        return None, None, result("UNVERIFIED", "CI_JOB_MISSING", "task:723")
+    try:
+        remote = run_git(repo, "remote", "get-url", "origin")
+    except (OSError, UnicodeError):
+        return None, None, result("UNVERIFIED", "CI_REPO_UNKNOWN", "task:723")
+    match = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(?:\.git)?$", remote.stdout.strip()) if not remote.returncode else None
+    if not match:
+        return None, None, result("UNVERIFIED", "CI_REPO_UNKNOWN", "task:723")
+    slug = f"{match.group(1)}/{match.group(2)}"
+    prefix = f"repos/{slug}/actions/runs/{run_id}/attempts/{attempt}"
+    try:
+        run_proc = subprocess.run(["gh", "api", prefix], text=True, capture_output=True, check=False, timeout=20)
+        jobs_proc = subprocess.run(["gh", "api", f"{prefix}/jobs"], text=True,
+                                   capture_output=True, check=False, timeout=20)
+        if run_proc.returncode or jobs_proc.returncode:
+            return None, None, result("UNVERIFIED", "CI_LOOKUP_FAILED", "task:723", repo=slug)
+        run = json.loads(run_proc.stdout)
+        jobs = json.loads(jobs_proc.stdout)
+        if not isinstance(run, dict) or not isinstance(jobs, dict) or not isinstance(jobs.get("jobs"), list):
+            raise ValueError("malformed CI response")
+        return run, jobs, result("PASS", "CI_ATTEMPT_READ", "task:723", repo=slug)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None, None, result("UNVERIFIED", "CI_LOOKUP_FAILED", "task:723", repo=slug)
+
+
 def _wrk_clause(wrk_text: str, alias: str) -> str | None:
     block = wrk_text.split("resolve_profile() {", 1)[-1]
     block = block.split('  case "$MODEL" in', 1)[-1]
@@ -120,14 +160,21 @@ def resolve_profile(alias: str, policy: dict, *, actual_model: str | None = None
     if not isinstance(spec, dict):
         return None, result("UNVERIFIED", "PROFILE_UNKNOWN", "bin/wrk:resolve_profile")
     try:
-        clause = _wrk_clause((root / "bin/wrk").read_text(), alias)
+        wrk_text = (root / "bin/wrk").read_text()
+        clause = _wrk_clause(wrk_text, alias)
         if clause is None:
             return None, result("UNVERIFIED", "PROFILE_UNKNOWN", "bin/wrk:resolve_profile")
         kind = re.search(r"PROFILE_KIND=([a-z]+)", clause)
         if not kind or kind.group(1) != spec["launcher"]:
             return None, result("UNVERIFIED", "POLICY_CONFLICT", "bin/wrk:resolve_profile")
         token = spec["launcher_model_token"]
-        if token and token not in clause:
+        if spec["launcher"] == "grok":
+            explicit = re.search(r"PROFILE_MODEL_ARG=([a-z0-9.-]+)", clause)
+            fallback = re.search(r"PROFILE_MODEL_ARG:-([a-z0-9.-]+)", wrk_text)
+            expected_model = explicit.group(1) if explicit else fallback.group(1) if fallback else None
+            if spec["model"] != expected_model:
+                return None, result("UNVERIFIED", "POLICY_CONFLICT", "bin/wrk:resolve_profile")
+        elif token and token not in clause:
             return None, result("UNVERIFIED", "POLICY_CONFLICT", "bin/wrk:resolve_profile")
         default_match = re.search(r"DEFAULT_EFFORT=([a-z]+)", clause)
         if 'DEFAULT_EFFORT="${MODEL##*-}"' in clause:
@@ -140,7 +187,10 @@ def resolve_profile(alias: str, policy: dict, *, actual_model: str | None = None
         if effort not in spec["grades"]:
             return None, result("UNVERIFIED", "PROFILE_EFFORT_UNKNOWN", "policy:profiles")
         if actual_model is not None and actual_model != spec["model"]:
-            return None, result("UNVERIFIED", "ACTUAL_MODEL_MISMATCH", "decision:2227")
+            return None, result("UNVERIFIED", "ACTUAL_MODEL_MISMATCH", "bin/wrk+policy:profiles")
+        inferred_family = model_family(spec["model"])
+        if inferred_family is None or spec["family"] != inferred_family:
+            return None, result("UNVERIFIED", "PROFILE_FAMILY_CONFLICT", "bin/wrk+policy:profiles")
         if role not in spec["roles"]:
             status = "UNVERIFIED" if spec.get("role_status") == "unknown" else "FAIL"
             reason = "PROFILE_ROLE_UNKNOWN" if status == "UNVERIFIED" else "PROFILE_ROLE_DENIED"
@@ -149,6 +199,8 @@ def resolve_profile(alias: str, policy: dict, *, actual_model: str | None = None
         resolved = {"alias": alias, "launcher": spec["launcher"], "family": spec["family"],
                     "model": spec["model"], "effort": effort, "grade": grade,
                     "roles": spec["roles"], "surfaces": spec["surfaces"]}
+        if spec.get("grade_status") == "conflict":
+            return resolved, result("UNVERIFIED", "PROFILE_GRADE_CONFLICT", "spawn-worker:2-2+policy:profiles", **resolved)
         if grade not in GRADES or spec["family"] == "unknown":
             return resolved, result("UNVERIFIED", "PROFILE_GRADE_UNKNOWN", "policy:profiles", **resolved)
         return resolved, result("PASS", "PROFILE_RESOLVED", "bin/wrk+policy:profiles")

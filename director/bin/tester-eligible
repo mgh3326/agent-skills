@@ -14,14 +14,15 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from gate_common import (  # noqa: E402
-    DEFAULT_POLICY, DEFAULT_RECEIPTS, GRADES, TOOL_VERSION, iso_time,
-    load_policy, new_action_id, overall, parse_time, resolve_profile, result, run_git,
+    DEFAULT_POLICY, DEFAULT_RECEIPTS, GRADES, iso_time,
+    load_policy, model_family, new_action_id, overall, parse_time, read_ci_attempt, resolve_profile, result, run_git,
     sha256_file, utc_now, write_receipt,
 )
 
 SHA = re.compile(r"^[0-9a-f]{40}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})$")
 STAGES = ("pre-spawn", "post-landing", "pre-merge")
+TOOL_VERSION = "tester-eligible/1.1"
 
 
 def _digest(value: object) -> str:
@@ -46,21 +47,27 @@ def diff_surface(evidence: dict, policy: dict) -> tuple[dict | None, dict]:
     for ref in (base, head):
         if run_git(repo, "cat-file", "-e", f"{ref}^{{commit}}").returncode:
             return None, result("UNVERIFIED", "DIFF_REF_MISSING", "spawn-worker:2-1")
-    names = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-only", base, head)
-    nums = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "--numstat", base, head)
+    names = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", base, head)
+    nums = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "--numstat", "-z", base, head)
     if names.returncode or nums.returncode:
         return None, result("UNVERIFIED", "DIFF_READ_FAILED", "spawn-worker:2-1")
-    paths = [line for line in names.stdout.splitlines() if line]
-    if not paths:
+    if not names.stdout:
         return None, result("UNVERIFIED", "DIFF_EMPTY", "spawn-worker:2-1")
-    if any("\n" in path or path.startswith("-") for path in paths):
+    if not names.stdout.endswith("\0") or not nums.stdout.endswith("\0"):
+        return None, result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1")
+    paths = names.stdout[:-1].split("\0")
+    if any(not path or any(ord(char) < 32 for char in path) or path.startswith("-") for path in paths):
         return None, result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1")
     lines = 0
-    for row in nums.stdout.splitlines():
+    numstat_paths = []
+    for row in nums.stdout[:-1].split("\0"):
         fields = row.split("\t", 2)
         if len(fields) != 3 or not fields[0].isdigit() or not fields[1].isdigit():
             return None, result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1")
         lines += int(fields[0]) + int(fields[1])
+        numstat_paths.append(fields[2])
+    if paths != numstat_paths:
+        return None, result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1")
     rules = policy["surface_rules"]
     names_lower = [name.lower() for name in paths]
     t3 = any(any(path.startswith(prefix.lower()) or f"/{prefix.lower()}" in path
@@ -139,8 +146,11 @@ def _current_pr(evidence: dict) -> dict:
     if not evidence.get("pr"):
         return result("UNVERIFIED", "PR_MISSING", "decision:3231")
     repo = Path(evidence["repo_path"])
-    proc = subprocess.run(["gh", "pr", "view", str(evidence["pr"]), "--json", "headRefOid,baseRefName"],
-                          cwd=repo, text=True, capture_output=True, check=False)
+    try:
+        proc = subprocess.run(["gh", "pr", "view", str(evidence["pr"]), "--json", "headRefOid,baseRefName"],
+                              cwd=repo, text=True, capture_output=True, check=False, timeout=20)
+    except (OSError, subprocess.TimeoutExpired):
+        return result("UNVERIFIED", "PR_LOOKUP_FAILED", "checker:G2")
     if proc.returncode:
         return result("UNVERIFIED", "PR_LOOKUP_FAILED", "checker:G2")
     try:
@@ -155,7 +165,7 @@ def _current_pr(evidence: dict) -> dict:
         if remote_base != evidence["base"]:
             return result("UNVERIFIED", "BASE_CHANGED", "checker:G4")
         return result("PASS", "PR_REFS_CURRENT", "checker:G2+G4", head=pr["headRefOid"], base=remote_base)
-    except (ValueError, KeyError, IndexError):
+    except (ValueError, KeyError, IndexError, OSError, UnicodeError):
         return result("UNVERIFIED", "PR_LOOKUP_FAILED", "checker:G2")
 
 
@@ -199,7 +209,7 @@ def _report(evidence: dict) -> dict:
         return result("UNVERIFIED", "REPORT_UNREADABLE", "checker:G1")
 
 
-def _ci_binding(evidence: dict) -> dict:
+def _ci_binding(evidence: dict, policy: dict | None = None) -> dict:
     ci = evidence.get("ci")
     if not isinstance(ci, dict) or not ci.get("run_id") or not ci.get("attempt"):
         return result("UNVERIFIED", "CI_JOB_MISSING", "task:723")
@@ -211,8 +221,45 @@ def _ci_binding(evidence: dict) -> dict:
         return result("UNVERIFIED", "CI_HEAD_STALE", "task:723")
     if ci.get("base") != evidence.get("base"):
         return result("UNVERIFIED", "CI_BASE_STALE", "task:723")
-    if evidence.get("trial_merge_tree") and ci.get("trial_merge_tree") != evidence["trial_merge_tree"]:
+    merge_tree = evidence.get("trial_merge_tree")
+    if not merge_tree or not SHA.fullmatch(str(merge_tree)):
+        return result("UNVERIFIED", "CI_MERGE_TREE_MISSING", "task:723")
+    try:
+        actual_tree = run_git(Path(evidence["repo_path"]), "merge-tree", "--write-tree",
+                              evidence["base"], evidence["head"])
+    except (OSError, UnicodeError):
         return result("UNVERIFIED", "CI_MERGE_TREE_STALE", "task:723")
+    if actual_tree.returncode or actual_tree.stdout.strip() != merge_tree:
+        return result("UNVERIFIED", "CI_MERGE_TREE_STALE", "task:723")
+    if ci.get("trial_merge_tree") != merge_tree:
+        return result("UNVERIFIED", "CI_MERGE_TREE_STALE", "task:723")
+    run, jobs, lookup = read_ci_attempt(Path(evidence["repo_path"]), ci["run_id"], ci["attempt"])
+    if lookup["status"] != "PASS":
+        return lookup
+    if (run.get("id") != ci["run_id"] or run.get("run_attempt") != ci["attempt"] or
+        run.get("event") != "pull_request"):
+        return result("UNVERIFIED", "CI_ATTEMPT_MISMATCH", "task:723")
+    if run.get("head_sha") != evidence["head"]:
+        return result("UNVERIFIED", "CI_HEAD_STALE", "task:723")
+    pulls = run.get("pull_requests") or []
+    if not any(pr.get("number") == evidence.get("pr") and
+               (pr.get("head") or {}).get("sha") == evidence["head"] and
+               (pr.get("base") or {}).get("sha") == evidence["base"] for pr in pulls if isinstance(pr, dict)):
+        return result("UNVERIFIED", "CI_BASE_STALE", "task:723")
+    if run.get("status") != "completed" or run.get("conclusion") != "success":
+        return result("UNVERIFIED", "CI_NOT_GREEN", "task:723")
+    repo_name = str(evidence.get("repo", "")).rsplit("/", 1)[-1]
+    required_jobs = (policy or {}).get("required_ci_jobs_by_repo", {}).get(repo_name)
+    if not isinstance(required_jobs, list) or not required_jobs:
+        return result("UNVERIFIED", "CI_POLICY_UNKNOWN", "task:723")
+    by_name = {job.get("name"): job for job in jobs["jobs"] if isinstance(job, dict)}
+    if any(name not in by_name for name in required_jobs):
+        return result("UNVERIFIED", "CI_JOB_MISSING", "task:723")
+    if any(by_name[name].get("conclusion") == "skipped" for name in required_jobs):
+        return result("UNVERIFIED", "CI_JOB_SKIPPED", "task:723")
+    if any(by_name[name].get("status") != "completed" or by_name[name].get("conclusion") != "success"
+           for name in required_jobs):
+        return result("UNVERIFIED", "CI_NOT_GREEN", "task:723")
     return result("PASS", "CI_BOUND", "task:723", run_id=ci["run_id"], attempt=ci["attempt"])
 
 
@@ -233,10 +280,13 @@ def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
     }.get(model, model)
     suffix = rf"\s*(?:\(\s*{re.escape(effort)}\s*\)|{re.escape(effort)})\s*·" if effort else r"\s*·"
     pattern = re.compile(rf"\b{re.escape(display)}{suffix}", re.IGNORECASE)
-    return any(pattern.search(line) for line in snapshot.splitlines()[-3:])
+    footer_lines = [line for line in snapshot.splitlines()[-5:]
+                    if " · " in line and re.search(r"\b(?:Grok|GPT-|Opus|Sonnet|Haiku|Kimi|Devin|Deepseek)", line,
+                                                   re.IGNORECASE)]
+    return bool(footer_lines) and bool(pattern.search(footer_lines[-1]))
 
 
-def _actual_observation(evidence: dict) -> dict:
+def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | None) -> dict:
     """Bind actual profile/effort to wrk events and model to a pane observation."""
     tester = evidence.get("tester") or {}
     record_dir = tester.get("job_record_dir")
@@ -259,7 +309,13 @@ def _actual_observation(evidence: dict) -> dict:
             spawned["payload"].get("pane_id") != pane):
             return result("UNVERIFIED", "JOB_RECORD_MISMATCH", "bin/wrk:job-record")
         launch = quota["payload"].get("launch_profile", "")
-        observed_effort = launch.rsplit("@", 1)[1] if "@" in launch else ""
+        launch_prefix, observed_effort = launch.rsplit("@", 1) if "@" in launch else ("", "")
+        launch_spec = policy.get("profiles", {}).get(launch_prefix)
+        if not tester_profile or not isinstance(launch_spec, dict):
+            return result("UNVERIFIED", "ACTUAL_LAUNCH_UNKNOWN", "bin/wrk:quota_pool.record")
+        if (launch_spec.get("family") != tester_profile["family"] or
+            model_family(str(launch_spec.get("model", ""))) != tester_profile["family"]):
+            return result("UNVERIFIED", "ACTUAL_LAUNCH_FAMILY_MISMATCH", "bin/wrk:quota_pool.record")
         if observed_effort != tester.get("actual_effort"):
             return result("UNVERIFIED", "ACTUAL_EFFORT_MISMATCH", "bin/wrk:quota_pool.record")
         path = Path(observation_path)
@@ -294,6 +350,10 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
     if policy_check["status"] == "PASS":
         try:
             surface, checks["surface"] = diff_surface(evidence, policy)
+        except UnicodeError:
+            checks["surface"] = result("UNVERIFIED", "DIFF_UNCLASSIFIABLE", "spawn-worker:2-1")
+        except OSError:
+            checks["surface"] = result("UNVERIFIED", "DIFF_READ_FAILED", "spawn-worker:2-1")
         except (KeyError, TypeError):
             checks["surface"] = result("UNVERIFIED", "POLICY_CONFLICT", "policy:surface_rules")
     else:
@@ -314,7 +374,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
     contributor_profiles = []
     contributors = evidence.get("contributors")
     if not isinstance(contributors, list) or not contributors:
-        checks["contributors"] = result("UNVERIFIED", "CONTRIBUTORS_MISSING", "decision:2227")
+        checks["contributors"] = result("UNVERIFIED", "CONTRIBUTORS_MISSING", "spawn-worker:2-4")
     else:
         failures = []
         for item in contributors:
@@ -328,8 +388,8 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
                 failures.append(check["reason_code"])
             else:
                 contributor_profiles.append(resolved)
-        checks["contributors"] = (result("UNVERIFIED", failures[0], "decision:2227") if failures else
-                                  result("PASS", "CONTRIBUTOR_UNION_RESOLVED", "decision:2227",
+        checks["contributors"] = (result("UNVERIFIED", failures[0], "spawn-worker:2-4") if failures else
+                                  result("PASS", "CONTRIBUTOR_UNION_RESOLVED", "spawn-worker:2-4",
                                          families=sorted({p["family"] for p in contributor_profiles})))
 
     tester = evidence.get("tester") if isinstance(evidence.get("tester"), dict) else {}
@@ -353,7 +413,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
             checks["tester"] = result("FAIL", "ACTUAL_PROFILE_CHANGED", "decision:3231")
             tester_profile = None
     checks["actual_source"] = (result("N/A", "PRE_SPAWN_PLAN", "decision:3231") if stage == "pre-spawn"
-                               else _actual_observation(evidence))
+                               else _actual_observation(evidence, policy, tester_profile))
 
     if tester_profile and declared and declared not in tester_profile["surfaces"]:
         checks["surface_permission"] = result("FAIL", "PROFILE_SURFACE_DENIED", "policy:profiles")
@@ -379,9 +439,9 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
 
     families = {p["family"] for p in contributor_profiles}
     if not tester_profile or checks["contributors"]["status"] != "PASS":
-        checks["independence"] = result("UNVERIFIED", "FAMILY_UNKNOWN", "decision:2227")
+        checks["independence"] = result("UNVERIFIED", "FAMILY_UNKNOWN", "spawn-worker:2-4")
     elif declared == "T3" and tester_profile["alias"] in {"devin-ds41", "devin-ds41-max"}:
-        checks["independence"] = result("FAIL", "DS41_T3_SOLE_TESTER", "decision:2227")
+        checks["independence"] = result("FAIL", "DS41_T3_SOLE_TESTER", "spawn-worker:2-4+task:726")
     elif tester_profile["family"] not in families:
         checks["independence"] = result("PASS", "CROSS_FAMILY", "spawn-worker:2-4", families=sorted(families))
     elif declared == "T3" or (surface and surface["floor"] == "T3"):
@@ -391,12 +451,25 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
         prior_sessions = {item.get("session") for item in contributors if isinstance(item, dict)}
         prior_worktrees = {item.get("worktree") for item in contributors if isinstance(item, dict)}
         ci_status = same.get("ci_status")
-        if required in GRADES and GRADES.index(required) > GRADES.index("A+"):
+        if surface and "gate_or_delivery" in surface["flags"]:
+            checks["independence"] = result("FAIL", "SAME_FAMILY_EXCLUDED_SURFACE", "spawn-worker:2-4")
+        elif same.get("excluded_surface") is True:
+            checks["independence"] = result("FAIL", "SAME_FAMILY_EXCLUDED_SURFACE", "spawn-worker:2-4")
+        elif required in GRADES and GRADES.index(required) > GRADES.index("A+"):
             checks["independence"] = result("FAIL", "SAME_FAMILY_GRADE_EXCLUDED", "spawn-worker:2-4")
+        elif same.get("reversible") is False:
+            checks["independence"] = result("FAIL", "SAME_FAMILY_NON_REVERSIBLE", "spawn-worker:2-4")
+        elif tester.get("session") and tester["session"] in prior_sessions:
+            checks["independence"] = result("FAIL", "SAME_TESTER_SESSION", "spawn-worker:2-4")
+        elif tester.get("worktree") and tester["worktree"] in prior_worktrees:
+            checks["independence"] = result("FAIL", "SAME_TESTER_WORKTREE", "spawn-worker:2-4")
+        elif any(tester_profile["effort"] == p["effort"] and tester_profile["grade"] == p["grade"]
+                 for p in contributor_profiles):
+            checks["independence"] = result("FAIL", "SAME_GRADE_EFFORT", "spawn-worker:2-4")
         else:
             conditions = [
             required in GRADES,
-            bool(same.get("reversible")) and not same.get("excluded_surface"),
+            same.get("reversible") is True and same.get("excluded_surface") is False,
             bool(tester.get("session")) and tester.get("session") not in prior_sessions,
             bool(tester.get("worktree")) and tester.get("worktree") not in prior_worktrees,
             all(tester_profile["effort"] != p["effort"] or tester_profile["grade"] != p["grade"] for p in contributor_profiles),
@@ -428,7 +501,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
         checks["report"] = result("N/A", "TESTER_IN_PROGRESS", "decision:3231") if stage == "post-landing" else _report(evidence)
         checks["current_pr"] = result("N/A", "POST_LANDING", "decision:3231") if stage == "post-landing" else _current_pr(evidence)
     checks["ci_binding"] = (result("N/A", "BEFORE_CI", "decision:3231") if stage != "pre-merge"
-                            else _ci_binding(evidence))
+                            else _ci_binding(evidence, policy))
     checks["artifact_hash"] = result("N/A", "POST_MERGE_ARTIFACT", "advice:astra-Q3")
     return checks, bound
 
@@ -453,7 +526,7 @@ def audit(receipt_dir: Path, repos: list[str], jobs_dir: Path, since: str | None
                 print(f"AUDIT UNVERIFIED repo={repo} merged PR window truncated")
                 return 2
             for pr in fetched:
-                actions.append(("merge", repo, str(pr["number"]), pr["mergedAt"]))
+                actions.append(("merge", repo, str(pr["number"]), pr["mergedAt"], pr["headRefOid"]))
         except (ValueError, KeyError):
             print(f"AUDIT UNVERIFIED repo={repo} malformed ledger")
             return 2
@@ -463,7 +536,18 @@ def audit(receipt_dir: Path, repos: list[str], jobs_dir: Path, since: str | None
             job = record.get("job_id") or path.parents[1].name
             at = record.get("created_at") or record.get("at")
             if at:
-                actions.append(("spawn", str(record.get("repo", "")), str(job), at))
+                repo = record.get("repo", "")
+                head = record.get("head")
+                if not repo:
+                    evidence_path = path.parents[1] / "eligibility-evidence.json"
+                    try:
+                        linked = json.loads(evidence_path.read_text())
+                        if linked.get("job") == job:
+                            repo = linked.get("repo", "")
+                            head = head or linked.get("head")
+                    except (OSError, ValueError):
+                        pass
+                actions.append(("spawn", str(repo), str(job), at, head))
         except (OSError, ValueError):
             continue
     if since:
@@ -475,10 +559,20 @@ def audit(receipt_dir: Path, repos: list[str], jobs_dir: Path, since: str | None
             return 2
     missing = late = reused = 0
     used = {}
-    for kind, repo, key, when in actions:
+    repo_names = [repo.rsplit("/", 1)[-1] for repo in repos]
+    def repo_matches(receipt_repo: object, action_repo: str) -> bool:
+        if not isinstance(receipt_repo, str) or not receipt_repo or not action_repo:
+            return False
+        if receipt_repo == action_repo:
+            return True
+        return (action_repo in repos and "/" not in receipt_repo and
+                receipt_repo == action_repo.rsplit("/", 1)[-1] and
+                repo_names.count(receipt_repo) == 1)
+    for kind, repo, key, when, head in actions:
         matches = [r for r in receipts if r.get("kind") == kind and
-                   (r.get("repo") == repo or not repo) and
+                   repo_matches(r.get("repo"), repo) and
                    str(r.get("job" if kind == "spawn" else "pr")) == key and
+                   (head is None or r.get("head") == head) and
                    r.get("stage") == ("pre-spawn" if kind == "spawn" else "pre-merge")]
         if not matches:
             missing += 1
