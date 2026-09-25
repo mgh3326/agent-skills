@@ -101,7 +101,8 @@ def evaluate_required_ci(
             elif item["base_sha"] != B:
                 problems.append((name, "CI_BASE_MOVED"))
     if problems:
-        name, code = problems[0]
-        status = "FAIL" if code in {"CI_FAILED", "CI_SKIPPED", "CI_HEAD_MISMATCH"} else "UNVERIFIED"
+        failures = {"CI_FAILED", "CI_SKIPPED", "CI_HEAD_MISMATCH"}
+        name, code = next(((name, code) for name, code in problems if code in failures), problems[0])
+        status = "FAIL" if code in failures else "UNVERIFIED"
         return _result(status, code, job=name, problems=[{"job": n, "reason_code": c} for n, c in problems], jobs=observations)
     return _result("PASS", "CI_ALL_REQUIRED_SUCCEEDED", jobs=observations)

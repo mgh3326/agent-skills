@@ -69,7 +69,8 @@ Installers still need a fresh predeployment comparison.
 
 If a PR body or deploy note cites an artifact SHA256, G10 requires a separate
 JSON receipt with kind `artifact-hash`, repo, PR, H, issuer, sha256, and
-artifact_ref. The issuer must be independent. This gate does not verify
+artifact_ref for each cited hash. Pass --hash-receipt more than once for
+multiple receipts, or use an artifacts array in one receipt. The issuer must be independent. This gate does not verify
 post-merge binary hashes.
 
 ## Remote head and base race
@@ -96,8 +97,9 @@ file:line and class. Zero hits are not proof of no secrets.
 
 Audit anti-joins JSON receipts against GitHub merged PRs for policy repos and
 local wrk `job.spawned` event records. It counts actions without receipts,
-receipts issued after the action, and reused receipts. Lookup failure is
-UNVERIFIED. The audit detects bypasses; it cannot prevent them.
+receipts issued after the action, merges preceded only by nonpassing receipts,
+and reused receipts. Any of those counts makes audit return FAIL; lookup
+failure is UNVERIFIED. The audit detects bypasses; it cannot prevent them.
 
 Run fixtures with `bash tests/test-merge-precheck.sh`. The three recorded
 read-only replays in `tests/fixtures/merge-precheck-replays.json` are merges

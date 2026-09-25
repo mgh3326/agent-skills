@@ -31,6 +31,7 @@ from gate_common import POLICY_PATH, PolicyError, file_ref, load_policy, write_r
 
 VERSION = "merge-precheck/1.0.0"
 SHA = re.compile(r"^[0-9a-f]{40}$")
+SHA256 = re.compile(r"^[0-9a-f]{64}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})\s*$")
 META = re.compile(r"^(TASK|REPO|PR|TESTER_JOB|TESTER_SESSION|HEAD|OWNER|JOIN):\s*(.+?)\s*$")
 DISPOSITION = re.compile(r"\bdisposition(?:_ref)?:\s*([^\s,;]+)", re.I)
@@ -59,7 +60,12 @@ def parse_time(value: str) -> datetime:
 
 
 def run_json(argv: list[str], timeout: int = 30) -> Any:
-    completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    try:
+        completed = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError("LOOKUP_TIMEOUT") from exc
+    except OSError as exc:
+        raise RuntimeError("LOOKUP_UNAVAILABLE") from exc
     if completed.returncode:
         raise RuntimeError("LOOKUP_FAILED")
     try:
@@ -105,7 +111,8 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
         H = structured.get("H")
         metadata = {key: structured.get(key.lower()) for key in ("TASK", "REPO", "PR", "TESTER_JOB", "TESTER_SESSION")}
         return {"ref": ref, "verdict": verdict, "H": H, "metadata": metadata, "issues": structured.get("issues", []), "text": content}
-    fenced = False
+    fence: tuple[str, int] | None = None
+    html_comment = False
     brief_level: int | None = None
     last = None
     metadata: dict[str, str] = {}
@@ -113,11 +120,23 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
     risks_section = False
     for line in content.splitlines():
         stripped = line.strip()
-        if re.match(r"^\s*(?:```|~~~)", line):
-            fenced = not fenced
+        marker = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if fence is not None:
+            if marker and marker.group(1)[0] == fence[0] and len(marker.group(1)) >= fence[1] and not marker.group(2).strip():
+                fence = None
+            continue
+        if marker:
+            fence = (marker.group(1)[0], len(marker.group(1)))
+            continue
+        if html_comment:
+            if "-->" in line:
+                html_comment = False
+            continue
+        if "<!--" in line:
+            html_comment = "-->" not in line.split("<!--", 1)[1]
             continue
         heading = re.match(r"^(#{1,6})\s+(.+)$", line)
-        if heading and not fenced:
+        if heading:
             level = len(heading.group(1))
             if brief_level is not None and (brief_level == 0 or level <= brief_level):
                 brief_level = None
@@ -130,7 +149,7 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
             continue
         if brief_level is not None:
             continue
-        if fenced or re.match(r"^\s*>", line):
+        if re.match(r"^\s*>", line):
             continue
         match = VERDICT.fullmatch(line)
         if match:
@@ -143,9 +162,11 @@ def parse_report(path: str | None, expected_hash: str | None = None) -> dict[str
         if issue:
             ref_match = DISPOSITION.search(issue.group(2))
             issues.append({"class": issue.group(1).upper(), "disposition_ref": ref_match.group(1) if ref_match else ""})
-        elif risks_section and re.match(r"^\s*[-*]\s+", line) and not re.search(r"\b(?:none|no risks|0 risks)\b", line, re.I):
-            ref_match = DISPOSITION.search(line)
-            issues.append({"class": "RISK", "disposition_ref": ref_match.group(1) if ref_match else ""})
+        elif risks_section and re.match(r"^\s*[-*]\s+", line):
+            bullet = re.sub(r"^\s*[-*]\s+", "", line).strip()
+            if not re.fullmatch(r"(?:none|no risks|0 risks)[.!]?", bullet, re.I):
+                ref_match = DISPOSITION.search(line)
+                issues.append({"class": "RISK", "disposition_ref": ref_match.group(1) if ref_match else ""})
     return {"ref": ref, "verdict": last[0] if last else None, "H": last[1] if last else metadata.get("HEAD"),
             "metadata": metadata, "issues": issues, "text": content}
 
@@ -222,6 +243,8 @@ def check_base(snapshot: dict[str, Any], ci: dict[str, Any]) -> dict[str, Any]:
         return result("UNVERIFIED", "TRIAL_MERGE_UNBOUND")
     if any(job.get("base_sha") != B for job in ci.get("jobs", [])):
         return result("UNVERIFIED", "BASE_AFTER_CI_UNKNOWN")
+    if ci.get("status") != "PASS" or not ci.get("jobs"):
+        return result("UNVERIFIED", "CI_BASE_UNPROVEN")
     return result("PASS", "BASE_AND_MERGE_CURRENT", behind=0, M=M,
                   merge_command=f"gh pr merge {snapshot['PR']} -R {snapshot['repo']} --merge --match-head-commit {H}")
 
@@ -266,9 +289,11 @@ def check_diff(snapshot: dict[str, Any], policy: dict[str, Any]) -> tuple[dict[s
 def check_surface(snapshot: dict[str, Any], surface: dict[str, Any]) -> dict[str, Any]:
     if surface["surface_class"] == "unknown":
         return result("UNVERIFIED", "SURFACE_UNKNOWN")
-    declared = snapshot.get("surface_class")
-    if surface["flags"] and declared != surface["surface_class"]:
-        return result("UNVERIFIED", "SURFACE_CLASS_UNBOUND", **surface)
+    if surface["flags"]:
+        eligible = snapshot.get("eligibility_receipt")
+        declared = eligible.get("data", {}).get("surface_class") if isinstance(eligible, dict) else None
+        if declared != surface["surface_class"]:
+            return result("UNVERIFIED", "SURFACE_CLASS_UNBOUND", **surface)
     return result("PASS", "SURFACE_FLAGS_RECORDED", **surface)
 
 
@@ -316,12 +341,14 @@ def check_runtime(snapshot: dict[str, Any], policy: dict[str, Any]) -> dict[str,
     paths = [f.get("filename", "") for f in snapshot["files"]]
     repo = snapshot["repo"]
     entries = policy.get("runtime", {}).get(repo, [])
-    relevant = [p for p in paths if p.endswith((".py", ".service", ".service.example", "Dockerfile", "pyproject.toml", "uv.lock")) or p.startswith(("runners/", "deploy/"))]
-    if not relevant:
-        return result("N/A", "RUNTIME_SURFACE_ABSENT", policy_ref="runtime")
-    matched = [entry for entry in entries if any(fnmatch.fnmatch(path, glob) for path in relevant for glob in entry.get("code_globs", []) + entry.get("dependency_globs", []))]
-    if not matched or len(matched) != 1:
+    matched = [entry for entry in entries if any(fnmatch.fnmatch(path, glob) for path in paths for glob in entry.get("code_globs", []) + entry.get("dependency_globs", []))]
+    if len(matched) > 1:
         return result("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN")
+    if not matched:
+        relevant = [p for p in paths if p.endswith((".py", ".service", ".service.example", "Dockerfile", "pyproject.toml", "uv.lock")) or fnmatch.fnmatch(p, "requirements*.txt") or p.startswith(("runners/", "deploy/", "scripts/"))]
+        if relevant:
+            return result("UNVERIFIED", "RUNTIME_TARGET_UNKNOWN")
+        return result("N/A", "RUNTIME_SURFACE_ABSENT", policy_ref="runtime")
     entry = matched[0]
     receipt = snapshot.get("runtime_receipt")
     if not receipt or receipt.get("error"):
@@ -351,13 +378,27 @@ def check_hash(snapshot: dict[str, Any]) -> dict[str, Any]:
     cited = {sha.lower() for content in texts for sha in ARTIFACT_SHA.findall(content)}
     if not cited:
         return result("N/A", "ARTIFACT_HASH_NOT_CITED", policy_ref="artifact_hash", note="Post-merge binary hashes are not verified by this tool.")
-    receipt = snapshot.get("hash_receipt")
-    if not receipt or receipt.get("error"):
+    receipts = snapshot.get("hash_receipts")
+    if receipts is None:
+        receipts = [snapshot["hash_receipt"]] if snapshot.get("hash_receipt") else []
+    if not receipts or any(not receipt or receipt.get("error") for receipt in receipts):
         return result("UNVERIFIED", "ARTIFACT_HASH_RECEIPT_MISSING", cited_count=len(cited))
-    data = receipt.get("data", {})
-    if data.get("kind") != "artifact-hash" or data.get("H") != snapshot["H"] or data.get("repo") != snapshot["repo"] or data.get("PR") != snapshot["PR"] or data.get("issuer") in (None, "", snapshot.get("issuer")) or data.get("sha256", "").lower() not in cited or not data.get("artifact_ref"):
-        return result("UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
-    return result("PASS", "ARTIFACT_HASH_INDEPENDENT", receipt=receipt["ref"], note="Post-merge binary hashes are not verified by this tool.")
+    bound: set[str] = set()
+    for receipt in receipts:
+        data = receipt.get("data", {})
+        if data.get("kind") != "artifact-hash" or data.get("H") != snapshot["H"] or data.get("repo") != snapshot["repo"] or data.get("PR") != snapshot["PR"] or data.get("issuer") in (None, "", snapshot.get("issuer")):
+            return result("UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
+        artifacts = data.get("artifacts") or [{"sha256": data.get("sha256"), "artifact_ref": data.get("artifact_ref")}]
+        if not isinstance(artifacts, list) or not artifacts:
+            return result("UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
+        for artifact in artifacts:
+            sha = artifact.get("sha256", "").lower() if isinstance(artifact, dict) else ""
+            if not SHA256.fullmatch(sha) or sha not in cited or not artifact.get("artifact_ref"):
+                return result("UNVERIFIED", "ARTIFACT_HASH_UNBOUND")
+            bound.add(sha)
+    if bound != cited:
+        return result("UNVERIFIED", "ARTIFACT_HASH_RECEIPT_MISSING", cited_count=len(cited), bound_count=len(bound))
+    return result("PASS", "ARTIFACT_HASH_INDEPENDENT", receipts=[receipt["ref"] for receipt in receipts], note="Post-merge binary hashes are not verified by this tool.")
 
 
 def evaluate(snapshot: dict[str, Any], policy: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -450,7 +491,7 @@ def gather_live(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str, A
         "builder_report": parse_report(args.builder_report, args.builder_report_sha256),
         "eligibility_receipt": read_json_receipt(args.eligibility_receipt),
         "runtime_receipt": read_json_receipt(args.runtime_receipt),
-        "hash_receipt": read_json_receipt(args.hash_receipt),
+        "hash_receipts": [read_json_receipt(path) for path in (args.hash_receipt or [])],
         "ci_runs": [], "ci_jobs": {}, "files": None, "scan": None, "job_events": None, "tester_events": None,
         "task_record": None, "head_to_base": None, "M": None, "merge_parents": []}
     try:
@@ -483,9 +524,6 @@ def gather_live(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str, A
     except (RuntimeError, KeyError, TypeError, OSError, UnicodeError):
         # Independent checks remain UNVERIFIED when one GitHub lookup fails.
         pass
-    snapshot["surface_class"] = args.surface_class
-    if snapshot["eligibility_receipt"] and not snapshot["eligibility_receipt"].get("error"):
-        snapshot["surface_class"] = snapshot["eligibility_receipt"]["data"].get("surface_class", snapshot["surface_class"])
     H = snapshot.get("H")
     if isinstance(H, str) and SHA.fullmatch(H):
         try:
@@ -526,9 +564,20 @@ def gather_live(args: argparse.Namespace, policy: dict[str, Any]) -> dict[str, A
     return snapshot
 
 
+def passing_merge_receipt(receipt: dict[str, Any]) -> bool:
+    checks = receipt.get("checks")
+    return isinstance(checks, dict) and all(
+        isinstance(checks.get(f"G{number}"), dict) and checks[f"G{number}"].get("status") in ("PASS", "N/A")
+        for number in range(1, 11)
+    )
+
+
 def audit(receipt_dir: Path, policy: dict[str, Any], since: str) -> dict[str, Any]:
     """Anti-join actual merged PRs and wrk spawns against pre-action receipts."""
-    start = parse_time(since)
+    try:
+        start = parse_time(since)
+    except (ValueError, TypeError):
+        return {"status": "UNVERIFIED", "reason_code": "AUDIT_TIME_INVALID"}
     receipts = []
     try:
         for path in receipt_dir.expanduser().glob("*.json"):
@@ -559,7 +608,7 @@ def audit(receipt_dir: Path, policy: dict[str, Any], since: str) -> dict[str, An
                 actions.append({"kind": "spawn", "job": row.get("job_id"), "at": row["created_at"]})
     except (RuntimeError, KeyError, OSError, ValueError):
         return {"status": "UNVERIFIED", "reason_code": "AUDIT_LEDGER_LOOKUP_FAILED"}
-    counts = {"actions": len(actions), "no_receipt": 0, "receipt_after_action": 0, "reused_receipt": 0}
+    counts = {"actions": len(actions), "no_receipt": 0, "receipt_after_action": 0, "receipt_not_pass": 0, "reused_receipt": 0}
     uses: dict[str, int] = {}
     for action in actions:
         matches = [r for r in receipts if r.get("kind") == action["kind"] and (
@@ -567,8 +616,15 @@ def audit(receipt_dir: Path, policy: dict[str, Any], since: str) -> dict[str, An
             or (action["kind"] == "spawn" and r.get("job") == action["job"]))]
         if not matches:
             counts["no_receipt"] += 1
-        elif all(parse_time(r["time"]) > parse_time(action["at"]) for r in matches):
-            counts["receipt_after_action"] += 1
+        else:
+            try:
+                earlier = [r for r in matches if parse_time(r["time"]) <= parse_time(action["at"])]
+            except (KeyError, ValueError, TypeError):
+                return {"status": "UNVERIFIED", "reason_code": "AUDIT_RECEIPT_TIME_INVALID"}
+            if not earlier:
+                counts["receipt_after_action"] += 1
+            elif action["kind"] == "merge" and not any(passing_merge_receipt(r) for r in earlier):
+                counts["receipt_not_pass"] += 1
         for receipt in matches:
             uses[receipt["action_id"]] = uses.get(receipt["action_id"], 0) + 1
     ids: dict[str, int] = {}
@@ -577,7 +633,8 @@ def audit(receipt_dir: Path, policy: dict[str, Any], since: str) -> dict[str, An
         if isinstance(action_id, str):
             ids[action_id] = ids.get(action_id, 0) + 1
     counts["reused_receipt"] = len({action_id for action_id, count in uses.items() if count > 1} | {action_id for action_id, count in ids.items() if count > 1})
-    return {"status": "PASS", "reason_code": "AUDIT_COMPLETE", "since": since, **counts}
+    bypass = any(counts[key] for key in ("no_receipt", "receipt_after_action", "receipt_not_pass", "reused_receipt"))
+    return {"status": "FAIL" if bypass else "PASS", "reason_code": "AUDIT_BYPASS_DETECTED" if bypass else "AUDIT_COMPLETE", "since": since, **counts}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -593,9 +650,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--builder-report-sha256")
     parser.add_argument("--eligibility-receipt")
     parser.add_argument("--runtime-receipt")
-    parser.add_argument("--hash-receipt")
+    parser.add_argument("--hash-receipt", action="append")
     parser.add_argument("--deploy-note")
-    parser.add_argument("--surface-class")
     parser.add_argument("--issuer", default="director-1")
     parser.add_argument("--receipt-dir", default=str(Path.home() / "work/herdr-inbox/receipts"))
     parser.add_argument("--policy", default=str(POLICY_PATH))
@@ -604,6 +660,9 @@ def main(argv: list[str] | None = None) -> int:
     try:
         policy, policy_ref = load_policy(args.policy)
     except PolicyError as exc:
+        if args.repo == "audit":
+            print(json.dumps({"status": "UNVERIFIED", "reason_code": exc.code}, sort_keys=True))
+            return 2
         try:
             ref = file_ref(args.policy)
         except OSError:
@@ -637,7 +696,7 @@ def main(argv: list[str] | None = None) -> int:
                      "eligibility_receipt": snapshot["eligibility_receipt"].get("ref") if snapshot["eligibility_receipt"] else None,
                      "ci_jobs": checks["G3"].get("jobs", []),
                      "runtime_receipt": snapshot["runtime_receipt"].get("ref") if snapshot["runtime_receipt"] else None,
-                     "hash_receipt": snapshot["hash_receipt"].get("ref") if snapshot["hash_receipt"] else None},
+                     "hash_receipts": [receipt.get("ref") for receipt in snapshot["hash_receipts"]]},
         "checks": checks,
         "merge_command": f"gh pr merge {args.pr} -R {args.repo} --merge --match-head-commit {snapshot['H']}" if snapshot.get("H") else None,
         "merge_path_limit": "--match-head-commit pins H; it does not atomically pin B. Re-read remote B and H immediately before merge. No post-merge binary hash is verified."}
