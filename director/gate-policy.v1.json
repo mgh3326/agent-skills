@@ -1,0 +1,53 @@
+{
+  "schema": 1,
+  "revision": "2026-09-25.1",
+  "effective_at": "2026-09-25T06:17:38Z",
+  "expires_at": "2026-10-02T06:17:38Z",
+  "conflicts": [],
+  "sources": {
+    "throughput_decision": {"key": "decision/2026-09-25/director-throughput-adopted", "id": 3231},
+    "throughput_advice": {"key": "advice/2026-09-25/director-throughput-astra", "id": 3243},
+    "provider_grade": {"key": "decision/2026-09-20/provider-family-and-ds41-grade", "id": 2227, "scope": "A+ reversible T1/T2 verification only"},
+    "ci_rule": {"task": 723, "scope": "repository test and build jobs at H, B and trial M"},
+    "runtime_fix": {"task": 695, "scope": "operator NCP Python 3.11 entrypoints"},
+    "artifact_hash": {"task": 660, "scope": "independent artifact hash receipt"},
+    "checker_gate": {"path": "checker/SKILL.md", "section": "G1-G8"},
+    "director_gate": {"path": "director/SKILL.md", "section": "merge gate"}
+  },
+  "ci": {
+    "mgh3326/agent-skills": {
+      ".github/workflows/ci.yml": ["ubuntu-latest", "macos-latest"]
+    },
+    "mgh3326/handoffkeep": {
+      ".github/workflows/ci.yml": ["test", "vitest", "build (darwin, arm64)", "build (linux, amd64)", "build (linux, arm64)"],
+      ".github/workflows/image.yml": ["image"]
+    },
+    "mgh3326/panewire": {
+      ".github/workflows/ci.yml": ["test (macos-latest)", "test (ubuntu-latest)"]
+    },
+    "mgh3326/scopefuel": {
+      ".github/workflows/ci.yml": ["test (macos-latest, 3.11)", "test (macos-latest, 3.13)", "test (macos-latest, 3.14)", "test (ubuntu-latest, 3.11)", "test (ubuntu-latest, 3.13)", "test (ubuntu-latest, 3.14)"]
+    },
+    "mgh3326/auto_trader": {
+      "branch_protection": ["lint", "taskiq-smoke", "test (3.13, 1)", "test (3.13, 2)", "test (3.13, 3)", "test (3.13, 4)"]
+    },
+    "mgh3326/auto_trader-operator": {
+      ".github/workflows/test.yml": ["test"]
+    }
+  },
+  "runtime": {
+    "mgh3326/auto_trader-operator": [
+      {
+        "service": "ncp-operator-runners",
+        "target": "NCP",
+        "code_globs": ["runners/**", "deploy/**", "scripts/**"],
+        "dependency_globs": ["pyproject.toml", "uv.lock", "requirements*.txt"],
+        "interpreter": "/usr/bin/python3.11",
+        "version_prefix": "3.11.",
+        "source": "runtime_fix"
+      }
+    ]
+  },
+  "runtime_unknown_repositories": ["mgh3326/auto_trader", "mgh3326/handoffkeep", "mgh3326/scopefuel", "mgh3326/panewire", "mgh3326/agent-skills"],
+  "artifact_paths": ["*.pyc", "*.class", "*.o", "*.a", "*.so", "*.dylib", "*.exe", "*.whl", "*.tar.gz", "*.zip", "dist/**", "build/**", "target/**", "node_modules/**", "__pycache__/**"]
+}

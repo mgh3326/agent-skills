@@ -17,6 +17,9 @@ jobs:
         os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
       - name: Install ShellCheck
         shell: bash
         run: |
@@ -45,6 +48,7 @@ jobs:
             tests/test-input-line-not-evidence.sh \
             tests/test-tester-family-policy.sh \
             tests/test-tester-eligible.sh \
+            tests/test-merge-precheck.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
       - name: Bash tests
         env:
@@ -69,3 +73,4 @@ jobs:
           bash tests/test-input-line-not-evidence.sh
           bash tests/test-tester-family-policy.sh
           bash tests/test-tester-eligible.sh
+          bash tests/test-merge-precheck.sh
