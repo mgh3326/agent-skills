@@ -296,6 +296,40 @@ class MergePrecheckTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_FAILED", mutant["reason_code"])
 
+    def test_ci_retry_without_a_start_time_fails_closed_with_assertion_red_mutants(self) -> None:
+        def retry_without_start(attempt: object) -> dict:
+            s = snapshot()
+            red = copy.deepcopy(s["ci_runs"][0])
+            red.update({"run_attempt": attempt, "conclusion": "failure"})
+            red.pop("run_started_at")
+            green = copy.deepcopy(s["ci_runs"][0])
+            green.update({"id": 11, "created_at": "2026-09-25T07:05:00Z", "run_started_at": "2026-09-25T07:05:00Z"})
+            s["ci_runs"] = [red, green]
+            s["ci_jobs"][11] = copy.deepcopy(s["ci_jobs"][10])
+            for job in s["ci_jobs"][11]:
+                job["id"] += 100
+                job["run_id"] = 11
+            return s
+
+        for attempt in (2, "2", None, True, 2.0):
+            with self.subTest(attempt=attempt):
+                s = retry_without_start(attempt)
+                assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_TIME_INVALID")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        fallback = "if raw is None and type(attempt) is int and attempt == 1:"
+        self.assertEqual(1, source.count(fallback))
+        s = retry_without_start(2)
+        namespace: dict = {"__name__": "ci_retry_time_mutant"}
+        exec(source.replace(fallback, "if raw is None:"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_RUN_TIME_INVALID", mutant["reason_code"])
+        namespace = {"__name__": "ci_retry_attempt_mutant"}
+        exec(source.replace("type(attempt) is int and attempt == 1", "type(attempt) is int and attempt <= 2"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_RUN_TIME_INVALID", mutant["reason_code"])
+
     def test_ci_collector_race_with_newer_job_attempt_is_not_met(self) -> None:
         for status, conclusion in (("completed", "failure"), ("in_progress", None)):
             with self.subTest(status=status):
@@ -316,6 +350,19 @@ class MergePrecheckTests(unittest.TestCase):
             {**copy.deepcopy(job), "id": job["id"] + 100, "run_attempt": 2, "conclusion": "failure"}
             for job in s["ci_jobs"][10]
         ]
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+        source_guard = "if type(run_id) is not int or type(job.get(\"run_id\")) is not int or job.get(\"run_id\") != run_id:"
+        self.assertEqual(1, source.count(source_guard))
+        s = snapshot()
+        s["ci_jobs"][10] += [
+            {**copy.deepcopy(job), "id": job["id"] + 200, "run_id": 9, "run_attempt": 0}
+            for job in s["ci_jobs"][10]
+        ]
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
+        namespace = {"__name__": "ci_foreign_job_mutant"}
+        exec(source.replace(source_guard, "if False:"), namespace)
         mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
@@ -345,6 +392,52 @@ class MergePrecheckTests(unittest.TestCase):
         mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
         with self.assertRaises(AssertionError):
             self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+        s = snapshot()
+        s["ci_runs"][0]["id"] = 0
+        s["ci_jobs"][0] = s["ci_jobs"].pop(10)
+        for job in s["ci_jobs"][0]:
+            job["run_id"] = 0
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
+        run_id_guard = "type(run_id) is int and run_id > 0"
+        self.assertEqual(1, source.count(run_id_guard))
+        namespace = {"__name__": "ci_zero_run_id_mutant"}
+        exec(source.replace(run_id_guard, "type(run_id) is int"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+        s = snapshot()
+        s["ci_runs"][0]["run_attempt"] = 0
+        for job in s["ci_jobs"][10]:
+            job["run_attempt"] = 0
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_EVIDENCE_BINDING_INVALID")
+        attempt_guard = "type(attempt) is int and attempt > 0"
+        self.assertEqual(1, source.count(attempt_guard))
+        namespace = {"__name__": "ci_zero_attempt_mutant"}
+        exec(source.replace(attempt_guard, "type(attempt) is int"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_EVIDENCE_BINDING_INVALID", mutant["reason_code"])
+
+    def test_ci_equal_start_times_from_different_runs_are_ambiguous(self) -> None:
+        s = snapshot()
+        s["ci_runs"][0].update({"run_attempt": 2, "conclusion": "failure"})
+        for job in s["ci_jobs"][10]:
+            job.update({"run_attempt": 2, "conclusion": "failure"})
+        green = copy.deepcopy(snapshot()["ci_runs"][0])
+        green["id"] = 11
+        s["ci_runs"].append(green)
+        s["ci_jobs"][11] = copy.deepcopy(snapshot()["ci_jobs"][10])
+        for job in s["ci_jobs"][11]:
+            job.update({"id": job["id"] + 100, "run_id": 11})
+        assert_check(self, s, "G3", "UNVERIFIED", "CI_RUN_AMBIGUOUS")
+        source = (ROOT / "director/ci_canonical.py").read_text()
+        guard = 'if len(selected) > 1 and order[id(selected[-1])] == order[id(selected[-2])] and selected[-1].get("id") != selected[-2].get("id"):'
+        self.assertEqual(1, source.count(guard))
+        namespace: dict = {"__name__": "ci_equal_time_mutant"}
+        exec(source.replace(guard, "if False:"), namespace)
+        mutant = namespace["evaluate_required_ci"](policy(), s["repo"], H, B, s["ci_runs"], s["ci_jobs"])
+        with self.assertRaises(AssertionError):
+            self.assertEqual("CI_RUN_AMBIGUOUS", mutant["reason_code"])
 
     def test_required_test_step_must_execute(self) -> None:
         s = snapshot()
