@@ -57,10 +57,18 @@ split. split contains parent_task (never the task itself), part=core or
 peripheral, and the core approval-boundary list boundary={paths, symbols}
 (paths and symbols that are core: guard wiring, safety DB constraints,
 error paths, lock/transaction lifetime, state/DB/exception boundary).
-parent_t may be given and must be T3 when present. Instead of an inline
-boundary, split.contract_path may name a repo-relative JSON file present
-at head whose contents supply the boundary (a top-level boundary object
-or bare paths/symbols); when both are given they must match. Optional
+parent_task must be a string or integer and parent_t, when given, must
+be T3. A peripheral part must also name split.contract_path: a
+repo-relative JSON file present at head whose contents supply the
+boundary (a top-level boundary object or bare paths/symbols). A contract
+is a reviewed, versioned source for the boundary; a self-declared inline
+boundary cannot approve a peripheral part on its own, though an inline
+boundary may be given alongside the contract and must then match it
+member-for-member. A core part may rely on an inline boundary. Paths are
+normalized before comparison (a leading ./, doubled slashes, and empty
+segments collapse; absolute paths, .., backslashes, and control
+characters are rejected), and path and symbol lists are sorted before
+hashing so reordered members are the same boundary. Optional
 split.behaviour_checks lists {id, result, ref} evidence where result is
 pass or fail.
 
@@ -68,19 +76,28 @@ For a peripheral part the command compares the changed paths, the changed
 symbols and call relations (a changed call site into a core symbol counts,
 including added or removed lines and the enclosing-function hunk context),
 removed definitions still referenced from boundary paths at head, and the
-declared boundary. Touching the boundary — a boundary path, the contract
-file, a core symbol, an import of a boundary module, or a removed symbol
-still referenced from core — is FAIL with reason PERIPHERAL_TOUCHES_CORE
-and the part must be re-run as T3. A missing or unusable boundary, an
-unreadable diff, a binary or uninspectable change, a failed or malformed
-behaviour check, or anything else that cannot be classified is UNVERIFIED
-with NEEDS_CLASSIFICATION or SPLIT_BOUNDARY_MISSING — never a lower T.
-The boundary is required for both parts; a core declaration without a
-usable boundary is SPLIT_BOUNDARY_MISSING. A clean peripheral keeps its
-declared T subject to the existing surface floor. A core part always
-raises the floor to T3 regardless of the diff shape. The receipt records the split verbatim and split_analysis with the
-boundary list hash, the contract hash, and the detected core touches;
-the split declaration is bound to the previous receipt, so a changed
+boundary from the contract. Identifiers bound to a boundary module or
+symbol at head — an import alias (from boundary import x as y, import
+boundary.mod as m) or an assignment whose value names a boundary symbol
+or module — count as boundary names too, so calls through an alias are
+still touches. Touching the boundary — a boundary path, the contract
+file, a core symbol or bound alias, an import of a boundary module, or a
+removed symbol still referenced from core — is FAIL with reason
+PERIPHERAL_TOUCHES_CORE and the part must be re-run as T3. A missing or
+unusable boundary or contract, an unreadable diff, a binary or
+uninspectable change, a dynamically assembled name (a non-literal
+getattr/setattr/delattr, exec, eval, __import__, importlib, globals, or
+vars use that cannot be resolved to a literal), a failed or malformed
+behaviour check, or anything else that cannot be classified is
+UNVERIFIED with NEEDS_CLASSIFICATION or SPLIT_BOUNDARY_MISSING — never
+a lower T. The boundary is required for both parts; a core declaration
+without a usable boundary is SPLIT_BOUNDARY_MISSING. A clean peripheral
+keeps its declared T subject to the existing surface floor. A core part
+always raises the floor to T3 regardless of the diff shape. The receipt
+records the split verbatim and split_analysis with the parent task, the
+part, the boundary list hash, the contract path and hash, the paths
+checked, the detected core touches, and the unclassifiable paths; the
+split declaration is bound to the previous receipt, so a changed
 declaration invalidates earlier stages.
 
 At pre-merge the tester provides report_path and report_sha256. The report

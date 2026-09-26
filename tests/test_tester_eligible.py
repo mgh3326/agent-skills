@@ -662,6 +662,9 @@ class EligibilityFixtures(unittest.TestCase):
 class SplitFixtures(EligibilityFixtures):
     """Mixed-grade T3 split: peripheral parts must not touch the core boundary."""
 
+    CONTRACT = "splits/733.json"
+    BOUNDARY = {"paths": ["services/lease_release.py"], "symbols": ["release_lease"]}
+
     def setUp(self) -> None:
         super().setUp()
         self.root = self.base
@@ -686,10 +689,19 @@ class SplitFixtures(EligibilityFixtures):
         self.base = git(self.repo, "rev-parse", "HEAD")
         return self.base
 
+    def write_contract(self, boundary: dict | str | None = None, path: str | None = None) -> str:
+        """Commit a boundary contract at base so the peripheral diff cannot author it."""
+        name = path or self.CONTRACT
+        if boundary is None:
+            boundary = self.BOUNDARY
+        content = boundary if isinstance(boundary, str) else json.dumps({"boundary": boundary})
+        self.commit({name: content})
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        return name
+
     def split(self, **changes: object) -> dict:
         declaration = {"parent_task": "733", "parent_t": "T3", "part": "peripheral",
-                       "boundary": {"paths": ["services/lease_release.py"],
-                                    "symbols": ["release_lease"]}}
+                       "contract_path": self.CONTRACT}
         declaration.update(changes)
         return declaration
 
@@ -697,7 +709,8 @@ class SplitFixtures(EligibilityFixtures):
         self.seed({"services/lease_release.py":
                    "def release_lease(order):\n    ledger.record(order)\n\n"
                    "def post_send_cleanup(order):\n    release_lease(order)\n",
-                   "ui/dashboard.py": "def render(row):\n    return str(row)\n"})
+                   "ui/dashboard.py": "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary": self.BOUNDARY})})
 
     def test_728_pr2_shape_touches_core_path(self) -> None:
         # #728 PR 2: a UI PR that also carried the post-send release fix.
@@ -723,34 +736,44 @@ class SplitFixtures(EligibilityFixtures):
         self.assertEqual(eligible.overall(checks), "PASS")
 
     def test_one_line_guard_call_in_ui_file_fails(self) -> None:
-        self.release_core()
+        self.write_contract({"paths": [], "symbols": ["guard_order"]})
         head = self.commit({"ui/dashboard.py":
                             "def render(row):\n    guard_order(row)\n    return str(row)\n"})
-        evidence = self.evidence(head, declared_t="T1",
-                                 split=self.split(boundary={"paths": [], "symbols": ["guard_order"]}))
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
         checks = self.check(evidence)
         self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
         self.assertEqual(checks["split"]["touches"][0]["kind"], "call")
 
-    def test_missing_boundary_is_unverified(self) -> None:
+    def test_missing_contract_is_unverified(self) -> None:
         self.release_core()
         head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
-        for boundary in (None, {}, {"paths": [], "symbols": []}, {"paths": "services/"}):
+        declaration = self.split()
+        declaration.pop("contract_path")
+        for boundary in (None, {}, {"paths": [], "symbols": []}, {"paths": "services/"},
+                         self.BOUNDARY):
             with self.subTest(boundary=boundary):
-                declaration = self.split()
-                if boundary is None:
-                    declaration.pop("boundary")
-                else:
+                if boundary is not None:
                     declaration["boundary"] = boundary
+                else:
+                    declaration.pop("boundary", None)
                 self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
                                  "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
+        declaration = self.split(contract_path="splits/absent.json")
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
         declaration = self.split(part="side")
         self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
                          "split", "UNVERIFIED", "SPLIT_INVALID")
         declaration = self.split(parent_task="726")
         self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
                          "split", "UNVERIFIED", "SPLIT_INVALID")
+        declaration = self.split(parent_task=["733"])
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_INVALID")
         declaration = self.split(parent_t="T2")
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_INVALID")
+        declaration = self.split(part=[])
         self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
                          "split", "UNVERIFIED", "SPLIT_INVALID")
 
@@ -758,7 +781,7 @@ class SplitFixtures(EligibilityFixtures):
         self.release_core()
         head = self.commit({"services/lease_release.py":
                             "def release_lease(order):\n    ledger.record(order)\n"})
-        declaration = self.split(part="core")
+        declaration = self.split(part="core", boundary=dict(self.BOUNDARY))
         evidence = self.evidence(head, declared_t="T2", split=declaration)
         checks = self.check(evidence)
         self.assert_case(checks, "split", "PASS", "SPLIT_CORE_DECLARED")
@@ -781,7 +804,8 @@ class SplitFixtures(EligibilityFixtures):
     def test_removed_guard_call_also_fails(self) -> None:
         self.seed({"services/lease_release.py":
                    "def release_lease(order):\n    ledger.record(order)\n",
-                   "ui/dashboard.py": "def render(row):\n    release_lease(row)\n    return str(row)\n"})
+                   "ui/dashboard.py": "def render(row):\n    release_lease(row)\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary": self.BOUNDARY})})
         head = self.commit({"ui/dashboard.py": "def render(row):\n    return str(row)\n"})
         evidence = self.evidence(head, declared_t="T1", split=self.split())
         self.assert_case(self.check(evidence), "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
@@ -790,11 +814,11 @@ class SplitFixtures(EligibilityFixtures):
         self.seed({"ui/helpers.py":
                    "def check_order_guard(order):\n    return True\n\n"
                    "def label(order):\n    return order['id']\n"})
+        self.write_contract({"paths": ["safety/"], "symbols": ["check_order_guard"]})
         head = self.commit({"ui/helpers.py":
                             "def check_order_guard(order):\n    return order.get('ok', True)\n\n"
                             "def label(order):\n    return order['id']\n"})
-        declaration = self.split(boundary={"paths": ["safety/"], "symbols": ["check_order_guard"]})
-        checks = self.check(self.evidence(head, declared_t="T1", split=declaration))
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
         self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
         self.assertEqual(checks["split"]["touches"][0]["kind"], "enclosing")
 
@@ -804,13 +828,64 @@ class SplitFixtures(EligibilityFixtures):
                             "def render(row):\n    fn = getattr(svc, 'release_lease')\n    return fn(row)\n"})
         self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
                          "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.release_core()
         head = self.commit({"ui/dashboard.py":
                             "import services.lease_release\n"
                             "def render(row):\n    return str(row)\n"})
-        declaration = self.split(boundary={"paths": ["services/lease_release.py"], "symbols": []})
-        checks = self.check(self.evidence(head, declared_t="T1", split=declaration))
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
         self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
         self.assertIn("import", {touch["kind"] for touch in checks["split"]["touches"]})
+
+    def test_alias_and_bound_name_calls_fail(self) -> None:
+        self.seed({"ui/dashboard.py":
+                   "from services.lease_release import release_lease as cleanup\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary": self.BOUNDARY})})
+        head = self.commit({"ui/dashboard.py":
+                            "from services.lease_release import release_lease as cleanup\n"
+                            "def render(row):\n    cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.seed({"ui/dashboard.py":
+                   "svc = services.lease_release\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary": self.BOUNDARY})})
+        head = self.commit({"ui/dashboard.py":
+                            "svc = services.lease_release\n"
+                            "def render(row):\n    svc.release_lease(row)\n    return str(row)\n"})
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_dynamic_assembly_is_needs_classification(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "def render(row):\n    fn = getattr(svc, 'relea' + 'se_lease')\n"
+                            "    return fn(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "def render(row):\n    exec(code)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "import importlib\n"
+                            "def render(row):\n    m = importlib.import_module(name)\n    return str(m)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_malformed_split_fields_do_not_crash(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
+        for malformed in (self.split(part=[]),
+                          self.split(part=42),
+                          self.split(behaviour_checks=[{"id": "x", "result": []}]),
+                          self.split(behaviour_checks=[{"id": []}]),
+                          self.split(contract_path=[])):
+            with self.subTest(malformed=malformed):
+                checks = self.check(self.evidence(head, declared_t="T1", split=malformed))
+                self.assertEqual(checks["split"]["status"], "UNVERIFIED")
 
     def test_removed_def_referenced_from_boundary_fails(self) -> None:
         self.seed({"services/order_flow.py":
@@ -818,50 +893,58 @@ class SplitFixtures(EligibilityFixtures):
                    "ui/format.py":
                    "def format_price(qty):\n    return f'{qty:.2f}'\n\n"
                    "def pad(text):\n    return text.center(8)\n"})
+        self.write_contract({"paths": ["services/"], "symbols": []})
         head = self.commit({"ui/format.py": "def pad(text):\n    return text.center(8)\n"})
-        declaration = self.split(boundary={"paths": ["services/"], "symbols": []})
-        checks = self.check(self.evidence(head, declared_t="T1", split=declaration))
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
         self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
         self.assertEqual(checks["split"]["touches"][0]["kind"], "removed_ref")
 
     def test_contract_path_supplies_boundary_and_tamper_fails(self) -> None:
         self.release_core()
-        self.commit({"director/splits/728.json": json.dumps({
-            "boundary": {"paths": ["services/lease_release.py"], "symbols": ["release_lease"]}})})
-        self.base = git(self.repo, "rev-parse", "HEAD")
         head = self.commit({"ui/dashboard.py": "def render(row):\n    return f'<b>{row}</b>'\n"})
-        declaration = self.split(contract_path="director/splits/728.json")
-        declaration.pop("boundary")
-        checks = self.check(self.evidence(head, declared_t="T1", split=declaration))
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
         self.assert_case(checks, "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
         head = self.commit({"ui/extra.py": "print('x')\n",
-                            "director/splits/728.json": json.dumps({"boundary": {"paths": []}})})
-        checks = self.check(self.evidence(head, declared_t="T1", split=declaration))
+                            self.CONTRACT: json.dumps({"boundary": {"paths": [], "symbols": []}})})
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
         self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
         self.assertIn("contract", {item["kind"] for item in checks["split"]["touches"]})
-        missing = self.split(contract_path="director/splits/absent.json")
-        missing.pop("boundary")
+        dot = self.split(contract_path="./splits/733.json")
+        checks = self.check(self.evidence(head, declared_t="T1", split=dot))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertIn("contract", {item["kind"] for item in checks["split"]["touches"]})
+        missing = self.split(contract_path="splits/absent.json")
         self.assert_case(self.check(self.evidence(head, declared_t="T1", split=missing)),
                          "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
 
+    def test_declaration_path_spellings_are_normalized(self) -> None:
+        self.write_contract({"paths": ["./services/lease_release.py"], "symbols": ["release_lease"]})
+        head = self.commit({"services/lease_release.py":
+                            "def release_lease(order):\n    ledger.record(order)\n    ledger.x(order)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.write_contract({"paths": ["services//lease_release.py"], "symbols": ["release_lease"]})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        for bad in ("../secrets.txt", "/abs/path", "a\\b"):
+            with self.subTest(bad=bad):
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split(contract_path=bad))),
+                                 "split", "UNVERIFIED", "SPLIT_INVALID")
+
     def test_contract_conflict_and_inline_consistency(self) -> None:
-        self.release_core()
-        self.commit({"director/splits/728.json": "{ not json"})
-        self.base = git(self.repo, "rev-parse", "HEAD")
+        self.write_contract("{ not json")
         head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
-        declaration = self.split(contract_path="director/splits/728.json")
-        declaration.pop("boundary")
-        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
                          "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
-        self.commit({"director/splits/728.json": json.dumps({
-            "boundary": {"paths": ["services/lease_release.py"], "symbols": ["release_lease"]}})})
-        self.base = git(self.repo, "rev-parse", "HEAD")
+        self.write_contract({"paths": ["services/lease_release.py", "safety/x.py"],
+                             "symbols": ["release_lease", "guard_order"]})
         head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['name']\n"})
-        matching = self.split(contract_path="director/splits/728.json")
-        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=matching)),
-                         "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
-        conflicting = self.split(contract_path="director/splits/728.json",
-                                 boundary={"paths": ["other/"], "symbols": ["other_sym"]})
+        matching = self.split(boundary={"paths": ["safety/x.py", "services/lease_release.py"],
+                                        "symbols": ["guard_order", "release_lease"]})
+        checks = self.check(self.evidence(head, declared_t="T1", split=matching))
+        self.assert_case(checks, "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
+        conflicting = self.split(boundary={"paths": ["other/"], "symbols": ["other_sym"]})
         self.assert_case(self.check(self.evidence(head, declared_t="T1", split=conflicting)),
                          "split", "UNVERIFIED", "SPLIT_BOUNDARY_CONFLICT")
 
@@ -893,7 +976,7 @@ class SplitFixtures(EligibilityFixtures):
         evidence = self.landed(self.evidence(head, declared_t="T1", split=self.split()))
         checks = self.check(evidence, "post-landing")
         self.assert_case(checks, "prior", "PASS", "PREVIOUS_RECEIPT_BOUND")
-        evidence["split"]["boundary"]["symbols"] = ["something_else"]
+        evidence["split"]["contract_path"] = "splits/other.json"
         self.assert_case(self.check(evidence, "post-landing"), "prior",
                          "UNVERIFIED", "EVIDENCE_CHANGED")
 
@@ -919,9 +1002,9 @@ class SplitFixtures(EligibilityFixtures):
         self.seed({"services/order_flow.py":
                    "def settle(order):\n    return format_price(order['qty'])\n",
                    "ui/format.py": "def format_price(qty):\n    return f'{qty:.2f}'\n"})
+        self.write_contract({"paths": ["services/"], "symbols": []})
         head = self.commit({"ui/format.py": "x = 1\n"})
-        evidence = self.evidence(head, declared_t="T1",
-                                 split=self.split(boundary={"paths": ["services/"], "symbols": []}))
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
         with mock.patch.object(eligible, "_referenced_from_boundary", return_value=[]):
             with self.assertRaises(AssertionError):
                 self.assert_case(self.check(evidence), "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")

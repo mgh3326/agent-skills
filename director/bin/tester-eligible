@@ -28,6 +28,12 @@ _REMOVED_DEF = re.compile(r"^-\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-
 _REMOVED_NAME = re.compile(r"^-([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]")
 _IMPORT_LINE = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_.]*)")
 _FROM_IMPORT = re.compile(r"^\s*from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\s+(.+)$")
+_FROM_ITEM = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?")
+_IMPORT_ALIAS = re.compile(r"^import\s+([A-Za-z_][A-Za-z0-9_.]*)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
+_BIND_LINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*=(?!=)(.*)$")
+_DYNAMIC_CALL = re.compile(r"\b(?:exec|eval|compile|__import__|globals|vars|importlib)\s*\(|\bimportlib\b")
+_ATTR_CALL = re.compile(r"\b(?:getattr|setattr|delattr)\s*\(")
+_ATTR_LITERAL = re.compile(r"(?:getattr|setattr|delattr)\s*\([^,]+,\s*(['\"])[A-Za-z_][A-Za-z0-9_.]*\1\s*[,)]")
 
 
 def _digest(value: object) -> str:
@@ -370,21 +376,38 @@ def _leaf(symbol: str) -> str | None:
     return tokens[-1] if tokens else None
 
 
+def _normalize_path(path: object) -> str | None:
+    """Canonical repo-relative path: collapses ./ and //; rejects .., /, \\."""
+    if not isinstance(path, str):
+        return None
+    text = path.strip()
+    if not text or text.startswith("/") or "\\" in text or any(ord(char) < 32 for char in text):
+        return None
+    parts = []
+    for segment in text.split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            return None
+        parts.append(segment)
+    return "/".join(parts) if parts else None
+
+
 def _normalize_boundary(raw: object) -> dict | None:
     if not isinstance(raw, dict):
         return None
     paths, symbols = raw.get("paths"), raw.get("symbols")
     if not isinstance(paths, list) or not isinstance(symbols, list):
         return None
-    if any(not isinstance(path, str) or not path.strip() or path.startswith("/") or
-           ".." in path.split("/") or any(ord(char) < 32 for char in path) for path in paths):
+    normalized = [_normalize_path(path) for path in paths]
+    if any(path is None for path in normalized):
         return None
     if any(not isinstance(symbol, str) or not symbol.strip() or _leaf(symbol) is None
            for symbol in symbols):
         return None
-    if not paths and not symbols:
+    if not normalized and not symbols:
         return None
-    return {"paths": [path.strip() for path in paths], "symbols": [symbol.strip() for symbol in symbols]}
+    return {"paths": sorted(set(normalized)), "symbols": sorted({symbol.strip() for symbol in symbols})}
 
 
 def _path_in_boundary(path: str, boundary: dict, contract_path: str | None) -> str | None:
@@ -425,6 +448,37 @@ def _import_modules(content: str) -> set[str]:
     inline = _IMPORT_LINE.match(content)
     if inline:
         names.add(inline.group(1))
+    return names
+
+
+def _module_in(module: str, modules: set[str]) -> bool:
+    return any(module == item or module.startswith(item + ".") for item in modules)
+
+
+def _bound_names(content: str, leaves: set[str], modules: set[str]) -> set[str]:
+    """Identifiers bound to a boundary module or symbol anywhere in the file at head."""
+    names = set()
+    for line in content.splitlines():
+        text = line.strip()
+        if not text or text.startswith("#"):
+            continue
+        found = _FROM_IMPORT.match(text)
+        if found and _module_in(found.group(1), modules):
+            for item in found.group(2).split(","):
+                bind = _FROM_ITEM.match(item.strip())
+                if bind:
+                    names.add(bind.group(2) or bind.group(1))
+            continue
+        alias = _IMPORT_ALIAS.match(text)
+        if alias:
+            if _module_in(alias.group(1), modules):
+                names.add(alias.group(2))
+            continue
+        bind = _BIND_LINE.match(text)
+        if bind and set(_IDENTIFIER.findall(bind.group(2))) & leaves:
+            leaf = _leaf(bind.group(1))
+            if leaf:
+                names.add(leaf)
     return names
 
 
@@ -473,27 +527,34 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
     if not isinstance(raw, dict):
         return None, result("UNVERIFIED", "SPLIT_INVALID", "task:746")
     part, parent = raw.get("part"), raw.get("parent_task")
-    info: dict = {"part": part, "parent_task": parent}
-    if (part not in {"core", "peripheral"} or not parent or
+    info: dict = {"part": part, "parent_task": parent, "paths_checked": None,
+                  "core_touches": [], "unverifiable": [], "boundary_sha256": None,
+                  "contract_path": None, "contract_sha256": None, "behaviour_checks": []}
+    if (not isinstance(part, str) or part not in {"core", "peripheral"} or
+        not isinstance(parent, (str, int)) or isinstance(parent, bool) or
         str(parent) == str(evidence.get("task")) or
         ("parent_t" in raw and raw["parent_t"] != "T3")):
         return info, result("UNVERIFIED", "SPLIT_INVALID", "task:746")
-    contract_path = raw.get("contract_path")
-    if contract_path is not None and (not isinstance(contract_path, str) or
-                                      not contract_path or contract_path.startswith(("/", "-")) or
-                                      ".." in contract_path.split("/")):
-        return info, result("UNVERIFIED", "SPLIT_INVALID", "task:746", field="contract_path")
+    contract_path = None
+    if raw.get("contract_path") is not None:
+        contract_path = _normalize_path(raw.get("contract_path"))
+        if contract_path is None:
+            return info, result("UNVERIFIED", "SPLIT_INVALID", "task:746", field="contract_path")
+    if part == "peripheral" and contract_path is None:
+        return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746",
+                            field="contract_path")
     behaviour = raw.get("behaviour_checks")
     seen = []
     if behaviour is not None:
         if not isinstance(behaviour, list):
             return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", field="behaviour_checks")
         for entry in behaviour:
-            if (not isinstance(entry, dict) or not entry.get("id") or
-                entry.get("result") not in {"pass", "fail"}):
+            if (not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or
+                not entry["id"].strip() or not isinstance(entry.get("result"), str) or
+                entry["result"] not in {"pass", "fail"}):
                 return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
                                     field="behaviour_checks")
-            seen.append({"id": entry["id"], "result": entry["result"], "ref": entry.get("ref")})
+            seen.append({"id": entry["id"].strip(), "result": entry["result"], "ref": entry.get("ref")})
         if any(entry["result"] == "fail" for entry in seen):
             return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
                                 field="behaviour_checks")
@@ -508,7 +569,7 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
         if paths is None:
             return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", detail=error)
         info["paths_checked"] = len(paths)
-        if contract_path is not None and contract_path in paths:
+        if contract_path in paths:
             info["core_touches"] = [{"path": contract_path, "kind": "contract"}]
             return info, result("FAIL", "PERIPHERAL_TOUCHES_CORE", "task:746",
                                 touches=info["core_touches"], required_rerun="T3")
@@ -559,22 +620,29 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
             if "Binary files" in patch or "GIT binary patch" in patch:
                 unverifiable.append(path)
                 continue
+            file_leaves = set(leaves)
+            show = run_git(repo, "show", f"{head}:{path}")
+            if show.returncode == 0:
+                file_leaves |= _bound_names(show.stdout, leaves, modules)
             for line in patch.splitlines():
                 if line.startswith("@@"):
                     context = "@@".join(line.split("@@")[2:])
                     touched.extend({"path": path, "kind": "enclosing", "symbol": leaf,
                                     "detail": context.strip()[:120]}
-                                   for leaf in _leaf_hits(context, leaves))
+                                   for leaf in _leaf_hits(context, file_leaves))
                 elif line[:1] in {"+", "-"} and not line.startswith(("+++", "---")):
                     content = line[1:]
                     touched.extend({"path": path, "kind": "call" if re.search(
                                         r"\b" + re.escape(leaf) + r"\s*\(", content) else "symbol",
                                     "symbol": leaf, "detail": content.strip()[:120]}
-                                   for leaf in _leaf_hits(content, leaves))
+                                   for leaf in _leaf_hits(content, file_leaves))
                     for module in _import_modules(content):
-                        if any(module == item or module.startswith(item + ".") for item in modules):
+                        if _module_in(module, modules):
                             touched.append({"path": path, "kind": "import", "symbol": module,
                                             "detail": content.strip()[:120]})
+                    if ((_ATTR_CALL.search(content) and not _ATTR_LITERAL.search(content)) or
+                        _DYNAMIC_CALL.search(content)):
+                        unverifiable.append(path)
             for name in _removed_names(patch):
                 hits = _referenced_from_boundary(repo, head, name, boundary)
                 if hits is None:
@@ -615,8 +683,9 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
         checks["surface"] = result("UNVERIFIED", "POLICY_UNAVAILABLE", "decision:3231")
     try:
         split_info, checks["split"] = _split_check(evidence)
-    except (UnicodeError, OSError):
-        split_info, checks["split"] = None, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746")
+    except Exception:
+        split_info, checks["split"] = None, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
+                                                   detail="classifier_error")
     declared = evidence.get("declared_t")
     if not re.fullmatch(r"T[0-3]", str(declared)):
         checks["tier"] = result("UNVERIFIED", "T_MISSING", "spawn-worker:2-1")
