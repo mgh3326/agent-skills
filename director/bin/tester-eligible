@@ -619,6 +619,43 @@ def _stmt_segments(text: str) -> list[str]:
     return [seg.strip() for seg in text.split(";") if seg.strip()]
 
 
+def _strip_comment(line: str) -> str:
+    """Remove a trailing # comment outside string literals."""
+    quote = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "#":
+            return line[:index]
+        index += 1
+    return line
+
+
+def _logical_lines(content: str) -> list[str]:
+    """Statements as lines: join backslash continuations, drop comments, and
+    split semicolons/control heads so import and binding forms always appear
+    at the start of a scanned line."""
+    lines: list[str] = []
+    buf = ""
+    for raw in content.splitlines():
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1] + " "
+            continue
+        lines.extend(_stmt_segments(_strip_comment(buf + raw)))
+        buf = ""
+    if buf.strip():
+        lines.extend(_stmt_segments(_strip_comment(buf)))
+    return lines
+
+
 def _bound_names(content: str, leaves: set[str], modules: set[str],
                  repo: Path | None = None, head: str | None = None,
                  file_path: str = "", depth: int = 0,
@@ -648,9 +685,11 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
     handles: dict[str, tuple[str, set[str], set[str]]] = {}
     unresolved = False
     converged = False
+    normalized = _logical_lines(content)
+    normalized_content = "\n".join(normalized)
     for _ in range(12):
         grown = False
-        for module, items_text in _from_clauses(content):
+        for module, items_text in _from_clauses(normalized_content):
             resolved = _resolve_module(module, file_path)
             items = [item.strip().strip("()").strip() for item in items_text.split(",")]
             star = items_text.strip() == "*"
@@ -732,8 +771,7 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                 elif imported in sub_cs and alias not in call_suspect:
                     call_suspect.add(alias)
                     grown = True
-        for line in content.splitlines():
-            text = line.strip()
+        for text in normalized:
             if not text or text.startswith(("#", "from ")):
                 continue
             alias = _IMPORT_ALIAS.match(text)
@@ -764,11 +802,12 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                 continue
             plain = _PLAIN_IMPORT.match(text)
             if plain:
-                for part in plain.group(1).split(","):
-                    modname = part.strip()
+                for modname in re.split(r"[\s,]+", plain.group(1).strip()):
                     if not modname:
                         continue
                     top = _leaf(modname.split(".", 1)[0])
+                    if not top:
+                        continue
                     resolved = _resolve_module(top, file_path)
                     if _module_in(resolved, modules):
                         if top not in bound:

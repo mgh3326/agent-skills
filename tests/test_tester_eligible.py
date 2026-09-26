@@ -1314,6 +1314,22 @@ class SplitFixtures(EligibilityFixtures):
                                                           split=self.split())),
                                  "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
 
+    def test_inline_import_forms_are_unverifiable(self) -> None:
+        # Plain imports that do not start a physical line — after a
+        # semicolon, behind a comment, or backslash-continued — still bind
+        # the name; a call through an uninspectable module is unverifiable.
+        for stmt in ("import missing; missing.run(row)",
+                     "import missing  # external provider\n    missing.run(row)",
+                     "import missing \\\n    # (continued)\n    missing.run(row)"):
+            with self.subTest(stmt=stmt):
+                self.seed_pkg("def render(row):\n    return str(row)\n")
+                head = self.commit({"pkg/ui/consumer.py":
+                                    "def render(row):\n    " + stmt +
+                                    "\n    return str(row)\n"})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
     def test_unproven_binding_without_call_stays_clean(self) -> None:
         # Unproven-value bindings only flag calls: data references stay clean.
         self.seed_pkg("def render(row):\n    return str(row)\n")
