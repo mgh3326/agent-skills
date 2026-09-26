@@ -575,11 +575,30 @@ def check(d: dict) -> None:
         return seen
 
     policy = json.loads(d["policy"], object_pairs_hook=_no_dup_keys)
+    # A shadow map under a near-key ("local_sources ", "Local_Sources",
+    # "local-sources", escaped decodes) reads as a duplicate to lenient
+    # parsers while exact-match lookups ignore it (R19 tester).
+    def _norm_key(k):
+        return "".join(c for c in k.strip().casefold() if c not in " _-")
+
+    near = [
+        k for k in policy
+        if k != "local_sources" and _norm_key(k) == "localsources"
+    ]
+    assert not near, f"gate_policy shadow local_sources key(s): {near!r}"
     pinned = policy["local_sources"]
     # Malformed shapes must fail by assertion, not TypeError (R5 tester:
     # numeric pin value and numeric local_sources crashed outside the
     # assertion-RED path).
     assert isinstance(pinned, dict), "gate_policy local_sources must be an object"
+    # Pin keys get the same near-key defense: "spawn_worker/SKILL.md" or
+    # "spawn-worker /SKILL.md" shadows a required pin for lenient readers.
+    _req_norm = {_norm_key(rel) for rel in REQUIRED_PINS}
+    nearpins = [
+        k for k in pinned
+        if k not in REQUIRED_PINS and _norm_key(k) in _req_norm
+    ]
+    assert not nearpins, f"gate_policy shadow pin key(s): {nearpins!r}"
     for rel in REQUIRED_PINS:
         assert rel in pinned, (
             f"gate_policy local_sources must pin {rel} "
@@ -770,6 +789,43 @@ _escmap["policy"] = _escmap["policy"].replace(
     1,
 )
 mutants["policy-escaped-local-sources"] = _escmap
+# R19 tester: near-key shadow maps and shadow pin keys that survive
+# exact-match readers but fool lenient ones.
+_shadow_space = dict(docs)
+_shadow_space["policy"] = _shadow_space["policy"].replace(
+    '"local_sources": {',
+    '"local_sources ": {"spawn-worker/SKILL.md": "' + "0" * 64 + '"},\n  "local_sources": {',
+    1,
+)
+mutants["policy-shadow-local-sources-space"] = _shadow_space
+_shadow_case = dict(docs)
+_shadow_case["policy"] = _shadow_case["policy"].replace(
+    '"local_sources": {',
+    '"Local_Sources": {"spawn-worker/SKILL.md": "' + "0" * 64 + '"},\n  "local_sources": {',
+    1,
+)
+mutants["policy-shadow-local-sources-case"] = _shadow_case
+_shadow_dash = dict(docs)
+_shadow_dash["policy"] = _shadow_dash["policy"].replace(
+    '"local_sources": {',
+    '"local-sources": {"spawn-worker/SKILL.md": "' + "0" * 64 + '"},\n  "local_sources": {',
+    1,
+)
+mutants["policy-shadow-local-sources-dash"] = _shadow_dash
+_shadowpin = dict(docs)
+_shadowpin["policy"] = _shadowpin["policy"].replace(
+    '"spawn-worker/SKILL.md": "',
+    '"spawn_worker/SKILL.md": "' + "0" * 64 + '",\n    "spawn-worker/SKILL.md": "',
+    1,
+)
+mutants["policy-shadow-pin-underscore"] = _shadowpin
+_shadowpin2 = dict(docs)
+_shadowpin2["policy"] = _shadowpin2["policy"].replace(
+    '"spawn-worker/SKILL.md": "',
+    '"spawn-worker /SKILL.md": "' + "0" * 64 + '",\n    "spawn-worker/SKILL.md": "',
+    1,
+)
+mutants["policy-shadow-pin-space"] = _shadowpin2
 # Rule sentences copied into pointer files beyond the three old phrases.
 mutants["builder-periph-rule-copied"] = append(
     "builder",
