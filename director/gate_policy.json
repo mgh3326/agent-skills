@@ -158,8 +158,8 @@
     ".github/workflows/ci.yml": "c2431cd9d0f68f7126681a0269eb0538f35f65466260ba2d6adce91fdffe1610",
     "bin/wrk": "a9acc02ec7c7c4c255618001b77c10f31b2da800779919260b0acab45224cf8a",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
-    "director/SKILL.md": "22d185a2d426dfcf12b7de05ee00a67fd71c54a4005e2196d91ede6a9ec25b26",
-    "spawn-worker/SKILL.md": "9d0ca1e18a31abf92f4e5aaa02a1aab331b42ee8e6a4f5adaab408bde9be1789"
+    "director/SKILL.md": "3e1e16af7b69e784ce851becc7f9a0f9c9e8216d8a07213c77e3dccff887a4e8",
+    "spawn-worker/SKILL.md": "2c55be7d4e6f1df6bd7cea678ea50189d961283392a30765bf91386dffec5e3c"
   },
   "profiles": {
     "agy-flash": {

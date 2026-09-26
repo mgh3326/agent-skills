@@ -49,31 +49,39 @@ max 를 쓸 수 없으므로 `SCOPEFUEL_E6_ARM` 표식과 무관하게 wrk 가 �
 
 <!-- T736-ASSIGNMENT-DEFAULTS -->
 🔴 **배정 기본값 (출처: 2026-09-26 운영자 결정 `decision/2026-09-26/effort-efficiency` B
-+ 같은 날 운영자 tier 표 — director-1 relay 수신분 + AA telemetry 스냅샷
-`pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23)** —
++ hk:doc `note/2026-09-26/grade-cost-table`(id 4098 — 카탈로그 급 × AA 작업당 비용)
++ AA telemetry 스냅샷 `pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23)** —
 벤치 수치는 스킬 문서에 복사하지 않는다. 급의 정본은 `scopefuel --recommend` 와
 scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다 — 급표 정본은
 `spawn-worker` §2-2 다.
 
+- **기본 규칙: 과제 급 이상으로 배치된 후보 중 작업당 비용이 가장 낮은 것을 기본으로
+  고른다**(note 4098 의 규칙 — 이후 값들은 고정 목록이 아니라 이 규칙의 현재 출력이다.
+  **#735 의 측정 rep 이 이 표를 재보정한다** — 규칙이 정본, 수치는 갱신된다). 배정은
+  규칙이 고른 `profile@effort` 를 `--effort` 로 명시해 적용한다 — **wrk 철자 기본값은
+  정책이 아니다**.
 - **빌더 좌석은 max 런그를 쓰지 않는다**(codex `ultra` = max+서브에이전트 계열, 같은 거부다) —
-  기본은 high 이하, 또는 devin 프로필이다(별도 승인된 xhigh 빌더 — `builder-grok`·
-  `builder-luna`·E6 xhigh 철자 — 는 그대로다). Sol 빌더는 Sol high 를 쓰고,
-  devin 빌더는 effort 플래그 없이 모델 런그 그대로다. **max effort 는 T3 구현 워커와
-  T3 tester 에만 예약한다** — T1 행의 Luna max·devin swe2-max 는 같은 결정이 명시한
-  예외다. wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
+  같은 규칙 아래에서도 빌더 후보는 max 를 빼고 고른다(별도 승인된 xhigh 빌더 —
+  `builder-grok`·`builder-luna`·E6 xhigh 철자 — 는 그대로다). Sol 빌더는 Sol high
+  (wrk 기본값 그대로), devin 빌더는 effort 플래그 없이 모델 런그 그대로다.
+  워커 쪽의 max 는 Sol 의 T3 코어 필요분과 E6 측정 런그에만 남는다.
+  wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
 - **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
   `builder-devin-max`)은 무료이므로 적극 쓴다.
 - **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** —
   `spawn-worker` §2-2 급표 행의 규칙 그대로다.
-- **티어별 기본**: T3 코어·tester = Opus xhigh / Sol xhigh(Sol max 는 T3 코어
-  한정, 필요할 때만) · T2 = Sonnet high / Terra high~xhigh 또는 Sol high ·
-  T1·기계적 작업 = Haiku / Luna max / devin swe2-max.
-- **codex 계열**: Sol 워커 배정은 `--effort xhigh` 명시가 기본이다 — `codex-sol`
-  철자 자체의 기본값은 max 라서 플래그 없이 띄우면 max 로 간다. **Terra max 는
-  Sol high~xhigh 로 대체한다** — Terra 는 Sol 을 못 쓸 때의 보조다(동점이면
-  토큰을 더 쓴다). gpt-reserve 7d 창이 어느 모델을 덮는지 미확정이므로 "Terra 가
-  부하를 분산한다"고 주장하지 않는다.
-- **Sonnet 5 는 우선순위 낮은 codex 대체재**다.
+- **현재 출력(예시) — claude**: Opus·Sonnet·Haiku 가 하나의 주간 창을 나누므로
+  작업당 비용이 곧 쿼타 소모 비교축이다. **S+ = Opus medium**(T3 코어 구현은
+  Opus high, T3 tester 는 Opus xhigh, **Opus max 는 쓰지 않는다**) · **S·A+·A =
+  Opus low**(모든 Sonnet effort 를 비용·점수 양쪽에서 지배) · **B·C·기계적 작업 =
+  Haiku**. ※ Opus low 는 현재 카탈로그에서 gate=escalation 이라 그대로 못 쓴다 —
+  해제는 scopefuel 카탈로그 변경이며 **이 PR 의 범위 밖**이다.
+- **현재 출력(예시) — codex**(공용 7d 창; reserve 창이 어느 모델을 덮는지 미확정):
+  **S+·S = Sol xhigh**(Sol max 는 T3 코어가 필요할 때만) · **A+ = Luna max** ·
+  **A = Luna high** · **B = Luna medium**. **Terra 는 모든 급에서 지배당한다** —
+  reserve 창이 Terra 전용으로 확인될 때만 보조로 쓴다(부하 분산 주장 금지).
+  `codex-sol` 철자 자체의 기본값은 max 라서 Sol 배정은 `--effort` 명시로 한다.
+  미측정(C) Sol high·medium 은 **E6 arm 우선 측정 대상**이다 — 측정되면 S 후보.
 <!-- /T736-ASSIGNMENT-DEFAULTS -->
 
 ## 시작과 브리프
