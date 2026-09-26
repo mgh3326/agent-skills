@@ -243,12 +243,26 @@ def check(d: dict) -> None:
         "wrk: the seat rule must gate on role=builder and refuse resolved max|ultra"
     )
     # #748: builder-kimi/kimi-k3 leave EFFECTIVE_EFFORT empty — the seat rule
-    # must read the kimi home's [thinking] effort or a max home slips through.
+    # must read the kimi home's resolved effort or a max home slips through.
     assert re.search(
-        r"-z \"\$seat_effort\" && \"\$PROFILE_KIND\" == kimi && -n \"\$KIMI_TRUST_HOME\".{0,600}?seat_effort=\"\$\(kimi_clone_thinking_effort \"\$KIMI_TRUST_HOME/config\.toml\"\)\"",
+        r"-z \"\$seat_effort\" && \"\$PROFILE_KIND\" == kimi && -n \"\$KIMI_TRUST_HOME\".{0,900}?seat_effort=\"\$\(kimi_clone_resolved_effort \"\$KIMI_TRUST_HOME/config\.toml\" \"\$kimi_model\"\)\"",
         wrk,
     ), (
-        "wrk: an empty resolved effort on a kimi profile must read the home's [thinking] effort for the seat rule"
+        "wrk: an empty resolved effort on a kimi profile must read the home's resolved effort for the seat rule"
+    )
+    # #748r2 (tester round 1): the resolution must honour TOML literal
+    # (single-quoted) strings and the model default_effort fallback with
+    # support_efforts membership — a double-quote-only scan or a
+    # thinking-only read leaves valid max homes admitted.
+    assert "default_effort" in wrk and "support_efforts" in wrk, (
+        "wrk: the kimi seat read must fall back to the model's default_effort honouring support_efforts"
+    )
+    assert re.search(
+        r"m_seen && \(t == \"\" \|\| \(s_seen && !\(t in S\)\)\)\) r = d",
+        wrk,
+    ), "wrk: the kimi resolver must substitute default_effort for missing/unsupported requests"
+    assert re.search(r"substr\(s, 1, 1\) == sq", wrk), (
+        "wrk: the kimi resolver must parse TOML literal (single-quoted) strings"
     )
     assert re.search(
         r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6-sol;\s*DEFAULT_EFFORT=high",
@@ -495,8 +509,20 @@ mutants["wrk-seat-rule-ultra-dropped"] = mutate(
 # kimi spellings blind to a max-effort home.
 mutants["wrk-seat-rule-kimi-blind"] = mutate(
     "wrk",
-    'seat_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"',
+    'seat_effort="$(kimi_clone_resolved_effort "$KIMI_TRUST_HOME/config.toml" "$kimi_model")"',
     'seat_effort=""',
+)
+# #748r2: dropping the default_effort fallback or the literal-string parse
+# reopens the tester-found max-home paths.
+mutants["wrk-seat-rule-no-model-default"] = mutate(
+    "wrk",
+    'if (m_seen && (t == "" || (s_seen && !(t in S)))) r = d',
+    'r = t',
+)
+mutants["wrk-seat-rule-no-literal-string"] = mutate(
+    "wrk",
+    "if (substr(s, 1, 1) == sq && substr(s, length(s), 1) == sq)\n        return substr(s, 2, length(s) - 2)",
+    'return ""',
 )
 # #748: the stale "marked rung needs a REF" claim must go RED in every
 # scanned doc; dropping the corrected wording goes RED via the required row.
