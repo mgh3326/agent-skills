@@ -875,23 +875,32 @@ def string(v):
     return v if isinstance(v, str) else None
 def truthy(v):
     return v is True or (isinstance(v, str) and v.lower() in ("1", "true", "yes", "on"))
-def strings(v):
-    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else None
 thinking = table(cfg.get("thinking"))
 model = table(table(cfg.get("models")).get(sys.argv[2]))
 over = table(model.get("overrides"))
 def pick(key):
     return over.get(key, model.get(key))
-if thinking.get("enabled") is False and not truthy(pick("always_thinking")):
-    print(string(pick("off_effort")) or "")
-    raise SystemExit(0)
-env_eff = os.environ.get("KIMI_EFFORT_ENV") or ""
-if env_eff:
-    print(env_eff)
-    raise SystemExit(0)
+def strings(v):
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else None
 effort = string(thinking.get("effort"))
 support = strings(pick("support_efforts"))
 default = string(pick("default_effort"))
+off = string(pick("off_effort"))
+caps = set(strings(pick("capabilities")) or [])
+# always-thinking is declared two ways: an always_thinking model field or an
+# "always_thinking" capability tag (either can sit under overrides). In both
+# shapes enabled=false does not take the model off.
+always = truthy(pick("always_thinking")) or "always_thinking" in caps
+if thinking.get("enabled") is False and not always:
+    print(off or "")
+    raise SystemExit(0)
+env_eff = (os.environ.get("KIMI_EFFORT_ENV") or "").strip().lower()
+if env_eff in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra", "off", "on"}:
+    print(env_eff)
+    raise SystemExit(0)
+if effort == "off" and not always:
+    print("off")
+    raise SystemExit(0)
 resolved = effort
 if model and (resolved is None or (support is not None and resolved not in support)):
     resolved = default
@@ -943,9 +952,19 @@ PY
       if ($0 ~ /\]/) collecting = 0
       next
     }
+    c_collecting {
+      caps = caps " " $0
+      if ($0 ~ /\]/) c_collecting = 0
+      next
+    }
     in_thinking && $0 ~ /^[[:space:]]*effort[[:space:]]*=/ { t = rhs(); next }
     in_thinking && $0 ~ /^[[:space:]]*enabled[[:space:]]*=/ { en = rawrhs(); next }
     in_model && $0 ~ /^[[:space:]]*always_thinking[[:space:]]*=/ { at = rawrhs(); next }
+    in_model && $0 ~ /^[[:space:]]*capabilities[[:space:]]*=/ {
+      caps = $0; c_seen = 1
+      if (caps !~ /\]/) c_collecting = 1
+      next
+    }
     in_model && $0 ~ /^[[:space:]]*off_effort[[:space:]]*=/ { o = rhs(); next }
     in_model && $0 ~ /^[[:space:]]*default_effort[[:space:]]*=/ { d = rhs(); next }
     in_model && $0 ~ /^[[:space:]]*support_efforts[[:space:]]*=/ {
@@ -954,8 +973,6 @@ PY
       next
     }
     END {
-      if (en == "false" && at != "true") { print o; exit }
-      if (env_eff != "") { print env_eff; exit }
       if (s_seen) {
         rest = sup
         while (match(rest, /"[^"]*"/)) {
@@ -968,6 +985,25 @@ PY
           rest = substr(rest, RSTART + RLENGTH)
         }
       }
+      if (c_seen) {
+        rest = caps
+        while (match(rest, /"[^"]*"/)) {
+          C[substr(rest, RSTART + 1, RLENGTH - 2)] = 1
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+        rest = caps
+        while (match(rest, sq "[^" sq "]*" sq)) {
+          C[substr(rest, RSTART + 1, RLENGTH - 2)] = 1
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+      }
+      always = (at == "true" || ("always_thinking" in C))
+      if (en == "false" && !always) { print o; exit }
+      if (env_eff != "") {
+        e = tolower(env_eff)
+        if (e ~ /^(minimal|low|medium|high|xhigh|max|ultra|off|on)$/) { print e; exit }
+      }
+      if (t == "off" && !always) { print "off"; exit }
       r = t
       if (m_seen && (t == "" || (s_seen && !(t in S)))) r = d
       print r

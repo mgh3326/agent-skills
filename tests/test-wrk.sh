@@ -3545,6 +3545,24 @@ off_effort = "max"
 enabled = false
 effort = "high"
 EOF
+# always-thinking also arrives as a capabilities tag or a boolean field —
+# enabled=false does not switch the model off in either shape.
+e6_khome "$TMP/kimi-at-cap-max" <<'EOF'
+[models."kimi-code/k3"]
+capabilities = [ "thinking", "always_thinking" ]
+default_effort = "high"
+[thinking]
+enabled = false
+effort = "max"
+EOF
+e6_khome "$TMP/kimi-at-field-max" <<'EOF'
+[models."kimi-code/k3"]
+always_thinking = true
+default_effort = "high"
+[thinking]
+enabled = false
+effort = "max"
+EOF
 # A malformed config (duplicate keys) can still carry a max line: the python
 # parse refuses to decode it, so the awk fallback's scan must stay
 # conservative and refuse.
@@ -3558,7 +3576,8 @@ effort = "max"
 EOF
 for e6_khome_case in kimi-dotted-thinking kimi-dotted-model kimi-inline-models \
     kimi-multiline-max kimi-escaped-max kimi-indented-max kimi-override-max \
-    kimi-comment-support kimi-off-effort-max kimi-dup-invalid; do
+    kimi-comment-support kimi-off-effort-max kimi-at-cap-max kimi-at-field-max \
+    kimi-dup-invalid; do
   set +e
   e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
     ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
@@ -3580,14 +3599,14 @@ default_effort = "high"
 effort = "high"
 EOF
 set +e
-e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-below" KIMI_MODEL_THINKING_EFFORT=max \
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-below" KIMI_MODEL_THINKING_EFFORT=MAX \
   ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
   spawn_base builder-kimi --role builder --lane kimi-env-max-lane --parent parent-lane \
   --job e6-kimi-env-max --t T1 2>&1)"
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 2 ]] ||
-  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=max exported must die rc 2 (rc=$e6_krc): $e6_kout"
+  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=MAX exported must die rc 2 (rc=$e6_krc): $e6_kout"
 grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
   fail "env-max refusal must name the builder-seat rule: $e6_kout"
 # Admitted paths: the env overlay wins over the config (max home + high env),
@@ -3615,6 +3634,15 @@ default_effort = "max"
 [thinking]
 enabled = false
 EOF
+# effort="off" is a valid off spelling — no rung even with a max default;
+# an unrecognised env value is not a rung either and falls back to config.
+e6_khome "$TMP/kimi-effort-off" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
+[thinking]
+effort = "off"
+EOF
 : >"$TMP/herdr.log"
 set +e
 e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-over-max" KIMI_MODEL_THINKING_EFFORT=high \
@@ -3627,7 +3655,7 @@ set -e
   fail "KIMI_MODEL_THINKING_EFFORT=high must override a max home and be admitted (rc=$e6_krc): $e6_kout"
 [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
   fail "env-high admission must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
-for e6_khome_case in kimi-disabled-max kimi-disabled-defmax; do
+for e6_khome_case in kimi-disabled-max kimi-disabled-defmax kimi-effort-off; do
   : >"$TMP/herdr.log"
   set +e
   e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \

@@ -288,6 +288,18 @@ def check(d: dict) -> None:
     assert 'pick("off_effort")' in wrk, (
         "wrk: the kimi resolver must read the model off_effort"
     )
+    # always-thinking also arrives as a capabilities tag, not only a boolean
+    # field; effort="off" is a valid off spelling; and the env overlay is
+    # bounded to documented rung spellings before it is honoured.
+    assert '"always_thinking" in caps' in wrk, (
+        "wrk: the kimi resolver must honour the always_thinking capability tag"
+    )
+    assert 'if effort == "off" and not always:' in wrk, (
+        "wrk: the kimi resolver must treat effort=off as Thinking off"
+    )
+    assert '"xhigh", "max", "ultra", "off", "on"' in wrk, (
+        "wrk: the kimi resolver must bound the env overlay to documented rung spellings"
+    )
     assert re.search(
         r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6-sol;\s*DEFAULT_EFFORT=high",
         wrk,
@@ -569,13 +581,30 @@ mutants["wrk-seat-rule-env-blind"] = mutate(
 )
 mutants["wrk-seat-rule-enabled-ignored"] = mutate(
     "wrk",
-    'if thinking.get("enabled") is False and not truthy(pick("always_thinking")):',
+    'if thinking.get("enabled") is False and not always:',
     "if False:",
 )
 mutants["wrk-seat-rule-overrides-dropped"] = mutate(
     "wrk",
     'over = table(model.get("overrides"))',
     "over = {}",
+)
+# The capabilities-tag always shape, the bounded env list and effort=off all
+# gate refusal paths; dropping any reopens a round-3 attack.
+mutants["wrk-seat-rule-no-cap-always"] = mutate(
+    "wrk",
+    '"always_thinking" in caps',
+    "False",
+)
+mutants["wrk-seat-rule-env-unbounded"] = mutate(
+    "wrk",
+    'if env_eff in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra", "off", "on"}:',
+    "if env_eff:",
+)
+mutants["wrk-seat-rule-off-ignored"] = mutate(
+    "wrk",
+    'if effort == "off" and not always:',
+    "if False:",
 )
 # #748: the stale "marked rung needs a REF" claim must go RED in every
 # scanned doc; dropping the corrected wording goes RED via the required row.
