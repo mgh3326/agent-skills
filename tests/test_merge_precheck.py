@@ -138,10 +138,11 @@ def merge_precheck_mutant(replacements: list[tuple[str, str]]):
 CHECKOUT_STAMP = "ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:00Z "
 
 
-def checkout_log(abbrev: str | None, checkout_sha: str, extra_announces: list[str] | None = None) -> str:
+def checkout_log(abbrev: str | None, checkout_sha: str, extra_announces: list[str] | None = None,
+                 command: str = "/usr/bin/git log -1 --format=%H") -> str:
     lines = [f"{CHECKOUT_STAMP}HEAD is now at {announce} Merge {H} into {B}"
              for announce in [abbrev, *(extra_announces or [])] if announce is not None]
-    lines.append(f"{CHECKOUT_STAMP}[command]/usr/bin/git log -1 --format=%H")
+    lines.append(f"{CHECKOUT_STAMP}[command]{command}")
     lines.append(f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {checkout_sha}")
     return "\n".join(lines) + "\n"
 
@@ -698,6 +699,20 @@ class MergePrecheckTests(unittest.TestCase):
         # Ambiguous: distinct announcements for distinct candidates in one log.
         other = "f" * 40
         self.assertIsNone(gate.checkout_merge_sha(two_checkout_log(checkout_sha[:9], checkout_sha, other[:9], other)))
+        # A non-git command that merely mentions the phrase is not the checkout command,
+        # even when its printed SHA shares the announced prefix (tester round-1 BLOCKER).
+        forged = "abcdef0111111111111111111111111111111111"
+        forge_log = (f"{CHECKOUT_STAMP}HEAD is now at abcdef0 Merge {H} into {B}\n"
+                     f"{CHECKOUT_STAMP}[command]/usr/bin/printf '%s\\n' {forged} # git log -1 --format=%H\n"
+                     f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {forged}\n")
+        self.assertIsNone(gate.checkout_merge_sha(forge_log))
+        # Other subcommands and trailing arguments are not the git-log command either.
+        for command in ("/usr/bin/git checkout --progress --force .",
+                        "git status",
+                        "/usr/bin/legit log -1 --format=%H",
+                        "/usr/bin/git log -1 --format=%H extra"):
+            with self.subTest(command=command):
+                self.assertIsNone(gate.checkout_merge_sha(checkout_log(checkout_sha[:9], checkout_sha, command=command)))
 
     def test_checkout_merge_sha_mutants_are_assertion_red(self) -> None:
         checkout_sha = "e" * 40
@@ -715,6 +730,13 @@ class MergePrecheckTests(unittest.TestCase):
         twin = "e" * 9 + "0" * 31
         with self.assertRaises(AssertionError):
             self.assertIsNone(first_wins(two_checkout_log(checkout_sha[:9], checkout_sha, twin[:9], twin)))
+        loose_command = merge_precheck_mutant([(r"\[command\](?:\S*/git|git) log -1 --format=%H\s*$", r"\[command\].*git log -1 --format=%H")])
+        forged = "abcdef0111111111111111111111111111111111"
+        forge_log = (f"{CHECKOUT_STAMP}HEAD is now at abcdef0 Merge {H} into {B}\n"
+                     f"{CHECKOUT_STAMP}[command]/usr/bin/printf '%s\\n' {forged} # git log -1 --format=%H\n"
+                     f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {forged}\n")
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(loose_command(forge_log))
 
     def test_missing_branch_protection_source_mutant_is_red(self) -> None:
         required = policy()

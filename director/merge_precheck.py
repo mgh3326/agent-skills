@@ -81,7 +81,7 @@ def checkout_merge_sha(log: str) -> str | None:
     candidates: list[str] = []
     lines = log.splitlines()
     for index, line in enumerate(lines[:-1]):
-        if "[command]" not in line or "git log -1 --format=%H" not in line:
+        if not re.search(r"\[command\](?:\S*/git|git) log -1 --format=%H\s*$", line):
             continue
         following = lines[index + 1]
         match = re.search(r"\b([0-9a-f]{40})\s*$", following)
