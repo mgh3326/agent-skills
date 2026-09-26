@@ -153,11 +153,24 @@ FILE_ROWS = [
 ]
 
 # Sentences that must exist ONLY inside the spawn block — a second copy in a
-# pointer file is a leak, not a reference.
+# pointer file is a leak, not a reference. Every fragment is §2-6-specific and
+# absent from the pointer files today (불변식 표·NEEDS_CLASSIFICATION·합집합·
+# 라운드 캡 are legitimate summary labels in the pointers and stay unpinned).
 RULE_PHRASES_NOT_COPIED = [
-    "핵심 책임자가 불변식 표를 먼저",
+    "핵심 책임자가",
     "호출 한 줄이어도",
     "라운드 상한을 따로 줄이지 않는다",
+    "(UI·CLI·테스트 등)가 아니라",
+    "더 저렴한 적격 모델 가능",
+    "순수 렌더링",
+    "분리 조건: 입/출력",
+    "안전 결정·권한·상태·증거에 영향 없음",
+    "허용 파일/심볼",
+    "독립 인수·되돌리기",
+    "lock/transaction 수명",
+    "상태/DB/예외 경계",
+    "T3 로 재분류한다",
+    "최종 통합 tester 가 될 수 없다",
 ]
 
 PINNED_SKILLS = (
@@ -205,25 +218,25 @@ def check(d: dict) -> None:
             )
     # The gate policy pins the skill files: a re-pinned hash must match the
     # edited bytes, and an un-pinned file must not have drifted either way.
-    # Duplicate keys smuggle stale pins past last-key-wins parsers (R3 tester):
-    # a "spawn-worker/SKILL.md": <stale> followed by the correct value parses
-    # as correct in Python but stale in a first-key-wins reader.
-    assert d["policy"].count('"local_sources"') == 1, (
-        "gate_policy must contain exactly one local_sources object"
-    )
-    ls_body = re.search(r'"local_sources"\s*:\s*\{([^}]*)\}', d["policy"])
-    assert ls_body, "gate_policy local_sources object missing"
-    ls_keys = re.findall(r'"([^"]+)"\s*:', ls_body.group(1))
-    ls_dups = sorted({k for k in ls_keys if ls_keys.count(k) > 1})
-    assert not ls_dups, f"gate_policy local_sources duplicate keys hide drift: {ls_dups}"
-    policy = json.loads(d["policy"])
+    # Duplicate keys — literal or JSON-escaped equivalents (R3/R4 tester:
+    # stale-first/correct-last pin, "spawn-worker\/SKILL.md", and a second
+    # "\u006cocal_sources" map) smuggle stale pins past last-key-wins parsers
+    # and literal-text scans. object_pairs_hook compares DECODED keys.
+    def _no_dup_keys(pairs):
+        seen = {}
+        for key, value in pairs:
+            assert key not in seen, f"gate_policy duplicate decoded key {key!r}"
+            seen[key] = value
+        return seen
+
+    policy = json.loads(d["policy"], object_pairs_hook=_no_dup_keys)
     pinned = policy["local_sources"]
     for rel in REQUIRED_PINS:
         assert rel in pinned, (
             f"gate_policy local_sources must pin {rel} "
             "(task-modified file; a removed pin hides drift)"
         )
-    for rel in PINNED_SKILLS:
+    for rel in sorted(set(PINNED_SKILLS) | set(REQUIRED_PINS)):
         if rel not in pinned:
             continue
         actual = hashlib.sha256((root / rel).read_bytes()).hexdigest()
@@ -366,6 +379,44 @@ _dupobj["policy"] = _dupobj["policy"].replace(
     1,
 )
 mutants["policy-dup-local-sources"] = _dupobj
+# R4 tester findings verbatim: a corrupted CI pin (required but not
+# hash-verified) and JSON-escaped duplicate keys that beat literal scans.
+_cipin = dict(docs)
+_cipin["policy"] = _cipin["policy"].replace(
+    '".github/workflows/ci.yml": "'
+    + docs["policy"].split('".github/workflows/ci.yml": "', 1)[1].split('"', 1)[0],
+    '".github/workflows/ci.yml": "' + "0" * 64,
+    1,
+)
+mutants["policy-ci-pin-corrupted"] = _cipin
+_esckey = dict(docs)
+_esckey["policy"] = _esckey["policy"].replace(
+    '"spawn-worker/SKILL.md": "',
+    '"spawn-worker\\/SKILL.md": "' + "0" * 64 + '",\n    "spawn-worker/SKILL.md": "',
+    1,
+)
+mutants["policy-spawn-pin-escaped-dup"] = _esckey
+_escmap = dict(docs)
+_escmap["policy"] = _escmap["policy"].replace(
+    '"local_sources": {',
+    '"\\u006cocal_sources": {"spawn-worker/SKILL.md": "' + "0" * 64 + '"},\n  "local_sources": {',
+    1,
+)
+mutants["policy-escaped-local-sources"] = _escmap
+# Rule sentences copied into pointer files beyond the three old phrases.
+mutants["builder-periph-rule-copied"] = append(
+    "builder",
+    "주변 (더 저렴한 적격 모델 가능): 순수 렌더링 · 검증된 읽기 API 의 CLI 출력(조회·정렬·출력) · 안전 경로와 무관한 고정 API 연결. 분리 조건: 입/출력·실패 계약 고정 · 안전 결정·권한·상태·증거에 영향 없음 · 허용 파일/심볼·금지 변경 열거 가능 · 독립 인수·되돌리기 가능.",
+)
+mutants["director-periph-condition-copied"] = append(
+    "director", "안전 결정·권한·상태·증거에 영향 없음."
+)
+mutants["director-core-enum-copied"] = append(
+    "director", "lock/transaction 수명 · 상태/DB/예외 경계."
+)
+mutants["builder-reclassify-copied"] = append(
+    "builder", "주변 PR 이 핵심을 건드리면 그 PR 은 T3 로 재분류한다."
+)
 # NEEDS_CLASSIFICATION rule dropped or inverted.
 mutants["spawn-needs-classification-dropped"] = mutate(
     "spawn", "낮은 T 로 실행하지 않고 `NEEDS_CLASSIFICATION`\n  으로 반환한다", "낮은 T 로 실행한다"
