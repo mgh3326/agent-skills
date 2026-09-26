@@ -115,7 +115,7 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
   자체는 미측정 C 라 배정 후보가 아니라 좌석 고정값이다), devin 빌더는 effort 플래그
   없이 모델 런그 그대로다. **max effort 는 T3 구현 워커·T3 tester 에만 예약한다
   (4088 B)** — 예외는 devin swe2-max(4088 명시, 무료)·A+ 의 Luna max(note 4098 비용
-  규칙)·E6 측정 런그다. wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
+  규칙)·워커 E6 측정 런그다(#704). wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
 - **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
   `builder-devin-max`)은 무료이므로 적극 쓴다.
 - **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** —
@@ -124,9 +124,10 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
   작업당 비용이 곧 쿼타 소모 비교축이다. **S+ = Opus medium**(T3 코어 구현은
   Opus high, T3 tester 는 Opus xhigh, **Opus max 는 쓰지 않는다**) · **S·A+·A =
   Opus low**(모든 Sonnet effort 를 비용·점수 양쪽에서 지배) · **B·C·기계적 작업 =
-  Haiku**. ※ Opus low 는 현재 카탈로그에서 gate=escalation 이라 그대로 못 쓴다 —
-  해제는 scopefuel 카탈로그 변경이며 **이 PR 의 범위 밖**이다. 해제 전까지 S·A+·A 도
-  사용 가능 후보 중 비용 최소로 고른다(현재 그 다음 저가는 Opus medium 이다).
+  Haiku**. ※ Opus low 는 현재 카탈로그에서 gate=escalation 이라 아직 그대로 못 쓴다 —
+  해제는 scopefuel #738 에서 merge 됐고 설치 예정이다(scopefuel 카탈로그 변경이며
+  **이 PR 의 범위 밖**). 해제 전까지 S·A+·A 도 사용 가능 후보 중 비용 최소로 고른다
+  (현재 그 다음 저가는 S·A+ = Opus medium·A = Sonnet low 다).
 - **현재 출력(예시) — codex**(공용 7d 창; reserve 창이 어느 모델을 덮는지 미확정):
   **S+·S = Sol xhigh**(Sol max 는 T3 코어가 필요할 때만) · **A+ = Luna max** ·
   **A = Luna high** · **B = Luna medium**. **Terra 는 모든 급에서 지배당한다** —

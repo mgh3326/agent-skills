@@ -92,6 +92,16 @@ BLOCK_ROWS = [
     # While Opus low is gated, S/A+/A still picks the cheapest USABLE
     # candidate — no ad-hoc gap (N-R3-1).
     ("opus-low-interim", r"해제 전까지 S·A\+·A 도 사용 가능 후보 중 비용 최소로 고른다"),
+    # The lift is a merged scopefuel change (#738) pending install — the
+    # caveat must not read as open-ended.
+    ("opus-low-738-status", r"#738[^\n]{0,25}?merge[^\n]{0,25}?설치"),
+    # The interim parenthetical pins the corrected per-grade output
+    # (S-R4-1): with Opus low gated, A's cheapest usable candidate is
+    # Sonnet low (note 4098, catalog gate=default), not Opus medium.
+    ("opus-low-interim-detail", r"그 다음 저가는 S·A\+ = Opus medium[^\n]{0,3}?A = Sonnet low"),
+    # E6 measurement rungs in the max-reservation exception are worker
+    # rungs — builder max stays closed (N-R4-1).
+    ("worker-e6-rungs", r"워커 E6 측정 런그"),
     # Current output — codex. Terra is dominated at every grade; the codex-sol
     # spelling itself still defaults to max, so Sol assignments carry --effort.
     ("codex-s-sol-xhigh", r"S\+·S = Sol xhigh"),
@@ -310,7 +320,7 @@ mutants["xhigh-exceptions-dropped"] = mutate(
 # Opus low's gate=escalation caveat is what keeps the S/A+/A default honest —
 # lifting it is a scopefuel catalog change, not this PR.
 mutants["opus-low-gate-dropped"] = mutate(
-    "spawn", "Opus low 는 현재 카탈로그에서 gate=escalation 이라 그대로 못 쓴다", "Opus low 도 바로 쓸 수 있다"
+    "spawn", "Opus low 는 현재 카탈로그에서 gate=escalation 이라 아직 그대로 못 쓴다", "Opus low 도 바로 쓸 수 있다"
 )
 mutants["opus-low-scope-caveat-dropped"] = mutate(
     "builder", "scopefuel 카탈로그 변경이며", "임의로 고쳐도 되며"
@@ -352,7 +362,21 @@ mutants["sol-high-seat-caveat-dropped"] = mutate(
 # While Opus low is gated the interim "cheapest usable" clause prevents
 # ad-hoc S/A+/A picks (N-R3-1).
 mutants["opus-low-interim-dropped"] = mutate(
-    "director", "해제 전까지 S·A+·A 도\n  사용 가능 후보 중 비용 최소로 고른다", ""
+    "director", "해제 전까지 S·A+·A 도 사용 가능 후보 중 비용 최소로 고른다\n  (현재 그 다음 저가는", ""
+)
+# The #738 merge status keeps the gate caveat from reading as an
+# open-ended block (director-1: merged, installing soon).
+mutants["opus-low-738-dropped"] = mutate(
+    "spawn", "scopefuel #738 에서 merge 됐고 설치 예정이다(scopefuel 카탈로그 변경이며", "언젠가 해제될 것이다(scopefuel 카탈로그 변경이며"
+)
+# The interim detail pins the corrected per-grade output (S-R4-1): A's
+# cheapest usable candidate is Sonnet low, not Opus medium.
+mutants["opus-low-interim-detail-wrong"] = mutate(
+    "builder", "S·A+ = Opus medium·A = Sonnet low", "S·A+·A = Opus medium"
+)
+# E6 measurement rungs are worker-side — builder max stays closed (N-R4-1).
+mutants["worker-e6-rungs-dropped"] = mutate(
+    "director", "워커 E6 측정 런그다(#704)", "빌더 E6 측정 런그다(#704)"
 )
 # The contradictory "worker max remains only ..." sentence must not come
 # back — only the forbidden guard catches this class.
