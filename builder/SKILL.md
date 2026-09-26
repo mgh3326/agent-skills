@@ -6,7 +6,7 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 # builder — PR 루프 소유자
 
 빌더는 PR 한 건의 실행 루프를 소유한다. canonical 빌더 프로필은 `builder-opus`(Opus, effort high) 또는
-`builder-sol`(codex-sol)이다. `captain-opus`·`captain-sol`은
+`builder-sol`(codex-sol, effort high — 2026-09-26 운영자 결정 전에는 max 였다)이다. `captain-opus`·`captain-sol`은
 legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
 `builder-grok`은 파일럿 1건을 통과해 **조건부 T1 빌더**로 등재됐다(2026-09-14
 운영자 결정). 조건은 **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(`spawn-worker` §2-4
@@ -43,6 +43,33 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
 필요하고 게이트는 그 런그를 `--effort`로 판정한다(grok·sol-medium 런그는 에스컬레이션이 아니므로
 `--operator-request` 불요). 기존 `builder-grok`·`builder-sol-high`는 그대로 — 별도 철자다
 (`builder-sol-high`는 #704의 `codex-sol@high` 표식 규칙 유지).
+**2026-09-26 운영자 결정으로 max 런그 철자(`builder-sonnet-max`·`builder-sol-max`·
+`builder-luna-max`·`builder-terra-max`·`builder-kimi-max`)는 닫혔다** — 빌더 좌석은
+max 를 쓸 수 없으므로 `SCOPEFUEL_E6_ARM` 표식과 무관하게 wrk 가 거부한다.
+
+<!-- T736-ASSIGNMENT-DEFAULTS -->
+🔴 **배정 기본값 (출처: 2026-09-26 운영자 결정 `decision/2026-09-26/effort-efficiency`
++ AA telemetry 스냅샷 `pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23)** —
+벤치 수치는 스킬 문서에 복사하지 않는다. 급의 정본은 `scopefuel --recommend` 와
+scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다 — 급표 정본은
+`spawn-worker` §2-2 다.
+
+- **빌더 좌석은 max 런그를 쓰지 않는다** — high 이하, 또는 devin 프로필이다.
+  Sol 빌더는 Sol high 를 쓴다. **max effort 는 T3 구현 워커와 T3 tester 에만
+  예약한다.** wrk 도 `--role builder` 에서 max 를 거부한다.
+- **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
+  `builder-devin-max`)은 무료이므로 적극 쓴다.
+- **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** —
+  `spawn-worker` §2-4 규칙 그대로다.
+- **티어별 기본**: T3 코어·tester = Opus xhigh / Sol xhigh(Sol max 는 T3 코어
+  한정, 필요할 때만) · T2 = Sonnet high / Terra high~xhigh 또는 Sol high ·
+  T1·기계적 작업 = Haiku / Luna max / devin swe2-max.
+- **codex 계열**: Sol 워커 기본 effort 는 `xhigh`(빌더는 high). **Terra max 는
+  Sol high~xhigh 로 대체한다** — Terra 는 Sol 을 못 쓸 때의 보조다(동점이면
+  토큰을 더 쓴다). gpt-reserve 7d 창이 어느 모델을 덮는지 미확정이므로 "Terra 가
+  부하를 분산한다"고 주장하지 않는다.
+- **Sonnet 5 는 우선순위 낮은 codex 대체재**다.
+<!-- /T736-ASSIGNMENT-DEFAULTS -->
 
 ## 시작과 브리프
 

@@ -160,6 +160,9 @@ herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000
 각각 `SCOPEFUEL_E6_ARM=grok-hi@low|medium|xhigh` 표식이 필요하고, grok·sol-medium 런그는
 에스컬레이션이 아니므로 `--operator-request`는 불요다. 기존 `builder-grok`은 그대로
 무표식(게이트는 `grok-hi` 기본 런그 판정), `builder-sol-high`도 #704 그대로다.
+2026-09-26 운영자 결정으로 max 런그 철자 5개(`builder-sonnet-max`·
+`builder-sol-max`·`builder-luna-max`·`builder-terra-max`·`builder-kimi-max`)는 닫혔다 —
+빌더 좌석은 max 를 쓰지 않으므로 wrk 가 표식과 무관하게 거부한다.
 
 `devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
 프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). `devin-ds41-max`도

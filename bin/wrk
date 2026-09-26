@@ -229,7 +229,9 @@ and codex-luna/codex-luna-hi/codex-luna-max now run gpt-6-luna. Rollback
 spellings codex-sol56/codex-luna56 run the pre-refresh gpt-5.6-sol/gpt-5.6-luna.
 Claude effort wiring (ROB-1191/ROB-1193): opus default=high, sonnet/sonnet-med default=high,
 haiku default=low; all support an explicit --effort override.
-Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol.
+Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol
+at effort high (was max before 2026-09-26 — a builder seat never takes a max rung,
+operator decision 2026-09-26; the seat rule is enforced on the resolved effort below).
 codex-astra = gpt-6-astra is a counsel-only profile for director/architect/operator-requested
 advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved); --role builder rejects it.
 It defaults to --effort xhigh and requires --purpose director|architect|operator-request,
@@ -258,6 +260,9 @@ builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max,
 builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max,
 builder-kimi-high and builder-kimi-max each pin exactly one effort rung (the
 suffix IS the rung; --effort is refused off-rung, allowed spelled the same).
+2026-09-26 (decision 4088 B): the max-rung members (builder-sonnet-max,
+builder-sol-max, builder-luna-max, builder-terra-max, builder-kimi-max) are
+closed — a builder seat never takes a max rung, marker or not.
 They exist only to measure that rung, so they refuse to spawn without
 SCOPEFUEL_E6_ARM=<gate profile>@<effort> naming exactly it — e.g.
 SCOPEFUEL_E6_ARM=codex-terra@high for builder-terra-high. For these profiles
@@ -1996,7 +2001,12 @@ resolve_catalog_profile() {
     fable) CATALOG_PROFILE=fable ;;
 
     codex) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high ;;
-    codex-sol|codex-max|builder-sol|captain-sol) CATALOG_PROFILE=codex-sol ;;
+    codex-sol|codex-max) CATALOG_PROFILE=codex-sol ;;
+    # 2026-09-26 (decision 4088 B): a builder seat never takes a max rung, so
+    # builder-sol consults the catalog at the high rung — the same shape the
+    # generic `codex` spelling already uses. The worker spellings above keep
+    # the catalog's own default.
+    builder-sol|captain-sol) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high ;;
     codex-terra|codex-med) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;
     codex-terra-max) CATALOG_PROFILE=codex-terra-max ;;
     codex-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=medium ;;
@@ -2267,7 +2277,10 @@ resolve_profile() {
     codex) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    # 2026-09-26 (decision 4088 B): builder seats never take a max rung — the
+    # builder-sol default drops to high, and the catalog pin in
+    # resolve_catalog_profile consults the same rung when the canon answers.
+    builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     # task #633 (#594 E3): builder-luna is codex-luna under --role builder at
     # xhigh. The literal is the catalog-unreachable fallback; #593 wiring lets
     # `policy launch` replace both fields.
@@ -2455,6 +2468,17 @@ resolve_profile() {
     EFFECTIVE_EFFORT="$EFFORT"
   else
     EFFECTIVE_EFFORT="$DEFAULT_EFFORT"
+  fi
+
+  # 2026-09-26 (decision 4088 B): a builder seat never takes a max rung — high
+  # or below, or a devin profile. This sits ahead of the E6 pin check so the
+  # #704 max-rung builder spellings (builder-sonnet-max, builder-sol-max,
+  # builder-luna-max, builder-terra-max, builder-kimi-max) are closed by the
+  # seat rule itself, not merely by a missing marker. devin profiles carry no
+  # --effort at all (EFFORT_SUPPORTED=0 above), so their free swe-2-max rung
+  # never reaches this check.
+  if [[ "${ROLE:-worker}" == builder && "$EFFECTIVE_EFFORT" == max ]]; then
+    die "$MODEL at effort max is refused for --role builder: builder seats never take a max rung (operator decision 2026-09-26) — use high or below, or a devin profile"
   fi
 
   # #704 (#594 E6): the per-rung builder spellings carry GATE_EFFORT_PIN. The
@@ -4374,7 +4398,7 @@ spawn_cmd() {
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
       builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max)" ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)

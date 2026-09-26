@@ -2101,8 +2101,8 @@ PY
 # profile, the spellings that already are canonical stay put, and the ROB-591
 # rollback spellings stay literal (they pin the superseded model).
 launch_profile_case codex-sol codex-sol-xhigh 'codex-sol@xhigh' --effort xhigh
-launch_profile_case builder-sol builder-sol-canon 'codex-sol@max' --role builder --lane builder-sol-lane --parent parent-lane
-launch_profile_case captain-sol captain-sol-canon 'codex-sol@max' --role builder --lane captain-sol-lane --parent parent-lane
+launch_profile_case builder-sol builder-sol-canon 'codex-sol@high' --role builder --lane builder-sol-lane --parent parent-lane
+launch_profile_case captain-sol captain-sol-canon 'codex-sol@high' --role builder --lane captain-sol-lane --parent parent-lane
 launch_profile_case codex-max codex-max-canon 'codex-sol@max'
 launch_profile_case codex codex-canon 'codex-sol@high'
 launch_profile_case codex-sol56 codex-sol56-rollback 'codex-sol56@max'
@@ -2966,10 +2966,16 @@ assert escalate["owner_lane"] == "builder-old-lane", escalate
 assert joined["owner_lane"] == "builder-new-lane", joined
 assert joined["parent_lane"] == "parent-new", joined
 PY
-: >"$TMP/herdr.log"
-builder_sol_out="$(spawn_base builder-sol --role builder --lane builder-sol-lane --parent parent-lane --job builder-sol-job --t T1 2>&1)"
+: >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log" 2>/dev/null || true
+builder_sol_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sol --role builder --lane builder-sol-lane --parent parent-lane --job builder-sol-job --t T1 2>&1)"
 grep -q 'model=builder-sol' <<<"$builder_sol_out"
 grep -q -- '-m gpt-6-sol' "$TMP/herdr.log"
+# 2026-09-26 (decision 4088 B): a builder seat never takes a max rung —
+# builder-sol runs codex-sol at effort high and consults the catalog at high.
+grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
+  fail "builder-sol must launch codex-sol at effort high: $(cat "$TMP/herdr.log")"
+grep -q 'policy launch codex-sol effort=high' "$TMP/launch.log" ||
+  fail "builder-sol must consult the catalog for codex-sol at effort high"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
 # task #526 AC2: the counsel path must not regress — `wrk spawn -m codex-astra`
 # under the default role (the ARCHITECT.md spawn shape, no --role) still
@@ -3279,17 +3285,12 @@ PY
 e6_builder_case builder-opus-low     opus        low    '--model opus --dangerously-skip-permissions --effort low'     --operator-request hk:task/704
 e6_builder_case builder-opus-medium  opus        medium '--model opus --dangerously-skip-permissions --effort medium'
 e6_builder_case builder-sonnet-xhigh sonnet      xhigh  '--model sonnet --dangerously-skip-permissions --effort xhigh' --operator-request hk:task/704
-e6_builder_case builder-sonnet-max   sonnet      max    '--model sonnet --dangerously-skip-permissions --effort max'
 e6_builder_case builder-sol-high     codex-sol   high   '--yolo -m gpt-6-sol -c model_reasoning_effort=high'
-e6_builder_case builder-sol-max      codex-sol   max    '--yolo -m gpt-6-sol -c model_reasoning_effort=max'
 # #737: codex-sol@medium joins the sol E6 rungs on the same pin rule.
 e6_builder_case builder-sol-medium   codex-sol   medium '--yolo -m gpt-6-sol -c model_reasoning_effort=medium'
-e6_builder_case builder-luna-max     codex-luna  max    '--yolo -m gpt-6-luna -c model_reasoning_effort=max'
 e6_builder_case builder-terra-high   codex-terra high   '--yolo -m gpt-5.6-terra -c model_reasoning_effort=high'
 e6_builder_case builder-terra-xhigh  codex-terra xhigh  '--yolo -m gpt-5.6-terra -c model_reasoning_effort=xhigh'
-e6_builder_case builder-terra-max    codex-terra max    '--yolo -m gpt-5.6-terra -c model_reasoning_effort=max'
 e6_builder_case builder-kimi-high    kimi-k3     high   '--auto -m kimi-code/k3'
-e6_builder_case builder-kimi-max     kimi-k3     max    '--auto -m kimi-code/k3'
 # #737 (decision 4088): the grok E6 rungs — grok-hi@low/medium/xhigh, same
 # generic grok argv shape as builder-grok, marker-gated at the pinned rung.
 e6_builder_case builder-grok-low     grok-hi     low    '--always-approve -m grok-4.7 --effort low'
@@ -3297,13 +3298,53 @@ e6_builder_case builder-grok-medium  grok-hi     medium '--always-approve -m gro
 e6_builder_case builder-grok-xhigh   grok-hi     xhigh  '--always-approve -m grok-4.7 --effort xhigh'
 echo "PASS 704+737 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
+# 2026-09-26 (decision 4088 B): the five max-rung builder spellings are closed —
+# a builder seat never takes a max rung, so the seat rule fires ahead of the
+# E6 marker check and refuses even with the exact SCOPEFUEL_E6_ARM armed.
+for e6_max_model in builder-sonnet-max builder-sol-max builder-luna-max \
+  builder-terra-max builder-kimi-max; do
+  case "$e6_max_model" in
+    builder-sonnet-max) e6_max_gate=sonnet ;;
+    builder-sol-max)    e6_max_gate=codex-sol ;;
+    builder-luna-max)   e6_max_gate=codex-luna ;;
+    builder-terra-max)  e6_max_gate=codex-terra ;;
+    builder-kimi-max)   e6_max_gate=kimi-k3 ;;
+  esac
+  set +e
+  e6_max_out="$(SCOPEFUEL_E6_ARM="$e6_max_gate@max" \
+    KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
+    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    spawn_base "$e6_max_model" --role builder --lane "$e6_max_model-lane" --parent parent-lane \
+    --job "e6-max-closed-$e6_max_model" --t T1 2>&1)"
+  e6_max_rc=$?
+  set -e
+  [[ "$e6_max_rc" -eq 2 ]] ||
+    fail "$e6_max_model with its exact marker must still die rc 2 (rc=$e6_max_rc): $e6_max_out"
+  grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
+    fail "$e6_max_model refusal must name the builder-seat rule: $e6_max_out"
+done
+# A non-rung spelling cannot sneak max onto a builder seat either: an explicit
+# --effort max on builder-sol (default high) dies on the same rule.
+set +e
+e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-max-lane --parent parent-lane \
+  --effort max --job e6-builder-sol-effort-max --t T1 2>&1)"
+e6_max_rc=$?
+set -e
+[[ "$e6_max_rc" -eq 2 ]] ||
+  fail "builder-sol --effort max must die rc 2 (rc=$e6_max_rc): $e6_max_out"
+grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
+  fail "builder-sol --effort max refusal must name the builder-seat rule: $e6_max_out"
+echo "PASS 736 max-rung builder spellings closed by the builder-seat rule"
+
 # Marker mutants: no marker, and a marker naming a different rung, both die on
 # wrk's own guard (rc 2, before the gate is asked) — the installed gate then
 # fail-closes the unmeasured C rungs a second time for good measure.
-for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
-  builder-sol-high builder-sol-max builder-sol-medium builder-luna-max builder-terra-high builder-terra-xhigh \
-  builder-terra-max builder-kimi-high builder-kimi-max \
-  builder-grok-low builder-grok-medium builder-grok-xhigh; do
+# The max-rung spellings are absent here: since 2026-09-26 the builder-seat
+# rule refuses them before the marker check (asserted above), so a missing
+# marker is no longer the operative refusal for them.
+for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
+  builder-sol-high builder-sol-medium builder-terra-high builder-terra-xhigh \
+  builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
@@ -3317,24 +3358,24 @@ for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh builde
     fail "$e6_model missing-marker refusal must name the marker: $e6_missing_out"
 done
 set +e
-e6_wrong_out="$(SCOPEFUEL_E6_ARM=kimi-k3@max \
-  spawn_base builder-sonnet-max --role builder --lane e6-wrong-lane --parent parent-lane \
+e6_wrong_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high \
+  spawn_base builder-sonnet-xhigh --role builder --lane e6-wrong-lane --parent parent-lane \
   --job e6-wrong-marker --t T1 2>&1)"
 e6_wrong_rc=$?
 set -e
 [[ "$e6_wrong_rc" -eq 2 ]] ||
-  fail "builder-sonnet-max with a mismatched marker must die rc 2 (rc=$e6_wrong_rc): $e6_wrong_out"
-grep -q 'SCOPEFUEL_E6_ARM=sonnet@max' <<<"$e6_wrong_out" ||
+  fail "builder-sonnet-xhigh with a mismatched marker must die rc 2 (rc=$e6_wrong_rc): $e6_wrong_out"
+grep -q 'SCOPEFUEL_E6_ARM=sonnet@xhigh' <<<"$e6_wrong_out" ||
   fail "wrong-marker refusal must name the required marker: $e6_wrong_out"
 # A correct marker for a different rung of the same gate profile also refuses.
 set +e
-e6_rung_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
-  spawn_base builder-kimi-max --role builder --lane e6-wrong-rung-lane --parent parent-lane \
+e6_rung_out="$(SCOPEFUEL_E6_ARM=kimi-k3@max KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
+  spawn_base builder-kimi-high --role builder --lane e6-wrong-rung-lane --parent parent-lane \
   --job e6-wrong-rung --t T1 2>&1)"
 e6_rung_rc=$?
 set -e
 [[ "$e6_rung_rc" -eq 2 ]] ||
-  fail "builder-kimi-max with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+  fail "builder-kimi-high with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
 # #737: same-profile wrong-rung marker on a grok rung refuses too — a
 # grok-hi@medium arm does not open builder-grok-low's grok-hi@low rung.
 set +e

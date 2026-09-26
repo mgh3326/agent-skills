@@ -49,6 +49,7 @@ jobs:
             tests/test-tester-family-policy.sh \
             tests/test-tester-eligible.sh \
             tests/test-ci-canonical-prose.sh \
+            tests/test-assignment-defaults.sh \
             tests/test-merge-precheck.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
       - name: Bash tests
@@ -75,4 +76,5 @@ jobs:
           bash tests/test-tester-family-policy.sh
           bash tests/test-tester-eligible.sh
           bash tests/test-ci-canonical-prose.sh
+          bash tests/test-assignment-defaults.sh
           bash tests/test-merge-precheck.sh
