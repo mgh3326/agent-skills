@@ -3211,9 +3211,12 @@ echo "PASS #666 devin builder variants reuse the worker argv and need --role bui
 # model argv at that effort, ask the gate about <gate profile>@<rung> (wrk
 # forwards --effort to the gate for these profiles only), record
 # launch_profile=<canonical>@<rung> (#677), and spawn only when
-# SCOPEFUEL_E6_ARM names that exact rung. The gate-marked escalation rungs
-# (sonnet@xhigh — and opus@low only in the fixture's default escalation
-# model, see the #740 block below) also need --operator-request; the kimi pair takes
+# SCOPEFUEL_E6_ARM names that exact rung. The fixture's escalation model
+# still demands --operator-request on its marked rungs (sonnet@xhigh in
+# both modes, opus@low in the default mode — see the #740 block below);
+# the real installed gate skips the escalation ladder on --effort-named
+# rungs (#716), so that demand is fixture-model behaviour, not installed
+# behaviour. The kimi pair takes
 # its rung from the pinned clone home (kimi has no --effort); the grok rungs
 # are plain marker-gated (not escalation).
 # Mutants: dropping GATE_EFFORT_PIN, the marker check, the clone-effort check,
@@ -3346,6 +3349,52 @@ set -e
 grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
   fail "builder-sol --effort ultra refusal must name the builder-seat rule: $e6_max_out"
 echo "PASS 736 max-rung builder spellings closed by the builder-seat rule"
+
+# #748: the unflagged kimi spellings admitted as builders (builder-kimi,
+# kimi-k3) leave EFFECTIVE_EFFORT empty — the seat rule reads the home's
+# [thinking] effort instead. A home pinned to max is refused on the same
+# seat rule; a home at high is admitted. builder-kimi-max in the loop above
+# is refused by the seat rule itself (exact marker armed AND a valid max
+# clone still refused), not merely by a missing marker.
+for e6_kimi_builder in builder-kimi kimi-k3; do
+  set +e
+  e6_kmax_out="$(KIMI_CODE_HOME="$E6_KIMI_MAX_HOME" \
+    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    spawn_base "$e6_kimi_builder" --role builder --lane "kmax-$e6_kimi_builder-lane" --parent parent-lane \
+    --job "e6-khome-max-$e6_kimi_builder" --t T1 2>&1)"
+  e6_kmax_rc=$?
+  set -e
+  [[ "$e6_kmax_rc" -eq 2 ]] ||
+    fail "$e6_kimi_builder on a max-effort kimi home must die rc 2 (rc=$e6_kmax_rc): $e6_kmax_out"
+  grep -q 'builder seats never take a max rung' <<<"$e6_kmax_out" ||
+    fail "$e6_kimi_builder max-home refusal must name the builder-seat rule: $e6_kmax_out"
+done
+# A high-effort kimi home stays admitted — same argv as before, no --effort
+# anywhere (the CLI has no flag; the rung lives only in the clone config).
+: >"$TMP/herdr.log"
+set +e
+e6_khigh_out="$(KIMI_CODE_HOME="$E6_KIMI_HIGH_HOME" \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-kimi --role builder --lane khigh-builder-kimi-lane --parent parent-lane \
+  --job e6-khome-high-builder-kimi --t T1 2>&1)"
+e6_khigh_rc=$?
+set -e
+[[ "$e6_khigh_rc" -eq 0 ]] ||
+  fail "builder-kimi on a high-effort kimi home must be admitted (rc=$e6_khigh_rc): $e6_khigh_out"
+e6_khigh_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$e6_khigh_start" == *' -- --auto -m kimi-code/k3' ]] ||
+  fail "builder-kimi on a high home must reuse the kimi-k3 argv verbatim: $e6_khigh_start"
+# The seat rule stays builder-scoped: the same max home on a worker spawn is
+# unaffected (worker max rungs are a separate reservation, not this rule).
+set +e
+e6_kworker_out="$(KIMI_CODE_HOME="$E6_KIMI_MAX_HOME" \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base kimi-k3 --job e6-khome-max-worker --t T1 2>&1)"
+e6_kworker_rc=$?
+set -e
+[[ "$e6_kworker_rc" -eq 0 ]] ||
+  fail "kimi-k3 worker on a max-effort home must stay admitted (rc=$e6_kworker_rc): $e6_kworker_out"
+echo "PASS 748 kimi builder spellings refuse a max-effort home on the seat rule"
 
 # Marker mutants: no marker, and a marker naming a different rung, both die on
 # wrk's own guard (rc 2, before the gate is asked) — the installed gate then

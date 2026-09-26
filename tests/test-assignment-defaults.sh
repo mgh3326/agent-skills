@@ -23,6 +23,7 @@ paths = {
     "spawn": Path(os.environ.get("SPAWN_WORKER_SKILL", root / "spawn-worker/SKILL.md")),
     "builder": Path(os.environ.get("BUILDER_SKILL", root / "builder/SKILL.md")),
     "director": Path(os.environ.get("DIRECTOR_SKILL", root / "director/SKILL.md")),
+    "readme": root / "README.md",
     "wrk": root / "bin/wrk",
     "policy": root / "director/gate_policy.json",
 }
@@ -154,6 +155,26 @@ WRK_FORBIDDEN = [
      r"builder-(?:sonnet|sol|luna|terra|kimi)-max[^\n]{0,30}?(?:opens?|launches|spawns?|열린|뜬)"),
 ]
 
+# #748 (post-#740 codex tester finding): on an explicit --effort rung the
+# installed gate judges quota rules and shows the escalation tag — it never
+# enforces a --operator-request REF there (scopefuel #716). The stale claim
+# that a marked rung "needs a REF" is forbidden wherever it appeared; the
+# negated forms ("요구하지 않는다", "no ... enforced") stay legal.
+REF_REQUIRED_FORBIDDEN = [
+    ("ref-required-en",
+     r"(?:needs?|requires?|demands?|must)\s+(?:an?\s+|the\s+|a\s+)?--operator-request"),
+    ("ref-required-en-passive",
+     r"--operator-request`?\s+(?:is|are)\s+(?:required|needed|mandatory)"),
+    ("ref-required-ko",
+     r"--operator-request`?\s*가\s*(?:추가로\s+)?필요(?:하다|함)|--operator-request`?\s*를\s*요구한다"),
+    ("ref-required-escalation",
+     r"에스컬레이션[^\n]{0,40}?--operator-request[^\n]{0,15}?추가"),
+]
+
+EXPLICIT_RUNG_NO_REF = (
+    r"명시[^\n]{0,20}?--effort[^\n]{0,60}?--operator-request[^\n]{0,40}?요구하지 않는다"
+)
+
 CLOSED_E6 = r"max 런그 철자\([^\n]*?builder-sonnet-max[^\n]*?\)는? 닫혔다"
 
 
@@ -190,19 +211,44 @@ def check(d: dict) -> None:
             f"{name}: closed max-rung E6 spellings note missing"
         )
 
-    # bin/wrk: the builder-seat rule must sit on EFFECTIVE_EFFORT, and
-    # builder-sol must resolve/catalog-pin at high.
+    # #748: the stale "marked rung needs a REF" claim may not appear in any
+    # scanned doc, and the corrected #716 wording must be where the rungs are
+    # documented (spawn/builder table rows, README note, wrk help).
+    for name in (*SKILLS, "wrk", "readme"):
+        for row, pattern in REF_REQUIRED_FORBIDDEN:
+            assert not re.search(pattern, flat(d[name])), (
+                f"{name}: stale REF-required claim reintroduced ({row}): "
+                f"{re.search(pattern, flat(d[name])).group(0)!r}"
+            )
+    for name in ("spawn", "builder", "readme"):
+        assert re.search(EXPLICIT_RUNG_NO_REF, flat(d[name])), (
+            f"{name}: #716 explicit-rung no-REF wording missing"
+        )
+    assert re.search(
+        r"explicit --effort rung[^\n]{0,80}?quota rules[^\n]{0,80}?no --operator-request[^\n]{0,40}?enforced",
+        wrk_flat,
+    ), "wrk: help must say explicit rungs are quota-judged with no REF enforced"
+
+    # bin/wrk: the builder-seat rule must sit on the resolved effort, and
+    # builder-sol must resolve/catalog-pin at high. The kimi home read below
+    # is what lets the unflagged kimi spellings reach the same case arm.
     wrk = flat(d["wrk"])
     assert "builder seats never take a max rung" in wrk, (
         "wrk: builder-seat max refusal message missing"
     )
-    assert re.search(r"ROLE:-worker.{0,40}?builder.{0,40}?EFFECTIVE_EFFORT.{0,15}?max", wrk), (
-        "wrk: the seat rule must gate on role=builder and resolved effort max"
+    assert re.search(
+        r"ROLE:-worker.{0,40}?builder.{0,60}?local seat_effort=\"\$EFFECTIVE_EFFORT\".{0,900}?case \"\$seat_effort\" in max\|ultra\)",
+        wrk,
+    ), (
+        "wrk: the seat rule must gate on role=builder and refuse resolved max|ultra"
     )
-    # ultra is the codex max tier plus subagents — the seat rule must refuse it
-    # as well, or --effort ultra bypasses the whole rule (tester-found hole).
-    assert re.search(r"EFFECTIVE_EFFORT.{0,15}?max\|ultra\)", wrk), (
-        "wrk: the seat rule must refuse the ultra rung too (max|ultra)"
+    # #748: builder-kimi/kimi-k3 leave EFFECTIVE_EFFORT empty — the seat rule
+    # must read the kimi home's [thinking] effort or a max home slips through.
+    assert re.search(
+        r"-z \"\$seat_effort\" && \"\$PROFILE_KIND\" == kimi && -n \"\$KIMI_TRUST_HOME\".{0,600}?seat_effort=\"\$\(kimi_clone_thinking_effort \"\$KIMI_TRUST_HOME/config\.toml\"\)\"",
+        wrk,
+    ), (
+        "wrk: an empty resolved effort on a kimi profile must read the home's [thinking] effort for the seat rule"
     )
     assert re.search(
         r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6-sol;\s*DEFAULT_EFFORT=high",
@@ -444,6 +490,40 @@ mutants["wrk-seat-rule-ultra-dropped"] = mutate(
     "wrk",
     "      max|ultra)",
     "      max)",
+)
+# #748: a seat rule that stops reading the kimi home leaves the unflagged
+# kimi spellings blind to a max-effort home.
+mutants["wrk-seat-rule-kimi-blind"] = mutate(
+    "wrk",
+    'seat_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"',
+    'seat_effort=""',
+)
+# #748: the stale "marked rung needs a REF" claim must go RED in every
+# scanned doc; dropping the corrected wording goes RED via the required row.
+mutants["builder-ref-required-back"] = mutate(
+    "builder",
+    "`--operator-request` REF를\n요구하지 않는다",
+    "`--operator-request`가 추가로\n필요하다",
+)
+mutants["spawn-ref-required-back"] = mutate(
+    "spawn",
+    "`--operator-request` REF를 요구하지 않는다",
+    "`--operator-request`가 추가로 필요하다",
+)
+mutants["readme-ref-required-back"] = mutate(
+    "readme",
+    "`--operator-request` REF를 요구하지 않는다",
+    "`--operator-request` 추가",
+)
+mutants["wrk-ref-required-back"] = mutate(
+    "wrk",
+    "so no --operator-request REF is enforced there",
+    "additionally need --operator-request REF",
+)
+mutants["builder-explicit-no-ref-dropped"] = mutate(
+    "builder",
+    "`--operator-request` REF를\n요구하지 않는다",
+    "`--operator-request` REF를\n요구한다",
 )
 mutants["wrk-builder-sol-back-to-max"] = mutate(
     "wrk",

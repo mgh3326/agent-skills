@@ -278,13 +278,14 @@ opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
 kimi-k3@max, grok-hi@xhigh; #737 adds grok-hi@low, grok-hi@medium and
 codex-sol@medium). The @max arms here are inert for builders since the
 seat rule fires first; they still describe worker-side measurement.
-Rungs the gate marks escalation (sonnet@xhigh)
-additionally need --operator-request REF. opus@low lost its escalation mark
-in scopefuel #738 (b5b0ad2): post-#738 the gate refuses a REF on it
-(operator_request_not_applicable, rc 3). Pre-#738 installs keep the mark but
-accept a REF on it — wrk forwards a caller-supplied REF verbatim either way
-and never adds one; which rungs are escalation is the gate's call, not
-wrk's. #737 adds the grok rungs of
+Rungs the gate marks escalation (sonnet@xhigh) are shown with that tag by
+the gate — on an explicit --effort rung it still judges quota rules only,
+so no --operator-request REF is enforced there (scopefuel #716). Which
+rungs are escalation-marked is the gate's call, not wrk's; wrk forwards a
+caller-supplied REF verbatim and never adds one. opus@low lost its
+escalation mark in scopefuel #738 (b5b0ad2): post-#738 the gate refuses a
+REF on it (operator_request_not_applicable, rc 3), while pre-#738 installs
+keep the mark but still accept a REF on it. #737 adds the grok rungs of
 decision 4088 — builder-grok-low, builder-grok-medium and
 builder-grok-xhigh pin grok-hi@<rung> the same way
 (SCOPEFUEL_E6_ARM=grok-hi@<rung>; grok rungs are not escalation-marked, so
@@ -2490,11 +2491,23 @@ resolve_profile() {
   # builder-luna-max, builder-terra-max, builder-kimi-max) are closed by the
   # seat rule itself, not merely by a missing marker. devin profiles carry no
   # --effort at all (EFFORT_SUPPORTED=0 above), so a devin builder's
-  # model-encoded rung never reaches this check.
+  # model-encoded rung never reaches this check. The unflagged kimi spellings
+  # (builder-kimi, kimi-k3) resolve their rung from the home's [thinking]
+  # effort below — the only place it exists for them.
   if [[ "${ROLE:-worker}" == builder ]]; then
-    case "$EFFECTIVE_EFFORT" in
+    local seat_effort="$EFFECTIVE_EFFORT"
+    if [[ -z "$seat_effort" && "$PROFILE_KIND" == kimi && -n "$KIMI_TRUST_HOME" ]]; then
+      # builder-kimi and kimi-k3 leave EFFECTIVE_EFFORT empty (no --effort
+      # flag, no DEFAULT_EFFORT): the only rung they can run is the
+      # [thinking] effort in the kimi home's config.toml. Read it or a
+      # max-effort home slips a builder seat past this rule unseen. A
+      # missing/unparseable config yields empty and stays fail-open here —
+      # the E6 rungs below are what fail closed on a missing clone.
+      seat_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"
+    fi
+    case "$seat_effort" in
       max|ultra)
-        die "$MODEL at effort $EFFECTIVE_EFFORT is refused for --role builder: builder seats never take a max rung (operator decision 2026-09-26) — use high or below, or a devin profile" ;;
+        die "$MODEL at effort $seat_effort is refused for --role builder: builder seats never take a max rung (operator decision 2026-09-26) — use high or below, or a devin profile" ;;
     esac
   fi
 

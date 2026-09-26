@@ -152,8 +152,9 @@ herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000
 `builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·`builder-sol-max`·
 `builder-luna-max`·`builder-terra-high`·`builder-terra-xhigh`·`builder-terra-max`·
 `builder-kimi-high`·`builder-kimi-max`를 추가한다 — 이름의 마지막 구간이 고정 런그이고,
-`SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식 없이는 스폰이 거부된다(에스컬레이션 런그는
-`--operator-request` 추가). kimi 런그는 `bin/kimi-clone-home --effort high|max`의 클론 홈이
+`SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식 없이는 스폰이 거부된다(게이트가 에스컬레이션으로
+표시한 런그도 명시 `--effort` 런그에는 `--operator-request` REF를 요구하지 않는다 — scopefuel
+#716). kimi 런그는 `bin/kimi-clone-home --effort high|max`의 클론 홈이
 런그를 고정한다. #737(decision 4088)은 같은 규칙으로 grok 런그
 `builder-grok-low`·`builder-grok-medium`·`builder-grok-xhigh`와 sol 런그
 `builder-sol-medium`(`SCOPEFUEL_E6_ARM=codex-sol@medium`)을 추가한다 —
