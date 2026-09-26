@@ -94,7 +94,7 @@ builder 가 워커·tester 스폰 없이 직접 구현하는 **단독 모드**�
 | `builder-devin` | **A+ 급 작업의 T1·T2 빌더**(2026-09-14 파일럿 1건 통과로 T1 한정 등재 → 2026-09-23 운영자 결정으로 T2 확대). 워커 프로필 `devin-swe2`의 argv·kind를 재사용한다. 조건: **급 A+ 이하 작업(`S` 이상 제외) · 가역 T1·T2 한정(T3 제외) · 라운드 상한 3 · 독립 tester는 타사 provider family(§2-4 조건부 동일 계열 검증·소진 시 지연 검증 적용) · 배포·라이브 매매 표면 제외**. 무료 풀이라 여유율 규칙상 **우선 배정** 후보다. 결정 기록: 2026-09-23 운영자 결정(receipt `decision/2026-09-23/operator-batch-1100`, 근거 본문 `task/2026-09-23/spawn-worker-builder-devin-t2`) — 09-21 이후 빌더 역할 표본 7건 전부 머지, 되돌리기 조건 발동 0. 다음 재판단: `S` 급 확대는 S 급 빌더 reps 를 측정한 뒤에 한다. 라운드 상한 초과나 게이트 BOUNCE 2회면 워커 전용으로 되돌린다. |
 | `builder-grok` | **조건부 T1 빌더**(2026-09-14 운영자 결정, 파일럿 1건 통과). grok 4.7 argv(ROB-591 전 파일럿 당시 4.6)를 effort `xhigh`로 재사용한다 — 🔴 워커 철자 `grok`/`grok-hi`로 빌더를 띄우면 기본 effort가 `high`라 조용히 달라지므로, 빌더는 `builder-grok`을 쓰거나 `--effort xhigh`를 명시한다. 조건: **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(§2-4 조건부 동일 계열 검증·소진 시 지연 검증 적용) · T2 이상과 배포·안전가드 표면 제외**. 배정은 codex·claude 풀이 빠듯할 때. 정식 등재와 T2 확대는 **빌더 역할 표본 3**에서 재판단하며, 라운드 상한 초과나 게이트 BOUNCE 2회면 워커 전용으로 되돌린다. |
 | `builder-luna` | **#594 E3 실험 표본용 codex-luna 빌더**(task #633). 워커 프로필 `codex-luna`(gpt-6-luna)의 argv를 effort `xhigh`로 재사용한다 — `--effort`는 xhigh로 고정(wrk가 그 외를 거부). 카탈로그상 codex-luna는 medium=B · max=A+ 이므로 이 프로필의 과제 급 상한은 카탈로그가 xhigh에 매기는 급과 같다 — 급 미달 과제에는 배정하지 않는다. E3 표본이므로 브리프에 `exp=E3`를 태그하고 reps 기록이 의무다(#594 운영 문서). |
-| #704/#737 E6 런그 빌더 — `builder-opus-low`·`builder-opus-medium`·`builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·`builder-sol-max`·`builder-luna-max`·`builder-terra-high`·`builder-terra-xhigh`·`builder-terra-max`·`builder-kimi-high`·`builder-kimi-max`·`builder-grok-low`·`builder-grok-medium`·`builder-grok-xhigh`·`builder-sol-medium` | **미측정(C) → E6 측정 전용**(#594 effort ladder, tasks #704·#737). 각 철자는 이름 마지막 구간의 런그 하나만 고정한다(그 외 `--effort`는 wrk가 거부). 스폰은 `SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식이 정확히 그 런그를 가리킬 때만 열린다 — 예: `builder-terra-high`는 `SCOPEFUEL_E6_ARM=codex-terra@high`, `builder-sol-high`는 `codex-sol@high`. 게이트가 에스컬레이션으로 표시한 런그(`builder-opus-low`·`builder-sonnet-xhigh`)는 `--operator-request`가 추가로 필요하다. `builder-kimi-high`·`builder-kimi-max`는 kimi CLI에 `--effort`가 없으므로 `bin/kimi-clone-home --effort high|max`의 클론 홈이 런그를 고정한다(wrk가 클론 설정을 검증). #737의 grok 런그(`builder-grok-low`·`builder-grok-medium`·`builder-grok-xhigh`)는 `grok-hi@low|medium|xhigh` 표식을 요구하며 에스컬레이션이 아니므로 `--operator-request`는 불요다(기존 `builder-grok`은 그대로 무표식). 과제당 한 런그만 측정하고, 브리프에 `exp=E6` 태그·reps 기록(`launch_profile`의 canonical `profile@effort`)이 의무다. |
+| #704/#737 E6 런그 빌더 — `builder-opus-low`·`builder-opus-medium`·`builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·`builder-sol-max`·`builder-luna-max`·`builder-terra-high`·`builder-terra-xhigh`·`builder-terra-max`·`builder-kimi-high`·`builder-kimi-max`·`builder-grok-low`·`builder-grok-medium`·`builder-grok-xhigh`·`builder-sol-medium` | **미측정(C) → E6 측정 전용**(#594 effort ladder, tasks #704·#737). 각 철자는 이름 마지막 구간의 런그 하나만 고정한다(그 외 `--effort`는 wrk가 거부). 스폰은 `SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식이 정확히 그 런그를 가리킬 때만 열린다 — 예: `builder-terra-high`는 `SCOPEFUEL_E6_ARM=codex-terra@high`, `builder-sol-high`는 `codex-sol@high`. 게이트가 에스컬레이션으로 표시한 런그(`builder-opus-low`·`builder-sonnet-xhigh`)는 `--operator-request`가 추가로 필요하다. `builder-kimi-high`·`builder-kimi-max`는 kimi CLI에 `--effort`가 없으므로 `bin/kimi-clone-home --effort high|max`의 클론 홈이 런그를 고정한다(wrk가 클론 설정을 검증). #737의 grok 런그(`builder-grok-low`·`builder-grok-medium`·`builder-grok-xhigh`)는 `grok-hi@low|medium|xhigh` 표식을 요구하며 에스컬레이션이 아니므로 `--operator-request`는 불요다(기존 `builder-grok`은 그대로 무표식). 과제당 한 런그만 측정하고, 브리프에 `exp=E6` 태그·reps 기록(`launch_profile`의 canonical `profile@effort`)이 의무다. **2026-09-26 운영자 결정(아래 T736 배정 기본값)으로 max 런그 철자(`builder-sonnet-max`·`builder-sol-max`·`builder-luna-max`·`builder-terra-max`·`builder-kimi-max`)는 닫혔다 — 빌더 좌석은 max 를 못 쓰므로 wrk 가 표식과 무관하게 거부한다.** |
 | `oc-solar4` | **B** 실측 확정(reps `id=699`·`700`·`702`: 구조·닫힌 어휘 위반 0, 원문 충실도는 1패스 실패·반복 개정으로 도달, 판단·의미는 3건 모두 약함). `T1` 한정·tester 금지를 유지한다. **산출물 자체가 판단인 과업은 배정하지 않는다**(감사 결론·리스크 분류·채택 여부 판정 등) — 검토가 뒤따르는 기계 검증 가능한 변환·태깅·형식화는 허용한다. 운용은 기계 검사 가능한 규칙 + 자력 개정 허용이 최적이며, **1패스 산출은 신뢰하지 않는다**. 브리프에 '승인 대기 없이 완주'를 명시한다(승인 대기 정지 1회 실측). 브리프에는 §3의 **rate limit 대응 절**(429·rate limit 시 지수 백오프, 막히면 중단·보고)도 반드시 포함한다. 상시 배정은 하지 않는다. 장기 정본과 등급 조정은 scopefuel을 따른다. |
 | `devin-glm52`·`devin-swe17` | **등재 보류** — 사유: SWE-2 대비 우위 없음(구세대·전세대이고 컨텍스트도 작다). 프로필은 이미 있으니 필요해지면 reps 만 돌리면 된다 — 배제가 아니라 **측정 비용의 우선순위** 문제다. devin-swe2 와 동일한 무인 argv(모델명만 `glm-5-2`·`swe-1-7`). scopefuel `devin` 풀 공유. |
 | `devin-ds41` | **미측정 → T1/T2** (유료 $0.22/1M in, 벤치 TB2.1 90.6). devin-swe2 와 동일한 무인 argv(모델명만 `deepseek-v4-1-flash-high`). reps 3건으로 급 확정. scopefuel `devin` 풀 공유 — 유료 사용 시 태스크 note 에 모델·급을 남긴다(사후 비용 귀속). |
@@ -133,6 +133,46 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
 2026-08-06 에 fable 이 낡은 컬럼으로 조회해 "grok medium 실사용 0건"으로 오판했고, 실제로는
 `grok@medium` 1건이 돌고 있었다. 급 적합성·reps 집계·실사용 카운트는 항상 `launch_profile`
 (또는 `scopefuel reps`) 으로 확인한다.
+
+<!-- T736-ASSIGNMENT-DEFAULTS -->
+🔴 **배정 기본값 (출처: 2026-09-26 운영자 결정 `decision/2026-09-26/effort-efficiency` B
++ hk:doc `note/2026-09-26/grade-cost-table`(id 4098 — 카탈로그 급 × AA 작업당 비용)
++ AA telemetry 스냅샷 `pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23)** —
+결정과 스냅샷은 인용하되 **벤치 수치는 이 문서에 복사하지 않는다.** 급의 정본은 계속
+`scopefuel --recommend` 와 scopefuel 정책이고, 위 급표가 이 문서의 유일한 급표다.
+
+- **기본 규칙: 과제 급 이상으로 배치된 후보 중 작업당 비용이 가장 낮은 것을 기본으로
+  고른다**(note 4098 의 규칙 — 이후 값들은 고정 목록이 아니라 이 규칙의 현재 출력이다.
+  **#735 의 측정 rep 이 이 표를 재보정한다** — 규칙이 정본, 수치는 갱신된다). 배정은
+  규칙이 고른 `profile@effort` 를 `--effort` 로 명시해 적용한다 — **wrk 철자 기본값은
+  정책이 아니다**.
+- **빌더 좌석은 max 런그를 쓰지 않는다**(codex `ultra` = max+서브에이전트 계열, 같은 거부다) —
+  기본은 high 이하 또는 devin 프로필이다(4088 B; 별도 승인된 xhigh 빌더 —
+  `builder-grok`·`builder-luna`·E6 xhigh 철자 — 는 그대로다). 같은 규칙 아래에서도
+  빌더 후보는 max 를 빼고 고른다. Sol 빌더는 Sol high(wrk 기본값 그대로 — Sol high
+  자체는 미측정 C 라 배정 후보가 아니라 좌석 고정값이다), devin 빌더는 effort 플래그
+  없이 모델 런그 그대로다. **max effort 는 T3 구현 워커·T3 tester 에만 예약한다
+  (4088 B)** — 예외는 devin swe2-max(4088 명시, 무료)·A+ 의 Luna max(note 4098 비용
+  규칙)·워커 E6 측정 런그다(#704). wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
+- **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
+  `builder-devin-max`)은 무료이므로 적극 쓴다.
+- **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** — §2-2 급표 행의
+  규칙 그대로 유지.
+- **현재 출력(예시) — claude**: Opus·Sonnet·Haiku 가 하나의 주간 창을 나누므로
+  작업당 비용이 곧 쿼타 소모 비교축이다. **S+ = Opus medium**(T3 코어 구현은
+  Opus high, T3 tester 는 Opus xhigh, **Opus max 는 쓰지 않는다**) · **S·A+·A =
+  Opus low**(모든 Sonnet effort 를 비용·점수 양쪽에서 지배) · **B·C·기계적 작업 =
+  Haiku**. ※ Opus low 는 현재 카탈로그에서 gate=escalation 이라 아직 그대로 못 쓴다 —
+  해제는 scopefuel #738 에서 merge 됐고 설치 예정이다(scopefuel 카탈로그 변경이며
+  **이 PR 의 범위 밖**). 해제 전까지 S·A+·A 도 사용 가능 후보 중 비용 최소로 고른다
+  (현재 그 다음 저가는 S·A+ = Opus medium·A = Sonnet low 다).
+- **현재 출력(예시) — codex**(공용 7d 창; reserve 창이 어느 모델을 덮는지 미확정):
+  **S+·S = Sol xhigh**(Sol max 는 T3 코어가 필요할 때만) · **A+ = Luna max** ·
+  **A = Luna high** · **B = Luna medium**. **Terra 는 모든 급에서 지배당한다** —
+  reserve 창이 Terra 전용으로 확인될 때만 보조로 쓴다(부하 분산 주장 금지).
+  `codex-sol` 철자 자체의 기본값은 max 라서 Sol 배정은 `--effort` 명시로 한다.
+  미측정 Sol high(C)·미배치 Sol medium 은 **E6 arm 우선 측정 대상**이다 — 측정되면 S 후보.
+<!-- /T736-ASSIGNMENT-DEFAULTS -->
 
 ### 2-3. 하네스 서브에이전트 vs herdr 워커 (경계)
 
