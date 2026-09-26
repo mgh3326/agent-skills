@@ -22,7 +22,12 @@ from gate_common import (  # noqa: E402
 SHA = re.compile(r"^[0-9a-f]{40}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})$")
 STAGES = ("pre-spawn", "post-landing", "pre-merge")
-TOOL_VERSION = "tester-eligible/1.1"
+TOOL_VERSION = "tester-eligible/1.2"
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_REMOVED_DEF = re.compile(r"^-\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
+_REMOVED_NAME = re.compile(r"^-([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]")
+_IMPORT_LINE = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_.]*)")
+_FROM_IMPORT = re.compile(r"^\s*from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\s+(.+)$")
 
 
 def _digest(value: object) -> str:
@@ -113,7 +118,7 @@ def _read_previous(path_text: str | None, required_stage: str, evidence: dict,
             return None, result("UNVERIFIED", "PREVIOUS_RECEIPT_INVALID", "decision:3231")
         for key in ("task", "contract_revision", "job", "repo", "repo_path", "issuer",
                     "head", "base", "diff_sha256", "contributors_digest", "declared_t",
-                    "required_grade", "implementation_grade"):
+                    "required_grade", "implementation_grade", "split"):
             if previous.get(key) != evidence.get(key):
                 reason = "HEAD_CHANGED" if key == "head" else "BASE_CHANGED" if key == "base" else "EVIDENCE_CHANGED"
                 return None, result("UNVERIFIED", reason, "decision:3231", field=key)
@@ -359,6 +364,236 @@ def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | Non
         return result("UNVERIFIED", "ACTUAL_SOURCE_UNREADABLE", "bin/wrk+pane")
 
 
+def _leaf(symbol: str) -> str | None:
+    """Trailing identifier of a boundary symbol (orders.release -> release)."""
+    tokens = _IDENTIFIER.findall(str(symbol))
+    return tokens[-1] if tokens else None
+
+
+def _normalize_boundary(raw: object) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    paths, symbols = raw.get("paths"), raw.get("symbols")
+    if not isinstance(paths, list) or not isinstance(symbols, list):
+        return None
+    if any(not isinstance(path, str) or not path.strip() or path.startswith("/") or
+           ".." in path.split("/") or any(ord(char) < 32 for char in path) for path in paths):
+        return None
+    if any(not isinstance(symbol, str) or not symbol.strip() or _leaf(symbol) is None
+           for symbol in symbols):
+        return None
+    if not paths and not symbols:
+        return None
+    return {"paths": [path.strip() for path in paths], "symbols": [symbol.strip() for symbol in symbols]}
+
+
+def _path_in_boundary(path: str, boundary: dict, contract_path: str | None) -> str | None:
+    if contract_path and path == contract_path:
+        return "contract"
+    for entry in boundary["paths"]:
+        if path == entry or path.startswith(entry.rstrip("/") + "/") or \
+                fnmatch.fnmatch(path, entry) or fnmatch.fnmatch(Path(path).name, entry):
+            return "path"
+    return None
+
+
+def _boundary_modules(boundary: dict) -> set[str]:
+    modules = set()
+    for entry in boundary["paths"]:
+        name = entry.rstrip("/")
+        if not name or any(char in name for char in "*?[]"):
+            continue
+        if name.endswith(".py"):
+            name = name[:-3]
+        elif "." in Path(name).name:
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_./]*", name):
+            modules.add(name.replace("/", "."))
+    return modules
+
+
+def _import_modules(content: str) -> set[str]:
+    names = set()
+    found = _FROM_IMPORT.match(content)
+    if found:
+        names.add(found.group(1))
+        for item in found.group(2).split(","):
+            leaf = _IDENTIFIER.match(item.strip())
+            if leaf:
+                names.add(found.group(1) + "." + leaf.group(0))
+        return names
+    inline = _IMPORT_LINE.match(content)
+    if inline:
+        names.add(inline.group(1))
+    return names
+
+
+def _leaf_hits(text: str, leaves: set[str]) -> list[str]:
+    if not text or not leaves:
+        return []
+    return sorted(leaf for leaf in leaves if leaf in set(_IDENTIFIER.findall(text)))
+
+
+def _changed_paths(repo: Path, base: str, head: str) -> tuple[list[str] | None, str | None]:
+    names = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", base, head)
+    if names.returncode or not names.stdout or not names.stdout.endswith("\0"):
+        return None, "DIFF_READ_FAILED"
+    paths = names.stdout[:-1].split("\0")
+    if any(not path or any(ord(char) < 32 for char in path) or path.startswith("-") for path in paths):
+        return None, "DIFF_UNCLASSIFIABLE"
+    return paths, None
+
+
+def _removed_names(patch: str) -> set[str]:
+    names = set()
+    for line in patch.splitlines():
+        found = _REMOVED_DEF.match(line) or _REMOVED_NAME.match(line)
+        if found:
+            names.add(found.group(1))
+    return names
+
+
+def _referenced_from_boundary(repo: Path, head: str, name: str, boundary: dict) -> list[str] | None:
+    proc = run_git(repo, "grep", "-w", "-l", name, head, "--")
+    if proc.returncode not in (0, 1):
+        return None
+    hits = []
+    for line in proc.stdout.splitlines():
+        _, _, path = line.partition(":")
+        if path and _path_in_boundary(path, boundary, None):
+            hits.append(path)
+    return sorted(hits)
+
+
+def _split_check(evidence: dict) -> tuple[dict | None, dict]:
+    """Mixed-grade T3 split: a peripheral part must not touch the core boundary."""
+    raw = evidence.get("split")
+    if raw is None:
+        return None, result("N/A", "SPLIT_NOT_DECLARED", "task:746")
+    if not isinstance(raw, dict):
+        return None, result("UNVERIFIED", "SPLIT_INVALID", "task:746")
+    part, parent = raw.get("part"), raw.get("parent_task")
+    info: dict = {"part": part, "parent_task": parent}
+    if (part not in {"core", "peripheral"} or not parent or
+        str(parent) == str(evidence.get("task")) or
+        ("parent_t" in raw and raw["parent_t"] != "T3")):
+        return info, result("UNVERIFIED", "SPLIT_INVALID", "task:746")
+    contract_path = raw.get("contract_path")
+    if contract_path is not None and (not isinstance(contract_path, str) or
+                                      not contract_path or contract_path.startswith(("/", "-")) or
+                                      ".." in contract_path.split("/")):
+        return info, result("UNVERIFIED", "SPLIT_INVALID", "task:746", field="contract_path")
+    behaviour = raw.get("behaviour_checks")
+    seen = []
+    if behaviour is not None:
+        if not isinstance(behaviour, list):
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", field="behaviour_checks")
+        for entry in behaviour:
+            if (not isinstance(entry, dict) or not entry.get("id") or
+                entry.get("result") not in {"pass", "fail"}):
+                return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
+                                    field="behaviour_checks")
+            seen.append({"id": entry["id"], "result": entry["result"], "ref": entry.get("ref")})
+        if any(entry["result"] == "fail" for entry in seen):
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
+                                field="behaviour_checks")
+    info["behaviour_checks"] = seen
+    repo = Path(str(evidence.get("repo_path", "")))
+    head, base = str(evidence.get("head", "")), str(evidence.get("base", ""))
+    paths = None
+    if part == "peripheral":
+        if not repo.is_dir() or not SHA.fullmatch(head) or not SHA.fullmatch(base):
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", field="diff")
+        paths, error = _changed_paths(repo, base, head)
+        if paths is None:
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", detail=error)
+        info["paths_checked"] = len(paths)
+        if contract_path is not None and contract_path in paths:
+            info["core_touches"] = [{"path": contract_path, "kind": "contract"}]
+            return info, result("FAIL", "PERIPHERAL_TOUCHES_CORE", "task:746",
+                                touches=info["core_touches"], required_rerun="T3")
+    boundary = _normalize_boundary(raw.get("boundary")) if "boundary" in raw else None
+    contract_sha = None
+    if contract_path is not None:
+        if not repo.is_dir() or not SHA.fullmatch(head):
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", field="repo")
+        show = run_git(repo, "show", f"{head}:{contract_path}")
+        if show.returncode:
+            return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746",
+                                contract_path=contract_path)
+        contract_sha = hashlib.sha256(show.stdout.encode()).hexdigest()
+        try:
+            document = json.loads(show.stdout)
+        except ValueError:
+            document = None
+        contract_boundary = _normalize_boundary(
+            (document or {}).get("boundary", document) if isinstance(document, dict) else None)
+        if contract_boundary is None:
+            return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746",
+                                contract_path=contract_path)
+        if boundary is not None and _digest(boundary) != _digest(contract_boundary):
+            return info, result("UNVERIFIED", "SPLIT_BOUNDARY_CONFLICT", "task:746")
+        boundary = boundary or contract_boundary
+    info["boundary_sha256"] = _digest(boundary) if boundary else None
+    info["contract_path"] = contract_path
+    info["contract_sha256"] = contract_sha
+    if boundary is None:
+        return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746")
+    if part == "core":
+        return info, result("PASS", "SPLIT_CORE_DECLARED", "task:746",
+                            boundary_sha256=info["boundary_sha256"])
+    touched = [{"path": path, "kind": kind} for path in paths
+               if (kind := _path_in_boundary(path, boundary, contract_path))]
+    analyzed = [path for path in paths if not _path_in_boundary(path, boundary, contract_path)]
+    if not touched:
+        modules = _boundary_modules(boundary)
+        leaves = {leaf for symbol in boundary["symbols"] if (leaf := _leaf(symbol))}
+        leaves |= {item.rsplit(".", 1)[-1] for item in modules}
+        unverifiable = []
+        for path in analyzed:
+            proc = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "-U0", base, head, "--", path)
+            if proc.returncode:
+                unverifiable.append(path)
+                continue
+            patch = proc.stdout
+            if "Binary files" in patch or "GIT binary patch" in patch:
+                unverifiable.append(path)
+                continue
+            for line in patch.splitlines():
+                if line.startswith("@@"):
+                    context = "@@".join(line.split("@@")[2:])
+                    touched.extend({"path": path, "kind": "enclosing", "symbol": leaf,
+                                    "detail": context.strip()[:120]}
+                                   for leaf in _leaf_hits(context, leaves))
+                elif line[:1] in {"+", "-"} and not line.startswith(("+++", "---")):
+                    content = line[1:]
+                    touched.extend({"path": path, "kind": "call" if re.search(
+                                        r"\b" + re.escape(leaf) + r"\s*\(", content) else "symbol",
+                                    "symbol": leaf, "detail": content.strip()[:120]}
+                                   for leaf in _leaf_hits(content, leaves))
+                    for module in _import_modules(content):
+                        if any(module == item or module.startswith(item + ".") for item in modules):
+                            touched.append({"path": path, "kind": "import", "symbol": module,
+                                            "detail": content.strip()[:120]})
+            for name in _removed_names(patch):
+                hits = _referenced_from_boundary(repo, head, name, boundary)
+                if hits is None:
+                    unverifiable.append(path)
+                elif hits:
+                    touched.append({"path": path, "kind": "removed_ref", "symbol": name,
+                                    "detail": ",".join(hits[:5])})
+        info["unverifiable"] = sorted(set(unverifiable))
+    info["core_touches"] = sorted(touched, key=lambda item: (item["path"], item.get("symbol") or ""))
+    if info["core_touches"]:
+        return info, result("FAIL", "PERIPHERAL_TOUCHES_CORE", "task:746",
+                            touches=info["core_touches"][:25], required_rerun="T3")
+    if info.get("unverifiable"):
+        return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
+                            unverifiable=info["unverifiable"])
+    return info, result("PASS", "SPLIT_PERIPHERAL_CLEAN", "task:746",
+                        boundary_sha256=info["boundary_sha256"], paths_checked=len(analyzed))
+
+
 def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
              *, root: Path | None = None) -> tuple[dict, dict]:
     checks: dict[str, dict] = {"policy": policy_check}
@@ -378,17 +613,24 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
             checks["surface"] = result("UNVERIFIED", "POLICY_CONFLICT", "policy:surface_rules")
     else:
         checks["surface"] = result("UNVERIFIED", "POLICY_UNAVAILABLE", "decision:3231")
+    try:
+        split_info, checks["split"] = _split_check(evidence)
+    except (UnicodeError, OSError):
+        split_info, checks["split"] = None, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746")
     declared = evidence.get("declared_t")
     if not re.fullmatch(r"T[0-3]", str(declared)):
         checks["tier"] = result("UNVERIFIED", "T_MISSING", "spawn-worker:2-1")
     elif surface is None:
         checks["tier"] = result("UNVERIFIED", "T_FLOOR_UNKNOWN", "spawn-worker:2-1")
-    elif int(declared[1]) < int(surface["floor"][1]):
-        checks["tier"] = result("FAIL", "T_BELOW_FLOOR", "spawn-worker:2-1",
-                                declared=declared, floor=surface["floor"])
     else:
-        checks["tier"] = result("PASS", "T_MEETS_FLOOR", "spawn-worker:2-1",
-                                declared=declared, floor=surface["floor"])
+        floor_num = max(int(surface["floor"][1]),
+                        3 if (split_info or {}).get("part") == "core" else 0)
+        if int(declared[1]) < floor_num:
+            checks["tier"] = result("FAIL", "T_BELOW_FLOOR", "spawn-worker:2-1",
+                                    declared=declared, floor=f"T{floor_num}")
+        else:
+            checks["tier"] = result("PASS", "T_MEETS_FLOOR", "spawn-worker:2-1",
+                                    declared=declared, floor=f"T{floor_num}")
 
     root = root or Path(__file__).resolve().parents[2]
     contributor_profiles = []
@@ -512,7 +754,8 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
 
     bound = {**evidence,
              "diff_sha256": surface["diff_sha256"] if surface else None,
-             "contributors_digest": _digest(contributors)}
+             "contributors_digest": _digest(contributors),
+             "split_analysis": split_info}
     if stage == "pre-spawn":
         checks["prior"] = result("N/A", "FIRST_CALL_POINT", "decision:3231")
         checks["report"] = result("N/A", "TESTER_NOT_SPAWNED", "decision:3231")
@@ -654,6 +897,7 @@ def main() -> int:
                "head": evidence.get("head"), "base": evidence.get("base"), "trial_merge_tree": evidence.get("trial_merge_tree"),
                "declared_t": evidence.get("declared_t"), "required_grade": evidence.get("required_grade"),
                "implementation_grade": evidence.get("implementation_grade"),
+               "split": evidence.get("split"), "split_analysis": bound.get("split_analysis"),
                "diff_sha256": bound.get("diff_sha256"), "contributors_digest": bound.get("contributors_digest"),
                "planned_tester_profile": (evidence.get("tester") or {}).get("planned_profile"),
                "planned_tester_effort": (evidence.get("tester") or {}).get("planned_effort"),

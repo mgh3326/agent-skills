@@ -52,6 +52,37 @@ same-family exception. Missing exclusion proof is UNVERIFIED; a gate or
 delivery path is excluded even when the evidence claims otherwise. The
 required grade and actual implementation grade must both be A+ or below.
 
+A T3 task split into a core part and peripheral parts is declared in
+split. split contains parent_task (never the task itself), part=core or
+peripheral, and the core approval-boundary list boundary={paths, symbols}
+(paths and symbols that are core: guard wiring, safety DB constraints,
+error paths, lock/transaction lifetime, state/DB/exception boundary).
+parent_t may be given and must be T3 when present. Instead of an inline
+boundary, split.contract_path may name a repo-relative JSON file present
+at head whose contents supply the boundary (a top-level boundary object
+or bare paths/symbols); when both are given they must match. Optional
+split.behaviour_checks lists {id, result, ref} evidence where result is
+pass or fail.
+
+For a peripheral part the command compares the changed paths, the changed
+symbols and call relations (a changed call site into a core symbol counts,
+including added or removed lines and the enclosing-function hunk context),
+removed definitions still referenced from boundary paths at head, and the
+declared boundary. Touching the boundary — a boundary path, the contract
+file, a core symbol, an import of a boundary module, or a removed symbol
+still referenced from core — is FAIL with reason PERIPHERAL_TOUCHES_CORE
+and the part must be re-run as T3. A missing or unusable boundary, an
+unreadable diff, a binary or uninspectable change, a failed or malformed
+behaviour check, or anything else that cannot be classified is UNVERIFIED
+with NEEDS_CLASSIFICATION or SPLIT_BOUNDARY_MISSING — never a lower T.
+The boundary is required for both parts; a core declaration without a
+usable boundary is SPLIT_BOUNDARY_MISSING. A clean peripheral keeps its
+declared T subject to the existing surface floor. A core part always
+raises the floor to T3 regardless of the diff shape. The receipt records the split verbatim and split_analysis with the
+boundary list hash, the contract hash, and the detected core touches;
+the split declaration is bound to the previous receipt, so a changed
+declaration invalidates earlier stages.
+
 At pre-merge the tester provides report_path and report_sha256. The report
 includes exact lines TASK, JOB, REPO, TESTED_HEAD, and TESTER_SESSION matching
 the current input. Its last nonempty line is VERDICT: PASS @ followed by the
