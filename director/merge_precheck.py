@@ -87,10 +87,15 @@ def checkout_merge_sha(log: str) -> str | None:
         match = re.search(r"\b([0-9a-f]{40})\s*$", following)
         if not match:
             return None
-        short = match.group(1)[:7]
-        if not any(re.search(r"HEAD is now at " + re.escape(short) + r"\b", previous) for previous in lines[max(0, index - 20):index]):
+        full = match.group(1)
+        abbreviations = {
+            found.group(1)
+            for previous in lines[max(0, index - 20):index]
+            for found in re.finditer(r"HEAD is now at ([0-9a-f]{7,40})\b", previous)
+        }
+        if not abbreviations or any(not full.startswith(abbrev) for abbrev in abbreviations):
             return None
-        candidates.append(match.group(1))
+        candidates.append(full)
     return candidates[0] if len(candidates) == 1 else None
 
 

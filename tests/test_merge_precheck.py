@@ -124,6 +124,38 @@ def canonical_ci_mutant(replacements: list[tuple[str, str]]):
     return namespace["evaluate_required_ci"]
 
 
+def merge_precheck_mutant(replacements: list[tuple[str, str]]):
+    source = (ROOT / "director/merge_precheck.py").read_text()
+    for old, new in replacements:
+        if source.count(old) != 1:
+            raise AssertionError(f"expected one mutation target: {old!r}")
+        source = source.replace(old, new)
+    namespace: dict = {"__name__": "merge_precheck_assertion_red_mutant"}
+    exec(compile(source, "director/merge_precheck.py", "exec"), namespace)
+    return namespace["checkout_merge_sha"]
+
+
+CHECKOUT_STAMP = "ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:00Z "
+
+
+def checkout_log(abbrev: str | None, checkout_sha: str, extra_announces: list[str] | None = None) -> str:
+    lines = [f"{CHECKOUT_STAMP}HEAD is now at {announce} Merge {H} into {B}"
+             for announce in [abbrev, *(extra_announces or [])] if announce is not None]
+    lines.append(f"{CHECKOUT_STAMP}[command]/usr/bin/git log -1 --format=%H")
+    lines.append(f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {checkout_sha}")
+    return "\n".join(lines) + "\n"
+
+
+def two_checkout_log(abbrev1: str, sha1: str, abbrev2: str, sha2: str) -> str:
+    out = "ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z "
+    return (f"{CHECKOUT_STAMP}HEAD is now at {abbrev1} Merge {H} into {B}\n"
+            f"{CHECKOUT_STAMP}[command]/usr/bin/git log -1 --format=%H\n"
+            f"{out}{sha1}\n"
+            f"{CHECKOUT_STAMP}HEAD is now at {abbrev2} Merge {H} into {B}\n"
+            f"{CHECKOUT_STAMP}[command]/usr/bin/git log -1 --format=%H\n"
+            f"{out}{sha2}\n")
+
+
 class MergePrecheckTests(unittest.TestCase):
     def test_normal_pass(self) -> None:
         checks = gate.evaluate(snapshot(), policy())
@@ -636,6 +668,53 @@ class MergePrecheckTests(unittest.TestCase):
             self.assertEqual({"tested_base_sha": B, "tested_merge_sha": checkout_sha, "tested_merge_tree": M},
                              gate.checkout_provenance("mgh3326/agent-skills", 10, 1, H))
         self.assertIsNone(gate.checkout_merge_sha(log.replace(checkout_sha, "short-sha")))
+
+    def test_checkout_merge_sha_accepts_7_to_40_char_abbreviations(self) -> None:
+        checkout_sha = "e" * 40
+        for length in (7, 9, 12, 40):
+            with self.subTest(abbreviation_length=length):
+                self.assertEqual(checkout_sha, gate.checkout_merge_sha(checkout_log(checkout_sha[:length], checkout_sha)))
+        # The #711r incident shape: Actions printed 9 chars and G3 fell to CI_BASE_UNBOUND.
+        with patch.object(gate, "run_text", return_value=checkout_log(checkout_sha[:9], checkout_sha)), patch.object(gate, "gh_api", return_value={
+            "parents": [{"sha": B}, {"sha": H}], "tree": {"sha": M}}):
+            self.assertEqual({"tested_base_sha": B, "tested_merge_sha": checkout_sha, "tested_merge_tree": M},
+                             gate.checkout_provenance("mgh3326/agent-skills", 10, 1, H))
+
+    def test_checkout_merge_sha_fails_closed_on_bad_or_ambiguous_prefix(self) -> None:
+        checkout_sha = "e" * 40
+        # Abbreviation that is not a prefix of the only candidate.
+        self.assertIsNone(gate.checkout_merge_sha(checkout_log("f" * 9, checkout_sha)))
+        # Tokens outside the 7..40 window are not announcements at all.
+        for abbrev in ("e" * 6, "e" * 41, "E" * 9):
+            with self.subTest(abbrev=abbrev[:10]):
+                self.assertIsNone(gate.checkout_merge_sha(checkout_log(abbrev, checkout_sha)))
+        # No announcement line at all.
+        self.assertIsNone(gate.checkout_merge_sha(checkout_log(None, checkout_sha)))
+        # A foreign announcement in the same window is ambiguous even beside a matching one.
+        self.assertIsNone(gate.checkout_merge_sha(checkout_log("f" * 9, checkout_sha, extra_announces=[checkout_sha[:9]])))
+        # Ambiguous: one 9-char abbreviation is a prefix of two different candidates.
+        twin = "e" * 9 + "0" * 31
+        self.assertIsNone(gate.checkout_merge_sha(two_checkout_log(checkout_sha[:9], checkout_sha, twin[:9], twin)))
+        # Ambiguous: distinct announcements for distinct candidates in one log.
+        other = "f" * 40
+        self.assertIsNone(gate.checkout_merge_sha(two_checkout_log(checkout_sha[:9], checkout_sha, other[:9], other)))
+
+    def test_checkout_merge_sha_mutants_are_assertion_red(self) -> None:
+        checkout_sha = "e" * 40
+        fixed_nine = checkout_log(checkout_sha[:9], checkout_sha)
+        only_seven = merge_precheck_mutant([("([0-9a-f]{7,40})", "([0-9a-f]{7})")])
+        with self.assertRaises(AssertionError):
+            self.assertEqual(checkout_sha, only_seven(fixed_nine))
+        any_announce = merge_precheck_mutant([("not full.startswith(abbrev)", "False")])
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(any_announce(checkout_log("f" * 9, checkout_sha)))
+        optional_announce = merge_precheck_mutant([("not abbreviations", "False")])
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(optional_announce(checkout_log(None, checkout_sha)))
+        first_wins = merge_precheck_mutant([("return candidates[0] if len(candidates) == 1 else None", "return candidates[0]")])
+        twin = "e" * 9 + "0" * 31
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(first_wins(two_checkout_log(checkout_sha[:9], checkout_sha, twin[:9], twin)))
 
     def test_missing_branch_protection_source_mutant_is_red(self) -> None:
         required = policy()
