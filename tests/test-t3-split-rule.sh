@@ -126,6 +126,23 @@ FILE_FORBIDDEN = [
      r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?단일 라운드[^\n]{0,5}?(?:로[^\n]{0,5}?(?:한정|제한|상한|캡)|한정[은을이가]|상한|캡|제한|만|까지|에만|검증)"),
     ("weekly-pool-t3-carry",
      r"T3[^\n]{0,40}?(?:최종\s*)?통합[^\n]{0,40}?tester[^\n]{0,40}?단일 라운드[^\n]{0,5}?(?:로[^\n]{0,5}?(?:한정|제한|상한|캡)|한정[은을이가]|상한|캡|제한|만|까지|에만|검증)"),
+    # R2 tester findings — same attack classes under alternate wording:
+    # a once-only integration pass, a skipped re-verify, ambiguous work run
+    # low then classified later, core classes named without the word 핵심.
+    ("integration-one-pass",
+     r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:한 차례|한 번|한번|1회|단 한 번)[^\n]{0,10}?(?:만[^\n]{0,10}?(?:검증|확인|통과)|검증[^\n]{0,10}?(?:으로\s*끝|까지만|충분|하면\s*된다))"),
+    ("integration-no-reverify",
+     r"(?:수정된|바뀐|새)\s*head[^\n]{0,15}?(?:재검증|다시 검증|재확인)[^\n]{0,5}?(?:하지\s*않|없)|재검증[^\n]{0,5}?(?:없이|하지|생략)"),
+    ("ambiguous-lower-t-alt",
+     r"(?:애매|경계가|분류 불가)[^\n]{0,30}?(?:T0|T1|T2|낮은 T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작)(?!하지)"),
+    ("ambiguous-posthoc-classify",
+     r"애매[^\n]{0,40}?(?:사후|나중에?|추후|뒤에?)[^\n]{0,10}?(?:분류|재분류)"),
+    ("core-class-lower-t",
+     r"(?:안전 DB|에러 경로|lock/transaction|상태/DB/예외 경계|가드 배선|가드 인자)[^\n]{0,25}?(?:T0|T1|T2|낮은 T)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼)"),
+    ("one-line-guard-periph",
+     r"(?:호출 한 줄|한 줄 호출|one[- ]line)[^\n]{0,30}?(?:T0|T1|T2|낮은 T|주변)"),
+    ("periph-core-merge-anyway",
+     r"(?:주변 PR|주변 작업)[^\n]{0,30}?(?:핵심|core|가드|안전)[^\n]{0,30}?(?:그대로|낮은 T|T0|T1|T2)[^\n]{0,15}?(?:머지|유지|통과|진행|실행)"),
 ]
 
 # Required rows against the whole spawn-worker file (outside the marked
@@ -148,6 +165,14 @@ PINNED_SKILLS = (
     "builder/SKILL.md",
     "director/SKILL.md",
     "checker/SKILL.md",
+)
+
+# Task-modified files that must stay pinned — removing the pin outright must
+# fail closed, not silently skip (R2 tester: a deleted spawn pin survived).
+REQUIRED_PINS = (
+    ".github/workflows/ci.yml",
+    "director/SKILL.md",
+    "spawn-worker/SKILL.md",
 )
 
 
@@ -182,6 +207,11 @@ def check(d: dict) -> None:
     # edited bytes, and an un-pinned file must not have drifted either way.
     policy = json.loads(d["policy"])
     pinned = policy["local_sources"]
+    for rel in REQUIRED_PINS:
+        assert rel in pinned, (
+            f"gate_policy local_sources must pin {rel} "
+            "(task-modified file; a removed pin hides drift)"
+        )
     for rel in PINNED_SKILLS:
         if rel not in pinned:
             continue
@@ -285,6 +315,29 @@ mutants["spawn-111-carveout-dropped"] = mutate(
 mutants["spawn-weekly-limit-applied"] = append(
     "spawn", "T3 최종 통합 tester 도 주간 풀 한정이라면 단일 라운드로 한정한다."
 )
+# R2 tester findings verbatim — alternate wording for the same attack classes.
+mutants["spawn-integration-one-pass-alt"] = append(
+    "spawn", "최종 통합 tester 는 한 차례만 검증하며 수정된 head 는 재검증하지 않는다."
+)
+mutants["spawn-ambiguous-t1-after"] = append(
+    "spawn", "경계가 애매한 작업은 먼저 T1 로 실행하고 사후에 분류한다."
+)
+mutants["spawn-one-line-guard-t1"] = append(
+    "spawn", "호출 한 줄 가드 배선은 T1 의 주변 작업으로 배정할 수 있다."
+)
+# Same classes again: reclassification bypass and a generic core class.
+mutants["spawn-periph-core-merge"] = append(
+    "spawn", "주변 PR 이 핵심을 건드려도 그대로 머지한다."
+)
+mutants["spawn-safety-db-t1"] = append(
+    "spawn", "안전 DB 제약 변경은 T1 주변 작업으로 배정한다."
+)
+# A required pin deleted outright must fail closed, not be skipped.
+_pinless = dict(docs)
+_pol = json.loads(_pinless["policy"])
+del _pol["local_sources"]["spawn-worker/SKILL.md"]
+_pinless["policy"] = json.dumps(_pol, ensure_ascii=False, indent=2)
+mutants["policy-spawn-pin-removed"] = _pinless
 # NEEDS_CLASSIFICATION rule dropped or inverted.
 mutants["spawn-needs-classification-dropped"] = mutate(
     "spawn", "낮은 T 로 실행하지 않고 `NEEDS_CLASSIFICATION`\n  으로 반환한다", "낮은 T 로 실행한다"
