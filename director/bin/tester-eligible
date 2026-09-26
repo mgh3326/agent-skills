@@ -578,9 +578,10 @@ _BIND_TARGETS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*
 _BIND_STMT = re.compile(r"^\s*([\w.,:()\[\]'\"*\s]+?)\s*(?:[+\-*/%&|^@]|:)?=(?!=)(.*)$")
 _FOR_STMT = re.compile(r"^for\s+(.+?)\s+in\s+(.+?)(?::\s*(.*))?$")
 _WITH_AS = re.compile(r"(?:^|,)\s*(.+?)\s+as\s+([A-Za-z_][A-Za-z0-9_.]*)")
-_CTRL_HEAD = re.compile(
-    r"^(?:if|elif|else|while|try|finally|except|match|case)\b"
-    r"(?::(?!=)|[^:])*:(?!\s*=)\s*")
+_COMPOUND_HEADS = {
+    "if", "elif", "else", "while", "for", "try", "except", "finally",
+    "with", "def", "class", "match", "case", "lambda",
+}
 _MODULE_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
 _PLAIN_IMPORT = re.compile(r"^import\s+([A-Za-z_][A-Za-z0-9_.,\s]*)$")
 _DOTTED_CALL = re.compile(
@@ -607,16 +608,69 @@ def _bind_targets(lhs: str) -> set[str]:
         - {""} - _PY_KEYWORDS
 
 
+def _top_delim(text: str) -> tuple[int, str] | None:
+    """First top-level `;` or a `:` that closes a compound-statement head
+    (if/for/def/case/...), ignoring delimiters inside brackets, string
+    literals and comments. Annotation `x: T` and walrus `:=` colons do not
+    split because their head is not a compound keyword."""
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if text.startswith(quote, index):
+                index += len(quote)
+                quote = None
+                continue
+            index += 1
+            continue
+        if text.startswith(('"""', "'''"), index):
+            quote = text[index:index + 3]
+            index += 3
+            continue
+        if char in "\"'":
+            quote = char
+        elif char == "#":
+            break
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and char == ";":
+            return index, ";"
+        elif depth == 0 and char == ":":
+            if text[index:index + 2] == ":=":
+                index += 2
+                continue
+            first = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text.lstrip())
+            if first and first.group(0) in _COMPOUND_HEADS:
+                return index, ":"
+        index += 1
+    return None
+
+
 def _stmt_segments(text: str) -> list[str]:
-    """Simple statements in a line: strip async/one-line control heads and
-    split semicolons so `if c: fn = x` and `a(); b = y` expose their bodies."""
-    text = re.sub(r"^async\s+", "", text)
-    head = _CTRL_HEAD.match(text)
-    while head:
-        text = text[head.end():].strip()
-        text = re.sub(r"^async\s+", "", text)
-        head = _CTRL_HEAD.match(text)
-    return [seg.strip() for seg in text.split(";") if seg.strip()]
+    """Simple statements in a line: split top-level `;` and compound-statement
+    colons so `if c: fn = x`, `def f(): import m` and `a(); b = y` expose
+    their heads and bodies as separate segments at any nesting depth."""
+    out: list[str] = []
+    pending = [text.strip()]
+    while pending:
+        seg = re.sub(r"^async\s+", "", pending.pop().strip())
+        if not seg:
+            continue
+        found = _top_delim(seg)
+        if found:
+            pos, _ = found
+            pending.append(seg[:pos])
+            pending.append(seg[pos + 1:])
+        else:
+            out.append(seg)
+    return out
 
 
 def _strip_comment(line: str) -> str:
@@ -687,153 +741,174 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
     converged = False
     normalized = _logical_lines(content)
     normalized_content = "\n".join(normalized)
-    for _ in range(12):
-        grown = False
-        for module, items_text in _from_clauses(normalized_content):
-            resolved = _resolve_module(module, file_path)
-            items = [item.strip().strip("()").strip() for item in items_text.split(",")]
-            star = items_text.strip() == "*"
-            if _module_in(resolved, modules):
-                if star:
-                    unresolved = True
-                    continue
-                for item in items:
-                    bind = _FROM_ITEM.match(item)
-                    if bind:
-                        name = bind.group(2) or bind.group(1)
-                        if name not in bound:
-                            bound.add(name)
-                            grown = True
-                continue
+    grown = False
+
+    def _from_items(module: str, items_text: str) -> None:
+        nonlocal unresolved, grown, bound, suspect, call_suspect, handles
+        resolved = _resolve_module(module, file_path)
+        items = [item.strip().strip("()").strip() for item in items_text.split(",")]
+        star = items_text.strip() == "*"
+        if _module_in(resolved, modules):
             if star:
-                entry = _module_names(repo, head, resolved, leaves, modules,
-                                      memo, depth, visited)
-                if not isinstance(entry, tuple):
-                    unresolved = True
-                    continue
-                sub_bound, sub_suspect, sub_cs, sub_unres = entry
-                unresolved |= sub_unres
-                for name in (sub_bound - bound) | (sub_suspect - suspect) \
-                        | (sub_cs - call_suspect):
-                    grown = True
-                bound |= sub_bound
-                suspect |= sub_suspect
-                call_suspect |= sub_cs
-                continue
-            entry: object = None
-            entry_ready = False
+                unresolved = True
+                return
             for item in items:
                 bind = _FROM_ITEM.match(item)
-                if not bind:
-                    continue
-                imported, alias = bind.group(1), bind.group(2) or bind.group(1)
-                # `from pkg.ui import bridge` may name a submodule pkg.ui.bridge.
-                submodule = resolved + "." + imported
-                sub_entry = _module_names(repo, head, submodule,
-                                          leaves, modules, memo, depth, visited)
-                if isinstance(sub_entry, tuple):
-                    record = (submodule, sub_entry[0],
-                              sub_entry[1] | sub_entry[2])
-                    if handles.get(alias) != record:
-                        handles[alias] = record
-                        unresolved |= sub_entry[3]
-                        grown = True
-                    continue
-                if sub_entry in ("unreadable", "unexpanded"):
-                    if alias not in suspect:
-                        suspect.add(alias)
-                        grown = True
-                    continue
-                if not entry_ready:
-                    entry = _module_names(repo, head, resolved, leaves, modules,
-                                          memo, depth, visited)
-                    entry_ready = True
-                if not isinstance(entry, tuple):
-                    if entry in ("unreadable", "unexpanded"):
-                        if alias not in suspect:
-                            suspect.add(alias)
-                            grown = True
-                    elif entry is None and alias not in call_suspect \
-                            and alias not in bound:
-                        # `from missing import f` — the source module cannot be
-                        # inspected, so the imported value is unproven.
-                        call_suspect.add(alias)
-                        grown = True
-                    continue
-                sub_bound, sub_suspect, sub_cs, sub_unres = entry
-                unresolved |= sub_unres
-                if imported in sub_bound and alias not in bound:
-                    bound.add(alias)
-                    grown = True
-                elif imported in sub_suspect and alias not in suspect:
-                    suspect.add(alias)
-                    grown = True
-                elif imported in sub_cs and alias not in call_suspect:
-                    call_suspect.add(alias)
-                    grown = True
-        for text in normalized:
-            if not text or text.startswith(("#", "from ")):
-                continue
-            alias = _IMPORT_ALIAS.match(text)
-            if alias:
-                resolved = _resolve_module(alias.group(1), file_path)
-                name = alias.group(2)
-                if _module_in(resolved, modules):
+                if bind:
+                    name = bind.group(2) or bind.group(1)
                     if name not in bound:
                         bound.add(name)
                         grown = True
-                else:
-                    entry = _module_names(repo, head, resolved, leaves, modules,
-                                          memo, depth, visited)
-                    if isinstance(entry, tuple):
-                        record = (resolved, entry[0], entry[1] | entry[2])
-                        if handles.get(name) != record:
-                            handles[name] = record
-                            unresolved |= entry[3]
-                            grown = True
-                    elif entry in ("unreadable", "unexpanded"):
-                        if name not in suspect:
-                            suspect.add(name)
-                            grown = True
-                    elif entry is None and name not in call_suspect \
-                            and name not in bound:
-                        call_suspect.add(name)
-                        grown = True
+            return
+        if star:
+            entry = _module_names(repo, head, resolved, leaves, modules,
+                                  memo, depth, visited)
+            if not isinstance(entry, tuple):
+                unresolved = True
+                return
+            sub_bound, sub_suspect, sub_cs, sub_unres = entry
+            unresolved |= sub_unres
+            for name in (sub_bound - bound) | (sub_suspect - suspect) \
+                    | (sub_cs - call_suspect):
+                grown = True
+            bound |= sub_bound
+            suspect |= sub_suspect
+            call_suspect |= sub_cs
+            return
+        entry: object = None
+        entry_ready = False
+        for item in items:
+            bind = _FROM_ITEM.match(item)
+            if not bind:
                 continue
-            plain = _PLAIN_IMPORT.match(text)
-            if plain:
-                for modname in re.split(r"[\s,]+", plain.group(1).strip()):
-                    if not modname:
-                        continue
-                    top = _leaf(modname.split(".", 1)[0])
-                    if not top:
-                        continue
-                    resolved = _resolve_module(top, file_path)
-                    if _module_in(resolved, modules):
-                        if top not in bound:
-                            bound.add(top)
-                            grown = True
-                        continue
-                    entry = _module_names(repo, head, resolved, leaves,
-                                          modules, memo, depth, visited)
-                    if isinstance(entry, tuple):
-                        record = (resolved, entry[0], entry[1] | entry[2])
-                        if handles.get(top) != record:
-                            handles[top] = record
-                            unresolved |= entry[3]
-                            grown = True
-                    elif entry in ("unreadable", "unexpanded"):
-                        if top not in suspect:
-                            suspect.add(top)
-                            grown = True
-                    elif entry is None and top not in call_suspect \
-                            and top not in bound:
-                        call_suspect.add(top)
+            imported, alias = bind.group(1), bind.group(2) or bind.group(1)
+            # `from pkg.ui import bridge` may name a submodule pkg.ui.bridge.
+            submodule = resolved + "." + imported
+            sub_entry = _module_names(repo, head, submodule,
+                                      leaves, modules, memo, depth, visited)
+            if isinstance(sub_entry, tuple):
+                record = (submodule, sub_entry[0],
+                          sub_entry[1] | sub_entry[2])
+                if handles.get(alias) != record:
+                    handles[alias] = record
+                    unresolved |= sub_entry[3]
+                    grown = True
+                continue
+            if sub_entry in ("unreadable", "unexpanded"):
+                if alias not in suspect:
+                    suspect.add(alias)
+                    grown = True
+                continue
+            if not entry_ready:
+                entry = _module_names(repo, head, resolved, leaves, modules,
+                                      memo, depth, visited)
+                entry_ready = True
+            if not isinstance(entry, tuple):
+                if entry in ("unreadable", "unexpanded"):
+                    if alias not in suspect:
+                        suspect.add(alias)
                         grown = True
+                elif entry is None and alias not in call_suspect \
+                        and alias not in bound:
+                    # `from missing import f` — the source module cannot be
+                    # inspected, so the imported value is unproven.
+                    call_suspect.add(alias)
+                    grown = True
+                continue
+            sub_bound, sub_suspect, sub_cs, sub_unres = entry
+            unresolved |= sub_unres
+            if imported in sub_bound and alias not in bound:
+                bound.add(alias)
+                grown = True
+            elif imported in sub_suspect and alias not in suspect:
+                suspect.add(alias)
+                grown = True
+            elif imported in sub_cs and alias not in call_suspect:
+                call_suspect.add(alias)
+                grown = True
+
+    def _import_stmt(text: str) -> bool:
+        """Classify an import/from statement wherever it appears; True when
+        the statement was an import form."""
+        nonlocal unresolved, grown, bound, suspect, call_suspect, handles
+        if text.startswith("from "):
+            found = _FROM_IMPORT.match(text)
+            if found:
+                _from_items(found.group(1), found.group(2))
+            return True
+        alias = _IMPORT_ALIAS.match(text)
+        if alias:
+            resolved = _resolve_module(alias.group(1), file_path)
+            name = alias.group(2)
+            if _module_in(resolved, modules):
+                if name not in bound:
+                    bound.add(name)
+                    grown = True
+            else:
+                entry = _module_names(repo, head, resolved, leaves, modules,
+                                      memo, depth, visited)
+                if isinstance(entry, tuple):
+                    record = (resolved, entry[0], entry[1] | entry[2])
+                    if handles.get(name) != record:
+                        handles[name] = record
+                        unresolved |= entry[3]
+                        grown = True
+                elif entry in ("unreadable", "unexpanded"):
+                    if name not in suspect:
+                        suspect.add(name)
+                        grown = True
+                elif entry is None and name not in call_suspect \
+                        and name not in bound:
+                    call_suspect.add(name)
+                    grown = True
+            return True
+        plain = _PLAIN_IMPORT.match(text)
+        if plain:
+            for modname in re.split(r"[\s,]+", plain.group(1).strip()):
+                if not modname:
+                    continue
+                top = _leaf(modname.split(".", 1)[0])
+                if not top:
+                    continue
+                resolved = _resolve_module(top, file_path)
+                if _module_in(resolved, modules):
+                    if top not in bound:
+                        bound.add(top)
+                        grown = True
+                    continue
+                entry = _module_names(repo, head, resolved, leaves,
+                                      modules, memo, depth, visited)
+                if isinstance(entry, tuple):
+                    record = (resolved, entry[0], entry[1] | entry[2])
+                    if handles.get(top) != record:
+                        handles[top] = record
+                        unresolved |= entry[3]
+                        grown = True
+                elif entry in ("unreadable", "unexpanded"):
+                    if top not in suspect:
+                        suspect.add(top)
+                        grown = True
+                elif entry is None and top not in call_suspect \
+                        and top not in bound:
+                    call_suspect.add(top)
+                    grown = True
+            return True
+        return False
+
+    for _ in range(12):
+        grown = False
+        for module, items_text in _from_clauses(normalized_content):
+            _from_items(module, items_text)
+        for text in normalized:
+            if not text or text.startswith("#"):
+                continue
+            if _import_stmt(text):
                 continue
             pending = _stmt_segments(text)
             while pending:
                 segment = pending.pop()
+                if _import_stmt(segment):
+                    continue
                 body = None
                 targets: set[str] = set()
                 rhs = ""
@@ -851,6 +926,18 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                     after = segment[segment.rfind(tail) + len(tail):]
                     if after.lstrip().startswith(":"):
                         body = after.lstrip()[1:].strip() or None
+                elif segment.startswith("case "):
+                    # Case-pattern names bind to matched values — a form the
+                    # scanner cannot resolve — so calls through them fail
+                    # closed. Lowercase names are bindings; capitalized names
+                    # are class references and stay out of the call suspects.
+                    pat = _STRING_LITERAL.sub("", segment[5:])
+                    for name in set(_IDENTIFIER.findall(pat)) - _PY_KEYWORDS:
+                        if name != "_" and name[:1].islower() \
+                                and name not in call_suspect:
+                            call_suspect.add(name)
+                            grown = True
+                    continue
                 else:
                     bind = _BIND_STMT.match(segment)
                     if not bind:

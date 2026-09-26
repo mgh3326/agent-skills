@@ -1316,11 +1316,16 @@ class SplitFixtures(EligibilityFixtures):
 
     def test_inline_import_forms_are_unverifiable(self) -> None:
         # Plain imports that do not start a physical line — after a
-        # semicolon, behind a comment, or backslash-continued — still bind
-        # the name; a call through an uninspectable module is unverifiable.
+        # semicolon, behind a comment, backslash-continued, or nested in a
+        # one-line control head — still bind the name; a call through an
+        # uninspectable module is unverifiable.
         for stmt in ("import missing; missing.run(row)",
                      "import missing  # external provider\n    missing.run(row)",
-                     "import missing \\\n    # (continued)\n    missing.run(row)"):
+                     "import missing \\\n    # (continued)\n    missing.run(row)",
+                     "if c: import missing\n    missing.run(row)",
+                     "while c: import missing\n    missing.run(row)",
+                     "try: import missing\n    missing.run(row)",
+                     "x = 1; import missing as m\n    m.run(row)"):
             with self.subTest(stmt=stmt):
                 self.seed_pkg("def render(row):\n    return str(row)\n")
                 head = self.commit({"pkg/ui/consumer.py":
