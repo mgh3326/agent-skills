@@ -441,8 +441,9 @@ class EligibilityFixtures(unittest.TestCase):
 
     def test_e6_builder_grades_conflict_and_grok_model_must_match_wrk(self) -> None:
         variants = ("builder-opus-low", "builder-opus-medium", "builder-sonnet-xhigh", "builder-sonnet-max",
-                    "builder-sol-high", "builder-sol-max", "builder-luna-max", "builder-terra-high",
-                    "builder-terra-xhigh", "builder-terra-max", "builder-kimi-high", "builder-kimi-max")
+                    "builder-sol-high", "builder-sol-max", "builder-sol-medium", "builder-luna-max", "builder-terra-high",
+                    "builder-terra-xhigh", "builder-terra-max", "builder-kimi-high", "builder-kimi-max",
+                    "builder-grok-low", "builder-grok-medium", "builder-grok-xhigh")
         for alias in variants:
             spec = self.policy["profiles"][alias]
             _, check = common.resolve_profile(alias, self.policy, actual_effort=spec["default_effort"],

@@ -50,7 +50,7 @@ ALL_PROFILES=(
   codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
   codex-sol56 codex-luna56
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max
-  builder-sol-high builder-sol-max builder-luna-max
+  builder-sol-high builder-sol-max builder-sol-medium builder-luna-max
   builder-terra-high builder-terra-xhigh builder-terra-max
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
@@ -61,6 +61,7 @@ ALL_PROFILES=(
   oc-qwen37-max oc-minimax-m3 oc-solar4
   agy-flash agy-flash36 agy-flash37
   grok grok-hi grok-med grok45 grok45-med grok46 grok46-med builder-grok
+  builder-grok-low builder-grok-medium builder-grok-xhigh
   cc-qwen38 cc-glm cc-dsflash cc-dspro cc-glm53
 )
 
@@ -150,12 +151,13 @@ Options:
                      builder-ds41-max, builder-grok, builder-kimi,
                      builder-luna, builder-opus-low, builder-opus-medium,
                      builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high,
-                     builder-sol-max, builder-luna-max, builder-terra-high,
-                     builder-terra-xhigh, builder-terra-max, builder-kimi-high
-                     or builder-kimi-max profiles; legacy captain-opus and
-                     captain-sol aliases and the pilot worker spellings
-                     devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi
-                     and kimi-k3 remain accepted.
+                     builder-sol-max, builder-sol-medium, builder-luna-max,
+                     builder-terra-high, builder-terra-xhigh, builder-terra-max,
+                     builder-kimi-high, builder-kimi-max, builder-grok-low,
+                     builder-grok-medium or builder-grok-xhigh profiles; legacy
+                     captain-opus and captain-sol aliases and the pilot worker
+                     spellings devin-swe2, devin-swe2-medium, devin-swe2-max,
+                     grok/grok-hi and kimi-k3 remain accepted.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      required for --role builder (spawn dies without it).
@@ -262,8 +264,14 @@ SCOPEFUEL_E6_ARM=codex-terra@high for builder-terra-high. For these profiles
 wrk passes the pinned rung as `scopefuel gate --effort` so the gate judges
 that rung's row, and the marker (forwarded through the environment) is what
 opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
-kimi-k3@max). Rungs the gate marks escalation (opus@low, sonnet@xhigh)
-additionally need --operator-request REF. The kimi pair takes its effort from
+kimi-k3@max, grok-hi@xhigh; #737 adds grok-hi@low, grok-hi@medium and
+codex-sol@medium). Rungs the gate marks escalation (opus@low, sonnet@xhigh)
+additionally need --operator-request REF. #737 adds the grok rungs of
+decision 4088 — builder-grok-low, builder-grok-medium and
+builder-grok-xhigh pin grok-hi@<rung> the same way
+(SCOPEFUEL_E6_ARM=grok-hi@<rung>; grok rungs are not escalation-marked, so
+no --operator-request) — plus builder-sol-medium pinning codex-sol@medium
+(SCOPEFUEL_E6_ARM=codex-sol@medium). The kimi pair takes its effort from
 the pinned clone homes KIMI_CODE_HIGH_HOME/KIMI_CODE_MAX_HOME (refresh with
 `bin/kimi-clone-home --effort high|max`); everything else carries the effort
 in its argv.
@@ -2001,7 +2009,8 @@ resolve_catalog_profile() {
     # #704: the E6 codex rungs resolve against the canonical catalog profile at
     # their pinned effort, so the quota record's launch_profile is the exact
     # catalog rung (codex-terra@high, codex-luna@max, codex-sol@high ...).
-    builder-sol-high|builder-sol-max) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
+    # #737 adds builder-sol-medium (codex-sol@medium) on the same pin rule.
+    builder-sol-high|builder-sol-max|builder-sol-medium) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     builder-luna-max) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=max ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     codex-astra) CATALOG_PROFILE=codex-astra ;;
@@ -2019,6 +2028,9 @@ resolve_catalog_profile() {
     grok|grok-hi) CATALOG_PROFILE=grok-hi ;;
     grok-med) CATALOG_PROFILE=grok; CATALOG_EFFORT_PIN=medium ;;
     builder-grok) CATALOG_PROFILE=grok-hi; CATALOG_EFFORT_PIN=xhigh ;;
+    # #737 (decision 4088): the E6 grok rungs consult the catalog at their
+    # pinned rung so the quota record's launch_profile is grok-hi@<rung>.
+    builder-grok-low|builder-grok-medium|builder-grok-xhigh) CATALOG_PROFILE=grok-hi; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
 
     cc-qwen38) CATALOG_PROFILE=cc-qwen38 ;;
     cc-glm) CATALOG_PROFILE=cc-glm ;;
@@ -2263,7 +2275,7 @@ resolve_profile() {
     # #704 (#594 E6): per-rung codex builder spellings. PROFILE_MODEL is the
     # catalog-unreachable literal; apply_catalog replaces it with the canon's
     # model id for that rung (codex-terra@high etc.).
-    builder-sol-high|builder-sol-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
+    builder-sol-high|builder-sol-max|builder-sol-medium) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     builder-luna-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     # task #527 요건 ⑦: codex-astra default effort is xhigh, unified with
@@ -2353,6 +2365,10 @@ resolve_profile() {
     # Task 240 pilot (operator decision 2026-09-14 §4): grok 4.6 builder at
     # effort xhigh — the same kind/argv the generic grok wiring emits.
     builder-grok) PROFILE_KIND=grok; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
+    # #737 (decision 4088): the E6 grok measurement rungs — the same grok
+    # kind/argv the generic wiring emits, each pinned to the rung in its last
+    # segment and marker-gated via GATE_EFFORT_PIN below.
+    builder-grok-low|builder-grok-medium|builder-grok-xhigh) PROFILE_KIND=grok; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
 
     # ROB-1222: agy-flash는 은퇴 목록에서 제외 — agy 네이티브로 실행.
     # 멘리: effort는 모델명에 인코딩(-high). --dangerously-skip-permissions 필수.
@@ -2392,7 +2408,7 @@ resolve_profile() {
     # effort rung (codex-sol@high, codex-luna@max, codex-terra@*) — not the
     # flat codex-max/codex-luna-max/codex-terra-max spellings the old builders
     # use, because scopefuel #692's E6 marker is profile@effort-exact.
-    builder-sol-high|builder-sol-max) GATE_PROFILE=codex-sol; GATE_EFFORT_PIN="${MODEL##*-}" ;;
+    builder-sol-high|builder-sol-max|builder-sol-medium) GATE_PROFILE=codex-sol; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     builder-luna-max) GATE_PROFILE=codex-luna; GATE_EFFORT_PIN=max ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) GATE_PROFILE=codex-terra; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     # task #527: the gate role-denies astra without an allowed --purpose, so the
@@ -2418,6 +2434,9 @@ resolve_profile() {
       GATE_PROFILE="$MODEL" ;;
     agy-flash|agy-flash36|agy-flash37) GATE_PROFILE="agy-flash" ;;
     grok|grok-hi|grok-med|grok45|grok45-med|grok46|grok46-med|builder-grok) GATE_PROFILE=grok-hi ;;
+    # #737: the E6 grok rungs gate at their pinned rung (unmeasured C rows
+    # under #692/#737 — spawn refuses without SCOPEFUEL_E6_ARM=grok-hi@<rung>).
+    builder-grok-low|builder-grok-medium|builder-grok-xhigh) GATE_PROFILE=grok-hi; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     # ROB-1252 / ROB-1253: clinepass 쿼타 풀로 귀속 — PROFILE_KIND=claude(구독 OAuth) 풀과
     # 완전 분리해야 admission/쿼타 집계가 섞이지 않는다.
     # 실험 지정 별칭(cc-dsflash/cc-dspro/cc-glm53)은 reps 축적 전까지 급표 미등재이므로
@@ -4354,8 +4373,8 @@ spawn_cmd() {
     case "$MODEL" in
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
-      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna or the #704 E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max)" ;;
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -4372,14 +4391,14 @@ spawn_cmd() {
       # resolve_profile repeats the check against GATE_EFFORT_PIN and enforces
       # the SCOPEFUEL_E6_ARM marker; refusing here too keeps the failure on the
       # same die path the other pinned builders use.
-      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max)
+      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh)
         [[ -z "$EFFORT" || "$EFFORT" == "${MODEL##*-}" ]] || die "$MODEL is pinned to effort ${MODEL##*-} (#594 E6 rung)"
         ;;
     esac
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
