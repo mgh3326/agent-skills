@@ -124,6 +124,42 @@ def canonical_ci_mutant(replacements: list[tuple[str, str]]):
     return namespace["evaluate_required_ci"]
 
 
+def merge_precheck_mutant(replacements: list[tuple[str, str]]):
+    source = (ROOT / "director/merge_precheck.py").read_text()
+    for old, new in replacements:
+        if source.count(old) != 1:
+            raise AssertionError(f"expected one mutation target: {old!r}")
+        source = source.replace(old, new)
+    namespace: dict = {"__name__": "merge_precheck_assertion_red_mutant"}
+    exec(compile(source, "director/merge_precheck.py", "exec"), namespace)
+    return namespace["checkout_merge_sha"]
+
+
+CHECKOUT_STAMP = "ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:00Z "
+
+
+def checkout_log(abbrev: str | None, checkout_sha: str, extra_announces: list[str] | None = None,
+                 command: str = "/usr/bin/git log -1 --format=%H",
+                 step: str = "Run actions/checkout@v4", out_step: str | None = None) -> str:
+    stamp = f"ubuntu-latest\t{step}\t2026-09-25T07:00:00Z "
+    out = f"ubuntu-latest\t{out_step or step}\t2026-09-25T07:00:01Z "
+    lines = [f"{stamp}HEAD is now at {announce} Merge {H} into {B}"
+             for announce in [abbrev, *(extra_announces or [])] if announce is not None]
+    lines.append(f"{stamp}[command]{command}")
+    lines.append(f"{out}{checkout_sha}")
+    return "\n".join(lines) + "\n"
+
+
+def two_checkout_log(abbrev1: str, sha1: str, abbrev2: str, sha2: str) -> str:
+    out = "ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z "
+    return (f"{CHECKOUT_STAMP}HEAD is now at {abbrev1} Merge {H} into {B}\n"
+            f"{CHECKOUT_STAMP}[command]/usr/bin/git log -1 --format=%H\n"
+            f"{out}{sha1}\n"
+            f"{CHECKOUT_STAMP}HEAD is now at {abbrev2} Merge {H} into {B}\n"
+            f"{CHECKOUT_STAMP}[command]/usr/bin/git log -1 --format=%H\n"
+            f"{out}{sha2}\n")
+
+
 class MergePrecheckTests(unittest.TestCase):
     def test_normal_pass(self) -> None:
         checks = gate.evaluate(snapshot(), policy())
@@ -636,6 +672,93 @@ class MergePrecheckTests(unittest.TestCase):
             self.assertEqual({"tested_base_sha": B, "tested_merge_sha": checkout_sha, "tested_merge_tree": M},
                              gate.checkout_provenance("mgh3326/agent-skills", 10, 1, H))
         self.assertIsNone(gate.checkout_merge_sha(log.replace(checkout_sha, "short-sha")))
+
+    def test_checkout_merge_sha_accepts_7_to_40_char_abbreviations(self) -> None:
+        checkout_sha = "e" * 40
+        for length in (7, 9, 12, 40):
+            with self.subTest(abbreviation_length=length):
+                self.assertEqual(checkout_sha, gate.checkout_merge_sha(checkout_log(checkout_sha[:length], checkout_sha)))
+        # The #711r incident shape: Actions printed 9 chars and G3 fell to CI_BASE_UNBOUND.
+        with patch.object(gate, "run_text", return_value=checkout_log(checkout_sha[:9], checkout_sha)), patch.object(gate, "gh_api", return_value={
+            "parents": [{"sha": B}, {"sha": H}], "tree": {"sha": M}}):
+            self.assertEqual({"tested_base_sha": B, "tested_merge_sha": checkout_sha, "tested_merge_tree": M},
+                             gate.checkout_provenance("mgh3326/agent-skills", 10, 1, H))
+
+    def test_checkout_merge_sha_fails_closed_on_bad_or_ambiguous_prefix(self) -> None:
+        checkout_sha = "e" * 40
+        # Abbreviation that is not a prefix of the only candidate.
+        self.assertIsNone(gate.checkout_merge_sha(checkout_log("f" * 9, checkout_sha)))
+        # Tokens outside the 7..40 window are not announcements at all.
+        for abbrev in ("e" * 6, "e" * 41, "E" * 9):
+            with self.subTest(abbrev=abbrev[:10]):
+                self.assertIsNone(gate.checkout_merge_sha(checkout_log(abbrev, checkout_sha)))
+        # No announcement line at all.
+        self.assertIsNone(gate.checkout_merge_sha(checkout_log(None, checkout_sha)))
+        # A foreign announcement in the same window is ambiguous even beside a matching one.
+        self.assertIsNone(gate.checkout_merge_sha(checkout_log("f" * 9, checkout_sha, extra_announces=[checkout_sha[:9]])))
+        # Ambiguous: one 9-char abbreviation is a prefix of two different candidates.
+        twin = "e" * 9 + "0" * 31
+        self.assertIsNone(gate.checkout_merge_sha(two_checkout_log(checkout_sha[:9], checkout_sha, twin[:9], twin)))
+        # Ambiguous: distinct announcements for distinct candidates in one log.
+        other = "f" * 40
+        self.assertIsNone(gate.checkout_merge_sha(two_checkout_log(checkout_sha[:9], checkout_sha, other[:9], other)))
+        # A non-git command that merely mentions the phrase is not the checkout command,
+        # even when its printed SHA shares the announced prefix (tester round-1 BLOCKER).
+        forged = "abcdef0111111111111111111111111111111111"
+        forge_log = (f"{CHECKOUT_STAMP}HEAD is now at abcdef0 Merge {H} into {B}\n"
+                     f"{CHECKOUT_STAMP}[command]/usr/bin/printf '%s\\n' {forged} # git log -1 --format=%H\n"
+                     f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {forged}\n")
+        self.assertIsNone(gate.checkout_merge_sha(forge_log))
+        # Other subcommands and trailing arguments are not the git-log command either.
+        for command in ("/usr/bin/git checkout --progress --force .",
+                        "git status",
+                        "/usr/bin/legit log -1 --format=%H",
+                        "/usr/bin/git log -1 --format=%H extra"):
+            with self.subTest(command=command):
+                self.assertIsNone(gate.checkout_merge_sha(checkout_log(checkout_sha[:9], checkout_sha, command=command)))
+        # Records outside the checkout step cannot be the candidate, even an exact
+        # verbatim echo of the real command (tester round-2 BLOCKER).
+        for step in ("Run echo forged checkout record", "Run bash", "Post actions/checkout@v4", "Pre Run actions/checkout@v4"):
+            with self.subTest(step=step):
+                self.assertIsNone(gate.checkout_merge_sha(checkout_log("abcdef0", forged, step=step)))
+        # An announce from another step does not corroborate the checkout output.
+        foreign_step_announce = (
+            "ubuntu-latest\tRun bash\t2026-09-25T07:00:00Z HEAD is now at " + checkout_sha[:9] + f" Merge {H} into {B}\n"
+            f"{CHECKOUT_STAMP}[command]/usr/bin/git log -1 --format=%H\n"
+            f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {checkout_sha}\n")
+        self.assertIsNone(gate.checkout_merge_sha(foreign_step_announce))
+        # The output line must come from the checkout step too.
+        self.assertIsNone(gate.checkout_merge_sha(checkout_log(checkout_sha[:9], checkout_sha, out_step="Run echo forged")))
+
+    def test_checkout_merge_sha_mutants_are_assertion_red(self) -> None:
+        checkout_sha = "e" * 40
+        fixed_nine = checkout_log(checkout_sha[:9], checkout_sha)
+        only_seven = merge_precheck_mutant([("([0-9a-f]{7,40})", "([0-9a-f]{7})")])
+        with self.assertRaises(AssertionError):
+            self.assertEqual(checkout_sha, only_seven(fixed_nine))
+        any_announce = merge_precheck_mutant([("not full.startswith(abbrev)", "False")])
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(any_announce(checkout_log("f" * 9, checkout_sha)))
+        optional_announce = merge_precheck_mutant([("not abbreviations", "False")])
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(optional_announce(checkout_log(None, checkout_sha)))
+        first_wins = merge_precheck_mutant([("return candidates[0] if len(candidates) == 1 else None", "return candidates[0]")])
+        twin = "e" * 9 + "0" * 31
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(first_wins(two_checkout_log(checkout_sha[:9], checkout_sha, twin[:9], twin)))
+        loose_command = merge_precheck_mutant([(r"\[command\](?:\S*/git|git) log -1 --format=%H\s*$", r"\[command\].*git log -1 --format=%H")])
+        forged = "abcdef0111111111111111111111111111111111"
+        forge_log = (f"{CHECKOUT_STAMP}HEAD is now at abcdef0 Merge {H} into {B}\n"
+                     f"{CHECKOUT_STAMP}[command]/usr/bin/printf '%s\\n' {forged} # git log -1 --format=%H\n"
+                     f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {forged}\n")
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(loose_command(forge_log))
+        any_step = merge_precheck_mutant([("not CHECKOUT_STEP.search(line)", "False")])
+        echo_forge_log = (f"{CHECKOUT_STAMP}HEAD is now at abcdef0 Merge {H} into {B}\n"
+                          f"ubuntu-latest\tRun echo forge\t2026-09-25T07:00:00Z [command]/usr/bin/git log -1 --format=%H\n"
+                          f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {forged}\n")
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(any_step(echo_forge_log))
 
     def test_missing_branch_protection_source_mutant_is_red(self) -> None:
         required = policy()

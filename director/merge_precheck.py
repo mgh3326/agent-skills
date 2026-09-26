@@ -38,6 +38,7 @@ META = re.compile(r"^(TASK|REPO|PR|TESTER_JOB|TESTER_SESSION|HEAD|OWNER|JOIN):\s
 DISPOSITION = re.compile(r"\bdisposition(?:_ref)?:\s*([^\s,;]+)", re.I)
 ISSUE = re.compile(r"^\s*(?:[-*]\s*)?(?:\*\*)?(BLOCKER|RISK)(?:\*\*)?(?:[- ]\d+)?\s*(?::|[—–-])\s*(.*)$", re.I)
 ARTIFACT_SHA = re.compile(r"(?i)(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])")
+CHECKOUT_STEP = re.compile(r"^[^\t]+\tRun actions/checkout@[^\t]*\t")
 SENSITIVE = {
     "private_address": re.compile(r"\b(?:10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.(?:\d{1,3}\.)\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})\b"),
     "pane_identifier": re.compile(r"\bw[A-Za-z0-9]+:p[A-Za-z0-9]+\b"),
@@ -81,16 +82,22 @@ def checkout_merge_sha(log: str) -> str | None:
     candidates: list[str] = []
     lines = log.splitlines()
     for index, line in enumerate(lines[:-1]):
-        if "[command]" not in line or "git log -1 --format=%H" not in line:
+        if not CHECKOUT_STEP.search(line) or not re.search(r"\[command\](?:\S*/git|git) log -1 --format=%H\s*$", line):
             continue
         following = lines[index + 1]
-        match = re.search(r"\b([0-9a-f]{40})\s*$", following)
+        match = re.search(r"\b([0-9a-f]{40})\s*$", following) if CHECKOUT_STEP.search(following) else None
         if not match:
             return None
-        short = match.group(1)[:7]
-        if not any(re.search(r"HEAD is now at " + re.escape(short) + r"\b", previous) for previous in lines[max(0, index - 20):index]):
+        full = match.group(1)
+        abbreviations = {
+            found.group(1)
+            for previous in lines[max(0, index - 20):index]
+            if CHECKOUT_STEP.search(previous)
+            for found in re.finditer(r"HEAD is now at ([0-9a-f]{7,40})\b", previous)
+        }
+        if not abbreviations or any(not full.startswith(abbrev) for abbrev in abbreviations):
             return None
-        candidates.append(match.group(1))
+        candidates.append(full)
     return candidates[0] if len(candidates) == 1 else None
 
 

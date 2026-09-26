@@ -52,6 +52,94 @@ same-family exception. Missing exclusion proof is UNVERIFIED; a gate or
 delivery path is excluded even when the evidence claims otherwise. The
 required grade and actual implementation grade must both be A+ or below.
 
+A T3 task split into a core part and peripheral parts is declared in
+split. split contains parent_task (never the task itself), part=core or
+peripheral, and the core approval-boundary list boundary={paths, symbols}
+(paths and symbols that are core: guard wiring, safety DB constraints,
+error paths, lock/transaction lifetime, state/DB/exception boundary).
+parent_task must be a string or integer and parent_t, when given, must
+be T3. A peripheral part must also name split.contract_path: a
+repo-relative JSON file present at head whose contents supply the
+boundary (a top-level boundary object or bare paths/symbols). A contract
+is a reviewed, versioned source for the boundary; a self-declared inline
+boundary cannot approve a peripheral part on its own, though an inline
+boundary may be given alongside the contract and must then match it
+member-for-member. A core part may rely on an inline boundary. Paths are
+normalized before comparison (a leading ./, doubled slashes, and empty
+segments collapse; absolute paths, .., backslashes, and control
+characters are rejected), and path and symbol lists are sorted before
+hashing so reordered members are the same boundary. Optional
+split.behaviour_checks lists {id, result, ref} evidence where result is
+pass or fail.
+
+For a peripheral part the command compares the changed paths, the changed
+symbols and call relations (a changed call site into a core symbol counts,
+including added or removed lines and the enclosing-function hunk context),
+removed definitions still referenced from boundary paths at head, and the
+boundary from the contract. The contract must be a regular file at head;
+a symlink, gitlink, or unreadable blob is SPLIT_BOUNDARY_MISSING.
+
+Identifiers bound to a boundary module or symbol at head count as
+boundary names, so calls through an alias are still touches. Binding
+forms recognised include absolute and relative from-imports (from ..x
+import y, from x import (a, b as c), and backslash-continued import
+lists — relative names resolve against the importing file's package and
+parenthesized or continued lists are joined), import module as m
+aliases, plain assignments whose value names a boundary symbol or
+module or an already-bound name (chains resolve to a fixed point; a
+fixpoint that does not converge makes the file unclassifiable), and
+re-exports through another repository file: from pkg.ui.bridge
+import cleanup [as alias] or from pkg.ui.bridge import * inherits the
+bound, suspect, and unproven names that bridge module binds at head,
+recursively.
+A repository module itself can be bound as a handle: from pkg.ui import
+bridge, import pkg.ui.bridge as b, h = pkg.ui.bridge, or an
+attribute-chain module reference such as h = bridge.sub or
+h = bridge.sub.path record the module's bound names under the alias, so
+a dotted call like bridge.cleanup(row) or h.cleanup(row) counts as a
+touch when the module binds cleanup to the boundary; binding a handle's
+bound attribute (x = bridge.cleanup) binds the alias directly. A name
+imported from a repo file that exists but cannot be read, or that lies
+past the re-export recursion depth, is treated as suspect; where a
+package directory and a sibling module file both exist, the package
+wins as it does at runtime. Assignment targets are read in tuple
+(a, b = …), annotated (a: T = …), subscript/attribute, walrus (a := …),
+starred (*a = …), one-line conditional (if c: a = …), async and plain
+for/with (for a in …, with … as a), and semicolon-separated forms. An
+`import *` whose source cannot be expanded — a boundary module or an
+unreadable or missing module — makes the whole file unclassifiable.
+Every other binding is fail-closed: a name bound to a value that cannot
+be proven non-core — an uninspectable module import, an unproven
+right-hand side, or an attribute of a core-deriving module that is not
+provably bound — may not be called in the diff; a changed call through
+such a name is UNVERIFIED NEEDS_CLASSIFICATION, though plain data
+references to it stay clean.
+
+Touching the boundary — a boundary path, the contract file, a core
+symbol or bound alias, an import of a boundary module, or a removed
+symbol still referenced from core — is FAIL with reason
+PERIPHERAL_TOUCHES_CORE and the part must be re-run as T3; a touch that
+was already recorded is reported even when a later file turns out to be
+uninspectable. A missing or unusable boundary or contract, an
+unreadable diff, a binary, undecodable, or uninspectable change, a
+dynamically assembled name (a non-literal getattr/setattr/delattr, exec,
+eval, __import__, importlib, globals, or vars use that cannot be
+resolved to a literal), a changed reference to a name bound to such a
+dynamic expression anywhere in the file at head, a failed or malformed
+behaviour check, or anything else that cannot be classified is
+UNVERIFIED with NEEDS_CLASSIFICATION or SPLIT_BOUNDARY_MISSING — never
+a lower T. The boundary is required for both parts; a core declaration
+without a usable boundary is SPLIT_BOUNDARY_MISSING. A clean peripheral
+keeps its declared T subject to the existing surface floor. A core part
+always raises the floor to T3 regardless of the diff shape. The receipt
+records the split verbatim and split_analysis with the parent task, the
+part, the boundary list hash, the contract path and hash, the paths
+checked, the detected core touches, the unclassifiable paths, and the
+behaviour checks; every code path — malformed declarations, early
+returns, and classifier failures alike — still leaves a populated
+split_analysis stub. The split declaration is bound to the previous
+receipt, so a changed declaration invalidates earlier stages.
+
 At pre-merge the tester provides report_path and report_sha256. The report
 includes exact lines TASK, JOB, REPO, TESTED_HEAD, and TESTER_SESSION matching
 the current input. Its last nonempty line is VERDICT: PASS @ followed by the

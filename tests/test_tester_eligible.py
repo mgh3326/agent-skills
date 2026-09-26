@@ -8,6 +8,7 @@ import importlib.machinery
 import importlib.util
 import io
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
@@ -95,6 +96,7 @@ class EligibilityFixtures(unittest.TestCase):
                                     "declared_t": evidence["declared_t"],
                                     "required_grade": evidence["required_grade"],
                                     "implementation_grade": evidence["implementation_grade"],
+                                    "split": evidence.get("split"),
                                     "diff_sha256": surface["diff_sha256"],
                                     "contributors_digest": eligible._digest(evidence["contributors"]),
                                     "planned_tester_profile": evidence["tester"]["planned_profile"],
@@ -656,6 +658,745 @@ class EligibilityFixtures(unittest.TestCase):
         with mock.patch.object(eligible.subprocess, "run", return_value=gh_response), redirect_stdout(output):
             eligible.audit(receipts, ["mgh3326/agent-skills"], jobs, "2026-09-25T00:00:00Z")
         self.assertIn("actions=2 missing=2 late=0 reused=0", output.getvalue())
+
+
+class SplitFixtures(EligibilityFixtures):
+    """Mixed-grade T3 split: peripheral parts must not touch the core boundary."""
+
+    CONTRACT = "splits/733.json"
+    BOUNDARY = {"paths": ["services/lease_release.py"], "symbols": ["release_lease"]}
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.root = self.base
+
+    def commit(self, files: dict) -> str:
+        for path, content in files.items():
+            target = self.repo / path
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if content is None:
+                target.unlink()
+            elif isinstance(content, bytes):
+                target.write_bytes(content)
+            else:
+                target.write_text(content)
+        git(self.repo, "add", "-A", ".")
+        git(self.repo, "commit", "-qm", "change")
+        return git(self.repo, "rev-parse", "HEAD")
+
+    def seed(self, files: dict) -> str:
+        git(self.repo, "reset", "--hard", self.root)
+        self.commit(files)
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        return self.base
+
+    def write_contract(self, boundary: dict | str | None = None, path: str | None = None) -> str:
+        """Commit a boundary contract at base so the peripheral diff cannot author it."""
+        name = path or self.CONTRACT
+        if boundary is None:
+            boundary = self.BOUNDARY
+        content = boundary if isinstance(boundary, str) else json.dumps({"boundary": boundary})
+        self.commit({name: content})
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        return name
+
+    def split(self, **changes: object) -> dict:
+        declaration = {"parent_task": "733", "parent_t": "T3", "part": "peripheral",
+                       "contract_path": self.CONTRACT}
+        declaration.update(changes)
+        return declaration
+
+    def release_core(self) -> None:
+        self.seed({"services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n\n"
+                   "def post_send_cleanup(order):\n    release_lease(order)\n",
+                   "ui/dashboard.py": "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary": self.BOUNDARY})})
+
+    def test_728_pr2_shape_touches_core_path(self) -> None:
+        # #728 PR 2: a UI PR that also carried the post-send release fix.
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n",
+                            "services/lease_release.py":
+                            "def release_lease(order):\n    ledger.record(order)\n\n"
+                            "def post_send_cleanup(order):\n    release_lease(order)\n    ledger.preserve(order)\n"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        checks = self.check(evidence)
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertIn("services/lease_release.py",
+                      {item["path"] for item in checks["split"]["touches"]})
+        self.assertEqual(eligible.overall(checks), "FAIL")
+
+    def test_pure_rendering_change_passes_at_declared_t(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return f'<b>{row}</b>'\n"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        checks = self.check(evidence)
+        self.assert_case(checks, "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
+        self.assert_case(checks, "tier", "PASS", "T_MEETS_FLOOR")
+        self.assertEqual(eligible.overall(checks), "PASS")
+
+    def test_one_line_guard_call_in_ui_file_fails(self) -> None:
+        self.write_contract({"paths": [], "symbols": ["guard_order"]})
+        head = self.commit({"ui/dashboard.py":
+                            "def render(row):\n    guard_order(row)\n    return str(row)\n"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        checks = self.check(evidence)
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertEqual(checks["split"]["touches"][0]["kind"], "call")
+
+    def test_missing_contract_is_unverified(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
+        declaration = self.split()
+        declaration.pop("contract_path")
+        for boundary in (None, {}, {"paths": [], "symbols": []}, {"paths": "services/"},
+                         self.BOUNDARY):
+            with self.subTest(boundary=boundary):
+                if boundary is not None:
+                    declaration["boundary"] = boundary
+                else:
+                    declaration.pop("boundary", None)
+                self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                                 "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
+        declaration = self.split(contract_path="splits/absent.json")
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
+        declaration = self.split(part="side")
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_INVALID")
+        declaration = self.split(parent_task="726")
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_INVALID")
+        declaration = self.split(parent_task=["733"])
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_INVALID")
+        declaration = self.split(parent_t="T2")
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_INVALID")
+        declaration = self.split(part=[])
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "SPLIT_INVALID")
+
+    def test_core_part_forces_t3_floor(self) -> None:
+        self.release_core()
+        head = self.commit({"services/lease_release.py":
+                            "def release_lease(order):\n    ledger.record(order)\n"})
+        declaration = self.split(part="core", boundary=dict(self.BOUNDARY))
+        evidence = self.evidence(head, declared_t="T2", split=declaration)
+        checks = self.check(evidence)
+        self.assert_case(checks, "split", "PASS", "SPLIT_CORE_DECLARED")
+        self.assert_case(checks, "tier", "FAIL", "T_BELOW_FLOOR")
+        self.assertEqual(checks["tier"]["floor"], "T3")
+        evidence = self.evidence(head, declared_t="T3", split=declaration)
+        checks = self.check(evidence)
+        self.assert_case(checks, "split", "PASS", "SPLIT_CORE_DECLARED")
+        self.assert_case(checks, "tier", "PASS", "T_MEETS_FLOOR")
+
+    def test_changed_call_site_into_core_symbol_fails(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "def render(row):\n    release_lease(row)\n    return str(row)\n"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        checks = self.check(evidence)
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertEqual(checks["split"]["touches"][0]["kind"], "call")
+
+    def test_removed_guard_call_also_fails(self) -> None:
+        self.seed({"services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "ui/dashboard.py": "def render(row):\n    release_lease(row)\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary": self.BOUNDARY})})
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return str(row)\n"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        self.assert_case(self.check(evidence), "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_enclosing_symbol_body_edit_fails(self) -> None:
+        self.seed({"ui/helpers.py":
+                   "def check_order_guard(order):\n    return True\n\n"
+                   "def label(order):\n    return order['id']\n"})
+        self.write_contract({"paths": ["safety/"], "symbols": ["check_order_guard"]})
+        head = self.commit({"ui/helpers.py":
+                            "def check_order_guard(order):\n    return order.get('ok', True)\n\n"
+                            "def label(order):\n    return order['id']\n"})
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertEqual(checks["split"]["touches"][0]["kind"], "enclosing")
+
+    def test_indirect_getattr_and_import_detection(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "def render(row):\n    fn = getattr(svc, 'release_lease')\n    return fn(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "import services.lease_release\n"
+                            "def render(row):\n    return str(row)\n"})
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertIn("import", {touch["kind"] for touch in checks["split"]["touches"]})
+
+    def test_alias_and_bound_name_calls_fail(self) -> None:
+        self.seed({"ui/dashboard.py":
+                   "from services.lease_release import release_lease as cleanup\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary": self.BOUNDARY})})
+        head = self.commit({"ui/dashboard.py":
+                            "from services.lease_release import release_lease as cleanup\n"
+                            "def render(row):\n    cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.seed({"ui/dashboard.py":
+                   "svc = services.lease_release\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary": self.BOUNDARY})})
+        head = self.commit({"ui/dashboard.py":
+                            "svc = services.lease_release\n"
+                            "def render(row):\n    svc.release_lease(row)\n    return str(row)\n"})
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_dynamic_assembly_is_needs_classification(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "def render(row):\n    fn = getattr(svc, 'relea' + 'se_lease')\n"
+                            "    return fn(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "def render(row):\n    exec(code)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "import importlib\n"
+                            "def render(row):\n    m = importlib.import_module(name)\n    return str(m)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_malformed_split_fields_do_not_crash(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
+        for malformed in (self.split(part=[]),
+                          self.split(part=42),
+                          self.split(behaviour_checks=[{"id": "x", "result": []}]),
+                          self.split(behaviour_checks=[{"id": []}]),
+                          self.split(contract_path=[])):
+            with self.subTest(malformed=malformed):
+                checks = self.check(self.evidence(head, declared_t="T1", split=malformed))
+                self.assertEqual(checks["split"]["status"], "UNVERIFIED")
+
+    def test_removed_def_referenced_from_boundary_fails(self) -> None:
+        self.seed({"services/order_flow.py":
+                   "def settle(order):\n    return format_price(order['qty'])\n",
+                   "ui/format.py":
+                   "def format_price(qty):\n    return f'{qty:.2f}'\n\n"
+                   "def pad(text):\n    return text.center(8)\n"})
+        self.write_contract({"paths": ["services/"], "symbols": []})
+        head = self.commit({"ui/format.py": "def pad(text):\n    return text.center(8)\n"})
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertEqual(checks["split"]["touches"][0]["kind"], "removed_ref")
+
+    def test_contract_path_supplies_boundary_and_tamper_fails(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return f'<b>{row}</b>'\n"})
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
+        head = self.commit({"ui/extra.py": "print('x')\n",
+                            self.CONTRACT: json.dumps({"boundary": {"paths": [], "symbols": []}})})
+        checks = self.check(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertIn("contract", {item["kind"] for item in checks["split"]["touches"]})
+        dot = self.split(contract_path="./splits/733.json")
+        checks = self.check(self.evidence(head, declared_t="T1", split=dot))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertIn("contract", {item["kind"] for item in checks["split"]["touches"]})
+        missing = self.split(contract_path="splits/absent.json")
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=missing)),
+                         "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
+
+    def test_declaration_path_spellings_are_normalized(self) -> None:
+        self.write_contract({"paths": ["./services/lease_release.py"], "symbols": ["release_lease"]})
+        head = self.commit({"services/lease_release.py":
+                            "def release_lease(order):\n    ledger.record(order)\n    ledger.x(order)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.write_contract({"paths": ["services//lease_release.py"], "symbols": ["release_lease"]})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        for bad in ("../secrets.txt", "/abs/path", "a\\b"):
+            with self.subTest(bad=bad):
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split(contract_path=bad))),
+                                 "split", "UNVERIFIED", "SPLIT_INVALID")
+
+    def test_contract_conflict_and_inline_consistency(self) -> None:
+        self.write_contract("{ not json")
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
+        self.write_contract({"paths": ["services/lease_release.py", "safety/x.py"],
+                             "symbols": ["release_lease", "guard_order"]})
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['name']\n"})
+        matching = self.split(boundary={"paths": ["safety/x.py", "services/lease_release.py"],
+                                        "symbols": ["guard_order", "release_lease"]})
+        checks = self.check(self.evidence(head, declared_t="T1", split=matching))
+        self.assert_case(checks, "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
+        conflicting = self.split(boundary={"paths": ["other/"], "symbols": ["other_sym"]})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=conflicting)),
+                         "split", "UNVERIFIED", "SPLIT_BOUNDARY_CONFLICT")
+
+    def test_binary_and_unreadable_diff_is_needs_classification(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/blob.bin": b"\x00\x01\x02\x03"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        self.assert_case(self.check(evidence), "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+        evidence = self.evidence(head, declared_t="T1", split=self.split(), base="0" * 40)
+        self.assert_case(self.check(evidence), "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_behaviour_check_failed_or_malformed_is_unverified(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
+        declaration = self.split(behaviour_checks=[{"id": "golden", "result": "fail", "ref": "x"}])
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+        declaration = self.split(behaviour_checks=[{"id": "golden"}])
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+        declaration = self.split(behaviour_checks=[{"id": "golden", "result": "pass", "ref": "r"},
+                                                   {"id": "io", "result": "pass"}])
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=declaration)),
+                         "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
+
+    def test_split_declaration_is_bound_to_previous_receipt(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
+        evidence = self.landed(self.evidence(head, declared_t="T1", split=self.split()))
+        checks = self.check(evidence, "post-landing")
+        self.assert_case(checks, "prior", "PASS", "PREVIOUS_RECEIPT_BOUND")
+        evidence["split"]["contract_path"] = "splits/other.json"
+        self.assert_case(self.check(evidence, "post-landing"), "prior",
+                         "UNVERIFIED", "EVIDENCE_CHANGED")
+
+    def test_split_mutants_are_assertion_red(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n",
+                            "services/lease_release.py":
+                            "def release_lease(order):\n    ledger.record(order)\n\n"
+                            "def post_send_cleanup(order):\n    release_lease(order)\n    ledger.preserve(order)\n"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        with mock.patch.object(eligible, "_path_in_boundary", return_value=None):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(evidence), "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+        self.release_core()
+        head = self.commit({"ui/dashboard.py":
+                            "def render(row):\n    release_lease(row)\n    return str(row)\n"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        with mock.patch.object(eligible, "_leaf_hits", return_value=[]):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(evidence), "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+        self.seed({"services/order_flow.py":
+                   "def settle(order):\n    return format_price(order['qty'])\n",
+                   "ui/format.py": "def format_price(qty):\n    return f'{qty:.2f}'\n"})
+        self.write_contract({"paths": ["services/"], "symbols": []})
+        head = self.commit({"ui/format.py": "x = 1\n"})
+        evidence = self.evidence(head, declared_t="T1", split=self.split())
+        with mock.patch.object(eligible, "_referenced_from_boundary", return_value=[]):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(evidence), "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+        clean = self.evidence(self.commit({"ui/one.py": "print(1)\n"}), declared_t="T1",
+                              split=self.split())
+        with mock.patch.object(eligible, "_normalize_boundary", return_value=None):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(clean), "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
+
+    def seed_pkg(self, consumer: str) -> None:
+        """Package fixtures: boundary module under pkg/services, consumer in pkg/ui."""
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/consumer.py": consumer,
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+
+    def test_relative_and_parenthesized_import_aliases_fail(self) -> None:
+        base = ("from ..services.lease_release import release_lease as cleanup\n"
+                "def render(row):\n    return str(row)\n")
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from ..services.lease_release import release_lease as cleanup\n"
+                            "def render(row):\n    cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        base = ("from pkg.services.lease_release import (\n"
+                "    release_lease as cleanup,\n)\n"
+                "def render(row):\n    return str(row)\n")
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py": base.replace(
+            "    return str(row)", "    cleanup(row)\n    return str(row)")})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_alias_chain_and_reexport_fail(self) -> None:
+        base = ("from pkg.services.lease_release import release_lease as cleanup\n"
+                "cleanup_alias = cleanup\n"
+                "def render(row):\n    return str(row)\n")
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py": base.replace(
+            "    return str(row)", "    cleanup_alias(row)\n    return str(row)")})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        # Re-export through a sibling module file.
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/bridge.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "from pkg.ui.bridge import cleanup as do_cleanup\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from pkg.ui.bridge import cleanup as do_cleanup\n"
+                            "def render(row):\n    do_cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        # Star re-export inherits the bridge's bound names.
+        self.commit({"pkg/ui/consumer.py":
+                     "from pkg.ui.bridge import *\n"
+                     "def render(row):\n    return str(row)\n"})
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from pkg.ui.bridge import *\n"
+                            "def render(row):\n    cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_unresolvable_star_import_is_needs_classification(self) -> None:
+        self.seed_pkg("from totally_absent_pkg import *\n"
+                      "def render(row):\n    return str(row)\n")
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from totally_absent_pkg import *\n"
+                            "def render(row):\n    anything(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_dynamic_bound_name_activation_is_unverified(self) -> None:
+        base = ("svc = object()\n"
+                "fn = getattr(svc, 'relea' + 'se_lease')\n"
+                "def render(row):\n    return str(row)\n")
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py": base.replace(
+            "    return str(row)", "    fn(row)\n    return str(row)")})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+        base = ("svc = object()\n"
+                "fn = getattr(svc, 'release_lease')\n"
+                "def render(row):\n    return str(row)\n")
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py": base.replace(
+            "    return str(row)", "    fn(row)\n    return str(row)")})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def eval_bound(self, evidence: dict) -> tuple[dict, dict]:
+        with mock.patch.object(eligible, "_read_pane", return_value=None):
+            return eligible.evaluate(evidence, "pre-spawn", self.policy, self.policy_check)
+
+    def test_submodule_import_and_module_alias_calls_fail(self) -> None:
+        # `from pkg.ui import bridge` binds a module handle; bridge.cleanup is core.
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/bridge.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "from pkg.ui import bridge\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from pkg.ui import bridge\n"
+                            "def render(row):\n    bridge.cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        # `import pkg.ui.bridge as b` binds the same handle under b.
+        self.commit({"pkg/ui/consumer.py":
+                     "import pkg.ui.bridge as b\n"
+                     "def render(row):\n    return str(row)\n"})
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        head = self.commit({"pkg/ui/consumer.py":
+                            "import pkg.ui.bridge as b\n"
+                            "def render(row):\n    b.cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_package_shadows_sibling_module_for_reexports(self) -> None:
+        # Both bridge.py and bridge/__init__.py exist; Python prefers the package.
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/bridge.py": "unrelated = 1\n",
+                   "pkg/ui/bridge/__init__.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "from pkg.ui.bridge import cleanup as do_cleanup\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from pkg.ui.bridge import cleanup as do_cleanup\n"
+                            "def render(row):\n    do_cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_deep_reexport_past_depth_is_needs_classification(self) -> None:
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/b1.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/b2.py": "from pkg.ui.b1 import cleanup\n",
+                   "pkg/ui/b3.py": "from pkg.ui.b2 import cleanup\n",
+                   "pkg/ui/b4.py": "from pkg.ui.b3 import cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "from pkg.ui.b4 import cleanup\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from pkg.ui.b4 import cleanup\n"
+                            "def render(row):\n    cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_backslash_continued_import_alias_fails(self) -> None:
+        base = ("from pkg.services.lease_release import \\\n"
+                "    release_lease as cleanup\n"
+                "def render(row):\n    return str(row)\n")
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py": base.replace(
+            "    return str(row)", "    cleanup(row)\n    return str(row)")})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_long_alias_chain_converges_or_is_unverified(self) -> None:
+        base = "from pkg.services.lease_release import release_lease\n"
+        base += "".join(f"x{index} = x{index + 1}\n" for index in range(7))
+        base += "x7 = release_lease\ndef render(row):\n    return str(row)\n"
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py": base.replace(
+            "    return str(row)", "    x0(row)\n    return str(row)")})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_dynamic_assignment_target_forms_are_unverified(self) -> None:
+        for lhs in ("fn, unused = (getattr(svc, key), None)",
+                    "fn: object = getattr(svc, key)",
+                    "if True: fn = getattr(svc, key)"):
+            with self.subTest(lhs=lhs):
+                base = ("from pkg.services.lease_release import Service as svc\n"
+                        "key = 'release_lease'\n" + lhs + "\n"
+                        "def render(row):\n    return str(row)\n")
+                self.seed_pkg(base)
+                head = self.commit({"pkg/ui/consumer.py": base.replace(
+                    "    return str(row)", "    fn(row)\n    return str(row)")})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_module_reference_assignment_binds_handle(self) -> None:
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/bridge.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "import pkg.ui.bridge\nh = pkg.ui.bridge\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "import pkg.ui.bridge\nh = pkg.ui.bridge\n"
+                            "def render(row):\n    h.cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def seed_handle_chain(self, sub_files: dict[str, str], consumer: str) -> None:
+        """Boundary + pkg.ui.bridge + nested submodules + consumer."""
+        files = {"pkg/services/lease_release.py":
+                 "def release_lease(order):\n    ledger.record(order)\n",
+                 "pkg/ui/bridge/__init__.py":
+                 "from pkg.services.lease_release import release_lease as cleanup\n",
+                 "pkg/ui/consumer.py": consumer,
+                 self.CONTRACT: json.dumps({"boundary":
+                                            {"paths": ["pkg/services/lease_release.py"],
+                                             "symbols": ["release_lease"]}})}
+        files.update(sub_files)
+        self.seed(files)
+
+    def test_handle_prefixed_dotted_module_assignment_fails(self) -> None:
+        # r4 shape: `h = bridge.sub` / `h = bridge.sub.path` resolves through
+        # the recorded handle's module, not a root-level path.
+        for stmt in ("h = bridge.sub", "h = bridge.sub.path"):
+            with self.subTest(stmt=stmt):
+                sub = {"pkg/ui/bridge/sub/path.py":
+                       "from pkg.services.lease_release import release_lease as cleanup\n"}
+                if stmt == "h = bridge.sub":
+                    sub["pkg/ui/bridge/sub/__init__.py"] = (
+                        "from pkg.services.lease_release import release_lease as cleanup\n")
+                base = ("import pkg.ui.bridge.sub.path\n"
+                        "from pkg.ui import bridge\n" + stmt + "\n"
+                        "def render(row):\n    return str(row)\n")
+                self.seed_handle_chain(sub, base)
+                head = self.commit({"pkg/ui/consumer.py": base.replace(
+                    "    return str(row)", "    h.cleanup(row)\n    return str(row)")})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_same_class_dotted_variants_fail(self) -> None:
+        # Variants of the handle/chain class: a handle-attr alias, a nested
+        # chain call, and a plain-import dotted call all reach core.
+        for head_body in (
+                "x = bridge.cleanup\ndef render(row):\n    x(row)\n    return str(row)\n",
+                "def render(row):\n    bridge.sub.cleanup(row)\n    return str(row)\n",
+                "import pkg.ui.bridge.sub\ndef render(row):\n"
+                "    pkg.ui.bridge.sub.cleanup(row)\n    return str(row)\n"):
+            with self.subTest(head=head_body):
+                base = ("import pkg.ui.bridge.sub\nfrom pkg.ui import bridge\n"
+                        "def render(row):\n    return str(row)\n")
+                self.seed_handle_chain({"pkg/ui/bridge/sub/__init__.py":
+                                        "from pkg.services.lease_release import "
+                                        "release_lease as cleanup\n"},
+                                       base)
+                head = self.commit({"pkg/ui/consumer.py":
+                                    ("import pkg.ui.bridge.sub\n"
+                                     "from pkg.ui import bridge\n" + head_body)})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_unresolvable_binding_is_needs_classification(self) -> None:
+        # A call through a name whose binding cannot be resolved or proven
+        # non-core is UNVERIFIED, never a lower-T pass.
+        for body in ("def render(row):\n    x = make_thing()\n    x(row)\n    return str(row)\n",
+                     "y = helper\ndef render(row):\n    x = y\n    x(row)\n    return str(row)\n",
+                     "def render(row):\n    x = row['fn']\n    x(row)\n    return str(row)\n",
+                     "from totally_missing import run\n"
+                     "def render(row):\n    run(row)\n    return str(row)\n"):
+            with self.subTest(body=body.splitlines()[-2].strip()):
+                self.seed_pkg("def render(row):\n    return str(row)\n")
+                head = self.commit({"pkg/ui/consumer.py": body})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_inline_import_forms_are_unverifiable(self) -> None:
+        # Plain imports that do not start a physical line — after a
+        # semicolon, behind a comment, backslash-continued, or nested in a
+        # one-line control head — still bind the name; a call through an
+        # uninspectable module is unverifiable.
+        for stmt in ("import missing; missing.run(row)",
+                     "import missing  # external provider\n    missing.run(row)",
+                     "import missing \\\n    # (continued)\n    missing.run(row)",
+                     "if c: import missing\n    missing.run(row)",
+                     "while c: import missing\n    missing.run(row)",
+                     "try: import missing\n    missing.run(row)",
+                     "x = 1; import missing as m\n    m.run(row)"):
+            with self.subTest(stmt=stmt):
+                self.seed_pkg("def render(row):\n    return str(row)\n")
+                head = self.commit({"pkg/ui/consumer.py":
+                                    "def render(row):\n    " + stmt +
+                                    "\n    return str(row)\n"})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_unproven_binding_without_call_stays_clean(self) -> None:
+        # Unproven-value bindings only flag calls: data references stay clean.
+        self.seed_pkg("def render(row):\n    return str(row)\n")
+        head = self.commit({"pkg/ui/consumer.py":
+                            "def render(row):\n    x = row['qty']\n    return x\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
+
+    def test_decode_error_keeps_touch_and_lists_unverifiable(self) -> None:
+        self.release_core()
+        head = self.commit({"a_touch.py": "release_lease(row)\n",
+                            "z_bad.py": b"\xff = 2\n"})
+        checks, bound = self.eval_bound(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        self.assertIn("a_touch.py", {item["path"] for item in checks["split"]["touches"]})
+        self.assertEqual(bound["split_analysis"]["unverifiable"], ["z_bad.py"])
+
+    def test_decode_error_alone_is_needs_classification(self) -> None:
+        self.release_core()
+        head = self.commit({"z_bad.py": b"\xff = 2\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_symlink_contract_is_boundary_missing(self) -> None:
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "ui/dashboard.py": "def render(row):\n    return str(row)\n"})
+        splits = self.repo / "splits"
+        splits.mkdir(exist_ok=True)
+        os.symlink('{"boundary": {"paths": ["pkg/services/lease_release.py"],'
+                   ' "symbols": ["release_lease"]}}', splits / "733.json")
+        git(self.repo, "add", "-A", ".")
+        git(self.repo, "commit", "-qm", "contract")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1", split=self.split())),
+                         "split", "UNVERIFIED", "SPLIT_BOUNDARY_MISSING")
+
+    def test_contract_tamper_receipt_keeps_contract_fields(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/extra.py": "print('x')\n",
+                            self.CONTRACT: json.dumps({"boundary": {"paths": [], "symbols": []}})})
+        checks, bound = self.eval_bound(self.evidence(head, declared_t="T1", split=self.split()))
+        self.assert_case(checks, "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        analysis = bound["split_analysis"]
+        self.assertEqual(analysis["contract_path"], self.CONTRACT)
+        self.assertIsNotNone(analysis["contract_sha256"])
+        self.assertEqual(analysis["core_touches"],
+                         [{"path": self.CONTRACT, "kind": "contract"}])
+
+    def test_malformed_split_keeps_analysis_stub(self) -> None:
+        self.release_core()
+        head = self.commit({"ui/dashboard.py": "def render(row):\n    return row['label']\n"})
+        evidence = self.evidence(head, declared_t="T1", split=[])
+        checks, bound = self.eval_bound(evidence)
+        self.assert_case(checks, "split", "UNVERIFIED", "SPLIT_INVALID")
+        analysis = bound["split_analysis"]
+        self.assertIsNotNone(analysis)
+        self.assertEqual(sorted(analysis), sorted(
+            ["part", "parent_task", "paths_checked", "core_touches", "unverifiable",
+             "boundary_sha256", "contract_path", "contract_sha256", "behaviour_checks"]))
 
 
 if __name__ == "__main__":

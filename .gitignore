@@ -15,3 +15,7 @@ linear-archive/denylist.txt
 # herdr reboot restore (`claude --resume`) re-reads them; per-worker state,
 # never committed.
 .claude/settings.local.json
+
+# Python bytecode caches the director/ gate tools leave in the tree —
+# build output, never committed.
+__pycache__/
