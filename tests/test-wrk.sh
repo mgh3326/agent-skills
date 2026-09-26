@@ -3205,10 +3205,11 @@ echo "PASS #666 devin builder variants reuse the worker argv and need --role bui
 # model argv at that effort, ask the gate about <gate profile>@<rung> (wrk
 # forwards --effort to the gate for these profiles only), record
 # launch_profile=<canonical>@<rung> (#677), and spawn only when
-# SCOPEFUEL_E6_ARM names that exact rung. The gate-marked escalation rungs
-# (opus@low, sonnet@xhigh) also need --operator-request; the kimi pair takes
-# its rung from the pinned clone home (kimi has no --effort); the grok rungs
-# are plain marker-gated (not escalation).
+# SCOPEFUEL_E6_ARM names that exact rung. The gate-marked escalation rung
+# (sonnet@xhigh) also needs --operator-request — #738 dropped the opus@low
+# escalation gate, so builder-opus-low is plain marker-gated like the grok
+# rungs; the kimi pair takes its rung from the pinned clone home (kimi has
+# no --effort).
 # Mutants: dropping GATE_EFFORT_PIN, the marker check, the clone-effort check,
 # the canonical launch_name, or the gate's --effort forward turns this RED.
 # ---------------------------------------------------------------------------
@@ -3276,7 +3277,9 @@ assert record["payload"]["launch_profile"] == sys.argv[2], (sys.argv[3], record)
 PY
 }
 
-e6_builder_case builder-opus-low     opus        low    '--model opus --dangerously-skip-permissions --effort low'     --operator-request hk:task/704
+# #738: opus@low is an ordinary grade-S row — builder-opus-low spawns on its
+# E6 marker alone (no --operator-request; a passed REF is gate-refused).
+e6_builder_case builder-opus-low     opus        low    '--model opus --dangerously-skip-permissions --effort low'
 e6_builder_case builder-opus-medium  opus        medium '--model opus --dangerously-skip-permissions --effort medium'
 e6_builder_case builder-sonnet-xhigh sonnet      xhigh  '--model sonnet --dangerously-skip-permissions --effort xhigh' --operator-request hk:task/704
 e6_builder_case builder-sonnet-max   sonnet      max    '--model sonnet --dangerously-skip-permissions --effort max'
@@ -3361,19 +3364,30 @@ grep -q 'SCOPEFUEL_E6_ARM=codex-sol@medium' <<<"$e6_rung_out" ||
   fail "wrong-rung refusal must name the required marker: $e6_rung_out"
 echo "PASS 704+737 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
 
-# Escalation rung: the marker alone does not open opus@low — the gate still
-# demands --operator-request, and its rc 3 propagates.
+# #738: opus@low dropped its escalation gate — a stale --operator-request is
+# now refused by the gate (rc 3 operator_request_not_applicable), while the
+# remaining escalation rung (sonnet@xhigh) still demands the REF.
 set +e
 e6_esc_out="$(SCOPEFUEL_E6_ARM=opus@low \
   spawn_base builder-opus-low --role builder --lane e6-esc-lane --parent parent-lane \
-  --job e6-esc-noopreq --t T1 2>&1)"
+  --operator-request hk:task/704 --job e6-esc-staleref --t T1 2>&1)"
 e6_esc_rc=$?
 set -e
 [[ "$e6_esc_rc" -eq 3 ]] ||
-  fail "opus@low without --operator-request must hit the gate escalation refusal (rc=$e6_esc_rc): $e6_esc_out"
+  fail "opus@low with a stale --operator-request must hit not_applicable (rc=$e6_esc_rc): $e6_esc_out"
+grep -q 'operator_request_not_applicable' <<<"$e6_esc_out" ||
+  fail "opus@low stale-REF refusal must be not_applicable: $e6_esc_out"
+set +e
+e6_esc_out="$(SCOPEFUEL_E6_ARM=sonnet@xhigh \
+  spawn_base builder-sonnet-xhigh --role builder --lane e6-esc2-lane --parent parent-lane \
+  --job e6-esc-sonnet-noopreq --t T1 2>&1)"
+e6_esc_rc=$?
+set -e
+[[ "$e6_esc_rc" -eq 3 ]] ||
+  fail "sonnet@xhigh without --operator-request must hit the gate escalation refusal (rc=$e6_esc_rc): $e6_esc_out"
 grep -q 'escalation' <<<"$e6_esc_out" ||
-  fail "opus@low refusal must be the escalation denial: $e6_esc_out"
-echo "PASS 704 E6 escalation rung still requires --operator-request"
+  fail "sonnet@xhigh refusal must be the escalation denial: $e6_esc_out"
+echo "PASS 738 opus@low refuses stale REF; sonnet@xhigh still requires --operator-request"
 
 # Effort mutants: off-rung --effort is refused on the pin; the same rung
 # spelled out is accepted; kimi refuses --effort outright (no CLI flag); a
@@ -3381,7 +3395,7 @@ echo "PASS 704 E6 escalation rung still requires --operator-request"
 set +e
 e6_eff_out="$(SCOPEFUEL_E6_ARM=opus@medium \
   spawn_base builder-opus-low --role builder --lane e6-eff-lane --parent parent-lane \
-  --effort medium --operator-request hk:task/704 --job e6-eff-mutant --t T1 2>&1)"
+  --effort medium --job e6-eff-mutant --t T1 2>&1)"
 e6_eff_rc=$?
 set -e
 [[ "$e6_eff_rc" -eq 2 ]] ||

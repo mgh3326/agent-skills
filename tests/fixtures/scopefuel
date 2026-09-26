@@ -258,11 +258,12 @@ if [[ -n "$operator_request" ]]; then
     exit 3
   fi
   # task #625: the request applies to escalation profiles (oc-omni, and per
-  # #704 the rung-scoped escalations the installed gate marks: opus@low,
-  # opus@max, sonnet@xhigh) and the consult_only identity (fable) — every other
+  # #704 the rung-scoped escalations the installed gate marks: opus@max,
+  # sonnet@xhigh — #738 made opus@low an ordinary grade-S row) and the
+  # consult_only identity (fable) — every other
   # profile@effort is not_applicable, exactly the installed gate's vocabulary.
   case "$profile@$effort" in
-    opus@low|opus@max|sonnet@xhigh) : ;;
+    opus@max|sonnet@xhigh) : ;;
     *) case "$profile" in
       fable|oc-omni) : ;;
       *)
@@ -292,9 +293,10 @@ case "$profile@$effort" in
       exit 3
     fi ;;
 esac
-# The rung-scoped escalations deny without a valid operator request.
+# The rung-scoped escalations deny without a valid operator request (#738:
+# opus@low is no longer one — it is an ordinary grade-S row).
 case "$profile@$effort" in
-  opus@low|opus@max|sonnet@xhigh)
+  opus@max|sonnet@xhigh)
     if [[ -z "$operator_request" ]]; then
       echo "$profile 은 escalation 후보 — $profile@$effort 는 --operator-request REF 필요 (fixture)" >&2
       exit 3
@@ -313,7 +315,7 @@ if [[ -n "$operator_request" ]]; then
   # consult_only — it overrode no alternative denial, so false (task #625).
   override=false
   case "$profile@$effort" in
-    oc-omni@|opus@low|opus@max|sonnet@xhigh) override=true ;;
+    oc-omni@|opus@max|sonnet@xhigh) override=true ;;
   esac
   extra=" escalation_override=$override operator_request_ref=$operator_request requested_by=${rb_stripped:-unknown} ref_resolution=unverified"
 fi

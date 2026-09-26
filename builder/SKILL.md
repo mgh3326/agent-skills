@@ -33,8 +33,9 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
 `builder-kimi-high`·`builder-kimi-max`를 연다. 각 철자는 이름 마지막 구간의 런그 하나만 고정하며
 (그 외 `--effort`는 거부), spawn은 `SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식이 정확히
 그 런그를 가리킬 때만 열린다 — 예: `builder-terra-high`는 `SCOPEFUEL_E6_ARM=codex-terra@high`.
-에스컬레이션 런그(`builder-opus-low`·`builder-sonnet-xhigh`)는 `--operator-request`가 추가로
-필요하다. kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없어
+에스컬레이션 런그(`builder-sonnet-xhigh`)는 `--operator-request`가 추가로
+필요하다(#738로 `builder-opus-low`는 평범한 S급 런그가 돼 표식만으로 열리고,
+넘긴 REF는 게이트가 `operator_request_not_applicable`로 거부한다). kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없어
 `bin/kimi-clone-home --effort high|max`가 만든 고정 클론 홈의 `[thinking] effort`로만
 런그가 결정된다. E6 표본이므로 브리프에 `exp=E6` 태그와 reps 기록이 의무다.
 #737(decision 4088)은 같은 E6 규칙으로 grok 런그 `builder-grok-low`·`builder-grok-medium`·
