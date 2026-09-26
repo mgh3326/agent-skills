@@ -90,20 +90,30 @@ module or an already-bound name (chains resolve to a fixed point; a
 fixpoint that does not converge makes the file unclassifiable), and
 re-exports through another repository file: from pkg.ui.bridge
 import cleanup [as alias] or from pkg.ui.bridge import * inherits the
-bound and suspect names that bridge module binds at head, recursively.
+bound, suspect, and unproven names that bridge module binds at head,
+recursively.
 A repository module itself can be bound as a handle: from pkg.ui import
-bridge, import pkg.ui.bridge as b, or h = pkg.ui.bridge record the
-module's bound names under the alias, so a dotted call like
-bridge.cleanup(row) counts as a touch when the module binds cleanup to
-the boundary. A name imported from a repo file that exists but cannot
-be read, or that lies past the re-export recursion depth, is treated as
-suspect; where a package directory and a sibling module file both
-exist, the package wins as it does at runtime. Assignment targets are
-read in tuple (a, b = …), annotated (a: T = …), subscript/attribute,
-one-line conditional (if c: a = …), for/with (for a in …, with … as a),
-and semicolon-separated forms. An `import *` whose source cannot be
-expanded — a boundary module or an unreadable or missing module —
-makes the whole file unclassifiable.
+bridge, import pkg.ui.bridge as b, h = pkg.ui.bridge, or an
+attribute-chain module reference such as h = bridge.sub or
+h = bridge.sub.path record the module's bound names under the alias, so
+a dotted call like bridge.cleanup(row) or h.cleanup(row) counts as a
+touch when the module binds cleanup to the boundary; binding a handle's
+bound attribute (x = bridge.cleanup) binds the alias directly. A name
+imported from a repo file that exists but cannot be read, or that lies
+past the re-export recursion depth, is treated as suspect; where a
+package directory and a sibling module file both exist, the package
+wins as it does at runtime. Assignment targets are read in tuple
+(a, b = …), annotated (a: T = …), subscript/attribute, walrus (a := …),
+starred (*a = …), one-line conditional (if c: a = …), async and plain
+for/with (for a in …, with … as a), and semicolon-separated forms. An
+`import *` whose source cannot be expanded — a boundary module or an
+unreadable or missing module — makes the whole file unclassifiable.
+Every other binding is fail-closed: a name bound to a value that cannot
+be proven non-core — an uninspectable module import, an unproven
+right-hand side, or an attribute of a core-deriving module that is not
+provably bound — may not be called in the diff; a changed call through
+such a name is UNVERIFIED NEEDS_CLASSIFICATION, though plain data
+references to it stay clean.
 
 Touching the boundary — a boundary path, the contract file, a core
 symbol or bound alias, an import of a boundary module, or a removed

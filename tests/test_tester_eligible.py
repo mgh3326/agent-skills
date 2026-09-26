@@ -1244,6 +1244,85 @@ class SplitFixtures(EligibilityFixtures):
                                                   split=self.split())),
                          "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
 
+    def seed_handle_chain(self, sub_files: dict[str, str], consumer: str) -> None:
+        """Boundary + pkg.ui.bridge + nested submodules + consumer."""
+        files = {"pkg/services/lease_release.py":
+                 "def release_lease(order):\n    ledger.record(order)\n",
+                 "pkg/ui/bridge/__init__.py":
+                 "from pkg.services.lease_release import release_lease as cleanup\n",
+                 "pkg/ui/consumer.py": consumer,
+                 self.CONTRACT: json.dumps({"boundary":
+                                            {"paths": ["pkg/services/lease_release.py"],
+                                             "symbols": ["release_lease"]}})}
+        files.update(sub_files)
+        self.seed(files)
+
+    def test_handle_prefixed_dotted_module_assignment_fails(self) -> None:
+        # r4 shape: `h = bridge.sub` / `h = bridge.sub.path` resolves through
+        # the recorded handle's module, not a root-level path.
+        for stmt in ("h = bridge.sub", "h = bridge.sub.path"):
+            with self.subTest(stmt=stmt):
+                sub = {"pkg/ui/bridge/sub/path.py":
+                       "from pkg.services.lease_release import release_lease as cleanup\n"}
+                if stmt == "h = bridge.sub":
+                    sub["pkg/ui/bridge/sub/__init__.py"] = (
+                        "from pkg.services.lease_release import release_lease as cleanup\n")
+                base = ("import pkg.ui.bridge.sub.path\n"
+                        "from pkg.ui import bridge\n" + stmt + "\n"
+                        "def render(row):\n    return str(row)\n")
+                self.seed_handle_chain(sub, base)
+                head = self.commit({"pkg/ui/consumer.py": base.replace(
+                    "    return str(row)", "    h.cleanup(row)\n    return str(row)")})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_same_class_dotted_variants_fail(self) -> None:
+        # Variants of the handle/chain class: a handle-attr alias, a nested
+        # chain call, and a plain-import dotted call all reach core.
+        for head_body in (
+                "x = bridge.cleanup\ndef render(row):\n    x(row)\n    return str(row)\n",
+                "def render(row):\n    bridge.sub.cleanup(row)\n    return str(row)\n",
+                "import pkg.ui.bridge.sub\ndef render(row):\n"
+                "    pkg.ui.bridge.sub.cleanup(row)\n    return str(row)\n"):
+            with self.subTest(head=head_body):
+                base = ("import pkg.ui.bridge.sub\nfrom pkg.ui import bridge\n"
+                        "def render(row):\n    return str(row)\n")
+                self.seed_handle_chain({"pkg/ui/bridge/sub/__init__.py":
+                                        "from pkg.services.lease_release import "
+                                        "release_lease as cleanup\n"},
+                                       base)
+                head = self.commit({"pkg/ui/consumer.py":
+                                    ("import pkg.ui.bridge.sub\n"
+                                     "from pkg.ui import bridge\n" + head_body)})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_unresolvable_binding_is_needs_classification(self) -> None:
+        # A call through a name whose binding cannot be resolved or proven
+        # non-core is UNVERIFIED, never a lower-T pass.
+        for body in ("def render(row):\n    x = make_thing()\n    x(row)\n    return str(row)\n",
+                     "y = helper\ndef render(row):\n    x = y\n    x(row)\n    return str(row)\n",
+                     "def render(row):\n    x = row['fn']\n    x(row)\n    return str(row)\n",
+                     "from totally_missing import run\n"
+                     "def render(row):\n    run(row)\n    return str(row)\n"):
+            with self.subTest(body=body.splitlines()[-2].strip()):
+                self.seed_pkg("def render(row):\n    return str(row)\n")
+                head = self.commit({"pkg/ui/consumer.py": body})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_unproven_binding_without_call_stays_clean(self) -> None:
+        # Unproven-value bindings only flag calls: data references stay clean.
+        self.seed_pkg("def render(row):\n    return str(row)\n")
+        head = self.commit({"pkg/ui/consumer.py":
+                            "def render(row):\n    x = row['qty']\n    return x\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "PASS", "SPLIT_PERIPHERAL_CLEAN")
+
     def test_decode_error_keeps_touch_and_lists_unverifiable(self) -> None:
         self.release_core()
         head = self.commit({"a_touch.py": "release_lease(row)\n",
