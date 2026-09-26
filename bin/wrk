@@ -278,8 +278,13 @@ opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
 kimi-k3@max, grok-hi@xhigh; #737 adds grok-hi@low, grok-hi@medium and
 codex-sol@medium). The @max arms here are inert for builders since the
 seat rule fires first; they still describe worker-side measurement.
-Rungs the gate marks escalation (opus@low, sonnet@xhigh)
-additionally need --operator-request REF. #737 adds the grok rungs of
+Rungs the gate marks escalation (sonnet@xhigh)
+additionally need --operator-request REF. opus@low lost its escalation mark
+in scopefuel #738 (b5b0ad2): post-#738 the gate refuses a REF on it
+(operator_request_not_applicable, rc 3). Pre-#738 installs keep the mark but
+accept a REF on it — wrk forwards a caller-supplied REF verbatim either way
+and never adds one; which rungs are escalation is the gate's call, not
+wrk's. #737 adds the grok rungs of
 decision 4088 — builder-grok-low, builder-grok-medium and
 builder-grok-xhigh pin grok-hi@<rung> the same way
 (SCOPEFUEL_E6_ARM=grok-hi@<rung>; grok rungs are not escalation-marked, so
