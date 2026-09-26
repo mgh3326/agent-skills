@@ -119,6 +119,8 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
 4. BLOCKER만 fix 라운드를 연다. 3라운드를 넘기지 않는다.
 5. **워커·tester 배치는 `wrk spawn`(hub placement)이 정한다.** 빌더 자신의 머신이 기본값이
    아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
+6. T3 작업을 여러 PR·워커로 나누는 분할 규칙(불변식 표·핵심/주변 경계·NEEDS_CLASSIFICATION·
+   최종 통합 T3 tester)의 정본은 `spawn-worker` §2-6이다 — 이 문서에 두 번째 사본을 두지 않는다.
 
 <!-- ci-canonical-full-suite:start -->
 **CI-covered full-suite canonical contract.** 아래 seven fixed IDs만이 이 주제의 규범 규칙이다.
