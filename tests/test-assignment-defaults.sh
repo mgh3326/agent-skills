@@ -60,10 +60,18 @@ BLOCK_ROWS = [
     # the cost rule builders still exclude max from the candidate set.
     ("builder-never-max", r"빌더 좌석은 max 런그를 쓰지 않는다"),
     ("builder-ultra-counts", r"ultra[^\n]{0,30}?(거부|상한)"),
+    ("builder-floor", r"기본은 high 이하 또는 devin 프로필"),
     ("builder-max-excluded", r"빌더 후보는 max 를 빼고 고른다"),
     ("builder-xhigh-exceptions", r"별도 승인된 xhigh 빌더"),
     ("builder-sol-high", r"Sol 빌더는? Sol high"),
+    # Sol high is an unmeasured (C) rung — the seat default is NOT an eligible
+    # candidate under the cost rule; the text must say so (S-R3-1).
+    ("sol-high-seat-not-candidate", r"Sol high[^\n]{0,30}?배정 후보가 아니라 좌석 고정값"),
     ("devin-no-effort-flag", r"devin 빌더는? effort 플래그 없이"),
+    # 4088 B reservation restored with its sourced exceptions — the only
+    # non-T3 max rungs are the ones the sources name.
+    ("max-t3-only", r"max effort 는? T3 구현 워커·T3 tester 에만\s*예약한다"),
+    ("max-exceptions-sourced", r"예외는? devin swe2-max[^\n]{0,60}?A\+ 의 Luna max[^\n]{0,40}?E6 측정 런그"),
     ("wrk-enforces", r"wrk 도? `?--role builder`? 에서 max 를 거부한다"),
     # Devin defaults (unchanged by the FINAL rule).
     ("t1t2-devin", r"T1/T2 구현 기본은 devin"),
@@ -81,6 +89,9 @@ BLOCK_ROWS = [
     ("claude-bc-haiku", r"B·C·기계적 작업 =\s*Haiku"),
     ("opus-low-gate-escalation", r"Opus low 는? 현재 카탈로그에서 gate=escalation"),
     ("opus-low-gate-scopefuel-only", r"scopefuel 카탈로그 변경이며[^\n]{0,30}?이 PR 의 범위 밖"),
+    # While Opus low is gated, S/A+/A still picks the cheapest USABLE
+    # candidate — no ad-hoc gap (N-R3-1).
+    ("opus-low-interim", r"해제 전까지 S·A\+·A 도 사용 가능 후보 중 비용 최소로 고른다"),
     # Current output — codex. Terra is dominated at every grade; the codex-sol
     # spelling itself still defaults to max, so Sol assignments carry --effort.
     ("codex-s-sol-xhigh", r"S\+·S = Sol xhigh"),
@@ -93,7 +104,7 @@ BLOCK_ROWS = [
     ("terra-no-load-claim", r"부하 분산 주장 금지"),
     ("sol-codex-default-max", r"codex-sol`?\s*철자 자체의 기본값은 max"),
     ("sol-assign-explicit-effort", r"Sol 배정은? `?--effort`? 명시"),
-    ("e6-sol-priority", r"미측정\(C\) Sol high·medium 은?[^\n]{0,40}?E6 arm 우선 측정 대상"),
+    ("e6-sol-priority", r"미측정 Sol high\(C\)·미배치 Sol medium 은?[^\n]{0,40}?E6 arm 우선 측정 대상"),
     # Provenance and authority.
     ("cite-decision", r"2026-09-26 운영자 결정"),
     ("cite-note-4098", r"note/2026-09-26/grade-cost-table"),
@@ -119,6 +130,11 @@ FILE_FORBIDDEN = [
     # neither "T2 = Sonnet" nor "Sonnet = T2" may come back, anywhere.
     ("sonnet-t2-stale",
      r"T2[^\n]{0,15}?=\s*Sonnet|Sonnet[^\n]{0,25}?=\s*T2"),
+    # The contradictory replacement sentence from the first FINAL-rule edit
+    # (B-R3-1): "worker max remains only X" contradicted the same block's
+    # A+ = Luna max row. The reservation is stated as 4088 B + exceptions now.
+    ("worker-max-remnant-contradiction",
+     r"워커 쪽의 max 는[^\n]{0,60}?에만 남는다"),
 ]
 
 # Same drift classes in the launcher: help and comment text must not claim a
@@ -227,6 +243,16 @@ for name in SKILLS:
     mutants[f"{name}-recalibrate-735-dropped"] = mutate(
         name, "#735 의 측정 rep 이 이 표를 재보정한다", "#735 도 이 표를 참고한다"
     )
+    # 4088 B clauses — dropping either again is the B-R3-1 regression.
+    mutants[f"{name}-max-reservation-dropped"] = mutate(
+        name, "max effort 는 T3 구현 워커·T3 tester 에만 예약한다", "max effort 는 상황에 따라 쓴다"
+    )
+    mutants[f"{name}-builder-floor-weakened"] = mutate(
+        name, "기본은 high 이하 또는 devin 프로필이다", "기본은 xhigh 이다"
+    )
+    mutants[f"{name}-max-exceptions-dropped"] = mutate(
+        name, "예외는 devin swe2-max", "예외는 없다"
+    )
     mutants[f"{name}-sonnet-t2-reintroduced"] = mutate(
         name,
         "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
@@ -316,7 +342,24 @@ mutants["wrk-defaults-as-policy"] = mutate(
     "director", "wrk 철자 기본값은\n  정책이 아니다", "wrk 철자 기본값이 곧 정책이다"
 )
 mutants["builder-sol-high-dropped"] = mutate(
-    "spawn", "Sol 빌더는 Sol high\n  (wrk 기본값 그대로)", "Sol 빌더는 상황에 따라"
+    "spawn", "Sol 빌더는 Sol high(wrk 기본값 그대로", "Sol 빌더는 상황에 따라"
+)
+# The Sol-high-is-not-a-candidate caveat keeps the seat default from being
+# read as grade eligibility (S-R3-1).
+mutants["sol-high-seat-caveat-dropped"] = mutate(
+    "builder", "자체는 미측정 C 라 배정 후보가 아니라 좌석 고정값이다", "자체는 이미 측정된 S 후보다"
+)
+# While Opus low is gated the interim "cheapest usable" clause prevents
+# ad-hoc S/A+/A picks (N-R3-1).
+mutants["opus-low-interim-dropped"] = mutate(
+    "director", "해제 전까지 S·A+·A 도\n  사용 가능 후보 중 비용 최소로 고른다", ""
+)
+# The contradictory "worker max remains only ..." sentence must not come
+# back — only the forbidden guard catches this class.
+mutants["worker-max-remnant-back"] = mutate(
+    "director",
+    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+    "워커 쪽의 max 는 Sol 의 T3 코어 필요분과 E6 측정 런그에만 남는다.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
 )
 # Forbidden-pattern mutants (tester round-1 classes): these only the guard
 # catches — every required row still reads the same.
