@@ -205,6 +205,17 @@ def check(d: dict) -> None:
             )
     # The gate policy pins the skill files: a re-pinned hash must match the
     # edited bytes, and an un-pinned file must not have drifted either way.
+    # Duplicate keys smuggle stale pins past last-key-wins parsers (R3 tester):
+    # a "spawn-worker/SKILL.md": <stale> followed by the correct value parses
+    # as correct in Python but stale in a first-key-wins reader.
+    assert d["policy"].count('"local_sources"') == 1, (
+        "gate_policy must contain exactly one local_sources object"
+    )
+    ls_body = re.search(r'"local_sources"\s*:\s*\{([^}]*)\}', d["policy"])
+    assert ls_body, "gate_policy local_sources object missing"
+    ls_keys = re.findall(r'"([^"]+)"\s*:', ls_body.group(1))
+    ls_dups = sorted({k for k in ls_keys if ls_keys.count(k) > 1})
+    assert not ls_dups, f"gate_policy local_sources duplicate keys hide drift: {ls_dups}"
     policy = json.loads(d["policy"])
     pinned = policy["local_sources"]
     for rel in REQUIRED_PINS:
@@ -338,6 +349,23 @@ _pol = json.loads(_pinless["policy"])
 del _pol["local_sources"]["spawn-worker/SKILL.md"]
 _pinless["policy"] = json.dumps(_pol, ensure_ascii=False, indent=2)
 mutants["policy-spawn-pin-removed"] = _pinless
+# R3 tester finding: a duplicate key — stale value first, correct last —
+# parses correct under last-key-wins but stale under first-key-wins.
+_dupkey = dict(docs)
+_dupkey["policy"] = _dupkey["policy"].replace(
+    '"spawn-worker/SKILL.md": "',
+    '"spawn-worker/SKILL.md": "' + "0" * 64 + '",\n    "spawn-worker/SKILL.md": "',
+    1,
+)
+mutants["policy-spawn-pin-duplicated"] = _dupkey
+# A second local_sources object carrying a stale mini-map.
+_dupobj = dict(docs)
+_dupobj["policy"] = _dupobj["policy"].replace(
+    '"profiles": {',
+    '"local_sources": {"spawn-worker/SKILL.md": "' + "0" * 64 + '"},\n  "profiles": {',
+    1,
+)
+mutants["policy-dup-local-sources"] = _dupobj
 # NEEDS_CLASSIFICATION rule dropped or inverted.
 mutants["spawn-needs-classification-dropped"] = mutate(
     "spawn", "낮은 T 로 실행하지 않고 `NEEDS_CLASSIFICATION`\n  으로 반환한다", "낮은 T 로 실행한다"
