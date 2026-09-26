@@ -136,13 +136,13 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
 
 <!-- T736-ASSIGNMENT-DEFAULTS -->
 🔴 **배정 기본값 (출처: 2026-09-26 운영자 결정 `decision/2026-09-26/effort-efficiency` B
-+ hk:doc `note/2026-09-26/grade-cost-table`(id 4098 — 카탈로그 급 × AA 작업당 비용)
++ hk:doc `decision/2026-09-26/grade-cost-rule-adopted`(id 4311 — 규칙 채택 기록; 비교표 `note/2026-09-26/grade-cost-table` id 4098, 카탈로그 급 × AA 작업당 비용)
 + AA telemetry 스냅샷 `pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23)** —
 결정과 스냅샷은 인용하되 **벤치 수치는 이 문서에 복사하지 않는다.** 급의 정본은 계속
 `scopefuel --recommend` 와 scopefuel 정책이고, 위 급표가 이 문서의 유일한 급표다.
 
 - **기본 규칙: 과제 급 이상으로 배치된 후보 중 작업당 비용이 가장 낮은 것을 기본으로
-  고른다**(note 4098 의 규칙 — 이후 값들은 고정 목록이 아니라 이 규칙의 현재 출력이다.
+  고른다**(결정 4311 이 채택한 규칙 — 비교표는 note 4098. 이후 값들은 고정 목록이 아니라 이 규칙의 현재 출력이다.
   **#735 의 측정 rep 이 이 표를 재보정한다** — 규칙이 정본, 수치는 갱신된다). 배정은
   규칙이 고른 `profile@effort` 를 `--effort` 로 명시해 적용한다 — **wrk 철자 기본값은
   정책이 아니다**.
@@ -152,8 +152,7 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
   빌더 후보는 max 를 빼고 고른다. Sol 빌더는 Sol high(wrk 기본값 그대로 — Sol high
   자체는 미측정 C 라 배정 후보가 아니라 좌석 고정값이다), devin 빌더는 effort 플래그
   없이 모델 런그 그대로다. **max effort 는 T3 구현 워커·T3 tester 에만 예약한다
-  (4088 B)** — 예외는 devin swe2-max(4088 명시, 무료)·A+ 의 Luna max(note 4098 비용
-  규칙)·워커 E6 측정 런그다(#704). wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
+  (4088 B)** — 예외는 devin swe2-max(4088 명시, 무료)·A+ 의 Luna max(4311 비용 규칙)·워커 E6 측정 런그다(#704). wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
 - **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
   `builder-devin-max`)은 무료이므로 적극 쓴다.
 - **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** — §2-2 급표 행의

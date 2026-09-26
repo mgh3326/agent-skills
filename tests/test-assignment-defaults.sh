@@ -118,6 +118,8 @@ BLOCK_ROWS = [
     # Provenance and authority.
     ("cite-decision", r"2026-09-26 운영자 결정"),
     ("cite-note-4098", r"note/2026-09-26/grade-cost-table"),
+    ("cite-decision-4311", r"decision/2026-09-26/grade-cost-rule-adopted"),
+    ("rule-adopted-4311", r"결정 4311 이 채택한 규칙"),
     ("cite-telemetry", r"pinion05\.github\.io/aa-model-telemetry"),
     ("cite-collected", r"수집 2026-09-23"),
     ("no-bench-copy", r"벤치 수치는?"),
@@ -290,6 +292,10 @@ mutants["director-cite-decision-dropped"] = mutate(
 )
 mutants["director-cite-4098-dropped"] = mutate(
     "director", "note/2026-09-26/grade-cost-table", "note/2026-09-26/effort-table"
+)
+mutants["director-cite-4311-dropped"] = mutate(
+    "director", "decision/2026-09-26/grade-cost-rule-adopted",
+    "decision/2026-09-26/grade-cost-rule-proposed"
 )
 mutants["spawn-no-bench-rule-dropped"] = mutate(
     "spawn", "벤치 수치는 이 문서에 복사하지 않는다.", ""
