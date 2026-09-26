@@ -23,6 +23,7 @@ paths = {
     "spawn": Path(os.environ.get("SPAWN_WORKER_SKILL", root / "spawn-worker/SKILL.md")),
     "builder": Path(os.environ.get("BUILDER_SKILL", root / "builder/SKILL.md")),
     "director": Path(os.environ.get("DIRECTOR_SKILL", root / "director/SKILL.md")),
+    "readme": root / "README.md",
     "wrk": root / "bin/wrk",
     "policy": root / "director/gate_policy.json",
 }
@@ -154,6 +155,26 @@ WRK_FORBIDDEN = [
      r"builder-(?:sonnet|sol|luna|terra|kimi)-max[^\n]{0,30}?(?:opens?|launches|spawns?|열린|뜬)"),
 ]
 
+# #748 (post-#740 codex tester finding): on an explicit --effort rung the
+# installed gate judges quota rules and shows the escalation tag — it never
+# enforces a --operator-request REF there (scopefuel #716). The stale claim
+# that a marked rung "needs a REF" is forbidden wherever it appeared; the
+# negated forms ("요구하지 않는다", "no ... enforced") stay legal.
+REF_REQUIRED_FORBIDDEN = [
+    ("ref-required-en",
+     r"(?:needs?|requires?|demands?|must)\s+(?:an?\s+|the\s+|a\s+)?--operator-request"),
+    ("ref-required-en-passive",
+     r"--operator-request`?\s+(?:is|are)\s+(?:required|needed|mandatory)"),
+    ("ref-required-ko",
+     r"--operator-request`?\s*가\s*(?:추가로\s+)?필요(?:하다|함)|--operator-request`?\s*를\s*요구한다"),
+    ("ref-required-escalation",
+     r"에스컬레이션[^\n]{0,40}?--operator-request[^\n]{0,15}?추가"),
+]
+
+EXPLICIT_RUNG_NO_REF = (
+    r"명시[^\n]{0,20}?--effort[^\n]{0,60}?--operator-request[^\n]{0,40}?요구하지 않는다"
+)
+
 CLOSED_E6 = r"max 런그 철자\([^\n]*?builder-sonnet-max[^\n]*?\)는? 닫혔다"
 
 
@@ -190,19 +211,117 @@ def check(d: dict) -> None:
             f"{name}: closed max-rung E6 spellings note missing"
         )
 
-    # bin/wrk: the builder-seat rule must sit on EFFECTIVE_EFFORT, and
-    # builder-sol must resolve/catalog-pin at high.
+    # #748: the stale "marked rung needs a REF" claim may not appear in any
+    # scanned doc, and the corrected #716 wording must be where the rungs are
+    # documented (spawn/builder table rows, README note, wrk help).
+    for name in (*SKILLS, "wrk", "readme"):
+        for row, pattern in REF_REQUIRED_FORBIDDEN:
+            assert not re.search(pattern, flat(d[name])), (
+                f"{name}: stale REF-required claim reintroduced ({row}): "
+                f"{re.search(pattern, flat(d[name])).group(0)!r}"
+            )
+    for name in ("spawn", "builder", "readme"):
+        assert re.search(EXPLICIT_RUNG_NO_REF, flat(d[name])), (
+            f"{name}: #716 explicit-rung no-REF wording missing"
+        )
+    assert re.search(
+        r"explicit --effort rung[^\n]{0,80}?quota rules[^\n]{0,80}?no --operator-request[^\n]{0,40}?enforced",
+        wrk_flat,
+    ), "wrk: help must say explicit rungs are quota-judged with no REF enforced"
+
+    # bin/wrk: the builder-seat rule must sit on the resolved effort, and
+    # builder-sol must resolve/catalog-pin at high. The kimi home read below
+    # is what lets the unflagged kimi spellings reach the same case arm.
     wrk = flat(d["wrk"])
     assert "builder seats never take a max rung" in wrk, (
         "wrk: builder-seat max refusal message missing"
     )
-    assert re.search(r"ROLE:-worker.{0,40}?builder.{0,40}?EFFECTIVE_EFFORT.{0,15}?max", wrk), (
-        "wrk: the seat rule must gate on role=builder and resolved effort max"
+    assert re.search(
+        r"ROLE:-worker.{0,40}?builder.{0,60}?local seat_effort=\"\$EFFECTIVE_EFFORT\".{0,900}?case \"\$seat_effort\" in max\|ultra\)",
+        wrk,
+    ), (
+        "wrk: the seat rule must gate on role=builder and refuse resolved max|ultra"
     )
-    # ultra is the codex max tier plus subagents — the seat rule must refuse it
-    # as well, or --effort ultra bypasses the whole rule (tester-found hole).
-    assert re.search(r"EFFECTIVE_EFFORT.{0,15}?max\|ultra\)", wrk), (
-        "wrk: the seat rule must refuse the ultra rung too (max|ultra)"
+    # #748: builder-kimi/kimi-k3 leave EFFECTIVE_EFFORT empty — the seat rule
+    # must read the kimi home's resolved effort or a max home slips through.
+    assert re.search(
+        r"-z \"\$seat_effort\" && \"\$PROFILE_KIND\" == kimi.{0,900}?kimi_clone_resolved_effort \"\$\{KIMI_TRUST_HOME:-\}/config\.toml\" \"\$kimi_model\"",
+        wrk,
+    ), (
+        "wrk: an empty resolved effort on a kimi profile must read the home's resolved effort for the seat rule"
+    )
+    # #748r2 (tester round 1): the resolution must honour TOML literal
+    # (single-quoted) strings and the model default_effort fallback with
+    # support_efforts membership — a double-quote-only scan or a
+    # thinking-only read leaves valid max homes admitted.
+    assert "default_effort" in wrk and "support_efforts" in wrk, (
+        "wrk: the kimi seat read must fall back to the model's default_effort honouring support_efforts"
+    )
+    assert re.search(
+        r"m_seen && \(t == \"\" \|\| \(s_seen && !\(t in S\)\)\)\) r = d",
+        wrk,
+    ), "wrk: the kimi resolver must substitute default_effort for missing/unsupported requests"
+    assert re.search(r"substr\(s, 1, 1\) == sq", wrk), (
+        "wrk: the kimi resolver must parse TOML literal (single-quoted) strings"
+    )
+    # #748r3 (tester round 2): the resolution must be a real TOML parse —
+    # dotted keys, inline tables, escapes, multiline strings and indented
+    # headers are equivalent spellings an awk scan cannot fully cover — plus
+    # the documented env overlay, Thinking disabled→off_effort, and the
+    # [models."<id>".overrides] table.
+    assert re.search(r"import tomllib\b", wrk), (
+        "wrk: the kimi resolver must parse real TOML via tomllib/tomli"
+    )
+    assert re.search(
+        r"resolved not in support\)\): resolved = default",
+        wrk,
+    ), "wrk: the kimi resolver must fall back to default_effort for missing/unsupported requests"
+    assert 'env_eff="${KIMI_MODEL_THINKING_EFFORT:-}"' in wrk, (
+        "wrk: the kimi resolver must honour the KIMI_MODEL_THINKING_EFFORT overlay"
+    )
+    assert 'thinking.get("enabled") is False' in wrk, (
+        "wrk: the kimi resolver must resolve disabled Thinking to off_effort"
+    )
+    assert 'model.get("overrides")' in wrk, (
+        "wrk: the kimi resolver must honour the model overrides table"
+    )
+    assert 'pick("off_effort")' in wrk, (
+        "wrk: the kimi resolver must read the model off_effort"
+    )
+    # always-thinking also arrives as a capabilities tag, not only a boolean
+    # field; effort="off" is a valid off spelling; and the env overlay is
+    # bounded to documented rung spellings before it is honoured.
+    assert '"always_thinking" in caps' in wrk, (
+        "wrk: the kimi resolver must honour the always_thinking capability tag"
+    )
+    assert 'if effort == "off" and not always:' in wrk, (
+        "wrk: the kimi resolver must treat effort=off as Thinking off"
+    )
+    assert '"xhigh", "max", "ultra", "off", "on"' in wrk, (
+        "wrk: the kimi resolver must bound the env overlay to documented rung spellings"
+    )
+    # CodeRabbit #153: with no readable config the env value alone resolves —
+    # it must be bounded and normalized like the real parse or MAX bypasses
+    # the case-sensitive seat match; the E6 pinned clone must exist before
+    # its effort is compared (the env overlay cannot stand in for it); and
+    # the awk overrides strip must anchor at the suffix, not eat the model
+    # id's closing quote.
+    assert re.search(
+        r'! -r "\$cfg".{0,600}?tr .\[:upper:\]. .\[:lower:\].',
+        wrk,
+    ), "wrk: the no-config env path must normalize the effort value"
+    assert 'minimal|low|medium|high|xhigh|max|ultra|off|on) printf' in wrk, (
+        "wrk: the no-config env path must bound the effort value to documented rungs"
+    )
+    assert 'printf \'%s\\n\' "$norm"' in wrk, (
+        "wrk: the no-config env path must print the normalized value, not the raw env"
+    )
+    assert re.search(
+        r'-r "\$KIMI_TRUST_HOME/config\.toml".{0,200}?config\.toml missing',
+        wrk,
+    ), "wrk: the E6 pinned kimi clone must fail closed on a missing config.toml"
+    assert 'sub(/\\.overrides$/, "", mh)' in wrk, (
+        "wrk: the awk overrides strip must anchor at the suffix, not eat the closing quote"
     )
     assert re.search(
         r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6-sol;\s*DEFAULT_EFFORT=high",
@@ -444,6 +563,122 @@ mutants["wrk-seat-rule-ultra-dropped"] = mutate(
     "wrk",
     "      max|ultra)",
     "      max)",
+)
+# #748: a seat rule that stops reading the kimi home leaves the unflagged
+# kimi spellings blind to a max-effort home.
+mutants["wrk-seat-rule-kimi-blind"] = mutate(
+    "wrk",
+    'seat_effort="$(kimi_clone_resolved_effort "${KIMI_TRUST_HOME:-}/config.toml" "$kimi_model")"',
+    'seat_effort=""',
+)
+# #748r2: dropping the default_effort fallback or the literal-string parse
+# reopens the tester-found max-home paths.
+mutants["wrk-seat-rule-no-model-default"] = mutate(
+    "wrk",
+    'if (m_seen && (t == "" || (s_seen && !(t in S)))) r = d',
+    'r = t',
+)
+mutants["wrk-seat-rule-no-literal-string"] = mutate(
+    "wrk",
+    "if (substr(s, 1, 1) == sq && substr(s, length(s), 1) == sq)\n        return substr(s, 2, length(s) - 2)",
+    'return ""',
+)
+# #748r3: dropping the real TOML parse, the env overlay, disabled-Thinking or
+# the overrides table reopens the round-2 paths. The python
+# `resolved = default` is the primary-path default fallback the awk `r = d`
+# mutant above covers for the degraded path.
+mutants["wrk-seat-rule-no-real-toml"] = mutate(
+    "wrk",
+    "    import tomllib",
+    "    import os as tomllib",
+)
+mutants["wrk-seat-rule-py-no-model-default"] = mutate(
+    "wrk",
+    "    resolved = default",
+    "    resolved = effort",
+)
+mutants["wrk-seat-rule-env-blind"] = mutate(
+    "wrk",
+    'env_eff="${KIMI_MODEL_THINKING_EFFORT:-}"',
+    'env_eff=""',
+)
+mutants["wrk-seat-rule-enabled-ignored"] = mutate(
+    "wrk",
+    'if thinking.get("enabled") is False and not always:',
+    "if False:",
+)
+mutants["wrk-seat-rule-overrides-dropped"] = mutate(
+    "wrk",
+    'over = table(model.get("overrides"))',
+    "over = {}",
+)
+# The capabilities-tag always shape, the bounded env list and effort=off all
+# gate refusal paths; dropping any reopens a round-3 attack.
+mutants["wrk-seat-rule-no-cap-always"] = mutate(
+    "wrk",
+    '"always_thinking" in caps',
+    "False",
+)
+mutants["wrk-seat-rule-env-unbounded"] = mutate(
+    "wrk",
+    'if env_eff in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra", "off", "on"}:',
+    "if env_eff:",
+)
+mutants["wrk-seat-rule-off-ignored"] = mutate(
+    "wrk",
+    'if effort == "off" and not always:',
+    "if False:",
+)
+# CodeRabbit #153: an unbounded env passthrough on the no-config path, an env
+# stand-in for a missing pinned clone, and a quote-eating overrides strip
+# each reopen a refusal path the tester or reviewer already demonstrated.
+mutants["wrk-seat-rule-env-unbounded-nocfg"] = mutate(
+    "wrk",
+    "minimal|low|medium|high|xhigh|max|ultra|off|on",
+    "minimal|low|medium|high",
+)
+mutants["wrk-e6-clone-env-standin"] = mutate(
+    "wrk",
+    '      [[ -r "$KIMI_TRUST_HOME/config.toml" ]] ||\n'
+    '        die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (config.toml missing); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"\n',
+    "",
+)
+mutants["wrk-seat-rule-env-raw-nocfg"] = mutate(
+    "wrk",
+    'printf \'%s\\n\' "$norm"',
+    'printf \'%s\\n\' "$env_eff"',
+)
+mutants["wrk-seat-rule-awk-overrides-quote"] = mutate(
+    "wrk",
+    'sub(/\\.overrides$/, "", mh)',
+    'sub(/[."]?\\.overrides.*$/, "", mh)',
+)
+# #748: the stale "marked rung needs a REF" claim must go RED in every
+# scanned doc; dropping the corrected wording goes RED via the required row.
+mutants["builder-ref-required-back"] = mutate(
+    "builder",
+    "`--operator-request` REF를\n요구하지 않는다",
+    "`--operator-request`가 추가로\n필요하다",
+)
+mutants["spawn-ref-required-back"] = mutate(
+    "spawn",
+    "`--operator-request` REF를 요구하지 않는다",
+    "`--operator-request`가 추가로 필요하다",
+)
+mutants["readme-ref-required-back"] = mutate(
+    "readme",
+    "`--operator-request` REF를 요구하지 않는다",
+    "`--operator-request` 추가",
+)
+mutants["wrk-ref-required-back"] = mutate(
+    "wrk",
+    "so no --operator-request REF is enforced there",
+    "additionally need --operator-request REF",
+)
+mutants["builder-explicit-no-ref-dropped"] = mutate(
+    "builder",
+    "`--operator-request` REF를\n요구하지 않는다",
+    "`--operator-request` REF를\n요구한다",
 )
 mutants["wrk-builder-sol-back-to-max"] = mutate(
     "wrk",

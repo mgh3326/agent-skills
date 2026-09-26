@@ -3211,9 +3211,12 @@ echo "PASS #666 devin builder variants reuse the worker argv and need --role bui
 # model argv at that effort, ask the gate about <gate profile>@<rung> (wrk
 # forwards --effort to the gate for these profiles only), record
 # launch_profile=<canonical>@<rung> (#677), and spawn only when
-# SCOPEFUEL_E6_ARM names that exact rung. The gate-marked escalation rungs
-# (sonnet@xhigh — and opus@low only in the fixture's default escalation
-# model, see the #740 block below) also need --operator-request; the kimi pair takes
+# SCOPEFUEL_E6_ARM names that exact rung. The fixture's escalation model
+# still demands --operator-request on its marked rungs (sonnet@xhigh in
+# both modes, opus@low in the default mode — see the #740 block below);
+# the real installed gate skips the escalation ladder on --effort-named
+# rungs (#716), so that demand is fixture-model behaviour, not installed
+# behaviour. The kimi pair takes
 # its rung from the pinned clone home (kimi has no --effort); the grok rungs
 # are plain marker-gated (not escalation).
 # Mutants: dropping GATE_EFFORT_PIN, the marker check, the clone-effort check,
@@ -3346,6 +3349,391 @@ set -e
 grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
   fail "builder-sol --effort ultra refusal must name the builder-seat rule: $e6_max_out"
 echo "PASS 736 max-rung builder spellings closed by the builder-seat rule"
+
+# #748: the unflagged kimi spellings admitted as builders (builder-kimi,
+# kimi-k3) leave EFFECTIVE_EFFORT empty — the seat rule reads the home's
+# [thinking] effort instead. A home pinned to max is refused on the same
+# seat rule; a home at high is admitted. builder-kimi-max in the loop above
+# is refused by the seat rule itself (exact marker armed AND a valid max
+# clone still refused), not merely by a missing marker.
+for e6_kimi_builder in builder-kimi kimi-k3; do
+  set +e
+  e6_kmax_out="$(KIMI_CODE_HOME="$E6_KIMI_MAX_HOME" \
+    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    spawn_base "$e6_kimi_builder" --role builder --lane "kmax-$e6_kimi_builder-lane" --parent parent-lane \
+    --job "e6-khome-max-$e6_kimi_builder" --t T1 2>&1)"
+  e6_kmax_rc=$?
+  set -e
+  [[ "$e6_kmax_rc" -eq 2 ]] ||
+    fail "$e6_kimi_builder on a max-effort kimi home must die rc 2 (rc=$e6_kmax_rc): $e6_kmax_out"
+  grep -q 'builder seats never take a max rung' <<<"$e6_kmax_out" ||
+    fail "$e6_kimi_builder max-home refusal must name the builder-seat rule: $e6_kmax_out"
+done
+# A high-effort kimi home stays admitted — same argv as before, no --effort
+# anywhere (the CLI has no flag; the rung lives only in the clone config).
+: >"$TMP/herdr.log"
+set +e
+e6_khigh_out="$(KIMI_CODE_HOME="$E6_KIMI_HIGH_HOME" \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-kimi --role builder --lane khigh-builder-kimi-lane --parent parent-lane \
+  --job e6-khome-high-builder-kimi --t T1 2>&1)"
+e6_khigh_rc=$?
+set -e
+[[ "$e6_khigh_rc" -eq 0 ]] ||
+  fail "builder-kimi on a high-effort kimi home must be admitted (rc=$e6_khigh_rc): $e6_khigh_out"
+e6_khigh_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$e6_khigh_start" == *' -- --auto -m kimi-code/k3' ]] ||
+  fail "builder-kimi on a high home must reuse the kimi-k3 argv verbatim: $e6_khigh_start"
+# The seat rule stays builder-scoped: the same max home on a worker spawn is
+# unaffected (worker max rungs are a separate reservation, not this rule).
+set +e
+e6_kworker_out="$(KIMI_CODE_HOME="$E6_KIMI_MAX_HOME" \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base kimi-k3 --job e6-khome-max-worker --t T1 2>&1)"
+e6_kworker_rc=$?
+set -e
+[[ "$e6_kworker_rc" -eq 0 ]] ||
+  fail "kimi-k3 worker on a max-effort home must stay admitted (rc=$e6_kworker_rc): $e6_kworker_out"
+echo "PASS 748 kimi builder spellings refuse a max-effort home on the seat rule"
+
+# #748r2 (tester round 1): the seat read must resolve what Kimi Code actually
+# runs, not just a double-quoted [thinking] effort. Valid TOML literal
+# (single-quoted) strings, a missing [thinking] with the spawned model's
+# default_effort = "max", and an unsupported [thinking] value falling back to
+# a max default all resolve to max — each must die on the seat rule. Mutants
+# in test-assignment-defaults.sh pin the resolver itself.
+e6_khome() { # build a minimal kimi home: $1=dest, config.toml on stdin
+  local dest="$1"
+  mkdir -p "$dest/credentials" "$dest/oauth"
+  cat >"$dest/config.toml"
+  printf 'x\n' >"$dest/credentials/kimi-code.json"
+  printf 'x\n' >"$dest/oauth/kimi-code"
+  printf 'x\n' >"$dest/device_id"
+}
+e6_khome "$TMP/kimi-sq-max" <<'EOF'
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[thinking]
+effort = 'max'
+EOF
+e6_khome "$TMP/kimi-default-max" <<'EOF'
+default_model = "kimi-code/k3"
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
+EOF
+e6_khome "$TMP/kimi-fallback-max" <<'EOF'
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
+[thinking]
+effort = "xhigh"
+EOF
+for e6_khome_case in kimi-sq-max kimi-default-max kimi-fallback-max; do
+  set +e
+  e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
+    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    spawn_base builder-kimi --role builder --lane "$e6_khome_case-lane" --parent parent-lane \
+    --job "e6-$e6_khome_case" --t T1 2>&1)"
+  e6_krc=$?
+  set -e
+  [[ "$e6_krc" -eq 2 ]] ||
+    fail "builder-kimi on a home resolving to max ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
+  grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+    fail "$e6_khome_case refusal must name the builder-seat rule: $e6_kout"
+done
+# The same fallback semantics admit when they resolve below max: a
+# single-quoted 'high' is a valid TOML rung, and an unsupported 'xhigh'
+# request falls back to the model's high default — both launch normally.
+e6_khome "$TMP/kimi-sq-high" <<'EOF'
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[thinking]
+effort = 'high'
+EOF
+e6_khome "$TMP/kimi-fallback-high" <<'EOF'
+[models."kimi-code/k3"]
+provider = "managed:kimi-code"
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[thinking]
+effort = "xhigh"
+EOF
+for e6_khome_case in kimi-sq-high kimi-fallback-high; do
+  : >"$TMP/herdr.log"
+  set +e
+  e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
+    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    spawn_base builder-kimi --role builder --lane "$e6_khome_case-lane" --parent parent-lane \
+    --job "e6-$e6_khome_case" --t T1 2>&1)"
+  e6_krc=$?
+  set -e
+  [[ "$e6_krc" -eq 0 ]] ||
+    fail "builder-kimi on a home resolving below max ($e6_khome_case) must be admitted (rc=$e6_krc): $e6_kout"
+  [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
+    fail "$e6_khome_case must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
+done
+echo "PASS 748r2 kimi seat rule resolves literal strings and model default_effort fallbacks"
+
+# #748r3 (tester round 2): the resolution must be a real TOML parse — dotted
+# keys, inline tables, multiline/escaped strings, indented headers,
+# [models."<id>".overrides] entries and comments inside arrays are all
+# equivalent spellings Kimi accepts; and KIMI_MODEL_THINKING_EFFORT overrides
+# the effort at runtime. [thinking].enabled=false resolves to off_effort.
+e6_khome "$TMP/kimi-dotted-thinking" <<'EOF'
+thinking.effort = "max"
+[models."kimi-code/k3"]
+provider = "x"
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+EOF
+e6_khome "$TMP/kimi-dotted-model" <<'EOF'
+models."kimi-code/k3".provider = "x"
+models."kimi-code/k3".support_efforts = [ "low", "high", "max" ]
+models."kimi-code/k3".default_effort = "max"
+EOF
+e6_khome "$TMP/kimi-inline-models" <<'EOF'
+models = { "kimi-code/k3" = { support_efforts = [ "low", "high", "max" ], default_effort = "max" } }
+EOF
+e6_khome "$TMP/kimi-multiline-max" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[thinking]
+effort = """max"""
+EOF
+# The effort value below is the TOML escape m + ́x: the file literally
+# contains "m\u0061x", which a real TOML decode turns into "max".
+e6_khome "$TMP/kimi-escaped-max" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[thinking]
+effort = "m\u0061x"
+EOF
+e6_khome "$TMP/kimi-indented-max" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+  [thinking]
+  effort = "max"
+EOF
+e6_khome "$TMP/kimi-override-max" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[models."kimi-code/k3".overrides]
+default_effort = "max"
+EOF
+e6_khome "$TMP/kimi-comment-support" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ] # "xhigh" intentionally unsupported
+default_effort = "max"
+[thinking]
+effort = "xhigh"
+EOF
+e6_khome "$TMP/kimi-off-effort-max" <<'EOF'
+[models."kimi-code/k3"]
+off_effort = "max"
+[thinking]
+enabled = false
+effort = "high"
+EOF
+# always-thinking also arrives as a capabilities tag or a boolean field —
+# enabled=false does not switch the model off in either shape.
+e6_khome "$TMP/kimi-at-cap-max" <<'EOF'
+[models."kimi-code/k3"]
+capabilities = [ "thinking", "always_thinking" ]
+default_effort = "high"
+[thinking]
+enabled = false
+effort = "max"
+EOF
+e6_khome "$TMP/kimi-at-field-max" <<'EOF'
+[models."kimi-code/k3"]
+always_thinking = true
+default_effort = "high"
+[thinking]
+enabled = false
+effort = "max"
+EOF
+# A malformed config (duplicate keys) can still carry a max line: the python
+# parse refuses to decode it, so the awk fallback's scan must stay
+# conservative and refuse.
+e6_khome "$TMP/kimi-dup-invalid" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[thinking]
+effort = "high"
+effort = "max"
+EOF
+for e6_khome_case in kimi-dotted-thinking kimi-dotted-model kimi-inline-models \
+    kimi-multiline-max kimi-escaped-max kimi-indented-max kimi-override-max \
+    kimi-comment-support kimi-off-effort-max kimi-at-cap-max kimi-at-field-max \
+    kimi-dup-invalid; do
+  set +e
+  e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
+    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    spawn_base builder-kimi --role builder --lane "$e6_khome_case-lane" --parent parent-lane \
+    --job "e6-$e6_khome_case" --t T1 2>&1)"
+  e6_krc=$?
+  set -e
+  [[ "$e6_krc" -eq 2 ]] ||
+    fail "builder-kimi on a home resolving to max ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
+  grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+    fail "$e6_khome_case refusal must name the builder-seat rule: $e6_kout"
+done
+# The env overlay is the rung when exported — even with a below-max home.
+e6_khome "$TMP/kimi-env-below" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[thinking]
+effort = "high"
+EOF
+set +e
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-below" KIMI_MODEL_THINKING_EFFORT=MAX \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-kimi --role builder --lane kimi-env-max-lane --parent parent-lane \
+  --job e6-kimi-env-max --t T1 2>&1)"
+e6_krc=$?
+set -e
+[[ "$e6_krc" -eq 2 ]] ||
+  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=MAX exported must die rc 2 (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+  fail "env-max refusal must name the builder-seat rule: $e6_kout"
+# CodeRabbit #153: the env overlay resolves even with no config file (kimi
+# applies it with an empty home too) — and must normalize like the real parse
+# or MAX bypasses the case-sensitive seat match on spelling alone.
+mkdir -p "$TMP/kimi-no-cfg"
+set +e
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-no-cfg" KIMI_MODEL_THINKING_EFFORT=MAX \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-kimi --role builder --lane kimi-nocfg-max-lane --parent parent-lane \
+  --job e6-kimi-nocfg-max --t T1 2>&1)"
+e6_krc=$?
+set -e
+[[ "$e6_krc" -eq 2 ]] ||
+  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=MAX and no config must die rc 2 (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+  fail "no-config env-max refusal must name the builder-seat rule: $e6_kout"
+# An env spelling outside the documented rungs is not a rung — fail-open like
+# an unparseable config, but only after the bounded check sees it.
+: >"$TMP/herdr.log"
+set +e
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-no-cfg" KIMI_MODEL_THINKING_EFFORT=banana \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-kimi --role builder --lane kimi-nocfg-bogus-lane --parent parent-lane \
+  --job e6-kimi-nocfg-bogus --t T1 2>&1)"
+e6_krc=$?
+set -e
+[[ "$e6_krc" -eq 0 ]] ||
+  fail "builder-kimi with an undocumented env effort and no config must be admitted (rc=$e6_krc): $e6_kout"
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
+  fail "bogus-env admission must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
+# The pinned rung must come from a real clone file, not the env overlay: a
+# missing clone config fails closed even when the env names the pinned rung.
+set +e
+e6_kout="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$TMP/kimi-no-cfg" \
+  KIMI_MODEL_THINKING_EFFORT=high \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-kimi-high --role builder --lane kimi-nocfg-pin-lane --parent parent-lane \
+  --job e6-kimi-nocfg-pin --t T1 2>&1)"
+e6_krc=$?
+set -e
+[[ "$e6_krc" -eq 2 ]] ||
+  fail "builder-kimi-high on a missing clone must die rc 2 even with the pinned rung in env (rc=$e6_krc): $e6_kout"
+grep -q 'config.toml missing' <<<"$e6_kout" ||
+  fail "missing-clone refusal must name the missing config: $e6_kout"
+# The awk fallback (no importable TOML lib) must resolve a quoted-key
+# [models."<id>".overrides] header the same way the real parse does — strip
+# only the .overrides suffix, never the closing quote.
+mkdir -p "$TMP/nopy3bin"
+printf '#!/bin/sh\nexit 1\n' > "$TMP/nopy3bin/python3"
+chmod +x "$TMP/nopy3bin/python3"
+e6_khome "$TMP/kimi-awk-override" <<'EOF'
+[models."kimi-code/k3".overrides]
+default_effort = "max"
+EOF
+set +e
+e6_kout="$(PATH="$TMP/nopy3bin:$PATH" KIMI_CODE_HOME="$TMP/kimi-awk-override" \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-kimi --role builder --lane kimi-awk-over-lane --parent parent-lane \
+  --job e6-kimi-awk-override --t T1 2>&1)"
+e6_krc=$?
+set -e
+[[ "$e6_krc" -eq 2 ]] ||
+  fail "builder-kimi on an overrides-default max home must die rc 2 via the awk fallback too (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+  fail "awk-path overrides-max refusal must name the builder-seat rule: $e6_kout"
+# Admitted paths: the env overlay wins over the config (max home + high env),
+# and disabled Thinking resolves to off_effort (absent → no rung) even when a
+# configured effort or default is max.
+e6_khome "$TMP/kimi-env-over-max" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
+[thinking]
+effort = "max"
+EOF
+e6_khome "$TMP/kimi-disabled-max" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "high"
+[thinking]
+enabled = false
+effort = "max"
+EOF
+e6_khome "$TMP/kimi-disabled-defmax" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
+[thinking]
+enabled = false
+EOF
+# effort="off" is a valid off spelling — no rung even with a max default;
+# an unrecognised env value is not a rung either and falls back to config.
+e6_khome "$TMP/kimi-effort-off" <<'EOF'
+[models."kimi-code/k3"]
+support_efforts = [ "low", "high", "max" ]
+default_effort = "max"
+[thinking]
+effort = "off"
+EOF
+: >"$TMP/herdr.log"
+set +e
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-over-max" KIMI_MODEL_THINKING_EFFORT=high \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-kimi --role builder --lane kimi-env-high-lane --parent parent-lane \
+  --job e6-kimi-env-high --t T1 2>&1)"
+e6_krc=$?
+set -e
+[[ "$e6_krc" -eq 0 ]] ||
+  fail "KIMI_MODEL_THINKING_EFFORT=high must override a max home and be admitted (rc=$e6_krc): $e6_kout"
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
+  fail "env-high admission must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
+for e6_khome_case in kimi-disabled-max kimi-disabled-defmax kimi-effort-off; do
+  : >"$TMP/herdr.log"
+  set +e
+  e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
+    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    spawn_base builder-kimi --role builder --lane "$e6_khome_case-lane" --parent parent-lane \
+    --job "e6-$e6_khome_case" --t T1 2>&1)"
+  e6_krc=$?
+  set -e
+  [[ "$e6_krc" -eq 0 ]] ||
+    fail "builder-kimi with Thinking disabled ($e6_khome_case) must be admitted (rc=$e6_krc): $e6_kout"
+  [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
+    fail "$e6_khome_case must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
+done
+echo "PASS 748r3 kimi seat rule resolves real TOML, env overlay, and disabled Thinking"
 
 # Marker mutants: no marker, and a marker naming a different rung, both die on
 # wrk's own guard (rc 2, before the gate is asked) — the installed gate then

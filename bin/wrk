@@ -278,13 +278,14 @@ opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
 kimi-k3@max, grok-hi@xhigh; #737 adds grok-hi@low, grok-hi@medium and
 codex-sol@medium). The @max arms here are inert for builders since the
 seat rule fires first; they still describe worker-side measurement.
-Rungs the gate marks escalation (sonnet@xhigh)
-additionally need --operator-request REF. opus@low lost its escalation mark
-in scopefuel #738 (b5b0ad2): post-#738 the gate refuses a REF on it
-(operator_request_not_applicable, rc 3). Pre-#738 installs keep the mark but
-accept a REF on it — wrk forwards a caller-supplied REF verbatim either way
-and never adds one; which rungs are escalation is the gate's call, not
-wrk's. #737 adds the grok rungs of
+Rungs the gate marks escalation (sonnet@xhigh) are shown with that tag by
+the gate — on an explicit --effort rung it still judges quota rules only,
+so no --operator-request REF is enforced there (scopefuel #716). Which
+rungs are escalation-marked is the gate's call, not wrk's; wrk forwards a
+caller-supplied REF verbatim and never adds one. opus@low lost its
+escalation mark in scopefuel #738 (b5b0ad2): post-#738 the gate refuses a
+REF on it (operator_request_not_applicable, rc 3), while pre-#738 installs
+keep the mark but still accept a REF on it. #737 adds the grok rungs of
 decision 4088 — builder-grok-low, builder-grok-medium and
 builder-grok-xhigh pin grok-hi@<rung> the same way
 (SCOPEFUEL_E6_ARM=grok-hi@<rung>; grok rungs are not escalation-marked, so
@@ -833,9 +834,191 @@ spawn_deliver_brief() {
 # clone home actually runs the requested effort — the kimi CLI has no
 # --effort flag, so the clone config is the only place the rung exists.
 kimi_clone_thinking_effort() {
-  local cfg="$1"
-  [[ -r "$cfg" ]] || return 0
-  awk -F'"' '/^\[/{in_thinking=($0 ~ /^\[thinking\]/)} in_thinking && /^[[:space:]]*effort[[:space:]]*=/ {print $2; exit}' "$cfg"
+  kimi_clone_resolved_effort "$1" ""
+}
+
+# Print the effort a Kimi home resolves to for a given spawned model id, in
+# Kimi Code's documented precedence:
+#   1. [thinking].enabled = false resolves to the model's off_effort —
+#      Thinking is off, so no configured/default effort applies (a model
+#      marked always_thinking ignores the flag).
+#   2. KIMI_MODEL_THINKING_EFFORT overlays the effort at runtime and bypasses
+#      support_efforts — when exported it is the rung.
+#   3. Otherwise the [thinking] effort when the model accepts it (no
+#      [models."<id>"] table, or a support_efforts list that contains it),
+#      else that model's default_effort — Kimi Code falls back to the model
+#      default for a missing or unsupported request. Keys under
+#      [models."<id>".overrides] override the base model entry.
+# config.toml is real TOML — dotted keys, inline tables, string escapes,
+# multiline strings and indented headers are all equivalent spellings — so
+# the authoritative read is a python3 tomllib/tomli parse; an awk scan
+# covers only the common table forms when no TOML lib is importable. With no
+# readable config the bounded env overlay alone resolves (kimi applies it
+# with no file); empty when nothing resolves: fail-open — the kimi argv
+# carries no rung either way.
+kimi_clone_resolved_effort() {
+  local cfg="$1" model="$2" out env_eff="${KIMI_MODEL_THINKING_EFFORT:-}"
+  if [[ ! -r "$cfg" ]]; then
+    # No file to parse, but kimi still applies the env overlay — bound and
+    # normalize it exactly like the python/awk paths or "MAX" slips past the
+    # case-sensitive seat rule on spelling alone.
+    local norm
+    norm="${env_eff#"${env_eff%%[![:space:]]*}"}"
+    norm="${norm%"${norm##*[![:space:]]}"}"
+    norm="$(printf '%s' "$norm" | tr '[:upper:]' '[:lower:]')"
+    case "$norm" in
+      minimal|low|medium|high|xhigh|max|ultra|off|on) printf '%s\n' "$norm" ;;
+    esac
+    return 0
+  fi
+  if out="$(KIMI_EFFORT_ENV="$env_eff" python3 - "$cfg" "$model" 2>/dev/null <<'PY'
+import os, sys
+try:
+    import tomllib
+except ImportError:
+    import tomli as tomllib
+with open(sys.argv[1], "rb") as fh:
+    cfg = tomllib.load(fh)
+def table(v):
+    return v if isinstance(v, dict) else {}
+def string(v):
+    return v if isinstance(v, str) else None
+def truthy(v):
+    return v is True or (isinstance(v, str) and v.lower() in ("1", "true", "yes", "on"))
+thinking = table(cfg.get("thinking"))
+model = table(table(cfg.get("models")).get(sys.argv[2]))
+over = table(model.get("overrides"))
+def pick(key):
+    return over.get(key, model.get(key))
+def strings(v):
+    return [x for x in v if isinstance(x, str)] if isinstance(v, list) else None
+effort = string(thinking.get("effort"))
+support = strings(pick("support_efforts"))
+default = string(pick("default_effort"))
+off = string(pick("off_effort"))
+caps = set(strings(pick("capabilities")) or [])
+# always-thinking is declared two ways: an always_thinking model field or an
+# "always_thinking" capability tag (either can sit under overrides). In both
+# shapes enabled=false does not take the model off.
+always = truthy(pick("always_thinking")) or "always_thinking" in caps
+if thinking.get("enabled") is False and not always:
+    print(off or "")
+    raise SystemExit(0)
+env_eff = (os.environ.get("KIMI_EFFORT_ENV") or "").strip().lower()
+if env_eff in {"minimal", "low", "medium", "high", "xhigh", "max", "ultra", "off", "on"}:
+    print(env_eff)
+    raise SystemExit(0)
+if effort == "off" and not always:
+    print("off")
+    raise SystemExit(0)
+resolved = effort
+if model and (resolved is None or (support is not None and resolved not in support)):
+    resolved = default
+print(resolved or "")
+PY
+)"; then
+    printf '%s\n' "$out"
+    return 0
+  fi
+  # awk fallback for hosts with no importable TOML lib: common table forms
+  # only — dotted keys, inline tables, string escapes and multiline strings
+  # need the real parser above.
+  awk -v want_model="$model" -v env_eff="$env_eff" '
+    BEGIN { sq = sprintf("%c", 39) }
+    function unq(s) {
+      sub(/^[[:space:]]+/, "", s); sub(/[[:space:]]+$/, "", s)
+      if (s ~ /^".*"$/) return substr(s, 2, length(s) - 2)
+      if (substr(s, 1, 1) == sq && substr(s, length(s), 1) == sq)
+        return substr(s, 2, length(s) - 2)
+      return ""
+    }
+    function rhs(   v) {
+      v = $0
+      sub(/^[^=]*=[[:space:]]*/, "", v)
+      sub(/[[:space:]]+#.*$/, "", v)
+      return unq(v)
+    }
+    function rawrhs(   v) {
+      v = $0
+      sub(/^[^=]*=[[:space:]]*/, "", v); sub(/[[:space:]]*#.*$/, "", v)
+      sub(/^[[:space:]]+/, "", v); sub(/[[:space:]]+$/, "", v)
+      return v
+    }
+    /^[[:space:]]*\[/ {
+      h = $0
+      sub(/^[[:space:]]*\[/, "", h); sub(/\].*$/, "", h)
+      gsub(/[[:space:]]/, "", h)
+      in_thinking = (h == "thinking")
+      in_model = 0
+      if (want_model != "" && h ~ /^models\./) {
+        mh = substr(h, 8)
+        sub(/\.overrides$/, "", mh)
+        if (unq(mh) == want_model) { in_model = 1; m_seen = 1 }
+      }
+      next
+    }
+    collecting {
+      sup = sup " " $0
+      if ($0 ~ /\]/) collecting = 0
+      next
+    }
+    c_collecting {
+      caps = caps " " $0
+      if ($0 ~ /\]/) c_collecting = 0
+      next
+    }
+    in_thinking && $0 ~ /^[[:space:]]*effort[[:space:]]*=/ { t = rhs(); next }
+    in_thinking && $0 ~ /^[[:space:]]*enabled[[:space:]]*=/ { en = rawrhs(); next }
+    in_model && $0 ~ /^[[:space:]]*always_thinking[[:space:]]*=/ { at = rawrhs(); next }
+    in_model && $0 ~ /^[[:space:]]*capabilities[[:space:]]*=/ {
+      caps = $0; c_seen = 1
+      if (caps !~ /\]/) c_collecting = 1
+      next
+    }
+    in_model && $0 ~ /^[[:space:]]*off_effort[[:space:]]*=/ { o = rhs(); next }
+    in_model && $0 ~ /^[[:space:]]*default_effort[[:space:]]*=/ { d = rhs(); next }
+    in_model && $0 ~ /^[[:space:]]*support_efforts[[:space:]]*=/ {
+      sup = $0; s_seen = 1
+      if (sup !~ /\]/) collecting = 1
+      next
+    }
+    END {
+      if (s_seen) {
+        rest = sup
+        while (match(rest, /"[^"]*"/)) {
+          S[substr(rest, RSTART + 1, RLENGTH - 2)] = 1
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+        rest = sup
+        while (match(rest, sq "[^" sq "]*" sq)) {
+          S[substr(rest, RSTART + 1, RLENGTH - 2)] = 1
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+      }
+      if (c_seen) {
+        rest = caps
+        while (match(rest, /"[^"]*"/)) {
+          C[substr(rest, RSTART + 1, RLENGTH - 2)] = 1
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+        rest = caps
+        while (match(rest, sq "[^" sq "]*" sq)) {
+          C[substr(rest, RSTART + 1, RLENGTH - 2)] = 1
+          rest = substr(rest, RSTART + RLENGTH)
+        }
+      }
+      always = (at == "true" || ("always_thinking" in C))
+      if (en == "false" && !always) { print o; exit }
+      if (env_eff != "") {
+        e = tolower(env_eff)
+        if (e ~ /^(minimal|low|medium|high|xhigh|max|ultra|off|on)$/) { print e; exit }
+      }
+      if (t == "off" && !always) { print "off"; exit }
+      r = t
+      if (m_seen && (t == "" || (s_seen && !(t in S)))) r = d
+      print r
+    }
+  ' "$cfg"
 }
 
 # Kimi opens a folder-trust modal for an unregistered CWD. Seed only the
@@ -2490,11 +2673,30 @@ resolve_profile() {
   # builder-luna-max, builder-terra-max, builder-kimi-max) are closed by the
   # seat rule itself, not merely by a missing marker. devin profiles carry no
   # --effort at all (EFFORT_SUPPORTED=0 above), so a devin builder's
-  # model-encoded rung never reaches this check.
+  # model-encoded rung never reaches this check. The unflagged kimi spellings
+  # (builder-kimi, kimi-k3) resolve their rung from the home's config below —
+  # the only place it exists for them.
   if [[ "${ROLE:-worker}" == builder ]]; then
-    case "$EFFECTIVE_EFFORT" in
+    local seat_effort="$EFFECTIVE_EFFORT"
+    if [[ -z "$seat_effort" && "$PROFILE_KIND" == kimi ]]; then
+      # builder-kimi and kimi-k3 leave EFFECTIVE_EFFORT empty (no --effort
+      # flag, no DEFAULT_EFFORT): the only rung they can run is whatever the
+      # kimi home resolves for the spawned model — the [thinking] effort, or
+      # the model's default_effort when the request is missing/unsupported
+      # (Kimi Code's documented fallback), or the KIMI_MODEL_THINKING_EFFORT
+      # overlay when exported. Read it or a max-effort home slips a builder
+      # seat past this rule unseen. A missing/unparseable config yields
+      # empty and stays fail-open here — the E6 rungs below are what fail
+      # closed on a missing clone.
+      local kimi_model="" i
+      for ((i = 0; i + 1 < ${#ARGS[@]}; i++)); do
+        [[ "${ARGS[i]}" == -m ]] && kimi_model="${ARGS[i + 1]}"
+      done
+      seat_effort="$(kimi_clone_resolved_effort "${KIMI_TRUST_HOME:-}/config.toml" "$kimi_model")"
+    fi
+    case "$seat_effort" in
       max|ultra)
-        die "$MODEL at effort $EFFECTIVE_EFFORT is refused for --role builder: builder seats never take a max rung (operator decision 2026-09-26) — use high or below, or a devin profile" ;;
+        die "$MODEL at effort $seat_effort is refused for --role builder: builder seats never take a max rung (operator decision 2026-09-26) — use high or below, or a devin profile" ;;
     esac
   fi
 
@@ -2513,7 +2715,10 @@ resolve_profile() {
     if [[ "$PROFILE_KIND" == kimi ]]; then
       # The kimi CLI has no --effort flag: the pinned clone home's
       # [thinking] effort is the only place this rung exists, so a missing or
-      # mismatched clone would silently launch the wrong rung. Fail closed.
+      # mismatched clone would silently launch the wrong rung. Fail closed —
+      # the env overlay must not stand in for a missing clone file.
+      [[ -r "$KIMI_TRUST_HOME/config.toml" ]] ||
+        die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (config.toml missing); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"
       local local_clone_effort
       local_clone_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"
       [[ "$local_clone_effort" == "$GATE_EFFORT_PIN" ]] ||
