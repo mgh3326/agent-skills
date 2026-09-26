@@ -139,11 +139,14 @@ CHECKOUT_STAMP = "ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:00Z "
 
 
 def checkout_log(abbrev: str | None, checkout_sha: str, extra_announces: list[str] | None = None,
-                 command: str = "/usr/bin/git log -1 --format=%H") -> str:
-    lines = [f"{CHECKOUT_STAMP}HEAD is now at {announce} Merge {H} into {B}"
+                 command: str = "/usr/bin/git log -1 --format=%H",
+                 step: str = "Run actions/checkout@v4", out_step: str | None = None) -> str:
+    stamp = f"ubuntu-latest\t{step}\t2026-09-25T07:00:00Z "
+    out = f"ubuntu-latest\t{out_step or step}\t2026-09-25T07:00:01Z "
+    lines = [f"{stamp}HEAD is now at {announce} Merge {H} into {B}"
              for announce in [abbrev, *(extra_announces or [])] if announce is not None]
-    lines.append(f"{CHECKOUT_STAMP}[command]{command}")
-    lines.append(f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {checkout_sha}")
+    lines.append(f"{stamp}[command]{command}")
+    lines.append(f"{out}{checkout_sha}")
     return "\n".join(lines) + "\n"
 
 
@@ -713,6 +716,19 @@ class MergePrecheckTests(unittest.TestCase):
                         "/usr/bin/git log -1 --format=%H extra"):
             with self.subTest(command=command):
                 self.assertIsNone(gate.checkout_merge_sha(checkout_log(checkout_sha[:9], checkout_sha, command=command)))
+        # Records outside the checkout step cannot be the candidate, even an exact
+        # verbatim echo of the real command (tester round-2 BLOCKER).
+        for step in ("Run echo forged checkout record", "Run bash", "Post actions/checkout@v4", "Pre Run actions/checkout@v4"):
+            with self.subTest(step=step):
+                self.assertIsNone(gate.checkout_merge_sha(checkout_log("abcdef0", forged, step=step)))
+        # An announce from another step does not corroborate the checkout output.
+        foreign_step_announce = (
+            "ubuntu-latest\tRun bash\t2026-09-25T07:00:00Z HEAD is now at " + checkout_sha[:9] + f" Merge {H} into {B}\n"
+            f"{CHECKOUT_STAMP}[command]/usr/bin/git log -1 --format=%H\n"
+            f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {checkout_sha}\n")
+        self.assertIsNone(gate.checkout_merge_sha(foreign_step_announce))
+        # The output line must come from the checkout step too.
+        self.assertIsNone(gate.checkout_merge_sha(checkout_log(checkout_sha[:9], checkout_sha, out_step="Run echo forged")))
 
     def test_checkout_merge_sha_mutants_are_assertion_red(self) -> None:
         checkout_sha = "e" * 40
@@ -737,6 +753,12 @@ class MergePrecheckTests(unittest.TestCase):
                      f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {forged}\n")
         with self.assertRaises(AssertionError):
             self.assertIsNone(loose_command(forge_log))
+        any_step = merge_precheck_mutant([("not CHECKOUT_STEP.search(line)", "False")])
+        echo_forge_log = (f"{CHECKOUT_STAMP}HEAD is now at abcdef0 Merge {H} into {B}\n"
+                          f"ubuntu-latest\tRun echo forge\t2026-09-25T07:00:00Z [command]/usr/bin/git log -1 --format=%H\n"
+                          f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {forged}\n")
+        with self.assertRaises(AssertionError):
+            self.assertIsNone(any_step(echo_forge_log))
 
     def test_missing_branch_protection_source_mutant_is_red(self) -> None:
         required = policy()
