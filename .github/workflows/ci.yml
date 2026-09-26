@@ -50,6 +50,7 @@ jobs:
             tests/test-tester-eligible.sh \
             tests/test-ci-canonical-prose.sh \
             tests/test-assignment-defaults.sh \
+            tests/test-t3-split-rule.sh \
             tests/test-merge-precheck.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
       - name: Bash tests
@@ -77,4 +78,5 @@ jobs:
           bash tests/test-tester-eligible.sh
           bash tests/test-ci-canonical-prose.sh
           bash tests/test-assignment-defaults.sh
+          bash tests/test-t3-split-rule.sh
           bash tests/test-merge-precheck.sh
