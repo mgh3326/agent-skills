@@ -76,6 +76,8 @@ if [[ "$1 $2" == "doc get" ]]; then
     forged)  printf '{"session":"JOB-lane","body":"round-extension: job=JOB extra=5 by=director-1\\n"}' ;;
     wrongj)  printf '{"session":"director-1","body":"round-extension: job=other-job extra=9 by=director-1\\n"}' ;;
     opdoc)   printf '{"session":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator\\n"}' ;;
+    opgood)  printf '{"session":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator-desk\\n"}' ;;
+    badws)   printf '{"session":"director-1","body":"  round-extension :  job=JOB\\textra=1\\tby=director-1  \\n"}' ;;
     nogrant) printf '{"session":"director-1","body":"looks approved but no grant line\\n"}' ;;
     *) printf 'not_found' ;;
   esac
@@ -169,6 +171,15 @@ printf 'no verdict line here\n' >"$TMP/bad.md"
 expect_rc 2 "$WRK" round verdict jc --file "$TMP/bad.md"
 expect_rc 2 "$WRK" round open jc --head "${H4:0:12}"
 expect_rc 2 "$WRK" round verdict jc --file "$TMP/absent.md"
+printf 'VERDICT: PASS @%sF\n' "$H1" >"$TMP/long41.md"        # 41-hex token
+expect_rc 2 "$WRK" round verdict jc --file "$TMP/long41.md"
+printf 'VERDICT: PASS @%sZ\n' "$H1" >"$TMP/tailz.md"        # 40 hex + suffix char
+expect_rc 2 "$WRK" round verdict jc --file "$TMP/tailz.md"
+printf 'VERDICT: PASS @%s notes\n' "$H1" >"$TMP/trail.md"   # trailing commentary
+expect_rc 2 "$WRK" round verdict jc --file "$TMP/trail.md"
+write_verdict "$TMP/multi.md" BLOCKER "$H1"
+printf 'VERDICT: PASS @%s\n' "$H2" >>"$TMP/multi.md"        # ambiguous file
+expect_rc 2 "$WRK" round verdict jc --file "$TMP/multi.md"
 echo "PASS verdict-file-and-sha-contract"
 
 # ── extension: refused without a valid approval ─────────────────────────────
@@ -179,6 +190,8 @@ for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" je "$h"; done
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/missing
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/forged   # own session claims director-1
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/wrongj   # grant names another job
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/opdoc    # by=operator but session is operator-desk
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/badws    # noncanonical grant whitespace
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/nogrant  # no grant line
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/92      # comment author is the builder
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:bogus/x      # unknown ref scheme
@@ -215,6 +228,15 @@ for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jt "$h"; done
 "$WRK" round open jt --head "$H4" --extend hk:task/91 >/dev/null
 expect_rc 78 "$WRK" round open jt --head "$H4" --extend hk:task/91
 echo "PASS extension-task-comment-one-round"
+
+# ── extension: operator doc grant where by= equals the session ──────────────
+mkjob jg
+mk_hk jg
+export HANDOFFKEEP_BIN="$TMP/hk-jg"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jg "$h"; done
+"$WRK" round open jg --head "$H4" --extend hk:doc/opgood >/dev/null
+expect_rc 78 "$WRK" round open jg --head "$H4" --extend hk:doc/opgood
+echo "PASS extension-operator-identity-one-round"
 
 # ── --extend before the cap is a usage error ────────────────────────────────
 mkjob ju
@@ -270,7 +292,10 @@ for anchor in (
     "if used >= cap:",
     '"reason": "tester round cap reached", "question": question,',
     "        used += 1  # this unbound verdict is itself a round",
-    "        if identity != issuer and not (issuer in ops and identity in ops):",
+    "        if extra < 1 or issuer not in allowed_issuers or issuer != identity:",
+    'r"^round-extension: job=(\\S+) extra=(\\d+) by=(\\S+)$"',
+    "{40})\\s*$",
+    "if len(matches) > 1:",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -327,7 +352,7 @@ set -e
 echo "PASS mutant-nocount"
 
 # mutant: approval issuer no longer checked against session/author
-printf '        if identity != issuer and not (issuer in ops and identity in ops): =>         if False:\n' >"$TMP/spec-noforge"
+printf '        if extra < 1 or issuer not in allowed_issuers or issuer != identity: =>         if extra < 1 or issuer not in allowed_issuers:\n' >"$TMP/spec-noforge"
 mutant noforge "$TMP/spec-noforge"
 jmf="mut-nf"
 mkjob "$jmf"
@@ -341,5 +366,53 @@ set -e
 [[ "$rc" -eq 0 ]] ||
   fail "mutant noforge did not accept the forged approval (rc=$rc) — issuer assertion is vacuous"
 echo "PASS mutant-noforge"
+
+# mutant: the grant regex accepts noncanonical whitespace — the badws doc then
+# grants, proving the strict-form assertion credits the canonical regex.
+printf 'r"^round-extension: job=(\\S+) extra=(\\d+) by=(\\S+)$" => r"^\\s*round-extension\\s*:\\s*job=(\\S+)\\s+extra=(\\d+)\\s+by=(\\S+)\\s*$"\n' >"$TMP/spec-loosews"
+mutant loosews "$TMP/spec-loosews"
+jmw="mut-ws"
+mkjob "$jmw"
+mk_hk "$jmw"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmw"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/loosews-wrk" "$jmw" "$h"; done
+set +e
+"$TMP/loosews-wrk" round open "$jmw" --head "$H4" --extend hk:doc/badws >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant loosews did not accept the whitespace grant (rc=$rc) — whitespace assertion is vacuous"
+echo "PASS mutant-loosews"
+
+# mutant: the verdict regex loses its sha end boundary — a 41-hex token then
+# records, proving the long-sha assertion credits the boundary.
+printf '{40})\\s*$ => {40})\n' >"$TMP/spec-noshaend"
+mutant noshaend "$TMP/spec-noshaend"
+jml="mut-long"
+mkjob "$jml"
+printf 'VERDICT: PASS @%sF\n' "$H1" >"$TMP/vlong41.md"
+set +e
+"$TMP/noshaend-wrk" round verdict "$jml" --file "$TMP/vlong41.md" >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant noshaend still refused the 41-hex verdict (rc=$rc) — sha-boundary assertion is vacuous"
+echo "PASS mutant-noshaend"
+
+# mutant: ambiguous verdict files (two VERDICT lines) are accepted — proves
+# the ambiguity assertion credits the >1 match check.
+printf 'if len(matches) > 1: => if False:\n' >"$TMP/spec-multi"
+mutant multi "$TMP/spec-multi"
+jmm="mut-mv"
+mkjob "$jmm"
+write_verdict "$TMP/vmulti.md" BLOCKER "$H1"
+printf 'VERDICT: PASS @%s\n' "$H2" >>"$TMP/vmulti.md"
+set +e
+"$TMP/multi-wrk" round verdict "$jmm" --file "$TMP/vmulti.md" >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant multi still refused the ambiguous verdict (rc=$rc) — ambiguity assertion is vacuous"
+echo "PASS mutant-multi"
 
 echo "ALL PASS round-cap"

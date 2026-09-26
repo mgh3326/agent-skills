@@ -3483,12 +3483,14 @@ try:
     doc = json.loads(raw)
 except ValueError:
     raise SystemExit(1)
-# A grant line names the job, the extra-round count and its issuer.
+# A grant line names the job, the extra-round count and its issuer, in one
+# canonical form — whitespace variants are malformed and rejected.
 GRANT = re.compile(
-    r"^\s*round-extension\s*:\s*job=(\S+)\s+extra=(\d+)\s+by=(\S+)\s*$")
-# The issuer written into the grant line must be backed by the record's
-# server-side identity — a doc's session or a task comment's author — so a
-# builder writing 'by=director-1' into its own record cannot pass.
+    r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
+# The issuer written into the grant line must equal the record's server-side
+# identity — a doc's session or a task comment's author — so a builder writing
+# 'by=director-1' into its own record cannot pass, and one operator identity
+# cannot claim another.
 sources = []
 if ref.startswith("hk:doc/"):
     if isinstance(doc, dict):
@@ -3504,9 +3506,7 @@ for identity, body in sources:
         if not m or m.group(1) != job:
             continue
         extra, issuer = int(m.group(2)), m.group(3)
-        if extra < 1 or issuer not in allowed_issuers:
-            continue
-        if identity != issuer and not (issuer in ops and identity in ops):
+        if extra < 1 or issuer not in allowed_issuers or issuer != identity:
             continue
         print("granted=%d issuer=%s" % (extra, issuer))
         raise SystemExit(0)
@@ -3747,18 +3747,23 @@ events, job, owner, label, pane, parent, vfile, cap = sys.argv[1:]
 cap = int(cap)
 os.makedirs(events, exist_ok=True)
 verdict = vsha = None
-VERDICT = re.compile(r"VERDICT:\s*(PASS|BLOCKER)\s*@([0-9a-fA-F]{40})")
+VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})\s*$")
+matches = []
 try:
     with open(vfile, encoding="utf-8") as f:
         for line in f:
-            m = VERDICT.search(line)
+            m = VERDICT.match(line)
             if m:
-                verdict, vsha = m.group(1), m.group(2).lower()
+                matches.append(m)
 except OSError:
     pass
-if verdict is None:
+if not matches:
     print("NO_VERDICT")
     raise SystemExit(0)
+if len(matches) > 1:
+    print("AMBIGUOUS")
+    raise SystemExit(0)
+verdict, vsha = matches[0].group(1), matches[0].group(2).lower()
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -3815,6 +3820,8 @@ PY
   case "$outcome" in
     NO_VERDICT)
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
+    AMBIGUOUS)
+      die "round verdict --file has more than one VERDICT line: $file" ;;
     RECORDED*)
       local round_no="" verdict_v="" head_v="" used_v="" over_v="" status question tok
       for tok in $outcome; do
