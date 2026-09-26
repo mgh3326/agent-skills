@@ -22,7 +22,17 @@ from gate_common import (  # noqa: E402
 SHA = re.compile(r"^[0-9a-f]{40}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})$")
 STAGES = ("pre-spawn", "post-landing", "pre-merge")
-TOOL_VERSION = "tester-eligible/1.1"
+TOOL_VERSION = "tester-eligible/1.5"
+_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_REMOVED_DEF = re.compile(r"^-\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
+_REMOVED_NAME = re.compile(r"^-([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]")
+_IMPORT_LINE = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_.]*)")
+_FROM_IMPORT = re.compile(r"^\s*from\s+(\.*[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\s+(.+)$")
+_FROM_ITEM = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?")
+_IMPORT_ALIAS = re.compile(r"^import\s+([A-Za-z_][A-Za-z0-9_.]*)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
+_DYNAMIC_CALL = re.compile(r"\b(?:exec|eval|compile|__import__|globals|vars|importlib)\s*\(|\bimportlib\b")
+_ATTR_CALL = re.compile(r"\b(?:getattr|setattr|delattr)\s*\(")
+_ATTR_LITERAL = re.compile(r"(?:getattr|setattr|delattr)\s*\([^,]+,\s*(['\"])[A-Za-z_][A-Za-z0-9_.]*\1\s*[,)]")
 
 
 def _digest(value: object) -> str:
@@ -113,7 +123,7 @@ def _read_previous(path_text: str | None, required_stage: str, evidence: dict,
             return None, result("UNVERIFIED", "PREVIOUS_RECEIPT_INVALID", "decision:3231")
         for key in ("task", "contract_revision", "job", "repo", "repo_path", "issuer",
                     "head", "base", "diff_sha256", "contributors_digest", "declared_t",
-                    "required_grade", "implementation_grade"):
+                    "required_grade", "implementation_grade", "split"):
             if previous.get(key) != evidence.get(key):
                 reason = "HEAD_CHANGED" if key == "head" else "BASE_CHANGED" if key == "base" else "EVIDENCE_CHANGED"
                 return None, result("UNVERIFIED", reason, "decision:3231", field=key)
@@ -359,6 +369,953 @@ def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | Non
         return result("UNVERIFIED", "ACTUAL_SOURCE_UNREADABLE", "bin/wrk+pane")
 
 
+def _leaf(symbol: str) -> str | None:
+    """Trailing identifier of a boundary symbol (orders.release -> release)."""
+    tokens = _IDENTIFIER.findall(str(symbol))
+    return tokens[-1] if tokens else None
+
+
+def _normalize_path(path: object) -> str | None:
+    """Canonical repo-relative path: collapses ./ and //; rejects .., /, \\."""
+    if not isinstance(path, str):
+        return None
+    text = path.strip()
+    if not text or text.startswith("/") or "\\" in text or any(ord(char) < 32 for char in text):
+        return None
+    parts = []
+    for segment in text.split("/"):
+        if segment in {"", "."}:
+            continue
+        if segment == "..":
+            return None
+        parts.append(segment)
+    return "/".join(parts) if parts else None
+
+
+def _normalize_boundary(raw: object) -> dict | None:
+    if not isinstance(raw, dict):
+        return None
+    paths, symbols = raw.get("paths"), raw.get("symbols")
+    if not isinstance(paths, list) or not isinstance(symbols, list):
+        return None
+    normalized = [_normalize_path(path) for path in paths]
+    if any(path is None for path in normalized):
+        return None
+    if any(not isinstance(symbol, str) or not symbol.strip() or _leaf(symbol) is None
+           for symbol in symbols):
+        return None
+    if not normalized and not symbols:
+        return None
+    return {"paths": sorted(set(normalized)), "symbols": sorted({symbol.strip() for symbol in symbols})}
+
+
+def _path_in_boundary(path: str, boundary: dict, contract_path: str | None) -> str | None:
+    if contract_path and path == contract_path:
+        return "contract"
+    for entry in boundary["paths"]:
+        if path == entry or path.startswith(entry.rstrip("/") + "/") or \
+                fnmatch.fnmatch(path, entry) or fnmatch.fnmatch(Path(path).name, entry):
+            return "path"
+    return None
+
+
+def _boundary_modules(boundary: dict) -> set[str]:
+    modules = set()
+    for entry in boundary["paths"]:
+        name = entry.rstrip("/")
+        if not name or any(char in name for char in "*?[]"):
+            continue
+        if name.endswith(".py"):
+            name = name[:-3]
+        elif "." in Path(name).name:
+            continue
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_./]*", name):
+            modules.add(name.replace("/", "."))
+    return modules
+
+
+def _resolve_module(module: str, file_path: str) -> str:
+    """Resolve leading-dot relative imports against the importing file's package."""
+    if not module.startswith("."):
+        return module
+    package = file_path.rsplit("/", 1)[0].split("/") if "/" in file_path else []
+    dots = len(module) - len(module.lstrip("."))
+    rest = module.lstrip(".")
+    keep = max(len(package) - (dots - 1), 0)
+    base = ".".join(package[:keep])
+    return ".".join(part for part in (base, rest) if part)
+
+
+def _from_clauses(content: str):
+    """Yield (module, items) for each from-import, joining parenthesized and
+    backslash-continued items."""
+    lines = content.splitlines()
+    index = 0
+    while index < len(lines):
+        found = _FROM_IMPORT.match(lines[index].strip())
+        if not found:
+            index += 1
+            continue
+        module, items = found.group(1), found.group(2)
+        while index + 1 < len(lines) and (
+                ("(" in items and ")" not in items) or items.rstrip().endswith("\\")):
+            index += 1
+            items += lines[index].strip()
+        index += 1
+        yield module, items.replace("\\", " ").strip("() \t\n")
+
+
+def _import_modules(content: str, file_path: str = "") -> set[str]:
+    names = set()
+    found = _FROM_IMPORT.match(content)
+    if found:
+        module = _resolve_module(found.group(1), file_path)
+        names.add(module)
+        for item in found.group(2).split(","):
+            leaf = _IDENTIFIER.match(item.strip())
+            if leaf:
+                names.add(module + "." + leaf.group(0))
+        return names
+    inline = _IMPORT_LINE.match(content)
+    if inline:
+        names.add(_resolve_module(inline.group(1), file_path))
+    return names
+
+
+def _module_in(module: str, modules: set[str]) -> bool:
+    return any(module == item or module.startswith(item + ".") for item in modules)
+
+
+def _module_file(repo: Path, head: str, module: str) -> tuple[str, str] | str | None:
+    """Map a module name to a file at head: (path, content), "unreadable", or None.
+
+    None means no such path exists in the tree (an external package);
+    "unreadable" means a blob exists but is a symlink, gitlink, or binary.
+    A package directory wins over a sibling module file, matching Python."""
+    stem = module.replace(".", "/")
+    for candidate in (stem + "/__init__.py", stem + ".py"):
+        tree = run_git(repo, "ls-tree", head, "--", candidate)
+        if tree.returncode or not tree.stdout.strip():
+            continue
+        mode = tree.stdout.split()[0]
+        if mode not in {"100644", "100755"}:
+            return "unreadable"
+        try:
+            show = run_git(repo, "show", f"{head}:{candidate}")
+        except UnicodeDecodeError:
+            return "unreadable"
+        if show.returncode:
+            return "unreadable"
+        return candidate, show.stdout
+    return None
+
+
+def _module_names(repo: Path | None, head: str | None, resolved: str,
+                  leaves: set[str], modules: set[str], memo: dict,
+                  depth: int, visited: frozenset[str]) -> object:
+    """Bound-name entry for a resolved module, memoized.
+
+    Returns a _bound_names tuple for a readable file, "unreadable" for a
+    present-but-unreadable source, "unexpanded" when the file exists but the
+    recursion cap stops expansion, or None when the module is absent."""
+    if resolved in memo:
+        return memo[resolved]
+    if not repo or not head:
+        entry: object = "unexpanded"
+    else:
+        ref = _module_file(repo, head, resolved)
+        if isinstance(ref, tuple):
+            if depth >= 3 or resolved in visited:
+                entry = "unexpanded"
+            else:
+                entry = _bound_names(ref[1], leaves, modules, repo, head,
+                                     ref[0], depth + 1, visited | {resolved},
+                                     memo)[:4]
+        else:
+            entry = ref
+    memo[resolved] = entry
+    return entry
+
+
+def _attr_class(chain: str, attr: str, handles: dict, call_suspect: set[str],
+                bound: set[str], suspect: set[str], leaves: set[str],
+                modules: set[str], repo: Path | None, head: str | None,
+                file_path: str, memo: dict) -> str | None:
+    """Classify a `chain.attr` reference: "bound" when the attribute provably
+    reaches the core boundary, "suspect" when it cannot be resolved
+    (unreadable/unexpanded module, uninspecatable external chain, unproven
+    attribute of a core-deriving handle), or None."""
+    handle = handles.get(chain)
+    if handle is not None:
+        if attr in handle[1]:
+            return "bound"
+        if attr in handle[3]:
+            return None
+        return "suspect"
+    resolved = _resolve_module(chain, file_path) if repo and head else chain
+    root = handles.get(chain.split(".", 1)[0])
+    if root is not None and "." in chain:
+        alt = root[0] + "." + chain.split(".", 1)[1]
+        if _module_file(repo, head, alt) is not None:
+            resolved = alt
+    if _module_in(resolved, modules):
+        return "bound" if attr in leaves else None
+    entry = _module_names(repo, head, resolved, leaves, modules,
+                          memo, 0, frozenset())
+    if isinstance(entry, tuple):
+        if attr in entry[0]:
+            return "bound"
+        if attr in entry[1] or attr in entry[2]:
+            return "suspect"
+        return None
+    if entry in ("unreadable", "unexpanded"):
+        return "suspect"
+    if chain in call_suspect or chain.split(".", 1)[0] in call_suspect:
+        return "suspect"
+    if "." in chain:
+        return "suspect"
+    # An attribute whose own name is already classified (a bound core symbol
+    # or an unresolvable binding) carries that verdict across any receiver
+    # namespace — `obj.release_lease` may be the boundary function re-exported
+    # onto an object the scanner cannot see.
+    if attr in bound:
+        return "bound"
+    if attr in suspect or attr in call_suspect:
+        return "suspect"
+    return None
+
+
+_BIND_TARGETS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+_BIND_STMT = re.compile(r"^\s*([\w.,:()\[\]'\"*\s]+?)\s*(?:[+\-*/%&|^@]|:)?=(?!=)(.*)$")
+_FOR_STMT = re.compile(r"^for\s+(.+?)\s+in\s+(.+?)(?::\s*(.*))?$")
+_WITH_AS = re.compile(r"(?:^|,)\s*(.+?)\s+as\s+([A-Za-z_][A-Za-z0-9_.]*)")
+_CLASS_HEAD = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)")
+_COMPOUND_HEADS = {
+    "if", "elif", "else", "while", "for", "try", "except", "finally",
+    "with", "def", "class", "match", "case", "lambda",
+}
+_MODULE_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+_PLAIN_IMPORT = re.compile(r"^import\s+([A-Za-z_][A-Za-z0-9_.,\s]*)$")
+_DOTTED_CALL = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_BARE_CALL = re.compile(r"(?<![.\w])([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+_DOTTED_REF = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.([A-Za-z_][A-Za-z0-9_]*)")
+_STRING_LITERAL = re.compile(r"'(?:[^'\\]|\\.)*'|\"(?:[^\"\\]|\\.)*\"")
+_PY_KEYWORDS = {
+    "and", "as", "assert", "async", "await", "break", "class", "continue",
+    "def", "del", "elif", "else", "except", "finally", "for", "from",
+    "global", "if", "import", "in", "is", "lambda", "nonlocal", "not",
+    "or", "pass", "raise", "return", "try", "while", "with", "yield",
+    "match", "case", "type", "None", "True", "False", "NotImplemented",
+    "Ellipsis", "self", "cls",
+}
+
+
+def _bind_targets(lhs: str) -> set[str]:
+    """Leaf names bound by an assignment target: tuple items, attribute
+    subscripts and annotations collapse to their bound identifiers."""
+    lhs = lhs.split(":", 1)[0]
+    return {_leaf(match.group(0)) for match in _BIND_TARGETS.finditer(lhs)} \
+        - {""} - _PY_KEYWORDS
+
+
+def _top_delim(text: str) -> tuple[int, str] | None:
+    """First top-level `;` or a `:` that closes a compound-statement head
+    (if/for/def/case/...), ignoring delimiters inside brackets, string
+    literals and comments. Annotation `x: T` and walrus `:=` colons do not
+    split because their head is not a compound keyword."""
+    depth = 0
+    quote: str | None = None
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if text.startswith(quote, index):
+                index += len(quote)
+                quote = None
+                continue
+            index += 1
+            continue
+        if text.startswith(('"""', "'''"), index):
+            quote = text[index:index + 3]
+            index += 3
+            continue
+        if char in "\"'":
+            quote = char
+        elif char == "#":
+            break
+        elif char in "([{":
+            depth += 1
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+        elif depth == 0 and char == ";":
+            return index, ";"
+        elif depth == 0 and char == ":":
+            if text[index:index + 2] == ":=":
+                index += 2
+                continue
+            first = re.match(r"[A-Za-z_][A-Za-z0-9_]*", text.lstrip())
+            if first and first.group(0) in _COMPOUND_HEADS:
+                return index, ":"
+        index += 1
+    return None
+
+
+def _stmt_segments(text: str) -> list[str]:
+    """Simple statements in a line: split top-level `;` and compound-statement
+    colons so `if c: fn = x`, `def f(): import m` and `a(); b = y` expose
+    their heads and bodies as separate segments at any nesting depth."""
+    out: list[str] = []
+    pending = [text.strip()]
+    while pending:
+        seg = re.sub(r"^async\s+", "", pending.pop().strip())
+        if not seg:
+            continue
+        found = _top_delim(seg)
+        if found:
+            pos, _ = found
+            pending.append(seg[:pos])
+            pending.append(seg[pos + 1:])
+        else:
+            out.append(seg)
+    return out
+
+
+def _strip_comment(line: str) -> str:
+    """Remove a trailing # comment outside string literals."""
+    quote = None
+    index = 0
+    while index < len(line):
+        char = line[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = None
+        elif char in "'\"":
+            quote = char
+        elif char == "#":
+            return line[:index]
+        index += 1
+    return line
+
+
+def _logical_lines(content: str) -> list[tuple[int, str]]:
+    """Statements as (indent, text) lines: join backslash continuations, drop
+    comments, and split semicolons/control heads so import and binding forms
+    always appear at the start of a scanned line. The indent is the physical
+    leading whitespace of the source line and lets the classifier attribute
+    class-body bindings to their class."""
+    lines: list[tuple[int, str]] = []
+    buf = ""
+    for raw in content.splitlines():
+        if raw.rstrip().endswith("\\"):
+            buf += raw.rstrip()[:-1] + " "
+            continue
+        indent = len(raw) - len(raw.lstrip())
+        lines.extend((indent, seg)
+                     for seg in _stmt_segments(_strip_comment(buf + raw)))
+        buf = ""
+    if buf.strip():
+        indent = len(buf) - len(buf.lstrip())
+        lines.extend((indent, seg)
+                     for seg in _stmt_segments(_strip_comment(buf)))
+    return lines
+
+
+def _bound_names(content: str, leaves: set[str], modules: set[str],
+                 repo: Path | None = None, head: str | None = None,
+                 file_path: str = "", depth: int = 0,
+                 visited: frozenset[str] = frozenset(),
+                 memo: dict | None = None) \
+        -> tuple[set[str], set[str], set[str], bool, dict]:
+    """Bound, suspect, call_suspect, unresolved, and module-handle bindings.
+
+    bound: names bound to a boundary module or symbol (import aliases,
+    assignments mentioning boundary names, names re-exported from repo files
+    that bind them). suspect: names bound to an unresolvable dynamic
+    expression (non-literal getattr/setattr/delattr, exec/eval, importlib,
+    globals), to a suspect name, or re-exported through a module whose names
+    could not be fully expanded — a changed reference to one cannot be
+    classified. call_suspect: names bound to a value that cannot be proven
+    non-core (unproven right-hand side, absent-module imports) — a changed
+    CALL through one cannot be classified. unresolved: an `import *` that
+    cannot be fully expanded, or a name-binding fixpoint that did not
+    converge. handles: names bound to a repository module, each mapped to
+    (module path, bound attrs, suspect attrs), used to classify dotted calls
+    like `bridge.cleanup(...)`."""
+    if memo is None:
+        memo = {}
+    bound: set[str] = set()
+    suspect: set[str] = set()
+    call_suspect: set[str] = set()
+    handles: dict[str, tuple[str, set[str], set[str], set[str]]] = {}
+    unresolved = False
+    converged = False
+    normalized = _logical_lines(content)
+    normalized_content = "\n".join(text for _, text in normalized)
+    grown = False
+
+    def _from_items(module: str, items_text: str) -> None:
+        nonlocal unresolved, grown, bound, suspect, call_suspect, handles
+        resolved = _resolve_module(module, file_path)
+        items = [item.strip().strip("()").strip() for item in items_text.split(",")]
+        star = items_text.strip() == "*"
+        if _module_in(resolved, modules):
+            if star:
+                unresolved = True
+                return
+            for item in items:
+                bind = _FROM_ITEM.match(item)
+                if bind:
+                    name = bind.group(2) or bind.group(1)
+                    if name not in bound:
+                        bound.add(name)
+                        grown = True
+            return
+        if star:
+            entry = _module_names(repo, head, resolved, leaves, modules,
+                                  memo, depth, visited)
+            if not isinstance(entry, tuple):
+                unresolved = True
+                return
+            sub_bound, sub_suspect, sub_cs, sub_unres = entry
+            unresolved |= sub_unres
+            for name in (sub_bound - bound) | (sub_suspect - suspect) \
+                    | (sub_cs - call_suspect):
+                grown = True
+            bound |= sub_bound
+            suspect |= sub_suspect
+            call_suspect |= sub_cs
+            return
+        entry: object = None
+        entry_ready = False
+        for item in items:
+            bind = _FROM_ITEM.match(item)
+            if not bind:
+                continue
+            imported, alias = bind.group(1), bind.group(2) or bind.group(1)
+            # `from pkg.ui import bridge` may name a submodule pkg.ui.bridge.
+            submodule = resolved + "." + imported
+            sub_entry = _module_names(repo, head, submodule,
+                                      leaves, modules, memo, depth, visited)
+            if isinstance(sub_entry, tuple):
+                record = (submodule, sub_entry[0],
+                          sub_entry[1] | sub_entry[2], set())
+                if handles.get(alias) != record:
+                    handles[alias] = record
+                    unresolved |= sub_entry[3]
+                    grown = True
+                continue
+            if sub_entry in ("unreadable", "unexpanded"):
+                if alias not in suspect:
+                    suspect.add(alias)
+                    grown = True
+                continue
+            if not entry_ready:
+                entry = _module_names(repo, head, resolved, leaves, modules,
+                                      memo, depth, visited)
+                entry_ready = True
+            if not isinstance(entry, tuple):
+                if entry in ("unreadable", "unexpanded"):
+                    if alias not in suspect:
+                        suspect.add(alias)
+                        grown = True
+                elif entry is None and alias not in call_suspect \
+                        and alias not in bound:
+                    # `from missing import f` — the source module cannot be
+                    # inspected, so the imported value is unproven.
+                    call_suspect.add(alias)
+                    grown = True
+                continue
+            sub_bound, sub_suspect, sub_cs, sub_unres = entry
+            unresolved |= sub_unres
+            if imported in sub_bound and alias not in bound:
+                bound.add(alias)
+                grown = True
+            elif imported in sub_suspect and alias not in suspect:
+                suspect.add(alias)
+                grown = True
+            elif imported in sub_cs and alias not in call_suspect:
+                call_suspect.add(alias)
+                grown = True
+
+    def _import_stmt(text: str) -> bool:
+        """Classify an import/from statement wherever it appears; True when
+        the statement was an import form."""
+        nonlocal unresolved, grown, bound, suspect, call_suspect, handles
+        if text.startswith("from "):
+            found = _FROM_IMPORT.match(text)
+            if found:
+                _from_items(found.group(1), found.group(2))
+            return True
+        alias = _IMPORT_ALIAS.match(text)
+        if alias:
+            resolved = _resolve_module(alias.group(1), file_path)
+            name = alias.group(2)
+            if _module_in(resolved, modules):
+                if name not in bound:
+                    bound.add(name)
+                    grown = True
+            else:
+                entry = _module_names(repo, head, resolved, leaves, modules,
+                                      memo, depth, visited)
+                if isinstance(entry, tuple):
+                    record = (resolved, entry[0], entry[1] | entry[2], set())
+                    if handles.get(name) != record:
+                        handles[name] = record
+                        unresolved |= entry[3]
+                        grown = True
+                elif entry in ("unreadable", "unexpanded"):
+                    if name not in suspect:
+                        suspect.add(name)
+                        grown = True
+                elif entry is None and name not in call_suspect \
+                        and name not in bound:
+                    call_suspect.add(name)
+                    grown = True
+            return True
+        plain = _PLAIN_IMPORT.match(text)
+        if plain:
+            for modname in re.split(r"[\s,]+", plain.group(1).strip()):
+                if not modname:
+                    continue
+                top = _leaf(modname.split(".", 1)[0])
+                if not top:
+                    continue
+                resolved = _resolve_module(top, file_path)
+                if _module_in(resolved, modules):
+                    if top not in bound:
+                        bound.add(top)
+                        grown = True
+                    continue
+                entry = _module_names(repo, head, resolved, leaves,
+                                      modules, memo, depth, visited)
+                if isinstance(entry, tuple):
+                    record = (resolved, entry[0], entry[1] | entry[2], set())
+                    if handles.get(top) != record:
+                        handles[top] = record
+                        unresolved |= entry[3]
+                        grown = True
+                elif entry in ("unreadable", "unexpanded"):
+                    if top not in suspect:
+                        suspect.add(top)
+                        grown = True
+                elif entry is None and top not in call_suspect \
+                        and top not in bound:
+                    call_suspect.add(top)
+                    grown = True
+            return True
+        return False
+
+    class_stack: list[tuple[int, str]] = []
+    classes: dict[str, tuple[set[str], set[str], set[str]]] = {}
+    for _ in range(12):
+        grown = False
+        class_stack.clear()
+        for module, items_text in _from_clauses(normalized_content):
+            _from_items(module, items_text)
+        for indent, text in normalized:
+            while class_stack and indent <= class_stack[-1][0]:
+                class_stack.pop()
+            if not text or text.startswith("#"):
+                continue
+            if _import_stmt(text):
+                continue
+            pending = _stmt_segments(text)
+            while pending:
+                segment = pending.pop()
+                cls_head = _CLASS_HEAD.match(segment)
+                if cls_head:
+                    # `class C` registers a namespace handle: names bound in
+                    # its body are C's attributes, and any unrecorded
+                    # `C.attr` call fails closed through the handle rule.
+                    cname = cls_head.group(1)
+                    if cname not in classes:
+                        classes[cname] = (set(), set(), set())
+                    handles[cname] = ("<class>", *classes[cname])
+                    class_stack.append((indent, cname))
+                    continue
+                if _import_stmt(segment):
+                    continue
+                body = None
+                targets: set[str] = set()
+                rhs = ""
+                found = _FOR_STMT.match(segment)
+                if found:
+                    targets = _bind_targets(found.group(1))
+                    rhs, body = found.group(2), found.group(3)
+                elif segment.startswith("with "):
+                    pairs = _WITH_AS.findall(segment[5:])
+                    if not pairs:
+                        continue
+                    targets = {_leaf(t) for _, t in pairs}
+                    rhs = " ".join(ctx for ctx, _ in pairs)
+                    tail = pairs[-1][1]
+                    after = segment[segment.rfind(tail) + len(tail):]
+                    if after.lstrip().startswith(":"):
+                        body = after.lstrip()[1:].strip() or None
+                elif segment.startswith("case "):
+                    # Case-pattern names bind to matched values — a form the
+                    # scanner cannot resolve — so calls through them fail
+                    # closed. Lowercase names are bindings; capitalized names
+                    # are class references and stay out of the call suspects.
+                    pat = _STRING_LITERAL.sub("", segment[5:])
+                    for name in set(_IDENTIFIER.findall(pat)) - _PY_KEYWORDS:
+                        if name != "_" and name[:1].islower() \
+                                and name not in call_suspect:
+                            call_suspect.add(name)
+                            grown = True
+                    continue
+                else:
+                    bind = _BIND_STMT.match(segment)
+                    if not bind:
+                        continue
+                    targets = _bind_targets(bind.group(1))
+                    rhs = bind.group(2)
+                if body:
+                    pending.extend(_stmt_segments(body))
+                targets -= {""}
+                if not targets:
+                    continue
+                rhs_names = set(_IDENTIFIER.findall(rhs))
+                rhs_text = rhs.strip()
+                unproven = set(_IDENTIFIER.findall(
+                    _STRING_LITERAL.sub("", rhs))) - _PY_KEYWORDS \
+                    - bound - suspect - call_suspect - set(handles)
+                ref_entry: object = None
+                ref_ready = False
+                if len(rhs_names) == 1 and next(iter(rhs_names)) in handles:
+                    source = next(iter(rhs_names))
+                    for target in targets:
+                        if handles.get(target) != handles[source]:
+                            handles[target] = handles[source]
+                            grown = True
+                if _MODULE_REF.match(rhs_text) and rhs_text not in bound \
+                        and rhs_text not in suspect:
+                    resolved = _resolve_module(rhs_text, file_path)
+                    first = handles.get(rhs_text.split(".", 1)[0])
+                    if first is not None and "." in rhs_text:
+                        # `bridge.sub` resolves through bridge's recorded
+                        # module, matching Python attribute access.
+                        alt = first[0] + "." + rhs_text.split(".", 1)[1]
+                        if _module_file(repo, head, alt) is not None:
+                            resolved = alt
+                    ref_entry = _module_names(repo, head, resolved, leaves,
+                                              modules, memo, depth, visited)
+                    ref_ready = True
+                if ((_ATTR_CALL.search(rhs) and not _ATTR_LITERAL.search(rhs)) or
+                    _DYNAMIC_CALL.search(rhs)) or rhs_names & suspect:
+                    for target in targets - suspect:
+                        suspect.add(target)
+                        grown = True
+                elif rhs_names & (leaves | bound):
+                    for target in targets - bound:
+                        bound.add(target)
+                        grown = True
+                elif ref_ready and isinstance(ref_entry, tuple):
+                    record = (resolved, ref_entry[0],
+                              ref_entry[1] | ref_entry[2], set())
+                    for target in targets:
+                        if handles.get(target) != record:
+                            handles[target] = record
+                            unresolved |= ref_entry[3]
+                            grown = True
+                elif ref_ready and ref_entry in ("unreadable", "unexpanded"):
+                    for target in targets - suspect:
+                        suspect.add(target)
+                        grown = True
+                elif rhs_names & call_suspect:
+                    for target in targets - call_suspect:
+                        call_suspect.add(target)
+                        grown = True
+                else:
+                    cls = None
+                    resolved_idents: set[str] = set()
+                    for ref in _DOTTED_REF.finditer(rhs_text):
+                        found_cls = _attr_class(ref.group(1), ref.group(2),
+                                                handles, call_suspect, bound,
+                                                suspect, leaves, modules,
+                                                repo, head, file_path, memo)
+                        if found_cls == "bound":
+                            cls = "bound"
+                            break
+                        if found_cls == "suspect":
+                            cls = "suspect"
+                        else:
+                            resolved_idents.update(_IDENTIFIER.findall(
+                                ref.group(0)))
+                    if cls == "bound":
+                        for target in targets - bound:
+                            bound.add(target)
+                            grown = True
+                    elif cls == "suspect":
+                        for target in targets - suspect:
+                            suspect.add(target)
+                            grown = True
+                    elif unproven - resolved_idents:
+                        for target in targets - call_suspect - bound - suspect:
+                            call_suspect.add(target)
+                            grown = True
+                if class_stack:
+                    cbound, csus, cclean = classes[class_stack[-1][1]]
+                    for target in targets:
+                        if target in bound:
+                            cbound.add(target)
+                        elif target in suspect or target in call_suspect:
+                            csus.add(target)
+                        else:
+                            cclean.add(target)
+        if not grown:
+            converged = True
+            break
+    return bound, suspect, call_suspect, unresolved or not converged, handles
+
+
+def _leaf_hits(text: str, leaves: set[str]) -> list[str]:
+    if not text or not leaves:
+        return []
+    return sorted(leaf for leaf in leaves if leaf in set(_IDENTIFIER.findall(text)))
+
+
+def _changed_paths(repo: Path, base: str, head: str) -> tuple[list[str] | None, str | None]:
+    names = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "--name-only", "-z", base, head)
+    if names.returncode or not names.stdout or not names.stdout.endswith("\0"):
+        return None, "DIFF_READ_FAILED"
+    paths = names.stdout[:-1].split("\0")
+    if any(not path or any(ord(char) < 32 for char in path) or path.startswith("-") for path in paths):
+        return None, "DIFF_UNCLASSIFIABLE"
+    return paths, None
+
+
+def _removed_names(patch: str) -> set[str]:
+    names = set()
+    for line in patch.splitlines():
+        found = _REMOVED_DEF.match(line) or _REMOVED_NAME.match(line)
+        if found:
+            names.add(found.group(1))
+    return names
+
+
+def _referenced_from_boundary(repo: Path, head: str, name: str, boundary: dict) -> list[str] | None:
+    proc = run_git(repo, "grep", "-w", "-l", name, head, "--")
+    if proc.returncode not in (0, 1):
+        return None
+    hits = []
+    for line in proc.stdout.splitlines():
+        _, _, path = line.partition(":")
+        if path and _path_in_boundary(path, boundary, None):
+            hits.append(path)
+    return sorted(hits)
+
+
+def _split_stub(raw: object) -> dict:
+    """Best-effort split_analysis fields for returns that precede validation."""
+    stub = {"part": None, "parent_task": None, "paths_checked": None,
+            "core_touches": [], "unverifiable": [], "boundary_sha256": None,
+            "contract_path": None, "contract_sha256": None, "behaviour_checks": []}
+    if isinstance(raw, dict):
+        stub["part"] = raw.get("part")
+        stub["parent_task"] = raw.get("parent_task")
+    return stub
+
+
+def _contract_blob(repo: Path, head: str, contract_path: str) -> tuple[str | None, str | None]:
+    """(sha256, text) of the contract blob at head; (None, None) when absent or
+    not a regular file (symlink/gitlink/unreadable)."""
+    tree = run_git(repo, "ls-tree", head, "--", contract_path)
+    if tree.returncode or not tree.stdout.strip():
+        return None, None
+    if tree.stdout.split()[0] not in {"100644", "100755"}:
+        return None, None
+    try:
+        show = run_git(repo, "show", f"{head}:{contract_path}")
+    except UnicodeDecodeError:
+        return None, None
+    if show.returncode:
+        return None, None
+    return hashlib.sha256(show.stdout.encode()).hexdigest(), show.stdout
+
+
+def _split_check(evidence: dict) -> tuple[dict | None, dict]:
+    """Mixed-grade T3 split: a peripheral part must not touch the core boundary."""
+    raw = evidence.get("split")
+    if raw is None:
+        return None, result("N/A", "SPLIT_NOT_DECLARED", "task:746")
+    if not isinstance(raw, dict):
+        return _split_stub(raw), result("UNVERIFIED", "SPLIT_INVALID", "task:746")
+    part, parent = raw.get("part"), raw.get("parent_task")
+    info: dict = _split_stub(raw)
+    if (not isinstance(part, str) or part not in {"core", "peripheral"} or
+        not isinstance(parent, (str, int)) or isinstance(parent, bool) or
+        str(parent) == str(evidence.get("task")) or
+        ("parent_t" in raw and raw["parent_t"] != "T3")):
+        return info, result("UNVERIFIED", "SPLIT_INVALID", "task:746")
+    contract_path = None
+    if raw.get("contract_path") is not None:
+        contract_path = _normalize_path(raw.get("contract_path"))
+        if contract_path is None:
+            return info, result("UNVERIFIED", "SPLIT_INVALID", "task:746", field="contract_path")
+    if part == "peripheral" and contract_path is None:
+        return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746",
+                            field="contract_path")
+    info["contract_path"] = contract_path
+    behaviour = raw.get("behaviour_checks")
+    seen = []
+    if behaviour is not None:
+        if not isinstance(behaviour, list):
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", field="behaviour_checks")
+        for entry in behaviour:
+            if (not isinstance(entry, dict) or not isinstance(entry.get("id"), str) or
+                not entry["id"].strip() or not isinstance(entry.get("result"), str) or
+                entry["result"] not in {"pass", "fail"}):
+                return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
+                                    field="behaviour_checks")
+            seen.append({"id": entry["id"].strip(), "result": entry["result"], "ref": entry.get("ref")})
+        if any(entry["result"] == "fail" for entry in seen):
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
+                                field="behaviour_checks")
+    info["behaviour_checks"] = seen
+    repo = Path(str(evidence.get("repo_path", "")))
+    head, base = str(evidence.get("head", "")), str(evidence.get("base", ""))
+    paths = None
+    if part == "peripheral":
+        if not repo.is_dir() or not SHA.fullmatch(head) or not SHA.fullmatch(base):
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", field="diff")
+        paths, error = _changed_paths(repo, base, head)
+        if paths is None:
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", detail=error)
+        info["paths_checked"] = len(paths)
+    boundary = _normalize_boundary(raw.get("boundary")) if "boundary" in raw else None
+    contract_boundary = None
+    if contract_path is not None:
+        if not repo.is_dir() or not SHA.fullmatch(head):
+            return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", field="repo")
+        info["contract_sha256"], contract_text = _contract_blob(repo, head, contract_path)
+        if contract_text is not None:
+            try:
+                document = json.loads(contract_text)
+            except ValueError:
+                document = None
+            contract_boundary = _normalize_boundary(
+                (document or {}).get("boundary", document) if isinstance(document, dict) else None)
+    if part == "peripheral" and contract_path in paths:
+        info["core_touches"] = [{"path": contract_path, "kind": "contract"}]
+        return info, result("FAIL", "PERIPHERAL_TOUCHES_CORE", "task:746",
+                            touches=info["core_touches"], required_rerun="T3")
+    if contract_path is not None:
+        if contract_boundary is None:
+            return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746",
+                                contract_path=contract_path)
+        if boundary is not None and _digest(boundary) != _digest(contract_boundary):
+            return info, result("UNVERIFIED", "SPLIT_BOUNDARY_CONFLICT", "task:746")
+        boundary = boundary or contract_boundary
+    info["boundary_sha256"] = _digest(boundary) if boundary else None
+    if boundary is None:
+        return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746")
+    if part == "core":
+        return info, result("PASS", "SPLIT_CORE_DECLARED", "task:746",
+                            boundary_sha256=info["boundary_sha256"])
+    touched = [{"path": path, "kind": kind} for path in paths
+               if (kind := _path_in_boundary(path, boundary, contract_path))]
+    analyzed = [path for path in paths if not _path_in_boundary(path, boundary, contract_path)]
+    if not touched:
+        modules = _boundary_modules(boundary)
+        leaves = {leaf for symbol in boundary["symbols"] if (leaf := _leaf(symbol))}
+        leaves |= {item.rsplit(".", 1)[-1] for item in modules}
+        unverifiable = []
+        for path in analyzed:
+            try:
+                proc = run_git(repo, "diff", "--no-ext-diff", "--no-renames",
+                               "-U0", base, head, "--", path)
+                if proc.returncode:
+                    unverifiable.append(path)
+                    continue
+                patch = proc.stdout
+                if "Binary files" in patch or "GIT binary patch" in patch:
+                    unverifiable.append(path)
+                    continue
+                file_leaves = set(leaves)
+                suspect: set[str] = set()
+                call_suspect: set[str] = set()
+                handles: dict[
+                    str, tuple[str, set[str], set[str], set[str]]] = {}
+                module_memo: dict = {}
+                show = run_git(repo, "show", f"{head}:{path}")
+                if show.returncode == 0:
+                    bound, suspect, call_suspect, unresolved, handles = \
+                        _bound_names(show.stdout, leaves, modules, repo, head,
+                                     path, memo=module_memo)
+                    file_leaves |= bound
+                    if unresolved:
+                        unverifiable.append(path)
+            except UnicodeDecodeError:
+                unverifiable.append(path)
+                continue
+            for line in patch.splitlines():
+                if line.startswith("@@"):
+                    context = "@@".join(line.split("@@")[2:])
+                    touched.extend({"path": path, "kind": "enclosing", "symbol": leaf,
+                                    "detail": context.strip()[:120]}
+                                   for leaf in _leaf_hits(context, file_leaves))
+                    if _leaf_hits(context, suspect):
+                        unverifiable.append(path)
+                elif line[:1] in {"+", "-"} and not line.startswith(("+++", "---")):
+                    content = line[1:]
+                    touched.extend({"path": path, "kind": "call" if re.search(
+                                        r"\b" + re.escape(leaf) + r"\s*\(", content) else "symbol",
+                                    "symbol": leaf, "detail": content.strip()[:120]}
+                                   for leaf in _leaf_hits(content, file_leaves))
+                    for module in _import_modules(content, path):
+                        if _module_in(module, modules):
+                            touched.append({"path": path, "kind": "import", "symbol": module,
+                                            "detail": content.strip()[:120]})
+                    # Calls through bound names: `x(...)`, `x.attr(...)` and
+                    # `a.b.attr(...)` where the binding cannot be proven
+                    # non-core is unverifiable; a proven core attr is a touch.
+                    for match in _DOTTED_CALL.finditer(content):
+                        cls = _attr_class(match.group(1), match.group(2),
+                                          handles, call_suspect, bound,
+                                          suspect, leaves, modules, repo,
+                                          head, path, module_memo)
+                        if cls == "bound":
+                            touched.append({"path": path, "kind": "call",
+                                            "symbol": match.group(2),
+                                            "detail": content.strip()[:120]})
+                        elif cls == "suspect":
+                            unverifiable.append(path)
+                    for match in _BARE_CALL.finditer(content):
+                        if match.group(1) in call_suspect:
+                            unverifiable.append(path)
+                            break
+                    if (_leaf_hits(content, suspect) or
+                        (_ATTR_CALL.search(content) and not _ATTR_LITERAL.search(content)) or
+                        _DYNAMIC_CALL.search(content)):
+                        unverifiable.append(path)
+            for name in _removed_names(patch):
+                hits = _referenced_from_boundary(repo, head, name, boundary)
+                if hits is None:
+                    unverifiable.append(path)
+                elif hits:
+                    touched.append({"path": path, "kind": "removed_ref", "symbol": name,
+                                    "detail": ",".join(hits[:5])})
+        info["unverifiable"] = sorted(set(unverifiable))
+    info["core_touches"] = sorted(touched, key=lambda item: (item["path"], item.get("symbol") or ""))
+    if info["core_touches"]:
+        return info, result("FAIL", "PERIPHERAL_TOUCHES_CORE", "task:746",
+                            touches=info["core_touches"][:25], required_rerun="T3")
+    if info.get("unverifiable"):
+        return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
+                            unverifiable=info["unverifiable"])
+    return info, result("PASS", "SPLIT_PERIPHERAL_CLEAN", "task:746",
+                        boundary_sha256=info["boundary_sha256"], paths_checked=len(analyzed))
+
+
 def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
              *, root: Path | None = None) -> tuple[dict, dict]:
     checks: dict[str, dict] = {"policy": policy_check}
@@ -378,17 +1335,25 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
             checks["surface"] = result("UNVERIFIED", "POLICY_CONFLICT", "policy:surface_rules")
     else:
         checks["surface"] = result("UNVERIFIED", "POLICY_UNAVAILABLE", "decision:3231")
+    try:
+        split_info, checks["split"] = _split_check(evidence)
+    except Exception:
+        split_info, checks["split"] = _split_stub(evidence.get("split")), result(
+            "UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", detail="classifier_error")
     declared = evidence.get("declared_t")
     if not re.fullmatch(r"T[0-3]", str(declared)):
         checks["tier"] = result("UNVERIFIED", "T_MISSING", "spawn-worker:2-1")
     elif surface is None:
         checks["tier"] = result("UNVERIFIED", "T_FLOOR_UNKNOWN", "spawn-worker:2-1")
-    elif int(declared[1]) < int(surface["floor"][1]):
-        checks["tier"] = result("FAIL", "T_BELOW_FLOOR", "spawn-worker:2-1",
-                                declared=declared, floor=surface["floor"])
     else:
-        checks["tier"] = result("PASS", "T_MEETS_FLOOR", "spawn-worker:2-1",
-                                declared=declared, floor=surface["floor"])
+        floor_num = max(int(surface["floor"][1]),
+                        3 if (split_info or {}).get("part") == "core" else 0)
+        if int(declared[1]) < floor_num:
+            checks["tier"] = result("FAIL", "T_BELOW_FLOOR", "spawn-worker:2-1",
+                                    declared=declared, floor=f"T{floor_num}")
+        else:
+            checks["tier"] = result("PASS", "T_MEETS_FLOOR", "spawn-worker:2-1",
+                                    declared=declared, floor=f"T{floor_num}")
 
     root = root or Path(__file__).resolve().parents[2]
     contributor_profiles = []
@@ -512,7 +1477,8 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
 
     bound = {**evidence,
              "diff_sha256": surface["diff_sha256"] if surface else None,
-             "contributors_digest": _digest(contributors)}
+             "contributors_digest": _digest(contributors),
+             "split_analysis": split_info}
     if stage == "pre-spawn":
         checks["prior"] = result("N/A", "FIRST_CALL_POINT", "decision:3231")
         checks["report"] = result("N/A", "TESTER_NOT_SPAWNED", "decision:3231")
@@ -654,6 +1620,7 @@ def main() -> int:
                "head": evidence.get("head"), "base": evidence.get("base"), "trial_merge_tree": evidence.get("trial_merge_tree"),
                "declared_t": evidence.get("declared_t"), "required_grade": evidence.get("required_grade"),
                "implementation_grade": evidence.get("implementation_grade"),
+               "split": evidence.get("split"), "split_analysis": bound.get("split_analysis"),
                "diff_sha256": bound.get("diff_sha256"), "contributors_digest": bound.get("contributors_digest"),
                "planned_tester_profile": (evidence.get("tester") or {}).get("planned_profile"),
                "planned_tester_effort": (evidence.get("tester") or {}).get("planned_effort"),
