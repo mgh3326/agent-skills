@@ -82,17 +82,28 @@ a symlink, gitlink, or unreadable blob is SPLIT_BOUNDARY_MISSING.
 Identifiers bound to a boundary module or symbol at head count as
 boundary names, so calls through an alias are still touches. Binding
 forms recognised include absolute and relative from-imports (from ..x
-import y, from x import (a, b as c) — relative names resolve against the
-importing file's package and parenthesized lists are joined), import
-module as m aliases, plain assignments whose value names a boundary
-symbol or module or an already-bound name (chains resolve to a fixed
-point), and re-exports through another repository file: from pkg.ui.bridge
+import y, from x import (a, b as c), and backslash-continued import
+lists — relative names resolve against the importing file's package and
+parenthesized or continued lists are joined), import module as m
+aliases, plain assignments whose value names a boundary symbol or
+module or an already-bound name (chains resolve to a fixed point; a
+fixpoint that does not converge makes the file unclassifiable), and
+re-exports through another repository file: from pkg.ui.bridge
 import cleanup [as alias] or from pkg.ui.bridge import * inherits the
 bound and suspect names that bridge module binds at head, recursively.
-A name imported from a repo file that exists but cannot be read is
-treated as suspect. An `import *` whose source cannot be expanded — a
-boundary module or an unreadable or missing module — makes the whole
-file unclassifiable.
+A repository module itself can be bound as a handle: from pkg.ui import
+bridge, import pkg.ui.bridge as b, or h = pkg.ui.bridge record the
+module's bound names under the alias, so a dotted call like
+bridge.cleanup(row) counts as a touch when the module binds cleanup to
+the boundary. A name imported from a repo file that exists but cannot
+be read, or that lies past the re-export recursion depth, is treated as
+suspect; where a package directory and a sibling module file both
+exist, the package wins as it does at runtime. Assignment targets are
+read in tuple (a, b = …), annotated (a: T = …), subscript/attribute,
+one-line conditional (if c: a = …), for/with (for a in …, with … as a),
+and semicolon-separated forms. An `import *` whose source cannot be
+expanded — a boundary module or an unreadable or missing module —
+makes the whole file unclassifiable.
 
 Touching the boundary — a boundary path, the contract file, a core
 symbol or bound alias, an import of a boundary module, or a removed

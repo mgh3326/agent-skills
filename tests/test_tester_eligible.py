@@ -1118,6 +1118,132 @@ class SplitFixtures(EligibilityFixtures):
         with mock.patch.object(eligible, "_read_pane", return_value=None):
             return eligible.evaluate(evidence, "pre-spawn", self.policy, self.policy_check)
 
+    def test_submodule_import_and_module_alias_calls_fail(self) -> None:
+        # `from pkg.ui import bridge` binds a module handle; bridge.cleanup is core.
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/bridge.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "from pkg.ui import bridge\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from pkg.ui import bridge\n"
+                            "def render(row):\n    bridge.cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+        # `import pkg.ui.bridge as b` binds the same handle under b.
+        self.commit({"pkg/ui/consumer.py":
+                     "import pkg.ui.bridge as b\n"
+                     "def render(row):\n    return str(row)\n"})
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        head = self.commit({"pkg/ui/consumer.py":
+                            "import pkg.ui.bridge as b\n"
+                            "def render(row):\n    b.cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_package_shadows_sibling_module_for_reexports(self) -> None:
+        # Both bridge.py and bridge/__init__.py exist; Python prefers the package.
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/bridge.py": "unrelated = 1\n",
+                   "pkg/ui/bridge/__init__.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "from pkg.ui.bridge import cleanup as do_cleanup\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from pkg.ui.bridge import cleanup as do_cleanup\n"
+                            "def render(row):\n    do_cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_deep_reexport_past_depth_is_needs_classification(self) -> None:
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/b1.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/b2.py": "from pkg.ui.b1 import cleanup\n",
+                   "pkg/ui/b3.py": "from pkg.ui.b2 import cleanup\n",
+                   "pkg/ui/b4.py": "from pkg.ui.b3 import cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "from pkg.ui.b4 import cleanup\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "from pkg.ui.b4 import cleanup\n"
+                            "def render(row):\n    cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_backslash_continued_import_alias_fails(self) -> None:
+        base = ("from pkg.services.lease_release import \\\n"
+                "    release_lease as cleanup\n"
+                "def render(row):\n    return str(row)\n")
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py": base.replace(
+            "    return str(row)", "    cleanup(row)\n    return str(row)")})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_long_alias_chain_converges_or_is_unverified(self) -> None:
+        base = "from pkg.services.lease_release import release_lease\n"
+        base += "".join(f"x{index} = x{index + 1}\n" for index in range(7))
+        base += "x7 = release_lease\ndef render(row):\n    return str(row)\n"
+        self.seed_pkg(base)
+        head = self.commit({"pkg/ui/consumer.py": base.replace(
+            "    return str(row)", "    x0(row)\n    return str(row)")})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
+    def test_dynamic_assignment_target_forms_are_unverified(self) -> None:
+        for lhs in ("fn, unused = (getattr(svc, key), None)",
+                    "fn: object = getattr(svc, key)",
+                    "if True: fn = getattr(svc, key)"):
+            with self.subTest(lhs=lhs):
+                base = ("from pkg.services.lease_release import Service as svc\n"
+                        "key = 'release_lease'\n" + lhs + "\n"
+                        "def render(row):\n    return str(row)\n")
+                self.seed_pkg(base)
+                head = self.commit({"pkg/ui/consumer.py": base.replace(
+                    "    return str(row)", "    fn(row)\n    return str(row)")})
+                self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                          split=self.split())),
+                                 "split", "UNVERIFIED", "NEEDS_CLASSIFICATION")
+
+    def test_module_reference_assignment_binds_handle(self) -> None:
+        self.seed({"pkg/services/lease_release.py":
+                   "def release_lease(order):\n    ledger.record(order)\n",
+                   "pkg/ui/bridge.py":
+                   "from pkg.services.lease_release import release_lease as cleanup\n",
+                   "pkg/ui/consumer.py":
+                   "import pkg.ui.bridge\nh = pkg.ui.bridge\n"
+                   "def render(row):\n    return str(row)\n",
+                   self.CONTRACT: json.dumps({"boundary":
+                                              {"paths": ["pkg/services/lease_release.py"],
+                                               "symbols": ["release_lease"]}})})
+        head = self.commit({"pkg/ui/consumer.py":
+                            "import pkg.ui.bridge\nh = pkg.ui.bridge\n"
+                            "def render(row):\n    h.cleanup(row)\n    return str(row)\n"})
+        self.assert_case(self.check(self.evidence(head, declared_t="T1",
+                                                  split=self.split())),
+                         "split", "FAIL", "PERIPHERAL_TOUCHES_CORE")
+
     def test_decode_error_keeps_touch_and_lists_unverifiable(self) -> None:
         self.release_core()
         head = self.commit({"a_touch.py": "release_lease(row)\n",

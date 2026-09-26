@@ -22,7 +22,7 @@ from gate_common import (  # noqa: E402
 SHA = re.compile(r"^[0-9a-f]{40}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})$")
 STAGES = ("pre-spawn", "post-landing", "pre-merge")
-TOOL_VERSION = "tester-eligible/1.3"
+TOOL_VERSION = "tester-eligible/1.4"
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _REMOVED_DEF = re.compile(r"^-\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
 _REMOVED_NAME = re.compile(r"^-([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]")
@@ -30,7 +30,6 @@ _IMPORT_LINE = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_.]*)")
 _FROM_IMPORT = re.compile(r"^\s*from\s+(\.*[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\s+(.+)$")
 _FROM_ITEM = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?")
 _IMPORT_ALIAS = re.compile(r"^import\s+([A-Za-z_][A-Za-z0-9_.]*)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
-_BIND_LINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*=(?!=)(.*)$")
 _DYNAMIC_CALL = re.compile(r"\b(?:exec|eval|compile|__import__|globals|vars|importlib)\s*\(|\bimportlib\b")
 _ATTR_CALL = re.compile(r"\b(?:getattr|setattr|delattr)\s*\(")
 _ATTR_LITERAL = re.compile(r"(?:getattr|setattr|delattr)\s*\([^,]+,\s*(['\"])[A-Za-z_][A-Za-z0-9_.]*\1\s*[,)]")
@@ -448,7 +447,8 @@ def _resolve_module(module: str, file_path: str) -> str:
 
 
 def _from_clauses(content: str):
-    """Yield (module, items) for each from-import, joining parenthesized items."""
+    """Yield (module, items) for each from-import, joining parenthesized and
+    backslash-continued items."""
     lines = content.splitlines()
     index = 0
     while index < len(lines):
@@ -457,11 +457,12 @@ def _from_clauses(content: str):
             index += 1
             continue
         module, items = found.group(1), found.group(2)
-        while "(" in items and ")" not in items and index + 1 < len(lines):
+        while index + 1 < len(lines) and (
+                ("(" in items and ")" not in items) or items.rstrip().endswith("\\")):
             index += 1
             items += lines[index].strip()
         index += 1
-        yield module, items.strip("() \t\n")
+        yield module, items.replace("\\", " ").strip("() \t\n")
 
 
 def _import_modules(content: str, file_path: str = "") -> set[str]:
@@ -489,9 +490,10 @@ def _module_file(repo: Path, head: str, module: str) -> tuple[str, str] | str | 
     """Map a module name to a file at head: (path, content), "unreadable", or None.
 
     None means no such path exists in the tree (an external package);
-    "unreadable" means a blob exists but is a symlink, gitlink, or binary."""
+    "unreadable" means a blob exists but is a symlink, gitlink, or binary.
+    A package directory wins over a sibling module file, matching Python."""
     stem = module.replace(".", "/")
-    for candidate in (stem + ".py", stem + "/__init__.py"):
+    for candidate in (stem + "/__init__.py", stem + ".py"):
         tree = run_git(repo, "ls-tree", head, "--", candidate)
         if tree.returncode or not tree.stdout.strip():
             continue
@@ -508,34 +510,93 @@ def _module_file(repo: Path, head: str, module: str) -> tuple[str, str] | str | 
     return None
 
 
+def _module_names(repo: Path | None, head: str | None, resolved: str,
+                  leaves: set[str], modules: set[str], memo: dict,
+                  depth: int, visited: frozenset[str]) -> object:
+    """Bound-name entry for a resolved module, memoized.
+
+    Returns a _bound_names tuple for a readable file, "unreadable" for a
+    present-but-unreadable source, "unexpanded" when the file exists but the
+    recursion cap stops expansion, or None when the module is absent."""
+    if resolved in memo:
+        return memo[resolved]
+    if not repo or not head:
+        entry: object = "unexpanded"
+    else:
+        ref = _module_file(repo, head, resolved)
+        if isinstance(ref, tuple):
+            if depth >= 3 or resolved in visited:
+                entry = "unexpanded"
+            else:
+                entry = _bound_names(ref[1], leaves, modules, repo, head, ref[0],
+                                     depth + 1, visited | {resolved}, memo)
+        else:
+            entry = ref
+    memo[resolved] = entry
+    return entry
+
+
+_BIND_TARGETS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*")
+_BIND_STMT = re.compile(r"^\s*([\w.,:()\[\]'\"\s]+?)\s*(?:[+\-*/%&|^@])?=(?!=)(.*)$")
+_FOR_STMT = re.compile(r"^for\s+(.+?)\s+in\s+(.+?)(?::\s*(.*))?$")
+_WITH_AS = re.compile(r"(?:^|,)\s*(.+?)\s+as\s+([A-Za-z_][A-Za-z0-9_.]*)")
+_CTRL_HEAD = re.compile(
+    r"^(?:if|elif|else|while|try|finally|except|match|case)\b[^:]*:\s*")
+_MODULE_REF = re.compile(r"^[A-Za-z_][A-Za-z0-9_.]*$")
+_DOTTED_CALL = re.compile(
+    r"([A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*)\.([A-Za-z_][A-Za-z0-9_]*)\s*\(")
+
+
+def _bind_targets(lhs: str) -> set[str]:
+    """Leaf names bound by an assignment target: tuple items, attribute
+    subscripts and annotations collapse to their bound identifiers."""
+    lhs = lhs.split(":", 1)[0]
+    return {_leaf(match.group(0)) for match in _BIND_TARGETS.finditer(lhs)} - {""}
+
+
+def _stmt_segments(text: str) -> list[str]:
+    """Simple statements in a line: strip one-line control heads and split
+    semicolons so `if c: fn = x` and `a(); b = y` expose their bodies."""
+    head = _CTRL_HEAD.match(text)
+    while head:
+        text = text[head.end():].strip()
+        head = _CTRL_HEAD.match(text)
+    return [seg.strip() for seg in text.split(";") if seg.strip()]
+
+
 def _bound_names(content: str, leaves: set[str], modules: set[str],
                  repo: Path | None = None, head: str | None = None,
                  file_path: str = "", depth: int = 0,
                  visited: frozenset[str] = frozenset(),
-                 memo: dict | None = None) -> tuple[set[str], set[str], bool]:
-    """Bound and suspect identifiers in file content at head.
+                 memo: dict | None = None) -> tuple[set[str], set[str], bool, dict]:
+    """Bound, suspect, unresolved, and module-handle bindings in file content.
 
     bound: names bound to a boundary module or symbol (import aliases,
     assignments mentioning boundary names, names re-exported from repo files
     that bind them). suspect: names bound to an unresolvable dynamic
     expression (non-literal getattr/setattr/delattr, exec/eval, importlib,
-    globals) or to a suspect name — a changed call through one cannot be
-    classified. unresolved_star: an `import *` whose source cannot be fully
-    expanded (a boundary module or an unreadable module) was found."""
+    globals), to a suspect name, or re-exported through a module whose names
+    could not be fully expanded — a changed call through one cannot be
+    classified. unresolved: an `import *` that cannot be fully expanded, or a
+    name-binding fixpoint that did not converge. handles: names bound to a
+    repository module, each mapped to (module path, bound attrs, suspect
+    attrs), used to classify dotted calls like `bridge.cleanup(...)`."""
     if memo is None:
         memo = {}
     bound: set[str] = set()
     suspect: set[str] = set()
-    unresolved_star = False
-    for _ in range(6):
+    handles: dict[str, tuple[str, set[str], set[str]]] = {}
+    unresolved = False
+    converged = False
+    for _ in range(12):
         grown = False
         for module, items_text in _from_clauses(content):
             resolved = _resolve_module(module, file_path)
-            items = [item.strip().strip("()") for item in items_text.split(",")]
+            items = [item.strip().strip("()").strip() for item in items_text.split(",")]
             star = items_text.strip() == "*"
             if _module_in(resolved, modules):
                 if star:
-                    unresolved_star = True
+                    unresolved = True
                     continue
                 for item in items:
                     bind = _FROM_ITEM.match(item)
@@ -545,45 +606,53 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                             bound.add(name)
                             grown = True
                 continue
-            if not repo or not head or depth >= 3 or resolved in visited:
-                if star:
-                    unresolved_star = True
-                continue
-            if resolved not in memo:
-                ref = _module_file(repo, head, resolved)
-                if isinstance(ref, tuple):
-                    memo[resolved] = _bound_names(
-                        ref[1], leaves, modules, repo, head, ref[0], depth + 1,
-                        visited | {resolved}, memo)
-                else:
-                    memo[resolved] = ref
-            entry = memo[resolved]
-            if entry is None or entry == "unreadable":
-                if star:
-                    unresolved_star = True
-                    continue
-                if entry == "unreadable":
-                    for item in items:
-                        bind = _FROM_ITEM.match(item)
-                        if bind:
-                            name = bind.group(2) or bind.group(1)
-                            if name not in suspect:
-                                suspect.add(name)
-                                grown = True
-                continue
-            sub_bound, sub_suspect, sub_star = entry
-            unresolved_star |= sub_star
             if star:
+                entry = _module_names(repo, head, resolved, leaves, modules,
+                                      memo, depth, visited)
+                if not isinstance(entry, tuple):
+                    unresolved = True
+                    continue
+                sub_bound, sub_suspect, sub_unres, _ = entry
+                unresolved |= sub_unres
                 for name in (sub_bound - bound) | (sub_suspect - suspect):
                     grown = True
                 bound |= sub_bound
                 suspect |= sub_suspect
                 continue
+            entry: object = None
+            entry_ready = False
             for item in items:
                 bind = _FROM_ITEM.match(item)
                 if not bind:
                     continue
                 imported, alias = bind.group(1), bind.group(2) or bind.group(1)
+                # `from pkg.ui import bridge` may name a submodule pkg.ui.bridge.
+                submodule = resolved + "." + imported
+                sub_entry = _module_names(repo, head, submodule,
+                                          leaves, modules, memo, depth, visited)
+                if isinstance(sub_entry, tuple):
+                    record = (submodule, sub_entry[0], sub_entry[1])
+                    if handles.get(alias) != record:
+                        handles[alias] = record
+                        unresolved |= sub_entry[2]
+                        grown = True
+                    continue
+                if sub_entry in ("unreadable", "unexpanded"):
+                    if alias not in suspect:
+                        suspect.add(alias)
+                        grown = True
+                    continue
+                if not entry_ready:
+                    entry = _module_names(repo, head, resolved, leaves, modules,
+                                          memo, depth, visited)
+                    entry_ready = True
+                if not isinstance(entry, tuple):
+                    if entry in ("unreadable", "unexpanded") and alias not in suspect:
+                        suspect.add(alias)
+                        grown = True
+                    continue
+                sub_bound, sub_suspect, sub_unres, _ = entry
+                unresolved |= sub_unres
                 if imported in sub_bound and alias not in bound:
                     bound.add(alias)
                     grown = True
@@ -596,30 +665,96 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                 continue
             alias = _IMPORT_ALIAS.match(text)
             if alias:
-                if _module_in(_resolve_module(alias.group(1), file_path), modules) \
-                        and alias.group(2) not in bound:
-                    bound.add(alias.group(2))
-                    grown = True
+                resolved = _resolve_module(alias.group(1), file_path)
+                name = alias.group(2)
+                if _module_in(resolved, modules):
+                    if name not in bound:
+                        bound.add(name)
+                        grown = True
+                else:
+                    entry = _module_names(repo, head, resolved, leaves, modules,
+                                          memo, depth, visited)
+                    if isinstance(entry, tuple):
+                        record = (resolved, entry[0], entry[1])
+                        if handles.get(name) != record:
+                            handles[name] = record
+                            unresolved |= entry[2]
+                            grown = True
+                    elif entry in ("unreadable", "unexpanded") and name not in suspect:
+                        suspect.add(name)
+                        grown = True
                 continue
-            bind = _BIND_LINE.match(text)
-            if not bind:
-                continue
-            target = _leaf(bind.group(1))
-            if not target:
-                continue
-            rhs = bind.group(2)
-            rhs_names = set(_IDENTIFIER.findall(rhs))
-            if ((_ATTR_CALL.search(rhs) and not _ATTR_LITERAL.search(rhs)) or
-                _DYNAMIC_CALL.search(rhs)) or rhs_names & suspect:
-                if target not in suspect:
-                    suspect.add(target)
-                    grown = True
-            elif rhs_names & (leaves | bound) and target not in bound:
-                bound.add(target)
-                grown = True
+            pending = _stmt_segments(text)
+            while pending:
+                segment = pending.pop()
+                body = None
+                targets: set[str] = set()
+                rhs = ""
+                found = _FOR_STMT.match(segment)
+                if found:
+                    targets = _bind_targets(found.group(1))
+                    rhs, body = found.group(2), found.group(3)
+                elif segment.startswith("with "):
+                    pairs = _WITH_AS.findall(segment[5:])
+                    if not pairs:
+                        continue
+                    targets = {_leaf(t) for _, t in pairs}
+                    rhs = " ".join(ctx for ctx, _ in pairs)
+                    tail = pairs[-1][1]
+                    after = segment[segment.rfind(tail) + len(tail):]
+                    if after.lstrip().startswith(":"):
+                        body = after.lstrip()[1:].strip() or None
+                else:
+                    bind = _BIND_STMT.match(segment)
+                    if not bind:
+                        continue
+                    targets = _bind_targets(bind.group(1))
+                    rhs = bind.group(2)
+                if body:
+                    pending.extend(_stmt_segments(body))
+                targets -= {""}
+                if not targets:
+                    continue
+                rhs_names = set(_IDENTIFIER.findall(rhs))
+                rhs_text = rhs.strip()
+                ref_entry: object = None
+                ref_ready = False
+                if len(rhs_names) == 1 and next(iter(rhs_names)) in handles:
+                    source = next(iter(rhs_names))
+                    for target in targets:
+                        if handles.get(target) != handles[source]:
+                            handles[target] = handles[source]
+                            grown = True
+                if _MODULE_REF.match(rhs_text) and rhs_text not in bound \
+                        and rhs_text not in suspect:
+                    resolved = _resolve_module(rhs_text, file_path)
+                    ref_entry = _module_names(repo, head, resolved, leaves,
+                                              modules, memo, depth, visited)
+                    ref_ready = True
+                if ((_ATTR_CALL.search(rhs) and not _ATTR_LITERAL.search(rhs)) or
+                    _DYNAMIC_CALL.search(rhs)) or rhs_names & suspect:
+                    for target in targets - suspect:
+                        suspect.add(target)
+                        grown = True
+                elif rhs_names & (leaves | bound):
+                    for target in targets - bound:
+                        bound.add(target)
+                        grown = True
+                elif ref_ready and isinstance(ref_entry, tuple):
+                    record = (resolved, ref_entry[0], ref_entry[1])
+                    for target in targets:
+                        if handles.get(target) != record:
+                            handles[target] = record
+                            unresolved |= ref_entry[2]
+                            grown = True
+                elif ref_ready and ref_entry in ("unreadable", "unexpanded"):
+                    for target in targets - suspect:
+                        suspect.add(target)
+                        grown = True
         if not grown:
+            converged = True
             break
-    return bound, suspect, unresolved_star
+    return bound, suspect, unresolved or not converged, handles
 
 
 def _leaf_hits(text: str, leaves: set[str]) -> list[str]:
@@ -787,12 +922,15 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
                     continue
                 file_leaves = set(leaves)
                 suspect: set[str] = set()
+                handles: dict[str, tuple[str, set[str], set[str]]] = {}
+                module_memo: dict = {}
                 show = run_git(repo, "show", f"{head}:{path}")
                 if show.returncode == 0:
-                    bound, suspect, star = _bound_names(show.stdout, leaves, modules,
-                                                        repo, head, path)
+                    bound, suspect, unresolved, handles = _bound_names(
+                        show.stdout, leaves, modules, repo, head, path,
+                        memo=module_memo)
                     file_leaves |= bound
-                    if star:
+                    if unresolved:
                         unverifiable.append(path)
             except UnicodeDecodeError:
                 unverifiable.append(path)
@@ -815,6 +953,37 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
                         if _module_in(module, modules):
                             touched.append({"path": path, "kind": "import", "symbol": module,
                                             "detail": content.strip()[:120]})
+                    # dotted calls through module handles and resolved module
+                    # chains: `bridge.cleanup(...)` where the module binds the
+                    # attribute to a boundary name.
+                    for match in _DOTTED_CALL.finditer(content):
+                        chain, attr = match.group(1), match.group(2)
+                        handle = handles.get(chain)
+                        if handle is not None:
+                            attrs = handle[1:]
+                        else:
+                            attrs = None
+                            resolved = _resolve_module(chain, path)
+                            root_handle = handles.get(chain.split(".", 1)[0])
+                            if root_handle is not None and "." in chain:
+                                alt = root_handle[0] + "." + chain.split(".", 1)[1]
+                                if _module_file(repo, head, alt) is not None:
+                                    resolved = alt
+                            if _module_in(resolved, modules):
+                                attrs = (leaves, set())
+                            else:
+                                entry = _module_names(repo, head, resolved, leaves,
+                                                      modules, module_memo, 0, frozenset())
+                                if isinstance(entry, tuple):
+                                    attrs = entry[:2]
+                                elif entry in ("unreadable", "unexpanded"):
+                                    unverifiable.append(path)
+                                    continue
+                        if attrs and attr in attrs[0]:
+                            touched.append({"path": path, "kind": "call", "symbol": attr,
+                                            "detail": content.strip()[:120]})
+                        elif attrs and attr in attrs[1]:
+                            unverifiable.append(path)
                     if (_leaf_hits(content, suspect) or
                         (_ATTR_CALL.search(content) and not _ATTR_LITERAL.search(content)) or
                         _DYNAMIC_CALL.search(content)):
