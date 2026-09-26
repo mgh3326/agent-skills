@@ -538,8 +538,9 @@ def _module_names(repo: Path | None, head: str | None, resolved: str,
 
 
 def _attr_class(chain: str, attr: str, handles: dict, call_suspect: set[str],
-                leaves: set[str], modules: set[str], repo: Path | None,
-                head: str | None, file_path: str, memo: dict) -> str | None:
+                bound: set[str], suspect: set[str], leaves: set[str],
+                modules: set[str], repo: Path | None, head: str | None,
+                file_path: str, memo: dict) -> str | None:
     """Classify a `chain.attr` reference: "bound" when the attribute provably
     reaches the core boundary, "suspect" when it cannot be resolved
     (unreadable/unexpanded module, uninspecatable external chain, unproven
@@ -548,6 +549,8 @@ def _attr_class(chain: str, attr: str, handles: dict, call_suspect: set[str],
     if handle is not None:
         if attr in handle[1]:
             return "bound"
+        if attr in handle[3]:
+            return None
         return "suspect"
     resolved = _resolve_module(chain, file_path) if repo and head else chain
     root = handles.get(chain.split(".", 1)[0])
@@ -571,6 +574,14 @@ def _attr_class(chain: str, attr: str, handles: dict, call_suspect: set[str],
         return "suspect"
     if "." in chain:
         return "suspect"
+    # An attribute whose own name is already classified (a bound core symbol
+    # or an unresolvable binding) carries that verdict across any receiver
+    # namespace — `obj.release_lease` may be the boundary function re-exported
+    # onto an object the scanner cannot see.
+    if attr in bound:
+        return "bound"
+    if attr in suspect or attr in call_suspect:
+        return "suspect"
     return None
 
 
@@ -578,6 +589,7 @@ _BIND_TARGETS = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*
 _BIND_STMT = re.compile(r"^\s*([\w.,:()\[\]'\"*\s]+?)\s*(?:[+\-*/%&|^@]|:)?=(?!=)(.*)$")
 _FOR_STMT = re.compile(r"^for\s+(.+?)\s+in\s+(.+?)(?::\s*(.*))?$")
 _WITH_AS = re.compile(r"(?:^|,)\s*(.+?)\s+as\s+([A-Za-z_][A-Za-z0-9_.]*)")
+_CLASS_HEAD = re.compile(r"^class\s+([A-Za-z_][A-Za-z0-9_]*)")
 _COMPOUND_HEADS = {
     "if", "elif", "else", "while", "for", "try", "except", "finally",
     "with", "def", "class", "match", "case", "lambda",
@@ -693,20 +705,26 @@ def _strip_comment(line: str) -> str:
     return line
 
 
-def _logical_lines(content: str) -> list[str]:
-    """Statements as lines: join backslash continuations, drop comments, and
-    split semicolons/control heads so import and binding forms always appear
-    at the start of a scanned line."""
-    lines: list[str] = []
+def _logical_lines(content: str) -> list[tuple[int, str]]:
+    """Statements as (indent, text) lines: join backslash continuations, drop
+    comments, and split semicolons/control heads so import and binding forms
+    always appear at the start of a scanned line. The indent is the physical
+    leading whitespace of the source line and lets the classifier attribute
+    class-body bindings to their class."""
+    lines: list[tuple[int, str]] = []
     buf = ""
     for raw in content.splitlines():
         if raw.rstrip().endswith("\\"):
             buf += raw.rstrip()[:-1] + " "
             continue
-        lines.extend(_stmt_segments(_strip_comment(buf + raw)))
+        indent = len(raw) - len(raw.lstrip())
+        lines.extend((indent, seg)
+                     for seg in _stmt_segments(_strip_comment(buf + raw)))
         buf = ""
     if buf.strip():
-        lines.extend(_stmt_segments(_strip_comment(buf)))
+        indent = len(buf) - len(buf.lstrip())
+        lines.extend((indent, seg)
+                     for seg in _stmt_segments(_strip_comment(buf)))
     return lines
 
 
@@ -736,11 +754,11 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
     bound: set[str] = set()
     suspect: set[str] = set()
     call_suspect: set[str] = set()
-    handles: dict[str, tuple[str, set[str], set[str]]] = {}
+    handles: dict[str, tuple[str, set[str], set[str], set[str]]] = {}
     unresolved = False
     converged = False
     normalized = _logical_lines(content)
-    normalized_content = "\n".join(normalized)
+    normalized_content = "\n".join(text for _, text in normalized)
     grown = False
 
     def _from_items(module: str, items_text: str) -> None:
@@ -788,7 +806,7 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                                       leaves, modules, memo, depth, visited)
             if isinstance(sub_entry, tuple):
                 record = (submodule, sub_entry[0],
-                          sub_entry[1] | sub_entry[2])
+                          sub_entry[1] | sub_entry[2], set())
                 if handles.get(alias) != record:
                     handles[alias] = record
                     unresolved |= sub_entry[3]
@@ -848,7 +866,7 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                 entry = _module_names(repo, head, resolved, leaves, modules,
                                       memo, depth, visited)
                 if isinstance(entry, tuple):
-                    record = (resolved, entry[0], entry[1] | entry[2])
+                    record = (resolved, entry[0], entry[1] | entry[2], set())
                     if handles.get(name) != record:
                         handles[name] = record
                         unresolved |= entry[3]
@@ -879,7 +897,7 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                 entry = _module_names(repo, head, resolved, leaves,
                                       modules, memo, depth, visited)
                 if isinstance(entry, tuple):
-                    record = (resolved, entry[0], entry[1] | entry[2])
+                    record = (resolved, entry[0], entry[1] | entry[2], set())
                     if handles.get(top) != record:
                         handles[top] = record
                         unresolved |= entry[3]
@@ -895,11 +913,16 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
             return True
         return False
 
+    class_stack: list[tuple[int, str]] = []
+    classes: dict[str, tuple[set[str], set[str], set[str]]] = {}
     for _ in range(12):
         grown = False
+        class_stack.clear()
         for module, items_text in _from_clauses(normalized_content):
             _from_items(module, items_text)
-        for text in normalized:
+        for indent, text in normalized:
+            while class_stack and indent <= class_stack[-1][0]:
+                class_stack.pop()
             if not text or text.startswith("#"):
                 continue
             if _import_stmt(text):
@@ -907,6 +930,17 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
             pending = _stmt_segments(text)
             while pending:
                 segment = pending.pop()
+                cls_head = _CLASS_HEAD.match(segment)
+                if cls_head:
+                    # `class C` registers a namespace handle: names bound in
+                    # its body are C's attributes, and any unrecorded
+                    # `C.attr` call fails closed through the handle rule.
+                    cname = cls_head.group(1)
+                    if cname not in classes:
+                        classes[cname] = (set(), set(), set())
+                    handles[cname] = ("<class>", *classes[cname])
+                    class_stack.append((indent, cname))
+                    continue
                 if _import_stmt(segment):
                     continue
                 body = None
@@ -985,7 +1019,8 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                         bound.add(target)
                         grown = True
                 elif ref_ready and isinstance(ref_entry, tuple):
-                    record = (resolved, ref_entry[0], ref_entry[1] | ref_entry[2])
+                    record = (resolved, ref_entry[0],
+                              ref_entry[1] | ref_entry[2], set())
                     for target in targets:
                         if handles.get(target) != record:
                             handles[target] = record
@@ -1004,9 +1039,9 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                     resolved_idents: set[str] = set()
                     for ref in _DOTTED_REF.finditer(rhs_text):
                         found_cls = _attr_class(ref.group(1), ref.group(2),
-                                                handles, call_suspect, leaves,
-                                                modules, repo, head,
-                                                file_path, memo)
+                                                handles, call_suspect, bound,
+                                                suspect, leaves, modules,
+                                                repo, head, file_path, memo)
                         if found_cls == "bound":
                             cls = "bound"
                             break
@@ -1027,6 +1062,15 @@ def _bound_names(content: str, leaves: set[str], modules: set[str],
                         for target in targets - call_suspect - bound - suspect:
                             call_suspect.add(target)
                             grown = True
+                if class_stack:
+                    cbound, csus, cclean = classes[class_stack[-1][1]]
+                    for target in targets:
+                        if target in bound:
+                            cbound.add(target)
+                        elif target in suspect or target in call_suspect:
+                            csus.add(target)
+                        else:
+                            cclean.add(target)
         if not grown:
             converged = True
             break
@@ -1199,7 +1243,8 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
                 file_leaves = set(leaves)
                 suspect: set[str] = set()
                 call_suspect: set[str] = set()
-                handles: dict[str, tuple[str, set[str], set[str]]] = {}
+                handles: dict[
+                    str, tuple[str, set[str], set[str], set[str]]] = {}
                 module_memo: dict = {}
                 show = run_git(repo, "show", f"{head}:{path}")
                 if show.returncode == 0:
@@ -1235,9 +1280,9 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
                     # non-core is unverifiable; a proven core attr is a touch.
                     for match in _DOTTED_CALL.finditer(content):
                         cls = _attr_class(match.group(1), match.group(2),
-                                          handles, call_suspect, leaves,
-                                          modules, repo, head, path,
-                                          module_memo)
+                                          handles, call_suspect, bound,
+                                          suspect, leaves, modules, repo,
+                                          head, path, module_memo)
                         if cls == "bound":
                             touched.append({"path": path, "kind": "call",
                                             "symbol": match.group(2),
