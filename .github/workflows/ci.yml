@@ -52,6 +52,7 @@ jobs:
             tests/test-assignment-defaults.sh \
             tests/test-t3-split-rule.sh \
             tests/test-merge-precheck.sh \
+            tests/test-round-cap.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' -perm -111 -print)
       - name: Bash tests
         env:
@@ -80,3 +81,4 @@ jobs:
           bash tests/test-assignment-defaults.sh
           bash tests/test-t3-split-rule.sh
           bash tests/test-merge-precheck.sh
+          bash tests/test-round-cap.sh

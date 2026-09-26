@@ -18,6 +18,9 @@ WRK_EXIT_JOB_STATE_UNREADABLE=75
 # observed. Automation opts into 76 to distinguish that outcome from the
 # ROB-1326 duplicate-job contracts above.
 WRK_EXIT_LANDING_UNCONFIRMED=76
+# #758: a refused tester-round open at the cap. Distinct from generic misuse
+# (2) so a builder loop can tell "stop and wait" apart from a bad invocation.
+WRK_EXIT_ROUND_CAP=78
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -91,7 +94,7 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts|heavy> [options]
+Usage: wrk <spawn|done|escalate|joined|round|reap|find|name-sync|profiles|hosts|heavy> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
@@ -99,6 +102,9 @@ Usage: wrk <spawn|done|escalate|joined|reap|find|name-sync|profiles|hosts|heavy>
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
+  wrk round open JOB --head SHA [--extend REF]
+  wrk round verdict JOB --file PATH
+  wrk round status JOB
   wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
@@ -3353,6 +3359,513 @@ joined_cmd() {
   echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
 }
 
+# ── #758: formal tester-round counting and the per-job round cap ────────────
+#
+# One formal tester round is one tester verdict recorded for one head. The
+# count lives ONLY in the job's events/ stream: a round starts with a
+# `job.round` record (wrk round open) and its verdict lands as a `job.verdict`
+# record bound to it (wrk round verdict). Rounds are numbered by wrk, so
+# sub-round names like r5b cannot exist — every open increments the count,
+# and a verdict that binds to no open round still counts as a round of its
+# own. The builder's head does not reset the count: rounds are per job, not
+# per head.
+ROUND_CAP_DEFAULT=3
+# Operator identities allowed to issue a round-cap extension approval.
+# Space-separated; the job's parent lane is always accepted on top of these.
+ROUND_CAP_OPERATORS="${WRK_ROUND_CAP_OPERATORS:-operator operator-desk mac-personal}"
+ROUND_CAP_REASON="tester round cap reached"
+
+round_help() {
+  cat <<'USAGE'
+Usage: wrk round <open|verdict|status> JOB [options]
+
+Formal tester-round bookkeeping for a builder job (#758). A formal round is
+one tester verdict recorded for one head. The count is taken only from the
+job's events/ stream (job.round and job.verdict records), so renamed or
+sub-rounds (r5b) cannot hide: wrk numbers every round itself.
+
+  wrk round open JOB --head SHA [--extend REF]
+      Open the next tester round for JOB (a builder job). At the cap
+      (default 3 rounds per job) the open is refused with exit 78 and one
+      job.escalate naming the job, head, last verdict and findings path is
+      emitted to the parent lane; the builder must stop and wait. Past the
+      cap an open is allowed only with --extend REF, where REF is
+      hk:doc/<key> or hk:task/<id> of an approval record fetched from
+      handoffkeep that names the job and the number of extra rounds on a
+      grant line:
+
+        round-extension: job=JOB extra=N by=ISSUER
+
+      ISSUER must be the job's parent lane or an operator identity and must
+      equal the record's server-side session (doc) or comment author (task).
+      Each grant covers <extra> more opens and each open consumes exactly one.
+  wrk round verdict JOB --file PATH
+      Record the tester's verdict file for the oldest open round that has
+      none. PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
+      A verdict that binds to no open round still counts as a round, so
+      verdict files written elsewhere or recorded without an open cannot
+      dodge the cap.
+  wrk round status JOB
+      Print one line: job=… rounds=N cap=N open=… last_verdict=…
+USAGE
+}
+
+# Scan the job's events stream once and emit one TSV line of key=value fields
+# the round commands need:
+#   rounds=<N>\topen=<csv|->\tlast_verdict=<V@SHA|->\tlast_findings=<path|->
+round_scan() {
+  local job="$1"
+  python3 - "$(wrk_jobs_root)/$job/events" <<'PY'
+import json, os, sys
+events = sys.argv[1]
+rounds = []          # job.round records in file order
+verdicts = []        # job.verdict records in file order
+try:
+    names = sorted(os.listdir(events))
+except OSError:
+    names = []
+for name in names:
+    if not name.endswith(".json"):
+        continue
+    try:
+        with open(os.path.join(events, name), encoding="utf-8") as f:
+            o = json.load(f)
+    except (OSError, ValueError):
+        continue
+    if o.get("kind") == "job.round":
+        rounds.append(o)
+    elif o.get("kind") == "job.verdict":
+        verdicts.append(o)
+bound = {v.get("round") for v in verdicts if isinstance(v.get("round"), int)}
+open_rounds = [str(r.get("round")) for r in rounds
+               if isinstance(r.get("round"), int) and r.get("round") not in bound]
+used = len(rounds) + sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+last = verdicts[-1] if verdicts else {}
+lv = "-"
+if last.get("verdict") and last.get("head"):
+    lv = "%s@%s" % (last["verdict"], last["head"])
+lf = last.get("path") or "-"
+print("rounds=%d\topen=%s\tlast_verdict=%s\tlast_findings=%s" %
+      (used, ",".join(open_rounds) if open_rounds else "-", lv, lf))
+PY
+}
+
+# Fetch an approval record from handoffkeep. Echoes the raw record text
+# (JSON) on stdout; non-zero when the record is absent or handoffkeep fails.
+round_approval_fetch() {
+  local ref="$1" handoffkeep out rc=0
+  handoffkeep="$(command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true)"
+  [[ -n "$handoffkeep" ]] || return 1
+  case "$ref" in
+    hk:doc/?*)  out="$("$handoffkeep" doc get "${ref#hk:doc/}" 2>/dev/null)" || rc=$? ;;
+    hk:task/?*) out="$("$handoffkeep" tasks comments "${ref#hk:task/}" 2>/dev/null)" || rc=$? ;;
+    *) return 2 ;;
+  esac
+  [[ "$rc" -eq 0 && -n "$out" && "$out" != not_found ]] || return 1
+  printf '%s' "$out"
+}
+
+# Verify a fetched approval record and print the granted extra-round count.
+# Args: ref, job, parent lane, operators (space separated), record file.
+# Prints "granted=<N> issuer=<name>" — nothing else — on success.
+round_approval_verify() {
+  local ref="$1" job="$2" parent="$3" operators="$4" record="$5"
+  python3 - "$ref" "$job" "$parent" "$operators" "$record" <<'PY'
+import json, re, sys
+ref, job, parent, operators, path = sys.argv[1:]
+ops = set(operators.split())
+try:
+    with open(path, encoding="utf-8") as f:
+        raw = f.read()
+except OSError:
+    raise SystemExit(1)
+try:
+    doc = json.loads(raw)
+except ValueError:
+    raise SystemExit(1)
+# A grant line names the job, the extra-round count and its issuer.
+GRANT = re.compile(
+    r"^\s*round-extension\s*:\s*job=(\S+)\s+extra=(\d+)\s+by=(\S+)\s*$")
+# The issuer written into the grant line must be backed by the record's
+# server-side identity — a doc's session or a task comment's author — so a
+# builder writing 'by=director-1' into its own record cannot pass.
+sources = []
+if ref.startswith("hk:doc/"):
+    if isinstance(doc, dict):
+        sources.append((doc.get("session") or "", doc.get("body") or ""))
+elif ref.startswith("hk:task/"):
+    for c in (doc.get("comments") if isinstance(doc, dict) else None) or []:
+        if isinstance(c, dict):
+            sources.append((c.get("author") or "", c.get("body") or ""))
+allowed_issuers = {parent} | ops
+for identity, body in sources:
+    for line in body.splitlines():
+        m = GRANT.match(line)
+        if not m or m.group(1) != job:
+            continue
+        extra, issuer = int(m.group(2)), m.group(3)
+        if extra < 1 or issuer not in allowed_issuers:
+            continue
+        if identity != issuer and not (issuer in ops and identity in ops):
+            continue
+        print("granted=%d issuer=%s" % (extra, issuer))
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Emit the round-cap job.escalate (once per job — a repeated refusal must not
+# spam the parent lane; #745 was a STOP that sat unread). Prints TSV:
+#   emitted\trounds=<N>\tlast_verdict=<v@sha|->\tfindings=<path|->
+# or the single token 'duplicate'.
+round_cap_event() {
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" head="$6" cap="$7"
+  local events
+  events="$(wrk_jobs_root)/$job/events"
+  mkdir -p "$events"
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "${HOSTNAME:-unknown}" "$head" "$cap" <<'PY'
+import fcntl, json, os, sys, tempfile
+events, job, owner, label, pane, parent, host, head, cap = sys.argv[1:]
+cap = int(cap)
+names = []
+try:
+    names = sorted(os.listdir(events))
+except OSError:
+    pass
+records = []
+for name in names:
+    if not name.endswith(".json"):
+        continue
+    try:
+        with open(os.path.join(events, name), encoding="utf-8") as f:
+            records.append(json.load(f))
+    except (OSError, ValueError):
+        continue
+verdicts = [r for r in records if r.get("kind") == "job.verdict"]
+used = sum(1 for r in records if r.get("kind") == "job.round")
+used += sum(1 for r in verdicts if not isinstance(r.get("round"), int))
+last = verdicts[-1] if verdicts else {}
+lv = "-"
+if last.get("verdict") and last.get("head"):
+    lv = "%s@%s" % (last["verdict"], last["head"])
+findings = last.get("path") or ""
+lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
+with open(lock_path, "w", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    # Dedupe must re-read inside the lock: the snapshot above is stale and two
+    # refusals racing on it would otherwise each think they are first.
+    for name in os.listdir(events):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(events, name), encoding="utf-8") as f:
+                r = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if r.get("kind") == "job.escalate" and r.get("reason") == "tester round cap reached":
+            print("duplicate")
+            raise SystemExit(0)
+    highest = 0
+    for name in os.listdir(events):
+        try:
+            highest = max(highest, int(name.split("-", 1)[0]))
+        except (ValueError, IndexError):
+            pass
+    question = ("tester round cap %d reached at %d rounds; builder must stop "
+                "and wait for the parent; extension needs a hk approval "
+                "record naming this job (wrk round open --extend REF)"
+                % (cap, used))
+    record = {"kind": "job.escalate", "job_id": job, "owner_lane": owner,
+              "label": label, "pane_id": pane, "host": host,
+              "report_path": findings, "report_last_line": lv,
+              "reason": "tester round cap reached", "question": question,
+              "parent_lane": parent, "head": head, "rounds": used,
+              "cap": cap, "last_verdict": lv, "findings_path": findings,
+              "epoch": 1}
+    fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, separators=(",", ":"))
+            f.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, os.path.join(events, "%05d-job.escalate.json" % (highest + 1)))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+print("emitted\trounds=%d\tlast_verdict=%s\tfindings=%s" % (used, lv, findings or "-"))
+PY
+}
+
+round_open_cmd() {
+  local job="${1:-}" head="" extend="" metadata owner label pane parent role
+  [[ -n "$job" && "$job" != -* ]] || die "round open requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --head) [[ $# -ge 2 && -n "$2" ]] || die "--head requires a SHA"; head="$2"; shift 2 ;;
+      --extend) [[ $# -ge 2 && -n "$2" ]] || die "--extend requires a hk:doc/<key> or hk:task/<id> ref"; extend="$2"; shift 2 ;;
+      *) die "unknown round open option '$1'" ;;
+    esac
+  done
+  [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] || die "round open --head requires a full 40-hex SHA"
+  head="$(printf '%s' "$head" | tr '[:upper:]' '[:lower:]')"
+  metadata="$(builder_metadata "$job")"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+
+  # An extension is approved before the count is consulted: the fetched hk
+  # record must carry a valid grant line for this job from an allowed issuer.
+  local grant="" grant_extra=0 grant_issuer=""
+  if [[ -n "$extend" ]]; then
+    local tmp_approval
+    tmp_approval="$(mktemp)"
+    if ! round_approval_fetch "$extend" >"$tmp_approval"; then
+      rm -f "$tmp_approval"
+      die "round open --extend: approval record not found in handoffkeep: $extend"
+    fi
+    grant="$(round_approval_verify "$extend" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$tmp_approval" || true)"
+    rm -f "$tmp_approval"
+    [[ -n "$grant" ]] ||
+      die "round open --extend: $extend holds no 'round-extension: job=$job extra=N by=<parent-lane|operator>' grant backed by the record's session/author"
+    grant_extra="${grant#granted=}"; grant_extra="${grant_extra%% *}"
+    grant_issuer="${grant##*issuer=}"
+  fi
+
+  # Round count and decision run under the events lock so a verdict landing
+  # concurrently cannot slip a second open past the cap.
+  local outcome rc=0
+  set +e
+  outcome="$(python3 - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend" "$grant_extra" "$grant_issuer" <<'PY'
+import fcntl, json, os, sys, tempfile
+(events, job, owner, label, pane, parent, head, cap,
+ extend_ref, grant_extra, grant_issuer) = sys.argv[1:]
+cap, grant_extra = int(cap), int(grant_extra)
+os.makedirs(events, exist_ok=True)
+lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
+with open(lock_path, "w", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    records = []
+    for name in sorted(os.listdir(events)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(events, name), encoding="utf-8") as f:
+                records.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    rounds = [r for r in records if r.get("kind") == "job.round"]
+    verdicts = [r for r in records if r.get("kind") == "job.verdict"]
+    used = len(rounds) + sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+    approval = None
+    if used >= cap:
+        if not extend_ref:
+            print("CAP rounds=%d" % used)
+            raise SystemExit(0)
+        # Each grant covers <extra> opens past the cap; one open consumes one.
+        consumed = sum(1 for r in rounds
+                       if (r.get("approval") or {}).get("ref") == extend_ref)
+        if consumed >= grant_extra:
+            print("CAP rounds=%d" % used)
+            raise SystemExit(0)
+        approval = {"ref": extend_ref, "issuer": grant_issuer, "extra": grant_extra}
+    elif extend_ref:
+        print("EXTEND_BEFORE_CAP")
+        raise SystemExit(0)
+    highest = 0
+    for name in os.listdir(events):
+        try:
+            highest = max(highest, int(name.split("-", 1)[0]))
+        except (ValueError, IndexError):
+            pass
+    record = {"kind": "job.round", "job_id": job, "owner_lane": owner,
+              "label": label, "pane_id": pane, "parent_lane": parent,
+              "head": head.lower(), "round": used + 1, "epoch": 1}
+    if approval:
+        record["approval"] = approval
+    fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, separators=(",", ":"))
+            f.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, os.path.join(events, "%05d-job.round.json" % (highest + 1)))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print("OPENED round=%d" % (used + 1))
+PY
+)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die "round open failed to inspect $job"
+  case "$outcome" in
+    OPENED\ round=*)
+      echo "OK job=$job ${outcome#OPENED } cap=$ROUND_CAP_DEFAULT head=$head"
+      ;;
+    EXTEND_BEFORE_CAP)
+      die "round open --extend is only valid once the cap ($ROUND_CAP_DEFAULT) is reached"
+      ;;
+    CAP\ rounds=*)
+      # The refusal is itself an event the parent must see: emit the
+      # escalate (deduped per job) and then stop the caller with rc 78.
+      local rounds last_v findings status question
+      status="$(round_cap_event "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT")"
+      if [[ "$status" == emitted* ]]; then
+        IFS=$'\t' read -r _ rounds last_v findings <<<"$status"
+        findings="${findings#findings=}"
+        [[ "$findings" == "-" ]] && findings=""
+        question="tester round cap $ROUND_CAP_DEFAULT reached at ${rounds#rounds=} rounds; builder must stop and wait for the parent; extension needs a hk approval record naming this job (wrk round open --extend REF)"
+        emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
+          "$findings" "${last_v#last_verdict=}" "$ROUND_CAP_REASON" "$question" "" "$head"
+        warn "round cap $ROUND_CAP_DEFAULT reached for $job (${rounds#rounds=} rounds); emitted job.escalate to parent $parent"
+      else
+        warn "round cap $ROUND_CAP_DEFAULT still reached for $job; job.escalate already recorded"
+      fi
+      exit "$WRK_EXIT_ROUND_CAP"
+      ;;
+    *) die "round open unexpected outcome: $outcome" ;;
+  esac
+}
+
+round_verdict_cmd() {
+  local job="${1:-}" file="" metadata owner label pane parent role
+  [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file) [[ $# -ge 2 && -n "$2" ]] || die "--file requires a path"; file="$2"; shift 2 ;;
+      *) die "unknown round verdict option '$1'" ;;
+    esac
+  done
+  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
+  metadata="$(builder_metadata "$job")"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  local outcome rc=0
+  set +e
+  outcome="$(python3 - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
+import fcntl, json, os, re, sys, tempfile
+events, job, owner, label, pane, parent, vfile, cap = sys.argv[1:]
+cap = int(cap)
+os.makedirs(events, exist_ok=True)
+verdict = vsha = None
+VERDICT = re.compile(r"VERDICT:\s*(PASS|BLOCKER)\s*@([0-9a-fA-F]{40})")
+try:
+    with open(vfile, encoding="utf-8") as f:
+        for line in f:
+            m = VERDICT.search(line)
+            if m:
+                verdict, vsha = m.group(1), m.group(2).lower()
+except OSError:
+    pass
+if verdict is None:
+    print("NO_VERDICT")
+    raise SystemExit(0)
+lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
+with open(lock_path, "w", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    records = []
+    for name in sorted(os.listdir(events)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(events, name), encoding="utf-8") as f:
+                records.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    rounds = [r for r in records if r.get("kind") == "job.round"]
+    verdicts = [r for r in records if r.get("kind") == "job.verdict"]
+    bound = {v.get("round") for v in verdicts if isinstance(v.get("round"), int)}
+    target = None
+    for r in rounds:
+        if isinstance(r.get("round"), int) and r.get("round") not in bound:
+            target = r["round"]
+            break
+    used = len(rounds) + sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+    if target is None:
+        used += 1  # this unbound verdict is itself a round
+    highest = 0
+    for name in os.listdir(events):
+        try:
+            highest = max(highest, int(name.split("-", 1)[0]))
+        except (ValueError, IndexError):
+            pass
+    record = {"kind": "job.verdict", "job_id": job, "owner_lane": owner,
+              "label": label, "pane_id": pane, "parent_lane": parent,
+              "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
+              "round": target, "epoch": 1}
+    if target is None:
+        record["unopened"] = True
+    fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, separators=(",", ":"))
+            f.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, os.path.join(events, "%05d-job.verdict.json" % (highest + 1)))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    over = target is None and used > cap
+    print("RECORDED round=%s verdict=%s head=%s used=%d over=%d" %
+          (target if target is not None else "unopened", verdict, vsha, used, int(over)))
+PY
+)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+  case "$outcome" in
+    NO_VERDICT)
+      die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
+    RECORDED*)
+      local round_no="" verdict_v="" head_v="" used_v="" over_v="" status question tok
+      for tok in $outcome; do
+        case "$tok" in
+          round=*) round_no="${tok#round=}" ;;
+          verdict=*) verdict_v="${tok#verdict=}" ;;
+          head=*) head_v="${tok#head=}" ;;
+          used=*) used_v="${tok#used=}" ;;
+          over=*) over_v="${tok#over=}" ;;
+        esac
+      done
+      if [[ "$round_no" == unopened ]]; then
+        warn "verdict bound to no open round; counted as a round itself (job=$job rounds=$used_v)"
+        if [[ "$over_v" == 1 ]]; then
+          status="$(round_cap_event "$job" "$owner" "$label" "$pane" "$parent" "$head_v" "$ROUND_CAP_DEFAULT")"
+          if [[ "$status" == emitted* ]]; then
+            question="tester round cap $ROUND_CAP_DEFAULT reached at $used_v rounds; builder must stop and wait for the parent; extension needs a hk approval record naming this job (wrk round open --extend REF)"
+            emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
+              "$file" "$verdict_v@$head_v" "$ROUND_CAP_REASON" "$question" "" "$head_v"
+            warn "round cap $ROUND_CAP_DEFAULT reached for $job ($used_v rounds); emitted job.escalate to parent $parent"
+          fi
+          echo "OK job=$job verdict=$verdict_v head=$head_v round=unopened rounds=$used_v cap=$ROUND_CAP_DEFAULT"
+          exit "$WRK_EXIT_ROUND_CAP"
+        fi
+      fi
+      echo "OK job=$job verdict=$verdict_v head=$head_v round=$round_no rounds=$used_v cap=$ROUND_CAP_DEFAULT"
+      ;;
+    *) die "round verdict unexpected outcome: $outcome" ;;
+  esac
+}
+
+round_status_cmd() {
+  local job="${1:-}"
+  [[ -n "$job" && "$job" != -* ]] || die "round status requires a job id"
+  [[ $# -eq 1 ]] || die "round status accepts only a job id"
+  local scan
+  scan="$(round_scan "$job")"
+  echo "job=$job cap=$ROUND_CAP_DEFAULT $scan"
+}
+
+round_cmd() {
+  local sub="${1:-}"
+  case "$sub" in
+    -h|--help|"") round_help ;;
+    open) shift; round_open_cmd "$@" ;;
+    verdict) shift; round_verdict_cmd "$@" ;;
+    status) shift; round_status_cmd "$@" ;;
+    *) die "unknown round subcommand '$sub' (see 'wrk round --help')" ;;
+  esac
+}
+
 # herdr 관측 3분류. 확정 소멸(gone)만 job.lost 로 이어지고, 나머지 장애는 일시
 # 장애(transient)로 재시도한다. 빈 출력은 소멸의 증거가 아니다 — 소켓 일시 정지,
 # 서버가 다른 세션에 있는 호스트, 타임아웃 모두 빈 출력을 낸다(2026-09-04: 그날
@@ -5588,6 +6101,7 @@ case "${1:-}" in
   done) shift; done_cmd "$@" ;;
   escalate) shift; escalate_cmd "$@" ;;
   joined) shift; joined_cmd "$@" ;;
+  round) shift; round_cmd "$@" ;;
   sentinel) shift; sentinel_cmd "$@" ;;
   reap) shift; reap_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;

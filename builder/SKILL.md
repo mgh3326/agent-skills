@@ -116,7 +116,18 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
    ("AC 대비 이 head 를 검증하라")만 받은 tester 는 결함 대부분을 놓친다(E7: 확인된 결함 8건 중
    동일 계열 0건·교차 계열 1건 검출). 결함 가설이나 정답을 알려 주라는 뜻은 아니다.
    동일 계열 tester 의 조건은 `spawn-worker` §2-4 조건부 동일 계열 검증이 정본이다.
-4. BLOCKER만 fix 라운드를 연다. 3라운드를 넘기지 않는다.
+4. BLOCKER만 fix 라운드를 연다. **tester 라운드는 `wrk round` 로 연다(#758)** — 검증·재검증
+   지시를 보내기 전에 `wrk round open <job> --head <40-hex sha>` 로 라운드를 열고, tester 의
+   verdict 파일을 받으면 `wrk round verdict <job> --file <path>` 로 기록한다. 한 verdict =
+   한 라운드다. 라운드 수의 정본은 job 의 `events/` 스트림의 `job.round`·`job.verdict` 레코드뿐이다
+   — r5b 같은 하위 라운드 명명은 존재할 수 없고(wrk가 번호를 매긴다), 열린 라운드 없이 기록된
+   verdict 도 자체로 한 라운드로 센다. head 가 바뀌어도 카운트는 리셋되지 않는다.
+   **상한 3라운드에서 `wrk round open`은 rc 78 로 거부되고 head·마지막 verdict·findings 경로를 담은
+   `job.escalate` 가 parent 레인으로 나간다 — 빌더는 그 지점에서 멈추고 상위 결정을 기다린다.**
+   정지는 pane 메시지를 읽는 데 달리지 않고 도구가 강제한다(#745·#746).
+   추가 라운드는 승인 기록이 있을 때만 `wrk round open --extend hk:doc/<key>`·`hk:task/<id>` 로 열린다
+   — 레코드 안에 `round-extension: job=<job> extra=N by=<parent lane|operator>` 줄이 있고 그
+   issuer 가 레코드의 session·author 와 일치해야 하며, 승인 1건의 extra 는 한 번에 1라운드씩 소진된다.
 5. **워커·tester 배치는 `wrk spawn`(hub placement)이 정한다.** 빌더 자신의 머신이 기본값이
    아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
 6. T3 작업을 여러 PR·워커로 나누는 분할 규칙(불변식 표·핵심/주변 경계·NEEDS_CLASSIFICATION·
@@ -330,7 +341,9 @@ shape다. 소비자는 flat completion event를 arbiter envelope이라고 가정
 
 1. 정책 선택이 필요할 때
 2. 레인 계약이 충돌할 때
-3. BLOCKER fix가 3라운드를 초과할 때
+3. BLOCKER fix가 3라운드를 초과할 때 — `wrk round open`의 상한 거부(rc 78)가 자동으로
+   `job.escalate` 를 parent 로 보낸다. 그 뒤 빌더는 멈추고 대기한다. 라운드 카운트는
+   §시작과 브리프 4항의 `wrk round` 계약만이 정본이다.
 4. 시크릿·배포·브로커 접촉이 필요한 때
 5. JOIN 판정이 불확실할 때
 6. 뮤턴트 RED는 assertion 실패일 때만 인정한다. 예외 또는 `IndexError`로 끝난 실행은 유효한
