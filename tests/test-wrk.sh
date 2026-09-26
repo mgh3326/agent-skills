@@ -3481,6 +3481,18 @@ echo "PASS 740 post-738 opus@low + REF is gate-refused not_applicable, verbatim 
 # sonnet@xhigh stays escalation-gated in BOTH gate worlds: marker alone is
 # refused (rc 3), marker + REF is admitted.
 set +e
+e6_sx_def_out="$(SCOPEFUEL_E6_ARM=sonnet@xhigh \
+  spawn_deny "$TMP/herdr-740-sx-def.log" builder-sonnet-xhigh --role builder --lane e6-sxdef-lane --parent parent-lane \
+  --job e6-740-sx-def --t T1 2>&1)"
+e6_sx_def_rc=$?
+set -e
+[[ "$e6_sx_def_rc" -eq 3 ]] ||
+  fail "pre-#738 sonnet@xhigh without REF must stay escalation-denied (rc=$e6_sx_def_rc): $e6_sx_def_out"
+grep -q 'escalation' <<<"$e6_sx_def_out" ||
+  fail "pre-#738 sonnet@xhigh refusal must stay the escalation denial: $e6_sx_def_out"
+[[ ! -e "$TMP/herdr-740-sx-def.log" ]] ||
+  fail "a denied sonnet@xhigh spawn reached Herdr"
+set +e
 e6_738_sx_out="$(SCOPEFUEL_E6_ARM=sonnet@xhigh WRK_GATE_738=1 \
   spawn_deny "$TMP/herdr-740-sx.log" builder-sonnet-xhigh --role builder --lane e6-740sx-lane --parent parent-lane \
   --job e6-740-sx-noref --t T1 2>&1)"
