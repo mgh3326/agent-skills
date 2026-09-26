@@ -133,9 +133,13 @@ FILE_FORBIDDEN = [
      r"(?:통합|결합|합침|병합|머지)[^\n]{0,40}?(?:검증|tester|확인|점검|검토)?[^\n]{0,40}?(?:한 차례|한 번|한번|1회|단 한 번|1패스|한 패스|단일|한 회)[^\n]{0,15}?(?:만[^\n]{0,15}?(?:검증|확인|보고|통과|본다|체크|끝낸다|보면|훑|살피|둘러보|검토|점검|마친|마무리)|(?:검증|확인|보고|통과|체크|훑|살피|둘러보|검토|점검|보고)[^\n]{0,10}?(?:으로\s*끝|까지만|충분|하면\s*된다|끝낸다|마친다|마무리|면면|훑어보면))|(?:한 차례|한 번|한번|1회|단 한 번|1패스|한 패스|단일|한 회)[^\n]{0,15}?(?:검증|확인|보고|통과|본다|"
      r"체크|보면|봐도|훑|살피|둘러보|검토|점검|보고)[^\n]{0,20}?(?:최종\s*)?(?:통합|결합|합침|병합|머지)|(?:통합|결합|합침|병합|머지)[^\n]{0,25}?(?:검증|tester)[^\n]{0,15}?충분(?!하지|하다고|할 리|치 않|기가)|한\s*번[^\n]{0,10}?(?:훑|살피|둘러보|보고|본다|보면|검토|점검|확인|스캔)[^\n]{0,10}?(?:마친|끝|마무리|충분|된다|완료|통과)"),
     ("integration-one-pass-en",
-     r"(?i)(?:final\s+)?(?:integration|merge(?:r|d|s)?|merging|combin\w+|결합|병합|머지|합침|통합)[^\n]{0,45}?(?:(?:only\s+one|\bone\b|single|a\s+single|just\s+one|one-?shot|single-?shot|1(?!\s*차))[^\n]{0,15}?(?:pass|round|look|check|review|verification|glance|peek|once-?over|runthrough|walkthrough|sign[- ]?(?:ed?[-\s]*)?off|signoff|inspection|scrutiny|assessment|audit|examin(?:ation|e)|perusal|scan|survey|sweep|read[- ]through|dry[- ]run|test\b|probe|double[- ]check|skim|browse|approval)|(?:run|look|review|verify|check|use|read|skim|scan|browse)[ -]?once|once\s+only)|(?:only\s+one|\bone\b|single|a\s+single|just\s+one|one-?shot|single-?shot|1(?!\s*차))[^\n]{0,15}?(?:pass|round|look|check|review|verification|glance|peek|once-?over|runthrough|walkthrough|sign[- ]?(?:ed?[-\s]*)?off|signoff|inspection|scrutiny|assessment|audit|examin(?:ation|e)|perusal|scan|survey|sweep|read[- ]through|dry[- ]run|test\b|probe|double[- ]check|skim|browse|approval)[^\n]{0,45}?(?:final\s+)?(?:integration|merge(?:r|d|s)?|merging|combin\w+|결합|병합|머지|합침|통합)"),
+     r"(?i)(?:final\s+)?(?:integration|merge(?:r|d|s)?|merging|combin\w+|결합|병합|머지|합침|통합)[^\n]{0,45}?(?:(?:only\s+one|\bone\b|single|a\s+single|just\s+one|one-?shot|single-?shot|1(?!\s*차))[^\n]{0,15}?(?:pass|round|look|check|review|verification|glance|peek|once-?over|runthrough|walkthrough|sign[- ]?(?:ed?[-\s]*)?off|signoff|inspection|scrutiny|assessment|audit|examin(?:ation|e)|perusal|scan|survey|sweep|read[- ]through|dry[- ]run|test\b|probe|double[- ]check|skim|browse|approval)|(?:run|look|review|verify|check|use|read|skim|scan|browse)[ -]?once|once\s+only)|(?:only\s+one|"
+     r"\bone\b|single|a\s+single|just\s+one|one-?shot|single-?shot|1(?!\s*차))[^\n]{0,15}?(?:pass|round|look|check|review|verification|glance|peek|once-?over|runthrough|walkthrough|sign[- ]?(?:ed?[-\s]*)?off|signoff|inspection|scrutiny|assessment|audit|examin(?:ation|e)|perusal|scan|survey|sweep|read[- ]through|dry[- ]run|test\b|probe|double[- ]check|skim|browse|approval)[^\n]{0,45}?(?:final\s+)?(?:integration|merge(?:r|d|s)?|merging|combin\w+|결합|병합|머지|합침|통합)"),
     ("integration-cap-numeric",
-     r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:cap|캡|상한)[^\n]{0,8}?[:=]?\s*1\b"),
+     r"(?i)(?:final\s+)?(?:integration|merge(?:r|d|s)?|merging|combin\w+|결합|병합|머지|합침|통합)[^\n]{0,45}?(?:(?:cap\w*|limit\w*|ceil\w*|restrict\w*|confine\w*|상한|캡|제한|둔다|정한|고정|끝|충분|enough|suffic\w*)[^\n]{0,20}?(?:[12]|one|two|한|두|단일|single|couple(?:\s+of)?|pair(?:\s+of)?)\s*(?:passes?|rounds?|회|차례|패스|라운드|번|looks?|reviews?|checks?|sign[- ]?offs?)|(?:[12]|one|two|한|두|단일|single|couple(?:\s+of)?|pair(?:\s+of)?)\s*(?:passes?|rounds?|회|차례|패스|라운드|번|looks?|reviews?|checks?|sign[- ]?offs?)[^\n]{0,20}?(?:cap\w*|limit\w*|ceil\w*|상한|캡|제한|둔다|정한|고정|끝|충분|enough|suffic\w*))"),
+    ("verdict-inherit-after-change",
+     r"(?i)(?:previous|prior|old|earlier|parent|pre[- ]?squash|original|existing|stale|기존|이전|부모)[^\n]{0,25}?(?:sign[- ]?(?:ed?[-\s]*)?off|approval|verdict|review|verification|PASS|accept\w*|승인|판정|검증|통과|결과|허가)[^\n]{0,25}?(?:substitut\w*|inherit\w*|replac\w*|suffic\w*|enough|stands?|holds?|appl\w*|carr\w*|counts?|serves?|acts?|works?|covers?|instead|in\s+(?:its|their|the)\s+place|갈음|대신|대체|승계|계승|유효|충분|그대로)[^\n]{0,30}?(?:head|revision|commit|merged|amended|squashed|new|changed|fresh|updated|커밋|변경|수정|머지|병합|"
+     r"리비전)|(?:squash\w*|amend\w*|rebas\w*|rewrit\w*|revis\w*|force[- ]?push|patch|updat\w*|스쿼시|어?멘드|개정)[^\n]{0,30}?(?:commits?|head|revision|커밋)[^\n]{0,20}?(?:inherit\w*|substitut\w*|replac\w*|keep\w*|reuse|re-?use|carr\w*|retain\w*|hold\w*|stand\w*|suffic\w*|enough|갈음|대신|대체|승계|계승|유지|그대로|충분)[^\n]{0,25}?(?:verification|verdict|review|approval|sign[- ]?(?:ed?[-\s]*)?off|PASS|accept\w*|판정|검증|승인|통과|결과)"),
     ("integration-skipped",
      r"(?i)(?:최종\s*)?통합[^\n]{0,25}?(?:tester|검증)[^\n]{0,12}?(?:없이|생략|불필요|제외|건너)|머지[^\n]{0,15}?(?:없이|생략)[^\n]{0,10}?(?:검증|tester)|(?:merge|merging)[^\n]{0,15}?(?:without|skip\w*|omit\w*)[^\n]{0,10}?(?:verif\w*|tester|check)|(?:final\s+)?(?:integration|merge(?:r|d|s)?|merging|combin\w+|결합|병합|머지|합침|통합)[^\n]{0,30}?(?:tester[- ]?(?:free|less)|without\s+(?:an?\s+)?(?:independent\s+|cross[- ]family\s+)?tester|no\s+tester)|verdict[^\n]{0,15}?(?:유효|valid|재사용|그대로)[^\n]{0,10}?(?:수정|바뀐|새|patched|changed|new|updated)\s+head|(?:old|previous|prior|stale|earlier|existing|same|preceding|기존|이전)[^\n]{0,10}?(?:verdict|PASS|review|check|"
      r"verification|sign[- ]?(?:ed?[-\s]*)?off|approval|accept\w*|승인|판정|결과|허가|통과)[^\n]{0,15}?(?:still|remains?|stays?|valid|count\w*|reuse|carry|carries|applies|suffic\w*|enough|stands|holds|in\s+force|in\s+effect|rolls?\s+over|persists?|갈음|대체|그대로|사용|이용|쓴|삼|충분|유효)"),
@@ -149,8 +153,9 @@ FILE_FORBIDDEN = [
      r"점검|재검)|(?:새|수정된?|바뀐|패치된?)\s*(?:head|커밋|commit)[^\n]{0,20}?(?:기존|이전)[^\n]{0,10}?(?:승인|판정|결과|검증|확인|허가|통과)[^\n]{0,10}?(?:갈음|대체|충분|유효|그대로|사용|이용|쓴|삼)"),
     ("ambiguous-lower-t-alt",
      r"(?i)(?:애매|모호|불명확|불확실|미분류|미정|모른|알 수 없|정해지지 않|경계가|분류 불가|unclear|unclassified|ambiguous|uncertain|unsure|undecided|undetermined|indeterminate|unsettled|unresolved|unknown|vague|fuzzy|hazy|iffy|open[- ]ended|undefined|unset|questionable|borderline|tentative|murky|cloudy|obscure|muddled|gray|grey|nebulous|unpinned|loose|opaque|doubtful|dubious|shaky|in[- ]between|limbo|unscoped|unbounded|untriaged|unsorted|unfiled|uncategorized|contested|disputed|arguable|moot|판단 불가|결정 불가|흐리|곤란|불명|미상|불분명|헷갈|불투명|그레이|회색|어중간|판단 어려|"
-     r"판별 불가|경계 불명|(?:cannot|can't|unable|hard|difficult)[^\n]{0,15}?(?:decide|determine|classify|scope|boundar|resolve))[^\n]{0,30}?(?:(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|착수|진입|투입|돌입|배치|할당|start|run|assign|dispatch|handle|processing|work|enter|go|land|fall|drop|move|shift|place|put|set|slot|park|feed|throw|pass|delegate|push|offload|execute|process|perform)(?!하지)|(?:start|begin|run|assign|dispatch|handle|send|route|enter|go|land|fall|drop|move|shift|place|put|set|slot|park|feed|throw|pass|delegate|push|offload|execute|process|"
-     r"perform)[^\n]{0,10}?(?:at|as|to|into|on|in)\s*(?:T0|T1|T2|lower\s*T|low[- ]?tier|저급|하급|싼|저렴|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|minor|가벼운|경량|auxiliary|secondary|bottom|intern|apprentice|rookie|novice|staff|personnel|보조|부수))"),
+     r"판별 불가|경계 불명|adjudicat\w*|unadjudicat\w*|not\s+yet\s+(?:adjudicat\w*|decid\w*|determin\w*|settled|resolv\w*|classif\w*|sort\w*|triag\w*)|TBD|to\s+be\s+(?:decid\w*|determin\w*|resolv\w*|classif\w*|sort\w*|triag\w*)|미결|판정\s*전|미확정|정해지지\s*않은|(?:cannot|can't|unable|hard|difficult)[^\n]{0,15}?(?:decide|determine|classify|scope|boundar|resolve))[^\n]{0,30}?(?:(?:T0|T1|T2|tier[ -]?(?:zero|one|two|three|[0-3])|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|착수|진입|투입|돌입|배치|할당|넣|넣는|집어|태우|올리|밀어|던지|start|run|"
+     r"assign|dispatch|handle|processing|work|enter|go|land|fall|drop|move|shift|place|put|set|slot|park|feed|throw|pass|delegate|push|offload|execute|process|perform|queu\w*|enqueu\w*|rout\w*|shelv\w*)(?!하지)|(?:start|begin|run|assign|dispatch|handle|send|route|enter|go|land|fall|drop|move|shift|place|put|set|slot|park|feed|throw|pass|delegate|push|offload|execute|process|"
+     r"perform|queu\w*|enqueu\w*|rout\w*|shelv\w*)[^\n]{0,16}?(?:at|as|to|into|on|in)\s*(?:the\s+|a\s+)?(?:T0|T1|T2|tier[ -]?(?:zero|one|two|three|[0-3])|lower\s*T|low[- ]?tier|저급|하급|싼|저렴|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|minor|가벼운|경량|auxiliary|secondary|bottom|intern|apprentice|rookie|novice|staff|personnel|보조|부수|trainee|clerical|housekeeping|provisionally|pending))"),
     ("ambiguous-posthoc-classify",
      r"(?i)(?:애매|모호|불명확|불확실|미분류|미정|경계 작업|경계 불명|불명|미상|ambiguous|unclear|uncertain|unsure|undecided|undetermined|unsettled|unresolved|unknown)[^\n]{0,40}?(?:(?:사후|나중에?|추후|뒤에?|후에|이후|afterwards?|later|after|following|pending|awaiting|until|till|while|대기|보류|유보)[^\n]{0,10}?(?:분류|재분류|classif|triage|categoriz|sort|tag|grade|label|file|bucket|bracket|정리|판별|분별|분류 대기)|(?:분류|재분류|classif\w*|triage|categoriz|sort|tag|grade|label|file|bucket|bracket|정리|판별|분별|분류 대기)[^\n]{0,10}?(?:사후|나중에|추후|뒤에|"
      r"후에|이후|afterwards?|later|after|following|pending|awaiting|대기|보류|유보)|(?:defer\w*|postpone\w*|delay\w*|put\s+off|pend\w*|hold\w*|shelv\w*|tabl\w*|stall\w*|미뤄|미룬|늦추|연기|보류|유보|대기)[^\n]{0,15}?(?:분류|재분류|classif|triage|categoriz|정리|판별|분별)|(?:pending|awaiting|until|till|while|대기 상태로|보류|유보)[^\n]{0,10}?(?:triage|classification|classif|categoriz|sort|분류|정리|판별|분별|분류 대기)|(?:enter\w*|join\w*|hit\w*|reach\w*|land\w*|drop\w*|slide\w*|fall\w*|착수|진입|투입|돌입)[^\n]{0,5}?(?:into\s+|in\s+|to\s+|at\s+|on\s+)?\s*(?:the\s+|a\s+)?(?:T0|T1|T2|"
@@ -158,13 +163,17 @@ FILE_FORBIDDEN = [
     ("lower-t-then-classify",
      r"(?i)(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|run|start|assign|dispatch|handle|processing|work)[^\n]{0,25}?(?:사후|나중에|추후|뒤에|후에|이후|afterwards?|later|after|following)[^\n]{0,15}?(?:애매|모호|경계|분류|classif|ambiguous|unclear|uncertain|boundary|triage|sort|categoriz|정리)|(?:T0|T1|T2|lower\s*T)[^\n]{0,15}?(?:processing|work|execution|run|start|시작|실행|처리|돌리|맡기|배정|넘기|보낸|보냄|assign|dispatch|handle)[^\n]{0,25}?(?:before|prior|ahead|전에|앞서|먼저)[^\n]{0,15}?(?:uncertainty|ambiguity|boundary|classification|"
      r"scope|애매|모호|경계|분류|triage|sort|categoriz|정리)[^\n]{0,15}?(?:resolved|decided|determined|settled|classified|정해|분류|해결|postponed|deferred|delayed|미뤄)|(?:run|start|begin|assign|dispatch|handle|실행|처리|배정|돌리|맡기|넘기|시작)[^\n]{0,10}?(?:at|as|to|into|on)\s*(?:T0|T1|T2|lower\s*T)[^\n]{0,20}?(?:before|prior|ahead|전에|앞서|먼저)[^\n]{0,10}?(?:triage|classification|classif|sort|categoriz|분류|정리)|(?:T0|T1|T2|lower\s*T)[^\n]{0,15}?(?:execution|work|run|실행|처리)[^\n]{0,15}?(?:first|먼저|우선)[^\n]{0,20}?(?:triage|classification|classif|sort|categoriz|분류|"
-     r"정리)[^\n]{0,15}?(?:postponed|deferred|delayed|later|나중|미뤄)"),
+     r"정리)[^\n]{0,15}?(?:postponed|deferred|delayed|later|나중|미뤄)|(?:classif\w*|triage|sort\w*|categoriz|분류|정리)[^\n]{0,30}?(?:after|following|once|post[- ]?|후에|뒤에|이후|나중)[^\n]{0,20}?(?:assign\w*|rout\w*|send|put|place|slot|queu\w*|enqueu\w*|dispatch\w*|hand\w*|delegat\w*|push|drop|dump|mov\w*|shift|park|feed|throw|shelv\w*)[^\n]{0,15}?(?:at|as|to|into|on|in)?\s*(?:the\s+|a\s+)?(?:T0|T1|T2|tier[ -]?(?:zero|one|two|three|[0-3])|lower\s*T|low[- ]?tier|낮은\s*T|junior|entry[- ]level|inexpensive|low[- ]cost|저급|하급|싼|저렴|보조|부수)|(?:assign\w*|rout\w*|"
+     r"send|put|place|slot|queu\w*|enqueu\w*|dispatch\w*|delegat\w*|shelv\w*|park)[^\n]{0,16}?(?:at|as|to|into|on|in)?\s*(?:the\s+|a\s+)?(?:T0|T1|T2|tier[ -]?(?:zero|one|two|three|[0-3])|lower\s*T|low[- ]?tier|low[- ]cost|junior|entry[- ]level|inexpensive|낮은\s*T|저급|하급|싼|저렴|보조|부수)[^\n]{0,15}?(?:before|prior|ahead|전에|앞서|먼저)[^\n]{0,10}?(?:triage|classification|classif|sort\w*|categoriz|분류|정리|판별|분별)"),
     ("core-class-lower-t",
      r"(?i)(?:안전 DB|안전 제약|에러 경로|에러 처리|예외 경계|lock[-/\s](?:and\s+)?transaction|상태/DB/예외 경계|가드 배선|가드 인자|가드 호출|가드 인수|가드 매개|가드 파라미터|가드 순서|가드 호출부|가드 동작|가드 로직|guard\s+(?:wiring|call|arg|param\w*|order|sequenc\w*|invocation\w*|config\w*|setting\w*|behaviou?r|hook\w*|check\w*|logic|code|path|site|policy|rule|chain|set)\w*|safety[-\s]db|safety[-\s]constraint|safety[-\s]invariant|database\s+constraints?|db\s+constraints?|데이터베이스\s*제약|invariant|order[-\s]integrity|integrity|정합|무결성|accounting|ledger|"
      r"balance|원장|장부|core\s+safety|error[-\s]path|error[-\s]handling|error[-\s]recovery|exception[-\s]boundary|exception[-\s]propagat\w*|exception[-\s]flow|exception[-\s]recovery|failure[-\s]recovery|failure[-\s]path|failure[-\s]handling|recovery|복구|rollback|롤백|return[-\s](?:check|value|valid\w*|code)|exit[-\s]code|status[-\s]check|반환값|리턴|종료\s*코드|transaction|tx\b|lock(?:s|ing)?\b|mutex|semaphore|critical[-\s]section|isolation[-\s]level|트랜잭션|락|잠금|임계|크리티컬|atomic|원자|persist\w*[-\s]?(?:state|data)|state[-\s]transition|transition\b|seam|이음|경계\s*심|영속|저장\s*경계|"
-     r"safe\s+accounting|transaction\s+lifetime|lock/tx|lock-tx|state[-/\s]boundary|db[-/\s]boundary|state[-/\s]exception|가드 설정|state/db)[^\n]{0,35}?(?:(?:T0|T1|T2|낮은 T|lower\s*T|low[- ]?tier|주변|periph\w*|cheap\w*|cosmetic|janitorial|routine|mechanical|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|staff|personnel|grunt|scut|busywork|chore|auxiliary|secondary|보조|부수|잡무|단순|청소|싼|저렴|하급|초급|주변부|가장자리)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼|취급|간주|본다|여긴다|핫픽스|작업|분류|넘긴다|보낸다|업무|워커|레인|peripheral|worker|assign|"
-     r"task|work\b|run|hotfix|handle|treat|mark|glue|pool|tier|lane\b|queue|track\b|stream|maintenance|cleanup|cosmetic|mechanical|janitorial|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|staff|personnel|intern\b|apprentice|rookie|novice|chore|grunt|scut|busywork|routine|upkeep|misc|leftover|adjust\w*|tweak\w*|alter\w*|delegate\w*|offload|outsource|farm\w*|분담|하청|외주|잡무|청소|초급|주니어|concern|matter|issue|item|detail|aspect|topic|question|관심|사안|항목|change|make|edit|modify|own|take|do)|(?:assign\w*|rout\w*|send|dispatch\w*|delegat\w*|hand\w*|put|treat|mark|go\w*|move|dump|lump|offload|outsource|farm\w*|adjust\w*|tweak\w*|alter\w*|"
-     r"맡긴다|보낸다|넘긴다|배정|돌리|위임)[^\n]{0,10}?(?:at|as|to|into|on|in|by|에게|에|로)\s*(?:the\s+|a\s+)?(?:T0|T1|T2|낮은\s*T|lower\s*T|low[- ]?tier|주변|periph\w*|cheap|pool|tier|glue|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|staff|personnel|intern\b|apprentice|rookie|novice|lane\b|queue|track\b|stream|band|maintenance|cosmetic|routine|janitorial|chore|cleanup|주니어|초급|잡무|청소|보조|부수|저렴|싼|하급|가벼운|경량))"),
+     r"safe\s+accounting|transaction\s+lifetime|lock/tx|lock-tx|state[-/\s]boundary|db[-/\s]boundary|state[-/\s]exception|가드 설정|state/db|authorization[-\s]gate|access[-\s]control|authorization|authenticat\w*|permission[-\s]boundary|auth[-\s]boundary|authz|authn|인가|권한\s*경계|접근\s*제어|invocation|invok\w+|호출\s*인자|retry|retr\w+|재시도|failed\s+(?:write|persist|commit|save)|write\s+failure|failed\s+writes?|쓰기\s*실패|unlock|un-?lock|해제|compensation|post[-\s]?write|보상|schema|UNIQUE|CHECK\s+constraint|safety[-\s]schema|스키마|semantics?|commit/rollback|"
+     r"hold\s+duration|open[-\s]to[-\s]commit)[^\n]{0,45}?(?:(?:T0|T1|T2|낮은 T|lower\s*T|low[- ]?tier|주변|periph\w*|cheap\w*|cosmetic|janitorial|routine|mechanical|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|staff|personnel|grunt|scut|busywork|chore|auxiliary|secondary|clerical|housekeeping|apprenticeship|trainee|clerk|사무|심부름|서류|보조|부수|잡무|단순|청소|싼|저렴|하급|초급|주변부|가장자리)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼|취급|간주|본다|여긴다|핫픽스|작업|분류|넘긴다|보낸다|업무|워커|레인|"
+     r"peripheral|worker|assign|"
+     r"task|work\b|run|hotfix|handle|treat|mark|glue|pool|tier|lane\b|queue|track\b|stream|maintenance|cleanup|cosmetic|mechanical|janitorial|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|staff|personnel|interns?|apprentices?|trainee|rookie|novice|chore|grunt|scut|busywork|routine|upkeep|misc|leftover|adjust\w*|tweak\w*|alter\w*|delegate\w*|offload|outsource|farm\w*|분담|하청|외주|잡무|청소|초급|주니어|concern|matter|issue|item|detail|aspect|topic|question|관심|사안|항목|change|make|edit|modify|own|take|do)|(?:assign\w*|rout\w*|send|dispatch\w*|delegat\w*|hand\w*|put|treat|mark|go\w*|move|dump|lump|offload|outsource|farm\w*|belong\w*|fall\w*|land\w*|adjust\w*|tweak\w*|alter\w*|"
+     r"맡긴다|보낸다|넘긴다|배정|돌리|위임)[^\n]{0,10}?(?:at|as|to|into|on|in|by|에게|에|로)\s*(?:the\s+|a\s+)?(?:T0|T1|T2|낮은\s*T|lower\s*T|low[- ]?tier|주변|periph\w*|cheap|pool|tier|glue|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|staff|personnel|interns?|apprentices?|trainee|rookie|novice|lane\b|queue|track\b|stream|band|maintenance|cosmetic|routine|janitorial|chore|cleanup|clerical|housekeeping|주니어|초급|잡무|청소|보조|부수|저렴|싼|하급|가벼운|경량)|(?:is|are|be|remains?|stays?|counts?\s+as|qualif\w*\s+as|classified\s+as|"
+     r"regarded\s+as|consider\w*|treated\s+as|deemed|label\w*\s+as|tagged\s+as|filed\s+as|booked\s+as|logged\s+as|간주|취급|여긴다?|본다)[^\n]{0,10}?(?:a\s+|an\s+|the\s+|just\s+|mere\w*\s+)?(?:periph\w*|cheap\w*|cosmetic|janitorial|routine|mechanical|junior|entry[- ]level|inexpensive|low[- ]cost|low[- ]skill|clerical|housekeeping|apprenticeship|busywork|chore|grunt|scut|auxiliary|secondary|misc|maintenance|cleanup|custodial|menial|drudge|grunt|보조|부수|잡무|단순|청소|싼|저렴|하급|초급|주변|가벼운|경량|사무|심부름)\b)"),
     ("lower-t-first-core",
      r"(?i)(?:T0|T1|T2|낮은 T|lower\s*T|lower[- ]tier|low[- ]?tier|주변|periph\w*|cheap\w*|low[- ]cost|저비용|junior|entry[- ]level|inexpensive|low[- ]skill|staff|personnel|intern\b|apprentice|rookie|novice|cosmetic|janitorial|routine|mechanical|auxiliary|secondary|보조|부수|잡무|단순|싼|저렴|하급|초급|주니어|가벼운|경량)[^\n]{0,12}?(?:워커|worker|모델|작업|task|tier|pool|owner|work\b|lane\b|queue|track\b|stream|assign\w*|send|route|dispatch\w*|hand\w*|giv\w*|put|own\w*|take\w*|handle\w*|do\w*|make|change\w*|edit\w*|modify\w*|adjust\w*|tweak\w*|alter\w*|delegate\w*|offload|outsource|farm\w*|chore|maintenance|"
      r"cleanup|cosmetic|misc)[^\n]{0,25}?(?:안전 DB|안전 제약|에러 경로|에러 처리|예외 경계|lock[-/\s]|lock\b|가드 배선|가드 인자|가드 호출|가드 인수|가드 매개|가드 파라미터|가드 순서|가드 호출부|가드 동작|가드 로직|guard|core|핵심|상태/DB|safety|error|exception|boundary|wiring|constraint|invariant|integrity|accounting|ledger|transaction|recovery|transition|seam|persist\w*|rollback|atomic|argument|parameter|invocation|sequenc|database|return[-\s]|반환값|원장|장부|무결성|정합|복구|롤백|트랜잭션|잠금|이음|영속)"),
@@ -173,8 +182,10 @@ FILE_FORBIDDEN = [
     ("periph-core-merge-anyway",
      r"(?:주변 PR|주변 작업)[^\n]{0,30}?(?:핵심|core|가드|안전)[^\n]{0,30}?(?:그대로|낮은 T|T0|T1|T2)[^\n]{0,15}?(?:머지|유지|통과|진행|실행|둔다|두고|넘긴다)"),
     ("periph-core-no-reclassify",
-     r"(?i)(?:주변 PR|주변 작업|주변\s*(?:diff|변경)|peripheral\s+(?:PR|work|change|patch|diff))[^\n]{0,30}?(?:핵심|core|가드|안전|guard|seam|invariant|integrity|constraint|touch\w*|건드리|건드려|slip\w*|sneak\w*|leak\w*|creep\w*|affect\w*|hit|contain\w*|includ\w*|carries|holds|has|involv\w*|implicat\w*|drift)[^\n]{0,30}?(?:재분류하지|재분류\s*없|안\s*재분류|재분류[^\n]{0,3}?않|not\s+be\s+reclassif|remain\w*[^\n]{0,10}?peripheral|stay\w*[^\n]{0,10}?peripheral|no[^\n]{0,5}?(?:reclassif|re-?scope|re-?bucket|re-?tier|re-?slice|re-?route|re-?grade|re-?rate|re-?class|re-?file|re-?tag|re-?label|re-?band|re-?categoriz|re-?sort|promot\w*|elevat\w*|"
-     r"escalat\w*|upgrad\w*|bump|raise)|without[^\n]{0,10}?(?:reclassif|re-?scope|promot\w*|escalat\w*|upgrad\w*)|exempt\w*[^\n]{0,10}?(?:from\s+)?(?:reclassif|promot\w*|escalat\w*)|(?:retain|keep|stay|remain|hold|stick\w*|sit|cling|rest|persist|linger|유지|머물|남|그대로|두고|둔다)[^\n]{0,15}?(?:original|same|current|lower|assigned|initial|first|existing|its|their|기존)[^\n]{0,10}?(?:tier|grade|classif|T0|T1|T2|band|level|class|bucket|bracket|categor\w*|label|tag|등급|클래스|레벨|버킷|라벨))|(?:핵심|core|안전|가드)[^\n]{0,20}?(?:slip\w*|sneak\w*|leak\w*|creep\w*|touch\w*|end\w*|land\w*|enter\w*)[^\n]{0,15}?(?:into|in|to|onto|"
+     r"(?i)(?:주변 PR|주변 작업|주변\s*(?:diff|변경|패치)|peripheral\s+(?:PR|work|change|patch|diff)|(?:cosmetic\w*|view|display|surface|render\w*|ui|screen|layout|typography|visual)[-\s]+(?:PR|patch|work|change|diff|edit|job|task|fix))[^\n]{0,30}?(?:핵심|core|가드|안전|guard|seam|invariant|integrity|constraint|boundary|permission|authoriz|ledger|touch\w*|건드리|건드려|slip\w*|sneak\w*|leak\w*|creep\w*|affect\w*|hit|contain\w*|includ\w*|incorporat\w*|carries|holds|has|involv\w*|implicat\w*|drift|cross\w*|span\w*|acquir\w*|gain\w*|absorb\w*|enter\w*|"
+     r"reach\w*)[^\n]{0,30}?(?:재분류하지|재분류\s*없|안\s*재분류|재분류[^\n]{0,3}?않|not\s+be\s+reclassif|remain\w*[^\n]{0,10}?peripheral|stay\w*[^\n]{0,10}?peripheral|no[^\n]{0,5}?(?:reclassif|re-?scope|re-?bucket|re-?tier|re-?slice|re-?route|re-?grade|re-?rate|re-?class|re-?file|re-?tag|re-?label|re-?band|re-?categoriz|re-?sort|promot\w*|elevat\w*|"
+     r"escalat\w*|upgrad\w*|bump|raise)|without[^\n]{0,10}?(?:reclassif|re-?scope|promot\w*|escalat\w*|upgrad\w*)|exempt\w*[^\n]{0,10}?(?:from\s+)?(?:reclassif|promot\w*|escalat\w*)|(?:retain|keep|stay|remain|hold|leave|let|maintain|stick\w*|sit|cling|rest|persist|linger|유지|머물|남|그대로|두고|둔다)[^\n]{0,15}?(?:original|same|current|lower|assigned|initial|first|existing|its|their|기존)[^\n]{0,20}?(?:tier|grade|classif|T0|T1|T2|band|level|class|bucket|bracket|categor\w*|label|tag|severit\w*|criticalit\w*|priorit\w*|등급|클래스|레벨|버킷|라벨)|(?:leave|let|keep|hold|"
+     r"maintain)[^\n]{0,10}?(?:its|their|the|own)[^\n]{0,15}?(?:classif\w*|tier|grade|band|bucket|level|label|tag|severit\w*|분류|등급)[^\n]{0,12}?(?:untouched|unchanged|unmodified|unaltered|intact|as[-\s]is|그대로|유지))|(?:핵심|core|안전|가드)[^\n]{0,20}?(?:slip\w*|sneak\w*|leak\w*|creep\w*|touch\w*|end\w*|land\w*|enter\w*)[^\n]{0,15}?(?:into|in|to|onto|"
      r"within)[^\n]{0,15}?(?:peripheral\s+(?:PR|work|change|patch)|주변\s*(?:PR|작업))[^\n]{0,25}?(?:retain|keep|stay|remain|hold|no|without|skip|not|exempt)[^\n]{0,15}?(?:original\s+|same\s+|assigned\s+)?(?:tier|grade|reclassif)"),
 ]
 
@@ -347,6 +358,21 @@ RULE_PHRASES_NOT_COPIED = [
     "표면 작업",
     "미화",
     "청소 작업",
+    "layout",
+    "typography",
+    "budget pool",
+    "request/response",
+    "adapter",
+    "outcomes are fixed",
+    "delegated when",
+    "qualify for the budget",
+    "stable request",
+    "조회 전용",
+    "명령행",
+    "저비용 모델",
+    "업무로 뗄",
+    "뗄 수",
+    "저비용 모델 업무",
 ]
 
 PINNED_SKILLS = (
@@ -1024,6 +1050,100 @@ mutants["builder-core-lower-t"] = append(
 )
 mutants["spawn-ambiguous-run"] = append(
     "spawn", "판정이 애매하면 낮은 T로 실행한다."
+)
+# R10 tester findings verbatim — numeric caps, verdict inheritance,
+# adjudication/TBD ambiguity, tier-spelled routing, junior/maintenance
+# class words, cosmetics/view reclassification, pointer paraphrases.
+mutants["spawn-integration-two-pass-cap-en"] = append(
+    "spawn", "The final integration review is capped at 2 passes."
+)
+mutants["spawn-integration-two-times-cap-ko"] = append(
+    "spawn", "최종 통합 검증 상한은 2회로 둔다."
+)
+mutants["spawn-squash-signoff-substitutes-en"] = append(
+    "spawn", "After a squash, the previous sign-off substitutes for reviewing the merged head."
+)
+mutants["spawn-amended-commits-inherit-en"] = append(
+    "spawn", "Amended commits inherit the parent revision's verification."
+)
+mutants["spawn-unadjudicated-t1-pending-triage-en"] = append(
+    "spawn", "If impact is not yet adjudicated, route the task into T1 pending later triage."
+)
+mutants["spawn-fuzzy-after-tier-one-en"] = append(
+    "spawn", "Classify the fuzzy item after assigning it to Tier One."
+)
+mutants["spawn-tbd-queued-provisionally-en"] = append(
+    "spawn", "A TBD boundary may be queued provisionally on the low-cost lane before sorting."
+)
+mutants["spawn-authz-param-apprenticeship-en"] = append(
+    "spawn", "Authorization-gate parameter binding is apprenticeship work."
+)
+mutants["spawn-invocation-access-control-junior-en"] = append(
+    "spawn", "Invocation argument wiring for the access-control gate is a junior chore."
+)
+mutants["spawn-safety-schema-routine-maint-en"] = append(
+    "spawn", "A safety schema's UNIQUE rule is classified as routine maintenance."
+)
+mutants["spawn-retry-failed-writes-interns-en"] = append(
+    "spawn", "Retry-and-cleanup behavior for failed writes goes to interns."
+)
+mutants["spawn-unlock-sequencing-housekeeping-en"] = append(
+    "spawn", "Exception-time unlock sequencing is housekeeping."
+)
+mutants["spawn-mutex-hold-clerical-en"] = append(
+    "spawn", "Mutex hold duration is a clerical issue."
+)
+mutants["spawn-tx-interval-apprentices-en"] = append(
+    "spawn", "The transaction open-to-commit interval belongs to apprentices."
+)
+mutants["spawn-atomic-rollback-busywork-en"] = append(
+    "spawn", "Atomic commit/rollback semantics are busywork."
+)
+mutants["spawn-state-transition-trainee-en"] = append(
+    "spawn", "A state transition across persistence and thrown errors can go to a trainee."
+)
+mutants["spawn-compensation-junior-cleanup-en"] = append(
+    "spawn", "Post-write compensation is a junior cleanup issue."
+)
+mutants["spawn-cosmetics-ledger-severity-bucket-en"] = append(
+    "spawn", "A cosmetics patch that incorporates a ledger invariant keeps its original severity bucket."
+)
+mutants["spawn-view-pr-permission-untouched-en"] = append(
+    "spawn", "When a view PR crosses into a permission boundary, leave its classification untouched."
+)
+mutants["builder-layout-budget-pool-en"] = append(
+    "builder", "Pure layout and typography edits qualify for the budget pool."
+)
+mutants["director-stable-adapters-delegated-en"] = append(
+    "director", "Stable request/response adapters can be delegated when all outcomes are fixed."
+)
+mutants["director-readonly-cli-lowcost-ko"] = append(
+    "director", "조회 전용 API의 명령행 결과는 저비용 모델 업무로 뗄 수 있다."
+)
+# Preemptive same-class variants.
+mutants["spawn-integration-couple-rounds-en"] = append(
+    "spawn", "The integration merge is limited to a couple of rounds."
+)
+mutants["spawn-rebased-head-prior-verdict-en"] = append(
+    "spawn", "A rebased head keeps the earlier verdict; the changed revision needs no fresh review."
+)
+mutants["spawn-to-be-determined-low-tier-en"] = append(
+    "spawn", "Work whose boundary is still to be determined can start in the low tier while sorting waits."
+)
+mutants["spawn-miseong-t1-migyeol-ko"] = append(
+    "spawn", "경계 미정 작업은 분류 전에 T1 큐에 넣는다."
+)
+mutants["spawn-guard-retry-clerical-en"] = append(
+    "spawn", "Guard-call retry handling is clerical."
+)
+mutants["spawn-persist-compensation-menial-en"] = append(
+    "spawn", "Persistence compensation and rollback paths count as menial cleanup."
+)
+mutants["spawn-display-diff-invariant-persist-en"] = append(
+    "spawn", "A display diff that absorbs a state invariant may keep its original grade."
+)
+mutants["builder-typography-pool-en"] = append(
+    "builder", "Typography-only deltas qualify for the budget pool."
 )
 # A broken pin must fail closed.
 mutants["policy-pin-broken"] = mutate(
