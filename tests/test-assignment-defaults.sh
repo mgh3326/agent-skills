@@ -300,6 +300,29 @@ def check(d: dict) -> None:
     assert '"xhigh", "max", "ultra", "off", "on"' in wrk, (
         "wrk: the kimi resolver must bound the env overlay to documented rung spellings"
     )
+    # CodeRabbit #153: with no readable config the env value alone resolves —
+    # it must be bounded and normalized like the real parse or MAX bypasses
+    # the case-sensitive seat match; the E6 pinned clone must exist before
+    # its effort is compared (the env overlay cannot stand in for it); and
+    # the awk overrides strip must anchor at the suffix, not eat the model
+    # id's closing quote.
+    assert re.search(
+        r'! -r "\$cfg".{0,600}?tr .\[:upper:\]. .\[:lower:\].',
+        wrk,
+    ), "wrk: the no-config env path must normalize the effort value"
+    assert 'minimal|low|medium|high|xhigh|max|ultra|off|on) printf' in wrk, (
+        "wrk: the no-config env path must bound the effort value to documented rungs"
+    )
+    assert 'printf \'%s\\n\' "$norm"' in wrk, (
+        "wrk: the no-config env path must print the normalized value, not the raw env"
+    )
+    assert re.search(
+        r'-r "\$KIMI_TRUST_HOME/config\.toml".{0,200}?config\.toml missing',
+        wrk,
+    ), "wrk: the E6 pinned kimi clone must fail closed on a missing config.toml"
+    assert 'sub(/\\.overrides$/, "", mh)' in wrk, (
+        "wrk: the awk overrides strip must anchor at the suffix, not eat the closing quote"
+    )
     assert re.search(
         r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6-sol;\s*DEFAULT_EFFORT=high",
         wrk,
@@ -605,6 +628,30 @@ mutants["wrk-seat-rule-off-ignored"] = mutate(
     "wrk",
     'if effort == "off" and not always:',
     "if False:",
+)
+# CodeRabbit #153: an unbounded env passthrough on the no-config path, an env
+# stand-in for a missing pinned clone, and a quote-eating overrides strip
+# each reopen a refusal path the tester or reviewer already demonstrated.
+mutants["wrk-seat-rule-env-unbounded-nocfg"] = mutate(
+    "wrk",
+    "minimal|low|medium|high|xhigh|max|ultra|off|on",
+    "minimal|low|medium|high",
+)
+mutants["wrk-e6-clone-env-standin"] = mutate(
+    "wrk",
+    '      [[ -r "$KIMI_TRUST_HOME/config.toml" ]] ||\n'
+    '        die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (config.toml missing); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"\n',
+    "",
+)
+mutants["wrk-seat-rule-env-raw-nocfg"] = mutate(
+    "wrk",
+    'printf \'%s\\n\' "$norm"',
+    'printf \'%s\\n\' "$env_eff"',
+)
+mutants["wrk-seat-rule-awk-overrides-quote"] = mutate(
+    "wrk",
+    'sub(/\\.overrides$/, "", mh)',
+    'sub(/[."]?\\.overrides.*$/, "", mh)',
 )
 # #748: the stale "marked rung needs a REF" claim must go RED in every
 # scanned doc; dropping the corrected wording goes RED via the required row.

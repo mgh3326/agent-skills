@@ -852,13 +852,23 @@ kimi_clone_thinking_effort() {
 # config.toml is real TOML — dotted keys, inline tables, string escapes,
 # multiline strings and indented headers are all equivalent spellings — so
 # the authoritative read is a python3 tomllib/tomli parse; an awk scan
-# covers only the common table forms when no TOML lib is importable. Empty
-# when nothing resolves (missing/unparseable config): fail-open — the kimi
-# argv carries no rung either way.
+# covers only the common table forms when no TOML lib is importable. With no
+# readable config the bounded env overlay alone resolves (kimi applies it
+# with no file); empty when nothing resolves: fail-open — the kimi argv
+# carries no rung either way.
 kimi_clone_resolved_effort() {
   local cfg="$1" model="$2" out env_eff="${KIMI_MODEL_THINKING_EFFORT:-}"
   if [[ ! -r "$cfg" ]]; then
-    [[ -n "$env_eff" ]] && printf '%s\n' "$env_eff"
+    # No file to parse, but kimi still applies the env overlay — bound and
+    # normalize it exactly like the python/awk paths or "MAX" slips past the
+    # case-sensitive seat rule on spelling alone.
+    local norm
+    norm="${env_eff#"${env_eff%%[![:space:]]*}"}"
+    norm="${norm%"${norm##*[![:space:]]}"}"
+    norm="$(printf '%s' "$norm" | tr '[:upper:]' '[:lower:]')"
+    case "$norm" in
+      minimal|low|medium|high|xhigh|max|ultra|off|on) printf '%s\n' "$norm" ;;
+    esac
     return 0
   fi
   if out="$(KIMI_EFFORT_ENV="$env_eff" python3 - "$cfg" "$model" 2>/dev/null <<'PY'
@@ -942,7 +952,7 @@ PY
       in_model = 0
       if (want_model != "" && h ~ /^models\./) {
         mh = substr(h, 8)
-        sub(/[."]?\.overrides.*$/, "", mh)
+        sub(/\.overrides$/, "", mh)
         if (unq(mh) == want_model) { in_model = 1; m_seen = 1 }
       }
       next
@@ -2705,7 +2715,10 @@ resolve_profile() {
     if [[ "$PROFILE_KIND" == kimi ]]; then
       # The kimi CLI has no --effort flag: the pinned clone home's
       # [thinking] effort is the only place this rung exists, so a missing or
-      # mismatched clone would silently launch the wrong rung. Fail closed.
+      # mismatched clone would silently launch the wrong rung. Fail closed —
+      # the env overlay must not stand in for a missing clone file.
+      [[ -r "$KIMI_TRUST_HOME/config.toml" ]] ||
+        die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (config.toml missing); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"
       local local_clone_effort
       local_clone_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"
       [[ "$local_clone_effort" == "$GATE_EFFORT_PIN" ]] ||
