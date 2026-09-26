@@ -384,11 +384,12 @@ grep -qx 'builder-ds41-max' <<<"$profiles_out"
 grep -qx 'builder-grok' <<<"$profiles_out"
 grep -qx 'builder-kimi' <<<"$profiles_out"
 grep -qx 'builder-luna' <<<"$profiles_out"
-# #704 (#594 E6): the twelve per-rung builder spellings.
+# #704 (#594 E6) + #737 (decision 4088): the per-rung builder spellings.
 for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
-  builder-sol-high builder-sol-max builder-luna-max \
+  builder-sol-high builder-sol-max builder-sol-medium builder-luna-max \
   builder-terra-high builder-terra-xhigh builder-terra-max \
-  builder-kimi-high builder-kimi-max; do
+  builder-kimi-high builder-kimi-max \
+  builder-grok-low builder-grok-medium builder-grok-xhigh; do
   grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
 done
 grep -qx 'captain-opus' <<<"$profiles_out"
@@ -2871,8 +2872,9 @@ expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent p
 echo "PASS builder-parent-and-director-lane-guards"
 
 for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna \
-  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max \
-  builder-luna-max builder-terra-high builder-terra-xhigh builder-terra-max builder-kimi-high builder-kimi-max; do
+  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
+  builder-luna-max builder-terra-high builder-terra-xhigh builder-terra-max builder-kimi-high builder-kimi-max \
+  builder-grok-low builder-grok-medium builder-grok-xhigh; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -2899,7 +2901,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -3087,6 +3089,11 @@ builder_grok_start="$(grep '^agent start ' "$TMP/herdr.log")"
   fail "builder-grok must reuse the grok worker argv at effort xhigh: $builder_grok_start"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "grok-hi" ]] ||
   fail "builder-grok must gate as the scopefuel-known grok-hi spelling"
+# #737: builder-grok stays the un-pinned spelling — its gate argv carries no
+# --effort and no marker is required (the E6 rungs own the rung pins).
+if grep -q -- '--effort' "$TMP/scopefuel.log"; then
+  fail "builder-grok must not forward a gate --effort: $(cat "$TMP/scopefuel.log")"
+fi
 python3 - "$ARBITER_INBOX_ROOT/builder-grok-job/events/00001-job.claim.json" <<'PY'
 import json, sys
 event = json.load(open(sys.argv[1]))
@@ -3193,13 +3200,15 @@ done
 echo "PASS #666 devin builder variants reuse the worker argv and need --role builder"
 
 # ---------------------------------------------------------------------------
-# #704 (#594 E6): twelve per-rung builder spellings — the name's last segment
-# IS the pinned rung. Each must launch the exact model argv at that effort,
-# ask the gate about <gate profile>@<rung> (wrk forwards --effort to the gate
-# for these profiles only), record launch_profile=<canonical>@<rung> (#677),
-# and spawn only when SCOPEFUEL_E6_ARM names that exact rung. The gate-marked
-# escalation rungs (opus@low, sonnet@xhigh) also need --operator-request; the
-# kimi pair takes its rung from the pinned clone home (kimi has no --effort).
+# #704 (#594 E6) + #737 (decision 4088 grok rungs): per-rung builder spellings
+# — the name's last segment IS the pinned rung. Each must launch the exact
+# model argv at that effort, ask the gate about <gate profile>@<rung> (wrk
+# forwards --effort to the gate for these profiles only), record
+# launch_profile=<canonical>@<rung> (#677), and spawn only when
+# SCOPEFUEL_E6_ARM names that exact rung. The gate-marked escalation rungs
+# (opus@low, sonnet@xhigh) also need --operator-request; the kimi pair takes
+# its rung from the pinned clone home (kimi has no --effort); the grok rungs
+# are plain marker-gated (not escalation).
 # Mutants: dropping GATE_EFFORT_PIN, the marker check, the clone-effort check,
 # the canonical launch_name, or the gate's --effort forward turns this RED.
 # ---------------------------------------------------------------------------
@@ -3273,20 +3282,28 @@ e6_builder_case builder-sonnet-xhigh sonnet      xhigh  '--model sonnet --danger
 e6_builder_case builder-sonnet-max   sonnet      max    '--model sonnet --dangerously-skip-permissions --effort max'
 e6_builder_case builder-sol-high     codex-sol   high   '--yolo -m gpt-6-sol -c model_reasoning_effort=high'
 e6_builder_case builder-sol-max      codex-sol   max    '--yolo -m gpt-6-sol -c model_reasoning_effort=max'
+# #737: codex-sol@medium joins the sol E6 rungs on the same pin rule.
+e6_builder_case builder-sol-medium   codex-sol   medium '--yolo -m gpt-6-sol -c model_reasoning_effort=medium'
 e6_builder_case builder-luna-max     codex-luna  max    '--yolo -m gpt-6-luna -c model_reasoning_effort=max'
 e6_builder_case builder-terra-high   codex-terra high   '--yolo -m gpt-5.6-terra -c model_reasoning_effort=high'
 e6_builder_case builder-terra-xhigh  codex-terra xhigh  '--yolo -m gpt-5.6-terra -c model_reasoning_effort=xhigh'
 e6_builder_case builder-terra-max    codex-terra max    '--yolo -m gpt-5.6-terra -c model_reasoning_effort=max'
 e6_builder_case builder-kimi-high    kimi-k3     high   '--auto -m kimi-code/k3'
 e6_builder_case builder-kimi-max     kimi-k3     max    '--auto -m kimi-code/k3'
-echo "PASS 704 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
+# #737 (decision 4088): the grok E6 rungs — grok-hi@low/medium/xhigh, same
+# generic grok argv shape as builder-grok, marker-gated at the pinned rung.
+e6_builder_case builder-grok-low     grok-hi     low    '--always-approve -m grok-4.7 --effort low'
+e6_builder_case builder-grok-medium  grok-hi     medium '--always-approve -m grok-4.7 --effort medium'
+e6_builder_case builder-grok-xhigh   grok-hi     xhigh  '--always-approve -m grok-4.7 --effort xhigh'
+echo "PASS 704+737 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
 # Marker mutants: no marker, and a marker naming a different rung, both die on
 # wrk's own guard (rc 2, before the gate is asked) — the installed gate then
 # fail-closes the unmeasured C rungs a second time for good measure.
 for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
-  builder-sol-high builder-sol-max builder-luna-max builder-terra-high builder-terra-xhigh \
-  builder-terra-max builder-kimi-high builder-kimi-max; do
+  builder-sol-high builder-sol-max builder-sol-medium builder-luna-max builder-terra-high builder-terra-xhigh \
+  builder-terra-max builder-kimi-high builder-kimi-max \
+  builder-grok-low builder-grok-medium builder-grok-xhigh; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
@@ -3318,7 +3335,31 @@ e6_rung_rc=$?
 set -e
 [[ "$e6_rung_rc" -eq 2 ]] ||
   fail "builder-kimi-max with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
-echo "PASS 704 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
+# #737: same-profile wrong-rung marker on a grok rung refuses too — a
+# grok-hi@medium arm does not open builder-grok-low's grok-hi@low rung.
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=grok-hi@medium \
+  spawn_base builder-grok-low --role builder --lane e6-grok-wrong-rung-lane --parent parent-lane \
+  --job e6-grok-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-grok-low with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=grok-hi@low' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+# #737 sol rung: the existing codex-sol@high marker must not open
+# builder-sol-medium's codex-sol@medium rung.
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=codex-sol@high \
+  spawn_base builder-sol-medium --role builder --lane e6-sol-wrong-rung-lane --parent parent-lane \
+  --job e6-sol-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-sol-medium with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=codex-sol@medium' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+echo "PASS 704+737 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
 
 # Escalation rung: the marker alone does not open opus@low — the gate still
 # demands --operator-request, and its rc 3 propagates.
@@ -3353,6 +3394,14 @@ e6_eff_rc=$?
 set -e
 [[ "$e6_eff_rc" -eq 2 ]] ||
   fail "builder-terra-high --effort max must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-sol@medium \
+  spawn_base builder-sol-medium --role builder --lane e6-sol-eff-lane --parent parent-lane \
+  --effort high --job e6-sol-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-sol-medium --effort high must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
 set +e
 e6_eff_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
   spawn_base builder-kimi-high --role builder --lane e6-kimi-eff-lane --parent parent-lane \

@@ -282,11 +282,11 @@ if [[ "$profile" == fable && -z "$operator_request" ]]; then
   echo "consult_only: fable — 운영자 명시 요청 없이 스폰 불가 (--operator-request hk:doc/<key> 또는 hk:task/<정수> 필요)" >&2
   exit 3
 fi
-# #692/#704: the unmeasured E6 rungs open only for an exact
+# #692/#704/#737: the unmeasured E6 rungs open only for an exact
 # SCOPEFUEL_E6_ARM=<profile>@<effort> marker — a marker for a different rung
 # does not widen admission (verified against the installed gate).
 case "$profile@$effort" in
-  sonnet@max|codex-sol@high|kimi-k3@high|kimi-k3@max|grok-hi@xhigh)
+  sonnet@max|codex-sol@high|codex-sol@medium|kimi-k3@high|kimi-k3@max|grok-hi@low|grok-hi@medium|grok-hi@xhigh)
     if [[ "${SCOPEFUEL_E6_ARM:-}" != "$profile@$effort" ]]; then
       echo "e6_arm_required: $profile@$effort 은 미측정 E6 측정 런그다 (#594) — SCOPEFUEL_E6_ARM=$profile@$effort 표식이 있어야 연다" >&2
       exit 3

@@ -37,6 +37,12 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
 필요하다. kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없어
 `bin/kimi-clone-home --effort high|max`가 만든 고정 클론 홈의 `[thinking] effort`로만
 런그가 결정된다. E6 표본이므로 브리프에 `exp=E6` 태그와 reps 기록이 의무다.
+#737(decision 4088)은 같은 E6 규칙으로 grok 런그 `builder-grok-low`·`builder-grok-medium`·
+`builder-grok-xhigh`와 sol 런그 `builder-sol-medium`(`SCOPEFUEL_E6_ARM=codex-sol@medium`)을
+연다 — 각각 `SCOPEFUEL_E6_ARM=grok-hi@low|medium|xhigh` 표식이
+필요하고 게이트는 그 런그를 `--effort`로 판정한다(grok·sol-medium 런그는 에스컬레이션이 아니므로
+`--operator-request` 불요). 기존 `builder-grok`·`builder-sol-high`는 그대로 — 별도 철자다
+(`builder-sol-high`는 #704의 `codex-sol@high` 표식 규칙 유지).
 
 ## 시작과 브리프
 
