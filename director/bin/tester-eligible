@@ -22,12 +22,12 @@ from gate_common import (  # noqa: E402
 SHA = re.compile(r"^[0-9a-f]{40}$")
 VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-f]{40})$")
 STAGES = ("pre-spawn", "post-landing", "pre-merge")
-TOOL_VERSION = "tester-eligible/1.2"
+TOOL_VERSION = "tester-eligible/1.3"
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 _REMOVED_DEF = re.compile(r"^-\s*(?:async\s+def|def|class)\s+([A-Za-z_][A-Za-z0-9_]*)")
 _REMOVED_NAME = re.compile(r"^-([A-Za-z_][A-Za-z0-9_]*)\s*=[^=]")
 _IMPORT_LINE = re.compile(r"^\s*(?:from|import)\s+([A-Za-z_][A-Za-z0-9_.]*)")
-_FROM_IMPORT = re.compile(r"^\s*from\s+([A-Za-z_][A-Za-z0-9_.]*)\s+import\s+(.+)$")
+_FROM_IMPORT = re.compile(r"^\s*from\s+(\.*[A-Za-z_][A-Za-z0-9_.]*|\.+)\s+import\s+(.+)$")
 _FROM_ITEM = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)(?:\s+as\s+([A-Za-z_][A-Za-z0-9_]*))?")
 _IMPORT_ALIAS = re.compile(r"^import\s+([A-Za-z_][A-Za-z0-9_.]*)\s+as\s+([A-Za-z_][A-Za-z0-9_]*)")
 _BIND_LINE = re.compile(r"^\s*([A-Za-z_][A-Za-z0-9_.]*)\s*=(?!=)(.*)$")
@@ -435,19 +435,49 @@ def _boundary_modules(boundary: dict) -> set[str]:
     return modules
 
 
-def _import_modules(content: str) -> set[str]:
+def _resolve_module(module: str, file_path: str) -> str:
+    """Resolve leading-dot relative imports against the importing file's package."""
+    if not module.startswith("."):
+        return module
+    package = file_path.rsplit("/", 1)[0].split("/") if "/" in file_path else []
+    dots = len(module) - len(module.lstrip("."))
+    rest = module.lstrip(".")
+    keep = max(len(package) - (dots - 1), 0)
+    base = ".".join(package[:keep])
+    return ".".join(part for part in (base, rest) if part)
+
+
+def _from_clauses(content: str):
+    """Yield (module, items) for each from-import, joining parenthesized items."""
+    lines = content.splitlines()
+    index = 0
+    while index < len(lines):
+        found = _FROM_IMPORT.match(lines[index].strip())
+        if not found:
+            index += 1
+            continue
+        module, items = found.group(1), found.group(2)
+        while "(" in items and ")" not in items and index + 1 < len(lines):
+            index += 1
+            items += lines[index].strip()
+        index += 1
+        yield module, items.strip("() \t\n")
+
+
+def _import_modules(content: str, file_path: str = "") -> set[str]:
     names = set()
     found = _FROM_IMPORT.match(content)
     if found:
-        names.add(found.group(1))
+        module = _resolve_module(found.group(1), file_path)
+        names.add(module)
         for item in found.group(2).split(","):
             leaf = _IDENTIFIER.match(item.strip())
             if leaf:
-                names.add(found.group(1) + "." + leaf.group(0))
+                names.add(module + "." + leaf.group(0))
         return names
     inline = _IMPORT_LINE.match(content)
     if inline:
-        names.add(inline.group(1))
+        names.add(_resolve_module(inline.group(1), file_path))
     return names
 
 
@@ -455,31 +485,141 @@ def _module_in(module: str, modules: set[str]) -> bool:
     return any(module == item or module.startswith(item + ".") for item in modules)
 
 
-def _bound_names(content: str, leaves: set[str], modules: set[str]) -> set[str]:
-    """Identifiers bound to a boundary module or symbol anywhere in the file at head."""
-    names = set()
-    for line in content.splitlines():
-        text = line.strip()
-        if not text or text.startswith("#"):
+def _module_file(repo: Path, head: str, module: str) -> tuple[str, str] | str | None:
+    """Map a module name to a file at head: (path, content), "unreadable", or None.
+
+    None means no such path exists in the tree (an external package);
+    "unreadable" means a blob exists but is a symlink, gitlink, or binary."""
+    stem = module.replace(".", "/")
+    for candidate in (stem + ".py", stem + "/__init__.py"):
+        tree = run_git(repo, "ls-tree", head, "--", candidate)
+        if tree.returncode or not tree.stdout.strip():
             continue
-        found = _FROM_IMPORT.match(text)
-        if found and _module_in(found.group(1), modules):
-            for item in found.group(2).split(","):
-                bind = _FROM_ITEM.match(item.strip())
-                if bind:
-                    names.add(bind.group(2) or bind.group(1))
-            continue
-        alias = _IMPORT_ALIAS.match(text)
-        if alias:
-            if _module_in(alias.group(1), modules):
-                names.add(alias.group(2))
-            continue
-        bind = _BIND_LINE.match(text)
-        if bind and set(_IDENTIFIER.findall(bind.group(2))) & leaves:
-            leaf = _leaf(bind.group(1))
-            if leaf:
-                names.add(leaf)
-    return names
+        mode = tree.stdout.split()[0]
+        if mode not in {"100644", "100755"}:
+            return "unreadable"
+        try:
+            show = run_git(repo, "show", f"{head}:{candidate}")
+        except UnicodeDecodeError:
+            return "unreadable"
+        if show.returncode:
+            return "unreadable"
+        return candidate, show.stdout
+    return None
+
+
+def _bound_names(content: str, leaves: set[str], modules: set[str],
+                 repo: Path | None = None, head: str | None = None,
+                 file_path: str = "", depth: int = 0,
+                 visited: frozenset[str] = frozenset(),
+                 memo: dict | None = None) -> tuple[set[str], set[str], bool]:
+    """Bound and suspect identifiers in file content at head.
+
+    bound: names bound to a boundary module or symbol (import aliases,
+    assignments mentioning boundary names, names re-exported from repo files
+    that bind them). suspect: names bound to an unresolvable dynamic
+    expression (non-literal getattr/setattr/delattr, exec/eval, importlib,
+    globals) or to a suspect name — a changed call through one cannot be
+    classified. unresolved_star: an `import *` whose source cannot be fully
+    expanded (a boundary module or an unreadable module) was found."""
+    if memo is None:
+        memo = {}
+    bound: set[str] = set()
+    suspect: set[str] = set()
+    unresolved_star = False
+    for _ in range(6):
+        grown = False
+        for module, items_text in _from_clauses(content):
+            resolved = _resolve_module(module, file_path)
+            items = [item.strip().strip("()") for item in items_text.split(",")]
+            star = items_text.strip() == "*"
+            if _module_in(resolved, modules):
+                if star:
+                    unresolved_star = True
+                    continue
+                for item in items:
+                    bind = _FROM_ITEM.match(item)
+                    if bind:
+                        name = bind.group(2) or bind.group(1)
+                        if name not in bound:
+                            bound.add(name)
+                            grown = True
+                continue
+            if not repo or not head or depth >= 3 or resolved in visited:
+                if star:
+                    unresolved_star = True
+                continue
+            if resolved not in memo:
+                ref = _module_file(repo, head, resolved)
+                if isinstance(ref, tuple):
+                    memo[resolved] = _bound_names(
+                        ref[1], leaves, modules, repo, head, ref[0], depth + 1,
+                        visited | {resolved}, memo)
+                else:
+                    memo[resolved] = ref
+            entry = memo[resolved]
+            if entry is None or entry == "unreadable":
+                if star:
+                    unresolved_star = True
+                    continue
+                if entry == "unreadable":
+                    for item in items:
+                        bind = _FROM_ITEM.match(item)
+                        if bind:
+                            name = bind.group(2) or bind.group(1)
+                            if name not in suspect:
+                                suspect.add(name)
+                                grown = True
+                continue
+            sub_bound, sub_suspect, sub_star = entry
+            unresolved_star |= sub_star
+            if star:
+                for name in (sub_bound - bound) | (sub_suspect - suspect):
+                    grown = True
+                bound |= sub_bound
+                suspect |= sub_suspect
+                continue
+            for item in items:
+                bind = _FROM_ITEM.match(item)
+                if not bind:
+                    continue
+                imported, alias = bind.group(1), bind.group(2) or bind.group(1)
+                if imported in sub_bound and alias not in bound:
+                    bound.add(alias)
+                    grown = True
+                elif imported in sub_suspect and alias not in suspect:
+                    suspect.add(alias)
+                    grown = True
+        for line in content.splitlines():
+            text = line.strip()
+            if not text or text.startswith(("#", "from ")):
+                continue
+            alias = _IMPORT_ALIAS.match(text)
+            if alias:
+                if _module_in(_resolve_module(alias.group(1), file_path), modules) \
+                        and alias.group(2) not in bound:
+                    bound.add(alias.group(2))
+                    grown = True
+                continue
+            bind = _BIND_LINE.match(text)
+            if not bind:
+                continue
+            target = _leaf(bind.group(1))
+            if not target:
+                continue
+            rhs = bind.group(2)
+            rhs_names = set(_IDENTIFIER.findall(rhs))
+            if ((_ATTR_CALL.search(rhs) and not _ATTR_LITERAL.search(rhs)) or
+                _DYNAMIC_CALL.search(rhs)) or rhs_names & suspect:
+                if target not in suspect:
+                    suspect.add(target)
+                    grown = True
+            elif rhs_names & (leaves | bound) and target not in bound:
+                bound.add(target)
+                grown = True
+        if not grown:
+            break
+    return bound, suspect, unresolved_star
 
 
 def _leaf_hits(text: str, leaves: set[str]) -> list[str]:
@@ -519,17 +659,43 @@ def _referenced_from_boundary(repo: Path, head: str, name: str, boundary: dict) 
     return sorted(hits)
 
 
+def _split_stub(raw: object) -> dict:
+    """Best-effort split_analysis fields for returns that precede validation."""
+    stub = {"part": None, "parent_task": None, "paths_checked": None,
+            "core_touches": [], "unverifiable": [], "boundary_sha256": None,
+            "contract_path": None, "contract_sha256": None, "behaviour_checks": []}
+    if isinstance(raw, dict):
+        stub["part"] = raw.get("part")
+        stub["parent_task"] = raw.get("parent_task")
+    return stub
+
+
+def _contract_blob(repo: Path, head: str, contract_path: str) -> tuple[str | None, str | None]:
+    """(sha256, text) of the contract blob at head; (None, None) when absent or
+    not a regular file (symlink/gitlink/unreadable)."""
+    tree = run_git(repo, "ls-tree", head, "--", contract_path)
+    if tree.returncode or not tree.stdout.strip():
+        return None, None
+    if tree.stdout.split()[0] not in {"100644", "100755"}:
+        return None, None
+    try:
+        show = run_git(repo, "show", f"{head}:{contract_path}")
+    except UnicodeDecodeError:
+        return None, None
+    if show.returncode:
+        return None, None
+    return hashlib.sha256(show.stdout.encode()).hexdigest(), show.stdout
+
+
 def _split_check(evidence: dict) -> tuple[dict | None, dict]:
     """Mixed-grade T3 split: a peripheral part must not touch the core boundary."""
     raw = evidence.get("split")
     if raw is None:
         return None, result("N/A", "SPLIT_NOT_DECLARED", "task:746")
     if not isinstance(raw, dict):
-        return None, result("UNVERIFIED", "SPLIT_INVALID", "task:746")
+        return _split_stub(raw), result("UNVERIFIED", "SPLIT_INVALID", "task:746")
     part, parent = raw.get("part"), raw.get("parent_task")
-    info: dict = {"part": part, "parent_task": parent, "paths_checked": None,
-                  "core_touches": [], "unverifiable": [], "boundary_sha256": None,
-                  "contract_path": None, "contract_sha256": None, "behaviour_checks": []}
+    info: dict = _split_stub(raw)
     if (not isinstance(part, str) or part not in {"core", "peripheral"} or
         not isinstance(parent, (str, int)) or isinstance(parent, bool) or
         str(parent) == str(evidence.get("task")) or
@@ -543,6 +709,7 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
     if part == "peripheral" and contract_path is None:
         return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746",
                             field="contract_path")
+    info["contract_path"] = contract_path
     behaviour = raw.get("behaviour_checks")
     seen = []
     if behaviour is not None:
@@ -569,26 +736,24 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
         if paths is None:
             return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", detail=error)
         info["paths_checked"] = len(paths)
-        if contract_path in paths:
-            info["core_touches"] = [{"path": contract_path, "kind": "contract"}]
-            return info, result("FAIL", "PERIPHERAL_TOUCHES_CORE", "task:746",
-                                touches=info["core_touches"], required_rerun="T3")
     boundary = _normalize_boundary(raw.get("boundary")) if "boundary" in raw else None
-    contract_sha = None
+    contract_boundary = None
     if contract_path is not None:
         if not repo.is_dir() or not SHA.fullmatch(head):
             return info, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", field="repo")
-        show = run_git(repo, "show", f"{head}:{contract_path}")
-        if show.returncode:
-            return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746",
-                                contract_path=contract_path)
-        contract_sha = hashlib.sha256(show.stdout.encode()).hexdigest()
-        try:
-            document = json.loads(show.stdout)
-        except ValueError:
-            document = None
-        contract_boundary = _normalize_boundary(
-            (document or {}).get("boundary", document) if isinstance(document, dict) else None)
+        info["contract_sha256"], contract_text = _contract_blob(repo, head, contract_path)
+        if contract_text is not None:
+            try:
+                document = json.loads(contract_text)
+            except ValueError:
+                document = None
+            contract_boundary = _normalize_boundary(
+                (document or {}).get("boundary", document) if isinstance(document, dict) else None)
+    if part == "peripheral" and contract_path in paths:
+        info["core_touches"] = [{"path": contract_path, "kind": "contract"}]
+        return info, result("FAIL", "PERIPHERAL_TOUCHES_CORE", "task:746",
+                            touches=info["core_touches"], required_rerun="T3")
+    if contract_path is not None:
         if contract_boundary is None:
             return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746",
                                 contract_path=contract_path)
@@ -596,8 +761,6 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
             return info, result("UNVERIFIED", "SPLIT_BOUNDARY_CONFLICT", "task:746")
         boundary = boundary or contract_boundary
     info["boundary_sha256"] = _digest(boundary) if boundary else None
-    info["contract_path"] = contract_path
-    info["contract_sha256"] = contract_sha
     if boundary is None:
         return info, result("UNVERIFIED", "SPLIT_BOUNDARY_MISSING", "task:746")
     if part == "core":
@@ -612,35 +775,48 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
         leaves |= {item.rsplit(".", 1)[-1] for item in modules}
         unverifiable = []
         for path in analyzed:
-            proc = run_git(repo, "diff", "--no-ext-diff", "--no-renames", "-U0", base, head, "--", path)
-            if proc.returncode:
+            try:
+                proc = run_git(repo, "diff", "--no-ext-diff", "--no-renames",
+                               "-U0", base, head, "--", path)
+                if proc.returncode:
+                    unverifiable.append(path)
+                    continue
+                patch = proc.stdout
+                if "Binary files" in patch or "GIT binary patch" in patch:
+                    unverifiable.append(path)
+                    continue
+                file_leaves = set(leaves)
+                suspect: set[str] = set()
+                show = run_git(repo, "show", f"{head}:{path}")
+                if show.returncode == 0:
+                    bound, suspect, star = _bound_names(show.stdout, leaves, modules,
+                                                        repo, head, path)
+                    file_leaves |= bound
+                    if star:
+                        unverifiable.append(path)
+            except UnicodeDecodeError:
                 unverifiable.append(path)
                 continue
-            patch = proc.stdout
-            if "Binary files" in patch or "GIT binary patch" in patch:
-                unverifiable.append(path)
-                continue
-            file_leaves = set(leaves)
-            show = run_git(repo, "show", f"{head}:{path}")
-            if show.returncode == 0:
-                file_leaves |= _bound_names(show.stdout, leaves, modules)
             for line in patch.splitlines():
                 if line.startswith("@@"):
                     context = "@@".join(line.split("@@")[2:])
                     touched.extend({"path": path, "kind": "enclosing", "symbol": leaf,
                                     "detail": context.strip()[:120]}
                                    for leaf in _leaf_hits(context, file_leaves))
+                    if _leaf_hits(context, suspect):
+                        unverifiable.append(path)
                 elif line[:1] in {"+", "-"} and not line.startswith(("+++", "---")):
                     content = line[1:]
                     touched.extend({"path": path, "kind": "call" if re.search(
                                         r"\b" + re.escape(leaf) + r"\s*\(", content) else "symbol",
                                     "symbol": leaf, "detail": content.strip()[:120]}
                                    for leaf in _leaf_hits(content, file_leaves))
-                    for module in _import_modules(content):
+                    for module in _import_modules(content, path):
                         if _module_in(module, modules):
                             touched.append({"path": path, "kind": "import", "symbol": module,
                                             "detail": content.strip()[:120]})
-                    if ((_ATTR_CALL.search(content) and not _ATTR_LITERAL.search(content)) or
+                    if (_leaf_hits(content, suspect) or
+                        (_ATTR_CALL.search(content) and not _ATTR_LITERAL.search(content)) or
                         _DYNAMIC_CALL.search(content)):
                         unverifiable.append(path)
             for name in _removed_names(patch):
@@ -684,8 +860,8 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
     try:
         split_info, checks["split"] = _split_check(evidence)
     except Exception:
-        split_info, checks["split"] = None, result("UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746",
-                                                   detail="classifier_error")
+        split_info, checks["split"] = _split_stub(evidence.get("split")), result(
+            "UNVERIFIED", "NEEDS_CLASSIFICATION", "task:746", detail="classifier_error")
     declared = evidence.get("declared_t")
     if not re.fullmatch(r"T[0-3]", str(declared)):
         checks["tier"] = result("UNVERIFIED", "T_MISSING", "spawn-worker:2-1")

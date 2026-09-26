@@ -76,18 +76,35 @@ For a peripheral part the command compares the changed paths, the changed
 symbols and call relations (a changed call site into a core symbol counts,
 including added or removed lines and the enclosing-function hunk context),
 removed definitions still referenced from boundary paths at head, and the
-boundary from the contract. Identifiers bound to a boundary module or
-symbol at head — an import alias (from boundary import x as y, import
-boundary.mod as m) or an assignment whose value names a boundary symbol
-or module — count as boundary names too, so calls through an alias are
-still touches. Touching the boundary — a boundary path, the contract
-file, a core symbol or bound alias, an import of a boundary module, or a
-removed symbol still referenced from core — is FAIL with reason
-PERIPHERAL_TOUCHES_CORE and the part must be re-run as T3. A missing or
-unusable boundary or contract, an unreadable diff, a binary or
-uninspectable change, a dynamically assembled name (a non-literal
-getattr/setattr/delattr, exec, eval, __import__, importlib, globals, or
-vars use that cannot be resolved to a literal), a failed or malformed
+boundary from the contract. The contract must be a regular file at head;
+a symlink, gitlink, or unreadable blob is SPLIT_BOUNDARY_MISSING.
+
+Identifiers bound to a boundary module or symbol at head count as
+boundary names, so calls through an alias are still touches. Binding
+forms recognised include absolute and relative from-imports (from ..x
+import y, from x import (a, b as c) — relative names resolve against the
+importing file's package and parenthesized lists are joined), import
+module as m aliases, plain assignments whose value names a boundary
+symbol or module or an already-bound name (chains resolve to a fixed
+point), and re-exports through another repository file: from pkg.ui.bridge
+import cleanup [as alias] or from pkg.ui.bridge import * inherits the
+bound and suspect names that bridge module binds at head, recursively.
+A name imported from a repo file that exists but cannot be read is
+treated as suspect. An `import *` whose source cannot be expanded — a
+boundary module or an unreadable or missing module — makes the whole
+file unclassifiable.
+
+Touching the boundary — a boundary path, the contract file, a core
+symbol or bound alias, an import of a boundary module, or a removed
+symbol still referenced from core — is FAIL with reason
+PERIPHERAL_TOUCHES_CORE and the part must be re-run as T3; a touch that
+was already recorded is reported even when a later file turns out to be
+uninspectable. A missing or unusable boundary or contract, an
+unreadable diff, a binary, undecodable, or uninspectable change, a
+dynamically assembled name (a non-literal getattr/setattr/delattr, exec,
+eval, __import__, importlib, globals, or vars use that cannot be
+resolved to a literal), a changed reference to a name bound to such a
+dynamic expression anywhere in the file at head, a failed or malformed
 behaviour check, or anything else that cannot be classified is
 UNVERIFIED with NEEDS_CLASSIFICATION or SPLIT_BOUNDARY_MISSING — never
 a lower T. The boundary is required for both parts; a core declaration
@@ -96,9 +113,11 @@ keeps its declared T subject to the existing surface floor. A core part
 always raises the floor to T3 regardless of the diff shape. The receipt
 records the split verbatim and split_analysis with the parent task, the
 part, the boundary list hash, the contract path and hash, the paths
-checked, the detected core touches, and the unclassifiable paths; the
-split declaration is bound to the previous receipt, so a changed
-declaration invalidates earlier stages.
+checked, the detected core touches, the unclassifiable paths, and the
+behaviour checks; every code path — malformed declarations, early
+returns, and classifier failures alike — still leaves a populated
+split_analysis stub. The split declaration is bound to the previous
+receipt, so a changed declaration invalidates earlier stages.
 
 At pre-merge the tester provides report_path and report_sha256. The report
 includes exact lines TASK, JOB, REPO, TESTED_HEAD, and TESTER_SESSION matching
