@@ -132,31 +132,31 @@ FILE_FORBIDDEN = [
     ("integration-one-pass",
      r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:한 차례|한 번|한번|1회|단 한 번|1패스|한 패스|단일|한 회)[^\n]{0,10}?(?:만[^\n]{0,15}?(?:검증|확인|보고|통과|본다|체크|끝낸다|보면)|(?:검증|확인|보고|통과|체크)[^\n]{0,10}?(?:으로\s*끝|까지만|충분|하면\s*된다|끝낸다))|(?:한 차례|한 번|한번|1회|단 한 번|1패스|한 패스|단일|한 회)[^\n]{0,15}?(?:검증|확인|보고|통과|본다|체크|보면|봐도)[^\n]{0,20}?(?:최종\s*)?통합|통합[^\n]{0,25}?(?:검증|tester)[^\n]{0,15}?충분(?!하지|하다고|할 리|치 않|기가)"),
     ("integration-one-pass-en",
-     r"(?i)(?:final\s+)?integration[^\n]{0,45}?(?:(?:only\s+one|one|single|a\s+single|just\s+one|one-?shot|single-?shot|1)[ -]?(?:pass|round|look|check|review|verification)|(?:run|look|review|verify|check|use|read)[ -]?once|once\s+only)|(?:only\s+one|one|single|a\s+single|just\s+one|one-?shot|single-?shot|1)[ -]?(?:pass|round|look|check|review|verification)[^\n]{0,45}?(?:final\s+)?integration"),
+     r"(?i)(?:final\s+)?integration[^\n]{0,45}?(?:(?:only\s+one|\bone\b|single|a\s+single|just\s+one|one-?shot|single-?shot|1)[^\n]{0,15}?(?:pass|round|look|check|review|verification|glance|peek|once-?over|runthrough|walkthrough|sign[- ]?off|signoff)|(?:run|look|review|verify|check|use|read)[ -]?once|once\s+only)|(?:only\s+one|\bone\b|single|a\s+single|just\s+one|one-?shot|single-?shot|1)[^\n]{0,15}?(?:pass|round|look|check|review|verification|glance|peek|once-?over|runthrough|walkthrough|sign[- ]?off|signoff)[^\n]{0,45}?(?:final\s+)?integration"),
     ("integration-cap-numeric",
      r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:cap|캡|상한)[^\n]{0,8}?[:=]?\s*1\b"),
     ("integration-skipped",
-     r"(?i)(?:최종\s*)?통합[^\n]{0,25}?(?:tester|검증)[^\n]{0,12}?(?:없이|생략|불필요|제외|건너)|머지[^\n]{0,15}?(?:없이|생략)[^\n]{0,10}?(?:검증|tester)|(?:merge|merging)[^\n]{0,15}?(?:without|skip\w*|omit\w*)[^\n]{0,10}?(?:verif\w*|tester|check)|(?:final\s+)?integration[^\n]{0,30}?(?:tester[- ]?(?:free|less)|without\s+(?:an?\s+)?(?:independent\s+|cross[- ]family\s+)?tester|no\s+tester)|verdict[^\n]{0,15}?(?:유효|valid|재사용|그대로)[^\n]{0,10}?(?:수정|바뀐|새|patched|changed|new|updated)\s+head|(?:old|previous|prior|stale|earlier|existing)[^\n]{0,10}?verdict[^\n]{0,15}?(?:still|remains|valid|count\w*|reuse|carry|applies)"),
+     r"(?i)(?:최종\s*)?통합[^\n]{0,25}?(?:tester|검증)[^\n]{0,12}?(?:없이|생략|불필요|제외|건너)|머지[^\n]{0,15}?(?:없이|생략)[^\n]{0,10}?(?:검증|tester)|(?:merge|merging)[^\n]{0,15}?(?:without|skip\w*|omit\w*)[^\n]{0,10}?(?:verif\w*|tester|check)|(?:final\s+)?integration[^\n]{0,30}?(?:tester[- ]?(?:free|less)|without\s+(?:an?\s+)?(?:independent\s+|cross[- ]family\s+)?tester|no\s+tester)|verdict[^\n]{0,15}?(?:유효|valid|재사용|그대로)[^\n]{0,10}?(?:수정|바뀐|새|patched|changed|new|updated)\s+head|(?:old|previous|prior|stale|earlier|existing|same)[^\n]{0,10}?(?:verdict|PASS|review|check|verification|sign[- ]?off)[^\n]{0,15}?(?:still|remains?|valid|count\w*|reuse|carry|carries|applies|suffic\w*|enough|stands|holds|충분|유효)"),
     ("integration-no-reverify",
      r"(?:수정된?|바뀐|새|패치된)\s*head[^\n]{0,20}?(?:재검증|다시 검증|재확인|후속 확인|후속 검증|추가 확인|검증|확인|점검)[^\n]{0,12}?(?:하지\s*않|없|생략|불필요|필요[^\n]{0,3}?없)|재검증[^\n]{0,12}?(?:없이|하지|생략|불필요|필요[^\n]{0,3}?없)|(?:후속|추가)\s*(?:확인|검증|점검)[^\n]{0,8}?(?:생략|불필요|없|하지)"),
     ("integration-no-reverify-en",
-     r"(?i)(?:re-?verif\w*|re-?check\w*|recheck\w*|re-?examin\w*|re-?inspect\w*|re-?review\w*|re-?evaluat\w*)[^\n]{0,15}?(?:waiv\w*|skip\w*|omit\w*|dropped|not needed|unnecessary|unneeded|no longer)|(?:skip|omit|waive|without|sans|no)[^\n]{0,15}(?:re-?verif\w*|re-?check\w*|recheck\w*|(?:second|third|another|extra)\s+(?:verification|check|pass|look|review|inspection|scrutiny)|follow-?up\s+(?:verification|check|look|review|inspection)|further\s+(?:verification|check|review|scrutiny|inspection|look))|(?:patched|changed|modified|updated|new)\s+heads?[^\n]{0,20}?(?:accept\w*|approv\w*|merg\w*|pass\w*|us\w*|go\w*|no|without|sans|skip\w*|omit\w*|waiv\w*|not needed|unnecessary|unneeded)[^\n]{0,15}?(?:second\s+|third\s+|another\s+|further\s+|additional\s+|re-?|extra\s+)?(?:verification|verif|check|pass|look|review|inspection|scrutiny)|after[^\n]{0,10}?(?:the\s+)?head[^\n]{0,10}?change\w*[^\n]{0,15}?(?:no|without|skip|omit|waive|not needed|unnecessary|accept\w*)[^\n]{0,12}?(?:second\s+)?(?:verification|check|pass|look|review|inspection|scrutiny)|(?:second|third|another|further|additional|extra)\s+(?:look|check|review|verification|pass|inspection|scrutiny)[^\n]{0,25}?(?:at|on|for|of)?[^\n]{0,15}?(?:patched|changed|modified|updated|new)\s+heads?|(?:no need|not needed|unnecessary|unneeded)[^\n]{0,15}?(?:for\s+)?(?:a\s+)?(?:second|third|another|follow-?up|further|additional|extra)[ -]?(?:look|check|review|verification|pass|inspection|scrutiny)"),
+     r"(?i)(?:re-?verif\w*|re-?check\w*|recheck\w*|re-?examin\w*|re-?inspect\w*|re-?review\w*|re-?evaluat\w*)[^\n]{0,15}?(?:waiv\w*|skip\w*|omit\w*|dropped|not needed|unnecessary|unneeded|no longer)|(?:skip|omit|waive|without|sans|no)[^\n]{0,15}(?:re-?verif\w*|re-?check\w*|recheck\w*|(?:second|third|another|extra)\s+(?:verification|check|pass|look|review|inspection|scrutiny)|follow-?up\s+(?:verification|check|look|review|inspection)|further\s+(?:verification|check|review|scrutiny|inspection|look))|(?:patched|changed|modified|updated|new)\s+heads?[^\n]{0,20}?(?:accept\w*|approv\w*|merg\w*|pass\w*|us\w*|go\w*|no|without|sans|skip\w*|omit\w*|waiv\w*|not needed|unnecessary|unneeded)[^\n]{0,15}?(?:second\s+|third\s+|another\s+|further\s+|additional\s+|re-?|extra\s+)?(?:verification|verif|check|pass|look|review|inspection|scrutiny)|after[^\n]{0,10}?(?:the\s+)?head[^\n]{0,10}?change\w*[^\n]{0,15}?(?:no|without|skip|omit|waive|not needed|unnecessary|accept\w*)[^\n]{0,12}?(?:second\s+)?(?:verification|check|pass|look|review|inspection|scrutiny)|(?:second|third|another|further|additional|extra)\s+(?:look|check|review|verification|pass|inspection|scrutiny)[^\n]{0,25}?(?:at|on|for|of)?[^\n]{0,15}?(?:patched|changed|modified|updated|new)\s+heads?|(?:no need|not needed|unnecessary|unneeded)[^\n]{0,15}?(?:for\s+)?(?:a\s+)?(?:second|third|another|follow-?up|further|additional|extra|fresh|new)[ -]?(?:look|check|review|verification|pass|inspection|scrutiny)|(?:no|without|sans|skip\w*|omit\w*|waiv\w*)[^\n]{0,10}?(?:fresh|new|additional|further|second|third|another|extra|follow-?up)\s+(?:check|verification|review|look|inspection|scrutiny|verif)[^\n]{0,15}?(?:is\s+|are\s+|be\s+)?(?:required|needed|necessary|mandatory|obligatory)|(?:post[- ]?update|after\s+(?:an?\s+)?(?:update|patch|change)|head[^\n]{0,6}?(?:change|update|patch|수정|변경))[^\n]{0,20}?(?:verification|verif|check|review|inspection|scrutiny|look|확인|검증|점검)[^\n]{0,12}?(?:optional|discretionary|skip\w*|omit\w*|waiv\w*|not needed|unnecessary|unneeded|생략|불필요|없)|(?:previous|prior|old|earlier|existing|same)[^\n]{0,10}?(?:review|verdict|check|verification|look)[^\n]{0,15}?(?:carries?\s*(?:through|over)|still\s+(?:valid|holds|applies|counts?)|remains?\s+(?:valid|sufficient|enough)|stands|holds|suffic\w*)"),
     ("ambiguous-lower-t-alt",
-     r"(?i)(?:애매|모호|불명확|불확실|미분류|미정|모른|알 수 없|정해지지 않|경계가|분류 불가|unclear|unclassified|ambiguous|uncertain|unsure|undecided|undetermined|indeterminate|unsettled|unresolved|unknown|vague|fuzzy|hazy|iffy|open[- ]ended|undefined|unset|(?:cannot|can't|unable|hard|difficult)[^\n]{0,15}?(?:decide|determine|classify|scope|boundar|resolve))[^\n]{0,30}?(?:(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|start|run|assign|dispatch|handle|processing|work)(?!하지)|(?:start|begin|run|assign|dispatch|handle|send|route)[^\n]{0,10}?(?:at|as|to|into|on)\s*(?:T0|T1|T2|lower\s*T))"),
+     r"(?i)(?:애매|모호|불명확|불확실|미분류|미정|모른|알 수 없|정해지지 않|경계가|분류 불가|unclear|unclassified|ambiguous|uncertain|unsure|undecided|undetermined|indeterminate|unsettled|unresolved|unknown|vague|fuzzy|hazy|iffy|open[- ]ended|undefined|unset|questionable|borderline|tentative|판단 불가|결정 불가|흐리|곤란|(?:cannot|can't|unable|hard|difficult)[^\n]{0,15}?(?:decide|determine|classify|scope|boundar|resolve))[^\n]{0,30}?(?:(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|start|run|assign|dispatch|handle|processing|work)(?!하지)|(?:start|begin|run|assign|dispatch|handle|send|route)[^\n]{0,10}?(?:at|as|to|into|on)\s*(?:T0|T1|T2|lower\s*T))"),
     ("ambiguous-posthoc-classify",
      r"(?i)(?:애매|모호|불명확|불확실|미분류|미정|경계 작업|ambiguous|unclear|uncertain|unsure|undecided|undetermined|unsettled|unknown)[^\n]{0,40}?(?:(?:사후|나중에?|추후|뒤에?|후에|이후|afterwards?|later|after|following)[^\n]{0,10}?(?:분류|재분류|classif)|(?:분류|재분류|classif\w*)[^\n]{0,10}?(?:사후|나중에|추후|뒤에|후에|이후|afterwards?|later|after|following)|(?:defer\w*|postpone\w*|delay\w*|put\s+off|미뤄|미룬|늦추|연기)[^\n]{0,15}?(?:분류|재분류|classif))"),
     ("lower-t-then-classify",
-     r"(?i)(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|run|start|assign|dispatch|handle|processing|work)[^\n]{0,25}?(?:사후|나중에|추후|뒤에|후에|이후|afterwards?|later|after|following)[^\n]{0,15}?(?:애매|모호|경계|분류|classif|ambiguous|unclear|uncertain|boundary)|(?:T0|T1|T2|lower\s*T)[^\n]{0,15}?(?:processing|work|execution|run|start|시작|실행|처리|돌리|맡기|배정|넘기|보낸|보냄|assign|dispatch|handle)[^\n]{0,25}?(?:before|prior|ahead|전에|앞서|먼저)[^\n]{0,15}?(?:uncertainty|ambiguity|boundary|classification|scope|애매|모호|경계|분류)[^\n]{0,15}?(?:resolved|decided|determined|settled|classified|정해|분류|해결)"),
+     r"(?i)(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|run|start|assign|dispatch|handle|processing|work)[^\n]{0,25}?(?:사후|나중에|추후|뒤에|후에|이후|afterwards?|later|after|following)[^\n]{0,15}?(?:애매|모호|경계|분류|classif|ambiguous|unclear|uncertain|boundary|triage|sort|categoriz|정리)|(?:T0|T1|T2|lower\s*T)[^\n]{0,15}?(?:processing|work|execution|run|start|시작|실행|처리|돌리|맡기|배정|넘기|보낸|보냄|assign|dispatch|handle)[^\n]{0,25}?(?:before|prior|ahead|전에|앞서|먼저)[^\n]{0,15}?(?:uncertainty|ambiguity|boundary|classification|scope|애매|모호|경계|분류|triage|sort|categoriz|정리)[^\n]{0,15}?(?:resolved|decided|determined|settled|classified|정해|분류|해결|postponed|deferred|delayed|미뤄)|(?:run|start|begin|assign|dispatch|handle|실행|처리|배정|돌리|맡기|넘기|시작)[^\n]{0,10}?(?:at|as|to|into|on)\s*(?:T0|T1|T2|lower\s*T)[^\n]{0,20}?(?:before|prior|ahead|전에|앞서|먼저)[^\n]{0,10}?(?:triage|classification|classif|sort|categoriz|분류|정리)|(?:T0|T1|T2|lower\s*T)[^\n]{0,15}?(?:execution|work|run|실행|처리)[^\n]{0,15}?(?:first|먼저|우선)[^\n]{0,20}?(?:triage|classification|classif|sort|categoriz|분류|정리)[^\n]{0,15}?(?:postponed|deferred|delayed|later|나중|미뤄)"),
     ("core-class-lower-t",
-     r"(?i)(?:안전 DB|안전 제약|에러 경로|에러 처리|예외 경계|lock[-/\s](?:and\s+)?transaction|상태/DB/예외 경계|가드 배선|가드 인자|가드 호출|guard\s+wiring|guard\s+call|guard\s+arg|safety[-\s]db|safety[-\s]constraint|core\s+safety|error[-\s]path|error[-\s]handling|exception[-\s]boundary|exception[-\s]propagat\w*|exception[-\s]flow|return[-\s]check|transaction\s+lifetime|lock/tx|lock-tx|state[-/\s]boundary|db[-/\s]boundary|state[-/\s]exception|guard\s+(?:config|setting|behavior|hook|check)|가드 설정|state/db)[^\n]{0,35}?(?:(?:T0|T1|T2|낮은 T|lower\s*T|주변|periph\w*|cheap\w*)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼|취급|간주|본다|여긴다|핫픽스|작업|분류|넘긴다|보낸다|업무|워커|peripheral|worker|assign|task|work|run|hotfix|handle|treat|mark|glue|pool|tier|change|make|edit|modify|own|take|do)|(?:assign\w*|rout\w*|send|dispatch\w*|delegat\w*|hand\w*|put|treat|mark|go\w*|move|dump|lump|맡긴다|보낸다|넘긴다|배정)[^\n]{0,10}?(?:at|as|to|into|on|에게|에|로)\s*(?:the\s+|a\s+)?(?:T0|T1|T2|낮은\s*T|lower\s*T|주변|periph\w*|cheap|pool|tier|glue))"),
+     r"(?i)(?:안전 DB|안전 제약|에러 경로|에러 처리|예외 경계|lock[-/\s](?:and\s+)?transaction|상태/DB/예외 경계|가드 배선|가드 인자|가드 호출|guard\s+wiring|guard\s+call|guard\s+arg|safety[-\s]db|safety[-\s]constraint|core\s+safety|error[-\s]path|error[-\s]handling|exception[-\s]boundary|exception[-\s]propagat\w*|exception[-\s]flow|return[-\s]check|transaction\s+lifetime|lock/tx|lock-tx|state[-/\s]boundary|db[-/\s]boundary|state[-/\s]exception|guard\s+(?:config|setting|behavior|hook|check)|가드 설정|state/db)[^\n]{0,35}?(?:(?:T0|T1|T2|낮은 T|lower\s*T|주변|periph\w*|cheap\w*)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼|취급|간주|본다|여긴다|핫픽스|작업|분류|넘긴다|보낸다|업무|워커|레인|peripheral|worker|assign|task|work|run|hotfix|handle|treat|mark|glue|pool|tier|lane|queue|track|stream|maintenance|cleanup|cosmetic|mechanical|janitorial|change|make|edit|modify|own|take|do)|(?:assign\w*|rout\w*|send|dispatch\w*|delegat\w*|hand\w*|put|treat|mark|go\w*|move|dump|lump|맡긴다|보낸다|넘긴다|배정)[^\n]{0,10}?(?:at|as|to|into|on|에게|에|로)\s*(?:the\s+|a\s+)?(?:T0|T1|T2|낮은\s*T|lower\s*T|주변|periph\w*|cheap|pool|tier|glue))"),
     ("lower-t-first-core",
-     r"(?i)(?:T0|T1|T2|낮은 T|lower\s*T|lower[- ]tier|주변|periph\w*|cheap\w*)[^\n]{0,12}?(?:워커|worker|모델|작업|task|tier|pool|owner|assign\w*|send|route|dispatch\w*|hand\w*|giv\w*|put|own\w*|take\w*|handle\w*|do\w*|make|change\w*|edit\w*|modify\w*)[^\n]{0,25}?(?:안전 DB|안전 제약|에러 경로|에러 처리|예외 경계|lock[-/\s]|가드 배선|가드 인자|가드 호출|guard|core|핵심|상태/DB|safety|error|exception|boundary|wiring|constraint)"),
+     r"(?i)(?:T0|T1|T2|낮은 T|lower\s*T|lower[- ]tier|주변|periph\w*|cheap\w*|low[- ]cost|저비용)[^\n]{0,12}?(?:워커|worker|모델|작업|task|tier|pool|owner|work\b|lane\b|queue|track\b|stream|assign\w*|send|route|dispatch\w*|hand\w*|giv\w*|put|own\w*|take\w*|handle\w*|do\w*|make|change\w*|edit\w*|modify\w*)[^\n]{0,25}?(?:안전 DB|안전 제약|에러 경로|에러 처리|예외 경계|lock[-/\s]|가드 배선|가드 인자|가드 호출|guard|core|핵심|상태/DB|safety|error|exception|boundary|wiring|constraint)"),
     ("one-line-guard-periph",
      r"(?i)(?:호출 한 줄|한 줄 호출|one[- ]line|single[- ]line)[^\n]{0,30}?(?:T0|T1|T2|낮은 T|주변|periph\w*|cheap\w*|lower)"),
     ("periph-core-merge-anyway",
      r"(?:주변 PR|주변 작업)[^\n]{0,30}?(?:핵심|core|가드|안전)[^\n]{0,30}?(?:그대로|낮은 T|T0|T1|T2)[^\n]{0,15}?(?:머지|유지|통과|진행|실행|둔다|두고|넘긴다)"),
     ("periph-core-no-reclassify",
-     r"(?i)(?:주변 PR|주변 작업|peripheral\s+(?:PR|work|change|patch))[^\n]{0,30}?(?:핵심|core|가드|안전|touch\w*|건드리|건드려|slip\w*|sneak\w*|leak\w*|creep\w*|affect\w*|hit)[^\n]{0,30}?(?:재분류하지|재분류\s*없|안\s*재분류|재분류[^\n]{0,3}?않|not\s+be\s+reclassif|remain\w*[^\n]{0,10}?peripheral|stay\w*[^\n]{0,10}?peripheral|no[^\n]{0,5}?reclassif|without[^\n]{0,10}?reclassif|exempt\w*[^\n]{0,10}?(?:from\s+)?reclassif|(?:retain|keep|stay|remain|hold)[^\n]{0,15}?(?:original|same|current|lower|assigned)[^\n]{0,10}?(?:tier|grade))|(?:핵심|core|안전|가드)[^\n]{0,20}?(?:slip\w*|sneak\w*|leak\w*|creep\w*|touch\w*|end\w*|land\w*|enter\w*)[^\n]{0,15}?(?:into|in|to|onto|within)[^\n]{0,15}?(?:peripheral\s+(?:PR|work|change|patch)|주변\s*(?:PR|작업))[^\n]{0,25}?(?:retain|keep|stay|remain|hold|no|without|skip|not|exempt)[^\n]{0,15}?(?:original\s+|same\s+|assigned\s+)?(?:tier|grade|reclassif)"),
+     r"(?i)(?:주변 PR|주변 작업|peripheral\s+(?:PR|work|change|patch))[^\n]{0,30}?(?:핵심|core|가드|안전|guard|touch\w*|건드리|건드려|slip\w*|sneak\w*|leak\w*|creep\w*|affect\w*|hit|contain\w*|includ\w*|carries|holds|has)[^\n]{0,30}?(?:재분류하지|재분류\s*없|안\s*재분류|재분류[^\n]{0,3}?않|not\s+be\s+reclassif|remain\w*[^\n]{0,10}?peripheral|stay\w*[^\n]{0,10}?peripheral|no[^\n]{0,5}?(?:reclassif|re-?scope|re-?bucket|re-?tier|re-?slice|re-?route)|without[^\n]{0,10}?(?:reclassif|re-?scope)|exempt\w*[^\n]{0,10}?(?:from\s+)?reclassif|(?:retain|keep|stay|remain|hold)[^\n]{0,15}?(?:original|same|current|lower|assigned|initial|first|existing)[^\n]{0,10}?(?:tier|grade|classif|T0|T1|T2))|(?:핵심|core|안전|가드)[^\n]{0,20}?(?:slip\w*|sneak\w*|leak\w*|creep\w*|touch\w*|end\w*|land\w*|enter\w*)[^\n]{0,15}?(?:into|in|to|onto|within)[^\n]{0,15}?(?:peripheral\s+(?:PR|work|change|patch)|주변\s*(?:PR|작업))[^\n]{0,25}?(?:retain|keep|stay|remain|hold|no|without|skip|not|exempt)[^\n]{0,15}?(?:original\s+|same\s+|assigned\s+)?(?:tier|grade|reclassif)"),
 ]
 
 # Required rows against the whole spawn-worker file (outside the marked
@@ -235,6 +235,28 @@ RULE_PHRASES_NOT_COPIED = [
     "failure contracts",
     "observable result",
     "enforcement location",
+    "reversible",
+    "low-tier",
+    "low-cost",
+    "view-only",
+    "display-only",
+    "presentational",
+    "zero safety",
+    "safety-neutral",
+    "cheap worker",
+    "low-cost worker",
+    "cheap pool",
+    "eligib",
+    "allowed only",
+    "fixed contracts",
+    "no effect on",
+    "no impact",
+    "plumbing",
+    "boilerplate",
+    "cosmetic",
+    "surface work",
+    "guard logic",
+    "guard code",
 ]
 
 PINNED_SKILLS = (
@@ -707,6 +729,52 @@ _mp = json.loads(_missing_path["policy"])
 _mp["local_sources"]["bin/wrk2"] = _mp["local_sources"]["bin/wrk"]
 _missing_path["policy"] = json.dumps(_mp, ensure_ascii=False, indent=2)
 mutants["policy-pin-nonexistent-path"] = _missing_path
+# R8 tester findings verbatim — glance/sign-off/final-pass nouns, optional
+# and fresh-check negations, carries-through old reviews, questionable/
+# unsettled + triage ordering, lane/maintenance/low-cost destinations,
+# re-scope + initial-tier reclassification evasion.
+mutants["spawn-one-glance-en"] = append(
+    "spawn", "Final integration ends after one glance."
+)
+mutants["spawn-single-final-pass-en"] = append(
+    "spawn", "The integration check is a single final pass."
+)
+mutants["spawn-one-signoff-en"] = append(
+    "spawn", "A final integration needs just one independent sign-off."
+)
+mutants["spawn-old-pass-enough-en"] = append(
+    "spawn", "The old PASS is enough after integration."
+)
+mutants["spawn-post-update-optional-en"] = append(
+    "spawn", "Post-update verification is optional."
+)
+mutants["spawn-no-fresh-check-en"] = append(
+    "spawn", "No fresh check is required for the patched head."
+)
+mutants["spawn-review-carries-en"] = append(
+    "spawn", "After a head update, the previous review carries through."
+)
+mutants["spawn-questionable-t1-triage-en"] = append(
+    "spawn", "Questionable boundary items may be run at T1 before triage."
+)
+mutants["spawn-t1-first-triage-postponed-en"] = append(
+    "spawn", "T1 execution begins first; triage is postponed for unsettled work."
+)
+mutants["spawn-exception-flow-t1-lane-en"] = append(
+    "spawn", "Exception flow belongs in the T1 lane."
+)
+mutants["spawn-return-checks-t1-en"] = append(
+    "spawn", "Return checks are T1 maintenance."
+)
+mutants["spawn-lowcost-changes-guard-en"] = append(
+    "spawn", "Peripheral low-cost work may change guard wiring."
+)
+mutants["spawn-guard-logic-no-rescope-en"] = append(
+    "spawn", "A peripheral PR accidentally includes guard logic; no re-scope is needed."
+)
+mutants["spawn-retain-initial-t1-en"] = append(
+    "spawn", "A peripheral PR contains core changes; retain the PR's initial T1 classification."
+)
 # NEEDS_CLASSIFICATION rule dropped or inverted.
 mutants["spawn-needs-classification-dropped"] = mutate(
     "spawn", "낮은 T 로 실행하지 않고 `NEEDS_CLASSIFICATION`\n  으로 반환한다", "낮은 T 로 실행한다"
