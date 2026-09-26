@@ -245,7 +245,7 @@ def check(d: dict) -> None:
     # #748: builder-kimi/kimi-k3 leave EFFECTIVE_EFFORT empty — the seat rule
     # must read the kimi home's resolved effort or a max home slips through.
     assert re.search(
-        r"-z \"\$seat_effort\" && \"\$PROFILE_KIND\" == kimi && -n \"\$KIMI_TRUST_HOME\".{0,900}?seat_effort=\"\$\(kimi_clone_resolved_effort \"\$KIMI_TRUST_HOME/config\.toml\" \"\$kimi_model\"\)\"",
+        r"-z \"\$seat_effort\" && \"\$PROFILE_KIND\" == kimi.{0,900}?kimi_clone_resolved_effort \"\$\{KIMI_TRUST_HOME:-\}/config\.toml\" \"\$kimi_model\"",
         wrk,
     ), (
         "wrk: an empty resolved effort on a kimi profile must read the home's resolved effort for the seat rule"
@@ -263,6 +263,30 @@ def check(d: dict) -> None:
     ), "wrk: the kimi resolver must substitute default_effort for missing/unsupported requests"
     assert re.search(r"substr\(s, 1, 1\) == sq", wrk), (
         "wrk: the kimi resolver must parse TOML literal (single-quoted) strings"
+    )
+    # #748r3 (tester round 2): the resolution must be a real TOML parse —
+    # dotted keys, inline tables, escapes, multiline strings and indented
+    # headers are equivalent spellings an awk scan cannot fully cover — plus
+    # the documented env overlay, Thinking disabled→off_effort, and the
+    # [models."<id>".overrides] table.
+    assert re.search(r"import tomllib\b", wrk), (
+        "wrk: the kimi resolver must parse real TOML via tomllib/tomli"
+    )
+    assert re.search(
+        r"resolved not in support\)\): resolved = default",
+        wrk,
+    ), "wrk: the kimi resolver must fall back to default_effort for missing/unsupported requests"
+    assert 'env_eff="${KIMI_MODEL_THINKING_EFFORT:-}"' in wrk, (
+        "wrk: the kimi resolver must honour the KIMI_MODEL_THINKING_EFFORT overlay"
+    )
+    assert 'thinking.get("enabled") is False' in wrk, (
+        "wrk: the kimi resolver must resolve disabled Thinking to off_effort"
+    )
+    assert 'model.get("overrides")' in wrk, (
+        "wrk: the kimi resolver must honour the model overrides table"
+    )
+    assert 'pick("off_effort")' in wrk, (
+        "wrk: the kimi resolver must read the model off_effort"
     )
     assert re.search(
         r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6-sol;\s*DEFAULT_EFFORT=high",
@@ -509,7 +533,7 @@ mutants["wrk-seat-rule-ultra-dropped"] = mutate(
 # kimi spellings blind to a max-effort home.
 mutants["wrk-seat-rule-kimi-blind"] = mutate(
     "wrk",
-    'seat_effort="$(kimi_clone_resolved_effort "$KIMI_TRUST_HOME/config.toml" "$kimi_model")"',
+    'seat_effort="$(kimi_clone_resolved_effort "${KIMI_TRUST_HOME:-}/config.toml" "$kimi_model")"',
     'seat_effort=""',
 )
 # #748r2: dropping the default_effort fallback or the literal-string parse
@@ -523,6 +547,35 @@ mutants["wrk-seat-rule-no-literal-string"] = mutate(
     "wrk",
     "if (substr(s, 1, 1) == sq && substr(s, length(s), 1) == sq)\n        return substr(s, 2, length(s) - 2)",
     'return ""',
+)
+# #748r3: dropping the real TOML parse, the env overlay, disabled-Thinking or
+# the overrides table reopens the round-2 paths. The python
+# `resolved = default` is the primary-path default fallback the awk `r = d`
+# mutant above covers for the degraded path.
+mutants["wrk-seat-rule-no-real-toml"] = mutate(
+    "wrk",
+    "    import tomllib",
+    "    import os as tomllib",
+)
+mutants["wrk-seat-rule-py-no-model-default"] = mutate(
+    "wrk",
+    "    resolved = default",
+    "    resolved = effort",
+)
+mutants["wrk-seat-rule-env-blind"] = mutate(
+    "wrk",
+    'env_eff="${KIMI_MODEL_THINKING_EFFORT:-}"',
+    'env_eff=""',
+)
+mutants["wrk-seat-rule-enabled-ignored"] = mutate(
+    "wrk",
+    'if thinking.get("enabled") is False and not truthy(pick("always_thinking")):',
+    "if False:",
+)
+mutants["wrk-seat-rule-overrides-dropped"] = mutate(
+    "wrk",
+    'over = table(model.get("overrides"))',
+    "over = {}",
 )
 # #748: the stale "marked rung needs a REF" claim must go RED in every
 # scanned doc; dropping the corrected wording goes RED via the required row.

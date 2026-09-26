@@ -156,7 +156,7 @@
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "c2431cd9d0f68f7126681a0269eb0538f35f65466260ba2d6adce91fdffe1610",
-    "bin/wrk": "62d3f403d91ca1189c69adf674575b19cb77fd03f94ec1b8f14aa43fbce571ef",
+    "bin/wrk": "d93ef90600ee7db7535ceba08340c929912f1e08b8d8a900384ee759b198106f",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
     "director/SKILL.md": "c242e1f0ac1aff42848001896e796e05888a695d6ba5a85675e1be96c8ff110c",
     "spawn-worker/SKILL.md": "a83f2527fb69c5f59e837bd4d834eff36e8697fdf12941a794ee86c5da2a42a6"
