@@ -3334,6 +3334,16 @@ set -e
   fail "builder-sol --effort max must die rc 2 (rc=$e6_max_rc): $e6_max_out"
 grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
   fail "builder-sol --effort max refusal must name the builder-seat rule: $e6_max_out"
+# codex `ultra` is the max tier plus subagents — the seat rule refuses it too.
+set +e
+e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-ultra-lane --parent parent-lane \
+  --effort ultra --job e6-builder-sol-effort-ultra --t T1 2>&1)"
+e6_max_rc=$?
+set -e
+[[ "$e6_max_rc" -eq 2 ]] ||
+  fail "builder-sol --effort ultra must die rc 2 (rc=$e6_max_rc): $e6_max_out"
+grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
+  fail "builder-sol --effort ultra refusal must name the builder-seat rule: $e6_max_out"
 echo "PASS 736 max-rung builder spellings closed by the builder-seat rule"
 
 # Marker mutants: no marker, and a marker naming a different rung, both die on

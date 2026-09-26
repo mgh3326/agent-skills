@@ -46,9 +46,13 @@ def block(text: str, name: str) -> str:
 # weakened or dropped clause goes RED instead of silently matching.
 BLOCK_ROWS = [
     ("builder-never-max", r"빌더 좌석은 max 런그를 쓰지 않는다"),
+    ("builder-ultra-counts", r"ultra[^\n]{0,30}?(거부|상한)"),
     ("builder-floor", r"high 이하, 또는 devin 프로필"),
+    ("builder-xhigh-exceptions", r"별도 승인된 xhigh 빌더"),
     ("builder-sol-high", r"Sol 빌더는? Sol high"),
+    ("devin-no-effort-flag", r"devin 빌더는? effort 플래그 없이"),
     ("max-t3-only", r"max effort 는 T3 구현 워커와 T3 tester 에만\s*예약한다"),
+    ("tier-max-exceptions", r"Luna max·devin swe2-max 는? 같은 결정이 명시한 예외"),
     ("wrk-enforces", r"wrk 도? `?--role builder`? 에서 max 를 거부한다"),
     ("t1t2-devin", r"T1/T2 구현 기본은 devin"),
     ("swe2max-free", r"SWE-2 max[^\n]{0,60}?무료이므로 적극 쓴다"),
@@ -57,12 +61,14 @@ BLOCK_ROWS = [
     ("sol-max-t3core", r"Sol max 는?[^\n]*?T3 코어[^\n]*한정"),
     ("tier-t2", r"T2 = Sonnet high / Terra high~xhigh 또는 Sol high"),
     ("tier-t1", r"T1·기계적 작업 = Haiku / Luna max / devin swe2-max"),
-    ("sol-worker-xhigh", r"Sol 워커 기본 effort 는? `?xhigh`?"),
+    ("sol-worker-xhigh", r"Sol 워커 배정은? `?--effort xhigh`? 명시가 기본"),
+    ("sol-worker-codex-max", r"codex-sol`?\s*철자 자체의 기본값은 max"),
     ("terra-replaced", r"Terra max 는? Sol high~xhigh 로 대체"),
     ("terra-auxiliary", r"Sol 을? 못 쓸 때의 보조"),
     ("terra-no-load-claim", r"부하를 분산한다\"?고 주장하지 않는다"),
     ("sonnet5-substitute", r"Sonnet 5 는? 우선순위 낮은 codex 대체재"),
     ("cite-decision", r"2026-09-26 운영자 결정"),
+    ("cite-relay", r"director-1 relay"),
     ("cite-telemetry", r"pinion05\.github\.io/aa-model-telemetry"),
     ("cite-collected", r"수집 2026-09-23"),
     ("no-bench-copy", r"벤치 수치는?"),
@@ -72,9 +78,22 @@ BLOCK_ROWS = [
 # Patterns that must NOT appear anywhere in a skill file — the classes of
 # drift this test exists to catch.
 FILE_FORBIDDEN = [
+    # devin builder spellings carry the rung in the model name and are
+    # allowed (and encouraged) — builder-devin-max/builder-ds41-max are not
+    # "a builder using max" in the drift sense.
     ("builder-max-default",
-     r"빌더[^\n]{0,40}?(?:max[^\n]{0,12}?(?:기본|default|권장|허용|쓴다)|(?:기본|default|권장|허용)[^\n]{0,12}?max)"),
-    ("devin-sole-granted", r"devin\(A\+\)[^\n]{0,20}?T3[^\n]{0,60}?단독[^\n]{0,80}?(된다|허용)"),
+     r"(?:빌더|builders?\b(?!-(?:devin|ds41)))[^\n]{0,40}?(?:max[^\n]{0,15}?(?:기본|default|권장|허용|쓴다|쓸 수 있다|써도 된다|열린다|뜬다|가능|\bmay\b|\bcan\b|\ballowed\b|\bopen\b|\blaunch)|(?:기본|default|권장|허용|\bmay\b|\bcan\b|\ballowed\b|\bopen\b|\blaunch)[^\n]{0,12}?max)"),
+    ("builder-max-spelling-opens",
+     r"builder-(?:sonnet|sol|luna|terra|kimi)-max[^\n]{0,30}?(?:launch|opens?|열린|뜬|쓸 수 있다|될 수 있다)"),
+    ("devin-sole-granted",
+     r"(?:devin[^\n]{0,40}?T3|T3[^\n]{0,40}?devin)[^\n]{0,60}?단독[^\n]{0,60}?(가 된다|될 수 있다|허용|가능|쓴다|쓸 수 있다)"),
+]
+
+# Same drift classes in the launcher: help and comment text must not claim a
+# closed max-rung builder spelling opens or launches.
+WRK_FORBIDDEN = [
+    ("wrk-max-spelling-launch",
+     r"builder-(?:sonnet|sol|luna|terra|kimi)-max[^\n]{0,30}?(?:opens?|launches|spawns?|열린|뜬)"),
 ]
 
 CLOSED_E6 = r"max 런그 철자\([^\n]*?builder-sonnet-max[^\n]*?\)는? 닫혔다"
@@ -100,6 +119,13 @@ def check(d: dict) -> None:
         assert not re.search(r"\d+\.\d+", blk), (
             f"{name}: benchmark-style number copied into the T736 block"
         )
+    # The launcher text must not claim a closed max-rung builder opens.
+    wrk_flat = flat(d["wrk"])
+    for row, pattern in WRK_FORBIDDEN:
+        assert not re.search(pattern, wrk_flat), (
+            f"wrk: forbidden wording reintroduced ({row}): "
+            f"{re.search(pattern, wrk_flat).group(0)!r}"
+        )
     # The closed max-rung E6 spellings are documented where the rungs live.
     for name in ("spawn", "builder"):
         assert re.search(CLOSED_E6, flat(d[name])), (
@@ -114,6 +140,11 @@ def check(d: dict) -> None:
     )
     assert re.search(r"ROLE:-worker.{0,40}?builder.{0,40}?EFFECTIVE_EFFORT.{0,15}?max", wrk), (
         "wrk: the seat rule must gate on role=builder and resolved effort max"
+    )
+    # ultra is the codex max tier plus subagents — the seat rule must refuse it
+    # as well, or --effort ultra bypasses the whole rule (tester-found hole).
+    assert re.search(r"EFFECTIVE_EFFORT.{0,15}?max\|ultra\)", wrk), (
+        "wrk: the seat rule must refuse the ultra rung too (max|ultra)"
     )
     assert re.search(
         r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6-sol;\s*DEFAULT_EFFORT=high",
@@ -158,9 +189,9 @@ for name in SKILLS:
         name, "단독 구현자·단독 tester 가 되지 않는다", "단독 구현자·단독 tester 도 된다"
     )
     reserve_old = (
-        "T3 구현 워커와\n  T3 tester 에만 예약한다"
+        "T3 구현 워커와 T3 tester 에만\n  예약한다"
         if name == "spawn"
-        else "T3 구현 워커와 T3 tester 에만\n  예약한다"
+        else "T3 구현 워커와\n  T3 tester 에만 예약한다"
     )
     mutants[f"{name}-max-reservation-dropped"] = mutate(
         name, reserve_old, "주로 T3 에 쓴다"
@@ -190,7 +221,55 @@ mutants["terra-replacement-dropped"] = mutate(
     "spawn", "Terra max 는 Sol high~xhigh 로\n  대체한다", "Terra max 도 유효하다"
 )
 mutants["sol-xhigh-default-weakened"] = mutate(
-    "spawn", "Sol 워커 기본 effort 는 `xhigh`", "Sol 기본 effort 는 max"
+    "spawn", "Sol 워커 배정은 `--effort xhigh` 명시가 기본이다", "Sol 워커 배정은 max 가 기본이다"
+)
+# A builder could read "Sol worker default xhigh" as the tool default and
+# launch `-m codex-sol` bare — getting max. The warning must stay.
+mutants["sol-codex-default-warning-dropped"] = mutate(
+    "spawn",
+    "`codex-sol` 철자\n  자체의 기본값은 max 라서 플래그 없이 띄우면 max 로 간다",
+    "`codex-sol` 철자로 띄운다",
+)
+# The named xhigh builder exceptions keep "high 이하" from contradicting
+# builder-grok/builder-luna; dropping them reintroduces the contradiction.
+mutants["xhigh-exceptions-dropped"] = mutate(
+    "builder", "별도 승인된 xhigh 빌더 — `builder-grok`·\n  `builder-luna`·E6 xhigh 철자 — 는 그대로다", ""
+)
+# The T1 max-variant exceptions are what keep the tier row consistent with
+# the T3-only max reservation; dropping them reintroduces the contradiction.
+mutants["tier-max-exceptions-dropped"] = mutate(
+    "director", "Luna max·devin swe2-max 는 같은 결정이 명시한\n  예외다", ""
+)
+# Provenance: the tier table came via the director-1 relay, not the hk doc.
+mutants["relay-citation-dropped"] = mutate(
+    "director", "director-1 relay 수신분", ""
+)
+# Forbidden-pattern mutants (tester round-1 classes): these only the guard
+# catches — every required row still reads the same.
+mutants["en-builder-may-max"] = mutate(
+    "director",
+    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+    "builders may use max for T3 work.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+)
+mutants["ko-builder-seats-can-max"] = mutate(
+    "builder",
+    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+    "빌더 좌석도 T3 에서는 max 런그를 쓸 수 있다.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+)
+mutants["devin-sole-permission-no-tag"] = mutate(
+    "director",
+    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+    "T3 tester 로 devin-swe2-max 단독 배정을 허용한다.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+)
+mutants["post-block-repeal"] = mutate(
+    "spawn",
+    "<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+    "위 규칙은 폐지됐다 — 빌더 좌석은 max 를 써도 된다.\n<!-- /T736-ASSIGNMENT-DEFAULTS -->",
+)
+mutants["wrk-help-max-launch"] = mutate(
+    "wrk",
+    "closed — a builder seat never takes a max rung, marker or not.",
+    "open — builder-sol-max launches when armed.",
 )
 mutants["tier-t2-weakened"] = mutate(
     "builder", "T2 = Sonnet high / Terra high~xhigh 또는 Sol high", "T2 = Sonnet max"
@@ -229,8 +308,13 @@ mutants["closed-e6-note-dropped"] = mutate(
 )
 mutants["wrk-seat-rule-removed"] = mutate(
     "wrk",
-    'if [[ "${ROLE:-worker}" == builder && "$EFFECTIVE_EFFORT" == max ]]; then',
+    'if [[ "${ROLE:-worker}" == builder ]]; then',
     "if false; then",
+)
+mutants["wrk-seat-rule-ultra-dropped"] = mutate(
+    "wrk",
+    "      max|ultra)",
+    "      max)",
 )
 mutants["wrk-builder-sol-back-to-max"] = mutate(
     "wrk",
@@ -305,6 +389,18 @@ set -e
 grep -q 'builder seats never take a max rung' <<<"$out" ||
   fail "builder-sol --effort max refusal must name the seat rule: $out"
 echo "PASS builder-sol --effort max dies on the builder-seat rule"
+
+# codex `ultra` is the max tier plus subagents — the seat rule refuses it too;
+# without that arm a builder could still take a max-tier rung (tester-found).
+set +e
+out="$(spawn_t736 builder-sol --role builder --lane builder-lane --parent parent-lane \
+  --effort ultra --job t736-builder-sol-ultra 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 2 ]] || fail "builder-sol --effort ultra must die rc 2 (rc=$rc): $out"
+grep -q 'builder seats never take a max rung' <<<"$out" ||
+  fail "builder-sol --effort ultra refusal must name the seat rule: $out"
+echo "PASS builder-sol --effort ultra dies on the builder-seat rule"
 
 # The E6 max-rung spelling dies the same way even with its exact marker armed —
 # the seat rule fires before the E6 pin check.

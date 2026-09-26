@@ -136,20 +136,26 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
 
 <!-- T736-ASSIGNMENT-DEFAULTS -->
 🔴 **배정 기본값 (출처: 2026-09-26 운영자 결정 `decision/2026-09-26/effort-efficiency` B
-+ AA telemetry 스냅샷 `pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23)** —
++ 같은 날 운영자 tier 표 — director-1 relay 수신분 + AA telemetry 스냅샷
+`pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23)** —
 결정과 스냅샷은 인용하되 **벤치 수치는 이 문서에 복사하지 않는다.** 급의 정본은 계속
 `scopefuel --recommend` 와 scopefuel 정책이고, 위 급표가 이 문서의 유일한 급표다.
 
-- **빌더 좌석은 max 런그를 쓰지 않는다** — high 이하, 또는 devin 프로필이다. Sol 빌더는
-  Sol high 를 쓰고, devin 빌더는 무료 런그 그대로다. **max effort 는 T3 구현 워커와
-  T3 tester 에만 예약한다.** wrk 도 `--role builder` 에서 max 를 거부한다.
+- **빌더 좌석은 max 런그를 쓰지 않는다**(codex `ultra` = max+서브에이전트 계열, 같은 거부다) —
+  기본은 high 이하, 또는 devin 프로필이다(별도 승인된 xhigh 빌더 — `builder-grok`·
+  `builder-luna`·E6 xhigh 철자 — 는 그대로다). Sol 빌더는 Sol high 를 쓰고, devin 빌더는
+  effort 플래그 없이 모델 런그 그대로다. **max effort 는 T3 구현 워커와 T3 tester 에만
+  예약한다** — T1 행의 Luna max·devin swe2-max 는 같은 결정이 명시한 예외다.
+  wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
 - **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
   `builder-devin-max`)은 무료이므로 적극 쓴다.
-- **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** — §2-4 규칙 그대로 유지.
-- **티어별 기본(T3 제외 모두 non-max)**: T3 코어·tester = Opus xhigh / Sol xhigh(Sol max 는
+- **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** — §2-2 급표 행의
+  규칙 그대로 유지.
+- **티어별 기본**: T3 코어·tester = Opus xhigh / Sol xhigh(Sol max 는
   필요할 때만, T3 코어 한정) · T2 = Sonnet high / Terra high~xhigh 또는 Sol high ·
   T1·기계적 작업 = Haiku / Luna max / devin swe2-max.
-- **codex 계열**: Sol 워커 기본 effort 는 `xhigh`. **Terra max 는 Sol high~xhigh 로
+- **codex 계열**: Sol 워커 배정은 `--effort xhigh` 명시가 기본이다 — `codex-sol` 철자
+  자체의 기본값은 max 라서 플래그 없이 띄우면 max 로 간다. **Terra max 는 Sol high~xhigh 로
   대체한다** — Terra 는 Sol 을 못 쓸 때의 보조다(동점이면 토큰을 더 쓴다). scopefuel 에
   gpt-reserve 7d 창(이 모델만)이 보이지만 어느 모델을 덮는지 미확정이므로 "Terra 가
   부하를 분산한다"고 주장하지 않는다.

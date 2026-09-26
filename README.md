@@ -180,7 +180,7 @@ reps 3건으로 확정한다. `devin-ds41`·`devin-ds41-max`만 유료다.
 `captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
 경고 후 builder로 정규화되는 legacy 별칭이다. `builder-devin`(devin-swe2
 argv, A+ 급 작업의 T1·T2 빌더 — `spawn-worker` 급표 행이 정본)와 빌더 파일럿으로 `builder-grok`(grok 4.7, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
-#666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)와 #704·#737 의 E6 측정 런그 철자(`builder-opus-low` 등 16개 — 위 단락 참조, `SCOPEFUEL_E6_ARM` 표식 필수)도 `--role builder`를 받는다.
+#666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)와 #704·#737 의 E6 측정 런그 철자(`builder-opus-low` 등 16개 — 위 단락 참조, `SCOPEFUEL_E6_ARM` 표식 필수; max 런그 5개는 2026-09-26 좌석 규칙으로 닫힘)도 `--role builder`를 받는다.
 파일럿이 지목한 워커 철자 `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire

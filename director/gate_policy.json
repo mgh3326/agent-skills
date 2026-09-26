@@ -156,10 +156,10 @@
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "c2431cd9d0f68f7126681a0269eb0538f35f65466260ba2d6adce91fdffe1610",
-    "bin/wrk": "ddd7031f8200d2d1070fc649f1b20fad63380ce8278a4155f57a27a9ead88f59",
+    "bin/wrk": "a9acc02ec7c7c4c255618001b77c10f31b2da800779919260b0acab45224cf8a",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
-    "director/SKILL.md": "6d7abcca2d9dd4a2d813db8c347d9202be2504129c7a30fdb9282237b74860f6",
-    "spawn-worker/SKILL.md": "e0e6736719c826b1461b016f1deeea3a686692b8281e9789f0b3686a8a5ffd38"
+    "director/SKILL.md": "22d185a2d426dfcf12b7de05ee00a67fd71c54a4005e2196d91ede6a9ec25b26",
+    "spawn-worker/SKILL.md": "9d0ca1e18a31abf92f4e5aaa02a1aab331b42ee8e6a4f5adaab408bde9be1789"
   },
   "profiles": {
     "agy-flash": {
