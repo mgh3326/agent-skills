@@ -155,11 +155,11 @@
   "effective_at": "2026-09-25T00:00:00Z",
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "921de879db75a614bedb7da4dcd4b629c3124b1f289c49316b6004d51434c96c",
-    "bin/wrk": "68319bf4c7e0ae2d402d993f1a2a43dc4a18c5ba4961329444ad5b939b6bd712",
+    ".github/workflows/ci.yml": "c2431cd9d0f68f7126681a0269eb0538f35f65466260ba2d6adce91fdffe1610",
+    "bin/wrk": "a3a6eb4ec630399b0c1c2d95276c48de1cd65a76e286afd2ee822c0209589916",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
-    "director/SKILL.md": "1e46b7961727ab3ebdd5f61aeebba678a48888995c0520acbc04046c243f025a",
-    "spawn-worker/SKILL.md": "1011822d1e0ad81034a76e6246a6a71375119815918cd1841cd46f20f9251357"
+    "director/SKILL.md": "c242e1f0ac1aff42848001896e796e05888a695d6ba5a85675e1be96c8ff110c",
+    "spawn-worker/SKILL.md": "7369362f71de114f4998b672545354f9e7a4cd69db66de1add891fb159012429"
   },
   "profiles": {
     "agy-flash": {
@@ -509,7 +509,7 @@
       ]
     },
     "builder-sol": {
-      "default_effort": "max",
+      "default_effort": "high",
       "family": "openai",
       "grades": {
         "high": "S+",
@@ -704,7 +704,7 @@
       ]
     },
     "captain-sol": {
-      "default_effort": "max",
+      "default_effort": "high",
       "family": "openai",
       "grades": {
         "high": "S+",
