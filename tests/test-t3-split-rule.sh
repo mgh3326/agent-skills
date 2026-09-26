@@ -68,11 +68,15 @@ BLOCK_ROWS = [
     ("core-error-path", r"에러 경로"),
     ("core-lock-tx", r"lock/transaction 수명"),
     ("core-state-boundary", r"상태/DB/예외 경계"),
-    # Peripheral work eligible for cheaper models.
+    # Peripheral work eligible for cheaper models — every eligibility
+    # condition is pinned, not just the allowed-file list (tester B-R1-1).
     ("periph-rendering", r"순수 렌더링"),
     ("periph-cli-readonly", r"검증된 읽기 API[^\n]{0,10}?CLI 출력"),
     ("periph-api-glue", r"고정 API 연결"),
+    ("periph-fixed-contract", r"입/출력[^\n]{0,5}?실패 계약 고정"),
+    ("periph-no-safety-impact", r"안전 결정[^\n]{0,5}?권한[^\n]{0,5}?상태[^\n]{0,5}?증거[^\n]{0,10}?영향 없음"),
     ("periph-conditions", r"허용 파일/심볼[^\n]{0,10}?금지 변경"),
+    ("periph-independent", r"독립 인수[^\n]{0,5}?되돌리기 가능"),
     # Ambiguous = NEEDS_CLASSIFICATION, never a lower-T run.
     ("needs-classification", r"애매하면[^\n]{0,20}?낮은 T[^\n]{0,10}?실행하지 않고[^\n]{0,10}?NEEDS_CLASSIFICATION"),
     # Peripheral PR that touches core is reclassified T3; cite #728 PR 2/#733.
@@ -83,6 +87,9 @@ BLOCK_ROWS = [
     # Normal round cap applies — no one-round cap on the integration tester.
     ("normal-round-cap", r"라운드 캡[^\n]{0,15}?3라운드[^\n]{0,20}?그대로 적용"),
     ("cap-not-shrunk", r"라운드 상한을 따로 줄이지 않는다"),
+    # The weekly-pool single-round limit (§2-2) must not reach the final
+    # integration tester — §2-6 carries the exclusion (tester B-R1-2).
+    ("weekly-pool-carveout", r"단일[^\n]{0,3}?라운드 한정[^\n]{0,20}?tester 는? 최종 통합 tester 가 될 수 없다"),
     # Parent T3 ownership and per-child gates survive.
     ("parent-ownership", r"불변식 소유[^\n]{0,10}?핵심 책임자 1명[^\n]{0,20}?최종 검증 수준[^\n]{0,10}?유지"),
     # Gate-side machinery is task #746's scope.
@@ -111,6 +118,21 @@ FILE_FORBIDDEN = [
     # File-type split coming back as the axis.
     ("file-type-axis",
      r"파일 종류로 나눈다|파일 종류[^\n]{0,16}?\)로 나눈다|UI/CLI/fixture/문서[^\n]{0,20}?자동[^\n]{0,10}?T[12]|UI·CLI·테스트[^\n]{0,20}?(?:로|별로)[^\n]{0,10}?분류"),
+    # The weekly-pool one-round limit carried onto the T3 final-integration
+    # tester (tester B-R1-2 — the pre-existing line-111 conflict). The cap
+    # alternation covers application forms only — the rule itself is cited
+    # by name ("단일 라운드 한정(§2-2)") in legit prose and must not trip.
+    ("integration-single-round-ko",
+     r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?단일 라운드[^\n]{0,5}?(?:로[^\n]{0,5}?(?:한정|제한|상한|캡)|한정[은을이가]|상한|캡|제한|만|까지|에만|검증)"),
+    ("weekly-pool-t3-carry",
+     r"T3[^\n]{0,40}?(?:최종\s*)?통합[^\n]{0,40}?tester[^\n]{0,40}?단일 라운드[^\n]{0,5}?(?:로[^\n]{0,5}?(?:한정|제한|상한|캡)|한정[은을이가]|상한|캡|제한|만|까지|에만|검증)"),
+]
+
+# Required rows against the whole spawn-worker file (outside the marked
+# block): the §2-2 weekly-pool footnote must carry the carve-out pointer.
+FILE_ROWS = [
+    ("weekly-pool-111-carveout",
+     r"단일 라운드 한정은?[^\n]{0,30}?최종 통합[^\n]{0,10}?T3 tester[^\n]{0,20}?적용하지 않는다"),
 ]
 
 # Sentences that must exist ONLY inside the spawn block — a second copy in a
@@ -140,6 +162,9 @@ def check(d: dict) -> None:
                 f"{name}: forbidden T3-split wording ({row}): "
                 f"{re.search(pattern, text).group(0)!r}"
             )
+    spawn_text = flat(d["spawn"])
+    for row, pattern in FILE_ROWS:
+        assert re.search(pattern, spawn_text), f"spawn: file-level row '{row}' missing or weakened"
     # Single canonical copy: pointers reference spawn §2-6 but carry no rules.
     for name in ("builder", "director"):
         assert START not in d[name] and END not in d[name], (
@@ -224,6 +249,41 @@ mutants["spawn-rendering-any"] = mutate(
 )
 mutants["spawn-cli-readwrite"] = mutate(
     "spawn", "검증된 읽기 API 의 CLI", "읽기·쓰기 API 의 CLI"
+)
+# The surviving mutant the tester found (B-R1-1): flipping the safety-impact
+# condition classified safety-touching work as peripheral while the contract
+# still passed. Every eligibility condition is pinned now.
+mutants["spawn-safety-impact-relaxed"] = mutate(
+    "spawn", "안전 결정·권한·상태·증거에 영향 없음", "안전 결정·권한·상태·증거에 영향 있음"
+)
+mutants["spawn-fixed-contract-dropped"] = mutate(
+    "spawn", "입/출력·\n  실패 계약 고정", "입/출력 계약은 추후에 정한다"
+)
+mutants["spawn-enumerable-dropped"] = mutate(
+    "spawn", "허용 파일/심볼·금지\n  변경 열거 가능", "허용 범위는 작업자가 정한다"
+)
+mutants["spawn-independent-dropped"] = mutate(
+    "spawn", "독립 인수·되돌리기 가능", "팀 내 인수만 가능"
+)
+# Other unlisted mutants the tester ran (all were RED — keep them in-repo).
+mutants["spawn-observation-column-dropped"] = mutate(
+    "spawn", "· 독립 관찰 결과", ""
+)
+mutants["spawn-api-glue-generalized"] = mutate(
+    "spawn", "안전 경로와 무관한 고정 API 연결", "API 연결은 전부 주변"
+)
+mutants["spawn-reclassify-t2"] = mutate(
+    "spawn", "그 PR 은 T3 로 재분류한다", "그 PR 은 T2 로 재분류한다"
+)
+# Weekly-pool one-round limit reaching the final integration tester (B-R1-2).
+mutants["spawn-weekly-carveout-dropped"] = mutate(
+    "spawn", "**주간 풀 단일\n  라운드 한정(§2-2)이 붙는 tester 는 최종 통합 tester 가 될 수 없다** — 통합\n  자리는 일반 라운드 캡이 필요하므로, 한정이 걸린 tester 로는 통합 검증을 열지\n  않고 다른 합집합 밖 tester 를 확보한다", ""
+)
+mutants["spawn-111-carveout-dropped"] = mutate(
+    "spawn", " 이 **단일 라운드 한정은 최종 통합 T3 tester 자리에는 적용하지 않는다** — 그 자리는 §2-6 의 일반 라운드 캡이 필요하다.", ""
+)
+mutants["spawn-weekly-limit-applied"] = append(
+    "spawn", "T3 최종 통합 tester 도 주간 풀 한정이라면 단일 라운드로 한정한다."
 )
 # NEEDS_CLASSIFICATION rule dropped or inverted.
 mutants["spawn-needs-classification-dropped"] = mutate(

@@ -159,7 +159,7 @@
     "bin/wrk": "496fb461f69a6dfd659a35030e9d01874a4cd7a4148badaee4cde538002bd298",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
     "director/SKILL.md": "73417f7f1f387f81878cd47f9084084b88a64c56b44be9363949fb0c92d4cb97",
-    "spawn-worker/SKILL.md": "0510dfa28447a3e9dd32b507e942cdd4736c6c273e91d0a1ba319365b6af3b57"
+    "spawn-worker/SKILL.md": "9c37e0c45cafeabb14b9bf6b8f672f07d7a771ebaf843f87aca5b7f9bf8c66f9"
   },
   "profiles": {
     "agy-flash": {
