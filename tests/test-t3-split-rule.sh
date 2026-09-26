@@ -130,19 +130,25 @@ FILE_FORBIDDEN = [
     # a once-only integration pass, a skipped re-verify, ambiguous work run
     # low then classified later, core classes named without the word 핵심.
     ("integration-one-pass",
-     r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:한 차례|한 번|한번|1회|단 한 번)[^\n]{0,10}?(?:만[^\n]{0,10}?(?:검증|확인|통과)|검증[^\n]{0,10}?(?:으로\s*끝|까지만|충분|하면\s*된다))"),
+     r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:한 차례|한 번|한번|1회|단 한 번|1패스|한 패스)[^\n]{0,10}?(?:만[^\n]{0,15}?(?:검증|확인|보고|통과|본다|체크|끝낸다)|(?:검증|확인|보고|통과|체크)[^\n]{0,10}?(?:으로\s*끝|까지만|충분|하면\s*된다|끝낸다))"),
+    ("integration-one-pass-en",
+     r"(?i)(?:final\s+)?integration[^\n]{0,40}?(?:tester|verification|verifier|review|check)[^\n]{0,40}?(?:(?:one|single|a\s+single|just\s+one|1)[ -]?(?:pass|round|look|check|review|verification)|verify\s+once|check\s+once|once\s+only)"),
+    ("integration-cap-numeric",
+     r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:cap|캡|상한)[^\n]{0,8}?[:=]?\s*1\b"),
     ("integration-no-reverify",
-     r"(?:수정된|바뀐|새)\s*head[^\n]{0,15}?(?:재검증|다시 검증|재확인)[^\n]{0,5}?(?:하지\s*않|없)|재검증[^\n]{0,5}?(?:없이|하지|생략)"),
+     r"(?:수정된|바뀐|새)\s*head[^\n]{0,15}?(?:재검증|다시 검증|재확인|검증)[^\n]{0,12}?(?:하지\s*않|없|생략|불필요|필요[^\n]{0,3}?없)|재검증[^\n]{0,12}?(?:없이|하지|생략|불필요|필요[^\n]{0,3}?없)"),
+    ("integration-no-reverify-en",
+     r"(?i)re-?verif\w*[^\n]{0,10}?(?:not needed|unnecessary|skipped)|(?:skip|omit|no|without)[^\n]{0,15}re-?verif"),
     ("ambiguous-lower-t-alt",
-     r"(?:애매|경계가|분류 불가)[^\n]{0,30}?(?:T0|T1|T2|낮은 T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작)(?!하지)"),
+     r"(?i)(?:애매|모호|불명확|미분류|경계가|분류 불가|unclear|unclassified|ambiguous)[^\n]{0,30}?(?:(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|start|run|assign|dispatch|handle)(?!하지)|(?:start|begin|run|assign|dispatch|handle|send|route)[^\n]{0,10}?(?:at|as|to|into|on)\s*(?:T0|T1|T2|lower\s*T))"),
     ("ambiguous-posthoc-classify",
-     r"애매[^\n]{0,40}?(?:사후|나중에?|추후|뒤에?)[^\n]{0,10}?(?:분류|재분류)"),
+     r"(?i)(?:애매|모호|불명확|미분류|경계 작업|ambiguous|unclear)[^\n]{0,40}?(?:(?:사후|나중에?|추후|뒤에?|afterwards|later)[^\n]{0,10}?(?:분류|재분류|classif)|(?:분류|재분류|classif\w*)[^\n]{0,10}?(?:사후|나중에|추후|뒤에|afterwards|later))"),
     ("core-class-lower-t",
-     r"(?:안전 DB|에러 경로|lock/transaction|상태/DB/예외 경계|가드 배선|가드 인자)[^\n]{0,25}?(?:T0|T1|T2|낮은 T)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼)"),
+     r"(?i)(?:안전 DB|에러 경로|lock/transaction|상태/DB/예외 경계|가드 배선|가드 인자|guard\s+wiring|safety[-\s]db|error\s+path|state/db)[^\n]{0,25}?(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼|취급|간주|본다|여긴다|핫픽스|작업|분류|넘긴다|보낸다|peripheral|assign|task|work|run|hotfix|handle)"),
     ("one-line-guard-periph",
-     r"(?:호출 한 줄|한 줄 호출|one[- ]line)[^\n]{0,30}?(?:T0|T1|T2|낮은 T|주변)"),
+     r"(?i)(?:호출 한 줄|한 줄 호출|one[- ]line)[^\n]{0,30}?(?:T0|T1|T2|낮은 T|주변)"),
     ("periph-core-merge-anyway",
-     r"(?:주변 PR|주변 작업)[^\n]{0,30}?(?:핵심|core|가드|안전)[^\n]{0,30}?(?:그대로|낮은 T|T0|T1|T2)[^\n]{0,15}?(?:머지|유지|통과|진행|실행)"),
+     r"(?:주변 PR|주변 작업)[^\n]{0,30}?(?:핵심|core|가드|안전)[^\n]{0,30}?(?:그대로|낮은 T|T0|T1|T2)[^\n]{0,15}?(?:머지|유지|통과|진행|실행|둔다|두고|넘긴다)"),
 ]
 
 # Required rows against the whole spawn-worker file (outside the marked
@@ -170,7 +176,21 @@ RULE_PHRASES_NOT_COPIED = [
     "lock/transaction 수명",
     "상태/DB/예외 경계",
     "T3 로 재분류한다",
+    "T3 재분류",
+    "핵심을 건드리면",
     "최종 통합 tester 가 될 수 없다",
+    "실패 계약 고정",
+    "안전 DB 제약",
+    "에러 경로",
+    "검증된 읽기",
+    "주간 풀 단일",
+    "일반 라운드 캡이 필요",
+    "미등록 변경은 침범",
+    "불변식 표를 먼저",
+    "주문·브로커",
+    "invariant impact",
+    "file type",
+    "ambiguous",
 ]
 
 PINNED_SKILLS = (
@@ -213,7 +233,7 @@ def check(d: dict) -> None:
             f"{name}: one-line pointer to spawn-worker §2-6 missing"
         )
         for phrase in RULE_PHRASES_NOT_COPIED:
-            assert phrase not in text, (
+            assert phrase.casefold() not in text.casefold(), (
                 f"{name}: rule sentence copied out of the canonical block: {phrase!r}"
             )
     # The gate policy pins the skill files: a re-pinned hash must match the
@@ -231,6 +251,10 @@ def check(d: dict) -> None:
 
     policy = json.loads(d["policy"], object_pairs_hook=_no_dup_keys)
     pinned = policy["local_sources"]
+    # Malformed shapes must fail by assertion, not TypeError (R5 tester:
+    # numeric pin value and numeric local_sources crashed outside the
+    # assertion-RED path).
+    assert isinstance(pinned, dict), "gate_policy local_sources must be an object"
     for rel in REQUIRED_PINS:
         assert rel in pinned, (
             f"gate_policy local_sources must pin {rel} "
@@ -239,10 +263,11 @@ def check(d: dict) -> None:
     for rel in sorted(set(PINNED_SKILLS) | set(REQUIRED_PINS)):
         if rel not in pinned:
             continue
+        val = pinned[rel]
         actual = hashlib.sha256((root / rel).read_bytes()).hexdigest()
-        assert pinned[rel] == actual, (
-            f"gate_policy local_sources pin for {rel} is stale "
-            f"(pinned {pinned[rel][:12]}… actual {actual[:12]}…)"
+        assert isinstance(val, str) and val == actual, (
+            f"gate_policy local_sources pin for {rel} is stale or malformed "
+            f"(pinned {str(val)[:12]}… actual {actual[:12]}…)"
         )
 
 
@@ -416,6 +441,49 @@ mutants["director-core-enum-copied"] = append(
 )
 mutants["builder-reclassify-copied"] = append(
     "builder", "주변 PR 이 핵심을 건드리면 그 PR 은 T3 로 재분류한다."
+)
+# R5 tester findings verbatim — further alternate wording, partial copies,
+# and numeric pin shapes that must fail by assertion (not TypeError).
+mutants["spawn-integration-look-once"] = append(
+    "spawn", "최종 통합 tester 는 한 번만 보고 끝낸다."
+)
+mutants["spawn-no-reverify-needed"] = append(
+    "spawn", "수정된 head 는 재검증할 필요가 없다."
+)
+mutants["spawn-vague-boundary-t1"] = append(
+    "spawn", "모호한 경계는 T1 에 먼저 배정하고 나중에 분류한다."
+)
+mutants["spawn-guard-arg-t1-regard"] = append(
+    "spawn", "가드 인자 변경은 T1 작업으로 취급할 수 있다."
+)
+mutants["spawn-safety-db-t1-hotfix"] = append(
+    "spawn", "안전 DB 제약 변경은 T1 핫픽스다."
+)
+mutants["builder-contract-frag-copied"] = append(
+    "builder", "입/출력·실패 계약 고정."
+)
+mutants["director-core-partial-copied"] = append(
+    "director", "안전 DB 제약 · 에러 경로."
+)
+mutants["builder-reclassify-partial"] = append(
+    "builder", "주변 PR 이 핵심을 건드리면 T3 재분류."
+)
+_numpin = dict(docs)
+_np = json.loads(_numpin["policy"])
+_np["local_sources"]["spawn-worker/SKILL.md"] = 17
+_numpin["policy"] = json.dumps(_np, ensure_ascii=False, indent=2)
+mutants["policy-spawn-pin-number"] = _numpin
+_nummap = dict(docs)
+_nm = json.loads(_nummap["policy"])
+_nm["local_sources"] = 17
+_nummap["policy"] = json.dumps(_nm, ensure_ascii=False, indent=2)
+mutants["policy-local-sources-number"] = _nummap
+# English forms of the same attack classes.
+mutants["spawn-integration-single-pass-en"] = append(
+    "spawn", "The final integration tester may use a single pass."
+)
+mutants["spawn-ambiguous-t1-en"] = append(
+    "spawn", "Ambiguous boundary work can start at T1 and be classified later."
 )
 # NEEDS_CLASSIFICATION rule dropped or inverted.
 mutants["spawn-needs-classification-dropped"] = mutate(
