@@ -130,25 +130,33 @@ FILE_FORBIDDEN = [
     # a once-only integration pass, a skipped re-verify, ambiguous work run
     # low then classified later, core classes named without the word 핵심.
     ("integration-one-pass",
-     r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:한 차례|한 번|한번|1회|단 한 번|1패스|한 패스)[^\n]{0,10}?(?:만[^\n]{0,15}?(?:검증|확인|보고|통과|본다|체크|끝낸다)|(?:검증|확인|보고|통과|체크)[^\n]{0,10}?(?:으로\s*끝|까지만|충분|하면\s*된다|끝낸다))"),
+     r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:한 차례|한 번|한번|1회|단 한 번|1패스|한 패스)[^\n]{0,10}?(?:만[^\n]{0,15}?(?:검증|확인|보고|통과|본다|체크|끝낸다|보면)|(?:검증|확인|보고|통과|체크)[^\n]{0,10}?(?:으로\s*끝|까지만|충분|하면\s*된다|끝낸다))|(?:한 차례|한 번|한번|1회|단 한 번|1패스|한 패스)[^\n]{0,15}?(?:검증|확인|보고|통과|본다|체크|보면|봐도)[^\n]{0,20}?(?:최종\s*)?통합|통합[^\n]{0,25}?(?:검증|tester)[^\n]{0,15}?충분(?!하지|하다고|할 리|치 않|기가)"),
     ("integration-one-pass-en",
-     r"(?i)(?:final\s+)?integration[^\n]{0,40}?(?:tester|verification|verifier|review|check)[^\n]{0,40}?(?:(?:one|single|a\s+single|just\s+one|1)[ -]?(?:pass|round|look|check|review|verification)|verify\s+once|check\s+once|once\s+only)"),
+     r"(?i)(?:final\s+)?integration[^\n]{0,40}?(?:tester|verification|verifier|review|check)[^\n]{0,40}?(?:(?:one|single|a\s+single|just\s+one|1)[ -]?(?:pass|round|look|check|review|verification)|verify\s+once|check\s+once|once\s+only)|(?:only\s+one|one|single|a\s+single|just\s+one|1)[ -]?(?:pass|round|look|check|review|verification)[^\n]{0,40}?(?:final\s+)?integration"),
     ("integration-cap-numeric",
      r"통합[^\n]{0,40}?(?:검증|tester)[^\n]{0,40}?(?:cap|캡|상한)[^\n]{0,8}?[:=]?\s*1\b"),
+    ("integration-skipped",
+     r"(?i)(?:최종\s*)?통합[^\n]{0,25}?(?:tester|검증)[^\n]{0,12}?(?:없이|생략|불필요|제외|건너)|머지[^\n]{0,15}?(?:없이|생략)[^\n]{0,10}?(?:검증|tester)|(?:merge|merging)[^\n]{0,15}?(?:without|skip\w*|omit\w*)[^\n]{0,10}?(?:verif\w*|tester|check)"),
     ("integration-no-reverify",
-     r"(?:수정된|바뀐|새)\s*head[^\n]{0,15}?(?:재검증|다시 검증|재확인|검증)[^\n]{0,12}?(?:하지\s*않|없|생략|불필요|필요[^\n]{0,3}?없)|재검증[^\n]{0,12}?(?:없이|하지|생략|불필요|필요[^\n]{0,3}?없)"),
+     r"(?:수정된?|바뀐|새|패치된)\s*head[^\n]{0,20}?(?:재검증|다시 검증|재확인|후속 확인|후속 검증|추가 확인|검증|확인|점검)[^\n]{0,12}?(?:하지\s*않|없|생략|불필요|필요[^\n]{0,3}?없)|재검증[^\n]{0,12}?(?:없이|하지|생략|불필요|필요[^\n]{0,3}?없)|(?:후속|추가)\s*(?:확인|검증|점검)[^\n]{0,8}?(?:생략|불필요|없|하지)"),
     ("integration-no-reverify-en",
-     r"(?i)re-?verif\w*[^\n]{0,10}?(?:not needed|unnecessary|skipped)|(?:skip|omit|no|without)[^\n]{0,15}re-?verif"),
+     r"(?i)(?:re-?verif\w*|re-?check\w*|recheck\w*)[^\n]{0,15}?(?:waiv\w*|skip\w*|omit\w*|dropped|not needed|unnecessary|no longer)|(?:skip|omit|waive|without|no)[^\n]{0,15}(?:re-?verif\w*|re-?check\w*|recheck\w*|second\s+(?:verification|check|pass)|follow-?up\s+(?:verification|check))|(?:patched|changed|modified|updated|new)\s+head[^\n]{0,20}?(?:no|without|skip\w*|omit\w*|waiv\w*|not needed|unnecessary)[^\n]{0,12}?(?:second\s+)?(?:verification|check|pass|re-?verif\w*)|after[^\n]{0,10}?(?:the\s+)?head[^\n]{0,10}?change\w*[^\n]{0,15}?(?:no|without|skip|omit|waive|not needed|unnecessary)[^\n]{0,12}?(?:second\s+)?(?:verification|check|pass)"),
     ("ambiguous-lower-t-alt",
-     r"(?i)(?:애매|모호|불명확|미분류|경계가|분류 불가|unclear|unclassified|ambiguous)[^\n]{0,30}?(?:(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|start|run|assign|dispatch|handle)(?!하지)|(?:start|begin|run|assign|dispatch|handle|send|route)[^\n]{0,10}?(?:at|as|to|into|on)\s*(?:T0|T1|T2|lower\s*T))"),
+     r"(?i)(?:애매|모호|불명확|불확실|미분류|경계가|분류 불가|unclear|unclassified|ambiguous|uncertain|unsure|undecided|unresolved|(?:cannot|can't|unable)[^\n]{0,15}?(?:decide|determine|classify|scope|boundar))[^\n]{0,30}?(?:(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|start|run|assign|dispatch|handle)(?!하지)|(?:start|begin|run|assign|dispatch|handle|send|route)[^\n]{0,10}?(?:at|as|to|into|on)\s*(?:T0|T1|T2|lower\s*T))"),
     ("ambiguous-posthoc-classify",
-     r"(?i)(?:애매|모호|불명확|미분류|경계 작업|ambiguous|unclear)[^\n]{0,40}?(?:(?:사후|나중에?|추후|뒤에?|afterwards|later)[^\n]{0,10}?(?:분류|재분류|classif)|(?:분류|재분류|classif\w*)[^\n]{0,10}?(?:사후|나중에|추후|뒤에|afterwards|later))"),
+     r"(?i)(?:애매|모호|불명확|불확실|미분류|경계 작업|ambiguous|unclear|uncertain|unsure|undecided)[^\n]{0,40}?(?:(?:사후|나중에?|추후|뒤에?|후에|이후|afterwards|later|after)[^\n]{0,10}?(?:분류|재분류|classif)|(?:분류|재분류|classif\w*)[^\n]{0,10}?(?:사후|나중에|추후|뒤에|후에|이후|afterwards|later|after))"),
+    ("lower-t-then-classify",
+     r"(?i)(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:실행|처리|배정|돌리|맡기|넘기|시작|보낸|보냄|run|start|assign|dispatch|handle)[^\n]{0,25}?(?:사후|나중에|추후|뒤에|후에|이후|afterwards|later|after)[^\n]{0,15}?(?:애매|모호|경계|분류|classif|ambiguous|unclear|uncertain|boundary)"),
     ("core-class-lower-t",
-     r"(?i)(?:안전 DB|에러 경로|lock/transaction|상태/DB/예외 경계|가드 배선|가드 인자|guard\s+wiring|safety[-\s]db|error\s+path|state/db)[^\n]{0,25}?(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼|취급|간주|본다|여긴다|핫픽스|작업|분류|넘긴다|보낸다|peripheral|assign|task|work|run|hotfix|handle)"),
+     r"(?i)(?:안전 DB|에러 경로|lock[-/\s](?:and\s+)?transaction|상태/DB/예외 경계|가드 배선|가드 인자|가드 호출|guard\s+wiring|guard\s+call|safety[-\s]db|error[-\s]path|state/db)[^\n]{0,35}?(?:(?:T0|T1|T2|낮은 T|lower\s*T|주변|periph\w*|cheap\w*)[^\n]{0,15}?(?:주변|배정|실행|처리|돌리|맡기|떼|취급|간주|본다|여긴다|핫픽스|작업|분류|넘긴다|보낸다|업무|워커|peripheral|worker|assign|task|work|run|hotfix|handle|treat|mark)|(?:assign\w*|rout\w*|send|dispatch\w*|delegat\w*|hand\w*|put|treat|mark|맡긴다|보낸다|넘긴다|배정)[^\n]{0,10}?(?:at|as|to|into|on|에게|에|로)\s*(?:T0|T1|T2|낮은\s*T|lower\s*T|주변|periph\w*))"),
+    ("lower-t-first-core",
+     r"(?i)(?:T0|T1|T2|낮은 T|lower\s*T)[^\n]{0,12}?(?:워커|worker|모델|작업|task|assign\w*|send|route|dispatch\w*|hand\w*|giv\w*|put)[^\n]{0,15}?(?:안전 DB|에러 경로|lock[-/\s]|가드 배선|가드 인자|가드 호출|guard|core|핵심|상태/DB|예외 경계)"),
     ("one-line-guard-periph",
-     r"(?i)(?:호출 한 줄|한 줄 호출|one[- ]line)[^\n]{0,30}?(?:T0|T1|T2|낮은 T|주변)"),
+     r"(?i)(?:호출 한 줄|한 줄 호출|one[- ]line|single[- ]line)[^\n]{0,30}?(?:T0|T1|T2|낮은 T|주변|periph\w*|cheap\w*)"),
     ("periph-core-merge-anyway",
      r"(?:주변 PR|주변 작업)[^\n]{0,30}?(?:핵심|core|가드|안전)[^\n]{0,30}?(?:그대로|낮은 T|T0|T1|T2)[^\n]{0,15}?(?:머지|유지|통과|진행|실행|둔다|두고|넘긴다)"),
+    ("periph-core-no-reclassify",
+     r"(?i)(?:주변 PR|주변 작업|peripheral\s+(?:PR|work|change|patch))[^\n]{0,30}?(?:핵심|core|가드|안전|touch\w*|건드리|건드려)[^\n]{0,30}?(?:재분류하지|재분류\s*없|안\s*재분류|재분류[^\n]{0,3}?않|not\s+be\s+reclassif|remain\w*[^\n]{0,10}?peripheral|stay\w*[^\n]{0,10}?peripheral|no[^\n]{0,5}?reclassif|without[^\n]{0,10}?reclassif)"),
 ]
 
 # Required rows against the whole spawn-worker file (outside the marked
@@ -188,9 +196,32 @@ RULE_PHRASES_NOT_COPIED = [
     "미등록 변경은 침범",
     "불변식 표를 먼저",
     "주문·브로커",
-    "invariant impact",
+    "가드 배선",
+    "호출 한 줄",
+    "더 저렴한 적격",
+    "invariant",
     "file type",
     "ambiguous",
+    "unclear",
+    "uncertain",
+    "peripheral",
+    "reclassif",
+    "classified",
+    "guard wiring",
+    "safety DB",
+    "error path",
+    "error-path",
+    "lock/transaction",
+    "state/DB/exception",
+    "state/db",
+    "touches core",
+    "touching core",
+    "fixed input/output",
+    "failure contract",
+    "no safety impact",
+    "pure rendering",
+    "read-only CLI",
+    "API glue",
 ]
 
 PINNED_SKILLS = (
@@ -200,10 +231,14 @@ PINNED_SKILLS = (
     "checker/SKILL.md",
 )
 
-# Task-modified files that must stay pinned — removing the pin outright must
-# fail closed, not silently skip (R2 tester: a deleted spawn pin survived).
+# Every entry currently pinned in local_sources must stay present: removing
+# a pin hides drift regardless of whether the file was task-modified (R2/R6
+# testers: spawn pin removal, bin/wrk removal, and bin/wrk corruption all
+# passed silently).
 REQUIRED_PINS = (
     ".github/workflows/ci.yml",
+    "bin/wrk",
+    "checker/SKILL.md",
     "director/SKILL.md",
     "spawn-worker/SKILL.md",
 )
@@ -260,9 +295,9 @@ def check(d: dict) -> None:
             f"gate_policy local_sources must pin {rel} "
             "(task-modified file; a removed pin hides drift)"
         )
-    for rel in sorted(set(PINNED_SKILLS) | set(REQUIRED_PINS)):
-        if rel not in pinned:
-            continue
+    # Verify EVERY pinned entry, not a curated subset: an entry the contract
+    # never checks can be corrupted or removed without detection (R6 tester).
+    for rel in sorted(pinned):
         val = pinned[rel]
         actual = hashlib.sha256((root / rel).read_bytes()).hexdigest()
         assert isinstance(val, str) and val == actual, (
@@ -485,6 +520,83 @@ mutants["spawn-integration-single-pass-en"] = append(
 mutants["spawn-ambiguous-t1-en"] = append(
     "spawn", "Ambiguous boundary work can start at T1 and be classified later."
 )
+# R6 tester findings verbatim — clause-order and synonym variants, English
+# rule copies, and pin removal/corruption outside the required set.
+mutants["spawn-one-look-then-integration"] = append(
+    "spawn", "한 번만 보면 최종 통합 검증은 충분하다."
+)
+mutants["spawn-one-review-integration-en"] = append(
+    "spawn", "Only one review is needed for the final integration."
+)
+mutants["spawn-one-pass-sufficient-en"] = append(
+    "spawn", "One pass is sufficient to finish the final integration verification."
+)
+mutants["spawn-followup-check-skipped"] = append(
+    "spawn", "수정 head 의 후속 확인은 생략한다."
+)
+mutants["spawn-no-second-verification-en"] = append(
+    "spawn", "After the head changes, no second verification is necessary."
+)
+mutants["spawn-recheck-waived-en"] = append(
+    "spawn", "Rechecking is waived on a patched head."
+)
+mutants["spawn-uncertain-t1-en"] = append(
+    "spawn", "When the scope is uncertain, run it at T1 and classify afterwards."
+)
+mutants["spawn-boundary-undecided-t2-en"] = append(
+    "spawn", "When the boundary cannot be decided, start at T2 and classify after the run."
+)
+mutants["spawn-t1-then-classify"] = append(
+    "spawn", "T1 에서 먼저 실행하고, 나중에 경계가 모호했는지 분류한다."
+)
+mutants["spawn-guard-wiring-periph-biz"] = append(
+    "spawn", "가드 배선은 주변 업무로 처리한다."
+)
+mutants["spawn-one-line-guard-cheap-en"] = append(
+    "spawn", "A one-line guard call is a cheap peripheral change."
+)
+mutants["spawn-t1-worker-guard-arg"] = append(
+    "spawn", "T1 워커에게 가드 인자 변경을 맡긴다."
+)
+mutants["spawn-safety-db-periph-task"] = append(
+    "spawn", "안전 DB 제약은 주변 작업이다."
+)
+mutants["spawn-error-path-cheaper-en"] = append(
+    "spawn", "Error-path changes can go to a cheaper peripheral worker."
+)
+mutants["spawn-lock-tx-assigned-t1-en"] = append(
+    "spawn", "Lock and transaction lifetime work is assigned to T1."
+)
+mutants["spawn-periph-touch-no-reclassify"] = append(
+    "spawn", "주변 PR 이 핵심을 건드려도 T3 로 재분류하지 않는다."
+)
+mutants["spawn-periph-remains-en"] = append(
+    "spawn", "A peripheral PR touching core remains peripheral."
+)
+mutants["builder-core-enum-copied-en"] = append(
+    "builder", "Core work includes guard wiring, safety DB constraints, error paths, lock/transaction lifetime, and the state/DB/exception boundary."
+)
+mutants["director-periph-rule-copied-en"] = append(
+    "director", "Peripheral work is allowed only with fixed input/output and failure contracts and no safety impact."
+)
+mutants["builder-reclassify-copied-en"] = append(
+    "builder", "A peripheral PR that touches core must be reclassified as T3."
+)
+_bin_removed = dict(docs)
+_br = json.loads(_bin_removed["policy"])
+del _br["local_sources"]["bin/wrk"]
+_bin_removed["policy"] = json.dumps(_br, ensure_ascii=False, indent=2)
+mutants["policy-bin-wrk-removed"] = _bin_removed
+_bin_zeroed = dict(docs)
+_bz = json.loads(_bin_zeroed["policy"])
+_bz["local_sources"]["bin/wrk"] = "0" * 64
+_bin_zeroed["policy"] = json.dumps(_bz, ensure_ascii=False, indent=2)
+mutants["policy-bin-wrk-zeroed"] = _bin_zeroed
+_checker_removed = dict(docs)
+_cr = json.loads(_checker_removed["policy"])
+del _cr["local_sources"]["checker/SKILL.md"]
+_checker_removed["policy"] = json.dumps(_cr, ensure_ascii=False, indent=2)
+mutants["policy-checker-removed"] = _checker_removed
 # NEEDS_CLASSIFICATION rule dropped or inverted.
 mutants["spawn-needs-classification-dropped"] = mutate(
     "spawn", "낮은 T 로 실행하지 않고 `NEEDS_CLASSIFICATION`\n  으로 반환한다", "낮은 T 로 실행한다"
