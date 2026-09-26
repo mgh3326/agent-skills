@@ -36,8 +36,10 @@ BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌
 에스컬레이션 런그(`builder-sonnet-xhigh`)는 `--operator-request`가 추가로
 필요하다. `builder-opus-low`는 scopefuel #738(b5b0ad2)로 일반 S 런그가 됐다 —
 post-#738 게이트는 그 런그의 REF를 `operator_request_not_applicable`(rc 3)로
-거부하고, pre-#738 설치본에서는 게이트가 여전히 에스컬레이션으로 표시해 REF를
-요구한다(어느 쪽이든 wrk는 REF를 있는 그대로 전달할 뿐 자체 판정을 두지 않는다). kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없어
+거부한다. pre-#738 설치본은 그 행을 에스컬레이션으로 표시한 채지만, 명시
+`--effort` 런그에는 scopefuel #716 규칙으로 에스컬레이션 사다리가 적용되지
+않아 REF를 요구하지 않고 받기만 한다(어느 쪽이든 wrk는 호출자의 REF를 있는
+그대로 전달할 뿐 자체 판정을 두지 않는다). kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없어
 `bin/kimi-clone-home --effort high|max`가 만든 고정 클론 홈의 `[thinking] effort`로만
 런그가 결정된다. E6 표본이므로 브리프에 `exp=E6` 태그와 reps 기록이 의무다.
 #737(decision 4088)은 같은 E6 규칙으로 grok 런그 `builder-grok-low`·`builder-grok-medium`·

@@ -235,9 +235,13 @@ case "${WRK_GATE_MODE:-ok}" in
 esac
 # #740 / scopefuel #738 (b5b0ad2): on the post-#738 gate opus@low is an
 # ordinary S row — no escalation mark, so a REF on it is not_applicable and no
-# REF is demanded. The fixture default keeps mirroring the installed
-# (pre-#738) gate where opus@low is still escalation; WRK_GATE_738=1 selects
-# the post-#738 behaviour so the suite can exercise wrk against both.
+# REF is demanded; WRK_GATE_738=1 selects that model, whose opus@low half
+# matches b5b0ad2's real behaviour. The default mode is a synthetic strict
+# escalation model — escalation-marked rungs refuse a bare spawn and demand a
+# REF — and is NOT a mirror of the installed gate: since scopefuel #716 the
+# real ladder is skipped for --effort-named rungs, which is every E6 call wrk
+# makes. The suite uses it to exercise wrk's refusal propagation and verbatim
+# REF forwarding under a strict gate, not to re-create installed behaviour.
 escalation_rung=0
 case "$profile@$effort" in
   opus@max|sonnet@xhigh) escalation_rung=1 ;;

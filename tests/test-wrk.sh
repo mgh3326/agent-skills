@@ -3206,8 +3206,8 @@ echo "PASS #666 devin builder variants reuse the worker argv and need --role bui
 # forwards --effort to the gate for these profiles only), record
 # launch_profile=<canonical>@<rung> (#677), and spawn only when
 # SCOPEFUEL_E6_ARM names that exact rung. The gate-marked escalation rungs
-# (sonnet@xhigh — and opus@low only on a pre-#738/b5b0ad2 install, see the
-# #740 block below) also need --operator-request; the kimi pair takes
+# (sonnet@xhigh — and opus@low only in the fixture's default escalation
+# model, see the #740 block below) also need --operator-request; the kimi pair takes
 # its rung from the pinned clone home (kimi has no --effort); the grok rungs
 # are plain marker-gated (not escalation).
 # Mutants: dropping GATE_EFFORT_PIN, the marker check, the clone-effort check,
@@ -3362,9 +3362,10 @@ grep -q 'SCOPEFUEL_E6_ARM=codex-sol@medium' <<<"$e6_rung_out" ||
   fail "wrong-rung refusal must name the required marker: $e6_rung_out"
 echo "PASS 704+737 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
 
-# Escalation rung (pre-#738 gate behaviour — the fixture default mirrors the
-# installed gate): the marker alone does not open opus@low — the gate still
-# demands --operator-request, and its rc 3 propagates.
+# Escalation rung (fixture default escalation model — strict; NOT the
+# installed gate, whose #716 rule skips the ladder for --effort rungs): the
+# marker alone does not open opus@low — the model gate demands
+# --operator-request, and its rc 3 propagates.
 set +e
 e6_esc_out="$(SCOPEFUEL_E6_ARM=opus@low \
   spawn_base builder-opus-low --role builder --lane e6-esc-lane --parent parent-lane \
@@ -3375,18 +3376,23 @@ set -e
   fail "opus@low without --operator-request must hit the gate escalation refusal (rc=$e6_esc_rc): $e6_esc_out"
 grep -q 'escalation' <<<"$e6_esc_out" ||
   fail "opus@low refusal must be the escalation denial: $e6_esc_out"
-echo "PASS 704 E6 escalation rung still requires --operator-request (pre-#738 gate)"
+echo "PASS 704 E6 escalation rung still requires --operator-request (fixture escalation model)"
 
 # ---------------------------------------------------------------------------
 # #740 (scopefuel #738 / b5b0ad2): post-#738 opus@low is an ordinary S rung —
 # builder-opus-low must spawn on its SCOPEFUEL_E6_ARM marker alone (wrk
 # neither adds nor demands --operator-request), and a caller-supplied REF is
 # forwarded verbatim into the gate's own operator_request_not_applicable
-# rc 3. sonnet@xhigh stays escalation-gated in both worlds. The fixture knob
-# WRK_GATE_738=1 selects the post-#738 gate; the default keeps the installed
-# pre-#738 behaviour. Mutants: wrk auto-adding --operator-request for
-# opus@low, wrk locally demanding it, or the fixture keeping opus@low
-# escalation-marked under WRK_GATE_738 all turn this block RED.
+# rc 3. sonnet@xhigh stays escalation-gated across the fixture's two modes
+# (model claim — real #716+ gates skip the ladder on --effort rungs for it
+# too; whether the gate should enforce it is a separate decision). The knob
+# WRK_GATE_738=1 selects the post-#738 gate (matches real b5b0ad2 for
+# opus@low); the default is a synthetic strict escalation model — the real
+# installed gate does NOT demand a REF on --effort-named rungs (scopefuel
+# #716), so the default exercises refusal propagation, not installed
+# behaviour. Mutants: wrk auto-adding --operator-request for opus@low, wrk
+# locally demanding it, or the fixture keeping opus@low escalation-marked
+# under WRK_GATE_738 all turn this block RED.
 # ---------------------------------------------------------------------------
 
 # Help text: the escalation-gated list must name sonnet@xhigh only — a stale
@@ -3446,18 +3452,18 @@ WRK_GATE_738=1 e6_opus_low_marker_only e6-740-marker-only ||
   fail "post-#738 gate must admit builder-opus-low on its marker alone"
 echo "PASS 740 post-738 builder-opus-low spawns on its E6 marker alone"
 
-# Assertion-RED mutant: the identical assertions under the pre-#738 gate MUST
-# fail — the marker-only spawn is still gate-refused there (escalation), so a
-# GREEN here would prove the predicate cannot tell the two gate behaviours
-# apart (and a wrk that auto-added the REF would fail the no-REF check under
-# WRK_GATE_738 the same way).
+# Assertion-RED mutant: the identical assertions under the escalation-model
+# gate MUST fail — the marker-only spawn is model-refused there
+# (escalation), so a GREEN here would prove the predicate cannot tell the
+# two gate behaviours apart (and a wrk that auto-added the REF would fail
+# the no-REF check under WRK_GATE_738 the same way).
 set +e
 e6_opus_low_marker_only e6-740-mutant
 e6_mutant_rc=$?
 set -e
 [[ "$e6_mutant_rc" -ne 0 ]] ||
-  fail "assertion mutant: marker-only assertions passed under the pre-#738 gate — they do not discriminate"
-echo "PASS 740 marker-only assertions go RED on the pre-#738 gate (mutant)"
+  fail "assertion mutant: marker-only assertions passed under the escalation-model gate — they do not discriminate"
+echo "PASS 740 marker-only assertions go RED on the escalation-model gate (mutant)"
 
 # Post-#738 gate: a caller-supplied REF on opus@low is still forwarded
 # verbatim and dies on the gate's own not_applicable refusal — wrk never
@@ -3478,7 +3484,7 @@ grep -qF -- '--operator-request hk:task/740' "$TMP/scopefuel.log" ||
   fail "a not_applicable REF reached Herdr"
 echo "PASS 740 post-738 opus@low + REF is gate-refused not_applicable, verbatim forward"
 
-# sonnet@xhigh stays escalation-gated in BOTH gate worlds: marker alone is
+# sonnet@xhigh stays escalation-gated in BOTH fixture modes: marker alone is
 # refused (rc 3), marker + REF is admitted.
 set +e
 e6_sx_def_out="$(SCOPEFUEL_E6_ARM=sonnet@xhigh \
@@ -3487,9 +3493,9 @@ e6_sx_def_out="$(SCOPEFUEL_E6_ARM=sonnet@xhigh \
 e6_sx_def_rc=$?
 set -e
 [[ "$e6_sx_def_rc" -eq 3 ]] ||
-  fail "pre-#738 sonnet@xhigh without REF must stay escalation-denied (rc=$e6_sx_def_rc): $e6_sx_def_out"
+  fail "escalation-model sonnet@xhigh without REF must stay escalation-denied (rc=$e6_sx_def_rc): $e6_sx_def_out"
 grep -q 'escalation' <<<"$e6_sx_def_out" ||
-  fail "pre-#738 sonnet@xhigh refusal must stay the escalation denial: $e6_sx_def_out"
+  fail "escalation-model sonnet@xhigh refusal must stay the escalation denial: $e6_sx_def_out"
 [[ ! -e "$TMP/herdr-740-sx-def.log" ]] ||
   fail "a denied sonnet@xhigh spawn reached Herdr"
 set +e
@@ -3521,7 +3527,7 @@ grep -qF 'gate -m sonnet --effort xhigh --operator-request hk:task/740' "$TMP/sc
   fail "sonnet@xhigh REF must reach the gate verbatim: $(cat "$TMP/scopefuel.log")"
 grep -q 'escalation_override=true' <<<"$e6_738_sxok_out" ||
   fail "sonnet@xhigh must keep escalation_override=true: $e6_738_sxok_out"
-echo "PASS 740 sonnet@xhigh stays escalation-gated under both gate behaviours"
+echo "PASS 740 sonnet@xhigh stays escalation-gated under both fixture modes"
 
 # Effort mutants: off-rung --effort is refused on the pin; the same rung
 # spelled out is accepted; kimi refuses --effort outright (no CLI flag); a
