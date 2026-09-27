@@ -23,13 +23,57 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 TMP="$(mktemp -d)"
-cleanup() {
-  local pidfile pid
+# wrk spawn leaves two detached writers that outlive their wrk and can still
+# be creating entries under $TMP at teardown, so a bare `rm -rf` raced them on
+# CI and exited "Directory not empty" (PR #155 ubuntu run 36283072131, PR #156
+# macOS run 36288704921 — both failed right after this suite's last PASS):
+#
+#   * a nohup'd `wrk sentinel` per arbiter-registered job (the remote/hub
+#     cases below run the real bin/arbiter, so their spawns register) — it
+#     logs to $ARBITER_INBOX_ROOT/<job>/completion-sentinel.log and probes the
+#     fixture herdr every interval, and each probe appends to
+#     WRK_FIXTURE_LOG;
+#   * refresh_quota_pool's detached supervisor — `( python3 - … ) &` -> fork +
+#     setsid -> `scopefuel refresh <pool> --background` — which appends
+#     WRK_REFRESH_LOG. It carries no pidfile and nothing waits on it.
+#
+# Signaling alone is not enough: a TERM'd process can still be mid-write, and
+# a killed sentinel leaves its interval `sleep` (and any in-flight probe)
+# orphaned. Kill all of them and wait until none remain, then rm.
+stop_tmp_writers() {
+  local pidfile pid child snap stray i
+  # Sentinels are named exactly by their pidfile. STOP first so one cannot
+  # fork a fresh probe/sleep child between the child sweep and the TERM.
   while IFS= read -r pidfile; do
     [[ -s "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
-    if [[ "$pid" =~ ^[0-9]+$ ]]; then kill "$pid" 2>/dev/null || true; fi
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill -STOP "$pid" 2>/dev/null || true
+    while IFS= read -r child; do kill "$child" 2>/dev/null || true; done \
+      < <(pgrep -P "$pid" 2>/dev/null || true)
+    kill "$pid" 2>/dev/null || true
+    kill -CONT "$pid" 2>/dev/null || true
   done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
+  # Pidfile-less writers are matched through the env every spawned process
+  # inherits (XDG_DATA_HOME/ARBITER_INBOX_ROOT/HK_STATE and the fixture logs
+  # all point under $TMP): the refresh supervisor and its scopefuel child,
+  # orphaned sentinel sleeps/probes, a sentinel mid `arbiter release`
+  # (state.db + journal under $TMP/xdg). Excluding $$ and its current
+  # children keeps the match scoped to this run's detached procs only.
+  for ((i = 0; i < 100; i++)); do
+    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
+    stray="$(awk -v self="$$" -v tmp="$TMP" \
+      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
+    [[ -n "$stray" ]] || return 0
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      if ((i >= 50)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
+    done <<<"$stray"
+    sleep 0.1
+  done
+}
+cleanup() {
+  stop_tmp_writers
   rm -rf "$TMP"
 }
 trap cleanup EXIT

@@ -15,7 +15,7 @@ HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d)"
 
 cleanup() {
-  local pidfile pid child
+  local pidfile pid child snap stray i
   while IFS= read -r pidfile; do
     [[ -s "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
@@ -26,6 +26,26 @@ cleanup() {
     kill "$pid" 2>/dev/null || true
     kill -CONT "$pid" 2>/dev/null || true
   done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
+  # kill alone does not suffice — a TERM'd writer can still be mid-append, and
+  # refresh_quota_pool's detached supervisor (`python3 - <scopefuel> …` ->
+  # setsid -> `scopefuel refresh --background`) has no pidfile at all. A dentry
+  # recreated while rm walks the tree makes rm -rf exit "Directory not empty"
+  # (CI runs 36283072131/36288704921). Every detached process this suite
+  # spawned inherits env pointing under $TMP (XDG_DATA_HOME/ARBITER_INBOX_ROOT/
+  # HK_STATE/fixture logs), so a full ps scan matches this run exactly; $$ and
+  # its live children are excluded so the sweep cannot hit itself or the
+  # caller (wrk heavy / CI bash).
+  for ((i = 0; i < 100; i++)); do
+    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
+    stray="$(awk -v self="$$" -v tmp="$TMP" \
+      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
+    [[ -n "$stray" ]] || break
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      if ((i >= 50)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
+    done <<<"$stray"
+    sleep 0.1
+  done
   rm -rf "$TMP"
 }
 trap cleanup EXIT

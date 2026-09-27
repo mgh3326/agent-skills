@@ -26,7 +26,40 @@ WRK="$ROOT/bin/wrk"
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+# wrk spawn's refresh_quota_pool leaves a detached supervisor — `( python3 -
+# … ) &` -> fork + setsid -> `scopefuel refresh <pool> --background` — which
+# appends WRK_REFRESH_LOG with no pidfile and nothing waiting on it. A dentry
+# recreated while rm walks the tree exits `rm -rf` with "Directory not empty"
+# (CI runs 36283072131/36288704921). Everything the suite detached inherits
+# env pointing under $TMP (XDG_DATA_HOME/ARBITER_INBOX_ROOT/HK_STATE/fixture
+# logs), so the ps scan matches exactly this run; $$ and its live children
+# are excluded so the sweep cannot hit itself or the caller.
+cleanup() {
+  local pidfile pid child snap stray i
+  while IFS= read -r pidfile; do
+    [[ -s "$pidfile" ]] || continue
+    read -r pid <"$pidfile" || continue
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill -STOP "$pid" 2>/dev/null || true
+    while IFS= read -r child; do kill "$child" 2>/dev/null || true; done \
+      < <(pgrep -P "$pid" 2>/dev/null || true)
+    kill "$pid" 2>/dev/null || true
+    kill -CONT "$pid" 2>/dev/null || true
+  done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
+  for ((i = 0; i < 100; i++)); do
+    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
+    stray="$(awk -v self="$$" -v tmp="$TMP" \
+      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
+    [[ -n "$stray" ]] || break
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      if ((i >= 50)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
+    done <<<"$stray"
+    sleep 0.1
+  done
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
 printf '%s\n' 'fixture prompt' >"$PROMPT"
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
