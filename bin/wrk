@@ -6269,8 +6269,9 @@ holder's slot automatically, unlike shlock pid-files). Slot 0 is the lock
 file itself; slots 1..N-1 are <lock>.slot<i>. The command runs under
 `nice -n 10` and only starts once load5/ncpu < 1.0. Total wait (slot +
 load) is capped at 20 minutes; on expiry the command is NOT run and wrk
-exits 75 (EX_TEMPFAIL). The slot fd is never inherited by the command, so an
-orphaned child cannot keep the lock held (the desktop flock -o leak, v637).
+exits 75 (EX_TEMPFAIL). The command inherits the slot fd (nested detection
+needs it — see WRK_HEAVY_HELD_FD), so an orphaned child keeps the slot while
+it lives; the kernel frees the slot when the whole holder tree is gone.
 
 The limit comes from hosts.toml `[local] heavy_max` (WRK_HOSTS_CONFIG or
 ~/.config/wrk/hosts.toml): unset = 1, 0 = refuse every heavy run on this
@@ -6282,29 +6283,35 @@ limit does not kill extra holders minted under a larger one; they drain.
 
 `wrk heavy status` prints the lock path, this host, the effective limit,
 one `holder` line per occupied slot, and queued waiters (holder pids are the
-wrk heavy python processes; killing one releases its slot even while the
-command's orphaned children keep running). status never creates slot files
-and is never refused.
+wrk heavy python processes; killing one frees its slot once the command
+tree that inherited the slot fd is also gone). status never creates slot
+files and is never refused.
 
 Every acquisition appends one JSON record to the heavy log (default
 ~/.local/state/wrk/heavy.log): ts, kind=run, host, job (ARBITER_JOB or -),
 task (HK_TASK_ID or -), pid, slot, limit, cmd, wait_s, wait_lock_s,
-wait_load_s, hold_s, rc. Refusals (kind=refused) and wait-cap expiries
-(kind=wait_cap) are logged too, so wait times stay aggregable.
+wait_load_s, hold_s, rc. Nested runs are logged as kind=nested, refusals as
+kind=refused and wait-cap expiries as kind=wait_cap, so wait times stay
+aggregable and no execution path evades the log.
 
 Notes: the command's own exit 75 is indistinguishable from a wait-cap 75 —
 check stderr. stdin is not forwarded (the command sees EOF). A nested
 `wrk heavy` on the same lock is detected and run directly under nice — the
-outer invocation already holds a slot, so nesting never deadlocks.
+outer invocation already holds a slot, so nesting never deadlocks. Because
+the command inherits the slot descriptor, the slot stays held for as long
+as any inheriting descendant lives: a crashed wrapper's slot is reclaimed
+by the kernel only once the whole holder process tree is gone.
 
 Environment:
   WRK_HEAVY_HELD        <lock path>:<holder pid>, set by wrk heavy for its
                         command; informational only — nested detection uses
                         WRK_HEAVY_HELD_FD
-  WRK_HEAVY_HELD_FD     <fd>:<proof path>, set by wrk heavy for its command
+  WRK_HEAVY_HELD_FD     <fd>:<slot path>, set by wrk heavy for its command
                         so a nested wrk heavy is detected; honored only when
-                        the fd is an inherited descriptor of the held proof
-                        lock AND the matching slot is flock-held right now
+                        the fd is an inherited descriptor of the open file
+                        description that owns that slot's flock right now,
+                        and the slot is acquirable under the current limit —
+                        forged env values and rewritten slot text cannot pass
   WRK_HEAVY_LOCK        lock file path
                         (default /tmp/wrk-heavy-<hostname>.lock)
   WRK_HEAVY_MAX         override the hosts.toml heavy_max for this run
@@ -6554,22 +6561,26 @@ def fd_is_open(fd):
     return True
 
 
-proof_re = re.compile(
-    re.escape(os.path.realpath(lock_path)) + r"\.heldproof-(\d+)$")
+slot_env_re = re.compile(
+    re.escape(os.path.realpath(lock_path)) + r"\.slot(\d+)$")
 
 
 def nested_held_fd(fd_s, env_path):
-    # WRK_HEAVY_HELD_FD=<fd>:<proof path> is honored only when every kernel
-    # check lines up: fd is an open descriptor on <proof>, <proof> is
-    # flock-held AND fd belongs to the open file description that owns the
-    # lock (relocking an inherited descriptor of the held OFD succeeds; a
-    # fresh open on a file held by another fails), and the matching slot is
-    # held right now. No env text, slot-file text, pid, or PATH helper is
-    # trusted — the proof fd travels only through inheritance (#772 tester
-    # rounds 1-2).
-    m = proof_re.match(os.path.realpath(env_path))
-    if not m:
-        return None
+    # WRK_HEAVY_HELD_FD=<fd>:<slot path> is honored only when every kernel
+    # check lines up: fd is an open descriptor on a slot acquirable under the
+    # current limit, that file is flock-held right now, AND fd belongs to the
+    # open file description that owns the lock (relocking an inherited
+    # descriptor of the held OFD succeeds; a fresh open on a file held by
+    # another fails). The proof object is the slot itself — no env text,
+    # slot text, pid, side file, or PATH helper is trusted, because anything
+    # a same-uid caller can name or rewrite it can also fake (#772 tester
+    # rounds 1-3). A `.slotN` outside the current limit is just a caller-made
+    # file — honoring it would let a self-flocked phantom slot forge nesting.
+    rp = os.path.realpath(env_path)
+    if rp != os.path.realpath(lock_path):
+        m = slot_env_re.match(rp)
+        if m is None or not 0 < int(m.group(1)) < limit:
+            return None
     try:
         env_fd = int(fd_s)
         fst = os.fstat(env_fd)
@@ -6578,12 +6589,8 @@ def nested_held_fd(fd_s, env_path):
         return None
     if (fst.st_dev, fst.st_ino) != (lst.st_dev, lst.st_ino):
         return None
-    slot_probe = lock_path if m.group(1) == "0" else (
-        "%s.slot%s" % (lock_path, m.group(1)))
-    if not flock_held(slot_probe):
-        return None  # the slot it claims is free — stale or forged
     if not flock_held(env_path):
-        return None  # nobody holds the proof — nothing to nest under
+        return None  # the slot it claims is free — stale or forged
     try:
         fcntl.flock(env_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
@@ -6592,10 +6599,9 @@ def nested_held_fd(fd_s, env_path):
 
 
 held_fd = None
+held_path = None
 nested_fd = None
-proof_fd = None
-proof_path = None
-nested_proof = None
+nested_path = None
 
 
 def run_command():
@@ -6603,10 +6609,10 @@ def run_command():
         env = dict(os.environ)
         env["WRK_HEAVY_HELD"] = "%s:%d" % (
             os.path.abspath(lock_path), os.getpid())
-        hfd = proof_fd if proof_fd is not None else nested_fd
-        hpath = proof_path if proof_fd is not None else nested_proof
+        hfd = held_fd if held_fd is not None else nested_fd
+        hpath = held_path if held_fd is not None else nested_path
         if hfd is not None and hpath and fd_is_open(hfd):
-            # hand the proof fd down so a nested wrk heavy can prove it is
+            # hand the slot fd down so a nested wrk heavy can prove it is
             # inside this holder's process tree (see nested_held_fd)
             env["WRK_HEAVY_HELD_FD"] = "%d:%s" % (hfd, hpath)
             pfds = {hfd}
@@ -6626,21 +6632,26 @@ def run_command():
 
 # A nested `wrk heavy` on the same lock would deadlock against itself for the
 # full cap — the outer invocation already holds a slot on this host, so run
-# the inner command directly (still under nice). Detection is by inherited
-# proof fd, not the pid env: the holder locks <lock>.heldproof-<slot> and
-# hands that descriptor to the command, and only a process that actually
-# received it can relock it.
+# the inner command directly (still under nice) and log it as a nested run.
+# Detection is by inherited slot fd, not the pid env: the holder hands its
+# slot descriptor to the command, and only a process that actually received
+# that descriptor can relock it.
 held_fd_env = os.environ.get("WRK_HEAVY_HELD_FD", "")
 held_fd_s, sep, held_fd_path = held_fd_env.partition(":")
 if sep and held_fd_s.isdigit():
     nested_fd = nested_held_fd(held_fd_s, held_fd_path)
     if nested_fd is not None:
-        nested_proof = os.path.realpath(held_fd_path)
+        nested_path = os.path.realpath(held_fd_path)
 if nested_fd is not None:
     print("wrk heavy: already holding %s in this process tree -- "
           "running nested command without re-locking" % lock_path,
           file=sys.stderr)
-    raise SystemExit(run_command())
+    nested_at = time.monotonic()
+    nrc = run_command()
+    log_event({"kind": "nested", "cmd": cmd_summary[:200], "limit": limit,
+               "wait_s": 0.0, "hold_s": round(time.monotonic() - nested_at, 3),
+               "rc": nrc})
+    raise SystemExit(nrc)
 
 os.makedirs(waiters_dir, exist_ok=True)
 me = os.path.join(waiters_dir, str(os.getpid()))
@@ -6648,11 +6659,13 @@ held_slot = -1
 acquired_at = None
 run_at = None
 rc = None
-# PEP 446: os.open returns a non-inheritable fd, so the command's process
-# tree never holds a slot — when this python process (the pid shown by
-# `wrk heavy status`) dies or the command exits, the slot is released even
-# while orphaned children keep running.
-slot_fds = [os.open(p, os.O_RDWR | os.O_CREAT, 0o644) for p in limit_slots()]
+# PEP 446: os.open returns non-inheritable fds; the acquired slot fd is
+# re-inherited into the command only via run_command's pass_fds so nested
+# runs can prove they are inside the holder's tree (nested_held_fd). A slot
+# therefore stays held for as long as any inheriting descendant lives — the
+# lock's lifetime is the holder's process tree, not just this wrapper.
+slot_paths = limit_slots()
+slot_fds = [os.open(p, os.O_RDWR | os.O_CREAT, 0o644) for p in slot_paths]
 try:
     with open(me, "w", encoding="utf-8") as f:
         f.write(info)
@@ -6661,7 +6674,7 @@ try:
             for i, sfd in enumerate(slot_fds):
                 try:
                     fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    held_fd, held_slot = sfd, i
+                    held_fd, held_slot, held_path = sfd, i, slot_paths[i]
                     break
                 except BlockingIOError:
                     pass
@@ -6684,26 +6697,6 @@ try:
         pass
     os.ftruncate(held_fd, 0)
     os.write(held_fd, (info + "\n").encode())
-    # Nested-run proof: a second lock this holder keeps private to the
-    # slot's index and hands to its command (run_command pass_fds). The
-    # slot fd itself is never passed down, so a dead holder's slot is still
-    # reclaimed even while orphans keep the proof descriptor.
-    proof_path = "%s.heldproof-%d" % (lock_path, held_slot)
-    try:
-        pfd = os.open(proof_path, os.O_RDWR | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(pfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
-            # an orphan from a dead run still holds this inode — mint a
-            # fresh one so this holder's children can prove nesting
-            os.unlink(proof_path)
-            os.close(pfd)
-            pfd = os.open(proof_path,
-                          os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o644)
-            fcntl.flock(pfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        proof_fd = pfd
-    except OSError:
-        proof_fd = None  # no proof fd — nested runs queue like any waiter
     while True:
         try:
             ratio = load_ratio()
@@ -6741,16 +6734,6 @@ finally:
                        "hold_s": round(time.monotonic() - acquired_at, 3),
                        "rc": rc})
         os.ftruncate(held_fd, 0)
-    if proof_fd is not None:
-        try:
-            os.close(proof_fd)
-        except OSError:
-            pass
-    if proof_path is not None:
-        try:
-            os.remove(proof_path)
-        except OSError:
-            pass
     for sfd in slot_fds:
         os.close(sfd)
 PY
