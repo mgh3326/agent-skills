@@ -36,7 +36,13 @@ export XDG_DATA_HOME="$TMP/xdg"
 export ARBITER_INBOX_ROOT="$TMP/inbox"
 export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 export PANEWIRE_BIN="$ROOT/tests/fixtures/panewire"
-export HANDOFFKEEP_BIN="$TMP/absent-handoffkeep"
+# #768: spawns bind an hk task; the fixture + a seeded HK_TASK_ID covers the
+# worker-role spawns (tester/advisory-style env inheritance), and spawn_argv
+# mints an explicit --task per call so the --role builder cases run too.
+export HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
+export HK_STATE="$TMP/hk-state.json"
+export HK_TASK_ID=76802
+"$HANDOFFKEEP_BIN" tasks add --id "$HK_TASK_ID" --title "contract suite task" --lane fixture >/dev/null
 export WRK_LAUNCH_LOG="$TMP/launch.log"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -68,7 +74,9 @@ spawn_argv() {
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
-    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 "$@" >/dev/null
+    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 \
+    --task "$("$HANDOFFKEEP_BIN" tasks add --title "contract task" 2>/dev/null |
+      python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')" "$@" >/dev/null
   cat "$TMP/herdr.log"
 }
 

@@ -54,7 +54,10 @@ export XDG_DATA_HOME="$TMP/xdg"
 export ARBITER_INBOX_ROOT="$TMP/inbox"
 export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 export PANEWIRE_BIN="$ROOT/tests/fixtures/panewire"
-export HANDOFFKEEP_BIN="$TMP/absent-handoffkeep"
+# #768: spawns bind an hk task; the fixture + a minted --task per spawn_in
+# call keep the resume-settings contract identical otherwise.
+export HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
+export HK_STATE="$TMP/hk-state.json"
 export KIMI_CODE_HOME="$TMP/kimi-home"
 # Isolate git's global ignore machinery: on a machine where Claude Code already
 # wrote **/.claude/settings.local.json into the user excludes, check-ignore
@@ -91,7 +94,10 @@ spawn_in() {
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
-    "$wrk" spawn -c "$cwd" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 "$@" >/dev/null 2>>"$TMP/wrk.stderr"
+    "$wrk" spawn -c "$cwd" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 \
+      --task "$("$HANDOFFKEEP_BIN" tasks add --title "resume task" 2>/dev/null |
+        python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')" \
+      "$@" >/dev/null 2>>"$TMP/wrk.stderr"
 }
 
 # assert_settings CWD EXPECT_JSON: compare the file's parsed content to the

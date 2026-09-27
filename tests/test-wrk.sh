@@ -79,9 +79,15 @@ export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 export PANEWIRE_BIN="$PANEWIRE"
 
-# Document uploads are also opt-in below. Keep pre-existing cases away from a
-# real handoffkeep installation while preserving their historical records.
-export HANDOFFKEEP_BIN="$TMP/absent-handoffkeep"
+# Document uploads are also opt-in below; the R21 section installs its own
+# scripted handoffkeep. #768 made every spawn bind a task, so the spawn paths
+# point at the deterministic fixture: pre-existing cases inherit one seeded
+# suite task through HK_TASK_ID (the same env a spawned pane receives), while
+# spawn_base mints a fresh --task per call so owner-mode claims run for real.
+export HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
+export HK_STATE="$TMP/hk-state.json"
+export HK_TASK_ID=76801
+"$HANDOFFKEEP_BIN" tasks add --id "$HK_TASK_ID" --title "suite-inherited-task" --lane fixture >/dev/null
 
 run_fail() {
   if "$@" >/dev/null 2>&1; then
@@ -136,6 +142,32 @@ spawn_base() {
   local model="$1"; shift
   local extra=("$@")
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
+  # #768: every spawn binds an hk task. Mint a fresh fixture task per spawn so
+  # owner-mode claims stay claimable; a case that supplies --task/--parent-job
+  # or unsets the task entirely (TEST_NO_TASK=1, e.g. usage-error probes)
+  # overrides this.
+  case " ${extra[*]-} " in
+    *" --task "*|*" --parent-job "*) ;;
+    *)
+      if [[ -z "${TEST_NO_TASK:-}" ]]; then
+        # Mint with an explicit id: parsing tasks-add output needs python3,
+        # which some cases deliberately stub out (awk-fallback probes). A file
+        # counter survives command-substitution subshells.
+        SPAWN_BASE_TASK=$(( $(cat "$TMP/mint-seq" 2>/dev/null || echo 768000) + 1 ))
+        printf '%s\n' "$SPAWN_BASE_TASK" >"$TMP/mint-seq"
+        "$HANDOFFKEEP_BIN" tasks add --id "$SPAWN_BASE_TASK" --title "spawn-base task" >/dev/null ||
+          fail "spawn_base: fixture task mint failed"
+        extra+=(--task "$SPAWN_BASE_TASK")
+      fi ;;
+  esac
+  # Record the effective --task each call carries. spawn_base often runs
+  # inside $(...), so a global is lost to the parent shell — a log file is
+  # the subshell-safe channel (tail -1 after a call = that call's task).
+  local resolved_task="" i
+  for ((i = 0; i < ${#extra[@]}; i++)); do
+    [[ "${extra[$i]}" == "--task" ]] && resolved_task="${extra[$((i + 1))]}"
+  done
+  [[ -n "$resolved_task" ]] && printf '%s\n' "$resolved_task" >>"$TMP/spawn-task.log"
   # A registered job leaves a detached sentinel behind, and that sentinel keeps
   # calling the fixture herdr — which appends every invocation to the shared
   # WRK_FIXTURE_LOG. At the default 30s interval one of those probes lands, about
@@ -2740,14 +2772,14 @@ builder_opus_out="$(spawn_base builder-opus --role builder --lane builder-lane -
 grep -q 'model=builder-opus' <<<"$builder_opus_out"
 grep -q -- '--model opus' "$TMP/herdr.log"
 grep -q -- '--effort high' "$TMP/herdr.log"
-python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events/00001-job.claim.json" <<'PY'
+python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events/00001-job.claim.json" "$(tail -n 1 "$TMP/spawn-task.log")" <<'PY'
 import json, sys
 event = json.load(open(sys.argv[1]))
 assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
 assert event["kind"] == "job.claim", event
 assert event["payload"] == {
     "agent_label": "fixture", "owner_lane": "builder-lane", "parent_lane": "parent-lane",
-    "role": "builder", "t_level": "T1",
+    "role": "builder", "t_level": "T1", "task_id": int(sys.argv[2]),
 }, event
 PY
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
@@ -5016,7 +5048,8 @@ def receipt(directory):
     assert len(paths) == 1, "exactly one job.spawned receipt, got %r" % paths
     return json.load(open(paths[0]))["payload"]
 kept, plain = receipt(sys.argv[1]), receipt(sys.argv[2])
-base = {"pane_id": "w:p1", "label": "fixture", "profile": "codex-terra", "workspace": "w", "tab_id": "w:t1"}
+base = {"pane_id": "w:p1", "label": "fixture", "profile": "codex-terra", "workspace": "w", "tab_id": "w:t1",
+        "task_id": 76801}
 assert plain == base, "a spawn without --keep must write the unchanged receipt, got %r" % plain
 assert kept == dict(base, keep=True), "--keep must record keep: true on the receipt, got %r" % kept
 assert kept["keep"] is True, "the marker must be the JSON literal true"

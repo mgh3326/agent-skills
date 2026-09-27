@@ -102,10 +102,17 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
    파일 인박스 보고 경로, 그리고 모든 지시와 AC의 1:1 대응을 명시한다. 🔴 보고서 경로는 항상
    worktree 밖이고, 브리프에 "이 경로는 worktree 밖이라 `git status` 에 영향이 없다 — 지우지
    마라" 를 명시한다(`spawn-worker` §3). 빌더 자신의 보고서도 같은 규칙이다.
-2. `wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE`으로 빌더 job을
-   등록한다. builder role은 canonical `builder-*`와 legacy `captain-*` 프로필을 모두 허용하며 parent 레인은 필수다.
+2. `wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE --task <hk task id>`으로
+   빌더 job을 등록한다. builder role은 canonical `builder-*`와 legacy `captain-*` 프로필을 모두 허용하며
+   parent 레인은 필수다.
    `captain` role 별칭은 deprecation 경고 후 builder로 정규화되고, arbiter의 `job.claim` envelope
-   payload에는 `owner_lane`, `role: "builder"`, `parent_lane`이 남는다.
+   payload에는 `owner_lane`, `role: "builder"`, `parent_lane`, `task_id`가 남는다.
+   🔴 **`--task`는 빌더 스폰의 필수다**(#768, task-job-linkage 항목 1): 스폰 성공 시 그 task가
+   빌더 라벨로 claim되고 `refs.job_id`가 잡에 바인딩된다. handoffkeep이 안 닿으면 스폰은
+   거부된다 — `--task-hk-bypass`로만 뚫리고 그 오버라이드는 잡 메타에 기록된다.
+   워커·tester 스폰에도 같은 규칙이다: 자기 task를 가진 워커는 `--task`, tester·자문
+   세션은 `--parent-job`이나 pane의 `HK_TASK_ID`로 부모 task를 상속한다
+   (`spawn-worker` §4 정본). 상속된 세션은 task를 다시 claim하지 않는다.
 3. 워커와 tester는 빌더가 스폰한다. tester의 급은 반드시 워커 이상이며, 독립 세션으로 AC 반증,
    변경 범위, 실패 경로를 확인한다. `spawn-worker`의 뮤턴트, 실모양 fixture, G3
    `merge_precheck`/`ci_canonical` 판정을 생략하지 않는다. `gh pr checks` 조회만으로 녹색을

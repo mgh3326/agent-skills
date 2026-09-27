@@ -566,6 +566,20 @@ def _require_job(con: sqlite3.Connection, job_id: str) -> None:
 # ------------------------------------------------------------------- commands
 
 
+def _claim_task_fields(args: argparse.Namespace, payload: dict) -> None:
+    # #768 task-job linkage: optional, additive fields. The hk task id is an
+    # integer on the hk side; keep the same type in the job meta so consumers
+    # can match `task.id == claim.task_id` without coercion. A non-numeric
+    # value is stored verbatim rather than rejected — the flag is audit
+    # metadata, not a gate.
+    if args.task_id is not None:
+        payload["task_id"] = int(args.task_id) if args.task_id.isdigit() else args.task_id
+    if args.task_link_override is not None:
+        payload["task_link_override"] = args.task_link_override
+    if args.task_inherited_from is not None:
+        payload["task_inherited_from"] = args.task_inherited_from
+
+
 def cmd_claim(args: argparse.Namespace) -> dict:
     con = connect_rw(bootstrap=True)
     moment = now_dt()
@@ -600,19 +614,21 @@ def cmd_claim(args: argparse.Namespace) -> dict:
                 " WHERE job_id = ?",
                 (args.lane, args.t, iso(moment), args.job),
             )
+            claim_payload = {
+                "owner_lane": args.lane,
+                "t_level": args.t,
+                "role": args.role,
+                "parent_lane": args.parent_lane,
+                "previous_created_at": row[3],
+                "previous_owner_lane": row[0],
+                "agent_label": args.agent_label or args.job,
+            }
+            _claim_task_fields(args, claim_payload)
             seq = record_event(
                 con,
                 args.job,
                 "job.reclaim",
-                {
-                    "owner_lane": args.lane,
-                    "t_level": args.t,
-                    "role": args.role,
-                    "parent_lane": args.parent_lane,
-                    "previous_created_at": row[3],
-                    "previous_owner_lane": row[0],
-                    "agent_label": args.agent_label or args.job,
-                },
+                claim_payload,
             )
         else:
             con.execute(
@@ -620,20 +636,22 @@ def cmd_claim(args: argparse.Namespace) -> dict:
                 " VALUES (?, ?, 'claimed', ?, ?, ?)",
                 (args.job, args.lane, args.t, iso(moment), iso(moment)),
             )
+            claim_payload = {
+                "owner_lane": args.lane,
+                "t_level": args.t,
+                "role": args.role,
+                "parent_lane": args.parent_lane,
+                # Herdr does not expose ARBITER_JOB. Persist the exact
+                # agent identity in the existing claim event instead of
+                # adding a schema column or guessing from a prefix.
+                "agent_label": args.agent_label or args.job,
+            }
+            _claim_task_fields(args, claim_payload)
             seq = record_event(
                 con,
                 args.job,
                 "job.claim",
-                {
-                    "owner_lane": args.lane,
-                    "t_level": args.t,
-                    "role": args.role,
-                    "parent_lane": args.parent_lane,
-                    # Herdr does not expose ARBITER_JOB. Persist the exact
-                    # agent identity in the existing claim event instead of
-                    # adding a schema column or guessing from a prefix.
-                    "agent_label": args.agent_label or args.job,
-                },
+                claim_payload,
             )
         con.execute("COMMIT")
     except BaseException:
@@ -1457,6 +1475,18 @@ def build_parser() -> argparse.ArgumentParser:
     claim.add_argument(
         "--agent-label",
         help="exact Herdr agent name/label for this job (defaults to --job; persisted in job.claim)",
+    )
+    claim.add_argument(
+        "--task-id",
+        help="handoffkeep task id this job is bound to (recorded in job.claim/job.reclaim payload)",
+    )
+    claim.add_argument(
+        "--task-link-override",
+        help="operator override marker recorded when a spawn proceeds without a confirmed hk task link",
+    )
+    claim.add_argument(
+        "--task-inherited-from",
+        help="parent job id whose task a tester/advisory child job inherited (recorded in job.claim/job.reclaim payload)",
     )
 
     lease = sub.add_parser("lease", parents=[common], help="원자적 lease 획득. 성공 시 token 출력")
