@@ -1889,7 +1889,7 @@ arbiter_handle_duplicate_claim() {
         return "$WRK_EXIT_JOB_STATE_UNREADABLE"
       fi
       set +e
-      "$ARBITER" claim --reclaim-released --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" "${ARBITER_CLAIM_TASK_ARGS[@]}" >/dev/null
+      "$ARBITER" claim --reclaim-released --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" ${ARBITER_CLAIM_TASK_ARGS[@]+"${ARBITER_CLAIM_TASK_ARGS[@]}"} >/dev/null
       reclaim_rc=$?
       set -e
       case "$reclaim_rc" in
@@ -2054,7 +2054,7 @@ arbiter_admit() {
 
   local claim_rc duplicate_rc
   set +e
-  "$ARBITER" claim --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" "${ARBITER_CLAIM_TASK_ARGS[@]}" >/dev/null
+  "$ARBITER" claim --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" ${ARBITER_CLAIM_TASK_ARGS[@]+"${ARBITER_CLAIM_TASK_ARGS[@]}"} >/dev/null
   claim_rc=$?
   set -e
   case "$claim_rc" in
@@ -5395,6 +5395,15 @@ hk_task_link() {
   # the other no-arbiter paths.
   [[ "${ARBITER_CLAIM_FAILED:-0}" -ne 1 ]] ||
     die "arbiter claim failed for job $JOB_ID — refusing to bind task $TASK_ID to an unregistered job (pane and quota record are being released)"
+  # Inherited children never claim: the owner's record stands. Even when a
+  # bypass flag degraded the precheck to bypassed:*, the link write stays
+  # owner-only — the outcome is recorded, the task is untouched.
+  if [[ "$TASK_LINK_MODE" == "inherited" ]]; then
+    local st="$TASK_LINK_STATUS"
+    [[ "$st" == bypassed:* ]] || st="inherited"
+    hk_task_link_event "$st" ""
+    return 0
+  fi
   case "$TASK_LINK_STATUS" in
     link|bypassed:*) ;;
     already_linked|inherited) hk_task_link_event "$TASK_LINK_STATUS" ""; return 0 ;;
@@ -5421,7 +5430,11 @@ raise SystemExit(0 if ok else 1)' "$LABEL" "$JOB_ID"; then
     hk_task_link_event "linked" ""
     return 0
   fi
-  if [[ "$TASK_HK_BYPASS" -eq 1 ]]; then
+  # The bypass covers only what it was declared for: hk unreachable at
+  # precheck (bypassed:*) plus a nonzero claim rc. A reachable refusal and a
+  # response that drops refs.job_id stay fail-closed — they are half-record
+  # evidence, not unavailability.
+  if [[ "$rc" -ne 0 && "$TASK_HK_BYPASS" -eq 1 && "$TASK_LINK_STATUS" == bypassed:* ]]; then
     warn "hk task link write failed (rc=$rc) but --task-hk-bypass was given — job $JOB_ID proceeds without the hk link; override recorded in job meta"
     hk_task_link_event "bypassed:link_write_failed" "$out"
     return 0

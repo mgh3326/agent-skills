@@ -313,6 +313,16 @@ no_claim "an unregistered job never binds the task"
 [[ "$(hk_field 1 state)" == backlog ]] || fail "task must stay unbound when the job claim failed"
 echo "PASS c9 arbiter-claim failure refuses before the hk bind"
 
+# C10: --task-hk-bypass must not launder a reachable failure. An hk that was
+# reachable at precheck and answers the claim while dropping refs.job_id is
+# a half-record, not unavailability — it dies even with the flag (review
+# finding: the write-failure bypass covered verify failures).
+reset_case c10
+HK_MODE=old spawn_try -- --task 1 --task-hk-bypass --job c10-job
+[[ "$SPAWN_RC" -ne 0 ]] || fail "verify failure must stay fail-closed despite --task-hk-bypass"
+expect_grep 'task link failed\|refs.job_id' "$TMP/stderr.txt" "verify failure must be loud"
+echo "PASS c10 bypass cannot launder a reachable verify failure"
+
 echo "== AC1 inheritance: tester/advisory spawns take the parent task =="
 
 # D1: --parent-job inheritance — task id comes from the parent's claim meta.
@@ -426,6 +436,19 @@ expect_rc 2 "malformed inherited task id must refuse despite bypass"
 expect_grep 'not a positive task id' "$TMP/stderr.txt" "malformed id must be named"
 no_job_dir d8-worker "no job for a malformed inherited task"
 echo "PASS d8 malformed inherited task id refuses despite bypass"
+
+# D9: an inherited child + hk-down + --task-hk-bypass still never claims —
+# the bypass degrades the precheck but the link write stays owner-only
+# (review finding: bypassed:* status sent the inherited child into the
+# claim branch).
+reset_case d9
+HK_MODE=down spawn_try -e HK_TASK_ID=7777 -- --task-hk-bypass --job d9-child
+expect_rc 0 "inherited child + hk-down + bypass proceeds"
+no_claim "an inherited child never claims, even under bypass"
+link_payload="$(event_payload d9-child job.task_link)"
+grep -qE '"status" *: *"bypassed:' <<<"$link_payload" ||
+  fail "bypassed precheck must be recorded in the link event: $link_payload"
+echo "PASS d9 inherited child never claims the parent task under bypass"
 
 echo "== AC3 version skew: an old handoffkeep is detected, never trusted =="
 
