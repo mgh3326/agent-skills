@@ -5889,7 +5889,8 @@ fi
 HEAVY_LOCK="$TMP/heavy.lock"
 HEAVY_LOAD="$TMP/heavy-load"
 printf '0\n' >"$HEAVY_LOAD"
-export WRK_HEAVY_LOCK="$HEAVY_LOCK" WRK_HEAVY_LOAD_FILE="$HEAVY_LOAD"
+export WRK_HEAVY_LOCK="$HEAVY_LOCK" WRK_HEAVY_LOAD_FILE="$HEAVY_LOAD" \
+  WRK_HEAVY_LOG="$TMP/heavy.log"
 
 heavy_status_has_waiter() { "$WRK" heavy status | grep -q 'waiter pid='; }
 pid_dead() { ! kill -0 "$1" 2>/dev/null; }
