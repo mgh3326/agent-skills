@@ -5824,9 +5824,9 @@ j499_run 1 present help escalate --help | grep -q '^Usage: wrk escalate JOB' ||
 [[ "$(j499_lines "$TMP/j499-help-job.log")" == 0 ]] || fail "escalate --help must not delegate"
 echo "PASS j499-delegates-once-to-panewire-job"
 
-# absent / garbage / hang / forced off: wrk's own path, exactly one record and
+# absent / garbage / forced off: wrk's own path, exactly one record and
 # one emit per command, zero delegated calls.
-for mode in absent garbage hang off; do
+for mode in absent garbage off; do
   job_mode="$mode" delegate=1
   if [[ "$mode" == off ]]; then job_mode=present delegate=0; fi
   worker="j499-$mode-worker" builder="j499-$mode-builder"
@@ -5857,6 +5857,34 @@ helper.assert_matches_record(joined_call, helper.record(builder, "job.joined"))
 PY
 done
 echo "PASS j499-falls-back-to-own-path-without-panewire-job"
+
+# hang: the fixture sleeps inside `panewire job probe`, so the probe is killed
+# by WRK_JOB_DELEGATE_TIMEOUT_S and the invocation marks panewire wedged. The
+# local path still writes exactly one record per command, but emit must not
+# re-enter the wedged binary: zero emit calls, one delegate_timeout marker
+# per skipped emit, and no delegated job call ever reaches the fixture log.
+mode=hang
+worker="j499-$mode-worker" builder="j499-$mode-builder"
+j499_claim "$worker"
+j499_claim "$builder" --role builder --parent-lane parent-a
+out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang 'done' "$worker" --report "$J499_REPORT")"
+[[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "hang: done output changed: $out"
+out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang escalate "$builder" --question 'fallback question')"
+[[ "$out" == "OK job=$builder owner_lane=lane-a kind=job.escalate" ]] || fail "hang: escalate output changed: $out"
+out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang joined "$builder" --pr https://example.invalid/pr/8 \
+  --head f00d --report "$J499_REPORT")"
+[[ "$out" == "OK job=$builder owner_lane=lane-a kind=job.joined pr=https://example.invalid/pr/8 head=f00d report=$J499_REPORT" ]] ||
+  fail "hang: joined output changed: $out"
+[[ "$(event_count "$J499_INBOX/$worker/events" job.completed)" == 1 ]] || fail "hang: done must write exactly one record"
+[[ "$(event_count "$J499_INBOX/$builder/events" job.escalate)" == 1 ]] || fail "hang: escalate must write exactly one record"
+[[ "$(event_count "$J499_INBOX/$builder/events" job.joined)" == 1 ]] || fail "hang: joined must write exactly one record"
+[[ "$(j499_calls "$TMP/j499-hang-emit.log")" == 0 ]] || fail "hang: emit must not re-enter the wedged panewire"
+[[ "$(j499_lines "$TMP/j499-hang-job.log")" == 0 ]] || fail "hang: nothing may be delegated past the hung probe"
+grep -Eq '^[0-9TZ:-]+ kind=job.completed rc=delegate_timeout$' "$J499_INBOX/$worker/emit-failures.log" ||
+  fail "hang: done must mark the skipped emit as delegate_timeout"
+[[ "$(grep -c 'rc=delegate_timeout$' "$J499_INBOX/$builder/emit-failures.log")" == 2 ]] ||
+  fail "hang: escalate+joined must each mark a delegate_timeout"
+echo "PASS j499-hang-wedges-panewire-and-skips-emit"
 
 # no binary: wrk's own record, and the missing emit is marked exactly as before.
 j499_claim j499-nobin-worker
