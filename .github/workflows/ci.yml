@@ -53,6 +53,7 @@ jobs:
             tests/test-t3-split-rule.sh \
             tests/test-merge-precheck.sh \
             tests/test-round-cap.sh \
+            tests/test-wrk-heavy-limit.sh \
             tests/test-wrk-task-link.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' ! -name 'handoffkeep' -perm -111 -print)
       - name: Bash tests
@@ -83,4 +84,5 @@ jobs:
           bash tests/test-t3-split-rule.sh
           bash tests/test-merge-precheck.sh
           bash tests/test-round-cap.sh
+          bash tests/test-wrk-heavy-limit.sh
           bash tests/test-wrk-task-link.sh

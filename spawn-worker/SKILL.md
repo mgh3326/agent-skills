@@ -566,6 +566,7 @@ hub 호출 자체가 실패했을 때만 아래의 로컬 폴백 측정(load5/nc
 [local]
 max_load_ratio = 0.5       # hub unavailable 때만 사용
 max_active = 4             # hub unavailable 때만 사용
+heavy_max = 1              # 이 머신의 wrk heavy 동시 홀더 수: 0=금지, N=슬롯 N개 (기본 1)
 
 [hub]
 hub_url = "wss://<hub-host>"
@@ -637,15 +638,27 @@ cwd_keys = {"<local-worktree>"="repo-a"}
   SSH로 조용히 되돌리지 않으며, `--host local` 또는 hosts.toml 보완을 안내한다. lost·인증
   실패·hub 오류도 같은 원칙으로 종료한다.
 
-### 4.x-3 무거운 로컬 실행 (호스트당 1개 — `wrk heavy`)
+### 4.x-3 무거운 로컬 실행 (호스트당 `heavy_max`개 — `wrk heavy`)
 
 "무거운 실행" = **1분 넘게 도는 어떤 테스트·빌드**(auto_trader·scopefuel full pytest, hk
 `go test -race`·vitest, panewire `go test ./...`, agent-skills `test-wrk.sh` — scopefuel 도
-포함이다). 반드시 `wrk heavy -- <cmd>` 로 감싼다 — 호스트당 락 1개(`fcntl.flock`, mac·Linux
-동일), **같은 head 에서 세션(역할)당 최대 1회**(워커의 실행과 tester 의 독립 재실행은
+포함이다). 반드시 `wrk heavy -- <cmd>` 로 감싼다 — 호스트당 슬롯 `heavy_max`개
+(`fcntl.flock` 카운팅 세마포, mac·Linux 동일; 죽은 홀더의 슬롯은 커널이 회수한다),
+**같은 head 에서 세션(역할)당 최대 1회**(워커의 실행과 tester 의 독립 재실행은
 별개다), 대기 상한 20분(초과 시 rc=75 로 실패하고 보고서에 "heavy 대기
 초과" 기록, 락 없이 임의로 돌리지 않는다), `nice -n 10`, 시작 전 load5/ncpu ≥ 1.0 이면 대기.
-보유자·대기열은 `wrk heavy status` 로 본다.
+보유자·대기열·유효 상한은 `wrk heavy status` 로 본다.
+
+호스트별 상한은 **그 머신 자신의** hosts.toml `[local] heavy_max` 가 정한다(없으면 1).
+`0`이면 그 호스트에서 heavy 를 전면 거부(rc 78, 호스트명을 적고 desktop 으로 안내한다).
+모든 획득·거부·대기초과는 `~/.local/state/wrk/heavy.log`(JSONL, `WRK_HEAVY_LOG`로 경로
+변경)에 `host`/`job`/`task`/`cmd`/`wait_s`/`hold_s` 등을 남겨 director 가 기계별 대기
+시간을 집계할 수 있다.
+
+09-27 운영자 확정값(정본은 hk task 772, **적용은 merge 후 director-1 이 라이브 설정에
+한다**): 이 맥(mac-personal) `heavy_max = 0` — syspolicyd SIGSEGV 방지, desktop
+`heavy_max = 1`, m1b `heavy_max = 2`. 이 맥에서는 1-3개 targeted test 파일을
+`wrk heavy` 없이 직접 돌리는 것만 허용된다.
 
 macOS 에는 `flock` 명령이 없으므로 **브리프에 셸 `flock` 문구를 직접 쓰지 않는다.** 09-24
 수동 규약(`flock /tmp/desktop-heavy-test.lock`)은 `wrk heavy` 로 대체됐다 — 그 파일을 직접

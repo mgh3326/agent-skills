@@ -5889,7 +5889,8 @@ fi
 HEAVY_LOCK="$TMP/heavy.lock"
 HEAVY_LOAD="$TMP/heavy-load"
 printf '0\n' >"$HEAVY_LOAD"
-export WRK_HEAVY_LOCK="$HEAVY_LOCK" WRK_HEAVY_LOAD_FILE="$HEAVY_LOAD"
+export WRK_HEAVY_LOCK="$HEAVY_LOCK" WRK_HEAVY_LOAD_FILE="$HEAVY_LOAD" \
+  WRK_HEAVY_LOG="$TMP/heavy.log"
 
 heavy_status_has_waiter() { "$WRK" heavy status | grep -q 'waiter pid='; }
 pid_dead() { ! kill -0 "$1" 2>/dev/null; }
@@ -6016,15 +6017,21 @@ grep -q 'wait cap' <<<"$out" || fail "cap expiry must say why: $out"
 wait "$holder_job" || fail "cap holder run failed"
 echo "PASS heavy-wait-cap-exits-75"
 
-# the lock fd is not inherited: an orphaned child must not keep the lock.
+# the slot fd is deliberately inherited (nested-proof): an orphaned child
+# keeps the slot while it lives — resource accounting tracks the work tree,
+# not the wrapper — and releases it the moment the orphan dies.
 "$WRK" heavy -- bash "$TMP/orphan.sh" || fail "orphan-spawning run failed"
 read -r orphan_pid <"$TMP/heavy-orphan.pid"
 kill -0 "$orphan_pid" 2>/dev/null || fail "orphan did not survive its parent"
-WRK_HEAVY_WAIT_CAP=5 "$WRK" heavy -- true ||
-  fail "orphaned child still holds the heavy lock (fd inherited)"
+rc=0
+out="$(WRK_HEAVY_WAIT_CAP=3 "$WRK" heavy -- true 2>&1)" || rc=$?
+[[ "$rc" == 75 ]] ||
+  fail "slot must stay held while the orphan lives (rc=$rc): $out"
 kill "$orphan_pid" 2>/dev/null || true
 heavy_dead "$orphan_pid" || fail "orphan sleep did not die"
-echo "PASS heavy-orphan-does-not-keep-the-lock"
+WRK_HEAVY_WAIT_CAP=5 "$WRK" heavy -- true ||
+  fail "slot not reclaimed after the whole holder tree died"
+echo "PASS heavy-orphan-slot-dies-with-tree"
 
 # load gate: load5/ncpu >= 1.0 blocks the start and is bounded by the same cap.
 # The boundary is exact: a ratio of precisely 1.0 still blocks (the gate is

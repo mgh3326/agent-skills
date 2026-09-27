@@ -6262,32 +6262,64 @@ heavy_help() {
 Usage: wrk heavy -- <command> [args...]
        wrk heavy status
 
-Serialize heavy (>1 minute) local test/build runs: one holder per host via
-fcntl.flock on a per-host lock file (works the same on macOS and Linux —
-macOS has no `flock` command). The command runs under `nice -n 10` and only
-starts once load5/ncpu < 1.0. Total wait (lock + load) is capped at 20
-minutes; on expiry the command is NOT run and wrk exits 75 (EX_TEMPFAIL).
-The lock fd is never inherited by the command, so an orphaned child cannot
-keep the lock held (the desktop flock -o leak, v637).
+Serialize heavy (>1 minute) local test/build runs: up to `heavy_max` holders
+per host (default 1) via fcntl.flock on per-host slot files (works the same
+on macOS and Linux — macOS has no `flock` command, and flock releases a dead
+holder's slot automatically, unlike shlock pid-files). Slot 0 is the lock
+file itself; slots 1..N-1 are <lock>.slot<i>. The command runs under
+`nice -n 10` and only starts once load5/ncpu < 1.0. Total wait (slot +
+load) is capped at 20 minutes; on expiry the command is NOT run and wrk
+exits 75 (EX_TEMPFAIL). The command inherits the slot fd (nested detection
+needs it — see WRK_HEAVY_HELD_FD), so an orphaned child keeps the slot while
+it lives; the kernel frees the slot when the whole holder tree is gone.
 
-`wrk heavy status` prints the lock path, the current holder, and queued
-waiters (the holder pid is the wrk heavy python process; killing it releases
-the lock even while the command's orphaned children keep running).
+The limit comes from hosts.toml `[local] heavy_max` (WRK_HOSTS_CONFIG or
+~/.config/wrk/hosts.toml): unset = 1, 0 = refuse every heavy run on this
+host with rc 78 (EX_CONFIG) and a message naming the host and pointing at
+desktop, N>1 = N concurrent holders. `WRK_HEAVY_MAX` overrides the
+configured value for one invocation. A non-integer or negative limit also
+refuses rc 78 — a config typo must not silently allow runs. Lowering the
+limit does not kill extra holders minted under a larger one; they drain.
+
+`wrk heavy status` prints the lock path, this host, the effective limit,
+one `holder` line per occupied slot, and queued waiters (holder pids are the
+wrk heavy python processes; killing one frees its slot once the command
+tree that inherited the slot fd is also gone). status never creates slot
+files and is never refused.
+
+Every acquisition appends one JSON record to the heavy log (default
+~/.local/state/wrk/heavy.log): ts, kind=run, host, job (ARBITER_JOB or -),
+task (HK_TASK_ID or -), pid, slot, limit, cmd, wait_s, wait_lock_s,
+wait_load_s, hold_s, rc. Nested runs are logged as kind=nested, refusals as
+kind=refused and wait-cap expiries as kind=wait_cap, so wait times stay
+aggregable and no execution path evades the log.
 
 Notes: the command's own exit 75 is indistinguishable from a wait-cap 75 —
 check stderr. stdin is not forwarded (the command sees EOF). A nested
 `wrk heavy` on the same lock is detected and run directly under nice — the
-outer invocation already serializes the host, so nesting never deadlocks.
+outer invocation already holds a slot, so nesting never deadlocks. Because
+the command inherits the slot descriptor, the slot stays held for as long
+as any inheriting descendant lives: a crashed wrapper's slot is reclaimed
+by the kernel only once the whole holder process tree is gone.
 
 Environment:
   WRK_HEAVY_HELD        <lock path>:<holder pid>, set by wrk heavy for its
-                        command so a nested wrk heavy is detected; ignored
-                        unless the pid is alive and is the recorded holder
+                        command; informational only — nested detection uses
+                        WRK_HEAVY_HELD_FD
+  WRK_HEAVY_HELD_FD     <fd>:<slot path>, set by wrk heavy for its command
+                        so a nested wrk heavy is detected; honored only when
+                        the fd is an inherited descriptor of the open file
+                        description that owns that slot's flock right now,
+                        and the slot is acquirable under the current limit —
+                        forged env values and rewritten slot text cannot pass
   WRK_HEAVY_LOCK        lock file path
                         (default /tmp/wrk-heavy-<hostname>.lock)
+  WRK_HEAVY_MAX         override the hosts.toml heavy_max for this run
   WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
   WRK_HEAVY_LOAD_FILE   file re-read each poll whose first field is used as
                         load5/ncpu (default: os.getloadavg()[1]/cpu_count)
+  WRK_HEAVY_LOG         acquisition log path
+                        (default ~/.local/state/wrk/heavy.log)
   -h, --help            show this usage
 USAGE
 }
@@ -6296,10 +6328,26 @@ heavy_cmd() {
   case "${1:-}" in
     -h|--help) heavy_help; return 0 ;;
   esac
-  python3 - "$@" <<'PY'
-import datetime, fcntl, os, socket, subprocess, sys, time
+  # Per-host heavy concurrency limit (#772): WRK_HEAVY_MAX wins for one
+  # invocation, then hosts.toml [local] heavy_max via the same
+  # spillover_value reader that owns the documented TOML surface, else 1.
+  # The python half validates and enforces it.
+  local heavy_limit heavy_limit_src
+  if [[ -n "${WRK_HEAVY_MAX:-}" ]]; then
+    heavy_limit="$WRK_HEAVY_MAX"
+    heavy_limit_src="WRK_HEAVY_MAX"
+  elif heavy_limit="$(spillover_value local heavy_max 2>/dev/null)"; then
+    heavy_limit_src="$(spillover_config) [local] heavy_max"
+  else
+    heavy_limit=1
+    heavy_limit_src="default"
+  fi
+  WRK_HEAVY_LIMIT="$heavy_limit" WRK_HEAVY_LIMIT_SRC="$heavy_limit_src" \
+    python3 - "$@" <<'PY'
+import datetime, fcntl, glob, json, os, re, socket, subprocess, sys, time
 
 EXIT_WAIT_CAP = 75  # EX_TEMPFAIL: transient, worth reporting and retrying later
+EXIT_REFUSED = 78   # EX_CONFIG: this host's configuration forbids the run
 
 
 def fail(msg, rc):
@@ -6329,26 +6377,110 @@ args = sys.argv[1:]
 if not args:
     fail("usage: wrk heavy -- <command> [args...] | wrk heavy status", 2)
 
+host = socket.gethostname()
 lock_path = os.environ.get("WRK_HEAVY_LOCK") or (
-    "/tmp/wrk-heavy-%s.lock" % socket.gethostname())
+    "/tmp/wrk-heavy-%s.lock" % host)
 waiters_dir = lock_path + ".waiters"
+
+# The bash half resolves the limit from WRK_HEAVY_MAX or hosts.toml [local]
+# heavy_max. Invalid (non-integer or negative) refuses the run rc 78; status
+# stays tolerant so a broken config can still be inspected.
+limit_raw = os.environ.get("WRK_HEAVY_LIMIT", "1")
+limit_src = os.environ.get("WRK_HEAVY_LIMIT_SRC", "default")
+try:
+    limit = int(limit_raw)
+    limit_ok = limit >= 0
+except ValueError:
+    limit, limit_ok = -1, False
+
+slot_re = re.compile(re.escape(lock_path) + r"\.slot(\d+)$")
+
+
+def slot_index(path):
+    if path == lock_path:
+        return 0
+    return int(slot_re.match(path).group(1))
+
+
+def limit_slots():
+    # Acquirable slots under the current limit. The base lock file stays
+    # slot 0 so a limit-1 host keeps byte-identical semantics (and stays
+    # mutually exclusive with older wrk versions that only know that file).
+    if not limit_ok:
+        return [lock_path]
+    return [lock_path] + [
+        "%s.slot%d" % (lock_path, i) for i in range(1, limit)]
+
+
+def known_slots():
+    # Slots a status/nested-holder probe must inspect: acquirable ones plus
+    # files minted under an earlier larger limit — their holders still
+    # serialize even though new runs may not take them.
+    paths = list(limit_slots())
+    extras = [p for p in glob.glob(lock_path + ".slot*")
+              if slot_re.match(p) and p not in paths]
+    return paths + sorted(extras, key=slot_index)
+
+
+log_path = os.environ.get("WRK_HEAVY_LOG") or os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "wrk", "heavy.log")
+
+
+def log_event(rec):
+    # One JSONL record per event the director aggregates: runs (with
+    # wait/hold seconds), refusals and wait-cap expiries. Best-effort — a
+    # lost record must not fail the run.
+    rec.update({
+        "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+        "host": host,
+        "job": os.environ.get("ARBITER_JOB") or "-",
+        "task": os.environ.get("HK_TASK_ID") or "-",
+        "pid": os.getpid(),
+    })
+    try:
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, sort_keys=True) + "\n")
+    except OSError as e:
+        print("wrk heavy: cannot write heavy log %s: %s" % (log_path, e),
+              file=sys.stderr)
+
+
+def flock_held(path):
+    # NB flock probe: True iff another process holds the file. Never mints
+    # the slot — a missing file cannot be held.
+    try:
+        fd = os.open(path, os.O_RDWR)
+    except OSError:
+        return False
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        return False
+    finally:
+        os.close(fd)  # close also releases a probe that did acquire
+
 
 if args[0] == "status":
     if len(args) != 1:
         fail("status takes no arguments", 2)
     print("lock " + lock_path)
-    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
-    try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            held = False
-        except BlockingIOError:
-            held = True
-    finally:
-        os.close(fd)
-    if held:
-        print("holder " + (read_text(lock_path) or "(info unreadable)"))
+    print("host " + host)
+    if limit_ok:
+        print("limit %d (%s)" % (limit, limit_src))
     else:
+        print("limit %s (invalid, %s)" % (limit_raw, limit_src))
+    paths = known_slots()
+    holders = []
+    for p in paths:
+        if flock_held(p):
+            holders.append((slot_index(p), read_text(p) or "(info unreadable)"))
+    for i, hinfo in holders:
+        print("holder " + (("slot=%d " % i) if len(paths) > 1 else "") + hinfo)
+    if not holders:
         print("holder none")
     waiters = []
     try:
@@ -6392,9 +6524,20 @@ try:
 except ValueError:
     fail("WRK_HEAVY_WAIT_CAP is not a number", 2)
 deadline = time.monotonic() + cap
-info = "pid=%d since=%s cmd=%s" % (
+cmd_summary = " ".join(cmd)
+info = "pid=%d since=%s job=%s cmd=%s" % (
     os.getpid(), datetime.datetime.now().isoformat(timespec="seconds"),
-    " ".join(cmd))
+    os.environ.get("ARBITER_JOB") or "-", cmd_summary)
+started_at = time.monotonic()
+
+if not limit_ok:
+    fail("invalid heavy limit '%s' from %s (want an integer >= 0)"
+         % (limit_raw, limit_src), EXIT_REFUSED)
+if limit == 0:
+    log_event({"kind": "refused", "cmd": cmd_summary[:200],
+               "limit": 0, "limit_src": limit_src})
+    fail("host '%s' is configured heavy_max=0 (%s) -- refusing; run heavy "
+         "commands on desktop instead" % (host, limit_src), EXIT_REFUSED)
 
 
 def load_ratio():
@@ -6410,15 +6553,55 @@ def load_ratio():
         return None
 
 
-def holder_pid():
-    info = read_text(lock_path)
-    first = info.split(None, 1)[0] if info else ""
-    if first.startswith("pid="):
-        try:
-            return int(first[4:])
-        except ValueError:
-            pass
-    return -1
+def fd_is_open(fd):
+    try:
+        os.fstat(fd)
+    except OSError:
+        return False
+    return True
+
+
+slot_env_re = re.compile(
+    re.escape(os.path.realpath(lock_path)) + r"\.slot(\d+)$")
+
+
+def nested_held_fd(fd_s, env_path):
+    # WRK_HEAVY_HELD_FD=<fd>:<slot path> is honored only when every kernel
+    # check lines up: fd is an open descriptor on a slot acquirable under the
+    # current limit, that file is flock-held right now, AND fd belongs to the
+    # open file description that owns the lock (relocking an inherited
+    # descriptor of the held OFD succeeds; a fresh open on a file held by
+    # another fails). The proof object is the slot itself — no env text,
+    # slot text, pid, side file, or PATH helper is trusted, because anything
+    # a same-uid caller can name or rewrite it can also fake (#772 tester
+    # rounds 1-3). A `.slotN` outside the current limit is just a caller-made
+    # file — honoring it would let a self-flocked phantom slot forge nesting.
+    rp = os.path.realpath(env_path)
+    if rp != os.path.realpath(lock_path):
+        m = slot_env_re.match(rp)
+        if m is None or not 0 < int(m.group(1)) < limit:
+            return None
+    try:
+        env_fd = int(fd_s)
+        fst = os.fstat(env_fd)
+        lst = os.stat(env_path)
+    except (OSError, ValueError):
+        return None
+    if (fst.st_dev, fst.st_ino) != (lst.st_dev, lst.st_ino):
+        return None
+    if not flock_held(env_path):
+        return None  # the slot it claims is free — stale or forged
+    try:
+        fcntl.flock(env_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return None  # a different OFD than the holder's
+    return env_fd
+
+
+held_fd = None
+held_path = None
+nested_fd = None
+nested_path = None
 
 
 def run_command():
@@ -6426,7 +6609,18 @@ def run_command():
         env = dict(os.environ)
         env["WRK_HEAVY_HELD"] = "%s:%d" % (
             os.path.abspath(lock_path), os.getpid())
-        rc = subprocess.call(["nice", "-n", "10"] + cmd, env=env)
+        hfd = held_fd if held_fd is not None else nested_fd
+        hpath = held_path if held_fd is not None else nested_path
+        if hfd is not None and hpath and fd_is_open(hfd):
+            # hand the slot fd down so a nested wrk heavy can prove it is
+            # inside this holder's process tree (see nested_held_fd)
+            env["WRK_HEAVY_HELD_FD"] = "%d:%s" % (hfd, hpath)
+            pfds = {hfd}
+        else:
+            env.pop("WRK_HEAVY_HELD_FD", None)
+            pfds = ()
+        rc = subprocess.call(["nice", "-n", "10"] + cmd, env=env,
+                             pass_fds=pfds)
         if rc < 0:
             rc = 128 - rc
         return rc
@@ -6437,71 +6631,111 @@ def run_command():
 
 
 # A nested `wrk heavy` on the same lock would deadlock against itself for the
-# full cap — the outer invocation already serializes this host, so run the
-# inner command directly (still under nice). The env value alone is not proof
-# (an orphan can outlive its holder and still carry it): the named holder pid
-# must be alive AND be the pid recorded in the lock file.
-held_env = os.environ.get("WRK_HEAVY_HELD", "")
-held_path, sep, held_pid = held_env.rpartition(":")
-if (sep and held_pid.isdigit()
-        and os.path.realpath(held_path) == os.path.realpath(lock_path)
-        and int(held_pid) == holder_pid() and alive(int(held_pid))):
+# full cap — the outer invocation already holds a slot on this host, so run
+# the inner command directly (still under nice) and log it as a nested run.
+# Detection is by inherited slot fd, not the pid env: the holder hands its
+# slot descriptor to the command, and only a process that actually received
+# that descriptor can relock it.
+held_fd_env = os.environ.get("WRK_HEAVY_HELD_FD", "")
+held_fd_s, sep, held_fd_path = held_fd_env.partition(":")
+if sep and held_fd_s.isdigit():
+    nested_fd = nested_held_fd(held_fd_s, held_fd_path)
+    if nested_fd is not None:
+        nested_path = os.path.realpath(held_fd_path)
+if nested_fd is not None:
     print("wrk heavy: already holding %s in this process tree -- "
           "running nested command without re-locking" % lock_path,
           file=sys.stderr)
-    raise SystemExit(run_command())
+    nested_at = time.monotonic()
+    nrc = run_command()
+    log_event({"kind": "nested", "cmd": cmd_summary[:200], "limit": limit,
+               "wait_s": 0.0, "hold_s": round(time.monotonic() - nested_at, 3),
+               "rc": nrc})
+    raise SystemExit(nrc)
 
 os.makedirs(waiters_dir, exist_ok=True)
 me = os.path.join(waiters_dir, str(os.getpid()))
-held = False
-# PEP 446: os.open returns a non-inheritable fd, so the command's process
-# tree never holds the lock — when this python process (the pid shown by
-# `wrk heavy status`) dies or the command exits, the lock is released even
-# while orphaned children keep running.
-fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+held_slot = -1
+acquired_at = None
+run_at = None
+rc = None
+# PEP 446: os.open returns non-inheritable fds; the acquired slot fd is
+# re-inherited into the command only via run_command's pass_fds so nested
+# runs can prove they are inside the holder's tree (nested_held_fd). A slot
+# therefore stays held for as long as any inheriting descendant lives — the
+# lock's lifetime is the holder's process tree, not just this wrapper.
+slot_paths = limit_slots()
+slot_fds = [os.open(p, os.O_RDWR | os.O_CREAT, 0o644) for p in slot_paths]
 try:
     with open(me, "w", encoding="utf-8") as f:
         f.write(info)
     while True:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            held = True
-            break
-        except BlockingIOError:
+            for i, sfd in enumerate(slot_fds):
+                try:
+                    fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    held_fd, held_slot, held_path = sfd, i, slot_paths[i]
+                    break
+                except BlockingIOError:
+                    pass
+            if held_fd is not None:
+                break
             if time.monotonic() >= deadline:
-                fail("wait cap %.0fs exceeded waiting for the host lock %s "
+                log_event({"kind": "wait_cap", "phase": "slot",
+                           "cmd": cmd_summary[:200], "limit": limit,
+                           "wait_s": round(time.monotonic() - started_at, 3)})
+                fail("wait cap %.0fs exceeded waiting for a heavy slot on %s "
                      "-- command not run" % (cap, lock_path), EXIT_WAIT_CAP)
             time.sleep(0.5)
         except KeyboardInterrupt:
-            fail("interrupted while waiting for the host lock %s "
+            fail("interrupted while waiting for a heavy slot on %s "
                  "-- command not run" % lock_path, 130)
+    acquired_at = time.monotonic()
     try:
         os.remove(me)
     except OSError:
         pass
-    os.ftruncate(fd, 0)
-    os.write(fd, (info + "\n").encode())
+    os.ftruncate(held_fd, 0)
+    os.write(held_fd, (info + "\n").encode())
     while True:
         try:
             ratio = load_ratio()
             if ratio is None or ratio < 1.0:
                 break
             if time.monotonic() >= deadline:
+                log_event({"kind": "wait_cap", "phase": "load",
+                           "cmd": cmd_summary[:200], "limit": limit,
+                           "wait_s": round(time.monotonic() - started_at, 3)})
                 fail("wait cap %.0fs exceeded waiting for load5/ncpu %.2f "
                      "< 1.0 -- command not run" % (cap, ratio), EXIT_WAIT_CAP)
             time.sleep(1)
         except KeyboardInterrupt:
             fail("interrupted while waiting for load to drop "
                  "-- command not run", 130)
-    raise SystemExit(run_command())
+    run_at = time.monotonic()
+    try:
+        rc = run_command()
+    except SystemExit as e:
+        rc = e.code if isinstance(e.code, int) else 1
+        raise
+    raise SystemExit(rc)
 finally:
     try:
         os.remove(me)
     except OSError:
         pass
-    if held:
-        os.ftruncate(fd, 0)
-    os.close(fd)
+    if held_fd is not None:
+        if run_at is not None:
+            log_event({"kind": "run", "cmd": cmd_summary[:200],
+                       "slot": held_slot, "limit": limit,
+                       "wait_s": round(run_at - started_at, 3),
+                       "wait_lock_s": round(acquired_at - started_at, 3),
+                       "wait_load_s": round(run_at - acquired_at, 3),
+                       "hold_s": round(time.monotonic() - acquired_at, 3),
+                       "rc": rc})
+        os.ftruncate(held_fd, 0)
+    for sfd in slot_fds:
+        os.close(sfd)
 PY
 }
 
