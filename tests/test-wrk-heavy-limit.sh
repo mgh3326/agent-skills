@@ -218,9 +218,9 @@ assert any(w >= 0.4 for w in waits), ("no run logged a real wait", waits)
 PY
 echo "PASS heavy-log-fields"
 
-# ── WRK_HEAVY_HELD: nested runs bypass, forged env does not ───────────────
-# the strongest forgery: a live ANCESTOR pid written into an unheld slot —
-# text alone used to pass nested detection and skip slot + log (#772 r1).
+# ── nested detection: real runs bypass, every forgery does not ────────────
+# WRK_HEAVY_HELD pid text and held-slot file text are both caller-writable —
+# nested detection must ignore them entirely (#772 tester r1-r2).
 printf 'pid=%d since=x job=- cmd=forged\n' $$ >"$WRK_HEAVY_LOCK"
 set +e
 out="$(WRK_HEAVY_HELD="$WRK_HEAVY_LOCK:$$" heavy_run "$CFGNOKEY" -- touch "$TMP/forge-ran" 2>&1)"
@@ -228,15 +228,16 @@ rc=$?
 set -e
 [[ "$rc" -eq 0 && -e "$TMP/forge-ran" ]] || fail "forged-env run failed: rc=$rc $out"
 ! grep -q 'already holding' <<<"$out" ||
-  fail "unheld slot text + live ancestor pid triggered the nested path: $out"
+  fail "slot text + live ancestor pid triggered the nested path: $out"
 python3 - "$WRK_HEAVY_LOG" <<'PY'
 import json, sys
 rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
 runs = [r for r in rows if r.get("kind") == "run" and "forge-ran" in r.get("cmd", "")]
 assert runs, "forged-env run bypassed acquisition logging"
 PY
-# a real holder's pid forged by a non-ancestor must queue, not nest
-printf 'touch "%s"\nsleep 6\n' "$TMP/rh-held" >"$TMP/rh.sh"
+# the r2 held-slot attack: rewrite a genuinely flock-held slot's pid= text
+# to this process's pid while forging the env — must still queue.
+printf 'touch "%s"\nsleep 12\n' "$TMP/rh-held" >"$TMP/rh.sh"
 heavy_run "$CFGNOKEY" -- bash "$TMP/rh.sh" &
 prh=$!
 wait_until 10 test -f "$TMP/rh-held" || fail "real holder never started"
@@ -251,15 +252,71 @@ set -e
 [[ ! -e "$TMP/rh-forged" ]] || fail "forged run executed while the slot was held"
 ! grep -q 'already holding' <<<"$out" ||
   fail "non-ancestor holder pid triggered the nested path: $out"
-wait "$prh" || fail "real holder run failed"
-# positive control: a real nested run still bypasses (live ancestor holder)
+# rewrite the HELD slot's pid= text to this pid and forge the env — the r2
+# bypass: held-text + ancestor used to pass. fd proof makes both irrelevant.
+python3 - "$WRK_HEAVY_LOCK" <<PY
+import re, sys
+p = sys.argv[1]
+open(p, "w").write(re.sub(r"pid=\\d+", "pid=%d" % $$, open(p).read()))
+PY
 set +e
-out="$(heavy_run "$CFGNOKEY" -- bash -c '"$1" heavy -- touch "$2"' _ "$WRK" "$TMP/nested-ran" 2>&1)"
+out="$(WRK_HEAVY_HELD="$WRK_HEAVY_LOCK:$$" WRK_HEAVY_WAIT_CAP=2 \
+  heavy_run "$CFGNOKEY" -- touch "$TMP/hh-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 75 ]] || fail "held-slot pid rewrite bypassed the queue (rc=$rc): $out"
+[[ ! -e "$TMP/hh-ran" ]] || fail "held-slot pid rewrite ran over the limit"
+! grep -q 'already holding' <<<"$out" ||
+  fail "rewritten held-slot pid triggered the nested path: $out"
+# forge WRK_HEAVY_HELD_FD with a fresh-open fd on the real proof file — the
+# fd names the right inode but sits on a different OFD, so the relock must
+# fail and the run must queue.
+PROOF="$WRK_HEAVY_LOCK.heldproof-0"
+wait_until 10 test -f "$PROOF" || fail "holder never minted its proof file"
+exec 9<>"$PROOF"
+set +e
+out="$(WRK_HEAVY_HELD_FD="9:$PROOF" WRK_HEAVY_WAIT_CAP=2 \
+  heavy_run "$CFGNOKEY" -- touch "$TMP/fd-ran" 2>&1)"
+rc=$?
+set -e
+exec 9>&-
+[[ "$rc" -eq 75 ]] || fail "forged proof fd bypassed the queue (rc=$rc): $out"
+[[ ! -e "$TMP/fd-ran" ]] || fail "forged proof fd ran over the limit"
+! grep -q 'already holding' <<<"$out" ||
+  fail "fresh-open proof fd triggered the nested path: $out"
+wait "$prh" || fail "real holder run failed"
+# a self-locked proof file with no real slot holder must not claim nested —
+# the slot gate binds the proof to a live holder.
+python3 - "$PROOF" "$CFGNOKEY" "$WRK" <<'PY'
+import fcntl, os, subprocess, sys
+proof, cfg, wrk = sys.argv[1:]
+fd = os.open(proof, os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+r = subprocess.run(
+    [wrk, "heavy", "--", "touch", sys.argv[1] + ".selflock-ran"],
+    env=dict(os.environ, WRK_HEAVY_HELD_FD="%d:%s" % (fd, proof),
+             WRK_HOSTS_CONFIG=cfg),
+    pass_fds={fd}, capture_output=True, text=True)
+assert r.returncode == 0, r.stderr
+assert "already holding" not in r.stderr, r.stderr
+os.close(fd)
+PY
+[[ -e "$PROOF.selflock-ran" ]] || fail "self-locked proof run did not execute"
+rm -f "$PROOF" "$PROOF.selflock-ran"
+# hostile PATH: a fake `ps` earlier in PATH must not matter — detection is a
+# kernel fd check, and a real nested run still takes the nested path.
+mkdir -p "$TMP/fakebin"
+printf '#!/bin/sh\necho forged >&2\nexit 1\n' >"$TMP/fakebin/ps"
+printf '#!/bin/sh\nexit 1\n' >"$TMP/fakebin/lsof"
+chmod +x "$TMP/fakebin/ps" "$TMP/fakebin/lsof"
+set +e
+out="$(PATH="$TMP/fakebin:$PATH" heavy_run "$CFGNOKEY" -- \
+  env PATH="$TMP/fakebin:$PATH" "$WRK" heavy -- touch "$TMP/nested-ran" 2>&1)"
 rc=$?
 set -e
 [[ "$rc" -eq 0 && -e "$TMP/nested-ran" ]] || fail "real nested run failed: rc=$rc $out"
 grep -q 'already holding' <<<"$out" ||
-  fail "real nested run did not take the nested path: $out"
+  fail "real nested run did not take the nested path under hostile PATH: $out"
 echo "PASS heavy-held-forged-not-nested"
 
 # ── assertion-RED mutants over the wrk source ──────────────────────────────
@@ -290,8 +347,10 @@ for anchor in (
     '"wait_s": round(run_at - started_at, 3),',
     "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
     "                    fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
-    "and int(held_pid) in ancestors()",
-    "and int(held_pid) in held_slot_pids()",
+    "fcntl.flock(env_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+    "if not flock_held(slot_probe):",
+    "if not flock_held(env_path):",
+    "if (fst.st_dev, fst.st_ino) != (lst.st_dev, lst.st_ino):",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -383,43 +442,87 @@ set -e
 wait "$pn" || fail "mutant noflock holder failed"
 echo "PASS mutant-noflock"
 
-# mutant notheldprobe: nested detection trusts slot text again — an unheld
-# file's pid= plus a live ancestor pid passes. RED proof: the forged-env run
-# from the fixed test must take the nested path under the mutant.
-printf 'and int(held_pid) in held_slot_pids() => and True\n' >"$TMP/spec-notheldprobe"
-mutant notheldprobe "$TMP/spec-notheldprobe"
-printf 'pid=%d since=x job=- cmd=forged\n' $$ >"$WRK_HEAVY_LOCK"
+# mutant norelock: the relock proof is skipped — any fd on the held proof
+# file counts as inherited. RED proof: the fresh-open forged-fd attack from
+# the fixed test must take the nested path under the mutant.
+printf 'fcntl.flock(env_fd, fcntl.LOCK_EX | fcntl.LOCK_NB) => None\n' \
+  >"$TMP/spec-norelock"
+mutant norelock "$TMP/spec-norelock"
+printf 'touch "%s"\nsleep 5\n' "$TMP/nr-held" >"$TMP/nr.sh"
+WRK_HOSTS_CONFIG="$CFGNOKEY" "$TMP/norelock-wrk" heavy -- bash "$TMP/nr.sh" &
+pnr=$!
+wait_until 10 test -f "$TMP/nr-held" || fail "mutant norelock holder never started"
+wait_until 10 test -f "$WRK_HEAVY_LOCK.heldproof-0" ||
+  fail "mutant norelock holder never minted its proof"
+exec 9<>"$WRK_HEAVY_LOCK.heldproof-0"
 set +e
-out="$(WRK_HEAVY_HELD="$WRK_HEAVY_LOCK:$$" WRK_HOSTS_CONFIG="$CFGNOKEY" \
-  "$TMP/notheldprobe-wrk" heavy -- touch "$TMP/nh-ran" 2>&1)"
+out="$(WRK_HEAVY_HELD_FD="9:$WRK_HEAVY_LOCK.heldproof-0" WRK_HEAVY_WAIT_CAP=2 \
+  WRK_HOSTS_CONFIG="$CFGNOKEY" "$TMP/norelock-wrk" heavy -- touch "$TMP/nr-ran" 2>&1)"
 rc=$?
 set -e
-[[ "$rc" -eq 0 && -e "$TMP/nh-ran" ]] || fail "mutant notheldprobe run failed: $out"
+exec 9>&-
+[[ "$rc" -eq 0 && -e "$TMP/nr-ran" ]] ||
+  fail "mutant norelock forged fd did not bypass (rc=$rc): $out"
 grep -q 'already holding' <<<"$out" ||
-  fail "mutant notheldprobe still required a held slot — probe assertion is vacuous"
-echo "PASS mutant-notheldprobe"
+  fail "mutant norelock still relocked the fd — relock assertion is vacuous"
+wait "$pnr" || fail "mutant norelock holder failed"
+echo "PASS mutant-norelock"
 
-# mutant noancestry: a held slot's real pid forged by a non-ancestor nests
-# anyway. RED proof: under the mutant the forged run bypasses the queue
-# instead of hitting the wait cap.
-printf 'and int(held_pid) in ancestors() => and True\n' >"$TMP/spec-noancestry"
-mutant noancestry "$TMP/spec-noancestry"
-printf 'touch "%s"\nsleep 6\n' "$TMP/na-held" >"$TMP/na.sh"
-WRK_HOSTS_CONFIG="$CFGNOKEY" "$TMP/noancestry-wrk" heavy -- bash "$TMP/na.sh" &
-pna=$!
-wait_until 10 test -f "$TMP/na-held" || fail "mutant noancestry holder never started"
-rp="$(slot_holder_pid "$WRK_HEAVY_LOCK")"
-[[ "$rp" =~ ^[0-9]+$ ]] || fail "mutant noancestry holder pid not recorded"
-set +e
-out="$(WRK_HEAVY_HELD="$WRK_HEAVY_LOCK:$rp" WRK_HEAVY_WAIT_CAP=2 \
-  WRK_HOSTS_CONFIG="$CFGNOKEY" "$TMP/noancestry-wrk" heavy -- touch "$TMP/na-ran" 2>&1)"
-rc=$?
-set -e
-[[ "$rc" -eq 0 && -e "$TMP/na-ran" ]] ||
-  fail "mutant noancestry forged run did not bypass (rc=$rc): $out"
-grep -q 'already holding' <<<"$out" ||
-  fail "mutant noancestry still checked ancestry — ancestry assertion is vacuous"
-wait "$pna" || fail "mutant noancestry holder failed"
-echo "PASS mutant-noancestry"
+# mutant noslotgate: the proof is honored without a live slot holder — a
+# self-locked proof file forges nesting. RED proof: the self-lock run from
+# the fixed test takes the nested path under the mutant.
+printf 'if not flock_held(slot_probe): => if False:\n' >"$TMP/spec-noslotgate"
+mutant noslotgate "$TMP/spec-noslotgate"
+python3 - "$WRK_HEAVY_LOCK.heldproof-0" "$CFGNOKEY" "$TMP/noslotgate-wrk" \
+  "$TMP/ns-ran" <<'PY'
+import fcntl, os, subprocess, sys
+proof, cfg, wrk, marker = sys.argv[1:]
+fd = os.open(proof, os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)
+r = subprocess.run([wrk, "heavy", "--", "touch", marker],
+                   env=dict(os.environ,
+                            WRK_HEAVY_HELD_FD="%d:%s" % (fd, proof),
+                            WRK_HOSTS_CONFIG=cfg),
+                   pass_fds={fd}, capture_output=True, text=True)
+assert r.returncode == 0, r.stderr
+assert "already holding" in r.stderr, \
+    "mutant noslotgate still checked the slot — gate assertion is vacuous"
+os.close(fd)
+PY
+[[ -e "$TMP/ns-ran" ]] || fail "mutant noslotgate nested run did not execute"
+rm -f "$WRK_HEAVY_LOCK.heldproof-0"
+echo "PASS mutant-noslotgate"
+
+# mutant nodevino: the fd's inode is never matched to the proof path — any
+# file the caller holds satisfies the env path it names. RED proof: a fd on
+# a caller-owned file plus the real proof path must take the nested path.
+printf 'if (fst.st_dev, fst.st_ino) != (lst.st_dev, lst.st_ino): => if False:\n' \
+  >"$TMP/spec-nodevino"
+mutant nodevino "$TMP/spec-nodevino"
+printf 'touch "%s"\nsleep 5\n' "$TMP/nd-held" >"$TMP/nd.sh"
+WRK_HOSTS_CONFIG="$CFGNOKEY" "$TMP/nodevino-wrk" heavy -- bash "$TMP/nd.sh" &
+pnd=$!
+wait_until 10 test -f "$TMP/nd-held" || fail "mutant nodevino holder never started"
+wait_until 10 test -f "$WRK_HEAVY_LOCK.heldproof-0" ||
+  fail "mutant nodevino holder never minted its proof"
+python3 - "$TMP/ownproof" "$WRK_HEAVY_LOCK.heldproof-0" "$CFGNOKEY" \
+  "$TMP/nodevino-wrk" "$TMP/nd-ran" <<'PY'
+import fcntl, os, subprocess, sys
+own, proof, cfg, wrk, marker = sys.argv[1:]
+fd = os.open(own, os.O_RDWR | os.O_CREAT, 0o644)
+fcntl.flock(fd, fcntl.LOCK_EX)  # the caller's own lock — not the proof's
+r = subprocess.run([wrk, "heavy", "--", "touch", marker],
+                   env=dict(os.environ,
+                            WRK_HEAVY_HELD_FD="%d:%s" % (fd, proof),
+                            WRK_HOSTS_CONFIG=cfg, WRK_HEAVY_WAIT_CAP="2"),
+                   pass_fds={fd}, capture_output=True, text=True)
+assert r.returncode == 0 and "already holding" in r.stderr, \
+    "mutant nodevino still checked the inode — ino assertion is vacuous"
+os.close(fd)
+PY
+[[ -e "$TMP/nd-ran" ]] || fail "mutant nodevino nested run did not execute"
+kill "$(slot_holder_pid "$WRK_HEAVY_LOCK")" 2>/dev/null || true
+wait "$pnd" 2>/dev/null || true
+echo "PASS mutant-nodevino"
 
 echo 'PASS test-wrk-heavy-limit'
