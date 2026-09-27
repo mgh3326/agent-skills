@@ -2146,6 +2146,8 @@ case_stale_started() {
   kill -0 "$pid" 2>/dev/null || return 1
 }
 
+# shellcheck disable=SC2329 # invoked indirectly via wait_until
+mut_spn_up() { [[ "$(sentinel_count mut-spawnreuse)" -eq 1 ]]; }
 case_spawn_reused_pidfile() {
   reset_case mut-spawnreuse || return 3
   spawn_sleeper
@@ -2164,8 +2166,6 @@ case_spawn_reused_pidfile() {
   # The sentinel's argv reaches its final `wrk sentinel JOB` shape only after
   # the nohup/env exec chain settles; sample once under load and a real spawn
   # can read 0. Poll — a suppressing mutant stays 0 for the whole window.
-  # shellcheck disable=SC2329 # invoked indirectly via wait_until
-  mut_spn_up() { [[ "$(sentinel_count mut-spawnreuse)" -eq 1 ]]; }
   wait_until 10 mut_spn_up || return 1
   kill -0 "$victim" 2>/dev/null || return 1
 }
