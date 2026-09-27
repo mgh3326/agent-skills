@@ -55,6 +55,7 @@ jobs:
             tests/test-round-cap.sh \
             tests/test-wrk-heavy-limit.sh \
             tests/test-wrk-task-link.sh \
+            tests/test-wrk-job-end.sh \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' ! -name 'handoffkeep' -perm -111 -print)
       - name: Bash tests
         env:
@@ -86,3 +87,4 @@ jobs:
           bash tests/test-round-cap.sh
           bash tests/test-wrk-heavy-limit.sh
           bash tests/test-wrk-task-link.sh
+          bash tests/test-wrk-job-end.sh

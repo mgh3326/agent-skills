@@ -4928,10 +4928,14 @@ cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/sentinel-idle/report.md"
 # the first sighting only logs action=pending.
 wait_until 30 event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 1 ||
   fail "an idle pane plus a settled report is exactly one job.completed (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
+# #770: the sentinel exits right after job.completed — a later report update
+# can no longer mint a second completion, and the watcher must be gone.
+wait_until 30 bash -c "! kill -0 $sentinel_idle_pid 2>/dev/null" ||
+  fail "the completion sentinel must exit once job.completed lands"
 printf 'updated report line\n' >>"$SENTINEL_INBOX/sentinel-idle/report.md"
-wait_until 30 event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 2 ||
-  fail "an updated report at the same path is a new round, so a second job.completed follows (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
-kill "$sentinel_idle_pid" 2>/dev/null || true
+sleep 2
+event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 1 ||
+  fail "no sentinel remains after job.completed, so a report update writes no second record (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 wait "$sentinel_idle_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-portable-discovery-and-dedupe"
 
@@ -5168,14 +5172,15 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=30 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel idem-race lane-a wrk-a w1:p1 "$IDEM_RACE_REPORT" >/dev/null 2>&1 &
 idem_race_pid=$!
-wait_until 30 sentinel_log_has "$IDEM_INBOX/idem-race/completion-sentinel.log" 'action=completed' ||
-  fail "the sentinel must still judge the settled report as completed"
+# #770: the sentinel sees the work-terminal record on its first watch and
+# exits — it never mints a second completion for an already-done job.
+wait_until 30 sentinel_log_has "$IDEM_INBOX/idem-race/completion-sentinel.log" 'action=watch-exit' ||
+  fail "a sentinel started after job.completed must notice the terminal and leave"
 sleep 1
 event_count_is "$IDEM_INBOX/idem-race/events" job.completed 1 ||
-  fail "the sentinel's observation of an already-completed report must be suppressed (got $(event_count "$IDEM_INBOX/idem-race/events" job.completed))"
-grep -q 'suppressed-duplicate' "$IDEM_INBOX/idem-race/completion-suppressed.log" ||
-  fail "the suppressed sentinel write must leave a durable note"
-kill "$idem_race_pid" 2>/dev/null || true
+  fail "a sentinel observing an already-completed job must not write a second record (got $(event_count "$IDEM_INBOX/idem-race/events" job.completed))"
+wait_until 15 bash -c "! kill -0 $idem_race_pid 2>/dev/null" ||
+  fail "the sentinel must exit once it sees the job already ended"
 wait "$idem_race_pid" 2>/dev/null || true
 echo "PASS completion-sentinel-observation-after-done-is-suppressed"
 
