@@ -173,6 +173,19 @@ if [[ "${1:-}" == refresh ]]; then
       fi
       exec sleep "${WRK_REFRESH_DELAY:-2}"
       ;;
+    hang-tree)
+      # TERM-immune grandchild in this process's group: the supervisor's
+      # group-TERM takes down this fixture shell, but only the follow-up
+      # SIGKILL reaps the whole tree — the difference a timeout-path mutant
+      # that drops the SIGKILL leaves observable.
+      if [[ -n "${WRK_REFRESH_PID_LOG:-}" ]]; then
+        printf '%s\n' "$$" >>"$WRK_REFRESH_PID_LOG"
+      fi
+      ( trap '' TERM; exec sleep "${WRK_REFRESH_DELAY:-2}" ) &
+      gchild=$!
+      [[ -z "${WRK_REFRESH_PID_LOG:-}" ]] || printf '%s\n' "$gchild" >>"$WRK_REFRESH_PID_LOG"
+      wait "$gchild" 2>/dev/null || true
+      ;;
   esac
   if [[ -n "${WRK_REFRESH_LOG:-}" ]]; then
     printf 'refresh %s %s\n' "$pool" "$3" >>"$WRK_REFRESH_LOG"

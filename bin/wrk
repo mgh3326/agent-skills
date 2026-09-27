@@ -106,6 +106,7 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|find|name-sync|profiles|hosts|
   wrk round verdict JOB --file PATH
   wrk round status JOB
   wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
+  wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -395,6 +396,35 @@ LANDING_CHECK_MAX_DELAY_SECONDS=2
 # proven result skips the entire landing check.
 PANEWIRE_PROMPT_DEFAULT_TIMEOUT_SECONDS=30
 PANEWIRE_PROMPT_CODEX_TIMEOUT_SECONDS=60
+
+# run_bounded SECS CMD... — run CMD with a hard wall-clock bound, exiting 124
+# on timeout. GNU timeout/gtimeout already run the child in a new process
+# group and kill the group; the python fallback must do the same — plain
+# subprocess.run kills only the direct child, so an orphaned grandchild keeps
+# inherited pipes open and a caller's $( ) still blocks until it exits
+# (#770: JE15b on macOS CI blocked 60s under a 2s bound).
+run_bounded() {
+  local secs="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$secs" "$@"
+    return
+  fi
+  if command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$secs" "$@"
+    return
+  fi
+  python3 -c 'import os, signal, subprocess, sys
+proc = subprocess.Popen(sys.argv[2:], start_new_session=True)
+try:
+    sys.exit(proc.wait(timeout=float(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    proc.wait()
+    sys.exit(124)' "$secs" "$@"
+}
 
 configure_landing_check() {
   local profile_kind="$1"
@@ -720,19 +750,7 @@ spawn_panewire_prompt() {
   seconds="$SPAWN_PANEWIRE_TIMEOUT_SECONDS"
   # The daemon enforces --timeout itself; the outer guard only covers a wedged
   # socket, which would otherwise hang the spawn with the gates already held.
-  local guard=(timeout $((seconds + 15)))
-  if ! command -v timeout >/dev/null 2>&1; then
-    if command -v gtimeout >/dev/null 2>&1; then
-      guard=(gtimeout $((seconds + 15)))
-    else
-      guard=(python3 -c 'import subprocess, sys
-try:
-    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
-except subprocess.TimeoutExpired:
-    sys.exit(124)' $((seconds + 15)))
-    fi
-  fi
-  err="$("${guard[@]}" "$panewire" prompt --from "wrk-spawn:$JOB_ID" --to "$LABEL" \
+  err="$(run_bounded $((seconds + 15)) "$panewire" prompt --from "wrk-spawn:$JOB_ID" --to "$LABEL" \
     --file "$file" --timeout "${seconds}s" 2>&1 >/dev/null)" || rc=$?
   SPAWN_PANEWIRE_RC="$rc"
   SPAWN_PANEWIRE_ERR="$(printf '%s' "$err" | tr -s '[:space:]' ' ' | cut -c1-160)"
@@ -2170,9 +2188,20 @@ refresh_quota_pool() {
   # The CLI's --background contract is itself non-blocking. Start a tiny
   # supervisor detached from wrk; it owns both the refresh child and timeout
   # cleanup in one dedicated process group. Its stderr stays attached so a
-  # refresh failure/timeout is user-visible while spawn remains fail-open.
+  # refresh failure/timeout is user-visible while spawn remains fail-open
+  # (the attachment is bounded — callers capturing output wait at most
+  # WRK_REFRESH_TIMEOUT_S for the supervisor). #770 gives it a bounded,
+  # traceable lifetime: pid/pool/deadline/start in JOB/quota-refresh.pid,
+  # the pidfile removed on the way out, and `wrk prune` can recognise a
+  # leftover (verified by start time before signalling, so a reused pid is
+  # never killed).
+  local refresh_pidfile=""
+  if [[ -n "${JOB_ID:-}" ]]; then
+    refresh_pidfile="$(wrk_jobs_root)/$JOB_ID/quota-refresh.pid"
+    mkdir -p "$(dirname "$refresh_pidfile")" 2>/dev/null || refresh_pidfile=""
+  fi
   (
-    python3 - "$SCOPEFUEL" "$pool" "${WRK_REFRESH_TIMEOUT_S:-5}" <<'PY'
+    python3 - "$SCOPEFUEL" "$pool" "${WRK_REFRESH_TIMEOUT_S:-5}" "$refresh_pidfile" "${JOB_ID:-}" <<'PY'
 import os
 import signal
 import subprocess
@@ -2183,11 +2212,29 @@ import time
 if os.fork():
     os._exit(0)
 os.setsid()
-scopefuel, pool, timeout_arg = sys.argv[1:]
+scopefuel, pool, timeout_arg, pidfile, job = sys.argv[1:]
 try:
     timeout = max(0.01, float(timeout_arg))
 except ValueError:
     timeout = 5.0
+
+if pidfile:
+    try:
+        with open(pidfile, "w", encoding="utf-8") as handle:
+            handle.write("pid=%d pool=%s job=%s timeout=%s deadline=%d started=%d\n" % (
+                os.getpid(), pool, job, timeout_arg,
+                int(time.time() + timeout), int(time.time())))
+    except OSError:
+        pidfile = ""
+
+
+def drop_pidfile():
+    if pidfile:
+        try:
+            os.unlink(pidfile)
+        except OSError:
+            pass
+
 
 proc = subprocess.Popen(
     [scopefuel, "refresh", pool, "--background"],
@@ -2195,7 +2242,27 @@ proc = subprocess.Popen(
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
     close_fds=True,
+    # The refresh child gets its own process group so the timeout path can
+    # kill the whole tree without the supervisor SIGKILLing itself mid-
+    # cleanup (a group kill of its own pgid never reaches drop_pidfile).
+    start_new_session=True,
 )
+
+
+def _term(_sig, _frame):
+    # wrk prune --apply signals the supervisor's group; cascade to the
+    # refresh child's group before going down so no refresh outlives us.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    drop_pidfile()
+    os._exit(143)
+
+
+signal.signal(signal.SIGTERM, _term)
+signal.signal(signal.SIGINT, _term)
+
 try:
     refresh_rc = proc.wait(timeout=timeout)
 except subprocess.TimeoutExpired:
@@ -2204,13 +2271,20 @@ except subprocess.TimeoutExpired:
         file=sys.stderr,
         flush=True,
     )
-    pgid = os.getpgrp()
-    signal.signal(signal.SIGTERM, signal.SIG_IGN)
-    os.killpg(pgid, signal.SIGTERM)
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except OSError:
+        pass
     time.sleep(0.2)
-    os.killpg(pgid, signal.SIGKILL)
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    proc.wait()
+    drop_pidfile()
     os._exit(124)
 
+drop_pidfile()
 if refresh_rc != 0:
     print(
         f"wrk: warning: scopefuel refresh failed for pool={pool}; spawn already succeeded",
@@ -3056,7 +3130,6 @@ append_document_suffix() {
 # (three-second) delay is the trade-off for that consistency.
 upload_report_document() {
   local job="$1" report="$2" handoffkeep key base rc=0
-  local guard=(timeout 3)
   REPORT_DOCUMENT_SUFFIX=""
   handoffkeep="$(command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true)"
   if [[ -z "$handoffkeep" ]]; then
@@ -3065,18 +3138,7 @@ upload_report_document() {
   fi
   base="$(basename "$report")"
   key="reports/$job/$base"
-  if ! command -v timeout >/dev/null 2>&1; then
-    if command -v gtimeout >/dev/null 2>&1; then
-      guard=(gtimeout 3)
-    else
-      guard=(python3 -c 'import subprocess, sys
-try:
-    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
-except subprocess.TimeoutExpired:
-    sys.exit(124)' 3)
-    fi
-  fi
-  local command=("${guard[@]}" "$handoffkeep" doc put --key "$key" --kind report --job "$job" --file "$report")
+  local command=(run_bounded 3 "$handoffkeep" doc put --key "$key" --kind report --job "$job" --file "$report")
   # Keep handoffkeep output out of wrk's one-line stdout contract; failures
   # below intentionally become one warning and never affect the exit status.
   "${command[@]}" >/dev/null 2>&1 || rc=$?
@@ -3102,6 +3164,15 @@ emit_relay_event() {
   local kind="$1" job="$2" owner="$3" label="$4" pane="$5" host="$6" report="$7"
   local last="$8" reason="$9" question="${10}" pr="${11}" head="${12}"
   local panewire rc=0
+  # #770 round-2: a panewire subprocess that was just killed by its timeout is
+  # wedged — re-entering it for emit would stall this call by another full
+  # emit guard (tester: sleeping stub made `wrk done` take delegate-timeout +
+  # 5s). The record already landed on disk; the daemon rescan picks it up.
+  if [[ "${PANEWIRE_WEDGED:-}" == 1 ]]; then
+    warn "panewire emit skipped: panewire timed out earlier this invocation (job=$job kind=$kind)"
+    record_emit_failure "$job" "$kind" "delegate_timeout"
+    return 0
+  fi
   panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
   if [[ -z "$panewire" ]]; then
     warn "panewire not found; relay event left as file only (job=$job kind=$kind)"
@@ -3112,25 +3183,13 @@ emit_relay_event() {
   # loop, so a hang there stops the fleet. `timeout` is GNU coreutils and a
   # stock macOS has neither it nor gtimeout, so python3 — already a hard
   # dependency above — carries the same guard there.
-  local guard=(timeout 5)
-  if ! command -v timeout >/dev/null 2>&1; then
-    if command -v gtimeout >/dev/null 2>&1; then
-      guard=(gtimeout 5)
-    else
-      guard=(python3 -c 'import subprocess, sys
-try:
-    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
-except subprocess.TimeoutExpired:
-    sys.exit(124)' 5)
-    fi
-  fi
   # panewire wants the root containing jobs/<job>/events — the parent of
   # wrk_jobs_root(), since ARBITER_INBOX_ROOT names the jobs directory itself.
   # Without it emit falls back to the daemon's default root and the relay
   # misses the record file wrk just wrote.
   local inbox_root
   inbox_root="$(dirname "$(wrk_jobs_root)")"
-  local command=("${guard[@]}" "$panewire" emit --kind "$kind" --job "$job" --report "$report"
+  local command=(run_bounded 5 "$panewire" emit --kind "$kind" --job "$job" --report "$report"
     --owner-lane "$owner" --epoch 1 --label "$label" --host "$host" --pane "$pane"
     --report-last-line "$last" --inbox-root "$inbox_root")
   # Empty optionals are omitted rather than passed as empty strings.
@@ -3236,8 +3295,10 @@ PY
 # print exactly the token below. A missing binary, an older panewire (rc 2, no
 # output), any other output, or a probe that hangs keeps wrk's own path — the
 # probe has no side effects, so falling back after it can never duplicate an
-# event. Once handed over, wrk execs and runs nothing further of its own, so
-# the event is written by exactly one of the two paths. WRK_JOB_DELEGATE=0
+# event. The delegated call runs as a bounded subprocess — never exec — so
+# wrk-side end housekeeping can still run after the record lands, and a
+# failed or hung delegation falls back to wrk's own write path instead of
+# losing the terminal record (#770 tester BLOCKER 1). WRK_JOB_DELEGATE=0
 # forces wrk's own path (golden regeneration, rollback).
 JOB_PROBE_TOKEN="panewire-job/1"
 delegate_job_cmd() {
@@ -3246,23 +3307,46 @@ delegate_job_cmd() {
   [[ "${WRK_JOB_DELEGATE:-1}" != 0 ]] || return 0
   panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
   [[ -n "$panewire" ]] || return 0
-  local guard=(timeout 5)
-  if ! command -v timeout >/dev/null 2>&1; then
-    if command -v gtimeout >/dev/null 2>&1; then
-      guard=(gtimeout 5)
-    else
-      guard=(python3 -c 'import subprocess, sys
-try:
-    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
-except subprocess.TimeoutExpired:
-    sys.exit(124)' 5)
-    fi
+  local run_timeout="${WRK_JOB_DELEGATE_TIMEOUT_S:-30}"
+  local prc=0
+  probe="$(run_bounded 5 "$panewire" job probe 2>/dev/null </dev/null)" || prc=$?
+  if [[ "$prc" -ne 0 ]]; then
+    # A probe killed by its own guard means the daemon is wedged, not absent —
+    # emit_relay_event must not re-enter it inside this same invocation.
+    if [[ "$prc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    return 0
   fi
-  probe="$("${guard[@]}" "$panewire" job probe 2>/dev/null </dev/null)" || return 0
   [[ "$probe" == "$JOB_PROBE_TOKEN" ]] || return 0
   # HOSTNAME is a shell variable bash does not necessarily export; the records
   # carry wrk's value, so hand it over explicitly.
-  HOSTNAME="${HOSTNAME:-unknown}" exec "$panewire" job "$sub" "$@"
+  local rc=0
+  HOSTNAME="${HOSTNAME:-unknown}" run_bounded "$run_timeout" "$panewire" job "$sub" "$@" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    # #770 tester BLOCKER 1: the probe proved the binary understands the job
+    # verbs — it did not prove the delegated call will succeed or even return.
+    # A nonzero exit or a hang past the timeout must not take the terminal
+    # record down with it: warn and return to the caller so wrk's own path
+    # writes the same record. If the delegated write did land before dying,
+    # the local path's completion dedup suppresses the second write. On a
+    # timeout the daemon is wedged — mark it so emit_relay_event does not
+    # stall this invocation on another doomed panewire call.
+    if [[ "$rc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    warn "panewire job $sub delegation failed or timed out (rc=$rc); using wrk's own path"
+    return 0
+  fi
+  # #770: a delegated terminal path still needs wrk-side housekeeping — the
+  # delegated binary wrote the record, but only wrk on this host can stop the
+  # completion sentinel and release the arbiter quota_pool record. Same as
+  # the local path: run it after the record lands, never mask the result.
+  if [[ "$sub" == "done" || "$sub" == "joined" ]]; then
+    local d_job="${1:-}" d_meta="" d_owner=""
+    if [[ -n "$d_job" && "$d_job" != -* ]]; then
+      d_meta="$(completion_metadata "$d_job" 2>/dev/null || true)"
+      d_owner="${d_meta%%$'\t'*}"
+      job_end_housekeeping "$d_job" "$d_owner" "$sub" "panewire job $sub" "wrk $sub (delegated)"
+    fi
+  fi
+  exit "$rc"
 }
 
 done_cmd() {
@@ -3293,12 +3377,19 @@ done_cmd() {
   if [[ "$completion_status" == duplicate ]]; then
     note_duplicate_completion "$job" "$report"
     warn "job.completed already recorded for this report; suppressed duplicate (job=$job)"
+    # #770: duplicate or not, done means the job is over — stop the sentinel
+    # and settle the hub/arbiter records before returning.
+    job_end_housekeeping "$job" "$owner" completed "wrk done (duplicate report)" "wrk done"
     echo "OK job=$job report=$report"
     return 0
   fi
   set_report_last_line "$report"
   emit_relay_event job.completed "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "" "" "" ""
+  # #770: end the hub job, release quota, and stop + wait on the completion
+  # sentinel. Runs after the relay emit so the completed record is the first
+  # thing panewire sees.
+  job_end_housekeeping "$job" "$owner" completed "wrk done" "wrk done"
   echo "OK job=$job report=$report"
 }
 
@@ -3399,10 +3490,26 @@ joined_cmd() {
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
   upload_report_document "$job" "$report"
+  # #770 tester BLOCKER 1: when the delegated `panewire job joined` landed the
+  # record and then failed, the fallback arrives with job.joined already the
+  # newest work-terminal — appending again would duplicate it. Same shape as
+  # done's duplicate branch: warn, skip the write+emit, still settle the job.
+  local joined_term
+  joined_term="$(job_events_scan "$(wrk_jobs_root)/$job/events" 2>/dev/null | awk -F'\t' '{print $4}')"
+  if [[ "$joined_term" == "job.joined" ]]; then
+    warn "job.joined already recorded for $job; suppressed duplicate"
+    job_end_housekeeping "$job" "$owner" joined "wrk joined (duplicate)" "wrk joined"
+    echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
+    return 0
+  fi
   builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head"
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "" "$pr" "$head"
+  # #770: job.joined is a work-terminal but not a hub-terminal — the hub keeps
+  # counting the job until the end declaration lands, and the completion
+  # sentinel must not outlive the join.
+  job_end_housekeeping "$job" "$owner" joined "wrk joined" "wrk joined"
   echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
 }
 
@@ -4013,6 +4120,412 @@ sentinel_log() {
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$token" "$transient" "$action" >>"$logfile" 2>/dev/null || true
 }
 
+# ── #770: job-end housekeeping ────────────────────────────────────────────
+# A job that ended must not leave three things behind: an "active" hub/arbiter
+# record, a live completion sentinel, or the sentinel's interval sleep child.
+# The helpers below are shared by every end path (wrk done / joined, the
+# sentinel's own completed/lost judgements, wrk reap, wrk prune).
+#
+# Terminal vocabulary here is deliberately narrower than "work is over":
+#   WORK_TERMINAL = what ends this job's lifecycle (completed, completion,
+#                   joined, revoked, reaped — job.lost is NOT one: the record
+#                   is an observation gap, and a lost job may still complete)
+#   HUB_TERMINAL  = what the hub and the node active-scan actually end on
+#                   (completed, completion, revoked — joined relays but keeps
+#                   the job counted, lost is explicitly not terminal)
+#   REVIVE        = a record that proves the job was picked up again
+#                   (claim/claimed/reclaim/spawned/reprompted after a terminal
+#                   un-ends it — the newest record wins, as in wrk reap)
+
+# job_events_scan EVENTS_DIR... — one TSV row per job:
+#   job \t ended \t hub_ended \t terminal_kind \t last_event_age_s \t last_kind
+#       \t completed_n \t owner \t label \t pane \t tab
+# ended         a work-terminal record exists after the newest revive
+# hub_ended     a hub-terminal record exists after the newest revive
+# terminal_kind the newest work-terminal kind ("-" when not ended)
+# completed_n   completed/completion records written after the newest revive
+# pane/tab      the newest job.spawned receipt's values — same source of truth
+#               as wrk reap; "-" when the job never spawned
+job_events_scan() {
+  python3 - "$@" <<'PY'
+import datetime, json, os, sys, time
+
+WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped"}
+HUB_TERMINAL = {"job.completed", "job.completion", "job.revoked"}
+REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.reprompted"}
+now = time.time()
+
+
+def moment(value, fallback):
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.astimezone()
+            return parsed.timestamp()
+        except ValueError:
+            pass
+    return fallback
+
+
+def field(doc, payload, key):
+    for source in (doc, payload):
+        value = source.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+for events in sys.argv[1:]:
+    job = os.path.basename(os.path.dirname(os.path.normpath(events)))
+    owner = label = pane = tab = ""
+    kinds = []
+    last_t = 0.0
+    last_kind = ""
+    try:
+        names = sorted(os.listdir(events))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        path = os.path.join(events, name)
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            mtime = now
+        try:
+            with open(path, encoding="utf-8") as handle:
+                doc = json.load(handle)
+        except (OSError, ValueError):
+            doc = None
+        if not isinstance(doc, dict):
+            # An unreadable event file is still activity evidence for aging,
+            # but contributes nothing else.
+            last_t = max(last_t, mtime)
+            continue
+        payload = doc.get("payload")
+        if not isinstance(payload, dict):
+            payload = {}
+        kind = doc.get("kind") or doc.get("type") or doc.get("event") or ""
+        when = moment(doc.get("created_at") or payload.get("at"), mtime)
+        if when >= last_t:
+            last_t, last_kind = when, kind or last_kind
+        kinds.append(kind)
+        if kind in ("job.claim", "job.claimed", "job.reclaim"):
+            owner = field(doc, payload, "owner_lane") or owner
+            label = field(doc, payload, "label") or field(doc, payload, "agent_label") or label
+        if kind == "job.spawned":
+            pane = field(doc, payload, "pane_id")
+            tab = field(doc, payload, "tab_id")
+    last_revive = -1
+    for index, kind in enumerate(kinds):
+        if kind in REVIVE:
+            last_revive = index
+    term_kind = ""
+    hub_ended = 0
+    completed_n = 0
+    for index, kind in enumerate(kinds):
+        if index <= last_revive:
+            continue
+        if kind in WORK_TERMINAL:
+            term_kind = kind
+        if kind in HUB_TERMINAL:
+            hub_ended = 1
+        if kind in ("job.completed", "job.completion"):
+            completed_n += 1
+    ended = 1 if term_kind else 0
+    age = int(now - last_t) if last_t else -1
+    print(job, ended, hub_ended, term_kind or "-", age, last_kind or "-",
+          completed_n, owner or "-", label or "-", pane or "-", tab or "-", sep="\t")
+PY
+}
+
+# job_end_record JOB OWNER OUTCOME REASON SOURCE — append the flat job.revoked
+# end declaration. The hub ends a job only on job.completed/job.revoked, so a
+# job whose newest terminal is joined or lost still counts "active" until this
+# marker lands. Skips when a hub-terminal record already follows the newest
+# revive (already-ended) or when a revive is newest (the job is live again —
+# ending it would be wrong). Prints created|already-ended|active.
+job_end_record() {
+  local job="$1" owner="$2" outcome="$3" reason="$4" source="$5" events
+  events="$(wrk_jobs_root)/$job/events"
+  mkdir -p "$events" || return 1
+  python3 - "$events" "$job" "$owner" "$outcome" "$reason" "$source" "${HOSTNAME:-unknown}" <<'PY'
+import datetime, fcntl, json, os, sys, tempfile
+
+events, job, owner, outcome, reason, source, host = sys.argv[1:]
+WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped"}
+HUB_TERMINAL = {"job.completed", "job.completion", "job.revoked"}
+REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.reprompted"}
+
+# The events lock is shared with completion_event so the "is it already
+# ended" check and the append are one atomic step — `wrk done`, the sentinel
+# and prune race on this directory.
+lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
+with open(lock_path, "w", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    highest = 0
+    kinds = []
+    try:
+        names = sorted(os.listdir(events))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            highest = max(highest, int(name.split("-", 1)[0]))
+        except (ValueError, IndexError):
+            pass
+        try:
+            with open(os.path.join(events, name), encoding="utf-8") as handle:
+                doc = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        kinds.append(doc.get("kind") or doc.get("type") or doc.get("event") or "")
+    last_revive = -1
+    last_term = -1
+    last_hub = -1
+    for index, kind in enumerate(kinds):
+        if kind in REVIVE:
+            last_revive = index
+        if kind in WORK_TERMINAL:
+            last_term = index
+        if kind in HUB_TERMINAL:
+            last_hub = index
+    if last_hub > -1 and last_hub > last_revive:
+        print("already-ended")
+        raise SystemExit(0)
+    if last_term > -1 and last_revive > last_term:
+        # Terminal first, then a claim/spawned again — the job was picked up
+        # after it ended and is live work; never end it from housekeeping.
+        print("active")
+        raise SystemExit(0)
+    record = {"kind": "job.revoked", "job_id": job, "epoch": 1,
+              "owner_lane": owner, "outcome": outcome, "reason": reason,
+              "source": source, "host": host,
+              "created_at": datetime.datetime.now(datetime.timezone.utc)
+              .isoformat(timespec="seconds").replace("+00:00", "Z")}
+    fd, temporary = tempfile.mkstemp(prefix=".ended-", dir=events)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, separators=(",", ":"))
+            handle.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, os.path.join(events, "%05d-job.revoked.json" % (highest + 1)))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print("created")
+PY
+}
+
+# release_job_quota_pool JOB — release every quota_pool record this job still
+# holds so the arbiter-side job record flips to released. Best-effort: an
+# unavailable arbiter, an empty status, or a missing record only costs a
+# retained row, never a failed end path.
+release_job_quota_pool() {
+  local job="$1" arb out pool
+  arb="${ARBITER:-}"
+  [[ -n "$arb" ]] || arb="$(command -v arbiter 2>/dev/null || true)"
+  [[ -n "$arb" && -x "$arb" ]] || return 0
+  out="$("$arb" status --job "$job" --json 2>/dev/null)" || return 0
+  while IFS= read -r pool; do
+    [[ -n "$pool" ]] || continue
+    "$arb" release --job "$job" --resource "$pool" --kind quota_pool >/dev/null 2>&1 || true
+  done < <(python3 -c 'import json, sys
+try:
+    doc = json.loads(sys.argv[1])
+except ValueError:
+    raise SystemExit(0)
+for row in doc.get("quota_pool_records") or []:
+    pool = row.get("pool")
+    if isinstance(pool, str) and pool:
+        print(pool)' "$out" 2>/dev/null || true)
+  return 0
+}
+
+# PID-reuse guard, part 1: the recorded pid is only ever this job's sentinel
+# when its argv is literally `…/wrk sentinel JOB OWNER LABEL PANE [REPORT …]`.
+# The token before `sentinel` must be the wrk program itself — argv[0], or
+# argv[1] behind the interpreter the kernel inserts for the shebang — and the
+# full owner/label/pane tail must be present. `wrk sentinel JOB` appearing as
+# mere arguments inside an unrelated command line (a python fixture carrying
+# a fake triple, an editor buffer, a log line) never matches.
+sentinel_pid_matches() {
+  local pid="$1" job="$2"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  ps -p "$pid" -o args= 2>/dev/null | awk -v job="$job" '
+    function is_shell(tok) { sub(/^.*\//, "", tok); return tok ~ /^(sh|bash|zsh|dash|ksh)$/ }
+    {
+      for (i = 1; i <= NF; i++)
+        if ($i ~ /(^|\/)wrk$/ && $(i + 1) == "sentinel" && $(i + 2) == job &&
+            NF >= i + 5 && (i == 1 || (i == 2 && is_shell($1)))) { found = 1; break }
+    }
+    END { exit(found ? 0 : 1) }'
+}
+
+# sentinel_pidfile_fields FILE — print "pid<TAB>started" parsed from a
+# completion-sentinel pidfile. Current files are two lines ("PID" then
+# "started=EPOCH"); bare numeric legacy pidfiles and flat "pid=N started=E"
+# forms parse identically. Missing or unparseable fields print empty — an
+# empty field never proves identity.
+sentinel_pidfile_fields() {
+  local file="$1" line="" extra="" tok pid="" started=""
+  if [[ -s "$file" ]]; then
+    { IFS= read -r line; IFS= read -r extra || extra=""; } <"$file" 2>/dev/null || true
+    for tok in $line $extra; do
+      case "$tok" in
+        pid=*) pid="${tok#pid=}" ;;
+        started=*) started="${tok#started=}" ;;
+        *)
+          if [[ -z "$pid" && "$tok" =~ ^[0-9]+$ ]]; then pid="$tok"; fi ;;
+      esac
+    done
+  fi
+  printf '%s\t%s\n' "$pid" "$started"
+}
+
+# PID-reuse guard, part 2: when a pidfile recorded the sentinel's spawn time,
+# the live process's real elapsed age must agree with it (±120s skew window —
+# the file is written a moment after fork). No recorded start, no verdict;
+# a malformed recorded start is never positive identity.
+sentinel_start_matches() {
+  local pid="$1" started="${2:-}"
+  [[ -n "$started" ]] || return 0
+  [[ "$started" =~ ^[0-9]+$ ]] || return 1
+  local el skew
+  el="$(proc_elapsed_s "$pid" 2>/dev/null)" || return 1
+  skew=$(( $(date +%s) - started - el ))
+  (( skew >= -120 && skew <= 120 ))
+}
+
+# kill -0 alone reports zombies as alive; the sentinel is reparented to launchd
+# so its post-TERM zombie window is short but real.
+sentinel_pid_alive() {
+  local pid="$1" state
+  kill -0 "$pid" 2>/dev/null || return 1
+  state="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
+  state="${state//[[:space:]]/}"
+  [[ "$state" == Z* ]] && return 1
+  return 0
+}
+
+# sentinel_sweep — one TSV row per live `wrk sentinel …` process on the host:
+#   pid \t job \t owner \t label \t pane \t report
+# The process sweep is the only way to find a sentinel that has no pidfile
+# (respawned or second instance) — prune uses it to list, end paths use it
+# so no copy survives the job (tester BLOCKER 2).
+sentinel_sweep() {
+  ps axo pid=,args= 2>/dev/null | awk '
+    function is_shell(tok) { sub(/^.*\//, "", tok); return tok ~ /^(sh|bash|zsh|dash|ksh)$/ }
+    {
+      pid = $1
+      for (i = 2; i <= NF; i++)
+        if ($i ~ /(^|\/)wrk$/ && $(i + 1) == "sentinel" && $(i + 2) != "" &&
+            NF >= i + 5 && (i == 2 || (i == 3 && is_shell($2)))) {
+          print pid "\t" $(i+2) "\t" $(i+3) "\t" $(i+4) "\t" $(i+5) "\t" $(i+6)
+          break
+        }
+    }' | sort -k2,2 -k1,1n
+}
+
+# stop_completion_sentinel JOB [PID] — stop and wait on the job's completion
+# sentinel and its interval sleep child. With an explicit PID only that
+# (argv-verified) process is signalled — prune uses it for one orphan row.
+# Without one, the pidfile pid AND every live `wrk sentinel JOB` the process
+# sweep finds are stopped: a respawned or second sentinel has no pidfile and
+# would otherwise outlive the end path (tester BLOCKER 2). The pidfile is
+# removed regardless of outcome so a dead handle never looks live.
+stop_completion_sentinel() {
+  local job="$1" explicit_pid="${2:-}" jobdir pidfile pid child deadline
+  jobdir="$(wrk_jobs_root)/$job"
+  pidfile="$jobdir/completion-sentinel.pid"
+  local -a pids=()
+  local pidfile_pid="" pidfile_started=""
+  if [[ -n "$explicit_pid" ]]; then
+    pids=("$explicit_pid")
+  else
+    if [[ -s "$pidfile" ]]; then
+      IFS=$'\t' read -r pidfile_pid pidfile_started <<<"$(sentinel_pidfile_fields "$pidfile")"
+      [[ "$pidfile_pid" =~ ^[0-9]+$ ]] && pids+=("$pidfile_pid")
+    fi
+    local _p _j _seen _dup
+    while IFS=$'\t' read -r _p _j _rest; do
+      [[ "$_j" == "$job" ]] || continue
+      _dup=0
+      for _seen in ${pids[@]+"${pids[@]}"}; do
+        [[ "$_seen" == "$_p" ]] && { _dup=1; break; }
+      done
+      (( _dup )) || pids+=("$_p")
+    done < <(sentinel_sweep)
+  fi
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    local _st=""
+    if [[ "$pid" == "$pidfile_pid" ]]; then _st="$pidfile_started"; fi
+    if [[ "$pid" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$pid" "$job" && sentinel_start_matches "$pid" "$_st"; then
+      # Freeze first so a sentinel waking mid-stop cannot fork a new sleep
+      # between the child enumeration and the signal batch (the test suites'
+      # cleanup uses this same STOP → kill children → TERM → CONT order).
+      kill -STOP "$pid" 2>/dev/null || true
+      while IFS= read -r child; do
+        kill "$child" 2>/dev/null || true
+      done < <(pgrep -P "$pid" 2>/dev/null || true)
+      kill "$pid" 2>/dev/null || true
+      kill -CONT "$pid" 2>/dev/null || true
+      deadline=$(( $(date +%s) + ${WRK_SENTINEL_STOP_WAIT_S:-5} ))
+      while sentinel_pid_alive "$pid"; do
+        if (( $(date +%s) >= deadline )); then
+          kill -9 "$pid" 2>/dev/null || true
+          deadline=$(( $(date +%s) + 2 ))
+          while sentinel_pid_alive "$pid" && (( $(date +%s) < deadline )); do
+            sleep 0.1
+          done
+          break
+        fi
+        sleep 0.1
+      done
+    fi
+  done
+  rm -f "$pidfile" 2>/dev/null || true
+  return 0
+}
+
+# job_end_housekeeping JOB OWNER OUTCOME REASON SOURCE — one call at every end
+# path: declare the job ended to the hub when its terminal record is not
+# hub-terminal on its own, release the quota_pool record, and stop + wait on
+# the completion sentinel. Every step is best-effort; a housekeeping failure
+# must never mask the record the caller just wrote.
+job_end_housekeeping() {
+  local job="$1" owner="$2" outcome="$3" reason="$4" source="$5"
+  job_end_record "$job" "$owner" "$outcome" "$reason" "$source" >/dev/null ||
+    warn "job end declaration write failed for $job; the records stay file-only"
+  release_job_quota_pool "$job"
+  stop_completion_sentinel "$job"
+  return 0
+}
+
+# sentinel_job_ended JOBDIR — the job's event stream already carries a
+# work-terminal record newer than every revive: some other end path (done,
+# joined, reap, prune — or a second sentinel) finished the job while this
+# sentinel was asleep, so the sentinel itself is now an orphan.
+sentinel_job_ended() {
+  job_events_scan "$1/events" | awk -F'\t' '$2 == 1 { found = 1 } END { exit(found ? 0 : 1) }'
+}
+
+# sentinel_self_exit JOB [RC] — remove our own pidfile only when it still
+# names us (a respawned sentinel may already have overwritten it), then exit.
+sentinel_self_exit() {
+  local job="$1" code="${2:-0}" pidfile pf
+  pidfile="$(wrk_jobs_root)/$job/completion-sentinel.pid"
+  read -r pf <"$pidfile" 2>/dev/null || pf=""
+  [[ "$pf" == "$$" ]] && rm -f "$pidfile"
+  exit "$code"
+}
+
 sentinel_cmd() {
   local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}"
   local timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
@@ -4073,6 +4586,14 @@ sentinel_cmd() {
       action="lost:timeout"
     fi
     sentinel_log "$logfile" "$token" "$transient" "$action"
+    # #770: the job may have ended by another path while the sentinel slept —
+    # done/joined/reap/prune all leave a work-terminal record. A terminal is
+    # only honoured when it is newer than every revive, so a job claimed back
+    # keeps its watcher.
+    if sentinel_job_ended "$jobdir"; then
+      sentinel_log "$logfile" "$token" "$transient" "watch-exit"
+      sentinel_self_exit "$job" 0
+    fi
     case "$action" in
       completed)
         local completion_status
@@ -4083,9 +4604,10 @@ sentinel_cmd() {
           warn "job.completed already recorded for this report; suppressed duplicate (job=$job)"
         fi
         [[ -z "$resource" || ! -x "$ARBITER" ]] || "$ARBITER" release --job "$job" --resource "$resource" --kind quota_pool >/dev/null 2>&1 || true
-        # lost 뒤의 completed 는 유효하다(panewire 가 completed 를 relay 한다).
-        # 유예 감시의 목적을 달성했으므로 여기서 끝낸다.
-        if [[ "$lost" -eq 1 ]]; then exit 0; fi
+        # #770: completed — including post-loss completion — ends the job, so
+        # the sentinel leaves with it instead of becoming the leftover process
+        # this task exists to remove.
+        sentinel_self_exit "$job" 0
         ;;
       lost:*)
         completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}" >/dev/null
@@ -4094,7 +4616,12 @@ sentinel_cmd() {
         ;;
     esac
     if [[ "$lost" -eq 1 ]] && (( now - lost_at >= lost_grace )); then
-      exit 0
+      # #770: the grace expired without a completion. job.lost is not a hub
+      # terminal, so declare the end (newest-revive wins, so a respawned job
+      # is left alone) before the sentinel leaves.
+      job_end_record "$job" "$owner" abandoned "sentinel lost grace expired" "wrk sentinel" >/dev/null || true
+      release_job_quota_pool "$job"
+      sentinel_self_exit "$job" 0
     fi
     sleep "$interval"
   done
@@ -4118,20 +4645,30 @@ build_sentinel_env() {
 
 start_completion_sentinel() {
   local pidfile="$1"; shift
+  local job="${1:-}"
   mkdir -p "$(dirname "$pidfile")"
-  local existing=""
+  local existing="" existing_started=""
   if [[ -s "$pidfile" ]]; then
-    read -r existing <"$pidfile" || existing=""
-    if [[ "$existing" =~ ^[0-9]+$ ]] && kill -0 "$existing" 2>/dev/null; then
+    IFS=$'\t' read -r existing existing_started <<<"$(sentinel_pidfile_fields "$pidfile")"
+    # kill -0 alone proves nothing: a reused pid belongs to whatever unrelated
+    # process took it, and letting that answer suppress this call would leave
+    # the job without a sentinel (director-1 measured reused pids on this box
+    # belonging to system daemons and to the director's own process). Only an
+    # argv-verified sentinel for this job — start time agreeing when the file
+    # recorded one — suppresses a new start.
+    if [[ "$existing" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$existing" "$job" && sentinel_start_matches "$existing" "$existing_started"; then
       return 0
     fi
   fi
   rm -f "$pidfile"
   build_sentinel_env
+  # The pidfile's second line records the spawn instant so a later reader can
+  # prove the pid still belongs to the process it launched — a bare pid is
+  # silently recyclable by the kernel.
   if [[ "${#SENTINEL_ENV[@]}" -gt 0 ]]; then
-    ( nohup env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
+    ( nohup env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   else
-    ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
+    ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   fi
 }
 
@@ -5152,17 +5689,7 @@ hk_bin() {
 # guard above).
 hk_cmd() {
   local bin="$1"; shift
-  if command -v timeout >/dev/null 2>&1; then
-    timeout "$HK_CMD_TIMEOUT" "$bin" "$@"
-  elif command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$HK_CMD_TIMEOUT" "$bin" "$@"
-  else
-    python3 -c 'import subprocess, sys
-try:
-    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
-except subprocess.TimeoutExpired:
-    sys.exit(124)' "$HK_CMD_TIMEOUT" "$bin" "$@"
-  fi
+  run_bounded "$HK_CMD_TIMEOUT" "$bin" "$@"
 }
 
 # task_resolve_parent — TASK_INHERITED_FROM is set by the caller to a parent
@@ -5717,6 +6244,12 @@ print(value if isinstance(value, str) else "")
   fi
   SPAWN_PANE_OPEN=0
   refresh_quota_pool
+  # #770: optional periodic prune, off by default until director-1 enables it
+  # (WRK_PRUNE_ON_SPAWN=1). Detached so the spawn path never waits on it; it
+  # runs the same `wrk prune --apply` an operator would.
+  if [[ "${WRK_PRUNE_ON_SPAWN:-0}" == 1 ]]; then
+    ( nohup "$0" prune --apply >>"$(wrk_jobs_root)/prune.log" 2>&1 & ) || true
+  fi
   ARBITER_HELD=0
   if [[ -n "$ARBITER_RESOURCE" ]]; then
     OK_LINE="OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
@@ -6102,6 +6635,10 @@ reap_cmd() {
     if [[ "$apply" -eq 1 ]]; then
       if "$HERDR" tab close "$tab" >/dev/null 2>&1; then
         reap_event "$job" "$owner" "$pane" "$tab"
+        # #770: a reaped job is ended — declare it to the hub (job.reaped is a
+        # work terminal but not one the hub ends on), release quota, and stop
+        # + wait on the completion sentinel before moving on.
+        job_end_housekeeping "$job" "$owner" abandoned "pane reaped" "wrk reap"
         echo "closed job=$job pane=$pane tab=$tab status=$token age=${age}s"
         acted=$(( acted + 1 ))
       else
@@ -6117,6 +6654,313 @@ reap_cmd() {
   else
     echo "reap: $acted candidate(s) (dry-run; re-run with --apply to close)"
   fi
+}
+
+# ── #770: wrk prune — report-only-by-default cleanup of what ended jobs
+# leave behind: orphan completion sentinels, stale jobs and detached
+# quota-refresh supervisors.
+#
+# The hard rule mirrors wrk reap: nothing is stopped on ambiguous evidence.
+# A pid is only ever signalled when its argv is verified to be this job's
+# `wrk sentinel JOB …` (pid reuse guard), and a live sentinel is only ever
+# stopped when the job's own records prove it ended or its pane is provably
+# gone — never on "looks old".
+
+# proc_elapsed_s PID — process age in seconds from ps etime (macOS has no
+# etimes); empty output or an unparseable field fails the call.
+proc_elapsed_s() {
+  local pid="$1" etime
+  etime="$(ps -p "$pid" -o etime= 2>/dev/null | tr -d ' ')" || return 1
+  [[ -n "$etime" ]] || return 1
+  python3 - "$etime" <<'PY'
+import re, sys
+match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", sys.argv[1])
+if not match:
+    raise SystemExit(1)
+days, hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
+print(days * 86400 + hours * 3600 + minutes * 60 + seconds)
+PY
+}
+
+# refresh_supervisor_argv_matches PID PIDFILE — the refresh supervisor's real
+# argv is `python3 - <scopefuel> <pool> <timeout> THIS-PIDFILE <job>`: the
+# pidfile path it babysits sits at argv[5]. A bare `python` substring match is
+# not identity — a plain `python3 -c 'sleep forever'` never carries this job's
+# pidfile path there, and that is the difference between pruning a leftover
+# and killing an unrelated process whose pid was recycled.
+refresh_supervisor_argv_matches() {
+  local pid="$1" pidfile="$2" args
+  args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+  [[ -n "$args" ]] || return 1
+  python3 - "$args" "$pidfile" <<'PY'
+import shlex, sys
+args, pidfile = sys.argv[1], sys.argv[2]
+try:
+    toks = shlex.split(args)
+except ValueError:
+    toks = args.split()
+ok = (len(toks) >= 6 and "python" in toks[0].rsplit("/", 1)[-1].lower()
+      and toks[1] == "-" and toks[5] == pidfile)
+sys.exit(0 if ok else 1)
+PY
+}
+
+prune_help() {
+  cat <<'USAGE'
+Usage: wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
+
+Report — and with --apply, remove — what ended or stale jobs leave behind:
+  * orphan completion sentinels (pidfile or a live `wrk sentinel JOB`
+    process whose job ended, or whose pane is provably gone)
+  * stale jobs (events silent past --stale-age AND pane absent; records are
+    never deleted — --apply appends a job.revoked end declaration so the
+    hub stops counting them)
+  * quota-refresh supervisor leftovers (quota-refresh.pid pointing at a
+    dead/reused pid, or a live supervisor past its recorded deadline or
+    whose job already ended)
+
+Dry-run is the default and prints one line per item with job id, pid, age,
+pane state and the exact reason it is or is not an orphan. --apply stops
+only verified orphans: a sentinel whose job is still active (pane alive, or
+job not ended, or pane state unverifiable) is never stopped, and a stale
+pidfile pointing at an unrelated process only loses the file, never the
+process.
+
+Options:
+  --apply          actually stop orphans / mark stale jobs / reap leftovers
+  --stale-age AGE  stale threshold, e.g. 86400, 12h, 1d (default 24h)
+  --job JOB        restrict every pass to one job id
+  --lane LANE      restrict every pass to jobs owned by LANE
+  -h, --help       show this usage
+
+Periodic hook: WRK_PRUNE_ON_SPAWN=1 runs this same --apply pass detached at
+the end of every `wrk spawn`. Off by default; enable only after director-1
+approves. Output appends to <jobs-root>/prune.log.
+USAGE
+}
+
+# prune_sentinel_row JOB PID PIDFILE ARGV_PANE ARGV_OWNER STARTED — classify
+# one completion sentinel (pidfile-sourced or process-sweep-sourced) and print
+# exactly one verdict line. STARTED is the pidfile's recorded spawn time;
+# sweep rows pass "" (argv alone proves those). Uses PRUNE_APPLY, PRUNE_LANE
+# and the precomputed PRUNE_SCAN table; bumps PRUNE_ORPHANS on verified
+# orphans.
+prune_sentinel_row() {
+  local job="$1" pid="$2" pidfile="$3" argv_pane="${4:-}" argv_owner="${5:-}" started="${6:-}"
+  local row ended="" terminal="" owner="" j_pane=""
+  [[ -z "$PRUNE_LANE" ]] || {
+    owner="$(awk -v j="$job" -F'\t' '$1==j {print $8; exit}' <<<"$PRUNE_SCAN")"
+    [[ "${owner:--}" == "$PRUNE_LANE" || "$argv_owner" == "$PRUNE_LANE" ]] || return 0
+  }
+  row="$(awk -v j="$job" -F'\t' '$1==j {print; exit}' <<<"$PRUNE_SCAN")"
+  if [[ -n "$row" ]]; then
+    IFS=$'\t' read -r _ ended _ terminal _ _ _ owner _ j_pane _ <<<"$row"
+  fi
+  local live=0 pidkind="absent" age="-"
+  if [[ "$pid" =~ ^[0-9]+$ ]]; then
+    if sentinel_pid_matches "$pid" "$job" && sentinel_start_matches "$pid" "$started"; then
+      live=1; pidkind="live"; age="$(proc_elapsed_s "$pid" 2>/dev/null || echo '?')"
+    elif kill -0 "$pid" 2>/dev/null; then
+      pidkind="reused"
+      # argv proved this pid is our sentinel but the recorded start disagrees
+      # with its real age — the pidfile was stale, not the process.
+      if sentinel_pid_matches "$pid" "$job"; then
+        pidkind="start-mismatch"
+      fi
+    else
+      pidkind="dead"
+    fi
+  else
+    pidkind="invalid"
+  fi
+  if [[ "$live" -eq 0 ]]; then
+    # No live sentinel — only a pidfile can be stale here.
+    [[ "$pidfile" != - ]] || return 0
+    echo "sentinel job=$job pid=${pid:-?} pidfile=$pidfile stale=yes reason=pid-$pidkind"
+    if [[ "$PRUNE_APPLY" -eq 1 ]]; then
+      rm -f "$pidfile" && echo "  action=removed-pidfile"
+    fi
+    return 0
+  fi
+  if [[ ! -d "$PRUNE_ROOT/$job" ]]; then
+    # Outside the jobs root there is no event stream to prove anything with —
+    # list it, never touch it.
+    echo "sentinel job=$job pid=$pid age=${age}s state=protected reason=outside-jobs-root"
+    return 0
+  fi
+  if [[ "$ended" == 1 ]]; then
+    PRUNE_ORPHANS=$(( PRUNE_ORPHANS + 1 ))
+    echo "sentinel job=$job pid=$pid age=${age}s orphan=yes reason=job-ended($terminal)"
+    if [[ "$PRUNE_APPLY" -eq 1 ]]; then
+      stop_completion_sentinel "$job" "$pid" && echo "  action=stopped"
+    fi
+    return 0
+  fi
+  local pane="${argv_pane:-$j_pane}" probe pclass ptoken
+  if [[ -z "$pane" || "$pane" == - ]]; then
+    echo "sentinel job=$job pid=$pid age=${age}s state=protected reason=no-pane-evidence"
+    return 0
+  fi
+  probe="$(herdr_agent_probe "$pane")"
+  IFS=$'\t' read -r pclass ptoken _ <<<"$probe"
+  case "$pclass" in
+    gone)
+      PRUNE_ORPHANS=$(( PRUNE_ORPHANS + 1 ))
+      echo "sentinel job=$job pid=$pid age=${age}s pane=$pane orphan=yes reason=pane-gone($ptoken)"
+      if [[ "$PRUNE_APPLY" -eq 1 ]]; then
+        job_end_record "$job" "$owner" abandoned "pane gone; sentinel orphaned" "wrk prune" >/dev/null || true
+        stop_completion_sentinel "$job" "$pid" && echo "  action=stopped+ended"
+      fi ;;
+    ok)
+      echo "sentinel job=$job pid=$pid age=${age}s pane=$pane state=protected reason=pane-alive($ptoken)" ;;
+    *)
+      echo "sentinel job=$job pid=$pid age=${age}s pane=$pane state=protected reason=pane-unverifiable($ptoken)" ;;
+  esac
+}
+
+prune_cmd() {
+  local apply=0 stale_age="${WRK_PRUNE_STALE_AGE:-24h}" lane="" only_job=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) prune_help; return 0 ;;
+      --apply) apply=1; shift ;;
+      --stale-age) [[ $# -ge 2 && -n "$2" ]] || die "--stale-age requires a value"; stale_age="$2"; shift 2 ;;
+      --lane) [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a value"; lane="$2"; shift 2 ;;
+      --job) [[ $# -ge 2 && -n "$2" ]] || die "--job requires a value"; only_job="$2"; shift 2 ;;
+      -*) die "unknown prune option '$1'" ;;
+      *) die "unexpected argument '$1'" ;;
+    esac
+  done
+  local stale_s jobs_root
+  stale_s="$(parse_duration_s "$stale_age")" || die "invalid --stale-age '$stale_age' (use 86400, 24h or 1d)"
+  jobs_root="$(wrk_jobs_root)"
+  if [[ ! -d "$jobs_root" ]]; then
+    echo "prune: no job inbox at $jobs_root"
+    return 0
+  fi
+  [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
+  PRUNE_APPLY="$apply" PRUNE_LANE="$lane" PRUNE_ROOT="$jobs_root" PRUNE_ORPHANS=0
+
+  # One python pass over every job's event stream — ended/hub_ended, newest
+  # terminal, silence age and the spawned pane — shared by all three passes.
+  local scan_dirs=() _d
+  for _d in "$jobs_root"/*/; do
+    [[ -d "$_d" ]] || continue
+    scan_dirs+=("${_d%/}/events")
+  done
+  PRUNE_SCAN=""
+  (( ${#scan_dirs[@]} )) && PRUNE_SCAN="$(job_events_scan "${scan_dirs[@]}")"
+
+  local _mode="dry-run" pf job pid jdir
+  (( apply )) && _mode="apply"
+  echo "prune ($_mode) root=$jobs_root stale_age=${stale_age}$( [[ -n "$lane" ]] && printf ' lane=%s' "$lane" )"
+
+  # Pass 1 — pidfile-sourced sentinels.
+  while IFS= read -r pf; do
+    [[ -n "$pf" ]] || continue
+    jdir="${pf%/completion-sentinel.pid}"; job="${jdir##*/}"
+    [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
+    pid=""; started=""
+    IFS=$'\t' read -r pid started <<<"$(sentinel_pidfile_fields "$pf")"
+    prune_sentinel_row "$job" "$pid" "$pf" "" "" "$started"
+  done < <(find "$jobs_root" -maxdepth 2 -name completion-sentinel.pid -type f 2>/dev/null | sort)
+
+  # Pass 2 — process sweep: live `wrk sentinel JOB …` processes, including
+  # ones that never had (or lost) a pidfile. A pidfile pass already covers
+  # the pair when its pid matches; a different live pid for the same job is
+  # a second sentinel and is judged on its own.
+  local _pid _job _owner _label _pane _report _pfpid
+  while IFS=$'\t' read -r _pid _job _owner _label _pane _report; do
+    [[ -n "$_job" ]] || continue
+    [[ -z "$only_job" || "$_job" == "$only_job" ]] || continue
+    if [[ -f "$jobs_root/$_job/completion-sentinel.pid" ]]; then
+      read -r _pfpid <"$jobs_root/$_job/completion-sentinel.pid" 2>/dev/null || _pfpid=""
+      [[ "$_pfpid" == "$_pid" ]] && continue
+    fi
+    prune_sentinel_row "$_job" "$_pid" - "$_pane" "$_owner"
+  done < <(sentinel_sweep)
+
+  # Pass 3 — stale jobs: silent past --stale-age AND pane absent. Records are
+  # kept; --apply only appends the hub-visible end declaration.
+  local stale_n=0 _ended _hub _term _age _last _comp _label _tab _pstate
+  while IFS=$'\t' read -r job _ended _hub _term _age _last _comp _owner _label _pane _tab; do
+    [[ -n "$job" ]] || continue
+    [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
+    [[ -z "$lane" || "$_owner" == "$lane" ]] || continue
+    [[ "$_ended" == 0 && "$_age" =~ ^[0-9]+$ && "$_age" -ge "$stale_s" ]] || continue
+    _pstate="no-pane-recorded"
+    if [[ "$_pane" != - ]]; then
+      local _probe _pclass _ptoken
+      _probe="$(herdr_agent_probe "$_pane")"
+      IFS=$'\t' read -r _pclass _ptoken _ <<<"$_probe"
+      [[ "$_pclass" == gone ]] || continue
+      _pstate="gone:$_ptoken"
+    fi
+    stale_n=$(( stale_n + 1 ))
+    echo "job $job stale=yes last_event_age=${_age}s owner=$_owner pane=$_pane pane_state=$_pstate"
+    if (( apply )); then
+      job_end_record "$job" "$_owner" abandoned "stale: silent ${_age}s, pane absent" "wrk prune" >/dev/null &&
+        echo "  action=end-declaration" || echo "  action=end-declaration-failed"
+    fi
+  done <<<"$PRUNE_SCAN"
+
+  # Pass 4 — quota-refresh supervisors (quota-refresh.pid written by
+  # refresh_quota_pool). A live pid is only a leftover when it verifies
+  # (start time matches the record within the pid-reuse window) AND the job
+  # ended or the recorded deadline passed.
+  local left_n=0 _rpf _rjob _rpid="" _rdeadline=0 _rstarted=0 _rpool="" _rfields _kv _elapsed _row _rended
+  while IFS= read -r _rpf; do
+    [[ -n "$_rpf" ]] || continue
+    jdir="${_rpf%/quota-refresh.pid}"; _rjob="${jdir##*/}"
+    [[ -z "$only_job" || "$_rjob" == "$only_job" ]] || continue
+    _rpid=""; _rdeadline=0; _rstarted=0; _rpool=""
+    _rfields="$(cat "$_rpf" 2>/dev/null || true)"
+    local -a _farr=()
+    read -r -a _farr <<<"$_rfields"
+    for _kv in "${_farr[@]}"; do
+      case "$_kv" in
+        pid=*) _rpid="${_kv#pid=}" ;;
+        deadline=*) _rdeadline="${_kv#deadline=}" ;;
+        started=*) _rstarted="${_kv#started=}" ;;
+        pool=*) _rpool="${_kv#pool=}" ;;
+      esac
+    done
+    if [[ ! "$_rpid" =~ ^[0-9]+$ ]] || ! kill -0 "$_rpid" 2>/dev/null; then
+      left_n=$(( left_n + 1 ))
+      echo "refresh job=$_rjob pid=${_rpid:-?} pool=${_rpool:--} leftover=yes reason=pid-stale"
+      (( apply )) && { rm -f "$_rpf" && echo "  action=removed-pidfile"; }
+      continue
+    fi
+    # Live pid: prove it is our supervisor — recorded start vs real elapsed
+    # must agree AND the argv must be the supervisor command itself carrying
+    # THIS pidfile path (a reused pid, or a bare `python3 -c …` that merely
+    # greps as "python", points at an unrelated process and is never
+    # signalled).
+    _elapsed="$(proc_elapsed_s "$_rpid" 2>/dev/null || echo "")"
+    if [[ -z "$_elapsed" || "$_rstarted" =~ [^0-9] || -z "$_rstarted" ]] ||
+       (( ( $(date +%s) - _rstarted - _elapsed ) > 120 || ( $(date +%s) - _rstarted - _elapsed ) < -120 )) ||
+       ! refresh_supervisor_argv_matches "$_rpid" "$_rpf"; then
+      echo "refresh job=$_rjob pid=$_rpid pool=${_rpool:--} state=protected reason=pid-unverified"
+      continue
+    fi
+    _row="$(awk -v j="$_rjob" -F'\t' '$1==j {print $2; exit}' <<<"$PRUNE_SCAN")"
+    _rended="${_row:-0}"
+    if [[ "$_rended" == 1 ]] || (( $(date +%s) > _rdeadline + 60 )); then
+      left_n=$(( left_n + 1 ))
+      echo "refresh job=$_rjob pid=$_rpid pool=${_rpool:--} leftover=yes reason=deadline-passed-or-job-ended"
+      if (( apply )); then
+        # Supervisor did setsid: its pgid equals its pid, and the group owns
+        # the scopefuel refresh child too.
+        kill -- "-$_rpid" 2>/dev/null || kill "$_rpid" 2>/dev/null || true
+        rm -f "$_rpf"
+        echo "  action=killed-group"
+      fi
+    else
+      echo "refresh job=$_rjob pid=$_rpid pool=${_rpool:--} state=alive deadline=${_rdeadline}"
+    fi
+  done < <(find "$jobs_root" -maxdepth 2 -name quota-refresh.pid -type f 2>/dev/null | sort)
+
+  echo "prune: orphans=$PRUNE_ORPHANS stale_jobs=$stale_n refresh_leftovers=$left_n ($_mode)"
 }
 
 find_cmd() {
@@ -6748,6 +7592,7 @@ case "${1:-}" in
   round) shift; round_cmd "$@" ;;
   sentinel) shift; sentinel_cmd "$@" ;;
   reap) shift; reap_cmd "$@" ;;
+  prune) shift; prune_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;
   profiles) shift; profiles_cmd "$@" ;;

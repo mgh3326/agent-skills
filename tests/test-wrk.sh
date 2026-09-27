@@ -4928,10 +4928,14 @@ cp "$SENTINEL_REPORT" "$SENTINEL_INBOX/sentinel-idle/report.md"
 # the first sighting only logs action=pending.
 wait_until 30 event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 1 ||
   fail "an idle pane plus a settled report is exactly one job.completed (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
+# #770: the sentinel exits right after job.completed — a later report update
+# can no longer mint a second completion, and the watcher must be gone.
+wait_until 30 bash -c "! kill -0 $sentinel_idle_pid 2>/dev/null" ||
+  fail "the completion sentinel must exit once job.completed lands"
 printf 'updated report line\n' >>"$SENTINEL_INBOX/sentinel-idle/report.md"
-wait_until 30 event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 2 ||
-  fail "an updated report at the same path is a new round, so a second job.completed follows (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
-kill "$sentinel_idle_pid" 2>/dev/null || true
+sleep 2
+event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 1 ||
+  fail "no sentinel remains after job.completed, so a report update writes no second record (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
 wait "$sentinel_idle_pid" 2>/dev/null || true
 echo "PASS r18-sentinel-portable-discovery-and-dedupe"
 
@@ -5093,7 +5097,7 @@ for keep_case in kept plain; do
     "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
     --t T1 --job "spawn-keep-$keep_case" --owner lane-a ${keep_args[@]+"${keep_args[@]}"} >/dev/null ||
     fail "#603: spawn ($keep_case) must succeed"
-  kill "$(cat "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null)" 2>/dev/null || true
+  kill "$(head -n 1 "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null)" 2>/dev/null || true
 done
 python3 - "$TMP/spawn-keep-kept/spawn-keep-kept/events" "$TMP/spawn-keep-plain/spawn-keep-plain/events" <<'PY'
 import glob, json, sys
@@ -5168,14 +5172,15 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=30 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel idem-race lane-a wrk-a w1:p1 "$IDEM_RACE_REPORT" >/dev/null 2>&1 &
 idem_race_pid=$!
-wait_until 30 sentinel_log_has "$IDEM_INBOX/idem-race/completion-sentinel.log" 'action=completed' ||
-  fail "the sentinel must still judge the settled report as completed"
+# #770: the sentinel sees the work-terminal record on its first watch and
+# exits — it never mints a second completion for an already-done job.
+wait_until 30 sentinel_log_has "$IDEM_INBOX/idem-race/completion-sentinel.log" 'action=watch-exit' ||
+  fail "a sentinel started after job.completed must notice the terminal and leave"
 sleep 1
 event_count_is "$IDEM_INBOX/idem-race/events" job.completed 1 ||
-  fail "the sentinel's observation of an already-completed report must be suppressed (got $(event_count "$IDEM_INBOX/idem-race/events" job.completed))"
-grep -q 'suppressed-duplicate' "$IDEM_INBOX/idem-race/completion-suppressed.log" ||
-  fail "the suppressed sentinel write must leave a durable note"
-kill "$idem_race_pid" 2>/dev/null || true
+  fail "a sentinel observing an already-completed job must not write a second record (got $(event_count "$IDEM_INBOX/idem-race/events" job.completed))"
+wait_until 15 bash -c "! kill -0 $idem_race_pid 2>/dev/null" ||
+  fail "the sentinel must exit once it sees the job already ended"
 wait "$idem_race_pid" 2>/dev/null || true
 echo "PASS completion-sentinel-observation-after-done-is-suppressed"
 
@@ -5803,22 +5808,25 @@ diff "$TMP/j499-present-job.log" <(printf '%s\n' \
   fail "delegated joined must not also write wrk's record"
 [[ "$(j499_calls "$TMP/j499-present-emit.log")" == 0 ]] ||
   fail "delegated commands must not also run wrk's emit"
-# A failing delegated call surfaces its own status and wrk does not retry it.
+# A failing delegated call falls back to wrk's own write path (#770 tester
+# BLOCKER 1): the terminal record must not ride down with panewire's rc.
 rc=0
-WRK_PANEWIRE_JOB_RC=7 j499_run 1 present rc 'done' j499-worker --report "$J499_REPORT" >/dev/null 2>&1 || rc=$?
-[[ "$rc" == 7 ]] || fail "a failing panewire job must surface its own status, got rc=$rc"
-[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 0 &&
-   "$(j499_calls "$TMP/j499-rc-emit.log")" == 0 ]] ||
-  fail "a failing panewire job must not fall back to a second write"
+out="$(WRK_PANEWIRE_JOB_RC=7 j499_run 1 present rc 'done' j499-worker --report "$J499_REPORT" 2>&1)" || rc=$?
+[[ "$rc" == 0 ]] || fail "a failing delegated done must fall back to wrk's own path, got rc=$rc"
+printf '%s\n' "$out" | grep -q 'delegation failed' ||
+  fail "the fallback must warn on stderr: $out"
+[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 1 &&
+   "$(j499_calls "$TMP/j499-rc-emit.log")" == 1 ]] ||
+  fail "the fallback must write and emit the record exactly once, locally"
 # Help stays wrk's own even when panewire has the command.
 j499_run 1 present help escalate --help | grep -q '^Usage: wrk escalate JOB' ||
   fail "escalate --help must stay local"
 [[ "$(j499_lines "$TMP/j499-help-job.log")" == 0 ]] || fail "escalate --help must not delegate"
 echo "PASS j499-delegates-once-to-panewire-job"
 
-# absent / garbage / hang / forced off: wrk's own path, exactly one record and
+# absent / garbage / forced off: wrk's own path, exactly one record and
 # one emit per command, zero delegated calls.
-for mode in absent garbage hang off; do
+for mode in absent garbage off; do
   job_mode="$mode" delegate=1
   if [[ "$mode" == off ]]; then job_mode=present delegate=0; fi
   worker="j499-$mode-worker" builder="j499-$mode-builder"
@@ -5849,6 +5857,34 @@ helper.assert_matches_record(joined_call, helper.record(builder, "job.joined"))
 PY
 done
 echo "PASS j499-falls-back-to-own-path-without-panewire-job"
+
+# hang: the fixture sleeps inside `panewire job probe`, so the probe is killed
+# by WRK_JOB_DELEGATE_TIMEOUT_S and the invocation marks panewire wedged. The
+# local path still writes exactly one record per command, but emit must not
+# re-enter the wedged binary: zero emit calls, one delegate_timeout marker
+# per skipped emit, and no delegated job call ever reaches the fixture log.
+mode=hang
+worker="j499-$mode-worker" builder="j499-$mode-builder"
+j499_claim "$worker"
+j499_claim "$builder" --role builder --parent-lane parent-a
+out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang 'done' "$worker" --report "$J499_REPORT")"
+[[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "hang: done output changed: $out"
+out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang escalate "$builder" --question 'fallback question')"
+[[ "$out" == "OK job=$builder owner_lane=lane-a kind=job.escalate" ]] || fail "hang: escalate output changed: $out"
+out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang joined "$builder" --pr https://example.invalid/pr/8 \
+  --head f00d --report "$J499_REPORT")"
+[[ "$out" == "OK job=$builder owner_lane=lane-a kind=job.joined pr=https://example.invalid/pr/8 head=f00d report=$J499_REPORT" ]] ||
+  fail "hang: joined output changed: $out"
+[[ "$(event_count "$J499_INBOX/$worker/events" job.completed)" == 1 ]] || fail "hang: done must write exactly one record"
+[[ "$(event_count "$J499_INBOX/$builder/events" job.escalate)" == 1 ]] || fail "hang: escalate must write exactly one record"
+[[ "$(event_count "$J499_INBOX/$builder/events" job.joined)" == 1 ]] || fail "hang: joined must write exactly one record"
+[[ "$(j499_calls "$TMP/j499-hang-emit.log")" == 0 ]] || fail "hang: emit must not re-enter the wedged panewire"
+[[ "$(j499_lines "$TMP/j499-hang-job.log")" == 0 ]] || fail "hang: nothing may be delegated past the hung probe"
+grep -Eq '^[0-9TZ:-]+ kind=job.completed rc=delegate_timeout$' "$J499_INBOX/$worker/emit-failures.log" ||
+  fail "hang: done must mark the skipped emit as delegate_timeout"
+[[ "$(grep -c 'rc=delegate_timeout$' "$J499_INBOX/$builder/emit-failures.log")" == 2 ]] ||
+  fail "hang: escalate+joined must each mark a delegate_timeout"
+echo "PASS j499-hang-wedges-panewire-and-skips-emit"
 
 # no binary: wrk's own record, and the missing emit is marked exactly as before.
 j499_claim j499-nobin-worker
