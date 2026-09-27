@@ -4348,18 +4348,59 @@ for row in doc.get("quota_pool_records") or []:
   return 0
 }
 
-# PID-reuse guard: the recorded pid is only ever this job's sentinel when its
-# argv is literally `…/wrk sentinel JOB …`. A dead pid and a pid reused by an
-# unrelated process both fail here — neither is ever signalled.
+# PID-reuse guard, part 1: the recorded pid is only ever this job's sentinel
+# when its argv is literally `…/wrk sentinel JOB OWNER LABEL PANE [REPORT …]`.
+# The token before `sentinel` must be the wrk program itself — argv[0], or
+# argv[1] behind the interpreter the kernel inserts for the shebang — and the
+# full owner/label/pane tail must be present. `wrk sentinel JOB` appearing as
+# mere arguments inside an unrelated command line (a python fixture carrying
+# a fake triple, an editor buffer, a log line) never matches.
 sentinel_pid_matches() {
   local pid="$1" job="$2"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   ps -p "$pid" -o args= 2>/dev/null | awk -v job="$job" '
+    function is_shell(tok) { sub(/^.*\//, "", tok); return tok ~ /^(sh|bash|zsh|dash|ksh)$/ }
     {
-      for (i = 2; i < NF; i++)
-        if ($i == "sentinel" && $(i + 1) == job && $(i - 1) ~ /(^|\/)wrk$/) { found = 1; break }
+      for (i = 1; i <= NF; i++)
+        if ($i ~ /(^|\/)wrk$/ && $(i + 1) == "sentinel" && $(i + 2) == job &&
+            NF >= i + 5 && (i == 1 || (i == 2 && is_shell($1)))) { found = 1; break }
     }
     END { exit(found ? 0 : 1) }'
+}
+
+# sentinel_pidfile_fields FILE — print "pid<TAB>started" parsed from a
+# completion-sentinel pidfile. Current files are two lines ("PID" then
+# "started=EPOCH"); bare numeric legacy pidfiles and flat "pid=N started=E"
+# forms parse identically. Missing or unparseable fields print empty — an
+# empty field never proves identity.
+sentinel_pidfile_fields() {
+  local file="$1" line="" extra="" tok pid="" started=""
+  if [[ -s "$file" ]]; then
+    { IFS= read -r line; IFS= read -r extra || extra=""; } <"$file" 2>/dev/null || true
+    for tok in $line $extra; do
+      case "$tok" in
+        pid=*) pid="${tok#pid=}" ;;
+        started=*) started="${tok#started=}" ;;
+        *)
+          if [[ -z "$pid" && "$tok" =~ ^[0-9]+$ ]]; then pid="$tok"; fi ;;
+      esac
+    done
+  fi
+  printf '%s\t%s\n' "$pid" "$started"
+}
+
+# PID-reuse guard, part 2: when a pidfile recorded the sentinel's spawn time,
+# the live process's real elapsed age must agree with it (±120s skew window —
+# the file is written a moment after fork). No recorded start, no verdict;
+# a malformed recorded start is never positive identity.
+sentinel_start_matches() {
+  local pid="$1" started="${2:-}"
+  [[ -n "$started" ]] || return 0
+  [[ "$started" =~ ^[0-9]+$ ]] || return 1
+  local el skew
+  el="$(proc_elapsed_s "$pid" 2>/dev/null)" || return 1
+  skew=$(( $(date +%s) - started - el ))
+  (( skew >= -120 && skew <= 120 ))
 }
 
 # kill -0 alone reports zombies as alive; the sentinel is reparented to launchd
@@ -4380,11 +4421,13 @@ sentinel_pid_alive() {
 # so no copy survives the job (tester BLOCKER 2).
 sentinel_sweep() {
   ps axo pid=,args= 2>/dev/null | awk '
+    function is_shell(tok) { sub(/^.*\//, "", tok); return tok ~ /^(sh|bash|zsh|dash|ksh)$/ }
     {
       pid = $1
-      for (i = 2; i < NF; i++)
-        if ($i == "sentinel" && $(i - 1) ~ /(^|\/)wrk$/ && $(i + 1) != "") {
-          print pid "\t" $(i+1) "\t" $(i+2) "\t" $(i+3) "\t" $(i+4) "\t" $(i+5)
+      for (i = 2; i <= NF; i++)
+        if ($i ~ /(^|\/)wrk$/ && $(i + 1) == "sentinel" && $(i + 2) != "" &&
+            NF >= i + 5 && (i == 2 || (i == 3 && is_shell($2)))) {
+          print pid "\t" $(i+2) "\t" $(i+3) "\t" $(i+4) "\t" $(i+5) "\t" $(i+6)
           break
         }
     }' | sort -k2,2 -k1,1n
@@ -4402,13 +4445,13 @@ stop_completion_sentinel() {
   jobdir="$(wrk_jobs_root)/$job"
   pidfile="$jobdir/completion-sentinel.pid"
   local -a pids=()
+  local pidfile_pid="" pidfile_started=""
   if [[ -n "$explicit_pid" ]]; then
     pids=("$explicit_pid")
   else
     if [[ -s "$pidfile" ]]; then
-      local _pf=""
-      read -r _pf <"$pidfile" 2>/dev/null || _pf=""
-      [[ -n "$_pf" ]] && pids+=("$_pf")
+      IFS=$'\t' read -r pidfile_pid pidfile_started <<<"$(sentinel_pidfile_fields "$pidfile")"
+      [[ "$pidfile_pid" =~ ^[0-9]+$ ]] && pids+=("$pidfile_pid")
     fi
     local _p _j _seen _dup
     while IFS=$'\t' read -r _p _j _rest; do
@@ -4421,7 +4464,9 @@ stop_completion_sentinel() {
     done < <(sentinel_sweep)
   fi
   for pid in ${pids[@]+"${pids[@]}"}; do
-    if [[ "$pid" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$pid" "$job"; then
+    local _st=""
+    if [[ "$pid" == "$pidfile_pid" ]]; then _st="$pidfile_started"; fi
+    if [[ "$pid" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$pid" "$job" && sentinel_start_matches "$pid" "$_st"; then
       # Freeze first so a sentinel waking mid-stop cannot fork a new sleep
       # between the child enumeration and the signal batch (the test suites'
       # cleanup uses this same STOP → kill children → TERM → CONT order).
@@ -4600,20 +4645,30 @@ build_sentinel_env() {
 
 start_completion_sentinel() {
   local pidfile="$1"; shift
+  local job="${1:-}"
   mkdir -p "$(dirname "$pidfile")"
-  local existing=""
+  local existing="" existing_started=""
   if [[ -s "$pidfile" ]]; then
-    read -r existing <"$pidfile" || existing=""
-    if [[ "$existing" =~ ^[0-9]+$ ]] && kill -0 "$existing" 2>/dev/null; then
+    IFS=$'\t' read -r existing existing_started <<<"$(sentinel_pidfile_fields "$pidfile")"
+    # kill -0 alone proves nothing: a reused pid belongs to whatever unrelated
+    # process took it, and letting that answer suppress this call would leave
+    # the job without a sentinel (director-1 measured reused pids on this box
+    # belonging to system daemons and to the director's own process). Only an
+    # argv-verified sentinel for this job — start time agreeing when the file
+    # recorded one — suppresses a new start.
+    if [[ "$existing" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$existing" "$job" && sentinel_start_matches "$existing" "$existing_started"; then
       return 0
     fi
   fi
   rm -f "$pidfile"
   build_sentinel_env
+  # The pidfile's second line records the spawn instant so a later reader can
+  # prove the pid still belongs to the process it launched — a bare pid is
+  # silently recyclable by the kernel.
   if [[ "${#SENTINEL_ENV[@]}" -gt 0 ]]; then
-    ( nohup env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
+    ( nohup env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   else
-    ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & echo $! >"$pidfile" )
+    ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   fi
 }
 
@@ -6627,6 +6682,29 @@ print(days * 86400 + hours * 3600 + minutes * 60 + seconds)
 PY
 }
 
+# refresh_supervisor_argv_matches PID PIDFILE — the refresh supervisor's real
+# argv is `python3 - <scopefuel> <pool> <timeout> THIS-PIDFILE <job>`: the
+# pidfile path it babysits sits at argv[5]. A bare `python` substring match is
+# not identity — a plain `python3 -c 'sleep forever'` never carries this job's
+# pidfile path there, and that is the difference between pruning a leftover
+# and killing an unrelated process whose pid was recycled.
+refresh_supervisor_argv_matches() {
+  local pid="$1" pidfile="$2" args
+  args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+  [[ -n "$args" ]] || return 1
+  python3 - "$args" "$pidfile" <<'PY'
+import shlex, sys
+args, pidfile = sys.argv[1], sys.argv[2]
+try:
+    toks = shlex.split(args)
+except ValueError:
+    toks = args.split()
+ok = (len(toks) >= 6 and "python" in toks[0].rsplit("/", 1)[-1].lower()
+      and toks[1] == "-" and toks[5] == pidfile)
+sys.exit(0 if ok else 1)
+PY
+}
+
 prune_help() {
   cat <<'USAGE'
 Usage: wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
@@ -6661,12 +6739,14 @@ approves. Output appends to <jobs-root>/prune.log.
 USAGE
 }
 
-# prune_sentinel_row JOB PID PIDFILE ARGV_PANE ARGV_OWNER — classify one
-# completion sentinel (pidfile-sourced or process-sweep-sourced) and print
-# exactly one verdict line. Uses PRUNE_APPLY, PRUNE_LANE and the precomputed
-# PRUNE_SCAN table; bumps PRUNE_ORPHANS on verified orphans.
+# prune_sentinel_row JOB PID PIDFILE ARGV_PANE ARGV_OWNER STARTED — classify
+# one completion sentinel (pidfile-sourced or process-sweep-sourced) and print
+# exactly one verdict line. STARTED is the pidfile's recorded spawn time;
+# sweep rows pass "" (argv alone proves those). Uses PRUNE_APPLY, PRUNE_LANE
+# and the precomputed PRUNE_SCAN table; bumps PRUNE_ORPHANS on verified
+# orphans.
 prune_sentinel_row() {
-  local job="$1" pid="$2" pidfile="$3" argv_pane="${4:-}" argv_owner="${5:-}"
+  local job="$1" pid="$2" pidfile="$3" argv_pane="${4:-}" argv_owner="${5:-}" started="${6:-}"
   local row ended="" terminal="" owner="" j_pane=""
   [[ -z "$PRUNE_LANE" ]] || {
     owner="$(awk -v j="$job" -F'\t' '$1==j {print $8; exit}' <<<"$PRUNE_SCAN")"
@@ -6678,10 +6758,15 @@ prune_sentinel_row() {
   fi
   local live=0 pidkind="absent" age="-"
   if [[ "$pid" =~ ^[0-9]+$ ]]; then
-    if sentinel_pid_matches "$pid" "$job"; then
+    if sentinel_pid_matches "$pid" "$job" && sentinel_start_matches "$pid" "$started"; then
       live=1; pidkind="live"; age="$(proc_elapsed_s "$pid" 2>/dev/null || echo '?')"
     elif kill -0 "$pid" 2>/dev/null; then
       pidkind="reused"
+      # argv proved this pid is our sentinel but the recorded start disagrees
+      # with its real age — the pidfile was stale, not the process.
+      if sentinel_pid_matches "$pid" "$job"; then
+        pidkind="start-mismatch"
+      fi
     else
       pidkind="dead"
     fi
@@ -6775,9 +6860,9 @@ prune_cmd() {
     [[ -n "$pf" ]] || continue
     jdir="${pf%/completion-sentinel.pid}"; job="${jdir##*/}"
     [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
-    pid=""
-    read -r pid <"$pf" 2>/dev/null || pid=""
-    prune_sentinel_row "$job" "$pid" "$pf"
+    pid=""; started=""
+    IFS=$'\t' read -r pid started <<<"$(sentinel_pidfile_fields "$pf")"
+    prune_sentinel_row "$job" "$pid" "$pf" "" "" "$started"
   done < <(find "$jobs_root" -maxdepth 2 -name completion-sentinel.pid -type f 2>/dev/null | sort)
 
   # Pass 2 — process sweep: live `wrk sentinel JOB …` processes, including
@@ -6847,12 +6932,14 @@ prune_cmd() {
       continue
     fi
     # Live pid: prove it is our supervisor — recorded start vs real elapsed
-    # must agree AND the argv must be the python supervisor (a reused pid
-    # points at an unrelated process and is never signalled).
+    # must agree AND the argv must be the supervisor command itself carrying
+    # THIS pidfile path (a reused pid, or a bare `python3 -c …` that merely
+    # greps as "python", points at an unrelated process and is never
+    # signalled).
     _elapsed="$(proc_elapsed_s "$_rpid" 2>/dev/null || echo "")"
     if [[ -z "$_elapsed" || "$_rstarted" =~ [^0-9] || -z "$_rstarted" ]] ||
        (( ( $(date +%s) - _rstarted - _elapsed ) > 120 || ( $(date +%s) - _rstarted - _elapsed ) < -120 )) ||
-       ! ps -p "$_rpid" -o args= 2>/dev/null | grep -qi 'python'; then
+       ! refresh_supervisor_argv_matches "$_rpid" "$_rpf"; then
       echo "refresh job=$_rjob pid=$_rpid pool=${_rpool:--} state=protected reason=pid-unverified"
       continue
     fi

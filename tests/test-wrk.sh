@@ -5097,7 +5097,7 @@ for keep_case in kept plain; do
     "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
     --t T1 --job "spawn-keep-$keep_case" --owner lane-a ${keep_args[@]+"${keep_args[@]}"} >/dev/null ||
     fail "#603: spawn ($keep_case) must succeed"
-  kill "$(cat "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null)" 2>/dev/null || true
+  kill "$(head -n 1 "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null)" 2>/dev/null || true
 done
 python3 - "$TMP/spawn-keep-kept/spawn-keep-kept/events" "$TMP/spawn-keep-plain/spawn-keep-plain/events" <<'PY'
 import glob, json, sys
