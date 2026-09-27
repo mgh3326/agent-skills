@@ -439,6 +439,69 @@ wait_until 8 pid_gone "$SENTINEL_PID" ||
   { kill -9 "$SENTINEL_PID" 2>/dev/null; fail "JE14: sentinel survived wrk reap --apply"; }
 echo "PASS je14 reap-housekeeping"
 
+echo "== JE15: a failed or hung delegation falls back to the local write =="
+reset_case je15
+mk_job je15-delegate
+REPORT="$TMP/je15-report.md"; printf 'x\n' >"$REPORT"
+start_sentinel je15-delegate w:p1 "$REPORT"
+sleep 0.8
+PSTUB="$TMP/panewire-stub"; cat >"$PSTUB" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+exit 42
+EOF
+chmod +x "$PSTUB"
+out="$(env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+  HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$PSTUB" \
+  "$WRK" 'done' je15-delegate --report "$REPORT" 2>&1)" || fail "JE15a: done must survive a delegated failure"
+printf '%s\n' "$out" | grep -q "delegation failed" ||
+  { printf '%s\n' "$out"; fail "JE15a: fallback must warn on stderr"; }
+event_count_is "$INBOX/je15-delegate/events" job.completed 1 ||
+  fail "JE15a: the terminal record must still be written by the local path"
+wait_until 8 pid_gone "$SENTINEL_PID" ||
+  { kill -9 "$SENTINEL_PID" 2>/dev/null; fail "JE15a: sentinel survived"; }
+
+# JE15b — a panewire that hangs on the real call must be bounded, not block.
+reset_case je15b
+mk_job je15-hang
+REPORT="$TMP/je15b-report.md"; printf 'x\n' >"$REPORT"
+PSTUB_HANG="$TMP/panewire-stub-hang"; cat >"$PSTUB_HANG" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+sleep 60
+EOF
+chmod +x "$PSTUB_HANG"
+start_ts=$(date +%s)
+out="$(env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+  HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$PSTUB_HANG" \
+  WRK_JOB_DELEGATE_TIMEOUT_S=2 \
+  "$WRK" 'done' je15-hang --report "$REPORT" 2>&1)" || fail "JE15b: done must survive a hung delegation"
+elapsed=$(( $(date +%s) - start_ts ))
+(( elapsed < 30 )) || fail "JE15b: hung delegation blocked $elapsed seconds (timeout was 2)"
+event_count_is "$INBOX/je15-hang/events" job.completed 1 ||
+  fail "JE15b: the terminal record must be written after the timeout"
+echo "PASS je15 delegation-failure-and-hang-fallback"
+
+echo "== JE16: wrk done stops every sentinel of the job, not just the pidfile's =="
+reset_case je16
+mk_job je16-dual
+REPORT="$TMP/je16-report.md"; printf 'x\n' >"$REPORT"
+start_sentinel je16-dual w:p1 "$REPORT"
+SENT_A=$SENTINEL_PID
+sleep 0.5
+start_sentinel je16-dual w:p1 "$REPORT"   # second sentinel overwrites the pidfile
+SENT_B=$SENTINEL_PID
+sleep 0.5
+if ! { kill -0 "$SENT_A" 2>/dev/null && kill -0 "$SENT_B" 2>/dev/null; }; then
+  fail "JE16: need both sentinels alive before done"
+fi
+done_run je16-dual --report "$REPORT" >/dev/null 2>&1
+wait_until 8 pid_gone "$SENT_A" ||
+  { kill -9 "$SENT_A" "$SENT_B" 2>/dev/null; fail "JE16: the pidfile-less sentinel survived done"; }
+wait_until 4 pid_gone "$SENT_B" ||
+  { kill -9 "$SENT_B" 2>/dev/null; fail "JE16: the pidfile sentinel survived done"; }
+echo "PASS je16 done-stops-all-sentinels"
+
 echo "== MUT: assertion-RED mutants per call site =="
 
 mkmut() {
@@ -509,6 +572,35 @@ case_prune_apply() {
   pid_gone "$pid"
 }
 
+case_delegate_fallback() {
+  reset_case mut-delegate
+  mk_job mut-delegate
+  REPORT="$TMP/mut-delegate-report.md"; printf 'x\n' >"$REPORT"
+  local stub="$TMP/mut-pw-stub"
+  cat >"$stub" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+exit 42
+EOF
+  chmod +x "$stub"
+  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$stub" \
+    "$WRK" 'done' mut-delegate --report "$REPORT" >/dev/null 2>&1 &&
+    event_count_is "$INBOX/mut-delegate/events" job.completed 1
+}
+
+case_dual_sentinel() {
+  reset_case mut-dual
+  mk_job mut-dual
+  REPORT="$TMP/mut-dual-report.md"; printf 'x\n' >"$REPORT"
+  start_sentinel mut-dual w:p1 "$REPORT"
+  local sent_a=$SENTINEL_PID; sleep 0.5
+  start_sentinel mut-dual w:p1 "$REPORT"
+  local sent_b=$SENTINEL_PID; sleep 0.5
+  done_run mut-dual --report "$REPORT" >/dev/null 2>&1
+  wait_until 8 pid_gone "$sent_a" && wait_until 4 pid_gone "$sent_b"
+}
+
 # shellcheck disable=SC2016 # the $VARs are literal sed pattern text for the wrk source lines
 mkmut no-done-housekeeping 's/^  job_end_housekeeping "\$job" "\$owner" completed "wrk done" "wrk done"$/  : mutant removed done housekeeping/'
 expect_mut_red "done housekeeping removal" case_done
@@ -524,5 +616,16 @@ expect_mut_red "sentinel record-watch removal" case_watch
 # shellcheck disable=SC2016 # the $VARs are literal sed pattern text for the wrk source lines
 mkmut no-prune-stop 's/stop_completion_sentinel "\$job" "\$pid"/: mutant removed prune stop/g'
 expect_mut_red "prune orphan-stop removal" case_prune_apply
+
+# Without the fallback, a delegated failure propagates rc and the local write
+# is skipped — the terminal record is lost (tester BLOCKER 1).
+# shellcheck disable=SC2016
+mkmut no-delegate-fallback '/warn "panewire job \$sub delegation failed/,+1d'
+expect_mut_red "delegation-fallback removal" case_delegate_fallback
+
+# Without the process sweep, stop_completion_sentinel trusts the pidfile only
+# — a second pidfile-less sentinel survives (tester BLOCKER 2).
+mkmut no-sweep 's/done < <(sentinel_sweep)/done < <(true)/g'
+expect_mut_red "sentinel-sweep removal" case_dual_sentinel
 
 echo "PASS test-wrk-job-end: all cases"

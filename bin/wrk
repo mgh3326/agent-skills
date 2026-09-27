@@ -3293,8 +3293,10 @@ PY
 # print exactly the token below. A missing binary, an older panewire (rc 2, no
 # output), any other output, or a probe that hangs keeps wrk's own path — the
 # probe has no side effects, so falling back after it can never duplicate an
-# event. Once handed over, wrk execs and runs nothing further of its own, so
-# the event is written by exactly one of the two paths. WRK_JOB_DELEGATE=0
+# event. The delegated call runs as a bounded subprocess — never exec — so
+# wrk-side end housekeeping can still run after the record lands, and a
+# failed or hung delegation falls back to wrk's own write path instead of
+# losing the terminal record (#770 tester BLOCKER 1). WRK_JOB_DELEGATE=0
 # forces wrk's own path (golden regeneration, rollback).
 JOB_PROBE_TOKEN="panewire-job/1"
 delegate_job_cmd() {
@@ -3303,16 +3305,23 @@ delegate_job_cmd() {
   [[ "${WRK_JOB_DELEGATE:-1}" != 0 ]] || return 0
   panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
   [[ -n "$panewire" ]] || return 0
-  local guard=(timeout 5)
+  local run_timeout="${WRK_JOB_DELEGATE_TIMEOUT_S:-30}"
+  local guard=(timeout 5) run_guard=(timeout "$run_timeout")
   if ! command -v timeout >/dev/null 2>&1; then
     if command -v gtimeout >/dev/null 2>&1; then
       guard=(gtimeout 5)
+      run_guard=(gtimeout "$run_timeout")
     else
       guard=(python3 -c 'import subprocess, sys
 try:
     sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
 except subprocess.TimeoutExpired:
     sys.exit(124)' 5)
+      run_guard=(python3 -c 'import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)' "$run_timeout")
     fi
   fi
   probe="$("${guard[@]}" "$panewire" job probe 2>/dev/null </dev/null)" || return 0
@@ -3320,12 +3329,22 @@ except subprocess.TimeoutExpired:
   # HOSTNAME is a shell variable bash does not necessarily export; the records
   # carry wrk's value, so hand it over explicitly.
   local rc=0
-  HOSTNAME="${HOSTNAME:-unknown}" "$panewire" job "$sub" "$@" || rc=$?
+  HOSTNAME="${HOSTNAME:-unknown}" "${run_guard[@]}" "$panewire" job "$sub" "$@" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    # #770 tester BLOCKER 1: the probe proved the binary understands the job
+    # verbs — it did not prove the delegated call will succeed or even return.
+    # A nonzero exit or a hang past the timeout must not take the terminal
+    # record down with it: warn and return to the caller so wrk's own path
+    # writes the same record. If the delegated write did land before dying,
+    # the local path's completion dedup suppresses the second write.
+    warn "panewire job $sub delegation failed or timed out (rc=$rc); using wrk's own path"
+    return 0
+  fi
   # #770: a delegated terminal path still needs wrk-side housekeeping — the
   # delegated binary wrote the record, but only wrk on this host can stop the
   # completion sentinel and release the arbiter quota_pool record. Same as
   # the local path: run it after the record lands, never mask the result.
-  if [[ "$rc" -eq 0 && ( "$sub" == "done" || "$sub" == "joined" ) ]]; then
+  if [[ "$sub" == "done" || "$sub" == "joined" ]]; then
     local d_job="${1:-}" d_meta="" d_owner=""
     if [[ -n "$d_job" && "$d_job" != -* ]]; then
       d_meta="$(completion_metadata "$d_job" 2>/dev/null || true)"
@@ -4348,44 +4367,78 @@ sentinel_pid_alive() {
   return 0
 }
 
+# sentinel_sweep — one TSV row per live `wrk sentinel …` process on the host:
+#   pid \t job \t owner \t label \t pane \t report
+# The process sweep is the only way to find a sentinel that has no pidfile
+# (respawned or second instance) — prune uses it to list, end paths use it
+# so no copy survives the job (tester BLOCKER 2).
+sentinel_sweep() {
+  ps axo pid=,args= 2>/dev/null | awk '
+    {
+      pid = $1
+      for (i = 2; i < NF; i++)
+        if ($i == "sentinel" && $(i - 1) ~ /(^|\/)wrk$/ && $(i + 1) != "") {
+          print pid "\t" $(i+1) "\t" $(i+2) "\t" $(i+3) "\t" $(i+4) "\t" $(i+5)
+          break
+        }
+    }' | sort -k2,2 -k1,1n
+}
+
 # stop_completion_sentinel JOB [PID] — stop and wait on the job's completion
-# sentinel and its interval sleep child. PID lets the process sweep reach
-# sentinels that have no pidfile; either way only an argv-verified sentinel is
-# signalled. The pidfile is removed regardless of outcome so a dead handle
-# never looks live.
+# sentinel and its interval sleep child. With an explicit PID only that
+# (argv-verified) process is signalled — prune uses it for one orphan row.
+# Without one, the pidfile pid AND every live `wrk sentinel JOB` the process
+# sweep finds are stopped: a respawned or second sentinel has no pidfile and
+# would otherwise outlive the end path (tester BLOCKER 2). The pidfile is
+# removed regardless of outcome so a dead handle never looks live.
 stop_completion_sentinel() {
   local job="$1" explicit_pid="${2:-}" jobdir pidfile pid child deadline
   jobdir="$(wrk_jobs_root)/$job"
   pidfile="$jobdir/completion-sentinel.pid"
-  pid=""
+  local -a pids=()
   if [[ -n "$explicit_pid" ]]; then
-    pid="$explicit_pid"
-  elif [[ -s "$pidfile" ]]; then
-    read -r pid <"$pidfile" || pid=""
+    pids=("$explicit_pid")
+  else
+    if [[ -s "$pidfile" ]]; then
+      local _pf=""
+      read -r _pf <"$pidfile" 2>/dev/null || _pf=""
+      [[ -n "$_pf" ]] && pids+=("$_pf")
+    fi
+    local _p _j _seen _dup
+    while IFS=$'\t' read -r _p _j _rest; do
+      [[ "$_j" == "$job" ]] || continue
+      _dup=0
+      for _seen in ${pids[@]+"${pids[@]}"}; do
+        [[ "$_seen" == "$_p" ]] && { _dup=1; break; }
+      done
+      (( _dup )) || pids+=("$_p")
+    done < <(sentinel_sweep)
   fi
-  if [[ "$pid" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$pid" "$job"; then
-    # Freeze first so a sentinel waking mid-stop cannot fork a new sleep
-    # between the child enumeration and the signal batch (the test suites'
-    # cleanup uses this same STOP → kill children → TERM → CONT order).
-    kill -STOP "$pid" 2>/dev/null || true
-    while IFS= read -r child; do
-      kill "$child" 2>/dev/null || true
-    done < <(pgrep -P "$pid" 2>/dev/null || true)
-    kill "$pid" 2>/dev/null || true
-    kill -CONT "$pid" 2>/dev/null || true
-    deadline=$(( $(date +%s) + ${WRK_SENTINEL_STOP_WAIT_S:-5} ))
-    while sentinel_pid_alive "$pid"; do
-      if (( $(date +%s) >= deadline )); then
-        kill -9 "$pid" 2>/dev/null || true
-        deadline=$(( $(date +%s) + 2 ))
-        while sentinel_pid_alive "$pid" && (( $(date +%s) < deadline )); do
-          sleep 0.1
-        done
-        break
-      fi
-      sleep 0.1
-    done
-  fi
+  for pid in ${pids[@]+"${pids[@]}"}; do
+    if [[ "$pid" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$pid" "$job"; then
+      # Freeze first so a sentinel waking mid-stop cannot fork a new sleep
+      # between the child enumeration and the signal batch (the test suites'
+      # cleanup uses this same STOP → kill children → TERM → CONT order).
+      kill -STOP "$pid" 2>/dev/null || true
+      while IFS= read -r child; do
+        kill "$child" 2>/dev/null || true
+      done < <(pgrep -P "$pid" 2>/dev/null || true)
+      kill "$pid" 2>/dev/null || true
+      kill -CONT "$pid" 2>/dev/null || true
+      deadline=$(( $(date +%s) + ${WRK_SENTINEL_STOP_WAIT_S:-5} ))
+      while sentinel_pid_alive "$pid"; do
+        if (( $(date +%s) >= deadline )); then
+          kill -9 "$pid" 2>/dev/null || true
+          deadline=$(( $(date +%s) + 2 ))
+          while sentinel_pid_alive "$pid" && (( $(date +%s) < deadline )); do
+            sleep 0.1
+          done
+          break
+        fi
+        sleep 0.1
+      done
+    fi
+  done
   rm -f "$pidfile" 2>/dev/null || true
   return 0
 }
@@ -6744,15 +6797,7 @@ prune_cmd() {
       [[ "$_pfpid" == "$_pid" ]] && continue
     fi
     prune_sentinel_row "$_job" "$_pid" - "$_pane" "$_owner"
-  done < <(ps axo pid=,args= 2>/dev/null | awk '
-    {
-      pid = $1
-      for (i = 2; i < NF; i++)
-        if ($i == "sentinel" && $(i - 1) ~ /(^|\/)wrk$/ && $(i + 1) != "") {
-          print pid "\t" $(i+1) "\t" $(i+2) "\t" $(i+3) "\t" $(i+4) "\t" $(i+5)
-          break
-        }
-    }' | sort -k2,2 -k1,1n)
+  done < <(sentinel_sweep)
 
   # Pass 3 — stale jobs: silent past --stale-age AND pane absent. Records are
   # kept; --apply only appends the hub-visible end declaration.

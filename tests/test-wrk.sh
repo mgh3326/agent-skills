@@ -5808,13 +5808,16 @@ diff "$TMP/j499-present-job.log" <(printf '%s\n' \
   fail "delegated joined must not also write wrk's record"
 [[ "$(j499_calls "$TMP/j499-present-emit.log")" == 0 ]] ||
   fail "delegated commands must not also run wrk's emit"
-# A failing delegated call surfaces its own status and wrk does not retry it.
+# A failing delegated call falls back to wrk's own write path (#770 tester
+# BLOCKER 1): the terminal record must not ride down with panewire's rc.
 rc=0
-WRK_PANEWIRE_JOB_RC=7 j499_run 1 present rc 'done' j499-worker --report "$J499_REPORT" >/dev/null 2>&1 || rc=$?
-[[ "$rc" == 7 ]] || fail "a failing panewire job must surface its own status, got rc=$rc"
-[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 0 &&
-   "$(j499_calls "$TMP/j499-rc-emit.log")" == 0 ]] ||
-  fail "a failing panewire job must not fall back to a second write"
+out="$(WRK_PANEWIRE_JOB_RC=7 j499_run 1 present rc 'done' j499-worker --report "$J499_REPORT" 2>&1)" || rc=$?
+[[ "$rc" == 0 ]] || fail "a failing delegated done must fall back to wrk's own path, got rc=$rc"
+printf '%s\n' "$out" | grep -q 'delegation failed' ||
+  fail "the fallback must warn on stderr: $out"
+[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 1 &&
+   "$(j499_calls "$TMP/j499-rc-emit.log")" == 1 ]] ||
+  fail "the fallback must write and emit the record exactly once, locally"
 # Help stays wrk's own even when panewire has the command.
 j499_run 1 present help escalate --help | grep -q '^Usage: wrk escalate JOB' ||
   fail "escalate --help must stay local"
