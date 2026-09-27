@@ -294,10 +294,10 @@ bound="$(hk_refs_job 1)"
 [[ "$(claim_count)" -ge 1 ]] || fail "concurrency: a claim must have run"
 echo "PASS c8 concurrent spawns serialize — exactly one binds the task"
 
-# C9: an arbiter claim that attempted and failed must not reach the link —
-# the task would bind to a job with no registered record (tester finding:
-# cold-db lock race left an hk winner without a job record). Distinct from
-# the arbiter-absent transition, which keeps the hk record as the only link.
+# C9: an arbiter claim that attempted and failed runs under the
+# installation-transition contract — the spawn continues unregistered and the
+# task still binds through hk, the durable record, with a loud note that the
+# job events carry no task_link entry (tester finding: cold-db lock race).
 reset_case c9
 hk_add --id 1 >/dev/null
 cat >"$TMP/arbiter-deny" <<'SH'
@@ -307,11 +307,26 @@ exit 0
 SH
 chmod +x "$TMP/arbiter-deny"
 spawn_try -e ARBITER_BIN="$TMP/arbiter-deny" -- --task 1 --job c9-job
-expect_rc 2 "arbiter claim failure must refuse the spawn at the link gate"
-expect_grep 'arbiter claim failed' "$TMP/stderr.txt" "the refusal must name the cause"
-no_claim "an unregistered job never binds the task"
-[[ "$(hk_field 1 state)" == backlog ]] || fail "task must stay unbound when the job claim failed"
-echo "PASS c9 arbiter-claim failure refuses before the hk bind"
+expect_rc 0 "claim failure stays under the transition contract — spawn continues"
+expect_grep 'arbiter claim failed' "$TMP/stderr.txt" "the unevidenced bind must be announced"
+[[ "$(hk_refs_job 1)" == c9-job ]] || fail "the hk bind is the durable record: $(hk_show 1)"
+[[ "$(hk_field 1 claimed_by)" == fixture ]] || fail "task must be claimed by the spawned label"
+echo "PASS c9 claim-failed spawn binds via hk with a loud note"
+
+# C9b: the same claim failure plus a post-pane die must not leak the pane —
+# the cleanup trap is armed at spawn start, not only after a quota lease
+# (tester finding: the losing pane survived its spawn failure).
+reset_case c9b
+cat >"$TMP/arbiter-deny2" <<'SH'
+#!/bin/sh
+[ "$1" = claim ] && exit 3
+exit 0
+SH
+chmod +x "$TMP/arbiter-deny2"
+SCENARIO=agent-never-foreground spawn_try -e ARBITER_BIN="$TMP/arbiter-deny2" -- --task 1 --job c9b-job
+[[ "$SPAWN_RC" -ne 0 ]] || fail "post-pane failure must still die"
+expect_grep 'closed leftover pane' "$TMP/stderr.txt" "the pane must be closed even without a lease"
+echo "PASS c9b no-lease post-pane failure still closes the pane"
 
 # C10: --task-hk-bypass must not launder a reachable failure. An hk that was
 # reachable at precheck and answers the claim while dropping refs.job_id is

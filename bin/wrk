@@ -5388,13 +5388,13 @@ PY
 # winner: the losing spawn dies here and its pane is cleaned by the EXIT trap.
 hk_task_link() {
   [[ -n "$TASK_ID" ]] || return 0
-  # An arbiter claim attempted but failed (a locked/partial db is not the
-  # installation-transition absence): binding the task to a job whose own
-  # record never landed would dangle the link — refuse instead. A pure
-  # arbiter-absent transition keeps the hk record as the only link, same as
-  # the other no-arbiter paths.
-  [[ "${ARBITER_CLAIM_FAILED:-0}" -ne 1 ]] ||
-    die "arbiter claim failed for job $JOB_ID — refusing to bind task $TASK_ID to an unregistered job (pane and quota record are being released)"
+  # A claim that attempted and failed runs under the installation-transition
+  # contract: the spawn continued without registration, so bind the task
+  # through hk anyway — it is the durable record — and say so loudly rather
+  # than silently leaving the bind unevidenced in the arbiter events.
+  if [[ "${ARBITER_CLAIM_FAILED:-0}" -eq 1 ]]; then
+    warn "arbiter claim failed for job $JOB_ID; binding task $TASK_ID via hk as the durable record — the job events will not carry a task_link entry (unregistered job)"
+  fi
   # Inherited children never claim: the owner's record stands. Even when a
   # bypass flag degraded the precheck to bypassed:*, the link write stays
   # owner-only — the outcome is recorded, the task is untouched.
@@ -5449,6 +5449,11 @@ spawn_cmd() {
   OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
+  # Armed once for the whole spawn: both cleanup actions are guarded (pane
+  # only when SPAWN_PANE_OPEN/PANE are set, quota release only when
+  # ARBITER_HELD=1), so a die anywhere after the pane opens cannot leak it —
+  # including the no-lease path where the arbiter claim or record failed.
+  trap 'spawn_pane_cleanup; arbiter_release_held' EXIT
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;

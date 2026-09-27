@@ -4471,6 +4471,7 @@ R20_ABSENT_ERR="$TMP/r20-absent.err"
 r20_claim r20-absent
 set +e
 r20_absent_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" PANEWIRE_BIN="$TMP/absent-panewire" \
+  HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' r20-absent --report "$R20_REPORT" 2>"$R20_ABSENT_ERR")"
 r20_absent_rc=$?
 set -e
@@ -4491,6 +4492,7 @@ R20_FAIL_ERR="$TMP/r20-fail.err"
 r20_claim r20-fail
 set +e
 r20_fail_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" WRK_PANEWIRE_RC=3 \
+  HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' r20-fail --report "$R20_REPORT" 2>"$R20_FAIL_ERR")"
 r20_fail_rc=$?
 set -e
