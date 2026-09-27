@@ -2198,7 +2198,7 @@ expect_mut_red "J04 local-joined-housekeeping" case_joined
 
 # J05: delegated joined gate narrows to done only
 # shellcheck disable=SC2016
-mkmut j05-delegated-join-skip 's~"done" \|\| "\$sub" == "joined"~"done"~'
+mkmut j05-delegated-join-skip 's~"done" || "\$sub" == "joined"~"done"~'
 expect_mut_red "J05 delegated-joined-gate" case_delegate_joined
 
 # J06: duplicate/partial joined housekeeping
