@@ -3372,7 +3372,9 @@ joined_cmd() {
 ROUND_CAP_DEFAULT=3
 # Operator identities allowed to issue a round-cap extension approval.
 # Space-separated; the job's parent lane is always accepted on top of these.
-ROUND_CAP_OPERATORS="${WRK_ROUND_CAP_OPERATORS:-operator operator-desk mac-personal}"
+# Fixed in the source: a builder must not be able to widen the trusted issuer
+# set through its own environment, or it could approve its own records.
+ROUND_CAP_OPERATORS="operator operator-desk mac-personal"
 ROUND_CAP_REASON="tester round cap reached"
 
 round_help() {
@@ -3527,46 +3529,45 @@ round_cap_event() {
 import fcntl, json, os, sys, tempfile
 events, job, owner, label, pane, parent, host, head, cap = sys.argv[1:]
 cap = int(cap)
-names = []
-try:
-    names = sorted(os.listdir(events))
-except OSError:
-    pass
-records = []
-for name in names:
-    if not name.endswith(".json"):
-        continue
-    try:
-        with open(os.path.join(events, name), encoding="utf-8") as f:
-            records.append(json.load(f))
-    except (OSError, ValueError):
-        continue
-verdicts = [r for r in records if r.get("kind") == "job.verdict"]
-used = sum(1 for r in records if r.get("kind") == "job.round")
-used += sum(1 for r in verdicts if not isinstance(r.get("round"), int))
-last = verdicts[-1] if verdicts else {}
-lv = "-"
-if last.get("verdict") and last.get("head"):
-    lv = "%s@%s" % (last["verdict"], last["head"])
-findings = last.get("path") or ""
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    # Dedupe must re-read inside the lock: the snapshot above is stale and two
-    # refusals racing on it would otherwise each think they are first.
-    for name in os.listdir(events):
+    # All state is read under the lock: a stale snapshot would let two racing
+    # refusals each think they are first, and a rounds count read before the
+    # lock could hide that an extension grant added rounds since.
+    records = []
+    try:
+        names = sorted(os.listdir(events))
+    except OSError:
+        names = []
+    for name in names:
         if not name.endswith(".json"):
             continue
         try:
             with open(os.path.join(events, name), encoding="utf-8") as f:
-                r = json.load(f)
+                records.append(json.load(f))
         except (OSError, ValueError):
             continue
-        if r.get("kind") == "job.escalate" and r.get("reason") == "tester round cap reached":
+    verdicts = [r for r in records if r.get("kind") == "job.verdict"]
+    used = sum(1 for r in records if r.get("kind") == "job.round")
+    used += sum(1 for r in verdicts if not isinstance(r.get("round"), int))
+    last = verdicts[-1] if verdicts else {}
+    lv = "-"
+    if last.get("verdict") and last.get("head"):
+        lv = "%s@%s" % (last["verdict"], last["head"])
+    findings = last.get("path") or ""
+    # Dedupe is scoped to the rounds count: a repeated refusal at the same
+    # count is a duplicate, but a refusal at a higher count — rounds an
+    # extension grant added since the last escalate — is a new signal the
+    # parent must see. #745 was a stop nobody read.
+    for r in records:
+        if (r.get("kind") == "job.escalate"
+                and r.get("reason") == "tester round cap reached"
+                and isinstance(r.get("rounds"), int) and r["rounds"] >= used):
             print("duplicate")
             raise SystemExit(0)
     highest = 0
-    for name in os.listdir(events):
+    for name in names:
         try:
             highest = max(highest, int(name.split("-", 1)[0]))
         except (ValueError, IndexError):

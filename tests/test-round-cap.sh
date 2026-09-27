@@ -16,7 +16,9 @@ export XDG_DATA_HOME="$TMP/xdg"
 export WRK_NO_SLEEP=1
 export WRK_JOB_DELEGATE=0
 export PANEWIRE_BIN="$TMP/absent-panewire"
-export WRK_ROUND_CAP_OPERATORS="operator operator-desk mac-personal"
+# The operator set is fixed in the wrk source; exporting job lanes here must be
+# ignored — a builder must not widen the trusted issuers through its own env.
+export WRK_ROUND_CAP_OPERATORS="je-lane jx-lane jg-lane selfish-lane"
 
 H1=1111111111111111111111111111111111111111
 H2=2222222222222222222222222222222222222222
@@ -78,6 +80,7 @@ if [[ "$1 $2" == "doc get" ]]; then
     opdoc)   printf '{"session":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator\\n"}' ;;
     opgood)  printf '{"session":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator-desk\\n"}' ;;
     badws)   printf '{"session":"director-1","body":"  round-extension :  job=JOB\\textra=1\\tby=director-1  \\n"}' ;;
+    selfops) printf '{"session":"JOB-lane","body":"round-extension: job=JOB extra=5 by=JOB-lane\\n"}' ;;
     nogrant) printf '{"session":"director-1","body":"looks approved but no grant line\\n"}' ;;
     *) printf 'not_found' ;;
   esac
@@ -192,6 +195,7 @@ expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/forged   # own ses
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/wrongj   # grant names another job
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/opdoc    # by=operator but session is operator-desk
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/badws    # noncanonical grant whitespace
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/selfops  # own lane in WRK_ROUND_CAP_OPERATORS must be ignored
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/nogrant  # no grant line
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/92      # comment author is the builder
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:bogus/x      # unknown ref scheme
@@ -205,9 +209,15 @@ mkjob jx
 mk_hk jx
 export HANDOFFKEEP_BIN="$TMP/hk-jx"
 for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jx "$h"; done
+expect_rc 78 "$WRK" round open jx --head "$H4"                         # first refusal: escalate at rounds=3
+[[ "$(escalate_count "$ARBITER_INBOX_ROOT/jx/events")" == 1 ]] ||
+  fail "first cap refusal must emit the cap escalate"
 "$WRK" round open jx --head "$H4" --extend hk:doc/good2 >/dev/null
 "$WRK" round open jx --head "$H4" --extend hk:doc/good2 >/dev/null
-expect_rc 78 "$WRK" round open jx --head "$H4" --extend hk:doc/good2   # grant exhausted
+expect_rc 78 "$WRK" round open jx --head "$H4" --extend hk:doc/good2   # grant exhausted: escalate again at rounds=5
+expect_rc 78 "$WRK" round open jx --head "$H4" --extend hk:doc/good2   # same count stays deduplicated
+[[ "$(escalate_count "$ARBITER_INBOX_ROOT/jx/events")" == 2 ]] ||
+  fail "a refusal at a higher count must reach the parent again (got $(escalate_count "$ARBITER_INBOX_ROOT/jx/events"))"
 status="$("$WRK" round status jx)"
 grep -q 'rounds=5' <<<"$status" || fail "extension rounds not counted: $status"
 python3 - "$ARBITER_INBOX_ROOT/jx/events" <<'PY'
@@ -217,6 +227,9 @@ ext = [e for e in evs if e["kind"] == "job.round" and e.get("approval")]
 assert len(ext) == 2, ext
 for e in ext:
     assert e["approval"] == {"ref": "hk:doc/good2", "issuer": "director-1", "extra": 2}, e
+esc = [e for e in evs
+       if e["kind"] == "job.escalate" and e["reason"] == "tester round cap reached"]
+assert [e["rounds"] for e in esc] == [3, 5], esc
 PY
 echo "PASS extension-doc-grant-consumed-per-round"
 
@@ -296,6 +309,8 @@ for anchor in (
     'r"^round-extension: job=(\\S+) extra=(\\d+) by=(\\S+)$"',
     "{40})\\s*$",
     "if len(matches) > 1:",
+    'ROUND_CAP_OPERATORS="operator operator-desk mac-personal"',
+    "                and isinstance(r.get(\"rounds\"), int) and r[\"rounds\"] >= used):",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -414,5 +429,43 @@ set -e
 [[ "$rc" -eq 0 ]] ||
   fail "mutant multi still refused the ambiguous verdict (rc=$rc) — ambiguity assertion is vacuous"
 echo "PASS mutant-multi"
+
+# mutant: the operator set becomes env-widenable again — a builder adds its own
+# lane and its own doc grants itself. RED proof: selfops must grant (rc=0).
+# shellcheck disable=SC2016 # the ${...} text is mutant-spec data, not an expansion
+printf 'ROUND_CAP_OPERATORS="operator operator-desk mac-personal" => ROUND_CAP_OPERATORS="${WRK_ROUND_CAP_OPERATORS:-operator operator-desk mac-personal}"\n' >"$TMP/spec-envops"
+mutant envops "$TMP/spec-envops"
+jme2="mut-eo"
+mkjob "$jme2"
+mk_hk "$jme2"
+export HANDOFFKEEP_BIN="$TMP/hk-$jme2"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/envops-wrk" "$jme2" "$h"; done
+set +e
+WRK_ROUND_CAP_OPERATORS="$jme2-lane" "$TMP/envops-wrk" round open "$jme2" --head "$H4" --extend hk:doc/selfops >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant envops did not accept the self-approval (rc=$rc) — fixed-operator-set assertion is vacuous"
+echo "PASS mutant-envops"
+
+# mutant: dedupe ignores the rounds count — any earlier cap escalate suppresses
+# a later refusal at a higher count. RED proof: second escalate count stays 1.
+printf '                and isinstance(r.get("rounds"), int) and r["rounds"] >= used): =>                 and isinstance(r.get("rounds"), int)):\n' >"$TMP/spec-dupsame"
+mutant dupsame "$TMP/spec-dupsame"
+jmd="mut-ds"
+mkjob "$jmd"
+mk_hk "$jmd"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmd"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/dupsame-wrk" "$jmd" "$h"; done
+set +e
+"$TMP/dupsame-wrk" round open "$jmd" --head "$H4" >/dev/null 2>&1
+set -e
+"$TMP/dupsame-wrk" round open "$jmd" --head "$H4" --extend hk:doc/good2 >/dev/null
+set +e
+"$TMP/dupsame-wrk" round open "$jmd" --head "$H4" >/dev/null 2>&1
+set -e
+[[ "$(escalate_count "$ARBITER_INBOX_ROOT/$jmd/events")" == 1 ]] ||
+  fail "mutant dupsame still emitted the higher-count escalate — dedupe assertion is vacuous"
+echo "PASS mutant-dupsame"
 
 echo "ALL PASS round-cap"
