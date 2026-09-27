@@ -35,7 +35,7 @@ TMP="$(mktemp -d)"
 # logs), so the ps scan matches exactly this run; $$ and its live children
 # are excluded so the sweep cannot hit itself or the caller.
 cleanup() {
-  local pidfile pid child stray i
+  local pidfile pid child snap stray i
   while IFS= read -r pidfile; do
     [[ -s "$pidfile" ]] || continue
     read -r pid <"$pidfile" || continue
@@ -47,9 +47,9 @@ cleanup() {
     kill -CONT "$pid" 2>/dev/null || true
   done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
   for ((i = 0; i < 100; i++)); do
-    stray="$(ps axeww -o pid= -o ppid= -o command= 2>/dev/null |
-      awk -v self="$$" -v tmp="$TMP" \
-        'index($0, tmp) && $1 != self && $2 != self {print $1}')" || true
+    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
+    stray="$(awk -v self="$$" -v tmp="$TMP" \
+      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
     [[ -n "$stray" ]] || break
     while IFS= read -r pid; do
       [[ "$pid" =~ ^[0-9]+$ ]] || continue

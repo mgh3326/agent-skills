@@ -53,11 +53,11 @@ cleanup() {
   # $TMP (ARBITER_INBOX_ROOT/XDG_DATA_HOME/HK_STATE/fixture logs), so the ps
   # scan below matches exactly this run; $$ and its live children are
   # excluded so the sweep cannot hit itself or the caller.
-  local stray pid i
+  local snap stray pid i
   for ((i = 0; i < 100; i++)); do
-    stray="$(ps axeww -o pid= -o ppid= -o command= 2>/dev/null |
-      awk -v self="$$" -v tmp="$TMP" \
-        'index($0, tmp) && $1 != self && $2 != self {print $1}')" || true
+    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
+    stray="$(awk -v self="$$" -v tmp="$TMP" \
+      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
     [[ -n "$stray" ]] || break
     while IFS= read -r pid; do
       [[ "$pid" =~ ^[0-9]+$ ]] || continue

@@ -41,7 +41,7 @@ TMP="$(mktemp -d)"
 # a killed sentinel leaves its interval `sleep` (and any in-flight probe)
 # orphaned. Kill all of them and wait until none remain, then rm.
 stop_tmp_writers() {
-  local pidfile pid child stray i
+  local pidfile pid child snap stray i
   # Sentinels are named exactly by their pidfile. STOP first so one cannot
   # fork a fresh probe/sleep child between the child sweep and the TERM.
   while IFS= read -r pidfile; do
@@ -61,9 +61,9 @@ stop_tmp_writers() {
   # (state.db + journal under $TMP/xdg). Excluding $$ and its current
   # children keeps the match scoped to this run's detached procs only.
   for ((i = 0; i < 100; i++)); do
-    stray="$(ps axeww -o pid= -o ppid= -o command= 2>/dev/null |
-      awk -v self="$$" -v tmp="$TMP" \
-        'index($0, tmp) && $1 != self && $2 != self {print $1}')" || true
+    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
+    stray="$(awk -v self="$$" -v tmp="$TMP" \
+      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
     [[ -n "$stray" ]] || return 0
     while IFS= read -r pid; do
       [[ "$pid" =~ ^[0-9]+$ ]] || continue

@@ -55,11 +55,11 @@ cleanup() {
   # HK_STATE·fixture 로그 경로)를 물려받으므로 전체 ps 스캔이 정확히 이 run
   # 에만 매치된다. $$ 와 현재 자식들을 제외해 파이프라인 자기 자신과
   # 부모(wrk heavy·CI bash)를 치지 않는다.
-  local stray i
+  local snap stray i
   for ((i = 0; i < 100; i++)); do
-    stray="$(ps axeww -o pid= -o ppid= -o command= 2>/dev/null |
-      awk -v self="$$" -v tmp="$TMP" \
-        'index($0, tmp) && $1 != self && $2 != self {print $1}')" || true
+    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
+    stray="$(awk -v self="$$" -v tmp="$TMP" \
+      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
     [[ -n "$stray" ]] || break
     while IFS= read -r pid; do
       [[ "$pid" =~ ^[0-9]+$ ]] || continue
