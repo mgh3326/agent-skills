@@ -695,8 +695,17 @@ block 밖의 문장은 이 IDs를 약화·재정의할 수 없으며, prose-cont
    계약 위반) / `SHOULD` / `NICE`.
    - **`BLOCKER`만 재작업 라운드를 트리거한다.** `SHOULD`·`NICE`는 후속 이슈로 기록하고
      **머지를 막지 않는다.**
-   - **하드 캡 3라운드.** 초과하면 코드가 아니라 설계가 불명확하다는 신호다 — 루프를 계속
-     돌리지 말고 운영자에게 에스컬레이션한다.
+   - **하드 캡 3라운드 — `wrk round` 가 센다(#758).** 한 라운드 = 한 head 에 대한 tester
+     verdict 1건. 빌더는 라운드 지시 전에 `wrk round open <job> --head <40-hex sha>` 로 열고,
+     verdict 파일이 오면 `wrk round verdict <job> --file <path>` 로 기록한다. 카운트의 정본은
+     job 의 `events/` 스트림의 `job.round`·`job.verdict` 레코드뿐이다 — 라운드 이름(r5b 등
+     하위 명명)은 카운트를 바꾸지 못하고, 열린 라운드 없이 기록된 verdict 도 한 라운드로 센다.
+     상한에서 `open`은 rc 78 로 거부되고 head·마지막 verdict·findings 경로를 담은
+     `job.escalate` 가 parent 로 나간다 — 빌더는 멈추고 대기한다(루프가 pane 의 STOP 을 읽기에
+     의존해 R20 까지 간 #745, 허용 마지막 라운드를 4개의 하위 라운드로 돌린 #746 의 차단).
+     연장은 hk 승인 기록(`round-extension: job=<job> extra=N by=<parent lane|operator>` —
+     issuer 는 레코드의 session·author 와 일치)을 `wrk round open --extend hk:doc/<key>`·
+     `hk:task/<id>` 로 검증할 때만 되고, 건당 1라운드씩만 소진된다.
    - 심각도 하한이 없으면 적대tester는 항상 무언가를 찾아내고 수렴이 무한히 늦어진다
      (07-31 실측: 개선 제안 하나가 풀 라운드를 트리거해 4과제 16라운드).
 5. 부재/미완 단정("테스트 없음"·"미배선")은 전수 탐색 후에만 보고에 인용.
