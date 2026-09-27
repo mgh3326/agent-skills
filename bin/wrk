@@ -3159,6 +3159,15 @@ emit_relay_event() {
   local kind="$1" job="$2" owner="$3" label="$4" pane="$5" host="$6" report="$7"
   local last="$8" reason="$9" question="${10}" pr="${11}" head="${12}"
   local panewire rc=0
+  # #770 round-2: a panewire subprocess that was just killed by its timeout is
+  # wedged — re-entering it for emit would stall this call by another full
+  # emit guard (tester: sleeping stub made `wrk done` take delegate-timeout +
+  # 5s). The record already landed on disk; the daemon rescan picks it up.
+  if [[ "${PANEWIRE_WEDGED:-}" == 1 ]]; then
+    warn "panewire emit skipped: panewire timed out earlier this invocation (job=$job kind=$kind)"
+    record_emit_failure "$job" "$kind" "delegate_timeout"
+    return 0
+  fi
   panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
   if [[ -z "$panewire" ]]; then
     warn "panewire not found; relay event left as file only (job=$job kind=$kind)"
@@ -3324,7 +3333,14 @@ except subprocess.TimeoutExpired:
     sys.exit(124)' "$run_timeout")
     fi
   fi
-  probe="$("${guard[@]}" "$panewire" job probe 2>/dev/null </dev/null)" || return 0
+  local prc=0
+  probe="$("${guard[@]}" "$panewire" job probe 2>/dev/null </dev/null)" || prc=$?
+  if [[ "$prc" -ne 0 ]]; then
+    # A probe killed by its own guard means the daemon is wedged, not absent —
+    # emit_relay_event must not re-enter it inside this same invocation.
+    if [[ "$prc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    return 0
+  fi
   [[ "$probe" == "$JOB_PROBE_TOKEN" ]] || return 0
   # HOSTNAME is a shell variable bash does not necessarily export; the records
   # carry wrk's value, so hand it over explicitly.
@@ -3336,7 +3352,10 @@ except subprocess.TimeoutExpired:
     # A nonzero exit or a hang past the timeout must not take the terminal
     # record down with it: warn and return to the caller so wrk's own path
     # writes the same record. If the delegated write did land before dying,
-    # the local path's completion dedup suppresses the second write.
+    # the local path's completion dedup suppresses the second write. On a
+    # timeout the daemon is wedged — mark it so emit_relay_event does not
+    # stall this invocation on another doomed panewire call.
+    if [[ "$rc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
     warn "panewire job $sub delegation failed or timed out (rc=$rc); using wrk's own path"
     return 0
   fi

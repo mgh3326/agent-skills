@@ -462,6 +462,9 @@ wait_until 8 pid_gone "$SENTINEL_PID" ||
   { kill -9 "$SENTINEL_PID" 2>/dev/null; fail "JE15a: sentinel survived"; }
 
 # JE15b — a panewire that hangs on the real call must be bounded, not block.
+# The delegated call is killed at WRK_JOB_DELEGATE_TIMEOUT_S=2 and the emit
+# must not re-enter the wedged binary for another 5s stall (round-2 finding:
+# without the wedge check this took delegate-timeout + 5s ≈ 8s).
 reset_case je15b
 mk_job je15-hang
 REPORT="$TMP/je15b-report.md"; printf 'x\n' >"$REPORT"
@@ -477,9 +480,11 @@ out="$(env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
   WRK_JOB_DELEGATE_TIMEOUT_S=2 \
   "$WRK" 'done' je15-hang --report "$REPORT" 2>&1)" || fail "JE15b: done must survive a hung delegation"
 elapsed=$(( $(date +%s) - start_ts ))
-(( elapsed < 30 )) || fail "JE15b: hung delegation blocked $elapsed seconds (timeout was 2)"
+(( elapsed < 7 )) || fail "JE15b: hung delegation blocked $elapsed seconds (timeout was 2)"
 event_count_is "$INBOX/je15-hang/events" job.completed 1 ||
   fail "JE15b: the terminal record must be written after the timeout"
+printf '%s\n' "$out" | grep -q 'emit skipped' ||
+  { printf '%s\n' "$out"; fail "JE15b: emit must not re-enter the wedged binary"; }
 echo "PASS je15 delegation-failure-and-hang-fallback"
 
 echo "== JE16: wrk done stops every sentinel of the job, not just the pidfile's =="
@@ -626,6 +631,27 @@ case_dual_sentinel() {
   wait_until 8 pid_gone "$sent_a" && wait_until 4 pid_gone "$sent_b"
 }
 
+case_delegate_hang() {
+  reset_case mut-hang
+  mk_job mut-hang
+  REPORT="$TMP/mut-hang-report.md"; printf 'x\n' >"$REPORT"
+  local stub="$TMP/mut-pw-hang-stub"
+  cat >"$stub" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+sleep 60
+EOF
+  chmod +x "$stub"
+  local start_ts elapsed
+  start_ts=$(date +%s)
+  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$stub" \
+    WRK_JOB_DELEGATE_TIMEOUT_S=2 \
+    "$WRK" 'done' mut-hang --report "$REPORT" >/dev/null 2>&1 || true
+  elapsed=$(( $(date +%s) - start_ts ))
+  (( elapsed < 7 )) && event_count_is "$INBOX/mut-hang/events" job.completed 1
+}
+
 case_partial_joined() {
   reset_case mut-pjoined
   mk_builder_job mut-pjoined
@@ -681,5 +707,11 @@ expect_mut_red "sentinel-sweep removal" case_dual_sentinel
 # shellcheck disable=SC2016
 mkmut no-joined-dedup 's/"\$joined_term" == "job.joined"/"$joined_term" == "-never-"/'
 expect_mut_red "joined-dedup removal" case_partial_joined
+
+# Without the wedge check the emit re-enters the timed-out binary and the
+# whole call stalls past the bound (round-2 finding: ~8.5s vs ~3s).
+# shellcheck disable=SC2016
+mkmut no-wedge-skip 's/\${PANEWIRE_WEDGED:-}" == 1/\${PANEWIRE_WEDGED:-}" == 0/'
+expect_mut_red "emit wedge-skip removal" case_delegate_hang
 
 echo "PASS test-wrk-job-end: all cases"
