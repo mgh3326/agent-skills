@@ -1431,8 +1431,22 @@ spawn_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARB
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
   "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l je35 --t T1 \
   --task 1 --job je35 2>&1)" || fail "JE35: spawn failed: $spawn_out"
-[[ "$(sentinel_count je35)" -eq 1 ]] ||
+# The new sentinel is forked inside start_completion_sentinel's subshell before
+# spawn returns, but its argv only reaches the final `wrk sentinel JOB` shape
+# after the nohup/env exec chain settles — on a loaded shared runner that can
+# lag the return by tens of ms, so poll rather than sample once. A suppressing
+# mutant never spawns one, so the bound preserves RED.
+# shellcheck disable=SC2329 # invoked indirectly via wait_until
+je35_sentinel_up() { [[ "$(sentinel_count je35)" -eq 1 ]]; }
+if ! wait_until 15 je35_sentinel_up; then
+  echo "JE35 diagnostic: ps sentinel rows:" >&2
+  # shellcheck disable=SC2009 # the diagnostic needs the full args column
+  ps axo pid=,args= 2>/dev/null | grep -F 'sentinel' | head -10 >&2
+  echo "JE35 diagnostic: pidfile=$(cat "$INBOX/je35/completion-sentinel.pid" 2>&1)" >&2
+  echo "JE35 diagnostic: sentinel log tail:" >&2
+  tail -10 "$INBOX/je35/completion-sentinel.log" 2>/dev/null >&2 || true
   fail "JE35: the reused-pid pidfile must not suppress a new sentinel start"
+fi
 NEW_PID="$(head -n 1 "$INBOX/je35/completion-sentinel.pid")"
 [[ "$NEW_PID" =~ ^[0-9]+$ && "$NEW_PID" != "$J35_SLEEP" ]] ||
   fail "JE35: the pidfile must be replaced by the new sentinel's pid"
@@ -1462,8 +1476,10 @@ start_via_lib() {
 mkdir -p "$INBOX/je36"
 J36_PF="$INBOX/je36/completion-sentinel.pid"
 start_via_lib "$J36_PF" je36 lane-a lbl w:p1 "$REPORT"
-sleep 0.5
-[[ "$(sentinel_count je36)" -eq 1 ]] ||
+# shellcheck disable=SC2329 # invoked indirectly via wait_until
+je36_sentinel_up() { [[ "$(sentinel_count je36)" -eq 1 ]]; }
+# Same exec-window race as JE35 — poll rather than sample once.
+wait_until 15 je36_sentinel_up ||
   fail "JE36: the first start must produce exactly one sentinel"
 J36_PID="$(head -n 1 "$J36_PF")"; own "$J36_PID"
 start_via_lib "$J36_PF" je36 lane-a lbl w:p1 "$REPORT"
@@ -2145,7 +2161,12 @@ case_spawn_reused_pidfile() {
     WRK_REFRESH_LOG="$TMP/mut-spawnreuse-refresh.log" \
     "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l mut-spawnreuse --t T1 \
     --task 1 --job mut-spawnreuse >/dev/null 2>&1 || return 3
-  [[ "$(sentinel_count mut-spawnreuse)" -eq 1 ]] || return 1
+  # The sentinel's argv reaches its final `wrk sentinel JOB` shape only after
+  # the nohup/env exec chain settles; sample once under load and a real spawn
+  # can read 0. Poll — a suppressing mutant stays 0 for the whole window.
+  # shellcheck disable=SC2329 # invoked indirectly via wait_until
+  mut_spn_up() { [[ "$(sentinel_count mut-spawnreuse)" -eq 1 ]]; }
+  wait_until 10 mut_spn_up || return 1
   kill -0 "$victim" 2>/dev/null || return 1
 }
 
@@ -2169,6 +2190,9 @@ case_second_start() {
     WRK_COMPLETION_INTERVAL_S=3600 WRK_LIBFILE="$lib" \
     bash -c '. "$WRK_LIBFILE"; start_completion_sentinel "$@"' "$WRK" \
     "$pf" mut-2nd lane-a lbl w:p1 "$REPORT" || return 3
+  sleep 0.5
+  # Settle past the second sentinel's nohup/env exec window before counting —
+  # under the I06 mutant it exists, and a transient 1 would read as fixed.
   sleep 0.5
   [[ "$(sentinel_count mut-2nd)" -eq 1 ]] || return 1
   [[ "$(head -n 1 "$pf")" == "$first_pid" ]] || return 1
