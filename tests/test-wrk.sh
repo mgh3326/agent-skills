@@ -45,6 +45,28 @@ cleanup() {
     if (( $(date +%s) >= deadline )); then break; fi
     sleep 0.2
   done
+  # kill만으로는 부족하다 — TERM 받은 프로세스가 아직 쓰기 중일 수 있고,
+  # refresh_quota_pool 의 분리된 supervisor(`python3 - <scopefuel> …` ->
+  # setsid -> `scopefuel refresh <pool> --background`)는 pidfile 없이
+  # WRK_REFRESH_LOG 를 덧붙인다. 죽인 뒤 rm 이 디렉터리를 걸으면서 재생성된
+  # 엔트리를 만나면 rm -rf 가 "Directory not empty" 로 실패한다(CI runs
+  # 36283072131/36288704921). 이 스위트가 띄운 모든 detached 프로세스는
+  # $TMP 아래를 가리키는 export 된 env(XDG_DATA_HOME·ARBITER_INBOX_ROOT·
+  # HK_STATE·fixture 로그 경로)를 물려받으므로 전체 ps 스캔이 정확히 이 run
+  # 에만 매치된다. $$ 와 현재 자식들을 제외해 파이프라인 자기 자신과
+  # 부모(wrk heavy·CI bash)를 치지 않는다.
+  local stray i
+  for ((i = 0; i < 100; i++)); do
+    stray="$(ps axeww -o pid= -o ppid= -o command= 2>/dev/null |
+      awk -v self="$$" -v tmp="$TMP" \
+        'index($0, tmp) && $1 != self && $2 != self {print $1}')" || true
+    [[ -n "$stray" ]] || break
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      if ((i >= 50)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
+    done <<<"$stray"
+    sleep 0.1
+  done
   rm -rf "$TMP"
   # 회귀 게이트: teardown 이 센티널 자식을 놓치면 조용히 새는 게 아니라 스위트가
   # 실패해야 한다.

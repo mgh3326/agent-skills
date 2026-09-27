@@ -43,6 +43,28 @@ cleanup() {
   local after
 
   stop_test_sentinels
+  # kill only signals — a TERM'd sentinel can still be mid-write (its own log,
+  # the fixture herdr log a probe appends to, or an `arbiter release` writing
+  # state.db under $TMP/xdg), and refresh_quota_pool's detached supervisor
+  # (`python3 - <scopefuel> …` -> setsid -> `scopefuel refresh --background`)
+  # carries no pidfile for find to name. A dentry recreated while rm walks the
+  # tree exits rm -rf with "Directory not empty" (CI runs 36283072131 /
+  # 36288704921). Everything this suite detached inherits env pointing under
+  # $TMP (ARBITER_INBOX_ROOT/XDG_DATA_HOME/HK_STATE/fixture logs), so the ps
+  # scan below matches exactly this run; $$ and its live children are
+  # excluded so the sweep cannot hit itself or the caller.
+  local stray pid i
+  for ((i = 0; i < 100; i++)); do
+    stray="$(ps axeww -o pid= -o ppid= -o command= 2>/dev/null |
+      awk -v self="$$" -v tmp="$TMP" \
+        'index($0, tmp) && $1 != self && $2 != self {print $1}')" || true
+    [[ -n "$stray" ]] || break
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      if ((i >= 50)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
+    done <<<"$stray"
+    sleep 0.1
+  done
   after="$(real_jobs_count)"
   rm -rf "$TMP"
   if [[ "$after" != "$REAL_JOBS_BEFORE" ]]; then
