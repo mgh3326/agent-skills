@@ -218,6 +218,50 @@ assert any(w >= 0.4 for w in waits), ("no run logged a real wait", waits)
 PY
 echo "PASS heavy-log-fields"
 
+# ── WRK_HEAVY_HELD: nested runs bypass, forged env does not ───────────────
+# the strongest forgery: a live ANCESTOR pid written into an unheld slot —
+# text alone used to pass nested detection and skip slot + log (#772 r1).
+printf 'pid=%d since=x job=- cmd=forged\n' $$ >"$WRK_HEAVY_LOCK"
+set +e
+out="$(WRK_HEAVY_HELD="$WRK_HEAVY_LOCK:$$" heavy_run "$CFGNOKEY" -- touch "$TMP/forge-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && -e "$TMP/forge-ran" ]] || fail "forged-env run failed: rc=$rc $out"
+! grep -q 'already holding' <<<"$out" ||
+  fail "unheld slot text + live ancestor pid triggered the nested path: $out"
+python3 - "$WRK_HEAVY_LOG" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+runs = [r for r in rows if r.get("kind") == "run" and "forge-ran" in r.get("cmd", "")]
+assert runs, "forged-env run bypassed acquisition logging"
+PY
+# a real holder's pid forged by a non-ancestor must queue, not nest
+printf 'touch "%s"\nsleep 6\n' "$TMP/rh-held" >"$TMP/rh.sh"
+heavy_run "$CFGNOKEY" -- bash "$TMP/rh.sh" &
+prh=$!
+wait_until 10 test -f "$TMP/rh-held" || fail "real holder never started"
+rp="$(slot_holder_pid "$WRK_HEAVY_LOCK")"
+[[ "$rp" =~ ^[0-9]+$ ]] || fail "no holder pid recorded in held slot"
+set +e
+out="$(WRK_HEAVY_HELD="$WRK_HEAVY_LOCK:$rp" WRK_HEAVY_WAIT_CAP=2 \
+  heavy_run "$CFGNOKEY" -- touch "$TMP/rh-forged" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 75 ]] || fail "forged held-pid bypassed the slot queue (rc=$rc): $out"
+[[ ! -e "$TMP/rh-forged" ]] || fail "forged run executed while the slot was held"
+! grep -q 'already holding' <<<"$out" ||
+  fail "non-ancestor holder pid triggered the nested path: $out"
+wait "$prh" || fail "real holder run failed"
+# positive control: a real nested run still bypasses (live ancestor holder)
+set +e
+out="$(heavy_run "$CFGNOKEY" -- bash -c '"$1" heavy -- touch "$2"' _ "$WRK" "$TMP/nested-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && -e "$TMP/nested-ran" ]] || fail "real nested run failed: rc=$rc $out"
+grep -q 'already holding' <<<"$out" ||
+  fail "real nested run did not take the nested path: $out"
+echo "PASS heavy-held-forged-not-nested"
+
 # ── assertion-RED mutants over the wrk source ──────────────────────────────
 mutant() { # mutant <name> <spec-file>; spec lines are 'OLD => NEW' (first match)
   local name="$1" spec="$2"
@@ -244,8 +288,10 @@ for anchor in (
     "for i in range(1, limit)]",
     "    heavy_limit=1",
     '"wait_s": round(run_at - started_at, 3),',
-    "                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+    "        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
     "                    fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)",
+    "and int(held_pid) in ancestors()",
+    "and int(held_pid) in held_slot_pids()",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -336,5 +382,44 @@ set -e
   fail "mutant noflock still serialized (rc=$rc) — exclusion assertion is vacuous"
 wait "$pn" || fail "mutant noflock holder failed"
 echo "PASS mutant-noflock"
+
+# mutant notheldprobe: nested detection trusts slot text again — an unheld
+# file's pid= plus a live ancestor pid passes. RED proof: the forged-env run
+# from the fixed test must take the nested path under the mutant.
+printf 'and int(held_pid) in held_slot_pids() => and True\n' >"$TMP/spec-notheldprobe"
+mutant notheldprobe "$TMP/spec-notheldprobe"
+printf 'pid=%d since=x job=- cmd=forged\n' $$ >"$WRK_HEAVY_LOCK"
+set +e
+out="$(WRK_HEAVY_HELD="$WRK_HEAVY_LOCK:$$" WRK_HOSTS_CONFIG="$CFGNOKEY" \
+  "$TMP/notheldprobe-wrk" heavy -- touch "$TMP/nh-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && -e "$TMP/nh-ran" ]] || fail "mutant notheldprobe run failed: $out"
+grep -q 'already holding' <<<"$out" ||
+  fail "mutant notheldprobe still required a held slot — probe assertion is vacuous"
+echo "PASS mutant-notheldprobe"
+
+# mutant noancestry: a held slot's real pid forged by a non-ancestor nests
+# anyway. RED proof: under the mutant the forged run bypasses the queue
+# instead of hitting the wait cap.
+printf 'and int(held_pid) in ancestors() => and True\n' >"$TMP/spec-noancestry"
+mutant noancestry "$TMP/spec-noancestry"
+printf 'touch "%s"\nsleep 6\n' "$TMP/na-held" >"$TMP/na.sh"
+WRK_HOSTS_CONFIG="$CFGNOKEY" "$TMP/noancestry-wrk" heavy -- bash "$TMP/na.sh" &
+pna=$!
+wait_until 10 test -f "$TMP/na-held" || fail "mutant noancestry holder never started"
+rp="$(slot_holder_pid "$WRK_HEAVY_LOCK")"
+[[ "$rp" =~ ^[0-9]+$ ]] || fail "mutant noancestry holder pid not recorded"
+set +e
+out="$(WRK_HEAVY_HELD="$WRK_HEAVY_LOCK:$rp" WRK_HEAVY_WAIT_CAP=2 \
+  WRK_HOSTS_CONFIG="$CFGNOKEY" "$TMP/noancestry-wrk" heavy -- touch "$TMP/na-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && -e "$TMP/na-ran" ]] ||
+  fail "mutant noancestry forged run did not bypass (rc=$rc): $out"
+grep -q 'already holding' <<<"$out" ||
+  fail "mutant noancestry still checked ancestry — ancestry assertion is vacuous"
+wait "$pna" || fail "mutant noancestry holder failed"
+echo "PASS mutant-noancestry"
 
 echo 'PASS test-wrk-heavy-limit'
