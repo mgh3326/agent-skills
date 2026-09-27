@@ -532,6 +532,39 @@ printf '%s\n' "$out" | grep -q 'already recorded' ||
   { printf '%s\n' "$out"; fail "JE17: expected the duplicate-suppression warning"; }
 echo "PASS je17 partial-joined-dedup"
 
+# JE18 — the python timeout fallback must bound the delegated call too.
+# macOS CI has neither GNU timeout nor gtimeout, so run_bounded takes the
+# python path there; hiding /usr/local/bin here reproduces that. The stub's
+# `sleep` is a GRANDCHILD of the guard — without a process-group kill it
+# survives the deadline holding wrk's stdout pipe, and this $( ) returns only
+# when the sleep exits (the real JE15b failure: 60s under a 2s bound).
+echo "== JE18: the python timeout fallback kills the delegated call's group =="
+reset_case je18
+mk_job je18-fbhang
+REPORT="$TMP/je18-report.md"; printf 'x\n' >"$REPORT"
+PSTUB_FB="$TMP/panewire-stub-fbhang"; cat >"$PSTUB_FB" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+sleep 12
+EOF
+chmod +x "$PSTUB_FB"
+# sanity: the restricted PATH really hides both GNU tools inside wrk's env.
+[[ -z "$(env PATH=/usr/bin:/bin bash -c 'command -v timeout gtimeout' 2>/dev/null)" ]] ||
+  fail "JE18: timeout/gtimeout still visible under the restricted PATH"
+start_ts=$(date +%s)
+out="$(env PATH=/usr/bin:/bin \
+  HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+  HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$PSTUB_FB" \
+  WRK_JOB_DELEGATE_TIMEOUT_S=2 \
+  "$WRK" 'done' je18-fbhang --report "$REPORT" 2>&1)" || fail "JE18: done must survive a hung delegation under the python fallback"
+elapsed=$(( $(date +%s) - start_ts ))
+(( elapsed < 7 )) || fail "JE18: fallback-blocked $elapsed seconds — orphaned grandchild held the pipe (timeout was 2)"
+event_count_is "$INBOX/je18-fbhang/events" job.completed 1 ||
+  fail "JE18: the terminal record must be written after the timeout"
+printf '%s\n' "$out" | grep -q 'emit skipped' ||
+  { printf '%s\n' "$out"; fail "JE18: emit must not re-enter the wedged binary"; }
+echo "PASS je18 fallback-bounds-hung-delegation"
+
 echo "== MUT: assertion-RED mutants per call site =="
 
 mkmut() {
@@ -675,6 +708,31 @@ EOF
   event_count_is "$INBOX/mut-pjoined/events" job.joined 1
 }
 
+# The $( ) capture is load-bearing here: the regression is not the guard
+# returning late but the orphaned grandchild holding wrk's stdout pipe, which
+# only blocks a caller that captures it — JE18's failure shape on macOS CI.
+case_fallback_group() {
+  reset_case mut-fbhang
+  mk_job mut-fbhang
+  REPORT="$TMP/mut-fbhang-report.md"; printf 'x\n' >"$REPORT"
+  local stub="$TMP/mut-pw-fbhang-stub"
+  cat >"$stub" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+sleep 12
+EOF
+  chmod +x "$stub"
+  local start_ts elapsed
+  start_ts=$(date +%s)
+  local out
+  out="$(env PATH=/usr/bin:/bin HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
+    PANEWIRE_BIN="$stub" WRK_JOB_DELEGATE_TIMEOUT_S=2 \
+    "$WRK" 'done' mut-fbhang --report "$REPORT" 2>&1)" || true
+  elapsed=$(( $(date +%s) - start_ts ))
+  (( elapsed < 7 )) && event_count_is "$INBOX/mut-fbhang/events" job.completed 1
+}
+
 # shellcheck disable=SC2016 # the $VARs are literal sed pattern text for the wrk source lines
 mkmut no-done-housekeeping 's/^  job_end_housekeeping "\$job" "\$owner" completed "wrk done" "wrk done"$/  : mutant removed done housekeeping/'
 expect_mut_red "done housekeeping removal" case_done
@@ -713,5 +771,12 @@ expect_mut_red "joined-dedup removal" case_partial_joined
 # shellcheck disable=SC2016
 mkmut no-wedge-skip 's/\${PANEWIRE_WEDGED:-}" == 1/\${PANEWIRE_WEDGED:-}" == 0/'
 expect_mut_red "emit wedge-skip removal" case_delegate_hang
+
+# Without the process-group kill the fallback's deadline kills only the stub
+# shell; the orphaned sleep keeps the captured pipe open for its full length
+# (JE15b on macOS CI: 60s under a 2s bound).
+# shellcheck disable=SC2016
+mkmut no-group-kill 's/os.killpg(proc.pid, signal.SIGKILL)/pass/'
+expect_mut_red "fallback group-kill removal" case_fallback_group
 
 echo "PASS test-wrk-job-end: all cases"
