@@ -3496,6 +3496,18 @@ joined_cmd() {
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
   upload_report_document "$job" "$report"
+  # #770 tester BLOCKER 1: when the delegated `panewire job joined` landed the
+  # record and then failed, the fallback arrives with job.joined already the
+  # newest work-terminal — appending again would duplicate it. Same shape as
+  # done's duplicate branch: warn, skip the write+emit, still settle the job.
+  local joined_term
+  joined_term="$(job_events_scan "$(wrk_jobs_root)/$job/events" 2>/dev/null | awk -F'\t' '{print $4}')"
+  if [[ "$joined_term" == "job.joined" ]]; then
+    warn "job.joined already recorded for $job; suppressed duplicate"
+    job_end_housekeeping "$job" "$owner" joined "wrk joined (duplicate)" "wrk joined"
+    echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
+    return 0
+  fi
   builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head"
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \

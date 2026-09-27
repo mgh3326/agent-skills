@@ -346,7 +346,7 @@ SUP_PID="$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$PIDFILE")"
 wait "$SPAWN_PID" || fail "spawn failed: $(cat "$TMP/je10.out" "$TMP/je10.err")"
 wait_until 20 test '!' -e "$PIDFILE" ||
   fail "the timeout path must remove the pidfile once the supervisor exits"
-pid_gone "$SUP_PID" ||
+wait_until 5 pid_gone "$SUP_PID" ||
   fail "the supervisor must be gone after its own timeout killed the group"
 grep -q 'scopefuel refresh timed out' "$TMP/je10.err" ||
   fail "the timeout warning must stay user-visible on stderr"
@@ -502,6 +502,31 @@ wait_until 4 pid_gone "$SENT_B" ||
   { kill -9 "$SENT_B" 2>/dev/null; fail "JE16: the pidfile sentinel survived done"; }
 echo "PASS je16 done-stops-all-sentinels"
 
+echo "== JE17: a partially-written delegated joined is not duplicated =="
+reset_case je17
+mk_builder_job je17-dup
+REPORT="$TMP/je17-report.md"; printf 'x\n' >"$REPORT"
+PSTUB_DUP="$TMP/panewire-stub-dup"; cat >"$PSTUB_DUP" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+if [ "$1" = "job" ] && [ "$2" = "joined" ]; then
+  "$STUB_ARBITER" event --job "$3" --kind job.joined \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl","pr":"u","head":"h"}' >/dev/null 2>&1
+  exit 42
+fi
+exit 42
+EOF
+chmod +x "$PSTUB_DUP"
+out="$(env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+  HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$PSTUB_DUP" STUB_ARBITER="$ARBITER" \
+  "$WRK" joined je17-dup --pr https://example.invalid/pr/9 --head beef \
+    --report "$REPORT" 2>&1)" || fail "JE17: joined must survive a partial delegated write"
+event_count_is "$INBOX/je17-dup/events" job.joined 1 ||
+  fail "JE17: the fallback must not write a second job.joined"
+printf '%s\n' "$out" | grep -q 'already recorded' ||
+  { printf '%s\n' "$out"; fail "JE17: expected the duplicate-suppression warning"; }
+echo "PASS je17 partial-joined-dedup"
+
 echo "== MUT: assertion-RED mutants per call site =="
 
 mkmut() {
@@ -601,6 +626,29 @@ case_dual_sentinel() {
   wait_until 8 pid_gone "$sent_a" && wait_until 4 pid_gone "$sent_b"
 }
 
+case_partial_joined() {
+  reset_case mut-pjoined
+  mk_builder_job mut-pjoined
+  REPORT="$TMP/mut-pjoined-report.md"; printf 'x\n' >"$REPORT"
+  local stub="$TMP/mut-pw-dup-stub"
+  cat >"$stub" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+if [ "$1" = "job" ] && [ "$2" = "joined" ]; then
+  "$STUB_ARBITER" event --job "$3" --kind job.joined \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl","pr":"u","head":"h"}' >/dev/null 2>&1
+  exit 42
+fi
+exit 42
+EOF
+  chmod +x "$stub"
+  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$stub" STUB_ARBITER="$ARBITER" \
+    "$WRK" joined mut-pjoined --pr https://example.invalid/pr/9 --head beef \
+      --report "$REPORT" >/dev/null 2>&1 || true
+  event_count_is "$INBOX/mut-pjoined/events" job.joined 1
+}
+
 # shellcheck disable=SC2016 # the $VARs are literal sed pattern text for the wrk source lines
 mkmut no-done-housekeeping 's/^  job_end_housekeeping "\$job" "\$owner" completed "wrk done" "wrk done"$/  : mutant removed done housekeeping/'
 expect_mut_red "done housekeeping removal" case_done
@@ -627,5 +675,11 @@ expect_mut_red "delegation-fallback removal" case_delegate_fallback
 # — a second pidfile-less sentinel survives (tester BLOCKER 2).
 mkmut no-sweep 's/done < <(sentinel_sweep)/done < <(true)/g'
 expect_mut_red "sentinel-sweep removal" case_dual_sentinel
+
+# Without the joined dedup, a partially-written delegated job.joined plus the
+# fallback produces two joined records (BLOCKER 1 residual edge).
+# shellcheck disable=SC2016
+mkmut no-joined-dedup 's/"\$joined_term" == "job.joined"/"$joined_term" == "-never-"/'
+expect_mut_red "joined-dedup removal" case_partial_joined
 
 echo "PASS test-wrk-job-end: all cases"
