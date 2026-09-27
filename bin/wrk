@@ -135,6 +135,7 @@ Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
                  [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--keep]
+                 [--task HK_TASK_ID | --parent-job JOB_ID] [--task-hk-bypass]
 
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -180,6 +181,34 @@ Options:
                      see also the idle-wake suppression reasons in panewire
                      (parentless_lane, unknown_owner) for the same failure
                      mode on the idle-detection path.
+  --task ID          handoffkeep task this job owns (#768 decision
+                     doc decision/2026-09-27/task-job-linkage, item 1; new
+                     spawns only, no backfill). Required for --role builder
+                     and for any worker/tester spawn that cannot inherit —
+                     missing it is a usage error before any side effect. On a
+                     successful spawn the task is claimed by the spawned label
+                     and refs.job_id is set to the job id in one `tasks claim
+                     --by --job-id` call (verified from the response; an hk
+                     that drops job_id is a loud failure, never a silent
+                     half-record). A task already bound to another job is
+                     fail-closed, as are closed (merged/dropped), held and
+                     needs_decision tasks; hk unreachable refuses the spawn
+                     (no job without its task link) unless --task-hk-bypass.
+  --parent-job JOB   tester/advisory inheritance: take the task id from the
+                     parent job's recorded claim meta instead of --task.
+                     Mutually exclusive with --task. When neither is given, a
+                     worker spawn tries the calling pane's ARBITER_JOB meta
+                     and then the HK_TASK_ID env (propagated into every
+                     spawned pane) before the usage error. The inherited task
+                     is recorded in job meta (task_id + task_inherited_from)
+                     and the child never re-claims it — the owning job's hk
+                     record stands.
+  --task-hk-bypass   explicit operator override: spawn without a confirmed
+                     hk task link when handoffkeep is unreachable. Recorded
+                     in the job's claim payload as task_link_override so the
+                     audit trail shows exactly which jobs lack the link and
+                     why. Never a silent skip: a reachable hk that refuses
+                     the claim still fails the spawn.
   --report PATH      report acceptance-criterion path watched by the completion sentinel
   --keep             protection marker: record "keep": true on the job.spawned
                      receipt so no session cleanup ever closes this pane — use it
@@ -1860,7 +1889,7 @@ arbiter_handle_duplicate_claim() {
         return "$WRK_EXIT_JOB_STATE_UNREADABLE"
       fi
       set +e
-      "$ARBITER" claim --reclaim-released --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" >/dev/null
+      "$ARBITER" claim --reclaim-released --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" ${ARBITER_CLAIM_TASK_ARGS[@]+"${ARBITER_CLAIM_TASK_ARGS[@]}"} >/dev/null
       reclaim_rc=$?
       set -e
       case "$reclaim_rc" in
@@ -1924,9 +1953,9 @@ arbiter_record_spawn_receipt() {
   # absence explicitly for downstream recovery rather than pretending success.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc
-  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" <<'PY'
+  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" "${TASK_ID:-}" <<'PY'
 import json, sys
-pane_id, label, profile, workspace, tab_id, keep = sys.argv[1:]
+pane_id, label, profile, workspace, tab_id, keep, task_id = sys.argv[1:]
 receipt = {
     "pane_id": pane_id,
     "label": label,
@@ -1936,6 +1965,9 @@ receipt = {
 # Additive and optional: existing consumers keep reading the four fields above.
 if tab_id:
     receipt["tab_id"] = tab_id
+# #768: the task binding is receipt evidence too, next to the pane it landed on.
+if task_id:
+    receipt["task_id"] = int(task_id) if task_id.isdigit() else task_id
 # Protection marker, task 603: present only with --keep, so an ordinary spawn
 # receipt stays byte-identical; its readers accept only the JSON literal true.
 # Keep this heredoc free of quote characters: bash 3.2 misparses them in a command substitution.
@@ -1998,6 +2030,21 @@ arbiter_admit() {
     # lookup failure below must remain fail-closed.
     warn "arbiter job-get probe failed (exit $job_get_probe_rc); duplicate state will fail-closed if observed"
   fi
+  # #768: an arbiter predating claim --task-id must not fail the claim on an
+  # unknown flag — same installation-transition carve-out as the probes above.
+  # The job meta then lacks task_id; the hk link itself is unaffected.
+  if [[ "${#ARBITER_CLAIM_TASK_ARGS[@]}" -gt 0 ]]; then
+    local claim_probe claim_probe_rc
+    set +e
+    claim_probe="$("$ARBITER" claim --help 2>&1)"
+    claim_probe_rc=$?
+    set -e
+    if [[ "$claim_probe_rc" -ne 0 ]] || ! grep -q -- "--task-id" <<<"$claim_probe"; then
+      warn "installed arbiter lacks claim --task-id; job meta will not record task_id (installation transition)"
+      ARBITER_CLAIM_TASK_ARGS=()
+    fi
+  fi
+
   if [[ "$GATE_READY" -ne 1 ]]; then
     # No scopefuel result means no authoritative pool. Leasing a guessed pool would
     # be worse than not leasing — the same installation-transition exception applies.
@@ -2007,7 +2054,7 @@ arbiter_admit() {
 
   local claim_rc duplicate_rc
   set +e
-  "$ARBITER" claim --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" >/dev/null
+  "$ARBITER" claim --job "$JOB_ID" --agent-label "$LABEL" --lane "$JOB_LANE" --t "$JOB_T" "${ARBITER_CLAIM_ROLE_ARGS[@]}" ${ARBITER_CLAIM_TASK_ARGS[@]+"${ARBITER_CLAIM_TASK_ARGS[@]}"} >/dev/null
   claim_rc=$?
   set -e
   case "$claim_rc" in
@@ -2019,7 +2066,7 @@ arbiter_admit() {
       set -e
       [[ "$duplicate_rc" -eq 0 ]] || return "$duplicate_rc"
       ;;
-    *) warn "arbiter quota-pool claim failed (exit $claim_rc); continuing spawn"; return 0 ;;
+    *) warn "arbiter quota-pool claim failed (exit $claim_rc); continuing spawn"; ARBITER_CLAIM_FAILED=1; return 0 ;;
   esac
 
   local gate_file gate_rc record_json record_rc parsed rc
@@ -4431,7 +4478,7 @@ spillover_wake() {
 # a flag and remains a perfectly valid --requested-by value.
 wrk_option_token() {
   case "$1" in
-    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -4452,12 +4499,14 @@ spillover_hub_args() {
         ;;
       --job-dup-ok)
         echo "wrk: --job-dup-ok is not permitted for a hub spawn" >&2; return 2 ;;
-      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--requested-by|--purpose)
+      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--requested-by|--purpose|--task|--parent-job)
         i=$((i + 1))
         { [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] && ! wrk_option_token "${args[$i]}"; } ||
           { echo "wrk: $arg requires a value" >&2; return 2; }
         SPILL_HUB_ARGS+=("$arg" "${args[$i]}")
         ;;
+      --task-hk-bypass)
+        SPILL_HUB_ARGS+=("$arg") ;;
       *)
         echo "wrk: option '$arg' is not permitted for a hub spawn" >&2; return 2 ;;
     esac
@@ -5079,16 +5128,336 @@ hosts_cmd() {
 }
 
 
+# ---------------------------------------------------------------- hk task link
+# #768 / hk:doc decision/2026-09-27/task-job-linkage item 1: every spawned job
+# is bound to a handoffkeep task. --task names the task the new job owns;
+# tester/advisory (child) spawns inherit the parent task instead — explicit
+# --parent-job, else the calling session's ARBITER_JOB claim, else HK_TASK_ID
+# env. The hk write is a single `tasks claim <id> --by <label> --job-id <job>`
+# on the success path only; a failed spawn must leave hk untouched, so the
+# probe below is read-only and the claim is the last side effect before the
+# OK line. Deployed hk predating claim+job_id support drops --job-id silently:
+# the post-claim verify turns that into a loud spawn failure instead of a
+# record that looks linked but is not (never two calls — see the report).
+
+HK_CMD_TIMEOUT="${HK_CMD_TIMEOUT:-15}"
+
+hk_bin() {
+  command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true
+}
+
+# A wedged handoffkeep must not stall a spawn. `timeout` is GNU coreutils and
+# a stock macOS has neither it nor gtimeout, so python3 — already a hard
+# dependency — carries the same guard there (same pattern as the panewire
+# guard above).
+hk_cmd() {
+  local bin="$1"; shift
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$HK_CMD_TIMEOUT" "$bin" "$@"
+  elif command -v gtimeout >/dev/null 2>&1; then
+    gtimeout "$HK_CMD_TIMEOUT" "$bin" "$@"
+  else
+    python3 -c 'import subprocess, sys
+try:
+    sys.exit(subprocess.run(sys.argv[2:], timeout=float(sys.argv[1])).returncode)
+except subprocess.TimeoutExpired:
+    sys.exit(124)' "$HK_CMD_TIMEOUT" "$bin" "$@"
+  fi
+}
+
+# task_resolve_parent — TASK_INHERITED_FROM is set by the caller to a parent
+# job id; fill TASK_ID from its newest claim/reclaim payload. Local read only:
+# the job registry under wrk_jobs_root is the same one the claim landed in.
+# The newest claim/reclaim event is authoritative: an unreadable one dies
+# rather than letting a stale older task_id through (tester finding).
+task_resolve_parent() {
+  local parent="$1" dir rc
+  dir="$(wrk_jobs_root)/$parent/events"
+  if TASK_ID="$(python3 - "$dir" <<'PY'
+import json, os, sys
+try:
+    names = sorted(n for n in os.listdir(sys.argv[1])
+                   if n.endswith(("claim.json", "reclaim.json")))
+except OSError:
+    raise SystemExit(1)
+if not names:
+    raise SystemExit(0)
+# Seq-prefixed names sort newest-last; only that event is authoritative.
+try:
+    o = json.load(open(os.path.join(sys.argv[1], names[-1]), encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(2)
+p = o.get("payload", o)
+v = p.get("task_id")
+print(v if isinstance(v, int) else (v if isinstance(v, str) else ""))
+PY
+)"; then
+    :
+  else
+    rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+      die "parent job '$parent' newest claim/reclaim event is unreadable — refusing to guess the task from older events"
+    fi
+    TASK_ID=""
+  fi
+}
+
+# task_validate — usage-error stage: resolve TASK_ID or die before any side
+# effect (gates, pane, hk writes all come later). Sets TASK_LINK_MODE to
+# owner (--task) or inherited (tester/advisory path) and TASK_INHERITED_FROM.
+task_validate() {
+  TASK_LINK_MODE="" TASK_INHERITED_FROM=""
+  if [[ -n "$TASK_ID" && ! "$TASK_ID" =~ ^[0-9]+$ ]]; then
+    die "--task must be a positive handoffkeep task id (got '$TASK_ID')"
+  fi
+  if [[ -n "$TASK_ID" ]] && (( 10#$TASK_ID < 1 )); then
+    die "--task must be a positive handoffkeep task id (got '$TASK_ID')"
+  fi
+  if [[ -n "$PARENT_JOB" ]] && [[ ! "$PARENT_JOB" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "--parent-job must be a job id (got '$PARENT_JOB')"
+  fi
+  if [[ "$ROLE" == builder ]]; then
+    [[ -z "$PARENT_JOB" ]] ||
+      die "--role builder links its own task with --task; --parent-job is the tester/advisory inheritance path"
+    [[ -n "$TASK_ID" ]] ||
+      die "--role builder requires --task <hk task id> (decision/2026-09-27/task-job-linkage: every job binds its task)"
+    TASK_LINK_MODE="owner"
+    return 0
+  fi
+  if [[ -n "$TASK_ID" && -n "$PARENT_JOB" ]]; then
+    die "--task and --parent-job are alternatives — a worker names either its own task or the parent job it inherits from, not both"
+  fi
+  if [[ -n "$TASK_ID" ]]; then
+    TASK_LINK_MODE="owner"
+    return 0
+  fi
+  # Worker/tester/advisory inheritance: the task comes from the parent job's
+  # recorded meta, never guessed. Explicit --parent-job first, then the
+  # calling session's own arbiter job (spawned panes carry ARBITER_JOB), then
+  # the propagated HK_TASK_ID env. For remote/hub spawns none of the local
+  # sources may exist — pass --task there (documented in wrk spawn --help).
+  local env_task=""
+  if [[ -z "$PARENT_JOB" && -n "${ARBITER_JOB:-}" ]]; then
+    PARENT_JOB="$ARBITER_JOB"
+  fi
+  if [[ -n "${HK_TASK_ID:-}" ]]; then
+    env_task="$HK_TASK_ID"
+  fi
+  if [[ -n "$PARENT_JOB" ]]; then
+    task_resolve_parent "$PARENT_JOB"
+    if [[ -z "$TASK_ID" && -n "$env_task" ]]; then
+      TASK_ID="$env_task"
+      TASK_INHERITED_FROM="env:HK_TASK_ID"
+    elif [[ -n "$TASK_ID" && -n "$env_task" && "$TASK_ID" != "$env_task" ]]; then
+      die "parent job '$PARENT_JOB' recorded task_id=$TASK_ID but HK_TASK_ID=$env_task — refusing to guess; pass --task explicitly"
+    else
+      TASK_INHERITED_FROM="$PARENT_JOB"
+    fi
+    [[ -n "$TASK_ID" ]] ||
+      die "parent job '$PARENT_JOB' has no task_id in its claim/reclaim meta — pass --task explicitly or re-register the parent with --task"
+    { [[ "$TASK_ID" =~ ^[0-9]+$ ]] && (( 10#$TASK_ID >= 1 )); } ||
+      die "task id '$TASK_ID' resolved from parent job '$PARENT_JOB' is not a positive task id — pass --task explicitly"
+    TASK_LINK_MODE="inherited"
+    return 0
+  fi
+  if [[ -n "$env_task" ]]; then
+    { [[ "$env_task" =~ ^[0-9]+$ ]] && (( 10#$env_task >= 1 )); } ||
+      die "HK_TASK_ID env is not a positive task id ('$env_task') — pass --task explicitly"
+    TASK_ID="$env_task"
+    TASK_LINK_MODE="inherited"
+    TASK_INHERITED_FROM="env:HK_TASK_ID"
+    return 0
+  fi
+  die "--task <hk task id> is required for --role worker (decision/2026-09-27/task-job-linkage). Tester/advisory spawns may instead inherit the parent task: pass --parent-job <job>, or spawn from a registered job's pane where ARBITER_JOB/HK_TASK_ID is set"
+}
+
+# hk_task_gate_failure — the hk-unreachable/undecidable funnel. The override
+# flag converts refusal into a recorded bypass; without it the spawn dies
+# here, before gates and pane: no job without its task link (AC3).
+hk_task_gate_failure() {
+  local reason="$1"
+  if [[ "$TASK_HK_BYPASS" -eq 1 ]]; then
+    warn "hk task precheck unavailable ($reason) — --task-hk-bypass override engaged; spawn proceeds, the link write will be retried after landing and the override recorded in job meta"
+    TASK_LINK_STATUS="bypassed:precheck"
+    return 0
+  fi
+  die "hk task precheck failed ($reason) — spawn refused: no job without its task link (pass --task-hk-bypass to override, recorded in job meta)"
+}
+
+# hk_task_precheck — read-only `tasks show` classification. Sets
+# TASK_LINK_STATUS: link (owner, needs the claim write), already_linked
+# (refs.job_id already this job — idempotent re-spawn), inherited (child job:
+# meta link only, the owner's claim stands), or bypassed:<reason> under the
+# override. Every refusal is a die before any side effect.
+hk_task_precheck() {
+  TASK_LINK_STATUS=""
+  [[ -n "$TASK_ID" ]] || die "internal: task_validate must run before hk_task_precheck"
+  local handoffkeep out rc=0 fields t_state="" t_claimed="" t_job=""
+  handoffkeep="$(hk_bin)"
+  if [[ -z "$handoffkeep" ]]; then
+    hk_task_gate_failure "handoffkeep binary not found (set HANDOFFKEEP_BIN)"
+    return 0
+  fi
+  set +e
+  out="$(hk_cmd "$handoffkeep" tasks show "$TASK_ID" 2>&1)"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    if grep -q "not_found" <<<"$out"; then
+      die "hk task $TASK_ID does not exist (not_found) — a job binds only an existing task"
+    fi
+    hk_task_gate_failure "handoffkeep tasks show rc=$rc: ${out:0:200}"
+    return 0
+  fi
+  set +e
+  # One tab-separated line: per-line prints would lose trailing empty fields
+  # to command-substitution stripping and the third `read` would hit EOF.
+  fields="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try: d = json.loads(sys.stdin.read())
+except ValueError: raise SystemExit(1)
+refs = d.get("refs") or {}
+print("\t".join([d.get("state") or "", d.get("claimed_by") or "",
+                 refs.get("job_id") or ""]))')"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    hk_task_gate_failure "handoffkeep tasks show returned unreadable JSON"
+    return 0
+  fi
+  IFS=$'\t' read -r t_state t_claimed t_job <<<"$fields"
+  if [[ "$TASK_LINK_MODE" == inherited ]]; then
+    # Child jobs never claim: the owner's record stands. Existence is the
+    # only requirement; state is observational.
+    TASK_LINK_STATUS="inherited"
+    return 0
+  fi
+  case "$t_state" in
+    merged|dropped)
+      die "hk task $TASK_ID is '$t_state' — a closed task is not a spawn target" ;;
+    needs_decision)
+      die "hk task $TASK_ID awaits an operator decision (needs_decision) — resolve it before spawning" ;;
+    hold)
+      die "hk task $TASK_ID is on hold — release it before spawning" ;;
+  esac
+  if [[ -n "$t_job" && "$t_job" != "$JOB_ID" ]]; then
+    die "hk task $TASK_ID is already bound to job '$t_job' (state=$t_state claimed_by=${t_claimed:-none}) — a task linked to another job cannot be re-spawned (fail-closed)"
+  fi
+  if [[ "$t_job" == "$JOB_ID" ]]; then
+    TASK_LINK_STATUS="already_linked"
+    return 0
+  fi
+  # Unbound. A claim recorded under a different label is a half-record wrk
+  # must not merge into; the same label is the repair path (a claim that
+  # landed without job_id, e.g. a bypassed spawn being re-run).
+  if [[ -n "$t_claimed" && "$t_claimed" != "$LABEL" ]]; then
+    die "hk task $TASK_ID is claimed by '$t_claimed' but bound to no job — a half-record; refusing to merge into another lane's claim"
+  fi
+  TASK_LINK_STATUS="link"
+  return 0
+}
+
+# hk_task_link_event — durable link outcome in the job's own events, next to
+# claim/reclaim. Best-effort: the claim payload already carries task_id; this
+# record answers "did the hk side land" from files alone.
+hk_task_link_event() {
+  local status="$1" detail="${2:-}"
+  [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 && -n "${ARBITER:-}" && -x "${ARBITER:-}" ]] || return 0
+  local payload
+  payload="$(python3 - "$TASK_ID" "$status" "$LABEL" "$JOB_ID" "$TASK_LINK_MODE" "$TASK_INHERITED_FROM" "$detail" <<'PY'
+import json, sys
+task_id, status, label, job, mode, inherited, detail = sys.argv[1:]
+x = {"task_id": int(task_id) if task_id.isdigit() else task_id,
+     "status": status, "claimed_by": label, "job_id": job, "mode": mode}
+if inherited: x["inherited_from"] = inherited
+if detail: x["detail"] = detail[:200]
+print(json.dumps(x, separators=(",", ":")))
+PY
+)" || return 0
+  "$ARBITER" event --job "$JOB_ID" --kind job.task_link --payload-json "$payload" >/dev/null 2>&1 ||
+    warn "arbiter job.task_link event failed (job=$JOB_ID task=$TASK_ID status=$status)"
+  return 0
+}
+
+# hk_task_link — the only hk write in the spawn path, and deliberately the
+# last side effect before the OK line: a failed spawn changes nothing in hk.
+# One `tasks claim` call must land claimed_by=<spawned label> AND
+# refs.job_id=<job> together; the response verify turns a hk that drops
+# job_id (predates claim+job_id support) into a loud refusal rather than a
+# silently half-written record. claim's own conflict keeps a concurrent
+# winner: the losing spawn dies here and its pane is cleaned by the EXIT trap.
+hk_task_link() {
+  [[ -n "$TASK_ID" ]] || return 0
+  # A claim that attempted and failed runs under the installation-transition
+  # contract: the spawn continued without registration, so bind the task
+  # through hk anyway — it is the durable record — and say so loudly rather
+  # than silently leaving the bind unevidenced in the arbiter events.
+  if [[ "${ARBITER_CLAIM_FAILED:-0}" -eq 1 ]]; then
+    warn "arbiter claim failed for job $JOB_ID; binding task $TASK_ID via hk as the durable record — the job events will not carry a task_link entry (unregistered job)"
+  fi
+  # Inherited children never claim: the owner's record stands. Even when a
+  # bypass flag degraded the precheck to bypassed:*, the link write stays
+  # owner-only — the outcome is recorded, the task is untouched.
+  if [[ "$TASK_LINK_MODE" == "inherited" ]]; then
+    local st="$TASK_LINK_STATUS"
+    [[ "$st" == bypassed:* ]] || st="inherited"
+    hk_task_link_event "$st" ""
+    return 0
+  fi
+  case "$TASK_LINK_STATUS" in
+    link|bypassed:*) ;;
+    already_linked|inherited) hk_task_link_event "$TASK_LINK_STATUS" ""; return 0 ;;
+    *) warn "hk task link skipped: unknown status '$TASK_LINK_STATUS'"; return 0 ;;
+  esac
+  local handoffkeep out rc=0
+  handoffkeep="$(hk_bin)"
+  if [[ -n "$handoffkeep" ]]; then
+    set +e
+    out="$(hk_cmd "$handoffkeep" tasks claim "$TASK_ID" --by "$LABEL" --job-id "$JOB_ID" 2>&1)"
+    rc=$?
+    set -e
+  else
+    rc=127 out="handoffkeep binary not found (set HANDOFFKEEP_BIN)"
+  fi
+  if [[ "$rc" -eq 0 ]] &&
+    printf '%s' "$out" | python3 -c '
+import json, sys
+try: d = json.loads(sys.stdin.read())
+except ValueError: raise SystemExit(1)
+refs = d.get("refs") or {}
+ok = d.get("claimed_by") == sys.argv[1] and refs.get("job_id") == sys.argv[2]
+raise SystemExit(0 if ok else 1)' "$LABEL" "$JOB_ID"; then
+    hk_task_link_event "linked" ""
+    return 0
+  fi
+  # The bypass covers only what it was declared for: hk unreachable at
+  # precheck (bypassed:*) plus a nonzero claim rc. A reachable refusal and a
+  # response that drops refs.job_id stay fail-closed — they are half-record
+  # evidence, not unavailability.
+  if [[ "$rc" -ne 0 && "$TASK_HK_BYPASS" -eq 1 && "$TASK_LINK_STATUS" == bypassed:* ]]; then
+    warn "hk task link write failed (rc=$rc) but --task-hk-bypass was given — job $JOB_ID proceeds without the hk link; override recorded in job meta"
+    hk_task_link_event "bypassed:link_write_failed" "$out"
+    return 0
+  fi
+  die "hk task link failed for task $TASK_ID job $JOB_ID (rc=$rc: ${out:0:300}) — spawn refused after landing; pane and quota record are being released. The claim must set claimed_by and refs.job_id in one call; on an hk predating claim+job_id the task may be left claimed without job_id — repair with 'handoffkeep tasks transition $TASK_ID --to in_progress --job-id $JOB_ID'"
+}
+
+
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE=""
+  OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
+  # Armed once for the whole spawn: both cleanup actions are guarded (pane
+  # only when SPAWN_PANE_OPEN/PANE are set, quota release only when
+  # ARBITER_HELD=1), so a die anywhere after the pane opens cannot leak it —
+  # including the no-lease path where the arbiter claim or record failed.
+  trap 'spawn_pane_cleanup; arbiter_release_held' EXIT
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
@@ -5097,9 +5466,10 @@ spawn_cmd() {
           --role) ROLE="$2" ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
           --report) REPORT_PATH="$2" ;;
           --operator-request) OPERATOR_REQUEST="$2" ;; --requested-by) REQUESTED_BY="$2" ;;
-          --purpose) PURPOSE="$2" ;;
+          --purpose) PURPOSE="$2" ;; --task) TASK_ID="$2" ;; --parent-job) PARENT_JOB="$2" ;;
         esac
         shift 2 ;;
+      --task-hk-bypass) TASK_HK_BYPASS=1; shift ;;
       --job-dup-ok) JOB_DUP_OK=1; shift ;;
       --landing-strict) LANDING_STRICT=1; shift ;;
       --keep) KEEP=1; shift ;;
@@ -5171,6 +5541,10 @@ spawn_cmd() {
     esac
   fi
 
+  # #768: task binding is decided here, still before any side effect — a
+  # missing/unresolvable task id is a usage error, never a partial spawn.
+  task_validate
+
   resolve_profile
   configure_landing_check "$PROFILE_KIND"
   LANE_ENV=()
@@ -5202,6 +5576,25 @@ spawn_cmd() {
   [[ -n "$JOB_T" ]] ||
     die "NEEDS_CLASSIFICATION: --t T0..T3 is required (job '$JOB_ID'); classify it, do not guess"
   case "$JOB_T" in T0|T1|T2|T3) ;; *) die "--t accepts only T0, T1, T2 or T3" ;; esac
+
+  # #768: read-only hk task probe — fail closed before the quota gate measures
+  # anything, before any pane, before any hk write. Sets TASK_LINK_STATUS.
+  hk_task_precheck
+
+  # #768: the job's own meta carries the task binding (job.claim/job.reclaim
+  # payload); the override marker is recorded only when the flag was passed —
+  # declared use is auditable even when the bypass turned out unnecessary.
+  ARBITER_CLAIM_TASK_ARGS=(--task-id "$TASK_ID")
+  if [[ "$TASK_HK_BYPASS" -eq 1 ]]; then
+    if [[ "$TASK_LINK_STATUS" == bypassed:* ]]; then
+      ARBITER_CLAIM_TASK_ARGS+=(--task-link-override "hk_unreachable")
+    else
+      ARBITER_CLAIM_TASK_ARGS+=(--task-link-override "declared")
+    fi
+  fi
+  if [[ "$TASK_LINK_MODE" == inherited ]]; then
+    ARBITER_CLAIM_TASK_ARGS+=(--task-inherited-from "$TASK_INHERITED_FROM")
+  fi
 
   # Advisory only (never fails spawn). After -L may have rewritten CWD.
   warn_if_canonical_off_default "$CWD"
@@ -5244,6 +5637,9 @@ spawn_cmd() {
               --env "ARBITER_KIND=quota_pool" --env "ARBITER_PROFILE=$ARBITER_PROFILE"
               --env "ARBITER_STARTED_AT=$ARBITER_STARTED_AT")
   fi
+  # #768: the pane carries its task identity so a tester/advisory spawn made
+  # from inside it inherits the task via HK_TASK_ID even without --parent-job.
+  TAB_ENV+=(--env "HK_TASK_ID=$TASK_ID")
   if [[ "${#TAB_ENV[@]}" -gt 0 ]]; then
     TAB_CREATE_JSON=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}")
   else
@@ -5306,6 +5702,12 @@ print(value if isinstance(value, str) else "")
   if [[ -z "$TAB_ID" ]]; then
     IFS=$'\t' read -r _ _ TAB_ID <<<"$(herdr_agent_probe "$PANE")" || TAB_ID=""
   fi
+  # #768: the hk task claim+link — the single hk write of the spawn, placed on
+  # the success side only (pane landed, prompt delivered) so a failed spawn
+  # never touches hk. A refusal here dies before the success receipt and while
+  # SPAWN_PANE_OPEN is still armed: the EXIT trap closes the pane and releases
+  # the quota record — no job without its task link.
+  hk_task_link
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   arbiter_record_spawn_receipt
   # A sentinel requires the durable claim/spawn metadata it later reads. During

@@ -69,11 +69,20 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
 hub_require_isolation
 XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-seed --agent-label seed --lane seed --t T1 >/dev/null
 
+# #768: spawns bind an hk task. The fixture stands in for handoffkeep and the
+# seeded HK_TASK_ID lets these worker-role spawns inherit through the env path
+# a spawned pane would use — hub/ssh forwarding itself is exercised by the
+# ssh/hub fixtures, not a real remote wrk.
+HK_FIXTURE="$ROOT/tests/fixtures/handoffkeep"
+export HK_STATE="$TMP/hk-state.json" HK_TASK_ID=76804
+HK_STATE="$HK_STATE" "$HK_FIXTURE" tasks add --id "$HK_TASK_ID" --title "spillover suite task" --lane fixture >/dev/null
+
 run_wrk() {
   hub_require_isolation
   local binary="$1"; shift
   env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" \
     SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="${WRK_TEST_ARBITER_BIN:-$ROOT/bin/arbiter}" XDG_DATA_HOME="$TMP/xdg" \
+    HANDOFFKEEP_BIN="$HK_FIXTURE" \
     WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="${WRK_TEST_HOSTS_CONFIG:-$CONFIG}" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
     WRK_TEST_THROTTLED=0 \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
@@ -125,7 +134,7 @@ printf '%s\n' 'BRIEF-CANARY-hub-fixture' >"$PROMPT"
 run_hub() {
   hub_require_isolation
   local binary="$1" config="$2"; shift 2
-  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "$@"
+  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" HANDOFFKEEP_BIN="$HK_FIXTURE" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "$@"
 }
 
 assert_no_hub_leak() {

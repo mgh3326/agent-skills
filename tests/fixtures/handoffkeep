@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+# #768 test fixture: a handoffkeep binary with just the `tasks` slice wrk's
+# spawn path uses — `tasks show` (read-only precheck) and `tasks claim
+# --by --job-id` (the single atomic link write). State lives in one JSON file
+# per test (HK_STATE); every claim mutation runs under an flock on that file
+# so two racing spawns serialize exactly like the real server transaction.
+#
+#   HK_STATE           required: JSON db {"tasks": {"<id>": {fields}}}
+#   HK_MODE            new (default: claim+job_id atomically)
+#                      old      deployed skew: claim drops --job-id silently
+#                      oldflag  older still: --job-id is an unknown flag
+#                      down     every call: 'handoffkeep: connection refused' rc1
+#                      garbage  tasks show prints non-JSON rc0
+#   HK_FIXTURE_HANG    seconds to stall before answering (timeout probes)
+#   HK_LOG             append one line per claim: 'claim id=<n> by=<x> job=<y>'
+#
+# `show` mirrors the real CLI verbatim: task JSON to stdout, or
+# 'handoffkeep: not_found' on stderr rc1, 'handoffkeep: task id must be
+# positive' for a bad id. `claim` mirrors real conflicts: anything already
+# claimed by another claimant or bound to another job_id is
+# 'handoffkeep: task_conflict' rc1 — including same-claimant re-claim once a
+# job is bound (the real server claims exactly once). A same-claimant claim on
+# a task with no job bound is the repair path and succeeds.
+import fcntl
+import json
+import os
+import sys
+import time
+
+ERR = "handoffkeep: "
+
+
+def die(msg, rc=1):
+    print(ERR + msg, file=sys.stderr)
+    sys.exit(rc)
+
+
+def load(state_path):
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {"tasks": {}}
+    except (OSError, json.JSONDecodeError):
+        die("fixture state unreadable", 2)
+
+
+def save(state_path, db):
+    tmp = state_path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(db, f, separators=(",", ":"))
+    os.replace(tmp, state_path)
+
+
+def task_or_not_found(db, tid):
+    t = db.get("tasks", {}).get(tid)
+    if t is None:
+        die("not_found")
+    return t
+
+
+def task_id_arg(argv, i):
+    if i >= len(argv):
+        die("task command requires id", 2)
+    tid = argv[i]
+    if not tid.isdigit() or int(tid) < 1:
+        die("task id must be positive")
+    return tid
+
+
+def parse_claim(argv):
+    # claim <id> --by X [--job-id J] — mirrors cmd parsing: unknown flags fail.
+    if len(argv) < 1:
+        die("task command requires id", 2)
+    tid = task_id_arg(argv, 0)
+    by = job = None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a in ("--by", "--job-id"):
+            if i + 1 >= len(argv):
+                die(f"flag needs an argument: {a}", 2)
+            if a == "--by":
+                by = argv[i + 1]
+            elif a == "--job-id":
+                if MODE == "oldflag":
+                    die("flag provided but not defined: -job-id", 2)
+                job = argv[i + 1]
+            i += 2
+        else:
+            die(f"flag provided but not defined: {a.lstrip('-')}", 2)
+    if not by:
+        die("required flag(s) --by not set", 2)
+    return tid, by, job
+
+
+MODE = os.environ.get("HK_MODE", "new")
+STATE = os.environ.get("HK_STATE")
+LOG = os.environ.get("HK_LOG")
+hang = os.environ.get("HK_FIXTURE_HANG")
+if hang:
+    time.sleep(float(hang))
+
+if MODE == "down":
+    die("connection refused")
+if not STATE:
+    die("fixture HK_STATE unset", 2)
+
+
+def main():
+    argv = sys.argv[1:]
+    if len(argv) < 2 or argv[0] != "tasks":
+        die("invalid_context", 2)
+    cmd = argv[1]
+
+    if cmd == "show":
+        tid = task_id_arg(argv, 2)
+        if MODE == "garbage":
+            print("handoffkeep fixture: not json")
+            return
+        t = task_or_not_found(load(STATE), tid)
+        print(json.dumps(t, separators=(",", ":")))
+        return
+
+    if cmd == "claim":
+        tid, by, job = parse_claim(argv[2:])
+        if LOG:
+            with open(LOG, "a", encoding="utf-8") as f:
+                f.write(f"claim id={tid} by={by} job={job}\n")
+        # Serialize like the server transaction: the check and the write are
+        # one critical section, so a racing claim sees the winner's state.
+        lock_path = STATE + ".lock"
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            db = load(STATE)
+            t = task_or_not_found(db, tid)
+            refs = t.get("refs") or {}
+            bound = refs.get("job_id") or ""
+            claimant = t.get("claimed_by") or ""
+            if t.get("state") in ("merged", "dropped", "hold", "needs_decision"):
+                die("task_conflict")
+            repair = claimant == by and not bound
+            already_same = claimant == by and bound == job and job is not None
+            if claimant and not (repair or already_same):
+                die("task_conflict")
+            if MODE == "old":
+                # Deployed skew: parses --job-id, writes claimed_by only.
+                if not claimant:
+                    t["claimed_by"] = by
+                    t["state"] = "claimed"
+                    t.setdefault("events", []).append(
+                        {"kind": "claim", "by": by, "refs": {}}
+                    )
+                    save(STATE, db)
+            else:
+                if not claimant or repair:
+                    t["claimed_by"] = by
+                    t["state"] = "claimed"
+                    t.setdefault("events", []).append(
+                        {"kind": "claim", "by": by, "refs": dict(refs)}
+                    )
+                if job is not None:
+                    refs["job_id"] = job
+                    t["refs"] = refs
+                save(STATE, db)
+            print(json.dumps(t, separators=(",", ":")))
+            return
+
+    if cmd == "add":
+        # Minimal setup helper. --id/--title/--lane plus seed overrides the
+        # real CLI lacks (--state/--claimed-by/--job-id) for pre-bound states.
+        title = lane = state = claimed_by = job_id = ""
+        tid = None
+        i = 2
+        while i < len(argv):
+            a = argv[i]
+            if i + 1 >= len(argv):
+                die(f"flag needs an argument: {a}", 2)
+            if a == "--id":
+                tid = argv[i + 1]
+            elif a == "--title":
+                title = argv[i + 1]
+            elif a == "--lane":
+                lane = argv[i + 1]
+            elif a == "--state":
+                state = argv[i + 1]
+            elif a == "--claimed-by":
+                claimed_by = argv[i + 1]
+            elif a == "--job-id":
+                job_id = argv[i + 1]
+            i += 2
+        lock_path = STATE + ".lock"
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            db = load(STATE)
+            ids = [int(k) for k in db.get("tasks", {}) if k.isdigit()]
+            tid = tid or str((max(ids) + 1) if ids else 1)
+            t = {
+                "id": int(tid), "lane": lane, "title": title, "kind": "implement",
+                "state": state or "backlog", "priority": 0,
+                "refs": {"job_id": job_id} if job_id else {},
+                "claimed_by": claimed_by,
+                "created_by": "fixture", "created_at": "2026-01-01T00:00:00+00:00",
+                "updated_at": "2026-01-01T00:00:00+00:00", "events": [],
+            }
+            db.setdefault("tasks", {})[tid] = t
+            save(STATE, db)
+        print(json.dumps(t, separators=(",", ":")))
+        return
+
+    die(f"unknown tasks command {cmd}", 2)
+
+
+if __name__ == "__main__":
+    main()

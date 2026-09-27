@@ -414,6 +414,16 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
             --t <T0..T3> --owner <내 세션 이름> [-L live|mock] [--effort <레벨>] [--job <id>]
   wrk --help          # 서브커맨드·옵션 전체
   ```
+  🔴 **task 연결(#768, decision/2026-09-27/task-job-linkage 항목 1)**: 워커·빌더
+  스폰은 반드시 hk task에 묶인다. 자기 task가 있는 스폰은 `--task <id>`를 붙인다
+  (빌더는 필수 — 없으면 스폰이 usage 에러로 죽는다). tester·자문·후속 세션은
+  `--task` 대신 **부모 task를 상속**한다: `--parent-job <부모잡>`을 주거나 아무것도
+  안 주면 스폰한 pane의 `ARBITER_JOB` claim 메타 → `HK_TASK_ID` 환경 순으로
+  해석된다(스폰된 pane에는 `HK_TASK_ID`가 자동으로 실린다 — pane 안에서의
+  워커 스폰은 보통 아무 옵션 없이 상속된다). 상속된 세션은 task를 다시
+  claim하지 않고 잡 메타에 `task_id`+`task_inherited_from`만 남긴다.
+  handoffkeep이 안 닿으면 스폰은 거부된다 — `--task-hk-bypass`로만 뚫리고
+  그 오버라이드는 잡 메타에 기록된다.
   신규 workspace 규약: workers(herdr workspace w16)는 worker/tester 신규 세션에,
   orchs는 orch류 신규 상주 세션에 사용한다. 기존 세션은 이동하지 않으며,
   이슈별 -w 값을 생략하거나 추측하지 않는다.

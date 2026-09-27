@@ -79,9 +79,33 @@ export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 export PANEWIRE_BIN="$PANEWIRE"
 
-# Document uploads are also opt-in below. Keep pre-existing cases away from a
-# real handoffkeep installation while preserving their historical records.
-export HANDOFFKEEP_BIN="$TMP/absent-handoffkeep"
+# Document uploads are also opt-in below; the R21 section installs its own
+# scripted handoffkeep. #768 made every spawn bind a task, so the spawn paths
+# point at the deterministic fixture: pre-existing cases inherit one seeded
+# suite task through HK_TASK_ID (the same env a spawned pane receives), while
+# spawn_base mints a fresh --task per call so owner-mode claims run for real.
+export HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
+export HK_STATE="$TMP/hk-state.json"
+export HK_TASK_ID=76801
+"$HANDOFFKEEP_BIN" tasks add --id "$HK_TASK_ID" --title "suite-inherited-task" --lane fixture >/dev/null
+# Pre-mint the owner-mode task pool: spawn_base only bumps the counter file,
+# never calls the fixture at spawn time — some cases stub python3 (the fixture
+# is python) to probe the awk TOML fallback, and minting must not die there.
+python3 - "$HK_STATE" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    state = json.load(open(path, encoding="utf-8"))
+except (OSError, ValueError):
+    state = {"tasks": {}}
+for i in range(768001, 768500):
+    state["tasks"][str(i)] = {
+        "id": i, "lane": "", "title": "spawn-base pool", "kind": "implement",
+        "state": "backlog", "priority": 0, "refs": {}, "claimed_by": "",
+        "created_by": "fixture", "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00", "events": []}
+json.dump(state, open(path, "w", encoding="utf-8"))
+PY
 
 run_fail() {
   if "$@" >/dev/null 2>&1; then
@@ -104,6 +128,14 @@ expect_exit() {
 }
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# mint_task — next id from the pre-minted pool. File-backed so it survives the
+# command-substitution subshells most spawn callers use.
+mint_task() {
+  local id=$(( $(cat "$TMP/mint-seq" 2>/dev/null || echo 768000) + 1 ))
+  printf '%s\n' "$id" >"$TMP/mint-seq"
+  printf '%s\n' "$id"
+}
 
 event_count() {
   find "$1" -name "*$2.json" 2>/dev/null | wc -l | tr -d ' '
@@ -136,6 +168,26 @@ spawn_base() {
   local model="$1"; shift
   local extra=("$@")
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
+  # #768: every spawn binds an hk task. Mint a fresh fixture task per spawn so
+  # owner-mode claims stay claimable; a case that supplies --task/--parent-job
+  # or unsets the task entirely (TEST_NO_TASK=1, e.g. usage-error probes)
+  # overrides this.
+  case " ${extra[*]-} " in
+    *" --task "*|*" --parent-job "*) ;;
+    *)
+      if [[ -z "${TEST_NO_TASK:-}" ]]; then
+        SPAWN_BASE_TASK="$(mint_task)"
+        extra+=(--task "$SPAWN_BASE_TASK")
+      fi ;;
+  esac
+  # Record the effective --task each call carries. spawn_base often runs
+  # inside $(...), so a global is lost to the parent shell — a log file is
+  # the subshell-safe channel (tail -1 after a call = that call's task).
+  local resolved_task="" i
+  for ((i = 0; i < ${#extra[@]}; i++)); do
+    [[ "${extra[$i]}" == "--task" ]] && resolved_task="${extra[$((i + 1))]}"
+  done
+  [[ -n "$resolved_task" ]] && printf '%s\n' "$resolved_task" >>"$TMP/spawn-task.log"
   # A registered job leaves a detached sentinel behind, and that sentinel keeps
   # calling the fixture herdr — which appends every invocation to the shared
   # WRK_FIXTURE_LOG. At the default 30s interval one of those probes lands, about
@@ -2417,12 +2469,22 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
 # Herdr call" stays provable.
 spawn_deny() {
   local log="$1" model="$2"; shift 2
+  local extra=("$@")
+  # #768: --role builder requires --task before the gate these cases probe.
+  # Draw from the same pre-minted pool spawn_base uses; worker-role calls keep
+  # the suite's HK_TASK_ID env inheritance instead.
+  case " ${extra[*]-} " in
+    *" --task "*|*" --parent-job "*) ;;
+    *" --role builder "*)
+      extra+=(--task "$(mint_task)")
+      printf '%s\n' "${extra[@]: -1}" >>"$TMP/spawn-task.log" ;;
+  esac
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml" \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$log" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "$@"
+    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
 }
 
 # AC-1: with no REF the consult_only profile is still gate-denied — the
@@ -2740,14 +2802,14 @@ builder_opus_out="$(spawn_base builder-opus --role builder --lane builder-lane -
 grep -q 'model=builder-opus' <<<"$builder_opus_out"
 grep -q -- '--model opus' "$TMP/herdr.log"
 grep -q -- '--effort high' "$TMP/herdr.log"
-python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events/00001-job.claim.json" <<'PY'
+python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events/00001-job.claim.json" "$(tail -n 1 "$TMP/spawn-task.log")" <<'PY'
 import json, sys
 event = json.load(open(sys.argv[1]))
 assert set(event) == {"created_at", "job_id", "kind", "payload", "seq"}, event
 assert event["kind"] == "job.claim", event
 assert event["payload"] == {
     "agent_label": "fixture", "owner_lane": "builder-lane", "parent_lane": "parent-lane",
-    "role": "builder", "t_level": "T1",
+    "role": "builder", "t_level": "T1", "task_id": int(sys.argv[2]),
 }, event
 PY
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
@@ -4409,6 +4471,7 @@ R20_ABSENT_ERR="$TMP/r20-absent.err"
 r20_claim r20-absent
 set +e
 r20_absent_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" PANEWIRE_BIN="$TMP/absent-panewire" \
+  HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' r20-absent --report "$R20_REPORT" 2>"$R20_ABSENT_ERR")"
 r20_absent_rc=$?
 set -e
@@ -4429,6 +4492,7 @@ R20_FAIL_ERR="$TMP/r20-fail.err"
 r20_claim r20-fail
 set +e
 r20_fail_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" WRK_PANEWIRE_RC=3 \
+  HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' r20-fail --report "$R20_REPORT" 2>"$R20_FAIL_ERR")"
 r20_fail_rc=$?
 set -e
@@ -5016,7 +5080,8 @@ def receipt(directory):
     assert len(paths) == 1, "exactly one job.spawned receipt, got %r" % paths
     return json.load(open(paths[0]))["payload"]
 kept, plain = receipt(sys.argv[1]), receipt(sys.argv[2])
-base = {"pane_id": "w:p1", "label": "fixture", "profile": "codex-terra", "workspace": "w", "tab_id": "w:t1"}
+base = {"pane_id": "w:p1", "label": "fixture", "profile": "codex-terra", "workspace": "w", "tab_id": "w:t1",
+        "task_id": 76801}
 assert plain == base, "a spawn without --keep must write the unchanged receipt, got %r" % plain
 assert kept == dict(base, keep=True), "--keep must record keep: true on the receipt, got %r" % kept
 assert kept["keep"] is True, "the marker must be the JSON literal true"

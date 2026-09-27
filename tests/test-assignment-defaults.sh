@@ -714,19 +714,28 @@ printf '%s\n' 'fixture prompt' >"$PROMPT"
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 
+# #768: spawns bind an hk task — the deterministic fixture stands in for
+# handoffkeep and spawn_t736 mints a fresh --task per call, which covers the
+# --role builder cases (builder requires an explicit --task, never env
+# inheritance).
+export HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
+export HK_STATE="$TMP/hk-state.json"
+
 spawn_t736() {
   local model="$1"; shift
   : >"$TMP/herdr.log"
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="$TMP/absent-arbiter" XDG_DATA_HOME="$TMP/xdg" \
     ARBITER_INBOX_ROOT="$TMP/inbox" WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml" \
-    PANEWIRE_BIN="$ROOT/tests/fixtures/panewire" HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
+    PANEWIRE_BIN="$ROOT/tests/fixtures/panewire" \
     WRK_COMPLETION_INTERVAL_S=3600 \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_LAUNCH_LOG="$TMP/launch.log" \
     WRK_REFRESH_LOG="$TMP/refresh.log" WRK_REFRESH_PID_LOG="$TMP/refresh.pids" \
     WRK_REFRESH_TIMEOUT_S=5 \
-    "$ROOT/bin/wrk" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 "$@"
+    "$ROOT/bin/wrk" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture --t T1 \
+    --task "$("$HANDOFFKEEP_BIN" tasks add --title "t736 task" 2>/dev/null |
+      python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')" "$@"
 }
 
 fail() { echo "FAIL: $*" >&2; exit 1; }

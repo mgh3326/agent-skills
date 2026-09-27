@@ -87,9 +87,9 @@ Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and wri
 ## `wrk` 사용법
 
 ```text
-wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
+wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3 --task HK_TASK_ID
           [-L live|mock] [--effort LEVEL] [--job ID]
-wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE ... -m builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi
+wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE --task HK_TASK_ID ... -m builder-opus|builder-sol|builder-devin|builder-grok|builder-kimi
 wrk done JOB [--report PATH]
 wrk escalate JOB --question TEXT [--report PATH]
 wrk joined JOB --pr URL --head SHA --report PATH
@@ -104,6 +104,21 @@ wrk heavy status       # 보유자·대기열
 canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은 설치된
 `scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
 `agy -p "$(cat PROMPT_FILE)"`이다.
+
+`--task <hk task id>`는 **모든 스폰이 묶이는 handoffkeep task**다(#768,
+decision/2026-09-27/task-job-linkage 항목 1 — 신규 스폰만, 기존 잡 백필 없음).
+`--role builder`와 `--role worker`에 필수이고 빠뜨리면 어떤 부작용보다 먼저
+usage 에러로 죽는다. tester·자문 세션은 `--task` 대신 부모 잡의 task를
+상속한다 — `--parent-job <job>`을 주거나, 스폰한 pane 안에서 호출하면 그 pane의
+`ARBITER_JOB` claim 메타 → `HK_TASK_ID` 환경 순으로 해석된다(모든 스폰된
+pane에는 `HK_TASK_ID`가 실린다). 스폰이 성공했을 때만 hk에 쓴다:
+`tasks claim <id> --by <라벨> --job-id <job>` 한 번에 claim과 `refs.job_id`
+바인딩이 함께 떨어지고, 응답에서 두 값을 검증한다(`--job-id`를 무시하는 옛
+handoffkeep은 조용한 반쪽 기록이 아니라 스폰 실패로 드러난다). 스폰 실패는
+hk를 건드리지 않는다. 다른 잡에 묶인 task, 잡 없이 claim만 된 남의 task,
+merged/dropped/hold/needs_decision 상태는 전부 fail-closed다. handoffkeep이
+안 닿으면 스폰을 거부한다 — `task_link_override`로 잡 메타에 기록되는
+`--task-hk-bypass`만이 그 거부를 뚫는다.
 
 새 탭의 셸이 아직 rc 파일을 실행 중이면(부하가 높을 때 수 초) herdr는 `agent start`를
 `agent_pane_busy`로 거부한다. `wrk`는 그 코드에 한해 프로필의 start 창(기본 30초, codex
