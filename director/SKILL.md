@@ -86,7 +86,12 @@ block 밖의 문장은 이 IDs를 약화·재정의할 수 없으며, prose-cont
   필요하다. red rerun이면 verification is not met다.
 <!-- ci-canonical-full-suite:end -->
 
-2. `wrk spawn --role builder --lane BUILDER_LANE --parent DIRECTOR_LANE`으로 스폰한다.
+2. `wrk spawn --role builder --lane BUILDER_LANE --parent DIRECTOR_LANE --task <hk task id>`로
+   스폰한다. `--task`는 필수다 — 없으면 스폰이 usage 에러로 거부되고, 성공 시 그 호출 안에서
+   task claim과 `refs.job_id` 바인딩이 함께 떨어진다(#768). handoffkeep #769부터 잡 없는
+   `tasks next`·`tasks claim`·`claimed`/`in_progress` 전이는 `task_job_required`로
+   거부된다 — 빌더를 위한 수동 claim은 없고, 잡 없는 decide/ops 전이는
+   `--no-job <reason>`으로 사유를 남긴다.
 3. **스폰 직후 relay 라우트에 빌더 레인을 등록**하고 왕복을 확인한다. 미등록 레인의
    escalate/joined는 조용히 유실된다 — 빌더가 오래 조용하면 모델보다 전달 경로를 먼저 의심한다
    (`events/*.json` 존재 + 내 pane 미도착 = 전달 실패).
