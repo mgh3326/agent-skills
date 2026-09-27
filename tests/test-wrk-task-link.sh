@@ -294,6 +294,25 @@ bound="$(hk_refs_job 1)"
 [[ "$(claim_count)" -ge 1 ]] || fail "concurrency: a claim must have run"
 echo "PASS c8 concurrent spawns serialize — exactly one binds the task"
 
+# C9: an arbiter claim that attempted and failed must not reach the link —
+# the task would bind to a job with no registered record (tester finding:
+# cold-db lock race left an hk winner without a job record). Distinct from
+# the arbiter-absent transition, which keeps the hk record as the only link.
+reset_case c9
+hk_add --id 1 >/dev/null
+cat >"$TMP/arbiter-deny" <<'SH'
+#!/bin/sh
+[ "$1" = claim ] && exit 3
+exit 0
+SH
+chmod +x "$TMP/arbiter-deny"
+spawn_try -e ARBITER_BIN="$TMP/arbiter-deny" -- --task 1 --job c9-job
+expect_rc 2 "arbiter claim failure must refuse the spawn at the link gate"
+expect_grep 'arbiter claim failed' "$TMP/stderr.txt" "the refusal must name the cause"
+no_claim "an unregistered job never binds the task"
+[[ "$(hk_field 1 state)" == backlog ]] || fail "task must stay unbound when the job claim failed"
+echo "PASS c9 arbiter-claim failure refuses before the hk bind"
+
 echo "== AC1 inheritance: tester/advisory spawns take the parent task =="
 
 # D1: --parent-job inheritance — task id comes from the parent's claim meta.
@@ -364,6 +383,49 @@ spawn_try -e HK_TASK_ID=9099 -- --parent-job parent-job-5 --job d5-worker
 expect_rc 2 "parent task vs HK_TASK_ID mismatch must refuse"
 expect_grep 'refusing to guess' "$TMP/stderr.txt" "mismatch must fail closed"
 echo "PASS d5 contradicting task sources refuse"
+
+# D6: a corrupt newest claim/reclaim event refuses — the newest event is
+# authoritative and an unreadable one must not fall back to a stale older
+# task_id (tester attack surface).
+reset_case d6
+mkdir -p "$INBOX/parent-job-6/events"
+printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9013}}' \
+  >"$INBOX/parent-job-6/events/00001-job.claim.json"
+printf '%s\n' 'not-json{{{' \
+  >"$INBOX/parent-job-6/events/00002-job.reclaim.json"
+hk_add --id 9013 >/dev/null
+spawn_try -- --parent-job parent-job-6 --job d6-worker
+expect_rc 2 "corrupt newest parent event must refuse"
+expect_grep 'unreadable' "$TMP/stderr.txt" "corrupt newest must be named"
+no_job_dir d6-worker "no job for an unreadable parent event"
+echo "PASS d6 corrupt newest parent event refuses"
+
+# D7: a corrupt OLDER event is ignored when a valid newer one is authoritative.
+reset_case d7
+mkdir -p "$INBOX/parent-job-7/events"
+printf '%s\n' 'garbage' >"$INBOX/parent-job-7/events/00001-job.claim.json"
+printf '%s\n' '{"kind":"job.reclaim","payload":{"task_id":9014}}' \
+  >"$INBOX/parent-job-7/events/00002-job.reclaim.json"
+hk_add --id 9014 >/dev/null
+spawn_try -- --parent-job parent-job-7 --job d7-worker
+expect_rc 0 "a valid newest event wins over a corrupt older one"
+claim_payload="$(event_payload d7-worker job.claim)"
+grep -qE '"task_id" *: *9014' <<<"$claim_payload" ||
+  fail "newest-wins must inherit 9014, not the corrupt older file: $claim_payload"
+echo "PASS d7 valid newest event wins over corrupt older"
+
+# D8: a malformed inherited task id is a usage error — never laundered
+# through --task-hk-bypass into an hk_unreachable override (tester finding:
+# task_id "oops" bypassed as unreachable and spawned rc 0).
+reset_case d8
+mkdir -p "$INBOX/parent-job-8/events"
+printf '%s\n' '{"kind":"job.claim","payload":{"task_id":"oops"}}' \
+  >"$INBOX/parent-job-8/events/00001-job.claim.json"
+spawn_try -- --parent-job parent-job-8 --task-hk-bypass --job d8-worker
+expect_rc 2 "malformed inherited task id must refuse despite bypass"
+expect_grep 'not a positive task id' "$TMP/stderr.txt" "malformed id must be named"
+no_job_dir d8-worker "no job for a malformed inherited task"
+echo "PASS d8 malformed inherited task id refuses despite bypass"
 
 echo "== AC3 version skew: an old handoffkeep is detected, never trusted =="
 

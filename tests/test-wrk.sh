@@ -88,6 +88,24 @@ export HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
 export HK_STATE="$TMP/hk-state.json"
 export HK_TASK_ID=76801
 "$HANDOFFKEEP_BIN" tasks add --id "$HK_TASK_ID" --title "suite-inherited-task" --lane fixture >/dev/null
+# Pre-mint the owner-mode task pool: spawn_base only bumps the counter file,
+# never calls the fixture at spawn time — some cases stub python3 (the fixture
+# is python) to probe the awk TOML fallback, and minting must not die there.
+python3 - "$HK_STATE" <<'PY'
+import json, sys
+path = sys.argv[1]
+try:
+    state = json.load(open(path, encoding="utf-8"))
+except (OSError, ValueError):
+    state = {"tasks": {}}
+for i in range(768001, 768500):
+    state["tasks"][str(i)] = {
+        "id": i, "lane": "", "title": "spawn-base pool", "kind": "implement",
+        "state": "backlog", "priority": 0, "refs": {}, "claimed_by": "",
+        "created_by": "fixture", "created_at": "2026-01-01T00:00:00+00:00",
+        "updated_at": "2026-01-01T00:00:00+00:00", "events": []}
+json.dump(state, open(path, "w", encoding="utf-8"))
+PY
 
 run_fail() {
   if "$@" >/dev/null 2>&1; then
@@ -110,6 +128,14 @@ expect_exit() {
 }
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
+
+# mint_task — next id from the pre-minted pool. File-backed so it survives the
+# command-substitution subshells most spawn callers use.
+mint_task() {
+  local id=$(( $(cat "$TMP/mint-seq" 2>/dev/null || echo 768000) + 1 ))
+  printf '%s\n' "$id" >"$TMP/mint-seq"
+  printf '%s\n' "$id"
+}
 
 event_count() {
   find "$1" -name "*$2.json" 2>/dev/null | wc -l | tr -d ' '
@@ -150,13 +176,7 @@ spawn_base() {
     *" --task "*|*" --parent-job "*) ;;
     *)
       if [[ -z "${TEST_NO_TASK:-}" ]]; then
-        # Mint with an explicit id: parsing tasks-add output needs python3,
-        # which some cases deliberately stub out (awk-fallback probes). A file
-        # counter survives command-substitution subshells.
-        SPAWN_BASE_TASK=$(( $(cat "$TMP/mint-seq" 2>/dev/null || echo 768000) + 1 ))
-        printf '%s\n' "$SPAWN_BASE_TASK" >"$TMP/mint-seq"
-        "$HANDOFFKEEP_BIN" tasks add --id "$SPAWN_BASE_TASK" --title "spawn-base task" >/dev/null ||
-          fail "spawn_base: fixture task mint failed"
+        SPAWN_BASE_TASK="$(mint_task)"
         extra+=(--task "$SPAWN_BASE_TASK")
       fi ;;
   esac
@@ -2449,12 +2469,22 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
 # Herdr call" stays provable.
 spawn_deny() {
   local log="$1" model="$2"; shift 2
+  local extra=("$@")
+  # #768: --role builder requires --task before the gate these cases probe.
+  # Draw from the same pre-minted pool spawn_base uses; worker-role calls keep
+  # the suite's HK_TASK_ID env inheritance instead.
+  case " ${extra[*]-} " in
+    *" --task "*|*" --parent-job "*) ;;
+    *" --role builder "*)
+      extra+=(--task "$(mint_task)")
+      printf '%s\n' "${extra[@]: -1}" >>"$TMP/spawn-task.log" ;;
+  esac
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml" \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$log" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "$@"
+    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
 }
 
 # AC-1: with no REF the consult_only profile is still gate-denied — the

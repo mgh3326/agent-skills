@@ -2066,7 +2066,7 @@ arbiter_admit() {
       set -e
       [[ "$duplicate_rc" -eq 0 ]] || return "$duplicate_rc"
       ;;
-    *) warn "arbiter quota-pool claim failed (exit $claim_rc); continuing spawn"; return 0 ;;
+    *) warn "arbiter quota-pool claim failed (exit $claim_rc); continuing spawn"; ARBITER_CLAIM_FAILED=1; return 0 ;;
   esac
 
   local gate_file gate_rc record_json record_rc parsed rc
@@ -5168,25 +5168,38 @@ except subprocess.TimeoutExpired:
 # task_resolve_parent — TASK_INHERITED_FROM is set by the caller to a parent
 # job id; fill TASK_ID from its newest claim/reclaim payload. Local read only:
 # the job registry under wrk_jobs_root is the same one the claim landed in.
+# The newest claim/reclaim event is authoritative: an unreadable one dies
+# rather than letting a stale older task_id through (tester finding).
 task_resolve_parent() {
-  local parent="$1" dir
+  local parent="$1" dir rc
   dir="$(wrk_jobs_root)/$parent/events"
-  TASK_ID="$(python3 - "$dir" <<'PY'
+  if TASK_ID="$(python3 - "$dir" <<'PY'
 import json, os, sys
-try: names = sorted(os.listdir(sys.argv[1]))
-except OSError: raise SystemExit(1)
-task = ""
-for name in names:
-    try: o = json.load(open(os.path.join(sys.argv[1], name), encoding="utf-8"))
-    except (OSError, json.JSONDecodeError): continue
-    if o.get("kind") not in ("job.claim", "job.reclaim"): continue
-    p = o.get("payload", o)
-    v = p.get("task_id")
-    if isinstance(v, int): task = str(v)
-    elif isinstance(v, str) and v: task = v
-print(task)
+try:
+    names = sorted(n for n in os.listdir(sys.argv[1])
+                   if n.endswith(("claim.json", "reclaim.json")))
+except OSError:
+    raise SystemExit(1)
+if not names:
+    raise SystemExit(0)
+# Seq-prefixed names sort newest-last; only that event is authoritative.
+try:
+    o = json.load(open(os.path.join(sys.argv[1], names[-1]), encoding="utf-8"))
+except (OSError, json.JSONDecodeError):
+    raise SystemExit(2)
+p = o.get("payload", o)
+v = p.get("task_id")
+print(v if isinstance(v, int) else (v if isinstance(v, str) else ""))
 PY
-)" || TASK_ID=""
+)"; then
+    :
+  else
+    rc=$?
+    if [[ "$rc" -eq 2 ]]; then
+      die "parent job '$parent' newest claim/reclaim event is unreadable — refusing to guess the task from older events"
+    fi
+    TASK_ID=""
+  fi
 }
 
 # task_validate — usage-error stage: resolve TASK_ID or die before any side
@@ -5242,11 +5255,13 @@ task_validate() {
     fi
     [[ -n "$TASK_ID" ]] ||
       die "parent job '$PARENT_JOB' has no task_id in its claim/reclaim meta — pass --task explicitly or re-register the parent with --task"
+    { [[ "$TASK_ID" =~ ^[0-9]+$ ]] && (( 10#$TASK_ID >= 1 )); } ||
+      die "task id '$TASK_ID' resolved from parent job '$PARENT_JOB' is not a positive task id — pass --task explicitly"
     TASK_LINK_MODE="inherited"
     return 0
   fi
   if [[ -n "$env_task" ]]; then
-    [[ "$env_task" =~ ^[0-9]+$ ]] ||
+    { [[ "$env_task" =~ ^[0-9]+$ ]] && (( 10#$env_task >= 1 )); } ||
       die "HK_TASK_ID env is not a positive task id ('$env_task') — pass --task explicitly"
     TASK_ID="$env_task"
     TASK_LINK_MODE="inherited"
@@ -5373,6 +5388,13 @@ PY
 # winner: the losing spawn dies here and its pane is cleaned by the EXIT trap.
 hk_task_link() {
   [[ -n "$TASK_ID" ]] || return 0
+  # An arbiter claim attempted but failed (a locked/partial db is not the
+  # installation-transition absence): binding the task to a job whose own
+  # record never landed would dangle the link — refuse instead. A pure
+  # arbiter-absent transition keeps the hk record as the only link, same as
+  # the other no-arbiter paths.
+  [[ "${ARBITER_CLAIM_FAILED:-0}" -ne 1 ]] ||
+    die "arbiter claim failed for job $JOB_ID — refusing to bind task $TASK_ID to an unregistered job (pane and quota record are being released)"
   case "$TASK_LINK_STATUS" in
     link|bypassed:*) ;;
     already_linked|inherited) hk_task_link_event "$TASK_LINK_STATUS" ""; return 0 ;;
@@ -5411,7 +5433,7 @@ raise SystemExit(0 if ok else 1)' "$LABEL" "$JOB_ID"; then
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS=""
+  OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
   while [[ $# -gt 0 ]]; do
