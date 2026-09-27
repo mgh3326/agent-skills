@@ -98,7 +98,7 @@ builder 가 워커·tester 스폰 없이 직접 구현하는 **단독 모드**�
 | `oc-solar4` | **B** 실측 확정(reps `id=699`·`700`·`702`: 구조·닫힌 어휘 위반 0, 원문 충실도는 1패스 실패·반복 개정으로 도달, 판단·의미는 3건 모두 약함). `T1` 한정·tester 금지를 유지한다. **산출물 자체가 판단인 과업은 배정하지 않는다**(감사 결론·리스크 분류·채택 여부 판정 등) — 검토가 뒤따르는 기계 검증 가능한 변환·태깅·형식화는 허용한다. 운용은 기계 검사 가능한 규칙 + 자력 개정 허용이 최적이며, **1패스 산출은 신뢰하지 않는다**. 브리프에 '승인 대기 없이 완주'를 명시한다(승인 대기 정지 1회 실측). 브리프에는 §3의 **rate limit 대응 절**(429·rate limit 시 지수 백오프, 막히면 중단·보고)도 반드시 포함한다. 상시 배정은 하지 않는다. 장기 정본과 등급 조정은 scopefuel을 따른다. |
 | `devin-glm52`·`devin-swe17` | **등재 보류** — 사유: SWE-2 대비 우위 없음(구세대·전세대이고 컨텍스트도 작다). 프로필은 이미 있으니 필요해지면 reps 만 돌리면 된다 — 배제가 아니라 **측정 비용의 우선순위** 문제다. devin-swe2 와 동일한 무인 argv(모델명만 `glm-5-2`·`swe-1-7`). scopefuel `devin` 풀 공유. |
 | `devin-ds41` | **미측정 → T1/T2** (유료 $0.22/1M in, 벤치 TB2.1 90.6). devin-swe2 와 동일한 무인 argv(모델명만 `deepseek-v4-1-flash-high`). reps 3건으로 급 확정. scopefuel `devin` 풀 공유 — 유료 사용 시 태스크 note 에 모델·급을 남긴다(사후 비용 귀속). |
-| `devin-swe2-medium`·`devin-swe2-max`·`devin-ds41-max` | **미측정(C) → T1/T2** (#635 effort 변형 — devin 에서 effort 는 모델 id 안에 있고 `--effort` 플래그는 없다. 런그별 별도 프로필, high 런그의 A+ 는 상속하지 않는다). devin-swe2 와 동일한 무인 argv에 모델명만 `swe-2-medium`·`swe-2-max`·`deepseek-v4-1-flash-max`. **swe-2 medium·max 는 무료** — #594 급 측정의 기본 런그. `devin-swe2-medium`·`devin-swe2-max` 는 `--role builder` 도 받는다(builder-devin 의 effort 경로). #666 부터 런그별 빌더 철자도 있다 — `builder-devin-medium`·`builder-devin-max`(동일 argv)와 유료 `builder-ds41`·`builder-ds41-max`(운영자 ds41-builder 정책; `devin-ds41`·`devin-ds41-max` 철자는 계속 worker 전용). scopefuel `devin` 풀 공유, reps 로 급 확정. |
+| `devin-swe2-medium`·`devin-swe2-max`·`devin-ds41-max` | `devin-swe2-medium` = **A**, `devin-swe2-max`·`devin-ds41-max` = **미측정(C) → T1/T2** (#635 effort 변형 — devin 에서 effort 는 모델 id 안에 있고 `--effort` 플래그는 없다. 런그별 별도 프로필, high 런그의 A+ 는 상속하지 않는다). swe2-medium 의 A 는 scopefuel 정본 그대로다(2026-09-27 운영자 결정, hk:doc 5177 item 2 — GRADE_TABLE scopefuel `1aa57ec5`, catalog `51322a09`). devin-swe2 와 동일한 무인 argv에 모델명만 `swe-2-medium`·`swe-2-max`·`deepseek-v4-1-flash-max`. **swe-2 medium·max 는 무료** — #594 급 측정의 기본 런그. `devin-swe2-medium`·`devin-swe2-max` 는 `--role builder` 도 받는다(builder-devin 의 effort 경로). #666 부터 런그별 빌더 철자도 있다 — `builder-devin-medium`·`builder-devin-max`(동일 argv)와 유료 `builder-ds41`·`builder-ds41-max`(운영자 ds41-builder 정책; `devin-ds41`·`devin-ds41-max` 철자는 계속 worker 전용). scopefuel `devin` 풀 공유, reps 로 급 확정. |
 
 급표 각주 (2026-09-14 운영자 결정 `free-lane-aggressive-use-3`·`devin-pro-paid-models`):
 
@@ -400,8 +400,12 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
 - kiro 워커: "Linear는 읽기만, 이슈·코멘트 변경 금지" 필수(kiro Linear MCP는 write 가능).
 - 무인 워커는 승인 우회 플래그 필요(codex `--yolo`, agy `--dangerously-skip-permissions`) —
   `wrk spawn` 프로필 매핑에 내장. mock 레인은 `-L mock` + `MOCK_MCP_PROFILE` 필수.
-- **스폰 = handoffkeep tasks 기록 의무**: 스폰과 매 라운드를 tasks 큐에 기록한다
-  (`claim` · `transition` · `refs`(`--pr`/`--head-sha`/`--report-path`/`--job-id`)). 태스크
+- **스폰 = handoffkeep tasks 기록 의무**: 스폰의 claim·`refs.job_id` 바인딩은 `wrk spawn
+  --task`가 한 번의 `tasks claim --by --job-id`로 직접 쓴다(#768) — 호출자가 따로
+  `tasks claim`·`tasks next`를 치지 않는다(handoffkeep #769부터 잡 링크 없는
+  `claimed`·`in_progress` 기록은 `task_job_required`로 거부; 잡 없는 decide/ops 전이는
+  `--no-job <reason>`을 단다). 이후의 `transition`·`refs`(`--pr`/`--head-sha`/
+  `--report-path`)와 매 라운드 기록 의무는 그대로다. 태스크
   상태의 정본은 세션 기억이 아니라 **tasks 큐**다 — 놓침 방지의 근간. Linear는 **빌더급
   태스크(PR 1건 루프) 중 진행 중인 것만** fable이 1:1 이슈로 관리한다. **워커·tester 단위
   이슈는 만들지 않는다.**

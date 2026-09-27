@@ -320,12 +320,22 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
 
 ## 큐와 상위 레인 보고
 
-다음 작업 선택과 상태 전이는 우선 다음 인터페이스를 사용한다.
+빌더의 task는 스폰 시점에 이미 묶여 있다 — `wrk spawn --task`가 그 task를 claim하고
+`refs.job_id`를 잡에 바인딩한다(#768). 🔴 handoffkeep #769(378c5b53, 배포됨)부터 잡 없는
+`tasks next`와 `refs.job_id` 없이 `claimed`·`in_progress`에 잡히는 claim·전이는
+`task_job_required`로 거부된다 — 빌더는 스스로 `tasks next`·`tasks claim`을 치지 않는다.
+빌더의 큐 쓰기는 자기 task의 상태 조회·전이뿐이다.
 
 ```bash
-handoffkeep tasks next
-handoffkeep tasks transition <job> <state>
+handoffkeep tasks show <task-id>
+handoffkeep tasks transition <task-id> --to <state>
 ```
+
+`claimed`·`in_progress`에 잡히는 전이는 그 task가 `refs.job_id`를 가져야 한다 — 잡 없이
+그 두 상태로 잡아야 하는 decide/ops 전이는 `--no-job <reason>`으로 사유를 기록한다
+(`--job-id`와 상호배타). tester·자문 같은 자식 스폰은 부모 task를 상속한다(463de3a3 이전에
+등록된 잡의 pane에서는 `HK_TASK_ID`로 상속). 그 외 상태로의 전이는 잡 링크를 요구하지
+않는다.
 
 현재 이 인터페이스가 없으면, `~/work/herdr-inbox/jobs/<job>/`의 파일 인박스를 상태 정본으로
 쓴다. 인터페이스가 없는 것을 근거로 상태를 추측하거나 새 큐를 만들지 않는다.
