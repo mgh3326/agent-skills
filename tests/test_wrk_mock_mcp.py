@@ -139,6 +139,15 @@ class IsolationTests(unittest.TestCase):
         # Keep that legacy preparation inside this fixture, including variants.
         for name in ("KIMI_CODE_HOME", "KIMI_CODE_LOW_HOME", "KIMI_CODE_HIGH_HOME", "KIMI_CODE_MAX_HOME"):
             self.env[name] = str(self.fixture_home / name.lower())
+        # #912: the Devin trust seeding is fail-closed on a missing store and
+        # runs before the unsupported-kind refusal, so pre-seed the fixture
+        # XDG store with the spawn cwd — a covered no-op that keeps the
+        # consumer refusals exercised here identical. The trust contract
+        # itself is tested in tests/test-wrk.sh.
+        devin_cli = self.fixture_home / ".local/share/devin/cli"
+        devin_cli.mkdir(parents=True)
+        (devin_cli / "trusted_workspaces.json").write_text(
+            json.dumps({"trusted_paths": [str(self.cwd.resolve())]}))
         python_bin = self.base / "python-bin"
         python_bin.mkdir()
         (python_bin / "python3").symlink_to(sys.executable)
