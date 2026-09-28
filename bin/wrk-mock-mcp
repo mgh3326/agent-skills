@@ -1,0 +1,485 @@
+#!/usr/bin/env python3
+"""Fail-closed mock MCP connection planner and private stdio gateway.
+
+Only prepare starts the selected upstream, once. Both pre-injection verification
+and the harness connect to that SAME process through a private Unix socket.
+No HTTP client, application imports, credentials files, or env-file support.
+"""
+import argparse
+import asyncio
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+POLICY = ROOT / "wrk-mcp/profiles.json"
+POLICY_SHA256 = "cf5831d4713ea494fa639026001aaff519bc3b6657e076d3f277dec7f5ce5dc4"
+REFUSAL = 79
+SUPPORTED = {"codex", "claude"}
+UNSUPPORTED = {
+    "devin": "--config replaces user settings, not the merged project/plugin MCP catalog",
+    "grok": "no exclusive MCP configuration option; leader and project/plugin catalogs merge",
+    "kimi": "Kimi Code merges user/project/plugin MCP; installed CLI has no exclusive MCP flag",
+    "kiro": "agent/global/project MCP merge has no verified exclusive connection adapter",
+    "opencode": "global/project/remote/plugin configuration merge has no verified exclusive adapter",
+    "agy": "user/project/plugin MCP merge has no verified exclusive connection adapter",
+}
+
+
+class Refused(Exception):
+    pass
+
+
+def require(ok, reason):
+    if not ok:
+        raise Refused(reason)
+
+
+def digest(path):
+    p = Path(path)
+    if not p.exists():
+        return None
+    require(p.is_file() and not p.is_symlink(), "configuration must be a regular file")
+    return hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def read_json(path):
+    return json.loads(Path(path).read_text())
+
+
+def policy(profile):
+    require(digest(POLICY) == POLICY_SHA256, "reviewed profile table changed (including aliases); review required")
+    profiles = read_json(POLICY)["profiles"]
+    require(profile and profile not in {"default", "full"}, "explicit non-default mock profile required")
+    require(profile in profiles, "unknown or unreviewed mock profile")
+    variants = profiles[profile]
+    for tools in variants:
+        require(tools and len(set(tools)) == len(tools), "invalid reviewed catalog")
+        for name in tools:
+            require(not re.search(r"(^|_)(live|real)(_|$)", name, re.I)
+                    and name not in {"place_order", "modify_order", "cancel_order", "trade", "execute_order"},
+                    "live order surface in reviewed profile table")
+    return variants
+
+
+def catalog(tools, variants):
+    require(isinstance(tools, list) and tools, "missing tools/list catalog")
+    names = [t.get("name") if isinstance(t, dict) else None for t in tools]
+    require(all(isinstance(n, str) for n in names) and len(set(names)) == len(names), "invalid tool catalog")
+    require(any(set(names) == set(v) for v in variants),
+            "unexpected tool/alias or missing tool; selected profile catalog does not match (no full fallback)")
+    return set(names)
+
+
+def descriptor(path, profile):
+    d = read_json(path)
+    require(set(d) == {"profile", "server"} and d["profile"] == profile, "connection profile mismatch")
+    s = d["server"]
+    require(isinstance(s, dict) and set(s) == {"command", "args", "cwd", "env"},
+            "only explicit stdio command/args/cwd/env is supported; URL profile env cannot propagate")
+    require(isinstance(s["command"], str) and Path(s["command"]).is_absolute()
+            and os.access(s["command"], os.X_OK), "stdio command must be an absolute executable")
+    require(isinstance(s["cwd"], str) and Path(s["cwd"]).is_absolute()
+            and Path(s["cwd"]).is_dir(), "stdio cwd must be an existing absolute directory")
+    require(isinstance(s["args"], list) and all(isinstance(a, str) for a in s["args"]), "invalid stdio args")
+    require(s["env"] == {"MCP_PROFILE": profile, "MCP_TYPE": "stdio"}, "missing explicit server profile env propagation")
+    require(not any(re.search(r"env[_-]?file|(^|[/=])\.env($|[./=])", a, re.I) for a in s["args"]),
+            "env file arguments are unsupported")
+    require(not any("\n" in a or "\r" in a or "\x00" in a for a in [s["command"], s["cwd"]] + s["args"]),
+            "invalid connection path/args")
+    return d
+
+
+def has_connections(value):
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if k in {"mcp_servers", "mcpServers", "managedMcpServers", "plugins", "enabledPlugins"} and v:
+                return True
+            if has_connections(v):
+                return True
+    elif isinstance(value, list):
+        return any(has_connections(v) for v in value)
+    return False
+
+
+def isolation(kind, cwd):
+    require(kind in SUPPORTED, "unsupported mock harness: " + UNSUPPORTED.get(kind, "unknown kind"))
+    home = Path.home()
+    ancestors = [cwd] + list(cwd.parents)
+    if kind == "codex":
+        conf_home = Path(os.environ.get("CODEX_HOME", home / ".codex")).resolve()
+        paths = [conf_home / "config.toml", conf_home / "managed_config.toml"]
+        paths += [p / ".codex/config.toml" for p in ancestors]
+        paths += [p / ".mcp.json" for p in ancestors]
+        managed = [conf_home / "managed_config.toml", conf_home / "requirements.toml",
+                   Path("/etc/codex/config.toml"), Path("/etc/codex/managed_config.toml"), Path("/etc/codex/requirements.toml"),
+                   Path("/Library/Application Support/Codex/managed_config.toml")]
+        plugin_dirs = [conf_home / "plugins"] + [p / ".codex/plugins" for p in ancestors]
+        env = {"CODEX_HOME": str(conf_home)}
+    else:
+        conf_home = Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude")).resolve()
+        # Server-managed OAuth policy may PROVIDE extra servers independently
+        # of --strict-mcp-config. Its effective catalog cannot be proved from
+        # local MCP files without contacting the account service. Refuse that
+        # auth/remote path, including opaque cached policy, without reading
+        # credentials. A clean local API context can still use the adapter.
+        policy_state = [conf_home / name for name in (".credentials.json", "remote-settings.json", "policy-limits.json")]
+        remote_env = ("CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR",
+                      "CLAUDE_CODE_SESSION_ACCESS_TOKEN", "CLAUDE_CODE_SESSION_INGRESS_URL")
+        require(not any(p.exists() for p in policy_state) and not any(os.environ.get(k) for k in remote_env),
+                "Claude OAuth/remote policy context cannot prove exclusive MCP catalog")
+        paths = [home / ".claude.json", conf_home / ".claude.json", conf_home / "settings.json"]
+        paths += [p / ".mcp.json" for p in ancestors]
+        paths += [p / rel for p in ancestors for rel in (".claude/settings.json", ".claude/settings.local.json")]
+        managed = [Path("/etc/claude-code/managed-mcp.json"), Path("/etc/claude-code/managed-settings.json"),
+                   Path("/Library/Application Support/ClaudeCode/managed-mcp.json"),
+                   Path("/Library/Application Support/ClaudeCode/managed-settings.json"), conf_home / "managed-settings.json"]
+        plugin_dirs = [conf_home / "plugins"] + [p / ".claude/plugins" for p in ancestors]
+        env = {"CLAUDE_CONFIG_DIR": str(conf_home)}
+    require(not any(p.exists() for p in managed), "managed MCP/config override cannot prove isolation")
+    require(not any(p.exists() and any(p.iterdir()) for p in plugin_dirs), "plugin MCP catalog cannot prove isolation")
+    fingerprints = {}
+    for p in paths:
+        fingerprints[str(p)] = digest(p)
+        if not p.exists():
+            continue
+        if p.suffix == ".toml":
+            try:
+                import tomllib
+            except ImportError:
+                try:
+                    import tomli as tomllib
+                except ImportError:
+                    raise Refused("Codex config inspection requires Python 3.11 or tomli; no parser fallback")
+            d = tomllib.loads(p.read_text())
+        else:
+            d = read_json(p)
+        require(kind != "claude" or not isinstance(d, dict) or not d.get("oauthAccount"),
+                "Claude OAuth account policy cannot prove exclusive MCP catalog")
+        require(not has_connections(d), "conflicting global/project MCP or plugin configuration")
+    return fingerprints, env
+
+
+def compact(value):
+    return json.dumps(value, separators=(",", ":"))
+
+
+async def socket_rpc(socket, method):
+    r, w = await asyncio.wait_for(asyncio.open_unix_connection(socket), 10)
+    try:
+        w.write((compact({"jsonrpc": "2.0", "id": 1, "method": method}) + "\n").encode())
+        await w.drain()
+        response = json.loads(await asyncio.wait_for(r.readline(), 10))
+        require("error" not in response, "configured connection refused catalog verification")
+        return response["result"]
+    finally:
+        w.close()
+        await w.wait_closed()
+
+
+def verify(plan_path, argv, require_attached=False, cwd=None):
+    p = read_json(plan_path)
+    policy(p["profile"])
+    require(cwd is not None and str(Path(cwd).resolve(strict=True)) == p["cwd"], "checked cwd differs from loaded harness cwd")
+    require("--wrk-pane-env" in argv, "missing harness environment evidence")
+    split = argv.index("--wrk-pane-env")
+    pane_args, argv = argv[split + 1:], argv[:split]
+    pane_env = {}
+    require(len(pane_args) % 2 == 0, "invalid harness environment evidence")
+    for key, val in zip(pane_args[::2], pane_args[1::2]):
+        require(key == "--env" and "=" in val, "invalid harness environment evidence")
+        name, value = val.split("=", 1)
+        pane_env[name] = value
+    require(all(pane_env.get(k) == v for k, v in p["env"].items())
+            and pane_env.get("MCP_PROFILE") == p["profile"], "missing/conflicting harness config env propagation")
+    require(argv == p["argv"], "checked harness argv differs from the loaded connection")
+    fingerprints, env = isolation(p["kind"], Path(p["cwd"]))
+    require(fingerprints == p["fingerprints"] and env == p["env"], "harness config changed after connection generation")
+    for path, sha in p["artifacts"].items():
+        require(digest(path) == sha, "generated connection configuration changed")
+    result = asyncio.run(socket_rpc(p["socket"], "wrk/verify"))
+    require(result.get("profile") == p["profile"] and result.get("policy") == POLICY_SHA256, "checked connection identity mismatch")
+    require(not require_attached or result.get("attached") is True, "required MCP connection was not loaded by the session")
+
+
+def prepare(a):
+    variants = policy(a.profile)
+    require(a.kind in SUPPORTED, "unsupported mock harness: " + UNSUPPORTED.get(a.kind, "unknown kind"))
+    require(a.config, "WRK_MOCK_MCP_CONFIG explicit connection descriptor required")
+    d = descriptor(a.config, a.profile)
+    cwd = Path(a.cwd).resolve(strict=True)
+    fingerprints, env = isolation(a.kind, cwd)
+    require(not any(x.startswith(("--mcp", "--strict-mcp", "--plugin", "--settings", "--setting-sources", "--remote"))
+                    or "mcp_servers" in x for x in a.argv), "conflicting harness connection options")
+    directory = Path(tempfile.mkdtemp(prefix="wrk-mcp-"))
+    os.chmod(directory, 0o700)
+    socket = str(directory / "s")
+    upstream = directory / "upstream.json"
+    upstream.write_text(compact(d))
+    os.chmod(upstream, 0o600)
+    gateway = {"command": sys.executable, "args": [str(Path(__file__).resolve()), "connect", "--socket", socket]}
+    config = directory / "mcp.json"
+    config.write_text(compact({"mcpServers": {"wrk_mock": gateway}}))
+    os.chmod(config, 0o600)
+    argv = a.argv[:]
+    if a.kind == "claude":
+        argv += ["--strict-mcp-config", "--mcp-config", str(config), "--setting-sources", ""]
+    else:
+        # Every other config layer was enumerated and proven empty above.
+        # Account Apps, plugin MCP, and automatic skill dependency connections
+        # are additional catalogs even without an mcp_servers config table.
+        for feature in ("apps", "enable_mcp_apps", "codex_apps_mcp_2026_07_28", "plugins",
+                        "remote_plugin", "skill_mcp_dependency_install"):
+            argv += ["-c", "features." + feature + "=false"]
+        prefix = "mcp_servers.wrk_mock."
+        for key, value in dict(gateway, required=True).items():
+            argv += ["-c", prefix + key + "=" + compact(value)]
+    p = {"kind": a.kind, "cwd": str(cwd), "profile": a.profile, "socket": socket,
+         "argv": argv, "env": env, "fingerprints": fingerprints,
+         "artifacts": {str(upstream): digest(upstream), str(config): digest(config)}}
+    plan = directory / "plan.json"
+    plan.write_text(compact(p))
+    os.chmod(plan, 0o600)
+    process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "serve", "--plan", str(plan)],
+                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                               start_new_session=True)
+    try:
+        deadline = time.monotonic() + 12
+        while not Path(socket).exists() and process.poll() is None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if process.poll() is not None or not Path(socket).exists():
+            failure = directory / "failure.json"
+            reason = read_json(failure)["reason"] if failure.exists() else "startup timeout; catalog unverified"
+            raise Refused("selected stdio connection: " + reason)
+        evidence = ["--wrk-pane-env", "--env", "MCP_PROFILE=" + a.profile]
+        for k, v in env.items():
+            evidence += ["--env", k + "=" + v]
+        verify(str(plan), argv + evidence, cwd=str(cwd))
+    except BaseException:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        shutil.rmtree(directory)
+        raise
+    print(str(plan))
+
+
+async def serve(plan):
+    p = read_json(plan)
+    variants = policy(p["profile"])
+    d = descriptor(next(iter(p["artifacts"])), p["profile"])
+    s = d["server"]
+    # Bounded inheritance: no ENV_FILE, provider tokens, or accidental profile fallback.
+    env = {k: v for k, v in os.environ.items() if k in {"PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "SYSTEMROOT"}}
+    env.update(s["env"])
+    proc = await asyncio.create_subprocess_exec(s["command"], *s["args"], cwd=s["cwd"], env=env,
+                                               stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                                               stderr=asyncio.subprocess.DEVNULL)
+    task = asyncio.current_task()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        asyncio.get_running_loop().add_signal_handler(sig, task.cancel)
+    lock = asyncio.Lock()
+    counter = 0
+    stop = asyncio.Event()
+    attached = False
+
+    async def rpc(method, params=None):
+        nonlocal counter
+        async with lock:
+            counter += 1
+            request = {"jsonrpc": "2.0", "id": counter, "method": method, "params": params or {}}
+            proc.stdin.write((compact(request) + "\n").encode())
+            await proc.stdin.drain()
+            while True:
+                line = await asyncio.wait_for(proc.stdout.readline(), 10)
+                require(line, "selected stdio server closed connection")
+                response = json.loads(line)
+                if response.get("id") == counter:
+                    require("error" not in response, "selected stdio server refused request")
+                    return response["result"]
+                # Ignore notifications; upstream requests are not a tool bypass.
+
+    async def list_tools():
+        tools, cursors, cursor = [], set(), None
+        for _ in range(32):
+            page = await rpc("tools/list", {"cursor": cursor} if cursor else {})
+            batch = page.get("tools")
+            require(isinstance(batch, list), "invalid tools/list page")
+            tools.extend(batch)
+            cursor = page.get("nextCursor")
+            if not cursor:
+                break
+            require(isinstance(cursor, str) and cursor not in cursors, "unverifiable tools/list pagination")
+            cursors.add(cursor)
+        else:
+            raise Refused("unverifiable tools/list pagination")
+        catalog(tools, variants)
+        return tools
+
+    async def client(reader, writer):
+        nonlocal attached
+        owns_attach = False
+        try:
+            while True:
+                line = await reader.readline()
+                if not line:
+                    break
+                q = json.loads(line)
+                method = q.get("method")
+                if "id" not in q:
+                    continue
+                response = {"jsonrpc": "2.0", "id": q["id"]}
+                try:
+                    if method == "wrk/attach":
+                        require(not attached, "connection already attached to a harness")
+                        attached = owns_attach = True
+                        result = {}
+                    elif method == "wrk/stop":
+                        stop.set()
+                        result = {}
+                    elif method == "wrk/verify":
+                        await list_tools()
+                        result = {"profile": p["profile"], "policy": POLICY_SHA256, "attached": attached}
+                    elif not owns_attach:
+                        raise Refused("MCP client must attach to the checked connection")
+                    elif method == "initialize":
+                        result = {"protocolVersion": q.get("params", {}).get("protocolVersion", "2024-11-05"),
+                                  "capabilities": {"tools": {}}, "serverInfo": {"name": "wrk-mock-guard", "version": "1"}}
+                    elif method == "ping":
+                        result = {}
+                    elif method == "tools/list":
+                        result = {"tools": await list_tools()}
+                    elif method == "tools/call":
+                        params = q.get("params", {})
+                        require(params.get("name") in catalog(await list_tools(), variants), "unapproved tool/alias call")
+                        result = await rpc(method, params)
+                    else:
+                        raise Refused("only reviewed tools are exposed; MCP method refused")
+                    response["result"] = result
+                except (Refused, ValueError, KeyError, asyncio.TimeoutError):
+                    response["error"] = {"code": -32000, "message": "mock MCP isolation refused request"}
+                writer.write((compact(response) + "\n").encode())
+                await writer.drain()
+        finally:
+            writer.close()
+            if owns_attach:
+                stop.set()
+
+    try:
+        await rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
+                                 "clientInfo": {"name": "wrk-mock-check", "version": "1"}})
+        proc.stdin.write((compact({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n").encode())
+        await proc.stdin.drain()
+        await list_tools()
+        server = await asyncio.start_unix_server(client, p["socket"])
+        os.chmod(p["socket"], 0o600)
+        async with server:
+            # Unattached failed spawns cannot leave an immortal server behind.
+            for _ in range(180):
+                if attached or stop.is_set():
+                    break
+                try:
+                    await asyncio.wait_for(stop.wait(), 1)
+                except asyncio.TimeoutError:
+                    pass
+            if attached:
+                await stop.wait()
+    finally:
+        if proc.returncode is None:
+            proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), 3)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+        Path(p["socket"]).unlink(missing_ok=True)
+
+
+async def connect(socket):
+    reader, writer = await asyncio.open_unix_connection(socket)
+    writer.write((compact({"jsonrpc": "2.0", "id": 0, "method": "wrk/attach"}) + "\n").encode())
+    await writer.drain()
+    require("error" not in json.loads(await reader.readline()), "checked connection attachment refused")
+    stdin = asyncio.StreamReader()
+    await asyncio.get_running_loop().connect_read_pipe(lambda: asyncio.StreamReaderProtocol(stdin), sys.stdin)
+
+    async def incoming():
+        while True:
+            line = await stdin.readline()
+            if not line:
+                return
+            writer.write(line)
+            await writer.drain()
+
+    async def outgoing():
+        while True:
+            line = await reader.readline()
+            if not line:
+                return
+            sys.stdout.buffer.write(line)
+            sys.stdout.buffer.flush()
+
+    tasks = [asyncio.create_task(incoming()), asyncio.create_task(outgoing())]
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for t in tasks:
+            t.cancel()
+        writer.close()
+        await writer.wait_closed()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("action", choices=["prepare", "verify", "serve", "connect", "stop"])
+    parser.add_argument("--kind")
+    parser.add_argument("--cwd")
+    parser.add_argument("--profile")
+    parser.add_argument("--config")
+    parser.add_argument("--plan")
+    parser.add_argument("--socket")
+    parser.add_argument("--require-attached", action="store_true")
+    raw = sys.argv[1:]
+    split = raw.index("--") if "--" in raw else len(raw)
+    a = parser.parse_args(raw[:split])
+    a.argv = raw[split + 1:]
+    try:
+        if a.action == "prepare":
+            prepare(a)
+        elif a.action == "verify":
+            verify(a.plan, a.argv, a.require_attached, a.cwd)
+        elif a.action == "serve":
+            asyncio.run(serve(a.plan))
+        elif a.action == "connect":
+            asyncio.run(connect(a.socket))
+        else:
+            asyncio.run(socket_rpc(read_json(a.plan)["socket"], "wrk/stop"))
+    except (Refused, OSError, ValueError, KeyError, TypeError, asyncio.TimeoutError):
+        # Never echo parser values, server stderr, URLs, or config contents.
+        e = sys.exc_info()[1]
+        reason = str(e) if isinstance(e, Refused) else "unreadable/invalid isolation configuration or unavailable checked connection"
+        if a.action == "serve" and a.plan:
+            try:
+                failure = Path(a.plan).parent / "failure.json"
+                failure.write_text(compact({"reason": reason}))
+                os.chmod(failure, 0o600)
+            except OSError:
+                pass
+        print("wrk: mock MCP isolation refused: " + reason, file=sys.stderr)
+        return REFUSAL
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
