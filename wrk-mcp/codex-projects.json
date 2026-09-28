@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "review": "director-1 Q-41; builder inventory 2026-09-28",
+  "required_enabled_tool_count": 30,
+  "projects": {
+    "auto_trader-operator": {
+      "purpose": "Operator briefing and request routing with the current approved read tools",
+      "evidence": "AGENTS.md:24-30; mock/CLAUDE.md:94-104",
+      "mock": "Attached project refuses guarded mock spawn; use a separately reviewed clean root"
+    },
+    "auto_trader": {
+      "purpose": "Explicit development and analysis MCP use",
+      "evidence": "0cde15ddbee104bc527b45543a22f3d86544da10 app/mcp_server/main.py:54,185; app/mcp_server/README.md:2601-2613"
+    },
+    "strategy-lab": {
+      "purpose": "Analysis only; preserve the current approved read tools, without order or policy mutation",
+      "evidence": "f226278cd2da002a85fc8d7e5c18c00733b33473 CLAUDE.md:23-25,41-44; .kickoff-brief.md:5"
+    }
+  },
+  "excluded": {
+    "tradingcodex-desk": "6cbd0b871ba7713fe7380d0393ab683047eaa622 AGENTS.md:47-49 requires the canonical TradingCodex provider boundary; runtime caller is not direct Codex attachment evidence",
+    "tradingcodex": "Historical adapter design reference only",
+    "prefect": "CLI scheduling is not an agent MCP consumer",
+    "agent-skills": "Implementation and governance references do not require ordinary sessions to load auto_trader",
+    "admiral": "No direct consumer demonstrated by builder inventory",
+    "handoffkeep": "No direct consumer demonstrated by builder inventory"
+  }
+}

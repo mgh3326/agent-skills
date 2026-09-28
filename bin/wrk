@@ -21,6 +21,8 @@ WRK_EXIT_LANDING_UNCONFIRMED=76
 # #758: a refused tester-round open at the cap. Distinct from generic misuse
 # (2) so a builder loop can tell "stop and wait" apart from a bad invocation.
 WRK_EXIT_ROUND_CAP=78
+# #872: distinguish physical mock MCP isolation refusal from quota/usage errors.
+WRK_EXIT_MOCK_MCP_REFUSED=79
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -141,7 +143,9 @@ Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
 Options:
   -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
   --t T0..T3         job scale; required — an unclassified job is not spawned
-  -L live|mock       select lane; mock requires MOCK_MCP_PROFILE
+  -L live|mock       select lane; mock requires MOCK_MCP_PROFILE and
+                    WRK_MOCK_MCP_CONFIG (reviewed stdio connection descriptor).
+                    Unsupported harnesses and remote mock placement refuse (79).
   --effort LEVEL     override codex/Kiro/Grok/Claude(opus,sonnet) profile effort
   --job ID           arbiter job id (default: LABEL)
   --owner NAME       spawning session name, recorded as the arbiter owner_lane
@@ -5494,6 +5498,17 @@ spawn_router_cmd() {
     fi
     ((i+=1))
   done
+  # #872: explicit remote mock placement cannot become an unguarded delegation
+  # or an admission-error local fallback. Auto placement is checked again after
+  # its final host decision below.
+  local requested_lane=""
+  for ((i=0; i<${#filtered[@]}; i++)); do
+    [[ "${filtered[$i]}" != -L ]] || requested_lane="${filtered[$((i + 1))]:-}"
+  done
+  if [[ "$requested" != auto && "$requested" != local && "$requested_lane" == mock ]]; then
+    echo "wrk: mock MCP isolation refused: remote execution host guard/config cannot be attested; use execution-host local spawn" >&2
+    return "$WRK_EXIT_MOCK_MCP_REFUSED"
+  fi
   # Classification and an active durable duplicate are admission invariants,
   # not placement work. Preserve their fail-closed boundary before asking
   # hub/local telemetry anything.
@@ -5582,6 +5597,18 @@ spawn_router_cmd() {
       spillover_local_measure; selected="$requested"; SPILL_REASON=forced-remote; SPILL_DECISION_SOURCE=forced
       ;;
   esac
+  # #872: neither the current hub contract nor ssh delegation attests which
+  # guard/config version the execution host will load. Refuse before copying
+  # a brief, probing/waking a host, or submitting a spawn. Never silently drop
+  # the descriptor or downgrade the mock lane on spill-over.
+  local execution_lane=""
+  for ((i=0; i<${#filtered[@]}; i++)); do
+    [[ "${filtered[$i]}" != -L ]] || execution_lane="${filtered[$((i + 1))]:-}"
+  done
+  if [[ "$selected" != local && "$execution_lane" == mock ]]; then
+    echo "wrk: mock MCP isolation refused: remote execution host guard/config cannot be attested; use execution-host local spawn" >&2
+    return "$WRK_EXIT_MOCK_MCP_REFUSED"
+  fi
   if [[ "$selected" != local && "$(spillover_host_via "$selected" 2>/dev/null || true)" == hub ]]; then
     spillover_log "$selected" "${SPILL_REASON};via=hub"
   else
@@ -5970,17 +5997,52 @@ raise SystemExit(0 if ok else 1)' "$LABEL" "$JOB_ID"; then
 }
 
 
+# #872: this helper is part of this wrk checkout, never a PATH-selected guard.
+# Artifacts live outside the worktree. No guard override or bypass is offered.
+mock_mcp_prepare() {
+  [[ "$LANE" == mock ]] || return 0
+  MOCK_MCP_HELPER="$(python3 -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve().parent / "wrk-mock-mcp")' "$0")"
+  [[ -x "$MOCK_MCP_HELPER" ]] || { echo "wrk: mock MCP isolation helper missing" >&2; return "$WRK_EXIT_MOCK_MCP_REFUSED"; }
+  local rc=0
+  MOCK_MCP_PLAN="$("$MOCK_MCP_HELPER" prepare --kind "$PROFILE_KIND" --cwd "$CWD" \
+    --profile "${MOCK_MCP_PROFILE:-}" --config "${WRK_MOCK_MCP_CONFIG:-}" -- "${ARGS[@]}")" || rc=$?
+  [[ "$rc" -eq 0 ]] || return "$WRK_EXIT_MOCK_MCP_REFUSED"
+  CWD="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["cwd"])' "$MOCK_MCP_PLAN")"
+  ARGS=()
+  while IFS= read -r -d '' value; do ARGS+=("$value"); done < <(
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.stdout.buffer.write(b"".join(x.encode()+b"\0" for x in d["argv"]))' "$MOCK_MCP_PLAN")
+  while IFS= read -r -d '' value; do TAB_ENV+=(--env "$value"); done < <(
+    python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); sys.stdout.buffer.write(b"".join((k+"="+v).encode()+b"\0" for k,v in d["env"].items()))' "$MOCK_MCP_PLAN")
+  mock_mcp_verify
+}
+
+mock_mcp_verify() {
+  [[ "$LANE" == mock ]] || return 0
+  [[ -n "${MOCK_MCP_PLAN:-}" ]] || { echo "wrk: mock MCP connection was not prepared" >&2; return "$WRK_EXIT_MOCK_MCP_REFUSED"; }
+  local verify_args=(verify --plan "$MOCK_MCP_PLAN" --cwd "$CWD")
+  [[ "${1:-}" != --require-attached ]] || verify_args+=(--require-attached)
+  "$MOCK_MCP_HELPER" "${verify_args[@]}" -- "${ARGS[@]}" --wrk-pane-env "${TAB_ENV[@]}" ||
+    return "$WRK_EXIT_MOCK_MCP_REFUSED"
+}
+
+mock_mcp_cleanup() {
+  if [[ "${SPAWN_MOCK_MCP_RETAIN:-0}" != 1 && -n "${MOCK_MCP_PLAN:-}" ]]; then
+    "$MOCK_MCP_HELPER" stop --plan "$MOCK_MCP_PLAN" >/dev/null 2>&1 || true
+  fi
+}
+
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
   OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
   TAB_CREATE_JSON="" TAB_ID=""
+  MOCK_MCP_PLAN="" MOCK_MCP_HELPER="" SPAWN_MOCK_MCP_RETAIN=0
   # Armed once for the whole spawn: both cleanup actions are guarded (pane
   # only when SPAWN_PANE_OPEN/PANE are set, quota release only when
   # ARBITER_HELD=1), so a die anywhere after the pane opens cannot leak it —
   # including the no-lease path where the arbiter claim or record failed.
-  trap 'spawn_pane_cleanup; arbiter_release_held' EXIT
+  trap 'spawn_pane_cleanup; arbiter_release_held; mock_mcp_cleanup' EXIT
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
@@ -6083,8 +6145,7 @@ spawn_cmd() {
       *) die "-L accepts only live or mock" ;;
     esac
     if [[ "$LANE" == mock ]]; then
-      [[ -n "${MOCK_MCP_PROFILE:-}" ]] || die "-L mock requires MOCK_MCP_PROFILE"
-      LANE_ENV+=(--env "MCP_PROFILE=$MOCK_MCP_PROFILE")
+      LANE_ENV+=(--env "MCP_PROFILE=${MOCK_MCP_PROFILE:-}")
     fi
   fi
   # ROB-1206: arbiter owner_lane is *who spawned this*, not the execution lane.
@@ -6167,6 +6228,9 @@ spawn_cmd() {
   # #768: the pane carries its task identity so a tester/advisory spawn made
   # from inside it inherits the task via HK_TASK_ID even without --parent-job.
   TAB_ENV+=(--env "HK_TASK_ID=$TASK_ID")
+  # Final kind/cwd/host and generated TAB_ENV are authoritative here. No pane
+  # exists and no brief has been injected if catalog/config verification fails.
+  mock_mcp_prepare || return "$WRK_EXIT_MOCK_MCP_REFUSED"
   if [[ "${#TAB_ENV[@]}" -gt 0 ]]; then
     TAB_CREATE_JSON=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}")
   else
@@ -6195,6 +6259,8 @@ print(value if isinstance(value, str) else "")
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
   [[ "$PROFILE_KIND" == codex ]] && START_TIMEOUT=120000 && BOOT_SETTLE=20
 
+  mock_mcp_verify || return "$WRK_EXIT_MOCK_MCP_REFUSED"
+
   if [[ "$PROFILE_KIND" == devin ]]; then
     devin_start_in_pane
   else
@@ -6222,6 +6288,7 @@ print(value if isinstance(value, str) else "")
   # #498: injection happens only here — after every gate above, tab create and
   # agent start (or Devin's temporary run/wait/rename branch). Nothing about it
   # may move ahead of quota_gate/arbiter_admit.
+  mock_mcp_verify --require-attached || return "$WRK_EXIT_MOCK_MCP_REFUSED"
   spawn_deliver_brief
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
@@ -6243,6 +6310,7 @@ print(value if isinstance(value, str) else "")
     start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE"
   fi
   SPAWN_PANE_OPEN=0
+  SPAWN_MOCK_MCP_RETAIN=1
   refresh_quota_pool
   # #770: optional periodic prune, off by default until director-1 enables it
   # (WRK_PRUNE_ON_SPAWN=1). Detached so the spawn path never waits on it; it

@@ -1,0 +1,14 @@
+# Documentation template only. Never install this example or use it as a
+# connection snapshot. The planner requires the ENTIRE current desk-reviewed
+# auto_trader table, including all 30 approved read tools and nested approvals.
+# Keep endpoint/auth material in desk-owned private inputs, outside this repo.
+[mcp_servers.auto_trader]
+url = "https://example.invalid/mcp"
+bearer_token_env_var = "AUTO_TRADER_MCP_TOKEN"
+env_http_headers = { "X-Tenant" = "AUTO_TRADER_MCP_TENANT" }
+enabled = false
+enabled_tools = ["REPLACE_WITH_EXACT_CURRENT_30_APPROVED_READ_TOOL_NAMES"]
+default_tools_approval_mode = "prompt"
+
+[mcp_servers.auto_trader.tools.REPLACE_WITH_APPROVED_READ_TOOL]
+approval_mode = "approve"

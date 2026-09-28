@@ -105,6 +105,15 @@ canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은
 `scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
 `agy -p "$(cat PROMPT_FILE)"`이다.
 
+`-L mock`은 MOCK_MCP_PROFILE과 WRK_MOCK_MCP_CONFIG의 명시적 stdio 연결을 요구한다.
+실제 세션이 로드한 연결과 도구 목록을 검사하며, 격리를 증명할 수 없는 하네스·충돌 설정·원격
+스폰은 exit 79로 거부한다. 설정 경로, 지원 범위, fake 검증과 운영자 활성화 절차는
+[mock MCP isolation runbook](docs/mock-mcp-isolation.md)을 따른다.
+
+Codex auto_trader를 필요한 trusted 프로젝트에만 연결하는 Q-41 이전은
+[project MCP runbook](docs/codex-project-mcp.md)의 render-only planner와 reviewed
+registry를 사용한다. 제안 파일만 만들며, merge 후 desk가 설정과 trust를 검토하고 적용한다.
+
 `--task <hk task id>`는 **모든 스폰이 묶이는 handoffkeep task**다(#768,
 decision/2026-09-27/task-job-linkage 항목 1 — 신규 스폰만, 기존 잡 백필 없음).
 `--role builder`와 `--role worker`에 필수이고 빠뜨리면 어떤 부작용보다 먼저
