@@ -92,6 +92,12 @@ export PANEWIRE_BIN="$ROOT/tests/fixtures/panewire"
 export HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
 export HK_STATE="$TMP/hk-state.json"
 export KIMI_CODE_HOME="$TMP/kimi-home"
+# #912: devin trust seeding fails closed on a missing store, so pre-seed the
+# fixture XDG root — $TMP covers every mkrepo spawn cwd below (parent
+# coverage is a legitimate no-op). The trust contract itself is tested in
+# tests/test-wrk.sh.
+mkdir -p "$XDG_DATA_HOME/devin/cli"
+printf '{"trusted_paths": ["%s"]}\n' "$TMP" >"$XDG_DATA_HOME/devin/cli/trusted_workspaces.json"
 # Isolate git's global ignore machinery: on a machine where Claude Code already
 # wrote **/.claude/settings.local.json into the user excludes, check-ignore
 # would pass without our info/exclude fallback and the mutant below could not

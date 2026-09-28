@@ -89,6 +89,16 @@ printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 # exercising the installation-transition path; the arbiter section below opts in.
 export ARBITER_BIN="$TMP/absent-arbiter"
 export XDG_DATA_HOME="$TMP/xdg"
+# #912: devin-kind spawns register the spawn cwd in devin's trusted-workspaces
+# store ($XDG_DATA_HOME/devin/cli/trusted_workspaces.json) before any pane
+# exists, and refuse closed when the store is missing or corrupt. Seed the
+# fixture store with $ROOT so every spawn_base devin case below is a covered
+# no-op; the dedicated #912 cases run against their own fixture XDG roots.
+mkdir -p "$XDG_DATA_HOME/devin/cli"
+python3 - "$XDG_DATA_HOME/devin/cli/trusted_workspaces.json" "$ROOT" <<'PY'
+import json, sys
+json.dump({"trusted_paths": [sys.argv[2]]}, open(sys.argv[1], "w", encoding="utf-8"), indent=2)
+PY
 export ARBITER_INBOX_ROOT="$TMP/inbox"
 # Nor the operator's real spill-over config: under host load it moved fixture
 # spawns onto a real remote host (or died with rc 2 on its cwd_map). Cases
@@ -225,6 +235,62 @@ spawn_base() {
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S="${WRK_REFRESH_TIMEOUT_S:-5}" \
     "$WRK" spawn \
     -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
+}
+
+# -- #912 devin trusted-workspaces helpers -----------------------------------
+# wrk registers the resolved spawn cwd — and only it — in devin's trusted
+# store ($XDG_DATA_HOME/devin/cli/trusted_workspaces.json) before any pane
+# exists: append-only, inherited-coverage no-op, fail-closed on a missing or
+# corrupt store. Every case uses a fixture XDG root under $TMP; the real user
+# store is never touched. devin_spawn_at mirrors spawn_base's env but takes
+# the XDG root and -c cwd as parameters.
+devin_spawn_at() {
+  local xdg="$1" dcwd="$2" label="$3" task="$4"; shift 4
+  case "$xdg" in
+    "$TMP"/*) ;;
+    *) fail "devin_spawn_at requires a fixture XDG root under TMP: $xdg" ;;
+  esac
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    XDG_DATA_HOME="$xdg" \
+    ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
+    WRK_FIXTURE_SCENARIO=devin-idle \
+    WRK_FIXTURE_LOG="$TMP/herdr-$label.log" WRK_FIXTURE_MARKER="" \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel-$label.log" \
+    WRK_REFRESH_LOG="$TMP/refresh-$label.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh-$label.pids" WRK_REFRESH_TIMEOUT_S=5 \
+    WRK_TEST_TRUST_DELAY_S="${WRK_TEST_TRUST_DELAY_S:-}" \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$dcwd" -m devin-swe2 -p "$PROMPT" \
+    -w w -l "$label" --t T1 --task "$task" "$@"
+}
+
+devin_trust_seed_store() {  # XDG_ROOT ENTRY...
+  local xdg="$1"; shift
+  mkdir -p "$xdg/devin/cli"
+  python3 - "$xdg/devin/cli/trusted_workspaces.json" "$@" <<'PY'
+import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump({"trusted_paths": list(sys.argv[2:])}, handle, indent=2)
+PY
+}
+
+devin_trust_paths() {  # XDG_ROOT — entries one per line; fails if unparsable
+  python3 - "$1/devin/cli/trusted_workspaces.json" <<'PY'
+import json, sys
+for entry in json.load(open(sys.argv[1], encoding="utf-8"))["trusted_paths"]:
+    print(entry)
+PY
+}
+
+devin_trust_mutant() {  # NAME OLD NEW — writes $TMP/mut-wrk-NAME, asserts applied
+  python3 - "$WRK" "$TMP/mut-wrk-$1" "$2" "$3" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old, new = sys.argv[3], sys.argv[4]
+assert src.count(old) == 1, "mutant anchor not unique: %r" % old
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new))
+PY
+  chmod +x "$TMP/mut-wrk-$1"
+  grep -qF "$3" "$TMP/mut-wrk-$1" || fail "devin trust mutant $1 did not apply"
 }
 
 hub_quota_run_case() {
@@ -1271,6 +1337,283 @@ echo "PASS devin-glm52/devin-swe17/devin-ds41 + #635 effort-variant worker kind/
 expect_exit 2 spawn_base devin-swe2-max --effort bogus
 expect_exit 2 spawn_base devin-ds41-max --effort medium
 
+# -- #912: devin trusted-workspaces seeding ----------------------------------
+# Helpers (devin_spawn_at / devin_trust_seed_store / devin_trust_paths /
+# devin_trust_mutant) live with spawn_base above so earlier sections can seed
+# their own fixture XDG stores.
+
+# AC1: an uncovered spawn cwd is appended — resolved to its physical path —
+# alongside the pre-existing entry, and a dated backup is written first.
+mkdir -p "$TMP/t912-add/deep/nest" "$TMP/t912-elsewhere"
+t912_xdg="$TMP/t912-xdg-add"
+devin_trust_seed_store "$t912_xdg" "$TMP/t912-elsewhere"
+t912_out="$(devin_spawn_at "$t912_xdg" "$TMP/t912-add/deep/nest" devin912a "$(mint_task)" 2>&1)" ||
+  fail "devin spawn over an uncovered cwd failed: $t912_out"
+grep -q '^OK ' <<<"$t912_out" || fail "devin trust-seed spawn lost its OK line: $t912_out"
+t912_resolved="$(cd "$TMP/t912-add/deep/nest" && pwd -P)"
+devin_trust_paths "$t912_xdg" | grep -qx "$t912_resolved" ||
+  fail "resolved spawn cwd was not added: $(devin_trust_paths "$t912_xdg")"
+[[ "$(devin_trust_paths "$t912_xdg" | wc -l | tr -d ' ')" -eq 2 ]] ||
+  fail "store gained more than the spawn cwd: $(devin_trust_paths "$t912_xdg")"
+devin_trust_paths "$t912_xdg" | grep -qx "$TMP/t912-elsewhere" ||
+  fail "pre-existing entry was removed: $(devin_trust_paths "$t912_xdg")"
+compgen -G "$t912_xdg/devin/cli/trusted_workspaces.json.bak-*" >/dev/null ||
+  fail "trust write produced no backup"
+echo "PASS 912-devin-trust adds only the resolved spawn cwd"
+
+# AC1: an already-trusted cwd is a pure no-op — bytes and backup dir unchanged.
+mkdir -p "$TMP/t912-same"
+t912_xdg="$TMP/t912-xdg-same"
+devin_trust_seed_store "$t912_xdg" "$(cd "$TMP/t912-same" && pwd -P)"
+cp "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-same.before"
+devin_spawn_at "$t912_xdg" "$TMP/t912-same" devin912b "$(mint_task)" >/dev/null ||
+  fail "devin spawn over an already-trusted cwd failed"
+cmp -s "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-same.before" ||
+  fail "already-trusted cwd rewrote the store"
+if compgen -G "$t912_xdg/devin/cli/trusted_workspaces.json.bak-*" >/dev/null; then
+  fail "no-op trust check produced a backup"
+fi
+echo "PASS 912-devin-trust already-trusted is a pure no-op"
+
+# AC1: a parent-covered cwd is also a pure no-op — inherited trust counts, the
+# child path is never appended, and the parent is what stays trusted.
+mkdir -p "$TMP/t912-parent/child"
+t912_xdg="$TMP/t912-xdg-parent"
+devin_trust_seed_store "$t912_xdg" "$(cd "$TMP/t912-parent" && pwd -P)"
+cp "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-parent.before"
+devin_spawn_at "$t912_xdg" "$TMP/t912-parent/child" devin912c "$(mint_task)" >/dev/null ||
+  fail "devin spawn over a parent-covered cwd failed"
+cmp -s "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-parent.before" ||
+  fail "parent-covered cwd rewrote the store"
+devin_trust_paths "$t912_xdg" | grep -qx "$(cd "$TMP/t912-parent/child" && pwd -P)" &&
+  fail "parent-covered cwd appended the child path"
+echo "PASS 912-devin-trust parent-covered is a pure no-op"
+
+# AC1: a trusted *sibling* does not cover the target — only ancestors do.
+mkdir -p "$TMP/t912-sib/trusted" "$TMP/t912-sib/untrusted"
+t912_xdg="$TMP/t912-xdg-sib"
+devin_trust_seed_store "$t912_xdg" "$(cd "$TMP/t912-sib/trusted" && pwd -P)"
+devin_spawn_at "$t912_xdg" "$TMP/t912-sib/untrusted" devin912sib "$(mint_task)" >/dev/null ||
+  fail "devin spawn next to a trusted sibling failed"
+devin_trust_paths "$t912_xdg" | grep -qx "$(cd "$TMP/t912-sib/untrusted" && pwd -P)" ||
+  fail "trusted sibling wrongly covered the spawn cwd"
+echo "PASS 912-devin-trust sibling trust does not cover"
+
+# AC2: a corrupt store is refused before any pane — bytes preserved verbatim.
+mkdir -p "$TMP/t912-cwd-corrupt"
+t912_xdg="$TMP/t912-xdg-corrupt"
+mkdir -p "$t912_xdg/devin/cli"
+printf '{ not json\n' >"$t912_xdg/devin/cli/trusted_workspaces.json"
+cp "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-corrupt.before"
+set +e
+t912_out="$(devin_spawn_at "$t912_xdg" "$TMP/t912-cwd-corrupt" devin912d "$(mint_task)" 2>&1)"
+t912_rc=$?
+set -e
+[[ "$t912_rc" -ne 0 ]] || fail "corrupt devin trust store did not refuse the spawn"
+grep -q 'not valid JSON' <<<"$t912_out" ||
+  fail "corrupt refusal lost its diagnostic: $t912_out"
+cmp -s "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-corrupt.before" ||
+  fail "corrupt store was overwritten"
+[[ ! -e "$TMP/herdr-devin912d.log" ]] ||
+  fail "corrupt-store refusal still reached herdr"
+echo "PASS 912-devin-trust corrupt store refused, bytes preserved"
+
+# AC2: an unparsable *shape* (trusted_paths not a string list) is refused the
+# same way — valid JSON alone must not be enough to write.
+mkdir -p "$TMP/t912-cwd-shape"
+t912_xdg="$TMP/t912-xdg-shape"
+mkdir -p "$t912_xdg/devin/cli"
+printf '{"trusted_paths": "yes"}\n' >"$t912_xdg/devin/cli/trusted_workspaces.json"
+cp "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-shape.before"
+set +e
+t912_out="$(devin_spawn_at "$t912_xdg" "$TMP/t912-cwd-shape" devin912sh "$(mint_task)" 2>&1)"
+t912_rc=$?
+set -e
+[[ "$t912_rc" -ne 0 ]] || fail "malformed trusted_paths did not refuse the spawn"
+grep -q 'trusted_paths' <<<"$t912_out" ||
+  fail "shape refusal lost its diagnostic: $t912_out"
+cmp -s "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-shape.before" ||
+  fail "malformed store was overwritten"
+echo "PASS 912-devin-trust malformed shape refused, bytes preserved"
+
+# AC2: a missing store is refused closed — nothing is created, no pane runs.
+mkdir -p "$TMP/t912-cwd-missing"
+t912_xdg="$TMP/t912-xdg-missing"
+mkdir -p "$t912_xdg/devin/cli"
+set +e
+t912_out="$(devin_spawn_at "$t912_xdg" "$TMP/t912-cwd-missing" devin912e "$(mint_task)" 2>&1)"
+t912_rc=$?
+set -e
+[[ "$t912_rc" -ne 0 ]] || fail "missing devin trust store did not refuse the spawn"
+grep -q 'store missing' <<<"$t912_out" ||
+  fail "missing-store refusal lost its diagnostic: $t912_out"
+[[ ! -e "$t912_xdg/devin/cli/trusted_workspaces.json" ]] ||
+  fail "missing store was created by the spawn"
+[[ ! -e "$TMP/herdr-devin912e.log" ]] ||
+  fail "missing-store refusal still reached herdr"
+echo "PASS 912-devin-trust missing store refused, nothing created"
+
+# AC1/AC3: two concurrent spawns into the same store — both entries must land
+# and the pre-existing entry must survive. The test delay holds each writer's
+# read->write gap open so a lost update would be deterministic, not luck.
+devin_trust_seed_store "$TMP/t912-xdg-race" "$TMP/t912-race-origin"
+mkdir -p "$TMP/t912-race-a" "$TMP/t912-race-b" "$TMP/t912-race-origin"
+t912_ta="$(mint_task)" t912_tb="$(mint_task)"
+WRK_TEST_TRUST_DELAY_S=0.5 \
+  devin_spawn_at "$TMP/t912-xdg-race" "$TMP/t912-race-a" devin912fa "$t912_ta" \
+  >"$TMP/t912-race-a.out" 2>&1 &
+t912_pa=$!
+WRK_TEST_TRUST_DELAY_S=0.5 \
+  devin_spawn_at "$TMP/t912-xdg-race" "$TMP/t912-race-b" devin912fb "$t912_tb" \
+  >"$TMP/t912-race-b.out" 2>&1 &
+t912_pb=$!
+set +e
+wait "$t912_pa"; t912_ra=$?
+wait "$t912_pb"; t912_rb=$?
+set -e
+[[ "$t912_ra" -eq 0 && "$t912_rb" -eq 0 ]] ||
+  fail "concurrent devin spawns failed rc=$t912_ra/$t912_rb: $(cat "$TMP/t912-race-a.out" "$TMP/t912-race-b.out")"
+t912_ra_path="$(cd "$TMP/t912-race-a" && pwd -P)"
+t912_rb_path="$(cd "$TMP/t912-race-b" && pwd -P)"
+devin_trust_paths "$TMP/t912-xdg-race" | grep -qx "$t912_ra_path" ||
+  fail "concurrent spawn lost entry A: $(devin_trust_paths "$TMP/t912-xdg-race")"
+devin_trust_paths "$TMP/t912-xdg-race" | grep -qx "$t912_rb_path" ||
+  fail "concurrent spawn lost entry B: $(devin_trust_paths "$TMP/t912-xdg-race")"
+devin_trust_paths "$TMP/t912-xdg-race" | grep -qx "$TMP/t912-race-origin" ||
+  fail "concurrent spawn removed the pre-existing entry"
+[[ "$(devin_trust_paths "$TMP/t912-xdg-race" | wc -l | tr -d ' ')" -eq 3 ]] ||
+  fail "concurrent spawn produced wrong entry count"
+echo "PASS 912-devin-trust concurrent spawns keep both entries"
+
+# AC3: with XDG_DATA_HOME unset the store resolves under the fixture HOME —
+# the real HOME store is never consulted.
+t912_home="$TMP/t912-home"
+mkdir -p "$t912_home/.local/share/devin/cli" "$TMP/t912-cwd-home"
+printf '{"trusted_paths": []}\n' >"$t912_home/.local/share/devin/cli/trusted_workspaces.json"
+t912_home_out="$(env -u XDG_DATA_HOME HOME="$t912_home" \
+  HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
+  WRK_FIXTURE_SCENARIO=devin-idle WRK_FIXTURE_LOG="$TMP/herdr-devin912h.log" \
+  WRK_FIXTURE_MARKER="" \
+  WRK_SCOPEFUEL_LOG="$TMP/scopefuel-devin912h.log" \
+  WRK_REFRESH_LOG="$TMP/refresh-devin912h.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh-devin912h.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$TMP/t912-cwd-home" -m devin-swe2 -p "$PROMPT" -w w \
+  -l devin912h --t T1 --task "$(mint_task)" 2>&1)" ||
+  fail "HOME-fallback devin spawn failed: $t912_home_out"
+devin_trust_paths "$t912_home/.local/share" |
+  grep -qx "$(cd "$TMP/t912-cwd-home" && pwd -P)" ||
+  fail "HOME-fallback store did not gain the spawn cwd"
+echo "PASS 912-devin-trust XDG unset falls back to fixture HOME"
+
+# -- assertion-RED mutants -------------------------------------------------
+# Each mutant weakens exactly one rule; each run must produce the bad outcome
+# the corresponding assertion above rejects, proving the assertion is live.
+# 1) widening: store the parent instead of the cwd.
+mkdir -p "$TMP/t912-m1/deep/nest"
+devin_trust_seed_store "$TMP/t912-xdg-m1" "$TMP/t912-m1-else"
+devin_trust_mutant widen \
+  'data["trusted_paths"] = paths + [cwd]' \
+  'data["trusted_paths"] = paths + [os.path.dirname(cwd)]'
+WRK_UNDER_TEST="$TMP/mut-wrk-widen" \
+  devin_spawn_at "$TMP/t912-xdg-m1" "$TMP/t912-m1/deep/nest" devin912m1 "$(mint_task)" \
+  >/dev/null 2>&1 || true
+if devin_trust_paths "$TMP/t912-xdg-m1" | grep -qx "$(cd "$TMP/t912-m1/deep/nest" && pwd -P)"; then
+  fail "parent-widening mutant survived: the spawn cwd was still added"
+fi
+devin_trust_paths "$TMP/t912-xdg-m1" |
+  grep -qx "$(cd "$TMP/t912-m1/deep" && pwd -P)" ||
+  fail "parent-widening mutant did not apply (parent entry absent)"
+echo "PASS 912-devin-trust mutant: parent widening goes RED"
+
+# 2) coverage degraded to equality: a parent-covered cwd gets appended.
+mkdir -p "$TMP/t912-m2/parent/child"
+devin_trust_seed_store "$TMP/t912-xdg-m2" "$(cd "$TMP/t912-m2/parent" && pwd -P)"
+cp "$TMP/t912-xdg-m2/devin/cli/trusted_workspaces.json" "$TMP/t912-m2.before"
+devin_trust_mutant eqcover \
+  'if os.path.commonpath((base, target)) == base:' \
+  'if base == target:'
+WRK_UNDER_TEST="$TMP/mut-wrk-eqcover" \
+  devin_spawn_at "$TMP/t912-xdg-m2" "$TMP/t912-m2/parent/child" devin912m2 "$(mint_task)" \
+  >/dev/null 2>&1 || true
+cmp -s "$TMP/t912-xdg-m2/devin/cli/trusted_workspaces.json" "$TMP/t912-m2.before" &&
+  fail "ancestor-coverage mutant survived: parent-covered cwd left the store untouched"
+echo "PASS 912-devin-trust mutant: equality-only coverage goes RED"
+
+# 3) coverage skipped entirely: an already-trusted cwd gets appended again.
+mkdir -p "$TMP/t912-m3"
+devin_trust_seed_store "$TMP/t912-xdg-m3" "$(cd "$TMP/t912-m3" && pwd -P)"
+cp "$TMP/t912-xdg-m3/devin/cli/trusted_workspaces.json" "$TMP/t912-m3.before"
+devin_trust_mutant always 'if covered():' 'if False:'
+WRK_UNDER_TEST="$TMP/mut-wrk-always" \
+  devin_spawn_at "$TMP/t912-xdg-m3" "$TMP/t912-m3" devin912m3 "$(mint_task)" \
+  >/dev/null 2>&1 || true
+cmp -s "$TMP/t912-xdg-m3/devin/cli/trusted_workspaces.json" "$TMP/t912-m3.before" &&
+  fail "coverage-skip mutant survived: already-trusted cwd left the store untouched"
+echo "PASS 912-devin-trust mutant: skipped coverage check goes RED"
+
+# 4) corrupt tolerated: invalid JSON silently replaced by an empty store.
+mkdir -p "$TMP/t912-m4-cwd" "$TMP/t912-xdg-m4/devin/cli"
+printf '{ not json\n' >"$TMP/t912-xdg-m4/devin/cli/trusted_workspaces.json"
+cp "$TMP/t912-xdg-m4/devin/cli/trusted_workspaces.json" "$TMP/t912-m4.before"
+devin_trust_mutant corrupt-ok \
+  'refuse("store is not valid JSON: %s (%s) — refusing to overwrite a corrupt file" % (path, exc))' \
+  'data = {"trusted_paths": []}'
+WRK_UNDER_TEST="$TMP/mut-wrk-corrupt-ok" \
+  devin_spawn_at "$TMP/t912-xdg-m4" "$TMP/t912-m4-cwd" devin912m4 "$(mint_task)" \
+  >/dev/null 2>&1 || true
+cmp -s "$TMP/t912-xdg-m4/devin/cli/trusted_workspaces.json" "$TMP/t912-m4.before" &&
+  fail "corrupt-tolerant mutant survived: corrupt store was never rewritten"
+echo "PASS 912-devin-trust mutant: corrupt tolerated goes RED"
+
+# 5) entries dropped: append becomes replace.
+mkdir -p "$TMP/t912-m5-cwd" "$TMP/t912-m5-keep"
+devin_trust_seed_store "$TMP/t912-xdg-m5" "$TMP/t912-m5-keep"
+devin_trust_mutant drop \
+  'data["trusted_paths"] = paths + [cwd]' \
+  'data["trusted_paths"] = [cwd]'
+WRK_UNDER_TEST="$TMP/mut-wrk-drop" \
+  devin_spawn_at "$TMP/t912-xdg-m5" "$TMP/t912-m5-cwd" devin912m5 "$(mint_task)" \
+  >/dev/null 2>&1 || true
+if devin_trust_paths "$TMP/t912-xdg-m5" | grep -qx "$TMP/t912-m5-keep"; then
+  fail "entry-dropping mutant survived: pre-existing entry still present"
+fi
+echo "PASS 912-devin-trust mutant: dropped entries go RED"
+
+# 6) missing store silently created instead of refused.
+mkdir -p "$TMP/t912-m6-cwd" "$TMP/t912-xdg-m6/devin/cli"
+devin_trust_mutant missing-create \
+  'refuse("store missing: %s — trust a directory in devin once or restore the file; not creating it" % path)' \
+  'open(path, "w").write('"'"'{"trusted_paths": []}'"'"')'
+WRK_UNDER_TEST="$TMP/mut-wrk-missing-create" \
+  devin_spawn_at "$TMP/t912-xdg-m6" "$TMP/t912-m6-cwd" devin912m6 "$(mint_task)" \
+  >/dev/null 2>&1 || true
+[[ -e "$TMP/t912-xdg-m6/devin/cli/trusted_workspaces.json" ]] ||
+  fail "missing-store-creating mutant survived: store still absent"
+echo "PASS 912-devin-trust mutant: missing store created goes RED"
+
+# 7) lock dropped: with the read->write gap held open, two writers lose one
+# entry — the concurrency assertions above must fail against this mutant.
+devin_trust_seed_store "$TMP/t912-xdg-m7" "$TMP/t912-m7-origin"
+mkdir -p "$TMP/t912-m7-a" "$TMP/t912-m7-b" "$TMP/t912-m7-origin"
+devin_trust_mutant nolock \
+  '    fcntl.flock(lock_fd, fcntl.LOCK_EX)' \
+  '    pass  # mutant: no flock'
+t912_ma="$(mint_task)" t912_mb="$(mint_task)"
+WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
+  devin_spawn_at "$TMP/t912-xdg-m7" "$TMP/t912-m7-a" devin912ma "$t912_ma" \
+  >/dev/null 2>&1 &
+t912_pa=$!
+WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
+  devin_spawn_at "$TMP/t912-xdg-m7" "$TMP/t912-m7-b" devin912mb "$t912_mb" \
+  >/dev/null 2>&1 &
+t912_pb=$!
+wait "$t912_pa" "$t912_pb" || true
+t912_m7_count="$(devin_trust_paths "$TMP/t912-xdg-m7" | wc -l | tr -d ' ')"
+[[ "$t912_m7_count" -lt 3 ]] ||
+  fail "lockless mutant survived: both concurrent entries landed anyway"
+echo "PASS 912-devin-trust mutant: dropped lock goes RED"
+
 # ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
 # file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
 run_fail env CLINEPASS_GATE_KEY_FILE="$TMP/nonexistent-gate-key.txt" \
@@ -2159,6 +2502,9 @@ echo "PASS devin-swe2 scopefuel-gate-to-arbiter-pool-and-spawn-receipt"
 # spawn). Records written here must not leak into that set.
 T677_INBOX="$TMP/inbox-677"
 T677_XDG="$TMP/xdg-677"
+# #912: the devin launch_profile case below is a real spawn; its fixture XDG
+# root needs a store that covers $ROOT, like the suite-level seed does.
+devin_trust_seed_store "$T677_XDG" "$ROOT"
 launch_profile_case() {
   local model="$1" job="$2" expected="$3"; shift 3
   ARBITER_INBOX_ROOT="$T677_INBOX" XDG_DATA_HOME="$T677_XDG" \
