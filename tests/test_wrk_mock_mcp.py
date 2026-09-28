@@ -104,6 +104,10 @@ class IsolationTests(unittest.TestCase):
         self.write_connection()
         self.plans = []
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("ARBITER_", "MOCK_", "WRK_", "HK_", "CODEX_", "CLAUDE_"))}
+        # wrk seeds Kimi workspace trust before the unsupported-kind refusal.
+        # Keep that legacy preparation inside this fixture, including variants.
+        for name in ("KIMI_CODE_HOME", "KIMI_CODE_LOW_HOME", "KIMI_CODE_HIGH_HOME", "KIMI_CODE_MAX_HOME"):
+            self.env[name] = str(self.fixture_home / name.lower())
         python_bin = self.base / "python-bin"
         python_bin.mkdir()
         (python_bin / "python3").symlink_to(sys.executable)
@@ -366,6 +370,10 @@ class IsolationTests(unittest.TestCase):
             self.assertRefused(r)
             self.assertNotIn("agent prompt ", log)
             self.assertNotIn("agent start ", log)
+            if model == "kimi-k3":
+                trust = list(Path(self.env["KIMI_CODE_HOME"]).glob("workspace-trust/wd_*"))
+                self.assertEqual(len(trust), 1, "consumer trust preparation must use the isolated Kimi home")
+                self.assertEqual(json.loads(trust[0].read_text())["root"], str(self.cwd.resolve()))
         self.connection["server"]["args"].append("--ignore-env")
         self.write_connection()
         (self.base / "herdr.log").unlink(missing_ok=True)
