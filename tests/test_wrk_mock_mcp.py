@@ -42,6 +42,14 @@ for line in sys.stdin:
    if q.get('params',{}).get('cursor')=='second':result={'tools':[{'name':'kis_live_cancel_order','inputSchema':{'type':'object'}}]}
    else:result['nextCursor']='second'
  elif m=='tools/call':
+  if '--stall-tool' in args:
+   import time
+   log.open('a').write('entered-stalled-fixture-call\n')
+   time.sleep(120)
+  if '--stall-tool-short' in args:
+   import time
+   log.open('a').write('entered-stalled-fixture-call\n')
+   time.sleep(8)
   if '--slow-tool' in args:
    import time
    time.sleep(1.2)
@@ -53,21 +61,32 @@ for line in sys.stdin:
 HARNESS = r'''#!/usr/bin/env python3
 # Read the ACTUAL start argv as a harness consumer, then run the declared MCP
 # command. This is not a real harness, endpoint, or herdr session.
-import json,subprocess,sys
+import json,os,subprocess,sys
 from pathlib import Path
 args=sys.argv[2:]; marker=Path(sys.argv[1])
 if '--mcp-config' in args:
- gateway=json.loads(Path(args[args.index('--mcp-config')+1]).read_text())['mcpServers']['wrk_mock']
+ servers=json.loads(Path(args[args.index('--mcp-config')+1]).read_text())['mcpServers']
 else:
  values=dict(x.split('=',1) for x in args if x.startswith('mcp_servers.'))
- gateway={k:json.loads(values['mcp_servers.wrk_mock.'+k]) for k in ('command','args')}
-proc=subprocess.Popen([gateway['command'],*gateway['args']],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
-for i,method in enumerate(('initialize','tools/list'),1):
- proc.stdin.write((json.dumps({'jsonrpc':'2.0','id':i,'method':method,'params':{}})+'\n').encode());proc.stdin.flush()
- r=json.loads(proc.stdout.readline())
- if 'error' in r:sys.exit(1)
-marker.write_text('configured gateway loaded')
-proc.wait()
+ names={k.split('.')[1] for k in values}
+ servers={name:{k:json.loads(values['mcp_servers.'+name+'.'+k]) for k in ('command','args')} for name in names}
+procs=[]; catalogs={}
+try:
+ for name in sorted(servers,key=lambda name:name!='wrk_mock'):
+  server=servers[name]
+  proc=subprocess.Popen([server['command'],*server['args']],env=dict(os.environ,**server.get('env',{})),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.DEVNULL)
+  procs.append(proc)
+  for i,method in enumerate(('initialize','tools/list'),1):
+   proc.stdin.write((json.dumps({'jsonrpc':'2.0','id':i,'method':method,'params':{}})+'\n').encode());proc.stdin.flush()
+   r=json.loads(proc.stdout.readline())
+   if 'error' in r:sys.exit(1)
+  catalogs[name]=[tool['name'] for tool in r['result']['tools']]
+ marker.write_text(json.dumps(catalogs))
+ procs[0].wait()
+finally:
+ for proc in procs:
+  if proc.poll() is None:
+   proc.terminate();proc.wait(timeout=5)
 '''
 
 
@@ -138,6 +157,156 @@ class IsolationTests(unittest.TestCase):
 
     def write_connection(self):
         self.config.write_text(json.dumps(self.connection))
+
+    def mutate_plan_before_consumer_extraction(self):
+        # A separate fixture process edits plan.json at wrk's first read AFTER
+        # prepare returns. No guard code/check is changed by this attack hook.
+        extra_log = self.base / "unchecked-server.log"
+        extra = ["-c", "mcp_servers.unchecked_fixture.command=" + json.dumps(str(self.fake)),
+                 "-c", "mcp_servers.unchecked_fixture.args=" + json.dumps([
+                     str(self.repo / "wrk-mcp/profiles.json"), str(extra_log), "--ignore-env"])]
+        python = self.base / "python-bin/python3"
+        python.unlink()
+        python.write_text("#!" + sys.executable + "\nimport json,os,sys\nfrom pathlib import Path\n"
+                          "if len(sys.argv)>3 and sys.argv[1]=='-c' and "
+                          "'print(json.load(open(sys.argv[1]))[\"cwd\"])' in sys.argv[2]:\n"
+                          " p=Path(sys.argv[3]); data=json.loads(p.read_text()); data['argv'].extend(" + repr(extra) + "); p.write_text(json.dumps(data))\n"
+                          "os.execv(sys.executable,[sys.executable,*sys.argv[1:]])\n")
+        python.chmod(0o755)
+        return extra_log
+
+    def test_consumer_mutated_plan_refuses_extra_connection_before_start_or_brief(self):
+        extra_log = self.mutate_plan_before_consumer_extraction()
+        result, log = self.consumer()
+        self.assertRefused(result, "binding")
+        self.assertNotIn("agent start ", log)
+        self.assertNotIn("agent prompt ", log)
+        self.assertFalse(extra_log.exists(), "unreviewed configured server must never start")
+
+    def test_mutated_plan_before_daemon_load_never_starts_upstream(self):
+        source = self.helper.read_text().replace(
+            "    process = subprocess.Popen(",
+            "    changed = read_json(plan)\n    changed['argv'].append('--fixture-plan-edit')\n"
+            "    plan.write_text(compact(changed))\n    process = subprocess.Popen(", 1)
+        self.helper.write_text(source)
+        result = self.prepare()
+        self.assertRefused(result)
+        self.assertFalse(self.log.exists(), "mutated startup plan launched the unbound upstream")
+
+    def test_external_codex_profiles_refuse_consumer_and_late_attachment(self):
+        home = Path(self.env["CODEX_HOME"])
+        home.mkdir()
+        profile = home / "hidden.config.toml"
+        profile.write_text('[mcp_servers.hidden_fixture]\ncommand="/fixture/never-start"\n')
+        result, log = self.consumer()
+        self.assertRefused(result, "conflicting global/project")
+        self.assertNotIn("agent start ", log)
+        self.assertNotIn("agent prompt ", log)
+        self.assertFalse(self.log.exists())
+        profile.unlink()
+        # A clean external layer is tracked even when not selected. Its later
+        # replacement must refuse before injection after actual harness start.
+        profile.write_text('model_reasoning_effort="high"\n')
+        hook = "printf '%s' '[mcp_servers.hidden_fixture]\ncommand=\"/fixture/never-start\"\n' > '" + str(profile) + "'"
+        result, log = self.consumer(hook=hook)
+        self.assertRefused(result)
+        self.assertIn("agent start ", log)
+        self.assertNotIn("agent prompt ", log)
+
+    def test_external_profile_selectors_and_symlinks_refuse(self):
+        home = Path(self.env["CODEX_HOME"])
+        home.mkdir()
+        (home / "config.toml").write_text('profile="hidden"\n')
+        self.assertRefused(self.prepare(), "profile selector")
+        (home / "config.toml").unlink()
+        outside = self.base / "outside-profile.toml"
+        outside.write_text('model_reasoning_effort="high"\n')
+        (home / "linked.config.toml").symlink_to(outside)
+        self.assertRefused(self.prepare(), "regular file")
+        (home / "linked.config.toml").unlink()
+        for argv in (["--profile", "hidden"], ["--profile=hidden"], ["-phidden"],
+                     ["-c", 'profile="hidden"'], ['--config=profile="hidden"']):
+            result = self.run_helper("prepare", "--kind", "codex", "--cwd", str(self.cwd),
+                                     "--profile", PROFILE, "--config", str(self.config), "--", *argv)
+            self.assertRefused(result, "profile selector")
+        self.assertFalse(self.log.exists(), "invalid loading selectors must fail before upstream start")
+
+    def test_stalled_call_disconnect_stops_gateway_and_owned_upstream(self):
+        self.connection["server"]["args"].append("--stall-tool")
+        self.write_connection()
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(Path(result.stdout.strip()).read_text())
+        async def exercise():
+            reader, writer = await asyncio.open_unix_connection(plan["socket"])
+            writer.write(b'{"jsonrpc":"2.0","id":1,"method":"wrk/attach"}\n')
+            await writer.drain()
+            self.assertIn("result", json.loads(await asyncio.wait_for(reader.readline(), 5)))
+            writer.write(b'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kis_mock_place_order","arguments":{}}}\n')
+            await writer.drain()
+            for _ in range(100):
+                if "entered-stalled-fixture-call" in self.log.read_text():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("owned fake never entered stalled call")
+            writer.close()
+            await writer.wait_closed()
+            pid = int(self.log.read_text().splitlines()[0].split()[1])
+            def alive():
+                try:
+                    os.kill(pid, 0)
+                    return True
+                except ProcessLookupError:
+                    return False
+            for _ in range(150):
+                if not Path(plan["socket"]).exists() and not alive():
+                    break
+                await asyncio.sleep(0.02)
+            self.assertFalse(Path(plan["socket"]).exists(), "gateway socket survives harness EOF during stalled call")
+            self.assertFalse(alive(), "owned fake survives harness EOF during stalled call")
+        asyncio.run(exercise())
+
+    def test_stalled_call_explicit_stop_stops_gateway_and_owned_upstream(self):
+        self.connection["server"]["args"].append("--stall-tool-short")
+        self.write_connection()
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan_path = result.stdout.strip()
+        plan = json.loads(Path(plan_path).read_text())
+        async def exercise():
+            reader, writer = await asyncio.open_unix_connection(plan["socket"])
+            writer.write(b'{"jsonrpc":"2.0","id":1,"method":"wrk/attach"}\n')
+            await writer.drain()
+            self.assertIn("result", json.loads(await asyncio.wait_for(reader.readline(), 5)))
+            writer.write(b'{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"kis_mock_place_order","arguments":{}}}\n')
+            await writer.drain()
+            for _ in range(100):
+                if "entered-stalled-fixture-call" in self.log.read_text():
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail("owned fake never entered stalled call")
+            stopped = await asyncio.to_thread(self.run_helper, "stop", "--plan", plan_path)
+            self.assertEqual(stopped.returncode, 0, stopped.stderr)
+            pid = int(self.log.read_text().splitlines()[0].split()[1])
+            def alive():
+                try:
+                    os.kill(pid, 0)
+                    return True
+                except ProcessLookupError:
+                    return False
+            for _ in range(150):
+                if not Path(plan["socket"]).exists() and not alive():
+                    break
+                await asyncio.sleep(0.02)
+            try:
+                self.assertFalse(Path(plan["socket"]).exists(), "explicit stop left gateway socket during stalled call")
+                self.assertFalse(alive(), "explicit stop left owned fake during stalled call")
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        asyncio.run(exercise())
 
     def run_helper(self, *args):
         return subprocess.run([sys.executable, str(self.helper), *args], env=self.env,
@@ -245,6 +414,23 @@ class IsolationTests(unittest.TestCase):
         source = re.sub(r'POLICY_SHA256 = "[a-f0-9]+"', 'POLICY_SHA256 = "' + hashlib.sha256(path.read_bytes()).hexdigest() + '"', source)
         self.helper.write_text(source)
         self.assertRefused(self.prepare(), "live order")
+
+    def test_repinned_live_order_names_refuse_before_fake_server_start(self):
+        names = ("toss_place_order", "toss_modify_order", "toss_cancel_order",
+                 "toss_reconcile_orders", "live_reconcile_orders", "kis-live-place-order",
+                 "KisLivePlaceOrder", "place_order_v2", "mcp__auto_trader__place_order")
+        path = self.repo / "wrk-mcp/profiles.json"
+        original = json.loads(path.read_text())
+        helper_source = self.helper.read_text()
+        for name in names:
+            with self.subTest(name=name):
+                d = json.loads(json.dumps(original))
+                d["profiles"][PROFILE][0].append(name)
+                path.write_text(json.dumps(d))
+                self.helper.write_text(re.sub(r'POLICY_SHA256 = "[a-f0-9]+"',
+                    'POLICY_SHA256 = "' + hashlib.sha256(path.read_bytes()).hexdigest() + '"', helper_source))
+                self.assertRefused(self.prepare(), "live order")
+                self.assertFalse(self.log.exists(), "unsafe re-pinned catalog started a fake upstream")
 
     def test_all_unsupported_harnesses_refuse_before_server_start(self):
         for kind in ("devin", "grok", "kimi", "kiro", "opencode", "agy", "future-harness"):

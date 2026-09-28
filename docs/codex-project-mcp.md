@@ -9,8 +9,13 @@ by the planner or by development tests.
 
 ## Supported configuration and project evidence
 
-Validated against installed codex-cli 0.157.1 on 2026-09-28. Codex loads trusted
-project .codex/config.toml. Project .mcp.json is not the Codex route. CLI overrides
+Validated against locally installed codex-cli 0.157.1 on 2026-09-28. Builder's
+desktop reported codex-cli 0.158.0; the targeted test accepts a semantic CLI
+version and still runs the full isolated configuration enumeration. A version
+proxy exercises the 0.158.0 output while delegating enumeration to the local
+installed binary; the desktop full suite must verify the real 0.158.0 binary.
+Codex loads trusted project .codex/config.toml. Project .mcp.json is not the
+Codex route. CLI overrides
 take precedence, followed by nearest trusted project configuration, selected
 profile, user configuration, cloud-managed defaults and system configuration.
 [Official OpenAI configuration basics](https://learn.chatgpt.com/docs/config-file/config-basic).
@@ -42,9 +47,13 @@ projects require reviewed evidence and a registry/pin update in code review.
 There is no directory-name search or ancestor allow rule. Desk explicitly maps
 each selected ID to one canonical, reviewed Git root. The tool checks root
 markers and boundaries; desk must verify repository identity against inventory.
-Each worktree has its own project configuration and trust review. Prepare a
-separate plan for each worktree before global replacement; duplicate IDs and
-overlapping roots refuse. Never trust or attach a shared work/services ancestor.
+Each worktree needs its own project configuration review. Codex 0.157.1 can
+inherit trust from the main repository for a linked worktree: if that worktree
+has its own .codex/config.toml, the attachment can load without a separate
+trust entry. Desk must inspect effective trust and configuration for every
+worktree. Prepare a separate plan for each worktree before global replacement;
+duplicate IDs and overlapping roots refuse. Never trust or attach a shared
+work/services ancestor.
 
 ## Render-only migration contract
 
@@ -177,11 +186,12 @@ Q-41 tests check exact global/project transfer, HTTP env auth and approvals
 offline, private staging/no active writes, attached-project mock refusal with
 absent start/brief, and assertion-RED guard mutants. HOME, CODEX_HOME, Claude,
 Kimi variants, Kiro and XDG homes are isolated before consumer spawns. Installed
-Codex 0.157.1 mcp list --json enumerates ONLY fake stdio definitions in fixture
+Codex mcp list --json enumerates ONLY fake stdio definitions in fixture
 homes: unrelated/untrusted roots lack auto_trader, the trusted selected Git
 root and child cwd see its configured command/env. It starts no fake server or
-API request. CLI list JSON omits enabled_tools in this version; parsed proposal
-equality proves the exact tool/approval preservation separately. Without an
-installed Codex binary that integration check skips explicitly; desk must
+API request. The locally observed 0.157.1 list JSON omits enabled_tools;
+parsed proposal equality proves the exact tool/approval preservation
+separately. Without an installed Codex binary that integration check skips
+explicitly; desk must
 verify its installed version. Full-suite execution belongs to builder's desktop
 wrk heavy lane; never run it on this Mac with heavy_max=0.

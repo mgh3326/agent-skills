@@ -4,6 +4,7 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -170,7 +171,8 @@ class MigrationTests(unittest.TestCase):
             self.assertFalse(Path(system).exists(), "cannot enumerate an uncontrolled system catalog")
         version = subprocess.run([codex, "--version"], env=self.env, capture_output=True, text=True, timeout=10)
         self.assertEqual(version.returncode, 0)
-        self.assertEqual(version.stdout.strip(), "codex-cli 0.157.1")
+        self.assertRegex(version.stdout.strip(), r"^codex-cli \d+\.\d+\.\d+(?:\S*)$")
+        print("CODEX_CONFIG_ENUMERATION observed=" + version.stdout.strip(), flush=True)
         self.module.render(self.bundle, self.stage)
         # Activate ONLY the owned fixture proposals, never any user files.
         shutil.copy2(self.stage / "global/config.toml", self.target)
@@ -205,6 +207,42 @@ class MigrationTests(unittest.TestCase):
         self.assertIn("auto_trader", enumerate_at(nested))
         self.assertNotIn("auto_trader", enumerate_at(unrelated))
         self.assertFalse(self.marker.exists(), "mcp list enumerates config only; no server/API calls")
+
+    def test_version_change_keeps_config_enumeration_and_red_pin_mutant(self):
+        codex = shutil.which("codex")
+        if not codex:
+            self.skipTest("Codex CLI absent; installed config enumeration must run on the desktop")
+        # Simulate the desktop's changed version output, forwarding EVERY config
+        # enumeration to the installed binary with isolated homes. This proves
+        # version portability without pretending to install/run 0.158.0 here.
+        proxy = self.base / "codex-version-proxy"
+        proxy.write_text("#!" + sys.executable + "\nimport os,sys\n"
+                         "if sys.argv[1:]==['--version']:\n print('codex-cli 0.158.0');sys.exit(0)\n"
+                         "os.execv(" + repr(codex) + ",[" + repr(codex) + ",*sys.argv[1:]])\n")
+        proxy.chmod(0o700)
+        rig = MigrationTests()
+        rig.setUp()
+        try:
+            with patch.object(shutil, "which", return_value=str(proxy)):
+                rig.test_untrusted_selected_and_unrelated_codex_enumeration_fake_only()
+        finally:
+            rig.doCleanups()
+        source = Path(__file__).read_text().replace(
+            'self.assertRegex(version.stdout.strip(), r"^codex-cli \\d+\\.\\d+\\.\\d+(?:\\S*)$")',
+            'self.assertEqual(version.stdout.strip(), "codex-cli 0.157.1")')
+        source = source.replace('ROOT = Path(__file__).resolve().parents[1]', 'ROOT = Path(' + repr(str(ROOT)) + ')', 1)
+        path = self.base / "mutant-version.py"
+        path.write_text(source)
+        module = load(path)
+        mutant = module.MigrationTests()
+        mutant.setUp()
+        try:
+            with patch.object(shutil, "which", return_value=str(proxy)):
+                with self.assertRaises(AssertionError) as caught:
+                    mutant.test_untrusted_selected_and_unrelated_codex_enumeration_fake_only()
+            print("ASSERTION-RED cli-version-portability: " + str(caught.exception).splitlines()[0], flush=True)
+        finally:
+            mutant.doCleanups()
 
     def test_attached_project_mock_consumer_refused_before_start_or_brief(self):
         rig = mock_fixtures.IsolationTests(methodName="test_consumer_allowed_and_refused_with_injection_absent")

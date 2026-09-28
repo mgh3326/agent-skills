@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import re
 import subprocess
+import time
 import unittest
 
 import test_wrk_mock_mcp as fixtures
@@ -11,6 +12,80 @@ from test_wrk_mock_mcp import PROFILE, load
 
 
 class GuardMutants(unittest.TestCase):
+    def test_stalled_call_disconnect_cleanup_mutant(self):
+        rig = self.rig()
+        rig.test_stalled_call_disconnect_stops_gateway_and_owned_upstream()
+        rig = self.rig()
+        source = rig.helper.read_text().replace(
+            "                if owns_attach:\n                    stop.set()",
+            "                if False:\n                    stop.set()", 1)
+        rig.helper.write_text(source)
+        self.red("stalled-call-disconnect-cleanup", rig.test_stalled_call_disconnect_stops_gateway_and_owned_upstream)
+
+    def test_stalled_call_explicit_stop_cleanup_mutant(self):
+        rig = self.rig()
+        rig.test_stalled_call_explicit_stop_stops_gateway_and_owned_upstream()
+        rig = self.rig()
+        source = rig.helper.read_text().replace(
+            "            for task in tuple(client_tasks):\n                task.cancel()",
+            "            for task in tuple(client_tasks):\n                pass", 1)
+        rig.helper.write_text(source)
+        self.red("stalled-call-explicit-stop-cleanup",
+                 rig.test_stalled_call_explicit_stop_stops_gateway_and_owned_upstream)
+        # The mutant uses an eight-second owned fixture stall. Wait for that
+        # fixture to finish so this RED probe leaves no background process.
+        socket = Path(json.loads(Path(rig.plans[-1]).read_text())["socket"])
+        for _ in range(100):
+            if not socket.exists():
+                break
+            time.sleep(0.1)
+        self.assertFalse(socket.exists(), "mutant fixture did not clean up after its bounded stall")
+
+    def test_mutable_plan_binding_consumer_and_startup_mutants(self):
+        rig = self.rig()
+        rig.test_consumer_mutated_plan_refuses_extra_connection_before_start_or_brief()
+        rig = self.rig()
+        self.skip_reason(rig, "prepared connection binding changed")
+        extra_log = rig.mutate_plan_before_consumer_extraction()
+        result, log = rig.consumer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent prompt ", log)
+        self.assertTrue(extra_log.exists())
+        catalogs = json.loads((rig.base / "connected").read_text())
+        self.assertIn("kis_live_place_order", catalogs["unchecked_fixture"])
+        self.red("consumer-plan-binding-refusal", lambda: rig.assertRefused(result))
+        self.red("consumer-plan-binding-injection-absent",
+                 lambda: self.assertNotIn("agent prompt ", log, "forbidden brief was injected"))
+        rig = self.rig()
+        rig.test_mutated_plan_before_daemon_load_never_starts_upstream()
+        rig = self.rig()
+        self.skip_reason(rig, "prepared connection binding changed")
+        self.red("plan-binding-before-upstream", rig.test_mutated_plan_before_daemon_load_never_starts_upstream)
+
+    def test_external_profile_catalog_and_selector_mutants(self):
+        rig = self.rig()
+        rig.test_external_codex_profiles_refuse_consumer_and_late_attachment()
+        rig = self.rig()
+        source = rig.helper.read_text().replace('paths += sorted(conf_home.glob("*.config.toml"))', 'paths += []')
+        rig.helper.write_text(source)
+        home = Path(rig.env["CODEX_HOME"])
+        home.mkdir()
+        (home / "hidden.config.toml").write_text('[mcp_servers.hidden_fixture]\ncommand="/fixture/never-start"\n')
+        result, log = rig.consumer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("agent prompt ", log)
+        self.red("consumer-external-profile-refusal", lambda: rig.assertRefused(result))
+        self.red("consumer-external-profile-injection-absent", lambda: self.assertNotIn("agent prompt ", log))
+        rig = self.rig()
+        args = ["prepare", "--kind", "codex", "--cwd", str(rig.cwd), "--profile", PROFILE,
+                "--config", str(rig.config), "--", "--profile", "hidden"]
+        rig.assertRefused(rig.run_helper(*args))
+        self.skip_reason(rig, "Codex profile selector cannot prove exclusive MCP catalog")
+        result = rig.run_helper(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        rig.plans.append(result.stdout.strip())
+        self.red("external-profile-selector", lambda: rig.assertRefused(result))
+
     def test_tool_call_must_not_inherit_catalog_timeout_mutant(self):
         rig = self.rig()
         rig.test_tool_call_outlives_catalog_deadline_and_preserves_next_response()
@@ -74,7 +149,10 @@ class GuardMutants(unittest.TestCase):
         self.red("stdio-transport-no-URL-fallback", lambda: self.expect_refusal(m, lambda: m.descriptor(rig.config, PROFILE)))
 
     def test_policy_pin_alias_and_live_surface_mutants(self):
-        for name in ("submit_ticket_alias", "kis_live_modify_order", "place_order"):
+        for name in ("submit_ticket_alias", "kis_live_modify_order", "place_order",
+                     "toss_place_order", "toss_modify_order", "toss_cancel_order",
+                     "toss_reconcile_orders", "live_reconcile_orders", "place_order_v2",
+                     "mcp__auto_trader__place_order", "kis-live-place-order", "KisLivePlaceOrder"):
             rig = self.rig()
             path = rig.repo / "wrk-mcp/profiles.json"
             d = json.loads(path.read_text())
@@ -90,6 +168,27 @@ class GuardMutants(unittest.TestCase):
             self.expect_refusal(m, lambda: m.policy(PROFILE))
             m = self.skip_reason(rig, reason)
             self.red("policy-" + name, lambda: self.expect_refusal(m, lambda: m.policy(PROFILE)))
+
+    def test_live_name_normalization_and_safe_mock_mutants(self):
+        rig = self.rig()
+        m = load(rig.helper)
+        for name in ("KisLivePlaceOrder", "kis-live-place-order", "mcp__auto_trader__place_order"):
+            self.assertTrue(m.live_order_surface(name))
+        self.assertFalse(m.live_order_surface("kis_mock_place_order"))
+        source = rig.helper.read_text().replace(
+            'normalized = re.sub(r"[^a-z0-9]+", "_", snake.lower()).strip("_")',
+            'normalized = name.lower()', 1)
+        rig.helper.write_text(source)
+        mutant = load(rig.helper)
+        self.red("live-name-case-normalization", lambda: self.assertTrue(mutant.live_order_surface("KisLivePlaceOrder")))
+        self.red("live-name-separator-normalization", lambda: self.assertTrue(mutant.live_order_surface("kis-live-place-order")))
+        rig = self.rig()
+        source = rig.helper.read_text().replace(
+            'if normalized in {"kis_mock_place_order", "kis_mock_modify_order", "kis_mock_cancel_order"}:',
+            'if False:', 1)
+        rig.helper.write_text(source)
+        mutant = load(rig.helper)
+        self.red("safe-mock-order-remains-allowed", lambda: self.assertFalse(mutant.live_order_surface("kis_mock_place_order")))
 
     def test_unexpected_catalog_and_duplicate_mutants(self):
         for name in ("kis_live_place_order", "submit_ticket_alias", "duplicate"):

@@ -35,6 +35,10 @@ The read-only auto_trader origin/main source at
   tools for HERMES_PAPER_KIS.
 - app/mcp_server/tooling/orders_kis_variants.py:464,469,579,605 defines the
   hard-pinned live registrar and place/cancel/modify public names.
+- app/mcp_server/tooling/registry.py:480 registers Toss live orders only in
+  DEFAULT. orders_toss_variants.py:2660,2693,2707 defines its live
+  place/modify/cancel names; :2741 defines toss_reconcile_orders, whose
+  non-dry-run path updates the live order ledger.
 
 A sanitized Mac file inspection found auto_trader as a URL connection in
 ~/.codex/config.toml:12-13. No URL, headers, tokens, or server request was
@@ -83,7 +87,9 @@ private plan outside the worktree. It then:
 2. Enumerates the relevant user, ancestor/project, plugin and known managed
    sources. Any conflicting catalog, unreadable file, symlink file, managed
    override or plugin directory refuses. Checks are conservative, including
-   dormant profile tables and Claude entries for other projects.
+   dormant profile tables, Codex external profile files and Claude entries for
+   other projects. Codex profile selectors in config or argv also refuse; a
+   selected external profile cannot silently add another catalog.
 3. Starts exactly one declared stdio process with explicit MCP_PROFILE and
    MCP_TYPE=stdio. Only PATH/HOME/TMPDIR/locale/system essentials are inherited;
    ENV_FILE and credential variables are not forwarded. Descriptors cannot
@@ -93,10 +99,13 @@ private plan outside the worktree. It then:
    generic order names and unreviewed aliases refuse.
 5. Generates a harness-specific connection to a private Unix socket for that
    same process. Checks argv, explicit pane config-home/profile env, file hashes,
-   source configuration fingerprints and socket identity before startup and
-   again before brief injection. The final check also requires the harness to
-   have actually loaded/attached to the gateway. Preparing a safe connection
-   while using a different connection cannot satisfy this check.
+   source configuration fingerprints, prepared-plan binding and socket identity
+   before startup and again before brief injection. The gateway binds the plan
+   before it starts upstream, so an edited plan cannot introduce an unchecked
+   harness argv between prepare and consumer extraction. The final check also
+   requires the harness to have actually loaded/attached to the gateway.
+   Preparing a safe connection while using a different connection cannot
+   satisfy this check.
 6. During the session exposes only reviewed tools. Each tools/list and
    tools/call rechecks the full upstream catalog. Tool calls outside it and
    resource/prompt/other MCP channels are not forwarded. Unexpected catalog
@@ -105,8 +114,9 @@ private plan outside the worktree. It then:
 Initialization/catalog RPCs retain a 10-second read deadline. Approved tool
 calls have no gateway deadline; the harness controls its tool timeout, so a
 slow call is not falsely reported as an isolation refusal while it continues
-upstream. The client loop observes disconnect after an in-flight call returns;
-the owned plan stop operation can interrupt a pending call during cleanup.
+upstream. An independent client reader detects harness EOF even during a
+stalled approved call; it stops the gateway and terminates its owned upstream.
+The owned plan stop operation also interrupts a pending call during cleanup.
 
 The reviewed offline table is wrk-mcp/profiles.json, copied as data from
 auto_trader tests/mcp_server/profile_tool_snapshot.json at the source commit
@@ -115,12 +125,15 @@ profiles are hermes-paper-kis (123 or 141 tools, feature gates off/on),
 shadow-replay (7), watch_repricing (18), and fill-watch-context (2). Other
 recognized application profiles remain unreviewed here and refuse.
 
-The table's SHA-256 is pinned in the helper. A new alias cannot be admitted by
-editing an operator allowlist or this JSON alone; table updates require review
-of the source registration semantics and an explicit code/policy change.
-Live-name/generic-order checks independently reject such names even under a
-new table hash. This is a closed catalog and trusted server implementation
-boundary; it is not a broker sandbox for the harness's shell tools.
+The table's SHA-256 is pinned in the helper. Editing this JSON alone cannot
+admit a new alias; table updates require source registration review and an
+explicit code/policy change. The second check normalizes case, separators and
+qualified names, then rejects live/real tokens and order place/modify/cancel,
+submit/execute, trade and reconcile actions, including the actual Toss live
+tools, even under a new table hash. It keeps the reviewed kis_mock order trio.
+Names that conceal their effect still require source review; naming rules are
+not a complete alias proof. This is a closed catalog and trusted server
+implementation boundary, not a broker sandbox for shell tools.
 
 The socket directory is mode 0700; socket and generated files are mode 0600.
 One harness may attach. Closing that connection stops its upstream; a spawn
@@ -153,8 +166,12 @@ After merge, installation and activation belong to director/operator-desk.
 The worker must not run install.sh or change the active wrk. Desk must review the
 declared executable and its automatic configuration loading independently.
 Create a dedicated harness configuration context with no other MCP/plugin
-catalog rather than changing operator connections as part of this PR. This
-worker neither provisions nor copies authentication or secrets.
+catalog only for a cwd whose scanned ancestors also have no such sources.
+The guard checks ancestor .codex files and plugin directories, including
+HOME/.codex for a cwd beneath HOME, even when CODEX_HOME points elsewhere.
+On this Mac the existing home plugin catalog prevents a guarded Codex mock
+spawn; this PR does not activate a usable mock context there. This worker
+neither provisions nor copies authentication or secrets.
 
 For a separately authorized fresh local spawn, desk supplies the private
 descriptor and profile in the invocation environment. Reuse the normal task,

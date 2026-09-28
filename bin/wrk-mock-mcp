@@ -55,6 +55,23 @@ def read_json(path):
     return json.loads(Path(path).read_text())
 
 
+def live_order_surface(name):
+    require(isinstance(name, str) and name, "invalid reviewed catalog")
+    # Normalize CLI-qualified names, separators and CamelCase before checking
+    # actions. Only the reviewed KIS mock order trio has a safe order suffix.
+    snake = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", name)
+    snake = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", snake)
+    normalized = re.sub(r"[^a-z0-9]+", "_", snake.lower()).strip("_")
+    tokens = normalized.split("_")
+    if "live" in tokens or "real" in tokens:
+        return True
+    if normalized in {"kis_mock_place_order", "kis_mock_modify_order", "kis_mock_cancel_order"}:
+        return False
+    return bool(re.search(r"(?:^|_)(?:place|modify|cancel|submit|execute)_orders?(?:_v\d+)?$", normalized)
+                or re.search(r"(?:^|_)reconcile_orders(?:_v\d+)?$", normalized)
+                or re.search(r"(?:^|_)trade(?:_v\d+)?$", normalized))
+
+
 def policy(profile):
     require(digest(POLICY) == POLICY_SHA256, "reviewed profile table changed (including aliases); review required")
     profiles = read_json(POLICY)["profiles"]
@@ -64,8 +81,7 @@ def policy(profile):
     for tools in variants:
         require(tools and len(set(tools)) == len(tools), "invalid reviewed catalog")
         for name in tools:
-            require(not re.search(r"(^|_)(live|real)(_|$)", name, re.I)
-                    and name not in {"place_order", "modify_order", "cancel_order", "trade", "execute_order"},
+            require(not live_order_surface(name),
                     "live order surface in reviewed profile table")
     return variants
 
@@ -117,6 +133,9 @@ def isolation(kind, cwd):
     if kind == "codex":
         conf_home = Path(os.environ.get("CODEX_HOME", home / ".codex")).resolve()
         paths = [conf_home / "config.toml", conf_home / "managed_config.toml"]
+        # External named profiles are separate Codex config layers. Inspect
+        # even dormant files, matching our conservative embedded-profile rule.
+        paths += sorted(conf_home.glob("*.config.toml"))
         paths += [p / ".codex/config.toml" for p in ancestors]
         paths += [p / ".mcp.json" for p in ancestors]
         managed = [conf_home / "managed_config.toml", conf_home / "requirements.toml",
@@ -164,12 +183,27 @@ def isolation(kind, cwd):
             d = read_json(p)
         require(kind != "claude" or not isinstance(d, dict) or not d.get("oauthAccount"),
                 "Claude OAuth account policy cannot prove exclusive MCP catalog")
+        require(kind != "codex" or not d.get("profile"), "Codex profile selector cannot prove exclusive MCP catalog")
         require(not has_connections(d), "conflicting global/project MCP or plugin configuration")
     return fingerprints, env
 
 
 def compact(value):
     return json.dumps(value, separators=(",", ":"))
+
+
+def plan_binding(plan):
+    return hashlib.sha256(json.dumps(plan, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def profile_option(argv):
+    for value in argv:
+        if value == "--profile" or value.startswith("--profile=") or value.startswith("-p"):
+            return True
+        value = re.sub(r"^(?:--config=|-c)", "", value).strip()
+        if re.match(r"^['\"]?profiles?['\"]?\s*(?:[.=])", value):
+            return True
+    return False
 
 
 async def socket_rpc(socket, method):
@@ -206,6 +240,7 @@ def verify(plan_path, argv, require_attached=False, cwd=None):
     for path, sha in p["artifacts"].items():
         require(digest(path) == sha, "generated connection configuration changed")
     result = asyncio.run(socket_rpc(p["socket"], "wrk/verify"))
+    require(result.get("binding") == plan_binding(p), "prepared connection binding changed")
     require(result.get("profile") == p["profile"] and result.get("policy") == POLICY_SHA256, "checked connection identity mismatch")
     require(not require_attached or result.get("attached") is True, "required MCP connection was not loaded by the session")
 
@@ -217,6 +252,7 @@ def prepare(a):
     d = descriptor(a.config, a.profile)
     cwd = Path(a.cwd).resolve(strict=True)
     fingerprints, env = isolation(a.kind, cwd)
+    require(a.kind != "codex" or not profile_option(a.argv), "Codex profile selector cannot prove exclusive MCP catalog")
     require(not any(x.startswith(("--mcp", "--strict-mcp", "--plugin", "--settings", "--setting-sources", "--remote"))
                     or "mcp_servers" in x for x in a.argv), "conflicting harness connection options")
     directory = Path(tempfile.mkdtemp(prefix="wrk-mcp-"))
@@ -248,7 +284,8 @@ def prepare(a):
     plan = directory / "plan.json"
     plan.write_text(compact(p))
     os.chmod(plan, 0o600)
-    process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "serve", "--plan", str(plan)],
+    process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "serve", "--plan", str(plan),
+                                "--binding", plan_binding(p)],
                                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                start_new_session=True)
     try:
@@ -275,8 +312,9 @@ def prepare(a):
     print(str(plan))
 
 
-async def serve(plan):
+async def serve(plan, binding):
     p = read_json(plan)
+    require(plan_binding(p) == binding, "prepared connection binding changed")
     variants = policy(p["profile"])
     d = descriptor(next(iter(p["artifacts"])), p["profile"])
     s = d["server"]
@@ -330,9 +368,28 @@ async def serve(plan):
     async def client(reader, writer):
         nonlocal attached
         owns_attach = False
+        inbox = asyncio.Queue()
+        disconnected = asyncio.Event()
+
+        async def read_requests():
+            # Read independently of upstream RPC completion so EOF can stop a
+            # stalled approved call without imposing a tool execution deadline.
+            try:
+                while True:
+                    line = await reader.readline()
+                    if not line:
+                        break
+                    inbox.put_nowait(line)
+            finally:
+                disconnected.set()
+                inbox.put_nowait(None)
+                if owns_attach:
+                    stop.set()
+
+        intake = asyncio.create_task(read_requests())
         try:
             while True:
-                line = await reader.readline()
+                line = await inbox.get()
                 if not line:
                     break
                 q = json.loads(line)
@@ -340,17 +397,22 @@ async def serve(plan):
                 if "id" not in q:
                     continue
                 response = {"jsonrpc": "2.0", "id": q["id"]}
+                stop_after_response = False
                 try:
                     if method == "wrk/attach":
                         require(not attached, "connection already attached to a harness")
                         attached = owns_attach = True
+                        if disconnected.is_set():
+                            stop.set()
+                            break
                         result = {}
                     elif method == "wrk/stop":
-                        stop.set()
+                        stop_after_response = True
                         result = {}
                     elif method == "wrk/verify":
                         await list_tools()
-                        result = {"profile": p["profile"], "policy": POLICY_SHA256, "attached": attached}
+                        result = {"profile": p["profile"], "policy": POLICY_SHA256,
+                                  "binding": binding, "attached": attached}
                     elif not owns_attach:
                         raise Refused("MCP client must attach to the checked connection")
                     elif method == "initialize":
@@ -372,12 +434,27 @@ async def serve(plan):
                     response["result"] = result
                 except (Refused, ValueError, KeyError, asyncio.TimeoutError):
                     response["error"] = {"code": -32000, "message": "mock MCP isolation refused request"}
-                writer.write((compact(response) + "\n").encode())
-                await writer.drain()
+                try:
+                    writer.write((compact(response) + "\n").encode())
+                    await writer.drain()
+                finally:
+                    if stop_after_response:
+                        stop.set()
+        except ConnectionError:
+            pass
         finally:
+            intake.cancel()
+            await asyncio.gather(intake, return_exceptions=True)
             writer.close()
             if owns_attach:
                 stop.set()
+
+    client_tasks = set()
+
+    def accept_client(reader, writer):
+        task = asyncio.create_task(client(reader, writer))
+        client_tasks.add(task)
+        task.add_done_callback(client_tasks.discard)
 
     try:
         await rpc("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
@@ -385,7 +462,7 @@ async def serve(plan):
         proc.stdin.write((compact({"jsonrpc": "2.0", "method": "notifications/initialized"}) + "\n").encode())
         await proc.stdin.drain()
         await list_tools()
-        server = await asyncio.start_unix_server(client, p["socket"])
+        server = await asyncio.start_unix_server(accept_client, p["socket"])
         os.chmod(p["socket"], 0o600)
         async with server:
             # Unattached failed spawns cannot leave an immortal server behind.
@@ -398,6 +475,12 @@ async def serve(plan):
                     pass
             if attached:
                 await stop.wait()
+            # Python 3.12+ Server.wait_closed waits for active handlers. Cancel
+            # a stalled tools/call before leaving the server context.
+            server.close()
+            for task in tuple(client_tasks):
+                task.cancel()
+            await asyncio.gather(*client_tasks, return_exceptions=True)
     finally:
         if proc.returncode is None:
             proc.terminate()
@@ -452,6 +535,7 @@ def main():
     parser.add_argument("--config")
     parser.add_argument("--plan")
     parser.add_argument("--socket")
+    parser.add_argument("--binding")
     parser.add_argument("--require-attached", action="store_true")
     raw = sys.argv[1:]
     split = raw.index("--") if "--" in raw else len(raw)
@@ -463,7 +547,7 @@ def main():
         elif a.action == "verify":
             verify(a.plan, a.argv, a.require_attached, a.cwd)
         elif a.action == "serve":
-            asyncio.run(serve(a.plan))
+            asyncio.run(serve(a.plan, a.binding))
         elif a.action == "connect":
             asyncio.run(connect(a.socket))
         else:
