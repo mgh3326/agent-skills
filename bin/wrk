@@ -1140,6 +1140,145 @@ PY
   echo "wrk: Kimi workspace trust seeded: $trust_file" >&2
 }
 
+# Devin 3000.11.x enforces workspace trust at startup: an untrusted cwd stops
+# at the "Do you trust the contents of this directory?" screen, which the
+# readiness window then reports as agent-not-detected (the 2026-09-28 Pi spawn
+# failure, task 912). --respect-workspace-trust false in the spawn argv covers
+# only non-interactive --print mode (devin docs reference/commands.mdx), so the
+# TUI still prompts. wrk therefore registers the resolved spawn cwd — and only
+# it — in devin's trusted-workspaces store before the pane exists.
+#
+# Store: ${XDG_DATA_HOME:-$HOME/.local/share}/devin/cli/trusted_workspaces.json
+# — the file devin reads in user-config/src/trusted_workspaces.rs (binary
+# strings: trusted_workspaces.json, trusted_paths, XDG_DATA_HOME plus the
+# .local/share/devin/cli segments; confirmed live on macOS 3000.11.3, where it
+# is NOT under ~/Library/Application Support). Same path rule on macOS and
+# Linux. Shape: {"trusted_paths": ["/abs/dir", ...]}; trust inherits into
+# subfolders.
+#
+# Unlike the kimi seed this is fail CLOSED: a missing or corrupt store means
+# the operator's trust state is unknown, and the fallback is a modal prompt a
+# spawned pane cannot answer — so the spawn is refused before any pane exists
+# rather than silently creating or overwriting the file.
+devin_seed_workspace_trust() {
+  local cwd="$1" abs_cwd trust_file
+  if ! abs_cwd="$(cd -- "$cwd" 2>/dev/null && pwd -P)"; then
+    die "cannot resolve Devin spawn CWD to an absolute path: $cwd"
+  fi
+  trust_file="${XDG_DATA_HOME:-$HOME/.local/share}/devin/cli/trusted_workspaces.json"
+  python3 - "$abs_cwd" "$trust_file" <<'PY'
+import fcntl
+import json
+import os
+import sys
+import tempfile
+import time
+
+cwd = sys.argv[1]
+path = os.path.realpath(sys.argv[2])
+
+
+def refuse(reason):
+    sys.stderr.write("wrk: Devin workspace trust refused: %s\n" % reason)
+    sys.exit(1)
+
+
+if not os.path.isdir(cwd):
+    refuse("spawn cwd does not resolve to a directory: %s" % cwd)
+# A missing store means devin has never been provisioned on this host (or the
+# file was lost): refuse instead of guessing a fresh store.
+if not os.path.isfile(path):
+    refuse("store missing: %s — trust a directory in devin once or restore the file; not creating it" % path)
+
+# The lock file is created once and never replaced, so flock always serializes
+# on one inode. The data file itself is atomically replaced below, so it must
+# be read fresh under the lock — a second spawn then sees the first spawn's
+# committed entry and keeps it.
+lock_path = path + ".wrk.lock"
+try:
+    lock_fd = open(lock_path, "a+b")
+except OSError as exc:
+    refuse("cannot open lock %s: %s" % (lock_path, exc))
+
+with lock_fd:
+    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        try:
+            with open(path, "rb") as handle:
+                raw = handle.read()
+        except OSError as exc:
+            refuse("cannot read store %s: %s" % (path, exc))
+        try:
+            data = json.loads(raw)
+        except ValueError as exc:
+            refuse("store is not valid JSON: %s (%s) — refusing to overwrite a corrupt file" % (path, exc))
+        paths = data.get("trusted_paths") if isinstance(data, dict) else None
+        if not isinstance(paths, list) or not all(isinstance(entry, str) for entry in paths):
+            refuse("store has no trusted_paths string list: %s — refusing to overwrite" % path)
+
+        target = os.path.realpath(cwd)
+
+        def covered():
+            for entry in paths:
+                base = os.path.realpath(entry) if os.path.isabs(entry) else ""
+                if not base:
+                    continue
+                try:
+                    # The entry itself or any ancestor of cwd covers it: devin
+                    # inherits trust into subfolders.
+                    if os.path.commonpath((base, target)) == base:
+                        return True
+                except ValueError:
+                    continue
+            return False
+
+        if covered():
+            sys.stderr.write("wrk: Devin workspace trust already covers %s in %s\n" % (cwd, path))
+            sys.exit(0)
+
+        # WRK_TEST_TRUST_DELAY_S (tests only) holds the read->write gap open so
+        # a lockless or stale-read mutant reliably loses one concurrent entry.
+        delay = float(os.environ.get("WRK_TEST_TRUST_DELAY_S") or 0)
+        if delay > 0:
+            time.sleep(delay)
+
+        backup = "%s.bak-%s" % (path, time.strftime("%Y%m%d"))
+        try:
+            with open(backup, "wb") as handle:
+                handle.write(raw)
+        except OSError as exc:
+            refuse("cannot write backup %s: %s — store left untouched" % (backup, exc))
+
+        # Append only: never removes, reorders, or widens an entry.
+        data["trusted_paths"] = paths + [cwd]
+        blob = json.dumps(data, indent=2).encode("utf-8") + b"\n"
+        mode = os.stat(path).st_mode & 0o777
+        tmp_fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".trusted_workspaces.", suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "wb") as handle:
+                handle.write(blob)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+            dir_fd = os.open(os.path.dirname(path), os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            refuse("atomic write failed for %s: %s" % (path, exc))
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+sys.stderr.write("wrk: Devin workspace trust seeded %s in %s (backup %s)\n" % (cwd, path, backup))
+PY
+}
+
 # Pre-spawn advisory: if -c points at a *canonical* checkout (not a linked worktree)
 # that is off its remote default branch, warn. Does not fail the spawn — operators
 # sometimes work on canonical on purpose. Worktrees and non-git paths stay silent.
@@ -6200,6 +6339,15 @@ spawn_cmd() {
       die "cannot resolve Kimi CWD to an absolute path: $CWD"
     fi
     kimi_seed_workspace_trust "$CWD" "$KIMI_TRUST_HOME"
+  fi
+
+  # #912: devin enforces workspace trust on the TUI path (the
+  # --respect-workspace-trust false argv covers --print only), so the resolved
+  # spawn cwd must be in its store before pane run — fail closed otherwise.
+  # Remote spawns re-enter this same function on the execution host, so the
+  # store seeded is always the host devin actually runs on.
+  if [[ "$PROFILE_KIND" == devin ]]; then
+    devin_seed_workspace_trust "$CWD"
   fi
 
   # #637: persist what the pane would otherwise lose on a herdr reboot restore
