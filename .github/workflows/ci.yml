@@ -88,5 +88,5 @@ jobs:
           bash tests/test-wrk-heavy-limit.sh
           bash tests/test-wrk-task-link.sh
           bash tests/test-wrk-job-end.sh
-      - name: Mock MCP isolation and assertion mutants (fake only)
-        run: python -m unittest discover -s tests -p 'test_wrk_mock_mcp*.py' -v
+      - name: Mock MCP isolation, project migration and assertion mutants (fake only)
+        run: python -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v

@@ -1,0 +1,254 @@
+#!/usr/bin/env python3
+"""Render a desk-reviewed Codex MCP migration from explicit offline snapshots.
+
+No activation, config discovery, subprocesses, network, or credential lookup.
+All outputs are new files beneath an exclusively created private staging root.
+"""
+import argparse
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import sys
+try:
+    import tomllib
+except ImportError:
+    print("Codex MCP plan refused: Python 3.11+ required", file=sys.stderr)
+    sys.exit(79)
+
+ROOT = Path(__file__).resolve().parents[1]
+REGISTRY = ROOT / "wrk-mcp/codex-projects.json"
+REGISTRY_SHA256 = "49ff929b4bef3ed91012d3a21e2397006ad509c18088fa3d69cb06d0322452eb"
+SERVER = "auto_trader"
+
+
+class Refused(Exception):
+    pass
+
+
+def require(ok, reason):
+    if not ok:
+        raise Refused(reason)
+
+
+def no_symlinks(path):
+    require(not any(p.is_symlink() for p in [path, *path.parents]), "symlink path is not supported")
+
+
+def absolute(value):
+    require(isinstance(value, str) and Path(value).is_absolute()
+            and not any(c in value for c in "\n\r\x00"), "explicit absolute path required")
+    p = Path(value)
+    require(p == p.resolve(), "canonical path required")
+    no_symlinks(p)
+    return p
+
+
+def within(path, root):
+    return path == root or root in path.parents
+
+
+def snapshot(bundle, name):
+    p = bundle / name
+    no_symlinks(p)
+    require(p.is_file() and p.stat().st_uid == os.getuid() and p.stat().st_mode & 0o077 == 0,
+            "snapshot must be an owned private regular file")
+    return p.read_bytes().decode("utf-8")
+
+
+def parse(text):
+    try:
+        return tomllib.loads(text)
+    except (ValueError, TypeError):
+        raise Refused("invalid or unsupported TOML snapshot (contents withheld)") from None
+
+
+def server_table(config):
+    servers = config.get("mcp_servers", {})
+    require(isinstance(servers, dict), "invalid MCP server table")
+    return servers.get(SERVER)
+
+
+def other_attachment(config, top=True):
+    if isinstance(config, dict):
+        for key, value in config.items():
+            if key == "mcp_servers" and isinstance(value, dict) and SERVER in value and not top:
+                return True
+            if other_attachment(value, False):
+                return True
+    elif isinstance(config, list):
+        return any(other_attachment(v, False) for v in config)
+    return False
+
+
+def reviewed_connection(baseline, connection, count):
+    table = server_table(connection)
+    require(isinstance(table, dict) and connection == {"mcp_servers": {SERVER: table}},
+            "connection snapshot must contain only mcp_servers.auto_trader")
+    require(server_table(baseline) == table, "connection differs from the current global baseline")
+    tools = table.get("enabled_tools")
+    require(isinstance(tools, list) and len(tools) == count
+            and all(isinstance(t, str) and t for t in tools) and len(set(tools)) == count,
+            "current approved 30-tool allowlist required; no full or widened fallback")
+    transports = set(table) & {"url", "command"}
+    require(len(transports) == 1 and all(isinstance(table[k], str) and table[k] for k in transports),
+            "one explicit connection transport required")
+    require(not other_attachment(baseline), "additional profile/plugin auto_trader attachment requires separate review")
+    return table
+
+
+def transfer(global_text, connection_text, count):
+    baseline, connection = parse(global_text), parse(connection_text)
+    table = reviewed_connection(baseline, connection, count)
+    # Preserve bytes instead of reserializing all TOML metadata/settings. Each
+    # header is independently parsed, so quoted keys and nested tool tables work.
+    # Semantic equality below refuses inline/dotted or multiline forms that
+    # cannot be split reliably, including header-like text inside strings.
+    chunks = re.split(r"(?m)(?=^[ \t]*\[)", global_text)
+    keep, moved = [], []
+    for chunk in chunks:
+        first = chunk.splitlines()[0] if chunk.splitlines() else ""
+        match = re.fullmatch(r"\s*(\[.*\])\s*(?:#.*)?", first)
+        selected = False
+        if match:
+            try:
+                selected = server_table(tomllib.loads(match[1])) is not None
+            except ValueError:
+                pass
+        (moved if selected else keep).append(chunk)
+    remainder, attachment = "".join(keep), "".join(moved)
+    expected = copy.deepcopy(baseline)
+    expected.get("mcp_servers", {}).pop(SERVER, None)
+    actual = parse(remainder)
+    if not expected.get("mcp_servers") and "mcp_servers" not in actual:
+        expected.pop("mcp_servers", None)
+    require(actual == expected and parse(attachment) == connection,
+            "lossless table transfer could not be proved; use explicit table headers in desk snapshots")
+    return remainder, attachment, table
+
+
+def project_config(existing, attachment, table):
+    prior = parse(existing)
+    require(server_table(prior) is None and not other_attachment(prior),
+            "project already attaches auto_trader; reconcile explicitly before planning")
+    expected = copy.deepcopy(prior)
+    expected.setdefault("mcp_servers", {})[SERVER] = table
+    output = existing + ("\n" if existing and not existing.endswith("\n") else "") + attachment
+    require(parse(output) == expected, "project merge changed unrelated settings or tool restrictions")
+    return output
+
+
+def selection(data, registry):
+    require(isinstance(data, dict) and set(data) == {"schema", "global_target", "projects"}
+            and data["schema"] == 1 and isinstance(data["projects"], list) and data["projects"],
+            "explicit selection schema and projects required")
+    global_target = absolute(data["global_target"])
+    require(global_target.name == "config.toml" and global_target.parent.name == ".codex",
+            "global target must identify a Codex config.toml")
+    projects, roots, ids = [], [], set()
+    for item in data["projects"]:
+        require(isinstance(item, dict) and set(item) == {"id", "root", "snapshot", "root_reviewed"},
+                "explicit project root and snapshot decision required")
+        pid = item["id"]
+        require(isinstance(pid, str) and pid in registry["projects"], "project absent from reviewed registry")
+        require(pid not in ids, "duplicate logical project; review worktrees in separate plans")
+        ids.add(pid)
+        root = absolute(item["root"])
+        require(item["root_reviewed"] is True and root.is_dir() and (root / ".git").exists()
+                and not within(ROOT, root) and not within(global_target, root),
+                "reviewed concrete git project root required; no shared ancestor or agent-skills attachment")
+        require(not any(within(root, p) or within(p, root) for p in roots), "overlapping project roots refused")
+        roots.append(root)
+        require(item["snapshot"] in {None, "projects/" + pid + ".toml"}, "project snapshot must be an explicit bundle member")
+        projects.append((pid, root, item["snapshot"]))
+    return global_target, projects
+
+
+def output_boundary(stage, bundle, global_target, projects):
+    no_symlinks(stage)
+    protected = [bundle, ROOT, global_target.parent, Path.home() / ".codex",
+                 Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve(),
+                 *[root for _, root, _ in projects]]
+    require(not any(within(stage, p) or within(p, stage) for p in protected),
+            "staging overlaps inputs, repository, or active configuration targets")
+    require(stage.parent.is_dir() and not stage.exists(), "staging must be a new directory beneath an existing parent")
+
+
+def write_private(path, text):
+    missing = []
+    parent = path.parent
+    while not parent.exists():
+        missing.append(parent)
+        parent = parent.parent
+    for parent in reversed(missing):
+        parent.mkdir(mode=0o700)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
+def render(bundle, stage):
+    bundle, stage = absolute(str(bundle)), absolute(str(stage))
+    require(bundle.is_dir() and bundle.stat().st_uid == os.getuid() and bundle.stat().st_mode & 0o077 == 0,
+            "input bundle must be an owned private directory")
+    registry_bytes = REGISTRY.read_bytes()
+    require(hashlib.sha256(registry_bytes).hexdigest() == REGISTRY_SHA256,
+            "reviewed project registry changed; review required")
+    registry = json.loads(registry_bytes)
+    data = json.loads(snapshot(bundle, "selection.json"))
+    global_target, projects = selection(data, registry)
+    require(not within(bundle, global_target.parent)
+            and not within(bundle, ROOT)
+            and not within(bundle, Path.home() / ".codex")
+            and not within(bundle, Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).resolve())
+            and not any(within(bundle, root) for _, root, _ in projects),
+            "input bundle must be offline, outside active configuration roots")
+    output_boundary(stage, bundle, global_target, projects)
+    global_text = snapshot(bundle, "global.toml")
+    connection_text = snapshot(bundle, "connection.toml")
+    remainder, attachment, table = transfer(global_text, connection_text, registry["required_enabled_tool_count"])
+    outputs = [("global/config.toml", global_target, remainder)]
+    for pid, root, name in projects:
+        target = root / ".codex/config.toml"
+        no_symlinks(target)
+        # Never inspect target contents. Its existence alone requires an explicit
+        # snapshot supplied by desk, avoiding a silently destructive blank merge.
+        require(name is not None or not target.exists(), "existing project config requires an explicit snapshot")
+        existing = snapshot(bundle, name) if name else ""
+        outputs.append(("projects/" + pid + "/.codex/config.toml", target,
+                        project_config(existing, attachment, table)))
+    # All validation precedes the first mutation. mkdir is exclusive: an existing
+    # directory, symlink, or active config can never be overwritten.
+    stage.mkdir(mode=0o700)
+    entries = []
+    for relative, target, content in outputs:
+        write_private(stage / relative, content)
+        entries.append({"proposed_file": relative, "target_for_desk_review_only": str(target),
+                        "sha256": hashlib.sha256(content.encode()).hexdigest()})
+    manifest = {"schema": 1, "status": "rendered; NOT activated", "trust": "desk review required for every exact root",
+                "enabled_tool_count": len(table["enabled_tools"]), "outputs": entries}
+    write_private(stage / "manifest.json", json.dumps(manifest, indent=2) + "\n")
+    return manifest
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--input-dir", required=True, type=Path, help="private desk-prepared offline bundle")
+    parser.add_argument("--stage", required=True, type=Path, help="new private output directory; never activates targets")
+    args = parser.parse_args()
+    try:
+        result = render(args.input_dir, args.stage)
+    except Refused as exc:
+        print("Codex MCP plan refused: " + str(exc), file=sys.stderr)
+        return 79
+    except (OSError, ValueError, TypeError, KeyError):
+        print("Codex MCP plan refused: invalid input or filesystem operation (contents withheld)", file=sys.stderr)
+        return 79
+    print("Rendered " + str(len(result["outputs"])) + " proposals in " + str(args.stage) + "; no activation")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

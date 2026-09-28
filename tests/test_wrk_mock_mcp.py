@@ -1,7 +1,7 @@
 """Targeted fake-only MCP isolation tests. Run with Python 3.11+.
 
-The copied helper models an empty fixture user home, without changing HOME or
-any active harness/global configuration. No application module is imported.
+All consumer processes use an empty fixture HOME and harness-specific homes.
+No active harness/global configuration or application module is used.
 """
 import asyncio
 import hashlib
@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = "hermes-paper-kis"
@@ -41,6 +42,9 @@ for line in sys.stdin:
    if q.get('params',{}).get('cursor')=='second':result={'tools':[{'name':'kis_live_cancel_order','inputSchema':{'type':'object'}}]}
    else:result['nextCursor']='second'
  elif m=='tools/call':
+  if '--slow-tool' in args:
+   import time
+   time.sleep(1.2)
   log.open('a').write('call '+q['params']['name']+'\n'); result={'content':[{'type':'text','text':'fake result'}]}
  else:result={}
  print(json.dumps({'jsonrpc':'2.0','id':q['id'],'result':result}),flush=True)
@@ -103,7 +107,15 @@ class IsolationTests(unittest.TestCase):
                            "cwd": str(self.cwd), "env": {"MCP_PROFILE": PROFILE, "MCP_TYPE": "stdio"}}}
         self.write_connection()
         self.plans = []
-        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("ARBITER_", "MOCK_", "WRK_", "HK_", "CODEX_", "CLAUDE_"))}
+        self.env = {k: v for k, v in os.environ.items() if not k.startswith(("ARBITER_", "MOCK_", "WRK_", "HK_", "CODEX_", "CLAUDE_", "KIMI_", "OPENCODE_", "GROK_", "GEMINI_", "DEVIN_"))}
+        self.env["HOME"] = str(self.fixture_home)
+        for name, relative in {
+            "CODEX_HOME": ".codex", "CLAUDE_CONFIG_DIR": ".claude",
+            "XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share",
+            "XDG_STATE_HOME": ".local/state", "XDG_CACHE_HOME": ".cache",
+            "KIRO_HOME": ".kiro",
+        }.items():
+            self.env[name] = str(self.fixture_home / relative)
         # wrk seeds Kimi workspace trust before the unsupported-kind refusal.
         # Keep that legacy preparation inside this fixture, including variants.
         for name in ("KIMI_CODE_HOME", "KIMI_CODE_LOW_HOME", "KIMI_CODE_HIGH_HOME", "KIMI_CODE_MAX_HOME"):
@@ -112,6 +124,9 @@ class IsolationTests(unittest.TestCase):
         python_bin.mkdir()
         (python_bin / "python3").symlink_to(sys.executable)
         self.env["PATH"] = str(python_bin) + os.pathsep + self.env["PATH"]
+        # Direct module probes must use the same isolated homes as subprocesses.
+        self.environment = patch.dict(os.environ, self.env, clear=True)
+        self.environment.start()
 
     def tearDown(self):
         for p in self.plans:
@@ -119,6 +134,7 @@ class IsolationTests(unittest.TestCase):
                            env=self.env, capture_output=True, timeout=15)
             shutil.rmtree(Path(p).parent, ignore_errors=True)
         self.tmp.cleanup()
+        self.environment.stop()
 
     def write_connection(self):
         self.config.write_text(json.dumps(self.connection))
@@ -401,6 +417,31 @@ class IsolationTests(unittest.TestCase):
         r, log = self.consumer(shell="/bin/bash")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("agent prompt ", log)
+
+    def test_tool_call_outlives_catalog_deadline_and_preserves_next_response(self):
+        # Scale the catalog deadline ONLY in the fixture copy. A call must not
+        # inherit it; the fake takes longer, without making this test wait 10s.
+        self.helper.write_text(self.helper.read_text().replace(
+            "async def rpc(method, params=None, timeout=10):", "async def rpc(method, params=None, timeout=1):"))
+        self.connection["server"]["args"].append("--slow-tool")
+        self.write_connection()
+        result = self.prepare()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        plan = json.loads(Path(result.stdout.strip()).read_text())
+        async def exercise():
+            reader, writer = await asyncio.open_unix_connection(plan["socket"])
+            async def request(method, params=None):
+                writer.write((json.dumps({"jsonrpc":"2.0", "id":1, "method":method, "params":params or {}}) + '\n').encode())
+                await writer.drain()
+                return json.loads(await asyncio.wait_for(reader.readline(), 5))
+            try:
+                self.assertIn("result", await request("wrk/attach"))
+                self.assertIn("result", await request("tools/call", {"name":"kis_mock_place_order", "arguments":{}}))
+                self.assertIn("tools", (await request("tools/list"))["result"])
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        asyncio.run(exercise())
 
     def test_consumer_remote_ssh_and_hub_refused_without_delegation(self):
         for via in ("ssh", "hub"):

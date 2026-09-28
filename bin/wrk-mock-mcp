@@ -294,7 +294,7 @@ async def serve(plan):
     stop = asyncio.Event()
     attached = False
 
-    async def rpc(method, params=None):
+    async def rpc(method, params=None, timeout=10):
         nonlocal counter
         async with lock:
             counter += 1
@@ -302,7 +302,7 @@ async def serve(plan):
             proc.stdin.write((compact(request) + "\n").encode())
             await proc.stdin.drain()
             while True:
-                line = await asyncio.wait_for(proc.stdout.readline(), 10)
+                line = await asyncio.wait_for(proc.stdout.readline(), timeout)
                 require(line, "selected stdio server closed connection")
                 response = json.loads(line)
                 if response.get("id") == counter:
@@ -363,7 +363,10 @@ async def serve(plan):
                     elif method == "tools/call":
                         params = q.get("params", {})
                         require(params.get("name") in catalog(await list_tools(), variants), "unapproved tool/alias call")
-                        result = await rpc(method, params)
+                        # The harness owns tool-call deadlines. A catalog check
+                        # timeout must not report refusal while a call continues
+                        # upstream, allowing an ambiguous retry/late response.
+                        result = await rpc(method, params, timeout=None)
                     else:
                         raise Refused("only reviewed tools are exposed; MCP method refused")
                     response["result"] = result

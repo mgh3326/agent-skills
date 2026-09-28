@@ -11,6 +11,15 @@ from test_wrk_mock_mcp import PROFILE, load
 
 
 class GuardMutants(unittest.TestCase):
+    def test_tool_call_must_not_inherit_catalog_timeout_mutant(self):
+        rig = self.rig()
+        rig.test_tool_call_outlives_catalog_deadline_and_preserves_next_response()
+        rig = self.rig()
+        source = rig.helper.read_text().replace("result = await rpc(method, params, timeout=None)",
+                                               "result = await rpc(method, params)")
+        rig.helper.write_text(source)
+        self.red("tool-call-catalog-timeout", rig.test_tool_call_outlives_catalog_deadline_and_preserves_next_response)
+
     def rig(self):
         rig = fixtures.IsolationTests(methodName="test_supported_harnesses_exact_connection_and_single_upstream")
         rig.setUp()
