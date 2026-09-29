@@ -42,6 +42,14 @@ sha40() {
     printf '%s' "$1" | sha256sum | cut -c1-40
   fi
 }
+sha_file() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | cut -d' ' -f1
+  else
+    sha256sum "$1" | cut -d' ' -f1
+  fi
+}
+mtime_of() { python3 -c "import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)" "$1"; }
 sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'; }
 remote_home() { printf '%s/%s' "$FAKE_ROOT" "$(sanitize "$1")"; }
 
@@ -54,7 +62,7 @@ reset_env() {
 
 mk_home() { mkdir -p "$1/.local/bin" "$1/.fleet-rev"; }
 
-give_scopefuel() { # home rev|missing|norev
+give_scopefuel() { # home rev|missing|norev [dep-rev]
   local dir="$1/.local/share/uv/tools/scopefuel"
   case "$2" in
     missing) rm -f "$dir/uv-receipt.toml" ;;
@@ -63,8 +71,13 @@ give_scopefuel() { # home rev|missing|norev
       printf '[tool]\nrequirements = []\n' >"$dir/uv-receipt.toml" ;;
     *)
       mkdir -p "$dir"
-      printf '[tool]\nrequirements = [{ name = "scopefuel", git = "https://github.com/mgh3326/scopefuel?rev=%s" }]\n' \
-        "$2" >"$dir/uv-receipt.toml" ;;
+      if [[ -n "${3:-}" ]]; then
+        printf '[tool]\nrequirements = [{ name = "scopefuel", git = "https://github.com/mgh3326/scopefuel?rev=%s" }, { name = "dep", git = "https://github.com/mgh3326/scopefuel?rev=%s" }]\n' \
+          "$2" "$3" >"$dir/uv-receipt.toml"
+      else
+        printf '[tool]\nrequirements = [{ name = "scopefuel", git = "https://github.com/mgh3326/scopefuel?rev=%s" }]\n' \
+          "$2" >"$dir/uv-receipt.toml"
+      fi ;;
   esac
 }
 
@@ -193,7 +206,17 @@ rm -f "$GHDIR/scopefuel.compare"
 run_fleet --only local,a
 [[ $RC -eq 1 ]] || fail "AC2 diverged rc: want 1 got $RC :: $OUT"
 assert_cell local scopefuel "diverged"
-pass "AC2 behind (either host order) and compare-404 diverged both force rc 1"
+
+# a transient compare failure (HTTP 502) is NOT diverged: status unknown,
+# detail 'compare failed', rc 3 — only a real 404 means diverged
+set_compare scopefuel "$S_OLD" http 502
+run_fleet --only local --json
+[[ $RC -eq 3 ]] || fail "AC2 compare-502 rc: want 3 got $RC :: $OUT"
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["status"]')" == "unknown" ]] ||
+  fail "AC2 compare-502 status: $(jval '["hosts"][0]["tools"]["scopefuel"]')"
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["detail"]')" == *"compare failed"* ]] ||
+  fail "AC2 compare-502 detail: $(jval '["hosts"][0]["tools"]["scopefuel"]["detail"]')"
+pass "AC2 behind (either host order), compare-404 diverged and compare-502 unknown"
 
 # ================================================================ AC3
 # Unreachable host: all four cells unreachable, others still probed. rc 3 when
@@ -397,7 +420,19 @@ run_fleet --only local --json
   fail "AC6 non-hex status: $(jval '["hosts"][0]["tools"]["scopefuel"]')"
 [[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["detail"]')" == *"bad rev"* ]] ||
   fail "AC6 non-hex detail: $(jval '["hosts"][0]["tools"]["scopefuel"]["detail"]')"
-pass "AC6 receipt rev=/missing/no-rev -> installed/absent/unknown; bad rev rejected"
+
+# a --with dep on the same requirements line (even on the scopefuel repo at a
+# different rev) is never picked: the rev must come from scopefuel's own entry
+DEP_REV="$(sha40 dep-rev)"
+set_main scopefuel "$S_MAIN"
+give_scopefuel "$LOCAL_HOME" "$S_MAIN" "$DEP_REV"
+set_compare scopefuel "$S_MAIN" identical 0
+run_fleet --only local --json
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["installed"]')" == "$S_MAIN" ]] ||
+  fail "AC6 dep-shadow installed: $(jval '["hosts"][0]["tools"]["scopefuel"]')"
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["status"]')" == "current" ]] ||
+  fail "AC6 dep-shadow status: $(jval '["hosts"][0]["tools"]["scopefuel"]')"
+pass "AC6 receipt rev=/missing/no-rev -> installed/absent/unknown; bad rev and dep rev rejected"
 
 # ================================================================ AC7
 # hosts.toml: [hosts.a] ssh="x" (alias x), [hosts.b] (alias b), commented
@@ -439,7 +474,32 @@ run_fleet --only b
 [[ "$(ssh_aliases)" == "b" ]] || fail "AC7 only aliases: $(ssh_aliases)"
 grep -q '^local ' <<<"$OUT" && fail "AC7 --only b still probed local"
 grep -q '^b ' <<<"$OUT" || fail "AC7 --only b row missing"
-pass "AC7 hosts.toml parse + --extra/--skip/--only"
+
+# wrk spillover shapes: the FIRST ssh= in a section wins, and a [hosts.NAME]
+# header with a trailing comment is still a header
+cat >"$WRK_HOSTS_CONFIG" <<'EOF'
+[hosts.a]
+ssh = "x"
+ssh = "x2"
+[hosts.q] # desktop
+ssh = "qq"
+EOF
+full_current_home "$(remote_home qq)"
+: >"$FLEET_REV_SSH_LOG"
+run_fleet
+[[ "$(ssh_aliases | sort -u | tr '\n' ' ')" == "qq x " ]] ||
+  fail "AC7 dup-ssh/comment-header aliases: $(ssh_aliases | sort -u | tr '\n' ' ')"
+grep -q 'x2' "$FLEET_REV_SSH_LOG" && fail "AC7 last ssh= won: $(cat "$FLEET_REV_SSH_LOG")"
+grep -q '^a ' <<<"$OUT" || fail "AC7 host a row missing"
+grep -q '^q ' <<<"$OUT" || fail "AC7 trailing-comment header q is not a host"
+cat >"$WRK_HOSTS_CONFIG" <<'EOF'
+[hosts.a]
+ssh = "x"
+[hosts.b]
+#[hosts.c]
+#ssh = "c-alias"
+EOF
+pass "AC7 hosts.toml parse + --extra/--skip/--only + first-ssh/trailing-comment"
 
 # ================================================================ AC8
 # --json: exactly the contracted keys, and its rc equals the process rc.
@@ -488,8 +548,14 @@ full_current_home "$LOCAL_HOME"
 full_current_home "$(remote_home x)"
 run_fleet --only local,a
 [[ -s "$FLEET_REV_SSH_LOG" ]] || fail "AC9 ssh never called"
-bad="$(grep -vE '^-o BatchMode=yes -o ConnectTimeout=10 [^ ]+ sh -s$' "$FLEET_REV_SSH_LOG" || true)"
+bad="$(grep -vE '^-o BatchMode=yes -o ConnectTimeout=10 -- [^ ]+ sh -s$' "$FLEET_REV_SSH_LOG" || true)"
 [[ -z "$bad" ]] || fail "AC9 unsafe ssh argv: $bad"
+
+# an alias starting with '-' must not become an ssh option: -- guards it
+: >"$FLEET_REV_SSH_LOG"
+run_fleet --extra 'z=-oProxyCommand=echo' --only z || true
+[[ "$(cat "$FLEET_REV_SSH_LOG")" == '-o BatchMode=yes -o ConnectTimeout=10 -- -oProxyCommand=echo sh -s' ]] ||
+  fail "AC9 dash-alias argv: $(cat "$FLEET_REV_SSH_LOG")"
 
 python3 - "$ROOT/bin/fleet-rev" >"$TMP/probe.sh" <<'PY'
 import re, sys
@@ -505,6 +571,27 @@ bad="$(grep -inE 'token|secret|\.env|id_rsa|netrc|\.aws|password|credential' "$T
 envnames="$(grep -oE 'environ\.get\("[A-Z_]+"|environ\["[A-Z_]+"\]' "$ROOT/bin/fleet-rev" | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u | tr '\n' ' ')"
 [[ "$envnames" == "FLEET_REV_GH FLEET_REV_SSH WRK_HOSTS_CONFIG XDG_CONFIG_HOME " ]] ||
   fail "AC9 env reads: $envnames"
-pass "AC9 probe is read-only: argv safe, no writes, no secret/env reads"
+
+# B1: the probe must not write .git/index — git's opportunistic index refresh
+# is off (GIT_OPTIONAL_LOCKS=0), so a stale-stat checkout stays byte-identical
+reset_env
+S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
+PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
+AS_MAIN="$(git -C "$CANON_AS" rev-parse HEAD)"
+set_main scopefuel "$S_MAIN"; set_main agent-skills "$AS_MAIN"
+set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
+full_current_home "$(remote_home x)"
+IDX_HOME="$(remote_home x)"
+printf 'seed\n' >"$IDX_HOME/.agents/skills/tracked.txt"
+git -C "$IDX_HOME/.agents/skills" add tracked.txt
+sleep 1
+touch "$IDX_HOME/.agents/skills/tracked.txt"
+IDX="$IDX_HOME/.agents/skills/.git/index"
+IDX_BEFORE="$(sha_file "$IDX")|$(mtime_of "$IDX")"
+run_fleet --only a
+IDX_AFTER="$(sha_file "$IDX")|$(mtime_of "$IDX")"
+[[ "$IDX_BEFORE" == "$IDX_AFTER" ]] ||
+  fail "AC9 probe rewrote .git/index: $IDX_BEFORE -> $IDX_AFTER"
+pass "AC9 probe is read-only: argv safe, no writes, no secret/env reads, git index untouched"
 
 pass "all fleet-rev acceptance tests"

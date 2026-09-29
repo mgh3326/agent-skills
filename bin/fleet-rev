@@ -6,7 +6,7 @@ handoffkeep on this machine plus every active [hosts.NAME] table in
 ${WRK_HOSTS_CONFIG:-~/.config/wrk/hosts.toml} and compares each against that
 repo's main on GitHub (org mgh3326).  The script never installs, restarts or
 writes anything: remote hosts get one fixed POSIX sh probe over
-`ssh -o BatchMode=yes -o ConnectTimeout=10 ALIAS sh -s` and the probe prints
+`ssh -o BatchMode=yes -o ConnectTimeout=10 -- ALIAS sh -s` and the probe prints
 only key=value lines.
 
 exit code
@@ -41,10 +41,12 @@ EXIT_UNKNOWN = 3
 PROBE = r"""
 PATH="$HOME/.local/bin:$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export PATH
+GIT_OPTIONAL_LOCKS=0
+export GIT_OPTIONAL_LOCKS
 
 f="$HOME/.local/share/uv/tools/scopefuel/uv-receipt.toml"
 if [ -f "$f" ]; then
-  v=$(sed -n 's/.*rev=\([^" ]*\).*/\1/p' "$f" | sed -n '1p')
+  v=$(sed -n 's/.*name = "scopefuel"[^}]*scopefuel?rev=\([^" }]*\).*/\1/p' "$f" | sed -n '1p')
   if [ -n "$v" ]; then printf 'scopefuel.installed=%s\n' "$v"; else printf 'scopefuel.installed=unknown\n'; fi
 else
   printf 'scopefuel.installed=absent\n'
@@ -170,8 +172,8 @@ def parse_hosts_config(path: str) -> list[tuple[str, str]]:
     except OSError:
         return []
     for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#"):
+        line = _toml_value(raw)
+        if not line:
             continue
         header = ANY_HEADER.match(line)
         if header:
@@ -183,7 +185,9 @@ def parse_hosts_config(path: str) -> list[tuple[str, str]]:
         if current.startswith("hosts."):
             key = SSH_KEY.match(line)
             if key:
-                ssh[current[len("hosts."):]] = _toml_value(key.group(1))
+                name = current[len("hosts."):]
+                if name not in ssh:
+                    ssh[name] = _toml_value(key.group(1))
     return [(name, ssh.get(name) or name) for name in order]
 
 
@@ -239,6 +243,7 @@ def probe_host(host: Host, timeout: float) -> tuple[dict[str, str] | None, str]:
             "BatchMode=yes",
             "-o",
             "ConnectTimeout=10",
+            "--",
             host.alias,
             "sh",
             "-s",
@@ -290,6 +295,30 @@ def resolve_mains(timeout: float) -> dict[str, str | None]:
     return mains
 
 
+def gh_compare(repo: str, installed: str, timeout: float) -> tuple[str | None, str]:
+    """One gh api compare call -> (line, error). error is '404' when gh
+    reports HTTP 404 (installed sha unknown to GitHub), 'failed' for every
+    other failure (5xx, rate limit, auth, timeout, launch error)."""
+    try:
+        proc = subprocess.run(
+            [
+                gh_bin(),
+                "api",
+                "repos/%s/%s/compare/%s...main" % (ORG, repo, installed),
+                "--jq",
+                '.status + " " + (.ahead_by|tostring)',
+            ],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None, "failed"
+    if proc.returncode != 0:
+        return None, "404" if "HTTP 404" in proc.stderr else "failed"
+    return proc.stdout.strip(), ""
+
+
 def compare_to_main(
     repo: str,
     installed: str,
@@ -299,17 +328,15 @@ def compare_to_main(
     key = (repo, installed)
     if key in cache:
         return cache[key]
-    out = gh_api(
-        "repos/%s/%s/compare/%s...main" % (ORG, repo, installed),
-        '.status + " " + (.ahead_by|tostring)',
-        timeout,
-    )
-    if out is None:
+    out, err = gh_compare(repo, installed, timeout)
+    if err == "404":
         result: tuple[str, int | None, str] = (
             "diverged",
             None,
             "installed not found on GitHub",
         )
+    elif err:
+        result = ("unknown", None, "compare failed")
     else:
         parts = out.split()
         status = parts[0] if parts else ""

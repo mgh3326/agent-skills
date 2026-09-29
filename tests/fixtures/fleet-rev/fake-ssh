@@ -15,6 +15,7 @@ printf '%s\n' "$*" >>"${FLEET_REV_SSH_LOG:-/dev/null}"
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -o) shift 2 ;;
+    --) shift ;;
     *) break ;;
   esac
 done

@@ -4,7 +4,9 @@
 #
 #   <repo>.main      one line: the sha `commits/main` should return
 #   <repo>.compare   lines: "<installed> <status> <ahead_by>"; '*' matches any
-#                    installed sha; no match -> 'gh: Not Found (HTTP 404)' rc1
+#                    installed sha; a "<installed> http <code>" line fails with
+#                    'gh: HTTP <code>' rc1; no match -> 'gh: Not Found
+#                    (HTTP 404)' rc1
 #
 #   FLEET_REV_GH_LOG         append one argv line per call (default /dev/null)
 set -euo pipefail
@@ -32,6 +34,10 @@ case "$endpoint" in
       while read -r b s n _; do
         [[ -z "${b:-}" || "$b" == \#* ]] && continue
         if [[ "$b" == "$base" || "$b" == "*" ]]; then
+          if [[ "$s" == "http" ]]; then
+            echo "gh: HTTP ${n:-500}" >&2
+            exit 1
+          fi
           printf '%s %s\n' "$s" "${n:-0}"
           exit 0
         fi
