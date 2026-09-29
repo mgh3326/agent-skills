@@ -54,6 +54,12 @@ PROMPT="$TMP/prompt.md"
 printf '%s\n' 'fixture prompt' >"$PROMPT"
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
+# #951: MODEL is parameterizable; a claude-kind MODEL would seed folder trust
+# into ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json — fixture HOME keeps the
+# operator's real config untouched either way.
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+unset CLAUDE_CONFIG_DIR
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 

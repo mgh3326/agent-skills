@@ -89,6 +89,13 @@ printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 # exercising the installation-transition path; the arbiter section below opts in.
 export ARBITER_BIN="$TMP/absent-arbiter"
 export XDG_DATA_HOME="$TMP/xdg"
+# #951: claude-kind spawns seed folder trust into ${CLAUDE_CONFIG_DIR:-$HOME}/
+# .claude.json — the operator's real config must never be touched by a fixture
+# spawn, so suite HOME is a fixture and ambient CLAUDE_CONFIG_DIR is unset (it
+# would relocate the store; the dedicated #951 cases set it explicitly).
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+unset CLAUDE_CONFIG_DIR
 # #912: devin-kind spawns register the spawn cwd in devin's trusted-workspaces
 # store ($XDG_DATA_HOME/devin/cli/trusted_workspaces.json) before any pane
 # exists, and refuse closed when the store is missing or corrupt. Seed the
@@ -291,6 +298,52 @@ open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new))
 PY
   chmod +x "$TMP/mut-wrk-$1"
   grep -qF "$3" "$TMP/mut-wrk-$1" || fail "devin trust mutant $1 did not apply"
+}
+
+# -- #951 claude folder-trust helpers ----------------------------------------
+# wrk records projects[<resolved cwd>].hasTrustDialogAccepted = true in
+# ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json for PROFILE_KIND=claude before any
+# pane exists — fail-open, atomic, other keys and projects preserved. Every
+# case uses a fixture HOME under $TMP; the real user config is never touched.
+# claude_spawn_at mirrors devin_spawn_at but parametrizes HOME (and unsets
+# CLAUDE_CONFIG_DIR so the default path is exercised); MODEL defaults to
+# sonnet so non-claude kinds can be driven through the same helper.
+claude_spawn_at() {
+  local home="$1" ccwd="$2" label="$3" task="$4" model="${5:-sonnet}"
+  case "$home" in
+    "$TMP"/*) ;;
+    *) fail "claude_spawn_at requires a fixture HOME under TMP: $home" ;;
+  esac
+  shift 4
+  if (($#)); then shift; fi  # drop the optional MODEL; rest are extra wrk args
+  env -u CLAUDE_CONFIG_DIR HOME="$home" HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
+    WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$TMP/herdr-$label.log" WRK_FIXTURE_MARKER="" \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel-$label.log" \
+    WRK_REFRESH_LOG="$TMP/refresh-$label.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh-$label.pids" WRK_REFRESH_TIMEOUT_S=5 \
+    WRK_TEST_TRUST_DELAY_S="${WRK_TEST_TRUST_DELAY_S:-}" \
+    WRK_TEST_TRUST_LOCK_TIMEOUT_S="${WRK_TEST_TRUST_LOCK_TIMEOUT_S:-}" \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ccwd" -m "$model" -p "$PROMPT" \
+    -w w -l "$label" --t T1 --task "$task" "$@"
+}
+
+claude_trust_entry() {  # STORE_PATH ABS_CWD — prints the projects entry (JSON), "absent" if none
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1], encoding="utf-8"))
+except (OSError, ValueError):
+    print("absent")
+    raise SystemExit(0)
+entry = data.get("projects", {}).get(sys.argv[2])
+print("absent" if entry is None else json.dumps(entry, sort_keys=True, separators=(",", ":")))
+PY
+}
+
+claude_trust_mutant() {  # NAME OLD NEW — same generic source replace as devin_trust_mutant
+  devin_trust_mutant "$@"
 }
 
 hub_quota_run_case() {
@@ -1600,9 +1653,15 @@ echo "PASS 912-devin-trust mutant: missing store created goes RED"
 # entry — the concurrency assertions above must fail against this mutant.
 devin_trust_seed_store "$TMP/t912-xdg-m7" "$TMP/t912-m7-origin"
 mkdir -p "$TMP/t912-m7-a" "$TMP/t912-m7-b" "$TMP/t912-m7-origin"
+# The flock line also exists verbatim in #951's claude block — anchor on the
+# devin-only `try:\n        try:` that follows it.
 devin_trust_mutant nolock \
-  '    fcntl.flock(lock_fd, fcntl.LOCK_EX)' \
-  '    pass  # mutant: no flock'
+  '    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    try:
+        try:' \
+  '    pass  # mutant: no flock
+    try:
+        try:'
 t912_ma="$(mint_task)" t912_mb="$(mint_task)"
 WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
   devin_spawn_at "$TMP/t912-xdg-m7" "$TMP/t912-m7-a" devin912ma "$t912_ma" \
@@ -1617,6 +1676,324 @@ t912_m7_count="$(devin_trust_paths "$TMP/t912-xdg-m7" | wc -l | tr -d ' ')"
 [[ "$t912_m7_count" -lt 3 ]] ||
   fail "lockless mutant survived: both concurrent entries landed anyway"
 echo "PASS 912-devin-trust mutant: dropped lock goes RED"
+
+# -- #951: claude folder-trust seeding ---------------------------------------
+# Helpers (claude_spawn_at / claude_trust_entry / claude_trust_mutant) live
+# with spawn_base above. Every case runs on a fixture HOME under $TMP.
+
+# AC1: fresh HOME — no .claude.json — gets exactly one projects entry keyed by
+# the resolved spawn cwd, file mode 0600, and the spawn proceeds.
+t951_home="$TMP/t951-home-fresh"; mkdir -p "$t951_home" "$TMP/t951-cwd-fresh"
+t951_out="$(claude_spawn_at "$t951_home" "$TMP/t951-cwd-fresh" t951a "$(mint_task)" 2>&1)" ||
+  fail "claude spawn over a fresh HOME failed: $t951_out"
+grep -q '^OK ' <<<"$t951_out" || fail "claude trust-seed spawn lost its OK line: $t951_out"
+t951_resolved="$(cd "$TMP/t951-cwd-fresh" && pwd -P)"
+[[ "$(claude_trust_entry "$t951_home/.claude.json" "$t951_resolved")" == '{"hasTrustDialogAccepted":true}' ]] ||
+  fail "fresh .claude.json lacks the trust entry: $(claude_trust_entry "$t951_home/.claude.json" "$t951_resolved")"
+[[ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$t951_home/.claude.json")" == 0o600 ]] ||
+  fail "fresh .claude.json mode is not 0600"
+[[ "$(python3 -c 'import json,sys; print(len(json.load(open(sys.argv[1]))["projects"]))' "$t951_home/.claude.json")" == 1 ]] ||
+  fail "fresh .claude.json gained extra project entries"
+echo "PASS 951-claude-trust fresh HOME seeds only the resolved cwd"
+
+# AC1/AC2: an existing store keeps every other key and every other project
+# entry; only hasTrustDialogAccepted is set on the spawn cwd's own entry —
+# entry keys it already had survive, file mode preserved.
+t951_home="$TMP/t951-home-keep"; mkdir -p "$t951_home" "$TMP/t951-cwd-keep"
+t951_resolved="$(cd "$TMP/t951-cwd-keep" && pwd -P)"
+python3 - "$t951_home/.claude.json" "$t951_resolved" <<'PY'
+import json, sys
+doc = {"userID": "fixture-user", "numStartups": 7, "greeting": "한글 claude",
+       "projects": {"/other/trusted": {"hasTrustDialogAccepted": True, "allowedTools": ["Bash(ls)"]},
+                    "/other/untrusted": {"hasTrustDialogAccepted": False, "note": "keep"},
+                    sys.argv[2]: {"note": "pre-existing"}}}
+with open(sys.argv[1], "w", encoding="utf-8") as h:
+    json.dump(doc, h, indent=2, ensure_ascii=False)
+PY
+chmod 640 "$t951_home/.claude.json"
+claude_spawn_at "$t951_home" "$TMP/t951-cwd-keep" t951b "$(mint_task)" >/dev/null ||
+  fail "claude spawn over an existing store failed"
+python3 - "$t951_home/.claude.json" "$t951_resolved" <<'PY' || fail "seeded store lost keys, projects, or entry keys"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert data["userID"] == "fixture-user" and data["numStartups"] == 7
+projs = data["projects"]
+assert len(projs) == 3
+assert projs["/other/trusted"] == {"hasTrustDialogAccepted": True, "allowedTools": ["Bash(ls)"]}
+assert projs["/other/untrusted"] == {"hasTrustDialogAccepted": False, "note": "keep"}
+assert projs[sys.argv[2]] == {"hasTrustDialogAccepted": True, "note": "pre-existing"}
+PY
+# r2 nit N1: non-ASCII content must survive as raw UTF-8, not XXXX escapes.
+grep -q '한글' "$t951_home/.claude.json" ||
+  fail "non-ASCII value was escaped to \\uXXXX escapes"
+[[ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$t951_home/.claude.json")" == 0o640 ]] ||
+  fail "existing store mode changed"
+echo "PASS 951-claude-trust preserves other keys, projects, entry keys, mode"
+
+# AC1: a projects entry that says hasTrustDialogAccepted=false is flipped to
+# true; an already-true entry is a pure no-op — bytes unchanged.
+t951_home="$TMP/t951-home-flip"; mkdir -p "$t951_home" "$TMP/t951-cwd-flip"
+t951_resolved="$(cd "$TMP/t951-cwd-flip" && pwd -P)"
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":false,"keep":"x"}}}\n' "$t951_resolved" >"$t951_home/.claude.json"
+claude_spawn_at "$t951_home" "$TMP/t951-cwd-flip" t951c "$(mint_task)" >/dev/null ||
+  fail "claude spawn over a false-flag entry failed"
+[[ "$(claude_trust_entry "$t951_home/.claude.json" "$t951_resolved")" == '{"hasTrustDialogAccepted":true,"keep":"x"}' ]] ||
+  fail "false flag was not flipped or entry keys were lost: $(claude_trust_entry "$t951_home/.claude.json" "$t951_resolved")"
+t951_home="$TMP/t951-home-same"; mkdir -p "$t951_home" "$TMP/t951-cwd-same"
+t951_resolved="$(cd "$TMP/t951-cwd-same" && pwd -P)"
+printf '{"projects":{"%s":{"hasTrustDialogAccepted":true}}}\n' "$t951_resolved" >"$t951_home/.claude.json"
+cp "$t951_home/.claude.json" "$TMP/t951-same.before"
+claude_spawn_at "$t951_home" "$TMP/t951-cwd-same" t951d "$(mint_task)" >/dev/null ||
+  fail "claude spawn over an already-trusted cwd failed"
+cmp -s "$t951_home/.claude.json" "$TMP/t951-same.before" ||
+  fail "already-trusted cwd rewrote the store"
+echo "PASS 951-claude-trust false-flag flips, already-trusted is a pure no-op"
+
+# AC1: the projects key is the physical path — a -c through a symlink records
+# the resolved directory, never the link spelling.
+mkdir -p "$TMP/t951-real/deep" "$TMP/t951-home-link"
+ln -s "$TMP/t951-real/deep" "$TMP/t951-link"
+claude_spawn_at "$TMP/t951-home-link" "$TMP/t951-link" t951e "$(mint_task)" >/dev/null ||
+  fail "claude spawn over a symlinked cwd failed"
+t951_resolved="$(cd "$TMP/t951-link" && pwd -P)"
+[[ "$t951_resolved" != "$TMP/t951-link" ]] || fail "fixture flaw: symlink resolved to itself"
+[[ "$(claude_trust_entry "$TMP/t951-home-link/.claude.json" "$t951_resolved")" == '{"hasTrustDialogAccepted":true}' ]] ||
+  fail "resolved path was not keyed: $(claude_trust_entry "$TMP/t951-home-link/.claude.json" "$t951_resolved")"
+[[ "$(claude_trust_entry "$TMP/t951-home-link/.claude.json" "$TMP/t951-link")" == absent ]] ||
+  fail "symlink spelling was recorded as a projects key"
+echo "PASS 951-claude-trust keys the resolved physical path"
+
+# AC1: CLAUDE_CONFIG_DIR relocates the store — the flag lands under the config
+# dir and the HOME-level file is never created.
+t951_home="$TMP/t951-home-cfg"; t951_cfg="$TMP/t951-cfgdir"
+mkdir -p "$t951_home" "$t951_cfg" "$TMP/t951-cwd-cfg"
+env HOME="$t951_home" CLAUDE_CONFIG_DIR="$t951_cfg" \
+  HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr-t951cfg.log" \
+  WRK_SCOPEFUEL_LOG="$TMP/scopefuel-t951cfg.log" WRK_REFRESH_LOG="$TMP/refresh-t951cfg.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh-t951cfg.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$TMP/t951-cwd-cfg" -m sonnet -p "$PROMPT" -w w -l t951cfg \
+  --t T1 --task "$(mint_task)" >/dev/null ||
+  fail "CLAUDE_CONFIG_DIR claude spawn failed"
+t951_resolved="$(cd "$TMP/t951-cwd-cfg" && pwd -P)"
+[[ "$(claude_trust_entry "$t951_cfg/.claude.json" "$t951_resolved")" == '{"hasTrustDialogAccepted":true}' ]] ||
+  fail "CLAUDE_CONFIG_DIR store lacks the trust entry"
+[[ ! -e "$t951_home/.claude.json" ]] ||
+  fail "HOME-level .claude.json was written despite CLAUDE_CONFIG_DIR"
+echo "PASS 951-claude-trust honors CLAUDE_CONFIG_DIR"
+
+# AC2: an unwritable store warns and the spawn continues — fail-open, never a
+# denial. The lock file pre-exists so the refusal lands on the atomic write.
+t951_home="$TMP/t951-home-ro"; mkdir -p "$t951_home" "$TMP/t951-cwd-ro"
+printf '{"projects":{}}\n' >"$t951_home/.claude.json"
+: >"$t951_home/.claude.json.wrk.lock"
+chmod 555 "$t951_home"
+set +e
+t951_out="$(claude_spawn_at "$t951_home" "$TMP/t951-cwd-ro" t951f "$(mint_task)" 2>&1)"
+t951_rc=$?
+set -e
+chmod 755 "$t951_home"
+[[ "$t951_rc" -eq 0 ]] || fail "unwritable store denied the spawn rc=$t951_rc: $t951_out"
+grep -q 'Claude folder trust' <<<"$t951_out" ||
+  fail "unwritable store lost its warning: $t951_out"
+grep -q '^OK ' <<<"$t951_out" || fail "unwritable-store spawn lost its OK line: $t951_out"
+[[ "$(cat "$t951_home/.claude.json")" == '{"projects":{}}' ]] ||
+  fail "unwritable store was modified"
+echo "PASS 951-claude-trust unwritable store warns and continues"
+
+# AC2: a corrupt store warns, is not overwritten, and the spawn continues.
+t951_home="$TMP/t951-home-corrupt"; mkdir -p "$t951_home" "$TMP/t951-cwd-corrupt"
+printf '{ not json\n' >"$t951_home/.claude.json"
+cp "$t951_home/.claude.json" "$TMP/t951-corrupt.before"
+set +e
+t951_out="$(claude_spawn_at "$t951_home" "$TMP/t951-cwd-corrupt" t951g "$(mint_task)" 2>&1)"
+t951_rc=$?
+set -e
+[[ "$t951_rc" -eq 0 ]] || fail "corrupt store denied the spawn rc=$t951_rc: $t951_out"
+grep -q 'not valid JSON' <<<"$t951_out" ||
+  fail "corrupt-store warning lost its diagnostic: $t951_out"
+grep -q '^OK ' <<<"$t951_out" || fail "corrupt-store spawn lost its OK line: $t951_out"
+cmp -s "$t951_home/.claude.json" "$TMP/t951-corrupt.before" ||
+  fail "corrupt store was overwritten"
+echo "PASS 951-claude-trust corrupt store warns, untouched, spawn continues"
+
+# AC3: a non-claude-kind spawn never touches .claude.json.
+t951_home="$TMP/t951-home-codex"; mkdir -p "$t951_home"
+claude_spawn_at "$t951_home" "$ROOT" t951h "$(mint_task)" codex-terra >/dev/null ||
+  fail "codex-kind spawn failed"
+[[ ! -e "$t951_home/.claude.json" ]] ||
+  fail "non-claude spawn wrote .claude.json"
+[[ ! -e "$t951_home/.claude.json.wrk.lock" ]] ||
+  fail "non-claude spawn left a lock file"
+echo "PASS 951-claude-trust non-claude kinds never touch the store"
+
+# AC1/AC2: two concurrent spawns into the same store — both entries must land.
+# The test delay holds each writer's read->write gap open so a lost update
+# would be deterministic, not luck.
+t951_home="$TMP/t951-home-race"; mkdir -p "$t951_home" "$TMP/t951-race-a" "$TMP/t951-race-b"
+t951_ta="$(mint_task)" t951_tb="$(mint_task)"
+WRK_TEST_TRUST_DELAY_S=0.5 \
+  claude_spawn_at "$t951_home" "$TMP/t951-race-a" t951ra "$t951_ta" \
+  >"$TMP/t951-race-a.out" 2>&1 &
+t951_pa=$!
+WRK_TEST_TRUST_DELAY_S=0.5 \
+  claude_spawn_at "$t951_home" "$TMP/t951-race-b" t951rb "$t951_tb" \
+  >"$TMP/t951-race-b.out" 2>&1 &
+t951_pb=$!
+set +e
+wait "$t951_pa"; t951_ra=$?
+wait "$t951_pb"; t951_rb=$?
+set -e
+[[ "$t951_ra" -eq 0 && "$t951_rb" -eq 0 ]] ||
+  fail "concurrent claude spawns failed rc=$t951_ra/$t951_rb: $(cat "$TMP/t951-race-a.out" "$TMP/t951-race-b.out")"
+t951_ra_path="$(cd "$TMP/t951-race-a" && pwd -P)"
+t951_rb_path="$(cd "$TMP/t951-race-b" && pwd -P)"
+[[ "$(claude_trust_entry "$t951_home/.claude.json" "$t951_ra_path")" == '{"hasTrustDialogAccepted":true}' ]] ||
+  fail "concurrent spawn lost entry A"
+[[ "$(claude_trust_entry "$t951_home/.claude.json" "$t951_rb_path")" == '{"hasTrustDialogAccepted":true}' ]] ||
+  fail "concurrent spawn lost entry B"
+echo "PASS 951-claude-trust concurrent spawns keep both entries"
+
+# AC2 (r2 blocker B1): HOME unset entirely must warn and continue — under
+# set -u an unguarded $HOME expansion aborts before the fail-open guard.
+mkdir -p "$TMP/t951-cwd-nohome" "$TMP/t951-xdg-nohome"
+set +e
+t951_out="$(env -u HOME -u CLAUDE_CONFIG_DIR \
+  HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
+  XDG_DATA_HOME="$TMP/t951-xdg-nohome" \
+  ARBITER_INBOX_ROOT="$TMP/t951-inbox-noh" \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr-t951noh.log" \
+  WRK_FIXTURE_MARKER="" WRK_SCOPEFUEL_LOG="$TMP/scopefuel-t951noh.log" \
+  WRK_REFRESH_LOG="$TMP/refresh-t951noh.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh-t951noh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$TMP/t951-cwd-nohome" -m sonnet -p "$PROMPT" -w w \
+  -l t951noh --t T1 --task "$(mint_task)" 2>&1)"
+t951_rc=$?
+set -e
+[[ "$t951_rc" -eq 0 ]] || fail "unset HOME denied the spawn rc=$t951_rc: $t951_out"
+grep -q 'Claude folder trust' <<<"$t951_out" ||
+  fail "unset-HOME spawn lost its warning: $t951_out"
+grep -q '^OK ' <<<"$t951_out" || fail "unset-HOME spawn lost its OK line: $t951_out"
+# HOME unset + CLAUDE_CONFIG_DIR set still seeds — the cfg dir does not need HOME.
+t951_cfg="$TMP/t951-cfg-nohome"; mkdir -p "$t951_cfg" "$TMP/t951-cwd-nohome2"
+env -u HOME CLAUDE_CONFIG_DIR="$t951_cfg" \
+  HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
+  XDG_DATA_HOME="$TMP/t951-xdg-nohome" \
+  ARBITER_INBOX_ROOT="$TMP/t951-inbox-noh" \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr-t951noh2.log" \
+  WRK_FIXTURE_MARKER="" WRK_SCOPEFUEL_LOG="$TMP/scopefuel-t951noh2.log" \
+  WRK_REFRESH_LOG="$TMP/refresh-t951noh2.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh-t951noh2.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$TMP/t951-cwd-nohome2" -m sonnet -p "$PROMPT" -w w \
+  -l t951noh2 --t T1 --task "$(mint_task)" >/dev/null ||
+  fail "HOME-unset + CLAUDE_CONFIG_DIR spawn failed"
+t951_resolved="$(cd "$TMP/t951-cwd-nohome2" && pwd -P)"
+[[ "$(claude_trust_entry "$t951_cfg/.claude.json" "$t951_resolved")" == '{"hasTrustDialogAccepted":true}' ]] ||
+  fail "HOME-unset + CLAUDE_CONFIG_DIR store lacks the trust entry"
+echo "PASS 951-claude-trust unset HOME warns and continues"
+
+# AC2 (r2 blocker B2): a lock held by a wedged process must time out and
+# continue, not block the spawn forever. The holder keeps LOCK_EX for 15s —
+# well past the seeder's 2s test deadline — and is killed once asserted.
+t951_home="$TMP/t951-home-held"; mkdir -p "$t951_home" "$TMP/t951-cwd-held"
+python3 - "$t951_home/.claude.json.wrk.lock" "$TMP/t951-held.ready" <<'PY' &
+import fcntl, sys, time
+fd = open(sys.argv[1], "w")
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(15)
+PY
+t951_holder=$!
+for _ in $(seq 100); do [[ -e "$TMP/t951-held.ready" ]] && break; sleep 0.05; done
+[[ -e "$TMP/t951-held.ready" ]] || fail "lock holder never acquired"
+set +e
+t951_out="$(WRK_TEST_TRUST_LOCK_TIMEOUT_S=2 \
+  claude_spawn_at "$t951_home" "$TMP/t951-cwd-held" t951held "$(mint_task)" 2>&1)"
+t951_rc=$?
+set -e
+kill "$t951_holder" 2>/dev/null || true
+wait "$t951_holder" 2>/dev/null || true
+[[ "$t951_rc" -eq 0 ]] || fail "held lock denied the spawn rc=$t951_rc: $t951_out"
+grep -q 'timed out waiting for lock' <<<"$t951_out" ||
+  fail "held lock lost its timeout warning: $t951_out"
+grep -q '^OK ' <<<"$t951_out" || fail "held-lock spawn lost its OK line: $t951_out"
+echo "PASS 951-claude-trust held lock times out, spawn continues"
+
+# -- assertion-RED mutants ---------------------------------------------------
+# 1) other keys dropped: the write must carry the whole document, not just our
+#    entry — a mutant that rewrites only the projects subtree loses data.
+t951_home="$TMP/t951-home-m1"; mkdir -p "$t951_home" "$TMP/t951-m1-cwd"
+python3 - "$t951_home/.claude.json" <<'PY'
+import json, sys
+json.dump({"keep": 1, "projects": {"/other": {"hasTrustDialogAccepted": True}}},
+          open(sys.argv[1], "w", encoding="utf-8"))
+PY
+# ensure_ascii=False keeps this anchor unique — devin's blob line lacks it.
+claude_trust_mutant drop-keys \
+  '        blob = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+' \
+  '        blob = json.dumps({"projects": {target: entry}}, indent=2, ensure_ascii=False).encode("utf-8")
+'
+WRK_UNDER_TEST="$TMP/mut-wrk-drop-keys" \
+  claude_spawn_at "$t951_home" "$TMP/t951-m1-cwd" t951m1 "$(mint_task)" \
+  >/dev/null 2>&1 || true
+python3 - "$t951_home/.claude.json" <<'PY' || fail "key-dropping mutant survived: all keys were preserved anyway"
+import json, sys
+data = json.load(open(sys.argv[1], encoding="utf-8"))
+assert "keep" not in data and len(data["projects"]) == 1, \
+    "mutant did not take effect: %r" % data
+PY
+echo "PASS 951-claude-trust mutant: dropped keys go RED"
+
+# 2) fail-open stripped: without the || warn guard the helper's refusal
+#    propagates under set -e and the corrupt-store spawn dies — the exact
+#    denial the AC forbids.
+t951_home="$TMP/t951-home-m2"; mkdir -p "$t951_home" "$TMP/t951-m2-cwd"
+printf '{ not json\n' >"$t951_home/.claude.json"
+claude_trust_mutant no-failopen \
+  "<<'PY' || warn \"Claude folder trust seed failed; spawn continues\"" \
+  "<<'PY'"
+set +e
+WRK_UNDER_TEST="$TMP/mut-wrk-no-failopen" \
+  claude_spawn_at "$t951_home" "$TMP/t951-m2-cwd" t951m2 "$(mint_task)" \
+  >/dev/null 2>&1
+t951_rc=$?
+set -e
+[[ "$t951_rc" -ne 0 ]] ||
+  fail "fail-open-stripping mutant survived: corrupt store still spawned"
+echo "PASS 951-claude-trust mutant: stripped fail-open guard goes RED"
+
+# 3) lock dropped: with the read->write gap held open, two writers lose one
+#    entry — the concurrency assertions above must fail against this mutant.
+#    The LOCK_NB spelling keeps this anchor unique to claude's poll loop
+#    (devin's flock is a bare LOCK_EX before 'try:try').
+t951_home="$TMP/t951-home-m7"; mkdir -p "$t951_home" "$TMP/t951-m7-a" "$TMP/t951-m7-b"
+claude_trust_mutant nolock \
+  '            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break' \
+  '            pass  # mutant: no flock
+            break'
+t951_ma="$(mint_task)" t951_mb="$(mint_task)"
+WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
+  claude_spawn_at "$t951_home" "$TMP/t951-m7-a" t951ma "$t951_ma" \
+  >/dev/null 2>&1 &
+t951_pa=$!
+WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
+  claude_spawn_at "$t951_home" "$TMP/t951-m7-b" t951mb "$t951_mb" \
+  >/dev/null 2>&1 &
+t951_pb=$!
+wait "$t951_pa" "$t951_pb" || true
+t951_m7_entries="$(python3 - "$t951_home/.claude.json" <<'PY'
+import json, sys
+print(len(json.load(open(sys.argv[1], encoding="utf-8"))["projects"]))
+PY
+)"
+[[ "$t951_m7_entries" -lt 2 ]] ||
+  fail "lockless mutant survived: both concurrent entries landed anyway"
+echo "PASS 951-claude-trust mutant: dropped lock goes RED"
 
 # ROB-1252: cc-qwen38/cc-glm must refuse to spawn when the clinepass gate key
 # file is missing, rather than silently spawning without ANTHROPIC_AUTH_TOKEN.
@@ -1822,6 +2199,11 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
 if [[ -n "$SETTINGS_SHA_BEFORE" ]]; then
   SETTINGS_SHA_AFTER="$(shasum -a 256 "$SETTINGS_PATH" | awk '{print $1}')"
   [[ "$SETTINGS_SHA_BEFORE" == "$SETTINGS_SHA_AFTER" ]]
+else
+  # Suite HOME is a fixture that starts without the file — a settings write
+  # under it is exactly the regression this check exists to catch.
+  [[ ! -f "$SETTINGS_PATH" ]] ||
+    fail "claude spawns created ~/.claude/settings.json"
 fi
 
 : >"$TMP/herdr.log"

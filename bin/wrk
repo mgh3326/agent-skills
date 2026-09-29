@@ -1287,6 +1287,160 @@ sys.stderr.write("wrk: Devin workspace trust seeded %s in %s (backup %s)\n" % (c
 PY
 }
 
+# #951: an unattended claude-kind spawn (opus/sonnet/haiku/fable/builder-*/cc-*)
+# blocks on Claude Code's folder-trust dialog when the spawn cwd has no
+# accepted-trust record — --dangerously-skip-permissions does not bypass it
+# (m1b spawn blockers, agent_not_ready "blocked during startup"). Claude Code
+# records an accepted dialog as projects[<absolute cwd>].hasTrustDialogAccepted
+# = true in the config file at ${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json
+# (verified live on claude 2.1.284: CLAUDE_CONFIG_DIR relocates .claude.json;
+# file mode 0600, json.dumps indent=2). wrk writes exactly that entry — and
+# only that entry — before the pane exists.
+#
+# Deliberately fail OPEN like the kimi seed (unlike the devin one): seeding is
+# a convenience and must never deny a spawn — every refusal path warns and the
+# spawn continues to whatever the dialog would have done. Writers serialize on
+# a persistent flock, re-read under it, and replace the file atomically (temp
+# + rename, mode preserved), so concurrent spawns cannot lose each other's
+# projects and a corrupt store is never overwritten.
+claude_seed_folder_trust() {
+  local cwd="$1" abs_cwd cfg_home trust_file
+  if ! abs_cwd="$(cd -- "$cwd" 2>/dev/null && pwd -P)"; then
+    warn "Claude folder trust seed skipped: cannot resolve absolute CWD: $cwd"
+    return 0
+  fi
+  cfg_home="${CLAUDE_CONFIG_DIR:-${HOME:-}}"
+  case "$cfg_home" in
+    /*) ;;
+    *) warn "Claude folder trust seed skipped: config home is not absolute: $cfg_home"; return 0 ;;
+  esac
+  trust_file="$cfg_home/.claude.json"
+  # The helper exits nonzero on every refusal; the || warn is what makes the
+  # seed fail-open — it must never take the spawn down with it.
+  python3 - "$abs_cwd" "$trust_file" <<'PY' || warn "Claude folder trust seed failed; spawn continues"
+import fcntl
+import json
+import os
+import sys
+import tempfile
+import time
+
+cwd = sys.argv[1]
+path = os.path.realpath(sys.argv[2])
+
+
+def skip(reason):
+    sys.stderr.write("wrk: Claude folder trust seed skipped: %s\n" % reason)
+    sys.exit(1)
+
+
+if not os.path.isdir(cwd):
+    skip("spawn cwd does not resolve to a directory: %s" % cwd)
+# The projects key is the physical path — the spawned process's getcwd() and
+# Claude Code's own records resolve symlinks the same way.
+target = os.path.realpath(cwd)
+parent = os.path.dirname(path)
+try:
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+except OSError as exc:
+    skip("cannot create config dir %s: %s" % (parent, exc))
+
+# The lock file is created once and never replaced, so flock always serializes
+# on one inode. The data file itself is atomically replaced below, so it must
+# be read fresh under the lock — a second spawn then sees the first spawn's
+# committed entry and keeps it.
+lock_path = path + ".wrk.lock"
+try:
+    lock_fd = os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "a+b")
+except OSError as exc:
+    skip("cannot open lock %s: %s" % (lock_path, exc))
+
+with lock_fd:
+    # Poll LOCK_EX|LOCK_NB with a deadline: a wedged holder (or a hung fs)
+    # must warn and continue the spawn, not block it forever. The env knob is
+    # test-only — production takes the 10s default.
+    deadline = time.monotonic() + float(os.environ.get("WRK_TEST_TRUST_LOCK_TIMEOUT_S") or 10.0)
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                skip("timed out waiting for lock %s" % lock_path)
+            time.sleep(0.05)
+    try:
+        raw = None
+        if os.path.exists(path):
+            try:
+                with open(path, "rb") as handle:
+                    raw = handle.read()
+            except OSError as exc:
+                skip("cannot read %s: %s" % (path, exc))
+        if raw is None:
+            data = {}
+            mode = 0o600
+        else:
+            try:
+                data = json.loads(raw)
+            except ValueError as exc:
+                skip("store is not valid JSON: %s (%s) — refusing to overwrite a corrupt file" % (path, exc))
+            if not isinstance(data, dict):
+                skip("store top level is not an object: %s — refusing to overwrite" % path)
+            mode = os.stat(path).st_mode & 0o777
+
+        projects = data.get("projects")
+        if projects is None:
+            projects = {}
+            data["projects"] = projects
+        elif not isinstance(projects, dict):
+            skip("store projects entry is not an object: %s — refusing to overwrite" % path)
+
+        entry = projects.get(target)
+        if isinstance(entry, dict) and entry.get("hasTrustDialogAccepted") is True:
+            sys.stderr.write("wrk: Claude folder trust already recorded for %s in %s\n" % (target, path))
+            sys.exit(0)
+        if entry is None:
+            entry = {}
+            projects[target] = entry
+        elif not isinstance(entry, dict):
+            skip("project entry for %s is not an object: %s — refusing to overwrite" % (target, path))
+        entry["hasTrustDialogAccepted"] = True
+
+        # WRK_TEST_TRUST_DELAY_S (tests only) holds the read->write gap open so
+        # a lockless or stale-read mutant reliably loses one concurrent entry.
+        delay = float(os.environ.get("WRK_TEST_TRUST_DELAY_S") or 0)
+        if delay > 0:
+            time.sleep(delay)
+
+        # Atomic replace: temp in the same dir, fsync, rename, dir fsync —
+        # mode preserved exactly, every other key (and project) untouched.
+        blob = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
+        tmp_fd, tmp = tempfile.mkstemp(dir=parent, prefix=".claude.json.", suffix=".tmp")
+        try:
+            with os.fdopen(tmp_fd, "wb") as handle:
+                handle.write(blob)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.chmod(tmp, mode)
+            os.replace(tmp, path)
+            dir_fd = os.open(parent, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
+        except OSError as exc:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            skip("atomic write failed for %s: %s" % (path, exc))
+    finally:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+
+sys.stderr.write("wrk: Claude folder trust recorded for %s in %s\n" % (target, path))
+PY
+}
+
 # Pre-spawn advisory: if -c points at a *canonical* checkout (not a linked worktree)
 # that is off its remote default branch, warn. Does not fail the spawn — operators
 # sometimes work on canonical on purpose. Worktrees and non-git paths stay silent.
@@ -6383,6 +6537,16 @@ spawn_cmd() {
   # store seeded is always the host devin actually runs on.
   if [[ "$PROFILE_KIND" == devin ]]; then
     devin_seed_workspace_trust "$CWD"
+  fi
+
+  # #951: unattended claude-kind spawns block on Claude Code's folder-trust
+  # dialog for an unrecorded cwd — --dangerously-skip-permissions does not
+  # bypass it. Record the accepted-trust flag in claude's own config ahead of
+  # the pane; fail-open like the kimi seed. Remote spawns re-enter this same
+  # function on the execution host, so the seeded config is the host claude
+  # actually runs on.
+  if [[ "$PROFILE_KIND" == claude ]]; then
+    claude_seed_folder_trust "$CWD"
   fi
 
   # #637: persist what the pane would otherwise lose on a herdr reboot restore
