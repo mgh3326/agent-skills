@@ -19,12 +19,70 @@ fixture_foreground() { cat "$fixture_foreground_file" 2>/dev/null || true; }
 # #979: the pane screen is modelled per spawn so `pane read` can answer the
 # readiness probe truthfully. `pane run` always echoes the typed line onto the
 # screen; whether it then runs depends on the pending-read scenarios below.
-# devin-read-eats-line consumes the first typed line of the spawn (the omz
-# `read -k 1` update prompt that ate `d` from `devin` on the Pi); a consumed
-# line echoes but produces no output. devin-read-never-ends consumes every
-# line — the probe never prints and the agent command is never executed.
+# devin-read-eats-line consumes the first typed line whole (a full-line
+# `read`); devin-read-eats-key consumes only its first character and the
+# remainder still runs (the Pi's omz `read -k 1` shape — the space-prefixed
+# probe survives it). devin-read-never-ends consumes every line — the probe
+# never prints and the agent command is never executed. devin-slow-rc keeps
+# sourcing rc while probes are typed: lines queue unexecuted until the
+# modelled rc finishes, then every queued line runs in order with the full
+# environment.
+# Fix-round-1: `pane send-keys ctrl+c` during pending rc is modelled as real
+# SIGINT — the rest of rc never runs, so the environment marker the rc sets
+# last is truncated (fixture_env -> "truncated") and every line that later
+# executes sees it. With no ctrl+c, rc always ends with env=full.
 fixture_screen_file="${TMPDIR:-/tmp}/wrk-fixture-screen-${WRK_RUN_ID:-standalone}"
 fixture_eaten_file="${TMPDIR:-/tmp}/wrk-fixture-eaten-${WRK_RUN_ID:-standalone}"
+fixture_queue_file="${TMPDIR:-/tmp}/wrk-fixture-queue-${WRK_RUN_ID:-standalone}"
+fixture_rcdone_file="${TMPDIR:-/tmp}/wrk-fixture-rcdone-${WRK_RUN_ID:-standalone}"
+fixture_env_file="${TMPDIR:-/tmp}/wrk-fixture-env-${WRK_RUN_ID:-standalone}"
+fixture_env() { cat "$fixture_env_file" 2>/dev/null || printf 'full\n'; }
+
+# devin-slow-rc keeps sourcing until the ${WRK_FIXTURE_RC_READS:-6}-th
+# `pane read` marks it done (the probe verification polls drive the modelled
+# wall clock — see the read handler); a ctrl+c ends it early — truncated.
+# The pending-read scenarios' rc ends when their prompt is satisfied;
+# never-ends' never does.
+fixture_rc_pending() {
+  case "$scenario" in
+    devin-slow-rc) [[ ! -f "$fixture_rcdone_file" ]] ;;
+    devin-read-eats-line|devin-read-eats-key) [[ ! -f "$fixture_eaten_file" ]] ;;
+    devin-read-never-ends) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# Execute one typed command line: log it, run the modelled effects.
+fixture_exec_line() {
+  local text="$1" run_token
+  [[ -z "${WRK_FIXTURE_LOG:-}" ]] || printf '%s\n' "$text" >>"${WRK_FIXTURE_LOG}.executed"
+  if [[ "$scenario" == devin-run-fail && "$text" == devin\ * ]]; then
+    printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture pane run failure"}}' >&2
+    exit 5
+  fi
+  case "$text" in
+    # The readiness probe prints its token as its own output line.
+    *wrk-ready-*)
+      run_token="${text##*wrk-ready-}"
+      run_token="${run_token%%[^A-Za-z0-9._-]*}"
+      printf 'wrk-ready-%s\n' "$run_token" >>"$fixture_screen_file" ;;
+    # A successful `pane run` is how the devin agent reaches the pane — it
+    # foregrounds the devin executable, inheriting whatever env the rc left.
+    devin\ *)
+      fixture_set_foreground devin
+      [[ -z "${WRK_FIXTURE_LOG:-}" ]] ||
+        printf 'env=%s\n' "$(fixture_env)" >"${WRK_FIXTURE_LOG}.devenv" ;;
+  esac
+}
+
+# A queued input line runs once the modelled rc finishes — in order, under
+# whatever environment the rc (or a ctrl+c) left behind.
+fixture_flush_queue() {
+  local queued
+  [[ -f "$fixture_queue_file" ]] || return 0
+  while IFS= read -r queued; do fixture_exec_line "$queued"; done <"$fixture_queue_file"
+  rm -f "$fixture_queue_file"
+}
 
 fixture_prompt_count() {
   [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]] || { printf '0\n'; return; }
@@ -196,7 +254,7 @@ if [[ "${1:-}" == agent && "${2:-}" =~ ^(get|wait|explain)$ ]]; then
       (( devin_gets <= ${WRK_FIXTURE_DEVIN_NOT_FOUND_COUNT:-3} )) && devin_undetected=1
       ;;
     devin-never-detect) devin_undetected=1 ;;
-    devin-read-eats-line|devin-read-never-ends)
+    devin-read-eats-line|devin-read-eats-key|devin-read-never-ends|devin-slow-rc)
       [[ "$(fixture_foreground)" != devin ]] && devin_undetected=1
       ;;
   esac
@@ -229,7 +287,7 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-shell-busy-m1b|devin-shell-never-ready-m1b|devin-explain-no-rule|devin-explain-empty|devin-trust-screen|devin-read-fail|devin-explain-starting|devin-explain-starting-stuck|devin-explain-unknown|devin-read-eats-line|devin-read-never-ends)
+          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-shell-busy-m1b|devin-shell-never-ready-m1b|devin-explain-no-rule|devin-explain-empty|devin-trust-screen|devin-read-fail|devin-explain-starting|devin-explain-starting-stuck|devin-explain-unknown|devin-read-eats-line|devin-read-eats-key|devin-read-never-ends|devin-slow-rc)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
           # #568 incident shape: the brief landed and devin is working on it,
@@ -470,11 +528,11 @@ case "${1:-}" in
         fi
         # A fresh tab holds a fresh shell — clear any foreground and screen
         # state a same-PID predecessor run left behind.
-        rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file"
+        rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file"
         printf '%s\n' '{"result":{"tab_id":"w:t1","root_pane":{"pane_id":"w:p1"}}}'
         ;;
       close)
-        rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file"
+        rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file"
         printf '%s\n' '{"result":{"closed":"'"${3:-}"'"}}'
         ;;
       list)
@@ -613,7 +671,7 @@ case "${1:-}" in
       exit 0
     fi
     if [[ "${2:-}" == close ]]; then
-      rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file"
+      rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file"
     fi
     if [[ "${2:-}" == read ]]; then
       if [[ "$scenario" == devin-read-fail ]]; then
@@ -625,6 +683,18 @@ case "${1:-}" in
         if [[ " $* " != *" --source recent-unwrapped --lines 60 "* ]]; then
           printf 'fixture: pane read unavailable\n' >&2
           exit 9
+        fi
+      fi
+      # devin-slow-rc: the modelled rc finishes on the
+      # ${WRK_FIXTURE_RC_READS:-6}-th pane read — every input line queued
+      # behind it now runs in order with the full environment.
+      if [[ "$scenario" == devin-slow-rc ]] && fixture_rc_pending; then
+        reads=0
+        [[ -n "${WRK_FIXTURE_LOG:-}" && -f "$WRK_FIXTURE_LOG" ]] &&
+          reads="$(grep -c '^pane read ' "$WRK_FIXTURE_LOG" 2>/dev/null || true)"
+        if (( reads >= ${WRK_FIXTURE_RC_READS:-6} )); then
+          : >"$fixture_rcdone_file"
+          fixture_flush_queue
         fi
       fi
       case "$scenario" in
@@ -643,36 +713,44 @@ case "${1:-}" in
       # whether or not it ever executes.
       run_text="${*:4}"
       printf '%s\n' "$run_text" >>"$fixture_screen_file"
-      consumed=0
+      consumed=0 queued=0
       case "$scenario" in
         devin-read-eats-line)
           if [[ ! -f "$fixture_eaten_file" ]]; then
             : >"$fixture_eaten_file"
             consumed=1
           fi ;;
+        devin-read-eats-key)
+          # read -k 1 takes the first character only; the remainder of the
+          # line is still in the tty buffer and runs once the prompt returns.
+          if [[ ! -f "$fixture_eaten_file" ]]; then
+            : >"$fixture_eaten_file"
+            fixture_exec_line "${run_text:1}"
+            consumed=1
+          fi ;;
         devin-read-never-ends) consumed=1 ;;
+        devin-slow-rc)
+          # rc still sourcing: the line queues and runs when it finishes.
+          if fixture_rc_pending; then
+            printf '%s\n' "$run_text" >>"$fixture_queue_file"
+            queued=1
+          fi ;;
       esac
-      if [[ "$consumed" -eq 0 ]]; then
-        [[ -z "${WRK_FIXTURE_LOG:-}" ]] || printf '%s\n' "$run_text" >>"${WRK_FIXTURE_LOG}.executed"
-        if [[ "$scenario" == devin-run-fail && "$run_text" == devin\ * ]]; then
-          printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture pane run failure"}}' >&2
-          exit 5
-        fi
-        case "$run_text" in
-          # The readiness probe prints its token as its own output line.
-          *wrk-ready-*)
-            run_token="${run_text##*wrk-ready-}"
-            run_token="${run_token%%[^A-Za-z0-9._-]*}"
-            printf 'wrk-ready-%s\n' "$run_token" >>"$fixture_screen_file" ;;
-          # A successful `pane run` is how the devin agent reaches the pane —
-          # it foregrounds the devin executable.
-          devin\ *) fixture_set_foreground devin ;;
-        esac
+      if [[ "$consumed" -eq 0 && "$queued" -eq 0 ]]; then
+        fixture_exec_line "$run_text"
       fi
       printf 'fixture pane %s\nACTUAL SCREEN LAST LINE\n' "${3:-unknown}"
       exit 0
     fi
     if [[ "${2:-}" == send-keys ]]; then
+      # ctrl+c during a still-sourcing rc is SIGINT: the rest of the rc never
+      # runs, so the environment it would have set last is truncated — but
+      # every input line already queued then runs under that truncated env.
+      if [[ "$*" == *ctrl+c* ]] && fixture_rc_pending; then
+        printf 'truncated\n' >"$fixture_env_file"
+        : >"$fixture_rcdone_file"
+        fixture_flush_queue
+      fi
       printf '%s\n' '{"result":{}}'
       exit 0
     fi

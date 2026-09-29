@@ -193,9 +193,13 @@ foreground만으로는 부족하다 — rc 파일이 `read -k 1` 같은 한 글�
 zsh는 foreground를 혼자 갖는다(Pi에서 oh-my-zsh 업데이트 프롬프트가 타이핑된 `devin`의
 d를 삼켜 `evin`이 실행된 사고). 그래서 셸이 foreground를 혼자 잡으면 devin argv를 넣기
 전에 공백으로 시작하는 `printf` 프로브(매번 새 nonce)를 타이핑하고, 그 토큰이 자기
-출력 줄로 정확히 돌아올 때만 진행한다 — 에코된 명령 줄은 증거가 아니다. 프로브에 답이
-없으면 ctrl+c로 입력 줄을 지우고 새 토큰으로 재시도하며, 창이 닫힐 때까지 답이 없으면
-자체 사유로 fail-closed한다. 이 대기는 뒤의 검출·idle 대기와 같은 30초 창을 나눠 쓴다.
+출력 줄로 정확히 돌아올 때만 진행한다 — 에코된 명령 줄은 증거가 아니다. 이 spawn이
+타이핑한 토큰 중 아무 것이나 돌아오면 된다 — 아직 sourcing 중인 rc 뒤에 queue된 줄은
+프롬프트가 올 때 모두 실행되고, `read -k 1`이 선행 공백을 삼켜도 나머지 줄은 그대로
+실행된다. 프로브에 답이 없으면 새 토큰으로 재타이핑할 뿐 절대 ctrl+c 등 키를 보내지
+않는다 — sourcing 중인 rc에 대한 SIGINT는 나머지 rc를 죽여 agent가 잘린 환경을 물려
+받는다. 창이 닫힐 때까지 답이 없으면 자체 사유로 fail-closed한다. 이 대기는 뒤의
+검출·idle 대기와 같은 30초 창을 나눠 쓴다.
 
 `devin-swe2`는 Devin 프로필이다. 현재 `wrk`는
 `herdr pane run <pane_id> devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false`로

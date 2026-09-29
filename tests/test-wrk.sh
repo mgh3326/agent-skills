@@ -1301,7 +1301,10 @@ fi
 exec /bin/date "$@"
 SH
 chmod +x "$TMP/jumpclock/date"
-devin_idle_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)"
+# #979 N1: the substitution must be guarded — when every probe read fails the
+# spawn exits nonzero and an unguarded $(...) dies silently under set -e.
+devin_idle_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-swe2 2>&1)" ||
+  fail "devin-idle spawn failed: $devin_idle_out"
 grep -q 'model=devin-swe2' <<<"$devin_idle_out"
 grep -q 'status=idle' <<<"$devin_idle_out"
 grep -q 'landed=yes' <<<"$devin_idle_out"
@@ -1949,10 +1952,15 @@ echo "PASS 604-m1b-envelope: unwrapped process-info polls shell-busy foreground,
 # `devin` and left `evin` to run. process-info cannot see it, so after the
 # foreground check passes wrk types a space-prefixed printf probe carrying a
 # fresh token and requires the token back as its own output line before the
-# agent argv is typed. The only `herdr pane run` call site that types into a
-# fresh shell pane is devin_start_in_pane (every other kind's start goes
-# through `agent start`, which herdr gates internally), so the probe lives
-# there and these cases cover it.
+# agent argv is typed; ANY token this spawn typed counts, because lines
+# queued behind a still-sourcing rc all execute when the prompt arrives and
+# a `read -k 1` that ate the leading space still runs the remainder. An
+# unanswered probe is only ever RETYPED — never interrupted: fix-round-1
+# showed ctrl+c during rc sourcing SIGINTs the rest of the rc and leaves the
+# agent in a truncated environment. The only `herdr pane run` call site that
+# types into a fresh shell pane is devin_start_in_pane (every other kind's
+# start goes through `agent start`, which herdr gates internally), so the
+# probe lives there and these cases cover it.
 t979_xdg="$TMP/t979-xdg"
 devin_trust_seed_store "$t979_xdg" "$ROOT" "$(cd "$ROOT" && pwd -P)"
 
@@ -1974,20 +1982,44 @@ t979_read_no="$(grep -n '^pane read w:p1 ' "$t979_log" | cut -d: -f1)"
 t979_agent_no="$(grep -n '^pane run w:p1 devin ' "$t979_log" | cut -d: -f1)"
 (( t979_probe_no < t979_read_no && t979_read_no < t979_agent_no )) ||
   fail "probe must be typed, its output read, and only then the agent command"
+if grep -q '^pane send-keys ' "$t979_log"; then
+  fail "wrk must never interrupt a shell that may still be sourcing its rc file: $(grep '^pane send-keys ' "$t979_log")"
+fi
 echo "PASS 979-AC3 ready shell: one probe, one read, one agent run"
 
-# AC1: the pending one-key read consumes the first typed line — the probe
-# goes unanswered, the input line is cleared, the probe is retyped with a new
-# token, and the full devin argv then lands unharmed.
+# The Pi shape exactly: `read -k 1` eats the first CHARACTER (the probe's
+# leading space) and the remainder `printf …` still runs — the probe passes
+# on the first try with no retype and no interrupt.
+: >"$TMP/herdr-t979-key.log"; rm -f "$TMP/herdr-t979-key.log.executed"
+devin_key_out="$(TEST_FIXTURE_SCENARIO=devin-read-eats-key devin_spawn_at "$t979_xdg" "$ROOT" t979-key "$(mint_task)" 2>&1)" ||
+  fail "Devin behind a pending read -k 1 must still spawn: $devin_key_out"
+grep -q 'landed=yes' <<<"$devin_key_out" || fail "read -k 1 devin did not land: $devin_key_out"
+t979_log="$TMP/herdr-t979-key.log"
+[[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$t979_log")" -eq 1 ]] ||
+  fail "a read -k 1-eaten probe must still execute its remainder: $(grep '^pane run ' "$t979_log")"
+[[ "$(grep -c '^pane run w:p1 devin ' "$t979_log")" -eq 1 ]] ||
+  fail "devin argv must be typed exactly once, after the shell proved it runs lines"
+grep -qx 'devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' \
+  "$t979_log.executed" ||
+  fail "the fake shell must execute the full devin argv: $(cat "$t979_log.executed")"
+if grep -q '^pane send-keys ' "$t979_log"; then
+  fail "wrk must never interrupt a shell that may still be sourcing its rc file: $(grep '^pane send-keys ' "$t979_log")"
+fi
+echo "PASS 979 eaten first char (read -k 1): probe remainder ran, no retype"
+
+# AC1: a pending full-line read consumes the first typed line — the probe
+# goes unanswered, it is retyped with a new token (retype only, never an
+# interrupt), and the full devin argv then lands unharmed.
 : >"$TMP/herdr-t979-eaten.log"; rm -f "$TMP/herdr-t979-eaten.log.executed"
 devin_eaten_out="$(TEST_FIXTURE_SCENARIO=devin-read-eats-line devin_spawn_at "$t979_xdg" "$ROOT" t979-eaten "$(mint_task)" 2>&1)" ||
   fail "Devin behind a pending read must still spawn: $devin_eaten_out"
 grep -q 'landed=yes' <<<"$devin_eaten_out" || fail "eaten-line devin did not land: $devin_eaten_out"
 t979_log="$TMP/herdr-t979-eaten.log"
 [[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$t979_log")" -eq 2 ]] ||
-  fail "unanswered probe must be cleared and retyped with a fresh token: $(grep '^pane run ' "$t979_log")"
-grep -qx 'pane send-keys w:p1 ctrl+c' "$t979_log" ||
-  fail "an unanswered probe must clear the input line (ctrl+c) before retyping"
+  fail "unanswered probe must be retyped with a fresh token: $(grep '^pane run ' "$t979_log")"
+if grep -q '^pane send-keys ' "$t979_log"; then
+  fail "wrk must never interrupt a shell that may still be sourcing its rc file: $(grep '^pane send-keys ' "$t979_log")"
+fi
 [[ "$(grep -c '^pane run w:p1 devin ' "$t979_log")" -eq 1 ]] ||
   fail "devin argv must be typed exactly once, after the shell proved it runs lines"
 grep -qx 'devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' \
@@ -1995,7 +2027,29 @@ grep -qx 'devin --model swe-2 --permission-mode dangerous --respect-workspace-tr
   fail "the fake shell must execute the full devin argv: $(cat "$t979_log.executed")"
 [[ "$(grep -c 'wrk-ready-' "$t979_log.executed")" -eq 1 ]] ||
   fail "the retried probe — and not the eaten one — must be the only executed probe"
+grep -qx 'env=full' "$t979_log.devenv" ||
+  fail "devin must inherit the fully-sourced rc environment: $(cat "$t979_log.devenv" 2>/dev/null)"
 echo "PASS 979-AC1 eaten first line: probe retried, agent argv intact, rc 0"
+
+# The fix-round-1 hazard: rc still sourcing while probes are typed. Lines
+# queue and ALL execute when rc finishes — the answer to an earlier probe is
+# proof, the spawn lands with the full environment, and no ctrl+c is sent.
+: >"$TMP/herdr-t979-slowrc.log"; rm -f "$TMP/herdr-t979-slowrc.log.executed" "$TMP/herdr-t979-slowrc.log.devenv"
+devin_slowrc_out="$(TEST_FIXTURE_SCENARIO=devin-slow-rc devin_spawn_at "$t979_xdg" "$ROOT" t979-slowrc "$(mint_task)" 2>&1)" ||
+  fail "Devin behind a slow rc file must still spawn: $devin_slowrc_out"
+grep -q 'landed=yes' <<<"$devin_slowrc_out" || fail "slow-rc devin did not land: $devin_slowrc_out"
+t979_log="$TMP/herdr-t979-slowrc.log"
+[[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$t979_log")" -gt 1 ]] ||
+  fail "an unanswered probe behind a slow rc must be retyped inside the window: $(grep '^pane run ' "$t979_log")"
+if grep -q '^pane send-keys ' "$t979_log"; then
+  fail "wrk must never interrupt a shell that may still be sourcing its rc file: $(grep '^pane send-keys ' "$t979_log")"
+fi
+grep -qx 'env=full' "$t979_log.devenv" ||
+  fail "devin must inherit the fully-sourced rc environment, not a ctrl+c-truncated one: $(cat "$t979_log.devenv" 2>/dev/null)"
+grep -qx 'devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' \
+  "$t979_log.executed" ||
+  fail "the fake shell must execute the full devin argv: $(cat "$t979_log.executed")"
+echo "PASS 979 slow rc: queued probes answered late, full env, no interrupt"
 
 # AC2: a pending read that never ends — the probe is never answered, the
 # spawn fails inside START_TIMEOUT with its own reason, the pane is cleaned
@@ -2012,6 +2066,9 @@ grep -q 'Devin pane startup failed: shell did not execute a readiness probe with
 t979_log="$TMP/herdr-t979-stuck.log"
 [[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$t979_log")" -gt 1 ]] ||
   fail "an unanswered probe must be retyped inside the window"
+if grep -q '^pane send-keys ' "$t979_log"; then
+  fail "wrk must never interrupt a shell that may still be sourcing its rc file: $(grep '^pane send-keys ' "$t979_log")"
+fi
 if grep -q '^pane run w:p1 devin ' "$t979_log"; then
   fail "agent command was typed into a shell that never executed a probe"
 fi
@@ -2021,19 +2078,33 @@ grep -q 'Devin spawn failure artifacts preserved under ' <<<"$devin_stuck_out" |
   fail "never-answering probe must keep the existing diagnostics path: $devin_stuck_out"
 echo "PASS 979-AC2 probe never answered: distinct reason, pane closed, no agent run"
 
+# No devin scenario may ever send pane keys — a ctrl+c into a still-sourcing
+# rc truncates the environment the agent then inherits.
+for t979_log in "$TMP"/herdr*.log; do
+  if grep -q '^pane send-keys ' "$t979_log" 2>/dev/null; then
+    fail "pane send-keys reached a devin pane in $t979_log: $(grep '^pane send-keys ' "$t979_log")"
+  fi
+done
+
 # AC6 mutants — assertion-RED invariants:
 #   M1 "the agent command is typed only after the shell has executed a probe"
 #      (mutant: ready foreground returns immediately, skipping the probe)
 #   M2 "a probe line that echoed but did not run is not proof"
 #      (mutant: substring match accepts the echoed command line)
+#   M3 "wrk never interrupts a shell that may still be sourcing its rc file"
+#      (mutant: ctrl+c after the miss count, then retype)
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
 devin_trust_mutant t979-no-probe \
   'if [[ "$ready" == yes ]]; then devin_probe_send || return 1; fi' \
   'if [[ "$ready" == yes ]]; then return 0; fi'
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
 devin_trust_mutant t979-echo-match \
-  'grep -qxF "$probe_token"' \
-  'grep -qF "$probe_token"'
+  'grep -qxF "$probe_any"' \
+  'grep -qF "$probe_any"'
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+devin_trust_mutant t979-ctrl-c \
+  '(( probe_misses >= DEVIN_PROBE_MISS_POLLS )) && probe_token=""' \
+  '(( probe_misses >= DEVIN_PROBE_MISS_POLLS )) && { "$HERDR" pane send-keys "$PANE" ctrl+c >/dev/null 2>&1 || true; probe_token=""; }'
 set +e
 t979_m1_out="$(TEST_FIXTURE_SCENARIO=devin-read-eats-line WRK_UNDER_TEST="$TMP/mut-wrk-t979-no-probe" \
   devin_spawn_at "$t979_xdg" "$ROOT" t979-m1 "$(mint_task)" 2>&1)"
@@ -2042,6 +2113,10 @@ t979_m2_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=
   TEST_FIXTURE_SCENARIO=devin-read-never-ends WRK_UNDER_TEST="$TMP/mut-wrk-t979-echo-match" \
   devin_spawn_at "$t979_xdg" "$ROOT" t979-m2 "$(mint_task)" 2>&1)"
 t979_m2_rc=$?
+rm -f "$TMP/herdr-t979-m3.log.devenv"
+t979_m3_out="$(TEST_FIXTURE_SCENARIO=devin-slow-rc WRK_UNDER_TEST="$TMP/mut-wrk-t979-ctrl-c" \
+  devin_spawn_at "$t979_xdg" "$ROOT" t979-m3 "$(mint_task)" 2>&1)"
+t979_m3_rc=$?
 set -e
 # M1 under AC1's eaten-line pane: the devin argv itself is consumed, so the
 # spawn must NOT reach the OK line (real run expects rc 0 + landed=yes).
@@ -2060,7 +2135,16 @@ if grep -q 'shell did not execute a readiness probe' <<<"$t979_m2_out"; then
 fi
 grep -q '^pane run w:p1 devin ' "$TMP/herdr-t979-m2.log" ||
   fail "M2 (echo accepted) proof — the agent command must have been (wrongly) typed"
-echo "PASS 979-AC6 mutants red: M1 skip-probe, M2 echo-as-proof"
+# M3 under the slow-rc pane: the ctrl+c ends rc early — the spawn still lands
+# (queued probes run), but the devin argv executes in a truncated
+# environment. The real assertion it breaks is the slow-rc case's env=full.
+[[ "$t979_m3_rc" -eq 0 ]] ||
+  fail "M3 (ctrl+c sent): spawn was expected to land truncated, not fail: $t979_m3_out"
+grep -qx 'env=truncated' "$TMP/herdr-t979-m3.log.devenv" ||
+  fail "M3 (ctrl+c sent) must truncate the rc environment devin inherits: $(cat "$TMP/herdr-t979-m3.log.devenv" 2>/dev/null)"
+grep -q '^pane send-keys w:p1 ctrl+c' "$TMP/herdr-t979-m3.log" ||
+  fail "M3 (ctrl+c sent) proof — the interrupt must appear in the herdr log"
+echo "PASS 979-AC6 mutants red: M1 skip-probe, M2 echo-as-proof, M3 ctrl+c"
 
 expect_exit 2 spawn_base devin-swe2 --effort high
 # Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker

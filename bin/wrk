@@ -1943,15 +1943,24 @@ else:
 # its own output line. The echoed command carries the token inside the printf
 # argument too, so only an exact-line match is proof — a substring match would
 # accept an echo from a shell that ran nothing. A probe that goes unanswered
-# is cleared with ctrl+c (which also aborts a pending read or a half-typed
-# line) and retyped with a new token, all inside the same START_TIMEOUT
-# window; a probe that never lands is a distinct fail-closed reason.
+# is retried with a fresh token after DEVIN_PROBE_MISS_POLLS reads — and only
+# retyped, never interrupted: a send-keys ctrl+c during a still-sourcing rc
+# file SIGINTs the rest of .zshrc/.bashrc and leaves the agent in a truncated
+# environment (fix-round-1 tester: 7s rc starts under load, and every earlier
+# queued line would have run unharmed once the shell was ready). The output
+# of ANY token this spawn typed counts as proof — lines queued behind a slow
+# rc all execute when the prompt arrives, and a `read -k 1` that ate the
+# leading space still runs the remainder of the line. A probe that never
+# lands is a distinct fail-closed reason inside the same START_TIMEOUT
+# window.
 DEVIN_PROBE_MISS_POLLS=4
 
-# probe_token/probe_sends/probe_misses/attempts are devin_wait_shell_ready
-# locals — dynamic scope is what lets this helper update them.
+# probe_token/probe_tokens/probe_sends/probe_misses/attempts are
+# devin_wait_shell_ready locals — dynamic scope is what lets this helper
+# update them.
 devin_probe_send() {
   probe_token="wrk-ready-$$-${attempts}-${RANDOM}"
+  probe_tokens="${probe_tokens:+$probe_tokens }$probe_token"
   probe_sends=$(( probe_sends + 1 ))
   probe_misses=0
   local probe_run_rc
@@ -1969,24 +1978,28 @@ devin_probe_send() {
 
 devin_wait_shell_ready() {
   local started_at="$1" attempts=0 max_attempts info_out info_rc ready
-  local probe_token="" probe_sends=0 probe_misses=0 probe_out probe_rc
+  local probe_token="" probe_tokens="" probe_sends=0 probe_misses=0
+  local probe_out probe_rc probe_matched probe_any
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
   while :; do
     attempts=$(( attempts + 1 ))
     if [[ -n "$probe_token" ]]; then
-      # A probe is in flight: only its own output line proves execution.
+      # A probe is in flight: only output lines prove execution, and the
+      # output of ANY token this spawn typed counts — queued lines run in
+      # order once the shell reaches its prompt.
       set +e
       probe_out="$("$HERDR" pane read "$PANE" --source recent-unwrapped --lines 60 2>/dev/null)"
       probe_rc=$?
       set -e
-      if [[ "$probe_rc" -eq 0 ]] && grep -qxF "$probe_token" <<<"$probe_out"; then
-        return 0
+      probe_matched=0
+      if [[ "$probe_rc" -eq 0 ]]; then
+        for probe_any in $probe_tokens; do
+          if grep -qxF "$probe_any" <<<"$probe_out"; then probe_matched=1; break; fi
+        done
       fi
+      [[ "$probe_matched" -eq 1 ]] && return 0
       probe_misses=$(( probe_misses + 1 ))
-      if (( probe_misses >= DEVIN_PROBE_MISS_POLLS )); then
-        "$HERDR" pane send-keys "$PANE" ctrl+c >/dev/null 2>&1 || true
-        probe_token=""
-      fi
+      (( probe_misses >= DEVIN_PROBE_MISS_POLLS )) && probe_token=""
     else
       set +e
       info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
