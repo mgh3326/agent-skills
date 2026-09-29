@@ -323,6 +323,9 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 이미 새 경로를 가리키는 `--report`(예: `report-r2.md`)는 있는 그대로 relay되고,
 `panewire emit`이 비0으로 끝나면 경고 한 줄에 job·report 경로·rc를 밝히고 OK 줄에
 `relay=file-only`를 붙인다(레코드·종료 처리·exit status는 그대로다).
+이 자동 스냅샷은 이 변경을 포함한 agent-skills가 설치된 곳에서만 적용된다
+— 그때까지는 후속 라운드 report를 `report-r<N>.md`로 쓰고 그 경로를
+`wrk done`에 넘겨라(명시한 새 경로는 있는 그대로 relay된다).
 
 **빈 값은 소멸의 증거가 아니다.** 2026-09-04 소켓 일시 정지와 비기본 herdr 세션
 때문에 그날 스폰한 거의 모든 잡이 스폰 30초 뒤 `job.lost`로 찍혔고, 센티널이 죽어

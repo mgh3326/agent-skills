@@ -6826,6 +6826,115 @@ grep -qxF "wrk: warning: panewire emit failed (rc=6 job=$RND5_JOB kind=job.compl
   fail "a failed emit must name job, report path and rc on stderr: $(cat "$RND5_ERR")"
 echo "PASS 1014-ac5-failed-emit-is-loud-and-exit-status-unchanged"
 
+# S3 — the delegated path (WRK_PANEWIRE_JOB=present, probe → panewire-job/1)
+# must carry the snapshot path too: `panewire job done` records and emits
+# whatever --report it is handed, so resolve runs before delegate_job_cmd.
+# The fixture's job-done writes the record itself and refuses a same
+# outbox-key/different-content call with rc 6, so a leaked original path is
+# observable as both a wrong argv and a failing delegated call.
+RND6_JOB="rnd-delegated"
+RND6_PW_JOB_LOG="$TMP/rnd6-pw-job.log"
+RND6_ERR="$TMP/rnd6.err"
+rnd_claim "$RND6_JOB"
+rnd6_report="$(rnd_report "$RND6_JOB" report.md 'delegated round one')"
+rnd6_snap2="$RND_JOBS/$RND6_JOB/report-r2.md"
+rnd6_snap3="$RND_JOBS/$RND6_JOB/report-r3.md"
+rnd6_done() {
+  env ARBITER_INBOX_ROOT="$RND_JOBS" HOSTNAME=fixture-host \
+    HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" PANEWIRE_BIN="$PANEWIRE" \
+    WRK_PANEWIRE_JOB=present WRK_PANEWIRE_JOB_LOG="$RND6_PW_JOB_LOG" \
+    "$WRK" 'done' "$RND6_JOB" --report "$rnd6_report"
+}
+rnd6_first="$(rnd6_done)"
+[[ "$rnd6_first" == "fixture job done $RND6_JOB --report $rnd6_report" ]] ||
+  fail "rnd-delegated r1: delegated stdout must pass through: $rnd6_first"
+grep -qxF "HOSTNAME=fixture-host [done] [$RND6_JOB] [--report] [$rnd6_report]" "$RND6_PW_JOB_LOG" ||
+  fail "rnd-delegated r1: delegated argv must name report.md: $(cat "$RND6_PW_JOB_LOG")"
+
+printf 'delegated round two\n' >"$rnd6_report"
+rnd6_second="$(rnd6_done 2>"$RND6_ERR")"
+[[ "$rnd6_second" == "fixture job done $RND6_JOB --report $rnd6_snap2" ]] ||
+  fail "rnd-delegated r2: delegated argv must name the snapshot: $rnd6_second"
+grep -qxF "HOSTNAME=fixture-host [done] [$RND6_JOB] [--report] [$rnd6_snap2]" "$RND6_PW_JOB_LOG" ||
+  fail "rnd-delegated r2: panewire must be handed report-r2.md: $(cat "$RND6_PW_JOB_LOG")"
+! grep -q 'delegation failed' "$RND6_ERR" ||
+  fail "rnd-delegated r2: the delegated call must not hit the duplicate-key rc 6: $(cat "$RND6_ERR")"
+
+printf 'delegated round three\n' >"$rnd6_report"
+rnd6_third="$(rnd6_done 2>"$RND6_ERR")"
+[[ "$rnd6_third" == "fixture job done $RND6_JOB --report $rnd6_snap3" ]] ||
+  fail "rnd-delegated r3: delegated argv must name the snapshot: $rnd6_third"
+grep -qxF "HOSTNAME=fixture-host [done] [$RND6_JOB] [--report] [$rnd6_snap3]" "$RND6_PW_JOB_LOG" ||
+  fail "rnd-delegated r3: panewire must be handed report-r3.md: $(cat "$RND6_PW_JOB_LOG")"
+! grep -q 'delegation failed' "$RND6_ERR" ||
+  fail "rnd-delegated r3: the delegated call must not hit the duplicate-key rc 6: $(cat "$RND6_ERR")"
+
+# Identical re-done: the delegated round-3 record carries report_sha256, so the
+# wrk-side resolve suppresses it before delegation — the job log stays at 3.
+rnd6_dup="$(rnd6_done 2>"$RND6_ERR")"
+[[ "$rnd6_dup" == "OK job=$RND6_JOB report=$rnd6_report" ]] ||
+  fail "rnd-delegated identical: suppression prints the caller's path: $rnd6_dup"
+grep -q 'suppressed duplicate' "$RND6_ERR" ||
+  fail "rnd-delegated identical: suppression must warn: $(cat "$RND6_ERR")"
+[[ "$(wc -l <"$RND6_PW_JOB_LOG" | tr -d ' ')" == 3 ]] ||
+  fail "rnd-delegated identical: a suppressed round must not delegate: $(cat "$RND6_PW_JOB_LOG")"
+python3 - "$RND_JOBS/$RND6_JOB/events" "$rnd6_report" "$rnd6_snap2" "$rnd6_snap3" <<'PY'
+import json, os, sys
+events, p1, p2, p3 = sys.argv[1:]
+paths = []
+for name in sorted(os.listdir(events)):
+    if "job.completed" in name and name.endswith(".json"):
+        with open(os.path.join(events, name)) as f:
+            paths.append(json.load(f).get("report_path"))
+assert paths == [p1, p2, p3], f"delegated rounds must record {p1}, {p2}, {p3}; got {paths}"
+PY
+echo "PASS 1014-s3-delegated-later-rounds-name-snapshots"
+
+# S1 (TOCTOU): completion_event must hash the bytes it snapshots, so the
+# record's report_sha256 always equals the sha256 of the file it names even
+# when report.md is rewritten while resolve waits on the events lock.
+RND7_JOB="rnd-toctou"
+RND7_ERR="$TMP/rnd7.err"
+rnd_claim "$RND7_JOB"
+rnd7_report="$(rnd_report "$RND7_JOB" report.md 'toctou round one')"
+env ARBITER_INBOX_ROOT="$RND_JOBS" HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
+  "$WRK" 'done' "$RND7_JOB" --report "$rnd7_report" >/dev/null
+python3 - "$RND_JOBS/$RND7_JOB/.wrk-events.lock" "$TMP/rnd7-lock-held" <<'PY' &
+import fcntl, sys, time
+f = open(sys.argv[1], "w")
+fcntl.flock(f, fcntl.LOCK_EX)
+open(sys.argv[2], "w").write("held")
+time.sleep(5)
+PY
+rnd7_holder=$!
+wait_until 10 test -f "$TMP/rnd7-lock-held" ||
+  fail "rnd-toctou: the lock helper must take the events lock"
+printf 'toctou round two\n' >"$rnd7_report"
+env ARBITER_INBOX_ROOT="$RND_JOBS" HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
+  "$WRK" 'done' "$RND7_JOB" --report "$rnd7_report" >"$TMP/rnd7.out" 2>"$RND7_ERR" &
+rnd7_done=$!
+sleep 1
+printf 'toctou round three\n' >"$rnd7_report"
+wait "$rnd7_holder"
+rnd7_rc=0
+wait "$rnd7_done" || rnd7_rc=$?
+[[ "$rnd7_rc" -eq 0 ]] || fail "rnd-toctou: done must exit 0, got $rnd7_rc: $(cat "$RND7_ERR")"
+python3 - "$RND_JOBS/$RND7_JOB/events" <<'PY'
+import hashlib, json, os, sys
+events = sys.argv[1]
+recs = []
+for name in sorted(os.listdir(events)):
+    if "job.completed" in name and name.endswith(".json"):
+        with open(os.path.join(events, name)) as f:
+            recs.append(json.load(f))
+assert len(recs) == 2, f"expected 2 completion records, got {len(recs)}"
+rec = recs[-1]
+actual = hashlib.sha256(open(rec["report_path"], "rb").read()).hexdigest()
+assert actual == rec["report_sha256"], \
+    f"record names {rec['report_path']} whose sha256 {actual} != report_sha256 {rec['report_sha256']}"
+PY
+echo "PASS 1014-s1-snapshot-bytes-match-record-digest"
+
 # R18 completion sentinel: a report alone is never completion evidence. A
 # worker still working must time out/lost rather than emit job.completed.
 SENTINEL_REPORT="$TMP/sentinel-report.md"
@@ -7743,8 +7852,10 @@ diff "$TMP/j499-present-job.log" <(printf '%s\n' \
   'HOSTNAME=fixture-host [escalate] [j499-builder] [--question] [two  spaces "and" quotes]' \
   "HOSTNAME=fixture-host [joined] [j499-builder] [--pr] [https://example.invalid/pr/9] [--head] [beef] [--report] [$J499_REPORT]") ||
   fail "delegation must hand panewire job the unmodified arguments"
-[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 0 ]] ||
-  fail "delegated done must not also write wrk's record"
+[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 1 ]] ||
+  fail "delegated done must leave exactly one record (the delegated binary's own)"
+grep -l '"via": "fixture-job-done"' "$J499_INBOX/j499-worker/events"/*-job.completed.json >/dev/null ||
+  fail "the delegated record must be panewire's own write, not wrk's"
 [[ "$(event_count "$J499_INBOX/j499-builder/events" job.escalate)" == 0 ]] ||
   fail "delegated escalate must not also write wrk's record"
 [[ "$(event_count "$J499_INBOX/j499-builder/events" job.joined)" == 0 ]] ||
@@ -7753,12 +7864,15 @@ diff "$TMP/j499-present-job.log" <(printf '%s\n' \
   fail "delegated commands must not also run wrk's emit"
 # A failing delegated call falls back to wrk's own write path (#770 tester
 # BLOCKER 1): the terminal record must not ride down with panewire's rc.
+# Fresh job — j499-worker already holds the delegated round-1 record, so an
+# identical re-done would be suppressed before delegation ever runs (#1014).
+j499_claim j499-rc-worker
 rc=0
-out="$(WRK_PANEWIRE_JOB_RC=7 j499_run 1 present rc 'done' j499-worker --report "$J499_REPORT" 2>&1)" || rc=$?
+out="$(WRK_PANEWIRE_JOB_RC=7 j499_run 1 present rc 'done' j499-rc-worker --report "$J499_REPORT" 2>&1)" || rc=$?
 [[ "$rc" == 0 ]] || fail "a failing delegated done must fall back to wrk's own path, got rc=$rc"
 printf '%s\n' "$out" | grep -q 'delegation failed' ||
   fail "the fallback must warn on stderr: $out"
-[[ "$(event_count "$J499_INBOX/j499-worker/events" job.completed)" == 1 &&
+[[ "$(event_count "$J499_INBOX/j499-rc-worker/events" job.completed)" == 1 &&
    "$(j499_calls "$TMP/j499-rc-emit.log")" == 1 ]] ||
   fail "the fallback must write and emit the record exactly once, locally"
 # Help stays wrk's own even when panewire has the command.

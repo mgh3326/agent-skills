@@ -132,6 +132,74 @@ if [[ "${1:-}" == job ]]; then
   if [[ -n "${WRK_PANEWIRE_JOB_LOG:-}" ]]; then
     { printf 'HOSTNAME=%s' "${HOSTNAME-<unset>}"; printf ' [%s]' "$@"; printf '\n'; } >>"$WRK_PANEWIRE_JOB_LOG"
   fi
+  # `panewire job done` in present mode mirrors the real command (#1014): it
+  # writes the durable record itself (with report_sha256 and a "via" marker so
+  # tests can prove the write came from panewire, not wrk) and refuses a same
+  # outbox-key call carrying different content with rc 6. WRK_PANEWIRE_JOB_RC
+  # still models a call that fails before writing anything.
+  if [[ "${1:-}" == 'done' ]]; then
+    if [[ "${WRK_PANEWIRE_JOB_RC:-0}" != 0 ]]; then
+      exit "${WRK_PANEWIRE_JOB_RC}"
+    fi
+    python3 - "${ARBITER_INBOX_ROOT:-}" "$@" <<'PY' || exit $?
+import hashlib, json, os, sys
+root = sys.argv[1]
+rest = sys.argv[2:]
+job = rest[1] if len(rest) > 1 else ""
+report = ""
+i = 2
+while i < len(rest):
+    if rest[i] == "--report" and i + 1 < len(rest):
+        report = rest[i + 1]
+        i += 2
+    else:
+        i += 1
+if root and job and report and os.path.isfile(report):
+    events = os.path.join(root, job, "events")
+    os.makedirs(events, exist_ok=True)
+    digest = hashlib.sha256(open(report, "rb").read()).hexdigest()
+    for name in sorted(os.listdir(events)):
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(events, name)) as f:
+                rec = json.load(f)
+        except (OSError, ValueError):
+            continue
+        if (rec.get("kind") or rec.get("type")) != "job.completed":
+            continue
+        if rec.get("report_path") != report:
+            continue
+        # Same outbox key (kind, job, epoch=1, report_path, reason=""):
+        # identical content is the round already delivered; different content
+        # under that key is refused exactly like writeEmitRecord.
+        if rec.get("report_sha256") == digest:
+            sys.exit(0)
+        print("emit: duplicate outbox key", file=sys.stderr)
+        sys.exit(6)
+    highest = 0
+    for name in os.listdir(events):
+        head = name.split("-", 1)[0]
+        if head.isdigit():
+            highest = max(highest, int(head))
+    last = ""
+    with open(report, "rb") as f:
+        lines = f.read().splitlines()
+        if lines:
+            last = lines[-1].decode("utf-8", "replace")[:240]
+    record = {
+        "kind": "job.completed",
+        "job_id": job,
+        "report_path": report,
+        "report_sha256": digest,
+        "report_last_line": last,
+        "epoch": 1,
+        "via": "fixture-job-done",
+    }
+    with open(os.path.join(events, f"{highest + 1:05d}-job.completed.json"), "w") as f:
+        json.dump(record, f)
+PY
+  fi
   echo "fixture job $*"
   exit "${WRK_PANEWIRE_JOB_RC:-0}"
 fi

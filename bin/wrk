@@ -3467,7 +3467,7 @@ completion_event() {
     last=""
   fi
   python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" "$mode" <<'PY'
-import fcntl, hashlib, json, os, re, shutil, sys, tempfile, time
+import fcntl, hashlib, json, os, re, sys, tempfile, time
 events, job, owner, label, pane, host, report, last, kind, reason, mode = sys.argv[1:]
 
 
@@ -3484,7 +3484,18 @@ def digest_of(path):
 # sentinel are separate processes racing on this directory, so the membership
 # check and the record write run inside one lock; the lockfile lives next to
 # events/ because the directory is also a consumer-facing record stream.
-digest = digest_of(report) if kind == "job.completed" else None
+# The bytes are read once: the digest and the snapshot below are computed from
+# and written with this same payload, so a record never names a snapshot whose
+# sha256 differs from report_sha256 even if report.md is rewritten mid-call.
+payload = None
+digest = None
+if kind == "job.completed":
+    try:
+        with open(report, 'rb') as f:
+            payload = f.read()
+        digest = hashlib.sha256(payload).hexdigest()
+    except OSError:
+        pass
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
@@ -3545,8 +3556,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                 try:
                     fd, temporary = tempfile.mkstemp(prefix='.report-', dir=directory)
                     with os.fdopen(fd, 'wb') as out:
-                        with open(report, 'rb') as src:
-                            shutil.copyfileobj(src, out)
+                        out.write(payload)
                     os.link(temporary, candidate)
                     report = candidate
                 except FileExistsError:
@@ -3878,7 +3888,6 @@ done_cmd() {
     done_help
     return 0
   fi
-  delegate_job_cmd 'done' "$@"
   local job="${1:-}" report=""
   [[ -n "$job" && "$job" != -* ]] || die "done requires a job id"
   shift || true
@@ -3899,9 +3908,12 @@ done_cmd() {
     report="$(find_latest_report "$jobs_root/$job")"
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
-  # Decide the artifact path before uploading: a changed report that reuses an
-  # earlier round's path is snapshot to <stem>-r<N>.md so its outbox key is
-  # fresh, and the document upload below must name that same file.
+  # Decide the artifact path before delegating or uploading: a changed report
+  # that reuses an earlier round's path is snapshot to <stem>-r<N>.md so its
+  # outbox key is fresh. Delegation comes after resolution because
+  # `panewire job done` records and emits whatever --report it is handed —
+  # forwarding the caller's unchanged path would collide on the earlier
+  # round's outbox key all over again (#1014 fix round).
   local resolution
   resolution="$(completion_event "$job" "$owner" "$label" "$pane" "$report" job.completed "" resolve)"
   if [[ "$resolution" == duplicate ]]; then
@@ -3915,6 +3927,7 @@ done_cmd() {
   fi
   [[ "$resolution" == resolved*$'\n'* ]] || die "done: unexpected resolve output: $resolution"
   report="${resolution#*$'\n'}"
+  delegate_job_cmd 'done' "$job" --report "$report"
   upload_report_document "$job" "$report"
   local completion_out completion_status
   completion_out="$(completion_event "$job" "$owner" "$label" "$pane" "$report")"

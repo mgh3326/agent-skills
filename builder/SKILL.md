@@ -309,7 +309,9 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
   내용의 `job.completed`는 panewire emit의 outbox 키 `(kind, job, epoch,
   report_path, reason)` 충돌로 rc 6 거부되기 때문이다. 후속 라운드 지시에
   새 보고 경로를 요구할 필요가 없고, emit이 실패하면 `wrk done`의 OK 줄은
-  `relay=file-only`를 보인다.
+  `relay=file-only`를 보인다. 이 자동 스냅샷은 이 변경이 설치된 agent-skills에만
+  적용된다 — 그 전까지는 워커에게 `report-r<N>.md`를 직접 쓰고 그 경로를
+  `wrk done`에 넘기라고 지시한다(명시한 새 경로는 있는 그대로 relay된다).
 
 ## 운영자 확인의 출처
 

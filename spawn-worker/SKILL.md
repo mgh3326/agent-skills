@@ -476,7 +476,9 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
   유예 동안 감시해 report 가 나오면 `job.completed` 를 추가로 쓴다. 같은 경로의
   report 를 갱신한 후속 라운드는 내용만 바뀌어도 `<stem>-r<N>.md` 스냅샷 경로로
   relay 된다(#1014 — 같은 경로+다른 내용은 panewire emit outbox 키 충돌로
-  거부된다). 판정은 잡 디렉토리
+  거부된다). 이 자동 스냅샷은 이 변경이 설치된 agent-skills에만 적용된다 —
+  그 전까지는 `report-r<N>.md`를 직접 쓰고 그 경로를 `wrk done`에 넘겨라
+  (명시한 새 경로는 있는 그대로 relay된다). 판정은 잡 디렉토리
   `completion-sentinel.log` 에 한 줄씩 남으니 "빌더가 무한 대기" 를 의심할 땐 그 파일부터 봐라.
   🔴 원격/데스크톱처럼 herdr 서버가 비기본 세션에 사는 호스트에서는 스폰 시
   `HERDR_SESSION`(또는 `WRK_SENTINEL_HERDR_SESSION`)을 반드시 넘겨라 — 2026-09-04 에 이 값이
