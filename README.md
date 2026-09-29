@@ -72,6 +72,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
 | `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부; #965 — hosts.toml `[hub] session_machine_ids`에 매핑된 세션의 worker 스폰은 `panewire lanes add`로 허브 레인을 등록하고 OK 줄에 `lane=`을 단다. #994 — `session_machine_ids`는 non-fleet herdr 세션 전용이다(예: M1의 기본 세션). fleet 세션을 매핑하면 모든 fleet worker가 global lane으로 등록되므로 지원하지 않는다) · `reap`(끝난 pane 회수, 기본 dry-run; `--apply`는 등록된 허브 레인도 `panewire lanes rm`으로 거둔다 — 잔여분은 `panewire lanes-audit`이 나열) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정) · `heavy`(>1분 로컬 실행의 호스트 직렬화 락, `-- <cmd>`·`status`). `wrk --help` 로 전체 확인 |
 | `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(path·linear_permit의 fencing lease + quota_pool의 비배타 실행 기록) · `status`(읽기 전용) · `gc`(배타 lease 만료 전이 + 설치된 `herdr agent list`와 대조해 stale 기록 정리; JSON 경로 fixture도 지원) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
+| `fleet-rev` | 5호스트 설치 버전 점검(**읽기 전용**) — 호스트별 scopefuel·agent-skills·panewire·handoffkeep의 설치 커밋을 GitHub main과 대조해 current/behind/diverged를 표로 출력. 호스트당 ssh 1회 + 고정 POSIX sh probe(key=value만 출력); 설치·재시작·쓰기 명령 없음. `--extra NAME=ALIAS` · `--skip NAME` · `--only NAME[,NAME]` · `--timeout` · `--json` |
 
 Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and writes a receipt. Usage and audit: [director/tester-eligible.md](director/tester-eligible.md).
 
@@ -83,6 +84,56 @@ Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and wri
 | `scopefuel` | 스폰 전 쿼타·pace 확인, 급별 후보 추천(`--recommend`), 스폰 게이트(`gate`) | 없음(정본) |
 | `wt` (worktrunk) | worktree 생성 + .env 자동 연결 | raw `git worktree add` + 수동 .env 심링크 |
 | `~/bin/herdr-spawn` | **deprecated** — `wrk spawn` 으로 위임하는 shim(옛 경로 호환용) | `wrk spawn` |
+
+## 설치 점검 (fleet-rev)
+
+머지마다 데스크가 5대 호스트에 네 도구를 손으로 재설치한다. `bin/fleet-rev`는
+각 호스트의 설치 커밋을 GitHub main과 대조해 어느 호스트가 아직 옛 빌드인지
+한 표로 보여준다. **읽기 전용** — 설치·재시작·파일 쓰기는 절대 하지 않으며
+설치 자체는 데스크의 일로 남는다.
+
+정본 호출(desk = 이 Mac, hosts.toml의 활성 `[hosts.*]` 전부 + M1은 `--extra`로,
+연결 불가인 oci는 `--skip`으로 제외):
+
+```bash
+bin/fleet-rev --extra mac-work=m1 --skip oci
+```
+
+probe 대상 = `local`(ssh 없이 직접 probe) + `WRK_HOSTS_CONFIG`
+(기본 `~/.config/wrk/hosts.toml`)의 활성 `[hosts.NAME]` 테이블 전부. 주석 처리된
+테이블은 호스트가 아니다. 5대 = 이 Mac(local) + m1b + desktop + Pi +
+M1(`--extra mac-work=m1`).
+
+각 호스트에는 `ssh -o BatchMode=yes -o ConnectTimeout=10 <alias> sh -s` 한 번으로
+고정 POSIX sh probe만 보낸다(stdin의 스크립트, key=value 줄만 출력). probe는
+`PATH`에 `~/.local/bin ~/go/bin /opt/homebrew/bin /usr/local/bin`을 앞에 붙인 뒤
+uv receipt·`~/.agents/skills` git·`panewire version`·`handoffkeep version --json`
+(없으면 `go version -m` 폴백)만 읽는다. 환경 파일·토큰·설정은 읽지 않는다.
+
+status(호스트×도구):
+
+| status | 뜻 |
+|---|---|
+| `current` | 설치 커밋 = GitHub main(짧은 sha는 main의 접두사일 때만 인정) |
+| `current+modified` | current + 작업트리 수정(agent-skills dirty>0, handoffkeep vcs.modified) |
+| `behind N` | main이 설치본보다 N커밋 앞섬(compare status ahead) |
+| `diverged` | compare status diverged, 또는 설치 sha를 GitHub이 모름(404) |
+| `unknown` | probe가 설치본을 판독 못함(파일은 있는데 rev 없음 등) |
+| `absent` | 바이너리·파일 자체가 없음 |
+| `unreachable` | 그 호스트의 ssh 실패·타임아웃(그 호스트 전 칸) |
+
+exit code: `0` 전부 current · `1` behind/diverged 하나라도 있음 ·
+`3` stale 없지만 unknown/absent/unreachable 있음 · `2` 사용법·설정 오류.
+`--json`은 `{"main": {repo: sha}, "hosts": [{"host","alias","reachable","tools"}],
+"rc"}` 한 객체를 출력하고 rc 필드는 종료코드와 같다.
+
+뒤처진 칸의 호스트별 재설치(데스크가 실행 — fleet-rev는 하지 않는다):
+
+- **scopefuel**: `uv tool install --force git+https://github.com/mgh3326/scopefuel@<sha>`
+- **agent-skills**: `git -C ~/.agents/skills pull --ff-only` 후 `./install.sh`
+- **panewire**: panewire repo의 [`docs/runbooks/node-update.md`](https://github.com/mgh3326/panewire/blob/main/docs/runbooks/node-update.md) 런북을 따른다.
+- **handoffkeep**: CLI 설치 절차는 handoffkeep repo에 문서화되어 있지 않다
+  (repo에는 서버용 `deploy/systemd/` 유닛과 `docs/README.md` 운영 절차만 있다).
 
 ## `wrk` 사용법
 

@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Fake ssh for fleet-rev tests. Records argv, honours a configurable dead/sleep
+# alias list, then runs the probe from stdin under a per-alias fixture HOME:
+#
+#   FLEET_REV_SSH_LOG        append one argv line per call (default /dev/null)
+#   FLEET_REV_FAKE_ROOT      required: dir holding one fixture home per alias,
+#                            keyed by sanitize(alias) = tr -c 'A-Za-z0-9_-' '_'
+#   FLEET_REV_FAKE_DEAD      comma list of aliases that fail with exit 255
+#   FLEET_REV_FAKE_SLEEP     comma list of aliases that stall first
+#   FLEET_REV_FAKE_SLEEP_S   stall seconds (default 5)
+set -euo pipefail
+
+printf '%s\n' "$*" >>"${FLEET_REV_SSH_LOG:-/dev/null}"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -o) shift 2 ;;
+    --) shift ;;
+    *) break ;;
+  esac
+done
+alias="${1:?fake ssh: missing alias}"
+shift
+[[ "${1:-}" == "sh" && "${2:-}" == "-s" && $# -eq 2 ]] || {
+  echo "fake ssh: unexpected remote command: $*" >&2
+  exit 3
+}
+
+case ",${FLEET_REV_FAKE_DEAD:-}," in
+  *,"$alias",*) exit 255 ;;
+esac
+case ",${FLEET_REV_FAKE_SLEEP:-}," in
+  *,"$alias",*) sleep "${FLEET_REV_FAKE_SLEEP_S:-5}" ;;
+esac
+
+home="${FLEET_REV_FAKE_ROOT:?}/$(printf '%s' "$alias" | tr -c 'A-Za-z0-9_-' '_')"
+[[ -d "$home" ]] || { echo "fake ssh: no fixture home for alias $alias" >&2; exit 254; }
+HOME="$home" sh -s
