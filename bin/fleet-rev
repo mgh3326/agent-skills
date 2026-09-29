@@ -101,20 +101,20 @@ budget_unknown() {
 
 # run_tool SECONDS CMD... — per-tool bound, portable (POSIX sh, no GNU
 # timeout, no setsid) and no temp files. CMD runs as a background job
-# with stdin /dev/null. A watchdog subshell sleeps the bound, SIGTERMs
-# the direct child at once (the bound is for the tool itself; the tree
-# walk's cost must not stretch it), walks the tree to pin the
-# descendants, SIGTERMs them too, then SIGKILLs child and list
-# KILL_GRACE seconds later; a wrapper's grandchild stays on the saved
-# pid list even after the wrapper died and reparented it. A second
-# subshell snapshots the tree every second while the child lives (a
-# dead pid has no listed children, so once the child exits the saved
-# list is all there is);
-# SIGUSR1 wakes it to SIGKILL the last-seen descendants and exit, so a
-# grandchild orphaned by a finished wrapper cannot keep the caller's
-# output pipe open (the snapshot is at most a second stale — a child
-# spawned and detached in that gap is the residual, as is a pid freed
-# and reused inside it).
+# with stdin /dev/null. A watchdog subshell sleeps the bound, walks the
+# tree while the direct child still lives to pin its descendants (the
+# walk must precede the TERM: once a wrapper dies its children are
+# reparented, the walk comes back empty, and a child started late in
+# the bound escapes), then SIGTERMs the child and the listed pids and
+# SIGKILLs them KILL_GRACE seconds later; a wrapper's grandchild stays
+# on the saved pid list even after the wrapper died and reparented it.
+# A second subshell snapshots the tree every second while the child
+# lives (a dead pid has no listed children, so once the child exits the
+# saved list is all there is); SIGUSR1 wakes it to SIGKILL the last-seen
+# descendants and exit, so a grandchild orphaned by a finished wrapper
+# cannot keep the caller's output pipe open (the snapshot is at most a
+# second stale — a child spawned and detached in that gap is the
+# residual, as is a pid freed and reused inside it).
 # Both helpers' fds go to /dev/null so neither they nor their sleeps can
 # hold the caller's output pipe open. (A separate process group would
 # cover all of this, but a non-interactive sh without a tty refuses
@@ -130,9 +130,8 @@ run_tool() {
   "$@" </dev/null &
   _rt_p=$!
   ( sleep "$_rt_t"
-    kill -TERM "$_rt_p" 2>/dev/null
     _rt_k=$(descendants "$_rt_p")
-    kill -TERM $_rt_k 2>/dev/null
+    kill -TERM "$_rt_p" $_rt_k 2>/dev/null
     sleep "$KILL_GRACE"
     kill -KILL "$_rt_p" $_rt_k $(descendants "$_rt_p") 2>/dev/null ) </dev/null >/dev/null 2>&1 &
   _rt_w=$!

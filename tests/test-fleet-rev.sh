@@ -863,6 +863,37 @@ pgrep -f 'while :; do sleep 64' >/dev/null 2>&1 &&
 pgrep -f 'sleep 64' >/dev/null 2>&1 &&
   fail "AC16 depth3 left a leaf behind: $(pgrep -fl 'sleep 64')"
 
+# late child: the wrapper backs off ~2.7s inside the bound, then starts a
+# hung retry and waits on it (the tester measured escapes for children
+# started at 2.2-2.9s; ~2.7 keeps the spawn clear of the sweeper's last
+# snapshot even where each tree walk is slow). If the watchdog SIGTERMs
+# the wrapper before walking the tree, the walk finds a dead parent —
+# the retry is already reparented and escapes the kill list, holding the
+# pipe until the host reads unreachable. Invariant I-M4: a hung child a
+# wrapper starts late in the bound never outlives the bound.
+full_current_home "$(remote_home x)"
+cat >"$(remote_home x)/.local/bin/panewire" <<'EOF'
+#!/bin/sh
+sleep 2.7
+sleep 67 &
+wait
+printf 'pw-deadbee\n'
+EOF
+chmod +x "$(remote_home x)/.local/bin/panewire"
+SECONDS=0
+run_fleet --only a --timeout 30
+ELA=$SECONDS
+[[ $RC -eq 3 ]] || fail "AC16 late-child rc: want 3 got $RC :: $OUT"
+assert_cell a panewire "unknown"
+[[ "$(cell a panewire)" == *"tool timed out"* ]] ||
+  fail "AC16 late-child detail: $(cell a panewire)"
+for t in scopefuel agent-skills handoffkeep; do
+  assert_cell a "$t" "current"
+done
+[[ $ELA -lt 10 ]] || fail "AC16 late-child stalled: ${ELA}s"
+pgrep -f 'sleep 67' >/dev/null 2>&1 &&
+  fail "AC16 late-child left the retry behind: $(pgrep -fl 'sleep 67')"
+
 # unit check: descendants prints every pid of a 3-level tree exactly
 # once, deepest first — the shared loop variable must not clobber an
 # interior node's own entry with its subtree's last leaf.
@@ -886,7 +917,7 @@ kill -KILL "$D3_P" "$D3_C" "$D3_L" 2>/dev/null || true
 wait 2>/dev/null || true
 [[ "$D3_GOT" == "$D3_WANT" ]] ||
   fail "AC16 descendants unit: want $(printf '[%s]' "$D3_WANT" | tr '\n' ' ') got $(printf '[%s]' "$D3_GOT" | tr '\n' ' ')"
-pass "AC16 non-exec wrapper (child, sleep-&-wait and depth-3 forms) bounded; whole tree killed"
+pass "AC16 non-exec wrapper (child, sleep-&-wait, depth-3 and late-child forms) bounded; whole tree killed"
 
 # ================================================================ AC17 (1007 B2)
 # The probe's real worst case: five sequential tool calls on one host and
