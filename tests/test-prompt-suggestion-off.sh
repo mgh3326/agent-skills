@@ -94,6 +94,11 @@ export HK_STATE="$TMP/hk-state.json"
 export HK_TASK_ID=76803
 "$HANDOFFKEEP_BIN" tasks add --id "$HK_TASK_ID" --title "prompt-suggestion suite task" --lane fixture >/dev/null
 export KIMI_CODE_HOME="$TMP/kimi-home"
+# #912: devin trust seeding fails closed on a missing store, so pre-seed the
+# fixture XDG root — the devin-swe2 spawn below (cwd $ROOT) is then a covered
+# no-op. The trust-path contract itself is exercised in tests/test-wrk.sh.
+mkdir -p "$XDG_DATA_HOME/devin/cli"
+printf '{"trusted_paths": ["%s"]}\n' "$ROOT" >"$XDG_DATA_HOME/devin/cli/trusted_workspaces.json"
 
 SETTING='--env CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false'
 
