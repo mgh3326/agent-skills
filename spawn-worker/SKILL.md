@@ -473,7 +473,10 @@ ROB-1150 비가역 외부 mutation 사고 4건. **5건 중 5건이 명세 단계
   README "완료 센티널 판정표" 가 정본이다. 요지: **빈 `agent get` 응답은 pane 소멸의 증거가
   아니다**(소켓 일시 정지·비기본 herdr 세션). 확정 소멸 에러 코드만 즉시 `job.lost` 이고,
   일시 장애는 연속 10회(≈5분) 넘겨야 `job.lost(herdr_unreachable)` 이며, 그 뒤에도 30분
-  유예 동안 감시해 report 가 나오면 `job.completed` 를 추가로 쓴다. 판정은 잡 디렉토리
+  유예 동안 감시해 report 가 나오면 `job.completed` 를 추가로 쓴다. 같은 경로의
+  report 를 갱신한 후속 라운드는 내용만 바뀌어도 `<stem>-r<N>.md` 스냅샷 경로로
+  relay 된다(#1014 — 같은 경로+다른 내용은 panewire emit outbox 키 충돌로
+  거부된다). 판정은 잡 디렉토리
   `completion-sentinel.log` 에 한 줄씩 남으니 "빌더가 무한 대기" 를 의심할 땐 그 파일부터 봐라.
   🔴 원격/데스크톱처럼 herdr 서버가 비기본 세션에 사는 호스트에서는 스폰 시
   `HERDR_SESSION`(또는 `WRK_SENTINEL_HERDR_SESSION`)을 반드시 넘겨라 — 2026-09-04 에 이 값이

@@ -158,6 +158,95 @@ fi
 
 [[ -z "${WRK_PANEWIRE_SLEEP:-}" ]] || sleep "$WRK_PANEWIRE_SLEEP"
 
+# `panewire emit` (#1014). The real binary's writeEmitRecord scans
+# <inbox-root>/jobs/<job>/events for a record with the same relay outbox key
+# (kind, job, epoch, report_path, reason): an identical record is the durable
+# half of this very notification and is accepted; a same-key record with
+# different metadata is refused with 'emit: duplicate outbox key' and rc 6
+# (ExitDeliveryFailure). wrk writes its record before emitting, so the scan
+# below must find and match it; nothing is written here. Fields are compared
+# like emit.go's matches(): every relay field except created_at/agent_label.
+if [[ "${1:-}" == emit ]]; then
+  shift
+  emit_rc=0
+  python3 - "$@" <<'PY' || emit_rc=$?
+import json, os, sys
+
+opts = {}
+argv = sys.argv[1:]
+i = 0
+while i < len(argv):
+    if argv[i].startswith("--") and i + 1 < len(argv):
+        opts[argv[i][2:]] = argv[i + 1]
+        i += 2
+    else:
+        i += 1
+
+kind = opts.get("kind", "")
+job = opts.get("job", "")
+root = opts.get("inbox-root", "")
+if not kind or not job or not root:
+    sys.exit(0)
+events = os.path.join(root, "jobs", job, "events")
+try:
+    epoch = int(opts.get("epoch") or 1)
+except ValueError:
+    sys.exit(2)
+
+
+def field(rec, key):
+    value = rec.get(key)
+    if isinstance(value, str) and value:
+        return value
+    payload = rec.get("payload")
+    if isinstance(payload, dict):
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value
+    return ""
+
+
+key = (kind, epoch, opts.get("report", ""), opts.get("reason", ""))
+try:
+    names = sorted(os.listdir(events))
+except OSError:
+    names = []
+for name in names:
+    if not name.endswith(".json"):
+        continue
+    try:
+        with open(os.path.join(events, name), "rb") as handle:
+            contents = handle.read()
+        if len(contents) > 16 * 1024:
+            continue
+        rec = json.loads(contents)
+    except (OSError, ValueError):
+        continue
+    rec_kind = rec.get("type") or rec.get("kind") or rec.get("event") or ""
+    if rec_kind == "job.completion":
+        rec_kind = "job.completed"
+    rec_epoch = rec.get("epoch") or 1
+    if (rec_kind, rec_epoch, field(rec, "report_path"), field(rec, "reason")) != key:
+        continue
+    if (kind == "job.escalate" and not opts.get("report")
+            and field(rec, "question") != opts.get("question", "")):
+        continue
+    same = all(
+        field(rec, rec_field) == opts.get(opt, "")
+        for opt, rec_field in (
+            ("owner-lane", "owner_lane"), ("label", "label"), ("host", "host"),
+            ("pane", "pane_id"), ("report", "report_path"),
+            ("report-last-line", "report_last_line"), ("reason", "reason"),
+            ("question", "question"), ("pr", "pr"), ("head", "head")))
+    if same:
+        sys.exit(0)
+    print("emit: duplicate outbox key", file=sys.stderr)
+    sys.exit(6)
+sys.exit(0)
+PY
+  [[ "$emit_rc" -eq 0 ]] || exit "$emit_rc"
+fi
+
 # `panewire lanes` (#965 worker hub-lane registration/reap). The call already
 # landed in WRK_PANEWIRE_LOG above like every other subcommand; the dedicated
 # log and rc let a case observe or fail lane writes without touching the

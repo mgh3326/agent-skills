@@ -6250,9 +6250,11 @@ r20_fail_rc=$?
 set -e
 [[ "$r20_fail_rc" -eq 0 ]]
 [[ -f "$R20_INBOX/r20-fail/events/00003-job.completed.json" ]]
-grep -qxF "OK job=r20-fail report=$R20_REPORT" <<<"$r20_fail_out"
+# #1014: a failed emit is loud twice — the report path in the warning and
+# relay=file-only on the OK line.
+grep -qxF "OK job=r20-fail report=$R20_REPORT relay=file-only" <<<"$r20_fail_out"
 grep -qxF 'wrk: warning: handoffkeep not found; report document not uploaded (job=r20-fail)' "$R20_FAIL_ERR"
-grep -qxF 'wrk: warning: panewire emit failed (rc=3 job=r20-fail kind=job.completed); relay event left as file only' "$R20_FAIL_ERR"
+grep -qxF "wrk: warning: panewire emit failed (rc=3 job=r20-fail kind=job.completed report=$R20_REPORT); relay event left as file only" "$R20_FAIL_ERR"
 [[ "$(wc -l <"$R20_FAIL_ERR" | tr -d ' ')" -eq 2 ]]
 # A19 — same durable-failure trace as TW4, this time for a non-zero rc rather
 # than a missing binary.
@@ -6276,7 +6278,8 @@ echo "r20 wedged-emit: elapsed_ms=$r20_slow_ms rc=$r20_slow_rc"
 [[ "$r20_slow_rc" -eq 0 ]]
 [[ "$r20_slow_ms" -lt 10000 ]]
 [[ -f "$R20_INBOX/r20-slow/events/00003-job.completed.json" ]]
-grep -qxF "OK job=r20-slow report=$R20_REPORT" <<<"$r20_slow_out"
+# #1014: the emit timed out, so the OK line marks the relay file-only.
+grep -qxF "OK job=r20-slow report=$R20_REPORT relay=file-only" <<<"$r20_slow_out"
 grep -q 'panewire emit failed' "$R20_SLOW_ERR"
 echo "PASS r20-wedged-emit-is-bounded-by-the-timeout-guard"
 
@@ -6612,6 +6615,216 @@ set -e
 [[ "$r21_esc_missing_rc" -ne 0 ]]
 [[ ! -s "$R21_ESC_MISSING_HK_LOG" ]]
 echo "PASS r21-escalate-report-optional-and-missing-path-is-fatal"
+
+# ── #1014: a later-round `wrk done` must relay, not collide ─────────────────
+# panewire's emit outbox key is (kind, job, epoch, report_path, reason), and
+# the fixture now refuses a same-key emit for a different record with rc 6
+# exactly like writeEmitRecord. A fix round that updates report.md in place
+# must therefore be relayed under a fresh artifact path: the durable record,
+# the handoffkeep document upload, the emit argv and the OK line all name it.
+# ARBITER_INBOX_ROOT ends in /jobs here so the emit --inbox-root (the parent
+# directory) resolves <root>/jobs/<job>/events to this very events dir — the
+# fixture's duplicate-key scan is then exercised rather than vacuous.
+RND_INBOX="$TMP/rnd-inbox"
+RND_JOBS="$RND_INBOX/jobs"
+mkdir -p "$RND_JOBS"
+rnd_arb() { env ARBITER_INBOX_ROOT="$RND_JOBS" XDG_DATA_HOME="$TMP/xdg-rnd" "$ARBITER" "$@"; }
+rnd_claim() {
+  rnd_arb claim --job "$1" --lane lane-a --agent-label wrk-a --t T1 "${@:2}" >/dev/null
+  rnd_arb event --job "$1" --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+}
+rnd_report() {
+  local path="$RND_JOBS/$1/$2"
+  mkdir -p "$(dirname "$path")"
+  printf '%s\n' "$3" >"$path"
+  printf '%s\n' "$path"
+}
+
+# AC1 — round 2 on the same path: snapshot to report-r2.md and relay under it.
+RND1_JOB="rnd-same-path"
+RND1_HK_LOG="$TMP/rnd1-handoffkeep.log"
+RND1_PW_LOG="$TMP/rnd1-panewire.log"
+rnd_claim "$RND1_JOB"
+rnd1_report="$(rnd_report "$RND1_JOB" report.md 'round one terminal line')"
+env ARBITER_INBOX_ROOT="$RND_JOBS" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_LOG="$RND1_HK_LOG" \
+  WRK_PANEWIRE_LOG="$RND1_PW_LOG" "$WRK" 'done' "$RND1_JOB" --report "$rnd1_report" >/dev/null
+printf 'round two terminal line\n' >"$rnd1_report"
+rnd1_second="$(env ARBITER_INBOX_ROOT="$RND_JOBS" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_LOG="$RND1_HK_LOG" \
+  WRK_PANEWIRE_LOG="$RND1_PW_LOG" "$WRK" 'done' "$RND1_JOB" --report "$rnd1_report")"
+rnd1_snapshot="$RND_JOBS/$RND1_JOB/report-r2.md"
+[[ -f "$rnd1_snapshot" ]] ||
+  fail "a changed report.md on an already-completed path must be snapshot to report-r2.md"
+grep -qxF "OK job=$RND1_JOB report=$rnd1_snapshot" <<<"$rnd1_second" ||
+  fail "the OK line must name the snapshot path: $rnd1_second"
+grep -qxF 'round two terminal line' "$rnd1_report" ||
+  fail "the original report.md must stay untouched"
+grep -qxF 'round two terminal line' "$rnd1_snapshot" ||
+  fail "the snapshot must carry the new report content"
+PYTHONPATH="$TMP" python3 - "$RND1_HK_LOG" "$RND1_PW_LOG" \
+  "$RND_JOBS/$RND1_JOB/events" "$rnd1_report" "$rnd1_snapshot" <<'PY'
+import glob, hashlib, json, pathlib, sys
+import r20_emit as helper
+
+handoff_log, panewire_log, events, report, snapshot = sys.argv[1:]
+uploads = helper.calls(handoff_log)
+assert len(uploads) == 2, uploads
+assert uploads[0][3] == "reports/rnd-same-path/report.md" and uploads[0][-1] == report, uploads[0]
+assert uploads[1][3] == "reports/rnd-same-path/report-r2.md" and uploads[1][-1] == snapshot, uploads[1]
+emits = helper.calls(panewire_log)
+assert len(emits) == 2, emits
+assert helper.flags(emits[0])["--report"] == report, emits[0]
+assert helper.flags(emits[1])["--report"] == snapshot, emits[1]
+records = [json.loads(p.read_text()) for p in sorted(pathlib.Path(events).glob("*job.completed.json"))]
+assert [r["report_path"] for r in records] == [report, snapshot], records
+assert records[1]["report_sha256"] == hashlib.sha256(pathlib.Path(snapshot).read_bytes()).hexdigest()
+assert records[0]["report_sha256"] != records[1]["report_sha256"], records
+helper.assert_matches_record(emits[1], records[1])
+assert records[1]["report_last_line"].endswith(" doc:reports/rnd-same-path/report-r2.md"), records[1]
+PY
+echo "PASS 1014-ac1-later-round-done-relays-under-snapshot-path"
+
+# AC2 — unchanged content on the same path stays a suppressed duplicate: no
+# second record, no second emit, no snapshot file.
+RND2_JOB="rnd-identical"
+RND2_HK_LOG="$TMP/rnd2-handoffkeep.log"
+RND2_PW_LOG="$TMP/rnd2-panewire.log"
+RND2_ERR="$TMP/rnd2.err"
+rnd_claim "$RND2_JOB"
+rnd2_report="$(rnd_report "$RND2_JOB" report.md 'same terminal line')"
+env ARBITER_INBOX_ROOT="$RND_JOBS" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_LOG="$RND2_HK_LOG" \
+  WRK_PANEWIRE_LOG="$RND2_PW_LOG" "$WRK" 'done' "$RND2_JOB" --report "$rnd2_report" >/dev/null
+rnd2_second="$(env ARBITER_INBOX_ROOT="$RND_JOBS" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_LOG="$RND2_HK_LOG" \
+  WRK_PANEWIRE_LOG="$RND2_PW_LOG" "$WRK" 'done' "$RND2_JOB" --report "$rnd2_report" 2>"$RND2_ERR")"
+grep -qxF "OK job=$RND2_JOB report=$rnd2_report" <<<"$rnd2_second" ||
+  fail "a suppressed duplicate still prints the caller's report path: $rnd2_second"
+grep -q 'job.completed already recorded for this report; suppressed duplicate' "$RND2_ERR" ||
+  fail "the duplicate suppression must stay a warning, got: $(cat "$RND2_ERR")"
+grep -q "suppressed-duplicate report=$rnd2_report" "$RND_JOBS/$RND2_JOB/completion-suppressed.log" ||
+  fail "the suppressed duplicate must leave its durable note"
+[[ "$(find "$RND_JOBS/$RND2_JOB/events" -name '*job.completed.json' | wc -l | tr -d ' ')" == 1 ]] ||
+  fail "a suppressed duplicate writes no second job.completed record"
+[[ ! -e "$RND_JOBS/$RND2_JOB/report-r2.md" ]] ||
+  fail "an identical report must not be snapshot"
+PYTHONPATH="$TMP" python3 - "$RND2_HK_LOG" "$RND2_PW_LOG" <<'PY'
+import sys
+import r20_emit as helper
+
+assert len(helper.calls(sys.argv[1])) == 1, helper.calls(sys.argv[1])
+assert len(helper.calls(sys.argv[2])) == 1, helper.calls(sys.argv[2])
+PY
+echo "PASS 1014-ac2-identical-report-still-suppressed"
+
+# AC3 — a caller that already names a fresh path gets no second snapshot: the
+# record, upload and emit use report-r2.md verbatim.
+RND3_JOB="rnd-new-path"
+RND3_HK_LOG="$TMP/rnd3-handoffkeep.log"
+RND3_PW_LOG="$TMP/rnd3-panewire.log"
+rnd_claim "$RND3_JOB"
+rnd3_first="$(rnd_report "$RND3_JOB" report.md 'round one terminal line')"
+env ARBITER_INBOX_ROOT="$RND_JOBS" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_LOG="$RND3_HK_LOG" \
+  WRK_PANEWIRE_LOG="$RND3_PW_LOG" "$WRK" 'done' "$RND3_JOB" --report "$rnd3_first" >/dev/null
+rnd3_report="$(rnd_report "$RND3_JOB" report-r2.md 'explicit round two path')"
+rnd3_out="$(env ARBITER_INBOX_ROOT="$RND_JOBS" HOSTNAME=fixture-host \
+  HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_LOG="$RND3_HK_LOG" \
+  WRK_PANEWIRE_LOG="$RND3_PW_LOG" "$WRK" 'done' "$RND3_JOB" --report "$rnd3_report")"
+grep -qxF "OK job=$RND3_JOB report=$rnd3_report" <<<"$rnd3_out" ||
+  fail "an explicit fresh path must be used verbatim: $rnd3_out"
+[[ ! -e "$RND_JOBS/$RND3_JOB/report-r3.md" ]] ||
+  fail "an explicit new path must not be snapshot again"
+PYTHONPATH="$TMP" python3 - "$RND3_HK_LOG" "$RND3_PW_LOG" \
+  "$RND_JOBS/$RND3_JOB/events" "$rnd3_report" <<'PY'
+import json, pathlib, sys
+import r20_emit as helper
+
+handoff_log, panewire_log, events, report = sys.argv[1:]
+uploads = helper.calls(handoff_log)
+assert len(uploads) == 2, uploads
+assert uploads[1][3] == "reports/rnd-new-path/report-r2.md" and uploads[1][-1] == report, uploads[1]
+emits = helper.calls(panewire_log)
+assert len(emits) == 2, emits
+assert helper.flags(emits[1])["--report"] == report, emits[1]
+records = [json.loads(p.read_text()) for p in sorted(pathlib.Path(events).glob("*job.completed.json"))]
+assert records[-1]["report_path"] == report, records
+helper.assert_matches_record(emits[1], records[-1])
+PY
+echo "PASS 1014-ac3-explicit-new-path-needs-no-snapshot"
+
+# AC4 — the completion sentinel and `wrk done` racing on the same changed
+# report land exactly one record for the round and exactly one snapshot file:
+# the events lock serializes the resolve-and-write decision.
+RND4_JOB="rnd-sentinel-race"
+RND4_PW_LOG="$TMP/rnd4-panewire.log"
+rnd_claim "$RND4_JOB"
+rnd4_report="$(rnd_report "$RND4_JOB" report.md 'round one terminal line')"
+env ARBITER_INBOX_ROOT="$RND_JOBS" HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
+  WRK_PANEWIRE_LOG="$RND4_PW_LOG" "$WRK" 'done' "$RND4_JOB" --report "$rnd4_report" >/dev/null
+# A fix round revives the job — a spawned record newer than the round-1
+# terminal keeps the sentinel watching instead of watch-exiting.
+rnd_arb event --job "$RND4_JOB" --kind job.spawned \
+  --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+printf 'round two terminal line\n' >"$rnd4_report"
+env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$RND_JOBS" \
+  WRK_FIXTURE_SCENARIO=sentinel-done WRK_COMPLETION_TIMEOUT_S=30 \
+  WRK_COMPLETION_INTERVAL_S=1 \
+  "$WRK" sentinel "$RND4_JOB" lane-a wrk-a w1:p1 "$rnd4_report" >/dev/null 2>&1 &
+rnd4_sentinel=$!
+# done lands inside the sentinel's settle window, so both processes reach
+# completion_event on the same changed report.
+sleep 2
+env ARBITER_INBOX_ROOT="$RND_JOBS" HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
+  WRK_PANEWIRE_LOG="$RND4_PW_LOG" "$WRK" 'done' "$RND4_JOB" --report "$rnd4_report" >/dev/null 2>&1
+rnd4_done_rc=$?
+# Whichever side won, both left: done returned above, and the sentinel exits
+# on its own completed write or on the watch-exit check that follows it.
+wait_until 20 bash -c "! kill -0 $rnd4_sentinel 2>/dev/null" ||
+  fail "the sentinel must exit once the raced round completed"
+wait "$rnd4_sentinel" 2>/dev/null || true
+[[ "$rnd4_done_rc" -eq 0 ]] || fail "wrk done during a sentinel race must still exit 0"
+[[ -f "$RND_JOBS/$RND4_JOB/report-r2.md" ]] ||
+  fail "the raced round must have produced exactly the report-r2.md snapshot"
+[[ ! -e "$RND_JOBS/$RND4_JOB/report-r3.md" ]] ||
+  fail "the events lock must prevent a second snapshot of the same round"
+PYTHONPATH="$TMP" python3 - "$RND4_PW_LOG" "$RND_JOBS/$RND4_JOB/events" \
+  "$rnd4_report" "$RND_JOBS/$RND4_JOB/report-r2.md" <<'PY'
+import hashlib, json, pathlib, sys
+import r20_emit as helper
+
+panewire_log, events, report, snapshot = sys.argv[1:]
+records = [json.loads(p.read_text()) for p in sorted(pathlib.Path(events).glob("*job.completed.json"))]
+paths = [r["report_path"] for r in records]
+assert paths == [report, snapshot], paths
+assert records[1]["report_sha256"] == hashlib.sha256(pathlib.Path(snapshot).read_bytes()).hexdigest()
+round_two_emits = [c for c in helper.calls(panewire_log)
+                   if helper.flags(c)["--report"] == snapshot]
+assert len(round_two_emits) <= 1, round_two_emits
+PY
+echo "PASS 1014-ac4-sentinel-done-race-yields-one-record-one-snapshot"
+
+# AC5 — a non-zero emit is loud: stderr names the job, report path and rc, and
+# the OK line carries relay=file-only; the exit status stays what it was.
+RND5_JOB="rnd-loud-failure"
+RND5_ERR="$TMP/rnd5.err"
+rnd_claim "$RND5_JOB"
+rnd5_report="$(rnd_report "$RND5_JOB" report.md 'loud failure line')"
+set +e
+rnd5_out="$(env ARBITER_INBOX_ROOT="$RND_JOBS" WRK_PANEWIRE_RC=6 \
+  HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
+  "$WRK" 'done' "$RND5_JOB" --report "$rnd5_report" 2>"$RND5_ERR")"
+rnd5_rc=$?
+set -e
+[[ "$rnd5_rc" -eq 0 ]] ||
+  fail "a failed emit must not change the done exit status, got $rnd5_rc"
+grep -qxF "OK job=$RND5_JOB report=$rnd5_report relay=file-only" <<<"$rnd5_out" ||
+  fail "a failed emit must mark the OK line relay=file-only: $rnd5_out"
+grep -qxF "wrk: warning: panewire emit failed (rc=6 job=$RND5_JOB kind=job.completed report=$rnd5_report); relay event left as file only" "$RND5_ERR" ||
+  fail "a failed emit must name job, report path and rc on stderr: $(cat "$RND5_ERR")"
+echo "PASS 1014-ac5-failed-emit-is-loud-and-exit-status-unchanged"
 
 # R18 completion sentinel: a report alone is never completion evidence. A
 # worker still working must time out/lost rather than emit job.completed.
