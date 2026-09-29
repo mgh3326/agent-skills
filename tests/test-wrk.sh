@@ -635,7 +635,7 @@ assert got[:2] == ["add", "lane-prec"], "sentinel session must win: %r" % got
 assert got[2:4] == ["--machine", "mac-work-default"], got
 PY
     fail "#965: WRK_SENTINEL_HERDR_SESSION must win over HERDR_SESSION"
-  HERDR_SESSION= WRK_SENTINEL_HERDR_SESSION= lanes_spawn lane-def --owner work-kairos
+  HERDR_SESSION='' WRK_SENTINEL_HERDR_SESSION='' lanes_spawn lane-def --owner work-kairos
   [[ "$LANES_RC" -eq 0 ]] || fail "#965: default-session spawn failed"
   python3 - "$LANES_CALLS" <<'PY' ||
 import sys
@@ -776,6 +776,7 @@ PY
   # Each mutant kills one invariant; each run must produce the bad outcome the
   # matching assertion above rejects, proving the assertion is live.
   # M1: "a mapped session registers exactly one lane" — skip registration.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-skip \
     '  [[ "$ROLE" == worker ]] || return 0' \
     '  return 0'
@@ -789,6 +790,7 @@ PY
   echo "PASS 965-lanes M1: skipping registration goes RED"
 
   # M2: "registration failure never fails the spawn" — exit on lanes add rc!=0.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-fatal \
     '    warn "hub lane not registered (panewire lanes add exited $rc)"' \
     '    warn "hub lane not registered (panewire lanes add exited $rc)"; exit "$rc"'
@@ -799,6 +801,7 @@ PY
   echo "PASS 965-lanes M2: failing the spawn on a lane refusal goes RED"
 
   # M3: "reap removes only the lane it registered" — rm for every closed job.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-rmall \
     '        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane"' \
     '        hub_lane_remove "$job"'
