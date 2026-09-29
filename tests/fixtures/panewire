@@ -165,6 +165,11 @@ fi
 #
 #   WRK_PANEWIRE_LANES_LOG   append one argv element per line, then `--`
 #   WRK_PANEWIRE_LANES_RC    exit code for lanes calls (default WRK_PANEWIRE_RC, else 0)
+#   WRK_PANEWIRE_LANES_LS    stdout of `lanes ls` (#994): the JSON envelope the
+#                            real CLI prints; default `{"lanes":[]}`
+#   WRK_PANEWIRE_LANES_LS_RC exit code for `lanes ls` only (default 0) — a
+#                            failed read must never fall back to LANES_RC,
+#                            which belongs to the add/rm write a case fails.
 if [[ "${1:-}" == lanes ]]; then
   shift
   if [[ -n "${WRK_PANEWIRE_LANES_LOG:-}" ]]; then
@@ -172,6 +177,11 @@ if [[ "${1:-}" == lanes ]]; then
       for argument in "$@"; do printf '%s\n' "$argument"; done
       printf -- '--\n'
     } >>"$WRK_PANEWIRE_LANES_LOG"
+  fi
+  if [[ "${1:-}" == ls ]]; then
+    [[ -z "${WRK_PANEWIRE_LANES_LS_RC:-}" ]] || exit "$WRK_PANEWIRE_LANES_LS_RC"
+    printf '%s\n' "${WRK_PANEWIRE_LANES_LS:-\{\"lanes\":[]\}}"
+    exit 0
   fi
   exit "${WRK_PANEWIRE_LANES_RC:-${WRK_PANEWIRE_RC:-0}}"
 fi
