@@ -262,6 +262,19 @@ line then ends with via=herdr-fallback.
                      --operator-request REF format gate above.
   -h, --help         show this usage
 
+Hub lane registration (#965): a --role worker spawn whose effective herdr
+session (WRK_SENTINEL_HERDR_SESSION, else HERDR_SESSION, else the herdr
+default) has an entry in hosts.toml's [hub] session_machine_ids registers a
+lane for the pane on that session's daemon —
+`panewire lanes add LABEL --machine ID --pane PANE --parent OWNER` with the
+[hub] hub_url/hub_token_env/hub_cf_env credentials (paths only; wrk never
+reads them). The OK line then ends with lane=LABEL@ID and the job.spawned
+meta records hub_lane/hub_lane_machine; `wrk reap --apply` removes the lane
+with `panewire lanes rm`. An unmapped session or a missing --owner warns once
+and spawns unregistered — as does a panewire failure; the spawn never fails
+over it and builder lanes are never touched (they stay the director's).
+`panewire lanes-audit` lists any leftover rows.
+
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
 the job and records its quota-pool execution in arbiter. arbiter resolves the
 pool from scopefuel's own output — wrk holds no pool mapping. A quota-pool
@@ -2276,9 +2289,9 @@ arbiter_record_spawn_receipt() {
   # absence explicitly for downstream recovery rather than pretending success.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc
-  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" "${TASK_ID:-}" <<'PY'
+  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" "${TASK_ID:-}" "${HUB_LANE:-}" "${HUB_LANE_MACHINE:-}" <<'PY'
 import json, sys
-pane_id, label, profile, workspace, tab_id, keep, task_id = sys.argv[1:]
+pane_id, label, profile, workspace, tab_id, keep, task_id, hub_lane, hub_lane_machine = sys.argv[1:]
 receipt = {
     "pane_id": pane_id,
     "label": label,
@@ -2296,6 +2309,11 @@ if task_id:
 # Keep this heredoc free of quote characters: bash 3.2 misparses them in a command substitution.
 if keep == "1":
     receipt["keep"] = True
+# #965: the hub lane this spawn registered. wrk reap removes exactly this lane
+# — a spawn without one keeps the receipt byte-identical to before.
+if hub_lane:
+    receipt["hub_lane"] = hub_lane
+    receipt["hub_lane_machine"] = hub_lane_machine
 print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
 PY
 )"; then
@@ -5106,6 +5124,117 @@ spillover_host_via() {
   esac
 }
 
+# [hub] session_machine_ids names the hub machine id of the panewire daemon
+# serving each herdr session on this host (#965: a host can run a second
+# daemon for a non-fleet session, and only that daemon may carry the session's
+# lane rows). The value is a one-line inline table, read with the same
+# quoted-pair matcher as cwd_map — still no TOML library.
+hub_session_machine_id() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+session, raw = sys.argv[1:]
+def unq(s):
+    return s.replace(r'\"', '"').replace(r'\\', '\\')
+for key, value in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw):
+    if unq(key) == session:
+        print(unq(value))
+        break
+PY
+}
+
+# #965: a worker/tester spawned into a herdr session served by its own
+# panewire daemon needs a hub lane row on that daemon's machine id — without
+# one the daemon suppresses the pane's idle-wakes as parentless_lane /
+# unknown_owner (2026-09-29: a default-session worker had no lane and its
+# builder stalled until the desk relayed by hand). The session→machine map is
+# hosts.toml's [hub] session_machine_ids; the effective session is
+# WRK_SENTINEL_HERDR_SESSION, else HERDR_SESSION, else the herdr default.
+# Runs only once the pane is provably up, and before the spawn receipt so
+# hub_lane/hub_lane_machine land in the same job meta as task_id/keep.
+# Best-effort at every step: an unmapped session, a missing --owner, absent
+# hub credentials or a panewire refusal warn once and leave the spawn
+# standing — a missing lane is the pre-#965 behavior, not a new failure, so
+# this never fails the spawn and never retries silently. Builder spawns never
+# reach here: a builder's lane stays the director's. Sets HUB_LANE and
+# HUB_LANE_MACHINE for the receipt payload and the OK line.
+hub_lane_register() {
+  HUB_LANE="" HUB_LANE_MACHINE=""
+  [[ "$ROLE" == worker ]] || return 0
+  local session raw machine panewire hub_url token_env cf_env rc=0
+  local args=()
+  session="${WRK_SENTINEL_HERDR_SESSION:-${HERDR_SESSION:-default}}"
+  raw="$(spillover_value hub session_machine_ids 2>/dev/null || true)"
+  # No map at all means this installation has not opted in; stay silent like
+  # the hub quota gate does on absent hub keys.
+  [[ -n "$raw" ]] || return 0
+  machine="$(hub_session_machine_id "$session" "$raw" 2>/dev/null || true)"
+  if [[ -z "$machine" ]]; then
+    warn "hub lane not registered (herdr session '$session' has no session_machine_ids entry)"
+    return 0
+  fi
+  if [[ -z "$OWNER" ]]; then
+    warn "hub lane not registered (--owner is unset; the spawning builder's lane is required as parent)"
+    return 0
+  fi
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  if [[ -z "$hub_url" || -z "$token_env" ]]; then
+    warn "hub lane not registered (hub_url/hub_token_env missing from hosts.toml [hub])"
+    return 0
+  fi
+  panewire="${PANEWIRE_BIN:-panewire}"
+  if [[ "$panewire" == */* ]]; then
+    [[ -x "$panewire" ]] || {
+      warn "hub lane not registered (panewire unavailable: $panewire)"
+      return 0
+    }
+  elif ! command -v "$panewire" >/dev/null 2>&1; then
+    warn "hub lane not registered (panewire unavailable)"
+    return 0
+  fi
+  # The token env values go to panewire as FILE PATHS; wrk never opens them.
+  args=(lanes add "$LABEL" --machine "$machine" --pane "$PANE" --parent "$OWNER"
+        --hub-url "$hub_url" --hub-token-env "$token_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  set +e
+  "$panewire" "${args[@]}" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    warn "hub lane not registered (panewire lanes add exited $rc)"
+    return 0
+  fi
+  HUB_LANE="$LABEL" HUB_LANE_MACHINE="$machine"
+}
+
+# The reverse of hub_lane_register for `wrk reap --apply`: remove exactly the
+# lane the job's newest job.spawned receipt recorded — never a guess, never a
+# sweep. A removal failure warns and the close still stands; `panewire
+# lanes-audit` is where leftovers surface.
+hub_lane_remove() {
+  local lane="$1" panewire hub_url token_env cf_env rc=0
+  local args=()
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  if [[ -z "$hub_url" || -z "$token_env" ]]; then
+    warn "hub lane '$lane' not removed (hub_url/hub_token_env missing from hosts.toml [hub])"
+    return 0
+  fi
+  panewire="${PANEWIRE_BIN:-panewire}"
+  args=(lanes rm "$lane" --hub-url "$hub_url" --hub-token-env "$token_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  set +e
+  "$panewire" "${args[@]}" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    warn "hub lane '$lane' not removed (panewire lanes rm exited $rc)"
+    return 0
+  fi
+}
+
 # Read precisely one shell-style assignment without sourcing an env file.  The
 # host configuration points at operator-managed files, so neither arbitrary
 # expansion nor their contents may reach this process's logs.
@@ -6649,6 +6778,11 @@ print(value if isinstance(value, str) else "")
   # SPAWN_PANE_OPEN is still armed: the EXIT trap closes the pane and releases
   # the quota record — no job without its task link.
   hk_task_link
+  # #965: with the pane provably up and the spawn committed to its OK line,
+  # register the worker's hub lane on the daemon serving this herdr session —
+  # before the spawn receipt so hub_lane/hub_lane_machine land in the same job
+  # meta as task_id/keep. Warn-only inside: never fails the spawn.
+  hub_lane_register
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   arbiter_record_spawn_receipt
   # A sentinel requires the durable claim/spawn metadata it later reads. During
@@ -6673,6 +6807,7 @@ print(value if isinstance(value, str) else "")
   fi
   # Appended, never inserted: OK-line parsers read key=value pairs.
   [[ "$SPAWN_VIA" != herdr-fallback ]] || OK_LINE="$OK_LINE via=herdr-fallback"
+  [[ -z "${HUB_LANE:-}" ]] || OK_LINE="$OK_LINE lane=$HUB_LANE@$HUB_LANE_MACHINE"
   echo "$OK_LINE"
   if [[ "$LANDING" == no ]]; then
     # Grok's echo can arrive 1-2 minutes after injection — past even its
@@ -6729,6 +6864,12 @@ Options:
 
 The default is a dry run: nothing is closed and no event is written. Each
 closed job records a flat job.reaped event (pane_id, tab_id, at).
+
+A job whose newest job.spawned receipt records a hub lane (hub_lane; spawned
+under a session mapped in hosts.toml's [hub] session_machine_ids, #965) is
+additionally deregistered on --apply: `panewire lanes rm LANE` with the [hub]
+credentials runs once the tab close is confirmed. A removal failure warns and
+the close still stands; `panewire lanes-audit` lists any leftover rows.
 USAGE
 }
 
@@ -6796,7 +6937,7 @@ for job in jobs:
     if not os.path.isdir(events_dir):
         continue
     owner = pane = tab = role = ""
-    spawned_pane = spawned_tab = ""
+    spawned_pane = spawned_tab = spawned_hub_lane = ""
     saw_spawn = False
     terminal_at = None
     revived = False
@@ -6843,6 +6984,9 @@ for job in jobs:
             saw_spawn = True
             spawned_pane = payload.get("pane_id") if isinstance(payload.get("pane_id"), str) else ""
             spawned_tab = payload.get("tab_id") if isinstance(payload.get("tab_id"), str) else ""
+            # #965: the hub lane travels in the same one receipt as pane/tab —
+            # a lane an older spawn registered is not this pane's to remove.
+            spawned_hub_lane = payload.get("hub_lane") if isinstance(payload.get("hub_lane"), str) else ""
         if kind == "job.reaped":
             reaped = True
         # 보호 표시(`wrk spawn --keep`, #603)는 누적이다: claim·reclaim·spawn 영수증 중
@@ -6893,7 +7037,11 @@ for job in jobs:
     if malformed_receipt or any(any(c.isspace() for c in value) for value in (job, owner, pane, tab)):
         print(job.split()[0] if job.split() else job, "-", "-", "-", age, "-", sep="\t")
         continue
-    print(job, owner or "-", pane, tab or "-", age, "-", sep="\t")
+    # #965: a lane id carrying whitespace is corrupt evidence — never an rm
+    # target. The pane itself still closes; the row is left for lanes-audit.
+    if any(c.isspace() for c in spawned_hub_lane):
+        spawned_hub_lane = ""
+    print(job, owner or "-", pane, tab or "-", age, "-", spawned_hub_lane or "-", sep="\t")
 PY
 }
 
@@ -6995,8 +7143,8 @@ reap_cmd() {
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
   candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
-  local job owner pane tab age note probe class token probe_tab verdict acted=0
-  while IFS=$'\t' read -r job owner pane tab age note; do
+  local job owner pane tab age note hub_lane probe class token probe_tab verdict acted=0
+  while IFS=$'\t' read -r job owner pane tab age note hub_lane; do
     [[ -n "$job" ]] || continue
     if [[ -n "$note" && "$note" != - ]]; then
       echo "skip job=$job reason=$note"
@@ -7005,6 +7153,7 @@ reap_cmd() {
     # 자리표시자를 되돌린다(위 reap_candidates 주석 참고).
     [[ "$owner" != - ]] || owner=""
     [[ "$tab" != - ]] || tab=""
+    [[ "$hub_lane" != - ]] || hub_lane=""
     if [[ "$pane" == - ]]; then
       echo "skip job=$job reason=malformed-record"
       continue
@@ -7054,6 +7203,10 @@ reap_cmd() {
         # work terminal but not one the hub ends on), release quota, and stop
         # + wait on the completion sentinel before moving on.
         job_end_housekeeping "$job" "$owner" abandoned "pane reaped" "wrk reap"
+        # #965: the lane this pane's spawn registered goes with it — only the
+        # recorded lane, only on a confirmed close. Failure warns; the pane
+        # stays closed and lanes-audit lists what is left behind.
+        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane"
         echo "closed job=$job pane=$pane tab=$tab status=$token age=${age}s"
         acted=$(( acted + 1 ))
       else

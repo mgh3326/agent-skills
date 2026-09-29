@@ -70,7 +70,7 @@ mutation 등)의 구체 사례에서 규칙을 뽑아 도메인 무관 형태로
 | 도구 | 용도 |
 |---|---|
 | `rob-lookup` | Linear 이슈 통합 조회 — `ROB-NNN`(active+soft-archived Linear API+Obsidian 아카이브 섹션) · `--search <키워드>`(아카이브 전문 검색 — **삭제분 내용 검색의 유일 경로**) · `--count`(쿼타 미터, 상한 275). 실측: 30일+ 경과 삭제분은 Linear에서 purge됨(ROB-383) — Obsidian이 유일 소스 |
-| `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부) · `reap`(끝난 pane 회수, 기본 dry-run) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정) · `heavy`(>1분 로컬 실행의 호스트 직렬화 락, `-- <cmd>`·`status`). `wrk --help` 로 전체 확인 |
+| `wrk` | 세션 오케스트레이션 CLI. `spawn`(worktree+탭+기동+주입 원샷, `-m` 필수·모르는 인자 거부; #965 — hosts.toml `[hub] session_machine_ids`에 매핑된 세션의 worker 스폰은 `panewire lanes add`로 허브 레인을 등록하고 OK 줄에 `lane=`을 단다) · `reap`(끝난 pane 회수, 기본 dry-run; `--apply`는 등록된 허브 레인도 `panewire lanes rm`으로 거둔다 — 잔여분은 `panewire lanes-audit`이 나열) · `find`(이름→라벨 폴백+화면 미리보기) · `name-sync`(탭 라벨→agent 이름 동기화, 무인자=미리보기·`--apply`=전체·`<라벨>`=지정) · `heavy`(>1분 로컬 실행의 호스트 직렬화 락, `-- <cmd>`·`status`). `wrk --help` 로 전체 확인 |
 | `arbiter` | 작업 조정(admission control) — `claim`(job 등록·중복 거부) · `lease`/`release`(path·linear_permit의 fencing lease + quota_pool의 비배타 실행 기록) · `status`(읽기 전용) · `gc`(배타 lease 만료 전이 + 설치된 `herdr agent list`와 대조해 stale 기록 정리; JSON 경로 fixture도 지원) · `event`(인박스 제출). 저장소는 `$XDG_DATA_HOME/arbiter/state.db`(scopefuel DB와 분리). 전 명령 `--json`. **fail-closed** — 우회 플래그 없음 |
 | `fleet-rev` | 5호스트 설치 버전 점검(**읽기 전용**) — 호스트별 scopefuel·agent-skills·panewire·handoffkeep의 설치 커밋을 GitHub main과 대조해 current/behind/diverged를 표로 출력. 호스트당 ssh 1회 + 고정 POSIX sh probe(key=value만 출력); 설치·재시작·쓰기 명령 없음. `--extra NAME=ALIAS` · `--skip NAME` · `--only NAME[,NAME]` · `--timeout` · `--json` |
 
