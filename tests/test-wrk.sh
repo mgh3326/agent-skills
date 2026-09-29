@@ -137,7 +137,7 @@ try:
     state = json.load(open(path, encoding="utf-8"))
 except (OSError, ValueError):
     state = {"tasks": {}}
-for i in range(768001, 768500):
+for i in range(768001, 768800):
     state["tasks"][str(i)] = {
         "id": i, "lane": "", "title": "spawn-base pool", "kind": "implement",
         "state": "backlog", "priority": 0, "refs": {}, "claimed_by": "",
@@ -571,7 +571,7 @@ lanes_spawn() {
   LANES_INBOX="$TMP/lanes-inbox-$name"
   set +e
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
-    ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$LANES_INBOX" \
+    ARBITER_BIN="${LANES_ARBITER_BIN:-$ARBITER}" ARBITER_INBOX_ROOT="$LANES_INBOX" \
     XDG_DATA_HOME="$TMP/lanes-xdg-$name" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
     WRK_FIXTURE_LOG="$LANES_HERDR_LOG" \
@@ -626,12 +626,14 @@ lanes_reap_run() {
 }
 
 lanes_reap_job() {
-  # JOB PANE TAB LANE HUB_LANE — claim + job.spawned (+hub_lane when nonempty)
-  # + job.completed, all backdated past the default grace.
-  local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5"
-  local spawned="{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}"
+  # JOB PANE TAB LANE HUB_LANE [LABEL [MACHINE]] — claim + job.spawned
+  # (+hub_lane/hub_lane_machine when nonempty) + job.completed, all backdated
+  # past the default grace. LABEL defaults to JOB (#994 needs lane != job !=
+  # label so a remove-by-job-id regression cannot pass silently).
+  local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5" label="${6:-$1}" machine="${7:-mac-work-default}"
+  local spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}"
   if [[ -n "$hub_lane" ]]; then
-    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"mac-work-default\"}"
+    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"$machine\"}"
   fi
   export ARBITER_TEST_NOW="$LANES_REAP_NOW"
   env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" claim \
@@ -796,7 +798,11 @@ PY
     fail "#965 AC6: the lane job must still be a dry-run candidate"
   echo "PASS 965-lanes AC6a: dry run registers no removal"
 
-  lanes_reap_run apply --lane lane-965 --apply
+  # #994: rm now fires only after `lanes ls` confirms the row still belongs
+  # to the recorded machine+pane — the apply case answers it with the
+  # recorded route.
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lanes-reap-ok","machine":"mac-work-default","pane":"w1:p5","parent":"lane-965","sink":false}]}' \
+    lanes_reap_run apply --lane lane-965 --apply
   [[ "$LANES_REAP_RC" -eq 0 ]] || fail "#965 AC6: apply failed: $(cat "$LANES_REAP_ERR")"
   python3 - "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_CF_FILE" <<'PY' ||
 import sys
@@ -804,20 +810,25 @@ log, token_file, cf_file = sys.argv[1:]
 try:
     got = open(log, encoding="utf-8").read().splitlines()
 except OSError:
-    raise SystemExit("no lanes rm call recorded")
-want = ["rm", "lanes-reap-ok", "--hub-url", "https://hub.invalid",
-        "--hub-token-env", token_file, "--hub-cf-env", cf_file, "--"]
-assert got == want, "lanes rm argv mismatch: got=%r want=%r" % (got, want)
+    raise SystemExit("no lanes call recorded")
+creds = ["--hub-url", "https://hub.invalid",
+         "--hub-token-env", token_file, "--hub-cf-env", cf_file]
+want = (["ls"] + creds + ["--"]
+        + ["rm", "lanes-reap-ok"] + creds + ["--"])
+assert got == want, "lanes ls+rm argv mismatch: got=%r want=%r" % (got, want)
 PY
-    fail "#965 AC6: reap must call lanes rm exactly once, with the recorded lane and identical credentials"
+    fail "#965 AC6: reap must confirm the row with lanes ls, then rm exactly once, with the recorded lane and identical credentials"
   grep -q '^closed job=lanes-reap-ok ' "$LANES_REAP_OUT" ||
     fail "#965 AC6: the lane job must close: $(cat "$LANES_REAP_OUT")"
   grep -q '^closed job=lanes-reap-plain ' "$LANES_REAP_OUT" ||
     fail "#965 AC6: the lane-less job must still close: $(cat "$LANES_REAP_OUT")"
   echo "PASS 965-lanes AC6b: apply removes only the recorded lane"
 
-  # A removal failure warns; the confirmed close still stands.
-  WRK_PANEWIRE_LANES_RC=5 lanes_reap_run rmfail --lane lane-965-f --apply
+  # A removal failure warns; the confirmed close still stands. `lanes ls`
+  # confirms the row first, so LANES_RC still reaches the rm call (#994).
+  WRK_PANEWIRE_LANES_RC=5 \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lanes-reap-fail","machine":"mac-work-default","pane":"w1:p7","parent":"lane-965-f","sink":false}]}' \
+    lanes_reap_run rmfail --lane lane-965-f --apply
   [[ "$LANES_REAP_RC" -eq 0 ]] || fail "#965: reap apply must survive an rm failure"
   grep -q "wrk: warning: hub lane 'lanes-reap-fail' not removed" "$LANES_REAP_ERR" ||
     fail "#965: an rm failure must warn: $(cat "$LANES_REAP_ERR")"
@@ -854,15 +865,240 @@ PY
   echo "PASS 965-lanes M2: failing the spawn on a lane refusal goes RED"
 
   # M3: "reap removes only the lane it registered" — rm for every closed job.
+  # The mutant removes by job id and carries no expected machine/pane, so the
+  # #994 `lanes ls` check must see rows that match empty wants (sink-shaped
+  # rows) for the sweep to be observable at all.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-rmall \
-    '        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane"' \
+    '        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane" "$hub_lane_machine" "$pane"' \
     '        hub_lane_remove "$job"'
-  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-rmall" lanes_reap_run rmall --lane lane-965-m3 --apply
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-rmall" \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lanes-m3-ok","machine":"","pane":"","parent":"","sink":true},{"lane":"lanes-m3-plain","machine":"","pane":"","parent":"","sink":true}]}' \
+    lanes_reap_run rmall --lane lane-965-m3 --apply
   if ! grep -q 'lanes-m3-plain' "$LANES_RM_LOG" 2>/dev/null; then
     fail "#965 M3 mutant survived: the lane-less job was not swept"
   fi
   echo "PASS 965-lanes M3: removing every job lane goes RED"
+
+  # ------------------------------------------------------------------
+  # #994 — no unreapable rows, safe removal, clearer docs
+  # ------------------------------------------------------------------
+  # AC1 — the arbiter is absent (no job record, ARBITER_JOB_REGISTERED=0) on
+  # a mapped session with --owner: zero lanes calls, one warning naming the
+  # missing job record, spawn still rc 0. A lane registered here could never
+  # be reaped, so registration must not happen.
+  LANES_ARBITER_BIN="$TMP/absent-arbiter" HERDR_SESSION=default \
+    lanes_spawn lane-994-ac1 --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#994 AC1: arbiter-less spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call lane-994-ac1
+  [[ "$(grep -c 'wrk: warning: hub lane not registered' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#994 AC1: exactly one lane warning expected: $(cat "$LANES_ERR")"
+  grep -q 'arbiter job record' "$LANES_ERR" ||
+    fail "#994 AC1: the warning must name the missing job record: $(cat "$LANES_ERR")"
+  ! grep -q ' lane=' "$LANES_OUT" ||
+    fail "#994 AC1: an unregistered lane must not reach the OK line"
+  echo "PASS 994-lanes AC1: no job record, no lane"
+
+  # AC2 — the job.spawned receipt write fails after the lane was registered:
+  # one compensating `lanes rm` for that lane with the same credentials (a
+  # `lanes ls` confirmation precedes it), one warning narrates the
+  # deregistration, the spawn still exits 0.
+  LANES_ARB_FAIL="$TMP/arbiter-fail-spawned"
+# shellcheck disable=SC2016 # the printf template is wrapper source, not an expansion site
+  printf '#!/usr/bin/env bash\nif [[ "$1" == event && " $* " == *" job.spawned "* ]]; then exit 3; fi\nexec "%s" "$@"\n' \
+    "$ARBITER" >"$LANES_ARB_FAIL"
+  chmod +x "$LANES_ARB_FAIL"
+  LANES_ARBITER_BIN="$LANES_ARB_FAIL" HERDR_SESSION=default \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-994-ac2","machine":"mac-work-default","pane":"w:p1","parent":"work-kairos","sink":false}]}' \
+    lanes_spawn lane-994-ac2 --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#994 AC2: a failed receipt must not fail the spawn (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_CALLS" "$LANES_TOKEN_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+log, token_file, cf_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+creds = ["--hub-url", "https://hub.invalid",
+         "--hub-token-env", token_file, "--hub-cf-env", cf_file]
+want = (["add", "lane-994-ac2", "--machine", "mac-work-default", "--pane", "w:p1",
+         "--parent", "work-kairos"] + creds + ["--"]
+        + ["ls"] + creds + ["--"]
+        + ["rm", "lane-994-ac2"] + creds + ["--"])
+assert got == want, "compensation argv mismatch: got=%r want=%r" % (got, want)
+PY
+    fail "#994 AC2: exactly one lanes rm for the registered lane, with the same credentials"
+  [[ "$(grep -c 'job.spawned receipt failed' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#994 AC2: the receipt failure must warn once: $(cat "$LANES_ERR")"
+  [[ "$(grep -c 'deregistering it' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#994 AC2: one deregistration warning expected: $(cat "$LANES_ERR")"
+  ! grep -q ' lane=' "$LANES_OUT" ||
+    fail "#994 AC2: an unrecorded lane must not reach the OK line"
+  echo "PASS 994-lanes AC2: a lost spawn receipt deregisters the lane"
+
+  # AC3 — lane != job id != label (#965's fixture reused the job id as the
+  # lane, which let a remove-by-job-id regression pass): `lanes rm` must
+  # carry the recorded lane value and nothing else.
+  lanes_reap_job j994-distinct w1:p11 w1:t11 own-994-d lane-994-distinct lbl-994-d
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-994-distinct","machine":"mac-work-default","pane":"w1:p11","parent":"x","sink":false}]}' \
+    lanes_reap_run ac3 --lane own-994-d --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#994 AC3: apply failed: $(cat "$LANES_REAP_ERR")"
+  python3 - "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+log, token_file, cf_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+creds = ["--hub-url", "https://hub.invalid",
+         "--hub-token-env", token_file, "--hub-cf-env", cf_file]
+want = (["ls"] + creds + ["--"]
+        + ["rm", "lane-994-distinct"] + creds + ["--"])
+assert got == want, "reap argv mismatch: got=%r want=%r" % (got, want)
+for stray in ("j994-distinct", "lbl-994-d", "own-994-d"):
+    assert stray not in got, "job/label/owner must never be an rm operand: %r" % stray
+PY
+    fail "#994 AC3: lanes rm must carry the recorded lane only"
+  grep -q '^closed job=j994-distinct ' "$LANES_REAP_OUT" ||
+    fail "#994 AC3: the job must close: $(cat "$LANES_REAP_OUT")"
+  echo "PASS 994-lanes AC3: rm carries the recorded lane, never job/label"
+
+  # AC4 — a flag-shaped (or otherwise invalid) lane value in the receipt
+  # never reaches panewire argv: the name check fires before any lanes call,
+  # one warning is logged and the pane still closes.
+  lanes_reap_job j994-flag w1:p12 w1:t12 own-994-f --hub-url=x lbl-994-f
+  lanes_reap_run ac4 --lane own-994-f --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#994 AC4: apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j994-flag ' "$LANES_REAP_OUT" ||
+    fail "#994 AC4: the pane must still close: $(cat "$LANES_REAP_OUT")"
+  if [[ -f "$LANES_RM_LOG" ]]; then
+    ! grep -qxF -- '--hub-url=x' "$LANES_RM_LOG" ||
+      fail "#994 AC4: the flag-shaped lane reached panewire argv: $(cat "$LANES_RM_LOG")"
+    ! grep -qxF 'rm' "$LANES_RM_LOG" ||
+      fail "#994 AC4: no lanes rm may run for an invalid lane: $(cat "$LANES_RM_LOG")"
+  fi
+  [[ "$(grep -c "hub lane '--hub-url=x' not removed" "$LANES_REAP_ERR")" -eq 1 ]] ||
+    fail "#994 AC4: one invalid-name warning expected: $(cat "$LANES_REAP_ERR")"
+  echo "PASS 994-lanes AC4: an invalid lane name never reaches panewire"
+
+  # AC5 — `lanes ls` decides removal: a row moved to another pane is never
+  # removed (a reused label must not lose the newer job's live row), a
+  # matching machine+pane row is removed exactly once, and a failed listing
+  # removes nothing (never remove blind).
+  lanes_reap_job j994-moved w1:p13 w1:t13 own-994-m lane-994-moved lbl-994-m
+  lanes_reap_job j994-match w1:p14 w1:t14 own-994-t lane-994-match lbl-994-t
+  lanes_reap_job j994-lsfail w1:p15 w1:t15 own-994-l lane-994-lsfail lbl-994-l
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-994-moved","machine":"mac-work-default","pane":"w1:p99","parent":"x","sink":false}]}' \
+    lanes_reap_run ac5a --lane own-994-m --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] || fail "#994 AC5: apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j994-moved ' "$LANES_REAP_OUT" ||
+    fail "#994 AC5: the pane must still close: $(cat "$LANES_REAP_OUT")"
+  if [[ -f "$LANES_RM_LOG" ]]; then
+    ! grep -qxF 'rm' "$LANES_RM_LOG" ||
+      fail "#994 AC5: a moved row must not be removed: $(cat "$LANES_RM_LOG")"
+  fi
+  [[ "$(grep -c "lane now belongs to" "$LANES_REAP_ERR")" -eq 1 ]] ||
+    fail "#994 AC5: one belongs-to-another-pane warning expected: $(cat "$LANES_REAP_ERR")"
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-994-match","machine":"mac-work-default","pane":"w1:p14","parent":"x","sink":false}]}' \
+    lanes_reap_run ac5b --lane own-994-t --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] || fail "#994 AC5: apply failed: $(cat "$LANES_REAP_ERR")"
+  [[ "$(grep -cxF 'rm' "$LANES_RM_LOG")" -eq 1 &&
+     "$(awk 'f{print; exit} /^rm$/{f=1}' "$LANES_RM_LOG")" == "lane-994-match" ]] ||
+    fail "#994 AC5: exactly one lanes rm for the matching lane: $(cat "$LANES_RM_LOG")"
+  WRK_PANEWIRE_LANES_LS_RC=7 lanes_reap_run ac5c --lane own-994-l --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] || fail "#994 AC5: an ls failure must not fail the reap"
+  grep -q '^closed job=j994-lsfail ' "$LANES_REAP_OUT" ||
+    fail "#994 AC5: the pane must still close after an ls failure"
+  if [[ -f "$LANES_RM_LOG" ]]; then
+    ! grep -qxF 'rm' "$LANES_RM_LOG" ||
+      fail "#994 AC5: a failed listing must never remove: $(cat "$LANES_RM_LOG")"
+  fi
+  [[ "$(grep -c "lanes ls exited 7" "$LANES_REAP_ERR")" -eq 1 ]] ||
+    fail "#994 AC5: one ls-failure warning expected: $(cat "$LANES_REAP_ERR")"
+  echo "PASS 994-lanes AC5: ls-confirmed removal only (moved/match/ls-fail)"
+
+  # AC6 — a session_machine_ids value the one-line matcher cannot read warns
+  # that the map could not be parsed; a parsed map without the session keeps
+  # the old "no entry" wording (#965 AC2 above still asserts it).
+  printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\n%s\n' \
+    "$LANES_TOKEN_FILE" "session_machine_ids = { 'default' = 'mac-work-default' }" \
+    >"$TMP/lanes-bad-squot.toml"
+  printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nsession_machine_ids = {\n  "default" = "mac-work-default"\n}\n' \
+    "$LANES_TOKEN_FILE" >"$TMP/lanes-bad-multiline.toml"
+  LANES_CFG_OVERRIDE="$TMP/lanes-bad-squot.toml" HERDR_SESSION=default \
+    lanes_spawn lane-994-squot --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] || fail "#994 AC6: spawn failed on a bad map (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call lane-994-squot
+  grep -q 'session_machine_ids value could not be parsed' "$LANES_ERR" ||
+    fail "#994 AC6: single-quoted keys must warn could-not-be-parsed: $(cat "$LANES_ERR")"
+  ! grep -q 'has no session_machine_ids entry' "$LANES_ERR" ||
+    fail "#994 AC6: a bad map must not read as a missing entry: $(cat "$LANES_ERR")"
+  LANES_CFG_OVERRIDE="$TMP/lanes-bad-multiline.toml" HERDR_SESSION=default \
+    lanes_spawn lane-994-multi --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] || fail "#994 AC6: spawn failed on a multi-line map (rc=$LANES_RC)"
+  grep -q 'session_machine_ids value could not be parsed' "$LANES_ERR" ||
+    fail "#994 AC6: a multi-line table must warn could-not-be-parsed: $(cat "$LANES_ERR")"
+  echo "PASS 994-lanes AC6: unparseable map warns could-not-be-parsed"
+
+  # AC7 — the non-fleet-only sentence is in --help and the README (grep). The
+  # help text is captured before grepping: a piped `grep -q` can exit on the
+  # match while the writer still has output buffered, which pipefail reads as
+  # a SIGPIPE failure.
+  ac7_help_out="$("$WRK" spawn --help)"
+  grep -qi 'session_machine_ids is for non-fleet herdr sessions' <<<"$ac7_help_out" ||
+    fail "#994 AC7: spawn --help must carry the non-fleet sentence"
+  grep -qi 'non-fleet' "$ROOT/README.md" ||
+    fail "#994 AC7: README must carry the non-fleet sentence"
+  echo "PASS 994-lanes AC7: docs say non-fleet sessions only"
+
+  # -- #994 assertion-RED mutants -------------------------------------------
+  # M1: "no lane without a receipt" — drop the arbiter gate; AC1's zero-call
+  # assertion must then fail.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-994-nogate \
+    '  if [[ "${ARBITER_JOB_REGISTERED:-0}" -ne 1 ]]; then' \
+    '  if false; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-994-nogate" \
+    LANES_ARBITER_BIN="$TMP/absent-arbiter" HERDR_SESSION=default \
+    lanes_spawn lane-994-m1 --owner work-kairos
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#994 M1 mutant survived: no lanes add ran without a job record"
+  fi
+  echo "PASS 994-lanes M1: dropping the arbiter gate goes RED"
+
+  # M2: "reap never removes another pane's lane" — skip the machine/pane
+  # compare; AC5's no-rm assertion must then fail.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-994-blindrm \
+    '  if [[ "$row_machine" != "$want_machine" || "$row_pane" != "$want_pane" ]]; then' \
+    '  if false; then'
+  lanes_reap_job j994-m2 w1:p16 w1:t16 own-994-m2 lane-994-m2 lbl-994-m2
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-994-blindrm" \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-994-m2","machine":"mac-work-default","pane":"w1:p88","parent":"x","sink":false}]}' \
+    lanes_reap_run m2 --lane own-994-m2 --apply
+  if [[ ! -f "$LANES_RM_LOG" ]] || ! grep -qxF 'rm' "$LANES_RM_LOG"; then
+    fail "#994 M2 mutant survived: the moved lane was not swept"
+  fi
+  echo "PASS 994-lanes M2: skipping the lanes ls compare goes RED"
+
+  # M3: "only valid lane names reach panewire" — drop the name check in
+  # hub_lane_remove; AC4's no-argv assertion must then fail.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-994-novalidate \
+    '  if ! hub_lane_name_valid "$lane"; then' \
+    '  if false; then'
+  lanes_reap_job j994-m3 w1:p17 w1:t17 own-994-m3 --hub-url=x lbl-994-m3
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-994-novalidate" \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"--hub-url=x","machine":"mac-work-default","pane":"w1:p17","parent":"x","sink":false}]}' \
+    lanes_reap_run m3 --lane own-994-m3 --apply
+  if [[ ! -f "$LANES_RM_LOG" ]] || ! grep -qxF -- '--hub-url=x' "$LANES_RM_LOG"; then
+    fail "#994 M3 mutant survived: the flag-shaped lane never reached argv"
+  fi
+  echo "PASS 994-lanes M3: dropping lane-name validation goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then
