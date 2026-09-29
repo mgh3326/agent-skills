@@ -46,7 +46,7 @@ CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-ke
 # 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
 # scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
 ALL_PROFILES=(
-  opus sonnet sonnet-med haiku fable builder-opus captain-opus
+  opus sonnet sonnet-med haiku fable builder-opus captain-opus builder-sonnet
   devin-swe2 devin-swe2-medium devin-swe2-max builder-devin
   builder-devin-medium builder-devin-max
   devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
@@ -161,8 +161,9 @@ Options:
                      builder-opus, builder-sol, builder-devin,
                      builder-devin-medium, builder-devin-max, builder-ds41,
                      builder-ds41-max, builder-grok, builder-kimi,
-                     builder-luna, builder-opus-low, builder-opus-medium,
-                     builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high,
+                     builder-luna, builder-sonnet, builder-opus-low,
+                     builder-opus-medium, builder-sonnet-xhigh,
+                     builder-sonnet-max, builder-sol-high,
 
                      builder-sol-max, builder-sol-medium, builder-luna-max,
                      builder-terra-high, builder-terra-xhigh, builder-terra-max,
@@ -174,7 +175,9 @@ Options:
                      (builder-sonnet-max, builder-sol-max, builder-luna-max,
                      builder-terra-max, builder-kimi-max) are closed: under
                      --role builder any resolved max or ultra rung is refused
-                     before the marker check (2026-09-26 decision).
+                     before the marker check (2026-09-26 decision), with one
+                     named exception — builder-sonnet takes an explicit
+                     --effort max (2026-09-29 operator report, experiment E2).
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      required for --role builder (spawn dies without it).
@@ -277,6 +280,11 @@ haiku default=low; all support an explicit --effort override.
 Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol
 at effort high (was max before 2026-09-26 — a builder seat never takes a max rung,
 operator decision 2026-09-26; the seat rule is enforced on the resolved effort below).
+builder-sonnet (#921, operator report 2026-09-29) = the Sonnet 5.5 experiment seat:
+Claude Sonnet via --model sonnet + --dangerously-skip-permissions (the builder-opus
+argv shape), --effort high|xhigh|max, default xhigh. Its explicit max rung is the
+seat rule's only named exception; builder-sonnet records launch_profile
+sonnet@<effort> so the E1/E2 reps attribute to the gated catalog rung.
 codex-astra = gpt-6-astra is a counsel-only profile for director/architect/operator-requested
 advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved); --role builder rejects it.
 It defaults to --effort xhigh and requires --purpose director|architect|operator-request,
@@ -2134,6 +2142,11 @@ arbiter_admit() {
     launch_name="$GATE_PROFILE"
   elif [[ "$PROFILE_KIND" == codex && -n "$CATALOG_PROFILE" ]]; then
     launch_name="$CATALOG_PROFILE"
+  elif [[ "$MODEL" == builder-sonnet ]]; then
+    # #921: the Sonnet 5.5 builder seat records the canonical catalog rung
+    # (sonnet@<effort>) so E1/E2 reps attribute to the gated profile — the
+    # same failure shape #677 fixed, applied to the claude pool.
+    launch_name="$CATALOG_PROFILE"
   fi
   local launch_profile="$launch_name${EFFECTIVE_EFFORT:+@$EFFECTIVE_EFFORT}"
   record_json="$(SCOPEFUEL_BIN="$SCOPEFUEL" "$ARBITER" lease --job "$JOB_ID" --kind quota_pool \
@@ -2324,6 +2337,10 @@ resolve_catalog_profile() {
     # rung they pin — the suffix is the rung by construction.
     builder-opus-low|builder-opus-medium) CATALOG_PROFILE=opus; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     builder-sonnet-xhigh|builder-sonnet-max) CATALOG_PROFILE=sonnet; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
+    # #921: the non-rung Sonnet builder consults the canon at the rung it will
+    # actually take — an unpinned consult answers sonnet's own high default and
+    # apply_catalog would silently overwrite this profile's xhigh default.
+    builder-sonnet) CATALOG_PROFILE=sonnet; CATALOG_EFFORT_PIN="${EFFORT:-xhigh}" ;;
     haiku) CATALOG_PROFILE=haiku ;;
     fable) CATALOG_PROFILE=fable ;;
 
@@ -2522,6 +2539,10 @@ resolve_profile() {
     # marker is the only channel that tells the gate which rung to judge).
     builder-opus-low|builder-opus-medium) PROFILE_KIND=claude; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
     builder-sonnet-xhigh|builder-sonnet-max) PROFILE_KIND=claude; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
+    # #921: Sonnet 5.5 builder seat — the builder-opus argv shape on the sonnet
+    # alias. The closed effort set (high|xhigh|max) is enforced in the --role
+    # builder arm below; default xhigh (E1 rung).
+    builder-sonnet) PROFILE_KIND=claude; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     sonnet|sonnet-med) PROFILE_KIND=claude; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     haiku) PROFILE_KIND=claude; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     fable) PROFILE_KIND=claude; ARGS=(--model claude-fable-5-1 --dangerously-skip-permissions) ;;
@@ -2728,7 +2749,7 @@ resolve_profile() {
   # exactly as requested.
   case "$MODEL" in
     opus|builder-opus|captain-opus) GATE_PROFILE=opus ;;
-    sonnet|sonnet-med) GATE_PROFILE=sonnet ;;
+    sonnet|sonnet-med|builder-sonnet) GATE_PROFILE=sonnet ;;
     # #704: E6 rungs gate at their own rung (GATE_EFFORT_PIN) — quota_gate
     # forwards it as `scopefuel gate --effort`, and spawn enforces
     # SCOPEFUEL_E6_ARM naming exactly GATE_PROFILE@GATE_EFFORT_PIN.
@@ -2827,7 +2848,12 @@ resolve_profile() {
     fi
     case "$seat_effort" in
       max|ultra)
-        die "$MODEL at effort $seat_effort is refused for --role builder: builder seats never take a max rung (operator decision 2026-09-26) — use high or below, or a devin profile" ;;
+        # #921: builder-sonnet is the operator's named exception (2026-09-29
+        # report, experiment E2) — an explicit max rung on exactly this
+        # spelling. ultra stays refused (its effort set excludes it), and the
+        # E6 max spellings stay closed.
+        [[ "$MODEL" == builder-sonnet && "$seat_effort" == max ]] ||
+          die "$MODEL at effort $seat_effort is refused for --role builder: builder seats never take a max rung (operator decision 2026-09-26) — use high or below, or a devin profile" ;;
     esac
   fi
 
@@ -6099,8 +6125,8 @@ spawn_cmd() {
     case "$MODEL" in
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
-      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26)" ;;
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -6113,6 +6139,15 @@ spawn_cmd() {
       builder-luna)
         [[ -z "$EFFORT" || "$EFFORT" == xhigh ]] || die "builder-luna requires effort xhigh (#594 E3 sample profile)"
         ;;
+      # #921: the Sonnet 5.5 experiment seat takes a closed effort set —
+      # high|xhigh|max (default xhigh). max is admitted for this spelling only
+      # (seat-rule exemption in resolve_profile); low/medium/ultra die here.
+      builder-sonnet)
+        case "${EFFORT:-xhigh}" in
+          high|xhigh|max) ;;
+          *) die "builder-sonnet accepts only --effort high|xhigh|max (default xhigh; #921)" ;;
+        esac
+        ;;
       # #704: the E6 rungs pin their effort in the name's last segment.
       # resolve_profile repeats the check against GATE_EFFORT_PIN and enforces
       # the SCOPEFUEL_E6_ARM marker; refusing here too keeps the failure on the
@@ -6124,7 +6159,7 @@ spawn_cmd() {
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac

@@ -53,6 +53,13 @@ kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없
 **2026-09-26 운영자 결정으로 max 런그 철자(`builder-sonnet-max`·`builder-sol-max`·
 `builder-luna-max`·`builder-terra-max`·`builder-kimi-max`)는 닫혔다** — 빌더 좌석은
 max 를 쓸 수 없으므로 `SCOPEFUEL_E6_ARM` 표식과 무관하게 wrk 가 거부한다.
+#921(operator 2026-09-29 Sonnet 5.5 실험 보고)은 비-런그 빌더 철자
+`builder-sonnet`을 연다 — `builder-opus` 의 argv 모양(`--model sonnet`
+`--dangerously-skip-permissions`)에 `--effort` 는 high·xhigh·max 만 받고 생략 시
+xhigh 이다(E1=xhigh 좌석, E2=max 좌석). 이 철자의 명시 max 가 아래 좌석 규칙의
+유일한 예외이고, E6 철자 `builder-sonnet-xhigh`·`builder-sonnet-max` 와는 별도
+프로필이다(마커 게이트·좌석 거부 그대로). quota pool 은 claude, launch_profile 은
+canonical `sonnet@<effort>` 로 기록된다.
 
 <!-- T736-ASSIGNMENT-DEFAULTS -->
 🔴 **배정 기본값 (출처: 2026-09-26 운영자 결정 `decision/2026-09-26/effort-efficiency` B
@@ -75,6 +82,8 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
   없이 모델 런그 그대로다. **max effort 는 T3 구현 워커·T3 tester 에만 예약한다
   (4088 B)** — 예외는 devin swe2-max(4088 명시, 무료)·A+ 의 Luna max(note 4098 비용
   규칙)·워커 E6 측정 런그다(#704). wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
+  유일한 좌석 예외는 #921 의 `builder-sonnet` — operator 2026-09-29 Sonnet 실험(E2)에서
+  이 철자의 명시 `--effort max` 만 연다(다른 빌더 철자와 E6 max 철자는 그대로 닫힌다).
 - **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
   `builder-devin-max`)은 무료이므로 적극 쓴다.
 - **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** —
