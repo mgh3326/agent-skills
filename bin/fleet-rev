@@ -62,13 +62,18 @@ case "$_pb_now" in ''|*[!0-9]*) _pb_now=0 ;; esac
 PROBE_DEADLINE=0
 if [ "$_pb_now" -gt 0 ]; then PROBE_DEADLINE=$((_pb_now + PROBE_BUDGET)); fi
 
-# descendants PID — every pid below PID, deepest first (a recursive
-# pgrep -P walk). With no pgrep the walk is empty and only the direct
-# child gets signalled.
+# descendants PID — every pid below PID exactly once, deepest first (a
+# recursive pgrep -P walk). POSIX sh has no local variables, so the
+# nested call would clobber the shared loop variable before this
+# level's printf; positional parameters are call-scoped, so $2 keeps
+# this frame's node safe across the recursion with no subshell fork.
+# With no pgrep the walk is empty and only the direct child gets
+# signalled.
 descendants() {
   for _d in $(pgrep -P "$1" 2>/dev/null); do
-    descendants "$_d"
-    printf '%s\n' "$_d"
+    set -- "$1" "$_d"
+    descendants "$2"
+    printf '%s\n' "$2"
   done
 }
 
@@ -96,13 +101,15 @@ budget_unknown() {
 
 # run_tool SECONDS CMD... — per-tool bound, portable (POSIX sh, no GNU
 # timeout, no setsid) and no temp files. CMD runs as a background job
-# with stdin /dev/null. A watchdog subshell sleeps the bound, walks the
-# tree while the direct child still lives to pin its descendants, then
-# SIGTERMs the child and the listed pids and SIGKILLs them KILL_GRACE
-# seconds later; a wrapper's grandchild stays on the saved pid list even
-# after the wrapper died and reparented it. A second subshell snapshots
-# the tree every second while the child lives (a dead pid has no listed
-# children, so once the child exits the saved list is all there is);
+# with stdin /dev/null. A watchdog subshell sleeps the bound, SIGTERMs
+# the direct child at once (the bound is for the tool itself; the tree
+# walk's cost must not stretch it), walks the tree to pin the
+# descendants, SIGTERMs them too, then SIGKILLs child and list
+# KILL_GRACE seconds later; a wrapper's grandchild stays on the saved
+# pid list even after the wrapper died and reparented it. A second
+# subshell snapshots the tree every second while the child lives (a
+# dead pid has no listed children, so once the child exits the saved
+# list is all there is);
 # SIGUSR1 wakes it to SIGKILL the last-seen descendants and exit, so a
 # grandchild orphaned by a finished wrapper cannot keep the caller's
 # output pipe open (the snapshot is at most a second stale — a child
@@ -123,8 +130,9 @@ run_tool() {
   "$@" </dev/null &
   _rt_p=$!
   ( sleep "$_rt_t"
+    kill -TERM "$_rt_p" 2>/dev/null
     _rt_k=$(descendants "$_rt_p")
-    kill -TERM "$_rt_p" $_rt_k 2>/dev/null
+    kill -TERM $_rt_k 2>/dev/null
     sleep "$KILL_GRACE"
     kill -KILL "$_rt_p" $_rt_k $(descendants "$_rt_p") 2>/dev/null ) </dev/null >/dev/null 2>&1 &
   _rt_w=$!

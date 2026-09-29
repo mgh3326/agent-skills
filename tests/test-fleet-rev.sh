@@ -833,7 +833,60 @@ done
 [[ $ELA -lt 10 ]] || fail "AC16 wait-form stalled: ${ELA}s"
 pgrep -f 'sleep 62' >/dev/null 2>&1 &&
   fail "AC16 wait-form left a grandchild behind: $(pgrep -fl 'sleep 62')"
-pass "AC16 non-exec wrapper (child and sleep-&-wait forms) bounded; grandchild killed"
+
+# depth-3 tree: wrapper -> interior that outlives its own leaf -> leaf.
+# The interior respawns its child forever, so an interior node left
+# unsignalled (a leaf-only kill list) keeps a fresh leaf holding the
+# pipe open and the host reads unreachable. Invariant I-M3: every
+# interior node of the tool tree is signalled.
+full_current_home "$(remote_home x)"
+cat >"$(remote_home x)/.local/bin/panewire" <<'EOF'
+#!/bin/sh
+sh -c 'while :; do sleep 64; done' &
+wait
+printf 'pw-deadbee\n'
+EOF
+chmod +x "$(remote_home x)/.local/bin/panewire"
+SECONDS=0
+run_fleet --only a --timeout 30
+ELA=$SECONDS
+[[ $RC -eq 3 ]] || fail "AC16 depth3 rc: want 3 got $RC :: $OUT"
+assert_cell a panewire "unknown"
+[[ "$(cell a panewire)" == *"tool timed out"* ]] ||
+  fail "AC16 depth3 detail: $(cell a panewire)"
+for t in scopefuel agent-skills handoffkeep; do
+  assert_cell a "$t" "current"
+done
+[[ $ELA -lt 10 ]] || fail "AC16 depth3 stalled: ${ELA}s"
+pgrep -f 'while :; do sleep 64' >/dev/null 2>&1 &&
+  fail "AC16 depth3 left the interior tool behind: $(pgrep -fl 'while :; do sleep 64')"
+pgrep -f 'sleep 64' >/dev/null 2>&1 &&
+  fail "AC16 depth3 left a leaf behind: $(pgrep -fl 'sleep 64')"
+
+# unit check: descendants prints every pid of a 3-level tree exactly
+# once, deepest first — the shared loop variable must not clobber an
+# interior node's own entry with its subtree's last leaf.
+python3 - "$FLEET_REV" >"$TMP/probe-ac16.sh" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+print(re.search(r'PROBE = r"""(.*?)"""', src, re.S).group(1))
+PY
+sed -n '/^descendants()/,/^}/p' "$TMP/probe-ac16.sh" >"$TMP/desc.sh"
+sh -c 'sh -c "sleep 65 & wait" & wait' &
+D3_P=$!
+disown 2>/dev/null || true
+sleep 1
+D3_C="$(pgrep -P "$D3_P" || true)"
+D3_L="$(pgrep -P "$D3_C" || true)"
+[[ -n "$D3_C" && -n "$D3_L" ]] ||
+  fail "AC16 descendants unit fixture broken: P=$D3_P C=$D3_C L=$D3_L"
+D3_GOT="$(sh -c ". \"$TMP/desc.sh\"; descendants \"$D3_P\"")"
+D3_WANT="$(printf '%s\n%s\n' "$D3_L" "$D3_C")"
+kill -KILL "$D3_P" "$D3_C" "$D3_L" 2>/dev/null || true
+wait 2>/dev/null || true
+[[ "$D3_GOT" == "$D3_WANT" ]] ||
+  fail "AC16 descendants unit: want $(printf '[%s]' "$D3_WANT" | tr '\n' ' ') got $(printf '[%s]' "$D3_GOT" | tr '\n' ' ')"
+pass "AC16 non-exec wrapper (child, sleep-&-wait and depth-3 forms) bounded; whole tree killed"
 
 # ================================================================ AC17 (1007 B2)
 # The probe's real worst case: five sequential tool calls on one host and
