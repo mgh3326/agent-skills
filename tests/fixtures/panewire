@@ -158,4 +158,22 @@ fi
 
 [[ -z "${WRK_PANEWIRE_SLEEP:-}" ]] || sleep "$WRK_PANEWIRE_SLEEP"
 
+# `panewire lanes` (#965 worker hub-lane registration/reap). The call already
+# landed in WRK_PANEWIRE_LOG above like every other subcommand; the dedicated
+# log and rc let a case observe or fail lane writes without touching the
+# prompt/place/job calls the same spawn also makes.
+#
+#   WRK_PANEWIRE_LANES_LOG   append one argv element per line, then `--`
+#   WRK_PANEWIRE_LANES_RC    exit code for lanes calls (default WRK_PANEWIRE_RC, else 0)
+if [[ "${1:-}" == lanes ]]; then
+  shift
+  if [[ -n "${WRK_PANEWIRE_LANES_LOG:-}" ]]; then
+    {
+      for argument in "$@"; do printf '%s\n' "$argument"; done
+      printf -- '--\n'
+    } >>"$WRK_PANEWIRE_LANES_LOG"
+  fi
+  exit "${WRK_PANEWIRE_LANES_RC:-${WRK_PANEWIRE_RC:-0}}"
+fi
+
 exit "${WRK_PANEWIRE_RC:-0}"

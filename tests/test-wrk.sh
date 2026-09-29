@@ -477,6 +477,344 @@ if [[ "${WRK_TEST_ONLY_HUB_QUOTA:-0}" -eq 1 ]]; then
 fi
 run_hub_quota_gate_tests
 
+# ---------------------------------------------------------------------------
+# #965: a worker spawned under a hub-mapped herdr session registers a lane
+# ---------------------------------------------------------------------------
+# A host can run a second panewire daemon serving a non-fleet herdr session;
+# hosts.toml's [hub] session_machine_ids maps the session to that daemon's hub
+# machine id. A local --role worker spawn under a mapped session then runs
+# `panewire lanes add` exactly once — after the pane is provably up, before the
+# job.spawned receipt so the lane lands in the same job meta — and
+# `wrk reap --apply` removes exactly that lane. Registration is warn-only at
+# every step: an unmapped session, a missing --owner and a panewire refusal all
+# spawn unregistered, and builder spawns never reach the call at all.
+LANES_CFG="$TMP/lanes-hosts.toml"
+LANES_TOKEN_FILE="$TMP/lanes-token.env"
+LANES_CF_FILE="$TMP/lanes-cf.env"
+LANES_TOKEN_VALUE="fixture-lanes-token-must-not-leak"
+LANES_CF_VALUE="fixture-lanes-cf-must-not-leak"
+printf 'HUB_TOKEN=%s\n' "$LANES_TOKEN_VALUE" >"$LANES_TOKEN_FILE"
+printf 'CF_ACCESS_CLIENT_ID=fixture\nCF_ACCESS_CLIENT_SECRET=%s\n' "$LANES_CF_VALUE" >"$LANES_CF_FILE"
+printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nhub_cf_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$LANES_TOKEN_FILE" "$LANES_CF_FILE" >"$LANES_CFG"
+# AC7's tripwire: the paths are passed to panewire, never opened — chmod 000
+# turns a silent read of either file into a loud failure instead.
+chmod 000 "$LANES_TOKEN_FILE" "$LANES_CF_FILE"
+# A config with [hub] but no session_machine_ids key: the installation has not
+# opted in, so the spawn stays silent — no warning, no call.
+LANES_CFG_NOMAP="$TMP/lanes-nomap-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nhub_cf_env = "%s"\n' \
+  "$LANES_TOKEN_FILE" "$LANES_CF_FILE" >"$LANES_CFG_NOMAP"
+
+lanes_spawn() {
+  # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
+  # stdout/stderr, both panewire logs and the inbox land in per-case paths;
+  # the exit code lands in LANES_RC. LANES_CFG_OVERRIDE swaps the hosts.toml,
+  # LANES_MODEL the profile.
+  local name="$1"; shift
+  LANES_OUT="$TMP/lanes-$name.out" LANES_ERR="$TMP/lanes-$name.err"
+  LANES_CALLS="$TMP/lanes-$name-calls.log" LANES_HERDR_LOG="$TMP/lanes-$name-herdr.log"
+  LANES_PANEWIRE_LOG="$TMP/lanes-$name-panewire.log"
+  LANES_INBOX="$TMP/lanes-inbox-$name"
+  set +e
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
+    ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$LANES_INBOX" \
+    XDG_DATA_HOME="$TMP/lanes-xdg-$name" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$LANES_HERDR_LOG" \
+    WRK_SCOPEFUEL_LOG="$TMP/lanes-scopefuel-$name.log" \
+    WRK_REFRESH_LOG="$TMP/lanes-refresh-$name.log" \
+    WRK_REFRESH_PID_LOG="$TMP/lanes-refresh-$name.pids" WRK_REFRESH_TIMEOUT_S=5 \
+    WRK_HOSTS_CONFIG="${LANES_CFG_OVERRIDE:-$LANES_CFG}" \
+    WRK_PANEWIRE_LOG="$LANES_PANEWIRE_LOG" \
+    WRK_PANEWIRE_LANES_LOG="$LANES_CALLS" \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m "${LANES_MODEL:-codex-terra}" \
+    -p "$PROMPT" -w w -l "$name" --t T1 --job "$name" --task "$(mint_task)" \
+    --host local "$@" >"$LANES_OUT" 2>"$LANES_ERR"
+  LANES_RC=$?
+  set -e
+}
+
+# Zero lanes traffic means no dedicated argv block AND no `lanes` subcommand
+# reaching the shared panewire log (place/prompt calls are unrelated).
+lanes_assert_no_lanes_call() {
+  local name="$1"
+  [[ ! -s "$TMP/lanes-$name-calls.log" ]] ||
+    fail "#965 $name: expected zero lanes calls, got: $(cat "$TMP/lanes-$name-calls.log")"
+  if [[ -f "$TMP/lanes-$name-panewire.log" ]] && grep -q '^lanes$' "$TMP/lanes-$name-panewire.log"; then
+    fail "#965 $name: a lanes subcommand reached panewire"
+  fi
+}
+
+lanes_spawned_payload() {
+  # NAME — print the single job.spawned receipt payload.
+  python3 - "$TMP/lanes-inbox-$1/$1/events" <<'PY'
+import glob, json, sys
+paths = sorted(glob.glob(sys.argv[1] + "/*job.spawned.json"))
+assert len(paths) == 1, "exactly one job.spawned receipt expected: %r" % paths
+print(json.dumps(json.load(open(paths[0]))["payload"], sort_keys=True))
+PY
+}
+
+lanes_reap_run() {
+  # NAME [reap args...] — wrk reap against LANES_REAP_INBOX with the #965
+  # hosts.toml; lanes rm argv lands in $TMP/lanes-rm-$name.log.
+  local name="$1"; shift
+  LANES_REAP_OUT="$TMP/lanes-reap-$name.out" LANES_REAP_ERR="$TMP/lanes-reap-$name.err"
+  LANES_RM_LOG="$TMP/lanes-rm-$name.log"
+  set +e
+  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" \
+    WRK_FIXTURE_SCENARIO=reap WRK_FIXTURE_LOG="$LANES_REAP_HERDR_LOG" \
+    WRK_HOSTS_CONFIG="$LANES_CFG" \
+    WRK_PANEWIRE_LANES_LOG="$LANES_RM_LOG" \
+    "${WRK_UNDER_TEST:-$WRK}" reap "$@" >"$LANES_REAP_OUT" 2>"$LANES_REAP_ERR"
+  LANES_REAP_RC=$?
+  set -e
+}
+
+lanes_reap_job() {
+  # JOB PANE TAB LANE HUB_LANE — claim + job.spawned (+hub_lane when nonempty)
+  # + job.completed, all backdated past the default grace.
+  local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5"
+  local spawned="{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}"
+  if [[ -n "$hub_lane" ]]; then
+    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"mac-work-default\"}"
+  fi
+  export ARBITER_TEST_NOW="$LANES_REAP_NOW"
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 >/dev/null
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+    --payload-json "$spawned" >/dev/null
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
+
+run_lanes_tests() {
+  # AC1 — mapped session + --owner: exactly one `lanes add` carrying the
+  # configured machine, the spawned pane, the owner lane as parent and every
+  # configured credential path. The OK line gains lane=LABEL@MACHINE and the
+  # job meta records both fields.
+  HERDR_SESSION=default lanes_spawn lane-ac1 --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#965 AC1: mapped worker spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_CALLS" "$LANES_TOKEN_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+log, token_file, cf_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+want = ["add", "lane-ac1", "--machine", "mac-work-default", "--pane", "w:p1",
+        "--parent", "work-kairos", "--hub-url", "https://hub.invalid",
+        "--hub-token-env", token_file, "--hub-cf-env", cf_file, "--"]
+assert got == want, "lanes add argv mismatch: got=%r want=%r" % (got, want)
+PY
+    fail "#965 AC1: lanes add must run exactly once with machine/pane/parent/credentials"
+  grep -q '^OK pane=w:p1 ' "$LANES_OUT" ||
+    fail "#965 AC1: the OK line is missing: $(cat "$LANES_OUT")"
+  grep -q ' lane=lane-ac1@mac-work-default$' "$LANES_OUT" ||
+    fail "#965 AC1: the OK line must end with lane=lane-ac1@mac-work-default: $(cat "$LANES_OUT")"
+  lanes_spawned_payload lane-ac1 | python3 -c '
+import json, sys
+payload = json.loads(sys.stdin.read())
+assert payload.get("hub_lane") == "lane-ac1", payload
+assert payload.get("hub_lane_machine") == "mac-work-default", payload' ||
+    fail "#965 AC1: job.spawned meta must carry hub_lane/hub_lane_machine"
+  echo "PASS 965-lanes AC1: mapped worker spawn registers the lane"
+
+  # Session resolution: WRK_SENTINEL_HERDR_SESSION wins over HERDR_SESSION;
+  # with neither set the herdr default session is what gets mapped.
+  WRK_SENTINEL_HERDR_SESSION=default HERDR_SESSION=worker \
+    lanes_spawn lane-prec --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] || fail "#965: sentinel-session override spawn failed"
+  python3 - "$LANES_CALLS" <<'PY' ||
+import sys
+got = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert got[:2] == ["add", "lane-prec"], "sentinel session must win: %r" % got
+assert got[2:4] == ["--machine", "mac-work-default"], got
+PY
+    fail "#965: WRK_SENTINEL_HERDR_SESSION must win over HERDR_SESSION"
+  HERDR_SESSION= WRK_SENTINEL_HERDR_SESSION= lanes_spawn lane-def --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] || fail "#965: default-session spawn failed"
+  python3 - "$LANES_CALLS" <<'PY' ||
+import sys
+got = open(sys.argv[1], encoding="utf-8").read().splitlines()
+assert got[:4] == ["add", "lane-def", "--machine", "mac-work-default"], \
+    "an unset session must resolve to the herdr default: %r" % got
+PY
+    fail "#965: an unset herdr session must resolve to the default session"
+  echo "PASS 965-lanes session precedence (sentinel override, default fallback)"
+
+  # AC2 — mapped config but an unmapped session: zero lanes calls, exactly one
+  # warning naming the session, and the OK line carries nothing appended.
+  HERDR_SESSION=worker lanes_spawn lane-ac2 --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#965 AC2: an unmapped-session spawn still succeeds (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call lane-ac2
+  [[ "$(grep -c 'wrk: warning: hub lane not registered' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#965 AC2: exactly one warning expected: $(cat "$LANES_ERR")"
+  grep -q "herdr session 'worker'" "$LANES_ERR" ||
+    fail "#965 AC2: the warning must name the session: $(cat "$LANES_ERR")"
+  grep -qxF 'OK pane=w:p1 host=local model=codex-terra label=lane-ac2 status=working landed=yes job=lane-ac2 quota_record=codex/quota_pool' "$LANES_OUT" ||
+    fail "#965 AC2: the OK line changed beyond 'nothing appended': $(cat "$LANES_OUT")"
+  # And a config without the key at all stays silent (opt-in absent).
+  LANES_CFG_OVERRIDE="$LANES_CFG_NOMAP" HERDR_SESSION=default lanes_spawn lane-ac2b --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] || fail "#965 AC2: unconfigured-map spawn failed"
+  lanes_assert_no_lanes_call lane-ac2b
+  ! grep -q 'hub lane' "$LANES_ERR" ||
+    fail "#965 AC2: no session_machine_ids key must stay silent: $(cat "$LANES_ERR")"
+  echo "PASS 965-lanes AC2: unmapped session warns once and spawns clean"
+
+  # AC3 — a builder spawn never touches lanes. Builder lanes stay the
+  # director's; the same mapped session and daemon are irrelevant here.
+  LANES_MODEL=builder-sol HERDR_SESSION=default \
+    lanes_spawn lane-ac3 --role builder --lane b965-builder --parent director-x
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#965 AC3: builder spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call lane-ac3
+  ! grep -q 'hub lane' "$LANES_ERR" ||
+    fail "#965 AC3: a builder spawn must not even warn about hub lanes: $(cat "$LANES_ERR")"
+  echo "PASS 965-lanes AC3: builder spawns never register"
+
+  # AC4 — mapped session, missing --owner: zero calls, one warning, rc
+  # unchanged (the spawn is still a success — a missing lane is pre-#965
+  # behaviour, not a new failure).
+  HERDR_SESSION=default lanes_spawn lane-ac4
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#965 AC4: a missing --owner must not fail the spawn (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call lane-ac4
+  [[ "$(grep -c 'wrk: warning: hub lane not registered' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#965 AC4: exactly one warning expected: $(cat "$LANES_ERR")"
+  grep -q -- '--owner' "$LANES_ERR" ||
+    fail "#965 AC4: the warning must point at --owner: $(cat "$LANES_ERR")"
+  grep -q '^OK pane=w:p1 ' "$LANES_OUT" || fail "#965 AC4: OK line missing"
+  ! grep -q ' lane=' "$LANES_OUT" || fail "#965 AC4: nothing may be appended"
+  echo "PASS 965-lanes AC4: missing --owner warns once and spawns unregistered"
+
+  # AC5 — panewire refuses the lane (rc 5): the spawn still exits 0 with its
+  # OK line, one warning carries 'hub lane not registered', and the receipt
+  # stays free of hub_lane.
+  WRK_PANEWIRE_LANES_RC=5 HERDR_SESSION=default lanes_spawn lane-ac5 --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#965 AC5: a lanes refusal must not fail the spawn (rc=$LANES_RC)"
+  [[ "$(grep -c '^add$' "$LANES_CALLS")" -eq 1 ]] ||
+    fail "#965 AC5: the registration call must still be attempted once"
+  [[ "$(grep -c 'wrk: warning: hub lane not registered' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#965 AC5: one 'hub lane not registered' warning expected: $(cat "$LANES_ERR")"
+  grep -q '^OK pane=w:p1 ' "$LANES_OUT" || fail "#965 AC5: OK line missing"
+  ! grep -q ' lane=' "$LANES_OUT" || fail "#965 AC5: a refused lane must not be printed"
+  ! lanes_spawned_payload lane-ac5 | grep -q 'hub_lane' ||
+    fail "#965 AC5: a refused lane must not land in job meta"
+  echo "PASS 965-lanes AC5: lanes add rc!=0 warns and keeps the spawn"
+
+  # AC7 — the credential files go to panewire as verbatim paths and are never
+  # opened by wrk (they are chmod 000 here — a read would have died). The
+  # secret values must appear in no output this feature produced.
+  for output in "$TMP"/lanes-*.out "$TMP"/lanes-*.err; do
+    if grep -Fq "$LANES_TOKEN_VALUE" "$output"; then
+      fail "#965 AC7: the token env contents leaked into ${output##*/}"
+    fi
+    if grep -Fq "$LANES_CF_VALUE" "$output"; then
+      fail "#965 AC7: the CF env contents leaked into ${output##*/}"
+    fi
+  done
+  echo "PASS 965-lanes AC7: credential paths passed verbatim, contents unread"
+
+  # AC6 — reap --apply removes exactly the recorded lane, only after the tab
+  # close is confirmed; a dry run and a lane-less job call nothing.
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox"
+  LANES_REAP_HERDR_LOG="$TMP/lanes-reap-herdr.log"
+  LANES_REAP_NOW="$(python3 -c 'import datetime; print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).replace(microsecond=0).isoformat())')"
+  lanes_reap_job lanes-reap-ok w1:p5 w1:t5 lane-965 lanes-reap-ok
+  lanes_reap_job lanes-reap-plain w1:p6 w1:t6 lane-965 ''
+  lanes_reap_job lanes-reap-fail w1:p7 w1:t7 lane-965-f lanes-reap-fail
+  # The M3 mutant below reaps its own lane: the AC6 apply above already closed
+  # lane-965's jobs, and a reaped job is never a candidate again.
+  lanes_reap_job lanes-m3-ok w1:p8 w1:t8 lane-965-m3 lanes-m3-ok
+  lanes_reap_job lanes-m3-plain w1:p10 w1:t10 lane-965-m3 ''
+
+  lanes_reap_run dry --lane lane-965
+  [[ "$LANES_REAP_RC" -eq 0 ]] || fail "#965 AC6: dry run failed"
+  [[ ! -e "$LANES_RM_LOG" ]] || fail "#965 AC6: a dry run must not call lanes rm"
+  ! grep -q '^tab close ' "$LANES_REAP_HERDR_LOG" ||
+    fail "#965 AC6: a dry run must not close a tab"
+  grep -q '^would-close job=lanes-reap-ok ' "$LANES_REAP_OUT" ||
+    fail "#965 AC6: the lane job must still be a dry-run candidate"
+  echo "PASS 965-lanes AC6a: dry run registers no removal"
+
+  lanes_reap_run apply --lane lane-965 --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] || fail "#965 AC6: apply failed: $(cat "$LANES_REAP_ERR")"
+  python3 - "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+log, token_file, cf_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes rm call recorded")
+want = ["rm", "lanes-reap-ok", "--hub-url", "https://hub.invalid",
+        "--hub-token-env", token_file, "--hub-cf-env", cf_file, "--"]
+assert got == want, "lanes rm argv mismatch: got=%r want=%r" % (got, want)
+PY
+    fail "#965 AC6: reap must call lanes rm exactly once, with the recorded lane and identical credentials"
+  grep -q '^closed job=lanes-reap-ok ' "$LANES_REAP_OUT" ||
+    fail "#965 AC6: the lane job must close: $(cat "$LANES_REAP_OUT")"
+  grep -q '^closed job=lanes-reap-plain ' "$LANES_REAP_OUT" ||
+    fail "#965 AC6: the lane-less job must still close: $(cat "$LANES_REAP_OUT")"
+  echo "PASS 965-lanes AC6b: apply removes only the recorded lane"
+
+  # A removal failure warns; the confirmed close still stands.
+  WRK_PANEWIRE_LANES_RC=5 lanes_reap_run rmfail --lane lane-965-f --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] || fail "#965: reap apply must survive an rm failure"
+  grep -q "wrk: warning: hub lane 'lanes-reap-fail' not removed" "$LANES_REAP_ERR" ||
+    fail "#965: an rm failure must warn: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=lanes-reap-fail ' "$LANES_REAP_OUT" ||
+    fail "#965: the pane must stay closed after an rm failure: $(cat "$LANES_REAP_OUT")"
+  echo "PASS 965-lanes: lanes rm failure warns and the close stands"
+
+  # -- assertion-RED mutants -------------------------------------------------
+  # Each mutant kills one invariant; each run must produce the bad outcome the
+  # matching assertion above rejects, proving the assertion is live.
+  # M1: "a mapped session registers exactly one lane" — skip registration.
+  devin_trust_mutant lanes-skip \
+    '  [[ "$ROLE" == worker ]] || return 0' \
+    '  return 0'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-skip" HERDR_SESSION=default \
+    lanes_spawn lane-ac1m --owner work-kairos
+  if [[ -s "$LANES_CALLS" ]]; then
+    fail "#965 M1 mutant survived: the lane was still registered"
+  fi
+  ! grep -q ' lane=' "$LANES_OUT" ||
+    fail "#965 M1 mutant survived: lane= still reached the OK line"
+  echo "PASS 965-lanes M1: skipping registration goes RED"
+
+  # M2: "registration failure never fails the spawn" — exit on lanes add rc!=0.
+  devin_trust_mutant lanes-fatal \
+    '    warn "hub lane not registered (panewire lanes add exited $rc)"' \
+    '    warn "hub lane not registered (panewire lanes add exited $rc)"; exit "$rc"'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-fatal" WRK_PANEWIRE_LANES_RC=5 \
+    HERDR_SESSION=default lanes_spawn lane-ac5m --owner work-kairos
+  [[ "$LANES_RC" -ne 0 ]] ||
+    fail "#965 M2 mutant survived: the spawn still exited 0 after a refused lane"
+  echo "PASS 965-lanes M2: failing the spawn on a lane refusal goes RED"
+
+  # M3: "reap removes only the lane it registered" — rm for every closed job.
+  devin_trust_mutant lanes-rmall \
+    '        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane"' \
+    '        hub_lane_remove "$job"'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-rmall" lanes_reap_run rmall --lane lane-965-m3 --apply
+  if ! grep -q 'lanes-m3-plain' "$LANES_RM_LOG" 2>/dev/null; then
+    fail "#965 M3 mutant survived: the lane-less job was not swept"
+  fi
+  echo "PASS 965-lanes M3: removing every job lane goes RED"
+}
+
+if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then
+  run_lanes_tests
+  exit 0
+fi
+run_lanes_tests
+
 arb() { "$ARBITER" "$@"; }
 
 "$WRK" --help >/dev/null
