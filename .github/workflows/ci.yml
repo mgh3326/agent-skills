@@ -56,6 +56,12 @@ jobs:
             tests/test-wrk-heavy-limit.sh \
             tests/test-wrk-task-link.sh \
             tests/test-wrk-job-end.sh \
+            tests/test-fleet-rev.sh \
+            tests/fixtures/fleet-rev/fake-ssh \
+            tests/fixtures/fleet-rev/fake-gh \
+            tests/fixtures/fleet-rev/panewire \
+            tests/fixtures/fleet-rev/handoffkeep \
+            tests/fixtures/fleet-rev/go \
             $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' ! -name 'handoffkeep' -perm -111 -print)
       - name: Bash tests
         env:
@@ -88,5 +94,6 @@ jobs:
           bash tests/test-wrk-heavy-limit.sh
           bash tests/test-wrk-task-link.sh
           bash tests/test-wrk-job-end.sh
+          bash tests/test-fleet-rev.sh
       - name: Mock MCP isolation, project migration and assertion mutants (fake only)
         run: python -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v

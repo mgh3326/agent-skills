@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fake go binary: `go version -m <bin>` prints build info whose vcs lines come
+# from the per-home control files.
+#
+#   $HOME/.fleet-rev/go-rev       vcs.revision
+#   $HOME/.fleet-rev/go-modified  vcs.modified (default false)
+set -euo pipefail
+[[ "${1:-}" == "version" && "${2:-}" == "-m" && -n "${3:-}" ]] || { echo "go: unknown command $*" >&2; exit 2; }
+bin="$3"
+rev="$(cat "$HOME/.fleet-rev/go-rev")"
+mod="$(cat "$HOME/.fleet-rev/go-modified" 2>/dev/null || printf 'false')"
+printf '%s: go1.25.0\n' "$bin"
+printf '\tmod\tgithub.com/mgh3326/handoffkeep\tv0.0.0-20260928005904-c9dafb3d343e+dirty\t\n'
+printf '\tbuild\t-buildmode=exe\n\tbuild\tvcs=git\n'
+printf '\tbuild\tvcs.revision=%s\n\tbuild\tvcs.time=2026-09-28T00:59:04Z\n\tbuild\tvcs.modified=%s\n' "$rev" "$mod"
