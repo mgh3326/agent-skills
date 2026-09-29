@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 # Fake panewire binary: `panewire version` prints pw-<rev> where <rev> comes
 # from the per-home control file $HOME/.fleet-rev/panewire-rev.
+#
+#   $HOME/.fleet-rev/panewire-hang  if non-empty, `exec sleep <seconds>`
+#                                   first — a wedged binary. exec (not a
+#                                   child) so the probe watchdog's kill
+#                                   leaves no process behind.
 set -euo pipefail
+hang="$(cat "$HOME/.fleet-rev/panewire-hang" 2>/dev/null || true)"
+[[ -n "$hang" ]] && exec sleep "$hang"
 [[ "${1:-}" == "version" && $# -eq 1 ]] || { echo "panewire: unknown command $*" >&2; exit 2; }
 printf 'pw-%s\n' "$(cat "$HOME/.fleet-rev/panewire-rev")"
