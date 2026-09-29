@@ -1,0 +1,479 @@
+#!/usr/bin/env python3
+"""fleet-rev — read-only fleet install check.
+
+Probes the installed commit of scopefuel, agent-skills, panewire and
+handoffkeep on this machine plus every active [hosts.NAME] table in
+${WRK_HOSTS_CONFIG:-~/.config/wrk/hosts.toml} and compares each against that
+repo's main on GitHub (org mgh3326).  The script never installs, restarts or
+writes anything: remote hosts get one fixed POSIX sh probe over
+`ssh -o BatchMode=yes -o ConnectTimeout=10 ALIAS sh -s` and the probe prints
+only key=value lines.
+
+exit code
+  0  every probed cell is current
+  1  at least one cell is behind or diverged
+  2  usage or config error
+  3  no stale cell, but at least one cell is unknown, absent or unreachable
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+PROG = "fleet-rev"
+ORG = "mgh3326"
+TOOLS = ("scopefuel", "agent-skills", "panewire", "handoffkeep")
+
+EXIT_OK = 0
+EXIT_STALE = 1
+EXIT_USAGE = 2
+EXIT_UNKNOWN = 3
+
+# The remote probe. POSIX sh on purpose: it must run under the remote `sh -s`
+# exactly like it runs locally. It prints only key=value lines and reads
+# nothing besides the uv receipt, the agent-skills git checkout and the tool
+# binaries on PATH.
+PROBE = r"""
+PATH="$HOME/.local/bin:$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+export PATH
+
+f="$HOME/.local/share/uv/tools/scopefuel/uv-receipt.toml"
+if [ -f "$f" ]; then
+  v=$(sed -n 's/.*rev=\([0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' "$f" | sed -n '1p')
+  if [ -n "$v" ]; then printf 'scopefuel.installed=%s\n' "$v"; else printf 'scopefuel.installed=unknown\n'; fi
+else
+  printf 'scopefuel.installed=absent\n'
+fi
+printf 'scopefuel.source=receipt\n'
+
+d="$HOME/.agents/skills"
+if [ -d "$d" ]; then
+  v=$(git -C "$d" rev-parse HEAD 2>/dev/null)
+  if [ -n "$v" ]; then
+    printf 'agent-skills.installed=%s\n' "$v"
+    printf 'agent-skills.dirty=%s\n' "$(git -C "$d" status --porcelain 2>/dev/null | grep -c .)"
+  else
+    printf 'agent-skills.installed=unknown\n'
+  fi
+else
+  printf 'agent-skills.installed=absent\n'
+fi
+printf 'agent-skills.source=git\n'
+
+if command -v panewire >/dev/null 2>&1; then
+  v=$(panewire version 2>/dev/null | sed -n '1p')
+  case "$v" in
+    pw-*)
+      r=${v#pw-}
+      case "$r" in
+        *[!0-9a-fA-F]*|'') printf 'panewire.installed=unknown\n' ;;
+        *) printf 'panewire.installed=%s\n' "$r" ;;
+      esac ;;
+    *) printf 'panewire.installed=unknown\n' ;;
+  esac
+else
+  printf 'panewire.installed=absent\n'
+fi
+printf 'panewire.source=version-cmd\n'
+
+if command -v handoffkeep >/dev/null 2>&1; then
+  src=none; v=""; m=""
+  if j=$(handoffkeep version --json 2>/dev/null); then
+    src=version-cmd
+    v=$(printf '%s\n' "$j" | sed -n 's/.*"rev"[ ]*:[ ]*"\([^"]*\)".*/\1/p' | sed -n '1p')
+    m=$(printf '%s\n' "$j" | sed -n 's/.*"modified"[ ]*:[ ]*\(true\|false\).*/\1/p' | sed -n '1p')
+  else
+    o=$(go version -m "$(command -v handoffkeep)" 2>/dev/null)
+    v=$(printf '%s\n' "$o" | sed -n 's/.*vcs\.revision=\([^ ]*\).*/\1/p' | sed -n '1p')
+    m=$(printf '%s\n' "$o" | sed -n 's/.*vcs\.modified=\([^ ]*\).*/\1/p' | sed -n '1p')
+    if [ -n "$v" ]; then src=go-buildinfo; fi
+  fi
+  if [ -n "$v" ]; then printf 'handoffkeep.installed=%s\n' "$v"; else printf 'handoffkeep.installed=unknown\n'; fi
+  printf 'handoffkeep.source=%s\n' "$src"
+  printf 'handoffkeep.modified=%s\n' "${m:-false}"
+else
+  printf 'handoffkeep.installed=absent\n'
+  printf 'handoffkeep.source=none\n'
+  printf 'handoffkeep.modified=false\n'
+fi
+"""
+
+HOSTS_HEADER = re.compile(r"^\[hosts\.([A-Za-z0-9_-]+)\]$")
+ANY_HEADER = re.compile(r"^\[([^]]+)\]$")
+SSH_KEY = re.compile(r"^ssh[ \t]*=[ \t]*(.*)$")
+NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def eprint(*args: object) -> None:
+    print(*args, file=sys.stderr)
+
+
+def hosts_config_path() -> str:
+    override = os.environ.get("WRK_HOSTS_CONFIG")
+    if override:
+        return override
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(
+        os.path.expanduser("~"), ".config"
+    )
+    return os.path.join(xdg, "wrk", "hosts.toml")
+
+
+def _toml_value(raw: str) -> str:
+    # Mirrors wrk's spillover_value: cut at the first '#', trim, then strip one
+    # pair of surrounding double quotes.
+    value = raw.split("#", 1)[0].strip()
+    if len(value) >= 2 and value.startswith('"') and value.endswith('"'):
+        value = value[1:-1]
+    return value
+
+
+def parse_hosts_config(path: str) -> list[tuple[str, str]]:
+    """Active [hosts.NAME] tables in file order -> (name, ssh-alias-or-name)."""
+    order: list[str] = []
+    ssh: dict[str, str] = {}
+    current = ""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return []
+    for raw in lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        header = ANY_HEADER.match(line)
+        if header:
+            current = header.group(1)
+            named = HOSTS_HEADER.match(line)
+            if named and named.group(1) not in order:
+                order.append(named.group(1))
+            continue
+        if current.startswith("hosts."):
+            key = SSH_KEY.match(line)
+            if key:
+                ssh[current[len("hosts."):]] = _toml_value(key.group(1))
+    return [(name, ssh.get(name) or name) for name in order]
+
+
+class Host:
+    def __init__(self, name: str, alias: str, local: bool) -> None:
+        self.name = name
+        self.alias = alias
+        self.local = local
+
+
+def build_hosts(args: argparse.Namespace, parser: argparse.ArgumentParser) -> list[Host]:
+    hosts: dict[str, Host] = {"local": Host("local", "local", True)}
+    for name, alias in parse_hosts_config(hosts_config_path()):
+        if name in hosts:
+            hosts[name].alias = alias
+        else:
+            hosts[name] = Host(name, alias, False)
+    for spec in args.extra or []:
+        if "=" not in spec:
+            parser.error("--extra expects NAME=ALIAS, got %r" % spec)
+        name, alias = spec.split("=", 1)
+        if not NAME_RE.match(name) or not alias:
+            parser.error("--extra expects NAME=ALIAS, got %r" % spec)
+        if name in hosts:
+            hosts[name].alias = alias
+        else:
+            hosts[name] = Host(name, alias, False)
+
+    skip: set[str] = set()
+    for item in args.skip or []:
+        skip.update(part for part in item.split(",") if part)
+    selected = [h for name, h in hosts.items() if name not in skip]
+
+    if args.only:
+        wanted: list[str] = []
+        for item in args.only:
+            wanted.extend(part for part in item.split(",") if part)
+        known = {h.name for h in selected}
+        missing = [n for n in wanted if n not in known]
+        if missing:
+            parser.error("--only names unknown hosts: %s" % ", ".join(missing))
+        selected = [h for h in selected if h.name in set(wanted)]
+    return selected
+
+
+def probe_host(host: Host, timeout: float) -> tuple[dict[str, str] | None, str]:
+    if host.local:
+        cmd = ["sh", "-s"]
+    else:
+        cmd = [
+            os.environ.get("FLEET_REV_SSH") or "ssh",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            host.alias,
+            "sh",
+            "-s",
+        ]
+    try:
+        proc = subprocess.run(
+            cmd, input=PROBE, capture_output=True, text=True, timeout=timeout
+        )
+    except subprocess.TimeoutExpired:
+        return None, "timeout after %ss" % timeout
+    except OSError as exc:
+        return None, "probe failed: %s" % exc
+    if proc.returncode != 0:
+        return None, "rc=%d" % proc.returncode
+    kv: dict[str, str] = {}
+    for line in proc.stdout.splitlines():
+        match = re.match(r"^([A-Za-z0-9_.-]+)=(.*)$", line)
+        if match:
+            kv[match.group(1)] = match.group(2)
+    return kv, ""
+
+
+def gh_bin() -> str:
+    return os.environ.get("FLEET_REV_GH") or "gh"
+
+
+def gh_api(endpoint: str, jq: str, timeout: float) -> str | None:
+    try:
+        proc = subprocess.run(
+            [gh_bin(), "api", endpoint, "--jq", jq],
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip()
+
+
+def resolve_mains(timeout: float) -> dict[str, str | None]:
+    mains: dict[str, str | None] = {}
+    for repo in TOOLS:
+        sha = gh_api("repos/%s/%s/commits/main" % (ORG, repo), ".sha", timeout)
+        mains[repo] = sha or None
+        if sha is None:
+            eprint("%s: warning: cannot resolve %s main via gh" % (PROG, repo))
+    return mains
+
+
+def compare_to_main(
+    repo: str,
+    installed: str,
+    timeout: float,
+    cache: dict[tuple[str, str], tuple[str, int | None, str]],
+) -> tuple[str, int | None, str]:
+    key = (repo, installed)
+    if key in cache:
+        return cache[key]
+    out = gh_api(
+        "repos/%s/%s/compare/%s...main" % (ORG, repo, installed),
+        '.status + " " + (.ahead_by|tostring)',
+        timeout,
+    )
+    if out is None:
+        result: tuple[str, int | None, str] = (
+            "diverged",
+            None,
+            "installed not found on GitHub",
+        )
+    else:
+        parts = out.split()
+        status = parts[0] if parts else ""
+        ahead = 0
+        if len(parts) > 1:
+            try:
+                ahead = int(parts[1])
+            except ValueError:
+                ahead = 0
+        if status == "ahead":
+            result = ("behind", ahead, "")
+        elif status == "identical":
+            result = ("current", None, "")
+        else:
+            result = ("diverged", None, "compare: %s" % (status or "error"))
+    cache[key] = result
+    return result
+
+
+def make_cell(
+    tool: str,
+    kv: dict[str, str],
+    main_sha: str | None,
+    timeout: float,
+    cache: dict[tuple[str, str], tuple[str, int | None, str]],
+) -> dict[str, object]:
+    installed = kv.get(tool + ".installed", "")
+    source = kv.get(tool + ".source", "none")
+
+    mods: list[str] = []
+    if tool == "agent-skills":
+        dirty = kv.get("agent-skills.dirty", "0")
+        if dirty not in ("", "0"):
+            mods.append("modified (dirty=%s)" % dirty)
+    if tool == "handoffkeep" and kv.get("handoffkeep.modified") == "true":
+        mods.append("modified")
+
+    cell: dict[str, object] = {
+        "installed": installed if installed not in ("", "absent", "unknown") else None,
+        "status": "unknown",
+        "behind": None,
+        "source": source,
+    }
+    detail: list[str] = []
+
+    if installed in ("", "unknown"):
+        cell["status"] = "unknown"
+        if not installed:
+            detail.append("probe silent")
+    elif installed == "absent":
+        cell["status"] = "absent"
+    elif main_sha is None:
+        cell["status"] = "unknown"
+        detail.append("main unresolved")
+    elif installed == main_sha or main_sha.startswith(installed):
+        cell["status"] = "current"
+    else:
+        status, ahead, note = compare_to_main(tool, installed, timeout, cache)
+        cell["status"] = status
+        if status == "behind":
+            cell["behind"] = ahead
+        if note:
+            detail.append(note)
+
+    detail = mods + detail
+    cell["detail"] = "; ".join(detail)
+    cell["display"] = cell["status"]
+    if cell["status"] == "current" and mods:
+        cell["display"] = "current+modified"
+    elif cell["status"] == "behind":
+        cell["display"] = "behind %s" % cell["behind"]
+    return cell
+
+
+def unreachable_cell(error: str) -> dict[str, object]:
+    return {
+        "installed": None,
+        "status": "unreachable",
+        "behind": None,
+        "source": "none",
+        "detail": error,
+        "display": "unreachable",
+    }
+
+
+def short(sha: object) -> str:
+    if not sha:
+        return "-"
+    return str(sha)[:7]
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog=PROG,
+        description="Read-only fleet install check; never installs or writes.",
+    )
+    parser.add_argument("--extra", action="append", metavar="NAME=ALIAS",
+                        help="add host NAME probed over ssh ALIAS (repeatable)")
+    parser.add_argument("--skip", action="append", metavar="NAME",
+                        help="drop host NAME from the probe set (repeatable)")
+    parser.add_argument("--only", action="append", metavar="NAME[,NAME]",
+                        help="probe only the named hosts")
+    parser.add_argument("--timeout", type=float, default=30, metavar="SECONDS",
+                        help="per-host and per-gh-call timeout (default 30)")
+    parser.add_argument("--json", action="store_true",
+                        help="print one JSON object instead of the table")
+    args = parser.parse_args(argv)
+    if args.timeout <= 0:
+        parser.error("--timeout must be positive")
+
+    hosts = build_hosts(args, parser)
+    mains = resolve_mains(args.timeout)
+    cache: dict[tuple[str, str], tuple[str, int | None, str]] = {}
+
+    rows: list[dict[str, object]] = []
+    cells: list[dict[str, object]] = []
+    for host in hosts:
+        kv, error = probe_host(host, args.timeout)
+        host_cells: dict[str, dict[str, object]] = {}
+        for tool in TOOLS:
+            if kv is None:
+                cell = unreachable_cell(error)
+            else:
+                cell = make_cell(tool, kv, mains[tool], args.timeout, cache)
+            host_cells[tool] = cell
+            cells.append(cell)
+        rows.append({
+            "host": host.name,
+            "alias": host.alias,
+            "reachable": kv is not None,
+            "tools": host_cells,
+        })
+
+    stale = [c for c in cells if c["status"] in ("behind", "diverged")]
+    other = [c for c in cells if c["status"] in ("unknown", "absent", "unreachable")]
+    if stale:
+        rc = EXIT_STALE
+    elif other:
+        rc = EXIT_UNKNOWN
+    else:
+        rc = EXIT_OK
+
+    if args.json:
+        payload = {
+            "main": {repo: mains[repo] for repo in TOOLS},
+            "hosts": [
+                {
+                    "host": row["host"],
+                    "alias": row["alias"],
+                    "reachable": row["reachable"],
+                    "tools": {
+                        tool: {
+                            "installed": cell["installed"],
+                            "status": cell["status"],
+                            "behind": cell["behind"],
+                            "source": cell["source"],
+                            "detail": cell["detail"],
+                        }
+                        for tool, cell in row["tools"].items()
+                    },
+                }
+                for row in rows
+            ],
+            "rc": rc,
+        }
+        print(json.dumps(payload))
+        return rc
+
+    table = [("host", "tool", "installed", "main", "status", "detail")]
+    for row in rows:
+        for tool in TOOLS:
+            cell = row["tools"][tool]
+            table.append((
+                str(row["host"]),
+                tool,
+                short(cell["installed"]),
+                short(mains[tool]),
+                str(cell["display"]),
+                str(cell["detail"]) or "-",
+            ))
+    widths = [max(len(line[i]) for line in table) for i in range(6)]
+    for line in table:
+        print("  ".join(part.ljust(widths[i]) for i, part in enumerate(line)).rstrip())
+
+    current = sum(1 for c in cells if c["status"] == "current")
+    print(
+        "%s: rc=%d current=%d behind=%d other=%d"
+        % (PROG, rc, current, len(stale), len(other))
+    )
+    return rc
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Fake handoffkeep binary. `version --json` exists only in hk-mode=json; any
+# other mode (or argv) fails like the older binary's usage error.
+#
+#   $HOME/.fleet-rev/hk-mode      json -> answer version --json; else rc1
+#   $HOME/.fleet-rev/hk-rev       rev field for the JSON answer
+#   $HOME/.fleet-rev/hk-modified  modified field (default false)
+set -euo pipefail
+
+mode="$(cat "$HOME/.fleet-rev/hk-mode" 2>/dev/null || printf 'old')"
+if [[ "${1:-}" == "version" && "${2:-}" == "--json" && "$mode" == "json" ]]; then
+  rev="$(cat "$HOME/.fleet-rev/hk-rev")"
+  mod="$(cat "$HOME/.fleet-rev/hk-modified" 2>/dev/null || printf 'false')"
+  printf '{"rev":"%s","time":"2026-09-28T00:59:04Z","modified":%s,"module":"github.com/mgh3326/handoffkeep","go":"go1.25.0"}\n' "$rev" "$mod"
+  exit 0
+fi
+echo "handoffkeep: usage: handoffkeep serve|mcp|ctx|memory|doc|attach|r2usage|tasks|decisions|linear|fleet-metrics" >&2
+exit 1
