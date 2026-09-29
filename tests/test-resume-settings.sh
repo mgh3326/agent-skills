@@ -84,6 +84,11 @@ export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 export ARBITER_BIN="$TMP/absent-arbiter"
 export XDG_DATA_HOME="$TMP/xdg"
+# #951: claude-kind spawns seed folder trust into ${CLAUDE_CONFIG_DIR:-$HOME}/
+# .claude.json — fixture HOME keeps the operator's real config untouched.
+export HOME="$TMP/home"
+mkdir -p "$HOME"
+unset CLAUDE_CONFIG_DIR
 export ARBITER_INBOX_ROOT="$TMP/inbox"
 export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 export PANEWIRE_BIN="$ROOT/tests/fixtures/panewire"
