@@ -324,7 +324,7 @@ def check(d: dict) -> None:
         "wrk: the awk overrides strip must anchor at the suffix, not eat the closing quote"
     )
     assert re.search(
-        r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6-sol;\s*DEFAULT_EFFORT=high",
+        r"builder-sol\|captain-sol\)\s*PROFILE_KIND=codex;\s*PROFILE_MODEL=gpt-6\.1-sol;\s*DEFAULT_EFFORT=high",
         wrk,
     ), "wrk: builder-sol must default to effort high"
     assert "builder-sol|captain-sol) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high" in d["wrk"], (
@@ -682,8 +682,8 @@ mutants["builder-explicit-no-ref-dropped"] = mutate(
 )
 mutants["wrk-builder-sol-back-to-max"] = mutate(
     "wrk",
-    "builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=high",
-    "builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max",
+    "builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT=high",
+    "builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT=max",
 )
 mutants["policy-builder-sol-back-to-max"] = mutate(
     "policy",
@@ -824,8 +824,8 @@ echo "PASS builder-sol-max refused even with SCOPEFUEL_E6_ARM=codex-sol@max"
 # Worker-side names keep working: a bare codex-sol worker spawn still resolves
 # (the seat rule is builder-scoped), running the Sol model argv.
 spawn_t736 codex-sol --job t736-worker-sol >/dev/null
-grep -q -- '-m gpt-6-sol' "$TMP/herdr.log" ||
-  fail "worker codex-sol must still resolve to gpt-6-sol: $(cat "$TMP/herdr.log")"
+grep -q -- '-m gpt-6.1-sol' "$TMP/herdr.log" ||
+  fail "worker codex-sol must resolve to gpt-6.1-sol (#1026): $(cat "$TMP/herdr.log")"
 echo "PASS worker codex-sol spelling still resolves"
 
 echo "PASS test-assignment-defaults (prose contract + wrk behavior + mutants)"

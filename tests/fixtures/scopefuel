@@ -30,7 +30,7 @@ catalog_model_for() {
     opus) echo claude-opus-5-5 ;;
     sonnet|haiku) echo "" ;;
     fable) echo claude-fable-5-1 ;;
-    codex-sol) echo gpt-6-sol ;;
+    codex-sol) echo gpt-6.1-sol ;;
     codex-terra|codex-terra-max) echo gpt-5.6-terra ;;
     codex-luna|codex-luna-max) echo gpt-6-luna ;;
     codex-astra) echo gpt-6-astra ;;
