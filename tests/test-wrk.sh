@@ -78,8 +78,6 @@ cleanup() {
 trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
 printf '%s\n' 'fixture prompt' >"$PROMPT"
-# DEBUG-CI: report the dying line and mint counter (temporary, will revert)
-trap 'rc=$?; echo "SUITE-DIED rc=$rc line=$LINENO mintseq=$(cat "$TMP/mint-seq" 2>/dev/null): $(sed -n "${LINENO}p" "$0" | head -c 200)" >&2' ERR
 
 # ROB-1252: cc-qwen38/cc-glm read the clinepass gate key from this file at
 # spawn time (never from ~/.claude/); point it at a harmless fixture value.
@@ -139,7 +137,7 @@ try:
     state = json.load(open(path, encoding="utf-8"))
 except (OSError, ValueError):
     state = {"tasks": {}}
-for i in range(768001, 768500):
+for i in range(768001, 768800):
     state["tasks"][str(i)] = {
         "id": i, "lane": "", "title": "spawn-base pool", "kind": "implement",
         "state": "backlog", "priority": 0, "refs": {}, "claimed_by": "",
@@ -1046,8 +1044,12 @@ PY
     fail "#994 AC6: a multi-line table must warn could-not-be-parsed: $(cat "$LANES_ERR")"
   echo "PASS 994-lanes AC6: unparseable map warns could-not-be-parsed"
 
-  # AC7 — the non-fleet-only sentence is in --help and the README (grep).
-  "$WRK" spawn --help | grep -qi 'session_machine_ids is for non-fleet herdr sessions' ||
+  # AC7 — the non-fleet-only sentence is in --help and the README (grep). The
+  # help text is captured before grepping: a piped `grep -q` can exit on the
+  # match while the writer still has output buffered, which pipefail reads as
+  # a SIGPIPE failure.
+  ac7_help_out="$("$WRK" spawn --help)"
+  grep -qi 'session_machine_ids is for non-fleet herdr sessions' <<<"$ac7_help_out" ||
     fail "#994 AC7: spawn --help must carry the non-fleet sentence"
   grep -qi 'non-fleet' "$ROOT/README.md" ||
     fail "#994 AC7: README must carry the non-fleet sentence"
