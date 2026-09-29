@@ -38,36 +38,116 @@ EXIT_UNKNOWN = 3
 # exactly like it runs locally. It prints only key=value lines and reads
 # nothing besides the uv receipt, the agent-skills git checkout and the tool
 # binaries on PATH. Every tool call goes through run_tool's watchdog so a
-# hung version command reads `unknown` with `tool timed out` while the other
-# tools on that host still report.
+# hung version command — even a shell wrapper's process tree — reads
+# `unknown` with `tool timed out` while the other tools on that host still
+# report, and a whole-probe budget keeps the worst case inside the host
+# timeout.
 PROBE = r"""
 PATH="$HOME/.local/bin:$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export PATH
 GIT_OPTIONAL_LOCKS=0
 export GIT_OPTIONAL_LOCKS
-TOOL_T=5
+TOOL_T=3
+KILL_GRACE=1
+# Whole-probe budget: the sum of every tool call must stay inside the
+# host timeout however many calls the probe grows, so each call gets the
+# smaller of TOOL_T and the budget still left (KILL_GRACE + 1s reserved
+# to reap). A call that cannot start in time is skipped and its cell
+# reads unknown with 'probe budget spent'. Worst case stays at
+# ~PROBE_BUDGET + KILL_GRACE seconds of tool time, under the default 30s
+# host timeout.
+PROBE_BUDGET=21
+_pb_now=$(date +%s 2>/dev/null || printf '0')
+case "$_pb_now" in ''|*[!0-9]*) _pb_now=0 ;; esac
+PROBE_DEADLINE=0
+if [ "$_pb_now" -gt 0 ]; then PROBE_DEADLINE=$((_pb_now + PROBE_BUDGET)); fi
+
+# descendants PID — every pid below PID, deepest first (a recursive
+# pgrep -P walk). With no pgrep the walk is empty and only the direct
+# child gets signalled.
+descendants() {
+  for _d in $(pgrep -P "$1" 2>/dev/null); do
+    descendants "$_d"
+    printf '%s\n' "$_d"
+  done
+}
+
+# next_tool_bound — seconds the next tool call may run: TOOL_T, or less
+# when the whole-probe budget is nearly spent, or 0 when it is gone. A
+# dead clock degrades to the per-tool bound on its own.
+next_tool_bound() {
+  _nb_now=$(date +%s 2>/dev/null || printf '0')
+  case "$_nb_now" in ''|*[!0-9]*) _nb_now=0 ;; esac
+  if [ "$PROBE_DEADLINE" -eq 0 ] || [ "$_nb_now" -eq 0 ]; then
+    printf '%s\n' "$TOOL_T"
+    return
+  fi
+  _nb_left=$((PROBE_DEADLINE - _nb_now - KILL_GRACE - 1))
+  if [ "$_nb_left" -gt "$TOOL_T" ]; then _nb_left=$TOOL_T; fi
+  if [ "$_nb_left" -lt 0 ]; then _nb_left=0; fi
+  printf '%s\n' "$_nb_left"
+}
+
+# budget_unknown TOOL — a tool skipped because the probe budget ran out.
+budget_unknown() {
+  printf '%s.installed=unknown\n' "$1"
+  printf '%s.error=probe budget spent\n' "$1"
+}
 
 # run_tool SECONDS CMD... — per-tool bound, portable (POSIX sh, no GNU
-# timeout) and no temp files. CMD runs as a background child; a watchdog
-# subshell sleeps the bound, then SIGTERMs the child and SIGKILLs it 2s
-# later if needed. The watchdog's fds go to /dev/null so neither it nor its
-# sleep can hold the caller's output pipe open. When CMD finishes first the
-# watchdog and its in-flight sleep are both killed (pgrep -P finds the
-# sleep; without pgrep the orphan still exits on its own within the bound),
-# then wait reaps everything. rc 124 means the watchdog killed the child
-# (timed out); a command killed by one of those signals for another reason
+# timeout, no setsid) and no temp files. CMD runs as a background job
+# with stdin /dev/null. A watchdog subshell sleeps the bound, walks the
+# tree while the direct child still lives to pin its descendants, then
+# SIGTERMs the child and the listed pids and SIGKILLs them KILL_GRACE
+# seconds later; a wrapper's grandchild stays on the saved pid list even
+# after the wrapper died and reparented it. A second subshell snapshots
+# the tree every second while the child lives (a dead pid has no listed
+# children, so once the child exits the saved list is all there is);
+# SIGUSR1 wakes it to SIGKILL the last-seen descendants and exit, so a
+# grandchild orphaned by a finished wrapper cannot keep the caller's
+# output pipe open (the snapshot is at most a second stale — a child
+# spawned and detached in that gap is the residual, as is a pid freed
+# and reused inside it).
+# Both helpers' fds go to /dev/null so neither they nor their sleeps can
+# hold the caller's output pipe open. (A separate process group would
+# cover all of this, but a non-interactive sh without a tty refuses
+# set -m, and command substitution disables it even where one exists.)
+# When CMD finishes first the watchdog and its in-flight sleep are
+# killed (pgrep -P finds the sleep; without pgrep it exits on its own
+# within the bound), the sweeper is woken to do its last kill, then wait
+# reaps everything. rc 124 means the watchdog killed the tool (timed
+# out); a command killed by one of those signals for another reason
 # reports the same, still "not readable".
 run_tool() {
   _rt_t=$1; shift
-  "$@" &
+  "$@" </dev/null &
   _rt_p=$!
-  ( sleep "$_rt_t"; kill -TERM "$_rt_p" 2>/dev/null; sleep 2; kill -KILL "$_rt_p" 2>/dev/null ) >/dev/null 2>&1 &
+  ( sleep "$_rt_t"
+    _rt_k=$(descendants "$_rt_p")
+    kill -TERM "$_rt_p" $_rt_k 2>/dev/null
+    sleep "$KILL_GRACE"
+    kill -KILL "$_rt_p" $_rt_k $(descendants "$_rt_p") 2>/dev/null ) </dev/null >/dev/null 2>&1 &
   _rt_w=$!
+  ( _rt_k=
+    _rt_nap=
+    trap 'kill -KILL $_rt_k $_rt_nap 2>/dev/null; exit' USR1
+    while kill -0 "$_rt_p" 2>/dev/null; do
+      _rt_k=$(descendants "$_rt_p")
+      sleep 1 &
+      _rt_nap=$!
+      wait "$_rt_nap" 2>/dev/null
+    done
+    kill -KILL $_rt_k 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+  _rt_s=$!
   wait "$_rt_p" 2>/dev/null
   _rt_rc=$?
   _rt_c=$(pgrep -P "$_rt_w" 2>/dev/null || true)
   kill -KILL "$_rt_w" $_rt_c 2>/dev/null
   wait "$_rt_w" 2>/dev/null
+  # wake the sweeper for its last kill; it exits right after (untrapped
+  # USR1 would kill it anyway) so this wait is bounded.
+  kill -USR1 "$_rt_s" 2>/dev/null
+  wait "$_rt_s" 2>/dev/null
   if [ "$_rt_rc" -eq 143 ] || [ "$_rt_rc" -eq 137 ]; then _rt_rc=124; fi
   return "$_rt_rc"
 }
@@ -83,19 +163,35 @@ printf 'scopefuel.source=receipt\n'
 
 d="$HOME/.agents/skills"
 if [ -d "$d" ]; then
-  v=$(run_tool "$TOOL_T" git -C "$d" rev-parse HEAD 2>/dev/null)
-  vrc=$?
+  _b=$(next_tool_bound)
+  if [ "$_b" -gt 0 ]; then
+    v=$(run_tool "$_b" git -C "$d" rev-parse HEAD 2>/dev/null)
+    vrc=$?
+  else
+    v=
+    vrc=125
+  fi
   if [ "$vrc" -eq 124 ]; then
     printf 'agent-skills.installed=unknown\n'
     printf 'agent-skills.error=tool timed out\n'
+  elif [ "$vrc" -eq 125 ]; then
+    budget_unknown agent-skills
   elif [ -n "$v" ]; then
     printf 'agent-skills.installed=%s\n' "$v"
-    s=$(run_tool "$TOOL_T" git -C "$d" status --porcelain 2>/dev/null)
-    src=$?
+    _b=$(next_tool_bound)
+    if [ "$_b" -gt 0 ]; then
+      s=$(run_tool "$_b" git -C "$d" status --porcelain 2>/dev/null)
+      src=$?
+    else
+      s=
+      src=125
+    fi
     if [ "$src" -eq 0 ]; then
       printf 'agent-skills.dirty=%s\n' "$(printf '%s\n' "$s" | grep -c .)"
     elif [ "$src" -eq 124 ]; then
       printf 'agent-skills.error=tool timed out\n'
+    elif [ "$src" -eq 125 ]; then
+      printf 'agent-skills.error=probe budget spent\n'
     fi
   else
     printf 'agent-skills.installed=unknown\n'
@@ -106,11 +202,19 @@ fi
 printf 'agent-skills.source=git\n'
 
 if command -v panewire >/dev/null 2>&1; then
-  v=$(run_tool "$TOOL_T" panewire version 2>/dev/null)
-  vrc=$?
+  _b=$(next_tool_bound)
+  if [ "$_b" -gt 0 ]; then
+    v=$(run_tool "$_b" panewire version 2>/dev/null)
+    vrc=$?
+  else
+    v=
+    vrc=125
+  fi
   if [ "$vrc" -eq 124 ]; then
     printf 'panewire.installed=unknown\n'
     printf 'panewire.error=tool timed out\n'
+  elif [ "$vrc" -eq 125 ]; then
+    budget_unknown panewire
   else
     v=$(printf '%s\n' "$v" | sed -n '1p')
     case "$v" in
@@ -127,16 +231,30 @@ fi
 printf 'panewire.source=version-cmd\n'
 
 if command -v handoffkeep >/dev/null 2>&1; then
-  j=$(run_tool "$TOOL_T" handoffkeep version --json 2>/dev/null)
-  jrc=$?
+  _b=$(next_tool_bound)
+  if [ "$_b" -gt 0 ]; then
+    j=$(run_tool "$_b" handoffkeep version --json 2>/dev/null)
+    jrc=$?
+  else
+    j=
+    jrc=125
+  fi
   if [ "$jrc" -eq 0 ]; then
     printf 'handoffkeep.source=version-cmd\n'
     printf 'handoffkeep.json=%s\n' "$(printf '%s' "$j" | sed -n '1p')"
   else
     if [ "$jrc" -eq 124 ]; then printf 'handoffkeep.error=tool timed out\n'; fi
-    o=$(run_tool "$TOOL_T" go version -m "$(command -v handoffkeep)" 2>/dev/null)
-    orc=$?
+    if [ "$jrc" -eq 125 ]; then printf 'handoffkeep.error=probe budget spent\n'; fi
+    _b=$(next_tool_bound)
+    if [ "$_b" -gt 0 ]; then
+      o=$(run_tool "$_b" go version -m "$(command -v handoffkeep)" 2>/dev/null)
+      orc=$?
+    else
+      o=
+      orc=125
+    fi
     if [ "$orc" -eq 124 ]; then printf 'handoffkeep.error=tool timed out\n'; fi
+    if [ "$orc" -eq 125 ]; then printf 'handoffkeep.error=probe budget spent\n'; fi
     v=$(printf '%s\n' "$o" | sed -n 's/.*vcs\.revision=\([^ ]*\).*/\1/p' | sed -n '1p')
     m=$(printf '%s\n' "$o" | sed -n 's/.*vcs\.modified=\([^ ]*\).*/\1/p' | sed -n '1p')
     if [ -n "$v" ]; then
