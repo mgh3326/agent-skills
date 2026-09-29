@@ -260,7 +260,7 @@ devin_spawn_at() {
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     XDG_DATA_HOME="$xdg" \
     ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
-    WRK_FIXTURE_SCENARIO=devin-idle \
+    WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-devin-idle}" \
     WRK_FIXTURE_LOG="$TMP/herdr-$label.log" WRK_FIXTURE_MARKER="" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel-$label.log" \
     WRK_REFRESH_LOG="$TMP/refresh-$label.log" \
@@ -1132,6 +1132,14 @@ grep -q -- '--include-captains legacy alias' <<<"$reap_help_out"
 "$WRK" name-sync --help >/dev/null
 "$WRK" profiles --help >/dev/null
 run_fail "$WRK" profiles --bogus
+# #979: hosts called the never-defined hosts_help — --help and -h must print
+# the usage and exit 0, while an unknown flag still dies as a usage error.
+hosts_help_out="$("$WRK" hosts --help)"
+grep -q 'Usage: wrk hosts' <<<"$hosts_help_out" ||
+  fail "hosts --help must print the hosts usage: $hosts_help_out"
+"$WRK" hosts -h >/dev/null || fail "hosts -h must exit 0"
+run_fail "$WRK" hosts --bogus
+run_fail "$WRK" hosts extra
 run_fail "$WRK" spawn -c "$ROOT" -p "$PROMPT" -w w -l fixture
 run_fail "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --bogus
 run_fail "$WRK" nope
@@ -1298,7 +1306,7 @@ grep -q 'model=devin-swe2' <<<"$devin_idle_out"
 grep -q 'status=idle' <<<"$devin_idle_out"
 grep -q 'landed=yes' <<<"$devin_idle_out"
 [[ "$(grep -c '^agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
-devin_run_line="$(grep '^pane run ' "$TMP/herdr.log")"
+devin_run_line="$(grep '^pane run w:p1 devin ' "$TMP/herdr.log")"
 [[ "$devin_run_line" == 'pane run w:p1 devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
   fail "devin pane-run argv snapshot mismatch: $devin_run_line"
 # Detection and the idle wait share one 30s window, so the wait gets what is
@@ -1319,7 +1327,7 @@ grep -qx 'agent rename w:p1 fixture' "$TMP/herdr.log" ||
 if grep -q '^agent start .*--kind devin' "$TMP/herdr.log"; then
   fail "devin workaround must not call agent start"
 fi
-devin_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+devin_run_no="$(grep -n '^pane run w:p1 devin ' "$TMP/herdr.log" | cut -d: -f1)"
 devin_get_no="$(grep -n '^agent get ' "$TMP/herdr.log" | head -n1 | cut -d: -f1)"
 (( devin_run_no < devin_get_no )) || fail "devin detection poll must follow pane run"
 devin_wait_no="$(grep -n '^agent wait ' "$TMP/herdr.log" | cut -d: -f1)"
@@ -1568,14 +1576,23 @@ grep -q 'Devin pane startup failed: agent explain matched no identity rule withi
 echo "PASS 649-unknown-screen-window-fails-closed"
 
 # Detection on the window edge: a fake clock (only `date +%s` is faked) puts
-# every reading after the first 31s past pane run. Detection succeeds on the
-# first get, but no time is left, so wrk must fail before agent wait instead of
-# handing it a zero or negative timeout.
+# the window deadline between detection and the idle wait. Detection succeeds
+# on the first get, but no time is left, so wrk must fail before agent wait
+# instead of handing it a zero or negative timeout.
 mkdir -p "$TMP/fakeclock"
+# #979: the readiness probe adds one `date +%s` call to the start path — the
+# readiness loop's deadline check on the iteration that sends the probe —
+# so the clock now stays in-window for the first two calls (started_at, the
+# probe-send iteration) and jumps on the third: the post-detection
+# remaining_ms check, or the first failed get's deadline check.
 cat >"$TMP/fakeclock/date" <<'SH'
 #!/usr/bin/env bash
 if [[ "$*" == +%s ]]; then
-  if [[ -e "$FAKECLOCK_STATE" ]]; then echo 1031; else : >"$FAKECLOCK_STATE"; echo 1000; fi
+  calls=0
+  [[ -e "$FAKECLOCK_STATE" ]] && calls="$(cat "$FAKECLOCK_STATE")"
+  calls=$(( calls + 1 ))
+  printf '%s\n' "$calls" >"$FAKECLOCK_STATE"
+  if (( calls > ${FAKECLOCK_AFTER_CALLS:-2} )); then echo 1031; else echo 1000; fi
   exit 0
 fi
 exec /bin/date "$@"
@@ -1866,7 +1883,7 @@ grep -q '^agent start fixture --kind codex --pane w:p1 --timeout 89000 -- ' "$TM
 devin_shell_out="$(TEST_FIXTURE_SCENARIO=devin-shell-busy spawn_base devin-swe2 2>&1)" ||
   fail "Devin with a shell ready on the fourth poll must still spawn: $devin_shell_out"
 grep -q 'landed=yes' <<<"$devin_shell_out" || fail "late-shell Devin did not land: $devin_shell_out"
-devin_shell_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+devin_shell_run_no="$(grep -n '^pane run w:p1 devin ' "$TMP/herdr.log" | cut -d: -f1)"
 [[ "$(head -n "$devin_shell_run_no" "$TMP/herdr.log" | grep -c '^pane process-info --pane w:p1$')" -eq 4 ]] ||
   fail "late-shell Devin must poll process-info on the tab-create pane until ready, then pane run"
 if grep -q '^pane close ' "$TMP/herdr.log"; then fail "late-shell Devin pane was closed"; fi
@@ -1919,12 +1936,131 @@ devin_m1b_out="$(TEST_FIXTURE_SCENARIO=devin-shell-busy-m1b spawn_base devin-swe
   fail "m1b-shape shell ready on the fourth poll must still spawn: $devin_m1b_out"
 grep -q 'landed=yes' <<<"$devin_m1b_out" ||
   fail "m1b-shape late-shell Devin did not land: $devin_m1b_out"
-devin_m1b_run_no="$(grep -n '^pane run ' "$TMP/herdr.log" | cut -d: -f1)"
+devin_m1b_run_no="$(grep -n '^pane run w:p1 devin ' "$TMP/herdr.log" | cut -d: -f1)"
 [[ "$(head -n "$devin_m1b_run_no" "$TMP/herdr.log" | grep -c '^pane process-info --pane w:p1$')" -eq 4 ]] ||
   fail "m1b-shape Devin must poll process-info until the shell is alone in the foreground"
 if grep -q '^pane close ' "$TMP/herdr.log"; then fail "m1b-shape late-shell Devin pane was closed"; fi
 devin_shell_failure_case devin-shell-never-ready-m1b 'shell not ready within 30000ms (foreground busy x120)'
 echo "PASS 604-m1b-envelope: unwrapped process-info polls shell-busy foreground, fail-closed at window"
+
+# #979 (Pi incident, jobs/971-stale-race-20260929-1848): a fresh pane can hold
+# the shell alone in the foreground while zsh sits in a pending rc-file read
+# — omz's update check holds `read -k 1`, which ate the `d` of the typed
+# `devin` and left `evin` to run. process-info cannot see it, so after the
+# foreground check passes wrk types a space-prefixed printf probe carrying a
+# fresh token and requires the token back as its own output line before the
+# agent argv is typed. The only `herdr pane run` call site that types into a
+# fresh shell pane is devin_start_in_pane (every other kind's start goes
+# through `agent start`, which herdr gates internally), so the probe lives
+# there and these cases cover it.
+t979_xdg="$TMP/t979-xdg"
+devin_trust_seed_store "$t979_xdg" "$ROOT" "$(cd "$ROOT" && pwd -P)"
+
+# AC3: an ordinary ready shell — exactly one probe line and one agent command
+# typed, the probe's token answered on the first pane read, spawn rc 0.
+: >"$TMP/herdr-t979-normal.log"; rm -f "$TMP/herdr-t979-normal.log.executed"
+devin_normal_out="$(TEST_FIXTURE_SCENARIO=devin-idle devin_spawn_at "$t979_xdg" "$ROOT" t979-normal "$(mint_task)" 2>&1)" ||
+  fail "ready-shell devin spawn failed: $devin_normal_out"
+grep -q 'landed=yes' <<<"$devin_normal_out" || fail "ready-shell devin did not land: $devin_normal_out"
+t979_log="$TMP/herdr-t979-normal.log"
+[[ "$(grep -c '^pane run ' "$t979_log")" -eq 2 ]] ||
+  fail "ready shell must see exactly one probe and one agent run: $(grep '^pane run ' "$t979_log")"
+grep -qE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-[0-9-]+'" "$t979_log" ||
+  fail "probe line missing or not space-prefixed printf: $(grep '^pane run ' "$t979_log")"
+[[ "$(grep -c '^pane read w:p1 ' "$t979_log")" -eq 1 ]] ||
+  fail "answered probe must cost exactly one pane read (one poll): $(grep -c '^pane read ' "$t979_log")"
+t979_probe_no="$(grep -nE "^pane run w:p1 +printf" "$t979_log" | cut -d: -f1)"
+t979_read_no="$(grep -n '^pane read w:p1 ' "$t979_log" | cut -d: -f1)"
+t979_agent_no="$(grep -n '^pane run w:p1 devin ' "$t979_log" | cut -d: -f1)"
+(( t979_probe_no < t979_read_no && t979_read_no < t979_agent_no )) ||
+  fail "probe must be typed, its output read, and only then the agent command"
+echo "PASS 979-AC3 ready shell: one probe, one read, one agent run"
+
+# AC1: the pending one-key read consumes the first typed line — the probe
+# goes unanswered, the input line is cleared, the probe is retyped with a new
+# token, and the full devin argv then lands unharmed.
+: >"$TMP/herdr-t979-eaten.log"; rm -f "$TMP/herdr-t979-eaten.log.executed"
+devin_eaten_out="$(TEST_FIXTURE_SCENARIO=devin-read-eats-line devin_spawn_at "$t979_xdg" "$ROOT" t979-eaten "$(mint_task)" 2>&1)" ||
+  fail "Devin behind a pending read must still spawn: $devin_eaten_out"
+grep -q 'landed=yes' <<<"$devin_eaten_out" || fail "eaten-line devin did not land: $devin_eaten_out"
+t979_log="$TMP/herdr-t979-eaten.log"
+[[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$t979_log")" -eq 2 ]] ||
+  fail "unanswered probe must be cleared and retyped with a fresh token: $(grep '^pane run ' "$t979_log")"
+grep -qx 'pane send-keys w:p1 ctrl+c' "$t979_log" ||
+  fail "an unanswered probe must clear the input line (ctrl+c) before retyping"
+[[ "$(grep -c '^pane run w:p1 devin ' "$t979_log")" -eq 1 ]] ||
+  fail "devin argv must be typed exactly once, after the shell proved it runs lines"
+grep -qx 'devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' \
+  "$t979_log.executed" ||
+  fail "the fake shell must execute the full devin argv: $(cat "$t979_log.executed")"
+[[ "$(grep -c 'wrk-ready-' "$t979_log.executed")" -eq 1 ]] ||
+  fail "the retried probe — and not the eaten one — must be the only executed probe"
+echo "PASS 979-AC1 eaten first line: probe retried, agent argv intact, rc 0"
+
+# AC2: a pending read that never ends — the probe is never answered, the
+# spawn fails inside START_TIMEOUT with its own reason, the pane is cleaned
+# up as today, and the agent command is never typed.
+: >"$TMP/herdr-t979-stuck.log"
+set +e
+devin_stuck_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends devin_spawn_at "$t979_xdg" "$ROOT" t979-stuck "$(mint_task)" 2>&1)"
+devin_stuck_rc=$?
+set -e
+[[ "$devin_stuck_rc" -eq 1 ]] || fail "never-answering probe expected rc=1, got $devin_stuck_rc: $devin_stuck_out"
+grep -q 'Devin pane startup failed: shell did not execute a readiness probe within 30000ms' <<<"$devin_stuck_out" ||
+  fail "never-answering probe lost its distinct diagnostic: $devin_stuck_out"
+t979_log="$TMP/herdr-t979-stuck.log"
+[[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$t979_log")" -gt 1 ]] ||
+  fail "an unanswered probe must be retyped inside the window"
+if grep -q '^pane run w:p1 devin ' "$t979_log"; then
+  fail "agent command was typed into a shell that never executed a probe"
+fi
+grep -qx 'pane close w:p1' "$t979_log" || fail "never-answering probe leaked its pane"
+if grep -q '^agent prompt ' "$t979_log"; then fail "never-answering probe delivered a brief"; fi
+grep -q 'Devin spawn failure artifacts preserved under ' <<<"$devin_stuck_out" ||
+  fail "never-answering probe must keep the existing diagnostics path: $devin_stuck_out"
+echo "PASS 979-AC2 probe never answered: distinct reason, pane closed, no agent run"
+
+# AC6 mutants — assertion-RED invariants:
+#   M1 "the agent command is typed only after the shell has executed a probe"
+#      (mutant: ready foreground returns immediately, skipping the probe)
+#   M2 "a probe line that echoed but did not run is not proof"
+#      (mutant: substring match accepts the echoed command line)
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+devin_trust_mutant t979-no-probe \
+  'if [[ "$ready" == yes ]]; then devin_probe_send || return 1; fi' \
+  'if [[ "$ready" == yes ]]; then return 0; fi'
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+devin_trust_mutant t979-echo-match \
+  'grep -qxF "$probe_token"' \
+  'grep -qF "$probe_token"'
+set +e
+t979_m1_out="$(TEST_FIXTURE_SCENARIO=devin-read-eats-line WRK_UNDER_TEST="$TMP/mut-wrk-t979-no-probe" \
+  devin_spawn_at "$t979_xdg" "$ROOT" t979-m1 "$(mint_task)" 2>&1)"
+t979_m1_rc=$?
+t979_m2_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends WRK_UNDER_TEST="$TMP/mut-wrk-t979-echo-match" \
+  devin_spawn_at "$t979_xdg" "$ROOT" t979-m2 "$(mint_task)" 2>&1)"
+t979_m2_rc=$?
+set -e
+# M1 under AC1's eaten-line pane: the devin argv itself is consumed, so the
+# spawn must NOT reach the OK line (real run expects rc 0 + landed=yes).
+[[ "$t979_m1_rc" -ne 0 ]] ||
+  fail "M1 (probe skipped): spawn succeeded despite the eaten agent line: $t979_m1_out"
+if grep -q '^OK ' <<<"$t979_m1_out"; then
+  fail "M1 (probe skipped): OK line printed for an eaten agent command: $t979_m1_out"
+fi
+# M2 under AC2's never-ending read: the echoed probe is accepted as proof, so
+# the agent command gets typed into the dead shell — the spawn must fail, and
+# NOT with the never-answered reason the real check produces.
+[[ "$t979_m2_rc" -ne 0 ]] ||
+  fail "M2 (echo accepted): spawn succeeded on a pane that only echoes: $t979_m2_out"
+if grep -q 'shell did not execute a readiness probe' <<<"$t979_m2_out"; then
+  fail "M2 (echo accepted) lost the divergence: substring match must pass the echo and fail downstream"
+fi
+grep -q '^pane run w:p1 devin ' "$TMP/herdr-t979-m2.log" ||
+  fail "M2 (echo accepted) proof — the agent command must have been (wrongly) typed"
+echo "PASS 979-AC6 mutants red: M1 skip-probe, M2 echo-as-proof"
 
 expect_exit 2 spawn_base devin-swe2 --effort high
 # Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker
@@ -1957,7 +2093,7 @@ for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepse
     fail "$devin_profile spawn output lost its model: $devin_variant_out"
   grep -q 'status=idle' <<<"$devin_variant_out" ||
     fail "$devin_profile did not reach idle landing: $devin_variant_out"
-  devin_variant_run="$(grep '^pane run ' "$TMP/herdr.log")"
+  devin_variant_run="$(grep '^pane run w:p1 devin ' "$TMP/herdr.log")"
   [[ "$devin_variant_run" == "pane run w:p1 devin --model $devin_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
     fail "$devin_profile run argv snapshot mismatch: $devin_variant_run"
   [[ " $devin_variant_run " != *' --effort '* ]] ||
@@ -4433,7 +4569,7 @@ set -e
   fail "builder-devin must be admitted under --role builder (rc=$builder_devin_rc): $builder_devin_out"
 grep -q 'model=builder-devin' <<<"$builder_devin_out" ||
   fail "builder-devin spawn output lost its model: $builder_devin_out"
-builder_devin_run="$(grep '^pane run ' "$TMP/herdr.log")"
+builder_devin_run="$(grep '^pane run w:p1 devin ' "$TMP/herdr.log")"
 [[ "$builder_devin_run" == 'pane run w:p1 devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false' ]] ||
   fail "builder-devin must reuse the devin-swe2 worker argv verbatim: $builder_devin_run"
 [[ " $builder_devin_run " != *' --effort '* ]] || fail "builder-devin must not gain an effort flag"
@@ -4464,7 +4600,7 @@ for devin_builder_pair in "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2
     fail "$devin_builder_profile must be admitted under --role builder (rc=$devin_variant_builder_rc): $devin_variant_builder_out"
   grep -q "model=$devin_builder_profile" <<<"$devin_variant_builder_out" ||
     fail "$devin_builder_profile builder spawn output lost its model: $devin_variant_builder_out"
-  devin_variant_builder_run="$(grep '^pane run ' "$TMP/herdr.log")"
+  devin_variant_builder_run="$(grep '^pane run w:p1 devin ' "$TMP/herdr.log")"
   [[ "$devin_variant_builder_run" == "pane run w:p1 devin --model $devin_builder_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
     fail "$devin_builder_profile builder argv mismatch: $devin_variant_builder_run"
   [[ " $devin_variant_builder_run " != *' --effort '* ]] ||
@@ -4780,7 +4916,7 @@ for devin_builder_pair in "builder-devin-medium:swe-2-medium" "builder-devin-max
     fail "$devin_builder_profile must be admitted under --role builder (rc=$devin_builder_rc): $devin_builder_out"
   grep -q "model=$devin_builder_profile" <<<"$devin_builder_out" ||
     fail "$devin_builder_profile spawn output lost its model: $devin_builder_out"
-  devin_builder_run="$(grep '^pane run ' "$TMP/herdr.log")"
+  devin_builder_run="$(grep '^pane run w:p1 devin ' "$TMP/herdr.log")"
   [[ "$devin_builder_run" == "pane run w:p1 devin --model $devin_builder_model --permission-mode dangerous --respect-workspace-trust false" ]] ||
     fail "$devin_builder_profile must reuse the worker variant's argv verbatim: $devin_builder_run"
   [[ " $devin_builder_run " != *' --effort '* ]] ||

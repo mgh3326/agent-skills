@@ -1933,21 +1933,71 @@ else:
 # is judged from shell_pid + foreground pids alone, the group id checked only
 # when present. What stays invalid — and fails closed at once — is an envelope
 # whose shell_pid/foreground list cannot be read at all.
+# #979: the shell holding the foreground alone is not proof of a command-line
+# prompt — a fresh pane's zsh can sit in a pending rc-file read (the Pi's
+# oh-my-zsh update check holds `read -k 1`; the typed `devin` lost its first
+# character to it and the spawn died agent_not_found on `evin`,
+# jobs/971-stale-race-20260929-1848). Once the foreground says "shell alone",
+# prove the shell executes command lines before the agent argv is typed: run a
+# probe whose printf argument is a fresh token and require the token back as
+# its own output line. The echoed command carries the token inside the printf
+# argument too, so only an exact-line match is proof — a substring match would
+# accept an echo from a shell that ran nothing. A probe that goes unanswered
+# is cleared with ctrl+c (which also aborts a pending read or a half-typed
+# line) and retyped with a new token, all inside the same START_TIMEOUT
+# window; a probe that never lands is a distinct fail-closed reason.
+DEVIN_PROBE_MISS_POLLS=4
+
+# probe_token/probe_sends/probe_misses/attempts are devin_wait_shell_ready
+# locals — dynamic scope is what lets this helper update them.
+devin_probe_send() {
+  probe_token="wrk-ready-$$-${attempts}-${RANDOM}"
+  probe_sends=$(( probe_sends + 1 ))
+  probe_misses=0
+  local probe_run_rc
+  set +e
+  # The leading space keeps the probe out of shell history where the shell
+  # honours it; the single argument is the whole typed line.
+  "$HERDR" pane run "$PANE" " printf '%s\\n' '$probe_token'" >/dev/null
+  probe_run_rc=$?
+  set -e
+  if [[ "$probe_run_rc" -ne 0 ]]; then
+    devin_spawn_diagnostics "readiness probe pane run exited $probe_run_rc"
+    return 1
+  fi
+}
+
 devin_wait_shell_ready() {
   local started_at="$1" attempts=0 max_attempts info_out info_rc ready
+  local probe_token="" probe_sends=0 probe_misses=0 probe_out probe_rc
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
   while :; do
     attempts=$(( attempts + 1 ))
-    set +e
-    info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
-    info_rc=$?
-    set -e
-    if [[ "$info_rc" -ne 0 ]]; then
-      devin_spawn_diagnostics "pane process-info exited $info_rc before pane run"
-      return 1
-    fi
-    set +e
-    ready="$(printf '%s' "$info_out" | python3 -c '
+    if [[ -n "$probe_token" ]]; then
+      # A probe is in flight: only its own output line proves execution.
+      set +e
+      probe_out="$("$HERDR" pane read "$PANE" --source recent-unwrapped --lines 60 2>/dev/null)"
+      probe_rc=$?
+      set -e
+      if [[ "$probe_rc" -eq 0 ]] && grep -qxF "$probe_token" <<<"$probe_out"; then
+        return 0
+      fi
+      probe_misses=$(( probe_misses + 1 ))
+      if (( probe_misses >= DEVIN_PROBE_MISS_POLLS )); then
+        "$HERDR" pane send-keys "$PANE" ctrl+c >/dev/null 2>&1 || true
+        probe_token=""
+      fi
+    else
+      set +e
+      info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
+      info_rc=$?
+      set -e
+      if [[ "$info_rc" -ne 0 ]]; then
+        devin_spawn_diagnostics "pane process-info exited $info_rc before pane run"
+        return 1
+      fi
+      set +e
+      ready="$(printf '%s' "$info_out" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 res = d.get("result")
@@ -1967,15 +2017,20 @@ if group is not None:
     ready = ready and group == shell
 print("yes" if ready else "no")
 ' 2>/dev/null)"
-    info_rc=$?
-    set -e
-    if [[ "$info_rc" -ne 0 ]]; then
-      devin_spawn_diagnostics "pane process-info returned an invalid envelope before pane run"
-      return 1
+      info_rc=$?
+      set -e
+      if [[ "$info_rc" -ne 0 ]]; then
+        devin_spawn_diagnostics "pane process-info returned an invalid envelope before pane run"
+        return 1
+      fi
+      if [[ "$ready" == yes ]]; then devin_probe_send || return 1; fi
     fi
-    [[ "$ready" == yes ]] && return 0
     if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= START_TIMEOUT )); then
-      devin_spawn_diagnostics "shell not ready within ${START_TIMEOUT}ms (foreground busy x$attempts)"
+      if [[ "$probe_sends" -gt 0 ]]; then
+        devin_spawn_diagnostics "shell did not execute a readiness probe within ${START_TIMEOUT}ms (probes typed x$probe_sends)"
+      else
+        devin_spawn_diagnostics "shell not ready within ${START_TIMEOUT}ms (foreground busy x$attempts)"
+      fi
       return 1
     fi
     sleep_for "$SHELL_READY_POLL_SECONDS"
@@ -6243,10 +6298,29 @@ spawn_router_cmd() {
   return "$rc"
 }
 
+hosts_help() {
+  cat <<'USAGE'
+Usage: wrk hosts
+
+Print the resolved hosts.toml path, this host's measured load
+(load5/ncpu ratio and active spawn count), then probe every configured
+spill-over host and print a status table (available, or the probe failure
+reason, with the remote load/active counts when reachable).
+
+  -h, --help   show this usage
+USAGE
+}
+
 hosts_cmd() {
   local host config
-  [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { hosts_help; return 0; }
-  [[ $# -eq 0 ]] || die "hosts accepts no arguments"
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+      [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+      hosts_help
+      return 0
+    fi
+    die "unexpected argument '$1'"
+  fi
   config="$(spillover_config)"
   spillover_local_measure
   printf 'config=%s\n' "$config"
