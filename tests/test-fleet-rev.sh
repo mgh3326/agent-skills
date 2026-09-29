@@ -693,8 +693,8 @@ assert_cell a panewire "unknown"
 for t in scopefuel agent-skills handoffkeep; do
   assert_cell a "$t" "current" || fail "AC13 $t did not report"
 done
-[[ $ELA -lt 12 ]] ||
-  fail "AC13 hung tool stalled the run: ${ELA}s (bound 5s + kill grace 2s)"
+[[ $ELA -lt 10 ]] ||
+  fail "AC13 hung tool stalled the run: ${ELA}s (bound 3s + kill grace 1s)"
 # no process left behind: the exec'd 'sleep 63' must be gone from the table
 if pgrep -f 'sleep 63' >/dev/null 2>&1; then
   fail "AC13 left a hung panewire process behind: $(pgrep -fl 'sleep 63')"
@@ -713,7 +713,7 @@ assert_cell a handoffkeep "unknown"
 for t in scopefuel agent-skills panewire; do
   assert_cell a "$t" "current" || fail "AC13 $t did not report"
 done
-[[ $ELA -lt 12 ]] ||
+[[ $ELA -lt 10 ]] ||
   fail "AC13 hung handoffkeep stalled the run: ${ELA}s"
 if pgrep -f 'sleep 63' >/dev/null 2>&1; then
   fail "AC13 left a hung handoffkeep process behind: $(pgrep -fl 'sleep 63')"
@@ -773,5 +773,246 @@ line="$(grep -A2 'uv tool install --force' "$ROOT/README.md")"
 [[ "$line" == *scopefuel* && "$line" == *권장* ]] ||
   fail "AC15 README scopefuel form not labelled recommended: $line"
 pass "AC15 README labels the scopefuel @<sha> form as recommended (N7)"
+
+# ================================================================ AC16 (1007 B1)
+# A tool that is a non-exec sh wrapper — the real work runs as a CHILD, so
+# killing only the wrapper leaves a grandchild holding the output pipe.
+# Invariant I-M1: a wrapper's grandchild never outlives the bound. Both
+# shapes (foreground child, 'sleep & wait') must read unknown with
+# 'tool timed out', the host stays reachable, the run ends inside the
+# bound plus margin (its own outer bound is --timeout 30), and no
+# grandchild survives.
+reset_env
+S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
+PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
+AS_MAIN="$(git -C "$CANON_AS" rev-parse HEAD)"
+set_main scopefuel "$S_MAIN"; set_main agent-skills "$AS_MAIN"
+set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
+
+full_current_home "$(remote_home x)"
+# wrapper shape 1: the real tool is a foreground child of the wrapper
+cat >"$(remote_home x)/.local/bin/panewire" <<'EOF'
+#!/bin/sh
+sleep 61
+printf 'pw-deadbee\n'
+EOF
+chmod +x "$(remote_home x)/.local/bin/panewire"
+SECONDS=0
+run_fleet --only a --timeout 30
+ELA=$SECONDS
+[[ $RC -eq 3 ]] || fail "AC16 child-form rc: want 3 got $RC :: $OUT"
+assert_cell a panewire "unknown"
+[[ "$(cell a panewire)" == *"tool timed out"* ]] ||
+  fail "AC16 child-form detail: $(cell a panewire)"
+for t in scopefuel agent-skills handoffkeep; do
+  assert_cell a "$t" "current"
+done
+[[ $ELA -lt 10 ]] || fail "AC16 child-form stalled: ${ELA}s (bound 3s + kill grace 1s)"
+pgrep -f 'sleep 61' >/dev/null 2>&1 &&
+  fail "AC16 child-form left a grandchild behind: $(pgrep -fl 'sleep 61')"
+
+# wrapper shape 2: 'sleep & wait' — the classic non-exec wrapper
+full_current_home "$(remote_home x)"
+cat >"$(remote_home x)/.local/bin/panewire" <<'EOF'
+#!/bin/sh
+sleep 62 &
+wait
+printf 'pw-deadbee\n'
+EOF
+chmod +x "$(remote_home x)/.local/bin/panewire"
+SECONDS=0
+run_fleet --only a --timeout 30
+ELA=$SECONDS
+[[ $RC -eq 3 ]] || fail "AC16 wait-form rc: want 3 got $RC :: $OUT"
+assert_cell a panewire "unknown"
+[[ "$(cell a panewire)" == *"tool timed out"* ]] ||
+  fail "AC16 wait-form detail: $(cell a panewire)"
+for t in scopefuel agent-skills handoffkeep; do
+  assert_cell a "$t" "current"
+done
+[[ $ELA -lt 10 ]] || fail "AC16 wait-form stalled: ${ELA}s"
+pgrep -f 'sleep 62' >/dev/null 2>&1 &&
+  fail "AC16 wait-form left a grandchild behind: $(pgrep -fl 'sleep 62')"
+
+# depth-3 tree: wrapper -> interior that outlives its own leaf -> leaf.
+# The interior respawns its child forever, so an interior node left
+# unsignalled (a leaf-only kill list) keeps a fresh leaf holding the
+# pipe open and the host reads unreachable. Invariant I-M3: every
+# interior node of the tool tree is signalled.
+full_current_home "$(remote_home x)"
+cat >"$(remote_home x)/.local/bin/panewire" <<'EOF'
+#!/bin/sh
+sh -c 'while :; do sleep 64; done' &
+wait
+printf 'pw-deadbee\n'
+EOF
+chmod +x "$(remote_home x)/.local/bin/panewire"
+SECONDS=0
+run_fleet --only a --timeout 30
+ELA=$SECONDS
+[[ $RC -eq 3 ]] || fail "AC16 depth3 rc: want 3 got $RC :: $OUT"
+assert_cell a panewire "unknown"
+[[ "$(cell a panewire)" == *"tool timed out"* ]] ||
+  fail "AC16 depth3 detail: $(cell a panewire)"
+for t in scopefuel agent-skills handoffkeep; do
+  assert_cell a "$t" "current"
+done
+[[ $ELA -lt 10 ]] || fail "AC16 depth3 stalled: ${ELA}s"
+pgrep -f 'while :; do sleep 64' >/dev/null 2>&1 &&
+  fail "AC16 depth3 left the interior tool behind: $(pgrep -fl 'while :; do sleep 64')"
+pgrep -f 'sleep 64' >/dev/null 2>&1 &&
+  fail "AC16 depth3 left a leaf behind: $(pgrep -fl 'sleep 64')"
+
+# late child: the wrapper backs off ~2.7s inside the bound, then starts a
+# hung retry and waits on it (the tester measured escapes for children
+# started at 2.2-2.9s; ~2.7 keeps the spawn clear of the sweeper's last
+# snapshot even where each tree walk is slow). If the watchdog SIGTERMs
+# the wrapper before walking the tree, the walk finds a dead parent —
+# the retry is already reparented and escapes the kill list, holding the
+# pipe until the host reads unreachable. Invariant I-M4: a hung child a
+# wrapper starts late in the bound never outlives the bound.
+full_current_home "$(remote_home x)"
+cat >"$(remote_home x)/.local/bin/panewire" <<'EOF'
+#!/bin/sh
+sleep 2.7
+sleep 67 &
+wait
+printf 'pw-deadbee\n'
+EOF
+chmod +x "$(remote_home x)/.local/bin/panewire"
+SECONDS=0
+run_fleet --only a --timeout 30
+ELA=$SECONDS
+[[ $RC -eq 3 ]] || fail "AC16 late-child rc: want 3 got $RC :: $OUT"
+assert_cell a panewire "unknown"
+[[ "$(cell a panewire)" == *"tool timed out"* ]] ||
+  fail "AC16 late-child detail: $(cell a panewire)"
+for t in scopefuel agent-skills handoffkeep; do
+  assert_cell a "$t" "current"
+done
+[[ $ELA -lt 10 ]] || fail "AC16 late-child stalled: ${ELA}s"
+pgrep -f 'sleep 67' >/dev/null 2>&1 &&
+  fail "AC16 late-child left the retry behind: $(pgrep -fl 'sleep 67')"
+
+# unit check: descendants prints every pid of a 3-level tree exactly
+# once, deepest first — the shared loop variable must not clobber an
+# interior node's own entry with its subtree's last leaf.
+python3 - "$FLEET_REV" >"$TMP/probe-ac16.sh" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+print(re.search(r'PROBE = r"""(.*?)"""', src, re.S).group(1))
+PY
+sed -n '/^descendants()/,/^}/p' "$TMP/probe-ac16.sh" >"$TMP/desc.sh"
+sh -c 'sh -c "sleep 65 & wait" & wait' &
+D3_P=$!
+disown 2>/dev/null || true
+sleep 1
+D3_C="$(pgrep -P "$D3_P" || true)"
+D3_L="$(pgrep -P "$D3_C" || true)"
+[[ -n "$D3_C" && -n "$D3_L" ]] ||
+  fail "AC16 descendants unit fixture broken: P=$D3_P C=$D3_C L=$D3_L"
+D3_GOT="$(sh -c ". \"$TMP/desc.sh\"; descendants \"$D3_P\"")"
+D3_WANT="$(printf '%s\n%s\n' "$D3_L" "$D3_C")"
+kill -KILL "$D3_P" "$D3_C" "$D3_L" 2>/dev/null || true
+wait 2>/dev/null || true
+[[ "$D3_GOT" == "$D3_WANT" ]] ||
+  fail "AC16 descendants unit: want $(printf '[%s]' "$D3_WANT" | tr '\n' ' ') got $(printf '[%s]' "$D3_GOT" | tr '\n' ' ')"
+pass "AC16 non-exec wrapper (child, sleep-&-wait, depth-3 and late-child forms) bounded; whole tree killed"
+
+# ================================================================ AC17 (1007 B2)
+# The probe's real worst case: five sequential tool calls on one host and
+# every one ignoring TERM (git rev-parse slow but successful just under
+# the bound, then status, panewire, handoffkeep --json and the go -m
+# fallback all wedged). Invariant I-M2: the probe's worst case fits the
+# host timeout — the run ends at most 25s after sh start and the local
+# row does not read unreachable. Its own outer bound is --timeout 30.
+reset_env
+S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
+PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
+AS_MAIN="$(git -C "$CANON_AS" rev-parse HEAD)"
+set_main scopefuel "$S_MAIN"; set_main agent-skills "$AS_MAIN"
+set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
+mk_home "$LOCAL_HOME"
+give_scopefuel "$LOCAL_HOME" "$S_MAIN"
+mkdir -p "$LOCAL_HOME/.agents/skills"
+# fake git: rev-parse answers just under the bound; status wedges.
+# trap '' TERM is inherited across exec, so every hang needs the KILL.
+cat >"$LOCAL_HOME/.local/bin/git" <<EOF
+#!/bin/sh
+trap '' TERM
+if [ "\$3" = "rev-parse" ]; then
+  sleep 2
+  printf '%s\n' "$AS_MAIN"
+else
+  exec sleep 71
+fi
+EOF
+chmod +x "$LOCAL_HOME/.local/bin/git"
+for t in panewire handoffkeep go; do
+  case "$t" in panewire) n=72 ;; handoffkeep) n=73 ;; *) n=74 ;; esac
+  printf '#!/bin/sh\ntrap "" TERM\nexec sleep %s\n' "$n" >"$LOCAL_HOME/.local/bin/$t"
+  chmod +x "$LOCAL_HOME/.local/bin/$t"
+done
+SECONDS=0
+run_fleet --only local --timeout 30
+ELA=$SECONDS
+echo "AC17 elapsed: ${ELA}s"
+assert_cell local panewire "unknown"
+assert_cell local handoffkeep "unknown"
+assert_cell local scopefuel "current"
+assert_cell local agent-skills "current"
+[[ "$(cell local agent-skills)" == *"tool timed out"* ]] ||
+  fail "AC17 agent-skills detail: $(cell local agent-skills)"
+[[ "$(cell local panewire)" == *"tool timed out"* || \
+   "$(cell local panewire)" == *"probe budget spent"* ]] ||
+  fail "AC17 panewire detail: $(cell local panewire)"
+[[ "$(cell local handoffkeep)" == *"tool timed out"* || \
+   "$(cell local handoffkeep)" == *"probe budget spent"* ]] ||
+  fail "AC17 handoffkeep detail: $(cell local handoffkeep)"
+[[ $RC -eq 3 ]] || fail "AC17 rc: want 3 got $RC :: $OUT"
+[[ $ELA -le 25 ]] || fail "AC17 probe worst case over the host window: ${ELA}s"
+pgrep -f 'sleep 7[1-4]' >/dev/null 2>&1 &&
+  fail "AC17 left wedged tools behind: $(pgrep -fl 'sleep 7[1-4]')"
+pass "AC17 all five calls wedged ignoring TERM: local reachable, run ${ELA}s (<= 25s)"
+
+# ================================================================ AC18 (1007 B3)
+# A tool that reads stdin must get EOF at once — the probe script on
+# stdin is not data. Runs the probe under 'sh -s' exactly as fleet-rev
+# does and checks every key still prints (a tool eating the script would
+# silently truncate every key after its own).
+reset_env
+mk_home "$LOCAL_HOME"
+python3 - "$FLEET_REV" >"$TMP/probe.sh" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+print(re.search(r'PROBE = r"""(.*?)"""', src, re.S).group(1))
+PY
+BASE_OUT="$(HOME="$LOCAL_HOME" sh -s <"$TMP/probe.sh")"
+cat >"$LOCAL_HOME/.local/bin/panewire" <<'EOF'
+#!/bin/sh
+n=$(cat | wc -c | tr -d ' ')
+printf '%s' "$n" >"$HOME/.fleet-rev/stdin-bytes"
+printf 'pw-1234abc\n'
+EOF
+chmod +x "$LOCAL_HOME/.local/bin/panewire"
+SECONDS=0
+set +e
+PROBE_OUT="$(HOME="$LOCAL_HOME" sh -s <"$TMP/probe.sh")"
+PROBE_RC=$?
+set -e
+ELA=$SECONDS
+[[ $PROBE_RC -eq 0 ]] || fail "AC18 probe rc: want 0 got $PROBE_RC :: $PROBE_OUT"
+[[ "$(cat "$LOCAL_HOME/.fleet-rev/stdin-bytes" 2>/dev/null)" == "0" ]] ||
+  fail "AC18 tool read stdin bytes: $(cat "$LOCAL_HOME/.fleet-rev/stdin-bytes" 2>/dev/null || echo missing)"
+# Every key the baseline run printed must still print: a tool eating the
+# probe script off stdin would silently truncate every key after its own.
+for k in $(printf '%s\n' "$BASE_OUT" | sed 's/=.*//'); do
+  printf '%s\n' "$PROBE_OUT" | grep -q "^$k=" ||
+    fail "AC18 probe missing key $k :: $PROBE_OUT"
+done
+[[ "$(printf '%s\n' "$PROBE_OUT" | sed -n 's/^panewire.installed=//p')" == "1234abc" ]] ||
+  fail "AC18 panewire.installed: $(printf '%s\n' "$PROBE_OUT" | grep panewire)"
+[[ $ELA -lt 10 ]] || fail "AC18 probe stalled: ${ELA}s"
+pass "AC18 tool reading stdin gets 0 bytes; every probe key still prints"
 
 pass "all fleet-rev acceptance tests"
