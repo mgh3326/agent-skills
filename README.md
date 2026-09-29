@@ -188,6 +188,13 @@ herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000
 2026-09-26 운영자 결정으로 max 런그 철자 5개(`builder-sonnet-max`·
 `builder-sol-max`·`builder-luna-max`·`builder-terra-max`·`builder-kimi-max`)는 닫혔다 —
 빌더 좌석은 max 를 쓰지 않으므로 wrk 가 표식과 무관하게 거부한다.
+#921(2026-09-29 운영자 보고, Sonnet 5.5 실험 E1/E2)은 비-런그 빌더 철자
+`builder-sonnet`을 연다 — `builder-opus`의 argv 모양(`--model sonnet`
+`--dangerously-skip-permissions`)을 쓰고 `--effort`는 high·xhigh·max만 받으며
+기본값은 xhigh다. 이 철자의 명시 max만 위 좌석 규칙의 예외이고, quota pool은
+claude, launch_profile은 canonical `sonnet@<effort>`로 기록된다. E6 철자
+`builder-sonnet-xhigh`·`builder-sonnet-max`는 별도 철자로 그대로다(표식 필요·
+max 좌석 거부).
 
 `devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
 프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). `devin-ds41-max`도

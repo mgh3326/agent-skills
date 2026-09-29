@@ -484,6 +484,8 @@ spawn_help_out="$("$WRK" spawn --help)"
 grep -q -- '--landing-strict' <<<"$spawn_help_out"
 grep -q -- '--role worker|builder (legacy alias: captain)' <<<"$spawn_help_out"
 grep -q -- 'builder-opus' <<<"$spawn_help_out"
+grep -q -- 'builder-sonnet' <<<"$spawn_help_out" ||
+  fail "spawn --help must document builder-sonnet (#921)"
 # Task 612: the help text must document the kimi-code/ namespace and must not
 # carry the retired kimi-for-coding/ prefix.
 grep -q -- 'kimi --auto -m kimi-code/k3' <<<"$spawn_help_out" ||
@@ -524,6 +526,8 @@ grep -qx 'builder-ds41-max' <<<"$profiles_out"
 grep -qx 'builder-grok' <<<"$profiles_out"
 grep -qx 'builder-kimi' <<<"$profiles_out"
 grep -qx 'builder-luna' <<<"$profiles_out"
+grep -qx 'builder-sonnet' <<<"$profiles_out" ||
+  fail "wrk profiles lost builder-sonnet (#921)"
 # #704 (#594 E6) + #737 (decision 4088): the per-rung builder spellings.
 for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
   builder-sol-high builder-sol-max builder-sol-medium builder-luna-max \
@@ -2534,6 +2538,12 @@ launch_profile_case codex-luna-hi codex-luna-hi-canon 'codex-luna@high'
 launch_profile_case codex-luna-max codex-luna-max-canon 'codex-luna-max@max'
 launch_profile_case codex-luna56 codex-luna56-rollback 'codex-luna56@medium'
 launch_profile_case builder-luna builder-luna-canon 'codex-luna@xhigh' --role builder --lane builder-luna-lane --parent parent-lane
+# #921: builder-sonnet records the canonical catalog rung on the claude pool,
+# not the launcher spelling — sonnet@xhigh by default, sonnet@max on the
+# seat-rule exception rung.
+launch_profile_case builder-sonnet builder-sonnet-canon 'sonnet@xhigh' --role builder --lane builder-sonnet-canon-lane --parent parent-lane
+launch_profile_case builder-sonnet builder-sonnet-canon-max 'sonnet@max' --role builder --lane builder-sonnet-canon-max-lane --parent parent-lane --effort max
+launch_profile_case builder-sonnet builder-sonnet-canon-high 'sonnet@high' --role builder --lane builder-sonnet-canon-high-lane --parent parent-lane --effort high
 launch_profile_case codex-astra codex-astra-canon 'codex-astra@xhigh'
 # Other pools keep their literal spelling@effort — no other pool's record moves.
 launch_profile_case devin-swe2 devin-launch-literal 'devin-swe2'
@@ -3301,7 +3311,7 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna \
+for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
   builder-luna-max builder-terra-high builder-terra-xhigh builder-terra-max builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh; do
@@ -3331,7 +3341,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -3597,6 +3607,201 @@ expect_exit 2 spawn_base builder-luna --role builder --lane builder-luna-lane --
 expect_exit 2 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --effort medium --job builder-luna-effort-low-mutant
 expect_exit 2 spawn_base builder-luna --job builder-luna-role-mutant --t T1
 echo "PASS builder-luna E3 profile launches codex-luna argv at xhigh"
+
+# ---------------------------------------------------------------------------
+# task #921 (operator report 2026-09-29, Sonnet 5.5 experiments E1/E2):
+# builder-sonnet is the non-rung Sonnet builder seat — the builder-opus argv
+# shape on the sonnet alias, a closed effort set (high|xhigh|max, default
+# xhigh), and the seat rule's only named max exception. It is NOT an E6 rung:
+# no SCOPEFUEL_E6_ARM, no GATE_EFFORT_PIN — the gate sees bare `-m sonnet`
+# (the fixture refuses a sonnet@xhigh/sonnet@max rung gate, so forwarding the
+# effort would close the seat). The catalog consult pins the requested rung so
+# a bare spawn cannot drift to sonnet's ordinary high default, and the quota
+# record carries the canonical launch_profile sonnet@<effort> on pool=claude.
+# ---------------------------------------------------------------------------
+: >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
+set +e
+builder_sonnet_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sonnet \
+  --role builder --lane builder-sonnet-lane --parent parent-lane \
+  --job builder-sonnet-job --t T1 2>&1)"
+builder_sonnet_rc=$?
+set -e
+[[ "$builder_sonnet_rc" -eq 0 ]] ||
+  fail "builder-sonnet must be admitted under --role builder (rc=$builder_sonnet_rc): $builder_sonnet_out"
+grep -q 'model=builder-sonnet' <<<"$builder_sonnet_out" ||
+  fail "builder-sonnet spawn output lost its model: $builder_sonnet_out"
+builder_sonnet_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_sonnet_start" == *' -- --model sonnet --dangerously-skip-permissions --effort xhigh' ]] ||
+  fail "builder-sonnet must launch the builder-opus argv shape on sonnet at xhigh: $builder_sonnet_start"
+grep -q 'policy launch sonnet effort=xhigh' "$TMP/launch.log" ||
+  fail "builder-sonnet must consult the catalog for sonnet pinned at xhigh: $(cat "$TMP/launch.log")"
+grep -qF 'gate -m sonnet' "$TMP/scopefuel.log" ||
+  fail "builder-sonnet must gate as the sonnet spelling: $(cat "$TMP/scopefuel.log")"
+if grep -qF 'gate -m sonnet --effort' "$TMP/scopefuel.log"; then
+  fail "builder-sonnet is not a rung spelling — the gate must not see --effort: $(cat "$TMP/scopefuel.log")"
+fi
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == sonnet ]] ||
+  fail "builder-sonnet must gate as sonnet: $(cat "$TMP/scopefuel.log")"
+python3 - "$ARBITER_INBOX_ROOT/builder-sonnet-job/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+claim = next(e for e in events if e["kind"] == "job.claim")
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert claim["payload"]["role"] == "builder", claim
+assert claim["payload"]["parent_lane"] == "parent-lane", claim
+assert claim["payload"]["owner_lane"] == "builder-sonnet-lane", claim
+assert record["payload"]["launch_profile"] == "sonnet@xhigh", record
+assert record["payload"]["pool"] == "claude", record
+PY
+
+# Explicit rungs restate or move within the closed set; the spawned argv and
+# the canonical record track the selected rung.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
+builder_sonnet_high_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sonnet \
+  --role builder --lane builder-sonnet-high-lane --parent parent-lane \
+  --effort high --job builder-sonnet-high-job --t T1 2>&1)"
+grep -q 'model=builder-sonnet' <<<"$builder_sonnet_high_out"
+builder_sonnet_high_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_sonnet_high_start" == *' -- --model sonnet --dangerously-skip-permissions --effort high' ]] ||
+  fail "builder-sonnet --effort high must carry the high rung in argv: $builder_sonnet_high_start"
+grep -q 'policy launch sonnet effort=high' "$TMP/launch.log" ||
+  fail "builder-sonnet --effort high must pin the catalog consult to high: $(cat "$TMP/launch.log")"
+# --effort max: the seat rule's only named exception (E2). Admitted, argv and
+# record both carry max.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
+builder_sonnet_max_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sonnet \
+  --role builder --lane builder-sonnet-max-lane --parent parent-lane \
+  --effort max --job builder-sonnet-max-job --t T1 2>&1)"
+grep -q 'model=builder-sonnet' <<<"$builder_sonnet_max_out" ||
+  fail "builder-sonnet --effort max must be admitted (named seat exception): $builder_sonnet_max_out"
+builder_sonnet_max_start="$(grep '^agent start ' "$TMP/herdr.log")"
+[[ "$builder_sonnet_max_start" == *' -- --model sonnet --dangerously-skip-permissions --effort max' ]] ||
+  fail "builder-sonnet --effort max must carry the max rung in argv: $builder_sonnet_max_start"
+grep -q 'policy launch sonnet effort=max' "$TMP/launch.log" ||
+  fail "builder-sonnet --effort max must pin the catalog consult to max: $(cat "$TMP/launch.log")"
+python3 - "$ARBITER_INBOX_ROOT/builder-sonnet-max-job/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert record["payload"]["launch_profile"] == "sonnet@max", record
+assert record["payload"]["pool"] == "claude", record
+PY
+
+# The effort set is closed: low, medium and ultra die on the builder-sonnet
+# arm before resolve_profile (ultra would also die on the seat rule — the arm
+# refuses it first, keeping the error on the closed set).
+for sonnet_bad_effort in low medium ultra bogus; do
+  set +e
+  sonnet_bad_out="$(spawn_base builder-sonnet --role builder --lane builder-sonnet-bad-lane \
+    --parent parent-lane --effort "$sonnet_bad_effort" --job "builder-sonnet-bad-$sonnet_bad_effort" --t T1 2>&1)"
+  sonnet_bad_rc=$?
+  set -e
+  [[ "$sonnet_bad_rc" -eq 2 ]] ||
+    fail "builder-sonnet --effort $sonnet_bad_effort must die rc 2 (rc=$sonnet_bad_rc): $sonnet_bad_out"
+  grep -q 'builder-sonnet accepts only --effort high|xhigh|max' <<<"$sonnet_bad_out" ||
+    fail "builder-sonnet --effort $sonnet_bad_effort refusal must name the closed set: $sonnet_bad_out"
+  [[ ! -e "$ARBITER_INBOX_ROOT/builder-sonnet-bad-$sonnet_bad_effort/events/00001-job.claim.json" ]] ||
+    fail "rejected builder-sonnet --effort $sonnet_bad_effort must not claim"
+done
+echo "PASS 921 builder-sonnet launches sonnet argv at high/xhigh/max, gates bare sonnet, records sonnet@<effort>"
+
+# Assertion-RED mutants: each probes a copy of bin/wrk with exactly one
+# behaviour removed. The probe must fail through an assertion (rc 1) — a
+# usage error (rc 2+) or a silent pass (rc 0) means the check does not see
+# the contract it claims to pin.
+expect_red() {
+  local label="$1"; shift
+  local rc=0
+  "$@" >/dev/null 2>&1 || rc=$?
+  [[ "$rc" -eq 1 ]] || fail "mutant $label: expected assertion RED (rc 1), got rc $rc"
+}
+mut_wrk() {  # dst old new — replace exactly one occurrence in a copy of bin/wrk
+  python3 - "$WRK" "$1" "$2" "$3" <<'PY'
+import sys
+src, dst, old, new = sys.argv[1:]
+text = open(src, encoding="utf-8").read()
+assert text.count(old) == 1, "mutant source must occur exactly once: %r" % old
+open(dst, "w", encoding="utf-8").write(text.replace(old, new, 1))
+PY
+  chmod +x "$1"
+}
+# $1=wrk path, $2=job tag, $3=expected argv tail; extra spawn flags after.
+# Returns 0 iff the spawn is admitted and the pane argv ends " -- <tail>".
+sonnet_builder_probe() {
+  local wrk="$1" tag="$2" want_tail="$3"; shift 3
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  local out start
+  out="$(WRK="$wrk" spawn_base builder-sonnet --role builder --lane "mut-$tag-lane" \
+    --parent parent-lane --job "mut-$tag" --t T1 "$@" 2>&1)" || return 1
+  grep -q 'model=builder-sonnet' <<<"$out" || return 1
+  start="$(grep '^agent start ' "$TMP/herdr.log")" || return 1
+  [[ "$start" == *" -- $want_tail" ]] || return 1
+}
+# $1=wrk path, $2=model, $3=job tag; extra spawn flags after.
+# Returns 0 iff the spawn is refused with rc 2.
+builder_refused_probe() {
+  local wrk="$1" model="$2" tag="$3"; shift 3
+  local out rc
+  out="$(WRK="$wrk" spawn_base "$model" --role builder --lane "mutr-$tag-lane" \
+    --parent parent-lane --job "mutr-$tag" --t T1 "$@" 2>&1)"
+  rc=$?
+  [[ "$rc" -eq 2 ]] || return 1
+}
+# $1=wrk path, $2=job tag — 0 iff the quota record is sonnet@xhigh.
+sonnet_builder_record_probe() {
+  local wrk="$1" tag="$2"
+  ARBITER_INBOX_ROOT="$TMP/mut-inbox-$tag" XDG_DATA_HOME="$TMP/mut-xdg-$tag" \
+    WRK="$wrk" spawn_base builder-sonnet --role builder --lane "mutq-$tag-lane" \
+    --parent parent-lane --job "mutq-$tag" --t T1 >/dev/null 2>&1 || return 1
+  python3 - "$TMP/mut-inbox-$tag/mutq-$tag/events" <<'PY' || return 1
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert record["payload"]["launch_profile"] == "sonnet@xhigh", record
+PY
+}
+MUT921="$TMP/mutants-921"
+mkdir -p "$MUT921"
+# 1. Model mapping: the sonnet alias swapped for opus turns the argv probe RED.
+mut_wrk "$MUT921/wrk-model" \
+  'builder-sonnet) PROFILE_KIND=claude; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;' \
+  'builder-sonnet) PROFILE_KIND=claude; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;'
+# 2. Effort validation: widening the closed set admits --effort low, which the
+#    refusal probe must still see die.
+mut_wrk "$MUT921/wrk-effortset" \
+  'high|xhigh|max) ;;' \
+  'high|xhigh|max|low) ;;'
+# 3. Effort propagation: dropping the claude --effort append strips the rung
+#    from the pane argv entirely.
+# shellcheck disable=SC2016 # the pattern is bin/wrk source text, not an expansion
+mut_wrk "$MUT921/wrk-effortflag" \
+  '        ARGS+=(--effort "$EFFECTIVE_EFFORT")' \
+  '        :'
+# 4. launch_profile canonicalization: the builder-sonnet arm must record the
+#    catalog name sonnet@<effort>, not the launcher spelling.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$MUT921/wrk-launchname" \
+  'elif [[ "$MODEL" == builder-sonnet ]]; then' \
+  'elif [[ "$MODEL" == builder-sonnet-removed ]]; then'
+# 5. Seat exception scope: dropping the model pin opens max for every builder —
+#    builder-sol --effort max must still die.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$MUT921/wrk-seat" \
+  '[[ "$MODEL" == builder-sonnet && "$seat_effort" == max ]]' \
+  '[[ "$seat_effort" == max ]]'
+# 6. Catalog pin: without the ${EFFORT:-xhigh} pin the consult returns sonnet's
+#    ordinary high default and a bare spawn silently launches high.
+# shellcheck disable=SC2016 # the pattern is bin/wrk source text, not an expansion
+mut_wrk "$MUT921/wrk-catalogpin" \
+  'builder-sonnet) CATALOG_PROFILE=sonnet; CATALOG_EFFORT_PIN="${EFFORT:-xhigh}" ;;' \
+  'builder-sonnet) CATALOG_PROFILE=sonnet ;;'
+expect_red model-swapped-to-opus sonnet_builder_probe "$MUT921/wrk-model" m1 '--model sonnet --dangerously-skip-permissions --effort xhigh'
+expect_red effort-set-widened builder_refused_probe "$MUT921/wrk-effortset" builder-sonnet e1 --effort low
+expect_red effort-flag-dropped sonnet_builder_probe "$MUT921/wrk-effortflag" e2 '--model sonnet --dangerously-skip-permissions --effort xhigh'
+expect_red launch-name-literal sonnet_builder_record_probe "$MUT921/wrk-launchname" q1
+expect_red seat-exception-broadened builder_refused_probe "$MUT921/wrk-seat" builder-sol s1 --effort max
+expect_red catalog-pin-dropped sonnet_builder_probe "$MUT921/wrk-catalogpin" c1 '--model sonnet --dangerously-skip-permissions --effort xhigh'
+echo "PASS 921 mutants assertion-red=6/6 (model map, effort set, effort flag, launch_profile, seat scope, catalog pin)"
 
 # #666: the devin effort rungs exist as named builder spellings — same
 # unattended argv as the worker variants, gated as devin-swe2 like every
@@ -4509,7 +4714,7 @@ for rejected in codex-terra codex-luna oc-solar4 devin-ds41 devin-ds41-max; do
   set -e
   [[ "$rejected_rc" -eq 2 ]] ||
     fail "--role builder must still reject $rejected with exit 2, got $rejected_rc: $rejected_out"
-  for named in builder-devin builder-devin-medium builder-devin-max builder-ds41 builder-ds41-max builder-grok builder-kimi builder-luna devin-glm52 devin-swe17 devin-ds41 devin-ds41-max; do
+  for named in builder-devin builder-devin-medium builder-devin-max builder-ds41 builder-ds41-max builder-grok builder-kimi builder-luna builder-sonnet devin-glm52 devin-swe17 devin-ds41 devin-ds41-max; do
     grep -q "$named" <<<"$rejected_out" ||
       fail "the --role builder refusal must list $named: $rejected_out"
   done

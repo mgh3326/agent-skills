@@ -156,10 +156,10 @@
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "0dcc861166085b58608b1fb6b51f28a5f1209a2d6beb4bf913dcc377627c59ce",
-    "bin/wrk": "dd3883dfa4b6a0dab0477c21144f666dc9924457c3b7fe27d3da4f5c9c503e09",
+    "bin/wrk": "026a738d8b24430e312c06dcf07f8c27eb41cbebab1fa98578d181b3884d1f45",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
-    "director/SKILL.md": "dd0b42f21559084f4b6410d85c359f1757ed056a392fa0bb51e9bd710af02c60",
-    "spawn-worker/SKILL.md": "f69bcd22a00aeda8d1d9093e666300f4c4c8da5fac4587783e7293575682d41d"
+    "director/SKILL.md": "bb1cda3c619be6679a6366e411ed277e32e1a5c2ba6fe6bab25e3b1df02aaa64",
+    "spawn-worker/SKILL.md": "8482e7ae240ce9656f79a0cbb409fbed966b3dd3e68575e93c91b29b1b9e3966"
   },
   "profiles": {
     "agy-flash": {
@@ -585,6 +585,26 @@
       "surfaces": [
         "T1",
         "T2"
+      ]
+    },
+    "builder-sonnet": {
+      "default_effort": "xhigh",
+      "family": "anthropic",
+      "grades": {
+        "high": "A+",
+        "max": "A+",
+        "xhigh": "A+"
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model sonnet",
+      "model": "claude-sonnet-5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
       ]
     },
     "builder-sonnet-max": {
