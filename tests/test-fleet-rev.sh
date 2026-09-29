@@ -166,7 +166,7 @@ run_fleet --only local,a
 for h in local a; do
   for t in scopefuel agent-skills panewire handoffkeep; do assert_cell "$h" "$t" "current"; done
 done
-[[ "$(tail -n1 <<<"$OUT")" == "fleet-rev: rc=0 current=8 behind=0 other=0" ]] ||
+[[ "$(tail -n1 <<<"$OUT")" == "fleet-rev: rc=0 current=8 behind=0 diverged=0 other=0" ]] ||
   fail "AC1 summary: $(tail -n1 <<<"$OUT")"
 pass "AC1 all-current fleet: 8/8 cells current, rc 0, summary counts"
 
@@ -190,7 +190,7 @@ run_fleet --only local,a
 [[ $RC -eq 1 ]] || fail "AC2 remote-behind rc: want 1 got $RC :: $OUT"
 assert_cell a scopefuel "behind 3"
 assert_cell local scopefuel "current"
-[[ "$(tail -n1 <<<"$OUT")" == "fleet-rev: rc=1 current=7 behind=1 other=0" ]] ||
+[[ "$(tail -n1 <<<"$OUT")" == "fleet-rev: rc=1 current=7 behind=1 diverged=0 other=0" ]] ||
   fail "AC2 summary: $(tail -n1 <<<"$OUT")"
 
 # same staleness on the FIRST host: rc must still be 1 (aggregate, not last-host)
@@ -238,7 +238,7 @@ for t in scopefuel agent-skills panewire handoffkeep; do
   assert_cell b "$t" "unreachable"
 done
 assert_cell local scopefuel "current"; assert_cell a panewire "current"
-[[ "$(tail -n1 <<<"$OUT")" == "fleet-rev: rc=3 current=8 behind=0 other=4" ]] ||
+[[ "$(tail -n1 <<<"$OUT")" == "fleet-rev: rc=3 current=8 behind=0 diverged=0 other=4" ]] ||
   fail "AC3 dead summary: $(tail -n1 <<<"$OUT")"
 
 # a behind cell plus an unreachable host is still rc 1
@@ -593,5 +593,185 @@ IDX_AFTER="$(sha_file "$IDX")|$(mtime_of "$IDX")"
 [[ "$IDX_BEFORE" == "$IDX_AFTER" ]] ||
   fail "AC9 probe rewrote .git/index: $IDX_BEFORE -> $IDX_AFTER"
 pass "AC9 probe is read-only: argv safe, no writes, no secret/env reads, git index untouched"
+
+# ================================================================ AC10 (993 N3)
+# A receipt keeps rev= as typed, so an uppercase-hex rev must compare as its
+# lowercase form: prefix-of-main -> current, otherwise compare -> behind.
+reset_env
+S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
+PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
+AS_MAIN="$(git -C "$CANON_AS" rev-parse HEAD)"
+set_main scopefuel "$S_MAIN"; set_main agent-skills "$AS_MAIN"
+set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
+full_current_home "$LOCAL_HOME"
+
+S_UPPER="$(printf '%s' "$S_MAIN" | tr 'a-f' 'A-F')"
+[[ "$S_UPPER" != "$S_MAIN" ]] || fail "AC10 fixture: S_MAIN has no a-f letters"
+give_scopefuel "$LOCAL_HOME" "$S_UPPER"
+run_fleet --only local --json
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["installed"]')" == "$S_MAIN" ]] ||
+  fail "AC10 uppercase installed: $(jval '["hosts"][0]["tools"]["scopefuel"]')"
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["status"]')" == "current" ]] ||
+  fail "AC10 uppercase status: $(jval '["hosts"][0]["tools"]["scopefuel"]')"
+
+S_OLD="$(sha40 s-old)"
+give_scopefuel "$LOCAL_HOME" "$(printf '%s' "$S_OLD" | tr 'a-f' 'A-F')"
+set_compare scopefuel "$S_OLD" ahead 4
+run_fleet --only local
+[[ $RC -eq 1 ]] || fail "AC10 uppercase-behind rc: want 1 got $RC :: $OUT"
+assert_cell local scopefuel "behind 4"
+pass "AC10 uppercase receipt rev lowercased before validating (N3)"
+
+# ================================================================ AC11 (993 N4)
+# The summary counts behind and diverged separately (they used to share
+# behind=). --json shape is unchanged (the AC8 key contract still holds).
+reset_env
+S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
+PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
+AS_MAIN="$(git -C "$CANON_AS" rev-parse HEAD)"
+set_main scopefuel "$S_MAIN"; set_main agent-skills "$AS_MAIN"
+set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
+full_current_home "$LOCAL_HOME"
+full_current_home "$(remote_home x)"
+S_OLD="$(sha40 s-old)"; S_OTHER="$(sha40 s-other)"
+give_scopefuel "$LOCAL_HOME" "$S_OLD"
+set_compare scopefuel "$S_OLD" ahead 3
+# a's rev has no compare entry -> gh 404 -> diverged (not behind)
+give_scopefuel "$(remote_home x)" "$S_OTHER"
+run_fleet --only local,a
+[[ $RC -eq 1 ]] || fail "AC11 rc: want 1 got $RC :: $OUT"
+assert_cell local scopefuel "behind 3"
+assert_cell a scopefuel "diverged"
+[[ "$(tail -n1 <<<"$OUT")" == "fleet-rev: rc=1 current=6 behind=1 diverged=1 other=0" ]] ||
+  fail "AC11 summary: $(tail -n1 <<<"$OUT")"
+run_fleet --only local,a --json
+[[ "$(jval '["hosts"][1]["tools"]["scopefuel"]["status"]')" == "diverged" ]] ||
+  fail "AC11 json diverged: $(jval '["hosts"][1]["tools"]["scopefuel"]')"
+pass "AC11 summary splits behind= and diverged= (N4)"
+
+# ================================================================ AC12 (993 N5)
+# handoffkeep version --json answering rev "unknown" is a parseable answer
+# that names the problem, not an empty detail.
+reset_env
+S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
+PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
+AS_MAIN="$(git -C "$CANON_AS" rev-parse HEAD)"
+set_main scopefuel "$S_MAIN"; set_main agent-skills "$AS_MAIN"
+set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
+full_current_home "$LOCAL_HOME"
+give_handoffkeep "$LOCAL_HOME" json unknown false
+run_fleet --only local --json
+[[ $RC -eq 3 ]] || fail "AC12 rc: want 3 got $RC :: $OUT"
+[[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["status"]')" == "unknown" ]] ||
+  fail "AC12 status: $(jval '["hosts"][0]["tools"]["handoffkeep"]')"
+[[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["detail"]')" == *"version json rev unknown"* ]] ||
+  fail "AC12 detail: $(jval '["hosts"][0]["tools"]["handoffkeep"]["detail"]')"
+pass "AC12 handoffkeep rev 'unknown' says 'version json rev unknown' (N5)"
+
+# ================================================================ AC13 (993 N6)
+# A hung version tool is bounded inside the probe: that cell reads unknown /
+# 'tool timed out', the host stays reachable and its other tools still
+# report. Invariant: a hung tool never makes its host unreachable. The run's
+# own outer bound is --timeout 15 plus the elapsed assertion.
+reset_env
+S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
+PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
+AS_MAIN="$(git -C "$CANON_AS" rev-parse HEAD)"
+set_main scopefuel "$S_MAIN"; set_main agent-skills "$AS_MAIN"
+set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
+full_current_home "$LOCAL_HOME"
+full_current_home "$(remote_home x)"
+
+printf '63\n' >"$(remote_home x)/.fleet-rev/panewire-hang"
+SECONDS=0
+run_fleet --only a --timeout 15
+ELA=$SECONDS
+[[ $RC -eq 3 ]] || fail "AC13 hung-panewire rc: want 3 got $RC :: $OUT"
+assert_cell a panewire "unknown"
+[[ "$(cell a panewire)" == *"tool timed out"* ]] ||
+  fail "AC13 panewire detail: $(cell a panewire)"
+for t in scopefuel agent-skills handoffkeep; do
+  assert_cell a "$t" "current" || fail "AC13 $t did not report"
+done
+[[ $ELA -lt 12 ]] ||
+  fail "AC13 hung tool stalled the run: ${ELA}s (bound 5s + kill grace 2s)"
+# no process left behind: the exec'd 'sleep 63' must be gone from the table
+if pgrep -f 'sleep 63' >/dev/null 2>&1; then
+  fail "AC13 left a hung panewire process behind: $(pgrep -fl 'sleep 63')"
+fi
+pass "AC13 hung panewire -> unknown 'tool timed out', host stays reachable (N6)"
+
+rm -f "$(remote_home x)/.fleet-rev/panewire-hang"
+printf '63\n' >"$(remote_home x)/.fleet-rev/hk-hang"
+SECONDS=0
+run_fleet --only a --timeout 15
+ELA=$SECONDS
+[[ $RC -eq 3 ]] || fail "AC13 hung-handoffkeep rc: want 3 got $RC :: $OUT"
+assert_cell a handoffkeep "unknown"
+[[ "$(cell a handoffkeep)" == *"tool timed out"* ]] ||
+  fail "AC13 handoffkeep detail: $(cell a handoffkeep)"
+for t in scopefuel agent-skills panewire; do
+  assert_cell a "$t" "current" || fail "AC13 $t did not report"
+done
+[[ $ELA -lt 12 ]] ||
+  fail "AC13 hung handoffkeep stalled the run: ${ELA}s"
+if pgrep -f 'sleep 63' >/dev/null 2>&1; then
+  fail "AC13 left a hung handoffkeep process behind: $(pgrep -fl 'sleep 63')"
+fi
+pass "AC13 hung handoffkeep -> unknown 'tool timed out', host stays reachable (N6)"
+
+# ================================================================ AC14 (993 CodeRabbit)
+# An explicitly set WRK_HOSTS_CONFIG that is missing or unreadable is a
+# usage error (rc 2, one stderr line) — not a silent local-only run. The
+# default path missing only warns once and probes local. Invariant: an
+# explicit missing config is an error.
+reset_env
+S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
+PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
+AS_MAIN="$(git -C "$CANON_AS" rev-parse HEAD)"
+set_main scopefuel "$S_MAIN"; set_main agent-skills "$AS_MAIN"
+set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
+full_current_home "$LOCAL_HOME"
+full_current_home "$(remote_home x)"
+
+export WRK_HOSTS_CONFIG="$TMP/no-such.toml"
+run_fleet --only local
+[[ $RC -eq 2 ]] || fail "AC14 missing explicit config rc: want 2 got $RC :: $OUT"
+[[ "$(printf '%s\n' "$ERR" | grep -c .)" -eq 1 ]] ||
+  fail "AC14 stderr line count: $(printf '%s\n' "$ERR" | grep -c .) :: $ERR"
+[[ "$ERR" == *WRK_HOSTS_CONFIG* ]] ||
+  fail "AC14 stderr does not name WRK_HOSTS_CONFIG: $ERR"
+
+# an unreadable explicit config errors the same way
+printf '[hosts.a]\nssh = "x"\n' >"$TMP/no-read.toml"
+chmod 000 "$TMP/no-read.toml"
+export WRK_HOSTS_CONFIG="$TMP/no-read.toml"
+run_fleet --only local
+[[ $RC -eq 2 ]] || fail "AC14 unreadable explicit config rc: want 2 got $RC :: $OUT"
+chmod 644 "$TMP/no-read.toml"
+export WRK_HOSTS_CONFIG="$TMP/hosts.toml"
+
+# unset -> default path missing -> one warning, local probed, rc as usual
+set +e
+OUT="$(HOME="$LOCAL_HOME" env -u WRK_HOSTS_CONFIG -u XDG_CONFIG_HOME \
+  "$FLEET_REV" --only local 2>"$TMP/err")"
+RC=$?
+set -e
+ERR="$(cat "$TMP/err")"
+[[ $RC -eq 0 ]] || fail "AC14 default-missing rc: want 0 got $RC :: $OUT"
+[[ "$(printf '%s\n' "$ERR" | grep -c .)" -eq 1 && "$ERR" == *warning* ]] ||
+  fail "AC14 default-missing warning: $ERR"
+[[ "$(awk '$2=="scopefuel"{print $1}' <<<"$OUT" | sort -u)" == "local" ]] ||
+  fail "AC14 default-missing probed more than local: $OUT"
+pass "AC14 explicit missing/unreadable config rc 2; default missing warns once (CodeRabbit)"
+
+# ================================================================ AC15 (993 N7)
+# The README scopefuel reinstall step labels the `git+...@<sha> --force`
+# form as fleet-rev's own recommended form (it is not cited from the
+# scopefuel README, which shows only a rev-less `uv tool install git+...`).
+line="$(grep -A2 'uv tool install --force' "$ROOT/README.md")"
+[[ "$line" == *scopefuel* && "$line" == *권장* ]] ||
+  fail "AC15 README scopefuel form not labelled recommended: $line"
+pass "AC15 README labels the scopefuel @<sha> form as recommended (N7)"
 
 pass "all fleet-rev acceptance tests"

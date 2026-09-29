@@ -9,7 +9,12 @@
 #                                 anything else -> usage error rc 1
 #   $HOME/.fleet-rev/hk-rev       rev field for the JSON answer
 #   $HOME/.fleet-rev/hk-modified  modified field, as a string (default "false")
+#   $HOME/.fleet-rev/hk-hang      if non-empty, `exec sleep <seconds>` first —
+#                                 a wedged binary. exec (not a child) so the
+#                                 probe watchdog's kill leaves nothing behind.
 set -euo pipefail
+hang="$(cat "$HOME/.fleet-rev/hk-hang" 2>/dev/null || true)"
+[[ -n "$hang" ]] && exec sleep "$hang"
 
 mode="$(cat "$HOME/.fleet-rev/hk-mode" 2>/dev/null || printf 'old')"
 if [[ "${1:-}" == "version" && "${2:-}" == "--json" ]]; then
