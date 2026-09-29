@@ -275,6 +275,11 @@ and spawns unregistered — as does a panewire failure; the spawn never fails
 over it and builder lanes are never touched (they stay the director's).
 `panewire lanes-audit` lists any leftover rows.
 
+session_machine_ids is for NON-fleet herdr sessions only — for example M1's
+default session, served by its own panewire daemon. Mapping a fleet session
+is not a supported use: it registers every fleet worker as a global lane for
+no benefit.
+
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
 the job and records its quota-pool execution in arbiter. arbiter resolves the
 pool from scopefuel's own output — wrk holds no pool mapping. A quota-pool
@@ -2318,6 +2323,7 @@ print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
 PY
 )"; then
     warn "arbiter job.spawned receipt preparation failed; spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
+    hub_lane_orphan_remove
     return 0
   fi
   set +e
@@ -2326,7 +2332,21 @@ PY
   set -e
   if [[ "$receipt_rc" -ne 0 ]]; then
     warn "arbiter job.spawned receipt failed (exit $receipt_rc); spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
+    hub_lane_orphan_remove
   fi
+}
+
+# #994/S1: a lane whose job.spawned receipt was never written is a row
+# `wrk reap` can never attribute to a job — it would sit on the daemon
+# forever. Deregister it while the machine and pane are still in hand (same
+# credentials, same warn-only contract); the spawn still succeeds, and a
+# failed removal is left for `panewire lanes-audit`.
+hub_lane_orphan_remove() {
+  [[ -n "${HUB_LANE:-}" ]] || return 0
+  local lane="$HUB_LANE" machine="$HUB_LANE_MACHINE"
+  HUB_LANE="" HUB_LANE_MACHINE=""
+  warn "hub lane '$lane' was registered but the job.spawned receipt was not written — deregistering it"
+  hub_lane_remove "$lane" "$machine" "$PANE"
 }
 
 arbiter_admit() {
@@ -5125,19 +5145,62 @@ spillover_host_via() {
 }
 
 # [hub] session_machine_ids names the hub machine id of the panewire daemon
-# serving each herdr session on this host (#965: a host can run a second
-# daemon for a non-fleet session, and only that daemon may carry the session's
-# lane rows). The value is a one-line inline table, read with the same
-# quoted-pair matcher as cwd_map — still no TOML library.
+# serving each NON-fleet herdr session on this host (#965: a host can run a
+# second daemon for a non-fleet session — M1's default session is the
+# example — and only that daemon may carry the session's lane rows). Mapping
+# a fleet session is not a supported use: every fleet worker would be
+# registered as a global lane (#994). The value is a one-line inline table,
+# read with the same quoted-pair matcher as cwd_map — still no TOML library.
 hub_session_machine_id() {
+  # rc 0: the machine id on stdout. rc 1: the map parsed but has no entry for
+  # the session. rc 2: content the one-line matcher cannot read — a missing
+  # closing brace (multi-line table), single-quoted keys, a bare value —
+  # which the caller must warn about differently from "no entry" (#994/N4).
   python3 - "$1" "$2" <<'PY'
 import re, sys
 session, raw = sys.argv[1:]
 def unq(s):
     return s.replace(r'\"', '"').replace(r'\\', '\\')
-for key, value in re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw):
+body = raw.strip()
+if not (body[:1] == "{" and body[-1:] == "}"):
+    raise SystemExit(2)
+pairs = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw)
+for key, value in pairs:
     if unq(key) == session:
         print(unq(value))
+        raise SystemExit(0)
+raise SystemExit(2 if (not pairs and body[1:-1].strip()) else 1)
+PY
+}
+
+# panewire's own lane-name rule — lanes_write.go laneNamePattern
+# ^[a-z0-9-]{1,32}$, enforced on the lanes add/rm operand (lanes_cli.go).
+# A value outside it must never reach panewire argv (#994/N2).
+hub_lane_name_valid() {
+  [[ "$1" =~ ^[a-z0-9-]{1,32}$ ]]
+}
+
+# Print "machine<TAB>pane" of the lane's row in a `panewire lanes ls`
+# envelope; nothing when the lane is absent. Exit 1 when the listing is not
+# the JSON the CLI emits — a row we could not read is a row we may not
+# remove (#994/N3).
+hub_lane_lookup() {
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+lane, raw = sys.argv[1:]
+try:
+    doc = json.loads(raw)
+except ValueError:
+    raise SystemExit(1)
+rows = doc.get("lanes") if isinstance(doc, dict) else None
+if not isinstance(rows, list):
+    raise SystemExit(1)
+for row in rows:
+    if isinstance(row, dict) and row.get("lane") == lane:
+        machine = row.get("machine")
+        pane = row.get("pane")
+        print("%s\t%s" % (machine if isinstance(machine, str) else "",
+                          pane if isinstance(pane, str) else ""))
         break
 PY
 }
@@ -5160,20 +5223,40 @@ PY
 hub_lane_register() {
   HUB_LANE="" HUB_LANE_MACHINE=""
   [[ "$ROLE" == worker ]] || return 0
-  local session raw machine panewire hub_url token_env cf_env rc=0
+  local session raw machine machine_rc=0 panewire hub_url token_env cf_env rc=0
   local args=()
   session="${WRK_SENTINEL_HERDR_SESSION:-${HERDR_SESSION:-default}}"
   raw="$(spillover_value hub session_machine_ids 2>/dev/null || true)"
   # No map at all means this installation has not opted in; stay silent like
   # the hub quota gate does on absent hub keys.
   [[ -n "$raw" ]] || return 0
-  machine="$(hub_session_machine_id "$session" "$raw" 2>/dev/null || true)"
+  set +e
+  machine="$(hub_session_machine_id "$session" "$raw")"
+  machine_rc=$?
+  set -e
+  if [[ "$machine_rc" -eq 2 ]]; then
+    warn "hub lane not registered (the [hub] session_machine_ids value could not be parsed; use the one-line {\"session\" = \"machine\"} inline table)"
+    return 0
+  fi
   if [[ -z "$machine" ]]; then
     warn "hub lane not registered (herdr session '$session' has no session_machine_ids entry)"
     return 0
   fi
+  # #994/S1: no lane without its job.spawned receipt — a registration the job
+  # record never carries is a row `wrk reap` can never remove. The same gate
+  # quota_hub_policy_gate uses.
+  if [[ "${ARBITER_JOB_REGISTERED:-0}" -ne 1 ]]; then
+    warn "hub lane not registered (no arbiter job record; a lane without a spawn receipt is unreapable)"
+    return 0
+  fi
   if [[ -z "$OWNER" ]]; then
     warn "hub lane not registered (--owner is unset; the spawning builder's lane is required as parent)"
+    return 0
+  fi
+  # #994/N2: the label becomes panewire argv verbatim — refuse names outside
+  # the daemon's own lane rule before the value can reach the command line.
+  if ! hub_lane_name_valid "$LABEL"; then
+    warn "hub lane not registered (label '$LABEL' is not a valid panewire lane name)"
     return 0
   fi
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
@@ -5208,13 +5291,25 @@ hub_lane_register() {
   HUB_LANE="$LABEL" HUB_LANE_MACHINE="$machine"
 }
 
-# The reverse of hub_lane_register for `wrk reap --apply`: remove exactly the
-# lane the job's newest job.spawned receipt recorded — never a guess, never a
-# sweep. A removal failure warns and the close still stands; `panewire
-# lanes-audit` is where leftovers surface.
+# The reverse of hub_lane_register for `wrk reap --apply` and for the
+# receipt-failure compensation in the spawn path: remove the lane only when
+# `panewire lanes ls` still shows it bound to the machine and pane the job's
+# receipt recorded. Lanes are keyed by label in one global namespace — a
+# label reused by a later spawn must never lose that spawn's live row to the
+# earlier job's reap (#994/N3). The lane value is validated against
+# panewire's own lane-name rule before it may reach argv (#994/N2), and a
+# `lanes ls` that cannot confirm the row — refusal, unreadable output, no
+# such lane, or a row belonging to another machine/pane — skips the removal:
+# never remove blind. A removal failure warns and the close still stands;
+# `panewire lanes-audit` is where leftovers surface.
 hub_lane_remove() {
-  local lane="$1" panewire hub_url token_env cf_env rc=0
+  local lane="$1" want_machine="${2:-}" want_pane="${3:-}" panewire hub_url token_env cf_env rc=0
+  local listing row row_machine row_pane
   local args=()
+  if ! hub_lane_name_valid "$lane"; then
+    warn "hub lane '$lane' not removed (not a valid panewire lane name)"
+    return 0
+  fi
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
   token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
@@ -5223,6 +5318,33 @@ hub_lane_remove() {
     return 0
   fi
   panewire="${PANEWIRE_BIN:-panewire}"
+  args=(lanes ls --hub-url "$hub_url" --hub-token-env "$token_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  set +e
+  listing="$("$panewire" "${args[@]}" 2>/dev/null)"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    warn "hub lane '$lane' not removed (panewire lanes ls exited $rc)"
+    return 0
+  fi
+  set +e
+  row="$(hub_lane_lookup "$lane" "$listing")"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    warn "hub lane '$lane' not removed (panewire lanes ls output was not parseable)"
+    return 0
+  fi
+  if [[ -z "$row" ]]; then
+    warn "hub lane '$lane' not removed (no such lane on the hub)"
+    return 0
+  fi
+  IFS=$'\t' read -r row_machine row_pane <<<"$row"
+  if [[ "$row_machine" != "$want_machine" || "$row_pane" != "$want_pane" ]]; then
+    warn "hub lane '$lane' not removed (the lane now belongs to $row_machine:$row_pane, not the recorded $want_machine:$want_pane)"
+    return 0
+  fi
   args=(lanes rm "$lane" --hub-url "$hub_url" --hub-token-env "$token_env")
   [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
   set +e
@@ -6868,8 +6990,10 @@ closed job records a flat job.reaped event (pane_id, tab_id, at).
 A job whose newest job.spawned receipt records a hub lane (hub_lane; spawned
 under a session mapped in hosts.toml's [hub] session_machine_ids, #965) is
 additionally deregistered on --apply: `panewire lanes rm LANE` with the [hub]
-credentials runs once the tab close is confirmed. A removal failure warns and
-the close still stands; `panewire lanes-audit` lists any leftover rows.
+credentials runs once the tab close is confirmed — and only while `panewire
+lanes ls` still shows the row bound to the recorded machine+pane (a reused
+label's newer row is never removed). A removal failure warns and the close
+still stands; `panewire lanes-audit` lists any leftover rows.
 USAGE
 }
 
@@ -6937,7 +7061,7 @@ for job in jobs:
     if not os.path.isdir(events_dir):
         continue
     owner = pane = tab = role = ""
-    spawned_pane = spawned_tab = spawned_hub_lane = ""
+    spawned_pane = spawned_tab = spawned_hub_lane = spawned_hub_lane_machine = ""
     saw_spawn = False
     terminal_at = None
     revived = False
@@ -6986,7 +7110,10 @@ for job in jobs:
             spawned_tab = payload.get("tab_id") if isinstance(payload.get("tab_id"), str) else ""
             # #965: the hub lane travels in the same one receipt as pane/tab —
             # a lane an older spawn registered is not this pane's to remove.
+            # #994: its machine too — `lanes rm` fires only while the daemon's
+            # row still matches the recorded machine+pane pair.
             spawned_hub_lane = payload.get("hub_lane") if isinstance(payload.get("hub_lane"), str) else ""
+            spawned_hub_lane_machine = payload.get("hub_lane_machine") if isinstance(payload.get("hub_lane_machine"), str) else ""
         if kind == "job.reaped":
             reaped = True
         # 보호 표시(`wrk spawn --keep`, #603)는 누적이다: claim·reclaim·spawn 영수증 중
@@ -7039,9 +7166,13 @@ for job in jobs:
         continue
     # #965: a lane id carrying whitespace is corrupt evidence — never an rm
     # target. The pane itself still closes; the row is left for lanes-audit.
+    # Same for its recorded machine (#994): a blanked machine can never match
+    # a live row, so the removal is skipped rather than aimed.
     if any(c.isspace() for c in spawned_hub_lane):
         spawned_hub_lane = ""
-    print(job, owner or "-", pane, tab or "-", age, "-", spawned_hub_lane or "-", sep="\t")
+    if any(c.isspace() for c in spawned_hub_lane_machine):
+        spawned_hub_lane_machine = ""
+    print(job, owner or "-", pane, tab or "-", age, "-", spawned_hub_lane or "-", spawned_hub_lane_machine or "-", sep="\t")
 PY
 }
 
@@ -7143,8 +7274,8 @@ reap_cmd() {
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
   candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
-  local job owner pane tab age note hub_lane probe class token probe_tab verdict acted=0
-  while IFS=$'\t' read -r job owner pane tab age note hub_lane; do
+  local job owner pane tab age note hub_lane hub_lane_machine probe class token probe_tab verdict acted=0
+  while IFS=$'\t' read -r job owner pane tab age note hub_lane hub_lane_machine; do
     [[ -n "$job" ]] || continue
     if [[ -n "$note" && "$note" != - ]]; then
       echo "skip job=$job reason=$note"
@@ -7154,6 +7285,7 @@ reap_cmd() {
     [[ "$owner" != - ]] || owner=""
     [[ "$tab" != - ]] || tab=""
     [[ "$hub_lane" != - ]] || hub_lane=""
+    [[ "$hub_lane_machine" != - ]] || hub_lane_machine=""
     if [[ "$pane" == - ]]; then
       echo "skip job=$job reason=malformed-record"
       continue
@@ -7204,9 +7336,11 @@ reap_cmd() {
         # + wait on the completion sentinel before moving on.
         job_end_housekeeping "$job" "$owner" abandoned "pane reaped" "wrk reap"
         # #965: the lane this pane's spawn registered goes with it — only the
-        # recorded lane, only on a confirmed close. Failure warns; the pane
-        # stays closed and lanes-audit lists what is left behind.
-        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane"
+        # recorded lane, only on a confirmed close, and (#994) only while the
+        # daemon still shows that row bound to the recorded machine+pane.
+        # Failure warns; the pane stays closed and lanes-audit lists what is
+        # left behind.
+        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane" "$hub_lane_machine" "$pane"
         echo "closed job=$job pane=$pane tab=$tab status=$token age=${age}s"
         acted=$(( acted + 1 ))
       else
