@@ -130,6 +130,8 @@ exit code: `0` 전부 current · `1` behind/diverged 하나라도 있음 ·
 뒤처진 칸의 호스트별 재설치(데스크가 실행 — fleet-rev는 하지 않는다):
 
 - **scopefuel**: `uv tool install --force git+https://github.com/mgh3326/scopefuel@<sha>`
+  — 이 `@<sha> --force` 형식은 fleet-rev의 권장 설치 형식이다(scopefuel README에는
+  rev 없는 `uv tool install git+…` 만 있고 핀 재설치 형식은 따로 문서화되어 있지 않다).
 - **agent-skills**: `git -C ~/.agents/skills pull --ff-only` 후 `./install.sh`
 - **panewire**: panewire repo의 [`docs/runbooks/node-update.md`](https://github.com/mgh3326/panewire/blob/main/docs/runbooks/node-update.md) 런북을 따른다.
 - **handoffkeep**: CLI 설치 절차는 handoffkeep repo에 문서화되어 있지 않다
