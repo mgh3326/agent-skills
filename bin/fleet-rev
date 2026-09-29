@@ -44,7 +44,7 @@ export PATH
 
 f="$HOME/.local/share/uv/tools/scopefuel/uv-receipt.toml"
 if [ -f "$f" ]; then
-  v=$(sed -n 's/.*rev=\([0-9a-fA-F][0-9a-fA-F]*\).*/\1/p' "$f" | sed -n '1p')
+  v=$(sed -n 's/.*rev=\([^" ]*\).*/\1/p' "$f" | sed -n '1p')
   if [ -n "$v" ]; then printf 'scopefuel.installed=%s\n' "$v"; else printf 'scopefuel.installed=unknown\n'; fi
 else
   printf 'scopefuel.installed=absent\n'
@@ -70,10 +70,8 @@ if command -v panewire >/dev/null 2>&1; then
   case "$v" in
     pw-*)
       r=${v#pw-}
-      case "$r" in
-        *[!0-9a-fA-F]*|'') printf 'panewire.installed=unknown\n' ;;
-        *) printf 'panewire.installed=%s\n' "$r" ;;
-      esac ;;
+      r=${r%% *}
+      if [ -n "$r" ]; then printf 'panewire.installed=%s\n' "$r"; else printf 'panewire.installed=unknown\n'; fi ;;
     *) printf 'panewire.installed=unknown\n' ;;
   esac
 else
@@ -82,20 +80,22 @@ fi
 printf 'panewire.source=version-cmd\n'
 
 if command -v handoffkeep >/dev/null 2>&1; then
-  src=none; v=""; m=""
   if j=$(handoffkeep version --json 2>/dev/null); then
-    src=version-cmd
-    v=$(printf '%s\n' "$j" | sed -n 's/.*"rev"[ ]*:[ ]*"\([^"]*\)".*/\1/p' | sed -n '1p')
-    m=$(printf '%s\n' "$j" | sed -n 's/.*"modified"[ ]*:[ ]*\(true\|false\).*/\1/p' | sed -n '1p')
+    printf 'handoffkeep.source=version-cmd\n'
+    printf 'handoffkeep.json=%s\n' "$(printf '%s' "$j" | sed -n '1p')"
   else
     o=$(go version -m "$(command -v handoffkeep)" 2>/dev/null)
     v=$(printf '%s\n' "$o" | sed -n 's/.*vcs\.revision=\([^ ]*\).*/\1/p' | sed -n '1p')
     m=$(printf '%s\n' "$o" | sed -n 's/.*vcs\.modified=\([^ ]*\).*/\1/p' | sed -n '1p')
-    if [ -n "$v" ]; then src=go-buildinfo; fi
+    if [ -n "$v" ]; then
+      printf 'handoffkeep.installed=%s\n' "$v"
+      printf 'handoffkeep.source=go-buildinfo\n'
+    else
+      printf 'handoffkeep.installed=unknown\n'
+      printf 'handoffkeep.source=none\n'
+    fi
+    printf 'handoffkeep.modified=%s\n' "${m:-false}"
   fi
-  if [ -n "$v" ]; then printf 'handoffkeep.installed=%s\n' "$v"; else printf 'handoffkeep.installed=unknown\n'; fi
-  printf 'handoffkeep.source=%s\n' "$src"
-  printf 'handoffkeep.modified=%s\n' "${m:-false}"
 else
   printf 'handoffkeep.installed=absent\n'
   printf 'handoffkeep.source=none\n'
@@ -107,6 +107,33 @@ HOSTS_HEADER = re.compile(r"^\[hosts\.([A-Za-z0-9_-]+)\]$")
 ANY_HEADER = re.compile(r"^\[([^]]+)\]$")
 SSH_KEY = re.compile(r"^ssh[ \t]*=[ \t]*(.*)$")
 NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+# An installed rev must look like a git commit prefix: at least 7 lowercase
+# hex (the panewire pw- form is 7), at most a full sha.
+VALID_INSTALLED = re.compile(r"[0-9a-f]{7,40}")
+HK_REV40 = re.compile(r"[0-9a-f]{40}")
+HK_MODIFIED_VALUES = ("true", "false", "unknown")
+
+
+def parse_handoffkeep_json(raw: str) -> tuple[str, str] | None:
+    """Validate the `handoffkeep version --json` line (#958 contract: every
+    field is a JSON string). Returns (rev, modified) or None when the output
+    is not an object whose rev is 40 lowercase hex or the literal 'unknown'
+    and whose modified is one of 'true', 'false', 'unknown'."""
+    try:
+        obj = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict):
+        return None
+    rev = obj.get("rev")
+    modified = obj.get("modified")
+    if not (
+        isinstance(rev, str) and (rev == "unknown" or HK_REV40.fullmatch(rev))
+    ):
+        return None
+    if modified not in HK_MODIFIED_VALUES:
+        return None
+    return rev, modified
 
 
 def eprint(*args: object) -> None:
@@ -313,12 +340,23 @@ def make_cell(
     source = kv.get(tool + ".source", "none")
 
     mods: list[str] = []
+    note = ""
     if tool == "agent-skills":
         dirty = kv.get("agent-skills.dirty", "0")
         if dirty not in ("", "0"):
             mods.append("modified (dirty=%s)" % dirty)
-    if tool == "handoffkeep" and kv.get("handoffkeep.modified") == "true":
-        mods.append("modified")
+    if tool == "handoffkeep":
+        if source == "version-cmd":
+            parsed = parse_handoffkeep_json(kv.get("handoffkeep.json", ""))
+            if parsed is None:
+                installed = "unknown"
+                note = "bad version json"
+            else:
+                installed, hk_modified = parsed
+                if hk_modified == "true":
+                    mods.append("modified")
+        elif kv.get("handoffkeep.modified") == "true":
+            mods.append("modified")
 
     cell: dict[str, object] = {
         "installed": installed if installed not in ("", "absent", "unknown") else None,
@@ -330,10 +368,15 @@ def make_cell(
 
     if installed in ("", "unknown"):
         cell["status"] = "unknown"
-        if not installed:
+        if note:
+            detail.append(note)
+        elif not installed:
             detail.append("probe silent")
     elif installed == "absent":
         cell["status"] = "absent"
+    elif not VALID_INSTALLED.fullmatch(installed):
+        cell["status"] = "unknown"
+        detail.append("bad rev")
     elif main_sha is None:
         cell["status"] = "unknown"
         detail.append("main unresolved")

@@ -35,7 +35,13 @@ EOF
 
 # ---------------------------------------------------------------- helpers
 
-sha40() { printf '%s' "$1" | shasum -a 256 | cut -c1-40; }
+sha40() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 256 | cut -c1-40
+  else
+    printf '%s' "$1" | sha256sum | cut -c1-40
+  fi
+}
 sanitize() { printf '%s' "$1" | tr -c 'A-Za-z0-9_-' '_'; }
 remote_home() { printf '%s/%s' "$FAKE_ROOT" "$(sanitize "$1")"; }
 
@@ -255,6 +261,19 @@ run_fleet --only local --json
 [[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["installed"]')" == "$HK_MAIN" ]] ||
   fail "AC4 json installed mismatch"
 
+# version --json with modified:"true" (real #958 shape: every field is a
+# string) -> current+modified with source version-cmd
+give_handoffkeep "$LOCAL_HOME" json "$HK_MAIN" true
+run_fleet --only local --json
+[[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["status"]')" == "current" ]] ||
+  fail "AC4 version-cmd modified status: $(jval '["hosts"][0]["tools"]["handoffkeep"]')"
+[[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["detail"]')" == *modified* ]] ||
+  fail "AC4 version-cmd modified detail: $(jval '["hosts"][0]["tools"]["handoffkeep"]["detail"]')"
+[[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["source"]')" == "version-cmd" ]] ||
+  fail "AC4 version-cmd modified source"
+run_fleet --only local
+assert_cell local handoffkeep "current+modified"
+
 give_handoffkeep "$LOCAL_HOME" old "$HK_MAIN" false
 run_fleet --only local --json
 [[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["source"]')" == "go-buildinfo" ]] ||
@@ -278,6 +297,15 @@ run_fleet --only local --json
   fail "AC4 no-source status: $(jval '["hosts"][0]["tools"]["handoffkeep"]')"
 [[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["source"]')" == "none" ]] ||
   fail "AC4 no-source source"
+
+# a version --json answer that is not the contracted object -> bad version json
+give_handoffkeep "$LOCAL_HOME" badjson "$HK_MAIN" false
+run_fleet --only local --json
+[[ $RC -eq 3 ]] || fail "AC4 badjson rc: want 3 got $RC"
+[[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["status"]')" == "unknown" ]] ||
+  fail "AC4 badjson status: $(jval '["hosts"][0]["tools"]["handoffkeep"]')"
+[[ "$(jval '["hosts"][0]["tools"]["handoffkeep"]["detail"]')" == *"bad version json"* ]] ||
+  fail "AC4 badjson detail: $(jval '["hosts"][0]["tools"]["handoffkeep"]["detail"]')"
 
 # agent-skills at main with an uncommitted file -> current + modified detail
 dirty_agentskills "$LOCAL_HOME"
@@ -352,7 +380,24 @@ run_fleet --only local,a,b --json
 [[ "$(jval '["hosts"][2]["tools"]["scopefuel"]["status"]')" == "unknown" ]] ||
   fail "AC6 norev status: $(jval '["hosts"][2]["tools"]["scopefuel"]')"
 [[ $RC -eq 3 ]] || fail "AC6 rc: want 3 got $RC"
-pass "AC6 receipt rev=/missing/no-rev -> installed/absent/unknown"
+
+# a rev that is not >=7 lowercase hex is 'bad rev' (unknown), never a prefix
+# match: a 1-char rev must not ride the prefix rule into 'current'
+set_main scopefuel "a$(sha40 s-a | cut -c2-40)"
+give_scopefuel "$LOCAL_HOME" "a"
+run_fleet --only local --json
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["status"]')" == "unknown" ]] ||
+  fail "AC6 1-char status: $(jval '["hosts"][0]["tools"]["scopefuel"]')"
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["detail"]')" == *"bad rev"* ]] ||
+  fail "AC6 1-char detail: $(jval '["hosts"][0]["tools"]["scopefuel"]["detail"]')"
+
+give_scopefuel "$LOCAL_HOME" "zzzzzzzz"
+run_fleet --only local --json
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["status"]')" == "unknown" ]] ||
+  fail "AC6 non-hex status: $(jval '["hosts"][0]["tools"]["scopefuel"]')"
+[[ "$(jval '["hosts"][0]["tools"]["scopefuel"]["detail"]')" == *"bad rev"* ]] ||
+  fail "AC6 non-hex detail: $(jval '["hosts"][0]["tools"]["scopefuel"]["detail"]')"
+pass "AC6 receipt rev=/missing/no-rev -> installed/absent/unknown; bad rev rejected"
 
 # ================================================================ AC7
 # hosts.toml: [hosts.a] ssh="x" (alias x), [hosts.b] (alias b), commented
