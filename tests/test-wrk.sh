@@ -78,6 +78,8 @@ cleanup() {
 trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
 printf '%s\n' 'fixture prompt' >"$PROMPT"
+# DEBUG-CI: report the dying line and mint counter (temporary, will revert)
+trap 'rc=$?; echo "SUITE-DIED rc=$rc line=$LINENO mintseq=$(cat "$TMP/mint-seq" 2>/dev/null): $(sed -n "${LINENO}p" "$0" | head -c 200)" >&2' ERR
 
 # ROB-1252: cc-qwen38/cc-glm read the clinepass gate key from this file at
 # spawn time (never from ~/.claude/); point it at a harmless fixture value.
