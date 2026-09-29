@@ -324,6 +324,7 @@ claude_spawn_at() {
     WRK_REFRESH_LOG="$TMP/refresh-$label.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh-$label.pids" WRK_REFRESH_TIMEOUT_S=5 \
     WRK_TEST_TRUST_DELAY_S="${WRK_TEST_TRUST_DELAY_S:-}" \
+    WRK_TEST_TRUST_LOCK_TIMEOUT_S="${WRK_TEST_TRUST_LOCK_TIMEOUT_S:-}" \
     "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ccwd" -m "$model" -p "$PROMPT" \
     -w w -l "$label" --t T1 --task "$task" "$@"
 }
@@ -1702,12 +1703,12 @@ t951_home="$TMP/t951-home-keep"; mkdir -p "$t951_home" "$TMP/t951-cwd-keep"
 t951_resolved="$(cd "$TMP/t951-cwd-keep" && pwd -P)"
 python3 - "$t951_home/.claude.json" "$t951_resolved" <<'PY'
 import json, sys
-doc = {"userID": "fixture-user", "numStartups": 7,
+doc = {"userID": "fixture-user", "numStartups": 7, "greeting": "한글 claude",
        "projects": {"/other/trusted": {"hasTrustDialogAccepted": True, "allowedTools": ["Bash(ls)"]},
                     "/other/untrusted": {"hasTrustDialogAccepted": False, "note": "keep"},
                     sys.argv[2]: {"note": "pre-existing"}}}
 with open(sys.argv[1], "w", encoding="utf-8") as h:
-    json.dump(doc, h, indent=2)
+    json.dump(doc, h, indent=2, ensure_ascii=False)
 PY
 chmod 640 "$t951_home/.claude.json"
 claude_spawn_at "$t951_home" "$TMP/t951-cwd-keep" t951b "$(mint_task)" >/dev/null ||
@@ -1722,6 +1723,9 @@ assert projs["/other/trusted"] == {"hasTrustDialogAccepted": True, "allowedTools
 assert projs["/other/untrusted"] == {"hasTrustDialogAccepted": False, "note": "keep"}
 assert projs[sys.argv[2]] == {"hasTrustDialogAccepted": True, "note": "pre-existing"}
 PY
+# r2 nit N1: non-ASCII content must survive as raw UTF-8, not XXXX escapes.
+grep -q '한글' "$t951_home/.claude.json" ||
+  fail "non-ASCII value was escaped to \\uXXXX escapes"
 [[ "$(python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode & 0o777))' "$t951_home/.claude.json")" == 0o640 ]] ||
   fail "existing store mode changed"
 echo "PASS 951-claude-trust preserves other keys, projects, entry keys, mode"
@@ -1851,6 +1855,73 @@ t951_rb_path="$(cd "$TMP/t951-race-b" && pwd -P)"
   fail "concurrent spawn lost entry B"
 echo "PASS 951-claude-trust concurrent spawns keep both entries"
 
+# AC2 (r2 blocker B1): HOME unset entirely must warn and continue — under
+# set -u an unguarded $HOME expansion aborts before the fail-open guard.
+mkdir -p "$TMP/t951-cwd-nohome" "$TMP/t951-xdg-nohome"
+set +e
+t951_out="$(env -u HOME -u CLAUDE_CONFIG_DIR \
+  HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
+  XDG_DATA_HOME="$TMP/t951-xdg-nohome" \
+  ARBITER_INBOX_ROOT="$TMP/t951-inbox-noh" \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr-t951noh.log" \
+  WRK_FIXTURE_MARKER="" WRK_SCOPEFUEL_LOG="$TMP/scopefuel-t951noh.log" \
+  WRK_REFRESH_LOG="$TMP/refresh-t951noh.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh-t951noh.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$TMP/t951-cwd-nohome" -m sonnet -p "$PROMPT" -w w \
+  -l t951noh --t T1 --task "$(mint_task)" 2>&1)"
+t951_rc=$?
+set -e
+[[ "$t951_rc" -eq 0 ]] || fail "unset HOME denied the spawn rc=$t951_rc: $t951_out"
+grep -q 'Claude folder trust' <<<"$t951_out" ||
+  fail "unset-HOME spawn lost its warning: $t951_out"
+grep -q '^OK ' <<<"$t951_out" || fail "unset-HOME spawn lost its OK line: $t951_out"
+# HOME unset + CLAUDE_CONFIG_DIR set still seeds — the cfg dir does not need HOME.
+t951_cfg="$TMP/t951-cfg-nohome"; mkdir -p "$t951_cfg" "$TMP/t951-cwd-nohome2"
+env -u HOME CLAUDE_CONFIG_DIR="$t951_cfg" \
+  HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  ARBITER_BIN="$TMP/absent-arbiter" WRK_COMPLETION_INTERVAL_S=3600 \
+  XDG_DATA_HOME="$TMP/t951-xdg-nohome" \
+  ARBITER_INBOX_ROOT="$TMP/t951-inbox-noh" \
+  WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr-t951noh2.log" \
+  WRK_FIXTURE_MARKER="" WRK_SCOPEFUEL_LOG="$TMP/scopefuel-t951noh2.log" \
+  WRK_REFRESH_LOG="$TMP/refresh-t951noh2.log" \
+  WRK_REFRESH_PID_LOG="$TMP/refresh-t951noh2.pids" WRK_REFRESH_TIMEOUT_S=5 \
+  "$WRK" spawn -c "$TMP/t951-cwd-nohome2" -m sonnet -p "$PROMPT" -w w \
+  -l t951noh2 --t T1 --task "$(mint_task)" >/dev/null ||
+  fail "HOME-unset + CLAUDE_CONFIG_DIR spawn failed"
+t951_resolved="$(cd "$TMP/t951-cwd-nohome2" && pwd -P)"
+[[ "$(claude_trust_entry "$t951_cfg/.claude.json" "$t951_resolved")" == '{"hasTrustDialogAccepted":true}' ]] ||
+  fail "HOME-unset + CLAUDE_CONFIG_DIR store lacks the trust entry"
+echo "PASS 951-claude-trust unset HOME warns and continues"
+
+# AC2 (r2 blocker B2): a lock held by a wedged process must time out and
+# continue, not block the spawn forever. The holder keeps LOCK_EX for 15s —
+# well past the seeder's 2s test deadline — and is killed once asserted.
+t951_home="$TMP/t951-home-held"; mkdir -p "$t951_home" "$TMP/t951-cwd-held"
+python3 - "$t951_home/.claude.json.wrk.lock" "$TMP/t951-held.ready" <<'PY' &
+import fcntl, sys, time
+fd = open(sys.argv[1], "w")
+fcntl.flock(fd, fcntl.LOCK_EX)
+open(sys.argv[2], "w").close()
+time.sleep(15)
+PY
+t951_holder=$!
+for _ in $(seq 100); do [[ -e "$TMP/t951-held.ready" ]] && break; sleep 0.05; done
+[[ -e "$TMP/t951-held.ready" ]] || fail "lock holder never acquired"
+set +e
+t951_out="$(WRK_TEST_TRUST_LOCK_TIMEOUT_S=2 \
+  claude_spawn_at "$t951_home" "$TMP/t951-cwd-held" t951held "$(mint_task)" 2>&1)"
+t951_rc=$?
+set -e
+kill "$t951_holder" 2>/dev/null || true
+wait "$t951_holder" 2>/dev/null || true
+[[ "$t951_rc" -eq 0 ]] || fail "held lock denied the spawn rc=$t951_rc: $t951_out"
+grep -q 'timed out waiting for lock' <<<"$t951_out" ||
+  fail "held lock lost its timeout warning: $t951_out"
+grep -q '^OK ' <<<"$t951_out" || fail "held-lock spawn lost its OK line: $t951_out"
+echo "PASS 951-claude-trust held lock times out, spawn continues"
+
 # -- assertion-RED mutants ---------------------------------------------------
 # 1) other keys dropped: the write must carry the whole document, not just our
 #    entry — a mutant that rewrites only the projects subtree loses data.
@@ -1860,12 +1931,11 @@ import json, sys
 json.dump({"keep": 1, "projects": {"/other": {"hasTrustDialogAccepted": True}}},
           open(sys.argv[1], "w", encoding="utf-8"))
 PY
-# Trailing newline required: the blob line is a substring of devin's
-# `...encode("utf-8") + b"\n"` line — without \n the anchor is not unique.
+# ensure_ascii=False keeps this anchor unique — devin's blob line lacks it.
 claude_trust_mutant drop-keys \
-  '        blob = json.dumps(data, indent=2).encode("utf-8")
+  '        blob = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
 ' \
-  '        blob = json.dumps({"projects": {target: entry}}, indent=2).encode("utf-8")
+  '        blob = json.dumps({"projects": {target: entry}}, indent=2, ensure_ascii=False).encode("utf-8")
 '
 WRK_UNDER_TEST="$TMP/mut-wrk-drop-keys" \
   claude_spawn_at "$t951_home" "$TMP/t951-m1-cwd" t951m1 "$(mint_task)" \
@@ -1898,15 +1968,14 @@ echo "PASS 951-claude-trust mutant: stripped fail-open guard goes RED"
 
 # 3) lock dropped: with the read->write gap held open, two writers lose one
 #    entry — the concurrency assertions above must fail against this mutant.
-#    The anchor spans into claude's block (devin's flock sits before 'try:try').
+#    The LOCK_NB spelling keeps this anchor unique to claude's poll loop
+#    (devin's flock is a bare LOCK_EX before 'try:try').
 t951_home="$TMP/t951-home-m7"; mkdir -p "$t951_home" "$TMP/t951-m7-a" "$TMP/t951-m7-b"
 claude_trust_mutant nolock \
-  '    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    try:
-        raw = None' \
-  '    pass  # mutant: no flock
-    try:
-        raw = None'
+  '            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break' \
+  '            pass  # mutant: no flock
+            break'
 t951_ma="$(mint_task)" t951_mb="$(mint_task)"
 WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
   claude_spawn_at "$t951_home" "$TMP/t951-m7-a" t951ma "$t951_ma" \

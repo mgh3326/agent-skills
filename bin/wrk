@@ -1309,7 +1309,7 @@ claude_seed_folder_trust() {
     warn "Claude folder trust seed skipped: cannot resolve absolute CWD: $cwd"
     return 0
   fi
-  cfg_home="${CLAUDE_CONFIG_DIR:-$HOME}"
+  cfg_home="${CLAUDE_CONFIG_DIR:-${HOME:-}}"
   case "$cfg_home" in
     /*) ;;
     *) warn "Claude folder trust seed skipped: config home is not absolute: $cfg_home"; return 0 ;;
@@ -1351,12 +1351,23 @@ except OSError as exc:
 # committed entry and keeps it.
 lock_path = path + ".wrk.lock"
 try:
-    lock_fd = open(lock_path, "a+b")
+    lock_fd = os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "a+b")
 except OSError as exc:
     skip("cannot open lock %s: %s" % (lock_path, exc))
 
 with lock_fd:
-    fcntl.flock(lock_fd, fcntl.LOCK_EX)
+    # Poll LOCK_EX|LOCK_NB with a deadline: a wedged holder (or a hung fs)
+    # must warn and continue the spawn, not block it forever. The env knob is
+    # test-only — production takes the 10s default.
+    deadline = time.monotonic() + float(os.environ.get("WRK_TEST_TRUST_LOCK_TIMEOUT_S") or 10.0)
+    while True:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                skip("timed out waiting for lock %s" % lock_path)
+            time.sleep(0.05)
     try:
         raw = None
         if os.path.exists(path):
@@ -1403,7 +1414,7 @@ with lock_fd:
 
         # Atomic replace: temp in the same dir, fsync, rename, dir fsync —
         # mode preserved exactly, every other key (and project) untouched.
-        blob = json.dumps(data, indent=2).encode("utf-8")
+        blob = json.dumps(data, indent=2, ensure_ascii=False).encode("utf-8")
         tmp_fd, tmp = tempfile.mkstemp(dir=parent, prefix=".claude.json.", suffix=".tmp")
         try:
             with os.fdopen(tmp_fd, "wb") as handle:
