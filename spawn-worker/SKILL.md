@@ -575,6 +575,7 @@ hub 호출 자체가 실패했을 때만 아래의 로컬 폴백 측정(load5/nc
 max_load_ratio = 0.5       # hub unavailable 때만 사용
 max_active = 4             # hub unavailable 때만 사용
 heavy_max = 1              # 이 머신의 wrk heavy 동시 홀더 수: 0=금지, N=슬롯 N개 (기본 1)
+spawn = false              # 이 호스트의 로컬 spawn 자체를 닫는다 — bare TOML boolean만 허용, 기본 true
 
 [hub]
 hub_url = "wss://<hub-host>"
@@ -618,6 +619,17 @@ wake = "panewire"
   probe·prepare·scp 같은 전송 leg의 실패 rc는 70이 될 수 없게 1로 정규화되므로
   라우터가 보는 70은 항상 원격 wrk 자신의 응답이다. 그 외 원격 실패(전송 오류, 원격
   quota 거부 rc 4 등)는 기존처럼 다음 후보를 시도하고, 모두 실패하면 로컬 폴백한다.
+- `spawn = false`(#1155)는 이 호스트의 로컬 spawn 자체를 닫는 운영 스위치다 — 켜고 끄는
+  것은 operator의 운영 단계다(wrk는 읽기만 한다). 닫힌 호스트에서 `--host auto`는 로컬
+  압력이 낮아도 로컬을 후보로 쓰지 않고, 모든 원격이 실패하면 로컬 폴백 없이 후보별
+  진단 뒤 `wrk: local spawns are disabled ...`와 함께 rc 80
+  (`WRK_EXIT_LOCAL_SPAWN_DISABLED`)으로 거부한다. `--host local`은 pane·arbiter·hk 클레임
+  같은 모든 부수효과 전에 같은 rc 80으로 거부된다. 위임된 원격 spawn은 실행 호스트에서
+  `wrk spawn --host local`로 도착하므로, 원격 호스트가 `spawn = false`이면 위임도 같은
+  rc 80으로 거절한다 — 스폰 호스트의 auto 순회는 이 응답을 stop set에 넣지 않고 다음
+  후보로 넘어간다(70과 달리 라운드를 멈추지 않는다). 값은 bare TOML boolean만 허용한다 —
+  `"false"`처럼 따옴표 붙인 문자열은 타입 오류로 rc 70 설정 거부다. 키가 없거나
+  `true`이면 main과 바이트 동일한 기존 동작이다.
 - `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
 - `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600
