@@ -89,6 +89,12 @@ if [[ "$remote" == *'wrk spawn'* ]]; then
       printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: hk task 1037 is already bound to job 'other-job' — a task linked to another job cannot be re-spawned (fail-closed)}" >&2
       exit "${WRK_REMOTE_RC:-1}"
       ;;
+    remote-config-refused)
+      # #1154: the remote wrk's own fail-closed answer — its hub quota gate
+      # refusing a malformed [hub] config on the execution host (rc 70).
+      printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: [hub] quota_gate accepts only \"local\"; refusing spawn}" >&2
+      exit 70
+      ;;
     remote-warn-ok)
       # A winning remote wrk may still talk on stderr (quota notes, warnings);
       # on main that text streamed live even when the spawn succeeded.

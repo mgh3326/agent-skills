@@ -612,6 +612,12 @@ wake = "panewire"
 - hub가 꺼져 폴백 중 원격 후보가 닿지 않으면 다음 후보를 본다. `wake = "panewire"`일 때만
   `panewire burst request --target <name> --hold <N>m`을 best-effort로 시도하며, wake 실패도
   다음 후보 탐색을 막지 않는다.
+- `--host auto` 순회에서 위임된 원격 wrk가 설정 오류로 거부(rc 70 — 예: 원격의 잘못된
+  [hub] quota_gate)하면 라운드는 즉시 멈추고 rc 70 fail-closed다(#1154). 다음 후보나
+  로컬 폴백으로 넘어가지 않는다 — 스폰이 닫힌 호스트에 job을 두지 않기 위해서다.
+  probe·prepare·scp 같은 전송 leg의 실패 rc는 70이 될 수 없게 1로 정규화되므로
+  라우터가 보는 70은 항상 원격 wrk 자신의 응답이다. 그 외 원격 실패(전송 오류, 원격
+  quota 거부 rc 4 등)는 기존처럼 다음 후보를 시도하고, 모두 실패하면 로컬 폴백한다.
 - `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
 - `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600
