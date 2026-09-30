@@ -5816,39 +5816,6 @@ spillover_local_is_pressured() {
   return 1
 }
 
-# #1155: this host's own [local] spawn key decides whether local spawns may
-# run here at all. Sets LOCAL_SPAWN_ALLOWED (1 allowed, 0 forbidden). Absent
-# or `spawn = true` is the historical behavior and byte-identical to before;
-# `spawn = false` forbids every local spawn path — --host auto treats local
-# as an unavailable candidate, --host local refuses, and a delegated remote
-# spawn (which arrives as --host local on the execution host) refuses too.
-# Accepted values are the bare TOML booleans true/false — a quoted spelling
-# such as "false" is a string, not a boolean, so it refuses like any other
-# value (fail-closed, the same boundary quota_gate uses).
-local_spawn_resolve() {
-  LOCAL_SPAWN_ALLOWED=1
-  local raw
-  raw="$(spillover_value local spawn raw 2>/dev/null)" || return 0
-  case "$raw" in
-    true) ;;
-    false) LOCAL_SPAWN_ALLOWED=0 ;;
-    *) echo "wrk: [local] spawn accepts only the bare TOML booleans true or false (got '$raw'); refusing spawn" >&2
-       return "$WRK_EXIT_CONFIG_REFUSED" ;;
-  esac
-}
-
-# The "use --host local" tail on failure lines is only advice while this host
-# accepts local spawns; with [local] spawn = false the tail names the flag
-# instead of an override that would be refused. $1 is the non-local
-# alternative the line also suggests (configure hosts.toml, retry, ...).
-spillover_local_advice() {
-  if [[ "${LOCAL_SPAWN_ALLOWED:-1}" -eq 0 ]]; then
-    printf 'local spawns are disabled on this host ([local] spawn = false)%s' "${1:+; }$1"
-  else
-    printf 'use --host local%s' "${1:+ or }$1"
-  fi
-}
-
 spillover_log() {
   local host="$1" reason="$2" log
   log="${WRK_SPILLOVER_LOG:-${XDG_STATE_HOME:-$HOME/.local/state}/wrk/spillover.log}"
@@ -6837,6 +6804,39 @@ spawn_router_cmd() {
   spillover_emit_host local "$out"
   rm -f "$out"
   return "$rc"
+}
+
+# #1155: this host's own [local] spawn key decides whether local spawns may
+# run here at all. Sets LOCAL_SPAWN_ALLOWED (1 allowed, 0 forbidden). Absent
+# or `spawn = true` is the historical behavior and byte-identical to before;
+# `spawn = false` forbids every local spawn path — --host auto treats local
+# as an unavailable candidate, --host local refuses, and a delegated remote
+# spawn (which arrives as --host local on the execution host) refuses too.
+# Accepted values are the bare TOML booleans true/false — a quoted spelling
+# such as "false" is a string, not a boolean, so it refuses like any other
+# value (fail-closed, the same boundary quota_gate uses).
+local_spawn_resolve() {
+  LOCAL_SPAWN_ALLOWED=1
+  local raw
+  raw="$(spillover_value local spawn raw 2>/dev/null)" || return 0
+  case "$raw" in
+    true) ;;
+    false) LOCAL_SPAWN_ALLOWED=0 ;;
+    *) echo "wrk: [local] spawn accepts only the bare TOML booleans true or false (got '$raw'); refusing spawn" >&2
+       return "$WRK_EXIT_CONFIG_REFUSED" ;;
+  esac
+}
+
+# The "use --host local" tail on failure lines is only advice while this host
+# accepts local spawns; with [local] spawn = false the tail names the flag
+# instead of an override that would be refused. $1 is the non-local
+# alternative the line also suggests (configure hosts.toml, retry, ...).
+spillover_local_advice() {
+  if [[ "${LOCAL_SPAWN_ALLOWED:-1}" -eq 0 ]]; then
+    printf 'local spawns are disabled on this host ([local] spawn = false)%s' "${1:+; }$1"
+  else
+    printf 'use --host local%s' "${1:+ or }$1"
+  fi
 }
 
 hosts_help() {
