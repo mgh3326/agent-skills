@@ -67,7 +67,7 @@ class EligibilityFixtures(unittest.TestCase):
             "repo": "agent-skills", "repo_path": str(self.repo), "pr": None,
             "head": head, "base": self.base, "issuer": "builder-sol",
             "declared_t": "T2", "required_grade": "S", "implementation_grade": "S",
-            "contributors": [{"profile": "builder-sol", "model": "gpt-6-sol", "effort": "max",
+            "contributors": [{"profile": "builder-sol", "model": "gpt-6.1-sol", "effort": "max",
                               "role": "builder", "kind": "initial", "session": "builder-session",
                               "worktree": "/tmp/builder-worktree"}],
             "tester": {"planned_profile": "grok", "planned_effort": "xhigh"},
@@ -404,8 +404,16 @@ class EligibilityFixtures(unittest.TestCase):
     def test_pane_footer_requires_model_and_effort(self) -> None:
         self.assertTrue(eligible._pane_model_matches("Grok 4.7 (xhigh) · always-approve", "grok-4.7", "xhigh"))
         self.assertTrue(eligible._pane_model_matches("GPT-6-Sol max · worktree", "gpt-6-sol", "max"))
+        # #1026: the switched model gets its own display label.
+        self.assertTrue(eligible._pane_model_matches("GPT-6.1-Sol max · worktree", "gpt-6.1-sol", "max"))
         self.assertFalse(eligible._pane_model_matches("Grok 4.7 (high) · always-approve", "grok-4.7", "xhigh"))
         self.assertFalse(eligible._pane_model_matches("Grok 4.6 (xhigh) · always-approve", "grok-4.7", "xhigh"))
+
+    def test_sol61_same_family_as_sol(self) -> None:
+        # #1026 AC3: gpt-6.1-sol stays in gpt-6-sol's family, so the same-family
+        # guard between a Sol builder and a Sol tester is unchanged.
+        self.assertEqual(common.model_family("gpt-6.1-sol"), common.model_family("gpt-6-sol"))
+        self.assertEqual(common.model_family("gpt-6.1-sol"), "openai")
 
     def test_new_contributor_invalidates_prior_receipt(self) -> None:
         evidence = self.landed(self.evidence(self.make_head()))

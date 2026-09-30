@@ -1180,6 +1180,9 @@ grep -qx 'codex-astra' <<<"$profiles_out"
 # ROB-591 rollback spellings (gpt-5.6-sol/gpt-5.6-luna) must remain spawnable.
 grep -qx 'codex-sol56' <<<"$profiles_out"
 grep -qx 'codex-luna56' <<<"$profiles_out"
+# #1026 rollback spellings (gpt-6-sol) join the same list.
+grep -qx 'codex-sol6' <<<"$profiles_out"
+grep -qx 'builder-sol6' <<<"$profiles_out"
 # task #526: the astra builder spellings were removed — astra is counsel-only
 # (hk:doc decision/2026-09-21/astra-allowed-purposes-approved).
 if grep -qx 'builder-astra' <<<"$profiles_out"; then exit 1; fi
@@ -1237,6 +1240,7 @@ profiles=(
   "codex-max:codex-max" "codex-terra:codex-terra-max"
   "codex-terra-max:codex-terra-max" "codex-luna-max:codex-luna-max"
   "codex-sol56:codex-max" "codex-luna56:codex-luna-max"
+  "codex-sol6:codex-max"
   "kiro:kiro-sol" "kiro-opus:kiro-opus" "kiro-sonnet:kiro-sonnet"
   "kiro-sol:kiro-sol" "kiro-luna:kiro-sol" "kiro-cheap:kiro-cheap"
   "kiro-glm:kiro-sol" "kiro-deepseek:kiro-sol" "kiro-minimax:kiro-sol"
@@ -3668,15 +3672,17 @@ echo "PASS devin-swe2 scopefuel-gate-to-arbiter-pool-and-spawn-receipt"
 # ---------------------------------------------------------------------------
 # task #677: the quota_pool.record launch_profile must carry the canonical
 # catalog profile, not the launcher spelling. codex-sol/codex-max/codex/
-# builder-sol/captain-sol all run gpt-6-sol, whose catalog profile is codex-sol
-# (scopefuel PROFILE_ALIASES: codex-max -> codex-sol; `policy launch builder-sol`
-# is not in the catalog at all). Recording the raw spelling split reps/usage
-# attribution across names the grade table cannot read — 2026-09-25: a
-# builder-sol xhigh spawn recorded launch_profile=builder-sol@xhigh and
+# builder-sol/captain-sol all run gpt-6.1-sol (#1026), whose catalog profile is
+# codex-sol (scopefuel PROFILE_ALIASES: codex-max -> codex-sol; `policy launch
+# builder-sol` is not in the catalog at all). Recording the raw spelling split
+# reps/usage attribution across names the grade table cannot read — 2026-09-25:
+# a builder-sol xhigh spawn recorded launch_profile=builder-sol@xhigh and
 # profile=codex-max while its pane ran gpt-6-sol xhigh. The ROB-1213
 # cross-checked fields stay put (pool from scopefuel, profile gate-normalized);
 # non-codex pools keep their literal spelling@effort, so no other pool's records
-# change; rollback spellings (codex-sol56) stay literal by design.
+# change; rollback spellings (codex-sol56, codex-sol6) stay literal by design —
+# builder-sol6 still records codex-sol@high through its grade consult even
+# though its model id stays literal.
 # Mutant: revert the canonical-name mapping in arbiter_admit -> these go RED.
 # ---------------------------------------------------------------------------
 # Own arbiter state (like the R20/R21/idempotency sections): these successful
@@ -3709,6 +3715,10 @@ launch_profile_case captain-sol captain-sol-canon 'codex-sol@high' --role builde
 launch_profile_case codex-max codex-max-canon 'codex-sol@max'
 launch_profile_case codex codex-canon 'codex-sol@high'
 launch_profile_case codex-sol56 codex-sol56-rollback 'codex-sol56@max'
+# #1026: codex-sol6 records its literal spelling@effort like codex-sol56, while
+# builder-sol6 still lands on the canonical consult rung codex-sol@high.
+launch_profile_case codex-sol6 codex-sol6-rollback 'codex-sol6@max'
+launch_profile_case builder-sol6 builder-sol6-canon 'codex-sol@high' --role builder --lane builder-sol6-lane --parent parent-lane
 launch_profile_case codex-terra codex-terra-canon 'codex-terra@medium'
 launch_profile_case codex-med codex-med-canon 'codex-terra@medium'
 launch_profile_case codex-terra-max codex-terra-max-canon 'codex-terra-max@max'
@@ -4490,7 +4500,7 @@ expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent p
 expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
-for builder_profile in builder-opus captain-opus builder-sol captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
+for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
   builder-luna-max builder-terra-high builder-terra-xhigh builder-terra-max builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh; do
@@ -4520,7 +4530,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -4588,7 +4598,8 @@ PY
 : >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log" 2>/dev/null || true
 builder_sol_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sol --role builder --lane builder-sol-lane --parent parent-lane --job builder-sol-job --t T1 2>&1)"
 grep -q 'model=builder-sol' <<<"$builder_sol_out"
-grep -q -- '-m gpt-6-sol' "$TMP/herdr.log"
+grep -q -- '-m gpt-6.1-sol' "$TMP/herdr.log" ||
+  fail "builder-sol must launch gpt-6.1-sol (#1026): $(cat "$TMP/herdr.log")"
 # 2026-09-26 (decision 4088 B): a builder seat never takes a max rung —
 # builder-sol runs codex-sol at effort high and consults the catalog at high.
 grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
@@ -4596,6 +4607,84 @@ grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
 grep -q 'policy launch codex-sol effort=high' "$TMP/launch.log" ||
   fail "builder-sol must consult the catalog for codex-sol at effort high"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
+
+# ---------------------------------------------------------------------------
+# #1026 (2026-09-30 operator decision): the codex-sol family switches to
+# gpt-6.1-sol. AC1 — every switched spelling carries -m gpt-6.1-sol at today's
+# effort, from the canon when it answers and from PROFILE_MODEL when it cannot.
+# ---------------------------------------------------------------------------
+sol61_case() {
+  local model="$1" effort="$2"; shift 2
+  : >"$TMP/herdr.log"
+  spawn_base "$model" --job "sol61-$model" --t T1 "$@" >/dev/null
+  grep -q -- '-m gpt-6.1-sol' "$TMP/herdr.log" ||
+    fail "$model must carry -m gpt-6.1-sol from the canon: $(cat "$TMP/herdr.log")"
+  grep -q "model_reasoning_effort=$effort" "$TMP/herdr.log" ||
+    fail "$model must keep today's $effort rung: $(cat "$TMP/herdr.log")"
+  # Unreachable canon: the literal PROFILE_MODEL must agree with the canon.
+  : >"$TMP/herdr.log"
+  WRK_LAUNCH_MODE=broken spawn_base "$model" --job "sol61-fb-$model" --t T1 "$@" >/dev/null
+  grep -q -- '-m gpt-6.1-sol' "$TMP/herdr.log" ||
+    fail "$model fallback must agree with the canon (-m gpt-6.1-sol): $(cat "$TMP/herdr.log")"
+  grep -q "model_reasoning_effort=$effort" "$TMP/herdr.log" ||
+    fail "$model fallback must keep today's $effort rung: $(cat "$TMP/herdr.log")"
+}
+sol61_case codex high
+sol61_case codex-sol max
+sol61_case codex-max max
+sol61_case builder-sol high --role builder --lane sol61-builder-lane --parent parent-lane
+sol61_case captain-sol high --role builder --lane sol61-captain-lane --parent parent-lane
+# The E6 builder rungs are switched spellings too (builder-sol-max is seat-closed
+# — its refusal is asserted in the #704 block below).
+SCOPEFUEL_E6_ARM=codex-sol@high sol61_case builder-sol-high high --role builder --lane sol61-e6h-lane --parent parent-lane
+SCOPEFUEL_E6_ARM=codex-sol@medium sol61_case builder-sol-medium medium --role builder --lane sol61-e6m-lane --parent parent-lane
+echo "PASS 1026-AC1-switched-spellings-carry-gpt-6.1-sol"
+
+# AC2 — the rollback spellings pin the literal gpt-6-sol even though the fake
+# canon now answers gpt-6.1-sol for codex-sol. codex-sol6 never consults the
+# catalog at all (ROB-591 shape, like codex-sol56); builder-sol6 still gets the
+# builder-seat consult at codex-sol@high but keeps the literal model id.
+# NB: `: >a >b >c` needs a `>` per file — `: >a b c` passes b and c as
+# arguments and only truncates a (see the one-file-per-line convention above).
+: >"$TMP/herdr.log"
+: >"$TMP/scopefuel.log"
+: >"$TMP/launch.log"
+sol6_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base codex-sol6 --job codex-sol6-job --t T1 2>&1)"
+grep -q 'model=codex-sol6' <<<"$sol6_out"
+grep -q -- '-m gpt-6-sol' "$TMP/herdr.log" ||
+  fail "codex-sol6 must keep the literal -m gpt-6-sol: $(cat "$TMP/herdr.log")"
+grep -q 'model_reasoning_effort=max' "$TMP/herdr.log" ||
+  fail "codex-sol6 must keep codex-sol's max default: $(cat "$TMP/herdr.log")"
+if grep -q 'gpt-6.1-sol' "$TMP/herdr.log"; then
+  fail "codex-sol6 took the canon's model id: $(cat "$TMP/herdr.log")"
+fi
+[[ ! -s "$TMP/launch.log" ]] ||
+  fail "codex-sol6 must not consult the catalog at all: $(cat "$TMP/launch.log")"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
+
+: >"$TMP/herdr.log"
+: >"$TMP/scopefuel.log"
+: >"$TMP/launch.log"
+bsol6_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sol6 --role builder \
+  --lane builder-sol6-lane --parent parent-lane --job builder-sol6-job --t T1 2>&1)"
+grep -q 'model=builder-sol6' <<<"$bsol6_out" ||
+  fail "builder-sol6 must be admitted under --role builder: $bsol6_out"
+grep -q -- '-m gpt-6-sol' "$TMP/herdr.log" ||
+  fail "builder-sol6 must keep the literal -m gpt-6-sol (canon serves gpt-6.1-sol): $(cat "$TMP/herdr.log")"
+grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
+  fail "builder-sol6 must launch at the builder-seat high rung: $(cat "$TMP/herdr.log")"
+if grep -q 'gpt-6.1-sol' "$TMP/herdr.log"; then
+  fail "builder-sol6 took the canon's model id: $(cat "$TMP/herdr.log")"
+fi
+# Exactly one consult, at exactly the graded rung — not a stray codex-sol6
+# line, not an unpinned consult that would hand back the max default.
+[[ "$(cat "$TMP/launch.log")" == 'policy launch codex-sol effort=high operator=0' ]] ||
+  fail "builder-sol6 must still consult the catalog at codex-sol@high: $(cat "$TMP/launch.log")"
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
+echo "PASS 1026-AC2-rollback-spellings-pin-gpt-6-sol"
+# The AC4 assertion-RED mutants live in the mutants section below (mut_wrk /
+# expect_red are defined there).
+
 # task #526 AC2: the counsel path must not regress — `wrk spawn -m codex-astra`
 # under the default role (the ARCHITECT.md spawn shape, no --role) still
 # resolves to gpt-6-astra and still gates as the codex-astra spelling so the
@@ -4982,6 +5071,43 @@ expect_red seat-exception-broadened builder_refused_probe "$MUT921/wrk-seat" bui
 expect_red catalog-pin-dropped sonnet_builder_probe "$MUT921/wrk-catalogpin" c1 '--model sonnet --dangerously-skip-permissions --effort xhigh'
 echo "PASS 921 mutants assertion-red=6/6 (model map, effort set, effort flag, launch_profile, seat scope, catalog pin)"
 
+# ---------------------------------------------------------------------------
+# #1026 AC4 — assertion-RED mutants for the gpt-6.1-sol switch.
+# ---------------------------------------------------------------------------
+# $1=wrk path; 0 iff a codex-sol6 spawn keeps the literal gpt-6-sol argv.
+sol6_literal_probe() {
+  local wrk="$1" out start
+  : >"$TMP/herdr.log"
+  out="$(WRK="$wrk" spawn_base codex-sol6 --job "mut-sol6" --t T1 2>&1)" || return 1
+  start="$(grep '^agent start ' "$TMP/herdr.log")" || return 1
+  [[ "$start" == *" -m gpt-6-sol "* ]] || return 1
+}
+# $1=wrk path; 0 iff an unreachable-canon codex-sol spawn carries gpt-6.1-sol.
+sol_fallback_probe() {
+  local wrk="$1" out start
+  : >"$TMP/herdr.log"
+  out="$(WRK="$wrk" WRK_LAUNCH_MODE=broken spawn_base codex-sol --job "mut-solfb" --t T1 2>&1)" || return 1
+  start="$(grep '^agent start ' "$TMP/herdr.log")" || return 1
+  [[ "$start" == *" -m gpt-6.1-sol "* ]] || return 1
+}
+MUT1026="$TMP/mutants-1026"
+mkdir -p "$MUT1026"
+# M1 — invariant: a rollback spelling never takes the canon's model id.
+# Mapping codex-sol6 into resolve_catalog_profile lets the served gpt-6.1-sol
+# through; the literal argv probe goes RED.
+mut_wrk "$MUT1026/wrk-sol6-canon" \
+  'codex-sol|codex-max) CATALOG_PROFILE=codex-sol ;;' \
+  'codex-sol|codex-max|codex-sol6) CATALOG_PROFILE=codex-sol ;;'
+# M2 — invariant: the fallback table agrees with the canon. A literal left on
+# gpt-6-sol silently rolls an unreachable-canon launch back; the fallback
+# probe goes RED.
+mut_wrk "$MUT1026/wrk-fallback" \
+  'codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT=max' \
+  'codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max'
+expect_red sol6-takes-canon-model sol6_literal_probe "$MUT1026/wrk-sol6-canon"
+expect_red fallback-table-stale sol_fallback_probe "$MUT1026/wrk-fallback"
+echo "PASS 1026-AC4-mutants-red"
+
 # #666: the devin effort rungs exist as named builder spellings — same
 # unattended argv as the worker variants, gated as devin-swe2 like every
 # devin-* profile, and refused without --role builder. builder-ds41[-max] is
@@ -5103,9 +5229,9 @@ PY
 e6_builder_case builder-opus-low     opus        low    '--model opus --dangerously-skip-permissions --effort low'     --operator-request hk:task/704
 e6_builder_case builder-opus-medium  opus        medium '--model opus --dangerously-skip-permissions --effort medium'
 e6_builder_case builder-sonnet-xhigh sonnet      xhigh  '--model sonnet --dangerously-skip-permissions --effort xhigh' --operator-request hk:task/704
-e6_builder_case builder-sol-high     codex-sol   high   '--yolo -m gpt-6-sol -c model_reasoning_effort=high'
+e6_builder_case builder-sol-high     codex-sol   high   '--yolo -m gpt-6.1-sol -c model_reasoning_effort=high'
 # #737: codex-sol@medium joins the sol E6 rungs on the same pin rule.
-e6_builder_case builder-sol-medium   codex-sol   medium '--yolo -m gpt-6-sol -c model_reasoning_effort=medium'
+e6_builder_case builder-sol-medium   codex-sol   medium '--yolo -m gpt-6.1-sol -c model_reasoning_effort=medium'
 e6_builder_case builder-terra-high   codex-terra high   '--yolo -m gpt-5.6-terra -c model_reasoning_effort=high'
 e6_builder_case builder-terra-xhigh  codex-terra xhigh  '--yolo -m gpt-5.6-terra -c model_reasoning_effort=xhigh'
 e6_builder_case builder-kimi-high    kimi-k3     high   '--auto -m kimi-code/k3'

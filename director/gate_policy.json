@@ -156,7 +156,7 @@
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "44c35ecb884b5517c688fd669bf5e731e562f9f158faf20ae17e4231a452ab2b",
-    "bin/wrk": "c646987696cc863afdc9be602018902a6ff023d6da4bac9a884cc7db41f13bcf",
+    "bin/wrk": "91430d0110a3e3382eb14c481a88f7700a65645dab1db6b5d2850526f3372cae",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
     "director/SKILL.md": "bb1cda3c619be6679a6366e411ed277e32e1a5c2ba6fe6bab25e3b1df02aaa64",
     "spawn-worker/SKILL.md": "1ff1fd24984711435215381ff1cd04e728da90ed4b079ac4a7baa9ab0e1c11ab"
@@ -517,8 +517,8 @@
         "xhigh": "S+"
       },
       "launcher": "codex",
-      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
-      "model": "gpt-6-sol",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
       "roles": [
         "builder",
         "worker",
@@ -539,8 +539,8 @@
         "high": null
       },
       "launcher": "codex",
-      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
-      "model": "gpt-6-sol",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
       "roles": [
         "builder"
       ],
@@ -558,8 +558,8 @@
         "max": null
       },
       "launcher": "codex",
-      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
-      "model": "gpt-6-sol",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
       "roles": [
         "builder"
       ],
@@ -577,8 +577,8 @@
         "medium": null
       },
       "launcher": "codex",
-      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
-      "model": "gpt-6-sol",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
       "roles": [
         "builder"
       ],
@@ -586,6 +586,19 @@
         "T1",
         "T2"
       ]
+    },
+    "builder-sol6": {
+      "default_effort": "high",
+      "family": "openai",
+      "grades": {
+        "high": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
+      "model": "gpt-6-sol",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
     },
     "builder-sonnet": {
       "default_effort": "xhigh",
@@ -732,8 +745,8 @@
         "xhigh": "S+"
       },
       "launcher": "codex",
-      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
-      "model": "gpt-6-sol",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
       "roles": [
         "builder",
         "worker",
@@ -819,8 +832,8 @@
         "xhigh": "S+"
       },
       "launcher": "codex",
-      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
-      "model": "gpt-6-sol",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
       "roles": [
         "builder",
         "worker",
@@ -925,8 +938,8 @@
         "xhigh": "S+"
       },
       "launcher": "codex",
-      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
-      "model": "gpt-6-sol",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
       "roles": [
         "builder",
         "worker",
@@ -966,8 +979,8 @@
         "xhigh": "S+"
       },
       "launcher": "codex",
-      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
-      "model": "gpt-6-sol",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
       "roles": [
         "builder",
         "worker",
@@ -988,6 +1001,19 @@
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-sol",
       "model": "gpt-5.6-sol",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "codex-sol6": {
+      "default_effort": "max",
+      "family": "openai",
+      "grades": {
+        "max": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-sol",
+      "model": "gpt-6-sol",
       "role_status": "unknown",
       "roles": [],
       "surfaces": []

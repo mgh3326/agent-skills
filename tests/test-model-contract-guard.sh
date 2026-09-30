@@ -87,7 +87,7 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # --- checked-in scopefuel catalog contract (counterpart: scopefuel repo,
 #     src/scopefuel/recommend.py GRADE_TABLE, ROB-591 rows) ------------------
-CONTRACT_SOL_MODEL_ID="gpt-6-sol"
+CONTRACT_SOL_MODEL_ID="gpt-6.1-sol"
 CONTRACT_LUNA_MODEL_ID="gpt-6-luna"
 CONTRACT_GROK_MODEL_ID="grok-4.7"
 # The launcher passes the Claude Code CLI *alias* "opus", not the literal
@@ -214,14 +214,27 @@ echo "PASS kiro-opus argv follows the canonical model id"
 
 # --- the exempt spellings must NOT follow the canon -------------------------
 # A rollback pin that follows the server is a rollback lever that does nothing.
-for pinned in codex-sol56 codex-luna56 grok46; do
+for pinned in codex-sol56 codex-luna56 codex-sol6 grok46; do
   argv="$(canon_argv "$pinned" should-never-appear)"
   grep -qF -- "should-never-appear" <<<"$argv" &&
     fail "rollback spelling '$pinned' followed the catalog; it must stay pinned"
 done
 grep -qF -- "-m gpt-5.6-sol" <<<"$(canon_argv codex-sol56 should-never-appear)" ||
   fail "codex-sol56 lost its pinned model id"
-echo "PASS rollback spellings (codex-sol56, codex-luna56, grok46) ignore the catalog"
+grep -qF -- "-m gpt-6-sol" <<<"$(canon_argv codex-sol6 should-never-appear)" ||
+  fail "codex-sol6 lost its pinned model id"
+# #1026: builder-sol6 is the split case — it consults the canon at
+# codex-sol@high for the gate but keeps the literal model id.
+argv="$(canon_argv builder-sol6 should-never-appear --role builder --lane guard-lane --parent guard-parent-lane \
+  --task "$("$HANDOFFKEEP_BIN" tasks add --title "builder-sol6 contract task" 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')")"
+grep -qF -- "should-never-appear" <<<"$argv" &&
+  fail "builder-sol6 followed the catalog's model id; the consult must not move it"
+grep -qF -- "-m gpt-6-sol" <<<"$argv" ||
+  fail "builder-sol6 lost its pinned model id"
+grep -q 'policy launch codex-sol effort=high' "$TMP/launch.log" ||
+  fail "builder-sol6 must still consult the catalog at codex-sol@high: $(cat "$TMP/launch.log")"
+echo "PASS rollback spellings (codex-sol56, codex-luna56, codex-sol6, builder-sol6, grok46) keep their literal model ids"
 
 # --- #527 overlap: codex-astra's default effort ----------------------------
 # codex-astra is consult_only, so a full spawn is refused at the gate before an
@@ -381,7 +394,7 @@ WRK_CATALOG_SPELLINGS_SNAPSHOT="$(printf '%s\n' \
   builder-grok builder-grok-low builder-grok-medium builder-grok-xhigh \
   builder-luna builder-luna-max builder-opus builder-opus-low \
   builder-opus-medium builder-sol builder-sol-high builder-sol-max \
-  builder-sol-medium builder-sonnet builder-sonnet-max builder-sonnet-xhigh \
+  builder-sol-medium builder-sol6 builder-sonnet builder-sonnet-max builder-sonnet-xhigh \
   builder-terra-high builder-terra-max \
   builder-terra-xhigh captain-opus captain-sol \
   cc-glm cc-qwen38 codex codex-astra codex-luna codex-luna-hi codex-luna-max \

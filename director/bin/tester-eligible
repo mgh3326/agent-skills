@@ -292,7 +292,8 @@ def _read_pane(pane: str) -> str | None:
 
 def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
     display = {
-        "grok-4.7": "Grok 4.7", "gpt-6-sol": "GPT-6-Sol", "gpt-6-luna": "GPT-6-Luna",
+        "grok-4.7": "Grok 4.7", "gpt-6.1-sol": "GPT-6.1-Sol", "gpt-6-sol": "GPT-6-Sol",
+        "gpt-6-luna": "GPT-6-Luna",
         "gpt-5.6-terra": "GPT-5.6-Terra", "claude-opus-5-5": "Opus 5.5",
         "claude-sonnet-5": "Sonnet 5",
     }.get(model, model)

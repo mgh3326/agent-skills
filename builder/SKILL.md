@@ -8,6 +8,9 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 빌더는 PR 한 건의 실행 루프를 소유한다. canonical 빌더 프로필은 `builder-opus`(Opus, effort high) 또는
 `builder-sol`(codex-sol, effort high — 2026-09-26 운영자 결정 전에는 max 였다)이다. `captain-opus`·`captain-sol`은
 legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
+#1026(2026-09-30 운영자 결정)로 codex-sol 계열은 gpt-6.1-sol 을 실행하고, 롤백 철자 `codex-sol6`·`builder-sol6`은
+gpt-6-sol 을 고정한다(ROB-591 의 codex-sol56 패턴 — `builder-sol6`은 빌더 좌석 형태로 codex-sol@high 급 consult를
+유지하면서 모델 id만 literal 이다).
 `builder-grok`은 파일럿 1건을 통과해 **조건부 T1 빌더**로 등재됐다(2026-09-14
 운영자 결정). 조건은 **가역 T1 한정 · 라운드 상한 3 · tester는 타사 provider family(`spawn-worker` §2-4
 조건부 동일 계열 검증·소진 시 지연 검증) · T2 이상과

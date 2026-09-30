@@ -53,7 +53,7 @@ ALL_PROFILES=(
   builder-ds41 builder-ds41-max
   codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
-  codex-sol56 codex-luna56
+  codex-sol56 codex-luna56 codex-sol6 builder-sol6
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max
   builder-sol-high builder-sol-max builder-sol-medium builder-luna-max
   builder-terra-high builder-terra-xhigh builder-terra-max
@@ -180,7 +180,7 @@ Options:
                      rejects --owner outright (use --lane instead).
   --role worker|builder (legacy alias: captain)
                      builder requires --lane and --parent, and accepts only
-                     builder-opus, builder-sol, builder-devin,
+                     builder-opus, builder-sol, builder-sol6, builder-devin,
                      builder-devin-medium, builder-devin-max, builder-ds41,
                      builder-ds41-max, builder-grok, builder-kimi,
                      builder-luna, builder-sonnet, builder-opus-low,
@@ -312,9 +312,10 @@ fail-closed, while exclusive arbiter leases retain their own fail-closed rules.
 Canonical codex profiles: codex-terra, codex-luna, codex-sol.
 Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
 codex-luna-max, codex-max, codex-terra-max.
-ROB-591: codex-sol/codex-max/codex/builder-sol/captain-sol now run gpt-6-sol,
-and codex-luna/codex-luna-hi/codex-luna-max now run gpt-6-luna. Rollback
-spellings codex-sol56/codex-luna56 run the pre-refresh gpt-5.6-sol/gpt-5.6-luna.
+ROB-591/#1026 (2026-09-30 operator decision): codex-sol/codex-max/codex/
+builder-sol/captain-sol now run gpt-6.1-sol, and codex-luna/codex-luna-hi/
+codex-luna-max run gpt-6-luna. Rollback spellings codex-sol6/builder-sol6 pin
+gpt-6-sol; codex-sol56/codex-luna56 run the pre-refresh gpt-5.6-sol/gpt-5.6-luna.
 Claude effort wiring (ROB-1191/ROB-1193): opus default=high, sonnet/sonnet-med default=high,
 haiku default=low; all support an explicit --effort override.
 Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol
@@ -2544,7 +2545,7 @@ arbiter_admit() {
   # became unauditable.
   #
   # task #677: the launch name is the canonical catalog profile, not the launcher
-  # spelling. codex-sol/codex-max/codex/builder-sol/captain-sol all run gpt-6-sol
+  # spelling. codex-sol/codex-max/codex/builder-sol/captain-sol all run gpt-6.1-sol
   # — the catalog profile is codex-sol (scopefuel PROFILE_ALIASES: codex-max ->
   # codex-sol), and scopefuel only knows the canonical name (`policy launch
   # builder-sol` is not in the catalog at all). Recording the raw spelling split
@@ -2552,8 +2553,10 @@ arbiter_admit() {
   # a builder-sol xhigh spawn recorded launch_profile=builder-sol@xhigh while its
   # pane ran gpt-6-sol xhigh). Scoped to codex-kind profiles: every other pool
   # keeps its literal spelling@effort, so no other pool's records change.
-  # Rollback spellings (codex-sol56) stay literal by design — pinning the
-  # superseded model is the point, and the canon does not carry them.
+  # Rollback spellings (codex-sol56, codex-sol6, builder-sol6) stay literal by
+  # design — pinning the superseded model is the point, and the canon does not
+  # carry the spellings' own ids (builder-sol6 records codex-sol@high via its
+  # grade consult, but its model id never comes back from the canon).
   local launch_name="$MODEL"
   if [[ -n "${GATE_EFFORT_PIN:-}" ]]; then
     # #704: the E6 rung spellings are measurement aliases — record the canonical
@@ -2600,8 +2603,9 @@ arbiter_admit() {
   ARBITER_HELD=1
   trap 'spawn_pane_cleanup; arbiter_release_held' EXIT
   # task #677: show the launch name next to the gate-normalized profile — the
-  # observed line said profile=codex-max while the pane ran gpt-6-sol, and the
-  # launch identity was only in the event payload.
+  # observed line said profile=codex-max while the pane ran gpt-6-sol (the
+  # family now runs gpt-6.1-sol, #1026), and the launch identity was only in
+  # the event payload.
   echo "wrk: arbiter quota-pool record pool=$ARBITER_RESOURCE profile=$ARBITER_PROFILE launch_profile=$launch_profile job=$JOB_ID" >&2
 }
 
@@ -2739,9 +2743,14 @@ PY
 # left out of this table keeps its literal model id and effort — that is the
 # fail-safe direction, and it is where the deliberate exceptions live:
 #
-#   * rollback spellings (codex-sol56, codex-luna56, grok45*, grok46*,
-#     agy-flash36) exist precisely to pin a superseded model. An explicit pin
-#     outranks the canon, or the rollback lever does nothing.
+#   * rollback spellings (codex-sol56, codex-luna56, codex-sol6, grok45*,
+#     grok46*, agy-flash36) exist precisely to pin a superseded model. An
+#     explicit pin outranks the canon, or the rollback lever does nothing.
+#   * builder-sol6 is the one split case: it stays in this table because the
+#     builder seat still needs the codex-sol@high grade consult (the canon's
+#     effort and the quota record's codex-sol@high launch_profile), but
+#     CATALOG_KEEP_MODEL keeps its model id literal so the consult can never
+#     hand back gpt-6.1-sol.
 #   * profiles the catalog does not carry (oc-*, kimi-*, devin-*, the ungraded
 #     kiro-* experiments, cc-dsflash/cc-dspro/cc-glm53) keep their literal argv.
 #   * profiles whose CLI argument is not the model id (agy encodes the effort
@@ -2772,6 +2781,11 @@ resolve_catalog_profile() {
     # generic `codex` spelling already uses. The worker spellings above keep
     # the catalog's own default.
     builder-sol|captain-sol) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high ;;
+    # #1026: builder-sol6 is builder-sol's rollback spelling — same builder-seat
+    # consult (codex-sol@high, so the quota record names the graded rung), but
+    # CATALOG_KEEP_MODEL pins the literal gpt-6-sol: the consult feeds effort
+    # and attribution only, never the model id.
+    builder-sol6) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high; CATALOG_KEEP_MODEL=1 ;;
     codex-terra|codex-med) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;
     codex-terra-max) CATALOG_PROFILE=codex-terra-max ;;
     codex-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=medium ;;
@@ -2922,7 +2936,9 @@ print("\n".join([
   # Only the kinds whose CLI argument *is* the model id consume it. For the
   # Claude CLI the argument is an alias ("--model opus"), which stays argv
   # skeleton; fable is the one Claude profile launched by literal model id.
-  if [[ -n "$model_id" ]]; then
+  # #1026: CATALOG_KEEP_MODEL skips this consumption entirely — builder-sol6
+  # consults the canon for effort/attribution but pins its literal model id.
+  if [[ -n "$model_id" && -z "${CATALOG_KEEP_MODEL:-}" ]]; then
     case "$PROFILE_KIND" in
       codex|kiro) PROFILE_MODEL="$model_id" ;;
       grok) PROFILE_MODEL_ARG="$model_id" ;;
@@ -2944,6 +2960,7 @@ resolve_profile() {
   PROFILE_MODEL_ARG=""
   CATALOG_PROFILE=""
   CATALOG_EFFORT_PIN=""
+  CATALOG_KEEP_MODEL=""
   CATALOG_STALE=0
   CATALOG_REFUSED=0
   CATALOG_REFUSE_REASON=""
@@ -3043,13 +3060,13 @@ resolve_profile() {
     codex-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
     codex-luna-hi) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     codex-luna-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    codex) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
-    codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
-    codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    codex) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    codex-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    codex-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     # 2026-09-26 (decision 4088 B): builder seats never take a max rung — the
     # builder-sol default drops to high, and the catalog pin in
     # resolve_catalog_profile consults the same rung when the canon answers.
-    builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    builder-sol|captain-sol) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     # task #633 (#594 E3): builder-luna is codex-luna under --role builder at
     # xhigh. The literal is the catalog-unreachable fallback; #593 wiring lets
     # `policy launch` replace both fields.
@@ -3057,7 +3074,7 @@ resolve_profile() {
     # #704 (#594 E6): per-rung codex builder spellings. PROFILE_MODEL is the
     # catalog-unreachable literal; apply_catalog replaces it with the canon's
     # model id for that rung (codex-terra@high etc.).
-    builder-sol-high|builder-sol-max|builder-sol-medium) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
+    builder-sol-high|builder-sol-max|builder-sol-medium) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     builder-luna-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     # task #527 요건 ⑦: codex-astra default effort is xhigh, unified with
@@ -3072,6 +3089,15 @@ resolve_profile() {
     # same efforts as their current default spellings.
     codex-sol56) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-luna56) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
+    # #1026 (2026-09-30 operator decision): the codex-sol family moved to
+    # gpt-6.1-sol; these are the gpt-6-sol rollback spellings, same ROB-591
+    # pattern as codex-sol56 above — the literal pin outranks the canon.
+    # codex-sol6 keeps codex-sol's default effort (max) and never consults the
+    # catalog; builder-sol6 is the builder-seat shape (high): it still gets the
+    # codex-sol@high grade consult via resolve_catalog_profile, but
+    # CATALOG_KEEP_MODEL keeps this literal model id.
+    codex-sol6) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
+    builder-sol6) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-sol; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     # builder-astra/captain-astra removed (task #526): astra is limited to
     # director judgment, architect counsel and operator-requested advice, so the
     # builder spellings have no legal role left.
@@ -3185,7 +3211,10 @@ resolve_profile() {
     # the job.spawned payload `profile` and the quota_pool.record
     # `launch_profile`, so reps stay separated per model.
     devin-glm52|devin-swe17|devin-ds41|devin-swe2-medium|devin-swe2-max|devin-ds41-max|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max) GATE_PROFILE=devin-swe2 ;;
-    codex|codex-sol|codex-max|builder-sol|captain-sol|codex-sol56) GATE_PROFILE=codex-max ;;
+    # #1026: the gpt-6-sol rollback spellings gate like the spellings they roll
+    # back — codex-sol6 like codex-sol, builder-sol6 like builder-sol (the flat
+    # codex-max spelling, not an E6 rung).
+    codex|codex-sol|codex-max|builder-sol|captain-sol|codex-sol56|codex-sol6|builder-sol6) GATE_PROFILE=codex-max ;;
     # #704: E6 codex rungs are judged at the canonical catalog profile + pinned
     # effort rung (codex-sol@high, codex-luna@max, codex-terra@*) — not the
     # flat codex-max/codex-luna-max/codex-terra-max spellings the old builders
@@ -6888,8 +6917,8 @@ spawn_cmd() {
     case "$MODEL" in
       builder-astra|codex-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
-      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -6922,7 +6951,7 @@ spawn_cmd() {
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
