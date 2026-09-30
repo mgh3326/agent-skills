@@ -978,6 +978,25 @@ printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nlanes_toke
 LANES_CFG_MISMATCH="$TMP/lanes-mismatch-hosts.toml"
 printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
   "$LANES_NODE_OTHER_FILE" >"$LANES_CFG_MISMATCH"
+# B1: a one-line node file — spillover_env_key returns the whole post-= tail,
+# so the "machine id" is 'mac-work-other HUB_TOKEN=<secret>'. Never a valid
+# bare id; any warning that echoed it would print the token to stderr.
+LANES_NODE_INLINE_FILE="$TMP/lanes-node-inline.env"
+LANES_NODE_INLINE_VALUE="fixture-lanes-inline-token-must-not-leak"
+printf 'HUB_MACHINE_ID=mac-work-other HUB_TOKEN=%s\n' "$LANES_NODE_INLINE_VALUE" >"$LANES_NODE_INLINE_FILE"
+chmod 600 "$LANES_NODE_INLINE_FILE"
+LANES_CFG_INLINE="$TMP/lanes-inline-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$LANES_NODE_INLINE_FILE" >"$LANES_CFG_INLINE"
+# A prefix-shaped id: mac-work is a proper prefix of mac-work-default — only
+# an exact compare may warn; a prefix match would silently register the lane.
+LANES_NODE_PREFIX_FILE="$TMP/lanes-node-prefix.env"
+LANES_NODE_PREFIX_VALUE="fixture-lanes-prefix-token-must-not-leak"
+printf 'HUB_MACHINE_ID=mac-work\nHUB_TOKEN=%s\n' "$LANES_NODE_PREFIX_VALUE" >"$LANES_NODE_PREFIX_FILE"
+chmod 600 "$LANES_NODE_PREFIX_FILE"
+LANES_CFG_PREFIX="$TMP/lanes-prefix-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$LANES_NODE_PREFIX_FILE" >"$LANES_CFG_PREFIX"
 
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
@@ -1632,11 +1651,42 @@ PY
   ! grep -q ' lane=' "$LANES_OUT" || fail "#1037 AC5: nothing may be appended"
   echo "PASS 1037-lanes AC5: machine mismatch warns once and skips"
 
+  # B1 — the extracted id reaches a compare or output ONLY as a bare machine
+  # id: a one-line file "HUB_MACHINE_ID=mac-work-other HUB_TOKEN=<secret>"
+  # yields a tail that is never charset-valid, so wrk warns once WITHOUT the
+  # value and skips. (Before the allowlist the mismatch warning echoed the
+  # raw tail — token included — to stderr on every spawn.)
+  LANES_CFG_OVERRIDE="$LANES_CFG_INLINE" HERDR_SESSION=default \
+    lanes_spawn lane-1037-malformed --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1037 malformed: a bad lanes id must not fail the spawn (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call lane-1037-malformed
+  [[ "$(grep -c 'wrk: warning: hub lane not registered' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#1037 malformed: exactly one warning expected: $(cat "$LANES_ERR")"
+  grep -qF 'lanes_token_env HUB_MACHINE_ID is malformed' "$LANES_ERR" ||
+    fail "#1037 malformed: the warning must be the value-free malformed one: $(cat "$LANES_ERR")"
+  echo "PASS 1037-lanes malformed id warns once without the value and skips"
+
+  # A prefix-shaped id is still a mismatch: mac-work vs mac-work-default must
+  # warn once carrying the (charset-valid) value — a prefix compare would
+  # silently register the lane against the wrong machine instead.
+  LANES_CFG_OVERRIDE="$LANES_CFG_PREFIX" HERDR_SESSION=default \
+    lanes_spawn lane-1037-prefix --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1037 prefix: a mismatched lanes id must not fail the spawn (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call lane-1037-prefix
+  [[ "$(grep -c 'wrk: warning: hub lane not registered' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#1037 prefix: exactly one warning expected: $(cat "$LANES_ERR")"
+  grep -qF "HUB_MACHINE_ID 'mac-work' does not match the session's machine 'mac-work-default'" "$LANES_ERR" ||
+    fail "#1037 prefix: the warning must carry the exact-compare mismatch: $(cat "$LANES_ERR")"
+  echo "PASS 1037-lanes prefix id warns once as a mismatch and skips"
+
   # The node token values appear nowhere: the paths travel, the contents do
-  # not — wrk matches only the HUB_MACHINE_ID assignment, never HUB_TOKEN.
-  for output in "$TMP"/lanes-1037-*.out "$TMP"/lanes-1037-*.err "$TMP"/lanes-reap-ac4.*; do
-    [[ -e "$output" ]] || continue
-    for secret in "$LANES_NODE_TOKEN_VALUE" "$LANES_NODE_OTHER_VALUE"; do
+  # not — wrk extracts only the HUB_MACHINE_ID assignment, never HUB_TOKEN.
+  for output in "$TMP"/lanes-lane-1037-* "$TMP"/lanes-reap-ac4.*; do
+    [[ -f "$output" ]] || continue
+    for secret in "$LANES_NODE_TOKEN_VALUE" "$LANES_NODE_OTHER_VALUE" \
+                  "$LANES_NODE_INLINE_VALUE" "$LANES_NODE_PREFIX_VALUE"; do
       if grep -Fq "$secret" "$output"; then
         fail "#1037: the lanes token contents leaked into ${output##*/}"
       fi
@@ -1688,6 +1738,22 @@ PY
     fail "#1037 M2 mutant survived: the lanes credential never reached place"
   fi
   echo "PASS 1037-lanes M2: the gate reading lanes_token_env goes RED"
+
+  # M3: "a malformed lanes machine id never reaches output" — the mutant
+  # drops the charset gate, so the inline file's raw tail (same-line
+  # HUB_TOKEN included) flows into the mismatch warning and the canary must
+  # appear in stderr. GREEN restores the value-free malformed warning.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1037-noidcheck \
+    '      if [[ ! "$lanes_machine" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then' \
+    '      if false; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1037-noidcheck" \
+    LANES_CFG_OVERRIDE="$LANES_CFG_INLINE" HERDR_SESSION=default \
+    lanes_spawn lane-1037-m3 --owner work-kairos
+  if ! grep -Fq "$LANES_NODE_INLINE_VALUE" "$LANES_ERR"; then
+    fail "#1037 M3 mutant survived: a malformed lanes machine id never reaches output"
+  fi
+  echo "PASS 1037-lanes M3: dropping the charset check goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then

@@ -290,10 +290,11 @@ default) has an entry in hosts.toml's [hub] session_machine_ids registers a
 lane for the pane on that session's daemon —
 `panewire lanes add LABEL --machine ID --pane PANE --parent OWNER` with the
 [hub] credentials: hub_url plus lanes_token_env when set, else hub_token_env
-(hub_cf_env optional). The values are file paths panewire opens; wrk reads
-only a lanes token's HUB_MACHINE_ID line — to skip a registration the hub
-would refuse when it differs from the session's mapped machine — and never
-prints file contents. lanes_token_env (#1037) is a node-scoped token that
+(hub_cf_env optional). The values are file paths panewire opens; wrk scans
+a lanes token file for the HUB_MACHINE_ID value only — to skip a
+registration the hub would refuse when it differs from the session's
+mapped machine — and never prints file contents (a malformed id warns
+once without the value). lanes_token_env (#1037) is a node-scoped token that
 may reach only the lanes routes: this registration, reap's `lanes rm`, and
 the `lanes ls` confirmation. No other hub path (quota gate, placement,
 spill-over wake, hub spawn) reads it, and a [hub] section with hub_url and
@@ -5516,14 +5517,25 @@ hub_lane_register() {
   fi
   # A lanes credential authorizes lanes on its own HUB_MACHINE_ID only — with
   # a different machine the hub refuses the add (lane_machine_mismatch), so
-  # compare first and skip. The file is read for that one assignment through
+  # compare first and skip. The file is scanned for that one key through
   # spillover_env_key, never sourced; HUB_TOKEN is never matched or printed.
-  # An unreadable/unset key falls through to panewire's own loader error.
+  # The extracted value may reach the compare — and any warning — only as a
+  # bare machine id: spillover_env_key returns the whole post-= tail, so an
+  # unparsed remainder like a same-line HUB_TOKEN would otherwise echo into
+  # the warning. Fail closed: anything outside ^[A-Za-z0-9._-]{1,64}$ warns
+  # once WITHOUT the value and skips. An unreadable file or unset/empty key
+  # still falls through to panewire's own loader error.
   if [[ -n "$lanes_env" ]]; then
     lanes_machine="$(spillover_env_key "$lanes_env" HUB_MACHINE_ID 2>/dev/null || true)"
-    if [[ -n "$lanes_machine" && "$lanes_machine" != "$machine" ]]; then
-      warn "hub lane not registered (lanes_token_env HUB_MACHINE_ID '$lanes_machine' does not match the session's machine '$machine')"
-      return 0
+    if [[ -n "$lanes_machine" ]]; then
+      if [[ ! "$lanes_machine" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+        warn "hub lane not registered (lanes_token_env HUB_MACHINE_ID is malformed)"
+        return 0
+      fi
+      if [[ "$lanes_machine" != "$machine" ]]; then
+        warn "hub lane not registered (lanes_token_env HUB_MACHINE_ID '$lanes_machine' does not match the session's machine '$machine')"
+        return 0
+      fi
     fi
   fi
   panewire="${PANEWIRE_BIN:-panewire}"

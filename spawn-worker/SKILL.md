@@ -616,9 +616,11 @@ wake = "panewire"
 - `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600
   `HUB_MACHINE_ID`/`HUB_TOKEN`)이다. 설정하면 `panewire lanes add/ls/rm`만 이 경로를
   `--hub-token-env`로 쓰고, quota gate·placement·wake·hub spawn 같은 다른 허브 경로는 계속
-  `hub_token_env`만 읽는다 — 이 파일은 operator route에 닿지 않는다. wrk는 파일에서
-  `HUB_MACHINE_ID` 한 줄만 읽어 `session_machine_ids`의 머신과 다르면 등록을 한 번 경고하고
-  건너뛴다(허브가 403 할 요청); `HUB_TOKEN`은 절대 읽거나 출력하지 않는다. `hub_token_env`
+  `hub_token_env`만 읽는다 — 이 파일은 operator route에 닿지 않는다. wrk는 파일을 스캔해
+  `HUB_MACHINE_ID` 키의 값만 추출한다. 그 값이 `^[A-Za-z0-9._-]{1,64}$` 모양의 머신 id가
+  아니면(예: 같은 줄에 `HUB_TOKEN`이 붙은 한 줄 파일) 값 없이 한 번 경고하고 건너뛰고,
+  유효한데 `session_machine_ids`의 머신과 다르면 역시 한 번 경고하고 건너뛴다(허브가 403 할
+  요청); `HUB_TOKEN`은 절대 읽거나 출력하지 않는다. `hub_token_env`
   없이 `hub_url`+`lanes_token_env`만 둔 lanes-only `[hub]`는 quota gate를 켜지 않는다 —
   게이트의 opt-in은 오직 `hub_token_env`다.
 - `--host local`은 운영자 강제 로컬, `--host <remote-name>`은 강제 원격이다. 둘 다 hub 판정을
