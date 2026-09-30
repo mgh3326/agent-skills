@@ -1061,10 +1061,15 @@ run_t1155_local_spawn_off_tests() {
   echo "PASS t1155 AC2 all-fail-refuses-80"
 
   # AC3: --host local refuses before any side effect — no pane, no arbiter
-  # record, no hk claim.
+  # record, no hk claim. A minted --task rides along so a claim written
+  # before the refusal would land in the log (the t1163 claim control below
+  # proves a surviving spawn does claim).
+  local t1155_ac3_task
+  t1155_ac3_task="$(mint_task)"
   rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ac3-hk.log"
   set +e
-  ( T1155_HOST_ARG=local T1155_JOB=t1155-ac3 T1155_HK_LOG="$TMP/t1155-ac3-hk.log" \
+  ( T1155_HOST_ARG=local T1155_JOB=t1155-ac3 T1155_TASK="$t1155_ac3_task" \
+      T1155_HK_LOG="$TMP/t1155-ac3-hk.log" \
       t1155_spawn ) >"$TMP/t1155-ac3.out" 2>"$TMP/t1155-ac3.err"
   t1155_rc=$?
   set -e
@@ -1078,8 +1083,8 @@ run_t1155_local_spawn_off_tests() {
     fail "1155 AC3: the refusal created a local pane"
   [[ ! -e "$T1155_INBOX/t1155-ac3" ]] ||
     fail "1155 AC3: the refusal left an arbiter record for t1155-ac3"
-  [[ ! -s "$TMP/t1155-ac3-hk.log" ]] ||
-    fail "1155 AC3: the refusal made an hk claim: $(cat "$TMP/t1155-ac3-hk.log")"
+  { [[ ! -e "$TMP/t1155-ac3-hk.log" ]] || ! grep -q "claim id=$t1155_ac3_task " "$TMP/t1155-ac3-hk.log"; } ||
+    fail "1155 AC3: the refusal claimed task $t1155_ac3_task: $(cat "$TMP/t1155-ac3-hk.log")"
   echo "PASS t1155 AC3 host-local-refused-before-side-effects"
 
   # AC4: the REMOTE's own disabled answer (its [local] spawn = false answering
@@ -1413,7 +1418,9 @@ PY
   local t1163_bad bad_hdr bad_body bad_rc want_frag t1163_task host_arg
   for t1163_bad in header-comment header-spaced header-quoted header-trailing \
       header-array header-unterminated header-twice key-twice key-bare \
-      key-colon key-eqeq key-quoted value-int value-quoted; do
+      key-colon key-eqeq key-quoted value-int value-quoted \
+      root-dotted root-quoted-dotted root-inline root-stray \
+      bom-first bom-inside; do
     bad_hdr='[local]' bad_body='spawn = false'
     case "$t1163_bad" in
       header-comment)      bad_hdr='[local] # closed by ops' ;;
@@ -1432,10 +1439,20 @@ spawn = false' ;;
       key-quoted)          bad_body='"spawn" = false' ;;
       value-int)           bad_body='spawn = 0' ;;
       value-quoted)        bad_body='spawn = "false"' ;;
+      # Valid TOML closures that are not the [local] flag: root-table keys
+      # (dotted, quoted-dotted, inline table) and stray text before any
+      # header. The root table must be empty — every one refuses.
+      root-dotted)        bad_hdr='local.spawn = false' bad_body='' ;;
+      root-quoted-dotted) bad_hdr='"local".spawn = false' bad_body='' ;;
+      root-inline)        bad_hdr='local = { spawn = false }' bad_body='' ;;
+      root-stray)         bad_hdr='ops-note: desk is closed' bad_body='' ;;
+      # A UTF-8 BOM at any line start is not a valid hosts.toml line.
+      bom-first)   bad_hdr=$'\xef\xbb\xbf[local]' ;;
+      bom-inside)  bad_body=$'\xef\xbb\xbfspawn = false' ;;
     esac
     {
       printf '%s\n' "$bad_hdr"
-      printf '%s\n' "$bad_body"
+      [[ "$t1163_bad" == root-* ]] || printf '%s\n' "$bad_body"
       printf '%s\n' '' '[hosts.desktop]' 'ssh = "desktop"' 'capacity = 3' \
         "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}"
     } >"$TMP/t1163-$t1163_bad.toml"
@@ -1445,6 +1462,8 @@ spawn = false' ;;
       key-twice) want_frag="duplicate spawn key in [local]" ;;
       key-*)     want_frag="malformed spawn assignment in [local]" ;;
       value-*)   want_frag="accepts only the bare TOML booleans true or false" ;;
+      root-*)    want_frag="root table must be empty in hosts.toml" ;;
+      bom-*)     want_frag="UTF-8 BOM at a line start" ;;
     esac
     for host_arg in local auto; do
       t1163_task="$(mint_task)"
@@ -1492,6 +1511,60 @@ spawn = false' ;;
       fail "1163 AC1 unreadable/$host_arg: the refusal left an arbiter record"
   done
   chmod 644 "$TMP/t1163-unreadable.toml"
+  # N3: 'readable regular file' is load-bearing — a directory, a FIFO and a
+  # dangling symlink all exist (or -L) yet must refuse rc 70, never read as
+  # allowed. (On the no--f mutant a directory opens fine and reads EOF, so
+  # it would land a pane — the M-mutant below pins that RED.)
+  mkdir "$TMP/t1163-isdir.toml"
+  mkfifo "$TMP/t1163-isfifo.toml"
+  ln -s "$TMP/t1163-no-such-target" "$TMP/t1163-dangling.toml"
+  local t1163_kind
+  for t1163_kind in isdir isfifo dangling; do
+    for host_arg in local auto; do
+      rm -f "$TMP/t1155-herdr.log"
+      set +e
+      ( T1155_HOST_ARG="$host_arg" T1155_HOSTS_OVERRIDE="$TMP/t1163-$t1163_kind.toml" \
+          T1155_JOB="t1163-$t1163_kind-$host_arg" T1155_TASK="$(mint_task)" t1155_spawn ) \
+        >"$TMP/t1163-$t1163_kind-$host_arg.out" 2>"$TMP/t1163-$t1163_kind-$host_arg.err"
+      bad_rc=$?
+      set -e
+      [[ "$bad_rc" -eq 70 ]] ||
+        fail "1163 N3 $t1163_kind/$host_arg: expected rc=70, got $bad_rc: $(cat "$TMP/t1163-$t1163_kind-$host_arg.err")"
+      grep -qF 'not a readable regular file' "$TMP/t1163-$t1163_kind-$host_arg.err" ||
+        fail "1163 N3 $t1163_kind/$host_arg: wrong refusal reason: $(cat "$TMP/t1163-$t1163_kind-$host_arg.err")"
+      { [[ ! -e "$TMP/t1155-herdr.log" ]] || ! grep -q 'tab create' "$TMP/t1155-herdr.log"; } ||
+        fail "1163 N3 $t1163_kind/$host_arg: the refusal created a local pane"
+    done
+  done
+  # S3: an unsearchable parent makes 'absent' unprovable — refuse rc 70
+  # where a truly nonexistent path stays allowed. Cover both the config's
+  # own directory and a deeper missing path under the unsearchable parent.
+  mkdir -p "$TMP/t1163-nosearch" && chmod 000 "$TMP/t1163-nosearch"
+  for t1163_kind in "$TMP/t1163-nosearch/hosts.toml" "$TMP/t1163-nosearch/deeper/hosts.toml"; do
+    set +e
+    ( T1155_HOST_ARG=local T1155_HOSTS_OVERRIDE="$t1163_kind" \
+        T1155_JOB=t1163-nosearch t1155_spawn ) \
+      >"$TMP/t1163-nosearch.out" 2>"$TMP/t1163-nosearch.err"
+    bad_rc=$?
+    set -e
+    [[ "$bad_rc" -eq 70 ]] ||
+      fail "1163 S3 nosearch ($t1163_kind): expected rc=70, got $bad_rc: $(cat "$TMP/t1163-nosearch.err")"
+    grep -qF 'not searchable' "$TMP/t1163-nosearch.err" ||
+      fail "1163 S3 nosearch ($t1163_kind): wrong refusal reason: $(cat "$TMP/t1163-nosearch.err")"
+  done
+  chmod 700 "$TMP/t1163-nosearch"
+  # Control: under the same machinery a truly nonexistent file stays allowed.
+  rm -f "$TMP/t1155-herdr.log"
+  set +e
+  ( T1155_HOST_ARG=local T1155_HOSTS_OVERRIDE="$TMP/t1163-nosearch/absent.toml" \
+      T1155_JOB=t1163-absent t1155_spawn ) \
+    >"$TMP/t1163-absent.out" 2>"$TMP/t1163-absent.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 0 ]] ||
+    fail "1163 S3 absent control: a nonexistent hosts.toml must stay allowed, got $t1155_rc: $(cat "$TMP/t1163-absent.err")"
+  grep -q 'host=local' "$TMP/t1163-absent.out" ||
+    fail "1163 S3 absent control: expected the local OK line: $(cat "$TMP/t1163-absent.out")"
   # Control for every no-claim assertion above: the same --task spawn on a
   # well-formed [local] does record the hk claim — the absence is real.
   t1163_task="$(mint_task)"
@@ -1507,7 +1580,7 @@ spawn = false' ;;
     fail "1163 claim control: expected rc=0 on a well-formed config, got $t1155_rc: $(cat "$TMP/t1163-claim-ok.err")"
   grep -q "claim id=$t1163_task " "$TMP/t1163-hk-ok.log" ||
     fail "1163 claim control: a surviving spawn never claimed task $t1163_task: $(cat "$TMP/t1163-hk-ok.log" 2>/dev/null)"
-  echo "PASS t1163 AC1 malformed-local-refuses-70 (14 spellings x local/auto + unreadable, no pane/arbiter/hk)"
+  echo "PASS t1163 AC1 malformed-local-refuses-70 (20 spellings x local/auto + unreadable + dir/fifo/dangling + unsearchable parent, no pane/arbiter/hk)"
 
   # AC2: well-formed [local] surfaces keep the pinned main behavior — a file
   # without [local], a commented value, a tight 'spawn=false' and a
@@ -1601,6 +1674,25 @@ spawn = false' ;;
     fail "1163 AC3: stdout differs from the pinned OK line: $(cat "$TMP/t1163-siblings.out")"
   echo "PASS t1163 AC3+AC4 wrk-hosts-flag (allowed/disabled/error rc 0, remote table unchanged)"
 
+  # M5 base: the empty-root rule ends at the first header — 'local.spawn'
+  # under [hosts.x] is hosts.x.local.spawn, not the flag, and stays ignored.
+  printf '%s\n' '[hosts.desktop]' 'ssh = "desktop"' 'local.spawn = false' \
+    'capacity = 3' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
+    >"$TMP/t1163-hostskey.toml"
+  rm -f "$TMP/t1155-herdr.log"
+  set +e
+  ( T1155_HOST_ARG=local T1155_HOSTS_OVERRIDE="$TMP/t1163-hostskey.toml" \
+      T1155_JOB=t1163-hostskey t1155_spawn ) \
+    >"$TMP/t1163-hostskey.out" 2>"$TMP/t1163-hostskey.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 0 ]] ||
+    fail "1163 M5: 'local.spawn' under [hosts.x] must stay ignored, got $t1155_rc: $(cat "$TMP/t1163-hostskey.err")"
+  grep -qxF "OK pane=w:p1 host=local model=codex-terra label=fixture status=working landed=yes job=t1163-hostskey quota_record=codex/quota_pool" \
+    "$TMP/t1163-hostskey.out" ||
+    fail "1163 M5: stdout differs from the pinned OK line: $(cat "$TMP/t1163-hostskey.out")"
+  echo "PASS t1163 M5-base local.spawn-under-hosts.x-ignored"
+
   # S3(a): the spawn_cmd backstop is the only guard on the arbiter-
   # unavailable path — an unreadable arbiter hands the whole spawn to
   # spawn_cmd, so on a closed host that backstop alone must refuse rc 80.
@@ -1621,27 +1713,6 @@ spawn = false' ;;
     fail "1163 S3a: the refusal left an arbiter record"
   echo "PASS t1163 S3a arbiter-unavailable-backstop-refuses"
 
-  # S3(c): a hub reply of decision=local with remaining eligible candidates
-  # on a closed host reroutes to the next eligible remote — never a pane.
-  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
-  set +e
-  ( T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$T1155_HOSTS_OFF_HUB" \
-      T1155_PANEWIRE="$ROOT/tests/fixtures/spillover-panewire" \
-      T1155_PLACE_SCENARIO=local-remaining T1155_SSH_SCENARIO_DESKTOP=ok \
-      T1155_JOB=t1163-hublocal t1155_spawn ) \
-    >"$TMP/t1163-hublocal.out" 2>"$TMP/t1163-hublocal.err"
-  t1155_rc=$?
-  set -e
-  [[ "$t1155_rc" -eq 0 ]] ||
-    fail "1163 S3c: the reroute to the next eligible remote must succeed, got $t1155_rc: $(cat "$TMP/t1163-hublocal.err")"
-  grep -q 'host=desktop' "$TMP/t1163-hublocal.out" ||
-    fail "1163 S3c: expected the desktop OK line: $(cat "$TMP/t1163-hublocal.out")"
-  grep -q 'wrk spawn' "$TMP/t1155-ssh.log" ||
-    fail "1163 S3c: the delegated spawn leg to desktop never ran: $(cat "$TMP/t1155-ssh.log")"
-  { [[ ! -e "$TMP/t1155-herdr.log" ]] || ! grep -q 'tab create' "$TMP/t1155-herdr.log"; } ||
-    fail "1163 S3c: a local pane was created on a closed host"
-  echo "PASS t1163 S3c hub-local-decision-reroutes-remote"
-
   # N1: help wins over a config refusal — --help/-h print rc 0 even when the
   # [local] surface is malformed (a closed host still needs its docs).
   for help_arg in --help -h; do
@@ -1659,8 +1730,9 @@ spawn = false' ;;
 
   # -- #1163 assertion-RED mutants ------------------------------------------
   # M1 "a commented [local] header never reads as spawn allowed" — the
-  # mutant silently skips any non-exact header naming local (main's old
-  # behavior): '[local] # comment' then leaves spawn unread = allowed.
+  # mutant restores main's old behavior whole: non-exact local-naming
+  # headers are skipped silently AND root lines pass unread, so
+  # '[local] # comment' leaves spawn unseen = allowed.
   python3 - "$WRK" "$TMP/mut-wrk-t1163-skip-loose-header" <<'PY'
 import sys
 src = open(sys.argv[1], encoding="utf-8").read()
@@ -1670,7 +1742,19 @@ old = ('      elif [[ "$name" == local ]]; then\n'
 new = ('      elif [[ "$name" == local ]]; then\n'
        '        :\n')
 assert src.count(old) == 1, "mutant anchor not unique: %r" % old
-open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new))
+src = src.replace(old, new)
+old2 = """    if [[ -z "$current" ]]; then
+      # The root table must be empty: every line before the first table
+      # header that is not blank or a comment — 'local.spawn = false',
+      # '"local".spawn = false', 'local = { spawn = false }', any other key
+      # or stray text — is refused rather than read or ignored.
+      LOCAL_SPAWN_ERROR="$config line $n: root table must be empty in hosts.toml (keys belong under a [table] header)"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+"""
+new2 = "    [[ -z \"$current\" ]] || continue\n"
+assert src.count(old2) == 1, "mutant anchor not unique: %r" % old2
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old2, new2))
 PY
   chmod +x "$TMP/mut-wrk-t1163-skip-loose-header"
   rm -f "$TMP/t1155-herdr.log"
@@ -1750,6 +1834,142 @@ PY
   grep -q 'tab create' "$TMP/t1155-herdr.log" ||
     fail "1163 M3: the mutant should show the forbidden local pane creation"
   echo "PASS t1163 M3: no-backstop mutant goes RED (S3a assertion 'rc=80, no local pane' fails: rc=$t1155_rc, local pane created)"
+
+  # M4 "a key in the root table never reads as spawn allowed" — the mutant
+  # silently skips root lines, so 'local.spawn = false' before any header
+  # is never seen and the spawn is allowed.
+  python3 - "$WRK" "$TMP/mut-wrk-t1163-skip-root" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = """    if [[ -z "$current" ]]; then
+      # The root table must be empty: every line before the first table
+      # header that is not blank or a comment — 'local.spawn = false',
+      # '"local".spawn = false', 'local = { spawn = false }', any other key
+      # or stray text — is refused rather than read or ignored.
+      LOCAL_SPAWN_ERROR="$config line $n: root table must be empty in hosts.toml (keys belong under a [table] header)"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+"""
+new = "    [[ -z \"$current\" ]] || continue\n"
+assert src.count(old) == 1, "mutant anchor not unique: %r" % old
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new))
+PY
+  chmod +x "$TMP/mut-wrk-t1163-skip-root"
+  rm -f "$TMP/t1155-herdr.log"
+  set +e
+  ( T1155_WRK="$TMP/mut-wrk-t1163-skip-root" T1155_HOST_ARG=local \
+      T1155_HOSTS_OVERRIDE="$TMP/t1163-root-dotted.toml" \
+      T1155_JOB=t1163-m4 t1155_spawn ) >"$TMP/t1163-m4.out" 2>"$TMP/t1163-m4.err"
+  t1155_rc=$?
+  set -e
+  if [[ "$t1155_rc" -eq 70 ]]; then
+    fail "1163 M4 mutant survived: a root key still refused rc=70"
+  fi
+  grep -q 'host=local' "$TMP/t1163-m4.out" ||
+    fail "1163 M4: the mutant should land the local pane the skipped root line allows"
+  echo "PASS t1163 M4: skip-root-lines mutant goes RED (AC1 assertion 'root-dotted refuses rc=70' fails: rc=$t1155_rc, local pane created)"
+
+  # M5 "local.spawn under [hosts.x] is ignored" — the mutant applies the
+  # empty-root check to every line, so the hostskey file's 'ssh = ...' key
+  # under [hosts.desktop] refuses: the M5-base spawn goes RED.
+  python3 - "$WRK" "$TMP/mut-wrk-t1163-root-everywhere" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = """    if [[ -z "$current" ]]; then
+      # The root table must be empty: every line before the first table
+      # header that is not blank or a comment — 'local.spawn = false',
+      # '"local".spawn = false', 'local = { spawn = false }', any other key
+      # or stray text — is refused rather than read or ignored.
+      LOCAL_SPAWN_ERROR="$config line $n: root table must be empty in hosts.toml (keys belong under a [table] header)"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+"""
+new = """    if [[ -n "$line" ]]; then
+      LOCAL_SPAWN_ERROR="$config line $n: root table must be empty in hosts.toml (keys belong under a [table] header)"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+"""
+assert src.count(old) == 1, "mutant anchor not unique: %r" % old
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new))
+PY
+  chmod +x "$TMP/mut-wrk-t1163-root-everywhere"
+  set +e
+  ( T1155_WRK="$TMP/mut-wrk-t1163-root-everywhere" T1155_HOST_ARG=local \
+      T1155_HOSTS_OVERRIDE="$TMP/t1163-hostskey.toml" \
+      T1155_JOB=t1163-m5 t1155_spawn ) >"$TMP/t1163-m5.out" 2>"$TMP/t1163-m5.err"
+  t1155_rc=$?
+  set -e
+  if [[ "$t1155_rc" -eq 0 ]]; then
+    fail "1163 M5 mutant survived: [hosts.x] keys still ignored"
+  fi
+  [[ "$t1155_rc" -eq 70 ]] ||
+    fail "1163 M5: expected the everywhere-mutant to refuse rc=70, got $t1155_rc: $(cat "$TMP/t1163-m5.err")"
+  echo "PASS t1163 M5: root-check-everywhere mutant goes RED (M5-base assertion 'local.spawn under [hosts.x] ignored, rc=0 + pinned OK line' fails: rc=$t1155_rc, refused)"
+
+  # M6 "a BOM line refuses" — the mutant strips the BOM silently, so a
+  # BOM-prefixed '[local] spawn = true' parses clean and lands a pane.
+  printf '\xef\xbb\xbf[local]\nspawn = true\n\n[hosts.desktop]\nssh = "desktop"\ncapacity = 3\ncwd_map = {"%s"="/remote/agent-skills"}\n' \
+    "$ROOT" >"$TMP/t1163-bom-allow.toml"
+  set +e
+  ( T1155_HOST_ARG=local T1155_HOSTS_OVERRIDE="$TMP/t1163-bom-allow.toml" \
+      T1155_JOB=t1163-bomallow t1155_spawn ) \
+    >"$TMP/t1163-bomallow.out" 2>"$TMP/t1163-bomallow.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 70 ]] ||
+    fail "1163 M6 base: a BOM line must refuse rc=70, got $t1155_rc: $(cat "$TMP/t1163-bomallow.err")"
+  python3 - "$WRK" "$TMP/mut-wrk-t1163-strip-bom" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = """    if [[ "$line" == $'\\xef\\xbb\\xbf'* ]]; then
+      LOCAL_SPAWN_ERROR="$config line $n: UTF-8 BOM at a line start is not valid hosts.toml"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+"""
+new = """    line="${line#$'\\xef\\xbb\\xbf'}"
+"""
+assert src.count(old) == 1, "mutant anchor not unique: %r" % old
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new))
+PY
+  chmod +x "$TMP/mut-wrk-t1163-strip-bom"
+  rm -f "$TMP/t1155-herdr.log"
+  set +e
+  ( T1155_WRK="$TMP/mut-wrk-t1163-strip-bom" T1155_HOST_ARG=local \
+      T1155_HOSTS_OVERRIDE="$TMP/t1163-bom-allow.toml" \
+      T1155_JOB=t1163-m6 t1155_spawn ) >"$TMP/t1163-m6.out" 2>"$TMP/t1163-m6.err"
+  t1155_rc=$?
+  set -e
+  if [[ "$t1155_rc" -eq 70 ]]; then
+    fail "1163 M6 mutant survived: a BOM line still refused rc=70"
+  fi
+  grep -q 'host=local' "$TMP/t1163-m6.out" ||
+    fail "1163 M6: the mutant should land the local pane the stripped BOM silently allows"
+  echo "PASS t1163 M6: strip-bom mutant goes RED (BOM assertion 'bom-allow refuses rc=70' fails: rc=$t1155_rc, local pane created)"
+
+  # N3 mutant: dropping the regular-file check sends a directory past the
+  # resolver — the pinned rc 70 refusal never fires (the spawn then dies
+  # downstream on the same directory read, or lands a pane where read(2)
+  # returns EOF): either way the 'isdir refuses rc=70' assertion goes RED.
+  python3 - "$WRK" "$TMP/mut-wrk-t1163-no-fcheck" <<'PY'
+import sys
+src = open(sys.argv[1], encoding="utf-8").read()
+old = '  if [[ ! -f "$config" || ! -r "$config" ]]; then\n'
+new = '  if [[ ! -r "$config" ]]; then\n'
+assert src.count(old) == 1, "mutant anchor not unique: %r" % old
+open(sys.argv[2], "w", encoding="utf-8").write(src.replace(old, new))
+PY
+  chmod +x "$TMP/mut-wrk-t1163-no-fcheck"
+  rm -f "$TMP/t1155-herdr.log"
+  set +e
+  ( T1155_WRK="$TMP/mut-wrk-t1163-no-fcheck" T1155_HOST_ARG=local \
+      T1155_HOSTS_OVERRIDE="$TMP/t1163-isdir.toml" \
+      T1155_JOB=t1163-mn3 t1155_spawn ) >"$TMP/t1163-mn3.out" 2>"$TMP/t1163-mn3.err"
+  t1155_rc=$?
+  set -e
+  if [[ "$t1155_rc" -eq 70 ]]; then
+    fail "1163 N3 mutant survived: a directory still refused rc=70"
+  fi
+  echo "PASS t1163 N3-mutant: no-regular-file-check mutant goes RED (N3 assertion 'isdir/local refuses rc=70' fails: rc=$t1155_rc, no refusal)"
 }
 
 if [[ "${WRK_TEST_ONLY_LOCAL_SPAWN_OFF:-0}" -eq 1 ]]; then

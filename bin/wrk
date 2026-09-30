@@ -340,9 +340,15 @@ line then ends with via=herdr-fallback.
                      'spawn: false', 'spawn == false'), or a value that is
                      not a bare true/false (a quoted spelling is a string,
                      not a boolean) — is a config error refusing every
-                     placement with rc 70, naming the file line and reason;
-                     a hosts.toml that exists but is unreadable refuses the
-                     same way. No [local] section, a [local] without spawn,
+                     placement with rc 70, naming the file line and reason.
+                     So is any content before the first table header (the
+                     root table must be empty — 'local.spawn = false' or
+                     'local = { spawn = false }' there are root keys, not
+                     the flag), a UTF-8 BOM at any line start, a hosts.toml
+                     that exists but is unreadable, or a path whose
+                     existence cannot be determined because a parent
+                     directory is not searchable. No [local] section, a
+                     [local] without spawn,
                      or one clean assignment keep the unchanged behavior.
                      `wrk hosts` reports the resolved state as
                      'local spawn=allowed|disabled|error'.
@@ -6656,7 +6662,10 @@ spawn_router_cmd() {
         if [[ "$selected" == local && "$LOCAL_SPAWN_ALLOWED" -eq 0 ]]; then
           # #1155: the hub may still pick this host, but local spawns are
           # refused — the round runs the reply's remaining eligible
-          # candidates instead.
+          # candidates instead. Defense in depth only: spillover_hub_placement
+          # answers the first eligible candidate, so decision=local arrives
+          # here as 'local' solely when the reply lists local itself as an
+          # eligible candidate — the tested replies never do.
           SPILL_REASON="${SPILL_REASON};local-spawn-disabled"
           selected="${SPILL_HUB_CANDIDATES[0]:-}"
           if [[ -z "$selected" ]]; then
@@ -6865,12 +6874,19 @@ spawn_router_cmd() {
 #     starting a would-be spawn key that is not 'spawn = <value>' (bare
 #     'spawn', 'spawn: false', 'spawn == false', a quoted "spawn" key);
 #   - a spawn value other than bare true/false after stripping a trailing
-#     '#' comment and whitespace.
-# A hosts.toml that exists but is not a readable regular file also refuses.
-# Everything else — no file, no [local], [local] without spawn, one clean
-# spawn = true/false, every other key and every other section — behaves
-# exactly as before; other readers keep going through spillover_value,
-# whose behavior this does not change.
+#     '#' comment and whitespace;
+#   - any content before the first table header — the root table must be
+#     empty, so 'local.spawn = false', '"local".spawn = false' or
+#     'local = { spawn = false }' there are root keys, not the flag;
+#   - a UTF-8 BOM at any line start (including line 1).
+# A hosts.toml that exists but is not a readable regular file also refuses,
+# and so does a path whose existence cannot be determined because a parent
+# directory is not searchable (stat EACCES) — a truly absent file stays
+# allowed. Everything else — no [local], [local] without spawn, one clean
+# spawn = true/false, every other key and every other section (a
+# 'local.spawn' under [hosts.x] is hosts.x.local.spawn and is ignored) —
+# behaves exactly as before; other readers keep going through
+# spillover_value, whose behavior this does not change.
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -6891,16 +6907,35 @@ local_spawn_table_name() {
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
   LOCAL_SPAWN_ERROR=""
-  local config line current="" inner rest name value
+  local config line="" current="" inner rest name value
   local n=0 local_seen=0 spawn_seen=0
   config="$(spillover_config)"
-  [[ -e "$config" || -L "$config" ]] || return 0
+  if [[ ! -e "$config" && ! -L "$config" ]]; then
+    # The stat failed: a real ENOENT means no flag, but an unsearchable
+    # parent (EACCES) makes "absent" unprovable. Walk up to the nearest
+    # ancestor that stats; refuse unless it is a searchable directory —
+    # anything shallower under it cannot hide a config either way.
+    local dir
+    dir="$(dirname -- "$config")"
+    while [[ ! -e "$dir" && ! -L "$dir" && "$dir" != / && "$dir" != . ]]; do
+      dir="$(dirname -- "$dir")"
+    done
+    if [[ -d "$dir" && ! -x "$dir" ]]; then
+      LOCAL_SPAWN_ERROR="$config: existence cannot be determined (a parent directory is not searchable)"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+    return 0
+  fi
   if [[ ! -f "$config" || ! -r "$config" ]]; then
     LOCAL_SPAWN_ERROR="$config: exists but is not a readable regular file"
     return "$WRK_EXIT_CONFIG_REFUSED"
   fi
   while IFS= read -r line || [[ -n "$line" ]]; do
     n=$((n + 1))
+    if [[ "$line" == $'\xef\xbb\xbf'* ]]; then
+      LOCAL_SPAWN_ERROR="$config line $n: UTF-8 BOM at a line start is not valid hosts.toml"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
     line="$(spillover_trim "$line")"
     [[ -z "$line" || "$line" == \#* ]] && continue
     if [[ "$line" == \[* ]]; then
@@ -6923,11 +6958,23 @@ local_spawn_scan() {
         return "$WRK_EXIT_CONFIG_REFUSED"
       elif [[ -z "$rest" ]]; then
         current="$inner"
+      elif [[ -z "$current" ]]; then
+        # A bracketed line that names no local table and is not a clean
+        # header ('[x] junk', an unclosed '[x') cannot end the root table —
+        # as root content it violates the empty-root rule below. Under a
+        # table it keeps the same ignore spillover_value gives it.
+        LOCAL_SPAWN_ERROR="$config line $n: root table must be empty in hosts.toml (keys belong under a [table] header)"
+        return "$WRK_EXIT_CONFIG_REFUSED"
       fi
-      # A bracketed line that names no local table and is not a clean header
-      # (trailing text, no close) leaves the section unchanged — the same
-      # ignore spillover_value gives it.
       continue
+    fi
+    if [[ -z "$current" ]]; then
+      # The root table must be empty: every line before the first table
+      # header that is not blank or a comment — 'local.spawn = false',
+      # '"local".spawn = false', 'local = { spawn = false }', any other key
+      # or stray text — is refused rather than read or ignored.
+      LOCAL_SPAWN_ERROR="$config line $n: root table must be empty in hosts.toml (keys belong under a [table] header)"
+      return "$WRK_EXIT_CONFIG_REFUSED"
     fi
     [[ "$current" == local ]] || continue
     case "$line" in

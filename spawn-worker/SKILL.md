@@ -639,10 +639,15 @@ wake = "panewire"
   `[ local ]`, `["local"]` 같은 헤더, 두 번째 `[local]` 테이블, 두 번째 spawn 키,
   `spawn`/`spawn: false`/`spawn == false`/`"spawn" = false`처럼 `spawn = value`가 아닌
   줄, bare true/false가 아닌 값 — 은 파일 줄 번호와 사유를 담은 rc 70 설정 오류로
-  모든 spawn 배치를 거부한다. hosts.toml이 존재하는데 일반 파일로 읽을 수 없을 때도
-  같다. `[local]`이 없거나 spawn 키가 없거나 정확한 한 줄이면 기존과 동일하다.
-  `wrk hosts`는 해석된 상태를 `local spawn=allowed|disabled|error(<사유>)`로 출력한다
-  (보고 명령이라 오류 상태에서도 rc 0).
+  모든 spawn 배치를 거부한다. 첫 테이블 헤더 이전의 모든 내용도 거부다 — root
+  테이블은 비어 있어야 해서 `local.spawn = false`, `"local".spawn = false`,
+  `local = { spawn = false }`는 플래그가 아니라 root 키다([hosts.x] 아래의
+  `local.spawn`은 hosts.x.local.spawn이라 무시된다). 줄 시작의 UTF-8 BOM도
+  거부다. hosts.toml이 존재하는데 일반 파일로 읽을 수 없거나, 상위 디렉터리의
+  search bit이 없어 존재 여부를 확인할 수 없을 때도 같다 — 진짜로 없는 파일만
+  허용이다. `[local]`이 없거나 spawn 키가 없거나 정확한 한 줄이면 기존과 동일하다.
+  `wrk hosts`는 해석된 상태를 `local spawn=allowed|disabled|error (<사유>)`로
+  출력한다 (보고 명령이라 오류 상태에서도 rc 0).
 - `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
 - `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600
