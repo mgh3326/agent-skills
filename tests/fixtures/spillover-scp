@@ -1,3 +1,24 @@
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${WRK_SCP_LOG:?}"
+# The destination arg is HOST:PATH; per-host overrides
+# (WRK_SCP_SCENARIO_DESKTOP, ...) win over the shared WRK_SCP_SCENARIO so
+# multi-host auto tests can fail one leg and let the next candidate succeed.
+dest="${*: -1}"
+host="${dest%%:*}"
+scenario="${WRK_SCP_SCENARIO:-ok}"
+if [[ -n "$host" && "$host" != "$dest" ]]; then
+  host_key="$(printf '%s' "$host" | tr '[:lower:]-' '[:upper:]_')"
+  scenario_var="WRK_SCP_SCENARIO_${host_key}"
+  [[ -z "${!scenario_var:-}" ]] || scenario="${!scenario_var}"
+fi
+case "$scenario" in
+  fail)
+    printf '%s\n' "scp: dest open \"${dest}\": Failure" >&2
+    exit 1
+    ;;
+  fail2)
+    printf '%s\n' "scp: dest open \"${dest}\": Failure" >&2
+    exit 2
+    ;;
+esac
