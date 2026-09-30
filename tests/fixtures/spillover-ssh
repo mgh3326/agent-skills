@@ -95,6 +95,13 @@ if [[ "$remote" == *'wrk spawn'* ]]; then
       printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: [hub] quota_gate accepts only \"local\"; refusing spawn}" >&2
       exit 70
       ;;
+    remote-spawn-disabled)
+      # #1155: the remote host's own [local] spawn = false — its wrk answers
+      # the delegated --host local spawn with rc 80. Under auto the spawning
+      # host must move on to the next candidate, not stop the round.
+      printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local}" >&2
+      exit 80
+      ;;
     remote-warn-ok)
       # A winning remote wrk may still talk on stderr (quota notes, warnings);
       # on main that text streamed live even when the spawn succeeded.

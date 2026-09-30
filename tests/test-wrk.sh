@@ -938,6 +938,473 @@ if [[ "${WRK_TEST_ONLY_REMOTE_ERR:-0}" -eq 1 ]]; then
 fi
 run_t1090_remote_err_tests
 
+run_t1155_local_spawn_off_tests() {
+  # -- #1155: [local] spawn = false closes this host to local spawns ---------
+  # A host-level switch the operator sets per machine. When it is off, --host
+  # auto treats local as an unavailable candidate, --host local refuses before
+  # any side effect (rc 80), and a remote host with the flag answers its
+  # delegated spawn with 80 — an answer that must not stop the spawning
+  # host's candidate round.
+  T1155_LOAD="$TMP/t1155-loadavg"
+  printf '0.20 0.10 0.10 1/1 1\n' >"$T1155_LOAD"
+  T1155_LOAD_HIGH="$TMP/t1155-loadavg-high"
+  printf '4.00 4.00 4.00 1/1 1\n' >"$T1155_LOAD_HIGH"
+  # Same private arbiter inbox convention as the t1090 block.
+  T1155_INBOX="$TMP/t1155-inbox" T1155_XDG="$TMP/t1155-xdg"
+  env ARBITER_INBOX_ROOT="$T1155_INBOX" XDG_DATA_HOME="$T1155_XDG" \
+    "$ARBITER" claim --job t1155-seed --agent-label t1155-seed --lane t1155 --t T1 >/dev/null
+
+  # One two-remote topology under the three flag states the contract
+  # distinguishes: refused (off), explicit allow (on) and the absent key,
+  # which must stay byte-identical to main.
+  T1155_HOSTS_OFF="$TMP/t1155-hosts-off.toml"
+  T1155_HOSTS_ON="$TMP/t1155-hosts-on.toml"
+  T1155_HOSTS_ABSENT="$TMP/t1155-hosts-absent.toml"
+  printf '%s\n' '[local]' 'spawn = false' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+    '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' '' \
+    '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 2' >"$T1155_HOSTS_OFF"
+  sed 's/^spawn = false$/spawn = true/' "$T1155_HOSTS_OFF" >"$T1155_HOSTS_ON"
+  sed '/^spawn = false$/d' "$T1155_HOSTS_OFF" >"$T1155_HOSTS_ABSENT"
+  # A hub-configured variant of the disabled host for the placement arm that
+  # consults panewire first.
+  T1155_HOSTS_OFF_HUB="$TMP/t1155-hosts-off-hub.toml"
+  printf '%s\n' '[local]' 'spawn = false' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+    '[hub]' 'hub_url = "https://hub.invalid"' 'hub_token_env = "/tmp/t1155-token.env"' '' \
+    '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' '' \
+    '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 2' >"$T1155_HOSTS_OFF_HUB"
+
+  t1155_spawn() {  # env knobs mirror t1090_spawn; T1155_* prefixed
+    env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+      ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$T1155_INBOX" XDG_DATA_HOME="$T1155_XDG" \
+      WRK_HOSTS_CONFIG="${T1155_HOSTS_OVERRIDE:-$T1155_HOSTS_OFF}" \
+      WRK_PROC_LOADAVG="${T1155_LOAD_FILE:-$T1155_LOAD}" \
+      WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 \
+      WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/t1155-herdr.log" \
+      WRK_SPILLOVER_LOG="$TMP/t1155-spillover.log" \
+      PANEWIRE_BIN="${T1155_PANEWIRE:-$PANEWIRE}" WRK_WAKE_LOG="$TMP/t1155-wake.log" \
+      WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
+      WRK_SCP_BIN="${T1155_SCP:-$ROOT/tests/fixtures/spillover-scp}" \
+      WRK_SSH_LOG="$TMP/t1155-ssh.log" WRK_SCP_LOG="$TMP/t1155-scp.log" \
+      WRK_SSH_SCENARIO="${T1155_SSH_SCENARIO:-ok}" \
+      WRK_SSH_SCENARIO_DESKTOP="${T1155_SSH_SCENARIO_DESKTOP:-}" \
+      WRK_SSH_SCENARIO_MAC_WORK="${T1155_SSH_SCENARIO_MAC_WORK:-}" \
+      WRK_SCP_SCENARIO="${T1155_SCP_SCENARIO:-ok}" \
+      WRK_REMOTE_RC="${T1155_REMOTE_RC:-}" \
+      WRK_REMOTE_STDERR_LINE="${T1155_REMOTE_STDERR_LINE:-}" \
+      WRK_PLACE_SCENARIO="${T1155_PLACE_SCENARIO:-unavailable}" \
+      HK_LOG="${T1155_HK_LOG:-$TMP/t1155-hk.log}" \
+      "${T1155_WRK:-$WRK}" spawn -c "${T1155_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
+      -w w -l fixture --t T1 --job "${T1155_JOB:-t1155-$RANDOM-$RANDOM}" --host "${T1155_HOST_ARG:-desktop}"
+  }
+
+  local t1155_rc t1155_last
+
+  # AC1: local pressure is low, which on main spawns locally — with the flag
+  # off the round uses the first remote instead and never opens a local pane.
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
+  set +e
+  ( T1155_HOST_ARG=auto T1155_SSH_SCENARIO_DESKTOP=ok \
+      T1155_SSH_SCENARIO_MAC_WORK=ok t1155_spawn ) >"$TMP/t1155-ac1.out" 2>"$TMP/t1155-ac1.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 0 ]] ||
+    fail "1155 AC1: a disabled local must hand the spawn to a remote, got rc=$t1155_rc: $(cat "$TMP/t1155-ac1.err")"
+  printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1155-ac1.want"
+  cmp -s "$TMP/t1155-ac1.want" "$TMP/t1155-ac1.out" ||
+    fail "1155 AC1: expected the desktop OK line: $(cat "$TMP/t1155-ac1.out")"
+  ! grep -q 'tab create' "$TMP/t1155-herdr.log" ||
+    fail "1155 AC1: a local pane was created on a disabled host: $(cat "$TMP/t1155-herdr.log")"
+  [[ ! -s "$TMP/t1155-ac1.err" ]] ||
+    fail "1155 AC1: skipped-local diagnostics must stay silent on success: $(cat "$TMP/t1155-ac1.err")"
+  grep -q 'reason=local-spawn-disabled' "$TMP/t1155-spillover.log" ||
+    fail "1155 AC1: the spill-over log must name the flag reason: $(cat "$TMP/t1155-spillover.log")"
+  echo "PASS t1155 AC1 disabled-local-auto-uses-remote"
+
+  # AC2: every remote fails — the all-fail path refuses rc 80 with one
+  # attributed line per host and the disabled line last, never the local
+  # fallback.
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
+  set +e
+  ( T1155_HOST_ARG=auto \
+      T1155_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1155_SSH_SCENARIO_MAC_WORK=remote-die-stderr t1155_spawn ) >"$TMP/t1155-ac2.out" 2>"$TMP/t1155-ac2.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 80 ]] ||
+    fail "1155 AC2: all-fail on a disabled host must refuse rc=80, got $t1155_rc: $(cat "$TMP/t1155-ac2.err")"
+  [[ ! -s "$TMP/t1155-ac2.out" ]] ||
+    fail "1155 AC2: a refused spawn must not write stdout: $(cat "$TMP/t1155-ac2.out")"
+  ! grep -q 'tab create' "$TMP/t1155-herdr.log" ||
+    fail "1155 AC2: a local pane was created on a disabled host"
+  grep -qF "remote host 'desktop' probe failed (ssh-unreachable, rc=255)" "$TMP/t1155-ac2.err" ||
+    fail "1155 AC2: desktop probe line missing: $(cat "$TMP/t1155-ac2.err")"
+  grep -qF "remote host 'desktop' failed (rc=255) at step 'probe'" "$TMP/t1155-ac2.err" ||
+    fail "1155 AC2: desktop summary missing: $(cat "$TMP/t1155-ac2.err")"
+  grep -qF "hk task 1037 is already bound to job 'other-job'" "$TMP/t1155-ac2.err" ||
+    fail "1155 AC2: mac-work refusal line missing: $(cat "$TMP/t1155-ac2.err")"
+  grep -qF "remote host 'mac-work' failed (rc=1) at step 'remote wrk'" "$TMP/t1155-ac2.err" ||
+    fail "1155 AC2: mac-work summary missing: $(cat "$TMP/t1155-ac2.err")"
+  ! grep -qF 'no remote spill-over candidate completed' "$TMP/t1155-ac2.err" ||
+    fail "1155 AC2: the local-fallback warning must not fire on a disabled host: $(cat "$TMP/t1155-ac2.err")"
+  t1155_last="$(tail -n 1 "$TMP/t1155-ac2.err")"
+  [[ "$t1155_last" == 'wrk: local spawns are disabled on this host ([local] spawn = false); no remote candidate completed.' ]] ||
+    fail "1155 AC2: last line must be the disabled answer, got: $t1155_last"
+  echo "PASS t1155 AC2 all-fail-refuses-80"
+
+  # AC3: --host local refuses before any side effect — no pane, no arbiter
+  # record, no hk claim.
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ac3-hk.log"
+  set +e
+  ( T1155_HOST_ARG=local T1155_JOB=t1155-ac3 T1155_HK_LOG="$TMP/t1155-ac3-hk.log" \
+      t1155_spawn ) >"$TMP/t1155-ac3.out" 2>"$TMP/t1155-ac3.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 80 ]] ||
+    fail "1155 AC3: --host local on a disabled host must refuse rc=80, got $t1155_rc: $(cat "$TMP/t1155-ac3.err")"
+  [[ ! -s "$TMP/t1155-ac3.out" ]] ||
+    fail "1155 AC3: a refused spawn must not write stdout: $(cat "$TMP/t1155-ac3.out")"
+  grep -qF 'wrk: local spawns are disabled on this host ([local] spawn = false)' "$TMP/t1155-ac3.err" ||
+    fail "1155 AC3: the refusal must name the key: $(cat "$TMP/t1155-ac3.err")"
+  { [[ ! -e "$TMP/t1155-herdr.log" ]] || ! grep -q 'tab create' "$TMP/t1155-herdr.log"; } ||
+    fail "1155 AC3: the refusal created a local pane"
+  [[ ! -e "$T1155_INBOX/t1155-ac3" ]] ||
+    fail "1155 AC3: the refusal left an arbiter record for t1155-ac3"
+  [[ ! -s "$TMP/t1155-ac3-hk.log" ]] ||
+    fail "1155 AC3: the refusal made an hk claim: $(cat "$TMP/t1155-ac3-hk.log")"
+  echo "PASS t1155 AC3 host-local-refused-before-side-effects"
+
+  # AC4: the REMOTE's own disabled answer (its [local] spawn = false answering
+  # the delegated --host local with rc 80) is not a stop-set member — the
+  # round moves on to the next remote.
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
+  set +e
+  ( T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$T1155_HOSTS_ABSENT" \
+      T1155_LOAD_FILE="$T1155_LOAD_HIGH" \
+      T1155_SSH_SCENARIO_DESKTOP=remote-spawn-disabled \
+      T1155_SSH_SCENARIO_MAC_WORK=ok t1155_spawn ) >"$TMP/t1155-ac4.out" 2>"$TMP/t1155-ac4.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 0 ]] ||
+    fail "1155 AC4: a remote 80 answer must fail over, got rc=$t1155_rc: $(cat "$TMP/t1155-ac4.err")"
+  printf '%s\n' 'OK pane=mac-work:p7 host=mac-work model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1155-ac4.want"
+  cmp -s "$TMP/t1155-ac4.want" "$TMP/t1155-ac4.out" ||
+    fail "1155 AC4: expected the mac-work OK line: $(cat "$TMP/t1155-ac4.out")"
+  grep -q 'wrk spawn' "$TMP/t1155-ssh.log" ||
+    fail "1155 AC4: desktop's delegated-spawn leg never ran: $(cat "$TMP/t1155-ssh.log")"
+  [[ ! -s "$TMP/t1155-ac4.err" ]] ||
+    fail "1155 AC4: the skipped remote's diagnostics must stay silent on success: $(cat "$TMP/t1155-ac4.err")"
+  echo "PASS t1155 AC4 remote-80-fails-over"
+
+  # A remote 80 under an explicit --host NAME keeps the named-host contract:
+  # the rc propagates and the advice does not suggest a refused override.
+  rm -f "$TMP/t1155-ssh.log"
+  set +e
+  ( T1155_HOST_ARG=desktop T1155_SSH_SCENARIO_DESKTOP=remote-spawn-disabled \
+      t1155_spawn ) >"$TMP/t1155-ac4b.out" 2>"$TMP/t1155-ac4b.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 80 ]] ||
+    fail "1155 AC4b: an explicit host must propagate the remote 80, got $t1155_rc: $(cat "$TMP/t1155-ac4b.err")"
+  grep -qF "wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local" "$TMP/t1155-ac4b.err" ||
+    fail "1155 AC4b: the remote's own refusal line is missing: $(cat "$TMP/t1155-ac4b.err")"
+  grep -qF "fix the remote (local spawns are disabled on this host: [local] spawn = false)" "$TMP/t1155-ac4b.err" ||
+    fail "1155 AC4b: the explicit-host line must not advise --host local: $(cat "$TMP/t1155-ac4b.err")"
+  echo "PASS t1155 AC4b explicit-host-remote-80"
+
+  # AC5a: absent key and spawn = true are byte-identical to main — a forced
+  # local spawn lands the pinned OK line, and stderr carries the same
+  # arbiter-record progress line main writes.
+  rm -f "$TMP/t1155-herdr.log"
+  for variant in absent on; do
+    cfg="$T1155_HOSTS_ABSENT"; [[ "$variant" == on ]] && cfg="$T1155_HOSTS_ON"
+    set +e
+    ( T1155_HOST_ARG=local T1155_HOSTS_OVERRIDE="$cfg" \
+        T1155_JOB="t1155-local-$variant" t1155_spawn ) >"$TMP/t1155-ac5a-$variant.out" 2>"$TMP/t1155-ac5a-$variant.err"
+    t1155_rc=$?
+    set -e
+    [[ "$t1155_rc" -eq 0 ]] ||
+      fail "1155 AC5 $variant-local: expected rc=0, got $t1155_rc: $(cat "$TMP/t1155-ac5a-$variant.err")"
+    grep -qxF "OK pane=w:p1 host=local model=codex-terra label=fixture status=working landed=yes job=t1155-local-$variant quota_record=codex/quota_pool" \
+      "$TMP/t1155-ac5a-$variant.out" ||
+      fail "1155 AC5 $variant-local: stdout differs from the pinned OK line: $(cat "$TMP/t1155-ac5a-$variant.out")"
+    grep -qxF "wrk: arbiter quota-pool record pool=codex profile=codex-terra-max launch_profile=codex-terra@medium job=t1155-local-$variant" \
+      "$TMP/t1155-ac5a-$variant.err" ||
+      fail "1155 AC5 $variant-local: stderr differs from the pinned arbiter line: $(cat "$TMP/t1155-ac5a-$variant.err")"
+  done
+  # The two runs differ only in the minted job id.
+  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5a-absent.out" >"$TMP/t1155-ac5a-absent.out.norm"
+  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5a-on.out" >"$TMP/t1155-ac5a-on.out.norm"
+  cmp -s "$TMP/t1155-ac5a-absent.out.norm" "$TMP/t1155-ac5a-on.out.norm" ||
+    fail "1155 AC5: absent-key and spawn=true local stdout differ"
+  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5a-absent.err" >"$TMP/t1155-ac5a-absent.err.norm"
+  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5a-on.err" >"$TMP/t1155-ac5a-on.err.norm"
+  cmp -s "$TMP/t1155-ac5a-absent.err.norm" "$TMP/t1155-ac5a-on.err.norm" ||
+    fail "1155 AC5: absent-key and spawn=true local stderr differ"
+
+  # AC5b: the auto all-fail local fallback is byte-identical too — same
+  # per-candidate lines, the same fallback warning, a local landing.
+  for variant in absent on; do
+    cfg="$T1155_HOSTS_ABSENT"; [[ "$variant" == on ]] && cfg="$T1155_HOSTS_ON"
+    rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
+    set +e
+    ( T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$cfg" \
+        T1155_LOAD_FILE="$T1155_LOAD_HIGH" T1155_JOB="t1155-fb-$variant" \
+        T1155_SSH_SCENARIO_DESKTOP=probe-unreachable \
+        T1155_SSH_SCENARIO_MAC_WORK=probe-herdr-missing t1155_spawn ) \
+      >"$TMP/t1155-ac5b-$variant.out" 2>"$TMP/t1155-ac5b-$variant.err"
+    t1155_rc=$?
+    set -e
+    [[ "$t1155_rc" -eq 0 ]] ||
+      fail "1155 AC5 $variant-fallback: expected rc=0, got $t1155_rc: $(cat "$TMP/t1155-ac5b-$variant.err")"
+    grep -q 'host=local' "$TMP/t1155-ac5b-$variant.out" ||
+      fail "1155 AC5 $variant-fallback: expected a local landing on stdout: $(cat "$TMP/t1155-ac5b-$variant.out")"
+    grep -qF 'no remote spill-over candidate completed; falling back to local' "$TMP/t1155-ac5b-$variant.err" ||
+      fail "1155 AC5 $variant-fallback: fallback warning missing: $(cat "$TMP/t1155-ac5b-$variant.err")"
+    grep -q 'tab create' "$TMP/t1155-herdr.log" ||
+      fail "1155 AC5 $variant-fallback: the local fallback never created a pane"
+  done
+  # The two runs differ only in the minted job id; everything else must be
+  # byte-identical between the absent key and an explicit true.
+  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-absent.out" >"$TMP/t1155-ac5b-absent.out.norm"
+  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-on.out" >"$TMP/t1155-ac5b-on.out.norm"
+  cmp -s "$TMP/t1155-ac5b-absent.out.norm" "$TMP/t1155-ac5b-on.out.norm" ||
+    fail "1155 AC5: absent-key and spawn=true fallback stdout differ"
+  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-absent.err" >"$TMP/t1155-ac5b-absent.err.norm"
+  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-on.err" >"$TMP/t1155-ac5b-on.err.norm"
+  cmp -s "$TMP/t1155-ac5b-absent.err.norm" "$TMP/t1155-ac5b-on.err.norm" ||
+    fail "1155 AC5: absent-key and spawn=true fallback stderr differ"
+  echo "PASS t1155 AC5 absent-and-true-byte-identical"
+
+  # AC5c: any other value is a config error — bare or quoted, a non-boolean
+  # refuses rc 70 naming the key. Quoted "true"/"false" are strings, not the
+  # TOML booleans this key accepts (documented decision), so they refuse too.
+  local bad_idx=0 bad_val bad_cfg
+  for bad_val in '0' 'maybe' '"no"' '"true"' '"false"' ''; do
+    bad_idx=$((bad_idx + 1))
+    bad_cfg="$TMP/t1155-hosts-bad-$bad_idx.toml"
+    sed "s/^spawn = false$/spawn = $bad_val/" "$T1155_HOSTS_OFF" >"$bad_cfg"
+    set +e
+    ( T1155_HOST_ARG=local T1155_HOSTS_OVERRIDE="$bad_cfg" \
+        T1155_JOB="t1155-bad-$bad_idx" t1155_spawn ) >"$TMP/t1155-bad-$bad_idx.out" 2>"$TMP/t1155-bad-$bad_idx.err"
+    t1155_rc=$?
+    set -e
+    [[ "$t1155_rc" -eq 70 ]] ||
+      fail "1155 AC5 invalid '$bad_val': expected rc=70, got $t1155_rc: $(cat "$TMP/t1155-bad-$bad_idx.err")"
+    grep -qF "[local] spawn accepts only the bare TOML booleans true or false" "$TMP/t1155-bad-$bad_idx.err" ||
+      fail "1155 AC5 invalid '$bad_val': refusal must name key and accepted values: $(cat "$TMP/t1155-bad-$bad_idx.err")"
+    [[ ! -s "$TMP/t1155-bad-$bad_idx.out" ]] ||
+      fail "1155 AC5 invalid '$bad_val': refused spawn must not write stdout"
+  done
+  # An invalid value is a config error on every placement, not only local.
+  set +e
+  ( T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$TMP/t1155-hosts-bad-1.toml" \
+      T1155_LOAD_FILE="$T1155_LOAD_HIGH" t1155_spawn ) >"$TMP/t1155-badauto.out" 2>"$TMP/t1155-badauto.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 70 ]] ||
+    fail "1155 AC5 invalid auto: expected rc=70, got $t1155_rc: $(cat "$TMP/t1155-badauto.err")"
+  echo "PASS t1155 AC5 invalid-values-refuse-70"
+
+  # The hub arm honors the flag too: a placement reply picking local leaves
+  # no eligible remote, so the round ends with the disabled answer, rc 80.
+  rm -f "$TMP/t1155-herdr.log"
+  set +e
+  ( T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$T1155_HOSTS_OFF_HUB" \
+      T1155_PANEWIRE="$ROOT/tests/fixtures/spillover-panewire" \
+      T1155_PLACE_SCENARIO=local t1155_spawn ) >"$TMP/t1155-hublocal.out" 2>"$TMP/t1155-hublocal.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 80 ]] ||
+    fail "1155 hub-local: a hub-picked local on a disabled host must refuse rc=80, got $t1155_rc: $(cat "$TMP/t1155-hublocal.err")"
+  ! grep -q 'tab create' "$TMP/t1155-herdr.log" ||
+    fail "1155 hub-local: a local pane was created on a disabled host"
+  grep -qF 'wrk: local spawns are disabled on this host ([local] spawn = false); no remote candidate completed.' "$TMP/t1155-hublocal.err" ||
+    fail "1155 hub-local: the disabled answer is missing: $(cat "$TMP/t1155-hublocal.err")"
+  echo "PASS t1155 hub-picked-local-refused"
+
+  # A normal hub decision for a remote is unaffected by the flag.
+  rm -f "$TMP/t1155-herdr.log"
+  set +e
+  ( T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$T1155_HOSTS_OFF_HUB" \
+      T1155_PANEWIRE="$ROOT/tests/fixtures/spillover-panewire" \
+      T1155_PLACE_SCENARIO=advance T1155_SSH_SCENARIO_DESKTOP=ok \
+      t1155_spawn ) >"$TMP/t1155-hubremote.out" 2>"$TMP/t1155-hubremote.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 0 ]] ||
+    fail "1155 hub-remote: expected rc=0 on the hub-picked remote, got $t1155_rc: $(cat "$TMP/t1155-hubremote.err")"
+  grep -q 'host=desktop' "$TMP/t1155-hubremote.out" ||
+    fail "1155 hub-remote: expected the desktop OK line: $(cat "$TMP/t1155-hubremote.out")"
+  echo "PASS t1155 hub-remote-unaffected"
+
+  # -- #1154 S1: a transport leg answering rc 70 fails over, never stops -----
+  # The probe is a transport leg; a 70 there is normalized to 1 like every
+  # other non-admission transport rc, so the round reaches the next remote.
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log" "$TMP/t1155-calls"
+  set +e
+  ( WRK_SSH_CALL_COUNT_FILE="$TMP/t1155-calls" WRK_SSH_FAIL_CALLS=1 WRK_SSH_FAIL_CODE=70 \
+      T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$T1155_HOSTS_ABSENT" \
+      T1155_LOAD_FILE="$T1155_LOAD_HIGH" \
+      T1155_SSH_SCENARIO_MAC_WORK=ok t1155_spawn ) >"$TMP/t1155-s1.out" 2>"$TMP/t1155-s1.err"
+  t1155_rc=$?
+  set -e
+  [[ "$t1155_rc" -eq 0 ]] ||
+    fail "1155 S1: a transport-70 must fail over to the next remote, got rc=$t1155_rc: $(cat "$TMP/t1155-s1.err")"
+  cmp -s "$TMP/t1155-ac4.want" "$TMP/t1155-s1.out" ||
+    fail "1155 S1: expected the mac-work OK line: $(cat "$TMP/t1155-s1.out")"
+  [[ ! -s "$TMP/t1155-s1.err" ]] ||
+    fail "1155 S1: skipped-host diagnostics must stay silent on success: $(cat "$TMP/t1155-s1.err")"
+  echo "PASS t1155 S1 transport-70-fails-over"
+
+  # -- assertion-RED mutants -------------------------------------------------
+  # M1 "a host with local spawns disabled never lands a local pane under
+  # auto" — the mutant keeps the local fallback. The flag is enforced twice
+  # on that path (the tail guard and the spawn_cmd backstop), so the mutant
+  # must bypass both for the regression to be observable.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1155-keep-fallback \
+    '  if [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 ]]; then' \
+    '  if false; then'
+  python3 - "$TMP/mut-wrk-t1155-keep-fallback" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+old = ('local_spawn_resolve || return\n'
+       '  if [[ "${LOCAL_SPAWN_ALLOWED:-1}" -eq 0 ]]; then')
+new = ('local_spawn_resolve || return\n'
+       '  if false; then')
+assert src.count(old) == 1, "mutant anchor not unique: %r" % old
+open(p, "w", encoding="utf-8").write(src.replace(old, new))
+PY
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
+  set +e
+  ( T1155_WRK="$TMP/mut-wrk-t1155-keep-fallback" \
+      T1155_HOST_ARG=auto \
+      T1155_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1155_SSH_SCENARIO_MAC_WORK=remote-die-stderr t1155_spawn ) >"$TMP/t1155-m1.out" 2>"$TMP/t1155-m1.err"
+  t1155_rc=$?
+  set -e
+  if [[ "$t1155_rc" -eq 80 ]]; then
+    fail "1155 M1 mutant survived: the all-fail path still refused rc=80"
+  fi
+  grep -q 'host=local' "$TMP/t1155-m1.out" ||
+    fail "1155 M1: the mutant should land the local fallback pane main produced"
+  grep -q 'tab create' "$TMP/t1155-herdr.log" ||
+    fail "1155 M1: the mutant should show the forbidden local pane creation"
+  echo "PASS t1155 M1: keep-fallback mutant goes RED (AC2 assertion 'rc=80, no local pane' fails: rc=$t1155_rc, local pane created)"
+
+  # M2 "the local placement arm respects the flag" — the mutant drops the
+  # flag from the pressure decision, so a healthy local spawns locally again.
+  # As in M1 the spawn_cmd backstop is the second enforcement layer on the
+  # local landing, so the mutant bypasses it too.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1155-arm-ignores-flag \
+    'if [[ "$LOCAL_SPAWN_ALLOWED" -eq 1 ]] && ! spillover_local_is_pressured; then' \
+    'if ! spillover_local_is_pressured; then'
+  python3 - "$TMP/mut-wrk-t1155-arm-ignores-flag" <<'PY'
+import sys
+p = sys.argv[1]
+src = open(p, encoding="utf-8").read()
+old = ('local_spawn_resolve || return\n'
+       '  if [[ "${LOCAL_SPAWN_ALLOWED:-1}" -eq 0 ]]; then')
+new = ('local_spawn_resolve || return\n'
+       '  if false; then')
+assert src.count(old) == 1, "mutant anchor not unique: %r" % old
+open(p, "w", encoding="utf-8").write(src.replace(old, new))
+PY
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
+  set +e
+  ( T1155_WRK="$TMP/mut-wrk-t1155-arm-ignores-flag" \
+      T1155_HOST_ARG=auto T1155_SSH_SCENARIO_DESKTOP=ok \
+      t1155_spawn ) >"$TMP/t1155-m2.out" 2>"$TMP/t1155-m2.err"
+  t1155_rc=$?
+  set -e
+  if cmp -s "$TMP/t1155-ac1.want" "$TMP/t1155-m2.out"; then
+    fail "1155 M2 mutant survived: the arm still picked the remote"
+  fi
+  grep -q 'host=local' "$TMP/t1155-m2.out" ||
+    fail "1155 M2: the mutant should land the local pane an unflagged arm produces"
+  grep -q 'tab create' "$TMP/t1155-herdr.log" ||
+    fail "1155 M2: the mutant should show the local pane creation"
+  echo "PASS t1155 M2: arm-ignores-flag mutant goes RED (AC1 assertion 'desktop OK line, no local pane' fails: rc=$t1155_rc, local pane created)"
+
+  # M3 "a remote's disabled answer never stops the round" — the mutant adds
+  # the new constant to the stop set, so AC4's remote-80 stops the round.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1155-80-stops \
+    '      2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE")' \
+    '      2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_LOCAL_SPAWN_DISABLED")'
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
+  set +e
+  ( T1155_WRK="$TMP/mut-wrk-t1155-80-stops" \
+      T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$T1155_HOSTS_ABSENT" \
+      T1155_LOAD_FILE="$T1155_LOAD_HIGH" \
+      T1155_SSH_SCENARIO_DESKTOP=remote-spawn-disabled \
+      T1155_SSH_SCENARIO_MAC_WORK=ok t1155_spawn ) >"$TMP/t1155-m3.out" 2>"$TMP/t1155-m3.err"
+  t1155_rc=$?
+  set -e
+  if [[ "$t1155_rc" -eq 0 ]] && cmp -s "$TMP/t1155-ac4.want" "$TMP/t1155-m3.out"; then
+    fail "1155 M3 mutant survived: the remote 80 still failed over"
+  fi
+  [[ "$t1155_rc" -eq 80 ]] ||
+    fail "1155 M3: the mutant should stop the round with rc 80, got $t1155_rc"
+  ! grep -q 'mac-work' "$TMP/t1155-ssh.log" ||
+    fail "1155 M3: the mutant must stop before the second candidate"
+  echo "PASS t1155 M3: 80-in-stop-set mutant goes RED (AC4 assertion 'rc 0 + mac-work OK line' fails: rc=$t1155_rc)"
+
+  # M4 "a transport-leg 70 is normalized to 1" — the mutant deletes the
+  # WRK_EXIT_CONFIG_REFUSED arm from spillover_transport_rc, so S1's
+  # transport-70 reaches the router as the remote's own config refusal.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1155-transport-keeps-70 \
+    '    2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_CONFIG_REFUSED") printf '"'"'1'"'"' ;;' \
+    '    2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE") printf '"'"'1'"'"' ;;'
+  rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log" "$TMP/t1155-calls"
+  set +e
+  ( T1155_WRK="$TMP/mut-wrk-t1155-transport-keeps-70" \
+      WRK_SSH_CALL_COUNT_FILE="$TMP/t1155-calls" WRK_SSH_FAIL_CALLS=1 WRK_SSH_FAIL_CODE=70 \
+      T1155_HOST_ARG=auto T1155_HOSTS_OVERRIDE="$T1155_HOSTS_ABSENT" \
+      T1155_LOAD_FILE="$T1155_LOAD_HIGH" \
+      T1155_SSH_SCENARIO_MAC_WORK=ok t1155_spawn ) >"$TMP/t1155-m4.out" 2>"$TMP/t1155-m4.err"
+  t1155_rc=$?
+  set -e
+  if [[ "$t1155_rc" -eq 0 ]] && cmp -s "$TMP/t1155-ac4.want" "$TMP/t1155-m4.out"; then
+    fail "1155 M4 mutant survived: a transport-70 still failed over"
+  fi
+  [[ "$t1155_rc" -eq 70 ]] ||
+    fail "1155 M4: the mutant should stop the round with rc 70, got $t1155_rc"
+  ! grep -q 'mac-work' "$TMP/t1155-ssh.log" ||
+    fail "1155 M4: the mutant must stop before the second candidate"
+  echo "PASS t1155 M4: transport-keeps-70 mutant goes RED (S1 assertion 'rc 0 + mac-work OK line' fails: rc=$t1155_rc)"
+
+  # N1: the --host help must say transport failures and non-stop remote
+  # answers move on, while remote 2/70/74/75, a cwd_map miss and a via=hub
+  # candidate end the round.
+  "$WRK" spawn --help >"$TMP/t1155-help.out" 2>"$TMP/t1155-help.err" ||
+    fail "1155 N1: wrk spawn --help failed"
+  grep -qF 'rc 2, 74 or 75' "$TMP/t1155-help.out" ||
+    fail "1155 N1: help does not name the remote stop rcs"
+  grep -qF 'cwd_map miss' "$TMP/t1155-help.out" ||
+    fail "1155 N1: help does not name the cwd_map stop"
+  grep -qF 'via=hub' "$TMP/t1155-help.out" ||
+    fail "1155 N1: help does not name the via=hub stop"
+  grep -qF 'Transport-leg failures' "$TMP/t1155-help.out" ||
+    fail "1155 N1: help does not say transport legs move on"
+  grep -qF 'spawn = false' "$TMP/t1155-help.out" ||
+    fail "1155 N1: help does not document [local] spawn"
+  echo "PASS t1155 N1 help-wording"
+}
+
+if [[ "${WRK_TEST_ONLY_LOCAL_SPAWN_OFF:-0}" -eq 1 ]]; then
+  run_t1155_local_spawn_off_tests
+  exit 0
+fi
+run_t1155_local_spawn_off_tests
+
 run_hub_quota_gate_tests() {
   local configured="$TMP/hub-quota-hosts.toml"
   local unconfigured="$TMP/hub-quota-no-hub.toml"
