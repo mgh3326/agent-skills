@@ -1,3 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >>"${WRK_SCP_LOG:?}"
+if [[ "${WRK_SCP_SCENARIO:-ok}" == fail ]]; then
+  printf '%s\n' "scp: dest open \"${*: -1}\": Failure" >&2
+  exit 1
+fi

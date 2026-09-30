@@ -5776,11 +5776,19 @@ print(*eligible[1:], sep="\n")
 }
 
 spillover_probe_host() {
-  local host="$1" ssh_name output capacity load
+  local host="$1" ssh_name output capacity load probe_err rc
   ssh_name="$(spillover_value "hosts.$host" ssh 2>/dev/null || true)"
   [[ -n "$ssh_name" ]] || ssh_name="$host"
-  if ! output="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'uptime; herdr agent list' 2>/dev/null)"; then
+  SPILL_PROBE_ERR=""
+  probe_err="$(mktemp)"
+  set +e
+  output="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'uptime; herdr agent list' 2>"$probe_err")"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
     SPILL_PROBE_REASON="ssh-unreachable"
+    SPILL_PROBE_ERR="$(cat "$probe_err" 2>/dev/null)"
+    rm -f "$probe_err"
     return 1
   fi
   SPILL_REMOTE_LOAD="$(sed -nE 's/.*load averages?:[[:space:]]*([0-9.]+).*/\1/p' <<<"$output" | head -1)"
@@ -5789,9 +5797,15 @@ spillover_probe_host() {
   [[ "$capacity" =~ ^[1-9][0-9]*$ ]] || capacity=1
   if [[ "$SPILL_REMOTE_ACTIVE" =~ ^[0-9]+$ && "$SPILL_REMOTE_ACTIVE" -lt "$capacity" ]]; then
     SPILL_PROBE_REASON="remote-active=${SPILL_REMOTE_ACTIVE}<${capacity}"
+    rm -f "$probe_err"
     return 0
   fi
   SPILL_PROBE_REASON="remote-full active=${SPILL_REMOTE_ACTIVE:-unknown} capacity=${capacity} load5=${SPILL_REMOTE_LOAD:-unknown}"
+  # A probe that connected but could not produce a parseable agent list usually
+  # left its reason on the remote stderr (herdr missing from the
+  # non-interactive PATH is the classic case) — keep it for the caller.
+  SPILL_PROBE_ERR="$(cat "$probe_err" 2>/dev/null)"
+  rm -f "$probe_err"
   return 1
 }
 
@@ -6092,8 +6106,23 @@ PY
 
 
 spillover_emit_host() {
-  local host="$1" file="$2"
-  awk -v host="$host" '/^OK pane=/ { sub(/ host=[^ ]+/, ""); sub(/^OK pane=[^ ]+/, "& host=" host) } { print }' "$file"
+  local host="$1" file="$2" remote_rc="${3:-0}"
+  # The OK pane line is the success contract: it stays on stdout even when the
+  # remote leg failed after printing it.  On failure every other captured line
+  # is diagnostic and belongs on stderr, never on the OK line's stream.
+  awk -v host="$host" -v failed="$remote_rc" '
+    /^OK pane=/ { sub(/ host=[^ ]+/, ""); sub(/^OK pane=[^ ]+/, "& host=" host); print; next }
+    failed != 0 { print > "/dev/stderr"; next }
+    { print }
+  ' "$file"
+}
+
+# A delegated leg captures the remote stderr separately so transport noise
+# (ssh banners, remote shell errors) and the remote wrk's own die lines reach
+# the operator verbatim instead of dying inside a temp file or /dev/null.
+spillover_relay_remote_err() {
+  local err_file="$1"
+  if [[ -s "$err_file" ]]; then cat "$err_file" >&2; fi
 }
 
 # Creates the derived remote worktree on the selected host.  Local-only
@@ -6163,10 +6192,11 @@ spillover_remote_prepare() {
     has_git=1
     [[ "$branch" == HEAD ]] && branch=""
   fi
-  local out rc
+  local out rc prep_err
+  prep_err="$(mktemp)"
   set +e
   out="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" \
-    "TARGET=$(printf '%q' "$remote_cwd") sh -s" <<'PREP' 2>/dev/null
+    "TARGET=$(printf '%q' "$remote_cwd") sh -s" <<'PREP' 2>"$prep_err"
 if [ -d "$TARGET" ]; then
   b=$(git -C "$TARGET" rev-parse --abbrev-ref HEAD 2>/dev/null) &&
     s=$(git -C "$TARGET" rev-parse HEAD 2>/dev/null) &&
@@ -6179,9 +6209,12 @@ PREP
   rc=$?
   set -e
   if [[ "$rc" -ne 0 ]]; then
-    echo "wrk: remote host '$host' is unreachable during worktree check; retry when it is available" >&2
-    return 1
+    spillover_relay_remote_err "$prep_err"
+    echo "wrk: remote host '$host' is unreachable during worktree check (prepare rc=$rc); retry when it is available" >&2
+    rm -f "$prep_err"
+    return "$rc"
   fi
+  rm -f "$prep_err"
   case "$out" in
     MISSING)
       if [[ "$has_git" -eq 0 ]]; then
@@ -6219,24 +6252,42 @@ PREP
 
 spillover_remote_spawn() {
   local host="$1" cwd="$2" prompt="$3"; shift 3
-  local ssh_name session remote_prompt remote_cwd workspace remote_cmd rc out
+  local ssh_name session remote_prompt remote_cwd workspace remote_cmd rc out remote_err
   ssh_name="$(spillover_value "hosts.$host" ssh 2>/dev/null || true)"; [[ -n "$ssh_name" ]] || ssh_name="$host"
   session="$(spillover_value "hosts.$host" herdr_session 2>/dev/null || true)"; [[ -n "$session" ]] || session=worker
   workspace="$(spillover_value "hosts.$host" workspace 2>/dev/null || true)"; [[ -n "$workspace" ]] || workspace=worker
+  # SPILL_REMOTE_STEP names the leg currently in flight so the router's final
+  # failure line can say which step's rc it carries.
+  SPILL_REMOTE_STEP="cwd-map"
   if ! spillover_cwd_map "$host" "$cwd"; then
     echo "wrk: remote host '$host' has no cwd_map entry for '$cwd'; use --host local or configure hosts.toml" >&2
     return 2
   fi
   remote_cwd="$SPILL_CWD_REMOTE"
+  SPILL_REMOTE_STEP="prepare"
   spillover_remote_prepare "$host" "$ssh_name" "$cwd" "$remote_cwd" "$SPILL_CWD_BASE" "$SPILL_CWD_KIND" || return
+  SPILL_REMOTE_STEP="mktemp"
+  remote_err="$(mktemp)"
+  set +e
   # shellcheck disable=SC2016 # ${TMPDIR} must expand on the selected remote host.
-  if ! remote_prompt="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'umask 077; mktemp "${TMPDIR:-/tmp}/wrk-spillover.XXXXXX.md"' 2>/dev/null)"; then
-    echo "wrk: remote host '$host' is unreachable; use --host local or retry after it is available" >&2
-    return 1
+  remote_prompt="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'umask 077; mktemp "${TMPDIR:-/tmp}/wrk-spillover.XXXXXX.md"' 2>"$remote_err")"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    spillover_relay_remote_err "$remote_err"
+    echo "wrk: remote host '$host' is unreachable or its mktemp failed (mktemp rc=$rc); use --host local or retry after it is available" >&2
+    rm -f "$remote_err"
+    return "$rc"
   fi
-  if ! "${WRK_SCP_BIN:-scp}" "$prompt" "$ssh_name:$remote_prompt"; then
-    echo "wrk: failed to copy brief to remote host '$host'" >&2
-    return 1
+  rm -f "$remote_err"
+  SPILL_REMOTE_STEP="scp"
+  set +e
+  "${WRK_SCP_BIN:-scp}" "$prompt" "$ssh_name:$remote_prompt"
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: failed to copy brief to remote host '$host' (scp rc=$rc)" >&2
+    return "$rc"
   fi
   local remote_args=(env "HERDR_SESSION=$session" wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   local arg saw_workspace=0 i=0 args=("$@")
@@ -6265,13 +6316,18 @@ spillover_remote_spawn() {
   # from hosts.toml when callers omit it.
   if [[ "$saw_workspace" -eq 0 ]]; then remote_args+=(-w "$workspace"); fi
   printf -v remote_cmd '%q ' "${remote_args[@]}"
+  SPILL_REMOTE_STEP="remote wrk"
   out="$(mktemp)"
+  remote_err="$(mktemp)"
   set +e
-  "${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" "$remote_cmd; rc=\$?; rm -f -- $(printf '%q' "$remote_prompt"); exit \$rc" >"$out"
+  "${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" "$remote_cmd; rc=\$?; rm -f -- $(printf '%q' "$remote_prompt"); exit \$rc" >"$out" 2>"$remote_err"
   rc=$?
   set -e
-  spillover_emit_host "$host" "$out"
-  rm -f "$out"
+  # A failed remote spawn must answer with the remote's own words: stderr is
+  # relayed verbatim and non-OK stdout follows it onto the local stderr.
+  spillover_relay_remote_err "$remote_err"
+  spillover_emit_host "$host" "$out" "$rc"
+  rm -f "$out" "$remote_err"
   return "$rc"
 }
 
@@ -6441,8 +6497,13 @@ spawn_router_cmd() {
       spillover_hub_spawn "$candidate" "$cwd" "$prompt" "${filtered[@]}"
       return $?
     fi
+    SPILL_REMOTE_STEP=""
     if ! spillover_probe_host "$candidate"; then
       [[ "$SPILL_PROBE_REASON" == ssh-unreachable ]] && spillover_wake "$candidate"
+      last_rc=1
+      SPILL_REMOTE_STEP="probe"
+      if [[ -n "${SPILL_PROBE_ERR:-}" ]]; then printf '%s\n' "$SPILL_PROBE_ERR" >&2; fi
+      echo "wrk: remote host '$candidate' probe failed (${SPILL_PROBE_REASON}); skipping" >&2
       continue
     fi
     if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "${filtered[@]}"; then return 0; else last_rc=$?; fi
@@ -6452,13 +6513,13 @@ spawn_router_cmd() {
     esac
     # The "next candidate" phrasing is honest only under --host auto; an
     # explicit --host exits right after this with the no-fallback error.
-    [[ "$requested" == auto ]] && warn "spill-over remote spawn failed host=$candidate exit=$last_rc; trying next candidate"
+    [[ "$requested" == auto ]] && warn "spill-over remote spawn failed host=$candidate exit=$last_rc at step '${SPILL_REMOTE_STEP:-unknown}'; trying next candidate"
   done
   # An explicit --host NAME is an operator forcing one remote: propagate the
   # remote exit instead of quietly landing the pane locally (#571).  The local
   # fallback below exists for --host auto only.
   if [[ "$requested" != auto ]]; then
-    echo "wrk: remote spawn on explicit host '$requested' failed (rc=$last_rc); no local fallback — fix the remote or use --host local" >&2
+    echo "wrk: remote spawn on explicit host '$requested' failed (rc=$last_rc) at step '${SPILL_REMOTE_STEP:-unknown}'; no local fallback — fix the remote or use --host local" >&2
     return "$last_rc"
   fi
   warn "no remote spill-over candidate completed; falling back to local"

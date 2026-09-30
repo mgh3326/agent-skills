@@ -389,6 +389,196 @@ hub_quota_expect_spawn() {
   fi
 }
 
+run_t1090_remote_err_tests() {
+  # -- #1090: a failed remote spawn must say why -------------------------------
+  # The remote legs used to swallow the remote's own words: the probe and the
+  # prepare check ran under 2>/dev/null, a refused candidate was skipped without
+  # a line, and the router's last message carried an initialized rc=1 naming no
+  # step. The contract pinned here: remote stderr and non-OK remote stdout land
+  # on the local stderr, and the final line names the failed step and its rc.
+  T1090_LOAD="$TMP/t1090-loadavg"
+  printf '0.20 0.10 0.10 1/1 1\n' >"$T1090_LOAD"
+  T1090_HOSTS="$TMP/t1090-hosts.toml"
+  printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+    '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >"$T1090_HOSTS"
+  # A suffix-kind mapping actually opens the prepare leg (exact mappings return
+  # before any remote check). The .wt sibling directory stands in for a derived
+  # worktree path so the sh -s leg is exercised end to end.
+  T1090_SUFFIX_ROOT="$TMP/t1090-lrepo"
+  mkdir -p "$T1090_SUFFIX_ROOT" "${T1090_SUFFIX_ROOT}.wt"
+  T1090_HOSTS_SUFFIX="$TMP/t1090-hosts-suffix.toml"
+  printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+    '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+    "cwd_map = {\"$T1090_SUFFIX_ROOT\"=\"/remote/lrepo\"}" 'capacity = 3' >"$T1090_HOSTS_SUFFIX"
+  # The router refuses remote placement while the arbiter lookup is unreadable;
+  # a seeded claim makes the block-private inbox a real database for preflight
+  # to read — it stays out of the shared $TMP/inbox other sections assert on.
+  T1090_INBOX="$TMP/t1090-inbox" T1090_XDG="$TMP/t1090-xdg"
+  env ARBITER_INBOX_ROOT="$T1090_INBOX" XDG_DATA_HOME="$T1090_XDG" \
+    "$ARBITER" claim --job t1090-seed --agent-label t1090-seed --lane t1090 --t T1 >/dev/null
+
+  t1090_spawn() {  # env knobs per call: T1090_{SSH,SCP}_SCENARIO, T1090_{HOSTS_OVERRIDE,CWD,WRK}
+    env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+      ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$T1090_INBOX" XDG_DATA_HOME="$T1090_XDG" \
+      WRK_HOSTS_CONFIG="${T1090_HOSTS_OVERRIDE:-$T1090_HOSTS}" WRK_PROC_LOADAVG="$T1090_LOAD" \
+      WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 \
+      WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/t1090-herdr.log" \
+      WRK_SPILLOVER_LOG="$TMP/t1090-spillover.log" \
+      PANEWIRE_BIN="$PANEWIRE" WRK_WAKE_LOG="$TMP/t1090-wake.log" \
+      WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
+      WRK_SCP_BIN="${T1090_SCP:-$ROOT/tests/fixtures/spillover-scp}" \
+      WRK_SSH_LOG="$TMP/t1090-ssh.log" WRK_SCP_LOG="$TMP/t1090-scp.log" \
+      WRK_SSH_SCENARIO="${T1090_SSH_SCENARIO:-ok}" \
+      WRK_SCP_SCENARIO="${T1090_SCP_SCENARIO:-ok}" \
+      "${T1090_WRK:-$WRK}" spawn -c "${T1090_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
+      -w w -l fixture --t T1 --job "t1090-$RANDOM-$RANDOM" --host desktop
+  }
+
+  # AC1: the remote wrk dies on stderr — the die line reaches the local stderr
+  # and the final line names the remote wrk step and its rc.
+  set +e
+  ( T1090_SSH_SCENARIO=remote-die-stderr t1090_spawn ) >"$TMP/t1090-ac1.out" 2>"$TMP/t1090-ac1.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 1 ]] || fail "AC1: remote rc=1 must propagate, got $t1090_rc"
+  grep -qF "hk task 1037 is already bound to job 'other-job'" "$TMP/t1090-ac1.err" ||
+    fail "AC1: remote stderr die line never reached local stderr: $(cat "$TMP/t1090-ac1.err")"
+  t1090_last="$(tail -n 1 "$TMP/t1090-ac1.err")"
+  [[ "$t1090_last" == *"rc=1"* && "$t1090_last" == *"remote wrk"* && "$t1090_last" == *"no local fallback"* ]] ||
+    fail "AC1: final line must name the remote wrk step and rc=1, got: $t1090_last"
+  [[ ! -s "$TMP/t1090-ac1.out" ]] || fail "AC1: a failed spawn must not write to stdout: $(cat "$TMP/t1090-ac1.out")"
+  echo "PASS t1090 AC1 remote-stderr-relayed"
+
+  # AC2: the remote wrk prints its refusal on stdout — same contract, and the
+  # line must move to stderr rather than masquerade on the OK stream.
+  set +e
+  ( T1090_SSH_SCENARIO=remote-die-stdout t1090_spawn ) >"$TMP/t1090-ac2.out" 2>"$TMP/t1090-ac2.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 1 ]] || fail "AC2: remote rc=1 must propagate, got $t1090_rc"
+  grep -qF "hk task 1037 is already bound to job 'other-job'" "$TMP/t1090-ac2.err" ||
+    fail "AC2: remote stdout refusal never reached local stderr: $(cat "$TMP/t1090-ac2.err")"
+  t1090_last="$(tail -n 1 "$TMP/t1090-ac2.err")"
+  [[ "$t1090_last" == *"rc=1"* && "$t1090_last" == *"remote wrk"* ]] ||
+    fail "AC2: final line must name the remote wrk step and rc=1, got: $t1090_last"
+  ! grep -qF 'already bound' "$TMP/t1090-ac2.out" ||
+    fail "AC2: remote refusal must not stay on stdout: $(cat "$TMP/t1090-ac2.out")"
+  echo "PASS t1090 AC2 remote-stdout-relayed"
+
+  # AC3: prepare, mktemp and scp failures each name their step on the final
+  # line, and each leg's stderr reaches the local stderr.
+  set +e
+  ( T1090_HOSTS_OVERRIDE="$T1090_HOSTS_SUFFIX" T1090_CWD="${T1090_SUFFIX_ROOT}.wt" \
+    T1090_SSH_SCENARIO=prepare-fails t1090_spawn ) >"$TMP/t1090-ac3a.out" 2>"$TMP/t1090-ac3a.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 255 ]] || fail "AC3 prepare: ssh rc must propagate, got $t1090_rc"
+  grep -qF 'Connection refused' "$TMP/t1090-ac3a.err" ||
+    fail "AC3 prepare: remote check stderr dropped: $(cat "$TMP/t1090-ac3a.err")"
+  t1090_last="$(tail -n 1 "$TMP/t1090-ac3a.err")"
+  [[ "$t1090_last" == *"rc=255"* && "$t1090_last" == *"prepare"* ]] ||
+    fail "AC3 prepare: final line must name the prepare step and rc, got: $t1090_last"
+
+  set +e
+  ( T1090_SSH_SCENARIO=mktemp-fails t1090_spawn ) >"$TMP/t1090-ac3b.out" 2>"$TMP/t1090-ac3b.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 1 ]] || fail "AC3 mktemp: remote rc must propagate, got $t1090_rc"
+  grep -qF 'No space left on device' "$TMP/t1090-ac3b.err" ||
+    fail "AC3 mktemp: remote mktemp stderr dropped: $(cat "$TMP/t1090-ac3b.err")"
+  t1090_last="$(tail -n 1 "$TMP/t1090-ac3b.err")"
+  [[ "$t1090_last" == *"rc=1"* && "$t1090_last" == *"mktemp"* ]] ||
+    fail "AC3 mktemp: final line must name the mktemp step and rc, got: $t1090_last"
+
+  set +e
+  ( T1090_SCP_SCENARIO=fail t1090_spawn ) >"$TMP/t1090-ac3c.out" 2>"$TMP/t1090-ac3c.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 1 ]] || fail "AC3 scp: scp rc must propagate, got $t1090_rc"
+  grep -qF 'scp: dest open' "$TMP/t1090-ac3c.err" ||
+    fail "AC3 scp: scp stderr missing: $(cat "$TMP/t1090-ac3c.err")"
+  t1090_last="$(tail -n 1 "$TMP/t1090-ac3c.err")"
+  [[ "$t1090_last" == *"rc=1"* && "$t1090_last" == *"scp"* ]] ||
+    fail "AC3 scp: final line must name the scp step and rc, got: $t1090_last"
+
+  # A refused probe is the failure that produced the incident's bare rc=1 line:
+  # the probe reason and the remote's stderr must be named, the step is 'probe'.
+  set +e
+  ( T1090_SSH_SCENARIO=probe-herdr-missing t1090_spawn ) >"$TMP/t1090-ac3d.out" 2>"$TMP/t1090-ac3d.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 1 ]] || fail "AC3 probe: expected rc=1, got $t1090_rc"
+  grep -qF 'herdr: command not found' "$TMP/t1090-ac3d.err" ||
+    fail "AC3 probe: remote probe stderr dropped: $(cat "$TMP/t1090-ac3d.err")"
+  grep -q 'remote-full' "$TMP/t1090-ac3d.err" ||
+    fail "AC3 probe: refusal reason missing: $(cat "$TMP/t1090-ac3d.err")"
+  t1090_last="$(tail -n 1 "$TMP/t1090-ac3d.err")"
+  [[ "$t1090_last" == *"rc=1"* && "$t1090_last" == *"probe"* ]] ||
+    fail "AC3 probe: final line must name the probe step and rc, got: $t1090_last"
+  echo "PASS t1090 AC3 failed-steps-named"
+
+  # AC4: the success path is byte-identical to main — the annotated OK line on
+  # stdout, nothing on stderr, rc 0.
+  set +e
+  ( t1090_spawn ) >"$TMP/t1090-ac4.out" 2>"$TMP/t1090-ac4.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] || fail "AC4: success rc must stay 0, got $t1090_rc"
+  printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1090-ac4.want"
+  cmp -s "$TMP/t1090-ac4.want" "$TMP/t1090-ac4.out" ||
+    fail "AC4: success stdout differs from the pinned OK line: $(cat "$TMP/t1090-ac4.out")"
+  [[ ! -s "$TMP/t1090-ac4.err" ]] ||
+    fail "AC4: success stderr must stay empty: $(cat "$TMP/t1090-ac4.err")"
+  echo "PASS t1090 AC4 success-byte-identical"
+
+  # AC5 invariants as assertion-RED mutants.
+  # M1 'a remote failure is never silent': dropping the stderr relay and the
+  # failure-mode stdout routing must turn AC1 red.
+  T1090_M1="$TMP/t1090-wrk-no-relay"
+  # shellcheck disable=SC2016 # the sed patterns are bin/wrk source text, not expansions
+  sed -e 's/spillover_relay_remote_err "\$remote_err"/:/' \
+      -e 's/spillover_emit_host "\$host" "\$out" "\$rc"/spillover_emit_host "$host" "$out"/' \
+      "$WRK" >"$T1090_M1"
+  chmod +x "$T1090_M1"
+  # shellcheck disable=SC2016 # the grep pattern is bin/wrk source text
+  grep -qF 'spillover_emit_host "$host" "$out"' "$T1090_M1" || fail 'M1 mutant did not apply'
+  set +e
+  ( T1090_WRK="$T1090_M1" T1090_SSH_SCENARIO=remote-die-stderr t1090_spawn ) >"$TMP/t1090-m1.out" 2>"$TMP/t1090-m1.err"
+  set -e
+  if grep -qF "hk task 1037 is already bound to job 'other-job'" "$TMP/t1090-m1.err"; then
+    fail "M1: dropping the remote relay must turn AC1 red, but the die line survived"
+  fi
+  echo "PASS t1090 M1: silent-failure mutant goes RED (AC1 assertion: remote die line absent from stderr)"
+
+  # M2 'the success path is unchanged': also forwarding remote stdout to stderr
+  # on a successful leg must turn AC4 red.
+  T1090_M2="$TMP/t1090-wrk-stdout-forward"
+  # shellcheck disable=SC2016 # the sed pattern is bin/wrk source text, not an expansion site
+  sed 's/spillover_emit_host "\$host" "\$out" "\$rc"/cat "\$out" >\&2; spillover_emit_host "$host" "$out" "$rc"/' \
+      "$WRK" >"$T1090_M2"
+  chmod +x "$T1090_M2"
+  # shellcheck disable=SC2016 # the grep pattern is mutant source text
+  grep -qF 'cat "$out" >&2' "$T1090_M2" || fail 'M2 mutant did not apply'
+  set +e
+  ( T1090_WRK="$T1090_M2" t1090_spawn ) >"$TMP/t1090-m2.out" 2>"$TMP/t1090-m2.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] || fail "M2: mutant spawn itself failed (rc=$t1090_rc)"
+  if cmp -s "$TMP/t1090-ac4.want" "$TMP/t1090-m2.out" && [[ ! -s "$TMP/t1090-m2.err" ]]; then
+    fail "M2: forwarding stdout on success must turn AC4 red, but output stayed identical"
+  fi
+  echo "PASS t1090 M2: stdout-on-success mutant goes RED (AC4 assertion: stderr no longer empty)"
+}
+
+# Slice gate: WRK_TEST_ONLY_REMOTE_ERR=1 runs only this section after the
+# shared fixture setup — the remote legs are fakes, so no real ssh/spawn runs.
+if [[ "${WRK_TEST_ONLY_REMOTE_ERR:-0}" -eq 1 ]]; then
+  run_t1090_remote_err_tests
+  exit 0
+fi
+run_t1090_remote_err_tests
+
 run_hub_quota_gate_tests() {
   local configured="$TMP/hub-quota-hosts.toml"
   local unconfigured="$TMP/hub-quota-no-hub.toml"
