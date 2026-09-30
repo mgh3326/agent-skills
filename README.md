@@ -315,6 +315,18 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 — 억제는 건수가 아니라 "이 report artifact의 완료가 이미 기록됐는가"의 멤버십 판정이다.
 내용이 바뀐 report는 새 라운드로 별개 레코드가 된다.
 
+같은 경로로 갱신된 후속 라운드는 panewire emit의 outbox 키
+`(kind, job, epoch, report_path, reason)`가 이전 레코드와 충돌해 rc 6으로 거부되므로,
+`wrk done`·센티널은 바뀐 내용을 같은 디렉터리의 `<stem>-r<N>.md`
+(N = 이 잡의 기록된 완료 라운드 수 + 1)로 스냅샷하고 레코드·handoffkeep 문서
+업로드·emit·OK 줄 모두 그 새 경로를 쓴다 — 원본 report 파일은 건드리지 않는다.
+이미 새 경로를 가리키는 `--report`(예: `report-r2.md`)는 있는 그대로 relay되고,
+`panewire emit`이 비0으로 끝나면 경고 한 줄에 job·report 경로·rc를 밝히고 OK 줄에
+`relay=file-only`를 붙인다(레코드·종료 처리·exit status는 그대로다).
+이 자동 스냅샷은 이 변경을 포함한 agent-skills가 설치된 곳에서만 적용된다
+— 그때까지는 후속 라운드 report를 `report-r<N>.md`로 쓰고 그 경로를
+`wrk done`에 넘겨라(명시한 새 경로는 있는 그대로 relay된다).
+
 **빈 값은 소멸의 증거가 아니다.** 2026-09-04 소켓 일시 정지와 비기본 herdr 세션
 때문에 그날 스폰한 거의 모든 잡이 스폰 30초 뒤 `job.lost`로 찍혔고, 센티널이 죽어
 워커가 정상 완료해도 `job.completed`를 아무도 쓰지 못했다(수동 전달 3회).
