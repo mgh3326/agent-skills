@@ -599,6 +599,60 @@ run_t1090_remote_err_tests() {
     fail "R1 auto-transport-2: desktop scp attempt missing from the fixture log"
   echo "PASS t1090 R1 auto-transport-rc2-fails-over"
 
+  # R1-D: probe rc fidelity — an ssh probe exiting 2 (a router fail-closed
+  # code) must report the real rc=2 on the probe line while the returned rc
+  # stays normalized to 1, so the explicit final line keeps main's shape.
+  set +e
+  ( T1090_SSH_SCENARIO=probe-exit2 t1090_spawn ) >"$TMP/t1090-p2.out" 2>"$TMP/t1090-p2.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 1 ]] || fail "R1 probe-rc2: expected rc=1, got $t1090_rc"
+  grep -q "probe failed (ssh-unreachable, rc=2)" "$TMP/t1090-p2.err" ||
+    fail "R1 probe-rc2: probe line must carry the real ssh rc=2: $(cat "$TMP/t1090-p2.err")"
+  grep -q "remote spawn on explicit host 'desktop' failed (rc=1) at step 'probe'" "$TMP/t1090-p2.err" ||
+    fail "R1 probe-rc2: router-visible rc must stay normalized to 1: $(cat "$TMP/t1090-p2.err")"
+  echo "PASS t1090 R1 probe-rc2-fidelity"
+
+  # R2-A: the winner's own stderr is not sacrificed to the capture — a remote
+  # wrk that warns on stderr and succeeds must surface that line on a
+  # successful auto spawn (main streamed it live), while the skipped host's
+  # diagnostics stay dropped.
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1090_SSH_SCENARIO_MAC_WORK=remote-warn-ok t1090_spawn ) >"$TMP/t1090-auto4.out" 2>"$TMP/t1090-auto4.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "R2 winner-stderr: expected rc=0, got $t1090_rc: $(cat "$TMP/t1090-auto4.err")"
+  cmp -s "$TMP/t1090-auto1.want" "$TMP/t1090-auto4.out" ||
+    fail "R2 winner-stderr: stdout differs from the pinned mac-work OK line: $(cat "$TMP/t1090-auto4.out")"
+  printf '%s\n' 'wrk: note: remote herdr quota nearly full on mac-work' >"$TMP/t1090-auto4.want"
+  cmp -s "$TMP/t1090-auto4.want" "$TMP/t1090-auto4.err" ||
+    fail "R2 winner-stderr: stderr must equal the winner's live stream: $(cat "$TMP/t1090-auto4.err")"
+  echo "PASS t1090 R2 winner-stderr-replayed"
+
+  # R2 mutant — invariant "a successful auto spawn keeps the winner's own
+  # stderr": dropping the winner's replay must turn R2-A red.
+  T1090_M4="$TMP/t1090-wrk-no-winner-replay"
+  # shellcheck disable=SC2016 # the sed pattern is bin/wrk source text, not an expansion site
+  sed 's/ cat "\$cand_err" >&2/ :/' "$WRK" >"$T1090_M4"
+  chmod +x "$T1090_M4"
+  # shellcheck disable=SC2016 # the grep pattern is literal bin/wrk source text
+  grep -qF 'cat "$cand_err" >&2' "$T1090_M4" && fail 'R2 mutant did not apply: winner replay still present'
+  set +e
+  ( T1090_WRK="$T1090_M4" T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1090_SSH_SCENARIO_MAC_WORK=remote-warn-ok t1090_spawn ) >"$TMP/t1090-m4.out" 2>"$TMP/t1090-m4.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] || fail "R2 mutant: the spawn itself should still succeed (rc=$t1090_rc)"
+  grep -q 'quota nearly full' "$TMP/t1090-m4.err" &&
+    fail "R2 mutant: winner stderr survived without the replay — mutant did not diverge"
+  echo "PASS t1090 R2 mutant: no-replay mutant goes RED (R2-A assertion: winner's stderr missing)"
+
   # R1 mutant — invariant "a successful auto spawn prints nothing about
   # skipped hosts": printing the captured diagnostics eagerly (dropping the
   # per-candidate stderr capture) must turn R1-A red.

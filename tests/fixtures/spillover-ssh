@@ -30,6 +30,12 @@ if [[ "$remote" == *'uptime; herdr agent list'* ]]; then
     printf '%s\n' "ssh: connect to host $host port 22: Operation timed out" >&2
     exit 255
   fi
+  if [[ "$scenario" == probe-exit2 ]]; then
+    # An ssh transport exit landing in the router's fail-closed admission set
+    # (2/74/75): the probe line must still report the real rc.
+    printf '%s\n' "ssh: connect to host $host port 22: remote-side refused (exit 2)" >&2
+    exit 2
+  fi
   if [[ "$scenario" == probe-herdr-missing ]]; then
     printf '%s\n' ' 10:00 up 1 day,  load average: 0.10, 0.10, 0.10'
     printf '%s\n' 'sh: herdr: command not found' >&2
@@ -82,6 +88,11 @@ if [[ "$remote" == *'wrk spawn'* ]]; then
       printf '%s\n' "wrk: remote stdout detail for task 1037"
       printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: hk task 1037 is already bound to job 'other-job' — a task linked to another job cannot be re-spawned (fail-closed)}" >&2
       exit "${WRK_REMOTE_RC:-1}"
+      ;;
+    remote-warn-ok)
+      # A winning remote wrk may still talk on stderr (quota notes, warnings);
+      # on main that text streamed live even when the spawn succeeded.
+      printf '%s\n' "wrk: note: remote herdr quota nearly full on $host" >&2
       ;;
   esac
 fi

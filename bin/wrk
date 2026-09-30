@@ -5790,7 +5790,9 @@ spillover_probe_host() {
   if [[ "$rc" -ne 0 ]]; then
     SPILL_PROBE_REASON="ssh-unreachable"
     SPILL_PROBE_ERR="$(cat "$probe_err" 2>/dev/null)"
-    SPILL_PROBE_RC="$(spillover_transport_rc "$rc")"
+    # The real ssh rc (255 for a dead host, 2 for a remote-side refusal) is
+    # what the probe line reports; try_candidate normalizes it for the router.
+    SPILL_PROBE_RC="$rc"
     rm -f "$probe_err"
     return 1
   fi
@@ -6369,7 +6371,10 @@ spillover_try_candidate() {
     else
       echo "wrk: remote host '$candidate' probe failed (${SPILL_PROBE_REASON}, rc=$SPILL_PROBE_RC)" >&2
     fi
-    rc="$SPILL_PROBE_RC"
+    # The probe is a transport leg: report the real ssh rc above, return a
+    # normalized rc so 2/74/75 cannot collide with the router's fail-closed
+    # admission codes.
+    rc="$(spillover_transport_rc "$SPILL_PROBE_RC")"
   else
     if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "$@"; then rc=0; else rc=$?; fi
   fi
@@ -6567,6 +6572,10 @@ spawn_router_cmd() {
       # if-context keeps the callee's internal set -e toggles from arming
       # errexit on its nonzero return.
       if ( spillover_try_candidate 1 "$candidate" "$cwd" "$prompt" "${filtered[@]}" ) 2>"$cand_err"; then
+        # Only the skipped candidates' diagnostics are dropped: the winner's
+        # own stderr (remote wrk warnings, scp chatter) replays verbatim, as
+        # it streamed live on main.
+        cat "$cand_err" >&2
         rm -f "$cand_err" "$auto_diag"
         return 0
       else
