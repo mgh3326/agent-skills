@@ -306,6 +306,15 @@ completion sentinel과 다른 절차이며, wait 종료는 보고서 검증이 �
   그 표시가 사라진 뒤에만 제출한다. 🔴 grok 의 queued 푸터는 공유 화면에서
   페이로드 귀속이 불가하므로 착지 주장은 배너가 아니라 소비 마커로 한다 — 배너·
   소비 마커 원문의 정본은 relay-handoff §3-2 하네스별 제출 마커 표다.
+- **fix·재작업 라운드의 보고 경로는 그대로 둬도 된다(#1014).** 워커가 같은
+  report 경로(`report.md`)를 갱신해 `wrk done` 하면, 바뀐 내용은 자동으로
+  `<stem>-r<N>.md` 스냅샷 경로로 레코드·업로드·relay 된다 — 같은 경로+다른
+  내용의 `job.completed`는 panewire emit의 outbox 키 `(kind, job, epoch,
+  report_path, reason)` 충돌로 rc 6 거부되기 때문이다. 후속 라운드 지시에
+  새 보고 경로를 요구할 필요가 없고, emit이 실패하면 `wrk done`의 OK 줄은
+  `relay=file-only`를 보인다. 이 자동 스냅샷은 이 변경이 설치된 agent-skills에만
+  적용된다 — 그 전까지는 워커에게 `report-r<N>.md`를 직접 쓰고 그 경로를
+  `wrk done`에 넘기라고 지시한다(명시한 새 경로는 있는 그대로 relay된다).
 
 ## 운영자 확인의 출처
 

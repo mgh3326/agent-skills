@@ -119,6 +119,28 @@ Run 'wrk <command> --help' for command-specific usage.
 USAGE
 }
 
+done_help() {
+  cat <<'USAGE'
+Usage: wrk done JOB [--report PATH]
+
+Write a job.completed record for JOB, upload the report as a handoffkeep
+document, and emit the relay event to the owner lane.
+
+Options:
+  --report PATH      existing report file (default: newest report*.md in the
+                     job directory). A re-completion with unchanged content is
+                     suppressed as a duplicate. When the content changed but
+                     PATH already names an earlier completed round, the
+                     current content is snapshot to <stem>-r<N>.md (N = 1 +
+                     earlier completed rounds) and the record, upload, emit
+                     and OK line all name that new path — the relay key stays
+                     unique and the original file is untouched.
+                     If the emit returns non-zero the OK line ends with
+                     relay=file-only.
+  -h, --help         show this usage
+USAGE
+}
+
 escalate_help() {
   cat <<'USAGE'
 Usage: wrk escalate JOB --question TEXT [--report PATH]
@@ -3451,8 +3473,18 @@ ensure_settings_local_ignored() {
     warn "$cwd/.claude/settings.local.json is still not git-ignored after updating info/exclude — do not commit it"
 }
 
+# completion_event JOB OWNER LABEL PANE REPORT [KIND] [REASON] [MODE]
+#
+# MODE=record (default) writes the durable event file and prints "created"
+# plus the report path the record names, or "duplicate" when an identical
+# report was already completed. MODE=resolve runs the same decisions under
+# the same lock but writes nothing: it prints "duplicate", or "resolved" plus
+# the target path — REPORT itself, or a freshly created <stem>-r<N>.md
+# snapshot of its content when REPORT already names an earlier completed
+# round. done_cmd resolves first so the document upload, the record, the
+# relay emit and the OK line all name one artifact.
 completion_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}" reason="${7:-}"
+  local job="$1" owner="$2" label="$3" pane="$4" report="$5" kind="${6:-job.completed}" reason="${7:-}" mode="${8:-record}"
   local events host last
   events="$(wrk_jobs_root)/$job/events"
   host="${HOSTNAME:-unknown}"
@@ -3463,9 +3495,9 @@ completion_event() {
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" <<'PY'
-import fcntl, hashlib, json, os, sys, tempfile, time
-events, job, owner, label, pane, host, report, last, kind, reason = sys.argv[1:]
+  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" "$mode" <<'PY'
+import fcntl, hashlib, json, os, re, sys, tempfile, time
+events, job, owner, label, pane, host, report, last, kind, reason, mode = sys.argv[1:]
 
 
 def digest_of(path):
@@ -3481,11 +3513,23 @@ def digest_of(path):
 # sentinel are separate processes racing on this directory, so the membership
 # check and the record write run inside one lock; the lockfile lives next to
 # events/ because the directory is also a consumer-facing record stream.
-digest = digest_of(report) if kind == "job.completed" else None
+# The bytes are read once: the digest and the snapshot below are computed from
+# and written with this same payload, so a record never names a snapshot whose
+# sha256 differs from report_sha256 even if report.md is rewritten mid-call.
+payload = None
+digest = None
+if kind == "job.completed":
+    try:
+        with open(report, 'rb') as f:
+            payload = f.read()
+        digest = hashlib.sha256(payload).hexdigest()
+    except OSError:
+        pass
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     if digest is not None:
+        priors = []
         for name in sorted(os.listdir(events)):
             if not name.endswith("-job.completed.json"):
                 continue
@@ -3496,6 +3540,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                 continue
             if prior.get("kind") != "job.completed":
                 continue
+            priors.append(prior)
             prior_digest = prior.get("report_sha256")
             # A legacy record carries no content identity, and no filesystem
             # proxy can reconstruct it — a rewritten file can keep an old
@@ -3507,6 +3552,58 @@ with open(lock_path, "w", encoding="utf-8") as lock:
             if prior_digest == digest:
                 print("duplicate")
                 sys.exit(0)
+        # panewire's relay outbox key is (kind, job, epoch, report_path,
+        # reason): a later round that reuses an earlier record's report path
+        # with changed content collides on that key and its emit is refused
+        # (rc 6), leaving the completion file-only. Rename the artifact, not
+        # the epoch: snapshot the current content to <stem>-r<N><ext> (N = 1 +
+        # this job's earlier distinct completed rounds) so the record the
+        # daemon rescans and the emit both carry a fresh key. The name is
+        # published by hard-link, never overwriting an existing file; an
+        # identical-content file already there is this same decision's
+        # leftover from a lost race and is adopted as-is.
+        used_paths = {p.get("report_path") for p in priors}
+        if report in used_paths:
+            stem, ext = os.path.splitext(os.path.basename(report))
+            stem = re.sub(r"-r[0-9]+$", "", stem)
+            rounds = sum(1 for p in priors if not p.get("report_sha256"))
+            rounds += len({p["report_sha256"] for p in priors if p.get("report_sha256")})
+            directory = os.path.dirname(report) or "."
+            n = rounds + 1
+            while True:
+                candidate = os.path.join(directory, "%s-r%d%s" % (stem, n, ext))
+                if candidate in used_paths:
+                    n += 1
+                    continue
+                if os.path.exists(candidate):
+                    if digest_of(candidate) == digest:
+                        report = candidate
+                        break
+                    n += 1
+                    continue
+                temporary = None
+                try:
+                    fd, temporary = tempfile.mkstemp(prefix='.report-', dir=directory)
+                    with os.fdopen(fd, 'wb') as out:
+                        out.write(payload)
+                    os.link(temporary, candidate)
+                    report = candidate
+                except FileExistsError:
+                    if digest_of(candidate) == digest:
+                        report = candidate
+                        break
+                    n += 1
+                    continue
+                except OSError:
+                    pass  # unsnapshotable dir or unreadable report: keep the path
+                finally:
+                    if temporary is not None and os.path.exists(temporary):
+                        os.unlink(temporary)
+                break
+    if mode == "resolve":
+        print("resolved")
+        print(report)
+        sys.exit(0)
     highest = 0
     for name in os.listdir(events):
         try: highest = max(highest, int(name.split('-', 1)[0]))
@@ -3529,6 +3626,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     finally:
         if os.path.exists(temporary): os.unlink(temporary)
 print("created")
+print(report)
 PY
 }
 
@@ -3555,6 +3653,10 @@ note_duplicate_completion() {
 # only the trailing newlines are dropped — anything else and the emit payload
 # stops being byte-identical to the record file the node also reads.
 EMIT_REPORT_LAST_LINE=""
+# Non-zero when this invocation's `panewire emit` returned non-zero (the other
+# non-delivery modes — missing binary, wedged daemon — keep their warning-only
+# shape). done_cmd reads it to mark the OK line relay=file-only.
+EMIT_RELAY_RC=0
 set_report_last_line() {
   local report="${1:-}"
   EMIT_REPORT_LAST_LINE=""
@@ -3622,6 +3724,7 @@ emit_relay_event() {
   local kind="$1" job="$2" owner="$3" label="$4" pane="$5" host="$6" report="$7"
   local last="$8" reason="$9" question="${10}" pr="${11}" head="${12}"
   local panewire rc=0
+  EMIT_RELAY_RC=0
   # #770 round-2: a panewire subprocess that was just killed by its timeout is
   # wedged — re-entering it for emit would stall this call by another full
   # emit guard (tester: sleeping stub made `wrk done` take delegate-timeout +
@@ -3659,7 +3762,8 @@ emit_relay_event() {
   # so the caller's single OK line stays the only thing on it.
   "${command[@]}" >/dev/null 2>&1 || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    warn "panewire emit failed (rc=$rc job=$job kind=$kind); relay event left as file only"
+    EMIT_RELAY_RC="$rc"
+    warn "panewire emit failed (rc=$rc job=$job kind=$kind report=$report); relay event left as file only"
     record_emit_failure "$job" "$kind" "$rc"
   fi
   return 0
@@ -3808,7 +3912,11 @@ delegate_job_cmd() {
 }
 
 done_cmd() {
-  delegate_job_cmd 'done' "$@"
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+    done_help
+    return 0
+  fi
   local job="${1:-}" report=""
   [[ -n "$job" && "$job" != -* ]] || die "done requires a job id"
   shift || true
@@ -3829,10 +3937,15 @@ done_cmd() {
     report="$(find_latest_report "$jobs_root/$job")"
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
-  upload_report_document "$job" "$report"
-  local completion_status
-  completion_status="$(completion_event "$job" "$owner" "$label" "$pane" "$report")"
-  if [[ "$completion_status" == duplicate ]]; then
+  # Decide the artifact path before delegating or uploading: a changed report
+  # that reuses an earlier round's path is snapshot to <stem>-r<N>.md so its
+  # outbox key is fresh. Delegation comes after resolution because
+  # `panewire job done` records and emits whatever --report it is handed —
+  # forwarding the caller's unchanged path would collide on the earlier
+  # round's outbox key all over again (#1014 fix round).
+  local resolution
+  resolution="$(completion_event "$job" "$owner" "$label" "$pane" "$report" job.completed "" resolve)"
+  if [[ "$resolution" == duplicate ]]; then
     note_duplicate_completion "$job" "$report"
     warn "job.completed already recorded for this report; suppressed duplicate (job=$job)"
     # #770: duplicate or not, done means the job is over — stop the sentinel
@@ -3841,14 +3954,33 @@ done_cmd() {
     echo "OK job=$job report=$report"
     return 0
   fi
+  [[ "$resolution" == resolved*$'\n'* ]] || die "done: unexpected resolve output: $resolution"
+  report="${resolution#*$'\n'}"
+  delegate_job_cmd 'done' "$job" --report "$report"
+  upload_report_document "$job" "$report"
+  local completion_out completion_status
+  completion_out="$(completion_event "$job" "$owner" "$label" "$pane" "$report")"
+  completion_status="${completion_out%%$'\n'*}"
+  if [[ "$completion_status" == duplicate ]]; then
+    # A racer (the completion sentinel, or a second done) recorded this exact
+    # report between the resolve above and this write; its record stands.
+    note_duplicate_completion "$job" "$report"
+    warn "job.completed already recorded for this report; suppressed duplicate (job=$job)"
+    job_end_housekeeping "$job" "$owner" completed "wrk done (duplicate report)" "wrk done"
+    echo "OK job=$job report=$report"
+    return 0
+  fi
+  report="${completion_out#*$'\n'}"
   set_report_last_line "$report"
   emit_relay_event job.completed "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "" "" "" ""
+  local relay_suffix=""
+  [[ "${EMIT_RELAY_RC:-0}" == 0 ]] || relay_suffix=" relay=file-only"
   # #770: end the hub job, release quota, and stop + wait on the completion
   # sentinel. Runs after the relay emit so the completed record is the first
   # thing panewire sees.
   job_end_housekeeping "$job" "$owner" completed "wrk done" "wrk done"
-  echo "OK job=$job report=$report"
+  echo "OK job=$job report=$report$relay_suffix"
 }
 
 builder_flat_event() {
