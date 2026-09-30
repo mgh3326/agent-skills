@@ -580,6 +580,8 @@ heavy_max = 1              # 이 머신의 wrk heavy 동시 홀더 수: 0=금지
 hub_url = "wss://<hub-host>"
 hub_token_env = "<path-to-token-env-file>"
 hub_cf_env = "<path-to-cf-env-file>"   # 선택 사항
+lanes_token_env = "<path-to-node-token-file>"  # 선택 사항 — lanes 전용 노드 토큰
+session_machine_ids = {"<non-fleet-session>" = "<hub-machine-id>"}  # 선택 사항 — 레인 자동 등록
 
 [hosts.<remote-name>]
 ssh = "<ssh-alias>"
@@ -611,6 +613,14 @@ wake = "panewire"
   다음 후보 탐색을 막지 않는다.
 - `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
+- `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600
+  `HUB_MACHINE_ID`/`HUB_TOKEN`)이다. 설정하면 `panewire lanes add/ls/rm`만 이 경로를
+  `--hub-token-env`로 쓰고, quota gate·placement·wake·hub spawn 같은 다른 허브 경로는 계속
+  `hub_token_env`만 읽는다 — 이 파일은 operator route에 닿지 않는다. wrk는 파일에서
+  `HUB_MACHINE_ID` 한 줄만 읽어 `session_machine_ids`의 머신과 다르면 등록을 한 번 경고하고
+  건너뛴다(허브가 403 할 요청); `HUB_TOKEN`은 절대 읽거나 출력하지 않는다. `hub_token_env`
+  없이 `hub_url`+`lanes_token_env`만 둔 lanes-only `[hub]`는 quota gate를 켜지 않는다 —
+  게이트의 opt-in은 오직 `hub_token_env`다.
 - `--host local`은 운영자 강제 로컬, `--host <remote-name>`은 강제 원격이다. 둘 다 hub 판정을
   우회하므로 장애 대응·진단에만 쓴다. 강제 원격은 실패해도 로컬로 폴백하지 않고 원격의
   exit code를 그대로 전파한다 — 로컬 폴백은 `--host auto`에서만 일어난다.

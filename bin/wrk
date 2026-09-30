@@ -289,10 +289,19 @@ session (WRK_SENTINEL_HERDR_SESSION, else HERDR_SESSION, else the herdr
 default) has an entry in hosts.toml's [hub] session_machine_ids registers a
 lane for the pane on that session's daemon —
 `panewire lanes add LABEL --machine ID --pane PANE --parent OWNER` with the
-[hub] hub_url/hub_token_env/hub_cf_env credentials (paths only; wrk never
-reads them). The OK line then ends with lane=LABEL@ID and the job.spawned
-meta records hub_lane/hub_lane_machine; `wrk reap --apply` removes the lane
-with `panewire lanes rm`. An unmapped session or a missing --owner warns once
+[hub] credentials: hub_url plus lanes_token_env when set, else hub_token_env
+(hub_cf_env optional). The values are file paths panewire opens; wrk reads
+only a lanes token's HUB_MACHINE_ID line — to skip a registration the hub
+would refuse when it differs from the session's mapped machine — and never
+prints file contents. lanes_token_env (#1037) is a node-scoped token that
+may reach only the lanes routes: this registration, reap's `lanes rm`, and
+the `lanes ls` confirmation. No other hub path (quota gate, placement,
+spill-over wake, hub spawn) reads it, and a [hub] section with hub_url and
+lanes_token_env but no hub_token_env does not opt into the hub quota gate —
+only a configured hub_token_env switches that on. The OK line then ends
+with lane=LABEL@ID and the job.spawned meta records
+hub_lane/hub_lane_machine; `wrk reap --apply` removes the lane with
+`panewire lanes rm`. An unmapped session or a missing --owner warns once
 and spawns unregistered — as does a panewire failure; the spawn never fails
 over it and builder lanes are never touched (they stay the director's).
 `panewire lanes-audit` lists any leftover rows.
@@ -1602,13 +1611,17 @@ quota_hub_policy_gate() {
   token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
 
-  # No hub keys means this installation has not opted in. Preserve the exact
-  # pre-hub local-only path. A partial configuration is different: silently
-  # treating it as absent would turn an operator error into permissive policy.
-  if [[ -z "$hub_url" && -z "$token_env" && -z "$cf_env" ]]; then
+  # Only the operator credential opts this gate in: a configured
+  # hub_token_env means this installation enabled hub quota policy.
+  # hub_url/hub_cf_env without it — and a lanes-only lanes_token_env, which
+  # this gate never reads (#1037: a node token may serve the lanes routes
+  # only) — preserve the exact pre-hub local-only path. A partial operator
+  # config is different: hub_token_env without hub_url is an operator error,
+  # and silently treating it as absent would turn it into permissive policy.
+  if [[ -z "$token_env" ]]; then
     return 0
   fi
-  if [[ -z "$hub_url" || -z "$token_env" ]]; then
+  if [[ -z "$hub_url" ]]; then
     echo "wrk: hub quota gate configuration is incomplete; refusing local fallback" >&2
     return 70
   fi
@@ -5453,6 +5466,7 @@ hub_lane_register() {
   HUB_LANE="" HUB_LANE_MACHINE=""
   [[ "$ROLE" == worker ]] || return 0
   local session raw machine machine_rc=0 panewire hub_url token_env cf_env rc=0
+  local lanes_env lanes_machine
   local args=()
   session="${WRK_SENTINEL_HERDR_SESSION:-${HERDR_SESSION:-default}}"
   raw="$(spillover_value hub session_machine_ids 2>/dev/null || true)"
@@ -5489,11 +5503,28 @@ hub_lane_register() {
     return 0
   fi
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
-  token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  # #1037: a dedicated lanes credential — a node token bound to this host's
+  # own machine id — wins over the shared operator file. It may reach only
+  # the lanes routes; every other hub path keeps hub_token_env.
+  token_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
+  lanes_env="$token_env"
+  [[ -n "$token_env" ]] || token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   if [[ -z "$hub_url" || -z "$token_env" ]]; then
-    warn "hub lane not registered (hub_url/hub_token_env missing from hosts.toml [hub])"
+    warn "hub lane not registered (hub_url missing or neither hub_token_env nor lanes_token_env set in hosts.toml [hub])"
     return 0
+  fi
+  # A lanes credential authorizes lanes on its own HUB_MACHINE_ID only — with
+  # a different machine the hub refuses the add (lane_machine_mismatch), so
+  # compare first and skip. The file is read for that one assignment through
+  # spillover_env_key, never sourced; HUB_TOKEN is never matched or printed.
+  # An unreadable/unset key falls through to panewire's own loader error.
+  if [[ -n "$lanes_env" ]]; then
+    lanes_machine="$(spillover_env_key "$lanes_env" HUB_MACHINE_ID 2>/dev/null || true)"
+    if [[ -n "$lanes_machine" && "$lanes_machine" != "$machine" ]]; then
+      warn "hub lane not registered (lanes_token_env HUB_MACHINE_ID '$lanes_machine' does not match the session's machine '$machine')"
+      return 0
+    fi
   fi
   panewire="${PANEWIRE_BIN:-panewire}"
   if [[ "$panewire" == */* ]]; then
@@ -5505,7 +5536,8 @@ hub_lane_register() {
     warn "hub lane not registered (panewire unavailable)"
     return 0
   fi
-  # The token env values go to panewire as FILE PATHS; wrk never opens them.
+  # The token env values go to panewire as FILE PATHS; wrk itself opens only
+  # the lanes token's HUB_MACHINE_ID line, for the mismatch check above.
   args=(lanes add "$LABEL" --machine "$machine" --pane "$PANE" --parent "$OWNER"
         --hub-url "$hub_url" --hub-token-env "$token_env")
   [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
@@ -5540,10 +5572,14 @@ hub_lane_remove() {
     return 0
   fi
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
-  token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  # Same credential rule as registration (#1037): lanes_token_env when set,
+  # else hub_token_env. The node token's own `lanes ls` is already
+  # machine-scoped hub-side, so no further check is needed here.
+  token_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
+  [[ -n "$token_env" ]] || token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   if [[ -z "$hub_url" || -z "$token_env" ]]; then
-    warn "hub lane '$lane' not removed (hub_url/hub_token_env missing from hosts.toml [hub])"
+    warn "hub lane '$lane' not removed (hub_url missing or neither hub_token_env nor lanes_token_env set in hosts.toml [hub])"
     return 0
   fi
   panewire="${PANEWIRE_BIN:-panewire}"
@@ -7238,10 +7274,11 @@ closed job records a flat job.reaped event (pane_id, tab_id, at).
 A job whose newest job.spawned receipt records a hub lane (hub_lane; spawned
 under a session mapped in hosts.toml's [hub] session_machine_ids, #965) is
 additionally deregistered on --apply: `panewire lanes rm LANE` with the [hub]
-credentials runs once the tab close is confirmed — and only while `panewire
-lanes ls` still shows the row bound to the recorded machine+pane (a reused
-label's newer row is never removed). A removal failure warns and the close
-still stands; `panewire lanes-audit` lists any leftover rows.
+lane credentials (lanes_token_env when set, else hub_token_env) runs once
+the tab close is confirmed — and only while `panewire lanes ls` still shows
+the row bound to the recorded machine+pane (a reused label's newer row is
+never removed). A removal failure warns and the close still stands;
+`panewire lanes-audit` lists any leftover rows.
 USAGE
 }
 

@@ -514,6 +514,52 @@ PY
     fail "hub-unconfigured path changed local gate stdout"
   echo "PASS hub-quota-unconfigured-preserves-local-only"
 
+  # #1037: the opt-in is the operator credential alone — a configured
+  # hub_token_env. hub_url (with or without hub_cf_env) and a lanes-only
+  # lanes_token_env must not switch the gate on: they run the exact
+  # local-only path above. (Before #1037 any hub key opted in, so each of
+  # these used to refuse every spawn with rc 70.)
+  local url_only="$TMP/hub-quota-url-only.toml"
+  local url_cf="$TMP/hub-quota-url-cf.toml"
+  local lanes_only="$TMP/hub-quota-lanes-only.toml"
+  local token_only="$TMP/hub-quota-token-only.toml"
+  printf '[hub]\nhub_url = "https://hub.invalid"\n' >"$url_only"
+  printf '[hub]\nhub_url = "https://hub.invalid"\nhub_cf_env = "%s"\n' "$cf_file" >"$url_cf"
+  printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\n' "$token_file" >"$lanes_only"
+  printf '[hub]\nhub_token_env = "%s"\n' "$token_file" >"$token_only"
+
+  hub_quota_run_case url-only-local-0 70 ok "$url_only"
+  hub_quota_expect_rc url-only-local-0 0
+  hub_quota_expect_spawn url-only-local-0 1
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "hub_url without a token key invoked panewire"
+  echo "PASS hub-quota-url-only-stays-local"
+
+  hub_quota_run_case url-cf-local-0 70 ok "$url_cf"
+  hub_quota_expect_rc url-cf-local-0 0
+  hub_quota_expect_spawn url-cf-local-0 1
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "hub_url+hub_cf_env without hub_token_env invoked panewire"
+  echo "PASS hub-quota-url-cf-stays-local"
+
+  hub_quota_run_case lanes-only-local-0 70 ok "$lanes_only"
+  hub_quota_expect_rc lanes-only-local-0 0
+  hub_quota_expect_spawn lanes-only-local-0 1
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "a lanes-only [hub] must not invoke panewire place"
+  echo "PASS hub-quota-lanes-only-never-opts-in"
+
+  # The genuinely partial gate config — hub_token_env without hub_url —
+  # keeps its rc-70 fail-closed refusal.
+  hub_quota_run_case token-no-url 0 ok "$token_only"
+  hub_quota_expect_rc token-no-url 70
+  hub_quota_expect_spawn token-no-url 0
+  grep -q 'hub quota gate configuration is incomplete' "$HUB_QUOTA_ERR" ||
+    fail "hub_token_env without hub_url must keep the incomplete-config refusal"
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "a partial gate config invoked panewire"
+  echo "PASS hub-quota-token-without-url-fails-closed"
+
   # The credential files are passed by path only. Neither their contents nor
   # panewire output can enter wrk's stdout, stderr, or spill-over audit log.
   for output in "$TMP"/hub-quota-*.out "$TMP"/hub-quota-*.err "$TMP"/hub-quota-*-spillover.log; do
@@ -558,6 +604,33 @@ chmod 000 "$LANES_TOKEN_FILE" "$LANES_CF_FILE"
 LANES_CFG_NOMAP="$TMP/lanes-nomap-hosts.toml"
 printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nhub_cf_env = "%s"\n' \
   "$LANES_TOKEN_FILE" "$LANES_CF_FILE" >"$LANES_CFG_NOMAP"
+
+# #1037: a dedicated lanes credential — a node token file (HUB_MACHINE_ID/
+# HUB_TOKEN) the lanes routes use instead of the operator file. Mode 0600,
+# not the 000 tripwire above: wrk reads its HUB_MACHINE_ID line for the
+# mismatch precheck, while HUB_TOKEN must still never reach any output.
+LANES_NODE_FILE="$TMP/lanes-node.env"
+LANES_NODE_TOKEN_VALUE="fixture-lanes-node-token-must-not-leak"
+printf 'HUB_MACHINE_ID=mac-work-default\nHUB_TOKEN=%s\n' "$LANES_NODE_TOKEN_VALUE" >"$LANES_NODE_FILE"
+chmod 600 "$LANES_NODE_FILE"
+LANES_NODE_OTHER_FILE="$TMP/lanes-node-other.env"
+LANES_NODE_OTHER_VALUE="fixture-lanes-node-other-must-not-leak"
+printf 'HUB_MACHINE_ID=mac-work-other\nHUB_TOKEN=%s\n' "$LANES_NODE_OTHER_VALUE" >"$LANES_NODE_OTHER_FILE"
+chmod 600 "$LANES_NODE_OTHER_FILE"
+# Lanes-only [hub]: hub_url + lanes_token_env + session_machine_ids — no
+# hub_token_env — must still register lanes yet never opt into the quota gate.
+LANES_CFG_NODE="$TMP/lanes-node-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nhub_cf_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$LANES_NODE_FILE" "$LANES_CF_FILE" >"$LANES_CFG_NODE"
+# Both credentials: the lanes routes take lanes_token_env while the quota
+# gate keeps hub_token_env.
+LANES_CFG_BOTH="$TMP/lanes-both-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nlanes_token_env = "%s"\nhub_cf_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$LANES_TOKEN_FILE" "$LANES_NODE_FILE" "$LANES_CF_FILE" >"$LANES_CFG_BOTH"
+# Same lanes-only shape, but the node token is bound to another machine.
+LANES_CFG_MISMATCH="$TMP/lanes-mismatch-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$LANES_NODE_OTHER_FILE" >"$LANES_CFG_MISMATCH"
 
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
@@ -618,7 +691,7 @@ lanes_reap_run() {
   set +e
   env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" \
     WRK_FIXTURE_SCENARIO=reap WRK_FIXTURE_LOG="$LANES_REAP_HERDR_LOG" \
-    WRK_HOSTS_CONFIG="$LANES_CFG" \
+    WRK_HOSTS_CONFIG="${LANES_REAP_CFG_OVERRIDE:-$LANES_CFG}" \
     WRK_PANEWIRE_LANES_LOG="$LANES_RM_LOG" \
     "${WRK_UNDER_TEST:-$WRK}" reap "$@" >"$LANES_REAP_OUT" 2>"$LANES_REAP_ERR"
   LANES_REAP_RC=$?
@@ -1099,6 +1172,175 @@ PY
     fail "#994 M3 mutant survived: the flag-shaped lane never reached argv"
   fi
   echo "PASS 994-lanes M3: dropping lane-name validation goes RED"
+
+  # ------------------------------------------------------------------
+  # #1037 — lanes_token_env: a lanes-only credential that never gates
+  # ------------------------------------------------------------------
+  # AC1 — a lanes-only [hub] (hub_url + lanes_token_env + session_machine_ids,
+  # no hub_token_env) still registers the lane, with the lanes credential as
+  # --hub-token-env, and never opts into the quota gate: no `place` call may
+  # reach panewire.
+  LANES_CFG_OVERRIDE="$LANES_CFG_NODE" HERDR_SESSION=default \
+    lanes_spawn lane-1037-ac1 --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1037 AC1: lanes-only spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_CALLS" "$LANES_NODE_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+log, token_file, cf_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+want = ["add", "lane-1037-ac1", "--machine", "mac-work-default", "--pane", "w:p1",
+        "--parent", "work-kairos", "--hub-url", "https://hub.invalid",
+        "--hub-token-env", token_file, "--hub-cf-env", cf_file, "--"]
+assert got == want, "lanes add argv mismatch: got=%r want=%r" % (got, want)
+PY
+    fail "#1037 AC1: lanes add must run once with the lanes credential"
+  if [[ -f "$LANES_PANEWIRE_LOG" ]] && grep -qxF 'place' "$LANES_PANEWIRE_LOG"; then
+    fail "#1037 AC1: a lanes-only config must never invoke the quota gate"
+  fi
+  grep -q ' lane=lane-1037-ac1@mac-work-default$' "$LANES_OUT" ||
+    fail "#1037 AC1: the OK line must carry the registered lane"
+  echo "PASS 1037-lanes AC1: lanes-only registers, quota gate stays off"
+
+  # AC2 — both credentials: lanes routes use lanes_token_env while the quota
+  # gate keeps hub_token_env. Assert each panewire call's exact argv.
+  LANES_CFG_OVERRIDE="$LANES_CFG_BOTH" HERDR_SESSION=default \
+    lanes_spawn lane-1037-ac2 --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1037 AC2: dual-credential spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_PANEWIRE_LOG" "$LANES_CALLS" "$ROOT" "$LANES_TOKEN_FILE" "$LANES_NODE_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+shared_path, lanes_path, cwd, op_file, node_file, cf_file = sys.argv[1:]
+def blocks(path):
+    out, cur = [], []
+    try:
+        lines = open(path, encoding="utf-8").read().splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        if line == "--":
+            out.append(cur)
+            cur = []
+        else:
+            cur.append(line)
+    return out
+shared = [b for b in blocks(shared_path) if b]
+lanes = [b for b in blocks(lanes_path) if b]
+place = [b for b in shared if b[0] == "place"]
+assert len(place) == 1, "exactly one place call expected: %r" % (shared,)
+want_place = ["place", "--class", "worker", "--cwd", cwd, "--pool", "codex",
+              "--hub-url", "https://hub.invalid", "--hub-token-env", op_file,
+              "--hub-cf-env", cf_file]
+assert place[0] == want_place, "place argv mismatch: got=%r want=%r" % (place[0], want_place)
+want_add = ["add", "lane-1037-ac2", "--machine", "mac-work-default",
+            "--pane", "w:p1", "--parent", "work-kairos",
+            "--hub-url", "https://hub.invalid", "--hub-token-env", node_file,
+            "--hub-cf-env", cf_file]
+assert lanes == [want_add], "lanes add argv mismatch: got=%r want=%r" % (lanes, want_add)
+PY
+    fail "#1037 AC2: place must use hub_token_env, lanes add must use lanes_token_env"
+  echo "PASS 1037-lanes AC2: the lanes credential reaches lanes only, place keeps the operator file"
+
+  # AC4 — under a lanes-only config, reap's `lanes ls` confirmation and
+  # `lanes rm` also carry the lanes credential.
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1037"
+  lanes_reap_job j1037-reap w1:p1 w1:t1 own-1037 lane-1037-reap lbl-1037
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1037-reap","machine":"mac-work-default","pane":"w1:p1","parent":"own-1037","sink":false}]}' \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_NODE" \
+    lanes_reap_run ac4 --lane own-1037 --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1037 AC4: apply failed: $(cat "$LANES_REAP_ERR")"
+  python3 - "$LANES_RM_LOG" "$LANES_NODE_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+log, node_file, cf_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+creds = ["--hub-url", "https://hub.invalid",
+         "--hub-token-env", node_file, "--hub-cf-env", cf_file]
+want = (["ls"] + creds + ["--"]
+        + ["rm", "lane-1037-reap"] + creds + ["--"])
+assert got == want, "reap lanes argv mismatch: got=%r want=%r" % (got, want)
+PY
+    fail "#1037 AC4: reap ls+rm must carry the lanes credential"
+  grep -q '^closed job=j1037-reap ' "$LANES_REAP_OUT" ||
+    fail "#1037 AC4: the job must close: $(cat "$LANES_REAP_OUT")"
+  echo "PASS 1037-lanes AC4: reap ls+rm use lanes_token_env"
+
+  # AC5 — a lanes credential bound to another machine never reaches the hub:
+  # wrk compares the token file's HUB_MACHINE_ID line with the session's
+  # mapped machine, warns once, and skips the registration it would 403.
+  LANES_CFG_OVERRIDE="$LANES_CFG_MISMATCH" HERDR_SESSION=default \
+    lanes_spawn lane-1037-ac5 --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1037 AC5: a mismatched lanes credential must not fail the spawn (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call lane-1037-ac5
+  [[ "$(grep -c 'wrk: warning: hub lane not registered' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#1037 AC5: exactly one warning expected: $(cat "$LANES_ERR")"
+  grep -q "does not match the session's machine" "$LANES_ERR" ||
+    fail "#1037 AC5: the warning must name the machine mismatch: $(cat "$LANES_ERR")"
+  ! grep -q ' lane=' "$LANES_OUT" || fail "#1037 AC5: nothing may be appended"
+  echo "PASS 1037-lanes AC5: machine mismatch warns once and skips"
+
+  # The node token values appear nowhere: the paths travel, the contents do
+  # not — wrk matches only the HUB_MACHINE_ID assignment, never HUB_TOKEN.
+  for output in "$TMP"/lanes-1037-*.out "$TMP"/lanes-1037-*.err "$TMP"/lanes-reap-ac4.*; do
+    [[ -e "$output" ]] || continue
+    for secret in "$LANES_NODE_TOKEN_VALUE" "$LANES_NODE_OTHER_VALUE"; do
+      if grep -Fq "$secret" "$output"; then
+        fail "#1037: the lanes token contents leaked into ${output##*/}"
+      fi
+    done
+  done
+  echo "PASS 1037-lanes: node token contents never printed"
+
+  # -- #1037 assertion-RED mutants ------------------------------------------
+  # M1: "a lanes-only config never switches on the quota gate" — the mutant
+  # opts in on hub_url alone, so AC1's no-`place` assertion (or its rc) would
+  # fail: the lanes-only spawn must visibly reach the gate or be refused.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1037-gateurl \
+    '  if [[ -z "$token_env" ]]; then
+    return 0
+  fi
+  if [[ -z "$hub_url" ]]; then' \
+    '  if [[ -z "$token_env" && -z "$hub_url" ]]; then
+    return 0
+  fi
+  if [[ -z "$hub_url" ]]; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1037-gateurl" \
+    LANES_CFG_OVERRIDE="$LANES_CFG_NODE" HERDR_SESSION=default \
+    lanes_spawn lane-1037-m1 --owner work-kairos
+  if [[ "$LANES_RC" -eq 0 ]] &&
+     ! { [[ -f "$LANES_PANEWIRE_LOG" ]] && grep -qxF 'place' "$LANES_PANEWIRE_LOG"; }; then
+    fail "#1037 M1 mutant survived: hub_url still did not opt into the gate"
+  fi
+  echo "PASS 1037-lanes M1: opting in on hub_url goes RED"
+
+  # M2: "the lanes credential never reaches place" — the mutant has the gate
+  # read lanes_token_env, so AC2's exact place argv (operator file on
+  # --hub-token-env) would fail: the node file must appear in the place call.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1037-gateread \
+    '  token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+
+  # Only the operator credential opts this gate in' \
+    '  token_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+
+  # Only the operator credential opts this gate in'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1037-gateread" \
+    LANES_CFG_OVERRIDE="$LANES_CFG_BOTH" HERDR_SESSION=default \
+    lanes_spawn lane-1037-m2 --owner work-kairos
+  if [[ ! -f "$LANES_PANEWIRE_LOG" ]] ||
+     ! grep -qxF "$LANES_NODE_FILE" "$LANES_PANEWIRE_LOG"; then
+    fail "#1037 M2 mutant survived: the lanes credential never reached place"
+  fi
+  echo "PASS 1037-lanes M2: the gate reading lanes_token_env goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then
