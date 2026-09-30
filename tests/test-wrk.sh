@@ -4644,7 +4644,11 @@ echo "PASS 1026-AC1-switched-spellings-carry-gpt-6.1-sol"
 # canon now answers gpt-6.1-sol for codex-sol. codex-sol6 never consults the
 # catalog at all (ROB-591 shape, like codex-sol56); builder-sol6 still gets the
 # builder-seat consult at codex-sol@high but keeps the literal model id.
-: >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
+# NB: `: >a >b >c` needs a `>` per file — `: >a b c` passes b and c as
+# arguments and only truncates a (see the one-file-per-line convention above).
+: >"$TMP/herdr.log"
+: >"$TMP/scopefuel.log"
+: >"$TMP/launch.log"
 sol6_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base codex-sol6 --job codex-sol6-job --t T1 2>&1)"
 grep -q 'model=codex-sol6' <<<"$sol6_out"
 grep -q -- '-m gpt-6-sol' "$TMP/herdr.log" ||
@@ -4658,7 +4662,9 @@ fi
   fail "codex-sol6 must not consult the catalog at all: $(cat "$TMP/launch.log")"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
 
-: >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
+: >"$TMP/herdr.log"
+: >"$TMP/scopefuel.log"
+: >"$TMP/launch.log"
 bsol6_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sol6 --role builder \
   --lane builder-sol6-lane --parent parent-lane --job builder-sol6-job --t T1 2>&1)"
 grep -q 'model=builder-sol6' <<<"$bsol6_out" ||
@@ -4670,7 +4676,9 @@ grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
 if grep -q 'gpt-6.1-sol' "$TMP/herdr.log"; then
   fail "builder-sol6 took the canon's model id: $(cat "$TMP/herdr.log")"
 fi
-grep -q 'policy launch codex-sol effort=high' "$TMP/launch.log" ||
+# Exactly one consult, at exactly the graded rung — not a stray codex-sol6
+# line, not an unpinned consult that would hand back the max default.
+[[ "$(cat "$TMP/launch.log")" == 'policy launch codex-sol effort=high operator=0' ]] ||
   fail "builder-sol6 must still consult the catalog at codex-sol@high: $(cat "$TMP/launch.log")"
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-max" ]]
 echo "PASS 1026-AC2-rollback-spellings-pin-gpt-6-sol"
