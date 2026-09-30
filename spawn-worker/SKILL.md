@@ -624,12 +624,25 @@ wake = "panewire"
   압력이 낮아도 로컬을 후보로 쓰지 않고, 모든 원격이 실패하면 로컬 폴백 없이 후보별
   진단 뒤 `wrk: local spawns are disabled ...`와 함께 rc 80
   (`WRK_EXIT_LOCAL_SPAWN_DISABLED`)으로 거부한다. `--host local`은 pane·arbiter·hk 클레임
-  같은 모든 부수효과 전에 같은 rc 80으로 거부된다. 위임된 원격 spawn은 실행 호스트에서
+  같은 모든 부수효과 전에 같은 rc 80으로 거부된다. **ssh 위임**은 실행 호스트에서
   `wrk spawn --host local`로 도착하므로, 원격 호스트가 `spawn = false`이면 위임도 같은
   rc 80으로 거절한다 — 스폰 호스트의 auto 순회는 이 응답을 stop set에 넣지 않고 다음
-  후보로 넘어간다(70과 달리 라운드를 멈추지 않는다). 값은 bare TOML boolean만 허용한다 —
-  `"false"`처럼 따옴표 붙인 문자열은 타입 오류로 rc 70 설정 거부다. 키가 없거나
-  `true`이면 main과 바이트 동일한 기존 동작이다.
+  후보로 넘어간다(70과 달리 라운드를 멈추지 않는다). **`via = "hub"` 위임은 다르다** —
+  hub(wrkgate)는 대상에서 `--host` 없이 `wrk spawn`을 실행하므로 닫힌 via=hub 대상은
+  auto 라운드를 돈다: 로컬 pane은 절대 생기지 않지만, 그 대상 자신의 원격 후보로는
+  job이 갈 수 있다. 값은 bare TOML boolean만 허용한다 — `"false"`처럼 따옴표 붙인
+  문자열은 타입 오류로 rc 70 설정 거부다. 키가 없거나 `true`이면 main과 바이트 동일한
+  기존 동작이다.
+- 이 스위치는 fail-closed다(#1163) — 오타로 "허용"으로 읽히는 안전 스위치는 없는 것보다
+  나쁘다. 허용 형태는 정확히 하나다: `[local]` 단독 줄 + `spawn = false`(또는 `true`)
+  한 번. 그 외 local 테이블이나 spawn 키를 가리키는 모든 형태 — `[local] # comment`,
+  `[ local ]`, `["local"]` 같은 헤더, 두 번째 `[local]` 테이블, 두 번째 spawn 키,
+  `spawn`/`spawn: false`/`spawn == false`/`"spawn" = false`처럼 `spawn = value`가 아닌
+  줄, bare true/false가 아닌 값 — 은 파일 줄 번호와 사유를 담은 rc 70 설정 오류로
+  모든 spawn 배치를 거부한다. hosts.toml이 존재하는데 일반 파일로 읽을 수 없을 때도
+  같다. `[local]`이 없거나 spawn 키가 없거나 정확한 한 줄이면 기존과 동일하다.
+  `wrk hosts`는 해석된 상태를 `local spawn=allowed|disabled|error(<사유>)`로 출력한다
+  (보고 명령이라 오류 상태에서도 rc 0).
 - `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
 - `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600

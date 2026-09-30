@@ -24,9 +24,11 @@ WRK_EXIT_ROUND_CAP=78
 # #872: distinguish physical mock MCP isolation refusal from quota/usage errors.
 WRK_EXIT_MOCK_MCP_REFUSED=79
 # The hub quota gate's fail-closed refusals (a bad [hub] quota_gate value, a
-# contradictory or incomplete gate config, a rejected policy response).  A
-# remote wrk answers its delegated spawn with 70, and under --host auto that
-# must stop the candidate round (#1154) — never fall back to a local spawn.
+# contradictory or incomplete gate config, a rejected policy response) and,
+# since #1163, a malformed [local] table — the spawn flag must never read
+# "allowed" on a typo.  A remote wrk answers its delegated spawn with 70,
+# and under --host auto that must stop the candidate round (#1154) — never
+# fall back to a local spawn.
 WRK_EXIT_CONFIG_REFUSED=70
 # #1155: this host's own hosts.toml [local] spawn = false forbids local spawns.
 # --host local and every local fallback answer 80; a remote wrk answers its
@@ -319,12 +321,31 @@ line then ends with via=herdr-fallback.
                      and only tries the remote candidates (an all-fail round
                      exits 80 with one attributed line per host instead of
                      the local fallback), local refuses with rc 80 before any
-                     side effect, and a delegated remote spawn — which
-                     arrives as --host local on the execution host — is
-                     refused the same way. A remote answering 80 does not
-                     stop the auto round. Accepted values are the bare TOML
-                     booleans true/false (quoted spellings are strings and
-                     refuse with rc 70); absent means true.
+                     side effect, and a delegated ssh spawn — which arrives
+                     as --host local on the execution host — is refused the
+                     same way. A via=hub delegated spawn is different: the
+                     hub's wrkgate runs `wrk spawn` on the target WITHOUT
+                     --host, so a closed via=hub target runs the auto round —
+                     it lands no local pane, but it may still place the job
+                     on one of that target's own remotes. A remote answering
+                     80 does not stop the auto round.
+
+                     The flag is fail-closed (#1163): the only accepted form
+                     is '[local]' on its own line with 'spawn = false' (or
+                     'spawn = true') written once. Anything else that names
+                     the local table or its spawn key — a header like
+                     '[local] # comment', '[ local ]' or '["local"]', a
+                     second [local] table, a second spawn key, a spawn line
+                     that is not a 'spawn = value' assignment ('spawn',
+                     'spawn: false', 'spawn == false'), or a value that is
+                     not a bare true/false (a quoted spelling is a string,
+                     not a boolean) — is a config error refusing every
+                     placement with rc 70, naming the file line and reason;
+                     a hosts.toml that exists but is unreadable refuses the
+                     same way. No [local] section, a [local] without spawn,
+                     or one clean assignment keep the unchanged behavior.
+                     `wrk hosts` reports the resolved state as
+                     'local spawn=allowed|disabled|error'.
   -h, --help         show this usage
 
 Hub lane registration (#965): a --role worker spawn whose effective herdr
@@ -6529,12 +6550,28 @@ spawn_router_cmd() {
     fi
     ((i+=1))
   done
+  # #1163 N1: help wins over config resolution — on a malformed [local] the
+  # resolve below is a refusal, but `wrk spawn --help`/-h must still print
+  # rc 0. The scan is value-aware (skips option arguments) so `-c --help`
+  # still dies in spawn_cmd as a usage error; an unknown or non-option token
+  # ends the scan — spawn_cmd dies on it before reaching any later --help.
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[$i]}" in
+      -h|--help) spawn_help; return 0 ;;
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--host) ((i += 1)) ;;
+      --task-hk-bypass|--job-dup-ok|--landing-strict|--keep) ;;
+      *) break ;;
+    esac
+  done
   # #1155: this host's own [local] spawn = false forbids local spawns here.
   # Resolve once, before any admission work: a malformed value is a config
   # error (70) on every placement, and --host local refuses before any pane,
-  # arbiter or hk side effect. A delegated remote spawn arrives on the
+  # arbiter or hk side effect. A delegated ssh spawn arrives on the
   # execution host as this same --host local, so the refusal is also what
-  # closes a remote host to delegated spawns.
+  # closes a remote host to ssh-delegated spawns. A via=hub delegated spawn
+  # is different — the hub runs `wrk spawn` on the target without --host,
+  # which is this auto path: a closed target lands no local pane, but the
+  # round may still place on that target's own remotes.
   local_spawn_resolve || return
   if [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 && "$requested" == local ]]; then
     echo "wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local" >&2
@@ -6810,21 +6847,128 @@ spawn_router_cmd() {
 # run here at all. Sets LOCAL_SPAWN_ALLOWED (1 allowed, 0 forbidden). Absent
 # or `spawn = true` is the historical behavior and byte-identical to before;
 # `spawn = false` forbids every local spawn path — --host auto treats local
-# as an unavailable candidate, --host local refuses, and a delegated remote
+# as an unavailable candidate, --host local refuses, and a delegated ssh
 # spawn (which arrives as --host local on the execution host) refuses too.
 # Accepted values are the bare TOML booleans true/false — a quoted spelling
 # such as "false" is a string, not a boolean, so it refuses like any other
 # value (fail-closed, the same boundary quota_gate uses).
-local_spawn_resolve() {
+#
+# #1163: the resolution is fail-closed — a safety switch that reads
+# "allowed" on a typo is worse than none. local_spawn_scan refuses (rc 70,
+# reason in LOCAL_SPAWN_ERROR as "<config> line N: ...") when the [local]
+# surface is not in the one accepted shape:
+#   - a header that names the local table but is not exactly '[local]' on
+#     its own line: '[local] # note', '[ local ]', '["local"]', '[[local]]',
+#     a truncated '[local', or '[local]' with trailing text;
+#   - a second [local] table header;
+#   - inside [local], a second spawn key whatever its value, or a line
+#     starting a would-be spawn key that is not 'spawn = <value>' (bare
+#     'spawn', 'spawn: false', 'spawn == false', a quoted "spawn" key);
+#   - a spawn value other than bare true/false after stripping a trailing
+#     '#' comment and whitespace.
+# A hosts.toml that exists but is not a readable regular file also refuses.
+# Everything else — no file, no [local], [local] without spawn, one clean
+# spawn = true/false, every other key and every other section — behaves
+# exactly as before; other readers keep going through spillover_value,
+# whose behavior this does not change.
+local_spawn_table_name() {
+  # Canonical name a bracketed line would give its table: trim, drop one
+  # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
+  # ('"local"'/'\'local\'' -> local). Callers compare against 'local'.
+  local name
+  name="$(spillover_trim "$1")"
+  name="${name#\[}"
+  name="${name%\]}"
+  name="$(spillover_trim "$name")"
+  if [[ "${#name}" -ge 2 ]] &&
+    { [[ "$name" == \"*\" && "$name" == *\" ]] ||
+      [[ "$name" == \'* && "$name" == *\' ]]; }; then
+    name="${name:1:${#name}-2}"
+  fi
+  printf '%s' "$name"
+}
+
+local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
-  local raw
-  raw="$(spillover_value local spawn raw 2>/dev/null)" || return 0
-  case "$raw" in
-    true) ;;
-    false) LOCAL_SPAWN_ALLOWED=0 ;;
-    *) echo "wrk: [local] spawn accepts only the bare TOML booleans true or false (got '$raw'); refusing spawn" >&2
-       return "$WRK_EXIT_CONFIG_REFUSED" ;;
-  esac
+  LOCAL_SPAWN_ERROR=""
+  local config line current="" inner rest name value
+  local n=0 local_seen=0 spawn_seen=0
+  config="$(spillover_config)"
+  [[ -e "$config" || -L "$config" ]] || return 0
+  if [[ ! -f "$config" || ! -r "$config" ]]; then
+    LOCAL_SPAWN_ERROR="$config: exists but is not a readable regular file"
+    return "$WRK_EXIT_CONFIG_REFUSED"
+  fi
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    n=$((n + 1))
+    line="$(spillover_trim "$line")"
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    if [[ "$line" == \[* ]]; then
+      if [[ "$line" =~ ^\[([^]]*)\](.*)$ ]]; then
+        inner="${BASH_REMATCH[1]}" rest="${BASH_REMATCH[2]}"
+      else
+        # No ']' anywhere — e.g. a truncated '[local'.
+        inner="${line#\[}" rest=unterminated
+      fi
+      name="$(local_spawn_table_name "$inner")"
+      if [[ "$name" == local && "$line" == '[local]' ]]; then
+        local_seen=$((local_seen + 1))
+        if [[ "$local_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate [local] table header"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        current=local
+      elif [[ "$name" == local ]]; then
+        LOCAL_SPAWN_ERROR="$config line $n: [local] table header must be exactly '[local]' on its own line"
+        return "$WRK_EXIT_CONFIG_REFUSED"
+      elif [[ -z "$rest" ]]; then
+        current="$inner"
+      fi
+      # A bracketed line that names no local table and is not a clean header
+      # (trailing text, no close) leaves the section unchanged — the same
+      # ignore spillover_value gives it.
+      continue
+    fi
+    [[ "$current" == local ]] || continue
+    case "$line" in
+      spawn[A-Za-z0-9_-]*) continue ;;   # a different bare key
+      spawn* | '"spawn"'* | "'spawn'"*) ;;   # a would-be spawn key
+      *) continue ;;
+    esac
+    if [[ "$line" =~ ^spawn[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+      value="${BASH_REMATCH[1]}"
+    else
+      LOCAL_SPAWN_ERROR="$config line $n: malformed spawn assignment in [local] (expected 'spawn = true|false')"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+    value="${value%%#*}"
+    value="$(spillover_trim "$value")"
+    spawn_seen=$((spawn_seen + 1))
+    if [[ "$spawn_seen" -gt 1 ]]; then
+      LOCAL_SPAWN_ERROR="$config line $n: duplicate spawn key in [local]"
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+    case "$value" in
+      true) ;;
+      false) LOCAL_SPAWN_ALLOWED=0 ;;
+      *) LOCAL_SPAWN_ERROR="$config line $n: [local] spawn accepts only the bare TOML booleans true or false (got '$value')"
+         return "$WRK_EXIT_CONFIG_REFUSED" ;;
+    esac
+  done <"$config" || {
+    # -f/-r passed but the open still failed (vanished, ACL) — fail closed.
+    LOCAL_SPAWN_ERROR="$config: exists but is not a readable regular file"
+    return "$WRK_EXIT_CONFIG_REFUSED"
+  }
+  return 0
+}
+
+local_spawn_resolve() {
+  local rc=0
+  local_spawn_scan || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: ${LOCAL_SPAWN_ERROR}; refusing spawn" >&2
+    return "$rc"
+  fi
 }
 
 # The "use --host local" tail on failure lines is only advice while this host
@@ -6843,10 +6987,13 @@ hosts_help() {
   cat <<'USAGE'
 Usage: wrk hosts
 
-Print the resolved hosts.toml path, this host's measured load
-(load5/ncpu ratio and active spawn count), then probe every configured
-spill-over host and print a status table (available, or the probe failure
-reason, with the remote load/active counts when reachable).
+Print the resolved hosts.toml path, this host's [local] spawn flag state
+(local spawn=allowed|disabled|error — an error means the file refuses
+spawns with rc 70; hosts is a reporting command and stays rc 0), this
+host's measured load (load5/ncpu ratio and active spawn count), then probe
+every configured spill-over host and print a status table (available, or
+the probe failure reason, with the remote load/active counts when
+reachable).
 
   -h, --help   show this usage
 USAGE
@@ -6865,6 +7012,17 @@ hosts_cmd() {
   config="$(spillover_config)"
   spillover_local_measure
   printf 'config=%s\n' "$config"
+  # #1163: surface the [local] spawn switch so a mistyped closure is visible
+  # on the reporting path. hosts is read-only — a config error shows as
+  # `error (...)` here and must not change this command's exit code.
+  local_spawn_scan || true
+  if [[ -n "${LOCAL_SPAWN_ERROR:-}" ]]; then
+    printf 'local spawn=error (%s)\n' "$LOCAL_SPAWN_ERROR"
+  elif [[ "${LOCAL_SPAWN_ALLOWED:-1}" -eq 0 ]]; then
+    printf 'local spawn=disabled\n'
+  else
+    printf 'local spawn=allowed\n'
+  fi
   printf 'local load5=%s ncpu=%s ratio=%s active=%s\n' "${SPILL_LOAD:-unknown}" "${SPILL_NCPU:-unknown}" "${SPILL_RATIO:-unknown}" "${SPILL_ACTIVE:-unknown}"
   printf 'host\tstatus\tload5\tactive\n'
   for host in $(spillover_hosts); do
