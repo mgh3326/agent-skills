@@ -14,14 +14,23 @@ host=""
 for arg in "$@"; do
   [[ "$arg" == desktop || "$arg" == mac-work ]] && host="$arg"
 done
+# Per-host override (WRK_SSH_SCENARIO_DESKTOP, WRK_SSH_SCENARIO_MAC_WORK)
+# wins over the shared WRK_SSH_SCENARIO so multi-host auto tests can give
+# each candidate its own failure mode.
+scenario="${WRK_SSH_SCENARIO:-ok}"
+if [[ -n "$host" ]]; then
+  host_key="$(printf '%s' "$host" | tr '[:lower:]-' '[:upper:]_')"
+  scenario_var="WRK_SSH_SCENARIO_${host_key}"
+  [[ -z "${!scenario_var:-}" ]] || scenario="${!scenario_var}"
+fi
 if [[ "$remote" == *'uptime; herdr agent list'* ]]; then
-  if [[ "$host" == desktop && "${WRK_SSH_SCENARIO:-ok}" == desktop-down ]]; then exit 255; fi
-  if [[ "$host" == mac-work && "${WRK_SSH_SCENARIO:-ok}" == backup-down ]]; then exit 255; fi
-  if [[ "${WRK_SSH_SCENARIO:-ok}" == probe-unreachable ]]; then
+  if [[ "$host" == desktop && "$scenario" == desktop-down ]]; then exit 255; fi
+  if [[ "$host" == mac-work && "$scenario" == backup-down ]]; then exit 255; fi
+  if [[ "$scenario" == probe-unreachable ]]; then
     printf '%s\n' "ssh: connect to host $host port 22: Operation timed out" >&2
     exit 255
   fi
-  if [[ "${WRK_SSH_SCENARIO:-ok}" == probe-herdr-missing ]]; then
+  if [[ "$scenario" == probe-herdr-missing ]]; then
     printf '%s\n' ' 10:00 up 1 day,  load average: 0.10, 0.10, 0.10'
     printf '%s\n' 'sh: herdr: command not found' >&2
     exit 0
@@ -31,7 +40,7 @@ if [[ "$remote" == *'uptime; herdr agent list'* ]]; then
   exit 0
 fi
 if [[ "$remote" == *mktemp* ]]; then
-  if [[ "${WRK_SSH_SCENARIO:-ok}" == mktemp-fails ]]; then
+  if [[ "$scenario" == mktemp-fails ]]; then
     printf '%s\n' "mktemp: failed to create file via template '${TMPDIR:-/tmp}/wrk-spillover.XXXXXX.md': No space left on device" >&2
     exit 1
   fi
@@ -42,7 +51,7 @@ fi
 # script on stdin.  With WRK_FAKE_REMOTE set, replay it against a local fake
 # root so tests exercise real git worktree semantics without touching a host.
 if [[ "$remote" == *'sh -s'* ]]; then
-  if [[ "${WRK_SSH_SCENARIO:-ok}" == prepare-fails ]]; then
+  if [[ "$scenario" == prepare-fails ]]; then
     printf '%s\n' "ssh: connect to host $host port 22: Connection refused" >&2
     exit 255
   fi
@@ -54,13 +63,13 @@ if [[ "$remote" == *'sh -s'* ]]; then
   env BASE="${BASE:-}" TARGET="${TARGET:-}" BRANCH="${BRANCH:-}" SHA="${SHA:-}" bash -c "$script"
   exit $?
 fi
-if [[ "$host" == desktop && "${WRK_SSH_SCENARIO:-ok}" == desktop-spawn-fails ]]; then exit 42; fi
+if [[ "$host" == desktop && "$scenario" == desktop-spawn-fails ]]; then exit 42; fi
 # The delegated spawn leg arrives as "env HERDR_SESSION=... wrk spawn ...;
 # rc=$?; rm -f brief; exit $rc".  These scenarios make the remote wrk fail the
 # way a real one does: a die line on stderr, a refusal printed on stdout, or
 # both — so tests can assert which channel reaches the operator.
 if [[ "$remote" == *'wrk spawn'* ]]; then
-  case "${WRK_SSH_SCENARIO:-ok}" in
+  case "$scenario" in
     remote-die-stderr)
       printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: hk task 1037 is already bound to job 'other-job' (state=claimed claimed_by=w-other) — a task linked to another job cannot be re-spawned (fail-closed)}" >&2
       exit "${WRK_REMOTE_RC:-1}"

@@ -417,11 +417,22 @@ run_t1090_remote_err_tests() {
   T1090_INBOX="$TMP/t1090-inbox" T1090_XDG="$TMP/t1090-xdg"
   env ARBITER_INBOX_ROOT="$T1090_INBOX" XDG_DATA_HOME="$T1090_XDG" \
     "$ARBITER" claim --job t1090-seed --agent-label t1090-seed --lane t1090 --t T1 >/dev/null
+  # --host auto needs the local side pressured (ratio >= max_load_ratio) so the
+  # router enumerates every configured host as a candidate in file order.
+  T1090_LOAD_HIGH="$TMP/t1090-loadavg-high"
+  printf '4.00 4.00 4.00 1/1 1\n' >"$T1090_LOAD_HIGH"
+  T1090_HOSTS_AUTO="$TMP/t1090-hosts-auto.toml"
+  printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+    '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' '' \
+    '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 2' >"$T1090_HOSTS_AUTO"
 
-  t1090_spawn() {  # env knobs per call: T1090_{SSH,SCP}_SCENARIO, T1090_{HOSTS_OVERRIDE,CWD,WRK}
+  t1090_spawn() {  # env knobs per call: T1090_{SSH,SCP}_SCENARIO{,_DESKTOP,_MAC_WORK}, T1090_{HOSTS_OVERRIDE,CWD,WRK,HOST_ARG,LOAD_FILE}
     env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
       ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$T1090_INBOX" XDG_DATA_HOME="$T1090_XDG" \
-      WRK_HOSTS_CONFIG="${T1090_HOSTS_OVERRIDE:-$T1090_HOSTS}" WRK_PROC_LOADAVG="$T1090_LOAD" \
+      WRK_HOSTS_CONFIG="${T1090_HOSTS_OVERRIDE:-$T1090_HOSTS}" \
+      WRK_PROC_LOADAVG="${T1090_LOAD_FILE:-$T1090_LOAD}" \
       WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 \
       WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/t1090-herdr.log" \
       WRK_SPILLOVER_LOG="$TMP/t1090-spillover.log" \
@@ -430,9 +441,12 @@ run_t1090_remote_err_tests() {
       WRK_SCP_BIN="${T1090_SCP:-$ROOT/tests/fixtures/spillover-scp}" \
       WRK_SSH_LOG="$TMP/t1090-ssh.log" WRK_SCP_LOG="$TMP/t1090-scp.log" \
       WRK_SSH_SCENARIO="${T1090_SSH_SCENARIO:-ok}" \
+      WRK_SSH_SCENARIO_DESKTOP="${T1090_SSH_SCENARIO_DESKTOP:-}" \
+      WRK_SSH_SCENARIO_MAC_WORK="${T1090_SSH_SCENARIO_MAC_WORK:-}" \
       WRK_SCP_SCENARIO="${T1090_SCP_SCENARIO:-ok}" \
+      WRK_SCP_SCENARIO_DESKTOP="${T1090_SCP_SCENARIO_DESKTOP:-}" \
       "${T1090_WRK:-$WRK}" spawn -c "${T1090_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
-      -w w -l fixture --t T1 --job "t1090-$RANDOM-$RANDOM" --host desktop
+      -w w -l fixture --t T1 --job "t1090-$RANDOM-$RANDOM" --host "${T1090_HOST_ARG:-desktop}"
   }
 
   # AC1: the remote wrk dies on stderr — the die line reaches the local stderr
@@ -517,6 +531,95 @@ run_t1090_remote_err_tests() {
   [[ "$t1090_last" == *"rc=1"* && "$t1090_last" == *"probe"* ]] ||
     fail "AC3 probe: final line must name the probe step and rc, got: $t1090_last"
   echo "PASS t1090 AC3 failed-steps-named"
+
+  # R1-A: --host auto holds per-candidate diagnostics until the round settles.
+  # desktop is unreachable, mac-work answers: the spawn lands on mac-work and
+  # stderr stays byte-identical to main — empty, not a word about desktop.
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1090_SSH_SCENARIO_MAC_WORK=ok t1090_spawn ) >"$TMP/t1090-auto1.out" 2>"$TMP/t1090-auto1.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "R1 auto-success: expected rc=0, got $t1090_rc: $(cat "$TMP/t1090-auto1.err")"
+  printf '%s\n' 'OK pane=mac-work:p7 host=mac-work model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1090-auto1.want"
+  cmp -s "$TMP/t1090-auto1.want" "$TMP/t1090-auto1.out" ||
+    fail "R1 auto-success: stdout differs from the pinned mac-work OK line: $(cat "$TMP/t1090-auto1.out")"
+  [[ ! -s "$TMP/t1090-auto1.err" ]] ||
+    fail "R1 auto-success: skipped-host diagnostics must stay silent on success: $(cat "$TMP/t1090-auto1.err")"
+  echo "PASS t1090 R1 auto-success-silent"
+
+  # R1-B: with every candidate failing, the buffered diagnostics flush before
+  # the local fallback — one attributed line per host (step + rc), with the
+  # remote's own words ahead of it.
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1090_SSH_SCENARIO_MAC_WORK=probe-herdr-missing t1090_spawn ) >"$TMP/t1090-auto2.out" 2>"$TMP/t1090-auto2.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "R1 auto-all-fail: local fallback should still land, got rc=$t1090_rc: $(cat "$TMP/t1090-auto2.err")"
+  grep -qF "remote host 'desktop' probe failed (ssh-unreachable, rc=255)" "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: desktop probe line missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -qF "remote host 'desktop' failed (rc=255) at step 'probe'" "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: desktop summary missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -qF 'herdr: command not found' "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: mac-work probe stderr dropped: $(cat "$TMP/t1090-auto2.err")"
+  grep -qF "remote host 'mac-work' skipped: remote-full (active unknown capacity 2)" "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: mac-work skipped line missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -qF "remote host 'mac-work' failed (rc=1) at step 'probe'" "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: mac-work summary missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -qF 'falling back to local' "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: fallback warning missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -q 'host=local' "$TMP/t1090-auto2.out" ||
+    fail "R1 auto-all-fail: expected a local landing on stdout: $(cat "$TMP/t1090-auto2.out")"
+  echo "PASS t1090 R1 auto-all-fail-per-host-lines"
+
+  # R1-C: a transport leg exiting 2 must not look like an admission refusal —
+  # desktop's scp dies with rc 2, the router maps it to a transport failure
+  # and the spawn lands on mac-work with stderr still empty.
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SCP_SCENARIO_DESKTOP=fail2 \
+      T1090_SSH_SCENARIO_MAC_WORK=ok t1090_spawn ) >"$TMP/t1090-auto3.out" 2>"$TMP/t1090-auto3.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "R1 auto-transport-2: expected failover to mac-work (rc=0), got $t1090_rc: $(cat "$TMP/t1090-auto3.err")"
+  cmp -s "$TMP/t1090-auto1.want" "$TMP/t1090-auto3.out" ||
+    fail "R1 auto-transport-2: expected the mac-work OK line: $(cat "$TMP/t1090-auto3.out")"
+  [[ ! -s "$TMP/t1090-auto3.err" ]] ||
+    fail "R1 auto-transport-2: skipped-host diagnostics must stay silent on success: $(cat "$TMP/t1090-auto3.err")"
+  grep -q 'desktop:' "$TMP/t1090-scp.log" ||
+    fail "R1 auto-transport-2: desktop scp attempt missing from the fixture log"
+  echo "PASS t1090 R1 auto-transport-rc2-fails-over"
+
+  # R1 mutant — invariant "a successful auto spawn prints nothing about
+  # skipped hosts": printing the captured diagnostics eagerly (dropping the
+  # per-candidate stderr capture) must turn R1-A red.
+  T1090_M3="$TMP/t1090-wrk-eager-diag"
+  # shellcheck disable=SC2016 # the sed pattern is bin/wrk source text, not an expansion site
+  sed 's/ ) 2>"\$cand_err"/ )/' "$WRK" >"$T1090_M3"
+  chmod +x "$T1090_M3"
+  # shellcheck disable=SC2016 # the grep pattern is literal bin/wrk source text
+  grep -qF '2>"$cand_err"' "$T1090_M3" && fail 'R1 mutant did not apply: capture redirect still present'
+  set +e
+  ( T1090_WRK="$T1090_M3" T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1090_SSH_SCENARIO_MAC_WORK=ok t1090_spawn ) >"$TMP/t1090-m3.out" 2>"$TMP/t1090-m3.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] || fail "R1 mutant: the spawn itself should still succeed (rc=$t1090_rc)"
+  if [[ ! -s "$TMP/t1090-m3.err" ]]; then
+    fail "R1 mutant: eager diagnostics must turn the silence check red, but stderr stayed empty"
+  fi
+  echo "PASS t1090 R1 mutant: eager-diagnostics mutant goes RED (R1-A assertion: stderr no longer empty)"
 
   # AC4: the success path is byte-identical to main — the annotated OK line on
   # stdout, nothing on stderr, rc 0.
