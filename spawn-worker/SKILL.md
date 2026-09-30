@@ -582,6 +582,7 @@ hub_token_env = "<path-to-token-env-file>"
 hub_cf_env = "<path-to-cf-env-file>"   # 선택 사항
 lanes_token_env = "<path-to-node-token-file>"  # 선택 사항 — lanes 전용 노드 토큰
 session_machine_ids = {"<non-fleet-session>" = "<hub-machine-id>"}  # 선택 사항 — 레인 자동 등록
+# quota_gate = "local"     # 선택 사항 — hub quota gate 의 명시적 opt-out (lanes-only 호스트용)
 
 [hosts.<remote-name>]
 ssh = "<ssh-alias>"
@@ -623,6 +624,12 @@ wake = "panewire"
   요청); `HUB_TOKEN`은 절대 읽거나 출력하지 않는다. `hub_token_env`
   없이 `hub_url`+`lanes_token_env`만 둔 lanes-only `[hub]`는 quota gate를 켜지 않는다 —
   게이트의 opt-in은 오직 `hub_token_env`다.
+- `quota_gate = "local"`(#1138)은 그 local-only 상태의 명시적 opt-out이다 — M1 같은
+  lanes-only 호스트가 쓴다. `hub_url`이 있고 `hub_token_env`가 없는 `[hub]`는 매 spawn마다
+  게이트가 건너뛰어지고 local scopefuel gate만 적용된다는 경고를 stderr에 정확히 한 번
+  출력하는데, `quota_gate = "local"`을 두면 그 경고 없이 같은 경로를 탄다. 다른 값은
+  모두 설정 오류로 rc 70 fail-closed이고, `hub_token_env`와 함께 두는 것도 모순된
+  설정으로 같은 70이다.
 - `--host local`은 운영자 강제 로컬, `--host <remote-name>`은 강제 원격이다. 둘 다 hub 판정을
   우회하므로 장애 대응·진단에만 쓴다. 강제 원격은 실패해도 로컬로 폴백하지 않고 원격의
   exit code를 그대로 전파한다 — 로컬 폴백은 `--host auto`에서만 일어난다.

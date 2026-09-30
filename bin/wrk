@@ -299,7 +299,11 @@ may reach only the lanes routes: this registration, reap's `lanes rm`, and
 the `lanes ls` confirmation. No other hub path (quota gate, placement,
 spill-over wake, hub spawn) reads it, and a [hub] section with hub_url and
 lanes_token_env but no hub_token_env does not opt into the hub quota gate —
-only a configured hub_token_env switches that on. The OK line then ends
+only a configured hub_token_env switches that on. That skipped gate is never
+silent: every spawn warns once that only the local scopefuel gate applies
+unless quota_gate = "local" is set, the deliberate opt-out a lanes-only host
+uses instead (any other quota_gate value — and "local" combined with
+hub_token_env — is a config error that refuses the spawn). The OK line then ends
 with lane=LABEL@ID and the job.spawned meta records
 hub_lane/hub_lane_machine; `wrk reap --apply` removes the lane with
 `panewire lanes rm`. An unmapped session or a missing --owner warns once
@@ -1601,12 +1605,7 @@ quota_gate() {
 # CLI owns transport/auth/response classification: only exit 4 is eligible for
 # the approved local-only fallback.
 quota_hub_policy_gate() {
-  # P5: a durable arbiter registration is the only evidence that permits hub
-  # contact. Absent/transitional arbiter keeps the pre-existing local-only path.
-  [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
-  [[ "${GATE_READY:-0}" -eq 1 ]] || return 0
-
-  local hub_url token_env cf_env first_line field pool="" panewire rc
+  local hub_url token_env cf_env quota_gate first_line field pool="" panewire rc
   local gate_fields=() args=()
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
   token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
@@ -1619,6 +1618,33 @@ quota_hub_policy_gate() {
   # only) — preserve the exact pre-hub local-only path. A partial operator
   # config is different: hub_token_env without hub_url is an operator error,
   # and silently treating it as absent would turn it into permissive policy.
+  #
+  # #1138: quota_gate = "local" is the explicit opt-out for a host that keeps
+  # a [hub] section without enabling hub quota policy (a lanes-only host such
+  # as M1). Both config checks — and the skipped-gate warning — run ahead of
+  # the evidence early-returns below so a malformed key fails closed on every
+  # spawn that reaches this gate, never silently.
+  if quota_gate="$(spillover_value hub quota_gate 2>/dev/null)"; then
+    if [[ "$quota_gate" != local ]]; then
+      echo "wrk: [hub] quota_gate accepts only \"local\"; refusing spawn" >&2
+      return 70
+    fi
+    if [[ -n "$token_env" ]]; then
+      echo "wrk: [hub] quota_gate = \"local\" contradicts hub_token_env; remove one of the two keys" >&2
+      return 70
+    fi
+    return 0
+  fi
+  if [[ -n "$hub_url" && -z "$token_env" && "${HUB_QUOTA_GATE_WARNED:-0}" -eq 0 ]]; then
+    HUB_QUOTA_GATE_WARNED=1
+    warn "[hub] hub_url is set but hub_token_env is not; hub quota gate skipped (local scopefuel gate only)"
+  fi
+
+  # P5: a durable arbiter registration is the only evidence that permits hub
+  # contact. Absent/transitional arbiter keeps the pre-existing local-only path.
+  [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
+  [[ "${GATE_READY:-0}" -eq 1 ]] || return 0
+
   if [[ -z "$token_env" ]]; then
     return 0
   fi
@@ -7049,7 +7075,7 @@ spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
   OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0
-  ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0
+  ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
   MOCK_MCP_PLAN="" MOCK_MCP_HELPER="" SPAWN_MOCK_MCP_RETAIN=0
   # Armed once for the whole spawn: both cleanup actions are guarded (pane

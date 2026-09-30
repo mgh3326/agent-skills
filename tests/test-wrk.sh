@@ -358,7 +358,7 @@ hub_quota_run_case() {
   : >"$HUB_QUOTA_SPILLOVER_LOG"
   set +e
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
-    ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/hub-quota-xdg-$name" \
+    ARBITER_BIN="${HUB_QUOTA_ARBITER_BIN:-$ARBITER}" XDG_DATA_HOME="$TMP/hub-quota-xdg-$name" \
     ARBITER_INBOX_ROOT="$TMP/hub-quota-inbox-$name" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
     WRK_FIXTURE_LOG="$HUB_QUOTA_HERDR_LOG" WRK_SCOPEFUEL_LOG="$TMP/hub-quota-scopefuel.log" \
@@ -367,7 +367,7 @@ hub_quota_run_case() {
     WRK_SPILLOVER_LOG="$HUB_QUOTA_SPILLOVER_LOG" \
     WRK_PANEWIRE_LOG="$HUB_QUOTA_PANEWIRE_LOG" WRK_PANEWIRE_RC="$hub_rc" \
     WRK_GATE_MODE="$gate_mode" \
-    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 --host local \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 --host local \
     >"$HUB_QUOTA_OUT" 2>"$HUB_QUOTA_ERR"
   HUB_QUOTA_RC=$?
   set -e
@@ -387,6 +387,18 @@ hub_quota_expect_spawn() {
   elif [[ -s "$HUB_QUOTA_HERDR_LOG" ]]; then
     fail "hub quota combination $name unexpectedly spawned"
   fi
+}
+
+# #1138: the skipped-gate warning — counted as whole lines equal to the exact
+# text, so "exactly once" is a count assertion, not a substring presence.
+HUB_QUOTA_WARN_TEXT='wrk: warning: [hub] hub_url is set but hub_token_env is not; hub quota gate skipped (local scopefuel gate only)'
+hub_quota_warn_count() { grep -cxF "$HUB_QUOTA_WARN_TEXT" "$HUB_QUOTA_ERR" || true; }
+
+hub_quota_expect_warn() {  # NAME WANT_COUNT — the #1138 skipped-gate warning
+  local name="$1" want="$2" got
+  got="$(hub_quota_warn_count)"
+  [[ "$got" -eq "$want" ]] ||
+    fail "hub quota combination $name expected $want skipped-gate warning(s), got $got: $(cat "$HUB_QUOTA_ERR")"
 }
 
 run_t1090_remote_err_tests() {
@@ -786,6 +798,7 @@ if got != want:
     raise SystemExit(f"hub quota argv mismatch: got={got!r} want={want!r}")
 PY
     fail "hub quota allow invocation did not preserve the panewire contract"
+  hub_quota_expect_warn allow/local-0 0
   echo "PASS hub-quota-combination allow/0=allow"
 
   # Local denial/unknown terminates before hub policy can override it. The fake
@@ -859,6 +872,9 @@ PY
     fail "hub-unconfigured local-only path invoked panewire"
   [[ "$(sed -n '1p' "$HUB_QUOTA_OUT")" == 'profile=codex-terra-max pool=codex used_pct=12.5 class=preserve' ]] ||
     fail "hub-unconfigured path changed local gate stdout"
+  # No [hub] section: stderr keeps its main shape — the #1138 warning is
+  # reachable only when hub_url is set.
+  hub_quota_expect_warn unconfigured/local-0 0
   echo "PASS hub-quota-unconfigured-preserves-local-only"
 
   # #1037: the opt-in is the operator credential alone — a configured
@@ -880,6 +896,8 @@ PY
   hub_quota_expect_spawn url-only-local-0 1
   [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
     fail "hub_url without a token key invoked panewire"
+  # #1138: the local-only path is now said out loud — exactly one warning line.
+  hub_quota_expect_warn url-only-local-0 1
   echo "PASS hub-quota-url-only-stays-local"
 
   hub_quota_run_case url-cf-local-0 70 ok "$url_cf"
@@ -887,6 +905,7 @@ PY
   hub_quota_expect_spawn url-cf-local-0 1
   [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
     fail "hub_url+hub_cf_env without hub_token_env invoked panewire"
+  hub_quota_expect_warn url-cf-local-0 1
   echo "PASS hub-quota-url-cf-stays-local"
 
   hub_quota_run_case lanes-only-local-0 70 ok "$lanes_only"
@@ -894,7 +913,19 @@ PY
   hub_quota_expect_spawn lanes-only-local-0 1
   [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
     fail "a lanes-only [hub] must not invoke panewire place"
+  hub_quota_expect_warn lanes-only-local-0 1
   echo "PASS hub-quota-lanes-only-never-opts-in"
+
+  # #1138: the warning is emitted at the top of the gate, before the
+  # ARBITER_JOB_REGISTERED/GATE_READY evidence early-returns — a spawn whose
+  # arbiter is absent (installation transition) still warns exactly once.
+  HUB_QUOTA_ARBITER_BIN="$TMP/absent-arbiter" \
+    hub_quota_run_case url-only-no-arbiter 70 ok "$url_only"
+  unset HUB_QUOTA_ARBITER_BIN
+  hub_quota_expect_rc url-only-no-arbiter 0
+  hub_quota_expect_spawn url-only-no-arbiter 1
+  hub_quota_expect_warn url-only-no-arbiter 1
+  echo "PASS hub-quota-url-only-warns-once-on-early-return"
 
   # The genuinely partial gate config — hub_token_env without hub_url —
   # keeps its rc-70 fail-closed refusal.
@@ -905,7 +936,60 @@ PY
     fail "hub_token_env without hub_url must keep the incomplete-config refusal"
   [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
     fail "a partial gate config invoked panewire"
+  # #1138: hub_url is empty here, so the skipped-gate warning stays silent.
+  hub_quota_expect_warn token-no-url 0
   echo "PASS hub-quota-token-without-url-fails-closed"
+
+  # -- #1138 quota_gate key --------------------------------------------------
+  # quota_gate = "local" is the deliberate opt-out a lanes-only host uses:
+  # the same local-only path without the warning. Any other value — and
+  # "local" next to the hub_token_env that opts the gate in — is a config
+  # error refusing the spawn fail-closed (rc 70).
+  local gate_local="$TMP/hub-quota-gate-local.toml"
+  local gate_local_lanes="$TMP/hub-quota-gate-local-lanes.toml"
+  local gate_bogus="$TMP/hub-quota-gate-bogus.toml"
+  local gate_local_token="$TMP/hub-quota-gate-local-token.toml"
+  printf '[hub]\nhub_url = "https://hub.invalid"\nquota_gate = "local"\n' >"$gate_local"
+  printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nquota_gate = "local"\n' \
+    "$token_file" >"$gate_local_lanes"
+  printf '[hub]\nhub_url = "https://hub.invalid"\nquota_gate = "hub"\n' >"$gate_bogus"
+  printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nquota_gate = "local"\n' \
+    "$token_file" >"$gate_local_token"
+
+  hub_quota_run_case gate-local 70 ok "$gate_local"
+  hub_quota_expect_rc gate-local 0
+  hub_quota_expect_spawn gate-local 1
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "quota_gate=local invoked panewire"
+  hub_quota_expect_warn gate-local 0
+  echo "PASS hub-quota-gate-local-stays-silent"
+
+  hub_quota_run_case gate-local-lanes 70 ok "$gate_local_lanes"
+  hub_quota_expect_rc gate-local-lanes 0
+  hub_quota_expect_spawn gate-local-lanes 1
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "a lanes-only [hub] with quota_gate=local invoked panewire place"
+  hub_quota_expect_warn gate-local-lanes 0
+  echo "PASS hub-quota-gate-local-lanes-stays-silent"
+
+  hub_quota_run_case gate-bogus 0 ok "$gate_bogus"
+  hub_quota_expect_rc gate-bogus 70
+  hub_quota_expect_spawn gate-bogus 0
+  grep -q 'quota_gate accepts only "local"' "$HUB_QUOTA_ERR" ||
+    fail "an unknown quota_gate value must refuse naming the accepted value: $(cat "$HUB_QUOTA_ERR")"
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "a malformed quota_gate invoked panewire"
+  hub_quota_expect_warn gate-bogus 0
+  echo "PASS hub-quota-gate-unknown-value-fails-closed"
+
+  hub_quota_run_case gate-local-token 0 ok "$gate_local_token"
+  hub_quota_expect_rc gate-local-token 70
+  hub_quota_expect_spawn gate-local-token 0
+  grep -q 'quota_gate = "local" contradicts hub_token_env' "$HUB_QUOTA_ERR" ||
+    fail "quota_gate=local with hub_token_env must refuse naming both keys: $(cat "$HUB_QUOTA_ERR")"
+  [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
+    fail "a contradictory quota_gate config invoked panewire"
+  echo "PASS hub-quota-gate-local-contradicts-token"
 
   # The credential files are passed by path only. Neither their contents nor
   # panewire output can enter wrk's stdout, stderr, or spill-over audit log.
@@ -915,6 +999,48 @@ PY
     fi
   done
   echo "PASS hub-quota-token-redaction"
+
+  # -- #1138 assertion-RED mutants ------------------------------------------
+  # M1: "a hub_url-without-hub_token_env config always warns" — the mutant
+  # drops the warning, so the url-only count assertion above goes RED (the
+  # mutant run itself must show zero warning lines).
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant hub-1138-nowarn \
+    '  if [[ -n "$hub_url" && -z "$token_env" && "${HUB_QUOTA_GATE_WARNED:-0}" -eq 0 ]]; then' \
+    '  if false; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-hub-1138-nowarn" \
+    hub_quota_run_case mut-nowarn 70 ok "$url_only"
+  if [[ "$(hub_quota_warn_count)" -ne 0 ]]; then
+    fail "#1138 M1 mutant survived: the url-only spawn still warned"
+  fi
+  echo "PASS 1138-hub M1: dropping the warning goes RED"
+
+  # M2: "the warning prints once per spawn" — the mutant emits it twice, so
+  # the exact-count assertions go RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant hub-1138-warntwice \
+    '    warn "[hub] hub_url is set but hub_token_env is not; hub quota gate skipped (local scopefuel gate only)"' \
+    '    warn "[hub] hub_url is set but hub_token_env is not; hub quota gate skipped (local scopefuel gate only)"
+    warn "[hub] hub_url is set but hub_token_env is not; hub quota gate skipped (local scopefuel gate only)"'
+  WRK_UNDER_TEST="$TMP/mut-wrk-hub-1138-warntwice" \
+    hub_quota_run_case mut-warntwice 70 ok "$url_only"
+  if [[ "$(hub_quota_warn_count)" -ne 2 ]]; then
+    fail "#1138 M2 mutant survived: the doubled warning did not reach stderr"
+  fi
+  echo "PASS 1138-hub M2: emitting the warning twice goes RED"
+
+  # M3: "an unknown quota_gate value is a config error" — the mutant treats an
+  # unknown value as absent, so gate-bogus spawns rc 0 instead of refusing.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant hub-1138-gateabsent \
+    '    if [[ "$quota_gate" != local ]]; then' \
+    '    if false; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-hub-1138-gateabsent" \
+    hub_quota_run_case mut-gateabsent 70 ok "$gate_bogus"
+  if [[ "$HUB_QUOTA_RC" -eq 70 ]]; then
+    fail "#1138 M3 mutant survived: an unknown quota_gate value still refused"
+  fi
+  echo "PASS 1138-hub M3: treating an unknown quota_gate as absent goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_HUB_QUOTA:-0}" -eq 1 ]]; then
@@ -997,6 +1123,13 @@ chmod 600 "$LANES_NODE_PREFIX_FILE"
 LANES_CFG_PREFIX="$TMP/lanes-prefix-hosts.toml"
 printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
   "$LANES_NODE_PREFIX_FILE" >"$LANES_CFG_PREFIX"
+# #1138: the same lanes-only shape plus quota_gate = "local" — the deliberate
+# opt-out that takes the identical local-only path without the warning.
+LANES_CFG_NODE_LOCAL="$TMP/lanes-node-local-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nhub_cf_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\nquota_gate = "local"\n' \
+  "$LANES_NODE_FILE" "$LANES_CF_FILE" >"$LANES_CFG_NODE_LOCAL"
+# #1138: the skipped-gate warning's exact line, counted on a spawn's stderr.
+HUB_GATE_WARN_TEXT='wrk: warning: [hub] hub_url is set but hub_token_env is not; hub quota gate skipped (local scopefuel gate only)'
 
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
@@ -1568,7 +1701,34 @@ PY
   fi
   grep -q ' lane=lane-1037-ac1@mac-work-default$' "$LANES_OUT" ||
     fail "#1037 AC1: the OK line must carry the registered lane"
+  # #1138 AC8d: a lanes-only [hub] without quota_gate still registers the lane
+  # AND prints the skipped-gate warning exactly once.
+  [[ "$(grep -cxF "$HUB_GATE_WARN_TEXT" "$LANES_ERR")" -eq 1 ]] ||
+    fail "#1138 AC8d: a lanes-only spawn must warn exactly once: $(cat "$LANES_ERR")"
   echo "PASS 1037-lanes AC1: lanes-only registers, quota gate stays off"
+
+  # #1138 AC8c: the same lanes-only shape plus quota_gate = "local" takes the
+  # identical local-only path silently — lane registered, no warning.
+  LANES_CFG_OVERRIDE="$LANES_CFG_NODE_LOCAL" HERDR_SESSION=default \
+    lanes_spawn lane-1138-local --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1138 AC8c: a quota_gate=local spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_CALLS" <<'PY' ||
+import sys
+try:
+    got = open(sys.argv[1], encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+assert got[:2] == ["add", "lane-1138-local"], \
+    "quota_gate=local must leave lanes registration intact: %r" % got
+PY
+    fail "#1138 AC8c: quota_gate=local must still register the lane"
+  [[ "$(grep -cxF "$HUB_GATE_WARN_TEXT" "$LANES_ERR")" -eq 0 ]] ||
+    fail "#1138 AC8c: quota_gate=local must suppress the warning: $(cat "$LANES_ERR")"
+  if [[ -f "$LANES_PANEWIRE_LOG" ]] && grep -qxF 'place' "$LANES_PANEWIRE_LOG"; then
+    fail "#1138 AC8c: quota_gate=local must never invoke the quota gate"
+  fi
+  echo "PASS 1138-lanes: quota_gate=local registers the lane without the warning"
 
   # AC2 — both credentials: lanes routes use lanes_token_env while the quota
   # gate keeps hub_token_env. Assert each panewire call's exact argv.
