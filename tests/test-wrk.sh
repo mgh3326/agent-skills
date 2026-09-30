@@ -457,6 +457,9 @@ run_t1090_remote_err_tests() {
       WRK_SSH_SCENARIO_MAC_WORK="${T1090_SSH_SCENARIO_MAC_WORK:-}" \
       WRK_SCP_SCENARIO="${T1090_SCP_SCENARIO:-ok}" \
       WRK_SCP_SCENARIO_DESKTOP="${T1090_SCP_SCENARIO_DESKTOP:-}" \
+      WRK_REMOTE_RC="${T1090_REMOTE_RC:-}" \
+      WRK_REMOTE_STDERR_LINE="${T1090_REMOTE_STDERR_LINE:-}" \
+      WRK_REMOTE_STDOUT_LINE="${T1090_REMOTE_STDOUT_LINE:-}" \
       "${T1090_WRK:-$WRK}" spawn -c "${T1090_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
       -w w -l fixture --t T1 --job "t1090-$RANDOM-$RANDOM" --host "${T1090_HOST_ARG:-desktop}"
   }
@@ -738,6 +741,193 @@ run_t1090_remote_err_tests() {
     fail "M2: forwarding stdout on success must turn AC4 red, but output stayed identical"
   fi
   echo "PASS t1090 M2: stdout-on-success mutant goes RED (AC4 assertion: stderr no longer empty)"
+
+  # -- #1154: under --host auto a remote config error (rc 70) stops the round --
+  # A remote wrk's own fail-closed answer (its quota gate refusing a malformed
+  # [hub] config on the execution host) must never reach the local fallback —
+  # the spawning host may be closed to spawns. Transport legs are normalized
+  # away from 70, so a router-visible 70 is always the remote wrk's own answer.
+  T1154_REMOTE_MSG='wrk: [hub] quota_gate accepts only "local"; refusing spawn'
+  T1154_ATTR_DESKTOP="wrk: remote host 'desktop' refused the spawn with a config error (rc=70); not falling back to local"
+  T1154_ATTR_MAC_WORK="wrk: remote host 'mac-work' refused the spawn with a config error (rc=70); not falling back to local"
+
+  # AC1: the first candidate's remote wrk exits 70 — the round returns 70,
+  # tries no second candidate and never runs a local spawn_cmd; the remote's
+  # message and the attribution line land on stderr exactly once.
+  rm -f "$TMP/t1090-herdr.log" "$TMP/t1090-ssh.log"
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=remote-config-refused \
+      T1090_SSH_SCENARIO_MAC_WORK=ok t1090_spawn ) >"$TMP/t1154-ac1.out" 2>"$TMP/t1154-ac1.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 70 ]] ||
+    fail "1154 AC1: a remote config error must return rc 70, got $t1090_rc: $(cat "$TMP/t1154-ac1.err")"
+  # The local pressure probe itself calls `herdr agent list`; a local pane
+  # exists only once `tab create` runs.
+  ! grep -q 'tab create' "$TMP/t1090-herdr.log" ||
+    fail "1154 AC1: a remote config error landed a local pane: $(cat "$TMP/t1090-herdr.log")"
+  [[ ! -s "$TMP/t1154-ac1.out" ]] ||
+    fail "1154 AC1: a refused spawn must not write to stdout: $(cat "$TMP/t1154-ac1.out")"
+  grep -q 'desktop' "$TMP/t1090-ssh.log" ||
+    fail "1154 AC1: the first candidate was never tried: $(cat "$TMP/t1090-ssh.log" 2>/dev/null)"
+  ! grep -q 'mac-work' "$TMP/t1090-ssh.log" ||
+    fail "1154 AC1: the round tried the second candidate after rc 70: $(cat "$TMP/t1090-ssh.log")"
+  [[ "$(grep -cxF "$T1154_REMOTE_MSG" "$TMP/t1154-ac1.err")" -eq 1 ]] ||
+    fail "1154 AC1: the remote refusal line must appear exactly once: $(cat "$TMP/t1154-ac1.err")"
+  [[ "$(grep -cxF "$T1154_ATTR_DESKTOP" "$TMP/t1154-ac1.err")" -eq 1 ]] ||
+    fail "1154 AC1: the attribution line must appear exactly once: $(cat "$TMP/t1154-ac1.err")"
+  ! grep -qF 'no remote spill-over candidate completed' "$TMP/t1154-ac1.err" ||
+    fail "1154 AC1: the fallback warning must not fire on a config stop: $(cat "$TMP/t1154-ac1.err")"
+  echo "PASS t1154 AC1 remote-config-error-stops-round"
+
+  # A transport failure on candidate one still moves on to the next remote —
+  # the control case the M2 mutant turns RED by mapping that 255 to 70.
+  rm -f "$TMP/t1090-herdr.log" "$TMP/t1090-ssh.log"
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1090_SSH_SCENARIO_MAC_WORK=ok t1090_spawn ) >"$TMP/t1154-tf.out" 2>"$TMP/t1154-tf.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "1154 transport-failover: expected rc=0, got $t1090_rc: $(cat "$TMP/t1154-tf.err")"
+  cmp -s "$TMP/t1090-auto1.want" "$TMP/t1154-tf.out" ||
+    fail "1154 transport-failover: expected the mac-work OK line: $(cat "$TMP/t1154-tf.out")"
+  echo "PASS t1154 transport-failover-control"
+
+  # AC2: a transport failure on candidate one moves on; the second
+  # candidate's remote wrk config error (rc 70) still stops the round.
+  rm -f "$TMP/t1090-herdr.log" "$TMP/t1090-ssh.log"
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1090_SSH_SCENARIO_MAC_WORK=remote-config-refused t1090_spawn ) >"$TMP/t1154-ac2.out" 2>"$TMP/t1154-ac2.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 70 ]] ||
+    fail "1154 AC2: rc must be 70 after the second candidate's config error, got $t1090_rc: $(cat "$TMP/t1154-ac2.err")"
+  ! grep -q 'tab create' "$TMP/t1090-herdr.log" ||
+    fail "1154 AC2: a remote config error landed a local pane: $(cat "$TMP/t1090-herdr.log")"
+  [[ ! -s "$TMP/t1154-ac2.out" ]] ||
+    fail "1154 AC2: a refused spawn must not write to stdout: $(cat "$TMP/t1154-ac2.out")"
+  grep -qF "remote host 'desktop' probe failed (ssh-unreachable, rc=255)" "$TMP/t1154-ac2.err" ||
+    fail "1154 AC2: desktop probe line missing: $(cat "$TMP/t1154-ac2.err")"
+  [[ "$(grep -cxF "$T1154_ATTR_MAC_WORK" "$TMP/t1154-ac2.err")" -eq 1 ]] ||
+    fail "1154 AC2: the mac-work attribution line must appear exactly once: $(cat "$TMP/t1154-ac2.err")"
+  ! grep -qF 'no remote spill-over candidate completed' "$TMP/t1154-ac2.err" ||
+    fail "1154 AC2: the fallback warning must not fire on a config stop: $(cat "$TMP/t1154-ac2.err")"
+  echo "PASS t1154 AC2 transport-failure-then-config-error-stops"
+
+  # AC3: all-remote non-stop failures keep main's local fallback — remote rc 1
+  # on both candidates, then a remote quota refusal (rc 4) on the first.
+  rm -f "$TMP/t1090-herdr.log" "$TMP/t1090-ssh.log"
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=remote-die-stderr \
+      T1090_SSH_SCENARIO_MAC_WORK=remote-die-stderr t1090_spawn ) >"$TMP/t1154-ac3.out" 2>"$TMP/t1154-ac3.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "1154 AC3: non-stop remote failures must keep the local fallback, got rc=$t1090_rc: $(cat "$TMP/t1154-ac3.err")"
+  grep -q 'host=local' "$TMP/t1154-ac3.out" ||
+    fail "1154 AC3: expected a local landing on stdout: $(cat "$TMP/t1154-ac3.out")"
+  grep -qF 'no remote spill-over candidate completed' "$TMP/t1154-ac3.err" ||
+    fail "1154 AC3: the fallback warning is missing: $(cat "$TMP/t1154-ac3.err")"
+  grep -q 'tab create' "$TMP/t1090-herdr.log" ||
+    fail "1154 AC3: the local fallback never created a pane: $(cat "$TMP/t1090-herdr.log")"
+  grep -q 'mac-work' "$TMP/t1090-ssh.log" ||
+    fail "1154 AC3: the round never tried the second candidate"
+
+  rm -f "$TMP/t1090-herdr.log" "$TMP/t1090-ssh.log"
+  set +e
+  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=remote-die-stderr T1090_REMOTE_RC=4 \
+      T1090_SSH_SCENARIO_MAC_WORK=probe-unreachable t1090_spawn ) >"$TMP/t1154-ac3b.out" 2>"$TMP/t1154-ac3b.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "1154 AC3 rc4: a remote rc 4 must keep the local fallback, got rc=$t1090_rc: $(cat "$TMP/t1154-ac3b.err")"
+  grep -q 'host=local' "$TMP/t1154-ac3b.out" ||
+    fail "1154 AC3 rc4: expected a local landing on stdout: $(cat "$TMP/t1154-ac3b.out")"
+  grep -qF 'no remote spill-over candidate completed' "$TMP/t1154-ac3b.err" ||
+    fail "1154 AC3 rc4: the fallback warning is missing: $(cat "$TMP/t1154-ac3b.err")"
+  echo "PASS t1154 AC3 non-stop-rcs-still-fall-back"
+
+  # AC4: explicit --host NAME is unchanged — the remote's own words stream
+  # live, the named-host failure line keeps its main shape, and rc propagates.
+  rm -f "$TMP/t1090-herdr.log" "$TMP/t1090-ssh.log"
+  set +e
+  ( T1090_SSH_SCENARIO=remote-config-refused t1090_spawn ) >"$TMP/t1154-ac4.out" 2>"$TMP/t1154-ac4.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 70 ]] ||
+    fail "1154 AC4: an explicit host must propagate rc 70, got $t1090_rc: $(cat "$TMP/t1154-ac4.err")"
+  grep -qF "$T1154_REMOTE_MSG" "$TMP/t1154-ac4.err" ||
+    fail "1154 AC4: the remote refusal line is missing: $(cat "$TMP/t1154-ac4.err")"
+  grep -qF "wrk: remote spawn on explicit host 'desktop' failed (rc=70) at step 'remote wrk'; no local fallback — fix the remote or use --host local" "$TMP/t1154-ac4.err" ||
+    fail "1154 AC4: the explicit-host failure line changed shape: $(cat "$TMP/t1154-ac4.err")"
+  ! grep -qF 'refused the spawn with a config error' "$TMP/t1154-ac4.err" ||
+    fail "1154 AC4: the auto attribution line must not appear on an explicit host: $(cat "$TMP/t1154-ac4.err")"
+  ! grep -q 'tab create' "$TMP/t1090-herdr.log" ||
+    fail "1154 AC4: an explicit-host refusal must not create a local pane"
+  echo "PASS t1154 AC4 explicit-host-unchanged"
+
+  # AC5 assertion-RED mutants.
+  # M1 "a remote config error never lands a local pane": dropping 70 from the
+  # stop set reproduces the #1146 N4 bug — the round falls through, the local
+  # fallback lands a pane, and the AC1 no-local-pane assertion goes RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1154-no-70-stop \
+    '      "$WRK_EXIT_CONFIG_REFUSED")' \
+    '      970)'
+  rm -f "$TMP/t1090-herdr.log" "$TMP/t1090-ssh.log"
+  set +e
+  ( T1090_WRK="$TMP/mut-wrk-t1154-no-70-stop" \
+      T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=remote-config-refused \
+      T1090_SSH_SCENARIO_MAC_WORK=probe-unreachable t1090_spawn ) >"$TMP/t1154-m1.out" 2>"$TMP/t1154-m1.err"
+  t1090_rc=$?
+  set -e
+  if [[ "$t1090_rc" -eq 70 ]]; then
+    fail "1154 M1 mutant survived: dropping 70 from the stop set still stopped the round"
+  fi
+  grep -q 'host=local' "$TMP/t1154-m1.out" ||
+    fail "1154 M1: the mutant should land the local fallback pane main produced"
+  grep -q 'tab create' "$TMP/t1090-herdr.log" ||
+    fail "1154 M1: the mutant should show the forbidden local pane creation"
+  echo "PASS t1154 M1: no-70-stop mutant goes RED (AC1 assertion 'a remote config error lands no local pane' fails: rc=$t1090_rc, local pane created)"
+
+  # M2 "only the remote wrk's own 70 stops the round": the mutant maps every
+  # transport-leg failure to 70, so a dead probe (ssh 255) is misread as a
+  # config refusal — the transport-failover control above goes RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1154-transport-to-70 \
+    "    *) printf '%s' \"\$1\" ;;" \
+    "    *) printf '70' ;;"
+  rm -f "$TMP/t1090-herdr.log" "$TMP/t1090-ssh.log"
+  set +e
+  ( T1090_WRK="$TMP/mut-wrk-t1154-transport-to-70" \
+      T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+      T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
+      T1090_SSH_SCENARIO_MAC_WORK=ok t1090_spawn ) >"$TMP/t1154-m2.out" 2>"$TMP/t1154-m2.err"
+  t1090_rc=$?
+  set -e
+  if [[ "$t1090_rc" -eq 0 ]] && cmp -s "$TMP/t1090-auto1.want" "$TMP/t1154-m2.out"; then
+    fail "1154 M2 mutant survived: a transport failure still failed over to mac-work"
+  fi
+  [[ "$t1090_rc" -eq 70 ]] ||
+    fail "1154 M2: the mutant should stop the round with rc 70, got $t1090_rc"
+  ! grep -q 'mac-work' "$TMP/t1090-ssh.log" ||
+    fail "1154 M2: the mutant must stop before the second candidate"
+  echo "PASS t1154 M2: transport-to-70 mutant goes RED (transport-failover assertion 'rc 0 + mac-work OK line' fails: rc=$t1090_rc)"
 }
 
 # Slice gate: WRK_TEST_ONLY_REMOTE_ERR=1 runs only this section after the

@@ -23,6 +23,11 @@ WRK_EXIT_LANDING_UNCONFIRMED=76
 WRK_EXIT_ROUND_CAP=78
 # #872: distinguish physical mock MCP isolation refusal from quota/usage errors.
 WRK_EXIT_MOCK_MCP_REFUSED=79
+# The hub quota gate's fail-closed refusals (a bad [hub] quota_gate value, a
+# contradictory or incomplete gate config, a rejected policy response).  A
+# remote wrk answers its delegated spawn with 70, and under --host auto that
+# must stop the candidate round (#1154) — never fall back to a local spawn.
+WRK_EXIT_CONFIG_REFUSED=70
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -282,6 +287,19 @@ line then ends with via=herdr-fallback.
                      env, #626); PURPOSE director leaves them as configured.
                      This is a purpose axis, distinct from the
                      --operator-request REF format gate above.
+  --host auto|local|NAME
+                     spawn placement. auto (the default) asks the hub first;
+                     when the hub cannot answer, local pressure decides and
+                     each configured remote host is tried in order. A remote
+                     candidate whose own wrk refuses the spawn with a config
+                     error (rc 70 — e.g. a malformed [hub] quota_gate on that
+                     host) stops the round immediately: the spawn fails
+                     closed with rc 70 and never falls back to local (#1154).
+                     Other remote failures move on to the next candidate, and
+                     only when every candidate fails does auto fall back to a
+                     local spawn. local forces a local spawn; NAME forces one
+                     remote host and propagates its exit code with no local
+                     fallback.
   -h, --help         show this usage
 
 Hub lane registration (#965): a --role worker spawn whose effective herdr
@@ -6206,13 +6224,15 @@ spillover_relay_remote_err() {
 }
 
 # Transport legs (probe, prepare, mktemp, scp) must never answer the router
-# with an admission code: 2/74/75 belong to the remote wrk and the cwd map —
-# fail-closed answers that stop auto failover.  A transport exit landing in
-# that set is remapped to 1 so failover proceeds exactly as it did when every
-# leg returned a flat 1.
+# with an admission code: 2/74/75 belong to the remote wrk and the cwd map,
+# and 70 to the remote wrk's own config refusal — fail-closed answers that
+# stop auto failover.  A transport exit landing in that set is remapped to 1
+# so failover proceeds exactly as it did when every leg returned a flat 1;
+# it also means a 70 the router sees can only be the remote wrk's own answer
+# from the delegated-spawn leg, which is never normalized (#1154).
 spillover_transport_rc() {
   case "$1" in
-    2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE") printf '1' ;;
+    2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_CONFIG_REFUSED") printf '1' ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -6672,6 +6692,20 @@ spawn_router_cmd() {
         [[ -s "$auto_diag" ]] && cat "$auto_diag" >&2
         rm -f "$auto_diag"
         return "$last_rc" ;;
+      "$WRK_EXIT_CONFIG_REFUSED")
+        # #1154: a remote wrk's config refusal (its own quota gate answering
+        # 70) stops the auto round like the admission refusals above — the
+        # round must never reach the local fallback, which could land the job
+        # on a host closed to spawns. Transport legs cannot produce 70
+        # (spillover_transport_rc maps it to 1), so this rc is always the
+        # remote wrk's own answer. An explicit --host NAME keeps its contract:
+        # it falls through to the named-host failure line below.
+        if [[ "$requested" == auto ]]; then
+          [[ -s "$auto_diag" ]] && cat "$auto_diag" >&2
+          echo "wrk: remote host '$candidate' refused the spawn with a config error (rc=$last_rc); not falling back to local" >&2
+          rm -f "$auto_diag"
+          return "$last_rc"
+        fi ;;
     esac
   done
   # An explicit --host NAME is an operator forcing one remote: propagate the
