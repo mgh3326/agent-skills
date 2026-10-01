@@ -406,6 +406,145 @@ hub_quota_expect_warn() {  # NAME WANT_COUNT — the #1138 skipped-gate warning
     fail "hub quota combination $name expected $want skipped-gate warning(s), got $got: $(cat "$HUB_QUOTA_ERR")"
 }
 
+# ---------------------------------------------------------------------------
+# #1045 (scopefuel #1024): a broken config makes `policy launch` print a long
+# "scopefuel: warning:" line ahead of the refusal, and the old squeeze+cut of
+# all stderr kept the warning while truncating the actual reason away. The
+# reason is now built from non-warning lines only — the warnings are
+# re-emitted verbatim on stderr — with a last-non-empty-line fallback and the
+# same 240-char cap. The slice lives this early so its ONLY gate can run
+# before the spill-over sections (they reach real ssh on some hosts).
+# ---------------------------------------------------------------------------
+run_t1045_catalog_reason_tests() {
+  # codex-astra is the clean refusal vehicle: its default architect purpose
+  # passes the quota gate while WRK_LAUNCH_MODE=refused makes the catalog
+  # refuse rc 3, so the held-back catalog die — not the gate — is what speaks.
+  local t1045_warn t1045_warn_line t1045_warn_b t1045_warn_two
+  t1045_warn="$TMP/cfg home path/.config/scopefuel/config.toml: TOML parse error at line 12, column 5 — duplicate table 'bench'; falling back to defaults"
+  t1045_warn_line="scopefuel: warning: $t1045_warn"
+  t1045_warn_b="the same broken config is still being read; check the file"
+  t1045_warn_two="$t1045_warn"$'\n'"$t1045_warn_b"
+
+  # AC1 body — warning + refusal stderr: the die quotes the refusal, not the
+  # warning; the warning reaches stderr verbatim exactly once. $1 tags the
+  # job so mutant runs do not collide with the green one.
+  t1045_ac1_body() {
+    local tag="${1:-green}" out rc=0 die_line
+    out="$(WRK_LAUNCH_MODE=refused WRK_LAUNCH_CONFIG_WARN="$t1045_warn" \
+      spawn_base codex-astra --job "t1045-ac1-$tag" --t T0 2>&1)" || rc=$?
+    [[ "$rc" -eq 2 ]] ||
+      fail "1045 AC1: the catalog refusal must die rc 2, got rc $rc: $out"
+    die_line="$(grep -F "refused profile 'codex-astra'" <<<"$out")" ||
+      fail "1045 AC1: no catalog refusal die line: $out"
+    grep -qF "consult_only; pass --operator-request" <<<"$die_line" ||
+      fail "1045 AC1: a leading scopefuel warning never hides the refusal reason: $die_line"
+    if grep -qF 'scopefuel: warning:' <<<"$die_line"; then
+      fail "1045 AC1: a leading scopefuel warning never hides the refusal reason: $die_line"
+    fi
+    [[ "$(grep -cxF "$t1045_warn_line" <<<"$out")" -eq 1 ]] ||
+      fail "1045 AC1: the warning must reach stderr verbatim exactly once: $out"
+  }
+  # AC2b body — only warning lines on stderr: the reason falls back to the
+  # last non-empty line (the second warning), never 'no reason reported'.
+  t1045_ac2b_body() {
+    local tag="${1:-green}" out rc=0 die_line
+    out="$(WRK_LAUNCH_MODE=refused WRK_LAUNCH_REFUSE_QUIET=1 \
+      WRK_LAUNCH_CONFIG_WARN="$t1045_warn_two" \
+      spawn_base codex-astra --job "t1045-ac2b-$tag" --t T0 2>&1)" || rc=$?
+    [[ "$rc" -eq 2 ]] ||
+      fail "1045 AC2: the quiet catalog refusal must die rc 2, got rc $rc: $out"
+    die_line="$(grep -F "refused profile 'codex-astra'" <<<"$out")" ||
+      fail "1045 AC2: no catalog refusal die line: $out"
+    if grep -qF 'no reason reported' <<<"$die_line"; then
+      fail "1045 AC2: an all-warning stderr still yields a reason: $die_line"
+    fi
+    grep -qF "scopefuel: warning: $t1045_warn_b" <<<"$die_line" ||
+      fail "1045 AC2: the fallback reason must be the last non-empty line: $die_line"
+  }
+  t1045_warn_probe() { ( WRK_UNDER_TEST="$1" t1045_ac1_body "$2" ); }
+  t1045_fallback_probe() { ( WRK_UNDER_TEST="$1" t1045_ac2b_body "$2" ); }
+  # Same contract as the expect_red helper in the #921 mutants block below —
+  # redeclared here so this slice's early gate needs no late definitions.
+  t1045_expect_red() {
+    local label="$1"; shift
+    local rc=0
+    "$@" >/dev/null 2>&1 || rc=$?
+    [[ "$rc" -eq 1 ]] || fail "mutant $label: expected assertion RED (rc 1), got rc $rc"
+  }
+
+  # AC1
+  t1045_ac1_body
+  echo "PASS 1045-AC1-warning-does-not-hide-the-refusal-reason"
+
+  # AC2a — refusal with no warning line: the die message is identical to main.
+  # (The refusal line's trailing newline squeezes to one trailing space, so the
+  # expected line ends in a space.)
+  local t1045_ac2a_out t1045_ac2a_rc=0 t1045_die
+  t1045_ac2a_out="$(WRK_LAUNCH_MODE=refused spawn_base codex-astra --job t1045-ac2a --t T0 2>&1)" || t1045_ac2a_rc=$?
+  [[ "$t1045_ac2a_rc" -eq 2 ]] ||
+    fail "1045 AC2: the plain refusal must die rc 2, got rc $t1045_ac2a_rc: $t1045_ac2a_out"
+  t1045_die="$(grep -F "refused profile 'codex-astra'" <<<"$t1045_ac2a_out")" ||
+    fail "1045 AC2: no catalog refusal die line: $t1045_ac2a_out"
+  [[ "$t1045_die" == "wrk: scopefuel policy launch refused profile 'codex-astra' (catalog profile 'codex-astra'): error: profile 'codex-astra' is consult_only; pass --operator-request " ]] ||
+    fail "1045 AC2: the no-warning die message drifted from main: <$t1045_die>"
+
+  # AC2b — only warning lines: fall back to the last non-empty line.
+  t1045_ac2b_body
+
+  # AC2c — empty stderr: no reason reported, as on main.
+  local t1045_ac2c_out t1045_ac2c_rc=0
+  t1045_ac2c_out="$(WRK_LAUNCH_MODE=refused WRK_LAUNCH_REFUSE_QUIET=1 \
+    spawn_base codex-astra --job t1045-ac2c --t T0 2>&1)" || t1045_ac2c_rc=$?
+  [[ "$t1045_ac2c_rc" -eq 2 ]] ||
+    fail "1045 AC2: the silent refusal must die rc 2, got rc $t1045_ac2c_rc: $t1045_ac2c_out"
+  t1045_die="$(grep -F "refused profile 'codex-astra'" <<<"$t1045_ac2c_out")" ||
+    fail "1045 AC2: no catalog refusal die line: $t1045_ac2c_out"
+  [[ "$t1045_die" == "wrk: scopefuel policy launch refused profile 'codex-astra' (catalog profile 'codex-astra'): no reason reported" ]] ||
+    fail "1045 AC2: an empty stderr must report no reason, as on main: <$t1045_die>"
+  echo "PASS 1045-AC2-plain-identical-warnonly-fallback-empty-none"
+
+  # AC3 — a refusal line longer than 240 characters is still cut at 240.
+  local t1045_long t1045_ac3_out t1045_ac3_rc=0
+  t1045_long="$(printf 'x%.0s' {1..300})"
+  t1045_ac3_out="$(WRK_LAUNCH_MODE=refused WRK_LAUNCH_CONFIG_WARN="$t1045_warn" \
+    WRK_LAUNCH_REFUSE_TEXT="$t1045_long" \
+    spawn_base codex-astra --job t1045-ac3 --t T0 2>&1)" || t1045_ac3_rc=$?
+  [[ "$t1045_ac3_rc" -eq 2 ]] ||
+    fail "1045 AC3: the long refusal must die rc 2, got rc $t1045_ac3_rc: $t1045_ac3_out"
+  t1045_die="$(grep -F "refused profile 'codex-astra'" <<<"$t1045_ac3_out")" ||
+    fail "1045 AC3: no catalog refusal die line: $t1045_ac3_out"
+  [[ "$t1045_die" == "wrk: scopefuel policy launch refused profile 'codex-astra' (catalog profile 'codex-astra'): ${t1045_long:0:240}" ]] ||
+    fail "1045 AC3: a >240-char refusal reason must still be cut at 240: <${t1045_die:0:60}…>"
+  echo "PASS 1045-AC3-refusal-still-cut-at-240"
+
+  # AC4 — assertion-RED mutants (devin_trust_mutant is the suite's generic
+  # one-site source replace; expect_red's late definition is why this slice
+  # carries its own check).
+  # M1 — invariant "a leading scopefuel warning never hides the refusal
+  # reason": keeping the warning lines in the reason restores the truncation.
+  devin_trust_mutant t1045-warnkept \
+    "CATALOG_REFUSE_REASON=\"\$(grep -v '^scopefuel: warning:' \"\$err_file\" | tr -s '[:space:]' ' ' | cut -c1-240 || true)\"" \
+    "CATALOG_REFUSE_REASON=\"\$(cat \"\$err_file\" | tr -s '[:space:]' ' ' | cut -c1-240)\""
+  # M2 — invariant "an all-warning stderr still yields a reason": dropping the
+  # fallback leaves the die at 'no reason reported'.
+  devin_trust_mutant t1045-nofallback \
+    "    if [[ -z \"\$CATALOG_REFUSE_REASON\" ]]; then
+      CATALOG_REFUSE_REASON=\"\$(grep . \"\$err_file\" | tail -n 1 | tr -s '[:space:]' ' ' | cut -c1-240 || true)\"
+    fi" \
+    "    :"
+  t1045_expect_red leading-warning-hides-reason t1045_warn_probe "$TMP/mut-wrk-t1045-warnkept" m1
+  t1045_expect_red all-warning-yields-no-reason t1045_fallback_probe "$TMP/mut-wrk-t1045-nofallback" m2
+  echo "PASS 1045-AC4-mutants-red (M1 keep-warning, M2 no-fallback)"
+}
+
+# Slice gate: WRK_TEST_ONLY_CATALOG_REASON=1 runs only this section after the
+# shared fixture setup — every spawn is fixture-backed, no real agent runs.
+if [[ "${WRK_TEST_ONLY_CATALOG_REASON:-0}" -eq 1 ]]; then
+  run_t1045_catalog_reason_tests
+  exit 0
+fi
+run_t1045_catalog_reason_tests
+
 run_t1090_remote_err_tests() {
   # -- #1090: a failed remote spawn must say why -------------------------------
   # The remote legs used to swallow the remote's own words: the probe and the

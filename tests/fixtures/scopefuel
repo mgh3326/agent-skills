@@ -58,6 +58,16 @@ catalog_effort_for() {
 }
 
 if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
+  # #1045: since scopefuel #1024 a broken config prints a "scopefuel: warning:"
+  # line on stderr ahead of any refusal. Each line of WRK_LAUNCH_CONFIG_WARN
+  # becomes one warning line; WRK_LAUNCH_REFUSE_QUIET=1 refuses rc 3 with no
+  # reason line (an all-warning stderr); WRK_LAUNCH_REFUSE_TEXT replaces the
+  # consult_only reason text (e.g. a >240-char line for the cap check).
+  if [[ -n "${WRK_LAUNCH_CONFIG_WARN:-}" ]]; then
+    while IFS= read -r cfg_warn_line; do
+      printf 'scopefuel: warning: %s\n' "$cfg_warn_line" >&2
+    done <<<"$WRK_LAUNCH_CONFIG_WARN"
+  fi
   case "${WRK_LAUNCH_MODE:-ok}" in
     # An installed scopefuel too old to have the subcommand at all.
     unsupported) echo "error: argument command: invalid choice: 'policy launch'" >&2; exit 2 ;;
@@ -94,7 +104,14 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   case "$launch_profile" in
     fable|codex-astra)
       if [[ "$launch_allowed" -ne 1 || "${WRK_LAUNCH_MODE:-ok}" == refused ]]; then
-        echo "error: profile '$launch_profile' is consult_only; pass --operator-request" >&2
+        if [[ "${WRK_LAUNCH_REFUSE_QUIET:-0}" == 1 ]]; then
+          exit 3
+        fi
+        if [[ -n "${WRK_LAUNCH_REFUSE_TEXT:-}" ]]; then
+          printf '%s\n' "$WRK_LAUNCH_REFUSE_TEXT" >&2
+        else
+          echo "error: profile '$launch_profile' is consult_only; pass --operator-request" >&2
+        fi
         exit 3
       fi ;;
   esac
