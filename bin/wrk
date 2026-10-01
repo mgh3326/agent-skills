@@ -6999,8 +6999,13 @@ spawn_router_cmd() {
       # the probe: silent when a later candidate lands, one held
       # diagnostic line on an all-fail round, and neutral for the wake
       # decision — it neither ends the round nor counts as remote-full
-      # evidence. An explicit --host NAME keeps the cwd-map rc 2.
-      if ! spillover_cwd_map "$candidate" "$cwd"; then
+      # evidence. The hub's own pick is exempt: a hub-selected host that
+      # cannot map the cwd keeps the fail-closed rc 2 contract — the
+      # placement decision is authoritative, and quietly moving past it
+      # would hide a broken config. An explicit --host NAME keeps the
+      # cwd-map rc 2 too.
+      if { [[ "$candidate" != "$selected" ]] || [[ "$SPILL_DECISION_SOURCE" != hub ]]; } &&
+         ! spillover_cwd_map "$candidate" "$cwd"; then
         printf "wrk: remote host '%s' skipped: no cwd_map entry for '%s'\n" "$candidate" "$cwd" >>"$auto_diag"
         continue
       fi

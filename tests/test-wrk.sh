@@ -2756,14 +2756,10 @@ run_t1239_desktop_wake_tests() {
   # its remote refuses rc 2 at cwd-map, the stop set ends the round before
   # the post-round wake; R2(a)'s 'wake fires, lands desktop' fails.
   devin_trust_mutant t1239-unmapped-stops-round \
-    '      if ! spillover_cwd_map "$candidate" "$cwd"; then
-        printf "wrk: remote host '"'"'%s'"'"' skipped: no cwd_map entry for '"'"'%s'"'"'\n" "$candidate" "$cwd" >>"$auto_diag"
-        continue
-      fi' \
-    '      if false; then
-        printf "wrk: remote host '"'"'%s'"'"' skipped: no cwd_map entry for '"'"'%s'"'"'\n" "$candidate" "$cwd" >>"$auto_diag"
-        continue
-      fi'
+    '      if { [[ "$candidate" != "$selected" ]] || [[ "$SPILL_DECISION_SOURCE" != hub ]]; } &&
+         ! spillover_cwd_map "$candidate" "$cwd"; then' \
+    '      if false &&
+         ! spillover_cwd_map "$candidate" "$cwd"; then'
   rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
   rm -rf "$T1239_AWAKE.held"
   set +e
