@@ -2167,6 +2167,49 @@ run_t1239_desktop_wake_tests() {
     "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 2' >"$T1239_HOSTS_TOKEN_ONLY"
   T1239_HOSTS_NO_CRED="$TMP/t1239-hosts-no-cred.toml"
   sed "/^operator_token_env =/d" "$T1239_HOSTS" >"$T1239_HOSTS_NO_CRED"
+  # Round-2 live-order fixture (tester B1): the real candidate order on this
+  # Mac — desktop, oci, mac-dev, rpi. oci has a cwd_map but no entry for the
+  # repos exercised and no capacity key; rpi has no cwd_map at all. Both are
+  # skipped BEFORE their probe under --host auto and count neither for nor
+  # against the wake. desktop and mac-dev map both repos; mac-dev answers
+  # remote-full and supplies the capacity evidence the wake needs.
+  T1239_TRADER="$TMP/t1239-auto_trader"; mkdir -p "$T1239_TRADER"
+  T1239_HOSTS_LIVE="$TMP/t1239-hosts-live.toml"
+  printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+    '[hub]' 'hub_url = "wss://hub.fixture.invalid"' \
+    "operator_token_env = \"$T1239_OPERATOR\"" 'quota_gate = "local"' '' \
+    '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "w1"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\" \"$T1239_TRADER\"=\"/remote/auto_trader\"}" 'capacity = 4' \
+    'wake = "panewire"' 'wake_hold = 10' 'wake_wait = 2' '' \
+    '[hosts.oci]' 'ssh = "oci"' 'herdr_session = "worker"' 'workspace = "w1"' \
+    'cwd_map = {"/nonexistent-local"="/remote/unrelated"}' '' \
+    '[hosts.mac-dev]' 'ssh = "mac-dev"' 'herdr_session = "worker"' 'workspace = "w1"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\" \"$T1239_TRADER\"=\"/remote/auto_trader\"}" 'capacity = 3' '' \
+    '[hosts.rpi]' 'ssh = "rpi"' 'herdr_session = "worker"' 'workspace = "w1"' >"$T1239_HOSTS_LIVE"
+  # R2(b): the same order with oci mapped for agent-skills and free — the
+  # job lands on oci and no wake fires.
+  T1239_HOSTS_LIVE_OCI="$TMP/t1239-hosts-live-oci.toml"
+  sed "s|cwd_map = {\"/nonexistent-local\"=\"/remote/unrelated\"}|cwd_map = {\"$ROOT\"=\"/remote/oci-work\"} capacity = 3|" \
+    "$T1239_HOSTS_LIVE" >"$T1239_HOSTS_LIVE_OCI"
+  # R2(c): rpi mapped too, so it can answer remote-full while mac-dev
+  # refuses for a non-capacity reason (rc 80 or a transport failure).
+  T1239_HOSTS_LIVE_RPI="$TMP/t1239-hosts-live-rpi.toml"
+  printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+    '[hub]' 'hub_url = "wss://hub.fixture.invalid"' \
+    "operator_token_env = \"$T1239_OPERATOR\"" 'quota_gate = "local"' '' \
+    '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "w1"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 4' \
+    'wake = "panewire"' 'wake_hold = 10' 'wake_wait = 2' '' \
+    '[hosts.oci]' 'ssh = "oci"' 'herdr_session = "worker"' 'workspace = "w1"' \
+    'cwd_map = {"/nonexistent-local"="/remote/unrelated"}' '' \
+    '[hosts.mac-dev]' 'ssh = "mac-dev"' 'herdr_session = "worker"' 'workspace = "w1"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' '' \
+    '[hosts.rpi]' 'ssh = "rpi"' 'herdr_session = "worker"' 'workspace = "w1"' \
+    "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 2' >"$T1239_HOSTS_LIVE_RPI"
+  # R2(d): same live order with local spawns disabled — when no candidate
+  # answers remote-full there is no wake and no local pane.
+  T1239_HOSTS_LIVE_NOLOCAL="$TMP/t1239-hosts-live-nolocal.toml"
+  sed 's/^max_active = 4$/max_active = 4\nspawn = false/' "$T1239_HOSTS_LIVE" >"$T1239_HOSTS_LIVE_NOLOCAL"
 
   t1239_spawn() {  # env knobs mirror t1155_spawn; T1239_* prefixed
     env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
@@ -2185,10 +2228,13 @@ run_t1239_desktop_wake_tests() {
       WRK_SSH_SCENARIO="${T1239_SSH_SCENARIO:-ok}" \
       WRK_SSH_SCENARIO_DESKTOP="${T1239_SSH_SCENARIO_DESKTOP:-}" \
       WRK_SSH_SCENARIO_MAC_WORK="${T1239_SSH_SCENARIO_MAC_WORK:-}" \
+      WRK_SSH_SCENARIO_OCI="${T1239_SSH_SCENARIO_OCI:-}" \
+      WRK_SSH_SCENARIO_MAC_DEV="${T1239_SSH_SCENARIO_MAC_DEV:-}" \
+      WRK_SSH_SCENARIO_RPI="${T1239_SSH_SCENARIO_RPI:-}" \
       WRK_BURST_SCENARIO="${T1239_BURST_SCENARIO:-up}" \
       WRK_DESKTOP_AWAKE="$T1239_AWAKE" \
       WRK_WAKE_POLL_S="${T1239_POLL_S:-0.2}" \
-      "${T1239_WRK:-$WRK}" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" \
+      "${T1239_WRK:-$WRK}" spawn -c "${T1239_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
       -w w -l fixture --t T1 --job "${T1239_JOB:-t1239-$RANDOM-$RANDOM}" --host "${T1239_HOST_ARG:-auto}"
   }
 
@@ -2494,6 +2540,135 @@ run_t1239_desktop_wake_tests() {
     fail "1239 explicit-host timeout: a local pane was created"
   echo "PASS t1239 explicit-host-wake"
 
+  # -- Round-2 fix tests (tester B1/B2, verdict 1239-verify-20261002-0149) --
+
+  # R2(a) live candidate order: desktop asleep+wake, oci reachable but
+  # unmapped for this cwd (skipped BEFORE its probe — no stop, no latch),
+  # mac-dev remote-full, rpi unmapped. The wake fires and the job lands on
+  # desktop — for an agent-skills cwd AND for an auto_trader cwd.
+  for t1239_cwd_name in agent-skills auto_trader; do
+    if [[ "$t1239_cwd_name" == agent-skills ]]; then
+      t1239_scenario_cwd="$ROOT"
+    else
+      t1239_scenario_cwd="$T1239_TRADER"
+    fi
+    rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
+    rm -rf "$T1239_AWAKE.held"
+    set +e
+    ( T1239_HOSTS_OVERRIDE="$T1239_HOSTS_LIVE" T1239_CWD="$t1239_scenario_cwd" \
+        T1239_SSH_SCENARIO_DESKTOP=desktop-asleep T1239_SSH_SCENARIO_MAC_DEV=probe-full \
+        T1239_JOB="t1239-r2a-$t1239_cwd_name" t1239_spawn ) \
+        >"$TMP/t1239-r2a-$t1239_cwd_name.out" 2>"$TMP/t1239-r2a-$t1239_cwd_name.err"
+    t1239_rc=$?
+    set -e
+    [[ "$t1239_rc" -eq 0 ]] ||
+      fail "1239 R2a($t1239_cwd_name): expected rc=0 after the wake, got $t1239_rc: $(cat "$TMP/t1239-r2a-$t1239_cwd_name.err")"
+    cmp -s "$TMP/t1239-ac1.want" "$TMP/t1239-r2a-$t1239_cwd_name.out" ||
+      fail "1239 R2a($t1239_cwd_name): expected the desktop OK line: $(cat "$TMP/t1239-r2a-$t1239_cwd_name.out")"
+    [[ "$(grep -c '^burst request ' "$TMP/t1239-wake.log")" -eq 1 ]] ||
+      fail "1239 R2a($t1239_cwd_name): expected exactly one burst request: $(cat "$TMP/t1239-wake.log" 2>/dev/null || true)"
+    t1239_wake_line="$(grep '^burst request ' "$TMP/t1239-wake.log")"
+    [[ "$t1239_wake_line" == *'--target desktop'* ]] ||
+      fail "1239 R2a($t1239_cwd_name): burst request missing --target desktop: $t1239_wake_line"
+    ! grep -q 'no cwd_map entry' "$TMP/t1239-r2a-$t1239_cwd_name.err" ||
+      fail "1239 R2a($t1239_cwd_name): skipped-candidate diagnostics must stay silent on a landed round: $(cat "$TMP/t1239-r2a-$t1239_cwd_name.err")"
+    ! grep -q 'oci' "$TMP/t1239-ssh.log" ||
+      fail "1239 R2a($t1239_cwd_name): the unmapped candidate must be skipped before its probe: $(cat "$TMP/t1239-ssh.log")"
+  done
+  echo "PASS t1239 R2a live-order-wake-lands-desktop (agent-skills + auto_trader)"
+
+  # R2(b) same live order, but oci mapped and free — the job lands on oci
+  # and no wake fires (the unmapped rpi still skips pre-probe).
+  rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
+  rm -rf "$T1239_AWAKE.held"
+  set +e
+  ( T1239_HOSTS_OVERRIDE="$T1239_HOSTS_LIVE_OCI" \
+      T1239_SSH_SCENARIO_DESKTOP=desktop-asleep T1239_SSH_SCENARIO_MAC_DEV=probe-full \
+      T1239_JOB=t1239-r2b t1239_spawn ) >"$TMP/t1239-r2b.out" 2>"$TMP/t1239-r2b.err"
+  t1239_rc=$?
+  set -e
+  [[ "$t1239_rc" -eq 0 ]] ||
+    fail "1239 R2b: expected rc=0 landing on oci, got $t1239_rc: $(cat "$TMP/t1239-r2b.err")"
+  grep -qF 'OK pane=oci:p7 host=oci' "$TMP/t1239-r2b.out" ||
+    fail "1239 R2b: expected the oci OK line: $(cat "$TMP/t1239-r2b.out")"
+  if [[ -f "$TMP/t1239-wake.log" ]]; then
+    ! grep -q '^burst ' "$TMP/t1239-wake.log" ||
+      fail "1239 R2b: a burst request fired although oci had a free slot"
+  fi
+  echo "PASS t1239 R2b oci-free-lands-no-wake"
+
+  # R2(c) a non-capacity remote answer (rc 80, or a transport failure) does
+  # NOT suppress the wake while another candidate answered remote-full.
+  for t1239_reason in rc80 transport; do
+    rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
+    rm -rf "$T1239_AWAKE.held"
+    if [[ "$t1239_reason" == rc80 ]]; then
+      t1239_scenario=remote-spawn-disabled
+    else
+      t1239_scenario=probe-unreachable
+    fi
+    set +e
+    ( T1239_HOSTS_OVERRIDE="$T1239_HOSTS_LIVE_RPI" \
+        T1239_SSH_SCENARIO_DESKTOP=desktop-asleep T1239_SSH_SCENARIO_MAC_DEV="$t1239_scenario" \
+        T1239_SSH_SCENARIO_RPI=probe-full T1239_JOB="t1239-r2c-$t1239_reason" t1239_spawn ) \
+        >"$TMP/t1239-r2c-$t1239_reason.out" 2>"$TMP/t1239-r2c-$t1239_reason.err"
+    t1239_rc=$?
+    set -e
+    [[ "$t1239_rc" -eq 0 ]] ||
+      fail "1239 R2c($t1239_reason): expected rc=0 after the wake, got $t1239_rc: $(cat "$TMP/t1239-r2c-$t1239_reason.err")"
+    cmp -s "$TMP/t1239-ac1.want" "$TMP/t1239-r2c-$t1239_reason.out" ||
+      fail "1239 R2c($t1239_reason): expected the desktop OK line: $(cat "$TMP/t1239-r2c-$t1239_reason.out")"
+    [[ "$(grep -c '^burst request ' "$TMP/t1239-wake.log")" -eq 1 ]] ||
+      fail "1239 R2c($t1239_reason): the wake must still fire: $(cat "$TMP/t1239-wake.log" 2>/dev/null || true)"
+  done
+  echo "PASS t1239 R2c non-capacity-answer-still-wakes (rc80 + transport)"
+
+  # R2(d) no remote-full evidence anywhere (mac-dev unreachable, oci and
+  # rpi unmapped, local spawns disabled): no wake, the all-fail path answers
+  # non-zero with the held diagnostics, and no local pane is created.
+  rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
+  rm -rf "$T1239_AWAKE.held"
+  set +e
+  ( T1239_HOSTS_OVERRIDE="$T1239_HOSTS_LIVE_NOLOCAL" \
+      T1239_SSH_SCENARIO_DESKTOP=desktop-asleep T1239_SSH_SCENARIO_MAC_DEV=probe-unreachable \
+      T1239_JOB=t1239-r2d t1239_spawn ) >"$TMP/t1239-r2d.out" 2>"$TMP/t1239-r2d.err"
+  t1239_rc=$?
+  set -e
+  [[ "$t1239_rc" -eq 80 ]] ||
+    fail "1239 R2d: expected rc=80 (local disabled, all-fail), got $t1239_rc: $(cat "$TMP/t1239-r2d.err")"
+  grep -qF "wrk: remote host 'oci' skipped: no cwd_map entry for" "$TMP/t1239-r2d.err" ||
+    fail "1239 R2d: the all-fail round must replay the held skip diagnostic: $(cat "$TMP/t1239-r2d.err")"
+  grep -qF "wrk: remote host 'rpi' skipped: no cwd_map entry for" "$TMP/t1239-r2d.err" ||
+    fail "1239 R2d: the all-fail round must replay the held skip diagnostic for rpi: $(cat "$TMP/t1239-r2d.err")"
+  grep -qF "wrk: remote host 'desktop' probe failed" "$TMP/t1239-r2d.err" ||
+    fail "1239 R2d: the all-fail round must replay the desktop probe line: $(cat "$TMP/t1239-r2d.err")"
+  if [[ -f "$TMP/t1239-wake.log" ]]; then
+    ! grep -q '^burst ' "$TMP/t1239-wake.log" ||
+      fail "1239 R2d: a burst request fired with no remote-full evidence"
+  fi
+  ! grep -q 'tab create' "$TMP/t1239-herdr.log" ||
+    fail "1239 R2d: a local pane was created although local spawns are disabled"
+  echo "PASS t1239 R2d no-remote-full-no-wake"
+
+  # R2(e) post-wake placement failure under auto propagates the remote rc —
+  # the tester reproduced rc 42 exiting as 0 because last_rc read the `if`.
+  rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
+  rm -rf "$T1239_AWAKE.held"
+  set +e
+  ( T1239_HOSTS_OVERRIDE="$T1239_HOSTS_LIVE" \
+      T1239_SSH_SCENARIO_DESKTOP=desktop-asleep-fail42 T1239_SSH_SCENARIO_MAC_DEV=probe-full \
+      T1239_JOB=t1239-r2e t1239_spawn ) >"$TMP/t1239-r2e.out" 2>"$TMP/t1239-r2e.err"
+  t1239_rc=$?
+  set -e
+  [[ "$t1239_rc" -eq 42 ]] ||
+    fail "1239 R2e: a post-wake placement failure must propagate rc=42, got $t1239_rc: $(cat "$TMP/t1239-r2e.err")"
+  grep -qF "wrk: remote host 'desktop' answered its wake but the spawn still failed (rc=42); not falling back to local" \
+    "$TMP/t1239-r2e.err" ||
+    fail "1239 R2e: the failure line must name the real rc: $(cat "$TMP/t1239-r2e.err")"
+  ! grep -q 'tab create' "$TMP/t1239-herdr.log" ||
+    fail "1239 R2e: a local pane was created after a wake attempt"
+  echo "PASS t1239 R2e post-wake-failure-propagates-42"
+
   # AC7 assertion-RED mutants — each breaks exactly one invariant.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   # M1 "a failed wake never lands a local pane" — the mutant drops the
@@ -2574,6 +2749,85 @@ run_t1239_desktop_wake_tests() {
   [[ "$t1239_wake_line" == *"--hub-token-env $T1239_NODE_TOKEN"* ]] ||
     fail "1239 M3: the precedence-swapped mutant must carry hub_token_env: $t1239_wake_line"
   echo "PASS t1239 M3: cred-swap mutant goes RED (AC5 assertion 'burst carries operator_token_env' fails: argv carried $T1239_NODE_TOKEN)"
+
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  # M4 "an unmapped candidate never ends an auto round" — the mutant keeps
+  # the rc-2 stop by disabling the pre-probe skip: oci probes reachable,
+  # its remote refuses rc 2 at cwd-map, the stop set ends the round before
+  # the post-round wake; R2(a)'s 'wake fires, lands desktop' fails.
+  devin_trust_mutant t1239-unmapped-stops-round \
+    '      if ! spillover_cwd_map "$candidate" "$cwd"; then
+        printf "wrk: remote host '"'"'%s'"'"' skipped: no cwd_map entry for '"'"'%s'"'"'\n" "$candidate" "$cwd" >>"$auto_diag"
+        continue
+      fi' \
+    '      if false; then
+        printf "wrk: remote host '"'"'%s'"'"' skipped: no cwd_map entry for '"'"'%s'"'"'\n" "$candidate" "$cwd" >>"$auto_diag"
+        continue
+      fi'
+  rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
+  rm -rf "$T1239_AWAKE.held"
+  set +e
+  ( T1239_WRK="$TMP/mut-wrk-t1239-unmapped-stops-round" \
+      T1239_HOSTS_OVERRIDE="$T1239_HOSTS_LIVE" \
+      T1239_SSH_SCENARIO_DESKTOP=desktop-asleep T1239_SSH_SCENARIO_MAC_DEV=probe-full \
+      T1239_JOB=t1239-m4 t1239_spawn ) >"$TMP/t1239-m4.out" 2>"$TMP/t1239-m4.err"
+  t1239_rc=$?
+  set -e
+  if [[ "$t1239_rc" -eq 0 ]]; then
+    fail "1239 M4 mutant survived: the unmapped candidate no longer ends the round"
+  fi
+  grep -q 'cwd-map' "$TMP/t1239-m4.err" ||
+    fail "1239 M4: the mutant should end the round on the cwd-map rc 2: $(cat "$TMP/t1239-m4.err")"
+  echo "PASS t1239 M4: unmapped-stops-round mutant goes RED (R2a assertion 'wake fires, job lands on desktop' fails: rc=$t1239_rc)"
+
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  # M5 "a post-wake placement failure is never rc 0" — the mutant restores
+  # the missing else so last_rc reads the if-statement's status; R2(e)'s
+  # 'rc=42 propagates' fails.
+  devin_trust_mutant t1239-wake-rc-swallowed \
+    '          return 0
+        else
+          last_rc=$?
+        fi
+        cat "$cand_err" >>"$auto_diag"' \
+    '          return 0
+        fi
+        last_rc=$?
+        cat "$cand_err" >>"$auto_diag"'
+  rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
+  rm -rf "$T1239_AWAKE.held"
+  set +e
+  ( T1239_WRK="$TMP/mut-wrk-t1239-wake-rc-swallowed" \
+      T1239_HOSTS_OVERRIDE="$T1239_HOSTS_LIVE" \
+      T1239_SSH_SCENARIO_DESKTOP=desktop-asleep-fail42 T1239_SSH_SCENARIO_MAC_DEV=probe-full \
+      T1239_JOB=t1239-m5 t1239_spawn ) >"$TMP/t1239-m5.out" 2>"$TMP/t1239-m5.err"
+  t1239_rc=$?
+  set -e
+  if [[ "$t1239_rc" -eq 42 ]]; then
+    fail "1239 M5 mutant survived: the post-wake failure still exited 42"
+  fi
+  grep -qF 'spawn still failed (rc=0)' "$TMP/t1239-m5.err" ||
+    fail "1239 M5: the mutant should report the swallowed rc as 0: $(cat "$TMP/t1239-m5.err")"
+  echo "PASS t1239 M5: wake-rc-swallowed mutant goes RED (R2e assertion 'rc=42 propagates' fails: rc=$t1239_rc, line reports rc=0)"
+
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  # M6 "no wake without remote-full evidence" — the mutant drops condition
+  # (d); R2(d)'s 'no burst request' fails.
+  devin_trust_mutant t1239-wake-no-evidence \
+    '    if [[ -n "$wake_pending" && "$remote_full_seen" -eq 1 ]] &&' \
+    '    if [[ -n "$wake_pending" ]] &&'
+  rm -f "$TMP/t1239-wake.log" "$TMP/t1239-ssh.log" "$TMP/t1239-herdr.log" "$T1239_AWAKE"
+  rm -rf "$T1239_AWAKE.held"
+  set +e
+  ( T1239_WRK="$TMP/mut-wrk-t1239-wake-no-evidence" \
+      T1239_HOSTS_OVERRIDE="$T1239_HOSTS_LIVE_NOLOCAL" \
+      T1239_SSH_SCENARIO_DESKTOP=desktop-asleep T1239_SSH_SCENARIO_MAC_DEV=probe-unreachable \
+      T1239_JOB=t1239-m6 t1239_spawn ) >"$TMP/t1239-m6.out" 2>"$TMP/t1239-m6.err"
+  t1239_rc=$?
+  set -e
+  grep -q '^burst request ' "$TMP/t1239-wake.log" ||
+    fail "1239 M6 mutant survived: no wake fired without remote-full evidence"
+  echo "PASS t1239 M6: wake-no-evidence mutant goes RED (R2d assertion 'no wake without remote-full' fails: burst request present)"
 }
 
 # Slice gate: WRK_TEST_ONLY_DESKTOP_WAKE=1 runs only this section after the

@@ -43,7 +43,21 @@ if [[ "${1:-}" == burst ]]; then
     # mkdir is atomic: the first concurrent caller takes it and the node
     # wakes; every later caller answers cooldown_active — which wrk treats as
     # "a wake is already in progress" and waits on.
-    if mkdir "${WRK_DESKTOP_AWAKE:?}.held" 2>/dev/null; then scenario=up; else scenario=cooldown; fi
+    # Barrier: the first requester does not connect the node immediately —
+    # it waits on req2, which the second requester raises before answering
+    # cooldown_active. A concurrent test therefore deterministically has
+    # the second spawn reach its own burst request while the node is still
+    # down. The wait is bounded so a solo caller still wakes the node.
+    if mkdir "${WRK_DESKTOP_AWAKE:?}.held" 2>/dev/null; then
+      for _ in $(seq 1 150); do
+        [[ -e "${WRK_DESKTOP_AWAKE}.held/req2" ]] && break
+        sleep 0.1
+      done
+      scenario=up
+    else
+      : >"${WRK_DESKTOP_AWAKE}.held/req2"
+      scenario=cooldown
+    fi
   fi
   case "$scenario" in
     up)

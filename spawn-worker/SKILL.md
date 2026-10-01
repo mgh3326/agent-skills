@@ -602,6 +602,19 @@ wake_hold = 10             # burst hold(분), 기본 10
 wake_wait = 300            # 노드 접속 대기 상한(초), 기본 300
 ```
 
+mac-personal의 실제 desktop 항목(기본 off, 필요할 때만 깨우는 대상)은 이렇게 생겼다:
+```toml
+[hosts.desktop]
+ssh = "desktop"
+herdr_session = "worker"
+workspace = "w1"
+cwd_map = {"<local-worktree>"="<remote-worktree>"}
+capacity = 4
+wake = "panewire"
+wake_hold = 10
+wake_wait = 300
+```
+
 - 원격 선택 시 브리프를 권한 `0600` 임시 파일로 `scp`하고,
   `ssh <alias> 'HERDR_SESSION=<session> wrk spawn ... --host local'`로 현지 `wrk`에 위임한다.
   그러므로 원격에서도 quota gate·pane 착지 검증이 동일하게 수행된다. 원격 `-w`는 설정의
@@ -615,12 +628,16 @@ wake_wait = 300            # 노드 접속 대기 상한(초), 기본 300
   확인한다. 로컬 브랜치가 origin에 push되지 않았거나 원격이 다른 커밋이면 덮어쓰지 않고
   fail-closed다 — push·정렬·수동 생성 중 무엇을 하면 되는지 메시지가 나온다. 정확히
   일치하는 리포 루트 매핑은 기존처럼 통과한다.
-- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. 로컬로 조용히 되돌리지 말고
-  `--host local` 또는 설정 추가를 안내한다.
+- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. `--host auto`는 그런 후보를
+  probe 전에 건너뛰고(성공 라운드에는 조용히, 전멸 라운드에는 보류된 진단 한 줄)
+  라운드를 멈추지도 wake 판정에도 세지 않는다. 명시적 `--host NAME`은 cwd-map rc 2를
+  그대로 유지한다.
 - `wake = "panewire"`(#1239)는 기본 off 원격 호스트를 필요할 때만 깨운다. 후보가 probe에서
   ssh-unreachable이었다는 것만으로는 깨우지 않고 라운드를 끝까지 돌린다: **로컬이 job을
-  받을 수 없고**(압력 초과이거나 `spawn = false`) **다른 도달 가능한 후보가 전부
-  remote-full로만 거절했을 때** 첫 wake 후보에 `panewire burst request --target <name>
+  받을 수 없고**(압력 초과이거나 `spawn = false`) **아무 후보도 job을 받지 못했으며**
+  **라운드가 stop-set 응답(도달한 원격 wrk의 rc 2·70·74·75)으로 끝나지 않았고**
+  **최소 하나의 후보가 remote-full을 응답했을 때**(정량적 용량 증거) 첫 wake 후보에
+  `panewire burst request --target <name>
   --hold <wake_hold>m --timeout <min(wake_wait,600)>s --reason … --hub-url …
   --hub-token-env <credential>`를 보낸다(`hub_url`은 다른 hub 경로와 같은
   `wss://`→`https://` 변환을 거친다). 자격 증명은 `[hub] operator_token_env`가 우선이고
@@ -633,9 +650,9 @@ wake_wait = 300            # 노드 접속 대기 상한(초), 기본 300
   실패·타임아웃·대기 후에도 unreachable이면 후보별 진단을 출력하고
   `wrk: <host> wake <사유>; not falling back to local` 한 줄로 rc 81
   (`WRK_EXIT_WAKE_FAILED`)이다 — wake를 시도한 뒤에는 `[local] spawn`과 무관하게
-  로컬로 폴백하지 않는다. non-capacity 사유로 거절한 후보가 하나라도 있으면 깨우지
-  않는다(이전 동작 유지). 명시적 `--host <wake host>`는 unreachable이어도 같은
-  wake+대기+배치를 하고 실패도 같은 형태다 — hosts.toml의 `wake` 키 자체가 opt-in이다.
+  로컬로 폴백하지 않는다. wake 후 배치가 실패하면 그 rc가 그대로 전파된다.
+  명시적 `--host <wake host>`는 unreachable이어도 같은 wake+대기+배치를 하고
+  실패도 같은 형태다 — hosts.toml의 `wake` 키 자체가 opt-in이다.
 - `--host auto` 순회에서 위임된 원격 wrk가 설정 오류로 거부(rc 70 — 예: 원격의 잘못된
   [hub] quota_gate)하면 라운드는 즉시 멈추고 rc 70 fail-closed다(#1154). 다음 후보나
   로컬 폴백으로 넘어가지 않는다 — 스폰이 닫힌 호스트에 job을 두지 않기 위해서다.

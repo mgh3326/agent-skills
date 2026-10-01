@@ -361,13 +361,16 @@ line then ends with via=herdr-fallback.
 
                      hosts.toml [hosts.NAME] may opt a default-off remote
                      into wake-on-demand with wake = "panewire" (#1239).
-                     Under auto an unreachable wake host is NOT woken on
-                     first sight — the round finishes over the other
-                     candidates first. The wake runs only when local
-                     cannot take the job (pressured, or spawn = false)
-                     AND every other reachable candidate refused for
-                     capacity (remote-full); any non-capacity refusal
-                     leaves the host asleep (pre-#1239 behavior). It is
+                     Under auto a candidate with no cwd_map entry for the
+                     cwd is skipped before it is probed, and an
+                     unreachable wake host is NOT woken on first sight —
+                     the round finishes over the other candidates first.
+                     The wake runs only when local cannot take the job
+                     (pressured, or spawn = false), no candidate landed,
+                     the round was not ended by a stop-set answer (a
+                     reachable remote wrk answering 2, 70, 74 or 75), and
+                     at least one candidate answered remote-full —
+                     positive capacity evidence. It is
                      `panewire burst request --target NAME --hold
                      <wake_hold>m --timeout <min(wake_wait,600)>s` using
                      the operator credential — [hub] operator_token_env,
@@ -376,8 +379,9 @@ line then ends with via=herdr-fallback.
                      the hub quota gate opt-in (#1138) that a
                      quota_gate = "local" host deliberately leaves off.
                      hub_cf_env stays optional. wake_hold is the burst
-                     hold in minutes (default 10; env
-                     WRK_WAKE_HOLD_MINUTES overrides) and wake_wait
+                     hold in minutes (default 10 — a configured
+                     wake_hold wins; WRK_WAKE_HOLD_MINUTES exists only
+                     as a test seam over the default) and wake_wait
                      bounds the wait for the node in seconds (default
                      300) — a granted hold or a cooldown_active (a
                      concurrent spawn's wake already in flight, waited
@@ -6956,9 +6960,9 @@ spawn_router_cmd() {
   local cand_err auto_diag="" cand_class
   # #1239 deferred-wake bookkeeping: wake_pending collects the wake-capable
   # candidates that probed ssh-unreachable (round order), and
-  # non_capacity_refusal latches when any other candidate failed for a
-  # reason that is not remote-full — either one disables the post-round wake.
-  local wake_pending="" non_capacity_refusal=0 wake_target=""
+  # remote_full_seen latches the positive capacity evidence the post-round
+  # wake requires — a round with no remote-full answer never wakes.
+  local wake_pending="" remote_full_seen=0 wake_target=""
   # --host auto holds every per-candidate diagnostic until the round settles:
   # a successful spawn must print nothing about the hosts it skipped, while an
   # all-fail round owes the operator one attributed line per host plus whatever
@@ -6988,6 +6992,18 @@ spawn_router_cmd() {
       return "$last_rc"
     fi
     if [[ -n "$auto_diag" ]]; then
+      # #1239: under --host auto a candidate with no cwd_map entry for this
+      # cwd can never accept the job — its remote would refuse rc 2 at the
+      # cwd-map step, which sits in the stop set below and would end the
+      # round before the post-round wake. The candidate is skipped BEFORE
+      # the probe: silent when a later candidate lands, one held
+      # diagnostic line on an all-fail round, and neutral for the wake
+      # decision — it neither ends the round nor counts as remote-full
+      # evidence. An explicit --host NAME keeps the cwd-map rc 2.
+      if ! spillover_cwd_map "$candidate" "$cwd"; then
+        printf "wrk: remote host '%s' skipped: no cwd_map entry for '%s'\n" "$candidate" "$cwd" >>"$auto_diag"
+        continue
+      fi
       cand_err="$(mktemp)"
       cand_class="$(mktemp)"
       # A subshell keeps a die() inside the remote legs survivable, and the
@@ -7004,12 +7020,11 @@ spawn_router_cmd() {
         last_rc=$?
       fi
       case "$(cat "$cand_class" 2>/dev/null || true)" in
-        remote-full) ;;
+        remote-full) remote_full_seen=1 ;;
         ssh-unreachable)
           if [[ "$(spillover_value "hosts.$candidate" wake 2>/dev/null || true)" == panewire ]]; then
             wake_pending+="$candidate "
           fi ;;
-        *) non_capacity_refusal=1 ;;
       esac
       cat "$cand_err" >>"$auto_diag"
       rm -f "$cand_err" "$cand_class"
@@ -7046,16 +7061,20 @@ spawn_router_cmd() {
   done
   # #1239: the deferred wake decision, made only once the candidate round is
   # over. Under --host auto a wake-capable candidate that probed
-  # ssh-unreachable is owed a wake when local cannot take the job ([local]
-  # spawn = false, or the same measured pressure that started this round
-  # still holds) AND no other candidate refused for a non-capacity reason —
-  # m1b answering remote-full is the case that matters; a remote that
-  # refused on admission or config keeps the pre-#1239 behavior (no wake).
-  # An explicit --host NAME is the operator forcing that host, so an
+  # ssh-unreachable is owed a wake when (a) local cannot take the job
+  # ([local] spawn = false, or the same measured pressure that started this
+  # round still holds), (b) no candidate landed the job — reaching here
+  # proves it, (c) the round was not ended by a stop-set answer — a
+  # reachable remote wrk answering 2, 70, 74 or 75 returns inside the loop
+  # and never gets here — and (d) at least one candidate answered
+  # remote-full, the positive capacity evidence that the fleet really is
+  # short. Unmapped candidates were skipped before probing, and transport
+  # failures or remote rc 80/81 answers no longer suppress the wake. An
+  # explicit --host NAME is the operator forcing that host, so an
   # unreachable wake-capable target wakes unconditionally — wake =
   # "panewire" on that hosts.toml entry is itself the opt-in.
   if [[ "$requested" == auto ]]; then
-    if [[ -n "$wake_pending" && "$non_capacity_refusal" -eq 0 ]] &&
+    if [[ -n "$wake_pending" && "$remote_full_seen" -eq 1 ]] &&
        { [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 ]] || spillover_local_is_pressured; }; then
       wake_target="${wake_pending%% *}"
     fi
@@ -7074,8 +7093,9 @@ spawn_router_cmd() {
           cat "$cand_err" >&2
           rm -f "$cand_err" "$auto_diag"
           return 0
+        else
+          last_rc=$?
         fi
-        last_rc=$?
         cat "$cand_err" >>"$auto_diag"
         rm -f "$cand_err"
       elif spillover_try_candidate 0 "$wake_target" "$cwd" "$prompt" "${filtered[@]}"; then
