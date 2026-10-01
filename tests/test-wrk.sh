@@ -245,7 +245,7 @@ spawn_base() {
     WRK_FIXTURE_MARKER="${WRK_FIXTURE_MARKER:-}" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S="${WRK_REFRESH_TIMEOUT_S:-5}" \
-    "$WRK" spawn \
+    "${WRK_UNDER_TEST:-$WRK}" spawn \
     -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
 }
 
@@ -3880,12 +3880,17 @@ set -e
   fail "devin gate refusal rc drifted (rc=$devin_gate_rc): $devin_gate_out"
 [[ ! -e "$TMP/herdr.log" ]] || fail "devin gate refusal reached Herdr"
 
-# Every other kind keeps the generic `agent start` path exactly.
+# Every other kind keeps the generic `agent start` path — its argv arrives
+# through herdr alone. #1016 adds the readiness probe before it: the only
+# `pane run` a non-Devin spawn may issue is the probe line itself.
 : >"$TMP/herdr.log"
 spawn_base codex-terra >/dev/null
 grep -qx 'agent start fixture --kind codex --pane w:p1 --timeout 120000 -- --yolo -m gpt-5.6-terra -c model_reasoning_effort=medium' "$TMP/herdr.log" ||
   fail "non-Devin agent-start path drifted"
-if grep -q '^pane run ' "$TMP/herdr.log"; then fail "non-Devin kind reached pane run"; fi
+[[ "$(grep -c '^pane run ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "non-Devin kind must type only the readiness probe: $(grep '^pane run ' "$TMP/herdr.log")"
+grep -qE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$TMP/herdr.log" ||
+  fail "the only non-Devin pane run must be the readiness probe: $(grep '^pane run ' "$TMP/herdr.log")"
 
 # #606: a fresh pane whose shell is still running rc subprocesses answers
 # `agent start` with agent_pane_busy (real herdr 0.9.0 envelope, stderr, rc=1).
@@ -3983,8 +3988,10 @@ fg_failure_case() {
 fg_failure_case opus agent-never-foreground 1
 grep -q 'agent not foreground within 10000ms (not-foreground x40)' <<<"$FG_CASE_OUT" ||
   fail "never-foreground claude lost its bounded-window diagnostic: $FG_CASE_OUT"
-[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 41 ]] ||
-  fail "never-foreground claude must stop at the 10000/250 cap plus one diagnostic"
+# 41 = the 10000/250 cap plus one diagnostic; #1016's readiness probe adds
+# its own single process-info read before agent start.
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 42 ]] ||
+  fail "never-foreground claude must stop at the 10000/250 cap plus one diagnostic (plus the #1016 probe's one)"
 fg_failure_case codex-terra agent-never-foreground 1
 fg_failure_case devin-swe2 agent-never-foreground 1
 # kiro's pre-brief /effort prompt is also an injection; the gate precedes it.
@@ -4000,7 +4007,10 @@ fg_failure_case opus agent-foreground-other 1
 fg_failure_case opus agent-foreground-info-fail 1
 grep -q 'pane process-info exited 3 before brief injection' <<<"$FG_CASE_OUT" ||
   fail "process-info failure lost its diagnostic: $FG_CASE_OUT"
-[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 2 ]] ||
+# #1016: the readiness probe's own process-info read (answered normally —
+# the scenario only fails once an agent holds the foreground) precedes the
+# failing check and the diagnostic.
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 3 ]] ||
   fail "process-info rc failure must fail on the first check, not be retried"
 fg_failure_case opus agent-foreground-garbage 1
 grep -q 'pane process-info returned an invalid envelope before brief injection' <<<"$FG_CASE_OUT" ||
@@ -4173,10 +4183,11 @@ echo "PASS 604-m1b-envelope: unwrapped process-info polls shell-busy foreground,
 # a `read -k 1` that ate the leading space still runs the remainder. An
 # unanswered probe is only ever RETYPED — never interrupted: fix-round-1
 # showed ctrl+c during rc sourcing SIGINTs the rest of the rc and leaves the
-# agent in a truncated environment. The only `herdr pane run` call site that
-# types into a fresh shell pane is devin_start_in_pane (every other kind's
-# start goes through `agent start`, which herdr gates internally), so the
-# probe lives there and these cases cover it.
+# agent in a truncated environment. The `herdr pane run` call site that
+# types into a fresh shell pane is devin_start_in_pane; #1016 then runs the
+# same probe inside agent_start_in_pane too, because `agent start` has
+# herdr type the argv into that same fresh shell behind the identical
+# foreground gate (the #1016 cases below cover that path).
 t979_xdg="$TMP/t979-xdg"
 devin_trust_seed_store "$t979_xdg" "$ROOT" "$(cd "$ROOT" && pwd -P)"
 
@@ -4361,6 +4372,181 @@ grep -qx 'env=truncated' "$TMP/herdr-t979-m3.log.devenv" ||
 grep -q '^pane send-keys w:p1 ctrl+c' "$TMP/herdr-t979-m3.log" ||
   fail "M3 (ctrl+c sent) proof — the interrupt must appear in the herdr log"
 echo "PASS 979-AC6 mutants red: M1 skip-probe, M2 echo-as-proof, M3 ctrl+c"
+
+# #1016 (979 tester SHOULD S2): `agent start` types the agent argv into the
+# same fresh pane shell and gates only on agent_pane_busy — the foreground
+# check a pending rc-file read defeats. wrk now runs the identical
+# retype-only readiness probe before the first agent start for every
+# non-devin kind, inside the same START_TIMEOUT window. These cases rerun
+# the 979 pending-read scenarios against claude/codex spawns; the fixture
+# records every line the fake shell executes in $LOG.executed, so an eaten
+# first character shows up as the truncated argv (e.g. `laude`).
+
+# AC1 (the Pi shape): `read -k 1` eats the probe's leading space, the
+# printf remainder still runs and returns the token, and only then herdr
+# types the agent argv — whole.
+for t1016_pair in \
+    'opus|claude --model opus --dangerously-skip-permissions --effort high' \
+    'codex-terra|codex --yolo -m gpt-5.6-terra -c model_reasoning_effort=medium'; do
+  t1016_model="${t1016_pair%%|*}"; t1016_argv="${t1016_pair#*|}"
+  : >"$TMP/herdr.log"; rm -f "$TMP/herdr.log.executed"
+  t1016_out="$(TEST_FIXTURE_SCENARIO=devin-read-eats-key spawn_base "$t1016_model" 2>&1)" ||
+    fail "$t1016_model behind a pending read -k 1 must still spawn: $t1016_out"
+  grep -q 'landed=yes' <<<"$t1016_out" ||
+    fail "$t1016_model behind a pending read -k 1 did not land: $t1016_out"
+  [[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$TMP/herdr.log")" -eq 1 ]] ||
+    fail "$t1016_model: a read -k 1-eaten probe must still execute its remainder: $(grep '^pane run ' "$TMP/herdr.log")"
+  [[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 1 ]] ||
+    fail "$t1016_model: agent start must run exactly once, after the shell proved it runs lines"
+  t1016_probe_no="$(grep -nE "^pane run w:p1 +printf" "$TMP/herdr.log" | cut -d: -f1)"
+  t1016_start_no="$(grep -n '^agent start ' "$TMP/herdr.log" | cut -d: -f1)"
+  (( t1016_probe_no < t1016_start_no )) ||
+    fail "$t1016_model: the readiness probe must be typed before agent start"
+  grep -qx "$t1016_argv" "$TMP/herdr.log.executed" ||
+    fail "$t1016_model: the fake shell must execute the whole agent argv: $(cat "$TMP/herdr.log.executed" 2>/dev/null)"
+  if grep -q '^pane send-keys ' "$TMP/herdr.log"; then
+    fail "$t1016_model: wrk must never interrupt a shell that may still be sourcing its rc file"
+  fi
+done
+echo "PASS 1016-AC1 read -k 1: probe remainder runs, claude/codex argv typed whole"
+
+# AC1 whole-line variant: a pending `read` consumes the first probe, it is
+# retyped with a fresh token, and the agent argv lands unharmed.
+: >"$TMP/herdr.log"; rm -f "$TMP/herdr.log.executed"
+t1016_out="$(TEST_FIXTURE_SCENARIO=devin-read-eats-line spawn_base opus 2>&1)" ||
+  fail "claude behind a pending read must still spawn: $t1016_out"
+grep -q 'landed=yes' <<<"$t1016_out" || fail "eaten-line claude did not land: $t1016_out"
+[[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "unanswered probe must be retyped with a fresh token: $(grep '^pane run ' "$TMP/herdr.log")"
+grep -qx 'claude --model opus --dangerously-skip-permissions --effort high' "$TMP/herdr.log.executed" ||
+  fail "the fake shell must execute the whole claude argv: $(cat "$TMP/herdr.log.executed" 2>/dev/null)"
+if grep -q '^pane send-keys ' "$TMP/herdr.log"; then
+  fail "wrk must never interrupt a shell that may still be sourcing its rc file"
+fi
+echo "PASS 1016-AC1 eaten first line (claude): probe retried, agent argv intact"
+
+# And the still-sourcing rc: probes queue unexecuted until rc finishes,
+# every queued line then runs in order, and the agent argv lands whole.
+: >"$TMP/herdr.log"; rm -f "$TMP/herdr.log.executed"
+t1016_out="$(TEST_FIXTURE_SCENARIO=devin-slow-rc spawn_base codex-terra 2>&1)" ||
+  fail "codex behind a slow rc file must still spawn: $t1016_out"
+grep -q 'landed=yes' <<<"$t1016_out" || fail "slow-rc codex did not land: $t1016_out"
+[[ "$(grep -cE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$TMP/herdr.log")" -gt 1 ]] ||
+  fail "an unanswered probe behind a slow rc must be retyped inside the window: $(grep '^pane run ' "$TMP/herdr.log")"
+grep -qx 'codex --yolo -m gpt-5.6-terra -c model_reasoning_effort=medium' "$TMP/herdr.log.executed" ||
+  fail "the fake shell must execute the whole codex argv: $(cat "$TMP/herdr.log.executed" 2>/dev/null)"
+if grep -q '^pane send-keys ' "$TMP/herdr.log"; then
+  fail "wrk must never interrupt a shell that may still be sourcing its rc file"
+fi
+echo "PASS 1016-AC1 slow rc (codex): queued probes answered late, argv whole"
+
+# AC2: a pending read that never ends — the probe is never answered, the
+# spawn fails inside START_TIMEOUT with its own reason (distinct from the
+# agent_pane_busy refusal above), the pane is closed, and `agent start` is
+# never called.
+: >"$TMP/herdr.log"
+set +e
+t1016_never_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends spawn_base opus 2>&1)"
+t1016_never_rc=$?
+set -e
+[[ "$t1016_never_rc" -eq 1 ]] ||
+  fail "never-answering probe expected rc=1, got $t1016_never_rc: $t1016_never_out"
+grep -q 'agent start failed: shell did not execute a readiness probe within 30000ms (probes typed x' <<<"$t1016_never_out" ||
+  fail "never-answering probe lost its distinct diagnostic: $t1016_never_out"
+[[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 0 ]] ||
+  fail "agent start must never be called for a shell that never executed a probe"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "never-answering probe leaked its pane"
+if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "never-answering probe delivered a brief"; fi
+echo "PASS 1016-AC2 never-ready shell: distinct reason, pane closed, no agent start"
+
+# AC3: an ordinary ready shell — exactly one probe (one `pane run` + one
+# `pane read`) and one `agent start` per non-devin spawn, probe strictly
+# first.
+: >"$TMP/herdr.log"; rm -f "$TMP/herdr.log.executed"
+t1016_out="$(TEST_FIXTURE_SCENARIO=spawn spawn_base opus 2>&1)" ||
+  fail "ready-shell claude spawn failed: $t1016_out"
+grep -q 'landed=yes' <<<"$t1016_out" || fail "ready-shell claude did not land: $t1016_out"
+[[ "$(grep -c '^pane run ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "a normal agent spawn must type only the probe: $(grep '^pane run ' "$TMP/herdr.log")"
+grep -qE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-" "$TMP/herdr.log" ||
+  fail "probe line missing or not space-prefixed printf: $(grep '^pane run ' "$TMP/herdr.log")"
+[[ "$(grep -c '^pane read w:p1 ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "answered probe must cost exactly one pane read: $(grep -c '^pane read ' "$TMP/herdr.log")"
+[[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "ready shell must see exactly one agent start"
+t1016_probe_no="$(grep -nE "^pane run w:p1 +printf" "$TMP/herdr.log" | cut -d: -f1)"
+t1016_read_no="$(grep -n '^pane read w:p1 ' "$TMP/herdr.log" | cut -d: -f1)"
+t1016_start_no="$(grep -n '^agent start ' "$TMP/herdr.log" | cut -d: -f1)"
+(( t1016_probe_no < t1016_read_no && t1016_read_no < t1016_start_no )) ||
+  fail "probe must be typed, its output read, and only then agent start"
+grep -qx 'claude --model opus --dangerously-skip-permissions --effort high' "$TMP/herdr.log.executed" ||
+  fail "the fake shell must execute the whole claude argv: $(cat "$TMP/herdr.log.executed" 2>/dev/null)"
+if grep -q '^pane send-keys ' "$TMP/herdr.log"; then
+  fail "wrk must never interrupt a shell that may still be sourcing its rc file"
+fi
+echo "PASS 1016-AC3 normal path: one probe, one read, one agent start, argv whole"
+
+# AC4 mutants — assertion-RED invariants:
+#   M1 "a non-devin argv is never typed before the shell has executed a
+#      probe" (mutant: skip the wait in agent_start_in_pane) -> AC1 fails
+#   M2 "a never-ready shell never gets agent start" (mutant: ignore the
+#      wait's failure) -> AC2 fails
+# The `max_attempts` tail makes each anchor unique to agent_start_in_pane —
+# devin_start_in_pane ends its own identical if-block with `set +e`.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+devin_trust_mutant t1016-no-wait \
+  'if ! devin_wait_shell_ready "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
+  max_attempts' \
+  'max_attempts'
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+devin_trust_mutant t1016-ignore-wait \
+  'if ! devin_wait_shell_ready "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
+  max_attempts' \
+  'devin_wait_shell_ready "$started_at" || true
+  max_attempts'
+set +e
+: >"$TMP/herdr.log"; rm -f "$TMP/herdr.log.executed"
+t1016_m1_out="$(TEST_FIXTURE_SCENARIO=devin-read-eats-key WRK_UNDER_TEST="$TMP/mut-wrk-t1016-no-wait" \
+  spawn_base opus 2>&1)"
+t1016_m1_rc=$?
+# M1's evidence is captured before M2 resets the shared log — the
+# never-ends pane below never executes a line, so it leaves no record.
+t1016_m1_starts="$(grep -c '^agent start ' "$TMP/herdr.log" 2>/dev/null || true)"
+t1016_m1_laude=0
+grep -qx 'laude --model opus --dangerously-skip-permissions --effort high' \
+  "$TMP/herdr.log.executed" 2>/dev/null && t1016_m1_laude=1
+: >"$TMP/herdr.log"; rm -f "$TMP/herdr.log.executed"
+t1016_m2_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends WRK_UNDER_TEST="$TMP/mut-wrk-t1016-ignore-wait" \
+  spawn_base opus 2>&1)"
+t1016_m2_rc=$?
+set -e
+# M1 under AC1's eaten-key pane: the argv is typed into the pending read,
+# its first character is eaten (`laude` runs to command-not-found), and
+# the spawn dies at the foreground gate — the AC1 assertion
+# "must still spawn" goes RED.
+[[ "$t1016_m1_rc" -ne 0 ]] ||
+  fail "M1 (wait skipped): claude spawn succeeded despite the eaten argv: $t1016_m1_out"
+[[ "$t1016_m1_starts" -eq 1 && "$t1016_m1_laude" -eq 1 ]] ||
+  fail "M1 (wait skipped): the eaten argv must show up truncated in the exec record"
+# M2 under AC2's never-ending read: the wait fails but is ignored, so
+# `agent start` IS called — the AC2 assertion "agent start must never be
+# called" goes RED — while the typed argv is consumed and the spawn still
+# dies at the foreground gate.
+[[ "$t1016_m2_rc" -ne 0 ]] ||
+  fail "M2 (wait failure ignored): claude spawn succeeded on a dead-read pane: $t1016_m2_out"
+[[ "$(grep -c '^agent start ' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "M2 (wait failure ignored): agent start must have been (wrongly) called"
+grep -q 'agent foreground check failed: agent not foreground' <<<"$t1016_m2_out" ||
+  fail "M2 (wait failure ignored): the typed argv must not have foregrounded an agent: $t1016_m2_out"
+echo "PASS 1016-AC4 mutants red: M1 skip-wait, M2 ignore-wait-failure"
 
 expect_exit 2 spawn_base devin-swe2 --effort high
 # Task 240 pilot (operator decision 2026-09-14 §3): the devin-swe2 worker

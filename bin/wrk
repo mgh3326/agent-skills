@@ -1922,6 +1922,17 @@ agent_start_in_pane() {
   # full window (the pre-#606 argv) even when a second ticks over here.
   started_at="$(date +%s)"
   now="$started_at"
+  # #1016 (#979 SHOULD S2): `agent start` types the argv into the same fresh
+  # pane shell and gates only on agent_pane_busy — the foreground check that
+  # cannot see a pending rc-file read. On the Pi that read (omz `read -k 1`)
+  # ate the first character of `devin`; for every other kind it eats the
+  # first character of the argv herdr types. Run the same retype-only
+  # readiness probe before the first start attempt — it shares this spawn's
+  # START_TIMEOUT window and fails closed without ever calling agent start.
+  if ! devin_wait_shell_ready "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
   while :; do
     attempts=$(( attempts + 1 ))
@@ -2056,7 +2067,9 @@ else:
 }
 
 # `pane run` has no availability check: it types into whatever holds the
-# terminal. Before running Devin, poll process-info until herdr's own
+# terminal, and `agent start`'s agent_pane_busy gate is the same foreground
+# check (#1016). Before the agent argv is typed — `pane run` for Devin,
+# `agent start` for every other kind — poll process-info until herdr's own
 # available-shell rule holds (the shell is the foreground process group and the
 # only foreground process). A process-info failure or an envelope that cannot
 # be read fails closed at once; only "not ready yet" is polled, inside the same
@@ -2092,6 +2105,22 @@ else:
 # window.
 DEVIN_PROBE_MISS_POLLS=4
 
+# #1016: the same wait guards `agent start` for every non-devin kind —
+# herdr types their argv into the same fresh shell. Devin's diagnostics
+# contract ("Devin pane startup failed", failure-artifact preservation) is
+# pinned by its tests; the other kinds report the same reason on the
+# agent-start failure line with the same process-info dump.
+shell_ready_diagnostics() {
+  local reason="$1"
+  if [[ "$PROFILE_KIND" == devin ]]; then
+    devin_spawn_diagnostics "$reason"
+    return
+  fi
+  echo "wrk: agent start failed: $reason; pane=$PANE" >&2
+  "$HERDR" pane process-info --pane "$PANE" >&2 ||
+    warn "agent start process-info failed for pane=$PANE"
+}
+
 # probe_token/probe_tokens/probe_sends/probe_misses/attempts are
 # devin_wait_shell_ready locals — dynamic scope is what lets this helper
 # update them.
@@ -2108,7 +2137,7 @@ devin_probe_send() {
   probe_run_rc=$?
   set -e
   if [[ "$probe_run_rc" -ne 0 ]]; then
-    devin_spawn_diagnostics "readiness probe pane run exited $probe_run_rc"
+    shell_ready_diagnostics "readiness probe pane run exited $probe_run_rc"
     return 1
   fi
 }
@@ -2117,6 +2146,11 @@ devin_wait_shell_ready() {
   local started_at="$1" attempts=0 max_attempts info_out info_rc ready
   local probe_token="" probe_tokens="" probe_sends=0 probe_misses=0
   local probe_out probe_rc probe_matched probe_any
+  # The command the shell must prove it can run before wrk (or herdr, for
+  # `agent start`) types it: `pane run` for devin, `agent start` for every
+  # other kind (#1016).
+  local start_action=pane\ run
+  [[ "$PROFILE_KIND" == devin ]] || start_action=agent\ start
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
   while :; do
     attempts=$(( attempts + 1 ))
@@ -2143,7 +2177,7 @@ devin_wait_shell_ready() {
       info_rc=$?
       set -e
       if [[ "$info_rc" -ne 0 ]]; then
-        devin_spawn_diagnostics "pane process-info exited $info_rc before pane run"
+        shell_ready_diagnostics "pane process-info exited $info_rc before $start_action"
         return 1
       fi
       set +e
@@ -2170,16 +2204,16 @@ print("yes" if ready else "no")
       info_rc=$?
       set -e
       if [[ "$info_rc" -ne 0 ]]; then
-        devin_spawn_diagnostics "pane process-info returned an invalid envelope before pane run"
+        shell_ready_diagnostics "pane process-info returned an invalid envelope before $start_action"
         return 1
       fi
       if [[ "$ready" == yes ]]; then devin_probe_send || return 1; fi
     fi
     if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= START_TIMEOUT )); then
       if [[ "$probe_sends" -gt 0 ]]; then
-        devin_spawn_diagnostics "shell did not execute a readiness probe within ${START_TIMEOUT}ms (probes typed x$probe_sends)"
+        shell_ready_diagnostics "shell did not execute a readiness probe within ${START_TIMEOUT}ms (probes typed x$probe_sends)"
       else
-        devin_spawn_diagnostics "shell not ready within ${START_TIMEOUT}ms (foreground busy x$attempts)"
+        shell_ready_diagnostics "shell not ready within ${START_TIMEOUT}ms (foreground busy x$attempts)"
       fi
       return 1
     fi

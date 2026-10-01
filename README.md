@@ -187,19 +187,23 @@ merged/dropped/hold/needs_decision 상태는 전부 fail-closed다. handoffkeep�
 120초 등) 안에서 0.25초 간격으로 재시도하고, 매 시도에 창의 남은 시간을 `--timeout`으로
 넘긴다. 남은 시간이 herdr 하한(3000ms) 이하이거나 시도 상한(창/250ms)에 닿으면 빈 pane을
 닫고 쿼터 기록을 해제하는 기존 fail-closed로 끝난다. 다른 오류 코드는 재시도하지 않는다.
-Devin은 `pane run`이 셸 상태를 확인하지 않으므로, 그 전에 `pane process-info`를 같은
-간격으로 조회해 셸이 foreground를 혼자 가진 상태(herdr의 available-shell 규칙)를 기다린다.
-foreground만으로는 부족하다 — rc 파일이 `read -k 1` 같은 한 글자 입력에 멈춰 있어도
-zsh는 foreground를 혼자 갖는다(Pi에서 oh-my-zsh 업데이트 프롬프트가 타이핑된 `devin`의
-d를 삼켜 `evin`이 실행된 사고). 그래서 셸이 foreground를 혼자 잡으면 devin argv를 넣기
-전에 공백으로 시작하는 `printf` 프로브(매번 새 nonce)를 타이핑하고, 그 토큰이 자기
-출력 줄로 정확히 돌아올 때만 진행한다 — 에코된 명령 줄은 증거가 아니다. 이 spawn이
-타이핑한 토큰 중 아무 것이나 돌아오면 된다 — 아직 sourcing 중인 rc 뒤에 queue된 줄은
-프롬프트가 올 때 모두 실행되고, `read -k 1`이 선행 공백을 삼켜도 나머지 줄은 그대로
-실행된다. 프로브에 답이 없으면 새 토큰으로 재타이핑할 뿐 절대 ctrl+c 등 키를 보내지
-않는다 — sourcing 중인 rc에 대한 SIGINT는 나머지 rc를 죽여 agent가 잘린 환경을 물려
-받는다. 창이 닫힐 때까지 답이 없으면 자체 사유로 fail-closed한다. 이 대기는 뒤의
-검출·idle 대기와 같은 30초 창을 나눠 쓴다.
+Devin은 `pane run`이 셸 상태를 확인하지 않고, `agent start`의 agent_pane_busy 게이트는
+바로 그 foreground 검사이므로, 어떤 kind든 agent argv를 넣기 전에 `pane process-info`를
+같은 간격으로 조회해 셸이 foreground를 혼자 가진 상태(herdr의 available-shell 규칙)를
+기다린다. foreground만으로는 부족하다 — rc 파일이 `read -k 1` 같은 한 글자 입력에 멈춰
+있어도 zsh는 foreground를 혼자 갖는다(Pi에서 oh-my-zsh 업데이트 프롬프트가 타이핑된
+`devin`의 d를 삼켜 `evin`이 실행된 사고; 다른 kind이면 herdr가 타이핑하는 argv의 첫
+글자가 삼켜진다). 그래서 셸이 foreground를 혼자 잡으면 devin의 `pane run`이든 다른
+kind의 `agent start`든 그 argv를 넣기 전에 공백으로 시작하는 `printf` 프로브(매번 새
+nonce)를 타이핑하고, 그 토큰이 자기 출력 줄로 정확히 돌아올 때만 진행한다 — 에코된
+명령 줄은 증거가 아니다. 이 spawn이 타이핑한 토큰 중 아무 것이나 돌아오면 된다 —
+아직 sourcing 중인 rc 뒤에 queue된 줄은 프롬프트가 올 때 모두 실행되고, `read -k 1`이
+선행 공백을 삼켜도 나머지 줄은 그대로 실행된다. 프로브에 답이 없으면 새 토큰으로
+재타이핑할 뿐 절대 ctrl+c 등 키를 보내지 않는다 — sourcing 중인 rc에 대한 SIGINT는
+나머지 rc를 죽여 agent가 잘린 환경을 물려 받는다. 창이 닫힐 때까지 답이 없으면 자체
+사유로 fail-closed하고 pane을 닫으며 `agent start`도 호출하지 않는다. 이 대기는 뒤의
+검출·idle 대기(Devin) 또는 `agent start` 재시도(다른 kind)와 같은 start 창(기본 30초,
+codex 120초 등)을 나눠 쓴다.
 
 `devin-swe2`는 Devin 프로필이다. 현재 `wrk`는
 `herdr pane run <pane_id> devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false`로

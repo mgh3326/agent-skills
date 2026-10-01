@@ -72,6 +72,12 @@ fixture_exec_line() {
       fixture_set_foreground devin
       [[ -z "${WRK_FIXTURE_LOG:-}" ]] ||
         printf 'env=%s\n' "$(fixture_env)" >"${WRK_FIXTURE_LOG}.devenv" ;;
+    # #1016: `agent start` types "<kind> <args>" into the same shell — a
+    # line whose first word survived intact is the agent's own command and
+    # foregrounds its kind; a line whose first character a pending read ate
+    # (e.g. `laude`) runs and fails without foregrounding anything.
+    claude\ *|codex\ *|grok\ *|kimi\ *|kiro\ *|opencode\ *|agy\ *)
+      fixture_set_foreground "${text%% *}" ;;
   esac
 }
 
@@ -208,7 +214,9 @@ fixture_brief_landed() {
   prompts="$(fixture_prompt_count)"
   recent_reads="$(fixture_recent_read_count)"
   case "$scenario" in
-    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy|agent-late-foreground) return 0 ;;
+    # #1016: the pending-read scenarios that can still reach a spawn's
+    # landing check (never-ends fails before it) land like a normal spawn.
+    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy|agent-late-foreground|devin-read-eats-line|devin-read-eats-key|devin-slow-rc) return 0 ;;
     landing-retry|opencode-retry)
       if (( prompts >= 2 )); then return 0; fi
       ;;
@@ -287,8 +295,17 @@ case "${1:-}" in
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
             ;;
-          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-shell-busy-m1b|devin-shell-never-ready-m1b|devin-explain-no-rule|devin-explain-empty|devin-trust-screen|devin-read-fail|devin-explain-starting|devin-explain-starting-stuck|devin-explain-unknown|devin-read-eats-line|devin-read-eats-key|devin-read-never-ends|devin-slow-rc)
+          devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-shell-busy-m1b|devin-shell-never-ready-m1b|devin-explain-no-rule|devin-explain-empty|devin-trust-screen|devin-read-fail|devin-explain-starting|devin-explain-starting-stuck|devin-explain-unknown)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          # #1016: the pending-read scenarios are kind-agnostic — `agent
+          # start` types a non-devin argv into the same shell, so the pane's
+          # agent is whichever kind this spawn actually foregrounded (empty
+          # before any command ran: report devin, the scenarios' origin).
+          devin-read-eats-line|devin-read-eats-key|devin-read-never-ends|devin-slow-rc)
+            fixture_list_kind="$(fixture_foreground)"
+            [[ -n "$fixture_list_kind" ]] || fixture_list_kind=devin
+            printf '%s\n' "{\"result\":{\"agents\":[{\"agent\":\"$fixture_list_kind\",\"agent_status\":\"idle\",\"name\":\"fixture\",\"pane_id\":\"w:p1\",\"tab_id\":\"w:t1\",\"workspace_id\":\"w\"}]}}"
             ;;
           # #568 incident shape: the brief landed and devin is working on it,
           # but panewire's classifier cannot prove devin submissions (rc 6).
@@ -499,9 +516,43 @@ case "${1:-}" in
             ;;
         esac
         # A successful start foregrounds the agent's own executable — the
-        # canonical --kind (herdr's kind IS the binary name).
+        # canonical --kind (herdr's kind IS the binary name). #1016: real
+        # herdr types "<kind> <args after -->" into the pane shell — the
+        # same typed line a `pane run` produces, so the #979 pending-read
+        # scenarios eat or queue it exactly the same way. The typed text
+        # echoes onto the modelled screen whether or not it ever executes;
+        # only a line that executes foregrounds the agent.
         start_kind="$(sed -n 's/.* --kind \([^ ]*\).*/\1/p' <<<" $*")"
-        [[ -z "$start_kind" ]] || fixture_set_foreground "$start_kind"
+        start_argv="$*"
+        agent_line="$start_kind"
+        [[ "$start_argv" == *" -- "* ]] && agent_line="$start_kind ${start_argv##* -- }"
+        printf '%s\n' "$agent_line" >>"$fixture_screen_file"
+        case "$scenario" in
+          devin-read-eats-line)
+            if [[ ! -f "$fixture_eaten_file" ]]; then
+              : >"$fixture_eaten_file"
+            else
+              fixture_exec_line "$agent_line"
+            fi ;;
+          devin-read-eats-key)
+            # read -k 1 takes the first character only; the remainder of
+            # the line is still in the tty buffer and runs once the prompt
+            # returns — `laude`, not `claude`, so nothing foregrounds.
+            if [[ ! -f "$fixture_eaten_file" ]]; then
+              : >"$fixture_eaten_file"
+              fixture_exec_line "${agent_line:1}"
+            else
+              fixture_exec_line "$agent_line"
+            fi ;;
+          devin-read-never-ends) : ;;
+          devin-slow-rc)
+            if fixture_rc_pending; then
+              printf '%s\n' "$agent_line" >>"$fixture_queue_file"
+            else
+              fixture_exec_line "$agent_line"
+            fi ;;
+          *) fixture_exec_line "$agent_line" ;;
+        esac
         printf '%s\n' '{"result":{"agent_info":{"agent_status":"working"}}}'
         ;;
       send-keys)
@@ -602,21 +653,44 @@ case "${1:-}" in
     # foreground.
     if [[ "${2:-}" == process-info ]]; then
       case "$scenario" in
-        devin-process-info-fail|agent-foreground-info-fail)
+        devin-process-info-fail)
           printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture process-info failure"},"id":"cli:pane:process_info"}' >&2
           exit 3
           ;;
-        devin-process-info-garbage|agent-foreground-garbage)
+        # #1016: the readiness probe runs this same process-info call before
+        # agent start — agent-foreground-* break it only once this spawn's
+        # own agent holds the foreground, so they still exercise the
+        # pre-injection check they were built for instead of failing early
+        # at the probe gate.
+        agent-foreground-info-fail)
+          if [[ -n "$(fixture_foreground)" ]]; then
+            printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture process-info failure"},"id":"cli:pane:process_info"}' >&2
+            exit 3
+          fi
+          ;;
+        devin-process-info-garbage)
           printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"pane_id":"w:p1","shell_pid":"4242"}}}'
           exit 0
+          ;;
+        agent-foreground-garbage)
+          if [[ -n "$(fixture_foreground)" ]]; then
+            printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"pane_id":"w:p1","shell_pid":"4242"}}}'
+            exit 0
+          fi
           ;;
         agent-never-foreground)
           printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
           exit 0
           ;;
         agent-foreground-other)
-          printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["vim","notes.txt"],"argv0":"vim","cmdline":"vim notes.txt","cwd":"/tmp","name":"vim","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
-          exit 0
+          # #1016: vim takes the foreground only once this spawn's own agent
+          # start ran — the readiness probe ahead of it must still see the
+          # bare shell, or the spawn fails at the probe gate instead of at
+          # the post-start check this scenario exists for.
+          if [[ -n "$(fixture_foreground)" ]]; then
+            printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4300,"foreground_processes":[{"argv":["vim","notes.txt"],"argv0":"vim","cmdline":"vim notes.txt","cwd":"/tmp","name":"vim","pid":4300}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+            exit 0
+          fi
           ;;
       esac
       infos="$(grep -c '^pane process-info ' "${WRK_FIXTURE_LOG:-/dev/null}" 2>/dev/null || true)"
