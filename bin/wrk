@@ -3028,7 +3028,19 @@ apply_catalog() {
   set -e
   CATALOG_REFUSE_REASON=""
   if [[ -n "$err_file" ]]; then
-    CATALOG_REFUSE_REASON="$(tr -s '[:space:]' ' ' <"$err_file" | cut -c1-240)"
+    # #1045 (scopefuel #1024): a broken config prints a ~190-char
+    # "scopefuel: warning:" line ahead of the refusal, and squeezing all of
+    # stderr kept the warning while cutting the actual reason away. The
+    # warnings are the operator's config signal, not the refusal's — stderr is
+    # captured here, so re-emit them verbatim or the operator never sees the
+    # broken config at all — and build the reason from the remaining lines,
+    # falling back to the last non-empty line so an all-warning stderr still
+    # reports something. The 240-char cap is unchanged.
+    grep '^scopefuel: warning:' "$err_file" >&2 || true
+    CATALOG_REFUSE_REASON="$(grep -v '^scopefuel: warning:' "$err_file" | tr -s '[:space:]' ' ' | cut -c1-240 || true)"
+    if [[ -z "$CATALOG_REFUSE_REASON" ]]; then
+      CATALOG_REFUSE_REASON="$(grep . "$err_file" | tail -n 1 | tr -s '[:space:]' ' ' | cut -c1-240 || true)"
+    fi
     rm -f "$err_file"
   fi
 
