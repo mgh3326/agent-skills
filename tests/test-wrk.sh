@@ -426,8 +426,11 @@ run_t1045_catalog_reason_tests() {
   t1045_warn_two="$t1045_warn"$'\n'"$t1045_warn_b"
 
   # AC1 body — warning + refusal stderr: the die quotes the refusal, not the
-  # warning; the warning reaches stderr verbatim exactly once. $1 tags the
-  # job so mutant runs do not collide with the green one.
+  # warning; the warning reaches stderr verbatim twice — once re-printed by
+  # apply_catalog for the refused launch, once through the quota gate's own
+  # scopefuel call whose stderr passes straight through (#1226 fixture: a
+  # broken config warns on every invocation). $1 tags the job so mutant runs
+  # do not collide with the green one.
   t1045_ac1_body() {
     local tag="${1:-green}" out rc=0 die_line
     out="$(WRK_LAUNCH_MODE=refused WRK_LAUNCH_CONFIG_WARN="$t1045_warn" \
@@ -441,8 +444,8 @@ run_t1045_catalog_reason_tests() {
     if grep -qF 'scopefuel: warning:' <<<"$die_line"; then
       fail "1045 AC1: a leading scopefuel warning never hides the refusal reason: $die_line"
     fi
-    [[ "$(grep -cxF "$t1045_warn_line" <<<"$out")" -eq 1 ]] ||
-      fail "1045 AC1: the warning must reach stderr verbatim exactly once: $out"
+    [[ "$(grep -cxF "$t1045_warn_line" <<<"$out")" -eq 2 ]] ||
+      fail "1045 AC1: the warning must reach stderr verbatim twice (launch re-print + gate passthrough): $out"
   }
   # AC2b body — only warning lines on stderr: the reason falls back to the
   # last non-empty line (the second warning), never 'no reason reported'.
@@ -528,13 +531,138 @@ run_t1045_catalog_reason_tests() {
   # M2 — invariant "an all-warning stderr still yields a reason": dropping the
   # fallback leaves the die at 'no reason reported'.
   devin_trust_mutant t1045-nofallback \
-    "    if [[ -z \"\$CATALOG_REFUSE_REASON\" ]]; then
-      CATALOG_REFUSE_REASON=\"\$(grep . \"\$err_file\" | tail -n 1 | tr -s '[:space:]' ' ' | cut -c1-240 || true)\"
+    "    if [[ -z \"\${CATALOG_REFUSE_REASON//[[:space:]]/}\" ]]; then
+      CATALOG_REFUSE_REASON=\"\$(grep '[^[:space:]]' \"\$err_file\" | tail -n 1 | tr -s '[:space:]' ' ' | cut -c1-240 || true)\"
     fi" \
     "    :"
   t1045_expect_red leading-warning-hides-reason t1045_warn_probe "$TMP/mut-wrk-t1045-warnkept" m1
   t1045_expect_red all-warning-yields-no-reason t1045_fallback_probe "$TMP/mut-wrk-t1045-nofallback" m2
   echo "PASS 1045-AC4-mutants-red (M1 keep-warning, M2 no-fallback)"
+
+  # -- #1226: S1 re-emit only on failure, S2 stderr-only, S3 blank reason ----
+  # Attribution: the launch's stderr is captured into err_file, so the only
+  # way a launch warning reaches wrk stderr is apply_catalog's re-print. The
+  # gate fixture emits the same config warning (a broken config warns on
+  # every invocation) and quota_gate lets that stderr pass straight through —
+  # so a warned spawn's stderr carries one copy per `gate -m` call (1, read
+  # off scopefuel.log) plus the launch re-print (0 or 1).
+  t1226_ac1_body() {  # success: nothing re-printed from the launch call
+    local tag="${1:-green}" launch_log rc=0 warns
+    launch_log="$TMP/t1226-ac1-$tag.launch"
+    rm -f "$TMP/scopefuel.log" "$launch_log"
+    WRK_LAUNCH_LOG="$launch_log" WRK_LAUNCH_CONFIG_WARN="$t1045_warn" \
+      spawn_base sonnet --job "t1226-ac1-$tag" --t T0 \
+      >"$TMP/t1226-ac1-$tag.out" 2>"$TMP/t1226-ac1-$tag.err" || rc=$?
+    [[ "$rc" -eq 0 ]] ||
+      fail "1226 AC1: the warned launch must succeed, got rc $rc: $(cat "$TMP/t1226-ac1-$tag.err")"
+    [[ "$(grep -c 'policy launch' "$launch_log")" -eq 1 ]] ||
+      fail "1226 AC1: expected exactly one policy launch call: $(cat "$launch_log")"
+    [[ "$(grep -c 'gate -m' "$TMP/scopefuel.log")" -eq 1 ]] ||
+      fail "1226 AC1: expected exactly one gate call: $(cat "$TMP/scopefuel.log")"
+    warns="$(grep -cxF "$t1045_warn_line" "$TMP/t1226-ac1-$tag.err" || true)"
+    [[ "$warns" -eq 1 ]] ||
+      fail "1226 AC1: a successful launch never re-prints the warning — stderr must carry only the gate passthrough copy (1), got $warns: $(cat "$TMP/t1226-ac1-$tag.err")"
+  }
+
+  t1226_ac2_body() {  # refusal: re-printed exactly once from the launch call
+    local tag="${1:-green}" launch_log rc=0 warns die_line
+    launch_log="$TMP/t1226-ac2-$tag.launch"
+    rm -f "$TMP/scopefuel.log" "$launch_log"
+    WRK_LAUNCH_LOG="$launch_log" WRK_LAUNCH_MODE=refused \
+      WRK_LAUNCH_CONFIG_WARN="$t1045_warn" \
+      spawn_base codex-astra --job "t1226-ac2-$tag" --t T0 \
+      >"$TMP/t1226-ac2-$tag.out" 2>"$TMP/t1226-ac2-$tag.err" || rc=$?
+    [[ "$rc" -eq 2 ]] ||
+      fail "1226 AC2: the catalog refusal must die rc 2, got rc $rc: $(cat "$TMP/t1226-ac2-$tag.err")"
+    die_line="$(grep -F "refused profile 'codex-astra'" "$TMP/t1226-ac2-$tag.err")" ||
+      fail "1226 AC2: no catalog refusal die line: $(cat "$TMP/t1226-ac2-$tag.err")"
+    grep -qF "consult_only; pass --operator-request" <<<"$die_line" ||
+      fail "1226 AC2: the reason must be the refusal text: $die_line"
+    [[ "$(grep -c 'policy launch' "$launch_log")" -eq 1 &&
+       "$(grep -c 'gate -m' "$TMP/scopefuel.log")" -eq 1 ]] ||
+      fail "1226 AC2: expected one launch and one gate call"
+    warns="$(grep -cxF "$t1045_warn_line" "$TMP/t1226-ac2-$tag.err" || true)"
+    [[ "$warns" -eq 2 ]] ||
+      fail "1226 AC2: a refused launch re-prints the warning exactly once — plus the gate passthrough (2 total), got $warns: $(cat "$TMP/t1226-ac2-$tag.err")"
+  }
+
+  t1226_ac3_body() {  # stream split: warnings land on stderr only
+    local tag="${1:-green}" rc=0
+    WRK_LAUNCH_MODE=refused WRK_LAUNCH_CONFIG_WARN="$t1045_warn" \
+      spawn_base codex-astra --job "t1226-ac3-$tag" --t T0 \
+      >"$TMP/t1226-ac3-$tag.out" 2>"$TMP/t1226-ac3-$tag.err" || rc=$?
+    [[ "$rc" -eq 2 ]] ||
+      fail "1226 AC3: the catalog refusal must die rc 2, got rc $rc: $(cat "$TMP/t1226-ac3-$tag.err")"
+    [[ "$(grep -cxF "$t1045_warn_line" "$TMP/t1226-ac3-$tag.err" || true)" -ge 1 ]] ||
+      fail "1226 AC3: the re-printed warning must reach stderr: $(cat "$TMP/t1226-ac3-$tag.err")"
+    [[ "$(grep -cxF "$t1045_warn_line" "$TMP/t1226-ac3-$tag.out" || true)" -eq 0 ]] ||
+      fail "1226 AC3: warnings go to stderr only, never stdout: $(cat "$TMP/t1226-ac3-$tag.out")"
+  }
+
+  t1226_ac4_body() {  # warning + blank line: the reason is not a blank
+    local tag="${1:-green}" out rc=0 die_line
+    out="$(WRK_LAUNCH_MODE=refused WRK_LAUNCH_REFUSE_QUIET=1 \
+      WRK_LAUNCH_CONFIG_WARN="$t1045_warn" WRK_LAUNCH_STDERR_RAW="" \
+      spawn_base codex-astra --job "t1226-ac4-$tag" --t T0 2>&1)" || rc=$?
+    [[ "$rc" -eq 2 ]] ||
+      fail "1226 AC4: the quiet refusal must die rc 2, got rc $rc: $out"
+    die_line="$(grep -F "refused profile 'codex-astra'" <<<"$out")" ||
+      fail "1226 AC4: no catalog refusal die line: $out"
+    grep -qF "$t1045_warn_line" <<<"$die_line" ||
+      fail "1226 AC4: a whitespace-only reason never reaches the die line — the reason must be the last non-empty line: $die_line"
+  }
+
+  # AC1 — a successful warned spawn emits only the gate's passthrough copy.
+  t1226_ac1_body
+  echo "PASS 1226-AC1-successful-launch-reprints-nothing"
+
+  # AC2 — a refused warned spawn re-prints once, gate copy counted separately.
+  t1226_ac2_body
+  echo "PASS 1226-AC2-refused-launch-reprints-once"
+
+  # AC3 — the re-print is routed to stderr, never stdout.
+  t1226_ac3_body
+  echo "PASS 1226-AC3-warnings-on-stderr-only"
+
+  # AC4 — a warning followed by a blank line yields the warning as the
+  # reason, not a blank; a trailing whitespace-only line is never picked.
+  t1226_ac4_body
+  local t1226_ac4b_out t1226_ac4b_rc=0
+  t1226_ac4b_out="$(WRK_LAUNCH_MODE=refused WRK_LAUNCH_REFUSE_QUIET=1 \
+    WRK_LAUNCH_CONFIG_WARN="$t1045_warn_two" WRK_LAUNCH_STDERR_RAW="   " \
+    spawn_base codex-astra --job t1226-ac4b --t T0 2>&1)" || t1226_ac4b_rc=$?
+  [[ "$t1226_ac4b_rc" -eq 2 ]] ||
+    fail "1226 AC4: the quiet refusal must die rc 2, got rc $t1226_ac4b_rc: $t1226_ac4b_out"
+  t1045_die="$(grep -F "refused profile 'codex-astra'" <<<"$t1226_ac4b_out")" ||
+    fail "1226 AC4: no catalog refusal die line: $t1226_ac4b_out"
+  grep -qF "$t1045_warn_b" <<<"$t1045_die" ||
+    fail "1226 AC4: the fallback must pick the last non-whitespace line, got: $t1045_die"
+  echo "PASS 1226-AC4-blank-and-whitespace-lines-fall-back"
+
+  # AC5 — assertion-RED mutants.
+  # M1 — invariant "a successful launch never re-prints the warning": dropping
+  # the rc guard restores the unconditional re-print (the #1045 behaviour).
+  devin_trust_mutant t1226-rc0reprint \
+    "    if [[ \"\$rc\" -ne 0 ]]; then
+      grep '^scopefuel: warning:' \"\$err_file\" >&2 || true
+    fi" \
+    "    grep '^scopefuel: warning:' \"\$err_file\" >&2 || true"
+  # M2 — invariant "warnings go to stderr only": the re-print lands on stdout.
+  devin_trust_mutant t1226-warnstdout \
+    "      grep '^scopefuel: warning:' \"\$err_file\" >&2 || true" \
+    "      grep '^scopefuel: warning:' \"\$err_file\" || true"
+  # M3 — invariant "a whitespace-only reason never reaches the die line":
+  # without the trim, a warning followed by a blank line dies blank.
+  devin_trust_mutant t1226-notrim \
+    "if [[ -z \"\${CATALOG_REFUSE_REASON//[[:space:]]/}\" ]]" \
+    "if [[ -z \"\$CATALOG_REFUSE_REASON\" ]]"
+  t1226_ok_probe() { ( WRK_UNDER_TEST="$1" t1226_ac1_body "$2" ); }
+  t1226_stream_probe() { ( WRK_UNDER_TEST="$1" t1226_ac3_body "$2" ); }
+  t1226_blank_probe() { ( WRK_UNDER_TEST="$1" t1226_ac4_body "$2" ); }
+  t1045_expect_red rc0-reprints-warning t1226_ok_probe "$TMP/mut-wrk-t1226-rc0reprint" m1
+  t1045_expect_red warnings-on-stdout t1226_stream_probe "$TMP/mut-wrk-t1226-warnstdout" m2
+  t1045_expect_red whitespace-reason-dies-blank t1226_blank_probe "$TMP/mut-wrk-t1226-notrim" m3
+  echo "PASS 1226-AC5-mutants-red (M1 rc0-reprint, M2 warn-on-stdout, M3 no-trim)"
 }
 
 # Slice gate: WRK_TEST_ONLY_CATALOG_REASON=1 runs only this section after the
