@@ -57,16 +57,28 @@ catalog_effort_for() {
   esac
 }
 
+# #1045: since scopefuel #1024 a broken config prints a "scopefuel: warning:"
+# line on stderr. #1226: the warning fires per invocation, not only on
+# `policy launch` — the quota gate's `gate` calls emit it too, and wrk lets
+# that stderr pass straight through to the operator.
+emit_config_warnings() {
+  [[ -n "${WRK_LAUNCH_CONFIG_WARN:-}" ]] || return 0
+  while IFS= read -r cfg_warn_line; do
+    printf 'scopefuel: warning: %s\n' "$cfg_warn_line" >&2
+  done <<<"$WRK_LAUNCH_CONFIG_WARN"
+}
+
 if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
-  # #1045: since scopefuel #1024 a broken config prints a "scopefuel: warning:"
-  # line on stderr ahead of any refusal. Each line of WRK_LAUNCH_CONFIG_WARN
-  # becomes one warning line; WRK_LAUNCH_REFUSE_QUIET=1 refuses rc 3 with no
-  # reason line (an all-warning stderr); WRK_LAUNCH_REFUSE_TEXT replaces the
-  # consult_only reason text (e.g. a >240-char line for the cap check).
-  if [[ -n "${WRK_LAUNCH_CONFIG_WARN:-}" ]]; then
-    while IFS= read -r cfg_warn_line; do
-      printf 'scopefuel: warning: %s\n' "$cfg_warn_line" >&2
-    done <<<"$WRK_LAUNCH_CONFIG_WARN"
+  # #1045: the warning lands ahead of any refusal. WRK_LAUNCH_REFUSE_QUIET=1
+  # refuses rc 3 with no reason line (an all-warning stderr);
+  # WRK_LAUNCH_REFUSE_TEXT replaces the consult_only reason text (e.g. a
+  # >240-char line for the cap check). #1226: WRK_LAUNCH_STDERR_RAW, when set
+  # at all — even to the empty string — is printed verbatim on stderr after
+  # the warnings; a blank or whitespace-only line cannot ride in
+  # WRK_LAUNCH_CONFIG_WARN because every line there gains the prefix.
+  emit_config_warnings
+  if [[ "${WRK_LAUNCH_STDERR_RAW+x}" == x ]]; then
+    printf '%s\n' "$WRK_LAUNCH_STDERR_RAW" >&2
   fi
   case "${WRK_LAUNCH_MODE:-ok}" in
     # An installed scopefuel too old to have the subcommand at all.
@@ -166,6 +178,14 @@ if [[ "${1:-}" == --json ]]; then
   esac
   printf '{"schema":"%s","generated_at":"2026-08-01T00:00:00+00:00","summary":{"mark":"ok","usage_mark":"ok"},"providers":%s}\n' "$schema_value" "$providers"
   exit "$json_rc"
+fi
+
+# #1226: a broken config warns on every invocation — gate calls included. wrk
+# captures the `gate --help` probe's stderr but lets the `gate -m` call's
+# pass straight through, which is where a warned spawn's gate-side copy comes
+# from.
+if [[ "${1:-}" == gate ]]; then
+  emit_config_warnings
 fi
 
 if [[ "${1:-}" == gate && "${2:-}" == --help ]]; then
