@@ -14,4 +14,56 @@ if [[ "${1:-}" == place ]]; then
   exit 0
 fi
 
+# #1239: `panewire burst request` — the wake-on-demand leg. The full argv is
+# logged to WRK_WAKE_LOG exactly like every other non-place call, then the
+# WRK_BURST_SCENARIO decides the answer. The real CLI answers a granted hold
+# with the lease JSON on stdout (rc 0), a hub-side refusal or timeout with
+# {"reason":"..."} on stdout (rc 3), a transport failure with "burst
+# unavailable" on stderr (rc 3), and an argument/credential rejection on
+# stderr (rc 2/5).
+if [[ "${1:-}" == burst ]]; then
+  printf '%s\n' "$*" >>"${WRK_WAKE_LOG:?}"
+  shift
+  subcmd="${1:-}"
+  target="" token_env="" hub_url=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --target) target="$2"; shift 2 ;;
+      --hub-token-env) token_env="$2"; shift 2 ;;
+      --hub-url) hub_url="$2"; shift 2 ;;
+      --*) if (( $# >= 2 )); then shift 2; else shift; fi ;;
+      *) shift ;;
+    esac
+  done
+  # The real CLI refuses a request missing --hub-url or --hub-token-env with
+  # rc 2 — the credential-routing tests rely on that boundary.
+  if [[ "$subcmd" != request || -z "$hub_url" || -z "$token_env" || -z "$target" ]]; then exit 2; fi
+  scenario="${WRK_BURST_SCENARIO:-up}"
+  if [[ "$scenario" == cooldown-after-first ]]; then
+    # mkdir is atomic: the first concurrent caller takes it and the node
+    # wakes; every later caller answers cooldown_active — which wrk treats as
+    # "a wake is already in progress" and waits on.
+    if mkdir "${WRK_DESKTOP_AWAKE:?}.held" 2>/dev/null; then scenario=up; else scenario=cooldown; fi
+  fi
+  case "$scenario" in
+    up)
+      [[ -z "${WRK_DESKTOP_AWAKE:-}" ]] || : >"$WRK_DESKTOP_AWAKE"
+      printf '%s\n' '{"id":"hold-fixture","target":"'"$target"'","reason":"wrk spill-over","status":"active","expires_at":"2026-10-02T00:00:00Z"}'
+      exit 0 ;;
+    no-up)
+      # Granted hold but the node never connects — exercises wrk's own
+      # wake_wait deadline rather than the hub's target_timeout.
+      printf '%s\n' '{"id":"hold-fixture","status":"active"}'
+      exit 0 ;;
+    cooldown) printf '%s\n' '{"reason":"cooldown_active"}'; exit 3 ;;
+    target-timeout) printf '%s\n' '{"reason":"target_timeout"}'; exit 3 ;;
+    target-unavailable) printf '%s\n' '{"reason":"target_unavailable"}'; exit 3 ;;
+    wake-via-unavailable) printf '%s\n' '{"reason":"wake_via_unavailable"}'; exit 3 ;;
+    invalid-request) printf '%s\n' '{"reason":"invalid_request"}'; exit 3 ;;
+    cli-fail) printf '%s\n' 'burst rejected: invalid operator token env' >&2; exit 5 ;;
+    unavailable) printf '%s\n' 'burst unavailable' >&2; exit 3 ;;
+    *) printf 'fixture panewire: unknown burst scenario %s\n' "$scenario" >&2; exit 2 ;;
+  esac
+fi
+
 printf '%s\n' "$*" >>"${WRK_WAKE_LOG:?}"
