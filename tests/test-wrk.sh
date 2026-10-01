@@ -2756,7 +2756,7 @@ run_t1239_desktop_wake_tests() {
   # its remote refuses rc 2 at cwd-map, the stop set ends the round before
   # the post-round wake; R2(a)'s 'wake fires, lands desktop' fails.
   devin_trust_mutant t1239-unmapped-stops-round \
-    '      if { [[ "$candidate" != "$selected" ]] || [[ "$SPILL_DECISION_SOURCE" != hub ]]; } &&
+    '      if [[ "$SPILL_DECISION_SOURCE" == local-fallback ]] &&
          ! spillover_cwd_map "$candidate" "$cwd"; then' \
     '      if false &&
          ! spillover_cwd_map "$candidate" "$cwd"; then'

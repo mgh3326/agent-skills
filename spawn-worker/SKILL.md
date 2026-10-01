@@ -628,11 +628,13 @@ wake_wait = 300
   확인한다. 로컬 브랜치가 origin에 push되지 않았거나 원격이 다른 커밋이면 덮어쓰지 않고
   fail-closed다 — push·정렬·수동 생성 중 무엇을 하면 되는지 메시지가 나온다. 정확히
   일치하는 리포 루트 매핑은 기존처럼 통과한다.
-- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. `--host auto`는 그런 후보를
-  probe 전에 건너뛰고(성공 라운드에는 조용히, 전멸 라운드에는 보류된 진단 한 줄)
-  라운드를 멈추지도 wake 판정에도 세지 않는다. 단 hub가 직접 고른 호스트는
-  예외다 — placement 결정이 권위이므로 그 호스트의 cwd-map 미스는 여전히 rc 2로
-  fail-closed다. 명시적 `--host NAME`도 cwd-map rc 2를 그대로 유지한다.
+- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. `--host auto`의
+  hosts.toml 순서 라운드(hub 응답이 없어 local-fallback으로 돌아간 경우)만
+  그런 후보를 probe 전에 건너뛰고(성공 라운드에는 조용히, 전멸 라운드에는
+  보류된 진단 한 줄) 라운드를 멈추지도 wake 판정에도 세지 않는다. hub가
+  답한 placement 라운드에는 skip이 없다 — placement 결정이 권위이므로 그
+  라운드의 cwd-map 미스는 여전히 rc 2로 fail-closed다. 명시적
+  `--host NAME`도 cwd-map rc 2를 그대로 유지한다.
 - `wake = "panewire"`(#1239)는 기본 off 원격 호스트를 필요할 때만 깨운다. 후보가 probe에서
   ssh-unreachable이었다는 것만으로는 깨우지 않고 라운드를 끝까지 돌린다: **로컬이 job을
   받을 수 없고**(압력 초과이거나 `spawn = false`) **아무 후보도 job을 받지 못했으며**
