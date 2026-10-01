@@ -2143,8 +2143,10 @@ run_t1239_desktop_wake_tests() {
   # The desk's real shape: quota_gate = "local" plus operator_token_env and
   # NO hub_token_env — the wake must never need the quota-gate key.
   T1239_HOSTS="$TMP/t1239-hosts.toml"
+  # hub_url is wss:// on purpose — the wake must convert it to the https
+  # operator base like every other hub path (AC1 asserts the logged argv).
   printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
-    '[hub]' 'hub_url = "https://hub.fixture.invalid"' \
+    '[hub]' 'hub_url = "wss://hub.fixture.invalid"' \
     "operator_token_env = \"$T1239_OPERATOR\"" 'quota_gate = "local"' '' \
     '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
     "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' \

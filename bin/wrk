@@ -6097,6 +6097,11 @@ spillover_wake_request() {
     return 1
   fi
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  # The burst operator client wants an HTTPS/HTTP base — reuse the same
+  # wss:// -> https:// conversion the other hub paths apply.
+  if [[ -n "$hub_url" ]]; then
+    hub_url="$(spillover_hub_http_base "$hub_url" 2>/dev/null || true)"
+  fi
   token_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
   if [[ -z "$token_env" ]]; then
     token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"

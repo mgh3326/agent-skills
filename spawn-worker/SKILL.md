@@ -622,7 +622,8 @@ wake_wait = 300            # 노드 접속 대기 상한(초), 기본 300
   받을 수 없고**(압력 초과이거나 `spawn = false`) **다른 도달 가능한 후보가 전부
   remote-full로만 거절했을 때** 첫 wake 후보에 `panewire burst request --target <name>
   --hold <wake_hold>m --timeout <min(wake_wait,600)>s --reason … --hub-url …
-  --hub-token-env <credential>`를 보낸다. 자격 증명은 `[hub] operator_token_env`가 우선이고
+  --hub-token-env <credential>`를 보낸다(`hub_url`은 다른 hub 경로와 같은
+  `wss://`→`https://` 변환을 거친다). 자격 증명은 `[hub] operator_token_env`가 우선이고
   없을 때만 `hub_token_env`로 폴백한다 — `hub_token_env`는 hub quota gate(#1138)의
   opt-in이기도 하므로 `quota_gate = "local"` 호스트는 그 키를 비워 둔 채 이 경로를 쓴다.
   `hub_cf_env`는 선택 사항이다. hold 승인(rc 0)이나 `cooldown_active`(동시에 돌린 다른
