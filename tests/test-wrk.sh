@@ -172,6 +172,11 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # command-substitution subshells most spawn callers use.
 mint_task() {
   local id=$(( $(cat "$TMP/mint-seq" 2>/dev/null || echo 768000) + 1 ))
+  # The fixture pool above pre-mints 768001-768799 only; an id past it mints
+  # a task that does not exist and the failure surfaces as a swallowed rc 2
+  # in a later spawn, far from the real cause — stop loudly instead (#1010/N7).
+  (( id <= 768799 )) ||
+    fail "mint_task: task pool exhausted (id $id exceeds the pre-minted 768001-768799 range)"
   printf '%s\n' "$id" >"$TMP/mint-seq"
   printf '%s\n' "$id"
 }
@@ -2876,8 +2881,8 @@ PY
   # compare; AC5's no-rm assertion must then fail.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-994-blindrm \
-    '  if [[ "$row_machine" != "$want_machine" || "$row_pane" != "$want_pane" ]]; then' \
-    '  if false; then'
+    '        if machine == want_machine and pane == want_pane:' \
+    '        if True:'
   lanes_reap_job j994-m2 w1:p16 w1:t16 own-994-m2 lane-994-m2 lbl-994-m2
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-994-blindrm" \
     WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-994-m2","machine":"mac-work-default","pane":"w1:p88","parent":"x","sink":false}]}' \
@@ -2901,6 +2906,168 @@ PY
     fail "#994 M3 mutant survived: the flag-shaped lane never reached argv"
   fi
   echo "PASS 994-lanes M3: dropping lane-name validation goes RED"
+
+  # ------------------------------------------------------------------
+  # #1010 — lane test gaps from the #994 tester
+  # ------------------------------------------------------------------
+  # S1 — same pane, another machine: AC5 above moves only the pane, so the
+  # machine half of the `lanes ls` compare could be deleted with the suite
+  # green (#994 tester mutant MD). A row bound to another machine on the
+  # recorded pane is never removed, and the close still stands.
+  lanes_reap_job j1010-s1 w1:p10 w1:t10 own-1010-s1 lane-1010-s1 lbl-1010-s1
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1010-s1","machine":"mac-work-other","pane":"w1:p10","parent":"x","sink":false}]}' \
+    lanes_reap_run s1 --lane own-1010-s1 --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1010 S1: apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j1010-s1 ' "$LANES_REAP_OUT" ||
+    fail "#1010 S1: the pane must still close: $(cat "$LANES_REAP_OUT")"
+  if [[ -f "$LANES_RM_LOG" ]]; then
+    ! grep -qxF 'rm' "$LANES_RM_LOG" ||
+      fail "#1010 S1: a row bound to another machine on the same pane was removed: $(cat "$LANES_RM_LOG")"
+  fi
+  [[ "$(grep -c "lane now belongs to" "$LANES_REAP_ERR")" -eq 1 ]] ||
+    fail "#1010 S1: one belongs-to-another-machine warning expected: $(cat "$LANES_REAP_ERR")"
+  echo "PASS 1010-lanes S1: a same-pane row on another machine is never removed"
+
+  # N2 — the lookup row used to come back as a TSV read with IFS=tab, where
+  # tab is IFS whitespace: an empty field collapses (machine "m-a<TAB>w1:p11"
+  # with an empty pane read back as machine m-a, pane w1:p11 — a false match)
+  # and an embedded newline truncates the row the same way. The compare now
+  # runs inside python on the parsed fields, so neither shape can match. Both
+  # rows are stub-only: real panewire refuses them at lanes add.
+  lanes_reap_job j1010-emptyf w1:p11 w1:t11 own-1010-e lane-1010-empty lbl-1010-e m-a
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1010-empty","machine":"m-a\tw1:p11","pane":"","parent":"x","sink":false}]}' \
+    lanes_reap_run n2a --lane own-1010-e --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1010 N2: apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j1010-emptyf ' "$LANES_REAP_OUT" ||
+    fail "#1010 N2: the pane must still close: $(cat "$LANES_REAP_OUT")"
+  if [[ -f "$LANES_RM_LOG" ]]; then
+    ! grep -qxF 'rm' "$LANES_RM_LOG" ||
+      fail "#1010 N2: an empty-field row must never match (the IFS collapse is gone): $(cat "$LANES_RM_LOG")"
+  fi
+  [[ "$(grep -c "lane now belongs to" "$LANES_REAP_ERR")" -eq 1 ]] ||
+    fail "#1010 N2: one belongs-to warning expected for the empty-field row: $(cat "$LANES_REAP_ERR")"
+  lanes_reap_job j1010-nlpane w1:p12 w1:t12 own-1010-n lane-1010-nl lbl-1010-n m-b
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1010-nl","machine":"m-b","pane":"w1:p12\nzz","parent":"x","sink":false}]}' \
+    lanes_reap_run n2b --lane own-1010-n --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1010 N2: apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j1010-nlpane ' "$LANES_REAP_OUT" ||
+    fail "#1010 N2: the pane must still close: $(cat "$LANES_REAP_OUT")"
+  if [[ -f "$LANES_RM_LOG" ]]; then
+    ! grep -qxF 'rm' "$LANES_RM_LOG" ||
+      fail "#1010 N2: a newline-carrying pane must never match (the read truncated at the newline): $(cat "$LANES_RM_LOG")"
+  fi
+  [[ "$(grep -c "lane now belongs to" "$LANES_REAP_ERR")" -eq 1 ]] ||
+    fail "#1010 N2: one belongs-to warning expected for the newline row: $(cat "$LANES_REAP_ERR")"
+  echo "PASS 1010-lanes N2: malformed lookup rows never match"
+
+  # N1 — the fixture's default `lanes ls` output must be valid JSON (the
+  # escaped braces once printed "\{"lanes":[]\}", which nothing could parse).
+  ( unset WRK_PANEWIRE_LANES_LS WRK_PANEWIRE_LANES_LS_RC WRK_PANEWIRE_LANES_LOG
+    "$PANEWIRE" lanes ls ) |
+    python3 -c 'import json,sys; json.load(sys.stdin)' ||
+    fail "#1010 N1: the fixture default lanes ls output must parse as JSON"
+  echo "PASS 1010-lanes N1: fixture default lanes ls output is valid JSON"
+
+  # N5 — a session_machine_ids value the matcher can only PARTIALLY read is a
+  # parse failure, not "no entry"; likewise a crashed interpreter. Neither may
+  # register, and the interpreter's stderr stays out of the spawn's.
+  printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nsession_machine_ids = { default = "mac-work-default", "other" = "m2" }\n' \
+    "$LANES_TOKEN_FILE" >"$TMP/lanes-bad-partial.toml"
+  LANES_CFG_OVERRIDE="$TMP/lanes-bad-partial.toml" HERDR_SESSION=default \
+    lanes_spawn lane-1010-partial --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1010 N5: spawn failed on a partially parsed map (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call lane-1010-partial
+  grep -q 'session_machine_ids value could not be parsed' "$LANES_ERR" ||
+    fail "#1010 N5: a partially parsed map must warn could-not-be-parsed: $(cat "$LANES_ERR")"
+  ! grep -q 'has no session_machine_ids entry' "$LANES_ERR" ||
+    fail "#1010 N5: a partially parsed map must not read as a missing entry: $(cat "$LANES_ERR")"
+  # A crashed python3 (the stub below exits 139 only for the
+  # `python3 - <session> <{raw}>` probe and delegates every other call) takes
+  # the same parse-failure wording — and its traceback never reaches stderr.
+  LANES_PY3_STUB="$TMP/py3stub"
+  mkdir -p "$LANES_PY3_STUB"
+  LANES_REAL_PY3="$(command -v python3)"
+# shellcheck disable=SC2016 # the stub's $N are its own argv, not expansions here
+  printf '#!/usr/bin/env bash\nif [[ "${WRK_TEST_PY3_CRASH:-0}" == 1 && "${1:-}" == "-" && "${2:-}" != /* && "${3:-}" == \\{* ]]; then\n  echo "Traceback (most recent call last):" >&2\n  echo "RuntimeError: fixture crash" >&2\n  exit 139\nfi\nexec "%s" "$@"\n' \
+    "$LANES_REAL_PY3" >"$LANES_PY3_STUB/python3"
+  chmod +x "$LANES_PY3_STUB/python3"
+  PATH="$LANES_PY3_STUB:$PATH" WRK_TEST_PY3_CRASH=1 HERDR_SESSION=default \
+    lanes_spawn lane-1010-crash --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1010 N5: a crashed interpreter must not fail the spawn (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call lane-1010-crash
+  grep -q 'session_machine_ids value could not be parsed' "$LANES_ERR" ||
+    fail "#1010 N5: a crashed interpreter must warn could-not-be-parsed, not no-entry: $(cat "$LANES_ERR")"
+  ! grep -q 'has no session_machine_ids entry' "$LANES_ERR" ||
+    fail "#1010 N5: a crashed interpreter must not read as a missing entry: $(cat "$LANES_ERR")"
+  ! grep -q 'Traceback' "$LANES_ERR" ||
+    fail "#1010 N5: interpreter stderr must stay out of the spawn's: $(cat "$LANES_ERR")"
+  # And on the normal path nothing from the interpreter leaks either.
+  HERDR_SESSION=default lanes_spawn lane-1010-quiet --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] || fail "#1010 N5: quiet-path spawn failed (rc=$LANES_RC)"
+  ! grep -q 'Traceback' "$LANES_ERR" ||
+    fail "#1010 N5: stray interpreter stderr on the normal path: $(cat "$LANES_ERR")"
+  echo "PASS 1010-lanes N5: parse failure warns could-not-be-parsed, stderr stays silent"
+
+  # N7 — mint_task stops loudly at the end of the pre-minted pool
+  # (768001-768799) instead of minting an id the fixture never created, which
+  # surfaced as a swallowed rc 2 in a later spawn.
+  lanes_mint_saved="$(cat "$TMP/mint-seq" 2>/dev/null || echo 768000)"
+  printf '768799\n' >"$TMP/mint-seq"
+  set +e
+  lanes_mint_out="$(mint_task 2>&1)"
+  lanes_mint_rc=$?
+  set -e
+  printf '%s\n' "$lanes_mint_saved" >"$TMP/mint-seq"
+  [[ "$lanes_mint_rc" -ne 0 ]] ||
+    fail "#1010 N7: mint_task must fail once the pool is exhausted"
+  grep -q 'task pool exhausted' <<<"$lanes_mint_out" ||
+    fail "#1010 N7: the exhaustion message must name the pool: $lanes_mint_out"
+  echo "PASS 1010-lanes N7: mint_task fails loudly at pool exhaustion"
+
+  # -- #1010 assertion-RED mutants ------------------------------------------
+  # M1: "reap never removes a lane whose machine differs even when the pane
+  # matches" — drop the machine half of the compare (#994 tester mutant MD,
+  # which slipped through the suite); S1's no-rm assertion must then fail.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1010-nomachine \
+    '        if machine == want_machine and pane == want_pane:' \
+    '        if pane == want_pane:'
+  lanes_reap_job j1010-m1 w1:p13 w1:t13 own-1010-m1 lane-1010-m1 lbl-1010-m1
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1010-nomachine" \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1010-m1","machine":"mac-work-other","pane":"w1:p13","parent":"x","sink":false}]}' \
+    lanes_reap_run m1010a --lane own-1010-m1 --apply
+  if [[ ! -f "$LANES_RM_LOG" ]] || ! grep -qxF 'rm' "$LANES_RM_LOG"; then
+    fail "#1010 M1 mutant survived: a same-pane row on another machine was not swept"
+  fi
+  echo "PASS 1010-lanes M1: dropping the machine half of the compare goes RED"
+
+  # M2: "a malformed lookup row never matches" — restore the old IFS=tab read
+  # semantics in the compare (tab-split with empty-field collapse, truncated
+  # at the first newline); N2's no-rm assertions must then fail.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1010-ifsread \
+    '        if machine == want_machine and pane == want_pane:' \
+    '        if [p for p in ("%s\t%s" % (machine, pane)).split("\n")[0].split("\t") if p] == [want_machine, want_pane]:'
+  lanes_reap_job j1010-m2a w1:p14 w1:t14 own-1010-m2a lane-1010-m2a lbl-1010-m2a m-c
+  lanes_reap_job j1010-m2b w1:p15 w1:t15 own-1010-m2b lane-1010-m2b lbl-1010-m2b m-d
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1010-ifsread" \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1010-m2a","machine":"m-c\tw1:p14","pane":"","parent":"x","sink":false}]}' \
+    lanes_reap_run m1010b --lane own-1010-m2a --apply
+  if [[ ! -f "$LANES_RM_LOG" ]] || ! grep -qxF 'rm' "$LANES_RM_LOG"; then
+    fail "#1010 M2 mutant survived: the empty-field row did not falsely match"
+  fi
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1010-ifsread" \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1010-m2b","machine":"m-d","pane":"w1:p15\nzz","parent":"x","sink":false}]}' \
+    lanes_reap_run m1010c --lane own-1010-m2b --apply
+  if [[ ! -f "$LANES_RM_LOG" ]] || ! grep -qxF 'rm' "$LANES_RM_LOG"; then
+    fail "#1010 M2 mutant survived: the newline-carrying row did not falsely match"
+  fi
+  echo "PASS 1010-lanes M2: restoring the IFS=tab read goes RED"
 
   # ------------------------------------------------------------------
   # #1037 — lanes_token_env: a lanes-only credential that never gates

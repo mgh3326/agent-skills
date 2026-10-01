@@ -337,7 +337,8 @@ if [[ "${1:-}" == lanes ]]; then
   fi
   if [[ "${1:-}" == ls ]]; then
     [[ -z "${WRK_PANEWIRE_LANES_LS_RC:-}" ]] || exit "$WRK_PANEWIRE_LANES_LS_RC"
-    printf '%s\n' "${WRK_PANEWIRE_LANES_LS:-\{\"lanes\":[]\}}"
+    lanes_ls_default='{"lanes":[]}'
+    printf '%s\n' "${WRK_PANEWIRE_LANES_LS:-$lanes_ls_default}"
     exit 0
   fi
   exit "${WRK_PANEWIRE_LANES_RC:-${WRK_PANEWIRE_RC:-0}}"

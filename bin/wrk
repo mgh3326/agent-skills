@@ -379,7 +379,11 @@ hub_lane/hub_lane_machine; `wrk reap --apply` removes the lane with
 `panewire lanes rm`. An unmapped session or a missing --owner warns once
 and spawns unregistered — as does a panewire failure; the spawn never fails
 over it and builder lanes are never touched (they stay the director's).
-`panewire lanes-audit` lists any leftover rows.
+The label becomes the lane name verbatim, so panewire's own lane rule
+^[a-z0-9-]{1,32}$ applies on top of wrk's: a label containing an underscore
+is a valid wrk label but not a valid lane name — on a mapped session such a
+spawn warns once and lands unregistered (#1010). `panewire lanes-audit`
+lists any leftover rows.
 
 session_machine_ids is for NON-fleet herdr sessions only — for example M1's
 default session, served by its own panewire daemon. Mapping a fleet session
@@ -5497,7 +5501,8 @@ spillover_host_via() {
 hub_session_machine_id() {
   # rc 0: the machine id on stdout. rc 1: the map parsed but has no entry for
   # the session. rc 2: content the one-line matcher cannot read — a missing
-  # closing brace (multi-line table), single-quoted keys, a bare value —
+  # closing brace (multi-line table), single-quoted keys, a bare value, or
+  # any residue left between the quoted pairs (a partially parsed map) —
   # which the caller must warn about differently from "no entry" (#994/N4).
   python3 - "$1" "$2" <<'PY'
 import re, sys
@@ -5507,12 +5512,19 @@ def unq(s):
 body = raw.strip()
 if not (body[:1] == "{" and body[-1:] == "}"):
     raise SystemExit(2)
-pairs = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"', raw)
+inner = body[1:-1]
+pair = re.compile(r'"([^"\\]*(?:\\.[^"\\]*)*)"\s*=\s*"([^"\\]*(?:\\.[^"\\]*)*)"')
+pairs = pair.findall(inner)
+# Anything the pair matcher left behind — an unquoted key, a bare value, a
+# second table — is a map we only partially read; that is a parse failure,
+# never a missing entry (#1010/N5).
+if pair.sub("", inner).strip(" \t,"):
+    raise SystemExit(2)
 for key, value in pairs:
     if unq(key) == session:
         print(unq(value))
         raise SystemExit(0)
-raise SystemExit(2 if (not pairs and body[1:-1].strip()) else 1)
+raise SystemExit(2 if (not pairs and inner.strip()) else 1)
 PY
 }
 
@@ -5523,14 +5535,20 @@ hub_lane_name_valid() {
   [[ "$1" =~ ^[a-z0-9-]{1,32}$ ]]
 }
 
-# Print "machine<TAB>pane" of the lane's row in a `panewire lanes ls`
-# envelope; nothing when the lane is absent. Exit 1 when the listing is not
-# the JSON the CLI emits — a row we could not read is a row we may not
+# Print one verdict line for LANE's row in a `panewire lanes ls` envelope,
+# compared against the recorded machine+pane: "match" when both fields equal
+# the recorded values, "mismatch OBSERVED" with the observed machine:pane
+# (control characters backslash-escaped so the verdict stays a single line),
+# and nothing when the lane is absent. The compare happens here, on the
+# parsed fields: piping the row back through an IFS=tab read collapses empty
+# fields and truncates at an embedded newline, which can slide another
+# machine's row into a false match (#1010/N2). Exit 1 when the listing is
+# not the JSON the CLI emits — a row we could not read is a row we may not
 # remove (#994/N3).
 hub_lane_lookup() {
-  python3 - "$1" "$2" <<'PY'
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
 import json, sys
-lane, raw = sys.argv[1:]
+lane, want_machine, want_pane, raw = sys.argv[1:]
 try:
     doc = json.loads(raw)
 except ValueError:
@@ -5538,12 +5556,18 @@ except ValueError:
 rows = doc.get("lanes") if isinstance(doc, dict) else None
 if not isinstance(rows, list):
     raise SystemExit(1)
+def disp(s):
+    return s.replace("\\", "\\\\").replace("\n", "\\n").replace("\t", "\\t")
 for row in rows:
     if isinstance(row, dict) and row.get("lane") == lane:
         machine = row.get("machine")
         pane = row.get("pane")
-        print("%s\t%s" % (machine if isinstance(machine, str) else "",
-                          pane if isinstance(pane, str) else ""))
+        machine = machine if isinstance(machine, str) else ""
+        pane = pane if isinstance(pane, str) else ""
+        if machine == want_machine and pane == want_pane:
+            print("match")
+        else:
+            print("mismatch %s:%s" % (disp(machine), disp(pane)))
         break
 PY
 }
@@ -5575,10 +5599,13 @@ hub_lane_register() {
   # the hub quota gate does on absent hub keys.
   [[ -n "$raw" ]] || return 0
   set +e
-  machine="$(hub_session_machine_id "$session" "$raw")"
+  machine="$(hub_session_machine_id "$session" "$raw" 2>/dev/null)"
   machine_rc=$?
   set -e
-  if [[ "$machine_rc" -eq 2 ]]; then
+  # #1010/N5: any rc beyond 0/1 — the matcher's own 2, a crashed interpreter,
+  # anything in between — is a parse failure, not a missing entry; stderr is
+  # silenced above so a traceback never leaks into the spawn's.
+  if [[ "$machine_rc" -ne 0 && "$machine_rc" -ne 1 ]]; then
     warn "hub lane not registered (the [hub] session_machine_ids value could not be parsed; use the one-line {\"session\" = \"machine\"} inline table)"
     return 0
   fi
@@ -5677,7 +5704,7 @@ hub_lane_register() {
 # `panewire lanes-audit` is where leftovers surface.
 hub_lane_remove() {
   local lane="$1" want_machine="${2:-}" want_pane="${3:-}" panewire hub_url token_env cf_env rc=0
-  local listing row row_machine row_pane
+  local listing verdict
   local args=()
   if ! hub_lane_name_valid "$lane"; then
     warn "hub lane '$lane' not removed (not a valid panewire lane name)"
@@ -5706,20 +5733,19 @@ hub_lane_remove() {
     return 0
   fi
   set +e
-  row="$(hub_lane_lookup "$lane" "$listing")"
+  verdict="$(hub_lane_lookup "$lane" "$want_machine" "$want_pane" "$listing")"
   rc=$?
   set -e
   if [[ "$rc" -ne 0 ]]; then
     warn "hub lane '$lane' not removed (panewire lanes ls output was not parseable)"
     return 0
   fi
-  if [[ -z "$row" ]]; then
+  if [[ -z "$verdict" ]]; then
     warn "hub lane '$lane' not removed (no such lane on the hub)"
     return 0
   fi
-  IFS=$'\t' read -r row_machine row_pane <<<"$row"
-  if [[ "$row_machine" != "$want_machine" || "$row_pane" != "$want_pane" ]]; then
-    warn "hub lane '$lane' not removed (the lane now belongs to $row_machine:$row_pane, not the recorded $want_machine:$want_pane)"
+  if [[ "$verdict" != match ]]; then
+    warn "hub lane '$lane' not removed (the lane now belongs to ${verdict#mismatch }, not the recorded $want_machine:$want_pane)"
     return 0
   fi
   args=(lanes rm "$lane" --hub-url "$hub_url" --hub-token-env "$token_env")
