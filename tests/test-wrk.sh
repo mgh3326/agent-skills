@@ -617,7 +617,7 @@ run_t1045_catalog_reason_tests() {
   echo "PASS 1226-AC1-successful-launch-reprints-nothing"
 
   # AC2 — a refused warned spawn re-prints once, gate copy counted separately.
-  t1226_ac2_body
+  t1226_ac2_body green
   echo "PASS 1226-AC2-refused-launch-reprints-once"
 
   # AC3 — the re-print is routed to stderr, never stdout.
