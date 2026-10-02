@@ -580,6 +580,7 @@ hub 호출 자체가 실패했을 때만 아래의 로컬 폴백 측정(load5/nc
 max_load_ratio = 0.5       # hub unavailable 때만 사용
 max_active = 4             # hub unavailable 때만 사용
 heavy_max = 1              # 이 머신의 wrk heavy 동시 홀더 수: 0=금지, N=슬롯 N개 (기본 1)
+heavy_load_wait = true     # wrk heavy의 슬롯 획득 후 load5/ncpu<1.0 대기 — false면 그 대기만 생략 (기본 true)
 spawn = false              # 이 호스트의 로컬 spawn 자체를 닫는다 — bare TOML boolean만 허용, 기본 true
 
 [hub]
@@ -653,6 +654,21 @@ wake = "panewire"
   허용이다. `[local]`이 없거나 spawn 키가 없거나 정확한 한 줄이면 기존과 동일하다.
   `wrk hosts`는 해석된 상태를 `local spawn=allowed|disabled|error (<사유>)`로
   출력한다 (보고 명령이라 오류 상태에서도 rc 0).
+- `heavy_load_wait`(#1241)은 같은 strict 스캐너가 읽는 두 번째 [local] boolean이다 —
+  같은 규칙이다: `[local]` 단독 줄 아래 `heavy_load_wait = true|false` 한 번만 허용되고,
+  따옴표 값·다른 철자·중복·변형된 키 줄은 모두 줄 번호를 단 rc 70 거부다(이 거부는
+  surface 전체에 걸려서 heavy 뿐 아니라 spawn 배치도 막는다). 없거나 `true`이면 기존과
+  동일(슬롯을 잡은 뒤 load5/ncpu<1.0이 될 때까지 기다린다). `false`이면 **그 load 대기만**
+  생략한다 — heavy_max 슬롯 획득·슬롯 락·`nice -n 10`·20분 cap(슬롯 대기에도 적용, 초과 시
+  rc 75)은 그대로다. 잘못된 [local]은 슬롯을 잡기 전에 rc 70으로 거부한다.
+  `wrk hosts`는 `local heavy_load_wait=true|false|error (<사유>)`를, `wrk heavy status`는
+  `load_wait true|false|error (<사유>)`를 출력한다(둘 다 보고 명령이라 오류에서도 rc 0).
+  hosts.toml 자체가 없으면(디렉터리도 없으면) 대기 on·heavy_max 1로 기존과 동일하고,
+  `[local]`에 이 키만 있는 파일은 생성 전과 비교해 이 스위치 외 라우팅·기본값·rc는
+  바꾸지 않는다 — 단 #58부터 있던 선행 차이 하나: 읽을 수 있는 hosts 파일이
+  생기면 --host auto 의 로컬 착지 OK 줄에 host=local 주석이 붙는다(파일이 없을 때의
+  fast path는 bare 줄을 출력한다). 이 diff가 아니라 어떤 hosts 파일이든 생기면
+  나타나는 기존 동작이다.
 - `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
 - `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600
@@ -714,8 +730,10 @@ cwd_keys = {"<local-worktree>"="repo-a"}
 (`fcntl.flock` 카운팅 세마포, mac·Linux 동일; 죽은 홀더의 슬롯은 커널이 회수한다),
 **같은 head 에서 세션(역할)당 최대 1회**(워커의 실행과 tester 의 독립 재실행은
 별개다), 대기 상한 20분(초과 시 rc=75 로 실패하고 보고서에 "heavy 대기
-초과" 기록, 락 없이 임의로 돌리지 않는다), `nice -n 10`, 시작 전 load5/ncpu ≥ 1.0 이면 대기.
-보유자·대기열·유효 상한은 `wrk heavy status` 로 본다.
+초과" 기록, 락 없이 임의로 돌리지 않는다), `nice -n 10`, 시작 전 load5/ncpu ≥ 1.0 이면 대기
+— 단 그 머신의 `[local] heavy_load_wait = false`(#1241)면 **이 load 대기만** 생략된다
+(슬롯·락·nice·cap은 그대로; 슬롯 대기가 cap을 쓰면 rc 75).
+보유자·대기열·유효 상한·load_wait 상태는 `wrk heavy status` 로 본다.
 
 호스트별 상한은 **그 머신 자신의** hosts.toml `[local] heavy_max` 가 정한다(없으면 1).
 `0`이면 그 호스트에서 heavy 를 전면 거부(rc 78, 호스트명을 적고 desktop 으로 안내한다).
@@ -727,6 +745,12 @@ cwd_keys = {"<local-worktree>"="repo-a"}
 한다**): 이 맥(mac-personal) `heavy_max = 0` — syspolicyd SIGSEGV 방지, desktop
 `heavy_max = 1`, m1b `heavy_max = 2`. 이 맥에서는 1-3개 targeted test 파일을
 `wrk heavy` 없이 직접 돌리는 것만 허용된다.
+
+10-02 운영자 지시(#1241, 적용은 merge 후 desk): m1b·mac-personal은 기존 `[local]` 아래에
+`heavy_load_wait = false` 한 줄을 추가하고, M1(mac-work)은 아직 hosts.toml 자체가 없으니
+`[local]` + `heavy_load_wait = false` 두 줄짜리 파일을 새로 만든다 — M1은 load5/ncpu ≈ 3으로
+load gate가 사실상 열리지 않아 heavy 실행이 20분 cap까지 큐잉됐다. 어느 파일이든 값은 bare
+boolean만 허용되고 잘못 쓰면 rc 70으로 거부된다.
 
 macOS 에는 `flock` 명령이 없으므로 **브리프에 셸 `flock` 문구를 직접 쓰지 않는다.** 09-24
 수동 규약(`flock /tmp/desktop-heavy-test.lock`)은 `wrk heavy` 로 대체됐다 — 그 파일을 직접
