@@ -9250,6 +9250,17 @@ try:
         pass
     os.ftruncate(held_fd, 0)
     os.write(held_fd, (info + "\n").encode())
+    # #1241 r2: the load loop below doubles as the post-acquire cap gate —
+    # a pass that wins the flock skips the slot loop's own deadline check,
+    # so a slot granted after the cap is caught only when the load wait
+    # runs. With the wait off there is no second gate: refuse the late slot
+    # exactly like a slot-wait expiry (same message, same wait_cap event).
+    if not load_wait and acquired_at >= deadline:
+        log_event({"kind": "wait_cap", "phase": "slot",
+                   "cmd": cmd_summary[:200], "limit": limit,
+                   "wait_s": round(time.monotonic() - started_at, 3)})
+        fail("wait cap %.0fs exceeded waiting for a heavy slot on %s "
+             "-- command not run" % (cap, lock_path), EXIT_WAIT_CAP)
     # heavy_load_wait = false skips only this wait — the slot above is
     # held, its wait counted toward the cap, and nice -n 10 is unchanged.
     while load_wait:
