@@ -350,7 +350,12 @@ line then ends with via=herdr-fallback.
                      directory is not searchable. No [local] section, a
                      [local] without spawn,
                      or one clean assignment keep the unchanged behavior.
-                     `wrk hosts` reports the resolved state as
+                     The same surface carries 'heavy_load_wait' (#1241,
+                     wrk heavy's load-wait switch — 'wrk heavy --help'):
+                     one clean 'heavy_load_wait = true|false' under
+                     '[local]', same refusal rules — a malformed
+                     heavy_load_wait refuses placements too, and vice
+                     versa. `wrk hosts` reports the resolved state as
                      'local spawn=allowed|disabled|error'.
   -h, --help         show this usage
 
@@ -6959,6 +6964,15 @@ spawn_router_cmd() {
 # 'local.spawn' under [hosts.x] is hosts.x.local.spawn and is ignored) —
 # behaves exactly as before; other readers keep going through
 # spillover_value, whose behavior this does not change.
+#
+# #1241: the same accepted [local] shape carries a second strict boolean —
+# 'heavy_load_wait = true|false' gates wrk heavy's post-slot load5/ncpu
+# wait. It is scanned here with the spawn rules verbatim (one clean
+# bare-boolean assignment; every would-be spelling, duplicate or other
+# value refuses), exported as LOCAL_HEAVY_LOAD_WAIT (1 = wait, absent/true;
+# 0 = skip) and LOCAL_HEAVY_LOAD_WAIT_SRC for the status lines. The refusal
+# is shared: a malformed heavy_load_wait also fails spawn placement and
+# vice versa — one [local] surface, one grammar.
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -6978,9 +6992,11 @@ local_spawn_table_name() {
 
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
+  LOCAL_HEAVY_LOAD_WAIT=1
+  LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -7049,6 +7065,35 @@ local_spawn_scan() {
       return "$WRK_EXIT_CONFIG_REFUSED"
     fi
     [[ "$current" == local ]] || continue
+    # #1241: 'heavy_load_wait' is the second strict [local] boolean — same
+    # accepted shape as spawn below (bare 'heavy_load_wait = true|false');
+    # every would-be spelling refuses, and a bare key it merely prefixes
+    # ('heavy_load_wait_extra') is somebody else's and ignored.
+    case "$line" in
+      heavy_load_wait[A-Za-z0-9_-]*) ;;   # a different bare key
+      heavy_load_wait* | '"heavy_load_wait"'* | "'heavy_load_wait'"*)
+        if [[ "$line" =~ ^heavy_load_wait[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed heavy_load_wait assignment in [local] (expected 'heavy_load_wait = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        heavy_load_wait_seen=$((heavy_load_wait_seen + 1))
+        if [[ "$heavy_load_wait_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate heavy_load_wait key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) ;;
+          false) LOCAL_HEAVY_LOAD_WAIT=0 ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] heavy_load_wait accepts only the bare TOML booleans true or false (got '$value')"
+             return "$WRK_EXIT_CONFIG_REFUSED" ;;
+        esac
+        LOCAL_HEAVY_LOAD_WAIT_SRC="$config [local] heavy_load_wait"
+        continue ;;
+    esac
     case "$line" in
       spawn[A-Za-z0-9_-]*) continue ;;   # a different bare key
       spawn* | '"spawn"'* | "'spawn'"*) ;;   # a would-be spawn key
@@ -7108,8 +7153,11 @@ Usage: wrk hosts
 
 Print the resolved hosts.toml path, this host's [local] spawn flag state
 (local spawn=allowed|disabled|error — an error means the file refuses
-spawns with rc 70; hosts is a reporting command and stays rc 0), this
-host's measured load (load5/ncpu ratio and active spawn count), then probe
+spawns with rc 70; hosts is a reporting command and stays rc 0) and its
+[local] heavy_load_wait state (local heavy_load_wait=true|false|error —
+one strict scan covers the whole [local] surface, so a scan error shows on
+both lines; wrk heavy --help documents the switch), this host's measured
+load (load5/ncpu ratio and active spawn count), then probe
 every configured spill-over host and print a status table (available, or
 the probe failure reason, with the remote load/active counts when
 reachable).
@@ -7141,6 +7189,15 @@ hosts_cmd() {
     printf 'local spawn=disabled\n'
   else
     printf 'local spawn=allowed\n'
+  fi
+  # #1241: the second strict [local] switch rides the same scan — one error
+  # covers the whole surface, so it is echoed on this line too.
+  if [[ -n "${LOCAL_SPAWN_ERROR:-}" ]]; then
+    printf 'local heavy_load_wait=error (%s)\n' "$LOCAL_SPAWN_ERROR"
+  elif [[ "${LOCAL_HEAVY_LOAD_WAIT:-1}" -eq 0 ]]; then
+    printf 'local heavy_load_wait=false\n'
+  else
+    printf 'local heavy_load_wait=true\n'
   fi
   printf 'local load5=%s ncpu=%s ratio=%s active=%s\n' "${SPILL_LOAD:-unknown}" "${SPILL_NCPU:-unknown}" "${SPILL_RATIO:-unknown}" "${SPILL_ACTIVE:-unknown}"
   printf 'host\tstatus\tload5\tactive\n'
@@ -8715,9 +8772,10 @@ per host (default 1) via fcntl.flock on per-host slot files (works the same
 on macOS and Linux — macOS has no `flock` command, and flock releases a dead
 holder's slot automatically, unlike shlock pid-files). Slot 0 is the lock
 file itself; slots 1..N-1 are <lock>.slot<i>. The command runs under
-`nice -n 10` and only starts once load5/ncpu < 1.0. Total wait (slot +
-load) is capped at 20 minutes; on expiry the command is NOT run and wrk
-exits 75 (EX_TEMPFAIL). The command inherits the slot fd (nested detection
+`nice -n 10` and, while the load wait is on (see heavy_load_wait below),
+only starts once load5/ncpu < 1.0. Total wait (slot + load) is capped at
+20 minutes; on expiry the command is NOT run and wrk exits 75
+(EX_TEMPFAIL). The command inherits the slot fd (nested detection
 needs it — see WRK_HEAVY_HELD_FD), so an orphaned child keeps the slot while
 it lives; the kernel frees the slot when the whole holder tree is gone.
 
@@ -8729,8 +8787,20 @@ configured value for one invocation. A non-integer or negative limit also
 refuses rc 78 — a config typo must not silently allow runs. Lowering the
 limit does not kill extra holders minted under a larger one; they drain.
 
+`[local] heavy_load_wait` is this host's switch for the load5/ncpu < 1.0
+wait (#1241), read through the same strict [local] scanner as `spawn`:
+bare TOML true/false only, written once under a clean '[local]' — absent
+or `true` keeps the wait exactly as above; `false` skips ONLY the load
+wait (the heavy_max slot, its lock, `nice -n 10` and the cap are
+unchanged — the slot wait still counts toward the cap and expires rc 75).
+A malformed [local] surface — bad value, quoted spelling, duplicate key,
+bad header — refuses the run rc 70 naming the file line, before any slot
+is taken. `wrk hosts` prints it as `local heavy_load_wait=true|false|
+error (...)`.
+
 `wrk heavy status` prints the lock path, this host, the effective limit,
-one `holder` line per occupied slot, and queued waiters (holder pids are the
+the load-wait switch (`load_wait true|false|error (...)`), one `holder`
+line per occupied slot, and queued waiters (holder pids are the
 wrk heavy python processes; killing one frees its slot once the command
 tree that inherited the slot fd is also gone). status never creates slot
 files and is never refused.
@@ -8776,6 +8846,23 @@ heavy_cmd() {
   case "${1:-}" in
     -h|--help) heavy_help; return 0 ;;
   esac
+  # #1241: the strict [local] scan owns heavy_load_wait (and spawn). A
+  # malformed [local] surface refuses a run rc 70 here — before the python
+  # half can take a slot or run anything (this check precedes heavy_max's
+  # own rc 78: one grammar error on the [local] surface outranks a bad
+  # value inside it). status is a reporting command: the error text is
+  # carried through for display instead.
+  local heavy_load_wait=1 heavy_load_wait_src=default heavy_load_wait_err=""
+  if local_spawn_scan; then
+    heavy_load_wait="$LOCAL_HEAVY_LOAD_WAIT"
+    heavy_load_wait_src="$LOCAL_HEAVY_LOAD_WAIT_SRC"
+  else
+    heavy_load_wait_err="$LOCAL_SPAWN_ERROR"
+    if [[ "${1:-}" != status ]]; then
+      echo "wrk: ${LOCAL_SPAWN_ERROR}; refusing heavy run" >&2
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+  fi
   # Per-host heavy concurrency limit (#772): WRK_HEAVY_MAX wins for one
   # invocation, then hosts.toml [local] heavy_max via the same
   # spillover_value reader that owns the documented TOML surface, else 1.
@@ -8791,6 +8878,9 @@ heavy_cmd() {
     heavy_limit_src="default"
   fi
   WRK_HEAVY_LIMIT="$heavy_limit" WRK_HEAVY_LIMIT_SRC="$heavy_limit_src" \
+    WRK_HEAVY_LOAD_WAIT="$heavy_load_wait" \
+    WRK_HEAVY_LOAD_WAIT_SRC="$heavy_load_wait_src" \
+    WRK_HEAVY_LOAD_WAIT_ERR="$heavy_load_wait_err" \
     python3 - "$@" <<'PY'
 import datetime, fcntl, glob, json, os, re, socket, subprocess, sys, time
 
@@ -8840,6 +8930,15 @@ try:
     limit_ok = limit >= 0
 except ValueError:
     limit, limit_ok = -1, False
+
+# #1241: hosts.toml [local] heavy_load_wait — resolved by the strict
+# [local] scan in the bash half — switches the post-slot load5/ncpu < 1.0
+# wait off per host. "0" skips only that wait; a scan error already
+# refused runs rc 70 before this process, so the error text only reaches
+# here for `status`, which prints it instead of a value.
+load_wait = os.environ.get("WRK_HEAVY_LOAD_WAIT", "1") != "0"
+load_wait_src = os.environ.get("WRK_HEAVY_LOAD_WAIT_SRC", "default")
+load_wait_err = os.environ.get("WRK_HEAVY_LOAD_WAIT_ERR", "")
 
 slot_re = re.compile(re.escape(lock_path) + r"\.slot(\d+)$")
 
@@ -8921,6 +9020,12 @@ if args[0] == "status":
         print("limit %d (%s)" % (limit, limit_src))
     else:
         print("limit %s (invalid, %s)" % (limit_raw, limit_src))
+    if load_wait_err:
+        print("load_wait error (%s)" % load_wait_err)
+    elif load_wait:
+        print("load_wait true (%s)" % load_wait_src)
+    else:
+        print("load_wait false (%s)" % load_wait_src)
     paths = known_slots()
     holders = []
     for p in paths:
@@ -9145,7 +9250,9 @@ try:
         pass
     os.ftruncate(held_fd, 0)
     os.write(held_fd, (info + "\n").encode())
-    while True:
+    # heavy_load_wait = false skips only this wait — the slot above is
+    # held, its wait counted toward the cap, and nice -n 10 is unchanged.
+    while load_wait:
         try:
             ratio = load_ratio()
             if ratio is None or ratio < 1.0:

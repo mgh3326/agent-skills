@@ -1872,6 +1872,78 @@ spawn = false' ;;
   done
   echo "PASS t1163 N1 help-rc0-on-malformed"
 
+  # -- #1241 addendum B: a [local]-only hosts.toml carrying just
+  # 'heavy_load_wait = false' — the file desk creates on M1 — must change
+  # nothing versus no hosts.toml at all. Spawn routing (--host auto with no
+  # remote candidates AND --host local) lands identically, the fallback
+  # defaults (max_load_ratio/max_active) and the heavy_max default are
+  # untouched, and wrk hosts output differs only in the config path and the
+  # one new 'local heavy_load_wait=' line.
+  T1241_NOFILE="$TMP/t1241-no-such-hosts.toml"
+  rm -f "$T1241_NOFILE"
+  printf '%s\n' '[local]' 'heavy_load_wait = false' >"$TMP/t1241-localonly.toml"
+  for t1241_arg in auto local; do
+    for variant in nofile localonly; do
+      cfg="$T1241_NOFILE"
+      [[ "$variant" == localonly ]] && cfg="$TMP/t1241-localonly.toml"
+      rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log" "$TMP/t1155-spillover.log"
+      set +e
+      ( T1155_HOST_ARG="$t1241_arg" T1155_HOSTS_OVERRIDE="$cfg" \
+          T1155_JOB="t1241-$t1241_arg-$variant" t1155_spawn ) \
+        >"$TMP/t1241-$t1241_arg-$variant.out" 2>"$TMP/t1241-$t1241_arg-$variant.err"
+      t1155_rc=$?
+      set -e
+      [[ "$t1155_rc" -eq 0 ]] ||
+        fail "1241B $t1241_arg/$variant: spawn must land local rc=0, got $t1155_rc: $(cat "$TMP/t1241-$t1241_arg-$variant.err")"
+      # a local landing is the fixture's own 'tab create' + landed=yes — the
+      # direct local OK line carries no host= field (only the remote/fallback
+      # emit path injects one)
+      grep -q 'landed=yes' "$TMP/t1241-$t1241_arg-$variant.out" ||
+        fail "1241B $t1241_arg/$variant: the spawn did not land: $(cat "$TMP/t1241-$t1241_arg-$variant.out")"
+      grep -q 'tab create' "$TMP/t1155-herdr.log" ||
+        fail "1241B $t1241_arg/$variant: expected a local pane creation"
+    done
+    # Byte-identical apart from the minted job id, the config path and — on
+    # --host auto only — the ONE pre-existing difference any readable hosts
+    # file makes (since #58, unrelated to this diff): the router annotates
+    # the local landing's OK line with host=local, while the no-file fast
+    # path prints spawn_cmd's bare line.  Pin that difference, then require
+    # everything else to be identical.
+    if [[ "$t1241_arg" == auto ]]; then
+      grep -qF 'OK pane=w:p1 host=local ' "$TMP/t1241-auto-localonly.out" ||
+        fail "1241B auto: the router's host=local annotation vanished: $(cat "$TMP/t1241-auto-localonly.out")"
+      ! grep -q 'host=' "$TMP/t1241-auto-nofile.out" ||
+        fail "1241B auto: the no-file OK line grew a host field: $(cat "$TMP/t1241-auto-nofile.out")"
+      sed -i '' -e 's/ host=local//' "$TMP/t1241-auto-localonly.out" 2>/dev/null ||
+        sed -i -e 's/ host=local//' "$TMP/t1241-auto-localonly.out"
+    fi
+    for stream in out err; do
+      sed -e 's/job=[^ ]*/job=J/' -e "s|$T1241_NOFILE|CFG|g" \
+        "$TMP/t1241-$t1241_arg-nofile.$stream" >"$TMP/t1241-$t1241_arg-nofile.$stream.norm"
+      sed -e 's/job=[^ ]*/job=J/' -e "s|$TMP/t1241-localonly.toml|CFG|g" \
+        "$TMP/t1241-$t1241_arg-localonly.$stream" >"$TMP/t1241-$t1241_arg-localonly.$stream.norm"
+      cmp -s "$TMP/t1241-$t1241_arg-nofile.$stream.norm" "$TMP/t1241-$t1241_arg-localonly.$stream.norm" ||
+        fail "1241B $t1241_arg: a [local]-only file changed spawn $stream vs no file: $(diff "$TMP/t1241-$t1241_arg-nofile.$stream.norm" "$TMP/t1241-$t1241_arg-localonly.$stream.norm" || true)"
+    done
+  done
+  # wrk hosts: every line identical apart from config= and the new line
+  rm -f "$TMP/t1163-hosts-ssh.log"
+  t1163_hosts "$T1241_NOFILE" >"$TMP/t1241-hosts-nofile.out" 2>"$TMP/t1241-hosts-nofile.err" ||
+    fail "1241B: wrk hosts must stay rc 0 with no file"
+  t1163_hosts "$TMP/t1241-localonly.toml" >"$TMP/t1241-hosts-localonly.out" 2>"$TMP/t1241-hosts-localonly.err" ||
+    fail "1241B: wrk hosts must stay rc 0 on the [local]-only file"
+  grep -qxF 'local heavy_load_wait=true' "$TMP/t1241-hosts-nofile.out" ||
+    fail "1241B: no file must read the switch as on: $(cat "$TMP/t1241-hosts-nofile.out")"
+  grep -qxF 'local heavy_load_wait=false' "$TMP/t1241-hosts-localonly.out" ||
+    fail "1241B: the [local]-only file must read the switch as off: $(cat "$TMP/t1241-hosts-localonly.out")"
+  grep -vxF -e "config=$T1241_NOFILE" -e 'local heavy_load_wait=true' \
+    "$TMP/t1241-hosts-nofile.out" >"$TMP/t1241-hosts-nofile.norm"
+  grep -vxF -e "config=$TMP/t1241-localonly.toml" -e 'local heavy_load_wait=false' \
+    "$TMP/t1241-hosts-localonly.out" >"$TMP/t1241-hosts-localonly.norm"
+  cmp -s "$TMP/t1241-hosts-nofile.norm" "$TMP/t1241-hosts-localonly.norm" ||
+    fail "1241B: wrk hosts output differs beyond the config path and the new line: $(diff "$TMP/t1241-hosts-nofile.norm" "$TMP/t1241-hosts-localonly.norm" || true)"
+  echo "PASS t1241 B local-only-file-identical-to-nofile (spawn auto+local, wrk hosts)"
+
   # -- #1163 assertion-RED mutants ------------------------------------------
   # M1 "a commented [local] header never reads as spawn allowed" — the
   # mutant restores main's old behavior whole: non-exact local-naming
