@@ -35,6 +35,12 @@ WRK_EXIT_CONFIG_REFUSED=70
 # delegated spawn with it too, and under --host auto that answer must NOT stop
 # the round — the next remote candidate is tried.
 WRK_EXIT_LOCAL_SPAWN_DISABLED=80
+# #1239: a wake attempt on a wake-capable host that was refused, timed out, or
+# left the host unreachable ends the spawn with 81 and never falls back to a
+# local pane. A remote wrk answering 81 is a capacity-adjacent answer (its own
+# wake failed), not an admission refusal — under --host auto it is not in the
+# stop set, so the round moves on to the next candidate.
+WRK_EXIT_WAKE_FAILED=81
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -304,8 +310,8 @@ line then ends with via=herdr-fallback.
                      closed with rc 70 and never falls back to local (#1154).
                      A remote wrk answering rc 2, 74 or 75 (usage error,
                      active-job duplicate, unreadable job state) also ends the
-                     round, as does a cwd_map miss and a via=hub candidate's
-                     own outcome. Transport-leg failures (probe, prepare,
+                     round, as does a cwd_map miss in a hub-selected round
+                     and a via=hub candidate's own outcome. Transport-leg failures (probe, prepare,
                      mktemp, scp — normalized off the admission codes) and
                      every other remote answer move on to the next candidate,
                      and only when every candidate fails does auto fall back
@@ -350,8 +356,51 @@ line then ends with via=herdr-fallback.
                      directory is not searchable. No [local] section, a
                      [local] without spawn,
                      or one clean assignment keep the unchanged behavior.
-                     `wrk hosts` reports the resolved state as
+                     The same surface carries 'heavy_load_wait' (#1241,
+                     wrk heavy's load-wait switch — 'wrk heavy --help'):
+                     one clean 'heavy_load_wait = true|false' under
+                     '[local]', same refusal rules — a malformed
+                     heavy_load_wait refuses placements too, and vice
+                     versa. `wrk hosts` reports the resolved state as
                      'local spawn=allowed|disabled|error'.
+
+                     hosts.toml [hosts.NAME] may opt a default-off remote
+                     into wake-on-demand with wake = "panewire" (#1239).
+                     In the hosts.toml-order auto round a candidate with
+                     no cwd_map entry for the cwd is skipped before it is
+                     probed (a hub-selected round keeps the fail-closed
+                     rc 2), and an
+                     unreachable wake host is NOT woken on first sight —
+                     the round finishes over the other candidates first.
+                     The wake runs only when local cannot take the job
+                     (pressured, or spawn = false), no candidate landed,
+                     the round was not ended by a stop-set answer (a
+                     reachable remote wrk answering 2, 70, 74 or 75), and
+                     at least one candidate answered remote-full —
+                     positive capacity evidence. It is
+                     `panewire burst request --target NAME --hold
+                     <wake_hold>m --timeout <min(wake_wait,600)>s` using
+                     the operator credential — [hub] operator_token_env,
+                     falling back to hub_token_env only when unset;
+                     hub_token_env is never required because it is also
+                     the hub quota gate opt-in (#1138) that a
+                     quota_gate = "local" host deliberately leaves off.
+                     hub_cf_env stays optional. wake_hold is the burst
+                     hold in minutes (default 10 — a configured
+                     wake_hold wins; WRK_WAKE_HOLD_MINUTES exists only
+                     as a test seam over the default) and wake_wait
+                     bounds the wait for the node in seconds (default
+                     300) — a granted hold or a cooldown_active (a
+                     concurrent spawn's wake already in flight, waited
+                     on instead of stacking a second request) re-probes
+                     the host until the deadline. A refused wake, a
+                     burst error, a timeout, or a host still unreachable
+                     after the wait exits 81 naming host, step and
+                     reason plus the held per-candidate diagnostics —
+                     never a local fallback, whatever [local] spawn says.
+                     An explicit --host NAME on an unreachable wake host
+                     wakes it the same way; the hosts.toml key is the
+                     opt-in.
   -h, --help         show this usage
 
 Hub lane registration (#965): a --role worker spawn whose effective herdr
@@ -3036,14 +3085,22 @@ apply_catalog() {
     # "scopefuel: warning:" line ahead of the refusal, and squeezing all of
     # stderr kept the warning while cutting the actual reason away. The
     # warnings are the operator's config signal, not the refusal's — stderr is
-    # captured here, so re-emit them verbatim or the operator never sees the
-    # broken config at all — and build the reason from the remaining lines,
-    # falling back to the last non-empty line so an all-warning stderr still
-    # reports something. The 240-char cap is unchanged.
-    grep '^scopefuel: warning:' "$err_file" >&2 || true
+    # captured here, so on a failure they are re-emitted verbatim or the
+    # operator never sees the broken config at all — and the reason is built
+    # from the remaining lines, falling back to the last non-empty line so an
+    # all-warning stderr still reports something. The 240-char cap is
+    # unchanged. #1226: the re-emit fires only when the launch did not
+    # succeed — on rc 0 the quota gate's own scopefuel call already passes the
+    # same warning through, so re-printing here showed it twice per spawn. A
+    # reason that is whitespace-only (a warning followed by a blank line)
+    # counts as empty so the fallback applies, and the fallback never picks a
+    # whitespace-only line.
+    if [[ "$rc" -ne 0 ]]; then
+      grep '^scopefuel: warning:' "$err_file" >&2 || true
+    fi
     CATALOG_REFUSE_REASON="$(grep -v '^scopefuel: warning:' "$err_file" | tr -s '[:space:]' ' ' | cut -c1-240 || true)"
-    if [[ -z "$CATALOG_REFUSE_REASON" ]]; then
-      CATALOG_REFUSE_REASON="$(grep . "$err_file" | tail -n 1 | tr -s '[:space:]' ' ' | cut -c1-240 || true)"
+    if [[ -z "${CATALOG_REFUSE_REASON//[[:space:]]/}" ]]; then
+      CATALOG_REFUSE_REASON="$(grep '[^[:space:]]' "$err_file" | tail -n 1 | tr -s '[:space:]' ' ' | cut -c1-240 || true)"
     fi
     rm -f "$err_file"
   fi
@@ -6039,20 +6096,102 @@ spillover_probe_host() {
   return 1
 }
 
-spillover_wake() {
-  local host="$1" wake hold panewire hub_url token_env cf_env args
+# #1239: deferred panewire wake. A wake-capable host is never woken on first
+# sight — spawn_router_cmd finishes the candidate round first, then calls
+# this once it knows no other placement is possible. The request itself
+# carries the OPERATOR credential: [hub] operator_token_env (the same file
+# the hub-spawn path uses) with hub_token_env as the fallback only — never a
+# requirement, because hub_token_env is also the hub quota gate opt-in
+# (#1138) and a quota_gate = "local" host deliberately leaves it unset.
+# `panewire burst request` waits hub-side for the node's connection up to
+# --timeout (server cap 10 minutes); a granted hold, or cooldown_active
+# (someone else's wake is already in flight — waiting on it instead of
+# stacking a second request is the concurrency story), then waits on the
+# probe loop below for the ssh side to come up, bounded by the hosts.toml
+# [hosts.<host>] wake_wait seconds (default 300). On refusal, CLI failure or
+# timeout the reason is left in SPILL_WAKE_ERR and the caller answers with
+# WRK_EXIT_WAKE_FAILED — never a local pane.
+spillover_wake_request() {
+  local host="$1" wake hub_url token_env cf_env hold wait_s panewire cli_timeout
+  local out rc reason cli_err deadline poll_s wait_note burst_err
   wake="$(spillover_value "hosts.$host" wake 2>/dev/null || true)"
-  [[ "$wake" == panewire ]] || return 0
-  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"; token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"; cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
-  [[ -n "$hub_url" && -n "$token_env" ]] || { warn "spill-over wake skipped host=$host: hub config is unset"; return 0; }
-  hold="${WRK_WAKE_HOLD_MINUTES:-10}"
-  [[ "$hold" =~ ^[1-9][0-9]*$ ]] || { warn "spill-over wake skipped host=$host: invalid hold"; return 0; }
-  panewire="${PANEWIRE_BIN:-panewire}"
-  args=(burst request --target "$host" --hold "${hold}m" --reason "wrk spill-over remote unavailable" --hub-url "$hub_url" --hub-token-env "$token_env")
-  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
-  if ! "$panewire" "${args[@]}" >/dev/null 2>&1; then
-    warn "spill-over wake skipped host=$host: panewire request failed"
+  if [[ "$wake" != panewire ]]; then
+    SPILL_WAKE_ERR="remote host '$host' has no wake = \"panewire\" setting"
+    return 1
   fi
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  # The burst operator client wants an HTTPS/HTTP base — reuse the same
+  # wss:// -> https:// conversion the other hub paths apply.
+  if [[ -n "$hub_url" ]]; then
+    hub_url="$(spillover_hub_http_base "$hub_url" 2>/dev/null || true)"
+  fi
+  token_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  if [[ -z "$token_env" ]]; then
+    token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  fi
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  if [[ -z "$hub_url" || -z "$token_env" ]]; then
+    SPILL_WAKE_ERR="remote host '$host' wake skipped ([hub] needs hub_url plus an operator credential: operator_token_env, else hub_token_env)"
+    return 1
+  fi
+  # wake_hold/wake_wait follow the other numeric hosts.toml keys: a missing
+  # or malformed value falls back to the default, never a refusal.
+  hold="$(spillover_value "hosts.$host" wake_hold 2>/dev/null || true)"
+  if [[ ! "$hold" =~ ^[1-9][0-9]*$ ]]; then hold="${WRK_WAKE_HOLD_MINUTES:-10}"; fi
+  if [[ ! "$hold" =~ ^[1-9][0-9]*$ ]]; then hold=10; fi
+  wait_s="$(spillover_value "hosts.$host" wake_wait 2>/dev/null || true)"
+  if [[ ! "$wait_s" =~ ^[1-9][0-9]*$ ]]; then wait_s=300; fi
+  # The hub caps a request's confirm timeout at 10 minutes; a longer
+  # wake_wait is honored by the re-probe loop below.
+  cli_timeout="$wait_s"
+  if (( cli_timeout > 600 )); then cli_timeout=600; fi
+  panewire="${PANEWIRE_BIN:-panewire}"
+  echo "wrk: waking remote host '$host' via panewire burst (hold ${hold}m, wait ${wait_s}s)" >&2
+  burst_err="$(mktemp)"
+  set +e
+  out="$("$panewire" burst request --target "$host" --hold "${hold}m" --timeout "${cli_timeout}s" \
+    --reason "wrk spill-over: every candidate at capacity" \
+    --hub-url "$hub_url" --hub-token-env "$token_env" ${cf_env:+--hub-cf-env "$cf_env"} 2>"$burst_err")"
+  rc=$?
+  set -e
+  cli_err="$(tail -n 1 "$burst_err" 2>/dev/null || true)"
+  rm -f "$burst_err"
+  reason=""
+  if [[ "$rc" -eq 3 ]]; then
+    reason="$(python3 -c 'import json,sys; print(json.load(sys.stdin).get("reason",""))' <<<"$out" 2>/dev/null || true)"
+  fi
+  wait_note="burst hold requested, node not connected"
+  case "$rc:$reason" in
+    0:*)
+      : ;;  # hold granted — the hub already saw the node connect
+    3:cooldown_active)
+      wait_note="cooldown_active: a wake is already in progress, node not connected" ;;
+    3:target_timeout)
+      SPILL_WAKE_ERR="remote host '$host' wake timed out after ${wait_s}s ($wait_note)"
+      return 1 ;;
+    3:*)
+      if [[ -n "$reason" ]]; then
+        SPILL_WAKE_ERR="remote host '$host' wake refused ($reason)"
+      else
+        SPILL_WAKE_ERR="remote host '$host' wake failed (${cli_err:-panewire burst request unavailable})"
+      fi
+      return 1 ;;
+    *)
+      SPILL_WAKE_ERR="remote host '$host' wake failed (panewire burst request exited $rc${cli_err:+: $cli_err})"
+      return 1 ;;
+  esac
+  # Bounded re-probe: a granted hold means the node reached the hub, but its
+  # sshd can lag a few seconds; the cooldown arm waits out the full budget.
+  poll_s="${WRK_WAKE_POLL_S:-5}"
+  deadline=$((SECONDS + wait_s))
+  while :; do
+    spillover_probe_host "$host" || true
+    if [[ "$SPILL_PROBE_REASON" != ssh-unreachable ]]; then return 0; fi
+    if (( SECONDS >= deadline )); then break; fi
+    sleep "$poll_s"
+  done
+  SPILL_WAKE_ERR="remote host '$host' wake timed out after ${wait_s}s ($wait_note)"
+  return 1
 }
 
 # A value-taking spawn option must not silently swallow the next option token:
@@ -6588,7 +6727,18 @@ spillover_try_candidate() {
   SPILL_REMOTE_STEP="probe"
   SPILL_PROBE_ERR=""; SPILL_PROBE_RC=1; SPILL_PROBE_DETAIL=""
   if ! spillover_probe_host "$candidate"; then
-    [[ "$SPILL_PROBE_REASON" == ssh-unreachable ]] && spillover_wake "$candidate"
+    # #1239: a wake-capable host is NOT woken here, on first sight — the
+    # router finishes the candidate round and decides. It learns the verdict
+    # through this one-token class file because the auto loop ran this
+    # function in a subshell: remote-full / ssh-unreachable / refused
+    # (anything else — probe noise, a refused remote admission, ...).
+    if [[ -n "${SPILL_CANDIDATE_CLASS_FILE:-}" ]]; then
+      case "$SPILL_PROBE_REASON" in
+        remote-full*) printf 'remote-full\n' ;;
+        ssh-unreachable) printf 'ssh-unreachable\n' ;;
+        *) printf 'refused\n' ;;
+      esac >"$SPILL_CANDIDATE_CLASS_FILE"
+    fi
     # The remote's own words first (banner noise, missing herdr), then the
     # attribution line: a refused host is "skipped", a dead one "failed".
     [[ -n "$SPILL_PROBE_ERR" ]] && printf '%s\n' "$SPILL_PROBE_ERR" >&2
@@ -6603,6 +6753,9 @@ spillover_try_candidate() {
     rc="$(spillover_transport_rc "$SPILL_PROBE_RC")"
   else
     if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "$@"; then rc=0; else rc=$?; fi
+    if [[ "$rc" -ne 0 && -n "${SPILL_CANDIDATE_CLASS_FILE:-}" ]]; then
+      printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+    fi
   fi
   if [[ "$rc" -ne 0 && "$hold_diag" == 1 ]]; then
     echo "wrk: remote host '$candidate' failed (rc=$rc) at step '${SPILL_REMOTE_STEP:-unknown}'" >&2
@@ -6823,7 +6976,12 @@ spawn_router_cmd() {
   fi
   [[ -n "$cwd" && -n "$prompt" ]] || die "-c CWD and -p PROMPT_FILE are required"
   local candidates=("$selected") candidate candidate_via last_rc=1 seen_candidates=""
-  local cand_err auto_diag=""
+  local cand_err auto_diag="" cand_class
+  # #1239 deferred-wake bookkeeping: wake_pending collects the wake-capable
+  # candidates that probed ssh-unreachable (round order), and
+  # remote_full_seen latches the positive capacity evidence the post-round
+  # wake requires — a round with no remote-full answer never wakes.
+  local wake_pending="" remote_full_seen=0 wake_target=""
   # --host auto holds every per-candidate diagnostic until the round settles:
   # a successful spawn must print nothing about the hosts it skipped, while an
   # all-fail round owes the operator one attributed line per host plus whatever
@@ -6853,22 +7011,47 @@ spawn_router_cmd() {
       return "$last_rc"
     fi
     if [[ -n "$auto_diag" ]]; then
+      # #1239: under --host auto a candidate with no cwd_map entry for this
+      # cwd can never accept the job — its remote would refuse rc 2 at the
+      # cwd-map step, which sits in the stop set below and would end the
+      # round before the post-round wake. The candidate is skipped BEFORE
+      # the probe: silent when a later candidate lands, one held
+      # diagnostic line on an all-fail round, and neutral for the wake
+      # decision — it neither ends the round nor counts as remote-full
+      # evidence. The skip applies only to the hosts.toml-order round
+      # (local-fallback): a hub-selected round keeps the fail-closed
+      # cwd-map rc 2 contract — the placement decision is authoritative,
+      # and quietly moving past it would hide a broken config. An
+      # explicit --host NAME keeps the cwd-map rc 2 too.
+      if [[ "$SPILL_DECISION_SOURCE" == local-fallback ]] &&
+         ! spillover_cwd_map "$candidate" "$cwd"; then
+        printf "wrk: remote host '%s' skipped: no cwd_map entry for '%s'\n" "$candidate" "$cwd" >>"$auto_diag"
+        continue
+      fi
       cand_err="$(mktemp)"
+      cand_class="$(mktemp)"
       # A subshell keeps a die() inside the remote legs survivable, and the
       # if-context keeps the callee's internal set -e toggles from arming
       # errexit on its nonzero return.
-      if ( spillover_try_candidate 1 "$candidate" "$cwd" "$prompt" "${filtered[@]}" ) 2>"$cand_err"; then
+      if ( SPILL_CANDIDATE_CLASS_FILE="$cand_class" spillover_try_candidate 1 "$candidate" "$cwd" "$prompt" "${filtered[@]}" ) 2>"$cand_err"; then
         # Only the skipped candidates' diagnostics are dropped: the winner's
         # own stderr (remote wrk warnings, scp chatter) replays verbatim, as
         # it streamed live on main.
         cat "$cand_err" >&2
-        rm -f "$cand_err" "$auto_diag"
+        rm -f "$cand_err" "$cand_class" "$auto_diag"
         return 0
       else
         last_rc=$?
       fi
+      case "$(cat "$cand_class" 2>/dev/null || true)" in
+        remote-full) remote_full_seen=1 ;;
+        ssh-unreachable)
+          if [[ "$(spillover_value "hosts.$candidate" wake 2>/dev/null || true)" == panewire ]]; then
+            wake_pending+="$candidate "
+          fi ;;
+      esac
       cat "$cand_err" >>"$auto_diag"
-      rm -f "$cand_err"
+      rm -f "$cand_err" "$cand_class"
     else
       if spillover_try_candidate 0 "$candidate" "$cwd" "$prompt" "${filtered[@]}"; then
         return 0
@@ -6900,6 +7083,60 @@ spawn_router_cmd() {
         fi ;;
     esac
   done
+  # #1239: the deferred wake decision, made only once the candidate round is
+  # over. Under --host auto a wake-capable candidate that probed
+  # ssh-unreachable is owed a wake when (a) local cannot take the job
+  # ([local] spawn = false, or the same measured pressure that started this
+  # round still holds), (b) no candidate landed the job — reaching here
+  # proves it, (c) the round was not ended by a stop-set answer — a
+  # reachable remote wrk answering 2, 70, 74 or 75 returns inside the loop
+  # and never gets here — and (d) at least one candidate answered
+  # remote-full, the positive capacity evidence that the fleet really is
+  # short. Unmapped candidates were skipped before probing, and transport
+  # failures or remote rc 80/81 answers no longer suppress the wake. An
+  # explicit --host NAME is the operator forcing that host, so an
+  # unreachable wake-capable target wakes unconditionally — wake =
+  # "panewire" on that hosts.toml entry is itself the opt-in.
+  if [[ "$requested" == auto ]]; then
+    if [[ -n "$wake_pending" && "$remote_full_seen" -eq 1 ]] &&
+       { [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 ]] || spillover_local_is_pressured; }; then
+      wake_target="${wake_pending%% *}"
+    fi
+  elif [[ "${SPILL_PROBE_REASON:-}" == ssh-unreachable ]] &&
+       [[ "$(spillover_value "hosts.$requested" wake 2>/dev/null || true)" == panewire ]]; then
+    wake_target="$requested"
+  fi
+  if [[ -n "$wake_target" ]]; then
+    if spillover_wake_request "$wake_target"; then
+      # The node answered: place the job through the same legs as any other
+      # candidate. A spawn that still fails propagates that rc — the wake
+      # already committed this round to the remote answer.
+      if [[ -n "$auto_diag" ]]; then
+        cand_err="$(mktemp)"
+        if ( spillover_try_candidate 1 "$wake_target" "$cwd" "$prompt" "${filtered[@]}" ) 2>"$cand_err"; then
+          cat "$cand_err" >&2
+          rm -f "$cand_err" "$auto_diag"
+          return 0
+        else
+          last_rc=$?
+        fi
+        cat "$cand_err" >>"$auto_diag"
+        rm -f "$cand_err"
+      elif spillover_try_candidate 0 "$wake_target" "$cwd" "$prompt" "${filtered[@]}"; then
+        return 0
+      else
+        last_rc=$?
+      fi
+      [[ -n "$auto_diag" && -s "$auto_diag" ]] && cat "$auto_diag" >&2
+      [[ -n "$auto_diag" ]] && rm -f "$auto_diag"
+      echo "wrk: remote host '$wake_target' answered its wake but the spawn still failed (rc=$last_rc); not falling back to local" >&2
+      return "$last_rc"
+    fi
+    [[ -n "$auto_diag" && -s "$auto_diag" ]] && cat "$auto_diag" >&2
+    [[ -n "$auto_diag" ]] && rm -f "$auto_diag"
+    echo "wrk: $SPILL_WAKE_ERR; not falling back to local" >&2
+    return "$WRK_EXIT_WAKE_FAILED"
+  fi
   # An explicit --host NAME is an operator forcing one remote: propagate the
   # remote exit instead of quietly landing the pane locally (#571).  The local
   # fallback below exists for --host auto only.
@@ -6963,6 +7200,15 @@ spawn_router_cmd() {
 # 'local.spawn' under [hosts.x] is hosts.x.local.spawn and is ignored) —
 # behaves exactly as before; other readers keep going through
 # spillover_value, whose behavior this does not change.
+#
+# #1241: the same accepted [local] shape carries a second strict boolean —
+# 'heavy_load_wait = true|false' gates wrk heavy's post-slot load5/ncpu
+# wait. It is scanned here with the spawn rules verbatim (one clean
+# bare-boolean assignment; every would-be spelling, duplicate or other
+# value refuses), exported as LOCAL_HEAVY_LOAD_WAIT (1 = wait, absent/true;
+# 0 = skip) and LOCAL_HEAVY_LOAD_WAIT_SRC for the status lines. The refusal
+# is shared: a malformed heavy_load_wait also fails spawn placement and
+# vice versa — one [local] surface, one grammar.
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -6982,9 +7228,11 @@ local_spawn_table_name() {
 
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
+  LOCAL_HEAVY_LOAD_WAIT=1
+  LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -7053,6 +7301,35 @@ local_spawn_scan() {
       return "$WRK_EXIT_CONFIG_REFUSED"
     fi
     [[ "$current" == local ]] || continue
+    # #1241: 'heavy_load_wait' is the second strict [local] boolean — same
+    # accepted shape as spawn below (bare 'heavy_load_wait = true|false');
+    # every would-be spelling refuses, and a bare key it merely prefixes
+    # ('heavy_load_wait_extra') is somebody else's and ignored.
+    case "$line" in
+      heavy_load_wait[A-Za-z0-9_-]*) ;;   # a different bare key
+      heavy_load_wait* | '"heavy_load_wait"'* | "'heavy_load_wait'"*)
+        if [[ "$line" =~ ^heavy_load_wait[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed heavy_load_wait assignment in [local] (expected 'heavy_load_wait = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        heavy_load_wait_seen=$((heavy_load_wait_seen + 1))
+        if [[ "$heavy_load_wait_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate heavy_load_wait key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) ;;
+          false) LOCAL_HEAVY_LOAD_WAIT=0 ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] heavy_load_wait accepts only the bare TOML booleans true or false (got '$value')"
+             return "$WRK_EXIT_CONFIG_REFUSED" ;;
+        esac
+        LOCAL_HEAVY_LOAD_WAIT_SRC="$config [local] heavy_load_wait"
+        continue ;;
+    esac
     case "$line" in
       spawn[A-Za-z0-9_-]*) continue ;;   # a different bare key
       spawn* | '"spawn"'* | "'spawn'"*) ;;   # a would-be spawn key
@@ -7112,8 +7389,11 @@ Usage: wrk hosts
 
 Print the resolved hosts.toml path, this host's [local] spawn flag state
 (local spawn=allowed|disabled|error — an error means the file refuses
-spawns with rc 70; hosts is a reporting command and stays rc 0), this
-host's measured load (load5/ncpu ratio and active spawn count), then probe
+spawns with rc 70; hosts is a reporting command and stays rc 0) and its
+[local] heavy_load_wait state (local heavy_load_wait=true|false|error —
+one strict scan covers the whole [local] surface, so a scan error shows on
+both lines; wrk heavy --help documents the switch), this host's measured
+load (load5/ncpu ratio and active spawn count), then probe
 every configured spill-over host and print a status table (available, or
 the probe failure reason, with the remote load/active counts when
 reachable).
@@ -7145,6 +7425,15 @@ hosts_cmd() {
     printf 'local spawn=disabled\n'
   else
     printf 'local spawn=allowed\n'
+  fi
+  # #1241: the second strict [local] switch rides the same scan — one error
+  # covers the whole surface, so it is echoed on this line too.
+  if [[ -n "${LOCAL_SPAWN_ERROR:-}" ]]; then
+    printf 'local heavy_load_wait=error (%s)\n' "$LOCAL_SPAWN_ERROR"
+  elif [[ "${LOCAL_HEAVY_LOAD_WAIT:-1}" -eq 0 ]]; then
+    printf 'local heavy_load_wait=false\n'
+  else
+    printf 'local heavy_load_wait=true\n'
   fi
   printf 'local load5=%s ncpu=%s ratio=%s active=%s\n' "${SPILL_LOAD:-unknown}" "${SPILL_NCPU:-unknown}" "${SPILL_RATIO:-unknown}" "${SPILL_ACTIVE:-unknown}"
   printf 'host\tstatus\tload5\tactive\n'
@@ -8719,9 +9008,10 @@ per host (default 1) via fcntl.flock on per-host slot files (works the same
 on macOS and Linux — macOS has no `flock` command, and flock releases a dead
 holder's slot automatically, unlike shlock pid-files). Slot 0 is the lock
 file itself; slots 1..N-1 are <lock>.slot<i>. The command runs under
-`nice -n 10` and only starts once load5/ncpu < 1.0. Total wait (slot +
-load) is capped at 20 minutes; on expiry the command is NOT run and wrk
-exits 75 (EX_TEMPFAIL). The command inherits the slot fd (nested detection
+`nice -n 10` and, while the load wait is on (see heavy_load_wait below),
+only starts once load5/ncpu < 1.0. Total wait (slot + load) is capped at
+20 minutes; on expiry the command is NOT run and wrk exits 75
+(EX_TEMPFAIL). The command inherits the slot fd (nested detection
 needs it — see WRK_HEAVY_HELD_FD), so an orphaned child keeps the slot while
 it lives; the kernel frees the slot when the whole holder tree is gone.
 
@@ -8733,8 +9023,20 @@ configured value for one invocation. A non-integer or negative limit also
 refuses rc 78 — a config typo must not silently allow runs. Lowering the
 limit does not kill extra holders minted under a larger one; they drain.
 
+`[local] heavy_load_wait` is this host's switch for the load5/ncpu < 1.0
+wait (#1241), read through the same strict [local] scanner as `spawn`:
+bare TOML true/false only, written once under a clean '[local]' — absent
+or `true` keeps the wait exactly as above; `false` skips ONLY the load
+wait (the heavy_max slot, its lock, `nice -n 10` and the cap are
+unchanged — the slot wait still counts toward the cap and expires rc 75).
+A malformed [local] surface — bad value, quoted spelling, duplicate key,
+bad header — refuses the run rc 70 naming the file line, before any slot
+is taken. `wrk hosts` prints it as `local heavy_load_wait=true|false|
+error (...)`.
+
 `wrk heavy status` prints the lock path, this host, the effective limit,
-one `holder` line per occupied slot, and queued waiters (holder pids are the
+the load-wait switch (`load_wait true|false|error (...)`), one `holder`
+line per occupied slot, and queued waiters (holder pids are the
 wrk heavy python processes; killing one frees its slot once the command
 tree that inherited the slot fd is also gone). status never creates slot
 files and is never refused.
@@ -8780,6 +9082,23 @@ heavy_cmd() {
   case "${1:-}" in
     -h|--help) heavy_help; return 0 ;;
   esac
+  # #1241: the strict [local] scan owns heavy_load_wait (and spawn). A
+  # malformed [local] surface refuses a run rc 70 here — before the python
+  # half can take a slot or run anything (this check precedes heavy_max's
+  # own rc 78: one grammar error on the [local] surface outranks a bad
+  # value inside it). status is a reporting command: the error text is
+  # carried through for display instead.
+  local heavy_load_wait=1 heavy_load_wait_src=default heavy_load_wait_err=""
+  if local_spawn_scan; then
+    heavy_load_wait="$LOCAL_HEAVY_LOAD_WAIT"
+    heavy_load_wait_src="$LOCAL_HEAVY_LOAD_WAIT_SRC"
+  else
+    heavy_load_wait_err="$LOCAL_SPAWN_ERROR"
+    if [[ "${1:-}" != status ]]; then
+      echo "wrk: ${LOCAL_SPAWN_ERROR}; refusing heavy run" >&2
+      return "$WRK_EXIT_CONFIG_REFUSED"
+    fi
+  fi
   # Per-host heavy concurrency limit (#772): WRK_HEAVY_MAX wins for one
   # invocation, then hosts.toml [local] heavy_max via the same
   # spillover_value reader that owns the documented TOML surface, else 1.
@@ -8795,6 +9114,9 @@ heavy_cmd() {
     heavy_limit_src="default"
   fi
   WRK_HEAVY_LIMIT="$heavy_limit" WRK_HEAVY_LIMIT_SRC="$heavy_limit_src" \
+    WRK_HEAVY_LOAD_WAIT="$heavy_load_wait" \
+    WRK_HEAVY_LOAD_WAIT_SRC="$heavy_load_wait_src" \
+    WRK_HEAVY_LOAD_WAIT_ERR="$heavy_load_wait_err" \
     python3 - "$@" <<'PY'
 import datetime, fcntl, glob, json, os, re, socket, subprocess, sys, time
 
@@ -8844,6 +9166,15 @@ try:
     limit_ok = limit >= 0
 except ValueError:
     limit, limit_ok = -1, False
+
+# #1241: hosts.toml [local] heavy_load_wait — resolved by the strict
+# [local] scan in the bash half — switches the post-slot load5/ncpu < 1.0
+# wait off per host. "0" skips only that wait; a scan error already
+# refused runs rc 70 before this process, so the error text only reaches
+# here for `status`, which prints it instead of a value.
+load_wait = os.environ.get("WRK_HEAVY_LOAD_WAIT", "1") != "0"
+load_wait_src = os.environ.get("WRK_HEAVY_LOAD_WAIT_SRC", "default")
+load_wait_err = os.environ.get("WRK_HEAVY_LOAD_WAIT_ERR", "")
 
 slot_re = re.compile(re.escape(lock_path) + r"\.slot(\d+)$")
 
@@ -8925,6 +9256,12 @@ if args[0] == "status":
         print("limit %d (%s)" % (limit, limit_src))
     else:
         print("limit %s (invalid, %s)" % (limit_raw, limit_src))
+    if load_wait_err:
+        print("load_wait error (%s)" % load_wait_err)
+    elif load_wait:
+        print("load_wait true (%s)" % load_wait_src)
+    else:
+        print("load_wait false (%s)" % load_wait_src)
     paths = known_slots()
     holders = []
     for p in paths:
@@ -9149,7 +9486,20 @@ try:
         pass
     os.ftruncate(held_fd, 0)
     os.write(held_fd, (info + "\n").encode())
-    while True:
+    # #1241 r2: the load loop below doubles as the post-acquire cap gate —
+    # a pass that wins the flock skips the slot loop's own deadline check,
+    # so a slot granted after the cap is caught only when the load wait
+    # runs. With the wait off there is no second gate: refuse the late slot
+    # exactly like a slot-wait expiry (same message, same wait_cap event).
+    if not load_wait and acquired_at >= deadline:
+        log_event({"kind": "wait_cap", "phase": "slot",
+                   "cmd": cmd_summary[:200], "limit": limit,
+                   "wait_s": round(time.monotonic() - started_at, 3)})
+        fail("wait cap %.0fs exceeded waiting for a heavy slot on %s "
+             "-- command not run" % (cap, lock_path), EXIT_WAIT_CAP)
+    # heavy_load_wait = false skips only this wait — the slot above is
+    # held, its wait counted toward the cap, and nice -n 10 is unchanged.
+    while load_wait:
         try:
             ratio = load_ratio()
             if ratio is None or ratio < 1.0:

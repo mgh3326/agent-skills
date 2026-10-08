@@ -580,6 +580,7 @@ hub 호출 자체가 실패했을 때만 아래의 로컬 폴백 측정(load5/nc
 max_load_ratio = 0.5       # hub unavailable 때만 사용
 max_active = 4             # hub unavailable 때만 사용
 heavy_max = 1              # 이 머신의 wrk heavy 동시 홀더 수: 0=금지, N=슬롯 N개 (기본 1)
+heavy_load_wait = true     # wrk heavy의 슬롯 획득 후 load5/ncpu<1.0 대기 — false면 그 대기만 생략 (기본 true)
 spawn = false              # 이 호스트의 로컬 spawn 자체를 닫는다 — bare TOML boolean만 허용, 기본 true
 
 [hub]
@@ -596,8 +597,23 @@ herdr_session = "worker"
 workspace = "<remote-workspace>"
 cwd_map = {"<local-worktree>"="<remote-worktree>"}
 capacity = 3               # hub unavailable 때의 후보 실측 한도
-# 선택적 wake: 기본 off. hub 설정의 URL·env 파일을 사용한다.
+# 선택적 wake-on-demand (#1239): 기본 off 호스트만 둔다. 아래 세 키가 세트다.
 wake = "panewire"
+wake_hold = 10             # burst hold(분), 기본 10
+wake_wait = 300            # 노드 접속 대기 상한(초), 기본 300
+```
+
+mac-personal의 실제 desktop 항목(기본 off, 필요할 때만 깨우는 대상)은 이렇게 생겼다:
+```toml
+[hosts.desktop]
+ssh = "desktop"
+herdr_session = "worker"
+workspace = "w1"
+cwd_map = {"<local-worktree>"="<remote-worktree>"}
+capacity = 4
+wake = "panewire"
+wake_hold = 10
+wake_wait = 300
 ```
 
 - 원격 선택 시 브리프를 권한 `0600` 임시 파일로 `scp`하고,
@@ -613,11 +629,34 @@ wake = "panewire"
   확인한다. 로컬 브랜치가 origin에 push되지 않았거나 원격이 다른 커밋이면 덮어쓰지 않고
   fail-closed다 — push·정렬·수동 생성 중 무엇을 하면 되는지 메시지가 나온다. 정확히
   일치하는 리포 루트 매핑은 기존처럼 통과한다.
-- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. 로컬로 조용히 되돌리지 말고
-  `--host local` 또는 설정 추가를 안내한다.
-- hub가 꺼져 폴백 중 원격 후보가 닿지 않으면 다음 후보를 본다. `wake = "panewire"`일 때만
-  `panewire burst request --target <name> --hold <N>m`을 best-effort로 시도하며, wake 실패도
-  다음 후보 탐색을 막지 않는다.
+- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. `--host auto`의
+  hosts.toml 순서 라운드(hub 응답이 없어 local-fallback으로 돌아간 경우)만
+  그런 후보를 probe 전에 건너뛰고(성공 라운드에는 조용히, 전멸 라운드에는
+  보류된 진단 한 줄) 라운드를 멈추지도 wake 판정에도 세지 않는다. hub가
+  답한 placement 라운드에는 skip이 없다 — placement 결정이 권위이므로 그
+  라운드의 cwd-map 미스는 여전히 rc 2로 fail-closed다. 명시적
+  `--host NAME`도 cwd-map rc 2를 그대로 유지한다.
+- `wake = "panewire"`(#1239)는 기본 off 원격 호스트를 필요할 때만 깨운다. 후보가 probe에서
+  ssh-unreachable이었다는 것만으로는 깨우지 않고 라운드를 끝까지 돌린다: **로컬이 job을
+  받을 수 없고**(압력 초과이거나 `spawn = false`) **아무 후보도 job을 받지 못했으며**
+  **라운드가 stop-set 응답(도달한 원격 wrk의 rc 2·70·74·75)으로 끝나지 않았고**
+  **최소 하나의 후보가 remote-full을 응답했을 때**(정량적 용량 증거) 첫 wake 후보에
+  `panewire burst request --target <name>
+  --hold <wake_hold>m --timeout <min(wake_wait,600)>s --reason … --hub-url …
+  --hub-token-env <credential>`를 보낸다(`hub_url`은 다른 hub 경로와 같은
+  `wss://`→`https://` 변환을 거친다). 자격 증명은 `[hub] operator_token_env`가 우선이고
+  없을 때만 `hub_token_env`로 폴백한다 — `hub_token_env`는 hub quota gate(#1138)의
+  opt-in이기도 하므로 `quota_gate = "local"` 호스트는 그 키를 비워 둔 채 이 경로를 쓴다.
+  `hub_cf_env`는 선택 사항이다. hold 승인(rc 0)이나 `cooldown_active`(동시에 돌린 다른
+  wrk의 wake가 이미 진행 중이라는 뜻 — 두 번째 요청을 쌓지 않고 그 wake를 기다리는 게
+  동시성 규약)이면 최대 `wake_wait`초 동안 ssh probe를 반복해 노드 접속을 확인한 뒤
+  spawn을 올린다. 거부(target_unavailable·wake_via_unavailable·invalid_request)·CLI
+  실패·타임아웃·대기 후에도 unreachable이면 후보별 진단을 출력하고
+  `wrk: <host> wake <사유>; not falling back to local` 한 줄로 rc 81
+  (`WRK_EXIT_WAKE_FAILED`)이다 — wake를 시도한 뒤에는 `[local] spawn`과 무관하게
+  로컬로 폴백하지 않는다. wake 후 배치가 실패하면 그 rc가 그대로 전파된다.
+  명시적 `--host <wake host>`는 unreachable이어도 같은 wake+대기+배치를 하고
+  실패도 같은 형태다 — hosts.toml의 `wake` 키 자체가 opt-in이다.
 - `--host auto` 순회에서 위임된 원격 wrk가 설정 오류로 거부(rc 70 — 예: 원격의 잘못된
   [hub] quota_gate)하면 라운드는 즉시 멈추고 rc 70 fail-closed다(#1154). 다음 후보나
   로컬 폴백으로 넘어가지 않는다 — 스폰이 닫힌 호스트에 job을 두지 않기 위해서다.
@@ -653,12 +692,28 @@ wake = "panewire"
   허용이다. `[local]`이 없거나 spawn 키가 없거나 정확한 한 줄이면 기존과 동일하다.
   `wrk hosts`는 해석된 상태를 `local spawn=allowed|disabled|error (<사유>)`로
   출력한다 (보고 명령이라 오류 상태에서도 rc 0).
+- `heavy_load_wait`(#1241)은 같은 strict 스캐너가 읽는 두 번째 [local] boolean이다 —
+  같은 규칙이다: `[local]` 단독 줄 아래 `heavy_load_wait = true|false` 한 번만 허용되고,
+  따옴표 값·다른 철자·중복·변형된 키 줄은 모두 줄 번호를 단 rc 70 거부다(이 거부는
+  surface 전체에 걸려서 heavy 뿐 아니라 spawn 배치도 막는다). 없거나 `true`이면 기존과
+  동일(슬롯을 잡은 뒤 load5/ncpu<1.0이 될 때까지 기다린다). `false`이면 **그 load 대기만**
+  생략한다 — heavy_max 슬롯 획득·슬롯 락·`nice -n 10`·20분 cap(슬롯 대기에도 적용, 초과 시
+  rc 75)은 그대로다. 잘못된 [local]은 슬롯을 잡기 전에 rc 70으로 거부한다.
+  `wrk hosts`는 `local heavy_load_wait=true|false|error (<사유>)`를, `wrk heavy status`는
+  `load_wait true|false|error (<사유>)`를 출력한다(둘 다 보고 명령이라 오류에서도 rc 0).
+  hosts.toml 자체가 없으면(디렉터리도 없으면) 대기 on·heavy_max 1로 기존과 동일하고,
+  `[local]`에 이 키만 있는 파일은 생성 전과 비교해 이 스위치 외 라우팅·기본값·rc는
+  바꾸지 않는다 — 단 #58부터 있던 선행 차이 하나: 읽을 수 있는 hosts 파일이
+  생기면 --host auto 의 로컬 착지 OK 줄에 host=local 주석이 붙는다(파일이 없을 때의
+  fast path는 bare 줄을 출력한다). 이 diff가 아니라 어떤 hosts 파일이든 생기면
+  나타나는 기존 동작이다.
 - `wrk hosts`는 현재 로컬 폴백 압력과 후보의 도달/활성 상태를 표로 보인다. 모든 라우팅은
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
 - `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600
   `HUB_MACHINE_ID`/`HUB_TOKEN`)이다. 설정하면 `panewire lanes add/ls/rm`만 이 경로를
-  `--hub-token-env`로 쓰고, quota gate·placement·wake·hub spawn 같은 다른 허브 경로는 계속
-  `hub_token_env`만 읽는다 — 이 파일은 operator route에 닿지 않는다. wrk는 파일을 스캔해
+  `--hub-token-env`로 쓴다 — 이 파일은 operator route에 닿지 않는다. quota gate·placement는
+  계속 `hub_token_env`만 읽고, wake(#1239)는 `operator_token_env`를 먼저 보고 없을 때만
+  `hub_token_env`로 폴백하며, hub spawn은 `operator_token_env`를 쓴다. wrk는 파일을 스캔해
   `HUB_MACHINE_ID` 키의 값만 추출한다. 그 값이 `^[A-Za-z0-9._-]{1,64}$` 모양의 머신 id가
   아니면(예: 같은 줄에 `HUB_TOKEN`이 붙은 한 줄 파일) 값 없이 한 번 경고하고 건너뛰고,
   유효한데 `session_machine_ids`의 머신과 다르면 역시 한 번 경고하고 건너뛴다(허브가 403 할
@@ -714,8 +769,10 @@ cwd_keys = {"<local-worktree>"="repo-a"}
 (`fcntl.flock` 카운팅 세마포, mac·Linux 동일; 죽은 홀더의 슬롯은 커널이 회수한다),
 **같은 head 에서 세션(역할)당 최대 1회**(워커의 실행과 tester 의 독립 재실행은
 별개다), 대기 상한 20분(초과 시 rc=75 로 실패하고 보고서에 "heavy 대기
-초과" 기록, 락 없이 임의로 돌리지 않는다), `nice -n 10`, 시작 전 load5/ncpu ≥ 1.0 이면 대기.
-보유자·대기열·유효 상한은 `wrk heavy status` 로 본다.
+초과" 기록, 락 없이 임의로 돌리지 않는다), `nice -n 10`, 시작 전 load5/ncpu ≥ 1.0 이면 대기
+— 단 그 머신의 `[local] heavy_load_wait = false`(#1241)면 **이 load 대기만** 생략된다
+(슬롯·락·nice·cap은 그대로; 슬롯 대기가 cap을 쓰면 rc 75).
+보유자·대기열·유효 상한·load_wait 상태는 `wrk heavy status` 로 본다.
 
 호스트별 상한은 **그 머신 자신의** hosts.toml `[local] heavy_max` 가 정한다(없으면 1).
 `0`이면 그 호스트에서 heavy 를 전면 거부(rc 78, 호스트명을 적고 desktop 으로 안내한다).
@@ -727,6 +784,12 @@ cwd_keys = {"<local-worktree>"="repo-a"}
 한다**): 이 맥(mac-personal) `heavy_max = 0` — syspolicyd SIGSEGV 방지, desktop
 `heavy_max = 1`, m1b `heavy_max = 2`. 이 맥에서는 1-3개 targeted test 파일을
 `wrk heavy` 없이 직접 돌리는 것만 허용된다.
+
+10-02 운영자 지시(#1241, 적용은 merge 후 desk): m1b·mac-personal은 기존 `[local]` 아래에
+`heavy_load_wait = false` 한 줄을 추가하고, M1(mac-work)은 아직 hosts.toml 자체가 없으니
+`[local]` + `heavy_load_wait = false` 두 줄짜리 파일을 새로 만든다 — M1은 load5/ncpu ≈ 3으로
+load gate가 사실상 열리지 않아 heavy 실행이 20분 cap까지 큐잉됐다. 어느 파일이든 값은 bare
+boolean만 허용되고 잘못 쓰면 rc 70으로 거부된다.
 
 macOS 에는 `flock` 명령이 없으므로 **브리프에 셸 `flock` 문구를 직접 쓰지 않는다.** 09-24
 수동 규약(`flock /tmp/desktop-heavy-test.lock`)은 `wrk heavy` 로 대체됐다 — 그 파일을 직접

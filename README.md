@@ -149,8 +149,8 @@ wrk joined JOB --pr URL --head SHA --report PATH
 wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders]
 wrk find <이름|라벨> [--pane-only]
 wrk name-sync [--apply|<라벨>...]
-wrk heavy -- <cmd>     # 호스트당 1개, 대기 상한 20분(rc 75), nice -n 10, load5/ncpu<1.0 게이트
-wrk heavy status       # 보유자·대기열
+wrk heavy -- <cmd>     # 호스트당 1개, 대기 상한 20분(rc 75), nice -n 10, load5/ncpu<1.0 게이트(hosts.toml [local] heavy_load_wait=false면 그 대기만 생략)
+wrk heavy status       # 보유자·대기열·load_wait 상태
 ```
 
 `-m`은 필수이며 `codex-terra`, `codex-luna`, `codex-sol`처럼 모델을 드러내는
