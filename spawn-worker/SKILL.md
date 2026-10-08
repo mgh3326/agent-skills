@@ -597,8 +597,23 @@ herdr_session = "worker"
 workspace = "<remote-workspace>"
 cwd_map = {"<local-worktree>"="<remote-worktree>"}
 capacity = 3               # hub unavailable 때의 후보 실측 한도
-# 선택적 wake: 기본 off. hub 설정의 URL·env 파일을 사용한다.
+# 선택적 wake-on-demand (#1239): 기본 off 호스트만 둔다. 아래 세 키가 세트다.
 wake = "panewire"
+wake_hold = 10             # burst hold(분), 기본 10
+wake_wait = 300            # 노드 접속 대기 상한(초), 기본 300
+```
+
+mac-personal의 실제 desktop 항목(기본 off, 필요할 때만 깨우는 대상)은 이렇게 생겼다:
+```toml
+[hosts.desktop]
+ssh = "desktop"
+herdr_session = "worker"
+workspace = "w1"
+cwd_map = {"<local-worktree>"="<remote-worktree>"}
+capacity = 4
+wake = "panewire"
+wake_hold = 10
+wake_wait = 300
 ```
 
 - 원격 선택 시 브리프를 권한 `0600` 임시 파일로 `scp`하고,
@@ -614,11 +629,34 @@ wake = "panewire"
   확인한다. 로컬 브랜치가 origin에 push되지 않았거나 원격이 다른 커밋이면 덮어쓰지 않고
   fail-closed다 — push·정렬·수동 생성 중 무엇을 하면 되는지 메시지가 나온다. 정확히
   일치하는 리포 루트 매핑은 기존처럼 통과한다.
-- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. 로컬로 조용히 되돌리지 말고
-  `--host local` 또는 설정 추가를 안내한다.
-- hub가 꺼져 폴백 중 원격 후보가 닿지 않으면 다음 후보를 본다. `wake = "panewire"`일 때만
-  `panewire burst request --target <name> --hold <N>m`을 best-effort로 시도하며, wake 실패도
-  다음 후보 탐색을 막지 않는다.
+- 선택한 호스트에 cwd 매핑이 없으면 **fail-closed**다. `--host auto`의
+  hosts.toml 순서 라운드(hub 응답이 없어 local-fallback으로 돌아간 경우)만
+  그런 후보를 probe 전에 건너뛰고(성공 라운드에는 조용히, 전멸 라운드에는
+  보류된 진단 한 줄) 라운드를 멈추지도 wake 판정에도 세지 않는다. hub가
+  답한 placement 라운드에는 skip이 없다 — placement 결정이 권위이므로 그
+  라운드의 cwd-map 미스는 여전히 rc 2로 fail-closed다. 명시적
+  `--host NAME`도 cwd-map rc 2를 그대로 유지한다.
+- `wake = "panewire"`(#1239)는 기본 off 원격 호스트를 필요할 때만 깨운다. 후보가 probe에서
+  ssh-unreachable이었다는 것만으로는 깨우지 않고 라운드를 끝까지 돌린다: **로컬이 job을
+  받을 수 없고**(압력 초과이거나 `spawn = false`) **아무 후보도 job을 받지 못했으며**
+  **라운드가 stop-set 응답(도달한 원격 wrk의 rc 2·70·74·75)으로 끝나지 않았고**
+  **최소 하나의 후보가 remote-full을 응답했을 때**(정량적 용량 증거) 첫 wake 후보에
+  `panewire burst request --target <name>
+  --hold <wake_hold>m --timeout <min(wake_wait,600)>s --reason … --hub-url …
+  --hub-token-env <credential>`를 보낸다(`hub_url`은 다른 hub 경로와 같은
+  `wss://`→`https://` 변환을 거친다). 자격 증명은 `[hub] operator_token_env`가 우선이고
+  없을 때만 `hub_token_env`로 폴백한다 — `hub_token_env`는 hub quota gate(#1138)의
+  opt-in이기도 하므로 `quota_gate = "local"` 호스트는 그 키를 비워 둔 채 이 경로를 쓴다.
+  `hub_cf_env`는 선택 사항이다. hold 승인(rc 0)이나 `cooldown_active`(동시에 돌린 다른
+  wrk의 wake가 이미 진행 중이라는 뜻 — 두 번째 요청을 쌓지 않고 그 wake를 기다리는 게
+  동시성 규약)이면 최대 `wake_wait`초 동안 ssh probe를 반복해 노드 접속을 확인한 뒤
+  spawn을 올린다. 거부(target_unavailable·wake_via_unavailable·invalid_request)·CLI
+  실패·타임아웃·대기 후에도 unreachable이면 후보별 진단을 출력하고
+  `wrk: <host> wake <사유>; not falling back to local` 한 줄로 rc 81
+  (`WRK_EXIT_WAKE_FAILED`)이다 — wake를 시도한 뒤에는 `[local] spawn`과 무관하게
+  로컬로 폴백하지 않는다. wake 후 배치가 실패하면 그 rc가 그대로 전파된다.
+  명시적 `--host <wake host>`는 unreachable이어도 같은 wake+대기+배치를 하고
+  실패도 같은 형태다 — hosts.toml의 `wake` 키 자체가 opt-in이다.
 - `--host auto` 순회에서 위임된 원격 wrk가 설정 오류로 거부(rc 70 — 예: 원격의 잘못된
   [hub] quota_gate)하면 라운드는 즉시 멈추고 rc 70 fail-closed다(#1154). 다음 후보나
   로컬 폴백으로 넘어가지 않는다 — 스폰이 닫힌 호스트에 job을 두지 않기 위해서다.
@@ -673,8 +711,9 @@ wake = "panewire"
   `~/.local/state/wrk/spillover.log`에 `source=hub|local-fallback`과 사유를 남긴다.
 - `lanes_token_env`(#1037)는 이 호스트 자신의 hub 머신 ID에 묶인 노드 토큰 파일(mode 0600
   `HUB_MACHINE_ID`/`HUB_TOKEN`)이다. 설정하면 `panewire lanes add/ls/rm`만 이 경로를
-  `--hub-token-env`로 쓰고, quota gate·placement·wake·hub spawn 같은 다른 허브 경로는 계속
-  `hub_token_env`만 읽는다 — 이 파일은 operator route에 닿지 않는다. wrk는 파일을 스캔해
+  `--hub-token-env`로 쓴다 — 이 파일은 operator route에 닿지 않는다. quota gate·placement는
+  계속 `hub_token_env`만 읽고, wake(#1239)는 `operator_token_env`를 먼저 보고 없을 때만
+  `hub_token_env`로 폴백하며, hub spawn은 `operator_token_env`를 쓴다. wrk는 파일을 스캔해
   `HUB_MACHINE_ID` 키의 값만 추출한다. 그 값이 `^[A-Za-z0-9._-]{1,64}$` 모양의 머신 id가
   아니면(예: 같은 줄에 `HUB_TOKEN`이 붙은 한 줄 파일) 값 없이 한 번 경고하고 건너뛰고,
   유효한데 `session_machine_ids`의 머신과 다르면 역시 한 번 경고하고 건너뛴다(허브가 403 할

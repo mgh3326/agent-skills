@@ -12,7 +12,7 @@ fi
 remote="${*: -1}"
 host=""
 for arg in "$@"; do
-  [[ "$arg" == desktop || "$arg" == mac-work ]] && host="$arg"
+  case "$arg" in desktop|mac-work|oci|mac-dev|rpi) host="$arg" ;; esac
 done
 # Per-host override (WRK_SSH_SCENARIO_DESKTOP, WRK_SSH_SCENARIO_MAC_WORK)
 # wins over the shared WRK_SSH_SCENARIO so multi-host auto tests can give
@@ -23,8 +23,24 @@ if [[ -n "$host" ]]; then
   scenario_var="WRK_SSH_SCENARIO_${host_key}"
   [[ -z "${!scenario_var:-}" ]] || scenario="${!scenario_var}"
 fi
+# #1239: a sleeping desktop refuses EVERY leg — probe, mktemp, scp'd spawn —
+# until the panewire burst-request fixture creates the flag file named by
+# WRK_DESKTOP_AWAKE, which is what "the node connected" means in the fake.
+# desktop-asleep-fail42 wakes the same way, then fails the delegated spawn.
+if [[ "$host" == desktop && ( "$scenario" == desktop-asleep || "$scenario" == desktop-asleep-fail42 ) ]] &&
+   { [[ -z "${WRK_DESKTOP_AWAKE:-}" ]] || [[ ! -e "$WRK_DESKTOP_AWAKE" ]]; }; then
+  printf '%s\n' "ssh: connect to host $host port 22: Operation timed out" >&2
+  exit 255
+fi
 if [[ "$remote" == *'uptime; herdr agent list'* ]]; then
   if [[ "$host" == desktop && "$scenario" == desktop-down ]]; then exit 255; fi
+  if [[ "$scenario" == probe-full ]]; then
+    # #1239: a reachable host at capacity — four working agents read as
+    # remote-full against any fixture capacity <= 4.
+    printf '%s\n' ' 10:00 up 1 day,  load average: 6.00, 6.00, 6.00'
+    printf '%s\n' '{"result":{"agents":[{"agent_status":"working"},{"agent_status":"working"},{"agent_status":"working"},{"agent_status":"working"}]}}'
+    exit 0
+  fi
   if [[ "$host" == mac-work && "$scenario" == backup-down ]]; then exit 255; fi
   if [[ "$scenario" == probe-unreachable ]]; then
     printf '%s\n' "ssh: connect to host $host port 22: Operation timed out" >&2
@@ -69,7 +85,7 @@ if [[ "$remote" == *'sh -s'* ]]; then
   env BASE="${BASE:-}" TARGET="${TARGET:-}" BRANCH="${BRANCH:-}" SHA="${SHA:-}" bash -c "$script"
   exit $?
 fi
-if [[ "$host" == desktop && "$scenario" == desktop-spawn-fails ]]; then exit 42; fi
+if [[ "$host" == desktop && ( "$scenario" == desktop-spawn-fails || "$scenario" == desktop-asleep-fail42 ) ]]; then exit 42; fi
 # The delegated spawn leg arrives as "env HERDR_SESSION=... wrk spawn ...;
 # rc=$?; rm -f brief; exit $rc".  These scenarios make the remote wrk fail the
 # way a real one does: a die line on stderr, a refusal printed on stdout, or
