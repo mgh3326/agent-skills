@@ -3076,14 +3076,22 @@ apply_catalog() {
     # "scopefuel: warning:" line ahead of the refusal, and squeezing all of
     # stderr kept the warning while cutting the actual reason away. The
     # warnings are the operator's config signal, not the refusal's — stderr is
-    # captured here, so re-emit them verbatim or the operator never sees the
-    # broken config at all — and build the reason from the remaining lines,
-    # falling back to the last non-empty line so an all-warning stderr still
-    # reports something. The 240-char cap is unchanged.
-    grep '^scopefuel: warning:' "$err_file" >&2 || true
+    # captured here, so on a failure they are re-emitted verbatim or the
+    # operator never sees the broken config at all — and the reason is built
+    # from the remaining lines, falling back to the last non-empty line so an
+    # all-warning stderr still reports something. The 240-char cap is
+    # unchanged. #1226: the re-emit fires only when the launch did not
+    # succeed — on rc 0 the quota gate's own scopefuel call already passes the
+    # same warning through, so re-printing here showed it twice per spawn. A
+    # reason that is whitespace-only (a warning followed by a blank line)
+    # counts as empty so the fallback applies, and the fallback never picks a
+    # whitespace-only line.
+    if [[ "$rc" -ne 0 ]]; then
+      grep '^scopefuel: warning:' "$err_file" >&2 || true
+    fi
     CATALOG_REFUSE_REASON="$(grep -v '^scopefuel: warning:' "$err_file" | tr -s '[:space:]' ' ' | cut -c1-240 || true)"
-    if [[ -z "$CATALOG_REFUSE_REASON" ]]; then
-      CATALOG_REFUSE_REASON="$(grep . "$err_file" | tail -n 1 | tr -s '[:space:]' ' ' | cut -c1-240 || true)"
+    if [[ -z "${CATALOG_REFUSE_REASON//[[:space:]]/}" ]]; then
+      CATALOG_REFUSE_REASON="$(grep '[^[:space:]]' "$err_file" | tail -n 1 | tr -s '[:space:]' ' ' | cut -c1-240 || true)"
     fi
     rm -f "$err_file"
   fi
