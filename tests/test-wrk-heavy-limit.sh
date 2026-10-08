@@ -371,6 +371,301 @@ grep -q 'already holding' <<<"$out" ||
 wait "$prh" || fail "real holder run failed"
 echo "PASS heavy-held-forged-not-nested"
 
+# ── #1241 heavy_load_wait: per-host switch for the post-slot load gate ────
+# [local] heavy_load_wait rides the same strict scanner as [local] spawn:
+# absent or true is exactly today's wait; false skips ONLY the load wait
+# (the heavy_max slot, its lock, nice -n 10 and the wait cap are
+# unchanged); every malformed spelling refuses rc 70 before a slot is
+# taken or the command runs.
+hlw_cfg() { # hlw_cfg <name> <toml-line>... — writes the lines under [local]
+  local cfg="$TMP/hlw-$1.toml"; shift
+  { printf '[local]\n'; printf '%s\n' "$@"; } >"$cfg"
+  printf '%s' "$cfg"
+}
+CFGHLW_ON="$(hlw_cfg on 'heavy_load_wait = true')"
+CFGHLW_OFF="$(hlw_cfg off 'heavy_load_wait = false')"
+# CFGHLW_OFF is deliberately the addendum file: a [local] section with ONLY
+# 'heavy_load_wait = false' — no [hosts.*], no [hub] — what desk writes on
+# M1. CFGMISSING (no file at all) is the pre-desk state.
+printf '1.5\n' >"$WRK_HEAVY_LOAD_FILE"
+
+# AC1+AC2+addendum-A: no file, a [local] without the key and '= true' are
+# byte-identical to main — the run waits on load5/ncpu and expires rc 75 at
+# the cap without running.
+for hlw_cfgf in "$CFGMISSING" "$CFGNOKEY" "$CFGHLW_ON"; do
+  rm -f "$TMP/hlw-ran"
+  set +e
+  out="$(WRK_HEAVY_WAIT_CAP=3 heavy_run "$hlw_cfgf" -- touch "$TMP/hlw-ran" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 75 ]] ||
+    fail "1241 AC1/2 ($hlw_cfgf): the load wait must expire rc 75, got rc=$rc: $out"
+  grep -q 'waiting for load5/ncpu 1.50 < 1.0' <<<"$out" ||
+    fail "1241 AC1/2 ($hlw_cfgf): expiry must name the load wait: $out"
+  [[ ! -e "$TMP/hlw-ran" ]] ||
+    fail "1241 AC1/2 ($hlw_cfgf): command ran despite the load wait"
+done
+# the cap records prove all three runs died on the LOAD phase, not the slot
+python3 - "$WRK_HEAVY_LOG" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+caps = [r for r in rows[-3:]
+        if r.get("kind") == "wait_cap" and r.get("phase") == "load"]
+assert len(caps) == 3, ("expected three phase=load wait_cap records", rows[-3:])
+PY
+echo "PASS heavy-load-wait-absent-and-true"
+
+# AC3a: '= false' skips only the load wait — the command runs at once at
+# ratio 1.5, still inside a held slot and still under nice -n 10.
+printf 'ps -o nice= -p $$ | tr -d " " > "%s"\nsleep 4\ntouch "%s"\n' \
+  "$TMP/hlw-nice.val" "$TMP/hlw-off-ran" >"$TMP/hlw-off.sh"
+t0="$(date +%s)"
+WRK_HEAVY_WAIT_CAP=8 heavy_run "$CFGHLW_OFF" -- bash "$TMP/hlw-off.sh" &
+poff=$!
+wait_until 10 test -f "$TMP/hlw-nice.val" ||
+  fail "1241 AC3: the load_wait=false run never started"
+out="$(WRK_HOSTS_CONFIG="$CFGHLW_OFF" "$WRK" heavy status)"
+grep -qE '^holder (slot=[0-9]+ )?pid=' <<<"$out" ||
+  fail "1241 AC3: no slot is held during the off run: $out"
+grep -q 'load_wait false' <<<"$out" ||
+  fail "1241 AC3: status must show load_wait false: $out"
+grep -q 'limit 1 (default)' <<<"$out" ||
+  fail "1241 AC3/C: the [local]-only file must keep the heavy_max default 1: $out"
+wait "$poff" || fail "1241 AC3: the load_wait=false run failed"
+[[ -e "$TMP/hlw-off-ran" ]] || fail "1241 AC3: the command did not run"
+elapsed=$(( $(date +%s) - t0 ))
+[[ "$elapsed" -lt 8 ]] ||
+  fail "1241 AC3: run took ${elapsed}s at ratio 1.5 — the load wait was not skipped"
+read -r nv <"$TMP/hlw-nice.val" || nv=""
+suite_nice="$(ps -o nice= -p "$$" | tr -d ' ')"
+nice_probe="$(nice -n 10 sh -c 'ps -o nice= -p $$' 2>/dev/null | tr -d ' ')"
+nice_ceiling="$(nice -n 40 sh -c 'ps -o nice= -p $$' 2>/dev/null | tr -d ' ')"
+if [[ "$suite_nice" =~ ^[0-9]+$ && "$nice_probe" =~ ^[0-9]+$ &&
+      "$nice_ceiling" =~ ^[0-9]+$ && "$nice_probe" -gt "$suite_nice" ]]; then
+  expected=$(( suite_nice + 10 ))
+  (( expected > nice_ceiling )) && expected="$nice_ceiling"
+  [[ "$nv" =~ ^[0-9]+$ && "$nv" -ge "$expected" ]] ||
+    fail "1241 AC3: command not under nice -n 10 (suite=$suite_nice got=$nv want>=$expected)"
+else
+  echo "SKIP 1241 nice assertion: nice(1) has no observable effect here"
+fi
+echo "PASS heavy-load-wait-off-runs-under-load"
+
+# addendum C: the [local]-only file runs at once at the M1-class load ratio
+# 3.2 too — the gate is off, not relaxed.
+printf '3.2\n' >"$WRK_HEAVY_LOAD_FILE"
+t0="$(date +%s)"
+WRK_HEAVY_WAIT_CAP=8 heavy_run "$CFGHLW_OFF" -- touch "$TMP/hlw-32-ran" ||
+  fail "1241 C: the [local]-only file must run at once at ratio 3.2"
+[[ -e "$TMP/hlw-32-ran" ]] || fail "1241 C: the command never ran"
+[[ $(( $(date +%s) - t0 )) -lt 8 ]] ||
+  fail "1241 C: the run waited on load at ratio 3.2"
+echo "PASS heavy-load-wait-off-ratio-3.2"
+
+# AC3b: 'false' still respects the slot — with the base slot held the run
+# queues on the LOCK (never the load) and expires rc 75 at the cap.
+printf 'touch "%s"\nsleep 5\n' "$TMP/hlw-holder-start" >"$TMP/hlw-holder.sh"
+heavy_run "$CFGHLW_OFF" -- bash "$TMP/hlw-holder.sh" &
+phold=$!
+wait_until 10 test -f "$TMP/hlw-holder-start" ||
+  fail "1241 AC3: the slot holder never started"
+set +e
+out="$(WRK_HEAVY_WAIT_CAP=2 heavy_run "$CFGHLW_OFF" -- touch "$TMP/hlw-slot-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 75 ]] ||
+  fail "1241 AC3: the slot wait under load_wait=false must expire rc 75, got rc=$rc: $out"
+grep -q 'waiting for a heavy slot' <<<"$out" ||
+  fail "1241 AC3: expiry must name the slot wait, not the load wait: $out"
+[[ ! -e "$TMP/hlw-slot-ran" ]] || fail "1241 AC3: command ran over a held slot"
+python3 - "$WRK_HEAVY_LOG" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+caps = [r for r in rows if r.get("kind") == "wait_cap"]
+assert caps and caps[-1]["phase"] == "slot", \
+    ("the off run must cap on the slot phase", caps[-1] if caps else "none")
+PY
+wait "$phold" || fail "1241 AC3: the slot holder failed"
+echo "PASS heavy-load-wait-off-still-takes-a-slot"
+
+# AC3c (r2, B1): a slot granted AFTER the total cap must still refuse —
+# the flock pass that wins never re-checks the deadline, and with the load
+# wait off no second gate existed. A held slot released past a tiny cap:
+# whichever gate catches it, the contract is identical — rc 75, the slot
+# wait message, the command never run, exactly one phase=slot wait_cap row.
+printf '3.2\n' >"$WRK_HEAVY_LOAD_FILE"
+printf 'touch "%s"\nsleep 0.8\n' "$TMP/hlw-late-held" >"$TMP/hlw-late-holder.sh"
+heavy_run "$CFGHLW_OFF" -- bash "$TMP/hlw-late-holder.sh" &
+plate=$!
+wait_until 10 test -f "$TMP/hlw-late-held" ||
+  fail "1241 r2 AC3c: the late-release holder never started"
+log_rows_before=$(wc -l <"$WRK_HEAVY_LOG")
+set +e
+out="$(WRK_HEAVY_WAIT_CAP=0.25 heavy_run "$CFGHLW_OFF" -- touch "$TMP/hlw-late-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 75 ]] ||
+  fail "1241 r2 AC3c: a post-cap slot grant must refuse rc=75, got rc=$rc: $out"
+grep -q 'waiting for a heavy slot' <<<"$out" ||
+  fail "1241 r2 AC3c: expiry must name the slot wait: $out"
+[[ ! -e "$TMP/hlw-late-ran" ]] ||
+  fail "1241 r2 AC3c: the command ran on a slot granted after the cap"
+python3 - "$WRK_HEAVY_LOG" "$log_rows_before" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+new = rows[int(sys.argv[2]):]
+caps = [r for r in new if r.get("kind") == "wait_cap"]
+assert len(caps) == 1 and caps[0]["phase"] == "slot", \
+    ("the late grant must log exactly one phase=slot wait_cap", new)
+PY
+wait "$plate" || fail "1241 r2 AC3c: the late-release holder failed"
+echo "PASS heavy-load-wait-off-late-slot-refuses-75"
+
+# AC3d (r2 boundary): the release-right-at-cap edge pinned deterministically —
+# WRK_HEAVY_WAIT_CAP=0 makes the deadline precede any acquisition, so even a
+# free slot granted on the first poll arrives "after the cap": only the
+# post-acquire gate can catch it (the slot loop never checks on a winning
+# pass, and the load wait is off). Under 'true'/absent the load loop is the
+# only post-acquire gate — cap 0 with an idle load still runs, exactly as
+# main does, so both stay byte-identical.
+printf '0\n' >"$WRK_HEAVY_LOAD_FILE"
+log_rows_before=$(wc -l <"$WRK_HEAVY_LOG")
+set +e
+out="$(WRK_HEAVY_WAIT_CAP=0 heavy_run "$CFGHLW_OFF" -- touch "$TMP/hlw-cap0-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 75 ]] ||
+  fail "1241 r2 AC3d: a load-off run must never start after the cap, got rc=$rc: $out"
+grep -q 'waiting for a heavy slot' <<<"$out" ||
+  fail "1241 r2 AC3d: the post-cap refusal must name the slot wait: $out"
+[[ ! -e "$TMP/hlw-cap0-ran" ]] ||
+  fail "1241 r2 AC3d: the command ran at cap 0 with the load wait off"
+python3 - "$WRK_HEAVY_LOG" "$log_rows_before" <<'PY'
+import json, sys
+rows = [json.loads(l) for l in open(sys.argv[1], encoding="utf-8")]
+new = rows[int(sys.argv[2]):]
+caps = [r for r in new if r.get("kind") == "wait_cap"]
+assert len(caps) == 1 and caps[0]["phase"] == "slot", \
+    ("cap-0 admission must log exactly one phase=slot wait_cap", new)
+PY
+for hlw_cfgf in "$CFGMISSING" "$CFGHLW_ON"; do
+  rm -f "$TMP/hlw-cap0-on-ran"
+  WRK_HEAVY_WAIT_CAP=0 heavy_run "$hlw_cfgf" -- touch "$TMP/hlw-cap0-on-ran" ||
+    fail "1241 r2 AC3d ($hlw_cfgf): load-wait-on must stay main-identical — the load loop is the only post-acquire gate at cap 0"
+  [[ -e "$TMP/hlw-cap0-on-ran" ]] ||
+    fail "1241 r2 AC3d ($hlw_cfgf): the load-wait-on run at cap 0 must run like main"
+done
+echo "PASS heavy-load-wait-cap0-boundary-and-on-unchanged"
+
+# AC4: every malformed spelling of the key — and any malformed [local]
+# surface — refuses rc 70 naming the file line, before a slot is taken or
+# the command runs.
+for hlw_bad in value-quoted value-case value-int value-empty key-twice \
+    key-bare key-colon key-eqeq key-quoted hdr-comment; do
+  hlw_hdr='[local]' hlw_body='heavy_load_wait = false'
+  case "$hlw_bad" in
+    value-quoted) hlw_body='heavy_load_wait = "false"'
+      hlw_want='accepts only the bare TOML booleans true or false' ;;
+    value-case)   hlw_body='heavy_load_wait = False'
+      hlw_want='accepts only the bare TOML booleans true or false' ;;
+    value-int)    hlw_body='heavy_load_wait = 0'
+      hlw_want='accepts only the bare TOML booleans true or false' ;;
+    value-empty)  hlw_body='heavy_load_wait ='
+      hlw_want='accepts only the bare TOML booleans true or false' ;;
+    key-twice)    hlw_body='heavy_load_wait = true
+heavy_load_wait = false'
+      hlw_want='duplicate heavy_load_wait key in [local]' ;;
+    key-bare|key-colon|key-eqeq|key-quoted)
+      hlw_want='malformed heavy_load_wait assignment in [local]'
+      case "$hlw_bad" in
+        key-bare)   hlw_body='heavy_load_wait' ;;
+        key-colon)  hlw_body='heavy_load_wait: false' ;;
+        key-eqeq)   hlw_body='heavy_load_wait == false' ;;
+        key-quoted) hlw_body='"heavy_load_wait" = false' ;;
+      esac ;;
+    hdr-comment)  hlw_hdr='[local] # closed by ops'
+      hlw_want="must be exactly '[local]' on its own line" ;;
+  esac
+  hlw_badcfg="$TMP/hlw-bad-$hlw_bad.toml"
+  printf '%s\n' "$hlw_hdr" "$hlw_body" >"$hlw_badcfg"
+  rm -f "$TMP/hlw-bad-ran"
+  set +e
+  out="$(heavy_run "$hlw_badcfg" -- touch "$TMP/hlw-bad-ran" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 70 ]] ||
+    fail "1241 AC4 $hlw_bad: malformed heavy_load_wait must refuse rc=70, got rc=$rc: $out"
+  grep -q 'line [0-9]' <<<"$out" ||
+    fail "1241 AC4 $hlw_bad: the refusal must name the file line: $out"
+  grep -qF "$hlw_want" <<<"$out" ||
+    fail "1241 AC4 $hlw_bad: wrong refusal reason: $out"
+  grep -qF 'refusing heavy run' <<<"$out" ||
+    fail "1241 AC4 $hlw_bad: refusal must come from the bash gate before python runs: $out"
+  [[ ! -e "$TMP/hlw-bad-ran" ]] ||
+    fail "1241 AC4 $hlw_bad: the command ran despite the refusal"
+done
+# nothing took a slot or queued for any of those refusals
+out="$(WRK_HOSTS_CONFIG="$CFGNOKEY" "$WRK" heavy status)"
+grep -q 'holder none' <<<"$out" ||
+  fail "1241 AC4: a refused run left a slot held: $out"
+grep -q 'waiters none' <<<"$out" ||
+  fail "1241 AC4: a refused run left a waiter behind: $out"
+# rc 70 vs 78: a malformed [local] refuses before heavy_max is validated;
+# a clean [local] with a bad heavy_max still refuses 78, and the
+# heavy_max=0 gate is untouched by the switch.
+printf '[local]\nheavy_load_wait = bogus\nheavy_max = banana\n' >"$TMP/hlw-both-bad.toml"
+set +e
+out="$(heavy_run "$TMP/hlw-both-bad.toml" -- true 2>&1)"; rc=$?
+set -e
+[[ "$rc" -eq 70 ]] ||
+  fail "1241 AC4: the scan refusal must precede the heavy_max check, got rc=$rc: $out"
+printf '[local]\nheavy_load_wait = false\nheavy_max = 0\n' >"$TMP/hlw-off-zero.toml"
+set +e
+out="$(heavy_run "$TMP/hlw-off-zero.toml" -- true 2>&1)"; rc=$?
+set -e
+[[ "$rc" -eq 78 ]] ||
+  fail "1241 AC4: heavy_max=0 must still refuse rc 78 under load_wait=false, got rc=$rc: $out"
+echo "PASS heavy-load-wait-bad-refuses-70"
+
+# AC5: wrk hosts and wrk heavy status report true/false/error — and stay
+# rc 0 on a scan error (reporting commands).
+for hlw_state in absent true false error; do
+  hlw_want="$hlw_state"
+  case "$hlw_state" in
+    absent) hlw_cfgf="$CFGMISSING" hlw_want=true ;;
+    true)   hlw_cfgf="$CFGHLW_ON" ;;
+    false)  hlw_cfgf="$CFGHLW_OFF" ;;
+    error)  hlw_cfgf="$TMP/hlw-bad-value-quoted.toml" ;;
+  esac
+  out="$(WRK_HOSTS_CONFIG="$hlw_cfgf" "$WRK" hosts)" ||
+    fail "1241 AC5: wrk hosts must stay rc 0 (state=$hlw_state)"
+  if [[ "$hlw_state" == error ]]; then
+    grep -qF 'local heavy_load_wait=error (' <<<"$out" ||
+      fail "1241 AC5: hosts must print =error (...): $out"
+    grep -qF 'local spawn=error (' <<<"$out" ||
+      fail "1241 AC5: the one scan error must show on the spawn line too: $out"
+  else
+    grep -qxF "local heavy_load_wait=$hlw_want" <<<"$out" ||
+      fail "1241 AC5: hosts must print 'local heavy_load_wait=$hlw_want' (state=$hlw_state): $out"
+  fi
+  out="$(WRK_HOSTS_CONFIG="$hlw_cfgf" "$WRK" heavy status)" ||
+    fail "1241 AC5: wrk heavy status must stay rc 0 (state=$hlw_state)"
+  case "$hlw_state" in
+    error)
+      grep -qF 'load_wait error (' <<<"$out" ||
+        fail "1241 AC5: status must print 'load_wait error (...)': $out" ;;
+    absent|true)
+      grep -qF 'load_wait true ' <<<"$out" ||
+        fail "1241 AC5: status must print 'load_wait true': $out" ;;
+    false)
+      grep -qF 'load_wait false ' <<<"$out" ||
+        fail "1241 AC5: status must print 'load_wait false': $out" ;;
+  esac
+done
+echo "PASS heavy-load-wait-hosts-and-status"
+
+printf '0\n' >"$WRK_HEAVY_LOAD_FILE"
+
 # ── assertion-RED mutants over the wrk source ──────────────────────────────
 mutant() { # mutant <name> <spec-file>; spec lines are 'OLD => NEW' (first match)
   local name="$1" spec="$2"
@@ -403,6 +698,9 @@ for anchor in (
     "    if not flock_held(env_path):",
     "    if (fst.st_dev, fst.st_ino) != (lst.st_dev, lst.st_ino):",
     "not 0 < int(m.group(1)) < limit",
+    "    while load_wait:",
+    "    if not load_wait and acquired_at >= deadline:",
+    '             return "$WRK_EXIT_CONFIG_REFUSED" ;;',
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -595,5 +893,84 @@ os.unlink(ghost)
 PY
 [[ -e "$TMP/nb-ran" ]] || fail "mutant noslotbound nested run did not execute"
 echo "PASS mutant-noslotbound"
+
+# ── #1241 mutants: the heavy_load_wait invariants ─────────────────────────
+# M1 "heavy_load_wait = false never waits on load" — the mutant restores
+# `while True:` (ignores the key): the AC3a run-at-once assertion goes RED
+# because the off-config run waits out the cap at ratio 1.5.
+printf '    while load_wait: =>     while True:\n' >"$TMP/spec-hlw-ignore"
+mutant hlwignore "$TMP/spec-hlw-ignore"
+printf '1.5\n' >"$WRK_HEAVY_LOAD_FILE"
+# a fresh lock path: earlier mutants leave orphaned command children whose
+# inherited slot fds still hold $WRK_HEAVY_LOCK for a few seconds
+set +e
+out="$(WRK_HEAVY_WAIT_CAP=2 WRK_HEAVY_LOCK="$TMP/hlw-m1.lock" \
+  WRK_HOSTS_CONFIG="$CFGHLW_OFF" \
+  "$TMP/hlwignore-wrk" heavy -- touch "$TMP/hlw-m1-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 75 && ! -e "$TMP/hlw-m1-ran" ]] ||
+  fail "mutant hlwignore did not wait on load (rc=$rc) — the AC3a assertion is vacuous"
+grep -q 'load5/ncpu' <<<"$out" ||
+  fail "mutant hlwignore expiry must still name the load wait: $out"
+echo "PASS mutant-hlw-ignore-key: 'false never waits on load' RED — AC3a 'runs at once' fails (rc=75, command not run)"
+
+# M2 "heavy_load_wait = false still respects heavy_max slots" — the mutant
+# skips the flock when the wait is off: the AC3b slot-cap assertion goes
+# RED because a second off run executes over the held slot.
+printf 'fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB) => (fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB) if load_wait else None)\n' \
+  >"$TMP/spec-hlw-noslot"
+mutant hlwnoslot "$TMP/spec-hlw-noslot"
+printf 'touch "%s"\nsleep 4\n' "$TMP/hlw-m2-held" >"$TMP/hlw-m2.sh"
+WRK_HEAVY_LOCK="$TMP/hlw-m2.lock" WRK_HOSTS_CONFIG="$CFGHLW_OFF" \
+  "$TMP/hlwnoslot-wrk" heavy -- bash "$TMP/hlw-m2.sh" &
+pm2=$!
+wait_until 10 test -f "$TMP/hlw-m2-held" ||
+  fail "mutant hlwnoslot holder never started"
+set +e
+out="$(WRK_HEAVY_WAIT_CAP=2 WRK_HEAVY_LOCK="$TMP/hlw-m2.lock" \
+  WRK_HOSTS_CONFIG="$CFGHLW_OFF" \
+  "$TMP/hlwnoslot-wrk" heavy -- touch "$TMP/hlw-m2-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && -e "$TMP/hlw-m2-ran" ]] ||
+  fail "mutant hlwnoslot still queued on the held slot (rc=$rc): $out — the AC3b assertion is vacuous"
+wait "$pm2" || fail "mutant hlwnoslot holder failed"
+echo "PASS mutant-hlw-noslot: 'false still respects slots' RED — AC3b 'expires rc 75' fails (rc=0, ran over the held slot)"
+
+# M3 "a bad heavy_load_wait never runs the command" — the mutant turns the
+# bad-value refusal into a no-op, so AC4's rc-70 assertion goes RED: the
+# quoted value is silently ignored and the command executes.
+# shellcheck disable=SC2016 # the spec literal must not expand in this shell
+printf '             return "$WRK_EXIT_CONFIG_REFUSED" ;; =>              true ;;\n' \
+  >"$TMP/spec-hlw-badok"
+mutant hlwbadok "$TMP/spec-hlw-badok"
+printf '0\n' >"$WRK_HEAVY_LOAD_FILE"
+set +e
+out="$(WRK_HEAVY_LOCK="$TMP/hlw-m3.lock" \
+  WRK_HOSTS_CONFIG="$TMP/hlw-bad-value-quoted.toml" \
+  "$TMP/hlwbadok-wrk" heavy -- touch "$TMP/hlw-m3-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && -e "$TMP/hlw-m3-ran" ]] ||
+  fail "mutant hlwbadok still refused the bad value (rc=$rc): $out — the AC4 assertion is vacuous"
+echo "PASS mutant-hlw-bad-ok: 'a bad value never runs' RED — AC4 'refuses rc 70' fails (rc=0, command ran)"
+
+# M4 (r2) "a load-off run never starts after the cap" — the mutant drops
+# the post-acquire gate: the deterministic cap-0 boundary run goes RED —
+# the command executes where the fixed source refuses rc 75.
+printf '    if not load_wait and acquired_at >= deadline: =>     if False:\n' \
+  >"$TMP/spec-hlw-postcap"
+mutant hlwpostcap "$TMP/spec-hlw-postcap"
+printf '0\n' >"$WRK_HEAVY_LOAD_FILE"
+set +e
+out="$(WRK_HEAVY_WAIT_CAP=0 WRK_HEAVY_LOCK="$TMP/hlw-m4.lock" \
+  WRK_HOSTS_CONFIG="$CFGHLW_OFF" \
+  "$TMP/hlwpostcap-wrk" heavy -- touch "$TMP/hlw-m4-ran" 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 0 && -e "$TMP/hlw-m4-ran" ]] ||
+  fail "mutant hlwpostcap still refused the post-cap admission (rc=$rc): $out — the AC3d assertion is vacuous"
+echo "PASS mutant-hlw-postcap: 'a load-off run never starts after the cap' RED — AC3d 'refuses rc 75' fails (rc=0, command ran)"
 
 echo 'PASS test-wrk-heavy-limit'
