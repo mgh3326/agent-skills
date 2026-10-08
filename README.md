@@ -202,8 +202,11 @@ nonce)를 타이핑하고, 그 토큰이 자기 출력 줄로 정확히 돌아�
 재타이핑할 뿐 절대 ctrl+c 등 키를 보내지 않는다 — sourcing 중인 rc에 대한 SIGINT는
 나머지 rc를 죽여 agent가 잘린 환경을 물려 받는다. 창이 닫힐 때까지 답이 없으면 자체
 사유로 fail-closed하고 pane을 닫으며 `agent start`도 호출하지 않는다. 이 대기는 뒤의
-검출·idle 대기(Devin) 또는 `agent start` 재시도(다른 kind)와 같은 start 창(기본 30초,
-codex 120초 등)을 나눠 쓴다.
+검출·idle 대기(Devin) 또는 `agent start` 시도(다른 kind)와 같은 start 창(기본 30초,
+codex 120초 등)을 나눠 쓴다 — 다른 kind의 첫 `agent start`도 창의 시작 시각 기준
+남은 시간만 `--timeout`으로 받으므로 프로브가 쓴 시간만큼 줄어든다. 창이 다 쓰여
+`agent start` 재시도가 끝나면 실패 줄은 프로브가 쓴 ms와 `agent_pane_busy` 횟수를
+구분해 밝힌다.
 
 `devin-swe2`는 Devin 프로필이다. 현재 `wrk`는
 `herdr pane run <pane_id> devin --model swe-2 --permission-mode dangerous --respect-workspace-trust false`로

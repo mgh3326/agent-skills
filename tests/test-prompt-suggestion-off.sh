@@ -194,13 +194,20 @@ done
 echo "PASS non-claude kinds tab-env=unset"
 
 # The Claude argv is exactly what it was: the setting is env, not a flag.
+# #1199: --timeout is the window the readiness probe left — pin the whole
+# argv around it and bound the number to (3000, 30000] instead.
+argv_is_opus() {
+  local start="$1"
+  [[ "$start" =~ ^agent\ start\ fixture\ --kind\ claude\ --pane\ w:p1\ --timeout\ ([0-9]+)\ --\ --model\ opus\ --dangerously-skip-permissions\ --effort\ high$ ]] &&
+    (( BASH_REMATCH[1] > 3000 && BASH_REMATCH[1] <= 30000 ))
+}
 log="$(spawn_log "$WRK" opus)"
 start="$(grep '^agent start ' <<<"$log")"
-[[ "$start" == 'agent start fixture --kind claude --pane w:p1 --timeout 30000 -- --model opus --dangerously-skip-permissions --effort high' ]] ||
+argv_is_opus "$start" ||
   fail "opus agent start argv changed: $start"
 log="$(spawn_log "$WRK" builder-opus --role builder --lane b-argv --parent director-x)"
 start="$(grep '^agent start ' <<<"$log")"
-[[ "$start" == 'agent start fixture --kind claude --pane w:p1 --timeout 30000 -- --model opus --dangerously-skip-permissions --effort high' ]] ||
+argv_is_opus "$start" ||
   fail "builder-opus agent start argv changed: $start"
 echo "PASS claude argv unchanged (setting is pane env only)"
 
