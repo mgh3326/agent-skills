@@ -57,6 +57,7 @@ jobs:
             tests/test-wrk-task-link.sh \
             tests/test-wrk-job-end.sh \
             tests/test-fleet-rev.sh \
+            tests/test-gate-policy-devin-grades.sh \
             tests/fixtures/fleet-rev/fake-ssh \
             tests/fixtures/fleet-rev/fake-gh \
             tests/fixtures/fleet-rev/panewire \
@@ -95,5 +96,6 @@ jobs:
           bash tests/test-wrk-task-link.sh
           bash tests/test-wrk-job-end.sh
           bash tests/test-fleet-rev.sh
+          bash tests/test-gate-policy-devin-grades.sh
       - name: Mock MCP isolation, project migration and assertion mutants (fake only)
         run: python -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
