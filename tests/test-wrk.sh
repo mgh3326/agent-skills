@@ -3452,6 +3452,18 @@ printf '%s\n' '[hub]' 'hub_url = "https://hub.invalid"' \
   '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' \
   'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
   'capacity = 3' >"$LANES_CFG_REMOTE"
+# Same delegation config plus a session_machine_ids entry for the target's
+# herdr session ("worker") — used to prove a remote --host worker spawn is
+# registered by the execution host's OWN session map (machine=target-9s),
+# never by the initiator on machine=desktop.
+LANES_CFG_REMOTE_WMAP="$TMP/lanes-1397-remote-wmap-hosts.toml"
+printf '%s\n' '[hub]' 'hub_url = "https://hub.invalid"' \
+  "operator_token_env = \"$LANES_OP_FILE\"" "hub_cf_env = \"$LANES_CF_FILE\"" \
+  'machine_id = "mac-personal"' \
+  'session_machine_ids = { "worker" = "target-9s" }' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' \
+  'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
+  'capacity = 3' >"$LANES_CFG_REMOTE_WMAP"
 
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
@@ -3509,7 +3521,7 @@ t1397_remote_spawn() {
     --lane t1397-seed --t T1 >/dev/null
   set +e
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
-    ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$TMP/t1397-inbox-$name" \
+    ARBITER_BIN="${T1397_ARBITER_BIN:-$ARBITER}" ARBITER_INBOX_ROOT="$TMP/t1397-inbox-$name" \
     XDG_DATA_HOME="$TMP/t1397-xdg-$name" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
     WRK_FIXTURE_LOG="$TMP/t1397-$name-herdr.log" \
@@ -3523,6 +3535,36 @@ t1397_remote_spawn() {
     "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m builder-sol \
     -p "$PROMPT" -w w -l "$name" --t T1 --job "$name" --task "$(mint_task)" \
     --role builder --lane "$name" --parent director-x \
+    --host "${T1397_HOST:-desktop}" "$@" >"$T1397_OUT" 2>"$T1397_ERR"
+  T1397_RC=$?
+  set -e
+}
+
+t1397_remote_worker() {
+  # NAME [extra spawn args...] — the worker half of a remote spawn: same
+  # delegation to desktop, no --role/--lane/--parent. Used to prove a remote
+  # worker keeps #965: no --lane-defer on the wire, no initiator-side add.
+  local name="$1"; shift
+  T1397_OUT="$TMP/t1397-$name.out" T1397_ERR="$TMP/t1397-$name.err"
+  T1397_CALLS="$TMP/t1397-$name-calls.log" T1397_SSH="$TMP/t1397-$name-ssh.log"
+  env ARBITER_INBOX_ROOT="$TMP/t1397-inbox-$name" XDG_DATA_HOME="$TMP/t1397-xdg-$name" \
+    "$ARBITER" claim --job "t1397-seed-$name" --agent-label "t1397-seed-$name" \
+    --lane t1397-seed --t T1 >/dev/null
+  set +e
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
+    ARBITER_BIN="${T1397_ARBITER_BIN:-$ARBITER}" ARBITER_INBOX_ROOT="$TMP/t1397-inbox-$name" \
+    XDG_DATA_HOME="$TMP/t1397-xdg-$name" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$TMP/t1397-$name-herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/t1397-$name-scopefuel.log" \
+    WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
+    WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
+    WRK_SSH_LOG="$T1397_SSH" WRK_SCP_LOG="$TMP/t1397-$name-scp.log" \
+    WRK_SSH_SCENARIO="${T1397_SSH_SCENARIO:-ok}" \
+    WRK_HOSTS_CONFIG="${T1397_CFG_OVERRIDE:-$LANES_CFG_REMOTE}" \
+    WRK_PANEWIRE_LANES_LOG="$T1397_CALLS" \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-terra \
+    -p "$PROMPT" -w w -l "$name" --t T1 --job "$name" --task "$(mint_task)" \
     --host "${T1397_HOST:-desktop}" "$@" >"$T1397_OUT" 2>"$T1397_ERR"
   T1397_RC=$?
   set -e
@@ -4648,6 +4690,76 @@ assert meta["hub_lane"] == "w1397-defer" and meta["hub_lane_machine"] == "deskto
     fail "#1397 AC2c: exactly one rm for the remote-recorded lane: $(cat "$LANES_RM_LOG")"
   echo "PASS 1397-lanes AC2c: reap removes the remote-registered lane symmetrically"
 
+  # AC2d — a remote --host WORKER keeps the #965 contract end-to-end: no
+  # --lane-defer on the wire, and zero `lanes add` from the initiator even
+  # though the initiator's config carries hub credentials AND a session map.
+  # The execution host's own session-map registration is the ordinary #965
+  # worker path (the delegated command is `--host local`), covered by the
+  # 965 assertions above; the ssh fixture answers with a canned OK line, so
+  # the observable here is the delegated argv and the untouched lane= field.
+  T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_WMAP" \
+    t1397_remote_worker w1397-remote --owner work-kairos
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1397 AC2d: remote worker spawn failed (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  if grep -q -- '--lane-defer' "$T1397_SSH"; then
+    fail "#1397 AC2d: --lane-defer must never reach a worker's delegated argv: $(cat "$T1397_SSH")"
+  fi
+  [[ ! -s "$T1397_CALLS" ]] ||
+    fail "#1397 AC2d: the initiator must make zero lanes calls for a remote worker: $(cat "$T1397_CALLS")"
+  if grep -q ' lane=' "$T1397_OUT"; then
+    fail "#1397 AC2d: no lane= field may be invented for a remote worker: $(cat "$T1397_OUT")"
+  fi
+  grep -q 'host=desktop' "$T1397_OUT" ||
+    fail "#1397 AC2d: the emitted OK line must carry host=desktop: $(cat "$T1397_OUT")"
+  echo "PASS 1397-lanes AC2d: remote worker defers nothing; initiator adds nothing"
+
+  # AC2e — a deferred spawn whose job.spawned receipt cannot be written must
+  # FAIL the remote leg: the receipt is the only record linking the job to
+  # the lane the initiator is about to lanes-add, so a lost write would leave
+  # a hub row no reap can attribute. Under --lane-defer the receipt failure
+  # answers 2 (a remote stop-set answer) instead of warn-only — a local spawn
+  # carrying the flag runs the remote wrk's own code path. A non-deferred
+  # spawn keeps the #994 contract: warn, deregister, rc 0.
+  T1397_FAIL_ARBITER="$TMP/t1397-arbiter-norcpt"
+  cat >"$T1397_FAIL_ARBITER" <<SH
+#!/bin/bash
+# Delegates to the real arbiter except event --kind job.spawned, which
+# answers rc 3 — a forced receipt write failure.
+if [[ "\$1" == event ]]; then
+  for a in "\$@"; do
+    [[ "\$a" == job.spawned ]] && exit 3
+  done
+fi
+exec "$ARBITER" "\$@"
+SH
+  chmod +x "$T1397_FAIL_ARBITER"
+  LANES_CFG_OVERRIDE="$LANES_CFG_OP" LANES_MODEL=builder-sol \
+    LANES_ARBITER_BIN="$T1397_FAIL_ARBITER" \
+    lanes_spawn b1397-norcpt --role builder --lane b1397-norcpt --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1397 AC2e: a deferred receipt failure must answer nonzero (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  if grep -q '^OK pane=' "$LANES_OUT"; then
+    fail "#1397 AC2e: no OK line may survive a failed deferred receipt: $(cat "$LANES_OUT")"
+  fi
+  grep -q 'receipt failed under --lane-defer' "$LANES_ERR" ||
+    fail "#1397 AC2e: the failure must name --lane-defer: $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call b1397-norcpt
+  LANES_CFG_OVERRIDE="$LANES_CFG_OP" LANES_MODEL=builder-sol \
+    LANES_ARBITER_BIN="$T1397_FAIL_ARBITER" \
+    lanes_spawn b1397-rcptok --role builder --lane b1397-rcptok --parent director-x
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1397 AC2e: a non-deferred receipt failure must stay warn-only (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  grep -q '^OK pane=' "$LANES_OUT" ||
+    fail "#1397 AC2e: the non-deferred spawn still prints its OK line: $(cat "$LANES_OUT")"
+  # The initiator half of the same guarantee: ANY nonzero remote answer —
+  # the receipt failure above included — skips the initiator's lanes add.
+  T1397_SSH_SCENARIO=remote-die-stderr t1397_remote_spawn b1397-nodie
+  [[ "$T1397_RC" -ne 0 ]] ||
+    fail "#1397 AC2e: a failed remote spawn must answer nonzero (rc=$T1397_RC)"
+  [[ ! -s "$T1397_CALLS" ]] ||
+    fail "#1397 AC2e: the initiator must not lanes-add when the remote answers nonzero: $(cat "$T1397_CALLS")"
+  echo "PASS 1397-lanes AC2e: a failed deferred receipt adds no lane and answers 2"
+
   # AC3 — every builder registration failure is loud on the OK line but
   # never fails the spawn: rc 0, `OK pane=w:p1` still there (the pane is not
   # orphaned), ` lane=UNREGISTERED` ends the line, exactly one warning.
@@ -4860,6 +4972,37 @@ PY
     fail "#1397 M4 mutant survived: a moved row was not swept"
   fi
   echo "PASS 1397-lanes M4: dropping the machine+pane reap check goes RED"
+
+  # M5: --lane-defer forwarded for workers again — the wire flag alone mutes
+  # the execution host's own session_machine_ids check, so AC2d's "no
+  # --lane-defer in the delegated argv" assertion goes RED the moment the
+  # flag leaks back in.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-deferall \
+    '  [[ "$remote_lane_role" == builder ]] && remote_args+=("--lane-defer" "$host")' \
+    '  remote_args+=("--lane-defer" "$host")'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-deferall" \
+    T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_WMAP" \
+    t1397_remote_worker w1397-m5 --owner work-kairos
+  if ! grep -q -- '--lane-defer' "$T1397_SSH"; then
+    fail "#1397 M5 mutant survived: the worker spawn carried no --lane-defer"
+  fi
+  echo "PASS 1397-lanes M5: forwarding --lane-defer to a worker goes RED"
+
+  # M6: the initiator registers a remote worker — the harmful half of the
+  # review finding: the worker lane then lands on machine=<host key>, which
+  # AC2d's add-argv assertion rejects.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-workeradd \
+    '  if [[ "$rc" -eq 0 && "$remote_lane_role" == builder && -n "$remote_lane_name" ]]; then' \
+    '  if [[ "$rc" -eq 0 && -n "$remote_lane_name" ]]; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-workeradd" \
+    T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_WMAP" \
+    t1397_remote_worker w1397-m6 --owner work-kairos
+  if ! grep -qxF 'desktop' "$T1397_CALLS"; then
+    fail "#1397 M6 mutant survived: no worker lane was added on machine=desktop"
+  fi
+  echo "PASS 1397-lanes M6: registering a remote worker on the initiator goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then

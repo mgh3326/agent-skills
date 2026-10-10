@@ -449,17 +449,20 @@ unregistered, because a fleet worker must never become a global lane.
 
 The job.spawned meta records hub_lane/hub_lane_machine and `wrk reap
 --apply` removes the lane with `panewire lanes rm` only when `lanes ls`
-still shows the same machine and pane. For a remote --host NAME spawn the
-ssh-delegated wrk on the target cannot reach the hub — PUT /v1/lanes wants
-the operator credential, which stays on the initiating host (per-host
-machine-scoped tokens are the step-4 follow-up) — so the delegation passes
---lane-defer NAME and the remote wrk only RECORDS lane+machine in its
-receipt; the initiating host performs `lanes add` itself after the remote
-answers, with machine = the hosts.toml key it reached the target by (the
-key IS the target's hub machine id). The receipt lives with the job on the
-execution host — the only place `wrk reap` can verify the pane — and reap
-there removes the lane through the same machine+pane check; `lanes rm`
-being a hub call, any operator-credentialed host can also remove the row.
+still shows the same machine and pane. For a remote --host NAME BUILDER
+spawn the ssh-delegated wrk on the target cannot reach the hub — PUT
+/v1/lanes wants the operator credential, which stays on the initiating
+host (per-host machine-scoped tokens are the step-4 follow-up) — so the
+delegation passes --lane-defer NAME and the remote wrk only RECORDS
+lane+machine in its receipt; the initiating host performs `lanes add`
+itself after the remote answers, with machine = the hosts.toml key it
+reached the target by (the key IS the target's hub machine id). A remote
+worker gets no flag and no initiator-side add — the execution host runs
+the ordinary worker lookup against its own session_machine_ids. The
+receipt lives with the job on the execution host — the only place `wrk
+reap` can verify the pane — and reap there removes the lane through the
+same machine+pane check; `lanes rm` being a hub call, any
+operator-credentialed host can also remove the row.
 
 A worker's OK line ends with lane=LABEL@ID on a confirmed registration and
 otherwise omits lane=, the pre-#965 contract. A builder's OK line ALWAYS
@@ -2639,6 +2642,13 @@ arbiter_record_spawn_receipt() {
   # A pane cannot be rolled back once its agent start/prompt succeeded.  This
   # evidence write is therefore deliberately warning-only; job-get renders its
   # absence explicitly for downstream recovery rather than pretending success.
+  # #1397/(a) exception: under --lane-defer this receipt is the ONLY record of
+  # the lane the ssh initiator is about to `lanes add` — a lost write would
+  # leave a hub row no reap can ever attribute. A deferred spawn therefore
+  # answers nonzero on receipt failure instead: the remote leg's rc stops the
+  # initiator's add (and a 2 sits in the remote stop set, so the auto round
+  # ends rather than re-placing the job). The still-armed pane trap closes the
+  # pane; an untracked lane is never left behind.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc
   if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" "${TASK_ID:-}" "${HUB_LANE:-}" "${HUB_LANE_MACHINE:-}" <<'PY'
@@ -2669,6 +2679,10 @@ if hub_lane:
 print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
 PY
 )"; then
+    if [[ -n "${LANE_DEFER:-}" ]]; then
+      warn "arbiter job.spawned receipt preparation failed under --lane-defer; the deferred lane would be untrackable — failing the spawn so the initiator registers nothing: job_id=$JOB_ID pane_id=$PANE"
+      return 2
+    fi
     warn "arbiter job.spawned receipt preparation failed; spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
     hub_lane_orphan_remove
     return 0
@@ -2678,6 +2692,10 @@ PY
   receipt_rc=$?
   set -e
   if [[ "$receipt_rc" -ne 0 ]]; then
+    if [[ -n "${LANE_DEFER:-}" ]]; then
+      warn "arbiter job.spawned receipt failed under --lane-defer (exit $receipt_rc); the deferred lane would be untrackable — failing the spawn so the initiator registers nothing: job_id=$JOB_ID pane_id=$PANE"
+      return 2
+    fi
     warn "arbiter job.spawned receipt failed (exit $receipt_rc); spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
     hub_lane_orphan_remove
   fi
@@ -5959,19 +5977,17 @@ hub_lane_register() {
 # is decided by the caller).
 hub_lane_register_remote() {
   HUB_REMOTE_LANE=""
-  local host="$1" pane="$2" lane="$3" parent="$4" role="${5:-worker}"
+  local host="$1" pane="$2" lane="$3" parent="$4"
   local hub_url token_env cf_env panewire rc=0
   local args=()
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
   token_env="$(hub_lanes_credential 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
-  # A host without hub_url never opted into lanes; a remote worker stays
-  # silent there exactly like an unmapped local session does. A builder
-  # always names why its lane is missing — that is the #1397 fail-loud rule.
+  # Only builders reach here — a remote worker keeps the #965 contract and
+  # this host never names its lane. A builder always names why its lane is
+  # missing — that is the #1397 fail-loud rule.
   if [[ -z "$hub_url" ]]; then
-    if [[ "$role" == builder ]]; then
-      warn "hub lane not registered for remote host '$host' (hub_url unset in hosts.toml [hub])"
-    fi
+    warn "hub lane not registered for remote host '$host' (hub_url unset in hosts.toml [hub])"
     return 0
   fi
   if [[ -z "$token_env" ]]; then
@@ -5987,11 +6003,7 @@ hub_lane_register_remote() {
     return 0
   fi
   if [[ -z "$parent" ]]; then
-    if [[ "$role" == builder ]]; then
-      warn "hub lane not registered for remote host '$host' (--parent is unset; the builder lane's parent is required)"
-    else
-      warn "hub lane not registered for remote host '$host' (--owner is unset; the spawning builder's lane is required as parent)"
-    fi
+    warn "hub lane not registered for remote host '$host' (--parent is unset; the builder lane's parent is required)"
     return 0
   fi
   panewire="${PANEWIRE_BIN:-panewire}"
@@ -6910,13 +6922,18 @@ spillover_remote_spawn() {
     echo "wrk: failed to copy brief to remote host '$host' (scp rc=$rc)" >&2
     return "$(spillover_transport_rc "$rc")"
   fi
-  # #1397/(a): the lane a remote spawn leaves is registered by THIS host, not
-  # the execution host — the delegated wrk gets --lane-defer <host key> so it
-  # records hub_lane/hub_lane_machine in its job.spawned receipt without
-  # calling panewire, and this host runs `lanes add` itself after the remote
-  # answers rc 0 (machine = the hosts.toml key, the host's hub machine id).
+  # #1397/(a): the lane a remote BUILDER spawn leaves is registered by THIS
+  # host, not the execution host — the delegated wrk gets --lane-defer <host
+  # key> so it records hub_lane/hub_lane_machine in its job.spawned receipt
+  # without calling panewire, and this host runs `lanes add` itself after the
+  # remote answers rc 0 (machine = the hosts.toml key, the host's hub
+  # machine id). A remote WORKER gets neither the flag nor the add: it keeps
+  # the #965 contract — the execution host checks its own
+  # session_machine_ids and registers there, or stays unregistered — because
+  # a fleet worker must never land on the hub as a global lane named after
+  # the initiating host's key.
   # The lane name/parent come from the forwarded args: a builder registers
-  # --lane under --parent; a worker registers its label under --owner.
+  # --lane under --parent.
   local remote_lane_role=worker remote_lane_name="" remote_lane_owner="" remote_lane_builder="" remote_lane_parent="" remote_label=""
   local arg saw_workspace=0 i=0 args=("$@")
   while [[ "$i" -lt "${#args[@]}" ]]; do
@@ -6939,7 +6956,11 @@ spillover_remote_spawn() {
   else
     remote_lane_name="$remote_label" remote_lane_route_parent="$remote_lane_owner"
   fi
-  local remote_args=(env "HERDR_SESSION=$session" wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local "--lane-defer" "$host")
+  local remote_args=(env "HERDR_SESSION=$session" wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
+  # Builders only — forwarding the flag to a worker would mute the execution
+  # host's own session-machine_ids check while this host then named the
+  # worker's lane on machine=<host key>.
+  [[ "$remote_lane_role" == builder ]] && remote_args+=("--lane-defer" "$host")
   i=0
   while [[ "$i" -lt "${#args[@]}" ]]; do
     arg="${args[$i]}"
@@ -6976,19 +6997,20 @@ spillover_remote_spawn() {
   # A failed remote spawn must answer with the remote's own words: stderr is
   # relayed verbatim and non-OK stdout follows it onto the local stderr.
   spillover_relay_remote_err "$remote_err"
-  # #1397/(a): the remote pane is up — now register its lane on the hub from
-  # THIS host (machine = the hosts.toml key, i.e. the host's hub machine id)
-  # and settle the OK line's lane= field before it prints. The remote wrk
-  # marked the lane deferred in its receipt; the field it printed is replaced
-  # with the outcome here: lane=L@HOST on a confirmed add, lane=UNREGISTERED
-  # for a builder whose add skipped/failed, and no field for a worker.
-  if [[ "$rc" -eq 0 && -n "$remote_lane_name" ]]; then
+  # #1397/(a): the remote builder pane is up — now register its lane on the
+  # hub from THIS host (machine = the hosts.toml key, i.e. the host's hub
+  # machine id) and settle the OK line's lane= field before it prints. The
+  # remote wrk marked the lane deferred in its receipt; the field it printed
+  # is replaced with the outcome here: lane=L@HOST on a confirmed add, else
+  # lane=UNREGISTERED. A remote worker never enters this block — its own
+  # lane= field (or its absence) passes through untouched.
+  if [[ "$rc" -eq 0 && "$remote_lane_role" == builder && -n "$remote_lane_name" ]]; then
     local remote_pane="" lane_field="" lane_out
     remote_pane="$(awk '/^OK pane=/{ for (i = 1; i <= NF; i++) if (substr($i, 1, 5) == "pane=") { print substr($i, 6); exit } }' "$out")"
-    hub_lane_register_remote "$host" "$remote_pane" "$remote_lane_name" "$remote_lane_route_parent" "$remote_lane_role"
+    hub_lane_register_remote "$host" "$remote_pane" "$remote_lane_name" "$remote_lane_route_parent"
     if [[ -n "$HUB_REMOTE_LANE" ]]; then
       lane_field="lane=$remote_lane_name@$host"
-    elif [[ "$remote_lane_role" == builder ]]; then
+    else
       lane_field="lane=UNREGISTERED"
     fi
     lane_out="$(mktemp)"

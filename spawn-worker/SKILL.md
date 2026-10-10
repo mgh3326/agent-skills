@@ -779,14 +779,16 @@ wake_wait = 300
   매핑되지 않은 워커는 여전히 경고 한 번 후 미등록 착지다(fleet worker가 global lane이
   되면 안 되므로). 빌더의 OK 줄은 항상 `lane=<lane>@<machine>` 또는 `lane=UNREGISTERED`를
   단다; 기본은 warn-only이고 `WRK_LANE_STRICT=1`이면 pane 기동·OK 출력 후 rc 82로
-  답한다(pane은 그대로 유효). 열린 job 중 빌더 레인 또는 그 parent가 `panewire lanes ls`에
-  없는 것은 `wrk lanes-missing`이 읽기 전용으로 나열한다.
-- **원격 `--host NAME` 스폰의 레인(#1397)**: 실행 호스트는 operator credential이 없으므로
-  `lanes add`를 스폰을 시킨 호스트가 한다 — 위임된 wrk는 `--lane-defer <host key>`를 받아
-  panewire 호출 없이 `hub_lane`/`hub_lane_machine`만 자기 `job.spawned` receipt에 기록하고,
+  답한다(pane은 그대로 유효). `owner_lane`이 기록된 열린 job(worker 포함) 중 그 레인 또는
+  parent가 `panewire lanes ls`에 없는 것은 `wrk lanes-missing`이 읽기 전용으로 나열한다.
+- **원격 `--host NAME` builder 스폰의 레인(#1397)**: 실행 호스트는 operator credential이
+  없으므로 `lanes add`를 스폰을 시킨 호스트가 한다 — 위임된 wrk는 `--lane-defer <host key>`를
+  받아 panewire 호출 없이 `hub_lane`/`hub_lane_machine`만 자기 `job.spawned` receipt에 기록하고,
   시작 호스트는 원격이 rc 0으로 답한 뒤 `lanes add`를 직접 친다(machine = 그 호스트의
-  hosts.toml 키 — 그 키가 곧 허브 머신 id다). receipt는 job과 함께 실행 호스트에 있으므로
-  `wrk reap`은 그곳에서 pane 검증을 거쳐 같은 machine+pane 가드로 `lanes rm`을 친다.
+  hosts.toml 키 — 그 키가 곧 허브 머신 id다). 이 경로는 빌더 전용이다 — 원격 worker에게는
+  `--lane-defer`도 시작 호스트의 `lanes add`도 없고, 실행 호스트가 자신의
+  `session_machine_ids`로 보통의 worker 조회를 한다. receipt는 job과 함께 실행 호스트에
+  있으므로 `wrk reap`은 그곳에서 pane 검증을 거쳐 같은 machine+pane 가드로 `lanes rm`을 친다.
 - `quota_gate = "local"`(#1138)은 그 local-only 상태의 명시적 opt-out이다 — M1 같은
   lanes-only 호스트가 쓴다. `hub_url`이 있고 `hub_token_env`가 없는 `[hub]`는 매 spawn마다
   게이트가 건너뛰어지고 local scopefuel gate만 적용된다는 경고를 stderr에 정확히 한 번
