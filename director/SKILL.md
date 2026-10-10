@@ -128,6 +128,12 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
   이 철자의 명시 `--effort max` 만 연다(다른 빌더 철자와 E6 max 철자는 그대로 닫힌다).
 - **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
   `builder-devin-max`)은 무료이므로 적극 쓴다.
+- **devin fusion 철자는 유료·Claude 계열 worker/tester 전용이다**(2026-10-10 운영자
+  결정, hk 1380): `devin-fusion-opus55`·`devin-fusion-sonnet55`는 미측정 B 로 T1/T2 에 한정하고
+  hk 1382 의 tester/checker 시험 대상이다 — 게이트는 devin-swe2 가 아니라 각자의
+  gate_policy 항목(anthropic family)으로 판정하고, `--role builder` 는 두 철자를 거부한다.
+  Claude 계열이라 **claude 빌더 산출물의 tester 로는 못 쓴다**(동일 계열 예외는
+  tester 급 S+ 부터) — devin·codex contributor 의 산출물에만 tester 로 선다.
 - **devin(A+)은 T3·S 의 단독 구현자·단독 tester 가 되지 않는다** —
   `spawn-worker` §2-2 급표 행의 규칙 그대로다.
 - **현재 출력(예시) — claude**: Opus·Sonnet·Haiku 가 하나의 주간 창을 나누므로

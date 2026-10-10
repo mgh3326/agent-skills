@@ -99,6 +99,7 @@ builder 가 워커·tester 스폰 없이 직접 구현하는 **단독 모드**�
 | `oc-solar4` | **B** 실측 확정(reps `id=699`·`700`·`702`: 구조·닫힌 어휘 위반 0, 원문 충실도는 1패스 실패·반복 개정으로 도달, 판단·의미는 3건 모두 약함). `T1` 한정·tester 금지를 유지한다. **산출물 자체가 판단인 과업은 배정하지 않는다**(감사 결론·리스크 분류·채택 여부 판정 등) — 검토가 뒤따르는 기계 검증 가능한 변환·태깅·형식화는 허용한다. 운용은 기계 검사 가능한 규칙 + 자력 개정 허용이 최적이며, **1패스 산출은 신뢰하지 않는다**. 브리프에 '승인 대기 없이 완주'를 명시한다(승인 대기 정지 1회 실측). 브리프에는 §3의 **rate limit 대응 절**(429·rate limit 시 지수 백오프, 막히면 중단·보고)도 반드시 포함한다. 상시 배정은 하지 않는다. 장기 정본과 등급 조정은 scopefuel을 따른다. |
 | `devin-glm52`·`devin-swe17` | **등재 보류** — 사유: SWE-2 대비 우위 없음(구세대·전세대이고 컨텍스트도 작다). 프로필은 이미 있으니 필요해지면 reps 만 돌리면 된다 — 배제가 아니라 **측정 비용의 우선순위** 문제다. devin-swe2 와 동일한 무인 argv(모델명만 `glm-5-2`·`swe-1-7`). scopefuel `devin` 풀 공유. |
 | `devin-ds41` | **미측정 → T1/T2** (유료 $0.22/1M in, 벤치 TB2.1 90.6). devin-swe2 와 동일한 무인 argv(모델명만 `deepseek-v4-1-flash-high`). reps 3건으로 급 확정. scopefuel `devin` 풀 공유 — 유료 사용 시 태스크 note 에 모델·급을 남긴다(사후 비용 귀속). |
+| `devin-fusion-opus55`·`devin-fusion-sonnet55` | **미측정 B → T1/T2 worker/tester 전용** (유료, Claude 계열 — hk 1382 의 tester/checker 시험 대상; 2026-10-10 운영자 결정으로 09-14 유료 Devin 미사용 선 대체; scopefuel catalog 5e9177b 의 unmeasured policy launch grade 가 B). devin-swe2 와 동일한 무인 argv에 모델명만 `fusion-claude-opus-5-5-high-sidekick-swe-2-medium`·`fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium`. 게이트는 `devin-swe2` 가 아니라 각자의 gate_policy 항목으로 판정하고 family 는 anthropic — **claude 빌더 산출물의 tester 로는 못 쓴다**(동일 계열이라 통과하지 않고, 동일 계열 예외는 tester 급 S+ 부터라 B 인 이 두 철자에는 해당 없음). devin·codex contributor 에는 교차 계열 tester 로 선다. scopefuel `devin` 풀 공유. `--role builder` 거부 — fusion 빌더 사용은 hk 1382 이후 결정한다. |
 | `devin-swe2-medium`·`devin-swe2-max`·`devin-ds41-max` | `devin-swe2-medium` = **A**, `devin-swe2-max`·`devin-ds41-max` = **미측정(C) → T1/T2** (#635 effort 변형 — devin 에서 effort 는 모델 id 안에 있고 `--effort` 플래그는 없다. 런그별 별도 프로필, high 런그의 A+ 는 상속하지 않는다). swe2-medium 의 A 는 scopefuel 정본 그대로다(2026-09-27 운영자 결정, hk:doc 5177 item 2 — GRADE_TABLE scopefuel `1aa57ec5`, catalog `51322a09`). devin-swe2 와 동일한 무인 argv에 모델명만 `swe-2-medium`·`swe-2-max`·`deepseek-v4-1-flash-max`. **swe-2 medium·max 는 무료** — #594 급 측정의 기본 런그. `devin-swe2-medium`·`devin-swe2-max` 는 `--role builder` 도 받는다(builder-devin 의 effort 경로). #666 부터 런그별 빌더 철자도 있다 — `builder-devin-medium`·`builder-devin-max`(동일 argv)와 유료 `builder-ds41`·`builder-ds41-max`(운영자 ds41-builder 정책; `devin-ds41`·`devin-ds41-max` 철자는 계속 worker 전용). scopefuel `devin` 풀 공유, reps 로 급 확정. |
 
 급표 각주 (2026-09-14 운영자 결정 `free-lane-aggressive-use-3`·`devin-pro-paid-models`):
@@ -107,7 +108,7 @@ builder 가 워커·tester 스폰 없이 직접 구현하는 **단독 모드**�
 - 🔴 **director T1 분리 의무(실효 조건)**: "T1 작업이 적어서 무료 풀이 안 돌아간다"를 막기 위해, director 는 태스크를 낼 때 T1 으로 쪼갤 수 있는 부분을 분리한다(문서·픽스처·형식화·테스트 추가는 본 작업에서 떼어낼 수 있는 경우가 많다). 쪼갠 결과를 태스크 note 에 1행으로 기록한다.
 - **Solar 기본 배정 밴드**(판단 아님·기계 검증 가능): 형식 변환·픽스처 생성·문서 정리·재구성·닫힌 어휘 태깅·스키마 적용 → 기본 `oc-solar4`. 제외(산출물 자체가 판단·tester 역할)는 위 표의 제외 규칙 그대로.
 - 🔴 **무료 풀 재판단 트리거**: Solar Free 플랜 변경·devin 쿼타 소진(무료 종료, ~10/10) 시 이 배정을 재판단한다.
-- 🔴 **고가대 등재 금지**: Opus·Fable·Astra·Sonnet·Kimi 는 등재하지 않는다 — claude·codex 구독과 **중복 지출**이기 때문이다.
+- 🔴 **고가대 등재 제한**: Opus·Fable·Astra·Sonnet·Kimi 는 등재하지 않는다 — claude·codex 구독과 **중복 지출**이기 때문이다. 예외는 2026-10-10 운영자 결정(hk 1380)이 연 유료 fusion 2종 `devin-fusion-opus55`·`devin-fusion-sonnet55` 뿐이다 — 이 결정이 위의 09-14 `devin-pro-paid-models` 유료 Devin 미사용 선을 이 두 철자에 대해 대체한다(Fable·Astra fusion 은 여전히 등재하지 않는다).
 - 🔴 **devin 쿼타 가시성**: 일간 잔량은 devin 배너에서 읽을 수 있다("Pro · 100% remaining (resets in Nh Nm)" 를 배너가 직접 렌더 — scopefuel 확장은 별도 태스크). 주간은 콘솔 전용이라 자동 감지 불가 — `used_pct=0` 고정 표기를 유지한다. 쿼타 소진 시 세션 정지 자체가 소진 신호다(조용히 저하되지 않아 탐지 가능).
 - 🔴 **주간 제약 풀의 tester 배정**(2026-09-14): `grok`·`kimi` 등 주간 리셋 풀은 잔여 30% 미만이면 tester 배정을 금지하는 것이 아니라 **조건부로 허용**한다 — ① **단일 라운드**로 한정 ② **중간 인수 의무**(검증 도중 소진돼도 다음 tester 가 이어받을 수 있게 진행분을 남긴다). 30% 는 게이트가 아니라 **인수 트리거**다. 5h 풀(`codex`·`claude`)은 몇 시간이면 돌아오므로 면제한다. 이유: 주간 풀은 소진되면 그날 안에 돌아오지 않아, 장시간 검증 도중 소진은 대체가 아니라 주 단위 공백이 된다(근거: 2026-09-14 grok 주간 70%→100% 하루 소진으로 검증 중 tester blocked). 이 **단일 라운드 한정은 최종 통합 T3 tester 자리에는 적용하지 않는다** — 그 자리는 §2-6 의 일반 라운드 캡이 필요하다.
 
@@ -285,7 +286,7 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
    - **실패도 데이터다**: `completed=0` 을 숨기지 마라. 라운드가 3번 돌았으면 `rounds=3` 이다. 좋아 보이려고 반올림하거나 축소 기록하는 순간 급표가 오염된다.
 4. **재배치는 비자동**: `reps` 데이터는 관측 근거일 뿐, 프로필의 급 이동은 운영자의 판단이다. 표본 1건 성공만으로 급을 즉시 올리지 마라(추정 프로필은 한 단계 보수적 적용 원칙 유지).
 5. **effort 별 통계 연동**: effort 별 실사용 및 실측 데이터는 §2-2와 같이 `events` payload의 `launch_profile` 및 `scopefuel reps` 규칙(ROB-1218)을 상호 참조하여 집계·확인한다.
-6. **devin 계열 reps 는 프로필별 분리 기록**: `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`devin-glm52`·`devin-swe17`·`devin-ds41`·`devin-ds41-max` — 같은 `devin` 풀을 공유해도 모델·effort 런그별로 남긴다.
+6. **devin 계열 reps 는 프로필별 분리 기록**: `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`devin-glm52`·`devin-swe17`·`devin-ds41`·`devin-ds41-max`·`devin-fusion-opus55`·`devin-fusion-sonnet55` — 같은 `devin` 풀을 공유해도 모델·effort 런그별로 남긴다.
 
 <!-- T745-T3-SPLIT -->
 ### 2-6. T3 분할(T3 split) — 불변식 영향으로 나눈다, 파일 종류로 나누지 않는다

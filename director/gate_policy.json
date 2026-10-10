@@ -156,10 +156,10 @@
   "expires_at": "2026-10-03T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "f338b9866dbc320824576c70220dd8d89af5076e841058b7e5d7e2ff88a600a8",
-    "bin/wrk": "4d96a786268eb831c63e1f4c5e17c5abb9764072b55e8b84f09340c7861c1af3",
+    "bin/wrk": "cfd58e17bbb724a42f78f5ed233a2ab4b0402675b387ccccc5d9a2be250dd618",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
-    "director/SKILL.md": "bb1cda3c619be6679a6366e411ed277e32e1a5c2ba6fe6bab25e3b1df02aaa64",
-    "spawn-worker/SKILL.md": "b5f533533e41eb3614e2b6d69c75086121490e4b4e210e4ba2d8f6ea5655104b"
+    "director/SKILL.md": "cb11f034731285666bd6fc412c3a7f99ecee2f01a836fa07bbf77cfdc932d0a8",
+    "spawn-worker/SKILL.md": "07b9c31321dff9e797fa5e70bc08391f85a4d048ba5e9ec7885dec8ba9553988"
   },
   "profiles": {
     "agy-flash": {
@@ -1094,6 +1094,42 @@
         "T2"
       ]
     },
+    "devin-fusion-opus55": {
+      "default_effort": "",
+      "family": "anthropic",
+      "grades": {
+        "": "B"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+      "model": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "devin-fusion-sonnet55": {
+      "default_effort": "",
+      "family": "anthropic",
+      "grades": {
+        "": "B"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+      "model": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "devin-glm52": {
       "default_effort": "",
       "family": "zhipu",
@@ -1779,7 +1815,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-09.0",
+  "revision": "2026-10-10.1",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
@@ -1841,6 +1877,10 @@
     "spawn-worker/SKILL.md": {
       "id": "section 2-1,2-2,2-4",
       "scope": "T floor, grade, family rules"
+    },
+    "task/1380": {
+      "id": 1380,
+      "scope": "devin-fusion-opus55/sonnet55 paid worker+tester spellings in the Claude family; operator 2026-10-10 Devin paid lane supersedes the 09-14 no-paid-Devin line; grade B per the merged scopefuel catalog 5e9177b (unmeasured, policy launch grade B) pending hk 1382 trial reps"
     },
     "task/660": {
       "id": 660,

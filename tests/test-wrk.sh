@@ -4460,6 +4460,12 @@ grep -qx 'devin-ds41' <<<"$profiles_out"
 grep -qx 'devin-swe2-medium' <<<"$profiles_out"
 grep -qx 'devin-swe2-max' <<<"$profiles_out"
 grep -qx 'devin-ds41-max' <<<"$profiles_out"
+# hk 1380: the paid fusion spellings (operator decision 2026-10-10) must be
+# spawnable profiles — worker/tester-only, no builder-* variants.
+grep -qx 'devin-fusion-opus55' <<<"$profiles_out"
+grep -qx 'devin-fusion-sonnet55' <<<"$profiles_out"
+if grep -qx 'builder-fusion-opus55' <<<"$profiles_out"; then exit 1; fi
+if grep -qx 'builder-fusion-sonnet55' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
 if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 
@@ -4498,6 +4504,7 @@ profiles=(
   "devin-swe2:devin-swe2"
   "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
   "devin-swe2-medium:devin-swe2" "devin-swe2-max:devin-swe2" "devin-ds41-max:devin-swe2"
+  "devin-fusion-opus55:devin-fusion-opus55" "devin-fusion-sonnet55:devin-fusion-sonnet55"
   "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
   "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
   "codex-max:codex-max" "codex-terra:codex-terra-max"
@@ -5826,7 +5833,9 @@ echo "PASS devin-swe2 worker kind/argv/no-effort snapshot + builder-pilot admiss
 # the effort rungs as named profiles (effort lives inside the model id), same
 # argv skeleton and same --effort rejection.
 for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepseek-v4-1-flash-high" \
-  "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2-max" "devin-ds41-max:deepseek-v4-1-flash-max"; do
+  "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2-max" "devin-ds41-max:deepseek-v4-1-flash-max" \
+  "devin-fusion-opus55:fusion-claude-opus-5-5-high-sidekick-swe-2-medium" \
+  "devin-fusion-sonnet55:fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium"; do
   devin_profile="${devin_pair%%:*}"
   devin_model="${devin_pair#*:}"
   : >"$TMP/herdr.log"
@@ -5842,7 +5851,7 @@ for devin_pair in "devin-glm52:glm-5-2" "devin-swe17:swe-1-7" "devin-ds41:deepse
     fail "$devin_profile run argv must not contain effort"
   expect_exit 2 spawn_base "$devin_profile" --effort high
 done
-echo "PASS devin-glm52/devin-swe17/devin-ds41 + #635 effort-variant worker kind/argv/no-effort snapshots"
+echo "PASS devin-glm52/devin-swe17/devin-ds41 + #635 effort-variant + hk 1380 fusion worker kind/argv/no-effort snapshots"
 
 # #635 AC2: an unknown effort token is still refused on the new spellings —
 # the generic unknown-effort die fires before the devin no-effort guard.
@@ -9675,12 +9684,29 @@ for rejected in codex-terra codex-luna oc-solar4 devin-ds41 devin-ds41-max; do
   set -e
   [[ "$rejected_rc" -eq 2 ]] ||
     fail "--role builder must still reject $rejected with exit 2, got $rejected_rc: $rejected_out"
-  for named in builder-devin builder-devin-medium builder-devin-max builder-ds41 builder-ds41-max builder-grok builder-kimi builder-luna builder-sonnet devin-glm52 devin-swe17 devin-ds41 devin-ds41-max; do
+  for named in builder-devin builder-devin-medium builder-devin-max builder-ds41 builder-ds41-max builder-grok builder-kimi builder-luna builder-sonnet devin-glm52 devin-swe17 devin-ds41 devin-ds41-max devin-fusion-opus55 devin-fusion-sonnet55; do
     grep -q "$named" <<<"$rejected_out" ||
       fail "the --role builder refusal must list $named: $rejected_out"
   done
 done
 echo "PASS builder-pilot-allowlist-rejects-outsiders-with-named-message"
+
+# hk 1380: the fusion spellings are worker/tester-only — --role builder refuses
+# each with its own named refusal citing the pending hk 1382 decision (the
+# generic allowlist message must not be what speaks).
+for fusion_rejected in devin-fusion-opus55 devin-fusion-sonnet55; do
+  set +e
+  fusion_rejected_out="$(spawn_base "$fusion_rejected" --role builder --lane builder-lane --parent parent-lane --job "builder-reject-$fusion_rejected" --t T1 2>&1)"
+  fusion_rejected_rc=$?
+  set -e
+  [[ "$fusion_rejected_rc" -eq 2 ]] ||
+    fail "--role builder must reject $fusion_rejected with exit 2, got $fusion_rejected_rc: $fusion_rejected_out"
+  grep -qF -e "--role builder rejects '$fusion_rejected': the devin fusion spellings are worker/tester-only" <<<"$fusion_rejected_out" ||
+    fail "$fusion_rejected lost its named fusion refusal: $fusion_rejected_out"
+  grep -q 'hk 1382' <<<"$fusion_rejected_out" ||
+    fail "$fusion_rejected refusal must cite the pending hk 1382 decision: $fusion_rejected_out"
+done
+echo "PASS builder-allowlist-rejects-fusion-spellings-with-named-message"
 
 # R19a keeps the historical captain payload as an inbox-consumer regression
 # input, while the new builder claim must be the exact bytes emitted by the
