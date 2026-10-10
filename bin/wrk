@@ -41,6 +41,13 @@ WRK_EXIT_LOCAL_SPAWN_DISABLED=80
 # wake failed), not an admission refusal — under --host auto it is not in the
 # stop set, so the round moves on to the next candidate.
 WRK_EXIT_WAKE_FAILED=81
+# #1397: a --role builder spawn whose hub lane could not be registered answers
+# 82 when the caller opted into strict lane reporting (WRK_LANE_STRICT=1).
+# The pane is up and the OK line already carries lane=UNREGISTERED — the code
+# exists so automation can tell "spawned but unrouted" apart from a clean
+# spawn. It joins the remote stop set with 2/70/74/75: the pane exists, so
+# moving the round to another host would double-spawn the job.
+WRK_EXIT_LANE_UNREGISTERED=82
 # kimi-k3-low: KIMI_CODE_HOME for the low-thinking-effort clone maintained by
 # bin/kimi-clone-home (config.toml [thinking] effort=low; real ~/.kimi-code
 # untouched). Scoped to only this profile below, not kimi-k3/kimi-k27.
@@ -114,7 +121,7 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|round|reap|find|name-sync|profiles|hosts|heavy> [options]
+Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
@@ -126,6 +133,7 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|find|name-sync|profiles|hosts|
   wrk round verdict JOB --file PATH
   wrk round status JOB
   wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
+  wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
@@ -403,41 +411,76 @@ line then ends with via=herdr-fallback.
                      opt-in.
   -h, --help         show this usage
 
-Hub lane registration (#965): a --role worker spawn whose effective herdr
-session (WRK_SENTINEL_HERDR_SESSION, else HERDR_SESSION, else the herdr
-default) has an entry in hosts.toml's [hub] session_machine_ids registers a
-lane for the pane on that session's daemon —
-`panewire lanes add LABEL --machine ID --pane PANE --parent OWNER` with the
-[hub] credentials: hub_url plus lanes_token_env when set, else hub_token_env
-(hub_cf_env optional). The values are file paths panewire opens; wrk scans
-a lanes token file for the HUB_MACHINE_ID value only — to skip a
-registration the hub would refuse when it differs from the session's
-mapped machine — and never prints file contents (a malformed id warns
-once without the value). lanes_token_env (#1037) is a node-scoped token that
-may reach only the lanes routes: this registration, reap's `lanes rm`, and
-the `lanes ls` confirmation. No other hub path (quota gate, placement,
-spill-over wake, hub spawn) reads it, and a [hub] section with hub_url and
-lanes_token_env but no hub_token_env does not opt into the hub quota gate —
-only a configured hub_token_env switches that on. That skipped gate is never
-silent: every spawn warns once that only the local scopefuel gate applies
-unless quota_gate = "local" is set, the deliberate opt-out a lanes-only host
-uses instead (any other quota_gate value — and "local" combined with
-hub_token_env — is a config error that refuses the spawn). The OK line then ends
-with lane=LABEL@ID and the job.spawned meta records
-hub_lane/hub_lane_machine; `wrk reap --apply` removes the lane with
-`panewire lanes rm`. An unmapped session or a missing --owner warns once
-and spawns unregistered — as does a panewire failure; the spawn never fails
-over it and builder lanes are never touched (they stay the director's).
-The label becomes the lane name verbatim, so panewire's own lane rule
-^[a-z0-9-]{1,32}$ applies on top of wrk's: a label containing an underscore
-is a valid wrk label but not a valid lane name — on a mapped session such a
-spawn warns once and lands unregistered (#1010). `panewire lanes-audit`
-lists any leftover rows.
+Hub lane registration (#965, extended to builders by #1397): a --role worker
+or --role builder spawn registers a lane row on the hub so the pane's events
+have somewhere to route —
+`panewire lanes add NAME --machine ID --pane PANE --parent PARENT` with the
+[hub] credentials: hub_url plus a lanes credential of lanes_token_env when
+set, else operator_token_env, else hub_token_env (hub_cf_env optional). The
+values are file paths panewire opens; wrk scans a lanes token file for the
+HUB_MACHINE_ID value only — to skip a registration the hub would refuse when
+it differs from the target machine — and never prints file contents (a
+malformed id warns once without the value). lanes_token_env (#1037) is a
+node-scoped token that may reach only the lanes routes: this registration,
+reap's `lanes rm`, the `lanes ls` confirmation, and `wrk lanes-missing`.
+No other hub path (quota gate, placement, spill-over wake, hub spawn) reads
+it, and a [hub] section with hub_url and lanes_token_env but no
+hub_token_env does not opt into the hub quota gate — only a configured
+hub_token_env switches that on. That skipped gate is never silent: every
+spawn warns once that only the local scopefuel gate applies unless
+quota_gate = "local" is set, the deliberate opt-out a lanes-only host uses
+instead (any other quota_gate value — and "local" combined with
+hub_token_env — is a config error that refuses the spawn).
+
+What gets registered differs by role. A worker registers NAME=label on the
+machine its effective herdr session (WRK_SENTINEL_HERDR_SESSION, else
+HERDR_SESSION, else the herdr default) maps to in hosts.toml's [hub]
+session_machine_ids, parented on --owner. A builder (#1397) registers
+NAME=--lane parented on --parent — the route job.escalate and job.joined
+take — on the machine the same map gives when the session is mapped, else
+the host's own [hub] machine_id, this host's hub machine id (the id a
+remote spawner names the host by in its hosts.toml). The machine_id
+fallback is builder-only: an unmapped worker still warns once and spawns
+unregistered, because a fleet worker must never become a global lane.
+
+The job.spawned meta records hub_lane/hub_lane_machine and `wrk reap
+--apply` removes the lane with `panewire lanes rm` only when `lanes ls`
+still shows the same machine and pane. For a remote --host NAME spawn the
+ssh-delegated wrk on the target cannot reach the hub — PUT /v1/lanes wants
+the operator credential, which stays on the initiating host (per-host
+machine-scoped tokens are the step-4 follow-up) — so the delegation passes
+--lane-defer NAME and the remote wrk only RECORDS lane+machine in its
+receipt; the initiating host performs `lanes add` itself after the remote
+answers, with machine = the hosts.toml key it reached the target by (the
+key IS the target's hub machine id). The receipt lives with the job on the
+execution host — the only place `wrk reap` can verify the pane — and reap
+there removes the lane through the same machine+pane check; `lanes rm`
+being a hub call, any operator-credentialed host can also remove the row.
+
+A worker's OK line ends with lane=LABEL@ID on a confirmed registration and
+otherwise omits lane=, the pre-#965 contract. A builder's OK line ALWAYS
+states its lane outcome: lane=LANE@ID on a confirmed registration, else
+lane=UNREGISTERED — plus one warning naming the reason (unmapped session
+and no machine_id, missing --parent, missing hub_url or credential,
+malformed machine id or lane name, panewire failure). The default stays
+warn-only because the pane is up; WRK_LANE_STRICT=1 exits 82 after the OK
+line so automation can tell "spawned but unrouted" from a clean spawn —
+and on a remote leg that 82 stops the auto round instead of re-placing
+the job on the next host. `wrk lanes-missing` is the matching audit: a
+read-only listing of open jobs whose owner lane or its parent is absent
+from `panewire lanes ls`.
+
+The lane name is validated against panewire's own rule ^[a-z0-9-]{1,32}$
+before it may reach argv: a worker label or builder --lane containing an
+underscore is a valid wrk name but not a valid lane name, so such a spawn
+warns once and lands unregistered (#1010). `panewire lanes-audit` lists
+any leftover rows.
 
 session_machine_ids is for NON-fleet herdr sessions only — for example M1's
 default session, served by its own panewire daemon. Mapping a fleet session
 is not a supported use: it registers every fleet worker as a global lane for
-no benefit.
+no benefit. A builder whose session is the fleet default relies on [hub]
+machine_id instead.
 
 Admission control (ROB-1199): after the scopefuel quota gate passes, wrk claims
 the job and records its quota-pool execution in arbiter. arbiter resolves the
@@ -2635,6 +2678,11 @@ PY
 # failed removal is left for `panewire lanes-audit`.
 hub_lane_orphan_remove() {
   [[ -n "${HUB_LANE:-}" ]] || return 0
+  # #1397/(a): under --lane-defer this host never added the row — the ssh
+  # initiator did. A receipt failure here must not reach for `lanes rm`
+  # (the row may not even exist yet); the initiator's lanes-missing audit
+  # and lanes-audit own cleanup instead.
+  [[ -z "${LANE_DEFER:-}" ]] || return 0
   local lane="$HUB_LANE" machine="$HUB_LANE_MACHINE"
   HUB_LANE="" HUB_LANE_MACHINE=""
   warn "hub lane '$lane' was registered but the job.spawned receipt was not written — deregistering it"
@@ -5686,38 +5734,88 @@ PY
 # builder stalled until the desk relayed by hand). The session→machine map is
 # hosts.toml's [hub] session_machine_ids; the effective session is
 # WRK_SENTINEL_HERDR_SESSION, else HERDR_SESSION, else the herdr default.
+# #1397: --role builder joins this path. A builder NEEDS its own lane with a
+# parent — job.joined and job.escalate route to the owner lane's parent, so
+# an unregistered builder loses exactly the events the parent waits on
+# (workers get by without one: the hub falls back to the node heartbeat's
+# active jobs). The builder lane is --lane, parented on --parent; its machine
+# is the mapped session daemon when the effective session is in the map, else
+# [hub] machine_id — this host's own hub machine id, the id a remote spawner
+# names the host by in its hosts.toml. A fleet session must still never be
+# mapped (#994), and workers keep the map-only rule — a fleet worker must not
+# become a global lane — so machine_id is builder fallback only.
 # Runs only once the pane is provably up, and before the spawn receipt so
 # hub_lane/hub_lane_machine land in the same job meta as task_id/keep.
-# Best-effort at every step: an unmapped session, a missing --owner, absent
-# hub credentials or a panewire refusal warn once and leave the spawn
-# standing — a missing lane is the pre-#965 behavior, not a new failure, so
-# this never fails the spawn and never retries silently. Builder spawns never
-# reach here: a builder's lane stays the director's. Sets HUB_LANE and
-# HUB_LANE_MACHINE for the receipt payload and the OK line.
+# Best-effort at every step: an unmapped session, an unconfigured machine, a
+# missing --owner, absent hub credentials or a panewire refusal warn once and
+# leave the spawn standing — a missing lane is the pre-#965 behavior, not a
+# new failure, so this never fails the spawn and never retries silently.
+# Sets HUB_LANE and HUB_LANE_MACHINE for the receipt payload and the OK line;
+# the caller turns an empty HUB_LANE on a builder into lane=UNREGISTERED and,
+# under WRK_LANE_STRICT=1, exit 82 — which is why every builder early-return
+# here warns exactly once.
 hub_lane_register() {
   HUB_LANE="" HUB_LANE_MACHINE=""
-  [[ "$ROLE" == worker ]] || return 0
-  local session raw machine machine_rc=0 panewire hub_url token_env cf_env rc=0
-  local lanes_env lanes_machine
+  [[ "$ROLE" == worker || "$ROLE" == builder ]] || return 0
+  # #1397/(a): a delegated remote spawn defers its lane row to the ssh
+  # initiator — only that host holds the operator credential (per-host
+  # machine-scoped tokens are the step-4 follow-up). --lane-defer carries the
+  # hub machine id the initiator names this host by (its hosts.toml key).
+  # This wrk performs no `lanes add`; it records hub_lane/hub_lane_machine in
+  # the job.spawned receipt as the claim of what the initiator will register,
+  # so `wrk reap` on THIS host — the only place the pane check can pass —
+  # removes the row through the same machine+pane guard. If the initiator's
+  # add fails, the receipt names a lane that is not there and the guarded
+  # removal harmlessly skips it. The flag (not an env var) is deliberate:
+  # wrk's env propagates into the spawned pane, where an inherited defer
+  # would mute every spawn that pane later makes.
+  if [[ -n "${LANE_DEFER:-}" ]]; then
+    local defer_lane
+    if [[ "$ROLE" == builder ]]; then defer_lane="$BUILDER_LANE"; else defer_lane="$LABEL"; fi
+    if hub_lane_name_valid "$defer_lane"; then
+      HUB_LANE="$defer_lane" HUB_LANE_MACHINE="$LANE_DEFER"
+    fi
+    return 0
+  fi
+  local session raw machine="" machine_rc=0 panewire hub_url token_env cf_env rc=0
+  local lanes_env lanes_machine lane_name parent_lane
   local args=()
   session="${WRK_SENTINEL_HERDR_SESSION:-${HERDR_SESSION:-default}}"
   raw="$(spillover_value hub session_machine_ids 2>/dev/null || true)"
-  # No map at all means this installation has not opted in; stay silent like
-  # the hub quota gate does on absent hub keys.
-  [[ -n "$raw" ]] || return 0
-  set +e
-  machine="$(hub_session_machine_id "$session" "$raw" 2>/dev/null)"
-  machine_rc=$?
-  set -e
-  # #1010/N5: any rc beyond 0/1 — the matcher's own 2, a crashed interpreter,
-  # anything in between — is a parse failure, not a missing entry; stderr is
-  # silenced above so a traceback never leaks into the spawn's.
-  if [[ "$machine_rc" -ne 0 && "$machine_rc" -ne 1 ]]; then
-    warn "hub lane not registered (the [hub] session_machine_ids value could not be parsed; use the one-line {\"session\" = \"machine\"} inline table)"
-    return 0
+  # No map at all means this installation has not opted in; a worker stays
+  # silent like the hub quota gate does on absent hub keys. A builder still
+  # has its [hub] machine_id fallback below.
+  if [[ -z "$raw" && "$ROLE" != builder ]]; then return 0; fi
+  if [[ -n "$raw" ]]; then
+    set +e
+    machine="$(hub_session_machine_id "$session" "$raw" 2>/dev/null)"
+    machine_rc=$?
+    set -e
+    # #1010/N5: any rc beyond 0/1 — the matcher's own 2, a crashed interpreter,
+    # anything in between — is a parse failure, not a missing entry; stderr is
+    # silenced above so a traceback never leaks into the spawn's. A builder
+    # must not fall back to machine_id here: the session might sit in the map
+    # we could not read, which would put the lane on the wrong daemon.
+    if [[ "$machine_rc" -ne 0 && "$machine_rc" -ne 1 ]]; then
+      warn "hub lane not registered (the [hub] session_machine_ids value could not be parsed; use the one-line {\"session\" = \"machine\"} inline table)"
+      return 0
+    fi
+  fi
+  if [[ -z "$machine" && "$ROLE" == builder ]]; then
+    machine="$(spillover_value hub machine_id 2>/dev/null || true)"
+    # Same allowlist the lanes-token HUB_MACHINE_ID scan enforces — a
+    # malformed value warns once WITHOUT it and skips, never reaching argv.
+    if [[ -n "$machine" && ! "$machine" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+      warn "hub lane not registered ([hub] machine_id is malformed)"
+      return 0
+    fi
   fi
   if [[ -z "$machine" ]]; then
-    warn "hub lane not registered (herdr session '$session' has no session_machine_ids entry)"
+    if [[ "$ROLE" == builder ]]; then
+      warn "hub lane not registered (herdr session '$session' has no session_machine_ids entry and [hub] machine_id is unset)"
+    else
+      warn "hub lane not registered (herdr session '$session' has no session_machine_ids entry)"
+    fi
     return 0
   fi
   # #994/S1: no lane without its job.spawned receipt — a registration the job
@@ -5727,26 +5825,44 @@ hub_lane_register() {
     warn "hub lane not registered (no arbiter job record; a lane without a spawn receipt is unreapable)"
     return 0
   fi
-  if [[ -z "$OWNER" ]]; then
-    warn "hub lane not registered (--owner is unset; the spawning builder's lane is required as parent)"
+  # What gets registered differs by role: a worker lane is its own label,
+  # parented on the spawning builder's lane (--owner); a builder lane is its
+  # own --lane, parented on --parent — the route job.joined/job.escalate
+  # take. --parent is die-required earlier for builders, but an empty parent
+  # stays a warn-and-skip either way.
+  if [[ "$ROLE" == builder ]]; then
+    lane_name="$BUILDER_LANE" parent_lane="$PARENT_LANE"
+  else
+    lane_name="$LABEL" parent_lane="$OWNER"
+  fi
+  if [[ -z "$parent_lane" ]]; then
+    if [[ "$ROLE" == builder ]]; then
+      warn "hub lane not registered (--parent is unset; the builder lane's parent is required)"
+    else
+      warn "hub lane not registered (--owner is unset; the spawning builder's lane is required as parent)"
+    fi
     return 0
   fi
-  # #994/N2: the label becomes panewire argv verbatim — refuse names outside
-  # the daemon's own lane rule before the value can reach the command line.
-  if ! hub_lane_name_valid "$LABEL"; then
-    warn "hub lane not registered (label '$LABEL' is not a valid panewire lane name)"
+  # #994/N2: the lane name becomes panewire argv verbatim — refuse names
+  # outside the daemon's own lane rule before the value can reach the
+  # command line.
+  if ! hub_lane_name_valid "$lane_name"; then
+    warn "hub lane not registered (lane '$lane_name' is not a valid panewire lane name)"
     return 0
   fi
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
   # #1037: a dedicated lanes credential — a node token bound to this host's
-  # own machine id — wins over the shared operator file. It may reach only
-  # the lanes routes; every other hub path keeps hub_token_env.
-  token_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
-  lanes_env="$token_env"
-  [[ -n "$token_env" ]] || token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  # own machine id — wins over the operator file. It may reach only the lanes
+  # routes; every other hub path keeps its own credential. #1397: the
+  # operator file itself (operator_token_env) now authorizes lanes too, ahead
+  # of the legacy hub_token_env fallback — PUT /v1/lanes accepts only the
+  # operator token, and hub_token_env doubles as the quota-gate opt-in a
+  # lanes-only host deliberately leaves unset.
+  token_env="$(hub_lanes_credential 2>/dev/null || true)"
+  lanes_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   if [[ -z "$hub_url" || -z "$token_env" ]]; then
-    warn "hub lane not registered (hub_url missing or neither hub_token_env nor lanes_token_env set in hosts.toml [hub])"
+    warn "hub lane not registered (hub_url missing or none of lanes_token_env, operator_token_env or hub_token_env set in hosts.toml [hub])"
     return 0
   fi
   # A lanes credential authorizes lanes on its own HUB_MACHINE_ID only — with
@@ -5784,7 +5900,7 @@ hub_lane_register() {
   fi
   # The token env values go to panewire as FILE PATHS; wrk itself opens only
   # the lanes token's HUB_MACHINE_ID line, for the mismatch check above.
-  args=(lanes add "$LABEL" --machine "$machine" --pane "$PANE" --parent "$OWNER"
+  args=(lanes add "$lane_name" --machine "$machine" --pane "$PANE" --parent "$parent_lane"
         --hub-url "$hub_url" --hub-token-env "$token_env")
   [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
   set +e
@@ -5795,7 +5911,100 @@ hub_lane_register() {
     warn "hub lane not registered (panewire lanes add exited $rc)"
     return 0
   fi
-  HUB_LANE="$LABEL" HUB_LANE_MACHINE="$machine"
+  HUB_LANE="$lane_name" HUB_LANE_MACHINE="$machine"
+}
+
+# #1397/(a): the ssh initiator's half of a delegated remote spawn. The
+# execution host cannot register its own lane — PUT /v1/lanes wants the
+# operator credential, which lives on the initiating host (per-host
+# machine-scoped tokens are the step-4 follow-up) — so the initiator runs
+# `panewire lanes add` itself once the remote spawn answers rc 0, with
+# machine = the hosts.toml key it reached the host by (that key IS the
+# host's hub machine id: mac-dev, rpi, desktop). The remote wrk already
+# recorded lane+machine in its job.spawned receipt through --lane-defer, so
+# `wrk reap` on the execution host removes the row through the same
+# machine+pane-guarded `lanes rm` — symmetric, and `lanes rm` is a hub call
+# any operator-credentialed host can make.
+# Sets HUB_REMOTE_LANE to the lane name on a confirmed add; every failure is
+# one warning and a skip — the pane is already up on the remote, so a
+# registration failure must never fail the spawn (the builder's strict exit
+# is decided by the caller).
+hub_lane_register_remote() {
+  HUB_REMOTE_LANE=""
+  local host="$1" pane="$2" lane="$3" parent="$4" role="${5:-worker}"
+  local hub_url token_env cf_env panewire rc=0
+  local args=()
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  token_env="$(hub_lanes_credential 2>/dev/null || true)"
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  # A host without hub_url never opted into lanes; a remote worker stays
+  # silent there exactly like an unmapped local session does. A builder
+  # always names why its lane is missing — that is the #1397 fail-loud rule.
+  if [[ -z "$hub_url" ]]; then
+    if [[ "$role" == builder ]]; then
+      warn "hub lane not registered for remote host '$host' (hub_url unset in hosts.toml [hub])"
+    fi
+    return 0
+  fi
+  if [[ -z "$token_env" ]]; then
+    warn "hub lane not registered for remote host '$host' (none of lanes_token_env, operator_token_env or hub_token_env set in hosts.toml [hub])"
+    return 0
+  fi
+  if [[ -z "$pane" ]]; then
+    warn "hub lane not registered for remote host '$host' (the remote OK line carried no pane=; the pane is up but the lane could not be targeted)"
+    return 0
+  fi
+  if ! hub_lane_name_valid "$lane"; then
+    warn "hub lane not registered for remote host '$host' (lane '$lane' is not a valid panewire lane name)"
+    return 0
+  fi
+  if [[ -z "$parent" ]]; then
+    if [[ "$role" == builder ]]; then
+      warn "hub lane not registered for remote host '$host' (--parent is unset; the builder lane's parent is required)"
+    else
+      warn "hub lane not registered for remote host '$host' (--owner is unset; the spawning builder's lane is required as parent)"
+    fi
+    return 0
+  fi
+  panewire="${PANEWIRE_BIN:-panewire}"
+  if [[ "$panewire" == */* ]]; then
+    [[ -x "$panewire" ]] || {
+      warn "hub lane not registered for remote host '$host' (panewire unavailable: $panewire)"
+      return 0
+    }
+  elif ! command -v "$panewire" >/dev/null 2>&1; then
+    warn "hub lane not registered for remote host '$host' (panewire unavailable)"
+    return 0
+  fi
+  # Credentials reach panewire as FILE PATHS, same as hub_lane_register —
+  # wrk never opens them.
+  args=(lanes add "$lane" --machine "$host" --pane "$pane" --parent "$parent"
+        --hub-url "$hub_url" --hub-token-env "$token_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  set +e
+  "$panewire" "${args[@]}" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    warn "hub lane not registered for remote host '$host' (panewire lanes add exited $rc)"
+    return 0
+  fi
+  HUB_REMOTE_LANE="$lane"
+}
+
+# #1397: the credential chain every lanes route resolves the same way —
+# `panewire lanes add/ls/rm` here, in hub_lane_remove, and the lanes-missing
+# audit. lanes_token_env (#1037, a node token bound to this host's machine
+# id) wins when set; then operator_token_env, the operator file PUT /v1/lanes
+# requires; then hub_token_env, the legacy fallback that is also the quota
+# gate's opt-in (#1138) — a lanes-only host leaves it unset on purpose.
+hub_lanes_credential() {
+  local v
+  v="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
+  [[ -n "$v" ]] || v="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  [[ -n "$v" ]] || v="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  [[ -n "$v" ]] || return 1
+  printf '%s' "$v"
 }
 
 # The reverse of hub_lane_register for `wrk reap --apply` and for the
@@ -5818,14 +6027,14 @@ hub_lane_remove() {
     return 0
   fi
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
-  # Same credential rule as registration (#1037): lanes_token_env when set,
-  # else hub_token_env. The node token's own `lanes ls` is already
-  # machine-scoped hub-side, so no further check is needed here.
-  token_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
-  [[ -n "$token_env" ]] || token_env="$(spillover_value hub hub_token_env 2>/dev/null || true)"
+  # Same credential chain as registration (#1037/#1397): lanes_token_env when
+  # set, else operator_token_env, else hub_token_env. A lanes credential's
+  # own `lanes ls` is already machine-scoped hub-side, so no further check
+  # is needed here.
+  token_env="$(hub_lanes_credential 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   if [[ -z "$hub_url" || -z "$token_env" ]]; then
-    warn "hub lane '$lane' not removed (hub_url missing or neither hub_token_env nor lanes_token_env set in hosts.toml [hub])"
+    warn "hub lane '$lane' not removed (hub_url missing or none of lanes_token_env, operator_token_env or hub_token_env set in hosts.toml [hub])"
     return 0
   fi
   panewire="${PANEWIRE_BIN:-panewire}"
@@ -6496,14 +6705,15 @@ spillover_relay_remote_err() {
 
 # Transport legs (probe, prepare, mktemp, scp) must never answer the router
 # with an admission code: 2/74/75 belong to the remote wrk and the cwd map,
-# and 70 to the remote wrk's own config refusal — fail-closed answers that
-# stop auto failover.  A transport exit landing in that set is remapped to 1
-# so failover proceeds exactly as it did when every leg returned a flat 1;
-# it also means a 70 the router sees can only be the remote wrk's own answer
-# from the delegated-spawn leg, which is never normalized (#1154).
+# 70 to the remote wrk's own config refusal, and 82 to its builder-lane
+# strict answer (#1397) — fail-closed answers that stop auto failover.  A
+# transport exit landing in that set is remapped to 1 so failover proceeds
+# exactly as it did when every leg returned a flat 1; it also means a 70 or
+# 82 the router sees can only be the remote wrk's own answer from the
+# delegated-spawn leg, which is never normalized (#1154).
 spillover_transport_rc() {
   case "$1" in
-    2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_CONFIG_REFUSED") printf '1' ;;
+    2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_CONFIG_REFUSED"|"$WRK_EXIT_LANE_UNREGISTERED") printf '1' ;;
     *) printf '%s' "$1" ;;
   esac
 }
@@ -6672,8 +6882,37 @@ spillover_remote_spawn() {
     echo "wrk: failed to copy brief to remote host '$host' (scp rc=$rc)" >&2
     return "$(spillover_transport_rc "$rc")"
   fi
-  local remote_args=(env "HERDR_SESSION=$session" wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
+  # #1397/(a): the lane a remote spawn leaves is registered by THIS host, not
+  # the execution host — the delegated wrk gets --lane-defer <host key> so it
+  # records hub_lane/hub_lane_machine in its job.spawned receipt without
+  # calling panewire, and this host runs `lanes add` itself after the remote
+  # answers rc 0 (machine = the hosts.toml key, the host's hub machine id).
+  # The lane name/parent come from the forwarded args: a builder registers
+  # --lane under --parent; a worker registers its label under --owner.
+  local remote_lane_role=worker remote_lane_name="" remote_lane_owner="" remote_lane_builder="" remote_lane_parent="" remote_label=""
   local arg saw_workspace=0 i=0 args=("$@")
+  while [[ "$i" -lt "${#args[@]}" ]]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      --role) remote_lane_role="${args[$((i + 1))]:-worker}"; ((i+=1)) ;;
+      --lane) remote_lane_builder="${args[$((i + 1))]:-}"; ((i+=1)) ;;
+      --parent) remote_lane_parent="${args[$((i + 1))]:-}"; ((i+=1)) ;;
+      --owner) remote_lane_owner="${args[$((i + 1))]:-}"; ((i+=1)) ;;
+      -l) remote_label="${args[$((i + 1))]:-}"; ((i+=1)) ;;
+    esac
+    ((i+=1))
+  done
+  # captain is the legacy builder alias — the remote wrk normalizes it before
+  # its own defer check, so this side must read --lane/--parent for it too.
+  [[ "$remote_lane_role" == captain ]] && remote_lane_role=builder
+  local remote_lane_name remote_lane_route_parent
+  if [[ "$remote_lane_role" == builder ]]; then
+    remote_lane_name="$remote_lane_builder" remote_lane_route_parent="$remote_lane_parent"
+  else
+    remote_lane_name="$remote_label" remote_lane_route_parent="$remote_lane_owner"
+  fi
+  local remote_args=(env "HERDR_SESSION=$session" wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local "--lane-defer" "$host")
+  i=0
   while [[ "$i" -lt "${#args[@]}" ]]; do
     arg="${args[$i]}"
     case "$arg" in
@@ -6709,8 +6948,40 @@ spillover_remote_spawn() {
   # A failed remote spawn must answer with the remote's own words: stderr is
   # relayed verbatim and non-OK stdout follows it onto the local stderr.
   spillover_relay_remote_err "$remote_err"
+  # #1397/(a): the remote pane is up — now register its lane on the hub from
+  # THIS host (machine = the hosts.toml key, i.e. the host's hub machine id)
+  # and settle the OK line's lane= field before it prints. The remote wrk
+  # marked the lane deferred in its receipt; the field it printed is replaced
+  # with the outcome here: lane=L@HOST on a confirmed add, lane=UNREGISTERED
+  # for a builder whose add skipped/failed, and no field for a worker.
+  if [[ "$rc" -eq 0 && -n "$remote_lane_name" ]]; then
+    local remote_pane="" lane_field="" lane_out
+    remote_pane="$(awk '/^OK pane=/{ for (i = 1; i <= NF; i++) if (substr($i, 1, 5) == "pane=") { print substr($i, 6); exit } }' "$out")"
+    hub_lane_register_remote "$host" "$remote_pane" "$remote_lane_name" "$remote_lane_route_parent" "$remote_lane_role"
+    if [[ -n "$HUB_REMOTE_LANE" ]]; then
+      lane_field="lane=$remote_lane_name@$host"
+    elif [[ "$remote_lane_role" == builder ]]; then
+      lane_field="lane=UNREGISTERED"
+    fi
+    lane_out="$(mktemp)"
+    if awk -v lf="$lane_field" '
+      /^OK pane=/ { sub(/ lane=[^ ]*/, ""); if (lf != "") $0 = $0 " " lf; print; next }
+      { print }
+    ' "$out" >"$lane_out"; then
+      mv "$lane_out" "$out"
+    else
+      rm -f "$lane_out"
+    fi
+  fi
   spillover_emit_host "$host" "$out" "$rc"
   rm -f "$out" "$remote_err"
+  # A strict builder answer is the remote spawn's own: it returns 82 so an
+  # auto round treats the leg like the other admission stops (2/70/74/75) —
+  # the pane exists on that host, so re-placing would double-spawn the job.
+  if [[ "$rc" -eq 0 && -n "$remote_lane_name" && "$remote_lane_role" == builder && -z "${HUB_REMOTE_LANE:-}" && "${WRK_LANE_STRICT:-0}" == 1 ]]; then
+    warn "spawn succeeded but the builder lane is UNREGISTERED; the pane on remote host '$host' remains valid; strict_exit=$WRK_EXIT_LANE_UNREGISTERED"
+    rc="$WRK_EXIT_LANE_UNREGISTERED"
+  fi
   return "$rc"
 }
 
@@ -6793,7 +7064,7 @@ spawn_router_cmd() {
   for ((i = 0; i < ${#args[@]}; i++)); do
     case "${args[$i]}" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--host) ((i += 1)) ;;
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--host|--lane-defer) ((i += 1)) ;;
       --task-hk-bypass|--job-dup-ok|--landing-strict|--keep) ;;
       *) break ;;
     esac
@@ -7061,9 +7332,11 @@ spawn_router_cmd() {
     fi
     # Admission refusals and cwd mapping stay fail-closed: transport legs are
     # normalized away from this set, so a 2/74/75 here is the remote wrk's own
-    # answer or a config refusal — stop instead of trying the next host.
+    # answer or a config refusal — stop instead of trying the next host. #1397:
+    # a remote 82 (builder lane strict) belongs here too — the pane already
+    # exists on that host, so moving the round would double-spawn the job.
     case "$last_rc" in
-      2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE")
+      2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_LANE_UNREGISTERED")
         [[ -s "$auto_diag" ]] && cat "$auto_diag" >&2
         rm -f "$auto_diag"
         return "$last_rc" ;;
@@ -7789,7 +8062,7 @@ mock_mcp_cleanup() {
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0
+  OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
   MOCK_MCP_PLAN="" MOCK_MCP_HELPER="" SPAWN_MOCK_MCP_RETAIN=0
@@ -7801,7 +8074,7 @@ spawn_cmd() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job)
+      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--lane-defer)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
@@ -7811,6 +8084,7 @@ spawn_cmd() {
           --report) REPORT_PATH="$2" ;;
           --operator-request) OPERATOR_REQUEST="$2" ;; --requested-by) REQUESTED_BY="$2" ;;
           --purpose) PURPOSE="$2" ;; --task) TASK_ID="$2" ;; --parent-job) PARENT_JOB="$2" ;;
+          --lane-defer) LANE_DEFER="$2" ;;
         esac
         shift 2 ;;
       --task-hk-bypass) TASK_HK_BYPASS=1; shift ;;
@@ -8094,10 +8368,12 @@ print(value if isinstance(value, str) else "")
   # SPAWN_PANE_OPEN is still armed: the EXIT trap closes the pane and releases
   # the quota record — no job without its task link.
   hk_task_link
-  # #965: with the pane provably up and the spawn committed to its OK line,
-  # register the worker's hub lane on the daemon serving this herdr session —
-  # before the spawn receipt so hub_lane/hub_lane_machine land in the same job
-  # meta as task_id/keep. Warn-only inside: never fails the spawn.
+  # #965/#1397: with the pane provably up and the spawn committed to its OK
+  # line, register the lane on the daemon serving this herdr session —
+  # worker label under --owner, builder --lane under --parent — before the
+  # spawn receipt so hub_lane/hub_lane_machine land in the same job meta as
+  # task_id/keep. Warn-only inside: never fails the spawn; the OK line turns
+  # a builder's miss into lane=UNREGISTERED below.
   hub_lane_register
   # The spawn stands; the execution record now belongs to the worker, not to this process.
   arbiter_record_spawn_receipt
@@ -8123,7 +8399,15 @@ print(value if isinstance(value, str) else "")
   fi
   # Appended, never inserted: OK-line parsers read key=value pairs.
   [[ "$SPAWN_VIA" != herdr-fallback ]] || OK_LINE="$OK_LINE via=herdr-fallback"
-  [[ -z "${HUB_LANE:-}" ]] || OK_LINE="$OK_LINE lane=$HUB_LANE@$HUB_LANE_MACHINE"
+  # #1397: a builder spawn always states its lane outcome — the registered
+  # lane@machine, or the loud lane=UNREGISTERED marker when registration
+  # warned and skipped. Workers keep the #965 contract: lane= appears only
+  # on a confirmed registration.
+  if [[ -n "${HUB_LANE:-}" ]]; then
+    OK_LINE="$OK_LINE lane=$HUB_LANE@$HUB_LANE_MACHINE"
+  elif [[ "$ROLE" == builder ]]; then
+    OK_LINE="$OK_LINE lane=UNREGISTERED"
+  fi
   echo "$OK_LINE"
   if [[ "$LANDING" == no ]]; then
     # Grok's echo can arrive 1-2 minutes after injection — past even its
@@ -8135,6 +8419,15 @@ print(value if isinstance(value, str) else "")
       return "$WRK_EXIT_LANDING_UNCONFIRMED"
     fi
     warn "spawn succeeded but brief landed=no; pane=$PANE remains valid; $LANDING_NO_DETAIL"
+  fi
+  # #1397: WRK_LANE_STRICT=1 turns the builder's lane=UNREGISTERED marker into
+  # a nonzero answer AFTER the pane is up and the OK line has printed — the
+  # warn-only default stays because the pane exists and a failed spawn would
+  # orphan it silently. On a remote --host leg the delegated wrk produces this
+  # line (and this exit) on the target, so the marker propagates verbatim.
+  if [[ "$ROLE" == builder && -z "${HUB_LANE:-}" && "${WRK_LANE_STRICT:-0}" == 1 ]]; then
+    warn "spawn succeeded but the builder lane is UNREGISTERED; pane=$PANE remains valid; strict_exit=$WRK_EXIT_LANE_UNREGISTERED"
+    return "$WRK_EXIT_LANE_UNREGISTERED"
   fi
 }
 
@@ -8184,9 +8477,9 @@ closed job records a flat job.reaped event (pane_id, tab_id, at).
 A job whose newest job.spawned receipt records a hub lane (hub_lane; spawned
 under a session mapped in hosts.toml's [hub] session_machine_ids, #965) is
 additionally deregistered on --apply: `panewire lanes rm LANE` with the [hub]
-lane credentials (lanes_token_env when set, else hub_token_env) runs once
-the tab close is confirmed — and only while `panewire lanes ls` still shows
-the row bound to the recorded machine+pane (a reused label's newer row is
+lane credentials (lanes_token_env when set, else operator_token_env, else
+hub_token_env) runs once the tab close is confirmed — and only while
+`panewire lanes ls` still shows the row bound to the recorded machine+pane (a reused label's newer row is
 never removed). A removal failure warns and the close still stands;
 `panewire lanes-audit` lists any leftover rows.
 USAGE
@@ -8551,6 +8844,149 @@ reap_cmd() {
   else
     echo "reap: $acted candidate(s) (dry-run; re-run with --apply to close)"
   fi
+}
+
+lanes_missing_help() {
+  cat <<'USAGE'
+Usage: wrk lanes-missing
+
+Read-only audit (#1397): list OPEN jobs under the jobs root whose owner
+(builder) lane — or that lane's parent — is absent from `panewire lanes ls`.
+A job's owner lane is where its job.* events route, and a builder's
+job.escalate/job.joined route to that lane's parent, so a missing row is
+exactly how completions get lost. "Open" means a claim or spawn exists and
+no terminal event (job.completed/job.joined/job.revoked) or job.reaped
+follows it — the same terminal/revive reading `wrk reap` uses.
+
+The command makes exactly one `panewire lanes ls` call with the [hub] lane
+credentials (lanes_token_env, else operator_token_env, else hub_token_env;
+hub_cf_env when set) and otherwise only reads the jobs inbox — nothing is
+added, removed or closed. It exits nonzero when the listing itself is
+unavailable (hub config missing, panewire failing or unparsable output) —
+an audit that cannot see the lanes file cannot say nothing is missing.
+
+Output: one `missing job=JOB lane=LANE [parent=P] absent=lane|parent role=R`
+line per finding, then a `lanes-missing: audited N open job(s), M missing`
+summary. rc 0 whether or not findings exist.
+
+  -h, --help   show this usage
+USAGE
+}
+
+lanes_missing_cmd() {
+  if [[ $# -gt 0 ]]; then
+    if [[ "$1" == "-h" || "$1" == "--help" ]]; then
+      [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+      lanes_missing_help
+      return 0
+    fi
+    die "unexpected argument '$1'"
+  fi
+  local jobs_root hub_url token_env cf_env panewire listing rc=0
+  local args=()
+  jobs_root="$(wrk_jobs_root)"
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  token_env="$(hub_lanes_credential 2>/dev/null || true)"
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  if [[ -z "$hub_url" || -z "$token_env" ]]; then
+    die "lanes-missing cannot audit: [hub] needs hub_url plus a lanes credential (lanes_token_env, else operator_token_env, else hub_token_env)"
+  fi
+  panewire="${PANEWIRE_BIN:-panewire}"
+  if [[ "$panewire" == */* ]]; then
+    [[ -x "$panewire" ]] || die "lanes-missing cannot audit: panewire unavailable: $panewire"
+  elif ! command -v "$panewire" >/dev/null 2>&1; then
+    die "lanes-missing cannot audit: panewire unavailable"
+  fi
+  args=(lanes ls --hub-url "$hub_url" --hub-token-env "$token_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  set +e
+  listing="$("$panewire" "${args[@]}" 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die "lanes-missing cannot audit: panewire lanes ls exited $rc"
+  # Open-job reading mirrors reap_candidates: a claim/reclaim records
+  # owner_lane/parent_lane/role, terminal kinds close the job, claim/
+  # reclaim/spawned/reprompted reopen it, job.reaped closes it for good.
+  # Findings print as key=value lines; the summary is the last line.
+  python3 - "$jobs_root" "$listing" <<'PY'
+import json, os, sys
+
+root, raw = sys.argv[1], sys.argv[2]
+try:
+    doc = json.loads(raw)
+except ValueError:
+    print("wrk: lanes-missing cannot audit: panewire lanes ls output was not parseable", file=sys.stderr)
+    sys.exit(2)
+rows = doc.get("lanes") if isinstance(doc, dict) else None
+if not isinstance(rows, list):
+    print("wrk: lanes-missing cannot audit: panewire lanes ls output was not parseable", file=sys.stderr)
+    sys.exit(2)
+lanes = {}
+for row in rows:
+    if isinstance(row, dict) and isinstance(row.get("lane"), str):
+        parent = row.get("parent")
+        lanes[row["lane"]] = parent if isinstance(parent, str) else ""
+
+TERMINAL = {"job.completed", "job.joined", "job.revoked"}
+REVIVE = {"job.claim", "job.reclaim", "job.spawned", "job.reprompted"}
+try:
+    jobs = sorted(os.listdir(root))
+except OSError:
+    jobs = []
+
+open_jobs = []
+for job in jobs:
+    events_dir = os.path.join(root, job, "events")
+    if not os.path.isdir(events_dir):
+        continue
+    owner = parent = role = ""
+    is_open = False
+    try:
+        names = sorted(os.listdir(events_dir))
+    except OSError:
+        continue
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(events_dir, name), encoding="utf-8") as handle:
+                record = json.load(handle)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(record, dict):
+            continue
+        payload = record.get("payload", record)
+        if not isinstance(payload, dict):
+            payload = {}
+        kind = record.get("kind")
+        if kind in ("job.claim", "job.reclaim"):
+            value = payload.get("owner_lane")
+            owner = value if isinstance(value, str) else ""
+            value = payload.get("parent_lane")
+            parent = value if isinstance(value, str) else ""
+            value = payload.get("role")
+            role = value if isinstance(value, str) else ""
+        if kind in REVIVE:
+            is_open = True
+        elif kind in TERMINAL or kind == "job.reaped":
+            is_open = False
+    if is_open and owner:
+        open_jobs.append((job, owner, parent, role))
+
+missing = 0
+for job, owner, parent, role in open_jobs:
+    tag = role or "-"
+    if owner not in lanes:
+        print("missing job=%s lane=%s absent=lane role=%s" % (job, owner, tag))
+        missing += 1
+        continue
+    effective_parent = parent or lanes.get(owner, "")
+    if effective_parent and effective_parent not in lanes:
+        print("missing job=%s lane=%s parent=%s absent=parent role=%s"
+              % (job, owner, effective_parent, tag))
+        missing += 1
+print("lanes-missing: audited %d open job(s), %d missing" % (len(open_jobs), missing))
+PY
 }
 
 # ── #770: wrk prune — report-only-by-default cleanup of what ended jobs
@@ -9550,6 +9986,7 @@ case "${1:-}" in
   round) shift; round_cmd "$@" ;;
   sentinel) shift; sentinel_cmd "$@" ;;
   reap) shift; reap_cmd "$@" ;;
+  lanes-missing) shift; lanes_missing_cmd "$@" ;;
   prune) shift; prune_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
   name-sync) shift; name_sync_cmd "$@" ;;

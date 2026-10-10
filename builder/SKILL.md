@@ -119,6 +119,12 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
    parent 레인은 필수다.
    `captain` role 별칭은 deprecation 경고 후 builder로 정규화되고, arbiter의 `job.claim` envelope
    payload에는 `owner_lane`, `role: "builder"`, `parent_lane`, `task_id`가 남는다.
+   🔴 **빌더 스폰은 자기 `--lane`을 허브 레인으로 등록한다**(#1397): `--parent`가 그 부모이고,
+   `job.escalate`/`job.joined`가 owner 레인의 parent로 라우팅되므로 레인이 없으면 이 이벤트가
+   유실된다. OK 줄은 항상 `lane=<lane>@<machine>` 또는 `lane=UNREGISTERED`로 끝나고,
+   `WRK_LANE_STRICT=1`이면 미등록 시 rc 82다(pane은 유효). 열린 job의 빌더 레인/parent 부재는
+   `wrk lanes-missing`으로 감사한다. 자격증명·머신·원격 `--lane-defer` 세부는
+   `spawn-worker`의 [hub] 절 정본을 따른다.
    🔴 **`--task`는 빌더 스폰의 필수다**(#768, task-job-linkage 항목 1): 스폰 성공 시 그 task가
    빌더 라벨로 claim되고 `refs.job_id`가 잡에 바인딩된다. handoffkeep이 안 닿으면 스폰은
    거부된다 — `--task-hk-bypass`로만 뚫리고 그 오버라이드는 잡 메타에 기록된다.
