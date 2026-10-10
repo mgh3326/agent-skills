@@ -587,8 +587,10 @@ spawn = false              # 이 호스트의 로컬 spawn 자체를 닫는다 �
 [hub]
 hub_url = "wss://<hub-host>"
 hub_token_env = "<path-to-token-env-file>"
+operator_token_env = "<path-to-operator-token-file>"  # 선택 사항 — lanes 자격증명 체인의 둘째 (#1397)
 hub_cf_env = "<path-to-cf-env-file>"   # 선택 사항
 lanes_token_env = "<path-to-node-token-file>"  # 선택 사항 — lanes 전용 노드 토큰
+machine_id = "<hub-machine-id>"        # 선택 사항 — 이 호스트 자신의 허브 머신 id, 빌더 폴백 (#1397)
 session_machine_ids = {"<non-fleet-session>" = "<hub-machine-id>"}  # 선택 사항 — 레인 자동 등록
 # quota_gate = "local"     # 선택 사항 — hub quota gate 의 명시적 opt-out (lanes-only 호스트용)
 
@@ -721,6 +723,25 @@ wake_wait = 300
   요청); `HUB_TOKEN`은 절대 읽거나 출력하지 않는다. `hub_token_env`
   없이 `hub_url`+`lanes_token_env`만 둔 lanes-only `[hub]`는 quota gate를 켜지 않는다 —
   게이트의 opt-in은 오직 `hub_token_env`다.
+- 레인 자격증명 체인(#1397): lanes route(`lanes add/ls/rm`, `wrk lanes-missing`)가 쓰는
+  credential은 `lanes_token_env` → 없으면 `operator_token_env` → 없으면 `hub_token_env` 순이다.
+  PUT /v1/lanes 는 operator 토큰만 받으므로 operator_token_env가 lanes를 authorizing할 수 있다.
+- **빌더 레인 등록(#1397)**: `--role builder` 스폰도 허브 레인을 등록한다 — `--lane`이
+  레인명, `--parent`가 부모(`job.joined`/`job.escalate`가 owner 레인의 parent로 라우팅되므로
+  빌더 레인이 없으면 이 이벤트가 유실된다). 머신은 `session_machine_ids`에 매핑된 세션이면
+  그 값, 아니면 `[hub] machine_id`(이 호스트 자신의 허브 머신 id — 원격 스폰어가
+  hosts.toml 키로 부르는 그 id)를 쓴다. `machine_id` 폴백은 빌더 전용이다 — fleet 세션에
+  매핑되지 않은 워커는 여전히 경고 한 번 후 미등록 착지다(fleet worker가 global lane이
+  되면 안 되므로). 빌더의 OK 줄은 항상 `lane=<lane>@<machine>` 또는 `lane=UNREGISTERED`를
+  단다; 기본은 warn-only이고 `WRK_LANE_STRICT=1`이면 pane 기동·OK 출력 후 rc 82로
+  답한다(pane은 그대로 유효). 열린 job 중 빌더 레인 또는 그 parent가 `panewire lanes ls`에
+  없는 것은 `wrk lanes-missing`이 읽기 전용으로 나열한다.
+- **원격 `--host NAME` 스폰의 레인(#1397)**: 실행 호스트는 operator credential이 없으므로
+  `lanes add`를 스폰을 시킨 호스트가 한다 — 위임된 wrk는 `--lane-defer <host key>`를 받아
+  panewire 호출 없이 `hub_lane`/`hub_lane_machine`만 자기 `job.spawned` receipt에 기록하고,
+  시작 호스트는 원격이 rc 0으로 답한 뒤 `lanes add`를 직접 친다(machine = 그 호스트의
+  hosts.toml 키 — 그 키가 곧 허브 머신 id다). receipt는 job과 함께 실행 호스트에 있으므로
+  `wrk reap`은 그곳에서 pane 검증을 거쳐 같은 machine+pane 가드로 `lanes rm`을 친다.
 - `quota_gate = "local"`(#1138)은 그 local-only 상태의 명시적 opt-out이다 — M1 같은
   lanes-only 호스트가 쓴다. `hub_url`이 있고 `hub_token_env`가 없는 `[hub]`는 매 spawn마다
   게이트가 건너뛰어지고 local scopefuel gate만 적용된다는 경고를 stderr에 정확히 한 번
