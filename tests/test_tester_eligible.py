@@ -161,8 +161,9 @@ class EligibilityFixtures(unittest.TestCase):
         # hk 1380: the devin fusion spellings carry the Claude family, so a
         # fusion tester against a claude builder is same-family (never the
         # unconditional CROSS_FAMILY pass) while a devin-swe2 or codex
-        # contributor leaves it cross-family eligible. Unmeasured C grade, so
-        # the demo pins required/implementation at C.
+        # contributor leaves it cross-family eligible. Unmeasured B per the
+        # merged catalog (scopefuel 5e9177b), so the demo pins
+        # required/implementation at B.
         fusion_models = {
             "devin-fusion-opus55": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
             "devin-fusion-sonnet55": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
@@ -180,7 +181,7 @@ class EligibilityFixtures(unittest.TestCase):
                     evidence = self.evidence(
                         self.make_head(f"src/{alias}-{contributor}.py"),
                         declared_t="T1",
-                        required_grade="C", implementation_grade="C")
+                        required_grade="B", implementation_grade="B")
                     evidence["contributors"][0].update(
                         profile=contributor, model=cmodel,
                         effort="high" if cmodel.startswith(("claude-", "gpt-")) else "")
@@ -189,6 +190,57 @@ class EligibilityFixtures(unittest.TestCase):
                     checks = self.check(evidence)
                     self.assert_case(checks, "tester", "PASS", "PROFILE_RESOLVED")
                     self.assert_case(checks, "independence", *want)
+
+    def test_bare_launch_and_fusion_footer_post_landing(self) -> None:
+        # hk 1380 B1/B2 (tester 1380b-verify): wrk records a bare
+        # launch_profile (no @effort) for effort-less devin profiles — the
+        # post-landing actual_source check must resolve it to the profile
+        # itself, not ACTUAL_LAUNCH_UNKNOWN. The fusion pane footer is the
+        # branded label captured verbatim from a real fusion pane
+        # (2026-10-10). devin-swe2 has no known footer branding, so its row
+        # proves the launch parse resolved by landing on the pane check.
+        cases = [
+            ("devin-fusion-opus55", "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+             "Fusion · Claude Opus 5.5 ◆ SWE-2 Medium", ("PASS", "ACTUAL_PROFILE_OBSERVED")),
+            ("devin-fusion-sonnet55", "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+             "Fusion · Claude Sonnet 5.5 ◆ SWE-2 Medium", ("PASS", "ACTUAL_PROFILE_OBSERVED")),
+            ("devin-ds41", "deepseek-v4-1-flash-high",
+             "deepseek-v4-1-flash-high · always", ("PASS", "ACTUAL_PROFILE_OBSERVED")),
+            ("devin-swe2", "swe-2",
+             "swe-2 · always", ("UNVERIFIED", "PANE_MODEL_UNVERIFIED")),
+        ]
+        for profile, model, footer, want in cases:
+            with self.subTest(profile=profile):
+                evidence = self.evidence(
+                    self.make_head(f"src/post-{profile}.py"), declared_t="T1",
+                    required_grade="B", implementation_grade="B",
+                    contributors=[{"profile": "devin-swe2", "model": "swe-2", "effort": "",
+                                   "role": "builder", "kind": "initial",
+                                   "session": "builder-session",
+                                   "worktree": "/tmp/builder-worktree"}],
+                    tester={"planned_profile": profile, "planned_effort": ""})
+                evidence = self.landed(evidence)
+                evidence["tester"].update(actual_profile=profile, actual_model=model,
+                                          actual_effort="", pane="w1:pTest")
+                record_dir = Path(self.temp.name) / f"job-{profile}"
+                events = record_dir / "events"
+                events.mkdir(parents=True, exist_ok=True)
+                evidence["tester"]["job_record_dir"] = str(record_dir)
+                (events / "00002-quota_pool.record.json").write_text(json.dumps({
+                    "job_id": evidence["job"], "kind": "quota_pool.record",
+                    "payload": {"launch_profile": profile}}))
+                (events / "00003-job.spawned.json").write_text(json.dumps({
+                    "job_id": evidence["job"], "kind": "job.spawned",
+                    "payload": {"profile": profile, "pane_id": "w1:pTest"}}))
+                observation = Path(self.temp.name) / f"obs-{profile}.json"
+                observation.write_text(json.dumps({
+                    "source": "pane", "job": evidence["job"], "pane": "w1:pTest",
+                    "model": model, "effort": ""}))
+                evidence["tester"]["model_observation_path"] = str(observation)
+                evidence["tester"]["model_observation_sha256"] = common.sha256_file(observation)
+                evidence["_pane_snapshot"] = footer
+                checks = self.check(evidence, "post-landing")
+                self.assert_case(checks, "actual_source", *want)
 
     def test_same_family_t3_incident_is_rejected(self) -> None:
         evidence = self.evidence(self.make_head("live/guard.py"), declared_t="T3",

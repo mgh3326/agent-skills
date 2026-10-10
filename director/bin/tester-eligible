@@ -296,12 +296,24 @@ def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
         "gpt-6-luna": "GPT-6-Luna",
         "gpt-5.6-terra": "GPT-5.6-Terra", "claude-opus-5-5": "Opus 5.5",
         "claude-sonnet-5": "Sonnet 5",
+        # hk 1380: a fusion pane brands the whole label — captured verbatim
+        # 2026-10-10 from `devin --model fusion-claude-opus-5-5-high-
+        # sidekick-swe-2-medium` (no prompt sent, footer read then /exit).
+        # The label carries its own separators and shows no effort or mode
+        # suffix, so these ids match the label itself, not display + "·".
+        "fusion-claude-opus-5-5-high-sidekick-swe-2-medium":
+            "Fusion · Claude Opus 5.5 ◆ SWE-2 Medium",
+        "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium":
+            "Fusion · Claude Sonnet 5.5 ◆ SWE-2 Medium",
     }.get(model, model)
-    suffix = rf"\s*(?:\(\s*{re.escape(effort)}\s*\)|{re.escape(effort)})\s*·" if effort else r"\s*·"
+    if display.startswith("Fusion · "):
+        suffix = r"(?:\s|$)"
+    else:
+        suffix = rf"\s*(?:\(\s*{re.escape(effort)}\s*\)|{re.escape(effort)})\s*·" if effort else r"\s*·"
     pattern = re.compile(rf"^\s*[│┃╭╰─\s]*{re.escape(display)}{suffix}", re.IGNORECASE)
     footer_lines = [line for line in snapshot.splitlines()[-5:]
                     if " · " in line and re.match(
-                        r"^\s*[│┃╭╰─\s]*(?:Grok|GPT-|Opus|Sonnet|Haiku|Kimi|Devin|Deepseek)",
+                        r"^\s*[│┃╭╰─\s]*(?:Grok|GPT-|Opus|Sonnet|Haiku|Kimi|Devin|Deepseek|Fusion)",
                         line, re.IGNORECASE)]
     return bool(footer_lines) and bool(pattern.search(footer_lines[-1]))
 
@@ -329,7 +341,10 @@ def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | Non
             spawned["payload"].get("pane_id") != pane):
             return result("UNVERIFIED", "JOB_RECORD_MISMATCH", "bin/wrk:job-record")
         launch = quota["payload"].get("launch_profile", "")
-        launch_prefix, observed_effort = launch.rsplit("@", 1) if "@" in launch else ("", "")
+        # A bare launch value (no @) is an exact profile with empty effort —
+        # wrk records effort-less profiles like devin-swe2 or the hk 1380
+        # fusion spellings verbatim, so they must still resolve.
+        launch_prefix, observed_effort = launch.rsplit("@", 1) if "@" in launch else (launch, "")
         launch_spec = policy.get("profiles", {}).get(launch_prefix)
         if not tester_profile or not isinstance(launch_spec, dict):
             return result("UNVERIFIED", "ACTUAL_LAUNCH_UNKNOWN", "bin/wrk:quota_pool.record")

@@ -13,9 +13,11 @@
 # The pin names its source commit; a scopefuel catalog change that promotes or
 # demotes a devin rung turns this test RED until the pin is re-transcribed.
 #
-# Pinned from scopefuel origin/main 5d911c4aac0e9b5b77b11d6614560338770867eb
-# ("recommend: scope the Sonnet estimate sentence to estimated rungs (#1305)"):
-#   recommend.py GRADE_TABLE (line numbers at that commit):
+# Pinned from scopefuel origin/main 5e9177b (hk 1380 Part A catalog rows
+# merged there; earlier rows transcribed at 5d911c4aac0e9b5b77b11d6614560338770867eb,
+# "recommend: scope the Sonnet estimate sentence to estimated rungs (#1305)",
+# line numbers at that commit):
+#   recommend.py GRADE_TABLE:
 #     A+  devin-swe2      (:887 _devin_swe2_profile effort-less row,
 #                          :907 devin-swe2@high rung — #1297, operator 2026-10-08)
 #     A+  devin-swe2-max  (:915 devin-swe2-max@max rung — #1297;
@@ -26,17 +28,20 @@
 #     C   devin-ds41-max  (:1283 — unmeasured effort-variant row)
 #     C   devin-glm52     (:1271 — unmeasured)
 #     C   devin-swe17     (:1272 — unmeasured)
+#   hk 1380 fusion rows (5e9177b, `scopefuel policy launch <name> --json` —
+#   billing=paid, pool=devin, unmeasured):
+#     B   devin-fusion-opus55    (model fusion-claude-opus-5-5-high-sidekick-swe-2-medium)
+#     B   devin-fusion-sonnet55  (model fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium)
 #   launch.py:84-91 LAUNCH_MODEL_IDS maps each catalog profile to the devin
 #   --model id the gate profile carries; devin encodes effort in the model id
 #   (#635), so devin-swe2-max IS the max rung and takes the @max grade A+.
 #   Every gate spelling that launches a model (worker devin-* and builder
 #   builder-*/builder-devin-* aliases) must carry the same grade.
 #
-# hk 1380 (operator 2026-10-10, Devin paid lane): the two fusion spellings are
-# pinned from `devin models list` (2026-10-10), not from the scopefuel catalog
-# — the catalog rows are hk 1380 Part A, a separate builder. Unmeasured rows
-# carry the same C the other unmeasured devin rungs pin, and stay below
-# devin-ds41's measured A+ by the task's grade ceiling.
+# Vocabulary note (N1): the catalog calls the fusion rows' family "claude"
+# while gate_policy.json says "anthropic" — same family, different names
+# (anthropic is the value every existing Claude profile uses here).
+# Nothing cross-reads the two strings.
 #
 # Every mutant reverts or moves one devin grade and must go RED by assertion.
 set -euo pipefail
@@ -61,7 +66,7 @@ eligible = importlib.util.module_from_spec(spec)
 sys.modules[loader.name] = eligible
 loader.exec_module(eligible)
 
-# devin --model id -> catalog grade (scopefuel 5d911c4, table above).
+# devin --model id -> catalog grade (scopefuel 5e9177b, table above).
 EXPECTED = {
     "swe-2": "A+",
     "swe-2-max": "A+",
@@ -70,10 +75,10 @@ EXPECTED = {
     "deepseek-v4-1-flash-max": "C",
     "glm-5-2": "C",
     "swe-1-7": "C",
-    # hk 1380 paid fusion spellings — unmeasured, pinned at the file's
-    # unmeasured convention C (below devin-ds41's measured A+).
-    "fusion-claude-opus-5-5-high-sidekick-swe-2-medium": "C",
-    "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium": "C",
+    # hk 1380 paid fusion spellings — unmeasured; the merged catalog rows
+    # (5e9177b) list both at B.
+    "fusion-claude-opus-5-5-high-sidekick-swe-2-medium": "B",
+    "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium": "B",
 }
 
 # Policy validity window per gate_policy.json effective_at/expires_at.
@@ -141,6 +146,10 @@ def check_gate(policy: dict, policy_check: dict) -> None:
         ("devin-glm52", "glm-5-2", "worker", "B", ("FAIL", "IMPLEMENTER_GRADE_LOW")),
         ("devin-swe17", "swe-1-7", "worker", "B", ("FAIL", "IMPLEMENTER_GRADE_LOW")),
         ("devin-ds41-max", "deepseek-v4-1-flash-max", "worker", "C", ("PASS", "GRADE_SUFFICIENT")),
+        # hk 1380: the fusion rows list at the catalog's unmeasured B — B work
+        # passes, A work refuses.
+        ("devin-fusion-opus55", "fusion-claude-opus-5-5-high-sidekick-swe-2-medium", "worker", "B", ("PASS", "GRADE_SUFFICIENT")),
+        ("devin-fusion-sonnet55", "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium", "worker", "A", ("FAIL", "IMPLEMENTER_GRADE_LOW")),
     ]
     for alias, model, role, assigned, want in cases:
         got = grade_verdict(policy, policy_check, alias, model, role, assigned)
@@ -160,7 +169,7 @@ check(policy)
 print(f"PASS devin-grades-pin profiles={len(devin_profiles(policy))} "
       f"models={len(EXPECTED)}/{len(EXPECTED)}")
 check_gate(policy, policy_check)
-print("PASS devin-gate-verdicts cases=10/10")
+print("PASS devin-gate-verdicts cases=12/12")
 
 mutants = {
     # Reverting this one row is exactly the #1330 defect.
@@ -175,6 +184,10 @@ mutants = {
     "glm52-promoted": mutate(policy, "devin-glm52", "A"),
     "swe17-promoted": mutate(policy, "devin-swe17", "B"),
     "spellings-split": mutate(policy, "builder-devin", "A"),
+    # N2: the fusion rows are pinned at the catalog B — demoting either to the
+    # old unmeasured-C placeholder must go RED.
+    "fusion-opus-back-to-C": mutate(policy, "devin-fusion-opus55", "C"),
+    "fusion-sonnet-back-to-C": mutate(policy, "devin-fusion-sonnet55", "C"),
 }
 added = json.loads(json.dumps(policy))
 added["profiles"]["devin-swe3"] = {

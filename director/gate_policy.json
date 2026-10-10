@@ -158,8 +158,8 @@
     ".github/workflows/ci.yml": "f338b9866dbc320824576c70220dd8d89af5076e841058b7e5d7e2ff88a600a8",
     "bin/wrk": "cfd58e17bbb724a42f78f5ed233a2ab4b0402675b387ccccc5d9a2be250dd618",
     "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
-    "director/SKILL.md": "332114e4a76750b1b2cc45e0a1761cdad458ed115a025bac47f2ec01e8e73921",
-    "spawn-worker/SKILL.md": "338b791ba3faf35d7994c208e64a1451dc1672aeee8e7361721f8c054c7dca14"
+    "director/SKILL.md": "cb11f034731285666bd6fc412c3a7f99ecee2f01a836fa07bbf77cfdc932d0a8",
+    "spawn-worker/SKILL.md": "07b9c31321dff9e797fa5e70bc08391f85a4d048ba5e9ec7885dec8ba9553988"
   },
   "profiles": {
     "agy-flash": {
@@ -1098,7 +1098,7 @@
       "default_effort": "",
       "family": "anthropic",
       "grades": {
-        "": "C"
+        "": "B"
       },
       "launcher": "devin",
       "launcher_model_token": "--model fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
@@ -1116,7 +1116,7 @@
       "default_effort": "",
       "family": "anthropic",
       "grades": {
-        "": "C"
+        "": "B"
       },
       "launcher": "devin",
       "launcher_model_token": "--model fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
@@ -1815,7 +1815,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-10.0",
+  "revision": "2026-10-10.1",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
@@ -1880,7 +1880,7 @@
     },
     "task/1380": {
       "id": 1380,
-      "scope": "devin-fusion-opus55/sonnet55 paid worker+tester spellings in the Claude family; operator 2026-10-10 Devin paid lane supersedes the 09-14 no-paid-Devin line; unmeasured C pending hk 1382 trial reps"
+      "scope": "devin-fusion-opus55/sonnet55 paid worker+tester spellings in the Claude family; operator 2026-10-10 Devin paid lane supersedes the 09-14 no-paid-Devin line; grade B per the merged scopefuel catalog 5e9177b (unmeasured, policy launch grade B) pending hk 1382 trial reps"
     },
     "task/660": {
       "id": 660,
