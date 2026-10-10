@@ -27,7 +27,10 @@ effort `xhigh`로 고정 재사용한다(그 외 `--effort`는 wrk가 거부; �
 (devin 의 effort 는 모델 id 안에 있으므로 swe-2 effort 런그가 builder-devin 의 effort 경로다).
 #666 부터 런그별 빌더 철자도 열려 있다 — `builder-devin-medium`·`builder-devin-max`(무료 swe-2 런그)와
 유료 `builder-ds41`·`builder-ds41-max`(운영자 ds41-builder 정책)로, 각각 워커 변형과 동일 argv이며
-ds41 워커 철자 자체는 계속 worker 전용이다. `builder-grok`·`builder-kimi`의
+ds41 워커 철자 자체는 계속 worker 전용이다. hk 1380 의 유료 fusion 철자
+`devin-fusion-opus55`·`devin-fusion-sonnet55`(Claude 계열, hk 1382 tester/checker 시험)도
+worker/tester 전용이다 — fusion 빌더 사용은 hk 1382 이후 결정이라 `--role builder` 가 두 철자를 거부한다.
+`builder-grok`·`builder-kimi`의
 **정식 등재와 T2 확대는 프로필당 표본 3(빌더 역할 reps)에서 재판단**하며, 라운드 상한 초과나 게이트
 BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌리기 조건이다).
 #704(#594 E6 측정 런그)는 런그별 빌더 철자 `builder-opus-low`·`builder-opus-medium`·

@@ -22,6 +22,9 @@ DEFAULT_RECEIPTS = Path.home() / "work/herdr-inbox/receipts"
 GRADES = ("C", "B", "A", "A+", "S", "S+")
 COMMON_VERSION = "gate-common/1.1"
 MODEL_FAMILY_PREFIXES = (
+    # fusion-claude-* ids run on the devin launcher but carry a Claude primary
+    # model — they are the Claude family for tester separation (hk 1380).
+    ("fusion-claude-", "anthropic"),
     ("claude-", "anthropic"), ("gpt-", "openai"), ("grok-", "xai"),
     ("kimi-", "moonshot"), ("deepseek-", "deepseek"), ("swe-", "cognition"),
     ("gemini-", "google"), ("glm-", "zhipu"), ("qwen", "alibaba"),

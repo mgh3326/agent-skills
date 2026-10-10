@@ -157,6 +157,39 @@ class EligibilityFixtures(unittest.TestCase):
         self.assert_case(checks, "independence", "FAIL", "DS41_T3_SOLE_TESTER")
         self.assert_case(checks, "surface_permission", "FAIL", "PROFILE_SURFACE_DENIED")
 
+    def test_devin_fusion_tester_is_claude_family(self) -> None:
+        # hk 1380: the devin fusion spellings carry the Claude family, so a
+        # fusion tester against a claude builder is same-family (never the
+        # unconditional CROSS_FAMILY pass) while a devin-swe2 or codex
+        # contributor leaves it cross-family eligible. Unmeasured C grade, so
+        # the demo pins required/implementation at C.
+        fusion_models = {
+            "devin-fusion-opus55": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+            "devin-fusion-sonnet55": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+        }
+        for alias, model in fusion_models.items():
+            spec = self.policy["profiles"][alias]
+            self.assertEqual((spec["model"], spec["family"], spec["launcher"]),
+                             (model, "anthropic", "devin"), alias)
+            for contributor, cmodel, want in (
+                ("builder-opus", "claude-opus-5-5", ("UNVERIFIED", "CI_JOB_MISSING")),
+                ("devin-swe2", "swe-2", ("PASS", "CROSS_FAMILY")),
+                ("builder-sol", "gpt-6.1-sol", ("PASS", "CROSS_FAMILY")),
+            ):
+                with self.subTest(alias=alias, contributor=contributor):
+                    evidence = self.evidence(
+                        self.make_head(f"src/{alias}-{contributor}.py"),
+                        declared_t="T1",
+                        required_grade="C", implementation_grade="C")
+                    evidence["contributors"][0].update(
+                        profile=contributor, model=cmodel,
+                        effort="high" if cmodel.startswith(("claude-", "gpt-")) else "")
+                    evidence["tester"] = {"planned_profile": alias,
+                                          "planned_effort": ""}
+                    checks = self.check(evidence)
+                    self.assert_case(checks, "tester", "PASS", "PROFILE_RESOLVED")
+                    self.assert_case(checks, "independence", *want)
+
     def test_same_family_t3_incident_is_rejected(self) -> None:
         evidence = self.evidence(self.make_head("live/guard.py"), declared_t="T3",
                                  required_grade="S+", implementation_grade="S+")

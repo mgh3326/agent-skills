@@ -32,6 +32,12 @@
 #   Every gate spelling that launches a model (worker devin-* and builder
 #   builder-*/builder-devin-* aliases) must carry the same grade.
 #
+# hk 1380 (operator 2026-10-10, Devin paid lane): the two fusion spellings are
+# pinned from `devin models list` (2026-10-10), not from the scopefuel catalog
+# — the catalog rows are hk 1380 Part A, a separate builder. Unmeasured rows
+# carry the same C the other unmeasured devin rungs pin, and stay below
+# devin-ds41's measured A+ by the task's grade ceiling.
+#
 # Every mutant reverts or moves one devin grade and must go RED by assertion.
 set -euo pipefail
 
@@ -64,6 +70,10 @@ EXPECTED = {
     "deepseek-v4-1-flash-max": "C",
     "glm-5-2": "C",
     "swe-1-7": "C",
+    # hk 1380 paid fusion spellings — unmeasured, pinned at the file's
+    # unmeasured convention C (below devin-ds41's measured A+).
+    "fusion-claude-opus-5-5-high-sidekick-swe-2-medium": "C",
+    "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium": "C",
 }
 
 # Policy validity window per gate_policy.json effective_at/expires_at.

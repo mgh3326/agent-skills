@@ -272,7 +272,17 @@ max 좌석 거부).
 scopefuel의 `devin` 풀 하나를 공유하고 worker 전용이다 — 유료 ds41 런그의 빌더
 경로는 `builder-ds41`·`builder-ds41-max` 철자뿐이다. 급은 미측정 —
 `devin-glm52`·`devin-swe17`은 T1, `devin-ds41`·`devin-ds41-max`는 T1/T2로 시작하며
-reps 3건으로 확정한다. `devin-ds41`·`devin-ds41-max`만 유료다.
+reps 3건으로 확정한다. 이 넷 중 `devin-ds41`·`devin-ds41-max`만 유료다.
+
+hk 1380(2026-10-10 운영자 결정 — 09-14 유료 Devin 미사용 선을 이 두 철자에 대해
+대체)은 유료 fusion 철자 `devin-fusion-opus55`·`devin-fusion-sonnet55`를 추가한다 —
+같은 무인 argv에 모델명만 `fusion-claude-opus-5-5-high-sidekick-swe-2-medium`·
+`fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium`. worker/tester 전용이고
+quota pool은 `devin`이지만 게이트는 `devin-swe2`가 아니라 각자의 gate_policy
+항목으로 판정하며 family 는 Claude 계열(anthropic)이다 — claude 빌더의 산출에는
+동일 계열로 간주된다. 미측정 C 로 T1/T2, hk 1382 의 tester/checker 시험 대상.
+`--role builder`는 두 철자를 거부한다(fusion 빌더 사용은 hk 1382 이후 결정).
+Fable·Astra fusion 철자는 없다.
 
 `--t`는 **필수**다(ROB-1198 §③). 빠지면 게이트·claim·스폰 어느 것도 하지 않고
 `NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에

@@ -7,6 +7,9 @@ pool_for() {
   case "$1" in
     opus|sonnet|fable|haiku) echo claude ;;
     devin-swe2) echo devin ;;
+    # hk 1380: the fusion spellings gate at their own catalog rows but stay in
+    # scopefuel's single `devin` quota pool.
+    devin-fusion-opus55|devin-fusion-sonnet55) echo devin ;;
     codex*) echo codex ;;
     kiro*) echo kiro ;;
     oc-gflash|oc-sonnet46|oc-oss) echo agy ;;
