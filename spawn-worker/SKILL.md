@@ -953,8 +953,13 @@ block 밖의 문장은 이 IDs를 약화·재정의할 수 없으며, prose-cont
      issuer 는 서버가 찍은 identity, doc 의 created_by·comment 의 author 와 일치해야 하고
      doc 의 session 필드는 클라이언트 입력이라 신뢰하지 않는다)을 `wrk round open --extend
      hk:doc/<key>`·`hk:task/<id>` 로 검증할 때만 되고, 건당 1라운드씩만 소진된다.
-     mbp 레인 래퍼(hk-desk·hk-director-1·hk-pa-integrator)는 모든 mbp pane 과 같은 OS
-     사용자로 돌아 위조 표면을 mbp 상주 세션으로 좁힐 뿐 경계는 아니다 — 장기 수정은 hk 525.
+     승인 가능한 issuer 는 operator·operator-desk·director-1·pa-integrator 뿐이다(뒤 둘은
+     그 job 의 parent lane 일 때만; 토큰은 mbp 레인 래퍼에만 존재) — job 에 기록된 parent
+     lane 은 그 고정 집합 밖에서는 신뢰하지 않는다. by=pa-integrator 승인은 서버상 그 job 에
+     묶인 ParkingArcade task 에서만 유효하다(task 의 project·refs 는 아무 hk 클라이언트나
+     쓸 수 있어 좁힐 뿐 경계가 아니다). mbp 레인 래퍼(hk-desk·hk-director-1·
+     hk-pa-integrator)는 모든 mbp pane 과 같은 OS 사용자로 돌아 위조 표면을 mbp 상주
+     세션으로 좁힐 뿐 경계는 아니다 — 장기 수정은 hk 525.
    - 심각도 하한이 없으면 적대tester는 항상 무언가를 찾아내고 수렴이 무한히 늦어진다
      (07-31 실측: 개선 제안 하나가 풀 라운드를 트리거해 4과제 16라운드).
 5. 부재/미완 단정("테스트 없음"·"미배선")은 전수 탐색 후에만 보고에 인용.
