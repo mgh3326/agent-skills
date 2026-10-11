@@ -771,6 +771,9 @@ wake_wait = 300
 - 레인 자격증명 체인(#1397): lanes route(`lanes add/ls/rm`, `wrk lanes-missing`)가 쓰는
   credential은 `lanes_token_env` → 없으면 `operator_token_env` → 없으면 `hub_token_env` 순이다.
   PUT /v1/lanes 는 operator 토큰만 받으므로 operator_token_env가 lanes를 authorizing할 수 있다.
+  같은 체인이 worker 등록에도 적용된다 — 자기 session_machine_ids 엔트리에 매핑된 worker는
+  operator_token_env만 설정된 호스트에서도 등록된다(#965 당시보다 넓어진 의도된 변화다;
+  reap의 `lanes rm`도 같은 체인을 따라가므로 대칭이다).
   예외 — 원격 `--host` builder 등록은 다른 머신의 레인을 쓰므로 `operator_token_env`를 먼저
   쓰고, 없을 때만 공유 체인으로 폴백한다(노드 스코프 lanes 토큰은 자기 호스트의 레인만
   authorizing한다고 가정).
@@ -787,11 +790,21 @@ wake_wait = 300
 - **원격 `--host NAME` builder 스폰의 레인(#1397)**: 실행 호스트는 operator credential이
   없으므로 `lanes add`를 스폰을 시킨 호스트가 한다 — 위임된 wrk는 `--lane-defer <host key>`를
   받아 panewire 호출 없이 `hub_lane`/`hub_lane_machine`만 자기 `job.spawned` receipt에 기록하고,
-  시작 호스트는 원격이 rc 0으로 답한 뒤 `lanes add`를 직접 친다(machine = 그 호스트의
-  hosts.toml 키 — 그 키가 곧 허브 머신 id다). 이 경로는 빌더 전용이다 — 원격 worker에게는
+  시작 호스트는 원격이 `OK pane=` 줄을 찍고 pane이 살아 있는 rc(0, 또는 landing 미확인 76)
+  로 답할 때 `lanes add`를 직접 친다(machine = 그 호스트의
+  hosts.toml 키 — 그 키가 곧 허브 머신 id다). add가 건너뛰어지거나 실패하면 그 줄의
+  `lane=`은 `UNREGISTERED`로 다시 쓰인다 — 시작 호스트가 확인하지 않은 `lane=L@M`은
+  절대 그대로 통과하지 않는다. 이 경로는 빌더 전용이다 — 원격 worker에게는
   `--lane-defer`도 시작 호스트의 `lanes add`도 없고, 실행 호스트가 자신의
   `session_machine_ids`로 보통의 worker 조회를 한다. receipt는 job과 함께 실행 호스트에
-  있으므로 `wrk reap`은 그곳에서 pane 검증을 거쳐 같은 machine+pane 가드로 `lanes rm`을 친다.
+  있으므로 `wrk reap`은 그곳에서 pane 검증을 거쳐 같은 machine+pane 가드로 `lanes rm`을
+  치는데, **`lanes rm`은 허브 호출이므로 실행 호스트 자신이 lanes credential을 들고
+  있을 때만 지워진다** — credential이 없는 실행 호스트의 reap은 경고를 남기고 허브 행은
+  남긴다(step-4 머신 스코프 토큰이 오기 전까지의 알려진 공백; `lanes rm`은 어느
+  operator-credentialed 호스트에서든 칠 수 있다).
+  알려진 순서 공백 — `--lane-defer` 스폰의 hk task claim+link는 deferred receipt 기록
+  **이전**에 일어난다. receipt 쓰기가 실패하면 pane은 닫히지만 task는 실제로 돌지 않은
+  job에 묶인 채 남고, 재시도는 hk의 already-bound 거절에 걸릴 수 있다.
 - `quota_gate = "local"`(#1138)은 그 local-only 상태의 명시적 opt-out이다 — M1 같은
   lanes-only 호스트가 쓴다. `hub_url`이 있고 `hub_token_env`가 없는 `[hub]`는 매 spawn마다
   게이트가 건너뛰어지고 local scopefuel gate만 적용된다는 경고를 stderr에 정확히 한 번

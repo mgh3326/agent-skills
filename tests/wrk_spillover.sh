@@ -226,6 +226,16 @@ hub_landed_no_out="$(WRK_HUB_SCENARIO=landed_no run_hub "$ROOT/bin/wrk" "$HUB_CO
 grep -Eq '^OK pane=pane-a host=machine-a .* status=idle landed=no job=job-a$' <<<"$hub_landed_no_out"
 printf '%s\n' 'PASS wrk-spillover hub-stdout-tail-landing'
 
+# #1397 S4: a BUILDER over the via=hub transport must still state its lane
+# outcome — the transport carries no registration-confirmation channel, so
+# the emitted line ends lane=UNREGISTERED rather than omitting lane= (the
+# worker shape) or claiming a lane nobody confirmed.
+hub_builder_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+  -m builder-sol --role builder --lane b-hub --parent director-x --task "$HK_TASK_ID" 2>&1)"
+grep -Eq '^OK pane=pane-a host=machine-a .* status=working landed=yes job=job-a lane=UNREGISTERED$' <<<"$hub_builder_out" ||
+  { echo 'FAIL wrk-spillover hub-builder-ok-line-lane-unregistered'; echo "$hub_builder_out"; exit 1; }
+printf '%s\n' 'PASS wrk-spillover hub-builder-ok-line-lane-unregistered'
+
 # A 504 pending reply polls once under WRK_NO_SLEEP and emits the same result.
 : >"$TMP/hub.log"
 hub_pending_out="$(WRK_HUB_SCENARIO=pending run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"

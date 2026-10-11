@@ -118,6 +118,16 @@ if [[ "$remote" == *'wrk spawn'* ]]; then
       printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local}" >&2
       exit 80
       ;;
+    remote-ok-nonzero)
+      # #1397 B1: a deferred remote BUILDER prints its OK line — including
+      # the unconfirmed lane= field its --lane-defer branch emits — then
+      # exits nonzero (76 = landing-strict landed=no, pane left up). The
+      # initiator must settle that field: a confirmed lanes add keeps
+      # lane=L@HOST, anything else becomes lane=UNREGISTERED — never a
+      # pass-through of a lane nobody added.
+      printf 'OK pane=%s:p7 host=local model=builder-sol label=fixture status=working landed=no job=fixture lane=fixture@%s\n' "$host" "$host"
+      exit "${WRK_REMOTE_RC:-76}"
+      ;;
     remote-warn-ok)
       # A winning remote wrk may still talk on stderr (quota notes, warnings);
       # on main that text streamed live even when the spawn succeeded.

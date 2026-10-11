@@ -3476,6 +3476,27 @@ printf '%s\n' '[hub]' 'hub_url = "https://hub.invalid"' \
   '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' \
   'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
   'capacity = 3' >"$LANES_CFG_REMOTE_BOTH"
+# A two-candidate delegation config for --host auto: pressured local means
+# the router walks desktop then mac-work in file order, so stop-set and
+# transport-normalization behavior around rc 82 is observable in -ssh.log.
+LANES_CFG_REMOTE_AUTO="$TMP/lanes-1397-remote-auto-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://hub.invalid"' \
+  "operator_token_env = \"$LANES_OP_FILE\"" "hub_cf_env = \"$LANES_CF_FILE\"" \
+  'machine_id = "mac-personal"' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' \
+  'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
+  'capacity = 3' '' \
+  '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' \
+  'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
+  'capacity = 2' >"$LANES_CFG_REMOTE_AUTO"
+T1397_LOAD_HIGH="$TMP/t1397-loadavg-high"
+printf '4.00 4.00 4.00 1/1 1\n' >"$T1397_LOAD_HIGH"
+# A session map that maps SOME OTHER session plus machine_id — proves the
+# machine_id fallback never leaks to workers (tester mu02).
+LANES_CFG_OP_OTHERMAP="$TMP/lanes-1397-othermap-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "mac-personal"\nsession_machine_ids = { "other-session" = "other-machine" }\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" >"$LANES_CFG_OP_OTHERMAP"
 
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
@@ -3542,6 +3563,14 @@ t1397_remote_spawn() {
     WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
     WRK_SSH_LOG="$T1397_SSH" WRK_SCP_LOG="$TMP/t1397-$name-scp.log" \
     WRK_SSH_SCENARIO="${T1397_SSH_SCENARIO:-ok}" \
+    WRK_SSH_SCENARIO_DESKTOP="${T1397_SSH_SCENARIO_DESKTOP:-}" \
+    WRK_SSH_SCENARIO_MAC_WORK="${T1397_SSH_SCENARIO_MAC_WORK:-}" \
+    WRK_SSH_CALL_COUNT_FILE="${T1397_SSH_CALL_COUNT_FILE:-}" \
+    WRK_SSH_FAIL_CALLS="${T1397_SSH_FAIL_CALLS:-}" \
+    WRK_SSH_FAIL_CODE="${T1397_SSH_FAIL_CODE:-}" \
+    WRK_REMOTE_RC="${T1397_REMOTE_RC:-}" \
+    WRK_PROC_LOADAVG="${T1397_LOAD_FILE:-}" \
+    WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 \
     WRK_HOSTS_CONFIG="${T1397_CFG_OVERRIDE:-$LANES_CFG_REMOTE}" \
     WRK_PANEWIRE_LANES_LOG="$T1397_CALLS" \
     "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m builder-sol \
@@ -4676,17 +4705,24 @@ import json, sys
 meta = json.loads(sys.stdin.read())
 assert meta["hub_lane"] == "b1397-defer" and meta["hub_lane_machine"] == "desktop", meta' ||
     fail "#1397 AC2b: the execution-host receipt must record lane+defer machine"
-  # A deferred WORKER records its label lane under the defer id the same way.
+  # A deferred WORKER is refused outright (tester N1): --lane-defer is
+  # builder-only — a worker handed the flag would print a lane= field it
+  # never registered. rc 2 (usage), no pane, zero lanes calls.
   HERDR_SESSION=default lanes_spawn w1397-defer --owner work-kairos --lane-defer desktop
-  [[ "$LANES_RC" -eq 0 ]] ||
-    fail "#1397 AC2b: deferred worker spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1397 AC2b: --lane-defer on a worker must refuse rc 2 (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  grep -q -- '--lane-defer requires --role builder' "$LANES_ERR" ||
+    fail "#1397 AC2b: the refusal must name the builder-only rule: $(cat "$LANES_ERR")"
   lanes_assert_no_lanes_call w1397-defer
-  lanes_spawned_payload w1397-defer | python3 -c '
-import json, sys
-meta = json.loads(sys.stdin.read())
-assert meta["hub_lane"] == "w1397-defer" and meta["hub_lane_machine"] == "desktop", meta' ||
-    fail "#1397 AC2b: the deferred worker receipt must record lane+defer machine"
-  echo "PASS 1397-lanes AC2b: --lane-defer records the receipt and never calls panewire"
+  # And a malformed defer id answers the same charset as [hub] machine_id.
+  LANES_MODEL=builder-sol \
+    lanes_spawn b1397-deferbad --role builder --lane b1397-deferbad --parent director-x --lane-defer 'bad/host'
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1397 AC2b: a malformed --lane-defer must refuse rc 2 (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  grep -q 'matching \[A-Za-z0-9._-\]' "$LANES_ERR" ||
+    fail "#1397 AC2b: the refusal must name the machine-id charset: $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call b1397-deferbad
+  echo "PASS 1397-lanes AC2b: --lane-defer is builder-only, validated, and never calls panewire"
 
   # AC2c — reap on the execution host removes a remote-registered lane the
   # same way: hub_lane_machine is the host key, and `lanes ls` must still
@@ -4794,6 +4830,41 @@ assert lanes_file not in got, "lanes_token_env must not authorize a cross-machin
 PY
     fail "#1397 AC2f: the remote add must prefer operator_token_env over lanes_token_env"
   echo "PASS 1397-lanes AC2f: the remote add prefers operator_token_env"
+
+  # AC2g — an OK pane= line settles the builder lane whatever the remote rc
+  # (tester B1): a deferred remote builder that prints its OK line then
+  # exits nonzero — landing-strict's 76 leaves the pane up — must NOT pass
+  # its unconfirmed lane= through. rc 76 runs the initiator add as rc 0
+  # does; a failed add, or a non-pane-valid rc, rewrites the field to
+  # lane=UNREGISTERED. The fixture's printed lane=fixture@desktop is the
+  # exact pass-through this guards against.
+  T1397_SSH_SCENARIO=remote-ok-nonzero T1397_REMOTE_RC=76 \
+    t1397_remote_spawn b1397-ok76
+  [[ "$T1397_RC" -eq 76 ]] ||
+    fail "#1397 AC2g: the remote's 76 must propagate (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -qxF 'add' "$T1397_CALLS" ||
+    fail "#1397 AC2g: rc 76 leaves the pane up — the add must run: $(cat "$T1397_CALLS")"
+  grep -q ' lane=b1397-ok76@desktop$' "$T1397_OUT" ||
+    fail "#1397 AC2g: a confirmed add keeps lane=L@HOST: $(cat "$T1397_OUT")"
+  ! grep -q 'fixture@desktop' "$T1397_OUT" ||
+    fail "#1397 AC2g: the unconfirmed remote lane= must never pass through"
+  WRK_PANEWIRE_LANES_RC=5 T1397_SSH_SCENARIO=remote-ok-nonzero T1397_REMOTE_RC=76 \
+    t1397_remote_spawn b1397-ok76fail
+  [[ "$T1397_RC" -eq 76 ]] ||
+    fail "#1397 AC2g: rc 76 still propagates when the add fails (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -q ' lane=UNREGISTERED$' "$T1397_OUT" ||
+    fail "#1397 AC2g: a failed add rewrites the field to UNREGISTERED: $(cat "$T1397_OUT")"
+  ! grep -q 'fixture@desktop' "$T1397_OUT" ||
+    fail "#1397 AC2g: the unconfirmed remote lane= must never pass through"
+  T1397_SSH_SCENARIO=remote-ok-nonzero T1397_REMOTE_RC=42 \
+    t1397_remote_spawn b1397-ok42
+  [[ "$T1397_RC" -eq 42 ]] ||
+    fail "#1397 AC2g: a non-pane-valid rc propagates (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  [[ ! -s "$T1397_CALLS" ]] ||
+    fail "#1397 AC2g: rc 42 is not pane-valid — no add may run: $(cat "$T1397_CALLS")"
+  grep -q ' lane=UNREGISTERED$' "$T1397_OUT" ||
+    fail "#1397 AC2g: an unconfirmed lane= is still settled to UNREGISTERED: $(cat "$T1397_OUT")"
+  echo "PASS 1397-lanes AC2g: an OK line settles the lane whatever the remote rc"
 
   # AC3 — every builder registration failure is loud on the OK line but
   # never fails the spawn: rc 0, `OK pane=w:p1` still there (the pane is not
@@ -4923,17 +4994,18 @@ got = open(sys.argv[1], encoding="utf-8").read().splitlines()
 assert got == want, "lanes-missing output mismatch: got=%r want=%r" % (got, want)
 PY
     fail "#1397 AC5: findings must name absent lanes and parents exactly"
-  # Read-only: the lanes log holds exactly one call and it is `ls`.
+  # Read-only: the lanes log holds exactly one call and it is `ls` — never a
+  # second listing (tester mu16), an add or an rm.
   python3 - "$T1397_LM_LOG" <<'PY' ||
 import sys
 try:
     got = [line for line in open(sys.argv[1], encoding="utf-8").read().splitlines() if line != "--"]
 except OSError:
     raise SystemExit("lanes-missing made no panewire call")
-assert got[0] == "ls" and "add" not in got and "rm" not in got, \
-    "lanes-missing must call only `lanes ls`: %r" % got
+assert got[0] == "ls" and got.count("ls") == 1 and "add" not in got and "rm" not in got, \
+    "lanes-missing must call `lanes ls` exactly once: %r" % got
 PY
-    fail "#1397 AC5: the audit may only call lanes ls"
+    fail "#1397 AC5: the audit may only call lanes ls, exactly once"
   # A failed listing dies nonzero; a host with no hub credential does too —
   # the audit must never guess.
   WRK_PANEWIRE_LANES_LS_RC=9 t1397_lanes_missing lsfail
@@ -4946,6 +5018,75 @@ PY
   [[ "$T1397_LM_RC" -eq 0 ]] ||
     fail "#1397 AC5: lanes-missing --help must answer rc 0"
   echo "PASS 1397-lanes AC5: lanes-missing audits read-only and dies on bad input"
+
+  # AC6 — the [hub] machine_id fallback is builder-only (tester mu02): a
+  # worker whose session is not in the map must NOT inherit the host's own
+  # machine id — a fleet worker never becomes a global lane. The map maps
+  # another session, so the lookup runs and misses; machine_id is set, and a
+  # worker-fallback mutant would register it on mac-personal.
+  LANES_CFG_OVERRIDE="$LANES_CFG_OP_OTHERMAP" HERDR_SESSION=default \
+    lanes_spawn w1397-wmap --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1397 AC6: an unmapped worker still spawns warn-only (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call w1397-wmap
+  grep -q "session 'default' has no session_machine_ids entry" "$LANES_ERR" ||
+    fail "#1397 AC6: the worker warning must name the unmapped session: $(cat "$LANES_ERR")"
+  ! grep -q 'machine_id is unset' "$LANES_ERR" ||
+    fail "#1397 AC6: a worker must never reach the machine_id fallback: $(cat "$LANES_ERR")"
+  ! grep -q ' lane=' "$LANES_OUT" ||
+    fail "#1397 AC6: an unmapped worker's OK line carries no lane= field"
+  echo "PASS 1397-lanes AC6: the machine_id fallback never applies to workers"
+
+  # AC7 — under --host auto a remote 82 stops the candidate round (tester
+  # mu09): the pane exists on that host, so re-placing the job on the next
+  # candidate would double-spawn it. Two 82 sources: the remote wrk's own
+  # strict answer, and the initiator's strict rewrite after a refused add.
+  T1397_HOST=auto T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_AUTO" \
+    T1397_LOAD_FILE="$T1397_LOAD_HIGH" \
+    T1397_SSH_SCENARIO_DESKTOP=remote-die-stderr T1397_REMOTE_RC=82 \
+    t1397_remote_spawn b1397-auto82
+  [[ "$T1397_RC" -eq 82 ]] ||
+    fail "#1397 AC7: a remote 82 must propagate (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  ! grep -q 'mac-work' "$T1397_SSH" ||
+    fail "#1397 AC7: a remote 82 must stop the round before mac-work: $(cat "$T1397_SSH")"
+  T1397_HOST=auto T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_AUTO" \
+    T1397_LOAD_FILE="$T1397_LOAD_HIGH" \
+    WRK_LANE_STRICT=1 WRK_PANEWIRE_LANES_RC=5 \
+    t1397_remote_spawn b1397-strictauto
+  [[ "$T1397_RC" -eq 82 ]] ||
+    fail "#1397 AC7: strict must turn the refused add into 82 (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  ! grep -q 'mac-work' "$T1397_SSH" ||
+    fail "#1397 AC7: a strict 82 must stop the round — no double spawn on mac-work: $(cat "$T1397_SSH")"
+  grep -q ' lane=UNREGISTERED$' "$T1397_OUT" ||
+    fail "#1397 AC7: the OK line still marks UNREGISTERED under strict: $(cat "$T1397_OUT")"
+  echo "PASS 1397-lanes AC7: a remote or initiator 82 stops the auto round"
+
+  # AC8 — a TRANSPORT leg exiting 82 normalizes to 1 and the round moves on
+  # (tester mu10): an admission code may only be the remote wrk's own answer.
+  # The first ssh call is desktop's probe; failing it with 82 must hand the
+  # spawn to mac-work, not stop the round.
+  T1397_HOST=auto T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_AUTO" \
+    T1397_LOAD_FILE="$T1397_LOAD_HIGH" \
+    T1397_SSH_CALL_COUNT_FILE="$TMP/t1397-ssh-count-ac8" \
+    T1397_SSH_FAIL_CALLS=1 T1397_SSH_FAIL_CODE=82 \
+    t1397_remote_spawn b1397-t82
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1397 AC8: a transport 82 must normalize and let mac-work win (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -q 'mac-work.*wrk spawn' "$T1397_SSH" ||
+    fail "#1397 AC8: the round must reach mac-work: $(cat "$T1397_SSH")"
+  echo "PASS 1397-lanes AC8: a transport-leg 82 normalizes and the round moves on"
+
+  # AC9 — WRK_LANE_STRICT is builder-only (tester mu11): an unregistered
+  # worker stays rc 0 under strict — strict marks the builder lane contract,
+  # never the worker's warn-only #965 path.
+  WRK_LANE_STRICT=1 LANES_CFG_OVERRIDE="$LANES_CFG_NOCRED" \
+    lanes_spawn w1397-strict --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1397 AC9: strict must never apply to a worker (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  grep -q '^OK pane=w:p1 ' "$LANES_OUT" ||
+    fail "#1397 AC9: the worker OK line still prints: $(cat "$LANES_OUT")"
+  lanes_assert_no_lanes_call w1397-strict
+  echo "PASS 1397-lanes AC9: WRK_LANE_STRICT never applies to workers"
 
   # -- #1397 assertion-RED mutants -----------------------------------------
   # M1: the builder gate back to worker-only — the mapped builder spawn then
@@ -5029,8 +5170,8 @@ PY
   # AC2d's add-argv assertion rejects.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-1397-workeradd \
-    '  if [[ "$rc" -eq 0 && "$remote_lane_role" == builder && -n "$remote_lane_name" ]]; then' \
-    '  if [[ "$rc" -eq 0 && -n "$remote_lane_name" ]]; then'
+    '  if [[ "$remote_lane_role" == builder && -n "$remote_lane_name" ]]; then' \
+    '  if [[ -n "$remote_lane_name" ]]; then'
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-workeradd" \
     T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_WMAP" \
     t1397_remote_worker w1397-m6 --owner work-kairos
@@ -5060,6 +5201,88 @@ assert got[i + 1] == lanes_file, \
 PY
     fail "#1397 M7 mutant survived: the remote add still preferred the operator credential"
   echo "PASS 1397-lanes M7: shared-chain credential order on the remote add goes RED"
+
+  # M8: the rc-0 gate back on the settle block (tester B1/mu06-shaped): an
+  # OK-line-plus-nonzero remote then keeps its unconfirmed lane=fixture@
+  # through, which AC2g rejects on BOTH halves — no add ran, and the field
+  # was never rewritten.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-r0gate \
+    '    if [[ -n "$remote_pane" ]]; then' \
+    '    if [[ "$rc" -eq 0 && -n "$remote_pane" ]]; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-r0gate" \
+    T1397_SSH_SCENARIO=remote-ok-nonzero T1397_REMOTE_RC=76 \
+    t1397_remote_spawn b1397-m8
+  if [[ -s "$T1397_CALLS" ]] || ! grep -q 'fixture@desktop' "$T1397_OUT"; then
+    fail "#1397 M8 mutant survived: the rc 76 lane was still settled"
+  fi
+  echo "PASS 1397-lanes M8: restoring the rc-0 settle gate goes RED"
+
+  # M9: machine_id fallback applied to workers (tester mu02) — a worker
+  # whose session misses the map then registers on the host's own machine
+  # id, which AC6's zero-calls assertion rejects.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-workmachine \
+    '  if [[ -z "$machine" && "$ROLE" == builder ]]; then' \
+    '  if [[ -z "$machine" ]]; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-workmachine" \
+    LANES_CFG_OVERRIDE="$LANES_CFG_OP_OTHERMAP" HERDR_SESSION=default \
+    lanes_spawn w1397-m9 --owner work-kairos
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#1397 M9 mutant survived: the worker still did not register"
+  fi
+  echo "PASS 1397-lanes M9: the machine_id fallback reaching workers goes RED"
+
+  # M10: 82 out of the auto-router stop set (tester mu09) — the strict
+  # remote answer then falls through and the job double-spawns on mac-work,
+  # which AC7's no-mac-work assertion rejects.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-stopset \
+    '    case "$last_rc" in
+      2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_LANE_UNREGISTERED")' \
+    '    case "$last_rc" in
+      2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE")'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-stopset" \
+    T1397_HOST=auto T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_AUTO" \
+    T1397_LOAD_FILE="$T1397_LOAD_HIGH" \
+    T1397_SSH_SCENARIO_DESKTOP=remote-die-stderr T1397_REMOTE_RC=82 \
+    t1397_remote_spawn b1397-m10
+  if ! grep -q 'mac-work.*wrk spawn' "$T1397_SSH"; then
+    fail "#1397 M10 mutant survived: mac-work was never double-spawned"
+  fi
+  echo "PASS 1397-lanes M10: removing 82 from the auto stop set goes RED"
+
+  # M11: 82 out of the transport normalizer (tester mu10) — a transport-leg
+  # 82 then reads as an admission answer and stops the round, which AC8's
+  # mac-work-win assertion rejects.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-transport82 \
+    '    2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_CONFIG_REFUSED"|"$WRK_EXIT_LANE_UNREGISTERED") printf '"'"'1'"'"' ;;' \
+    '    2|"$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"$WRK_EXIT_JOB_STATE_UNREADABLE"|"$WRK_EXIT_CONFIG_REFUSED") printf '"'"'1'"'"' ;;'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-transport82" \
+    T1397_HOST=auto T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_AUTO" \
+    T1397_LOAD_FILE="$T1397_LOAD_HIGH" \
+    T1397_SSH_CALL_COUNT_FILE="$TMP/t1397-ssh-count-m11" \
+    T1397_SSH_FAIL_CALLS=1 T1397_SSH_FAIL_CODE=82 \
+    t1397_remote_spawn b1397-m11
+  if [[ "$T1397_RC" -eq 0 ]]; then
+    fail "#1397 M11 mutant survived: the transport 82 still normalized"
+  fi
+  echo "PASS 1397-lanes M11: a transport leg keeping 82 goes RED"
+
+  # M12: WRK_LANE_STRICT applied to workers (tester mu11) — an unregistered
+  # worker then answers 82, which AC9's rc-0 assertion rejects.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-strictworker \
+    '  if [[ "$ROLE" == builder && -z "${HUB_LANE:-}" && "${WRK_LANE_STRICT:-0}" == 1 ]]; then' \
+    '  if [[ -z "${HUB_LANE:-}" && "${WRK_LANE_STRICT:-0}" == 1 ]]; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-strictworker" \
+    WRK_LANE_STRICT=1 LANES_CFG_OVERRIDE="$LANES_CFG_NOCRED" \
+    lanes_spawn w1397-m12 --owner work-kairos
+  if [[ "$LANES_RC" -ne 82 ]]; then
+    fail "#1397 M12 mutant survived: the worker did not answer 82"
+  fi
+  echo "PASS 1397-lanes M12: strict reaching workers goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then
