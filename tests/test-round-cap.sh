@@ -27,11 +27,11 @@ H4=4444444444444444444444444444444444444444
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-mkjob() { # mkjob <name> — builder claim envelope
+mkjob() { # mkjob <name> [parent-lane] — builder claim envelope
   local events="$ARBITER_INBOX_ROOT/$1/events"
   mkdir -p "$events"
   cat >"$events/00001-job.claim.json" <<EOF
-{"created_at":"2026-09-27T00:00:00Z","job_id":"$1","kind":"job.claim","payload":{"agent_label":"$1","owner_lane":"$1-lane","pane_id":"w:p1","parent_lane":"director-1","role":"builder","t_level":"T2"},"seq":1}
+{"created_at":"2026-09-27T00:00:00Z","job_id":"$1","kind":"job.claim","payload":{"agent_label":"$1","owner_lane":"$1-lane","pane_id":"w:p1","parent_lane":"${2:-director-1}","role":"builder","t_level":"T2"},"seq":1}
 EOF
 }
 
@@ -74,20 +74,28 @@ cat >"$TMP/hk-template" <<'EOF'
 # handoffkeep stub: doc get <key> / tasks comments <id> (JSON with \n escapes)
 if [[ "$1 $2" == "doc get" ]]; then
   case "$3" in
-    good2)   printf '{"session":"director-1","body":"approved\\nround-extension: job=JOB extra=2 by=director-1\\n"}' ;;
-    forged)  printf '{"session":"JOB-lane","body":"round-extension: job=JOB extra=5 by=director-1\\n"}' ;;
-    wrongj)  printf '{"session":"director-1","body":"round-extension: job=other-job extra=9 by=director-1\\n"}' ;;
-    opdoc)   printf '{"session":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator\\n"}' ;;
-    opgood)  printf '{"session":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator-desk\\n"}' ;;
-    badws)   printf '{"session":"director-1","body":"  round-extension :  job=JOB\\textra=1\\tby=director-1  \\n"}' ;;
-    selfops) printf '{"session":"JOB-lane","body":"round-extension: job=JOB extra=5 by=JOB-lane\\n"}' ;;
-    nogrant) printf '{"session":"director-1","body":"looks approved but no grant line\\n"}' ;;
+    good2)      printf '{"session":"director-1","created_by":"director-1","body":"approved\\nround-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    good2diff)  printf '{"session":"mac-personal","created_by":"director-1","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    good2nosess) printf '{"session":"","created_by":"director-1","body":"round-extension: job=JOB extra=1 by=director-1\\n"}' ;;
+    forged)     printf '{"session":"JOB-lane","created_by":"JOB-lane","body":"round-extension: job=JOB extra=5 by=director-1\\n"}' ;;
+    sessforge)  printf '{"session":"director-1","created_by":"mac-personal","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    pasess)     printf '{"session":"pa-integrator","created_by":"mac-personal","body":"round-extension: job=JOB extra=1 by=pa-integrator\\n"}' ;;
+    padoc)      printf '{"session":"","created_by":"pa-integrator","body":"round-extension: job=JOB extra=1 by=pa-integrator\\n"}' ;;
+    macdoc)     printf '{"session":"mac-personal","created_by":"mac-personal","body":"round-extension: job=JOB extra=1 by=mac-personal\\n"}' ;;
+    nocreated)  printf '{"session":"director-1","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    wrongj)     printf '{"session":"director-1","created_by":"director-1","body":"round-extension: job=other-job extra=9 by=director-1\\n"}' ;;
+    opdoc)      printf '{"session":"operator-desk","created_by":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator\\n"}' ;;
+    opgood)     printf '{"session":"operator-desk","created_by":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator-desk\\n"}' ;;
+    badws)      printf '{"session":"director-1","created_by":"director-1","body":"  round-extension :  job=JOB\\textra=1\\tby=director-1  \\n"}' ;;
+    selfops)    printf '{"session":"JOB-lane","created_by":"JOB-lane","body":"round-extension: job=JOB extra=5 by=JOB-lane\\n"}' ;;
+    nogrant)    printf '{"session":"director-1","created_by":"director-1","body":"looks approved but no grant line\\n"}' ;;
     *) printf 'not_found' ;;
   esac
 elif [[ "$1 $2" == "tasks comments" ]]; then
   case "$3" in
     91) printf '{"comments":[{"author":"mac-personal","body":"go one more\\nround-extension: job=JOB extra=1 by=mac-personal\\n"}]}' ;;
     92) printf '{"comments":[{"author":"JOB-lane","body":"round-extension: job=JOB extra=3 by=director-1\\n"}]}' ;;
+    93) printf '{"comments":[{"author":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator-desk\\n"}]}' ;;
     *)  printf '{"comments":[]}' ;;
   esac
 else
@@ -191,14 +199,20 @@ mk_hk je
 export HANDOFFKEEP_BIN="$TMP/hk-je"
 for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" je "$h"; done
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/missing
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/forged   # own session claims director-1
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/wrongj   # grant names another job
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/opdoc    # by=operator but session is operator-desk
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/badws    # noncanonical grant whitespace
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/selfops  # own lane in WRK_ROUND_CAP_OPERATORS must be ignored
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/nogrant  # no grant line
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/92      # comment author is the builder
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:bogus/x      # unknown ref scheme
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/forged    # own created_by claims director-1
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/sessforge # session says director-1, created_by is mac-personal
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/nocreated # no server-set identity at all
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/pasess    # session pa-integrator, created_by mac-personal
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/padoc     # pa-integrator is not this job's parent lane
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/macdoc    # mac-personal dropped from the trusted set
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/wrongj    # grant names another job
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/opdoc     # by=operator but created_by is operator-desk
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/badws     # noncanonical grant whitespace
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/selfops   # own lane in WRK_ROUND_CAP_OPERATORS must be ignored
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/nogrant   # no grant line
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/91       # comment author mac-personal no longer trusted
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/92       # comment author is the builder
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:bogus/x       # unknown ref scheme
 expect_rc 78 "$WRK" round open je --head "$H4"                         # still capped afterwards
 [[ "$(find "$ARBITER_INBOX_ROOT/je/events" -name '*-job.round.json' | wc -l)" -eq 3 ]] ||
   fail "a refused extension still wrote a job.round"
@@ -233,16 +247,35 @@ assert [e["rounds"] for e in esc] == [3, 5], esc
 PY
 echo "PASS extension-doc-grant-consumed-per-round"
 
-# ── extension: task comment by operator identity buys exactly one open ──────
+# ── extension: task comment author is server-set; mac-personal cannot grant ──
 mkjob jt
 mk_hk jt
 export HANDOFFKEEP_BIN="$TMP/hk-jt"
 for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jt "$h"; done
-"$WRK" round open jt --head "$H4" --extend hk:task/91 >/dev/null
-expect_rc 78 "$WRK" round open jt --head "$H4" --extend hk:task/91
+"$WRK" round open jt --head "$H4" --extend hk:task/93 >/dev/null        # operator-desk comment grants
+expect_rc 78 "$WRK" round open jt --head "$H4" --extend hk:task/93
 echo "PASS extension-task-comment-one-round"
 
-# ── extension: operator doc grant where by= equals the session ──────────────
+# ── extension: doc session is ignored — only server-set created_by counts ────
+mkjob jd
+mk_hk jd
+export HANDOFFKEEP_BIN="$TMP/hk-jd"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jd "$h"; done
+"$WRK" round open jd --head "$H4" --extend hk:doc/good2diff >/dev/null   # session disagrees, created_by director-1 grants
+"$WRK" round open jd --head "$H4" --extend hk:doc/good2nosess >/dev/null # empty session still grants on created_by
+expect_rc 78 "$WRK" round open jd --head "$H4" --extend hk:doc/good2nosess # extra=1 consumed
+echo "PASS extension-doc-session-ignored"
+
+# ── extension: parent-lane grant needs the lane's own server-set client id ────
+mkjob jp pa-integrator
+mk_hk jp
+export HANDOFFKEEP_BIN="$TMP/hk-jp"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jp "$h"; done
+"$WRK" round open jp --head "$H4" --extend hk:doc/padoc >/dev/null       # created_by pa-integrator is this job's parent lane
+expect_rc 78 "$WRK" round open jp --head "$H4" --extend hk:doc/padoc     # extra=1 consumed
+echo "PASS extension-parent-lane-grant"
+
+# ── extension: operator doc grant where by= equals the created_by ────────────
 mkjob jg
 mk_hk jg
 export HANDOFFKEEP_BIN="$TMP/hk-jg"
@@ -309,7 +342,9 @@ for anchor in (
     'r"^round-extension: job=(\\S+) extra=(\\d+) by=(\\S+)$"',
     "{40})\\s*$",
     "if len(matches) > 1:",
-    'ROUND_CAP_OPERATORS="operator operator-desk mac-personal"',
+    'ROUND_CAP_OPERATORS="operator operator-desk"',
+    'doc.get("created_by")',
+    "allowed_issuers = {parent} | ops",
     "                and isinstance(r.get(\"rounds\"), int) and r[\"rounds\"] >= used):",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
@@ -433,7 +468,7 @@ echo "PASS mutant-multi"
 # mutant: the operator set becomes env-widenable again — a builder adds its own
 # lane and its own doc grants itself. RED proof: selfops must grant (rc=0).
 # shellcheck disable=SC2016 # the ${...} text is mutant-spec data, not an expansion
-printf 'ROUND_CAP_OPERATORS="operator operator-desk mac-personal" => ROUND_CAP_OPERATORS="${WRK_ROUND_CAP_OPERATORS:-operator operator-desk mac-personal}"\n' >"$TMP/spec-envops"
+printf 'ROUND_CAP_OPERATORS="operator operator-desk" => ROUND_CAP_OPERATORS="${WRK_ROUND_CAP_OPERATORS:-operator operator-desk}"\n' >"$TMP/spec-envops"
 mutant envops "$TMP/spec-envops"
 jme2="mut-eo"
 mkjob "$jme2"
@@ -467,5 +502,56 @@ set -e
 [[ "$(escalate_count "$ARBITER_INBOX_ROOT/$jmd/events")" == 1 ]] ||
   fail "mutant dupsame still emitted the higher-count escalate — dedupe assertion is vacuous"
 echo "PASS mutant-dupsame"
+
+# mutant: the doc identity is read from the client-supplied session again —
+# the sessforge doc (session director-1, created_by mac-personal) then grants.
+printf 'doc.get("created_by") => doc.get("session")\n' >"$TMP/spec-sessident"
+mutant sessident "$TMP/spec-sessident"
+jmsi="mut-si"
+mkjob "$jmsi"
+mk_hk "$jmsi"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmsi"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/sessident-wrk" "$jmsi" "$h"; done
+set +e
+"$TMP/sessident-wrk" round open "$jmsi" --head "$H4" --extend hk:doc/sessforge >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant sessident did not accept the session-forged doc (rc=$rc) — created_by assertion is vacuous"
+echo "PASS mutant-sessident"
+
+# mutant: mac-personal is trusted again — the mac-personal-authored comment
+# (task/91) then grants. RED proof: rc 0.
+printf 'ROUND_CAP_OPERATORS="operator operator-desk" => ROUND_CAP_OPERATORS="operator operator-desk mac-personal"\n' >"$TMP/spec-macops"
+mutant macops "$TMP/spec-macops"
+jmmo="mut-mo"
+mkjob "$jmmo"
+mk_hk "$jmmo"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmmo"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/macops-wrk" "$jmmo" "$h"; done
+set +e
+"$TMP/macops-wrk" round open "$jmmo" --head "$H4" --extend hk:task/91 >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant macops did not accept the mac-personal grant (rc=$rc) — operator-set assertion is vacuous"
+echo "PASS mutant-macops"
+
+# mutant: pa-integrator is allowed regardless of the job's parent lane —
+# padoc then grants for a director-1 child.
+printf 'allowed_issuers = {parent} | ops => allowed_issuers = {parent} | ops | {"pa-integrator"}\n' >"$TMP/spec-anypa"
+mutant anypa "$TMP/spec-anypa"
+jmpa="mut-pa"
+mkjob "$jmpa"
+mk_hk "$jmpa"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmpa"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/anypa-wrk" "$jmpa" "$h"; done
+set +e
+"$TMP/anypa-wrk" round open "$jmpa" --head "$H4" --extend hk:doc/padoc >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant anypa did not accept the cross-parent grant (rc=$rc) — parent-lane assertion is vacuous"
+echo "PASS mutant-anypa"
 
 echo "ALL PASS round-cap"

@@ -4452,7 +4452,7 @@ ROUND_CAP_DEFAULT=3
 # Space-separated; the job's parent lane is always accepted on top of these.
 # Fixed in the source: a builder must not be able to widen the trusted issuer
 # set through its own environment, or it could approve its own records.
-ROUND_CAP_OPERATORS="operator operator-desk mac-personal"
+ROUND_CAP_OPERATORS="operator operator-desk"
 ROUND_CAP_REASON="tester round cap reached"
 
 round_help() {
@@ -4477,7 +4477,15 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
         round-extension: job=JOB extra=N by=ISSUER
 
       ISSUER must be the job's parent lane or an operator identity and must
-      equal the record's server-side session (doc) or comment author (task).
+      equal the record's server-set identity: created_by for an hk:doc (the
+      client-supplied session field is never trusted) or the comment author
+      for an hk:task. A doc with no created_by cannot grant. Trusted issuers
+      are operator, operator-desk and the job's parent lane, so a parent-lane
+      grant only works while a handoffkeep client id of that name exists.
+      Caveat: the mbp lane wrappers (hk-desk, hk-director-1, hk-pa-integrator)
+      run as the same OS user as every mbp pane, so this narrows grant
+      forgery to mbp-resident sessions but is not a boundary; hk 525 is the
+      long-term fix.
       Each grant covers <extra> more opens and each open consumes exactly one.
   wrk round verdict JOB --file PATH
       Record the tester's verdict file for the oldest open round that has
@@ -4567,14 +4575,16 @@ except ValueError:
 # canonical form — whitespace variants are malformed and rejected.
 GRANT = re.compile(
     r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
-# The issuer written into the grant line must equal the record's server-side
-# identity — a doc's session or a task comment's author — so a builder writing
-# 'by=director-1' into its own record cannot pass, and one operator identity
-# cannot claim another.
+# The issuer written into the grant line must equal the record's server-set
+# identity — a doc's created_by (stamped from the bearer token; the
+# client-supplied session field is ignored) or a task comment's author — so a
+# builder writing 'by=director-1' into its own record cannot pass, and one
+# identity cannot claim another. A doc with no created_by yields an empty
+# identity and can never grant.
 sources = []
 if ref.startswith("hk:doc/"):
     if isinstance(doc, dict):
-        sources.append((doc.get("session") or "", doc.get("body") or ""))
+        sources.append((doc.get("created_by") or "", doc.get("body") or ""))
 elif ref.startswith("hk:task/"):
     for c in (doc.get("comments") if isinstance(doc, dict) else None) or []:
         if isinstance(c, dict):
@@ -4704,7 +4714,7 @@ round_open_cmd() {
     grant="$(round_approval_verify "$extend" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$tmp_approval" || true)"
     rm -f "$tmp_approval"
     [[ -n "$grant" ]] ||
-      die "round open --extend: $extend holds no 'round-extension: job=$job extra=N by=<parent-lane|operator>' grant backed by the record's session/author"
+      die "round open --extend: $extend holds no 'round-extension: job=$job extra=N by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
     grant_extra="${grant#granted=}"; grant_extra="${grant_extra%% *}"
     grant_issuer="${grant##*issuer=}"
   fi
