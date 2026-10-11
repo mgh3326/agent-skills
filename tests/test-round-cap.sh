@@ -19,6 +19,9 @@ export PANEWIRE_BIN="$TMP/absent-panewire"
 # The operator set is fixed in the wrk source; exporting job lanes here must be
 # ignored — a builder must not widen the trusted issuers through its own env.
 export WRK_ROUND_CAP_OPERATORS="je-lane jx-lane jg-lane selfish-lane"
+# Same for the trusted parent-lane set: host ids pushed through the env must
+# not become grant issuers.
+export WRK_ROUND_CAP_PARENT_ISSUERS="mac-dev mac-personal jrf-lane jrm-lane"
 
 H1=1111111111111111111111111111111111111111
 H2=2222222222222222222222222222222222222222
@@ -27,11 +30,20 @@ H4=4444444444444444444444444444444444444444
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-mkjob() { # mkjob <name> — builder claim envelope
-  local events="$ARBITER_INBOX_ROOT/$1/events"
+mkjob() { # mkjob <name> [parent-lane] [task-id] — builder claim envelope
+  local events="$ARBITER_INBOX_ROOT/$1/events" tid=""
   mkdir -p "$events"
+  [[ -z "${3:-}" ]] || tid=",\"task_id\":$3"
   cat >"$events/00001-job.claim.json" <<EOF
-{"created_at":"2026-09-27T00:00:00Z","job_id":"$1","kind":"job.claim","payload":{"agent_label":"$1","owner_lane":"$1-lane","pane_id":"w:p1","parent_lane":"director-1","role":"builder","t_level":"T2"},"seq":1}
+{"created_at":"2026-09-27T00:00:00Z","job_id":"$1","kind":"job.claim","payload":{"agent_label":"$1","owner_lane":"$1-lane","pane_id":"w:p1","parent_lane":"${2:-director-1}"${tid},"role":"builder","t_level":"T2"},"seq":1}
+EOF
+}
+
+reclaim() { # reclaim <job> <parent-lane> [task-id] — a later event rewriting the recorded meta
+  local tid=""
+  [[ -z "${3:-}" ]] || tid=",\"task_id\":$3"
+  cat >"$ARBITER_INBOX_ROOT/$1/events/00002-job.reclaim.json" <<EOF
+{"created_at":"2026-10-12T00:00:00Z","job_id":"$1","kind":"job.reclaim","payload":{"agent_label":"$1","owner_lane":"$1-lane","pane_id":"w:p1","parent_lane":"$2"${tid},"role":"builder","t_level":"T2"},"seq":2}
 EOF
 }
 
@@ -74,21 +86,47 @@ cat >"$TMP/hk-template" <<'EOF'
 # handoffkeep stub: doc get <key> / tasks comments <id> (JSON with \n escapes)
 if [[ "$1 $2" == "doc get" ]]; then
   case "$3" in
-    good2)   printf '{"session":"director-1","body":"approved\\nround-extension: job=JOB extra=2 by=director-1\\n"}' ;;
-    forged)  printf '{"session":"JOB-lane","body":"round-extension: job=JOB extra=5 by=director-1\\n"}' ;;
-    wrongj)  printf '{"session":"director-1","body":"round-extension: job=other-job extra=9 by=director-1\\n"}' ;;
-    opdoc)   printf '{"session":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator\\n"}' ;;
-    opgood)  printf '{"session":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator-desk\\n"}' ;;
-    badws)   printf '{"session":"director-1","body":"  round-extension :  job=JOB\\textra=1\\tby=director-1  \\n"}' ;;
-    selfops) printf '{"session":"JOB-lane","body":"round-extension: job=JOB extra=5 by=JOB-lane\\n"}' ;;
-    nogrant) printf '{"session":"director-1","body":"looks approved but no grant line\\n"}' ;;
+    good2)      printf '{"session":"director-1","created_by":"director-1","body":"approved\\nround-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    good2diff)  printf '{"session":"mac-personal","created_by":"director-1","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    good2nosess) printf '{"session":"","created_by":"director-1","body":"round-extension: job=JOB extra=1 by=director-1\\n"}' ;;
+    forged)     printf '{"session":"JOB-lane","created_by":"JOB-lane","body":"round-extension: job=JOB extra=5 by=director-1\\n"}' ;;
+    sessforge)  printf '{"session":"director-1","created_by":"mac-personal","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    pasess)     printf '{"session":"pa-integrator","created_by":"mac-personal","body":"round-extension: job=JOB extra=1 by=pa-integrator\\n"}' ;;
+    padoc)      printf '{"session":"","created_by":"pa-integrator","body":"round-extension: job=JOB extra=1 by=pa-integrator\\n"}' ;;
+    macdoc)     printf '{"session":"mac-personal","created_by":"mac-personal","body":"round-extension: job=JOB extra=1 by=mac-personal\\n"}' ;;
+    nocreated)  printf '{"session":"director-1","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    wrongj)     printf '{"session":"director-1","created_by":"director-1","body":"round-extension: job=other-job extra=9 by=director-1\\n"}' ;;
+    opdoc)      printf '{"session":"operator-desk","created_by":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator\\n"}' ;;
+    opgood)     printf '{"session":"operator-desk","created_by":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator-desk\\n"}' ;;
+    badws)      printf '{"session":"director-1","created_by":"director-1","body":"  round-extension :  job=JOB\\textra=1\\tby=director-1  \\n"}' ;;
+    selfops)    printf '{"session":"JOB-lane","created_by":"JOB-lane","body":"round-extension: job=JOB extra=5 by=JOB-lane\\n"}' ;;
+    nogrant)    printf '{"session":"director-1","created_by":"director-1","body":"looks approved but no grant line\\n"}' ;;
+    devdoc)     printf '{"session":"mac-dev","created_by":"mac-dev","body":"round-extension: job=JOB extra=2 by=mac-dev\\n"}' ;;
+    cbempty)    printf '{"session":"","created_by":"","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    cbnull)     printf '{"session":"","created_by":null,"body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    cbpad)      printf '{"session":"","created_by":" director-1 ","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    cbcase)     printf '{"session":"","created_by":"Director-1","body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
+    cbnum)      printf '{"session":"","created_by":1447,"body":"round-extension: job=JOB extra=2 by=director-1\\n"}' ;;
     *) printf 'not_found' ;;
   esac
 elif [[ "$1 $2" == "tasks comments" ]]; then
   case "$3" in
     91) printf '{"comments":[{"author":"mac-personal","body":"go one more\\nround-extension: job=JOB extra=1 by=mac-personal\\n"}]}' ;;
     92) printf '{"comments":[{"author":"JOB-lane","body":"round-extension: job=JOB extra=3 by=director-1\\n"}]}' ;;
+    93) printf '{"comments":[{"author":"operator-desk","body":"round-extension: job=JOB extra=1 by=operator-desk\\n"}]}' ;;
+    94) printf '{"comments":[{"body":"round-extension: job=JOB extra=2 by=director-1\\n"}]}' ;;
+    95) printf '{"comments":[{"author":91,"body":"round-extension: job=JOB extra=2 by=director-1\\n"}]}' ;;
     *)  printf '{"comments":[]}' ;;
+  esac
+elif [[ "$1 $2" == "tasks show" ]]; then
+  case "$3" in
+    701) printf '{"id":701,"project":"ParkingArcade","refs":{"job_id":"JOB"}}' ;;
+    702) printf '{"id":702,"project":"agent-skills","refs":{"job_id":"JOB"}}' ;;
+    703) printf '{"id":703,"project":"ParkingArcade","refs":{"job_id":"other-job"}}' ;;
+    704) printf '{"id":704,"project":"ParkingArcade"}' ;;
+    706) printf 'not json at all' ;;
+    707) exit 1 ;;
+    *)  printf 'not_found' ;;
   esac
 else
   exit 1
@@ -191,14 +229,27 @@ mk_hk je
 export HANDOFFKEEP_BIN="$TMP/hk-je"
 for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" je "$h"; done
 expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/missing
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/forged   # own session claims director-1
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/wrongj   # grant names another job
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/opdoc    # by=operator but session is operator-desk
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/badws    # noncanonical grant whitespace
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/selfops  # own lane in WRK_ROUND_CAP_OPERATORS must be ignored
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/nogrant  # no grant line
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/92      # comment author is the builder
-expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:bogus/x      # unknown ref scheme
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/forged    # own created_by claims director-1
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/sessforge # session says director-1, created_by is mac-personal
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/nocreated # no server-set identity at all
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/pasess    # session pa-integrator, created_by mac-personal
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/padoc     # pa-integrator is not this job's parent lane
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/macdoc    # mac-personal dropped from the trusted set
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/wrongj    # grant names another job
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/opdoc     # by=operator but created_by is operator-desk
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/badws     # noncanonical grant whitespace
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/selfops   # own lane in WRK_ROUND_CAP_OPERATORS must be ignored
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/nogrant   # no grant line
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/91       # comment author mac-personal no longer trusted
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/92       # comment author is the builder
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/94       # comment without an author
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:task/95       # non-string comment author
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/cbempty   # empty created_by
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/cbnull    # null created_by
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/cbpad     # whitespace-padded created_by — exact compare
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/cbcase    # differently cased created_by — exact compare
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:doc/cbnum     # non-string created_by
+expect_rc 2 "$WRK" round open je --head "$H4" --extend hk:bogus/x       # unknown ref scheme
 expect_rc 78 "$WRK" round open je --head "$H4"                         # still capped afterwards
 [[ "$(find "$ARBITER_INBOX_ROOT/je/events" -name '*-job.round.json' | wc -l)" -eq 3 ]] ||
   fail "a refused extension still wrote a job.round"
@@ -233,16 +284,122 @@ assert [e["rounds"] for e in esc] == [3, 5], esc
 PY
 echo "PASS extension-doc-grant-consumed-per-round"
 
-# ── extension: task comment by operator identity buys exactly one open ──────
+# ── extension: task comment author is server-set; mac-personal cannot grant ──
 mkjob jt
 mk_hk jt
 export HANDOFFKEEP_BIN="$TMP/hk-jt"
 for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jt "$h"; done
-"$WRK" round open jt --head "$H4" --extend hk:task/91 >/dev/null
-expect_rc 78 "$WRK" round open jt --head "$H4" --extend hk:task/91
+"$WRK" round open jt --head "$H4" --extend hk:task/93 >/dev/null        # operator-desk comment grants
+expect_rc 78 "$WRK" round open jt --head "$H4" --extend hk:task/93
 echo "PASS extension-task-comment-one-round"
 
-# ── extension: operator doc grant where by= equals the session ──────────────
+# ── extension: doc session is ignored — only server-set created_by counts ────
+mkjob jd
+mk_hk jd
+export HANDOFFKEEP_BIN="$TMP/hk-jd"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jd "$h"; done
+"$WRK" round open jd --head "$H4" --extend hk:doc/good2diff >/dev/null   # session disagrees, created_by director-1 grants
+"$WRK" round open jd --head "$H4" --extend hk:doc/good2nosess >/dev/null # empty session still grants on created_by
+expect_rc 78 "$WRK" round open jd --head "$H4" --extend hk:doc/good2nosess # extra=1 consumed
+echo "PASS extension-doc-session-ignored"
+
+# ── extension: parent-lane grant needs the lane's own server-set client id ────
+mkjob jp pa-integrator 701
+mk_hk jp
+export HANDOFFKEEP_BIN="$TMP/hk-jp"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jp "$h"; done
+"$WRK" round open jp --head "$H4" --extend hk:doc/padoc >/dev/null       # created_by pa-integrator is this job's parent lane
+expect_rc 78 "$WRK" round open jp --head "$H4" --extend hk:doc/padoc     # extra=1 consumed
+echo "PASS extension-parent-lane-grant"
+
+# ── extension: a builder-rewritten or host-id parent lane never grants ───────
+# The recorded parent lane is builder-writable through job.reclaim events;
+# only lanes in the fixed ROUND_CAP_PARENT_ISSUERS set may grant (#1447 B1).
+mkjob jrf
+mk_hk jrf
+export HANDOFFKEEP_BIN="$TMP/hk-jrf"
+reclaim jrf mac-dev
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jrf "$h"; done
+expect_rc 2 "$WRK" round open jrf --head "$H4" --extend hk:doc/devdoc    # reclaim rewrote the parent to mac-dev
+
+mkjob jrm
+mk_hk jrm
+export HANDOFFKEEP_BIN="$TMP/hk-jrm"
+reclaim jrm mac-personal
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jrm "$h"; done
+expect_rc 2 "$WRK" round open jrm --head "$H4" --extend hk:doc/macdoc    # same rewrite to mac-personal
+
+mkjob jrh mac-personal
+mk_hk jrh
+export HANDOFFKEEP_BIN="$TMP/hk-jrh"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jrh "$h"; done
+expect_rc 2 "$WRK" round open jrh --head "$H4" --extend hk:doc/macdoc    # a host-id parent from the start (S2)
+echo "PASS extension-rewritten-parent-refused"
+
+# ── extension: by=pa-integrator counts only on ParkingArcade server tasks ─────
+# The job's recorded task_id must fetch on the server to a task whose project
+# is exactly ParkingArcade and whose refs.job_id is exactly this job.
+mkjob jpa pa-integrator 701
+mk_hk jpa
+export HANDOFFKEEP_BIN="$TMP/hk-jpa"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpa "$h"; done
+"$WRK" round open jpa --head "$H4" --extend hk:doc/padoc >/dev/null       # PA task bound to this job
+expect_rc 78 "$WRK" round open jpa --head "$H4" --extend hk:doc/padoc     # extra=1 consumed
+
+mkjob jpb pa-integrator 702
+mk_hk jpb
+export HANDOFFKEEP_BIN="$TMP/hk-jpb"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpb "$h"; done
+expect_rc 2 "$WRK" round open jpb --head "$H4" --extend hk:doc/padoc      # project is agent-skills
+
+mkjob jpc pa-integrator 703
+mk_hk jpc
+export HANDOFFKEEP_BIN="$TMP/hk-jpc"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpc "$h"; done
+expect_rc 2 "$WRK" round open jpc --head "$H4" --extend hk:doc/padoc      # PA task bound to another job
+
+mkjob jpd pa-integrator 704
+mk_hk jpd
+export HANDOFFKEEP_BIN="$TMP/hk-jpd"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpd "$h"; done
+expect_rc 2 "$WRK" round open jpd --head "$H4" --extend hk:doc/padoc      # PA task without refs.job_id
+
+mkjob jpe pa-integrator 705
+mk_hk jpe
+export HANDOFFKEEP_BIN="$TMP/hk-jpe"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpe "$h"; done
+expect_rc 2 "$WRK" round open jpe --head "$H4" --extend hk:doc/padoc      # task fetch returns not_found
+
+mkjob jpk pa-integrator 707
+mk_hk jpk
+export HANDOFFKEEP_BIN="$TMP/hk-jpk"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpk "$h"; done
+expect_rc 2 "$WRK" round open jpk --head "$H4" --extend hk:doc/padoc      # task fetch transport failure
+
+mkjob jpf pa-integrator 706
+mk_hk jpf
+export HANDOFFKEEP_BIN="$TMP/hk-jpf"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpf "$h"; done
+expect_rc 2 "$WRK" round open jpf --head "$H4" --extend hk:doc/padoc      # task record is not JSON
+
+mkjob jpg pa-integrator
+mk_hk jpg
+export HANDOFFKEEP_BIN="$TMP/hk-jpg"
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpg "$h"; done
+expect_rc 2 "$WRK" round open jpg --head "$H4" --extend hk:doc/padoc      # no task_id in the job meta
+
+# A builder relinking its own job meta to a PA task bound to another job must
+# not pass: the reclaim rewrite is honoured for the read, but the server task
+# still names the other job.
+mkjob jpr
+mk_hk jpr
+export HANDOFFKEEP_BIN="$TMP/hk-jpr"
+reclaim jpr pa-integrator 703
+for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jpr "$h"; done
+expect_rc 2 "$WRK" round open jpr --head "$H4" --extend hk:doc/padoc
+echo "PASS extension-pa-grant-needs-parkingarcade-task"
+
+# ── extension: operator doc grant where by= equals the created_by ────────────
 mkjob jg
 mk_hk jg
 export HANDOFFKEEP_BIN="$TMP/hk-jg"
@@ -309,7 +466,12 @@ for anchor in (
     'r"^round-extension: job=(\\S+) extra=(\\d+) by=(\\S+)$"',
     "{40})\\s*$",
     "if len(matches) > 1:",
-    'ROUND_CAP_OPERATORS="operator operator-desk mac-personal"',
+    'ROUND_CAP_OPERATORS="operator operator-desk"',
+    'doc.get("created_by")',
+    "({parent} & trusted_parents) | ops",
+    "issuer != identity",
+    't.get("project") == "ParkingArcade"',
+    'refs.get("job_id") == job',
     "                and isinstance(r.get(\"rounds\"), int) and r[\"rounds\"] >= used):",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
@@ -433,7 +595,7 @@ echo "PASS mutant-multi"
 # mutant: the operator set becomes env-widenable again — a builder adds its own
 # lane and its own doc grants itself. RED proof: selfops must grant (rc=0).
 # shellcheck disable=SC2016 # the ${...} text is mutant-spec data, not an expansion
-printf 'ROUND_CAP_OPERATORS="operator operator-desk mac-personal" => ROUND_CAP_OPERATORS="${WRK_ROUND_CAP_OPERATORS:-operator operator-desk mac-personal}"\n' >"$TMP/spec-envops"
+printf 'ROUND_CAP_OPERATORS="operator operator-desk" => ROUND_CAP_OPERATORS="${WRK_ROUND_CAP_OPERATORS:-operator operator-desk}"\n' >"$TMP/spec-envops"
 mutant envops "$TMP/spec-envops"
 jme2="mut-eo"
 mkjob "$jme2"
@@ -467,5 +629,143 @@ set -e
 [[ "$(escalate_count "$ARBITER_INBOX_ROOT/$jmd/events")" == 1 ]] ||
   fail "mutant dupsame still emitted the higher-count escalate — dedupe assertion is vacuous"
 echo "PASS mutant-dupsame"
+
+# mutant: the doc identity is read from the client-supplied session again —
+# the sessforge doc (session director-1, created_by mac-personal) then grants.
+printf 'doc.get("created_by") => doc.get("session")\n' >"$TMP/spec-sessident"
+mutant sessident "$TMP/spec-sessident"
+jmsi="mut-si"
+mkjob "$jmsi"
+mk_hk "$jmsi"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmsi"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/sessident-wrk" "$jmsi" "$h"; done
+set +e
+"$TMP/sessident-wrk" round open "$jmsi" --head "$H4" --extend hk:doc/sessforge >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant sessident did not accept the session-forged doc (rc=$rc) — created_by assertion is vacuous"
+echo "PASS mutant-sessident"
+
+# mutant: mac-personal is trusted again — the mac-personal-authored comment
+# (task/91) then grants. RED proof: rc 0.
+printf 'ROUND_CAP_OPERATORS="operator operator-desk" => ROUND_CAP_OPERATORS="operator operator-desk mac-personal"\n' >"$TMP/spec-macops"
+mutant macops "$TMP/spec-macops"
+jmmo="mut-mo"
+mkjob "$jmmo"
+mk_hk "$jmmo"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmmo"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/macops-wrk" "$jmmo" "$h"; done
+set +e
+"$TMP/macops-wrk" round open "$jmmo" --head "$H4" --extend hk:task/91 >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant macops did not accept the mac-personal grant (rc=$rc) — operator-set assertion is vacuous"
+echo "PASS mutant-macops"
+
+# mutant: pa-integrator is allowed regardless of the job's parent lane —
+# padoc then grants for a director-1 child (the job still binds a PA task so
+# the mutant isolates the issuer-set change, not the server-task check).
+printf '({parent} & trusted_parents) | ops => ({parent} & trusted_parents) | ops | {"pa-integrator"}\n' >"$TMP/spec-anypa"
+mutant anypa "$TMP/spec-anypa"
+jmpa="mut-pa"
+mkjob "$jmpa" director-1 701
+mk_hk "$jmpa"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmpa"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/anypa-wrk" "$jmpa" "$h"; done
+set +e
+"$TMP/anypa-wrk" round open "$jmpa" --head "$H4" --extend hk:doc/padoc >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant anypa did not accept the cross-parent grant (rc=$rc) — parent-lane assertion is vacuous"
+echo "PASS mutant-anypa"
+
+# mutant: the parent-set check is dropped — a builder-rewritten host-id
+# parent then grants again (the reclaim forgery the fixed set exists to stop).
+printf '({parent} & trusted_parents) | ops => {parent} | ops\n' >"$TMP/spec-noparentset"
+mutant noparentset "$TMP/spec-noparentset"
+jmps="mut-ps"
+mkjob "$jmps"
+mk_hk "$jmps"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmps"
+reclaim "$jmps" mac-dev
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/noparentset-wrk" "$jmps" "$h"; done
+set +e
+"$TMP/noparentset-wrk" round open "$jmps" --head "$H4" --extend hk:doc/devdoc >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant noparentset did not accept the rewritten-parent grant (rc=$rc) — parent-set assertion is vacuous"
+echo "PASS mutant-noparentset"
+
+# mutant: the server-set identity is stripped before compare — a padded
+# created_by then matches, crediting the exact-string requirement.
+printf 'issuer != identity => issuer != identity.strip()\n' >"$TMP/spec-stripid"
+mutant stripid "$TMP/spec-stripid"
+jmst="mut-st"
+mkjob "$jmst"
+mk_hk "$jmst"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmst"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/stripid-wrk" "$jmst" "$h"; done
+set +e
+"$TMP/stripid-wrk" round open "$jmst" --head "$H4" --extend hk:doc/cbpad >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant stripid did not accept the padded identity (rc=$rc) — exact-match assertion is vacuous"
+echo "PASS mutant-stripid"
+
+# mutant: the identity compare is case-folded — a differently cased
+# created_by then matches.
+printf 'issuer != identity => issuer.lower() != identity.lower()\n' >"$TMP/spec-lowerid"
+mutant lowerid "$TMP/spec-lowerid"
+jmlc="mut-lc"
+mkjob "$jmlc"
+mk_hk "$jmlc"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmlc"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/lowerid-wrk" "$jmlc" "$h"; done
+set +e
+"$TMP/lowerid-wrk" round open "$jmlc" --head "$H4" --extend hk:doc/cbcase >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant lowerid did not accept the differently cased identity (rc=$rc) — exact-match assertion is vacuous"
+echo "PASS mutant-lowerid"
+
+# mutant: the pa-integrator project check is skipped — an agent-skills task
+# then satisfies a pa-integrator grant.
+printf 't.get("project") == "ParkingArcade" => True\n' >"$TMP/spec-noproj"
+mutant noproj "$TMP/spec-noproj"
+jmnp="mut-np"
+mkjob "$jmnp" pa-integrator 702
+mk_hk "$jmnp"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmnp"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/noproj-wrk" "$jmnp" "$h"; done
+set +e
+"$TMP/noproj-wrk" round open "$jmnp" --head "$H4" --extend hk:doc/padoc >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant noproj did not accept the wrong-project grant (rc=$rc) — project assertion is vacuous"
+echo "PASS mutant-noproj"
+
+# mutant: the refs.job_id match is skipped — a ParkingArcade task bound to
+# another job then satisfies the grant.
+printf 'refs.get("job_id") == job => True\n' >"$TMP/spec-norefs"
+mutant norefs "$TMP/spec-norefs"
+jmnr="mut-nr"
+mkjob "$jmnr" pa-integrator 703
+mk_hk "$jmnr"
+export HANDOFFKEEP_BIN="$TMP/hk-$jmnr"
+for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/norefs-wrk" "$jmnr" "$h"; done
+set +e
+"$TMP/norefs-wrk" round open "$jmnr" --head "$H4" --extend hk:doc/padoc >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant norefs did not accept the other-job grant (rc=$rc) — refs assertion is vacuous"
+echo "PASS mutant-norefs"
 
 echo "ALL PASS round-cap"

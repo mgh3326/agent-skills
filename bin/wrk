@@ -4449,10 +4449,17 @@ joined_cmd() {
 # per head.
 ROUND_CAP_DEFAULT=3
 # Operator identities allowed to issue a round-cap extension approval.
-# Space-separated; the job's parent lane is always accepted on top of these.
+# Space-separated; the job's parent lane is accepted on top of these only
+# when it is in ROUND_CAP_PARENT_ISSUERS.
 # Fixed in the source: a builder must not be able to widen the trusted issuer
 # set through its own environment, or it could approve its own records.
-ROUND_CAP_OPERATORS="operator operator-desk mac-personal"
+ROUND_CAP_OPERATORS="operator operator-desk"
+# Parent lanes accepted as the job's parent issuer on top of the operator
+# set. The recorded parent lane is builder-writable through
+# job.claim/job.reclaim events, so it is honoured only inside this fixed
+# set — a rewritten parent, a host or client id, or a builder lane never
+# grants. Fixed in the source for the same reason as the operator set.
+ROUND_CAP_PARENT_ISSUERS="director-1 pa-integrator"
 ROUND_CAP_REASON="tester round cap reached"
 
 round_help() {
@@ -4476,8 +4483,19 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
 
         round-extension: job=JOB extra=N by=ISSUER
 
-      ISSUER must be the job's parent lane or an operator identity and must
-      equal the record's server-side session (doc) or comment author (task).
+      ISSUER must equal the record's server-set identity: created_by for an
+      hk:doc (the client-supplied session field is never trusted) or the
+      comment author for an hk:task. A doc with no created_by cannot grant.
+      Grants need the server-set identity of operator, operator-desk,
+      director-1 or pa-integrator — the last two only as the job's parent
+      lane — whose tokens live only in the mbp lane wrappers. The job's
+      recorded parent lane is not trusted beyond that fixed set.
+      A by=pa-integrator grant counts only on ParkingArcade tasks bound to
+      the job on the server (refs.job_id must equal the job); task project
+      and refs are writable by any hk client, so this narrows, not bounds.
+      Caveat: the mbp lane wrappers run as the same OS user as every mbp
+      pane, so this narrows grant forgery to mbp-resident sessions but is
+      not a boundary; hk 525 is the long-term fix.
       Each grant covers <extra> more opens and each open consumes exactly one.
   wrk round verdict JOB --file PATH
       Record the tester's verdict file for the oldest open round that has
@@ -4546,14 +4564,16 @@ round_approval_fetch() {
 }
 
 # Verify a fetched approval record and print the granted extra-round count.
-# Args: ref, job, parent lane, operators (space separated), record file.
+# Args: ref, job, parent lane, operators, trusted parent lanes (both space
+# separated), record file.
 # Prints "granted=<N> issuer=<name>" — nothing else — on success.
 round_approval_verify() {
-  local ref="$1" job="$2" parent="$3" operators="$4" record="$5"
-  python3 - "$ref" "$job" "$parent" "$operators" "$record" <<'PY'
+  local ref="$1" job="$2" parent="$3" operators="$4" parent_issuers="$5" record="$6"
+  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" <<'PY'
 import json, re, sys
-ref, job, parent, operators, path = sys.argv[1:]
+ref, job, parent, operators, parent_issuers, path = sys.argv[1:]
 ops = set(operators.split())
+trusted_parents = set(parent_issuers.split())
 try:
     with open(path, encoding="utf-8") as f:
         raw = f.read()
@@ -4567,19 +4587,25 @@ except ValueError:
 # canonical form — whitespace variants are malformed and rejected.
 GRANT = re.compile(
     r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
-# The issuer written into the grant line must equal the record's server-side
-# identity — a doc's session or a task comment's author — so a builder writing
-# 'by=director-1' into its own record cannot pass, and one operator identity
-# cannot claim another.
+# The issuer written into the grant line must equal the record's server-set
+# identity — a doc's created_by (stamped from the bearer token; the
+# client-supplied session field is ignored) or a task comment's author — so a
+# builder writing 'by=director-1' into its own record cannot pass, and one
+# identity cannot claim another. A doc with no created_by yields an empty
+# identity and can never grant.
 sources = []
 if ref.startswith("hk:doc/"):
     if isinstance(doc, dict):
-        sources.append((doc.get("session") or "", doc.get("body") or ""))
+        sources.append((doc.get("created_by") or "", doc.get("body") or ""))
 elif ref.startswith("hk:task/"):
     for c in (doc.get("comments") if isinstance(doc, dict) else None) or []:
         if isinstance(c, dict):
             sources.append((c.get("author") or "", c.get("body") or ""))
-allowed_issuers = {parent} | ops
+# The recorded parent lane counts only inside the fixed parent set:
+# claim/reclaim events are builder-writable, so any other value — a host or
+# client id included — is not a trusted issuer even when it matches the
+# grant's server-set identity.
+allowed_issuers = ({parent} & trusted_parents) | ops
 for identity, body in sources:
     for line in body.splitlines():
         m = GRANT.match(line)
@@ -4590,6 +4616,63 @@ for identity, body in sources:
             continue
         print("granted=%d issuer=%s" % (extra, issuer))
         raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# The job's recorded task id, taken the same way as task linkage: the newest
+# claim/reclaim payload.task_id. Prints it or nothing; rc 1 when the meta is
+# unreadable so a broken record fails closed instead of falling back to an
+# older claim the newest event superseded.
+round_job_task_id() {
+  python3 - "$(wrk_jobs_root)/$1/events" <<'PY'
+import json, os, sys
+try:
+    names = sorted(n for n in os.listdir(sys.argv[1])
+                   if n.endswith(("claim.json", "reclaim.json")))
+except OSError:
+    raise SystemExit(1)
+if not names:
+    raise SystemExit(0)
+try:
+    with open(os.path.join(sys.argv[1], names[-1]), encoding="utf-8") as f:
+        o = json.load(f)
+except (OSError, ValueError):
+    raise SystemExit(1)
+p = o.get("payload", o)
+v = p.get("task_id")
+print(v if isinstance(v, (int, str)) else "")
+PY
+}
+
+# Fetch the job's hk task record from the server. Echoes the raw record text
+# (JSON) on stdout; non-zero when the record is absent or handoffkeep fails.
+round_pa_task_fetch() {
+  local task_id="$1" handoffkeep out rc=0
+  handoffkeep="$(command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true)"
+  [[ -n "$handoffkeep" ]] || return 1
+  out="$("$handoffkeep" tasks show "$task_id" 2>/dev/null)" || rc=$?
+  [[ "$rc" -eq 0 && -n "$out" && "$out" != not_found ]] || return 1
+  printf '%s' "$out"
+}
+
+# Verify a fetched task record pins a pa-integrator grant to ParkingArcade
+# work: project must be exactly "ParkingArcade" and refs.job_id exactly the
+# job being extended. Prints nothing; rc 0 only when both hold.
+round_pa_task_verify() {
+  local job="$1" record="$2"
+  python3 - "$job" "$record" <<'PY'
+import json, sys
+job, path = sys.argv[1:]
+try:
+    with open(path, encoding="utf-8") as f:
+        t = json.load(f)
+except (OSError, ValueError):
+    raise SystemExit(1)
+refs = t.get("refs") if isinstance(t, dict) else None
+if (isinstance(t, dict) and t.get("project") == "ParkingArcade"
+        and isinstance(refs, dict) and refs.get("job_id") == job):
+    raise SystemExit(0)
 raise SystemExit(1)
 PY
 }
@@ -4701,12 +4784,34 @@ round_open_cmd() {
       rm -f "$tmp_approval"
       die "round open --extend: approval record not found in handoffkeep: $extend"
     fi
-    grant="$(round_approval_verify "$extend" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$tmp_approval" || true)"
+    grant="$(round_approval_verify "$extend" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_approval" || true)"
     rm -f "$tmp_approval"
     [[ -n "$grant" ]] ||
-      die "round open --extend: $extend holds no 'round-extension: job=$job extra=N by=<parent-lane|operator>' grant backed by the record's session/author"
+      die "round open --extend: $extend holds no 'round-extension: job=$job extra=N by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
     grant_extra="${grant#granted=}"; grant_extra="${grant_extra%% *}"
     grant_issuer="${grant##*issuer=}"
+    # A pa-integrator grant counts only on ParkingArcade work, checked on the
+    # server — never from local event files: the task id recorded in the job
+    # meta must fetch to a task whose project is exactly ParkingArcade and
+    # whose refs.job_id is exactly this job. Every other outcome (no task id,
+    # fetch failure, malformed record, wrong project, refs mismatch) fails
+    # closed. director-1, operator and operator-desk grants skip this check.
+    if [[ "$grant_issuer" == "pa-integrator" ]]; then
+      local task_id tmp_task
+      task_id="$(round_job_task_id "$job" || true)"
+      [[ -n "$task_id" ]] ||
+        die "round open --extend: pa-integrator grants need the job's hk task on the server; $job records no task_id"
+      tmp_task="$(mktemp)"
+      if ! round_pa_task_fetch "$task_id" >"$tmp_task"; then
+        rm -f "$tmp_task"
+        die "round open --extend: pa-integrator grants need the job's hk task on the server; cannot fetch task $task_id"
+      fi
+      if ! round_pa_task_verify "$job" "$tmp_task"; then
+        rm -f "$tmp_task"
+        die "round open --extend: pa-integrator grants count only when the server task for $job is project ParkingArcade with refs.job_id=$job"
+      fi
+      rm -f "$tmp_task"
+    fi
   fi
 
   # Round count and decision run under the events lock so a verdict landing
