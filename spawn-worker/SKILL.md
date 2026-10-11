@@ -771,6 +771,9 @@ wake_wait = 300
 - 레인 자격증명 체인(#1397): lanes route(`lanes add/ls/rm`, `wrk lanes-missing`)가 쓰는
   credential은 `lanes_token_env` → 없으면 `operator_token_env` → 없으면 `hub_token_env` 순이다.
   PUT /v1/lanes 는 operator 토큰만 받으므로 operator_token_env가 lanes를 authorizing할 수 있다.
+  예외 — 원격 `--host` builder 등록은 다른 머신의 레인을 쓰므로 `operator_token_env`를 먼저
+  쓰고, 없을 때만 공유 체인으로 폴백한다(노드 스코프 lanes 토큰은 자기 호스트의 레인만
+  authorizing한다고 가정).
 - **빌더 레인 등록(#1397)**: `--role builder` 스폰도 허브 레인을 등록한다 — `--lane`이
   레인명, `--parent`가 부모(`job.joined`/`job.escalate`가 owner 레인의 parent로 라우팅되므로
   빌더 레인이 없으면 이 이벤트가 유실된다). 머신은 `session_machine_ids`에 매핑된 세션이면

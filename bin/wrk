@@ -5981,7 +5981,13 @@ hub_lane_register_remote() {
   local hub_url token_env cf_env panewire rc=0
   local args=()
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
-  token_env="$(hub_lanes_credential 2>/dev/null || true)"
+  # The remote add writes a lane on ANOTHER machine — a node-scoped
+  # lanes_token_env is only known to authorize this host's own lanes, so the
+  # operator credential wins here even when a lanes token is also configured.
+  # Without an operator credential the shared lanes chain is still the
+  # fallback (a lanes-only initiator stays warn-only, never hard-refused).
+  token_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  [[ -n "$token_env" ]] || token_env="$(hub_lanes_credential 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   # Only builders reach here — a remote worker keeps the #965 contract and
   # this host never names its lane. A builder always names why its lane is

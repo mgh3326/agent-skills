@@ -3452,10 +3452,11 @@ printf '%s\n' '[hub]' 'hub_url = "https://hub.invalid"' \
   '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' \
   'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
   'capacity = 3' >"$LANES_CFG_REMOTE"
-# Same delegation config plus a session_machine_ids entry for the target's
-# herdr session ("worker") — used to prove a remote --host worker spawn is
-# registered by the execution host's OWN session map (machine=target-9s),
-# never by the initiator on machine=desktop.
+# Same delegation config plus a session_machine_ids entry — used to prove a
+# remote --host worker spawn makes ZERO lanes calls on the initiator even
+# when the initiator's config is fully hub-enabled and session-mapped (the
+# execution host's own lookup is the plain #965 worker path after the
+# delegated `--host local`, covered by the 965 assertions).
 LANES_CFG_REMOTE_WMAP="$TMP/lanes-1397-remote-wmap-hosts.toml"
 printf '%s\n' '[hub]' 'hub_url = "https://hub.invalid"' \
   "operator_token_env = \"$LANES_OP_FILE\"" "hub_cf_env = \"$LANES_CF_FILE\"" \
@@ -3464,6 +3465,17 @@ printf '%s\n' '[hub]' 'hub_url = "https://hub.invalid"' \
   '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' \
   'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
   'capacity = 3' >"$LANES_CFG_REMOTE_WMAP"
+# The remote add writes a lane on another machine — when the initiator has
+# BOTH a node-scoped lanes token and the operator credential, the remote
+# path must reach for operator_token_env first.
+LANES_CFG_REMOTE_BOTH="$TMP/lanes-1397-remote-both-hosts.toml"
+printf '%s\n' '[hub]' 'hub_url = "https://hub.invalid"' \
+  "lanes_token_env = \"$LANES_TOKEN_FILE\"" \
+  "operator_token_env = \"$LANES_OP_FILE\"" "hub_cf_env = \"$LANES_CF_FILE\"" \
+  'machine_id = "mac-personal"' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' \
+  'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" \
+  'capacity = 3' >"$LANES_CFG_REMOTE_BOTH"
 
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
@@ -4760,6 +4772,29 @@ SH
     fail "#1397 AC2e: the initiator must not lanes-add when the remote answers nonzero: $(cat "$T1397_CALLS")"
   echo "PASS 1397-lanes AC2e: a failed deferred receipt adds no lane and answers 2"
 
+  # AC2f — the remote add writes a lane on ANOTHER machine: a node-scoped
+  # lanes_token_env only authorizes this host's own lanes, so when the
+  # initiator has both configured the remote add must carry
+  # operator_token_env, not the shared chain's first hit.
+  T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_BOTH" t1397_remote_spawn b1397-opcred
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1397 AC2f: remote builder spawn failed (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  python3 - "$T1397_CALLS" "$LANES_OP_FILE" "$LANES_TOKEN_FILE" <<'PY' ||
+import sys
+log, op_file, lanes_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+assert "add" in got, "the initiator must still add the remote builder lane: %r" % got
+i = got.index("--hub-token-env")
+assert got[i + 1] == op_file, \
+    "the remote add must carry operator_token_env, not the node-scoped lanes token: %r" % got
+assert lanes_file not in got, "lanes_token_env must not authorize a cross-machine add: %r" % got
+PY
+    fail "#1397 AC2f: the remote add must prefer operator_token_env over lanes_token_env"
+  echo "PASS 1397-lanes AC2f: the remote add prefers operator_token_env"
+
   # AC3 — every builder registration failure is loud on the OK line but
   # never fails the spawn: rc 0, `OK pane=w:p1` still there (the pane is not
   # orphaned), ` lane=UNREGISTERED` ends the line, exactly one warning.
@@ -5003,6 +5038,28 @@ PY
     fail "#1397 M6 mutant survived: no worker lane was added on machine=desktop"
   fi
   echo "PASS 1397-lanes M6: registering a remote worker on the initiator goes RED"
+
+  # M7: the remote add dropping back to the shared lane credential chain —
+  # a node-scoped lanes token then "wins" a cross-machine write that only
+  # the operator credential can authorize, and AC2f's argv check goes RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-remoteop \
+    '  token_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  [[ -n "$token_env" ]] || token_env="$(hub_lanes_credential 2>/dev/null || true)"' \
+    '  token_env="$(hub_lanes_credential 2>/dev/null || true)"'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-remoteop" \
+    T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_BOTH" \
+    t1397_remote_spawn b1397-m7
+  python3 - "$T1397_CALLS" "$LANES_TOKEN_FILE" <<'PY' ||
+import sys
+log, lanes_file = sys.argv[1:]
+got = open(log, encoding="utf-8").read().splitlines()
+i = got.index("--hub-token-env")
+assert got[i + 1] == lanes_file, \
+    "the mutant must reach panewire with the lanes token (divergence shown): %r" % got
+PY
+    fail "#1397 M7 mutant survived: the remote add still preferred the operator credential"
+  echo "PASS 1397-lanes M7: shared-chain credential order on the remote add goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then
