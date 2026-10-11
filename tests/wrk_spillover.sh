@@ -226,6 +226,43 @@ hub_landed_no_out="$(WRK_HUB_SCENARIO=landed_no run_hub "$ROOT/bin/wrk" "$HUB_CO
 grep -Eq '^OK pane=pane-a host=machine-a .* status=idle landed=no job=job-a$' <<<"$hub_landed_no_out"
 printf '%s\n' 'PASS wrk-spillover hub-stdout-tail-landing'
 
+# #1397 S4: a BUILDER over the via=hub transport must still state its lane
+# outcome — the transport carries no registration-confirmation channel, so
+# the emitted line ends lane=UNREGISTERED rather than omitting lane= (the
+# worker shape) or claiming a lane nobody confirmed.
+hub_builder_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+  -m builder-sol --role builder --lane b-hub --parent director-x --task "$HK_TASK_ID" 2>&1)"
+grep -Eq '^OK pane=pane-a host=machine-a .* status=working landed=yes job=job-a lane=UNREGISTERED$' <<<"$hub_builder_out" ||
+  { echo 'FAIL wrk-spillover hub-builder-ok-line-lane-unregistered'; echo "$hub_builder_out"; exit 1; }
+printf '%s\n' 'PASS wrk-spillover hub-builder-ok-line-lane-unregistered'
+
+# #1397 S1-r2: WRK_LANE_STRICT is uniform across transports — a via=hub
+# builder answers 82 (WRK_EXIT_LANE_UNREGISTERED) AFTER its UNREGISTERED OK
+# line, exactly like the local and ssh legs. A worker under strict stays
+# rc 0, and a non-strict builder keeps the rc-0 S4 contract above.
+set +e
+hub_strict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+  -m builder-sol --role builder --lane b-strict --parent director-x --task "$HK_TASK_ID" 2>&1)"
+hub_strict_rc=$?
+set -e
+[[ "$hub_strict_rc" -eq 82 ]] ||
+  { echo 'FAIL wrk-spillover hub-builder-strict-rc82'; echo "$hub_strict_out rc=$hub_strict_rc"; exit 1; }
+grep -Eq '^OK pane=pane-a .* lane=UNREGISTERED$' <<<"$hub_strict_out" ||
+  { echo 'FAIL wrk-spillover hub-builder-strict-ok-line'; echo "$hub_strict_out"; exit 1; }
+# The captain alias resolves to the same strict-82 contract.
+set +e
+hub_cap_strict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+  -m builder-sol --role captain --lane b-cstrict --parent director-x --task "$HK_TASK_ID" 2>&1)"
+hub_cap_strict_rc=$?
+set -e
+[[ "$hub_cap_strict_rc" -eq 82 && "$hub_cap_strict_out" == *'lane=UNREGISTERED'* ]] ||
+  { echo 'FAIL wrk-spillover hub-captain-strict-rc82'; echo "$hub_cap_strict_out rc=$hub_cap_strict_rc"; exit 1; }
+# A worker under strict is untouched: rc 0, no lane= field at all.
+hub_wstrict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+grep -Eq '^OK pane=pane-a .* job=job-a$' <<<"$hub_wstrict_out" ||
+  { echo 'FAIL wrk-spillover hub-worker-strict-unchanged'; echo "$hub_wstrict_out"; exit 1; }
+printf '%s\n' 'PASS wrk-spillover hub-builder-strict-82'
+
 # A 504 pending reply polls once under WRK_NO_SLEEP and emits the same result.
 : >"$TMP/hub.log"
 hub_pending_out="$(WRK_HUB_SCENARIO=pending run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
@@ -427,6 +464,24 @@ PY
 [[ "$M4_out" == *'OK pane=pending-pane'* ]] || { echo 'hub pending-poll mutant survived' >&2; exit 1; }
 source_must_stay_unchanged M4
 
+# M5 (#1397 S1-r2): dropping the strict return inside spillover_hub_emit_ok
+# must turn the strict-82 assertion RED — the mutated copy then answers
+# rc 0 under WRK_LANE_STRICT=1 while still printing the OK line.
+MUT_HSTRICT="$TMP/wrk-hub-strict"
+cp "$ROOT/bin/wrk" "$MUT_HSTRICT"
+sed -i.bak '/^spillover_hub_emit_ok() {/,/^}/s|    return "$WRK_EXIT_LANE_UNREGISTERED"|    :|' "$MUT_HSTRICT" || true
+chmod +x "$MUT_HSTRICT"
+mutation_must_change M5 "$MUT_HSTRICT"
+set +e
+MUT_HSTRICT_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$MUT_HSTRICT" "$HUB_CONFIG" \
+  -m builder-sol --role builder --lane b-mstrict --parent director-x --task "$HK_TASK_ID" 2>&1)"
+MUT_HSTRICT_rc=$?
+set -e
+[[ "$MUT_HSTRICT_rc" -ne 82 ]] || { echo 'hub strict-emit mutant survived: strict still returns 82' >&2; exit 1; }
+[[ "$MUT_HSTRICT_out" == *'lane=UNREGISTERED'* ]] ||
+  { echo 'hub strict-emit mutant lost the lane field too' >&2; exit 1; }
+source_must_stay_unchanged M5
+
 # task611: cwd_keys shares the prefix rule — a sibling-worktree cwd maps to
 # the derived key <key>.<suffix> instead of failing closed on an exact miss.
 : >"$TMP/hub.log"
@@ -444,7 +499,7 @@ printf '%s\n' 'PASS wrk-spillover hub-cwd-keys-prefix'
 # legacy routing cases, whose fixture logs are intentionally reset below.
 stop_test_sentinels
 
-echo 'PASS wrk-spillover hub-mutants-red=4/4'
+echo 'PASS wrk-spillover hub-mutants-red=5/5'
 )
 
 # B5: deleting the isolation export in a copy must stop before its seed claim.
@@ -606,7 +661,7 @@ if [[ ! -s "$TMP/ssh.log" || ! -s "$TMP/place.log" ]]; then echo 'lookup-routing
 # M6: treating 74 as retryable must probe the second candidate, so the exact
 # backup_probe_count=0 assertion above becomes red.
 MUT_DUPLICATE="$TMP/wrk-duplicate-retries"; cp "$ROOT/bin/wrk" "$MUT_DUPLICATE"
-sed -i.bak 's/2|"\$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"\$WRK_EXIT_JOB_STATE_UNREADABLE")/2)/' "$MUT_DUPLICATE"
+sed -i.bak 's/2|"\$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"\$WRK_EXIT_JOB_STATE_UNREADABLE"|"\$WRK_EXIT_LANE_UNREGISTERED")/2)/' "$MUT_DUPLICATE"
 : >"$TMP/ssh.log"; : >"$TMP/calls"
 WRK_PLACE_SCENARIO=advance WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3 WRK_SSH_FAIL_CODE=74 run_wrk "$MUT_DUPLICATE" -w local >/dev/null 2>&1 || true
 backup_probe_count="$(grep -c 'mac-work.*uptime; herdr agent list' "$TMP/ssh.log" || true)"
