@@ -427,8 +427,10 @@ Hub lane registration (#965, extended to builders by #1397): a --role worker
 or --role builder spawn registers a lane row on the hub so the pane's events
 have somewhere to route —
 `panewire lanes add NAME --machine ID --pane PANE --parent PARENT` with the
-[hub] credentials: hub_url plus a lanes credential of lanes_token_env when
-set, else operator_token_env, else hub_token_env (hub_cf_env optional). The
+[hub] credentials: hub_url plus a lanes credential resolved per role — a
+WORKER lane keeps the pre-#1397 chain of lanes_token_env when set, else
+hub_token_env (operator_token_env is never read for it); a BUILDER lane
+inserts operator_token_env between the two (hub_cf_env optional). The
 values are file paths panewire opens; wrk scans a lanes token file for the
 HUB_MACHINE_ID value only — to skip a registration the hub would refuse when
 it differs from the target machine — and never prints file contents (a
@@ -487,7 +489,8 @@ malformed machine id or lane name, panewire failure). Over the via=hub
 transport there is no registration-confirmation channel, so a builder's
 emitted line always ends lane=UNREGISTERED. The default stays warn-only
 because the pane is up; WRK_LANE_STRICT=1 exits 82 after the OK
-line so automation can tell "spawned but unrouted" from a clean spawn —
+line — on every transport, via=hub included — so automation can tell
+"spawned but unrouted" from a clean spawn —
 and on a remote leg that 82 stops the auto round instead of re-placing
 the job on the next host. `wrk lanes-missing` is the matching audit: a
 read-only listing of open jobs whose owner lane or its parent is absent
@@ -2732,7 +2735,7 @@ hub_lane_orphan_remove() {
   local lane="$HUB_LANE" machine="$HUB_LANE_MACHINE"
   HUB_LANE="" HUB_LANE_MACHINE=""
   warn "hub lane '$lane' was registered but the job.spawned receipt was not written — deregistering it"
-  hub_lane_remove "$lane" "$machine" "$PANE"
+  hub_lane_remove "$lane" "$machine" "$PANE" "${ROLE:-worker}"
 }
 
 arbiter_admit() {
@@ -5916,15 +5919,20 @@ hub_lane_register() {
   # #1037: a dedicated lanes credential — a node token bound to this host's
   # own machine id — wins over the operator file. It may reach only the lanes
   # routes; every other hub path keeps its own credential. #1397: the
-  # operator file itself (operator_token_env) now authorizes lanes too, ahead
-  # of the legacy hub_token_env fallback — PUT /v1/lanes accepts only the
-  # operator token, and hub_token_env doubles as the quota-gate opt-in a
-  # lanes-only host deliberately leaves unset.
-  token_env="$(hub_lanes_credential 2>/dev/null || true)"
+  # operator file itself (operator_token_env) authorizes lanes too, ahead of
+  # the legacy hub_token_env fallback — but only for a builder lane. A worker
+  # lane keeps the pre-#1397 chain (lanes_token_env, then hub_token_env):
+  # operator_token_env is never read for a worker, and hub_token_env doubles
+  # as the quota-gate opt-in a lanes-only host deliberately leaves unset.
+  token_env="$(hub_lanes_credential "$ROLE" 2>/dev/null || true)"
   lanes_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   if [[ -z "$hub_url" || -z "$token_env" ]]; then
-    warn "hub lane not registered (hub_url missing or none of lanes_token_env, operator_token_env or hub_token_env set in hosts.toml [hub])"
+    if [[ "$ROLE" == builder ]]; then
+      warn "hub lane not registered (hub_url missing or none of lanes_token_env, operator_token_env or hub_token_env set in hosts.toml [hub])"
+    else
+      warn "hub lane not registered (hub_url missing or neither hub_token_env nor lanes_token_env set in hosts.toml [hub])"
+    fi
     return 0
   fi
   # A lanes credential authorizes lanes on its own HUB_MACHINE_ID only — with
@@ -6003,7 +6011,7 @@ hub_lane_register_remote() {
   # Without an operator credential the shared lanes chain is still the
   # fallback (a lanes-only initiator stays warn-only, never hard-refused).
   token_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
-  [[ -n "$token_env" ]] || token_env="$(hub_lanes_credential 2>/dev/null || true)"
+  [[ -n "$token_env" ]] || token_env="$(hub_lanes_credential builder 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   # Only builders reach here — a remote worker keeps the #965 contract and
   # this host never names its lane. A builder always names why its lane is
@@ -6054,16 +6062,22 @@ hub_lane_register_remote() {
   HUB_REMOTE_LANE="$lane"
 }
 
-# #1397: the credential chain every lanes route resolves the same way —
-# `panewire lanes add/ls/rm` here, in hub_lane_remove, and the lanes-missing
-# audit. lanes_token_env (#1037, a node token bound to this host's machine
-# id) wins when set; then operator_token_env, the operator file PUT /v1/lanes
-# requires; then hub_token_env, the legacy fallback that is also the quota
-# gate's opt-in (#1138) — a lanes-only host leaves it unset on purpose.
+# #1397: the credential chain a lanes route resolves — `panewire lanes
+# add/ls/rm` here, in hub_lane_remove, and the lanes-missing audit. The chain
+# is per-role: a BUILDER lane resolves lanes_token_env (#1037, a node token
+# bound to this host's machine id), then operator_token_env (the operator
+# file PUT /v1/lanes requires), then hub_token_env (the legacy fallback that
+# is also the quota gate's opt-in, #1138). A WORKER lane keeps the pre-#1397
+# contract: lanes_token_env then hub_token_env — operator_token_env is never
+# read for a worker, so a mapped worker on an operator-only host registers
+# nothing exactly as on main. The default is the worker chain; callers that
+# speak for builders (remote registration, the all-roles audit) pass it.
 hub_lanes_credential() {
-  local v
+  local role="${1:-worker}" v
   v="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
-  [[ -n "$v" ]] || v="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  if [[ "$role" == builder && -z "$v" ]]; then
+    v="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  fi
   [[ -n "$v" ]] || v="$(spillover_value hub hub_token_env 2>/dev/null || true)"
   [[ -n "$v" ]] || return 1
   printf '%s' "$v"
@@ -6081,7 +6095,7 @@ hub_lanes_credential() {
 # never remove blind. A removal failure warns and the close still stands;
 # `panewire lanes-audit` is where leftovers surface.
 hub_lane_remove() {
-  local lane="$1" want_machine="${2:-}" want_pane="${3:-}" panewire hub_url token_env cf_env rc=0
+  local lane="$1" want_machine="${2:-}" want_pane="${3:-}" lane_role="${4:-worker}" panewire hub_url token_env cf_env rc=0
   local listing verdict
   local args=()
   if ! hub_lane_name_valid "$lane"; then
@@ -6089,14 +6103,21 @@ hub_lane_remove() {
     return 0
   fi
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
-  # Same credential chain as registration (#1037/#1397): lanes_token_env when
-  # set, else operator_token_env, else hub_token_env. A lanes credential's
-  # own `lanes ls` is already machine-scoped hub-side, so no further check
-  # is needed here.
-  token_env="$(hub_lanes_credential 2>/dev/null || true)"
+  # The credential chain follows the lane's own role (#1397): a worker lane
+  # resolves lanes_token_env then hub_token_env exactly as on main —
+  # operator_token_env is never read for it — while a builder lane also
+  # accepts the operator file in between. An unknown role defaults to the
+  # worker chain: it can only ever see less, never more. A lanes
+  # credential's own `lanes ls` is already machine-scoped hub-side, so no
+  # further check is needed here.
+  token_env="$(hub_lanes_credential "$lane_role" 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   if [[ -z "$hub_url" || -z "$token_env" ]]; then
-    warn "hub lane '$lane' not removed (hub_url missing or none of lanes_token_env, operator_token_env or hub_token_env set in hosts.toml [hub])"
+    if [[ "$lane_role" == builder ]]; then
+      warn "hub lane '$lane' not removed (hub_url missing or none of lanes_token_env, operator_token_env or hub_token_env set in hosts.toml [hub])"
+    else
+      warn "hub lane '$lane' not removed (hub_url missing or neither hub_token_env nor lanes_token_env set in hosts.toml [hub])"
+    fi
     return 0
   fi
   panewire="${PANEWIRE_BIN:-panewire}"
@@ -6529,6 +6550,14 @@ spillover_hub_emit_ok() {
   [[ "$role" == builder ]] && lane_field=" lane=UNREGISTERED"
   printf 'OK pane=%s host=%s model=%s label=%s status=%s landed=%s job=%s%s\n' \
     "$pane" "$host" "$model" "$label" "$status" "$landed" "$job_id" "$lane_field"
+  # #1397/S1-r2: WRK_LANE_STRICT means the same on every transport — a
+  # builder's UNREGISTERED marker answers 82 AFTER the OK line prints, so
+  # automation can tell "spawned but unrouted" from a clean spawn here too.
+  # Workers and non-strict runs are untouched.
+  if [[ "$role" == builder && "${WRK_LANE_STRICT:-0}" == 1 ]]; then
+    warn "spawn succeeded but the builder lane is UNREGISTERED; the pane on host '$host' remains valid; strict_exit=$WRK_EXIT_LANE_UNREGISTERED"
+    return "$WRK_EXIT_LANE_UNREGISTERED"
+  fi
 }
 
 spillover_hub_curl_run() {
@@ -6658,7 +6687,7 @@ spillover_hub_poll() {
           pane="$(sed -n '1p' <<<"$parsed")"; job_id="$(sed -n '2p' <<<"$parsed")"
           status="$(sed -n '3p' <<<"$parsed")"; landed="$(sed -n '4p' <<<"$parsed")"
           spillover_hub_emit_ok "$host" "$pane" "$job_id" "$status" "$landed" "$@"
-          return 0
+          return
         fi
         [[ "$state" == pending ]] || { echo "wrk: hub spawn returned an invalid poll response for host '$host'" >&2; return 1; }
         ;;
@@ -8577,8 +8606,10 @@ closed job records a flat job.reaped event (pane_id, tab_id, at).
 A job whose newest job.spawned receipt records a hub lane (hub_lane; spawned
 under a session mapped in hosts.toml's [hub] session_machine_ids, #965) is
 additionally deregistered on --apply: `panewire lanes rm LANE` with the [hub]
-lane credentials (lanes_token_env when set, else operator_token_env, else
-hub_token_env) runs once the tab close is confirmed — and only while
+lane credentials resolved by the lane's role — a worker lane uses
+lanes_token_env when set, else hub_token_env (operator_token_env is never
+read for it, the pre-#1397 contract); a builder lane inserts
+operator_token_env between the two — once the tab close is confirmed — and only while
 `panewire lanes ls` still shows the row bound to the recorded machine+pane (a reused label's newer row is
 never removed). A removal failure warns and the close still stands;
 `panewire lanes-audit` lists any leftover rows.
@@ -8760,7 +8791,11 @@ for job in jobs:
         spawned_hub_lane = ""
     if any(c.isspace() for c in spawned_hub_lane_machine):
         spawned_hub_lane_machine = ""
-    print(job, owner or "-", pane, tab or "-", age, "-", spawned_hub_lane or "-", spawned_hub_lane_machine or "-", sep="\t")
+    # #1397: the claim's role travels too — hub_lane_remove resolves the lane's
+    # credential chain per role (a worker lane never reads operator_token_env;
+    # a builder lane may). An unreadable/absent role marks "-" and the removal
+    # falls back to the narrower worker chain.
+    print(job, owner or "-", pane, tab or "-", age, "-", spawned_hub_lane or "-", spawned_hub_lane_machine or "-", role or "-", sep="\t")
 PY
 }
 
@@ -8862,8 +8897,8 @@ reap_cmd() {
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
   candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
-  local job owner pane tab age note hub_lane hub_lane_machine probe class token probe_tab verdict acted=0
-  while IFS=$'\t' read -r job owner pane tab age note hub_lane hub_lane_machine; do
+  local job owner pane tab age note hub_lane hub_lane_machine lane_role probe class token probe_tab verdict acted=0
+  while IFS=$'\t' read -r job owner pane tab age note hub_lane hub_lane_machine lane_role; do
     [[ -n "$job" ]] || continue
     if [[ -n "$note" && "$note" != - ]]; then
       echo "skip job=$job reason=$note"
@@ -8874,6 +8909,7 @@ reap_cmd() {
     [[ "$tab" != - ]] || tab=""
     [[ "$hub_lane" != - ]] || hub_lane=""
     [[ "$hub_lane_machine" != - ]] || hub_lane_machine=""
+    [[ "$lane_role" != - ]] || lane_role=""
     if [[ "$pane" == - ]]; then
       echo "skip job=$job reason=malformed-record"
       continue
@@ -8928,7 +8964,7 @@ reap_cmd() {
         # daemon still shows that row bound to the recorded machine+pane.
         # Failure warns; the pane stays closed and lanes-audit lists what is
         # left behind.
-        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane" "$hub_lane_machine" "$pane"
+        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane" "$hub_lane_machine" "$pane" "${lane_role:-worker}"
         echo "closed job=$job pane=$pane tab=$tab status=$token age=${age}s"
         acted=$(( acted + 1 ))
       else
@@ -8986,7 +9022,9 @@ lanes_missing_cmd() {
   local args=()
   jobs_root="$(wrk_jobs_root)"
   hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
-  token_env="$(hub_lanes_credential 2>/dev/null || true)"
+  # The audit reads lanes of every role, so it resolves the full builder
+  # chain — a read-only `lanes ls`, never a worker's registration contract.
+  token_env="$(hub_lanes_credential builder 2>/dev/null || true)"
   cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
   if [[ -z "$hub_url" || -z "$token_env" ]]; then
     die "lanes-missing cannot audit: [hub] needs hub_url plus a lanes credential (lanes_token_env, else operator_token_env, else hub_token_env)"

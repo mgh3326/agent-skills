@@ -3493,10 +3493,18 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
 T1397_LOAD_HIGH="$TMP/t1397-loadavg-high"
 printf '4.00 4.00 4.00 1/1 1\n' >"$T1397_LOAD_HIGH"
 # A session map that maps SOME OTHER session plus machine_id — proves the
-# machine_id fallback never leaks to workers (tester mu02).
-LANES_CFG_OP_OTHERMAP="$TMP/lanes-1397-othermap-hosts.toml"
-printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "mac-personal"\nsession_machine_ids = { "other-session" = "other-machine" }\n' \
-  "$LANES_OP_FILE" "$LANES_CF_FILE" >"$LANES_CFG_OP_OTHERMAP"
+# machine_id fallback never leaks to workers (tester mu02). The credential is
+# hub_token_env, one a worker DOES read: an operator-only config could never
+# register the mutated worker and the mutant would survive unproven.
+LANES_CFG_OTHERMAP="$TMP/lanes-1397-othermap-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "mac-personal"\nsession_machine_ids = { "other-session" = "other-machine" }\n' \
+  "$LANES_TOKEN_FILE" "$LANES_CF_FILE" >"$LANES_CFG_OTHERMAP"
+# Mapped + hub_token_env + operator_token_env (B1-r4 pin): a WORKER lane keeps
+# the pre-#1397 chain and must reach panewire with the hub_token file — never
+# the operator file — while a BUILDER on the same config takes the operator.
+LANES_CFG_WBOTH="$TMP/lanes-1397-wboth-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$LANES_TOKEN_FILE" "$LANES_OP_FILE" "$LANES_CF_FILE" >"$LANES_CFG_WBOTH"
 
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
@@ -3653,18 +3661,22 @@ lanes_reap_run() {
 }
 
 lanes_reap_job() {
-  # JOB PANE TAB LANE HUB_LANE [LABEL [MACHINE]] — claim + job.spawned
+  # JOB PANE TAB LANE HUB_LANE [LABEL [MACHINE [ROLE]]] — claim + job.spawned
   # (+hub_lane/hub_lane_machine when nonempty) + job.completed, all backdated
   # past the default grace. LABEL defaults to JOB (#994 needs lane != job !=
-  # label so a remove-by-job-id regression cannot pass silently).
-  local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5" label="${6:-$1}" machine="${7:-mac-work-default}"
+  # label so a remove-by-job-id regression cannot pass silently). ROLE
+  # defaults to worker — the claim records it, reap's per-role credential
+  # chain and the --include-builders filter both read it (#1397).
+  local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5" label="${6:-$1}" machine="${7:-mac-work-default}" role="${8:-worker}"
   local spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}"
   if [[ -n "$hub_lane" ]]; then
     spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"$machine\"}"
   fi
+  local claim_role=(--role "$role")
+  [[ "$role" == builder ]] && claim_role+=(--parent-lane director-x)
   export ARBITER_TEST_NOW="$LANES_REAP_NOW"
   env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" claim \
-    --job "$job" --lane "$lane" --agent-label "$job" --t T1 >/dev/null
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 "${claim_role[@]}" >/dev/null
   env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
     --payload-json "$spawned" >/dev/null
   env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
@@ -3925,7 +3937,7 @@ PY
   # rows) for the sweep to be observable at all.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-rmall \
-    '        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane" "$hub_lane_machine" "$pane"' \
+    '        [[ -z "$hub_lane" ]] || hub_lane_remove "$hub_lane" "$hub_lane_machine" "$pane" "${lane_role:-worker}"' \
     '        hub_lane_remove "$job"'
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-rmall" \
     WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lanes-m3-ok","machine":"","pane":"","parent":"","sink":true},{"lane":"lanes-m3-plain","machine":"","pane":"","parent":"","sink":true}]}' \
@@ -4632,10 +4644,10 @@ PY
   # hub_lane_machine=mac-personal is removed only while `lanes ls` shows the
   # row bound to that machine+pane, and the rm carries the operator file.
   LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1397"
-  lanes_reap_job j1397-reap w1:p13 w1:t13 b1397-reap lane-1397-reap lbl-1397 mac-personal
+  lanes_reap_job j1397-reap w1:p13 w1:t13 b1397-reap lane-1397-reap lbl-1397 mac-personal builder
   WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1397-reap","machine":"mac-personal","pane":"w1:p13","parent":"director-x","sink":false}]}' \
     LANES_REAP_CFG_OVERRIDE="$LANES_CFG_OP" \
-    lanes_reap_run ac1c --lane b1397-reap --apply
+    lanes_reap_run ac1c --lane b1397-reap --apply --include-builders
   [[ "$LANES_REAP_RC" -eq 0 ]] ||
     fail "#1397 AC1c: apply failed: $(cat "$LANES_REAP_ERR")"
   python3 - "$LANES_RM_LOG" "$LANES_OP_FILE" "$LANES_CF_FILE" <<'PY' ||
@@ -4727,10 +4739,10 @@ assert meta["hub_lane"] == "b1397-defer" and meta["hub_lane_machine"] == "deskto
   # AC2c — reap on the execution host removes a remote-registered lane the
   # same way: hub_lane_machine is the host key, and `lanes ls` must still
   # show that machine+pane.
-  lanes_reap_job j1397-rreap w1:p14 w1:t14 b1397-x lane-1397-remote lbl-1397r desktop
+  lanes_reap_job j1397-rreap w1:p14 w1:t14 b1397-x lane-1397-remote lbl-1397r desktop builder
   WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1397-remote","machine":"desktop","pane":"w1:p14","parent":"director-x","sink":false}]}' \
     LANES_REAP_CFG_OVERRIDE="$LANES_CFG_OP" \
-    lanes_reap_run ac2c --lane b1397-x --apply
+    lanes_reap_run ac2c --lane b1397-x --apply --include-builders
   [[ "$LANES_REAP_RC" -eq 0 ]] ||
     fail "#1397 AC2c: apply failed: $(cat "$LANES_REAP_ERR")"
   [[ "$(grep -cxF 'rm' "$LANES_RM_LOG")" -eq 1 &&
@@ -5024,7 +5036,7 @@ PY
   # machine id — a fleet worker never becomes a global lane. The map maps
   # another session, so the lookup runs and misses; machine_id is set, and a
   # worker-fallback mutant would register it on mac-personal.
-  LANES_CFG_OVERRIDE="$LANES_CFG_OP_OTHERMAP" HERDR_SESSION=default \
+  LANES_CFG_OVERRIDE="$LANES_CFG_OTHERMAP" HERDR_SESSION=default \
     lanes_spawn w1397-wmap --owner work-kairos
   [[ "$LANES_RC" -eq 0 ]] ||
     fail "#1397 AC6: an unmapped worker still spawns warn-only (rc=$LANES_RC): $(cat "$LANES_ERR")"
@@ -5088,6 +5100,92 @@ PY
   lanes_assert_no_lanes_call w1397-strict
   echo "PASS 1397-lanes AC9: WRK_LANE_STRICT never applies to workers"
 
+  # AC10 — the worker credential chain is the pre-#1397 one (tester B1-r4,
+  # operator ruling): a WORKER lane resolves lanes_token_env then
+  # hub_token_env and NEVER reads operator_token_env, for register AND reap;
+  # a builder lane inserts operator_token_env between the two.
+  # (a) mapped worker on hub_token_env + operator_token_env: the add, the ls
+  # and the rm all carry the hub_token file — never the operator file.
+  LANES_CFG_OVERRIDE="$LANES_CFG_WBOTH" HERDR_SESSION=default \
+    lanes_spawn w1397-wboth --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1397 AC10a: mapped worker spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_CALLS" "$LANES_TOKEN_FILE" "$LANES_OP_FILE" <<'PY' ||
+import sys
+log, token_file, op_file = sys.argv[1:]
+got = open(log, encoding="utf-8").read().splitlines()
+i = got.index("--hub-token-env")
+assert got[i + 1] == token_file, \
+    "a worker must carry hub_token_env, not the operator file: %r" % got
+assert op_file not in got, "the operator path must never reach worker argv: %r" % got
+PY
+    fail "#1397 AC10a: the worker add must carry the hub_token file, never operator"
+  grep -q ' lane=w1397-wboth@mac-work-default$' "$LANES_OUT" ||
+    fail "#1397 AC10a: the worker OK line must carry the lane: $(cat "$LANES_OUT")"
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-wboth"
+  lanes_reap_job j1397-wboth w1:p16 w1:t16 own-1397wb lane-1397-wboth lbl-1397wb mac-work-default
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1397-wboth","machine":"mac-work-default","pane":"w1:p16","parent":"work-kairos","sink":false}]}' \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run wboth --lane own-1397wb --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1397 AC10a: worker apply failed: $(cat "$LANES_REAP_ERR")"
+  python3 - "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_OP_FILE" <<'PY' ||
+import sys
+log, token_file, op_file = sys.argv[1:]
+got = open(log, encoding="utf-8").read().splitlines()
+envs = [got[i + 1] for i, x in enumerate(got) if x == "--hub-token-env"]
+assert envs == [token_file, token_file], \
+    "worker ls+rm must carry hub_token_env twice, got %r" % got
+assert op_file not in got, "the operator path must never reach worker reap argv: %r" % got
+PY
+    fail "#1397 AC10a: worker reap ls+rm must carry the hub_token file, never operator"
+  echo "PASS 1397-lanes AC10a: a mapped worker keeps the hub_token credential end to end"
+
+  # (b) mapped worker on operator_token_env only: the worker chain sees no
+  # lanes credential at all — zero calls, no lane= on the OK line, exactly
+  # one warning with main's wording.
+  LANES_CFG_OVERRIDE="$LANES_CFG_OP_MAP" HERDR_SESSION=default \
+    lanes_spawn w1397-wop --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1397 AC10b: operator-only worker spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call w1397-wop
+  ! grep -q ' lane=' "$LANES_OUT" ||
+    fail "#1397 AC10b: an operator-only worker must not claim a lane: $(cat "$LANES_OUT")"
+  grep -q 'neither hub_token_env nor lanes_token_env set' "$LANES_ERR" ||
+    fail "#1397 AC10b: the warning must keep main's worker wording: $(cat "$LANES_ERR")"
+  # A worker lane receipt reaped on the same config also makes zero calls —
+  # the removal half of the worker contract.
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-wop"
+  lanes_reap_job j1397-wop w1:p17 w1:t17 own-1397wop lane-1397-wop lbl-1397wop mac-work-default
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1397-wop","machine":"mac-work-default","pane":"w1:p17","parent":"work-kairos","sink":false}]}' \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_OP_MAP" \
+    lanes_reap_run wop --lane own-1397wop --apply
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1397 AC10b: worker apply failed: $(cat "$LANES_REAP_ERR")"
+  if [[ -s "$LANES_RM_LOG" ]]; then
+    fail "#1397 AC10b: an operator-only host must not ls/rm a worker lane: $(cat "$LANES_RM_LOG")"
+  fi
+  echo "PASS 1397-lanes AC10b: operator_token_env never reaches a worker (register + reap)"
+
+  # (c) the builder control on the same two configs: the operator file still
+  # wins where the builder chain says so — AC1a/AC1b/AC1c pin the argv above;
+  # this case adds the hub_token+operator mix, where the builder picks the
+  # operator file the worker just refused.
+  LANES_CFG_OVERRIDE="$LANES_CFG_WBOTH" LANES_MODEL=builder-sol HERDR_SESSION=default \
+    lanes_spawn b1397-wboth --role builder --lane b1397-wboth --parent director-x
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1397 AC10c: builder spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_CALLS" "$LANES_OP_FILE" <<'PY' ||
+import sys
+log, op_file = sys.argv[1:]
+got = open(log, encoding="utf-8").read().splitlines()
+i = got.index("--hub-token-env")
+assert got[i + 1] == op_file, \
+    "a builder on hub_token+operator must carry the operator file: %r" % got
+PY
+    fail "#1397 AC10c: the builder add must carry the operator file"
+  echo "PASS 1397-lanes AC10c: the builder chain still prefers the operator credential"
+
   # -- #1397 assertion-RED mutants -----------------------------------------
   # M1: the builder gate back to worker-only — the mapped builder spawn then
   # registers nothing and answers UNREGISTERED, exactly what AC1a rejects.
@@ -5110,7 +5208,9 @@ PY
   # assertion goes RED.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-1397-noop \
-    '  [[ -n "$v" ]] || v="$(spillover_value hub operator_token_env 2>/dev/null || true)"' \
+    '  if [[ "$role" == builder && -z "$v" ]]; then
+    v="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  fi' \
     '  :'
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-noop" \
     LANES_CFG_OVERRIDE="$LANES_CFG_OP" LANES_MODEL=builder-sol \
@@ -5139,11 +5239,11 @@ PY
   devin_trust_mutant lanes-1397-blindrm \
     '        if machine == want_machine and pane == want_pane:' \
     '        if True:'
-  lanes_reap_job j1397-m4 w1:p15 w1:t15 own-1397m4 lane-1397-m4 lbl-1397m4 mac-personal
+  lanes_reap_job j1397-m4 w1:p15 w1:t15 own-1397m4 lane-1397-m4 lbl-1397m4 mac-personal builder
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-blindrm" \
     WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1397-m4","machine":"mac-personal","pane":"w1:p99","parent":"x","sink":false}]}' \
     LANES_REAP_CFG_OVERRIDE="$LANES_CFG_OP" \
-    lanes_reap_run m4 --lane own-1397m4 --apply
+    lanes_reap_run m4 --lane own-1397m4 --apply --include-builders
   if [[ ! -f "$LANES_RM_LOG" ]] || ! grep -qxF 'rm' "$LANES_RM_LOG"; then
     fail "#1397 M4 mutant survived: a moved row was not swept"
   fi
@@ -5186,8 +5286,8 @@ PY
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-1397-remoteop \
     '  token_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
-  [[ -n "$token_env" ]] || token_env="$(hub_lanes_credential 2>/dev/null || true)"' \
-    '  token_env="$(hub_lanes_credential 2>/dev/null || true)"'
+  [[ -n "$token_env" ]] || token_env="$(hub_lanes_credential builder 2>/dev/null || true)"' \
+    '  token_env="$(hub_lanes_credential builder 2>/dev/null || true)"'
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-remoteop" \
     T1397_CFG_OVERRIDE="$LANES_CFG_REMOTE_BOTH" \
     t1397_remote_spawn b1397-m7
@@ -5226,7 +5326,7 @@ PY
     '  if [[ -z "$machine" && "$ROLE" == builder ]]; then' \
     '  if [[ -z "$machine" ]]; then'
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-workmachine" \
-    LANES_CFG_OVERRIDE="$LANES_CFG_OP_OTHERMAP" HERDR_SESSION=default \
+    LANES_CFG_OVERRIDE="$LANES_CFG_OTHERMAP" HERDR_SESSION=default \
     lanes_spawn w1397-m9 --owner work-kairos
   if [[ ! -s "$LANES_CALLS" ]]; then
     fail "#1397 M9 mutant survived: the worker still did not register"
@@ -5283,6 +5383,36 @@ PY
     fail "#1397 M12 mutant survived: the worker did not answer 82"
   fi
   echo "PASS 1397-lanes M12: strict reaching workers goes RED"
+
+  # M13: re-widening the worker credential chain (tester B1-r4) — letting a
+  # worker lane read operator_token_env again. Register side: the
+  # operator-only worker spawn must now call lanes add, which AC10b's
+  # zero-call assertion would reject on the fixed code.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1397-widerworker \
+    '  if [[ "$role" == builder && -z "$v" ]]; then' \
+    '  if [[ -z "$v" ]]; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-widerworker" \
+    LANES_CFG_OVERRIDE="$LANES_CFG_OP_MAP" HERDR_SESSION=default \
+    lanes_spawn w1397-m13 --owner work-kairos
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#1397 M13 mutant survived: the worker still ignores operator_token_env"
+  fi
+  # Reap side: a worker lane receipt reaped on the same operator-only
+  # config must now run ls+rm where the fixed code warns and skips. The
+  # pane/tab pair must be one the herdr fixture's tab list carries —
+  # a tab the list does not know is a tab-count-unknown skip, and the
+  # removal never runs at all.
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-m13"
+  lanes_reap_job j1397-m13 w1:p16 w1:t16 own-1397m13 lane-1397-m13 lbl-1397m13 mac-work-default
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1397-widerworker" \
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1397-m13","machine":"mac-work-default","pane":"w1:p16","parent":"work-kairos","sink":false}]}' \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_OP_MAP" \
+    lanes_reap_run m13 --lane own-1397m13 --apply
+  if [[ ! -f "$LANES_RM_LOG" ]] || ! grep -qxF 'rm' "$LANES_RM_LOG"; then
+    fail "#1397 M13 mutant survived: the worker reap still skips operator_token_env"
+  fi
+  echo "PASS 1397-lanes M13: re-widening the worker chain goes RED (register + reap)"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then

@@ -632,7 +632,7 @@ spawn = false              # 이 호스트의 로컬 spawn 자체를 닫는다 �
 [hub]
 hub_url = "wss://<hub-host>"
 hub_token_env = "<path-to-token-env-file>"
-operator_token_env = "<path-to-operator-token-file>"  # 선택 사항 — lanes 자격증명 체인의 둘째 (#1397)
+operator_token_env = "<path-to-operator-token-file>"  # 선택 사항 — builder lanes 자격증명 체인의 둘째, worker는 안 읽음 (#1397)
 hub_cf_env = "<path-to-cf-env-file>"   # 선택 사항
 lanes_token_env = "<path-to-node-token-file>"  # 선택 사항 — lanes 전용 노드 토큰
 machine_id = "<hub-machine-id>"        # 선택 사항 — 이 호스트 자신의 허브 머신 id, 빌더 폴백 (#1397)
@@ -768,12 +768,15 @@ wake_wait = 300
   요청); `HUB_TOKEN`은 절대 읽거나 출력하지 않는다. `hub_token_env`
   없이 `hub_url`+`lanes_token_env`만 둔 lanes-only `[hub]`는 quota gate를 켜지 않는다 —
   게이트의 opt-in은 오직 `hub_token_env`다.
-- 레인 자격증명 체인(#1397): lanes route(`lanes add/ls/rm`, `wrk lanes-missing`)가 쓰는
-  credential은 `lanes_token_env` → 없으면 `operator_token_env` → 없으면 `hub_token_env` 순이다.
-  PUT /v1/lanes 는 operator 토큰만 받으므로 operator_token_env가 lanes를 authorizing할 수 있다.
-  같은 체인이 worker 등록에도 적용된다 — 자기 session_machine_ids 엔트리에 매핑된 worker는
-  operator_token_env만 설정된 호스트에서도 등록된다(#965 당시보다 넓어진 의도된 변화다;
-  reap의 `lanes rm`도 같은 체인을 따라가므로 대칭이다).
+- 레인 자격증명 체인(#1397): lanes route(`lanes add/ls/rm`)가 쓰는 credential은
+  레인의 role로 갈린다 — **worker 레인은 #965 때와 같은 `lanes_token_env` →
+  `hub_token_env` 체인을 그대로 유지**하며 `operator_token_env`를 절대 읽지 않는다
+  (operator_token_env만 설정된 호스트의 매핑 worker는 #965 때처럼 등록 없이 한 번
+  경고하고 끝난다); **builder 레인만** `lanes_token_env` → `operator_token_env` →
+  `hub_token_env` 순을 쓴다. PUT /v1/lanes 는 operator 토큰만 받으므로
+  operator_token_env가 builder lanes를 authorizing할 수 있다. `reap --apply`의
+  `lanes rm`도 job의 claim role로 같은 구분을 따라간다(대칭). `wrk lanes-missing`은
+  모든 role의 레인을 감사하므로 builder 체인(셋 다)으로 한 번 `lanes ls`를 친다.
   예외 — 원격 `--host` builder 등록은 다른 머신의 레인을 쓰므로 `operator_token_env`를 먼저
   쓰고, 없을 때만 공유 체인으로 폴백한다(노드 스코프 lanes 토큰은 자기 호스트의 레인만
   authorizing한다고 가정).
