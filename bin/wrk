@@ -391,7 +391,10 @@ line then ends with via=herdr-fallback.
                      one clean 'heavy_load_wait = true|false' under
                      '[local]', same refusal rules — a malformed
                      heavy_load_wait refuses placements too, and vice
-                     versa. `wrk hosts` reports the resolved state as
+                     versa. `shell_ready_timeout_ms = N` (30000..300000)
+                     lengthens this host's shell readiness window for every
+                     kind and cannot shorten its kind default; a remote
+                     spawn uses the target host's own [local] value. `wrk hosts` reports the resolved state as
                      'local spawn=allowed|disabled|error'.
 
                      hosts.toml [hosts.NAME] may opt a default-off remote
@@ -1992,8 +1995,11 @@ devin_preserve_failure_artifacts() {
 }
 
 devin_spawn_diagnostics() {
-  local reason="$1" detected="${2:-0}" explain_rc="${3:-}" explain_json="${4:-}" out
-  echo "wrk: Devin pane startup failed: $reason; pane=$PANE" >&2
+  local reason="$1" detected="${2:-0}" explain_rc="${3:-}" explain_json="${4:-}" out source_suffix=""
+  if [[ -n "${START_TIMEOUT:-}" && "$reason" == *"${START_TIMEOUT}ms"* ]]; then
+    source_suffix="; timeout source: ${START_TIMEOUT_SOURCE:-agent kind default}"
+  fi
+  echo "wrk: Devin pane startup failed: $reason; pane=$PANE$source_suffix" >&2
   out="$(devin_preserve_failure_artifacts "$reason" "$detected" "$explain_rc" "$explain_json")"
   # The operator-facing process-info dump replays the capture preservation just
   # made: a second live call would change the pane-touch count the readiness
@@ -2079,7 +2085,7 @@ agent_start_in_pane() {
     attempts=$(( attempts + 1 ))
     remaining_ms=$(( START_TIMEOUT - (now - started_at) * 1000 ))
     if (( remaining_ms <= AGENT_START_MIN_TIMEOUT_MS )); then
-      echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (readiness probe used ${probe_used_ms}ms, agent_pane_busy x$(( attempts - 1 ))); pane=$PANE" >&2
+      echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (readiness probe used ${probe_used_ms}ms, agent_pane_busy x$(( attempts - 1 ))); pane=$PANE; timeout source: $START_TIMEOUT_SOURCE" >&2
       spawn_pane_cleanup
       return 1
     fi
@@ -2096,7 +2102,7 @@ agent_start_in_pane() {
     # The wall clock is checked at the top of the loop; the cap bounds it
     # when sleep is disabled.
     if (( attempts >= max_attempts )); then
-      echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (readiness probe used ${probe_used_ms}ms, agent_pane_busy x$attempts); pane=$PANE" >&2
+      echo "wrk: agent start failed: shell not ready within the ${START_TIMEOUT}ms window (readiness probe used ${probe_used_ms}ms, agent_pane_busy x$attempts); pane=$PANE; timeout source: $START_TIMEOUT_SOURCE" >&2
       spawn_pane_cleanup
       return "$start_rc"
     fi
@@ -2252,12 +2258,15 @@ DEVIN_PROBE_MISS_POLLS=4
 # pinned by its tests; the other kinds report the same reason on the
 # agent-start failure line with the same process-info dump.
 shell_ready_diagnostics() {
-  local reason="$1"
+  local reason="$1" source_suffix=""
   if [[ "$PROFILE_KIND" == devin ]]; then
     devin_spawn_diagnostics "$reason"
     return
   fi
-  echo "wrk: agent start failed: $reason; pane=$PANE" >&2
+  if [[ -n "${START_TIMEOUT:-}" && "$reason" == *"${START_TIMEOUT}ms"* ]]; then
+    source_suffix="; timeout source: ${START_TIMEOUT_SOURCE:-agent kind default}"
+  fi
+  echo "wrk: agent start failed: $reason; pane=$PANE$source_suffix" >&2
   "$HERDR" pane process-info --pane "$PANE" >&2 ||
     warn "agent start process-info failed for pane=$PANE"
 }
@@ -7720,6 +7729,10 @@ spawn_router_cmd() {
 # 0 = skip) and LOCAL_HEAVY_LOAD_WAIT_SRC for the status lines. The refusal
 # is shared: a malformed heavy_load_wait also fails spawn placement and
 # vice versa — one [local] surface, one grammar.
+# #1492: shell_ready_timeout_ms is the third strict [local] key. It accepts
+# one bare integer from 30000 through 300000 and is used as a floor for each
+# kind's existing shell readiness window. An absent key leaves each default
+# unchanged; a malformed or out-of-range assignment refuses before spawn.
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -7741,9 +7754,11 @@ local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
   LOCAL_HEAVY_LOAD_WAIT=1
   LOCAL_HEAVY_LOAD_WAIT_SRC=default
+  LOCAL_SHELL_READY_TIMEOUT_MS=0
+  LOCAL_SHELL_READY_TIMEOUT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -7812,6 +7827,37 @@ local_spawn_scan() {
       return "$WRK_EXIT_CONFIG_REFUSED"
     fi
     [[ "$current" == local ]] || continue
+    # #1492: a bare integer, with the same one-key, one-clean-assignment
+    # grammar as the other strict [local] settings. Check the decimal length
+    # before arithmetic so an arbitrarily large integer cannot wrap in bash.
+    case "$line" in
+      shell_ready_timeout_ms[A-Za-z0-9_-]*) ;;   # a different bare key
+      shell_ready_timeout_ms* | '"shell_ready_timeout_ms"'* | "'shell_ready_timeout_ms'"*)
+        if [[ "$line" =~ ^shell_ready_timeout_ms[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed shell_ready_timeout_ms assignment in [local] (expected 'shell_ready_timeout_ms = integer')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        shell_ready_timeout_seen=$((shell_ready_timeout_seen + 1))
+        if [[ "$shell_ready_timeout_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate shell_ready_timeout_ms key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        if [[ ! "$value" =~ ^(0|[1-9][0-9]*)$ ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: [local] shell_ready_timeout_ms must be a bare integer from 30000 to 300000 (got '$value')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        if (( ${#value} > 6 )) || (( 10#$value < 30000 || 10#$value > 300000 )); then
+          LOCAL_SPAWN_ERROR="$config line $n: [local] shell_ready_timeout_ms must be from 30000 to 300000 (got '$value')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        LOCAL_SHELL_READY_TIMEOUT_MS="$value"
+        LOCAL_SHELL_READY_TIMEOUT_SRC="$config [local] shell_ready_timeout_ms"
+        continue ;;
+    esac
     # #1241: 'heavy_load_wait' is the second strict [local] boolean — same
     # accepted shape as spawn below (bare 'heavy_load_wait = true|false');
     # every would-be spelling refuses, and a bare key it merely prefixes
@@ -8596,9 +8642,17 @@ print(value if isinstance(value, str) else "")
   SPAWN_PANE_OPEN=1   # ROB-1214: disarmed only at the success line
   sleep_for 5
   START_TIMEOUT=30000; BOOT_SETTLE=12
+  START_TIMEOUT_SOURCE="$PROFILE_KIND kind default"
   [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
   [[ "$PROFILE_KIND" == codex ]] && START_TIMEOUT=120000 && BOOT_SETTLE=20
+  if [[ "$PROFILE_KIND" == kimi || "$PROFILE_KIND" == codex ]]; then
+    START_TIMEOUT_SOURCE="$PROFILE_KIND kind default"
+  fi
+  if (( ${LOCAL_SHELL_READY_TIMEOUT_MS:-0} >= START_TIMEOUT )); then
+    START_TIMEOUT="$LOCAL_SHELL_READY_TIMEOUT_MS"
+    START_TIMEOUT_SOURCE="$LOCAL_SHELL_READY_TIMEOUT_SRC"
+  fi
 
   mock_mcp_verify || return "$WRK_EXIT_MOCK_MCP_REFUSED"
 
