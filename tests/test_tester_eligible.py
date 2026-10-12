@@ -48,7 +48,7 @@ class EligibilityFixtures(unittest.TestCase):
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-qm", "base")
         self.base = git(self.repo, "rev-parse", "HEAD")
-        policy, check = common.load_policy(now=datetime(2026, 9, 25, 6, 0, tzinfo=timezone.utc))
+        policy, check = common.load_policy(now=datetime(2026, 10, 12, 6, 0, tzinfo=timezone.utc))
         self.assertEqual((check["status"], check["reason_code"]), ("PASS", "POLICY_CURRENT"))
         self.policy = policy
         self.policy_check = check
@@ -289,19 +289,26 @@ class EligibilityFixtures(unittest.TestCase):
         evidence = self.evidence(self.make_head())
         evidence["tester"]["planned_profile"] = "fictional-launcher"
         self.assert_case(self.check(evidence), "tester", "UNVERIFIED", "PROFILE_UNKNOWN")
-        _, stale = common.load_policy(now=datetime(2026, 10, 4, tzinfo=timezone.utc))
+        _, stale = common.load_policy(now=datetime(2026, 10, 21, tzinfo=timezone.utc))
         self.assertEqual((stale["status"], stale["reason_code"]), ("UNVERIFIED", "POLICY_STALE"))
         changed = json.loads(json.dumps(self.policy))
         changed["sources"]["decision/2026-09-20/provider-family-and-ds41-grade"]["id"] = 0
         path = Path(self.temp.name) / "policy.json"
         path.write_text(json.dumps(changed))
-        _, conflict = common.load_policy(path, now=datetime(2026, 9, 25, 6, tzinfo=timezone.utc))
+        _, conflict = common.load_policy(path, now=datetime(2026, 10, 12, 6, tzinfo=timezone.utc))
         self.assertEqual((conflict["status"], conflict["reason_code"]), ("UNVERIFIED", "POLICY_CONFLICT"))
 
     def test_advertised_aliases_have_explicit_policy_entries(self) -> None:
         names = subprocess.run([str(ROOT / "bin/wrk"), "profiles"], text=True,
                                capture_output=True, check=True).stdout.splitlines()
-        self.assertEqual(set(names), set(self.policy["profiles"]))
+        # Terra spellings are refused (operator 2026-10-12 noterra): wrk no longer
+        # advertises them, and the policy keeps each one only as an explicit denial.
+        barred = {"codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",
+                  "builder-terra-xhigh", "builder-terra-max"}
+        self.assertTrue(barred.isdisjoint(names), sorted(barred & set(names)))
+        self.assertEqual(set(names), set(self.policy["profiles"]) - barred)
+        for name in barred:
+            self.assertEqual(self.policy["profiles"][name]["role_status"], "denied", name)
         for name in names:
             self.assertIsNotNone(common._wrk_clause((ROOT / "bin/wrk").read_text(), name), name)
             spec = self.policy["profiles"][name]
@@ -536,8 +543,8 @@ class EligibilityFixtures(unittest.TestCase):
 
     def test_e6_builder_grades_conflict_and_grok_model_must_match_wrk(self) -> None:
         variants = ("builder-opus-low", "builder-opus-medium", "builder-sonnet-xhigh", "builder-sonnet-max",
-                    "builder-sol-high", "builder-sol-max", "builder-sol-medium", "builder-luna-max", "builder-terra-high",
-                    "builder-terra-xhigh", "builder-terra-max", "builder-kimi-high", "builder-kimi-max",
+                    "builder-sol-high", "builder-sol-max", "builder-sol-medium", "builder-luna-max",
+                    "builder-kimi-high", "builder-kimi-max",
                     "builder-grok-low", "builder-grok-medium", "builder-grok-xhigh")
         for alias in variants:
             spec = self.policy["profiles"][alias]
@@ -553,6 +560,34 @@ class EligibilityFixtures(unittest.TestCase):
         changed["profiles"]["codex-sol"]["family"] = "xai"
         _, check = common.resolve_profile("codex-sol", changed, actual_effort="max", role="tester")
         self.assertEqual((check["status"], check["reason_code"]), ("UNVERIFIED", "PROFILE_FAMILY_CONFLICT"))
+
+    def test_every_terra_profile_is_denied_to_testers(self) -> None:
+        barred = ("codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",
+                  "builder-terra-xhigh", "builder-terra-max")
+        for alias in barred:
+            with self.subTest(profile=alias):
+                spec = self.policy["profiles"][alias]
+                self.assertEqual(spec["roles"], [])
+                self.assertEqual(spec["surfaces"], [])
+                self.assertEqual(spec["role_status"], "denied")
+                evidence = self.evidence(self.make_head(f"src/{alias}-tester.py"))
+                evidence["tester"] = {"planned_profile": alias,
+                                       "planned_effort": spec["default_effort"]}
+                checks = self.check(evidence)
+                self.assert_case(checks, "tester", "FAIL", "PROFILE_ROLE_DENIED")
+
+    def test_codex_med_grant_mutant_goes_red(self) -> None:
+        mutant = json.loads(json.dumps(self.policy))
+        mutant["profiles"]["codex-med"].update(
+            role_status="unknown", roles=["worker", "tester"], surfaces=["T1", "T2"])
+        evidence = self.evidence(self.make_head("src/codex-med-tester-mutant.py"))
+        evidence["tester"] = {"planned_profile": "codex-med", "planned_effort": "medium"}
+        checks, _ = eligible.evaluate(evidence, "pre-spawn", mutant, self.policy_check)
+        # The mutant permits the tester, so the T-A4 refusal assertion must go
+        # RED if the codex-med grant is restored in gate_policy.
+        with self.assertRaises(AssertionError):
+            self.assert_case(checks, "tester", "FAIL", "PROFILE_ROLE_DENIED")
+        self.assertEqual(checks["tester"]["status"], "PASS")
 
     def test_mutants_are_assertion_red(self) -> None:
         evidence = self.evidence(self.make_head("deploy/runtime.service"))

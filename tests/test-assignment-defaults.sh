@@ -110,9 +110,7 @@ BLOCK_ROWS = [
     ("codex-aplus-luna-max", r"A\+ = Luna max"),
     ("codex-a-luna-high", r"A = Luna high"),
     ("codex-b-luna-medium", r"B = Luna medium"),
-    ("terra-dominated", r"Terra 는? 모든 급에서 지배당한다"),
-    ("terra-reserve-only", r"Terra 전용으로 확인될 때만 보조"),
-    ("terra-no-load-claim", r"부하 분산 주장 금지"),
+    ("terra-refused", r"Terra profiles are refused by operator 2026-10-12 noterra and are not assignment candidates"),
     ("sol-codex-default-max", r"codex-sol`?\s*철자 자체의 기본값은 max"),
     ("sol-assign-explicit-effort", r"Sol 배정은? `?--effort`? 명시"),
     ("e6-sol-priority", r"미측정 Sol high\(C\)·미배치 Sol medium 은?[^\n]{0,40}?E6 arm 우선 측정 대상"),
@@ -134,7 +132,7 @@ FILE_FORBIDDEN = [
     ("builder-max-default",
      r"(?:빌더|builders?\b(?!-(?:devin|ds41)))[^\n]{0,40}?(?:max[^\n]{0,15}?(?:기본|default|권장|허용|쓴다|쓸 수 있다|써도 된다|열린다|뜬다|가능|\bmay\b|\bcan\b|\ballowed\b|\bopen\b|\blaunch)|(?:기본|default|권장|허용|\bmay\b|\bcan\b|\ballowed\b|\bopen\b|\blaunch)[^\n]{0,12}?max)"),
     ("builder-max-spelling-opens",
-     r"builder-(?:sonnet|sol|luna|terra|kimi)-max[^\n]{0,30}?(?:launch|opens?|열린|뜬|쓸 수 있다|될 수 있다)"),
+     r"builder-(?:sonnet|sol|luna|kimi)-max[^\n]{0,30}?(?:launch|opens?|열린|뜬|쓸 수 있다|될 수 있다)"),
     ("devin-sole-granted",
      r"(?:devin[^\n]{0,40}?T3|T3[^\n]{0,40}?devin)[^\n]{0,60}?단독[^\n]{0,60}?(가 된다|될 수 있다|허용|가능|쓴다|쓸 수 있다)"),
     # Withdrawn by the FINAL rule (note 4098): Sonnet is not the T2 default —
@@ -152,7 +150,7 @@ FILE_FORBIDDEN = [
 # closed max-rung builder spelling opens or launches.
 WRK_FORBIDDEN = [
     ("wrk-max-spelling-launch",
-     r"builder-(?:sonnet|sol|luna|terra|kimi)-max[^\n]{0,30}?(?:opens?|launches|spawns?|열린|뜬)"),
+     r"builder-(?:sonnet|sol|luna|kimi)-max[^\n]{0,30}?(?:opens?|launches|spawns?|열린|뜬)"),
 ]
 
 # #748 (post-#740 codex tester finding): on an explicit --effort rung the
@@ -416,11 +414,10 @@ mutants["spawn-no-bench-rule-dropped"] = mutate(
 mutants["director-wrk-enforce-dropped"] = mutate(
     "director", "wrk 도 `--role builder` 에서 max 를 거부한다", "wrk 가 참고한다"
 )
-mutants["terra-dominated-dropped"] = mutate(
-    "spawn", "Terra 는 모든 급에서 지배당한다", "Terra 도 모든 급의 후보다"
-)
-mutants["terra-reserve-only-weakened"] = mutate(
-    "builder", "Terra 전용으로 확인될 때만 보조로 쓴다", "Terra 로 부하를 분산한다"
+mutants["terra-refusal-dropped"] = mutate(
+    "spawn",
+    "Terra profiles are refused by operator 2026-10-12 noterra and are not assignment candidates.",
+    "Terra profiles are assignment candidates.",
 )
 # A builder could read "Sol default xhigh" as the tool default and launch
 # `-m codex-sol` bare — getting max. The spelling-default warning must stay.
@@ -744,6 +741,12 @@ cleanup() {
 trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
 printf '%s\n' 'fixture prompt' >"$PROMPT"
+export HOME="$TMP/home"
+export XDG_DATA_HOME="$TMP/xdg-data"
+export XDG_CACHE_HOME="$TMP/xdg-cache"
+export XDG_CONFIG_HOME="$TMP/xdg-config"
+export XDG_STATE_HOME="$TMP/xdg-state"
+mkdir -p "$HOME" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 
@@ -759,6 +762,8 @@ spawn_t736() {
   : >"$TMP/herdr.log"
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="$TMP/absent-arbiter" XDG_DATA_HOME="$TMP/xdg" \
+    XDG_CACHE_HOME="$TMP/xdg-cache" XDG_CONFIG_HOME="$TMP/xdg-config" \
+    XDG_STATE_HOME="$TMP/xdg-state" HOME="$TMP/home" \
     ARBITER_INBOX_ROOT="$TMP/inbox" WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml" \
     PANEWIRE_BIN="$ROOT/tests/fixtures/panewire" \
     WRK_COMPLETION_INTERVAL_S=3600 \

@@ -28,7 +28,7 @@ OTHER = "d" * 40
 
 
 def policy() -> dict:
-    loaded, check = load_policy(ROOT / "director/gate_policy.json", now=datetime(2026, 9, 26, tzinfo=timezone.utc), merge_required=True)
+    loaded, check = load_policy(ROOT / "director/gate_policy.json", now=datetime(2026, 10, 13, tzinfo=timezone.utc), merge_required=True)
     if check["status"] != "PASS":
         raise AssertionError(check)
     return loaded
@@ -264,17 +264,17 @@ class MergePrecheckTests(unittest.TestCase):
 
     def test_policy_unknown_stale_conflict(self) -> None:
         path = ROOT / "director/gate_policy.json"
-        self.assertEqual("POLICY_STALE", load_policy(path, now=datetime(2026, 10, 3, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
+        self.assertEqual("POLICY_STALE", load_policy(path, now=datetime(2026, 10, 20, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
         with tempfile.TemporaryDirectory() as directory:
             p = json.loads(path.read_text())
             p["conflicts"] = ["test conflict"]
             target = Path(directory) / "policy.json"
             target.write_text(json.dumps(p))
-            self.assertEqual("POLICY_CONFLICT", load_policy(target, now=datetime(2026, 9, 26, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
+            self.assertEqual("POLICY_CONFLICT", load_policy(target, now=datetime(2026, 10, 13, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
             p["conflicts"] = []
             del p["ci"]["mgh3326/agent-skills"]
             target.write_text(json.dumps(p))
-            self.assertEqual("POLICY_CI_EXECUTION_UNKNOWN", load_policy(target, now=datetime(2026, 9, 26, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
+            self.assertEqual("POLICY_CI_EXECUTION_UNKNOWN", load_policy(target, now=datetime(2026, 10, 13, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
             self.assertEqual("CI_POLICY_UNKNOWN", gate.evaluate(snapshot(), p)["G3"]["reason_code"])
             for field, value, reason in (("runtime", [], "POLICY_RUNTIME_UNKNOWN"),
                                          ("artifact_paths", [], "POLICY_ARTIFACT_PATHS_UNKNOWN"),
@@ -283,7 +283,7 @@ class MergePrecheckTests(unittest.TestCase):
                 invalid = json.loads(path.read_text())
                 invalid[field] = value
                 target.write_text(json.dumps(invalid))
-                self.assertEqual(reason, load_policy(target, now=datetime(2026, 9, 26, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
+                self.assertEqual(reason, load_policy(target, now=datetime(2026, 10, 13, tzinfo=timezone.utc), merge_required=True)[1]["reason_code"])
 
     def test_ci_missing_skipped_and_later_red(self) -> None:
         s = snapshot()
