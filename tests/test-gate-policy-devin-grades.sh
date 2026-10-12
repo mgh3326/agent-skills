@@ -82,7 +82,7 @@ EXPECTED = {
 }
 
 # Policy validity window per gate_policy.json effective_at/expires_at.
-NOW = datetime(2026, 9, 26, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 13, tzinfo=timezone.utc)
 
 
 def devin_profiles(policy: dict) -> dict:

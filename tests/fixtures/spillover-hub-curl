@@ -71,7 +71,7 @@ success = {
     "rc": 0,
     "job_id": "job-a",
     "pane": "pane-a",
-    "stdout_tail": "OK pane=pane-a host=local model=codex-terra label=fixture status=working landed=yes job=job-a",
+    "stdout_tail": "OK pane=pane-a host=local model=codex-luna label=fixture status=working landed=yes job=job-a",
     "completed_at": "2026-09-07T00:00:00Z",
 }
 if scenario == "pending":
@@ -87,7 +87,7 @@ elif scenario == "hub409":
 elif scenario == "hub400":
   status, result = 400, {"error": "invalid_request"}
 elif scenario == "landed_no":
-    success["stdout_tail"] = "OK pane=pane-a host=local model=codex-terra label=fixture status=idle landed=no job=job-a"
+    success["stdout_tail"] = "OK pane=pane-a host=local model=codex-luna label=fixture status=idle landed=no job=job-a"
     status, result = 200, success
 else:
     status, result = 200, success

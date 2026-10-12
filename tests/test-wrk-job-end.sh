@@ -518,7 +518,7 @@ env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
   WRK_REFRESH_PID_LOG="$TMP/je10-refresh.pids" WRK_REFRESH_TIMEOUT_S=8 \
   WRK_REFRESH_MODE=hang-tree WRK_REFRESH_DELAY=90 \
-  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l je10 --t T1 \
+  "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l je10 --t T1 \
   --task 1 --job je10 >"$TMP/je10.out" 2>"$TMP/je10.err" &
 SPAWN_PID=$!
 PIDFILE="$INBOX/je10/quota-refresh.pid"
@@ -682,7 +682,7 @@ spawn_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARB
   WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
   WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$HERDR_LOG" \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
-  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l je13 --t T1 \
+  "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l je13 --t T1 \
   --task 1 --job je13 2>&1)" || fail "spawn failed: $spawn_out"
 sleep 0.5
 [[ ! -e "$INBOX/prune.log" ]] ||
@@ -1172,7 +1172,7 @@ env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
   WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$HERDR_LOG" \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
   WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=1 WRK_REFRESH_TIMEOUT_S=10 \
-  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l je29 --t T1 \
+  "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l je29 --t T1 \
   --task 1 --job je29 >"$TMP/je29.out" 2>"$TMP/je29.err" &
 SPAWN_PID=$!
 PIDFILE="$INBOX/je29/quota-refresh.pid"
@@ -1429,7 +1429,7 @@ spawn_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARB
   WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
   WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$HERDR_LOG" \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
-  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l je35 --t T1 \
+  "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l je35 --t T1 \
   --task 1 --job je35 2>&1)" || fail "JE35: spawn failed: $spawn_out"
 # The new sentinel is forked inside start_completion_sentinel's subshell before
 # spawn returns, but its argv only reaches the final `wrk sentinel JOB` shape
@@ -1982,7 +1982,7 @@ case_refresh_fields() {
     WRK_SCOPEFUEL_LOG="$TMP/mut-rfields-scopefuel.log" \
     WRK_REFRESH_LOG="$TMP/mut-rfields-refresh.log" \
     WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=90 WRK_REFRESH_TIMEOUT_S=8 \
-    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l mut-rfields --t T1 \
+    "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l mut-rfields --t T1 \
     --task 1 --job mut-rfields >/dev/null 2>&1 &
   local spawn_pid=$!
   local pf="$INBOX/mut-rfields/quota-refresh.pid"
@@ -2015,7 +2015,7 @@ case_refresh_success() {
     WRK_SCOPEFUEL_LOG="$TMP/mut-rsucc-scopefuel.log" \
     WRK_REFRESH_LOG="$TMP/mut-rsucc-refresh.log" \
     WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=1 WRK_REFRESH_TIMEOUT_S=10 \
-    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l mut-rsucc --t T1 \
+    "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l mut-rsucc --t T1 \
     --task 1 --job mut-rsucc >/dev/null 2>&1 || return 3
   # The detached supervisor writes its pidfile after spawn returns; first prove
   # it was written, then prove the success path removes it (hang-mode child hits
@@ -2036,7 +2036,7 @@ case_refresh_tree() {
     WRK_REFRESH_LOG="$TMP/mut-rtree-refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/mut-rtree.pids" \
     WRK_REFRESH_MODE=hang-tree WRK_REFRESH_DELAY=90 WRK_REFRESH_TIMEOUT_S=6 \
-    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l mut-rtree --t T1 \
+    "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l mut-rtree --t T1 \
     --task 1 --job mut-rtree >/dev/null 2>&1
   # The grandchild sleep must be gone shortly after the supervisor timeout —
   # under the Q03 mutant only TERM reaches it and it survives (RED). The pid
@@ -2161,7 +2161,7 @@ case_spawn_reused_pidfile() {
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$HERDR_LOG" \
     WRK_SCOPEFUEL_LOG="$TMP/mut-spawnreuse-scopefuel.log" \
     WRK_REFRESH_LOG="$TMP/mut-spawnreuse-refresh.log" \
-    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l mut-spawnreuse --t T1 \
+    "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l mut-spawnreuse --t T1 \
     --task 1 --job mut-spawnreuse >/dev/null 2>&1 || return 3
   # The sentinel's argv reaches its final `wrk sentinel JOB` shape only after
   # the nohup/env exec chain settles; sample once under load and a real spawn

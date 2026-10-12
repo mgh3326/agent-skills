@@ -113,7 +113,7 @@ spawn_try() {
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
     WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml" \
     "${extra_env[@]+"${extra_env[@]}"}" \
-    "$WRK" spawn -c "$ROOT" -m "${MODEL:-codex-terra}" -p "$PROMPT" -w w \
+    "$WRK" spawn -c "$ROOT" -m "${MODEL:-codex-luna}" -p "$PROMPT" -w w \
       -l "${LABEL:-fixture}" --t T1 "$@" </dev/null >"$out_file" 2>"$err_file"
   SPAWN_RC=$?
   set -e

@@ -7,7 +7,9 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 
 빌더는 PR 한 건의 실행 루프를 소유한다. canonical 빌더 프로필은 `builder-opus`(Opus, effort high) 또는
 `builder-sol`(codex-sol, effort high — 2026-09-26 운영자 결정 전에는 max 였다)이다. `captain-opus`·`captain-sol`은
-legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
+legacy 별칭으로 같은 프로필을 뜻한다. `codex-luna`는 워커 전용이다. Terra 계열
+(`codex-terra`·`codex-terra-max`·`codex-med`·`builder-terra-*`)은 gpt-5.6-terra가
+operator 2026-10-12 noterra 결정으로 금지되어 모든 spawn에서 거부된다.
 #1026(2026-09-30 운영자 결정)로 codex-sol 계열은 gpt-6.1-sol 을 실행하고, 롤백 철자 `codex-sol6`·`builder-sol6`은
 gpt-6-sol 을 고정한다(ROB-591 의 codex-sol56 패턴 — `builder-sol6`은 빌더 좌석 형태로 codex-sol@high 급 consult를
 유지하면서 모델 id만 literal 이다).
@@ -35,10 +37,10 @@ worker/tester 전용이다 — fusion 빌더 사용은 hk 1382 이후 결정이�
 BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌리기 조건이다).
 #704(#594 E6 측정 런그)는 런그별 빌더 철자 `builder-opus-low`·`builder-opus-medium`·
 `builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·`builder-sol-max`·
-`builder-luna-max`·`builder-terra-high`·`builder-terra-xhigh`·`builder-terra-max`·
+`builder-luna-max`·
 `builder-kimi-high`·`builder-kimi-max`를 연다. 각 철자는 이름 마지막 구간의 런그 하나만 고정하며
 (그 외 `--effort`는 거부), spawn은 `SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식이 정확히
-그 런그를 가리킬 때만 열린다 — 예: `builder-terra-high`는 `SCOPEFUEL_E6_ARM=codex-terra@high`.
+그 런그를 가리킬 때만 열린다. Terra E6 철자는 표식과 무관하게 barred-model guard가 거부한다.
 게이트가 에스컬레이션으로 표시한 런그(`builder-sonnet-xhigh`)도 명시
 `--effort` 런그에는 scopefuel #716 규칙으로 `--operator-request` REF를
 요구하지 않는다 — 게이트는 그 런그를 쿼타 규칙으로만 판정하고 에스컬레이션
@@ -57,7 +59,7 @@ kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없
 `--operator-request` 불요). 기존 `builder-grok`·`builder-sol-high`는 그대로 — 별도 철자다
 (`builder-sol-high`는 #704의 `codex-sol@high` 표식 규칙 유지).
 **2026-09-26 운영자 결정으로 max 런그 철자(`builder-sonnet-max`·`builder-sol-max`·
-`builder-luna-max`·`builder-terra-max`·`builder-kimi-max`)는 닫혔다** — 빌더 좌석은
+`builder-luna-max`·`builder-kimi-max`)는 닫혔다** — 빌더 좌석은
 max 를 쓸 수 없으므로 `SCOPEFUEL_E6_ARM` 표식과 무관하게 wrk 가 거부한다.
 #921(operator 2026-09-29 Sonnet 5.5 실험 보고)은 비-런그 빌더 철자
 `builder-sonnet`을 연다 — `builder-opus` 의 argv 모양(`--model sonnet`
@@ -104,8 +106,8 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
   (현재 그 다음 저가는 S·A+ = Opus medium·A = Sonnet low 다).
 - **현재 출력(예시) — codex**(공용 7d 창; reserve 창이 어느 모델을 덮는지 미확정):
   **S+·S = Sol xhigh**(Sol max 는 T3 코어가 필요할 때만) · **A+ = Luna max** ·
-  **A = Luna high** · **B = Luna medium**. **Terra 는 모든 급에서 지배당한다** —
-  reserve 창이 Terra 전용으로 확인될 때만 보조로 쓴다(부하 분산 주장 금지).
+  **A = Luna high** · **B = Luna medium**. Terra profiles are refused by
+  operator 2026-10-12 noterra and are not assignment candidates.
   `codex-sol` 철자 자체의 기본값은 max 라서 Sol 배정은 `--effort` 명시로 한다.
   미측정 Sol high(C)·미배치 Sol medium 은 **E6 arm 우선 측정 대상**이다 — 측정되면 S 후보.
 <!-- /T736-ASSIGNMENT-DEFAULTS -->

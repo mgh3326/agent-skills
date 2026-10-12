@@ -152,14 +152,14 @@
     }
   },
   "conflicts": [],
-  "effective_at": "2026-09-25T00:00:00Z",
-  "expires_at": "2026-10-03T00:00:00Z",
+  "effective_at": "2026-10-12T00:00:00Z",
+  "expires_at": "2026-10-20T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "f338b9866dbc320824576c70220dd8d89af5076e841058b7e5d7e2ff88a600a8",
-    "bin/wrk": "7299ed7029760da4271dbeec79c8e9e741651cdd814c0bf24bfaec83cc45994e",
-    "checker/SKILL.md": "11c4d8ec98954ccb60d4882001a20b921484dbcf6548572d78c193a601038ce0",
-    "director/SKILL.md": "9f474787a2bc29eafded98d23916257cb2be7d5b164fbd07007aefb8c539c77d",
-    "spawn-worker/SKILL.md": "cf4c38bdcf09acf91391ef1f6ed8584ea8659a4495ae2ce27250590b2b9d96f7"
+    "bin/wrk": "ca1ba1f1a7df3734bf0a401b3267781d892a40864c8dd23d28932322437a098d",
+    "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
+    "director/SKILL.md": "c6b95f71c691d7711aeb9ee55f5e804f889319e99a21987a813eec148135ba42",
+    "spawn-worker/SKILL.md": "86ba4efedb5a0511615b553e18107f4f9a50d888473f52b4d2a5dd246d129bb6"
   },
   "profiles": {
     "agy-flash": {
@@ -669,13 +669,9 @@
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
       "model": "gpt-5.6-terra",
-      "roles": [
-        "builder"
-      ],
-      "surfaces": [
-        "T1",
-        "T2"
-      ]
+      "role_status": "denied",
+      "roles": [],
+      "surfaces": []
     },
     "builder-terra-max": {
       "default_effort": "max",
@@ -688,13 +684,9 @@
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
       "model": "gpt-5.6-terra",
-      "roles": [
-        "builder"
-      ],
-      "surfaces": [
-        "T1",
-        "T2"
-      ]
+      "role_status": "denied",
+      "roles": [],
+      "surfaces": []
     },
     "builder-terra-xhigh": {
       "default_effort": "xhigh",
@@ -707,13 +699,9 @@
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
       "model": "gpt-5.6-terra",
-      "roles": [
-        "builder"
-      ],
-      "surfaces": [
-        "T1",
-        "T2"
-      ]
+      "role_status": "denied",
+      "roles": [],
+      "surfaces": []
     },
     "captain-opus": {
       "default_effort": "high",
@@ -960,15 +948,9 @@
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
       "model": "gpt-5.6-terra",
-      "roles": [
-        "builder",
-        "worker",
-        "tester"
-      ],
-      "surfaces": [
-        "T1",
-        "T2"
-      ]
+      "role_status": "denied",
+      "roles": [],
+      "surfaces": []
     },
     "codex-sol": {
       "default_effort": "max",
@@ -1027,15 +1009,9 @@
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
       "model": "gpt-5.6-terra",
-      "roles": [
-        "builder",
-        "worker",
-        "tester"
-      ],
-      "surfaces": [
-        "T1",
-        "T2"
-      ]
+      "role_status": "denied",
+      "roles": [],
+      "surfaces": []
     },
     "codex-terra-max": {
       "default_effort": "max",
@@ -1046,15 +1022,9 @@
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-5.6-terra",
       "model": "gpt-5.6-terra",
-      "roles": [
-        "builder",
-        "worker",
-        "tester"
-      ],
-      "surfaces": [
-        "T1",
-        "T2"
-      ]
+      "role_status": "denied",
+      "roles": [],
+      "surfaces": []
     },
     "devin-ds41": {
       "default_effort": "",
@@ -1815,7 +1785,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-10.1",
+  "revision": "2026-10-12.2",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
