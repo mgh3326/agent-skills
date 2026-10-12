@@ -120,13 +120,17 @@ cleanup() {
 trap cleanup EXIT
 
 make_changed_wrk_file() {
-  local diff_output changed_lines tmp_file source_file base_commit
+  local diff_output changed_lines tmp_file source_file base_commit merge_base
   local -a diff_args
   base_commit=$(git -C "$REPO_ROOT" rev-parse --verify --end-of-options "${CHANGED_BASE}^{commit}" 2>/dev/null) || {
     printf 'shellcheck-capped: invalid git base for --changed: %s\n' "$CHANGED_BASE" >&2
     return 2
   }
-  diff_args=(diff --no-ext-diff --unified=0 "${base_commit}...HEAD" -- bin/wrk)
+  merge_base=$(git -C "$REPO_ROOT" merge-base "$base_commit" HEAD 2>/dev/null) || {
+    printf 'shellcheck-capped: cannot find merge base for --changed: %s\n' "$CHANGED_BASE" >&2
+    return 2
+  }
+  diff_args=(diff --no-ext-diff --unified=0 "$merge_base" -- bin/wrk)
   if ! diff_output=$(git -C "$REPO_ROOT" "${diff_args[@]}" 2>/dev/null); then
     printf 'shellcheck-capped: invalid git base for --changed: %s\n' "$CHANGED_BASE" >&2
     return 2
@@ -136,8 +140,8 @@ make_changed_wrk_file() {
   TEMP_FILES+=("$tmp_file")
   source_file=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped-source.XXXXXX")
   TEMP_FILES+=("$source_file")
-  if ! git -C "$REPO_ROOT" show HEAD:bin/wrk >"$source_file"; then
-    printf '%s\n' 'shellcheck-capped: cannot read bin/wrk at HEAD' >&2
+  if ! cat "$WRK_FILE" >"$source_file"; then
+    printf '%s\n' 'shellcheck-capped: cannot read bin/wrk' >&2
     return 2
   fi
   head -n 1 "$source_file" >"$tmp_file"
@@ -169,14 +173,39 @@ make_changed_wrk_file() {
     function is_function(line) {
       return line ~ /^[[:space:]]*(function[[:space:]]+)?[[:alpha:]_][[:alnum:]_]*([[:space:]]*\([[:space:]]*\))?[[:space:]]*\{/
     }
-    function heredoc_delimiter(line, token) {
+    function arithmetic_context(line, position, prefix, open_count, close_count) {
+      prefix = substr(line, 1, position - 1)
+      open_count = gsub(/\(\(/, "", prefix)
+      close_count = gsub(/\)\)/, "", prefix)
+      return open_count > close_count
+    }
+    function heredoc_delimiter(line, position, token_pos, start, quote, delimiter, strip_tabs, previous) {
       heredoc_strip_tabs = 0
-      if (!match(line, /<<-?[[:space:]]*[\047\042]?[[:alnum:]_-]+[\047\042]?/)) return ""
-      token = substr(line, RSTART, RLENGTH)
-      heredoc_strip_tabs = (substr(token, 1, 3) == "<<-")
-      sub(/^<<-?[[:space:]]*/, "", token)
-      gsub(/[\047\042]/, "", token)
-      return token
+      for (position = 1; position < length(line); position++) {
+        if (substr(line, position, 2) != "<<") continue
+        previous = (position > 1 ? substr(line, position - 1, 1) : "")
+        if (previous == "<" || substr(line, position + 2, 1) == "<") continue
+        if (arithmetic_context(line, position)) continue
+
+        token_pos = position + 2
+        strip_tabs = 0
+        if (substr(line, token_pos, 1) == "-") {
+          strip_tabs = 1
+          token_pos++
+        }
+        while (substr(line, token_pos, 1) == " " || substr(line, token_pos, 1) == "\t") token_pos++
+        quote = substr(line, token_pos, 1)
+        if (quote == "\047" || quote == "\042") token_pos++
+        start = token_pos
+        while (substr(line, token_pos, 1) ~ /^[[:alnum:]_-]$/) token_pos++
+        if (token_pos == start) continue
+        if ((quote == "\047" || quote == "\042") && substr(line, token_pos, 1) != quote) continue
+
+        delimiter = substr(line, start, token_pos - start)
+        heredoc_strip_tabs = strip_tabs
+        return delimiter
+      }
+      return ""
     }
     function contains_changed(start, end, n) {
       for (n = start; n <= end; n++) if (changed[n]) return 1

@@ -87,7 +87,7 @@ Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and wri
 
 ## Local ShellCheck
 
-Run local checks through `scripts/shellcheck-capped`, which reads ShellCheck options from the CI workflow and applies a 2048 MB memory cap by default. On pi and oci, use `--changed origin/main` for an advisory check of changed `bin/wrk` functions, or leave the full `bin/wrk` check to CI. CI continues to run its existing direct ShellCheck step.
+Run local checks through `scripts/shellcheck-capped`, which reads ShellCheck options from the CI workflow and applies a 2048 MB memory cap by default. On pi and oci, use `--changed origin/main` for an advisory check of changed `bin/wrk` functions; this compares the merge base with the working tree, so uncommitted edits are included. The selected functions are checked with the working-tree contents and without their full-file context. Leave the full `bin/wrk` check to CI. CI continues to run its existing direct ShellCheck step.
 
 ```sh
 scripts/shellcheck-capped tests/test-wrk.sh

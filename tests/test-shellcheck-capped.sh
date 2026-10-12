@@ -30,6 +30,10 @@ if [[ -n "${SHELLCHECK_PID_FILE:-}" ]]; then printf '%s\n' "$$" >"$SHELLCHECK_PI
 last=
 for arg in "$@"; do last=$arg; done
 if [[ -n "${SHELLCHECK_CAPTURE_FILE:-}" && -f "$last" ]]; then cp "$last" "$SHELLCHECK_CAPTURE_FILE"; fi
+if [[ -n "${SHELLCHECK_STUB_FAIL_IF_CONTAINS:-}" && -f "$last" ]] \
+  && grep -Fq "$SHELLCHECK_STUB_FAIL_IF_CONTAINS" "$last"; then
+  exit 1
+fi
 if [[ -n "${BYSTANDER_PID_FILE:-}" ]]; then
   /bin/sleep 20 &
   printf '%s\n' "$!" >"$BYSTANDER_PID_FILE"
@@ -233,6 +237,9 @@ heredoc content
 PY
   echo old
 }
+sentinel_after_t4() {
+  echo sentinel must not be included
+}
 FIXTURE
 printf '%s\n' 'echo whole-file' >"$CHANGE_REPO/tests/whole.sh"
 git -C "$CHANGE_REPO" init -q --initial-branch=main
@@ -264,6 +271,9 @@ heredoc content
 PY
   echo new
 }
+sentinel_after_t4() {
+  echo sentinel must not be included
+}
 FIXTURE
 git -C "$CHANGE_REPO" add bin/wrk
 git -C "$CHANGE_REPO" commit -qm 'change fixture function'
@@ -288,6 +298,80 @@ bash -n "$CAPTURE_FILE" || { echo 'FAIL T4: extracted function is not valid shel
 if grep -Fq 'unchanged_function() {' "$CAPTURE_FILE"; then echo 'FAIL T4: unchanged function included' >&2; exit 1; fi
 echo 'PASS T4-changed-function-advisory-and-whole-other-files'
 
+awk '$0 == "  echo new" { print "  echo uncommitted bad edit" } { print }' \
+  "$CHANGE_REPO/bin/wrk" >"$TMP/dirty-wrk"
+mv "$TMP/dirty-wrk" "$CHANGE_REPO/bin/wrk"
+rm -f "$ARGS_FILE" "$CAPTURE_FILE"
+rc=0
+env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_CAPTURE_FILE="$CAPTURE_FILE" \
+  SHELLCHECK_STUB_EXIT=0 SHELLCHECK_STUB_RSS_KB=0 SHELLCHECK_STUB_FAIL_IF_CONTAINS='uncommitted bad edit' \
+  "$CHANGE_REPO/scripts/shellcheck-capped" --changed "$base" -- bin/wrk >/dev/null || rc=$?
+[[ "$rc" == 1 ]] || { printf 'FAIL T4: expected uncommitted bad edit to fail stub ShellCheck, got %s\n' "$rc" >&2; exit 1; }
+grep -Fq 'echo uncommitted bad edit' "$CAPTURE_FILE" || { echo 'FAIL T4: working-tree edit missing from extracted function' >&2; exit 1; }
+if grep -Fq 'sentinel_after_t4() {' "$CAPTURE_FILE"; then echo 'FAIL T4: unchanged function included with working-tree edit' >&2; exit 1; fi
+echo 'PASS T4-uncommitted-working-tree-edit-is-checked'
+
+for syntax_case in herestring arithmetic; do
+  shape_repo="$TMP/$syntax_case-repo"
+  mkdir -p "$shape_repo/scripts" "$shape_repo/bin" "$shape_repo/.github/workflows"
+  cp "$ROOT/scripts/shellcheck-capped" "$shape_repo/scripts/shellcheck-capped"
+  cp "$ROOT/.github/workflows/ci.yml" "$shape_repo/.github/workflows/ci.yml"
+  cat >"$shape_repo/bin/wrk" <<'BASE'
+#!/bin/bash
+sentinel_after_shape() {
+  echo sentinel
+}
+BASE
+  git -C "$shape_repo" init -q --initial-branch=main
+  git -C "$shape_repo" config user.name 'ShellCheck Capped Test'
+  git -C "$shape_repo" config user.email shellcheck-capped@example.invalid
+  git -C "$shape_repo" add bin/wrk scripts/shellcheck-capped .github/workflows/ci.yml
+  git -C "$shape_repo" commit -qm 'shape fixture base'
+  shape_base=$(git -C "$shape_repo" rev-parse HEAD)
+  case "$syntax_case" in
+    herestring)
+      cat >"$shape_repo/bin/wrk" <<'FIXTURE'
+#!/bin/bash
+changed_herestring_function() {
+  cat <<<'token'
+  echo here-string body
+}
+sentinel_after_shape() {
+  echo sentinel
+}
+FIXTURE
+      ;;
+    arithmetic)
+      cat >"$shape_repo/bin/wrk" <<'FIXTURE'
+#!/bin/bash
+changed_arithmetic_function() {
+  shifted=$((x<<2))
+  echo arithmetic body
+}
+sentinel_after_shape() {
+  echo sentinel
+}
+FIXTURE
+      ;;
+  esac
+  git -C "$shape_repo" add bin/wrk
+  git -C "$shape_repo" commit -qm "add $syntax_case fixture"
+  rm -f "$ARGS_FILE" "$CAPTURE_FILE"
+  env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_CAPTURE_FILE="$CAPTURE_FILE" \
+    SHELLCHECK_STUB_EXIT=0 SHELLCHECK_STUB_RSS_KB=0 \
+    "$shape_repo/scripts/shellcheck-capped" --changed "$shape_base" -- bin/wrk >/dev/null
+  grep -Fq "changed_${syntax_case}_function() {" "$CAPTURE_FILE" || {
+    echo "FAIL T4: $syntax_case function missing" >&2
+    exit 1
+  }
+  if grep -Fq 'sentinel_after_shape() {' "$CAPTURE_FILE"; then
+    echo "FAIL T4: $syntax_case was mistaken for a heredoc" >&2
+    exit 1
+  fi
+  bash -n "$CAPTURE_FILE" || { echo "FAIL T4: $syntax_case extraction is invalid shell syntax" >&2; exit 1; }
+  printf 'PASS T4-%s-not-heredoc\n' "$syntax_case"
+done
+
 cat >"$CHANGE_REPO/.github/workflows/ci.yml" <<'FIXTURE'
 name: CI
 jobs:
@@ -309,4 +393,4 @@ assert_exit 0 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK
 assert_ci_args tests/test-wrk.sh
 echo 'PASS T5-wrapper-flags-match-parsed-CI-step'
 
-echo 'PASS test-shellcheck-capped (11 assertions)'
+echo 'PASS test-shellcheck-capped (14 assertions)'
