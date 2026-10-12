@@ -867,6 +867,21 @@ cwd_keys = {"<local-worktree>"="repo-a"}
 변경)에 `host`/`job`/`task`/`cmd`/`wait_s`/`hold_s` 등을 남겨 director 가 기계별 대기
 시간을 집계할 수 있다.
 
+**우선순위 class (hk 1533).** `WRK_HEAVY_CLASS=ci` 는 CI 작업 표시다(미설정·빈 값·`lane` 은
+기본 lane class이고, 그 밖의 값은 rc 78 로 거부된다). 호스트 락에 살아 있는 ci 대기자가 있는
+동안 lane 대기자는 그 ci 대기자가 가져갈 수 있는 슬롯(그 ci 대기자가 대기할 때의 자기
+limit 미만 인덱스)을 잡지 않는다 — 슬롯이 비면 먼저 폴링한 쪽이 아니라 ci 대기자가 가져간다.
+**선점은 없다**: 실행 중인 보유자는 신호를 받지도, 쫓겨나지도, 단축되지도 않으며, ci 대기자
+자신은 양보하지 않는다. ci 대기자의 limit 보다 위 슬롯(데스크톱 러너처럼 ci 가
+`WRK_HEAVY_MAX=1` 이면 slot 1)은 lane 에게 열려 있어 놀지 않는다. pid 가 사라진 ci 대기자
+파일(stale)은 아무것도 막지 않는다. 기아 방지: ci 대기자 뒤에서 `WRK_HEAVY_CI_DEFER_MAX` 초
+(기본 1800, 0 = 양보 안 함)를 넘게 기다린 lane 대기자는 그 대기가 끝날 때까지 더는 양보하지
+않는다. 총 대기 cap(기본 1200 s)은 그대로라서 기본 cap 에서는 `WRK_HEAVY_WAIT_CAP` 을 키운
+호출에서만 이 가드가 의미를 가진다. `wrk heavy status` 는 보유자·대기자 줄마다
+`class=ci|lane` 과 대기 당시 `limit=` 을 보여 주고, heavy.log 의 run/wait_cap 행에는 `class`
+필드가 붙으며, 양보한 lane 대기자는 양보가 끝날 때 `kind=defer` 행을 1개(`wait_s`,
+`defer_s`, `reason`) 남긴다.
+
 09-27 운영자 확정값(정본은 hk task 772, **적용은 merge 후 director-1 이 라이브 설정에
 한다**): 이 맥(mac-personal) `heavy_max = 0` — syspolicyd SIGSEGV 방지, desktop
 `heavy_max = 1`, m1b `heavy_max = 2`. 이 맥에서는 1-3개 targeted test 파일을

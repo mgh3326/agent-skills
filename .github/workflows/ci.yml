@@ -54,6 +54,7 @@ jobs:
             tests/test-merge-precheck.sh \
             tests/test-round-cap.sh \
             tests/test-wrk-heavy-limit.sh \
+            tests/test-wrk-heavy-class.sh \
             tests/test-wrk-task-link.sh \
             tests/test-wrk-job-end.sh \
             tests/test-fleet-rev.sh \
@@ -93,6 +94,7 @@ jobs:
           bash tests/test-merge-precheck.sh
           bash tests/test-round-cap.sh
           bash tests/test-wrk-heavy-limit.sh
+          bash tests/test-wrk-heavy-class.sh
           bash tests/test-wrk-task-link.sh
           bash tests/test-wrk-job-end.sh
           bash tests/test-fleet-rev.sh
