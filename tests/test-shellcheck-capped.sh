@@ -186,6 +186,10 @@ unchanged_function() {
   echo unchanged
 }
 changed_function() {
+  cat <<'PY'
+}
+heredoc content
+PY
   echo old
 }
 FIXTURE
@@ -205,6 +209,10 @@ unchanged_function() {
   echo unchanged
 }
 changed_function() {
+  cat <<'PY'
+}
+heredoc content
+PY
   echo new
 }
 FIXTURE
@@ -223,6 +231,7 @@ grep -Fxq tests/whole.sh "$ARGS_FILE" || { echo 'FAIL T4: non-bin/wrk file was n
 grep -Fxq '#!/bin/bash' "$CAPTURE_FILE" || { echo 'FAIL T4: source shebang missing from changed-function input' >&2; exit 1; }
 grep -Fxq '# shellcheck disable=SC2034' "$CAPTURE_FILE" || { echo 'FAIL T4: global shellcheck directive missing' >&2; exit 1; }
 grep -Fq 'changed_function() {' "$CAPTURE_FILE" || { echo 'FAIL T4: changed function missing' >&2; exit 1; }
+grep -Fxq 'heredoc content' "$CAPTURE_FILE" || { echo 'FAIL T4: function extraction stopped inside a heredoc' >&2; exit 1; }
 grep -Fq 'echo new' "$CAPTURE_FILE" || { echo 'FAIL T4: changed function body missing' >&2; exit 1; }
 if grep -Fq 'unchanged_function() {' "$CAPTURE_FILE"; then echo 'FAIL T4: unchanged function included' >&2; exit 1; fi
 echo 'PASS T4-changed-function-advisory-and-whole-other-files'
