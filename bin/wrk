@@ -6927,7 +6927,9 @@ spillover_transport_rc() {
 spillover_remote_step() {
   local host="$1" step="$2" now elapsed
   SPILL_REMOTE_STEP="$step"
-  now="$(date +%s)"
+  # Bash's counter avoids extra date calls on local spawns, which can affect
+  # callers that provide a controlled date clock.
+  now="$SECONDS"
   if [[ ! "${SPILL_REMOTE_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
     SPILL_REMOTE_STARTED_AT="$now"
   fi
@@ -7279,7 +7281,7 @@ spillover_try_candidate() {
 }
 
 spawn_router_cmd() {
-  SPILL_REMOTE_STARTED_AT="$(date +%s)"
+  SPILL_REMOTE_STARTED_AT="$SECONDS"
   local requested=auto cwd="" prompt="" selected="" arg next=0 out rc host
   for arg in "$@"; do
     if [[ "$next" -eq 1 ]]; then cwd="$arg"; next=0; continue; fi
