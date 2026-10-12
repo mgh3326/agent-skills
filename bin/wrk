@@ -6922,6 +6922,28 @@ spillover_transport_rc() {
   esac
 }
 
+# Name the remote leg before starting it and emit the last reached step to the
+# caller. Under --host auto this stderr is held with the candidate diagnostics.
+spillover_remote_step() {
+  local host="$1" step="$2" now elapsed
+  SPILL_REMOTE_STEP="$step"
+  now="$(date +%s)"
+  if [[ ! "${SPILL_REMOTE_STARTED_AT:-}" =~ ^[0-9]+$ ]]; then
+    SPILL_REMOTE_STARTED_AT="$now"
+  fi
+  elapsed=$((now - SPILL_REMOTE_STARTED_AT))
+  (( elapsed < 0 )) && elapsed=0
+  printf "wrk: remote host '%s' step %s elapsed=%ss\n" "$host" "$step" "$elapsed" >&2
+}
+
+# The progress lines are useful when an auto round fails, but a successful
+# auto placement must keep its existing quiet-stderr contract. Other stderr
+# from the winning remote wrk (for example a quota warning) still passes.
+spillover_replay_success_stderr() {
+  local err_file="$1"
+  grep -vE "^wrk: remote host '[^']+' step (probe|cwd-map|prepare|mktemp|scp|remote wrk|lane) elapsed=[0-9]+s$" "$err_file" >&2 || true
+}
+
 # Creates the derived remote worktree on the selected host.  Local-only
 # branches and commits that origin does not have are terminal: the remote
 # side can only check out what its own origin fetch can see, so spawning
@@ -7053,18 +7075,16 @@ spillover_remote_spawn() {
   ssh_name="$(spillover_value "hosts.$host" ssh 2>/dev/null || true)"; [[ -n "$ssh_name" ]] || ssh_name="$host"
   session="$(spillover_value "hosts.$host" herdr_session 2>/dev/null || true)"; [[ -n "$session" ]] || session=worker
   workspace="$(spillover_value "hosts.$host" workspace 2>/dev/null || true)"; [[ -n "$workspace" ]] || workspace=worker
-  # SPILL_REMOTE_STEP names the leg currently in flight so the router's final
-  # failure line can say which step's rc it carries.
-  SPILL_REMOTE_STEP="cwd-map"
+  spillover_remote_step "$host" cwd-map
   if ! spillover_cwd_map "$host" "$cwd"; then
     echo "wrk: remote host '$host' has no cwd_map entry for '$cwd'; $(spillover_local_advice "configure hosts.toml")" >&2
     return 2
   fi
   remote_cwd="$SPILL_CWD_REMOTE"
-  SPILL_REMOTE_STEP="prepare"
+  [[ "$SPILL_CWD_KIND" == exact ]] || spillover_remote_step "$host" prepare
   spillover_remote_prepare "$host" "$ssh_name" "$cwd" "$remote_cwd" "$SPILL_CWD_BASE" "$SPILL_CWD_KIND" || return
-  SPILL_REMOTE_STEP="mktemp"
   remote_err="$(mktemp)"
+  spillover_remote_step "$host" mktemp
   set +e
   # shellcheck disable=SC2016 # ${TMPDIR} must expand on the selected remote host.
   remote_prompt="$("${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" 'umask 077; mktemp "${TMPDIR:-/tmp}/wrk-spillover.XXXXXX.md"' 2>"$remote_err")"
@@ -7077,7 +7097,7 @@ spillover_remote_spawn() {
     return "$(spillover_transport_rc "$rc")"
   fi
   rm -f "$remote_err"
-  SPILL_REMOTE_STEP="scp"
+  spillover_remote_step "$host" scp
   set +e
   "${WRK_SCP_BIN:-scp}" "$prompt" "$ssh_name:$remote_prompt"
   rc=$?
@@ -7151,9 +7171,9 @@ spillover_remote_spawn() {
   # from hosts.toml when callers omit it.
   if [[ "$saw_workspace" -eq 0 ]]; then remote_args+=(-w "$workspace"); fi
   printf -v remote_cmd '%q ' "${remote_args[@]}"
-  SPILL_REMOTE_STEP="remote wrk"
   out="$(mktemp)"
   remote_err="$(mktemp)"
+  spillover_remote_step "$host" 'remote wrk'
   set +e
   "${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" "$remote_cmd; rc=\$?; rm -f -- $(printf '%q' "$remote_prompt"); exit \$rc" >"$out" 2>"$remote_err"
   rc=$?
@@ -7175,6 +7195,7 @@ spillover_remote_spawn() {
     local remote_pane="" lane_field="" lane_out
     remote_pane="$(awk '/^OK pane=/{ for (i = 1; i <= NF; i++) if (substr($i, 1, 5) == "pane=") { print substr($i, 6); exit } }' "$out")"
     if [[ -n "$remote_pane" ]]; then
+      spillover_remote_step "$host" lane
       HUB_REMOTE_LANE=""
       case "$rc" in
         0|"$WRK_EXIT_LANDING_UNCONFIRMED")
@@ -7218,7 +7239,7 @@ spillover_remote_spawn() {
 spillover_try_candidate() {
   local hold_diag="$1" candidate="$2" cwd="$3" prompt="$4"; shift 4
   local rc
-  SPILL_REMOTE_STEP="probe"
+  spillover_remote_step "$candidate" probe
   SPILL_PROBE_ERR=""; SPILL_PROBE_RC=1; SPILL_PROBE_DETAIL=""
   if ! spillover_probe_host "$candidate"; then
     # #1239: a wake-capable host is NOT woken here, on first sight — the
@@ -7258,6 +7279,7 @@ spillover_try_candidate() {
 }
 
 spawn_router_cmd() {
+  SPILL_REMOTE_STARTED_AT="$(date +%s)"
   local requested=auto cwd="" prompt="" selected="" arg next=0 out rc host
   for arg in "$@"; do
     if [[ "$next" -eq 1 ]]; then cwd="$arg"; next=0; continue; fi
@@ -7531,7 +7553,7 @@ spawn_router_cmd() {
         # Only the skipped candidates' diagnostics are dropped: the winner's
         # own stderr (remote wrk warnings, scp chatter) replays verbatim, as
         # it streamed live on main.
-        cat "$cand_err" >&2
+        spillover_replay_success_stderr "$cand_err"
         rm -f "$cand_err" "$cand_class" "$auto_diag"
         return 0
       else

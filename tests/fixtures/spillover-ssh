@@ -92,6 +92,10 @@ if [[ "$host" == desktop && ( "$scenario" == desktop-spawn-fails || "$scenario" 
 # both — so tests can assert which channel reaches the operator.
 if [[ "$remote" == *'wrk spawn'* ]]; then
   case "$scenario" in
+    remote-sleep)
+      sleep "${WRK_REMOTE_SLEEP_SECONDS:-1}"
+      exit 0
+      ;;
     remote-die-stderr)
       printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: hk task 1037 is already bound to job 'other-job' (state=claimed claimed_by=w-other) — a task linked to another job cannot be re-spawned (fail-closed)}" >&2
       exit "${WRK_REMOTE_RC:-1}"
