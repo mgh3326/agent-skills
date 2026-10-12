@@ -42,11 +42,16 @@ cat >"$FAKE_BIN/systemd-run" <<'STUB'
 set -euo pipefail
 last=
 for arg in "$@"; do last=$arg; done
-if [[ "${SYSTEMD_STUB_MODE:-fail}" != success ]]; then exit 1; fi
 if [[ "$last" == /bin/true ]]; then
+  [[ "${SYSTEMD_STUB_MODE:-fail}" == success || "${SYSTEMD_STUB_MODE:-fail}" == oom ]] || exit 1
   printf '%s\n' probe >>"$SYSTEMD_CALLS_FILE"
   exit 0
 fi
+if [[ "${SYSTEMD_STUB_MODE:-fail}" == oom ]]; then
+  printf '%s\n' scope >>"$SYSTEMD_CALLS_FILE"
+  exit 137
+fi
+[[ "${SYSTEMD_STUB_MODE:-fail}" == success ]] || exit 1
 printf '%s\n' scope >>"$SYSTEMD_CALLS_FILE"
 printf '%s\n' "$@" >"$SYSTEMD_ARGS_FILE"
 while (($#)); do
@@ -59,11 +64,23 @@ while (($#)); do
 done
 exit 2
 STUB
+cat >"$FAKE_BIN/systemctl" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *Result*) printf '%s\n' "${SYSTEMD_RESULT:-success}" ;;
+  *MemoryPeak*) printf '%s\n' "${SYSTEMD_MEMORY_PEAK:-[not set]}" ;;
+  *) exit 2 ;;
+esac
+STUB
 cat >"$FAKE_BIN/ps" <<'STUB'
 #!/usr/bin/env bash
+if [[ -n "${BYSTANDER_PID_FILE:-}" && ! -s "${BYSTANDER_PID_FILE}" ]]; then
+  printf '0\n'
+  exit 0
+fi
 printf '%s\n' "${SHELLCHECK_STUB_RSS_KB:-0}"
 STUB
-chmod +x "$FAKE_BIN/shellcheck" "$FAKE_BIN/systemd-run" "$FAKE_BIN/ps"
+chmod +x "$FAKE_BIN/shellcheck" "$FAKE_BIN/systemd-run" "$FAKE_BIN/systemctl" "$FAKE_BIN/ps"
 TEST_PATH="$FAKE_BIN:$PATH"
 
 ci_command=$(awk '
@@ -147,6 +164,22 @@ printf '%s\n' probe scope >"$TMP/expected-systemd-calls"
 diff -u "$TMP/expected-systemd-calls" "$TMP/systemd-calls"
 echo 'PASS T1-cgroup-cap-probe-and-CI-flags'
 
+rm -f "$ARGS_FILE" "$TMP/systemd-args" "$TMP/systemd-calls"
+out="$TMP/cgroup-oom.stdout"
+err="$TMP/cgroup-oom.stderr"
+rc=0
+env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SYSTEMD_STUB_MODE=oom \
+  SYSTEMD_RESULT=oom-kill SYSTEMD_ARGS_FILE="$TMP/systemd-args" SYSTEMD_CALLS_FILE="$TMP/systemd-calls" \
+  "$ROOT/scripts/shellcheck-capped" tests/test-wrk.sh >"$out" 2>"$err" || rc=$?
+[[ "$rc" == 86 ]] || { printf 'FAIL T2: cgroup OOM should map to 86, got %s\n' "$rc" >&2; exit 1; }
+[[ "$(wc -l <"$err" | tr -d '[:space:]')" == 1 ]] || { echo 'FAIL T2: cgroup cap should emit one stderr line' >&2; exit 1; }
+grep -Fxq 'shellcheck-capped: shellcheck exceeded 2048 MB on tests/test-wrk.sh; run it in CI or use --changed BASE' "$err" || {
+  echo 'FAIL T2: cgroup cap diagnostic missing' >&2
+  exit 1
+}
+[[ ! -e "$ARGS_FILE" ]] || { echo 'FAIL T2: shellcheck ran after cgroup OOM' >&2; exit 1; }
+echo 'PASS T2-cgroup-oom-maps-to-cap-exit'
+
 rm -f "$ARGS_FILE" "$BYSTANDER_PID_FILE" "$SHELLCHECK_PID_FILE"
 out="$TMP/cap.stdout"
 err="$TMP/cap.stderr"
@@ -186,6 +219,14 @@ unchanged_function() {
   echo unchanged
 }
 changed_function() {
+  false || {
+    echo brace group
+  }
+  awk '
+    function nested() {
+      print "brace"
+    }
+  '
   cat <<'PY'
 }
 heredoc content
@@ -209,6 +250,14 @@ unchanged_function() {
   echo unchanged
 }
 changed_function() {
+  false || {
+    echo brace group
+  }
+  awk '
+    function nested() {
+      print "brace"
+    }
+  '
   cat <<'PY'
 }
 heredoc content
@@ -231,14 +280,33 @@ grep -Fxq tests/whole.sh "$ARGS_FILE" || { echo 'FAIL T4: non-bin/wrk file was n
 grep -Fxq '#!/bin/bash' "$CAPTURE_FILE" || { echo 'FAIL T4: source shebang missing from changed-function input' >&2; exit 1; }
 grep -Fxq '# shellcheck disable=SC2034' "$CAPTURE_FILE" || { echo 'FAIL T4: global shellcheck directive missing' >&2; exit 1; }
 grep -Fq 'changed_function() {' "$CAPTURE_FILE" || { echo 'FAIL T4: changed function missing' >&2; exit 1; }
+grep -Fq 'echo brace group' "$CAPTURE_FILE" || { echo 'FAIL T4: function stopped at brace-group close' >&2; exit 1; }
+grep -Fq 'print "brace"' "$CAPTURE_FILE" || { echo 'FAIL T4: function stopped inside quoted awk program' >&2; exit 1; }
 grep -Fxq 'heredoc content' "$CAPTURE_FILE" || { echo 'FAIL T4: function extraction stopped inside a heredoc' >&2; exit 1; }
 grep -Fq 'echo new' "$CAPTURE_FILE" || { echo 'FAIL T4: changed function body missing' >&2; exit 1; }
+bash -n "$CAPTURE_FILE" || { echo 'FAIL T4: extracted function is not valid shell syntax' >&2; exit 1; }
 if grep -Fq 'unchanged_function() {' "$CAPTURE_FILE"; then echo 'FAIL T4: unchanged function included' >&2; exit 1; fi
 echo 'PASS T4-changed-function-advisory-and-whole-other-files'
+
+cat >"$CHANGE_REPO/.github/workflows/ci.yml" <<'FIXTURE'
+name: CI
+jobs:
+  check:
+    steps:
+      - name: ShellCheck
+        run: |
+          shellcheck -x -e SC2034 --severity=warning bin/wrk
+FIXTURE
+rm -f "$ARGS_FILE"
+env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_EXIT=0 \
+  "$CHANGE_REPO/scripts/shellcheck-capped" tests/whole.sh >/dev/null
+printf '%s\n' -x -e SC2034 --severity=warning tests/whole.sh >"$TMP/expected-synthetic-args"
+diff -u "$TMP/expected-synthetic-args" "$ARGS_FILE"
+echo 'PASS T5-synthetic-CI-flags-forwarded'
 
 rm -f "$ARGS_FILE"
 assert_exit 0 env PATH="$TEST_PATH" SHELLCHECK_ARGS_FILE="$ARGS_FILE" SHELLCHECK_STUB_EXIT=0 "$ROOT/scripts/shellcheck-capped" tests/test-wrk.sh
 assert_ci_args tests/test-wrk.sh
 echo 'PASS T5-wrapper-flags-match-parsed-CI-step'
 
-echo 'PASS test-shellcheck-capped (9 assertions)'
+echo 'PASS test-shellcheck-capped (11 assertions)'

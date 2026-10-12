@@ -34,6 +34,7 @@ while (($#)); do
     --changed)
       (( CHANGED_SET == 0 )) || usage_error '--changed may be supplied only once'
       (($# >= 2)) || usage_error '--changed requires a git base'
+      [[ "$2" != -* ]] || usage_error '--changed base must not start with a dash'
       CHANGED_SET=1
       CHANGED_BASE=$2
       shift 2
@@ -114,14 +115,18 @@ shellcheck_bin=$(command -v shellcheck || true)
 TEMP_FILES=()
 cleanup() {
   local file
-  for file in "${TEMP_FILES[@]}"; do rm -f "$file"; done
+  for file in "${TEMP_FILES[@]+"${TEMP_FILES[@]}"}"; do rm -f "$file"; done
 }
 trap cleanup EXIT
 
 make_changed_wrk_file() {
-  local diff_output changed_lines tmp_file
+  local diff_output changed_lines tmp_file source_file base_commit
   local -a diff_args
-  diff_args=(diff --no-ext-diff --unified=0 "${CHANGED_BASE}...HEAD" -- bin/wrk)
+  base_commit=$(git -C "$REPO_ROOT" rev-parse --verify --end-of-options "${CHANGED_BASE}^{commit}" 2>/dev/null) || {
+    printf 'shellcheck-capped: invalid git base for --changed: %s\n' "$CHANGED_BASE" >&2
+    return 2
+  }
+  diff_args=(diff --no-ext-diff --unified=0 "${base_commit}...HEAD" -- bin/wrk)
   if ! diff_output=$(git -C "$REPO_ROOT" "${diff_args[@]}" 2>/dev/null); then
     printf 'shellcheck-capped: invalid git base for --changed: %s\n' "$CHANGED_BASE" >&2
     return 2
@@ -129,13 +134,19 @@ make_changed_wrk_file() {
 
   tmp_file=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped.XXXXXX")
   TEMP_FILES+=("$tmp_file")
-  head -n 1 "$WRK_FILE" >"$tmp_file"
+  source_file=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped-source.XXXXXX")
+  TEMP_FILES+=("$source_file")
+  if ! git -C "$REPO_ROOT" show HEAD:bin/wrk >"$source_file"; then
+    printf '%s\n' 'shellcheck-capped: cannot read bin/wrk at HEAD' >&2
+    return 2
+  fi
+  head -n 1 "$source_file" >"$tmp_file"
   awk '
     NR == 1 && /^#!/ { next }
     !seen_code && /^#[[:space:]]*shellcheck([[:space:]]|$)/ { print; next }
     !seen_code && /^[[:space:]]*(#.*)?$/ { next }
     { seen_code = 1 }
-  ' "$WRK_FILE" >>"$tmp_file"
+  ' "$source_file" >>"$tmp_file"
 
   changed_lines=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped-lines.XXXXXX")
   TEMP_FILES+=("$changed_lines")
@@ -198,7 +209,9 @@ make_changed_wrk_file() {
           in_heredoc = 1
           next
         }
-        if (line ~ /^[[:space:]]*}[[:space:]]*(#.*)?$/) {
+        # bin/wrk defines functions at column zero and closes them at column
+        # zero. Indented braces can belong to groups or quoted awk programs.
+        if (line ~ /^}[[:space:]]*(#.*)?$/) {
           if (contains_changed(start, FNR)) printf "%s", function_text
           in_function = 0
           function_text = ""
@@ -208,7 +221,7 @@ make_changed_wrk_file() {
     END {
       if (in_function && contains_changed(start, FNR)) printf "%s", function_text
     }
-  ' "$changed_lines" "$WRK_FILE" >>"$tmp_file"
+  ' "$changed_lines" "$source_file" >>"$tmp_file"
   REPLY=$tmp_file
 }
 
@@ -233,7 +246,7 @@ run_watchdog() {
   local pid rss_output rss_kb rc err_file
   err_file=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped-stderr.XXXXXX")
   TEMP_FILES+=("$err_file")
-  "$shellcheck_bin" "${ci_flags[@]}" "${CHECK_FILES[@]}" 2>"$err_file" &
+  "$shellcheck_bin" "${ci_flags[@]+"${ci_flags[@]}"}" "${CHECK_FILES[@]}" 2>"$err_file" &
   pid=$!
   while kill -0 "$pid" 2>/dev/null; do
     rss_output=$(ps -o rss= -p "$pid" 2>/dev/null || true)
@@ -275,7 +288,7 @@ run_cgroup() {
   err_file=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped-stderr.XXXXXX")
   TEMP_FILES+=("$err_file")
   if systemd-run --user --scope --quiet --unit="$unit" -p "MemoryMax=${CAP_MB}M" -p MemorySwapMax=0 \
-    "$shellcheck_bin" "${ci_flags[@]}" "${CHECK_FILES[@]}" 2>"$err_file"; then
+    "$shellcheck_bin" "${ci_flags[@]+"${ci_flags[@]}"}" "${CHECK_FILES[@]}" 2>"$err_file"; then
     rc=0
   else
     rc=$?
