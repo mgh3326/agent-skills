@@ -6404,7 +6404,7 @@ printf '[local]\nshell_ready_timeout_ms = 60000\n' >"$t1492_cfg60"
 set +e
 t1492_codex_out="$(WRK_HOSTS_CONFIG="$t1492_cfg60" PATH="$TMP/jumpclock:$PATH" \
   FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=121 TEST_FIXTURE_SCENARIO=devin-read-never-ends \
-  spawn_base codex-terra --host local 2>&1)"
+  spawn_base codex-luna --host local 2>&1)"
 t1492_codex_rc=$?
 set -e
 [[ "$t1492_codex_rc" -eq 1 ]] || fail "1492 codex window expected rc=1, got $t1492_codex_rc: $t1492_codex_out"
@@ -6473,7 +6473,7 @@ PY
 set +e
 t1492_min_mutant_out="$(WRK_UNDER_TEST="$TMP/t1492-mut-min" WRK_HOSTS_CONFIG="$t1492_cfg60" \
   PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=121 \
-  TEST_FIXTURE_SCENARIO=devin-read-never-ends spawn_base codex-terra --host local 2>&1)"
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends spawn_base codex-luna --host local 2>&1)"
 t1492_min_mutant_rc=$?
 set -e
 [[ "$t1492_min_mutant_rc" -eq 1 ]] || fail "1492 min mutant should fail its bounded readiness probe: $t1492_min_mutant_out"
