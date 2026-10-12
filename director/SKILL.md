@@ -160,7 +160,10 @@ pane 메시지는 그 알림이다. 콘솔(큐 drawer · Decisions)은 이 기�
     handoffkeep tasks decision-request <task-id> --question "<질문>" \
       --option 'A|<요약>' --option 'B|<요약>' [--recommended A --reason "<권고 이유>"] \
       --default-action "<무응답 시 동작 — 없으면 '자동 적용 없음'>" [--default-option B] \
-      [--default-trigger "<발동 조건>"] [--due <RFC3339+오프셋>] [--doc <결과·근거 문서 key>] [--block]
+      [--default-trigger "<발동 조건>"] [--due <RFC3339+오프셋>] [--doc <결과·근거 문서 key>] [--block] [--human-only]
+
+- Any `decision-request` about merge, deploy, spend (money, paid quota, purchases), tokens/credentials/external access, host/security settings, or policy/gate/cap exceptions MUST carry `--human-only`; assistant judgement must never answer these (hk refuses `human_only` on that path). If unsure, use `--human-only`.
+- GPT Dots may answer a `human_only` request only as `operator_decided`, with the operator's verbatim quote and exact `request_id`; GPT Dots' own judgement never closes it.
 
 - **기록 먼저, 알림에 request_id.** 출력의 `request_id`(`dr-<task>-<rev>`)를 붙여 알린다
   (출력 `notify` 줄). 명령이 실패하면(`NOT recorded`) 기록되지 않은 것이다 — 그때는

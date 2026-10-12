@@ -38,10 +38,34 @@ def section(text: str, heading: str) -> str:
 
 
 def check(text: str) -> None:
-    sec = flat(section(text, HEADING))
+    raw_section = section(text, HEADING)
+    sec = flat(raw_section)
     assert "handoffkeep tasks decision-request" in sec, "decision-request CLI line missing"
     for flag in ("--question", "--option", "--recommended", "--default-action", "--due"):
         assert flag in sec, f"CLI line must carry {flag}"
+    # Keep the safety flag in the CLI template itself; a mention in prose
+    # must not mask its removal from the producer command.
+    cli_lines = raw_section.splitlines()
+    cli_start = next((i for i, line in enumerate(cli_lines) if "handoffkeep tasks decision-request" in line), None)
+    assert cli_start is not None, "decision-request CLI line missing"
+    cli_block = [cli_lines[cli_start]]
+    while cli_block[-1].rstrip().endswith("\\"):
+        next_line = cli_start + len(cli_block)
+        assert next_line < len(cli_lines), "decision-request CLI continuation is incomplete"
+        cli_block.append(cli_lines[next_line])
+    assert "--human-only" in flat("\n".join(cli_block)), "decision-request CLI line must carry --human-only"
+    assert re.search(
+        r"merge.*deploy.*spend.*money.*paid quota.*purchases.*tokens?.*credentials?.*external access.*host.*security.*policy.*gate.*cap.*exceptions?.*MUST carry `--human-only`",
+        sec,
+        re.IGNORECASE,
+    ), "human_only category rule missing"
+    assert re.search(r"assistant judgement must never answer these.{0,100}hk refuses `human_only`", sec), "human_only assistant refusal reason missing"
+    assert re.search(r"If unsure.{0,40}`--human-only`", sec), "human_only default-when-unsure rule missing"
+    assert re.search(
+        r"GPT Dots may answer a `human_only` request only as `operator_decided`.{0,120}operator's verbatim quote.{0,80}exact `request_id`",
+        sec,
+    ), "operator_decided provenance contract missing"
+    assert re.search(r"GPT Dots' own judgement never closes it", sec), "GPT Dots judgement must not close human_only requests"
     assert re.search(r"기록 먼저.{0,40}request_id", sec), "record-first-then-notify-with-request_id rule missing (A6)"
     assert re.search(r"NOT recorded.{0,80}통지하지 않는다", sec), "no console-visibility claim on a failed record (A6)"
     # M2 (#48): an unconfirmable write is UNKNOWN — check tasks show before
@@ -58,7 +82,8 @@ def check(text: str) -> None:
 def expect_assertion(label, callback):
     try:
         callback()
-    except AssertionError:
+    except AssertionError as exc:
+        print(f"EXPECTED RED {label}: {exc}")
         return
     except Exception as exc:  # noqa: BLE001 - a crash is not a RED assertion
         raise AssertionError(f"{label} mutant errored instead of assertion RED: {exc}")
@@ -70,6 +95,9 @@ print("PASS director decision-request contract")
 
 mutants = [
     ("cli-line-removed", director_text.replace("handoffkeep tasks decision-request", "handoffkeep tasks transition")),
+    ("human-only-cli-flag-removed", director_text.replace("[--block] [--human-only]", "[--block]", 1)),
+    ("human-only-rule-removed", re.sub(r"(?m)^- Any `decision-request` about merge,.*\n", "", director_text, count=1)),
+    ("operator-decided-provenance-removed", re.sub(r"(?m)^- GPT Dots may answer a `human_only` request.*\n", "", director_text, count=1)),
     ("record-first-removed", director_text.replace("기록 먼저, 알림에 request_id", "알림")),
     ("failed-record-claim", director_text.replace("통지하지 않는다", "통지한다")),
     ("default-merged-into-recommendation", director_text.replace("권고와 무응답 동작은 별개다", "권고가 곧 기본값이다")),

@@ -158,7 +158,7 @@
     ".github/workflows/ci.yml": "f338b9866dbc320824576c70220dd8d89af5076e841058b7e5d7e2ff88a600a8",
     "bin/wrk": "a876676e094b61116d2c92decc061e6dc1a2e3644d1b8ece1d7aa6636341ee2a",
     "checker/SKILL.md": "030f6a12ba7bae54e474b5f1cc18350c60390fff339922fb97318f3fd5aedcb8",
-    "director/SKILL.md": "c6805671e4cd133ac2910462b7003e412a66df1d64f77aa6efa032dbc1d2f4aa",
+    "director/SKILL.md": "82c96c1f1de9dc7e26481f63e268f7a3acf35f5a760cfdbff20143483063d094",
     "spawn-worker/SKILL.md": "86ba4efedb5a0511615b553e18107f4f9a50d888473f52b4d2a5dd246d129bb6"
   },
   "profiles": {
