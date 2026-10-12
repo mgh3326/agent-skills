@@ -116,6 +116,10 @@ run_wrk() {
     --job "${WRK_TEST_JOB:-spillover-$RANDOM-$RANDOM}" "$@"
 }
 
+# Task inheritance has a separate compact harness so its SSH argv and target
+# fallback can be verified without the hub credential-file fixtures below.
+bash "$ROOT/tests/wrk_remote_task.sh"
+
 set +e
 isolation_guard_output="$(
   (ARBITER_INBOX_ROOT=; run_wrk "$ROOT/bin/wrk") 2>&1

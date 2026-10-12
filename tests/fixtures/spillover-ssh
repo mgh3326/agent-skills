@@ -2,6 +2,10 @@
 set -euo pipefail
 
 printf '%s\n' "$*" >>"${WRK_SSH_LOG:?}"
+if [[ -n "${WRK_SSH_ARGV_LOG:-}" ]]; then
+  printf '%s\0' "$@" >>"$WRK_SSH_ARGV_LOG"
+  printf '\0' >>"$WRK_SSH_ARGV_LOG"
+fi
 if [[ -n "${WRK_SSH_CALL_COUNT_FILE:-}" ]]; then
   call=0
   [[ ! -f "$WRK_SSH_CALL_COUNT_FILE" ]] || call="$(cat "$WRK_SSH_CALL_COUNT_FILE")"
@@ -66,7 +70,7 @@ if [[ "$remote" == *mktemp* ]]; then
     printf '%s\n' "mktemp: failed to create file via template '${TMPDIR:-/tmp}/wrk-spillover.XXXXXX.md': No space left on device" >&2
     exit 1
   fi
-  printf '%s\n' "/tmp/${host}-brief.md"
+  printf '%s\n' "${WRK_REMOTE_PROMPT_PATH:-/tmp/${host}-brief.md}"
   exit 0
 fi
 # Remote worktree preparation arrives as "VAR=<remote-path> ... sh -s" with the
@@ -91,6 +95,10 @@ if [[ "$host" == desktop && ( "$scenario" == desktop-spawn-fails || "$scenario" 
 # way a real one does: a die line on stderr, a refusal printed on stdout, or
 # both — so tests can assert which channel reaches the operator.
 if [[ "$remote" == *'wrk spawn'* ]]; then
+  if [[ "${WRK_SSH_EXEC_REMOTE:-0}" == 1 ]]; then
+    bash -c "$remote"
+    exit $?
+  fi
   case "$scenario" in
     remote-die-stderr)
       printf '%s\n' "${WRK_REMOTE_STDERR_LINE:-wrk: hk task 1037 is already bound to job 'other-job' (state=claimed claimed_by=w-other) — a task linked to another job cannot be re-spawned (fail-closed)}" >&2
