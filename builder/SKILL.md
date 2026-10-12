@@ -7,7 +7,9 @@ description: Own one pull-request delivery loop by briefing, spawning, independe
 
 빌더는 PR 한 건의 실행 루프를 소유한다. canonical 빌더 프로필은 `builder-opus`(Opus, effort high) 또는
 `builder-sol`(codex-sol, effort high — 2026-09-26 운영자 결정 전에는 max 였다)이다. `captain-opus`·`captain-sol`은
-legacy 별칭으로 같은 프로필을 뜻한다. `codex-terra`와 `codex-luna`는 워커 전용이다.
+legacy 별칭으로 같은 프로필을 뜻한다. `codex-luna`는 워커 전용이다. Terra 계열
+(`codex-terra`·`codex-terra-max`·`codex-med`·`builder-terra-*`)은 gpt-5.6-terra가
+operator 2026-10-12 noterra 결정으로 금지되어 모든 spawn에서 거부된다.
 #1026(2026-09-30 운영자 결정)로 codex-sol 계열은 gpt-6.1-sol 을 실행하고, 롤백 철자 `codex-sol6`·`builder-sol6`은
 gpt-6-sol 을 고정한다(ROB-591 의 codex-sol56 패턴 — `builder-sol6`은 빌더 좌석 형태로 codex-sol@high 급 consult를
 유지하면서 모델 id만 literal 이다).
@@ -35,10 +37,10 @@ worker/tester 전용이다 — fusion 빌더 사용은 hk 1382 이후 결정이�
 BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌리기 조건이다).
 #704(#594 E6 측정 런그)는 런그별 빌더 철자 `builder-opus-low`·`builder-opus-medium`·
 `builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·`builder-sol-max`·
-`builder-luna-max`·`builder-terra-high`·`builder-terra-xhigh`·`builder-terra-max`·
+`builder-luna-max`·
 `builder-kimi-high`·`builder-kimi-max`를 연다. 각 철자는 이름 마지막 구간의 런그 하나만 고정하며
 (그 외 `--effort`는 거부), spawn은 `SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식이 정확히
-그 런그를 가리킬 때만 열린다 — 예: `builder-terra-high`는 `SCOPEFUEL_E6_ARM=codex-terra@high`.
+그 런그를 가리킬 때만 열린다. Terra E6 철자는 표식과 무관하게 barred-model guard가 거부한다.
 게이트가 에스컬레이션으로 표시한 런그(`builder-sonnet-xhigh`)도 명시
 `--effort` 런그에는 scopefuel #716 규칙으로 `--operator-request` REF를
 요구하지 않는다 — 게이트는 그 런그를 쿼타 규칙으로만 판정하고 에스컬레이션
@@ -57,7 +59,7 @@ kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없
 `--operator-request` 불요). 기존 `builder-grok`·`builder-sol-high`는 그대로 — 별도 철자다
 (`builder-sol-high`는 #704의 `codex-sol@high` 표식 규칙 유지).
 **2026-09-26 운영자 결정으로 max 런그 철자(`builder-sonnet-max`·`builder-sol-max`·
-`builder-luna-max`·`builder-terra-max`·`builder-kimi-max`)는 닫혔다** — 빌더 좌석은
+`builder-luna-max`·`builder-kimi-max`)는 닫혔다** — 빌더 좌석은
 max 를 쓸 수 없으므로 `SCOPEFUEL_E6_ARM` 표식과 무관하게 wrk 가 거부한다.
 #921(operator 2026-09-29 Sonnet 5.5 실험 보고)은 비-런그 빌더 철자
 `builder-sonnet`을 연다 — `builder-opus` 의 argv 모양(`--model sonnet`
@@ -104,8 +106,8 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
   (현재 그 다음 저가는 S·A+ = Opus medium·A = Sonnet low 다).
 - **현재 출력(예시) — codex**(공용 7d 창; reserve 창이 어느 모델을 덮는지 미확정):
   **S+·S = Sol xhigh**(Sol max 는 T3 코어가 필요할 때만) · **A+ = Luna max** ·
-  **A = Luna high** · **B = Luna medium**. **Terra 는 모든 급에서 지배당한다** —
-  reserve 창이 Terra 전용으로 확인될 때만 보조로 쓴다(부하 분산 주장 금지).
+  **A = Luna high** · **B = Luna medium**. Terra profiles are refused by
+  operator 2026-10-12 noterra and are not assignment candidates.
   `codex-sol` 철자 자체의 기본값은 max 라서 Sol 배정은 `--effort` 명시로 한다.
   미측정 Sol high(C)·미배치 Sol medium 은 **E6 arm 우선 측정 대상**이다 — 측정되면 S 후보.
 <!-- /T736-ASSIGNMENT-DEFAULTS -->
@@ -153,6 +155,9 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
    **상한 3라운드에서 `wrk round open`은 rc 78 로 거부되고 head·마지막 verdict·findings 경로를 담은
    `job.escalate` 가 parent 레인으로 나간다 — 빌더는 그 지점에서 멈추고 상위 결정을 기다린다.**
    정지는 pane 메시지를 읽는 데 달리지 않고 도구가 강제한다(#745·#746).
+   `round open`은 head 가 실제 commit 인지 job 의 최신 claim/reclaim 메타데이터(repo·worktree·cwd)에서
+   찾은 저장소로 확인한다. 사용할 경로가 없으면 `--repo PATH` 를 받고, 로컬에 commit 이 없으면 origin 을
+   한 번 fetch 한 뒤에도 없을 때 라운드 이벤트 없이 거부한다.
    추가 라운드는 승인 기록이 있을 때만 `wrk round open --extend hk:doc/<key>`·`hk:task/<id>` 로 열린다
    — 레코드 안에 `round-extension: job=<job> extra=N by=<parent lane|operator>` 줄이 있고 그
    issuer 가 서버가 찍은 identity(doc 의 created_by·comment 의 author — doc session 은
@@ -160,6 +165,11 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
    issuer 는 operator·operator-desk·director-1·pa-integrator 뿐이다(뒤 둘은 그 job 의
    parent lane 일 때만 — 기록된 parent lane 은 그 고정 집합 밖에서 신뢰하지 않는다);
    by=pa-integrator 는 서버상 그 job 에 묶인 ParkingArcade task 에서만 유효하다.
+   기존 verdict 가 없는 라운드는 `wrk round void JOB N --by REF [--reason TEXT]` 로 폐기할 수 있다.
+   승인 문서는 `round-void: job=JOB round=N by=<parent-lane|operator>` 줄을 포함해야 하며,
+   기존 extension 과 같은 서버 identity·parent-lane·pa-integrator task 검증을 거친다. 유효한 void 는
+   cap 에서 한 슬롯을 빼고 `round status` 에 `round N void (REF)` 로 표시된다. 해당 round 에 verdict 가
+   있으면 cap 에서 제외되지 않는다.
 5. **워커·tester 배치는 `wrk spawn`(hub placement)이 정한다.** 빌더 자신의 머신이 기본값이
    아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
 6. T3 작업을 여러 PR·워커로 나누는 분할 규칙(불변식 표·핵심/주변 경계·NEEDS_CLASSIFICATION·

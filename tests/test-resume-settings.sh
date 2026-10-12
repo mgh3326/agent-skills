@@ -360,7 +360,7 @@ spawn_in "$WRK" "$d" devin-swe2 ||
 [[ ! -e "$d/$SETTINGS" ]] ||
   { echo "RED: AC5: devin spawn wrote $SETTINGS" >&2; exit 1; }
 d="$(mkrepo ac5-codex)"
-spawn_in "$WRK" "$d" codex-terra ||
+spawn_in "$WRK" "$d" codex-luna ||
   fail "AC5 codex spawn failed: $(tail -n 3 "$TMP/wrk.stderr")"
 [[ ! -e "$d/$SETTINGS" ]] ||
   { echo "RED: AC5: codex spawn wrote $SETTINGS" >&2; exit 1; }
@@ -431,7 +431,7 @@ open(dst, "w", encoding="utf-8").write(
 PY
 mut_ac5() {
   local d; d="$(mkrepo mut3)"
-  spawn_in "$MUT/wrk-nonclaude" "$d" codex-terra || { echo "ERROR: mutant spawn failed" >&2; return 99; }
+  spawn_in "$MUT/wrk-nonclaude" "$d" codex-luna || { echo "ERROR: mutant spawn failed" >&2; return 99; }
   [[ ! -e "$d/$SETTINGS" ]] || return 1
 }
 

@@ -68,8 +68,8 @@ KIMI_CODE_MAX_HOME="${KIMI_CODE_MAX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/k
 CLINEPASS_GATE_URL="http://127.0.0.1:8317"
 CLINEPASS_GATE_KEY_FILE="${CLINEPASS_GATE_KEY_FILE:-$HOME/.config/cliproxyapi-key.txt}"
 
-# 프로필 이름 전체 목록(resolve_profile 의 case 문과 동기화 유지) — `wrk profiles` 출력 및
-# scopefuel 교차검증(추천 프로필 ⊆ wrk 가 띄울 수 있는 프로필)의 근거.
+# 활성 프로필 목록 — `wrk profiles` 출력 및 scopefuel 교차검증의 근거.
+# Barred spellings remain in resolve_profile solely so spawn can name their refusal.
 ALL_PROFILES=(
   opus sonnet sonnet-med haiku fable builder-opus captain-opus builder-sonnet
   devin-swe2 devin-swe2-medium devin-swe2-max builder-devin
@@ -77,12 +77,11 @@ ALL_PROFILES=(
   devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
   devin-fusion-opus55 devin-fusion-sonnet55
   builder-ds41 builder-ds41-max
-  codex-terra codex-med codex-terra-max codex-luna codex-luna-hi codex-luna-max
+  codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
   codex-sol56 codex-luna56 codex-sol6 builder-sol6
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max
   builder-sol-high builder-sol-max builder-sol-medium builder-luna-max
-  builder-terra-high builder-terra-xhigh builder-terra-max
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
@@ -100,10 +99,11 @@ profiles_help() {
   cat <<'USAGE'
 Usage: wrk profiles
 
-Print every model profile name resolve_profile() accepts, one per line
-(machine-readable; excludes retired agy-* aliases). Used for
-scopefuel-vs-wrk cross-validation (every scopefuel-recommended profile
-must be spawnable here).
+Print active model profile names, one per line (machine-readable; excludes
+retired agy-* aliases and barred Terra profiles). Terra spellings are still
+recognized so spawn can refuse them with the operator decision.
+Barred: codex-terra, codex-terra-max, codex-med, builder-terra-high,
+builder-terra-xhigh and builder-terra-max — operator 2026-10-12 noterra.
   -h, --help   show this usage
 USAGE
 }
@@ -117,7 +117,14 @@ profiles_cmd() {
     fi
     die "unexpected argument '$1'"
   fi
-  printf '%s\n' "${ALL_PROFILES[@]}"
+  local profile
+  for profile in "${ALL_PROFILES[@]}"; do
+    case "$profile" in
+      codex-terra|codex-terra-max|codex-med|builder-terra-high|builder-terra-xhigh|builder-terra-max)
+        continue ;;
+    esac
+    printf '%s\n' "$profile"
+  done
 }
 
 usage() {
@@ -130,8 +137,9 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|p
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
-  wrk round open JOB --head SHA [--extend REF]
+  wrk round open JOB --head SHA [--extend REF] [--repo PATH]
   wrk round verdict JOB --file PATH
+  wrk round void JOB N --by REF [--reason TEXT]
   wrk round status JOB
   wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk lanes-missing
@@ -183,14 +191,14 @@ USAGE
 
 spawn_help() {
   cat <<'USAGE'
-Usage: wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
+Usage: wrk spawn -c CWD -m|--profile MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
                  [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--keep]
                  [--task HK_TASK_ID | --parent-job JOB_ID] [--task-hk-bypass]
 
 Options:
-  -c CWD, -m MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
+  -c CWD, -m|--profile MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
   --t T0..T3         job scale; required — an unclassified job is not spawned
   -L live|mock       select lane; mock requires MOCK_MCP_PROFILE and
                     WRK_MOCK_MCP_CONFIG (reviewed stdio connection descriptor).
@@ -215,14 +223,13 @@ Options:
                      builder-sonnet-max, builder-sol-high,
 
                      builder-sol-max, builder-sol-medium, builder-luna-max,
-                     builder-terra-high, builder-terra-xhigh, builder-terra-max,
                      builder-kimi-high, builder-kimi-max, builder-grok-low,
                      builder-grok-medium or builder-grok-xhigh profiles; legacy
                      captain-opus and captain-sol aliases and the pilot worker
                      spellings devin-swe2, devin-swe2-medium, devin-swe2-max,
                      grok/grok-hi and kimi-k3 remain accepted. The max-rung E6 spellings
                      (builder-sonnet-max, builder-sol-max, builder-luna-max,
-                     builder-terra-max, builder-kimi-max) are closed: under
+                     builder-kimi-max) are closed: under
                      --role builder any resolved max or ultra rung is refused
                      before the marker check (2026-09-26 decision), with one
                      named exception — builder-sonnet takes an explicit
@@ -230,6 +237,10 @@ Options:
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
                      builder refuses them pending hk 1382.
+                     All codex-terra, codex-terra-max, codex-med and
+                     builder-terra-* spellings are refused: gpt-5.6-terra is
+                     barred by operator 2026-10-12 noterra; use codex-sol or
+                     codex-luna.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      required for --role builder (spawn dies without it).
@@ -518,9 +529,10 @@ claim/record or preparation failure is warned and does not deny the spawn; a
 failed spawn releases a successfully created record. The scopefuel gate remains
 fail-closed, while exclusive arbiter leases retain their own fail-closed rules.
 
-Canonical codex profiles: codex-terra, codex-luna, codex-sol.
-Existing codex aliases remain valid: codex, codex-med, codex-luna-hi,
-codex-luna-max, codex-max, codex-terra-max.
+Canonical codex profiles: codex-luna, codex-sol.
+Existing codex aliases remain valid: codex, codex-luna-hi, codex-luna-max,
+codex-max. codex-terra, codex-terra-max and codex-med resolve for a named
+refusal: gpt-5.6-terra is barred by operator 2026-10-12 noterra.
 ROB-591/#1026 (2026-09-30 operator decision): codex-sol/codex-max/codex/
 builder-sol/captain-sol now run gpt-6.1-sol, and codex-luna/codex-luna-hi/
 codex-luna-max run gpt-6-luna. Rollback spellings codex-sol6/builder-sol6 pin
@@ -568,15 +580,15 @@ builder use is decided after hk 1382 — the --role builder allowlist refuses
 both spellings. No Fable or Astra fusion.
 E6 measurement builders (#704, #594): builder-opus-low, builder-opus-medium,
 builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max,
-builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max,
-builder-kimi-high and builder-kimi-max each pin exactly one effort rung (the
+builder-luna-max, builder-kimi-high and builder-kimi-max each pin exactly one effort rung (the
 suffix IS the rung; --effort is refused off-rung, allowed spelled the same).
 2026-09-26 (decision 4088 B): the max-rung members (builder-sonnet-max,
-builder-sol-max, builder-luna-max, builder-terra-max, builder-kimi-max) are
+builder-sol-max, builder-luna-max, builder-kimi-max) are
 closed — a builder seat never takes a max rung, marker or not.
 They exist only to measure that rung, so the open (non-max) spellings refuse to
-spawn without SCOPEFUEL_E6_ARM=<gate profile>@<effort> naming exactly it — e.g.
-SCOPEFUEL_E6_ARM=codex-terra@high for builder-terra-high. For these profiles
+spawn without SCOPEFUEL_E6_ARM=<gate profile>@<effort> naming exactly it. The
+Terra E6 spellings builder-terra-high, builder-terra-xhigh and builder-terra-max
+are refused by operator 2026-10-12 noterra. For the remaining profiles
 wrk passes the pinned rung as `scopefuel gate --effort` so the gate judges
 that rung's row, and the marker (forwarded through the environment) is what
 opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
@@ -2867,7 +2879,7 @@ arbiter_admit() {
   local launch_name="$MODEL"
   if [[ -n "${GATE_EFFORT_PIN:-}" ]]; then
     # #704: the E6 rung spellings are measurement aliases — record the canonical
-    # rung (opus@low, kimi-k3@max, codex-terra@high) so reps attribute to the
+    # rung (opus@low, kimi-k3@max, codex-sol@high) so reps attribute to the
     # profile@effort the gate judged, not a launcher-only name the grade table
     # cannot read (the same failure #677 fixed inside the codex pool).
     launch_name="$GATE_PROFILE"
@@ -3104,7 +3116,7 @@ resolve_catalog_profile() {
     builder-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=xhigh ;;
     # #704: the E6 codex rungs resolve against the canonical catalog profile at
     # their pinned effort, so the quota record's launch_profile is the exact
-    # catalog rung (codex-terra@high, codex-luna@max, codex-sol@high ...).
+    # catalog rung (codex-sol@high, codex-luna@max ...).
     # #737 adds builder-sol-medium (codex-sol@medium) on the same pin rule.
     builder-sol-high|builder-sol-max|builder-sol-medium) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     builder-luna-max) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=max ;;
@@ -3559,8 +3571,8 @@ resolve_profile() {
     # codex-max spelling, not an E6 rung).
     codex|codex-sol|codex-max|builder-sol|captain-sol|codex-sol56|codex-sol6|builder-sol6) GATE_PROFILE=codex-max ;;
     # #704: E6 codex rungs are judged at the canonical catalog profile + pinned
-    # effort rung (codex-sol@high, codex-luna@max, codex-terra@*) — not the
-    # flat codex-max/codex-luna-max/codex-terra-max spellings the old builders
+    # effort rung (codex-sol@high, codex-luna@max) — not the
+    # flat codex-max/codex-luna-max spellings the old builders
     # use, because scopefuel #692's E6 marker is profile@effort-exact.
     builder-sol-high|builder-sol-max|builder-sol-medium) GATE_PROFILE=codex-sol; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     builder-luna-max) GATE_PROFILE=codex-luna; GATE_EFFORT_PIN=max ;;
@@ -3615,7 +3627,7 @@ resolve_profile() {
   # or below, or a devin profile. codex `ultra` is the max tier plus subagents,
   # so it is refused here as well. This sits ahead of the E6 pin check so the
   # #704 max-rung builder spellings (builder-sonnet-max, builder-sol-max,
-  # builder-luna-max, builder-terra-max, builder-kimi-max) are closed by the
+  # builder-luna-max, builder-kimi-max) are closed by the
   # seat rule itself, not merely by a missing marker. devin profiles carry no
   # --effort at all (EFFORT_SUPPORTED=0 above), so a devin builder's
   # model-encoded rung never reaches this check. The unflagged kimi spellings
@@ -4473,14 +4485,14 @@ ROUND_CAP_REASON="tester round cap reached"
 
 round_help() {
   cat <<'USAGE'
-Usage: wrk round <open|verdict|status> JOB [options]
+Usage: wrk round <open|verdict|void|status> JOB [options]
 
 Formal tester-round bookkeeping for a builder job (#758). A formal round is
 one tester verdict recorded for one head. The count is taken only from the
-job's events/ stream (job.round and job.verdict records), so renamed or
+job's events/ stream (job.round, job.verdict and job.round_void records), so renamed or
 sub-rounds (r5b) cannot hide: wrk numbers every round itself.
 
-  wrk round open JOB --head SHA [--extend REF]
+  wrk round open JOB --head SHA [--extend REF] [--repo PATH]
       Open the next tester round for JOB (a builder job). At the cap
       (default 3 rounds per job) the open is refused with exit 78 and one
       job.escalate naming the job, head, last verdict and findings path is
@@ -4506,6 +4518,9 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       pane, so this narrows grant forgery to mbp-resident sessions but is
       not a boundary; hk 525 is the long-term fix.
       Each grant covers <extra> more opens and each open consumes exactly one.
+      Before opening, wrk checks HEAD^{commit} in the repo from the newest
+      job.claim/job.reclaim repo, worktree or cwd field. If none is usable,
+      pass --repo PATH. A missing commit triggers one bounded fetch of origin.
   wrk round verdict JOB --file PATH
       Record the tester's verdict file for the oldest open round that has
       none. PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
@@ -4513,13 +4528,96 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       verdict files written elsewhere or recorded without an open cannot
       dodge the cap.
   wrk round status JOB
-      Print one line: job=… rounds=N cap=N open=… last_verdict=…
+      Print one line: job=… rounds=N cap=N open=… last_verdict=… and any
+      voided rounds as 'round N void (hk:doc/…)' or 'round N void (hk:task/…)'.
+  wrk round void JOB N --by REF [--reason TEXT]
+      Void an existing round without a verdict, using a matching round-void
+      grant in hk:doc/<key> or hk:task/<id>. The grant line is the default
+      reason; --reason overrides it. Voids release one cap slot.
 USAGE
 }
 
+# Resolve the job repository from its newest claim/reclaim metadata. A usable
+# recorded repo/worktree/cwd takes precedence over the command-line fallback.
+round_repo_resolve() {
+  local job="$1" fallback="$2"
+  python3 - "$(wrk_jobs_root)/$job/events" "$fallback" <<'PY'
+import json, os, subprocess, sys
+events, fallback = sys.argv[1:]
+latest = None
+try:
+    names = sorted(os.listdir(events))
+except OSError:
+    names = []
+for name in names:
+    if not name.endswith('.json'):
+        continue
+    try:
+        with open(os.path.join(events, name), encoding='utf-8') as f:
+            o = json.load(f)
+    except (OSError, ValueError):
+        continue
+    if o.get('kind') in ('job.claim', 'job.reclaim'):
+        latest = o.get('payload', o)
+
+def repo_root(path):
+    try:
+        result = subprocess.run(
+            ['git', '-C', path, 'rev-parse', '--show-toplevel'],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=5, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    root = result.stdout.strip()
+    return os.path.realpath(root) if root else None
+
+if isinstance(latest, dict):
+    for field in ('repo', 'worktree', 'cwd'):
+        value = latest.get(field)
+        if isinstance(value, str) and value.strip():
+            root = repo_root(os.path.expanduser(value.strip()))
+            if root:
+                print(root)
+                raise SystemExit(0)
+if fallback:
+    root = repo_root(os.path.expanduser(fallback))
+    if root:
+        print(root)
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Check a full SHA as a commit. A missing local object gets one bounded fetch
+# from origin, then one final check. argv is fixed and no shell evaluates SHA.
+round_head_check() {
+  local repo="$1" head="$2"
+  python3 - "$repo" "$head" <<'PY'
+import os, subprocess, sys
+repo, head = sys.argv[1:]
+env = os.environ.copy()
+env['GIT_TERMINAL_PROMPT'] = '0'
+
+def run(args, timeout):
+    try:
+        return subprocess.run(args, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, env=env,
+                              timeout=timeout, check=False).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+check = ['git', '-C', repo, 'cat-file', '-e', head + '^{commit}']
+if run(check, 10):
+    raise SystemExit(0)
+run(['git', '-C', repo, 'fetch', 'origin'], 30)
+raise SystemExit(0 if run(check, 10) else 1)
+PY
+}
+
 # Scan the job's events stream once and emit one TSV line of key=value fields
-# the round commands need:
-#   rounds=<N>\topen=<csv|->\tlast_verdict=<V@SHA|->\tlast_findings=<path|->
+# the round commands need, including the effective voids and their refs.
 round_scan() {
   local job="$1"
   python3 - "$(wrk_jobs_root)/$job/events" <<'PY'
@@ -4527,6 +4625,7 @@ import json, os, sys
 events = sys.argv[1]
 rounds = []          # job.round records in file order
 verdicts = []        # job.verdict records in file order
+voids = []            # job.round_void records in file order
 try:
     names = sorted(os.listdir(events))
 except OSError:
@@ -4543,17 +4642,32 @@ for name in names:
         rounds.append(o)
     elif o.get("kind") == "job.verdict":
         verdicts.append(o)
+    elif o.get("kind") == "job.round_void":
+        voids.append(o)
 bound = {v.get("round") for v in verdicts if isinstance(v.get("round"), int)}
+round_numbers = {r.get("round") for r in rounds
+                 if isinstance(r.get("round"), int)}
+voided = {}
+for v in voids:
+    n, ref = v.get("round"), v.get("ref")
+    if (v.get("job_id") == os.path.basename(os.path.dirname(events))
+            and isinstance(n, int) and n in round_numbers and n not in bound
+            and isinstance(ref, str) and ref.startswith(("hk:doc/", "hk:task/"))):
+        voided[n] = ref
 open_rounds = [str(r.get("round")) for r in rounds
-               if isinstance(r.get("round"), int) and r.get("round") not in bound]
-used = len(rounds) + sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+               if isinstance(r.get("round"), int) and r.get("round") not in bound
+               and r.get("round") not in voided]
+used = sum(1 for r in rounds
+           if not (isinstance(r.get("round"), int) and r.get("round") in voided))
+used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
 last = verdicts[-1] if verdicts else {}
 lv = "-"
 if last.get("verdict") and last.get("head"):
     lv = "%s@%s" % (last["verdict"], last["head"])
 lf = last.get("path") or "-"
-print("rounds=%d\topen=%s\tlast_verdict=%s\tlast_findings=%s" %
-      (used, ",".join(open_rounds) if open_rounds else "-", lv, lf))
+voided_text = ",".join("round %d void (%s)" % item for item in sorted(voided.items())) or "-"
+print("rounds=%d\topen=%s\tlast_verdict=%s\tlast_findings=%s\tvoided=%s" %
+      (used, ",".join(open_rounds) if open_rounds else "-", lv, lf, voided_text))
 PY
 }
 
@@ -4572,15 +4686,16 @@ round_approval_fetch() {
   printf '%s' "$out"
 }
 
-# Verify a fetched approval record and print the granted extra-round count.
+# Verify a fetched round approval record for the grant type and optional round.
 # Args: ref, job, parent lane, operators, trusted parent lanes (both space
-# separated), record file.
+# separated), record file, grant type (default round-extension), round number.
 # Prints "granted=<N> issuer=<name>" — nothing else — on success.
 round_approval_verify() {
   local ref="$1" job="$2" parent="$3" operators="$4" parent_issuers="$5" record="$6"
-  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" <<'PY'
+  local grant_kind="${7:-round-extension}" round_number="${8:-}"
+  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" "$grant_kind" "$round_number" <<'PY'
 import json, re, sys
-ref, job, parent, operators, parent_issuers, path = sys.argv[1:]
+ref, job, parent, operators, parent_issuers, path, grant_kind, round_number = sys.argv[1:]
 ops = set(operators.split())
 trusted_parents = set(parent_issuers.split())
 try:
@@ -4592,10 +4707,15 @@ try:
     doc = json.loads(raw)
 except ValueError:
     raise SystemExit(1)
-# A grant line names the job, the extra-round count and its issuer, in one
-# canonical form — whitespace variants are malformed and rejected.
-GRANT = re.compile(
-    r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
+# Each grant type has one canonical line form; whitespace variants are
+# malformed and rejected. The identity and parent-lane checks below are
+# shared by round extensions and voids.
+if grant_kind == "round-extension":
+    GRANT = re.compile(r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
+elif grant_kind == "round-void":
+    GRANT = re.compile(r"^round-void: job=(\S+) round=(\d+) by=(\S+)$")
+else:
+    raise SystemExit(1)
 # The issuer written into the grant line must equal the record's server-set
 # identity — a doc's created_by (stamped from the bearer token; the
 # client-supplied session field is ignored) or a task comment's author — so a
@@ -4620,10 +4740,14 @@ for identity, body in sources:
         m = GRANT.match(line)
         if not m or m.group(1) != job:
             continue
-        extra, issuer = int(m.group(2)), m.group(3)
-        if extra < 1 or issuer not in allowed_issuers or issuer != identity:
+        amount, issuer = int(m.group(2)), m.group(3)
+        if (grant_kind == "round-extension" and amount < 1) or (
+                grant_kind == "round-void" and str(amount) != round_number):
             continue
-        print("granted=%d issuer=%s" % (extra, issuer))
+        if issuer not in allowed_issuers or issuer != identity:
+            continue
+        print("granted=%d issuer=%s" %
+              (amount if grant_kind == "round-extension" else 1, issuer))
         raise SystemExit(0)
 raise SystemExit(1)
 PY
@@ -4718,8 +4842,19 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                 records.append(json.load(f))
         except (OSError, ValueError):
             continue
+    rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
-    used = sum(1 for r in records if r.get("kind") == "job.round")
+    voids = [r for r in records if r.get("kind") == "job.round_void"]
+    bound = {v.get("round") for v in verdicts if isinstance(v.get("round"), int)}
+    round_numbers = {r.get("round") for r in rounds
+                     if isinstance(r.get("round"), int)}
+    voided = {v.get("round") for v in voids
+              if (v.get("job_id") == job and isinstance(v.get("round"), int)
+                  and v.get("round") in round_numbers and v.get("round") not in bound
+                  and isinstance(v.get("ref"), str)
+                  and v["ref"].startswith(("hk:doc/", "hk:task/")))}
+    used = sum(1 for r in rounds
+               if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for r in verdicts if not isinstance(r.get("round"), int))
     last = verdicts[-1] if verdicts else {}
     lv = "-"
@@ -4768,13 +4903,14 @@ PY
 }
 
 round_open_cmd() {
-  local job="${1:-}" head="" extend="" metadata owner label pane parent role
+  local job="${1:-}" head="" extend="" repo_override="" repo="" metadata owner label pane parent role
   [[ -n "$job" && "$job" != -* ]] || die "round open requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --head) [[ $# -ge 2 && -n "$2" ]] || die "--head requires a SHA"; head="$2"; shift 2 ;;
       --extend) [[ $# -ge 2 && -n "$2" ]] || die "--extend requires a hk:doc/<key> or hk:task/<id> ref"; extend="$2"; shift 2 ;;
+      --repo) [[ $# -ge 2 && -n "$2" ]] || die "--repo requires a path"; repo_override="$2"; shift 2 ;;
       *) die "unknown round open option '$1'" ;;
     esac
   done
@@ -4782,6 +4918,15 @@ round_open_cmd() {
   head="$(printf '%s' "$head" | tr '[:upper:]' '[:lower:]')"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  if ! repo="$(round_repo_resolve "$job" "$repo_override")"; then
+    if [[ -n "$repo_override" ]]; then
+      die "round open: --repo $repo_override is not a usable git repository"
+    fi
+    die "round open: job $job has no usable repo, worktree or cwd in job.claim/job.reclaim; pass --repo PATH"
+  fi
+  if ! round_head_check "$repo" "$head"; then
+    die "round open: --head $head is not a commit in $repo"
+  fi
 
   # An extension is approved before the count is consulted: the fetched hk
   # record must carry a valid grant line for this job from an allowed issuer.
@@ -4847,7 +4992,18 @@ with open(lock_path, "w", encoding="utf-8") as lock:
             continue
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
-    used = len(rounds) + sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+    voids = [r for r in records if r.get("kind") == "job.round_void"]
+    bound = {v.get("round") for v in verdicts if isinstance(v.get("round"), int)}
+    round_numbers = {r.get("round") for r in rounds
+                     if isinstance(r.get("round"), int)}
+    voided = {v.get("round") for v in voids
+              if (v.get("job_id") == job and isinstance(v.get("round"), int)
+                  and v.get("round") in round_numbers and v.get("round") not in bound
+                  and isinstance(v.get("ref"), str)
+                  and v["ref"].startswith(("hk:doc/", "hk:task/")))}
+    used = sum(1 for r in rounds
+               if not (isinstance(r.get("round"), int) and r.get("round") in voided))
+    used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
     approval = None
     if used >= cap:
         if not extend_ref:
@@ -4864,14 +5020,16 @@ with open(lock_path, "w", encoding="utf-8") as lock:
         print("EXTEND_BEFORE_CAP")
         raise SystemExit(0)
     highest = 0
+    highest_round = max(round_numbers) if round_numbers else 0
     for name in os.listdir(events):
         try:
             highest = max(highest, int(name.split("-", 1)[0]))
         except (ValueError, IndexError):
             pass
+    next_round = max(used, highest_round) + 1
     record = {"kind": "job.round", "job_id": job, "owner_lane": owner,
               "label": label, "pane_id": pane, "parent_lane": parent,
-              "head": head.lower(), "round": used + 1, "epoch": 1}
+              "head": head.lower(), "round": next_round, "epoch": 1}
     if approval:
         record["approval"] = approval
     fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
@@ -4884,7 +5042,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-    print("OPENED round=%d" % (used + 1))
+    print("OPENED round=%d" % next_round)
 PY
 )"
   rc=$?
@@ -4916,6 +5074,120 @@ PY
       exit "$WRK_EXIT_ROUND_CAP"
       ;;
     *) die "round open unexpected outcome: $outcome" ;;
+  esac
+}
+
+round_void_cmd() {
+  local job="${1:-}" round_number="${2:-}" ref="" reason="" metadata owner label pane parent role
+  [[ -n "$job" && "$job" != -* ]] || die "round void requires a job id"
+  [[ "$round_number" =~ ^[1-9][0-9]*$ ]] || die "round void requires a positive round number"
+  shift 2 || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --by) [[ $# -ge 2 && -n "$2" ]] || die "--by requires a hk:doc/<key> or hk:task/<id> ref"; ref="$2"; shift 2 ;;
+      --reason) [[ $# -ge 2 && -n "$2" ]] || die "--reason requires text"; reason="$2"; shift 2 ;;
+      *) die "unknown round void option '$1'" ;;
+    esac
+  done
+  [[ -n "$ref" ]] || die "round void requires --by REF"
+  metadata="$(builder_metadata "$job")"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+
+  local tmp_approval grant grant_issuer
+  tmp_approval="$(mktemp)"
+  if ! round_approval_fetch "$ref" >"$tmp_approval"; then
+    rm -f "$tmp_approval"
+    die "round void --by: approval record not found in handoffkeep: $ref"
+  fi
+  grant="$(round_approval_verify "$ref" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_approval" round-void "$round_number" || true)"
+  rm -f "$tmp_approval"
+  [[ -n "$grant" ]] ||
+    die "round void --by: $ref has no matching 'round-void: job=$job round=$round_number by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
+  grant_issuer="${grant##*issuer=}"
+  if [[ "$grant_issuer" == "pa-integrator" ]]; then
+    local task_id tmp_task
+    task_id="$(round_job_task_id "$job" || true)"
+    [[ -n "$task_id" ]] ||
+      die "round void --by: pa-integrator grants need the job's hk task on the server; $job records no task_id"
+    tmp_task="$(mktemp)"
+    if ! round_pa_task_fetch "$task_id" >"$tmp_task"; then
+      rm -f "$tmp_task"
+      die "round void --by: pa-integrator grants need the job's hk task on the server; cannot fetch task $task_id"
+    fi
+    if ! round_pa_task_verify "$job" "$tmp_task"; then
+      rm -f "$tmp_task"
+      die "round void --by: pa-integrator grants count only when the server task for $job is project ParkingArcade with refs.job_id=$job"
+    fi
+    rm -f "$tmp_task"
+  fi
+  [[ -n "$reason" ]] || reason="round-void: job=$job round=$round_number by=$grant_issuer"
+
+  local outcome rc=0
+  set +e
+  outcome="$(python3 - "$(wrk_jobs_root)/$job/events" "$job" "$round_number" "$ref" "$reason" "$grant_issuer" <<'PY'
+import fcntl, json, os, sys, tempfile
+events, job, round_text, ref, reason, issuer = sys.argv[1:]
+round_number = int(round_text)
+os.makedirs(events, exist_ok=True)
+lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
+with open(lock_path, "w", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    records = []
+    try:
+        names = sorted(os.listdir(events))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        try:
+            with open(os.path.join(events, name), encoding="utf-8") as f:
+                records.append(json.load(f))
+        except (OSError, ValueError):
+            continue
+    rounds = [r for r in records if r.get("kind") == "job.round"
+              and r.get("job_id") == job and r.get("round") == round_number]
+    if not rounds:
+        print("NO_ROUND")
+        raise SystemExit(0)
+    if any(r.get("kind") == "job.verdict" and r.get("job_id") == job
+           and r.get("round") == round_number for r in records):
+        print("HAS_VERDICT")
+        raise SystemExit(0)
+    if any(r.get("kind") == "job.round_void" and r.get("job_id") == job
+           and r.get("round") == round_number for r in records):
+        print("ALREADY_VOID")
+        raise SystemExit(0)
+    highest = 0
+    for name in names:
+        try:
+            highest = max(highest, int(name.split("-", 1)[0]))
+        except (ValueError, IndexError):
+            pass
+    record = {"kind": "job.round_void", "job_id": job, "round": round_number,
+              "reason": reason, "ref": ref, "issuer": issuer, "epoch": 1}
+    fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f, separators=(",", ":"))
+            f.write("\n")
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, os.path.join(events, "%05d-job.round_void.json" % (highest + 1)))
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+    print("VOIDED round=%d" % round_number)
+PY
+  )"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die "round void failed to inspect $job"
+  case "$outcome" in
+    VOIDED\ round=*) echo "OK job=$job $outcome ref=$ref" ;;
+    NO_ROUND) die "round void: round $round_number does not exist for job $job" ;;
+    HAS_VERDICT) die "round void: round $round_number already has a job.verdict" ;;
+    ALREADY_VOID) die "round void: round $round_number is already voided" ;;
+    *) die "round void unexpected outcome: $outcome" ;;
   esac
 }
 
@@ -4971,13 +5243,24 @@ with open(lock_path, "w", encoding="utf-8") as lock:
             continue
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
+    voids = [r for r in records if r.get("kind") == "job.round_void"]
     bound = {v.get("round") for v in verdicts if isinstance(v.get("round"), int)}
+    round_numbers = {r.get("round") for r in rounds
+                     if isinstance(r.get("round"), int)}
+    voided = {v.get("round") for v in voids
+              if (v.get("job_id") == job and isinstance(v.get("round"), int)
+                  and v.get("round") in round_numbers and v.get("round") not in bound
+                  and isinstance(v.get("ref"), str)
+                  and v["ref"].startswith(("hk:doc/", "hk:task/")))}
     target = None
     for r in rounds:
-        if isinstance(r.get("round"), int) and r.get("round") not in bound:
+        if (isinstance(r.get("round"), int) and r.get("round") not in bound
+                and r.get("round") not in voided):
             target = r["round"]
             break
-    used = len(rounds) + sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+    used = sum(1 for r in rounds
+               if not (isinstance(r.get("round"), int) and r.get("round") in voided))
+    used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
     if target is None:
         used += 1  # this unbound verdict is itself a round
     highest = 0
@@ -5061,6 +5344,7 @@ round_cmd() {
     -h|--help|"") round_help ;;
     open) shift; round_open_cmd "$@" ;;
     verdict) shift; round_verdict_cmd "$@" ;;
+    void) shift; round_void_cmd "$@" ;;
     status) shift; round_status_cmd "$@" ;;
     *) die "unknown round subcommand '$sub' (see 'wrk round --help')" ;;
   esac
@@ -7291,12 +7575,13 @@ spillover_try_candidate() {
 
 spawn_router_cmd() {
   SPILL_REMOTE_STARTED_AT="$SECONDS"
-  local requested=auto cwd="" prompt="" selected="" arg next=0 out rc host
+  local requested=auto cwd="" prompt="" selected="" router_profile="" arg next=0 out rc host
   for arg in "$@"; do
     if [[ "$next" -eq 1 ]]; then cwd="$arg"; next=0; continue; fi
     if [[ "$next" -eq 2 ]]; then prompt="$arg"; next=0; continue; fi
+    if [[ "$next" -eq 3 ]]; then router_profile="$arg"; next=0; continue; fi
     case "$arg" in
-      -c) next=1 ;; -p) next=2 ;;
+      -c) next=1 ;; -p) next=2 ;; -m|--profile) next=3 ;;
     esac
   done
   local filtered=() i=0 args=("$@")
@@ -7320,11 +7605,14 @@ spawn_router_cmd() {
   for ((i = 0; i < ${#args[@]}; i++)); do
     case "${args[$i]}" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--host|--lane-defer) ((i += 1)) ;;
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--host|--lane-defer) ((i += 1)) ;;
       --task-hk-bypass|--job-dup-ok|--landing-strict|--keep) ;;
       *) break ;;
     esac
   done
+  # Barred spellings stop before local host resolution, arbiter preflight,
+  # spillover telemetry or a hub placement request.
+  [[ -z "$router_profile" ]] || refuse_known_terra_spelling "$router_profile"
   # #1155: this host's own [local] spawn = false forbids local spawns here.
   # Resolve once, before any admission work: a malformed value is a config
   # error (70) on every placement, and --host local refuses before any pane,
@@ -8352,6 +8640,25 @@ mock_mcp_cleanup() {
   fi
 }
 
+refuse_barred_model_id() {
+  local model_id="${1:-}" profile="${2:-$MODEL}"
+  case "$model_id" in
+    gpt-5.6-terra|gpt-5.6-terra-*)
+      die "profile $profile refused: $model_id is barred, operator 2026-10-12 noterra; use codex-sol or codex-luna" ;;
+  esac
+}
+
+refuse_known_terra_spelling() {
+  local profile="${1:-$MODEL}"
+  case "$profile" in
+    codex-terra|codex-terra-max|codex-med|builder-terra-high|builder-terra-xhigh|builder-terra-max)
+      # This early known-alias check also gives a named refusal when the caller
+      # supplies a role those spellings cannot take. The resolved model-id check
+      # below remains the policy boundary for every profile that reaches resolve_profile.
+      refuse_barred_model_id gpt-5.6-terra "$profile" ;;
+  esac
+}
+
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
@@ -8367,10 +8674,10 @@ spawn_cmd() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--lane-defer)
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--lane-defer)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
-          -c) CWD="$2" ;; -m) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
+          -c) CWD="$2" ;; -m|--profile) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
           --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
           --role) ROLE="$2" ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
@@ -8388,6 +8695,10 @@ spawn_cmd() {
       *) die "unexpected argument '$1'" ;;
     esac
   done
+  # Refuse known Terra spellings as soon as arguments are parsed, before host
+  # routing or any spawn preparation. The resolved-model check below covers
+  # future aliases too.
+  refuse_known_terra_spelling
   # #1155: several router paths reach spawn_cmd directly (an unclassified
   # spawn, an unreadable arbiter, a hosts.toml-less auto). The flag gate
   # repeats here so no local spawn path runs on a host whose own [local]
@@ -8441,8 +8752,8 @@ spawn_cmd() {
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
       devin-fusion-opus55|devin-fusion-sonnet55)
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
-      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-terra-high, builder-terra-xhigh, builder-terra-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; codex-terra, the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -8475,7 +8786,7 @@ spawn_cmd() {
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
@@ -8486,6 +8797,9 @@ spawn_cmd() {
   task_validate
 
   resolve_profile
+  # Refuse by the resolved launcher model id, not by the spelling list. Keep
+  # this before gate work, quota/arbiter admission, worktree or pane creation.
+  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"
   configure_landing_check "$PROFILE_KIND"
   LANE_ENV=()
   if [[ -n "$LANE" ]]; then
