@@ -829,8 +829,10 @@ run_t1090_remote_err_tests() {
   # The scp progress assertion is an assertion-RED mutant: omitting this
   # helper call must make the expected step sequence fail.
   T1493_M1="$TMP/t1493-wrk-no-scp-progress"
+  # shellcheck disable=SC2016 # $host is literal source text in the mutation pattern
   sed 's/spillover_remote_step "$host" scp/:/' "$WRK" >"$T1493_M1"
   chmod +x "$T1493_M1"
+  # shellcheck disable=SC2016 # the searched wrk source text is literal
   grep -qF 'spillover_remote_step "$host" scp' "$T1493_M1" &&
     fail "T2 mutant did not apply: scp progress helper call remains"
   set +e
