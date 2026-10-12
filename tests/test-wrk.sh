@@ -13265,4 +13265,5 @@ wait "$waiter_job" || fail "run did not start after the load gate opened"
 [[ -e "$TMP/heavy-load-ran2" ]] || fail "load-gated run never executed"
 echo "PASS heavy-load-gate-bounds-the-start"
 
+bash "$ROOT/tests/test-shellcheck-capped.sh"
 echo 'PASS test-wrk'
