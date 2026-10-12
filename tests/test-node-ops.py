@@ -513,10 +513,14 @@ class TestRepoFastForward(NodeOpsCase):
 
     def test_side_branch_sha_is_refused_before_merge(self):
         def make_side_sha():
+            self.reset_repo_after = True
             git_raw(["-C", str(self.repo), "checkout", "-b", "side"], self.fixture_env)
             (self.repo / "side.txt").write_text("side\n", encoding="utf-8")
             git_raw(["-C", str(self.repo), "add", "side.txt"], self.fixture_env)
-            git_raw(["-C", str(self.repo), "commit", "-m", "side"], self.fixture_env)
+            git_raw(
+                ["-c", "user.email=node-ops@example.invalid", "-c", "user.name=Node Ops Test", "-C", str(self.repo), "commit", "-m", "side"],
+                self.fixture_env,
+            )
             self.side_sha = self.head()
             git_raw(["-C", str(self.repo), "checkout", "main"], self.fixture_env)
 
