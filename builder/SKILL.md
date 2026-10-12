@@ -153,6 +153,9 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
    **상한 3라운드에서 `wrk round open`은 rc 78 로 거부되고 head·마지막 verdict·findings 경로를 담은
    `job.escalate` 가 parent 레인으로 나간다 — 빌더는 그 지점에서 멈추고 상위 결정을 기다린다.**
    정지는 pane 메시지를 읽는 데 달리지 않고 도구가 강제한다(#745·#746).
+   `round open`은 head 가 실제 commit 인지 job 의 최신 claim/reclaim 메타데이터(repo·worktree·cwd)에서
+   찾은 저장소로 확인한다. 사용할 경로가 없으면 `--repo PATH` 를 받고, 로컬에 commit 이 없으면 origin 을
+   한 번 fetch 한 뒤에도 없을 때 라운드 이벤트 없이 거부한다.
    추가 라운드는 승인 기록이 있을 때만 `wrk round open --extend hk:doc/<key>`·`hk:task/<id>` 로 열린다
    — 레코드 안에 `round-extension: job=<job> extra=N by=<parent lane|operator>` 줄이 있고 그
    issuer 가 서버가 찍은 identity(doc 의 created_by·comment 의 author — doc session 은
@@ -160,6 +163,11 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
    issuer 는 operator·operator-desk·director-1·pa-integrator 뿐이다(뒤 둘은 그 job 의
    parent lane 일 때만 — 기록된 parent lane 은 그 고정 집합 밖에서 신뢰하지 않는다);
    by=pa-integrator 는 서버상 그 job 에 묶인 ParkingArcade task 에서만 유효하다.
+   기존 verdict 가 없는 라운드는 `wrk round void JOB N --by REF [--reason TEXT]` 로 폐기할 수 있다.
+   승인 문서는 `round-void: job=JOB round=N by=<parent-lane|operator>` 줄을 포함해야 하며,
+   기존 extension 과 같은 서버 identity·parent-lane·pa-integrator task 검증을 거친다. 유효한 void 는
+   cap 에서 한 슬롯을 빼고 `round status` 에 `round N void (REF)` 로 표시된다. 해당 round 에 verdict 가
+   있으면 cap 에서 제외되지 않는다.
 5. **워커·tester 배치는 `wrk spawn`(hub placement)이 정한다.** 빌더 자신의 머신이 기본값이
    아니다 — 배치를 가정하지 말고 스폰 결과의 pane·머신을 확인한다.
 6. T3 작업을 여러 PR·워커로 나누는 분할 규칙(불변식 표·핵심/주변 경계·NEEDS_CLASSIFICATION·
