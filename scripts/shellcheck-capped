@@ -1,0 +1,281 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  printf '%s\n' 'Usage: scripts/shellcheck-capped [--cap-mb N] [--changed BASE] [--] FILES...' >&2
+  exit 2
+}
+
+usage_error() {
+  printf 'shellcheck-capped: %s\n' "$1" >&2
+  usage
+}
+
+CAP_MB=2048
+CHANGED_BASE=
+CAP_SET=0
+CHANGED_SET=0
+FILES=()
+
+while (($#)); do
+  case "$1" in
+    --cap-mb)
+      (( CAP_SET == 0 )) || usage_error '--cap-mb may be supplied only once'
+      (($# >= 2)) || usage_error '--cap-mb requires an integer'
+      CAP_SET=1
+      raw_cap=$2
+      [[ "$raw_cap" =~ ^[0-9]+$ ]] || usage_error '--cap-mb must be an integer from 512 through 8192'
+      while [[ ${#raw_cap} -gt 1 && ${raw_cap:0:1} == 0 ]]; do raw_cap=${raw_cap:1}; done
+      ((${#raw_cap} <= 4)) || usage_error '--cap-mb must be an integer from 512 through 8192'
+      CAP_MB=$((10#$raw_cap))
+      (( CAP_MB >= 512 && CAP_MB <= 8192 )) || usage_error '--cap-mb must be an integer from 512 through 8192'
+      shift 2
+      ;;
+    --changed)
+      (( CHANGED_SET == 0 )) || usage_error '--changed may be supplied only once'
+      (($# >= 2)) || usage_error '--changed requires a git base'
+      CHANGED_SET=1
+      CHANGED_BASE=$2
+      shift 2
+      ;;
+    --)
+      shift
+      FILES+=("$@")
+      break
+      ;;
+    -*) usage_error "unknown option: $1" ;;
+    *)
+      FILES+=("$@")
+      break
+      ;;
+  esac
+done
+
+((${#FILES[@]} > 0)) || usage_error 'at least one file is required'
+
+SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
+REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+CI_FILE="$REPO_ROOT/.github/workflows/ci.yml"
+WRK_FILE="$REPO_ROOT/bin/wrk"
+
+[[ -r "$CI_FILE" ]] || { printf 'shellcheck-capped: cannot read CI workflow: %s\n' "$CI_FILE" >&2; exit 2; }
+
+ci_command=$(awk '
+  /^[[:space:]]*-[[:space:]]*name:[[:space:]]*ShellCheck[[:space:]]*$/ { in_step = 1; next }
+  in_step && /^[[:space:]]*-[[:space:]]*name:/ { exit }
+  in_step && /^[[:space:]]*run:[[:space:]]*\|[[:space:]]*$/ { in_block = 1; next }
+  in_step && !in_block && /^[[:space:]]*run:[[:space:]]*/ {
+    line = $0
+    sub(/^[[:space:]]*run:[[:space:]]*/, "", line)
+    print line
+    exit
+  }
+  in_step && in_block {
+    line = $0
+    sub(/^[[:space:]]*/, "", line)
+    if (line == "") next
+    continued = (line ~ /\\[[:space:]]*$/)
+    sub(/[[:space:]]*\\[[:space:]]*$/, "", line)
+    command = command " " line
+    if (!continued) {
+      print command
+      exit
+    }
+  }
+' "$CI_FILE")
+
+[[ -n "$ci_command" ]] || { printf 'shellcheck-capped: cannot find the ShellCheck run command in %s\n' "$CI_FILE" >&2; exit 2; }
+read -r -a ci_words <<< "$ci_command"
+[[ ${ci_words[0]:-} == shellcheck ]] || { printf 'shellcheck-capped: CI ShellCheck step must start with shellcheck\n' >&2; exit 2; }
+
+ci_flags=()
+needs_value() {
+  case "$1" in
+    -e|-f|-i|-o|-P|-s|-S|--exclude|--format|--include|--enable|--source-path|--shell|--severity) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+for ((i = 1; i < ${#ci_words[@]}; i++)); do
+  arg=${ci_words[i]}
+  [[ "$arg" != -- ]] || break
+  [[ "$arg" == -* ]] || break
+  ci_flags+=("$arg")
+  if [[ "$arg" != *=* ]] && needs_value "$arg"; then
+    ((i + 1 < ${#ci_words[@]})) || { printf 'shellcheck-capped: CI ShellCheck option is missing its value: %s\n' "$arg" >&2; exit 2; }
+    ((i += 1))
+    ci_flags+=("${ci_words[i]}")
+  fi
+done
+
+shellcheck_bin=$(command -v shellcheck || true)
+[[ -n "$shellcheck_bin" ]] || { printf 'shellcheck-capped: shellcheck is not installed\n' >&2; exit 127; }
+
+TEMP_FILES=()
+cleanup() {
+  local file
+  for file in "${TEMP_FILES[@]}"; do rm -f "$file"; done
+}
+trap cleanup EXIT
+
+make_changed_wrk_file() {
+  local diff_output changed_lines tmp_file
+  local -a diff_args
+  diff_args=(diff --no-ext-diff --unified=0 "${CHANGED_BASE}...HEAD" -- bin/wrk)
+  if ! diff_output=$(git -C "$REPO_ROOT" "${diff_args[@]}" 2>/dev/null); then
+    printf 'shellcheck-capped: invalid git base for --changed: %s\n' "$CHANGED_BASE" >&2
+    return 2
+  fi
+
+  tmp_file=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped.XXXXXX")
+  TEMP_FILES+=("$tmp_file")
+  head -n 1 "$WRK_FILE" >"$tmp_file"
+  awk '
+    NR == 1 && /^#!/ { next }
+    !seen_code && /^#[[:space:]]*shellcheck([[:space:]]|$)/ { print; next }
+    !seen_code && /^[[:space:]]*(#.*)?$/ { next }
+    { seen_code = 1 }
+  ' "$WRK_FILE" >>"$tmp_file"
+
+  changed_lines=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped-lines.XXXXXX")
+  TEMP_FILES+=("$changed_lines")
+  printf '%s\n' "$diff_output" | awk '
+    /^@@/ {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ /^\+[0-9]+(,[0-9]+)?$/) {
+          range = substr($i, 2)
+          parts = split(range, values, ",")
+          first = values[1] + 0
+          count = (parts > 1 ? values[2] + 0 : 1)
+          if (count == 0) count = 1
+          for (line = first; line < first + count; line++) print line
+        }
+      }
+    }
+  ' >"$changed_lines"
+
+  awk -v changed_file="$changed_lines" '
+    function is_function(line) {
+      return line ~ /^[[:space:]]*(function[[:space:]]+)?[[:alpha:]_][[:alnum:]_]*([[:space:]]*\([[:space:]]*\))?[[:space:]]*\{/
+    }
+    function contains_changed(start, end, n) {
+      for (n = start; n <= end; n++) if (changed[n]) return 1
+      return 0
+    }
+    FILENAME == changed_file { changed[$1 + 0] = 1; next }
+    {
+      line = $0
+      if (!in_function && is_function(line)) {
+        in_function = 1
+        start = FNR
+        function_text = line "\n"
+        if (line ~ /\{.*}[[:space:]]*(#.*)?$/) {
+          if (contains_changed(start, FNR)) printf "%s\n", function_text
+          in_function = 0
+          function_text = ""
+        }
+        next
+      }
+      if (in_function) {
+        function_text = function_text line "\n"
+        if (line ~ /^[[:space:]]*}[[:space:]]*(#.*)?$/) {
+          if (contains_changed(start, FNR)) printf "%s", function_text
+          in_function = 0
+          function_text = ""
+        }
+      }
+    }
+    END {
+      if (in_function && contains_changed(start, FNR)) printf "%s", function_text
+    }
+  ' "$changed_lines" "$WRK_FILE" >>"$tmp_file"
+  REPLY=$tmp_file
+}
+
+CHECK_FILES=()
+ADVISORY_PRINTED=0
+for file in "${FILES[@]}"; do
+  if (( CHANGED_SET )) && [[ "$file" == bin/wrk || "$file" == ./bin/wrk || "$file" == "$WRK_FILE" ]]; then
+    make_changed_wrk_file || exit $?
+    changed_wrk=$REPLY
+    CHECK_FILES+=("$changed_wrk")
+    if (( ADVISORY_PRINTED == 0 )); then
+      printf '%s\n' 'shellcheck-capped: --changed is advisory; selected bin/wrk functions lack full-file context'
+      ADVISORY_PRINTED=1
+    fi
+  else
+    CHECK_FILES+=("$file")
+  fi
+done
+
+cap_kb=$((CAP_MB * 1024))
+run_watchdog() {
+  local pid rss_output rss_kb rc err_file
+  err_file=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped-stderr.XXXXXX")
+  TEMP_FILES+=("$err_file")
+  "$shellcheck_bin" "${ci_flags[@]}" "${CHECK_FILES[@]}" 2>"$err_file" &
+  pid=$!
+  while kill -0 "$pid" 2>/dev/null; do
+    rss_output=$(ps -o rss= -p "$pid" 2>/dev/null || true)
+    if [[ "$rss_output" =~ ^[[:space:]]*([0-9]+)[[:space:]]*$ ]]; then
+      rss_kb=${BASH_REMATCH[1]}
+      if (( rss_kb > cap_kb )); then
+        kill -TERM "$pid" 2>/dev/null || true
+        sleep 2
+        if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+        wait "$pid" 2>/dev/null || true
+        printf 'shellcheck-capped: shellcheck exceeded %s MB on %s; run it in CI or use --changed BASE\n' "$CAP_MB" "${FILES[0]}" >&2
+        return 86
+      fi
+    elif kill -0 "$pid" 2>/dev/null; then
+      kill -TERM "$pid" 2>/dev/null || true
+      sleep 2
+      if kill -0 "$pid" 2>/dev/null; then kill -KILL "$pid" 2>/dev/null || true; fi
+      wait "$pid" 2>/dev/null || true
+      printf '%s\n' 'shellcheck-capped: cannot read shellcheck RSS; stopped the process' >&2
+      return 1
+    else
+      break
+    fi
+    sleep 0.5
+  done
+  if wait "$pid"; then
+    cat "$err_file" >&2
+    return 0
+  else
+    rc=$?
+    cat "$err_file" >&2
+    return "$rc"
+  fi
+}
+
+run_cgroup() {
+  local unit err_file rc result peak peak_bytes
+  unit="shellcheck-capped-${$}-${RANDOM}"
+  err_file=$(mktemp "${TMPDIR:-/tmp}/shellcheck-capped-stderr.XXXXXX")
+  TEMP_FILES+=("$err_file")
+  if systemd-run --user --scope --quiet --unit="$unit" -p "MemoryMax=${CAP_MB}M" -p MemorySwapMax=0 \
+    "$shellcheck_bin" "${ci_flags[@]}" "${CHECK_FILES[@]}" 2>"$err_file"; then
+    rc=0
+  else
+    rc=$?
+  fi
+  if (( rc != 0 )); then
+    result=$(systemctl --user show --property=Result --value "${unit}.scope" 2>/dev/null || true)
+    peak=$(systemctl --user show --property=MemoryPeak --value "${unit}.scope" 2>/dev/null || true)
+    peak_bytes=$((CAP_MB * 1024 * 1024))
+    if [[ "$result" == oom-kill || ( "$rc" == 137 && "$peak" =~ ^[0-9]+$ && peak -ge peak_bytes ) ]]; then
+      printf 'shellcheck-capped: shellcheck exceeded %s MB on %s; run it in CI or use --changed BASE\n' "$CAP_MB" "${FILES[0]}" >&2
+      return 86
+    fi
+  fi
+  cat "$err_file" >&2
+  return "$rc"
+}
+
+if [[ $(uname -s) == Linux ]] && command -v systemd-run >/dev/null 2>&1 \
+  && systemd-run --user --scope --quiet /bin/true >/dev/null 2>&1; then
+  if run_cgroup; then exit 0; else exit $?; fi
+else
+  if run_watchdog; then exit 0; else exit $?; fi
+fi

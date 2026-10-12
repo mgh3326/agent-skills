@@ -85,6 +85,15 @@ Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and wri
 | `wt` (worktrunk) | worktree 생성 + .env 자동 연결 | raw `git worktree add` + 수동 .env 심링크 |
 | `~/bin/herdr-spawn` | **deprecated** — `wrk spawn` 으로 위임하는 shim(옛 경로 호환용) | `wrk spawn` |
 
+## Local ShellCheck
+
+Run local checks through `scripts/shellcheck-capped`, which reads ShellCheck options from the CI workflow and applies a 2048 MB memory cap by default. On pi and oci, use `--changed origin/main` for an advisory check of changed `bin/wrk` functions, or leave the full `bin/wrk` check to CI. CI continues to run its existing direct ShellCheck step.
+
+```sh
+scripts/shellcheck-capped tests/test-wrk.sh
+scripts/shellcheck-capped --changed origin/main -- bin/wrk tests/test-wrk.sh
+```
+
 ## 설치 점검 (fleet-rev)
 
 머지마다 데스크가 5대 호스트에 네 도구를 손으로 재설치한다. `bin/fleet-rev`는
