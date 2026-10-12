@@ -66,6 +66,10 @@ export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 export ARBITER_BIN="$TMP/absent-arbiter"
 export XDG_DATA_HOME="$TMP/xdg"
+export XDG_CACHE_HOME="$TMP/xdg-cache"
+export XDG_CONFIG_HOME="$TMP/xdg-config"
+export XDG_STATE_HOME="$TMP/xdg-state"
+mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 # #951: claude-kind spawns seed folder trust into ${CLAUDE_CONFIG_DIR:-$HOME}/
 # .claude.json — fixture HOME keeps the operator's real config untouched.
 export HOME="$TMP/home"
@@ -141,6 +145,20 @@ for luna_profile in codex-luna codex-luna-hi codex-luna-max; do
   assert_argv_has "$luna_profile" "-m $CONTRACT_LUNA_MODEL_ID"
 done
 echo "PASS Luna profiles (codex-luna, codex-luna-hi, codex-luna-max) run $CONTRACT_LUNA_MODEL_ID"
+
+# Operator decision 2026-10-12 noterra: the machine-readable list omits barred
+# profiles while help names the refusal, so neither surface offers Terra.
+profiles="$("$WRK" profiles)"
+for barred in codex-terra codex-terra-max codex-med \
+  builder-terra-high builder-terra-xhigh builder-terra-max; do
+  if grep -qx "$barred" <<<"$profiles"; then
+    fail "wrk profiles still offers barred profile '$barred'"
+  fi
+done
+spawn_help="$("$WRK" spawn --help)"
+grep -q 'operator 2026-10-12 noterra' <<<"$spawn_help" ||
+  fail "spawn help omits the Terra refusal decision"
+echo "PASS Terra profiles are absent from wrk listings and named as refused in help"
 
 # --- Grok: generic fallback argv ------------------------------------------
 assert_argv_has grok "-m $CONTRACT_GROK_MODEL_ID"
@@ -395,14 +413,15 @@ WRK_CATALOG_SPELLINGS_SNAPSHOT="$(printf '%s\n' \
   builder-luna builder-luna-max builder-opus builder-opus-low \
   builder-opus-medium builder-sol builder-sol-high builder-sol-max \
   builder-sol-medium builder-sol6 builder-sonnet builder-sonnet-max builder-sonnet-xhigh \
-  builder-terra-high builder-terra-max \
-  builder-terra-xhigh captain-opus captain-sol \
+  captain-opus captain-sol \
   cc-glm cc-qwen38 codex codex-astra codex-luna codex-luna-hi codex-luna-max \
-  codex-max codex-med codex-sol codex-terra codex-terra-max fable grok grok-hi \
+  codex-max codex-sol fable grok grok-hi \
   grok-med haiku kiro-cheap kiro-haiku kiro-opus kiro-opus-max kiro-opus-xhigh \
   kiro-sol kiro-sol-max kiro-sol-xhigh kiro-sonnet opus sonnet sonnet-med | sort)"
 
-# Parse resolve_catalog_profile()'s case labels out of the real script.
+# Parse resolve_catalog_profile()'s case labels out of the real script. Terra
+# names remain there only as refusal identities; they are not catalog-consuming
+# launch spellings and therefore do not belong in the cross-repo snapshot.
 WRK_CATALOG_SPELLINGS_ACTUAL="$(awk '
   /^resolve_catalog_profile\(\) \{/ { inside = 1; next }
   inside && /^\}/ { exit }
@@ -413,7 +432,7 @@ WRK_CATALOG_SPELLINGS_ACTUAL="$(awk '
     n = split(line, parts, "|")
     for (i = 1; i <= n; i++) print parts[i]
   }
-' "$WRK" | sort)"
+' "$WRK" | grep -Ev '^(codex-terra|codex-terra-max|codex-med|builder-terra-high|builder-terra-xhigh|builder-terra-max)$' | sort)"
 
 if [[ "$WRK_CATALOG_SPELLINGS_SNAPSHOT" != "$WRK_CATALOG_SPELLINGS_ACTUAL" ]]; then
   echo "resolve_catalog_profile() drifted from the checked-in contract:" >&2

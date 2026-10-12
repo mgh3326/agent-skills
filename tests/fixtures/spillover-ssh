@@ -135,4 +135,4 @@ if [[ "$remote" == *'wrk spawn'* ]]; then
       ;;
   esac
 fi
-printf '%s\n' "OK pane=${host}:p7 host=local model=codex-terra label=fixture status=working landed=yes"
+printf '%s\n' "OK pane=${host}:p7 host=local model=codex-luna label=fixture status=working landed=yes"

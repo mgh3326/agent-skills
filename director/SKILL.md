@@ -146,8 +146,8 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
   (현재 그 다음 저가는 S·A+ = Opus medium·A = Sonnet low 다).
 - **현재 출력(예시) — codex**(공용 7d 창; reserve 창이 어느 모델을 덮는지 미확정):
   **S+·S = Sol xhigh**(Sol max 는 T3 코어가 필요할 때만) · **A+ = Luna max** ·
-  **A = Luna high** · **B = Luna medium**. **Terra 는 모든 급에서 지배당한다** —
-  reserve 창이 Terra 전용으로 확인될 때만 보조로 쓴다(부하 분산 주장 금지).
+  **A = Luna high** · **B = Luna medium**. Terra profiles are refused by
+  operator 2026-10-12 noterra and are not assignment candidates.
   `codex-sol` 철자 자체의 기본값은 max 라서 Sol 배정은 `--effort` 명시로 한다.
   미측정 Sol high(C)·미배치 Sol medium 은 **E6 arm 우선 측정 대상**이다 — 측정되면 S 후보.
 <!-- /T736-ASSIGNMENT-DEFAULTS -->
@@ -237,7 +237,7 @@ pane 메시지는 그 알림이다. 콘솔(큐 drawer · Decisions)은 이 기�
 <!-- openai-independent-verification:start -->
 **OpenAI 계열 독립검증 계약**
 
-OpenAI 기여가 있는 PR은 contributor 계열 합집합 밖의 검증된 tester가 최종 head에 PASS하지 않으면 머지하지 않는다. 유일한 예외는 `spawn-worker` §2-4 조건부 동일 계열 검증의 조건을 전부 충족한 경우다(A+ 이하 · 가역 T1/T2 · 제외 표면 아님 · 새 세션+detached worktree · opus xhigh 급 이상 tester · 지시형 공격 표면 브리프 · 독립 반례 · 최종 SHA required CI). 그 PASS는 "동일 계열 독립 세션 검증"으로 표기하고 "교차 검증 완료"와 구분한다. 계열만으로는 자격이 되지 않는다. T3와 제외 표면은 예외 없이 합집합 밖 PASS가 필요하다. Sol·Astra·Terra·Luna는 모델명이 달라도 서로 독립 검증이 아니다.
+OpenAI 기여가 있는 PR은 contributor 계열 합집합 밖의 검증된 tester가 최종 head에 PASS하지 않으면 머지하지 않는다. 유일한 예외는 `spawn-worker` §2-4 조건부 동일 계열 검증의 조건을 전부 충족한 경우다(A+ 이하 · 가역 T1/T2 · 제외 표면 아님 · 새 세션+detached worktree · opus xhigh 급 이상 tester · 지시형 공격 표면 브리프 · 독립 반례 · 최종 SHA required CI). 그 PASS는 "동일 계열 독립 세션 검증"으로 표기하고 "교차 검증 완료"와 구분한다. 계열만으로는 자격이 되지 않는다. T3와 제외 표면은 예외 없이 합집합 밖 PASS가 필요하다. Sol·Astra·Luna는 모델명이 달라도 서로 독립 검증이 아니다. Terra profiles are barred by operator 2026-10-12 noterra.
 
 기여 계열은 합집합이다 — 최종 커미터만 보지 않고 초안·수리·처방을 낸 모든 계열. 계열 unknown이면 독립성 불통과.
 
