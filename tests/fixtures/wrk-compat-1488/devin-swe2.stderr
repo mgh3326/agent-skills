@@ -1,0 +1,2 @@
+wrk: warning: arbiter unavailable; admission control skipped during installation transition
+wrk: Devin workspace trust already covers <TEST_ROOT> in <TEST_TMP>/xdg/devin/cli/trusted_workspaces.json

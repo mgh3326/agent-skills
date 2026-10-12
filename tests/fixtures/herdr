@@ -216,7 +216,7 @@ fixture_brief_landed() {
   case "$scenario" in
     # #1016: the pending-read scenarios that can still reach a spawn's
     # landing check (never-ends fails before it) land like a normal spawn.
-    spawn|landing-marker|prompt-wait-fails|grok-marker|shell-busy|agent-late-foreground|devin-read-eats-line|devin-read-eats-key|devin-slow-rc) return 0 ;;
+    spawn|landing-marker|landing-composer-enter|landing-composer-idle|landing-marker-working|prompt-wait-fails|grok-marker|shell-busy|agent-late-foreground|devin-read-eats-line|devin-read-eats-key|devin-slow-rc) return 0 ;;
     landing-retry|opencode-retry)
       if (( prompts >= 2 )); then return 0; fi
       ;;
@@ -294,6 +294,16 @@ case "${1:-}" in
             ;;
           landing-marker|landing-retry|landing-no|landing-pasted|landing-observation-fails|opencode-retry|opencode-no|generic-idle-no-marker)
             printf '%s\n' '{"result":{"agents":[{"agent":"codex","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
+            ;;
+          landing-composer-enter|landing-composer-idle|landing-pasted-enter|landing-marker-working)
+            fixture_status=idle
+            if [[ "$scenario" == landing-marker-working ]]; then
+              fixture_status=working
+            elif [[ "$scenario" != landing-composer-idle && -n "${WRK_FIXTURE_LOG:-}" ]] &&
+                 grep -q '^agent send-keys w:p1 return$' "$WRK_FIXTURE_LOG" 2>/dev/null; then
+              fixture_status=working
+            fi
+            printf '%s\n' "{\"result\":{\"agents\":[{\"agent\":\"codex\",\"agent_status\":\"$fixture_status\",\"name\":\"fixture\",\"pane_id\":\"w:p1\",\"tab_id\":\"w:t1\",\"workspace_id\":\"w\"}]}}"
             ;;
           devin-idle|devin-wrong-rule|devin-wait-timeout|devin-late-detect|devin-shell-busy|devin-shell-busy-m1b|devin-shell-never-ready-m1b|devin-explain-no-rule|devin-explain-empty|devin-trust-screen|devin-read-fail|devin-explain-starting|devin-explain-starting-stuck|devin-explain-unknown)
             printf '%s\n' '{"result":{"agents":[{"agent":"devin","agent_status":"idle","name":"fixture","pane_id":"w:p1","tab_id":"w:t1","workspace_id":"w"}]}}'
@@ -398,7 +408,7 @@ case "${1:-}" in
           else
             printf 'fixture output after prompt scrolled out\n'
           fi
-        elif [[ "$scenario" == landing-pasted ]] && ! fixture_is_recent_unwrapped_read "$@"; then
+        elif [[ "$scenario" == landing-pasted || "$scenario" == landing-pasted-enter ]] && ! fixture_is_recent_unwrapped_read "$@"; then
           printf 'Pasted text\n'
         elif ! fixture_is_recent_unwrapped_read "$@" && fixture_grok_visible_screen; then
           :

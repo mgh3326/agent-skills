@@ -1,0 +1,3 @@
+profile=grok-hi pool=grok used_pct=12.5 class=preserve
+gate allowed profile=grok-hi
+OK pane=w:p1 host=local model=grok label=fixture status=idle landed=yes

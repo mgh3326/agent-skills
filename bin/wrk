@@ -737,6 +737,41 @@ landing_check_detail() {
     printf ' first_ambiguous_reason=%s' "$LANDING_CHECK_AMBIGUOUS_REASON"
 }
 
+landing_requires_active_status() {
+  [[ "$1" == claude || "$1" == codex ]] &&
+    [[ "$2" == accepted || "$2" == unconfirmed ]]
+}
+
+landing_check_active_status() {
+  local pane="$1" evidence="$2" status
+  if ! status="$(agent_status_for_pane "$pane")"; then
+    LANDING_CHECK_AMBIGUOUS=1
+    LANDING_CHECK_LAST_STATUS=unknown
+    LANDING_CHECK_LAST_REASON="evidence-${evidence}-status-read-failed"
+    LANDING_CHECK_IN_COMPOSER=0
+    return 1
+  fi
+  LANDING_CHECK_LAST_STATUS="$status"
+  case "$status" in
+    working|blocked|done)
+      LANDING_CHECK_LAST_REASON="evidence-${evidence}-status-${status}"
+      LANDING_CHECK_IN_COMPOSER=0
+      return 0
+      ;;
+    idle)
+      LANDING_CHECK_LAST_REASON="prompt-in-composer"
+      LANDING_CHECK_IN_COMPOSER=1
+      return 1
+      ;;
+    *)
+      LANDING_CHECK_AMBIGUOUS=1
+      LANDING_CHECK_LAST_REASON="evidence-${evidence}-status-${status:-unknown}"
+      LANDING_CHECK_IN_COMPOSER=0
+      return 1
+      ;;
+  esac
+}
+
 prompt_marker() {
   local prompt_file="$1" line
   while IFS= read -r line || [[ -n "$line" ]]; do
@@ -780,9 +815,15 @@ sys.exit(1)
 }
 
 landing_check_once() {
-  local pane="$1" marker="$2" profile_kind="$3" submit="${4:-}" recent visible status
+  local pane="$1" marker="$2" profile_kind="$3" submit="${4:-}" recent visible status evidence=""
   LANDING_CHECK_LAST_EVIDENCE=none
   if ! recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
+    if landing_requires_active_status "$profile_kind" "$submit" &&
+       [[ -n "${LANDING_CHECK_EVIDENCE_SEEN:-}" ]]; then
+      LANDING_CHECK_LAST_EVIDENCE="$LANDING_CHECK_EVIDENCE_SEEN"
+      landing_check_active_status "$pane" "$LANDING_CHECK_EVIDENCE_SEEN"
+      return $?
+    fi
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_STATUS=unknown
     LANDING_CHECK_LAST_REASON="recent-unwrapped-read-failed"
@@ -794,9 +835,7 @@ landing_check_once() {
   # away. `working` below is deliberately not evidence: a cold codex boot
   # reports working before the composer has received the payload.
   if [[ -n "$marker" ]] && grep -Fq -- "$marker" <<<"$recent"; then
-    LANDING_CHECK_LAST_EVIDENCE=marker
-    LANDING_CHECK_LAST_REASON="marker-in-recent-unwrapped"
-    return 0
+    evidence=marker
   fi
   # #568: Devin folds long lines at its render width, so the transcript's copy
   # of the marker can carry a line break or indent the raw substring never
@@ -809,19 +848,25 @@ landing_check_once() {
     LANDING_CHECK_LAST_REASON="folded-marker-in-recent-unwrapped"
     return 0
   fi
-  if ! visible="$("$HERDR" agent read "$pane" --source visible --lines 40 2>/dev/null)"; then
-    LANDING_CHECK_AMBIGUOUS=1
-    LANDING_CHECK_LAST_STATUS=unknown
-    LANDING_CHECK_LAST_REASON="visible-read-failed"
-    return 1
-  fi
+  if [[ -z "$evidence" ]]; then
+    if ! visible="$("$HERDR" agent read "$pane" --source visible --lines 40 2>/dev/null)"; then
+      if landing_requires_active_status "$profile_kind" "$submit" &&
+         [[ -n "${LANDING_CHECK_EVIDENCE_SEEN:-}" ]]; then
+        LANDING_CHECK_LAST_EVIDENCE="$LANDING_CHECK_EVIDENCE_SEEN"
+        landing_check_active_status "$pane" "$LANDING_CHECK_EVIDENCE_SEEN"
+        return $?
+      fi
+      LANDING_CHECK_AMBIGUOUS=1
+      LANDING_CHECK_LAST_STATUS=unknown
+      LANDING_CHECK_LAST_REASON="visible-read-failed"
+      return 1
+    fi
 
-  # The UI chip is an independent positive observation that the payload is
-  # queued; keep it as the fallback for prompts whose transcript is delayed.
-  if grep -Fq -- "Pasted text" <<<"$visible"; then
-    LANDING_CHECK_LAST_EVIDENCE=pasted
-    LANDING_CHECK_LAST_REASON=pasted-text-chip
-    return 0
+    # The UI chip is an independent positive observation that the payload is
+    # queued; keep it as the fallback for prompts whose transcript is delayed.
+    if grep -Fq -- "Pasted text" <<<"$visible"; then
+      evidence=pasted
+    fi
   fi
   # Grok's queued footer has no `──` head the way devin's chip does: the
   # observed shape is `○ 1 command still running · 1 queued, Enter to send
@@ -837,18 +882,37 @@ landing_check_once() {
   # payload is sitting in Devin's queue. Like grok's chip it cannot be
   # attributed to THIS injection, so it is ambiguous evidence that suppresses
   # re-injection — never positive.
-  if [[ "$profile_kind" == devin ]] &&
+  if [[ -z "$evidence" && "$profile_kind" == devin ]] &&
      grep -Eq '── [0-9]+ queued ──|Press Enter to send queued messages now' <<<"$visible"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_EVIDENCE=devin-queued
     LANDING_CHECK_LAST_REASON="devin-queue-banner-unattributable"
     return 1
   fi
-  if [[ "$profile_kind" == grok ]] && grep -Eq '[1-9][0-9]* queued, Enter to send now' <<<"$visible"; then
+  if [[ -z "$evidence" && "$profile_kind" == grok ]] && grep -Eq '[1-9][0-9]* queued, Enter to send now' <<<"$visible"; then
     LANDING_CHECK_AMBIGUOUS=1
     LANDING_CHECK_LAST_EVIDENCE=grok-queued
     LANDING_CHECK_LAST_REASON="grok-queue-chip-unattributable"
     return 1
+  fi
+  if [[ -n "$evidence" ]]; then
+    LANDING_CHECK_EVIDENCE_SEEN="$evidence"
+    LANDING_CHECK_LAST_EVIDENCE="$evidence"
+    if landing_requires_active_status "$profile_kind" "$submit"; then
+      landing_check_active_status "$pane" "$evidence"
+      return $?
+    fi
+    LANDING_CHECK_LAST_REASON="${evidence}-evidence"
+    return 0
+  fi
+  # Once claude/codex evidence has appeared after an unproven submit, keep
+  # checking status through the landing window even if the marker scrolls away
+  # or a transient pasted-text chip disappears.
+  if landing_requires_active_status "$profile_kind" "$submit" &&
+     [[ -n "${LANDING_CHECK_EVIDENCE_SEEN:-}" ]]; then
+    LANDING_CHECK_LAST_EVIDENCE="$LANDING_CHECK_EVIDENCE_SEEN"
+    landing_check_active_status "$pane" "$LANDING_CHECK_EVIDENCE_SEEN"
+    return $?
   fi
   if ! status="$(agent_status_for_pane "$pane")"; then
     LANDING_CHECK_AMBIGUOUS=1
@@ -901,6 +965,8 @@ landing_check() {
   LANDING_CHECK_LAST_EVIDENCE=none
   LANDING_CHECK_LAST_STATUS=unknown
   LANDING_CHECK_LAST_REASON=not-observed
+  LANDING_CHECK_IN_COMPOSER=0
+  LANDING_CHECK_EVIDENCE_SEEN=""
   for ((tick=0; tick<LANDING_CHECK_TIMEOUT_TICKS; tick++)); do
     LANDING_CHECK_ATTEMPTS=$((tick + 1))
     if landing_check_once "$pane" "$marker" "$profile_kind" "$submit"; then return 0; fi
@@ -914,6 +980,31 @@ landing_check() {
     fi
   done
   return 1
+}
+
+# A brief observed in claude/codex's composer is submitted once with the key
+# spelling herdr accepts (return). The post-Enter poll never sends text or
+# invokes panewire again.
+landing_status_after_enter() {
+  local pane="$1" tick status
+  LANDING_ENTER_FINAL_STATUS=unknown
+  for ((tick=0; tick<6; tick++)); do
+    if status="$(agent_status_for_pane "$pane")"; then :; else status=unknown; fi
+    LANDING_ENTER_FINAL_STATUS="$status"
+    case "$status" in
+      working|blocked|done) return 0 ;;
+    esac
+    [[ "$tick" -eq 5 ]] || sleep_for 2
+  done
+  return 1
+}
+
+landing_submit_composer_once() {
+  local pane="$1"
+  [[ "${LANDING_ENTER_SENT:-0}" -eq 0 ]] || return 1
+  LANDING_ENTER_SENT=1
+  "$HERDR" agent send-keys "$pane" return >/dev/null 2>&1 || true
+  landing_status_after_enter "$pane"
 }
 
 # #498: the spawn brief reaches the pane only through `panewire prompt`; the
@@ -1077,6 +1168,9 @@ spawn_deliver_brief() {
   SPAWN_FALLBACKS=0
   SPAWN_PROMPT_FILES=()
   LANDING=no
+  LANDING_EVIDENCE=none
+  LANDING_ACTION=none
+  LANDING_ENTER_SENT=0
   PROMPT_PAYLOAD="$(<"$PROMPT")"
   PROMPT_MARKER="$(prompt_marker "$PROMPT")"
   SPAWN_EXPECT_CWD="$(spawn_expect_cwd "$CWD" "$PANE")"
@@ -1088,6 +1182,8 @@ spawn_deliver_brief() {
   case "$SPAWN_SUBMIT" in
     proven)
       LANDING=yes
+      LANDING_EVIDENCE="panewire-proven"
+      LANDING_ACTION=proven
       return 0
       ;;
     unsent)
@@ -1100,8 +1196,16 @@ spawn_deliver_brief() {
       # observation attaches to a delivery that definitely happened.
       if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" accepted; then
         LANDING=yes
+        LANDING_EVIDENCE="$LANDING_CHECK_LAST_EVIDENCE"
+        LANDING_ACTION=observe
       else
         detail="$(landing_check_detail)"
+        LANDING_EVIDENCE="$LANDING_CHECK_LAST_EVIDENCE"
+        if [[ "$LANDING_CHECK_IN_COMPOSER" -eq 1 ]]; then
+          LANDING_ACTION=none
+          LANDING_NO_DETAIL="phase=initial $first via=herdr-fallback evidence=$LANDING_EVIDENCE status=$LANDING_CHECK_LAST_STATUS action=none $detail reason=prompt-in-composer"
+          return 0
+        fi
         LANDING_NO_DETAIL="phase=initial $first via=herdr-fallback $detail action=landed-no retry=skipped reason=fallback-once"
       fi
       return 0
@@ -1111,9 +1215,27 @@ spawn_deliver_brief() {
   # accepted | unconfirmed: panewire could not prove it. Observe only.
   if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
     LANDING=yes
+    LANDING_EVIDENCE="$LANDING_CHECK_LAST_EVIDENCE"
+    LANDING_ACTION=observe
     return 0
   fi
   detail="$(landing_check_detail)"
+  LANDING_EVIDENCE="$LANDING_CHECK_LAST_EVIDENCE"
+  if [[ "$LANDING_CHECK_IN_COMPOSER" -eq 1 ]]; then
+    if [[ "$SPAWN_SUBMIT" != daemon ]] && landing_submit_composer_once "$PANE"; then
+      LANDING=enter
+      LANDING_ACTION=enter-once
+      return 0
+    fi
+    if [[ "$SPAWN_SUBMIT" != daemon ]]; then
+      LANDING_ACTION=enter-once
+      LANDING_NO_DETAIL="phase=initial $first evidence=$LANDING_EVIDENCE status=$LANDING_ENTER_FINAL_STATUS action=enter-once $detail reason=prompt-in-composer"
+    else
+      LANDING_ACTION=none
+      LANDING_NO_DETAIL="phase=initial $first evidence=$LANDING_EVIDENCE status=$LANDING_CHECK_LAST_STATUS action=none $detail reason=prompt-in-composer"
+    fi
+    return 0
+  fi
   # Grok is never re-injected: its echo can outlive even the extended window,
   # so a confirmed-looking non-landing can still be a brief in flight, and a
   # second injection is the duplicate-brief risk this lane exists to avoid.
@@ -1128,13 +1250,21 @@ spawn_deliver_brief() {
     local second="panewire_rc=$SPAWN_PANEWIRE_RC submit=$SPAWN_SUBMIT"
     [[ -z "$SPAWN_PANEWIRE_ERR" ]] || second="$second panewire_err=\"$SPAWN_PANEWIRE_ERR\""
     case "$SPAWN_SUBMIT" in
-      proven) LANDING=retry; return 0 ;;
+      proven)
+        LANDING=retry
+        LANDING_EVIDENCE="panewire-proven"
+        LANDING_ACTION=proven-retry
+        return 0
+        ;;
       accepted|unconfirmed)
         if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
           LANDING=retry
+          LANDING_EVIDENCE="$LANDING_CHECK_LAST_EVIDENCE"
+          LANDING_ACTION=observe
           return 0
         fi
         detail="$(landing_check_detail)"
+        LANDING_EVIDENCE="$LANDING_CHECK_LAST_EVIDENCE"
         ;;
     esac
     LANDING_NO_DETAIL="phase=retry $second $detail action=landed-no"
@@ -2679,16 +2809,20 @@ arbiter_record_spawn_receipt() {
   # pane; an untracked lane is never left behind.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc
-  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" "${TASK_ID:-}" "${HUB_LANE:-}" "${HUB_LANE_MACHINE:-}" <<'PY'
+  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" "${TASK_ID:-}" "${HUB_LANE:-}" "${HUB_LANE_MACHINE:-}" "$LANDING" "$LANDING_EVIDENCE" "$STATUS" "$LANDING_ACTION" <<'PY'
 import json, sys
-pane_id, label, profile, workspace, tab_id, keep, task_id, hub_lane, hub_lane_machine = sys.argv[1:]
+pane_id, label, profile, workspace, tab_id, keep, task_id, hub_lane, hub_lane_machine, landing, landing_evidence, landing_status, landing_action = sys.argv[1:]
 receipt = {
     "pane_id": pane_id,
     "label": label,
     "profile": profile,
     "workspace": workspace,
+    "landing": landing,
+    "landing_evidence": landing_evidence,
+    "landing_status": landing_status,
+    "landing_action": landing_action,
 }
-# Additive and optional: existing consumers keep reading the four fields above.
+# Additive fields keep existing consumers reading the pane/profile metadata.
 if tab_id:
     receipt["tab_id"] = tab_id
 # #768: the task binding is receipt evidence too, next to the pane it landed on.
@@ -8684,6 +8818,11 @@ print(value if isinstance(value, str) else "")
     OK_LINE="OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING job=$JOB_ID quota_record=$ARBITER_RESOURCE/quota_pool"
   else
     OK_LINE="OK pane=$PANE model=$MODEL label=$LABEL status=$STATUS landed=$LANDING"
+  fi
+  if [[ ( "$PROFILE_KIND" == claude || "$PROFILE_KIND" == codex ) &&
+        "$LANDING_EVIDENCE" != none &&
+        ( "$SPAWN_SUBMIT" == accepted || "$SPAWN_SUBMIT" == unconfirmed || "$SPAWN_SUBMIT" == daemon ) ]]; then
+    OK_LINE="$OK_LINE evidence=$LANDING_EVIDENCE action=$LANDING_ACTION"
   fi
   # Appended, never inserted: OK-line parsers read key=value pairs.
   [[ "$SPAWN_VIA" != herdr-fallback ]] || OK_LINE="$OK_LINE via=herdr-fallback"
