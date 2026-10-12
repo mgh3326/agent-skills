@@ -959,6 +959,12 @@ block 밖의 문장은 이 IDs를 약화·재정의할 수 없으며, prose-cont
      쓸 수 있어 좁힐 뿐 경계가 아니다). mbp 레인 래퍼(hk-desk·hk-director-1·
      hk-pa-integrator)는 모든 mbp pane 과 같은 OS 사용자로 돌아 위조 표면을 mbp 상주
      세션으로 좁힐 뿐 경계는 아니다 — 장기 수정은 hk 525.
+     `round open`은 최신 claim/reclaim 의 repo·worktree·cwd 경로에서 head commit 을 확인하고, 사용할
+     경로가 없으면 `--repo PATH` 를 받는다. 로컬에 head 가 없으면 origin 을 한 번 fetch 한 뒤에도
+     commit 이 없을 때 라운드 이벤트를 쓰지 않고 거부한다. verdict 가 없는 라운드는 동일한 서버 identity,
+     parent-lane 및 pa-integrator task 규칙을 적용한 `round-void: job=<job> round=N by=<parent-lane|operator>`
+     승인으로 `wrk round void JOB N --by REF [--reason TEXT]` 에서 취소할 수 있다. void 는 cap 을 한 칸
+     줄이고 status 에 표시되며, verdict 가 붙은 void 라운드는 계속 cap 에 포함된다.
    - 심각도 하한이 없으면 적대tester는 항상 무언가를 찾아내고 수렴이 무한히 늦어진다
      (07-31 실측: 개선 제안 하나가 풀 라운드를 트리거해 4과제 16라운드).
 5. 부재/미완 단정("테스트 없음"·"미배선")은 전수 탐색 후에만 보고에 인용.
