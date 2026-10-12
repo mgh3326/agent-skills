@@ -444,9 +444,53 @@ class TestReplayAndInstructionValidation(NodeOpsCase):
         state = self.read_state()
         state["docs"][self.receipt_key] = {"created_by": "mac-work", "body": json.dumps({"id": self.instruction_id})}
         self.write_state(state)
+        before = self.head()
+        for filename in ("hk-calls.bin", "git-calls.bin"):
+            path = self.home / filename
+            if path.exists():
+                path.unlink()
         result = self.run_cli()
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout.strip(), "RECEIPT key={} result=ok".format(self.receipt_key))
+        self.assertEqual(result.stdout.strip(), "RECEIPT key={} result=failed".format(self.receipt_key))
+        self.assertEqual(self.head(), before)
+        self.assertEqual(
+            self.read_state()["docs"][self.receipt_key],
+            {"created_by": "mac-work", "body": json.dumps({"id": self.instruction_id})},
+        )
+        puts = [args for args in self.calls("hk-calls.jsonl") if args[:2] == ["doc", "put"]]
+        self.assertEqual([args[3] for args in puts], ["ops/node/_identity"])
+        self.assertEqual(self.calls("git-calls.jsonl"), [])
+
+    def test_malformed_and_non_ok_replay_receipts_never_report_ok(self):
+        self.put_instruction(self.base_body(), created_by="forged-desk")
+        cases = [
+            ([], "failed"),
+            ({"created_by": "mac-work", "body": "{"}, "failed"),
+            ({"created_by": "mac-work", "body": json.dumps({"result": ["ok"]})}, "failed"),
+            ({"created_by": "mac-work", "body": json.dumps({"result": "refused"})}, "refused"),
+            ({"created_by": "mac-work", "body": json.dumps({"result": "failed"})}, "failed"),
+        ]
+        before = self.head()
+        for stored_document, expected_result in cases:
+            with self.subTest(stored_document=stored_document):
+                for filename in ("hk-calls.bin", "git-calls.bin"):
+                    path = self.home / filename
+                    if path.exists():
+                        path.unlink()
+                state = self.read_state()
+                state["docs"][self.receipt_key] = stored_document
+                self.write_state(state)
+                result = self.run_cli()
+                self.assertEqual(result.returncode, 0)
+                self.assertEqual(
+                    result.stdout.strip(),
+                    "RECEIPT key={} result={}".format(self.receipt_key, expected_result),
+                )
+                self.assertEqual(self.head(), before)
+                self.assertEqual(self.read_state()["docs"][self.receipt_key], stored_document)
+                puts = [args for args in self.calls("hk-calls.jsonl") if args[:2] == ["doc", "put"]]
+                self.assertEqual([args[3] for args in puts], ["ops/node/_identity"])
+                self.assertEqual(self.calls("git-calls.jsonl"), [])
 
     def test_invalid_id_refuses_without_receipt(self):
         body = self.base_body(id="bad-id")
@@ -477,6 +521,14 @@ class TestReplayAndInstructionValidation(NodeOpsCase):
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.receipt()["reason"], "unknown_action")
         self.assertEqual(self.calls("git-calls.jsonl"), [])
+
+
+class TestRunArgv(NodeOpsCase):
+    def test_run_argv_uses_a_bounded_timeout(self):
+        self.assertEqual(NODE_OPS.ARGV_TIMEOUT_SECONDS, 60)
+        with unittest.mock.patch.object(NODE_OPS, "ARGV_TIMEOUT_SECONDS", 0.1):
+            with self.assertRaises(subprocess.TimeoutExpired):
+                NODE_OPS.run_argv([sys.executable, "-c", "import time; time.sleep(1)"])
 
 
 class TestRepoFastForward(NodeOpsCase):
@@ -675,6 +727,12 @@ class TestHkCliInstall(NodeOpsCase):
         self.assertFalse(NODE_OPS.valid_redirect_url("https://github.com/a#"))
         self.assertTrue(NODE_OPS.valid_redirect_url("https://github.com/a"))
         self.assertTrue(NODE_OPS.valid_redirect_url("https://objects.githubusercontent.com/a?sig=1"))
+        self.assertTrue(NODE_OPS.valid_redirect_url("https://release-assets.githubusercontent.com/a?sig=1"))
+        self.assertFalse(NODE_OPS.valid_redirect_url("https://release-assets.githubusercontent.com.evil.example/a"))
+        self.assertFalse(NODE_OPS.valid_redirect_url("http://release-assets.githubusercontent.com/a"))
+        self.assertFalse(NODE_OPS.valid_redirect_url("https://user@release-assets.githubusercontent.com/a"))
+        self.assertFalse(NODE_OPS.valid_redirect_url("https://release-assets.githubusercontent.com/a#fragment"))
+        self.assertFalse(NODE_OPS.valid_redirect_url("https://release-assets.githubusercontent.com:444/a"))
 
     def test_download_cap_is_64_mib_and_rejects_overflow(self):
         self.assertEqual(NODE_OPS.MAX_DOWNLOAD_BYTES, 64 * 1024 * 1024)

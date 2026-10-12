@@ -25,6 +25,7 @@ TAG_RE = re.compile(r"^v[0-9]+\.[0-9]+\.[0-9]+$")
 SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
 OS_ARCHES = {"darwin_arm64", "darwin_amd64", "linux_arm64", "linux_amd64"}
 MAX_DOWNLOAD_BYTES = 64 * 1024 * 1024
+ARGV_TIMEOUT_SECONDS = 60
 RECEIPT_RESULTS = {"ok", "refused", "failed"}
 
 
@@ -56,6 +57,7 @@ def run_argv(argv):
         errors="replace",
         shell=False,
         check=False,
+        timeout=ARGV_TIMEOUT_SECONDS,
     )
 
 
@@ -150,11 +152,13 @@ def parse_instruction_body(value):
 
 def stored_receipt_result(document):
     if not isinstance(document, dict):
-        return "ok"
+        return "failed"
     body = parse_instruction_body(document.get("body"))
-    if isinstance(body, dict) and body.get("result") in RECEIPT_RESULTS:
-        return body["result"]
-    return "ok"
+    if isinstance(body, dict):
+        result = body.get("result")
+        if isinstance(result, str) and result in RECEIPT_RESULTS:
+            return result
+    return "failed"
 
 
 def new_receipt(identifier, action, result, reason, before, after):
@@ -253,7 +257,7 @@ def valid_redirect_url(url):
         return False
     if host == "github.com":
         return parsed.query == ""
-    if host == "objects.githubusercontent.com":
+    if host in ("objects.githubusercontent.com", "release-assets.githubusercontent.com"):
         return True
     return False
 
