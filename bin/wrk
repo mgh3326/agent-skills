@@ -756,7 +756,7 @@ landing_check_active_status() {
       return 0
       ;;
     idle)
-      LANDING_CHECK_LAST_REASON=prompt-in-composer
+      LANDING_CHECK_LAST_REASON="prompt-in-composer"
       LANDING_CHECK_IN_COMPOSER=1
       return 1
       ;;
@@ -1179,7 +1179,7 @@ spawn_deliver_brief() {
   case "$SPAWN_SUBMIT" in
     proven)
       LANDING=yes
-      LANDING_EVIDENCE=panewire-proven
+      LANDING_EVIDENCE="panewire-proven"
       LANDING_ACTION=proven
       return 0
       ;;
@@ -1249,7 +1249,7 @@ spawn_deliver_brief() {
     case "$SPAWN_SUBMIT" in
       proven)
         LANDING=retry
-        LANDING_EVIDENCE=panewire-proven
+        LANDING_EVIDENCE="panewire-proven"
         LANDING_ACTION=proven-retry
         return 0
         ;;
