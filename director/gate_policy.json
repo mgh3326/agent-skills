@@ -155,7 +155,7 @@
   "effective_at": "2026-10-12T00:00:00Z",
   "expires_at": "2026-10-20T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "f338b9866dbc320824576c70220dd8d89af5076e841058b7e5d7e2ff88a600a8",
+    ".github/workflows/ci.yml": "9dfca61cfad3d9fa1916aae82ef1f28a8c2ec30f3ca096d863918d7c150e1d42",
     "bin/wrk": "d62a196aeb3429614a195aa77cef871b7b1a53c7a64cba26516d4eb1a25a3380",
     "builder/SKILL.md": "91cdb4c1d22177fc219db5b876ecc52b852122bc37128a0180def3668c8c38e8",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
@@ -1786,7 +1786,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-12.2",
+  "revision": "2026-10-13.1",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
