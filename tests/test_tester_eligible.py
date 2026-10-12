@@ -289,19 +289,26 @@ class EligibilityFixtures(unittest.TestCase):
         evidence = self.evidence(self.make_head())
         evidence["tester"]["planned_profile"] = "fictional-launcher"
         self.assert_case(self.check(evidence), "tester", "UNVERIFIED", "PROFILE_UNKNOWN")
-        _, stale = common.load_policy(now=datetime(2026, 10, 4, tzinfo=timezone.utc))
+        _, stale = common.load_policy(now=datetime(2026, 10, 21, tzinfo=timezone.utc))
         self.assertEqual((stale["status"], stale["reason_code"]), ("UNVERIFIED", "POLICY_STALE"))
         changed = json.loads(json.dumps(self.policy))
         changed["sources"]["decision/2026-09-20/provider-family-and-ds41-grade"]["id"] = 0
         path = Path(self.temp.name) / "policy.json"
         path.write_text(json.dumps(changed))
-        _, conflict = common.load_policy(path, now=datetime(2026, 9, 25, 6, tzinfo=timezone.utc))
+        _, conflict = common.load_policy(path, now=datetime(2026, 10, 12, 6, tzinfo=timezone.utc))
         self.assertEqual((conflict["status"], conflict["reason_code"]), ("UNVERIFIED", "POLICY_CONFLICT"))
 
     def test_advertised_aliases_have_explicit_policy_entries(self) -> None:
         names = subprocess.run([str(ROOT / "bin/wrk"), "profiles"], text=True,
                                capture_output=True, check=True).stdout.splitlines()
-        self.assertEqual(set(names), set(self.policy["profiles"]))
+        # Terra spellings are refused (operator 2026-10-12 noterra): wrk no longer
+        # advertises them, and the policy keeps each one only as an explicit denial.
+        barred = {"codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",
+                  "builder-terra-xhigh", "builder-terra-max"}
+        self.assertTrue(barred.isdisjoint(names), sorted(barred & set(names)))
+        self.assertEqual(set(names), set(self.policy["profiles"]) - barred)
+        for name in barred:
+            self.assertEqual(self.policy["profiles"][name]["role_status"], "denied", name)
         for name in names:
             self.assertIsNotNone(common._wrk_clause((ROOT / "bin/wrk").read_text(), name), name)
             spec = self.policy["profiles"][name]

@@ -22,7 +22,7 @@ END = "<!-- openai-independent-verification:end -->"
 EXPECTED_BLOCK = """<!-- openai-independent-verification:start -->
 **OpenAI 계열 독립검증 계약**
 
-OpenAI 기여가 있는 PR은 contributor 계열 합집합 밖의 검증된 tester가 최종 head에 PASS하지 않으면 머지하지 않는다. 유일한 예외는 `spawn-worker` §2-4 조건부 동일 계열 검증의 조건을 전부 충족한 경우다(A+ 이하 · 가역 T1/T2 · 제외 표면 아님 · 새 세션+detached worktree · opus xhigh 급 이상 tester · 지시형 공격 표면 브리프 · 독립 반례 · 최종 SHA required CI). 그 PASS는 "동일 계열 독립 세션 검증"으로 표기하고 "교차 검증 완료"와 구분한다. 계열만으로는 자격이 되지 않는다. T3와 제외 표면은 예외 없이 합집합 밖 PASS가 필요하다. Sol·Astra·Terra·Luna는 모델명이 달라도 서로 독립 검증이 아니다.
+OpenAI 기여가 있는 PR은 contributor 계열 합집합 밖의 검증된 tester가 최종 head에 PASS하지 않으면 머지하지 않는다. 유일한 예외는 `spawn-worker` §2-4 조건부 동일 계열 검증의 조건을 전부 충족한 경우다(A+ 이하 · 가역 T1/T2 · 제외 표면 아님 · 새 세션+detached worktree · opus xhigh 급 이상 tester · 지시형 공격 표면 브리프 · 독립 반례 · 최종 SHA required CI). 그 PASS는 "동일 계열 독립 세션 검증"으로 표기하고 "교차 검증 완료"와 구분한다. 계열만으로는 자격이 되지 않는다. T3와 제외 표면은 예외 없이 합집합 밖 PASS가 필요하다. Sol·Astra·Luna는 모델명이 달라도 서로 독립 검증이 아니다. Terra profiles are barred by operator 2026-10-12 noterra.
 
 기여 계열은 합집합이다 — 최종 커미터만 보지 않고 초안·수리·처방을 낸 모든 계열. 계열 unknown이면 독립성 불통과.
 
