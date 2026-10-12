@@ -7770,9 +7770,8 @@ grep -q ' via=herdr-fallback$' <<<"$once_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 [[ "$(grep -c 'agent send-keys w:p1 return' "$TMP/herdr.log")" -eq 1 ]]
 
-# ROB-1321 landing acceptance fixtures. `working` is only a reason to keep
-# observing: marker (recent-unwrapped scrollback) or the visible Pasted text
-# chip is required before the brief may be called landed.
+# Landing evidence fixtures. For an unproven claude/codex submit, marker or
+# Pasted text is accepted only with an active post-evidence agent status.
 marker_prompt="$TMP/landing-marker.md"
 marker_first_line='marker-source-0123456789012345678901234567890123456789'
 marker_expected="${marker_first_line:0:40}"
@@ -8120,6 +8119,147 @@ for pw_mode in unproven composer; do
   grep -q 'reinject' <<<"$fn_out" && fail "498 false negative ($pw_mode) announced a reinject: $fn_out"
 done
 echo "PASS 498-a6-false-negative-no-duplicate"
+
+# HK 1488: an unproven claude/codex marker or chip is composer residue while
+# status stays idle. Submit the queued text once, then use the final pane
+# status to classify the landing. Every case uses only the herdr/panewire
+# fixtures above. Keep the task-specific checks quick by shortening only the
+# copied wrk's observation tick counts; production timing stays untouched.
+t1488_fast_wrk="$TMP/wrk-1488-fast-window"
+sed -e 's/LANDING_CHECK_TIMEOUT_TICKS=18/LANDING_CHECK_TIMEOUT_TICKS=2/' \
+  -e 's/LANDING_CHECK_TIMEOUT_TICKS=33/LANDING_CHECK_TIMEOUT_TICKS=2/' \
+  "$WRK" >"$t1488_fast_wrk"
+chmod +x "$t1488_fast_wrk"
+t1488_spawn() { WRK_UNDER_TEST="$t1488_fast_wrk" pw_spawn "$@"; }
+
+pw_reset
+t1488_enter_out="$(WRK_PANEWIRE_PROMPT=unproven TEST_FIXTURE_SCENARIO=landing-composer-enter \
+  t1488_spawn codex-terra 2>&1)"
+grep -q '^OK pane=w:p1 .*status=working landed=enter .*evidence=marker action=enter-once$' <<<"$t1488_enter_out" ||
+  fail "1488 T1 marker composer must land after one Enter: $t1488_enter_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] ||
+  fail "1488 T1 must send one panewire prompt and one brief"
+[[ "$(grep -c '^agent send-keys w:p1 return$' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "1488 T1 must send exactly one Enter: $t1488_enter_out"
+echo "PASS 1488-T1-marker-composer-enter-once"
+
+pw_reset
+t1488_idle_out="$(WRK_PANEWIRE_PROMPT=unproven TEST_FIXTURE_SCENARIO=landing-composer-idle \
+  t1488_spawn codex-terra 2>&1)"
+grep -q '^OK pane=w:p1 .*status=idle landed=no .*evidence=marker action=enter-once$' <<<"$t1488_idle_out" ||
+  fail "1488 T2 idle composer must remain landed=no: $t1488_idle_out"
+grep -q 'evidence=marker status=idle action=enter-once' <<<"$t1488_idle_out" ||
+  fail "1488 T2 detail must show evidence and final status: $t1488_idle_out"
+grep -q 'reason=prompt-in-composer' <<<"$t1488_idle_out" ||
+  fail "1488 T2 must name the composer reason: $t1488_idle_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] ||
+  fail "1488 T2 must not send a second prompt"
+[[ "$(grep -c '^agent send-keys w:p1 return$' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "1488 T2 must send exactly one Enter: $t1488_idle_out"
+echo "PASS 1488-T2-idle-after-one-enter"
+
+pw_reset
+t1488_working_out="$(WRK_PANEWIRE_PROMPT=unproven TEST_FIXTURE_SCENARIO=landing-marker-working \
+  t1488_spawn codex-terra 2>&1)"
+grep -q '^OK pane=w:p1 .*status=working landed=yes .*evidence=marker action=observe$' <<<"$t1488_working_out" ||
+  fail "1488 T3 marker plus working status must land without Enter: $t1488_working_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] ||
+  fail "1488 T3 must not send a second prompt"
+! grep -q '^agent send-keys w:p1 return$' "$TMP/herdr.log" ||
+  fail "1488 T3 must not send Enter: $t1488_working_out"
+echo "PASS 1488-T3-marker-working-no-enter"
+
+pw_reset
+t1488_pasted_out="$(WRK_PANEWIRE_PROMPT=unproven TEST_FIXTURE_SCENARIO=landing-pasted-enter \
+  t1488_spawn sonnet 2>&1)"
+grep -q '^OK pane=w:p1 .*status=working landed=enter .*evidence=pasted action=enter-once$' <<<"$t1488_pasted_out" ||
+  fail "1488 T4 pasted composer must land after one Enter: $t1488_pasted_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] ||
+  fail "1488 T4 must send one panewire prompt and one brief"
+[[ "$(grep -c '^agent send-keys w:p1 return$' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "1488 T4 must send exactly one Enter: $t1488_pasted_out"
+echo "PASS 1488-T4-pasted-composer-enter-once"
+
+# T5: preserve stdout/stderr byte for byte on devin and grok using the base
+# wrk implementation with the same stubbed unproven delivery.
+prechange_wrk="$TMP/prechange/bin/wrk"
+mkdir -p "$(dirname "$prechange_wrk")"
+git -C "$ROOT" show 8a914eb5b584d8383b7169ac9583b77160f635ee:bin/wrk >"$prechange_wrk" ||
+  fail "1488 T5 could not read the pre-change wrk from the base commit"
+chmod +x "$prechange_wrk"
+for t1488_compat in "devin-swe2 landing-marker" "grok landing-marker"; do
+  read -r t1488_model t1488_scenario <<<"$t1488_compat"
+  pw_reset
+  WRK_UNDER_TEST="$prechange_wrk" WRK_PANEWIRE_PROMPT=unproven \
+    TEST_FIXTURE_SCENARIO="$t1488_scenario" spawn_base "$t1488_model" \
+    >"$TMP/t1488-$t1488_model.pre.out" 2>"$TMP/t1488-$t1488_model.pre.err"
+  pw_reset
+  WRK_PANEWIRE_PROMPT=unproven TEST_FIXTURE_SCENARIO="$t1488_scenario" \
+    spawn_base "$t1488_model" >"$TMP/t1488-$t1488_model.post.out" 2>"$TMP/t1488-$t1488_model.post.err"
+  cmp -s "$TMP/t1488-$t1488_model.pre.out" "$TMP/t1488-$t1488_model.post.out" ||
+    fail "1488 T5 $t1488_model stdout changed from base"
+  cmp -s "$TMP/t1488-$t1488_model.pre.err" "$TMP/t1488-$t1488_model.post.err" ||
+    fail "1488 T5 $t1488_model stderr changed from base"
+  ! grep -q '^agent send-keys w:p1 return$' "$TMP/herdr.log" ||
+    fail "1488 T5 $t1488_model sent Enter"
+done
+echo "PASS 1488-T5-devin-grok-byte-identical-no-enter"
+
+# T6: panewire-proven is unchanged and skips the landing observer.
+pw_reset
+t1488_proven_out="$(t1488_spawn codex-terra 2>&1)"
+grep -q 'landed=yes' <<<"$t1488_proven_out" ||
+  fail "1488 T6 proven submission did not land: $t1488_proven_out"
+[[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] ||
+  fail "1488 T6 must have one proven delivery"
+[[ "$(grep -c '^agent read w:p1 --source recent-unwrapped --lines 200$' "$TMP/herdr.log")" -eq 1 ]] ||
+  fail "1488 T6 must skip wrk landing_check after the panewire proof"
+! grep -q '^agent send-keys w:p1 return$' "$TMP/herdr.log" ||
+  fail "1488 T6 must not send Enter"
+echo "PASS 1488-T6-proven-skips-landing-check"
+
+# T7: unsent rc=5 never enters the composer; daemon fallback keeps its
+# existing one-shot delivery and applies the active-status gate without Enter.
+pw_reset
+t1488_unsent_out="$(WRK_PANEWIRE_PROMPT=expect-fail TEST_FIXTURE_SCENARIO=landing-composer-enter \
+  t1488_spawn codex-terra 2>&1)"
+grep -q 'landed=no' <<<"$t1488_unsent_out" ||
+  fail "1488 T7 unsent submission must remain landed=no: $t1488_unsent_out"
+[[ "$(herdr_briefs)" -eq 0 && "$(pw_calls)" -eq 1 ]] ||
+  fail "1488 T7 unsent submission must not deliver"
+! grep -q '^agent send-keys w:p1 return$' "$TMP/herdr.log" ||
+  fail "1488 T7 unsent submission must not send Enter"
+pw_reset
+t1488_daemon_out="$(WRK_PANEWIRE_PROMPT=daemon-down TEST_FIXTURE_SCENARIO=landing-composer-enter \
+  t1488_spawn codex-terra 2>&1)"
+grep -q '^OK pane=w:p1 .*landed=no .*via=herdr-fallback$' <<<"$t1488_daemon_out" ||
+  fail "1488 T7 daemon fallback must keep its one-shot path: $t1488_daemon_out"
+grep -q 'evidence=marker status=idle action=none' <<<"$t1488_daemon_out" ||
+  fail "1488 T7 daemon fallback must apply the active-status gate without Enter: $t1488_daemon_out"
+[[ "$(herdr_briefs)" -eq 1 && "$(pw_calls)" -eq 1 ]] ||
+  fail "1488 T7 daemon fallback must inject exactly once"
+! grep -q '^agent send-keys w:p1 return$' "$TMP/herdr.log" ||
+  fail "1488 T7 daemon fallback must not send Enter"
+echo "PASS 1488-T7-unsent-daemon-no-enter"
+
+# The spawned receipt carries enough landing evidence to diagnose the next
+# composer incident after the pane is gone.
+pw_reset
+t1488_event_out="$(WRK_PANEWIRE_PROMPT=unproven TEST_FIXTURE_SCENARIO=landing-composer-enter \
+  TEST_ARBITER_BIN="$ARBITER" t1488_spawn codex-terra --job b1488-landing-event 2>&1)"
+grep -q 'landed=enter' <<<"$t1488_event_out" ||
+  fail "1488 event fixture did not use the Enter landing path: $t1488_event_out"
+python3 - "$TMP/inbox/b1488-landing-event/events" <<'PY'
+import glob, json, sys
+paths = glob.glob(sys.argv[1] + "/*job.spawned.json")
+assert len(paths) == 1, paths
+payload = json.load(open(paths[0], encoding="utf-8"))["payload"]
+assert payload["landing"] == "enter", payload
+assert payload["landing_evidence"] == "marker", payload
+assert payload["landing_status"] == "working", payload
+assert payload["landing_action"] == "enter-once", payload
+PY
+echo "PASS 1488-job-spawned-landing-evidence"
 
 # I2: confirmed non-landing re-injects once, through panewire, as a new file.
 pw_reset
