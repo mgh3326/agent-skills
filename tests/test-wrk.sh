@@ -8181,26 +8181,26 @@ grep -q '^OK pane=w:p1 .*status=working landed=enter .*evidence=pasted action=en
   fail "1488 T4 must send exactly one Enter: $t1488_pasted_out"
 echo "PASS 1488-T4-pasted-composer-enter-once"
 
-# T5: preserve stdout/stderr byte for byte on devin and grok using the base
-# wrk implementation with the same stubbed unproven delivery.
-prechange_wrk="$TMP/prechange/bin/wrk"
-mkdir -p "$(dirname "$prechange_wrk")"
-git -C "$ROOT" show 8a914eb5b584d8383b7169ac9583b77160f635ee:bin/wrk >"$prechange_wrk" ||
-  fail "1488 T5 could not read the pre-change wrk from the base commit"
-chmod +x "$prechange_wrk"
+# T5: compare devin and grok stdout/stderr byte for byte with captures from the
+# pre-change base wrk. The snapshots keep CI independent of checkout depth;
+# only the unique suite temp root and checkout root are normalized because
+# both appear in Devin's trust diagnostic.
+t1488_compat_root="$ROOT/tests/fixtures/wrk-compat-1488"
 for t1488_compat in "devin-swe2 landing-marker" "grok landing-marker"; do
   read -r t1488_model t1488_scenario <<<"$t1488_compat"
   pw_reset
-  WRK_UNDER_TEST="$prechange_wrk" WRK_PANEWIRE_PROMPT=unproven \
-    TEST_FIXTURE_SCENARIO="$t1488_scenario" spawn_base "$t1488_model" \
-    >"$TMP/t1488-$t1488_model.pre.out" 2>"$TMP/t1488-$t1488_model.pre.err"
-  pw_reset
   WRK_PANEWIRE_PROMPT=unproven TEST_FIXTURE_SCENARIO="$t1488_scenario" \
-    spawn_base "$t1488_model" >"$TMP/t1488-$t1488_model.post.out" 2>"$TMP/t1488-$t1488_model.post.err"
-  cmp -s "$TMP/t1488-$t1488_model.pre.out" "$TMP/t1488-$t1488_model.post.out" ||
-    fail "1488 T5 $t1488_model stdout changed from base"
-  cmp -s "$TMP/t1488-$t1488_model.pre.err" "$TMP/t1488-$t1488_model.post.err" ||
-    fail "1488 T5 $t1488_model stderr changed from base"
+    spawn_base "$t1488_model" >"$TMP/t1488-$t1488_model.out" 2>"$TMP/t1488-$t1488_model.err"
+  TMP="$TMP" TEST_ROOT="$ROOT" perl -pe \
+    's/\Q$ENV{TMP}\E/<TEST_TMP>/g; s/\Q$ENV{TEST_ROOT}\E/<TEST_ROOT>/g' \
+    "$TMP/t1488-$t1488_model.out" >"$TMP/t1488-$t1488_model.stdout"
+  TMP="$TMP" TEST_ROOT="$ROOT" perl -pe \
+    's/\Q$ENV{TMP}\E/<TEST_TMP>/g; s/\Q$ENV{TEST_ROOT}\E/<TEST_ROOT>/g' \
+    "$TMP/t1488-$t1488_model.err" >"$TMP/t1488-$t1488_model.stderr"
+  cmp -s "$t1488_compat_root/$t1488_model.stdout" "$TMP/t1488-$t1488_model.stdout" ||
+    fail "1488 T5 $t1488_model stdout changed from pre-change fixture"
+  cmp -s "$t1488_compat_root/$t1488_model.stderr" "$TMP/t1488-$t1488_model.stderr" ||
+    fail "1488 T5 $t1488_model stderr changed from pre-change fixture"
   ! grep -q '^agent send-keys w:p1 return$' "$TMP/herdr.log" ||
     fail "1488 T5 $t1488_model sent Enter"
 done

@@ -1,0 +1,3 @@
+profile=devin-swe2 pool=devin used_pct=0 class=spend
+gate allowed profile=devin-swe2
+OK pane=w:p1 host=local model=devin-swe2 label=fixture status=idle landed=yes
