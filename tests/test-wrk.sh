@@ -7844,10 +7844,11 @@ echo "PASS ac5-scrollback-marker-no-duplicate: $scrollout_out"
 
 : >"$TMP/herdr.log"
 pasted_out="$(TEST_FIXTURE_SCENARIO=landing-pasted spawn_base codex-terra 2>&1)"
-grep -q 'landed=yes' <<<"$pasted_out"
+grep -q 'landed=no' <<<"$pasted_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 grep -q 'agent read w:p1 --source visible --lines 40' "$TMP/herdr.log"
-echo "PASS pasted-chip-queued: $pasted_out"
+[[ "$(grep -c '^agent send-keys w:p1 return$' "$TMP/herdr.log")" -eq 1 ]]
+echo "PASS pasted-chip-idle-composer-sends-one-enter: $pasted_out"
 
 # task406: a queued grok payload renders as a `N queued, Enter to send now`
 # footer with no `──` head. On a shared screen that chip cannot be attributed
