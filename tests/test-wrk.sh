@@ -6303,6 +6303,150 @@ for shell_window_jump in 27 29 30 31; do
   grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "retry at ${shell_window_jump}s leaked its pane"
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "retry at ${shell_window_jump}s delivered a brief"; fi
 done
+
+# #1492: the optional [local] window can lengthen every kind's readiness
+# wait, never shorten it, and refuses malformed or out-of-range values. The
+# fake clock advances the configured seconds after a probe is typed, so no
+# case sleeps for its 30s/90s/120s window.
+t1492_default_out=""
+: >"$TMP/herdr.log"
+set +e
+t1492_default_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=31 \
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends spawn_base opus --host local 2>&1)"
+t1492_default_rc=$?
+set -e
+[[ "$t1492_default_rc" -eq 1 ]] || fail "1492 default window expected rc=1, got $t1492_default_rc: $t1492_default_out"
+grep -q 'shell did not execute a readiness probe within 30000ms' <<<"$t1492_default_out" ||
+  fail "1492 without a key must keep the 30000ms default: $t1492_default_out"
+grep -q 'timeout source: claude kind default' <<<"$t1492_default_out" ||
+  fail "1492 default failure must name its source: $t1492_default_out"
+echo "PASS 1492 T1: default readiness window remains 30000ms"
+
+t1492_cfg90="$TMP/t1492-shell-ready-90000.toml"
+printf '[local]\nshell_ready_timeout_ms = 90000\n' >"$t1492_cfg90"
+: >"$TMP/herdr.log"
+set +e
+t1492_90_out="$(WRK_HOSTS_CONFIG="$t1492_cfg90" PATH="$TMP/jumpclock:$PATH" \
+  FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=91 TEST_FIXTURE_SCENARIO=devin-read-never-ends \
+  spawn_base opus --host local 2>&1)"
+t1492_90_rc=$?
+set -e
+[[ "$t1492_90_rc" -eq 1 ]] || fail "1492 configured window expected rc=1, got $t1492_90_rc: $t1492_90_out"
+grep -q 'shell did not execute a readiness probe within 90000ms' <<<"$t1492_90_out" ||
+  fail "1492 claude must use the configured 90000ms window: $t1492_90_out"
+grep -qF "timeout source: $t1492_cfg90 [local] shell_ready_timeout_ms" <<<"$t1492_90_out" ||
+  fail "1492 configured failure must name the hosts.toml key: $t1492_90_out"
+echo "PASS 1492 T2: claude uses configured 90000ms window and names its source"
+
+t1492_cfg60="$TMP/t1492-shell-ready-60000.toml"
+printf '[local]\nshell_ready_timeout_ms = 60000\n' >"$t1492_cfg60"
+: >"$TMP/herdr.log"
+set +e
+t1492_codex_out="$(WRK_HOSTS_CONFIG="$t1492_cfg60" PATH="$TMP/jumpclock:$PATH" \
+  FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=121 TEST_FIXTURE_SCENARIO=devin-read-never-ends \
+  spawn_base codex-terra --host local 2>&1)"
+t1492_codex_rc=$?
+set -e
+[[ "$t1492_codex_rc" -eq 1 ]] || fail "1492 codex window expected rc=1, got $t1492_codex_rc: $t1492_codex_out"
+grep -q 'shell did not execute a readiness probe within 120000ms' <<<"$t1492_codex_out" ||
+  fail "1492 configured 60000ms must not shorten codex's 120000ms default: $t1492_codex_out"
+grep -q 'timeout source: codex kind default' <<<"$t1492_codex_out" ||
+  fail "1492 codex failure must name the winning kind default: $t1492_codex_out"
+echo "PASS 1492 T3: configured 60000ms cannot shorten codex's 120000ms window"
+
+for t1492_bad in 1000 999999 90s duplicate; do
+  t1492_badcfg="$TMP/t1492-shell-ready-bad-$t1492_bad.toml"
+  case "$t1492_bad" in
+    duplicate) printf '[local]\nshell_ready_timeout_ms = 90000\nshell_ready_timeout_ms = 120000\n' >"$t1492_badcfg" ;;
+    *) printf '[local]\nshell_ready_timeout_ms = %s\n' "$t1492_bad" >"$t1492_badcfg" ;;
+  esac
+  : >"$TMP/herdr.log"
+  set +e
+  t1492_bad_out="$(WRK_HOSTS_CONFIG="$t1492_badcfg" TEST_FIXTURE_SCENARIO=spawn \
+    spawn_base opus --host local 2>&1)"
+  t1492_bad_rc=$?
+  set -e
+  [[ "$t1492_bad_rc" -eq 70 ]] ||
+    fail "1492 invalid value $t1492_bad must refuse rc=70, got $t1492_bad_rc: $t1492_bad_out"
+  grep -qF 'shell_ready_timeout_ms' <<<"$t1492_bad_out" ||
+    fail "1492 refusal for $t1492_bad must name the key: $t1492_bad_out"
+  grep -qF 'refusing spawn' <<<"$t1492_bad_out" ||
+    fail "1492 refusal for $t1492_bad must use the spawn config refusal style: $t1492_bad_out"
+  if [[ "$t1492_bad" == duplicate ]]; then
+    grep -qF 'duplicate shell_ready_timeout_ms key in [local]' <<<"$t1492_bad_out" ||
+      fail "1492 duplicate refusal lost its reason: $t1492_bad_out"
+  else
+    grep -qF 'line ' <<<"$t1492_bad_out" || fail "1492 refusal must name its config line: $t1492_bad_out"
+  fi
+  if grep -q '^tab create ' "$TMP/herdr.log"; then
+    fail "1492 invalid value $t1492_bad created a pane: $(grep '^tab create ' "$TMP/herdr.log")"
+  fi
+done
+echo "PASS 1492 T4: out-of-range, malformed and duplicate values refuse before pane creation"
+
+# A shell probe that is answered only after the fake clock advances 40s must
+# still pass with the configured 90s window; agent start receives the 50s left.
+: >"$TMP/herdr.log"
+t1492_delayed_out="$(WRK_HOSTS_CONFIG="$t1492_cfg90" PATH="$TMP/jumpclock:$PATH" \
+  FAKECLOCK_AFTER='pane read w:p1' FAKECLOCK_JUMP=40 WRK_FIXTURE_RC_READS=6 \
+  TEST_FIXTURE_SCENARIO=devin-slow-rc spawn_base opus --host local 2>&1)" ||
+  fail "1492 readiness probe answered after 40s must pass: $t1492_delayed_out"
+grep -q 'landed=yes' <<<"$t1492_delayed_out" ||
+  fail "1492 delayed readiness probe did not land the spawn: $t1492_delayed_out"
+grep -q '^agent start fixture --kind claude --pane w:p1 --timeout 50000 -- ' "$TMP/herdr.log" ||
+  fail "1492 40s readiness cost must leave 50000ms for agent start: $(grep '^agent start ' "$TMP/herdr.log")"
+echo "PASS 1492 T5: configured 90000ms window admits a probe answered after 40s"
+
+# Mutant checks are scoped to the contract cases above: using min instead of
+# max makes T3 report 60000ms; dropping the range check lets 1000 spawn.
+python3 - "$WRK" "$TMP/t1492-mut-min" <<'PY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+old = "if (( ${LOCAL_SHELL_READY_TIMEOUT_MS:-0} >= START_TIMEOUT )); then"
+new = "if (( ${LOCAL_SHELL_READY_TIMEOUT_MS:-0} <= START_TIMEOUT )); then"
+assert source.count(old) == 1, "expected one max comparison"
+path = pathlib.Path(sys.argv[2])
+path.write_text(source.replace(old, new, 1), encoding="utf-8")
+path.chmod(0o755)
+PY
+: >"$TMP/herdr.log"
+set +e
+t1492_min_mutant_out="$(WRK_UNDER_TEST="$TMP/t1492-mut-min" WRK_HOSTS_CONFIG="$t1492_cfg60" \
+  PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=121 \
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends spawn_base codex-terra --host local 2>&1)"
+t1492_min_mutant_rc=$?
+set -e
+[[ "$t1492_min_mutant_rc" -eq 1 ]] || fail "1492 min mutant should fail its bounded readiness probe: $t1492_min_mutant_out"
+grep -q 'shell did not execute a readiness probe within 60000ms' <<<"$t1492_min_mutant_out" ||
+  fail "1492 T3 did not kill the min mutant: $t1492_min_mutant_out"
+echo "PASS 1492 mutant: min instead of max makes T3 RED"
+
+python3 - "$WRK" "$TMP/t1492-mut-no-range" <<'PY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+old = '''        if (( ${#value} > 6 )) || (( 10#$value < 30000 || 10#$value > 300000 )); then
+          LOCAL_SPAWN_ERROR="$config line $n: [local] shell_ready_timeout_ms must be from 30000 to 300000 (got '$value')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+'''
+assert source.count(old) == 1, "expected one timeout range guard"
+path = pathlib.Path(sys.argv[2])
+path.write_text(source.replace(old, "        : # mutant: range check removed\n", 1), encoding="utf-8")
+path.chmod(0o755)
+PY
+t1492_range_mutant_cfg="$TMP/t1492-shell-ready-1000.toml"
+printf '[local]\nshell_ready_timeout_ms = 1000\n' >"$t1492_range_mutant_cfg"
+: >"$TMP/herdr.log"
+t1492_range_mutant_out="$(WRK_UNDER_TEST="$TMP/t1492-mut-no-range" \
+  WRK_HOSTS_CONFIG="$t1492_range_mutant_cfg" TEST_FIXTURE_SCENARIO=spawn \
+  spawn_base opus --host local 2>&1)" ||
+  fail "1492 T4 range mutant should be exposed by allowing 1000: $t1492_range_mutant_out"
+grep -q 'landed=yes' <<<"$t1492_range_mutant_out" ||
+  fail "1492 range mutant did not bypass the invalid-value refusal: $t1492_range_mutant_out"
+grep -q '^tab create ' "$TMP/herdr.log" ||
+  fail "1492 range mutant did not create the pane that T4 forbids"
+echo "PASS 1492 mutant: dropping the range check makes T4 RED"
+
 # #1199: the probe's wait is charged to the window — a second ticking over
 # while the probe runs leaves the first `agent start` only the remaining
 # --timeout 29000 (pre-#1199 it still got the full 30000).
