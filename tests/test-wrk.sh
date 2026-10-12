@@ -946,8 +946,8 @@ run_t1090_remote_err_tests() {
     '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
     "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 2' >"$T1090_HOSTS_AUTO"
 
-  t1090_spawn() {  # env knobs per call: T1090_{SSH,SCP}_SCENARIO{,_DESKTOP,_MAC_WORK}, T1090_{HOSTS_OVERRIDE,CWD,WRK,HOST_ARG,LOAD_FILE}
-    env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  t1090_spawn() {  # env knobs per call include T1090_{SSH,SCP}_SCENARIO*, delay, host, cwd, and fixture controls
+    exec env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
       ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$T1090_INBOX" XDG_DATA_HOME="$T1090_XDG" \
       WRK_HOSTS_CONFIG="${T1090_HOSTS_OVERRIDE:-$T1090_HOSTS}" \
       WRK_PROC_LOADAVG="${T1090_LOAD_FILE:-$T1090_LOAD}" \
@@ -958,16 +958,35 @@ run_t1090_remote_err_tests() {
       WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
       WRK_SCP_BIN="${T1090_SCP:-$ROOT/tests/fixtures/spillover-scp}" \
       WRK_SSH_LOG="$TMP/t1090-ssh.log" WRK_SCP_LOG="$TMP/t1090-scp.log" \
+      WRK_SSH_DELAY_SECONDS_DESKTOP="${T1090_SSH_DELAY_SECONDS_DESKTOP:-}" \
       WRK_SSH_SCENARIO="${T1090_SSH_SCENARIO:-ok}" \
       WRK_SSH_SCENARIO_DESKTOP="${T1090_SSH_SCENARIO_DESKTOP:-}" \
       WRK_SSH_SCENARIO_MAC_WORK="${T1090_SSH_SCENARIO_MAC_WORK:-}" \
       WRK_SCP_SCENARIO="${T1090_SCP_SCENARIO:-ok}" \
       WRK_SCP_SCENARIO_DESKTOP="${T1090_SCP_SCENARIO_DESKTOP:-}" \
       WRK_REMOTE_RC="${T1090_REMOTE_RC:-}" \
+      WRK_REMOTE_SLEEP_SECONDS="${T1090_REMOTE_SLEEP_SECONDS:-1}" \
+      WRK_REMOTE_STDERR_BINARY="${T1090_REMOTE_STDERR_BINARY:-0}" \
       WRK_REMOTE_STDERR_LINE="${T1090_REMOTE_STDERR_LINE:-}" \
       WRK_REMOTE_STDOUT_LINE="${T1090_REMOTE_STDOUT_LINE:-}" \
       "${T1090_WRK:-$WRK}" spawn -c "${T1090_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" \
       -w w -l fixture --t T1 --job "t1090-$RANDOM-$RANDOM" --host "${T1090_HOST_ARG:-desktop}"
+  }
+
+  t1090_check_steps() {
+    local err_file="$1" host="$2" tag="$3"
+    shift 3
+    local want_file="$TMP/$tag.want-steps" raw_file="$TMP/$tag.raw-steps"
+    local got_file="$TMP/$tag.got-steps" bad_file="$TMP/$tag.bad-steps"
+    printf '%s\n' "$@" >"$want_file"
+    grep -E "^wrk: remote host '$host' step " "$err_file" >"$raw_file" || true
+    if grep -Ev "^wrk: remote host '$host' step (probe|cwd-map|prepare|mktemp|scp|remote wrk|lane) elapsed=[0-9]+s$" \
+        "$raw_file" >"$bad_file"; then
+      fail "$tag: malformed progress line: $(cat "$bad_file")"
+    fi
+    sed -E "s/^wrk: remote host '$host' step (.*) elapsed=[0-9]+s$/\\1/" "$raw_file" >"$got_file"
+    cmp -s "$want_file" "$got_file" ||
+      fail "$tag: progress steps differ: $(cat "$got_file")"
   }
 
   # AC1: the remote wrk dies on stderr — the die line reaches the local stderr
@@ -1009,6 +1028,7 @@ run_t1090_remote_err_tests() {
   t1090_rc=$?
   set -e
   [[ "$t1090_rc" -eq 255 ]] || fail "AC3 prepare: ssh rc must propagate, got $t1090_rc"
+  t1090_check_steps "$TMP/t1090-ac3a.err" desktop t1090-prepare probe cwd-map prepare
   grep -qF 'Connection refused' "$TMP/t1090-ac3a.err" ||
     fail "AC3 prepare: remote check stderr dropped: $(cat "$TMP/t1090-ac3a.err")"
   t1090_last="$(tail -n 1 "$TMP/t1090-ac3a.err")"
@@ -1031,11 +1051,38 @@ run_t1090_remote_err_tests() {
   t1090_rc=$?
   set -e
   [[ "$t1090_rc" -eq 1 ]] || fail "AC3 scp: scp rc must propagate, got $t1090_rc"
+  t1090_check_steps "$TMP/t1090-ac3c.err" desktop t1090-scp probe cwd-map mktemp scp
+  t1090_scp_step="$(grep -E "^wrk: remote host 'desktop' step scp elapsed=[0-9]+s$" "$TMP/t1090-ac3c.err" | tail -n 1)"
+  t1090_scp_step_line="$(grep -nF "$t1090_scp_step" "$TMP/t1090-ac3c.err" | tail -n 1 | cut -d: -f1)"
+  t1090_scp_error_line="$(grep -nF 'scp: dest open' "$TMP/t1090-ac3c.err" | head -n 1 | cut -d: -f1)"
+  [[ -n "$t1090_scp_error_line" && "$t1090_scp_step_line" -lt "$t1090_scp_error_line" ]] ||
+    fail "AC3 scp: the progress line must precede the scp error: $(cat "$TMP/t1090-ac3c.err")"
   grep -qF 'scp: dest open' "$TMP/t1090-ac3c.err" ||
     fail "AC3 scp: scp stderr missing: $(cat "$TMP/t1090-ac3c.err")"
   t1090_last="$(tail -n 1 "$TMP/t1090-ac3c.err")"
   [[ "$t1090_last" == *"rc=1"* && "$t1090_last" == *"scp"* ]] ||
     fail "AC3 scp: final line must name the scp step and rc, got: $t1090_last"
+
+  # The scp progress assertion is an assertion-RED mutant: omitting this
+  # helper call must make the expected step sequence fail.
+  T1493_M1="$TMP/t1493-wrk-no-scp-progress"
+  # shellcheck disable=SC2016 # $host is literal source text in the mutation pattern
+  sed 's/spillover_remote_step "$host" scp/:/' "$WRK" >"$T1493_M1"
+  chmod +x "$T1493_M1"
+  # shellcheck disable=SC2016 # the searched wrk source text is literal
+  grep -qF 'spillover_remote_step "$host" scp' "$T1493_M1" &&
+    fail "T2 mutant did not apply: scp progress helper call remains"
+  set +e
+  ( T1090_WRK="$T1493_M1" T1090_SCP_SCENARIO=fail t1090_spawn ) \
+    >"$TMP/t1493-m1.out" 2>"$TMP/t1493-m1.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 1 ]] ||
+    fail "T2 mutant: scp failure rc changed under the missing-progress mutant: $t1090_rc"
+  if ( t1090_check_steps "$TMP/t1493-m1.err" desktop t1493-m1 probe cwd-map mktemp scp ) >/dev/null 2>&1; then
+    fail "T2 mutant survived: the last-step assertion accepted a missing scp progress line"
+  fi
+  echo "PASS t1493 M1: missing-scp-progress mutant goes RED at the last-step assertion"
 
   # A refused probe is the failure that produced the incident's bare rc=1 line:
   # the probe reason and the remote's stderr must be named, the step is 'probe'.
@@ -1078,6 +1125,7 @@ run_t1090_remote_err_tests() {
   set +e
   ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
       T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_DELAY_SECONDS_DESKTOP=2 \
       T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
       T1090_SSH_SCENARIO_MAC_WORK=probe-herdr-missing t1090_spawn ) >"$TMP/t1090-auto2.out" 2>"$TMP/t1090-auto2.err"
   t1090_rc=$?
@@ -1094,6 +1142,18 @@ run_t1090_remote_err_tests() {
     fail "R1 auto-all-fail: mac-work skipped line missing: $(cat "$TMP/t1090-auto2.err")"
   grep -qF "remote host 'mac-work' failed (rc=1) at step 'probe'" "$TMP/t1090-auto2.err" ||
     fail "R1 auto-all-fail: mac-work summary missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -qE "^wrk: remote host 'desktop' step probe elapsed=[0-9]+s$" "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: desktop's captured progress line is missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -qE "^wrk: remote host 'mac-work' step probe elapsed=[0-9]+s$" "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: mac-work's captured progress line is missing: $(cat "$TMP/t1090-auto2.err")"
+  t1090_mac_probe_line="$(grep -E "^wrk: remote host 'mac-work' step probe elapsed=[0-9]+s$" "$TMP/t1090-auto2.err")"
+  if [[ "$t1090_mac_probe_line" =~ elapsed=([0-9]+)s$ ]]; then
+    t1090_mac_probe_elapsed="${BASH_REMATCH[1]}"
+  else
+    fail "R1 auto-all-fail: second candidate's elapsed value is malformed"
+  fi
+  [[ "$t1090_mac_probe_elapsed" -ge 2 ]] ||
+    fail "R1 auto-all-fail: second candidate did not include time spent in the first remote leg"
   grep -qF 'falling back to local' "$TMP/t1090-auto2.err" ||
     fail "R1 auto-all-fail: fallback warning missing: $(cat "$TMP/t1090-auto2.err")"
   grep -q 'host=local' "$TMP/t1090-auto2.out" ||
@@ -1139,7 +1199,7 @@ run_t1090_remote_err_tests() {
   # successful auto spawn (main streamed it live), while the skipped host's
   # diagnostics stay dropped.
   set +e
-  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+  ( T1090_REMOTE_STDERR_BINARY=1 T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
       T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
       T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
       T1090_SSH_SCENARIO_MAC_WORK=remote-warn-ok t1090_spawn ) >"$TMP/t1090-auto4.out" 2>"$TMP/t1090-auto4.err"
@@ -1150,18 +1210,19 @@ run_t1090_remote_err_tests() {
   cmp -s "$TMP/t1090-auto1.want" "$TMP/t1090-auto4.out" ||
     fail "R2 winner-stderr: stdout differs from the pinned mac-work OK line: $(cat "$TMP/t1090-auto4.out")"
   printf '%s\n' 'wrk: note: remote herdr quota nearly full on mac-work' >"$TMP/t1090-auto4.want"
+  printf 'wrk: binary warning \377\000 tail\n' >>"$TMP/t1090-auto4.want"
   cmp -s "$TMP/t1090-auto4.want" "$TMP/t1090-auto4.err" ||
-    fail "R2 winner-stderr: stderr must equal the winner's live stream: $(cat "$TMP/t1090-auto4.err")"
+    fail "R2 winner-stderr: stderr must equal the winner's live byte stream"
   echo "PASS t1090 R2 winner-stderr-replayed"
 
   # R2 mutant — invariant "a successful auto spawn keeps the winner's own
   # stderr": dropping the winner's replay must turn R2-A red.
   T1090_M4="$TMP/t1090-wrk-no-winner-replay"
   # shellcheck disable=SC2016 # the sed pattern is bin/wrk source text, not an expansion site
-  sed 's/ cat "\$cand_err" >&2/ :/' "$WRK" >"$T1090_M4"
+  sed 's/        spillover_replay_success_stderr "\$cand_err"/        :/' "$WRK" >"$T1090_M4"
   chmod +x "$T1090_M4"
   # shellcheck disable=SC2016 # the grep pattern is literal bin/wrk source text
-  grep -qF 'cat "$cand_err" >&2' "$T1090_M4" && fail 'R2 mutant did not apply: winner replay still present'
+  grep -qF 'spillover_replay_success_stderr "$cand_err"' "$T1090_M4" && fail 'R2 mutant did not apply: winner replay still present'
   set +e
   ( T1090_WRK="$T1090_M4" T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
       T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
@@ -1196,8 +1257,8 @@ run_t1090_remote_err_tests() {
   fi
   echo "PASS t1090 R1 mutant: eager-diagnostics mutant goes RED (R1-A assertion: stderr no longer empty)"
 
-  # AC4: the success path is byte-identical to main — the annotated OK line on
-  # stdout, nothing on stderr, rc 0.
+  # AC4: the success stdout remains byte-identical; explicit remote stderr has
+  # one progress line for each leg reached.
   set +e
   ( t1090_spawn ) >"$TMP/t1090-ac4.out" 2>"$TMP/t1090-ac4.err"
   t1090_rc=$?
@@ -1206,9 +1267,55 @@ run_t1090_remote_err_tests() {
   printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-luna label=fixture status=working landed=yes' >"$TMP/t1090-ac4.want"
   cmp -s "$TMP/t1090-ac4.want" "$TMP/t1090-ac4.out" ||
     fail "AC4: success stdout differs from the pinned OK line: $(cat "$TMP/t1090-ac4.out")"
-  [[ ! -s "$TMP/t1090-ac4.err" ]] ||
-    fail "AC4: success stderr must stay empty: $(cat "$TMP/t1090-ac4.err")"
-  echo "PASS t1090 AC4 success-byte-identical"
+  t1090_check_steps "$TMP/t1090-ac4.err" desktop t1090-explicit-success \
+    probe cwd-map mktemp scp "remote wrk"
+  echo "PASS t1090 AC4 explicit-success-progress-and-stdout-byte-identical"
+
+  # A derived cwd mapping uses the prepare leg between cwd-map and mktemp.
+  T1090_FAKE_REMOTE="$TMP/t1090-fake-remote"
+  mkdir -p "$T1090_FAKE_REMOTE/remote/lrepo.wt"
+  set +e
+  ( T1090_HOSTS_OVERRIDE="$T1090_HOSTS_SUFFIX" T1090_CWD="${T1090_SUFFIX_ROOT}.wt" \
+    WRK_FAKE_REMOTE="$T1090_FAKE_REMOTE" t1090_spawn ) \
+    >"$TMP/t1090-prepare-success.out" 2>"$TMP/t1090-prepare-success.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "AC4 derived cwd success: prepare should pass, got rc=$t1090_rc: $(cat "$TMP/t1090-prepare-success.err")"
+  t1090_check_steps "$TMP/t1090-prepare-success.err" desktop t1090-derived-success \
+    probe cwd-map prepare mktemp scp "remote wrk"
+  echo "PASS t1090 AC4 derived-cwd-prepare-progress"
+
+  # t1090_spawn execs env so this test's PID is the wrk process itself. Cut it
+  # off while the delegated remote wrk is sleeping; stderr must end at the
+  # last reached step and wait must report SIGTERM for that exact PID.
+  ( T1090_SSH_SCENARIO=remote-sleep T1090_REMOTE_SLEEP_SECONDS=5 t1090_spawn ) \
+    >"$TMP/t1090-cutoff.out" 2>"$TMP/t1090-cutoff.err" &
+  t1090_cutoff_pid=$!
+  t1090_cutoff_seen=0
+  for ((t1090_wait = 0; t1090_wait < 100; t1090_wait++)); do
+    if grep -qE "^wrk: remote host 'desktop' step remote wrk elapsed=[0-9]+s$" "$TMP/t1090-cutoff.err"; then
+      t1090_cutoff_seen=1
+      break
+    fi
+    sleep 0.02
+  done
+  if [[ "$t1090_cutoff_seen" -ne 1 ]]; then
+    kill -TERM "$t1090_cutoff_pid" 2>/dev/null || true
+    wait "$t1090_cutoff_pid" 2>/dev/null || true
+    fail "T3 cutoff: remote wrk progress line did not arrive: $(cat "$TMP/t1090-cutoff.err")"
+  fi
+  kill -TERM "$t1090_cutoff_pid"
+  set +e
+  wait "$t1090_cutoff_pid"
+  t1090_cutoff_rc=$?
+  set -e
+  [[ "$t1090_cutoff_rc" -eq 143 ]] ||
+    fail "T3 cutoff: expected the started wrk PID to exit on SIGTERM (rc=143), got $t1090_cutoff_rc"
+  t1090_cutoff_last="$(tail -n 1 "$TMP/t1090-cutoff.err")"
+  printf '%s\n' "$t1090_cutoff_last" | grep -Eq "^wrk: remote host 'desktop' step remote wrk elapsed=[0-9]+s$" ||
+    fail "T3 cutoff: stderr must end at remote wrk after signal (rc=$t1090_cutoff_rc): $(cat "$TMP/t1090-cutoff.err")"
+  echo "PASS t1090 T3 cutoff-ends-at-remote-wrk"
 
   # AC5 invariants as assertion-RED mutants.
   # M1 'a remote failure is never silent': dropping the stderr relay and the
@@ -1661,8 +1768,8 @@ run_t1155_local_spawn_off_tests() {
   cmp -s "$TMP/t1155-ac5a-absent.err.norm" "$TMP/t1155-ac5a-on.err.norm" ||
     fail "1155 AC5: absent-key and spawn=true local stderr differ"
 
-  # AC5b: the auto all-fail local fallback is byte-identical too — same
-  # per-candidate lines, the same fallback warning, a local landing.
+  # AC5b: the auto all-fail local fallback is equivalent too — same
+  # per-candidate diagnostics, the same fallback warning, a local landing.
   for variant in absent on; do
     cfg="$T1155_HOSTS_ABSENT"; [[ "$variant" == on ]] && cfg="$T1155_HOSTS_ON"
     rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
@@ -1683,17 +1790,19 @@ run_t1155_local_spawn_off_tests() {
     grep -q 'tab create' "$TMP/t1155-herdr.log" ||
       fail "1155 AC5 $variant-fallback: the local fallback never created a pane"
   done
-  # The two runs differ only in the minted job id; everything else must be
-  # byte-identical between the absent key and an explicit true.
+  # The two runs differ in the minted job id and elapsed seconds; everything
+  # else must match between the absent key and an explicit true.
   sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-absent.out" >"$TMP/t1155-ac5b-absent.out.norm"
   sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-on.out" >"$TMP/t1155-ac5b-on.out.norm"
   cmp -s "$TMP/t1155-ac5b-absent.out.norm" "$TMP/t1155-ac5b-on.out.norm" ||
     fail "1155 AC5: absent-key and spawn=true fallback stdout differ"
-  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-absent.err" >"$TMP/t1155-ac5b-absent.err.norm"
-  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-on.err" >"$TMP/t1155-ac5b-on.err.norm"
+  sed -e 's/job=[^ ]*/job=J/' -e 's/elapsed=[0-9]*s/elapsed=Ns/' \
+    "$TMP/t1155-ac5b-absent.err" >"$TMP/t1155-ac5b-absent.err.norm"
+  sed -e 's/job=[^ ]*/job=J/' -e 's/elapsed=[0-9]*s/elapsed=Ns/' \
+    "$TMP/t1155-ac5b-on.err" >"$TMP/t1155-ac5b-on.err.norm"
   cmp -s "$TMP/t1155-ac5b-absent.err.norm" "$TMP/t1155-ac5b-on.err.norm" ||
     fail "1155 AC5: absent-key and spawn=true fallback stderr differ"
-  echo "PASS t1155 AC5 absent-and-true-byte-identical"
+  echo "PASS t1155 AC5 absent-and-true-equivalent"
 
   # AC5c: any other value is a config error — bare or quoted, a non-boolean
   # refuses rc 70 naming the key. Quoted "true"/"false" are strings, not the
@@ -2708,6 +2817,8 @@ run_t1239_desktop_wake_tests() {
     fail "1239 AC1: the wake path must not arm the hub quota gate: $(cat "$TMP/t1239-ac1.err")"
   grep -qF "wrk: waking remote host 'desktop'" "$TMP/t1239-ac1.err" ||
     fail "1239 AC1: the wake action line is missing: $(cat "$TMP/t1239-ac1.err")"
+  ! grep -qE "^wrk: remote host '[^']+' step " "$TMP/t1239-ac1.err" ||
+    fail "1239 AC1: successful wake placement leaked captured remote progress lines"
   echo "PASS t1239 AC1 deferred-wake-lands-desktop"
 
   # AC2 (director-1's case): same pressure picture, the node never connects
@@ -4912,6 +5023,8 @@ PY
   t1397_remote_spawn b1397-remote
   [[ "$T1397_RC" -eq 0 ]] ||
     fail "#1397 AC2a: remote builder spawn failed (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -qE "^wrk: remote host 'desktop' step lane elapsed=[0-9]+s$" "$T1397_ERR" ||
+    fail "#1397 AC2a: initiator-side builder lane registration progress line is missing: $(cat "$T1397_ERR")"
   grep -q -- '--lane-defer desktop' "$T1397_SSH" ||
     fail "#1397 AC2a: the delegated spawn must carry --lane-defer desktop: $(cat "$T1397_SSH")"
   grep -q -- '--host local' "$T1397_SSH" ||
