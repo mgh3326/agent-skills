@@ -1518,8 +1518,8 @@ run_t1155_local_spawn_off_tests() {
   cmp -s "$TMP/t1155-ac5a-absent.err.norm" "$TMP/t1155-ac5a-on.err.norm" ||
     fail "1155 AC5: absent-key and spawn=true local stderr differ"
 
-  # AC5b: the auto all-fail local fallback is byte-identical too — same
-  # per-candidate lines, the same fallback warning, a local landing.
+  # AC5b: the auto all-fail local fallback is equivalent too — same
+  # per-candidate diagnostics, the same fallback warning, a local landing.
   for variant in absent on; do
     cfg="$T1155_HOSTS_ABSENT"; [[ "$variant" == on ]] && cfg="$T1155_HOSTS_ON"
     rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
@@ -1540,17 +1540,19 @@ run_t1155_local_spawn_off_tests() {
     grep -q 'tab create' "$TMP/t1155-herdr.log" ||
       fail "1155 AC5 $variant-fallback: the local fallback never created a pane"
   done
-  # The two runs differ only in the minted job id; everything else must be
-  # byte-identical between the absent key and an explicit true.
+  # The two runs differ in the minted job id and elapsed seconds; everything
+  # else must match between the absent key and an explicit true.
   sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-absent.out" >"$TMP/t1155-ac5b-absent.out.norm"
   sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-on.out" >"$TMP/t1155-ac5b-on.out.norm"
   cmp -s "$TMP/t1155-ac5b-absent.out.norm" "$TMP/t1155-ac5b-on.out.norm" ||
     fail "1155 AC5: absent-key and spawn=true fallback stdout differ"
-  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-absent.err" >"$TMP/t1155-ac5b-absent.err.norm"
-  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-on.err" >"$TMP/t1155-ac5b-on.err.norm"
+  sed -e 's/job=[^ ]*/job=J/' -e 's/elapsed=[0-9]*s/elapsed=Ns/' \
+    "$TMP/t1155-ac5b-absent.err" >"$TMP/t1155-ac5b-absent.err.norm"
+  sed -e 's/job=[^ ]*/job=J/' -e 's/elapsed=[0-9]*s/elapsed=Ns/' \
+    "$TMP/t1155-ac5b-on.err" >"$TMP/t1155-ac5b-on.err.norm"
   cmp -s "$TMP/t1155-ac5b-absent.err.norm" "$TMP/t1155-ac5b-on.err.norm" ||
     fail "1155 AC5: absent-key and spawn=true fallback stderr differ"
-  echo "PASS t1155 AC5 absent-and-true-byte-identical"
+  echo "PASS t1155 AC5 absent-and-true-equivalent"
 
   # AC5c: any other value is a config error — bare or quoted, a non-boolean
   # refuses rc 70 naming the key. Quoted "true"/"false" are strings, not the
