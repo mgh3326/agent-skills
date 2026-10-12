@@ -23,6 +23,10 @@ if [[ -n "$host" ]]; then
   scenario_var="WRK_SSH_SCENARIO_${host_key}"
   [[ -z "${!scenario_var:-}" ]] || scenario="${!scenario_var}"
 fi
+if [[ "$remote" == *'uptime; herdr agent list'* && "$host" == desktop &&
+      -n "${WRK_SSH_DELAY_SECONDS_DESKTOP:-}" ]]; then
+  sleep "$WRK_SSH_DELAY_SECONDS_DESKTOP"
+fi
 # #1239: a sleeping desktop refuses EVERY leg — probe, mktemp, scp'd spawn —
 # until the panewire burst-request fixture creates the flag file named by
 # WRK_DESKTOP_AWAKE, which is what "the node connected" means in the fake.
@@ -136,6 +140,9 @@ if [[ "$remote" == *'wrk spawn'* ]]; then
       # A winning remote wrk may still talk on stderr (quota notes, warnings);
       # on main that text streamed live even when the spawn succeeded.
       printf '%s\n' "wrk: note: remote herdr quota nearly full on $host" >&2
+      if [[ "${WRK_REMOTE_STDERR_BINARY:-0}" == 1 ]]; then
+        printf 'wrk: binary warning \377\000 tail\n' >&2
+      fi
       ;;
   esac
 fi

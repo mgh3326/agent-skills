@@ -6943,7 +6943,7 @@ spillover_remote_step() {
 # from the winning remote wrk (for example a quota warning) still passes.
 spillover_replay_success_stderr() {
   local err_file="$1"
-  grep -vE "^wrk: remote host '[^']+' step (probe|cwd-map|prepare|mktemp|scp|remote wrk|lane) elapsed=[0-9]+s$" "$err_file" >&2 || true
+  grep -avE "^wrk: remote host '[^']+' step (probe|cwd-map|prepare|mktemp|scp|remote wrk|lane) elapsed=[0-9]+s$" "$err_file" >&2 || true
 }
 
 # Creates the derived remote worktree on the selected host.  Local-only
@@ -7634,7 +7634,7 @@ spawn_router_cmd() {
       if [[ -n "$auto_diag" ]]; then
         cand_err="$(mktemp)"
         if ( spillover_try_candidate 1 "$wake_target" "$cwd" "$prompt" "${filtered[@]}" ) 2>"$cand_err"; then
-          cat "$cand_err" >&2
+          spillover_replay_success_stderr "$cand_err"
           rm -f "$cand_err" "$auto_diag"
           return 0
         else

@@ -712,8 +712,8 @@ run_t1090_remote_err_tests() {
     '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
     "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 2' >"$T1090_HOSTS_AUTO"
 
-  t1090_spawn() {  # env knobs per call: T1090_{SSH,SCP}_SCENARIO{,_DESKTOP,_MAC_WORK}, T1090_{HOSTS_OVERRIDE,CWD,WRK,HOST_ARG,LOAD_FILE}
-    env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  t1090_spawn() {  # env knobs per call include T1090_{SSH,SCP}_SCENARIO*, delay, host, cwd, and fixture controls
+    exec env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
       ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$T1090_INBOX" XDG_DATA_HOME="$T1090_XDG" \
       WRK_HOSTS_CONFIG="${T1090_HOSTS_OVERRIDE:-$T1090_HOSTS}" \
       WRK_PROC_LOADAVG="${T1090_LOAD_FILE:-$T1090_LOAD}" \
@@ -724,12 +724,15 @@ run_t1090_remote_err_tests() {
       WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
       WRK_SCP_BIN="${T1090_SCP:-$ROOT/tests/fixtures/spillover-scp}" \
       WRK_SSH_LOG="$TMP/t1090-ssh.log" WRK_SCP_LOG="$TMP/t1090-scp.log" \
+      WRK_SSH_DELAY_SECONDS_DESKTOP="${T1090_SSH_DELAY_SECONDS_DESKTOP:-}" \
       WRK_SSH_SCENARIO="${T1090_SSH_SCENARIO:-ok}" \
       WRK_SSH_SCENARIO_DESKTOP="${T1090_SSH_SCENARIO_DESKTOP:-}" \
       WRK_SSH_SCENARIO_MAC_WORK="${T1090_SSH_SCENARIO_MAC_WORK:-}" \
       WRK_SCP_SCENARIO="${T1090_SCP_SCENARIO:-ok}" \
       WRK_SCP_SCENARIO_DESKTOP="${T1090_SCP_SCENARIO_DESKTOP:-}" \
       WRK_REMOTE_RC="${T1090_REMOTE_RC:-}" \
+      WRK_REMOTE_SLEEP_SECONDS="${T1090_REMOTE_SLEEP_SECONDS:-1}" \
+      WRK_REMOTE_STDERR_BINARY="${T1090_REMOTE_STDERR_BINARY:-0}" \
       WRK_REMOTE_STDERR_LINE="${T1090_REMOTE_STDERR_LINE:-}" \
       WRK_REMOTE_STDOUT_LINE="${T1090_REMOTE_STDOUT_LINE:-}" \
       "${T1090_WRK:-$WRK}" spawn -c "${T1090_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
@@ -888,6 +891,7 @@ run_t1090_remote_err_tests() {
   set +e
   ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
       T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_DELAY_SECONDS_DESKTOP=2 \
       T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
       T1090_SSH_SCENARIO_MAC_WORK=probe-herdr-missing t1090_spawn ) >"$TMP/t1090-auto2.out" 2>"$TMP/t1090-auto2.err"
   t1090_rc=$?
@@ -908,6 +912,14 @@ run_t1090_remote_err_tests() {
     fail "R1 auto-all-fail: desktop's captured progress line is missing: $(cat "$TMP/t1090-auto2.err")"
   grep -qE "^wrk: remote host 'mac-work' step probe elapsed=[0-9]+s$" "$TMP/t1090-auto2.err" ||
     fail "R1 auto-all-fail: mac-work's captured progress line is missing: $(cat "$TMP/t1090-auto2.err")"
+  t1090_mac_probe_line="$(grep -E "^wrk: remote host 'mac-work' step probe elapsed=[0-9]+s$" "$TMP/t1090-auto2.err")"
+  if [[ "$t1090_mac_probe_line" =~ elapsed=([0-9]+)s$ ]]; then
+    t1090_mac_probe_elapsed="${BASH_REMATCH[1]}"
+  else
+    fail "R1 auto-all-fail: second candidate's elapsed value is malformed"
+  fi
+  [[ "$t1090_mac_probe_elapsed" -ge 2 ]] ||
+    fail "R1 auto-all-fail: second candidate did not include time spent in the first remote leg"
   grep -qF 'falling back to local' "$TMP/t1090-auto2.err" ||
     fail "R1 auto-all-fail: fallback warning missing: $(cat "$TMP/t1090-auto2.err")"
   grep -q 'host=local' "$TMP/t1090-auto2.out" ||
@@ -953,7 +965,7 @@ run_t1090_remote_err_tests() {
   # successful auto spawn (main streamed it live), while the skipped host's
   # diagnostics stay dropped.
   set +e
-  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+  ( T1090_REMOTE_STDERR_BINARY=1 T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
       T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
       T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
       T1090_SSH_SCENARIO_MAC_WORK=remote-warn-ok t1090_spawn ) >"$TMP/t1090-auto4.out" 2>"$TMP/t1090-auto4.err"
@@ -964,8 +976,9 @@ run_t1090_remote_err_tests() {
   cmp -s "$TMP/t1090-auto1.want" "$TMP/t1090-auto4.out" ||
     fail "R2 winner-stderr: stdout differs from the pinned mac-work OK line: $(cat "$TMP/t1090-auto4.out")"
   printf '%s\n' 'wrk: note: remote herdr quota nearly full on mac-work' >"$TMP/t1090-auto4.want"
+  printf 'wrk: binary warning \377\000 tail\n' >>"$TMP/t1090-auto4.want"
   cmp -s "$TMP/t1090-auto4.want" "$TMP/t1090-auto4.err" ||
-    fail "R2 winner-stderr: stderr must equal the winner's live stream: $(cat "$TMP/t1090-auto4.err")"
+    fail "R2 winner-stderr: stderr must equal the winner's live byte stream"
   echo "PASS t1090 R2 winner-stderr-replayed"
 
   # R2 mutant — invariant "a successful auto spawn keeps the winner's own
@@ -1039,9 +1052,10 @@ run_t1090_remote_err_tests() {
     probe cwd-map prepare mktemp scp "remote wrk"
   echo "PASS t1090 AC4 derived-cwd-prepare-progress"
 
-  # Cut off only the process started by this test while its delegated remote
-  # wrk is sleeping. The captured stderr must end at the last reached step.
-  ( T1090_SSH_SCENARIO=remote-sleep t1090_spawn ) \
+  # t1090_spawn execs env so this test's PID is the wrk process itself. Cut it
+  # off while the delegated remote wrk is sleeping; stderr must end at the
+  # last reached step and wait must report SIGTERM for that exact PID.
+  ( T1090_SSH_SCENARIO=remote-sleep T1090_REMOTE_SLEEP_SECONDS=5 t1090_spawn ) \
     >"$TMP/t1090-cutoff.out" 2>"$TMP/t1090-cutoff.err" &
   t1090_cutoff_pid=$!
   t1090_cutoff_seen=0
@@ -1062,6 +1076,8 @@ run_t1090_remote_err_tests() {
   wait "$t1090_cutoff_pid"
   t1090_cutoff_rc=$?
   set -e
+  [[ "$t1090_cutoff_rc" -eq 143 ]] ||
+    fail "T3 cutoff: expected the started wrk PID to exit on SIGTERM (rc=143), got $t1090_cutoff_rc"
   t1090_cutoff_last="$(tail -n 1 "$TMP/t1090-cutoff.err")"
   printf '%s\n' "$t1090_cutoff_last" | grep -Eq "^wrk: remote host 'desktop' step remote wrk elapsed=[0-9]+s$" ||
     fail "T3 cutoff: stderr must end at remote wrk after signal (rc=$t1090_cutoff_rc): $(cat "$TMP/t1090-cutoff.err")"
@@ -2567,6 +2583,8 @@ run_t1239_desktop_wake_tests() {
     fail "1239 AC1: the wake path must not arm the hub quota gate: $(cat "$TMP/t1239-ac1.err")"
   grep -qF "wrk: waking remote host 'desktop'" "$TMP/t1239-ac1.err" ||
     fail "1239 AC1: the wake action line is missing: $(cat "$TMP/t1239-ac1.err")"
+  ! grep -qE "^wrk: remote host '[^']+' step " "$TMP/t1239-ac1.err" ||
+    fail "1239 AC1: successful wake placement leaked captured remote progress lines"
   echo "PASS t1239 AC1 deferred-wake-lands-desktop"
 
   # AC2 (director-1's case): same pressure picture, the node never connects
