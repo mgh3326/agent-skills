@@ -399,7 +399,7 @@ pass "ROB-1326 C3: job-get is JSON read-only and has a dedicated not-found exit"
 # event --payload-json carries a structured spawn receipt without a schema
 # migration.  job-get surfaces its pane_id and the durable event timestamp.
 expect_rc 0 event --job receipt-query --kind job.spawned \
-  --payload-json '{"pane_id":"w:p99","label":"receipt-agent","profile":"codex-terra","workspace":"fixture"}'
+  --payload-json '{"pane_id":"w:p99","label":"receipt-agent","profile":"codex-luna","workspace":"fixture"}'
 run job-get --job receipt-query --json
 [[ "$RC" -eq 0 ]] || fail "job-get failed after recording receipt: $ERR"
 pycheck "$OUT" <<'PY' || fail "job-get did not expose the spawn receipt"
@@ -409,7 +409,7 @@ r = d["receipt"]
 assert r["pane_id"] == "w:p99", d
 assert r["spawned_at"], d
 assert r["label"] == "receipt-agent", d
-assert r["profile"] == "codex-terra", d
+assert r["profile"] == "codex-luna", d
 assert r["workspace"] == "fixture", d
 assert d["recent_event_kinds"][-1] == "job.spawned", d
 PY

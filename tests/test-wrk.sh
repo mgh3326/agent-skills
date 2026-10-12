@@ -89,6 +89,10 @@ printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 # exercising the installation-transition path; the arbiter section below opts in.
 export ARBITER_BIN="$TMP/absent-arbiter"
 export XDG_DATA_HOME="$TMP/xdg"
+export XDG_CACHE_HOME="$TMP/xdg-cache"
+export XDG_CONFIG_HOME="$TMP/xdg-config"
+export XDG_STATE_HOME="$TMP/xdg-state"
+mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 # #951: claude-kind spawns seed folder trust into ${CLAUDE_CONFIG_DIR:-$HOME}/
 # .claude.json — the operator's real config must never be touched by a fixture
 # spawn, so suite HOME is a fixture and ambient CLAUDE_CONFIG_DIR is unset (it
@@ -249,6 +253,236 @@ spawn_base() {
     -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
 }
 
+run_terra_refusal_tests() {
+# ROB-1190 ④-2: wrk profiles — 기계 판독 가능한 프로필 목록. oc-omni 가 포함돼야 한다
+# (드리프트 방지: scopefuel 이 추천하는데 wrk 가 못 띄우는 상태 방지).
+profiles_out="$("$WRK" profiles)"
+grep -qx 'oc-omni' <<<"$profiles_out"
+grep -qx 'oc-solar4' <<<"$profiles_out"
+grep -qx 'kimi-k3' <<<"$profiles_out"
+grep -qx 'kimi-k27' <<<"$profiles_out"
+grep -qx 'kimi-k27-code' <<<"$profiles_out"
+grep -qx 'kimi-k3-low' <<<"$profiles_out"
+grep -qx 'codex-luna-max' <<<"$profiles_out"
+for barred_profile in codex-terra codex-terra-max codex-med \
+  builder-terra-high builder-terra-xhigh builder-terra-max; do
+  if grep -qx "$barred_profile" <<<"$profiles_out"; then
+    fail "wrk profiles must omit barred profile $barred_profile"
+  fi
+done
+profiles_help_out="$($WRK profiles --help)"
+grep -q 'operator 2026-10-12 noterra' <<<"$profiles_help_out" ||
+  fail "wrk profiles --help must name the Terra refusal decision"
+grep -qx 'builder-opus' <<<"$profiles_out"
+grep -qx 'builder-sol' <<<"$profiles_out"
+grep -qx 'builder-devin' <<<"$profiles_out"
+grep -qx 'builder-devin-medium' <<<"$profiles_out"
+grep -qx 'builder-devin-max' <<<"$profiles_out"
+grep -qx 'builder-ds41' <<<"$profiles_out"
+grep -qx 'builder-ds41-max' <<<"$profiles_out"
+grep -qx 'builder-grok' <<<"$profiles_out"
+grep -qx 'builder-kimi' <<<"$profiles_out"
+grep -qx 'builder-luna' <<<"$profiles_out"
+grep -qx 'builder-sonnet' <<<"$profiles_out" ||
+  fail "wrk profiles lost builder-sonnet (#921)"
+# #704 (#594 E6) + #737 (decision 4088): the per-rung builder spellings.
+for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
+  builder-sol-high builder-sol-max builder-sol-medium builder-luna-max \
+  builder-kimi-high builder-kimi-max \
+  builder-grok-low builder-grok-medium builder-grok-xhigh; do
+  grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
+done
+grep -qx 'captain-opus' <<<"$profiles_out"
+grep -qx 'captain-sol' <<<"$profiles_out"
+grep -qx 'codex-astra' <<<"$profiles_out"
+# ROB-591 rollback spellings (gpt-5.6-sol/gpt-5.6-luna) must remain spawnable.
+grep -qx 'codex-sol56' <<<"$profiles_out"
+grep -qx 'codex-luna56' <<<"$profiles_out"
+# #1026 rollback spellings (gpt-6-sol) join the same list.
+grep -qx 'codex-sol6' <<<"$profiles_out"
+grep -qx 'builder-sol6' <<<"$profiles_out"
+# task #526: the astra builder spellings were removed — astra is counsel-only
+# (hk:doc decision/2026-09-21/astra-allowed-purposes-approved).
+if grep -qx 'builder-astra' <<<"$profiles_out"; then exit 1; fi
+if grep -qx 'captain-astra' <<<"$profiles_out"; then exit 1; fi
+[[ "$(grep -xc 'devin-swe2' <<<"$profiles_out")" -eq 1 ]]
+grep -qx 'devin-glm52' <<<"$profiles_out"
+grep -qx 'devin-swe17' <<<"$profiles_out"
+grep -qx 'devin-ds41' <<<"$profiles_out"
+# #635: the devin effort rungs are named profiles (effort sits inside the
+# devin model id — no --effort flag exists). The scopefuel catalog lists all
+# three, so the wrk⊇scopefuel cross-check needs them here.
+grep -qx 'devin-swe2-medium' <<<"$profiles_out"
+grep -qx 'devin-swe2-max' <<<"$profiles_out"
+grep -qx 'devin-ds41-max' <<<"$profiles_out"
+# hk 1380: the paid fusion spellings (operator decision 2026-10-10) must be
+# spawnable profiles — worker/tester-only, no builder-* variants.
+grep -qx 'devin-fusion-opus55' <<<"$profiles_out"
+grep -qx 'devin-fusion-sonnet55' <<<"$profiles_out"
+if grep -qx 'builder-fusion-opus55' <<<"$profiles_out"; then exit 1; fi
+if grep -qx 'builder-fusion-sonnet55' <<<"$profiles_out"; then exit 1; fi
+if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
+if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
+
+# T-A1/T-A2: every Terra spelling refuses before quota, arbiter, task claim,
+# worktree, pane, or hub work. Only fixture agent binaries are reachable here.
+TERRA_PROBE_SEQ=0
+terra_refusal_probe() {
+  local executable="$1" profile="$2" role_path="$3" case_name="$4"
+  local profile_flag="${5:--m}"
+  local root="$TMP/noterra/$case_name" home data cache config state inbox
+  local out err herdr_log scopefuel_log panewire_log db before_tree after_tree before_hk after_hk task_id job rc=0
+  TERRA_PROBE_SEQ=$((TERRA_PROBE_SEQ + 1))
+  mkdir -p "$root"; home="$root/home"; data="$root/data"; cache="$root/cache"
+  config="$root/config"; state="$root/state"; inbox="$root/inbox/jobs"
+  mkdir -p "$home" "$data" "$cache" "$config" "$state" "$inbox"
+  out="$root/out"; err="$root/err"; herdr_log="$root/herdr.log"
+  scopefuel_log="$root/scopefuel.log"; panewire_log="$root/panewire.log"
+  : >"$herdr_log"; : >"$scopefuel_log"; : >"$panewire_log"
+  before_tree="$(git -C "$ROOT" worktree list --porcelain | sha256sum | awk '{print $1}')"
+  before_hk="$(sha256sum "$HK_STATE" | awk '{print $1}')"
+  task_id="$(mint_task)"; job="noterra-$case_name"
+  local args=(spawn -c "$ROOT" "$profile_flag" "$profile" -p "$PROMPT" -w w -l "nr-$TERRA_PROBE_SEQ" --t T1 --job "$job")
+  case "$role_path" in
+    worker) args+=(--role worker --task "$task_id") ;;
+    builder) args+=(--role builder --lane "nr-lane-$TERRA_PROBE_SEQ" --parent parent-lane --task "$task_id") ;;
+    tester) args+=(--parent-job "$HK_TASK_ID") ;;
+    *) return 1 ;;
+  esac
+  set +e
+  env HOME="$home" XDG_DATA_HOME="$data" XDG_CACHE_HOME="$cache" \
+    XDG_CONFIG_HOME="$config" XDG_STATE_HOME="$state" \
+    HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$inbox" HANDOFFKEEP_BIN="$HANDOFFKEEP_BIN" HK_STATE="$HK_STATE" \
+    PANEWIRE_BIN="$PANEWIRE" WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$herdr_log" \
+    WRK_SCOPEFUEL_LOG="$scopefuel_log" WRK_PANEWIRE_LOG="$panewire_log" \
+    "$executable" "${args[@]}" >"$out" 2>"$err"
+  rc=$?
+  set -e
+  [[ "$rc" -ne 0 ]] || { echo "T-A1 $profile/$role_path unexpectedly spawned" >&2; return 1; }
+  db="$data/arbiter/state.db"
+  python3 - "$db" <<'PY' || { echo "T-A1 arbiter gained a job or quota record" >&2; return 1; }
+import pathlib, sqlite3, sys
+path = pathlib.Path(sys.argv[1])
+if path.exists():
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 0
+        assert con.execute("SELECT COUNT(*) FROM quota_pool_records").fetchone()[0] == 0
+    finally:
+        con.close()
+PY
+  [[ ! -s "$herdr_log" && ! -s "$scopefuel_log" && ! -s "$panewire_log" ]] || { echo "T-A1 fixture was called for $profile/$role_path" >&2; return 1; }
+  [[ "$(wc -l <"$err" | tr -d ' ')" == 1 ]] || { echo "T-A1 expected one stderr line for $profile/$role_path: $(<"$err")" >&2; return 1; }
+  grep -q "profile $profile refused: gpt-5.6-terra is barred" "$err" || { echo "T-A1 missing named refusal: $(<"$err")" >&2; return 1; }
+  grep -q 'operator 2026-10-12 noterra; use codex-sol or codex-luna' "$err" || { echo "T-A1 missing decision/replacements: $(<"$err")" >&2; return 1; }
+  [[ -z "$(find "$inbox" -type f -print -quit)" ]] || { echo "T-A1 inbox changed for $profile/$role_path" >&2; return 1; }
+  after_tree="$(git -C "$ROOT" worktree list --porcelain | sha256sum | awk '{print $1}')"
+  [[ "$before_tree" == "$after_tree" ]] || { echo "T-A1 worktree set changed for $profile/$role_path" >&2; return 1; }
+  after_hk="$(sha256sum "$HK_STATE" | awk '{print $1}')"
+  [[ "$before_hk" == "$after_hk" ]] || { echo "T-A1 task store changed for $profile/$role_path" >&2; return 1; }
+}
+
+for barred_profile in codex-terra codex-terra-max codex-med \
+  builder-terra-high builder-terra-xhigh builder-terra-max; do
+  for refusal_path in worker builder tester; do
+    terra_refusal_probe "$WRK" "$barred_profile" "$refusal_path" \
+      "known-${barred_profile}-${refusal_path}" || fail "T-A1 refused $barred_profile/$refusal_path with no side effects"
+  done
+  terra_refusal_probe "$WRK" "$barred_profile" tester \
+    "profile-option-${barred_profile}" --profile ||
+    fail "T-A1 --profile refused $barred_profile tester path with no side effects"
+done
+echo "PASS T-A1: all six Terra spellings refuse worker/builder/tester paths via -m and tester --profile before side effects"
+SCOPEFUEL_E6_ARM=codex-terra@high terra_refusal_probe "$WRK" codex-terra worker e6-arm-codex ||
+  fail "T-A2 codex-terra@high arm must be refused before side effects"
+SCOPEFUEL_E6_ARM=codex-terra@high terra_refusal_probe "$WRK" builder-terra-high builder e6-arm-builder ||
+  fail "T-A2 builder-terra-high arm must be refused before side effects"
+echo "PASS T-A2: Terra E6 markers cannot reach gate or spawn"
+
+# T-A1 model-id guard pin: inject an unlisted alias into a throwaway wrk copy.
+make_future_terra_wrk() {
+  local output="$1" move_after_claim="${2:-0}"
+  python3 - "$WRK" "$output" "$move_after_claim" <<'PY'
+from pathlib import Path
+import sys
+src = Path(sys.argv[1]).read_text()
+dst = Path(sys.argv[2])
+dst.parent.mkdir(parents=True, exist_ok=True)
+replacements = (
+    ("codex-terra|codex-med) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;",
+     "codex-terra|codex-med|future-terra-alias) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;") ,
+    ("codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;",
+     "codex-terra|codex-med|future-terra-alias) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;"),
+    ("codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;",
+     "codex-terra|codex-med|codex-terra-max|future-terra-alias) GATE_PROFILE=codex-terra-max ;;"),
+)
+for old, new in replacements:
+    if src.count(old) != 1:
+        raise SystemExit(f"expected one resolver clause: {old}")
+    src = src.replace(old, new, 1)
+if sys.argv[3] == "1":
+    guard = '  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"\n'
+    claim = '  arbiter_admit\n'
+    if src.count(guard) != 1 or src.count(claim) != 1:
+        raise SystemExit("resolved guard or arbiter admission call is not unique")
+    src = src.replace(guard, "", 1).replace(claim, claim + guard, 1)
+dst.write_text(src)
+dst.chmod(0o755)
+PY
+}
+FUTURE_TERRA_WRK="$TMP/noterra/future-terra-wrk"
+make_future_terra_wrk "$FUTURE_TERRA_WRK"
+terra_refusal_probe "$FUTURE_TERRA_WRK" future-terra-alias worker model-id-alias ||
+  fail "T-A1 model-id guard must refuse a future alias that resolves to Terra"
+echo "PASS T-A1 model-id pin: unlisted Terra-resolving alias is refused"
+
+# Named mutants: dropping the model-id check, or moving it beyond arbiter
+# admission, makes the alias refusal assertion red. Only fixtures are reachable.
+M1_FUTURE_TERRA_WRK="$TMP/noterra/m1-no-model-check-wrk"
+python3 - "$FUTURE_TERRA_WRK" "$M1_FUTURE_TERRA_WRK" <<'PY'
+from pathlib import Path
+import sys
+src = Path(sys.argv[1]).read_text()
+guard = '  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"\n'
+if src.count(guard) != 1:
+    raise SystemExit("m1 target guard is not unique")
+Path(sys.argv[2]).write_text(src.replace(guard, "", 1))
+Path(sys.argv[2]).chmod(0o755)
+PY
+if terra_refusal_probe "$M1_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m1; then
+  m1_red_rc=0
+else
+  m1_red_rc=$?
+fi
+[[ "$m1_red_rc" -ne 0 ]] || fail "m1 mutant survived the resolved-model refusal pin"
+echo "PASS mutant m1: resolved-model refusal assertion goes RED (rc=$m1_red_rc)"
+
+M2_FUTURE_TERRA_WRK="$TMP/noterra/m2-post-claim-wrk"
+make_future_terra_wrk "$M2_FUTURE_TERRA_WRK" 1
+if terra_refusal_probe "$M2_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m2; then
+  m2_red_rc=0
+else
+  m2_red_rc=$?
+fi
+[[ "$m2_red_rc" -ne 0 ]] || fail "m2 mutant survived the no-side-effect refusal pin"
+echo "PASS mutant m2: no-side-effect assertion goes RED (rc=$m2_red_rc)"
+
+# T-A3: permitted Sol and Luna profiles still traverse this fixture-backed path.
+for allowed_codex in codex-sol codex-luna; do
+  allowed_out="$(spawn_base "$allowed_codex" --job "noterra-allowed-$allowed_codex" --t T1 2>&1)" ||
+    fail "T-A3 $allowed_codex was blocked by the Terra refusal: $allowed_out"
+  grep -q "model=$allowed_codex" <<<"$allowed_out" || fail "T-A3 missing $allowed_codex launch: $allowed_out"
+done
+echo "PASS T-A3: codex-sol and codex-luna remain spawnable"
+}
+
+if [[ "${WRK_TEST_ONLY_TERRA:-0}" -eq 1 ]]; then
+  run_terra_refusal_tests
+  exit 0
+fi
+
 # -- #912 devin trusted-workspaces helpers -----------------------------------
 # wrk registers the resolved spawn cwd — and only it — in devin's trusted
 # store ($XDG_DATA_HOME/devin/cli/trusted_workspaces.json) before any pane
@@ -372,7 +606,7 @@ hub_quota_run_case() {
     WRK_SPILLOVER_LOG="$HUB_QUOTA_SPILLOVER_LOG" \
     WRK_PANEWIRE_LOG="$HUB_QUOTA_PANEWIRE_LOG" WRK_PANEWIRE_RC="$hub_rc" \
     WRK_GATE_MODE="$gate_mode" \
-    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 --host local \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1 --host local \
     >"$HUB_QUOTA_OUT" 2>"$HUB_QUOTA_ERR"
   HUB_QUOTA_RC=$?
   set -e
@@ -712,8 +946,8 @@ run_t1090_remote_err_tests() {
     '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
     "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 2' >"$T1090_HOSTS_AUTO"
 
-  t1090_spawn() {  # env knobs per call: T1090_{SSH,SCP}_SCENARIO{,_DESKTOP,_MAC_WORK}, T1090_{HOSTS_OVERRIDE,CWD,WRK,HOST_ARG,LOAD_FILE}
-    env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  t1090_spawn() {  # env knobs per call include T1090_{SSH,SCP}_SCENARIO*, delay, host, cwd, and fixture controls
+    exec env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
       ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$T1090_INBOX" XDG_DATA_HOME="$T1090_XDG" \
       WRK_HOSTS_CONFIG="${T1090_HOSTS_OVERRIDE:-$T1090_HOSTS}" \
       WRK_PROC_LOADAVG="${T1090_LOAD_FILE:-$T1090_LOAD}" \
@@ -724,16 +958,35 @@ run_t1090_remote_err_tests() {
       WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
       WRK_SCP_BIN="${T1090_SCP:-$ROOT/tests/fixtures/spillover-scp}" \
       WRK_SSH_LOG="$TMP/t1090-ssh.log" WRK_SCP_LOG="$TMP/t1090-scp.log" \
+      WRK_SSH_DELAY_SECONDS_DESKTOP="${T1090_SSH_DELAY_SECONDS_DESKTOP:-}" \
       WRK_SSH_SCENARIO="${T1090_SSH_SCENARIO:-ok}" \
       WRK_SSH_SCENARIO_DESKTOP="${T1090_SSH_SCENARIO_DESKTOP:-}" \
       WRK_SSH_SCENARIO_MAC_WORK="${T1090_SSH_SCENARIO_MAC_WORK:-}" \
       WRK_SCP_SCENARIO="${T1090_SCP_SCENARIO:-ok}" \
       WRK_SCP_SCENARIO_DESKTOP="${T1090_SCP_SCENARIO_DESKTOP:-}" \
       WRK_REMOTE_RC="${T1090_REMOTE_RC:-}" \
+      WRK_REMOTE_SLEEP_SECONDS="${T1090_REMOTE_SLEEP_SECONDS:-1}" \
+      WRK_REMOTE_STDERR_BINARY="${T1090_REMOTE_STDERR_BINARY:-0}" \
       WRK_REMOTE_STDERR_LINE="${T1090_REMOTE_STDERR_LINE:-}" \
       WRK_REMOTE_STDOUT_LINE="${T1090_REMOTE_STDOUT_LINE:-}" \
-      "${T1090_WRK:-$WRK}" spawn -c "${T1090_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
+      "${T1090_WRK:-$WRK}" spawn -c "${T1090_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" \
       -w w -l fixture --t T1 --job "t1090-$RANDOM-$RANDOM" --host "${T1090_HOST_ARG:-desktop}"
+  }
+
+  t1090_check_steps() {
+    local err_file="$1" host="$2" tag="$3"
+    shift 3
+    local want_file="$TMP/$tag.want-steps" raw_file="$TMP/$tag.raw-steps"
+    local got_file="$TMP/$tag.got-steps" bad_file="$TMP/$tag.bad-steps"
+    printf '%s\n' "$@" >"$want_file"
+    grep -E "^wrk: remote host '$host' step " "$err_file" >"$raw_file" || true
+    if grep -Ev "^wrk: remote host '$host' step (probe|cwd-map|prepare|mktemp|scp|remote wrk|lane) elapsed=[0-9]+s$" \
+        "$raw_file" >"$bad_file"; then
+      fail "$tag: malformed progress line: $(cat "$bad_file")"
+    fi
+    sed -E "s/^wrk: remote host '$host' step (.*) elapsed=[0-9]+s$/\\1/" "$raw_file" >"$got_file"
+    cmp -s "$want_file" "$got_file" ||
+      fail "$tag: progress steps differ: $(cat "$got_file")"
   }
 
   # AC1: the remote wrk dies on stderr — the die line reaches the local stderr
@@ -775,6 +1028,7 @@ run_t1090_remote_err_tests() {
   t1090_rc=$?
   set -e
   [[ "$t1090_rc" -eq 255 ]] || fail "AC3 prepare: ssh rc must propagate, got $t1090_rc"
+  t1090_check_steps "$TMP/t1090-ac3a.err" desktop t1090-prepare probe cwd-map prepare
   grep -qF 'Connection refused' "$TMP/t1090-ac3a.err" ||
     fail "AC3 prepare: remote check stderr dropped: $(cat "$TMP/t1090-ac3a.err")"
   t1090_last="$(tail -n 1 "$TMP/t1090-ac3a.err")"
@@ -797,11 +1051,38 @@ run_t1090_remote_err_tests() {
   t1090_rc=$?
   set -e
   [[ "$t1090_rc" -eq 1 ]] || fail "AC3 scp: scp rc must propagate, got $t1090_rc"
+  t1090_check_steps "$TMP/t1090-ac3c.err" desktop t1090-scp probe cwd-map mktemp scp
+  t1090_scp_step="$(grep -E "^wrk: remote host 'desktop' step scp elapsed=[0-9]+s$" "$TMP/t1090-ac3c.err" | tail -n 1)"
+  t1090_scp_step_line="$(grep -nF "$t1090_scp_step" "$TMP/t1090-ac3c.err" | tail -n 1 | cut -d: -f1)"
+  t1090_scp_error_line="$(grep -nF 'scp: dest open' "$TMP/t1090-ac3c.err" | head -n 1 | cut -d: -f1)"
+  [[ -n "$t1090_scp_error_line" && "$t1090_scp_step_line" -lt "$t1090_scp_error_line" ]] ||
+    fail "AC3 scp: the progress line must precede the scp error: $(cat "$TMP/t1090-ac3c.err")"
   grep -qF 'scp: dest open' "$TMP/t1090-ac3c.err" ||
     fail "AC3 scp: scp stderr missing: $(cat "$TMP/t1090-ac3c.err")"
   t1090_last="$(tail -n 1 "$TMP/t1090-ac3c.err")"
   [[ "$t1090_last" == *"rc=1"* && "$t1090_last" == *"scp"* ]] ||
     fail "AC3 scp: final line must name the scp step and rc, got: $t1090_last"
+
+  # The scp progress assertion is an assertion-RED mutant: omitting this
+  # helper call must make the expected step sequence fail.
+  T1493_M1="$TMP/t1493-wrk-no-scp-progress"
+  # shellcheck disable=SC2016 # $host is literal source text in the mutation pattern
+  sed 's/spillover_remote_step "$host" scp/:/' "$WRK" >"$T1493_M1"
+  chmod +x "$T1493_M1"
+  # shellcheck disable=SC2016 # the searched wrk source text is literal
+  grep -qF 'spillover_remote_step "$host" scp' "$T1493_M1" &&
+    fail "T2 mutant did not apply: scp progress helper call remains"
+  set +e
+  ( T1090_WRK="$T1493_M1" T1090_SCP_SCENARIO=fail t1090_spawn ) \
+    >"$TMP/t1493-m1.out" 2>"$TMP/t1493-m1.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 1 ]] ||
+    fail "T2 mutant: scp failure rc changed under the missing-progress mutant: $t1090_rc"
+  if ( t1090_check_steps "$TMP/t1493-m1.err" desktop t1493-m1 probe cwd-map mktemp scp ) >/dev/null 2>&1; then
+    fail "T2 mutant survived: the last-step assertion accepted a missing scp progress line"
+  fi
+  echo "PASS t1493 M1: missing-scp-progress mutant goes RED at the last-step assertion"
 
   # A refused probe is the failure that produced the incident's bare rc=1 line:
   # the probe reason and the remote's stderr must be named, the step is 'probe'.
@@ -831,7 +1112,7 @@ run_t1090_remote_err_tests() {
   set -e
   [[ "$t1090_rc" -eq 0 ]] ||
     fail "R1 auto-success: expected rc=0, got $t1090_rc: $(cat "$TMP/t1090-auto1.err")"
-  printf '%s\n' 'OK pane=mac-work:p7 host=mac-work model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1090-auto1.want"
+  printf '%s\n' 'OK pane=mac-work:p7 host=mac-work model=codex-luna label=fixture status=working landed=yes' >"$TMP/t1090-auto1.want"
   cmp -s "$TMP/t1090-auto1.want" "$TMP/t1090-auto1.out" ||
     fail "R1 auto-success: stdout differs from the pinned mac-work OK line: $(cat "$TMP/t1090-auto1.out")"
   [[ ! -s "$TMP/t1090-auto1.err" ]] ||
@@ -844,6 +1125,7 @@ run_t1090_remote_err_tests() {
   set +e
   ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
       T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
+      T1090_SSH_DELAY_SECONDS_DESKTOP=2 \
       T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
       T1090_SSH_SCENARIO_MAC_WORK=probe-herdr-missing t1090_spawn ) >"$TMP/t1090-auto2.out" 2>"$TMP/t1090-auto2.err"
   t1090_rc=$?
@@ -860,6 +1142,18 @@ run_t1090_remote_err_tests() {
     fail "R1 auto-all-fail: mac-work skipped line missing: $(cat "$TMP/t1090-auto2.err")"
   grep -qF "remote host 'mac-work' failed (rc=1) at step 'probe'" "$TMP/t1090-auto2.err" ||
     fail "R1 auto-all-fail: mac-work summary missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -qE "^wrk: remote host 'desktop' step probe elapsed=[0-9]+s$" "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: desktop's captured progress line is missing: $(cat "$TMP/t1090-auto2.err")"
+  grep -qE "^wrk: remote host 'mac-work' step probe elapsed=[0-9]+s$" "$TMP/t1090-auto2.err" ||
+    fail "R1 auto-all-fail: mac-work's captured progress line is missing: $(cat "$TMP/t1090-auto2.err")"
+  t1090_mac_probe_line="$(grep -E "^wrk: remote host 'mac-work' step probe elapsed=[0-9]+s$" "$TMP/t1090-auto2.err")"
+  if [[ "$t1090_mac_probe_line" =~ elapsed=([0-9]+)s$ ]]; then
+    t1090_mac_probe_elapsed="${BASH_REMATCH[1]}"
+  else
+    fail "R1 auto-all-fail: second candidate's elapsed value is malformed"
+  fi
+  [[ "$t1090_mac_probe_elapsed" -ge 2 ]] ||
+    fail "R1 auto-all-fail: second candidate did not include time spent in the first remote leg"
   grep -qF 'falling back to local' "$TMP/t1090-auto2.err" ||
     fail "R1 auto-all-fail: fallback warning missing: $(cat "$TMP/t1090-auto2.err")"
   grep -q 'host=local' "$TMP/t1090-auto2.out" ||
@@ -905,7 +1199,7 @@ run_t1090_remote_err_tests() {
   # successful auto spawn (main streamed it live), while the skipped host's
   # diagnostics stay dropped.
   set +e
-  ( T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
+  ( T1090_REMOTE_STDERR_BINARY=1 T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
       T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
       T1090_SSH_SCENARIO_DESKTOP=probe-unreachable \
       T1090_SSH_SCENARIO_MAC_WORK=remote-warn-ok t1090_spawn ) >"$TMP/t1090-auto4.out" 2>"$TMP/t1090-auto4.err"
@@ -916,18 +1210,19 @@ run_t1090_remote_err_tests() {
   cmp -s "$TMP/t1090-auto1.want" "$TMP/t1090-auto4.out" ||
     fail "R2 winner-stderr: stdout differs from the pinned mac-work OK line: $(cat "$TMP/t1090-auto4.out")"
   printf '%s\n' 'wrk: note: remote herdr quota nearly full on mac-work' >"$TMP/t1090-auto4.want"
+  printf 'wrk: binary warning \377\000 tail\n' >>"$TMP/t1090-auto4.want"
   cmp -s "$TMP/t1090-auto4.want" "$TMP/t1090-auto4.err" ||
-    fail "R2 winner-stderr: stderr must equal the winner's live stream: $(cat "$TMP/t1090-auto4.err")"
+    fail "R2 winner-stderr: stderr must equal the winner's live byte stream"
   echo "PASS t1090 R2 winner-stderr-replayed"
 
   # R2 mutant — invariant "a successful auto spawn keeps the winner's own
   # stderr": dropping the winner's replay must turn R2-A red.
   T1090_M4="$TMP/t1090-wrk-no-winner-replay"
   # shellcheck disable=SC2016 # the sed pattern is bin/wrk source text, not an expansion site
-  sed 's/ cat "\$cand_err" >&2/ :/' "$WRK" >"$T1090_M4"
+  sed 's/        spillover_replay_success_stderr "\$cand_err"/        :/' "$WRK" >"$T1090_M4"
   chmod +x "$T1090_M4"
   # shellcheck disable=SC2016 # the grep pattern is literal bin/wrk source text
-  grep -qF 'cat "$cand_err" >&2' "$T1090_M4" && fail 'R2 mutant did not apply: winner replay still present'
+  grep -qF 'spillover_replay_success_stderr "$cand_err"' "$T1090_M4" && fail 'R2 mutant did not apply: winner replay still present'
   set +e
   ( T1090_WRK="$T1090_M4" T1090_HOST_ARG=auto T1090_HOSTS_OVERRIDE="$T1090_HOSTS_AUTO" \
       T1090_LOAD_FILE="$T1090_LOAD_HIGH" \
@@ -962,19 +1257,65 @@ run_t1090_remote_err_tests() {
   fi
   echo "PASS t1090 R1 mutant: eager-diagnostics mutant goes RED (R1-A assertion: stderr no longer empty)"
 
-  # AC4: the success path is byte-identical to main — the annotated OK line on
-  # stdout, nothing on stderr, rc 0.
+  # AC4: the success stdout remains byte-identical; explicit remote stderr has
+  # one progress line for each leg reached.
   set +e
   ( t1090_spawn ) >"$TMP/t1090-ac4.out" 2>"$TMP/t1090-ac4.err"
   t1090_rc=$?
   set -e
   [[ "$t1090_rc" -eq 0 ]] || fail "AC4: success rc must stay 0, got $t1090_rc"
-  printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1090-ac4.want"
+  printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-luna label=fixture status=working landed=yes' >"$TMP/t1090-ac4.want"
   cmp -s "$TMP/t1090-ac4.want" "$TMP/t1090-ac4.out" ||
     fail "AC4: success stdout differs from the pinned OK line: $(cat "$TMP/t1090-ac4.out")"
-  [[ ! -s "$TMP/t1090-ac4.err" ]] ||
-    fail "AC4: success stderr must stay empty: $(cat "$TMP/t1090-ac4.err")"
-  echo "PASS t1090 AC4 success-byte-identical"
+  t1090_check_steps "$TMP/t1090-ac4.err" desktop t1090-explicit-success \
+    probe cwd-map mktemp scp "remote wrk"
+  echo "PASS t1090 AC4 explicit-success-progress-and-stdout-byte-identical"
+
+  # A derived cwd mapping uses the prepare leg between cwd-map and mktemp.
+  T1090_FAKE_REMOTE="$TMP/t1090-fake-remote"
+  mkdir -p "$T1090_FAKE_REMOTE/remote/lrepo.wt"
+  set +e
+  ( T1090_HOSTS_OVERRIDE="$T1090_HOSTS_SUFFIX" T1090_CWD="${T1090_SUFFIX_ROOT}.wt" \
+    WRK_FAKE_REMOTE="$T1090_FAKE_REMOTE" t1090_spawn ) \
+    >"$TMP/t1090-prepare-success.out" 2>"$TMP/t1090-prepare-success.err"
+  t1090_rc=$?
+  set -e
+  [[ "$t1090_rc" -eq 0 ]] ||
+    fail "AC4 derived cwd success: prepare should pass, got rc=$t1090_rc: $(cat "$TMP/t1090-prepare-success.err")"
+  t1090_check_steps "$TMP/t1090-prepare-success.err" desktop t1090-derived-success \
+    probe cwd-map prepare mktemp scp "remote wrk"
+  echo "PASS t1090 AC4 derived-cwd-prepare-progress"
+
+  # t1090_spawn execs env so this test's PID is the wrk process itself. Cut it
+  # off while the delegated remote wrk is sleeping; stderr must end at the
+  # last reached step and wait must report SIGTERM for that exact PID.
+  ( T1090_SSH_SCENARIO=remote-sleep T1090_REMOTE_SLEEP_SECONDS=5 t1090_spawn ) \
+    >"$TMP/t1090-cutoff.out" 2>"$TMP/t1090-cutoff.err" &
+  t1090_cutoff_pid=$!
+  t1090_cutoff_seen=0
+  for ((t1090_wait = 0; t1090_wait < 100; t1090_wait++)); do
+    if grep -qE "^wrk: remote host 'desktop' step remote wrk elapsed=[0-9]+s$" "$TMP/t1090-cutoff.err"; then
+      t1090_cutoff_seen=1
+      break
+    fi
+    sleep 0.02
+  done
+  if [[ "$t1090_cutoff_seen" -ne 1 ]]; then
+    kill -TERM "$t1090_cutoff_pid" 2>/dev/null || true
+    wait "$t1090_cutoff_pid" 2>/dev/null || true
+    fail "T3 cutoff: remote wrk progress line did not arrive: $(cat "$TMP/t1090-cutoff.err")"
+  fi
+  kill -TERM "$t1090_cutoff_pid"
+  set +e
+  wait "$t1090_cutoff_pid"
+  t1090_cutoff_rc=$?
+  set -e
+  [[ "$t1090_cutoff_rc" -eq 143 ]] ||
+    fail "T3 cutoff: expected the started wrk PID to exit on SIGTERM (rc=143), got $t1090_cutoff_rc"
+  t1090_cutoff_last="$(tail -n 1 "$TMP/t1090-cutoff.err")"
+  printf '%s\n' "$t1090_cutoff_last" | grep -Eq "^wrk: remote host 'desktop' step remote wrk elapsed=[0-9]+s$" ||
+    fail "T3 cutoff: stderr must end at remote wrk after signal (rc=$t1090_cutoff_rc): $(cat "$TMP/t1090-cutoff.err")"
+  echo "PASS t1090 T3 cutoff-ends-at-remote-wrk"
 
   # AC5 invariants as assertion-RED mutants.
   # M1 'a remote failure is never silent': dropping the stderr relay and the
@@ -1273,7 +1614,7 @@ run_t1155_local_spawn_off_tests() {
       WRK_REMOTE_STDERR_LINE="${T1155_REMOTE_STDERR_LINE:-}" \
       WRK_PLACE_SCENARIO="${T1155_PLACE_SCENARIO:-unavailable}" \
       HK_LOG="${T1155_HK_LOG:-$TMP/t1155-hk.log}" \
-      "${T1155_WRK:-$WRK}" spawn -c "${T1155_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
+      "${T1155_WRK:-$WRK}" spawn -c "${T1155_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" \
       -w w -l fixture --t T1 --job "${T1155_JOB:-t1155-$RANDOM-$RANDOM}" --host "${T1155_HOST_ARG:-desktop}" \
       ${t1155_task_args[@]+"${t1155_task_args[@]}"}
   }
@@ -1290,7 +1631,7 @@ run_t1155_local_spawn_off_tests() {
   set -e
   [[ "$t1155_rc" -eq 0 ]] ||
     fail "1155 AC1: a disabled local must hand the spawn to a remote, got rc=$t1155_rc: $(cat "$TMP/t1155-ac1.err")"
-  printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1155-ac1.want"
+  printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-luna label=fixture status=working landed=yes' >"$TMP/t1155-ac1.want"
   cmp -s "$TMP/t1155-ac1.want" "$TMP/t1155-ac1.out" ||
     fail "1155 AC1: expected the desktop OK line: $(cat "$TMP/t1155-ac1.out")"
   ! grep -q 'tab create' "$TMP/t1155-herdr.log" ||
@@ -1372,7 +1713,7 @@ run_t1155_local_spawn_off_tests() {
   set -e
   [[ "$t1155_rc" -eq 0 ]] ||
     fail "1155 AC4: a remote 80 answer must fail over, got rc=$t1155_rc: $(cat "$TMP/t1155-ac4.err")"
-  printf '%s\n' 'OK pane=mac-work:p7 host=mac-work model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1155-ac4.want"
+  printf '%s\n' 'OK pane=mac-work:p7 host=mac-work model=codex-luna label=fixture status=working landed=yes' >"$TMP/t1155-ac4.want"
   cmp -s "$TMP/t1155-ac4.want" "$TMP/t1155-ac4.out" ||
     fail "1155 AC4: expected the mac-work OK line: $(cat "$TMP/t1155-ac4.out")"
   grep -q 'wrk spawn' "$TMP/t1155-ssh.log" ||
@@ -1410,10 +1751,10 @@ run_t1155_local_spawn_off_tests() {
     set -e
     [[ "$t1155_rc" -eq 0 ]] ||
       fail "1155 AC5 $variant-local: expected rc=0, got $t1155_rc: $(cat "$TMP/t1155-ac5a-$variant.err")"
-    grep -qxF "OK pane=w:p1 host=local model=codex-terra label=fixture status=working landed=yes job=t1155-local-$variant quota_record=codex/quota_pool" \
+    grep -qxF "OK pane=w:p1 host=local model=codex-luna label=fixture status=working landed=yes job=t1155-local-$variant quota_record=codex/quota_pool" \
       "$TMP/t1155-ac5a-$variant.out" ||
       fail "1155 AC5 $variant-local: stdout differs from the pinned OK line: $(cat "$TMP/t1155-ac5a-$variant.out")"
-    grep -qxF "wrk: arbiter quota-pool record pool=codex profile=codex-terra-max launch_profile=codex-terra@medium job=t1155-local-$variant" \
+    grep -qxF "wrk: arbiter quota-pool record pool=codex profile=codex-luna-max launch_profile=codex-luna@medium job=t1155-local-$variant" \
       "$TMP/t1155-ac5a-$variant.err" ||
       fail "1155 AC5 $variant-local: stderr differs from the pinned arbiter line: $(cat "$TMP/t1155-ac5a-$variant.err")"
   done
@@ -1427,8 +1768,8 @@ run_t1155_local_spawn_off_tests() {
   cmp -s "$TMP/t1155-ac5a-absent.err.norm" "$TMP/t1155-ac5a-on.err.norm" ||
     fail "1155 AC5: absent-key and spawn=true local stderr differ"
 
-  # AC5b: the auto all-fail local fallback is byte-identical too — same
-  # per-candidate lines, the same fallback warning, a local landing.
+  # AC5b: the auto all-fail local fallback is equivalent too — same
+  # per-candidate diagnostics, the same fallback warning, a local landing.
   for variant in absent on; do
     cfg="$T1155_HOSTS_ABSENT"; [[ "$variant" == on ]] && cfg="$T1155_HOSTS_ON"
     rm -f "$TMP/t1155-herdr.log" "$TMP/t1155-ssh.log"
@@ -1449,17 +1790,19 @@ run_t1155_local_spawn_off_tests() {
     grep -q 'tab create' "$TMP/t1155-herdr.log" ||
       fail "1155 AC5 $variant-fallback: the local fallback never created a pane"
   done
-  # The two runs differ only in the minted job id; everything else must be
-  # byte-identical between the absent key and an explicit true.
+  # The two runs differ in the minted job id and elapsed seconds; everything
+  # else must match between the absent key and an explicit true.
   sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-absent.out" >"$TMP/t1155-ac5b-absent.out.norm"
   sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-on.out" >"$TMP/t1155-ac5b-on.out.norm"
   cmp -s "$TMP/t1155-ac5b-absent.out.norm" "$TMP/t1155-ac5b-on.out.norm" ||
     fail "1155 AC5: absent-key and spawn=true fallback stdout differ"
-  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-absent.err" >"$TMP/t1155-ac5b-absent.err.norm"
-  sed 's/job=[^ ]*/job=J/' "$TMP/t1155-ac5b-on.err" >"$TMP/t1155-ac5b-on.err.norm"
+  sed -e 's/job=[^ ]*/job=J/' -e 's/elapsed=[0-9]*s/elapsed=Ns/' \
+    "$TMP/t1155-ac5b-absent.err" >"$TMP/t1155-ac5b-absent.err.norm"
+  sed -e 's/job=[^ ]*/job=J/' -e 's/elapsed=[0-9]*s/elapsed=Ns/' \
+    "$TMP/t1155-ac5b-on.err" >"$TMP/t1155-ac5b-on.err.norm"
   cmp -s "$TMP/t1155-ac5b-absent.err.norm" "$TMP/t1155-ac5b-on.err.norm" ||
     fail "1155 AC5: absent-key and spawn=true fallback stderr differ"
-  echo "PASS t1155 AC5 absent-and-true-byte-identical"
+  echo "PASS t1155 AC5 absent-and-true-equivalent"
 
   # AC5c: any other value is a config error — bare or quoted, a non-boolean
   # refuses rc 70 naming the key. Quoted "true"/"false" are strings, not the
@@ -1877,10 +2220,10 @@ spawn = false' ;;
     if [[ "$variant" == nolocal ]]; then
       [[ "$t1155_rc" -eq 0 ]] ||
         fail "1163 AC2 $variant: expected rc=0, got $t1155_rc: $(cat "$TMP/t1163-v2-$variant.err")"
-      grep -qxF "OK pane=w:p1 host=local model=codex-terra label=fixture status=working landed=yes job=t1163-v2-$variant quota_record=codex/quota_pool" \
+      grep -qxF "OK pane=w:p1 host=local model=codex-luna label=fixture status=working landed=yes job=t1163-v2-$variant quota_record=codex/quota_pool" \
         "$TMP/t1163-v2-$variant.out" ||
         fail "1163 AC2 $variant: stdout differs from the pinned main OK line: $(cat "$TMP/t1163-v2-$variant.out")"
-      grep -qxF "wrk: arbiter quota-pool record pool=codex profile=codex-terra-max launch_profile=codex-terra@medium job=t1163-v2-$variant" \
+      grep -qxF "wrk: arbiter quota-pool record pool=codex profile=codex-luna-max launch_profile=codex-luna@medium job=t1163-v2-$variant" \
         "$TMP/t1163-v2-$variant.err" ||
         fail "1163 AC2 $variant: stderr differs from the pinned main arbiter line: $(cat "$TMP/t1163-v2-$variant.err")"
     else
@@ -1941,7 +2284,7 @@ spawn = false' ;;
   set -e
   [[ "$t1155_rc" -eq 0 ]] ||
     fail "1163 AC3: sibling keys must not disturb spawn resolution: $(cat "$TMP/t1163-siblings.err")"
-  grep -qxF "OK pane=w:p1 host=local model=codex-terra label=fixture status=working landed=yes job=t1163-siblings quota_record=codex/quota_pool" \
+  grep -qxF "OK pane=w:p1 host=local model=codex-luna label=fixture status=working landed=yes job=t1163-siblings quota_record=codex/quota_pool" \
     "$TMP/t1163-siblings.out" ||
     fail "1163 AC3: stdout differs from the pinned OK line: $(cat "$TMP/t1163-siblings.out")"
   echo "PASS t1163 AC3+AC4 wrk-hosts-flag (allowed/disabled/error rc 0, remote table unchanged)"
@@ -1960,7 +2303,7 @@ spawn = false' ;;
   set -e
   [[ "$t1155_rc" -eq 0 ]] ||
     fail "1163 M5: 'local.spawn' under [hosts.x] must stay ignored, got $t1155_rc: $(cat "$TMP/t1163-hostskey.err")"
-  grep -qxF "OK pane=w:p1 host=local model=codex-terra label=fixture status=working landed=yes job=t1163-hostskey quota_record=codex/quota_pool" \
+  grep -qxF "OK pane=w:p1 host=local model=codex-luna label=fixture status=working landed=yes job=t1163-hostskey quota_record=codex/quota_pool" \
     "$TMP/t1163-hostskey.out" ||
     fail "1163 M5: stdout differs from the pinned OK line: $(cat "$TMP/t1163-hostskey.out")"
   echo "PASS t1163 M5-base local.spawn-under-hosts.x-ignored"
@@ -2434,7 +2777,7 @@ run_t1239_desktop_wake_tests() {
       WRK_BURST_SCENARIO="${T1239_BURST_SCENARIO:-up}" \
       WRK_DESKTOP_AWAKE="$T1239_AWAKE" \
       WRK_WAKE_POLL_S="${T1239_POLL_S:-0.2}" \
-      "${T1239_WRK:-$WRK}" spawn -c "${T1239_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" \
+      "${T1239_WRK:-$WRK}" spawn -c "${T1239_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" \
       -w w -l fixture --t T1 --job "${T1239_JOB:-t1239-$RANDOM-$RANDOM}" --host "${T1239_HOST_ARG:-auto}"
   }
 
@@ -2452,7 +2795,7 @@ run_t1239_desktop_wake_tests() {
   set -e
   [[ "$t1239_rc" -eq 0 ]] ||
     fail "1239 AC1: expected rc=0 after the wake, got $t1239_rc: $(cat "$TMP/t1239-ac1.err")"
-  printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-terra label=fixture status=working landed=yes' >"$TMP/t1239-ac1.want"
+  printf '%s\n' 'OK pane=desktop:p7 host=desktop model=codex-luna label=fixture status=working landed=yes' >"$TMP/t1239-ac1.want"
   cmp -s "$TMP/t1239-ac1.want" "$TMP/t1239-ac1.out" ||
     fail "1239 AC1: expected the desktop OK line: $(cat "$TMP/t1239-ac1.out")"
   [[ "$(grep -c '^burst request ' "$TMP/t1239-wake.log")" -eq 1 ]] ||
@@ -2474,6 +2817,8 @@ run_t1239_desktop_wake_tests() {
     fail "1239 AC1: the wake path must not arm the hub quota gate: $(cat "$TMP/t1239-ac1.err")"
   grep -qF "wrk: waking remote host 'desktop'" "$TMP/t1239-ac1.err" ||
     fail "1239 AC1: the wake action line is missing: $(cat "$TMP/t1239-ac1.err")"
+  ! grep -qE "^wrk: remote host '[^']+' step " "$TMP/t1239-ac1.err" ||
+    fail "1239 AC1: successful wake placement leaked captured remote progress lines"
   echo "PASS t1239 AC1 deferred-wake-lands-desktop"
 
   # AC2 (director-1's case): same pressure picture, the node never connects
@@ -3052,14 +3397,14 @@ run_hub_quota_gate_tests() {
   hub_quota_run_case local-contract-3 0 3 "$unconfigured"
   hub_quota_expect_rc local-contract-3 3
   hub_quota_expect_spawn local-contract-3 0
-  grep -q 'gate blocked profile=codex-terra-max' "$HUB_QUOTA_ERR" ||
+  grep -q 'gate blocked profile=codex-luna-max' "$HUB_QUOTA_ERR" ||
     fail "W1 scopefuel exit 3 stderr was not preserved"
   echo "PASS hub-quota-local-contract exit-3=deny"
 
   hub_quota_run_case local-contract-4 0 4 "$unconfigured"
   hub_quota_expect_rc local-contract-4 4
   hub_quota_expect_spawn local-contract-4 0
-  grep -q 'gate measurement unavailable profile=codex-terra-max' "$HUB_QUOTA_ERR" ||
+  grep -q 'gate measurement unavailable profile=codex-luna-max' "$HUB_QUOTA_ERR" ||
     fail "W1 scopefuel exit 4 stderr was not preserved"
   echo "PASS hub-quota-local-contract exit-4=unknown"
 
@@ -3068,9 +3413,9 @@ run_hub_quota_gate_tests() {
   hub_quota_run_case allow-local-0 0 ok "$configured"
   hub_quota_expect_rc allow/local-0 0
   hub_quota_expect_spawn allow/local-0 1
-  [[ "$(sed -n '1p' "$HUB_QUOTA_OUT")" == 'profile=codex-terra-max pool=codex used_pct=12.5 class=preserve' ]] ||
+  [[ "$(sed -n '1p' "$HUB_QUOTA_OUT")" == 'profile=codex-luna-max pool=codex used_pct=12.5 class=preserve' ]] ||
     fail "scopefuel gate stdout line 1 was not reprinted verbatim"
-  [[ "$(sed -n '2p' "$HUB_QUOTA_OUT")" == 'gate allowed profile=codex-terra-max' ]] ||
+  [[ "$(sed -n '2p' "$HUB_QUOTA_OUT")" == 'gate allowed profile=codex-luna-max' ]] ||
     fail "scopefuel gate stdout line 2 was not reprinted verbatim"
   python3 - "$HUB_QUOTA_PANEWIRE_LOG" "$ROOT" "$token_file" "$cf_file" <<'PY' ||
 import sys
@@ -3094,7 +3439,7 @@ PY
   hub_quota_expect_spawn allow/local-3 0
   [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
     fail "hub allow was consulted after local exit 3"
-  grep -q 'gate blocked profile=codex-terra-max' "$HUB_QUOTA_ERR" ||
+  grep -q 'gate blocked profile=codex-luna-max' "$HUB_QUOTA_ERR" ||
     fail "scopefuel exit 3 stderr was not preserved"
   echo "PASS hub-quota-combination allow/3=deny"
 
@@ -3103,7 +3448,7 @@ PY
   hub_quota_expect_spawn allow/local-4 0
   [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
     fail "hub allow was consulted after local exit 4"
-  grep -q 'gate measurement unavailable profile=codex-terra-max' "$HUB_QUOTA_ERR" ||
+  grep -q 'gate measurement unavailable profile=codex-luna-max' "$HUB_QUOTA_ERR" ||
     fail "scopefuel exit 4 stderr was not preserved"
   echo "PASS hub-quota-combination allow/4=unknown"
 
@@ -3156,7 +3501,7 @@ PY
   hub_quota_expect_spawn unconfigured/local-0 1
   [[ ! -s "$HUB_QUOTA_PANEWIRE_LOG" ]] ||
     fail "hub-unconfigured local-only path invoked panewire"
-  [[ "$(sed -n '1p' "$HUB_QUOTA_OUT")" == 'profile=codex-terra-max pool=codex used_pct=12.5 class=preserve' ]] ||
+  [[ "$(sed -n '1p' "$HUB_QUOTA_OUT")" == 'profile=codex-luna-max pool=codex used_pct=12.5 class=preserve' ]] ||
     fail "hub-unconfigured path changed local gate stdout"
   # No [hub] section: stderr keeps its main shape — the #1138 warning is
   # reachable only when hub_url is set.
@@ -3528,7 +3873,7 @@ lanes_spawn() {
     WRK_HOSTS_CONFIG="${LANES_CFG_OVERRIDE:-$LANES_CFG}" \
     WRK_PANEWIRE_LOG="$LANES_PANEWIRE_LOG" \
     WRK_PANEWIRE_LANES_LOG="$LANES_CALLS" \
-    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m "${LANES_MODEL:-codex-terra}" \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m "${LANES_MODEL:-codex-luna}" \
     -p "$PROMPT" -w w -l "$name" --t T1 --job "$name" --task "$(mint_task)" \
     --host local "$@" >"$LANES_OUT" 2>"$LANES_ERR"
   LANES_RC=$?
@@ -3612,7 +3957,7 @@ t1397_remote_worker() {
     WRK_SSH_SCENARIO="${T1397_SSH_SCENARIO:-ok}" \
     WRK_HOSTS_CONFIG="${T1397_CFG_OVERRIDE:-$LANES_CFG_REMOTE}" \
     WRK_PANEWIRE_LANES_LOG="$T1397_CALLS" \
-    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-terra \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-luna \
     -p "$PROMPT" -w w -l "$name" --t T1 --job "$name" --task "$(mint_task)" \
     --host "${T1397_HOST:-desktop}" "$@" >"$T1397_OUT" 2>"$T1397_ERR"
   T1397_RC=$?
@@ -3750,7 +4095,7 @@ PY
     fail "#965 AC2: exactly one warning expected: $(cat "$LANES_ERR")"
   grep -q "herdr session 'worker'" "$LANES_ERR" ||
     fail "#965 AC2: the warning must name the session: $(cat "$LANES_ERR")"
-  grep -qxF 'OK pane=w:p1 host=local model=codex-terra label=lane-ac2 status=working landed=yes job=lane-ac2 quota_record=codex/quota_pool' "$LANES_OUT" ||
+  grep -qxF 'OK pane=w:p1 host=local model=codex-luna label=lane-ac2 status=working landed=yes job=lane-ac2 quota_record=codex/quota_pool' "$LANES_OUT" ||
     fail "#965 AC2: the OK line changed beyond 'nothing appended': $(cat "$LANES_OUT")"
   # And a config without the key at all stays silent (opt-in absent).
   LANES_CFG_OVERRIDE="$LANES_CFG_NOMAP" HERDR_SESSION=default lanes_spawn lane-ac2b --owner work-kairos
@@ -4678,6 +5023,8 @@ PY
   t1397_remote_spawn b1397-remote
   [[ "$T1397_RC" -eq 0 ]] ||
     fail "#1397 AC2a: remote builder spawn failed (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -qE "^wrk: remote host 'desktop' step lane elapsed=[0-9]+s$" "$T1397_ERR" ||
+    fail "#1397 AC2a: initiator-side builder lane registration progress line is missing: $(cat "$T1397_ERR")"
   grep -q -- '--lane-defer desktop' "$T1397_SSH" ||
     fail "#1397 AC2a: the delegated spawn must carry --lane-defer desktop: $(cat "$T1397_SSH")"
   grep -q -- '--host local' "$T1397_SSH" ||
@@ -5455,70 +5802,10 @@ grep -q 'Usage: wrk hosts' <<<"$hosts_help_out" ||
 run_fail "$WRK" hosts --bogus
 run_fail "$WRK" hosts extra
 run_fail "$WRK" spawn -c "$ROOT" -p "$PROMPT" -w w -l fixture
-run_fail "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --bogus
+run_fail "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture --bogus
 run_fail "$WRK" nope
 
-# ROB-1190 ④-2: wrk profiles — 기계 판독 가능한 프로필 목록. oc-omni 가 포함돼야 한다
-# (드리프트 방지: scopefuel 이 추천하는데 wrk 가 못 띄우는 상태 방지).
-profiles_out="$("$WRK" profiles)"
-grep -qx 'oc-omni' <<<"$profiles_out"
-grep -qx 'oc-solar4' <<<"$profiles_out"
-grep -qx 'kimi-k3' <<<"$profiles_out"
-grep -qx 'kimi-k27' <<<"$profiles_out"
-grep -qx 'kimi-k27-code' <<<"$profiles_out"
-grep -qx 'kimi-k3-low' <<<"$profiles_out"
-grep -qx 'codex-terra-max' <<<"$profiles_out"
-grep -qx 'builder-opus' <<<"$profiles_out"
-grep -qx 'builder-sol' <<<"$profiles_out"
-grep -qx 'builder-devin' <<<"$profiles_out"
-grep -qx 'builder-devin-medium' <<<"$profiles_out"
-grep -qx 'builder-devin-max' <<<"$profiles_out"
-grep -qx 'builder-ds41' <<<"$profiles_out"
-grep -qx 'builder-ds41-max' <<<"$profiles_out"
-grep -qx 'builder-grok' <<<"$profiles_out"
-grep -qx 'builder-kimi' <<<"$profiles_out"
-grep -qx 'builder-luna' <<<"$profiles_out"
-grep -qx 'builder-sonnet' <<<"$profiles_out" ||
-  fail "wrk profiles lost builder-sonnet (#921)"
-# #704 (#594 E6) + #737 (decision 4088): the per-rung builder spellings.
-for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
-  builder-sol-high builder-sol-max builder-sol-medium builder-luna-max \
-  builder-terra-high builder-terra-xhigh builder-terra-max \
-  builder-kimi-high builder-kimi-max \
-  builder-grok-low builder-grok-medium builder-grok-xhigh; do
-  grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
-done
-grep -qx 'captain-opus' <<<"$profiles_out"
-grep -qx 'captain-sol' <<<"$profiles_out"
-grep -qx 'codex-astra' <<<"$profiles_out"
-# ROB-591 rollback spellings (gpt-5.6-sol/gpt-5.6-luna) must remain spawnable.
-grep -qx 'codex-sol56' <<<"$profiles_out"
-grep -qx 'codex-luna56' <<<"$profiles_out"
-# #1026 rollback spellings (gpt-6-sol) join the same list.
-grep -qx 'codex-sol6' <<<"$profiles_out"
-grep -qx 'builder-sol6' <<<"$profiles_out"
-# task #526: the astra builder spellings were removed — astra is counsel-only
-# (hk:doc decision/2026-09-21/astra-allowed-purposes-approved).
-if grep -qx 'builder-astra' <<<"$profiles_out"; then exit 1; fi
-if grep -qx 'captain-astra' <<<"$profiles_out"; then exit 1; fi
-[[ "$(grep -xc 'devin-swe2' <<<"$profiles_out")" -eq 1 ]]
-grep -qx 'devin-glm52' <<<"$profiles_out"
-grep -qx 'devin-swe17' <<<"$profiles_out"
-grep -qx 'devin-ds41' <<<"$profiles_out"
-# #635: the devin effort rungs are named profiles (effort sits inside the
-# devin model id — no --effort flag exists). The scopefuel catalog lists all
-# three, so the wrk⊇scopefuel cross-check needs them here.
-grep -qx 'devin-swe2-medium' <<<"$profiles_out"
-grep -qx 'devin-swe2-max' <<<"$profiles_out"
-grep -qx 'devin-ds41-max' <<<"$profiles_out"
-# hk 1380: the paid fusion spellings (operator decision 2026-10-10) must be
-# spawnable profiles — worker/tester-only, no builder-* variants.
-grep -qx 'devin-fusion-opus55' <<<"$profiles_out"
-grep -qx 'devin-fusion-sonnet55' <<<"$profiles_out"
-if grep -qx 'builder-fusion-opus55' <<<"$profiles_out"; then exit 1; fi
-if grep -qx 'builder-fusion-sonnet55' <<<"$profiles_out"; then exit 1; fi
-if grep -qx 'codex-ultra' <<<"$profiles_out"; then exit 1; fi
-if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
+run_terra_refusal_tests
 
 name_out="$(WRK_FIXTURE_SCENARIO=find-name HERDR_BIN="$HERDR" "$WRK" find orch)"
 grep -q 'pane_id=w:p1' <<<"$name_out"
@@ -5543,12 +5830,12 @@ grep -q "w:p3" <<<"$apply_sync"
 
 : >"$TMP/herdr.log"
 : >"$TMP/scopefuel.log"
-canonical_out="$(spawn_base codex-terra --effort max)"
-grep -q 'codex-terra-max' "$TMP/scopefuel.log"
-grep -q -- '-m gpt-5.6-terra' "$TMP/herdr.log"
+canonical_out="$(spawn_base codex-luna --effort max)"
+grep -q 'codex-luna-max' "$TMP/scopefuel.log"
+grep -q -- '-m gpt-6-luna' "$TMP/herdr.log"
 grep -q 'model_reasoning_effort=max' "$TMP/herdr.log"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
-grep -q 'model=codex-terra' <<<"$canonical_out"
+grep -q 'model=codex-luna' <<<"$canonical_out"
 
 profiles=(
   "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku"
@@ -5556,10 +5843,9 @@ profiles=(
   "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
   "devin-swe2-medium:devin-swe2" "devin-swe2-max:devin-swe2" "devin-ds41-max:devin-swe2"
   "devin-fusion-opus55:devin-fusion-opus55" "devin-fusion-sonnet55:devin-fusion-sonnet55"
-  "codex:codex-max" "codex-sol:codex-max" "codex-med:codex-terra-max"
-  "codex-luna:codex-luna-max" "codex-luna-hi:codex-luna-max"
-  "codex-max:codex-max" "codex-terra:codex-terra-max"
-  "codex-terra-max:codex-terra-max" "codex-luna-max:codex-luna-max"
+  "codex:codex-max" "codex-sol:codex-max" "codex-luna:codex-luna-max"
+  "codex-luna-hi:codex-luna-max" "codex-max:codex-max"
+  "codex-luna-max:codex-luna-max"
   "codex-sol56:codex-max" "codex-luna56:codex-luna-max"
   "codex-sol6:codex-max"
   "kiro:kiro-sol" "kiro-opus:kiro-opus" "kiro-sonnet:kiro-sonnet"
@@ -5995,8 +6281,8 @@ set -e
 # is frozen so the probe's share of the shared window (#1199) reads 0 and the
 # first start still sees the full --timeout.
 : >"$TMP/herdr.log"
-PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 spawn_base codex-terra >/dev/null
-grep -qx 'agent start fixture --kind codex --pane w:p1 --timeout 120000 -- --yolo -m gpt-5.6-terra -c model_reasoning_effort=medium' "$TMP/herdr.log" ||
+PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 spawn_base codex-luna >/dev/null
+grep -qx 'agent start fixture --kind codex --pane w:p1 --timeout 120000 -- --yolo -m gpt-6-luna -c model_reasoning_effort=medium' "$TMP/herdr.log" ||
   fail "non-Devin agent-start path drifted"
 [[ "$(grep -c '^pane run ' "$TMP/herdr.log")" -eq 1 ]] ||
   fail "non-Devin kind must type only the readiness probe: $(grep '^pane run ' "$TMP/herdr.log")"
@@ -6008,7 +6294,7 @@ grep -qE "^pane run w:p1 +printf '%s\\\\n' 'wrk-ready-[0-9]+-[0-9]+-[0-9]+'$" "$
 # Inside the START_TIMEOUT window that is retried with the 250ms poll; every
 # other start failure still fails at once. Removing the retry turns the
 # shell-busy cases red; retrying every error turns the non-busy cases red.
-for shell_busy_pair in "opus:claude" "codex-terra:codex"; do
+for shell_busy_pair in "opus:claude" "codex-luna:codex"; do
   shell_busy_model="${shell_busy_pair%%:*}"
   shell_busy_kind="${shell_busy_pair#*:}"
   : >"$TMP/herdr.log"
@@ -6103,7 +6389,7 @@ grep -q 'agent not foreground within 10000ms (not-foreground x40)' <<<"$FG_CASE_
 # its own single process-info read before agent start.
 [[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 42 ]] ||
   fail "never-foreground claude must stop at the 10000/250 cap plus one diagnostic (plus the #1016 probe's one)"
-fg_failure_case codex-terra agent-never-foreground 1
+fg_failure_case codex-luna agent-never-foreground 1
 fg_failure_case devin-swe2 agent-never-foreground 1
 # kiro's pre-brief /effort prompt is also an injection; the gate precedes it.
 # (`agent start` argv legitimately carries `--effort`, so assert on the prompt
@@ -6146,7 +6432,7 @@ echo "PASS task609 pre-injection foreground-agent check"
 # as a node leader plus a native "codex" child — so the fixture emits those
 # real values and every kind below must still be admitted (the #609 follow-up
 # hotfix: matching only the kind string fail-closed every real kimi spawn).
-for fg_kind_pair in opus:claude codex-terra:codex devin-swe2:devin kimi-k3:kimi grok:grok kiro:kiro oc-glm:opencode agy-flash:agy; do
+for fg_kind_pair in opus:claude codex-luna:codex devin-swe2:devin kimi-k3:kimi grok:grok kiro:kiro oc-glm:opencode agy-flash:agy; do
   fg_model="${fg_kind_pair%%:*}"; fg_kind="${fg_kind_pair##*:}"
   : >"$TMP/herdr.log"
   set +e
@@ -6190,6 +6476,150 @@ for shell_window_jump in 27 29 30 31; do
   grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "retry at ${shell_window_jump}s leaked its pane"
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "retry at ${shell_window_jump}s delivered a brief"; fi
 done
+
+# #1492: the optional [local] window can lengthen every kind's readiness
+# wait, never shorten it, and refuses malformed or out-of-range values. The
+# fake clock advances the configured seconds after a probe is typed, so no
+# case sleeps for its 30s/90s/120s window.
+t1492_default_out=""
+: >"$TMP/herdr.log"
+set +e
+t1492_default_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=31 \
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends spawn_base opus --host local 2>&1)"
+t1492_default_rc=$?
+set -e
+[[ "$t1492_default_rc" -eq 1 ]] || fail "1492 default window expected rc=1, got $t1492_default_rc: $t1492_default_out"
+grep -q 'shell did not execute a readiness probe within 30000ms' <<<"$t1492_default_out" ||
+  fail "1492 without a key must keep the 30000ms default: $t1492_default_out"
+grep -q 'timeout source: claude kind default' <<<"$t1492_default_out" ||
+  fail "1492 default failure must name its source: $t1492_default_out"
+echo "PASS 1492 T1: default readiness window remains 30000ms"
+
+t1492_cfg90="$TMP/t1492-shell-ready-90000.toml"
+printf '[local]\nshell_ready_timeout_ms = 90000\n' >"$t1492_cfg90"
+: >"$TMP/herdr.log"
+set +e
+t1492_90_out="$(WRK_HOSTS_CONFIG="$t1492_cfg90" PATH="$TMP/jumpclock:$PATH" \
+  FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=91 TEST_FIXTURE_SCENARIO=devin-read-never-ends \
+  spawn_base opus --host local 2>&1)"
+t1492_90_rc=$?
+set -e
+[[ "$t1492_90_rc" -eq 1 ]] || fail "1492 configured window expected rc=1, got $t1492_90_rc: $t1492_90_out"
+grep -q 'shell did not execute a readiness probe within 90000ms' <<<"$t1492_90_out" ||
+  fail "1492 claude must use the configured 90000ms window: $t1492_90_out"
+grep -qF "timeout source: $t1492_cfg90 [local] shell_ready_timeout_ms" <<<"$t1492_90_out" ||
+  fail "1492 configured failure must name the hosts.toml key: $t1492_90_out"
+echo "PASS 1492 T2: claude uses configured 90000ms window and names its source"
+
+t1492_cfg60="$TMP/t1492-shell-ready-60000.toml"
+printf '[local]\nshell_ready_timeout_ms = 60000\n' >"$t1492_cfg60"
+: >"$TMP/herdr.log"
+set +e
+t1492_codex_out="$(WRK_HOSTS_CONFIG="$t1492_cfg60" PATH="$TMP/jumpclock:$PATH" \
+  FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=121 TEST_FIXTURE_SCENARIO=devin-read-never-ends \
+  spawn_base codex-luna --host local 2>&1)"
+t1492_codex_rc=$?
+set -e
+[[ "$t1492_codex_rc" -eq 1 ]] || fail "1492 codex window expected rc=1, got $t1492_codex_rc: $t1492_codex_out"
+grep -q 'shell did not execute a readiness probe within 120000ms' <<<"$t1492_codex_out" ||
+  fail "1492 configured 60000ms must not shorten codex's 120000ms default: $t1492_codex_out"
+grep -q 'timeout source: codex kind default' <<<"$t1492_codex_out" ||
+  fail "1492 codex failure must name the winning kind default: $t1492_codex_out"
+echo "PASS 1492 T3: configured 60000ms cannot shorten codex's 120000ms window"
+
+for t1492_bad in 1000 999999 90s duplicate; do
+  t1492_badcfg="$TMP/t1492-shell-ready-bad-$t1492_bad.toml"
+  case "$t1492_bad" in
+    duplicate) printf '[local]\nshell_ready_timeout_ms = 90000\nshell_ready_timeout_ms = 120000\n' >"$t1492_badcfg" ;;
+    *) printf '[local]\nshell_ready_timeout_ms = %s\n' "$t1492_bad" >"$t1492_badcfg" ;;
+  esac
+  : >"$TMP/herdr.log"
+  set +e
+  t1492_bad_out="$(WRK_HOSTS_CONFIG="$t1492_badcfg" TEST_FIXTURE_SCENARIO=spawn \
+    spawn_base opus --host local 2>&1)"
+  t1492_bad_rc=$?
+  set -e
+  [[ "$t1492_bad_rc" -eq 70 ]] ||
+    fail "1492 invalid value $t1492_bad must refuse rc=70, got $t1492_bad_rc: $t1492_bad_out"
+  grep -qF 'shell_ready_timeout_ms' <<<"$t1492_bad_out" ||
+    fail "1492 refusal for $t1492_bad must name the key: $t1492_bad_out"
+  grep -qF 'refusing spawn' <<<"$t1492_bad_out" ||
+    fail "1492 refusal for $t1492_bad must use the spawn config refusal style: $t1492_bad_out"
+  if [[ "$t1492_bad" == duplicate ]]; then
+    grep -qF 'duplicate shell_ready_timeout_ms key in [local]' <<<"$t1492_bad_out" ||
+      fail "1492 duplicate refusal lost its reason: $t1492_bad_out"
+  else
+    grep -qF 'line ' <<<"$t1492_bad_out" || fail "1492 refusal must name its config line: $t1492_bad_out"
+  fi
+  if grep -q '^tab create ' "$TMP/herdr.log"; then
+    fail "1492 invalid value $t1492_bad created a pane: $(grep '^tab create ' "$TMP/herdr.log")"
+  fi
+done
+echo "PASS 1492 T4: out-of-range, malformed and duplicate values refuse before pane creation"
+
+# A shell probe that is answered only after the fake clock advances 40s must
+# still pass with the configured 90s window; agent start receives the 50s left.
+: >"$TMP/herdr.log"
+t1492_delayed_out="$(WRK_HOSTS_CONFIG="$t1492_cfg90" PATH="$TMP/jumpclock:$PATH" \
+  FAKECLOCK_AFTER='pane read w:p1' FAKECLOCK_JUMP=40 WRK_FIXTURE_RC_READS=6 \
+  TEST_FIXTURE_SCENARIO=devin-slow-rc spawn_base opus --host local 2>&1)" ||
+  fail "1492 readiness probe answered after 40s must pass: $t1492_delayed_out"
+grep -q 'landed=yes' <<<"$t1492_delayed_out" ||
+  fail "1492 delayed readiness probe did not land the spawn: $t1492_delayed_out"
+grep -q '^agent start fixture --kind claude --pane w:p1 --timeout 50000 -- ' "$TMP/herdr.log" ||
+  fail "1492 40s readiness cost must leave 50000ms for agent start: $(grep '^agent start ' "$TMP/herdr.log")"
+echo "PASS 1492 T5: configured 90000ms window admits a probe answered after 40s"
+
+# Mutant checks are scoped to the contract cases above: using min instead of
+# max makes T3 report 60000ms; dropping the range check lets 1000 spawn.
+python3 - "$WRK" "$TMP/t1492-mut-min" <<'PY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+old = "if (( ${LOCAL_SHELL_READY_TIMEOUT_MS:-0} >= START_TIMEOUT )); then"
+new = "if (( ${LOCAL_SHELL_READY_TIMEOUT_MS:-0} <= START_TIMEOUT )); then"
+assert source.count(old) == 1, "expected one max comparison"
+path = pathlib.Path(sys.argv[2])
+path.write_text(source.replace(old, new, 1), encoding="utf-8")
+path.chmod(0o755)
+PY
+: >"$TMP/herdr.log"
+set +e
+t1492_min_mutant_out="$(WRK_UNDER_TEST="$TMP/t1492-mut-min" WRK_HOSTS_CONFIG="$t1492_cfg60" \
+  PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER='pane run w:p1' FAKECLOCK_JUMP=121 \
+  TEST_FIXTURE_SCENARIO=devin-read-never-ends spawn_base codex-luna --host local 2>&1)"
+t1492_min_mutant_rc=$?
+set -e
+[[ "$t1492_min_mutant_rc" -eq 1 ]] || fail "1492 min mutant should fail its bounded readiness probe: $t1492_min_mutant_out"
+grep -q 'shell did not execute a readiness probe within 60000ms' <<<"$t1492_min_mutant_out" ||
+  fail "1492 T3 did not kill the min mutant: $t1492_min_mutant_out"
+echo "PASS 1492 mutant: min instead of max makes T3 RED"
+
+python3 - "$WRK" "$TMP/t1492-mut-no-range" <<'PY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+old = '''        if (( ${#value} > 6 )) || (( 10#$value < 30000 || 10#$value > 300000 )); then
+          LOCAL_SPAWN_ERROR="$config line $n: [local] shell_ready_timeout_ms must be from 30000 to 300000 (got '$value')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+'''
+assert source.count(old) == 1, "expected one timeout range guard"
+path = pathlib.Path(sys.argv[2])
+path.write_text(source.replace(old, "        : # mutant: range check removed\n", 1), encoding="utf-8")
+path.chmod(0o755)
+PY
+t1492_range_mutant_cfg="$TMP/t1492-shell-ready-1000.toml"
+printf '[local]\nshell_ready_timeout_ms = 1000\n' >"$t1492_range_mutant_cfg"
+: >"$TMP/herdr.log"
+t1492_range_mutant_out="$(WRK_UNDER_TEST="$TMP/t1492-mut-no-range" \
+  WRK_HOSTS_CONFIG="$t1492_range_mutant_cfg" TEST_FIXTURE_SCENARIO=spawn \
+  spawn_base opus --host local 2>&1)" ||
+  fail "1492 T4 range mutant should be exposed by allowing 1000: $t1492_range_mutant_out"
+grep -q 'landed=yes' <<<"$t1492_range_mutant_out" ||
+  fail "1492 range mutant did not bypass the invalid-value refusal: $t1492_range_mutant_out"
+grep -q '^tab create ' "$TMP/herdr.log" ||
+  fail "1492 range mutant did not create the pane that T4 forbids"
+echo "PASS 1492 mutant: dropping the range check makes T4 RED"
+
 # #1199: the probe's wait is charged to the window — a second ticking over
 # while the probe runs leaves the first `agent start` only the remaining
 # --timeout 29000 (pre-#1199 it still got the full 30000).
@@ -6211,7 +6641,7 @@ tick_out="$(PATH="$TMP/tickclock:$PATH" FAKECLOCK_STATE="$TMP/tickclock.state" s
   fail "first-attempt start across a second tick must start once"
 grep -q '^agent start fixture --kind claude --pane w:p1 --timeout 29000 -- ' "$TMP/herdr.log" ||
   fail "the probe's tick must come out of the first start's window (--timeout 29000): $(grep '^agent start ' "$TMP/herdr.log")"
-shell_window_case codex-terra shell-busy 'agent start ' 31
+shell_window_case codex-luna shell-busy 'agent start ' 31
 [[ "$SHELL_WINDOW_RC" -eq 0 ]] || fail "codex retry at 31s of 120s must spawn: $SHELL_WINDOW_OUT"
 grep -q '^agent start fixture --kind codex --pane w:p1 --timeout 89000 -- ' "$TMP/herdr.log" ||
   fail "codex retry at 31s must hand herdr the 89000ms left of its window"
@@ -6497,7 +6927,7 @@ echo "PASS 979-AC6 mutants red: M1 skip-probe, M2 echo-as-proof, M3 ctrl+c"
 # (e.g. `laude`).
 T1016_KIND_PAIRS=(
   'opus|claude --model opus --dangerously-skip-permissions --effort high'
-  'codex-terra|codex --yolo -m gpt-5.6-terra -c model_reasoning_effort=medium'
+  'codex-luna|codex --yolo -m gpt-6-luna -c model_reasoning_effort=medium'
   'grok|grok --always-approve -m grok-4.7 --effort high'
   'kimi-k3|kimi --auto -m kimi-code/k3'
   'kiro|kiro chat --v3 --trust-all-tools --require-mcp-startup --effort high'
@@ -7335,7 +7765,7 @@ echo "PASS 951-claude-trust corrupt store warns, untouched, spawn continues"
 
 # AC3: a non-claude-kind spawn never touches .claude.json.
 t951_home="$TMP/t951-home-codex"; mkdir -p "$t951_home"
-claude_spawn_at "$t951_home" "$ROOT" t951h "$(mint_task)" codex-terra >/dev/null ||
+claude_spawn_at "$t951_home" "$ROOT" t951h "$(mint_task)" codex-luna >/dev/null ||
   fail "codex-kind spawn failed"
 [[ ! -e "$t951_home/.claude.json" ]] ||
   fail "non-claude spawn wrote .claude.json"
@@ -7526,10 +7956,10 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   "$WRK" spawn -c "$ROOT" -m codex-luna-ultra -p "$PROMPT" -w w -l fixture
 
 : >"$TMP/herdr.log"
-spawn_base codex-med >/dev/null
+spawn_base codex-luna >/dev/null
 grep -q 'model_reasoning_effort=medium' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
-spawn_base codex-med --effort high >/dev/null
+spawn_base codex-luna --effort high >/dev/null
 grep -q 'model_reasoning_effort=high' "$TMP/herdr.log"
 : >"$TMP/herdr.log"
 spawn_base codex-sol >/dev/null
@@ -7763,8 +8193,8 @@ once_out="$(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=prompt-wait-fails WRK_FIXTURE_LOG="$TMP/herdr.log" \
   WRK_PANEWIRE_PROMPT=daemon-down \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" "$WRK" spawn \
-  -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
-grep -q 'model=codex-terra' <<<"$once_out"
+  -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
+grep -q 'model=codex-luna' <<<"$once_out"
 grep -q 'landed=yes' <<<"$once_out"
 grep -q ' via=herdr-fallback$' <<<"$once_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
@@ -7779,7 +8209,7 @@ marker_expected="${marker_first_line:0:40}"
 printf '\n%s\nsecond line\n' "$marker_first_line" >"$marker_prompt"
 PROMPT="$marker_prompt"
 : >"$TMP/herdr.log"
-marker_out="$(TEST_FIXTURE_SCENARIO=landing-marker WRK_FIXTURE_MARKER="$marker_expected" spawn_base codex-terra 2>&1)"
+marker_out="$(TEST_FIXTURE_SCENARIO=landing-marker WRK_FIXTURE_MARKER="$marker_expected" spawn_base codex-luna 2>&1)"
 grep -q 'landed=yes' <<<"$marker_out"
 grep -q "$marker_first_line" "$TMP/herdr.log"
 [[ "$(grep -c '^agent prompt ' "$TMP/herdr.log")" -eq 1 ]]
@@ -7790,7 +8220,7 @@ PROMPT="$TMP/prompt.md"
 # AC1 RED before ROB-1321: the old implementation emits landed=yes here
 # solely because the freshly booted agent reports working. A complete first
 # observation window must instead re-inject once and then report landed=no.
-working_no_marker_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base codex-terra 2>&1)"
+working_no_marker_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base codex-luna 2>&1)"
 grep -q 'landed=no' <<<"$working_no_marker_out"
 grep -q 'action=reinject-once' <<<"$working_no_marker_out"
 grep -q 'last_status=working' <<<"$working_no_marker_out"
@@ -7802,21 +8232,21 @@ grep -q 'window=60s checks=33' <<<"$working_no_marker_out" ||
 echo "PASS ac1-working-without-marker-retries-then-no: $working_no_marker_out"
 
 : >"$TMP/herdr.log"
-delayed_marker_out="$(TEST_FIXTURE_SCENARIO=landing-delayed-marker spawn_base codex-terra 2>&1)"
+delayed_marker_out="$(TEST_FIXTURE_SCENARIO=landing-delayed-marker spawn_base codex-luna 2>&1)"
 grep -q 'landed=yes' <<<"$delayed_marker_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 [[ "$(grep -c -- '--source recent-unwrapped' "$TMP/herdr.log")" -ge 3 ]]
 echo "PASS ac2-delayed-marker-no-retry: $delayed_marker_out"
 
 : >"$TMP/herdr.log"
-retry_out="$(TEST_FIXTURE_SCENARIO=landing-retry spawn_base codex-terra 2>&1)"
+retry_out="$(TEST_FIXTURE_SCENARIO=landing-retry spawn_base codex-luna 2>&1)"
 grep -q 'landed=retry' <<<"$retry_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 2 ]]
 echo "PASS ac3-swallowed-then-retry: $retry_out"
 
 : >"$TMP/herdr.log"
 set +e
-no_landing_out="$(TEST_FIXTURE_SCENARIO=landing-no spawn_base codex-terra 2>&1)"
+no_landing_out="$(TEST_FIXTURE_SCENARIO=landing-no spawn_base codex-luna 2>&1)"
 no_landing_rc=$?
 set -e
 [[ "$no_landing_rc" -eq 0 ]]
@@ -7827,7 +8257,7 @@ echo "PASS landed-no-default-exit=$no_landing_rc: $no_landing_out"
 
 : >"$TMP/herdr.log"
 set +e
-strict_no_landing_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base codex-terra --landing-strict 2>&1)"
+strict_no_landing_out="$(TEST_FIXTURE_SCENARIO=landing-working-no-marker spawn_base codex-luna --landing-strict 2>&1)"
 strict_no_landing_rc=$?
 set -e
 [[ "$strict_no_landing_rc" -eq 76 ]]
@@ -7837,14 +8267,14 @@ grep -q 'spawn succeeded but brief landed=no' <<<"$strict_no_landing_out"
 echo "PASS ac4-landing-strict exit=$strict_no_landing_rc: $strict_no_landing_out"
 
 : >"$TMP/herdr.log"
-scrollout_out="$(TEST_FIXTURE_SCENARIO=landing-scrollback-marker spawn_base codex-terra 2>&1)"
+scrollout_out="$(TEST_FIXTURE_SCENARIO=landing-scrollback-marker spawn_base codex-luna 2>&1)"
 grep -q 'landed=yes' <<<"$scrollout_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 grep -q 'agent read w:p1 --source recent-unwrapped --lines 200' "$TMP/herdr.log"
 echo "PASS ac5-scrollback-marker-no-duplicate: $scrollout_out"
 
 : >"$TMP/herdr.log"
-pasted_out="$(TEST_FIXTURE_SCENARIO=landing-pasted spawn_base codex-terra 2>&1)"
+pasted_out="$(TEST_FIXTURE_SCENARIO=landing-pasted spawn_base codex-luna 2>&1)"
 grep -q 'landed=yes' <<<"$pasted_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 grep -q 'agent read w:p1 --source visible --lines 40' "$TMP/herdr.log"
@@ -8000,7 +8430,7 @@ grep -q 'landed=retry' <<<"$opencode_retry_out"
 echo "PASS opencode-landing-retry: $opencode_retry_out"
 
 : >"$TMP/herdr.log"
-observation_fail_out="$(TEST_FIXTURE_SCENARIO=landing-observation-fails spawn_base codex-terra 2>&1)"
+observation_fail_out="$(TEST_FIXTURE_SCENARIO=landing-observation-fails spawn_base codex-luna 2>&1)"
 grep -q 'landed=no' <<<"$observation_fail_out"
 [[ "$(grep -c 'agent prompt .*fixture prompt' "$TMP/herdr.log")" -eq 1 ]]
 echo "PASS ambiguous-observation-no-retry: $observation_fail_out"
@@ -8018,7 +8448,7 @@ pw_spawn() { WRK_PANEWIRE_PROMPT_LOG="$PW_LOG" spawn_base "$@"; }
 
 # A-7: expect line, agent-name target, absolute fresh file, no uptake.
 pw_reset
-pw_out="$(pw_spawn codex-terra 2>&1)"
+pw_out="$(pw_spawn codex-luna 2>&1)"
 grep -q 'landed=yes' <<<"$pw_out" || fail "498 baseline spawn must land: $pw_out"
 [[ "$(pw_calls)" -eq 1 ]] || fail "498 one panewire prompt call expected"
 [[ "$(herdr_briefs)" -eq 1 ]] || fail "498 exactly one brief injection expected"
@@ -8060,11 +8490,11 @@ echo "PASS 498-c4-injection-after-start"
 # A-3: every refusing gate means zero panewire calls and zero injections.
 for gate_mode in 3 4 broken; do
   pw_reset
-  WRK_GATE_MODE="$gate_mode" pw_spawn codex-terra >/dev/null 2>&1 && fail "498 gate $gate_mode must refuse"
+  WRK_GATE_MODE="$gate_mode" pw_spawn codex-luna >/dev/null 2>&1 && fail "498 gate $gate_mode must refuse"
   [[ "$(pw_calls)" -eq 0 && "$(herdr_briefs)" -eq 0 ]] || fail "498 gate $gate_mode refusal still prompted"
 done
 pw_reset
-TEST_FIXTURE_SCENARIO=tab-create-fails pw_spawn codex-terra >/dev/null 2>&1 && fail "498 tab create failure must fail the spawn"
+TEST_FIXTURE_SCENARIO=tab-create-fails pw_spawn codex-luna >/dev/null 2>&1 && fail "498 tab create failure must fail the spawn"
 [[ "$(pw_calls)" -eq 0 ]] || fail "498 no prompt without a pane"
 echo "PASS 498-a3-gate-refusal-no-prompt"
 
@@ -8080,7 +8510,7 @@ cwd_case() {
   out="$(WRK_PANEWIRE_PROMPT_LOG="$PW_LOG" WRK_FIXTURE_AGENT_CWD="$reported" WRK_PANEWIRE_PANE_CWD="$pane_cwd" \
     env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-    "$WRK" spawn -c "$TMP/pw-cwd-link" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
+    "$WRK" spawn -c "$TMP/pw-cwd-link" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
   grep -q 'landed=yes' <<<"$out" || fail "498 cwd case reported=$reported pane=$pane_cwd: $out $(head -n1 "$PW_LOG.1" 2>/dev/null)"
   [[ "$(head -n1 "$PW_LOG.1")" == "expect: name=fixture cwd=$pane_cwd" ]] || fail "498 cwd spelling: $(head -n1 "$PW_LOG.1")"
 }
@@ -8093,7 +8523,7 @@ pw_reset
 elsewhere_out="$(WRK_PANEWIRE_PROMPT_LOG="$PW_LOG" WRK_FIXTURE_AGENT_CWD=/ WRK_PANEWIRE_PANE_CWD=/ \
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
   WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-  "$WRK" spawn -c "$TMP/pw-cwd-link" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
+  "$WRK" spawn -c "$TMP/pw-cwd-link" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1 2>&1)"
 [[ "$(head -n1 "$PW_LOG.1")" == "expect: name=fixture cwd=$pw_cwd_physical" ]] || fail "498 foreign cwd adopted"
 grep -q 'landed=no' <<<"$elsewhere_out" || fail "498 cwd mismatch must be landed=no: $elsewhere_out"
 grep -q 'panewire_rc=5 submit=unsent' <<<"$elsewhere_out" || fail "498 cwd mismatch detail: $elsewhere_out"
@@ -8104,7 +8534,7 @@ echo "PASS 498-c3-cwd-normalized"
 # still gets the brief (the fixture refuses working targets when uptake is
 # set, as prompt.go does).
 pw_reset
-working_out="$(TEST_FIXTURE_SCENARIO=landing-scrollback-marker pw_spawn codex-terra 2>&1)"
+working_out="$(TEST_FIXTURE_SCENARIO=landing-scrollback-marker pw_spawn codex-luna 2>&1)"
 [[ "$(herdr_briefs)" -eq 1 ]] || fail "498 working target must still receive the brief: $working_out"
 grep -q 'landed=yes' <<<"$working_out" || fail "498 working target landing: $working_out"
 echo "PASS 498-a6-working-target-injected"
@@ -8114,7 +8544,7 @@ echo "PASS 498-a6-working-target-injected"
 # corrected by read-only corroboration — landed=yes and no second brief.
 for pw_mode in unproven composer; do
   pw_reset
-  fn_out="$(WRK_PANEWIRE_PROMPT="$pw_mode" pw_spawn codex-terra 2>&1)"
+  fn_out="$(WRK_PANEWIRE_PROMPT="$pw_mode" pw_spawn codex-luna 2>&1)"
   grep -q 'landed=yes' <<<"$fn_out" || fail "498 false negative ($pw_mode) must land: $fn_out"
   [[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 false negative ($pw_mode) re-injected"
   grep -q 'reinject' <<<"$fn_out" && fail "498 false negative ($pw_mode) announced a reinject: $fn_out"
@@ -8123,7 +8553,7 @@ echo "PASS 498-a6-false-negative-no-duplicate"
 
 # I2: confirmed non-landing re-injects once, through panewire, as a new file.
 pw_reset
-pw_retry_out="$(TEST_FIXTURE_SCENARIO=landing-retry pw_spawn codex-terra 2>&1)"
+pw_retry_out="$(TEST_FIXTURE_SCENARIO=landing-retry pw_spawn codex-luna 2>&1)"
 grep -q 'landed=retry' <<<"$pw_retry_out" || fail "498 retry: $pw_retry_out"
 [[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] || fail "498 retry must be one extra panewire delivery"
 first_file="$(sed -n '1s/.* file=\([^ ]*\) .*/\1/p' "$PW_LOG")"
@@ -8132,7 +8562,7 @@ second_file="$(sed -n '2s/.* file=\([^ ]*\) .*/\1/p' "$PW_LOG")"
 [[ "$first_file" == "$TMP/inbox/fixture/"* || "$first_file" == "$(cd "$TMP" && pwd -P)/inbox/fixture/"* ]] ||
   fail "498 prompt file must live in the (fixture) job dir: $first_file"
 pw_reset
-pw_never_out="$(TEST_FIXTURE_SCENARIO=landing-no pw_spawn codex-terra 2>&1)"
+pw_never_out="$(TEST_FIXTURE_SCENARIO=landing-no pw_spawn codex-luna 2>&1)"
 grep -q 'landed=no' <<<"$pw_never_out" || fail "498 never-lands: $pw_never_out"
 [[ "$(pw_calls)" -eq 2 && "$(herdr_briefs)" -eq 2 ]] || fail "498 at most one re-injection"
 echo "PASS 498-i2-reinject-once-new-file"
@@ -8140,12 +8570,12 @@ echo "PASS 498-i2-reinject-once-new-file"
 # A-5: rc 4 (no daemon socket = guaranteed unsent) and only rc 4 falls back to
 # one direct herdr injection, visible on the OK line; never twice.
 pw_reset
-fb_out="$(WRK_PANEWIRE_PROMPT=daemon-down pw_spawn codex-terra 2>&1)"
+fb_out="$(WRK_PANEWIRE_PROMPT=daemon-down pw_spawn codex-luna 2>&1)"
 grep -q '^OK pane=w:p1 .*landed=yes.* via=herdr-fallback$' <<<"$fb_out" || fail "498 fallback OK line: $fb_out"
 [[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 fallback must inject exactly once"
 pw_reset
 set +e
-fb_no_out="$(WRK_PANEWIRE_PROMPT=daemon-down TEST_FIXTURE_SCENARIO=landing-working-no-marker pw_spawn codex-terra --landing-strict 2>&1)"
+fb_no_out="$(WRK_PANEWIRE_PROMPT=daemon-down TEST_FIXTURE_SCENARIO=landing-working-no-marker pw_spawn codex-luna --landing-strict 2>&1)"
 fb_no_rc=$?
 set -e
 [[ "$fb_no_rc" -eq 76 ]] || fail "498 fallback landed=no strict exit: $fb_no_rc"
@@ -8153,14 +8583,14 @@ grep -q '^OK pane=w:p1 .*landed=no.* via=herdr-fallback$' <<<"$fb_no_out" || fai
 [[ "$(pw_calls)" -eq 1 && "$(herdr_briefs)" -eq 1 ]] || fail "498 fallback must never repeat: $(herdr_briefs)"
 grep -q 'reason=fallback-once' <<<"$fb_no_out" || fail "498 fallback no-retry reason: $fb_no_out"
 pw_reset
-missing_out="$(PANEWIRE_BIN="$TMP/absent-panewire" pw_spawn codex-terra 2>&1)"
+missing_out="$(PANEWIRE_BIN="$TMP/absent-panewire" pw_spawn codex-luna 2>&1)"
 grep -q 'landed=yes.* via=herdr-fallback$' <<<"$missing_out" || fail "498 missing panewire binary: $missing_out"
 [[ "$(herdr_briefs)" -eq 1 ]] || fail "498 missing panewire: one injection"
 # rc 3, rc 5 and both rc 6 flavors never fall back.
 for pw_mode in timeout expect-fail rejected-unsent rejected; do
   pw_reset
   set +e
-  nf_out="$(WRK_PANEWIRE_PROMPT="$pw_mode" TEST_FIXTURE_SCENARIO=landing-no pw_spawn codex-terra --landing-strict 2>&1)"
+  nf_out="$(WRK_PANEWIRE_PROMPT="$pw_mode" TEST_FIXTURE_SCENARIO=landing-no pw_spawn codex-luna --landing-strict 2>&1)"
   nf_rc=$?
   set -e
   grep -q 'via=herdr-fallback' <<<"$nf_out" && fail "498 $pw_mode must not fall back: $nf_out"
@@ -8254,34 +8684,34 @@ grep -q 'action=reinject-once' <<<"$devin_coll_out" ||
 echo "PASS 568-devin-fold-collision-not-marker"
 
 rm -f "$TMP/herdr.log"
-blocked3="$(WRK_GATE_MODE=3 spawn_base codex-terra 2>&1 || true)"
+blocked3="$(WRK_GATE_MODE=3 spawn_base codex-luna 2>&1 || true)"
 grep -q 'gate blocked' <<<"$blocked3"
 [[ ! -e "$TMP/herdr.log" ]]
-blocked4="$(WRK_GATE_MODE=4 spawn_base codex-terra 2>&1 || true)"
+blocked4="$(WRK_GATE_MODE=4 spawn_base codex-luna 2>&1 || true)"
 grep -q 'measurement unavailable' <<<"$blocked4"
 [[ ! -e "$TMP/herdr.log" ]]
 rm -f "$TMP/herdr.log"
-unsupported="$(WRK_GATE_MODE=unsupported spawn_base codex-terra 2>&1)"
+unsupported="$(WRK_GATE_MODE=unsupported spawn_base codex-luna 2>&1)"
 grep -q 'no gate subcommand' <<<"$unsupported"
 [[ -e "$TMP/herdr.log" ]]
 rm -f "$TMP/herdr.log"
 run_fail env WRK_GATE_MODE=broken HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1
+  "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1
 SCOPEFUEL_BIN="$TMP/missing-scopefuel" HERDR_BIN="$HERDR" WRK_NO_SLEEP=1 \
-  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture \
   --t T1 >"$TMP/missing.out" 2>&1
 grep -q 'scopefuel unavailable; quota gate skipped' "$TMP/missing.out"
 grep -q 'scopefuel refresh skipped; gate/arbiter did not provide a pool' "$TMP/missing.out"
-grep -q 'model=codex-terra' "$TMP/missing.out"
+grep -q 'model=codex-luna' "$TMP/missing.out"
 
 # ROB-1227 D4: refresh is detached, uses the gate-provided pool, and exposes
 # failure/timeout warnings without changing the successful spawn.
 : >"$TMP/refresh.log"
 start_ns="$(python3 -c 'import time; print(time.time_ns())')"
-success_out="$(spawn_base codex-terra 2>&1)"
+success_out="$(spawn_base codex-luna 2>&1)"
 elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - start_ns) / 1000000 ))"
-grep -q 'model=codex-terra' <<<"$success_out"
+grep -q 'model=codex-luna' <<<"$success_out"
 [[ "$elapsed_ms" -lt 1800 ]]  # 동일 flake 계열 — 위 timeout 케이스와 같은 근거로 완화
 for _ in {1..20}; do
   grep -q '^refresh codex --background$' "$TMP/refresh.log" && break
@@ -8289,19 +8719,19 @@ for _ in {1..20}; do
 done
 grep -q '^refresh codex --background$' "$TMP/refresh.log"
 
-failed_out="$(WRK_REFRESH_MODE=fail spawn_base codex-terra 2>&1)"
+failed_out="$(WRK_REFRESH_MODE=fail spawn_base codex-luna 2>&1)"
 grep -q 'scopefuel refresh failed for pool=codex; spawn already succeeded' <<<"$failed_out"
-grep -q 'model=codex-terra' <<<"$failed_out"
+grep -q 'model=codex-luna' <<<"$failed_out"
 
 timeout_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 : >"$TMP/refresh.pids"
-timeout_out="$(WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=2 WRK_REFRESH_TIMEOUT_S=0.2 spawn_base codex-terra 2>&1)"
+timeout_out="$(WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=2 WRK_REFRESH_TIMEOUT_S=0.2 spawn_base codex-luna 2>&1)"
 timeout_elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - timeout_start_ns) / 1000000 ))"
 # 2s hang 을 기다리지 않았음을 증명하면 충분하다 — 1000ms 는 부하 있는 머신에서
 # 오탐(실측 1075ms flake)이라 hang(2000ms) 대비 명확히 짧은 1800ms 로 완화.
 [[ "$timeout_elapsed_ms" -lt 1800 ]]
 grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' <<<"$timeout_out"
-grep -q 'model=codex-terra' <<<"$timeout_out"
+grep -q 'model=codex-luna' <<<"$timeout_out"
 while IFS= read -r refresh_pid; do
   [[ -z "$refresh_pid" ]] || ! ps -p "$refresh_pid" -o pid= | grep -q '[0-9]'
 done <"$TMP/refresh.pids"
@@ -8309,7 +8739,7 @@ done <"$TMP/refresh.pids"
 cp "$SCOPEFUEL" "$TMP/non-executable-scopefuel"
 chmod -x "$TMP/non-executable-scopefuel"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$TMP/non-executable-scopefuel" WRK_NO_SLEEP=1 \
-  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1
 
 # ---------------------------------------------------------------------------
 # ROB-1199/ROB-1201: arbiter admission control. wrk holds no pool mapping — arbiter reads
@@ -8320,17 +8750,17 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$TMP/non-executable-scopefuel" WR
 
 # ⑦ arbiter not installed at all → warn, spawn proceeds (installation transition).
 rm -f "$TMP/herdr.log"
-absent_out="$(spawn_base codex-terra 2>&1)"
+absent_out="$(spawn_base codex-luna 2>&1)"
 grep -q 'arbiter unavailable' <<<"$absent_out"
-grep -q 'model=codex-terra' <<<"$absent_out"
+grep -q 'model=codex-luna' <<<"$absent_out"
 [[ -e "$TMP/herdr.log" ]]
 
 # ⑦ installed arbiter that predates the lease subcommand → warn, spawn proceeds.
 rm -f "$TMP/herdr.log"
 export TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-legacy"
-legacy_out="$(spawn_base codex-terra 2>&1)"
+legacy_out="$(spawn_base codex-luna 2>&1)"
 grep -q 'no lease subcommand' <<<"$legacy_out"
-grep -q 'model=codex-terra' <<<"$legacy_out"
+grep -q 'model=codex-luna' <<<"$legacy_out"
 [[ -e "$TMP/herdr.log" ]]
 unset TEST_ARBITER_BIN
 
@@ -8339,9 +8769,9 @@ cp "$ARBITER" "$TMP/non-executable-arbiter"
 chmod -x "$TMP/non-executable-arbiter"
 rm -f "$TMP/herdr.log"
 export TEST_ARBITER_BIN="$TMP/non-executable-arbiter"
-nonexec_out="$(spawn_base codex-terra 2>&1)"
+nonexec_out="$(spawn_base codex-luna 2>&1)"
 grep -q 'quota-pool record unavailable' <<<"$nonexec_out"
-grep -q 'model=codex-terra' <<<"$nonexec_out"
+grep -q 'model=codex-luna' <<<"$nonexec_out"
 [[ -e "$TMP/herdr.log" ]]
 unset TEST_ARBITER_BIN
 
@@ -8349,16 +8779,16 @@ unset TEST_ARBITER_BIN
 # worker is handed its own job/resource/profile identity.
 export TEST_ARBITER_BIN="$ARBITER"
 rm -f "$TMP/herdr.log"
-admit_out="$(spawn_base codex-terra --job arb-ok --t T2 2>&1)"
+admit_out="$(spawn_base codex-luna --job arb-ok --t T2 2>&1)"
 grep -q 'quota_record=codex/quota_pool' <<<"$admit_out"
 grep -q 'job=arb-ok' <<<"$admit_out"
 grep -q 'ARBITER_JOB=arb-ok' "$TMP/herdr.log"
 grep -q 'ARBITER_RESOURCE=codex' "$TMP/herdr.log"
 grep -q 'ARBITER_KIND=quota_pool' "$TMP/herdr.log"
-grep -q 'ARBITER_PROFILE=codex-terra-max' "$TMP/herdr.log"
+grep -q 'ARBITER_PROFILE=codex-luna-max' "$TMP/herdr.log"
 grep -q 'ARBITER_STARTED_AT=' "$TMP/herdr.log"
 arb status --job arb-ok --json |
-  python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["quota_pool_records"]; assert len(r)==1 and r[0]["pool"]=="codex" and r[0]["profile"]=="codex-terra-max", d'
+  python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["quota_pool_records"]; assert len(r)==1 and r[0]["pool"]=="codex" and r[0]["profile"]=="codex-luna-max", d'
 arb status --job arb-ok --json |
   python3 -c 'import json,sys; j=json.load(sys.stdin)["jobs"]; assert len(j)==1 and j[0]["t_level"]=="T2" and j[0]["owner_lane"]=="default", j'
 python3 - "$ARBITER_INBOX_ROOT/arb-ok/events/00001-job.claim.json" <<'PY'
@@ -8435,12 +8865,9 @@ launch_profile_case codex-sol56 codex-sol56-rollback 'codex-sol56@max'
 # builder-sol6 still lands on the canonical consult rung codex-sol@high.
 launch_profile_case codex-sol6 codex-sol6-rollback 'codex-sol6@max'
 launch_profile_case builder-sol6 builder-sol6-canon 'codex-sol@high' --role builder --lane builder-sol6-lane --parent parent-lane
-launch_profile_case codex-terra codex-terra-canon 'codex-terra@medium'
-launch_profile_case codex-med codex-med-canon 'codex-terra@medium'
-launch_profile_case codex-terra-max codex-terra-max-canon 'codex-terra-max@max'
 launch_profile_case codex-luna codex-luna-canon 'codex-luna@medium'
-launch_profile_case codex-luna-hi codex-luna-hi-canon 'codex-luna@high'
 launch_profile_case codex-luna-max codex-luna-max-canon 'codex-luna-max@max'
+launch_profile_case codex-luna-hi codex-luna-hi-canon 'codex-luna@high'
 launch_profile_case codex-luna56 codex-luna56-rollback 'codex-luna56@medium'
 launch_profile_case builder-luna builder-luna-canon 'codex-luna@xhigh' --role builder --lane builder-luna-lane --parent parent-lane
 # #921: builder-sonnet records the canonical catalog rung on the claude pool,
@@ -8570,7 +8997,7 @@ echo "PASS devin-ds41 shares the devin-swe2 gate spelling and devin quota pool"
 # ⑥ the pool is a record, not a mutex: another job asking for the same pool
 # succeeds and both records remain visible.
 rm -f "$TMP/herdr.log"
-second_out="$(spawn_base codex-terra --job arb-second --t T2 2>&1)"
+second_out="$(spawn_base codex-luna --job arb-second --t T2 2>&1)"
 grep -q 'quota_record=codex/quota_pool' <<<"$second_out"
 arb status --json |
   python3 -c 'import json,sys; d=json.load(sys.stdin); r=[x for x in d["quota_pool_records"] if x["pool"]=="codex"]; assert {x["job_id"] for x in r} >= {"arb-ok","arb-second"}, d'
@@ -8590,7 +9017,7 @@ grep -q 'quota_record=kiro/quota_pool' <<<"$other_out"
 arb claim --job idem-active --agent-label incumbent --lane incumbent-lane --t T2 >/dev/null
 rm -f "$TMP/herdr.log"
 set +e
-active_dup_out="$(spawn_base codex-terra --job idem-active --t T2 2>&1)"
+active_dup_out="$(spawn_base codex-luna --job idem-active --t T2 2>&1)"
 active_dup_rc=$?
 set -e
 [[ "$active_dup_rc" -eq 74 ]] || { echo "expected active duplicate exit 74, got $active_dup_rc: $active_dup_out" >&2; exit 1; }
@@ -8602,10 +9029,10 @@ echo "PASS ROB-1326 AC1 active duplicate fail-closed: $active_dup_out"
 
 # AC2: a released row gets the explicit reclaim transition, then spawns once.
 arb claim --job idem-released --agent-label released-old --lane released-old-lane --t T1 >/dev/null
-arb lease --job idem-released --kind quota_pool --profile codex-terra-max --gate-output <("$SCOPEFUEL" gate -m codex-terra-max) >/dev/null
+arb lease --job idem-released --kind quota_pool --profile codex-luna-max --gate-output <("$SCOPEFUEL" gate -m codex-luna-max) >/dev/null
 arb release --job idem-released --resource codex --kind quota_pool >/dev/null
 rm -f "$TMP/herdr.log"
-released_dup_out="$(spawn_base codex-terra --job idem-released --t T3 2>&1)"
+released_dup_out="$(spawn_base codex-luna --job idem-released --t T3 2>&1)"
 grep -q '^OK ' <<<"$released_dup_out"
 [[ -e "$TMP/herdr.log" ]] || { echo "released job did not reach fixture spawn" >&2; exit 1; }
 arb job-get --job idem-released --json | python3 -c '
@@ -8624,7 +9051,7 @@ export WRK_ARBITER_PROXY_MODE=job-get-fails
 export TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-proxy"
 rm -f "$TMP/herdr.log"
 set +e
-unknown_dup_out="$(spawn_base codex-terra --job idem-unknown --t T1 2>&1)"
+unknown_dup_out="$(spawn_base codex-luna --job idem-unknown --t T1 2>&1)"
 unknown_dup_rc=$?
 set -e
 [[ "$unknown_dup_rc" -eq 75 ]] || { echo "expected unreadable-state exit 75, got $unknown_dup_rc: $unknown_dup_out" >&2; exit 1; }
@@ -8637,7 +9064,7 @@ echo "PASS ROB-1326 AC3 duplicate lookup failure is fail-closed: $unknown_dup_ou
 export TEST_ARBITER_BIN="$ARBITER"
 arb claim --job idem-override --agent-label override-owner --lane override-lane --t T1 >/dev/null
 rm -f "$TMP/herdr.log"
-override_out="$(spawn_base codex-terra --job idem-override --t T1 --job-dup-ok 2>&1)"
+override_out="$(spawn_base codex-luna --job idem-override --t T1 --job-dup-ok 2>&1)"
 grep -q '^OK ' <<<"$override_out"
 grep -q 'job-dup-ok override' <<<"$override_out"
 grep -q 'state=claimed' <<<"$override_out"
@@ -8648,7 +9075,7 @@ echo "PASS ROB-1326 AC8 explicit active duplicate override: $override_out"
 # failure is non-transactional: the pane remains successful but job-get says
 # receipt=absent, and wrk emits a warning.
 rm -f "$TMP/herdr.log"
-receipt_out="$(spawn_base codex-terra --job idem-receipt --t T1 2>&1)"
+receipt_out="$(spawn_base codex-luna --job idem-receipt --t T1 2>&1)"
 grep -q '^OK pane=w:p1' <<<"$receipt_out"
 arb job-get --job idem-receipt --json | python3 -c '
 import json, sys
@@ -8657,7 +9084,7 @@ r = d["receipt"]
 assert r["pane_id"] == "w:p1", d
 assert r["spawned_at"], d
 assert r["label"] == "fixture", d
-assert r["profile"] == "codex-terra", d
+assert r["profile"] == "codex-luna", d
 assert r["workspace"] == "w", d
 assert "job.spawned" in d["recent_event_kinds"], d
 '
@@ -8665,7 +9092,7 @@ export REAL_ARBITER="$ARBITER"
 export WRK_ARBITER_PROXY_MODE=spawn-receipt-fails
 export TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-proxy"
 rm -f "$TMP/herdr.log"
-receipt_fail_out="$(spawn_base codex-terra --job idem-receipt-fail --t T1 2>&1)"
+receipt_fail_out="$(spawn_base codex-luna --job idem-receipt-fail --t T1 2>&1)"
 grep -q '^OK pane=w:p1' <<<"$receipt_fail_out"
 grep -q 'job.spawned receipt failed' <<<"$receipt_fail_out"
 [[ -e "$TMP/herdr.log" ]] || { echo "receipt failure stopped successful fixture spawn" >&2; exit 1; }
@@ -8716,9 +9143,9 @@ EOF
 chmod +x "$TMP/quota-record-failing-arbiter"
 rm -f "$TMP/herdr.log"
 export TEST_ARBITER_BIN="$TMP/quota-record-failing-arbiter"
-record_failed_out="$(spawn_base codex-terra --job arb-record-fail --t T1 2>&1)"
+record_failed_out="$(spawn_base codex-luna --job arb-record-fail --t T1 2>&1)"
 grep -q 'arbiter quota-pool record failed' <<<"$record_failed_out"
-grep -q 'model=codex-terra' <<<"$record_failed_out"
+grep -q 'model=codex-luna' <<<"$record_failed_out"
 [[ -e "$TMP/herdr.log" ]]
 arb status --job arb-record-fail --json |
   python3 -c 'import json,sys; assert json.load(sys.stdin)["quota_pool_records"] == [], sys.stdin'
@@ -8970,7 +9397,7 @@ echo "PASS AC-14 option-token-value-not-swallowed rc=$swallow_rc"
 # Ordinary spawns carry no operator-request argv and no audit fields — the
 # pass-through must be strictly opt-in.
 : >"$TMP/scopefuel.log"
-plain_out="$(spawn_base codex-terra --job esc-plain --t T1 2>&1)"
+plain_out="$(spawn_base codex-luna --job esc-plain --t T1 2>&1)"
 grep -q '^OK pane=' <<<"$plain_out"
 if grep -q -- 'operator-request\|requested-by' "$TMP/scopefuel.log"; then
   fail "a plain spawn leaked operator-request argv: $(cat "$TMP/scopefuel.log")"
@@ -8996,7 +9423,7 @@ unset TEST_ARBITER_BIN
 grep -q -- '--purpose' <<<"$spawn_help_out" ||
   fail "spawn --help lost --purpose"
 run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
-  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1 --purpose
+  WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1 --purpose
 
 # The architect counsel path injects --purpose architect on its own: a plain
 # `-m codex-astra` spawn must reach the gate with the purpose attached.
@@ -9066,7 +9493,7 @@ echo "PASS 527-astra-quota-denial-distinct rc=$quota_denied_rc"
 # --purpose is audit metadata for non-astra profiles: it is forwarded but the
 # spawn outcome is unchanged.
 : >"$TMP/scopefuel.log"
-plain_purpose_out="$(spawn_base codex-terra --job plain-purpose --t T1 --purpose builder 2>&1)"
+plain_purpose_out="$(spawn_base codex-luna --job plain-purpose --t T1 --purpose builder 2>&1)"
 grep -q '^OK pane=' <<<"$plain_purpose_out" ||
   fail "non-astra spawn with --purpose was refused: $plain_purpose_out"
 grep -q -- '--purpose builder' "$TMP/scopefuel.log" ||
@@ -9176,7 +9603,7 @@ echo "PASS role-builder-rejects-astra-spellings"
 role_must_fail() {
   local rejected_role="$1" job="$2" output rc
   set +e
-  output="$(spawn_base codex-terra --role "$rejected_role" --job "$job" --t T1 2>&1)"
+  output="$(spawn_base codex-luna --role "$rejected_role" --job "$job" --t T1 2>&1)"
   rc=$?
   set -e
   python3 - "$rc" "$rejected_role" "$output" <<'PY'
@@ -9193,7 +9620,7 @@ role_must_fail tester role-unknown-tester
 role_must_require_value() {
   local job="$1" output rc
   set +e
-  output="$(spawn_base codex-terra --role '' --job "$job" --t T1 2>&1)"
+  output="$(spawn_base codex-luna --role '' --job "$job" --t T1 2>&1)"
   rc=$?
   set -e
   python3 - "$rc" "$output" <<'PY'
@@ -9213,12 +9640,12 @@ expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --paren
 expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --parent builder-lane --job builder-self-parent
 expect_exit 2 spawn_base builder-opus --role builder --lane director-9 --parent parent-lane --job builder-director-lane
 expect_exit 2 spawn_base builder-opus --role builder --lane admiral-9 --parent parent-lane --job builder-admiral-lane
-expect_exit 2 spawn_base codex-terra --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
+expect_exit 2 spawn_base codex-luna --role worker --lane worker-lane --parent parent-lane --job worker-hierarchy-regression
 echo "PASS builder-parent-and-director-lane-guards"
 
 for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
-  builder-luna-max builder-terra-high builder-terra-xhigh builder-terra-max builder-kimi-high builder-kimi-max \
+  builder-luna-max builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
@@ -9246,7 +9673,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -9255,7 +9682,7 @@ accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|bui
 # inside builder-grok); grok-hi presence covers it, and the literal accept-line
 # pin above guards the list itself. `builder-level` is prose, `captain-NN` is a
 # session name in SKILL.md — neither is a profile.
-builder_tokens() { grep -oE '(builder|captain)-[a-z0-9-]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vxE 'builder-level|captain-[0-9]+' | sort -u; }
+builder_tokens() { grep -oE '(builder|captain)-[a-z0-9-]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vxE 'builder-level|captain-[0-9]+' | grep -v '^builder-terra-' | sort -u; }
 accept_set="$(builder_tokens <<<"$accept_line")"
 help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
 help_set="$(builder_tokens <<<"$help_block")"
@@ -9438,7 +9865,7 @@ echo "PASS 593-fable-not-unlocked-by-purpose"
 
 # Mutants: a worker-grade profile, missing parent, and a non-high Opus effort
 # must all stop before gate/claim/tab creation.
-expect_exit 2 spawn_base codex-terra --role builder --lane builder-lane --parent parent-lane --job builder-terra-mutant
+expect_exit 2 spawn_base codex-luna --role builder --lane builder-lane --parent parent-lane --job builder-worker-profile-mutant
 expect_exit 2 spawn_base codex-luna --role builder --lane builder-lane --parent parent-lane --job builder-luna-mutant
 expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --job builder-parent-mutant
 expect_exit 2 spawn_base builder-opus --role builder --lane builder-lane --parent parent-lane --effort max --job builder-effort-mutant
@@ -9948,8 +10375,6 @@ e6_builder_case builder-sonnet-xhigh sonnet      xhigh  '--model sonnet --danger
 e6_builder_case builder-sol-high     codex-sol   high   '--yolo -m gpt-6.1-sol -c model_reasoning_effort=high'
 # #737: codex-sol@medium joins the sol E6 rungs on the same pin rule.
 e6_builder_case builder-sol-medium   codex-sol   medium '--yolo -m gpt-6.1-sol -c model_reasoning_effort=medium'
-e6_builder_case builder-terra-high   codex-terra high   '--yolo -m gpt-5.6-terra -c model_reasoning_effort=high'
-e6_builder_case builder-terra-xhigh  codex-terra xhigh  '--yolo -m gpt-5.6-terra -c model_reasoning_effort=xhigh'
 e6_builder_case builder-kimi-high    kimi-k3     high   '--auto -m kimi-code/k3'
 # #737 (decision 4088): the grok E6 rungs — grok-hi@low/medium/xhigh, same
 # generic grok argv shape as builder-grok, marker-gated at the pinned rung.
@@ -9958,16 +10383,14 @@ e6_builder_case builder-grok-medium  grok-hi     medium '--always-approve -m gro
 e6_builder_case builder-grok-xhigh   grok-hi     xhigh  '--always-approve -m grok-4.7 --effort xhigh'
 echo "PASS 704+737 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
-# 2026-09-26 (decision 4088 B): the five max-rung builder spellings are closed —
+# 2026-09-26 (decision 4088 B): the four max-rung builder spellings are closed —
 # a builder seat never takes a max rung, so the seat rule fires ahead of the
 # E6 marker check and refuses even with the exact SCOPEFUEL_E6_ARM armed.
-for e6_max_model in builder-sonnet-max builder-sol-max builder-luna-max \
-  builder-terra-max builder-kimi-max; do
+for e6_max_model in builder-sonnet-max builder-sol-max builder-luna-max builder-kimi-max; do
   case "$e6_max_model" in
     builder-sonnet-max) e6_max_gate=sonnet ;;
     builder-sol-max)    e6_max_gate=codex-sol ;;
     builder-luna-max)   e6_max_gate=codex-luna ;;
-    builder-terra-max)  e6_max_gate=codex-terra ;;
     builder-kimi-max)   e6_max_gate=kimi-k3 ;;
   esac
   set +e
@@ -10398,7 +10821,7 @@ echo "PASS 748r3 kimi seat rule resolves real TOML, env overlay, and disabled Th
 # rule refuses them before the marker check (asserted above), so a missing
 # marker is no longer the operative refusal for them.
 for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
-  builder-sol-high builder-sol-medium builder-terra-high builder-terra-xhigh \
+  builder-sol-high builder-sol-medium \
   builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
@@ -10636,13 +11059,13 @@ set -e
 [[ "$e6_eff_rc" -eq 2 ]] ||
   fail "builder-opus-low --effort medium must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
 set +e
-e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-terra@max \
-  spawn_base builder-terra-high --role builder --lane e6-eff2-lane --parent parent-lane \
+e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-sol@high \
+  spawn_base builder-sol-high --role builder --lane e6-eff2-lane --parent parent-lane \
   --effort max --job e6-eff2-mutant --t T1 2>&1)"
 e6_eff_rc=$?
 set -e
 [[ "$e6_eff_rc" -eq 2 ]] ||
-  fail "builder-terra-high --effort max must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+  fail "builder-sol-high --effort max must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
 set +e
 e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-sol@medium \
   spawn_base builder-sol-medium --role builder --lane e6-sol-eff-lane --parent parent-lane \
@@ -10680,15 +11103,15 @@ set -e
 # The pinned rung spelled out explicitly is allowed.
 : >"$TMP/herdr.log"
 set +e
-e6_same_out="$(SCOPEFUEL_E6_ARM=codex-terra@high \
-  spawn_base builder-terra-high --role builder --lane e6-same-lane --parent parent-lane \
+e6_same_out="$(SCOPEFUEL_E6_ARM=codex-sol@high \
+  spawn_base builder-sol-high --role builder --lane e6-same-lane --parent parent-lane \
   --effort high --job e6-same-effort --t T1 2>&1)"
 e6_same_rc=$?
 set -e
 [[ "$e6_same_rc" -eq 0 ]] ||
-  fail "builder-terra-high --effort high (the pinned rung) must be admitted (rc=$e6_same_rc): $e6_same_out"
+  fail "builder-sol-high --effort high (the pinned rung) must be admitted (rc=$e6_same_rc): $e6_same_out"
 grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
-  fail "builder-terra-high --effort high must keep the pinned rung: $e6_same_out"
+  fail "builder-sol-high --effort high must keep the pinned rung: $e6_same_out"
 # Role/hierarchy mutants for the new spellings.
 set +e
 e6_hier_out="$(SCOPEFUEL_E6_ARM=codex-sol@high \
@@ -10728,7 +11151,7 @@ echo "PASS builder-pilot-admits-worker-spellings"
 # refusal enumerates the builder profiles by name plus the worker-only
 # devin model variants (task 281, #635 ds41-max, #666 builder spellings —
 # the ds41 worker spellings stay refused under --role builder).
-for rejected in codex-terra codex-luna oc-solar4 devin-ds41 devin-ds41-max; do
+for rejected in codex-sol codex-luna oc-solar4 devin-ds41 devin-ds41-max; do
   set +e
   rejected_out="$(spawn_base "$rejected" --role builder --lane builder-lane --parent parent-lane --job "builder-reject-$rejected" --t T1 2>&1)"
   rejected_rc=$?
@@ -10797,7 +11220,7 @@ spawn_untyped() {
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" WRK_FIXTURE_SCENARIO=spawn \
     WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture "$@"
+    "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture "$@"
 }
 rm -f "$TMP/herdr.log" "$TMP/scopefuel.log"
 export TEST_ARBITER_BIN="$ARBITER"
@@ -10826,7 +11249,7 @@ canon_guard_spawn() {
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="$TMP/absent-arbiter" WRK_FIXTURE_SCENARIO=spawn \
     WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
-    "$WRK" spawn -c "$cwd" -m codex-terra -p "$PROMPT" -w w -l fixture --t T1
+    "$WRK" spawn -c "$cwd" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1
 }
 setup_temp_repo() {
   # $1 = dest dir. Creates a bare origin + clone with origin/HEAD = master (not main)
@@ -11973,7 +12396,7 @@ env -u HERDR_SESSION -u HERDR_SOCKET_PATH \
   WRK_COMPLETION_INTERVAL_S=1 WRK_SENTINEL_LOST_GRACE=0 \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
   WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
-  "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
+  "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture \
   --t T1 --job sentinel-env --owner lane-a >/dev/null
 ENV_PIDFILE="$ENV_INBOX/sentinel-env/completion-sentinel.pid"
 [[ -s "$ENV_PIDFILE" ]] || fail "spawn must start a completion sentinel once the job is registered"
@@ -12005,7 +12428,7 @@ for keep_case in kept plain; do
     WRK_FIXTURE_LOG="$TMP/spawn-keep-herdr.log" WRK_COMPLETION_INTERVAL_S=1 \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
-    "$WRK" spawn -c "$ROOT" -m codex-terra -p "$PROMPT" -w w -l fixture \
+    "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture \
     --t T1 --job "spawn-keep-$keep_case" --owner lane-a ${keep_args[@]+"${keep_args[@]}"} >/dev/null ||
     fail "#603: spawn ($keep_case) must succeed"
   kill "$(head -n 1 "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null)" 2>/dev/null || true
@@ -12017,7 +12440,7 @@ def receipt(directory):
     assert len(paths) == 1, "exactly one job.spawned receipt, got %r" % paths
     return json.load(open(paths[0]))["payload"]
 kept, plain = receipt(sys.argv[1]), receipt(sys.argv[2])
-base = {"pane_id": "w:p1", "label": "fixture", "profile": "codex-terra", "workspace": "w", "tab_id": "w:t1",
+base = {"pane_id": "w:p1", "label": "fixture", "profile": "codex-luna", "workspace": "w", "tab_id": "w:t1",
         "task_id": 76801}
 assert plain == base, "a spawn without --keep must write the unchanged receipt, got %r" % plain
 assert kept == dict(base, keep=True), "--keep must record keep: true on the receipt, got %r" % kept
@@ -12026,7 +12449,7 @@ PY
 grep -q -- '--keep' <<<"$("$WRK" spawn --help)" || fail "#603: spawn --help must document --keep"
 # bash 3.2 cannot `source <(...)`, so the two functions go through a file.
 sed -n '/^wrk_option_token()/,/^}/p;/^spillover_hub_args()/,/^}/p' "$WRK" >"$TMP/spill-keep-funcs.sh"
-spill_keep_err="$(bash -c '. "$1"; spillover_hub_args -m codex-terra -l fixture --keep' _ "$TMP/spill-keep-funcs.sh" 2>&1)" &&
+spill_keep_err="$(bash -c '. "$1"; spillover_hub_args -m codex-luna -l fixture --keep' _ "$TMP/spill-keep-funcs.sh" 2>&1)" &&
   fail "#603: a hub spill-over must refuse --keep rather than silently drop the marker"
 grep -q "option '--keep' is not permitted for a hub spawn" <<<"$spill_keep_err" ||
   fail "#603: the hub spill-over refusal must name --keep: $spill_keep_err"
@@ -13008,4 +13431,5 @@ wait "$waiter_job" || fail "run did not start after the load gate opened"
 [[ -e "$TMP/heavy-load-ran2" ]] || fail "load-gated run never executed"
 echo "PASS heavy-load-gate-bounds-the-start"
 
+bash "$ROOT/tests/test-shellcheck-capped.sh"
 echo 'PASS test-wrk'

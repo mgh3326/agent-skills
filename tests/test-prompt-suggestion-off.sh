@@ -187,7 +187,7 @@ done
 echo "PASS cc-profile-env preserved alongside setting"
 
 # Non-Claude kinds are untouched.
-for model in codex-sol codex-terra kiro-sol kimi-k3 kimi-k3-low devin-swe2 grok-hi oc-glm; do
+for model in codex-sol codex-luna kiro-sol kimi-k3 kimi-k3-low devin-swe2 grok-hi oc-glm; do
   log="$(spawn_log "$WRK" "$model")"
   tab_lacks_setting "$model" "$log" || exit 1
 done

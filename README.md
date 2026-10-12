@@ -85,6 +85,15 @@ Shadow tester eligibility: `director/bin/tester-eligible` reads evidence and wri
 | `wt` (worktrunk) | worktree 생성 + .env 자동 연결 | raw `git worktree add` + 수동 .env 심링크 |
 | `~/bin/herdr-spawn` | **deprecated** — `wrk spawn` 으로 위임하는 shim(옛 경로 호환용) | `wrk spawn` |
 
+## Local ShellCheck
+
+Run local checks through `scripts/shellcheck-capped`, which reads ShellCheck options from the CI workflow and applies a 2048 MB memory cap by default. On pi and oci, use `--changed origin/main` for an advisory check of changed `bin/wrk` functions; this compares the merge base with the working tree, so uncommitted edits are included. The selected functions are checked with the working-tree contents and without their full-file context. Leave the full `bin/wrk` check to CI. CI continues to run its existing direct ShellCheck step.
+
+```sh
+scripts/shellcheck-capped tests/test-wrk.sh
+scripts/shellcheck-capped --changed origin/main -- bin/wrk tests/test-wrk.sh
+```
+
 ## 설치 점검 (fleet-rev)
 
 머지마다 데스크가 5대 호스트에 네 도구를 손으로 재설치한다. `bin/fleet-rev`는
@@ -153,8 +162,10 @@ wrk heavy -- <cmd>     # 호스트당 1개, 대기 상한 20분(rc 75), nice -n 
 wrk heavy status       # 보유자·대기열·load_wait 상태
 ```
 
-`-m`은 필수이며 `codex-terra`, `codex-luna`, `codex-sol`처럼 모델을 드러내는
-canonical 이름과 기존 codex 별칭을 함께 지원한다. 쿼터 판정은 설치된
+`-m`은 필수이며 `codex-luna`, `codex-sol`처럼 모델을 드러내는 canonical 이름과
+기존 허용 codex 별칭을 함께 지원한다. `codex-terra`, `codex-terra-max`, `codex-med`와
+`builder-terra-*`는 gpt-5.6-terra가 금지되어 operator 2026-10-12 noterra에 따라
+spawn이 거부된다. 쿼터 판정은 설치된
 `scopefuel gate`에 위임한다. 은퇴한 agy TUI 프로필의 비상 headless 백업은
 `agy -p "$(cat PROMPT_FILE)"`이다.
 
@@ -244,7 +255,7 @@ herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000
 빌더 운용 범위(A+ 급 작업의 T1·T2)의 정본은 `spawn-worker/SKILL.md` §2-2 급표의 `builder-devin` 행이다.
 #704(#594 E6 측정)는 런그별 빌더 철자 `builder-opus-low`·`builder-opus-medium`·
 `builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·`builder-sol-max`·
-`builder-luna-max`·`builder-terra-high`·`builder-terra-xhigh`·`builder-terra-max`·
+`builder-luna-max`·
 `builder-kimi-high`·`builder-kimi-max`를 추가한다 — 이름의 마지막 구간이 고정 런그이고,
 `SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식 없이는 스폰이 거부된다(게이트가 에스컬레이션으로
 표시한 런그도 명시 `--effort` 런그에는 `--operator-request` REF를 요구하지 않는다 — scopefuel
@@ -255,8 +266,8 @@ herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000
 각각 `SCOPEFUEL_E6_ARM=grok-hi@low|medium|xhigh` 표식이 필요하고, grok·sol-medium 런그는
 에스컬레이션이 아니므로 `--operator-request`는 불요다. 기존 `builder-grok`은 그대로
 무표식(게이트는 `grok-hi` 기본 런그 판정), `builder-sol-high`도 #704 그대로다.
-2026-09-26 운영자 결정으로 max 런그 철자 5개(`builder-sonnet-max`·
-`builder-sol-max`·`builder-luna-max`·`builder-terra-max`·`builder-kimi-max`)는 닫혔다 —
+2026-09-26 운영자 결정으로 max 런그 철자 4개(`builder-sonnet-max`·
+`builder-sol-max`·`builder-luna-max`·`builder-kimi-max`)는 닫혔다 —
 빌더 좌석은 max 를 쓰지 않으므로 wrk 가 표식과 무관하게 거부한다.
 #921(2026-09-29 운영자 보고, Sonnet 5.5 실험 E1/E2)은 비-런그 빌더 철자
 `builder-sonnet`을 연다 — `builder-opus`의 argv 모양(`--model sonnet`

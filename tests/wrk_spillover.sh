@@ -112,7 +112,7 @@ run_wrk() {
     WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
     WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" \
     WRK_PLACE_LOG="$TMP/place.log" WRK_SPILLOVER_CANDIDATES_LOG="$TMP/candidates.log" \
-    "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" -l fixture --t T1 \
+    "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" -l fixture --t T1 \
     --job "${WRK_TEST_JOB:-spillover-$RANDOM-$RANDOM}" "$@"
 }
 
@@ -168,7 +168,7 @@ run_hub() {
   # ordinary worker cases an explicit task so the remote-task guard does not
   # intentionally refuse the via=hub requests covered by the separate test.
   if [[ "$has_task_link" -eq 0 ]]; then task_args+=(--task "$HK_TASK_ID"); fi
-  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" HANDOFFKEEP_BIN="$HK_FIXTURE" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-terra -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "${task_args[@]}" "$@"
+  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" HANDOFFKEEP_BIN="$HK_FIXTURE" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "${task_args[@]}" "$@"
 }
 
 assert_no_hub_leak() {

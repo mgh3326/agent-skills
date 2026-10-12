@@ -110,7 +110,7 @@ chmod +x "$TMP/remote-bin/wrk"
 
 run_remote() {
   local binary="$1"; shift
-  local model="${WRK_CASE_MODEL:-codex-terra}" label="${WRK_CASE_LABEL:-remote-child}"
+  local model="${WRK_CASE_MODEL:-codex-luna}" label="${WRK_CASE_LABEL:-remote-child}"
   local job="${WRK_CASE_JOB:-remote-$RANDOM-$RANDOM}" config="${WRK_CASE_CONFIG:-$CONFIG}"
   env HOME="$HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_DATA_HOME="$XDG_DATA_HOME" \
     XDG_STATE_HOME="$XDG_STATE_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
@@ -204,7 +204,7 @@ grep -q -- '--task 9' "$TMP/ssh.log" || { echo 'FAIL T4 explicit task was droppe
 ! grep -q 'HK_TASK_ID=' "$TMP/ssh.log" || { echo 'FAIL T4 added an env task' >&2; exit 1; }
 grep -q '^HK_TASK_ID=<unset>$' "$TMP/remote-wrk.log" || { echo 'FAIL T4 target received an added task env' >&2; exit 1; }
 t4_baseline_args=(env HERDR_SESSION=worker wrk spawn -c "$REMOTE_CWD" -p "$REMOTE_PROMPT_PATH" --host local \
-  -m codex-terra -w workers -l remote-child --t T1 --job t4-explicit --task 9)
+  -m codex-luna -w workers -l remote-child --t T1 --job t4-explicit --task 9)
 printf -v t4_baseline_cmd '%q ' "${t4_baseline_args[@]}"
 t4_expected_line="-o BatchMode=yes desktop ${t4_baseline_cmd}; rc=\$?; rm -f -- $(printf '%q' "$REMOTE_PROMPT_PATH"); exit \$rc"
 [[ "$(tail -n 1 "$TMP/ssh.log")" == "$t4_expected_line" ]] || {
@@ -282,7 +282,7 @@ import sys
 
 source = Path(sys.argv[1]).read_text()
 early = '  spillover_resolve_remote_task "${filtered[@]}"\n'
-late_marker = '  SPILL_REMOTE_STEP="scp"\n'
+late_marker = '  spillover_remote_step "$host" scp\n'
 assert source.count(early) == 1
 assert source.count(late_marker) == 1
 source = source.replace(early, "", 1)
