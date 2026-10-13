@@ -99,5 +99,6 @@ jobs:
           bash tests/test-wrk-job-end.sh
           bash tests/test-fleet-rev.sh
           bash tests/test-gate-policy-devin-grades.sh
+          python3 tests/test-node-ops.py
       - name: Mock MCP isolation, project migration and assertion mutants (fake only)
         run: python -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
