@@ -10384,22 +10384,73 @@ def log_event(rec):
               file=sys.stderr)
 
 
-def flock_held(path):
-    # NB flock probe: True iff another process holds the file. Never mints
-    # the slot — a missing file cannot be held. O_NOFOLLOW: a symlink
-    # planted at the predictable slot name is not followed (hk 1545).
+def slot_probe(path):
+    # NB flock probe: an open fd iff the path is a conforming slot inode —
+    # a plain file, one link, owned by this uid — that another process
+    # holds flocked right now; the caller may then read the holder record
+    # through the returned fd (no second open to race a swap) and must
+    # close it. Never mints the slot — a missing file cannot be held.
+    # O_NOFOLLOW refuses a planted symlink; the fstat refuses a planted
+    # hardlink or a foreign inode at the same predictable name — a file
+    # another local user linked in is not a slot (hk 1545).
     try:
         fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
     except OSError:
-        return False
+        return None
+    held = False
     try:
-        try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return True
-        return False
-    finally:
+        st = os.fstat(fd)
+        if (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and
+                st.st_uid == os.getuid()):
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                held = True
+    except OSError:
+        pass
+    if not held:
         os.close(fd)  # close also releases a probe that did acquire
+        return None
+    return fd
+
+
+def flock_held(path):
+    fd = slot_probe(path)
+    if fd is None:
+        return False
+    os.close(fd)
+    return True
+
+
+def waiters_dir_fd():
+    # Open the waiters dir itself, never through a link: O_DIRECTORY pins
+    # the object to a real directory and O_NOFOLLOW refuses a symlink at
+    # the waiters name — a repointable link is exactly the foreign-party-
+    # controls-names case the run path refuses outright (hk 1545 r2).
+    # Callers that then listdir/open/rename/remove through this fd cannot
+    # have their operations redirected by a same-name path swap either.
+    try:
+        return os.open(waiters_dir,
+                       os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return None
+
+
+def read_waiter_record(dirfd, name):
+    # A record entry is opened through the dir fd with O_NOFOLLOW and
+    # O_NONBLOCK: a link swapped in after the regular-file check is refused
+    # outright and a fifo swapped in can never block the read (hk 1545).
+    # "" means the entry is not a readable record.
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=dirfd)
+    except OSError:
+        return ""
+    try:
+        with os.fdopen(fd, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
 
 
 if args[0] == "status":
@@ -10420,42 +10471,57 @@ if args[0] == "status":
     paths = known_slots()
     holders = []
     for p in paths:
-        if flock_held(p):
-            holders.append((slot_index(p), read_text(p) or "(info unreadable)"))
+        sfd = slot_probe(p)
+        if sfd is not None:
+            try:
+                info = os.pread(sfd, 8192, 0).decode("utf-8", "replace")
+            except OSError:
+                info = ""
+            os.close(sfd)
+            holders.append((slot_index(p),
+                            info.strip() or "(info unreadable)"))
     for i, hinfo in holders:
         print("holder " + (("slot=%d " % i) if len(paths) > 1 else "")
               + with_class(hinfo))
     if not holders:
         print("holder none")
     waiters = []
-    try:
-        names = sorted(os.listdir(waiters_dir))
-    except OSError:
-        names = []
+    # O_DIRECTORY|O_NOFOLLOW on the dir itself: a link planted at the
+    # waiters name is not followed into another user's dir, and listing
+    # through the fd cannot be redirected by a same-name swap after open.
+    wfd = waiters_dir_fd()
+    names = []
+    if wfd is not None:
+        try:
+            names = sorted(os.listdir(wfd))
+        except OSError:
+            names = []
     for name in names:
         if name.startswith("."):
             continue  # a record being published (see publish_record)
-        path = os.path.join(waiters_dir, name)
         try:
             # A planted symlink or fifo is never opened as a record: in a
             # shared (sticky) waiters dir another user can still create
             # entries, and a record read must not follow one elsewhere.
-            if not stat.S_ISREG(os.lstat(path).st_mode):
+            if not stat.S_ISREG(os.stat(name, dir_fd=wfd,
+                                        follow_symlinks=False).st_mode):
                 continue
         except OSError:
             continue
-        info = read_text(path)
+        info = read_waiter_record(wfd, name)
         # The pid is the first field of the record we write — never scan
         # later fields, or a `pid=` token inside the command text would make
         # a live waiter look dead here (record_head reads the head only).
         pid = record_head(info)[0]
         if pid > 0 and not alive(pid):
             try:
-                os.remove(path)
+                os.remove(name, dir_fd=wfd)
             except OSError:
                 pass
             continue
         waiters.append(with_class(info) if info else name)
+    if wfd is not None:
+        os.close(wfd)
     for w in waiters:
         print("waiter " + w)
     if not waiters:
@@ -10525,20 +10591,20 @@ def ci_reserved():
     # reserves nothing — priority degrades to the old free-for-all, it never
     # idles a slot on a record that cannot say which slots it wants.
     try:
-        names = os.listdir(waiters_dir)
+        names = os.listdir(waiters_fd)
     except OSError:
         return 0
     reserved = 0
     for name in names:
         if name.startswith("."):
             continue  # a record being published (see publish_record)
-        path = os.path.join(waiters_dir, name)
         try:
-            if not stat.S_ISREG(os.lstat(path).st_mode):
+            if not stat.S_ISREG(os.stat(name, dir_fd=waiters_fd,
+                                        follow_symlinks=False).st_mode):
                 continue  # a planted link or fifo is not a record
         except OSError:
             continue
-        pid, cls, lim = record_head(read_text(path))
+        pid, cls, lim = record_head(read_waiter_record(waiters_fd, name))
         if cls != "ci" or pid <= 0 or pid == os.getpid():
             continue
         if lim is None or lim < 1 or not alive(pid):
@@ -10647,36 +10713,48 @@ if nested_fd is not None:
                "rc": nrc})
     raise SystemExit(nrc)
 
-def waiters_dir_trusted():
+def waiters_dir_open():
     # hk 1545: the waiters dir sits next to the lock, which defaults under
     # /tmp, so before a record is published the dir must not hand another
-    # local user control over names in it. Fail closed: a dir owned by a
-    # different uid is refused (its owner can rename or delete entries even
-    # under the sticky bit), and a group/other-writable dir without the
-    # sticky bit is refused (any local user could then remove or replace
-    # records). A writable dir WITH the sticky bit stays usable: files in
-    # it are still only removable by their owner, and mkstemp's
-    # unpredictable O_EXCL tmp name is what closes the plant-a-symlink hole.
+    # local user control over names in it. Fail closed: the open itself
+    # refuses a symlink at the waiters name (its owner could repoint it
+    # after any path check — waiters_dir_fd), and fstat then checks the
+    # object the fd holds: a dir owned by a different uid is refused (its
+    # owner can rename or delete entries even under the sticky bit), and
+    # a group/other-writable dir without the sticky bit is refused (any
+    # local user could then remove or replace records). A writable dir
+    # WITH the sticky bit stays usable: files in it are still only
+    # removable by their owner, and mkstemp's unpredictable O_EXCL tmp
+    # name is what closes the plant-a-symlink hole. The returned fd is
+    # kept for the run: every later record create-target, rename, list
+    # and unlink goes through dir_fd, so no path re-resolution can move
+    # a publish or a cleanup into a swapped-in dir.
+    fd = waiters_dir_fd()
+    if fd is None:
+        return -1
     try:
-        st = os.stat(waiters_dir)
+        st = os.fstat(fd)
+        trusted = (st.st_uid == os.getuid() and
+                   not (st.st_mode & 0o022 and
+                        not st.st_mode & stat.S_ISVTX))
     except OSError:
-        return False
-    if st.st_uid != os.getuid():
-        return False
-    if st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX:
-        return False
-    return True
+        trusted = False
+    if not trusted:
+        os.close(fd)
+        return -1
+    return fd
 
 
 try:
     os.makedirs(waiters_dir, exist_ok=True)
 except OSError as e:
     fail("cannot create waiters dir %s: %s" % (waiters_dir, e), EXIT_REFUSED)
-if not waiters_dir_trusted():
-    fail("refusing untrusted waiters dir %s (must be owned by uid %d; a "
-         "group/other-writable dir must carry the sticky bit)"
-         % (waiters_dir, os.getuid()), EXIT_REFUSED)
-me = os.path.join(waiters_dir, str(os.getpid()))
+waiters_fd = waiters_dir_open()
+if waiters_fd < 0:
+    fail("refusing untrusted waiters dir %s (must be owned by uid %d and "
+         "not a symlink; a group/other-writable dir must carry the sticky "
+         "bit)" % (waiters_dir, os.getuid()), EXIT_REFUSED)
+me_name = str(os.getpid())
 held_slot = -1
 acquired_at = None
 run_at = None
@@ -10717,20 +10795,24 @@ def publish_record():
     # pass reads a whole record or none (never the empty file an open-then-
     # write leaves for a moment). mkstemp picks that dot name (hk 1545):
     # O_EXCL on an unpredictable name, already open, so a symlink another
-    # local user pre-planted at the old .<pid>.tmp is never followed. This
-    # precedes this waiter's first slot attempt. A ci waiter counts as
-    # queued from the rename on.
+    # local user pre-planted at the old .<pid>.tmp is never followed. The
+    # rename and the cleanup unlink run through waiters_fd (hk 1545 r2):
+    # they land in the exact dir the trust check opened, never in whatever
+    # the waiters path might be repointed to. This precedes this waiter's
+    # first slot attempt. A ci waiter counts as queued from the rename on.
     global record_tmp
     fd, tmp = tempfile.mkstemp(dir=waiters_dir, prefix=".")
-    record_tmp = tmp
+    record_tmp = os.path.basename(tmp)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(info)
-        os.replace(tmp, me)
+        os.replace(record_tmp, me_name,
+                   src_dir_fd=waiters_fd, dst_dir_fd=waiters_fd)
+        record_tmp = None
     finally:
         if record_tmp is not None:
             try:
-                os.remove(record_tmp)
+                os.remove(record_tmp, dir_fd=waiters_fd)
             except OSError:
                 pass
             record_tmp = None
@@ -10742,16 +10824,31 @@ def publish_record():
 # therefore stays held for as long as any inheriting descendant lives — the
 # lock's lifetime is the holder's process tree, not just this wrapper.
 slot_paths = limit_slots()
-# The slot files are predictable names under /tmp too: O_NOFOLLOW refuses a
-# pre-planted symlink instead of letting the flock win and the truncate
-# below rewrite its target (same attack class as the old record tmp name).
+# The slot files are predictable names under /tmp too: O_NOFOLLOW refuses
+# a pre-planted symlink, and the fstat refuses the rest of that attack
+# class (hk 1545 r2): a planted hardlink or a foreign file would still
+# open, then be flocked, truncated and rewritten through the victim's
+# inode — a slot must be a plain file, one link, owned by this uid; a
+# fifo or device at the name is refused cleanly here instead of dying on
+# the flock below.
 slot_fds = []
 for _sp in slot_paths:
     try:
-        slot_fds.append(os.open(_sp, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW,
-                                0o644))
+        _fd = os.open(_sp, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o644)
     except OSError as e:
         fail("cannot open heavy slot %s: %s" % (_sp, e), EXIT_REFUSED)
+    try:
+        _st = os.fstat(_fd)
+    except OSError as e:
+        os.close(_fd)
+        fail("cannot stat heavy slot %s: %s" % (_sp, e), EXIT_REFUSED)
+    if not (stat.S_ISREG(_st.st_mode) and _st.st_nlink == 1 and
+            _st.st_uid == os.getuid()):
+        os.close(_fd)
+        fail("refusing untrusted heavy slot %s (must be a plain file "
+             "with one link owned by uid %d)" % (_sp, os.getuid()),
+             EXIT_REFUSED)
+    slot_fds.append(_fd)
 try:
     publish_record()
     while True:
@@ -10811,7 +10908,7 @@ try:
     acquired_at = time.monotonic()
     end_defer("acquired")
     try:
-        os.remove(me)
+        os.remove(me_name, dir_fd=waiters_fd)
     except OSError:
         pass
     os.ftruncate(held_fd, 0)
@@ -10853,14 +10950,15 @@ try:
     raise SystemExit(rc)
 finally:
     end_defer("exit")
-    for leftover in (me, record_tmp,
-                     os.path.join(waiters_dir, ".%d.tmp" % os.getpid())):
+    for leftover in (me_name, record_tmp,
+                     ".%d.tmp" % os.getpid()):
         if leftover is None:
             continue
         try:
-            os.remove(leftover)
+            os.remove(leftover, dir_fd=waiters_fd)
         except OSError:
             pass
+    os.close(waiters_fd)
     if held_fd is not None:
         if run_at is not None:
             log_event({"kind": "run", "cmd": cmd_summary[:200],
