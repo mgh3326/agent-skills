@@ -5,9 +5,13 @@
 # shared heavy lock: while a live ci waiter is queued, lane waiters skip the
 # slots it could take (index below the limit it queued under) so the next
 # slot to free goes to it. Nothing is preempted; a dead ci waiter's leftover
-# record reserves nothing; a lane waiter stops deferring after
-# WRK_HEAVY_CI_DEFER_MAX seconds (default 1800); slots above the ci waiter's
-# limit stay open to lanes (the desktop runner runs WRK_HEAVY_MAX=1).
+# record reserves nothing; a lane waiter stops deferring once it has spent
+# WRK_HEAVY_CI_DEFER_MAX seconds (default 1800) actually deferring to a live
+# ci waiter (time with none queued does not count); slots above the ci
+# waiter's limit stay open to lanes (the desktop runner runs WRK_HEAVY_MAX=1).
+# The order is read from the waiters dir, not a lock: records are published
+# atomically, a lane pass already past its scan may still take a slot, and the
+# documented windows are pinned below (heavy-class-documented-windows).
 #
 # Stub commands only. HOME and every XDG dir point into a temp dir, every
 # lock, waiters dir, load file and log is a temp path, and only pids this
@@ -90,8 +94,8 @@ EOF
 release() { local n; for n in "$@"; do : >"$TMP/$n.rel"; done; }
 
 bg_heavy() { # bg_heavy <name> [VAR=val...]: <name>.sh under wrk heavy; pid -> BG
-  local name="$1"; shift
-  env "$@" "$WRK" heavy -- bash "$TMP/$name.sh" >"$TMP/$name.out" 2>&1 &
+  local name="$1"; shift # HEAVY_BIN overrides the wrk binary (mutant copies)
+  env "$@" "${HEAVY_BIN:-$WRK}" heavy -- bash "$TMP/$name.sh" >"$TMP/$name.out" 2>&1 &
   BG=$!
   PIDS+=("$BG")
 }
@@ -128,10 +132,12 @@ PY
 # ── static: docs name the class and the guard; no signal path exists ───────
 help_out="$("$WRK" heavy --help)"
 for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 'class=ci|lane' \
-  'kind=defer' 'preempt'; do
+  'kind=defer' 'preempt' 'not a lock' 'renamed into place' 'starting up' \
+  'spent WRK_HEAVY_CI_DEFER_MAX'; do
   grep -qF -- "$token" <<<"$help_out" || fail "heavy --help must mention: $token"
 done
-for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 kind=defer; do
+for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 kind=defer \
+  '원자적' '약속하지 않는 것'; do
   grep -qF -- "$token" "$ROOT/spawn-worker/SKILL.md" ||
     fail "spawn-worker/SKILL.md heavy section must mention: $token"
 done
@@ -144,6 +150,9 @@ sig = re.findall(r"os\.(?:kill|killpg)\([^)]*\)|\.(?:kill|terminate|send_signal)
                  r"import[^\n]*\bsignal\b|from signal\b", half)
 # alive() probes with signal 0; nothing in the heavy path may signal a holder
 assert sig == ["os.kill(pid, 0)"], ("a signal path exists in wrk heavy", sig)
+# the waiter record is published by rename, never by open-then-write in place
+assert "os.replace(tmp, me)" in half, "waiter record is not renamed into place"
+assert 'open(me, "w"' not in half, "waiter record is written in place again"
 PY
 echo "PASS heavy-class-static-docs-and-no-signal-path"
 
@@ -428,17 +437,162 @@ assert runs and runs[-1]["class"] == "lane", runs
 PY
 echo "PASS heavy-class-log-rows-carry-class"
 
-# ── assertion-RED mutants over a copy of bin/wrk ───────────────────────────
+
+# ── a ci record that becomes visible while a lane is already queued ────────
+# Honoured from the lane's next pass: the freed slot is NOT taken, and the
+# lane runs once the ci waiter is gone.
+new_lock s2b
+mkhold s2b-H; mkhold s2b-L
+release s2b-L
+bg_heavy s2b-H; ph=$BG
+wait_until 10 started s2b-H || fail "s2b: holder never started"
+bg_heavy s2b-L; pl=$BG
+wait_until 10 queued s2b-L lane 1 || fail "s2b: lane never queued"
+sleep 1.2 # several passes with no ci waiter at all
+fake_ci 1
+sleep 1.2 # the lane's next passes see it
+release s2b-H
+wait "$ph" || fail "s2b: holder failed"
+sleep 3
+started s2b-L && fail "s2b: the lane took the freed slot although a ci record had been visible for several passes"
+kill_own "$FAKE"
+wait_until 10 started s2b-L || fail "s2b: the lane never ran after the ci waiter died"
+wait "$pl" || fail "s2b: lane run failed"
+echo "PASS heavy-class-ci-record-honoured-from-next-pass"
+
+# ── the guard counts only time actually spent deferring ────────────────────
+# ci#1 is live ~2 s, nothing is queued for 6 s (the clock pauses), then a late
+# ci#2 appears. With DEFER_MAX=7 the guard must fire after ~5 s more of
+# deferring to ci#2, not at once. A clock that kept running through the gap
+# (the previous behaviour) would be spent at ci#2's first pass.
+new_lock s2c
+mkhold s2c-H; mkhold s2c-L
+release s2c-L
+bg_heavy s2c-H; ph=$BG
+wait_until 10 started s2c-H || fail "s2c: holder never started"
+fake_ci 1
+ci1=$FAKE
+bg_heavy s2c-L WRK_HEAVY_CI_DEFER_MAX=7; pl=$BG
+wait_until 10 queued s2c-L lane 1 || fail "s2c: lane never queued"
+sleep 1.5
+kill_own "$ci1"
+sleep 6 # no live ci waiter: this must not count
+fake_ci 1
+sleep 1
+release s2c-H
+wait "$ph" || fail "s2c: holder failed"
+sleep 2
+started s2c-L && fail "s2c: the guard fired at the late ci waiter's first pass — idle time was counted"
+wait_until 15 started s2c-L || fail "s2c: the guard never released the lane"
+kill_own "$FAKE"
+wait "$pl" || fail "s2c: lane run failed"
+log_rows defer s2c-L | python3 -c '
+import json, sys
+rows = [json.loads(l) for l in sys.stdin.read().splitlines()]
+assert len(rows) == 1, rows
+r = rows[0]
+assert r["reason"] == "guard" and r["class"] == "lane", r
+assert 6.5 <= r["defer_s"] <= 9.5, r
+# the 6 s with no ci waiter are in wait_s but not in defer_s
+assert r["wait_s"] - r["defer_s"] >= 5, r
+'
+echo "PASS heavy-class-guard-counts-only-deferred-time"
+
+# ── waiter records are published atomically ────────────────────────────────
+# A poller reads every record in the waiters dir as fast as it can while
+# several ci waiters start. Every record it ever reads must be whole.
+cat >"$TMP/poll.py" <<'POLL'
+import os, sys, time
+d, out, secs = sys.argv[1], sys.argv[2], float(sys.argv[3])
+end = time.time() + secs
+whole = bad = 0
+while time.time() < end:
+    try:
+        names = os.listdir(d)
+    except OSError:
+        names = []
+    for n in names:
+        if n.startswith("."):
+            continue
+        try:
+            with open(os.path.join(d, n), encoding="utf-8") as f:
+                t = f.read()
+        except OSError:
+            continue
+        if t.startswith("pid=") and " class=" in t and " cmd=" in t:
+            whole += 1
+        else:
+            bad += 1
+with open(out, "w", encoding="utf-8") as f:
+    f.write("%d %d\n" % (whole, bad))
+POLL
+publish_flow() { # publish_flow <tag> <ci wrk binary>: "whole bad" counts -> $TMP/<tag>.poll
+  local tag="$1" bin="$2" i ph pp
+  new_lock "$tag"
+  mkhold "$tag-H"
+  bg_heavy "$tag-H"; ph=$BG
+  wait_until 10 started "$tag-H" || fail "$tag: holder never started"
+  python3 "$TMP/poll.py" "$WRK_HEAVY_LOCK.waiters" "$TMP/$tag.poll" 5 &
+  pp=$!
+  PIDS+=("$pp")
+  for i in 1 2 3 4 5 6; do
+    mkhold "$tag-C$i"
+    release "$tag-C$i"
+    HEAVY_BIN="$bin" bg_heavy "$tag-C$i" WRK_HEAVY_CLASS=ci
+  done
+  wait "$pp" || fail "$tag: poller failed"
+  release "$tag-H"
+  wait_until 40 test -e "$TMP/$tag-C1.done" -a -e "$TMP/$tag-C2.done" -a -e "$TMP/$tag-C3.done" \
+    -a -e "$TMP/$tag-C4.done" -a -e "$TMP/$tag-C5.done" -a -e "$TMP/$tag-C6.done" ||
+    fail "$tag: not every ci waiter ran after the holder was released"
+  wait "$ph" || fail "$tag: holder failed"
+}
+publish_flow s10 "$WRK"
+read -r whole bad <"$TMP/s10.poll"
+[[ "$whole" -ge 6 && "$bad" -eq 0 ]] ||
+  fail "s10: records were not published atomically (whole=$whole bad=$bad)"
+echo "PASS heavy-class-records-published-atomically"
+
+# ── the documented windows, pinned ─────────────────────────────────────────
+# What the docs do NOT promise: a lane pass already past its record scan when
+# a ci record appears may still take a slot that frees in that pass (the
+# records are not re-read before the slot attempts). This is a model: a copy
+# of wrk parks the pass right after the scan until a gate file exists. If
+# someone adds a re-check, this goes RED and the docs must change with it.
 mutant() { # mutant <name> <old> <new>: wrk copy with the unique <old> replaced
-  python3 - "$WRK" "$TMP/$1-wrk" "$2" "$3" <<'PY'
+  python3 - "$WRK" "$TMP/$1-wrk" "$2" "$3" <<'MUT'
 import sys
 src_path, out_path, old, new = sys.argv[1:]
 src = open(src_path, encoding="utf-8").read()
 assert src.count(old) == 1, ("mutant anchor must be unique", old, src.count(old))
 open(out_path, "w", encoding="utf-8").write(src.replace(old, new, 1))
-PY
+MUT
   chmod +x "$TMP/$1-wrk"
 }
+mutant inflight $'                reserved = ci_reserved()\n' \
+  $'                reserved = ci_reserved()\n                while not os.path.exists(os.environ["WRK_TEST_PASS_GATE"]):\n                    time.sleep(0.05)\n'
+new_lock s11
+mkhold s11-H; mkhold s11-L
+release s11-L
+bg_heavy s11-H; ph=$BG
+wait_until 10 started s11-H || fail "s11: holder never started"
+HEAVY_BIN="$TMP/inflight-wrk" bg_heavy s11-L WRK_TEST_PASS_GATE="$TMP/s11.gate"; pl=$BG
+wait_until 10 queued s11-L lane 1 || fail "s11: lane never queued"
+sleep 1 # the first pass is parked right after its scan, which read no ci record
+fake_ci 1
+release s11-H
+wait "$ph" || fail "s11: holder failed"
+started s11-L && fail "s11: the lane moved before the gate opened"
+: >"$TMP/s11.gate"
+wait_until 10 started s11-L ||
+  fail "s11: the in-flight pass no longer takes the slot — the documented window changed, update the docs"
+status_out | grep -q "^waiter pid=$FAKE class=ci limit=1 " ||
+  fail "s11: the ci record must still be queued"
+kill_own "$FAKE"
+wait "$pl" || fail "s11: lane run failed"
+echo "PASS heavy-class-documented-windows"
+
+# ── assertion-RED mutants over a copy of bin/wrk ───────────────────────────
 
 # nopriority: lanes never defer. RED proof: with a live ci waiter and a free
 # slot the lane runs at once — the s2 "kept waiting" assertion is what fails.
@@ -453,7 +607,7 @@ echo "PASS mutant-nopriority"
 
 # noguard: the guard never fires. RED proof: the lane that must acquire after
 # DEFER_MAX=1 instead waits out the cap (rc 75).
-mutant noguard 'if now - defer_since >= defer_max:' 'if False:'
+mutant noguard 'if defer_total + (now - defer_mark) >= defer_max:' 'if False:'
 new_lock m2
 fake_ci 1
 rc=0
@@ -532,6 +686,16 @@ wait_until 10 queued m6-C2 ci 1 || fail "mutant cidefers: second ci waiter never
 release m6-H
 wait "$mh" || fail "mutant cidefers holder failed"
 sleep 3
+# the idle slot only proves deferral if both waiters were alive, still queued
+# and the slot really free through the whole observation window
+if ! { kill -0 "$mc1" 2>/dev/null && kill -0 "$mc2" 2>/dev/null; }; then
+  fail "mutant cidefers: a waiter exited before the idle-slot check"
+fi
+if ! { queued m6-C1 ci 1 && queued m6-C2 ci 1; }; then
+  fail "mutant cidefers: a ci waiter left the queue before the idle-slot check"
+fi
+status_out | grep -q '^holder none' ||
+  fail "mutant cidefers: the slot was not free during the observation window"
 if started m6-C1 || started m6-C2; then
   fail "mutant cidefers still let a ci waiter take the slot — never-defer assertion is vacuous"
 fi
@@ -542,5 +706,43 @@ rm -f "$WRK_HEAVY_LOCK".waiters/*
 wait "$mc1" || fail "mutant cidefers: waiter 1 failed after the records were dropped"
 wait "$mc2" || fail "mutant cidefers: waiter 2 failed after the records were dropped"
 echo "PASS mutant-cidefers"
+
+
+# nogapclock: the guard clock keeps running while no ci waiter is queued (the
+# previous behaviour). RED proof: the late ci#2 of the s2c scenario finds the
+# guard already spent, so the lane takes the freed slot at once.
+mutant nogapclock $'                elif defer_mark is not None:\n' $'                elif False:\n'
+new_lock m7
+mkhold m7-H; mkhold m7-L
+release m7-L
+bg_heavy m7-H; ph=$BG
+wait_until 10 started m7-H || fail "mutant nogapclock holder never started"
+fake_ci 1
+ci1=$FAKE
+HEAVY_BIN="$TMP/nogapclock-wrk" bg_heavy m7-L WRK_HEAVY_CI_DEFER_MAX=5; pl=$BG
+wait_until 10 queued m7-L lane 1 || fail "mutant nogapclock lane never queued"
+sleep 1.5
+kill_own "$ci1"
+sleep 5 # a clock that runs through this gap is spent by now
+fake_ci 1
+sleep 1
+release m7-H
+wait "$ph" || fail "mutant nogapclock holder failed"
+wait_until 4 started m7-L ||
+  fail "mutant nogapclock still deferred — the gap-clock assertion is vacuous"
+kill_own "$FAKE"
+wait "$pl" || fail "mutant nogapclock lane failed"
+echo "PASS mutant-nogapclock"
+
+# nonatomic: the record is written in place, with the open-then-write gap
+# widened to 0.4 s. RED proof: the poller reads empty records that the
+# renaming code never exposes.
+mutant nonatomic $'    with open(tmp, "w", encoding="utf-8") as f:\n        f.write(info)\n    os.replace(tmp, me)\n' \
+  $'    with open(me, "w", encoding="utf-8") as f:\n        time.sleep(0.4)\n        f.write(info)\n'
+publish_flow m8 "$TMP/nonatomic-wrk"
+read -r whole bad <"$TMP/m8.poll"
+[[ "$bad" -ge 1 ]] ||
+  fail "mutant nonatomic still published whole records (whole=$whole bad=$bad) — the poller assertion is vacuous"
+echo "PASS mutant-nonatomic"
 
 echo 'PASS test-wrk-heavy-class'
