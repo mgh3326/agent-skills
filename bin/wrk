@@ -278,10 +278,12 @@ Options:
                      Mutually exclusive with --task. When neither is given, a
                      worker spawn tries the calling pane's ARBITER_JOB meta
                      and then the HK_TASK_ID env (propagated into every
-                     spawned pane) before the usage error. The inherited task
-                     is recorded in job meta (task_id + task_inherited_from)
-                     and the child never re-claims it — the owning job's hk
-                     record stands.
+                     spawned pane) before the usage error. SSH remote spawns
+                     resolve that task on the initiator and forward HK_TASK_ID;
+                     via=hub cannot carry an inherited environment and refuses
+                     before sending a request. The inherited task is recorded
+                     in job meta (task_id + task_inherited_from) and the child
+                     never re-claims it — the owning job's hk record stands.
   --task-hk-bypass   explicit operator override: spawn without a confirmed
                      hk task link when handoffkeep is unreachable. Recorded
                      in the job's claim payload as task_link_override so the
@@ -7210,6 +7212,13 @@ spillover_hub_poll() {
 spillover_hub_spawn() {
   local host="$1" cwd="$2" prompt="$3"; shift 3
   local cwd_key operator_env cf_env operator_token cf_client_id cf_client_secret hub_url base request_id request_body state parsed
+  # /v1/spawn carries the allowed argv but has no child-environment field.
+  # Do not send an inherited --parent-job request that the target cannot
+  # resolve; SSH delegation carries the same value through HK_TASK_ID instead.
+  if [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]]; then
+    echo "wrk: via=hub cannot forward an inherited task: /v1/spawn carries argv but no child environment; use SSH transport for --parent-job inheritance" >&2
+    return 2
+  fi
   if ! cwd_key="$(spillover_cwd_key "$host" "$cwd")"; then
     echo "wrk: remote host '$host' has no cwd_keys entry for '$cwd'; $(spillover_local_advice "configure hosts.toml")" >&2
     return 2
@@ -7540,7 +7549,9 @@ spillover_remote_spawn() {
   else
     remote_lane_name="$remote_label" remote_lane_route_parent="$remote_lane_owner"
   fi
-  local remote_args=(env "HERDR_SESSION=$session" wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
+  local remote_args=(env "HERDR_SESSION=$session")
+  [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
+  remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   # Builders only — forwarding the flag to a worker would mute the execution
   # host's own session-machine_ids check while this host then named the
   # worker's lane on machine=<host key>.
@@ -7895,6 +7906,9 @@ spawn_router_cmd() {
     return "$rc"
   fi
   [[ -n "$cwd" && -n "$prompt" ]] || die "-c CWD and -p PROMPT_FILE are required"
+  # Validate task inheritance before the probe, prepare, mktemp, or scp SSH
+  # legs. A failed lookup must be a local refusal with no remote side effect.
+  spillover_resolve_remote_task "${filtered[@]}"
   local candidates=("$selected") candidate candidate_via last_rc=1 seen_candidates=""
   local cand_err auto_diag="" cand_class
   # #1239 deferred-wake bookkeeping: wake_pending collects the wake-capable
@@ -8464,10 +8478,21 @@ PY
   else
     rc=$?
     if [[ "$rc" -eq 2 ]]; then
-      die "parent job '$parent' newest claim/reclaim event is unreadable — refusing to guess the task from older events"
+      die "parent job '$parent' newest claim/reclaim event is unreadable — refusing to guess the task from older events$(task_remote_hint)"
     fi
     TASK_ID=""
   fi
+}
+
+# Remote SSH delegation runs this same inheritance check on the initiator,
+# before its first SSH leg. Name the machine where the refusal happened so a
+# caller can distinguish an initiator-side failure from the target's answer.
+task_remote_hint() {
+  [[ "${TASK_REMOTE_INITIATOR:-0}" == 1 ]] || return 0
+  local host
+  host="$(hostname -s 2>/dev/null || true)"
+  [[ -n "$host" ]] || host=local
+  printf '; for a remote spawn the initiator must know the task; pass --task (resolution failed on host %s)' "$host"
 }
 
 # task_validate — usage-error stage: resolve TASK_ID or die before any side
@@ -8502,8 +8527,9 @@ task_validate() {
   # Worker/tester/advisory inheritance: the task comes from the parent job's
   # recorded meta, never guessed. Explicit --parent-job first, then the
   # calling session's own arbiter job (spawned panes carry ARBITER_JOB), then
-  # the propagated HK_TASK_ID env. For remote/hub spawns none of the local
-  # sources may exist — pass --task there (documented in wrk spawn --help).
+  # the propagated HK_TASK_ID env. SSH delegation resolves these same sources
+  # on its initiator before transport and forwards the value as HK_TASK_ID; the
+  # via=hub request has no environment field and refuses inherited tasks.
   local env_task=""
   if [[ -z "$PARENT_JOB" && -n "${ARBITER_JOB:-}" ]]; then
     PARENT_JOB="$ARBITER_JOB"
@@ -8522,21 +8548,56 @@ task_validate() {
       TASK_INHERITED_FROM="$PARENT_JOB"
     fi
     [[ -n "$TASK_ID" ]] ||
-      die "parent job '$PARENT_JOB' has no task_id in its claim/reclaim meta — pass --task explicitly or re-register the parent with --task"
+      die "parent job '$PARENT_JOB' has no task_id in its claim/reclaim meta — pass --task explicitly or re-register the parent with --task$(task_remote_hint)"
     { [[ "$TASK_ID" =~ ^[0-9]+$ ]] && (( 10#$TASK_ID >= 1 )); } ||
-      die "task id '$TASK_ID' resolved from parent job '$PARENT_JOB' is not a positive task id — pass --task explicitly"
+      die "task id '$TASK_ID' resolved from parent job '$PARENT_JOB' is not a positive task id — pass --task explicitly$(task_remote_hint)"
     TASK_LINK_MODE="inherited"
     return 0
   fi
   if [[ -n "$env_task" ]]; then
     { [[ "$env_task" =~ ^[0-9]+$ ]] && (( 10#$env_task >= 1 )); } ||
-      die "HK_TASK_ID env is not a positive task id ('$env_task') — pass --task explicitly"
+      die "HK_TASK_ID env is not a positive task id ('$env_task') — pass --task explicitly$(task_remote_hint)"
     TASK_ID="$env_task"
     TASK_LINK_MODE="inherited"
     TASK_INHERITED_FROM="env:HK_TASK_ID"
     return 0
   fi
-  die "--task <hk task id> is required for --role worker (decision/2026-09-27/task-job-linkage). Tester/advisory spawns may instead inherit the parent task: pass --parent-job <job>, or spawn from a registered job's pane where ARBITER_JOB/HK_TASK_ID is set"
+  die "--task <hk task id> is required for --role worker (decision/2026-09-27/task-job-linkage). Tester/advisory spawns may instead inherit the parent task: pass --parent-job <job>, or spawn from a registered job's pane where ARBITER_JOB/HK_TASK_ID is set$(task_remote_hint)"
+}
+
+# Resolve inheritance on the initiating host before remote placement probes.
+# Explicit --task and builder spawns keep their existing argv unchanged; an
+# inherited worker task is forwarded by the SSH transport as one env argv item.
+spillover_resolve_remote_task() {
+  SPILL_REMOTE_HK_TASK=""
+  local role=worker explicit_task=0 parent_job="" arg i=0 args=("$@")
+  while [[ "$i" -lt "${#args[@]}" ]]; do
+    arg="${args[$i]}"
+    case "$arg" in
+      --role|--task|--parent-job)
+        ((i+=1))
+        # Malformed options remain the target wrk's usage error; only valid
+        # inheritance requests need an initiator-side lookup here.
+        [[ "$i" -lt "${#args[@]}" ]] || return 0
+        case "$arg" in
+          --role) role="${args[$i]}" ;;
+          --task) explicit_task=1 ;;
+          --parent-job) parent_job="${args[$i]}" ;;
+        esac
+        ;;
+    esac
+    ((i+=1))
+  done
+  [[ "$role" != builder && "$role" != captain && "$explicit_task" -eq 0 ]] || return 0
+
+  local saved_role="${ROLE:-}" saved_task="${TASK_ID:-}" saved_parent="${PARENT_JOB:-}"
+  local saved_link_mode="${TASK_LINK_MODE:-}" saved_inherited_from="${TASK_INHERITED_FROM:-}"
+  local TASK_REMOTE_INITIATOR=1
+  ROLE="$role" TASK_ID="" PARENT_JOB="$parent_job"
+  task_validate
+  SPILL_REMOTE_HK_TASK="$TASK_ID"
+  ROLE="$saved_role" TASK_ID="$saved_task" PARENT_JOB="$saved_parent"
+  TASK_LINK_MODE="$saved_link_mode" TASK_INHERITED_FROM="$saved_inherited_from"
 }
 
 # hk_task_gate_failure — the hk-unreachable/undecidable funnel. The override
