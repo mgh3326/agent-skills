@@ -171,6 +171,8 @@ assert "os.O_DIRECTORY" in half, "waiters dir must open as a real directory"
 assert "dir_fd=waiters_fd" in half, "record ops must use the trusted dir fd"
 # r2: a planted hardlink or foreign inode at the slot name is not a slot
 assert "st_nlink == 1" in half, "slot opens must refuse a hardlinked inode"
+# r3: root-owned shared locks (desktop tmpfiles) stay usable
+assert "def owner_trusted" in half, "root-owned shared locks must pass"
 PY
 echo "PASS heavy-class-static-docs-and-no-signal-path"
 
@@ -903,7 +905,7 @@ out="$("$WRK" heavy -- touch "$TMP/t3h-ran" 2>&1)" || rc=$?
   fail "t3h: a hardlinked slot file must refuse rc 78, got rc=$rc: $out"
 [[ "$(cat "$TMP/victim-hl")" == "VICTIM-HARDLINK" ]] ||
   fail "t3h: the slot hardlink was used — victim rewritten"
-[[ "$(stat -f%z "$TMP/victim-hl" 2>/dev/null || stat -c%s "$TMP/victim-hl")" == "17" ]] ||
+[[ "$(stat -f%z "$TMP/victim-hl" 2>/dev/null || stat -c%s "$TMP/victim-hl")" == "16" ]] ||
   fail "t3h: the victim was truncated"
 [[ ! -e "$TMP/t3h-ran" ]] || fail "t3h: the command ran over a hardlinked slot file"
 "$WRK" heavy status | grep -q '^holder none' ||
@@ -938,6 +940,32 @@ grep -q 'untrusted waiters dir' <<<"$out" ||
   fail "t3s: status must stay readable on a symlinked waiters dir"
 echo "PASS heavy-tmp-symlinked-waiters-dir-refused"
 
+# ── hk 1545 r3: a root-owned lock and waiters dir are still usable ─────────
+# desktop's tmpfiles install creates /tmp/wrk-heavy-*.lock root-owned 0660
+# (runner granted by ACL) and .waiters root-owned 1770; refusing uid-0
+# objects would break every heavy run there. Simulated by a wrk copy whose
+# getuid() reports a uid that owns nothing, with the trusted-root slot
+# mapped onto our real uid — our own 0660 lock and 1770 dir play root's role.
+python3 - "$WRK" "$TMP/desktop-wrk" "$UID" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+me = sys.argv[3]
+src = src.replace("os.getuid()", "42424242").replace(
+    "42424242, 0", "42424242, " + me)
+assert "owner_trusted" in src and ("42424242, " + me) in src
+open(sys.argv[2], "w").write(src)
+PY
+chmod +x "$TMP/desktop-wrk"
+new_lock t3d
+: >"$WRK_HEAVY_LOCK"; chmod 0660 "$WRK_HEAVY_LOCK"
+chmod 1770 "$WRK_HEAVY_LOCK.waiters"
+"$TMP/desktop-wrk" heavy -- touch "$TMP/t3d-ran" ||
+  fail "t3d: a root-owned shared lock and waiters dir must be usable (desktop tmpfiles layout)"
+[[ -e "$TMP/t3d-ran" ]] || fail "t3d: the command did not run over the root-owned layout"
+"$TMP/desktop-wrk" heavy status >/dev/null ||
+  fail "t3d: status must stay readable over the root-owned layout"
+echo "PASS heavy-tmp-root-owned-desktop-layout"
+
 # ── hk 1545: a planted record symlink is never read ────────────────────────
 # A live-looking ci record behind a symlink would otherwise reserve every
 # slot for lanes; the scans read regular files only.
@@ -963,8 +991,10 @@ symlink_flow m9 vuln
 echo "PASS mutant-predtmp"
 
 # trustopen: the waiters-dir trust check never refuses. RED proof: the 0777
-# non-sticky dir that must refuse rc 78 accepts the run.
-mutant trustopen 'if waiters_fd < 0:' 'if False:'
+# non-sticky dir that must refuse rc 78 accepts the run. The cut lands
+# inside waiters_dir_open — dropping the caller-side guard would only
+# crash the mutant on a -1 fd.
+mutant trustopen '    if not trusted:' '    if False:'
 new_lock m10
 chmod 0777 "$WRK_HEAVY_LOCK.waiters"
 "$TMP/trustopen-wrk" heavy -- touch "$TMP/m10-ran" ||

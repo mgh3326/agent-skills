@@ -10384,6 +10384,16 @@ def log_event(rec):
               file=sys.stderr)
 
 
+def owner_trusted(st):
+    # The caller's own objects, and root's (hk 1545 r3): an unprivileged
+    # local user cannot create a root-owned file or dir at a predictable
+    # name, so uid 0 is as trusted as our own — operator-installed shared
+    # locks on desktop are root-owned on purpose, with the runner granted
+    # access by ACL. A hardlink to a root file still fails the nlink
+    # check, and mode rules below apply to any owner.
+    return st.st_uid in (os.getuid(), 0)
+
+
 def slot_probe(path):
     # NB flock probe: an open fd iff the path is a conforming slot inode —
     # a plain file, one link, owned by this uid — that another process
@@ -10401,7 +10411,7 @@ def slot_probe(path):
     try:
         st = os.fstat(fd)
         if (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and
-                st.st_uid == os.getuid()):
+                owner_trusted(st)):
             try:
                 fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
@@ -10719,22 +10729,23 @@ def waiters_dir_open():
     # local user control over names in it. Fail closed: the open itself
     # refuses a symlink at the waiters name (its owner could repoint it
     # after any path check — waiters_dir_fd), and fstat then checks the
-    # object the fd holds: a dir owned by a different uid is refused (its
-    # owner can rename or delete entries even under the sticky bit), and
-    # a group/other-writable dir without the sticky bit is refused (any
-    # local user could then remove or replace records). A writable dir
-    # WITH the sticky bit stays usable: files in it are still only
-    # removable by their owner, and mkstemp's unpredictable O_EXCL tmp
-    # name is what closes the plant-a-symlink hole. The returned fd is
-    # kept for the run: every later record create-target, rename, list
-    # and unlink goes through dir_fd, so no path re-resolution can move
-    # a publish or a cleanup into a swapped-in dir.
+    # object the fd holds: a dir owned by a uid that is neither ours nor
+    # root is refused (its owner can rename or delete entries even under
+    # the sticky bit), and a group/other-writable dir without the sticky
+    # bit is refused (any local user could then remove or replace
+    # records). A writable dir WITH the sticky bit stays usable: files in
+    # it are still only removable by their owner, and mkstemp's
+    # unpredictable O_EXCL tmp name is what closes the plant-a-symlink
+    # hole. The returned fd is kept for the run: every later record
+    # create-target, rename, list and unlink goes through dir_fd, so no
+    # path re-resolution can move a publish or a cleanup into a
+    # swapped-in dir.
     fd = waiters_dir_fd()
     if fd is None:
         return -1
     try:
         st = os.fstat(fd)
-        trusted = (st.st_uid == os.getuid() and
+        trusted = (owner_trusted(st) and
                    not (st.st_mode & 0o022 and
                         not st.st_mode & stat.S_ISVTX))
     except OSError:
@@ -10746,14 +10757,17 @@ def waiters_dir_open():
 
 
 try:
-    os.makedirs(waiters_dir, exist_ok=True)
+    # mode=0o700: a liberal umask (002) must not mint a group-writable dir
+    # this same run then refuses (hk 1545 r3); an existing dir is untouched
+    os.makedirs(waiters_dir, mode=0o700, exist_ok=True)
 except OSError as e:
     fail("cannot create waiters dir %s: %s" % (waiters_dir, e), EXIT_REFUSED)
 waiters_fd = waiters_dir_open()
 if waiters_fd < 0:
-    fail("refusing untrusted waiters dir %s (must be owned by uid %d and "
-         "not a symlink; a group/other-writable dir must carry the sticky "
-         "bit)" % (waiters_dir, os.getuid()), EXIT_REFUSED)
+    fail("refusing untrusted waiters dir %s (must be owned by uid %d or "
+         "root and not be a symlink; a group/other-writable dir must "
+         "carry the sticky bit)" % (waiters_dir, os.getuid()),
+         EXIT_REFUSED)
 me_name = str(os.getpid())
 held_slot = -1
 acquired_at = None
@@ -10828,7 +10842,8 @@ slot_paths = limit_slots()
 # a pre-planted symlink, and the fstat refuses the rest of that attack
 # class (hk 1545 r2): a planted hardlink or a foreign file would still
 # open, then be flocked, truncated and rewritten through the victim's
-# inode — a slot must be a plain file, one link, owned by this uid; a
+# inode — a slot must be a plain file, one link, owned by this uid or
+# root (operator-installed shared locks are root-owned on desktop); a
 # fifo or device at the name is refused cleanly here instead of dying on
 # the flock below.
 slot_fds = []
@@ -10843,10 +10858,10 @@ for _sp in slot_paths:
         os.close(_fd)
         fail("cannot stat heavy slot %s: %s" % (_sp, e), EXIT_REFUSED)
     if not (stat.S_ISREG(_st.st_mode) and _st.st_nlink == 1 and
-            _st.st_uid == os.getuid()):
+            owner_trusted(_st)):
         os.close(_fd)
         fail("refusing untrusted heavy slot %s (must be a plain file "
-             "with one link owned by uid %d)" % (_sp, os.getuid()),
+             "with one link owned by uid %d or root)" % (_sp, os.getuid()),
              EXIT_REFUSED)
     slot_fds.append(_fd)
 try:
