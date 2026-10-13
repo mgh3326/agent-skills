@@ -6741,9 +6741,11 @@ pinfo_seq_case() {  # NAME MODEL TOKENS... — one WRK_FIXTURE_PINFO_SEQUENCE pe
   local name="$1" model="$2"; shift 2
   printf '%s\n' "$@" >"$TMP/pinfo-seq-$name"
   rm -f "$TMP/pinfo-seq-$name.calls" "$TMP/inbox/fixture/pinfo-bad"
+  mkdir -p "$TMP/pinfo-tmpdir"
   : >"$TMP/herdr.log"
   set +e
   PINFO_CASE_OUT="$(WRK_FIXTURE_PINFO_SEQUENCE="$TMP/pinfo-seq-$name" \
+    TMPDIR="$TMP/pinfo-tmpdir" \
     PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
     TEST_FIXTURE_SCENARIO=spawn spawn_base "$model" 2>&1)"
   PINFO_CASE_RC=$?
@@ -6836,11 +6838,16 @@ grep -q 'bad_total=6' "$TMP/inbox/fixture/pinfo-bad" ||
   fail "1541 pinfo-bad must count every bad reply it saw: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
 grep -q 'consecutive_bad=1' "$TMP/inbox/fixture/pinfo-bad" ||
   fail "1541 a valid reply must reset the consecutive count: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
+# tester D1: the poll's stderr scratch file is consumed and deleted — after
+# six bad + seven good polls the scratch TMPDIR must hold nothing.
+if find "$TMP/pinfo-tmpdir" -name 'wrk-pinfo-err.*' | grep -q .; then
+  fail "1541 the stderr scratch file leaked into TMPDIR: $(ls "$TMP/pinfo-tmpdir")"
+fi
 # shellcheck disable=SC2016  # the pattern is bin/wrk source text, not an expansion
 devin_trust_mutant t1541-no-reset \
-  '          # A readable reply — ready or not — ends the unreadable run.
+  '          # stderr scratch file was never consumed; drop it here.
           pinfo_bad=0' \
-  '          # A readable reply — ready or not — ends the unreadable run.
+  '          # stderr scratch file was never consumed; drop it here.
           :'
 : >"$TMP/herdr.log"; rm -f "$TMP/pinfo-seq-alternating.calls" "$TMP/inbox/fixture/pinfo-bad"
 set +e

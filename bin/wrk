@@ -2323,7 +2323,13 @@ pinfo_note_bad() {
   # $1 class (exit = process-info rc non-zero, envelope = unreadable reply)
   # $2 the reply's own rc   $3 raw stdout   $4 file holding raw stderr
   local class="$1" bad_rc="$2" bad_out="$3" bad_err=""
-  [[ -z "$4" || ! -f "$4" ]] || bad_err="$(cat "$4" 2>/dev/null || true)"
+  if [[ -n "$4" && -f "$4" ]]; then
+    bad_err="$(cat "$4" 2>/dev/null || true)"
+    # The poll's stderr scratch file is consumed here — delete it or it
+    # would leak one tempfile per spawn into TMPDIR (tester D1).
+    rm -f "$4" 2>/dev/null || true
+    pinfo_err_file=""
+  fi
   pinfo_bad=$(( pinfo_bad + 1 ))
   pinfo_bad_total=$(( pinfo_bad_total + 1 ))
   if [[ -z "$pinfo_first_class" ]]; then
@@ -2363,8 +2369,9 @@ devin_wait_shell_ready() {
   local probe_out probe_rc probe_matched probe_any
   # hk 1541: the unreadable-reply run (pinfo_bad is the consecutive count the
   # budget applies to, pinfo_bad_total the count the diagnostics and the
-  # pinfo-bad file report) and its evidence. pinfo_err_file is reused for
-  # every poll so the reply's own stderr survives too.
+  # pinfo-bad file report) and its evidence. pinfo_err_file is the poll's
+  # stderr scratch file, consumed and deleted by pinfo_note_bad or dropped on
+  # a readable reply — it must never outlive the wait.
   local pinfo_bad=0 pinfo_bad_total=0 pinfo_err_file="" parse_rc=0 pinfo_suffix=""
   local pinfo_first_class="" pinfo_first_rc="" pinfo_first_out="" pinfo_first_err=""
   local pinfo_last_class="" pinfo_last_rc="" pinfo_last_out="" pinfo_last_err=""
@@ -2445,8 +2452,13 @@ print("yes" if ready else "no")
             return 1
           fi
         else
-          # A readable reply — ready or not — ends the unreadable run.
+          # A readable reply — ready or not — ends the unreadable run. Its
+          # stderr scratch file was never consumed; drop it here.
           pinfo_bad=0
+          if [[ -n "$pinfo_err_file" ]]; then
+            rm -f "$pinfo_err_file" 2>/dev/null || true
+            pinfo_err_file=""
+          fi
           if [[ "$ready" == yes ]]; then devin_probe_send || return 1; fi
         fi
       fi
