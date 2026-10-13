@@ -779,13 +779,17 @@ PY
 }
 
 symlink_flow() { # symlink_flow <tag> safe|vuln — safe pins the fix, vuln is the mutant proof
-  local tag="$1" mode="$2" recs wpid
+  local tag="$1" mode="$2" recs wpid ph pl
   new_lock "$tag"
   chmod 1777 "$WRK_HEAVY_LOCK.waiters" # a writable+sticky dir is the attack surface
   printf 'VICTIM-TMP-%s\n' "$tag" >"$TMP/victim-$tag-tmp"
   printf 'VICTIM-REC-%s\n' "$tag" >"$TMP/victim-$tag-rec"
   plant_links "$WRK_HEAVY_LOCK.waiters" "$TMP/victim-$tag-tmp" "$TMP/victim-$tag-rec"
-  mkhold "$tag-L"
+  # a held slot keeps the tested run queued: its record stays visible as a
+  # waiter instead of being published and removed inside one acquire pass
+  mkhold "$tag-H"; mkhold "$tag-L"
+  bg_heavy "$tag-H"; ph=$BG
+  wait_until 10 started "$tag-H" || fail "$tag: holder never started"
   if [[ "$mode" == vuln ]]; then
     HEAVY_BIN="$TMP/predtmp-wrk" bg_heavy "$tag-L"
     # RED proof for the safe flow below: the restored predictable-name code
@@ -793,18 +797,19 @@ symlink_flow() { # symlink_flow <tag> safe|vuln — safe pins the fix, vuln is t
     # record text. If this does not appear, the safe assertions are vacuous.
     wait_until 10 grep -q '^pid=' "$TMP/victim-$tag-tmp" ||
       fail "$tag: mutant predtmp did not follow the planted symlink — safe-mode assertions are vacuous"
-    release "$tag-L"
-    wait "$BG" || fail "$tag: mutant predtmp run failed"
+    release "$tag-H" "$tag-L"
+    wait "$ph" "$BG" || fail "$tag: mutant predtmp runs failed"
     return 0
   fi
   bg_heavy "$tag-L"
-  local pl=$BG
+  pl=$BG
   wait_until 10 queued "$tag-L" lane 1 || fail "$tag: lane never queued"
   # exactly one record, a regular file (the planted <pid> link was replaced,
   # not followed), holding this waiter's own record text
-  [[ "$(find "$WRK_HEAVY_LOCK.waiters" -maxdepth 1 -type f | wc -l | tr -d ' ')" -eq 1 ]] ||
+  [[ "$(find "$WRK_HEAVY_LOCK.waiters" -maxdepth 1 -type f ! -name '.*' |
+       wc -l | tr -d ' ')" -eq 1 ]] ||
     fail "$tag: expected exactly one regular record file"
-  recs="$(find "$WRK_HEAVY_LOCK.waiters" -maxdepth 1 -type f -print)"
+  recs="$(find "$WRK_HEAVY_LOCK.waiters" -maxdepth 1 -type f ! -name '.*' -print)"
   wpid="$(basename "$recs")"
   [[ "$wpid" =~ ^[0-9]+$ ]] || fail "$tag: record name is not a pid: $wpid"
   grep -q "^pid=$wpid class=lane " "$recs" ||
@@ -820,8 +825,8 @@ symlink_flow() { # symlink_flow <tag> safe|vuln — safe pins the fix, vuln is t
     fail "$tag: the planted .pid.tmp symlink was followed — victim rewritten"
   [[ "$(cat "$TMP/victim-$tag-rec")" == "VICTIM-REC-$tag" ]] ||
     fail "$tag: the planted record-name symlink was followed — victim rewritten"
-  release "$tag-L"
-  wait "$pl" || fail "$tag: lane run failed"
+  release "$tag-H" "$tag-L"
+  wait "$ph" "$pl" || fail "$tag: runs failed"
   # exit cleanup sweeps the old predictable name — and only removes the link
   [[ ! -e "$WRK_HEAVY_LOCK.waiters/.$wpid.tmp" && ! -L "$WRK_HEAVY_LOCK.waiters/.$wpid.tmp" ]] ||
     fail "$tag: the planted tmp symlink was not swept on exit"
