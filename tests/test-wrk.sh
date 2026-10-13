@@ -6670,14 +6670,27 @@ devin_shell_failure_case() {
     fail "$scenario ran Devin, renamed or delivered into an unready shell"
   fi
   grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "$scenario leaked its pane"
+  DEVIN_CASE_OUT="$out"
 }
 devin_shell_failure_case devin-shell-never-ready 'shell not ready within 30000ms (foreground busy x120)'
-devin_shell_failure_case devin-process-info-fail 'pane process-info exited 3 before pane run'
-[[ "$(grep -c '^pane process-info ' "$TMP/herdr.log")" -eq 2 ]] ||
-  fail "a failed process-info must not be polled again (one check + one diagnostic)"
-devin_shell_failure_case devin-process-info-garbage 'pane process-info returned an invalid envelope before pane run'
-[[ "$(grep -c '^pane process-info ' "$TMP/herdr.log")" -eq 2 ]] ||
-  fail "an unreadable process-info must not be polled again (one check + one diagnostic)"
+# hk 1541: an unreadable reply is "not ready yet" for up to PINFO_BAD_MAX
+# consecutive polls inside the same window — a run of them fails closed with
+# the old reason text plus the count, and the pane count is the run plus the
+# one diagnostic capture (5 + 1 = 6).
+devin_shell_failure_case devin-process-info-fail 'pane process-info exited 3 before pane run (consecutive bad replies x5)'
+[[ "$(grep -c '^pane process-info ' "$TMP/herdr.log")" -eq 6 ]] ||
+  fail "a failed process-info must be tolerated up to the consecutive-bad budget (5 checks + one diagnostic)"
+devin_shell_failure_case devin-process-info-garbage 'pane process-info returned an invalid envelope before pane run (consecutive bad replies x5)'
+[[ "$(grep -c '^pane process-info ' "$TMP/herdr.log")" -eq 6 ]] ||
+  fail "an unreadable process-info must be tolerated up to the consecutive-bad budget (5 checks + one diagnostic)"
+# The failure artifacts carry the captured first/last bad reply verbatim.
+artifact_dir="$(sed -n 's/.*Devin spawn failure artifacts preserved under \(.*\)/\1/p' <<<"$DEVIN_CASE_OUT" | head -n1)"
+[[ -f "$artifact_dir/pinfo-bad" ]] ||
+  fail "1541 the devin failure artifacts must include the pinfo-bad record: $artifact_dir"
+grep -q 'shell_pid.*4242' "$artifact_dir/pinfo-bad" ||
+  fail "1541 pinfo-bad lost the unreadable reply's raw stdout: $(cat "$artifact_dir/pinfo-bad" 2>/dev/null)"
+grep -q '=== first class=envelope rc=0 ===' "$artifact_dir/pinfo-bad" ||
+  fail "1541 pinfo-bad must record the first bad reply's class and rc: $(cat "$artifact_dir/pinfo-bad" 2>/dev/null)"
 shell_window_case devin-swe2 devin-shell-busy 'pane process-info ' 29
 [[ "$SHELL_WINDOW_RC" -eq 0 ]] || fail "Devin shell ready at 29s of 30s must spawn: $SHELL_WINDOW_OUT"
 grep -qx 'agent wait w:p1 --until idle --timeout 1000' "$TMP/herdr.log" ||
@@ -6712,6 +6725,152 @@ devin_m1b_run_no="$(grep -n '^pane run w:p1 devin ' "$TMP/herdr.log" | cut -d: -
 if grep -q '^pane close ' "$TMP/herdr.log"; then fail "m1b-shape late-shell Devin pane was closed"; fi
 devin_shell_failure_case devin-shell-never-ready-m1b 'shell not ready within 30000ms (foreground busy x120)'
 echo "PASS 604-m1b-envelope: unwrapped process-info polls shell-busy foreground, fail-closed at window"
+
+# ── hk 1541: a transient unreadable process-info reply is "not ready yet" ───
+# m1b 2026-10-13 08:18-08:22: a fresh pane's first process-info reply came
+# back unreadable under load while a re-query moments later held a ready
+# shell, and the poll discarded the raw reply so nobody ever saw it. Inside
+# the same START_TIMEOUT window an unreadable reply (a non-zero rc or an
+# envelope the parser cannot read) is tolerated for up to PINFO_BAD_MAX
+# consecutive polls; a readable reply — ready or not — resets the run. The
+# stdout, stderr and rc of the first and last bad reply land in the job's
+# pinfo-bad file (every kind) and in the Devin failure artifacts.
+# The frozen clock (FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0) keeps every poll
+# inside the window so only the counters — never the wall clock — decide.
+pinfo_seq_case() {  # NAME MODEL TOKENS... — one WRK_FIXTURE_PINFO_SEQUENCE per case
+  local name="$1" model="$2"; shift 2
+  printf '%s\n' "$@" >"$TMP/pinfo-seq-$name"
+  rm -f "$TMP/pinfo-seq-$name.calls" "$TMP/inbox/fixture/pinfo-bad"
+  : >"$TMP/herdr.log"
+  set +e
+  PINFO_CASE_OUT="$(WRK_FIXTURE_PINFO_SEQUENCE="$TMP/pinfo-seq-$name" \
+    PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
+    TEST_FIXTURE_SCENARIO=spawn spawn_base "$model" 2>&1)"
+  PINFO_CASE_RC=$?
+  set -e
+}
+
+# One garbage stdout line then a ready shell: the spawn proceeds and the
+# pinfo-bad file holds the reply that used to be thrown away.
+pinfo_seq_case garbage-then-good devin-swe2 garbage
+[[ "$PINFO_CASE_RC" -eq 0 ]] ||
+  fail "1541 a single garbage reply must not fail the spawn: $PINFO_CASE_OUT"
+grep -q 'landed=yes' <<<"$PINFO_CASE_OUT" ||
+  fail "1541 garbage-then-good devin did not land: $PINFO_CASE_OUT"
+devin_run_no="$(grep -n '^pane run w:p1 devin ' "$TMP/herdr.log" | cut -d: -f1)"
+[[ "$(head -n "$devin_run_no" "$TMP/herdr.log" | grep -c '^pane process-info --pane w:p1$')" -eq 2 ]] ||
+  fail "1541 the ready reply after one garbage must admit the shell on the second poll"
+[[ -f "$TMP/inbox/fixture/pinfo-bad" ]] ||
+  fail "1541 the raw unreadable reply was not preserved next to the spawn log"
+grep -q 'not json at all' "$TMP/inbox/fixture/pinfo-bad" ||
+  fail "1541 pinfo-bad lost the garbage reply's raw stdout: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
+grep -q '=== first class=envelope rc=0 ===' "$TMP/inbox/fixture/pinfo-bad" ||
+  fail "1541 pinfo-bad must record the first bad reply's class and rc"
+# The same transient on the shared non-devin path (agent start).
+pinfo_seq_case claude-garbage-then-good opus garbage
+[[ "$PINFO_CASE_RC" -eq 0 ]] ||
+  fail "1541 a single garbage reply must not fail a claude spawn: $PINFO_CASE_OUT"
+grep -q 'landed=yes' <<<"$PINFO_CASE_OUT" ||
+  fail "1541 garbage-then-good claude did not land: $PINFO_CASE_OUT"
+grep -q 'not json at all' "$TMP/inbox/fixture/pinfo-bad" ||
+  fail "1541 claude's pinfo-bad lost the garbage reply: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
+
+# A non-zero process-info rc once, then a valid reply: proceeds, and the
+# file holds the reply's rc and stderr.
+pinfo_seq_case rc-then-good opus exit3
+[[ "$PINFO_CASE_RC" -eq 0 ]] ||
+  fail "1541 one bad rc then valid must still spawn: $PINFO_CASE_OUT"
+grep -q 'landed=yes' <<<"$PINFO_CASE_OUT" ||
+  fail "1541 rc-then-good claude did not land: $PINFO_CASE_OUT"
+grep -q '=== first class=exit rc=3 ===' "$TMP/inbox/fixture/pinfo-bad" ||
+  fail "1541 pinfo-bad must record the failed reply's rc: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
+grep -q 'pane_not_found' "$TMP/inbox/fixture/pinfo-bad" ||
+  fail "1541 pinfo-bad lost the failed reply's raw stderr: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
+
+# PINFO_BAD_MAX consecutive unreadable replies still fail closed on the
+# shared non-devin path, with the old reason text plus the count, inside the
+# window — a genuinely dead pane does not spawn. 5 polls + one diagnostic.
+: >"$TMP/herdr.log"; rm -f "$TMP/inbox/fixture/pinfo-bad"
+set +e
+pinfo_dead_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
+  TEST_FIXTURE_SCENARIO=devin-process-info-garbage spawn_base opus 2>&1)"
+pinfo_dead_rc=$?
+set -e
+[[ "$pinfo_dead_rc" -eq 1 ]] ||
+  fail "1541 a run of unreadable replies must fail closed, got rc=$pinfo_dead_rc: $pinfo_dead_out"
+grep -q 'agent start failed: pane process-info returned an invalid envelope before agent start (consecutive bad replies x5); pane=w:p1' <<<"$pinfo_dead_out" ||
+  fail "1541 the fail-closed line lost the old reason text or the count: $pinfo_dead_out"
+[[ "$(grep -c '^pane process-info --pane w:p1' "$TMP/herdr.log")" -eq 6 ]] ||
+  fail "1541 the unreadable run must stop at the budget (5 checks + one diagnostic)"
+if grep -q '^agent start ' "$TMP/herdr.log"; then
+  fail "1541 agent start was called on a dead pane"
+fi
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "1541 the dead pane leaked"
+grep -q '=== last class=envelope rc=0 ===' "$TMP/inbox/fixture/pinfo-bad" ||
+  fail "1541 the dead-pane run must still leave its last bad reply: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
+# The same for a non-zero-rc run on the shared path.
+: >"$TMP/herdr.log"; rm -f "$TMP/inbox/fixture/pinfo-bad"
+set +e
+pinfo_deadrc_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
+  TEST_FIXTURE_SCENARIO=devin-process-info-fail spawn_base opus 2>&1)"
+pinfo_deadrc_rc=$?
+set -e
+[[ "$pinfo_deadrc_rc" -eq 1 ]] ||
+  fail "1541 a run of failed calls must fail closed, got rc=$pinfo_deadrc_rc: $pinfo_deadrc_out"
+grep -q 'pane process-info exited 3 before agent start (consecutive bad replies x5)' <<<"$pinfo_deadrc_out" ||
+  fail "1541 the failed-rc run lost its reason or count: $pinfo_deadrc_out"
+
+# Reset invariant: alternating bad/valid replies never form a consecutive
+# run, so six bad replies interleaved with valid ones must still succeed —
+# and a mutant that never resets the counter must fail on the fifth bad.
+pinfo_seq_case alternating devin-swe2 \
+  garbage busy garbage busy garbage busy garbage busy garbage busy garbage busy
+[[ "$PINFO_CASE_RC" -eq 0 ]] ||
+  fail "1541 alternating bad/valid must still spawn: $PINFO_CASE_OUT"
+grep -q 'landed=yes' <<<"$PINFO_CASE_OUT" ||
+  fail "1541 alternating replies did not land: $PINFO_CASE_OUT"
+devin_run_no="$(grep -n '^pane run w:p1 devin ' "$TMP/herdr.log" | cut -d: -f1)"
+[[ "$(head -n "$devin_run_no" "$TMP/herdr.log" | grep -c '^pane process-info --pane w:p1$')" -eq 13 ]] ||
+  fail "1541 the alternating run must be admitted by the first post-sequence ready reply"
+grep -q 'bad_total=6' "$TMP/inbox/fixture/pinfo-bad" ||
+  fail "1541 pinfo-bad must count every bad reply it saw: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
+grep -q 'consecutive_bad=1' "$TMP/inbox/fixture/pinfo-bad" ||
+  fail "1541 a valid reply must reset the consecutive count: $(cat "$TMP/inbox/fixture/pinfo-bad" 2>/dev/null)"
+# shellcheck disable=SC2016  # the pattern is bin/wrk source text, not an expansion
+devin_trust_mutant t1541-no-reset \
+  '          # A readable reply — ready or not — ends the unreadable run.
+          pinfo_bad=0' \
+  '          # A readable reply — ready or not — ends the unreadable run.
+          :'
+: >"$TMP/herdr.log"; rm -f "$TMP/pinfo-seq-alternating.calls" "$TMP/inbox/fixture/pinfo-bad"
+set +e
+pinfo_mut_out="$(WRK_FIXTURE_PINFO_SEQUENCE="$TMP/pinfo-seq-alternating" \
+  PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 \
+  TEST_FIXTURE_SCENARIO=spawn WRK_UNDER_TEST="$TMP/mut-wrk-t1541-no-reset" \
+  spawn_base devin-swe2 2>&1)"
+pinfo_mut_rc=$?
+set -e
+[[ "$pinfo_mut_rc" -eq 1 ]] ||
+  fail "1541 no-reset mutant: the fifth accumulated bad reply must fail closed: $pinfo_mut_out"
+grep -q 'consecutive bad replies x5' <<<"$pinfo_mut_out" ||
+  fail "1541 no-reset mutant must hit the consecutive budget: $pinfo_mut_out"
+
+# The budget cannot exceed the window: on a ticking clock the first
+# unreadable reply already spent 31s of the 30s window, so the run ends on
+# the window — one poll — not on the bad counter.
+: >"$TMP/herdr.log"; rm -f "$TMP/inbox/fixture/pinfo-bad"
+set +e
+pinfo_window_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER='pane process-info ' FAKECLOCK_JUMP=31 \
+  TEST_FIXTURE_SCENARIO=devin-process-info-garbage spawn_base devin-swe2 2>&1)"
+pinfo_window_rc=$?
+set -e
+[[ "$pinfo_window_rc" -eq 1 ]] ||
+  fail "1541 a spent window must close the run, got rc=$pinfo_window_rc: $pinfo_window_out"
+grep -q 'shell not ready within 30000ms (foreground busy x1, unreadable replies x1)' <<<"$pinfo_window_out" ||
+  fail "1541 the window failure must name the unreadable count: $pinfo_window_out"
+[[ "$(grep -c '^pane process-info ' "$TMP/herdr.log")" -eq 2 ]] ||
+  fail "1541 the retry budget must not exceed the window (one poll + one diagnostic)"
+echo "PASS 1541: transient unreadable process-info tolerated, counted, preserved, window-bound"
 
 # #979 (Pi incident, jobs/971-stale-race-20260929-1848): a fresh pane can hold
 # the shell alone in the foreground while zsh sits in a pending rc-file read

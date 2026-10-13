@@ -1991,6 +1991,13 @@ devin_preserve_failure_artifacts() {
   "$HERDR" pane process-info --pane "$PANE" >"$out/process-info.out" 2>"$out/process-info.err"
   printf 'rc=%s\n' "$?" >"$out/process-info.rc"
   set -e
+  # hk 1541: the unreadable process-info replies the readiness wait saw are
+  # part of this failure's evidence — the job's pinfo-bad record is copied
+  # verbatim (it may not exist when no reply was ever unreadable).
+  if [[ -f "$dir/pinfo-bad" ]]; then
+    cp "$dir/pinfo-bad" "$out/pinfo-bad" 2>/dev/null ||
+      warn "Devin failure pinfo-bad could not be copied under $out"
+  fi
   echo "wrk: Devin spawn failure artifacts preserved under $out" >&2
   printf '%s\n' "$out"
 }
@@ -2004,7 +2011,7 @@ devin_spawn_diagnostics() {
   out="$(devin_preserve_failure_artifacts "$reason" "$detected" "$explain_rc" "$explain_json")"
   # The operator-facing process-info dump replays the capture preservation just
   # made: a second live call would change the pane-touch count the readiness
-  # failure contract pins (one check + one diagnostic).
+  # failure contract pins (the unreadable-reply run's checks + one diagnostic).
   if [[ -n "$out" && -d "$out" ]]; then
     [[ ! -s "$out/process-info.out" ]] || cat "$out/process-info.out" >&2
     [[ ! -s "$out/process-info.err" ]] || cat "$out/process-info.err" >&2
@@ -2219,9 +2226,21 @@ else:
 # check (#1016). Before the agent argv is typed — `pane run` for Devin,
 # `agent start` for every other kind — poll process-info until herdr's own
 # available-shell rule holds (the shell is the foreground process group and the
-# only foreground process). A process-info failure or an envelope that cannot
-# be read fails closed at once; only "not ready yet" is polled, inside the same
-# window that detection and the idle wait then share.
+# only foreground process). "Not ready yet" is polled inside the same window
+# that detection and the idle wait then share.
+# hk 1541: under load a fresh pane's first process-info reply can come back
+# unreadable — a non-zero rc or an envelope the parser cannot read — while a
+# re-query seconds later answers a valid one (m1b 2026-10-13 08:18-08:22:
+# two spawns failed closed on a transient reply whose re-query held a
+# ready shell). Inside the same START_TIMEOUT window an unreadable reply is
+# therefore "not ready yet" too, for up to PINFO_BAD_MAX consecutive
+# replies; only a run of that length, or the window ending, fails closed
+# with the old reason text plus the count. A readable reply — ready or not
+# — resets the run. The poll used to discard the raw reply (2>/dev/null,
+# stdout never saved), so the transient was never seen: the stdout, stderr
+# and rc of the first and last bad reply are now preserved into the job's
+# pinfo-bad file, and into the Devin failure artifacts on failure. Nothing
+# outside those three streams is ever written there.
 # #604/m1b: herdr's process-info shape is not identical everywhere — the m1b
 # 0.9.0 reply (hk:doc evidence/2026-09-24/task604-m1b-repro) carries
 # process_info without the "result" wrapper and without
@@ -2229,8 +2248,9 @@ else:
 # list. That is a readable "not ready yet" (an rc-file subprocess like
 # compinit's grep holding the foreground), not an invalid envelope: readiness
 # is judged from shell_pid + foreground pids alone, the group id checked only
-# when present. What stays invalid — and fails closed at once — is an envelope
-# whose shell_pid/foreground list cannot be read at all.
+# when present. What stays invalid — and fails closed once its run reaches
+# PINFO_BAD_MAX — is an envelope whose shell_pid/foreground list cannot be
+# read at all.
 # #979: the shell holding the foreground alone is not proof of a command-line
 # prompt — a fresh pane's zsh can sit in a pending rc-file read (the Pi's
 # oh-my-zsh update check holds `read -k 1`; the typed `devin` lost its first
@@ -2293,10 +2313,64 @@ devin_probe_send() {
   fi
 }
 
+# hk 1541: the consecutive-unreadable budget inside the START_TIMEOUT window.
+PINFO_BAD_MAX=5
+
+# pinfo_bad/pinfo_bad_total/pinfo_first_*/pinfo_last_* are
+# devin_wait_shell_ready locals — dynamic scope is what lets these helpers
+# update them (the same contract as devin_probe_send above).
+pinfo_note_bad() {
+  # $1 class (exit = process-info rc non-zero, envelope = unreadable reply)
+  # $2 the reply's own rc   $3 raw stdout   $4 file holding raw stderr
+  local class="$1" bad_rc="$2" bad_out="$3" bad_err=""
+  [[ -z "$4" || ! -f "$4" ]] || bad_err="$(cat "$4" 2>/dev/null || true)"
+  pinfo_bad=$(( pinfo_bad + 1 ))
+  pinfo_bad_total=$(( pinfo_bad_total + 1 ))
+  if [[ -z "$pinfo_first_class" ]]; then
+    pinfo_first_class="$class" pinfo_first_rc="$bad_rc"
+    pinfo_first_out="$bad_out" pinfo_first_err="$bad_err"
+  fi
+  pinfo_last_class="$class" pinfo_last_rc="$bad_rc"
+  pinfo_last_out="$bad_out" pinfo_last_err="$bad_err"
+  pinfo_write_bad_file
+}
+
+pinfo_write_bad_file() {
+  local dir
+  [[ -n "${JOB_ID:-}" ]] || return 0
+  dir="$(wrk_jobs_root)/$JOB_ID"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  {
+    printf 'pane=%s\njob=%s\nat=%s\n' "$PANE" "$JOB_ID" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'bad_total=%s\nconsecutive_bad=%s\n' "$pinfo_bad_total" "$pinfo_bad"
+    printf '=== first class=%s rc=%s ===\n' "$pinfo_first_class" "$pinfo_first_rc"
+    printf '%s\n' '--- stdout ---'
+    printf '%s\n' "$pinfo_first_out"
+    printf '%s\n' '--- stderr ---'
+    printf '%s\n' "$pinfo_first_err"
+    printf '=== last class=%s rc=%s ===\n' "$pinfo_last_class" "$pinfo_last_rc"
+    printf '%s\n' '--- stdout ---'
+    printf '%s\n' "$pinfo_last_out"
+    printf '%s\n' '--- stderr ---'
+    printf '%s\n' "$pinfo_last_err"
+  } >"$dir/pinfo-bad" 2>/dev/null ||
+    warn "unreadable process-info replies could not be preserved under $dir/pinfo-bad"
+}
+
 devin_wait_shell_ready() {
   local started_at="$1" attempts=0 max_attempts info_out info_rc ready
   local probe_token="" probe_tokens="" probe_sends=0 probe_misses=0
   local probe_out probe_rc probe_matched probe_any
+  # hk 1541: the unreadable-reply run (pinfo_bad is the consecutive count the
+  # budget applies to, pinfo_bad_total the count the diagnostics and the
+  # pinfo-bad file report) and its evidence. pinfo_err_file is reused for
+  # every poll so the reply's own stderr survives too.
+  local pinfo_bad=0 pinfo_bad_total=0 pinfo_err_file="" parse_rc=0 pinfo_suffix=""
+  local pinfo_first_class="" pinfo_first_rc="" pinfo_first_out="" pinfo_first_err=""
+  local pinfo_last_class="" pinfo_last_rc="" pinfo_last_out="" pinfo_last_err=""
+  # A retry under the same job id replaces the unreadable-reply evidence of
+  # its own wait rather than reading a predecessor's as its own.
+  [[ -z "${JOB_ID:-}" ]] || rm -f "$(wrk_jobs_root)/$JOB_ID/pinfo-bad" 2>/dev/null || true
   # The command the shell must prove it can run before wrk (or herdr, for
   # `agent start`) types it: `pane run` for devin, `agent start` for every
   # other kind (#1016).
@@ -2323,16 +2397,26 @@ devin_wait_shell_ready() {
       probe_misses=$(( probe_misses + 1 ))
       (( probe_misses >= DEVIN_PROBE_MISS_POLLS )) && probe_token=""
     else
+      if [[ -z "$pinfo_err_file" ]]; then
+        pinfo_err_file="$(mktemp "${TMPDIR:-/tmp}/wrk-pinfo-err.XXXXXX" 2>/dev/null)" || pinfo_err_file=""
+      fi
       set +e
-      info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
+      if [[ -n "$pinfo_err_file" ]]; then
+        info_out="$("$HERDR" pane process-info --pane "$PANE" 2>"$pinfo_err_file")"
+      else
+        info_out="$("$HERDR" pane process-info --pane "$PANE" 2>/dev/null)"
+      fi
       info_rc=$?
       set -e
       if [[ "$info_rc" -ne 0 ]]; then
-        shell_ready_diagnostics "pane process-info exited $info_rc before $start_action"
-        return 1
-      fi
-      set +e
-      ready="$(printf '%s' "$info_out" | python3 -c '
+        pinfo_note_bad exit "$info_rc" "$info_out" "$pinfo_err_file"
+        if (( pinfo_bad >= PINFO_BAD_MAX )); then
+          shell_ready_diagnostics "pane process-info exited $info_rc before $start_action (consecutive bad replies x$pinfo_bad)"
+          return 1
+        fi
+      else
+        set +e
+        ready="$(printf '%s' "$info_out" | python3 -c '
 import json, sys
 d = json.load(sys.stdin)
 res = d.get("result")
@@ -2352,19 +2436,28 @@ if group is not None:
     ready = ready and group == shell
 print("yes" if ready else "no")
 ' 2>/dev/null)"
-      info_rc=$?
-      set -e
-      if [[ "$info_rc" -ne 0 ]]; then
-        shell_ready_diagnostics "pane process-info returned an invalid envelope before $start_action"
-        return 1
+        parse_rc=$?
+        set -e
+        if [[ "$parse_rc" -ne 0 ]]; then
+          pinfo_note_bad envelope 0 "$info_out" "$pinfo_err_file"
+          if (( pinfo_bad >= PINFO_BAD_MAX )); then
+            shell_ready_diagnostics "pane process-info returned an invalid envelope before $start_action (consecutive bad replies x$pinfo_bad)"
+            return 1
+          fi
+        else
+          # A readable reply — ready or not — ends the unreadable run.
+          pinfo_bad=0
+          if [[ "$ready" == yes ]]; then devin_probe_send || return 1; fi
+        fi
       fi
-      if [[ "$ready" == yes ]]; then devin_probe_send || return 1; fi
     fi
     if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= START_TIMEOUT )); then
+      pinfo_suffix=""
+      (( pinfo_bad_total > 0 )) && pinfo_suffix=", unreadable replies x$pinfo_bad_total"
       if [[ "$probe_sends" -gt 0 ]]; then
-        shell_ready_diagnostics "shell did not execute a readiness probe within ${START_TIMEOUT}ms (probes typed x$probe_sends)"
+        shell_ready_diagnostics "shell did not execute a readiness probe within ${START_TIMEOUT}ms (probes typed x$probe_sends$pinfo_suffix)"
       else
-        shell_ready_diagnostics "shell not ready within ${START_TIMEOUT}ms (foreground busy x$attempts)"
+        shell_ready_diagnostics "shell not ready within ${START_TIMEOUT}ms (foreground busy x$attempts$pinfo_suffix)"
       fi
       return 1
     fi
