@@ -155,12 +155,12 @@
   "effective_at": "2026-10-12T00:00:00Z",
   "expires_at": "2026-10-20T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "f338b9866dbc320824576c70220dd8d89af5076e841058b7e5d7e2ff88a600a8",
-    "bin/wrk": "5c3ab251d32cf88a1cb6f5f887f5ad1165f51d4282ad0a3aee94c8af90cf8eaa",
+    ".github/workflows/ci.yml": "bc7e430fac437a5ecd39cfd260486372e0e1521a83c6d47008374d74bae2eb9b",
+    "bin/wrk": "df76f4fb99016d9f0a68067c8da2be762682536d88832040f7050425dd84d6ca",
     "builder/SKILL.md": "91cdb4c1d22177fc219db5b876ecc52b852122bc37128a0180def3668c8c38e8",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
     "director/SKILL.md": "c6b95f71c691d7711aeb9ee55f5e804f889319e99a21987a813eec148135ba42",
-    "spawn-worker/SKILL.md": "b1faccfa09b8619ba0e84de1f697a3ff3baac8cb23430d3ecaf55e864a340502"
+    "spawn-worker/SKILL.md": "37ea2781705286fd0c069b7d70794755cf69470607431900905e7751ddeab7c3"
   },
   "profiles": {
     "agy-flash": {
@@ -1786,7 +1786,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-12.2",
+  "revision": "2026-10-13.4",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {

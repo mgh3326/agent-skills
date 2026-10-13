@@ -10166,19 +10166,53 @@ bad header — refuses the run rc 70 naming the file line, before any slot
 is taken. `wrk hosts` prints it as `local heavy_load_wait=true|false|
 error (...)`.
 
+Priority class (hk 1533): `WRK_HEAVY_CLASS=ci` marks a run as CI work; unset,
+empty or `lane` is the default lane class, and any other value refuses rc 78.
+While a live ci waiter is queued on the lock, a lane waiter does not take any
+slot that ci waiter could take (a slot index below the limit the ci waiter
+itself runs under) — the next slot to free goes to the ci waiter instead of
+whoever polls first. It is a queue order only, never preemption: a running
+holder is not signalled, displaced or shortened, and a ci waiter never
+defers. Slots above every live ci waiter's limit stay open to lanes, so a ci
+waiter confined to slot 0 (WRK_HEAVY_MAX=1) never leaves slot 1 idle. A ci
+waiter whose pid is gone (a stale waiter file) reserves nothing. Starvation
+guard: a lane waiter that has spent WRK_HEAVY_CI_DEFER_MAX seconds in total
+deferring to live ci waiters (default 1800; 0 = never defer) stops deferring
+for the rest of its wait. Only time with a live ci waiter counts: the clock
+runs while a ci waiter could take a slot and pauses while none is queued, so
+a ci waiter that arrives late never finds the guard already spent. The total
+wait cap still applies, so with the default 1200 s cap the guard only matters
+under a larger WRK_HEAVY_WAIT_CAP.
+
+Exactly what the ordering promises (it is a queue order read from the
+waiters dir, not a lock): a ci waiter is queued from the moment its record is
+visible there. The record is written under a dot name and renamed into place
+before the waiter's first slot attempt, so a lane pass reads a whole record
+or none. Every lane pass that starts after that rename skips the slots the ci
+waiter could take; the next slot to free goes to the ci waiter. Not
+promised: a ci waiter is not queued while wrk and its python half are still
+starting up (before the record exists), and a lane pass that had already
+read the records when the rename happened (one pass, no re-read before its
+slot attempts) can still take a slot that frees in that same pass. Neither
+is preempted afterwards. Waiters of an older wrk ignore classes entirely.
+
 `wrk heavy status` prints the lock path, this host, the effective limit,
 the load-wait switch (`load_wait true|false|error (...)`), one `holder`
 line per occupied slot, and queued waiters (holder pids are the
 wrk heavy python processes; killing one frees its slot once the command
-tree that inherited the slot fd is also gone). status never creates slot
-files and is never refused.
+tree that inherited the slot fd is also gone). Every holder and waiter line
+carries `class=ci|lane` (and the limit it queued under). status never
+creates slot files and is never refused.
 
 Every acquisition appends one JSON record to the heavy log (default
 ~/.local/state/wrk/heavy.log): ts, kind=run, host, job (ARBITER_JOB or -),
-task (HK_TASK_ID or -), pid, slot, limit, cmd, wait_s, wait_lock_s,
-wait_load_s, hold_s, rc. Nested runs are logged as kind=nested, refusals as
-kind=refused and wait-cap expiries as kind=wait_cap, so wait times stay
-aggregable and no execution path evades the log.
+task (HK_TASK_ID or -), pid, class (ci|lane), slot, limit, cmd, wait_s,
+wait_lock_s, wait_load_s, hold_s, rc. Nested runs are logged as kind=nested,
+refusals as kind=refused and wait-cap expiries as kind=wait_cap, so wait
+times stay aggregable and no execution path evades the log. A lane waiter
+that was held back behind a ci waiter also writes one kind=defer row when the
+hold-back ends: wait_s, defer_s and reason (guard, acquired, cap, interrupt
+or exit).
 
 Notes: the command's own exit 75 is indistinguishable from a wait-cap 75 —
 check stderr. stdin is not forwarded (the command sees EOF). A nested
@@ -10201,6 +10235,11 @@ Environment:
   WRK_HEAVY_LOCK        lock file path
                         (default /tmp/wrk-heavy-<hostname>.lock)
   WRK_HEAVY_MAX         override the hosts.toml heavy_max for this run
+  WRK_HEAVY_CLASS       ci | lane (unset = lane): ci waiters get the next
+                        free slot before any lane waiter, without preempting
+  WRK_HEAVY_CI_DEFER_MAX
+                        seconds a lane waiter defers to a live ci waiter
+                        before it stops (default 1800, 0 = never defer)
   WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
   WRK_HEAVY_LOAD_FILE   file re-read each poll whose first field is used as
                         load5/ncpu (default: os.getloadavg()[1]/cpu_count)
@@ -10279,6 +10318,42 @@ def read_text(path):
         return ""
 
 
+def record_head(text):
+    # (pid, class, limit) of a holder/waiter record, which this process
+    # writes as `pid=N class=ci|lane limit=N since=... job=... cmd=...`. Only
+    # the first three fields are read: job and cmd are free text, and a pid=
+    # or class= token inside the command must never forge a live waiter or a
+    # ci class. A record an older wrk wrote has no class or limit: it reads
+    # as a lane waiter of unknown limit. pid -1 = unparsable.
+    pid, cls, lim = -1, "lane", None
+    toks = text.split(None, 3)[:3]
+    if toks and toks[0].startswith("pid="):
+        try:
+            pid = int(toks[0][4:])
+        except ValueError:
+            pass
+    for tok in toks[1:]:
+        if tok.startswith("class=") and tok[6:] in ("ci", "lane"):
+            cls = tok[6:]
+        elif tok.startswith("limit="):
+            try:
+                lim = int(tok[6:])
+            except ValueError:
+                pass
+    return pid, cls, lim
+
+
+def with_class(text):
+    # status prints the class of every record; one an older wrk wrote carries
+    # none, so it is shown as the lane it behaves as.
+    toks = text.split(None, 3)[:3]
+    if not toks or not toks[0].startswith("pid="):
+        return text
+    if any(t.startswith("class=") for t in toks[1:]):
+        return text
+    return toks[0] + " class=lane" + text[len(toks[0]):]
+
+
 args = sys.argv[1:]
 if not args:
     fail("usage: wrk heavy -- <command> [args...] | wrk heavy status", 2)
@@ -10307,6 +10382,13 @@ except ValueError:
 load_wait = os.environ.get("WRK_HEAVY_LOAD_WAIT", "1") != "0"
 load_wait_src = os.environ.get("WRK_HEAVY_LOAD_WAIT_SRC", "default")
 load_wait_err = os.environ.get("WRK_HEAVY_LOAD_WAIT_ERR", "")
+
+# hk 1533: WRK_HEAVY_CLASS=ci puts this run ahead of lane waiters on the
+# host's lock; unset or empty is the lane class. Any other spelling refuses
+# the run rc 78 below (status stays tolerant and just reports records).
+hclass_raw = os.environ.get("WRK_HEAVY_CLASS", "")
+hclass = hclass_raw or "lane"
+hclass_ok = hclass in ("ci", "lane")
 
 slot_re = re.compile(re.escape(lock_path) + r"\.slot(\d+)$")
 
@@ -10352,6 +10434,7 @@ def log_event(rec):
         "job": os.environ.get("ARBITER_JOB") or "-",
         "task": os.environ.get("HK_TASK_ID") or "-",
         "pid": os.getpid(),
+        "class": hclass,
     })
     try:
         os.makedirs(os.path.dirname(log_path), exist_ok=True)
@@ -10400,7 +10483,8 @@ if args[0] == "status":
         if flock_held(p):
             holders.append((slot_index(p), read_text(p) or "(info unreadable)"))
     for i, hinfo in holders:
-        print("holder " + (("slot=%d " % i) if len(paths) > 1 else "") + hinfo)
+        print("holder " + (("slot=%d " % i) if len(paths) > 1 else "")
+              + with_class(hinfo))
     if not holders:
         print("holder none")
     waiters = []
@@ -10409,25 +10493,21 @@ if args[0] == "status":
     except OSError:
         names = []
     for name in names:
+        if name.startswith("."):
+            continue  # a record being published (see publish_record)
         path = os.path.join(waiters_dir, name)
         info = read_text(path)
         # The pid is the first field of the record we write — never scan
         # later fields, or a `pid=` token inside the command text would make
-        # a live waiter look dead here.
-        pid = -1
-        first = info.split(None, 1)[0] if info else ""
-        if first.startswith("pid="):
-            try:
-                pid = int(first[4:])
-            except ValueError:
-                pass
+        # a live waiter look dead here (record_head reads the head only).
+        pid = record_head(info)[0]
         if pid > 0 and not alive(pid):
             try:
                 os.remove(path)
             except OSError:
                 pass
             continue
-        waiters.append(info or name)
+        waiters.append(with_class(info) if info else name)
     for w in waiters:
         print("waiter " + w)
     if not waiters:
@@ -10445,15 +10525,29 @@ try:
 except ValueError:
     fail("WRK_HEAVY_WAIT_CAP is not a number", 2)
 deadline = time.monotonic() + cap
+# hk 1533 anti-starvation guard: seconds a lane waiter keeps deferring to a
+# live ci waiter before it stops. 0 turns the deferral off for this run.
+try:
+    defer_max = float(os.environ.get("WRK_HEAVY_CI_DEFER_MAX", "1800"))
+except ValueError:
+    defer_max = -1.0
+if not defer_max >= 0:
+    fail("WRK_HEAVY_CI_DEFER_MAX is not a non-negative number", 2)
 cmd_summary = " ".join(cmd)
-info = "pid=%d since=%s job=%s cmd=%s" % (
-    os.getpid(), datetime.datetime.now().isoformat(timespec="seconds"),
+# class and limit stay in the fixed head of the record (record_head): a ci
+# waiter's limit tells a lane waiter which slots that ci waiter could take.
+info = "pid=%d class=%s limit=%d since=%s job=%s cmd=%s" % (
+    os.getpid(), hclass, limit,
+    datetime.datetime.now().isoformat(timespec="seconds"),
     os.environ.get("ARBITER_JOB") or "-", cmd_summary)
 started_at = time.monotonic()
 
 if not limit_ok:
     fail("invalid heavy limit '%s' from %s (want an integer >= 0)"
          % (limit_raw, limit_src), EXIT_REFUSED)
+if not hclass_ok:
+    fail("invalid WRK_HEAVY_CLASS '%s' (want ci or lane; unset = lane)"
+         % hclass_raw, EXIT_REFUSED)
 if limit == 0:
     log_event({"kind": "refused", "cmd": cmd_summary[:200],
                "limit": 0, "limit_src": limit_src})
@@ -10472,6 +10566,32 @@ def load_ratio():
         return os.getloadavg()[1] / (os.cpu_count() or 1)
     except OSError:
         return None
+
+
+def ci_reserved():
+    # hk 1533: how many leading slots (index < N) a live ci waiter other
+    # than this process could take; 0 when none is queued. Liveness is the
+    # rule status uses for stale waiter files (pid alive) — a dead ci
+    # waiter's leftover record never reserves anything. Read-only: status
+    # owns the cleanup of stale files. A ci record with no usable limit
+    # reserves nothing — priority degrades to the old free-for-all, it never
+    # idles a slot on a record that cannot say which slots it wants.
+    try:
+        names = os.listdir(waiters_dir)
+    except OSError:
+        return 0
+    reserved = 0
+    for name in names:
+        if name.startswith("."):
+            continue  # a record being published (see publish_record)
+        pid, cls, lim = record_head(
+            read_text(os.path.join(waiters_dir, name)))
+        if cls != "ci" or pid <= 0 or pid == os.getpid():
+            continue
+        if lim is None or lim < 1 or not alive(pid):
+            continue
+        reserved = max(reserved, lim)
+    return reserved
 
 
 def fd_is_open(fd):
@@ -10580,6 +10700,47 @@ held_slot = -1
 acquired_at = None
 run_at = None
 rc = None
+# Seconds this waiter actually spent deferring to a live ci waiter: closed
+# intervals in defer_total, the open one (started the pass reserved first
+# went above 0, closed the pass it drops back to 0) from defer_mark. Time
+# with no live ci waiter never counts, so a ci waiter that shows up late
+# cannot find the guard already spent.
+defer_total = 0.0
+defer_mark = None
+defer_seen = False   # held back at least once: a defer row is owed
+defer_over = False   # guard fired: no more deferral for the rest of the wait
+defer_logged = False
+
+
+def end_defer(reason):
+    # One kind=defer row per lane waiter that was held back behind a ci
+    # waiter, written when the hold-back ends: reason guard
+    # (WRK_HEAVY_CI_DEFER_MAX of deferred time spent), acquired, cap,
+    # interrupt or exit. defer_s is the time actually spent deferring.
+    global defer_logged
+    if not defer_seen or defer_logged:
+        return
+    defer_logged = True
+    now = time.monotonic()
+    spent = defer_total + ((now - defer_mark) if defer_mark is not None else 0)
+    log_event({"kind": "defer", "cmd": cmd_summary[:200], "limit": limit,
+               "wait_s": round(now - started_at, 3),
+               "defer_s": round(spent, 3),
+               "reason": reason})
+
+
+def publish_record():
+    # The waiter record is published atomically: written under a dot name
+    # that status and the ci scan skip, then renamed into place, so a lane
+    # pass reads a whole record or none (never the empty file an open-then-
+    # write leaves for a moment). This precedes this waiter's first slot
+    # attempt. A ci waiter counts as queued from the rename on.
+    tmp = os.path.join(waiters_dir, ".%d.tmp" % os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(info)
+    os.replace(tmp, me)
+
+
 # PEP 446: os.open returns non-inheritable fds; the acquired slot fd is
 # re-inherited into the command only via run_command's pass_fds so nested
 # runs can prove they are inside the holder's tree (nested_held_fd). A slot
@@ -10588,11 +10749,41 @@ rc = None
 slot_paths = limit_slots()
 slot_fds = [os.open(p, os.O_RDWR | os.O_CREAT, 0o644) for p in slot_paths]
 try:
-    with open(me, "w", encoding="utf-8") as f:
-        f.write(info)
+    publish_record()
     while True:
         try:
+            # hk 1533 priority: while a live ci waiter is queued, a lane
+            # waiter does not take any slot that waiter could take (index
+            # below its limit) — the next slot to free goes to the ci waiter.
+            # Slots above every live ci waiter's limit stay open, so a ci
+            # waiter that only ever uses slot 0 never leaves slot 1 idle.
+            # Nothing is preempted: only free slots are contested, and a ci
+            # waiter itself never defers. This is a queue order read from the
+            # waiters dir, not a lock: the records are scanned once per pass
+            # and not re-read before the slot attempts, so a pass already
+            # past its scan when a ci record is renamed into place may still
+            # take a slot that frees in that pass, and a ci waiter is not
+            # queued before its record is visible (see wrk heavy --help).
+            reserved = 0
+            if hclass != "ci" and defer_max > 0 and not defer_over:
+                reserved = ci_reserved()
+                now = time.monotonic()
+                if reserved:
+                    if defer_mark is None:
+                        defer_mark = now
+                        defer_seen = True
+                    if defer_total + (now - defer_mark) >= defer_max:
+                        defer_total += now - defer_mark
+                        defer_mark = None
+                        defer_over = True
+                        reserved = 0
+                        end_defer("guard")
+                elif defer_mark is not None:
+                    defer_total += now - defer_mark
+                    defer_mark = None
             for i, sfd in enumerate(slot_fds):
+                if i < reserved:
+                    continue
                 try:
                     fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     held_fd, held_slot, held_path = sfd, i, slot_paths[i]
@@ -10602,6 +10793,7 @@ try:
             if held_fd is not None:
                 break
             if time.monotonic() >= deadline:
+                end_defer("cap")
                 log_event({"kind": "wait_cap", "phase": "slot",
                            "cmd": cmd_summary[:200], "limit": limit,
                            "wait_s": round(time.monotonic() - started_at, 3)})
@@ -10609,9 +10801,11 @@ try:
                      "-- command not run" % (cap, lock_path), EXIT_WAIT_CAP)
             time.sleep(0.5)
         except KeyboardInterrupt:
+            end_defer("interrupt")
             fail("interrupted while waiting for a heavy slot on %s "
                  "-- command not run" % lock_path, 130)
     acquired_at = time.monotonic()
+    end_defer("acquired")
     try:
         os.remove(me)
     except OSError:
@@ -10654,10 +10848,12 @@ try:
         raise
     raise SystemExit(rc)
 finally:
-    try:
-        os.remove(me)
-    except OSError:
-        pass
+    end_defer("exit")
+    for leftover in (me, os.path.join(waiters_dir, ".%d.tmp" % os.getpid())):
+        try:
+            os.remove(leftover)
+        except OSError:
+            pass
     if held_fd is not None:
         if run_at is not None:
             log_event({"kind": "run", "cmd": cmd_summary[:200],
