@@ -154,6 +154,35 @@ fixture_is_recent_unwrapped_read() {
   [[ " $* " == *" --source recent-unwrapped "* ]]
 }
 
+# WRK_FIXTURE_PINFO_SEQUENCE 는 `pane process-info` 응답을 호출 순서대로 적은
+# 파일이다. 한 줄에 하나: garbage | exit3 | busy | ready. 시퀀스가 소진되면
+# 평범한 시나리오 응답으로 돌아간다(반환 1 = 이 호출을 소비하지 않았다는 뜻이
+# 아니라 기본 경로로 넘긴다는 뜻).
+fixture_pinfo_sequence_step() {
+  local calls index total token
+  calls="${WRK_FIXTURE_PINFO_SEQUENCE}.calls"
+  printf 'pinfo\n' >>"$calls"
+  index="$(awk 'END{print NR}' "$calls")"
+  total="$(awk 'END{print NR}' "$WRK_FIXTURE_PINFO_SEQUENCE")"
+  if [[ "$total" -eq 0 || "$index" -gt "$total" ]]; then return 1; fi
+  token="$(awk -v n="$index" 'NR==n{print; exit}' "$WRK_FIXTURE_PINFO_SEQUENCE")"
+  case "$token" in
+    # hk 1541: the transient m1b shape — one stdout line that is not an
+    # envelope at all, on an otherwise healthy pane.
+    garbage) printf 'fixture herdr: not json at all\n'; exit 0 ;;
+    exit3)
+      printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture process-info failure"},"id":"cli:pane:process_info"}' >&2
+      exit 3 ;;
+    busy)
+      printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4250,"foreground_processes":[{"argv":["git","rev-parse","--show-toplevel"],"argv0":"git","cmdline":"git rev-parse --show-toplevel","cwd":"/tmp","name":"git","pid":4250}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+      exit 0 ;;
+    ready)
+      printf '%s\n' '{"id":"cli:pane:process_info","result":{"process_info":{"foreground_process_group_id":4242,"foreground_processes":[{"argv":["-zsh"],"argv0":"-zsh","cmdline":"-zsh","cwd":"/tmp","name":"zsh","pid":4242}],"pane_id":"w:p1","shell_pid":4242},"type":"pane_process_info"}}'
+      exit 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 fixture_prompt_injected() {
   (( $(fixture_prompt_count) >= 1 ))
 }
@@ -652,6 +681,12 @@ case "${1:-}" in
     # calls first; agent-foreground-other keeps an unrelated process in the
     # foreground.
     if [[ "${2:-}" == process-info ]]; then
+      # hk 1541: a per-call reply script drives the transient cases — handled
+      # tokens exit inside the step; an exhausted or absent sequence falls
+      # through to the scenario replies below.
+      if [[ -n "${WRK_FIXTURE_PINFO_SEQUENCE:-}" && -f "${WRK_FIXTURE_PINFO_SEQUENCE}" ]]; then
+        fixture_pinfo_sequence_step || true
+      fi
       case "$scenario" in
         devin-process-info-fail)
           printf '%s\n' '{"error":{"code":"pane_not_found","message":"fixture process-info failure"},"id":"cli:pane:process_info"}' >&2

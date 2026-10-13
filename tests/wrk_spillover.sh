@@ -116,6 +116,10 @@ run_wrk() {
     --job "${WRK_TEST_JOB:-spillover-$RANDOM-$RANDOM}" "$@"
 }
 
+# Task inheritance has a separate compact harness so its SSH argv and target
+# fallback can be verified without the hub credential-file fixtures below.
+bash "$ROOT/tests/wrk_remote_task.sh"
+
 set +e
 isolation_guard_output="$(
   (ARBITER_INBOX_ROOT=; run_wrk "$ROOT/bin/wrk") 2>&1
@@ -155,8 +159,16 @@ printf '%s\n' 'BRIEF-CANARY-hub-fixture' >"$PROMPT"
 
 run_hub() {
   hub_require_isolation
-  local binary="$1" config="$2"; shift 2
-  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" HANDOFFKEEP_BIN="$HK_FIXTURE" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a "$@"
+  local binary="$1" config="$2" arg has_task_link=0; shift 2
+  local task_args=()
+  for arg in "$@"; do
+    case "$arg" in --task|--parent-job) has_task_link=1 ;; esac
+  done
+  # These cases exercise hub placement, not inherited-task transport. Give
+  # ordinary worker cases an explicit task so the remote-task guard does not
+  # intentionally refuse the via=hub requests covered by the separate test.
+  if [[ "$has_task_link" -eq 0 ]]; then task_args+=(--task "$HK_TASK_ID"); fi
+  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" HANDOFFKEEP_BIN="$HK_FIXTURE" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a ${task_args[@]+"${task_args[@]}"} "$@"
 }
 
 assert_no_hub_leak() {
