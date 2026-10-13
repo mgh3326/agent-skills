@@ -22,3 +22,7 @@ case "$scenario" in
     exit 2
     ;;
 esac
+if [[ -n "${WRK_REMOTE_PROMPT_PATH:-}" && "$dest" == *:* ]]; then
+  mkdir -p "$(dirname "$WRK_REMOTE_PROMPT_PATH")"
+  cp "$1" "$WRK_REMOTE_PROMPT_PATH"
+fi

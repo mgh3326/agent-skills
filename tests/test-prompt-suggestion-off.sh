@@ -282,7 +282,9 @@ printf '%s\n' '[hub]' 'hub_url = "wss://hub.fixture.invalid"' 'hub_token_env = "
   '[hosts.machine-a]' 'via = "hub"' 'ssh = "machine-a"' 'herdr_session = "worker"' 'workspace = "worker"' \
   "cwd_map = {\"$ROOT\"=\"$REMOTE_CWD\"}" "cwd_keys = {\"$ROOT\"=\"repo-a\"}" 'capacity = 3' >"$TMP/hub-hosts.toml"
 hub_log() {
-  local model="$1"; shift
+  local model="$1" task_id; shift
+  task_id="$("$HANDOFFKEEP_BIN" tasks add --title "hub-log task" 2>/dev/null |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')" || return 99
   : >"$TMP/hub.log"; : >"$TMP/hub-local-herdr.log"; : >"$TMP/hub-node-herdr.log"
   env HERDR_BIN="$HERDR" ARBITER_BIN="$ROOT/bin/arbiter" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_HOSTS_CONFIG="$TMP/hub-hosts.toml" \
@@ -291,7 +293,7 @@ hub_log() {
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/hub-local-herdr.log" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
-    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$model-$RANDOM" --host machine-a "$@" \
+    "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$model-$RANDOM" --host machine-a --task "$task_id" "$@" \
     >/dev/null 2>>"$TMP/wrk.stderr" ||
     { echo "ERROR: hub spawn -m $model exited non-zero: $(tail -n 3 "$TMP/wrk.stderr")" >&2; return 99; }
   # The local side must not have spawned anything itself (a sentinel probe
