@@ -12,6 +12,12 @@
 # The order is read from the waiters dir, not a lock: records are published
 # atomically, a lane pass already past its scan may still take a slot, and the
 # documented windows are pinned below (heavy-class-documented-windows).
+# hk 1545: the tmp side of a publication is an unpredictable mkstemp name
+# (a symlink pre-planted at the old .<pid>.tmp is never followed), a waiters
+# dir that is foreign-owned, a symlink, or group/other-writable without the
+# sticky bit refuses the run rc 78 before anything is written, slot files
+# open O_NOFOLLOW and refuse hardlink/foreign/non-regular inodes, and every
+# record list/rename/unlink/read goes through the trusted dir fd.
 #
 # Stub commands only. HOME and every XDG dir point into a temp dir, every
 # lock, waiters dir, load file and log is a temp path, and only pids this
@@ -151,8 +157,22 @@ sig = re.findall(r"os\.(?:kill|killpg)\([^)]*\)|\.(?:kill|terminate|send_signal)
 # alive() probes with signal 0; nothing in the heavy path may signal a holder
 assert sig == ["os.kill(pid, 0)"], ("a signal path exists in wrk heavy", sig)
 # the waiter record is published by rename, never by open-then-write in place
-assert "os.replace(tmp, me)" in half, "waiter record is not renamed into place"
+assert "os.replace(record_tmp, me_name" in half, \
+    "waiter record is not renamed into place"
 assert 'open(me, "w"' not in half, "waiter record is written in place again"
+# hk 1545: the tmp side of the rename is an unpredictable mkstemp name, the
+# waiters dir is opened O_NOFOLLOW and checked before publication, slot
+# opens never follow a planted symlink, and record ops go through dir_fd
+assert "tempfile.mkstemp(dir=waiters_dir" in half, \
+    "record tmp must come from mkstemp, not a predictable name"
+assert "def waiters_dir_open" in half, "waiters dir trust check missing"
+assert "os.O_NOFOLLOW" in half, "slot opens must not follow a planted symlink"
+assert "os.O_DIRECTORY" in half, "waiters dir must open as a real directory"
+assert "dir_fd=waiters_fd" in half, "record ops must use the trusted dir fd"
+# r2: a planted hardlink or foreign inode at the slot name is not a slot
+assert "st_nlink == 1" in half, "slot opens must refuse a hardlinked inode"
+# r3: root-owned shared locks (desktop tmpfiles) stay usable
+assert "def owner_trusted" in half, "root-owned shared locks must pass"
 PY
 echo "PASS heavy-class-static-docs-and-no-signal-path"
 
@@ -737,12 +757,264 @@ echo "PASS mutant-nogapclock"
 # nonatomic: the record is written in place, with the open-then-write gap
 # widened to 0.4 s. RED proof: the poller reads empty records that the
 # renaming code never exposes.
-mutant nonatomic $'    with open(tmp, "w", encoding="utf-8") as f:\n        f.write(info)\n    os.replace(tmp, me)\n' \
-  $'    with open(me, "w", encoding="utf-8") as f:\n        time.sleep(0.4)\n        f.write(info)\n'
+mutant nonatomic $'        os.replace(record_tmp, me_name,\n                   src_dir_fd=waiters_fd, dst_dir_fd=waiters_fd)\n' \
+  $'        with open(os.path.join(waiters_dir, me_name), "w", encoding="utf-8") as f:\n            time.sleep(0.4)\n            f.write(info)\n'
 publish_flow m8 "$TMP/nonatomic-wrk"
 read -r whole bad <"$TMP/m8.poll"
 [[ "$bad" -ge 1 ]] ||
   fail "mutant nonatomic still published whole records (whole=$whole bad=$bad) — the poller assertion is vacuous"
 echo "PASS mutant-nonatomic"
+
+# ── hk 1545: planted symlinks at the predictable names are never followed ──
+# An attacker who can write the waiters dir pre-plants a symlink at the old
+# predictable .<pid>.tmp (writes the record through it) and at the final
+# <pid> record name (the rename must replace the link, not its target). The
+# waiter's pid is not known ahead, so a python one-shot plants a range of
+# both names first; the run's actual pid is read back as the only regular
+# file in the dir and asserted to be inside the planted range.
+plant_links() { # plant_links <waiters dir> <tmp victim> <record victim>
+  python3 - "$1" "$2" "$3" <<'PY'
+import os, sys
+d, vtmp, vrec = sys.argv[1:4]
+base = os.getpid()
+for i in range(base + 1, base + 901):
+    for name, target in ((".%d.tmp" % i, vtmp), (str(i), vrec)):
+        try:
+            os.symlink(target, os.path.join(d, name))
+        except FileExistsError:
+            pass
+PY
+}
+
+symlink_flow() { # symlink_flow <tag> safe|vuln — safe pins the fix, vuln is the mutant proof
+  local tag="$1" mode="$2" recs wpid ph pl
+  new_lock "$tag"
+  chmod 1777 "$WRK_HEAVY_LOCK.waiters" # a writable+sticky dir is the attack surface
+  printf 'VICTIM-TMP-%s\n' "$tag" >"$TMP/victim-$tag-tmp"
+  printf 'VICTIM-REC-%s\n' "$tag" >"$TMP/victim-$tag-rec"
+  plant_links "$WRK_HEAVY_LOCK.waiters" "$TMP/victim-$tag-tmp" "$TMP/victim-$tag-rec"
+  # a held slot keeps the tested run queued: its record stays visible as a
+  # waiter instead of being published and removed inside one acquire pass
+  mkhold "$tag-H"; mkhold "$tag-L"
+  bg_heavy "$tag-H"; ph=$BG
+  wait_until 10 started "$tag-H" || fail "$tag: holder never started"
+  if [[ "$mode" == vuln ]]; then
+    HEAVY_BIN="$TMP/predtmp-wrk" bg_heavy "$tag-L"
+    # RED proof for the safe flow below: the restored predictable-name code
+    # opens .<pid>.tmp through the planted symlink, so the victim now holds
+    # record text. If this does not appear, the safe assertions are vacuous.
+    wait_until 10 grep -q '^pid=' "$TMP/victim-$tag-tmp" ||
+      fail "$tag: mutant predtmp did not follow the planted symlink — safe-mode assertions are vacuous"
+    release "$tag-H" "$tag-L"
+    wait "$ph" "$BG" || fail "$tag: mutant predtmp runs failed"
+    return 0
+  fi
+  bg_heavy "$tag-L"
+  pl=$BG
+  wait_until 10 queued "$tag-L" lane 1 || fail "$tag: lane never queued"
+  # exactly one record, a regular file (the planted <pid> link was replaced,
+  # not followed), holding this waiter's own record text
+  [[ "$(find "$WRK_HEAVY_LOCK.waiters" -maxdepth 1 -type f ! -name '.*' |
+       wc -l | tr -d ' ')" -eq 1 ]] ||
+    fail "$tag: expected exactly one regular record file"
+  recs="$(find "$WRK_HEAVY_LOCK.waiters" -maxdepth 1 -type f ! -name '.*' -print)"
+  wpid="$(basename "$recs")"
+  [[ "$wpid" =~ ^[0-9]+$ ]] || fail "$tag: record name is not a pid: $wpid"
+  grep -q "^pid=$wpid class=lane " "$recs" ||
+    fail "$tag: published record content is wrong: $(cat "$recs")"
+  # the waiter's pid must be inside the planted range, and the planted
+  # .<pid>.tmp symlink must still be a symlink to the victim — publication
+  # used an unpredictable name, not this one
+  [[ -L "$WRK_HEAVY_LOCK.waiters/.$wpid.tmp" ]] ||
+    fail "$tag: the waiter pid was outside the planted range — test inconclusive"
+  [[ "$(readlink "$WRK_HEAVY_LOCK.waiters/.$wpid.tmp")" == "$TMP/victim-$tag-tmp" ]] ||
+    fail "$tag: the planted tmp symlink was replaced, not left alone"
+  [[ "$(cat "$TMP/victim-$tag-tmp")" == "VICTIM-TMP-$tag" ]] ||
+    fail "$tag: the planted .pid.tmp symlink was followed — victim rewritten"
+  [[ "$(cat "$TMP/victim-$tag-rec")" == "VICTIM-REC-$tag" ]] ||
+    fail "$tag: the planted record-name symlink was followed — victim rewritten"
+  release "$tag-H" "$tag-L"
+  wait "$ph" "$pl" || fail "$tag: runs failed"
+  # exit cleanup sweeps the old predictable name — and only removes the link
+  [[ ! -e "$WRK_HEAVY_LOCK.waiters/.$wpid.tmp" && ! -L "$WRK_HEAVY_LOCK.waiters/.$wpid.tmp" ]] ||
+    fail "$tag: the planted tmp symlink was not swept on exit"
+  [[ "$(cat "$TMP/victim-$tag-tmp")" == "VICTIM-TMP-$tag" ]] ||
+    fail "$tag: exit cleanup followed the planted symlink"
+}
+symlink_flow t1 safe
+echo "PASS heavy-tmp-planted-symlinks-never-followed"
+
+# ── hk 1545: an untrusted waiters dir refuses the run before any write ─────
+# Group/other-writable WITHOUT the sticky bit: another local user could
+# remove or replace records — refuse rc 78, run nothing, mint no slot file.
+new_lock t2
+chmod 0777 "$WRK_HEAVY_LOCK.waiters"
+rc=0
+out="$("$WRK" heavy -- touch "$TMP/t2-ran" 2>&1)" || rc=$?
+[[ "$rc" -eq 78 ]] ||
+  fail "t2: world-writable non-sticky waiters dir must refuse rc 78, got rc=$rc: $out"
+grep -q 'untrusted waiters dir' <<<"$out" ||
+  fail "t2: the refusal must name the waiters dir: $out"
+[[ ! -e "$TMP/t2-ran" ]] || fail "t2: the command ran on an untrusted waiters dir"
+[[ ! -e "$WRK_HEAVY_LOCK" ]] ||
+  fail "t2: a slot file was minted although the run was refused"
+"$WRK" heavy status >/dev/null ||
+  fail "t2: status must stay readable on an untrusted waiters dir"
+chmod 0770 "$WRK_HEAVY_LOCK.waiters"
+rc=0
+"$WRK" heavy -- true >/dev/null 2>&1 || rc=$?
+[[ "$rc" -eq 78 ]] ||
+  fail "t2: group-writable non-sticky waiters dir must refuse rc 78, got rc=$rc"
+# the sticky bit restores usability for a writable dir owned by us, and a
+# plain private dir still works — normal publication is unaffected
+chmod 1777 "$WRK_HEAVY_LOCK.waiters"
+"$WRK" heavy -- touch "$TMP/t2-ran" ||
+  fail "t2: a sticky writable waiters dir owned by the user must be usable"
+[[ -e "$TMP/t2-ran" ]] || fail "t2: the command did not run on a sticky waiters dir"
+chmod 0755 "$WRK_HEAVY_LOCK.waiters"
+"$WRK" heavy -- touch "$TMP/t2-ran2" ||
+  fail "t2: a normal private waiters dir must not be refused"
+[[ -e "$TMP/t2-ran2" ]] || fail "t2: the command did not run on a normal waiters dir"
+echo "PASS heavy-tmp-untrusted-waiters-dir-refused"
+
+# ── hk 1545: a symlink at the predictable slot path is refused ─────────────
+new_lock t3
+printf 'VICTIM-SLOT\n' >"$TMP/victim-slot"
+ln -s "$TMP/victim-slot" "$WRK_HEAVY_LOCK"
+rc=0
+out="$("$WRK" heavy -- touch "$TMP/t3-ran" 2>&1)" || rc=$?
+[[ "$rc" -eq 78 ]] ||
+  fail "t3: a symlinked slot file must refuse rc 78, got rc=$rc: $out"
+[[ "$(cat "$TMP/victim-slot")" == "VICTIM-SLOT" ]] ||
+  fail "t3: the slot symlink was followed — victim rewritten"
+[[ ! -e "$TMP/t3-ran" ]] || fail "t3: the command ran over a symlinked slot file"
+"$WRK" heavy status | grep -q '^holder none' ||
+  fail "t3: status must treat a symlinked slot as unheld"
+echo "PASS heavy-tmp-slot-symlink-refused"
+
+# ── hk 1545 r2: a hardlink at the predictable slot path is refused ─────────
+# O_NOFOLLOW does not cover hardlinks: without the fstat check the slot
+# open would succeed and the flock/truncate would rewrite the victim
+# inode — the tester proved this destroys the target file on this host.
+new_lock t3h
+printf 'VICTIM-HARDLINK\n' >"$TMP/victim-hl"
+ln "$TMP/victim-hl" "$WRK_HEAVY_LOCK"
+rc=0
+out="$("$WRK" heavy -- touch "$TMP/t3h-ran" 2>&1)" || rc=$?
+[[ "$rc" -eq 78 ]] ||
+  fail "t3h: a hardlinked slot file must refuse rc 78, got rc=$rc: $out"
+[[ "$(cat "$TMP/victim-hl")" == "VICTIM-HARDLINK" ]] ||
+  fail "t3h: the slot hardlink was used — victim rewritten"
+[[ "$(stat -f%z "$TMP/victim-hl" 2>/dev/null || stat -c%s "$TMP/victim-hl")" == "16" ]] ||
+  fail "t3h: the victim was truncated"
+[[ ! -e "$TMP/t3h-ran" ]] || fail "t3h: the command ran over a hardlinked slot file"
+"$WRK" heavy status | grep -q '^holder none' ||
+  fail "t3h: status must treat a hardlinked slot as unheld"
+# a fifo at the slot path fails closed the same way — cleanly, no traceback
+rm "$WRK_HEAVY_LOCK"
+mkfifo "$WRK_HEAVY_LOCK"
+rc=0
+out="$("$WRK" heavy -- touch "$TMP/t3f-ran" 2>&1)" || rc=$?
+[[ "$rc" -eq 78 ]] ||
+  fail "t3h: a fifo slot must refuse rc 78, got rc=$rc: $out"
+[[ ! -e "$TMP/t3f-ran" ]] || fail "t3h: the command ran over a fifo slot file"
+echo "PASS heavy-tmp-slot-hardlink-and-fifo-refused"
+
+# ── hk 1545 r2: a symlinked waiters dir is refused, never repointed ────────
+# The link's owner can repoint it after any stat-style check, so the dir
+# open itself must not follow: the run refuses before any write.
+new_lock t3s
+rmdir "$WRK_HEAVY_LOCK.waiters"
+mkdir "$TMP/t3s-target" && chmod 0700 "$TMP/t3s-target"
+ln -s "$TMP/t3s-target" "$WRK_HEAVY_LOCK.waiters"
+rc=0
+out="$("$WRK" heavy -- touch "$TMP/t3s-ran" 2>&1)" || rc=$?
+[[ "$rc" -eq 78 ]] ||
+  fail "t3s: a symlinked waiters dir must refuse rc 78, got rc=$rc: $out"
+grep -q 'untrusted waiters dir' <<<"$out" ||
+  fail "t3s: the refusal must name the waiters dir: $out"
+[[ ! -e "$TMP/t3s-ran" ]] || fail "t3s: the command ran over a symlinked waiters dir"
+[[ -z "$(find "$TMP/t3s-target" -mindepth 1 -print -quit)" ]] ||
+  fail "t3s: a record was written through the waiters-dir symlink"
+"$WRK" heavy status >/dev/null ||
+  fail "t3s: status must stay readable on a symlinked waiters dir"
+echo "PASS heavy-tmp-symlinked-waiters-dir-refused"
+
+# ── hk 1545 r3: a root-owned lock and waiters dir are still usable ─────────
+# desktop's tmpfiles install creates /tmp/wrk-heavy-*.lock root-owned 0660
+# (runner granted by ACL) and .waiters root-owned 1770; refusing uid-0
+# objects would break every heavy run there. Simulated by a wrk copy whose
+# getuid() reports a uid that owns nothing, with the trusted-root slot
+# mapped onto our real uid — our own 0660 lock and 1770 dir play root's role.
+python3 - "$WRK" "$TMP/desktop-wrk" "$UID" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+me = sys.argv[3]
+src = src.replace("os.getuid()", "42424242").replace(
+    "42424242, 0", "42424242, " + me)
+assert "owner_trusted" in src and ("42424242, " + me) in src
+open(sys.argv[2], "w").write(src)
+PY
+chmod +x "$TMP/desktop-wrk"
+new_lock t3d
+: >"$WRK_HEAVY_LOCK"; chmod 0660 "$WRK_HEAVY_LOCK"
+chmod 1770 "$WRK_HEAVY_LOCK.waiters"
+"$TMP/desktop-wrk" heavy -- touch "$TMP/t3d-ran" ||
+  fail "t3d: a root-owned shared lock and waiters dir must be usable (desktop tmpfiles layout)"
+[[ -e "$TMP/t3d-ran" ]] || fail "t3d: the command did not run over the root-owned layout"
+"$TMP/desktop-wrk" heavy status >/dev/null ||
+  fail "t3d: status must stay readable over the root-owned layout"
+echo "PASS heavy-tmp-root-owned-desktop-layout"
+
+# ── hk 1545: a planted record symlink is never read ────────────────────────
+# A live-looking ci record behind a symlink would otherwise reserve every
+# slot for lanes; the scans read regular files only.
+new_lock t4
+printf 'pid=1 class=ci limit=9 since=2026-01-01T00:00:00 job=- cmd=planted\n' \
+  >"$TMP/planted-src"
+ln -s "$TMP/planted-src" "$WRK_HEAVY_LOCK.waiters/424242"
+status_out | grep -q 'cmd=planted' &&
+  fail "t4: status read a record through a planted symlink"
+WRK_HEAVY_WAIT_CAP=8 "$WRK" heavy -- touch "$TMP/t4-ran" ||
+  fail "t4: a lane was blocked by a record behind a planted symlink"
+[[ -e "$TMP/t4-ran" ]] || fail "t4: the command did not run"
+echo "PASS heavy-tmp-planted-record-symlink-ignored"
+
+# ── hk 1545 assertion-RED mutants ──────────────────────────────────────────
+
+# predtmp: the old predictable .<pid>.tmp publication is restored. RED proof:
+# the same planted-symlink setup as t1 ends with record text inside the tmp
+# victim — the symlink WAS followed.
+mutant predtmp $'    fd, tmp = tempfile.mkstemp(dir=waiters_dir, prefix=".")\n    record_tmp = os.path.basename(tmp)\n    try:\n        with os.fdopen(fd, "w", encoding="utf-8") as f:\n' \
+  $'    tmp = os.path.join(waiters_dir, ".%d.tmp" % os.getpid())\n    record_tmp = os.path.basename(tmp)\n    try:\n        with open(tmp, "w", encoding="utf-8") as f:\n'
+symlink_flow m9 vuln
+echo "PASS mutant-predtmp"
+
+# trustopen: the waiters-dir trust check never refuses. RED proof: the 0777
+# non-sticky dir that must refuse rc 78 accepts the run. The cut lands
+# inside waiters_dir_open — dropping the caller-side guard would only
+# crash the mutant on a -1 fd.
+mutant trustopen '    if not trusted:' '    if False:'
+new_lock m10
+chmod 0777 "$WRK_HEAVY_LOCK.waiters"
+"$TMP/trustopen-wrk" heavy -- touch "$TMP/m10-ran" ||
+  fail "mutant trustopen still refused the untrusted dir — refusal assertion is vacuous"
+[[ -e "$TMP/m10-ran" ]] || fail "mutant trustopen run did not execute"
+echo "PASS mutant-trustopen"
+
+# slotlink: the slot fstat check accepts a hardlink. RED proof: the run
+# flocks the planted link and the holder record is written through it —
+# the victim's own inode carries wrk's text while the slot is held.
+mutant slotlink '_st.st_nlink == 1 and' 'True and'
+new_lock m11
+printf 'M11-VICTIM\n' >"$TMP/m11-victim"
+ln "$TMP/m11-victim" "$WRK_HEAVY_LOCK"
+mkhold m11-x
+HEAVY_BIN="$TMP/slotlink-wrk" bg_heavy m11-x
+wait_until 10 grep -q 'pid=' "$TMP/m11-victim" ||
+  fail "mutant slotlink did not write the record into the victim — assertion is vacuous"
+release m11-x
+wait "$BG" || fail "mutant slotlink run failed"
+echo "PASS mutant-slotlink"
 
 echo 'PASS test-wrk-heavy-class'

@@ -880,8 +880,9 @@ limit 미만 인덱스)을 잡지 않는다 — 슬롯이 비면 먼저 폴링�
 늦게 온 ci 대기자 앞에서 가드가 이미 소진돼 있는 일은 없다. 총 대기 cap(기본 1200 s)은 그대로라서
 기본 cap 에서는 `WRK_HEAVY_WAIT_CAP` 을 키운 호출에서만 이 가드가 의미를 가진다.
 `wrk heavy status` 는 보유자·대기자 줄마다 `class=ci|lane` 과 대기 당시 `limit=` 을 보여 주고,
-heavy.log 의 run/wait_cap 행에는 `class` 필드가 붙으며, 양보한 lane 대기자는 양보가 끝날 때
-`kind=defer` 행을 1개(`wait_s`, `defer_s` = 실제 양보한 시간, `reason`) 남긴다.
+heavy.log 의 모든 행에는 `class` 필드가 붙는다(`kind` 무관 — run·wait_cap·defer·nested·refused
+전부, `log_event` 가 행마다 넣는다). 양보한 lane 대기자는 양보가 끝날 때 `kind=defer` 행을
+1개(`class` 포함, `wait_s`, `defer_s` = 실제 양보한 시간, `reason`) 남긴다.
 
 이 순서는 잠금이 아니라 대기자 디렉터리를 읽는 대기열 순서이고, 약속하는 범위는 정확히
 이만큼이다: ci 대기자는 기록이 그 디렉터리에 **보이는 순간부터** 대기 중이다(기록은 점 이름으로

@@ -156,11 +156,11 @@
   "expires_at": "2026-10-20T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "bc7e430fac437a5ecd39cfd260486372e0e1521a83c6d47008374d74bae2eb9b",
-    "bin/wrk": "beb36544dd8b82849aaa18d2a6dfcec3415c86405bbadff87c34f0f4369303b2",
+    "bin/wrk": "038fb0c2ca2b83fbefc717ec0e1c7b1167bc131423cce2644945b60fc644883b",
     "builder/SKILL.md": "91cdb4c1d22177fc219db5b876ecc52b852122bc37128a0180def3668c8c38e8",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
     "director/SKILL.md": "c6b95f71c691d7711aeb9ee55f5e804f889319e99a21987a813eec148135ba42",
-    "spawn-worker/SKILL.md": "37ea2781705286fd0c069b7d70794755cf69470607431900905e7751ddeab7c3"
+    "spawn-worker/SKILL.md": "876f82baa3bb9607da8103899ad4735a3d5c9a54ca8b4ee916b686c7826a5948"
   },
   "profiles": {
     "agy-flash": {
@@ -1786,7 +1786,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-13.6",
+  "revision": "2026-10-13.7",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
