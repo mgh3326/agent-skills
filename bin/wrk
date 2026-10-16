@@ -3660,12 +3660,21 @@ resolve_profile() {
     haiku) GATE_PROFILE=haiku ;;
     fable) GATE_PROFILE=fable ;;
     devin-swe2|builder-devin) GATE_PROFILE=devin-swe2 ;;
-    # All devin-* model profiles share one gate spelling: `devin-swe2` is the
-    # only devin profile installed scopefuel accepts (any other spelling is
-    # argparse-rejected, rc=2 fail-closed). Per-model attribution survives in
-    # the job.spawned payload `profile` and the quota_pool.record
-    # `launch_profile`, so reps stay separated per model.
-    devin-glm52|devin-swe17|devin-ds41|devin-swe2-medium|devin-swe2-max|devin-ds41-max|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max) GATE_PROFILE=devin-swe2 ;;
+    # hk 1604: scopefuel gate -m accepts every GRADE_TABLE profile, so each
+    # devin spelling is judged as itself. Collapsing them onto devin-swe2
+    # put the paid DeepSeek rungs (ds41, ds41-max) on the SWE-2 Free bucket.
+    # Paid rungs must never be judged on the SWE-2 Free bucket. Builder seats
+    # take the runtime profile from scopefuel grades.py _BUILDER_RUNGS
+    # (builder-devin-medium -> devin-swe2-medium, and the same shape for
+    # -max / ds41 / ds41-max). This case does not set GATE_EFFORT_PIN, so
+    # quota_pool.record launch_profile stays the launcher spelling. An
+    # installed scopefuel that rejects a name (argparse rc 2) still refuses
+    # the spawn.
+    devin-swe2-medium|devin-swe2-max|devin-swe17|devin-glm52|devin-ds41|devin-ds41-max) GATE_PROFILE="$MODEL" ;;
+    builder-devin-medium) GATE_PROFILE=devin-swe2-medium ;;
+    builder-devin-max) GATE_PROFILE=devin-swe2-max ;;
+    builder-ds41) GATE_PROFILE=devin-ds41 ;;
+    builder-ds41-max) GATE_PROFILE=devin-ds41-max ;;
     # hk 1380: the fusion spellings gate at their OWN gate_policy.json entries,
     # never at devin-swe2 — their family is the Claude family (anthropic), and
     # folding them into devin-swe2 would make a fusion tester look

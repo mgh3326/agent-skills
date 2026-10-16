@@ -6,7 +6,9 @@ set -euo pipefail
 pool_for() {
   case "$1" in
     opus|sonnet|fable|haiku) echo claude ;;
-    devin-swe2) echo devin ;;
+    # hk 1604: each devin gate spelling stays in scopefuel's single devin pool.
+    # Builder seats are not gate names; wrk asks for the runtime profile.
+    devin-swe2|devin-swe2-medium|devin-swe2-max|devin-swe17|devin-glm52|devin-ds41|devin-ds41-max) echo devin ;;
     # hk 1380: the fusion spellings gate at their own catalog rows but stay in
     # scopefuel's single `devin` quota pool.
     devin-fusion-opus55|devin-fusion-sonnet55) echo devin ;;

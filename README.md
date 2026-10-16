@@ -237,8 +237,7 @@ Devin에는 `--effort` 플래그가 없고 effort가 모델 id 안에 들어 있
 effort 런그는 별도 프로필이다(#635): `devin-swe2-medium`(`--model swe-2-medium`)과
 `devin-swe2-max`(`--model swe-2-max`)는 무료이고, `devin-ds41-max`
 (`--model deepseek-v4-1-flash-max`)는 유료다. `devin-swe2`는 high 기본값을 유지한다.
-quota gate에는 이름을 그대로 `devin-swe2`로
-넘기고 pool 결정·기록은 scopefuel 출력과 arbiter가 소유한다.
+quota gate는 `devin-swe2`와 `builder-devin`만 `devin-swe2`로 넘긴다. 그 외 devin 철자(`devin-swe2-medium`, `devin-swe2-max`, `devin-swe17`, `devin-glm52`, `devin-ds41`, `devin-ds41-max`)는 자기 이름으로 넘기고, `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`는 scopefuel grades.py의 런타임 프로필(`devin-swe2-medium`, `devin-swe2-max`, `devin-ds41`, `devin-ds41-max`)로 넘긴다. 유료 런그를 SWE-2 Free 버킷으로 판정하지 않기 위해서다. pool 결정·기록은 scopefuel 출력과 arbiter가 소유하고, launch_profile은 런처 철자 그대로다.
 
 이 분기는 herdr 0.9.1의 `agent start` 소유권 검사가 Devin 3000.11.1에서 실패하는 동안의
 임시 우회다. herdr가 고쳐지면 걷어낸다. 해제 조건은 운영자가 만든 disposable pane에서
