@@ -527,6 +527,16 @@ for entry in json.load(open(sys.argv[1], encoding="utf-8"))["trusted_paths"]:
 PY
 }
 
+# A piped grep -q exits on the first hit and SIGPIPEs this writer. Under
+# pipefail that is a failure even when the entry is present: the #912
+# concurrent check died as BrokenPipeError on a later print. Capture the
+# list, then grep the text. Same shape as the #994 AC7 note.
+devin_trust_has() {  # XDG_ROOT ENTRY
+  local paths
+  paths="$(devin_trust_paths "$1")" || return 1
+  grep -qxF -- "$2" <<<"$paths"
+}
+
 devin_trust_mutant() {  # NAME OLD NEW — writes $TMP/mut-wrk-NAME, asserts applied
   python3 - "$WRK" "$TMP/mut-wrk-$1" "$2" "$3" <<'PY'
 import sys
@@ -5840,8 +5850,8 @@ grep -q 'model=codex-luna' <<<"$canonical_out"
 profiles=(
   "opus:opus" "sonnet:sonnet" "sonnet-med:sonnet" "haiku:haiku"
   "devin-swe2:devin-swe2"
-  "devin-glm52:devin-swe2" "devin-swe17:devin-swe2" "devin-ds41:devin-swe2"
-  "devin-swe2-medium:devin-swe2" "devin-swe2-max:devin-swe2" "devin-ds41-max:devin-swe2"
+  "devin-glm52:devin-glm52" "devin-swe17:devin-swe17" "devin-ds41:devin-ds41"
+  "devin-swe2-medium:devin-swe2-medium" "devin-swe2-max:devin-swe2-max" "devin-ds41-max:devin-ds41-max"
   "devin-fusion-opus55:devin-fusion-opus55" "devin-fusion-sonnet55:devin-fusion-sonnet55"
   "codex:codex-max" "codex-sol:codex-max" "codex-luna:codex-luna-max"
   "codex-luna-hi:codex-luna-max" "codex-max:codex-max"
@@ -7519,11 +7529,11 @@ t912_out="$(devin_spawn_at "$t912_xdg" "$TMP/t912-add/deep/nest" devin912a "$(mi
   fail "devin spawn over an uncovered cwd failed: $t912_out"
 grep -q '^OK ' <<<"$t912_out" || fail "devin trust-seed spawn lost its OK line: $t912_out"
 t912_resolved="$(cd "$TMP/t912-add/deep/nest" && pwd -P)"
-devin_trust_paths "$t912_xdg" | grep -qx "$t912_resolved" ||
+devin_trust_has "$t912_xdg" "$t912_resolved" ||
   fail "resolved spawn cwd was not added: $(devin_trust_paths "$t912_xdg")"
 [[ "$(devin_trust_paths "$t912_xdg" | wc -l | tr -d ' ')" -eq 2 ]] ||
   fail "store gained more than the spawn cwd: $(devin_trust_paths "$t912_xdg")"
-devin_trust_paths "$t912_xdg" | grep -qx "$TMP/t912-elsewhere" ||
+devin_trust_has "$t912_xdg" "$TMP/t912-elsewhere" ||
   fail "pre-existing entry was removed: $(devin_trust_paths "$t912_xdg")"
 compgen -G "$t912_xdg/devin/cli/trusted_workspaces.json.bak-*" >/dev/null ||
   fail "trust write produced no backup"
@@ -7553,7 +7563,7 @@ devin_spawn_at "$t912_xdg" "$TMP/t912-parent/child" devin912c "$(mint_task)" >/d
   fail "devin spawn over a parent-covered cwd failed"
 cmp -s "$t912_xdg/devin/cli/trusted_workspaces.json" "$TMP/t912-parent.before" ||
   fail "parent-covered cwd rewrote the store"
-devin_trust_paths "$t912_xdg" | grep -qx "$(cd "$TMP/t912-parent/child" && pwd -P)" &&
+devin_trust_has "$t912_xdg" "$(cd "$TMP/t912-parent/child" && pwd -P)" &&
   fail "parent-covered cwd appended the child path"
 echo "PASS 912-devin-trust parent-covered is a pure no-op"
 
@@ -7563,7 +7573,7 @@ t912_xdg="$TMP/t912-xdg-sib"
 devin_trust_seed_store "$t912_xdg" "$(cd "$TMP/t912-sib/trusted" && pwd -P)"
 devin_spawn_at "$t912_xdg" "$TMP/t912-sib/untrusted" devin912sib "$(mint_task)" >/dev/null ||
   fail "devin spawn next to a trusted sibling failed"
-devin_trust_paths "$t912_xdg" | grep -qx "$(cd "$TMP/t912-sib/untrusted" && pwd -P)" ||
+devin_trust_has "$t912_xdg" "$(cd "$TMP/t912-sib/untrusted" && pwd -P)" ||
   fail "trusted sibling wrongly covered the spawn cwd"
 echo "PASS 912-devin-trust sibling trust does not cover"
 
@@ -7643,11 +7653,11 @@ set -e
   fail "concurrent devin spawns failed rc=$t912_ra/$t912_rb: $(cat "$TMP/t912-race-a.out" "$TMP/t912-race-b.out")"
 t912_ra_path="$(cd "$TMP/t912-race-a" && pwd -P)"
 t912_rb_path="$(cd "$TMP/t912-race-b" && pwd -P)"
-devin_trust_paths "$TMP/t912-xdg-race" | grep -qx "$t912_ra_path" ||
+devin_trust_has "$TMP/t912-xdg-race" "$t912_ra_path" ||
   fail "concurrent spawn lost entry A: $(devin_trust_paths "$TMP/t912-xdg-race")"
-devin_trust_paths "$TMP/t912-xdg-race" | grep -qx "$t912_rb_path" ||
+devin_trust_has "$TMP/t912-xdg-race" "$t912_rb_path" ||
   fail "concurrent spawn lost entry B: $(devin_trust_paths "$TMP/t912-xdg-race")"
-devin_trust_paths "$TMP/t912-xdg-race" | grep -qx "$TMP/t912-race-origin" ||
+devin_trust_has "$TMP/t912-xdg-race" "$TMP/t912-race-origin" ||
   fail "concurrent spawn removed the pre-existing entry"
 [[ "$(devin_trust_paths "$TMP/t912-xdg-race" | wc -l | tr -d ' ')" -eq 3 ]] ||
   fail "concurrent spawn produced wrong entry count"
@@ -7669,8 +7679,7 @@ t912_home_out="$(env -u XDG_DATA_HOME HOME="$t912_home" \
   "$WRK" spawn -c "$TMP/t912-cwd-home" -m devin-swe2 -p "$PROMPT" -w w \
   -l devin912h --t T1 --task "$(mint_task)" 2>&1)" ||
   fail "HOME-fallback devin spawn failed: $t912_home_out"
-devin_trust_paths "$t912_home/.local/share" |
-  grep -qx "$(cd "$TMP/t912-cwd-home" && pwd -P)" ||
+devin_trust_has "$t912_home/.local/share" "$(cd "$TMP/t912-cwd-home" && pwd -P)" ||
   fail "HOME-fallback store did not gain the spawn cwd"
 echo "PASS 912-devin-trust XDG unset falls back to fixture HOME"
 
@@ -7686,11 +7695,10 @@ devin_trust_mutant widen \
 WRK_UNDER_TEST="$TMP/mut-wrk-widen" \
   devin_spawn_at "$TMP/t912-xdg-m1" "$TMP/t912-m1/deep/nest" devin912m1 "$(mint_task)" \
   >/dev/null 2>&1 || true
-if devin_trust_paths "$TMP/t912-xdg-m1" | grep -qx "$(cd "$TMP/t912-m1/deep/nest" && pwd -P)"; then
+if devin_trust_has "$TMP/t912-xdg-m1" "$(cd "$TMP/t912-m1/deep/nest" && pwd -P)"; then
   fail "parent-widening mutant survived: the spawn cwd was still added"
 fi
-devin_trust_paths "$TMP/t912-xdg-m1" |
-  grep -qx "$(cd "$TMP/t912-m1/deep" && pwd -P)" ||
+devin_trust_has "$TMP/t912-xdg-m1" "$(cd "$TMP/t912-m1/deep" && pwd -P)" ||
   fail "parent-widening mutant did not apply (parent entry absent)"
 echo "PASS 912-devin-trust mutant: parent widening goes RED"
 
@@ -7743,7 +7751,7 @@ devin_trust_mutant drop \
 WRK_UNDER_TEST="$TMP/mut-wrk-drop" \
   devin_spawn_at "$TMP/t912-xdg-m5" "$TMP/t912-m5-cwd" devin912m5 "$(mint_task)" \
   >/dev/null 2>&1 || true
-if devin_trust_paths "$TMP/t912-xdg-m5" | grep -qx "$TMP/t912-m5-keep"; then
+if devin_trust_has "$TMP/t912-xdg-m5" "$TMP/t912-m5-keep"; then
   fail "entry-dropping mutant survived: pre-existing entry still present"
 fi
 echo "PASS 912-devin-trust mutant: dropped entries go RED"
@@ -9142,23 +9150,22 @@ assert any(event.get("kind") == "quota_pool.release" for event in events), event
 PY
 echo "PASS task606 never-ready shell closes pane and releases its arbiter record"
 
-# Task 281: the new devin model variants share scopefuel's single `devin` pool
-# — the gate call uses the only devin spelling installed scopefuel accepts
-# (devin-swe2), while the spawn receipt keeps the actual launch profile.
+# hk 1604: devin-ds41 is judged as itself, still on scopefuel's single devin
+# pool. The spawn receipt keeps the launcher spelling (here the same name).
 rm -f "$TMP/herdr.log" "$TMP/scopefuel.log"
 ds41_admit_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base devin-ds41 --job arb-devin-ds41 --t T1 2>&1)"
-grep -qx 'profile=devin-swe2 pool=devin used_pct=0 class=spend' <<<"$ds41_admit_out"
+grep -qx 'profile=devin-ds41 pool=devin used_pct=12.5 class=preserve' <<<"$ds41_admit_out"
 grep -q 'quota_record=devin/quota_pool' <<<"$ds41_admit_out"
-[[ "$(tail -n 1 "$TMP/scopefuel.log")" == 'devin-swe2' ]]
+[[ "$(tail -n 1 "$TMP/scopefuel.log")" == 'devin-ds41' ]]
 arb status --job arb-devin-ds41 --json |
-  python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["quota_pool_records"]; assert len(r)==1 and r[0]["pool"]=="devin" and r[0]["profile"]=="devin-swe2", d'
+  python3 -c 'import json,sys; d=json.load(sys.stdin); r=d["quota_pool_records"]; assert len(r)==1 and r[0]["pool"]=="devin" and r[0]["profile"]=="devin-ds41", d'
 python3 - "$ARBITER_INBOX_ROOT/arb-devin-ds41/events" <<'PY'
 import json, pathlib, sys
 events = [json.loads(path.read_text()) for path in pathlib.Path(sys.argv[1]).glob("*.json")]
 spawned = next(event for event in events if event["kind"] == "job.spawned")
 assert spawned["payload"]["profile"] == "devin-ds41", spawned
 PY
-echo "PASS devin-ds41 shares the devin-swe2 gate spelling and devin quota pool"
+echo "PASS devin-ds41 gates as itself on the devin quota pool"
 
 # ⑥ the pool is a record, not a mutex: another job asking for the same pool
 # succeeds and both records remain visible.
@@ -10087,8 +10094,8 @@ for devin_builder_pair in "devin-swe2-medium:swe-2-medium" "devin-swe2-max:swe-2
     fail "$devin_builder_profile builder argv mismatch: $devin_variant_builder_run"
   [[ " $devin_variant_builder_run " != *' --effort '* ]] ||
     fail "$devin_builder_profile builder argv must not gain an effort flag"
-  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "devin-swe2" ]] ||
-    fail "$devin_builder_profile must gate as the scopefuel-known devin-swe2 spelling"
+  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "$devin_builder_profile" ]] ||
+    fail "$devin_builder_profile must gate as itself (hk 1604), got: $(tail -n 1 "$TMP/scopefuel.log")"
   python3 - "$ARBITER_INBOX_ROOT/builder-${devin_builder_profile}-job/events/00001-job.claim.json" <<'PY'
 import json, sys
 event = json.load(open(sys.argv[1]))
@@ -10418,14 +10425,20 @@ expect_red fallback-table-stale sol_fallback_probe "$MUT1026/wrk-fallback"
 echo "PASS 1026-AC4-mutants-red"
 
 # #666: the devin effort rungs exist as named builder spellings — same
-# unattended argv as the worker variants, gated as devin-swe2 like every
-# devin-* profile, and refused without --role builder. builder-ds41[-max] is
-# the paid rung admitted per the operator's ds41-builder policy; the ds41
-# worker spellings stay worker-only (the refusal loop below pins that).
-for devin_builder_pair in "builder-devin-medium:swe-2-medium" "builder-devin-max:swe-2-max" \
-  "builder-ds41:deepseek-v4-1-flash-high" "builder-ds41-max:deepseek-v4-1-flash-max"; do
+# unattended argv as the worker variants, refused without --role builder.
+# hk 1604: each seat gates as its runtime profile (scopefuel grades.py
+# _BUILDER_RUNGS), not as devin-swe2. builder-ds41[-max] is the paid rung
+# admitted per the operator's ds41-builder policy; the ds41 worker spellings
+# stay worker-only (the refusal loop below pins that).
+for devin_builder_pair in \
+  "builder-devin-medium:swe-2-medium:devin-swe2-medium" \
+  "builder-devin-max:swe-2-max:devin-swe2-max" \
+  "builder-ds41:deepseek-v4-1-flash-high:devin-ds41" \
+  "builder-ds41-max:deepseek-v4-1-flash-max:devin-ds41-max"; do
   devin_builder_profile="${devin_builder_pair%%:*}"
-  devin_builder_model="${devin_builder_pair#*:}"
+  devin_builder_rest="${devin_builder_pair#*:}"
+  devin_builder_model="${devin_builder_rest%%:*}"
+  devin_builder_gate="${devin_builder_rest#*:}"
   : >"$TMP/herdr.log" "$TMP/scopefuel.log"
   set +e
   devin_builder_out="$(TEST_FIXTURE_SCENARIO=devin-idle spawn_base "$devin_builder_profile" --role builder --lane "$devin_builder_profile-lane" --parent parent-lane --job "$devin_builder_profile-job" --t T1 2>&1)"
@@ -10440,8 +10453,8 @@ for devin_builder_pair in "builder-devin-medium:swe-2-medium" "builder-devin-max
     fail "$devin_builder_profile must reuse the worker variant's argv verbatim: $devin_builder_run"
   [[ " $devin_builder_run " != *' --effort '* ]] ||
     fail "$devin_builder_run run argv must not contain effort"
-  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "devin-swe2" ]] ||
-    fail "$devin_builder_profile must gate as the scopefuel-known devin-swe2 spelling"
+  [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "$devin_builder_gate" ]] ||
+    fail "$devin_builder_profile must gate as $devin_builder_gate (hk 1604), got: $(tail -n 1 "$TMP/scopefuel.log")"
   python3 - "$ARBITER_INBOX_ROOT/$devin_builder_profile-job/events/00001-job.claim.json" "$devin_builder_profile" <<'PY'
 import json, sys
 event = json.load(open(sys.argv[1]))
@@ -13433,7 +13446,14 @@ printf '0\n' >"$HEAVY_LOAD"
 export WRK_HEAVY_LOCK="$HEAVY_LOCK" WRK_HEAVY_LOAD_FILE="$HEAVY_LOAD" \
   WRK_HEAVY_LOG="$TMP/heavy.log"
 
-heavy_status_has_waiter() { "$WRK" heavy status | grep -q 'waiter pid='; }
+# Capture before grep -q. A pipe closes on the first hit, and under pipefail
+# the status writer's later lines (waiters none) become a SIGPIPE failure
+# even when the matched line is present. Same shape as devin_trust_has.
+heavy_status_has_waiter() {
+  local out
+  out="$("$WRK" heavy status)" || return 1
+  grep -q 'waiter pid=' <<<"$out"
+}
 pid_dead() { ! kill -0 "$1" 2>/dev/null; }
 heavy_dead() { wait_until 10 pid_dead "$1"; }
 heavy_touch() { printf 'touch "%s"\n' "$1" >"$2"; }
@@ -13457,7 +13477,9 @@ expect_exit 2 "$WRK" heavy no-double-dash
 expect_exit 2 "$WRK" heavy --
 expect_exit 2 "$WRK" heavy status extra
 expect_exit 0 "$WRK" heavy status
-"$WRK" heavy status | grep -q 'holder none' || fail "free lock must report 'holder none'"
+heavy_out="$("$WRK" heavy status)" || fail "free lock status failed: $heavy_out"
+grep -q 'holder none' <<<"$heavy_out" ||
+  fail "free lock must report 'holder none': $heavy_out"
 "$WRK" heavy -- true || fail "simple run must succeed"
 expect_exit 1 "$WRK" heavy -- false
 expect_exit 127 "$WRK" heavy -- definitely-not-a-real-binary-721
@@ -13467,8 +13489,10 @@ expect_exit 127 "$WRK" heavy -- definitely-not-a-real-binary-721
 # its .waiters dir: other sessions serialize on that inode, and unlinking
 # it mid-hold splits the host queue (r2 finding N1).
 default_lock="$(python3 -c 'import socket; print("/tmp/wrk-heavy-%s.lock" % socket.gethostname())')"
-env -u WRK_HEAVY_LOCK "$WRK" heavy status | grep -qF "lock $default_lock" ||
-  fail "default lock path not used"
+default_out="$(env -u WRK_HEAVY_LOCK "$WRK" heavy status)" ||
+  fail "default lock status failed: $default_out"
+grep -qF "lock $default_lock" <<<"$default_out" ||
+  fail "default lock path not used: $default_out"
 
 # the command runs under nice -n 10 — asserted relative to this suite's own
 # nice value so the check still has teeth when the suite itself is already
@@ -13598,4 +13622,7 @@ wait "$waiter_job" || fail "run did not start after the load gate opened"
 echo "PASS heavy-load-gate-bounds-the-start"
 
 bash "$ROOT/tests/test-shellcheck-capped.sh"
+# hk 1604: devin gate-profile contract. The real-scopefuel smoke stays opt-in
+# (SCOPEFUEL_SMOKE_REPO), so this CI invocation does not need a checkout.
+bash "$ROOT/tests/test-devin-gate-profile.sh"
 echo 'PASS test-wrk'
