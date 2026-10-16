@@ -17,7 +17,7 @@ PANEWIRE="$ROOT/tests/fixtures/panewire"
 TMP="$(mktemp -d)"
 JOB_SEQ=0
 LAST_GATE=""
-declare -A GATE_CACHE=()
+mkdir -p "$TMP/gate-cache"
 
 cleanup() {
   local pidfile pid child
@@ -110,10 +110,11 @@ spawn_one() {
 # Record the gate profile this wrk binary asks scopefuel for. The log's first
 # line is the full gate argv and the last line is the bare profile.
 measure_gate() {
-  local wrk_bin="$1" model="$2" key out rc count first gate
-  key="$wrk_bin|$model"
-  if [[ -n "${GATE_CACHE[$key]+x}" ]]; then
-    LAST_GATE="${GATE_CACHE[$key]}"
+  local wrk_bin="$1" model="$2" cache out rc count first gate
+  # Per-key files, not an associative array: macos CI bash is 3.2.
+  cache="$TMP/gate-cache/$(basename "$wrk_bin")--$model"
+  if [[ -f "$cache" ]]; then
+    LAST_GATE=$(cat "$cache")
     return 0
   fi
   JOB_SEQ=$((JOB_SEQ + 1))
@@ -135,7 +136,7 @@ measure_gate() {
   gate=$(tail -n 1 "$TMP/scopefuel.log")
   [[ "$count" -eq 2 && "$first" == "gate -m $gate" && "$first" != *"--effort"* ]] ||
     fail "gate log for $model is not a bare -m call: $(cat "$TMP/scopefuel.log")"
-  GATE_CACHE[$key]=$gate
+  printf '%s\n' "$gate" >"$cache"
   LAST_GATE=$gate
 }
 
@@ -165,45 +166,58 @@ assert_invariant() {
   return 0
 }
 
-python3 - "$WRK" <(git -C "$ROOT" show origin/main:bin/wrk) <<'PY'
+# Pinned hk 1380 fusion arm. The expected text is this literal. The test
+# does not read a git ref.
+cat >"$TMP/fusion-expected.txt" <<'EOF'
+    # hk 1380: the fusion spellings gate at their OWN gate_policy.json entries,
+    # never at devin-swe2 — their family is the Claude family (anthropic), and
+    # folding them into devin-swe2 would make a fusion tester look
+    # cross-family against a claude builder and break the §2-4 separation.
+    # The quota pool is still scopefuel's single `devin` pool — wrk owns no
+    # pool mapping, the gate answer names the pool.
+    devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;
+EOF
+python3 - "$WRK" "$TMP/fusion-expected.txt" <<'PY'
 import pathlib, sys
-marker = "    # hk 1380: the fusion spellings gate"
-arm = 'devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;'
-def slice_arm(text):
-    start = text.index(marker)
-    end = text.index(arm, start)
-    end = text.index("\n", end) + 1
-    return text[start:end]
-now = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
-base = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
-got, expected = slice_arm(now), slice_arm(base)
-assert got == expected, (got, expected)
+text = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+expected = pathlib.Path(sys.argv[2]).read_text(encoding="utf-8")
+count = text.count(expected)
+if count != 1:
+    raise SystemExit("fusion arm literal count %s" % count)
 PY
 grep -q 'devin-swe2|builder-devin) GATE_PROFILE=devin-swe2' "$WRK" ||
   fail "devin-swe2 and builder-devin must still gate as devin-swe2"
-echo "PASS fusion arm unchanged against origin/main"
+echo "PASS fusion arm matches pinned hk 1380 literal"
 
-declare -A EXPECTED=(
-  [devin-swe2]=devin-swe2
-  [builder-devin]=devin-swe2
-  [devin-swe2-medium]=devin-swe2-medium
-  [devin-swe2-max]=devin-swe2-max
-  [devin-swe17]=devin-swe17
-  [devin-glm52]=devin-glm52
-  [devin-ds41]=devin-ds41
-  [devin-ds41-max]=devin-ds41-max
-  [builder-devin-medium]=devin-swe2-medium
-  [builder-devin-max]=devin-swe2-max
-  [builder-ds41]=devin-ds41
-  [builder-ds41-max]=devin-ds41-max
-  [devin-fusion-opus55]=devin-fusion-opus55
-  [devin-fusion-sonnet55]=devin-fusion-sonnet55
-)
+# Plain case function: bash 3.2 has no associative arrays.
+expected_gate() {
+  case "$1" in
+    devin-swe2|builder-devin) printf '%s\n' devin-swe2 ;;
+    devin-swe2-medium|builder-devin-medium) printf '%s\n' devin-swe2-medium ;;
+    devin-swe2-max|builder-devin-max) printf '%s\n' devin-swe2-max ;;
+    devin-swe17) printf '%s\n' devin-swe17 ;;
+    devin-glm52) printf '%s\n' devin-glm52 ;;
+    devin-ds41|builder-ds41) printf '%s\n' devin-ds41 ;;
+    devin-ds41-max|builder-ds41-max) printf '%s\n' devin-ds41-max ;;
+    devin-fusion-opus55) printf '%s\n' devin-fusion-opus55 ;;
+    devin-fusion-sonnet55) printf '%s\n' devin-fusion-sonnet55 ;;
+    *) return 1 ;;
+  esac
+}
 spelling=""
-for spelling in "${!EXPECTED[@]}"; do
+want=""
+for spelling in \
+  devin-swe2 builder-devin \
+  devin-swe2-medium devin-swe2-max devin-swe17 devin-glm52 \
+  devin-ds41 devin-ds41-max \
+  builder-devin-medium builder-devin-max \
+  builder-ds41 builder-ds41-max \
+  devin-fusion-opus55 devin-fusion-sonnet55
+do
   measure_gate "$WRK" "$spelling"
-  [[ "$LAST_GATE" == "${EXPECTED[$spelling]}" ]] ||
-    fail "$spelling gated as $LAST_GATE, want ${EXPECTED[$spelling]}"
+  want=$(expected_gate "$spelling") || fail "no expected gate for $spelling"
+  [[ "$LAST_GATE" == "$want" ]] ||
+    fail "$spelling gated as $LAST_GATE, want $want"
   printf 'gate %s -> %s\n' "$spelling" "$LAST_GATE"
 done
 echo "PASS mapping table"
