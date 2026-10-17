@@ -32,13 +32,12 @@
 #   billing=paid, pool=devin, unmeasured):
 #     B   devin-fusion-opus55    (model fusion-claude-opus-5-5-high-sidekick-swe-2-medium)
 #     B   devin-fusion-sonnet55  (model fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium)
-#   hk 1620 Argon trial rows (scopefuel PR #1620 head): launch.py
-#   UNGRADED_TRIAL_SNAPSHOT — grade C is the inert carrier; the operator
-#   placed no grade (phase 1 spawn plumbing), billing=paid, pool=devin,
-#   family google:
-#     C   devin-argon          (model gemini-4-argon-high)
-#     C   devin-argon-medium   (model gemini-4-argon-medium)
-#     C   devin-argon-low      (model gemini-4-argon-low)
+#   hk 1620 Argon trial rows (scopefuel PR 152 head f256fac): launch.py
+#   UNGRADED_TRIAL_SNAPSHOT — ungraded phase-1 spawn plumbing; billing=paid,
+#   pool=devin, family google, surfaces T1/T2/T3, no grade placed:
+#     ungraded  devin-argon          (model gemini-4-argon-high)
+#     ungraded  devin-argon-medium   (model gemini-4-argon-medium)
+#     ungraded  devin-argon-low      (model gemini-4-argon-low)
 #   launch.py:84-91 LAUNCH_MODEL_IDS maps each catalog profile to the devin
 #   --model id the gate profile carries; devin encodes effort in the model id
 #   (#635), so devin-swe2-max IS the max rung and takes the @max grade A+.
@@ -86,13 +85,12 @@ EXPECTED = {
     # (5e9177b) list both at B.
     "fusion-claude-opus-5-5-high-sidekick-swe-2-medium": "B",
     "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium": "B",
-    # hk 1620 paid Argon trial spellings — phase 1, ungraded. The catalog
-    # rows (launch.UNGRADED_TRIAL_SNAPSHOT, inert grade C) are gate-able but
-    # never placements: the operator placed no grade, so C is the carrier,
-    # not a measured position.
-    "gemini-4-argon-high": "C",
-    "gemini-4-argon-medium": "C",
-    "gemini-4-argon-low": "C",
+    # hk 1620 paid Argon trial spellings — phase 1, no grade placed. The
+    # non-ladder "ungraded" marker makes resolve_profile answer UNVERIFIED
+    # PROFILE_GRADE_UNKNOWN, never PASS and never FAIL.
+    "gemini-4-argon-high": "ungraded",
+    "gemini-4-argon-medium": "ungraded",
+    "gemini-4-argon-low": "ungraded",
 }
 
 # Policy validity window per gate_policy.json effective_at/expires_at.
@@ -121,6 +119,13 @@ def check(policy: dict) -> None:
         resolved, outcome = common.resolve_profile(
             name, policy, actual_model=spec["model"],
             actual_effort=spec["default_effort"], role=role, root=root)
+        if want == "ungraded":
+            # hk 1620 r2: an Argon row carries no grade — resolve_profile must
+            # answer UNVERIFIED PROFILE_GRADE_UNKNOWN, never PASS or FAIL.
+            assert outcome["status"] == "UNVERIFIED", f"{name}: {outcome}"
+            assert outcome["reason_code"] == "PROFILE_GRADE_UNKNOWN", f"{name}: {outcome}"
+            assert spec["surfaces"] == ["T1", "T2", "T3"], f"{name}: {spec['surfaces']}"
+            continue
         assert outcome["status"] == "PASS", f"{name}: resolve_profile {outcome}"
         assert resolved["grade"] == want, (
             f"{name}: resolved grade {resolved['grade']} != {want}")
@@ -169,6 +174,30 @@ def check_gate(policy: dict, policy_check: dict) -> None:
         got = grade_verdict(policy, policy_check, alias, model, role, assigned)
         assert got == want, f"{alias} on {assigned}: grade check {got} != {want}"
 
+    # hk 1620 r2 (item 4): an Argon tester on an A+ T3 task resolves
+    # UNVERIFIED PROFILE_GRADE_UNKNOWN — never a grade verdict, never a
+    # FAIL. The trial reps are gated by this unverified state, not refused
+    # as TESTER_GRADE_LOW.
+    for alias, model in (
+        ("devin-argon", "gemini-4-argon-high"),
+        ("devin-argon-medium", "gemini-4-argon-medium"),
+        ("devin-argon-low", "gemini-4-argon-low"),
+    ):
+        evidence = {
+            "declared_t": "T3", "required_grade": "A+",
+            "implementation_grade": "A+",
+            "contributors": [{"profile": "devin-swe2", "model": "swe-2", "effort": "",
+                              "role": "worker", "kind": "initial",
+                              "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+            "tester": {"planned_profile": alias, "planned_effort": ""},
+        }
+        checks, _ = eligible.evaluate(evidence, "pre-spawn", policy, policy_check,
+                                      root=root)
+        assert checks["tester"]["status"] == "UNVERIFIED", (alias, checks["tester"])
+        assert checks["tester"]["reason_code"] == "PROFILE_GRADE_UNKNOWN", (alias, checks["tester"])
+        assert checks["grade"]["status"] == "UNVERIFIED", (alias, checks["grade"])
+    print("PASS argon-tester-eligible UNVERIFIED x3 (A+/T3)")
+
 
 def mutate(policy: dict, name: str, grade) -> dict:
     changed = json.loads(json.dumps(policy))
@@ -202,6 +231,11 @@ mutants = {
     # old unmeasured-C placeholder must go RED.
     "fusion-opus-back-to-C": mutate(policy, "devin-fusion-opus55", "C"),
     "fusion-sonnet-back-to-C": mutate(policy, "devin-fusion-sonnet55", "C"),
+    # hk 1620 r2: putting a real grade back on an Argon row (the round-1
+    # BLOCKER shape) makes tester-eligible read it as placed — must go RED.
+    "argon-back-to-C": mutate(policy, "devin-argon", "C"),
+    "argon-medium-graded-B": mutate(policy, "devin-argon-medium", "B"),
+    "argon-low-graded-A": mutate(policy, "devin-argon-low", "A"),
 }
 added = json.loads(json.dumps(policy))
 added["profiles"]["devin-swe3"] = {
