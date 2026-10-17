@@ -12,6 +12,9 @@ pool_for() {
     # hk 1380: the fusion spellings gate at their own catalog rows but stay in
     # scopefuel's single `devin` quota pool.
     devin-fusion-opus55|devin-fusion-sonnet55) echo devin ;;
+    # hk 1620: the Argon trial spellings gate at their own catalog rows but
+    # stay in scopefuel's single `devin` quota pool.
+    devin-argon|devin-argon-medium|devin-argon-low) echo devin ;;
     codex*) echo codex ;;
     kiro*) echo kiro ;;
     oc-gflash|oc-sonnet46|oc-oss) echo agy ;;

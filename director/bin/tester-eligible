@@ -1413,6 +1413,13 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
         if actual_alias and (actual_alias != planned_alias or effort != planned_effort):
             checks["tester"] = result("FAIL", "ACTUAL_PROFILE_CHANGED", "decision:3231")
             tester_profile = None
+        elif checks["tester"]["status"] != "PASS":
+            # hk 1620 r2: a resolution that did not PASS (e.g. an ungraded
+            # Argon trial row -> UNVERIFIED PROFILE_GRADE_UNKNOWN) still
+            # returns a resolved dict whose grade is not on the ladder — it
+            # must not flow into the GRADES.index comparisons below, so the
+            # tester is treated as unresolved downstream.
+            tester_profile = None
     checks["actual_source"] = (result("N/A", "PRE_SPAWN_PLAN", "decision:3231") if stage == "pre-spawn"
                                else _actual_observation(evidence, policy, tester_profile))
 

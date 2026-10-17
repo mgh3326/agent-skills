@@ -295,6 +295,15 @@ B 인 이 철자들에는 해당 없음). 미측정 B 로 T1/T2, hk 1382 의 tes
 `--role builder`는 두 철자를 거부한다(fusion 빌더 사용은 hk 1382 이후 결정).
 Fable·Astra fusion 철자는 없다.
 
+hk 1620(2026-10-18 운영자 결정 devin-argon-trial, phase 1 — operator-desk
+r1018b953go 승인)은 유료 Argon 시험 철자 `devin-argon`·`devin-argon-medium`·
+`devin-argon-low`를 추가한다 — 같은 무인 argv에 모델명만 `gemini-4-argon-high`·
+`gemini-4-argon-medium`·`gemini-4-argon-low`. worker/tester 전용이고 quota pool은
+`devin`(계정 Daily/Weekly — SWE-2 Free 모델스코프 버킷이 아니다)이며 게이트는
+각자의 gate_policy 항목으로 판정한다. family 는 Gemini 계열(google)이다.
+Phase 1은 스폰 배선뿐 — 급 미배치(grade 없음), 10-27 전까지 director-1이
+tester/checker rep 2건을 돌린다. `--role builder`는 세 철자를 거부한다.
+
 `--t`는 **필수**다(ROB-1198 §③). 빠지면 게이트·claim·스폰 어느 것도 하지 않고
 `NEEDS_CLASSIFICATION`으로 거부한다 — 기본값을 만들면 분류하지 않은 값이 arbiter에
 사실로 기록되기 때문이다. `--job`은 생략하면 `-l LABEL`을 쓴다.
