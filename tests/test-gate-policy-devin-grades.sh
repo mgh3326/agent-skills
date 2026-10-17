@@ -32,6 +32,13 @@
 #   billing=paid, pool=devin, unmeasured):
 #     B   devin-fusion-opus55    (model fusion-claude-opus-5-5-high-sidekick-swe-2-medium)
 #     B   devin-fusion-sonnet55  (model fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium)
+#   hk 1620 Argon trial rows (scopefuel PR #1620 head): launch.py
+#   UNGRADED_TRIAL_SNAPSHOT — grade C is the inert carrier; the operator
+#   placed no grade (phase 1 spawn plumbing), billing=paid, pool=devin,
+#   family google:
+#     C   devin-argon          (model gemini-4-argon-high)
+#     C   devin-argon-medium   (model gemini-4-argon-medium)
+#     C   devin-argon-low      (model gemini-4-argon-low)
 #   launch.py:84-91 LAUNCH_MODEL_IDS maps each catalog profile to the devin
 #   --model id the gate profile carries; devin encodes effort in the model id
 #   (#635), so devin-swe2-max IS the max rung and takes the @max grade A+.
@@ -79,6 +86,13 @@ EXPECTED = {
     # (5e9177b) list both at B.
     "fusion-claude-opus-5-5-high-sidekick-swe-2-medium": "B",
     "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium": "B",
+    # hk 1620 paid Argon trial spellings — phase 1, ungraded. The catalog
+    # rows (launch.UNGRADED_TRIAL_SNAPSHOT, inert grade C) are gate-able but
+    # never placements: the operator placed no grade, so C is the carrier,
+    # not a measured position.
+    "gemini-4-argon-high": "C",
+    "gemini-4-argon-medium": "C",
+    "gemini-4-argon-low": "C",
 }
 
 # Policy validity window per gate_policy.json effective_at/expires_at.

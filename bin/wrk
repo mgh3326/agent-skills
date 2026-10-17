@@ -76,6 +76,7 @@ ALL_PROFILES=(
   builder-devin-medium builder-devin-max
   devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
   devin-fusion-opus55 devin-fusion-sonnet55
+  devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
@@ -236,7 +237,10 @@ Options:
                      --effort max (2026-09-29 operator report, experiment E2).
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
-                     builder refuses them pending hk 1382.
+                     builder refuses them pending hk 1382. The devin Argon
+                     trial spellings devin-argon, devin-argon-medium and
+                     devin-argon-low are likewise worker/tester-only (hk 1620
+                     phase 1) — --role builder refuses all three.
                      All codex-terra, codex-terra-max, codex-med and
                      builder-terra-* spellings are refused: gpt-5.6-terra is
                      barred by operator 2026-10-12 noterra; use codex-sol or
@@ -580,6 +584,14 @@ gate_policy.json entries in the Claude family so a fusion tester is
 same-family against a claude builder; the quota pool stays `devin`. Fusion
 builder use is decided after hk 1382 — the --role builder allowlist refuses
 both spellings. No Fable or Astra fusion.
+Devin Argon trial variants (hk 1620, operator decision 2026-10-18 phase 1):
+devin-argon, devin-argon-medium and devin-argon-low run the same unattended
+devin argv on the Gemini 4 Argon model ids — paid ($1/1M in), worker/tester-
+only, gating at their own gate_policy.json entries in the google family so an
+argon tester is same-family against a gemini implementer; the quota pool
+stays `devin` (account Daily/Weekly, never a SWE-2 Free bucket). No builder
+seat exists — the --role builder allowlist refuses all three spellings.
+Phase 1 is spawn plumbing only: no grade placement; trial reps pending.
 E6 measurement builders (#704, #594): builder-opus-low, builder-opus-medium,
 builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max,
 builder-luna-max, builder-kimi-high and builder-kimi-max each pin exactly one effort rung (the
@@ -3467,6 +3479,17 @@ resolve_profile() {
     # decided after hk 1382). No Fable or Astra fusion.
     devin-fusion-opus55) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model fusion-claude-opus-5-5-high-sidekick-swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
     devin-fusion-sonnet55) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
+    # hk 1620 (operator decision 2026-10-18 devin-argon-trial, phase 1, approved
+    # by operator-desk r1018b953go): the Gemini 4 Argon trial spellings —
+    # identical unattended argv, only the --model name differs; the rung is
+    # baked into the model id like every devin spelling. Paid ($1/1M in),
+    # worker/tester-only; there are no builder-* spellings and the --role
+    # builder allowlist refuses all three names. devin-argon is the high rung
+    # (the devin-swe2 -> swe-2 default shape). Phase 1 is spawn plumbing only:
+    # no grade placement, trial reps pending (2 tester/checker reps by 10-27).
+    devin-argon) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model gemini-4-argon-high --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-argon-medium) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model gemini-4-argon-medium --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-argon-low) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model gemini-4-argon-low --permission-mode dangerous --respect-workspace-trust false) ;;
 
     # cc-qwen38/cc-glm/cc-dsflash/cc-dspro/cc-glm53: Claude Code CLI harness,
     # model traffic redirected via env to CLIProxyAPI(127.0.0.1:8317) -> ClinePass.
@@ -3682,6 +3705,13 @@ resolve_profile() {
     # The quota pool is still scopefuel's single `devin` pool — wrk owns no
     # pool mapping, the gate answer names the pool.
     devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;
+    # hk 1620: the Argon trial spellings gate at their OWN gate_policy.json
+    # entries, never at devin-swe2 (hk 1604 rule — each devin spelling gates
+    # as itself). Their family is google (Gemini), and folding them into a
+    # SWE-2 spelling would route a paid spelling onto a Free model-scope
+    # bucket. The quota pool is still scopefuel's single `devin` pool — wrk
+    # owns no pool mapping, the gate answer names the pool.
+    devin-argon|devin-argon-medium|devin-argon-low) GATE_PROFILE="$MODEL" ;;
     # #1026: the gpt-6-sol rollback spellings gate like the spellings they roll
     # back — codex-sol6 like codex-sol, builder-sol6 like builder-sol (the flat
     # codex-max spelling, not an E6 rung).
@@ -8927,8 +8957,10 @@ spawn_cmd() {
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
       devin-fusion-opus55|devin-fusion-sonnet55)
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
+      devin-argon|devin-argon-medium|devin-argon-low)
+        die "--role builder rejects '$MODEL': the devin Argon trial spellings are worker/tester-only — phase 1 is spawn plumbing, no builder seat (hk 1620, operator decision 2026-10-18)" ;;
       builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
