@@ -60,6 +60,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+from unittest import mock
 
 root = Path(sys.argv[1])
 sys.path.insert(0, str(root / "director"))
@@ -196,7 +197,77 @@ def check_gate(policy: dict, policy_check: dict) -> None:
         assert checks["tester"]["status"] == "UNVERIFIED", (alias, checks["tester"])
         assert checks["tester"]["reason_code"] == "PROFILE_GRADE_UNKNOWN", (alias, checks["tester"])
         assert checks["grade"]["status"] == "UNVERIFIED", (alias, checks["grade"])
+        assert checks["grade"]["reason_code"] == "PROFILE_GRADE_UNKNOWN", (alias, checks["grade"])
     print("PASS argon-tester-eligible UNVERIFIED x3 (A+/T3)")
+
+    # hk 1620 r2 addendum: an Argon WORKER as contributor (sonnet tester)
+    # must also end UNVERIFIED PROFILE_GRADE_UNKNOWN — no traceback, never a
+    # verdict computed on the off-ladder marker.
+    evidence = {
+        "declared_t": "T2", "required_grade": "A+",
+        "implementation_grade": "A+",
+        "contributors": [{"profile": "devin-argon", "model": "gemini-4-argon-high",
+                          "effort": "", "role": "worker", "kind": "initial",
+                          "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+        "tester": {"planned_profile": "sonnet", "planned_effort": "high"},
+    }
+    checks, _ = eligible.evaluate(evidence, "pre-spawn", policy, policy_check,
+                                  root=root)
+    assert checks["contributors"]["status"] == "UNVERIFIED", checks["contributors"]
+    assert checks["grade"]["status"] == "UNVERIFIED", checks["grade"]
+    assert checks["grade"]["reason_code"] == "PROFILE_GRADE_UNKNOWN", checks["grade"]
+    print("PASS argon-contributor UNVERIFIED (sonnet tester)")
+
+    # hk 1620 r2 addendum: the same-family branch must not PASS on an
+    # ungraded profile. No graded google-family profile exists in the
+    # policy, so pin devin-swe2 into the google family (resolve_profile
+    # cross-checks bin/wrk clauses, so the family pin needs a patched
+    # model_family to stay consistent) and pair it with an Argon tester.
+    samefam = json.loads(json.dumps(policy))
+    samefam["profiles"]["devin-swe2"]["family"] = "google"
+    real_family = common.model_family
+    with mock.patch.object(
+            common, "model_family",
+            lambda model: "google" if model == "swe-2" else real_family(model)):
+        evidence = {
+            "declared_t": "T2", "required_grade": "A",
+            "implementation_grade": "A",
+            "contributors": [{"profile": "devin-swe2", "model": "swe-2", "effort": "",
+                              "role": "worker", "kind": "initial",
+                              "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+            "tester": {"planned_profile": "devin-argon", "planned_effort": "",
+                       "session": "other-session", "worktree": "/tmp/other-wt"},
+        }
+        checks, _ = eligible.evaluate(evidence, "pre-spawn", samefam, policy_check,
+                                      root=root)
+    assert checks["contributors"]["status"] == "PASS", checks["contributors"]
+    assert checks["independence"]["status"] == "UNVERIFIED", checks["independence"]
+    assert checks["independence"]["reason_code"] == "PROFILE_GRADE_UNKNOWN", checks["independence"]
+    print("PASS argon-same-family not PASS (UNVERIFIED PROFILE_GRADE_UNKNOWN)")
+
+    # hk 1620 r2 addendum (guard-drop mutant): with the off-ladder guard
+    # forced off, the ungraded marker reaches GRADES.index and dies as
+    # ValueError — RED; restored, the same evidence is UNVERIFIED — GREEN.
+    argon_t3 = {
+        "declared_t": "T3", "required_grade": "A+",
+        "implementation_grade": "A+",
+        "contributors": [{"profile": "devin-swe2", "model": "swe-2", "effort": "",
+                          "role": "worker", "kind": "initial",
+                          "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+        "tester": {"planned_profile": "devin-argon", "planned_effort": ""},
+    }
+    try:
+        with mock.patch.object(eligible, "_off_ladder", return_value=False):
+            eligible.evaluate(argon_t3, "pre-spawn", policy, policy_check, root=root)
+    except ValueError:
+        print("RED guard-drop-mutant (GRADES.index ValueError on ungraded tester)")
+    else:
+        raise SystemExit("guard-drop mutant did not raise ValueError")
+    checks, _ = eligible.evaluate(argon_t3, "pre-spawn", policy, policy_check,
+                                  root=root)
+    assert checks["grade"]["status"] == "UNVERIFIED", checks["grade"]
+    assert checks["grade"]["reason_code"] == "PROFILE_GRADE_UNKNOWN", checks["grade"]
+    print("GREEN guard restored (UNVERIFIED PROFILE_GRADE_UNKNOWN)")
 
 
 def mutate(policy: dict, name: str, grade) -> dict:
