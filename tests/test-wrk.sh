@@ -5783,7 +5783,7 @@ arb() { "$ARBITER" "$@"; }
 "$WRK" --help >/dev/null
 spawn_help_out="$("$WRK" spawn --help)"
 grep -q -- '--landing-strict' <<<"$spawn_help_out"
-grep -q -- '--role worker|builder (legacy alias: captain)' <<<"$spawn_help_out"
+grep -q -- '--role worker|builder|tester|reviewer|counsel (legacy alias: captain)' <<<"$spawn_help_out"
 grep -q -- 'builder-opus' <<<"$spawn_help_out"
 grep -q -- 'builder-sonnet' <<<"$spawn_help_out" ||
   fail "spawn --help must document builder-sonnet (#921)"
@@ -9783,12 +9783,12 @@ role_must_fail() {
 import sys
 assert int(sys.argv[1]) == 2, "unknown --role %r must be a usage error, rc=%s output=%s" % (sys.argv[2], sys.argv[1], sys.argv[3])
 PY
-  grep -Fqx -- 'wrk: --role accepts only worker or builder (legacy alias: captain)' <<<"$output" ||
+  grep -Fqx -- 'wrk: --role accepts worker, builder, tester, reviewer or counsel (legacy alias: captain)' <<<"$output" ||
     fail "unknown --role '$rejected_role' must hit role validation: $output"
   [[ ! -e "$ARBITER_INBOX_ROOT/$job/events/00001-job.claim.json" ]] || fail "unknown role must not claim $job"
 }
 role_must_fail admiral role-unknown-admiral
-role_must_fail tester role-unknown-tester
+role_must_fail observer role-unknown-observer
 
 role_must_require_value() {
   local job="$1" output rc

@@ -169,6 +169,14 @@ printf '%s|%s|%s' "$ROLE" "$HUB_LANE" "$HUB_LANE_MACHINE"
                 expected = f"{role}|fixture-tester|fixture-machine" if role != "unrecognized" else role + "||"
                 self.assertEqual(process.stdout, expected)
 
+    def test_help_and_unknown_role_match_expanded_role_contract(self):
+        process = subprocess.run(["bash", "-c", 'source "$1"; spawn_help', "fixture", str(self.lib)],
+                                 env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("--role worker|builder|tester|reviewer|counsel (legacy alias: captain)", process.stdout)
+        self.assertIn("--role accepts worker, builder, tester, reviewer or counsel (legacy alias: captain)",
+                      self.assert_denied(role="observer"))
+
 
 if __name__ == "__main__":
     unittest.main()
