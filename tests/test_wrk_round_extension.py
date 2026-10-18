@@ -229,6 +229,17 @@ arbiter_admit() { exit 91; }
         self.assertEqual(process.returncode, 91, process.stderr)
         self.assertTrue(any(REF in c for c in calls))
 
+    def test_shared_scopefuel_fixture_accepts_role_contract(self):
+        fixture = str(ROOT / "tests/fixtures/scopefuel")
+        policy = [fixture, "policy", "launch", "codex-astra", "--json",
+                  "--role", "worker", "--purpose", "architect"]
+        gate = [fixture, "gate", "-m", "codex-astra", "--role", "worker", "--purpose", "architect"]
+        for args, mode, expected in ((policy, "ok", 0), (gate, "ok", 0), (policy, "refused", 3)):
+            with self.subTest(args=args, mode=mode):
+                process = subprocess.run(args, env={**self.env, "WRK_LAUNCH_MODE": mode},
+                                         capture_output=True, text=True, timeout=60)
+                self.assertEqual(process.returncode, expected, process.stderr)
+
     def test_child_roles_keep_worker_lane_topology_and_global_role(self):
         for role in ("tester", "reviewer", "counsel", "unrecognized"):
             with self.subTest(role=role):

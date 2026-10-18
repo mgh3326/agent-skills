@@ -101,6 +101,7 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
       --json) shift ;;
       --operator-request) launch_operator=1; shift ;;
       --purpose) launch_purpose="${2:-}"; shift 2 ;;
+      --role) shift 2 ;; # New seat argument; grant semantics are tested against real scopefuel.
       --effort) launch_effort="${2:-}"; shift 2 ;;
       *) echo "fixture scopefuel: unexpected policy launch argument '$1'" >&2; exit 2 ;;
     esac
@@ -246,7 +247,7 @@ shift
 profile="" operator_request="" requested_by="" requested_by_seen=0 purpose="" effort=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    -m|--operator-request|--requested-by|--purpose|--effort)
+    -m|--operator-request|--requested-by|--purpose|--effort|--role)
       [[ $# -ge 2 ]] || { echo 'fixture scopefuel: unexpected arguments' >&2; exit 2; }
       case "$1" in
         -m) profile="$2" ;;
