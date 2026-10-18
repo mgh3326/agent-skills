@@ -1332,6 +1332,15 @@ def _split_check(evidence: dict) -> tuple[dict | None, dict]:
                         boundary_sha256=info["boundary_sha256"], paths_checked=len(analyzed))
 
 
+def _off_ladder(profile: dict | None) -> bool:
+    # hk 1620 r2 (b953 addendum): resolve_profile returns the resolved dict
+    # even when the grade is off-ladder (UNVERIFIED PROFILE_GRADE_UNKNOWN —
+    # the Argon trial rows carry the "ungraded" marker). Every GRADES.index
+    # call in evaluate assumes an on-ladder grade, so an off-ladder tester
+    # or contributor must be stopped before it reaches one.
+    return profile is not None and profile["grade"] not in GRADES
+
+
 def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
              *, root: Path | None = None) -> tuple[dict, dict]:
     checks: dict[str, dict] = {"policy": policy_check}
@@ -1373,6 +1382,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
 
     root = root or Path(__file__).resolve().parents[2]
     contributor_profiles = []
+    contributor_resolved = []
     contributors = evidence.get("contributors")
     if not isinstance(contributors, list) or not contributors:
         checks["contributors"] = result("UNVERIFIED", "CONTRIBUTORS_MISSING", "spawn-worker:2-4")
@@ -1385,6 +1395,8 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
                 continue
             resolved, check = resolve_profile(item.get("profile", ""), policy, actual_model=item.get("model"),
                                               actual_effort=item.get("effort"), role=item.get("role", "builder"), root=root)
+            if resolved is not None:
+                contributor_resolved.append(resolved)
             if check["status"] != "PASS":
                 failures.append(check["reason_code"])
             else:
@@ -1425,7 +1437,12 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
 
     required = evidence.get("required_grade")
     assigned = evidence.get("implementation_grade")
-    if required not in GRADES or assigned not in GRADES:
+    if _off_ladder(tester_profile) or any(_off_ladder(p) for p in contributor_resolved):
+        # hk 1620 r2 (b953 addendum): an off-ladder grade marker must never
+        # reach the GRADES.index comparisons below — UNVERIFIED
+        # PROFILE_GRADE_UNKNOWN, never PASS and never FAIL, no exception.
+        checks["grade"] = result("UNVERIFIED", "PROFILE_GRADE_UNKNOWN", "policy:profiles")
+    elif required not in GRADES or assigned not in GRADES:
         checks["grade"] = result("UNVERIFIED", "GRADE_INPUT_MISSING", "spawn-worker:2-2")
     elif tester_profile is None or checks["contributors"]["status"] != "PASS":
         checks["grade"] = result("UNVERIFIED", "GRADE_UNRESOLVED", "spawn-worker:2-4")
@@ -1445,6 +1462,11 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
         checks["independence"] = result("FAIL", "DS41_T3_SOLE_TESTER", "spawn-worker:2-4+task:726")
     elif tester_profile["family"] not in families:
         checks["independence"] = result("PASS", "CROSS_FAMILY", "spawn-worker:2-4", families=sorted(families))
+    elif _off_ladder(tester_profile):
+        # hk 1620 r2 (b953 addendum): the same-family branch compares the
+        # effort+grade marker and indexes tester_profile["grade"] — an
+        # ungraded tester must never PASS it (or crash it).
+        checks["independence"] = result("UNVERIFIED", "PROFILE_GRADE_UNKNOWN", "policy:profiles")
     elif declared == "T3" or (surface and surface["floor"] == "T3"):
         checks["independence"] = result("FAIL", "SAME_FAMILY_T3", "spawn-worker:2-4")
     else:

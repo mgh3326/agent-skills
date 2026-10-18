@@ -201,6 +201,9 @@ expected_gate() {
     devin-ds41-max|builder-ds41-max) printf '%s\n' devin-ds41-max ;;
     devin-fusion-opus55) printf '%s\n' devin-fusion-opus55 ;;
     devin-fusion-sonnet55) printf '%s\n' devin-fusion-sonnet55 ;;
+    devin-argon) printf '%s\n' devin-argon ;;
+    devin-argon-medium) printf '%s\n' devin-argon-medium ;;
+    devin-argon-low) printf '%s\n' devin-argon-low ;;
     *) return 1 ;;
   esac
 }
@@ -212,7 +215,8 @@ for spelling in \
   devin-ds41 devin-ds41-max \
   builder-devin-medium builder-devin-max \
   builder-ds41 builder-ds41-max \
-  devin-fusion-opus55 devin-fusion-sonnet55
+  devin-fusion-opus55 devin-fusion-sonnet55 \
+  devin-argon devin-argon-medium devin-argon-low
 do
   measure_gate "$WRK" "$spelling"
   want=$(expected_gate "$spelling") || fail "no expected gate for $spelling"
@@ -421,7 +425,8 @@ EOF
   for name in grok kimi kiro-cli claude codex; do
     ln -s fast-fail "$bindir/$name"
   done
-  for name in devin-swe2-medium devin-swe2-max devin-swe17 devin-glm52 devin-ds41 devin-ds41-max; do
+  for name in devin-swe2-medium devin-swe2-max devin-swe17 devin-glm52 devin-ds41 devin-ds41-max \
+    devin-argon devin-argon-medium devin-argon-low; do
     out="$TMP/smoke-$name.out"
     err="$TMP/smoke-$name.err"
     set +e
