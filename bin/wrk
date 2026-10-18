@@ -6594,7 +6594,10 @@ PY
 # here warns exactly once.
 hub_lane_register() {
   HUB_LANE="" HUB_LANE_MACHINE=""
-  case "$ROLE" in worker|builder|tester|reviewer|counsel) ;; *) return 0 ;; esac
+  # Child seats use the worker lane/credential topology inside this helper.
+  local ROLE="$ROLE"
+  case "$ROLE" in tester|reviewer|counsel) ROLE=worker ;; esac
+  [[ "$ROLE" == worker || "$ROLE" == builder ]] || return 0
   # #1397/(a): a delegated remote spawn defers its lane row to the ssh
   # initiator — only that host holds the operator credential (per-host
   # machine-scoped tokens are the step-4 follow-up). --lane-defer carries the

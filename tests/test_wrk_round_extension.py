@@ -157,6 +157,18 @@ arbiter_admit() { exit 91; }
         self.assertEqual(process.returncode, 91, process.stderr)
         self.assertTrue(any(REF in c for c in calls))
 
+    def test_child_roles_keep_worker_lane_topology_and_global_role(self):
+        for role in ("tester", "reviewer", "counsel", "unrecognized"):
+            with self.subTest(role=role):
+                process = subprocess.run(["bash", "-c", '''source "$1"
+ROLE="$2" LABEL=fixture-tester LANE_DEFER=fixture-machine
+hub_lane_register
+printf '%s|%s|%s' "$ROLE" "$HUB_LANE" "$HUB_LANE_MACHINE"
+''', "fixture", str(self.lib), role], env=self.env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                expected = f"{role}|fixture-tester|fixture-machine" if role != "unrecognized" else role + "||"
+                self.assertEqual(process.stdout, expected)
+
 
 if __name__ == "__main__":
     unittest.main()
