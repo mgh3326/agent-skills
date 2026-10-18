@@ -184,6 +184,16 @@ printf '%s|%s|%s' "$ROLE" "$HUB_LANE" "$HUB_LANE_MACHINE"
         self.assertIn("--role accepts worker, builder, tester, reviewer or counsel (legacy alias: captain)",
                       self.assert_denied(role="observer"))
 
+    def test_unrelated_spawn_does_not_add_a_python_prerequisite(self):
+        process = subprocess.run(["bash", "-c", '''source "$1"
+PURPOSE="" ROUND_EXT_REF=""
+python3() { return 42; }
+round_ext_validate
+printf 'unrelated-pass'
+''', "fixture", str(self.lib)], env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(process.stdout, "unrelated-pass")
+
 
 if __name__ == "__main__":
     unittest.main()

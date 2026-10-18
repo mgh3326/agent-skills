@@ -8721,6 +8721,7 @@ hk_cmd() {
 # hk 1632: fail closed before catalog/gate calls. Exact parent-job ownership
 # is deliberately narrower than accepting any label attached to the same task.
 round_ext_validate() {
+  [[ -n "$PURPOSE" || -n "$ROUND_EXT_REF" ]] || return 0
   local normalized
   # Match scopefuel's Unicode strip/casefold before deciding whether the
   # paired flags are required; ASCII-only normalization leaves another path.
