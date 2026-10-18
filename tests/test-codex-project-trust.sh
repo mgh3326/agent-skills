@@ -325,16 +325,12 @@ echo 'PASS CODEX_HOME-override-and-default-paths'
 NO_TOML="$TMP/no-toml"
 mkdir -p "$NO_TOML"
 cat >"$NO_TOML/sitecustomize.py" <<'PY'
-import builtins
+import sys
 
-real_import = builtins.__import__
-
-def reject_toml_parser(name, *args, **kwargs):
-    if name in ("tomllib", "tomli"):
-        raise ImportError("blocked by header-only fixture")
-    return real_import(name, *args, **kwargs)
-
-builtins.__import__ = reject_toml_parser
+# Block both import spellings, including importlib.import_module, so this
+# fixture exercises the header-only fallback on every supported Python.
+sys.modules["tomllib"] = None
+sys.modules["tomli"] = None
 PY
 HEADER_HOME="$TMP/codex-header-only"
 mkdir -p "$HEADER_HOME"

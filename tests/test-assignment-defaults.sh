@@ -38,6 +38,23 @@ def flat(text: str) -> str:
     return re.sub(r"\s+", " ", text)
 
 
+KIMI_IMPORT_GUARD_ERROR = (
+    "wrk: the kimi resolver must import tomllib inside kimi_clone_resolved_effort"
+)
+
+
+def kimi_resolver_body(text: str) -> str:
+    match = re.search(
+        r"(?ms)^kimi_clone_resolved_effort\(\) \{\n(?P<body>.*?)^\}", text
+    )
+    return match.group("body") if match else ""
+
+
+def has_kimi_tomllib_import(text: str) -> bool:
+    body = kimi_resolver_body(text)
+    return bool(body and re.search(r"(?m)^[ \t]*import[ \t]+tomllib\b", body))
+
+
 def block(text: str, name: str) -> str:
     assert text.count(START) == 1 and text.count(END) == 1, (
         f"{name}: exactly one T736-ASSIGNMENT-DEFAULTS block required "
@@ -267,9 +284,7 @@ def check(d: dict) -> None:
     # headers are equivalent spellings an awk scan cannot fully cover — plus
     # the documented env overlay, Thinking disabled→off_effort, and the
     # [models."<id>".overrides] table.
-    assert re.search(r"import tomllib\b", wrk), (
-        "wrk: the kimi resolver must parse real TOML via tomllib/tomli"
-    )
+    assert has_kimi_tomllib_import(d["wrk"]), KIMI_IMPORT_GUARD_ERROR
     assert re.search(
         r"resolved not in support\)\): resolved = default",
         wrk,
@@ -349,6 +364,35 @@ def mutate(name: str, old: str, new: str) -> dict:
     assert doc[name].count(old) >= 1, f"fixture: {old!r} not in {name}"
     doc[name] = doc[name].replace(old, new, 1)
     return doc
+
+
+def disable_kimi_parser_imports(doc: dict) -> dict:
+    mutant = dict(doc)
+    text = mutant["wrk"]
+    match = re.search(
+        r"(?ms)^kimi_clone_resolved_effort\(\) \{\n(?P<body>.*?)^\}", text
+    )
+    assert match, "fixture: kimi_clone_resolved_effort function missing"
+    body = match.group("body")
+    for old in ("    import tomllib\n", "    import tomli as tomllib\n"):
+        assert body.count(old) == 1, f"fixture: expected one Kimi import {old!r}"
+        body = body.replace(old, "    parser = None\n", 1)
+    mutant["wrk"] = text[: match.start("body")] + body + text[match.end("body") :]
+    return mutant
+
+
+def add_import_in_function(doc: dict, function: str, anchor: str, line: str) -> dict:
+    mutant = dict(doc)
+    text = mutant["wrk"]
+    match = re.search(
+        rf"(?ms)^{re.escape(function)}\(\) \{{\n(?P<body>.*?)^\}}", text
+    )
+    assert match, f"fixture: {function} function missing"
+    body = match.group("body")
+    assert body.count(anchor) == 1, f"fixture: {anchor!r} is not unique in {function}"
+    body = body.replace(anchor, anchor + line + "\n", 1)
+    mutant["wrk"] = text[: match.start("body")] + body + text[match.end("body") :]
+    return mutant
 
 
 mutants = {}
@@ -589,6 +633,36 @@ mutants["wrk-seat-rule-no-real-toml"] = mutate(
     "    import tomllib",
     "    import os as tomllib",
 )
+# The guard is about the parser import inside the Kimi resolver. Keep the
+# original no-real-TOML mutant red, then prove unrelated placements cannot
+# satisfy it after every real Kimi parser import is removed.
+kimi_without_parsers = disable_kimi_parser_imports(docs)
+mutants["wrk-kimi-parser-no-parser"] = kimi_without_parsers
+mutants["wrk-kimi-parser-codex-p1"] = add_import_in_function(
+    kimi_without_parsers,
+    "codex_seed_project_trust",
+    "    import importlib\n",
+    "    import tomllib as _placement_probe",
+)
+mutants["wrk-kimi-parser-codex-p2"] = add_import_in_function(
+    kimi_without_parsers,
+    "codex_seed_project_trust",
+    "    import importlib\n",
+    "    import tomllib as parser",
+)
+mutants["wrk-kimi-parser-claude-placement"] = add_import_in_function(
+    kimi_without_parsers,
+    "claude_seed_folder_trust",
+    "import json\n",
+    "import tomli as tomllib",
+)
+KIMI_IMPORT_GUARD_MUTANTS = {
+    "wrk-seat-rule-no-real-toml",
+    "wrk-kimi-parser-no-parser",
+    "wrk-kimi-parser-codex-p1",
+    "wrk-kimi-parser-codex-p2",
+    "wrk-kimi-parser-claude-placement",
+}
 mutants["wrk-seat-rule-py-no-model-default"] = mutate(
     "wrk",
     "    resolved = default",
@@ -692,7 +766,13 @@ for name, doc in mutants.items():
     try:
         check(doc)
     except AssertionError as exc:
-        print(f"RED {name}")
+        if name in KIMI_IMPORT_GUARD_MUTANTS:
+            assert str(exc) == KIMI_IMPORT_GUARD_ERROR, (
+                f"{name} went RED for the wrong reason: {exc}"
+            )
+            print(f"RED {name} (Kimi parser guard)")
+        else:
+            print(f"RED {name}")
         continue
     raise SystemExit(f"mutant {name} did not go RED")
 print(f"PASS mutants assertion-red={len(mutants)}/{len(mutants)}")
