@@ -40,8 +40,10 @@ if mode == "down": raise SystemExit(1)
 if sys.argv[1:3] == ["doc", "get"]:
     if mode == "missing": print("not_found"); raise SystemExit(1)
     if mode == "garbage": print("{}"); raise SystemExit(0)
-    print(json.dumps({"key": sys.argv[3], "body": "round extension record",
-        "created_by": os.environ.get("DOC_ISSUER", "director-1")}))
+    doc = {"key": sys.argv[3], "body": "round extension record"}
+    if os.environ.get("DOC_ISSUER") != "missing-field":
+        doc["created_by"] = os.environ.get("DOC_ISSUER", "director-1")
+    print(json.dumps(doc))
 elif sys.argv[1:3] == ["tasks", "show"]:
     if "TASK_REPLY" in os.environ: print(os.environ["TASK_REPLY"]); raise SystemExit(0)
     print(json.dumps({"state": "in_progress", "claimed_by": "fixture-builder",
@@ -168,7 +170,7 @@ arbiter_admit() { exit 91; }
         self.assertEqual(process.returncode, 91, process.stderr)
 
     def test_document_server_issuer_is_required(self):
-        for issuer in ("mac-dev", "builder-sol", "", "pa-integrator"):
+        for issuer in ("mac-dev", "builder-sol", "", "pa-integrator", "missing-field"):
             with self.subTest(issuer=issuer):
                 self.assertIn("issuer denied", self.assert_denied(environment={"DOC_ISSUER": issuer}))
         for issuer in ("director-1", "operator", "operator-desk"):

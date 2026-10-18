@@ -8777,7 +8777,7 @@ try:
     if (not isinstance(doc, dict) or doc.get("key", sys.argv[1]) != sys.argv[1]
         or not isinstance(doc.get("body"), str) or not doc["body"].strip() or doc.get("error")):
         raise ValueError("not a document")
-    issuer = doc.get("created_by")
+    issuer = doc["created_by"]
     allowed = set(sys.argv[2].split())
     if issuer not in allowed:
         events = Path(sys.argv[4])
@@ -8790,7 +8790,7 @@ try:
         if issuer not in set(sys.argv[3].split()) or issuer != parent:
             raise ValueError("created_by is not an authorized issuer for this parent job")
     print(issuer)
-except (OSError, ValueError, TypeError, AttributeError) as error:
+except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
     print("--round-ext: document/issuer verification failed: " + str(error), file=sys.stderr)
     raise SystemExit(1)
 ' "${ROUND_EXT_REF#hk:doc/}" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" \
