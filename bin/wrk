@@ -1725,6 +1725,224 @@ sys.stderr.write("wrk: Claude folder trust recorded for %s in %s\n" % (target, p
 PY
 }
 
+# Codex CLI 0.162 blocks at startup for an untrusted project cwd. Project trust
+# is a TOML table in the user's config, so wrk appends one entry before the
+# pane starts. Accept only a physical root of a linked Git worktree: the
+# --show-toplevel equality is wrk's worktree-root rule, and the distinct
+# --git-dir/common-dir pair excludes the operator's canonical checkout.
+# This is fail-open: malformed config, unsafe paths and every I/O failure warn
+# once and never stop the spawn. Writers hold a persistent sidecar flock,
+# validate the complete append, then atomically replace the file.
+codex_seed_project_trust() {
+  local cwd="$1" abs_cwd output
+  if ! abs_cwd="$(cd -- "$cwd" 2>/dev/null && pwd -P)"; then
+    warn "Codex project trust skipped: cannot resolve absolute CWD: $cwd"
+    return 0
+  fi
+  if ! output="$(python3 - "$abs_cwd" 2>&1 <<'PY'
+import fcntl
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+cwd = sys.argv[1]
+
+
+def log(status, reason, mode="not-run"):
+    detail = " (%s)" % reason if reason else ""
+    sys.stderr.write("wrk: Codex project trust %s%s [validation=%s]\n" % (status, detail, mode))
+
+
+def skip(reason, mode="not-run"):
+    log("skipped", reason, mode)
+    raise SystemExit(0)
+
+
+if not os.path.isabs(cwd) or not os.path.isdir(cwd):
+    skip("spawn cwd is not an absolute directory")
+if not re.fullmatch(r"[A-Za-z0-9._/-]+", cwd):
+    skip("spawn cwd contains unsupported characters")
+if cwd == "/":
+    skip("refusing filesystem root")
+
+home = os.environ.get("HOME")
+if not home or not os.path.isabs(home):
+    skip("cannot resolve HOME")
+home = os.path.realpath(home)
+try:
+    if os.path.commonpath((cwd, home)) == cwd:
+        skip("refusing HOME or its parent")
+except ValueError:
+    skip("cannot compare spawn cwd with HOME")
+
+
+def git_value(*args):
+    try:
+        result = subprocess.run(
+            ["git", "-C", cwd, "rev-parse", *args],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return os.path.realpath(value) if value else None
+
+
+worktree_root = git_value("--show-toplevel")
+git_dir = git_value("--path-format=absolute", "--git-dir")
+common_dir = git_value("--path-format=absolute", "--git-common-dir")
+if worktree_root != cwd or not git_dir or not common_dir or git_dir == common_dir:
+    skip("spawn cwd is not a linked worktree root")
+
+config_home = os.environ.get("CODEX_HOME") or os.path.join(home, ".codex")
+if not os.path.isabs(config_home):
+    skip("CODEX_HOME is not absolute")
+config_path = os.path.join(os.path.abspath(config_home), "config.toml")
+parent = os.path.dirname(config_path)
+
+parser = None
+parser_name = "header-only"
+try:
+    import tomllib as parser
+    parser_name = "tomllib"
+except ImportError:
+    try:
+        import tomli as parser
+        parser_name = "tomli"
+    except ImportError:
+        pass
+
+
+def parse_toml(raw, path, mode):
+    try:
+        return parser.loads(raw.decode("utf-8"))
+    except Exception:
+        skip("config does not parse" if path == config_path else "appended config does not parse", mode)
+
+
+try:
+    os.makedirs(parent, mode=0o700, exist_ok=True)
+except OSError:
+    skip("cannot create config directory", parser_name)
+
+lock_path = config_path + ".wrk.lock"
+try:
+    lock_fd = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+except OSError:
+    skip("cannot open lock file", parser_name)
+
+with os.fdopen(lock_fd, "a+b") as lock_handle:
+    try:
+        lock_timeout = float(os.environ.get("WRK_TEST_CODEX_TRUST_LOCK_TIMEOUT_S") or 10.0)
+    except ValueError:
+        skip("invalid lock timeout", parser_name)
+    deadline = time.monotonic() + lock_timeout
+    while True:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                skip("timed out waiting for lock", parser_name)
+            time.sleep(0.05)
+    try:
+        raw = None
+        try:
+            with open(config_path, "rb") as handle:
+                raw = handle.read()
+        except FileNotFoundError:
+            pass
+        except OSError:
+            skip("cannot read config", parser_name)
+
+        if raw is None:
+            mode = 0o600
+        else:
+            try:
+                mode = stat.S_IMODE(os.stat(config_path).st_mode)
+            except OSError:
+                skip("cannot stat config", parser_name)
+
+        header = ('[projects."%s"]' % cwd).encode("ascii")
+        if parser is None:
+            if raw is not None and header in raw.splitlines():
+                log("exists", "", parser_name)
+                raise SystemExit(0)
+        elif raw is not None:
+            existing = parse_toml(raw, config_path, parser_name)
+            projects = existing.get("projects") if isinstance(existing, dict) else None
+            if isinstance(projects, dict) and cwd in projects:
+                log("exists", "", parser_name)
+                raise SystemExit(0)
+
+        block = ('[projects."%s"]\ntrust_level = "trusted"\n' % cwd).encode("ascii")
+        if raw is None or not raw:
+            new_raw = (raw or b"") + block
+        elif raw.endswith(b"\n"):
+            new_raw = raw + b"\n" + block
+        else:
+            new_raw = raw + b"\n\n" + block
+
+        if parser is None:
+            if header not in new_raw.splitlines():
+                skip("appended header validation failed", parser_name)
+        else:
+            updated = parse_toml(new_raw, config_path + ".new", parser_name)
+            projects = updated.get("projects") if isinstance(updated, dict) else None
+            project = projects.get(cwd) if isinstance(projects, dict) else None
+            if not isinstance(project, dict) or project.get("trust_level") != "trusted":
+                skip("appended trust validation failed", parser_name)
+
+        try:
+            test_delay = float(os.environ.get("WRK_TEST_CODEX_TRUST_DELAY_S") or 0)
+        except ValueError:
+            skip("invalid test delay", parser_name)
+        if test_delay > 0:
+            time.sleep(test_delay)
+
+        tmp_path = None
+        try:
+            tmp_fd, tmp_path = tempfile.mkstemp(dir=parent, prefix=".config.toml.", suffix=".tmp")
+            with os.fdopen(tmp_fd, "wb") as handle:
+                handle.write(new_raw)
+                os.fchmod(handle.fileno(), mode)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, config_path)
+            tmp_path = None
+        except OSError:
+            skip("atomic config write failed", parser_name)
+        finally:
+            if tmp_path is not None:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+    finally:
+        try:
+            fcntl.flock(lock_handle, fcntl.LOCK_UN)
+        except OSError:
+            pass
+
+log("seeded", "", parser_name)
+PY
+)"; then
+    warn "Codex project trust skipped: helper failed"
+    return 0
+  fi
+  [[ -z "$output" ]] || printf '%s\n' "$output" >&2
+}
+
 # Pre-spawn advisory: if -c points at a *canonical* checkout (not a linked worktree)
 # that is off its remote default branch, warn. Does not fail the spawn — operators
 # sometimes work on canonical on purpose. Worktrees and non-git paths stay silent.
@@ -9091,6 +9309,13 @@ spawn_cmd() {
   # actually runs on.
   if [[ "$PROFILE_KIND" == claude ]]; then
     claude_seed_folder_trust "$CWD"
+  fi
+
+  # Codex uses $CODEX_HOME/config.toml when set (otherwise $HOME/.codex).
+  # Remote spawns re-enter spawn_cmd on the execution host, so this writes the
+  # config Codex will read on that host rather than the initiating machine.
+  if [[ "$PROFILE_KIND" == codex ]]; then
+    codex_seed_project_trust "$CWD"
   fi
 
   # #637: persist what the pane would otherwise lose on a herdr reboot restore
