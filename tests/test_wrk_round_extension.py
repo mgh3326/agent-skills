@@ -147,6 +147,8 @@ arbiter_admit() { exit 91; }
             {"state": "x\ty\tb1632-sol", "claimed_by": "", "refs": {}},
             {**valid, "state": "claimed\n"},
             {**valid, "claimed_by": "x\x7f"},
+            {**valid, "claimed_by": "x\u200b"},
+            {**valid, "refs": {"job_id": "b1632-sol", "note": "x\u2028"}},
             {**valid, "refs": {"job_id": "b1632-sol", "other": {"value": "x\t"}}},
             {"state": "claimed", "refs": valid["refs"]},
             {"claimed_by": "", "refs": valid["refs"]},

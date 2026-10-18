@@ -9007,7 +9007,7 @@ def invalid_constant(value):
 
 def controls(value):
     if isinstance(value, str):
-        return any(unicodedata.category(char) == "Cc" for char in value)
+        return any(unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} for char in value)
     if isinstance(value, dict):
         return any(controls(key) or controls(item) for key, item in value.items())
     if isinstance(value, list):
