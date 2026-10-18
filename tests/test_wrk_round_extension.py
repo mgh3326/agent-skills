@@ -116,6 +116,13 @@ arbiter_admit() { exit 91; }
         self.assert_denied(purpose=None)
         self.assert_denied(ref=None, purpose=" Round-Extension ",
                            extra=("--operator-request", REF))
+        for purpose in ("\u2003round-extension\u2003", "round-exten\u017fion"):
+            with self.subTest(purpose=purpose):
+                self.assert_denied(model="fable", ref=None, purpose=purpose,
+                                   extra=("--operator-request", REF))
+                self.assert_denied(model="fable", ref=None, purpose=purpose,
+                                   extra=("--operator-request", REF),
+                                   environment={"LC_ALL": "C", "PYTHONUTF8": "1"})
 
     def test_wrong_ref_shape_or_job_never_calls_gate(self):
         for ref in ("hk:task/5", "hk:doc/other/b1632-sol", "hk:doc/round-ext/other-task",

@@ -8722,7 +8722,9 @@ hk_cmd() {
 # is deliberately narrower than accepting any label attached to the same task.
 round_ext_validate() {
   local normalized
-  normalized="$(printf '%s' "$PURPOSE" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' | tr '[:upper:]' '[:lower:]')"
+  # Match scopefuel's Unicode strip/casefold before deciding whether the
+  # paired flags are required; ASCII-only normalization leaves another path.
+  normalized="$(printf '%s' "$PURPOSE" | python3 -c 'import sys; print(sys.stdin.read().strip().casefold())')"
   [[ "$normalized" == round-extension || -n "$ROUND_EXT_REF" ]] || return 0
   [[ "$PURPOSE" == round-extension && -n "$ROUND_EXT_REF" ]] ||
     die "--purpose round-extension and --round-ext REF require each other"
