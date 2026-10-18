@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -48,7 +48,7 @@ class EligibilityFixtures(unittest.TestCase):
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-qm", "base")
         self.base = git(self.repo, "rev-parse", "HEAD")
-        policy, check = common.load_policy(now=datetime(2026, 10, 12, 6, 0, tzinfo=timezone.utc))
+        policy, check = common.load_policy(now=datetime(2026, 10, 19, 6, 0, tzinfo=timezone.utc))
         self.assertEqual((check["status"], check["reason_code"]), ("PASS", "POLICY_CURRENT"))
         self.policy = policy
         self.policy_check = check
@@ -289,14 +289,46 @@ class EligibilityFixtures(unittest.TestCase):
         evidence = self.evidence(self.make_head())
         evidence["tester"]["planned_profile"] = "fictional-launcher"
         self.assert_case(self.check(evidence), "tester", "UNVERIFIED", "PROFILE_UNKNOWN")
-        _, stale = common.load_policy(now=datetime(2026, 10, 21, tzinfo=timezone.utc))
+        _, stale = common.load_policy(now=datetime(2026, 10, 31, tzinfo=timezone.utc))
         self.assertEqual((stale["status"], stale["reason_code"]), ("UNVERIFIED", "POLICY_STALE"))
         changed = json.loads(json.dumps(self.policy))
         changed["sources"]["decision/2026-09-20/provider-family-and-ds41-grade"]["id"] = 0
         path = Path(self.temp.name) / "policy.json"
         path.write_text(json.dumps(changed))
-        _, conflict = common.load_policy(path, now=datetime(2026, 10, 12, 6, tzinfo=timezone.utc))
+        _, conflict = common.load_policy(path, now=datetime(2026, 10, 19, 6, tzinfo=timezone.utc))
         self.assertEqual((conflict["status"], conflict["reason_code"]), ("UNVERIFIED", "POLICY_CONFLICT"))
+
+    def test_policy_window_boundaries(self) -> None:
+        # The validity window is half-open: [effective_at, expires_at).
+        window = json.loads(common.DEFAULT_POLICY.read_text())
+        start = common.parse_time(window["effective_at"])
+        end = common.parse_time(window["expires_at"])
+        one_second = timedelta(seconds=1)
+        for label, instant, want in (
+            ("effective_at - 1s", start - one_second, ("UNVERIFIED", "POLICY_STALE")),
+            ("effective_at", start, ("PASS", "POLICY_CURRENT")),
+            ("expires_at - 1s", end - one_second, ("PASS", "POLICY_CURRENT")),
+            ("expires_at", end, ("UNVERIFIED", "POLICY_STALE")),
+        ):
+            with self.subTest(label):
+                _, check = common.load_policy(now=instant)
+                self.assertEqual((check["status"], check["reason_code"]), want)
+
+    def test_argon_trial_path_alive_at_end_of_window(self) -> None:
+        # hk 1620: the Argon discount ends about 2026-10-27; the policy must still be
+        # current there and an ungraded Argon tester must stay UNVERIFIED, not FAIL.
+        policy, policy_check = common.load_policy(now=datetime(2026, 10, 27, tzinfo=timezone.utc))
+        self.assertEqual((policy_check["status"], policy_check["reason_code"]), ("PASS", "POLICY_CURRENT"))
+        head = self.make_head()
+        for alias in ("devin-argon", "devin-argon-medium", "devin-argon-low"):
+            with self.subTest(alias):
+                evidence = self.evidence(head)
+                evidence["tester"] = {"planned_profile": alias, "planned_effort": ""}
+                evidence["policy_sha256"] = common.sha256_file(common.DEFAULT_POLICY)
+                with mock.patch.object(eligible, "_read_pane", return_value=None):
+                    checks, _ = eligible.evaluate(evidence, "pre-spawn", policy, policy_check)
+                self.assert_case(checks, "policy", "PASS", "POLICY_CURRENT")
+                self.assert_case(checks, "grade", "UNVERIFIED", "PROFILE_GRADE_UNKNOWN")
 
     def test_advertised_aliases_have_explicit_policy_entries(self) -> None:
         names = subprocess.run([str(ROOT / "bin/wrk"), "profiles"], text=True,

@@ -152,8 +152,8 @@
     }
   },
   "conflicts": [],
-  "effective_at": "2026-10-12T00:00:00Z",
-  "expires_at": "2026-10-20T00:00:00Z",
+  "effective_at": "2026-10-18T00:00:00Z",
+  "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "bc7e430fac437a5ecd39cfd260486372e0e1521a83c6d47008374d74bae2eb9b",
     "bin/wrk": "e849077606418ffb9fb6fab44423e6b18021544effc78a44396b4f087743c54f",
@@ -1843,7 +1843,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-16.1",
+  "revision": "2026-10-19.1",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
