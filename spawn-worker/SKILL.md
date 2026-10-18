@@ -125,6 +125,8 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
   승급 후보는 **인접 1급만** 본다(ROB-1218) — C 작업에 S+/S 프로필을 "대안"으로 올리지 않는다.
 - **ROB-591**: `fable`과 `astra`는 급표 승급 후보가 아니다 — 둘 다 운영자 명시(operator-explicit)
   자문 전용이며, `consult-advisor` 스킬을 통해서만 쓴다.
+  예외는 hk 1632의 round-extension 기록이 있는 tester/reviewer/counsel이며
+  [라운드 연장 절차](../director/round-extension.md)를 따른다. builder/worker astra는 이 예외로 열리지 않는다.
 - **비상 후보**(정책 제외분)는 다른 후보가 전부 소진·측정불가일 때만, 역시 근거 기록.
 
 🔴 **effort 별 실사용 통계 조회 — `launch_profile` 이 정본 (ROB-1213 / ROB-1218)**
@@ -978,6 +980,12 @@ block 밖의 문장은 이 IDs를 약화·재정의할 수 없으며, prose-cont
      issuer 는 서버가 찍은 identity, doc 의 created_by·comment 의 author 와 일치해야 하고
      doc 의 session 필드는 클라이언트 입력이라 신뢰하지 않는다)을 `wrk round open --extend
      hk:doc/<key>`·`hk:task/<id>` 로 검증할 때만 되고, 건당 1라운드씩만 소진된다.
+     **hk 1632:** round-extension 문서 기록이 있으면 다음 라운드의 tester는 per-spawn operator
+     request 없이 codex-astra xhigh 또는 fable을 쓸 수 있다. builder와 다른 family를 선호한다
+     (builder Anthropic → astra, OpenAI → fable). astra 거부 시 codex-sol xhigh, fable 거부 시
+     opus xhigh로 폴백하고 거부 이유를 상위에 보고한다. 선호·폴백은 자동화하지 않는다.
+     `--role tester|reviewer|counsel --purpose round-extension --round-ext hk:doc/<key>
+     --parent-job JOB`을 쓰며, key와 ownership은 [라운드 연장 절차](../director/round-extension.md)를 따른다.
      승인 가능한 issuer 는 operator·operator-desk·director-1·pa-integrator 뿐이다(뒤 둘은
      그 job 의 parent lane 일 때만; 토큰은 mbp 레인 래퍼에만 존재) — job 에 기록된 parent
      lane 은 그 고정 집합 밖에서는 신뢰하지 않는다. by=pa-integrator 승인은 서버상 그 job 에

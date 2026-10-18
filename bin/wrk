@@ -134,7 +134,7 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|p
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
-            [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--keep]
+            [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH
@@ -195,7 +195,7 @@ spawn_help() {
 Usage: wrk spawn -c CWD -m|--profile MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
-                 [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--keep]
+                 [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
                  [--task HK_TASK_ID | --parent-job JOB_ID] [--task-hk-bypass]
 
 Options:
@@ -214,7 +214,8 @@ Options:
                      completion only — it does NOT route job.escalate or
                      job.joined; see --parent for that, and note --role builder
                      rejects --owner outright (use --lane instead).
-  --role worker|builder (legacy alias: captain)
+  --role worker|builder|tester|reviewer|counsel (legacy alias: captain)
+                     tester/reviewer/counsel use worker lease topology.
                      builder requires --lane and --parent, and accepts only
                      builder-opus, builder-sol, builder-sol6, builder-devin,
                      builder-devin-medium, builder-devin-max, builder-ds41,
@@ -314,6 +315,11 @@ The brief is delivered with `panewire prompt` (no uptake; first line
 `expect: name=LABEL cwd=CWD`). Only when panewire cannot reach its daemon
 (rc 4) or is not installed does wrk inject once directly through herdr; the OK
 line then ends with via=herdr-fallback.
+  --round-ext REF   Verified round-extension document, hk:doc/round-extension/JOB,
+                     hk:doc/round-ext/JOB or hk:doc/PROJECT/round-ext/JOB.
+                     Requires --purpose round-extension, explicit --parent-job JOB,
+                     and --role tester|reviewer|counsel. Only codex-astra (xhigh)
+                     or fable; document and parent task ownership must be readable.
   --operator-request REF
                      operator request reference passed verbatim to
                      `scopefuel gate` (the gate accepts only hk:doc/<key>
@@ -2027,6 +2033,9 @@ quota_gate() {
   [[ -z "${OPERATOR_REQUEST:-}" ]] || gate_args+=(--operator-request "$OPERATOR_REQUEST")
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
+  if [[ "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
+    gate_args+=(--role "$ROLE")
+  fi
   local out rc
   set +e
   out="$("$SCOPEFUEL" "${gate_args[@]}")"
@@ -3511,7 +3520,11 @@ apply_catalog() {
 
   local launch_args=(policy launch "$CATALOG_PROFILE" --json)
   [[ -z "$CATALOG_EFFORT_PIN" ]] || launch_args+=(--effort "$CATALOG_EFFORT_PIN")
-  [[ -z "${OPERATOR_REQUEST:-}" ]] || launch_args+=(--operator-request)
+  if [[ -n "${ROUND_EXT_REF:-}" ]]; then
+    launch_args+=(--operator-request "$ROUND_EXT_REF")
+  elif [[ -n "${OPERATOR_REQUEST:-}" ]]; then
+    launch_args+=(--operator-request)
+  fi
   # task #527 + #593: the declared purpose reaches the catalog too, not only the
   # quota gate. A bare `-m codex-astra` is the architect counsel path (PURPOSE is
   # defaulted to architect above), the gate admits it, and the catalog marks astra
@@ -3520,6 +3533,9 @@ apply_catalog() {
   # purposes count is scopefuel's judgement, not wrk's, and it applies the rule to
   # astra only.
   [[ -z "${PURPOSE:-}" ]] || launch_args+=(--purpose "$PURPOSE")
+  if [[ "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
+    launch_args+=(--role "$ROLE")
+  fi
 
   # Keep stderr: rc 3 has several distinct reasons (consult_only, a retired rung,
   # an unknown profile, a gate a stale catalog may not widen) and only scopefuel
@@ -6584,6 +6600,9 @@ PY
 # here warns exactly once.
 hub_lane_register() {
   HUB_LANE="" HUB_LANE_MACHINE=""
+  # Child seats use the worker lane/credential topology inside this helper.
+  local ROLE="$ROLE"
+  case "$ROLE" in tester|reviewer|counsel) ROLE=worker ;; esac
   [[ "$ROLE" == worker || "$ROLE" == builder ]] || return 0
   # #1397/(a): a delegated remote spawn defers its lane row to the ssh
   # initiator — only that host holds the operator credential (per-host
@@ -7256,7 +7275,7 @@ spillover_wake_request() {
 # a flag and remains a perfectly valid --requested-by value.
 wrk_option_token() {
   case "$1" in
-    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -7277,7 +7296,7 @@ spillover_hub_args() {
         ;;
       --job-dup-ok)
         echo "wrk: --job-dup-ok is not permitted for a hub spawn" >&2; return 2 ;;
-      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--requested-by|--purpose|--task|--parent-job)
+      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job)
         i=$((i + 1))
         { [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] && ! wrk_option_token "${args[$i]}"; } ||
           { echo "wrk: $arg requires a value" >&2; return 2; }
@@ -7979,7 +7998,7 @@ spawn_router_cmd() {
   for ((i = 0; i < ${#args[@]}; i++)); do
     case "${args[$i]}" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--host|--lane-defer) ((i += 1)) ;;
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--host|--lane-defer) ((i += 1)) ;;
       --task-hk-bypass|--job-dup-ok|--landing-strict|--keep) ;;
       *) break ;;
     esac
@@ -8705,6 +8724,79 @@ hk_cmd() {
   run_bounded "$HK_CMD_TIMEOUT" "$bin" "$@"
 }
 
+# hk 1632: fail closed before catalog/gate calls. Exact parent-job ownership
+# is deliberately narrower than accepting any label attached to the same task.
+round_ext_validate() {
+  if [[ "${MODEL:-}" == codex-astra || "${MODEL:-}" == fable ]] &&
+     [[ "${ROLE:-}" == tester || "${ROLE:-}" == reviewer ]]; then
+    [[ "$PURPOSE" == round-extension && -n "$ROUND_EXT_REF" ]] ||
+      die "astra/fable tester/reviewer requires --purpose round-extension and verified --round-ext REF"
+  fi
+  [[ -n "$PURPOSE" || -n "$ROUND_EXT_REF" ]] || return 0
+  local normalized
+  # Match scopefuel's Unicode strip/casefold before deciding whether the
+  # paired flags are required; ASCII-only normalization leaves another path.
+  normalized="$(printf '%s' "$PURPOSE" | python3 -c 'import sys; print(sys.stdin.read().strip().casefold())')"
+  [[ "$normalized" == round-extension || -n "$ROUND_EXT_REF" ]] || return 0
+  [[ "$PURPOSE" == round-extension && -n "$ROUND_EXT_REF" ]] ||
+    die "--purpose round-extension and --round-ext REF require each other"
+  case "$ROLE" in
+    tester|reviewer|counsel) ;;
+    *) die "round-extension requires --role tester, reviewer or counsel; builder/worker forbidden" ;;
+  esac
+  case "$MODEL" in
+    codex-astra)
+      [[ -z "$EFFORT" || "$EFFORT" == xhigh ]] || die "round-extension codex-astra requires effort xhigh"
+      EFFORT=xhigh ;;
+    fable) ;;
+    *) die "round-extension supports only codex-astra or fable" ;;
+  esac
+  local pattern='^hk:doc/(round-extension|round-ext|[a-z0-9][a-z0-9-]*/round-ext)/[a-z0-9][a-z0-9._-]*$'
+  [[ ${#ROUND_EXT_REF} -le 128 && "$ROUND_EXT_REF" =~ $pattern ]] ||
+    die "--round-ext requires JOB [a-z0-9][a-z0-9._-]* (lowercase JOB starting with a letter/digit), REF at most 128 characters"
+  [[ -n "$PARENT_JOB" && "${ROUND_EXT_REF##*/}" == "$PARENT_JOB" ]] ||
+    die "--round-ext ownership denied: document JOB must equal explicit --parent-job (JOB [a-z0-9][a-z0-9._-]*)"
+  [[ -z "$OPERATOR_REQUEST" || "$OPERATOR_REQUEST" == "$ROUND_EXT_REF" ]] ||
+    die "--round-ext conflicts with --operator-request"
+  OPERATOR_REQUEST="$ROUND_EXT_REF"
+}
+
+round_ext_precheck() {
+  [[ -n "$ROUND_EXT_REF" ]] || return 0
+  local handoffkeep out
+  handoffkeep="$(hk_bin)"
+  [[ -n "$handoffkeep" ]] || die "--round-ext: handoffkeep unavailable"
+  out="$(hk_cmd "$handoffkeep" doc get "${ROUND_EXT_REF#hk:doc/}" 2>/dev/null)" ||
+    die "--round-ext: document missing or handoffkeep unreachable"
+  # A successful transport with an error/empty/malformed body is not existence.
+  ROUND_EXT_ISSUER="$(printf '%s' "$out" | python3 -c '
+import json, sys
+from pathlib import Path
+try:
+    doc = json.load(sys.stdin)
+    if (not isinstance(doc, dict) or doc.get("key", sys.argv[1]) != sys.argv[1]
+        or not isinstance(doc.get("body"), str) or not doc["body"].strip() or doc.get("error")):
+        raise ValueError("not a document")
+    issuer = doc["created_by"]
+    allowed = set(sys.argv[2].split())
+    if issuer not in allowed:
+        events = Path(sys.argv[4])
+        claims = sorted(p for p in events.glob("*.json")
+                        if p.name.endswith(("claim.json", "reclaim.json")))
+        if not claims:
+            raise ValueError("issuer requires recorded parent lane")
+        record = json.loads(claims[-1].read_text())
+        parent = record.get("payload", record).get("parent_lane")
+        if issuer not in set(sys.argv[3].split()) or issuer != parent:
+            raise ValueError("created_by is not an authorized issuer for this parent job")
+    print(issuer)
+except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
+    print("--round-ext: document/issuer verification failed: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+' "${ROUND_EXT_REF#hk:doc/}" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" \
+    "$(wrk_jobs_root)/$PARENT_JOB/events")" || die "--round-ext: document missing, unreadable or issuer denied"
+}
+
 # task_resolve_parent — TASK_INHERITED_FROM is set by the caller to a parent
 # job id; fill TASK_ID from its newest claim/reclaim payload. Local read only:
 # the job registry under wrk_jobs_root is the same one the claim landed in.
@@ -8894,6 +8986,56 @@ hk_task_precheck() {
       die "hk task $TASK_ID does not exist (not_found) — a job binds only an existing task"
     fi
     hk_task_gate_failure "handoffkeep tasks show rc=$rc: ${out:0:200}"
+    return 0
+  fi
+  if [[ -n "${ROUND_EXT_REF:-}" ]]; then
+    # The grant needs an unambiguous server binding. Do not transport task
+    # fields through shell IFS: empty fields and embedded TABs shift columns.
+    printf '%s' "$out" | python3 -c '
+import json, sys, unicodedata
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError("non-JSON constant")
+
+def controls(value):
+    if isinstance(value, str):
+        return any(unicodedata.category(char) in {"Cc", "Cf", "Zl", "Zp"} for char in value)
+    if isinstance(value, dict):
+        return any(controls(key) or controls(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(controls(item) for item in value)
+    return False
+
+try:
+    task = json.load(sys.stdin, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+    if not isinstance(task, dict) or not {"state", "claimed_by", "refs"} <= task.keys():
+        raise ValueError("missing task fields")
+    if (not isinstance(task["state"], str) or not task["state"]
+        or not isinstance(task["claimed_by"], str) or not isinstance(task["refs"], dict)):
+        raise ValueError("invalid task field types")
+    if any(controls(task[key]) for key in ("state", "claimed_by", "refs")):
+        raise ValueError("control character in task binding fields")
+    job = task["refs"].get("job_id")
+    if not isinstance(job, str) or not job:
+        raise ValueError("missing refs.job_id binding")
+    if job != sys.argv[1]:
+        raise ValueError("task is not bound to parent job")
+    if sys.argv[2] == "pa-integrator" and task.get("project") != "ParkingArcade":
+        raise ValueError("pa-integrator issuer requires a ParkingArcade task")
+except (ValueError, TypeError) as error:
+    print("--round-ext: invalid hk task reply: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+' "$PARENT_JOB" "$ROUND_EXT_ISSUER" || die "--round-ext ownership denied: ambiguous or unreadable hk task binding"
+    [[ "$TASK_LINK_MODE" == inherited ]] || die "--round-ext requires inherited task binding"
+    TASK_LINK_STATUS="inherited"
     return 0
   fi
   set +e
@@ -9086,7 +9228,7 @@ refuse_known_terra_spelling() {
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
+  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
   MOCK_MCP_PLAN="" MOCK_MCP_HELPER="" SPAWN_MOCK_MCP_RETAIN=0
@@ -9098,7 +9240,7 @@ spawn_cmd() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--requested-by|--purpose|--task|--parent-job|--lane-defer)
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--lane-defer)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m|--profile) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
@@ -9107,6 +9249,7 @@ spawn_cmd() {
           --role) ROLE="$2" ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
           --report) REPORT_PATH="$2" ;;
           --operator-request) OPERATOR_REQUEST="$2" ;; --requested-by) REQUESTED_BY="$2" ;;
+          --round-ext) ROUND_EXT_REF="$2" ;;
           --purpose) PURPOSE="$2" ;; --task) TASK_ID="$2" ;; --parent-job) PARENT_JOB="$2" ;;
           --lane-defer) LANE_DEFER="$2" ;;
         esac
@@ -9147,13 +9290,14 @@ spawn_cmd() {
   [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
 
   case "$ROLE" in
-    worker|builder) ;;
+    worker|builder|tester|reviewer|counsel) ;;
     captain)
       warn "--role captain is deprecated; use --role builder"
       ROLE="builder"
       ;;
-    *) die "--role accepts only worker or builder (legacy alias: captain)" ;;
+    *) die "--role accepts worker, builder, tester, reviewer or counsel (legacy alias: captain)" ;;
   esac
+  round_ext_validate
   # #1397: --lane-defer exists solely for the delegated remote-builder path —
   # the initiator adds the lane it names. A worker handed the flag would
   # print a lane= it never registered, so it is refused outright; the value
@@ -9221,6 +9365,12 @@ spawn_cmd() {
   # #768: task binding is decided here, still before any side effect — a
   # missing/unresolvable task id is a usage error, never a partial spawn.
   task_validate
+  round_ext_precheck
+  # Round-extension ownership cannot use the task availability bypass.
+  if [[ -n "$ROUND_EXT_REF" ]]; then
+    [[ "$TASK_HK_BYPASS" -eq 0 ]] || die "--round-ext forbids --task-hk-bypass"
+    hk_task_precheck
+  fi
 
   resolve_profile
   # Refuse by the resolved launcher model id, not by the spelling list. Keep
@@ -9245,6 +9395,8 @@ spawn_cmd() {
   # -L live|mock stays the execution lane; --owner names the spawning session.
   JOB_LANE="${BUILDER_LANE:-${OWNER:-default}}"
   ARBITER_CLAIM_ROLE_ARGS=(--role "$ROLE")
+  # Arbiter roles describe lease topology; these are all leaf seats.
+  case "$ROLE" in tester|reviewer|counsel) ARBITER_CLAIM_ROLE_ARGS=(--role worker) ;; esac
   if [[ "$ROLE" == builder ]]; then
     ARBITER_CLAIM_ROLE_ARGS+=(--parent-lane "$PARENT_LANE")
   fi

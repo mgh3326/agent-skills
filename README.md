@@ -15,6 +15,31 @@ fencing token 단조성·stale/replay release 거부·GC가 `unknown` 기록을 
 
 > ROB-NNN 은 비공개 이슈 트래커 참조이며, 각 규칙 옆 본문이 근거를 자립 설명한다.
 
+## Round-extension tester grant (hk 1632)
+
+After a round-extension document exists, the next round's tester/reviewer/counsel
+may use codex-astra xhigh or fable without a per-spawn operator request. Use
+`wrk spawn ... --role tester --purpose round-extension --round-ext hk:doc/round-ext/JOB
+--parent-job JOB`. The two flags require each other. Accepted keys are
+`round-extension/JOB`, `round-ext/JOB`, and `<project>/round-ext/JOB`.
+JOB follows the generic document segment rule `[a-z0-9][a-z0-9._-]*`;
+project is `[a-z0-9][a-z0-9-]*`. The entire REF is at most 128 ASCII characters.
+Uppercase, leading punctuation and dot-only JOBs are refused.
+The final job must equal the explicit parent job; the hk task must be bound to
+that parent. Document/task lookup failures refuse before catalog and quota calls;
+the document's server-set created_by must be an operator issuer or the job's
+authorized parent lane, using the same issuer allow-list as round open --extend.
+pa-integrator also requires a ParkingArcade task. Ambiguous/missing task fields
+and control characters refuse. Astra/fable tester and reviewer roles always need
+this verified grant; ordinary counsel purposes retain their existing behavior.
+`--task-hk-bypass` cannot relax this. Only codex-astra (xhigh pinned) and fable
+qualify, only as tester/reviewer/counsel. Quota checks still apply.
+
+Prefer the family other than the builder's (Anthropic builder → astra; OpenAI → fable).
+If astra is refused, use codex-sol xhigh; if fable is refused, use opus xhigh,
+and report the refusal reason up. These are director practice, not automatic
+fallbacks. See [the round-extension procedure](director/round-extension.md).
+
 ## 도메인 오버레이
 
 `spawn-worker`·`linear-archive`·`relay-handoff`는 특정 실행 환경(되돌릴 수 없는 외부
