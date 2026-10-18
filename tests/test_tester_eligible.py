@@ -153,7 +153,8 @@ class EligibilityFixtures(unittest.TestCase):
                 with self.subTest(alias=alias, ref=ref):
                     _, check = common.resolve_profile(alias, self.policy, actual_effort=effort,
                                                       round_ext_ref=ref)
-                    valid = ref is not None and common.ROUND_EXT_REF.fullmatch(ref) is not None
+                    valid = ref in {"hk:doc/round-ext/job", "hk:doc/round-extension/job",
+                                    "hk:doc/parkingarcade/round-ext/job"}
                     self.assertEqual((check["status"], check["reason_code"]),
                         ("PASS", "PROFILE_RESOLVED") if valid else ("FAIL", "PROFILE_ROLE_DENIED"))
             for surface in ("T1", "T2", "T3"):
