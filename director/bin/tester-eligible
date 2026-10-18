@@ -123,7 +123,7 @@ def _read_previous(path_text: str | None, required_stage: str, evidence: dict,
             return None, result("UNVERIFIED", "PREVIOUS_RECEIPT_INVALID", "decision:3231")
         for key in ("task", "contract_revision", "job", "repo", "repo_path", "issuer",
                     "head", "base", "diff_sha256", "contributors_digest", "declared_t",
-                    "required_grade", "implementation_grade", "split"):
+                    "required_grade", "implementation_grade", "split", "round_ext_ref"):
             if previous.get(key) != evidence.get(key):
                 reason = "HEAD_CHANGED" if key == "head" else "BASE_CHANGED" if key == "base" else "EVIDENCE_CHANGED"
                 return None, result("UNVERIFIED", reason, "decision:3231", field=key)
@@ -353,13 +353,13 @@ def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | Non
             return result("UNVERIFIED", "ACTUAL_LAUNCH_FAMILY_MISMATCH", "bin/wrk:quota_pool.record")
         if launch_spec.get("model") != tester_profile["model"]:
             return result("UNVERIFIED", "ACTUAL_LAUNCH_MODEL_MISMATCH", "bin/wrk:quota_pool.record")
-        if "tester" not in launch_spec.get("roles", []) or evidence.get("declared_t") not in launch_spec.get("surfaces", []):
+        if evidence.get("declared_t") not in launch_spec.get("surfaces", []):
             return result("UNVERIFIED", "ACTUAL_LAUNCH_PROFILE_DENIED", "bin/wrk:quota_pool.record")
         if observed_effort != tester.get("actual_effort"):
             return result("UNVERIFIED", "ACTUAL_EFFORT_MISMATCH", "bin/wrk:quota_pool.record")
         resolved_launch, launch_check = resolve_profile(
             launch_prefix, policy, actual_model=tester_profile["model"],
-            actual_effort=observed_effort, role="tester")
+            actual_effort=observed_effort, role="tester", round_ext_ref=evidence.get("round_ext_ref"))
         if launch_check["status"] != "PASS" or resolved_launch is None:
             return result("UNVERIFIED", "ACTUAL_LAUNCH_PROFILE_UNVERIFIED", "bin/wrk+policy:profiles")
         if resolved_launch["grade"] != tester_profile["grade"]:
@@ -1421,7 +1421,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
         effort = tester.get("actual_effort") if actual_alias else planned_effort
         tester_profile, checks["tester"] = resolve_profile(alias, policy,
             actual_model=tester.get("actual_model") if actual_alias else None,
-            actual_effort=effort, role="tester", root=root)
+            actual_effort=effort, role="tester", root=root, round_ext_ref=evidence.get("round_ext_ref"))
         if actual_alias and (actual_alias != planned_alias or effort != planned_effort):
             checks["tester"] = result("FAIL", "ACTUAL_PROFILE_CHANGED", "decision:3231")
             tester_profile = None
@@ -1659,6 +1659,7 @@ def main() -> int:
                "declared_t": evidence.get("declared_t"), "required_grade": evidence.get("required_grade"),
                "implementation_grade": evidence.get("implementation_grade"),
                "split": evidence.get("split"), "split_analysis": bound.get("split_analysis"),
+               "round_ext_ref": evidence.get("round_ext_ref"),
                "diff_sha256": bound.get("diff_sha256"), "contributors_digest": bound.get("contributors_digest"),
                "planned_tester_profile": (evidence.get("tester") or {}).get("planned_profile"),
                "planned_tester_effort": (evidence.get("tester") or {}).get("planned_effort"),

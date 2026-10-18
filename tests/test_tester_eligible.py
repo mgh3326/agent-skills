@@ -101,6 +101,7 @@ class EligibilityFixtures(unittest.TestCase):
                                     "contributors_digest": eligible._digest(evidence["contributors"]),
                                     "planned_tester_profile": evidence["tester"]["planned_profile"],
                                     "planned_tester_effort": evidence["tester"]["planned_effort"],
+                                    "round_ext_ref": evidence.get("round_ext_ref"),
                                     "policy": {"revision": self.policy["revision"],
                                                "sha256": common.sha256_file(common.DEFAULT_POLICY)}}
         if stage == "post-landing":
@@ -140,6 +141,61 @@ class EligibilityFixtures(unittest.TestCase):
         tester["model_observation_path"] = str(observation)
         tester["model_observation_sha256"] = common.sha256_file(observation)
         evidence["_pane_snapshot"] = "Grok 4.7 (xhigh) · always-approve"
+
+    def test_round_extension_tester_role_is_conditional(self) -> None:
+        head = self.make_head()
+        for alias, effort in (("codex-astra", "xhigh"), ("fable", "")):
+            for ref in (None, "hk:task/5", "hk:doc/other/job", "hk:doc/round-ext/job\n",
+                        "hk:doc/round-ext/job", "hk:doc/round-extension/job",
+                        "hk:doc/parkingarcade/round-ext/job"):
+                with self.subTest(alias=alias, ref=ref):
+                    _, check = common.resolve_profile(alias, self.policy, actual_effort=effort,
+                                                      round_ext_ref=ref)
+                    valid = ref is not None and common.ROUND_EXT_REF.fullmatch(ref) is not None
+                    self.assertEqual((check["status"], check["reason_code"]),
+                        ("PASS", "PROFILE_RESOLVED") if valid else ("FAIL", "PROFILE_ROLE_DENIED"))
+            for surface in ("T1", "T2", "T3"):
+                evidence = self.evidence(head, declared_t=surface, round_ext_ref="hk:doc/round-ext/job",
+                    tester={"planned_profile": alias, "planned_effort": effort})
+                checks = self.check(evidence)
+                self.assert_case(checks, "tester", "PASS", "PROFILE_RESOLVED")
+                self.assert_case(checks, "surface_permission", "PASS", "PROFILE_SURFACE_ALLOWED")
+        evidence = self.evidence(head, round_ext_ref="hk:doc/round-ext/job")
+        evidence["contributors"][0].update(profile="codex-astra", model="gpt-6-astra", effort="xhigh")
+        checks = self.check(evidence)
+        self.assert_case(checks, "contributors", "UNVERIFIED", "PROFILE_ROLE_DENIED")
+
+    def test_round_extension_ref_bound_in_previous_receipt(self) -> None:
+        evidence = self.evidence(self.make_head())
+        path = self.previous(evidence, "pre-spawn")
+        evidence["round_ext_ref"] = "hk:doc/round-ext/job"
+        surface, _ = eligible.diff_surface(evidence, self.policy)
+        evidence.update(diff_sha256=surface["diff_sha256"],
+                        contributors_digest=eligible._digest(evidence["contributors"]))
+        _, check = eligible._read_previous(str(path), "pre-spawn", evidence,
+            self.policy["revision"], common.sha256_file(common.DEFAULT_POLICY))
+        self.assertEqual(check.get("field"), "round_ext_ref")
+
+    def test_round_extension_observed_launch_is_accepted(self) -> None:
+        for alias, effort, model in (("codex-astra", "xhigh", "gpt-6-astra"),
+                                     ("fable", "", "claude-fable-5-1")):
+            with self.subTest(alias=alias):
+                evidence = self.evidence(self.make_head(f"src/{alias}.py"),
+                    round_ext_ref="hk:doc/round-ext/job",
+                    tester={"planned_profile": alias, "planned_effort": effort})
+                evidence = self.landed(evidence)
+                evidence["tester"].update(actual_profile=alias, actual_model=model, actual_effort=effort)
+                self.add_actual_source(evidence)
+                events = Path(evidence["tester"]["job_record_dir"]) / "events"
+                (events / "00002-quota_pool.record.json").write_text(json.dumps({
+                    "job_id": evidence["job"], "kind": "quota_pool.record",
+                    "payload": {"launch_profile": alias + ("@" + effort if effort else "")}}))
+                # Match the installed footer parser's literal model spelling.
+                evidence["_pane_snapshot"] = model + (f" ({effort})" if effort else "")
+                checks = self.check(evidence, "post-landing")
+                self.assertEqual(checks["tester"]["status"], "PASS")
+                self.assertNotIn(checks["actual_source"]["reason_code"],
+                    {"ACTUAL_LAUNCH_PROFILE_DENIED", "ACTUAL_LAUNCH_PROFILE_UNVERIFIED"})
 
     def test_normal_pass_and_hash_incident_boundary(self) -> None:
         evidence = self.evidence(self.make_head())

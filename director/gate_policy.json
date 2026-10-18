@@ -160,7 +160,7 @@
     "builder/SKILL.md": "91cdb4c1d22177fc219db5b876ecc52b852122bc37128a0180def3668c8c38e8",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
     "director/SKILL.md": "c6b95f71c691d7711aeb9ee55f5e804f889319e99a21987a813eec148135ba42",
-    "spawn-worker/SKILL.md": "876f82baa3bb9607da8103899ad4735a3d5c9a54ca8b4ee916b686c7826a5948"
+    "spawn-worker/SKILL.md": "a7a71f7d601b19f33dc681203094b52074d57205fd2c77a1acc439fb94d593f8"
   },
   "profiles": {
     "agy-flash": {
@@ -846,7 +846,14 @@
       "roles": [
         "counsel"
       ],
-      "surfaces": []
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ],
+      "round_extension_roles": [
+        "tester"
+      ]
     },
     "codex-luna": {
       "default_effort": "medium",
@@ -1265,7 +1272,14 @@
       "roles": [
         "counsel"
       ],
-      "surfaces": []
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ],
+      "round_extension_roles": [
+        "tester"
+      ]
     },
     "grok": {
       "default_effort": "high",
@@ -1933,6 +1947,10 @@
     "task/723": {
       "id": 723,
       "scope": "canonical required repository CI jobs and execution steps at H, B and M"
+    },
+    "task/1632": {
+      "id": 1632,
+      "scope": "Round-extension doc allows astra xhigh and fable testers; ordinary counsel roles unchanged"
     }
   },
   "surface_rules": {
