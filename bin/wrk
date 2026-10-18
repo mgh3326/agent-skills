@@ -1813,11 +1813,12 @@ parent = os.path.dirname(config_path)
 parser = None
 parser_name = "header-only"
 try:
-    import tomllib as parser
+    import importlib
+    parser = importlib.import_module("tomllib")
     parser_name = "tomllib"
 except ImportError:
     try:
-        import tomli as parser
+        parser = importlib.import_module("tomli")
         parser_name = "tomli"
     except ImportError:
         pass
