@@ -32,7 +32,9 @@ cleanup() {
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     kill -STOP "$pid" 2>/dev/null || true
     while IFS= read -r child; do
-      [[ "$child" =~ ^[0-9]+$ ]] && kill "$child" 2>/dev/null || true
+      if [[ "$child" =~ ^[0-9]+$ ]]; then
+        kill "$child" 2>/dev/null || true
+      fi
     done < <(pgrep -P "$pid" 2>/dev/null || true)
     kill "$pid" 2>/dev/null || true
     kill -CONT "$pid" 2>/dev/null || true
