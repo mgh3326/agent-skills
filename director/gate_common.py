@@ -21,7 +21,9 @@ DEFAULT_POLICY = ROOT / "director" / "gate_policy.json"
 DEFAULT_RECEIPTS = Path.home() / "work/herdr-inbox/receipts"
 GRADES = ("C", "B", "A", "A+", "S", "S+")
 COMMON_VERSION = "gate-common/1.1"
-ROUND_EXT_REF = re.compile(r"^hk:doc/(?:round-extension|round-ext|[a-z0-9-]+/round-ext)/[A-Za-z0-9._-]+$")
+ROUND_EXT_REF = re.compile(
+    r"(?=.{1,128}\Z)hk:doc/(?:round-extension|round-ext|[a-z0-9][a-z0-9-]*/round-ext)/"
+    r"[a-z0-9][a-z0-9._-]*\Z")
 
 
 def round_ext_tester_allowed(alias: str, ref: object) -> bool:

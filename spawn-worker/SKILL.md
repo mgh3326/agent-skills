@@ -124,7 +124,8 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
 - **승급 후보(`⚠`)** 는 조건 충족 시에만 쓰고 **근거를 이슈에 기록**한다.
   승급 후보는 **인접 1급만** 본다(ROB-1218) — C 작업에 S+/S 프로필을 "대안"으로 올리지 않는다.
 - **ROB-591**: `fable`과 `astra`는 급표 승급 후보가 아니다 — 둘 다 운영자 명시(operator-explicit)
-  자문 경로를 쓴다. 예외는 hk 1632의 round-extension 기록이 있는 tester/reviewer/counsel이며
+  자문 전용이며, `consult-advisor` 스킬을 통해서만 쓴다.
+  예외는 hk 1632의 round-extension 기록이 있는 tester/reviewer/counsel이며
   [라운드 연장 절차](../director/round-extension.md)를 따른다. builder/worker astra는 이 예외로 열리지 않는다.
 - **비상 후보**(정책 제외분)는 다른 후보가 전부 소진·측정불가일 때만, 역시 근거 기록.
 

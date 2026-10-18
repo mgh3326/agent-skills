@@ -146,6 +146,8 @@ class EligibilityFixtures(unittest.TestCase):
         head = self.make_head()
         for alias, effort in (("codex-astra", "xhigh"), ("fable", "")):
             for ref in (None, "hk:task/5", "hk:doc/other/job", "hk:doc/round-ext/job\n",
+                        "hk:doc/round-ext/JOB", "hk:doc/round-ext/.job", "hk:doc/round-ext/_job",
+                        "hk:doc/round-ext/-job", "hk:doc/round-ext/..", "hk:doc/round-ext/" + "j" * 128,
                         "hk:doc/round-ext/job", "hk:doc/round-extension/job",
                         "hk:doc/parkingarcade/round-ext/job"):
                 with self.subTest(alias=alias, ref=ref):
@@ -183,6 +185,9 @@ class EligibilityFixtures(unittest.TestCase):
                 evidence = self.evidence(self.make_head(f"src/{alias}.py"),
                     round_ext_ref="hk:doc/round-ext/job",
                     tester={"planned_profile": alias, "planned_effort": effort})
+                if alias == "codex-astra":
+                    evidence["contributors"][0].update(profile="builder-opus", model="claude-opus-5-5",
+                                                        effort="high")
                 evidence = self.landed(evidence)
                 evidence["tester"].update(actual_profile=alias, actual_model=model, actual_effort=effort)
                 self.add_actual_source(evidence)
@@ -190,12 +195,11 @@ class EligibilityFixtures(unittest.TestCase):
                 (events / "00002-quota_pool.record.json").write_text(json.dumps({
                     "job_id": evidence["job"], "kind": "quota_pool.record",
                     "payload": {"launch_profile": alias + ("@" + effort if effort else "")}}))
-                # Match the installed footer parser's literal model spelling.
-                evidence["_pane_snapshot"] = model + (f" ({effort})" if effort else "")
+                evidence["_pane_snapshot"] = ("GPT-6-Astra xhigh · worktree" if alias == "codex-astra"
+                                              else "Fable 5.1 · worktree")
                 checks = self.check(evidence, "post-landing")
-                self.assertEqual(checks["tester"]["status"], "PASS")
-                self.assertNotIn(checks["actual_source"]["reason_code"],
-                    {"ACTUAL_LAUNCH_PROFILE_DENIED", "ACTUAL_LAUNCH_PROFILE_UNVERIFIED"})
+                self.assert_case(checks, "actual_source", "PASS", "ACTUAL_PROFILE_OBSERVED")
+                self.assertEqual(eligible.overall(checks), "PASS", checks)
 
     def test_normal_pass_and_hash_incident_boundary(self) -> None:
         evidence = self.evidence(self.make_head())

@@ -2033,6 +2033,9 @@ quota_gate() {
   [[ -z "${OPERATOR_REQUEST:-}" ]] || gate_args+=(--operator-request "$OPERATOR_REQUEST")
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
+  if [[ "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
+    gate_args+=(--role "$ROLE")
+  fi
   local out rc
   set +e
   out="$("$SCOPEFUEL" "${gate_args[@]}")"
@@ -3530,6 +3533,9 @@ apply_catalog() {
   # purposes count is scopefuel's judgement, not wrk's, and it applies the rule to
   # astra only.
   [[ -z "${PURPOSE:-}" ]] || launch_args+=(--purpose "$PURPOSE")
+  if [[ "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
+    launch_args+=(--role "$ROLE")
+  fi
 
   # Keep stderr: rc 3 has several distinct reasons (consult_only, a retired rung,
   # an unknown profile, a gate a stale catalog may not widen) and only scopefuel
@@ -8721,6 +8727,11 @@ hk_cmd() {
 # hk 1632: fail closed before catalog/gate calls. Exact parent-job ownership
 # is deliberately narrower than accepting any label attached to the same task.
 round_ext_validate() {
+  if [[ "${MODEL:-}" == codex-astra || "${MODEL:-}" == fable ]] &&
+     [[ "${ROLE:-}" == tester || "${ROLE:-}" == reviewer ]]; then
+    [[ "$PURPOSE" == round-extension && -n "$ROUND_EXT_REF" ]] ||
+      die "astra/fable tester/reviewer requires --purpose round-extension and verified --round-ext REF"
+  fi
   [[ -n "$PURPOSE" || -n "$ROUND_EXT_REF" ]] || return 0
   local normalized
   # Match scopefuel's Unicode strip/casefold before deciding whether the
@@ -8740,10 +8751,11 @@ round_ext_validate() {
     fable) ;;
     *) die "round-extension supports only codex-astra or fable" ;;
   esac
-  local pattern='^hk:doc/(round-extension|round-ext|[a-z0-9-]+/round-ext)/[A-Za-z0-9._-]+$'
-  [[ "$ROUND_EXT_REF" =~ $pattern ]] || die "--round-ext requires a round-extension document ref (hk:doc/<key>)"
+  local pattern='^hk:doc/(round-extension|round-ext|[a-z0-9][a-z0-9-]*/round-ext)/[a-z0-9][a-z0-9._-]*$'
+  [[ ${#ROUND_EXT_REF} -le 128 && "$ROUND_EXT_REF" =~ $pattern ]] ||
+    die "--round-ext requires JOB [a-z0-9][a-z0-9._-]* (lowercase JOB starting with a letter/digit), REF at most 128 characters"
   [[ -n "$PARENT_JOB" && "${ROUND_EXT_REF##*/}" == "$PARENT_JOB" ]] ||
-    die "--round-ext ownership denied: document job must equal explicit --parent-job"
+    die "--round-ext ownership denied: document JOB must equal explicit --parent-job (JOB [a-z0-9][a-z0-9._-]*)"
   [[ -z "$OPERATOR_REQUEST" || "$OPERATOR_REQUEST" == "$ROUND_EXT_REF" ]] ||
     die "--round-ext conflicts with --operator-request"
   OPERATOR_REQUEST="$ROUND_EXT_REF"
@@ -8757,16 +8769,32 @@ round_ext_precheck() {
   out="$(hk_cmd "$handoffkeep" doc get "${ROUND_EXT_REF#hk:doc/}" 2>/dev/null)" ||
     die "--round-ext: document missing or handoffkeep unreachable"
   # A successful transport with an error/empty/malformed body is not existence.
-  printf '%s' "$out" | python3 -c '
+  ROUND_EXT_ISSUER="$(printf '%s' "$out" | python3 -c '
 import json, sys
+from pathlib import Path
 try:
     doc = json.load(sys.stdin)
     if (not isinstance(doc, dict) or doc.get("key", sys.argv[1]) != sys.argv[1]
         or not isinstance(doc.get("body"), str) or not doc["body"].strip() or doc.get("error")):
         raise ValueError("not a document")
-except (ValueError, TypeError):
+    issuer = doc.get("created_by")
+    allowed = set(sys.argv[2].split())
+    if issuer not in allowed:
+        events = Path(sys.argv[4])
+        claims = sorted(p for p in events.glob("*.json")
+                        if p.name.endswith(("claim.json", "reclaim.json")))
+        if not claims:
+            raise ValueError("issuer requires recorded parent lane")
+        record = json.loads(claims[-1].read_text())
+        parent = record.get("payload", record).get("parent_lane")
+        if issuer not in set(sys.argv[3].split()) or issuer != parent:
+            raise ValueError("created_by is not an authorized issuer for this parent job")
+    print(issuer)
+except (OSError, ValueError, TypeError, AttributeError) as error:
+    print("--round-ext: document/issuer verification failed: " + str(error), file=sys.stderr)
     raise SystemExit(1)
-' "${ROUND_EXT_REF#hk:doc/}" || die "--round-ext: document missing or unreadable"
+' "${ROUND_EXT_REF#hk:doc/}" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" \
+    "$(wrk_jobs_root)/$PARENT_JOB/events")" || die "--round-ext: document missing, unreadable or issuer denied"
 }
 
 # task_resolve_parent — TASK_INHERITED_FROM is set by the caller to a parent
@@ -8960,6 +8988,56 @@ hk_task_precheck() {
     hk_task_gate_failure "handoffkeep tasks show rc=$rc: ${out:0:200}"
     return 0
   fi
+  if [[ -n "${ROUND_EXT_REF:-}" ]]; then
+    # The grant needs an unambiguous server binding. Do not transport task
+    # fields through shell IFS: empty fields and embedded TABs shift columns.
+    printf '%s' "$out" | python3 -c '
+import json, sys, unicodedata
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+def invalid_constant(value):
+    raise ValueError("non-JSON constant")
+
+def controls(value):
+    if isinstance(value, str):
+        return any(unicodedata.category(char) == "Cc" for char in value)
+    if isinstance(value, dict):
+        return any(controls(key) or controls(item) for key, item in value.items())
+    if isinstance(value, list):
+        return any(controls(item) for item in value)
+    return False
+
+try:
+    task = json.load(sys.stdin, object_pairs_hook=unique_object, parse_constant=invalid_constant)
+    if not isinstance(task, dict) or not {"state", "claimed_by", "refs"} <= task.keys():
+        raise ValueError("missing task fields")
+    if (not isinstance(task["state"], str) or not task["state"]
+        or not isinstance(task["claimed_by"], str) or not isinstance(task["refs"], dict)):
+        raise ValueError("invalid task field types")
+    if any(controls(task[key]) for key in ("state", "claimed_by", "refs")):
+        raise ValueError("control character in task binding fields")
+    job = task["refs"].get("job_id")
+    if not isinstance(job, str) or not job:
+        raise ValueError("missing refs.job_id binding")
+    if job != sys.argv[1]:
+        raise ValueError("task is not bound to parent job")
+    if sys.argv[2] == "pa-integrator" and task.get("project") != "ParkingArcade":
+        raise ValueError("pa-integrator issuer requires a ParkingArcade task")
+except (ValueError, TypeError) as error:
+    print("--round-ext: invalid hk task reply: " + str(error), file=sys.stderr)
+    raise SystemExit(1)
+' "$PARENT_JOB" "$ROUND_EXT_ISSUER" || die "--round-ext ownership denied: ambiguous or unreadable hk task binding"
+    [[ "$TASK_LINK_MODE" == inherited ]] || die "--round-ext requires inherited task binding"
+    TASK_LINK_STATUS="inherited"
+    return 0
+  fi
   set +e
   # One tab-separated line: per-line prints would lose trailing empty fields
   # to command-substitution stripping and the third `read` would hit EOF.
@@ -8977,9 +9055,6 @@ print("\t".join([d.get("state") or "", d.get("claimed_by") or "",
     return 0
   fi
   IFS=$'\t' read -r t_state t_claimed t_job <<<"$fields"
-  if [[ -n "${ROUND_EXT_REF:-}" && "$t_job" != "$PARENT_JOB" ]]; then
-    die "--round-ext ownership denied: hk task $TASK_ID is not bound to parent job $PARENT_JOB"
-  fi
   if [[ "$TASK_LINK_MODE" == inherited ]]; then
     # Child jobs never claim: the owner's record stands. Existence is the
     # only requirement; state is observational.

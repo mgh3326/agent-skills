@@ -10,14 +10,26 @@ standing grant 2026-10-18, hk:doc owner/fleet/decision/2026-10-18/round-ext-astr
 
 Use `--role tester|reviewer|counsel --purpose round-extension --round-ext REF
 --parent-job JOB`. Accepted REF keys are `round-extension/JOB`, `round-ext/JOB`,
-or `<project>/round-ext/JOB`, where project matches `[a-z0-9-]+` and JOB matches
-`[A-Za-z0-9._-]+`. We implement exact equality with the explicit parent job,
+or `<project>/round-ext/JOB`, where project matches `[a-z0-9][a-z0-9-]*` and JOB follows
+the generic document segment rule `[a-z0-9][a-z0-9._-]*`. The entire REF is at most
+128 ASCII characters. Uppercase, leading punctuation and dot-only JOBs are refused.
+We implement exact equality with the explicit parent job,
 rather than accepting another job on the task. The hk task's job binding must
 also equal that parent. This keeps another task's document from unlocking a spawn,
 including when local job metadata is absent. Missing documents, unreachable hk,
 malformed replies and ownership failures refuse before catalog/quota calls.
+The document's server-set created_by must match the existing round-open issuer
+policy: operator or operator-desk, or director-1/pa-integrator when that identity
+is the parent job's recorded parent lane. The fixed allow-lists are reused;
+client-provided session/by text cannot authorize a document. pa-integrator also
+requires the server task to be ParkingArcade. Missing task fields, ambiguous JSON
+and control characters in state, claimed_by or refs refuse; an empty claimed_by
+is valid when refs.job_id binds the correct parent.
 Task bypass is unavailable for this path. Builder/worker roles are refused;
 codex-astra is pinned to xhigh and other efforts are refused. Quota still applies.
+Astra/fable tester and reviewer seats require this grant for every purpose.
+wrk forwards --role to both scopefuel gate and policy launch; ordinary counsel
+seats keep their existing purpose rules.
 
 Prefer a provider family different from the builder: Anthropic builder → astra;
 OpenAI builder → fable. If astra is refused, use codex-sol xhigh; if fable is

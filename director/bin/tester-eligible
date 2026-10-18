@@ -295,7 +295,7 @@ def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
         "grok-4.7": "Grok 4.7", "gpt-6.1-sol": "GPT-6.1-Sol", "gpt-6-sol": "GPT-6-Sol",
         "gpt-6-luna": "GPT-6-Luna",
         "gpt-5.6-terra": "GPT-5.6-Terra", "claude-opus-5-5": "Opus 5.5",
-        "claude-sonnet-5": "Sonnet 5",
+        "claude-sonnet-5": "Sonnet 5", "claude-fable-5-1": "Fable 5.1",
         # hk 1380: a fusion pane brands the whole label — captured verbatim
         # 2026-10-10 from `devin --model fusion-claude-opus-5-5-high-
         # sidekick-swe-2-medium` (no prompt sent, footer read then /exit).
@@ -313,7 +313,7 @@ def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
     pattern = re.compile(rf"^\s*[│┃╭╰─\s]*{re.escape(display)}{suffix}", re.IGNORECASE)
     footer_lines = [line for line in snapshot.splitlines()[-5:]
                     if " · " in line and re.match(
-                        r"^\s*[│┃╭╰─\s]*(?:Grok|GPT-|Opus|Sonnet|Haiku|Kimi|Devin|Deepseek|Fusion)",
+                        r"^\s*[│┃╭╰─\s]*(?:Grok|GPT-|Opus|Sonnet|Haiku|Fable|Kimi|Devin|Deepseek|Fusion)",
                         line, re.IGNORECASE)]
     return bool(footer_lines) and bool(pattern.search(footer_lines[-1]))
 

@@ -29,7 +29,7 @@ class RoundExtensionSpawn(unittest.TestCase):
         events = self.base / "jobs/b1632-sol/events"
         events.mkdir(parents=True)
         (events / "00001-job.claim.json").write_text(json.dumps({"job_id": "b1632-sol",
-            "kind": "job.claim", "payload": {"task_id": "1632"}}))
+            "kind": "job.claim", "payload": {"task_id": "1632", "parent_lane": "director-1"}}))
         self.prompt = self.base / "brief.md"
         self.prompt.write_text("inert fixture")
         self.stub("hk", '''import json, os, sys
@@ -40,8 +40,10 @@ if mode == "down": raise SystemExit(1)
 if sys.argv[1:3] == ["doc", "get"]:
     if mode == "missing": print("not_found"); raise SystemExit(1)
     if mode == "garbage": print("{}"); raise SystemExit(0)
-    print(json.dumps({"key": sys.argv[3], "body": "round extension record"}))
+    print(json.dumps({"key": sys.argv[3], "body": "round extension record",
+        "created_by": os.environ.get("DOC_ISSUER", "director-1")}))
 elif sys.argv[1:3] == ["tasks", "show"]:
+    if "TASK_REPLY" in os.environ: print(os.environ["TASK_REPLY"]); raise SystemExit(0)
     print(json.dumps({"state": "in_progress", "claimed_by": "fixture-builder",
         "refs": {"job_id": "other-task" if mode == "wrong-owner" else "b1632-sol"}}))
 else: raise SystemExit("unexpected hk mutation")
@@ -110,6 +112,7 @@ arbiter_admit() { exit 91; }
                     for args in paths:
                         self.assertEqual(args[args.index("--operator-request") + 1], ref)
                         self.assertEqual(args[args.index("--purpose") + 1], "round-extension")
+                        self.assertEqual(args[args.index("--role") + 1], role)
 
     def test_purpose_and_ref_require_each_other(self):
         self.assert_denied(ref=None)
@@ -129,6 +132,68 @@ arbiter_admit() { exit 91; }
                     "hk:doc/ParkingArcade/round-ext/b1632-sol", REF + "/child", REF + "\n"):
             with self.subTest(ref=ref):
                 self.assert_denied(ref=ref)
+
+    def test_narrowed_ref_grammar_refuses_before_quota(self):
+        for job in ("B1632-Sol", ".job", "_job", "-job", ".", "..", "j" * 128):
+            with self.subTest(job=job):
+                reason = self.assert_denied(ref="hk:doc/round-ext/" + job,
+                                           extra=("--parent-job", job))
+                self.assertIn("lowercase JOB", reason)
+
+    def test_task_json_must_be_unambiguous(self):
+        valid = {"state": "claimed", "claimed_by": "", "refs": {"job_id": "b1632-sol"}}
+        replies = [
+            {"state": "claimed", "claimed_by": "x\tb1632-sol", "refs": {}},
+            {"state": "x\ty\tb1632-sol", "claimed_by": "", "refs": {}},
+            {**valid, "state": "claimed\n"},
+            {**valid, "claimed_by": "x\x7f"},
+            {**valid, "refs": {"job_id": "b1632-sol", "other": {"value": "x\t"}}},
+            {"state": "claimed", "refs": valid["refs"]},
+            {"claimed_by": "", "refs": valid["refs"]},
+            {"state": "claimed", "claimed_by": ""},
+            {**valid, "refs": []},
+            {**valid, "refs": {}},
+        ]
+        for reply in replies:
+            with self.subTest(reply=reply):
+                self.assertIn("ownership denied", self.assert_denied(
+                    environment={"TASK_REPLY": json.dumps(reply)}))
+        for reply in ("not JSON", "[]", '{"state":"claimed","state":"open"}',
+                      json.dumps(valid)[:-1] + ',"other":NaN}'):
+            with self.subTest(raw=reply):
+                self.assert_denied(environment={"TASK_REPLY": reply})
+        process, _ = self.run_spawn(environment={"TASK_REPLY": json.dumps(valid)})
+        self.assertEqual(process.returncode, 91, process.stderr)
+
+    def test_document_server_issuer_is_required(self):
+        for issuer in ("mac-dev", "builder-sol", "", "pa-integrator"):
+            with self.subTest(issuer=issuer):
+                self.assertIn("issuer denied", self.assert_denied(environment={"DOC_ISSUER": issuer}))
+        for issuer in ("director-1", "operator", "operator-desk"):
+            with self.subTest(issuer=issuer):
+                process, _ = self.run_spawn(environment={"DOC_ISSUER": issuer})
+                self.assertEqual(process.returncode, 91, process.stderr)
+        claim = self.base / "jobs/b1632-sol/events/00001-job.claim.json"
+        claim.write_text(json.dumps({"kind": "job.claim", "payload": {
+            "task_id": "1632", "parent_lane": "pa-integrator"}}))
+        reply = {"state": "claimed", "claimed_by": "", "project": "ParkingArcade",
+                 "refs": {"job_id": "b1632-sol"}}
+        process, _ = self.run_spawn(environment={"DOC_ISSUER": "pa-integrator",
+                                                "TASK_REPLY": json.dumps(reply)})
+        self.assertEqual(process.returncode, 91, process.stderr)
+        reply["project"] = "other"
+        self.assert_denied(environment={"DOC_ISSUER": "pa-integrator", "TASK_REPLY": json.dumps(reply)})
+
+    def test_tester_reviewer_cannot_use_counsel_purposes_without_grant(self):
+        for model in ("codex-astra", "fable"):
+            for role in ("tester", "reviewer"):
+                for purpose in (None, "architect", "director", "operator-request"):
+                    with self.subTest(model=model, role=role, purpose=purpose):
+                        self.assert_denied(model=model, role=role, purpose=purpose, ref=None,
+                                           extra=("--operator-request", "hk:doc/ordinary/request"))
+            process, _ = self.run_spawn(model=model, role="counsel", purpose="architect", ref=None,
+                                       extra=("--operator-request", "hk:doc/ordinary/request"))
+            self.assertEqual(process.returncode, 91, process.stderr)
 
     def test_worker_and_builder_seats_never_unlock(self):
         for model in ("codex-astra", "fable", "builder-astra", "captain-astra"):
