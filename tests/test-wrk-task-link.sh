@@ -13,39 +13,18 @@ ARBITER="$ROOT/bin/arbiter"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d)"
+. "$ROOT/tests/lib/tmp-writers.sh"
+TW_TMP="$TMP"
 
 cleanup() {
-  local pidfile pid child snap stray i
-  while IFS= read -r pidfile; do
-    [[ -s "$pidfile" ]] || continue
-    read -r pid <"$pidfile" || continue
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    kill -STOP "$pid" 2>/dev/null || true
-    while IFS= read -r child; do kill "$child" 2>/dev/null || true; done \
-      < <(pgrep -P "$pid" 2>/dev/null || true)
-    kill "$pid" 2>/dev/null || true
-    kill -CONT "$pid" 2>/dev/null || true
-  done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
-  # kill alone does not suffice — a TERM'd writer can still be mid-append, and
-  # refresh_quota_pool's detached supervisor (`python3 - <scopefuel> …` ->
-  # setsid -> `scopefuel refresh --background`) has no pidfile at all. A dentry
-  # recreated while rm walks the tree makes rm -rf exit "Directory not empty"
-  # (CI runs 36283072131/36288704921). Every detached process this suite
-  # spawned inherits env pointing under $TMP (XDG_DATA_HOME/ARBITER_INBOX_ROOT/
-  # HK_STATE/fixture logs), so a full ps scan matches this run exactly; $$ and
-  # its live children are excluded so the sweep cannot hit itself or the
-  # caller (wrk heavy / CI bash).
-  for ((i = 0; i < 100; i++)); do
-    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
-    stray="$(awk -v self="$$" -v tmp="$TMP" \
-      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
-    [[ -n "$stray" ]] || break
-    while IFS= read -r pid; do
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      if ((i >= 50)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
-    done <<<"$stray"
-    sleep 0.1
-  done
+  # kill alone does not suffice — a TERM'd writer can still be mid-append,
+  # and refresh_quota_pool's detached supervisor plus its scopefuel child
+  # outlive their wrk. A dentry recreated while rm walks the tree makes
+  # rm -rf exit "Directory not empty" (CI runs 36283072131/36288704921).
+  # tests/lib/tmp-writers.sh reaps each one by an exact verified pid —
+  # completion-sentinel.pid / quota-refresh.pid / the WRK_REFRESH_PID_LOG
+  # registry / a descendant walk — never a process-table pattern match.
+  tmp_writers_stop
   rm -rf "$TMP"
 }
 trap cleanup EXIT

@@ -8,6 +8,8 @@ SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 HANDOFFKEEP="$ROOT/tests/fixtures/handoffkeep"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 TMP="$(mktemp -d)"
+. "$ROOT/tests/lib/tmp-writers.sh"
+TW_TMP="$TMP"
 SOURCE="$TMP/source"
 HOME_FIXTURE="$TMP/home"
 XDG_DATA="$TMP/xdg-data"
@@ -22,23 +24,10 @@ fail() {
 }
 
 cleanup() {
-  local pidfile pid child
   if [[ "${lock_holder_pid:-}" =~ ^[0-9]+$ ]]; then
-    kill "$lock_holder_pid" 2>/dev/null || true
+    tw_kill_tree "$lock_holder_pid" 2>/dev/null || true
   fi
-  while IFS= read -r -d '' pidfile; do
-    [[ -s "$pidfile" ]] || continue
-    read -r pid <"$pidfile" || continue
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    kill -STOP "$pid" 2>/dev/null || true
-    while IFS= read -r child; do
-      if [[ "$child" =~ ^[0-9]+$ ]]; then
-        kill "$child" 2>/dev/null || true
-      fi
-    done < <(pgrep -P "$pid" 2>/dev/null || true)
-    kill "$pid" 2>/dev/null || true
-    kill -CONT "$pid" 2>/dev/null || true
-  done < <(find "$TMP" -name completion-sentinel.pid -type f -print0 2>/dev/null)
+  tmp_writers_stop
   chmod 700 "$TMP/codex-readonly" 2>/dev/null || true
   rm -rf "$TMP"
 }

@@ -15,25 +15,15 @@ ARBITER="$ROOT/bin/arbiter"
 HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 TMP="$(mktemp -d)"
+. "$ROOT/tests/lib/tmp-writers.sh"
+TW_TMP="$TMP"
 JOB_SEQ=0
 LAST_GATE=""
 mkdir -p "$TMP/gate-cache"
 
 cleanup() {
-  local pidfile pid child
   if [[ -n "${TMP:-}" && -d "${TMP:-}" ]]; then
-    while IFS= read -r pidfile; do
-      [[ -s "$pidfile" ]] || continue
-      read -r pid <"$pidfile" || continue
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      kill -STOP "$pid" 2>/dev/null || true
-      while IFS= read -r child; do
-        [[ "$child" =~ ^[0-9]+$ ]] || continue
-        kill "$child" 2>/dev/null || true
-      done < <(pgrep -P "$pid" 2>/dev/null || true)
-      kill "$pid" 2>/dev/null || true
-      kill -CONT "$pid" 2>/dev/null || true
-    done < <(find "$TMP" -name 'completion-sentinel.pid' -print 2>/dev/null || true)
+    tmp_writers_stop
     rm -rf "$TMP"
   fi
 }
@@ -102,6 +92,7 @@ spawn_one() {
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-devin-idle}" \
     WRK_FIXTURE_LOG="${TEST_HERDR_LOG:-$TMP/herdr.log}" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh.pids" \
     "$wrk_bin" spawn \
     -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture \
     --task "$task" "$@"
