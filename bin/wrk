@@ -8747,6 +8747,23 @@ hk_cmd() {
   run_bounded "$HK_CMD_TIMEOUT" "$bin" "$@"
 }
 
+# Ordinary implicit counsel shapes predate explicit worker-seat restrictions.
+# Round-extension spawns still require the caller to choose an explicit role.
+normalize_implicit_counsel_role() {
+  [[ "${ROLE_EXPLICIT:-1}" == 0 && "$ROLE" == worker && -z "$ROUND_EXT_REF" ]] || return 0
+  [[ "$MODEL" == codex-astra || "$MODEL" == fable ]] || return 0
+  local normalized
+  normalized="$(printf '%s' "$PURPOSE" | python3 -c 'import sys; print(sys.stdin.read().strip().casefold())')"
+  [[ "$normalized" != round-extension ]] || return 0
+  case "$MODEL" in
+    codex-astra)
+      case "$normalized" in ""|architect|director|operator-request) ROLE=counsel ;; esac ;;
+    fable)
+      [[ -z "$OPERATOR_REQUEST" ]] || ROLE=counsel ;;
+  esac
+  return 0
+}
+
 # hk 1632: fail closed before catalog/gate calls. Exact parent-job ownership
 # is deliberately narrower than accepting any label attached to the same task.
 round_ext_validate() {
@@ -9301,7 +9318,7 @@ refuse_known_terra_spelling() {
 
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
   OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
@@ -9320,7 +9337,7 @@ spawn_cmd() {
           -c) CWD="$2" ;; -m|--profile) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
           --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
-          --role) ROLE="$2" ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
+          --role) ROLE="$2"; ROLE_EXPLICIT=1 ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
           --report) REPORT_PATH="$2" ;;
           --operator-request) OPERATOR_REQUEST="$2" ;; --requested-by) REQUESTED_BY="$2" ;;
           --round-ext) ROUND_EXT_REF="$2" ;;
@@ -9363,6 +9380,7 @@ spawn_cmd() {
 
   [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
 
+  normalize_implicit_counsel_role
   case "$ROLE" in
     worker|builder|tester|reviewer|counsel) ;;
     captain)

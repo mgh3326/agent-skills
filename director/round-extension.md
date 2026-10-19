@@ -29,7 +29,11 @@ Task bypass is unavailable for this path. Worker roles are refused;
 codex-astra is pinned to xhigh and other efforts are refused. Quota still applies.
 Astra/fable tester and reviewer seats require this grant for every purpose.
 wrk forwards --role to both scopefuel gate and policy launch; ordinary counsel
-seats keep their existing purpose rules.
+seats keep their existing purpose rules. Without an explicit --role, eligible
+astra architect/director/operator-request calls and operator-requested fable
+calls normalize to counsel before role validation and catalog/gate transport.
+This normalization never applies with --purpose round-extension or --round-ext:
+those spawns still require an explicit role. Explicit worker remains refused.
 
 The additional standing grant of 2026-10-19 (hk 1672, hk:doc
 owner/fleet/decision/2026-10-19/round-ext-builder-astra-fable) also permits a
@@ -77,3 +81,16 @@ and builder roles on T1/T2/T3 from a correctly shaped ref. Both resolve to grade
 S+; wrk verifies document existence, issuer and current task ownership. Builder
 contributors require this evidence too. Apply the usual T1–T3 family separation:
 astra builders need a non-OpenAI tester and fable builders a non-Anthropic tester.
+This builder-only restriction does not remove the existing T1/T2 same-family
+exception for counsel/prescription contributors.
+
+Delivery order is agent-skills FIRST, then scopefuel, under director-1's
+hk:doc rulings/b1672-sol/r1 (including the accepted gate-owner addendum).
+The measured old/new matrix uses real archived hk 1632 scopefuel and current CLI:
+new wrk with old scopefuel preserves implicit counsel and tester seats for both
+models while refusing the new builders before gate/pane for missing hk1672/v1
+evidence. Existing tester seats also pass with old wrk/new scopefuel; implicit
+counsel fails in that reverse window. Old/old and new/new controls were measured.
+This satisfies the ruling's condition for changing delivery order; PR creation
+order remains scopefuel #154 then agent-skills #209. It grants no installation
+or merge authority.

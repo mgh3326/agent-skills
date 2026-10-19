@@ -178,22 +178,21 @@ grep -qF -- "--effort high" <<<"$opus_argv" ||
 echo "PASS opus alias argv unchanged (--model opus, default --effort high) — scopefuel side maps this to $CONTRACT_OPUS_MODEL_ID"
 
 # --- Fable: consult-only, and the launcher enforces it ----------------------
-# Before #593 a bare `wrk -m fable` reached the launcher and only the quota gate
-# stood between it and a spawn. The catalog now answers consult_only (rc 3) and
-# the launcher refuses on that answer, so the bare form must not start anything.
+# A bare `wrk -m fable` must not reach the launcher. Without an operator
+# request its implicit role stays worker and is refused before catalog/gate;
+# no catalog or launcher fallback may turn the bare form into a spawn.
 # spawn_argv() ends in `cat`, so its status cannot carry wrk's — invoke wrk directly.
 if env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
   WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
   WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S=5 \
   "$WRK" spawn -c "$ROOT" -m fable -p "$PROMPT" -w w -l fixture --t T1 >/dev/null 2>&1; then
-  fail "bare 'wrk -m fable' must be refused — the catalog answers consult_only"
+  fail "bare 'wrk -m fable' must be refused without an operator request"
 fi
-echo "PASS bare fable launch is refused (consult_only)"
+echo "PASS bare fable launch is refused without an operator request"
 
 # With the operator request it launches, on the literal 5.1 model ID.
 assert_argv_has fable "--model $CONTRACT_FABLE_MODEL_ID " \
-  --role counsel \
   --operator-request hk:doc/decision/2026-09-23/task593-dispatch-ac4-absorbed \
   --requested-by operator
 echo "PASS operator-requested fable launch runs $CONTRACT_FABLE_MODEL_ID"

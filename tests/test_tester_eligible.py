@@ -197,6 +197,33 @@ class EligibilityFixtures(unittest.TestCase):
                         evidence.pop("round_ext_ref")
                         self.assert_case(self.check(evidence), "contributors", "UNVERIFIED", "PROFILE_ROLE_DENIED")
 
+    def test_counsel_prescription_keeps_same_family_exception(self) -> None:
+        head = self.make_head()
+        for alias, model, effort, tester in (
+            ("codex-astra", "gpt-6-astra", "xhigh", "codex-sol"),
+            ("fable", "claude-fable-5-1", "", "opus"),
+        ):
+            for tier in ("T1", "T2"):
+                for ref in (None, "hk:doc/round-ext/job"):
+                    with self.subTest(alias=alias, tier=tier, ref=ref):
+                        evidence = self.evidence(head, declared_t=tier, required_grade="A", implementation_grade="A",
+                            contributors=[
+                                {"profile": "builder-opus", "model": "claude-opus-5-5", "effort": "xhigh",
+                                 "role": "builder", "kind": "initial", "session": "builder-session", "worktree": "/tmp/builder"},
+                                {"profile": alias, "model": model, "effort": effort, "role": "counsel",
+                                 "kind": "prescription", "session": "advisor-session", "worktree": "/tmp/advisor"}],
+                            tester={"planned_profile": tester, "planned_effort": "high",
+                                    "session": "tester-session", "worktree": "/tmp/tester"},
+                            same_family={"reversible": True, "excluded_surface": False, "qualification_ref": "hk:doc/q",
+                                "directed_brief_ref": "hk:doc/brief", "independent_counterexample_ref": "hk:doc/ce",
+                                "ci_run_id": 1, "ci_attempt": 1, "ci_status": "success",
+                                "report_phrase": "동일 계열 독립 세션 검증"})
+                        if ref is not None:
+                            evidence["round_ext_ref"] = ref
+                        checks = self.check(evidence)
+                        self.assert_case(checks, "contributors", "PASS", "CONTRIBUTOR_UNION_RESOLVED")
+                        self.assert_case(checks, "independence", "PASS", "SAME_FAMILY_EXCEPTION_PROVEN")
+
     def test_round_extension_ref_bound_in_previous_receipt(self) -> None:
         evidence = self.evidence(self.make_head())
         path = self.previous(evidence, "pre-spawn")

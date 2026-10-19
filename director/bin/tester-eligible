@@ -1401,7 +1401,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
             if check["status"] != "PASS":
                 failures.append(check["reason_code"])
             else:
-                contributor_profiles.append(resolved)
+                contributor_profiles.append({**resolved, "role": item.get("role", "builder")})
         checks["contributors"] = (result("UNVERIFIED", failures[0], "spawn-worker:2-4") if failures else
                                   result("PASS", "CONTRIBUTOR_UNION_RESOLVED", "spawn-worker:2-4",
                                          families=sorted({p["family"] for p in contributor_profiles})))
@@ -1463,7 +1463,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
         checks["independence"] = result("FAIL", "DS41_T3_SOLE_TESTER", "spawn-worker:2-4+task:726")
     elif tester_profile["family"] not in families:
         checks["independence"] = result("PASS", "CROSS_FAMILY", "spawn-worker:2-4", families=sorted(families))
-    elif any(p["alias"] in {"codex-astra", "fable"} and p["family"] == tester_profile["family"]
+    elif any(p["role"] == "builder" and p["alias"] in {"codex-astra", "fable"} and p["family"] == tester_profile["family"]
              for p in contributor_profiles):
         checks["independence"] = result("FAIL", "ROUND_EXTENSION_BUILDER_SAME_FAMILY", "task:1672")
     elif _off_ladder(tester_profile):

@@ -38,7 +38,7 @@ class RoundExtensionSpawn(unittest.TestCase):
 from pathlib import Path
 with Path(os.environ["CALL_LOG"]).open("a") as f: f.write(json.dumps(sys.argv[1:]) + "\\n")
 mode = os.environ.get("HK_MODE", "ok")
-if (Path(os.environ["CALL_LOG"]).parent / "reclaimed").exists(): mode = "wrong-owner"
+if (Path(os.environ["CALL_LOG"]).parent / "reclaimed").exists() and os.environ.get("AUTH_CHANGE") != "issuer": mode = "wrong-owner"
 if mode == "down": raise SystemExit(1)
 if sys.argv[1:3] == ["doc", "get"]:
     if "DOC_REPLY" in os.environ: print(os.environ["DOC_REPLY"]); raise SystemExit(0)
@@ -91,7 +91,9 @@ else: raise SystemExit("unexpected scopefuel command")
                   purpose="round-extension", extra=(), environment=None, router=False, launch=False):
         self.log.unlink(missing_ok=True)
         args = ["-c", str(self.base), "-m", model, "-p", str(self.prompt), "-w", "fixture",
-                "-l", "fixture-tester", "--t", "T3", "--role", role]
+                "-l", "fixture-tester", "--t", "T3"]
+        if role is not None:
+            args += ["--role", role]
         if role == "builder":
             args += ["--task", "1632", "--job", "b1632-sol", "--lane", "fixture-builder", "--parent", "director-1"]
         else:
@@ -170,6 +172,62 @@ mock_mcp_verify() { :; }
                         self.assertEqual(args[args.index("--operator-request") + 1], ref)
                         self.assertEqual(args[args.index("--purpose") + 1], "round-extension")
                         self.assertEqual(args[args.index("--role") + 1], role)
+
+    def test_implicit_counsel_normalized_before_catalog_and_gate(self):
+        request = ("--operator-request", "hk:doc/ordinary/request", "--requested-by", "operator")
+        for model, purpose, extra in (
+            ("codex-astra", None, ()),
+            ("codex-astra", "architect", ()),
+            ("codex-astra", "director", ()),
+            ("codex-astra", "operator-request", request),
+            ("fable", None, request),
+        ):
+            for router in (False, True):
+                with self.subTest(model=model, purpose=purpose, router=router):
+                    process, calls = self.run_spawn(model=model, role=None, ref=None,
+                        purpose=purpose, extra=extra, router=router)
+                    self.assertEqual(process.returncode, 91, process.stderr)
+                    paths = [c for c in calls if c[:2] in (["policy", "launch"], ["gate", "-m"])]
+                    self.assertEqual(len(paths), 2, calls)
+                    for args in paths:
+                        self.assertEqual(args[args.index("--role") + 1], "counsel")
+
+    def test_implicit_round_extension_requires_explicit_role(self):
+        for model in ("codex-astra", "fable"):
+            for purpose, ref in (("round-extension", None), (None, REF), ("round-extension", REF),
+                                 (" Round-Extension ", None)):
+                for extra in ((), ("--operator-request", REF, "--requested-by", "operator")):
+                    with self.subTest(model=model, purpose=purpose, ref=ref, extra=extra):
+                        self.assert_denied(model=model, role=None, purpose=purpose, ref=ref, extra=extra)
+
+    def test_implicit_role_does_not_grant_other_astra_purposes(self):
+        for purpose in ("builder", "worker"):
+            self.assert_denied(model="codex-astra", role=None, ref=None, purpose=purpose)
+        for purpose in (None, "architect"):
+            for extra in ((), ("--requested-by", "operator")):
+                reason = self.assert_denied(model="fable", role=None, ref=None, purpose=purpose, extra=extra)
+                self.assertIn("astra/fable worker role forbidden", reason)
+
+        # Actual committed gate fixture: explicit counsel retains the original
+        # orphan-requester and disallowed-purpose errors, with no pane creation.
+        for model, purpose, extra, rc, reason in (
+            ("fable", None, ("--requested-by", "operator"), 3, "requested_by_requires_operator_request"),
+            ("codex-astra", "worker", (), 77, "role_restricted"),
+        ):
+            process, calls = self.run_spawn(model=model, role="counsel", ref=None,
+                purpose=purpose, extra=extra, launch=True,
+                environment={"SCOPEFUEL_BIN": str(ROOT / "tests/fixtures/scopefuel")})
+            self.assertEqual(process.returncode, rc, process.stderr)
+            self.assertIn(reason, process.stderr)
+            self.assertFalse(any(c[:1] == ["herdr"] for c in calls), calls)
+
+    def test_ordinary_implicit_worker_and_explicit_counsel_keep_roles(self):
+        for model, explicit_role in (("codex-sol", "worker"), ("codex-astra", "counsel")):
+            implicit, calls = self.run_spawn(model=model, role=None, ref=None, purpose=None)
+            explicit, other_calls = self.run_spawn(model=model, role=explicit_role, ref=None, purpose=None)
+            self.assertEqual(implicit.returncode, 91, implicit.stderr)
+            self.assertEqual((implicit.returncode, implicit.stdout, implicit.stderr, calls),
+                             (explicit.returncode, explicit.stdout, explicit.stderr, other_calls))
 
     def test_purpose_and_ref_require_each_other(self):
         self.assert_denied(ref=None)
@@ -400,6 +458,8 @@ mock_mcp_verify() { :; }
                         self.assertFalse(any(c[:3] == ["herdr", "agent", "start"] for c in calls), calls)
                         self.assertNotIn(["brief"], calls)
                         self.assertEqual(process.returncode, 2, process.stderr)
+                        if authority == "issuer":
+                            self.assertIn("issuer denied", process.stderr)
                         self.assertIn(["herdr", "pane", "close", "fixture-pane"], calls)
 
     def test_reclaim_during_boot_closes_started_pane_before_brief(self):
@@ -411,6 +471,8 @@ mock_mcp_verify() { :; }
                         environment={"RECLAIM_AT": "boot", "AUTH_CHANGE": authority})
                     self.assertNotIn(["brief"], calls)
                     self.assertEqual(process.returncode, 2, process.stderr)
+                    if authority == "issuer":
+                        self.assertIn("issuer denied", process.stderr)
                     self.assertTrue(any(c[:3] == ["herdr", "agent", "start"] for c in calls))
                     self.assertIn(["herdr", "pane", "close", "fixture-pane"], calls)
 

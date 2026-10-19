@@ -148,7 +148,7 @@ claude_profiles_on() {
     tab_has_setting "$model" "$log" || return
   done
   # fable is consult_only: an operator-requested consult.
-  log="$(spawn_log "$wrk" fable --role counsel --operator-request hk:doc/decision/2026-09-21/astra-allowed-purposes-approved \
+  log="$(spawn_log "$wrk" fable --operator-request hk:doc/decision/2026-09-21/astra-allowed-purposes-approved \
     --requested-by operator)" || return
   tab_has_setting "fable (operator-requested consult)" "$log" || return
   # builder lane (builder-opus and its legacy alias).
