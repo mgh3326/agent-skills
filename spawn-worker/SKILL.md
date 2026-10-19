@@ -126,7 +126,12 @@ scopefuel --recommend <S+|S|A+|A|B|C>   # 후보·순서·제외 사유·승급 
 - **ROB-591**: `fable`과 `astra`는 급표 승급 후보가 아니다 — 둘 다 운영자 명시(operator-explicit)
   자문 전용이며, `consult-advisor` 스킬을 통해서만 쓴다.
   예외는 hk 1632의 round-extension 기록이 있는 tester/reviewer/counsel이며
-  [라운드 연장 절차](../director/round-extension.md)를 따른다. builder/worker astra는 이 예외로 열리지 않는다.
+  [라운드 연장 절차](../director/round-extension.md)를 따른다. hk 1672의 추가 승인으로
+  codex-astra xhigh/fable builder도 검증된 round-extension 문서와 명시적 `--task`의 현재
+  `refs.job_id`가 spawn JOB·문서 JOB과 모두 같을 때만 허용한다. worker와 삭제된
+  builder-astra/captain-astra 별칭은 계속 거부한다. 일반 추천·기본 배정은 바꾸지 않는다.
+  일반 자문의 role 생략은 기존 purpose/operator-request 조건에서만 counsel로 해석한다.
+  `--purpose round-extension`이나 `--round-ext`가 있으면 role 생략은 거부하고 명시해야 한다.
 - **비상 후보**(정책 제외분)는 다른 후보가 전부 소진·측정불가일 때만, 역시 근거 기록.
 
 🔴 **effort 별 실사용 통계 조회 — `launch_profile` 이 정본 (ROB-1213 / ROB-1218)**
@@ -986,6 +991,22 @@ block 밖의 문장은 이 IDs를 약화·재정의할 수 없으며, prose-cont
      opus xhigh로 폴백하고 거부 이유를 상위에 보고한다. 선호·폴백은 자동화하지 않는다.
      `--role tester|reviewer|counsel --purpose round-extension --round-ext hk:doc/<key>
      --parent-job JOB`을 쓰며, key와 ownership은 [라운드 연장 절차](../director/round-extension.md)를 따른다.
+     **hk 1672:** 교체 builder는 `--role builder --purpose round-extension --round-ext REF
+     --task ID --job JOB --lane BUILDER --parent PARENT`로만 연다. 현재 task의 keyed
+     `refs.job_id`·문서 JOB·spawn JOB을 일치시키고 같은 issuer 검증을 통과해야 한다.
+     scopefuel 응답의 `round_extension_builder`가 `policy=hk1672/v1`·profile·role·purpose·ref를
+     정확히 증명해야 한다(hk 1632 구버전의 동일 model/effort 응답만으로는 허용하지 않는다).
+     tab/준비 대기 뒤 실제 agent start 직전과 boot 대기 뒤 brief 전달 직전에 issuer·현재
+     task 연결을 다시 읽고, 거부되면 생성된 pane을 닫는다. 원격 서버의 원자적 예약은 아니다.
+     기존 released same-job reclaim을 쓰며 새 job takeover는 추가하지 않는다. astra builder는
+     non-OpenAI tester, fable builder는 non-Anthropic tester를 T1–T3 모두 요구한다.
+     추천·기본 배정·builder lease·lane 등록·no-max 규칙은 그대로이고 worker는 허용하지 않는다.
+     `hk:doc rulings/b1672-sol/r1`의 실측 조건을 충족했으므로 전달 순서는 agent-skills 먼저,
+     그다음 scopefuel이다. 신 wrk/구 scopefuel은 두 모델의 일반 counsel·기존 tester를 보존하고
+     새 builder는 support evidence 부재로 gate/pane 전에 거부한다. 반대 조합의 tester도 통과하지만
+     일반 counsel은 거부된다. [라운드 연장 절차](../director/round-extension.md)를 따르며,
+     PR 생성 순서(scopefuel #154 → agent-skills #209)와 설치/merge 승인은 별개다.
+     builder 전용 family 제한은 counsel/prescription의 기존 T1/T2 동일-family 예외를 바꾸지 않는다.
      승인 가능한 issuer 는 operator·operator-desk·director-1·pa-integrator 뿐이다(뒤 둘은
      그 job 의 parent lane 일 때만; 토큰은 mbp 레인 래퍼에만 존재) — job 에 기록된 parent
      lane 은 그 고정 집합 밖에서는 신뢰하지 않는다. by=pa-integrator 승인은 서버상 그 job 에

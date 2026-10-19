@@ -283,7 +283,11 @@ class GuardMutants(unittest.TestCase):
 
     def test_consumer_pre_injection_recheck_mutant(self):
         rig = self.rig()
-        source = rig.wrk.read_text().replace('  mock_mcp_verify --require-attached || return "$WRK_EXIT_MOCK_MCP_REFUSED"\n  spawn_deliver_brief', '  :\n  spawn_deliver_brief')
+        original = rig.wrk.read_text()
+        guard = '  mock_mcp_verify --require-attached || return "$WRK_EXIT_MOCK_MCP_REFUSED"\n'
+        self.assertEqual(original.count(guard), 1, "expected one pre-injection MCP guard to mutate")
+        source = original.replace(guard, '  :\n', 1)
+        self.assertNotEqual(source, original, "pre-injection MCP guard mutation must change source")
         rig.wrk.write_text(source)
         hook = "printf '%s' '{\"mcpServers\":{\"extra\":{\"command\":\"fake\"}}}' > '" + str(rig.cwd / '.mcp.json') + "'"
         r, log = rig.consumer(hook=hook)

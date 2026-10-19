@@ -1,0 +1,46 @@
+{
+  "base": "ee6183cc5c30d33dfabe28df6386edd148192543",
+  "request": {
+    "role": "builder",
+    "purpose": "round-extension",
+    "operator_request": "hk:doc/round-ext/b1632-sol"
+  },
+  "responses": {
+    "codex-astra": {
+      "profile": "codex-astra",
+      "model_id": "gpt-6-astra",
+      "effort": "xhigh",
+      "pool": "codex",
+      "gate": "consult_only",
+      "grade": "S+",
+      "gate_reason": "astra \ub294 director \ud310\uc815\u00b7architect \uc790\ubb38\u00b7\uc6b4\uc601\uc790 \uc694\uccad \uc870\uc5b8\uc5d0 \ud55c\uc815 (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)",
+      "operator_request": true,
+      "e6_arm": null,
+      "billing": "unknown",
+      "family": "codex",
+      "catalog": {
+        "source": "snapshot",
+        "stale": false,
+        "age_s": null
+      }
+    },
+    "fable": {
+      "profile": "fable",
+      "model_id": "claude-fable-5-1",
+      "effort": "",
+      "pool": "claude",
+      "gate": "consult_only",
+      "grade": "S+",
+      "gate_reason": "Opus \ub300\ube44 2\ubc30 \uac00\uaca9 \u2014 \uc6b4\uc601\uc790 \uba85\uc2dc \uc694\uccad(consult-only)\uc77c \ub54c\ub9cc. hk:doc note/2026-09-23/model-refresh-opus55-gpt6-grok47",
+      "operator_request": true,
+      "e6_arm": null,
+      "billing": "unknown",
+      "family": "claude",
+      "catalog": {
+        "source": "snapshot",
+        "stale": false,
+        "age_s": null
+      }
+    }
+  }
+}

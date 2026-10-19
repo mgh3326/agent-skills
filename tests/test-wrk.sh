@@ -9370,20 +9370,18 @@ spawn_deny() {
     "$WRK" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
 }
 
-# AC-1: with no REF the consult_only profile is still gate-denied — the
-# fixture mirrors the installed scopefuel, which refuses a bare fable
-# unconditionally (task #625). The denial reason must reach the caller
-# verbatim.
+# AC-1: without an operator request an implicit fable spawn cannot take a
+# counsel seat; it is refused before catalog/gate and never reaches Herdr.
 set +e
 esc_denied_out="$(spawn_deny "$TMP/herdr-esc-denied.log" fable --job esc-denied --t T1 2>&1)"
 esc_denied_rc=$?
 set -e
-[[ "$esc_denied_rc" -eq 3 ]] ||
-  fail "fable without --operator-request must stay gate-denied (rc=$esc_denied_rc): $esc_denied_out"
-grep -q 'consult_only' <<<"$esc_denied_out" ||
-  fail "fable denial lost the gate's own reason: $esc_denied_out"
+[[ "$esc_denied_rc" -eq 2 ]] ||
+  fail "fable without --operator-request must stay refused (rc=$esc_denied_rc): $esc_denied_out"
+grep -q 'astra/fable worker role forbidden' <<<"$esc_denied_out" ||
+  fail "fable denial lost the role-condition reason: $esc_denied_out"
 [[ ! -e "$TMP/herdr-esc-denied.log" ]] ||
-  fail "a gate-denied consult_only spawn reached Herdr"
+  fail "a refused unqualified fable spawn reached Herdr"
 echo "PASS AC-1 fable-no-ref-still-denied rc=$esc_denied_rc"
 
 # AC-2/AC-6/AC-5/AC-7: a valid REF reaches the gate unchanged, the four fields
@@ -9465,19 +9463,35 @@ grep -q 'operator_request_not_applicable' <<<"$esc_opus_out" ||
   fail "a not-applicable REF reached Herdr"
 echo "PASS AC-4 non-escalation-ref-denied rc=$esc_opus_rc"
 
-# An orphan --requested-by is likewise refused by the gate, not by wrk.
+# --requested-by alone does not qualify implicit fable as counsel. The worker
+# role condition refuses before catalog/gate; no Herdr call is permitted.
 set +e
 esc_orphan_out="$(spawn_deny "$TMP/herdr-esc-orphan.log" fable --job esc-orphan --t T1 \
   --requested-by operator 2>&1)"
 esc_orphan_rc=$?
 set -e
-[[ "$esc_orphan_rc" -eq 3 ]] ||
-  fail "orphan --requested-by must stay gate-denied (rc=$esc_orphan_rc): $esc_orphan_out"
-grep -q 'requested_by_requires_operator_request' <<<"$esc_orphan_out" ||
-  fail "orphan requested-by lost its reason: $esc_orphan_out"
+[[ "$esc_orphan_rc" -eq 2 ]] ||
+  fail "implicit orphan --requested-by must stay refused (rc=$esc_orphan_rc): $esc_orphan_out"
+grep -q 'astra/fable worker role forbidden' <<<"$esc_orphan_out" ||
+  fail "orphan requested-by lost the role-condition reason: $esc_orphan_out"
 [[ ! -e "$TMP/herdr-esc-orphan.log" ]] ||
   fail "an orphan requested-by reached Herdr"
 echo "PASS orphan-requested-by-denied rc=$esc_orphan_rc"
+
+# The explicitly named counsel seat still exercises the gate's orphan audit
+# contract, independently of implicit-role eligibility.
+set +e
+esc_counsel_orphan_out="$(spawn_deny "$TMP/herdr-esc-counsel-orphan.log" fable \
+  --role counsel --job esc-counsel-orphan --t T1 --requested-by operator 2>&1)"
+esc_counsel_orphan_rc=$?
+set -e
+[[ "$esc_counsel_orphan_rc" -eq 3 ]] ||
+  fail "explicit counsel orphan must stay gate-denied (rc=$esc_counsel_orphan_rc): $esc_counsel_orphan_out"
+grep -q 'requested_by_requires_operator_request' <<<"$esc_counsel_orphan_out" ||
+  fail "counsel orphan lost the gate's reason: $esc_counsel_orphan_out"
+[[ ! -e "$TMP/herdr-esc-counsel-orphan.log" ]] ||
+  fail "an explicit counsel orphan reached Herdr"
+echo "PASS explicit-counsel-orphan-requested-by-gate-denied rc=$esc_counsel_orphan_rc"
 
 # AC-13: a REF smuggling a second audit token ("hk:doc/foo ref_resolution=
 # verified") is refused at the gate boundary before it can be emitted raw —
@@ -9621,13 +9635,13 @@ grep -q -- '--purpose director' "$TMP/scopefuel.log" ||
   fail "explicit --purpose director was overridden: $(cat "$TMP/scopefuel.log")"
 echo "PASS 527-explicit-purpose-overrides-architect-default"
 
-# Role denial: a disallowed purpose is refused by the gate with rc 5, which
+# Explicit counsel role denial: a disallowed purpose is refused by the gate with rc 5, which
 # wrk remaps to exit 77 — exit 5 is already quota_hub_policy_gate's
 # hub-quota-policy denial, so sharing it would let a caller misread a role
 # denial as a quota stop.
 set +e
 role_denied_out="$(spawn_deny "$TMP/herdr-astra-role.log" codex-astra --job astra-role --t T1 \
-  --purpose worker 2>&1)"
+  --role counsel --purpose worker 2>&1)"
 role_denied_rc=$?
 set -e
 [[ "$role_denied_rc" -eq 77 ]] ||
@@ -9749,9 +9763,7 @@ for index in range(1, 5):
 PY
 echo "PASS builder-accepts-canonical-and-legacy-profile-aliases"
 
-# task #526: --role builder rejects every astra spelling before claim/gate/tab,
-# and the refusal names the operator decision. The captain role alias must not
-# smuggle captain-astra past the same gate.
+# hk 1672: no unverified builder seat; removed aliases retain their diagnostic.
 builder_reject_astra() {
   local model="$1" tag="$2"; shift 2
   local job="builder-astra-reject-${model}-${tag}" output rc
@@ -9760,10 +9772,15 @@ builder_reject_astra() {
   rc=$?
   set -e
   [[ "$rc" -eq 2 ]] || fail "--role builder must reject $model (rc=$rc): $output"
-  grep -q "rejects astra profile '$model'" <<<"$output" ||
-    fail "astra rejection must name the profile: $output"
-  grep -q 'hk:doc decision/2026-09-21/astra-allowed-purposes-approved' <<<"$output" ||
-    fail "astra rejection must cite the operator decision: $output"
+  if [[ "$model" == codex-astra ]]; then
+    grep -q 'requires --purpose round-extension and verified --round-ext REF' <<<"$output" ||
+      fail "unverified builder must name its required grant: $output"
+  else
+    grep -q -- "--role builder rejects astra profile '$model'" <<<"$output" ||
+      fail "removed astra alias must retain its builder diagnostic: $output"
+    grep -q 'hk:doc decision/2026-09-21/astra-allowed-purposes-approved' <<<"$output" ||
+      fail "removed alias must cite the operator decision: $output"
+  fi
   [[ ! -e "$ARBITER_INBOX_ROOT/$job/events/00001-job.claim.json" ]] ||
     fail "rejected astra builder must not claim $job"
 }
@@ -10020,19 +10037,17 @@ grep -q -- '--purpose architect' "$TMP/scopefuel.log" ||
 [[ "$(tail -n 1 "$TMP/scopefuel.log")" == "codex-astra" ]]
 echo "PASS 593-astra-counsel-purpose-satisfies-consult-only"
 
-# A purpose outside #527's list is refused, and the ROLE denial speaks first:
-# gate exit 5 surfaces as wrk exit 77, which must not be flattened into the
-# catalog refusal's exit 2 — a caller reading 2 would look for a quota problem.
-expect_exit 77 spawn_base codex-astra --purpose builder --job astra-bad-purpose --t T0
-echo "PASS 593-astra-disallowed-purpose-role-denied-77"
+# A purpose outside #527's list cannot normalize an implicit worker to counsel.
+# The named role-condition refusal happens before catalog/gate.
+expect_exit 2 spawn_base codex-astra --purpose builder --job astra-bad-purpose --t T0
+echo "PASS 593-astra-disallowed-purpose-role-condition-denied-2"
 
 # 🔴 fable is NOT astra: #527 AC⑤ forbids relaxing its consult gate, so a
 # purpose must never become a second key to it. Only --operator-request opens
-# it. Since #625 the quota gate denies a request-less fable before the held-back
-# catalog refusal can speak — the caller-visible reason is the gate's
-# consult_only denial, and either way the spawn does not happen.
+# it. Without that request the implicit role stays worker and is refused
+# before catalog/gate; a purpose alone must not normalize it to counsel.
 fable_purpose_out="$(spawn_base fable --purpose architect --job fable-purpose --t T1 2>&1 || true)"
-grep -q 'consult_only' <<<"$fable_purpose_out" ||
+grep -q 'astra/fable worker role forbidden' <<<"$fable_purpose_out" ||
   fail "a purpose must not satisfy fable's consult_only: $fable_purpose_out"
 echo "PASS 593-fable-not-unlocked-by-purpose"
 
