@@ -41,6 +41,17 @@ BANNER = re.compile(r"^[ \t]*\u25b2[ \t]+Something went wrong[ \t]*$", re.IGNORE
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 ABSOLUTE = re.compile(r"\bat\s+(\d(?:\s*\d)?)\s*:\s*(\d(?:\s*\d)?)\s+UTC\b", re.IGNORECASE)
 RELATIVE = re.compile(r"\breset\s+in\s+(\d+)\s+minutes?\b", re.IGNORECASE)
+# Devin free-window notices seen in the field advertise a reset within about
+# an hour of the notice, so a stated UTC reset already this far behind the
+# observation cannot be the window that notice meant: the window simply
+# ended before the pane was read (slept host, late sentinel, notice printed
+# with under a minute left) and no hold should be recorded. A stated reset
+# further back than GRACE must instead belong to the next day. Six hours is
+# far above the ~1h notice horizon and well under the 24h rollover cap.
+GRACE = dt.timedelta(hours=6)
+# Relative and absolute spellings of the same reset are allowed to differ by
+# rounding; beyond this they disagree and the earlier reset wins.
+DISAGREE = dt.timedelta(minutes=5)
 
 
 def aware_utc(value: str) -> dt.datetime:
@@ -81,33 +92,66 @@ def parse_rate_limit(transcript: str, observed: dt.datetime) -> dict[str, object
     details = notice[match.end() : match.end() + 320]
 
     absolute = ABSOLUTE.search(details)
+    absolute_reset: dt.datetime | None = None
+    absolute_expired = False
+    absolute_signature = ""
     if absolute:
         hour, minute = (int(re.sub(r"\s+", "", part)) for part in absolute.groups())
         if hour < 24 and minute < 60:
-            reset = observed.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if reset <= observed:
-                reset += dt.timedelta(days=1)
+            stated = observed.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if stated > observed:
+                absolute_reset = stated
+            elif observed - stated <= GRACE:
+                # The stated window already ended; the notice was read late.
+                absolute_reset = stated
+                absolute_expired = True
+            else:
+                absolute_reset = stated + dt.timedelta(days=1)
             # A wall-clock reset is at most one day away after the rollover.
-            reset = min(reset, observed + dt.timedelta(hours=24))
-            signature = hashlib.sha256(f"free-limit|utc|{hour:02d}:{minute:02d}".encode()).hexdigest()
-            return {
-                "signature": signature,
-                "reset": iso_utc(reset),
-                "observed": iso_utc(observed),
-                "unparsed": False,
-            }
+            absolute_reset = min(absolute_reset, observed + dt.timedelta(hours=24))
+            absolute_signature = hashlib.sha256(
+                f"free-limit|utc|{hour:02d}:{minute:02d}".encode()
+            ).hexdigest()
 
     relative = RELATIVE.search(details)
+    relative_reset: dt.datetime | None = None
+    relative_signature = ""
     if relative:
         raw_minutes = int(relative.group(1))
-        minutes = min(raw_minutes, 24 * 60)
-        reset = observed + dt.timedelta(minutes=minutes)
-        signature = hashlib.sha256(f"free-limit|relative|{raw_minutes}".encode()).hexdigest()
+        relative_reset = observed + dt.timedelta(minutes=min(raw_minutes, 24 * 60))
+        relative_signature = hashlib.sha256(
+            f"free-limit|relative|{raw_minutes}".encode()
+        ).hexdigest()
+
+    disagreement = ""
+    if absolute_reset is not None and relative_reset is not None:
+        if abs(absolute_reset - relative_reset) > DISAGREE:
+            disagreement = (
+                f"absolute:{iso_utc(absolute_reset)};relative:{iso_utc(relative_reset)}"
+            )
+            use_absolute = absolute_reset <= relative_reset
+        else:
+            use_absolute = True
+    else:
+        use_absolute = relative_reset is None
+
+    if absolute_reset is not None and use_absolute:
         return {
-            "signature": signature,
-            "reset": iso_utc(reset),
+            "signature": absolute_signature,
+            "reset": iso_utc(absolute_reset),
             "observed": iso_utc(observed),
             "unparsed": False,
+            "expired": absolute_expired,
+            "disagreement": disagreement,
+        }
+    if relative_reset is not None:
+        return {
+            "signature": relative_signature,
+            "reset": iso_utc(relative_reset),
+            "observed": iso_utc(observed),
+            "unparsed": False,
+            "expired": False,
+            "disagreement": disagreement,
         }
 
     reset = observed + dt.timedelta(hours=1)
@@ -117,6 +161,8 @@ def parse_rate_limit(transcript: str, observed: dt.datetime) -> dict[str, object
         "reset": iso_utc(reset),
         "observed": iso_utc(observed),
         "unparsed": True,
+        "expired": False,
+        "disagreement": "",
     }
 
 
@@ -174,6 +220,25 @@ def observe(args: argparse.Namespace, transcript: str) -> str:
             if matching is not None:
                 return ""
 
+            suffix = f" disagreement={event['disagreement']}" if event["disagreement"] else ""
+
+            if event["expired"]:
+                # The stated reset already passed: record no hold, keep the
+                # signature so later polls of the same pane do not re-trigger.
+                record = {
+                    "signature": event["signature"],
+                    "reset": event["reset"],
+                    "observed": event["observed"],
+                    "unparsed": event["unparsed"],
+                    "rung": args.rung,
+                    "result": "expired",
+                }
+                if event["disagreement"]:
+                    record["disagreement"] = event["disagreement"]
+                events.append(record)
+                atomic_json(state_path, {"version": 1, "events": events})
+                return f"observer-expired-reset={event['reset']}{suffix}"
+
             # This state belongs to one job. The rate-limit phrase is required
             # before a reset can reach this branch, so unrelated pane messages
             # cannot be mistaken for a previously observed window.
@@ -200,6 +265,8 @@ def observe(args: argparse.Namespace, transcript: str) -> str:
                 "rung": args.rung,
                 "result": "pending",
             }
+            if event["disagreement"]:
+                record["disagreement"] = event["disagreement"]
             events.append(record)
             atomic_json(state_path, {"version": 1, "events": events})
 
@@ -207,7 +274,7 @@ def observe(args: argparse.Namespace, transcript: str) -> str:
             if not scopefuel:
                 record["result"] = "missing-cli"
                 atomic_json(state_path, {"version": 1, "events": events})
-                return f"observer-failed-missing-cli-reset={event['reset']}"
+                return f"observer-failed-missing-cli-reset={event['reset']}{suffix}"
             command = [
                 scopefuel,
                 "observe",
@@ -238,7 +305,7 @@ def observe(args: argparse.Namespace, transcript: str) -> str:
             record["result"] = f"rc-{rc}"
             atomic_json(state_path, {"version": 1, "events": events})
             outcome = "ok" if rc == 0 else f"failed-rc-{rc}"
-            return f"observer-{outcome}-reset={event['reset']}"
+            return f"observer-{outcome}-reset={event['reset']}{suffix}"
     except OSError:
         return "observer-failed-state-io"
 
