@@ -135,6 +135,12 @@ class FreeLimitObserverTests(unittest.TestCase):
         event = observer.parse_rate_limit(text, when("2026-10-19T07:11:00Z"))
         self.assertEqual(event["reset"], "2026-10-19T08:01:00Z")
 
+    def test_absolute_time_wrapped_after_colon_is_preferred_in_kst_observation(self) -> None:
+        text = "Reached free model rate limit; reset in 50 minutes (at 08:\n01 UTC)"
+        event = observer.parse_rate_limit(text, when("2026-10-19T16:10:00+09:00"))
+        self.assertEqual(event["observed"], "2026-10-19T07:10:00Z")
+        self.assertEqual(event["reset"], "2026-10-19T08:01:00Z")
+
     def test_garbled_notice_uses_one_hour_and_unparsed_flag(self) -> None:
         result = self.run_helper(
             "Reached free model rate limit, reset information unavailable",
@@ -164,16 +170,43 @@ class FreeLimitObserverTests(unittest.TestCase):
         state = json.loads((self.root / "job-1690" / "free-limit-observer.json").read_text())
         self.assertEqual(state["events"][0]["reset"], "2026-10-19T08:01:00Z")
 
+    def test_relative_notice_dedupe_ignores_changed_trailing_pane_text(self) -> None:
+        first = self.run_helper(
+            "Reached free model rate limit; reset in 50 minutes\nWorking A",
+            "2026-10-19T08:00:00Z",
+        )
+        second = self.run_helper(
+            "Reached free model rate limit; reset in 50 minutes\nWorking B",
+            "2026-10-19T08:02:00Z",
+        )
+        self.assertIn("reset=2026-10-19T08:50:00Z", first.stdout)
+        self.assertEqual(second.stdout, "")
+        self.assertEqual(len(self.calls()), 1)
+
     def test_non_devin_pane_never_persists_or_calls_even_with_same_text(self) -> None:
+        for pane_kind in ("claude", "codex"):
+            result = self.run_helper(
+                "Reached free model rate limit; reset in 50 minutes",
+                "2026-10-19T07:11:00Z",
+                job=f"{pane_kind}-job",
+                pane_kind=pane_kind,
+            )
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, "")
+        self.assertEqual(self.calls(), [])
+        for pane_kind in ("claude", "codex"):
+            self.assertFalse((self.root / f"{pane_kind}-job" / "free-limit-observer.json").exists())
+
+    def test_paid_devin_kind_records_the_actual_rung(self) -> None:
         result = self.run_helper(
             "Reached free model rate limit; reset in 50 minutes",
             "2026-10-19T07:11:00Z",
-            pane_kind="codex",
+            rung="devin-ds41",
         )
         self.assertEqual(result.returncode, 0)
-        self.assertEqual(result.stdout, "")
-        self.assertEqual(self.calls(), [])
-        self.assertFalse((self.root / "job-1690" / "free-limit-observer.json").exists())
+        self.assertIn("observer-ok-reset=2026-10-19T08:01:00Z", result.stdout)
+        args = self.calls()[0]
+        self.assertEqual(args[args.index("--rung") + 1], "devin-ds41")
 
     def test_old_scopefuel_command_failure_is_soft_and_not_retried(self) -> None:
         text = "Reached free model rate limit; reset in 50 minutes"
@@ -240,7 +273,14 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(args[args.index("--source") + 1], "job:concurrent-job")
         self.assertEqual(args[args.index("--rung") + 1], "devin-swe2-max")
 
-    def run_sentinel(self, job: str, rung: str) -> tuple[subprocess.CompletedProcess[str], Path]:
+    def run_sentinel(
+        self,
+        job: str,
+        pane_kind: str,
+        rung: str,
+        *,
+        wrk_path: Path | None = None,
+    ) -> tuple[subprocess.CompletedProcess[str], Path]:
         pane_log = self.root / f"{job}-herdr.jsonl"
         herdr = self.root / f"{job}-herdr-stub"
         herdr.write_text(
@@ -268,12 +308,24 @@ class FreeLimitObserverTests(unittest.TestCase):
             STUB_HERDR_LOG=str(pane_log),
             STUB_PANE_TEXT="Reached free model rate limit; reset in 50 minutes",
         )
-        args = [str(ROOT / "bin" / "wrk"), "sentinel", job, "worker", "test", "pane-1", "", "", rung, str(self.scopefuel)]
+        args = [
+            str(wrk_path or ROOT / "bin" / "wrk"),
+            "sentinel",
+            job,
+            "worker",
+            "test",
+            "pane-1",
+            "",
+            "",
+            pane_kind,
+            rung,
+            str(self.scopefuel),
+        ]
         result = subprocess.run(args, text=True, capture_output=True, timeout=15, env=env, check=False)
         return result, pane_log
 
     def test_sentinel_reads_passively_once_and_skips_non_devin(self) -> None:
-        result, herdr_log = self.run_sentinel("devin-job", "devin-swe2-medium")
+        result, herdr_log = self.run_sentinel("devin-job", "devin", "devin-swe2-medium")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.calls()), 1)
         entries = [json.loads(line) for line in herdr_log.read_text(encoding="utf-8").splitlines()]
@@ -283,12 +335,39 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertNotIn("Reached free model rate limit", (self.root / "jobs/devin-job/completion-sentinel.log").read_text())
 
         before = len(self.calls())
-        other_result, other_log = self.run_sentinel("codex-job", "")
+        other_result, other_log = self.run_sentinel("codex-job", "codex", "codex")
         self.assertEqual(other_result.returncode, 0, other_result.stderr)
         after_entries = [json.loads(line) for line in other_log.read_text(encoding="utf-8").splitlines()]
         self.assertFalse(any(entry[:2] == ["agent", "read"] for entry in after_entries))
         self.assertEqual(len(self.calls()), before)
         self.assertFalse((self.root / "jobs/codex-job/free-limit-observer.json").exists())
+
+        claude_result, claude_log = self.run_sentinel("claude-job", "claude", "claude")
+        self.assertEqual(claude_result.returncode, 0, claude_result.stderr)
+        claude_entries = [json.loads(line) for line in claude_log.read_text(encoding="utf-8").splitlines()]
+        self.assertFalse(any(entry[:2] == ["agent", "read"] for entry in claude_entries))
+        self.assertEqual(len(self.calls()), before)
+        self.assertFalse((self.root / "jobs/claude-job/free-limit-observer.json").exists())
+
+        paid_result, paid_log = self.run_sentinel("paid-devin-job", "devin", "devin-ds41")
+        self.assertEqual(paid_result.returncode, 0, paid_result.stderr)
+        self.assertEqual(len(self.calls()), before + 1)
+        paid_args = self.calls()[-1]
+        self.assertEqual(paid_args[paid_args.index("--rung") + 1], "devin-ds41")
+        paid_entries = [json.loads(line) for line in paid_log.read_text(encoding="utf-8").splitlines()]
+        self.assertTrue(any(entry[:2] == ["agent", "read"] for entry in paid_entries))
+
+    def test_installed_wrk_symlink_resolves_observer_helper(self) -> None:
+        link = self.home / ".local" / "bin" / "wrk"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(ROOT / "bin" / "wrk")
+        result, herdr_log = self.run_sentinel(
+            "installed-shape-job", "devin", "devin-swe2", wrk_path=link
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls()), 1)
+        entries = [json.loads(line) for line in herdr_log.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(sum(entry[:2] == ["agent", "read"] for entry in entries), 1)
 
 
 if __name__ == "__main__":

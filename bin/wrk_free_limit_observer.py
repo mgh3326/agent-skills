@@ -17,17 +17,28 @@ import tempfile
 from pathlib import Path
 
 
-FREE_RUNGS = {
+DEVIN_RUNGS = {
     "devin-swe2",
     "devin-swe2-medium",
     "devin-swe2-max",
     "builder-devin",
     "builder-devin-medium",
     "builder-devin-max",
+    "devin-glm52",
+    "devin-swe17",
+    "devin-ds41",
+    "devin-ds41-max",
+    "builder-ds41",
+    "builder-ds41-max",
+    "devin-fusion-opus55",
+    "devin-fusion-sonnet55",
+    "devin-argon",
+    "devin-argon-medium",
+    "devin-argon-low",
 }
 RATE_LIMIT = re.compile(r"Reached\s+free\s+model\s+rate\s+limit", re.IGNORECASE)
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
-ABSOLUTE = re.compile(r"\bat\s+(\d{1,2}):(\d{2})\s+UTC\b", re.IGNORECASE)
+ABSOLUTE = re.compile(r"\bat\s+(\d(?:\s*\d)?)\s*:\s*(\d(?:\s*\d)?)\s+UTC\b", re.IGNORECASE)
 RELATIVE = re.compile(r"\breset\s+in\s+(\d+)\s+minutes?\b", re.IGNORECASE)
 
 
@@ -50,22 +61,19 @@ def parse_rate_limit(transcript: str, observed: dt.datetime) -> dict[str, object
         return None
 
     match = matches[-1]
-    # Keep the identity local to the rate-limit notice. Later pane output and
-    # unrelated transcript lines must not change a relative fallback reset.
-    excerpt = normalized[match.start() : match.start() + 320].strip()
-    signature = hashlib.sha256(excerpt.casefold().encode("utf-8")).hexdigest()
     observed = observed.astimezone(dt.timezone.utc)
     details = normalized[match.end() : match.start() + 320]
 
     absolute = ABSOLUTE.search(details)
     if absolute:
-        hour, minute = (int(absolute.group(1)), int(absolute.group(2)))
+        hour, minute = (int(re.sub(r"\s+", "", part)) for part in absolute.groups())
         if hour < 24 and minute < 60:
             reset = observed.replace(hour=hour, minute=minute, second=0, microsecond=0)
             if reset <= observed:
                 reset += dt.timedelta(days=1)
             # A wall-clock reset is at most one day away after the rollover.
             reset = min(reset, observed + dt.timedelta(hours=24))
+            signature = hashlib.sha256(f"free-limit|utc|{hour:02d}:{minute:02d}".encode()).hexdigest()
             return {
                 "signature": signature,
                 "reset": iso_utc(reset),
@@ -75,8 +83,10 @@ def parse_rate_limit(transcript: str, observed: dt.datetime) -> dict[str, object
 
     relative = RELATIVE.search(details)
     if relative:
-        minutes = min(int(relative.group(1)), 24 * 60)
+        raw_minutes = int(relative.group(1))
+        minutes = min(raw_minutes, 24 * 60)
         reset = observed + dt.timedelta(minutes=minutes)
+        signature = hashlib.sha256(f"free-limit|relative|{raw_minutes}".encode()).hexdigest()
         return {
             "signature": signature,
             "reset": iso_utc(reset),
@@ -85,6 +95,7 @@ def parse_rate_limit(transcript: str, observed: dt.datetime) -> dict[str, object
         }
 
     reset = observed + dt.timedelta(hours=1)
+    signature = hashlib.sha256(b"free-limit|unparsed").hexdigest()
     return {
         "signature": signature,
         "reset": iso_utc(reset),
@@ -124,7 +135,7 @@ def load_events(path: Path) -> list[dict[str, object]]:
 
 
 def observe(args: argparse.Namespace, transcript: str) -> str:
-    if args.pane_kind != "devin" or args.rung not in FREE_RUNGS:
+    if args.pane_kind != "devin" or args.rung not in DEVIN_RUNGS:
         return ""
     try:
         observed = aware_utc(args.observed) if args.observed else dt.datetime.now(dt.timezone.utc)

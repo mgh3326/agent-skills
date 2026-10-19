@@ -6254,7 +6254,7 @@ sentinel_self_exit() {
 
 sentinel_cmd() {
   local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}"
-  local free_rung="${7:-}" scopefuel_bin="${8:-}"
+  local pane_kind="${7:-}" observed_rung="${8:-}" scopefuel_bin="${9:-}"
   local timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
   local interval="${WRK_COMPLETION_INTERVAL_S:-30}"
   local transient_max="${WRK_SENTINEL_TRANSIENT_MAX:-10}"
@@ -6264,13 +6264,19 @@ sentinel_cmd() {
   jobdir="$(wrk_jobs_root)/$job"
   mkdir -p "$jobdir"
   logfile="$jobdir/completion-sentinel.log"
-  case "$free_rung" in
-    devin-swe2|devin-swe2-medium|devin-swe2-max|builder-devin|builder-devin-medium|builder-devin-max)
-      wrk_path="$(command -v "$0" 2>/dev/null || printf '%s' "$0")"
-      observer_script="$(cd "$(dirname "$wrk_path")" && pwd)/wrk_free_limit_observer.py"
-      ;;
-    *) free_rung="" ;;
-  esac
+  if [[ "$pane_kind" == devin && -n "$observed_rung" ]]; then
+    wrk_path="$(python3 - "$0" <<'PY'
+from pathlib import Path
+import shutil, sys
+
+entry = sys.argv[1]
+print(Path(shutil.which(entry) or entry).resolve())
+PY
+)"
+    observer_script="$(dirname "$wrk_path")/wrk_free_limit_observer.py"
+  else
+    pane_kind=""
+  fi
   started="$(date +%s)"
   seen=""
   pending=""
@@ -6316,14 +6322,14 @@ sentinel_cmd() {
         fi
         ;;
     esac
-    # One bounded, read-only transcript observation is allowed for the six
-    # free Devin spellings. Paid Devin and every other pane never enter this
-    # path. The helper deduplicates by job/reset under a per-job file lock.
-    if [[ -n "$free_rung" && "$class" == ok ]]; then
+    # One bounded, read-only transcript observation is allowed for Devin-kind
+    # panes. The helper validates and records the actual Devin rung; admission
+    # denial remains limited to the six free SWE-2 profiles in scopefuel.
+    if [[ "$pane_kind" == devin && -n "$observed_rung" && "$class" == ok ]]; then
       local recent observer_result
       if recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
         observer_result="$(printf '%s\n' "$recent" | python3 "$observer_script" \
-          --pane-kind devin --job "$job" --rung "$free_rung" \
+          --pane-kind "$pane_kind" --job "$job" --rung "$observed_rung" \
           --state "$jobdir/free-limit-observer.json" --scopefuel "$scopefuel_bin" 2>/dev/null || true)"
         if [[ -n "$observer_result" ]]; then
           sentinel_log "$logfile" "$token" "$transient" "$observer_result"
@@ -9712,13 +9718,9 @@ print(value if isinstance(value, str) else "")
   # A sentinel requires the durable claim/spawn metadata it later reads. During
   # an installation transition the old fail-open spawn contract remains intact.
   if [[ "$ARBITER_JOB_REGISTERED" -eq 1 ]]; then
-    FREE_LIMIT_RUNG=""
-    case "$MODEL" in
-      devin-swe2|devin-swe2-medium|devin-swe2-max|builder-devin|builder-devin-medium|builder-devin-max)
-        FREE_LIMIT_RUNG="$MODEL"
-        ;;
-    esac
-    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE" "$FREE_LIMIT_RUNG" "$SCOPEFUEL"
+    OBSERVED_DEVIN_RUNG=""
+    [[ "$PROFILE_KIND" != devin ]] || OBSERVED_DEVIN_RUNG="$MODEL"
+    start_completion_sentinel "$(wrk_jobs_root)/$JOB_ID/completion-sentinel.pid" "$JOB_ID" "$JOB_LANE" "$LABEL" "$PANE" "$REPORT_PATH" "$ARBITER_RESOURCE" "$PROFILE_KIND" "$OBSERVED_DEVIN_RUNG" "$SCOPEFUEL"
   fi
   SPAWN_PANE_OPEN=0
   SPAWN_MOCK_MCP_RETAIN=1
