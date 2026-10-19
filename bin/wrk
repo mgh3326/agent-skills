@@ -1054,6 +1054,7 @@ spawn_panewire_prompt() {
   fi
   SPAWN_PROMPT_FILES+=("$file")
   seconds="$SPAWN_PANEWIRE_TIMEOUT_SECONDS"
+  round_ext_builder_recheck
   # The daemon enforces --timeout itself; the outer guard only covers a wedged
   # socket, which would otherwise hang the spawn with the gates already held.
   err="$(run_bounded $((seconds + 15)) "$panewire" prompt --from "wrk-spawn:$JOB_ID" --to "$LABEL" \
@@ -1093,6 +1094,7 @@ spawn_opencode_submit() {
 # the pre-#498 direct injection, without its re-injection: a second direct
 # send would be a second fallback.
 spawn_herdr_fallback() {
+  round_ext_builder_recheck
   SPAWN_VIA=herdr-fallback
   SPAWN_FALLBACKS=$((SPAWN_FALLBACKS + 1))
   if [[ "$PROFILE_KIND" == opencode ]]; then
@@ -2343,6 +2345,7 @@ agent_start_in_pane() {
       spawn_pane_cleanup
       return 1
     fi
+    round_ext_builder_recheck
     set +e
     start_err="$("$HERDR" agent start "$LABEL" --kind "$PROFILE_KIND" --pane "$PANE" --timeout "$remaining_ms" -- "${ARGS[@]}" 2>&1 >/dev/null)"
     start_rc=$?
@@ -3611,6 +3614,11 @@ if not isinstance(catalog, dict) or "stale" not in catalog:
     # canon — an old build, a proxy, a truncated write. Treat it exactly like an
     # unreachable catalog rather than trusting the values it did send.
     sys.exit(1)
+if sys.argv[1] == "builder" and sys.argv[3]:
+    expected = {"policy": "hk1672/v1", "profile": sys.argv[2], "role": "builder",
+                "purpose": "round-extension", "ref": sys.argv[3]}
+    if payload.get("round_extension_builder") != expected:
+        sys.exit(1)
 # One field per line, not a tab-joined record: tab is IFS whitespace, so bash
 # collapses a leading empty field and every later field shifts up by one. An
 # empty model_id is normal (sonnet/haiku launch by CLI alias), and the shift
@@ -3621,7 +3629,7 @@ print("\n".join([
     str(catalog.get("source") or ""),
     "1" if catalog.get("stale") else "0",
 ]))
-' 2>/dev/null)"; then
+' "${ROLE:-}" "$MODEL" "${ROUND_EXT_REF:-}" 2>/dev/null)"; then
     CATALOG_STALE=1
     warn "scopefuel policy launch returned unreadable JSON; using the launcher's own values (catalog=stale)"
     return 0
@@ -4007,7 +4015,7 @@ resolve_profile() {
   apply_catalog
   if [[ "${ROLE:-}" == builder && -n "${ROUND_EXT_REF:-}" ]]; then
     [[ "${ROUND_EXT_CATALOG_VERIFIED:-0}" == 1 ]] ||
-      die "--round-ext builder requires a readable, admitting scopefuel policy launch (check installed scopefuel version)"
+      die "--round-ext builder requires readable hk1672/v1 support evidence from scopefuel policy launch (check installed scopefuel version)"
   fi
 
   if [[ -n "$EFFORT" ]]; then
@@ -8743,6 +8751,9 @@ hk_cmd() {
 # is deliberately narrower than accepting any label attached to the same task.
 round_ext_validate() {
   if [[ "${MODEL:-}" == builder-astra || "${MODEL:-}" == captain-astra ]]; then
+    if [[ "${ROLE:-}" == builder ]]; then
+      die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)"
+    fi
     die "profile '$MODEL' was removed: astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved); use codex-astra"
   fi
   if [[ "${MODEL:-}" == codex-astra || "${MODEL:-}" == fable ]] && [[ "${ROLE:-}" == worker ]]; then
@@ -8834,6 +8845,13 @@ except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
     raise SystemExit(1)
 ' "${ROUND_EXT_REF#hk:doc/}" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" \
     "$(wrk_jobs_root)/$grant_job/events" "$ROLE" "$TASK_ID")" || die "--round-ext: document missing, unreadable or issuer denied"
+}
+
+# Fresh server reads at each builder launch/handoff boundary; never a takeover.
+round_ext_builder_recheck() {
+  [[ "${ROLE:-}" == builder && -n "${ROUND_EXT_REF:-}" ]] || return 0
+  round_ext_precheck
+  hk_task_precheck
 }
 
 # task_resolve_parent — TASK_INHERITED_FROM is set by the caller to a parent
@@ -9072,7 +9090,7 @@ try:
     if "id" in task and str(task["id"]) != sys.argv[3]:
         raise ValueError("reply belongs to another task")
     key = sys.argv[4].removeprefix("hk:doc/")
-    if key.count("/") == 2 and (not isinstance(task.get("project"), str)
+    if sys.argv[5] == "builder" and key.count("/") == 2 and (not isinstance(task.get("project"), str)
                                or task["project"].casefold() != key.split("/")[0]):
         raise ValueError("document belongs to another project")
     if sys.argv[2] == "pa-integrator" and task.get("project") != "ParkingArcade":
@@ -9081,7 +9099,7 @@ try:
 except (ValueError, TypeError) as error:
     print("--round-ext: invalid hk task reply: " + str(error), file=sys.stderr)
     raise SystemExit(1)
-' "$grant_job" "$ROUND_EXT_ISSUER" "$TASK_ID" "$ROUND_EXT_REF")" || die "--round-ext ownership denied: ambiguous or unreadable hk task binding"
+' "$grant_job" "$ROUND_EXT_ISSUER" "$TASK_ID" "$ROUND_EXT_REF" "$ROLE")" || die "--round-ext ownership denied: ambiguous or unreadable hk task binding"
     if [[ "$ROLE" == builder ]]; then
       [[ "$TASK_LINK_MODE" == owner ]] || die "--round-ext builder requires explicit --task"
       case "$grant_state" in
@@ -9561,10 +9579,7 @@ spawn_cmd() {
   mock_mcp_prepare || return "$WRK_EXIT_MOCK_MCP_REFUSED"
   # hk 1672: admission can race a task reclaim or a new recorded parent.
   # Re-read server ownership and issuer at the last point before pane creation.
-  if [[ "$ROLE" == builder && -n "$ROUND_EXT_REF" ]]; then
-    round_ext_precheck
-    hk_task_precheck
-  fi
+  round_ext_builder_recheck
   if [[ "${#TAB_ENV[@]}" -gt 0 ]]; then
     TAB_CREATE_JSON=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}")
   else
@@ -9631,6 +9646,7 @@ print(value if isinstance(value, str) else "")
   # agent start (or Devin's temporary run/wait/rename branch). Nothing about it
   # may move ahead of quota_gate/arbiter_admit.
   mock_mcp_verify --require-attached || return "$WRK_EXIT_MOCK_MCP_REFUSED"
+  round_ext_builder_recheck
   spawn_deliver_brief
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi

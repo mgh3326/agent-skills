@@ -9771,8 +9771,8 @@ builder_reject_astra() {
     grep -q 'requires --purpose round-extension and verified --round-ext REF' <<<"$output" ||
       fail "unverified builder must name its required grant: $output"
   else
-    grep -q "profile '$model' was removed" <<<"$output" ||
-      fail "removed astra alias must retain its diagnostic: $output"
+    grep -q -- "--role builder rejects astra profile '$model'" <<<"$output" ||
+      fail "removed astra alias must retain its builder diagnostic: $output"
     grep -q 'hk:doc decision/2026-09-21/astra-allowed-purposes-approved' <<<"$output" ||
       fail "removed alias must cite the operator decision: $output"
   fi

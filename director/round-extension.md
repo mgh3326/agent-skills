@@ -38,17 +38,28 @@ replacement builder using exactly codex-astra xhigh or fable. Use `--role builde
 --parent PARENT`. The document JOB, spawn JOB and explicit task's current keyed
 `refs.job_id` must all match. An unbound task, another job/task/project, ambiguous
 task JSON or an unauthorized document issuer refuses before catalog/quota.
-Project-prefixed documents must match the server task's project (case-insensitive).
+For builders, project-prefixed documents must match the server task's project
+(case-insensitive); existing inherited tester/reviewer/counsel paths keep their
+previous namespace handling.
 The existing issuer lists, newest recorded parent lane and pa-integrator's
 ParkingArcade restriction apply to builders too. A builder-created or mac-dev
 document cannot authorize a seat, and no task bypass is available. Ownership and
-issuer are checked again immediately before pane creation to catch a reclaim
-during admission; server ownership can still change after that final read.
+issuer are checked again before pane creation, immediately before each actual
+agent-start attempt after shell readiness, and before brief handoff after the
+agent boot wait. Each actual panewire/direct-herdr handoff also takes fresh reads.
+A refusal closes any already-created pane through the existing EXIT trap. These
+reads detect changes across admission, tab creation, readiness and boot waits;
+they are not an atomic server reservation, and ownership can change after a read.
 
 Reuse the existing released same-job reclaim, with its builder lease and lane
 registration. This grant introduces no takeover or new-job replacement path.
-The scopefuel launch answer must admit the approved model/effort; unavailable,
-unreadable or refusing old installations fail closed for this builder exception.
+The scopefuel JSON launch answer must admit the approved model/effort AND carry
+`round_extension_builder` evidence exactly binding `policy=hk1672/v1`, profile,
+`role=builder`, `purpose=round-extension` and the requested ref. Only these
+conditional builder responses add that field; ordinary launch/recommend output
+stays byte-identical. hk 1632 scopefuel admits the same model/effort without this
+evidence, so wrk must reject that actual old response too. Unavailable, unreadable,
+refusing or unsupported installations fail closed for this builder exception.
 Astra uses builder-sol's Codex sandbox/approval flags at xhigh; fable uses
 builder-opus's permission flags with literal `claude-fable-5-1`. Builder no-max
 rules remain in force. Removed builder-astra/captain-astra aliases stay removed;

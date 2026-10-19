@@ -992,6 +992,10 @@ block 밖의 문장은 이 IDs를 약화·재정의할 수 없으며, prose-cont
      **hk 1672:** 교체 builder는 `--role builder --purpose round-extension --round-ext REF
      --task ID --job JOB --lane BUILDER --parent PARENT`로만 연다. 현재 task의 keyed
      `refs.job_id`·문서 JOB·spawn JOB을 일치시키고 같은 issuer 검증을 통과해야 한다.
+     scopefuel 응답의 `round_extension_builder`가 `policy=hk1672/v1`·profile·role·purpose·ref를
+     정확히 증명해야 한다(hk 1632 구버전의 동일 model/effort 응답만으로는 허용하지 않는다).
+     tab/준비 대기 뒤 실제 agent start 직전과 boot 대기 뒤 brief 전달 직전에 issuer·현재
+     task 연결을 다시 읽고, 거부되면 생성된 pane을 닫는다. 원격 서버의 원자적 예약은 아니다.
      기존 released same-job reclaim을 쓰며 새 job takeover는 추가하지 않는다. astra builder는
      non-OpenAI tester, fable builder는 non-Anthropic tester를 T1–T3 모두 요구한다.
      추천·기본 배정·builder lease·lane 등록·no-max 규칙은 그대로이고 worker는 허용하지 않는다.
