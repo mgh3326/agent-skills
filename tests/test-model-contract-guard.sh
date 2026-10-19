@@ -193,6 +193,7 @@ echo "PASS bare fable launch is refused (consult_only)"
 
 # With the operator request it launches, on the literal 5.1 model ID.
 assert_argv_has fable "--model $CONTRACT_FABLE_MODEL_ID " \
+  --role counsel \
   --operator-request hk:doc/decision/2026-09-23/task593-dispatch-ac4-absorbed \
   --requested-by operator
 echo "PASS operator-requested fable launch runs $CONTRACT_FABLE_MODEL_ID"

@@ -16,7 +16,7 @@ class RoundExtensionSpawn(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.log = self.base / "calls"
-        self.env = {"PATH": os.environ["PATH"], "HOME": str(self.base),
+        self.env = {"PATH": os.environ["PATH"], "HOME": str(self.base), "CODEX_HOME": str(self.base / "codex"),
                     "HK_TASK_ID": "1632", "ARBITER_INBOX_ROOT": str(self.base / "jobs"),
                     "HANDOFFKEEP_BIN": str(self.base / "hk"),
                     "SCOPEFUEL_BIN": str(self.base / "scopefuel"),
@@ -38,6 +38,7 @@ with Path(os.environ["CALL_LOG"]).open("a") as f: f.write(json.dumps(sys.argv[1:
 mode = os.environ.get("HK_MODE", "ok")
 if mode == "down": raise SystemExit(1)
 if sys.argv[1:3] == ["doc", "get"]:
+    if "DOC_REPLY" in os.environ: print(os.environ["DOC_REPLY"]); raise SystemExit(0)
     if mode == "missing": print("not_found"); raise SystemExit(1)
     if mode == "garbage": print("{}"); raise SystemExit(0)
     doc = {"key": sys.argv[3], "body": "round extension record"}
@@ -47,6 +48,7 @@ if sys.argv[1:3] == ["doc", "get"]:
 elif sys.argv[1:3] == ["tasks", "show"]:
     if "TASK_REPLY" in os.environ: print(os.environ["TASK_REPLY"]); raise SystemExit(0)
     print(json.dumps({"state": "in_progress", "claimed_by": "fixture-builder",
+        "project": "ParkingArcade", "id": int(sys.argv[3]),
         "refs": {"job_id": "other-task" if mode == "wrong-owner" else "b1632-sol"}}))
 else: raise SystemExit("unexpected hk mutation")
 ''')
@@ -55,6 +57,9 @@ from pathlib import Path
 args = sys.argv[1:]
 with Path(os.environ["CALL_LOG"]).open("a") as f: f.write(json.dumps(args) + "\\n")
 if args[:2] == ["policy", "launch"]:
+    if os.environ.get("CATALOG_MODE") == "old": raise SystemExit(2)
+    if os.environ.get("CATALOG_MODE") == "refused": raise SystemExit(3)
+    if os.environ.get("CATALOG_MODE") == "malformed": print("{}"); raise SystemExit(0)
     print(json.dumps({"model_id": "gpt-6-astra" if args[2] == "codex-astra" else "claude-fable-5-1",
         "effort": "xhigh" if args[2] == "codex-astra" else "",
         "catalog": {"source": "fixture", "stale": False}}))
@@ -71,11 +76,14 @@ else: raise SystemExit("unexpected scopefuel command")
         path.chmod(0o700)
 
     def run_spawn(self, *, model="codex-astra", role="tester", ref=REF,
-                  purpose="round-extension", extra=(), environment=None, router=False):
+                  purpose="round-extension", extra=(), environment=None, router=False, launch=False):
         self.log.unlink(missing_ok=True)
         args = ["-c", str(self.base), "-m", model, "-p", str(self.prompt), "-w", "fixture",
-                "-l", "fixture-tester", "--t", "T3", "--role", role,
-                "--parent-job", "b1632-sol"]
+                "-l", "fixture-tester", "--t", "T3", "--role", role]
+        if role == "builder":
+            args += ["--task", "1632", "--job", "b1632-sol", "--lane", "fixture-builder", "--parent", "director-1"]
+        else:
+            args += ["--parent-job", "b1632-sol"]
         if ref is not None:
             args += ["--round-ext", ref]
         if purpose is not None:
@@ -89,6 +97,32 @@ arbiter_release_held() { :; }
 mock_mcp_cleanup() { :; }
 arbiter_admit() { exit 91; }
 '''
+        if launch:
+            self.stub("herdr", '''import json, os, sys
+from pathlib import Path
+args=sys.argv[1:]
+with Path(os.environ["CALL_LOG"]).open("a") as f: f.write(json.dumps(["herdr", *args])+"\\n")
+if args[:2] == ["tab", "create"]:
+    print(json.dumps({"result": {"root_pane": {"pane_id": "fixture-pane"}, "tab_id": "fixture-tab"}}))
+elif args[:2] != ["agent", "start"]: raise SystemExit("unexpected herdr call")
+''')
+            self.env["HERDR_BIN"] = str(self.base / "herdr")
+            harness += '''
+arbiter_admit() {
+  printf '["lease","%s","%s","%s","%s"]\\n' "${ARBITER_CLAIM_ROLE_ARGS[@]}" >>"$CALL_LOG"
+  if [[ "${RACE_BINDING:-}" == 1 ]]; then export HK_MODE=wrong-owner; fi
+}
+quota_hub_policy_gate() { :; }
+sleep_for() { :; }
+devin_wait_shell_ready() { :; }
+agent_wait_foreground() { :; }
+spawn_deliver_brief() { LANDING=confirmed SPAWN_VIA=fixture; }
+agent_status_for_pane() { printf ready; }
+hub_lane_register() { HUB_LANE=fixture-builder HUB_LANE_MACHINE=fixture-machine; }
+refresh_quota_pool() { :; }
+mock_mcp_prepare() { :; }
+mock_mcp_verify() { :; }
+'''
         harness += 'spawn_router_cmd --host local "$@"' if router else 'spawn_cmd "$@"'
         process = subprocess.run(["bash", "-c", harness, "fixture", str(self.lib), *args],
             env={**self.env, **(environment or {})}, capture_output=True, text=True, timeout=60)
@@ -97,8 +131,8 @@ arbiter_admit() { exit 91; }
 
     def assert_denied(self, **kw):
         process, calls = self.run_spawn(**kw)
-        self.assertEqual(process.returncode, 2, process.stderr)
         self.assertFalse(any(c[:1] in (["gate"], ["policy"]) for c in calls), calls)
+        self.assertEqual(process.returncode, 2, process.stderr)
         return process.stderr
 
     def test_valid_refs_forward_to_both_scopefuel_paths(self):
@@ -199,11 +233,150 @@ arbiter_admit() { exit 91; }
                                        extra=("--operator-request", "hk:doc/ordinary/request"))
             self.assertEqual(process.returncode, 91, process.stderr)
 
-    def test_worker_and_builder_seats_never_unlock(self):
+    def test_worker_captain_and_removed_aliases_never_unlock(self):
         for model in ("codex-astra", "fable", "builder-astra", "captain-astra"):
-            for role in ("worker", "builder", "captain"):
-                with self.subTest(model=model, role=role):
-                    self.assert_denied(model=model, role=role)
+            for role in ("worker", "captain"):
+                for ref, purpose in ((REF, "round-extension"), (None, "architect"), (None, "director"),
+                                     (None, "operator-request"), (None, None)):
+                    with self.subTest(model=model, role=role, ref=ref, purpose=purpose):
+                        self.assert_denied(model=model, role=role, ref=ref, purpose=purpose,
+                            extra=("--operator-request", "hk:doc/ordinary/request") if ref is None else ())
+            if model in ("builder-astra", "captain-astra"):
+                self.assertIn("was removed", self.assert_denied(model=model, role="builder"))
+
+    def test_builder_requires_verified_pair_before_catalog_and_gate(self):
+        for model in ("codex-astra", "fable"):
+            for purpose in (None, "builder", "architect", "director", "operator-request", "round-extension"):
+                with self.subTest(model=model, purpose=purpose):
+                    reason = self.assert_denied(model=model, role="builder", purpose=purpose, ref=None)
+                    self.assertIn("role condition, not quota", reason)
+            for environment in ({"DOC_ISSUER": "mac-dev"}, {"DOC_ISSUER": "builder-sol"},
+                                {"HK_MODE": "wrong-owner"}, {"HK_MODE": "missing"}):
+                self.assert_denied(model=model, role="builder", environment=environment)
+            self.assert_denied(model=model, role="builder", ref="hk:doc/round-ext/other-job")
+            self.assert_denied(model=model, role="builder", extra=("--task-hk-bypass",))
+            for flag in ("--task", "--lane", "--parent"):
+                self.assert_denied(model=model, role="builder", extra=(flag, ""))
+            process, calls = self.run_spawn(model=model, role="builder")
+            self.assertEqual(process.returncode, 91, process.stderr)
+            self.assertEqual(len([c for c in calls if c[:1] == ["policy"]]), 1)
+            self.assertEqual(len([c for c in calls if c[:2] == ["gate", "-m"]]), 1)
+
+    def test_builder_strict_current_task_binding(self):
+        valid = {"id": 1632, "state": "claimed", "claimed_by": "", "project": "ParkingArcade",
+                 "refs": {"job_id": "b1632-sol"}}
+        replies = [
+            {**valid, "id": 1633}, {**valid, "refs": {}},
+            {**valid, "refs": {"job_id": "previous-job"}},
+            {**valid, "state": "claimed\n"}, {**valid, "claimed_by": "x\t"},
+            {**valid, "refs": {"job_id": "b1632-sol", "extra": {"x": "\u200b"}}},
+            {**valid, "refs": []}, {**valid, "state": None}, {**valid, "claimed_by": None},
+            {"state": "claimed", "refs": valid["refs"]},
+        ]
+        raw = [json.dumps(reply) for reply in replies] + ["not JSON", "[]",
+            '{"state":"claimed","claimed_by":"","refs":{"job_id":"b1632-sol","job_id":"other"}}',
+            json.dumps(valid)[:-1] + ',"bad":NaN}']
+        for model in ("codex-astra", "fable"):
+            for reply in raw:
+                with self.subTest(model=model, reply=reply):
+                    self.assertIn("ownership denied", self.assert_denied(model=model, role="builder",
+                        environment={"TASK_REPLY": reply}))
+            for state in ("merged", "dropped", "hold", "needs_decision"):
+                self.assert_denied(model=model, role="builder",
+                    environment={"TASK_REPLY": json.dumps({**valid, "state": state})})
+            self.assert_denied(model=model, role="builder", ref="hk:doc/other/round-ext/b1632-sol",
+                environment={"TASK_REPLY": json.dumps(valid)})
+
+    def test_builder_newest_recorded_parent_and_parkingarcade_restriction(self):
+        events = self.base / "jobs/b1632-sol/events"
+        newest = events / "00002-job.reclaim.json"
+        newest.write_text(json.dumps({"kind": "job.reclaim", "payload": {
+            "task_id": "1632", "parent_lane": "pa-integrator"}}))
+        self.assert_denied(role="builder")  # Old director-1 parent no longer authorizes.
+        for issuer in ("operator", "operator-desk", "pa-integrator"):
+            process, _ = self.run_spawn(role="builder", environment={"DOC_ISSUER": issuer})
+            self.assertEqual(process.returncode, 91, process.stderr)
+        reply = {"state": "claimed", "claimed_by": "", "project": "other", "refs": {"job_id": "b1632-sol"}}
+        self.assert_denied(role="builder", environment={"DOC_ISSUER": "pa-integrator", "TASK_REPLY": json.dumps(reply)})
+        newest.write_text("not JSON")
+        self.assert_denied(role="builder")
+        newest.write_text(json.dumps({"kind": "job.reclaim", "payload": {
+            "task_id": "1633", "parent_lane": "director-1"}}))
+        for issuer in ("operator", "director-1"):
+            self.assert_denied(role="builder", environment={"DOC_ISSUER": issuer})
+
+    def test_builder_ambiguous_document_never_authorizes(self):
+        for reply in ("[]", "not JSON", '{"body":"x","created_by":"operator"}',
+                      '{"key":"round-ext/b1632-sol","body":"x","created_by":"builder-sol","created_by":"operator"}'):
+            self.assert_denied(role="builder", environment={"DOC_REPLY": reply})
+
+    def test_builder_exact_launch_lines_and_builder_lease(self):
+        for model, kind, argv in (
+            ("codex-astra", "codex", ["--yolo", "-m", "gpt-6-astra", "-c", "model_reasoning_effort=xhigh"]),
+            ("fable", "claude", ["--model", "claude-fable-5-1", "--dangerously-skip-permissions"]),
+        ):
+            with self.subTest(model=model):
+                process, calls = self.run_spawn(model=model, role="builder", launch=True)
+                self.assertEqual(process.returncode, 0, process.stderr)
+                starts = [c for c in calls if c[:3] == ["herdr", "agent", "start"]]
+                self.assertEqual(len(starts), 1, calls)
+                self.assertEqual(starts[0][:8], ["herdr", "agent", "start", "fixture-tester", "--kind", kind,
+                                              "--pane", "fixture-pane"])
+                self.assertEqual(starts[0][10:], ["--", *argv])
+                self.assertIn(["lease", "--role", "builder", "--parent-lane", "director-1"], calls)
+                self.assertFalse(any(c[:2] == ["tasks", "claim"] for c in calls))
+
+    def test_builder_rechecks_binding_after_admission_before_pane(self):
+        process, calls = self.run_spawn(role="builder", launch=True, environment={"RACE_BINDING": "1"})
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertIn("ownership denied", process.stderr)
+        self.assertTrue(any(c[:1] == ["policy"] for c in calls))
+        self.assertFalse(any(c[:1] == ["herdr"] for c in calls), calls)
+
+    def test_builder_old_scopefuel_never_falls_back_to_local_table(self):
+        for mode in ("old", "refused", "malformed"):
+            process, calls = self.run_spawn(role="builder", launch=True, environment={"CATALOG_MODE": mode})
+            self.assertEqual(process.returncode, 2, process.stderr)
+            self.assertIn("scopefuel policy launch", process.stderr)
+            self.assertFalse(any(c[:1] == ["herdr"] for c in calls), calls)
+
+    def test_existing_released_reclaim_keeps_job_and_records_replacement_model(self):
+        self.stub("arbiter", '''import json, os, sys
+from pathlib import Path
+args=sys.argv[1:]
+with Path(os.environ["CALL_LOG"]).open("a") as f: f.write(json.dumps(args)+"\\n")
+if args[:1] == ["job-get"]:
+    print(json.dumps({"job_id": "b1632-sol", "state": os.environ.get("DUP_STATE", "released"),
+                      "owner_lane": "old-builder", "created_at": "2026-10-18T00:00:00Z"}))
+elif args[:1] not in (["claim"], ["event"]): raise SystemExit("unexpected arbiter call")
+''')
+        harness = '''source "$1"
+ARBITER="$2" JOB_ID=b1632-sol MODEL="$3" LABEL=replacement JOB_LANE=new-builder JOB_T=T3
+ROLE=builder TASK_ID=1632 TASK_LINK_MODE=owner TASK_HK_BYPASS=0 ROUND_EXT_REF="" ROUND_EXT_ISSUER=""
+ARBITER_CLAIM_ROLE_ARGS=(--role builder --parent-lane director-1)
+ARBITER_CLAIM_TASK_ARGS=(--task-id 1632)
+hk_task_precheck
+[[ "$TASK_LINK_STATUS" == already_linked ]] || exit 90
+arbiter_handle_duplicate_claim
+PANE=fixture-pane WS=fixture
+arbiter_record_spawn_receipt
+'''
+        for model in ("codex-astra", "fable"):
+            self.log.unlink(missing_ok=True)
+            process = subprocess.run(["bash", "-c", harness, "fixture", str(self.lib),
+                str(self.base / "arbiter"), model], env=self.env, text=True, capture_output=True, timeout=60)
+            self.assertEqual(process.returncode, 0, process.stderr)
+            calls = [json.loads(line) for line in self.log.read_text().splitlines()]
+            claim = next(c for c in calls if c[:1] == ["claim"])
+            self.assertEqual(claim, ["claim", "--reclaim-released", "--job", "b1632-sol", "--agent-label",
+                "replacement", "--lane", "new-builder", "--t", "T3", "--role", "builder",
+                "--parent-lane", "director-1", "--task-id", "1632"])
+            event = next(c for c in calls if c[:1] == ["event"])
+            self.assertEqual(json.loads(event[-1])["profile"], model)
+        process = subprocess.run(["bash", "-c", harness, "fixture", str(self.lib),
+            str(self.base / "arbiter"), "codex-astra"], env={**self.env, "DUP_STATE": "claimed"},
+            text=True, capture_output=True, timeout=60)
+        self.assertEqual(process.returncode, 74, process.stderr)
 
     def test_astra_effort_pinned(self):
         for effort in ("low", "medium", "high", "max", "ultra"):

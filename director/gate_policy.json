@@ -852,7 +852,8 @@
         "T3"
       ],
       "round_extension_roles": [
-        "tester"
+        "tester",
+        "builder"
       ]
     },
     "codex-luna": {
@@ -1278,7 +1279,8 @@
         "T3"
       ],
       "round_extension_roles": [
-        "tester"
+        "tester",
+        "builder"
       ]
     },
     "grok": {

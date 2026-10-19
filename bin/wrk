@@ -317,8 +317,9 @@ The brief is delivered with `panewire prompt` (no uptake; first line
 line then ends with via=herdr-fallback.
   --round-ext REF   Verified round-extension document, hk:doc/round-extension/JOB,
                      hk:doc/round-ext/JOB or hk:doc/PROJECT/round-ext/JOB.
-                     Requires --purpose round-extension, explicit --parent-job JOB,
-                     and --role tester|reviewer|counsel. Only codex-astra (xhigh)
+                     Requires --purpose round-extension; tester|reviewer|counsel
+                     uses explicit --parent-job JOB. Builder uses --task ID and
+                     the same JOB currently bound in refs.job_id. Only codex-astra (xhigh)
                      or fable; document and parent task ownership must be readable.
   --operator-request REF
                      operator request reference passed verbatim to
@@ -559,11 +560,14 @@ Claude Sonnet via --model sonnet + --dangerously-skip-permissions (the builder-o
 argv shape), --effort high|xhigh|max, default xhigh. Its explicit max rung is the
 seat rule's only named exception; builder-sonnet records launch_profile
 sonnet@<effort> so the E1/E2 reps attribute to the gated catalog rung.
-codex-astra = gpt-6-astra is a counsel-only profile for director/architect/operator-requested
-advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved); --role builder rejects it.
-It defaults to --effort xhigh and requires --purpose director|architect|operator-request,
-which the gate enforces as role denial (gate exit 5, surfaced by wrk as exit 77) when
-missing or wrong.
+codex-astra = gpt-6-astra supports director/architect/operator-requested counsel
+(hk:doc decision/2026-09-21/astra-allowed-purposes-approved). codex-astra xhigh/fable
+builder seats require --purpose round-extension and a verified --round-ext REF
+for the job currently bound to explicit --task. Worker seats remain refused.
+Ordinary counsel defaults to --effort xhigh and retains the
+director|architect|operator-request purposes; round-extension also uses xhigh
+and requires the verified paired flags. The gate's role denial is exit 5,
+surfaced by wrk as exit 77.
 Pilot builders (task 240): builder-devin = devin-swe2 argv; builder-grok = grok 4.7 at effort xhigh; builder-kimi = kimi-k3 argv.
 builder-luna (task #633) = codex-luna (gpt-6-luna) at effort xhigh — the #594 E3
 sample spelling; --effort is pinned to xhigh because the catalog grades
@@ -3507,6 +3511,7 @@ resolve_catalog_profile() {
 # judgement and is the thing that stops the spawn, so the launcher keeps its
 # literal values and does not mislabel a refusal as a missing canon.
 apply_catalog() {
+  ROUND_EXT_CATALOG_VERIFIED=0
   [[ -n "$CATALOG_PROFILE" ]] || return 0
 
   if [[ -z "${SCOPEFUEL:-}" ]]; then
@@ -3624,6 +3629,12 @@ print("\n".join([
 
   local model_id effort _source stale
   { read -r model_id; read -r effort; read -r _source; read -r stale; } <<<"$parsed"
+  if [[ "${ROLE:-}" == builder && -n "${ROUND_EXT_REF:-}" ]]; then
+    case "$MODEL:$model_id:$effort" in
+      codex-astra:gpt-6-astra:xhigh|fable:claude-fable-5-1:) ROUND_EXT_CATALOG_VERIFIED=1 ;;
+      *) die "--round-ext builder requires the approved model and effort from scopefuel policy launch" ;;
+    esac
+  fi
   [[ "$stale" != "1" ]] || CATALOG_STALE=1
 
   # Only the kinds whose CLI argument *is* the model id consume it. For the
@@ -3994,6 +4005,10 @@ resolve_profile() {
 
   resolve_catalog_profile
   apply_catalog
+  if [[ "${ROLE:-}" == builder && -n "${ROUND_EXT_REF:-}" ]]; then
+    [[ "${ROUND_EXT_CATALOG_VERIFIED:-0}" == 1 ]] ||
+      die "--round-ext builder requires a readable, admitting scopefuel policy launch (check installed scopefuel version)"
+  fi
 
   if [[ -n "$EFFORT" ]]; then
     case "$EFFORT" in low|medium|high|xhigh|max|ultra) ;; *) die "unknown effort '$EFFORT'" ;; esac
@@ -8727,10 +8742,16 @@ hk_cmd() {
 # hk 1632: fail closed before catalog/gate calls. Exact parent-job ownership
 # is deliberately narrower than accepting any label attached to the same task.
 round_ext_validate() {
+  if [[ "${MODEL:-}" == builder-astra || "${MODEL:-}" == captain-astra ]]; then
+    die "profile '$MODEL' was removed: astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved); use codex-astra"
+  fi
+  if [[ "${MODEL:-}" == codex-astra || "${MODEL:-}" == fable ]] && [[ "${ROLE:-}" == worker ]]; then
+    die "astra/fable worker role forbidden; round-extension does not authorize workers"
+  fi
   if [[ "${MODEL:-}" == codex-astra || "${MODEL:-}" == fable ]] &&
-     [[ "${ROLE:-}" == tester || "${ROLE:-}" == reviewer ]]; then
+     [[ "${ROLE:-}" == builder || "${ROLE:-}" == tester || "${ROLE:-}" == reviewer ]]; then
     [[ "$PURPOSE" == round-extension && -n "$ROUND_EXT_REF" ]] ||
-      die "astra/fable tester/reviewer requires --purpose round-extension and verified --round-ext REF"
+      die "astra/fable builder/tester/reviewer requires --purpose round-extension and verified --round-ext REF (role condition, not quota)"
   fi
   [[ -n "$PURPOSE" || -n "$ROUND_EXT_REF" ]] || return 0
   local normalized
@@ -8741,8 +8762,8 @@ round_ext_validate() {
   [[ "$PURPOSE" == round-extension && -n "$ROUND_EXT_REF" ]] ||
     die "--purpose round-extension and --round-ext REF require each other"
   case "$ROLE" in
-    tester|reviewer|counsel) ;;
-    *) die "round-extension requires --role tester, reviewer or counsel; builder/worker forbidden" ;;
+    builder|tester|reviewer|counsel) ;;
+    *) die "round-extension requires --role builder, tester, reviewer or counsel; worker forbidden" ;;
   esac
   case "$MODEL" in
     codex-astra)
@@ -8754,8 +8775,13 @@ round_ext_validate() {
   local pattern='^hk:doc/(round-extension|round-ext|[a-z0-9][a-z0-9-]*/round-ext)/[a-z0-9][a-z0-9._-]*$'
   [[ ${#ROUND_EXT_REF} -le 128 && "$ROUND_EXT_REF" =~ $pattern ]] ||
     die "--round-ext requires JOB [a-z0-9][a-z0-9._-]* (lowercase JOB starting with a letter/digit), REF at most 128 characters"
-  [[ -n "$PARENT_JOB" && "${ROUND_EXT_REF##*/}" == "$PARENT_JOB" ]] ||
-    die "--round-ext ownership denied: document JOB must equal explicit --parent-job (JOB [a-z0-9][a-z0-9._-]*)"
+  if [[ "$ROLE" == builder ]]; then
+    [[ -n "$TASK_ID" && "${ROUND_EXT_REF##*/}" == "$JOB_ID" ]] ||
+      die "--round-ext ownership denied: builder document JOB must equal spawn JOB currently bound to explicit --task"
+  else
+    [[ -n "$PARENT_JOB" && "${ROUND_EXT_REF##*/}" == "$PARENT_JOB" ]] ||
+      die "--round-ext ownership denied: document JOB must equal explicit --parent-job (JOB [a-z0-9][a-z0-9._-]*)"
+  fi
   [[ -z "$OPERATOR_REQUEST" || "$OPERATOR_REQUEST" == "$ROUND_EXT_REF" ]] ||
     die "--round-ext conflicts with --operator-request"
   OPERATOR_REQUEST="$ROUND_EXT_REF"
@@ -8763,7 +8789,8 @@ round_ext_validate() {
 
 round_ext_precheck() {
   [[ -n "$ROUND_EXT_REF" ]] || return 0
-  local handoffkeep out
+  local handoffkeep out grant_job="$PARENT_JOB"
+  [[ "$ROLE" != builder ]] || grant_job="$JOB_ID"
   handoffkeep="$(hk_bin)"
   [[ -n "$handoffkeep" ]] || die "--round-ext: handoffkeep unavailable"
   out="$(hk_cmd "$handoffkeep" doc get "${ROUND_EXT_REF#hk:doc/}" 2>/dev/null)" ||
@@ -8772,29 +8799,41 @@ round_ext_precheck() {
   ROUND_EXT_ISSUER="$(printf '%s' "$out" | python3 -c '
 import json, sys
 from pathlib import Path
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
 try:
-    doc = json.load(sys.stdin)
-    if (not isinstance(doc, dict) or doc.get("key", sys.argv[1]) != sys.argv[1]
+    doc = json.load(sys.stdin, object_pairs_hook=unique_object)
+    if (not isinstance(doc, dict) or doc.get("key") != sys.argv[1]
         or not isinstance(doc.get("body"), str) or not doc["body"].strip() or doc.get("error")):
         raise ValueError("not a document")
     issuer = doc["created_by"]
     allowed = set(sys.argv[2].split())
-    if issuer not in allowed:
+    if issuer not in allowed or sys.argv[5] == "builder":
         events = Path(sys.argv[4])
         claims = sorted(p for p in events.glob("*.json")
                         if p.name.endswith(("claim.json", "reclaim.json")))
         if not claims:
             raise ValueError("issuer requires recorded parent lane")
-        record = json.loads(claims[-1].read_text())
-        parent = record.get("payload", record).get("parent_lane")
-        if issuer not in set(sys.argv[3].split()) or issuer != parent:
+        record = json.loads(claims[-1].read_text(), object_pairs_hook=unique_object)
+        payload = record.get("payload", record)
+        parent = payload.get("parent_lane")
+        if sys.argv[5] == "builder" and str(payload.get("task_id")) != sys.argv[6]:
+            raise ValueError("newest job claim belongs to another task")
+        if issuer not in allowed and (issuer not in set(sys.argv[3].split()) or issuer != parent):
             raise ValueError("created_by is not an authorized issuer for this parent job")
     print(issuer)
 except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
     print("--round-ext: document/issuer verification failed: " + str(error), file=sys.stderr)
     raise SystemExit(1)
 ' "${ROUND_EXT_REF#hk:doc/}" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" \
-    "$(wrk_jobs_root)/$PARENT_JOB/events")" || die "--round-ext: document missing, unreadable or issuer denied"
+    "$(wrk_jobs_root)/$grant_job/events" "$ROLE" "$TASK_ID")" || die "--round-ext: document missing, unreadable or issuer denied"
 }
 
 # task_resolve_parent — TASK_INHERITED_FROM is set by the caller to a parent
@@ -8991,7 +9030,9 @@ hk_task_precheck() {
   if [[ -n "${ROUND_EXT_REF:-}" ]]; then
     # The grant needs an unambiguous server binding. Do not transport task
     # fields through shell IFS: empty fields and embedded TABs shift columns.
-    printf '%s' "$out" | python3 -c '
+    local grant_job="$PARENT_JOB" grant_state
+    [[ "$ROLE" != builder ]] || grant_job="$JOB_ID"
+    grant_state="$(printf '%s' "$out" | python3 -c '
 import json, sys, unicodedata
 
 def unique_object(pairs):
@@ -9028,14 +9069,29 @@ try:
         raise ValueError("missing refs.job_id binding")
     if job != sys.argv[1]:
         raise ValueError("task is not bound to parent job")
+    if "id" in task and str(task["id"]) != sys.argv[3]:
+        raise ValueError("reply belongs to another task")
+    key = sys.argv[4].removeprefix("hk:doc/")
+    if key.count("/") == 2 and (not isinstance(task.get("project"), str)
+                               or task["project"].casefold() != key.split("/")[0]):
+        raise ValueError("document belongs to another project")
     if sys.argv[2] == "pa-integrator" and task.get("project") != "ParkingArcade":
         raise ValueError("pa-integrator issuer requires a ParkingArcade task")
+    print(task["state"])
 except (ValueError, TypeError) as error:
     print("--round-ext: invalid hk task reply: " + str(error), file=sys.stderr)
     raise SystemExit(1)
-' "$PARENT_JOB" "$ROUND_EXT_ISSUER" || die "--round-ext ownership denied: ambiguous or unreadable hk task binding"
-    [[ "$TASK_LINK_MODE" == inherited ]] || die "--round-ext requires inherited task binding"
-    TASK_LINK_STATUS="inherited"
+' "$grant_job" "$ROUND_EXT_ISSUER" "$TASK_ID" "$ROUND_EXT_REF")" || die "--round-ext ownership denied: ambiguous or unreadable hk task binding"
+    if [[ "$ROLE" == builder ]]; then
+      [[ "$TASK_LINK_MODE" == owner ]] || die "--round-ext builder requires explicit --task"
+      case "$grant_state" in
+        merged|dropped|needs_decision|hold) die "--round-ext builder task is unavailable (state=$grant_state)" ;;
+      esac
+      TASK_LINK_STATUS="already_linked"
+    else
+      [[ "$TASK_LINK_MODE" == inherited ]] || die "--round-ext requires inherited task binding"
+      TASK_LINK_STATUS="inherited"
+    fi
     return 0
   fi
   set +e
@@ -9292,6 +9348,8 @@ spawn_cmd() {
   case "$ROLE" in
     worker|builder|tester|reviewer|counsel) ;;
     captain)
+      [[ "$MODEL" != codex-astra && "$MODEL" != fable ]] ||
+        die "astra/fable captain role forbidden; use the explicit verified builder seat"
       warn "--role captain is deprecated; use --role builder"
       ROLE="builder"
       ;;
@@ -9316,14 +9374,15 @@ spawn_cmd() {
     [[ -z "$OWNER" ]] || die "--role builder uses --lane; do not combine it with --owner"
     [[ "$BUILDER_LANE" != "$PARENT_LANE" ]] || die "--role builder forbids --lane and --parent being the same (self parent)"
     case "$MODEL" in
-      builder-astra|codex-astra|captain-astra)
+      builder-astra|captain-astra)
         die "--role builder rejects astra profile '$MODEL': astra is limited to director judgment, architect counsel and operator-requested advice (hk:doc decision/2026-09-21/astra-allowed-purposes-approved)" ;;
+      codex-astra|fable) ;; # Paired round-extension flags verified before catalog.
       devin-fusion-opus55|devin-fusion-sonnet55)
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
         die "--role builder rejects '$MODEL': the devin Argon trial spellings are worker/tester-only — phase 1 is spawn plumbing, no builder seat (hk 1620, operator decision 2026-10-18)" ;;
       builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; astra spellings rejected per hk:doc decision/2026-09-21/astra-allowed-purposes-approved; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -9500,6 +9559,12 @@ spawn_cmd() {
   # Final kind/cwd/host and generated TAB_ENV are authoritative here. No pane
   # exists and no brief has been injected if catalog/config verification fails.
   mock_mcp_prepare || return "$WRK_EXIT_MOCK_MCP_REFUSED"
+  # hk 1672: admission can race a task reclaim or a new recorded parent.
+  # Re-read server ownership and issuer at the last point before pane creation.
+  if [[ "$ROLE" == builder && -n "$ROUND_EXT_REF" ]]; then
+    round_ext_precheck
+    hk_task_precheck
+  fi
   if [[ "${#TAB_ENV[@]}" -gt 0 ]]; then
     TAB_CREATE_JSON=$("$HERDR" tab create --workspace "$WS" --cwd "$CWD" --label "$LABEL" --no-focus "${TAB_ENV[@]}")
   else

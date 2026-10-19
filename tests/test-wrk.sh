@@ -215,6 +215,11 @@ PY
 spawn_base() {
   local model="$1"; shift
   local extra=("$@")
+  # Consultation fixtures must name their seat; explicit worker remains refused.
+  case "$model" in
+    codex-astra|fable)
+      case " ${extra[*]-} " in *" --role "*) ;; *) extra+=(--role counsel) ;; esac ;;
+  esac
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
   # #768: every spawn binds an hk task. Mint a fresh fixture task per spawn so
   # owner-mode claims stay claimable; a case that supplies --task/--parent-job
@@ -9353,6 +9358,10 @@ run_fail env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
 spawn_deny() {
   local log="$1" model="$2"; shift 2
   local extra=("$@")
+  case "$model" in
+    codex-astra|fable)
+      case " ${extra[*]-} " in *" --role "*) ;; *) extra+=(--role counsel) ;; esac ;;
+  esac
   # #768: --role builder requires --task before the gate these cases probe.
   # Draw from the same pre-minted pool spawn_base uses; worker-role calls keep
   # the suite's HK_TASK_ID env inheritance instead.
@@ -9749,9 +9758,7 @@ for index in range(1, 5):
 PY
 echo "PASS builder-accepts-canonical-and-legacy-profile-aliases"
 
-# task #526: --role builder rejects every astra spelling before claim/gate/tab,
-# and the refusal names the operator decision. The captain role alias must not
-# smuggle captain-astra past the same gate.
+# hk 1672: no unverified builder seat; removed aliases retain their diagnostic.
 builder_reject_astra() {
   local model="$1" tag="$2"; shift 2
   local job="builder-astra-reject-${model}-${tag}" output rc
@@ -9760,10 +9767,15 @@ builder_reject_astra() {
   rc=$?
   set -e
   [[ "$rc" -eq 2 ]] || fail "--role builder must reject $model (rc=$rc): $output"
-  grep -q "rejects astra profile '$model'" <<<"$output" ||
-    fail "astra rejection must name the profile: $output"
-  grep -q 'hk:doc decision/2026-09-21/astra-allowed-purposes-approved' <<<"$output" ||
-    fail "astra rejection must cite the operator decision: $output"
+  if [[ "$model" == codex-astra ]]; then
+    grep -q 'requires --purpose round-extension and verified --round-ext REF' <<<"$output" ||
+      fail "unverified builder must name its required grant: $output"
+  else
+    grep -q "profile '$model' was removed" <<<"$output" ||
+      fail "removed astra alias must retain its diagnostic: $output"
+    grep -q 'hk:doc decision/2026-09-21/astra-allowed-purposes-approved' <<<"$output" ||
+      fail "removed alias must cite the operator decision: $output"
+  fi
   [[ ! -e "$ARBITER_INBOX_ROOT/$job/events/00001-job.claim.json" ]] ||
     fail "rejected astra builder must not claim $job"
 }

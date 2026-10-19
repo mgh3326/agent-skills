@@ -26,7 +26,7 @@ ROUND_EXT_REF = re.compile(
     r"[a-z0-9][a-z0-9._-]*\Z")
 
 
-def round_ext_tester_allowed(alias: str, ref: object) -> bool:
+def round_ext_role_allowed(alias: str, ref: object) -> bool:
     return alias in {"codex-astra", "fable"} and isinstance(ref, str) and ROUND_EXT_REF.fullmatch(ref) is not None
 
 
@@ -246,16 +246,16 @@ def resolve_profile(alias: str, policy: dict, *, actual_model: str | None = None
         inferred_family = model_family(spec["model"])
         if inferred_family is None or spec["family"] != inferred_family:
             return None, result("UNVERIFIED", "PROFILE_FAMILY_CONFLICT", "bin/wrk+policy:profiles")
-        conditional_tester = (role == "tester" and role in spec.get("round_extension_roles", [])
-                              and round_ext_tester_allowed(alias, round_ext_ref))
-        if role not in spec["roles"] and not conditional_tester:
+        conditional_role = (role in {"builder", "tester"} and role in spec.get("round_extension_roles", [])
+                            and round_ext_role_allowed(alias, round_ext_ref))
+        if role not in spec["roles"] and not conditional_role:
             status = "UNVERIFIED" if spec.get("role_status") == "unknown" else "FAIL"
             reason = "PROFILE_ROLE_UNKNOWN" if status == "UNVERIFIED" else "PROFILE_ROLE_DENIED"
             return None, result(status, reason, "policy:profiles")
         grade = spec["grades"][effort]
         resolved = {"alias": alias, "launcher": spec["launcher"], "family": spec["family"],
                     "model": spec["model"], "effort": effort, "grade": grade,
-                    "roles": spec["roles"] + (["tester"] if conditional_tester else []), "surfaces": spec["surfaces"]}
+                    "roles": spec["roles"] + ([role] if conditional_role else []), "surfaces": spec["surfaces"]}
         if spec.get("grade_status") == "conflict":
             return resolved, result("UNVERIFIED", "PROFILE_GRADE_CONFLICT", "spawn-worker:2-2+policy:profiles", **resolved)
         if grade not in GRADES or spec["family"] == "unknown":

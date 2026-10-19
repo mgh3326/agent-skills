@@ -166,7 +166,36 @@ class EligibilityFixtures(unittest.TestCase):
         evidence = self.evidence(head, round_ext_ref="hk:doc/round-ext/job")
         evidence["contributors"][0].update(profile="codex-astra", model="gpt-6-astra", effort="xhigh")
         checks = self.check(evidence)
-        self.assert_case(checks, "contributors", "UNVERIFIED", "PROFILE_ROLE_DENIED")
+        self.assert_case(checks, "contributors", "PASS", "CONTRIBUTOR_UNION_RESOLVED")
+
+    def test_round_extension_builder_role_grade_family_and_independence(self) -> None:
+        head = self.make_head()
+        for alias, model, effort, family, same, cross in (
+            ("codex-astra", "gpt-6-astra", "xhigh", "openai", "codex-max", "opus"),
+            ("fable", "claude-fable-5-1", "", "anthropic", "opus", "codex-max"),
+        ):
+            for ref in (None, "hk:doc/other/job", "hk:doc/round-ext/job", "hk:doc/round-ext/job\n"):
+                resolved, check = common.resolve_profile(alias, self.policy, role="builder", round_ext_ref=ref)
+                if ref == "hk:doc/round-ext/job":
+                    self.assertEqual(check["status"], "PASS")
+                    self.assertEqual((resolved["family"], resolved["grade"]), (family, "S+"))
+                    self.assertIn("builder", resolved["roles"])
+                else:
+                    self.assertEqual(check["reason_code"], "PROFILE_ROLE_DENIED")
+            for tier in ("T1", "T2", "T3"):
+                for tester, independent in ((same, False), (cross, True)):
+                    with self.subTest(alias=alias, tier=tier, tester=tester):
+                        evidence = self.evidence(head, declared_t=tier, required_grade="S+", implementation_grade="S+",
+                            round_ext_ref="hk:doc/round-ext/job",
+                            contributors=[{"profile": alias, "model": model, "effort": effort, "role": "builder",
+                                           "kind": "initial", "session": "builder", "worktree": "/tmp/builder"}],
+                            tester={"planned_profile": tester, "planned_effort": "high" if tester == "opus" else "max"})
+                        checks = self.check(evidence)
+                        self.assert_case(checks, "contributors", "PASS", "CONTRIBUTOR_UNION_RESOLVED")
+                        self.assert_case(checks, "independence", "PASS" if independent else "FAIL",
+                                         "CROSS_FAMILY" if independent else "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+                        evidence.pop("round_ext_ref")
+                        self.assert_case(self.check(evidence), "contributors", "UNVERIFIED", "PROFILE_ROLE_DENIED")
 
     def test_round_extension_ref_bound_in_previous_receipt(self) -> None:
         evidence = self.evidence(self.make_head())

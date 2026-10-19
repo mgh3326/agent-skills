@@ -25,11 +25,35 @@ client-provided session/by text cannot authorize a document. pa-integrator also
 requires the server task to be ParkingArcade. Missing task fields, ambiguous JSON
 and control characters in state, claimed_by or refs refuse; an empty claimed_by
 is valid when refs.job_id binds the correct parent.
-Task bypass is unavailable for this path. Builder/worker roles are refused;
+Task bypass is unavailable for this path. Worker roles are refused;
 codex-astra is pinned to xhigh and other efforts are refused. Quota still applies.
 Astra/fable tester and reviewer seats require this grant for every purpose.
 wrk forwards --role to both scopefuel gate and policy launch; ordinary counsel
 seats keep their existing purpose rules.
+
+The additional standing grant of 2026-10-19 (hk 1672, hk:doc
+owner/fleet/decision/2026-10-19/round-ext-builder-astra-fable) also permits a
+replacement builder using exactly codex-astra xhigh or fable. Use `--role builder
+--purpose round-extension --round-ext REF --task ID --job JOB --lane BUILDER
+--parent PARENT`. The document JOB, spawn JOB and explicit task's current keyed
+`refs.job_id` must all match. An unbound task, another job/task/project, ambiguous
+task JSON or an unauthorized document issuer refuses before catalog/quota.
+Project-prefixed documents must match the server task's project (case-insensitive).
+The existing issuer lists, newest recorded parent lane and pa-integrator's
+ParkingArcade restriction apply to builders too. A builder-created or mac-dev
+document cannot authorize a seat, and no task bypass is available. Ownership and
+issuer are checked again immediately before pane creation to catch a reclaim
+during admission; server ownership can still change after that final read.
+
+Reuse the existing released same-job reclaim, with its builder lease and lane
+registration. This grant introduces no takeover or new-job replacement path.
+The scopefuel launch answer must admit the approved model/effort; unavailable,
+unreadable or refusing old installations fail closed for this builder exception.
+Astra uses builder-sol's Codex sandbox/approval flags at xhigh; fable uses
+builder-opus's permission flags with literal `claude-fable-5-1`. Builder no-max
+rules remain in force. Removed builder-astra/captain-astra aliases stay removed;
+there is no builder-fable profile. Ordinary defaults and recommendations do not
+change, and recommendation candidates never include these exceptional seats.
 
 Prefer a provider family different from the builder: Anthropic builder → astra;
 OpenAI builder → fable. If astra is refused, use codex-sol xhigh; if fable is
@@ -38,5 +62,7 @@ practice and must not become automatic fallback logic.
 
 Tester eligibility evidence carries top-level `round_ext_ref` through pre-spawn,
 post-landing and pre-merge receipts. Only codex-astra and fable gain the tester
-role on T1/T2/T3 from a correctly shaped ref. Their grades and contributor-role
-restrictions remain unchanged; wrk verifies document existence and ownership.
+and builder roles on T1/T2/T3 from a correctly shaped ref. Both resolve to grade
+S+; wrk verifies document existence, issuer and current task ownership. Builder
+contributors require this evidence too. Apply the usual T1–T3 family separation:
+astra builders need a non-OpenAI tester and fable builders a non-Anthropic tester.
