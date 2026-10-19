@@ -20,11 +20,6 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-if [[ "${WRK_FREE_LIMIT_TESTS_ONLY:-0}" == 1 ]]; then
-  python3 "$ROOT/tests/test_wrk_free_limit_observer.py"
-  python3 "$ROOT/tests/test_quoted_notice.py"
-  exit 0
-fi
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 TMP="$(mktemp -d)"
