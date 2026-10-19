@@ -1,6 +1,6 @@
 # Devin SWE-2 free-window observer
 
-Install scopefuel before agent-skills. The minimum scopefuel commit that accepts `observe devin-free-limit` is `99abef2b3b8636d06b04080b90b047dad79a0ec7`. Older scopefuel versions reject the command; the completion sentinel records the failure and continues the job lifecycle.
+Install scopefuel before agent-skills. The oldest scopefuel commit that accepts `observe devin-free-limit` is `99abef2b3b8636d06b04080b90b047dad79a0ec7`. Full compatibility with this observer, including observations from paid Devin rungs, requires `542a8c744b9e012b095ef345eff3501f8bfcddbc` or newer. Older scopefuel versions reject the command; the completion sentinel records the failure and continues the job lifecycle.
 
 For Devin-kind jobs, wrk reads only the pane's bounded `recent-unwrapped` transcript. It records a matching rate-limit message once per job/reset, with the observed time, reset, actual source rung, and job id. Scopefuel accepts actual Devin profile UIDs for the observation record, but only the six free SWE-2 names are included in gate and recommendation denial. The observer resolves the installed wrk symlink before locating its helper. It does not read agent configuration or credentials and does not send pane input. Other providers do not enter this read path.
 
