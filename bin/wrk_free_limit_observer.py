@@ -36,7 +36,8 @@ DEVIN_RUNGS = {
     "devin-argon-medium",
     "devin-argon-low",
 }
-RATE_LIMIT = re.compile(r"Reached\s+free\s+model\s+rate\s+limit", re.IGNORECASE)
+RATE_LIMIT = re.compile(r"^Reached\s+free\s+model\s+rate\s+limit", re.IGNORECASE)
+BANNER = re.compile(r"^[ \t]*\u25b2[ \t]+Something went wrong[ \t]*$", re.IGNORECASE)
 ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 ABSOLUTE = re.compile(r"\bat\s+(\d(?:\s*\d)?)\s*:\s*(\d(?:\s*\d)?)\s+UTC\b", re.IGNORECASE)
 RELATIVE = re.compile(r"\breset\s+in\s+(\d+)\s+minutes?\b", re.IGNORECASE)
@@ -54,15 +55,30 @@ def iso_utc(value: dt.datetime) -> str:
 
 
 def parse_rate_limit(transcript: str, observed: dt.datetime) -> dict[str, object] | None:
-    """Parse one rate-limit notice from the bounded pane transcript."""
-    normalized = " ".join(ANSI.sub(" ", transcript).split())
-    matches = list(RATE_LIMIT.finditer(normalized))
-    if not matches:
+    """Parse a reset only from an indented rate-limit body after Devin's banner."""
+    cleaned = ANSI.sub("", transcript).replace("\r\n", "\n").replace("\r", "\n")
+    lines = cleaned.splitlines()
+    blocks: list[str] = []
+    for index, line in enumerate(lines):
+        if not BANNER.fullmatch(line):
+            continue
+        body: list[str] = []
+        for following in lines[index + 1 :]:
+            if not following.strip() or not re.match(r"^[ \t]{3,}\S", following):
+                break
+            body.append(following.strip())
+        normalized = " ".join(" ".join(body).split())
+        match = RATE_LIMIT.match(normalized)
+        if match is not None:
+            blocks.append(normalized)
+    if not blocks:
         return None
 
-    match = matches[-1]
+    notice = blocks[-1]
+    match = RATE_LIMIT.match(notice)
+    assert match is not None
     observed = observed.astimezone(dt.timezone.utc)
-    details = normalized[match.end() : match.start() + 320]
+    details = notice[match.end() : match.end() + 320]
 
     absolute = ABSOLUTE.search(details)
     if absolute:

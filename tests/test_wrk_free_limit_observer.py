@@ -22,6 +22,11 @@ def when(value: str) -> dt.datetime:
     return observer.aware_utc(value)
 
 
+def provider_notice(message: str) -> str:
+    body = "\n".join("   " + line for line in message.splitlines())
+    return f"\n ▲ Something went wrong\n{body}\n"
+
+
 class FreeLimitObserverTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="wrk-free-window-")
@@ -103,7 +108,10 @@ class FreeLimitObserverTests(unittest.TestCase):
         return [json.loads(line) for line in self.call_log.read_text(encoding="utf-8").splitlines()]
 
     def test_exact_hk_message_prefers_absolute_utc(self) -> None:
-        text = "Reached free model rate limit ... reset in 50 minutes (at 08:01 UTC)"
+        text = provider_notice(
+            "Reached free model rate limit. Upgrade to Max for higher limits, or switch to a different\n"
+            "model. Your limit will reset in 50 minutes (at 08:01 UTC). (trace ID: sample). Send a message to retry"
+        )
         event = observer.parse_rate_limit(text, when("2026-10-19T07:11:00Z"))
         self.assertEqual(event["reset"], "2026-10-19T08:01:00Z")
         self.assertEqual(event["observed"], "2026-10-19T07:11:00Z")
@@ -111,39 +119,46 @@ class FreeLimitObserverTests(unittest.TestCase):
 
     def test_absolute_only_and_relative_only(self) -> None:
         absolute = observer.parse_rate_limit(
-            "Reached free model rate limit (at 08:01 UTC)", when("2026-10-19T07:11:00Z")
+            provider_notice("Reached free model rate limit (at 08:01 UTC)"),
+            when("2026-10-19T07:11:00Z"),
         )
         relative = observer.parse_rate_limit(
-            "Reached free model rate limit; reset in 50 minutes", when("2026-10-19T07:11:00Z")
+            provider_notice("Reached free model rate limit; reset in 50 minutes"),
+            when("2026-10-19T07:11:00Z"),
         )
         self.assertEqual(absolute["reset"], "2026-10-19T08:01:00Z")
         self.assertEqual(relative["reset"], "2026-10-19T08:01:00Z")
 
     def test_absolute_rolls_to_next_day_and_relative_is_capped_at_24h(self) -> None:
         observed = when("2026-10-19T23:30:00Z")
-        absolute = observer.parse_rate_limit("Reached free model rate limit at 08:01 UTC", observed)
-        relative = observer.parse_rate_limit("Reached free model rate limit reset in 9999 minutes", observed)
+        absolute = observer.parse_rate_limit(
+            provider_notice("Reached free model rate limit at 08:01 UTC"), observed
+        )
+        relative = observer.parse_rate_limit(
+            provider_notice("Reached free model rate limit reset in 9999 minutes"), observed
+        )
         self.assertEqual(absolute["reset"], "2026-10-20T08:01:00Z")
         self.assertEqual(relative["reset"], "2026-10-20T23:30:00Z")
         same_minute = observer.parse_rate_limit(
-            "Reached free model rate limit at 08:01 UTC", when("2026-10-19T08:01:00Z")
+            provider_notice("Reached free model rate limit at 08:01 UTC"),
+            when("2026-10-19T08:01:00Z"),
         )
         self.assertEqual(same_minute["reset"], "2026-10-20T08:01:00Z")
 
     def test_wrapped_phrase_and_time_parse(self) -> None:
-        text = "Reached free model rate\n    limit; reset in 50 minutes (at 08:01\n    UTC)"
+        text = provider_notice("Reached free model rate\nlimit; reset in 50 minutes (at 08:01\nUTC)")
         event = observer.parse_rate_limit(text, when("2026-10-19T07:11:00Z"))
         self.assertEqual(event["reset"], "2026-10-19T08:01:00Z")
 
     def test_absolute_time_wrapped_after_colon_is_preferred_in_kst_observation(self) -> None:
-        text = "Reached free model rate limit; reset in 50 minutes (at 08:\n01 UTC)"
+        text = provider_notice("Reached free model rate limit; reset in 50 minutes (at 08:\n01 UTC)")
         event = observer.parse_rate_limit(text, when("2026-10-19T16:10:00+09:00"))
         self.assertEqual(event["observed"], "2026-10-19T07:10:00Z")
         self.assertEqual(event["reset"], "2026-10-19T08:01:00Z")
 
     def test_garbled_notice_uses_one_hour_and_unparsed_flag(self) -> None:
         result = self.run_helper(
-            "Reached free model rate limit, reset information unavailable",
+            provider_notice("Reached free model rate limit, reset information unavailable"),
             "2026-10-19T07:11:00Z",
         )
         self.assertEqual(result.returncode, 0)
@@ -153,7 +168,7 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(args[args.index("--source") + 1], "job:job-1690")
 
     def test_repeated_garbled_notice_does_not_slide_cooldown(self) -> None:
-        text = "Reached free model rate limit, reset details were garbled"
+        text = provider_notice("Reached free model rate limit, reset details were garbled")
         first = self.run_helper(text, "2026-10-19T07:11:00Z")
         second = self.run_helper(text, "2026-10-19T07:35:00Z")
         self.assertIn("reset=2026-10-19T08:11:00Z", first.stdout)
@@ -161,7 +176,7 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(len(self.calls()), 1)
 
     def test_relative_repeat_does_not_slide_reset_or_call_again(self) -> None:
-        text = "Reached free model rate limit; reset in 50 minutes"
+        text = provider_notice("Reached free model rate limit; reset in 50 minutes")
         first = self.run_helper(text, "2026-10-19T07:11:00Z")
         second = self.run_helper(text, "2026-10-19T07:20:00Z")
         self.assertIn("reset=2026-10-19T08:01:00Z", first.stdout)
@@ -172,11 +187,11 @@ class FreeLimitObserverTests(unittest.TestCase):
 
     def test_relative_notice_dedupe_ignores_changed_trailing_pane_text(self) -> None:
         first = self.run_helper(
-            "Reached free model rate limit; reset in 50 minutes\nWorking A",
+            provider_notice("Reached free model rate limit; reset in 50 minutes") + "Working A\n",
             "2026-10-19T08:00:00Z",
         )
         second = self.run_helper(
-            "Reached free model rate limit; reset in 50 minutes\nWorking B",
+            provider_notice("Reached free model rate limit; reset in 50 minutes") + "Working B\n",
             "2026-10-19T08:02:00Z",
         )
         self.assertIn("reset=2026-10-19T08:50:00Z", first.stdout)
@@ -199,7 +214,7 @@ class FreeLimitObserverTests(unittest.TestCase):
 
     def test_paid_devin_kind_records_the_actual_rung(self) -> None:
         result = self.run_helper(
-            "Reached free model rate limit; reset in 50 minutes",
+            provider_notice("Reached free model rate limit; reset in 50 minutes"),
             "2026-10-19T07:11:00Z",
             rung="devin-ds41",
         )
@@ -209,7 +224,7 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(args[args.index("--rung") + 1], "devin-ds41")
 
     def test_old_scopefuel_command_failure_is_soft_and_not_retried(self) -> None:
-        text = "Reached free model rate limit; reset in 50 minutes"
+        text = provider_notice("Reached free model rate limit; reset in 50 minutes")
         old_cli = self.root / "old-scopefuel"
         old_cli.write_text(
             "#!" + sys.executable + "\nimport sys\nsys.exit(2)\n", encoding="utf-8"
@@ -232,7 +247,7 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(rc2.stdout, "")
 
     def test_concurrent_same_job_reset_calls_scopefuel_once(self) -> None:
-        text = "Reached free model rate limit (at 08:01 UTC)"
+        text = provider_notice("Reached free model rate limit (at 08:01 UTC)")
         state = self.root / "concurrent-job" / "free-limit-observer.json"
         command = [
             sys.executable,
@@ -306,7 +321,7 @@ class FreeLimitObserverTests(unittest.TestCase):
             WRK_SENTINEL_LOST_GRACE="0",
             WRK_SENTINEL_INTERVAL_S="0",
             STUB_HERDR_LOG=str(pane_log),
-            STUB_PANE_TEXT="Reached free model rate limit; reset in 50 minutes",
+            STUB_PANE_TEXT=provider_notice("Reached free model rate limit; reset in 50 minutes"),
         )
         args = [
             str(wrk_path or ROOT / "bin" / "wrk"),
@@ -329,7 +344,8 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.calls()), 1)
         entries = [json.loads(line) for line in herdr_log.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual(sum(entry[:2] == ["agent", "read"] for entry in entries), 1)
+        reads = [entry for entry in entries if entry[:2] == ["agent", "read"]]
+        self.assertEqual(reads, [["agent", "read", "pane-1", "--source", "recent-unwrapped", "--lines", "200"]])
         self.assertTrue(all(entry[:2] in (["agent", "get"], ["agent", "read"]) for entry in entries))
         self.assertTrue(any("observer-ok-reset=" in line for line in (self.root / "jobs/devin-job/completion-sentinel.log").read_text().splitlines()))
         self.assertNotIn("Reached free model rate limit", (self.root / "jobs/devin-job/completion-sentinel.log").read_text())
@@ -368,6 +384,59 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(len(self.calls()), 1)
         entries = [json.loads(line) for line in herdr_log.read_text(encoding="utf-8").splitlines()]
         self.assertEqual(sum(entry[:2] == ["agent", "read"] for entry in entries), 1)
+
+    def test_spawn_callsite_passes_devin_kind_rung_and_scopefuel_to_sentinel(self) -> None:
+        source = (ROOT / "bin" / "wrk").read_text(encoding="utf-8")
+        start_marker = '  if [[ "$ARBITER_JOB_REGISTERED" -eq 1 ]]; then\n    OBSERVED_DEVIN_RUNG=""'
+        start = source.index(start_marker)
+        end = source.index("  fi\n  SPAWN_PANE_OPEN=0", start) + len("  fi")
+        callsite = source[start:end]
+        script = (
+            "set -euo pipefail\n"
+            "JOB_ID=spawn-job\nJOB_LANE=worker\nLABEL=label\nPANE=pane-1\n"
+            "REPORT_PATH=\nARBITER_RESOURCE=\nARBITER_JOB_REGISTERED=1\n"
+            'PROFILE_KIND="${TEST_PROFILE_KIND}"\nMODEL="${TEST_MODEL}"\n'
+            'SCOPEFUEL="${TEST_SCOPEFUEL}"\n'
+            'wrk_jobs_root() { printf "%s\\n" "$TEST_JOB_ROOT/jobs"; }\n'
+            'start_completion_sentinel() { printf "%s\\0" "$@"; }\n'
+            f"{callsite}\n"
+        )
+
+        def run_callsite(kind: str, model: str) -> list[str]:
+            result = subprocess.run(
+                ["bash", "-c", script],
+                text=True,
+                capture_output=True,
+                timeout=10,
+                env=self.call_env(
+                    TEST_PROFILE_KIND=kind,
+                    TEST_MODEL=model,
+                    TEST_SCOPEFUEL=str(self.scopefuel),
+                    TEST_JOB_ROOT=str(self.root),
+                ),
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return result.stdout.split("\0")[:-1]
+
+        devin_args = run_callsite("devin", "devin-ds41")
+        self.assertEqual(
+            devin_args,
+            [
+                str(self.root / "jobs" / "spawn-job" / "completion-sentinel.pid"),
+                "spawn-job",
+                "worker",
+                "label",
+                "pane-1",
+                "",
+                "",
+                "devin",
+                "devin-ds41",
+                str(self.scopefuel),
+            ],
+        )
+        codex_args = run_callsite("codex", "codex-luna")
+        self.assertEqual(codex_args[7:], ["codex", "", str(self.scopefuel)])
 
 
 if __name__ == "__main__":
