@@ -224,6 +224,159 @@ class EligibilityFixtures(unittest.TestCase):
                         self.assert_case(checks, "contributors", "PASS", "CONTRIBUTOR_UNION_RESOLVED")
                         self.assert_case(checks, "independence", "PASS", "SAME_FAMILY_EXCEPTION_PROVEN")
 
+    def test_code_producing_astra_is_never_counsel(self) -> None:
+        # hk 1689 C9: an astra/fable contribution that produces code (kind
+        # initial or fix) takes the builder path whatever role the evidence
+        # declares. With a round-extension ref it reaches the builder guard;
+        # without one it is denied like any astra/fable builder.
+        head = self.make_head()
+        for alias, model, effort, same_tester, cross_tester in (
+            ("codex-astra", "gpt-6-astra", "xhigh", "codex-sol", "opus"),
+            ("fable", "claude-fable-5-1", "", "opus", "codex-max"),
+        ):
+            for kind in ("initial", "fix"):
+                for tester, independent in ((same_tester, False), (cross_tester, True)):
+                    with self.subTest(alias=alias, kind=kind, tester=tester):
+                        evidence = self.evidence(head, declared_t="T1", required_grade="A", implementation_grade="A",
+                            round_ext_ref="hk:doc/round-ext/job",
+                            contributors=[{"profile": alias, "model": model, "effort": effort, "role": "counsel",
+                                           "kind": kind, "session": "builder-session", "worktree": "/tmp/builder"}],
+                            tester={"planned_profile": tester,
+                                    "planned_effort": "high" if tester == "opus" else "max"})
+                        checks = self.check(evidence)
+                        self.assert_case(checks, "contributors", "PASS", "CONTRIBUTOR_UNION_RESOLVED")
+                        self.assert_case(checks, "independence", "PASS" if independent else "FAIL",
+                                         "CROSS_FAMILY" if independent else "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+                        evidence.pop("round_ext_ref")
+                        self.assert_case(self.check(evidence), "contributors", "UNVERIFIED", "PROFILE_ROLE_DENIED")
+
+    def test_missing_contributor_role_defaults_to_builder(self) -> None:
+        # hk 1689 default: a contributor with no role resolves as builder, and
+        # an astra builder with no role still reaches the builder guard (E4).
+        head = self.make_head()
+        plain = self.evidence(head)
+        plain["contributors"] = [{"profile": "codex-sol", "model": "gpt-6.1-sol", "effort": "max",
+                                  "kind": "initial", "session": "builder-session", "worktree": "/tmp/builder"}]
+        self.assert_case(self.check(plain), "contributors", "PASS", "CONTRIBUTOR_UNION_RESOLVED")
+        astra = self.evidence(head, declared_t="T1", required_grade="A", implementation_grade="A",
+            round_ext_ref="hk:doc/round-ext/job",
+            contributors=[{"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh",
+                           "kind": "initial", "session": "builder-session", "worktree": "/tmp/builder"}],
+            tester={"planned_profile": "codex-sol", "planned_effort": "max"})
+        self.assert_case(self.check(astra), "independence", "FAIL", "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+
+    def test_other_family_declared_role_is_unchanged(self) -> None:
+        # hk 1689: a contributor outside astra/fable keeps its declared role.
+        head = self.make_head()
+        for kind in ("initial", "fix", "prescription"):
+            for ref in (None, "hk:doc/round-ext/job"):
+                with self.subTest(kind=kind, ref=ref):
+                    evidence = self.evidence(head, contributors=[
+                        {"profile": "codex-sol", "model": "gpt-6.1-sol", "effort": "max", "role": "counsel",
+                         "kind": kind, "session": "builder-session", "worktree": "/tmp/builder"}])
+                    if ref is not None:
+                        evidence["round_ext_ref"] = ref
+                    self.assert_case(self.check(evidence), "contributors", "UNVERIFIED", "PROFILE_ROLE_DENIED")
+
+    def test_astra_role_spellings_and_order_still_take_the_builder_path(self) -> None:
+        # hk 1689: case, whitespace, unknown and empty role spellings on a
+        # code-producing astra contributor still resolve as builder, and the
+        # guard does not depend on contributor order or a mixed list.
+        head = self.make_head()
+        for declared in ("counsel", "Counsel", " counsel ", "COUNSEL", "worker", "unknown", ""):
+            with self.subTest(role=declared):
+                evidence = self.evidence(head, declared_t="T1", required_grade="A", implementation_grade="A",
+                    round_ext_ref="hk:doc/round-ext/job",
+                    contributors=[{"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh",
+                                   "role": declared, "kind": "initial", "session": "builder-session",
+                                   "worktree": "/tmp/builder"}],
+                    tester={"planned_profile": "codex-sol", "planned_effort": "max"})
+                self.assert_case(self.check(evidence), "independence", "FAIL", "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+        for order in ((0, 1), (1, 0)):
+            with self.subTest(order=order):
+                contributors = [
+                    {"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh", "role": "counsel",
+                     "kind": "prescription", "session": "advisor-session", "worktree": "/tmp/advisor"},
+                    {"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh", "role": "builder",
+                     "kind": "fix", "session": "builder-session", "worktree": "/tmp/builder"},
+                ]
+                evidence = self.evidence(head, declared_t="T1", required_grade="A", implementation_grade="A",
+                    round_ext_ref="hk:doc/round-ext/job",
+                    contributors=[contributors[i] for i in order],
+                    tester={"planned_profile": "codex-sol", "planned_effort": "max"})
+                self.assert_case(self.check(evidence), "independence", "FAIL", "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+        no_kind = self.evidence(head, round_ext_ref="hk:doc/round-ext/job",
+            contributors=[{"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh", "role": "counsel",
+                           "session": "builder-session", "worktree": "/tmp/builder"}],
+            tester={"planned_profile": "codex-sol", "planned_effort": "max"})
+        self.assert_case(self.check(no_kind), "contributors", "UNVERIFIED", "CONTRIBUTOR_PROVENANCE_MISSING")
+
+    def test_contributors_digest_tracks_role_and_kind(self) -> None:
+        base = [{"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh", "role": "counsel",
+                 "kind": "prescription", "session": "advisor", "worktree": "/tmp/advisor"}]
+        self.assertEqual(eligible._digest(base), eligible._digest(json.loads(json.dumps(base))))
+        self.assertNotEqual(eligible._digest(base), eligible._digest([{**base[0], "role": "builder"}]))
+        self.assertNotEqual(eligible._digest(base), eligible._digest([{**base[0], "kind": "initial"}]))
+
+    def test_mutant_code_producing_astra_contributor_is_never_counsel(self) -> None:
+        head = self.make_head()
+        evidence = self.evidence(head, declared_t="T1", required_grade="A", implementation_grade="A",
+            round_ext_ref="hk:doc/round-ext/job",
+            contributors=[{"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh", "role": "counsel",
+                           "kind": "initial", "session": "builder-session", "worktree": "/tmp/builder"}],
+            tester={"planned_profile": "codex-sol", "planned_effort": "max"})
+        self.assert_case(self.check(evidence), "independence", "FAIL", "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+        original = eligible.contributor_role
+        def as_counsel(item):
+            if item.get("profile") in {"codex-astra", "fable"} and item.get("kind") in {"initial", "fix"}:
+                return item.get("role", "builder")
+            return original(item)
+        with mock.patch.object(eligible, "contributor_role", as_counsel):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(evidence), "independence", "FAIL", "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+
+    def test_mutant_prescription_only_astra_contributor_is_never_builder(self) -> None:
+        head = self.make_head()
+        evidence = self.evidence(head, declared_t="T1", required_grade="A", implementation_grade="A",
+            round_ext_ref="hk:doc/round-ext/job",
+            contributors=[
+                {"profile": "builder-opus", "model": "claude-opus-5-5", "effort": "xhigh", "role": "builder",
+                 "kind": "initial", "session": "builder-session", "worktree": "/tmp/builder"},
+                {"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh", "role": "counsel",
+                 "kind": "prescription", "session": "advisor-session", "worktree": "/tmp/advisor"}],
+            tester={"planned_profile": "codex-sol", "planned_effort": "max",
+                    "session": "tester-session", "worktree": "/tmp/tester"},
+            same_family={"reversible": True, "excluded_surface": False, "qualification_ref": "hk:doc/q",
+                "directed_brief_ref": "hk:doc/brief", "independent_counterexample_ref": "hk:doc/ce",
+                "ci_run_id": 1, "ci_attempt": 1, "ci_status": "success",
+                "report_phrase": "동일 계열 독립 세션 검증"})
+        self.assert_case(self.check(evidence), "independence", "PASS", "SAME_FAMILY_EXCEPTION_PROVEN")
+        original = eligible.contributor_role
+        def as_builder(item):
+            if item.get("profile") in {"codex-astra", "fable"}:
+                return "builder"
+            return original(item)
+        with mock.patch.object(eligible, "contributor_role", as_builder):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(evidence), "independence", "PASS", "SAME_FAMILY_EXCEPTION_PROVEN")
+
+    def test_mutant_missing_role_is_never_anything_but_builder(self) -> None:
+        head = self.make_head()
+        evidence = self.evidence(head, declared_t="T1", required_grade="A", implementation_grade="A",
+            round_ext_ref="hk:doc/round-ext/job",
+            contributors=[{"profile": "codex-astra", "model": "gpt-6-astra", "effort": "xhigh",
+                           "kind": "initial", "session": "builder-session", "worktree": "/tmp/builder"}],
+            tester={"planned_profile": "codex-sol", "planned_effort": "max"})
+        self.assert_case(self.check(evidence), "independence", "FAIL", "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+        original = eligible.contributor_role
+        def missing_as_counsel(item):
+            if "role" not in item:
+                return "counsel"
+            return original(item)
+        with mock.patch.object(eligible, "contributor_role", missing_as_counsel):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(evidence), "independence", "FAIL", "ROUND_EXTENSION_BUILDER_SAME_FAMILY")
+
     def test_round_extension_ref_bound_in_previous_receipt(self) -> None:
         evidence = self.evidence(self.make_head())
         path = self.previous(evidence, "pre-spawn")

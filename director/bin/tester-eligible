@@ -1341,6 +1341,16 @@ def _off_ladder(profile: dict | None) -> bool:
     return profile is not None and profile["grade"] not in GRADES
 
 
+def contributor_role(item: dict) -> str:
+    # hk 1689: an astra or fable contributor that produces code (kind initial
+    # or fix) is judged as a builder by every check, whatever role the
+    # evidence declares; only a prescription may carry counsel. Any other
+    # contributor keeps its declared role, defaulting to builder.
+    if item.get("profile") in {"codex-astra", "fable"} and item.get("kind") in {"initial", "fix"}:
+        return "builder"
+    return item.get("role", "builder")
+
+
 def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
              *, root: Path | None = None) -> tuple[dict, dict]:
     checks: dict[str, dict] = {"policy": policy_check}
@@ -1393,15 +1403,16 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
                 item.get("kind") not in {"initial", "fix", "prescription"}):
                 failures.append("CONTRIBUTOR_PROVENANCE_MISSING")
                 continue
+            role = contributor_role(item)
             resolved, check = resolve_profile(item.get("profile", ""), policy, actual_model=item.get("model"),
-                                              actual_effort=item.get("effort"), role=item.get("role", "builder"),
+                                              actual_effort=item.get("effort"), role=role,
                                               root=root, round_ext_ref=evidence.get("round_ext_ref"))
             if resolved is not None:
                 contributor_resolved.append(resolved)
             if check["status"] != "PASS":
                 failures.append(check["reason_code"])
             else:
-                contributor_profiles.append({**resolved, "role": item.get("role", "builder")})
+                contributor_profiles.append({**resolved, "role": role})
         checks["contributors"] = (result("UNVERIFIED", failures[0], "spawn-worker:2-4") if failures else
                                   result("PASS", "CONTRIBUTOR_UNION_RESOLVED", "spawn-worker:2-4",
                                          families=sorted({p["family"] for p in contributor_profiles})))
