@@ -100,7 +100,7 @@ spawn_one() {
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_COMPLETION_INTERVAL_S=3600 \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-devin-idle}" \
-    WRK_FIXTURE_LOG="$TMP/herdr.log" \
+    WRK_FIXTURE_LOG="${TEST_HERDR_LOG:-$TMP/herdr.log}" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
     "$wrk_bin" spawn \
     -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture \
@@ -294,15 +294,18 @@ exit 2
 EOF
 chmod +x "$RC2"
 : >"$TMP/scopefuel.log"
-: >"$TMP/herdr.log"
+# Earlier successful spawns have passive sentinels. Keep this admission
+# assertion on its own attempt's log so their late reads cannot contaminate it.
+RC2_HERDR_LOG="$TMP/herdr-rc2.log"
+: >"$RC2_HERDR_LOG"
 set +e
-rc2_out=$(spawn_one "$WRK" "$RC2" devin-glm52 --job gp-rc2 --t T1 2>&1)
+rc2_out=$(TEST_HERDR_LOG="$RC2_HERDR_LOG" spawn_one "$WRK" "$RC2" devin-glm52 --job gp-rc2 --t T1 2>&1)
 rc2_rc=$?
 set -e
 [[ "$rc2_rc" -ne 0 ]] || fail "rc 2 gate must refuse the spawn: $rc2_out"
 grep -q 'scopefuel gate failed (exit 2)' <<<"$rc2_out" ||
   fail "rc 2 refusal lost its message: $rc2_out"
-[[ ! -s "$TMP/herdr.log" ]] || fail "rc 2 refusal reached herdr: $(cat "$TMP/herdr.log")"
+[[ ! -s "$RC2_HERDR_LOG" ]] || fail "rc 2 refusal reached herdr: $(cat "$RC2_HERDR_LOG")"
 echo "PASS argparse rc 2 still refuses the spawn"
 
 assert_launch() {

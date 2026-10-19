@@ -358,3 +358,7 @@ chmod +x "$MUT"/wrk-*
 expect_red setting-removed claude_profiles_on "$MUT/wrk-no-setting"
 expect_red optout-removed director_left_alone "$MUT/wrk-no-optout"
 echo "PASS mutants assertion-red=2/2 (setting removed, director opt-out removed)"
+
+# Task 1690: passive Devin free-window observation parser and sentinel checks.
+python3 "$ROOT/tests/test_wrk_free_limit_observer.py"
+python3 "$ROOT/tests/test_quoted_notice.py"
