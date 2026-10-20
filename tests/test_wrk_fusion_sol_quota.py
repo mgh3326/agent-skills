@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
-import resource
 import signal
 import subprocess
 import tempfile
@@ -13,27 +12,6 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-ADDRESS_SPACE_LIMIT = 2 * 1024 * 1024 * 1024
-
-
-def _set_memory_limit(limit_kind: int) -> bool:
-    try:
-        _soft, hard = resource.getrlimit(limit_kind)
-        cap = ADDRESS_SPACE_LIMIT if hard == resource.RLIM_INFINITY else min(ADDRESS_SPACE_LIMIT, hard)
-        resource.setrlimit(limit_kind, (cap, cap))
-        return True
-    except (OSError, ValueError):
-        return False
-
-
-def limit_child_memory() -> None:
-    # RLIMIT_AS is unavailable or rejected by some macOS Python builds. Its
-    # data-segment limit still caps the fixture subprocess heap there.
-    address_space = getattr(resource, "RLIMIT_AS", None)
-    if address_space is not None and _set_memory_limit(address_space):
-        return
-    if not _set_memory_limit(resource.RLIMIT_DATA):
-        raise RuntimeError("could not apply the fixture subprocess memory cap")
 
 
 class FusionSolQuotaSpawnTests(unittest.TestCase):
@@ -107,7 +85,6 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
-            preexec_fn=limit_child_memory,
         )
         self.groups.append((process.pid, self.inbox / job / "completion-sentinel.pid"))
         try:
