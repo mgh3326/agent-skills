@@ -715,6 +715,14 @@ case_takeover_live() {
   takeover_spawn --task 1 --job mutant-live --takeover-from old-job
   [[ "$SPAWN_RC" -ne 0 && ! -s "$HERDR_LOG" && -z "$(job_event_doc mutant-live job.takeover)" ]]
 }
+case_takeover_refusal() {
+  reset_case mut-take-refusal
+  hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
+  seed_old_job old-job ended
+  HK_MODE=rejectrebind takeover_spawn --task 1 --job mutant-refusal --takeover-from old-job
+  [[ "$SPAWN_RC" -ne 0 && ! -s "$HERDR_LOG" && ! -d "$INBOX/mutant-refusal" &&
+     -z "$(job_event_doc mutant-refusal job.takeover)" ]]
+}
 case_takeover_rounds() {
   reset_case mut-take-rounds
   hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
@@ -753,6 +761,9 @@ expect_mut_red "claim task_id arg removal" case_meta
 
 mkmut no-terminal-check 's/die "takeover refused: old job.*still live; no work-terminal follows its newest revive"/: # terminal guard removed by mutant/'
 expect_mut_red "live old-job terminal check removal" case_takeover_live
+
+mkmut no-rebind-call 's/^  hk_task_takeover_rebind$/  : rebind call removed by mutant/'
+expect_mut_red "refused rebind leaves no pane or partial record" case_takeover_refusal
 
 mkmut no-round-inheritance 's/used += wrk_takeover_rounds(events)/# takeover inheritance removed by mutant/'
 expect_mut_red "takeover round baseline removal" case_takeover_rounds
