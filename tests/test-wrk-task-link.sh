@@ -679,6 +679,65 @@ grep -q 'would-close job=old-reap pane=w1:p10 tab=w1:t10 status=idle' <<<"$reap_
   fail "reap dry-run must never list live NEW: $reap_out"
 echo "PASS g4 handed-off old job is reapable after grace; new job is not"
 
+# G5: two hops. C's rounds_used is every round A consumed plus every round B
+# consumed, and C's own open refuses at the cap. Returns 1 on an assertion
+# miss so the chain mutant below stays assertion-RED.
+case_takeover_chain() {
+  G5_SEQ=$(( ${G5_SEQ:-0} + 1 ))
+  reset_case "g5-$G5_SEQ"
+  hk_add --id 1 --state claimed --claimed-by old-label --job-id job-a >/dev/null
+  seed_old_job job-a ended 2
+  takeover_spawn --task 1 --job job-b --takeover-from job-a
+  [[ "$SPAWN_RC" -eq 0 ]] || { echo "FAIL: A to B takeover rc=$SPAWN_RC" >&2; return 1; }
+  local b_takeover
+  b_takeover="$(job_event_doc job-b job.takeover)"
+  grep -qE '"rounds_used" *: *2' <<<"$b_takeover" ||
+    { echo "FAIL: B must inherit A's two rounds: $b_takeover" >&2; return 1; }
+  local head rc
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  set +e
+  env -u ARBITER_JOB -u HK_TASK_ID ARBITER_INBOX_ROOT="$INBOX" ARBITER_BIN="$ARBITER" \
+    HANDOFFKEEP_BIN="$HK" HOME="$HOME" XDG_DATA_HOME="$TMP/g5-xdg-$G5_SEQ" \
+    TMPDIR="$TMP" PANEWIRE_BIN="$PANEWIRE" WRK_NO_SLEEP=1 \
+    "$WRK" round open job-b --head "$head" --repo "$ROOT" >"$TMP/g5-b-open.out" 2>"$TMP/g5-b-open.err"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || { echo "FAIL: B must open a round: $(cat "$TMP/g5-b-open.err")" >&2; return 1; }
+  grep -q 'round=3' "$TMP/g5-b-open.out" ||
+    { echo "FAIL: B must open round three: $(cat "$TMP/g5-b-open.out")" >&2; return 1; }
+  python3 - "$INBOX/job-b/events/90000-job.revoked.json" <<'PY' || return 1
+import json, sys
+doc = {"kind": "job.revoked", "job_id": "job-b", "owner_lane": "new-lane",
+       "outcome": "abandoned", "reason": "fixture end",
+       "at": "2099-01-01T00:00:00.000Z"}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(doc, handle)
+    handle.write("\n")
+PY
+  takeover_spawn --task 1 --job job-c --takeover-from job-b
+  [[ "$SPAWN_RC" -eq 0 ]] || { echo "FAIL: B to C takeover rc=$SPAWN_RC" >&2; return 1; }
+  local c_takeover
+  c_takeover="$(job_event_doc job-c job.takeover)"
+  grep -qE '"rounds_used" *: *3' <<<"$c_takeover" ||
+    { echo "FAIL: C rounds_used must be A's 2 plus B's 1: $c_takeover" >&2; return 1; }
+  set +e
+  env -u ARBITER_JOB -u HK_TASK_ID ARBITER_INBOX_ROOT="$INBOX" ARBITER_BIN="$ARBITER" \
+    HANDOFFKEEP_BIN="$HK" HOME="$HOME" XDG_DATA_HOME="$TMP/g5-xdg-$G5_SEQ" \
+    TMPDIR="$TMP" PANEWIRE_BIN="$PANEWIRE" WRK_NO_SLEEP=1 \
+    "$WRK" round open job-c --head "$head" --repo "$ROOT" >"$TMP/g5-c-open.out" 2>"$TMP/g5-c-open.err"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 78 ]] ||
+    { echo "FAIL: C must refuse at the cap (rc=$rc): $(cat "$TMP/g5-c-open.err")" >&2; return 1; }
+  grep -q 'round cap 3 reached' "$TMP/g5-c-open.err" ||
+    { echo "FAIL: C cap refusal must name the cap" >&2; return 1; }
+  return 0
+}
+
+echo "== G5: two takeovers accumulate rounds and the third job refuses at the cap =="
+case_takeover_chain || fail "G5 a takeover chain must sum rounds_used"
+echo "PASS g5 two-hop takeover rounds accumulate and refuse at the cap"
+
 echo "== MUT: assertion-RED mutants per call site =="
 
 mkmut() { # MUT NAME SED-EXPR — build a mutated wrk copy
@@ -786,5 +845,10 @@ expect_mut_red "refused rebind leaves no pane or partial record" case_takeover_r
 
 mkmut no-round-inheritance 's/used += wrk_takeover_rounds(events)/# takeover inheritance removed by mutant/'
 expect_mut_red "takeover round baseline removal" case_takeover_rounds
+
+# Every hop stores 0 instead of the predecessor's full round_scan. Valid
+# python, so the miss is the rounds_used / cap assertion, not an exception.
+mkmut no-round-chain 's/used += wrk_takeover_rounds(events)/used += 0/g'
+expect_mut_red "takeover chain under-count" case_takeover_chain
 
 echo "PASS test-wrk-task-link: all cases"

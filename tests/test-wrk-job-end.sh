@@ -150,6 +150,8 @@ start_sentinel() {
   # leaves the interval sleep inside a group teardown can name exactly —
   # `kill -- -SENTINEL_PID` reaches orphans that re-parented to init.
   tw_own_session env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" \
+    ${RECOVERY_ARBITER:+ARBITER_BIN="$RECOVERY_ARBITER"} \
+    ${RECOVERY_STUB_LOG:+RECOVERY_STUB_LOG="$RECOVERY_STUB_LOG"} \
     WRK_FIXTURE_SCENARIO="${SCENARIO:-sentinel-working}" \
     ${seq:+WRK_FIXTURE_GET_SEQUENCE="$seq"} \
     WRK_COMPLETION_TIMEOUT_S="${SENT_TIMEOUT:-300}" \
@@ -161,6 +163,90 @@ start_sentinel() {
   own "$SENTINEL_PID"
   mkdir -p "$INBOX/$job"
   printf '%s\n' "$SENTINEL_PID" >"$INBOX/$job/completion-sentinel.pid"
+}
+
+# Quota stub for the sentinel's release_job_quota_pool. The real arbiter is
+# left alone: only the sentinel process receives ARBITER_BIN (wrk copies that
+# onto ARBITER at startup) and the log path.
+recovery_arm_stub() {
+  RECOVERY_STUB_LOG="$TMP/recovery-stub-$CASE_SEQ.log"
+  : >"$RECOVERY_STUB_LOG"
+  RECOVERY_ARBITER="$TMP/recovery-arbiter-$CASE_SEQ"
+  cat >"$RECOVERY_ARBITER" <<'EOF'
+#!/bin/bash
+set -euo pipefail
+if [[ "${1:-}" == status ]]; then
+  printf '%s\n' '{"quota_pool_records":[{"pool":"claude"}]}'
+  exit 0
+fi
+if [[ "${1:-}" == release ]]; then
+  printf '%s\n' "$*" >>"${RECOVERY_STUB_LOG:?}"
+  exit 0
+fi
+exit 0
+EOF
+  chmod +x "$RECOVERY_ARBITER"
+}
+
+recovery_release_count() {
+  local n=0
+  if [[ -n "${RECOVERY_STUB_LOG:-}" && -f "$RECOVERY_STUB_LOG" ]]; then
+    n="$(grep -c '^release ' "$RECOVERY_STUB_LOG" || true)"
+  fi
+  printf '%s\n' "${n:-0}"
+}
+
+recovery_calls_at_least() {
+  local n=0
+  if [[ -f "$1" ]]; then
+    n="$(awk 'END{print NR+0}' "$1")"
+  fi
+  [[ "${n:-0}" -ge "$2" ]]
+}
+
+recovery_lost_reasons() {
+  python3 - "$1" <<'PY'
+import glob, json, sys
+reasons = []
+for path in sorted(glob.glob(sys.argv[1] + "/*job.lost.json")):
+    reasons.append(json.load(open(path, encoding="utf-8")).get("reason") or "")
+print(" ".join(reasons))
+PY
+}
+
+recovery_assert_record() {
+  python3 - "$1" "$2" "$3" <<'PY' || return 1
+import glob, json, sys
+events, reason, minimum = sys.argv[1:]
+paths = sorted(glob.glob(events + "/*job.recovered.json"))
+assert len(paths) == 1, paths
+doc = json.load(open(paths[0], encoding="utf-8"))
+assert doc.get("kind") == "job.recovered", doc
+assert doc.get("reason") == reason, doc
+duration = doc.get("lost_duration_s")
+assert isinstance(duration, int) and not isinstance(duration, bool), doc
+assert duration >= int(minimum), doc
+PY
+}
+
+# Drop the recovery knobs. A prefix on start_sentinel does not survive the
+# function, but an assignment here would, and the mutant sweep needs the
+# file defaults: interval 3600 so a removed stop cannot be saved by a wake,
+# grace 1800, and the working scenario.
+recovery_stop() {
+  if [[ -n "${SENTINEL_PID:-}" ]]; then
+    if kill -0 "$SENTINEL_PID" 2>/dev/null; then
+      kill_owned_tree "$SENTINEL_PID" || true
+    fi
+    wait "$SENTINEL_PID" 2>/dev/null || true
+  fi
+  unset LOST_GRACE SENT_INTERVAL SCENARIO TRANSIENT_MAX RECOVERY_ARBITER RECOVERY_STUB_LOG
+}
+
+recovery_fail() {
+  echo "FAIL: $*" >&2
+  recovery_stop
+  return 1
 }
 
 # done_run JOB [extra env…] — wrk done against the case fixtures.
@@ -1477,6 +1563,254 @@ sleep 0.5
 kill_owned_tree "$J36_PID"
 echo "PASS je36 verified-sentinel-suppresses-duplicate"
 
+# hk 1770: lost clears when the same probe that lost the agent finds it again.
+# Grace counts only the current episode. These bodies are also the mutant
+# targets, so every check returns instead of exiting the suite.
+
+case_recovery_stays() {
+  reset_case je37 || return 3
+  mk_job je37 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je37-$CASE_SEQ.seq" events="$INBOX/je37/events"
+  printf '%s\n' not-found working >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=8 TRANSIENT_MAX=10 \
+    start_sentinel je37 w:p1 "$TMP/je37-report.md" "$seq"
+  wait_until 20 event_count_is "$events" job.recovered 1 ||
+    recovery_fail "agent return must record one job.recovered" || return
+  event_count_is "$events" job.lost 1 ||
+    recovery_fail "one loss episode is one job.lost" || return
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "return inside the grace must not revoke" || return
+  [[ "$(recovery_release_count)" -eq 0 ]] ||
+    recovery_fail "return inside the grace must not release quota" || return
+  recovery_assert_record "$events" agent_not_found 0 ||
+    recovery_fail "job.recovered must name agent_not_found and a duration" || return
+  grep -q 'action=recovered:agent_not_found' "$INBOX/je37/completion-sentinel.log" ||
+    recovery_fail "the decision log must name the recovery" || return
+  sleep 3
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "still inside the original grace, no revoke" || return
+  sleep 6
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "agent present after recovery must never be revoked" || return
+  event_count_is "$events" job.lost 1 ||
+    recovery_fail "later polls must not open another loss" || return
+  event_count_is "$events" job.recovered 1 ||
+    recovery_fail "later polls must not record another recovery" || return
+  [[ "$(recovery_release_count)" -eq 0 ]] ||
+    recovery_fail "a live recovered job must keep its quota" || return
+  kill -0 "$SENTINEL_PID" 2>/dev/null ||
+    recovery_fail "the sentinel must stay up after recovery" || return
+  if grep -q 'watch-exit' "$INBOX/je37/completion-sentinel.log"; then
+    recovery_fail "recovery must not watch-exit" || return
+  fi
+  recovery_stop
+}
+
+case_recovery_expires() {
+  reset_case je38 || return 3
+  mk_job je38 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je38-$CASE_SEQ.seq" events="$INBOX/je38/events"
+  printf '%s\n' not-found >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=2 TRANSIENT_MAX=10 \
+    start_sentinel je38 w:p1 "$TMP/je38-report.md" "$seq"
+  wait_until 20 event_count_is "$events" job.revoked 1 ||
+    recovery_fail "continuous loss past the grace must revoke" || return
+  wait_until 10 pid_gone "$SENTINEL_PID" ||
+    recovery_fail "the sentinel must leave after the grace" || return
+  event_count_is "$events" job.lost 1 ||
+    recovery_fail "continuous loss is one job.lost" || return
+  event_count_is "$events" job.recovered 0 ||
+    recovery_fail "continuous loss must not recover" || return
+  [[ "$(recovery_release_count)" -eq 1 ]] ||
+    recovery_fail "grace expiry must release quota once (got $(recovery_release_count))" || return
+  if grep -q 'watch-exit' "$INBOX/je38/completion-sentinel.log"; then
+    recovery_fail "grace expiry must not watch-exit" || return
+  fi
+  python3 - "$events" <<'PY' || recovery_fail "grace expiry must abandon the job" || return
+import glob, json, sys
+records = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.revoked.json"))]
+assert len(records) == 1, records
+assert records[0].get("outcome") == "abandoned", records
+assert "lost" in (records[0].get("reason") or ""), records
+PY
+  recovery_stop
+}
+
+case_recovery_flap() {
+  reset_case je39 || return 3
+  mk_job je39 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je39-$CASE_SEQ.seq" events="$INBOX/je39/events" reasons
+  printf '%s\n' not-found working working not-found >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=2 TRANSIENT_MAX=10 \
+    start_sentinel je39 w:p1 "$TMP/je39-report.md" "$seq"
+  wait_until 20 event_count_is "$events" job.lost 2 ||
+    recovery_fail "a flap must record two job.lost" || return
+  # The second loss starts its own clock, so this poll cannot already be revoked.
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "the second loss must not already be past its own grace" || return
+  event_count_is "$events" job.recovered 1 ||
+    recovery_fail "the flap must record one job.recovered" || return
+  wait_until 15 event_count_is "$events" job.revoked 1 ||
+    recovery_fail "the second episode past the grace must revoke once" || return
+  event_count_is "$events" job.lost 2 ||
+    recovery_fail "revoke must not add a loss event" || return
+  event_count_is "$events" job.recovered 1 ||
+    recovery_fail "revoke must not add a recovery" || return
+  [[ "$(recovery_release_count)" -eq 1 ]] ||
+    recovery_fail "one revoke releases quota once (got $(recovery_release_count))" || return
+  if grep -q 'watch-exit' "$INBOX/je39/completion-sentinel.log"; then
+    recovery_fail "flap revoke must not watch-exit" || return
+  fi
+  reasons="$(recovery_lost_reasons "$events")"
+  [[ "$reasons" == "agent_not_found agent_not_found" ]] ||
+    recovery_fail "both episodes are agent_not_found ($reasons)" || return
+  recovery_stop
+}
+
+case_recovery_boundary() {
+  reset_case je40 || return 3
+  mk_job je40 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je40-$CASE_SEQ.seq" events="$INBOX/je40/events"
+  local deadline saw=0
+  printf '%s\n' not-found working >"$seq"
+  SENT_INTERVAL=3 LOST_GRACE=2 TRANSIENT_MAX=10 \
+    start_sentinel je40 w:p1 "$TMP/je40-report.md" "$seq"
+  deadline=$(( $(date +%s) + 20 ))
+  while (( $(date +%s) <= deadline )); do
+    if event_count_is "$events" job.revoked 1; then
+      recovery_fail "a wake past the grace must recover instead of revoking" || return
+    fi
+    if event_count_is "$events" job.recovered 1; then
+      saw=1
+      break
+    fi
+    sleep 0.2
+  done
+  [[ "$saw" -eq 1 ]] ||
+    recovery_fail "recovery must land after the sleep that crosses the grace" || return
+  recovery_assert_record "$events" agent_not_found 2 ||
+    recovery_fail "duration must cover the sleep across the grace" || return
+  sleep 6
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "recovered job must stay unrevoked past the old grace" || return
+  [[ "$(recovery_release_count)" -eq 0 ]] ||
+    recovery_fail "cross-boundary recovery must not release" || return
+  kill -0 "$SENTINEL_PID" 2>/dev/null ||
+    recovery_fail "sentinel must stay up after a late recovery" || return
+  if grep -q 'watch-exit' "$INBOX/je40/completion-sentinel.log"; then
+    recovery_fail "cross-boundary recovery must not watch-exit" || return
+  fi
+  recovery_stop
+}
+
+case_recovery_pane_only() {
+  reset_case je41 || return 3
+  mk_job je41 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je41-$CASE_SEQ.seq" events="$INBOX/je41/events"
+  printf '%s\n' not-found pane-only pane-only pane-only >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=30 TRANSIENT_MAX=10 \
+    start_sentinel je41 w:p1 "$TMP/je41-report.md" "$seq"
+  wait_until 20 recovery_calls_at_least "$seq.calls" 4 ||
+    recovery_fail "pane-only polls did not run" || return
+  event_count_is "$events" job.recovered 0 ||
+    recovery_fail "a pane without agent_status must not recover" || return
+  event_count_is "$events" job.lost 1 ||
+    recovery_fail "the initial loss must still be recorded" || return
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "pane-only must not revoke inside a long grace" || return
+  printf '%s\n' working >>"$seq"
+  wait_until 20 event_count_is "$events" job.recovered 1 ||
+    recovery_fail "class=ok after pane-only must recover once" || return
+  event_count_is "$events" job.lost 1 ||
+    recovery_fail "finding the agent must not add a loss" || return
+  event_count_is "$events" job.recovered 1 ||
+    recovery_fail "finding the agent records one recovery" || return
+  recovery_assert_record "$events" agent_not_found 0 ||
+    recovery_fail "pane-only recovery must still name agent_not_found" || return
+  recovery_stop
+}
+
+case_recovery_herdr_back() {
+  reset_case je42 || return 3
+  mk_job je42 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je42-$CASE_SEQ.seq" events="$INBOX/je42/events" reasons
+  printf '%s\n' empty empty empty empty working >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=30 TRANSIENT_MAX=3 \
+    start_sentinel je42 w:p1 "$TMP/je42-report.md" "$seq"
+  wait_until 20 event_count_is "$events" job.recovered 1 ||
+    recovery_fail "herdr reachable again must recover" || return
+  event_count_is "$events" job.lost 1 ||
+    recovery_fail "one herdr_unreachable episode" || return
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "herdr recovery must not revoke" || return
+  [[ "$(recovery_release_count)" -eq 0 ]] ||
+    recovery_fail "herdr recovery must not release" || return
+  reasons="$(recovery_lost_reasons "$events")"
+  [[ "$reasons" == herdr_unreachable ]] ||
+    recovery_fail "lost reason must be herdr_unreachable ($reasons)" || return
+  recovery_assert_record "$events" herdr_unreachable 0 ||
+    recovery_fail "job.recovered must name herdr_unreachable" || return
+  recovery_stop
+}
+
+case_recovery_herdr_gone() {
+  reset_case je43 || return 3
+  mk_job je43 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je43-$CASE_SEQ.seq" events="$INBOX/je43/events" reasons
+  printf '%s\n' empty empty empty empty not-found >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=30 TRANSIENT_MAX=3 \
+    start_sentinel je43 w:p1 "$TMP/je43-report.md" "$seq"
+  wait_until 20 event_count_is "$events" job.lost 2 ||
+    recovery_fail "gone after unreachable must open a new loss" || return
+  event_count_is "$events" job.recovered 1 ||
+    recovery_fail "herdr answering must recover the unreachable episode" || return
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "the new episode must restart the grace" || return
+  [[ "$(recovery_release_count)" -eq 0 ]] ||
+    recovery_fail "rearm must not release" || return
+  reasons="$(recovery_lost_reasons "$events")"
+  [[ "$reasons" == "herdr_unreachable agent_not_found" ]] ||
+    recovery_fail "episode order ($reasons)" || return
+  recovery_assert_record "$events" herdr_unreachable 0 ||
+    recovery_fail "recovered the unreachable episode" || return
+  recovery_stop
+}
+
+echo "== JE37: agent missing inside the grace, then found, stays live =="
+case_recovery_stays || fail "JE37 agent return must clear lost"
+echo "PASS je37 recovery-clears-lost"
+
+echo "== JE38: continuous loss past the grace still abandons and releases =="
+case_recovery_expires || fail "JE38 continuous loss must revoke and release"
+echo "PASS je38 continuous-loss-revokes"
+
+echo "== JE39: flap revokes once, from the second loss =="
+case_recovery_flap || fail "JE39 flap must revoke once from the second episode"
+echo "PASS je39 flap-revokes-from-second-loss"
+
+echo "== JE40: a wake that slept across the grace recovers =="
+case_recovery_boundary || fail "JE40 recovery must win over a grace crossed while asleep"
+echo "PASS je40 recovery-across-grace-boundary"
+
+echo "== JE41: a pane envelope without agent_status does not recover =="
+case_recovery_pane_only || fail "JE41 pane-only must not count as the agent returning"
+echo "PASS je41 pane-without-status-is-not-recovery"
+
+echo "== JE42: herdr_unreachable recovers when herdr answers =="
+case_recovery_herdr_back || fail "JE42 herdr reachable again must recover"
+echo "PASS je42 herdr-unreachable-recovers"
+
+echo "== JE43: herdr answering gone rearms agent_not_found =="
+case_recovery_herdr_gone || fail "JE43 herdr gone answer must rearm the loss"
+echo "PASS je43 herdr-unreachable-rearms-on-gone"
+
 # ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants: sed'd copies of bin/wrk (path ends in /wrk —
 # H02 — so every mutant sentinel is judged by the same argv identity rule).
@@ -2240,6 +2574,24 @@ expect_mut_red "J10 sentinel-completed-exit" case_sentinel_complete
 # shellcheck disable=SC2016
 mkmut j11-no-lostgrace-exit 's~^      sentinel_self_exit "$job" 0$~      : removed lost-grace self-exit~'
 expect_mut_red "J11 sentinel-lostgrace-exit" case_lost_grace
+
+# hk1770: clearing lost is what stops the grace. Leaving it set revokes a live agent.
+mkmut j1770-no-clear 's/lost=0 # hk1770 clear/lost=1 # hk1770 clear/'
+expect_mut_red "J1770 recovery-clears-lost" case_recovery_stays
+
+# hk1770: the grace check is the abandon path.
+# shellcheck disable=SC2016
+mkmut j1770-no-grace 's~^    if \[\[ "\$lost" -eq 1 \]\] && (( now - lost_at >= lost_grace )); then$~    if false; then~'
+expect_mut_red "J1770 continuous-loss-revokes" case_recovery_expires
+
+# hk1770: a new episode must start its own clock.
+# shellcheck disable=SC2016
+mkmut j1770-stale-clock 's/lost_at="\$now" # hk1770 episode start/: # hk1770 episode start/'
+expect_mut_red "J1770 grace-restarts-at-latest-loss" case_recovery_flap
+
+# hk1770: class=ok requires agent_status. Any parsed document is not enough.
+mkmut j1770-pane-exists 's/if status:/if True:/'
+expect_mut_red "J1770 agent-found-is-class-ok" case_recovery_pane_only
 
 # J12: sentinel record watch
 # shellcheck disable=SC2016

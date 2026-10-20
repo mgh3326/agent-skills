@@ -364,7 +364,8 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 `wrk spawn`은 job이 arbiter에 등록되면 완료 센티널을 분리 기동한다. 센티널은
 `herdr agent get <pane>` 관측을 **3분류**하고, 판정 1건마다 잡 디렉토리의
 `completion-sentinel.log`에 한 줄씩 남긴다
-(`<ts> status=<상태|empty|err:code> transient=<n> action=<none|pending|completed|lost:reason>`).
+(`<ts> status=<상태|empty|err:code> transient=<n> action=<none|pending|completed|lost:reason|recovered:reason>`).
+같은 폴이 pending·completed 이면서 회복이면 action 은 그 판정이고 줄 끝에 `recovered=<reason>` 이 붙는다.
 
 | 관측 | 분류 | 판정 |
 |---|---|---|
@@ -399,6 +400,15 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 (기본 1800초) 동안 계속 감시해 그 사이 report가 생기고 상태가 `done`/`idle`이 되면
 `job.completed`를 **추가로** 쓰고 종료한다(panewire가 completed를 relay한다).
 
+유예는 **연속 부재**만 센다. lost 상태에서 나중 폴이 에이전트를 다시 보면 `lost`를
+지우고 `job.recovered` 한 건을 남긴다(`reason`은 직전 lost 사유, `lost_duration_s`는
+그 에피소드의 초). `agent_not_found`는 `herdr_agent_probe`가 class=ok(agent_status가
+있는 응답)일 때만 풀린다. pane만 있고 상태가 없는 응답은 회복이 아니다.
+`herdr_unreachable`은 herdr가 다시 답하면(class가 transient가 아니면) 풀리고, 그 답이
+gone이면 같은 폴에서 `agent_not_found` 에피소드를 새로 연다. `timeout`은 감시 창이라
+class=ok로 풀리지 않는다. 한 에피소드의 `job.lost`는 한 건이고, 같은 상태가 이어지는
+폴은 이벤트를 더 쓰지 않는다. `job.recovered`는 terminal도 revive도 아니다.
+
 분리된 센티널은 터미널에서 유도되는 herdr 세션 컨텍스트를 잃는다. 그래서 wrk는
 스폰 시점의 `HERDR_SESSION`·`HERDR_SOCKET_PATH`·`HERDR_BIN(_PATH)`를 센티널 환경에
 명시적으로 박아 넣는다. 서버가 비기본 세션에 사는 호스트에서는
@@ -423,7 +433,7 @@ wrk reap --lane REAP_LANE --apply      # 실제로 herdr tab close
 - terminal 이벤트(`job.completed`·`job.joined`·`job.revoked`)가 있다
 - 가장 늦은 terminal 이벤트 **뒤에** `job.claim`·`job.reclaim`·`job.spawned`(·`job.reprompted`)가
   없다 — 끝난 뒤 다시 잡힌 잡은 살아 있는 작업이다(`skip … reason=reclaimed-after-terminal`).
-  `job.lost`·`quota_pool.*`는 되살림이 아니다
+  `job.lost`·`job.recovered`·`quota_pool.*`는 되살림이 아니다
 - 그 terminal 이벤트가 `--grace`(기본 10m)보다 오래됐다
 - **가장 늦은** `job.spawned` 영수증의 `pane_id`가 herdr에 살아 있고 상태가 `idle`·`done`이다.
   pane·tab은 그 영수증 하나에서 **한 벌로** 읽는다(앞선 영수증의 tab과 섞지 않고, 깨진 최신

@@ -5883,10 +5883,17 @@ PY
 }
 
 # 판정 1건 = 로그 1줄. 회전은 없다(잡 디렉토리 수명과 같다).
+# extra 가 비어 있으면 줄은 네 칸 그대로다. 회복이 pending·completed 와 같은
+# 폴에 겹치면 action 은 그 판정을 유지하고 끝에 recovered=<reason> 만 붙는다.
 sentinel_log() {
-  local logfile="$1" token="$2" transient="$3" action="$4"
-  printf '%s status=%s transient=%s action=%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$token" "$transient" "$action" >>"$logfile" 2>/dev/null || true
+  local logfile="$1" token="$2" transient="$3" action="$4" extra="${5:-}"
+  if [[ -n "$extra" ]]; then
+    printf '%s status=%s transient=%s action=%s %s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$token" "$transient" "$action" "$extra" >>"$logfile" 2>/dev/null || true
+  else
+    printf '%s status=%s transient=%s action=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$token" "$transient" "$action" >>"$logfile" 2>/dev/null || true
+  fi
 }
 
 # ── #770: job-end housekeeping ────────────────────────────────────────────
@@ -5898,13 +5905,16 @@ sentinel_log() {
 # Terminal vocabulary here is deliberately narrower than "work is over":
 #   WORK_TERMINAL = what ends this job's lifecycle (completed, completion,
 #                   joined, revoked, reaped — job.lost is NOT one: the record
-#                   is an observation gap, and a lost job may still complete)
+#                   is an observation gap, and a lost job may still complete.
+#                   job.recovered is NOT one either: it only closes that gap)
 #   HUB_TERMINAL  = what the hub and the node active-scan actually end on
 #                   (completed, completion, revoked — joined relays but keeps
-#                   the job counted, lost is explicitly not terminal)
+#                   the job counted; lost and recovered are explicitly not
+#                   terminal)
 #   REVIVE        = a record that proves the job was picked up again
 #                   (claim/claimed/reclaim/spawned/reprompted after a terminal
-#                   un-ends it — the newest record wins, as in wrk reap)
+#                   un-ends it — the newest record wins, as in wrk reap.
+#                   job.recovered is not a revive)
 
 # job_events_scan EVENTS_DIR... — one TSV row per job:
 #   job \t ended \t hub_ended \t terminal_kind \t last_event_age_s \t last_kind
@@ -5923,6 +5933,9 @@ exec(os.environ["WRK_EVENTS_PY"])
 WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped", "job.handed_off"}
 HUB_TERMINAL = {"job.completed", "job.completion", "job.revoked"}
 REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.reprompted"}
+NEUTRAL = {"job.lost", "job.recovered"}
+if NEUTRAL & (WORK_TERMINAL | HUB_TERMINAL | REVIVE):
+    raise SystemExit("neutral event kind is also terminal or revive")
 now = time.time()
 
 
@@ -6005,6 +6018,9 @@ events, job, owner, outcome, reason, source, host = sys.argv[1:]
 WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped", "job.handed_off"}
 HUB_TERMINAL = {"job.completed", "job.completion", "job.revoked"}
 REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.reprompted"}
+NEUTRAL = {"job.lost", "job.recovered"}
+if NEUTRAL & (WORK_TERMINAL | HUB_TERMINAL | REVIVE):
+    raise SystemExit("neutral event kind is also terminal or revive")
 
 # The events lock is shared with completion_event so the "is it already
 # ended" check and the append are one atomic step — `wrk done`, the sentinel
@@ -6255,6 +6271,36 @@ sentinel_self_exit() {
   exit "$code"
 }
 
+# job_recovered_record JOB OWNER LABEL PANE REASON LOST_DURATION_S
+# One flat job.recovered for the end of a lost episode. Not a terminal and
+# not a revive. Not emitted through panewire, same as job.lost.
+job_recovered_record() {
+  local job="$1" owner="$2" label="$3" pane="$4" reason="$5" duration="$6"
+  local events
+  events="$(wrk_jobs_root)/$job/events"
+  mkdir -p "$events" || return 1
+  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" "$reason" "$duration" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+
+events, job, owner, label, pane, host, reason, duration = sys.argv[1:]
+try:
+    duration_s = int(duration)
+except ValueError:
+    duration_s = 0
+if duration_s < 0:
+    duration_s = 0
+record = {"kind": "job.recovered", "job_id": job, "owner_lane": owner,
+          "label": label, "pane_id": pane, "host": host, "epoch": 1,
+          "reason": reason, "lost_duration_s": duration_s}
+lock = wrk_events_locked(events)
+try:
+    wrk_event_commit(events, "job.recovered", record)
+finally:
+    lock.close()
+PY
+}
+
 sentinel_cmd() {
   local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}"
   local pane_kind="${7:-}" observed_rung="${8:-}" scopefuel_bin="${9:-}"
@@ -6263,7 +6309,7 @@ sentinel_cmd() {
   local transient_max="${WRK_SENTINEL_TRANSIENT_MAX:-10}"
   local lost_grace="${WRK_SENTINEL_LOST_GRACE:-1800}"
   [[ -n "$job" && -n "$owner" && -n "$label" && -n "$pane" ]] || exit 2
-  local jobdir logfile started seen pending transient lost lost_at observer_script wrk_path
+  local jobdir logfile started seen pending transient lost lost_at lost_reason observer_script wrk_path
   jobdir="$(wrk_jobs_root)/$job"
   mkdir -p "$jobdir"
   logfile="$jobdir/completion-sentinel.log"
@@ -6286,21 +6332,39 @@ PY
   transient=0
   lost=0
   lost_at=0
+  lost_reason=""
   while :; do
-    local now probe class token candidate key action
+    local now probe class token candidate key action recover_reason rearm_loss log_extra
     now="$(date +%s)"
     probe="$(herdr_agent_probe "$pane")"
     IFS=$'\t' read -r class token _ <<<"$probe"
     action=none
     candidate=""
     key=""
+    recover_reason=""
+    rearm_loss=""
     case "$class" in
       gone)
         transient=0
-        if [[ "$lost" -eq 0 ]]; then action="lost:agent_not_found"; fi
+        if [[ "$lost" -eq 0 ]]; then
+          action="lost:agent_not_found"
+        elif [[ "$lost_reason" == herdr_unreachable ]]; then
+          # herdr answered. The unreachable episode ends, and a fresh
+          # agent_not_found episode starts on this same poll.
+          recover_reason="herdr_unreachable"
+          rearm_loss="agent_not_found"
+        fi
         ;;
       ok)
         transient=0
+        # Same classification that produced agent_not_found: class=ok means
+        # agent_status is present. A pane envelope without it stays transient
+        # and does not recover. timeout is a watch window, not an absence.
+        if [[ "$lost" -eq 1 ]]; then
+          case "$lost_reason" in
+            agent_not_found|herdr_unreachable) recover_reason="$lost_reason" ;;
+          esac
+        fi
         candidate="$report"
         if [[ -z "$candidate" || ! -f "$candidate" ]]; then
           candidate="$(find_latest_report "$jobdir")"
@@ -6343,7 +6407,18 @@ PY
     if [[ "$action" == none && "$lost" -eq 0 ]] && (( now - started >= timeout )); then
       action="lost:timeout"
     fi
-    sentinel_log "$logfile" "$token" "$transient" "$action"
+    # Recovery is applied after this poll's classification and after the
+    # record-watch, and before the grace check. A wake that slept across the
+    # grace boundary still recovers when the agent is present. A job another
+    # path already ended does not also get job.recovered.
+    if [[ -n "$recover_reason" && "$action" == none ]]; then
+      action="recovered:$recover_reason"
+    fi
+    log_extra=""
+    if [[ -n "$recover_reason" && "$action" != recovered:* ]]; then
+      log_extra="recovered=$recover_reason"
+    fi
+    sentinel_log "$logfile" "$token" "$transient" "$action" "$log_extra"
     # #770: the job may have ended by another path while the sentinel slept —
     # done/joined/reap/prune all leave a work-terminal record. A terminal is
     # only honoured when it is newer than every revive, so a job claimed back
@@ -6351,6 +6426,12 @@ PY
     if sentinel_job_ended "$jobdir"; then
       sentinel_log "$logfile" "$token" "$transient" "watch-exit"
       sentinel_self_exit "$job" 0
+    fi
+    if [[ -n "$recover_reason" ]]; then
+      job_recovered_record "$job" "$owner" "$label" "$pane" "$recover_reason" "$(( now - lost_at ))"
+      lost=0 # hk1770 clear
+      lost_reason=""
+      lost_at=0
     fi
     case "$action" in
       completed)
@@ -6370,9 +6451,16 @@ PY
       lost:*)
         completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "${action#lost:}" >/dev/null
         lost=1
-        lost_at="$now"
+        lost_reason="${action#lost:}"
+        lost_at="$now" # hk1770 episode start
         ;;
     esac
+    if [[ -n "$rearm_loss" ]]; then
+      completion_event "$job" "$owner" "$label" "$pane" "${report:-/dev/null}" job.lost "$rearm_loss" >/dev/null
+      lost=1
+      lost_reason="$rearm_loss"
+      lost_at="$now" # hk1770 rearm start
+    fi
     if [[ "$lost" -eq 1 ]] && (( now - lost_at >= lost_grace )); then
       # #770: the grace expired without a completion. job.lost is not a hub
       # terminal, so declare the end (newest-revive wins, so a respawned job
@@ -10024,14 +10112,18 @@ include_builders = include_builders == "1"
 TERMINAL = {"job.completed", "job.joined", "job.revoked", "job.handed_off"}
 # 종료 뒤에 이 중 하나가 오면 그 잡은 다시 살아난 것이다(완료 → 재클레임 → 작업 중
 # 잠깐 idle). 상태 검사(idle|done)는 긴 턴 중 오표시가 실측돼 있어 마지막 방어선이
-# 못 된다 — 판정은 인박스 순서로 한다. job.lost·quota_pool.* 는 되살림이 아니다
-# (넣으면 completed → lost 인 정상 종결 잡이 영구히 빠진다). job.reprompted 는 아직
+# 못 된다 — 판정은 인박스 순서로 한다. job.lost·job.recovered·quota_pool.* 는
+# 되살림이 아니다 (넣으면 completed → lost 인 정상 종결 잡이 영구히 빠지고,
+# 회복 한 건이 끝난 잡을 다시 연다). job.reprompted 는 아직
 # 없는 종류지만(#113 ①) 생기면 같은 뜻이다.
 # The order is the shared (event time, mtime, name) key: two writers number
 # this directory independently, so the newest job.spawned must win by time —
 # a respawned job whose spawned receipt has a lower prefix than its terminal
 # is never a candidate (#1750).
 REVIVE = {"job.claim", "job.reclaim", "job.spawned", "job.reprompted"}
+NEUTRAL = {"job.lost", "job.recovered"}
+if NEUTRAL & (TERMINAL | REVIVE):
+    raise SystemExit("neutral event kind is also terminal or revive")
 now = time.time()
 
 
@@ -10382,6 +10474,7 @@ lanes_missing_cmd() {
   # Open-job reading mirrors reap_candidates: a claim/reclaim records
   # owner_lane/parent_lane/role, terminal kinds close the job, claim/
   # reclaim/spawned/reprompted reopen it, job.reaped closes it for good.
+  # job.lost and job.recovered are neutral: they neither close nor reopen.
   # Findings print as key=value lines; the summary is the last line.
   wrk_py - "$jobs_root" "$listing" <<'PY'
 import json, os, sys
@@ -10405,6 +10498,9 @@ for row in rows:
 
 TERMINAL = {"job.completed", "job.joined", "job.revoked", "job.handed_off"}
 REVIVE = {"job.claim", "job.reclaim", "job.spawned", "job.reprompted"}
+NEUTRAL = {"job.lost", "job.recovered"}
+if NEUTRAL & (TERMINAL | REVIVE):
+    raise SystemExit("neutral event kind is also terminal or revive")
 try:
     jobs = sorted(os.listdir(root))
 except OSError:
