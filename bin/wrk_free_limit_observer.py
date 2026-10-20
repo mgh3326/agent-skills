@@ -516,6 +516,9 @@ def main(argv: list[str] | None = None) -> int:
         pane_failure = ""
         try:
             observe_pane(args, transcript)
+        except RecursionError:
+            # Deeply nested damaged JSON must not stop the free-limit hold.
+            pane_failure = "pane-observer-skipped-recursion-error"
         except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
             # A damaged audit state must not disable the existing quota hold.
             pane_failure = "pane-observer-failed-state-io"

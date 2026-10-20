@@ -38,6 +38,18 @@ class EligibilityFixtures(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
+        self.jobs = Path(self.temp.name) / "jobs"
+        env = mock.patch.dict(os.environ, {"ARBITER_INBOX_ROOT": str(self.jobs)})
+        env.start()
+        self.addCleanup(env.stop)
+        # Legacy profile/grade fixtures still need resolvable contributor jobs.
+        # Seed only their known sessions; never create records in check().
+        for session in ("builder-session", "advisor-session", "builder", "advisor"):
+            events = self.jobs / session / "events"
+            events.mkdir(parents=True)
+            (events / "00001-job.spawned.json").write_text(json.dumps({
+                "kind": "job.spawned", "job_id": session,
+                "payload": {"pane_id": session}}))
         self.repo = Path(self.temp.name) / "repo"
         self.repo.mkdir()
         git(self.repo, "init", "-q")
@@ -543,6 +555,78 @@ class EligibilityFixtures(unittest.TestCase):
         record("03-job.model_observed.json", "Fusion · GPT-6.1 Sol ◆ NewModel High")
         self.assert_case(self.check(evidence), "independence", "UNVERIFIED", "FAMILY_UNKNOWN")
         self.assert_case(self.check(evidence), "contributors", "UNVERIFIED", "CONTRIBUTOR_MODEL_UNATTRIBUTED")
+
+    def session_contributor(self, pane="w1:pK5", at="2026-10-20T16:00:00Z"):
+        evidence = self.evidence(self.make_head(), task="1730", declared_t="T3",
+                                 required_grade="A+", implementation_grade="A+")
+        evidence["contributors"] = [{"profile": "devin-swe2", "model": "swe-2", "effort": "",
+            "role": "worker", "kind": "initial", "session": pane, "at": at,
+            "worktree": "/tmp/contributor"}]
+        evidence["tester"] = {"planned_profile": "codex-sol", "planned_effort": "xhigh"}
+        return evidence
+
+    def contributor_job(self, job, pane, at, raw, name="00003-job.spawned.json", mtime=None):
+        events = self.jobs / job / "events"
+        events.mkdir(parents=True)
+        receipt = events / name
+        receipt.write_text(json.dumps({"job_id": job, "kind": "job.spawned", "created_at": at,
+                                      "payload": {"pane_id": pane, "task_id": "1730"}}))
+        if mtime is not None:
+            os.utime(receipt, (mtime, mtime))
+        (events / "observer-job.model_observed.json").write_text(json.dumps({
+            "kind": "job.model_observed", "payload": dict(eligible.parse_model_line(raw), task_id="1730")}))
+        return receipt
+
+    def test_session_only_unresolved_never_passes_with_fusion_history_elsewhere(self):
+        evidence = self.session_contributor()
+        self.contributor_job("contrib-job", "w1:another-pane", "2026-10-20T15:00:00Z",
+                             "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium")
+        checks = self.check(evidence)
+        self.assert_case(checks, "contributors", "UNVERIFIED", "CONTRIBUTOR_JOB_UNRESOLVED")
+        self.assert_case(checks, "independence", "UNVERIFIED", "FAMILY_UNKNOWN")
+        original = eligible.contributor_observations
+        def absent_dir_verified(item, task):
+            families, records, verified, resolution = original(item, task)
+            return families, records, True, resolution
+        with mock.patch.object(eligible, "contributor_observations", side_effect=absent_dir_verified):
+            with self.assertRaises(AssertionError):
+                self.assert_case(self.check(evidence), "independence", "UNVERIFIED", "FAMILY_UNKNOWN")
+        evidence["contributors"][0]["job_id"] = "contrib-job"
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_T3")
+        evidence["contributors"][0]["job_id"] = "missing"
+        self.assert_case(self.check(evidence), "contributors", "UNVERIFIED", "CONTRIBUTOR_JOB_RECORD_MISSING")
+
+    def test_reused_pane_selects_job_before_contribution_and_names_receipt(self):
+        evidence = self.session_contributor()
+        prior = self.contributor_job("prior-job", "w1:pK5", "2026-10-20T15:00:00Z",
+                                    "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium", name="00099-job.spawned.json")
+        self.contributor_job("later-job", "w1:pK5", "2026-10-20T17:00:00Z", "SWE-2 High",
+                             name="00001-job.spawned.json")
+        checks, bound = eligible.evaluate(evidence, "pre-spawn", self.policy, self.policy_check)
+        self.assert_case(checks, "independence", "FAIL", "SAME_FAMILY_T3")
+        record = checks["contributors"]["job_records"][0]
+        self.assertEqual((record["job_id"], record["source"], record["path"]),
+                         ("prior-job", "job.spawned", str(prior)))
+        self.assertEqual(bound["contributor_job_records"], [record])
+        # A contribution after reuse selects the other job and changes the digest.
+        evidence["contributors"][0]["at"] = "2026-10-20T18:00:00Z"
+        checks, later = eligible.evaluate(evidence, "pre-spawn", self.policy, self.policy_check)
+        self.assert_case(checks, "independence", "PASS", "CROSS_FAMILY")
+        self.assertEqual(checks["contributors"]["job_records"][0]["job_id"], "later-job")
+        self.assertNotEqual(bound["contributors_digest"], later["contributors_digest"])
+        del evidence["contributors"][0]["at"]
+        self.assert_case(self.check(evidence), "contributors", "UNVERIFIED", "CONTRIBUTOR_TIME_MISSING")
+
+    def test_pane_receipts_use_hk1750_whole_second_mtime_order(self):
+        evidence = self.session_contributor()
+        self.contributor_job("earlier-write", "w1:pK5", "2026-10-20T15:00:00.900Z", "SWE-2 High",
+                             name="00099-job.spawned.json", mtime=100)
+        self.contributor_job("later-write", "w1:pK5", "2026-10-20T15:00:00Z",
+                             "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium",
+                             name="00001-job.spawned.json", mtime=101)
+        checks = self.check(evidence)
+        self.assert_case(checks, "independence", "FAIL", "SAME_FAMILY_T3")
+        self.assertEqual(checks["contributors"]["job_records"][0]["job_id"], "later-write")
 
     def test_new_contributor_observation_invalidates_previous_receipt(self):
         evidence = self.evidence(self.make_head())

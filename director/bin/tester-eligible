@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import fnmatch
 import hashlib
 import json
@@ -1397,15 +1398,72 @@ def contributor_role(item: dict) -> str:
     return item.get("role", "builder")
 
 
-def contributor_observations(item: dict, task: object) -> tuple[set[str], list[dict], bool]:
-    """Union every historical observation from this contributor's job, never latest-only."""
-    explicit = item.get("job_record_dir")
-    job = item.get("job_id") or item.get("job") or item.get("session", "")
+def _job_record(item: dict) -> tuple[Path | None, dict]:
+    """Resolve a job directory, retaining the receipt used for a pane alias."""
     jobs = Path(os.environ.get("ARBITER_INBOX_ROOT", str(Path.home() / "work/herdr-inbox/jobs")))
-    directory = Path(explicit) if explicit else jobs / job
-    if not (directory / "events").is_dir():
-        return set(), [], not bool(explicit or item.get("job_id") or item.get("job"))
+    explicit = item.get("job_record_dir")
+    job = item.get("job_id") or item.get("job")
+    session = item.get("session", "")
+    directory = Path(explicit) if explicit else jobs / (job or session)
+    source = "job_record_dir" if explicit else "job_id" if job else "session_job_directory"
+    if explicit or job or (":" not in session and (directory / "events").is_dir()):
+        record = dict(job_id=job or directory.name, source=source, path=str(directory))
+        if (directory / "events").is_dir():
+            return directory, record
+        return None, dict(record, reason="CONTRIBUTOR_JOB_RECORD_MISSING")
+    # Pane ids are recycled. Never pick an arbitrary matching job, or one
+    # spawned after this contribution. Evidence must supply its own time.
+    try:
+        cutoff = parse_time(item.get("at") or item.get("time")).timestamp()
+    except (ValueError, TypeError, OverflowError, OSError):
+        return None, dict(source="job.spawned", reason="CONTRIBUTOR_TIME_MISSING")
+    candidates = []
+    try:
+        paths = sorted(jobs.glob("*/events/*job.spawned.json"))
+        for path in paths:
+            document = json.loads(path.read_text())
+            data = document.get("payload", document)
+            if document.get("kind") != "job.spawned" or data.get("pane_id") != session:
+                continue
+            mtime = path.stat().st_mtime
+            moment = None
+            # hk 1750: event time (created_at/at, envelope then payload),
+            # otherwise mtime; whole seconds, then mtime, then filename.
+            for value in (document.get("created_at"), document.get("at"),
+                          data.get("created_at"), data.get("at")):
+                try:
+                    if not isinstance(value, str) or not value.strip():
+                        continue
+                    moment = datetime.fromisoformat(value.strip().replace("Z", "+00:00")).timestamp()
+                    break
+                except (ValueError, TypeError, OverflowError, OSError):
+                    continue
+            moment = mtime if moment is None else moment
+            if moment <= cutoff:
+                record = dict(job_id=document.get("job_id") or path.parents[1].name,
+                              source="job.spawned", path=str(path), receipt=document)
+                candidates.append(((int(moment), mtime, path.name), path.parents[1], record))
+    except (OSError, ValueError, TypeError, AttributeError, RecursionError):
+        return None, dict(source="job.spawned", reason="CONTRIBUTOR_JOB_RECORD_UNREADABLE")
+    if not candidates:
+        return None, dict(source="job.spawned", reason="CONTRIBUTOR_JOB_UNRESOLVED")
+    candidates.sort(key=lambda candidate: candidate[0])
+    if len(candidates) > 1 and candidates[-1][0] == candidates[-2][0]:
+        return None, dict(source="job.spawned", reason="CONTRIBUTOR_JOB_AMBIGUOUS")
+    _, directory, record = candidates[-1]
+    return directory, record
+
+
+def contributor_observations(item: dict, task: object) -> tuple[set[str], list[dict], bool, dict]:
+    """Union every historical observation from this contributor's resolved job."""
+    directory, resolution = _job_record(item)
+    if directory is None:
+        return set(), [], False, resolution
     families, records, verified = set(), [], True
+    # Binding the selected spawn receipt prevents a recycled pane resolving to
+    # a different job between eligibility calls without invalidating the prior.
+    if resolution.get("receipt"):
+        records.append({"contributor_job": resolution})
     for path in sorted((directory / "events").glob("*.json")):
         try:
             doc = json.loads(path.read_text())
@@ -1423,9 +1481,11 @@ def contributor_observations(item: dict, task: object) -> tuple[set[str], list[d
                 verified = False
             else:
                 families.update(parsed["families"])
-        except (OSError, ValueError, TypeError, AttributeError):
+        except (OSError, ValueError, TypeError, AttributeError, RecursionError):
             verified = False
-    return families, records, verified
+    if not verified:
+        resolution = dict(resolution, reason="CONTRIBUTOR_MODEL_UNATTRIBUTED")
+    return families, records, verified, resolution
 
 
 def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
@@ -1471,6 +1531,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
     contributor_profiles = []
     observed_families: set[str] = set()
     observed_records: list[dict] = []
+    contributor_job_records: list[dict] = []
     contributor_resolved = []
     contributors = evidence.get("contributors")
     if not isinstance(contributors, list) or not contributors:
@@ -1482,11 +1543,12 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
                 item.get("kind") not in {"initial", "fix", "prescription"}):
                 failures.append("CONTRIBUTOR_PROVENANCE_MISSING")
                 continue
-            families, records, verified = contributor_observations(item, evidence.get("task"))
+            families, records, verified, resolution = contributor_observations(item, evidence.get("task"))
+            contributor_job_records.append(dict(session=item["session"], **resolution))
             observed_families.update(families)
             observed_records.extend(records)
             if not verified:
-                failures.append("CONTRIBUTOR_MODEL_UNATTRIBUTED")
+                failures.append(resolution["reason"])
             role = contributor_role(item)
             resolved, check = resolve_profile(item.get("profile", ""), policy, actual_model=item.get("model"),
                                               actual_effort=item.get("effort"), role=role,
@@ -1497,9 +1559,11 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
                 failures.append(check["reason_code"])
             else:
                 contributor_profiles.append({**resolved, "role": role})
-        checks["contributors"] = (result("UNVERIFIED", failures[0], "spawn-worker:2-4") if failures else
+        checks["contributors"] = (result("UNVERIFIED", failures[0], "spawn-worker:2-4",
+                                         job_records=contributor_job_records) if failures else
                                   result("PASS", "CONTRIBUTOR_UNION_RESOLVED", "spawn-worker:2-4",
-                                         families=sorted({p["family"] for p in contributor_profiles} | observed_families)))
+                                         families=sorted({p["family"] for p in contributor_profiles} | observed_families),
+                                         job_records=contributor_job_records))
 
     tester = evidence.get("tester") if isinstance(evidence.get("tester"), dict) else {}
     planned_alias = tester.get("planned_profile")
@@ -1615,7 +1679,7 @@ def evaluate(evidence: dict, stage: str, policy: dict, policy_check: dict,
     bound = {**evidence,
              "diff_sha256": surface["diff_sha256"] if surface else None,
              "contributors_digest": _digest([contributors, observed_records]) if observed_records else _digest(contributors),
-             "split_analysis": split_info}
+             "split_analysis": split_info, "contributor_job_records": contributor_job_records}
     if stage == "pre-spawn":
         checks["prior"] = result("N/A", "FIRST_CALL_POINT", "decision:3231")
         checks["report"] = result("N/A", "TESTER_NOT_SPAWNED", "decision:3231")
@@ -1760,6 +1824,7 @@ def main() -> int:
                "split": evidence.get("split"), "split_analysis": bound.get("split_analysis"),
                "round_ext_ref": evidence.get("round_ext_ref"),
                "diff_sha256": bound.get("diff_sha256"), "contributors_digest": bound.get("contributors_digest"),
+               "contributor_job_records": bound.get("contributor_job_records"),
                "planned_tester_profile": (evidence.get("tester") or {}).get("planned_profile"),
                "planned_tester_effort": (evidence.get("tester") or {}).get("planned_effort"),
                "actual_tester_profile": (evidence.get("tester") or {}).get("actual_profile"),

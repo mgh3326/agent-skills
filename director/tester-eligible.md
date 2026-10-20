@@ -37,8 +37,15 @@ Contributors is an array of initial, fix, and prescription contributors. Each
 entry includes profile, model, effort, role, kind, session, and worktree.
 For contributor jobs, include job_record_dir or job_id/job; otherwise session
 is resolved beneath ARBITER_INBOX_ROOT (default ~/work/herdr-inbox/jobs).
+For a pane session, supply the contribution timestamp in at (or time), with
+a timezone. The gate selects the newest job.spawned receipt for that pane
+before that timestamp, using hk 1750 order (whole-second event time, mtime,
+filename), and reports the selected job_id, source and receipt path in
+contributor_job_records and the contributors check. A missing timestamp,
+unresolvable job, ambiguous order or unreadable record gives a named
+UNVERIFIED reason. The selected receipt also binds the contributor digest.
 All job.model_observed events add their parsed families to the spawned family
-union. Unknown parts or unreadable explicit job records make independence
+union. Unknown parts or unreadable job records make independence
 UNVERIFIED; observation history also binds the contributor receipt digest. The
 tester has planned_profile and planned_effort at pre-spawn. Later calls also
 need actual_profile, actual_model, actual_effort, session, worktree, pane,

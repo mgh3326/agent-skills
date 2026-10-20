@@ -151,6 +151,8 @@ class FreeLimitObserverTests(unittest.TestCase):
             parsed = models.parse_model_line(raw)
             self.assertTrue(parsed["attributed"], raw)
             self.assertEqual(models.latest_model_line(raw), raw)
+        sidekick = models.parse_model_line(labels[0])["parts"][1]
+        self.assertEqual((sidekick["pool"], sidekick["bucket"]), ("devin", "free"))
         for status in ("Devin update available", "Opus is thinking about it", "Fusion mode enabled",
                        "GPT-6.1 Sol please fix this", "> SWE-2 High", "Fusion · please use GPT-6.1 Sol ◆ SWE-2 Medium"):
             self.assertEqual(models.latest_model_line(labels[0] + "\n" + status), labels[0])
@@ -214,7 +216,9 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(observed[-1]["families"], ["openai"])
         self.assertEqual([part["account"] for part in observed[-1]["parts"]], ["devin-linked"] * 2)
         self.assertEqual([part["account_tag"] for part in observed[-1]["parts"]], ["01234567"] * 2)
-        self.assertEqual(len([doc for doc in events if doc["kind"] == "quota_pool.drift"]), 2)
+        drifts = [observer.payload(doc) for doc in events if doc["kind"] == "quota_pool.drift"]
+        self.assertEqual([(doc["from_pool"], doc["to_pool"]) for doc in drifts],
+                         [("devin", ["codex", "devin"]), ("devin", ["codex"])])
         self.assertEqual(json.loads((jobdir / "events/00001-quota_pool.record.json").read_text())["payload"], {"pool": "devin"})
         for rung in ("devin-swe2", "builder-devin-max", "devin-ds41", "devin-fusion-sol61-xhigh"):
             events = self.pane_observe(models.expected_label(rung), at, rung=rung, job=rung)
@@ -222,8 +226,27 @@ class FreeLimitObserverTests(unittest.TestCase):
         events = self.pane_observe("Fusion · GPT-6.1 Sol ◆ Unknown High", "2026-10-20T07:03:00Z")
         self.assertFalse(observer.payload(events[-1])["attributed"])
 
+    def test_model_return_a_to_b_to_a_records_each_change(self):
+        a, b = "SWE-2 High", "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium"
+        for raw, at in ((a, "07:00:00"), (b, "07:01:00"), (a, "07:02:00")):
+            events = self.pane_observe(raw, "2026-10-20T" + at + "Z")
+        self.assertEqual([observer.payload(doc)["raw_line"] for doc in events
+                          if doc["kind"] == "job.model_observed"], [a, b, a])
+
+    def test_deeply_nested_audit_event_does_not_disable_hold(self):
+        events = self.root / "deep-event/events"
+        events.mkdir(parents=True)
+        (events / "00009-bad.json").write_text("[" * 200000)
+        result = self.run_helper(provider_notice("Reached free model rate limit reset in 1 minute"),
+                                 "2026-10-20T07:00:00Z", job="deep-event")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("observer-ok-reset=2026-10-20T07:01:00Z", result.stdout)
+        self.assertIn("pane-observer-skipped-recursion-error", result.stdout)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.calls()[0][:2], ["observe", "devin-free-limit"])
+
     def test_free_stall_reset_margin_once_and_progress_clears(self):
-        text = provider_notice("Reached free model rate limit reset in 1 minute")
+        text = provider_notice("Reached free model rate limit reset in 1 minute") + "SWE-2 High\n"
         start = "2026-10-20T07:00:00Z"
         with mock.patch.object(observer, "emit_stall", return_value=True) as emit:
             self.pane_observe(text, start)
@@ -240,7 +263,7 @@ class FreeLimitObserverTests(unittest.TestCase):
             for job, progress in (("content-progress", True), ("event-progress", False)):
                 self.pane_observe(text, start, job=job)
                 if not progress:
-                    observer.atomic_json(self.root / job / "events/00001-job.progress.json", dict(kind="job.progress"))
+                    observer.atomic_json(self.root / job / "events/00002-job.progress.json", dict(kind="job.progress"))
                 changed = text + "work resumed\n" if progress else text
                 self.pane_observe(changed, "2026-10-20T07:01:30Z", job=job)
                 events = self.pane_observe(changed, "2026-10-20T07:10:00Z", job=job)
@@ -624,6 +647,7 @@ class FreeLimitObserverTests(unittest.TestCase):
         *,
         wrk_path: Path | None = None,
         pane_text: str | None = None,
+        owner: str = "worker",
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         pane_log = self.root / f"{job}-herdr.jsonl"
         herdr = self.root / f"{job}-herdr-stub"
@@ -652,11 +676,22 @@ class FreeLimitObserverTests(unittest.TestCase):
             STUB_HERDR_LOG=str(pane_log),
             STUB_PANE_TEXT=pane_text or provider_notice("Reached free model rate limit; reset in 50 minutes"),
         )
+        # Capture the real sentinel-to-helper argv without changing the helper.
+        shimdir = self.root / (job + "-bin")
+        shimdir.mkdir()
+        shim = shimdir / "python3"
+        shim.write_text("#!" + sys.executable + "\nimport json, os, sys\n"
+                        "if any(a.endswith('wrk_free_limit_observer.py') for a in sys.argv[1:]):\n"
+                        "    with open(os.environ['HELPER_ARGV_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                        "os.execv(sys.executable, [sys.executable] + sys.argv[1:])\n")
+        shim.chmod(0o700)
+        env.update(PATH=str(shimdir) + os.pathsep + os.defpath,
+                   HELPER_ARGV_LOG=str(self.root / (job + "-helper.jsonl")))
         args = [
             str(wrk_path or ROOT / "bin" / "wrk"),
             "sentinel",
             job,
-            "worker",
+            owner,
             "test",
             "pane-1",
             "",
@@ -705,8 +740,11 @@ class FreeLimitObserverTests(unittest.TestCase):
     def test_sentinel_real_callsite_records_latest_model_parts_without_pane_input(self):
         label = "Fusion · GPT-6.1 Sol ◆ GPT-6 Luna High"
         text = "SWE-2 High\n" + label + "\nDevin update available"
-        result, log = self.run_sentinel("model-callsite", "devin", "devin-swe2", pane_text=text)
+        result, log = self.run_sentinel("model-callsite", "devin", "devin-swe2", pane_text=text, owner="owner-lane-x")
         self.assertEqual(result.returncode, 0, result.stderr)
+        argv = json.loads((self.root / "model-callsite-helper.jsonl").read_text().splitlines()[0])
+        self.assertIn("--owner-lane", argv)
+        self.assertEqual(argv[argv.index("--owner-lane") + 1], "owner-lane-x")
         observed = [observer.payload(doc) for doc in observer.job_events(self.root / "jobs/model-callsite")
                     if doc["kind"] == "job.model_observed"]
         self.assertEqual(len(observed), 1)
