@@ -295,13 +295,27 @@ def _label_tokens(value: str) -> list[str]:
     return re.findall(r"[a-z0-9]+", value.casefold())
 
 
+def _latest_model_footer(snapshot: str) -> str | None:
+    """Return the newest last-five line that starts like a model footer.
+
+    Fusion-GPT labels vary in spacing and separators, so this keeps the shared
+    footer prefix list without the generic path's " · " requirement. Only the
+    newest such line counts: an older Fusion-Sol label followed by another
+    model footer is stale (hk 1729 r2).
+    """
+    footer_lines = [line for line in snapshot.splitlines()[-5:]
+                    if re.match(
+                        r"^\s*[│┃╭╰─\s]*(?:Grok|GPT-|Opus|Sonnet|Haiku|Fable|Kimi|Devin|Deepseek|Fusion)",
+                        line, re.IGNORECASE)]
+    return footer_lines[-1] if footer_lines else None
+
+
 def _fusion_sol_profile(snapshot: str, policy: dict, *, spawn_profile: str = "",
                         quota_profile: str = "") -> dict | None:
     """Resolve the shared Fusion-Sol pane label using this job's own records."""
     expected = ["fusion", "gpt", "6", "1", "sol", "swe", "2", "medium"]
-    footer_lines = [line for line in snapshot.splitlines()[-5:]
-                    if re.match(r"^\s*[│┃╭╰─\s]*Fusion", line, re.IGNORECASE)]
-    if not any(_label_tokens(line)[:len(expected)] == expected for line in footer_lines):
+    latest = _latest_model_footer(snapshot)
+    if latest is None or _label_tokens(latest)[:len(expected)] != expected:
         return None
     xhigh = "devin-fusion-sol61-xhigh"
     profile = xhigh if xhigh in {spawn_profile, quota_profile} else "devin-fusion-sol61"
@@ -333,16 +347,15 @@ def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
     }.get(model, model)
     if display.startswith("Fusion · GPT-"):
         expected = _label_tokens(display)
-        footer_lines = [line for line in snapshot.splitlines()[-5:]
-                        if re.match(r"^\s*[│┃╭╰─\s]*Fusion", line, re.IGNORECASE)]
-        return any(_label_tokens(line)[:len(expected)] == expected for line in footer_lines)
+        latest = _latest_model_footer(snapshot)
+        return latest is not None and _label_tokens(latest)[:len(expected)] == expected
     if display.startswith("Fusion · "):
         suffix = r"(?:\s|$)"
     else:
         suffix = rf"\s*(?:\(\s*{re.escape(effort)}\s*\)|{re.escape(effort)})\s*·" if effort else r"\s*·"
     pattern = re.compile(rf"^\s*[│┃╭╰─\s]*{re.escape(display)}{suffix}", re.IGNORECASE)
     footer_lines = [line for line in snapshot.splitlines()[-5:]
-                    if re.match(
+                    if " · " in line and re.match(
                         r"^\s*[│┃╭╰─\s]*(?:Grok|GPT-|Opus|Sonnet|Haiku|Fable|Kimi|Devin|Deepseek|Fusion)",
                         line, re.IGNORECASE)]
     return bool(footer_lines) and bool(pattern.search(footer_lines[-1]))

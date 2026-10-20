@@ -119,6 +119,43 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
         for profile in ("devin-swe2", "devin-ds41"):
             self.assertIn(f"gate -m {profile}", gate_calls)
 
+    def launched_model(self, profile: str) -> str:
+        executed = (self.root / f"herdr-{profile}.log.executed").read_text(encoding="utf-8")
+        launches = [line.split() for line in executed.splitlines()
+                    if line.split()[:1] == ["devin"]]
+        self.assertEqual(len(launches), 1, f"{profile}: {executed}")
+        argv = launches[0]
+        self.assertEqual(argv.count("--model"), 1, argv)
+        return argv[argv.index("--model") + 1]
+
+    def test_xhigh_gates_as_itself_on_codex(self) -> None:
+        # hk 1729 r2 B4: the xhigh spelling gates at its own catalog row and
+        # records the codex pool, never devin-swe2 or the devin pool.
+        profile = "devin-fusion-sol61-xhigh"
+        payload = self.spawn(profile)["payload"]
+        self.assertEqual((payload["profile"], payload["pool"], payload["launch_profile"]),
+                         (profile, "codex", profile))
+        self.assertEqual(self.scopefuel_log.read_text(encoding="utf-8").splitlines()[0],
+                         f"gate -m {profile}")
+        herdr = (self.root / f"herdr-{profile}.log").read_text(encoding="utf-8")
+        self.assertIn("--env ARBITER_RESOURCE=codex ", herdr)
+        self.assertIn(f"--env ARBITER_PROFILE={profile} ", herdr)
+
+    def test_launch_argv_never_uses_a_fast_model(self) -> None:
+        # hk 1729 decision: -fast bills Devin quota, so neither spelling may
+        # launch a -fast id in any position (suffix or infix).
+        expected = {
+            "devin-fusion-sol61": "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+            "devin-fusion-sol61-xhigh": "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium",
+        }
+        for profile, model in expected.items():
+            with self.subTest(profile=profile):
+                self.spawn(profile)
+                launched = self.launched_model(profile)
+                self.assertNotIn("-fast", launched.casefold())
+                self.assertFalse(launched.casefold().endswith("fast"), launched)
+                self.assertEqual(launched, model)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

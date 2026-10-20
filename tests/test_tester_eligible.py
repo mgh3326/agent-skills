@@ -501,6 +501,13 @@ class EligibilityFixtures(unittest.TestCase):
         self.assertEqual((anthropic["family"], common.model_family(anthropic["model"])),
                          ("anthropic", "anthropic"))
         self.assertNotEqual(fusion["family"], anthropic["family"])
+        # hk 1729 r2 B5: tester separation reads this file, so all four
+        # rows are openai here even though scopefuel's informational
+        # provider_family says codex for codex-sol and codex-luna.
+        self.assertEqual({name: self.policy["profiles"][name]["family"] for name in (
+            "codex-sol", "codex-luna", "devin-fusion-sol61", "devin-fusion-sol61-xhigh")},
+            dict.fromkeys(("codex-sol", "codex-luna", "devin-fusion-sol61",
+                           "devin-fusion-sol61-xhigh"), "openai"))
         for profile, model in (
             ("devin-fusion-sol61", "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium"),
             ("devin-fusion-sol61-xhigh", "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium"),
@@ -509,6 +516,70 @@ class EligibilityFixtures(unittest.TestCase):
                                                actual_effort="", role="builder", root=ROOT)
             self.assertEqual((check["status"], check["reason_code"]),
                              ("FAIL", "PROFILE_ROLE_DENIED"))
+
+    def test_existing_model_footers_match_base_differential(self) -> None:
+        # hk 1729 r2 B1: the Fusion-Sol change must not move the generic
+        # footer path. The fixture holds the round-1 tester's 133 cases with
+        # the answers recorded from base main; every one must stay the same.
+        fixture = json.loads((ROOT / "tests/fixtures/tester-eligible-footer-differential.json")
+                             .read_text(encoding="utf-8"))
+        cases = fixture["cases"]
+        self.assertEqual(len(cases), 133)
+        self.assertFalse([case for case in cases if "fusion-gpt-" in case["model"]])
+        changed = [(case["model"], case["effort"], case["snapshot"])
+                   for case in cases
+                   if eligible._pane_model_matches(case["snapshot"], case["model"], case["effort"])
+                   != case["base_match"]]
+        self.assertEqual(changed, [])
+
+    def test_fusion_sol_judges_only_the_latest_model_footer(self) -> None:
+        # hk 1729 r2 B2: an older Fusion-Sol label followed by a newer model
+        # footer is stale, as for the Claude fusion precedent.
+        label = "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium"
+        stale = (
+            label + "\nFusion · Claude Opus 5.5 ◆ SWE-2 Medium",
+            label + "\nFusion · Claude Sonnet 5.5 ◆ SWE-2 Medium",
+            label + "\nOpus 5.5 (high) · ~/work",
+            label + "\nGPT-6.1-Sol (xhigh) · ~/work",
+        )
+        for snapshot in stale:
+            for model in ("fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+                          "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium"):
+                with self.subTest(snapshot=snapshot, model=model):
+                    self.assertFalse(eligible._pane_model_matches(snapshot, model, ""))
+            with self.subTest(snapshot=snapshot):
+                self.assertIsNone(eligible._fusion_sol_profile(snapshot, self.policy))
+                self.assertIsNone(eligible._fusion_sol_profile(
+                    snapshot, self.policy, spawn_profile="devin-fusion-sol61-xhigh"))
+        latest = "Fusion · Claude Opus 5.5 ◆ SWE-2 Medium\n" + label + "\n? for shortcuts"
+        self.assertTrue(eligible._pane_model_matches(
+            latest, "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium", ""))
+        self.assertEqual(eligible._fusion_sol_profile(latest, self.policy)["profile"],
+                         "devin-fusion-sol61")
+        self.assertFalse(eligible._pane_model_matches(
+            latest, "fusion-claude-opus-5-5-high-sidekick-swe-2-medium", ""))
+
+    def test_fusion_sol_label_rejects_other_lead_sidekick_and_version(self) -> None:
+        negatives = {
+            "wrong lead": "Fusion · GPT-6.1 Luna ◆ SWE-2 Medium",
+            "wrong lead family": "Fusion · Claude Opus 5.5 ◆ SWE-2 Medium",
+            "wrong sidekick rung": "Fusion · GPT-6.1 Sol ◆ SWE-2 Max",
+            "wrong sidekick model": "Fusion · GPT-6.1 Sol ◆ SWE-1.7 Medium",
+            "older version": "Fusion · GPT-6 Sol ◆ SWE-2 Medium",
+            "longer version": "Fusion · GPT-6.10 Sol ◆ SWE-2 Medium",
+            "patch version": "Fusion · GPT-6.1.1 Sol ◆ SWE-2 Medium",
+            "fast lead": "Fusion · GPT-6.1 Sol Fast ◆ SWE-2 Medium",
+            "no fusion prefix": "GPT-6.1 Sol ◆ SWE-2 Medium",
+        }
+        for name, label in negatives.items():
+            snapshot = "previous output\n" + label
+            with self.subTest(name=name):
+                self.assertIsNone(eligible._fusion_sol_profile(snapshot, self.policy))
+                self.assertIsNone(eligible._fusion_sol_profile(
+                    snapshot, self.policy, spawn_profile="devin-fusion-sol61-xhigh"))
+                for model in ("fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+                              "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium"):
+                    self.assertFalse(eligible._pane_model_matches(snapshot, model, ""))
 
     def test_bare_launch_and_fusion_footer_post_landing(self) -> None:
         # hk 1380 B1/B2 (tester 1380b-verify): wrk records a bare
