@@ -8964,7 +8964,7 @@ task_validate() {
   if [[ -n "$PARENT_JOB" ]] && [[ ! "$PARENT_JOB" =~ ^[A-Za-z0-9._-]+$ ]]; then
     die "--parent-job must be a job id (got '$PARENT_JOB')"
   fi
-  if [[ -n "$TAKEOVER_FROM" ]]; then
+  if [[ -n "${TAKEOVER_FROM:-}" ]]; then
     [[ "$TAKEOVER_FROM" =~ ^[A-Za-z0-9._-]+$ ]] ||
       die "--takeover-from must be a job id (got '$TAKEOVER_FROM')"
     [[ "$ROLE" == builder ]] || die "--takeover-from is builder-only; worker and tester roles cannot take over a task"
