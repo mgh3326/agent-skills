@@ -215,7 +215,7 @@ _tw_pidfile_fields() {
 _tw_start_matches() {
   local pid="$1" started="${2:-}" el skew
   [[ -n "$started" ]] || return 0
-  [[ "$started" =~ ^[0-9]{1,12}$ ]] || return 1
+  [[ "$started" =~ ^[0123456789]{1,12}$ ]] || return 1
   el="$(_tw_elapsed_s "$pid" 2>/dev/null)" || return 1
   # 10#: a leading-zero started= is decimal, never octal — an invalid
   # octal literal is a fatal expansion error that would abort the pass.
@@ -382,7 +382,7 @@ _tw_identity_verdict() {
 # _tw_start_matches uses). A missing or malformed started= is no proof.
 _tw_pidfile_recycled() {
   local pid="$1" started="${2:-}" el skew
-  [[ "$started" =~ ^[0-9]{1,12}$ ]] || return 1
+  [[ "$started" =~ ^[0123456789]{1,12}$ ]] || return 1
   el="$(_tw_elapsed_s "$pid" 2>/dev/null)" || return 1
   # 10#: a leading-zero started= is decimal, never octal — an invalid
   # octal literal is a fatal expansion error that would abort the pass.
@@ -929,6 +929,9 @@ tmp_writers_stop() {
     # Read the record's fields positionally: IFS= read collapses adjacent
     # tabs, which would turn an empty identity into the pgid field.
     IFS= read -r sline <"$sfile" 2>/dev/null || continue
+    # Leading tabs are field separators, not part of the pid: the sweep
+    # and pass two read the row, so pass one must not skip it.
+    sline="${sline#"${sline%%[!$'\t']*}"}"
     spid="${sline%%$'\t'*}"
     sident=""
     if [[ "$sline" == *$'\t'* ]]; then

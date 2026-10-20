@@ -959,4 +959,202 @@ pass "T23 empty session identity is no evidence"
 ) || fail "T24: window edge / digit bound violated (subshell rc=$?)"
 pass "T24 +/-120s window edges and {1,12} digit bound"
 
+
+# ═══ tester round 3 candidate tests ═══
+
+# unresolved_plus_stale LABEL SETUP-FN — one live pid with an UNRESOLVED record and a stale registry
+# line naming the same pid number: the unresolved claim must keep it a leftover.
+unresolved_plus_stale() {
+  local label="$1" setup="$2" up rc
+  new_run
+  sleep 60 & up=$!
+  track "$up"
+  "$setup" "$up"
+  printf '%s\t%s\n' "$up" "0" >>"$TW_TMP/stale.pids.identities"
+  printf '%s\n' "$up" >>"$TW_TMP/stale.pids"
+  rc=99
+  tmp_writers_stop || rc=$?
+  [[ "$rc" -eq 1 ]] || fail "$label: unresolved record + stale record must fail teardown (rc=$rc)"
+  listed "$up" || fail "$label: pid missing from TW_LEFTOVER_PIDS"
+  recycled "$up" && fail "$label: unresolved pid named recycled"
+  alive "$up" || fail "$label: pid was signalled"
+  stray_kill "$up"; pid_gone "$up"; untrack "$up"
+  pass "T25 $label"
+}
+setup_nostart()  { mkdir -p "$TW_TMP/inbox/ns"; printf '%s\n' "$1" >"$TW_TMP/inbox/ns/completion-sentinel.pid"; }
+setup_inwindow() { mkdir -p "$TW_TMP/inbox/iw"; printf '%s\nstarted=%s\n' "$1" "$(date +%s)" >"$TW_TMP/inbox/iw/completion-sentinel.pid"; }
+setup_garbled()  { mkdir -p "$TW_TMP/inbox/gb"; printf '%s\nstarted=abc\n' "$1" >"$TW_TMP/inbox/gb/completion-sentinel.pid"; }
+setup_barereg()  { printf '%s\n' "$1" >"$TW_TMP/bare.pids"; }
+setup_emptysess() { mkdir -p "$TW_TMP/tw-own-sessions"; printf '%s\t\t%s\n' "$1" "$1" >"$TW_TMP/tw-own-sessions/$1"; }
+setup_onefield() { mkdir -p "$TW_TMP/tw-own-sessions"; printf '%s\n' "$1" >"$TW_TMP/tw-own-sessions/$1"; }
+unresolved_plus_stale "pidfile without started=" setup_nostart
+unresolved_plus_stale "pidfile with in-window started=" setup_inwindow
+unresolved_plus_stale "pidfile with garbled started=" setup_garbled
+unresolved_plus_stale "registry entry without identity" setup_barereg
+unresolved_plus_stale "session row with empty identity" setup_emptysess
+unresolved_plus_stale "session row with pid only" setup_onefield
+
+
+
+# T26: a verified descendant whose identity could not be captured stays unresolved even beside a stale record.
+new_run
+bash -c 'sleep 4321 & printf "%s\n" "$!" >"$1"; wait' _ "$TW_TMP/child.pid" &
+par=$!
+track "$par"
+for _i in $(seq 1 50); do [[ -s "$TW_TMP/child.pid" ]] && break; sleep 0.1; done
+ch="$(cat "$TW_TMP/child.pid")"; track "$ch"
+tw_register_pid "$TW_TMP/par.pids" "$par"
+printf '%s\t%s\n' "$ch" "0" >>"$TW_TMP/stale.pids.identities"; printf '%s\n' "$ch" >>"$TW_TMP/stale.pids"
+eval "$(declare -f _tw_pid_identity | sed '1s/_tw_pid_identity/_t26_orig_identity/')"
+_tw_pid_identity() { if [[ "$1" == "$ch" && ! -e "$TW_TMP/ch.seen" ]]; then : >"$TW_TMP/ch.seen"; return 1; fi; _t26_orig_identity "$@"; }
+kill() { local a; for a in "$@"; do [[ "${a#-}" == "$ch" ]] && return 0; done; builtin kill "$@"; }
+rc=99; tmp_writers_stop || rc=$?
+unset -f kill
+eval "$(declare -f _t26_orig_identity | sed '1s/_t26_orig_identity/_tw_pid_identity/')"; unset -f _t26_orig_identity
+[[ -e "$TW_TMP/ch.seen" ]] || fail "T26: discovery read was not intercepted (void fixture)"
+[[ "$rc" -eq 1 ]] || fail "T26: unverified member + stale record must fail teardown (rc=$rc)"
+listed "$ch" || fail "T26: unverified member missing from leftovers"
+recycled "$ch" && fail "T26: unverified member named recycled"
+stray_kill "$ch"; stray_kill "$par"; pid_gone "$ch"; untrack "$ch"; untrack "$par"
+pass "T26 unverified member is not discharged by a stale record"
+
+
+
+
+# T29: `stored` must not leak from one registry's pid into the next registry's pid.
+# a.pids (sorted first) has a real identity line for A; b.pids has NO .identities file and lists B bare.
+new_run
+sleep 60 & ap=$!; track "$ap"
+sleep 0.2; sleep 60 & bp=$!; track "$bp"
+tw_register_pid "$TW_TMP/a.pids" "$ap"
+printf '%s\n' "$bp" >"$TW_TMP/b.pids"
+eval "$(declare -f _tw_registry_pid_ok | sed '1s/_tw_registry_pid_ok/_t29_orig/')"
+_tw_registry_pid_ok() { return 1; }
+rc=99; tmp_writers_stop || rc=$?
+eval "$(declare -f _t29_orig | sed '1s/_t29_orig/_tw_registry_pid_ok/')"; unset -f _t29_orig
+[[ "$rc" -eq 1 ]] || fail "T29: rc=$rc"
+listed "$bp" || fail "T29: bare registry pid dropped from leftovers (stale identity leaked across registries)"
+recycled "$bp" && fail "T29: bare registry pid named recycled"
+stray_kill "$ap"; stray_kill "$bp"; pid_gone "$ap"; pid_gone "$bp"; untrack "$ap"; untrack "$bp"
+pass "T29 registry identity does not leak across registries"
+
+
+# T30: `sident` must not leak from one session row into a following pid-only row (find order is
+# unspecified, so use several rows of each kind).
+new_run
+mkdir -p "$TW_TMP/tw-own-sessions"
+ids=""; ones=""
+for i in 1 2 3 4; do
+  sleep 60 & p=$!; track "$p"; ids="$ids $p"
+  printf '%s\t%s\t%s\n' "$p" "bogus-ident-$i" "$p" >"$TW_TMP/tw-own-sessions/id$i"
+  sleep 60 & q=$!; track "$q"; ones="$ones $q"
+  printf '%s\n' "$q" >"$TW_TMP/tw-own-sessions/one$i"
+done
+rc=99; tmp_writers_stop || rc=$?
+[[ "$rc" -eq 1 ]] || fail "T30: pid-only session rows must keep teardown red (rc=$rc)"
+for q in $ones; do
+  listed "$q" || fail "T30: pid-only session row $q was discharged (identity leaked from an earlier row)"
+done
+for p in $ids; do recycled "$p" || fail "T30: stale-identity row $p should be recycled"; done
+for p in $ids $ones; do stray_kill "$p"; done
+for p in $ids $ones; do pid_gone "$p"; untrack "$p"; done
+pass "T30 session identity does not leak across rows"
+
+
+# T31: a verified descendant (identity captured at discovery) that outlives TERM and KILL-swallowing is a
+# MATCHING sighting; a stale registry line for the same pid number must not discharge it.
+new_run
+bash -c 'sleep 4321 & printf "%s\n" "$!" >"$1"; wait' _ "$TW_TMP/child.pid" &
+par=$!
+track "$par"
+for _i in $(seq 1 50); do [[ -s "$TW_TMP/child.pid" ]] && break; sleep 0.1; done
+ch="$(cat "$TW_TMP/child.pid")"; track "$ch"
+tw_register_pid "$TW_TMP/par.pids" "$par"
+printf '%s\t%s\n' "$ch" "0" >>"$TW_TMP/stale.pids.identities"; printf '%s\n' "$ch" >>"$TW_TMP/stale.pids"
+kill() { local a; for a in "$@"; do [[ "${a#-}" == "$ch" ]] && return 0; done; builtin kill "$@"; }
+rc=99; tmp_writers_stop || rc=$?
+unset -f kill
+[[ "$rc" -eq 1 ]] || fail "T31: surviving verified descendant + stale record must fail teardown (rc=$rc)"
+listed "$ch" || fail "T31: verified descendant missing from leftovers"
+recycled "$ch" && fail "T31: verified descendant named recycled"
+stray_kill "$ch"; stray_kill "$par"; pid_gone "$ch"; untrack "$ch"; untrack "$par"
+pass "T31 matching member outranks a stale record"
+
+
+# T32: a matching session record outranks a stale registry line for the same pid number.
+new_run
+sleep 60 & sp=$!; track "$sp"
+mkdir -p "$TW_TMP/tw-own-sessions"
+printf '%s\t%s\t%s\n' "$sp" "$(_tw_pid_identity "$sp")" "$sp" >"$TW_TMP/tw-own-sessions/$sp"
+printf '%s\t%s\n' "$sp" "0" >>"$TW_TMP/stale.pids.identities"; printf '%s\n' "$sp" >>"$TW_TMP/stale.pids"
+kill() { local a; for a in "$@"; do [[ "${a#-}" == "$sp" ]] && return 0; done; builtin kill "$@"; }
+rc=99; tmp_writers_stop || rc=$?
+unset -f kill
+[[ "$rc" -eq 1 ]] || fail "T32: matching session record + stale record must fail teardown (rc=$rc)"
+listed "$sp" || fail "T32: pid missing from leftovers"
+recycled "$sp" && fail "T32: matching session pid named recycled"
+stray_kill "$sp"; pid_gone "$sp"; untrack "$sp"
+pass "T32 matching session record outranks a stale record"
+
+
+# T33: an UNREADABLE live identity is no evidence either way (not proof of reuse).
+new_run
+sleep 60 & rp=$!; track "$rp"
+tw_register_pid "$TW_TMP/own.pids" "$rp"
+eval "$(declare -f _tw_pid_identity | sed '1s/_tw_pid_identity/_t33_orig/')"
+_tw_pid_identity() { return 1; }
+rc=99; tmp_writers_stop || rc=$?
+eval "$(declare -f _t33_orig | sed '1s/_t33_orig/_tw_pid_identity/')"; unset -f _t33_orig
+[[ "$rc" -eq 1 ]] || fail "T33: unreadable live identity must keep the pid a leftover (rc=$rc)"
+listed "$rp" || fail "T33: pid missing from leftovers"
+recycled "$rp" && fail "T33: unreadable identity mistaken for proof of reuse"
+stray_kill "$rp"; pid_gone "$rp"; untrack "$rp"
+pass "T33 unreadable identity is not proof of reuse"
+
+
+# T34: TW_LEFTOVER_PIDS from an earlier call must not survive into a clean call.
+new_run
+TW_LEFTOVER_PIDS=" 999999"
+tmp_writers_stop || fail "T34: stale TW_LEFTOVER_PIDS leaked into a clean teardown (rc=$?, left=${TW_LEFTOVER_PIDS:-})"
+[[ -z "${TW_LEFTOVER_PIDS:-}" ]] || fail "T34: stale TW_LEFTOVER_PIDS survived"
+pass "T34 leftover ledger reset per call"
+
+# T27 (R3-2): a session row with a leading tab is a live record for the sweep and pass two; pass one must see it too.
+new_run
+sleep 60 & lp=$!
+track "$lp"
+mkdir -p "$TW_TMP/tw-own-sessions"
+printf '\t%s\t\t%s\n' "$lp" "$lp" >"$TW_TMP/tw-own-sessions/$lp"
+printf '%s\t%s\n' "$lp" "0" >>"$TW_TMP/stale.pids.identities"; printf '%s\n' "$lp" >>"$TW_TMP/stale.pids"
+rc=99; tmp_writers_stop || rc=$?
+[[ "$rc" -eq 1 ]] || fail "T27: leading-tab session row + stale record must fail teardown (rc=$rc)"
+listed "$lp" || fail "T27: pid missing from leftovers"
+recycled "$lp" && fail "T27: pid named recycled"
+stray_kill "$lp"; pid_gone "$lp"; untrack "$lp"
+pass "T27 leading-tab session row is seen by pass one"
+
+
+
+# T28 (R3-1): a non-ASCII-digit started= must not abort the pass in a UTF-8 locale whose [0-9] matches it.
+t28_loc=""
+for _l in $(locale -a 2>/dev/null | grep -i 'utf-\?8' || true); do
+  if LC_ALL="$_l" bash -c '[[ "٣" =~ ^[0-9]{1,12}$ ]]' 2>/dev/null; then t28_loc="$_l"; break; fi
+done
+if [[ -z "$t28_loc" ]]; then
+  pass "T28 skipped (no locale where [0-9] matches non-ASCII digits)"
+else
+  new_run
+  sleep 60 & ap=$!
+  track "$ap"
+  mkdir -p "$TW_TMP/inbox/uni"
+  printf '%s\nstarted=٣\n' "$ap" >"$TW_TMP/inbox/uni/completion-sentinel.pid"
+  t28_out="$(LC_ALL="$t28_loc"; rc=99; tmp_writers_stop || rc=$?; printf '%s|%s\n' "$rc" "${TW_LEFTOVER_PIDS:-}")" || true
+  [[ "${t28_out%%|*}" == 1 ]] || fail "T28: pass aborted or wrongly succeeded under $t28_loc (got ${t28_out})"
+  [[ " ${t28_out#*|} " == *" $ap "* ]] || fail "T28: pid missing from leftovers under $t28_loc"
+  stray_kill "$ap"; pid_gone "$ap"; untrack "$ap"
+  pass "T28 non-ASCII-digit started= does not abort the pass ($t28_loc)"
+fi
+
+
+
 echo "PASS test-tmp-writers"
