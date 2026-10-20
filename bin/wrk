@@ -9229,7 +9229,7 @@ takeover_old_job_check() {
   IFS=$'\t' read -r _ ended _ _ <<<"$scan"
   [[ "$ended" == 1 ]] ||
     die "takeover refused: old job '$old' is still live; no work-terminal follows its newest revive"
-  TAKEOVER_ROUNDS_USED="$(round_scan "$old" | sed -n 's/.*rounds=\([0-9][0-9]*\).*/\1/p')"
+  TAKEOVER_ROUNDS_USED="$(round_scan "$old" | sed -n 's/^rounds=\([0-9][0-9]*\)[[:space:]].*/\1/p')"
   [[ "$TAKEOVER_ROUNDS_USED" =~ ^[0-9]+$ ]] ||
     die "takeover refused: cannot read old job '$old' round count"
 }
@@ -9404,7 +9404,7 @@ hk_task_link() {
   fi
   case "$TASK_LINK_STATUS" in
     link|bypassed:*) ;;
-    already_linked|inherited) hk_task_link_event "$TASK_LINK_STATUS" ""; return 0 ;;
+    already_linked|inherited|takeover) hk_task_link_event "$TASK_LINK_STATUS" ""; return 0 ;;
     *) warn "hk task link skipped: unknown status '$TASK_LINK_STATUS'"; return 0 ;;
   esac
   local handoffkeep out rc=0

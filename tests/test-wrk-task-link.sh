@@ -143,6 +143,19 @@ seed_old_job() {
   fi
 }
 
+seed_old_verdict() {
+  local job="$1" path="$2" dir="$INBOX/$1/events"
+  python3 - "$job" "$path" "$dir/00010-job.verdict.json" <<'PY'
+import json, sys
+job, path, output = sys.argv[1:]
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump({"kind": "job.verdict", "job_id": job, "round": 2,
+               "verdict": "PASS", "head": "a" * 40, "path": path,
+               "at": "2026-10-18T00:00:04Z"}, handle)
+    handle.write("\n")
+PY
+}
+
 takeover_spawn() {
   MODEL=builder-sol LABEL=new-builder spawn_try -- "$@" --role builder --lane new-lane --parent director-1
 }
@@ -554,6 +567,7 @@ echo "== AC4: builder takeover rebinds only an ended task owner and carries roun
 reset_case g1
 hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
 seed_old_job old-job ended 2
+seed_old_verdict old-job /work/review/rounds=0/verdict.md
 takeover_spawn --task 1 --job new-job --takeover-from old-job
 expect_rc 0 "takeover of ended old job"
 [[ "$(hk_refs_job 1)" == new-job && "$(hk_field 1 claimed_by)" == new-builder ]] ||
@@ -564,6 +578,11 @@ takeover_doc="$(job_event_doc new-job job.takeover)"
 grep -qE '"from_job" *: *"old-job"' <<<"$takeover_doc" || fail "job.takeover must name OLD: $takeover_doc"
 grep -qE '"task_id" *: *1' <<<"$takeover_doc" || fail "job.takeover must name the task: $takeover_doc"
 grep -qE '"rounds_used" *: *2' <<<"$takeover_doc" || fail "job.takeover must carry two rounds: $takeover_doc"
+task_link_payload="$(event_payload new-job job.task_link)"
+grep -qE '"status" *: *"takeover"' <<<"$task_link_payload" ||
+  fail "takeover must record its task link outcome: $task_link_payload"
+! grep -q "unknown status 'takeover'" "$TMP/stderr.txt" ||
+  fail "takeover task-link outcome must not be treated as unknown"
 handed_doc="$(job_event_doc old-job job.handed_off)"
 grep -qE '"to_job" *: *"new-job"' <<<"$handed_doc" || fail "old job must record handoff destination: $handed_doc"
 new_head="$(git -C "$ROOT" rev-parse HEAD)"
