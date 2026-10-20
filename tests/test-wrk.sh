@@ -7,8 +7,9 @@ HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 ARBITER="$ROOT/bin/arbiter"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
-TW_TMP="$TMP"
+export TW_TMP="$TMP"
 # OWNED_PIDS — every background pid this file launches registers here; the
 # teardown's *.pids registry pass signals exactly that set (direct `wrk
 # sentinel … &` runs carry no pidfile of their own).
@@ -25,8 +26,8 @@ cleanup() {
   rm -rf "$TMP"
   # 회귀 게이트: teardown 이 추적한 writer 를 놓치면 조용히 새는 게 아니라
   # 스위트가 실패해야 한다.
-  if [[ -n "$TW_LEFTOVER_PIDS" ]]; then
-    echo "FAIL: tracked writers survived teardown:$TW_LEFTOVER_PIDS" >&2
+  if [[ -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
     exit 1
   fi
 }

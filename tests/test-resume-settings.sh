@@ -26,8 +26,9 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
-TW_TMP="$TMP"
+export TW_TMP="$TMP"
 # wrk spawn leaves detached writers that outlive their wrk and can still be
 # creating entries under $TMP at teardown, so `rm -rf` raced them on CI and
 # exited "Directory not empty" (the earlier 3s retry only narrowed the race;

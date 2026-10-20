@@ -20,8 +20,9 @@ ARBITER="$ROOT/bin/arbiter"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
-TW_TMP="$TMP"
+export TW_TMP="$TMP"
 
 # OWNED_PID_LOG — the process registry. Every fixture process this file
 # launches appends its pid; cleanup terminates exactly that set. Works

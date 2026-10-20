@@ -15,8 +15,9 @@ ARBITER="$ROOT/bin/arbiter"
 HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
-TW_TMP="$TMP"
+export TW_TMP="$TMP"
 JOB_SEQ=0
 LAST_GATE=""
 mkdir -p "$TMP/gate-cache"

@@ -4,8 +4,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
-TW_TMP="$TMP"
+export TW_TMP="$TMP"
 
 hub_require_isolation() {
   [[ -n "${ARBITER_INBOX_ROOT:-}" && "$ARBITER_INBOX_ROOT" == "$TMP"/* ]] || {

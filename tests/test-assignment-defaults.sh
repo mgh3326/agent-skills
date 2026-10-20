@@ -785,8 +785,9 @@ PY
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
-TW_TMP="$TMP"
+export TW_TMP="$TMP"
 # wrk spawn's refresh_quota_pool leaves a detached supervisor — `( python3 -
 # … ) &` -> fork + setsid -> `scopefuel refresh <pool> --background` — which
 # appends WRK_REFRESH_LOG. It names itself in <job>/quota-refresh.pid, and

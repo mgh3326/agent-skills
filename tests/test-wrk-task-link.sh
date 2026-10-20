@@ -13,8 +13,9 @@ ARBITER="$ROOT/bin/arbiter"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
-TW_TMP="$TMP"
+export TW_TMP="$TMP"
 
 cleanup() {
   # kill alone does not suffice — a TERM'd writer can still be mid-append,
