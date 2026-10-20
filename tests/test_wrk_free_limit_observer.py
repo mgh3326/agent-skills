@@ -182,6 +182,28 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertIn("observer-expired-reset=2026-10-20T00:30:00Z", after.stdout)
         self.assertEqual(len(self.calls()), 1)
 
+    def test_fusion_sol_notice_is_recorded_with_its_observed_rung(self) -> None:
+        notice = provider_notice(
+            "Reached free model rate limit. Upgrade to Max for higher limits. "
+            "Your limit will reset in 50 minutes (at 08:01 UTC)."
+        )
+        for rung in ("devin-fusion-sol61", "devin-fusion-sol61-xhigh"):
+            with self.subTest(rung=rung):
+                result = self.run_helper(
+                    notice,
+                    "2026-10-19T07:11:00Z",
+                    job=f"fusion-sol-observation-{rung}",
+                    rung=rung,
+                    pane_kind="devin",
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(len(self.calls()), 1)
+                args = self.calls()[0]
+                self.assertEqual(args[:2], ["observe", "devin-free-limit"])
+                self.assertEqual(args[args.index("--rung") + 1], rung)
+                self.assertEqual(args[args.index("--reset") + 1], "2026-10-19T08:01:00Z")
+                self.call_log.unlink(missing_ok=True)
+
     def test_stale_notice_just_after_midnight_records_no_hold(self) -> None:
         notice = provider_notice("Reached free model rate limit (at 23:59 UTC)")
         for observed, job in (

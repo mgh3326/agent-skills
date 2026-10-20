@@ -1150,6 +1150,44 @@
         "T2"
       ]
     },
+    "devin-fusion-sol61": {
+      "default_effort": "",
+      "family": "openai",
+      "grades": {
+        "": "ungraded"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+      "model": "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "devin-fusion-sol61-xhigh": {
+      "default_effort": "",
+      "family": "openai",
+      "grades": {
+        "": "ungraded"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium",
+      "model": "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
     "devin-fusion-sonnet55": {
       "default_effort": "",
       "family": "anthropic",

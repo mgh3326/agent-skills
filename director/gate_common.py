@@ -34,6 +34,9 @@ MODEL_FAMILY_PREFIXES = (
     # fusion-claude-* ids run on the devin launcher but carry a Claude primary
     # model — they are the Claude family for tester separation (hk 1380).
     ("fusion-claude-", "anthropic"),
+    # Fusion-Sol runs on the devin launcher with an OpenAI primary model
+    # (hk 1729).
+    ("fusion-gpt-", "openai"),
     ("claude-", "anthropic"), ("gpt-", "openai"), ("grok-", "xai"),
     ("kimi-", "moonshot"), ("deepseek-", "deepseek"), ("swe-", "cognition"),
     ("gemini-", "google"), ("glm-", "zhipu"), ("qwen", "alibaba"),

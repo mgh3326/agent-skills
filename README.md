@@ -319,6 +319,8 @@ tester 로는 못 쓴다**(동일 계열로 간주되고, 동일 계열 예외�
 B 인 이 철자들에는 해당 없음). 미측정 B 로 T1/T2, hk 1382 의 tester/checker 시험 대상.
 `--role builder`는 두 철자를 거부한다(fusion 빌더 사용은 hk 1382 이후 결정).
 Fable·Astra fusion 철자는 없다.
+`devin-fusion-sol61`은 Devin launcher의 Fusion-Sol high 프로필이며 scopefuel codex pool과 openai family를 쓴다 — 현재 worker/tester 전용이고 `-fast` 철자는 지원하지 않는다.
+`devin-fusion-sol61-xhigh`은 Devin launcher의 Fusion-Sol xhigh 프로필이며 scopefuel codex pool과 openai family를 쓴다 — 현재 worker/tester 전용이고 `-fast` 철자는 지원하지 않는다.
 
 hk 1620(2026-10-18 운영자 결정 devin-argon-trial, phase 1 — operator-desk
 r1018b953go 승인)은 유료 Argon 시험 철자 `devin-argon`·`devin-argon-medium`·

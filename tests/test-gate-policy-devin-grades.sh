@@ -38,6 +38,10 @@
 #     ungraded  devin-argon          (model gemini-4-argon-high)
 #     ungraded  devin-argon-medium   (model gemini-4-argon-medium)
 #     ungraded  devin-argon-low      (model gemini-4-argon-low)
+#   hk 1729 Fusion-Sol rows (scopefuel PR 157 head ffcd635): ungraded,
+#   codex pool, openai family, surfaces T1/T2/T3, no grade placed:
+#     ungraded  devin-fusion-sol61        (model fusion-gpt-6-1-sol-high-sidekick-swe-2-medium)
+#     ungraded  devin-fusion-sol61-xhigh  (model fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium)
 #   launch.py:84-91 LAUNCH_MODEL_IDS maps each catalog profile to the devin
 #   --model id the gate profile carries; devin encodes effort in the model id
 #   (#635), so devin-swe2-max IS the max rung and takes the @max grade A+.
@@ -92,6 +96,9 @@ EXPECTED = {
     "gemini-4-argon-high": "ungraded",
     "gemini-4-argon-medium": "ungraded",
     "gemini-4-argon-low": "ungraded",
+    # hk 1729 Fusion-Sol spellings are ungraded while their A+/S reps are pending.
+    "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium": "ungraded",
+    "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium": "ungraded",
 }
 
 # Policy validity window per gate_policy.json effective_at/expires_at.

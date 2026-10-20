@@ -461,6 +461,55 @@ class EligibilityFixtures(unittest.TestCase):
                     self.assert_case(checks, "tester", "PASS", "PROFILE_RESOLVED")
                     self.assert_case(checks, "independence", *want)
 
+    def test_fusion_sol_label_defaults_high_and_uses_exact_job_evidence(self) -> None:
+        label = "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium"
+        high_model = "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium"
+        xhigh_model = "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium"
+        default = eligible._fusion_sol_profile(label, self.policy)
+        self.assertEqual(default, {"profile": "devin-fusion-sol61", "family": "openai",
+                                   "model": high_model})
+        from_spawn = eligible._fusion_sol_profile(
+            label, self.policy, spawn_profile="devin-fusion-sol61-xhigh")
+        from_quota = eligible._fusion_sol_profile(
+            label, self.policy, quota_profile="devin-fusion-sol61-xhigh")
+        self.assertEqual(from_spawn["profile"], "devin-fusion-sol61-xhigh")
+        self.assertEqual(from_spawn["model"], xhigh_model)
+        self.assertEqual(from_quota, from_spawn)
+        self.assertEqual(common.model_family(high_model), "openai")
+        self.assertEqual(common.model_family(xhigh_model), "openai")
+        self.assertEqual(self.policy["profiles"]["codex-sol"]["family"], default["family"])
+
+        variants = (
+            "Fusion  |  GPT 6.1 Sol / SWE-2 Medium · worktree",
+            "│ Fusion — GPT-6.1 Sol • SWE-2 Medium · worktree",
+        )
+        for snapshot in variants:
+            with self.subTest(snapshot=snapshot):
+                self.assertEqual(eligible._fusion_sol_profile(snapshot, self.policy), default)
+                self.assertTrue(eligible._pane_model_matches(snapshot, high_model, ""))
+                self.assertTrue(eligible._pane_model_matches(snapshot, xhigh_model, ""))
+        self.assertTrue(eligible._pane_model_matches(label + " · worktree", high_model, ""))
+        self.assertTrue(eligible._pane_model_matches(label + " · worktree", xhigh_model, ""))
+
+    def test_codex_tester_and_fusion_sol_contributor_are_same_family(self) -> None:
+        fusion = self.policy["profiles"]["devin-fusion-sol61"]
+        codex = self.policy["profiles"]["codex-sol"]
+        anthropic = self.policy["profiles"]["devin-fusion-sonnet55"]
+        self.assertEqual((fusion["family"], codex["family"]), ("openai", "openai"))
+        self.assertEqual(common.model_family(fusion["model"]), codex["family"])
+        self.assertEqual(common.model_family(codex["model"]), fusion["family"])
+        self.assertEqual((anthropic["family"], common.model_family(anthropic["model"])),
+                         ("anthropic", "anthropic"))
+        self.assertNotEqual(fusion["family"], anthropic["family"])
+        for profile, model in (
+            ("devin-fusion-sol61", "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium"),
+            ("devin-fusion-sol61-xhigh", "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium"),
+        ):
+            _, check = common.resolve_profile(profile, self.policy, actual_model=model,
+                                               actual_effort="", role="builder", root=ROOT)
+            self.assertEqual((check["status"], check["reason_code"]),
+                             ("FAIL", "PROFILE_ROLE_DENIED"))
+
     def test_bare_launch_and_fusion_footer_post_landing(self) -> None:
         # hk 1380 B1/B2 (tester 1380b-verify): wrk records a bare
         # launch_profile (no @effort) for effort-less devin profiles — the
@@ -474,6 +523,10 @@ class EligibilityFixtures(unittest.TestCase):
              "Fusion · Claude Opus 5.5 ◆ SWE-2 Medium", ("PASS", "ACTUAL_PROFILE_OBSERVED")),
             ("devin-fusion-sonnet55", "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
              "Fusion · Claude Sonnet 5.5 ◆ SWE-2 Medium", ("PASS", "ACTUAL_PROFILE_OBSERVED")),
+            ("devin-fusion-sol61", "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+             "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium", ("PASS", "ACTUAL_PROFILE_OBSERVED")),
+            ("devin-fusion-sol61-xhigh", "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium",
+             "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium", ("PASS", "ACTUAL_PROFILE_OBSERVED")),
             ("devin-ds41", "deepseek-v4-1-flash-high",
              "deepseek-v4-1-flash-high · always", ("PASS", "ACTUAL_PROFILE_OBSERVED")),
             ("devin-swe2", "swe-2",
