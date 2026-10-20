@@ -5,8 +5,10 @@
 # recorded own-session group ownership, pending-descendant escalation,
 # and the no-rm-while-a-tracked-writer-lives contract.
 # (hk1746): the leftover pass proves recycling — a live pid whose stored
-# start identity differs is named one per line on TW_RECYCLED_PIDS and
-# can no longer fail teardown; matching or absent identities still can.
+# start identity differs, with no matching and no unresolved record, is
+# named one per line on TW_RECYCLED_PIDS and can no longer fail
+# teardown; matching identities, writer argv sightings and unresolved
+# records still can.
 set -euo pipefail
 
 # Standalone-safe isolation: never depend on the caller's environment.
@@ -782,10 +784,11 @@ printf '%s\nstarted=%s\n' "$fpid" "$(( $(date +%s) + 10000 ))" \
 printf '%s\n' "$opid" >"$TW_TMP/inbox/bare/completion-sentinel.pid"
 printf '%s\nstarted=abc\n' "$mpid" \
   >"$TW_TMP/inbox/malformed/completion-sentinel.pid"
-_tw_start_matches "$zpid" 08 &&
-  fail "T19: started=08 must not match the live elapsed window"
 _tw_pidfile_recycled "$zpid" 08 ||
   fail "T19: started=08 must be a positive recycling proof"
+# The _tw_start_matches half of the octal fix cannot be asserted here:
+# a fatal expansion error discards the whole statement, so an inline
+# check would be vacuous. T22 guards it through tmp_writers_stop.
 rc=0
 tmp_writers_stop || rc=$?
 [[ "$rc" -eq 1 ]] ||
@@ -876,5 +879,84 @@ recycled "$wp" && fail "T21: matching-identity writer wrongly named recycled"
 alive "$wp" || fail "T21: matching-identity writer was signalled"
 stray_kill "$wp"; pid_gone "$wp"; untrack "$wp"
 pass "T21 matching identity outranks a stale record"
+
+# ── T22: sweep path with a sentinel-shaped writer and started=08 ───────
+# _tw_start_matches (kill authorisation) is only reached once the argv
+# shape matches, so T19's sleep fixtures never exercise its octal
+# handling. A real-shaped sentinel does: the sweep must refuse the
+# signal, the pass must return, and the writer must be a leftover.
+new_run
+jobdir="$TW_TMP/inbox/job-t22"
+mkdir -p "$jobdir"
+copy="$TW_TMP/octal-t22-wrk"
+mk_sentinel_script "$copy"
+python3 - "$copy" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+old = '"$(date +%s)"'
+assert text.count(old) == 1, "expected one sentinel started timestamp expression"
+open(path, "w", encoding="utf-8").write(text.replace(old, "08", 1))
+PY
+env SENT_JOBDIR="$jobdir" \
+  bash "$copy" sentinel job-t22 lane lbl w1:p1 "$jobdir/report.json" &
+sent=$!
+track "$sent"
+wait_pidfile "$jobdir/completion-sentinel.pid" ||
+  fail "T22: sentinel pidfile missing"
+wait_pidfile "$jobdir/sentinel-child.pid" ||
+  fail "T22: sentinel child pidfile missing"
+child="$(cat "$jobdir/sentinel-child.pid")"
+track "$child"
+rc=99
+tmp_writers_stop || rc=$?
+[[ "$rc" -eq 1 ]] || fail "T22: pass aborted or wrongly succeeded (rc=$rc)"
+listed "$sent" || fail "T22: argv-matched started=08 writer missing from leftovers"
+recycled "$sent" && fail "T22: writer wrongly named recycled"
+alive "$sent" || fail "T22: sentinel was signalled"
+stray_kill "$sent"; stray_kill "$child"
+pid_gone "$sent" || fail "T22: sentinel survived cleanup"
+pid_gone "$child" || fail "T22: child survived cleanup"
+untrack "$sent"; untrack "$child"
+pass "T22 started=08 on a sentinel-shaped writer reaches the verdict"
+
+# ── T23: own-session record with an EMPTY identity field ───────────────
+# IFS= read collapses adjacent tabs, so a positional read must not let
+# the pgid field masquerade as an identity (that would prove recycling).
+new_run
+sleep 60 & ep=$!
+track "$ep"
+mkdir -p "$TW_TMP/tw-own-sessions"
+printf '%s\t\t%s\n' "$ep" "$ep" >"$TW_TMP/tw-own-sessions/$ep"
+rc=99
+tmp_writers_stop || rc=$?
+[[ "$rc" -eq 1 ]] ||
+  fail "T23: empty-identity session record must stay a leftover (rc=$rc)"
+listed "$ep" || fail "T23: pid missing from leftovers"
+recycled "$ep" && fail "T23: empty identity mistaken for the pgid"
+stray_kill "$ep"; pid_gone "$ep"; untrack "$ep"
+pass "T23 empty session identity is no evidence"
+
+# ── T24: window edges and digit bounds, deterministic clock ────────────
+(
+  date() { if [[ "${1:-}" == "+%s" ]]; then echo 1700000000; else command date "$@"; fi; }
+  _tw_elapsed_s() { echo 50; }
+  s() { echo $(( 1700000000 - 50 - $1 )); }   # started= whose skew is $1
+  for off in -121 121; do
+    ! _tw_start_matches 1 "$(s $off)" || exit 11
+    _tw_pidfile_recycled 1 "$(s $off)" || exit 12
+  done
+  for off in -120 0 120; do
+    _tw_start_matches 1 "$(s $off)" || exit 13
+    ! _tw_pidfile_recycled 1 "$(s $off)" || exit 14
+  done
+  # 20 digits that would wrap to skew 0 without the {1,12} bound.
+  wrapped="$(python3 -c 'print(18446744073709551616 + 1700000000 - 50)')"
+  ! _tw_start_matches 1 "$wrapped" || exit 15
+  ! _tw_pidfile_recycled 1 "$wrapped" || exit 16
+  ! _tw_pidfile_recycled 1 18446744073709551616 || exit 17
+  exit 0
+) || fail "T24: window edge / digit bound violated (subshell rc=$?)"
+pass "T24 +/-120s window edges and {1,12} digit bound"
 
 echo "PASS test-tmp-writers"
