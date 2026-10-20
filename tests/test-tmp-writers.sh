@@ -758,4 +758,34 @@ recycled "$rp" && fail "T18: matching-identity writer named recycled"
 stray_kill "$rp"; pid_gone "$rp"; untrack "$rp"
 pass "T18 leftover pass separates recycled from matching-identity pids"
 
+# ── T19: leading-zero started= is decimal, never a fatal octal ─────────
+# An invalid octal literal in the skew arithmetic is a fatal expansion
+# error: it aborted the whole pass — rc 0 with no leftovers — hiding
+# every later entry. The window checks must treat 08 as decimal.
+new_run
+sleep 60 & zpid=$!
+track "$zpid"
+sleep 60 & opid=$!
+track "$opid"
+mkdir -p "$TW_TMP/inbox/octal" "$TW_TMP/inbox/bare"
+printf '%s\nstarted=08\n' "$zpid" >"$TW_TMP/inbox/octal/completion-sentinel.pid"
+printf '%s\n' "$opid" >"$TW_TMP/inbox/bare/completion-sentinel.pid"
+_tw_start_matches "$zpid" 08 &&
+  fail "T19: started=08 must not match the live elapsed window"
+_tw_pidfile_recycled "$zpid" 08 ||
+  fail "T19: started=08 must be a positive recycling proof"
+rc=0
+tmp_writers_stop || rc=$?
+[[ "$rc" -eq 1 ]] ||
+  fail "T19: pass aborted instead of reporting the no-identity leftover"
+listed "$opid" || fail "T19: no-identity pidfile pid missing from leftovers"
+recycled "$zpid" || fail "T19: started=08 pid missing from TW_RECYCLED_PIDS"
+alive "$zpid" || fail "T19: started=08 pid was signalled"
+alive "$opid" || fail "T19: no-identity pid was signalled"
+stray_kill "$zpid"; stray_kill "$opid"
+pid_gone "$zpid" || fail "T19: zpid survived cleanup"
+pid_gone "$opid" || fail "T19: opid survived cleanup"
+untrack "$zpid"; untrack "$opid"
+pass "T19 leading-zero started= stays decimal, no pass abort"
+
 echo "PASS test-tmp-writers"

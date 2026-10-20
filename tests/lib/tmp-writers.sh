@@ -212,7 +212,9 @@ _tw_start_matches() {
   [[ -n "$started" ]] || return 0
   [[ "$started" =~ ^[0-9]+$ ]] || return 1
   el="$(_tw_elapsed_s "$pid" 2>/dev/null)" || return 1
-  skew=$(( $(date +%s) - started - el ))
+  # 10#: a leading-zero started= is decimal, never octal — an invalid
+  # octal literal is a fatal expansion error that would abort the pass.
+  skew=$(( $(date +%s) - 10#$started - el ))
   (( skew >= -120 && skew <= 120 ))
 }
 
@@ -365,7 +367,9 @@ _tw_pidfile_recycled() {
   local pid="$1" started="${2:-}" el skew
   [[ "$started" =~ ^[0-9]+$ ]] || return 1
   el="$(_tw_elapsed_s "$pid" 2>/dev/null)" || return 1
-  skew=$(( $(date +%s) - started - el ))
+  # 10#: a leading-zero started= is decimal, never octal — an invalid
+  # octal literal is a fatal expansion error that would abort the pass.
+  skew=$(( $(date +%s) - 10#$started - el ))
   (( skew < -120 || skew > 120 ))
 }
 
