@@ -15,26 +15,22 @@ ARBITER="$ROOT/bin/arbiter"
 HANDOFFKEEP_BIN="$ROOT/tests/fixtures/handoffkeep"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
+. "$ROOT/tests/lib/tmp-writers.sh"
+export TW_TMP="$TMP"
 JOB_SEQ=0
 LAST_GATE=""
 mkdir -p "$TMP/gate-cache"
 
 cleanup() {
-  local pidfile pid child
   if [[ -n "${TMP:-}" && -d "${TMP:-}" ]]; then
-    while IFS= read -r pidfile; do
-      [[ -s "$pidfile" ]] || continue
-      read -r pid <"$pidfile" || continue
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      kill -STOP "$pid" 2>/dev/null || true
-      while IFS= read -r child; do
-        [[ "$child" =~ ^[0-9]+$ ]] || continue
-        kill "$child" 2>/dev/null || true
-      done < <(pgrep -P "$pid" 2>/dev/null || true)
-      kill "$pid" 2>/dev/null || true
-      kill -CONT "$pid" 2>/dev/null || true
-    done < <(find "$TMP" -name 'completion-sentinel.pid' -print 2>/dev/null || true)
-    rm -rf "$TMP"
+    local tw_rc=0
+    tmp_writers_stop || tw_rc=$?
+    (( tw_rc == 0 )) && rm -rf "$TMP"
+    if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+      echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+      exit 1
+    fi
   fi
 }
 trap cleanup EXIT
@@ -102,6 +98,7 @@ spawn_one() {
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-devin-idle}" \
     WRK_FIXTURE_LOG="${TEST_HERDR_LOG:-$TMP/herdr.log}" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh.pids" \
     "$wrk_bin" spawn \
     -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture \
     --task "$task" "$@"

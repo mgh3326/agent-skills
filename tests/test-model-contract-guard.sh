@@ -26,38 +26,25 @@ WRK="$ROOT/bin/wrk"
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
+. "$ROOT/tests/lib/tmp-writers.sh"
+export TW_TMP="$TMP"
 # wrk spawn's refresh_quota_pool leaves a detached supervisor — `( python3 -
 # … ) &` -> fork + setsid -> `scopefuel refresh <pool> --background` — which
-# appends WRK_REFRESH_LOG with no pidfile and nothing waiting on it. A dentry
+# appends WRK_REFRESH_LOG. It names itself in <job>/quota-refresh.pid, and
+# the scopefuel child logs its own pid to WRK_REFRESH_PID_LOG. A dentry
 # recreated while rm walks the tree exits `rm -rf` with "Directory not empty"
-# (CI runs 36283072131/36288704921). Everything the suite detached inherits
-# env pointing under $TMP (XDG_DATA_HOME/ARBITER_INBOX_ROOT/HK_STATE/fixture
-# logs), so the ps scan matches exactly this run; $$ and its live children
-# are excluded so the sweep cannot hit itself or the caller.
+# (CI runs 36283072131/36288704921), so tests/lib/tmp-writers.sh reaps every
+# tracked writer by exact verified pid before the rm — never a process-table
+# pattern match or another process's environment.
 cleanup() {
-  local pidfile pid child snap stray i
-  while IFS= read -r pidfile; do
-    [[ -s "$pidfile" ]] || continue
-    read -r pid <"$pidfile" || continue
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    kill -STOP "$pid" 2>/dev/null || true
-    while IFS= read -r child; do kill "$child" 2>/dev/null || true; done \
-      < <(pgrep -P "$pid" 2>/dev/null || true)
-    kill "$pid" 2>/dev/null || true
-    kill -CONT "$pid" 2>/dev/null || true
-  done < <(find "$TMP" -name 'completion-sentinel.pid' 2>/dev/null)
-  for ((i = 0; i < 100; i++)); do
-    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
-    stray="$(awk -v self="$$" -v tmp="$TMP" \
-      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
-    [[ -n "$stray" ]] || break
-    while IFS= read -r pid; do
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      if ((i >= 50)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
-    done <<<"$stray"
-    sleep 0.1
-  done
-  rm -rf "$TMP"
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
+  (( tw_rc == 0 )) && rm -rf "$TMP"
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
@@ -274,6 +261,10 @@ echo "PASS codex-astra takes its default effort from the catalog (no max pin)"
 # so the marker is visible either way.
 brief_header() {
   local mode="$1" scopefuel_bin="$2" model="${3:-codex-sol}"
+  # a prior spawn's detached writers can still be writing under $TMP/inbox —
+  # reap them by exact pid first or the rm races a recreated dentry.
+  tmp_writers_stop ||
+    fail "tracked writers survived the mid-case teardown:${TW_LEFTOVER_PIDS:-}"
   rm -rf "$TMP/inbox"
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$scopefuel_bin" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_LAUNCH_MODE="$mode" \
@@ -323,6 +314,8 @@ echo "PASS a server without the catalog route does not mark the brief stale"
 # `wrk-note:` body line: visible to the spawned agent and still recorded in
 # the job-dir brief. A mutant that puts the marker back on expect: turns this
 # block RED (strict fixture refuses → zero deliveries).
+tmp_writers_stop ||
+  fail "tracked writers survived the mid-case teardown:${TW_LEFTOVER_PIDS:-}"
 rm -rf "$TMP/inbox" "$TMP/pw-strict.log"
 : >"$TMP/herdr.log"
 env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
@@ -359,6 +352,8 @@ fi
 exec "$SCOPEFUEL_FIXTURE" "$@"
 REFUSE
 chmod +x "$refusal"
+tmp_writers_stop ||
+  fail "tracked writers survived the mid-case teardown:${TW_LEFTOVER_PIDS:-}"
 rm -rf "$TMP/inbox"
 if env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$refusal" SCOPEFUEL_FIXTURE="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \

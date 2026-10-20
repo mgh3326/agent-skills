@@ -20,58 +20,39 @@ ARBITER="$ROOT/bin/arbiter"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
+. "$ROOT/tests/lib/tmp-writers.sh"
+export TW_TMP="$TMP"
 
 # OWNED_PID_LOG — the process registry. Every fixture process this file
-# launches appends its pid; cleanup terminates exactly that set first, then
-# the TMP-path stray sweep is only a backstop. Works across subshells (mutant
-# cases run in ( … )), unlike a shell array.
+# launches appends its pid; cleanup terminates exactly that set. Works
+# across subshells (mutant cases run in ( … )), unlike a shell array. The
+# owned-pids name is part of tests/lib/tmp-writers.sh's registry
+# convention, so teardown picks it up without being told.
 OWNED_PID_LOG="$TMP/owned-pids"; : >"$OWNED_PID_LOG"
-own() { printf '%s\n' "$1" >>"$OWNED_PID_LOG"; }
+own() { [[ "$1" =~ ^[0-9]+$ ]] || return 0; tw_register_pid "$OWNED_PID_LOG" "$1"; }
 
 kill_owned_tree() {
-  # Same discipline as production stop_completion_sentinel: freeze, reap the
-  # children, TERM, CONT so a STOPped fixture actually exits.
-  local pid="$1" child
-  kill -STOP "$pid" 2>/dev/null || true
-  while IFS= read -r child; do kill "$child" 2>/dev/null || true; done \
-    < <(pgrep -P "$pid" 2>/dev/null || true)
-  kill "$pid" 2>/dev/null || true
-  kill -CONT "$pid" 2>/dev/null || true
+  # Same discipline as production stop_completion_sentinel: freeze, reap
+  # the children, TERM, CONT so a STOPped fixture actually exits — plus the
+  # group/leader pass tests/lib/tmp-writers.sh adds for own-session
+  # fixtures and orphaned members.
+  tw_kill_tree "$1"
 }
 
 cleanup() {
-  local pidfile pid stray i snap
-  while IFS= read -r pid; do
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    kill_owned_tree "$pid"
-  done <"$OWNED_PID_LOG"
-  # TERM-immune fixtures (hang-tree grandchild) need the escalation pass.
-  sleep 0.3
-  while IFS= read -r pid; do
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    if kill -0 "$pid" 2>/dev/null; then kill -9 "$pid" 2>/dev/null || true; fi
-  done <"$OWNED_PID_LOG"
-  while IFS= read -r pidfile; do
-    [[ -s "$pidfile" ]] || continue
-    read -r pid <"$pidfile" || continue
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    kill_owned_tree "$pid"
-  done < <(find "$TMP" \( -name 'completion-sentinel.pid' -o -name 'sentinel.pid' -o -name 'quota-refresh.pid' \) 2>/dev/null || true)
-  # Backstop: anything still holding $TMP in argv or environment. Every
-  # fixture either lives under $TMP or was launched with INBOX/XDG inside it.
-  # Only this test shell itself is exempt — direct children are ours too.
-  for ((i = 0; i < 60; i++)); do
-    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
-    stray="$(awk -v self="$$" -v tmp="$TMP" \
-      'index($0, tmp) && $1 != self {print $1}' <<<"$snap")" || true
-    [[ -n "$stray" ]] || break
-    while IFS= read -r pid; do
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      if ((i >= 30)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
-    done <<<"$stray"
-    sleep 0.1
-  done
-  rm -rf "$TMP"
+  # tmp_writers_stop reaps every tracked writer by an exact verified pid —
+  # this registry, the *.pids fixture logs, the sentinel/refresh pidfiles,
+  # descendant walks and test-owned process groups — and waits until none
+  # remain before the rm. It never reads another process's environment and
+  # never kills by pattern.
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
+  (( tw_rc == 0 )) && rm -rf "$TMP"
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 
@@ -164,7 +145,11 @@ sentinel_count() {
 # sentinel is mid-sleep when the end lands), TRANSIENT_MAX, LOST_GRACE.
 start_sentinel() {
   local job="$1" pane="$2" report="$3" seq="${4:-}"
-  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" \
+  # tw_own_session gives the sentinel its own process group (pgid == its
+  # pid): a mutant or a mid-run kill that drops the child reaping still
+  # leaves the interval sleep inside a group teardown can name exactly —
+  # `kill -- -SENTINEL_PID` reaches orphans that re-parented to init.
+  tw_own_session env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" \
     WRK_FIXTURE_SCENARIO="${SCENARIO:-sentinel-working}" \
     ${seq:+WRK_FIXTURE_GET_SEQUENCE="$seq"} \
     WRK_COMPLETION_TIMEOUT_S="${SENT_TIMEOUT:-300}" \
@@ -580,6 +565,7 @@ start_fake_supervisor() {
   mkdir -p "$INBOX/$job"
   env ARBITER_INBOX_ROOT="$INBOX" \
     WRK_REFRESH_MODE="${WRK_REFRESH_MODE:-hang}" WRK_REFRESH_DELAY="${WRK_REFRESH_DELAY:-600}" \
+    WRK_REFRESH_PID_LOG="$TMP/fake-supervisors.pids" \
     python3 - "$SCOPEFUEL" fakepool 60 "$pf" "$job" "$deadline_offset" <<'PY' >/dev/null 2>&1 &
 import os, signal, subprocess, sys, time
 if os.fork():

@@ -4,6 +4,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
+# shellcheck disable=SC1091
+. "$ROOT/tests/lib/tmp-writers.sh"
+export TW_TMP="$TMP"
 
 hub_require_isolation() {
   [[ -n "${ARBITER_INBOX_ROOT:-}" && "$ARBITER_INBOX_ROOT" == "$TMP"/* ]] || {
@@ -23,50 +26,27 @@ real_jobs_count() {
 
 REAL_JOBS_BEFORE="$(real_jobs_count)"
 
-stop_test_sentinels() {
-  local inbox_root="${ARBITER_INBOX_ROOT:-}" pidfile pid command_line
-
-  [[ -n "$inbox_root" ]] || return 0
-
-  while IFS= read -r pidfile; do
-    [[ -r "$pidfile" ]] || continue
-    read -r pid <"$pidfile" || continue
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-    [[ "$command_line" == *"$ROOT/bin/wrk sentinel "* || "$command_line" == *"$TMP/"*' sentinel '* ]] || continue
-    kill "$pid" 2>/dev/null || true
-  done < <(find "$inbox_root" -type f -name completion-sentinel.pid -print 2>/dev/null || true)
-}
-
 cleanup() {
   local rc=$?
   local after
 
-  stop_test_sentinels
-  # kill only signals — a TERM'd sentinel can still be mid-write (its own log,
-  # the fixture herdr log a probe appends to, or an `arbiter release` writing
-  # state.db under $TMP/xdg), and refresh_quota_pool's detached supervisor
-  # (`python3 - <scopefuel> …` -> setsid -> `scopefuel refresh --background`)
-  # carries no pidfile for find to name. A dentry recreated while rm walks the
-  # tree exits rm -rf with "Directory not empty" (CI runs 36283072131 /
-  # 36288704921). Everything this suite detached inherits env pointing under
-  # $TMP (ARBITER_INBOX_ROOT/XDG_DATA_HOME/HK_STATE/fixture logs), so the ps
-  # scan below matches exactly this run; $$ and its live children are
-  # excluded so the sweep cannot hit itself or the caller.
-  local snap stray pid i
-  for ((i = 0; i < 100; i++)); do
-    snap="$(exec ps axeww -o pid= -o ppid= -o command= 2>/dev/null)" || true
-    stray="$(awk -v self="$$" -v tmp="$TMP" \
-      'index($0, tmp) && $1 != self && $2 != self {print $1}' <<<"$snap")" || true
-    [[ -n "$stray" ]] || break
-    while IFS= read -r pid; do
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      if ((i >= 50)); then kill -9 "$pid" 2>/dev/null || true; else kill "$pid" 2>/dev/null || true; fi
-    done <<<"$stray"
-    sleep 0.1
-  done
+  # kill only signals — a TERM'd sentinel can still be mid-write (its own
+  # log, the fixture herdr log a probe appends to, or an `arbiter release`
+  # writing state.db under $TMP/xdg), and refresh_quota_pool's detached
+  # supervisor plus its scopefuel child outlive their wrk. A dentry
+  # recreated while rm walks the tree exits rm -rf with "Directory not
+  # empty" (CI runs 36283072131 / 36288704921). tests/lib/tmp-writers.sh
+  # reaps each one by an exact verified pid — pidfile, registry, descendant
+  # walk — never a process-table pattern match.
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
   after="$(real_jobs_count)"
-  rm -rf "$TMP"
+  # Never rm while a tracked writer lives.
+  (( tw_rc == 0 )) && rm -rf "$TMP"
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+    exit 1
+  fi
   if [[ "$after" != "$REAL_JOBS_BEFORE" ]]; then
     echo "FAIL: real inbox mutated ${REAL_JOBS_BEFORE} -> ${after}" >&2
     exit 1
@@ -509,7 +489,7 @@ printf '%s\n' 'PASS wrk-spillover hub-cwd-keys-prefix'
 # Every hub invocation above starts its completion sentinel through the normal
 # spawn path. Reap only the test-owned sentinels before returning to the
 # legacy routing cases, whose fixture logs are intentionally reset below.
-stop_test_sentinels
+tw_stop_sentinels "$ARBITER_INBOX_ROOT"
 
 echo 'PASS wrk-spillover hub-mutants-red=5/5'
 )
@@ -608,7 +588,7 @@ grep -q '^OK pane=w:p1 host=local ' <<<"$forced_out"
 
 # A readable active duplicate remains terminal before either local telemetry or
 # hub/SSH work, for both automatic and explicitly local routing.
-stop_test_sentinels
+tw_stop_sentinels "$ARBITER_INBOX_ROOT"
 for route in auto local; do
   active_job="spillover-active-$route"
   XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job "$active_job" --agent-label owner --lane owner --t T1 >/dev/null
@@ -627,7 +607,7 @@ done
 
 # P5: an unreadable or absent arbiter may use the ordinary local path, but is
 # never enough evidence to call the hub or route remotely.
-stop_test_sentinels
+tw_stop_sentinels "$ARBITER_INBOX_ROOT"
 : >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
 XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-lookup-fail --agent-label owner --lane owner --t T1 >/dev/null
 set +e

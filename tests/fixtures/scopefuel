@@ -208,15 +208,24 @@ fi
 if [[ "${1:-}" == refresh ]]; then
   pool="${2:-}"
   [[ "${3:-}" == --background ]] || { echo 'fixture scopefuel: refresh requires --background' >&2; exit 2; }
+  # Every refresh child names itself to the suite: the pid log is the
+  # teardown's exact-pid handle on this process when its supervisor is
+  # already gone (the child runs in its own session, so a pgrep -P walk off
+  # a dead supervisor cannot reach it).
+  if [[ -n "${WRK_REFRESH_PID_LOG:-}" ]]; then
+    # Registration captures this shell's start identity (per-entry, not a
+    # file-mtime window) before it exec's — exec keeps the start identity,
+    # so the teardown can still verify the pid after `exec sleep`.
+    # shellcheck disable=SC1091
+    . "$(cd "$(dirname "$0")/../lib" && pwd)/tmp-writers.sh"
+    tw_register_pid "$WRK_REFRESH_PID_LOG" "$$"
+  fi
   case "${WRK_REFRESH_MODE:-ok}" in
     fail)
       echo "fixture scopefuel: refresh failed for pool=$pool" >&2
       exit 23
       ;;
     hang)
-      if [[ -n "${WRK_REFRESH_PID_LOG:-}" ]]; then
-        printf '%s\n' "$$" >>"$WRK_REFRESH_PID_LOG"
-      fi
       exec sleep "${WRK_REFRESH_DELAY:-2}"
       ;;
     hang-tree)
@@ -224,12 +233,9 @@ if [[ "${1:-}" == refresh ]]; then
       # group-TERM takes down this fixture shell, but only the follow-up
       # SIGKILL reaps the whole tree — the difference a timeout-path mutant
       # that drops the SIGKILL leaves observable.
-      if [[ -n "${WRK_REFRESH_PID_LOG:-}" ]]; then
-        printf '%s\n' "$$" >>"$WRK_REFRESH_PID_LOG"
-      fi
       ( trap '' TERM; exec sleep "${WRK_REFRESH_DELAY:-2}" ) &
       gchild=$!
-      [[ -z "${WRK_REFRESH_PID_LOG:-}" ]] || printf '%s\n' "$gchild" >>"$WRK_REFRESH_PID_LOG"
+      [[ -z "${WRK_REFRESH_PID_LOG:-}" ]] || tw_register_pid "$WRK_REFRESH_PID_LOG" "$gchild"
       wait "$gchild" 2>/dev/null || true
       ;;
   esac
