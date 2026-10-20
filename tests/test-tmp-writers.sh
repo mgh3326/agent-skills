@@ -698,14 +698,12 @@ sleep 0.2 & holder=$!
 holder_ident="$(_tw_pid_identity "$holder" 2>/dev/null || true)"
 [[ -n "$holder_ident" ]] || fail "T18: dead holder identity unavailable"
 wait "$holder" 2>/dev/null || true
+# macOS lstart has one-second granularity, and a live process's identity
+# never changes. Launch the reuse process in a LATER second (the gap is
+# over one full second) so its identity provably differs from the dead
+# holder's on both platforms.
+sleep 1
 sleep 60 & reuse=$!
-# macOS lstart has one-second granularity, so a process started in the
-# same second as the holder carries the SAME stored identity. Poll until
-# the live pid's start identity provably differs from the dead holder's.
-for _n in $(seq 1 30); do
-  [[ "$(_tw_pid_identity "$reuse" 2>/dev/null || true)" == "$holder_ident" ]] || break
-  sleep 0.1
-done
 [[ "$(_tw_pid_identity "$reuse" 2>/dev/null || true)" != "$holder_ident" ]] ||
   fail "T18: fixture start identities did not diverge"
 track "$reuse"
