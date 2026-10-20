@@ -11370,6 +11370,7 @@ schema_failed_out="$(spawn_base grok --job arb-broken --t T1 2>&1)"
 grep -q 'arbiter quota-pool claim failed' <<<"$schema_failed_out"
 grep -q 'continuing spawn' <<<"$schema_failed_out"
 [[ -e "$TMP/herdr.log" ]]
+tmp_writers_stop
 rm -rf "$TMP/xdg/arbiter"
 unset TEST_ARBITER_BIN
 
