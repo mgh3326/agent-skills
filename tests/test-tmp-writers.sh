@@ -4,6 +4,9 @@
 # refusal visibility in TW_LEFTOVER_PIDS, dead-entry caching bounds,
 # recorded own-session group ownership, pending-descendant escalation,
 # and the no-rm-while-a-tracked-writer-lives contract.
+# (hk1746): the leftover pass proves recycling — a live pid whose stored
+# start identity differs is named one per line on TW_RECYCLED_PIDS and
+# can no longer fail teardown; matching or absent identities still can.
 set -euo pipefail
 
 # Standalone-safe isolation: never depend on the caller's environment.
@@ -32,7 +35,10 @@ track() {
   [[ "$pid" =~ ^[0-9]+$ ]] || return 0
   ident="$(_tw_pid_identity "$pid" 2>/dev/null || true)"
   [[ -n "$ident" ]] || return 0
-  STRAYS="$STRAYS$pid"$'\t'"$ident"$'\n'
+  # Entries are newline-JOINED: untrack's $( ) strips the trailing
+  # newline, so a trailing-newline format would fuse the next entry
+  # onto the last line and hide it from stray_kill's $1 match.
+  STRAYS="${STRAYS:+$STRAYS$'\n'}$pid"$'\t'"$ident"
 }
 
 untrack() { # PID — drop every ledger line for a confirmed-dead pid
@@ -79,6 +85,7 @@ new_run() {
   TW_TMP="$(mktemp -d)"
   export TW_TMP
   TW_LEFTOVER_PIDS=""
+  TW_RECYCLED_PIDS=""
   TW_RUN_START="$(date +%s)"
   RUNS="$RUNS $TW_TMP"
 }
@@ -97,6 +104,7 @@ pid_gone() {  # wait until kill -0 fails
   while alive "$1"; do (( ++n > 100 )) && return 1; sleep 0.1; done
 }
 listed() { [[ " $TW_LEFTOVER_PIDS " == *" $1 "* ]]; }
+recycled() { grep -qxF "$1" <<<"${TW_RECYCLED_PIDS:-}"; }
 
 # mk_sentinel_script PATH — a fake wrk copy: writes its own sentinel
 # pidfile (pid + started=EPOCH) into $SENT_JOBDIR, then holds a `sleep`
@@ -117,6 +125,21 @@ wait_pidfile() {
   local _n
   for _n in 1 2 3 4 5 6 7 8 9 10; do
     [[ -s "$1" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+# wait_group_member PGID — up to ~5s for another process to appear in
+# PGID's process group; prints the member pid.
+wait_group_member() {
+  local _n _m
+  for _n in $(seq 1 50); do
+    _m="$(pgrep -g "$1" 2>/dev/null | grep -vx "$1" | head -n 1 || true)"
+    if [[ -n "$_m" ]]; then
+      printf '%s\n' "$_m"
+      return 0
+    fi
     sleep 0.1
   done
   return 1
@@ -209,13 +232,15 @@ grep -q 'own() {.*tw_register_pid' "$ROOT/tests/test-wrk-job-end.sh" ||
   fail "T5: test-wrk-job-end.sh own() must go through tw_register_pid"
 pass "T5 own() call sites all register through tw_register_pid"
 
-# ── T6: stale per-entry token on an earlier line refuses a foreign pid ──
+# ── T6: stale per-entry token on an earlier line proves recycling ──────
 new_run
 reg="$TW_TMP/mixed.pids"
 sleep 60 & fp=$!
 track "$fp"
 # Earlier line: a bare registry entry plus a token that is not fp's real
-# start identity (as a recycled/stale token would be).
+# start identity — the shape a dead-and-reused pid leaves behind. The
+# sweep still refuses to signal it, and the leftover pass now proves it
+# recycled: named on TW_RECYCLED_PIDS, out of TW_LEFTOVER_PIDS, rc 0.
 printf '%s\t%s\n' "$fp" "0" >>"$reg.identities"
 printf '%s\n' "$fp" >>"$reg"
 sleep 60 & op=$!
@@ -223,13 +248,14 @@ track "$op"
 tw_register_pid "$reg" "$op"
 rc=0
 tmp_writers_stop || rc=$?
-[[ "$rc" -ne 0 ]] || fail "T6: refused foreign pid must fail the sweep"
+[[ "$rc" -eq 0 ]] || fail "T6: proven-recycled pid must not fail the sweep"
 alive "$fp" || fail "T6: foreign pid on a stale-token line was signalled"
 dead "$op" || fail "T6: valid later entry was not reaped"
-listed "$fp" || fail "T6: refused pid must appear in TW_LEFTOVER_PIDS"
+listed "$fp" && fail "T6: recycled pid must leave TW_LEFTOVER_PIDS"
+recycled "$fp" || fail "T6: recycled pid missing from TW_RECYCLED_PIDS"
 untrack "$op"
 stray_kill "$fp"; pid_gone "$fp"; untrack "$fp"
-pass "T6 stale per-entry token refuses, appended valid entry reaped"
+pass "T6 stale per-entry token refuses signal, named recycled"
 
 # ── T7: missing identity token is refused too ──────────────────────────
 new_run
@@ -290,8 +316,7 @@ exec sleep 60
 SH
 tw_own_session bash "$TW_TMP/orphan-leader.sh" & sess=$!
 track "$sess"
-sleep 0.3
-member="$(pgrep -g "$sess" 2>/dev/null | grep -vx "$sess" | head -n 1 || true)"
+member="$(wait_group_member "$sess" || true)"
 [[ "$member" =~ ^[0-9]+$ ]] || fail "T9: own-session member missing"
 track "$member"
 tmp_writers_stop || fail "T9: sweep failed (${TW_LEFTOVER_PIDS:-})"
@@ -305,8 +330,7 @@ new_run
 tw_own_session bash -c '( trap "" TERM; exec sleep 60 ) & exec sleep 60' &
 sess=$!
 track "$sess"
-sleep 0.3
-member="$(pgrep -g "$sess" 2>/dev/null | grep -vx "$sess" | head -n 1 || true)"
+member="$(wait_group_member "$sess" || true)"
 [[ "$member" =~ ^[0-9]+$ ]] || fail "T10: own-session member missing"
 track "$member"
 kill -9 "$sess" 2>/dev/null || true
@@ -350,8 +374,7 @@ new_run
 ( unset TW_TMP; tw_own_session bash -c '( exec sleep 60 ) & exec sleep 1' ) &
 fsess=$!
 track "$fsess"
-sleep 0.3
-fmem="$(pgrep -g "$fsess" 2>/dev/null | grep -vx "$fsess" | head -n 1 || true)"
+fmem="$(wait_group_member "$fsess" || true)"
 [[ "$fmem" =~ ^[0-9]+$ ]] || fail "T12: foreign group member missing"
 track "$fmem"
 wait "$fsess" 2>/dev/null || true    # leader exits after ~1s on its own
@@ -617,7 +640,8 @@ untrack "$leader"; untrack "$sentinel"; untrack "$child"
 pass "T17 first-sweep group candidates survive verifier delay"
 
 # A self-record whose live leader identity mismatches is a candidate only:
-# its group/member must remain untouched and the live leader must be reported.
+# its group/member must remain untouched, and the leftover pass proves the
+# leader recycled — named on TW_RECYCLED_PIDS, out of TW_LEFTOVER_PIDS.
 new_run
 wrapper="$TW_TMP/mismatch-wrapper.sh"
 cat >"$wrapper" <<'SH'
@@ -645,10 +669,12 @@ IFS=$'\t' read -r record_pid record_ident record_pgid <"$record"
 printf '%s\t%s\t%s\n' "$proxy" "mismatched-$record_ident" "$proxy" >"$record"
 t17_rc=0
 tmp_writers_stop || t17_rc=$?
-[[ "$t17_rc" -ne 0 ]] ||
-  fail "T17 negative: mismatched live leader identity falsely succeeded"
-listed "$proxy" ||
-  fail "T17 negative: refused live leader missing from leftovers"
+[[ "$t17_rc" -eq 0 ]] ||
+  fail "T17 negative: proven-recycled leader must not fail teardown"
+listed "$proxy" &&
+  fail "T17 negative: recycled leader stayed in TW_LEFTOVER_PIDS"
+recycled "$proxy" ||
+  fail "T17 negative: recycled leader missing from TW_RECYCLED_PIDS"
 [[ -d "$TW_TMP" ]] || fail "T17 negative: TMP removed while proxy was alive"
 alive "$proxy" || fail "T17 negative: mismatched live leader was signalled"
 alive "$member" || fail "T17 negative: candidate group member was signalled"
@@ -659,5 +685,70 @@ pid_gone "$proxy" || fail "T17 negative: proxy survived exact-pid cleanup"
 pid_gone "$member" || fail "T17 negative: member survived exact-pid cleanup"
 untrack "$proxy"; untrack "$member"
 pass "T17 mismatched live session identity refuses leader and member"
+
+# ── T18: the leftover pass separates proven-recycled from survivors ────
+# Mutant invariant: a pid proven recycled never fails teardown, and a
+# pid with a matching identity always does.
+new_run
+reg="$TW_TMP/reused.pids"
+# A registered writer died and its number was reused by an unrelated
+# test-owned process: the stored start identity belongs to the dead
+# holder, not to the live process now carrying the pid.
+sleep 0.2 & holder=$!
+holder_ident="$(_tw_pid_identity "$holder" 2>/dev/null || true)"
+[[ -n "$holder_ident" ]] || fail "T18: dead holder identity unavailable"
+wait "$holder" 2>/dev/null || true
+sleep 60 & reuse=$!
+track "$reuse"
+printf '%s\t%s\n' "$reuse" "$holder_ident" >>"$reg.identities"
+printf '%s\n' "$reuse" >>"$reg"
+rc=0
+tmp_writers_stop || rc=$?
+[[ "$rc" -eq 0 ]] ||
+  fail "T18: proven-recycled registry pid failed teardown (${TW_LEFTOVER_PIDS:-})"
+alive "$reuse" || fail "T18: recycled registry pid was signalled"
+listed "$reuse" && fail "T18: recycled pid stayed in TW_LEFTOVER_PIDS"
+recycled "$reuse" || fail "T18: recycled pid missing from TW_RECYCLED_PIDS"
+stray_kill "$reuse"; pid_gone "$reuse"; untrack "$reuse"
+
+# Same proof through a pidfile: the recorded writer started long ago, so
+# the recently-started live pid cannot be it.
+new_run
+sleep 60 & fp=$!
+track "$fp"
+mkdir -p "$TW_TMP/inbox/reused-pf"
+printf '%s\nstarted=%s\n' "$fp" "$(( $(date +%s) - 10000 ))" \
+  >"$TW_TMP/inbox/reused-pf/completion-sentinel.pid"
+rc=0
+tmp_writers_stop || rc=$?
+[[ "$rc" -eq 0 ]] ||
+  fail "T18: proven-recycled pidfile pid failed teardown (${TW_LEFTOVER_PIDS:-})"
+alive "$fp" || fail "T18: recycled pidfile pid was signalled"
+listed "$fp" && fail "T18: recycled pidfile pid stayed in TW_LEFTOVER_PIDS"
+recycled "$fp" || fail "T18: recycled pidfile pid missing from TW_RECYCLED_PIDS"
+stray_kill "$fp"; pid_gone "$fp"; untrack "$fp"
+
+# A live writer whose stored identity still matches is still a leftover:
+# keep it alive by refusing its signal path only — the leftover pass
+# must then count it and the run must return 1.
+new_run
+reg="$TW_TMP/match.pids"
+sleep 60 & rp=$!
+track "$rp"
+tw_register_pid "$reg" "$rp"
+eval "$(declare -f _tw_registry_pid_ok \
+  | sed '1s/_tw_registry_pid_ok/_t18_orig_registry_pid_ok/')"
+_tw_registry_pid_ok() { return 1; }
+rc=0
+tmp_writers_stop || rc=$?
+eval "$(declare -f _t18_orig_registry_pid_ok \
+  | sed '1s/_t18_orig_registry_pid_ok/_tw_registry_pid_ok/')"
+unset -f _t18_orig_registry_pid_ok
+[[ "$rc" -eq 1 ]] ||
+  fail "T18: matching-identity live writer must fail teardown"
+listed "$rp" || fail "T18: matching-identity writer missing from leftovers"
+recycled "$rp" && fail "T18: matching-identity writer named recycled"
+stray_kill "$rp"; pid_gone "$rp"; untrack "$rp"
+pass "T18 leftover pass separates recycled from matching-identity pids"
 
 echo "PASS test-tmp-writers"

@@ -61,7 +61,12 @@
 # tmp_writers_stop loops until every tracked pid is gone or a ~10s
 # wall-clock deadline passes (TERM for the first half, KILL after), then
 # returns nonzero with TW_LEFTOVER_PIDS set and the caller preserves TMP:
-# no rm while a tracked writer lives.
+# no rm while a tracked writer lives. The leftover pass counts a live
+# pid only while it can still be the tracked writer — its stored start
+# identity matches, or none was ever recorded. A pid PROVEN recycled (a
+# stored identity that differs from the live one) is a different process
+# than the one this run tracked: it is named on its own line in
+# TW_RECYCLED_PIDS for the log, never counted, never signalled.
 #
 # Public API:
 #   TW_TMP=DIR                    — the run's tmp dir (set before teardown)
@@ -72,6 +77,10 @@
 #                                   writers remain (TMP must be kept)
 #   TW_LEFTOVER_PIDS              — tracked pids still alive when the bound
 #                                   ran out (empty on success)
+#   TW_RECYCLED_PIDS              — one pid per line: live pids proven
+#                                   recycled (stored start identity
+#                                   differs from the live one); excluded
+#                                   from TW_LEFTOVER_PIDS, never signalled
 #   tw_register_pid REGISTRY PID  — append PID to REGISTRY after recording
 #                                   its start identity in REGISTRY.identities
 #   tw_kill_pidfile FILE [SIG]    — verify one pidfile (argv + recorded
@@ -87,6 +96,7 @@
 
 TW_TMP=""
 TW_LEFTOVER_PIDS=""
+TW_RECYCLED_PIDS=""
 TW_TRACKED_LOG="${TW_TRACKED_LOG:-}"
 TW_RUN_START="$(date +%s)"
 _TW_LAST_DESC=""
@@ -335,6 +345,30 @@ _tw_registry_pid_ok() {
   [[ -n "$cur" && "$cur" == "$ident" ]]
 }
 
+# _tw_identity_recycled PID STORED — rc 0 only as positive proof of
+# recycling: a stored start identity exists, the live pid's current
+# identity is readable, and they differ. An empty stored identity (the
+# pid was never verified) or an unreadable current one is no proof —
+# callers keep reporting the pid as before.
+_tw_identity_recycled() {
+  local pid="$1" stored="${2:-}" cur
+  [[ -n "$stored" ]] || return 1
+  cur="$(_tw_pid_identity "$pid" 2>/dev/null)" || return 1
+  [[ -n "$cur" && "$cur" != "$stored" ]]
+}
+
+# _tw_pidfile_recycled PID STARTED — the pidfile form of the same proof:
+# rc 0 only when the file recorded a numeric started= epoch AND the live
+# pid's real elapsed provably disagrees with it (outside the ±120s window
+# _tw_start_matches uses). A missing or malformed started= is no proof.
+_tw_pidfile_recycled() {
+  local pid="$1" started="${2:-}" el skew
+  [[ "$started" =~ ^[0-9]+$ ]] || return 1
+  el="$(_tw_elapsed_s "$pid" 2>/dev/null)" || return 1
+  skew=$(( $(date +%s) - started - el ))
+  (( skew < -120 || skew > 120 ))
+}
+
 # _tw_leftover_argv_ok ARGS — a dead tracked leader's group member still
 # counts as this run's leftover only when its argv is a bare `sleep N` (the
 # sentinel interval child) or carries this run's $TMP / the repo root.
@@ -530,7 +564,9 @@ _tw_member_id() {
 # a TERM-immune child still takes the KILL and a recycled member pid is
 # never signalled. rc 0 when nothing tracked remains alive; rc 1 with
 # TW_LEFTOVER_PIDS set otherwise — the caller must then preserve $TW_TMP
-# instead of rm -rf'ing it.
+# instead of rm -rf'ing it. Live pids whose stored start identity
+# provably differs (the tracked writer died and the number was reused)
+# do not count: they are named one per line on TW_RECYCLED_PIDS instead.
 tmp_writers_stop() {
   local round_start sig quiet=0 alive deadline now
   local pf reg pid started kind args stat dp cur
@@ -541,6 +577,9 @@ tmp_writers_stop() {
   local _TW_MEMBERS_NEW="" _TW_MEMBERS_UNVER="" _TW_MEMBER_IDS=""
   local g glist gmembers gm="" mpid margs mstat mident mstored mepoch mlstart
   local next_members kept groups_prev
+  local stored="" recycled=""
+  TW_LEFTOVER_PIDS=""
+  TW_RECYCLED_PIDS=""
   [[ -n "${TW_TMP:-}" && -d "$TW_TMP" ]] || return 0
   round_start="$(date +%s)"
   deadline=$(( round_start + 10 ))
@@ -804,14 +843,68 @@ tmp_writers_stop() {
   done
   # Report leftovers: every live pid found in this run's own pidfiles,
   # registries and session records — including ones verification refused
-  # — plus pending members still alive. A refused live writer shows up
-  # here instead of hiding, and a nonzero return keeps the caller from
-  # rm -rf'ing TMP.
-  TW_LEFTOVER_PIDS=""
+  # — plus pending members still alive. A live pid counts as a leftover
+  # only while it can still be the tracked writer: its stored start
+  # identity still matches (pidfile started= inside the ±120s window;
+  # registry/session/member identity byte-equal), or none was ever
+  # recorded so it was never verified. A pid PROVEN recycled — a stored
+  # identity that differs from the live one — is a different process
+  # than the writer this run tracked: it is named on its own line in
+  # TW_RECYCLED_PIDS for the log, never counted, and (as in every pass
+  # here) never signalled. A refused live writer still shows up as a
+  # leftover instead of hiding, and a nonzero return keeps the caller
+  # from rm -rf'ing TMP.
+  # Pass one: prove recycling per source so a pid named by several
+  # records is excluded by ANY of them — a no-identity listing elsewhere
+  # cannot resurrect a pid another record proves dead-and-reused.
+  while IFS= read -r pf; do
+    IFS=$'\t' read -r pid started <<<"$(_tw_pidfile_fields "$pf")"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    _tw_pid_alive "$pid" || continue
+    _tw_list_has "$recycled" "$pid" && continue
+    _tw_pidfile_recycled "$pid" "$started" &&
+      recycled="$recycled $pid"
+  done < <(find "$TW_TMP" -type f \
+             \( -name 'completion-sentinel.pid' -o -name 'sentinel.pid' \
+                -o -name 'quota-refresh.pid' \) 2>/dev/null || true)
+  while IFS= read -r reg; do
+    [[ -f "$reg" ]] || continue
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      _tw_pid_alive "$pid" || continue
+      _tw_list_has "$recycled" "$pid" && continue
+      stored=""
+      [[ -f "$reg.identities" ]] &&
+        stored="$(_tw_registered_identity "$pid" "$reg.identities")"
+      _tw_identity_recycled "$pid" "$stored" &&
+        recycled="$recycled $pid"
+    done <"$reg"
+  done < <(_tw_registries)
+  while IFS= read -r sfile; do
+    IFS=$'\t' read -r spid sident _ <"$sfile" 2>/dev/null || continue
+    [[ "$spid" =~ ^[0-9]+$ ]] || continue
+    _tw_pid_alive "$spid" || continue
+    _tw_list_has "$recycled" "$spid" && continue
+    _tw_identity_recycled "$spid" "$sident" &&
+      recycled="$recycled $spid"
+  done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
+  for mpid in $_TW_MEMBERS; do
+    _tw_pid_alive "$mpid" || continue
+    _tw_list_has "$recycled" "$mpid" && continue
+    mstored="$(_tw_member_id "$mpid" <<<"$_TW_MEMBER_IDS")"
+    _tw_identity_recycled "$mpid" "$mstored" &&
+      recycled="$recycled $mpid"
+  done
+  for pid in $recycled; do
+    TW_RECYCLED_PIDS="${TW_RECYCLED_PIDS}${pid}"$'\n'
+  done
+  # Pass two: leftovers are the live tracked pids no record proved
+  # recycled.
   while IFS= read -r pf; do
     IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$pf")"
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     _tw_pid_alive "$pid" || continue
+    _tw_list_has "$recycled" "$pid" && continue
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
   done < <(find "$TW_TMP" -type f \
              \( -name 'completion-sentinel.pid' -o -name 'sentinel.pid' \
@@ -821,6 +914,7 @@ tmp_writers_stop() {
     while IFS= read -r pid; do
       [[ "$pid" =~ ^[0-9]+$ ]] || continue
       _tw_pid_alive "$pid" || continue
+      _tw_list_has "$recycled" "$pid" && continue
       TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
     done <"$reg"
   done < <(_tw_registries)
@@ -828,10 +922,12 @@ tmp_writers_stop() {
     IFS=$'\t' read -r spid _ _ <"$sfile" 2>/dev/null || continue
     [[ "$spid" =~ ^[0-9]+$ ]] || continue
     _tw_pid_alive "$spid" || continue
+    _tw_list_has "$recycled" "$spid" && continue
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $spid"
   done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
   for mpid in $_TW_MEMBERS $_TW_MEMBERS_UNVER; do
     _tw_pid_alive "$mpid" || continue
+    _tw_list_has "$recycled" "$mpid" && continue
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $mpid"
   done
   [[ -z "$TW_LEFTOVER_PIDS" ]]
