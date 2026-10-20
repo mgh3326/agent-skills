@@ -197,7 +197,7 @@ Usage: wrk spawn -c CWD -m|--profile MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL 
                  [-L live|mock] [--effort LEVEL] [--job ID] [--owner NAME] [--report PATH] [--job-dup-ok]
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
                  [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
-                 [--task HK_TASK_ID | --parent-job JOB_ID] [--task-hk-bypass]
+                 [--task HK_TASK_ID | --parent-job JOB_ID] [--takeover-from OLD_JOB] [--task-hk-bypass]
 
 Options:
   -c CWD, -m|--profile MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
@@ -292,6 +292,10 @@ Options:
                      before sending a request. The inherited task is recorded
                      in job meta (task_id + task_inherited_from) and the child
                      never re-claims it — the owning job's hk record stands.
+  --takeover-from OLD_JOB
+                    builder-only task takeover. Requires --task and an ended
+                    old job; rebinds through handoffkeep and carries its round
+                    count into the new job. Workers and testers cannot use it.
   --task-hk-bypass   explicit operator override: spawn without a confirmed
                      hk task link when handoffkeep is unreachable. Recorded
                      in the job's claim payload as task_link_override so the
@@ -4322,6 +4326,19 @@ def wrk_events_ordered(events):
     return [(name, document, mtime) for _, mtime, name, document in rows]
 
 
+def wrk_takeover_rounds(events):
+    """Round count inherited by this job from its newest takeover record."""
+    inherited = 0
+    for _, document, _ in wrk_events_ordered(events):
+        if document is None or document.get("kind") != "job.takeover":
+            continue
+        payload = document.get("payload", document)
+        value = payload.get("rounds_used") if isinstance(payload, dict) else None
+        if isinstance(value, int) and not isinstance(value, bool):
+            inherited = max(inherited, value)
+    return inherited
+
+
 def wrk_event_highest(events):
     highest = 0
     try:
@@ -5184,6 +5201,7 @@ open_rounds = [str(r.get("round")) for r in rounds
 used = sum(1 for r in rounds
            if not (isinstance(r.get("round"), int) and r.get("round") in voided))
 used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+used += wrk_takeover_rounds(events)
 last = verdicts[-1] if verdicts else {}
 lv = "-"
 if last.get("verdict") and last.get("head"):
@@ -5367,6 +5385,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     used = sum(1 for r in rounds
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for r in verdicts if not isinstance(r.get("round"), int))
+    used += wrk_takeover_rounds(events)
     last = verdicts[-1] if verdicts else {}
     lv = "-"
     if last.get("verdict") and last.get("head"):
@@ -5493,6 +5512,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     used = sum(1 for r in rounds
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+    used += wrk_takeover_rounds(events)
     approval = None
     if used >= cap:
         if not extend_ref:
@@ -5702,6 +5722,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     used = sum(1 for r in rounds
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+    used += wrk_takeover_rounds(events)
     if target is None:
         used += 1  # this unbound verdict is itself a round
     record = {"kind": "job.verdict", "job_id": job, "owner_lane": owner,
@@ -5899,7 +5920,7 @@ job_events_scan() {
 import json, os, sys, time
 exec(os.environ["WRK_EVENTS_PY"])
 
-WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped"}
+WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped", "job.handed_off"}
 HUB_TERMINAL = {"job.completed", "job.completion", "job.revoked"}
 REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.reprompted"}
 now = time.time()
@@ -5981,7 +6002,7 @@ import datetime, fcntl, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 
 events, job, owner, outcome, reason, source, host = sys.argv[1:]
-WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped"}
+WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped", "job.handed_off"}
 HUB_TERMINAL = {"job.completed", "job.completion", "job.revoked"}
 REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.reprompted"}
 
@@ -6000,15 +6021,20 @@ with open(lock_path, "w", encoding="utf-8") as lock:
         kinds.append(doc.get("kind") or doc.get("type") or doc.get("event") or "")
     last_revive = -1
     last_term = -1
+    last_term_kind = ""
     last_hub = -1
     for index, kind in enumerate(kinds):
         if kind in REVIVE:
             last_revive = index
         if kind in WORK_TERMINAL:
             last_term = index
+            last_term_kind = kind
         if kind in HUB_TERMINAL:
             last_hub = index
     if last_hub > -1 and last_hub > last_revive:
+        print("already-ended")
+        raise SystemExit(0)
+    if last_term > last_revive and last_term_kind == "job.handed_off":
         print("already-ended")
         raise SystemExit(0)
     if last_term > -1 and last_revive > last_term:
@@ -7304,7 +7330,7 @@ spillover_wake_request() {
 # a flag and remains a perfectly valid --requested-by value.
 wrk_option_token() {
   case "$1" in
-    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -7325,7 +7351,7 @@ spillover_hub_args() {
         ;;
       --job-dup-ok)
         echo "wrk: --job-dup-ok is not permitted for a hub spawn" >&2; return 2 ;;
-      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job)
+      -m|-w|-l|--t|--effort|--job|--owner|--report|--role|--lane|--parent|-L|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from)
         i=$((i + 1))
         { [[ "$i" -lt "${#args[@]}" && -n "${args[$i]}" ]] && ! wrk_option_token "${args[$i]}"; } ||
           { echo "wrk: $arg requires a value" >&2; return 2; }
@@ -8027,7 +8053,7 @@ spawn_router_cmd() {
   for ((i = 0; i < ${#args[@]}; i++)); do
     case "${args[$i]}" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--host|--lane-defer) ((i += 1)) ;;
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--host|--lane-defer) ((i += 1)) ;;
       --task-hk-bypass|--job-dup-ok|--landing-strict|--keep) ;;
       *) break ;;
     esac
@@ -8938,6 +8964,15 @@ task_validate() {
   if [[ -n "$PARENT_JOB" ]] && [[ ! "$PARENT_JOB" =~ ^[A-Za-z0-9._-]+$ ]]; then
     die "--parent-job must be a job id (got '$PARENT_JOB')"
   fi
+  if [[ -n "$TAKEOVER_FROM" ]]; then
+    [[ "$TAKEOVER_FROM" =~ ^[A-Za-z0-9._-]+$ ]] ||
+      die "--takeover-from must be a job id (got '$TAKEOVER_FROM')"
+    [[ "$ROLE" == builder ]] || die "--takeover-from is builder-only; worker and tester roles cannot take over a task"
+    [[ -z "$PARENT_JOB" ]] || die "--takeover-from cannot be combined with --parent-job"
+    [[ "$TASK_HK_BYPASS" -eq 0 ]] || die "--takeover-from forbids --task-hk-bypass"
+    [[ -z "$ROUND_EXT_REF" ]] || die "--takeover-from cannot be combined with --round-ext"
+    [[ "$TAKEOVER_FROM" != "$JOB_ID" ]] || die "--takeover-from must name a different job from --job"
+  fi
   if [[ "$ROLE" == builder ]]; then
     [[ -z "$PARENT_JOB" ]] ||
       die "--role builder links its own task with --task; --parent-job is the tester/advisory inheritance path"
@@ -9182,6 +9217,145 @@ print("\t".join([d.get("state") or "", d.get("claimed_by") or "",
   return 0
 }
 
+# A takeover is permitted only when the shared event-time order says the old
+# job has a work-terminal record newer than its newest revive. This read-only
+# check runs before admission side effects and is repeated immediately before
+# handoffkeep rebinds the task.
+takeover_old_job_check() {
+  local old="$1" events scan ended terminal
+  events="$(wrk_jobs_root)/$old/events"
+  [[ -d "$events" ]] || die "takeover refused: old job '$old' has no event history"
+  scan="$(job_events_scan "$events")" || die "takeover refused: cannot inspect old job '$old'"
+  IFS=$'\t' read -r _ ended _ terminal _ _ _ _ _ _ _ <<<"$scan"
+  [[ "$ended" == 1 ]] ||
+    die "takeover refused: old job '$old' is still live; no work-terminal follows its newest revive"
+  TAKEOVER_ROUNDS_USED="$(round_scan "$old" | sed -n 's/.*rounds=\([0-9][0-9]*\).*/\1/p')"
+  [[ "$TAKEOVER_ROUNDS_USED" =~ ^[0-9]+$ ]] ||
+    die "takeover refused: cannot read old job '$old' round count"
+  TAKEOVER_OLD_TERMINAL="$terminal"
+}
+
+# Read-only task check. The sole non-OLD row accepted is the same-NEW/same-
+# label replay; the API remains the authority that checks its matching audit
+# event before treating that request as a no-op.
+hk_task_takeover_precheck() {
+  [[ -n "$TASK_ID" && -n "$TAKEOVER_FROM" ]] ||
+    die "internal: task_validate must run before takeover precheck"
+  takeover_old_job_check "$TAKEOVER_FROM"
+  local handoffkeep out rc=0 parsed
+  handoffkeep="$(hk_bin)"
+  [[ -n "$handoffkeep" ]] || die "takeover refused: handoffkeep binary not found (set HANDOFFKEEP_BIN)"
+  set +e
+  out="$(hk_cmd "$handoffkeep" tasks show "$TASK_ID" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die "takeover refused: handoffkeep tasks show failed: ${out:0:200}"
+  parsed="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    task = json.load(sys.stdin)
+    if not isinstance(task, dict): raise ValueError("task is not an object")
+    state, claimant = task.get("state"), task.get("claimed_by")
+    refs = task.get("refs")
+    if not isinstance(state, str) or not isinstance(claimant, str) or not isinstance(refs, dict):
+        raise ValueError("missing task binding fields")
+    job = refs.get("job_id")
+    events = task.get("events") or []
+    replay = any(isinstance(event, dict) and isinstance(event.get("rebind"), dict)
+                 and event["rebind"].get("from_job") == sys.argv[1]
+                 and event["rebind"].get("to_job") == sys.argv[2]
+                 and event["rebind"].get("by") == sys.argv[3]
+                 for event in events)
+    if state not in ("claimed", "in_progress"):
+        raise ValueError("task state is not claimed or in_progress (state=%s)" % state)
+    if not ((job == sys.argv[1]) or (job == sys.argv[2] and claimant == sys.argv[3] and replay)):
+        raise ValueError("task is bound to current job %s (claimed_by=%s)" % (job or "(none)", claimant or "(none)"))
+    print("ok")
+except (ValueError, TypeError, AttributeError) as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)
+' "$TAKEOVER_FROM" "$JOB_ID" "$LABEL" 2>&1)" ||
+    die "takeover refused: task $TASK_ID binding check failed: $parsed"
+  [[ "$parsed" == ok ]] || die "takeover refused: task $TASK_ID binding check failed: $parsed"
+  TASK_LINK_STATUS="takeover"
+}
+
+# The task rebind must land before any pane is created. Only a successful,
+# verified response is followed by the paired local audit records.
+hk_task_takeover_rebind() {
+  [[ -n "$TAKEOVER_FROM" ]] || return 0
+  hk_task_takeover_precheck
+  local handoffkeep out rc=0 verify
+  handoffkeep="$(hk_bin)"
+  [[ -n "$handoffkeep" ]] || die "takeover refused: handoffkeep binary not found (set HANDOFFKEEP_BIN)"
+  set +e
+  out="$(hk_cmd "$handoffkeep" tasks rebind "$TASK_ID" --from-job "$TAKEOVER_FROM" \
+    --to-job "$JOB_ID" --by "$LABEL" --reason "builder takeover from $TAKEOVER_FROM" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die "takeover refused: handoffkeep tasks rebind failed: ${out:0:300}"
+  verify="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    task = json.load(sys.stdin)
+    if (not isinstance(task, dict) or task.get("state") not in ("claimed", "in_progress")
+        or task.get("claimed_by") != sys.argv[1]
+        or not isinstance(task.get("refs"), dict)
+        or task["refs"].get("job_id") != sys.argv[2]):
+        raise ValueError("task response did not confirm the new binding")
+except (ValueError, TypeError, AttributeError, KeyError) as error:
+    print(str(error), file=sys.stderr)
+    raise SystemExit(1)
+print("ok")
+' "$LABEL" "$JOB_ID" 2>&1)" || die "takeover refused: invalid task rebind response: $verify"
+  [[ "$verify" == ok ]] || die "takeover refused: invalid task rebind response: $verify"
+  takeover_event_pair_commit
+  TAKEOVER_REBOUND=1
+}
+
+# Commit both local audit records under their event locks. A rebind that the
+# server refuses reaches neither call nor event directory.
+takeover_event_pair_commit() {
+  local old_events="$(wrk_jobs_root)/$TAKEOVER_FROM/events"
+  local new_events="$(wrk_jobs_root)/$JOB_ID/events"
+  wrk_py - "$old_events" "$new_events" "$TAKEOVER_FROM" "$JOB_ID" \
+    "$TASK_ID" "$TAKEOVER_ROUNDS_USED" "$LABEL" "$BUILDER_LANE" "$PARENT_LANE" <<'PY'
+import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+old_events, new_events, old_job, new_job, task, rounds, label, lane, parent = sys.argv[1:]
+rounds = int(rounds)
+for directory in (old_events, new_events):
+    os.makedirs(directory, exist_ok=True)
+locks = [wrk_events_locked(path) for path in sorted((old_events, new_events))]
+new_record = {"kind": "job.takeover", "job_id": new_job, "from_job": old_job,
+              "task_id": int(task), "rounds_used": rounds, "label": label,
+              "owner_lane": lane, "parent_lane": parent, "role": "builder", "epoch": 1}
+old_record = {"kind": "job.handed_off", "job_id": old_job, "to_job": new_job,
+              "task_id": int(task), "rounds_used": rounds, "label": label,
+              "owner_lane": lane, "parent_lane": parent, "role": "builder", "epoch": 1}
+def matching(directory, kind, fields):
+    matches = []
+    for _, document, _ in wrk_events_ordered(directory):
+        if document is None or document.get("kind") != kind:
+            continue
+        payload = document.get("payload", document)
+        if isinstance(payload, dict) and all(payload.get(key) == value for key, value in fields.items()):
+            matches.append(payload)
+    return matches
+
+new_match = matching(new_events, "job.takeover", {
+    "job_id": new_job, "from_job": old_job, "task_id": int(task), "rounds_used": rounds})
+old_match = matching(old_events, "job.handed_off", {
+    "job_id": old_job, "to_job": new_job, "task_id": int(task), "rounds_used": rounds})
+if not new_match:
+    wrk_event_commit(new_events, "job.takeover", new_record)
+if not old_match:
+    wrk_event_commit(old_events, "job.handed_off", old_record)
+for lock in reversed(locks):
+    lock.close()
+PY
+}
+
 # hk_task_link_event — durable link outcome in the job's own events, next to
 # claim/reclaim. Best-effort: the claim payload already carries task_id; this
 # record answers "did the hk side land" from files alone.
@@ -9324,7 +9498,7 @@ refuse_known_terra_spelling() {
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
+  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TAKEOVER_REBOUND=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
   MOCK_MCP_PLAN="" MOCK_MCP_HELPER="" SPAWN_MOCK_MCP_RETAIN=0
@@ -9336,7 +9510,7 @@ spawn_cmd() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--lane-defer)
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--lane-defer)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m|--profile) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
@@ -9346,7 +9520,7 @@ spawn_cmd() {
           --report) REPORT_PATH="$2" ;;
           --operator-request) OPERATOR_REQUEST="$2" ;; --requested-by) REQUESTED_BY="$2" ;;
           --round-ext) ROUND_EXT_REF="$2" ;;
-          --purpose) PURPOSE="$2" ;; --task) TASK_ID="$2" ;; --parent-job) PARENT_JOB="$2" ;;
+          --purpose) PURPOSE="$2" ;; --task) TASK_ID="$2" ;; --parent-job) PARENT_JOB="$2" ;; --takeover-from) TAKEOVER_FROM="$2" ;;
           --lane-defer) LANE_DEFER="$2" ;;
         esac
         shift 2 ;;
@@ -9467,6 +9641,9 @@ spawn_cmd() {
   # #768: task binding is decided here, still before any side effect — a
   # missing/unresolvable task id is a usage error, never a partial spawn.
   task_validate
+  if [[ -n "$TAKEOVER_FROM" ]]; then
+    hk_task_takeover_precheck
+  fi
   round_ext_precheck
   # Round-extension ownership cannot use the task availability bypass.
   if [[ -n "$ROUND_EXT_REF" ]]; then
@@ -9512,7 +9689,11 @@ spawn_cmd() {
 
   # #768: read-only hk task probe — fail closed before the quota gate measures
   # anything, before any pane, before any hk write. Sets TASK_LINK_STATUS.
-  hk_task_precheck
+  if [[ -n "$TAKEOVER_FROM" ]]; then
+    hk_task_takeover_precheck
+  else
+    hk_task_precheck
+  fi
 
   # #768: the job's own meta carries the task binding (job.claim/job.reclaim
   # payload); the override marker is recorded only when the flag was passed —
@@ -9536,6 +9717,9 @@ spawn_cmd() {
   # The catalog's own refusal, held back so the quota gate could speak first.
   [[ "${CATALOG_REFUSED:-0}" -ne 1 ]] ||
     die "scopefuel policy launch refused profile '$MODEL' (catalog profile '$CATALOG_PROFILE'): ${CATALOG_REFUSE_REASON:-no reason reported}"
+  # A takeover route refusal must precede the arbiter claim as well as pane
+  # creation, so no failed rebind can leave partial local job records.
+  hk_task_takeover_rebind
   arbiter_admit
   quota_hub_policy_gate
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
@@ -9838,7 +10022,7 @@ exec(os.environ["WRK_EVENTS_PY"])
 root, lane, grace, include_builders = sys.argv[1:5]
 grace = int(grace)
 include_builders = include_builders == "1"
-TERMINAL = {"job.completed", "job.joined", "job.revoked"}
+TERMINAL = {"job.completed", "job.joined", "job.revoked", "job.handed_off"}
 # 종료 뒤에 이 중 하나가 오면 그 잡은 다시 살아난 것이다(완료 → 재클레임 → 작업 중
 # 잠깐 idle). 상태 검사(idle|done)는 긴 턴 중 오표시가 실측돼 있어 마지막 방어선이
 # 못 된다 — 판정은 인박스 순서로 한다. job.lost·quota_pool.* 는 되살림이 아니다
@@ -10220,7 +10404,7 @@ for row in rows:
         parent = row.get("parent")
         lanes[row["lane"]] = parent if isinstance(parent, str) else ""
 
-TERMINAL = {"job.completed", "job.joined", "job.revoked"}
+TERMINAL = {"job.completed", "job.joined", "job.revoked", "job.handed_off"}
 REVIVE = {"job.claim", "job.reclaim", "job.spawned", "job.reprompted"}
 try:
     jobs = sorted(os.listdir(root))
