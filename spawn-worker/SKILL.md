@@ -1153,3 +1153,7 @@ wrk reap --lane <내 세션 이름> --apply      # 실제 회수
   수용조건 10건 전부 통과했다 → §2-1·§5.
 - **07-31 매핑 드리프트**: 쿼타 가드가 프로필→풀 매핑을 스킬·도구 양쪽에 중복 보유해
   `oc-*`가 잘못된 풀을 조회(만차여도 초록불). 정본을 scopefuel 하나로 모아 해소 → §2-2.
+
+### Devin live model provenance (hk 1730)
+
+For reps and spawn-cost review, read the contributor job's events/job.model_observed history alongside quota_pool.record: each observation retains the raw pane label, parsed lead/sidekick, pool, family, free bucket, spawned profile, drift and timestamp. GPT Fusion parts bill codex with account devin-linked (the Devin-linked ChatGPT account), never the host codex account; account_tag is the first eight characters of scopefuel's declared pools.codex.fusion_billing_fp when configured. Unknown parts leave the observation unattributed. quota_pool.drift records the recorded source pool and observed destination pools; these are audit events, and the arbiter lease stays unchanged. tester-eligible reads every contributor observation through job_record_dir (or job_id/job under ARBITER_INBOX_ROOT, falling back to session as the job directory), unions historical families with spawned profiles, and returns UNVERIFIED for unattributed observations. Reps and cost reviewers must consume these job events to account for live model changes; this task does not change the lease or automatically rewrite reps totals. The sentinel also emits job.stalled_free_limit and one owner lane.event after a free reset plus STALL_MARGIN, or after invalid_argument plus that margin, without pane input.

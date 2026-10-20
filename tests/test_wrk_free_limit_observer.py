@@ -12,11 +12,14 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
+import argparse
 
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "bin"))
 import wrk_free_limit_observer as observer  # noqa: E402
+import wrk_pane_models as models  # noqa: E402
 
 
 def when(value: str) -> dt.datetime:
@@ -39,6 +42,8 @@ class FreeLimitObserverTests(unittest.TestCase):
             "XDG_CONFIG_HOME": str(self.root / "config"),
             "XDG_DATA_HOME": str(self.root / "data"),
             "XDG_STATE_HOME": str(self.root / "state"),
+            "XDG_RUNTIME_DIR": str(self.root / "runtime"),
+            "TMPDIR": str(self.root / "tmp"),
             "PATH": os.defpath,
             "LC_ALL": "C.UTF-8",
         }
@@ -129,6 +134,181 @@ class FreeLimitObserverTests(unittest.TestCase):
         )
         self.assertEqual(absolute["reset"], "2026-10-19T08:01:00Z")
         self.assertEqual(relative["reset"], "2026-10-19T08:01:00Z")
+
+    def pane_observe(self, text, at, rung="devin-swe2", job="drift-job"):
+        args = argparse.Namespace(pane_kind="devin", rung=rung, job=job,
+                                  state=str(self.root / job / "free-limit-observer.json"),
+                                  observed=at, owner_lane="owner")
+        with mock.patch.dict(os.environ, self.dirs, clear=True):
+            observer.observe_pane(args, text)
+        return observer.job_events(self.root / job)
+
+    def test_strict_shared_parser_labels_status_and_unknown_parts(self):
+        labels = ["Fusion · GPT-6.1 Sol ◆ SWE-2 Medium",
+                  "Fusion · GPT-6.1 Sol ◆ GPT-6 Luna High",
+                  "SWE-2 High", "DeepSeek V4.1 Flash High"]
+        for raw in labels:
+            parsed = models.parse_model_line(raw)
+            self.assertTrue(parsed["attributed"], raw)
+            self.assertEqual(models.latest_model_line(raw), raw)
+        sidekick = models.parse_model_line(labels[0])["parts"][1]
+        self.assertEqual((sidekick["pool"], sidekick["bucket"]), ("devin", "free"))
+        for status in ("Devin update available", "Opus is thinking about it", "Fusion mode enabled",
+                       "GPT-6.1 Sol please fix this", "> SWE-2 High", "Fusion · please use GPT-6.1 Sol ◆ SWE-2 Medium"):
+            self.assertEqual(models.latest_model_line(labels[0] + "\n" + status), labels[0])
+        self.assertEqual(models.latest_model_line(labels[0] + "\n" + labels[2]), labels[2])
+        for unknown in ("NewModel High", "SWE-2.9 Medium", "Claude Opus 5.5"):
+            parsed = models.parse_model_line("Fusion · GPT-6.1 Sol ◆ " + unknown)
+            self.assertFalse(parsed["attributed"])
+            self.assertEqual(parsed["pools"], [])
+            self.assertIsNone(parsed["parts"][-1]["pool"])
+        for lead in ("Claude Opus 5.5", "Opus 5.5", "Sonnet 5.5"):
+            parsed = models.parse_model_line("Fusion · " + lead + " ◆ SWE-2 Medium")
+            self.assertEqual(parsed["families"], ["anthropic", "cognition"])
+            self.assertEqual(parsed["pools"], ["devin"])
+
+    def test_system_python_without_tomllib_keeps_observer_and_account_tag(self):
+        config = Path(self.dirs["XDG_CONFIG_HOME"]) / "scopefuel/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('[pools.codex]\nfusion_billing_fp = "0123456789abcdef" # billing\n[pools.devin]\n')
+        # Reproduce the macOS PATH-selected interpreter without tomllib, both
+        # importing the actual helper and executing the CLI (not just the tag).
+        blocker = self.root / "no-tomllib"
+        blocker.mkdir()
+        (blocker / "sitecustomize.py").write_text("import sys\nsys.modules['tomllib'] = None\n")
+        proc = subprocess.run([sys.executable, str(ROOT / "bin/wrk_free_limit_observer.py"),
+            "--pane-kind", "devin", "--rung", "devin-swe2", "--job", "old-python",
+            "--state", str(self.root / "old-python/free-limit-observer.json"),
+            "--scopefuel", str(self.scopefuel), "--observed", "2026-10-20T07:00:00Z"],
+            input=provider_notice("Reached free model rate limit reset in 1 minute") +
+                  "Fusion · GPT-6.1 Sol ◆ GPT-6 Luna High\n",
+            text=True, capture_output=True, timeout=10,
+            env=self.call_env(PYTHONPATH=str(blocker)), check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("observer-ok-reset", proc.stdout)
+        observations = [observer.payload(doc) for doc in observer.job_events(self.root / "old-python")
+                        if doc["kind"] == "job.model_observed"]
+        self.assertEqual([part["account_tag"] for part in observations[0]["parts"]], ["01234567"] * 2)
+        with mock.patch.dict(sys.modules, {"tomllib": None}), mock.patch.dict(os.environ, self.dirs, clear=True):
+            config.write_text('[pools.other]\nfusion_billing_fp="0123456789abcdef"\n[pools.codex]\n')
+            self.assertIsNone(observer.billing_account_tag())
+            config.write_text('[pools.codex]\nfusion_billing_fp="0123456789abcdef"\nfusion_billing_fp="fedcba9876543210"\n')
+            self.assertIsNone(observer.billing_account_tag())
+
+    def test_model_change_records_parts_pool_drift_account_and_no_repeat(self):
+        jobdir = self.root / "drift-job"
+        observer.atomic_json(jobdir / "events/00001-quota_pool.record.json",
+                             dict(kind="quota_pool.record", payload=dict(pool="devin")))
+        config = Path(self.dirs["XDG_CONFIG_HOME"]) / "scopefuel/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('[pools.codex]\nfusion_billing_fp = "0123456789abcdef"\n')
+        at = "2026-10-20T07:00:00Z"
+        self.pane_observe("SWE-2 High", at)
+        self.pane_observe("SWE-2 High", "2026-10-20T07:00:30Z")
+        sol = "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium"
+        self.pane_observe(sol, "2026-10-20T07:01:00Z")
+        self.pane_observe(sol, "2026-10-20T07:01:30Z")
+        events = self.pane_observe("Fusion · GPT-6.1 Sol ◆ GPT-6 Luna High", "2026-10-20T07:02:00Z")
+        observed = [observer.payload(doc) for doc in events if doc["kind"] == "job.model_observed"]
+        self.assertEqual(len(observed), 3)
+        self.assertEqual([doc["drift"] for doc in observed], [False, True, True])
+        self.assertEqual(observed[-1]["pools"], ["codex"])
+        self.assertEqual(observed[-1]["families"], ["openai"])
+        self.assertEqual([part["account"] for part in observed[-1]["parts"]], ["devin-linked"] * 2)
+        self.assertEqual([part["account_tag"] for part in observed[-1]["parts"]], ["01234567"] * 2)
+        drifts = [observer.payload(doc) for doc in events if doc["kind"] == "quota_pool.drift"]
+        self.assertEqual([(doc["from_pool"], doc["to_pool"]) for doc in drifts],
+                         [("devin", ["codex", "devin"]), ("devin", ["codex"])])
+        self.assertEqual(json.loads((jobdir / "events/00001-quota_pool.record.json").read_text())["payload"], {"pool": "devin"})
+        for rung in ("devin-swe2", "builder-devin-max", "devin-ds41", "devin-fusion-sol61-xhigh"):
+            events = self.pane_observe(models.expected_label(rung), at, rung=rung, job=rung)
+            self.assertFalse(observer.payload(events[-1])["drift"])
+        events = self.pane_observe("Fusion · GPT-6.1 Sol ◆ Unknown High", "2026-10-20T07:03:00Z")
+        self.assertFalse(observer.payload(events[-1])["attributed"])
+
+    def test_model_return_a_to_b_to_a_records_each_change(self):
+        a, b = "SWE-2 High", "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium"
+        for raw, at in ((a, "07:00:00"), (b, "07:01:00"), (a, "07:02:00")):
+            events = self.pane_observe(raw, "2026-10-20T" + at + "Z")
+        self.assertEqual([observer.payload(doc)["raw_line"] for doc in events
+                          if doc["kind"] == "job.model_observed"], [a, b, a])
+
+    def test_deeply_nested_audit_event_does_not_disable_hold(self):
+        events = self.root / "deep-event/events"
+        events.mkdir(parents=True)
+        (events / "00009-bad.json").write_text("[" * 200000)
+        result = self.run_helper(provider_notice("Reached free model rate limit reset in 1 minute"),
+                                 "2026-10-20T07:00:00Z", job="deep-event")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("observer-ok-reset=2026-10-20T07:01:00Z", result.stdout)
+        self.assertIn("pane-observer-skipped-recursion-error", result.stdout)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(self.calls()[0][:2], ["observe", "devin-free-limit"])
+
+    def test_free_stall_reset_margin_once_and_progress_clears(self):
+        text = provider_notice("Reached free model rate limit reset in 1 minute") + "SWE-2 High\n"
+        start = "2026-10-20T07:00:00Z"
+        with mock.patch.object(observer, "emit_stall", return_value=True) as emit:
+            self.pane_observe(text, start)
+            events = self.pane_observe(text, "2026-10-20T07:02:59Z")
+            self.assertFalse(any(doc["kind"] == "job.stalled_free_limit" for doc in events))
+            events = self.pane_observe(text, "2026-10-20T07:03:00Z")
+            self.pane_observe(text, "2026-10-20T07:06:00Z")
+            stalls = [observer.payload(doc) for doc in events if doc["kind"] == "job.stalled_free_limit"]
+            self.assertEqual(len(stalls), 1)
+            self.assertEqual(stalls[0]["reset"], "2026-10-20T07:01:00Z")
+            self.assertEqual(stalls[0]["notice_time"], start)
+            self.assertEqual(stalls[0]["error_class"], "free_model_rate_limit")
+            self.assertEqual(emit.call_count, 1)
+            for job, progress in (("content-progress", True), ("event-progress", False)):
+                self.pane_observe(text, start, job=job)
+                if not progress:
+                    observer.atomic_json(self.root / job / "events/00002-job.progress.json", dict(kind="job.progress"))
+                changed = text + "work resumed\n" if progress else text
+                self.pane_observe(changed, "2026-10-20T07:01:30Z", job=job)
+                events = self.pane_observe(changed, "2026-10-20T07:10:00Z", job=job)
+                self.assertFalse(any(doc["kind"] == "job.stalled_free_limit" for doc in events))
+
+    def test_protocol_stall_last_error_only_and_lane_command(self):
+        text = provider_notice("invalid_argument: malformed tool response")
+        self.assertEqual(observer.active_protocol_error(text), "invalid_argument")
+        self.assertIsNone(observer.active_protocol_error(text + "work resumed\n"))
+        self.pane_observe(text, "2026-10-20T07:00:00Z")
+        with mock.patch.object(observer.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, stderr=b"")) as run:
+            events = self.pane_observe(text, "2026-10-20T07:02:00Z")
+            self.pane_observe(text, "2026-10-20T07:03:00Z")
+            self.assertEqual(run.call_count, 1)
+            argv = run.call_args.args[0]
+            self.assertEqual(argv[:6], ["panewire", "emit", "--kind", "lane.event", "--lane", "owner"])
+            self.assertNotIn("send-text", argv)
+            self.assertNotIn("prompt", argv)
+        stalls = [observer.payload(doc) for doc in events if doc["kind"] == "job.stalled_free_limit"]
+        self.assertEqual(stalls[0]["error_class"], "invalid_argument")
+
+    def test_invariant_mutants_fail_by_assertion(self):
+        label = "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium"
+        def strict_footer():
+            self.assertEqual(models.latest_model_line(label + "\nDevin update available"), label)
+        strict_footer()
+        original = models._components
+        with mock.patch.object(models, "_components", side_effect=lambda raw: [raw] if raw == "Devin update available" else original(raw)):
+            with self.assertRaises(AssertionError):
+                strict_footer()
+        def unknown_stays_unattributed():
+            self.assertFalse(models.parse_model_line("Fusion · GPT-6.1 Sol ◆ SWE-2.9 Medium")["attributed"])
+        unknown_stays_unattributed()
+        with mock.patch.object(models, "SIDECARS", ((r"SWE-", "devin", "cognition", "free", None),) + models.SIDECARS):
+            with self.assertRaises(AssertionError):
+                unknown_stays_unattributed()
+        def record_change(job):
+            self.pane_observe("SWE-2 High", "2026-10-20T07:00:00Z", job=job)
+            events = self.pane_observe(label, "2026-10-20T07:00:30Z", job=job)
+            changes = [observer.payload(doc)["raw_line"] for doc in events if doc["kind"] == "job.model_observed"]
+            self.assertEqual(changes, ["SWE-2 High", label])
+        record_change("mutant-green")
+        with mock.patch.object(observer, "commit_event"):
+            with self.assertRaises(AssertionError):
+                record_change("mutant-red")
 
     def test_absolute_rolls_to_next_day_and_relative_is_capped_at_24h(self) -> None:
         observed = when("2026-10-19T23:30:00Z")
@@ -466,6 +646,8 @@ class FreeLimitObserverTests(unittest.TestCase):
         rung: str,
         *,
         wrk_path: Path | None = None,
+        pane_text: str | None = None,
+        owner: str = "worker",
     ) -> tuple[subprocess.CompletedProcess[str], Path]:
         pane_log = self.root / f"{job}-herdr.jsonl"
         herdr = self.root / f"{job}-herdr-stub"
@@ -492,13 +674,24 @@ class FreeLimitObserverTests(unittest.TestCase):
             WRK_SENTINEL_LOST_GRACE="0",
             WRK_SENTINEL_INTERVAL_S="0",
             STUB_HERDR_LOG=str(pane_log),
-            STUB_PANE_TEXT=provider_notice("Reached free model rate limit; reset in 50 minutes"),
+            STUB_PANE_TEXT=pane_text or provider_notice("Reached free model rate limit; reset in 50 minutes"),
         )
+        # Capture the real sentinel-to-helper argv without changing the helper.
+        shimdir = self.root / (job + "-bin")
+        shimdir.mkdir()
+        shim = shimdir / "python3"
+        shim.write_text("#!" + sys.executable + "\nimport json, os, sys\n"
+                        "if any(a.endswith('wrk_free_limit_observer.py') for a in sys.argv[1:]):\n"
+                        "    with open(os.environ['HELPER_ARGV_LOG'], 'a') as f: f.write(json.dumps(sys.argv[1:]) + '\\n')\n"
+                        "os.execv(sys.executable, [sys.executable] + sys.argv[1:])\n")
+        shim.chmod(0o700)
+        env.update(PATH=str(shimdir) + os.pathsep + os.defpath,
+                   HELPER_ARGV_LOG=str(self.root / (job + "-helper.jsonl")))
         args = [
             str(wrk_path or ROOT / "bin" / "wrk"),
             "sentinel",
             job,
-            "worker",
+            owner,
             "test",
             "pane-1",
             "",
@@ -543,6 +736,22 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertEqual(paid_args[paid_args.index("--rung") + 1], "devin-ds41")
         paid_entries = [json.loads(line) for line in paid_log.read_text(encoding="utf-8").splitlines()]
         self.assertTrue(any(entry[:2] == ["agent", "read"] for entry in paid_entries))
+
+    def test_sentinel_real_callsite_records_latest_model_parts_without_pane_input(self):
+        label = "Fusion · GPT-6.1 Sol ◆ GPT-6 Luna High"
+        text = "SWE-2 High\n" + label + "\nDevin update available"
+        result, log = self.run_sentinel("model-callsite", "devin", "devin-swe2", pane_text=text, owner="owner-lane-x")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = json.loads((self.root / "model-callsite-helper.jsonl").read_text().splitlines()[0])
+        self.assertIn("--owner-lane", argv)
+        self.assertEqual(argv[argv.index("--owner-lane") + 1], "owner-lane-x")
+        observed = [observer.payload(doc) for doc in observer.job_events(self.root / "jobs/model-callsite")
+                    if doc["kind"] == "job.model_observed"]
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(observed[0]["raw_line"], label)
+        self.assertEqual([part["label"] for part in observed[0]["parts"]], ["GPT-6.1 Sol", "GPT-6 Luna High"])
+        entries = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(all(entry[:2] in (["agent", "get"], ["agent", "read"]) for entry in entries))
 
     def test_installed_wrk_symlink_resolves_observer_helper(self) -> None:
         link = self.home / ".local" / "bin" / "wrk"

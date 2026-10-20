@@ -6308,7 +6308,7 @@ PY
       if recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
         observer_result="$(printf '%s\n' "$recent" | python3 "$observer_script" \
           --pane-kind "$pane_kind" --job "$job" --rung "$observed_rung" \
-          --state "$jobdir/free-limit-observer.json" --scopefuel "$scopefuel_bin" 2>/dev/null || true)"
+          --owner-lane "$owner" --state "$jobdir/free-limit-observer.json" --scopefuel "$scopefuel_bin" 2>/dev/null || true)"
         if [[ -n "$observer_result" ]]; then
           sentinel_log "$logfile" "$token" "$transient" "$observer_result"
         fi
