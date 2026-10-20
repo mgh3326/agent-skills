@@ -219,6 +219,39 @@ expect_rc 4 event --job ev --kind explicit --seq 50
   || fail "duplicate seq produced a second artifact"
 pass "⑨ duplicate (job_id, seq) rejected (exit 4); no duplicate artifact written"
 
+# ⑨ hk 1750: wrk numbers the same directory from its own highest prefix. An
+# arbiter write after wrk's files must take a number above the directory
+# highest, not just above its DB seq, or one record overwrites the other.
+expect_rc 0 claim --job order-mix --lane live --t T1
+mix_events="$ARBITER_INBOX_ROOT/order-mix/events"
+python3 - "$mix_events" <<'PY'
+import json, os, sys
+events = sys.argv[1]
+for seq, kind in ((7, "job.completed"), (9, "job.escalate")):
+    path = os.path.join(events, "%05d-%s.json" % (seq, kind))
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"kind": kind, "job_id": "order-mix", "payload": {}}, handle)
+PY
+run event --job order-mix --kind job.spawned --payload-json '{"pane_id":"w1:p1"}' --json
+[[ "$RC" -eq 0 ]] || fail "#1750: event after wrk files failed: $ERR"
+[[ "$(jget seq <<<"$OUT")" == 10 ]] ||
+  fail "#1750: arbiter seq must be max(DB seq, directory highest) + 1 (got $(jget seq <<<"$OUT"))"
+[[ -f "$mix_events/00010-job.spawned.json" ]] ||
+  fail "#1750: arbiter artifact did not take 00010"
+[[ -f "$mix_events/00009-job.escalate.json" ]] ||
+  fail "#1750: arbiter overwrote a wrk-numbered file"
+pass "⑨ #1750 arbiter numbering takes max(DB seq, directory highest) + 1"
+
+# An explicit --seq that names an existing event file is refused and the wrk
+# record's bytes survive (no overwrite, DB row rolled back).
+expect_rc 4 event --job order-mix --kind job.escalate --seq 9
+[[ "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["kind"])' \
+  "$mix_events/00009-job.escalate.json")" == "job.escalate" ]] ||
+  fail "#1750: an explicit seq overwrote a wrk-numbered file"
+[[ "$(find "$mix_events" -name '00009-*' | wc -l | tr -d ' ')" -eq 1 ]] ||
+  fail "#1750: an explicit seq produced a second artifact at 00009"
+pass "⑨ #1750 explicit seq collision is refused, never overwrites"
+
 expect_rc 3 event --job nope --kind orphan
 pass "⑨ events for an unclaimed job are refused"
 

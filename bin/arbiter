@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import fcntl
 import json
 import os
 import re
@@ -334,69 +335,125 @@ def next_token(con: sqlite3.Connection) -> str:
 # --------------------------------------------------------------------- events
 
 
+def _events_directory(job_id: str) -> Path:
+    return inbox_root() / job_id / "events"
+
+
+def _directory_highest_seq(directory: Path) -> int:
+    """events 디렉터리의 최고 파일 prefix (없거나 읽을 수 없으면 0).
+
+    wrk 는 이 디렉터리에 자기 번호(최고 prefix + 1)로 파일을 쓴다. DB seq 만
+    보면 두 writer 가 같은 번호를 골라 한쪽 기록이 사라진다(#1750).
+    """
+    highest = 0
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return 0
+    for name in names:
+        try:
+            highest = max(highest, int(name.split("-", 1)[0]))
+        except (ValueError, IndexError):
+            pass
+    return highest
+
+
 def record_event(
     con: sqlite3.Connection, job_id: str, kind: str, payload: dict, *, seq: int | None = None
 ) -> int:
     """events 행 + 인박스 artifact 를 한 트랜잭션 안에서 남긴다.
 
-    artifact 는 임시 파일에 쓴 뒤 atomic rename 으로 제출한다(부분 쓰기 소비 금지).
-    중복 소비는 DB 의 UNIQUE(job_id, seq) 가 막는다 — rename 은 그 뒤에만 일어난다.
+    artifact 는 임시 파일에 쓴 뒤 hard-link 로 제출한다(부분 쓰기 소비 금지,
+    기존 파일 덮어쓰기 금지). 자동 번호는 DB 의 MAX(seq) 와 디렉터리 최고
+    prefix 중 큰 값 + 1 이다 — wrk 도 같은 디렉터리에 번호를 매기므로 DB 만
+    보면 두 writer 가 같은 번호를 쓴다. 중복 소비는 DB 의 UNIQUE(job_id, seq)
+    가 막는다: INSERT 가 실패하면 artifact 는 만들어지지 않고, 같은 이름이
+    이미 있으면 덮어쓰지 않고 실패한다. 번호 계산과 제출은 wrk 와 같은
+    events lock(jobdir/.wrk-events.lock) 아래에서 일어난다.
     """
-    if seq is None:
-        row = con.execute(
-            "SELECT COALESCE(MAX(seq), 0) + 1 FROM events WHERE job_id = ?", (job_id,)
-        ).fetchone()
-        seq = int(row[0])
-    created_at = iso(now_dt())
-    body = json.dumps(
-        {"job_id": job_id, "seq": seq, "kind": kind, "payload": payload, "created_at": created_at},
-        ensure_ascii=False,
-        sort_keys=True,
-    )
+    directory = _events_directory(job_id)
     try:
-        con.execute(
-            "INSERT INTO events (job_id, seq, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
-            (job_id, seq, kind, body, created_at),
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise ArbiterError(EXIT_STORAGE, f"event 디렉터리를 만들 수 없다: {exc}") from exc
+    lock_path = directory.parent / ".wrk-events.lock"
+    try:
+        lock = lock_path.open("w", encoding="utf-8")
+    except OSError as exc:
+        raise ArbiterError(EXIT_STORAGE, f"event lock 을 열 수 없다: {exc}") from exc
+    with lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if seq is None:
+            row = con.execute(
+                "SELECT COALESCE(MAX(seq), 0) FROM events WHERE job_id = ?", (job_id,)
+            ).fetchone()
+            seq = max(int(row[0]), _directory_highest_seq(directory)) + 1
+        created_at = iso(now_dt())
+        body = json.dumps(
+            {"job_id": job_id, "seq": seq, "kind": kind, "payload": payload, "created_at": created_at},
+            ensure_ascii=False,
+            sort_keys=True,
         )
-    except sqlite3.IntegrityError as exc:
-        raise ArbiterError(
-            EXIT_DUPLICATE,
-            f"event 중복: job_id={job_id} seq={seq} 는 이미 존재한다",
-            job_id=job_id,
-            seq=seq,
-        ) from exc
-    _write_artifact(job_id, seq, kind, body)
+        try:
+            con.execute(
+                "INSERT INTO events (job_id, seq, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (job_id, seq, kind, body, created_at),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise ArbiterError(
+                EXIT_DUPLICATE,
+                f"event 중복: job_id={job_id} seq={seq} 는 이미 존재한다",
+                job_id=job_id,
+                seq=seq,
+            ) from exc
+        _write_artifact(directory, seq, kind, body)
     return seq
 
 
-def _write_artifact(job_id: str, seq: int, kind: str, body: str) -> Path:
-    directory = inbox_root() / job_id / "events"
+def _write_artifact(directory: Path, seq: int, kind: str, body: str) -> Path:
+    safe_kind = re.sub(r"[^A-Za-z0-9._-]", "_", kind)
+    final = directory / f"{seq:05d}-{safe_kind}.json"
+    handle = tempfile.NamedTemporaryFile(
+        "w", encoding="utf-8", dir=directory, prefix=".tmp-", suffix=".json", delete=False
+    )
     try:
-        directory.mkdir(parents=True, exist_ok=True)
-        safe_kind = re.sub(r"[^A-Za-z0-9._-]", "_", kind)
-        final = directory / f"{seq:05d}-{safe_kind}.json"
-        handle = tempfile.NamedTemporaryFile(
-            "w", encoding="utf-8", dir=directory, prefix=".tmp-", suffix=".json", delete=False
-        )
+        with handle:
+            handle.write(body + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
         try:
-            with handle:
-                handle.write(body + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(handle.name, final)
-        except BaseException:
+            os.link(handle.name, final)
+        except FileExistsError as exc:
+            raise ArbiterError(
+                EXIT_DUPLICATE, f"event artifact 이름이 이미 있다: {final}"
+            ) from exc
+        except OSError:
+            # Hard links unavailable: create the final name exclusively. Never
+            # os.replace — another writer's record must not be overwritten.
             try:
-                os.unlink(handle.name)
-            except OSError:
-                pass
-            raise
+                fd = os.open(final, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            except FileExistsError as exc:
+                raise ArbiterError(
+                    EXIT_DUPLICATE, f"event artifact 이름이 이미 있다: {final}"
+                ) from exc
+            with os.fdopen(fd, "w", encoding="utf-8") as out:
+                out.write(body + "\n")
+                out.flush()
+                os.fsync(out.fileno())
         fd = os.open(directory, os.O_RDONLY)
         try:
             os.fsync(fd)
         finally:
             os.close(fd)
+    except ArbiterError:
+        raise
     except OSError as exc:
         raise ArbiterError(EXIT_STORAGE, f"event artifact 를 제출할 수 없다: {exc}") from exc
+    finally:
+        try:
+            os.unlink(handle.name)
+        except OSError:
+            pass
     return final
 
 
@@ -1541,7 +1598,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="herdr agent list JSON 경로(생략 시 설치된 HERDR_BIN/`herdr agent list` 실행)",
     )
 
-    event = sub.add_parser("event", parents=[common], help="job event 제출(atomic rename)")
+    event = sub.add_parser("event", parents=[common], help="job event 제출(exclusive link)")
     event.add_argument("--job", required=True, help="job id")
     event.add_argument("--kind", required=True, help="event 종류")
     event_payload = event.add_mutually_exclusive_group()
