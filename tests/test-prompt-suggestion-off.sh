@@ -47,8 +47,13 @@ export TW_TMP="$TMP"
 # run can verify — pidfile, registry, descendant walk or a test-owned
 # process group — and waits until none remain, then rm.
 cleanup() {
-  tmp_writers_stop
-  rm -rf "$TMP"
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
+  (( tw_rc == 0 )) && rm -rf "$TMP"
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
@@ -336,3 +341,8 @@ echo "PASS mutants assertion-red=2/2 (setting removed, director opt-out removed)
 # Task 1690: passive Devin free-window observation parser and sentinel checks.
 python3 "$ROOT/tests/test_wrk_free_limit_observer.py"
 python3 "$ROOT/tests/test_quoted_notice.py"
+
+# hk1699 r2: teardown regression cases for tests/lib/tmp-writers.sh —
+# renamed-copy sentinel argv, per-entry registry identities, refusal
+# visibility, dead-entry caching, and the no-rm-while-tracked contract.
+bash "$ROOT/tests/test-tmp-writers.sh"

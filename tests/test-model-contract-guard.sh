@@ -38,8 +38,13 @@ export TW_TMP="$TMP"
 # tracked writer by exact verified pid before the rm — never a process-table
 # pattern match or another process's environment.
 cleanup() {
-  tmp_writers_stop
-  rm -rf "$TMP"
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
+  (( tw_rc == 0 )) && rm -rf "$TMP"
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 PROMPT="$TMP/prompt.md"
@@ -258,7 +263,8 @@ brief_header() {
   local mode="$1" scopefuel_bin="$2" model="${3:-codex-sol}"
   # a prior spawn's detached writers can still be writing under $TMP/inbox —
   # reap them by exact pid first or the rm races a recreated dentry.
-  tmp_writers_stop
+  tmp_writers_stop ||
+    fail "tracked writers survived the mid-case teardown:${TW_LEFTOVER_PIDS:-}"
   rm -rf "$TMP/inbox"
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$scopefuel_bin" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_LAUNCH_MODE="$mode" \
@@ -308,7 +314,8 @@ echo "PASS a server without the catalog route does not mark the brief stale"
 # `wrk-note:` body line: visible to the spawned agent and still recorded in
 # the job-dir brief. A mutant that puts the marker back on expect: turns this
 # block RED (strict fixture refuses → zero deliveries).
-tmp_writers_stop
+tmp_writers_stop ||
+  fail "tracked writers survived the mid-case teardown:${TW_LEFTOVER_PIDS:-}"
 rm -rf "$TMP/inbox" "$TMP/pw-strict.log"
 : >"$TMP/herdr.log"
 env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
@@ -345,7 +352,8 @@ fi
 exec "$SCOPEFUEL_FIXTURE" "$@"
 REFUSE
 chmod +x "$refusal"
-tmp_writers_stop
+tmp_writers_stop ||
+  fail "tracked writers survived the mid-case teardown:${TW_LEFTOVER_PIDS:-}"
 rm -rf "$TMP/inbox"
 if env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$refusal" SCOPEFUEL_FIXTURE="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \

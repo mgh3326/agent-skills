@@ -28,9 +28,14 @@ cleanup() {
   if [[ "${lock_holder_pid:-}" =~ ^[0-9]+$ ]]; then
     tw_kill_tree "$lock_holder_pid" 2>/dev/null || true
   fi
-  tmp_writers_stop
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
   chmod 700 "$TMP/codex-readonly" 2>/dev/null || true
-  rm -rf "$TMP"
+  (( tw_rc == 0 )) && rm -rf "$TMP"
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 

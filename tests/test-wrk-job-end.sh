@@ -30,7 +30,7 @@ export TW_TMP="$TMP"
 # owned-pids name is part of tests/lib/tmp-writers.sh's registry
 # convention, so teardown picks it up without being told.
 OWNED_PID_LOG="$TMP/owned-pids"; : >"$OWNED_PID_LOG"
-own() { printf '%s\n' "$1" >>"$OWNED_PID_LOG"; }
+own() { [[ "$1" =~ ^[0-9]+$ ]] || return 0; tw_register_pid "$OWNED_PID_LOG" "$1"; }
 
 kill_owned_tree() {
   # Same discipline as production stop_completion_sentinel: freeze, reap
@@ -46,8 +46,13 @@ cleanup() {
   # descendant walks and test-owned process groups — and waits until none
   # remain before the rm. It never reads another process's environment and
   # never kills by pattern.
-  tmp_writers_stop
-  rm -rf "$TMP"
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
+  (( tw_rc == 0 )) && rm -rf "$TMP"
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+    exit 1
+  fi
 }
 trap cleanup EXIT
 

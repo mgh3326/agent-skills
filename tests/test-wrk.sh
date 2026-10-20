@@ -14,7 +14,7 @@ export TW_TMP="$TMP"
 # teardown's *.pids registry pass signals exactly that set (direct `wrk
 # sentinel … &` runs carry no pidfile of their own).
 OWNED_PIDS="$TMP/owned.pids"; : >"$OWNED_PIDS"
-own() { printf '%s\n' "$1" >>"$OWNED_PIDS"; }
+own() { [[ "$1" =~ ^[0-9]+$ ]] || return 0; tw_register_pid "$OWNED_PIDS" "$1"; }
 # spawn 이 띄운 센티널은 nohup 으로 분리되어 있다 — 스위트가 끝나면 그 자식
 # (interval 동안 살아남는 sleep)과 함께 거둔다. 센티널만 죽이면 sleep 이 orphan
 # 으로 남아 잡 디렉토리의 flock fd 를 interval 내내 잡고 있는다(#637, #682).
@@ -22,11 +22,14 @@ own() { printf '%s\n' "$1" >>"$OWNED_PIDS"; }
 # 만으로 각 writer 를 정확한 pid 로 거둔다 — 다른 프로세스의 환경을 읽거나
 # 패턴 매치로 죽이지 않는다.
 cleanup() {
-  tmp_writers_stop
-  rm -rf "$TMP"
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
+  # A refused or unkillable tracked writer keeps TMP and fails the suite —
+  # never rm -rf while one lives.
+  (( tw_rc == 0 )) && rm -rf "$TMP"
   # 회귀 게이트: teardown 이 추적한 writer 를 놓치면 조용히 새는 게 아니라
   # 스위트가 실패해야 한다.
-  if [[ -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
     echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
     exit 1
   fi
@@ -7597,12 +7600,12 @@ WRK_TEST_TRUST_DELAY_S=0.5 \
   devin_spawn_at "$TMP/t912-xdg-race" "$TMP/t912-race-a" devin912fa "$t912_ta" \
   >"$TMP/t912-race-a.out" 2>&1 &
 t912_pa=$!
-own "$t912_pa=$!"
+own "$t912_pa"
 WRK_TEST_TRUST_DELAY_S=0.5 \
   devin_spawn_at "$TMP/t912-xdg-race" "$TMP/t912-race-b" devin912fb "$t912_tb" \
   >"$TMP/t912-race-b.out" 2>&1 &
 t912_pb=$!
-own "$t912_pb=$!"
+own "$t912_pb"
 set +e
 wait "$t912_pa"; t912_ra=$?
 wait "$t912_pb"; t912_rb=$?
@@ -7744,12 +7747,12 @@ WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
   devin_spawn_at "$TMP/t912-xdg-m7" "$TMP/t912-m7-a" devin912ma "$t912_ma" \
   >/dev/null 2>&1 &
 t912_pa=$!
-own "$t912_pa=$!"
+own "$t912_pa"
 WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
   devin_spawn_at "$TMP/t912-xdg-m7" "$TMP/t912-m7-b" devin912mb "$t912_mb" \
   >/dev/null 2>&1 &
 t912_pb=$!
-own "$t912_pb=$!"
+own "$t912_pb"
 wait "$t912_pa" "$t912_pb" || true
 t912_m7_count="$(devin_trust_paths "$TMP/t912-xdg-m7" | wc -l | tr -d ' ')"
 [[ "$t912_m7_count" -lt 3 ]] ||
@@ -7916,12 +7919,12 @@ WRK_TEST_TRUST_DELAY_S=0.5 \
   claude_spawn_at "$t951_home" "$TMP/t951-race-a" t951ra "$t951_ta" \
   >"$TMP/t951-race-a.out" 2>&1 &
 t951_pa=$!
-own "$t951_pa=$!"
+own "$t951_pa"
 WRK_TEST_TRUST_DELAY_S=0.5 \
   claude_spawn_at "$t951_home" "$TMP/t951-race-b" t951rb "$t951_tb" \
   >"$TMP/t951-race-b.out" 2>&1 &
 t951_pb=$!
-own "$t951_pb=$!"
+own "$t951_pb"
 set +e
 wait "$t951_pa"; t951_ra=$?
 wait "$t951_pb"; t951_rb=$?
@@ -7988,7 +7991,7 @@ open(sys.argv[2], "w").close()
 time.sleep(15)
 PY
 t951_holder=$!
-own "$t951_holder=$!"
+own "$t951_holder"
 for _ in $(seq 100); do [[ -e "$TMP/t951-held.ready" ]] && break; sleep 0.05; done
 [[ -e "$TMP/t951-held.ready" ]] || fail "lock holder never acquired"
 set +e
@@ -8063,12 +8066,12 @@ WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
   claude_spawn_at "$t951_home" "$TMP/t951-m7-a" t951ma "$t951_ma" \
   >/dev/null 2>&1 &
 t951_pa=$!
-own "$t951_pa=$!"
+own "$t951_pa"
 WRK_TEST_TRUST_DELAY_S=0.6 WRK_UNDER_TEST="$TMP/mut-wrk-nolock" \
   claude_spawn_at "$t951_home" "$TMP/t951-m7-b" t951mb "$t951_mb" \
   >/dev/null 2>&1 &
 t951_pb=$!
-own "$t951_pb=$!"
+own "$t951_pb"
 wait "$t951_pa" "$t951_pb" || true
 t951_m7_entries="$(python3 - "$t951_home/.claude.json" <<'PY'
 import json, sys
@@ -11370,7 +11373,8 @@ schema_failed_out="$(spawn_base grok --job arb-broken --t T1 2>&1)"
 grep -q 'arbiter quota-pool claim failed' <<<"$schema_failed_out"
 grep -q 'continuing spawn' <<<"$schema_failed_out"
 [[ -e "$TMP/herdr.log" ]]
-tmp_writers_stop
+tmp_writers_stop ||
+  fail "tracked writers survived the mid-case teardown:${TW_LEFTOVER_PIDS:-}"
 rm -rf "$TMP/xdg/arbiter"
 unset TEST_ARBITER_BIN
 
@@ -12216,7 +12220,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$RND_JOBS" \
   WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel "$RND4_JOB" lane-a wrk-a w1:p1 "$rnd4_report" >/dev/null 2>&1 &
 rnd4_sentinel=$!
-own "$rnd4_sentinel=$!"
+own "$rnd4_sentinel"
 # done lands inside the sentinel's settle window, so both processes reach
 # completion_event on the same changed report.
 sleep 2
@@ -12350,14 +12354,14 @@ open(sys.argv[2], "w").write("held")
 time.sleep(5)
 PY
 rnd7_holder=$!
-own "$rnd7_holder=$!"
+own "$rnd7_holder"
 wait_until 10 test -f "$TMP/rnd7-lock-held" ||
   fail "rnd-toctou: the lock helper must take the events lock"
 printf 'toctou round two\n' >"$rnd7_report"
 env ARBITER_INBOX_ROOT="$RND_JOBS" HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' "$RND7_JOB" --report "$rnd7_report" >"$TMP/rnd7.out" 2>"$RND7_ERR" &
 rnd7_done=$!
-own "$rnd7_done=$!"
+own "$rnd7_done"
 sleep 1
 printf 'toctou round three\n' >"$rnd7_report"
 wait "$rnd7_holder"
@@ -12417,7 +12421,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
-own "$sentinel_idle_pid=$!"
+own "$sentinel_idle_pid"
 sleep 2
 event_count_is "$SENTINEL_INBOX/sentinel-idle/events" job.completed 0 ||
   fail "a job with no report is not complete, whatever the pane status says (got $(event_count "$SENTINEL_INBOX/sentinel-idle/events" job.completed))"
@@ -12444,7 +12448,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-done WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel sentinel-done lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
 sentinel_done_pid=$!
-own "$sentinel_done_pid=$!"
+own "$sentinel_done_pid"
 wait_until 30 event_count_is "$SENTINEL_INBOX/sentinel-done/events" job.completed 1 ||
   fail "a done pane plus a settled report is exactly one job.completed (got $(event_count "$SENTINEL_INBOX/sentinel-done/events" job.completed))"
 tw_kill_tree "$sentinel_done_pid" 2>/dev/null || true
@@ -12466,7 +12470,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$TRANSIENT_INBOX" \
   WRK_SENTINEL_TRANSIENT_MAX=10 WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel sentinel-transient lane-a worker w1:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
 transient_pid=$!
-own "$transient_pid=$!"
+own "$transient_pid"
 TRANSIENT_EVENTS="$TRANSIENT_INBOX/sentinel-transient/events"
 wait_until 30 event_count_is "$TRANSIENT_EVENTS" job.completed 1 ||
   fail "transient herdr failures below WRK_SENTINEL_TRANSIENT_MAX must still reach job.completed (got $(event_count "$TRANSIENT_EVENTS" job.completed))"
@@ -12504,7 +12508,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$GRACE_INBOX" \
   WRK_SENTINEL_TRANSIENT_MAX=3 WRK_SENTINEL_LOST_GRACE=120 \
   "$WRK" sentinel sentinel-grace lane-a worker w1:p1 "$GRACE_REPORT" >/dev/null 2>&1 &
 grace_pid=$!
-own "$grace_pid=$!"
+own "$grace_pid"
 GRACE_EVENTS="$GRACE_INBOX/sentinel-grace/events"
 wait_until 30 event_count_is "$GRACE_EVENTS" job.lost 1 ||
   fail "more than WRK_SENTINEL_TRANSIENT_MAX consecutive unreachable observations must end in job.lost"
@@ -12571,7 +12575,7 @@ wait_until 30 grep -q 'HERDR_SESSION=host-a' "$ENV_LOG" ||
   fail "the sentinel must query herdr with the session wrk pinned into it (HERDR_SESSION=host-a), saw: $(tr '\n' '|' <"$ENV_LOG")"
 grep -q 'HERDR_SOCKET_PATH=/tmp/host-a.sock' "$ENV_LOG" ||
   fail "the sentinel must query herdr through the socket wrk pinned into it"
-tw_kill_tree "$(cat "$ENV_PIDFILE")" 2>/dev/null || true
+tw_kill_pidfile "$ENV_PIDFILE" 2>/dev/null || true
 python3 - "$ENV_INBOX/sentinel-env/events" <<'PY'
 import glob, json, sys
 spawned = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.spawned.json"))]
@@ -12598,7 +12602,7 @@ for keep_case in kept plain; do
     "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture \
     --t T1 --job "spawn-keep-$keep_case" --owner lane-a ${keep_args[@]+"${keep_args[@]}"} >/dev/null ||
     fail "#603: spawn ($keep_case) must succeed"
-  tw_kill_tree "$(head -n 1 "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null)" 2>/dev/null || true
+  tw_kill_pidfile "$keep_inbox/spawn-keep-$keep_case/completion-sentinel.pid" 2>/dev/null || true
 done
 python3 - "$TMP/spawn-keep-kept/spawn-keep-kept/events" "$TMP/spawn-keep-plain/spawn-keep-plain/events" <<'PY'
 import glob, json, sys
@@ -12673,7 +12677,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=30 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel idem-race lane-a wrk-a w1:p1 "$IDEM_RACE_REPORT" >/dev/null 2>&1 &
 idem_race_pid=$!
-own "$idem_race_pid=$!"
+own "$idem_race_pid"
 # #770: the sentinel sees the work-terminal record on its first watch and
 # exits — it never mints a second completion for an already-done job.
 wait_until 30 sentinel_log_has "$IDEM_INBOX/idem-race/completion-sentinel.log" 'action=watch-exit' ||
@@ -12720,7 +12724,7 @@ env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_PARTIAL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=60 WRK_COMPLETION_INTERVAL_S=3 \
   "$WRK" sentinel idem-partial lane-a wrk-a w1:p1 "$IDEM_PARTIAL_REPORT" >/dev/null 2>&1 &
 idem_partial_pid=$!
-own "$idem_partial_pid=$!"
+own "$idem_partial_pid"
 wait_until 30 sentinel_log_has "$IDEM_PARTIAL_INBOX/idem-partial/completion-sentinel.log" 'action=pending' ||
   fail "the first sighting of a report must be a pending observation, not a completion"
 event_count_is "$IDEM_PARTIAL_INBOX/idem-partial/events" job.completed 0 ||
@@ -13511,7 +13515,7 @@ echo "PASS heavy-basic-contract"
 # holder + waiter: the waiter's command runs only after the holder releases.
 "$WRK" heavy -- bash "$TMP/holder2.sh" &
 holder_job=$!
-own "$holder_job=$!"
+own "$holder_job"
 wait_until 10 test -f "$TMP/heavy-held-start" || fail "holder never took the lock"
 "$WRK" heavy -- test -f "$TMP/heavy-holder-done" ||
   fail "waiter ran before the holder released the lock"
@@ -13522,14 +13526,14 @@ echo "PASS heavy-serializes-holder-and-waiter"
 # own command text contains a pid= token (must not be mistaken for dead).
 "$WRK" heavy -- bash "$TMP/holder6.sh" &
 holder_job=$!
-own "$holder_job=$!"
+own "$holder_job"
 wait_until 10 test -f "$TMP/heavy-stat-held" || fail "status holder never started"
 out="$("$WRK" heavy status)"
 grep -q 'holder pid=' <<<"$out" || fail "status must show the holder: $out"
 grep -q 'cmd=' <<<"$out" || fail "status must show the holder command: $out"
 "$WRK" heavy -- env pid=999999 true &
 waiter_job=$!
-own "$waiter_job=$!"
+own "$waiter_job"
 wait_until 10 heavy_status_has_waiter || fail "status never showed the waiter"
 wait "$waiter_job" || fail "queued waiter never ran"
 wait "$holder_job" || fail "holder run failed"
@@ -13566,7 +13570,7 @@ echo "PASS heavy-signal-exit-mapped"
 # running its command.
 "$WRK" heavy -- bash "$TMP/holder8.sh" &
 holder_job=$!
-own "$holder_job=$!"
+own "$holder_job"
 wait_until 10 test -f "$TMP/heavy-cap-held" || fail "cap holder never started"
 rc=0
 out="$(WRK_HEAVY_WAIT_CAP=3 "$WRK" heavy -- bash "$TMP/touch-cap.sh" 2>&1)" || rc=$?
@@ -13610,7 +13614,7 @@ out="$(WRK_HEAVY_WAIT_CAP=3 "$WRK" heavy -- bash "$TMP/touch-load3.sh" 2>&1)" ||
 printf '9.9\n' >"$HEAVY_LOAD"
 "$WRK" heavy -- bash "$TMP/touch-load2.sh" &
 waiter_job=$!
-own "$waiter_job=$!"
+own "$waiter_job"
 sleep 2
 printf '0\n' >"$HEAVY_LOAD"
 wait "$waiter_job" || fail "run did not start after the load gate opened"

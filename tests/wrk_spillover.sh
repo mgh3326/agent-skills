@@ -38,9 +38,15 @@ cleanup() {
   # empty" (CI runs 36283072131 / 36288704921). tests/lib/tmp-writers.sh
   # reaps each one by an exact verified pid — pidfile, registry, descendant
   # walk — never a process-table pattern match.
-  tmp_writers_stop
+  local tw_rc=0
+  tmp_writers_stop || tw_rc=$?
   after="$(real_jobs_count)"
-  rm -rf "$TMP"
+  # Never rm while a tracked writer lives.
+  (( tw_rc == 0 )) && rm -rf "$TMP"
+  if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+    echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+    exit 1
+  fi
   if [[ "$after" != "$REAL_JOBS_BEFORE" ]]; then
     echo "FAIL: real inbox mutated ${REAL_JOBS_BEFORE} -> ${after}" >&2
     exit 1

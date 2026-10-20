@@ -24,8 +24,13 @@ mkdir -p "$TMP/gate-cache"
 
 cleanup() {
   if [[ -n "${TMP:-}" && -d "${TMP:-}" ]]; then
-    tmp_writers_stop
-    rm -rf "$TMP"
+    local tw_rc=0
+    tmp_writers_stop || tw_rc=$?
+    (( tw_rc == 0 )) && rm -rf "$TMP"
+    if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
+      echo "FAIL: tracked writers survived teardown:${TW_LEFTOVER_PIDS:-}" >&2
+      exit 1
+    fi
   fi
 }
 trap cleanup EXIT

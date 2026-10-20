@@ -6,9 +6,14 @@
 #
 #   1. pidfiles under the run's $TMP written by the process itself —
 #      completion-sentinel.pid / sentinel.pid: the pid is signalled only
-#      when its argv is literally `…/wrk sentinel <jobdir-name> …` and, when
-#      the file recorded started=EPOCH, the process's real elapsed matches
-#      (±120s, same window bin/wrk prune uses);
+#      when its argv has `sentinel JOB …` directly after a wrk executable
+#      position — the executable must be this repo's bin/wrk or a path
+#      under this run's $TW_TMP (a renamed mutant copy still verifies; a
+#      `bash -c …` program cannot), and the tokens after `sentinel` carry
+#      this run's job id (or its jobdir under $TW_TMP) plus the required
+#      trailing arguments — and, when the file recorded started=EPOCH, the
+#      process's real elapsed matches (±120s, same window bin/wrk prune
+#      uses);
 #      quota-refresh.pid: the pid is signalled only when its argv is the
 #      supervisor shape `python* - <scopefuel> <pool> <timeout> PIDFILE
 #      <job>` — the pidfile it babysits sits at argv[5] — and its recorded
@@ -17,40 +22,61 @@
 #   2. pid registries written by this run — any `*.pids` (or `owned-pids`)
 #      file under $TMP, plus extra paths passed to tmp_writers_stop: the
 #      scopefuel fixture logs its own pid to WRK_REFRESH_PID_LOG, and tests
-#      log pids they launched themselves (own). A listed pid is signalled
-#      only when it started inside this run's window (its elapsed cannot
-#      exceed the time since this file was sourced, +5s slack) AND before
-#      the registry's last write (its start must precede mtime +5s) — a pid
-#      recycled after the write, or a foreign process that predates the
-#      run, fails one side and is never signalled.
+#      log pids they launched themselves (own → tw_register_pid). Every
+#      registration also appends `PID<TAB>START-IDENTITY` to a companion
+#      REGISTRY.identities file — Linux /proc/PID/stat start ticks, macOS
+#      ps lstart — captured at registration time. A listed pid is
+#      signalled only when its CURRENT start identity exactly equals the
+#      stored entry; a missing or malformed identity, a pid recycled
+#      after the write, or a foreign process sharing the line refuses —
+#      there is no fallback to file mtime. The registry itself stays a
+#      plain numeric-pid log for existing readers.
 #   3. descendants of a verified pid, walked recursively with pgrep -P and
 #      frozen with STOP as they are found — the STOP-first order is what
 #      keeps a sentinel's interval sleep (or an in-flight probe/release
 #      child) from being orphaned between the enumeration and the signal.
-#   4. the process group of a tracked pid — only when the pid is itself
-#      the group leader (setsid'd supervisors, sentinels a test launched
-#      through tw_own_session). For a live verified leader `kill -- -pid`
-#      reaps members the walk can no longer reach (children already
-#      reparented to init stay in the group). For a dead leader, group
-#      members are enumerated and signalled individually, each still
-#      checked as this run's leftover (a bare `sleep N`, or an argv
-#      carrying this run's $TMP or the repo root) that started inside the
-#      run window — a pid recycled into a foreign group leader never
-#      satisfies that.
+#      Found descendants stay pending across sweep rounds so a
+#      TERM-immune child still takes the KILL after its parent dies.
+#   4. the process group of a tracked pid — only when ownership is
+#      established: the pid was verified while alive this sweep, or its
+#      registration recorded pgid == pid (an observed group leader), or a
+#      tw_own_session self-record under $TW_TMP/tw-own-sessions proves the
+#      group is this run's own (a live recorded leader is signalled only
+#      while its identity still matches the record). A stale pidfile or
+#      an arbitrary registered pid owns no group. For a live verified
+#      leader `kill -- -pid` reaps members the walk can no longer reach
+#      (children already reparented to init stay in the group). For a
+#      dead owned leader, group members are enumerated by exact pgid
+#      (pgrep -g, never a whole-table scan) and signalled individually,
+#      each still checked as this run's leftover (a bare `sleep N`, or an
+#      argv carrying this run's $TMP or the repo root) that started
+#      inside the run window — a stale numeric pidfile never owns a
+#      group, and a pid recycled into a foreign group leader never
+#      satisfies the member check.
 #
 # A pidfile or registry entry that fails its check is skipped, never
 # signalled: a stale pidfile, a recycled pid, or a fake written to name an
-# unrelated process is inert by construction. tmp_writers_stop loops until
-# every tracked pid is gone (or the ~10s bound), then the caller rm -rf's:
-# no rm while a tracked writer lives, matching the old bound.
+# unrelated process is inert by construction — but it still shows up in
+# TW_LEFTOVER_PIDS so the refusal is visible instead of hiding.
+# tmp_writers_stop loops until every tracked pid is gone or a ~10s
+# wall-clock deadline passes (TERM for the first half, KILL after), then
+# returns nonzero with TW_LEFTOVER_PIDS set and the caller preserves TMP:
+# no rm while a tracked writer lives.
 #
 # Public API:
 #   TW_TMP=DIR                    — the run's tmp dir (set before teardown)
 #   tmp_writers_stop [REG …]      — reap everything; extra registry paths
 #                                   may be passed (files under $TW_TMP are
-#                                   found anyway by the *.pids convention)
+#                                   found anyway by the *.pids convention).
+#                                   rc 0 = clean; rc 1 = live tracked
+#                                   writers remain (TMP must be kept)
 #   TW_LEFTOVER_PIDS              — tracked pids still alive when the bound
 #                                   ran out (empty on success)
+#   tw_register_pid REGISTRY PID  — append PID to REGISTRY after recording
+#                                   its start identity in REGISTRY.identities
+#   tw_kill_pidfile FILE [SIG]    — verify one pidfile (argv + recorded
+#                                   start) and kill its tree; rc 1 when the
+#                                   pid is alive but refused
 #   tw_kill_tree PID [SIG]        — STOP → kill descendants → group kill if
 #                                   leader → kill pid → CONT (default TERM)
 #   tw_own_session CMD …          — exec CMD in a new session so its whole
@@ -63,10 +89,12 @@ TW_TMP=""
 TW_LEFTOVER_PIDS=""
 TW_TRACKED_LOG="${TW_TRACKED_LOG:-}"
 TW_RUN_START="$(date +%s)"
-_TW_ORPHAN_HITS=0
+_TW_LAST_DESC=""
+_TW_LAST_PGID=""
 
 # _tw_track PID — when TW_TRACKED_LOG names a file, append each pid this
-# run signals so the caller can kill -0 the exact tracked set afterwards.
+# run discovered (pidfiles, verified registries, descendants, group
+# members) so the caller can kill -0 the exact tracked set afterwards.
 _tw_track() {
   [[ -z "$TW_TRACKED_LOG" ]] || printf '%s\n' "$1" >>"$TW_TRACKED_LOG" 2>/dev/null || true
 }
@@ -101,11 +129,49 @@ print(days * 86400 + hours * 3600 + minutes * 60 + seconds)
 PY
 }
 
-# _tw_mtime FILE — file mtime as epoch (portable via python3, no stat
-# dialect split between GNU and BSD).
-_tw_mtime() {
-  python3 -c 'import os,sys; print(int(os.stat(sys.argv[1]).st_mtime))' \
-    "$1" 2>/dev/null
+# _tw_pid_identity PID — the process's start identity: Linux /proc stat
+# start ticks (field 22, parsed after the comm ')' so a comm with spaces
+# cannot shift it), macOS ps lstart. Fails when it cannot produce one —
+# callers treat that as unverifiable, never as a fallback to file mtimes.
+_tw_pid_identity() {
+  local pid="$1" stat rest ident
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  if [[ -d /proc ]]; then
+    [[ -r "/proc/$pid/stat" ]] || return 1
+    stat="$(<"/proc/$pid/stat")" || return 1
+    rest="${stat##*) }"
+    set -- $rest
+    ident="${20:-}"
+    [[ "$ident" =~ ^[0-9]+$ ]] || return 1
+    printf '%s\n' "$ident"
+    return 0
+  fi
+  ident="$(LC_ALL=C ps -o lstart= -p "$pid" 2>/dev/null)" || return 1
+  ident="${ident#"${ident%%[![:space:]]*}"}"
+  ident="${ident%"${ident##*[![:space:]]}"}"
+  [[ -n "$ident" ]] || return 1
+  printf '%s\n' "$ident"
+}
+
+# tw_register_pid REGISTRY PID — the registration API every registry
+# writer uses: record PID's start identity in REGISTRY.identities first
+# (readers of the pid log only ever see the pid after its identity is
+# stored), then append the bare pid line existing readers expect. When the
+# pid already leads its own process group at registration time a third
+# `pgid` field is recorded — the only way a registry entry can later own a
+# dead leader's orphan group (a registered arbitrary pid is not group
+# ownership). Write failures are loud: a lost live-writer registration
+# must not fail silently.
+tw_register_pid() {
+  local reg="$1" pid="$2" ident="" pgid="" extra=""
+  [[ -n "$reg" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  ident="$(_tw_pid_identity "$pid" 2>/dev/null || true)"
+  pgid="$( { ps -o pgid= -p "$pid" 2>/dev/null || true; } | tr -d '[:space:]')"
+  [[ -n "$pgid" && "$pgid" == "$pid" ]] && extra=$'\t'"$pgid"
+  if [[ -n "$ident" ]]; then
+    printf '%s\t%s%s\n' "$pid" "$ident" "$extra" >>"$reg.identities" || return 1
+  fi
+  printf '%s\n' "$pid" >>"$reg"
 }
 
 # ── identity checks (ports of bin/wrk's pid-reuse guards) ───────────────
@@ -140,29 +206,60 @@ _tw_start_matches() {
   (( skew >= -120 && skew <= 120 ))
 }
 
-# _tw_sentinel_argv_ok PID JOB — the recorded pid is this job's sentinel
-# only when its argv is literally `…/wrk sentinel JOB OWNER LABEL PANE
-# [REPORT …]`. Port of bin/wrk's sentinel_pid_matches.
-_tw_sentinel_argv_ok() {
-  local pid="$1" job="$2"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
-  ps -p "$pid" -o args= 2>/dev/null | awk -v job="$job" '
-    function is_shell(tok) { sub(/^.*\//, "", tok); return tok ~ /^(sh|bash|zsh|dash|ksh)$/ }
-    {
-      for (i = 1; i <= NF; i++)
-        if ($i ~ /(^|\/)wrk$/ && $(i + 1) == "sentinel" && $(i + 2) == job &&
-            NF >= i + 5 && (i == 1 || (i == 2 && is_shell($1)))) { found = 1; break }
-    }
-    END { exit(found ? 0 : 1) }'
+# _tw_lstart_epoch LSTART — epoch seconds for an LC_ALL=C `ps lstart`
+# timestamp ("Www Mmm DD HH:MM:SS YYYY" on both GNU and BSD ps). Fails on
+# unparseable input.
+_tw_lstart_epoch() {
+  python3 - "$1" <<'PY'
+import sys, time
+try:
+    print(int(time.mktime(time.strptime(sys.argv[1], "%a %b %d %H:%M:%S %Y"))))
+except Exception:
+    raise SystemExit(1)
+PY
 }
 
-# _tw_supervisor_argv_ok PID PIDFILE — the refresh supervisor's argv is
+# _tw_sentinel_args_ok ARGS JOB JOBDIR — the argv is this job's sentinel
+# only when `sentinel JOB OWNER LABEL PANE [REPORT …]` sits directly
+# after the executable position: the bare executable, or one shell token
+# then the script path. The executable token must be this repo's bin/wrk
+# or a path under this run's $TW_TMP — a renamed mutant copy passes,
+# while `sentinel` inside a `bash -c` program or another tool's argv does
+# not. JOBDIR (the directory the pidfile sits in) is accepted in place of
+# the bare job id. Port of bin/wrk's sentinel_pid_matches.
+_tw_sentinel_args_ok() {
+  local args="$1" job="$2" jobdir="$3"
+  [[ -n "$args" ]] || return 1
+  awk -v job="$job" -v jobdir="$jobdir" \
+      -v wrk="${ROOT:-}" -v tmp="${TW_TMP:-}" '
+    function is_shell(tok) { sub(/^.*\//, "", tok); return tok ~ /^(sh|bash|zsh|dash|ksh)$/ }
+    function is_wrk_path(tok) {
+      return (wrk != "" && tok == wrk "/bin/wrk") ||
+             (tmp != "" && index(tok, tmp "/") == 1)
+    }
+    {
+      for (i = 1; i + 5 <= NF; i++)
+        if ((i == 1 || (i == 2 && is_shell($1))) && is_wrk_path($i) &&
+            $(i + 1) == "sentinel" &&
+            ($(i + 2) == job || $(i + 2) == jobdir))
+          { found = 1; break }
+    }
+    END { exit(found ? 0 : 1) }' <<<"$args"
+}
+
+_tw_sentinel_argv_ok() {
+  local pid="$1" job="$2" jobdir="${3:-}" args
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+  _tw_sentinel_args_ok "$args" "$job" "$jobdir"
+}
+
+# _tw_supervisor_args_ok ARGS PIDFILE — the refresh supervisor's argv is
 # `python* - <scopefuel> <pool> <timeout> THIS-PIDFILE <job>`: the pidfile
 # it babysits sits at argv[5]. Port of bin/wrk's
 # refresh_supervisor_argv_matches.
-_tw_supervisor_argv_ok() {
-  local pid="$1" pidfile="$2" args
-  args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+_tw_supervisor_args_ok() {
+  local args="$1" pidfile="$2"
   [[ -n "$args" ]] || return 1
   python3 - "$args" "$pidfile" <<'PY'
 import shlex, sys
@@ -177,19 +274,65 @@ sys.exit(0 if ok else 1)
 PY
 }
 
-# _tw_registry_pid_ok PID MTIME — a registry-listed pid is this run's only
-# when it started inside the run's window and before the registry's last
-# write: elapsed <= run-age + slack (a foreign process that predates the
-# run fails), and now-elapsed <= mtime + slack (a pid recycled after the
-# write fails). Both bounds use start time only — no environments.
+_tw_supervisor_argv_ok() {
+  local pid="$1" pidfile="$2" args
+  args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
+  [[ -n "$args" ]] || return 1
+  _tw_supervisor_args_ok "$args" "$pidfile"
+}
+
+# _tw_pidfile_verify FILE PID ARGS — the per-kind pidfile check used by
+# both the sweep and tw_kill_pidfile: argv shape plus the recorded start.
+_tw_pidfile_verify() {
+  local file="$1" pid="$2" args="$3" kind job jobdir started
+  kind="${file##*/}"
+  jobdir="${file%/"$kind"}"
+  case "$kind" in
+    completion-sentinel.pid|sentinel.pid)
+      job="${jobdir##*/}"
+      IFS=$'\t' read -r _ started <<<"$(_tw_pidfile_fields "$file")"
+      { _tw_sentinel_args_ok "$args" "$job" "$jobdir" &&
+        _tw_start_matches "$pid" "$started"; }
+      ;;
+    quota-refresh.pid)
+      IFS=$'\t' read -r _ started <<<"$(_tw_pidfile_fields "$file")"
+      { _tw_supervisor_args_ok "$args" "$file" &&
+        _tw_start_matches "$pid" "$started"; }
+      ;;
+    *) return 1 ;;
+  esac
+}
+
+# _tw_registered_identity PID FILE — the start identity REGISTRY recorded
+# for PID (tab-separated field 2; last matching line wins). Empty output
+# means this registry never captured one for the pid.
+_tw_registered_identity() {
+  awk -v p="$1" -F '\t' '$1 == p { i = $2 } END { printf "%s", i }' \
+    "$2" 2>/dev/null
+}
+
+# _tw_registered_pgid PID FILE — field 3 of PID's identities entry: the
+# process group it led at registration time. Only `pgid == pid` is ever
+# recorded, so a nonempty result is proof the registered pid owned its
+# group — registration of an arbitrary pid alone proves nothing.
+_tw_registered_pgid() {
+  awk -v p="$1" -F '\t' '$1 == p { i = $3 } END { printf "%s", i }' \
+    "$2" 2>/dev/null
+}
+
+# _tw_registry_pid_ok PID REGISTRY — a registry-listed pid is this run's
+# only when its CURRENT start identity exactly equals the identity the
+# registration captured: a pid recycled after the write, a foreign
+# process named by a stale earlier line, or an entry with no recorded
+# identity all refuse. No mtime window is consulted.
 _tw_registry_pid_ok() {
-  local pid="$1" mtime="$2" el now
+  local pid="$1" reg="$2" ident cur
   _tw_pid_alive "$pid" || return 1
-  el="$(_tw_elapsed_s "$pid" 2>/dev/null)" || return 1
-  now="$(date +%s)"
-  (( el <= now - TW_RUN_START + 5 )) || return 1
-  (( now - el <= mtime + 5 )) || return 1
-  return 0
+  [[ -f "$reg.identities" ]] || return 1
+  ident="$(_tw_registered_identity "$pid" "$reg.identities")"
+  [[ -n "$ident" ]] || return 1
+  cur="$(_tw_pid_identity "$pid" 2>/dev/null)" || return 1
+  [[ -n "$cur" && "$cur" == "$ident" ]]
 }
 
 # _tw_leftover_argv_ok ARGS — a dead tracked leader's group member still
@@ -219,51 +362,37 @@ _tw_descendants() {
     while IFS= read -r c; do
       [[ "$c" =~ ^[0-9]+$ ]] || continue
       kill -STOP "$c" 2>/dev/null || true
+      _tw_track "$c"
       printf '%s\n' "$c"
       queue+=("$c")
     done < <(pgrep -P "$p" 2>/dev/null || true)
   done
 }
 
-# _tw_reap_orphan_group PGID SIG — PGID names a tracked pid that is already
-# dead. When it was a group leader its group can outlive it (children
-# reparented to init keep the pgid); signal each remaining member that
-# still verifies as this run's leftover (_tw_leftover_argv_ok) and started
-# inside the run window. A pid recycled into a foreign group leader fails
-# the member check. Sets _TW_ORPHAN_HITS to the signalled count.
-_tw_reap_orphan_group() {
-  local pgid="$1" sig="$2" mpid margs el
-  _TW_ORPHAN_HITS=0
-  [[ "$pgid" =~ ^[0-9]+$ ]] || return 0
-  while IFS=$'\t' read -r mpid margs; do
-    [[ "$mpid" =~ ^[0-9]+$ ]] || continue
-    _tw_leftover_argv_ok "$margs" || continue
-    el="$(_tw_elapsed_s "$mpid" 2>/dev/null)" || continue
-    (( el <= $(date +%s) - TW_RUN_START + 5 )) || continue
-    kill "$sig" "$mpid" 2>/dev/null || true
-    _TW_ORPHAN_HITS=$(( _TW_ORPHAN_HITS + 1 ))
-  done < <(ps axo pid=,pgid=,args= 2>/dev/null \
-             | awk -v g="$pgid" '$2 == g && $1 != g {
-                 rest = $0; sub(/^ *[0-9]+ +[0-9]+ +/, "", rest);
-                 print $1 "\t" rest }')
-}
-
 # tw_kill_tree PID [SIG] — signal PID's whole tree. STOP the root first so
 # it cannot fork a fresh child or exit mid-walk; descendants are frozen as
 # they are found, signalled, then released with CONT so a pending TERM can
-# land. When PID leads its own group the group takes the same signal —
-# orphaned members the walk cannot reach die with it. A dead PID is passed
-# to _tw_reap_orphan_group. SIG defaults to -TERM.
+# land — the found list is left in _TW_LAST_DESC so a TERM-immune child
+# can stay pending across sweep rounds. When PID leads its own group the
+# group takes the same signal — orphaned members the walk cannot reach die
+# with it; the queried pgid is left in _TW_LAST_PGID so the caller can tell
+# observed group leadership from a generic verified pid. A dead PID is
+# never treated as group ownership here — the sweep's ownership-aware
+# group ledger reaps dead leaders' groups. SIG defaults to -TERM.
 tw_kill_tree() {
   local pid="$1" sig="${2:--TERM}" desc d pgid
   [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  _TW_LAST_DESC=""
+  _TW_LAST_PGID=""
   if _tw_pid_alive "$pid"; then
     kill -STOP "$pid" 2>/dev/null || true
     desc="$(_tw_descendants "$pid")"
+    _TW_LAST_DESC="$desc"
     while IFS= read -r d; do
       [[ -n "$d" ]] && kill "$sig" "$d" 2>/dev/null || true
     done <<<"$desc"
     pgid="$(ps -o pgid= -p "$pid" 2>/dev/null | tr -d '[:space:]')"
+    _TW_LAST_PGID="$pgid"
     if [[ "$pgid" == "$pid" ]]; then
       kill "$sig" -- "-$pid" 2>/dev/null || true
     fi
@@ -272,9 +401,27 @@ tw_kill_tree() {
     while IFS= read -r d; do
       [[ -n "$d" ]] && kill -CONT "$d" 2>/dev/null || true
     done <<<"$desc"
-  else
-    _tw_reap_orphan_group "$pid" "$sig"
   fi
+}
+
+# tw_kill_pidfile FILE [SIG] — verify the pid named by one pidfile under
+# this run's $TMP (per-kind argv shape plus the recorded start) and kill
+# its tree. rc 0 when the pid is gone or was verified and signalled; rc 1
+# when a live pid was refused — the refusal is still visible through the
+# sweep's TW_LEFTOVER_PIDS pass.
+tw_kill_pidfile() {
+  local file="$1" sig="${2:--TERM}" pid args
+  [[ -f "$file" ]] || return 0
+  # Only this run's own pidfiles are actionable — a path outside $TW_TMP
+  # is refused even when its contents would otherwise verify.
+  [[ -n "${TW_TMP:-}" && "$file" == "$TW_TMP/"* ]] || return 1
+  IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$file")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  _tw_track "$pid"
+  _tw_pid_alive "$pid" || return 0
+  args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+  _tw_pidfile_verify "$file" "$pid" "$args" || return 1
+  tw_kill_tree "$pid" "$sig"
 }
 
 # tw_stop_sentinels DIR — argv-verified, start-checked STOP-walk-TERM of
@@ -283,24 +430,49 @@ tw_kill_tree() {
 # spawns' sentinels gone); same checks as the teardown's pidfile pass, no
 # wait loop.
 tw_stop_sentinels() {
-  local dir="$1" pf pid started job
+  local dir="$1" pf
   [[ -n "$dir" && -d "$dir" ]] || return 0
   while IFS= read -r pf; do
-    IFS=$'\t' read -r pid started <<<"$(_tw_pidfile_fields "$pf")"
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
-    job="${pf%/completion-sentinel.pid}"; job="${job##*/}"
-    { _tw_sentinel_argv_ok "$pid" "$job" &&
-      _tw_start_matches "$pid" "$started"; } || continue
-    tw_kill_tree "$pid"
+    tw_kill_pidfile "$pf" || true
   done < <(find "$dir" -type f -name 'completion-sentinel.pid' 2>/dev/null || true)
 }
 
 # tw_own_session CMD … — exec CMD as the leader of a new session (pgid ==
 # its pid), so the group stays reachable by `kill -- -PID` even after the
-# leader dies. Meant for `tw_own_session … & pid=$!` launches; python3 is
-# the portable setsid (macOS has no setsid(1)).
+# leader dies. After setsid and before exec it self-records ownership
+# under $TW_TMP/tw-own-sessions/<pid> (pid, start identity, pgid) so the
+# sweep can recover the orphan group even if the leader dies before any
+# registry registration. Meant for `tw_own_session … & pid=$!` launches;
+# python3 is the portable setsid (macOS has no setsid(1)).
 tw_own_session() {
-  exec python3 -c 'import os,sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' "$@"
+  exec python3 -c '
+import os, sys
+os.setsid()
+tmp = os.environ.get("TW_TMP", "")
+pid = str(os.getpid())
+ident = ""
+if tmp:
+    try:
+        stat = open("/proc/self/stat").read()
+        ident = stat.rsplit(")", 1)[1].split()[19]
+    except Exception:
+        try:
+            import subprocess
+            ident = subprocess.check_output(
+                ["ps", "-o", "lstart=", "-p", pid],
+                env={"PATH": os.environ.get("PATH", ""), "LC_ALL": "C"}
+            ).decode().strip()
+        except Exception:
+            ident = ""
+    if ident:
+        try:
+            d = os.path.join(tmp, "tw-own-sessions")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, pid), "w") as f:
+                f.write("%s\t%s\t%s\n" % (pid, ident, os.getpgrp()))
+        except OSError:
+            pass
+os.execvp(sys.argv[1], sys.argv[1:])' "$@"
 }
 
 # _tw_registries — every pid registry for this run: the *.pids / owned-pids
@@ -316,66 +488,291 @@ _tw_registries() {
 
 # ── the sweep ────────────────────────────────────────────────────────────
 
+# _tw_list_has LIST PID — membership in a space-separated pid ledger.
+_tw_list_has() {
+  [[ " $1 " == *" $2 "* ]]
+}
+
+# _tw_snap_field SNAP PID COL — one whitespace field from the snapshot.
+_tw_snap_field() {
+  awk -v p="$2" -v c="$3" '$1 == p { print $c; exit }' <<<"$1"
+}
+
+# _tw_snap_args SNAP PID — the args tail of a `pid stat lstart args` row:
+# lstart in LC_ALL=C is always five tokens, so args begins at field 8.
+_tw_snap_args() {
+  awk -v p="$2" '$1 == p { for (i = 1; i <= 7; i++) $i = ""; sub(/^ +/, "");
+                            print; exit }' <<<"$1"
+}
+
+# _tw_snap_lstart SNAP PID — the five-token LC_ALL=C lstart field.
+_tw_snap_lstart() {
+  awk -v p="$2" '$1 == p { print $3, $4, $5, $6, $7; exit }' <<<"$1"
+}
+
+# _tw_member_id PID — the start identity captured when a pending member
+# was found; reads the "pid<TAB>ident" ledger on stdin.
+_tw_member_id() {
+  awk -F '\t' -v p="$1" '$1 == p { print $2; exit }'
+}
+
 # tmp_writers_stop [REGISTRY …] — reap every tracked writer under $TW_TMP
-# and wait until none remains, up to the ~10s bound the old sweeps used
-# (100 × 0.1s rounds; TERM for the first half, KILL after). Sets
-# TW_LEFTOVER_PIDS to any tracked pids still alive at the bound.
+# and wait until none remains, bounded by a ~10s wall-clock deadline
+# (TERM for the first five seconds, KILL after; five quiet 0.1s rounds
+# settle the run). Each round takes ONE snapshot — `ps -o
+# pid=,stat=,lstart=,args= -p <exact tracked pid list>` — never a
+# whole-table scan, never an environment read; known orphan groups'
+# members are enumerated by exact pgid (pgrep -g) BEFORE the snapshot so
+# their rows come from it too. Dead entries are cached, so stale pidfiles
+# cost no further process state. Verified descendants and orphan group
+# members stay pending across rounds — each with the start identity
+# captured when it was found, re-verified before every later signal — so
+# a TERM-immune child still takes the KILL and a recycled member pid is
+# never signalled. rc 0 when nothing tracked remains alive; rc 1 with
+# TW_LEFTOVER_PIDS set otherwise — the caller must then preserve $TW_TMP
+# instead of rm -rf'ing it.
 tmp_writers_stop() {
-  local round sig quiet=0 alive
-  local pf reg mtime pid started kind job
+  local round_start sig quiet=0 alive deadline now
+  local pf reg pid started kind args stat dp cur
+  local sfile spid sident spgid
+  local tracked commalist snap members_at_snap gtok
   local -a _TW_EXTRA_REGS=("$@")
+  local _TW_DEAD="" _TW_OWNED="" _TW_GROUPS="" _TW_MEMBERS=""
+  local _TW_MEMBERS_NEW="" _TW_MEMBERS_UNVER="" _TW_MEMBER_IDS=""
+  local g glist gmembers gm="" mpid margs mstat mident mstored mepoch mlstart
+  local next_members kept groups_prev
   [[ -n "${TW_TMP:-}" && -d "$TW_TMP" ]] || return 0
-  for ((round = 0; round < 100; round++)); do
+  round_start="$(date +%s)"
+  deadline=$(( round_start + 10 ))
+  while :; do
+    now="$(date +%s)"
+    (( now >= deadline )) && break
     alive=0
-    if (( round >= 50 )); then sig=-KILL; else sig=-TERM; fi
-    # 1. pidfiles the writers wrote about themselves. A live pid is
+    if (( now - round_start >= 5 )); then sig=-KILL; else sig=-TERM; fi
+    _TW_MEMBERS_NEW=""
+    groups_prev="$_TW_GROUPS"
+    # 0. collect this round's tracked pids (dead entries are cached and
+    #    never re-read). Pending orphan groups contribute their exact
+    #    member list first (pgrep -g PGID — no table scan) so the single
+    #    snapshot below already covers them.
+    tracked="$_TW_MEMBERS $_TW_MEMBERS_UNVER"
+    gm=""
+    for g in $_TW_GROUPS; do
+      gmembers="$(pgrep -g "$g" 2>/dev/null | tr -s ' \n' ',,' || true)"
+      gmembers="${gmembers#,}"; gmembers="${gmembers%,}"
+      [[ -n "$gmembers" ]] || continue
+      gm="$gm $g:$gmembers"
+      tracked="$tracked ${gmembers//,/ }"
+    done
+    while IFS= read -r pf; do
+      IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$pf")"
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      _tw_track "$pid"
+      _tw_list_has "$_TW_DEAD" "$pid" || tracked="$tracked $pid"
+    done < <(find "$TW_TMP" -type f \
+               \( -name 'completion-sentinel.pid' -o -name 'sentinel.pid' \
+                  -o -name 'quota-refresh.pid' \) 2>/dev/null || true)
+    while IFS= read -r reg; do
+      [[ -f "$reg" ]] || continue
+      while IFS= read -r pid; do
+        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        _tw_list_has "$_TW_DEAD" "$pid" || tracked="$tracked $pid"
+      done <"$reg"
+    done < <(_tw_registries)
+    while IFS= read -r sfile; do
+      IFS=$'\t' read -r spid _ _ <"$sfile" 2>/dev/null || continue
+      [[ "$spid" =~ ^[0-9]+$ ]] || continue
+      _tw_track "$spid"
+      _tw_list_has "$_TW_DEAD" "$spid" || tracked="$tracked $spid"
+    done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
+    # 1. the round's single process snapshot: pid, state, start, argv of
+    #    exactly this run's tracked pids (plus pending members and known
+    #    orphan-group members).
+    commalist="$(tr -s ' ' ',' <<<"${tracked# }")"
+    commalist="${commalist#,}"; commalist="${commalist%,}"
+    snap=""
+    [[ -n "$commalist" ]] &&
+      snap="$(LC_ALL=C ps -o pid=,stat=,lstart=,args= -p "$commalist" 2>/dev/null || true)"
+    members_at_snap="$_TW_MEMBERS"
+    # 2. pidfiles the writers wrote about themselves. A live pid is
     #    signalled only after the per-kind argv + recorded-start checks
-    #    pass; a dead one only frees its group of verified leftovers.
+    #    pass; a dead one frees its group only when it was verified while
+    #    alive this sweep — a stale or forged numeric pidfile owns no
+    #    group, whatever timestamp it carries.
     while IFS= read -r pf; do
       kind="${pf##*/}"
       IFS=$'\t' read -r pid started <<<"$(_tw_pidfile_fields "$pf")"
       [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      if _tw_pid_alive "$pid"; then
-        case "$kind" in
-          completion-sentinel.pid|sentinel.pid)
-            job="${pf%/"$kind"}"; job="${job##*/}"
-            { _tw_sentinel_argv_ok "$pid" "$job" &&
-              _tw_start_matches "$pid" "$started"; } || continue
-            ;;
-          quota-refresh.pid)
-            { _tw_supervisor_argv_ok "$pid" "$pf" &&
-              _tw_start_matches "$pid" "$started"; } || continue
-            ;;
-          *) continue ;;
-        esac
-        _tw_track "$pid"
-        tw_kill_tree "$pid" "$sig"
-        alive=1
+      _tw_list_has "$_TW_DEAD" "$pid" && continue
+      stat="$(_tw_snap_field "$snap" "$pid" 2)"
+      if [[ -n "$stat" && "$stat" != Z* ]]; then
+        args="$(_tw_snap_args "$snap" "$pid")"
+        if _tw_pidfile_verify "$pf" "$pid" "$args"; then
+          _tw_track "$pid"
+          tw_kill_tree "$pid" "$sig"
+          [[ "${_TW_LAST_PGID:-}" == "$pid" ]] && _TW_OWNED="$_TW_OWNED $pid"
+          for dp in $_TW_LAST_DESC; do
+            mident="$(_tw_pid_identity "$dp" 2>/dev/null || true)"
+            if [[ -n "$mident" ]]; then
+              { _tw_list_has "$_TW_MEMBERS" "$dp" ||
+                _tw_list_has "$_TW_MEMBERS_NEW" "$dp"; } ||
+                { _TW_MEMBERS_NEW="$_TW_MEMBERS_NEW $dp"
+                  _TW_MEMBER_IDS="$_TW_MEMBER_IDS$dp"$'\t'"$mident"$'\n'; }
+            else
+              _tw_list_has "$_TW_MEMBERS_UNVER" "$dp" ||
+                _TW_MEMBERS_UNVER="$_TW_MEMBERS_UNVER $dp"
+            fi
+          done
+          alive=1
+        fi
       else
-        tw_kill_tree "$pid" "$sig"
-        (( _TW_ORPHAN_HITS > 0 )) && alive=1
+        _TW_DEAD="$_TW_DEAD $pid"
+        if _tw_list_has "$_TW_OWNED" "$pid"; then
+          _tw_list_has "$_TW_GROUPS" "$pid" || _TW_GROUPS="$_TW_GROUPS $pid"
+        fi
       fi
     done < <(find "$TW_TMP" -type f \
                \( -name 'completion-sentinel.pid' -o -name 'sentinel.pid' \
                   -o -name 'quota-refresh.pid' \) 2>/dev/null || true)
-    # 2. registries written by this run.
+    # 3. registries written by this run (per-entry start identities). A
+    #    dead entry owns its group only when its registration recorded
+    #    pgid == pid (an observed group leader), or it was verified while
+    #    alive this sweep — an arbitrary registered pid owns no group.
     while IFS= read -r reg; do
       [[ -f "$reg" ]] || continue
-      mtime="$(_tw_mtime "$reg")" || continue
-      [[ "$mtime" =~ ^[0-9]+$ ]] || continue
       while IFS= read -r pid; do
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
-        if _tw_pid_alive "$pid"; then
-          _tw_registry_pid_ok "$pid" "$mtime" || continue
-          _tw_track "$pid"
-          tw_kill_tree "$pid" "$sig"
-          alive=1
+        _tw_list_has "$_TW_DEAD" "$pid" && continue
+        stat="$(_tw_snap_field "$snap" "$pid" 2)"
+        if [[ -n "$stat" && "$stat" != Z* ]]; then
+          if _tw_registry_pid_ok "$pid" "$reg"; then
+            _tw_track "$pid"
+            tw_kill_tree "$pid" "$sig"
+            [[ "${_TW_LAST_PGID:-}" == "$pid" ]] && _TW_OWNED="$_TW_OWNED $pid"
+            for dp in $_TW_LAST_DESC; do
+              mident="$(_tw_pid_identity "$dp" 2>/dev/null || true)"
+              if [[ -n "$mident" ]]; then
+                { _tw_list_has "$_TW_MEMBERS" "$dp" ||
+                  _tw_list_has "$_TW_MEMBERS_NEW" "$dp"; } ||
+                  { _TW_MEMBERS_NEW="$_TW_MEMBERS_NEW $dp"
+                    _TW_MEMBER_IDS="$_TW_MEMBER_IDS$dp"$'\t'"$mident"$'\n'; }
+              else
+                _tw_list_has "$_TW_MEMBERS_UNVER" "$dp" ||
+                  _TW_MEMBERS_UNVER="$_TW_MEMBERS_UNVER $dp"
+              fi
+            done
+            alive=1
+          fi
         else
-          tw_kill_tree "$pid" "$sig"
-          (( _TW_ORPHAN_HITS > 0 )) && alive=1
+          _TW_DEAD="$_TW_DEAD $pid"
+          if _tw_list_has "$_TW_OWNED" "$pid" ||
+             { [[ -f "$reg.identities" ]] &&
+               [[ "$(_tw_registered_pgid "$pid" "$reg.identities")" == "$pid" ]]; }; then
+            _tw_list_has "$_TW_GROUPS" "$pid" || _TW_GROUPS="$_TW_GROUPS $pid"
+          fi
         fi
       done <"$reg"
     done < <(_tw_registries)
+    # 4. self-recorded own-session leaders ($TW_TMP/tw-own-sessions/):
+    #    the record was written between setsid and exec, so the stored
+    #    identity is this run's proof of group ownership. A dead recorded
+    #    leader frees its recorded pgid; a live one is signalled only
+    #    while its current identity still matches the record — a recycled
+    #    pid leading the group is never signalled (its members are still
+    #    checked individually through the group pass).
+    while IFS= read -r sfile; do
+      IFS=$'\t' read -r spid sident spgid <"$sfile" 2>/dev/null || continue
+      [[ "$spid" =~ ^[0-9]+$ && "$spgid" =~ ^[0-9]+$ ]] || continue
+      _tw_list_has "$_TW_DEAD" "$spid" && continue
+      stat="$(_tw_snap_field "$snap" "$spid" 2)"
+      if [[ -n "$stat" && "$stat" != Z* ]]; then
+        cur="$(_tw_pid_identity "$spid" 2>/dev/null || true)"
+        if [[ -n "$sident" && "$cur" == "$sident" ]]; then
+          _tw_track "$spid"
+          tw_kill_tree "$spid" "$sig"
+          [[ "${_TW_LAST_PGID:-}" == "$spid" ]] && _TW_OWNED="$_TW_OWNED $spid"
+          for dp in $_TW_LAST_DESC; do
+            mident="$(_tw_pid_identity "$dp" 2>/dev/null || true)"
+            if [[ -n "$mident" ]]; then
+              { _tw_list_has "$_TW_MEMBERS" "$dp" ||
+                _tw_list_has "$_TW_MEMBERS_NEW" "$dp"; } ||
+                { _TW_MEMBERS_NEW="$_TW_MEMBERS_NEW $dp"
+                  _TW_MEMBER_IDS="$_TW_MEMBER_IDS$dp"$'\t'"$mident"$'\n'; }
+            else
+              _tw_list_has "$_TW_MEMBERS_UNVER" "$dp" ||
+                _TW_MEMBERS_UNVER="$_TW_MEMBERS_UNVER $dp"
+            fi
+          done
+          alive=1
+        fi
+        # A live recorded leader whose identity no longer matches the
+        # record is a recycled pid: it is never signalled and its group
+        # is never enqueued — it just stays visible as a leftover.
+      else
+        _TW_DEAD="$_TW_DEAD $spid"
+        _tw_list_has "$_TW_GROUPS" "$spgid" || _TW_GROUPS="$_TW_GROUPS $spgid"
+      fi
+    done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
+    # 5. pending orphan groups: members were enumerated by exact pgid in
+    #    step 0, so their rows are already in this round's snapshot. Each
+    #    still has to verify as this run's leftover argv and to have
+    #    started inside the run window (snapshot lstart — no extra ps).
+    for gtok in $gm; do
+      g="${gtok%%:*}"; glist="${gtok#*:}"
+      for mpid in ${glist//,/ }; do
+        [[ "$mpid" =~ ^[0-9]+$ ]] || continue
+        [[ "$mpid" == "$g" ]] && continue
+        mstat="$(_tw_snap_field "$snap" "$mpid" 2)"
+        [[ -n "$mstat" && "$mstat" != Z* ]] || continue
+        margs="$(_tw_snap_args "$snap" "$mpid")"
+        _tw_leftover_argv_ok "$margs" || continue
+        mlstart="$(_tw_snap_lstart "$snap" "$mpid")"
+        mepoch="$(_tw_lstart_epoch "$mlstart" 2>/dev/null)" || continue
+        (( mepoch >= TW_RUN_START - 5 && mepoch <= now + 5 )) || continue
+        kill "$sig" "$mpid" 2>/dev/null || true
+        _tw_track "$mpid"
+        mident="$(_tw_pid_identity "$mpid" 2>/dev/null || true)"
+        if [[ -n "$mident" ]]; then
+          { _tw_list_has "$_TW_MEMBERS" "$mpid" ||
+            _tw_list_has "$_TW_MEMBERS_NEW" "$mpid"; } ||
+            { _TW_MEMBERS_NEW="$_TW_MEMBERS_NEW $mpid"
+              _TW_MEMBER_IDS="$_TW_MEMBER_IDS$mpid"$'\t'"$mident"$'\n'; }
+        else
+          _tw_list_has "$_TW_MEMBERS_UNVER" "$mpid" ||
+            _TW_MEMBERS_UNVER="$_TW_MEMBERS_UNVER $mpid"
+        fi
+        alive=1
+      done
+    done
+    # A group stays pending while pgrep still reports members (gm was
+    # built from this round's live pgrep); groups with no members left
+    # are dropped, groups queued this round keep until first scan.
+    kept=""
+    for g in $_TW_GROUPS; do
+      if _tw_list_has "$groups_prev" "$g"; then
+        [[ " $gm " == *" $g:"* ]] && kept="$kept $g"
+      else
+        kept="$kept $g"
+      fi
+    done
+    _TW_GROUPS="$kept"
+    # 6. pending members found before this round's snapshot: verify each
+    #    one's CURRENT identity against what was captured at discovery
+    #    before re-signalling — a recycled member pid is never touched.
+    #    Members found this round (_TW_MEMBERS_NEW) are not in snap, so
+    #    they carry over untouched until the next snapshot sees them.
+    next_members=""
+    for mpid in $members_at_snap; do
+      mstat="$(_tw_snap_field "$snap" "$mpid" 2)"
+      [[ -n "$mstat" && "$mstat" != Z* ]] || continue
+      mstored="$(_tw_member_id "$mpid" <<<"$_TW_MEMBER_IDS")"
+      cur="$(_tw_pid_identity "$mpid" 2>/dev/null || true)"
+      [[ -n "$mstored" && "$cur" == "$mstored" ]] || continue
+      kill "$sig" "$mpid" 2>/dev/null || true
+      next_members="$next_members $mpid"
+      alive=1
+    done
+    _TW_MEMBERS="${next_members# }$_TW_MEMBERS_NEW"
     if (( alive == 0 )); then
       # five quiet rounds (0.5s) with no live tracked pid: enough slack for
       # a just-forked supervisor's pidfile to land before the caller rm's.
@@ -385,39 +782,37 @@ tmp_writers_stop() {
     fi
     sleep 0.1
   done
-  # Report leftovers: verified tracked pids still alive after the bound.
+  # Report leftovers: every live pid found in this run's own pidfiles,
+  # registries and session records — including ones verification refused
+  # — plus pending members still alive. A refused live writer shows up
+  # here instead of hiding, and a nonzero return keeps the caller from
+  # rm -rf'ing TMP.
   TW_LEFTOVER_PIDS=""
   while IFS= read -r pf; do
-    kind="${pf##*/}"
-    IFS=$'\t' read -r pid started <<<"$(_tw_pidfile_fields "$pf")"
+    IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$pf")"
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     _tw_pid_alive "$pid" || continue
-    case "$kind" in
-      completion-sentinel.pid|sentinel.pid)
-        job="${pf%/"$kind"}"; job="${job##*/}"
-        { _tw_sentinel_argv_ok "$pid" "$job" &&
-          _tw_start_matches "$pid" "$started"; } || continue
-        ;;
-      quota-refresh.pid)
-        { _tw_supervisor_argv_ok "$pid" "$pf" &&
-          _tw_start_matches "$pid" "$started"; } || continue
-        ;;
-      *) continue ;;
-    esac
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
   done < <(find "$TW_TMP" -type f \
              \( -name 'completion-sentinel.pid' -o -name 'sentinel.pid' \
                 -o -name 'quota-refresh.pid' \) 2>/dev/null || true)
   while IFS= read -r reg; do
     [[ -f "$reg" ]] || continue
-    mtime="$(_tw_mtime "$reg")" || continue
-    [[ "$mtime" =~ ^[0-9]+$ ]] || continue
     while IFS= read -r pid; do
       [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      if _tw_registry_pid_ok "$pid" "$mtime"; then
-        TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
-      fi
+      _tw_pid_alive "$pid" || continue
+      TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
     done <"$reg"
   done < <(_tw_registries)
-  return 0
+  while IFS= read -r sfile; do
+    IFS=$'\t' read -r spid _ _ <"$sfile" 2>/dev/null || continue
+    [[ "$spid" =~ ^[0-9]+$ ]] || continue
+    _tw_pid_alive "$spid" || continue
+    TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $spid"
+  done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
+  for mpid in $_TW_MEMBERS $_TW_MEMBERS_UNVER; do
+    _tw_pid_alive "$mpid" || continue
+    TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $mpid"
+  done
+  [[ -z "$TW_LEFTOVER_PIDS" ]]
 }
