@@ -192,7 +192,7 @@ tw_register_pid "$reg" "$rp"
 [[ "$(tail -n 1 "$reg")" == "$rp" ]] || fail "T4: bare pid line missing"
 grep -q "^$rp	." "$reg.identities" ||
   fail "T4: REGISTRY.identities must carry a per-entry start identity"
-[[ "$(wc -l <"$reg")" == 1 ]] || fail "T4: registry keeps bare-numeric lines"
+[[ "$(wc -l <"$reg")" -eq 1 ]] || fail "T4: registry keeps bare-numeric lines"
 tmp_writers_stop || fail "T4: registered writer not reaped (${TW_LEFTOVER_PIDS:-})"
 dead "$rp" || fail "T4: registered sleep survived"
 untrack "$rp"
