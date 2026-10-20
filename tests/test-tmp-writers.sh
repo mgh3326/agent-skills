@@ -472,4 +472,70 @@ t15_out="$(
   fail "T15: registration-race subtest rc=${t15_rc:-0} out=$t15_out"
 pass "T15 tw_register_pid survives mid-registration death"
 
+# ── T16: a fake-clock sentinel remains owned through its session record ─
+new_run
+jobdir="$TW_TMP/inbox/job-t16"
+mkdir -p "$jobdir"
+copy="$TW_TMP/fakeclock-wrk"
+mk_sentinel_script "$copy"
+python3 - "$copy" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+old = '"$(date +%s)"'
+assert text.count(old) == 1, "expected one sentinel started timestamp expression"
+open(path, "w", encoding="utf-8").write(text.replace(old, "1000", 1))
+PY
+wrapper="$TW_TMP/fakeclock-wrapper.sh"
+cat >"$wrapper" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+copy="$1"; jobdir="$2"
+export SENT_JOBDIR="$jobdir"
+bash "$copy" sentinel job-t16 lane lbl w1:p1 "$jobdir/report.json" &
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -s "$jobdir/completion-sentinel.pid" &&
+     -s "$jobdir/sentinel-child.pid" ]] && exit 0
+  sleep 0.1
+done
+exit 1
+SH
+tw_own_session bash "$wrapper" "$copy" "$jobdir" &
+leader=$!
+track "$leader"
+wait "$leader" || fail "T16: own-session wrapper did not finish"
+record="$TW_TMP/tw-own-sessions/$leader"
+[[ -s "$record" ]] || fail "T16: self-recorded session ownership missing"
+IFS=$'\t' read -r record_pid record_ident record_pgid <"$record"
+[[ "$record_pid" == "$leader" && "$record_pgid" == "$leader" &&
+   -n "$record_ident" ]] || fail "T16: malformed session ownership record"
+sentinel="$(head -n 1 "$jobdir/completion-sentinel.pid")"
+child="$(cat "$jobdir/sentinel-child.pid")"
+track "$sentinel"; track "$child"
+started="$(_tw_pidfile_fields "$jobdir/completion-sentinel.pid")"
+IFS=$'\t' read -r started_pid started_epoch <<<"$started"
+[[ "$started_epoch" == 1000 ]] ||
+  fail "T16: fixture did not preserve fake started=1000 ($started)"
+sentinel_args="$(ps -p "$sentinel" -o args= 2>/dev/null)" ||
+  fail "T16: sentinel argv unavailable"
+_tw_sentinel_args_ok "$sentinel_args" "job-t16" "$jobdir" ||
+  fail "T16: sentinel argv shape was not recognized"
+if _tw_pidfile_verify "$jobdir/completion-sentinel.pid" "$sentinel" "$sentinel_args"; then
+  fail "T16: stale fake-clock pidfile unexpectedly verified"
+fi
+dead "$leader" || fail "T16: own-session wrapper leader still alive"
+tmp_writers_stop || fail "T16: sweep failed (${TW_LEFTOVER_PIDS:-})"
+[[ -z "${TW_LEFTOVER_PIDS:-}" ]] ||
+  fail "T16: leftovers after session-ledger reap:${TW_LEFTOVER_PIDS}"
+dead "$sentinel" || fail "T16: fake-clock sentinel survived group reap"
+dead "$child" || fail "T16: fake-clock sentinel child survived group reap"
+untrack "$leader"; untrack "$sentinel"; untrack "$child"
+grep -qF 'builder_grok_out="$(TEST_OWN_SESSION=1 ' "$ROOT/tests/test-wrk.sh" ||
+  fail "T16: builder-grok fake-clock call lacks session opt-in"
+grep -qF 'builder_kimi_out="$(TEST_OWN_SESSION=1 ' "$ROOT/tests/test-wrk.sh" ||
+  fail "T16: builder-kimi fake-clock call lacks session opt-in"
+grep -qF 'builder_luna_out="$(TEST_OWN_SESSION=1 ' "$ROOT/tests/test-wrk.sh" ||
+  fail "T16: builder-luna fake-clock call lacks session opt-in"
+pass "T16 fake-clock sentinel reaped by self-recorded own session"
+
 echo "PASS test-tmp-writers"

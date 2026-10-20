@@ -174,6 +174,11 @@ PY
 spawn_base() {
   local model="$1"; shift
   local extra=("$@")
+  # The fake clock records started=1000, which correctly fails the real
+  # process-start check. In the opt-in cases, the self-recorded session
+  # keeps the orphan sentinel owned independently of that pidfile.
+  local -a own_session=()
+  [[ "${TEST_OWN_SESSION:-0}" == 1 ]] && own_session=(tw_own_session)
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
   # #768: every spawn binds an hk task. Mint a fresh fixture task per spawn so
   # owner-mode claims stay claimable; a case that supplies --task/--parent-job
@@ -201,7 +206,7 @@ spawn_base() {
   # once in three runs, between a case's `rm -f "$TMP/herdr.log"` and its
   # `[[ ! -e "$TMP/herdr.log" ]]`, and the suite dies there with no message.
   # Park the probes past the end of the run instead.
-  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  "${own_session[@]+"${own_session[@]}"}" env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_COMPLETION_INTERVAL_S="${WRK_COMPLETION_INTERVAL_S:-3600}" \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
@@ -10090,7 +10095,7 @@ echo "PASS devin-swe2 effort spellings admitted under --role builder (#635)"
 
 : >"$TMP/herdr.log" "$TMP/scopefuel.log"
 set +e
-builder_grok_out="$(PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 spawn_base builder-grok --role builder --lane builder-grok-lane --parent parent-lane --job builder-grok-job --t T1 2>&1)"
+builder_grok_out="$(TEST_OWN_SESSION=1 PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 spawn_base builder-grok --role builder --lane builder-grok-lane --parent parent-lane --job builder-grok-job --t T1 2>&1)"
 builder_grok_rc=$?
 set -e
 [[ "$builder_grok_rc" -eq 0 ]] ||
@@ -10118,7 +10123,7 @@ echo "PASS builder-grok pilot profile reuses grok kind/argv at xhigh"
 
 : >"$TMP/herdr.log" "$TMP/scopefuel.log"
 set +e
-builder_kimi_out="$(KIMI_CODE_HOME="$TMP/kimi-builder-home" PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 spawn_base builder-kimi --role builder --lane builder-kimi-lane --parent parent-lane --job builder-kimi-job --t T1 2>&1)"
+builder_kimi_out="$(TEST_OWN_SESSION=1 KIMI_CODE_HOME="$TMP/kimi-builder-home" PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 spawn_base builder-kimi --role builder --lane builder-kimi-lane --parent parent-lane --job builder-kimi-job --t T1 2>&1)"
 builder_kimi_rc=$?
 set -e
 [[ "$builder_kimi_rc" -eq 0 ]] ||
@@ -10146,7 +10151,7 @@ echo "PASS builder-kimi pilot profile reuses kimi-k3 kind/argv"
 # spelling like every other luna variant.
 : >"$TMP/herdr.log" "$TMP/scopefuel.log"
 set +e
-builder_luna_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --job builder-luna-job --t T1 2>&1)"
+builder_luna_out="$(TEST_OWN_SESSION=1 WRK_LAUNCH_LOG="$TMP/launch.log" PATH="$TMP/jumpclock:$PATH" FAKECLOCK_AFTER=never FAKECLOCK_JUMP=0 spawn_base builder-luna --role builder --lane builder-luna-lane --parent parent-lane --job builder-luna-job --t T1 2>&1)"
 builder_luna_rc=$?
 set -e
 [[ "$builder_luna_rc" -eq 0 ]] ||
