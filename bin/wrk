@@ -76,6 +76,7 @@ ALL_PROFILES=(
   builder-devin-medium builder-devin-max
   devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
   devin-fusion-opus55 devin-fusion-sonnet55
+  devin-fusion-sol61 devin-fusion-sol61-xhigh
   devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
@@ -238,8 +239,10 @@ Options:
                      --effort max (2026-09-29 operator report, experiment E2).
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
-                     builder refuses them pending hk 1382. The devin Argon
-                     trial spellings devin-argon, devin-argon-medium and
+                     builder refuses them pending hk 1382. Fusion-Sol
+                     spellings devin-fusion-sol61 and devin-fusion-sol61-xhigh
+                     are worker/tester-only until hk 1729 reps are reviewed.
+                     The devin Argon trial spellings devin-argon, devin-argon-medium and
                      devin-argon-low are likewise worker/tester-only (hk 1620
                      phase 1) — --role builder refuses all three.
                      All codex-terra, codex-terra-max, codex-med and
@@ -3733,6 +3736,10 @@ resolve_profile() {
     # decided after hk 1382). No Fable or Astra fusion.
     devin-fusion-opus55) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model fusion-claude-opus-5-5-high-sidekick-swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
     devin-fusion-sonnet55) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
+    # hk 1729: Fusion-Sol uses the Devin launcher but bills against codex.
+    # Its pane label does not show lead effort; catalog and job records do.
+    devin-fusion-sol61) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model fusion-gpt-6-1-sol-high-sidekick-swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
+    devin-fusion-sol61-xhigh) PROFILE_KIND=devin; EFFORT_SUPPORTED=0; ARGS=(--model fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium --permission-mode dangerous --respect-workspace-trust false) ;;
     # hk 1620 (operator decision 2026-10-18 devin-argon-trial, phase 1, approved
     # by operator-desk r1018b953go): the Gemini 4 Argon trial spellings —
     # identical unattended argv, only the --model name differs; the rung is
@@ -3959,6 +3966,9 @@ resolve_profile() {
     # The quota pool is still scopefuel's single `devin` pool — wrk owns no
     # pool mapping, the gate answer names the pool.
     devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;
+    # hk 1729: Fusion-Sol profiles also gate at their exact catalog rows;
+    # scopefuel supplies the codex pool recorded by arbiter.
+    devin-fusion-sol61|devin-fusion-sol61-xhigh) GATE_PROFILE="$MODEL" ;;
     # hk 1620: the Argon trial spellings gate at their OWN gate_policy.json
     # entries, never at devin-swe2 (hk 1604 rule — each devin spelling gates
     # as itself). Their family is google (Gemini), and folding them into a
@@ -6324,7 +6334,8 @@ PY
     esac
     # One bounded, read-only transcript observation is allowed for Devin-kind
     # panes. The helper validates and records the actual Devin rung; admission
-    # denial remains limited to the six free SWE-2 profiles in scopefuel.
+    # denial covers only scopefuel's hold members (the six free SWE-2 profiles
+    # and, since hk 1729 r2, the two Fusion-Sol profiles).
     if [[ "$pane_kind" == devin && -n "$observed_rung" && "$class" == ok ]]; then
       local recent observer_result
       if recent="$("$HERDR" agent read "$pane" --source recent-unwrapped --lines 200 2>/dev/null)"; then
@@ -9443,6 +9454,8 @@ spawn_cmd() {
       codex-astra|fable) ;; # Paired round-extension flags verified before catalog.
       devin-fusion-opus55|devin-fusion-sonnet55)
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
+      devin-fusion-sol61|devin-fusion-sol61-xhigh)
+        die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
         die "--role builder rejects '$MODEL': the devin Argon trial spellings are worker/tester-only — phase 1 is spawn plumbing, no builder seat (hk 1620, operator decision 2026-10-18)" ;;
       builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;

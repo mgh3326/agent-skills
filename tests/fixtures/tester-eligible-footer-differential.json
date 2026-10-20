@@ -1,0 +1,804 @@
+{
+ "comment": "hk 1729 r2 B1: base-versus-head differential for _pane_model_matches on existing models. base_match was recorded from director/bin/tester-eligible at agent-skills main 9d27f060d77e48a3d0c081f50541918882e79d53 (before the Fusion-Sol change); every case must keep that answer.",
+ "base_commit": "9d27f060d77e48a3d0c081f50541918882e79d53",
+ "cases": [
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\n? for shortcuts",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nDevin update available",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nOpus is thinking about it",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nGPT-5 note without separator",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nFusion mode enabled",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nGrok said hello\nKimi said hi",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "xhigh",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\n? for shortcuts",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nDevin update available",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nOpus is thinking about it",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nGPT-5 note without separator",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nFusion mode enabled",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh) · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\n? for shortcuts",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nDevin update available",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nOpus is thinking about it",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nGPT-5 note without separator",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nFusion mode enabled",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol xhigh · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\n? for shortcuts",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nDevin update available",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nOpus is thinking about it",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nGPT-5 note without separator",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nFusion mode enabled",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGPT-6.1-Sol (xhigh)·~/work\nGrok said hello\nKimi said hi",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\n? for shortcuts",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nDevin update available",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nOpus is thinking about it",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nGPT-5 note without separator",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nFusion mode enabled",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6.1-sol",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\n│ GPT-6.1-Sol (xhigh) · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": false
+  },
+  {
+   "model": "gpt-6-sol",
+   "effort": "max",
+   "snapshot": "previous output line\nanother line\nGPT-6-Sol (max) · ~/work",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6-sol",
+   "effort": "max",
+   "snapshot": "previous output line\nanother line\nGPT-6-Sol (max) · ~/work\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6-sol",
+   "effort": "max",
+   "snapshot": "previous output line\nanother line\nGPT-6-Sol (max) · ~/work\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6-sol",
+   "effort": "max",
+   "snapshot": "previous output line\nanother line\nGPT-6-Sol (max) · ~/work\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6-sol",
+   "effort": "max",
+   "snapshot": "previous output line\nanother line\nGPT-6-Sol (max) · ~/work\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6-sol",
+   "effort": "max",
+   "snapshot": "previous output line\nanother line\nGPT-6-Sol (max) · ~/work\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "gpt-6-sol",
+   "effort": "max",
+   "snapshot": "previous output line\nanother line\nGPT-6-Sol (max) · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high) · ~/work",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high) · ~/work\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high) · ~/work\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high) · ~/work\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high) · ~/work\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high) · ~/work\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high) · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 high · ~/work",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 high · ~/work\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 high · ~/work\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 high · ~/work\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 high · ~/work\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 high · ~/work\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 high · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high)·x",
+   "base_match": false
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high)·x\n? for shortcuts",
+   "base_match": false
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high)·x\nDevin update available",
+   "base_match": false
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high)·x\nOpus is thinking about it",
+   "base_match": false
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high)·x\nGPT-5 note without separator",
+   "base_match": false
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high)·x\nFusion mode enabled",
+   "base_match": false
+  },
+  {
+   "model": "claude-opus-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nOpus 5.5 (high)·x\nGrok said hello\nKimi said hi",
+   "base_match": false
+  },
+  {
+   "model": "claude-sonnet-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nSonnet 5.5 (high) · ~/work",
+   "base_match": false
+  },
+  {
+   "model": "claude-sonnet-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nSonnet 5.5 (high) · ~/work\n? for shortcuts",
+   "base_match": false
+  },
+  {
+   "model": "claude-sonnet-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nSonnet 5.5 (high) · ~/work\nDevin update available",
+   "base_match": false
+  },
+  {
+   "model": "claude-sonnet-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nSonnet 5.5 (high) · ~/work\nOpus is thinking about it",
+   "base_match": false
+  },
+  {
+   "model": "claude-sonnet-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nSonnet 5.5 (high) · ~/work\nGPT-5 note without separator",
+   "base_match": false
+  },
+  {
+   "model": "claude-sonnet-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nSonnet 5.5 (high) · ~/work\nFusion mode enabled",
+   "base_match": false
+  },
+  {
+   "model": "claude-sonnet-5-5",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nSonnet 5.5 (high) · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": false
+  },
+  {
+   "model": "grok-4.7",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGrok 4.7 (high) · ~/work",
+   "base_match": true
+  },
+  {
+   "model": "grok-4.7",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGrok 4.7 (high) · ~/work\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "grok-4.7",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGrok 4.7 (high) · ~/work\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "grok-4.7",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGrok 4.7 (high) · ~/work\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "grok-4.7",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGrok 4.7 (high) · ~/work\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "grok-4.7",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGrok 4.7 (high) · ~/work\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "grok-4.7",
+   "effort": "high",
+   "snapshot": "previous output line\nanother line\nGrok 4.7 (high) · ~/work\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\ndeepseek-v4-1-flash-high · always",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\ndeepseek-v4-1-flash-high · always\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\ndeepseek-v4-1-flash-high · always\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\ndeepseek-v4-1-flash-high · always\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\ndeepseek-v4-1-flash-high · always\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\ndeepseek-v4-1-flash-high · always\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\ndeepseek-v4-1-flash-high · always\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nDeepseek-v4-1-flash-high · always",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nDeepseek-v4-1-flash-high · always\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nDeepseek-v4-1-flash-high · always\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nDeepseek-v4-1-flash-high · always\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nDeepseek-v4-1-flash-high · always\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nDeepseek-v4-1-flash-high · always\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "deepseek-v4-1-flash-high",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nDeepseek-v4-1-flash-high · always\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "swe-2",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nswe-2 · always",
+   "base_match": false
+  },
+  {
+   "model": "swe-2",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nswe-2 · always\n? for shortcuts",
+   "base_match": false
+  },
+  {
+   "model": "swe-2",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nswe-2 · always\nDevin update available",
+   "base_match": false
+  },
+  {
+   "model": "swe-2",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nswe-2 · always\nOpus is thinking about it",
+   "base_match": false
+  },
+  {
+   "model": "swe-2",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nswe-2 · always\nGPT-5 note without separator",
+   "base_match": false
+  },
+  {
+   "model": "swe-2",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nswe-2 · always\nFusion mode enabled",
+   "base_match": false
+  },
+  {
+   "model": "swe-2",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nswe-2 · always\nGrok said hello\nKimi said hi",
+   "base_match": false
+  },
+  {
+   "model": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Opus 5.5 ◆ SWE-2 Medium",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Opus 5.5 ◆ SWE-2 Medium\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Opus 5.5 ◆ SWE-2 Medium\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Opus 5.5 ◆ SWE-2 Medium\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Opus 5.5 ◆ SWE-2 Medium\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Opus 5.5 ◆ SWE-2 Medium\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-opus-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Opus 5.5 ◆ SWE-2 Medium\nGrok said hello\nKimi said hi",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Sonnet 5.5 ◆ SWE-2 Medium",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Sonnet 5.5 ◆ SWE-2 Medium\n? for shortcuts",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Sonnet 5.5 ◆ SWE-2 Medium\nDevin update available",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Sonnet 5.5 ◆ SWE-2 Medium\nOpus is thinking about it",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Sonnet 5.5 ◆ SWE-2 Medium\nGPT-5 note without separator",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Sonnet 5.5 ◆ SWE-2 Medium\nFusion mode enabled",
+   "base_match": true
+  },
+  {
+   "model": "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium",
+   "effort": "",
+   "snapshot": "previous output line\nanother line\nFusion · Claude Sonnet 5.5 ◆ SWE-2 Medium\nGrok said hello\nKimi said hi",
+   "base_match": true
+  }
+ ]
+}

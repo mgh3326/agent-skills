@@ -155,13 +155,13 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "df5279e523fbbb39ec54c0d8dbcf8fe27ac60d5d85d9b6b48d985736fbfcd43f",
-    "bin/wrk": "3c06d7a5ea2c6ad0a9a9ddd8275977cd8b26a47941e1a2bd0ca3f7a4d2c75015",
-    "bin/wrk_free_limit_observer.py": "c305e6689f7c5f388922a974307ae61715b7af9bca8e1067480fa5fe7737a543",
+    ".github/workflows/ci.yml": "32191d9e8f996c87a49960b4eb334ad068853b6ba6bed625e9bf5345310fce61",
+    "bin/wrk": "527bb5bca641cdd2bc87a16b291d4f22692bcdf5e6ff37efb2f62044dbcb5fde",
+    "bin/wrk_free_limit_observer.py": "e2528721f311aec13e1dc5ae7689d213293e9ca2c4068ad02771531b0ed3d9df",
     "builder/SKILL.md": "91cdb4c1d22177fc219db5b876ecc52b852122bc37128a0180def3668c8c38e8",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
     "director/SKILL.md": "c6b95f71c691d7711aeb9ee55f5e804f889319e99a21987a813eec148135ba42",
-    "director/bin/tester-eligible": "765616fddc16b5306cd777af1ecc2b1881c8a9a7a17c5139c0f7d38343aa0e0b",
+    "director/bin/tester-eligible": "ab27e81b2f1c9d12c5be4e5681b94c9c1a0b6699971b0ca8d9c7168a66a9f231",
     "spawn-worker/SKILL.md": "3e01a09573fd57b2697b8ddb81381e42512401cfb26acc3e3c6ed885d0b2e0e9"
   },
   "profiles": {
@@ -1148,6 +1148,44 @@
       "surfaces": [
         "T1",
         "T2"
+      ]
+    },
+    "devin-fusion-sol61": {
+      "default_effort": "",
+      "family": "openai",
+      "grades": {
+        "": "ungraded"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+      "model": "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
+      ]
+    },
+    "devin-fusion-sol61-xhigh": {
+      "default_effort": "",
+      "family": "openai",
+      "grades": {
+        "": "ungraded"
+      },
+      "launcher": "devin",
+      "launcher_model_token": "--model fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium",
+      "model": "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2",
+        "T3"
       ]
     },
     "devin-fusion-sonnet55": {

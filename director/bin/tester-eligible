@@ -290,6 +290,41 @@ def _read_pane(pane: str) -> str | None:
     return proc.stdout if proc.returncode == 0 else None
 
 
+def _label_tokens(value: str) -> list[str]:
+    """Fold pane typography and separators into comparable word tokens."""
+    return re.findall(r"[a-z0-9]+", value.casefold())
+
+
+def _latest_model_footer(snapshot: str) -> str | None:
+    """Return the newest last-five line that starts like a model footer.
+
+    Fusion-GPT labels vary in spacing and separators, so this keeps the shared
+    footer prefix list without the generic path's " · " requirement. Only the
+    newest such line counts: an older Fusion-Sol label followed by another
+    model footer is stale (hk 1729 r2).
+    """
+    footer_lines = [line for line in snapshot.splitlines()[-5:]
+                    if re.match(
+                        r"^\s*[│┃╭╰─\s]*(?:Grok|GPT-|Opus|Sonnet|Haiku|Fable|Kimi|Devin|Deepseek|Fusion)",
+                        line, re.IGNORECASE)]
+    return footer_lines[-1] if footer_lines else None
+
+
+def _fusion_sol_profile(snapshot: str, policy: dict, *, spawn_profile: str = "",
+                        quota_profile: str = "") -> dict | None:
+    """Resolve the shared Fusion-Sol pane label using this job's own records."""
+    expected = ["fusion", "gpt", "6", "1", "sol", "swe", "2", "medium"]
+    latest = _latest_model_footer(snapshot)
+    if latest is None or _label_tokens(latest)[:len(expected)] != expected:
+        return None
+    xhigh = "devin-fusion-sol61-xhigh"
+    profile = xhigh if xhigh in {spawn_profile, quota_profile} else "devin-fusion-sol61"
+    spec = policy.get("profiles", {}).get(profile)
+    if not isinstance(spec, dict) or spec.get("family") != "openai":
+        return None
+    return {"profile": profile, "family": spec["family"], "model": spec.get("model")}
+
+
 def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
     display = {
         "grok-4.7": "Grok 4.7", "gpt-6.1-sol": "GPT-6.1-Sol", "gpt-6-sol": "GPT-6-Sol",
@@ -305,7 +340,15 @@ def _pane_model_matches(snapshot: str, model: str, effort: str) -> bool:
             "Fusion · Claude Opus 5.5 ◆ SWE-2 Medium",
         "fusion-claude-sonnet-5-5-high-sidekick-swe-2-medium":
             "Fusion · Claude Sonnet 5.5 ◆ SWE-2 Medium",
+        "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium":
+            "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium",
+        "fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium":
+            "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium",
     }.get(model, model)
+    if display.startswith("Fusion · GPT-"):
+        expected = _label_tokens(display)
+        latest = _latest_model_footer(snapshot)
+        return latest is not None and _label_tokens(latest)[:len(expected)] == expected
     if display.startswith("Fusion · "):
         suffix = r"(?:\s|$)"
     else:
@@ -360,7 +403,9 @@ def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | Non
         resolved_launch, launch_check = resolve_profile(
             launch_prefix, policy, actual_model=tester_profile["model"],
             actual_effort=observed_effort, role="tester", round_ext_ref=evidence.get("round_ext_ref"))
-        if launch_check["status"] != "PASS" or resolved_launch is None:
+        exact_ungraded = (launch_check["reason_code"] == "PROFILE_GRADE_UNKNOWN" and
+                          resolved_launch is not None and resolved_launch.get("grade") == "ungraded")
+        if (launch_check["status"] != "PASS" and not exact_ungraded) or resolved_launch is None:
             return result("UNVERIFIED", "ACTUAL_LAUNCH_PROFILE_UNVERIFIED", "bin/wrk+policy:profiles")
         if resolved_launch["grade"] != tester_profile["grade"]:
             return result("UNVERIFIED", "ACTUAL_LAUNCH_PROFILE_CHANGED", "bin/wrk+policy:profiles")
@@ -377,6 +422,13 @@ def _actual_observation(evidence: dict, policy: dict, tester_profile: dict | Non
             return result("UNVERIFIED", "PANE_UNREADABLE", "decision:3231")
         if not _pane_model_matches(snapshot, tester["actual_model"], tester["actual_effort"]):
             return result("UNVERIFIED", "PANE_MODEL_UNVERIFIED", "decision:3231")
+        fusion = _fusion_sol_profile(snapshot, policy,
+            spawn_profile=str(spawned["payload"].get("profile", "")),
+            quota_profile=launch_prefix)
+        if fusion and (fusion["profile"] != tester.get("actual_profile") or
+                       fusion["model"] != tester.get("actual_model") or
+                       fusion["family"] != tester_profile.get("family")):
+            return result("UNVERIFIED", "PANE_PROFILE_UNVERIFIED", "bin/wrk+quota_pool.record")
         return result("PASS", "ACTUAL_PROFILE_OBSERVED", "bin/wrk+pane",
                       job_record_dir=str(record_dir), pane=pane, model_observation_path=str(path),
                       model_observation_sha256=observation_sha,

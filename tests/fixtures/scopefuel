@@ -12,6 +12,8 @@ pool_for() {
     # hk 1380: the fusion spellings gate at their own catalog rows but stay in
     # scopefuel's single `devin` quota pool.
     devin-fusion-opus55|devin-fusion-sonnet55) echo devin ;;
+    # hk 1729: Fusion-Sol is a Devin launcher profile billed to codex.
+    devin-fusion-sol61|devin-fusion-sol61-xhigh) echo codex ;;
     # hk 1620: the Argon trial spellings gate at their own catalog rows but
     # stay in scopefuel's single `devin` quota pool.
     devin-argon|devin-argon-medium|devin-argon-low) echo devin ;;
@@ -35,6 +37,8 @@ pool_for() {
 # WRK_LAUNCH_MODE: ok | stale | unsupported | broken | refused
 catalog_model_for() {
   case "$1" in
+    devin-fusion-sol61) echo fusion-gpt-6-1-sol-high-sidekick-swe-2-medium ;;
+    devin-fusion-sol61-xhigh) echo fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium ;;
     opus) echo claude-opus-5-5 ;;
     sonnet|haiku) echo "" ;;
     fable) echo claude-fable-5-1 ;;
