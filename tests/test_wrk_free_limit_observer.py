@@ -165,6 +165,34 @@ class FreeLimitObserverTests(unittest.TestCase):
             self.assertEqual(parsed["families"], ["anthropic", "cognition"])
             self.assertEqual(parsed["pools"], ["devin"])
 
+    def test_system_python_without_tomllib_keeps_observer_and_account_tag(self):
+        config = Path(self.dirs["XDG_CONFIG_HOME"]) / "scopefuel/config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text('[pools.codex]\nfusion_billing_fp = "0123456789abcdef" # billing\n[pools.devin]\n')
+        # Reproduce the macOS PATH-selected interpreter without tomllib, both
+        # importing the actual helper and executing the CLI (not just the tag).
+        blocker = self.root / "no-tomllib"
+        blocker.mkdir()
+        (blocker / "sitecustomize.py").write_text("import sys\nsys.modules['tomllib'] = None\n")
+        proc = subprocess.run([sys.executable, str(ROOT / "bin/wrk_free_limit_observer.py"),
+            "--pane-kind", "devin", "--rung", "devin-swe2", "--job", "old-python",
+            "--state", str(self.root / "old-python/free-limit-observer.json"),
+            "--scopefuel", str(self.scopefuel), "--observed", "2026-10-20T07:00:00Z"],
+            input=provider_notice("Reached free model rate limit reset in 1 minute") +
+                  "Fusion · GPT-6.1 Sol ◆ GPT-6 Luna High\n",
+            text=True, capture_output=True, timeout=10,
+            env=self.call_env(PYTHONPATH=str(blocker)), check=False)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("observer-ok-reset", proc.stdout)
+        observations = [observer.payload(doc) for doc in observer.job_events(self.root / "old-python")
+                        if doc["kind"] == "job.model_observed"]
+        self.assertEqual([part["account_tag"] for part in observations[0]["parts"]], ["01234567"] * 2)
+        with mock.patch.dict(sys.modules, {"tomllib": None}), mock.patch.dict(os.environ, self.dirs, clear=True):
+            config.write_text('[pools.other]\nfusion_billing_fp="0123456789abcdef"\n[pools.codex]\n')
+            self.assertIsNone(observer.billing_account_tag())
+            config.write_text('[pools.codex]\nfusion_billing_fp="0123456789abcdef"\nfusion_billing_fp="fedcba9876543210"\n')
+            self.assertIsNone(observer.billing_account_tag())
+
     def test_model_change_records_parts_pool_drift_account_and_no_repeat(self):
         jobdir = self.root / "drift-job"
         observer.atomic_json(jobdir / "events/00001-quota_pool.record.json",

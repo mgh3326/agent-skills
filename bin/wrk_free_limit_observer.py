@@ -15,7 +15,6 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-import tomllib
 
 from wrk_pane_models import expected_label, latest_model_line, model_tokens, parse_model_line
 
@@ -355,8 +354,24 @@ def billing_account_tag() -> str | None:
     # configuration or fall back to the host's codex account/snapshot.
     config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "scopefuel/config.toml"
     try:
-        with config.open("rb") as handle:
-            fp = tomllib.load(handle).get("pools", {}).get("codex", {}).get("fusion_billing_fp")
+        text = config.read_text(encoding="utf-8")
+        try:
+            import tomllib
+        except ImportError:
+            # macOS's system python3 can precede 3.11. Accept only the exact
+            # section/key spelling emitted by scopefuel's policy writer there;
+            # a missing, duplicate or noncanonical declaration stays untagged.
+            sections = list(re.finditer(r"(?m)^\s*\[pools\.codex\][ \t]*(?:#[^\n]*)?$", text))
+            if len(sections) != 1:
+                return None
+            body = re.split(r"(?m)^\s*\[", text[sections[0].end():], maxsplit=1)[0]
+            declarations = re.findall(r"(?m)^[ \t]*fusion_billing_fp[ \t]*=[ \t]*(.*)$", body)
+            if len(declarations) != 1:
+                return None
+            match = re.fullmatch(r"([\"'])([0-9a-f]{16})\1[ \t]*(?:#[^\n]*)?", declarations[0])
+            fp = match.group(2) if match else None
+        else:
+            fp = tomllib.loads(text).get("pools", {}).get("codex", {}).get("fusion_billing_fp")
         return fp[:8] if isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{16}", fp) else None
     except (OSError, ValueError, AttributeError):
         return None
