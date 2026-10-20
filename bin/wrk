@@ -9222,17 +9222,16 @@ print("\t".join([d.get("state") or "", d.get("claimed_by") or "",
 # check runs before admission side effects and is repeated immediately before
 # handoffkeep rebinds the task.
 takeover_old_job_check() {
-  local old="$1" events scan ended terminal
+  local old="$1" events scan ended
   events="$(wrk_jobs_root)/$old/events"
   [[ -d "$events" ]] || die "takeover refused: old job '$old' has no event history"
   scan="$(job_events_scan "$events")" || die "takeover refused: cannot inspect old job '$old'"
-  IFS=$'\t' read -r _ ended _ terminal _ _ _ _ _ _ _ <<<"$scan"
+  IFS=$'\t' read -r _ ended _ _ <<<"$scan"
   [[ "$ended" == 1 ]] ||
     die "takeover refused: old job '$old' is still live; no work-terminal follows its newest revive"
   TAKEOVER_ROUNDS_USED="$(round_scan "$old" | sed -n 's/.*rounds=\([0-9][0-9]*\).*/\1/p')"
   [[ "$TAKEOVER_ROUNDS_USED" =~ ^[0-9]+$ ]] ||
     die "takeover refused: cannot read old job '$old' round count"
-  TAKEOVER_OLD_TERMINAL="$terminal"
 }
 
 # Read-only task check. The sole non-OLD row accepted is the same-NEW/same-
@@ -9310,14 +9309,14 @@ print("ok")
 ' "$LABEL" "$JOB_ID" 2>&1)" || die "takeover refused: invalid task rebind response: $verify"
   [[ "$verify" == ok ]] || die "takeover refused: invalid task rebind response: $verify"
   takeover_event_pair_commit
-  TAKEOVER_REBOUND=1
 }
 
 # Commit both local audit records under their event locks. A rebind that the
 # server refuses reaches neither call nor event directory.
 takeover_event_pair_commit() {
-  local old_events="$(wrk_jobs_root)/$TAKEOVER_FROM/events"
-  local new_events="$(wrk_jobs_root)/$JOB_ID/events"
+  local old_events new_events
+  old_events="$(wrk_jobs_root)/$TAKEOVER_FROM/events"
+  new_events="$(wrk_jobs_root)/$JOB_ID/events"
   wrk_py - "$old_events" "$new_events" "$TAKEOVER_FROM" "$JOB_ID" \
     "$TASK_ID" "$TAKEOVER_ROUNDS_USED" "$LABEL" "$BUILDER_LANE" "$PARENT_LANE" <<'PY'
 import json, os, sys
@@ -9498,7 +9497,7 @@ refuse_known_terra_spelling() {
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TAKEOVER_REBOUND=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
+  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
   MOCK_MCP_PLAN="" MOCK_MCP_HELPER="" SPAWN_MOCK_MCP_RETAIN=0
