@@ -11505,9 +11505,10 @@ real_done_case() (
   printf 'completion report\n' >"$report"
   "$WRK" 'done' "$job" --report "$report" >/dev/null
   python3 - "$jobs_root/$job/events/00003-job.completed.json" "$job" <<'PY'
-import json, sys
+import json, re, sys
 event = json.load(open(sys.argv[1]))
-assert set(event) == {"kind", "job_id", "owner_lane", "label", "pane_id", "host", "report_path", "report_last_line", "epoch", "report_sha256"}, event
+assert set(event) == {"kind", "job_id", "owner_lane", "label", "pane_id", "host", "report_path", "report_last_line", "epoch", "report_sha256", "at"}, event
+assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", event["at"]), event
 assert event["kind"] == "job.completed" and event["job_id"] == sys.argv[2], event
 assert event["pane_id"] == "test:pane", (
     "pane_id is what panewire routes on; it must be the pane alone, not the rest of the metadata row: %r"
@@ -11604,10 +11605,23 @@ cp "$R20_FIXTURE/00001-job.claim.json" "$R20_FIXTURE/00002-job.spawned.json" \
     WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" joined captain-fixture \
     --pr https://example.invalid/pr/1 --head deadbeef --report report.md >/dev/null
 )
-cmp "$R20_FIXTURE/00003-job.escalate.json" \
-  "$R20_FIXTURE_INBOX/captain-fixture/events/00003-job.escalate.json"
-cmp "$R20_FIXTURE/00004-job.joined.json" \
-  "$R20_FIXTURE_INBOX/captain-fixture/events/00004-job.joined.json"
+# hk 1750 adds one required member: at is appended last as a UTC ISO
+# millisecond timestamp. Strip exactly that member and require the remaining
+# bytes to stay identical to the committed R19a fixture.
+r20_strip_at() {
+  python3 - "$1" "$2" <<'PY'
+import re, sys
+source, target = sys.argv[1:]
+text = open(source, encoding="utf-8").read()
+stripped = re.sub(r',"at":"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z"(?=})', "", text)
+assert stripped != text, text
+open(target, "w", encoding="utf-8").write(stripped)
+PY
+}
+r20_strip_at "$R20_FIXTURE_INBOX/captain-fixture/events/00003-job.escalate.json" "$TMP/r20-escalate-norm.json"
+r20_strip_at "$R20_FIXTURE_INBOX/captain-fixture/events/00004-job.joined.json" "$TMP/r20-joined-norm.json"
+cmp "$R20_FIXTURE/00003-job.escalate.json" "$TMP/r20-escalate-norm.json"
+cmp "$R20_FIXTURE/00004-job.joined.json" "$TMP/r20-joined-norm.json"
 PYTHONPATH="$TMP" python3 - "$R20_FIXTURE_LOG" "$R20_FIXTURE_INBOX/captain-fixture/events" <<'PY'
 import sys
 import r20_emit as helper
@@ -13625,6 +13639,379 @@ printf '0\n' >"$HEAVY_LOAD"
 wait "$waiter_job" || fail "run did not start after the load gate opened"
 [[ -e "$TMP/heavy-load-ran2" ]] || fail "load-gated run never executed"
 echo "PASS heavy-load-gate-bounds-the-start"
+
+# ── hk 1750: job event order must not depend on two writers' numbering ─────
+# The fixture copies the measured b1729-luna layout: arbiter envelopes carry
+# created_at, wrk records carry no time field, and the respawn (00009) sorts
+# before the terminal (00011) by name. mtimes are the measured event times, so
+# a name-ordered reader sees a terminal last and a time-ordered reader does not.
+ORDER_INBOX="$TMP/order-inbox"
+ORDER_LIB="$TMP/order-wrk-lib"
+python3 - "$WRK" "$ORDER_LIB" <<'PY'
+import sys
+text = open(sys.argv[1], encoding="utf-8").read()
+open(sys.argv[2], "w", encoding="utf-8").write(text.rsplit('case "${1:-}" in', 1)[0])
+PY
+
+order_fixture() {
+  # NAME [--no-respawn] — write the b1729-luna event layout under ORDER_INBOX.
+  local name="$1" variant="${2:-}"
+  local dir="$ORDER_INBOX/$name/events"
+  mkdir -p "$dir"
+  python3 - "$dir" "$name" "$variant" <<'PY'
+import datetime, json, os, sys
+directory, job, variant = sys.argv[1:]
+# The fixture herdr derives a pane's tab as w1:t<rest>; the no-respawn variant
+# must reach the pane probe as a closable single-pane tab, so it uses w1:p1.
+pane, tab = ("w1:p1", "w1:t1") if variant == "--no-respawn" else ("w1:pJK", "w1:t1")
+rows = [
+    ("00001-job.claim", "job.claim", "2026-10-20T11:34:00+09:00", None,
+     {"owner_lane": "w1", "label": "luna", "pane_id": pane, "task_id": 1729}),
+    ("00004-job.spawned", "job.spawned", "2026-10-20T11:34:30+09:00", None,
+     {"owner_lane": "w1", "label": "luna", "pane_id": pane, "tab_id": tab}),
+    ("00005-job.escalate", "job.escalate", None, "2026-10-20T13:15:00+09:00",
+     {"owner_lane": "w1", "label": "luna"}),
+    ("00009-job.escalate", "job.escalate", None, "2026-10-20T15:58:00+09:00",
+     {"owner_lane": "w1", "label": "luna"}),
+    ("00010-job.verdict", "job.verdict", None, "2026-10-20T16:26:14+09:00",
+     {"owner_lane": "w1", "label": "luna", "verdict": "PASS", "head": "a" * 40}),
+    ("00011-job.completed", "job.completed", None, "2026-10-20T16:26:27+09:00",
+     {"owner_lane": "w1", "label": "luna", "pane_id": pane}),
+    ("00005-quota_pool.release", "quota_pool.release", "2026-10-20T16:26:27+09:00", None,
+     {"owner_lane": "w1"}),
+]
+if variant != "--no-respawn":
+    rows += [
+        ("00006-job.reclaim", "job.reclaim", "2026-10-20T16:29:44+09:00", None,
+         {"owner_lane": "w1", "label": "luna", "pane_id": "w1:pJS", "task_id": 1729}),
+        ("00007-quota_pool.record", "quota_pool.record", "2026-10-20T16:29:45+09:00", None,
+         {"owner_lane": "w1"}),
+        ("00008-job.task_link", "job.task_link", "2026-10-20T16:30:08+09:00", None,
+         {"owner_lane": "w1"}),
+        ("00009-job.spawned", "job.spawned", "2026-10-20T16:30:08+09:00", None,
+         {"owner_lane": "w1", "label": "luna", "pane_id": "w1:pJS", "tab_id": "w1:t9"}),
+    ]
+for name, kind, created, mtime, payload in rows:
+    doc = {"kind": kind, "job_id": job, "payload": payload, "epoch": 1}
+    if created:
+        doc["created_at"] = created
+    path = os.path.join(directory, name + ".json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle)
+    when = datetime.datetime.fromisoformat(created or mtime).timestamp()
+    os.utime(path, (when, when))
+PY
+}
+
+order_scan() {
+  # NAME — job_events_scan through the sourced wrk library.
+  # shellcheck disable=SC2016 # $1..$3 are the child shell's argv
+  env ARBITER_INBOX_ROOT="$ORDER_INBOX" \
+    bash -c 'set -euo pipefail; . "$1"; job_events_scan "$2/$3/events"' _ \
+    "$ORDER_LIB" "$ORDER_INBOX" "$1"
+}
+
+order_reap() {
+  # OUT — dry-run reap over ORDER_INBOX with the fixture herdr.
+  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$ORDER_INBOX" WRK_FIXTURE_SCENARIO=reap \
+    "$WRK" reap --lane w1 --grace 0 >"$1" 2>"$1.err"
+}
+
+order_fixture b1729-luna
+order_reap "$TMP/order-reap.out" ||
+  fail "reap over the b1729 fixture failed: $(cat "$TMP/order-reap.out.err")"
+grep -qx 'skip job=b1729-luna reason=reclaimed-after-terminal' "$TMP/order-reap.out" ||
+  fail "b1729-luna must be skipped as reclaimed-after-terminal: $(cat "$TMP/order-reap.out")"
+if grep -q '^would-close job=b1729-luna ' "$TMP/order-reap.out"; then
+  fail "a job respawned after its terminal is never a reap candidate"
+fi
+scan="$(order_scan b1729-luna)"
+[[ "$(cut -f2 <<<"$scan")" == 0 ]] ||
+  fail "job_events_scan must report ended 0 for b1729-luna: $scan"
+[[ "$(cut -f4 <<<"$scan")" == "-" ]] ||
+  fail "job_events_scan must report no terminal kind for b1729-luna: $scan"
+[[ "$(cut -f10 <<<"$scan")" == "w1:pJS" ]] ||
+  fail "job_events_scan must take the newest spawned pane: $scan"
+echo "PASS hk1750-reap-skips-reclaimed-after-terminal"
+
+order_fixture b1729-nospawn --no-respawn
+order_reap "$TMP/order-reap2.out" ||
+  fail "reap over the no-respawn fixture failed: $(cat "$TMP/order-reap2.out.err")"
+grep -q '^would-close job=b1729-nospawn ' "$TMP/order-reap2.out" ||
+  fail "without the respawn the completed job stays a candidate: $(cat "$TMP/order-reap2.out")"
+scan="$(order_scan b1729-nospawn)"
+[[ "$(cut -f2 <<<"$scan")" == 1 ]] ||
+  fail "job_events_scan must report ended 1 without the respawn: $scan"
+echo "PASS hk1750-completed-without-respawn-stays-a-candidate"
+
+# Two wrk writers of the same kind racing on one directory: both records land
+# and neither overwrites the other (exclusive create + bounded retry).
+CONC_DIR="$ORDER_INBOX/order-conc/events"
+mkdir -p "$CONC_DIR"
+printf 'first report\n' >"$TMP/order-report-a.md"
+printf 'second report\n' >"$TMP/order-report-b.md"
+# shellcheck disable=SC2016 # $1..$3 are the child shell's argv
+env ARBITER_INBOX_ROOT="$ORDER_INBOX" bash -c '
+  set -euo pipefail
+  . "$1"
+  completion_event order-conc w1 lbl w1:p1 "$2" job.completed "" record >/dev/null &
+  completion_event order-conc w1 lbl w1:p1 "$3" job.completed "" record >/dev/null &
+  wait
+' _ "$ORDER_LIB" "$TMP/order-report-a.md" "$TMP/order-report-b.md" ||
+  fail "concurrent completion_event writers failed"
+conc_count="$(find "$CONC_DIR" -name '*-job.completed.json' | wc -l | tr -d ' ')"
+[[ "$conc_count" -eq 2 ]] ||
+  fail "two concurrent writers must both land (got $conc_count)"
+python3 - "$CONC_DIR" <<'PY'
+import glob, json, os, re, sys
+paths = sorted(glob.glob(os.path.join(sys.argv[1], "*-job.completed.json")))
+assert len(paths) == 2, paths
+digests = set()
+for path in paths:
+    doc = json.load(open(path, encoding="utf-8"))
+    assert doc["kind"] == "job.completed", doc
+    assert re.fullmatch(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{3}Z", doc.get("at", "")), doc
+    digests.add(doc["report_sha256"])
+assert len(digests) == 2, digests
+PY
+echo "PASS hk1750-concurrent-writers-both-land"
+
+# A writer that computes a number already taken retries at the next number and
+# never replaces the existing record. The collision is forced (both writers
+# see highest=1) against an existing 00002 sentinel, so an os.replace writer
+# cannot pass by choosing a free name and the sentinel hash must survive.
+COLLIDE_DIR="$ORDER_INBOX/order-collide/events"
+mkdir -p "$COLLIDE_DIR"
+printf '{"kind":"job.completed","job_id":"order-collide","sentinel":1}\n' \
+  >"$COLLIDE_DIR/00001-job.completed.json"
+printf '{"kind":"job.completed","job_id":"order-collide","sentinel":2}\n' \
+  >"$COLLIDE_DIR/00002-job.completed.json"
+collide_before="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$COLLIDE_DIR/00002-job.completed.json")"
+cat >"$TMP/order-collide.py" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+events = sys.argv[1]
+real = wrk_event_highest
+calls = {"n": 0}
+def wrk_event_highest(path):
+    # Each writer's first attempt sees highest=1 (00002 is taken); its retry
+    # sees the real directory again.
+    calls["n"] += 1
+    return 1 if calls["n"] % 2 == 1 else real(path)
+for tag in ("first", "second"):
+    wrk_event_commit(events, "job.completed",
+                     {"kind": "job.completed", "job_id": "order-collide", "tag": tag})
+PY
+# shellcheck disable=SC2016 # $1..$3 are the child shell's argv
+env ARBITER_INBOX_ROOT="$ORDER_INBOX" bash -c '. "$1"; wrk_py "$2" "$3"' _ \
+  "$ORDER_LIB" "$TMP/order-collide.py" "$COLLIDE_DIR" ||
+  fail "collision retry write failed"
+collide_after="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$COLLIDE_DIR/00002-job.completed.json")"
+[[ "$collide_before" == "$collide_after" ]] ||
+  fail "an existing event file was overwritten"
+python3 - "$COLLIDE_DIR" <<'PY'
+import glob, json, os, sys
+tags = {}
+for path in glob.glob(os.path.join(sys.argv[1], "*-job.completed.json")):
+    doc = json.load(open(path, encoding="utf-8"))
+    if "tag" in doc:
+        tags[doc["tag"]] = os.path.basename(path)
+assert sorted(tags) == ["first", "second"], tags
+assert tags["first"] != tags["second"], tags
+PY
+echo "PASS hk1750-existing-event-never-overwritten"
+
+# A wrk terminal at hh:mm:ss.429 followed by an arbiter revive at
+# hh:mm:ss.000+300ms must order terminal-then-revive: event time is compared
+# at whole seconds and the mtime (write time) breaks the sub-second tie.
+SUB_DIR="$ORDER_INBOX/order-subsecond/events"
+mkdir -p "$SUB_DIR"
+python3 - "$SUB_DIR" <<'PY'
+import datetime, json, os, sys
+directory = sys.argv[1]
+rows = [
+    ("00001-job.claim", "job.claim", "2026-10-20T10:00:00+00:00", None, {"owner_lane": "w1", "pane_id": "w1:p1"}),
+    ("00002-job.spawned", "job.spawned", "2026-10-20T10:00:01+00:00", None, {"owner_lane": "w1", "pane_id": "w1:p1", "tab_id": "w1:t1"}),
+    ("00003-job.completed", "job.completed", None, "2026-10-20T10:00:05.429+00:00", {"owner_lane": "w1", "pane_id": "w1:p1"}),
+    ("00004-job.reclaim", "job.reclaim", "2026-10-20T10:00:05+00:00", None, {"owner_lane": "w1", "pane_id": "w1:p1"}),
+]
+for name, kind, created, mtime, payload in rows:
+    doc = {"kind": kind, "job_id": "order-subsecond", "payload": payload, "epoch": 1}
+    if created:
+        doc["created_at"] = created
+    if kind == "job.completed":
+        doc["at"] = "2026-10-20T10:00:05.429Z"
+    path = os.path.join(directory, name + ".json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle)
+    when = datetime.datetime.fromisoformat(created or mtime).timestamp()
+    if kind == "job.reclaim":
+        # Written 300 ms after the terminal at hh:mm:ss.429.
+        when = datetime.datetime.fromisoformat(
+            "2026-10-20T10:00:05.429+00:00").timestamp() + 0.300
+    os.utime(path, (when, when))
+PY
+scan="$(order_scan order-subsecond)"
+[[ "$(cut -f2 <<<"$scan")" == 0 ]] ||
+  fail "a sub-second revive after the terminal must report ended 0: $scan"
+order_reap "$TMP/order-reap-sub.out" ||
+  fail "reap over the sub-second fixture failed: $(cat "$TMP/order-reap-sub.out.err")"
+grep -qx 'skip job=order-subsecond reason=reclaimed-after-terminal' "$TMP/order-reap-sub.out" ||
+  fail "sub-second revive must keep the job out of reap: $(cat "$TMP/order-reap-sub.out")"
+echo "PASS hk1750-subsecond-revive-beats-second-precision-terminal"
+
+# Event time wins over mtime; top-level and payload time fields both count.
+# Ignoring event time, reading only top-level fields, or sorting mtime first
+# changes this order (and the ended verdict below).
+TIME_DIR="$ORDER_INBOX/order-time/events"
+mkdir -p "$TIME_DIR"
+python3 - "$TIME_DIR" <<'PY'
+import datetime, json, os, sys
+directory = sys.argv[1]
+rows = [
+    ("00001-job.completed", "job.completed", "2026-10-20T10:00:05.000Z", "2026-10-20T12:00:00+00:00"),
+    ("00002-job.escalate", "job.escalate", None, "2026-10-20T08:00:00+00:00"),
+    ("00003-job.spawned", "job.spawned", "2026-10-20T10:00:10+00:00", "2026-10-20T09:00:00+00:00"),
+]
+for name, kind, created, mtime in rows:
+    doc = {"kind": kind, "job_id": "order-time", "epoch": 1, "payload": {"owner_lane": "live"}}
+    if kind == "job.completed":
+        doc["at"] = created
+    elif kind == "job.escalate":
+        doc["payload"]["at"] = "2026-10-20T10:00:07.000Z"
+    else:
+        doc["created_at"] = created
+    path = os.path.join(directory, name + ".json")
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(doc, handle)
+    when = datetime.datetime.fromisoformat(mtime).timestamp()
+    os.utime(path, (when, when))
+PY
+cat >"$TMP/order-print.py" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+print("\n".join(name for name, _, _ in wrk_events_ordered(sys.argv[1])))
+PY
+# shellcheck disable=SC2016 # $1..$3 are the child shell's argv
+time_order="$(env ARBITER_INBOX_ROOT="$ORDER_INBOX" bash -c '. "$1"; wrk_py "$2" "$3"' _ \
+  "$ORDER_LIB" "$TMP/order-print.py" "$TIME_DIR")" ||
+  fail "ordered names failed"
+[[ "$time_order" == $'00001-job.completed.json\n00002-job.escalate.json\n00003-job.spawned.json' ]] ||
+  fail "event time must beat mtime and payload at must count: $time_order"
+scan="$(order_scan order-time)"
+[[ "$(cut -f2 <<<"$scan")" == 0 ]] ||
+  fail "the time-ordered job must report ended 0: $scan"
+echo "PASS hk1750-event-time-beats-mtime-and-reads-payload"
+
+# The arbiter and the two wrk writers that used to publish unlocked must wait
+# on the shared events lock while another writer holds it.
+cat >"$TMP/order-lock-hold.py" <<'PY'
+import fcntl, sys, time
+lock = open(sys.argv[1], "w", encoding="utf-8")
+fcntl.flock(lock, fcntl.LOCK_EX)
+time.sleep(float(sys.argv[2]))
+PY
+LOCK_DIR="$ORDER_INBOX/order-lock/events"
+mkdir -p "$LOCK_DIR"
+env ARBITER_INBOX_ROOT="$ORDER_INBOX" "$ARBITER" claim --job order-lock --lane live --t T1 >/dev/null
+python3 "$TMP/order-lock-hold.py" "$ORDER_INBOX/order-lock/.wrk-events.lock" 2 &
+lock_holder=$!
+sleep 0.4
+env ARBITER_INBOX_ROOT="$ORDER_INBOX" "$ARBITER" event --job order-lock --kind job.task_link \
+  --payload-json '{}' --json >/dev/null &
+lock_writer=$!
+sleep 0.5
+[[ ! -e "$LOCK_DIR/00002-job.task_link.json" ]] ||
+  fail "arbiter event did not wait on the shared events lock"
+wait "$lock_writer" || fail "arbiter event failed after the lock released"
+wait "$lock_holder" || true
+[[ -e "$LOCK_DIR/00002-job.task_link.json" ]] ||
+  fail "arbiter event did not land after the lock released"
+
+LOCK_WRK_DIR="$ORDER_INBOX/order-lock-wrk/events"
+mkdir -p "$LOCK_WRK_DIR"
+python3 "$TMP/order-lock-hold.py" "$ORDER_INBOX/order-lock-wrk/.wrk-events.lock" 2 &
+lock_holder=$!
+sleep 0.4
+# shellcheck disable=SC2016 # $1 is the child shell's argv
+env ARBITER_INBOX_ROOT="$ORDER_INBOX" bash -c \
+  '. "$1"; builder_flat_event order-lock-wrk live lbl w1:p1 director-1 job.escalate "" "" "q" "" ""' \
+  _ "$ORDER_LIB" >/dev/null 2>&1 &
+lock_writer=$!
+sleep 0.5
+[[ ! -e "$LOCK_WRK_DIR/00001-job.escalate.json" ]] ||
+  fail "builder_flat_event did not wait on the shared events lock"
+wait "$lock_writer" || fail "builder_flat_event failed after the lock released"
+wait "$lock_holder" || true
+[[ -e "$LOCK_WRK_DIR/00001-job.escalate.json" ]] ||
+  fail "builder_flat_event did not land after the lock released"
+
+LOCK_REAP_DIR="$ORDER_INBOX/order-lock-reap/events"
+mkdir -p "$LOCK_REAP_DIR"
+python3 "$TMP/order-lock-hold.py" "$ORDER_INBOX/order-lock-reap/.wrk-events.lock" 2 &
+lock_holder=$!
+sleep 0.4
+# shellcheck disable=SC2016 # $1 is the child shell's argv
+env ARBITER_INBOX_ROOT="$ORDER_INBOX" bash -c '. "$1"; reap_event order-lock-reap live w1:p1 w1:t1' \
+  _ "$ORDER_LIB" >/dev/null 2>&1 &
+lock_writer=$!
+sleep 0.5
+[[ ! -e "$LOCK_REAP_DIR/00001-job.reaped.json" ]] ||
+  fail "reap_event did not wait on the shared events lock"
+wait "$lock_writer" || fail "reap_event failed after the lock released"
+wait "$lock_holder" || true
+[[ -e "$LOCK_REAP_DIR/00001-job.reaped.json" ]] ||
+  fail "reap_event did not land after the lock released"
+echo "PASS hk1750-writers-wait-on-shared-events-lock"
+
+# The helper's O_EXCL fallback (no hard links) still publishes, and a stuck
+# number raises instead of overwriting.
+cat >"$TMP/order-helper-paths.py" <<'PY'
+import errno, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+mode, events = sys.argv[1], sys.argv[2]
+if mode == "fallback":
+    def no_link(*args, **kwargs):
+        raise OSError(errno.EPERM, "no hard links here")
+    _os.link = no_link
+    wrk_event_commit(events, "job.escalate",
+                     {"kind": "job.escalate", "job_id": "helper", "tag": "fallback"})
+elif mode == "exhausted":
+    def stuck(path):
+        return 1
+    wrk_event_highest = stuck
+    try:
+        wrk_event_commit(events, "job.escalate", {"kind": "job.escalate", "job_id": "helper"})
+    except OSError as exc:
+        print("EXHAUSTED", exc)
+    else:
+        raise SystemExit("expected OSError")
+PY
+FALLBACK_DIR="$ORDER_INBOX/order-fallback/events"
+mkdir -p "$FALLBACK_DIR"
+# shellcheck disable=SC2016 # $1..$3 are the child shell's argv
+env ARBITER_INBOX_ROOT="$ORDER_INBOX" bash -c '. "$1"; wrk_py "$2" fallback "$3"' _ \
+  "$ORDER_LIB" "$TMP/order-helper-paths.py" "$FALLBACK_DIR" ||
+  fail "O_EXCL fallback publish failed"
+python3 - "$FALLBACK_DIR" <<'PY'
+import glob, json, sys
+docs = [json.load(open(p, encoding="utf-8")) for p in glob.glob(sys.argv[1] + "/*job.escalate.json")]
+assert [d.get("tag") for d in docs] == ["fallback"], docs
+PY
+EXHAUST_DIR="$ORDER_INBOX/order-exhaust/events"
+mkdir -p "$EXHAUST_DIR"
+printf '{"kind":"job.escalate","sentinel":true}\n' >"$EXHAUST_DIR/00002-job.escalate.json"
+exhaust_before="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$EXHAUST_DIR/00002-job.escalate.json")"
+# shellcheck disable=SC2016 # $1..$3 are the child shell's argv
+exhaust_out="$(env ARBITER_INBOX_ROOT="$ORDER_INBOX" bash -c '. "$1"; wrk_py "$2" exhausted "$3"' _ \
+  "$ORDER_LIB" "$TMP/order-helper-paths.py" "$EXHAUST_DIR")" ||
+  fail "exhausted numbering must exit non-zero: $exhaust_out"
+grep -q '^EXHAUSTED ' <<<"$exhaust_out" ||
+  fail "exhausted numbering must raise OSError: $exhaust_out"
+exhaust_after="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "$EXHAUST_DIR/00002-job.escalate.json")"
+[[ "$exhaust_before" == "$exhaust_after" ]] ||
+  fail "exhausted numbering overwrote the existing record"
+echo "PASS hk1750-helper-fallback-and-bounded-exhaustion"
 
 bash "$ROOT/tests/test-shellcheck-capped.sh"
 # hk 1604: devin gate-profile contract. The real-scopefuel smoke stays opt-in

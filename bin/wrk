@@ -4242,6 +4242,158 @@ ensure_settings_local_ignored() {
     warn "$cwd/.claude/settings.local.json is still not git-ignored after updating info/exclude — do not commit it"
 }
 
+# ── job event order and publication (hk 1750) ─────────────────────────────
+# bin/arbiter numbers its event files from its own SQLite seq and wrk numbers
+# from the directory's highest prefix, so the two writers interleave: the same
+# directory holds 00011-job.completed and then 00009-job.spawned. File name
+# order alone therefore never decides terminal vs revive. Every reader that
+# decides order and every writer that publishes a record uses this one
+# definition. The order key is (event time, file mtime, name): event time is
+# the record's created_at or at when present, otherwise the file mtime, and
+# the name is only the final tie-break.
+#
+# Snippets run `exec(os.environ["WRK_EVENTS_PY"])`; wrk_py hands them the code
+# per invocation, so the helper never leaks into a spawned pane's environment.
+WRK_EVENTS_PY='
+import datetime as _dt
+import json as _json
+import os as _os
+import tempfile as _tempfile
+
+
+def wrk_event_moment(value):
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = _dt.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.astimezone()
+        return parsed.timestamp()
+    except (ValueError, OverflowError, OSError):
+        return None
+
+
+def wrk_event_time(document, mtime):
+    """The record time: created_at or at when present, else the file mtime."""
+    if isinstance(document, dict):
+        payload = document.get("payload")
+        if not isinstance(payload, dict):
+            payload = document
+        for value in (document.get("created_at"), document.get("at"),
+                      payload.get("created_at"), payload.get("at")):
+            moment = wrk_event_moment(value)
+            if moment is not None:
+                return moment
+    return mtime
+
+
+def wrk_events_ordered(events):
+    """[(name, document-or-None, mtime)] sorted by (event time, mtime, name).
+
+    Event time is compared at whole-second precision. Writers stamp different
+    precisions (wrk at is milliseconds, the arbiter envelope created_at is
+    whole seconds), so comparing the raw values would sort a terminal at
+    hh:mm:ss.429 after a revive written 300 ms later at hh:mm:ss.000 — the
+    incident shape again, one second wide. Within a second the file mtime,
+    the actual write time, breaks the tie; the name stays the last resort.
+    """
+    rows = []
+    try:
+        names = _os.listdir(events)
+    except OSError:
+        return rows
+    for name in names:
+        if name.startswith(".") or not name.endswith(".json"):
+            continue
+        path = _os.path.join(events, name)
+        try:
+            mtime = _os.path.getmtime(path)
+        except OSError:
+            mtime = 0.0
+        try:
+            with open(path, encoding="utf-8") as handle:
+                document = _json.load(handle)
+        except (OSError, ValueError):
+            document = None
+        if not isinstance(document, dict):
+            document = None
+        rows.append((int(wrk_event_time(document, mtime)), mtime, name, document))
+    rows.sort(key=lambda row: (row[0], row[1], row[2]))
+    return [(name, document, mtime) for _, mtime, name, document in rows]
+
+
+def wrk_event_highest(events):
+    highest = 0
+    try:
+        names = _os.listdir(events)
+    except OSError:
+        return 0
+    for name in names:
+        try:
+            highest = max(highest, int(name.split("-", 1)[0]))
+        except (ValueError, IndexError):
+            pass
+    return highest
+
+
+def wrk_event_at():
+    return (_dt.datetime.now(_dt.timezone.utc)
+            .isoformat(timespec="milliseconds").replace("+00:00", "Z"))
+
+
+def wrk_events_locked(events):
+    """The events lock shared with bin/arbiter and the other wrk writers."""
+    import fcntl
+    lock = open(_os.path.join(_os.path.dirname(events), ".wrk-events.lock"),
+                "w", encoding="utf-8")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def wrk_event_commit(events, kind, record, attempts=100):
+    """Publish one record at a name no other event owns.
+
+    The final name is created by hard-linking the fully written temp file, so
+    a collision with a concurrent writer (or with the arbiter) is
+    FileExistsError, never an overwrite; the writer then retries at the next
+    directory number, bounded.
+    """
+    record.setdefault("at", wrk_event_at())
+    fd, temporary = _tempfile.mkstemp(prefix=".event-", dir=events)
+    try:
+        with _os.fdopen(fd, "w", encoding="utf-8") as handle:
+            _json.dump(record, handle, separators=(",", ":"))
+            handle.write("\n")
+        _os.chmod(temporary, 0o600)
+        for _ in range(attempts):
+            final = _os.path.join(
+                events, "%05d-%s.json" % (wrk_event_highest(events) + 1, kind))
+            try:
+                _os.link(temporary, final)
+                return final
+            except FileExistsError:
+                continue
+            except OSError:
+                # A filesystem without hard links still must not overwrite:
+                # create the same final name exclusively and write the bytes.
+                try:
+                    out = _os.open(
+                        final, _os.O_WRONLY | _os.O_CREAT | _os.O_EXCL, 0o600)
+                except FileExistsError:
+                    continue
+                with _os.fdopen(out, "w", encoding="utf-8") as handle:
+                    _json.dump(record, handle, separators=(",", ":"))
+                    handle.write("\n")
+                return final
+        raise OSError("event numbering exhausted after %d attempts" % attempts)
+    finally:
+        if _os.path.exists(temporary):
+            _os.unlink(temporary)
+'
+wrk_py() {
+  WRK_EVENTS_PY="$WRK_EVENTS_PY" python3 "$@"
+}
+
 # completion_event JOB OWNER LABEL PANE REPORT [KIND] [REASON] [MODE]
 #
 # MODE=record (default) writes the durable event file and prints "created"
@@ -4264,8 +4416,9 @@ completion_event() {
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" "$mode" <<'PY'
+  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$host" "$report" "$last" "$kind" "$reason" "$mode" <<'PY'
 import fcntl, hashlib, json, os, re, sys, tempfile, time
+exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, label, pane, host, report, last, kind, reason, mode = sys.argv[1:]
 
 
@@ -4299,15 +4452,10 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
     if digest is not None:
         priors = []
-        for name in sorted(os.listdir(events)):
+        for name, prior, _ in wrk_events_ordered(events):
             if not name.endswith("-job.completed.json"):
                 continue
-            try:
-                with open(os.path.join(events, name), encoding="utf-8") as f:
-                    prior = json.load(f)
-            except (OSError, ValueError):
-                continue
-            if prior.get("kind") != "job.completed":
+            if prior is None or prior.get("kind") != "job.completed":
                 continue
             priors.append(prior)
             prior_digest = prior.get("report_sha256")
@@ -4373,10 +4521,6 @@ with open(lock_path, "w", encoding="utf-8") as lock:
         print("resolved")
         print(report)
         sys.exit(0)
-    highest = 0
-    for name in os.listdir(events):
-        try: highest = max(highest, int(name.split('-', 1)[0]))
-        except (ValueError, IndexError): pass
     record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
               "pane_id": pane, "host": host, "report_path": report,
               "report_last_line": last, "epoch": 1}
@@ -4385,15 +4529,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     # job.lost always states why. Downstream recovery treats agent_not_found as
     # a vanished pane and herdr_unreachable/timeout as an observation gap.
     if reason: record["reason"] = reason
-    fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
-    try:
-        with os.fdopen(fd, 'w', encoding='utf-8') as f:
-            json.dump(record, f, separators=(',', ':'))
-            f.write('\n')
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
-    finally:
-        if os.path.exists(temporary): os.unlink(temporary)
+    wrk_event_commit(events, kind, record)
 print("created")
 print(report)
 PY
@@ -4564,14 +4700,12 @@ wrk_jobs_root() {
 
 completion_metadata() {
   local job="$1"
-  python3 - "$(wrk_jobs_root)/$job/events" <<'PY'
+  wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
 import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
 owner=label=pane=parent=role=''
-try: names=sorted(os.listdir(sys.argv[1]))
-except OSError: raise SystemExit(1)
-for name in names:
-    try: o=json.load(open(os.path.join(sys.argv[1],name), encoding='utf-8'))
-    except (OSError,json.JSONDecodeError): continue
+for name, o, _ in wrk_events_ordered(sys.argv[1]):
+    if o is None: continue
     p=o.get('payload',o)
     # Claim/reclaim establishes ownership.  Keep the newest one: a released
     # job can be reclaimed by a different builder and parent.
@@ -4763,28 +4897,20 @@ builder_flat_event() {
   else
     last=""
   fi
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
+  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
 import json, os, sys, tempfile
+exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
-highest = 0
-for name in os.listdir(events):
-    try: highest = max(highest, int(name.split('-', 1)[0]))
-    except (ValueError, IndexError): pass
+# wrk escalate/joined publish outside the round writers' lock: take the shared
+# events lock so numbering is serialized with bin/arbiter and wrk done too.
+lock = wrk_events_locked(events)
 record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
           "pane_id": pane, "host": host, "report_path": report,
           "report_last_line": last, "reason": reason, "parent_lane": parent, "epoch": 1}
 if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
-fd, temporary = tempfile.mkstemp(prefix='.completion-', dir=events)
-try:
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(record, f, separators=(',', ':'))
-        f.write('\n')
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-{kind}.json'))
-finally:
-    if os.path.exists(temporary): os.unlink(temporary)
+wrk_event_commit(events, kind, record)
 PY
 }
 
@@ -4955,21 +5081,13 @@ USAGE
 # recorded repo/worktree/cwd takes precedence over the command-line fallback.
 round_repo_resolve() {
   local job="$1" fallback="$2"
-  python3 - "$(wrk_jobs_root)/$job/events" "$fallback" <<'PY'
+  wrk_py - "$(wrk_jobs_root)/$job/events" "$fallback" <<'PY'
 import json, os, subprocess, sys
+exec(os.environ["WRK_EVENTS_PY"])
 events, fallback = sys.argv[1:]
 latest = None
-try:
-    names = sorted(os.listdir(events))
-except OSError:
-    names = []
-for name in names:
-    if not name.endswith('.json'):
-        continue
-    try:
-        with open(os.path.join(events, name), encoding='utf-8') as f:
-            o = json.load(f)
-    except (OSError, ValueError):
+for name, o, _ in wrk_events_ordered(events):
+    if o is None:
         continue
     if o.get('kind') in ('job.claim', 'job.reclaim'):
         latest = o.get('payload', o)
@@ -5034,23 +5152,15 @@ PY
 # the round commands need, including the effective voids and their refs.
 round_scan() {
   local job="$1"
-  python3 - "$(wrk_jobs_root)/$job/events" <<'PY'
+  wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
 import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
 events = sys.argv[1]
-rounds = []          # job.round records in file order
-verdicts = []        # job.verdict records in file order
-voids = []            # job.round_void records in file order
-try:
-    names = sorted(os.listdir(events))
-except OSError:
-    names = []
-for name in names:
-    if not name.endswith(".json"):
-        continue
-    try:
-        with open(os.path.join(events, name), encoding="utf-8") as f:
-            o = json.load(f)
-    except (OSError, ValueError):
+rounds = []          # job.round records in event-time order
+verdicts = []        # job.verdict records in event-time order
+voids = []            # job.round_void records in event-time order
+for name, o, _ in wrk_events_ordered(events):
+    if o is None:
         continue
     if o.get("kind") == "job.round":
         rounds.append(o)
@@ -5172,13 +5282,11 @@ PY
 # unreadable so a broken record fails closed instead of falling back to an
 # older claim the newest event superseded.
 round_job_task_id() {
-  python3 - "$(wrk_jobs_root)/$1/events" <<'PY'
+  wrk_py - "$(wrk_jobs_root)/$1/events" <<'PY'
 import json, os, sys
-try:
-    names = sorted(n for n in os.listdir(sys.argv[1])
-                   if n.endswith(("claim.json", "reclaim.json")))
-except OSError:
-    raise SystemExit(1)
+exec(os.environ["WRK_EVENTS_PY"])
+names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
+         if name.endswith(("claim.json", "reclaim.json"))]
 if not names:
     raise SystemExit(0)
 try:
@@ -5233,8 +5341,9 @@ round_cap_event() {
   local events
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
-  python3 - "$events" "$job" "$owner" "$label" "$pane" "$parent" "${HOSTNAME:-unknown}" "$head" "$cap" <<'PY'
+  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "${HOSTNAME:-unknown}" "$head" "$cap" <<'PY'
 import fcntl, json, os, sys, tempfile
+exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, label, pane, parent, host, head, cap = sys.argv[1:]
 cap = int(cap)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
@@ -5243,19 +5352,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     # All state is read under the lock: a stale snapshot would let two racing
     # refusals each think they are first, and a rounds count read before the
     # lock could hide that an extension grant added rounds since.
-    records = []
-    try:
-        names = sorted(os.listdir(events))
-    except OSError:
-        names = []
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(events, name), encoding="utf-8") as f:
-                records.append(json.load(f))
-        except (OSError, ValueError):
-            continue
+    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
     voids = [r for r in records if r.get("kind") == "job.round_void"]
@@ -5285,12 +5382,6 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                 and isinstance(r.get("rounds"), int) and r["rounds"] >= used):
             print("duplicate")
             raise SystemExit(0)
-    highest = 0
-    for name in names:
-        try:
-            highest = max(highest, int(name.split("-", 1)[0]))
-        except (ValueError, IndexError):
-            pass
     question = ("tester round cap %d reached at %d rounds; builder must stop "
                 "and wait for the parent; extension needs a hk approval "
                 "record naming this job (wrk round open --extend REF)"
@@ -5302,16 +5393,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
               "parent_lane": parent, "head": head, "rounds": used,
               "cap": cap, "last_verdict": lv, "findings_path": findings,
               "epoch": 1}
-    fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(record, f, separators=(",", ":"))
-            f.write("\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, os.path.join(events, "%05d-job.escalate.json" % (highest + 1)))
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    wrk_event_commit(events, "job.escalate", record)
 print("emitted\trounds=%d\tlast_verdict=%s\tfindings=%s" % (used, lv, findings or "-"))
 PY
 }
@@ -5386,8 +5468,9 @@ round_open_cmd() {
   # concurrently cannot slip a second open past the cap.
   local outcome rc=0
   set +e
-  outcome="$(python3 - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend" "$grant_extra" "$grant_issuer" <<'PY'
+  outcome="$(wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend" "$grant_extra" "$grant_issuer" <<'PY'
 import fcntl, json, os, sys, tempfile
+exec(os.environ["WRK_EVENTS_PY"])
 (events, job, owner, label, pane, parent, head, cap,
  extend_ref, grant_extra, grant_issuer) = sys.argv[1:]
 cap, grant_extra = int(cap), int(grant_extra)
@@ -5395,15 +5478,7 @@ os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    records = []
-    for name in sorted(os.listdir(events)):
-        if not name.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(events, name), encoding="utf-8") as f:
-                records.append(json.load(f))
-        except (OSError, ValueError):
-            continue
+    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
     voids = [r for r in records if r.get("kind") == "job.round_void"]
@@ -5433,29 +5508,14 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     elif extend_ref:
         print("EXTEND_BEFORE_CAP")
         raise SystemExit(0)
-    highest = 0
     highest_round = max(round_numbers) if round_numbers else 0
-    for name in os.listdir(events):
-        try:
-            highest = max(highest, int(name.split("-", 1)[0]))
-        except (ValueError, IndexError):
-            pass
     next_round = max(used, highest_round) + 1
     record = {"kind": "job.round", "job_id": job, "owner_lane": owner,
               "label": label, "pane_id": pane, "parent_lane": parent,
               "head": head.lower(), "round": next_round, "epoch": 1}
     if approval:
         record["approval"] = approval
-    fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(record, f, separators=(",", ":"))
-            f.write("\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, os.path.join(events, "%05d-job.round.json" % (highest + 1)))
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    wrk_event_commit(events, "job.round", record)
     print("OPENED round=%d" % next_round)
 PY
 )"
@@ -5538,27 +5598,16 @@ round_void_cmd() {
 
   local outcome rc=0
   set +e
-  outcome="$(python3 - "$(wrk_jobs_root)/$job/events" "$job" "$round_number" "$ref" "$reason" "$grant_issuer" <<'PY'
+  outcome="$(wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$round_number" "$ref" "$reason" "$grant_issuer" <<'PY'
 import fcntl, json, os, sys, tempfile
+exec(os.environ["WRK_EVENTS_PY"])
 events, job, round_text, ref, reason, issuer = sys.argv[1:]
 round_number = int(round_text)
 os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    records = []
-    try:
-        names = sorted(os.listdir(events))
-    except OSError:
-        names = []
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(events, name), encoding="utf-8") as f:
-                records.append(json.load(f))
-        except (OSError, ValueError):
-            continue
+    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"
               and r.get("job_id") == job and r.get("round") == round_number]
     if not rounds:
@@ -5572,24 +5621,9 @@ with open(lock_path, "w", encoding="utf-8") as lock:
            and r.get("round") == round_number for r in records):
         print("ALREADY_VOID")
         raise SystemExit(0)
-    highest = 0
-    for name in names:
-        try:
-            highest = max(highest, int(name.split("-", 1)[0]))
-        except (ValueError, IndexError):
-            pass
     record = {"kind": "job.round_void", "job_id": job, "round": round_number,
               "reason": reason, "ref": ref, "issuer": issuer, "epoch": 1}
-    fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(record, f, separators=(",", ":"))
-            f.write("\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, os.path.join(events, "%05d-job.round_void.json" % (highest + 1)))
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    wrk_event_commit(events, "job.round_void", record)
     print("VOIDED round=%d" % round_number)
 PY
   )"
@@ -5620,8 +5654,9 @@ round_verdict_cmd() {
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   local outcome rc=0
   set +e
-  outcome="$(python3 - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
+  outcome="$(wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
 import fcntl, json, os, re, sys, tempfile
+exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, label, pane, parent, vfile, cap = sys.argv[1:]
 cap = int(cap)
 os.makedirs(events, exist_ok=True)
@@ -5646,15 +5681,7 @@ verdict, vsha = matches[0].group(1), matches[0].group(2).lower()
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    records = []
-    for name in sorted(os.listdir(events)):
-        if not name.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(events, name), encoding="utf-8") as f:
-                records.append(json.load(f))
-        except (OSError, ValueError):
-            continue
+    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
     voids = [r for r in records if r.get("kind") == "job.round_void"]
@@ -5677,28 +5704,13 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
     if target is None:
         used += 1  # this unbound verdict is itself a round
-    highest = 0
-    for name in os.listdir(events):
-        try:
-            highest = max(highest, int(name.split("-", 1)[0]))
-        except (ValueError, IndexError):
-            pass
     record = {"kind": "job.verdict", "job_id": job, "owner_lane": owner,
               "label": label, "pane_id": pane, "parent_lane": parent,
               "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
               "round": target, "epoch": 1}
     if target is None:
         record["unopened"] = True
-    fd, temporary = tempfile.mkstemp(prefix=".completion-", dir=events)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(record, f, separators=(",", ":"))
-            f.write("\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, os.path.join(events, "%05d-job.verdict.json" % (highest + 1)))
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    wrk_event_commit(events, "job.verdict", record)
     over = target is None and used > cap
     print("RECORDED round=%s verdict=%s head=%s used=%d over=%d" %
           (target if target is not None else "unopened", verdict, vsha, used, int(over)))
@@ -5883,25 +5895,14 @@ sentinel_log() {
 # pane/tab      the newest job.spawned receipt's values — same source of truth
 #               as wrk reap; "-" when the job never spawned
 job_events_scan() {
-  python3 - "$@" <<'PY'
-import datetime, json, os, sys, time
+  wrk_py - "$@" <<'PY'
+import json, os, sys, time
+exec(os.environ["WRK_EVENTS_PY"])
 
 WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped"}
 HUB_TERMINAL = {"job.completed", "job.completion", "job.revoked"}
 REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.reprompted"}
 now = time.time()
-
-
-def moment(value, fallback):
-    if isinstance(value, str) and value.strip():
-        try:
-            parsed = datetime.datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-            if parsed.tzinfo is None:
-                parsed = parsed.astimezone()
-            return parsed.timestamp()
-        except ValueError:
-            pass
-    return fallback
 
 
 def field(doc, payload, key):
@@ -5918,35 +5919,23 @@ for events in sys.argv[1:]:
     kinds = []
     last_t = 0.0
     last_kind = ""
-    try:
-        names = sorted(os.listdir(events))
-    except OSError:
-        names = []
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        path = os.path.join(events, name)
-        try:
-            mtime = os.path.getmtime(path)
-        except OSError:
-            mtime = now
-        try:
-            with open(path, encoding="utf-8") as handle:
-                doc = json.load(handle)
-        except (OSError, ValueError):
-            doc = None
-        if not isinstance(doc, dict):
+    # Event-time order, not file-name order: terminal/revive below walks this
+    # list by index, and two writers number the directory independently.
+    for name, doc, mtime in wrk_events_ordered(events):
+        when = wrk_event_time(doc, mtime if mtime else now)
+        if doc is None:
             # An unreadable event file is still activity evidence for aging,
             # but contributes nothing else.
-            last_t = max(last_t, mtime)
+            last_t = max(last_t, when)
             continue
         payload = doc.get("payload")
         if not isinstance(payload, dict):
             payload = {}
         kind = doc.get("kind") or doc.get("type") or doc.get("event") or ""
-        when = moment(doc.get("created_at") or payload.get("at"), mtime)
-        if when >= last_t:
-            last_t, last_kind = when, kind or last_kind
+        # The loop is already in the shared order, so the last readable row is
+        # the newest kind; only the raw time is a max for the age field.
+        last_t = max(last_t, when)
+        last_kind = kind or last_kind
         kinds.append(kind)
         if kind in ("job.claim", "job.claimed", "job.reclaim"):
             owner = field(doc, payload, "owner_lane") or owner
@@ -5987,8 +5976,9 @@ job_end_record() {
   local job="$1" owner="$2" outcome="$3" reason="$4" source="$5" events
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events" || return 1
-  python3 - "$events" "$job" "$owner" "$outcome" "$reason" "$source" "${HOSTNAME:-unknown}" <<'PY'
+  wrk_py - "$events" "$job" "$owner" "$outcome" "$reason" "$source" "${HOSTNAME:-unknown}" <<'PY'
 import datetime, fcntl, json, os, sys, tempfile
+exec(os.environ["WRK_EVENTS_PY"])
 
 events, job, owner, outcome, reason, source, host = sys.argv[1:]
 WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped"}
@@ -6001,25 +5991,11 @@ REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.repromp
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    highest = 0
     kinds = []
-    try:
-        names = sorted(os.listdir(events))
-    except OSError:
-        names = []
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        try:
-            highest = max(highest, int(name.split("-", 1)[0]))
-        except (ValueError, IndexError):
-            pass
-        try:
-            with open(os.path.join(events, name), encoding="utf-8") as handle:
-                doc = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        if not isinstance(doc, dict):
+    # Event-time order: "already ended" and "revived after a terminal" are
+    # index comparisons below, and file names do not order the two writers.
+    for name, doc, _ in wrk_events_ordered(events):
+        if doc is None:
             continue
         kinds.append(doc.get("kind") or doc.get("type") or doc.get("event") or "")
     last_revive = -1
@@ -6045,16 +6021,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
               "source": source, "host": host,
               "created_at": datetime.datetime.now(datetime.timezone.utc)
               .isoformat(timespec="seconds").replace("+00:00", "Z")}
-    fd, temporary = tempfile.mkstemp(prefix=".ended-", dir=events)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(record, handle, separators=(",", ":"))
-            handle.write("\n")
-        os.chmod(temporary, 0o600)
-        os.replace(temporary, os.path.join(events, "%05d-job.revoked.json" % (highest + 1)))
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
+    wrk_event_commit(events, "job.revoked", record)
     print("created")
 PY
 }
@@ -8863,9 +8830,10 @@ round_ext_precheck() {
   out="$(hk_cmd "$handoffkeep" doc get "${ROUND_EXT_REF#hk:doc/}" 2>/dev/null)" ||
     die "--round-ext: document missing or handoffkeep unreachable"
   # A successful transport with an error/empty/malformed body is not existence.
-  ROUND_EXT_ISSUER="$(printf '%s' "$out" | python3 -c '
-import json, sys
+  ROUND_EXT_ISSUER="$(printf '%s' "$out" | wrk_py -c '
+import json, os, sys
 from pathlib import Path
+exec(os.environ["WRK_EVENTS_PY"])
 
 def unique_object(pairs):
     result = {}
@@ -8884,11 +8852,11 @@ try:
     allowed = set(sys.argv[2].split())
     if issuer not in allowed or sys.argv[5] == "builder":
         events = Path(sys.argv[4])
-        claims = sorted(p for p in events.glob("*.json")
-                        if p.name.endswith(("claim.json", "reclaim.json")))
+        claims = [name for name, _, _ in wrk_events_ordered(str(events))
+                  if name.endswith(("claim.json", "reclaim.json"))]
         if not claims:
             raise ValueError("issuer requires recorded parent lane")
-        record = json.loads(claims[-1].read_text(), object_pairs_hook=unique_object)
+        record = json.loads((events / claims[-1]).read_text(), object_pairs_hook=unique_object)
         payload = record.get("payload", record)
         parent = payload.get("parent_lane")
         if sys.argv[5] == "builder" and str(payload.get("task_id")) != sys.argv[6]:
@@ -8918,16 +8886,14 @@ round_ext_builder_recheck() {
 task_resolve_parent() {
   local parent="$1" dir rc
   dir="$(wrk_jobs_root)/$parent/events"
-  if TASK_ID="$(python3 - "$dir" <<'PY'
+  if TASK_ID="$(wrk_py - "$dir" <<'PY'
 import json, os, sys
-try:
-    names = sorted(n for n in os.listdir(sys.argv[1])
-                   if n.endswith(("claim.json", "reclaim.json")))
-except OSError:
-    raise SystemExit(1)
+exec(os.environ["WRK_EVENTS_PY"])
+names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
+         if name.endswith(("claim.json", "reclaim.json"))]
 if not names:
     raise SystemExit(0)
-# Seq-prefixed names sort newest-last; only that event is authoritative.
+# The newest claim/reclaim by (event time, mtime, name) is authoritative.
 try:
     o = json.load(open(os.path.join(sys.argv[1], names[-1]), encoding="utf-8"))
 except (OSError, json.JSONDecodeError):
@@ -9865,8 +9831,9 @@ PY
 # (2026-09-05 검증 실증: `would-close … tab=1928`).
 reap_candidates() {
   local root="$1" lane="$2" grace="$3" include_builders="$4"
-  python3 - "$root" "$lane" "$grace" "$include_builders" <<'PY'
-import datetime, json, os, sys, time
+  wrk_py - "$root" "$lane" "$grace" "$include_builders" <<'PY'
+import json, os, sys, time
+exec(os.environ["WRK_EVENTS_PY"])
 
 root, lane, grace, include_builders = sys.argv[1:5]
 grace = int(grace)
@@ -9877,21 +9844,12 @@ TERMINAL = {"job.completed", "job.joined", "job.revoked"}
 # 못 된다 — 판정은 인박스 순서로 한다. job.lost·quota_pool.* 는 되살림이 아니다
 # (넣으면 completed → lost 인 정상 종결 잡이 영구히 빠진다). job.reprompted 는 아직
 # 없는 종류지만(#113 ①) 생기면 같은 뜻이다.
+# The order is the shared (event time, mtime, name) key: two writers number
+# this directory independently, so the newest job.spawned must win by time —
+# a respawned job whose spawned receipt has a lower prefix than its terminal
+# is never a candidate (#1750).
 REVIVE = {"job.claim", "job.reclaim", "job.spawned", "job.reprompted"}
 now = time.time()
-
-
-def moment_of(value, fallback):
-    if not isinstance(value, str) or not value.strip():
-        return fallback
-    text = value.strip().replace("Z", "+00:00")
-    try:
-        parsed = datetime.datetime.fromisoformat(text)
-    except ValueError:
-        return fallback
-    if parsed.tzinfo is None:
-        parsed = parsed.astimezone()
-    return parsed.timestamp()
 
 
 try:
@@ -9910,20 +9868,8 @@ for job in jobs:
     revived = False
     reaped = False
     keep = False
-    try:
-        names = sorted(os.listdir(events_dir))
-    except OSError:
-        continue
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        path = os.path.join(events_dir, name)
-        try:
-            with open(path, encoding="utf-8") as handle:
-                document = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        if not isinstance(document, dict):
+    for name, document, mtime in wrk_events_ordered(events_dir):
+        if document is None:
             continue
         payload = document.get("payload", document)
         if not isinstance(payload, dict):
@@ -9968,11 +9914,7 @@ for job in jobs:
             revived = True
         if kind in TERMINAL:
             revived = False
-            try:
-                fallback = os.path.getmtime(path)
-            except OSError:
-                fallback = now
-            terminal_at = moment_of(document.get("created_at") or payload.get("at"), fallback)
+            terminal_at = wrk_event_time(document, mtime if mtime else now)
     # 스폰 영수증이 pane/tab 의 정본이다. 완료 이벤트의 pane_id 를 그대로 믿으면
     # be4dad1 이전 `wrk done` 이 남긴 오염 레코드("w1:p1\t\tworker")를 집는다 —
     # 실 인박스에 23건 남아 있다.
@@ -10070,26 +10012,14 @@ reap_event() {
   local events
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
-  python3 - "$events" "$job" "$owner" "$pane" "$tab" "${HOSTNAME:-unknown}" <<'PY'
-import datetime, json, os, sys, tempfile
+  wrk_py - "$events" "$job" "$owner" "$pane" "$tab" "${HOSTNAME:-unknown}" <<'PY'
+import json, os, sys, tempfile
+exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, pane, tab, host = sys.argv[1:]
-highest = 0
-for name in os.listdir(events):
-    try: highest = max(highest, int(name.split('-', 1)[0]))
-    except (ValueError, IndexError): pass
+lock = wrk_events_locked(events)
 record = {"kind": "job.reaped", "job_id": job, "owner_lane": owner,
-          "pane_id": pane, "tab_id": tab, "host": host,
-          "at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z"),
-          "epoch": 1}
-fd, temporary = tempfile.mkstemp(prefix='.reaped-', dir=events)
-try:
-    with os.fdopen(fd, 'w', encoding='utf-8') as f:
-        json.dump(record, f, separators=(',', ':'))
-        f.write('\n')
-    os.chmod(temporary, 0o600)
-    os.replace(temporary, os.path.join(events, f'{highest + 1:05d}-job.reaped.json'))
-finally:
-    if os.path.exists(temporary): os.unlink(temporary)
+          "pane_id": pane, "tab_id": tab, "host": host, "epoch": 1}
+wrk_event_commit(events, "job.reaped", record)
 PY
 }
 
@@ -10270,8 +10200,9 @@ lanes_missing_cmd() {
   # owner_lane/parent_lane/role, terminal kinds close the job, claim/
   # reclaim/spawned/reprompted reopen it, job.reaped closes it for good.
   # Findings print as key=value lines; the summary is the last line.
-  python3 - "$jobs_root" "$listing" <<'PY'
+  wrk_py - "$jobs_root" "$listing" <<'PY'
 import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
 
 root, raw = sys.argv[1], sys.argv[2]
 try:
@@ -10303,19 +10234,10 @@ for job in jobs:
         continue
     owner = parent = role = ""
     is_open = False
-    try:
-        names = sorted(os.listdir(events_dir))
-    except OSError:
-        continue
-    for name in names:
-        if not name.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(events_dir, name), encoding="utf-8") as handle:
-                record = json.load(handle)
-        except (OSError, ValueError):
-            continue
-        if not isinstance(record, dict):
+    # Same event-time order as reap_candidates: terminal/revive are decided by
+    # the shared key, never by which writer numbered the file.
+    for name, record, _ in wrk_events_ordered(events_dir):
+        if record is None:
             continue
         payload = record.get("payload", record)
         if not isinstance(payload, dict):
