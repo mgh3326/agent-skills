@@ -535,7 +535,7 @@ tmp_writers_stop() {
   local round_start sig quiet=0 alive deadline now
   local pf reg pid started kind args stat dp cur
   local sfile spid sident spgid
-  local tracked commalist snap members_at_snap gtok
+  local tracked commalist snap members_at_snap gtok group_candidates
   local -a _TW_EXTRA_REGS=("$@")
   local _TW_DEAD="" _TW_OWNED="" _TW_GROUPS="" _TW_MEMBERS=""
   local _TW_MEMBERS_NEW="" _TW_MEMBERS_UNVER="" _TW_MEMBER_IDS=""
@@ -552,18 +552,13 @@ tmp_writers_stop() {
     _TW_MEMBERS_NEW=""
     groups_prev="$_TW_GROUPS"
     # 0. collect this round's tracked pids (dead entries are cached and
-    #    never re-read). Pending orphan groups contribute their exact
-    #    member list first (pgrep -g PGID — no table scan) so the single
-    #    snapshot below already covers them.
+    #    never re-read). Group candidates come from prior authorization,
+    #    self-recorded sessions, and registry entries that recorded
+    #    pgid == pid. They are only snapshot candidates here, not yet
+    #    authority to signal a group.
     tracked="$_TW_MEMBERS $_TW_MEMBERS_UNVER"
+    group_candidates="$_TW_GROUPS"
     gm=""
-    for g in $_TW_GROUPS; do
-      gmembers="$(pgrep -g "$g" 2>/dev/null | tr -s ' \n' ',,' || true)"
-      gmembers="${gmembers#,}"; gmembers="${gmembers%,}"
-      [[ -n "$gmembers" ]] || continue
-      gm="$gm $g:$gmembers"
-      tracked="$tracked ${gmembers//,/ }"
-    done
     while IFS= read -r pf; do
       IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$pf")"
       [[ "$pid" =~ ^[0-9]+$ ]] || continue
@@ -578,13 +573,37 @@ tmp_writers_stop() {
         [[ "$pid" =~ ^[0-9]+$ ]] || continue
         _tw_list_has "$_TW_DEAD" "$pid" || tracked="$tracked $pid"
       done <"$reg"
+      if [[ -f "$reg.identities" ]]; then
+        while IFS= read -r g; do
+          [[ "$g" =~ ^[0-9]+$ ]] || continue
+          _tw_list_has "$group_candidates" "$g" ||
+            group_candidates="$group_candidates $g"
+        done < <(awk -F '\t' \
+          '$1 ~ /^[0-9]+$/ && $2 != "" && $3 ~ /^[0-9]+$/ && $1 == $3 { print $3 }' \
+          "$reg.identities" 2>/dev/null)
+      fi
     done < <(_tw_registries)
     while IFS= read -r sfile; do
-      IFS=$'\t' read -r spid _ _ <"$sfile" 2>/dev/null || continue
+      IFS=$'\t' read -r spid sident spgid <"$sfile" 2>/dev/null || continue
       [[ "$spid" =~ ^[0-9]+$ ]] || continue
       _tw_track "$spid"
       _tw_list_has "$_TW_DEAD" "$spid" || tracked="$tracked $spid"
+      if [[ "$spid" == "$spgid" && -n "$sident" ]]; then
+        _tw_list_has "$group_candidates" "$spgid" ||
+          group_candidates="$group_candidates $spgid"
+      fi
     done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
+    # Enumerate all candidate groups by exact pgid before the one snapshot.
+    # Candidates only add PIDs to that snapshot; step 5 still requires the
+    # independent authorized _TW_GROUPS ledger before signalling members.
+    for g in $group_candidates; do
+      [[ "$g" =~ ^[0-9]+$ ]] || continue
+      gmembers="$(pgrep -g "$g" 2>/dev/null | tr -s ' \n' ',,' || true)"
+      gmembers="${gmembers#,}"; gmembers="${gmembers%,}"
+      [[ -n "$gmembers" ]] || continue
+      gm="$gm $g:$gmembers"
+      tracked="$tracked ${gmembers//,/ }"
+    done
     # 1. the round's single process snapshot: pid, state, start, argv of
     #    exactly this run's tracked pids (plus pending members and known
     #    orphan-group members).
@@ -713,12 +732,13 @@ tmp_writers_stop() {
         _tw_list_has "$_TW_GROUPS" "$spgid" || _TW_GROUPS="$_TW_GROUPS $spgid"
       fi
     done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
-    # 5. pending orphan groups: members were enumerated by exact pgid in
-    #    step 0, so their rows are already in this round's snapshot. Each
-    #    still has to verify as this run's leftover argv and to have
-    #    started inside the run window (snapshot lstart — no extra ps).
+    # 5. pending orphan groups: candidates were enumerated by exact pgid
+    #    before the snapshot, but only independently authorized groups
+    #    may signal members. Each member still verifies as this run's
+    #    leftover argv and started inside the run window (snapshot lstart).
     for gtok in $gm; do
       g="${gtok%%:*}"; glist="${gtok#*:}"
+      _tw_list_has "$_TW_GROUPS" "$g" || continue
       for mpid in ${glist//,/ }; do
         [[ "$mpid" =~ ^[0-9]+$ ]] || continue
         [[ "$mpid" == "$g" ]] && continue

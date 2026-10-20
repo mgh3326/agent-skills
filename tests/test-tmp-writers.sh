@@ -538,4 +538,126 @@ grep -qF 'builder_luna_out="$(TEST_OWN_SESSION=1 ' "$ROOT/tests/test-wrk.sh" ||
   fail "T16: builder-luna fake-clock call lacks session opt-in"
 pass "T16 fake-clock sentinel reaped by self-recorded own session"
 
+# ── T17: group candidates are snapshotted before a slow first sweep ─────
+new_run
+jobdir="$TW_TMP/inbox/job-t17"
+mkdir -p "$jobdir"
+copy="$TW_TMP/fakeclock-slow-wrk"
+mk_sentinel_script "$copy"
+python3 - "$copy" <<'PY'
+import sys
+path = sys.argv[1]
+text = open(path, encoding="utf-8").read()
+old = '"$(date +%s)"'
+assert text.count(old) == 1, "expected one sentinel started timestamp expression"
+open(path, "w", encoding="utf-8").write(text.replace(old, "1000", 1))
+PY
+wrapper="$TW_TMP/fakeclock-slow-wrapper.sh"
+cat >"$wrapper" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+copy="$1"; jobdir="$2"
+export SENT_JOBDIR="$jobdir"
+bash "$copy" sentinel job-t17 lane lbl w1:p1 "$jobdir/report.json" &
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -s "$jobdir/completion-sentinel.pid" &&
+     -s "$jobdir/sentinel-child.pid" ]] && exit 0
+  sleep 0.1
+done
+exit 1
+SH
+tw_own_session bash "$wrapper" "$copy" "$jobdir" &
+leader=$!
+track "$leader"
+wait "$leader" || fail "T17: own-session wrapper did not finish"
+record="$TW_TMP/tw-own-sessions/$leader"
+[[ -s "$record" ]] || fail "T17: self-recorded session ownership missing"
+IFS=$'\t' read -r record_pid record_ident record_pgid <"$record"
+[[ "$record_pid" == "$leader" && "$record_pgid" == "$leader" &&
+   -n "$record_ident" ]] || fail "T17: malformed session ownership record"
+sentinel="$(head -n 1 "$jobdir/completion-sentinel.pid")"
+child="$(cat "$jobdir/sentinel-child.pid")"
+track "$sentinel"; track "$child"
+started="$(_tw_pidfile_fields "$jobdir/completion-sentinel.pid")"
+IFS=$'\t' read -r started_pid started_epoch <<<"$started"
+[[ "$started_epoch" == 1000 ]] ||
+  fail "T17: fixture did not preserve fake started=1000 ($started)"
+sentinel_args="$(ps -p "$sentinel" -o args= 2>/dev/null)" ||
+  fail "T17: sentinel argv unavailable"
+_tw_sentinel_args_ok "$sentinel_args" "job-t17" "$jobdir" ||
+  fail "T17: sentinel argv shape was not recognized"
+if _tw_pidfile_verify "$jobdir/completion-sentinel.pid" "$sentinel" "$sentinel_args"; then
+  fail "T17: stale fake-clock pidfile unexpectedly verified"
+fi
+dead "$leader" || fail "T17: own-session wrapper leader still alive"
+
+eval "$(declare -f _tw_pidfile_verify | sed '1s/_tw_pidfile_verify/_t17_original_pidfile_verify/')"
+t17_slow_once=0
+_tw_pidfile_verify() {
+  if (( t17_slow_once == 0 )); then
+    t17_slow_once=1
+    sleep 11
+  fi
+  _t17_original_pidfile_verify "$@"
+}
+t17_rc=0
+tmp_writers_stop || t17_rc=$?
+t17_slow_calls="$t17_slow_once"
+eval "$(declare -f _t17_original_pidfile_verify | sed '1s/_t17_original_pidfile_verify/_tw_pidfile_verify/')"
+unset -f _t17_original_pidfile_verify
+unset t17_slow_once
+[[ "$t17_slow_calls" == 1 ]] || fail "T17: verifier delay did not run exactly once"
+[[ "$t17_rc" -eq 0 ]] ||
+  fail "T17: first sweep missed pre-snapshot group members (rc=$t17_rc leftovers=${TW_LEFTOVER_PIDS:-})"
+[[ -z "${TW_LEFTOVER_PIDS:-}" ]] ||
+  fail "T17: leftovers after delayed first sweep:${TW_LEFTOVER_PIDS}"
+dead "$sentinel" || fail "T17: fake-clock sentinel survived delayed first sweep"
+dead "$child" || fail "T17: fake-clock child survived delayed first sweep"
+untrack "$leader"; untrack "$sentinel"; untrack "$child"
+pass "T17 first-sweep group candidates survive verifier delay"
+
+# A self-record whose live leader identity mismatches is a candidate only:
+# its group/member must remain untouched and the live leader must be reported.
+new_run
+wrapper="$TW_TMP/mismatch-wrapper.sh"
+cat >"$wrapper" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+sleep 60 &
+printf '%s\n' "$!" >"$1/member.pid"
+wait
+SH
+tw_own_session bash "$wrapper" "$TW_TMP" &
+proxy=$!
+track "$proxy"
+record="$TW_TMP/tw-own-sessions/$proxy"
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+  [[ -s "$record" && -s "$TW_TMP/member.pid" ]] && break
+  sleep 0.1
+done
+[[ -s "$record" && -s "$TW_TMP/member.pid" ]] ||
+  fail "T17 negative: live proxy ownership fixtures missing"
+member="$(cat "$TW_TMP/member.pid")"
+track "$member"
+IFS=$'\t' read -r record_pid record_ident record_pgid <"$record"
+[[ "$record_pid" == "$proxy" && "$record_pgid" == "$proxy" &&
+   -n "$record_ident" ]] || fail "T17 negative: malformed proxy record"
+printf '%s\t%s\t%s\n' "$proxy" "mismatched-$record_ident" "$proxy" >"$record"
+t17_rc=0
+tmp_writers_stop || t17_rc=$?
+[[ "$t17_rc" -ne 0 ]] ||
+  fail "T17 negative: mismatched live leader identity falsely succeeded"
+listed "$proxy" ||
+  fail "T17 negative: refused live leader missing from leftovers"
+[[ -d "$TW_TMP" ]] || fail "T17 negative: TMP removed while proxy was alive"
+alive "$proxy" || fail "T17 negative: mismatched live leader was signalled"
+alive "$member" || fail "T17 negative: candidate group member was signalled"
+# Clean only these explicitly tracked fixture pids, never their group.
+stray_kill "$proxy"; stray_kill "$member"
+wait "$proxy" 2>/dev/null || true
+pid_gone "$proxy" || fail "T17 negative: proxy survived exact-pid cleanup"
+pid_gone "$member" || fail "T17 negative: member survived exact-pid cleanup"
+untrack "$proxy"; untrack "$member"
+pass "T17 mismatched live session identity refuses leader and member"
+
 echo "PASS test-tmp-writers"
