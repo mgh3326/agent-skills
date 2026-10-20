@@ -34,7 +34,12 @@ diff gets T2 only when every path is on the versioned nontrading path list;
 unknown paths are UNVERIFIED. T0 additionally requires local_only=true.
 
 Contributors is an array of initial, fix, and prescription contributors. Each
-entry includes profile, model, effort, role, kind, session, and worktree. The
+entry includes profile, model, effort, role, kind, session, and worktree.
+For contributor jobs, include job_record_dir or job_id/job; otherwise session
+is resolved beneath ARBITER_INBOX_ROOT (default ~/work/herdr-inbox/jobs).
+All job.model_observed events add their parsed families to the spawned family
+union. Unknown parts or unreadable explicit job records make independence
+UNVERIFIED; observation history also binds the contributor receipt digest. The
 tester has planned_profile and planned_effort at pre-spawn. Later calls also
 need actual_profile, actual_model, actual_effort, session, worktree, pane,
 job_record_dir, model_observation_path, and model_observation_sha256. The job

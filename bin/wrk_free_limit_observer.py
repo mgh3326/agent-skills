@@ -15,6 +15,9 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
+import tomllib
+
+from wrk_pane_models import expected_label, latest_model_line, model_tokens, parse_model_line
 
 
 DEVIN_RUNGS = {
@@ -316,6 +319,173 @@ def observe(args: argparse.Namespace, transcript: str) -> str:
         return "observer-failed-state-io"
 
 
+# Two poll intervals (30s each) plus one minute for scheduling/render latency.
+# This is deliberately time based, so a delayed poll cannot hide a stale pane.
+STALL_MARGIN = dt.timedelta(minutes=2)
+OBSERVER_KINDS = {"job.model_observed", "quota_pool.drift", "job.stalled_free_limit"}
+
+
+def job_events(jobdir: Path) -> list[dict]:
+    rows = []
+    for path in (jobdir / "events").glob("*.json"):
+        try:
+            doc = json.loads(path.read_text())
+            if isinstance(doc, dict):
+                stamp = doc.get("created_at", doc.get("at", ""))
+                rows.append((stamp if isinstance(stamp, str) else "", path.stat().st_mtime_ns, path.name, doc))
+        except (OSError, ValueError):
+            continue
+    return [row[-1] for row in sorted(rows)]
+
+
+def payload(doc: dict) -> dict:
+    return doc.get("payload") if isinstance(doc.get("payload"), dict) else doc
+
+
+def commit_event(jobdir: Path, job: str, kind: str, key: str, data: dict, now: str) -> None:
+    # An independent namespace avoids either arbiter or wrk's numeric writer.
+    # Deterministic keys make retries after a state-write failure idempotent.
+    path = jobdir / "events" / f"observer-{key}-{kind}.json"
+    if not path.exists():
+        atomic_json(path, dict(job_id=job, kind=kind, created_at=now, payload=data))
+
+
+def billing_account_tag() -> str | None:
+    # Read only scopefuel's credential-free policy field. Never open an agent
+    # configuration or fall back to the host's codex account/snapshot.
+    config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "scopefuel/config.toml"
+    try:
+        with config.open("rb") as handle:
+            fp = tomllib.load(handle).get("pools", {}).get("codex", {}).get("fusion_billing_fp")
+        return fp[:8] if isinstance(fp, str) and re.fullmatch(r"[0-9a-f]{16}", fp) else None
+    except (OSError, ValueError, AttributeError):
+        return None
+
+
+def active_protocol_error(transcript: str) -> str | None:
+    lines = ANSI.sub("", transcript).splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        if not BANNER.fullmatch(lines[index]):
+            continue
+        body = []
+        trailing = []
+        in_body = True
+        for line in lines[index + 1:]:
+            if in_body and re.match(r"^[ \t]{3,}\S", line):
+                body.append(line.strip())
+            else:
+                in_body = False
+                if line.strip():
+                    trailing.append(line)
+        # A retained banner above subsequent work is not the last error.
+        if any(latest_model_line(line) is None and line.strip() != "? for shortcuts" for line in trailing):
+            return None
+        text = " ".join(body)
+        match = re.match(r"(?:\[|\()?invalid_argument(?:\]|\))?(?=[: \t]|$)", text)
+        return "invalid_argument" if match else None
+    return None
+
+
+def emit_stall(args: argparse.Namespace, jobdir: Path, pending: dict) -> bool:
+    owner = getattr(args, "owner_lane", "")
+    if not owner:
+        for doc in reversed(job_events(jobdir)):
+            owner = payload(doc).get("owner_lane", "")
+            if owner:
+                break
+    if not owner:
+        return False
+    command = [os.environ.get("PANEWIRE_BIN", "panewire"), "emit", "--kind", "lane.event",
+               "--lane", owner, "--event-id", f"stall-{args.job}-{pending['signature']}",
+               "--text", f"job.stalled_free_limit job={args.job} error_class={pending['error_class']} reset={pending['reset']}",
+               "--inbox-root", str(jobdir.parent.parent)]
+    try:
+        result = subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.PIPE, timeout=5, check=False)
+        return result.returncode == 0 or b"duplicate event_id" in result.stderr
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def observe_pane(args: argparse.Namespace, transcript: str) -> None:
+    if args.pane_kind != "devin":
+        return
+    observed = aware_utc(args.observed) if args.observed else dt.datetime.now(dt.timezone.utc)
+    now = iso_utc(observed)
+    jobdir = Path(args.state).parent
+    jobdir.mkdir(parents=True, exist_ok=True)
+    state_path = jobdir / "pane-observer.json"
+    with (jobdir / ".pane-observer.lock").open("a+") as lock:
+        os.chmod(lock.name, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            state = json.loads(state_path.read_text())
+        except (OSError, ValueError):
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        events = job_events(jobdir)
+        progress_events = [doc for doc in events if doc.get("kind") not in OBSERVER_KINDS]
+        event_digest = hashlib.sha256(json.dumps(progress_events, sort_keys=True).encode()).hexdigest()
+        content_digest = hashlib.sha256(transcript.encode()).hexdigest()
+        progressed = bool(state) and (state.get("content") != content_digest or state.get("events") != event_digest)
+        if progressed or not state:
+            state["last_progress"] = now
+        state.update(content=content_digest, events=event_digest)
+
+        raw = latest_model_line("\n".join(transcript.splitlines()[-5:]))
+        previous = next((doc for doc in reversed(events) if doc.get("kind") == "job.model_observed"), None)
+        if raw is not None and (previous is None or payload(previous).get("raw_line") != raw):
+            model = parse_model_line(raw)
+            expected = expected_label(args.rung)
+            model.update(spawned_profile=args.rung, expected_label=expected,
+                         drift=expected is None or model_tokens(raw) != model_tokens(expected), time=now)
+            tag = billing_account_tag()
+            for part in model["parts"]:
+                if part["account"] == "devin-linked":
+                    part["account_tag"] = tag
+            key = hashlib.sha256(json.dumps([previous, raw], sort_keys=True).encode()).hexdigest()
+            commit_event(jobdir, args.job, "job.model_observed", key, model, now)
+            quota = next((payload(doc) for doc in reversed(events) if doc.get("kind") == "quota_pool.record"), {})
+            from_pool = quota.get("pool") or quota.get("resource")
+            # With no quota record, provenance still names the observed pools;
+            # absence of a recorded source pool is never guessed from the host.
+            if model["drift"] and model["attributed"] and from_pool and any(pool != from_pool for pool in model["pools"]):
+                commit_event(jobdir, args.job, "quota_pool.drift", key,
+                             dict(from_pool=from_pool, to_pool=model["pools"], parts=model["parts"],
+                                  spawned_profile=args.rung, time=now, lease_changed=False), now)
+
+        notice = parse_rate_limit(transcript, observed)
+        protocol = active_protocol_error(transcript)
+        if protocol:
+            notice = dict(signature=hashlib.sha256((protocol + transcript).encode()).hexdigest(),
+                          observed=now, reset=now, error_class=protocol)
+        elif notice:
+            notice["error_class"] = "free_model_rate_limit"
+        pending = state.get("pending")
+        signatures = state.setdefault("notices", [])
+        if notice and notice["signature"] not in signatures:
+            signatures.append(notice["signature"])
+            pending = {key: notice[key] for key in ("signature", "observed", "reset", "error_class")}
+            pending["last_progress"] = state["last_progress"]
+            state["pending"] = pending
+        elif pending and progressed and not pending.get("flagged"):
+            # Work after the notice clears this candidate; a retained notice
+            # must not re-arm itself on a later quiet poll.
+            state.pop("pending", None)
+            pending = None
+        if pending and not pending.get("flagged") and not progressed:
+            threshold = max(aware_utc(pending["reset"]), aware_utc(state["last_progress"])) + STALL_MARGIN
+            if observed >= threshold:
+                commit_event(jobdir, args.job, "job.stalled_free_limit", pending["signature"],
+                             dict(notice_time=pending["observed"], reset=pending["reset"],
+                                  last_progress_time=state["last_progress"], error_class=pending["error_class"], time=now), now)
+                pending["flagged"] = True
+        if pending and pending.get("flagged") and not pending.get("lane_sent"):
+            pending["lane_sent"] = emit_stall(args, jobdir, pending)
+        atomic_json(state_path, state)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--job", required=True)
@@ -324,10 +494,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--scopefuel", default="")
     parser.add_argument("--pane-kind", required=True)
     parser.add_argument("--observed", default="")
+    parser.add_argument("--owner-lane", default="")
     args = parser.parse_args(argv)
     try:
-        output = observe(args, sys.stdin.read())
-    except (OSError, UnicodeError):
+        transcript = sys.stdin.read()
+        pane_failure = ""
+        try:
+            observe_pane(args, transcript)
+        except (OSError, UnicodeError, ValueError, TypeError, AttributeError):
+            # A damaged audit state must not disable the existing quota hold.
+            pane_failure = "pane-observer-failed-state-io"
+        output = " ".join(part for part in (observe(args, transcript), pane_failure) if part)
+    except (OSError, UnicodeError, ValueError):
         output = "observer-failed-input"
     if output:
         print(output)

@@ -517,6 +517,43 @@ class EligibilityFixtures(unittest.TestCase):
             self.assertEqual((check["status"], check["reason_code"]),
                              ("FAIL", "PROFILE_ROLE_DENIED"))
 
+    def test_status_lines_never_replace_a_fusion_footer(self):
+        label = "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium"
+        for status in ("Devin update available", "Opus is thinking about it", "Fusion mode enabled", "GPT-5 note without separator"):
+            self.assertEqual(eligible._latest_model_footer(label + "\n" + status), label)
+            self.assertTrue(eligible._pane_model_matches(label + "\n" + status,
+                            "fusion-gpt-6-1-sol-high-sidekick-swe-2-medium", ""))
+
+    def test_observed_fusion_contributor_adds_all_families_and_unknown_fails_closed(self):
+        evidence = self.evidence(self.make_head(), declared_t="T3", required_grade="A+", implementation_grade="A+")
+        evidence["contributors"] = [{"profile": "devin-swe2", "model": "swe-2", "effort": "",
+            "role": "worker", "kind": "initial", "session": "contributor", "worktree": "/tmp/contributor"}]
+        evidence["tester"] = {"planned_profile": "codex-sol", "planned_effort": "xhigh"}
+        directory = Path(self.temp.name) / "contributor/events"
+        directory.mkdir(parents=True)
+        evidence["contributors"][0]["job_record_dir"] = str(directory.parent)
+        def record(name, raw):
+            (directory / name).write_text(json.dumps({"kind": "job.model_observed", "payload": eligible.parse_model_line(raw)}))
+        self.assert_case(self.check(evidence), "independence", "PASS", "CROSS_FAMILY")
+        record("01-job.model_observed.json", "Fusion · GPT-6.1 Sol ◆ SWE-2 Medium")
+        record("02-job.model_observed.json", "SWE-2 High")
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_T3")
+        evidence["tester"] = {"planned_profile": "opus", "planned_effort": "high"}
+        self.assert_case(self.check(evidence), "independence", "PASS", "CROSS_FAMILY")
+        record("03-job.model_observed.json", "Fusion · GPT-6.1 Sol ◆ NewModel High")
+        self.assert_case(self.check(evidence), "independence", "UNVERIFIED", "FAMILY_UNKNOWN")
+        self.assert_case(self.check(evidence), "contributors", "UNVERIFIED", "CONTRIBUTOR_MODEL_UNATTRIBUTED")
+
+    def test_new_contributor_observation_invalidates_previous_receipt(self):
+        evidence = self.evidence(self.make_head())
+        directory = Path(self.temp.name) / "contributor/events"
+        directory.mkdir(parents=True)
+        evidence["contributors"][0]["job_record_dir"] = str(directory.parent)
+        landed = self.landed(evidence)
+        record = {"kind": "job.model_observed", "payload": eligible.parse_model_line("SWE-2 High")}
+        (directory / "01-job.model_observed.json").write_text(json.dumps(record))
+        self.assert_case(self.check(landed, "post-landing"), "prior", "UNVERIFIED", "EVIDENCE_CHANGED")
+
     def test_existing_model_footers_match_base_differential(self) -> None:
         # hk 1729 r2 B1: the Fusion-Sol change must not move the generic
         # footer path. The fixture holds the round-1 tester's 133 cases with
