@@ -42,12 +42,15 @@ ANSI = re.compile(r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07]*(?:\x07|\x1b\\))")
 ABSOLUTE = re.compile(r"\bat\s+(\d(?:\s*\d)?)\s*:\s*(\d(?:\s*\d)?)\s+UTC\b", re.IGNORECASE)
 RELATIVE = re.compile(r"\breset\s+in\s+(\d+)\s+minutes?\b", re.IGNORECASE)
 # Devin free-window notices seen in the field advertise a reset within about
-# an hour of the notice, so a stated UTC reset already this far behind the
-# observation cannot be the window that notice meant: the window simply
-# ended before the pane was read (slept host, late sentinel, notice printed
-# with under a minute left) and no hold should be recorded. A stated reset
-# further back than GRACE must instead belong to the next day. Six hours is
-# far above the ~1h notice horizon and well under the 24h rollover cap.
+# an hour of the notice, so a genuine reset is never more than 24h - GRACE
+# ahead of the observation: a stated UTC reset that far out cannot be the
+# window the notice meant. Either side of UTC midnight the most recent
+# occurrence of the stated HH:MM is the candidate that already passed, and
+# when it lies within GRACE behind the observation the window simply ended
+# before the pane was read (slept host, late sentinel, notice printed with
+# under a minute left) and no hold is recorded. Only a stated reset further
+# back than GRACE rolls to the next day. Six hours is far above the ~1h
+# notice horizon and well under the 24h rollover cap.
 GRACE = dt.timedelta(hours=6)
 # Relative and absolute spellings of the same reset are allowed to differ by
 # rounding; beyond this they disagree and the earlier reset wins.
@@ -99,12 +102,13 @@ def parse_rate_limit(transcript: str, observed: dt.datetime) -> dict[str, object
         hour, minute = (int(re.sub(r"\s+", "", part)) for part in absolute.groups())
         if hour < 24 and minute < 60:
             stated = observed.replace(hour=hour, minute=minute, second=0, microsecond=0)
-            if stated > observed:
-                absolute_reset = stated
-            elif observed - stated <= GRACE:
+            previous = stated if stated <= observed else stated - dt.timedelta(days=1)
+            if observed - previous <= GRACE:
                 # The stated window already ended; the notice was read late.
-                absolute_reset = stated
+                absolute_reset = previous
                 absolute_expired = True
+            elif stated > observed:
+                absolute_reset = stated
             else:
                 absolute_reset = stated + dt.timedelta(days=1)
             # A wall-clock reset is at most one day away after the rollover.

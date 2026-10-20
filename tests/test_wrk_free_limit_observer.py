@@ -182,6 +182,51 @@ class FreeLimitObserverTests(unittest.TestCase):
         self.assertIn("observer-expired-reset=2026-10-20T00:30:00Z", after.stdout)
         self.assertEqual(len(self.calls()), 1)
 
+    def test_stale_notice_just_after_midnight_records_no_hold(self) -> None:
+        notice = provider_notice("Reached free model rate limit (at 23:59 UTC)")
+        for observed, job in (
+            ("2026-10-20T00:00:00Z", "just-midnight-job"),
+            ("2026-10-20T00:30:00Z", "after-midnight-30-job"),
+            ("2026-10-20T05:58:00Z", "after-midnight-558-job"),
+        ):
+            with self.subTest(observed=observed):
+                event = observer.parse_rate_limit(notice, when(observed))
+                self.assertTrue(event["expired"])
+                self.assertEqual(event["reset"], "2026-10-19T23:59:00Z")
+                result = self.run_helper(notice, observed, job=job)
+                self.assertEqual(result.returncode, 0)
+                self.assertIn("observer-expired-reset=2026-10-19T23:59:00Z", result.stdout)
+                state = json.loads(
+                    (self.root / job / "free-limit-observer.json").read_text()
+                )
+                self.assertEqual(len(state["events"]), 1)
+                self.assertEqual(state["events"][0]["result"], "expired")
+        self.assertEqual(self.calls(), [])
+
+    def test_previous_day_candidate_beyond_grace_takes_todays_reset(self) -> None:
+        notice = provider_notice("Reached free model rate limit (at 23:59 UTC)")
+        event = observer.parse_rate_limit(notice, when("2026-10-20T06:00:00Z"))
+        self.assertFalse(event["expired"])
+        self.assertEqual(event["reset"], "2026-10-20T23:59:00Z")
+        result = self.run_helper(notice, "2026-10-20T06:00:00Z", job="beyond-grace-job")
+        self.assertIn("observer-ok-reset=2026-10-20T23:59:00Z", result.stdout)
+        self.assertEqual(len(self.calls()), 1)
+        args = self.calls()[0]
+        self.assertEqual(args[args.index("--reset") + 1], "2026-10-20T23:59:00Z")
+
+    def test_expired_post_midnight_signature_does_not_suppress_new_notice(self) -> None:
+        stale = provider_notice("Reached free model rate limit (at 23:59 UTC)")
+        first = self.run_helper(stale, "2026-10-20T00:30:00Z", job="midnight-renewed")
+        self.assertIn("observer-expired", first.stdout)
+        fresh = provider_notice("Reached free model rate limit (at 01:15 UTC)")
+        second = self.run_helper(fresh, "2026-10-20T00:40:00Z", job="midnight-renewed")
+        self.assertIn("observer-ok-reset=2026-10-20T01:15:00Z", second.stdout)
+        self.assertEqual(len(self.calls()), 1)
+        state = json.loads(
+            (self.root / "midnight-renewed" / "free-limit-observer.json").read_text()
+        )
+        self.assertEqual([event["result"] for event in state["events"]], ["expired", "rc-0"])
+
     def test_disagreeing_relative_and_absolute_pick_earlier_reset(self) -> None:
         absolute_earlier = provider_notice(
             "Reached free model rate limit; reset in 130 minutes (at 08:01 UTC)"
