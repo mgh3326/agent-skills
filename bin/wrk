@@ -494,9 +494,11 @@ remote spawner names the host by in its hosts.toml). The machine_id
 fallback is builder-only: an unmapped worker still warns once and spawns
 unregistered, because a fleet worker must never become a global lane.
 
-The job.spawned meta records hub_lane/hub_lane_machine and `wrk reap
---apply` removes the lane with `panewire lanes rm` only when `lanes ls`
-still shows the same machine and pane. For a remote --host NAME BUILDER
+The job.spawned meta records hub_lane/hub_lane_machine plus lane_role (the
+role the lane registered under: builder, or worker for worker, tester,
+reviewer and counsel seats), and `wrk reap --apply` removes the lane with
+`panewire lanes rm`, resolving the credential chain from that lane_role,
+only when `lanes ls` still shows the same machine and pane. For a remote --host NAME BUILDER
 spawn the ssh-delegated wrk on the target cannot reach the hub — PUT
 /v1/lanes wants the operator credential, which stays on the initiating
 host (per-host machine-scoped tokens are the step-4 follow-up) — so the
@@ -3060,10 +3062,20 @@ arbiter_record_spawn_receipt() {
   # ends rather than re-placing the job). The still-armed pane trap closes the
   # pane; an untracked lane is never left behind.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
-  local payload receipt_rc
-  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" "${TASK_ID:-}" "${HUB_LANE:-}" "${HUB_LANE_MACHINE:-}" <<'PY'
+  local payload receipt_rc lane_role
+  # #1438: the role the lane was registered under — the same normalization
+  # hub_lane_register applies (captain is already builder by now; tester,
+  # reviewer and counsel seats are leaf worker lanes). It rides in the receipt
+  # because reap cannot recover it from the claim: claim roles are cumulative,
+  # and a job id first claimed as builder then reused by a worker spawn would
+  # otherwise remove the worker lane with the builder (operator) credential.
+  case "${ROLE:-worker}" in
+    builder|captain) lane_role=builder ;;
+    *) lane_role=worker ;;
+  esac
+  if ! payload="$(python3 - "$PANE" "$LABEL" "$MODEL" "$WS" "${TAB_ID:-}" "${KEEP:-0}" "${TASK_ID:-}" "${HUB_LANE:-}" "${HUB_LANE_MACHINE:-}" "$lane_role" <<'PY'
 import json, sys
-pane_id, label, profile, workspace, tab_id, keep, task_id, hub_lane, hub_lane_machine = sys.argv[1:]
+pane_id, label, profile, workspace, tab_id, keep, task_id, hub_lane, hub_lane_machine, lane_role = sys.argv[1:]
 receipt = {
     "pane_id": pane_id,
     "label": label,
@@ -3083,9 +3095,12 @@ if keep == "1":
     receipt["keep"] = True
 # #965: the hub lane this spawn registered. wrk reap removes exactly this lane
 # — a spawn without one keeps the receipt byte-identical to before.
+# #1438: lane_role travels with the lane it describes, so a receipt without a
+# hub_lane gains nothing.
 if hub_lane:
     receipt["hub_lane"] = hub_lane
     receipt["hub_lane_machine"] = hub_lane_machine
+    receipt["lane_role"] = lane_role
 print(json.dumps(receipt, ensure_ascii=False, separators=(",", ":")))
 PY
 )"; then
@@ -10101,7 +10116,9 @@ closed job records a flat job.reaped event (pane_id, tab_id, at).
 A job whose newest job.spawned receipt records a hub lane (hub_lane; spawned
 under a session mapped in hosts.toml's [hub] session_machine_ids, #965) is
 additionally deregistered on --apply: `panewire lanes rm LANE` with the [hub]
-lane credentials resolved by the lane's role — a worker lane uses
+lane credentials resolved by the lane's role — the lane_role that receipt
+records, not the job's claim role (#1438); a receipt without lane_role is a
+worker lane — a worker lane uses
 lanes_token_env when set, else hub_token_env (operator_token_env is never
 read for it, the pre-#1397 contract); a builder lane inserts
 operator_token_env between the two — once the tab close is confirmed — and only while
@@ -10172,6 +10189,7 @@ for job in jobs:
         continue
     owner = pane = tab = role = ""
     spawned_pane = spawned_tab = spawned_hub_lane = spawned_hub_lane_machine = ""
+    spawned_lane_role = ""
     saw_spawn = False
     terminal_at = None
     revived = False
@@ -10212,6 +10230,14 @@ for job in jobs:
             # row still matches the recorded machine+pane pair.
             spawned_hub_lane = payload.get("hub_lane") if isinstance(payload.get("hub_lane"), str) else ""
             spawned_hub_lane_machine = payload.get("hub_lane_machine") if isinstance(payload.get("hub_lane_machine"), str) else ""
+            # #1438: the role that registered that lane rides in the same
+            # receipt, so the credential chain follows the lane's own spawn —
+            # never the cumulative claim role (a job id first claimed as a
+            # builder and reused by a worker spawn would otherwise remove the
+            # worker lane with the operator credential). Only the exact
+            # builder literal selects the builder chain; an absent (legacy
+            # receipt) or unknown value is the narrower worker chain.
+            spawned_lane_role = "builder" if payload.get("lane_role") == "builder" else "worker"
         if kind == "job.reaped":
             reaped = True
         # 보호 표시(`wrk spawn --keep`, #603)는 누적이다: claim·reclaim·spawn 영수증 중
@@ -10266,11 +10292,13 @@ for job in jobs:
         spawned_hub_lane = ""
     if any(c.isspace() for c in spawned_hub_lane_machine):
         spawned_hub_lane_machine = ""
-    # #1397: the claim's role travels too — hub_lane_remove resolves the lane's
+    # #1397: the lane's role travels too — hub_lane_remove resolves the lane's
     # credential chain per role (a worker lane never reads operator_token_env;
-    # a builder lane may). An unreadable/absent role marks "-" and the removal
-    # falls back to the narrower worker chain.
-    print(job, owner or "-", pane, tab or "-", age, "-", spawned_hub_lane or "-", spawned_hub_lane_machine or "-", role or "-", sep="\t")
+    # a builder lane may). #1438: that role is the newest spawn receipt's
+    # lane_role, not the cumulative claim role above (which only filters
+    # --include-builders). Lane and role come from the one receipt that owns
+    # the live lane; with no lane the field is unused and prints "-".
+    print(job, owner or "-", pane, tab or "-", age, "-", spawned_hub_lane or "-", spawned_hub_lane_machine or "-", spawned_lane_role if spawned_hub_lane else "-", sep="\t")
 PY
 }
 

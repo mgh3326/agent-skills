@@ -3981,16 +3981,22 @@ lanes_reap_run() {
 }
 
 lanes_reap_job() {
-  # JOB PANE TAB LANE HUB_LANE [LABEL [MACHINE [ROLE]]] — claim + job.spawned
-  # (+hub_lane/hub_lane_machine when nonempty) + job.completed, all backdated
-  # past the default grace. LABEL defaults to JOB (#994 needs lane != job !=
-  # label so a remove-by-job-id regression cannot pass silently). ROLE
-  # defaults to worker — the claim records it, reap's per-role credential
-  # chain and the --include-builders filter both read it (#1397).
+  # JOB PANE TAB LANE HUB_LANE [LABEL [MACHINE [ROLE [LANE_ROLE]]]] — claim +
+  # job.spawned (+hub_lane/hub_lane_machine/lane_role when HUB_LANE is
+  # nonempty) + job.completed, all backdated past the default grace. LABEL
+  # defaults to JOB (#994 needs lane != job != label so a remove-by-job-id
+  # regression cannot pass silently). ROLE defaults to worker — the claim
+  # records it, and the --include-builders filter reads it (#1397). The
+  # credential chain reads the receipt's lane_role instead (#1438): LANE_ROLE
+  # defaults to ROLE, as a real spawn registers a lane under its own role,
+  # and "-" writes the legacy receipt that carries none.
   local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5" label="${6:-$1}" machine="${7:-mac-work-default}" role="${8:-worker}"
+  local lane_role="${9:-$role}"
   local spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}"
   if [[ -n "$hub_lane" ]]; then
-    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"$machine\"}"
+    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"$machine\""
+    [[ "$lane_role" == - ]] || spawned+=",\"lane_role\":\"$lane_role\""
+    spawned+="}"
   fi
   local claim_role=(--role "$role")
   [[ "$role" == builder ]] && claim_role+=(--parent-lane director-x)
@@ -4003,6 +4009,65 @@ lanes_reap_job() {
     --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
   unset ARBITER_TEST_NOW
 }
+
+lanes_reap_reused_job() {
+  # JOB PANE TAB LANE HUB_LANE LABEL MACHINE LANE_ROLE... — a job id first
+  # claimed as a builder, released, reclaimed by a worker spawn (#1438; the
+  # reap_builder_reclaimed_job shape), whose job.spawned receipts then land in
+  # order, one per LANE_ROLE argument ("-" writes a legacy receipt with no
+  # lane_role), each naming HUB_LANE on MACHINE — then job.completed. The
+  # cumulative claim role stays builder; only the receipts say what the
+  # lane is.
+  local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5" label="$6" machine="$7"
+  shift 7
+  local lane_role receipt
+  export ARBITER_TEST_NOW="$LANES_REAP_NOW"
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 \
+    --role builder --parent-lane director-x >/dev/null
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" lease \
+    --job "$job" --resource "$TMP/reap-$job" --kind path >/dev/null
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" release \
+    --job "$job" --resource "$TMP/reap-$job" --kind path --force >/dev/null
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" claim --reclaim-released \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 >/dev/null
+  for lane_role in "$@"; do
+    receipt="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"$machine\""
+    [[ "$lane_role" == - ]] || receipt+=",\"lane_role\":\"$lane_role\""
+    env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+      --payload-json "$receipt}" >/dev/null
+  done
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
+
+# Asserts one `lanes ls` + `lanes rm LANE` pair reached panewire, each
+# carrying WANT as its only hub token path and never OTHER.
+t1438_assert_rm_chain() {  # LOG WANT OTHER LANE
+  python3 - "$@" <<'PY'
+import sys
+log, want, other, lane = sys.argv[1:5]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+envs = [got[i + 1] for i, x in enumerate(got) if x == "--hub-token-env"]
+assert envs == [want, want], "ls+rm must each carry %r, got %r" % (want, got)
+assert other not in got, "the other credential reached panewire argv: %r" % got
+assert got.count("rm") == 1 and got[got.index("rm") + 1] == lane, \
+    "exactly one rm of %r expected: %r" % (lane, got)
+PY
+}
+# The lane_role the single spawn receipt of NAME carries, or "absent".
+t1438_receipt_lane_role() {  # NAME
+  lanes_spawned_payload "$1" | python3 -c '
+import json, sys
+print(json.loads(sys.stdin.read()).get("lane_role", "absent"))'
+}
+T1438_LS='{"lanes":[{"lane":"%s","machine":"%s","pane":"%s","parent":"work-kairos","sink":false}]}'
+# shellcheck disable=SC2059 # the template is the fixture's own format string
+t1438_ls() { printf "$T1438_LS" "$1" "$2" "$3"; }  # LANE MACHINE PANE
 
 run_lanes_tests() {
   # AC1 — mapped session + --owner: exactly one `lanes add` carrying the
@@ -5735,6 +5800,196 @@ PY
     fail "#1397 M13 mutant survived: the worker reap still skips operator_token_env"
   fi
   echo "PASS 1397-lanes M13: re-widening the worker chain goes RED (register + reap)"
+
+  # ------------------------------------------------------------------
+  # #1438 — reap resolves a lane's credential chain from the role that
+  # registered it (the job.spawned receipt's lane_role), not from the
+  # cumulative claim role: a job id first claimed as builder, released and
+  # reused by a worker spawn must never lose its worker lane to the
+  # operator credential
+  # ------------------------------------------------------------------
+  # AC1 — claim as builder, release, reclaim as worker: the cumulative role
+  # is builder (so --include-builders is needed), but the receipt says the
+  # lane is a worker lane. Both the ls confirmation and the rm carry the
+  # hub_token file of the worker chain — never the operator credential the
+  # same config also holds.
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1438"
+  lanes_reap_reused_job j1438-reuse w1:p10 w1:t10 own-1438a lane-1438-reuse lbl-1438a mac-work-default worker
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-reuse mac-work-default w1:p10)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac1 --lane own-1438a --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC1: apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j1438-reuse ' "$LANES_REAP_OUT" ||
+    fail "#1438 AC1: the reused job must close: $(cat "$LANES_REAP_OUT")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_OP_FILE" lane-1438-reuse ||
+    fail "#1438 AC1: a builder-then-worker job id must remove its worker lane with the hub_token file, never the operator credential"
+  echo "PASS 1438-lanes AC1: a reused job id's worker lane is removed with the worker chain"
+
+  # AC2 — the reverse: a builder spawn receipt (lane_role builder) keeps the
+  # builder chain on the same config, so the narrower reading never reaches a
+  # real builder lane. (AC1c pins the operator-only host.)
+  lanes_reap_job j1438-bld w1:p11 w1:t11 own-1438b lane-1438-bld lbl-1438b mac-work-default builder
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-bld mac-work-default w1:p11)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac2 --lane own-1438b --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC2: apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_OP_FILE" "$LANES_TOKEN_FILE" lane-1438-bld ||
+    fail "#1438 AC2: a builder lane receipt must keep the operator credential"
+  echo "PASS 1438-lanes AC2: a builder receipt still removes with the builder chain"
+
+  # AC3 — a legacy receipt (hub_lane, no lane_role) is the worker chain even
+  # when the claim says builder: on a host holding both credentials it takes
+  # the hub_token file; on an operator-only host nothing is called, the
+  # existing worker warning names the missing credential, and the job still
+  # closes — the row stays for the lanes-missing audit.
+  lanes_reap_job j1438-legacy w1:p12 w1:t12 own-1438c lane-1438-legacy lbl-1438c mac-work-default builder -
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-legacy mac-work-default w1:p12)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac3a --lane own-1438c --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC3: legacy apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_OP_FILE" lane-1438-legacy ||
+    fail "#1438 AC3: a legacy receipt must use the worker chain"
+  lanes_reap_job j1438-legacy-op w1:p13 w1:t13 own-1438e lane-1438-legacy-op lbl-1438e mac-personal builder -
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-legacy-op mac-personal w1:p13)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_OP" \
+    lanes_reap_run 1438-ac3b --lane own-1438e --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC3: legacy operator-only apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j1438-legacy-op ' "$LANES_REAP_OUT" ||
+    fail "#1438 AC3: the legacy job must still close: $(cat "$LANES_REAP_OUT")"
+  [[ ! -s "$LANES_RM_LOG" ]] ||
+    fail "#1438 AC3: an operator-only host must not ls/rm a legacy lane: $(cat "$LANES_RM_LOG")"
+  grep -q "hub lane 'lane-1438-legacy-op' not removed (hub_url missing or neither hub_token_env nor lanes_token_env set" "$LANES_REAP_ERR" ||
+    fail "#1438 AC3: the existing worker warning must name the skipped removal: $(cat "$LANES_REAP_ERR")"
+  echo "PASS 1438-lanes AC3: a legacy receipt takes the worker chain (operator-only host skips with the warning)"
+
+  # AC4 — a respawned job carries two receipts for one lane: the newest one
+  # owns the live lane, in both orders. builder-then-worker takes the worker
+  # chain, worker-then-builder the builder chain.
+  lanes_reap_reused_job j1438-respawn-w w1:p14 w1:t14 own-1438d lane-1438-respawn-w lbl-1438d mac-work-default builder worker
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-respawn-w mac-work-default w1:p14)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac4a --lane own-1438d --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC4: respawn apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_OP_FILE" lane-1438-respawn-w ||
+    fail "#1438 AC4: the newest (worker) receipt must win over the older builder one"
+  lanes_reap_reused_job j1438-respawn-b w1:p15 w1:t15 own-1438f lane-1438-respawn-b lbl-1438f mac-work-default worker builder
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-respawn-b mac-work-default w1:p15)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac4b --lane own-1438f --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC4: respawn apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_OP_FILE" "$LANES_TOKEN_FILE" lane-1438-respawn-b ||
+    fail "#1438 AC4: the newest (builder) receipt must win over the older worker one"
+  echo "PASS 1438-lanes AC4: the newest job.spawned receipt decides the chain, in both orders"
+
+  # AC5 — the receipt writer. lane_role is the normalized registration role,
+  # and rides only with a hub_lane: a worker, a tester seat (leaf worker lane),
+  # a builder and a --lane-defer builder (the remote execution host's path)
+  # each record theirs; a spawn that registered no lane leaves the receipt
+  # exactly as before.
+  HERDR_SESSION=default lanes_spawn w1438-worker --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: worker spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$(t1438_receipt_lane_role w1438-worker)" == worker ]] ||
+    fail "#1438 AC5: a worker receipt must record lane_role worker"
+  HERDR_SESSION=default lanes_spawn w1438-tester --owner work-kairos --role tester
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: tester spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$(t1438_receipt_lane_role w1438-tester)" == worker ]] ||
+    fail "#1438 AC5: a tester seat registers a worker lane and must record lane_role worker"
+  LANES_CFG_OVERRIDE="$LANES_CFG_OP" LANES_MODEL=builder-sol \
+    lanes_spawn b1438-builder --role builder --lane b1438-builder --parent director-x
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: builder spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$(t1438_receipt_lane_role b1438-builder)" == builder ]] ||
+    fail "#1438 AC5: a builder receipt must record lane_role builder"
+  LANES_MODEL=builder-sol HERDR_SESSION=default \
+    lanes_spawn b1438-defer --role builder --lane b1438-defer --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: deferred builder spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$(t1438_receipt_lane_role b1438-defer)" == builder ]] ||
+    fail "#1438 AC5: a --lane-defer builder receipt must record lane_role builder"
+  HERDR_SESSION=worker lanes_spawn w1438-nolane --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: unmapped worker spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_spawned_payload w1438-nolane | python3 -c '
+import json, sys
+payload = json.loads(sys.stdin.read())
+assert set(payload) == {"pane_id", "label", "profile", "workspace", "tab_id", "task_id"}, payload' ||
+    fail "#1438 AC5: a receipt without a hub_lane must keep exactly its pre-change fields"
+  echo "PASS 1438-lanes AC5: lane_role is recorded with the lane, by every receipt writer path"
+
+  # -- #1438 assertion-RED mutants -----------------------------------------
+  # M1: the cumulative claim role printed as the 9th field again — AC1's
+  # reused worker lane then carries the operator credential.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1438-cumulative \
+    'spawned_hub_lane_machine or "-", spawned_lane_role if spawned_hub_lane else "-", sep="\t")' \
+    'spawned_hub_lane_machine or "-", role or "-", sep="\t")'
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1438-m1"
+  lanes_reap_reused_job j1438-m1 w1:p10 w1:t10 own-1438m1 lane-1438-m1 lbl-1438m1 mac-work-default worker
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1438-cumulative" \
+    WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-m1 mac-work-default w1:p10)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-m1 --lane own-1438m1 --apply --include-builders
+  if ! grep -qxF "$LANES_OP_FILE" "$LANES_RM_LOG"; then
+    fail "#1438 M1 mutant survived: the cumulative role no longer reaches the worker lane"
+  fi
+  echo "PASS 1438-lanes M1: printing the cumulative role as the 9th field goes RED"
+
+  # M2: lane_role dropped from the receipt — every spawn then writes a
+  # receipt AC5 rejects, and reap would read every builder lane as legacy.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1438-nolanerole \
+    '    receipt["lane_role"] = lane_role' \
+    '    pass'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1438-nolanerole" \
+    LANES_CFG_OVERRIDE="$LANES_CFG_OP" LANES_MODEL=builder-sol \
+    lanes_spawn b1438-m2 --role builder --lane b1438-m2 --parent director-x
+  [[ "$LANES_RC" -eq 0 ]] || fail "#1438 M2: mutant builder spawn failed: $(cat "$LANES_ERR")"
+  if [[ "$(t1438_receipt_lane_role b1438-m2)" != absent ]]; then
+    fail "#1438 M2 mutant survived: the receipt still carries lane_role"
+  fi
+  echo "PASS 1438-lanes M2: dropping lane_role from the receipt goes RED"
+
+  # M3: lane_role read from the oldest job.spawned instead of the newest —
+  # AC4's builder-then-worker respawn then removes the lane with operator.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1438-oldest \
+    '            spawned_lane_role = "builder" if payload.get("lane_role") == "builder" else "worker"' \
+    '            spawned_lane_role = spawned_lane_role or ("builder" if payload.get("lane_role") == "builder" else "worker")'
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1438-m3"
+  lanes_reap_reused_job j1438-m3 w1:p14 w1:t14 own-1438m3 lane-1438-m3 lbl-1438m3 mac-work-default builder worker
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1438-oldest" \
+    WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-m3 mac-work-default w1:p14)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-m3 --lane own-1438m3 --apply --include-builders
+  if ! grep -qxF "$LANES_OP_FILE" "$LANES_RM_LOG"; then
+    fail "#1438 M3 mutant survived: the oldest receipt no longer decides the chain"
+  fi
+  echo "PASS 1438-lanes M3: reading lane_role from the oldest receipt goes RED"
+
+  # M4: a legacy receipt inheriting the cumulative claim role — AC3's legacy
+  # builder-claimed lane then takes the operator credential again.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1438-legacyrole \
+    'spawned_lane_role = "builder" if payload.get("lane_role") == "builder" else "worker"' \
+    'spawned_lane_role = "builder" if payload.get("lane_role", role) == "builder" else "worker"'
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1438-m4"
+  lanes_reap_job j1438-m4 w1:p12 w1:t12 own-1438m4 lane-1438-m4 lbl-1438m4 mac-work-default builder -
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1438-legacyrole" \
+    WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-m4 mac-work-default w1:p12)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-m4 --lane own-1438m4 --apply --include-builders
+  if ! grep -qxF "$LANES_OP_FILE" "$LANES_RM_LOG"; then
+    fail "#1438 M4 mutant survived: a legacy receipt no longer inherits the claim role"
+  fi
+  echo "PASS 1438-lanes M4: a legacy receipt inheriting the claim role goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then
