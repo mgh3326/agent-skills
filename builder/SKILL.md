@@ -58,6 +58,12 @@ kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없
 필요하고 게이트는 그 런그를 `--effort`로 판정한다(grok·sol-medium 런그는 에스컬레이션이 아니므로
 `--operator-request` 불요). 기존 `builder-grok`·`builder-sol-high`는 그대로 — 별도 철자다
 (`builder-sol-high`는 #704의 `codex-sol@high` 표식 규칙 유지).
+hk 1796은 같은 규칙으로 hk 1786 팔의 네 런그를 연다 — `builder-sonnet-medium`
+(`SCOPEFUEL_E6_ARM=sonnet@medium`), `builder-haiku-low`(`haiku@low`),
+`builder-luna-low`(`codex-luna@low`), `builder-luna-medium`(`codex-luna@medium`).
+넷 다 배치된 canon 행이라 표식은 게이트 판정을 그 행으로만 좁히고,
+luna 쌍은 `codex-luna@<런그>`로 게이트되며 모델 id는 카탈로그 행에서 온다
+(오늘 codex-luna@low 는 gpt-5.6-luna).
 **2026-09-26 운영자 결정으로 max 런그 철자(`builder-sonnet-max`·`builder-sol-max`·
 `builder-luna-max`·`builder-kimi-max`)는 닫혔다** — 빌더 좌석은
 max 를 쓸 수 없으므로 `SCOPEFUEL_E6_ARM` 표식과 무관하게 wrk 가 거부한다.
