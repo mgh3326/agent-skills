@@ -361,6 +361,25 @@
         "T1"
       ]
     },
+    "builder-haiku-low": {
+      "default_effort": "low",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "low": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-kimi": {
       "default_effort": "",
       "family": "moonshot",
@@ -434,6 +453,25 @@
         "T2"
       ]
     },
+    "builder-luna-low": {
+      "default_effort": "low",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "low": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-luna",
+      "model": "gpt-5.6-luna",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-luna-max": {
       "default_effort": "max",
       "family": "openai",
@@ -441,6 +479,25 @@
       "grade_status": "conflict",
       "grades": {
         "max": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
+      "model": "gpt-6-luna",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-luna-medium": {
+      "default_effort": "medium",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "medium": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
@@ -631,6 +688,25 @@
       "grade_status": "conflict",
       "grades": {
         "max": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model sonnet",
+      "model": "claude-sonnet-5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-sonnet-medium": {
+      "default_effort": "medium",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "medium": null
       },
       "launcher": "claude",
       "launcher_model_token": "--model sonnet",

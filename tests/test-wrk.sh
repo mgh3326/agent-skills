@@ -249,11 +249,12 @@ grep -qx 'builder-kimi' <<<"$profiles_out"
 grep -qx 'builder-luna' <<<"$profiles_out"
 grep -qx 'builder-sonnet' <<<"$profiles_out" ||
   fail "wrk profiles lost builder-sonnet (#921)"
-# #704 (#594 E6) + #737 (decision 4088): the per-rung builder spellings.
+# #704 (#594 E6) + #737 (decision 4088) + hk 1796: the per-rung builder spellings.
 for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
   builder-sol-high builder-sol-max builder-sol-medium builder-luna-max \
   builder-kimi-high builder-kimi-max \
-  builder-grok-low builder-grok-medium builder-grok-xhigh; do
+  builder-grok-low builder-grok-medium builder-grok-xhigh \
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium; do
   grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
 done
 grep -qx 'captain-opus' <<<"$profiles_out"
@@ -9809,7 +9810,8 @@ echo "PASS builder-parent-and-director-lane-guards"
 for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
   builder-luna-max builder-kimi-high builder-kimi-max \
-  builder-grok-low builder-grok-medium builder-grok-xhigh; do
+  builder-grok-low builder-grok-medium builder-grok-xhigh \
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -9836,7 +9838,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -10548,7 +10550,16 @@ e6_builder_case builder-kimi-high    kimi-k3     high   '--auto -m kimi-code/k3'
 e6_builder_case builder-grok-low     grok-hi     low    '--always-approve -m grok-4.7 --effort low'
 e6_builder_case builder-grok-medium  grok-hi     medium '--always-approve -m grok-4.7 --effort medium'
 e6_builder_case builder-grok-xhigh   grok-hi     xhigh  '--always-approve -m grok-4.7 --effort xhigh'
-echo "PASS 704+737 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
+# hk 1796: the four hk 1786 arms on the same pin rule. All four are placed
+# canon rows — no --operator-request anywhere. The luna pair must gate at
+# codex-luna@<rung> (NOT codex-luna-max) and take its model id from the
+# catalog row: the fixture serves gpt-5.6-luna for codex-luna@low, so a
+# launcher that hard-coded gpt-6-luna on the low spelling goes RED here.
+e6_builder_case builder-sonnet-medium sonnet     medium '--model sonnet --dangerously-skip-permissions --effort medium'
+e6_builder_case builder-haiku-low    haiku      low    '--model haiku --dangerously-skip-permissions --effort low'
+e6_builder_case builder-luna-low     codex-luna low    '--yolo -m gpt-5.6-luna -c model_reasoning_effort=low'
+e6_builder_case builder-luna-medium  codex-luna medium '--yolo -m gpt-6-luna -c model_reasoning_effort=medium'
+echo "PASS 704+737+1796 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
 # 2026-09-26 (decision 4088 B): the four max-rung builder spellings are closed —
 # a builder seat never takes a max rung, so the seat rule fires ahead of the
@@ -10989,7 +11000,8 @@ echo "PASS 748r3 kimi seat rule resolves real TOML, env overlay, and disabled Th
 # marker is no longer the operative refusal for them.
 for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
   builder-sol-high builder-sol-medium \
-  builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh; do
+  builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh \
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
@@ -11045,7 +11057,50 @@ set -e
   fail "builder-sol-medium with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
 grep -q 'SCOPEFUEL_E6_ARM=codex-sol@medium' <<<"$e6_rung_out" ||
   fail "wrong-rung refusal must name the required marker: $e6_rung_out"
-echo "PASS 704+737 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
+# hk 1796: same-profile wrong-rung markers refuse on each of the four new
+# spellings too — a marker for a different rung of the same gate profile
+# does not open the pinned rung.
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=sonnet@xhigh \
+  spawn_base builder-sonnet-medium --role builder --lane e6-smed-wrong-rung-lane --parent parent-lane \
+  --job e6-smed-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-sonnet-medium with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=sonnet@medium' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=haiku@medium \
+  spawn_base builder-haiku-low --role builder --lane e6-hkw-wrong-rung-lane --parent parent-lane \
+  --job e6-hkw-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-haiku-low with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=haiku@low' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=codex-luna@medium \
+  spawn_base builder-luna-low --role builder --lane e6-llow-wrong-rung-lane --parent parent-lane \
+  --job e6-llow-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-luna-low with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=codex-luna@low' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=codex-luna@low \
+  spawn_base builder-luna-medium --role builder --lane e6-lmed-wrong-rung-lane --parent parent-lane \
+  --job e6-lmed-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-luna-medium with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=codex-luna@medium' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+echo "PASS 704+737+1796 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
 
 # Escalation rung (fixture default escalation model — strict; NOT the
 # installed gate, whose #716 rule skips the ladder for --effort rungs): the
@@ -11241,6 +11296,39 @@ e6_eff_rc=$?
 set -e
 [[ "$e6_eff_rc" -eq 2 ]] ||
   fail "builder-sol-medium --effort high must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+# hk 1796: off-rung --effort dies on the pin for the four new spellings too.
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=sonnet@medium \
+  spawn_base builder-sonnet-medium --role builder --lane e6-smed-eff-lane --parent parent-lane \
+  --effort high --job e6-smed-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-sonnet-medium --effort high must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=haiku@low \
+  spawn_base builder-haiku-low --role builder --lane e6-hkw-eff-lane --parent parent-lane \
+  --effort medium --job e6-hkw-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-haiku-low --effort medium must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-luna@low \
+  spawn_base builder-luna-low --role builder --lane e6-llow-eff-lane --parent parent-lane \
+  --effort medium --job e6-llow-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-luna-low --effort medium must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-luna@medium \
+  spawn_base builder-luna-medium --role builder --lane e6-lmed-eff-lane --parent parent-lane \
+  --effort low --job e6-lmed-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-luna-medium --effort low must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
 set +e
 e6_eff_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
   spawn_base builder-kimi-high --role builder --lane e6-kimi-eff-lane --parent parent-lane \

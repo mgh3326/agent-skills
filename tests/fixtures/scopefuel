@@ -36,6 +36,10 @@ pool_for() {
 #   rc 2 -> scopefuel could not answer
 # WRK_LAUNCH_MODE: ok | stale | unsupported | broken | refused
 catalog_model_for() {
+  # $2 is the requested effort (may be empty — the rung default applies later).
+  # hk 1796: the real catalog grades codex-luna per rung and the low rung sits
+  # on gpt-5.6-luna today — mirror that so a launcher that hard-coded
+  # gpt-6-luna for the low spelling goes RED.
   case "$1" in
     devin-fusion-sol61) echo fusion-gpt-6-1-sol-high-sidekick-swe-2-medium ;;
     devin-fusion-sol61-xhigh) echo fusion-gpt-6-1-sol-xhigh-sidekick-swe-2-medium ;;
@@ -44,7 +48,8 @@ catalog_model_for() {
     fable) echo claude-fable-5-1 ;;
     codex-sol) echo gpt-6.1-sol ;;
     codex-terra|codex-terra-max) echo gpt-5.6-terra ;;
-    codex-luna|codex-luna-max) echo gpt-6-luna ;;
+    codex-luna) case "$2" in low) echo gpt-5.6-luna ;; *) echo gpt-6-luna ;; esac ;;
+    codex-luna-max) echo gpt-6-luna ;;
     codex-astra) echo gpt-6-astra ;;
     kiro-opus) echo claude-opus-5 ;;
     kiro-sonnet) echo claude-sonnet-5 ;;
@@ -140,7 +145,7 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
         exit 3
       fi ;;
   esac
-  launch_model="$(catalog_model_for "$launch_profile")"
+  launch_model="$(catalog_model_for "$launch_profile" "$launch_effort")"
   # Lets a test prove the launcher really reads the canon: serve a model id that
   # exists nowhere in bin/wrk and assert the argv carries it.
   [[ -z "${WRK_LAUNCH_MODEL_OVERRIDE:-}" ]] || launch_model="$WRK_LAUNCH_MODEL_OVERRIDE"

@@ -405,9 +405,11 @@ echo "PASS a missing scopefuel marks the brief catalog=stale (never a silent fal
 # has to be acknowledged in the same commit.
 WRK_CATALOG_SPELLINGS_SNAPSHOT="$(printf '%s\n' \
   builder-grok builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-luna builder-luna-max builder-opus builder-opus-low \
+  builder-haiku-low \
+  builder-luna builder-luna-low builder-luna-max builder-luna-medium \
+  builder-opus builder-opus-low \
   builder-opus-medium builder-sol builder-sol-high builder-sol-max \
-  builder-sol-medium builder-sol6 builder-sonnet builder-sonnet-max builder-sonnet-xhigh \
+  builder-sol-medium builder-sol6 builder-sonnet builder-sonnet-max builder-sonnet-medium builder-sonnet-xhigh \
   captain-opus captain-sol \
   cc-glm cc-qwen38 codex codex-astra codex-luna codex-luna-hi codex-luna-max \
   codex-max codex-sol fable grok grok-hi \
