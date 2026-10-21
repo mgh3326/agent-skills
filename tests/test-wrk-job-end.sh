@@ -180,7 +180,7 @@ recovery_arm_stub() {
 set -euo pipefail
 if [[ "\${1:-}" == status ]]; then
   job=""
-  while (($#)); do
+  while ((\$#)); do
     if [[ "\$1" == --job && \$# -ge 2 ]]; then job="\$2"; break; fi
     shift
   done
