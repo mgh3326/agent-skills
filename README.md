@@ -365,7 +365,7 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 `herdr agent get <pane>` 관측을 **3분류**하고, 판정 1건마다 잡 디렉토리의
 `completion-sentinel.log`에 한 줄씩 남긴다
 (`<ts> status=<상태|empty|err:code> transient=<n> action=<none|pending|completed|lost:reason|recovered:reason>`).
-같은 폴이 pending·completed 이면서 회복이면 action 은 그 판정이고 줄 끝에 `recovered=<reason>` 이 붙는다.
+action 이 `recovered:` 가 아닌 회복 폴(pending, completed, 또는 창 만료의 `lost:timeout`)은 줄 끝에 `recovered=<reason>` 이 붙는다.
 
 | 관측 | 분류 | 판정 |
 |---|---|---|
@@ -406,7 +406,9 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 있는 응답)일 때만 풀린다. pane만 있고 상태가 없는 응답은 회복이 아니다.
 `herdr_unreachable`은 herdr가 다시 답하면(class가 transient가 아니면) 풀리고, 그 답이
 gone이면 같은 폴에서 `agent_not_found` 에피소드를 새로 연다. `timeout`은 감시 창이라
-class=ok로 풀리지 않는다. 한 에피소드의 `job.lost`는 한 건이고, 같은 상태가 이어지는
+class=ok로 풀리지 않는다. 창이 이미 지난 회복 폴도 `job.lost`(`reason=timeout`)를
+남긴다. 그 폴은 부재 에피소드의 `job.recovered`를 쓴 뒤 timeout 에피소드를 연다.
+gone과 ok가 한 폴씩 번갈아 와도 창을 뒤로 미루지 못한다. 한 에피소드의 `job.lost`는 한 건이고, 같은 상태가 이어지는
 폴은 이벤트를 더 쓰지 않는다. `job.recovered`는 terminal도 revive도 아니다.
 
 분리된 센티널은 터미널에서 유도되는 herdr 세션 컨텍스트를 잃는다. 그래서 wrk는

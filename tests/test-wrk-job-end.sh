@@ -240,7 +240,7 @@ recovery_stop() {
     fi
     wait "$SENTINEL_PID" 2>/dev/null || true
   fi
-  unset LOST_GRACE SENT_INTERVAL SCENARIO TRANSIENT_MAX RECOVERY_ARBITER RECOVERY_STUB_LOG
+  unset LOST_GRACE SENT_INTERVAL SENT_TIMEOUT SCENARIO TRANSIENT_MAX RECOVERY_ARBITER RECOVERY_STUB_LOG
 }
 
 recovery_fail() {
@@ -1811,6 +1811,53 @@ echo "== JE43: herdr answering gone rearms agent_not_found =="
 case_recovery_herdr_gone || fail "JE43 herdr gone answer must rearm the loss"
 echo "PASS je43 herdr-unreachable-rearms-on-gone"
 
+# A strict gone/ok flap must not postpone the watch window. The sequence is
+# long enough that the run ends while the lines are still alternating: the
+# fixture repeats only its last line, and a trailing working line would let
+# the old check time out for the wrong reason.
+case_recovery_window_flap() {
+  reset_case je44 || return 3
+  mk_job je44 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je44-$CASE_SEQ.seq" events="$INBOX/je44/events" reasons i
+  : >"$seq"
+  for ((i = 0; i < 40; i++)); do
+    printf '%s\n' not-found working >>"$seq"
+  done
+  SENT_INTERVAL=1 LOST_GRACE=3 SENT_TIMEOUT=4 TRANSIENT_MAX=10 \
+    start_sentinel je44 w:p1 "$TMP/je44-report.md" "$seq"
+  wait_until 40 event_count_is "$events" job.revoked 1 ||
+    recovery_fail "a gone/ok flap past the watch window must revoke" || return
+  wait_until 10 pid_gone "$SENTINEL_PID" ||
+    recovery_fail "the sentinel must leave after the windowed flap" || return
+  event_count_is "$events" job.revoked 1 ||
+    recovery_fail "the windowed flap revokes once" || return
+  if event_count_is "$events" job.recovered 0; then
+    recovery_fail "the flap must recover the absence episodes" || return
+  fi
+  [[ "$(recovery_release_count)" -eq 1 ]] ||
+    recovery_fail "the windowed flap releases quota once (got $(recovery_release_count))" || return
+  if grep -q 'watch-exit' "$INBOX/je44/completion-sentinel.log"; then
+    recovery_fail "the windowed flap must not watch-exit" || return
+  fi
+  grep -q 'action=lost:timeout recovered=' "$INBOX/je44/completion-sentinel.log" ||
+    recovery_fail "the timeout poll must also log the recovery" || return
+  reasons="$(recovery_lost_reasons "$events")"
+  python3 - "$reasons" <<'PY' || recovery_fail "the flap must end in one timeout loss ($reasons)" || return
+import sys
+reasons = sys.argv[1].split()
+assert reasons, reasons
+assert reasons.count("timeout") == 1, reasons
+assert reasons[-1] == "timeout", reasons
+assert "agent_not_found" in reasons, reasons
+PY
+  recovery_stop
+}
+
+echo "== JE44: a gone/ok flap still hits the watch window =="
+case_recovery_window_flap || fail "JE44 gone/ok flap must not postpone the watch window"
+echo "PASS je44 flap-cannot-postpone-watch-window"
+
 # ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants: sed'd copies of bin/wrk (path ends in /wrk —
 # H02 — so every mutant sentinel is judged by the same argv identity rule).
@@ -2365,7 +2412,13 @@ case_refresh_tree() {
     _ "$TMP/mut-rtree.pids" || return 3
   local gchild; gchild="$(sed -n '2p' "$TMP/mut-rtree.pids")"
   own "$gchild"
-  pid_gone "$gchild" || return 1
+  if ! pid_gone "$gchild"; then
+    # hang-tree's grandchild ignores TERM (trap '' TERM before exec sleep).
+    # This pid was recorded by this case; reap it here so a slow teardown
+    # sweep cannot leave it past the sweep's SIGKILL deadline.
+    kill -KILL "$gchild" 2>/dev/null || true
+    return 1
+  fi
 }
 
 case_refresh_leftover() {
@@ -2592,6 +2645,11 @@ expect_mut_red "J1770 grace-restarts-at-latest-loss" case_recovery_flap
 # hk1770: class=ok requires agent_status. Any parsed document is not enough.
 mkmut j1770-pane-exists 's/if status:/if True:/'
 expect_mut_red "J1770 agent-found-is-class-ok" case_recovery_pane_only
+
+mkmut_span j1770-window-stuck \
+  '&& ( "$lost" -eq 0 || -n "$recover_reason" )' \
+  '    if [[ "$action" == none && "$lost" -eq 0 ]] && (( now - started >= timeout )); then'
+expect_mut_red "J1770 flap-cannot-postpone-window" case_recovery_window_flap
 
 # J12: sentinel record watch
 # shellcheck disable=SC2016

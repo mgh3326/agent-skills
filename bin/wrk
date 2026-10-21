@@ -6404,7 +6404,11 @@ PY
         fi
       fi
     fi
-    if [[ "$action" == none && "$lost" -eq 0 ]] && (( now - started >= timeout )); then
+    # The clear is below this check, so a recovery poll still has lost=1.
+    # Count that poll toward the watch window. Otherwise a gone/ok flap
+    # never has action=none while lost=0, the window never expires, and
+    # the grace never accumulates either.
+    if [[ "$action" == none && ( "$lost" -eq 0 || -n "$recover_reason" ) ]] && (( now - started >= timeout )); then
       action="lost:timeout"
     fi
     # Recovery is applied after this poll's classification and after the
