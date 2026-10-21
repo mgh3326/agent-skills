@@ -6113,18 +6113,20 @@ with open(lock_path, "w", encoding="utf-8") as lock:
 PY
 }
 
-# quota_release_log JOB POOL REASON — one durable line per release failure,
-# where the #770 silent release used to swallow it: the job's
-# completion-sentinel.log when the job has a dir, and stderr either way.
-# Never fails the end path that called it.
+# quota_release_log JOB POOL REASON — one durable line per release failure.
+# Use the job log when available; a sentinel's stderr is already redirected to
+# that same file, so writing both would duplicate the failure. Fall back to
+# stderr when the job log cannot be written.
 quota_release_log() {
-  local job="$1" pool="$2" reason="$3" jobdir
+  local job="$1" pool="$2" reason="$3" jobdir line
   jobdir="$(wrk_jobs_root)/$job"
-  warn "arbiter quota_pool release failed (job=$job pool=$pool $reason)"
   if [[ -d "$jobdir" ]]; then
-    sentinel_log "$jobdir/completion-sentinel.log" "-" "0" \
-      "quota-release-failed" "$reason job=$job pool=$pool"
+    line="$(date -u +%Y-%m-%dT%H:%M:%SZ) status=- transient=0 action=quota-release-failed $reason job=$job pool=$pool"
+    if printf '%s\n' "$line" >>"$jobdir/completion-sentinel.log" 2>/dev/null; then
+      return 0
+    fi
   fi
+  warn "arbiter quota_pool release failed (job=$job pool=$pool $reason)"
   return 0
 }
 
