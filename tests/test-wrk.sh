@@ -13744,6 +13744,91 @@ scan="$(order_scan b1729-nospawn)"
   fail "job_events_scan must report ended 1 without the respawn: $scan"
 echo "PASS hk1750-completed-without-respawn-stays-a-candidate"
 
+# hk 1770: job.recovered closes a loss episode. It is not a terminal and not a
+# revive, so a finished job stays finished and a live job stays live.
+[[ "$(grep -c 'NEUTRAL = {"job.lost", "job.recovered"}' "$WRK")" -eq 4 ]] ||
+  fail "job.lost and job.recovered must be on the neutral allowlist of all four readers"
+[[ "$(grep -c 'neutral event kind is also terminal or revive' "$WRK")" -eq 4 ]] ||
+  fail "each neutral allowlist must reject a kind that is also terminal or revive"
+RECOV_INBOX="$TMP/recovered-inbox"
+python3 - "$RECOV_INBOX" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+
+def write(job, name, doc):
+    directory = os.path.join(root, job, "events")
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+        json.dump(doc, handle)
+        handle.write("\n")
+
+write("recov-ended", "00001-job.claim.json",
+      {"kind": "job.claim", "at": "2020-01-01T00:00:00Z",
+       "payload": {"owner_lane": "w1", "label": "lbl", "role": "worker"}})
+write("recov-ended", "00002-job.spawned.json",
+      {"kind": "job.spawned", "at": "2020-01-01T00:00:01Z",
+       "payload": {"pane_id": "w1:p1", "tab_id": "w1:t1"}})
+write("recov-ended", "00003-job.completed.json",
+      {"kind": "job.completed", "at": "2020-01-02T00:00:00Z",
+       "payload": {"owner_lane": "w1", "pane_id": "w1:p1"}})
+write("recov-ended", "00004-job.recovered.json",
+      {"kind": "job.recovered", "at": "2020-06-01T00:00:00Z",
+       "job_id": "recov-ended", "owner_lane": "w1", "reason": "agent_not_found",
+       "lost_duration_s": 3})
+write("recov-live", "00001-job.claim.json",
+      {"kind": "job.claim", "at": "2020-01-01T00:00:00Z",
+       "payload": {"owner_lane": "w1", "label": "lbl"}})
+write("recov-live", "00002-job.spawned.json",
+      {"kind": "job.spawned", "at": "2020-01-01T00:00:01Z",
+       "payload": {"pane_id": "w1:p3", "tab_id": "w1:t3"}})
+write("recov-live", "00003-job.lost.json",
+      {"kind": "job.lost", "at": "2020-01-01T00:01:00Z", "reason": "agent_not_found"})
+write("recov-live", "00004-job.recovered.json",
+      {"kind": "job.recovered", "at": "2020-01-01T00:02:00Z",
+       "reason": "agent_not_found", "lost_duration_s": 60})
+PY
+# shellcheck disable=SC2016 # $1..$3 are the child shell's argv
+recov_scan() {
+  env ARBITER_INBOX_ROOT="$RECOV_INBOX" \
+    bash -c 'set -euo pipefail; . "$1"; job_events_scan "$2/$3/events"' _ \
+    "$ORDER_LIB" "$RECOV_INBOX" "$1"
+}
+scan="$(recov_scan recov-ended)"
+[[ "$(cut -f2 <<<"$scan")" == 1 ]] ||
+  fail "job.recovered after completed must stay ended: $scan"
+[[ "$(cut -f4 <<<"$scan")" == job.completed ]] ||
+  fail "job.recovered must not replace the terminal kind: $scan"
+[[ "$(cut -f6 <<<"$scan")" == job.recovered ]] ||
+  fail "job.recovered may be the newest kind without ending or reviving: $scan"
+scan="$(recov_scan recov-live)"
+[[ "$(cut -f2 <<<"$scan")" == 0 ]] ||
+  fail "claim, lost, and recovered with no terminal must stay not ended: $scan"
+[[ "$(cut -f4 <<<"$scan")" == "-" ]] ||
+  fail "job.recovered must not become a terminal kind: $scan"
+[[ "$(cut -f6 <<<"$scan")" == job.recovered ]] ||
+  fail "the live job's newest kind is job.recovered: $scan"
+recov_reap="$(env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$RECOV_INBOX" \
+  WRK_FIXTURE_SCENARIO=reap "$WRK" reap --lane w1 --grace 0 2>&1)" ||
+  fail "reap over recovered fixtures failed: $recov_reap"
+grep -q '^would-close job=recov-ended ' <<<"$recov_reap" ||
+  fail "completed then recovered stays a reap candidate: $recov_reap"
+if grep -q 'job=recov-live' <<<"$recov_reap"; then
+  fail "lost plus recovered with no terminal is not a reap candidate: $recov_reap"
+fi
+# shellcheck disable=SC2016 # $1 and $2 are the child shell's argv
+recov_end="$(env ARBITER_INBOX_ROOT="$RECOV_INBOX" \
+  bash -c 'set -euo pipefail; . "$1"; job_end_record "$2" w1 abandoned probe test' _ \
+  "$ORDER_LIB" recov-live)"
+[[ "$recov_end" == created ]] ||
+  fail "job.recovered must not block a later end declaration: $recov_end"
+# shellcheck disable=SC2016 # $1 and $2 are the child shell's argv
+recov_end="$(env ARBITER_INBOX_ROOT="$RECOV_INBOX" \
+  bash -c 'set -euo pipefail; . "$1"; job_end_record "$2" w1 abandoned probe test' _ \
+  "$ORDER_LIB" recov-ended)"
+[[ "$recov_end" == already-ended ]] ||
+  fail "a completed job stays ended after job.recovered: $recov_end"
+echo "PASS hk1770-recovered-is-neutral"
+
 # Two wrk writers of the same kind racing on one directory: both records land
 # and neither overwrites the other (exclusive create + bounded retry).
 CONC_DIR="$ORDER_INBOX/order-conc/events"

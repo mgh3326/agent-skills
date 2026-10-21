@@ -129,7 +129,7 @@ fixture_agent_get_error() {
 }
 
 # WRK_FIXTURE_GET_SEQUENCE 는 `agent get` 응답을 호출 순서대로 적은 파일이다.
-# 한 줄에 하나: empty | exit1 | socket | not-found | garbage | <상태이름>.
+# 한 줄에 하나: empty | exit1 | socket | not-found | garbage | pane-only | <상태이름>.
 # 줄이 소진되면 마지막 줄을 계속 반환한다.
 fixture_get_sequence_step() {
   local pane="$1" calls index total token
@@ -146,6 +146,11 @@ fixture_get_sequence_step() {
     socket) fixture_agent_get_error transport_unavailable ;;
     not-found) fixture_agent_get_error agent_not_found ;;
     garbage) printf '%s\n' 'fixture herdr: not json at all' ;;
+    # A pane envelope with no agent_status. The probe must classify this as
+    # transient (err:parse), never as the agent being back.
+    pane-only)
+      printf '{"id":"cli:agent:get","result":{"pane":{"pane_id":"%s","tab_id":"w1:t1"},"type":"pane_info"}}\n' "$pane"
+      ;;
     *) fixture_agent_get_result "$pane" "$token" ;;
   esac
 }
