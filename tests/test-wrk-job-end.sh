@@ -204,6 +204,13 @@ recovery_release_count() {
   printf '%s\n' "${n:-0}"
 }
 
+# recovery_release_count_is N — wait_until target: polls the stub log so a
+# release that lands just after the job.revoked event still counts (macOS
+# ordering raced the single-read check, hk 1798 round 1 rerun).
+recovery_release_count_is() {
+  [[ "$(recovery_release_count)" == "$1" ]]
+}
+
 recovery_calls_at_least() {
   local n=0
   if [[ -f "$1" ]]; then
@@ -1712,7 +1719,7 @@ case_recovery_expires() {
     recovery_fail "continuous loss is one job.lost" || return
   event_count_is "$events" job.recovered 0 ||
     recovery_fail "continuous loss must not recover" || return
-  [[ "$(recovery_release_count)" -eq 1 ]] ||
+  wait_until 15 recovery_release_count_is 1 ||
     recovery_fail "grace expiry must release quota once (got $(recovery_release_count))" || return
   if grep -q 'watch-exit' "$INBOX/je38/completion-sentinel.log"; then
     recovery_fail "grace expiry must not watch-exit" || return
@@ -1748,7 +1755,7 @@ case_recovery_flap() {
     recovery_fail "revoke must not add a loss event" || return
   event_count_is "$events" job.recovered 1 ||
     recovery_fail "revoke must not add a recovery" || return
-  [[ "$(recovery_release_count)" -eq 1 ]] ||
+  wait_until 15 recovery_release_count_is 1 ||
     recovery_fail "one revoke releases quota once (got $(recovery_release_count))" || return
   if grep -q 'watch-exit' "$INBOX/je39/completion-sentinel.log"; then
     recovery_fail "flap revoke must not watch-exit" || return
@@ -1924,7 +1931,7 @@ case_recovery_window_flap() {
   if event_count_is "$events" job.recovered 0; then
     recovery_fail "the flap must recover the absence episodes" || return
   fi
-  [[ "$(recovery_release_count)" -eq 1 ]] ||
+  wait_until 15 recovery_release_count_is 1 ||
     recovery_fail "the windowed flap releases quota once (got $(recovery_release_count))" || return
   if grep -q 'watch-exit' "$INBOX/je44/completion-sentinel.log"; then
     recovery_fail "the windowed flap must not watch-exit" || return
