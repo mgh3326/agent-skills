@@ -11724,7 +11724,8 @@ echo "PASS r20-emit-on-real-arbiter-fixture-artifacts"
 # TW2 — `wrk done` emits job.completed carrying the record's own values.
 R20_DONE_LOG="$TMP/r20-done-emit.log"
 r20_claim r20-done
-r20_done_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+r20_done_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_DONE_LOG" "$WRK" 'done' r20-done --report "$R20_REPORT")"
 PYTHONPATH="$TMP" python3 - "$R20_DONE_LOG" "$R20_INBOX/r20-done/events" <<'PY'
 import sys
@@ -11748,10 +11749,12 @@ echo "PASS r20-emit-argv-matches-done-record"
 # the record's reason verbatim.
 R20_BUILDER_LOG="$TMP/r20-builder-emit.log"
 r20_claim r20-builder --role builder --parent-lane parent-a
-r20_escalate_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+r20_escalate_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" escalate r20-builder \
   --question 'need parent decision')"
-r20_joined_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+r20_joined_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" joined r20-builder \
   --pr https://example.invalid/pr/1 --head deadbeef --report "$R20_REPORT")"
 PYTHONPATH="$TMP" python3 - "$R20_BUILDER_LOG" "$R20_INBOX/r20-builder/events" <<'PY'
@@ -11775,7 +11778,8 @@ echo "PASS r20-emit-argv-matches-builder-escalate-and-joined-records"
 R20_ABSENT_ERR="$TMP/r20-absent.err"
 r20_claim r20-absent
 set +e
-r20_absent_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" PANEWIRE_BIN="$TMP/absent-panewire" \
+r20_absent_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" PANEWIRE_BIN="$TMP/absent-panewire" \
   HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' r20-absent --report "$R20_REPORT" 2>"$R20_ABSENT_ERR")"
 r20_absent_rc=$?
@@ -11796,7 +11800,8 @@ echo "PASS r20-missing-panewire-warns-without-changing-exit-or-stdout"
 R20_FAIL_ERR="$TMP/r20-fail.err"
 r20_claim r20-fail
 set +e
-r20_fail_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" WRK_PANEWIRE_RC=3 \
+r20_fail_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" WRK_PANEWIRE_RC=3 \
   HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' r20-fail --report "$R20_REPORT" 2>"$R20_FAIL_ERR")"
 r20_fail_rc=$?
@@ -11822,7 +11827,8 @@ R20_SLOW_ERR="$TMP/r20-slow.err"
 r20_claim r20-slow
 r20_slow_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 set +e
-r20_slow_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" WRK_PANEWIRE_SLEEP=30 \
+r20_slow_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" WRK_PANEWIRE_SLEEP=30 \
   "$WRK" 'done' r20-slow --report "$R20_REPORT" 2>"$R20_SLOW_ERR")"
 r20_slow_rc=$?
 set -e
@@ -11841,7 +11847,8 @@ echo "PASS r20-wedged-emit-is-bounded-by-the-timeout-guard"
 R20_LOST_LOG="$TMP/r20-lost-emit.log"
 R20_LOST_INBOX="$TMP/r20-lost-inbox"
 set +e
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$R20_LOST_INBOX" WRK_PANEWIRE_LOG="$R20_LOST_LOG" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_INBOX_ROOT="$R20_LOST_INBOX" WRK_PANEWIRE_LOG="$R20_LOST_LOG" \
   WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel r20-lost lane-a wrk-a w1:p1 "$R20_REPORT" >/dev/null 2>&1
@@ -11875,14 +11882,17 @@ R20_ROOT_LOG="$TMP/r20-inbox-root-emit.log"
 R20_ROOT_ERR="$TMP/r20-inbox-root.err"
 r20_claim r20-root-done
 r20_claim r20-root-builder --role builder --parent-lane parent-a
-env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
   "$WRK" 'done' r20-root-done --report "$R20_REPORT" 2>"$R20_ROOT_ERR" >/dev/null
-env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
   "$WRK" escalate r20-root-builder --question 'need parent decision' \
   2>>"$R20_ROOT_ERR" >/dev/null
-env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
   "$WRK" joined r20-root-builder --pr https://example.invalid/pr/1 \
   --head deadbeef --report "$R20_REPORT" 2>>"$R20_ROOT_ERR" >/dev/null
@@ -12322,7 +12332,8 @@ env ARBITER_INBOX_ROOT="$RND_JOBS" HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
 rnd_arb event --job "$RND4_JOB" --kind job.spawned \
   --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
 printf 'round two terminal line\n' >"$rnd4_report"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$RND_JOBS" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-rnd" \
+  ARBITER_INBOX_ROOT="$RND_JOBS" \
   WRK_FIXTURE_SCENARIO=sentinel-done WRK_COMPLETION_TIMEOUT_S=30 \
   WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel "$RND4_JOB" lane-a wrk-a w1:p1 "$rnd4_report" >/dev/null 2>&1 &
@@ -12497,7 +12508,7 @@ SENTINEL_REPORT="$TMP/sentinel-report.md"
 printf 'sentinel final line\n' >"$SENTINEL_REPORT"
 SENTINEL_INBOX="$TMP/sentinel-inbox"
 set +e
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel sentinel-working lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1
@@ -12524,7 +12535,7 @@ env ARBITER_INBOX_ROOT="$SENTINEL_INBOX" "$ARBITER" claim \
   --job sentinel-idle --lane test-lane --agent-label test-label --t T1 >/dev/null
 env ARBITER_INBOX_ROOT="$SENTINEL_INBOX" "$ARBITER" event --job sentinel-idle \
   --kind job.spawned --payload-json '{"owner_lane":"test-lane","label":"test-label","pane_id":"test:pane"}' >/dev/null
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
@@ -12551,7 +12562,7 @@ echo "PASS r18-sentinel-portable-discovery-and-dedupe"
 # Both terminal statuses are accepted; `done` is tested separately so this is
 # an explicit status-set contract rather than an idle-only implementation.
 SENTINEL_INBOX="$TMP/sentinel-done-inbox"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-done WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel sentinel-done lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
 sentinel_done_pid=$!
@@ -12571,7 +12582,7 @@ echo "PASS r18-sentinel-accepts-done-status"
 TRANSIENT_INBOX="$TMP/sentinel-transient-inbox"
 TRANSIENT_SEQ="$TMP/sentinel-transient.seq"
 printf '%s\n' empty exit1 garbage socket working idle >"$TRANSIENT_SEQ"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$TRANSIENT_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$TRANSIENT_INBOX" \
   WRK_FIXTURE_GET_SEQUENCE="$TRANSIENT_SEQ" \
   WRK_COMPLETION_TIMEOUT_S=120 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_TRANSIENT_MAX=10 WRK_SENTINEL_LOST_GRACE=0 \
@@ -12609,7 +12620,7 @@ GRACE_SEQ="$TMP/sentinel-grace.seq"
 printf '%s\n' empty empty empty empty idle >"$GRACE_SEQ"
 GRACE_REPORT="$TMP/sentinel-grace-report.md"
 rm -f "$GRACE_REPORT"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$GRACE_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$GRACE_INBOX" \
   WRK_FIXTURE_GET_SEQUENCE="$GRACE_SEQ" \
   WRK_COMPLETION_TIMEOUT_S=300 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_TRANSIENT_MAX=3 WRK_SENTINEL_LOST_GRACE=120 \
@@ -12644,7 +12655,7 @@ echo "PASS sentinel-lost-grace-still-completes"
 GONE_INBOX="$TMP/sentinel-gone-inbox"
 GONE_SEQ="$TMP/sentinel-gone.seq"
 printf '%s\n' not-found >"$GONE_SEQ"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$GONE_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$GONE_INBOX" \
   WRK_FIXTURE_GET_SEQUENCE="$GONE_SEQ" \
   WRK_COMPLETION_TIMEOUT_S=300 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_TRANSIENT_MAX=10 WRK_SENTINEL_LOST_GRACE=0 \
@@ -12780,7 +12791,8 @@ idem_claim idem-race
 IDEM_RACE_REPORT="$TMP/idem-race-report.md"
 printf 'race verdict line\n' >"$IDEM_RACE_REPORT"
 env ARBITER_INBOX_ROOT="$IDEM_INBOX" "$WRK" 'done' idem-race --report "$IDEM_RACE_REPORT" >/dev/null 2>&1
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-idem" \
+  ARBITER_INBOX_ROOT="$IDEM_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=30 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel idem-race lane-a wrk-a w1:p1 "$IDEM_RACE_REPORT" >/dev/null 2>&1 &
 idem_race_pid=$!
@@ -12827,7 +12839,8 @@ IDEM_PARTIAL_REPORT="$TMP/idem-partial-report.md"
 printf 'partial draft\n' >"$IDEM_PARTIAL_REPORT"
 # The 3s interval leaves a whole settle window between the pending sighting and
 # the completion decision — enough to swap in the final content deterministically.
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_PARTIAL_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-idem" \
+  ARBITER_INBOX_ROOT="$IDEM_PARTIAL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=60 WRK_COMPLETION_INTERVAL_S=3 \
   "$WRK" sentinel idem-partial lane-a wrk-a w1:p1 "$IDEM_PARTIAL_REPORT" >/dev/null 2>&1 &
 idem_partial_pid=$!

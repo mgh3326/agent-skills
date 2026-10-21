@@ -2189,8 +2189,8 @@ grep -q 'job=qr13' "$INBOX/qr13/completion-sentinel.log" ||
   fail "QR13: the logged failure must name the job"
 grep -q 'pool=codex' "$INBOX/qr13/completion-sentinel.log" ||
   fail "QR13: the logged failure must name the pool"
-grep -q 'job=qr13 pool=codex rc=7' <<<"$QR13_OUT" ||
-  fail "QR13: stderr must carry the job/pool/rc line: $QR13_OUT"
+[[ "$(grep -c 'action=quota-release-failed' "$INBOX/qr13/completion-sentinel.log")" == 1 ]] ||
+  fail "QR13: one failed release must write exactly one durable log line"
 event_count_is "$INBOX/qr13/events" job.completed 1 ||
   fail "QR13: job.completed must land despite the release failure"
 echo "PASS qr13 release-failure-logged"
