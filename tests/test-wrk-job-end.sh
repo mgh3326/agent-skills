@@ -170,21 +170,25 @@ start_sentinel() {
 }
 
 # Quota stub for the sentinel's release_job_quota_pool. The real arbiter is
-# left alone: only the sentinel process receives ARBITER_BIN (wrk copies that
-# onto ARBITER at startup) and the log path.
+# left alone: the sentinel gets this executable and its case-local XDG/inbox.
 recovery_arm_stub() {
+  RECOVERY_ARBITER="$TMP/recovery-arbiter-$CASE_SEQ"
   RECOVERY_STUB_LOG="$TMP/recovery-stub-$CASE_SEQ.log"
   : >"$RECOVERY_STUB_LOG"
-  RECOVERY_ARBITER="$TMP/recovery-arbiter-$CASE_SEQ"
-  cat >"$RECOVERY_ARBITER" <<'EOF'
+  cat >"$RECOVERY_ARBITER" <<EOF
 #!/bin/bash
 set -euo pipefail
-if [[ "${1:-}" == status ]]; then
-  printf '%s\n' '{"quota_pool_records":[{"pool":"claude"}]}'
+if [[ "\${1:-}" == status ]]; then
+  job=""
+  while (($#)); do
+    if [[ "\$1" == --job && \$# -ge 2 ]]; then job="\$2"; break; fi
+    shift
+  done
+  printf '{"quota_pool_records":[{"job_id":"%s","pool":"claude"}]}\\n' "\$job"
   exit 0
 fi
-if [[ "${1:-}" == release ]]; then
-  printf '%s\n' "$*" >>"${RECOVERY_STUB_LOG:?}"
+if [[ "\${1:-}" == release ]]; then
+  printf '%s\\n' "\$*" >>"$RECOVERY_STUB_LOG"
   exit 0
 fi
 exit 0
@@ -194,8 +198,8 @@ EOF
 
 recovery_release_count() {
   local n=0
-  if [[ -n "${RECOVERY_STUB_LOG:-}" && -f "$RECOVERY_STUB_LOG" ]]; then
-    n="$(grep -c '^release ' "$RECOVERY_STUB_LOG" || true)"
+  if [[ -n "${RECOVERY_ARBITER:-}" && -f "$TMP/recovery-stub-$CASE_SEQ.log" ]]; then
+    n="$(grep -c '^release ' "$TMP/recovery-stub-$CASE_SEQ.log" || true)"
   fi
   printf '%s\n' "${n:-0}"
 }
@@ -2877,15 +2881,18 @@ case_refresh_stale_start() {
   reset_case mut-rstale || return 3
   mk_job mut-rstale || return 3
   local pf="$INBOX/mut-rstale/quota-refresh.pid"
-  mkdir -p "$INBOX/mut-rstale"
-  python3 - "$SCOPEFUEL" fakepool 60 "$pf" mut-rstale <<'PY' >/dev/null 2>&1 &
-import sys, time
-time.sleep(600)
+  start_fake_supervisor mut-rstale -7200
+  wait_until 10 test -s "$pf" || return 3
+  local sup; sup="$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$pf")"; own "$sup"
+  local stale_started; stale_started=$(( $(date +%s) - 7200 ))
+  python3 - "$pf" "$stale_started" <<'PY' || return 3
+import pathlib, sys
+path, started = pathlib.Path(sys.argv[1]), sys.argv[2]
+text = path.read_text(encoding="utf-8")
+parts = [token for token in text.split() if not token.startswith("started=")]
+parts.append("started=" + started)
+path.write_text(" ".join(parts) + "\n", encoding="utf-8")
 PY
-  local sup=$!; own "$sup"
-  local now; now=$(date +%s)
-  printf 'pid=%d pool=fakepool job=mut-rstale timeout=60 deadline=%d started=%d\n' \
-    "$sup" "$(( now - 120 ))" "$(( now - 7200 ))" >"$pf"
   prune_run --apply >/dev/null 2>&1
   kill -0 "$sup" 2>/dev/null || return 1
 }
