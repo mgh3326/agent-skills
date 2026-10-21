@@ -15,10 +15,11 @@ REPORT = ROOT / "director" / "bin" / "quota-stale-report"
 NOW = "2026-10-21T12:00:00+00:00"
 
 
-def run_report(jobs_root: Path, status: dict | str, *extra: str) -> subprocess.CompletedProcess:
+def run_report(jobs_root: Path, status: dict | str, *extra: str,
+               script: Path = REPORT) -> subprocess.CompletedProcess:
     payload = status if isinstance(status, str) else json.dumps(status)
     return subprocess.run(
-        [sys.executable, str(REPORT), "--jobs-root", str(jobs_root), *extra],
+        [sys.executable, str(script), "--jobs-root", str(jobs_root), *extra],
         input=payload, text=True, capture_output=True,
     )
 
@@ -105,6 +106,75 @@ class QuotaStaleReport(unittest.TestCase):
         self.assertIn("\tcompleted_no_release\t", proc.stdout)
         proc = run_report(self.jobs_root, self.status(records), "--since-hours", "5")
         self.assertIn("\trecent\t", proc.stdout)
+
+    def assert_revived_job_is_not_terminal(self, proc: subprocess.CompletedProcess) -> None:
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("\tno_terminal\t", proc.stdout)
+        self.assertNotIn("_no_release\t", proc.stdout)
+
+    def check_revival_after_terminal(self, revival_kind: str) -> None:
+        job = "j-revived"
+        write_events(self.jobs_root, job,
+                     ["quota_pool.record", "job.completed", revival_kind])
+        proc = run_report(self.jobs_root, self.status(
+            [record(job, "2026-10-19T00:00:00+00:00")]))
+        self.assert_revived_job_is_not_terminal(proc)
+        self.assertIn(f"\t{revival_kind}\n", proc.stdout)
+
+    def test_claim_after_terminal_is_not_stale_terminal(self) -> None:
+        self.check_revival_after_terminal("job.claim")
+
+    def test_reclaim_after_terminal_is_not_stale_terminal(self) -> None:
+        self.check_revival_after_terminal("job.reclaim")
+
+    def test_spawned_after_terminal_is_not_stale_terminal(self) -> None:
+        self.check_revival_after_terminal("job.spawned")
+
+    def test_reprompted_after_terminal_is_not_stale_terminal(self) -> None:
+        self.check_revival_after_terminal("job.reprompted")
+
+    def test_recent_revived_job_is_no_terminal_not_recent(self) -> None:
+        write_events(self.jobs_root, "j-recent-revived",
+                     ["quota_pool.record", "job.completed", "job.spawned"])
+        proc = run_report(self.jobs_root, self.status(
+            [record("j-recent-revived", "2026-10-21T11:00:00+00:00")]))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("\tno_terminal\t", proc.stdout)
+        self.assertNotIn("\trecent\t", proc.stdout)
+
+    def test_all_terminal_kinds_have_a_report_category(self) -> None:
+        expected = {
+            "job.completed": "completed_no_release",
+            "job.completion": "completed_no_release",
+            "job.joined": "completed_no_release",
+            "job.handed_off": "completed_no_release",
+            "job.reaped": "reaped_no_release",
+            "job.lost": "lost_or_revoked_no_release",
+            "job.revoked": "lost_or_revoked_no_release",
+        }
+        records = []
+        for index, (kind, category) in enumerate(expected.items()):
+            job = f"j-terminal-{index}"
+            write_events(self.jobs_root, job, ["quota_pool.record", kind])
+            records.append(record(job, "2026-10-19T00:00:00+00:00"))
+        proc = run_report(self.jobs_root, self.status(records))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        for category in expected.values():
+            self.assertIn(f"\t{category}\t", proc.stdout)
+
+    def test_revival_ordering_check_has_assertion_red_mutant(self) -> None:
+        write_events(self.jobs_root, "j-revived",
+                     ["quota_pool.record", "job.completed", "job.reclaim"])
+        status = self.status([record("j-revived", "2026-10-19T00:00:00+00:00")])
+        source = REPORT.read_text(encoding="utf-8")
+        guard = '    if revived_after_terminal(kinds):\n        return "no_terminal"\n'
+        self.assertIn(guard, source)
+        with tempfile.TemporaryDirectory() as scratch:
+            mutant = Path(scratch) / "quota-stale-report-mutant"
+            mutant.write_text(source.replace(guard, "", 1), encoding="utf-8")
+            proc = run_report(self.jobs_root, status, script=mutant)
+            with self.assertRaises(AssertionError):
+                self.assert_revived_job_is_not_terminal(proc)
 
     def test_release_after_record_is_not_no_release(self) -> None:
         # Terminal, but the release lands after the last record: the leaked

@@ -24,9 +24,17 @@ EVENT_NAME = re.compile(r"^(\d+)-(.+)\.json$")
 TERMINAL_CATEGORY = {
     "job.completed": "completed_no_release",
     "job.completion": "completed_no_release",
+    "job.joined": "completed_no_release",
+    "job.handed_off": "completed_no_release",
     "job.reaped": "reaped_no_release",
     "job.lost": "lost_or_revoked_no_release",
     "job.revoked": "lost_or_revoked_no_release",
+}
+REVIVAL_KINDS = {
+    "job.claim",
+    "job.reclaim",
+    "job.spawned",
+    "job.reprompted",
 }
 
 
@@ -67,6 +75,15 @@ def read_events(events_dir: Path) -> list[str]:
     return [kind for _, _, kind in kinds]
 
 
+def revived_after_terminal(kinds: list[str]) -> bool:
+    last_terminal = max(
+        (i for i, kind in enumerate(kinds) if kind in TERMINAL_CATEGORY),
+        default=-1,
+    )
+    last_revival = max((i for i, kind in enumerate(kinds) if kind in REVIVAL_KINDS), default=-1)
+    return last_terminal >= 0 and last_revival > last_terminal
+
+
 def categorize(kinds: list[str], has_events_dir: bool) -> str:
     if not has_events_dir:
         return "no_events_dir"
@@ -74,10 +91,11 @@ def categorize(kinds: list[str], has_events_dir: bool) -> str:
     last_release = max((i for i, k in enumerate(kinds) if k == "quota_pool.release"), default=-1)
     released_after_record = last_release > last_record
     terminal = ""
-    for kind in reversed(kinds):
+    for kind in kinds:
         if kind in TERMINAL_CATEGORY:
             terminal = TERMINAL_CATEGORY[kind]
-            break
+    if revived_after_terminal(kinds):
+        return "no_terminal"
     if terminal and not released_after_record:
         return terminal
     if last_release >= 0 and last_record > last_release:
@@ -120,7 +138,8 @@ def main() -> int:
         has_events_dir = events_dir.is_dir()
         kinds = read_events(events_dir) if has_events_dir else []
 
-        if started is not None and age_h < args.since_hours:
+        if (started is not None and age_h < args.since_hours
+                and not revived_after_terminal(kinds)):
             category = "recent"
         else:
             category = categorize(kinds, has_events_dir)
