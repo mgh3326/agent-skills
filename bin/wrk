@@ -9615,7 +9615,10 @@ mock_mcp_cleanup() {
 refuse_barred_model_id() {
   local model_id="${1:-}" profile="${2:-$MODEL}"
   case "$model_id" in
-    gpt-5.6-terra|gpt-5.6-terra-*)
+    # The bar is on the model, not the spelling: any resolved model id carrying
+    # a -terra segment refuses, so a future alias or catalog row serving a new
+    # terra id (e.g. gpt-9.9-terra) cannot slip past the gpt-5.6-terra literal.
+    terra|*-terra|*-terra-*)
       die "profile $profile refused: $model_id is barred, operator 2026-10-12 noterra; use codex-sol or codex-luna" ;;
   esac
 }

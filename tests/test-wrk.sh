@@ -294,7 +294,7 @@ if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 TERRA_PROBE_SEQ=0
 terra_refusal_probe() {
   local executable="$1" profile="$2" role_path="$3" case_name="$4"
-  local profile_flag="${5:--m}"
+  local profile_flag="${5:--m}" expected_model="${6:-gpt-5.6-terra}"
   local root="$TMP/noterra/$case_name" home data cache config state inbox
   local out err herdr_log scopefuel_log panewire_log db before_tree after_tree before_hk after_hk task_id job rc=0
   TERRA_PROBE_SEQ=$((TERRA_PROBE_SEQ + 1))
@@ -340,7 +340,7 @@ if path.exists():
 PY
   [[ ! -s "$herdr_log" && ! -s "$scopefuel_log" && ! -s "$panewire_log" ]] || { echo "T-A1 fixture was called for $profile/$role_path" >&2; return 1; }
   [[ "$(wc -l <"$err" | tr -d ' ')" == 1 ]] || { echo "T-A1 expected one stderr line for $profile/$role_path: $(<"$err")" >&2; return 1; }
-  grep -q "profile $profile refused: gpt-5.6-terra is barred" "$err" || { echo "T-A1 missing named refusal: $(<"$err")" >&2; return 1; }
+  grep -q "profile $profile refused: $expected_model is barred" "$err" || { echo "T-A1 missing named refusal: $(<"$err")" >&2; return 1; }
   grep -q 'operator 2026-10-12 noterra; use codex-sol or codex-luna' "$err" || { echo "T-A1 missing decision/replacements: $(<"$err")" >&2; return 1; }
   [[ -z "$(find "$inbox" -type f -print -quit)" ]] || { echo "T-A1 inbox changed for $profile/$role_path" >&2; return 1; }
   after_tree="$(git -C "$ROOT" worktree list --porcelain | sha256sum | awk '{print $1}')"
@@ -367,6 +367,10 @@ SCOPEFUEL_E6_ARM=codex-terra@high terra_refusal_probe "$WRK" builder-terra-high 
 echo "PASS T-A2: Terra E6 markers cannot reach gate or spawn"
 
 # T-A1 model-id guard pin: inject an unlisted alias into a throwaway wrk copy.
+# The alias resolves to gpt-9.9-terra — a terra model id the original
+# gpt-5.6-terra-only enumeration did not know — and gets no catalog mapping, so
+# the resolver literal is exactly the model id the guard sees. A guard that
+# matches only the enumerated literal spawns it: this is the hk 1810 gap.
 make_future_terra_wrk() {
   local output="$1" move_after_claim="${2:-0}"
   python3 - "$WRK" "$output" "$move_after_claim" <<'PY'
@@ -376,10 +380,8 @@ src = Path(sys.argv[1]).read_text()
 dst = Path(sys.argv[2])
 dst.parent.mkdir(parents=True, exist_ok=True)
 replacements = (
-    ("codex-terra|codex-med) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;",
-     "codex-terra|codex-med|future-terra-alias) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;") ,
     ("codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;",
-     "codex-terra|codex-med|future-terra-alias) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;"),
+     "codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;\n    future-terra-alias) PROFILE_KIND=codex; PROFILE_MODEL=gpt-9.9-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;"),
     ("codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;",
      "codex-terra|codex-med|codex-terra-max|future-terra-alias) GATE_PROFILE=codex-terra-max ;;"),
 )
@@ -399,12 +401,30 @@ PY
 }
 FUTURE_TERRA_WRK="$TMP/noterra/future-terra-wrk"
 make_future_terra_wrk "$FUTURE_TERRA_WRK"
-terra_refusal_probe "$FUTURE_TERRA_WRK" future-terra-alias worker model-id-alias ||
+terra_refusal_probe "$FUTURE_TERRA_WRK" future-terra-alias worker model-id-alias -m gpt-9.9-terra ||
   fail "T-A1 model-id guard must refuse a future alias that resolves to Terra"
 echo "PASS T-A1 model-id pin: unlisted Terra-resolving alias is refused"
+# The same bar holds when the canon — not the resolver table — is what hands a
+# non-Terra spelling a terra model id (WRK_LAUNCH_MODEL_OVERRIDE on the fixture
+# scopefuel is the catalog injection surface, hk 1810 repro).
+WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-terra \
+  terra_refusal_probe "$WRK" codex-luna worker catalog-terra-override -m gpt-9.9-terra ||
+  fail "T-A1 catalog-served terra model id must be refused for a non-Terra spelling"
+echo "PASS T-A1 catalog pin: a canon-served Terra model id is refused on codex-luna"
 
-# Named mutants: dropping the model-id check, or moving it beyond arbiter
-# admission, makes the alias refusal assertion red. Only fixtures are reachable.
+# Named mutants: dropping the model-id check, moving it beyond arbiter
+# admission, or re-narrowing it to the old literal enumeration must each make a
+# named probe assertion red. Probe output is captured per mutant and the
+# specific tripped assertion is pinned — a probe that dies on an unrelated
+# check (syntax error, missing refusal text) cannot count as a caught mutant,
+# and expected-RED diagnostics stop leaking into passing logs looking like a
+# real failed assertion. Only fixtures are reachable.
+expect_probe_red() {
+  local log="$1" want_line="$2" label="$3"
+  grep -qF "$want_line" "$log" ||
+    fail "$label must trip the '$want_line' assertion, not a different check: $(<"$log")"
+}
+
 M1_FUTURE_TERRA_WRK="$TMP/noterra/m1-no-model-check-wrk"
 python3 - "$FUTURE_TERRA_WRK" "$M1_FUTURE_TERRA_WRK" <<'PY'
 from pathlib import Path
@@ -416,23 +436,42 @@ if src.count(guard) != 1:
 Path(sys.argv[2]).write_text(src.replace(guard, "", 1))
 Path(sys.argv[2]).chmod(0o755)
 PY
-if terra_refusal_probe "$M1_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m1; then
-  m1_red_rc=0
-else
-  m1_red_rc=$?
+m1_probe_log="$TMP/noterra/m1-probe.log"
+if terra_refusal_probe "$M1_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m1 -m gpt-9.9-terra >"$m1_probe_log" 2>&1; then
+  fail "m1 mutant survived the resolved-model refusal pin"
 fi
-[[ "$m1_red_rc" -ne 0 ]] || fail "m1 mutant survived the resolved-model refusal pin"
-echo "PASS mutant m1: resolved-model refusal assertion goes RED (rc=$m1_red_rc)"
+expect_probe_red "$m1_probe_log" "T-A1 future-terra-alias/worker unexpectedly spawned" "mutant m1"
+echo "PASS mutant m1: resolved-model refusal assertion goes RED"
 
 M2_FUTURE_TERRA_WRK="$TMP/noterra/m2-post-claim-wrk"
 make_future_terra_wrk "$M2_FUTURE_TERRA_WRK" 1
-if terra_refusal_probe "$M2_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m2; then
-  m2_red_rc=0
-else
-  m2_red_rc=$?
+m2_probe_log="$TMP/noterra/m2-probe.log"
+if terra_refusal_probe "$M2_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m2 -m gpt-9.9-terra >"$m2_probe_log" 2>&1; then
+  fail "m2 mutant survived the no-side-effect refusal pin"
 fi
-[[ "$m2_red_rc" -ne 0 ]] || fail "m2 mutant survived the no-side-effect refusal pin"
-echo "PASS mutant m2: no-side-effect assertion goes RED (rc=$m2_red_rc)"
+expect_probe_red "$m2_probe_log" "T-A1 arbiter gained a job or quota record" "mutant m2"
+echo "PASS mutant m2: no-side-effect assertion goes RED"
+
+# m3: the pre-hk-1810 enumeration knows gpt-5.6-terra only — restoring it lets
+# the alias spawn, so the unexpected-spawn assertion must be the one that trips.
+M3_FUTURE_TERRA_WRK="$TMP/noterra/m3-literal-only-wrk"
+python3 - "$FUTURE_TERRA_WRK" "$M3_FUTURE_TERRA_WRK" <<'PY'
+from pathlib import Path
+import sys
+src = Path(sys.argv[1]).read_text()
+widened = "    terra|*-terra|*-terra-*)\n"
+narrowed = "    gpt-5.6-terra|gpt-5.6-terra-*)\n"
+if src.count(widened) != 1:
+    raise SystemExit("m3 target pattern is not unique")
+Path(sys.argv[2]).write_text(src.replace(widened, narrowed, 1))
+Path(sys.argv[2]).chmod(0o755)
+PY
+m3_probe_log="$TMP/noterra/m3-probe.log"
+if terra_refusal_probe "$M3_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m3 -m gpt-9.9-terra >"$m3_probe_log" 2>&1; then
+  fail "m3 mutant (literal-only enumeration) survived the terra model-id pin"
+fi
+expect_probe_red "$m3_probe_log" "T-A1 future-terra-alias/worker unexpectedly spawned" "mutant m3"
+echo "PASS mutant m3: the literal-only enumeration goes RED"
 
 # T-A3: permitted Sol and Luna profiles still traverse this fixture-backed path.
 for allowed_codex in codex-sol codex-luna; do
