@@ -6378,7 +6378,7 @@ PY
 }
 
 sentinel_cmd() {
-  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}" resource="${6:-}"
+  local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}"
   local pane_kind="${7:-}" observed_rung="${8:-}" scopefuel_bin="${9:-}"
   local timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
   local interval="${WRK_COMPLETION_INTERVAL_S:-30}"

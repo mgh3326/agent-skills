@@ -1980,7 +1980,7 @@ chmod +x "$QR3_STUB"
 env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
   XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
   PANEWIRE_BIN="$QR3_STUB" STUB_ARBITER="$ARBITER" \
-  "$WRK" done qr3 --report "$REPORT" >/dev/null 2>&1 ||
+  "$WRK" 'done' qr3 --report "$REPORT" >/dev/null 2>&1 ||
   fail "QR3: delegated done must succeed"
 assert_quota_released qr3 "delegated done"
 echo "PASS qr3 delegated-done-releases-quota"
@@ -2179,7 +2179,7 @@ REPORT="$TMP/qr13-report.md"; printf 'x\n' >"$REPORT"
 QR13_OUT="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$QR13_ARB" \
   ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
   HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$PANEWIRE" \
-  "$WRK" done qr13 --report "$REPORT" 2>&1)" ||
+  "$WRK" 'done' qr13 --report "$REPORT" 2>&1)" ||
   fail "QR13: a failed release must not fail wrk done: $QR13_OUT"
 grep -q 'quota-release-failed' "$INBOX/qr13/completion-sentinel.log" ||
   fail "QR13: the sentinel log must carry the release failure"
@@ -3192,7 +3192,7 @@ EOF
   env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
     XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
     PANEWIRE_BIN="$stub" STUB_ARBITER="$ARBITER" \
-    "$WRK" done mut-rdel --report "$REPORT" >/dev/null 2>&1
+    "$WRK" 'done' mut-rdel --report "$REPORT" >/dev/null 2>&1
   [[ "$(quota_rows mut-rdel)" == 0 ]] || return 1
 }
 
