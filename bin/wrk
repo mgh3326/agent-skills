@@ -6323,11 +6323,21 @@ stop_completion_sentinel() {
 # the completion sentinel. Every step is best-effort; a housekeeping failure
 # must never mask the record the caller just wrote.
 job_end_housekeeping() {
-  local job="$1" owner="$2" outcome="$3" reason="$4" source="$5"
-  job_end_record "$job" "$owner" "$outcome" "$reason" "$source" >/dev/null ||
+  local job="$1" owner="$2" outcome="$3" reason="$4" source="$5" end_out
+  end_out="$(job_end_record "$job" "$owner" "$outcome" "$reason" "$source" 2>/dev/null)" || {
     warn "job end declaration write failed for $job; the records stay file-only"
-  release_job_quota_pool "$job"
-  stop_completion_sentinel "$job"
+    return 0
+  }
+  case "$end_out" in
+    created|already-ended)
+      release_job_quota_pool "$job" # hk1798-housekeeping-release
+      stop_completion_sentinel "$job"
+      ;;
+    active) return 0 ;; # hk1798-housekeeping-active-guard
+    *)
+      warn "job end declaration returned an unknown result for $job"
+      return 0 ;;
+  esac
   return 0
 }
 
@@ -6508,7 +6518,7 @@ PY
     if sentinel_job_ended "$jobdir"; then
       # hk1798: another path ended this job; if it left a live quota record
       # behind, this waking sentinel is the last thing that can return it.
-      release_job_quota_pool "$job"
+      release_job_quota_pool "$job" # hk1798-sentinel-watch-exit-release
       sentinel_log "$logfile" "$token" "$transient" "watch-exit"
       sentinel_self_exit "$job" 0
     fi
@@ -6530,7 +6540,7 @@ PY
         # hk1798: every live record of the job goes back through the shared
         # helper — the $resource-only release missed re-recorded pools and
         # silently skipped whenever ARBITER never reached the sentinel env.
-        release_job_quota_pool "$job"
+        release_job_quota_pool "$job" # hk1798-sentinel-completed-release
         # #770: completed — including post-loss completion — ends the job, so
         # the sentinel leaves with it instead of becoming the leftover process
         # this task exists to remove.
@@ -6553,8 +6563,13 @@ PY
       # #770: the grace expired without a completion. job.lost is not a hub
       # terminal, so declare the end (newest-revive wins, so a respawned job
       # is left alone) before the sentinel leaves.
-      job_end_record "$job" "$owner" abandoned "sentinel lost grace expired" "wrk sentinel" >/dev/null || true
-      release_job_quota_pool "$job"
+      local end_out=""
+      end_out="$(job_end_record "$job" "$owner" abandoned "sentinel lost grace expired" "wrk sentinel" 2>/dev/null)" || true
+      # The end declaration may lose a race to a revive; only a terminal result
+      # authorizes releasing that job's quota rows.
+      case "$end_out" in
+        created|already-ended) release_job_quota_pool "$job" ;; # hk1798-lost-grace-release
+      esac
       sentinel_self_exit "$job" 0
     fi
     sleep "$interval"
@@ -6575,10 +6590,6 @@ build_sentinel_env() {
   [[ -z "$socket" ]] || SENTINEL_ENV+=("HERDR_SOCKET_PATH=$socket")
   [[ -z "${HERDR_BIN_PATH:-}" ]] || SENTINEL_ENV+=("HERDR_BIN_PATH=$HERDR_BIN_PATH")
   [[ -z "$HERDR" ]] || SENTINEL_ENV+=("HERDR_BIN=$HERDR")
-  # hk1798: the sentinel's end paths release quota_pool records through this
-  # same binary. The spawn-side resolution lives only in the shell variable
-  # $ARBITER — a detached sentinel without it silently skipped every release.
-  [[ -z "${ARBITER:-}" ]] || SENTINEL_ENV+=("ARBITER_BIN=$ARBITER")
 }
 
 start_completion_sentinel() {
@@ -9492,7 +9503,7 @@ print("ok")
   # hk1798: job.handed_off is the old job's last work-terminal — hand back
   # every quota_pool record it still holds; a re-recorded or never-released
   # pool survives the hand-off otherwise.
-  release_job_quota_pool "$TAKEOVER_FROM"
+  release_job_quota_pool "$TAKEOVER_FROM" # hk1798-takeover-release
 }
 
 # Commit both local audit records under their event locks. A rebind that the
@@ -10511,7 +10522,7 @@ reap_cmd() {
       # hk1798: release the job's remaining quota_pool records before the tab
       # close — the job already carries a work-terminal, so the records are
       # owed whether or not the close below lands.
-      release_job_quota_pool "$job"
+      release_job_quota_pool "$job" # hk1798-reap-preclose-release
       if "$HERDR" tab close "$tab" >/dev/null 2>&1; then
         reap_event "$job" "$owner" "$pane" "$tab"
         # #770: a reaped job is ended — declare it to the hub (job.reaped is a
@@ -10818,9 +10829,9 @@ prune_sentinel_row() {
     PRUNE_ORPHANS=$(( PRUNE_ORPHANS + 1 ))
     echo "sentinel job=$job pid=$pid age=${age}s orphan=yes reason=job-ended($terminal)"
     if [[ "$PRUNE_APPLY" -eq 1 ]]; then
-      # hk1798: the job already ended — hand back any quota record its own
-      # end path leaked (idempotent: a clean job has no rows to release).
-      release_job_quota_pool "$job"
+  # hk1798: the job already ended — hand back any quota record its own
+  # end path leaked (idempotent: a clean job has no rows to release).
+      release_job_quota_pool "$job" # hk1798-prune-orphan-release
       stop_completion_sentinel "$job" "$pid" && echo "  action=stopped"
     fi
     return 0
@@ -10837,9 +10848,16 @@ prune_sentinel_row() {
       PRUNE_ORPHANS=$(( PRUNE_ORPHANS + 1 ))
       echo "sentinel job=$job pid=$pid age=${age}s pane=$pane orphan=yes reason=pane-gone($ptoken)"
       if [[ "$PRUNE_APPLY" -eq 1 ]]; then
-        job_end_record "$job" "$owner" abandoned "pane gone; sentinel orphaned" "wrk prune" >/dev/null || true
-        release_job_quota_pool "$job"
-        stop_completion_sentinel "$job" "$pid" && echo "  action=stopped+ended"
+        local _end_out=""
+        _end_out="$(job_end_record "$job" "$owner" abandoned "pane gone; sentinel orphaned" "wrk prune" 2>/dev/null)" || true
+        # The pane observation can be stale after a revive; only release if
+        # job_end_record confirms that this path actually ended the job.
+        if [[ "$_end_out" == created || "$_end_out" == already-ended ]]; then # hk1798-pane-gone-end-gate
+          release_job_quota_pool "$job" # hk1798-pane-gone-release
+          stop_completion_sentinel "$job" "$pid" && echo "  action=stopped+ended"
+        else
+          stop_completion_sentinel "$job" "$pid" && echo "  action=stopped"
+        fi
       fi ;;
     ok)
       echo "sentinel job=$job pid=$pid age=${age}s pane=$pane state=protected reason=pane-alive($ptoken)" ;;
@@ -10935,7 +10953,7 @@ prune_cmd() {
         echo "  action=end-declaration"
         # hk1798: the end declaration landed (or the job had already ended) —
         # return whatever quota records the dead pane's lease left behind.
-        release_job_quota_pool "$job"
+        release_job_quota_pool "$job" # hk1798-prune-stale-release
       else
         echo "  action=end-declaration-failed"
       fi

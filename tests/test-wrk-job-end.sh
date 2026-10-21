@@ -77,7 +77,10 @@ reset_case() {
   HK_STATE="$HK_DB" "$HK" tasks add --id 1 --title "case task" --lane fixture >/dev/null
 }
 
-arb() { env ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$ARBITER" "$@"; }
+arb() {
+  env SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$ARBITER" "$@"
+}
 
 # mk_job JOB [PANE] — claim + job.spawned receipt, the smallest live-job record.
 mk_job() {
@@ -149,8 +152,9 @@ start_sentinel() {
   # pid): a mutant or a mid-run kill that drops the child reaping still
   # leaves the interval sleep inside a group teardown can name exactly —
   # `kill -- -SENTINEL_PID` reaches orphans that re-parented to init.
-  tw_own_session env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" \
-    ${RECOVERY_ARBITER:+ARBITER_BIN="$RECOVERY_ARBITER"} \
+  tw_own_session env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" \
+    ARBITER_BIN="${RECOVERY_ARBITER:-$ARBITER}" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
     ${RECOVERY_STUB_LOG:+RECOVERY_STUB_LOG="$RECOVERY_STUB_LOG"} \
     WRK_FIXTURE_SCENARIO="${SCENARIO:-sentinel-working}" \
     ${seq:+WRK_FIXTURE_GET_SEQUENCE="$seq"} \
@@ -324,6 +328,15 @@ quota_spawn_ok() {
   out="$(quota_spawn "$@" 2>&1)" || return 1
   [[ "$(quota_rows "$job")" == 1 ]] || return 1
   printf '%s\n' "$out" | grep -q 'quota_record=' || return 1
+}
+
+quota_wait_sentinel_sleep() {
+  local job="$1" pidfile pid
+  pidfile="$INBOX/$job/completion-sentinel.pid"
+  [[ -s "$pidfile" ]] || return 1
+  pid="$(head -n 1 "$pidfile")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  sentinel_mid_sleep "$pid" >/dev/null
 }
 
 assert_quota_released() {
@@ -1939,6 +1952,7 @@ echo "PASS je44 flap-cannot-postpone-watch-window"
 echo "== QR1: wrk done releases the job's live quota_pool record =="
 reset_case qr1
 quota_spawn_ok qr1 || die3 "QR1 setup: spawn did not leave a live record"
+quota_wait_sentinel_sleep qr1 || die3 "QR1 setup: sentinel did not reach its sleep"
 REPORT="$TMP/qr1-report.md"; printf 'done verdict\n' >"$REPORT"
 done_run qr1 --report "$REPORT" >/dev/null 2>&1 ||
   fail "QR1: wrk done must still succeed with a releasable record"
@@ -1951,6 +1965,7 @@ reset_case qr2
 QR_MODEL=builder-sol quota_spawn_ok qr2 \
   --role builder --lane qr2-lane --parent director-1 ||
   die3 "QR2 setup: builder spawn did not leave a live record"
+quota_wait_sentinel_sleep qr2 || die3 "QR2 setup: sentinel did not reach its sleep"
 REPORT="$TMP/qr2-report.md"; printf 'joined report\n' >"$REPORT"
 env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
   XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
@@ -1964,6 +1979,7 @@ echo "PASS qr2 joined-releases-quota"
 echo "== QR3: delegated done releases the record =="
 reset_case qr3
 quota_spawn_ok qr3 || die3 "QR3 setup"
+quota_wait_sentinel_sleep qr3 || die3 "QR3 setup: sentinel did not reach its sleep"
 REPORT="$TMP/qr3-report.md"; printf 'x\n' >"$REPORT"
 QR3_STUB="$TMP/qr3-panewire"
 cat >"$QR3_STUB" <<'EOF'
@@ -2051,6 +2067,7 @@ EOF
 chmod +x "$QR7_ARB"
 QR_HERDR="$QR7_HERDR" QR_ARBITER="$QR7_ARB" quota_spawn_ok qr7 --owner qr7lane ||
   die3 "QR7 setup"
+quota_wait_sentinel_sleep qr7 || die3 "QR7 setup: sentinel did not reach its sleep"
 # The spawn's recorded pane/tab live in workspace w; the reap fixture's tab
 # census only knows w1:* — point the newest receipt at a reapable pair.
 arb event --job qr7 --kind job.spawned \
@@ -2080,6 +2097,7 @@ echo "PASS qr7 reap-releases-before-close"
 echo "== QR8: prune releases an ended job's leftover record =="
 reset_case qr8
 quota_spawn_ok qr8 || die3 "QR8 setup"
+quota_wait_sentinel_sleep qr8 || die3 "QR8 setup: sentinel did not reach its sleep"
 arb event --job qr8 --kind job.completed \
   --payload-json '{"owner_lane":"default","label":"lbl-qr8"}' >/dev/null
 prune_run --apply >/dev/null 2>&1 || fail "QR8: prune --apply must succeed"
@@ -2090,6 +2108,7 @@ echo "PASS qr8 prune-ended-releases-quota"
 echo "== QR9: prune pane-gone path ends and releases =="
 reset_case qr9
 quota_spawn_ok qr9 || die3 "QR9 setup"
+quota_wait_sentinel_sleep qr9 || die3 "QR9 setup: sentinel did not reach its sleep"
 QR9_SEQ="$TMP/qr9.seq"; printf 'not-found\n' >"$QR9_SEQ"
 env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
   XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$QR9_SEQ" \
@@ -2135,6 +2154,11 @@ ARBITER_TEST_NOW="2026-10-17T00:00:00Z" arb claim --job qr11-old \
   --lane old-lane --agent-label old-label --t T1 >/dev/null
 ARBITER_TEST_NOW="2026-10-17T00:00:01Z" arb_lease qr11-old
 [[ "$(quota_rows qr11-old)" == 1 ]] || die3 "QR11 setup: old job needs a live record"
+arb claim --job qr11-unrelated --lane unrelated-lane \
+  --agent-label unrelated-label --t T1 >/dev/null
+arb_lease qr11-unrelated
+[[ "$(quota_rows qr11-unrelated)" == 1 ]] ||
+  die3 "QR11 setup: unrelated job needs its own live record"
 QR_MODEL=builder-sol quota_spawn_ok qr11-new \
   --role builder --lane qr11-lane --parent director-1 \
   --takeover-from qr11-old >/dev/null ||
@@ -2142,12 +2166,19 @@ QR_MODEL=builder-sol quota_spawn_ok qr11-new \
 event_count_is "$QR11_OLDEV" job.handed_off 1 ||
   fail "QR11: takeover must write job.handed_off on the old job"
 assert_quota_released qr11-old "takeover hand-off"
+[[ "$(quota_rows qr11-unrelated)" == 1 ]] ||
+  fail "QR11: takeover must not release an unrelated job's record"
+[[ "$(release_events qr11-unrelated)" == 0 ]] ||
+  fail "QR11: takeover must not write an unrelated job's release event"
+[[ "$(quota_rows qr11-new)" == 1 ]] ||
+  fail "QR11: takeover must leave the new job's record live"
 echo "PASS qr11 takeover-releases-old-job-quota"
 
 # QR12 — released once, re-recorded, then ended: the end still releases
 echo "== QR12: a re-recorded record is released at job end =="
 reset_case qr12
 quota_spawn_ok qr12 || die3 "QR12 setup"
+quota_wait_sentinel_sleep qr12 || die3 "QR12 setup: sentinel did not reach its sleep"
 arb release --job qr12 --resource codex --kind quota_pool >/dev/null ||
   die3 "QR12 setup: first release"
 arb_lease qr12 || die3 "QR12 setup: re-record"
@@ -2175,6 +2206,7 @@ exec "$ARBITER" "\$@"
 EOF
 chmod +x "$QR13_ARB"
 QR_ARBITER="$QR13_ARB" quota_spawn_ok qr13 || die3 "QR13 setup"
+quota_wait_sentinel_sleep qr13 || die3 "QR13 setup: sentinel did not reach its sleep"
 REPORT="$TMP/qr13-report.md"; printf 'x\n' >"$REPORT"
 QR13_OUT="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$QR13_ARB" \
   ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
@@ -2194,6 +2226,63 @@ grep -q 'pool=codex' "$INBOX/qr13/completion-sentinel.log" ||
 event_count_is "$INBOX/qr13/events" job.completed 1 ||
   fail "QR13: job.completed must land despite the release failure"
 echo "PASS qr13 release-failure-logged"
+
+case_live_revival_prune_pane_gone() {
+  reset_case mut-ractive || return 3
+  quota_spawn mut-ractive >/dev/null 2>&1 || return 3
+  quota_wait_sentinel_sleep mut-ractive || return 3
+  ARBITER_TEST_NOW=2099-01-01T00:00:00Z arb release --job mut-ractive \
+    --resource codex --kind quota_pool >/dev/null || return 3
+  ARBITER_TEST_NOW=2099-01-02T00:00:00Z arb event --job mut-ractive --kind job.completed \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive","pane_id":"w:p1"}' >/dev/null ||
+    return 3
+  ARBITER_TEST_NOW=2099-01-03T00:00:00Z arb event --job mut-ractive --kind job.reclaim \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive"}' >/dev/null || return 3
+  ARBITER_TEST_NOW=2099-01-04T00:00:00Z arb event --job mut-ractive --kind job.spawned \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive","pane_id":"w:p2"}' >/dev/null ||
+    return 3
+  ARBITER_TEST_NOW=2099-01-05T00:00:00Z arb_lease mut-ractive || return 3
+  [[ "$(quota_rows mut-ractive)" == 1 ]] || return 3
+  local seq="$TMP/mut-ractive.seq"; printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply --job mut-ractive >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-ractive)" == 1 ]] || return 1
+  event_count_is "$INBOX/mut-ractive/events" job.revoked 0 || return 1
+  [[ "$(release_events mut-ractive)" == 1 ]] || return 1
+}
+
+case_duplicate_done_after_revival() {
+  reset_case mut-rduplicate || return 3
+  quota_spawn mut-rduplicate >/dev/null 2>&1 || return 3
+  quota_wait_sentinel_sleep mut-rduplicate || return 3
+  local report="$TMP/mut-rduplicate-report.md"
+  printf 'round one report\n' >"$report"
+  done_run mut-rduplicate --report "$report" >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rduplicate)" == 0 ]] || return 3
+  ARBITER_TEST_NOW=2099-02-01T00:00:00Z arb event --job mut-rduplicate \
+    --kind job.reclaim --payload-json '{"owner_lane":"default","label":"lbl-mut-rduplicate"}' >/dev/null ||
+    return 3
+  ARBITER_TEST_NOW=2099-02-02T00:00:00Z arb event --job mut-rduplicate \
+    --kind job.spawned --payload-json \
+    '{"owner_lane":"default","label":"lbl-mut-rduplicate","pane_id":"w:p2"}' >/dev/null || return 3
+  ARBITER_TEST_NOW=2099-02-03T00:00:00Z arb_lease mut-rduplicate || return 3
+  [[ "$(quota_rows mut-rduplicate)" == 1 ]] || return 3
+  done_run mut-rduplicate --report "$report" >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rduplicate)" == 1 ]] || return 1
+  [[ "$(release_events mut-rduplicate)" == 1 ]] || return 1
+}
+
+# QR14 — pane-gone prune must not release a revived job's live round record.
+echo "== QR14: pane-gone prune preserves a revived job's quota row =="
+case_live_revival_prune_pane_gone || fail "QR14: pane-gone prune must preserve a revived round"
+echo "PASS qr14 pane-gone-prune-preserves-revived-record"
+
+# QR15 — a duplicate completion after a revive must not release the new round.
+echo "== QR15: duplicate done after revive preserves the live round record =="
+case_duplicate_done_after_revival ||
+  fail "QR15: duplicate done must preserve the revived round's record"
+echo "PASS qr15 duplicate-done-after-revive-preserves-record"
 
 # ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants: sed'd copies of bin/wrk (path ends in /wrk —
@@ -3153,6 +3242,7 @@ case_release_done() {
   reset_case mut-rdone || return 3
   quota_spawn mut-rdone >/dev/null 2>&1 || return 3
   [[ "$(quota_rows mut-rdone)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rdone || return 3
   REPORT="$TMP/mut-rdone-report.md"; printf 'x\n' >"$REPORT"
   done_run mut-rdone --report "$REPORT" >/dev/null 2>&1
   [[ "$(quota_rows mut-rdone)" == 0 ]] || return 1
@@ -3163,6 +3253,7 @@ case_release_joined() {
   QR_MODEL=builder-sol quota_spawn mut-rjoined \
     --role builder --lane mut-rjoined-lane --parent director-1 >/dev/null 2>&1 || return 3
   [[ "$(quota_rows mut-rjoined)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rjoined || return 3
   REPORT="$TMP/mut-rjoined-report.md"; printf 'x\n' >"$REPORT"
   env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
     XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
@@ -3176,6 +3267,7 @@ case_release_delegate_done() {
   reset_case mut-rdel || return 3
   quota_spawn mut-rdel >/dev/null 2>&1 || return 3
   [[ "$(quota_rows mut-rdel)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rdel || return 3
   REPORT="$TMP/mut-rdel-report.md"; printf 'x\n' >"$REPORT"
   local stub="$TMP/mut-rdel-panewire"
   cat >"$stub" <<'EOF'
@@ -3247,6 +3339,7 @@ EOF
   chmod +x "$hwrap" "$astub" || return 3
   QR_HERDR="$hwrap" QR_ARBITER="$astub" quota_spawn mut-rreap --owner mutrrlane >/dev/null 2>&1 || return 3
   [[ "$(quota_rows mut-rreap)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rreap || return 3
   arb event --job mut-rreap --kind job.spawned \
     --payload-json '{"owner_lane":"mutrrlane","label":"lbl-mut-rreap","pane_id":"w1:p1","tab_id":"w1:t1"}' >/dev/null || return 3
   arb event --job mut-rreap --kind job.completed \
@@ -3269,6 +3362,7 @@ case_release_prune_orphan() {
   reset_case mut-rpo || return 3
   quota_spawn mut-rpo >/dev/null 2>&1 || return 3
   [[ "$(quota_rows mut-rpo)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rpo || return 3
   # Interval stays 3600: a waking sentinel would self-release through the
   # watch-exit path and mask this site's removal (same hazard as H01).
   arb event --job mut-rpo --kind job.completed \
@@ -3281,6 +3375,7 @@ case_release_prune_panegone() {
   reset_case mut-rpg || return 3
   quota_spawn mut-rpg >/dev/null 2>&1 || return 3
   [[ "$(quota_rows mut-rpg)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rpg || return 3
   local seq="$TMP/mut-rpg.seq"; printf 'not-found\n' >"$seq"
   env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
     XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
@@ -3323,59 +3418,71 @@ case_release_takeover() {
 # R1: the release inside shared job_end_housekeeping — covers wrk done,
 # wrk joined and the delegated panewire path alike.
 mkmut_span r1-no-housekeep-release \
-  'warn "job end declaration write failed for $job; the records stay file-only"' \
-  '    : removed hk1798 housekeeping release' 1
+  'hk1798-housekeeping-release' \
+  '      : removed hk1798 housekeeping release'
 expect_mut_red "R1a done-quota-release" case_release_done
 expect_mut_red "R1b joined-quota-release" case_release_joined
 expect_mut_red "R1c delegated-done-quota-release" case_release_delegate_done
 
 # R2: the sentinel completed path's release
 mkmut_span r2-no-sentinel-release \
-  '# silently skipped whenever ARBITER never reached the sentinel env.' \
-  '        : removed hk1798 sentinel-completed release' 1
+  'hk1798-sentinel-completed-release' \
+  '        : removed hk1798 sentinel-completed release'
 expect_mut_red "R2 sentinel-completed-release" case_release_sentinel_completed
 
 # R3: the sentinel lost-grace release (keep the end record; drop the release)
 mkmut_span r3-no-lostgrace-release \
-  'job_end_record "$job" "$owner" abandoned "sentinel lost grace expired" "wrk sentinel" >/dev/null || true' \
-  '      job_end_record "$job" "$owner" abandoned "sentinel lost grace expired" "wrk sentinel" >/dev/null || true' 1
+  'hk1798-lost-grace-release' \
+  '        created|already-ended) : ;; # removed hk1798 lost-grace release'
 expect_mut_red "R3 lost-grace-release" case_release_lost_grace
 
 # R4: the watch-exit release
 mkmut_span r4-no-watchexit-release \
-  'behind, this waking sentinel is the last thing that can return it.' \
-  '      : removed hk1798 watch-exit release' 1
+  'hk1798-sentinel-watch-exit-release' \
+  '      : removed hk1798 watch-exit release'
 expect_mut_red "R4 watch-exit-release" case_release_watch_exit
 
 # R5: reap's pre-close release — the order assertion is what goes RED (the
 # post-close housekeeping release still drains the row under this mutant).
 mkmut_span r5-no-reap-release \
-  'owed whether or not the close below lands.' \
-  '      : removed hk1798 reap pre-close release' 1
+  'hk1798-reap-preclose-release' \
+  '      : removed hk1798 reap pre-close release'
 expect_mut_red "R5 reap-release-before-close" case_release_reap_order
 
 # R6: prune's ended-orphan release
 mkmut_span r6-no-orphan-release \
-  'end path leaked (idempotent: a clean job has no rows to release).' \
-  '      : removed hk1798 orphan release' 1
+  'hk1798-prune-orphan-release' \
+  '      : removed hk1798 orphan release'
 expect_mut_red "R6 prune-orphan-release" case_release_prune_orphan
 
 # R7: prune's pane-gone release (keep the end record; drop the release)
 mkmut_span r7-no-panegone-release \
-  'job_end_record "$job" "$owner" abandoned "pane gone; sentinel orphaned" "wrk prune" >/dev/null || true' \
-  '        job_end_record "$job" "$owner" abandoned "pane gone; sentinel orphaned" "wrk prune" >/dev/null || true' 1
+  'hk1798-pane-gone-release' \
+  '          : removed hk1798 pane-gone release'
 expect_mut_red "R7 prune-pane-gone-release" case_release_prune_panegone
 
 # R8: prune's stale-job release
 mkmut_span r8-no-stale-release \
-  'return whatever quota records the dead pane' \
-  '        : removed hk1798 stale release' 1
+  'hk1798-prune-stale-release' \
+  '        : removed hk1798 stale release'
 expect_mut_red "R8 prune-stale-release" case_release_prune_stale
 
 # R9: the takeover hand-off release
 mkmut_span r9-no-takeover-release \
-  'pool survives the hand-off otherwise.' \
-  '  : removed hk1798 takeover release' 1
+  'hk1798-takeover-release' \
+  '  : removed hk1798 takeover release'
 expect_mut_red "R9 takeover-release" case_release_takeover
+
+# R10: pane-gone observations cannot end a job revived after its terminal.
+mkmut_span r10-pane-gone-live-guard \
+  'hk1798-pane-gone-end-gate' \
+  '        if true; then # removed hk1798 pane-gone live guard'
+expect_mut_red "R10 pane-gone-live-release-guard" case_live_revival_prune_pane_gone
+
+# R11: housekeeping must not release a round revived after a prior completion.
+mkmut_span r11-housekeeping-active-release \
+  'hk1798-housekeeping-active-guard' \
+  '    active) release_job_quota_pool "$job"; stop_completion_sentinel "$job"; return 0 ;;'
+expect_mut_red "R11 housekeeping-active-revive-guard" case_duplicate_done_after_revival
 
 echo "PASS test-wrk-job-end: all cases"
