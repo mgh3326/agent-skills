@@ -62,6 +62,15 @@ export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 
+# hk1798 round 2: no invocation this file makes may fall back to the
+# operator's tools — a wrk call that forgets its fixture env resolves the
+# repo's stub arbiter/scopefuel and a throwaway XDG home, never the live
+# ~/.local/bin or ~/.local/share. Per-call env still wins where a case needs
+# its own stub.
+export ARBITER_BIN="$ARBITER" SCOPEFUEL_BIN="$SCOPEFUEL"
+export XDG_DATA_HOME="$TMP/xdg-default"
+mkdir -p "$XDG_DATA_HOME"
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 die3() { echo "SETUP: $*" >&2; exit 3; }  # setup failure inside a mutant case — not an assertion verdict
 
@@ -878,7 +887,8 @@ kill -0 "$SENTINEL_PID" 2>/dev/null ||
 # housekeeping can end it before the next probe.
 arb event --job je14-reap --kind job.joined \
   --payload-json '{"owner_lane":"lane-a","label":"je14-reap","pane_id":"w1:p1"}' >/dev/null
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$XDG" \
+  ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
   WRK_FIXTURE_LOG="$HERDR_LOG" \
   "$WRK" reap --apply --lane lane-a --grace 0s >"$TMP/je14-reap.out" 2>&1 ||
   { cat "$TMP/je14-reap.out"; fail "JE14: wrk reap --apply failed"; }
@@ -1417,7 +1427,8 @@ arb event --job je30-reap --kind job.joined \
   --payload-json '{"owner_lane":"lane-a","label":"je30-reap","pane_id":"w1:p1"}' >/dev/null
 spawn_sleeper; J30E=$SLEEPER_PID
 printf '%s\n' "$J30E" >"$INBOX/je30-reap/completion-sentinel.pid"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$XDG" \
+  ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
   "$WRK" reap --apply --lane lane-a --grace 0s >/dev/null 2>&1 ||
   fail "JE30/reap: wrk reap --apply must succeed"
 kill -0 "$J30E" 2>/dev/null ||
@@ -2254,6 +2265,12 @@ case_live_revival_prune_pane_gone() {
     return 3
   ARBITER_TEST_NOW=2099-01-05T00:00:00Z arb_lease mut-ractive || return 3
   [[ "$(quota_rows mut-ractive)" == 1 ]] || return 3
+  # Point the pidfile sentinel at the NEWEST spawn pane so this case exercises
+  # the pane-gone end-gate; the stale round-one watcher (w:p1) is what the
+  # superseded gate then stops in the sweep pass (hk1798 round 2).
+  REPORT="$TMP/mut-ractive-report.md"; printf 'x\n' >"$REPORT"
+  start_sentinel mut-ractive w:p2 "$REPORT"
+  sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
   local seq="$TMP/mut-ractive.seq"; printf 'not-found\n' >"$seq"
   env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
     XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
@@ -2261,6 +2278,7 @@ case_live_revival_prune_pane_gone() {
   [[ "$(quota_rows mut-ractive)" == 1 ]] || return 1
   event_count_is "$INBOX/mut-ractive/events" job.revoked 0 || return 1
   [[ "$(release_events mut-ractive)" == 1 ]] || return 1
+  wait_until 8 pid_gone "$SENTINEL_PID" || return 1
 }
 
 case_duplicate_done_after_revival() {
@@ -2294,6 +2312,92 @@ echo "== QR15: duplicate done after revive preserves the live round record =="
 case_duplicate_done_after_revival ||
   fail "QR15: duplicate done must preserve the revived round's record"
 echo "PASS qr15 duplicate-done-after-revive-preserves-record"
+
+# A revive with NO work-terminal before it: claim, spawned w:p0, record, a
+# job.lost, the stale record released, then a --reclaim-released claim, a new
+# spawned on a different pane and a fresh live record. No terminal ever lands,
+# so the end-gate alone cannot see that round two is live — only the newest
+# job.spawned pane names it. Shared by QR16 (prune) and QR17 (lost grace).
+revive_noterminal_setup() {
+  local job="$1" oldpane="$2" newpane="$3"
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"pane_id\":\"$oldpane\",\"tab_id\":\"w:t0\"}" >/dev/null ||
+    return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.lost \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"reason\":\"agent_not_found\"}" >/dev/null ||
+    return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"pane_id\":\"$newpane\",\"tab_id\":\"w:t2\"}" >/dev/null ||
+    return 3
+  arb_lease "$job" || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+}
+
+# The stale round-one sentinel kept its pidfile across the respawn and still
+# watches the dead old pane. Prune may stop it, but the watched pane is not
+# the job's newest spawn, so no end declaration or release may follow.
+case_revive_noterminal_prune_superseded() {
+  reset_case mut-rsupp || return 3
+  revive_noterminal_setup mut-rsupp w:p0 w:p2 || return 3
+  REPORT="$TMP/mut-rsupp-report.md"; printf 'x\n' >"$REPORT"
+  start_sentinel mut-rsupp w:p0 "$REPORT"
+  sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
+  local seq="$TMP/mut-rsupp.seq"; printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply --job mut-rsupp >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rsupp)" == 1 ]] || return 1
+  event_count_is "$INBOX/mut-rsupp/events" job.revoked 0 || return 1
+  [[ "$(release_events mut-rsupp)" == 1 ]] || return 1
+  wait_until 8 pid_gone "$SENTINEL_PID" || return 1
+}
+
+# Same revive through the sentinel's own lost grace: the stale watcher
+# records job.lost on the dead pane, the job is reclaimed and respawned on a
+# new pane, and the grace then expires. The superseded sentinel must leave
+# without declaring the end or releasing the live round.
+case_revive_noterminal_lostgrace_superseded() {
+  reset_case mut-rsupg || return 3
+  arb claim --job mut-rsupg --lane lane-a --agent-label lbl-mut-rsupg --t T1 >/dev/null || return 3
+  arb event --job mut-rsupg --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl-mut-rsupg","pane_id":"w:p0","tab_id":"w:t0"}' >/dev/null ||
+    return 3
+  arb_lease mut-rsupg || return 3
+  local seq="$TMP/mut-rsupg.seq"; printf 'not-found\n' >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=5 start_sentinel mut-rsupg w:p0 "$TMP/mut-rsupg-report.md" "$seq"
+  wait_until 15 event_count_is "$INBOX/mut-rsupg/events" job.lost 1 || return 3
+  arb release --job mut-rsupg --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job mut-rsupg --lane lane-a --agent-label lbl-mut-rsupg --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb event --job mut-rsupg --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl-mut-rsupg","pane_id":"w:p1","tab_id":"w:t1"}' >/dev/null ||
+    return 3
+  arb_lease mut-rsupg || return 3
+  [[ "$(quota_rows mut-rsupg)" == 1 ]] || return 3
+  wait_until 15 pid_gone "$SENTINEL_PID" || return 1
+  event_count_is "$INBOX/mut-rsupg/events" job.revoked 0 || return 1
+  [[ "$(quota_rows mut-rsupg)" == 1 ]] || return 1
+  [[ "$(release_events mut-rsupg)" == 1 ]] || return 1
+  grep -q 'superseded' "$INBOX/mut-rsupg/completion-sentinel.log" || return 1
+}
+
+# QR16 — prune must supersede a stale sentinel on a terminal-less revive:
+# stop it without declaring the end or releasing the live round's record.
+echo "== QR16: pane-gone prune supersedes a stale sentinel without ending the revived job =="
+case_revive_noterminal_prune_superseded ||
+  fail "QR16: prune must supersede the stale sentinel, not end the revived job"
+echo "PASS qr16 pane-gone-prune-superseded-preserves-record"
+
+# QR17 — the same revive through the sentinel's own lost grace.
+echo "== QR17: a superseded sentinel's lost grace ends nothing =="
+case_revive_noterminal_lostgrace_superseded ||
+  fail "QR17: the superseded sentinel must exit without end or release"
+echo "PASS qr17 lost-grace-superseded-preserves-record"
 
 # ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants: sed'd copies of bin/wrk (path ends in /wrk —
@@ -2475,7 +2579,8 @@ case_reap() {
   sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
   arb event --job mut-reap --kind job.joined \
     --payload-json '{"owner_lane":"lane-a","label":"mut-reap","pane_id":"w1:p1"}' >/dev/null || return 3
-  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$XDG" \
+    ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
     "$WRK" reap --apply --lane lane-a --grace 0s >/dev/null 2>&1
   wait_until 8 pid_gone "$SENTINEL_PID" || return 1
   [[ ! -e "$INBOX/mut-reap/completion-sentinel.pid" ]] || return 1
@@ -3498,5 +3603,19 @@ mkmut_span r11-housekeeping-active-release \
   'hk1798-housekeeping-active-guard' \
   '    active) release_job_quota_pool "$job"; stop_completion_sentinel "$job"; return 0 ;;'
 expect_mut_red "R11 housekeeping-active-revive-guard" case_duplicate_done_after_revival
+
+# R12: prune's pane-gone superseded gate — without it a stale sentinel's dead
+# pane lets prune end and release the terminal-less revived round.
+mkmut_span r12-no-panegone-superseded \
+  'hk1798-pane-gone-superseded' \
+  '        if false; then # removed hk1798 pane-gone superseded gate'
+expect_mut_red "R12 pane-gone-superseded-gate" case_revive_noterminal_prune_superseded
+
+# R13: the sentinel's own lost-grace superseded gate — without it the stale
+# watcher ends and releases the live round when its grace expires.
+mkmut_span r13-no-lostgrace-superseded \
+  'hk1798-lost-grace-superseded' \
+  '        if false; then # removed hk1798 lost-grace superseded gate'
+expect_mut_red "R13 lost-grace-superseded-gate" case_revive_noterminal_lostgrace_superseded
 
 echo "PASS test-wrk-job-end: all cases"

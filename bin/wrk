@@ -6191,6 +6191,22 @@ sentinel_pid_matches() {
     END { exit(found ? 0 : 1) }'
 }
 
+# sentinel_argv_pane PID JOB — the pane argument of a live
+# `wrk sentinel JOB OWNER LABEL PANE …` process, empty when the argv does not
+# prove this job's sentinel. Same argv shape as sentinel_pid_matches; the
+# pane the process watches is evidence, not the job's newest job.spawned.
+sentinel_argv_pane() {
+  local pid="$1" job="$2"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  ps -p "$pid" -o args= 2>/dev/null | awk -v job="$job" '
+    function is_shell(tok) { sub(/^.*\//, "", tok); return tok ~ /^(sh|bash|zsh|dash|ksh)$/ }
+    {
+      for (i = 1; i <= NF; i++)
+        if ($i ~ /(^|\/)wrk$/ && $(i + 1) == "sentinel" && $(i + 2) == job &&
+            NF >= i + 5 && (i == 1 || (i == 2 && is_shell($1)))) { print $(i + 5); exit }
+    }'
+}
+
 # sentinel_pidfile_fields FILE — print "pid<TAB>started" parsed from a
 # completion-sentinel pidfile. Current files are two lines ("PID" then
 # "started=EPOCH"); bare numeric legacy pidfiles and flat "pid=N started=E"
@@ -6563,6 +6579,17 @@ PY
       # #770: the grace expired without a completion. job.lost is not a hub
       # terminal, so declare the end (newest-revive wins, so a respawned job
       # is left alone) before the sentinel leaves.
+      # hk1798: a revive without a work-terminal — a released-record reclaim
+      # or a --job-dup-ok respawn — never trips the revive check, but its
+      # newest job.spawned still names the live round's pane. A watcher
+      # parked on an older pane is superseded: declaring the end here would
+      # release that live round's records, so it leaves quietly instead.
+      local newest_pane=""
+      newest_pane="$(job_events_scan "$jobdir/events" 2>/dev/null | awk -F'\t' '{print $10; exit}')"
+      if [[ -n "$newest_pane" && "$newest_pane" != - && "$newest_pane" != "$pane" ]]; then # hk1798-lost-grace-superseded
+        sentinel_log "$logfile" "$token" "$transient" "superseded" "newest-pane=$newest_pane"
+        sentinel_self_exit "$job" 0
+      fi
       local end_out=""
       end_out="$(job_end_record "$job" "$owner" abandoned "sentinel lost grace expired" "wrk sentinel" 2>/dev/null)" || true
       # The end declaration may lose a race to a revive; only a terminal result
@@ -10829,14 +10856,22 @@ prune_sentinel_row() {
     PRUNE_ORPHANS=$(( PRUNE_ORPHANS + 1 ))
     echo "sentinel job=$job pid=$pid age=${age}s orphan=yes reason=job-ended($terminal)"
     if [[ "$PRUNE_APPLY" -eq 1 ]]; then
-  # hk1798: the job already ended — hand back any quota record its own
-  # end path leaked (idempotent: a clean job has no rows to release).
+      # hk1798: the job already ended — hand back any quota record its own
+      # end path leaked (idempotent: a clean job has no rows to release).
       release_job_quota_pool "$job" # hk1798-prune-orphan-release
       stop_completion_sentinel "$job" "$pid" && echo "  action=stopped"
     fi
     return 0
   fi
-  local pane="${argv_pane:-$j_pane}" probe pclass ptoken
+  # The pane this sentinel watches is evidence in its own argv; the scan's
+  # j_pane is the job's NEWEST spawn, which a terminal-less revive moves past
+  # a stale watcher. Probe the watched pane, not the job's.
+  local pane="${argv_pane:-}"
+  if [[ -z "$pane" && "$live" -eq 1 ]]; then
+    pane="$(sentinel_argv_pane "$pid" "$job")"
+  fi
+  [[ -n "$pane" ]] || pane="$j_pane"
+  local probe pclass ptoken
   if [[ -z "$pane" || "$pane" == - ]]; then
     echo "sentinel job=$job pid=$pid age=${age}s state=protected reason=no-pane-evidence"
     return 0
@@ -10848,15 +10883,22 @@ prune_sentinel_row() {
       PRUNE_ORPHANS=$(( PRUNE_ORPHANS + 1 ))
       echo "sentinel job=$job pid=$pid age=${age}s pane=$pane orphan=yes reason=pane-gone($ptoken)"
       if [[ "$PRUNE_APPLY" -eq 1 ]]; then
-        local _end_out=""
-        _end_out="$(job_end_record "$job" "$owner" abandoned "pane gone; sentinel orphaned" "wrk prune" 2>/dev/null)" || true
-        # The pane observation can be stale after a revive; only release if
-        # job_end_record confirms that this path actually ended the job.
-        if [[ "$_end_out" == created || "$_end_out" == already-ended ]]; then # hk1798-pane-gone-end-gate
-          release_job_quota_pool "$job" # hk1798-pane-gone-release
-          stop_completion_sentinel "$job" "$pid" && echo "  action=stopped+ended"
+        if [[ -n "$j_pane" && "$j_pane" != - && "$pane" != "$j_pane" ]]; then # hk1798-pane-gone-superseded
+          # hk1798: the watched pane is not the job's newest job.spawned pane
+          # — a terminal-less revive superseded this sentinel, so ending or
+          # releasing here would hit the live round's records.
+          stop_completion_sentinel "$job" "$pid" && echo "  action=stopped-superseded"
         else
-          stop_completion_sentinel "$job" "$pid" && echo "  action=stopped"
+          local _end_out=""
+          _end_out="$(job_end_record "$job" "$owner" abandoned "pane gone; sentinel orphaned" "wrk prune" 2>/dev/null)" || true
+          # The pane observation can be stale after a revive; only release if
+          # job_end_record confirms that this path actually ended the job.
+          if [[ "$_end_out" == created || "$_end_out" == already-ended ]]; then # hk1798-pane-gone-end-gate
+            release_job_quota_pool "$job" # hk1798-pane-gone-release
+            stop_completion_sentinel "$job" "$pid" && echo "  action=stopped+ended"
+          else
+            stop_completion_sentinel "$job" "$pid" && echo "  action=stopped"
+          fi
         fi
       fi ;;
     ok)
