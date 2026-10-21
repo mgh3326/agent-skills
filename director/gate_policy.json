@@ -156,7 +156,7 @@
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "b1c644bfa7c6875639cadc9f5ae7a212968509542b1f6b135e75398596368658",
-    "bin/wrk": "8ec3dc8920beb97d62c489216261575389ea06314d99bf45266dec855603fd3b",
+    "bin/wrk": "54e53698fb5b1263cf3493d3cfa7a3a4e46372928ac8659071c1f5fbcb6e6590",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
     "builder/SKILL.md": "23e2a1b63bab9bf01fbcad9b0b1e76149c9598df1c40ee9908e93bebcc050bd1",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
