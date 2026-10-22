@@ -9623,6 +9623,20 @@ refuse_barred_model_id() {
   esac
 }
 
+# Every channel a resolved model id can ride into the launcher argv must face
+# the same bar: codex/kiro put it in PROFILE_MODEL, grok in PROFILE_MODEL_ARG,
+# and apply_catalog can write it straight into ARGS as --model <id> (fable).
+refuse_barred_launcher_model() {
+  local i
+  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"
+  refuse_barred_model_id "$PROFILE_MODEL_ARG" "$MODEL"
+  for ((i = 0; i < ${#ARGS[@]} - 1; i++)); do
+    case "${ARGS[$i]}" in
+      -m|--model) refuse_barred_model_id "${ARGS[$((i + 1))]}" "$MODEL" ;;
+    esac
+  done
+}
+
 refuse_known_terra_spelling() {
   local profile="${1:-$MODEL}"
   case "$profile" in
@@ -9793,7 +9807,7 @@ spawn_cmd() {
   resolve_profile
   # Refuse by the resolved launcher model id, not by the spelling list. Keep
   # this before gate work, quota/arbiter admission, worktree or pane creation.
-  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"
+  refuse_barred_launcher_model
   configure_landing_check "$PROFILE_KIND"
   LANE_ENV=()
   if [[ -n "$LANE" ]]; then

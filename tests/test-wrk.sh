@@ -294,7 +294,7 @@ if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 TERRA_PROBE_SEQ=0
 terra_refusal_probe() {
   local executable="$1" profile="$2" role_path="$3" case_name="$4"
-  local profile_flag="${5:--m}" expected_model="${6:-gpt-5.6-terra}"
+  local profile_flag="${5:--m}" expected_model="${6:-gpt-5.6-terra}" extra_opt="${7:-}"
   local root="$TMP/noterra/$case_name" home data cache config state inbox
   local out err herdr_log scopefuel_log panewire_log db before_tree after_tree before_hk after_hk task_id job rc=0
   TERRA_PROBE_SEQ=$((TERRA_PROBE_SEQ + 1))
@@ -312,8 +312,14 @@ terra_refusal_probe() {
     worker) args+=(--role worker --task "$task_id") ;;
     builder) args+=(--role builder --lane "nr-lane-$TERRA_PROBE_SEQ" --parent parent-lane --task "$task_id") ;;
     tester) args+=(--parent-job "$HK_TASK_ID") ;;
+    counsel) args+=(--role counsel) ;;
     *) return 1 ;;
   esac
+  if [[ -n "$extra_opt" ]]; then
+    local extra_arr=()
+    read -ra extra_arr <<<"$extra_opt"
+    args+=("${extra_arr[@]}")
+  fi
   set +e
   env HOME="$home" XDG_DATA_HOME="$data" XDG_CACHE_HOME="$cache" \
     XDG_CONFIG_HOME="$config" XDG_STATE_HOME="$state" \
@@ -390,7 +396,7 @@ for old, new in replacements:
         raise SystemExit(f"expected one resolver clause: {old}")
     src = src.replace(old, new, 1)
 if sys.argv[3] == "1":
-    guard = '  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"\n'
+    guard = '  refuse_barred_launcher_model\n'
     claim = '  arbiter_admit\n'
     if src.count(guard) != 1 or src.count(claim) != 1:
         raise SystemExit("resolved guard or arbiter admission call is not unique")
@@ -411,6 +417,16 @@ WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-terra \
   terra_refusal_probe "$WRK" codex-luna worker catalog-terra-override -m gpt-9.9-terra ||
   fail "T-A1 catalog-served terra model id must be refused for a non-Terra spelling"
 echo "PASS T-A1 catalog pin: a canon-served Terra model id is refused on codex-luna"
+# The bar also covers the non-codex launch channels: grok consumes the canon
+# model id via PROFILE_MODEL_ARG -> argv -m, fable via --model in ARGS.
+WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-terra \
+  terra_refusal_probe "$WRK" grok-hi worker catalog-terra-grok -m gpt-9.9-terra ||
+  fail "T-A1 catalog-served terra model id must be refused on the grok argv channel"
+echo "PASS T-A1 catalog pin: a canon-served Terra model id is refused on grok-hi"
+WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-terra \
+  terra_refusal_probe "$WRK" fable counsel catalog-terra-fable -m gpt-9.9-terra "--operator-request hk:doc/decision/2026-09-21/astra-allowed-purposes-approved" ||
+  fail "T-A1 catalog-served terra model id must be refused on the fable ARGS channel"
+echo "PASS T-A1 catalog pin: a canon-served Terra model id is refused on fable"
 
 # Named mutants: dropping the model-id check, moving it beyond arbiter
 # admission, or re-narrowing it to the old literal enumeration must each make a
@@ -430,7 +446,7 @@ python3 - "$FUTURE_TERRA_WRK" "$M1_FUTURE_TERRA_WRK" <<'PY'
 from pathlib import Path
 import sys
 src = Path(sys.argv[1]).read_text()
-guard = '  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"\n'
+guard = '  refuse_barred_launcher_model\n'
 if src.count(guard) != 1:
     raise SystemExit("m1 target guard is not unique")
 Path(sys.argv[2]).write_text(src.replace(guard, "", 1))
