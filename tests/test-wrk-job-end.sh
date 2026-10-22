@@ -2556,6 +2556,11 @@ expect_mut_red() {
   echo "PASS mut $desc is assertion-RED (rc=$rc${expected:+, assertion=$expected})"
 }
 
+assertion_red() {
+  printf 'ASSERT-RED: %s\n' "$1" >&2
+  return 1
+}
+
 # nth_lineno PATTERN N — the line number of the Nth fixed-string occurrence.
 nth_lineno() {
   grep -nF "$1" "$WRK" | sed -n "${2}p" | cut -d: -f1
@@ -3756,11 +3761,6 @@ seed_ended_rerecorded_quota() {
   arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
   arb_lease "$job" || return 3
   [[ "$(quota_rows "$job")" == 1 ]] || return 3
-}
-
-assertion_red() {
-  printf 'ASSERT-RED: %s\n' "$1" >&2
-  return 1
 }
 
 run_red_first_case() {
