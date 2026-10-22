@@ -125,7 +125,8 @@ def main() -> int:
         return 2
     if status.get("ok", True) is not True:
         detail = status.get("error")
-        suffix = f": {str(detail)[:200]}" if isinstance(detail, str) else ""
+        flat = " ".join(detail.split()) if isinstance(detail, str) else ""
+        suffix = f": {flat[:200]}" if flat else ""
         print(f"quota-stale-report: arbiter status reported ok false{suffix}",
               file=sys.stderr)
         return 2

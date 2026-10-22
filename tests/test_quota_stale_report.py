@@ -239,6 +239,21 @@ class QuotaStaleReport(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, f"ok={bad!r}")
             self.assertEqual(proc.stdout, "")
 
+    def test_ok_non_exact_true_values_exit_2(self) -> None:
+        for bad in (1, 0, "true", "", [], {}):
+            proc = run_report(self.jobs_root, {"ok": bad})
+            self.assertEqual(proc.returncode, 2, f"ok={bad!r}")
+            self.assertEqual(proc.stdout, "")
+
+    def test_ok_false_error_newline_stays_one_stderr_line(self) -> None:
+        proc = run_report(self.jobs_root,
+                          {"ok": False, "error": "line1\nline2\t  line3"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        lines = proc.stderr.splitlines()
+        self.assertEqual(len(lines), 1, proc.stderr)
+        self.assertIn("line1 line2 line3", lines[0])
+
     def test_ok_absent_keeps_previous_behaviour(self) -> None:
         write_events(self.jobs_root, "j-done",
                      ["quota_pool.record", "job.completed"])
@@ -261,7 +276,7 @@ class QuotaStaleReport(unittest.TestCase):
             mutant.write_text(source.replace(guard, "    if False:\n", 1),
                               encoding="utf-8")
             proc = run_report(self.jobs_root, status, script=mutant)
-            self.assertNotEqual(proc.returncode, 2)
+            self.assertEqual(proc.returncode, 0)
 
     def test_unparseable_stdin_exits_2(self) -> None:
         proc = run_report(self.jobs_root, "not json {")
