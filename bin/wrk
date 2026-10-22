@@ -6201,18 +6201,30 @@ quota_release_log() {
   return 0
 }
 
-# quota_release_round_current JOB PANE — prove the latest terminal still owns
-# the current watch round. PANE is the candidate's observed pane; an empty
-# value is resolved from the newest event scan and still fails closed when no
-# current pane can be established.
+# quota_release_round_current JOB PANE [MODE] — prove that the latest terminal
+# still authorizes this release. The default mode requires the candidate's
+# observed pane to be the current watch round. ended-no-sentinel is reserved
+# for prune pass 4: terminal ordering must prove the job ended and no live
+# completion sentinel may still own cleanup.
 quota_release_round_current() {
-  local job="$1" pane="${2:-}" jobdir
+  local job="$1" pane="${2:-}" mode="${3:-current}" jobdir
   jobdir="$(wrk_jobs_root)/$job"
   if [[ -z "$pane" || "$pane" == - ]]; then
     pane="$(job_events_scan "$jobdir/events" 2>/dev/null | awk -F '\t' -v j="$job" '$1==j {print $10; exit}')"
     [[ "$pane" == - ]] && pane=""
   fi
-  if ! sentinel_job_ended "$jobdir" || ! job_watch_current "$jobdir/events" "$pane"; then
+  if ! sentinel_job_ended "$jobdir"; then
+    echo "skip job=$job reason=revived-since-scan"
+    return 2
+  fi
+  if [[ "$mode" == ended-no-sentinel ]]; then # hk1813-ended-no-sentinel-mode
+    if job_has_live_completion_sentinel "$job"; then # hk1813-ended-quota-live-sentinel-check
+      echo "skip job=$job reason=live-sentinel"
+      return 2
+    fi
+    return 0
+  fi
+  if [[ "$mode" != current ]] || ! job_watch_current "$jobdir/events" "$pane"; then
     echo "skip job=$job reason=revived-since-scan"
     return 2
   fi
@@ -6226,10 +6238,11 @@ quota_release_round_current() {
 # released here too. Idempotent: a second call finds no rows. Best-effort:
 # an unavailable arbiter, a failed status, or a failed release is logged once
 # (rc, job, pool) via quota_release_log and never fails the end path. Before
-# each release, re-read the terminal and watch-round evidence; a scan snapshot
-# cannot authorize releasing a row after a same-id reclaim or respawn.
+# each release, re-read the terminal and the selected release-mode evidence; a
+# scan snapshot cannot authorize releasing a row after a same-id reclaim or
+# respawn.
 release_job_quota_pool() {
-  local job="$1" pane="${2:-}" arb out pool rc
+  local job="$1" pane="${2:-}" mode="${3:-current}" arb out pool rc
   arb="${ARBITER:-}"
   if [[ -z "$arb" || ! -x "$arb" ]]; then
     arb="$(command -v arbiter 2>/dev/null || true)"
@@ -6248,7 +6261,7 @@ release_job_quota_pool() {
     # This check must follow status and sit immediately before each arbiter
     # release. A revive after the command's earlier candidate scan leaves the
     # live round's row untouched and makes the caller leave its paired action.
-    quota_release_round_current "$job" "$pane" || return $? # hk1813-release-time-check
+    quota_release_round_current "$job" "$pane" "$mode" || return $? # hk1813-release-time-check
     "$arb" release --job "$job" --resource "$pool" --kind quota_pool >/dev/null 2>&1 || {
       rc=$?
       quota_release_log "$job" "$pool" "rc=$rc"
@@ -6728,7 +6741,7 @@ PY
       # The end declaration may lose a race to a revive; only a terminal result
       # authorizes releasing that job's quota rows.
       case "$end_out" in
-        created|already-ended) release_job_quota_pool "$job" "$pane" ;; # hk1798-lost-grace-release
+        created|already-ended) release_job_quota_pool "$job" "$pane" || : ;; # hk1798-lost-grace-release
       esac
       sentinel_self_exit "$job" 0
     fi
@@ -9643,7 +9656,7 @@ except (ValueError, TypeError, AttributeError) as error:
 hk_task_takeover_rebind() {
   [[ -n "$TAKEOVER_FROM" ]] || return 0
   hk_task_takeover_precheck
-  local handoffkeep out rc=0 verify
+  local handoffkeep out rc=0 verify release_rc=0
   handoffkeep="$(hk_bin)"
   [[ -n "$handoffkeep" ]] || die "takeover refused: handoffkeep binary not found (set HANDOFFKEEP_BIN)"
   set +e
@@ -9671,7 +9684,11 @@ print("ok")
   # hk1798: job.handed_off is the old job's last work-terminal — hand back
   # every quota_pool record it still holds; a re-recorded or never-released
   # pool survives the hand-off otherwise.
-  release_job_quota_pool "$TAKEOVER_FROM" # hk1798-takeover-release
+  release_job_quota_pool "$TAKEOVER_FROM" || release_rc=$? # hk1813-takeover-release-best-effort
+  if (( release_rc != 0 && release_rc != 2 )); then
+    warn "takeover quota cleanup skipped for $TAKEOVER_FROM (rc=$release_rc)"
+  fi
+  return 0
 }
 
 # Commit both local audit records under their event locks. A rebind that the
@@ -11218,13 +11235,13 @@ PY
     [[ "$_quota_pane" == - ]] && _quota_pane=""
     if (( apply )); then
       _quota_rc=0
-      release_job_quota_pool "$job" "$_quota_pane" || _quota_rc=$? # hk1813-ended-quota-release-call
+      release_job_quota_pool "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$? # hk1813-ended-quota-release-call
       [[ "$_quota_rc" != 2 ]] || continue
       quota_releases=$(( quota_releases + 1 ))
       echo "release-attempted job=$job pools=$_quota_csv"
     else
       _quota_rc=0
-      quota_release_round_current "$job" "$_quota_pane" || _quota_rc=$?
+      quota_release_round_current "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$?
       [[ "$_quota_rc" != 2 ]] || continue
       quota_releases=$(( quota_releases + 1 ))
       echo "would-release job=$job pools=$_quota_csv"

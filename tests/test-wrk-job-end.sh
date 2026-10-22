@@ -13,10 +13,10 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-WRK="$ROOT/bin/wrk"
+WRK="${WRK_TEST_BIN:-$ROOT/bin/wrk}"
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
-ARBITER="$ROOT/bin/arbiter"
+ARBITER="${ARBITER_TEST_BIN:-$ROOT/bin/arbiter}"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/wrk-job-end.XXXXXX")"
@@ -3660,6 +3660,35 @@ case_release_takeover() {
   [[ "$(quota_rows mut-rtk-old)" == 0 ]] || return 1
 }
 
+# A release-time guard may safely skip quota cleanup after takeover has already
+# committed the task rebind and hand-off records. That skip must not abort the
+# spawn before arbiter admission and pane creation continue.
+case_takeover_release_guard_skip_continues_spawn() {
+  reset_case mut-1813-takeover-skip || return 3
+  local lib out rc=0
+  lib="$(wrk_test_library)" || return 3
+  out="$(env WRK_LIBFILE="$lib" bash -c '
+    set -euo pipefail
+    . "$WRK_LIBFILE"
+    hk_task_takeover_precheck() { :; }
+    hk_bin() { printf "%s\n" /fixture/handoffkeep; }
+    hk_cmd() { printf "%s\n" '\''{"state":"claimed","claimed_by":"new-label","refs":{"job_id":"new-job"}}'\''; }
+    takeover_event_pair_commit() { printf "%s\n" event-pair-committed; }
+    release_job_quota_pool() { return 2; }
+    TASK_ID=1 TAKEOVER_FROM=old-job JOB_ID=new-job LABEL=new-label
+    BUILDER_LANE=builder-lane PARENT_LANE=director-1 TAKEOVER_ROUNDS_USED=1
+    hk_task_takeover_rebind
+    printf "%s\n" spawn-continued
+  ' 2>&1)" || rc=$?
+  grep -Fq event-pair-committed <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    return 3
+  }
+  if (( rc != 0 )) || ! grep -Fq spawn-continued <<<"$out"; then
+    assertion_red 'R30 takeover continues spawn when the release guard skips cleanup' || return 1
+  fi
+}
+
 # hk1813 helpers: make a sourceable wrk library from the current under-test
 # file so mutations exercise the same functions as the production entrypoint.
 wrk_test_library() {
@@ -3673,6 +3702,13 @@ job_watch_current_from_library() {
   local lib="$1" events="$2" pane="$3"
   env WRK_LIBFILE="$lib" bash -c \
     '. "$WRK_LIBFILE"; job_watch_current "$@"' "$WRK" "$events" "$pane"
+}
+
+quota_release_current_from_library() {
+  local lib="$1"; shift
+  env HERDR_BIN="$HERDR" ARBITER_BIN="${RECOVERY_ARBITER:-$ARBITER}" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" WRK_LIBFILE="$lib" \
+    bash -c '. "$WRK_LIBFILE"; quota_release_round_current "$@"' "$WRK" "$@"
 }
 
 start_completion_from_library() {
@@ -4157,6 +4193,102 @@ PY
   }
 }
 
+# A receipt-less reclaimed round can still have a later terminal proving the
+# job ended. Pass 4 should release its row when no watcher remains to own it.
+case_prune_receiptless_ended_quota() {
+  reset_case mut-1813-prune-receiptless-ended || return 3
+  local job=mut-1813-prune-receiptless-ended out
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label lbl --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+  out="$(prune_run --job "$job" --stale-age 0s 2>&1)" || return 3
+  if ! grep -Fq "would-release job=$job" <<<"$out"; then
+    assertion_red 'R31 prune dry-run includes an ended receipt-less reclaimed quota row' || return 1
+  fi
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+  out="$(prune_run --apply --job "$job" --stale-age 0s 2>&1)" || return 3
+  if [[ "$(quota_rows "$job")" != 0 ]]; then
+    assertion_red 'R31 prune apply releases an ended receipt-less reclaimed quota row' || return 1
+  fi
+  [[ "$(grep -Fc "release-attempted job=$job" <<<"$out")" == 1 ]] || {
+    assertion_red 'R31 prune logs one release for the ended receipt-less reclaimed job' || return 1
+  }
+}
+
+# The ended-no-sentinel release mode is still fail-closed if a live watcher
+# appears after prune's candidate scan.
+case_ended_quota_release_requires_no_live_sentinel() {
+  reset_case mut-1813-ended-live-sentinel || return 3
+  local job=mut-1813-ended-live-sentinel report="$TMP/1813-ended-live-sentinel.md"
+  local lib out rc=0 pid
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  printf 'watch\n' >"$report"
+  SENT_INTERVAL=3600 start_completion_from_library \
+    "$INBOX/$job/completion-sentinel.pid" "$job" lane-a "lbl-$job" w:p1 "$report" || return 3
+  pid="$SENTINEL_PID"
+  sentinel_mid_sleep "$pid" >/dev/null || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || return 3
+  lib="$(wrk_test_library)" || return 3
+  out="$(quota_release_current_from_library "$lib" "$job" w:p1 ended-no-sentinel 2>&1)" || rc=$?
+  kill_owned_tree "$pid" || true
+  if (( rc != 2 )) || ! grep -Fq "skip job=$job reason=live-sentinel" <<<"$out"; then
+    assertion_red 'R32 ended quota release skips while a live sentinel exists' || return 1
+  fi
+}
+
+# If a revive races the lost-grace release check, the sentinel must leave
+# through sentinel_self_exit even though the guarded release returns rc=2.
+case_lostgrace_guard_skip_removes_pidfile() {
+  reset_case mut-1813-lostgrace-skip || return 3
+  local job=mut-1813-lostgrace-skip seq="$TMP/1813-lostgrace-seq"
+  local injected="$TMP/1813-lostgrace-injected" arbwrap="$TMP/1813-lostgrace-arbiter"
+  local gatefile="$TMP/1813-lostgrace-gate" trace="$TMP/1813-lostgrace-trace" pid pidfile
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  quota_gate_out >"$gatefile" || return 3
+  printf 'not-found\n' >"$seq"
+  cat >"$arbwrap" <<EOF || return 3
+#!/bin/bash
+set -euo pipefail
+printf 'call=%s\n' "\$*" >>"$trace"
+if [[ "\${1:-}" == status && "\${3:-}" == "$job" && ! -e "$injected" ]] &&
+    compgen -G "$INBOX/$job/events/*-job.revoked.json" >/dev/null; then
+  printf 'inject\n' >>"$trace"
+  : >"$injected"
+  "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null
+  "$ARBITER" claim --job "$job" --lane lane-a --agent-label lbl --t T1 \\
+    --reclaim-released >/dev/null
+  "$ARBITER" lease --job "$job" --kind quota_pool --profile codex-luna \\
+    --gate-output "\$(cat "$gatefile")" >/dev/null
+fi
+exec "$ARBITER" "\$@"
+EOF
+  chmod +x "$arbwrap" || return 3
+  RECOVERY_ARBITER="$arbwrap" SENT_INTERVAL=1 LOST_GRACE=1 \
+    WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    start_completion_from_library "$INBOX/$job/completion-sentinel.pid" \
+      "$job" lane-a "lbl-$job" w:p1 "$TMP/1813-lostgrace-report.md" || return 3
+  pid="$SENTINEL_PID"
+  pidfile="$INBOX/$job/completion-sentinel.pid"
+  wait_until 20 pid_gone "$pid" || return 3
+  if [[ -s "$pidfile" ]]; then
+    assertion_red 'R33 lost-grace guarded release skip removes the sentinel pidfile' || return 1
+  fi
+  [[ "$(quota_rows "$job")" == 1 ]] || {
+    cat "$trace" >&2
+    find "$INBOX/$job/events" -maxdepth 1 -type f -print >&2
+    assertion_red 'R33 lost-grace revive keeps the reclaimed quota row live' || return 1
+  }
+}
+
 case_prune_revived_during_release_scan() {
   reset_case mut-1813-prune-race || return 3
   local job=mut-1813-prune-race pid
@@ -4311,12 +4443,10 @@ if [[ "${WRK_JOB_END_RED_FIRST:-0}" == 1 ]]; then
     'ASSERT-RED: R18 foreground release failure warns once on stderr'
   run_red_first_case "item 4 claim-only spawn receipt" case_t4_claim_without_spawn_is_current \
     'ASSERT-RED: R19 claim-only first round is current without a spawn receipt'
-  run_red_first_case "item 4 receipt-less in-flight lost-grace regression" case_t4_receiptless_inflight_lostgrace \
-    'ASSERT-RED: R26 receipt-less in-flight lost-grace leaves the revived quota row live'
+  # R26 and R27 cover regressions introduced by the receipt-less fix; the
+  # unmodified base already leaves these in-flight reclaim rows untouched.
   run_red_first_case "item 4 receipt-less in-flight completion regression" case_t4_receiptless_inflight_completed \
     'ASSERT-RED: R28 receipt-less in-flight completion writes no job.completed'
-  run_red_first_case "item 4 receipt-less in-flight prune regression" case_t4_receiptless_inflight_prune \
-    'ASSERT-RED: R27 receipt-less in-flight prune leaves the revived quota row live'
   run_red_first_case "item 4 pane-less spawn reset" case_t4_missing_pane_resets_previous_spawn \
     'ASSERT-RED: R20 pane-less newest spawn does not inherit the prior pane'
   run_red_first_case "item 5 N6 stale sentinel replacement" case_respawn_replaces_only_stale_sentinel \
@@ -4329,6 +4459,10 @@ if [[ "${WRK_JOB_END_RED_FIRST:-0}" == 1 ]]; then
     'ASSERT-RED: R24 prune skips a job revived after its release scan'
   run_red_first_case "item 6b historical release then re-record" case_prune_historical_release_releases_rerecord \
     'ASSERT-RED: R25 a historical release does not hide a newer live record'
+  run_red_first_case "takeover handles a guarded release skip" case_takeover_release_guard_skip_continues_spawn \
+    'ASSERT-RED: R30 takeover continues spawn when the release guard skips cleanup'
+  run_red_first_case "ended receipt-less quota prune" case_prune_receiptless_ended_quota \
+    'ASSERT-RED: R31 prune dry-run includes an ended receipt-less reclaimed quota row'
   echo "PASS hk1813 RED-first cases failed at assertions on base $(git -C "$ROOT" rev-parse --short HEAD)"
   exit 0
 fi
@@ -4346,6 +4480,10 @@ run_green_contract_case "item 5 N7 dead current round" case_dead_current_round_e
 run_green_contract_case "item 6a terminal quota dry-run" case_prune_terminal_quota_dry_run
 run_green_contract_case "item 6a prune scan-to-release race" case_prune_revived_during_release_scan
 run_green_contract_case "item 6b historical release then re-record" case_prune_historical_release_releases_rerecord
+run_green_contract_case "takeover continues after guarded release skip" case_takeover_release_guard_skip_continues_spawn
+run_green_contract_case "ended receipt-less reclaimed quota prune" case_prune_receiptless_ended_quota
+run_green_contract_case "ended quota release requires no live sentinel" case_ended_quota_release_requires_no_live_sentinel
+run_green_contract_case "lost-grace guard skip clears its sentinel pidfile" case_lostgrace_guard_skip_removes_pidfile
 run_green_contract_case "prune orphan-sentinel release site" case_release_prune_sentinel_orphan
 
 # R16: the reap candidate is only a snapshot. Its post-probe release must
@@ -4452,5 +4590,37 @@ mkmut_span r29-no-prune-sentinel-release \
   '      : # removed hk1798 prune orphan-sentinel release'
 expect_mut_red "R29 prune orphan-sentinel release site" case_release_prune_sentinel_orphan \
   'ASSERT-RED: R29 prune orphan-sentinel path releases the ended live quota row'
+
+# R30: the hand-off is already committed when the release guard can safely
+# skip, so its rc=2 must not abort the new spawn after changing task refs.
+mkmut_span r30-abort-on-takeover-release-skip \
+  'hk1813-takeover-release-best-effort' \
+  '  release_job_quota_pool "$TAKEOVER_FROM" # reverted hk1813 takeover release handling'
+expect_mut_red "R30 takeover continues after guarded release skip" case_takeover_release_guard_skip_continues_spawn \
+  'ASSERT-RED: R30 takeover continues spawn when the release guard skips cleanup'
+
+# R31: an ended receipt-less reclaimed round has no current pane to match,
+# but terminal ordering and the no-live-sentinel check authorize pass 4.
+mkmut_span r31-require-current-pane-for-ended-quota \
+  'hk1813-ended-no-sentinel-mode' \
+  '  if false; then # removed hk1813 ended-no-sentinel mode'
+expect_mut_red "R31 ended receipt-less quota prune mode" case_prune_receiptless_ended_quota \
+  'ASSERT-RED: R31 prune dry-run includes an ended receipt-less reclaimed quota row'
+
+# R32: pass 4 must recheck that no live completion sentinel owns the ended
+# job immediately before releasing its quota row.
+mkmut_span r32-ignore-ended-live-sentinel \
+  'hk1813-ended-quota-live-sentinel-check' \
+  '    if false; then # removed hk1813 no-live-sentinel check'
+expect_mut_red "R32 ended quota no-live-sentinel release guard" case_ended_quota_release_requires_no_live_sentinel \
+  'ASSERT-RED: R32 ended quota release skips while a live sentinel exists'
+
+# R33: a rc=2 release guard in lost-grace is a safe skip, not a reason to
+# bypass sentinel_self_exit and strand a stale pidfile.
+mkmut_span r33-strand-lostgrace-sentinel-pidfile \
+  'hk1798-lost-grace-release' \
+  '        created|already-ended) release_job_quota_pool "$job" "$pane" ;; # reverted lost-grace rc handling'
+expect_mut_red "R33 lost-grace guard skip removes sentinel pidfile" case_lostgrace_guard_skip_removes_pidfile \
+  'ASSERT-RED: R33 lost-grace guarded release skip removes the sentinel pidfile'
 
 echo "PASS test-wrk-job-end: all cases"
