@@ -12847,7 +12847,7 @@ env ARBITER_INBOX_ROOT="$SENTINEL_INBOX" "$ARBITER" event --job sentinel-idle \
   --kind job.spawned --payload-json '{"owner_lane":"test-lane","label":"test-label","pane_id":"test:pane"}' >/dev/null
 env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
-  "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
+  "$WRK" sentinel sentinel-idle lane worker test:pane "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
 own "$sentinel_idle_pid"
 sleep 2

@@ -2283,7 +2283,7 @@ case_live_revival_prune_pane_gone() {
 
 case_duplicate_done_after_revival() {
   reset_case mut-rduplicate || return 3
-  quota_spawn mut-rduplicate >/dev/null 2>&1 || return 3
+  QR_INTERVAL=3600 quota_spawn mut-rduplicate >/dev/null 2>&1 || return 3
   quota_wait_sentinel_sleep mut-rduplicate || return 3
   local report="$TMP/mut-rduplicate-report.md"
   printf 'round one report\n' >"$report"
@@ -2298,7 +2298,10 @@ case_duplicate_done_after_revival() {
   ARBITER_TEST_NOW=2099-02-03T00:00:00Z arb_lease mut-rduplicate || return 3
   [[ "$(quota_rows mut-rduplicate)" == 1 ]] || return 3
   done_run mut-rduplicate --report "$report" >/dev/null 2>&1 || return 3
-  [[ "$(quota_rows mut-rduplicate)" == 1 ]] || return 1
+  [[ "$(quota_rows mut-rduplicate)" == 1 ]] || {
+    assertion_red 'R11 duplicate completion preserves the revived quota row'
+    return 1
+  }
   [[ "$(release_events mut-rduplicate)" == 1 ]] || return 1
 }
 
@@ -3227,22 +3230,22 @@ case_second_start() {
 
 # J01: local done housekeeping
 # shellcheck disable=SC2016
-mkmut j01-no-done-housekeeping 's~^  job_end_housekeeping "$job" "$owner" completed "wrk done" "wrk done"$~  : removed local done housekeeping~'
+mkmut j01-no-done-housekeeping 's~^  job_end_housekeeping "$job" "$owner" completed "wrk done" "wrk done" "$pane"$~  : removed local done housekeeping~'
 expect_mut_red "J01 local-done-housekeeping" case_done
 
 # J02: delegated done housekeeping
 # shellcheck disable=SC2016
-mkmut j02-no-delegated-housekeeping 's~^      job_end_housekeeping "$d_job" "$d_owner" "$sub" "panewire job $sub" "wrk $sub (delegated)"$~      : removed delegated housekeeping~'
+mkmut j02-no-delegated-housekeeping 's~^      job_end_housekeeping "$d_job" "$d_owner" "$sub" "panewire job $sub" "wrk $sub (delegated)" "$d_pane"$~      : removed delegated housekeeping~'
 expect_mut_red "J02 delegated-done-housekeeping" case_delegate_done
 
 # J03: duplicate done housekeeping
 # shellcheck disable=SC2016
-mkmut j03-no-dup-housekeeping 's~^    job_end_housekeeping "$job" "$owner" completed "wrk done (duplicate report)" "wrk done"$~    : removed duplicate done housekeeping~'
+mkmut j03-no-dup-housekeeping 's~^    job_end_housekeeping "$job" "$owner" completed "wrk done (duplicate report)" "wrk done" "$pane"$~    : removed duplicate done housekeeping~'
 expect_mut_red "J03 duplicate-done-housekeeping" case_dup_done
 
 # J04: local joined housekeeping
 # shellcheck disable=SC2016
-mkmut j04-no-joined-housekeeping 's~^  job_end_housekeeping "$job" "$owner" joined "wrk joined" "wrk joined"$~  : removed local joined housekeeping~'
+mkmut j04-no-joined-housekeeping 's~^  job_end_housekeeping "$job" "$owner" joined "wrk joined" "wrk joined" "$pane"$~  : removed local joined housekeeping~'
 expect_mut_red "J04 local-joined-housekeeping" case_joined
 
 # J05: delegated joined gate narrows to done only
@@ -3252,12 +3255,12 @@ expect_mut_red "J05 delegated-joined-gate" case_delegate_joined
 
 # J06: duplicate/partial joined housekeeping
 # shellcheck disable=SC2016
-mkmut j06-no-pjoined-housekeeping 's~^    job_end_housekeeping "$job" "$owner" joined "wrk joined (duplicate)" "wrk joined"$~    : removed duplicate joined housekeeping~'
+mkmut j06-no-pjoined-housekeeping 's~^    job_end_housekeeping "$job" "$owner" joined "wrk joined (duplicate)" "wrk joined" "$pane"$~    : removed duplicate joined housekeeping~'
 expect_mut_red "J06 partial-joined-housekeeping" case_partial_joined
 
 # J07: reap housekeeping
 # shellcheck disable=SC2016
-mkmut j07-no-reap-housekeeping 's~^        job_end_housekeeping "$job" "$owner" abandoned "pane reaped" "wrk reap"$~        : removed reap housekeeping~'
+mkmut j07-no-reap-housekeeping 's~^        job_end_housekeeping "$job" "$owner" abandoned "pane reaped" "wrk reap" "$pane"$~        : removed reap housekeeping~'
 expect_mut_red "J07 reap-housekeeping" case_reap
 
 # J08: prune's ended-orphan stop
@@ -3586,15 +3589,22 @@ PY
 
 case_release_prune_orphan() {
   reset_case mut-rpo || return 3
-  quota_spawn mut-rpo >/dev/null 2>&1 || return 3
+  QR_INTERVAL=3600 quota_spawn mut-rpo >/dev/null 2>&1 || return 3
   [[ "$(quota_rows mut-rpo)" == 1 ]] || return 3
   quota_wait_sentinel_sleep mut-rpo || return 3
-  # Interval stays 3600: a waking sentinel would self-release through the
-  # watch-exit path and mask this site's removal (same hazard as H01).
+  local pid
+  IFS= read -r pid <"$INBOX/mut-rpo/completion-sentinel.pid" || return 3
+  own "$pid"
+  kill_owned_tree "$pid" || return 3
+  wait_until 5 pid_gone "$pid" || return 3
+  rm -f "$INBOX/mut-rpo/completion-sentinel.pid"
   arb event --job mut-rpo --kind job.completed \
     --payload-json '{"owner_lane":"default","label":"lbl-mut-rpo"}' >/dev/null || return 3
   prune_run --apply >/dev/null 2>&1
-  [[ "$(quota_rows mut-rpo)" == 0 ]] || return 1
+  [[ "$(quota_rows mut-rpo)" == 0 ]] || {
+    assertion_red 'R6 prune releases an ended orphan quota row'
+    return 1
+  }
 }
 
 case_release_prune_panegone() {
@@ -4086,11 +4096,12 @@ mkmut_span r5-no-reap-release \
   '      : removed hk1798 reap pre-close release'
 expect_mut_red "R5 reap-release-before-close" case_release_reap_order
 
-# R6: prune's ended-orphan release
-mkmut_span r6-no-orphan-release \
-  'hk1798-prune-orphan-release' \
-  '      : removed hk1798 orphan release'
-expect_mut_red "R6 prune-orphan-release" case_release_prune_orphan
+# R6: an ended job with no live sentinel is drained by prune's terminal quota pass.
+mkmut_span r6-no-ended-quota-release \
+  'hk1813-ended-quota-release-call' \
+  '      : removed hk1813 ended quota release'
+expect_mut_red "R6 prune-ended-quota-release" case_release_prune_orphan \
+  'ASSERT-RED: R6 prune releases an ended orphan quota row'
 
 # R7: prune's pane-gone release (keep the end record; drop the release)
 mkmut_span r7-no-panegone-release \
@@ -4120,7 +4131,16 @@ expect_mut_red "R10 pane-gone-live-release-guard" case_live_revival_prune_pane_g
 mkmut_span r11-housekeeping-active-release \
   'hk1798-housekeeping-active-guard' \
   '    active) release_job_quota_pool "$job"; stop_completion_sentinel "$job"; return 0 ;;'
-expect_mut_red "R11 housekeeping-active-revive-guard" case_duplicate_done_after_revival
+r11_mut_source="$MUT"
+r11_mut_dir="$TMP/mut-r11-without-release-time-check"
+mkdir -p "$r11_mut_dir"
+awk -v pat='hk1813-release-time-check' \
+  'index($0, pat) { print "    : # removed hk1813 release-time check"; next } { print }' \
+  "$r11_mut_source" >"$r11_mut_dir/wrk"
+chmod +x "$r11_mut_dir/wrk"
+MUT="$r11_mut_dir/wrk"
+expect_mut_red "R11 housekeeping-active-revive-guard" case_duplicate_done_after_revival \
+  'ASSERT-RED: R11 duplicate completion preserves the revived quota row'
 
 # R12: prune's pane-gone superseded gate — without it a stale sentinel's dead
 # pane lets prune end and release the terminal-less revived round.
