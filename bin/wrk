@@ -6060,6 +6060,7 @@ exec(os.environ["WRK_EVENTS_PY"])
 events, pane = sys.argv[1:]
 CLAIM = {"job.claim", "job.claimed", "job.reclaim"}
 last_claim = last_spawn = -1
+claim_count = 0
 spawn_pane = ""
 for index, (name, doc, _mtime) in enumerate(wrk_events_ordered(events)):
     if doc is None:
@@ -6076,12 +6077,14 @@ for index, (name, doc, _mtime) in enumerate(wrk_events_ordered(events)):
             spawn_pane = candidate
     elif kind in CLAIM:
         last_claim = index
+        claim_count += 1
 # Current when the newest spawn names this pane and no claim follows it, or
-# when the stream carries neither (a manual sentinel on an unclaimed job —
-# nothing proves another round exists). A claim newer than the newest spawn
-# is an in-flight respawn: superseded even when the panes still match.
+# when a receipt-less stream is still at its initial claim. A second claim
+# without an intervening spawned receipt means a reclaimed round is in flight,
+# so the older pane watcher is superseded. A claim newer than the newest spawn
+# is likewise an in-flight respawn: superseded even when the panes still match.
 current = (last_spawn != -1 and spawn_pane == pane and last_claim < last_spawn) or \
-          (last_spawn == -1) # hk1813-t4-no-spawn-current
+          (last_spawn == -1 and claim_count <= 1) # hk1813-t4-no-spawn-current
 sys.exit(0 if current else 1)
 PY
 }

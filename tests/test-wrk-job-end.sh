@@ -3686,6 +3686,46 @@ start_completion_from_library() {
   own "$pid"
 }
 
+case_release_prune_sentinel_orphan() {
+  reset_case mut-1813-prune-sentinel-orphan || return 3
+  local job=mut-1813-prune-sentinel-orphan pidfile pid started lib out
+  local report="$TMP/1813-r29-report.md"
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  pidfile="$INBOX/$job/completion-sentinel.pid"
+  SENT_INTERVAL=3600 start_completion_from_library \
+    "$pidfile" "$job" lane-a "lbl-$job" w:p1 "$report" || return 3
+  pid="$SENTINEL_PID"
+  sentinel_mid_sleep "$pid" >/dev/null || return 3
+  lib="$(wrk_test_library)" || return 3
+  IFS=$'\t' read -r pid started < <(env WRK_LIBFILE="$lib" bash -c \
+    '. "$WRK_LIBFILE"; sentinel_pidfile_fields "$1"' "$WRK" "$pidfile") || return 3
+  # Keep the sentinel live while its stream becomes terminal. Otherwise its
+  # own watch loop can exit between the terminal receipt and prune's scan.
+  kill -STOP "$pid" || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"default\",\"label\":\"lbl-$job\"}" >/dev/null || return 3
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    WRK_LIBFILE="$lib" PRUNE_ROOT="$INBOX" PRUNE_APPLY=1 PRUNE_LANE="" \
+    PRUNE_ORPHANS=0 bash -c '
+      . "$WRK_LIBFILE"
+      PRUNE_SCAN="$(job_events_scan "$PRUNE_ROOT/$1/events")"
+      prune_sentinel_row "$1" "$2" "$3" "" "" "$4"
+    ' "$WRK" "$job" "$pid" "$pidfile" "$started" 2>&1)" || return 3
+  # The direct release-site test owns the sentinel process, so clean it up by
+  # its recorded PID even if prune has already made it a short-lived zombie.
+  kill_owned_tree "$pid" || true
+  rm -f "$pidfile"
+  grep -q 'reason=job-ended' <<<"$out" || return 1
+  if [[ "$(quota_rows "$job")" != 0 ]]; then
+    assertion_red 'R29 prune orphan-sentinel path releases the ended live quota row' || return 1
+  fi
+  [[ "$(release_events "$job")" == 1 ]] || {
+    assertion_red 'R29 prune orphan-sentinel path releases exactly once' || return 1
+  }
+}
+
 re_record_quota_round() {
   local job="$1" pane="$2" tab="$3"
   arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 1
@@ -3891,6 +3931,94 @@ case_t4_claim_without_spawn_is_current() {
   if ! job_watch_current_from_library "$lib" "$INBOX/$job/events" w:p1; then
     assertion_red 'R19 claim-only first round is current without a spawn receipt' || return 1
   fi
+}
+
+# A failed first spawned receipt leaves one claim and no pane receipt. If that
+# first round's quota row is released and the same job is reclaimed before a
+# new spawned receipt lands, the old watcher must become superseded. This is
+# the receipt-less form of the QR18/QR19 in-flight window.
+receiptless_first_claim_setup() {
+  local job="$1"
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 >/dev/null || return 3
+  arb_lease "$job" || return 3
+}
+
+case_t4_receiptless_inflight_lostgrace() {
+  reset_case mut-1813-t4-lostgrace || return 3
+  local job=mut-1813-t4-lostgrace seq="$TMP/1813-t4-lostgrace.seq" report="$TMP/1813-t4-lostgrace.md"
+  receiptless_first_claim_setup "$job" || return 3
+  printf 'not-found\n' >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=5 start_sentinel "$job" w:p1 "$report" "$seq"
+  wait_until 10 event_count_is "$INBOX/$job/events" job.lost 1 || return 3
+  # The lost-grace watch began on round 1. Round 2 is now claimed and leased,
+  # but its job.spawned receipt is missing, exactly the T4 receipt-failure case.
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease "$job" || return 3
+  wait_until 15 pid_gone "$SENTINEL_PID" || return 3
+  if [[ "$(quota_rows "$job")" != 1 ]]; then
+    assertion_red 'R26 receipt-less in-flight lost-grace leaves the revived quota row live' || return 1
+  fi
+  if [[ "$(event_count "$INBOX/$job/events" job.revoked)" != 0 ]]; then
+    assertion_red 'R26 receipt-less in-flight lost-grace writes no job.revoked' || return 1
+  fi
+  [[ "$(release_events "$job")" == 1 ]] || return 1
+  grep -q 'superseded' "$INBOX/$job/completion-sentinel.log" || return 1
+}
+
+case_t4_receiptless_inflight_completed() {
+  reset_case mut-1813-t4-completed || return 3
+  local job=mut-1813-t4-completed seq="$TMP/1813-t4-completed.seq"
+  local report="$INBOX/$job/report.md" pid
+  receiptless_first_claim_setup "$job" || return 3
+  printf 'working\n' >"$seq"
+  SENT_INTERVAL=1 start_sentinel "$job" w:p1 "$report" "$seq"
+  pid="$SENTINEL_PID"
+  sentinel_mid_sleep "$pid" >/dev/null || return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease "$job" || return 3
+  printf 'new round report\n' >"$report"
+  printf 'done\n' >"$seq"
+  wait_until 20 pid_gone "$pid" || return 3
+  if [[ "$(event_count "$INBOX/$job/events" job.completed)" != 0 ]]; then
+    assertion_red 'R28 receipt-less in-flight completion writes no job.completed' || return 1
+  fi
+  if [[ "$(quota_rows "$job")" != 1 ]]; then
+    assertion_red 'R28 receipt-less in-flight completion leaves the revived quota row live' || return 1
+  fi
+  [[ "$(release_events "$job")" == 1 ]] || return 1
+  grep -q 'superseded' "$INBOX/$job/completion-sentinel.log" || return 1
+}
+
+case_t4_receiptless_inflight_prune() {
+  reset_case mut-1813-t4-prune || return 3
+  local job=mut-1813-t4-prune seq="$TMP/1813-t4-prune.seq" report="$TMP/1813-t4-prune.md" pid out
+  # Keep the old watcher alive and asleep while prune probes its now-gone pane.
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 >/dev/null || return 3
+  arb_lease "$job" || return 3
+  SENT_INTERVAL=3600 start_sentinel "$job" w:p1 "$report"
+  pid="$SENTINEL_PID"
+  sentinel_mid_sleep "$pid" >/dev/null || return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease "$job" || return 3
+  printf 'not-found\n' >"$seq"
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    WRK_FIXTURE_GET_SEQUENCE="$seq" "$WRK" prune --apply --job "$job" 2>&1)" || return 3
+  if [[ "$(quota_rows "$job")" != 1 ]]; then
+    assertion_red 'R27 receipt-less in-flight prune leaves the revived quota row live' || return 1
+  fi
+  if [[ "$(event_count "$INBOX/$job/events" job.revoked)" != 0 ]]; then
+    assertion_red 'R27 receipt-less in-flight prune writes no job.revoked' || return 1
+  fi
+  [[ "$(release_events "$job")" == 1 ]] || return 1
+  grep -q 'action=stopped-superseded' <<<"$out" || return 1
+  wait_until 8 pid_gone "$pid" || return 1
 }
 
 case_t4_missing_pane_resets_previous_spawn() {
@@ -4179,6 +4307,12 @@ if [[ "${WRK_JOB_END_RED_FIRST:-0}" == 1 ]]; then
     'ASSERT-RED: R18 foreground release failure warns once on stderr'
   run_red_first_case "item 4 claim-only spawn receipt" case_t4_claim_without_spawn_is_current \
     'ASSERT-RED: R19 claim-only first round is current without a spawn receipt'
+  run_red_first_case "item 4 receipt-less in-flight lost-grace regression" case_t4_receiptless_inflight_lostgrace \
+    'ASSERT-RED: R26 receipt-less in-flight lost-grace leaves the revived quota row live'
+  run_red_first_case "item 4 receipt-less in-flight completion regression" case_t4_receiptless_inflight_completed \
+    'ASSERT-RED: R28 receipt-less in-flight completion writes no job.completed'
+  run_red_first_case "item 4 receipt-less in-flight prune regression" case_t4_receiptless_inflight_prune \
+    'ASSERT-RED: R27 receipt-less in-flight prune leaves the revived quota row live'
   run_red_first_case "item 4 pane-less spawn reset" case_t4_missing_pane_resets_previous_spawn \
     'ASSERT-RED: R20 pane-less newest spawn does not inherit the prior pane'
   run_red_first_case "item 5 N6 stale sentinel replacement" case_respawn_replaces_only_stale_sentinel \
@@ -4199,12 +4333,16 @@ run_green_contract_case "item 1 reap release-time recheck" case_reap_revived_sin
 run_green_contract_case "item 2 stale sentinel completed gate" case_sentinel_completed_superseded
 run_green_contract_case "item 3 foreground and detached failure logs" case_release_failure_logging_modes
 run_green_contract_case "item 4 claim-only spawn receipt" case_t4_claim_without_spawn_is_current
+run_green_contract_case "item 4 receipt-less in-flight lost-grace" case_t4_receiptless_inflight_lostgrace
+run_green_contract_case "item 4 receipt-less in-flight completion" case_t4_receiptless_inflight_completed
+run_green_contract_case "item 4 receipt-less in-flight prune" case_t4_receiptless_inflight_prune
 run_green_contract_case "item 4 pane-less spawn reset" case_t4_missing_pane_resets_previous_spawn
 run_green_contract_case "item 5 N6 stale sentinel replacement" case_respawn_replaces_only_stale_sentinel
 run_green_contract_case "item 5 N7 dead current round" case_dead_current_round_ends_after_grace
 run_green_contract_case "item 6a terminal quota dry-run" case_prune_terminal_quota_dry_run
 run_green_contract_case "item 6a prune scan-to-release race" case_prune_revived_during_release_scan
 run_green_contract_case "item 6b historical release then re-record" case_prune_historical_release_releases_rerecord
+run_green_contract_case "prune orphan-sentinel release site" case_release_prune_sentinel_orphan
 
 # R16: the reap candidate is only a snapshot. Its post-probe release must
 # re-read both terminal ordering and the candidate pane before touching rows.
@@ -4232,7 +4370,7 @@ expect_mut_red "R18 foreground release warning" case_release_failure_logging_mod
 # R19: a first-round job.claim without a job.spawned receipt still owns its
 # sentinel; preserve QR18/QR19 where a known prior spawn is followed by claim.
 mkmut r19-revert-claim-only-current \
-  's~(last_spawn == -1) # hk1813-t4-no-spawn-current~(last_spawn == -1 and last_claim == -1) # hk1813-t4-no-spawn-current~'
+  's~(last_spawn == -1 and claim_count <= 1) # hk1813-t4-no-spawn-current~(last_spawn == -1 and claim_count == 0) # hk1813-t4-no-spawn-current~'
 expect_mut_red "R19 claim-only spawn receipt guard" case_t4_claim_without_spawn_is_current \
   'ASSERT-RED: R19 claim-only first round is current without a spawn receipt'
 
@@ -4282,5 +4420,33 @@ mkmut_span r25-suppress-rerecord-after-release \
   '        if grep -q "quota_pool.release" "$PRUNE_ROOT/$job"/events/*; then :; else release_job_quota_pool "$job" "$_pane"; fi # hk1813 ended quota release call'
 expect_mut_red "R25 historical release does not hide re-record" case_prune_historical_release_releases_rerecord \
   'ASSERT-RED: R25 a historical release does not hide a newer live record'
+
+# R26: a receipt-less second claim is a reclaimed round; the old sentinel's
+# lost-grace action must not revoke or release that round's live quota row.
+mkmut r26-receiptless-lostgrace-current \
+  's~(last_spawn == -1 and claim_count <= 1) # hk1813-t4-no-spawn-current~(last_spawn == -1) # hk1813-t4-no-spawn-current~'
+expect_mut_red "R26 receipt-less in-flight lost-grace guard" case_t4_receiptless_inflight_lostgrace \
+  'ASSERT-RED: R26 receipt-less in-flight lost-grace leaves the revived quota row live'
+
+# R27: the prune pane-gone path must apply the same receipt-less reclaim rule.
+mkmut r27-receiptless-prune-current \
+  's~(last_spawn == -1 and claim_count <= 1) # hk1813-t4-no-spawn-current~(last_spawn == -1) # hk1813-t4-no-spawn-current~'
+expect_mut_red "R27 receipt-less in-flight prune guard" case_t4_receiptless_inflight_prune \
+  'ASSERT-RED: R27 receipt-less in-flight prune leaves the revived quota row live'
+
+# R28: the completed path also uses current-round identity when a T4 receipt
+# is missing and a reclaimed round is in flight.
+mkmut r28-receiptless-completed-current \
+  's~(last_spawn == -1 and claim_count <= 1) # hk1813-t4-no-spawn-current~(last_spawn == -1) # hk1813-t4-no-spawn-current~'
+expect_mut_red "R28 receipt-less in-flight completion guard" case_t4_receiptless_inflight_completed \
+  'ASSERT-RED: R28 receipt-less in-flight completion writes no job.completed'
+
+# R29: this is distinct from the newer terminal quota pass, which skips a
+# job while the orphan sentinel is still live.
+mkmut_span r29-no-prune-sentinel-release \
+  'release_job_quota_pool "$job" "$j_pane" || release_rc=$? # hk1798-prune-orphan-release' \
+  '      : # removed hk1798 prune orphan-sentinel release'
+expect_mut_red "R29 prune orphan-sentinel release site" case_release_prune_sentinel_orphan \
+  'ASSERT-RED: R29 prune orphan-sentinel path releases the ended live quota row'
 
 echo "PASS test-wrk-job-end: all cases"
