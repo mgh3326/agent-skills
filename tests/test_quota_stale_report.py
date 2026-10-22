@@ -196,6 +196,73 @@ class QuotaStaleReport(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("\tno_events_dir\t-\n", proc.stdout)
 
+    def test_ok_false_exits_2_no_stdout(self) -> None:
+        proc = run_report(self.jobs_root,
+                          {"ok": False, "now": NOW, "quota_pool_records": []})
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertEqual(len(proc.stderr.strip().splitlines()), 1)
+        self.assertTrue(proc.stderr.startswith("quota-stale-report:"))
+        self.assertIn("ok false", proc.stderr)
+
+    def test_ok_false_with_records_still_exits_2(self) -> None:
+        write_events(self.jobs_root, "j-done",
+                     ["quota_pool.record", "job.completed"])
+        proc = run_report(self.jobs_root,
+                          {"ok": False, "now": NOW,
+                           "quota_pool_records": [record("j-done", "2026-10-21T02:00:00+00:00")]})
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertNotIn("j-done", proc.stdout)
+
+    def test_ok_false_appends_error_truncated(self) -> None:
+        proc = run_report(self.jobs_root,
+                          {"ok": False, "error": "state.db unreadable"})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("state.db unreadable", proc.stderr)
+        long_error = "x" * 500
+        proc = run_report(self.jobs_root,
+                          {"ok": False, "error": long_error})
+        self.assertEqual(proc.returncode, 2)
+        self.assertIn("x" * 200, proc.stderr)
+        self.assertNotIn("x" * 201, proc.stderr)
+
+    def test_ok_false_non_string_error_ignored(self) -> None:
+        proc = run_report(self.jobs_root, {"ok": False, "error": 42})
+        self.assertEqual(proc.returncode, 2)
+        self.assertEqual(proc.stdout, "")
+        self.assertIn("ok false", proc.stderr)
+
+    def test_ok_string_false_and_null_count_as_not_true(self) -> None:
+        for bad in ("false", None):
+            proc = run_report(self.jobs_root, {"ok": bad})
+            self.assertEqual(proc.returncode, 2, f"ok={bad!r}")
+            self.assertEqual(proc.stdout, "")
+
+    def test_ok_absent_keeps_previous_behaviour(self) -> None:
+        write_events(self.jobs_root, "j-done",
+                     ["quota_pool.record", "job.completed"])
+        records = [record("j-done", "2026-10-21T02:00:00+00:00")]
+        status = {"now": NOW, "quota_pool_records": records}
+        proc = run_report(self.jobs_root, status)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with_ok = run_report(self.jobs_root,
+                             {"ok": True, **status})
+        self.assertEqual(with_ok.returncode, 0, with_ok.stderr)
+        self.assertEqual(proc.stdout, with_ok.stdout)
+
+    def test_ok_guard_red_mutant(self) -> None:
+        status = {"ok": False, "now": NOW, "quota_pool_records": []}
+        source = REPORT.read_text(encoding="utf-8")
+        guard = "    if status.get(\"ok\", True) is not True:\n"
+        self.assertIn(guard, source)
+        with tempfile.TemporaryDirectory() as scratch:
+            mutant = Path(scratch) / "quota-stale-report-mutant"
+            mutant.write_text(source.replace(guard, "    if False:\n", 1),
+                              encoding="utf-8")
+            proc = run_report(self.jobs_root, status, script=mutant)
+            self.assertNotEqual(proc.returncode, 2)
+
     def test_unparseable_stdin_exits_2(self) -> None:
         proc = run_report(self.jobs_root, "not json {")
         self.assertEqual(proc.returncode, 2)
