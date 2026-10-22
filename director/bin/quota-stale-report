@@ -6,6 +6,10 @@ Reads the JSON of `arbiter status --json` on stdin plus --jobs-root PATH
 staleness category derived from the job's events/ stream, then a summary
 line per pool and category. Never runs arbiter, never opens state.db,
 never writes anything.
+
+When the status object carries an `ok` key that is not exactly true, the
+report prints one stderr line and exits 2 with nothing on stdout, since
+arbiter could not read its state and an empty report would be a lie.
 """
 
 from __future__ import annotations
@@ -118,6 +122,13 @@ def main() -> int:
         return 2
     if not isinstance(status, dict):
         print("quota-stale-report: status JSON on stdin is not an object", file=sys.stderr)
+        return 2
+    if status.get("ok", True) is not True:
+        detail = status.get("error")
+        flat = " ".join(detail.split()) if isinstance(detail, str) else ""
+        suffix = f": {flat[:200]}" if flat else ""
+        print(f"quota-stale-report: arbiter status reported ok false{suffix}",
+              file=sys.stderr)
         return 2
 
     now = parse_time(status.get("now")) or datetime.now(timezone.utc)
