@@ -4381,7 +4381,7 @@ expect_mut_red "R8 prune-stale-release" case_release_prune_stale
 
 # R9: the takeover hand-off release
 mkmut_span r9-no-takeover-release \
-  'hk1798-takeover-release' \
+  'hk1813-takeover-release-best-effort' \
   '  : removed hk1798 takeover release'
 expect_mut_red "R9 takeover-release" case_release_takeover
 
