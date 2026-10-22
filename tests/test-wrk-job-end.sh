@@ -3115,8 +3115,11 @@ parts = [token for token in text.split() if not token.startswith("started=")]
 parts.append("started=" + started)
 path.write_text(" ".join(parts) + "\n", encoding="utf-8")
 PY
-  prune_run --apply >/dev/null 2>&1
-  kill -0 "$sup" 2>/dev/null || return 1
+  local out
+  out="$(prune_run --apply 2>&1)" || return 3
+  if ! grep -q "mut-rstale.*reason=pid-unverified" <<<"$out" || [[ ! -e "$pf" ]]; then
+    assertion_red 'Q07 inconsistent start time leaves the refresh pidfile protected' || return 1
+  fi
 }
 
 case_unrelated_pidfile() {
@@ -3420,7 +3423,8 @@ expect_mut_red "Q06 supervisor-argv-identity" case_refresh_unverified
 
 # Q07: the start-time agreement check removed
 mkmut q07-no-start-check 's~^       (( ( \$(date +%s) - _rstarted - _elapsed ) > 120 || ( \$(date +%s) - _rstarted - _elapsed ) < -120 )) ||$~       false ||~'
-expect_mut_red "Q07 supervisor-start-check" case_refresh_stale_start
+expect_mut_red "Q07 supervisor-start-check" case_refresh_stale_start \
+  'ASSERT-RED: Q07 inconsistent start time leaves the refresh pidfile protected'
 
 # I01: the stop path's identity check forced true
 # shellcheck disable=SC2016
