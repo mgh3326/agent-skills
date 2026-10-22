@@ -6179,9 +6179,9 @@ PY
 }
 
 # quota_release_log JOB POOL REASON — one durable line per release failure.
-# Use the job log when available; a sentinel's stderr is already redirected to
-# that same file, so writing both would duplicate the failure. Fall back to
-# stderr when the job log cannot be written.
+# A detached sentinel's stderr is redirected to its job log, so durable logging
+# alone avoids duplicate lines there. Foreground callers also warn on stderr;
+# if the job log cannot be written, all modes fall back to stderr.
 quota_release_log() {
   local job="$1" pool="$2" reason="$3" jobdir line
   jobdir="$(wrk_jobs_root)/$job"
