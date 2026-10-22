@@ -62,6 +62,15 @@ export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 export WRK_HOSTS_CONFIG="$TMP/no-such-hosts.toml"
 
+# hk1798 round 2: no invocation this file makes may fall back to the
+# operator's tools — a wrk call that forgets its fixture env resolves the
+# repo's stub arbiter/scopefuel and a throwaway XDG home, never the live
+# ~/.local/bin or ~/.local/share. Per-call env still wins where a case needs
+# its own stub.
+export ARBITER_BIN="$ARBITER" SCOPEFUEL_BIN="$SCOPEFUEL"
+export XDG_DATA_HOME="$TMP/xdg-default"
+mkdir -p "$XDG_DATA_HOME"
+
 fail() { echo "FAIL: $*" >&2; exit 1; }
 die3() { echo "SETUP: $*" >&2; exit 3; }  # setup failure inside a mutant case — not an assertion verdict
 
@@ -77,7 +86,10 @@ reset_case() {
   HK_STATE="$HK_DB" "$HK" tasks add --id 1 --title "case task" --lane fixture >/dev/null
 }
 
-arb() { env ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$ARBITER" "$@"; }
+arb() {
+  env SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$ARBITER" "$@"
+}
 
 # mk_job JOB [PANE] — claim + job.spawned receipt, the smallest live-job record.
 mk_job() {
@@ -149,8 +161,9 @@ start_sentinel() {
   # pid): a mutant or a mid-run kill that drops the child reaping still
   # leaves the interval sleep inside a group teardown can name exactly —
   # `kill -- -SENTINEL_PID` reaches orphans that re-parented to init.
-  tw_own_session env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" \
-    ${RECOVERY_ARBITER:+ARBITER_BIN="$RECOVERY_ARBITER"} \
+  tw_own_session env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" \
+    ARBITER_BIN="${RECOVERY_ARBITER:-$ARBITER}" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
     ${RECOVERY_STUB_LOG:+RECOVERY_STUB_LOG="$RECOVERY_STUB_LOG"} \
     WRK_FIXTURE_SCENARIO="${SCENARIO:-sentinel-working}" \
     ${seq:+WRK_FIXTURE_GET_SEQUENCE="$seq"} \
@@ -158,7 +171,7 @@ start_sentinel() {
     WRK_COMPLETION_INTERVAL_S="${SENT_INTERVAL:-3600}" \
     WRK_SENTINEL_TRANSIENT_MAX="${TRANSIENT_MAX:-10}" \
     WRK_SENTINEL_LOST_GRACE="${LOST_GRACE:-1800}" \
-    "$WRK" sentinel "$job" lane-a lbl "$pane" "$report" >/dev/null 2>&1 &
+    "$WRK" sentinel "$job" "${SENT_OWNER:-lane-a}" lbl "$pane" "$report" >/dev/null 2>&1 &
   SENTINEL_PID=$!
   own "$SENTINEL_PID"
   mkdir -p "$INBOX/$job"
@@ -166,21 +179,25 @@ start_sentinel() {
 }
 
 # Quota stub for the sentinel's release_job_quota_pool. The real arbiter is
-# left alone: only the sentinel process receives ARBITER_BIN (wrk copies that
-# onto ARBITER at startup) and the log path.
+# left alone: the sentinel gets this executable and its case-local XDG/inbox.
 recovery_arm_stub() {
+  RECOVERY_ARBITER="$TMP/recovery-arbiter-$CASE_SEQ"
   RECOVERY_STUB_LOG="$TMP/recovery-stub-$CASE_SEQ.log"
   : >"$RECOVERY_STUB_LOG"
-  RECOVERY_ARBITER="$TMP/recovery-arbiter-$CASE_SEQ"
-  cat >"$RECOVERY_ARBITER" <<'EOF'
+  cat >"$RECOVERY_ARBITER" <<EOF
 #!/bin/bash
 set -euo pipefail
-if [[ "${1:-}" == status ]]; then
-  printf '%s\n' '{"quota_pool_records":[{"pool":"claude"}]}'
+if [[ "\${1:-}" == status ]]; then
+  job=""
+  while ((\$#)); do
+    if [[ "\$1" == --job && \$# -ge 2 ]]; then job="\$2"; break; fi
+    shift
+  done
+  printf '{"quota_pool_records":[{"job_id":"%s","pool":"claude"}]}\\n' "\$job"
   exit 0
 fi
-if [[ "${1:-}" == release ]]; then
-  printf '%s\n' "$*" >>"${RECOVERY_STUB_LOG:?}"
+if [[ "\${1:-}" == release ]]; then
+  printf '%s\\n' "\$*" >>"$RECOVERY_STUB_LOG"
   exit 0
 fi
 exit 0
@@ -190,10 +207,17 @@ EOF
 
 recovery_release_count() {
   local n=0
-  if [[ -n "${RECOVERY_STUB_LOG:-}" && -f "$RECOVERY_STUB_LOG" ]]; then
-    n="$(grep -c '^release ' "$RECOVERY_STUB_LOG" || true)"
+  if [[ -n "${RECOVERY_ARBITER:-}" && -f "$TMP/recovery-stub-$CASE_SEQ.log" ]]; then
+    n="$(grep -c '^release ' "$TMP/recovery-stub-$CASE_SEQ.log" || true)"
   fi
   printf '%s\n' "${n:-0}"
+}
+
+# recovery_release_count_is N — wait_until target: polls the stub log so a
+# release that lands just after the job.revoked event still counts (macOS
+# ordering raced the single-read check, hk 1798 round 1 rerun).
+recovery_release_count_is() {
+  [[ "$(recovery_release_count)" == "$1" ]]
 }
 
 recovery_calls_at_least() {
@@ -251,14 +275,95 @@ recovery_fail() {
 
 # done_run JOB [extra env…] — wrk done against the case fixtures.
 done_run() {
-  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" \
     HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$PANEWIRE" \
     "$WRK" 'done' "$@"
 }
 
 prune_run() {
-  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" \
     "$WRK" prune "$@"
+}
+
+# ── hk1798: quota_pool record release at every job end path ──────────────
+# The "stub arbiter" is the real bin/arbiter bound to the per-case
+# XDG_DATA_HOME/ARBITER_INBOX_ROOT temp dirs: a release it "saw" is the
+# quota_pool.release event artifact in the job's event stream, and "gone
+# from the stub DB" is an empty status --job --json quota_pool_records list.
+GATE_OUT=""
+quota_gate_out() {
+  if [[ -z "$GATE_OUT" ]]; then
+    GATE_OUT="$TMP/gate.out"
+    "$SCOPEFUEL" gate -m codex-luna >"$GATE_OUT"
+  fi
+  printf '%s\n' "$GATE_OUT"
+}
+
+# arb_lease JOB [PROFILE] — a live quota_pool record for JOB in the case DB.
+arb_lease() {
+  arb lease --job "$1" --kind quota_pool --profile "${2:-codex-luna}" \
+    --gate-output "$(quota_gate_out)" >/dev/null
+}
+
+quota_rows() {
+  arb status --job "$1" --json | python3 -c \
+    'import json,sys; print(len(json.load(sys.stdin).get("quota_pool_records") or []))'
+}
+
+# shellcheck disable=SC2329 # invoked indirectly via wait_until
+quota_is_zero() { [[ "$(quota_rows "$1")" == 0 ]]; }
+
+release_events() { event_count "$INBOX/$1/events" quota_pool.release; }
+
+# quota_spawn JOB [args…] — a stubbed wrk spawn against the real fixture
+# arbiter: job.claim, a live quota_pool record, and a completion sentinel.
+# Case knobs (QR_* prefix, consumed per call): QR_MODEL, QR_SCENARIO,
+# QR_INTERVAL, QR_LOST_GRACE, QR_GET_SEQUENCE, QR_HERDR, QR_ARBITER.
+quota_spawn() {
+  local job="$1"; shift
+  env -u ARBITER_JOB -u HK_TASK_ID \
+    HERDR_BIN="${QR_HERDR:-$HERDR}" SCOPEFUEL_BIN="$SCOPEFUEL" \
+    ARBITER_BIN="${QR_ARBITER:-$ARBITER}" \
+    XDG_DATA_HOME="$XDG" ARBITER_INBOX_ROOT="$INBOX" \
+    HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" HK_MODE=new \
+    PANEWIRE_BIN="${QR_PANEWIRE:-$PANEWIRE}" \
+    WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S="${QR_INTERVAL:-3600}" \
+    WRK_SENTINEL_LOST_GRACE="${QR_LOST_GRACE:-1800}" \
+    WRK_FIXTURE_SCENARIO="${QR_SCENARIO:-spawn}" \
+    ${QR_GET_SEQUENCE:+WRK_FIXTURE_GET_SEQUENCE="$QR_GET_SEQUENCE"} \
+    WRK_FIXTURE_LOG="$HERDR_LOG" \
+    WRK_SCOPEFUEL_LOG="$TMP/scopefuel-$CASE_SEQ.log" \
+    WRK_REFRESH_LOG="$TMP/refresh-$CASE_SEQ.log" \
+    WRK_REFRESH_PID_LOG="$TMP/refresh-$CASE_SEQ.pids" WRK_REFRESH_TIMEOUT_S=2 \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m "${QR_MODEL:-codex-luna}" \
+      -p "$PROMPT" -w w -l "lbl-$job" --t T1 --task 1 --job "$job" "$@"
+}
+
+# A live record after spawn is a precondition of every release test, not an
+# assertion about the end path.
+quota_spawn_ok() {
+  local job="$1" out
+  out="$(quota_spawn "$@" 2>&1)" || return 1
+  [[ "$(quota_rows "$job")" == 1 ]] || return 1
+  printf '%s\n' "$out" | grep -q 'quota_record=' || return 1
+}
+
+quota_wait_sentinel_sleep() {
+  local job="$1" pidfile pid
+  pidfile="$INBOX/$job/completion-sentinel.pid"
+  [[ -s "$pidfile" ]] || return 1
+  pid="$(head -n 1 "$pidfile")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  sentinel_mid_sleep "$pid" >/dev/null
+}
+
+assert_quota_released() {
+  [[ "$(quota_rows "$1")" == 0 ]] ||
+    fail "$2: live quota_pool record survived the end of $1"
+  [[ "$(release_events "$1")" -ge 1 ]] ||
+    fail "$2: no quota_pool.release event landed for $1"
 }
 
 # A long-lived test-owned process that is NOT this job's sentinel — the
@@ -782,7 +887,8 @@ kill -0 "$SENTINEL_PID" 2>/dev/null ||
 # housekeeping can end it before the next probe.
 arb event --job je14-reap --kind job.joined \
   --payload-json '{"owner_lane":"lane-a","label":"je14-reap","pane_id":"w1:p1"}' >/dev/null
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$XDG" \
+  ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
   WRK_FIXTURE_LOG="$HERDR_LOG" \
   "$WRK" reap --apply --lane lane-a --grace 0s >"$TMP/je14-reap.out" 2>&1 ||
   { cat "$TMP/je14-reap.out"; fail "JE14: wrk reap --apply failed"; }
@@ -1321,7 +1427,8 @@ arb event --job je30-reap --kind job.joined \
   --payload-json '{"owner_lane":"lane-a","label":"je30-reap","pane_id":"w1:p1"}' >/dev/null
 spawn_sleeper; J30E=$SLEEPER_PID
 printf '%s\n' "$J30E" >"$INBOX/je30-reap/completion-sentinel.pid"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$XDG" \
+  ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
   "$WRK" reap --apply --lane lane-a --grace 0s >/dev/null 2>&1 ||
   fail "JE30/reap: wrk reap --apply must succeed"
 kill -0 "$J30E" 2>/dev/null ||
@@ -1623,7 +1730,7 @@ case_recovery_expires() {
     recovery_fail "continuous loss is one job.lost" || return
   event_count_is "$events" job.recovered 0 ||
     recovery_fail "continuous loss must not recover" || return
-  [[ "$(recovery_release_count)" -eq 1 ]] ||
+  wait_until 15 recovery_release_count_is 1 ||
     recovery_fail "grace expiry must release quota once (got $(recovery_release_count))" || return
   if grep -q 'watch-exit' "$INBOX/je38/completion-sentinel.log"; then
     recovery_fail "grace expiry must not watch-exit" || return
@@ -1659,7 +1766,7 @@ case_recovery_flap() {
     recovery_fail "revoke must not add a loss event" || return
   event_count_is "$events" job.recovered 1 ||
     recovery_fail "revoke must not add a recovery" || return
-  [[ "$(recovery_release_count)" -eq 1 ]] ||
+  wait_until 15 recovery_release_count_is 1 ||
     recovery_fail "one revoke releases quota once (got $(recovery_release_count))" || return
   if grep -q 'watch-exit' "$INBOX/je39/completion-sentinel.log"; then
     recovery_fail "flap revoke must not watch-exit" || return
@@ -1835,7 +1942,7 @@ case_recovery_window_flap() {
   if event_count_is "$events" job.recovered 0; then
     recovery_fail "the flap must recover the absence episodes" || return
   fi
-  [[ "$(recovery_release_count)" -eq 1 ]] ||
+  wait_until 15 recovery_release_count_is 1 ||
     recovery_fail "the windowed flap releases quota once (got $(recovery_release_count))" || return
   if grep -q 'watch-exit' "$INBOX/je44/completion-sentinel.log"; then
     recovery_fail "the windowed flap must not watch-exit" || return
@@ -1857,6 +1964,538 @@ PY
 echo "== JE44: a gone/ok flap still hits the watch window =="
 case_recovery_window_flap || fail "JE44 gone/ok flap must not postpone the watch window"
 echo "PASS je44 flap-cannot-postpone-watch-window"
+
+# ════════════════════════════════════════════════════════════════════════
+# ════════════════════════════════════════════════════════════════════════
+# QR — hk1798: every job end path returns the job's live quota_pool records
+# ════════════════════════════════════════════════════════════════════════
+
+# QR1 — wrk done (local path)
+echo "== QR1: wrk done releases the job's live quota_pool record =="
+reset_case qr1
+quota_spawn_ok qr1 || die3 "QR1 setup: spawn did not leave a live record"
+quota_wait_sentinel_sleep qr1 || die3 "QR1 setup: sentinel did not reach its sleep"
+REPORT="$TMP/qr1-report.md"; printf 'done verdict\n' >"$REPORT"
+done_run qr1 --report "$REPORT" >/dev/null 2>&1 ||
+  fail "QR1: wrk done must still succeed with a releasable record"
+assert_quota_released qr1 "wrk done"
+echo "PASS qr1 done-releases-quota"
+
+# QR2 — wrk joined (builder job)
+echo "== QR2: wrk joined releases the job's live quota_pool record =="
+reset_case qr2
+QR_MODEL=builder-sol quota_spawn_ok qr2 \
+  --role builder --lane qr2-lane --parent director-1 ||
+  die3 "QR2 setup: builder spawn did not leave a live record"
+quota_wait_sentinel_sleep qr2 || die3 "QR2 setup: sentinel did not reach its sleep"
+REPORT="$TMP/qr2-report.md"; printf 'joined report\n' >"$REPORT"
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+  XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
+  PANEWIRE_BIN="$PANEWIRE" \
+  "$WRK" joined qr2 --pr https://example.invalid/pr/2 --head deadbeef \
+  --report "$REPORT" >/dev/null 2>&1 || fail "QR2: wrk joined must succeed"
+assert_quota_released qr2 "wrk joined"
+echo "PASS qr2 joined-releases-quota"
+
+# QR3 — delegated `panewire job done` still releases via wrk housekeeping
+echo "== QR3: delegated done releases the record =="
+reset_case qr3
+quota_spawn_ok qr3 || die3 "QR3 setup"
+quota_wait_sentinel_sleep qr3 || die3 "QR3 setup: sentinel did not reach its sleep"
+REPORT="$TMP/qr3-report.md"; printf 'x\n' >"$REPORT"
+QR3_STUB="$TMP/qr3-panewire"
+cat >"$QR3_STUB" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+if [ "$1" = "job" ] && [ "$2" = "done" ]; then
+  "$STUB_ARBITER" event --job "$3" --kind job.completed \
+    --payload-json '{"owner_lane":"default","label":"lbl-qr3","pane_id":"w:p1"}' >/dev/null 2>&1
+  exit 0
+fi
+exit 42
+EOF
+chmod +x "$QR3_STUB"
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+  XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
+  PANEWIRE_BIN="$QR3_STUB" STUB_ARBITER="$ARBITER" \
+  "$WRK" 'done' qr3 --report "$REPORT" >/dev/null 2>&1 ||
+  fail "QR3: delegated done must succeed"
+assert_quota_released qr3 "delegated done"
+echo "PASS qr3 delegated-done-releases-quota"
+
+# QR4 — sentinel completed path releases through the shared helper
+echo "== QR4: sentinel-completed releases the record =="
+reset_case qr4
+QR_GET_SEQUENCE="$TMP/qr4.seq"; printf 'working\n' >"$QR_GET_SEQUENCE"
+QR_INTERVAL=1 quota_spawn_ok qr4 ||
+  die3 "QR4 setup"
+printf 'done\n' >"$QR_GET_SEQUENCE"; : >"${QR_GET_SEQUENCE}.calls"
+printf 'final report\n' >"$INBOX/qr4/report.md"
+wait_until 20 event_count_is "$INBOX/qr4/events" job.completed 1 ||
+  fail "QR4: sentinel must record job.completed once the report is stable"
+wait_until 15 quota_is_zero qr4 ||
+  fail "QR4: sentinel-completed must release the live record"
+assert_quota_released qr4 "sentinel completed"
+QR_GET_SEQUENCE=""
+echo "PASS qr4 sentinel-completed-releases-quota"
+
+# QR5 — sentinel lost-grace expiry releases
+echo "== QR5: sentinel lost-grace releases the record =="
+reset_case qr5
+QR_GET_SEQUENCE="$TMP/qr5.seq"; printf 'working\n' >"$QR_GET_SEQUENCE"
+QR_INTERVAL=1 QR_LOST_GRACE=2 quota_spawn_ok qr5 ||
+  die3 "QR5 setup"
+printf 'not-found\n' >"$QR_GET_SEQUENCE"; : >"${QR_GET_SEQUENCE}.calls"
+wait_until 25 event_count_is "$INBOX/qr5/events" job.revoked 1 ||
+  fail "QR5: lost grace expiry must end the job"
+wait_until 15 quota_is_zero qr5 ||
+  fail "QR5: lost-grace must release the live record"
+assert_quota_released qr5 "sentinel lost-grace"
+QR_GET_SEQUENCE=""
+echo "PASS qr5 lost-grace-releases-quota"
+
+# QR6 — a sentinel that wakes to an externally ended job releases leftovers
+echo "== QR6: sentinel watch-exit releases leftover records =="
+reset_case qr6
+QR_INTERVAL=1 quota_spawn_ok qr6 || die3 "QR6 setup"
+arb event --job qr6 --kind job.completed \
+  --payload-json '{"owner_lane":"default","label":"lbl-qr6"}' >/dev/null
+wait_until 15 quota_is_zero qr6 ||
+  fail "QR6: the watch-exit must release the leftover record"
+assert_quota_released qr6 "sentinel watch-exit"
+echo "PASS qr6 watch-exit-releases-quota"
+
+# QR7 — reap --apply releases remaining records BEFORE the tab close
+echo "== QR7: reap releases records before closing the tab =="
+reset_case qr7
+QR7_ORDER="$TMP/qr7-order.log"; : >"$QR7_ORDER"
+QR7_HERDR="$TMP/qr7-herdr"
+cat >"$QR7_HERDR" <<EOF
+#!/bin/sh
+if [ "\$1" = "tab" ] && [ "\$2" = "close" ]; then
+  printf 'tabclose %s\n' "\$3" >>"$QR7_ORDER"
+fi
+exec "$HERDR" "\$@"
+EOF
+chmod +x "$QR7_HERDR"
+QR7_ARB="$TMP/qr7-arbiter"
+cat >"$QR7_ARB" <<EOF
+#!/bin/sh
+if [ "\$1" = "release" ]; then
+  printf 'release %s\n' "\$*" >>"$QR7_ORDER"
+fi
+exec "$ARBITER" "\$@"
+EOF
+chmod +x "$QR7_ARB"
+QR_HERDR="$QR7_HERDR" QR_ARBITER="$QR7_ARB" quota_spawn_ok qr7 --owner qr7lane ||
+  die3 "QR7 setup"
+quota_wait_sentinel_sleep qr7 || die3 "QR7 setup: sentinel did not reach its sleep"
+# The spawn's recorded pane/tab live in workspace w; the reap fixture's tab
+# census only knows w1:* — point the newest receipt at a reapable pair.
+arb event --job qr7 --kind job.spawned \
+  --payload-json '{"owner_lane":"qr7lane","label":"lbl-qr7","pane_id":"w1:p1","tab_id":"w1:t1"}' >/dev/null
+arb event --job qr7 --kind job.completed \
+  --payload-json '{"owner_lane":"qr7lane","label":"lbl-qr7","pane_id":"w1:p1"}' >/dev/null
+env HERDR_BIN="$QR7_HERDR" ARBITER_BIN="$QR7_ARB" ARBITER_INBOX_ROOT="$INBOX" \
+  XDG_DATA_HOME="$XDG" WRK_FIXTURE_SCENARIO=reap WRK_FIXTURE_LOG="$HERDR_LOG" \
+  "$WRK" reap --apply --lane qr7lane --grace 0s >/"$TMP/qr7-reap.out" 2>&1 ||
+  fail "QR7: reap --apply must succeed: $(cat "$TMP/qr7-reap.out")"
+grep -q 'closed job=qr7' "$TMP/qr7-reap.out" ||
+  fail "QR7: the ended job's tab must close: $(cat "$TMP/qr7-reap.out")"
+python3 - "$QR7_ORDER" <<'PY' ||
+import sys
+lines = [line.strip() for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+release_at = next((i for i, line in enumerate(lines) if line.startswith("release ")), None)
+close_at = next((i for i, line in enumerate(lines) if line.startswith("tabclose")), None)
+assert release_at is not None, f"no release call recorded: {lines}"
+assert close_at is not None, f"no tab close recorded: {lines}"
+assert release_at < close_at, f"release must precede the tab close: {lines}"
+PY
+  fail "QR7: release must run before the tab close"
+assert_quota_released qr7 "reap --apply"
+echo "PASS qr7 reap-releases-before-close"
+
+# QR8 — prune --apply on an ended job's orphan sentinel releases leftovers
+echo "== QR8: prune releases an ended job's leftover record =="
+reset_case qr8
+quota_spawn_ok qr8 || die3 "QR8 setup"
+quota_wait_sentinel_sleep qr8 || die3 "QR8 setup: sentinel did not reach its sleep"
+arb event --job qr8 --kind job.completed \
+  --payload-json '{"owner_lane":"default","label":"lbl-qr8"}' >/dev/null
+prune_run --apply >/dev/null 2>&1 || fail "QR8: prune --apply must succeed"
+assert_quota_released qr8 "prune ended-orphan"
+echo "PASS qr8 prune-ended-releases-quota"
+
+# QR9 — prune --apply on a pane-gone sentinel ends and releases
+echo "== QR9: prune pane-gone path ends and releases =="
+reset_case qr9
+quota_spawn_ok qr9 || die3 "QR9 setup"
+quota_wait_sentinel_sleep qr9 || die3 "QR9 setup: sentinel did not reach its sleep"
+QR9_SEQ="$TMP/qr9.seq"; printf 'not-found\n' >"$QR9_SEQ"
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+  XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$QR9_SEQ" \
+  "$WRK" prune --apply >/dev/null 2>&1 || fail "QR9: prune --apply must succeed"
+event_count_is "$INBOX/qr9/events" job.revoked 1 ||
+  fail "QR9: a pane-gone job must gain the end declaration"
+assert_quota_released qr9 "prune pane-gone"
+echo "PASS qr9 prune-pane-gone-releases-quota"
+
+# QR10 — prune's stale-job pass ends and releases (no live sentinel)
+echo "== QR10: prune stale-job pass ends and releases =="
+reset_case qr10
+quota_spawn_ok qr10 || die3 "QR10 setup"
+# Isolate pass 3: remove the live sentinel and its pidfile so only the
+# stale-job sweep can act.
+QR10_PID="$(head -n 1 "$INBOX/qr10/completion-sentinel.pid")"
+own "$QR10_PID"; kill_owned_tree "$QR10_PID"
+rm -f "$INBOX/qr10/completion-sentinel.pid"
+QR10_SEQ="$TMP/qr10.seq"; printf 'not-found\n' >"$QR10_SEQ"
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+  XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$QR10_SEQ" \
+  "$WRK" prune --apply --stale-age 0s >/"$TMP/qr10-prune.out" 2>&1 ||
+  fail "QR10: prune --apply must succeed"
+grep -q "qr10.*stale=yes" "$TMP/qr10-prune.out" ||
+  fail "QR10: the silent pane-gone job must be flagged stale: $(cat "$TMP/qr10-prune.out")"
+event_count_is "$INBOX/qr10/events" job.revoked 1 ||
+  fail "QR10: stale marking must append the end declaration"
+assert_quota_released qr10 "prune stale-job"
+echo "PASS qr10 prune-stale-releases-quota"
+
+# QR11 — takeover hand-off releases the OLD job's leftover record
+echo "== QR11: takeover hand-off releases the old job's record =="
+reset_case qr11
+HK_STATE="$HK_DB" "$HK" tasks add --id 1 --state claimed \
+  --claimed-by old-label --job-id qr11-old >/dev/null
+QR11_OLDEV="$INBOX/qr11-old/events"; mkdir -p "$QR11_OLDEV"
+printf '%s\n' '{"kind":"job.claim","at":"2026-10-18T00:00:00Z","payload":{"job_id":"qr11-old","owner_lane":"old-lane","label":"old-label","role":"builder","task_id":1}}' >"$QR11_OLDEV/00001-job.claim.json"
+printf '%s\n' '{"kind":"job.spawned","at":"2026-10-18T00:00:01Z","payload":{"job_id":"qr11-old","pane_id":"w1:p10","tab_id":"w1:t10"}}' >"$QR11_OLDEV/00002-job.spawned.json"
+printf '%s\n' '{"kind":"job.revoked","at":"2026-10-19T00:00:00Z","payload":{"job_id":"qr11-old","owner_lane":"old-lane"}}' >"$QR11_OLDEV/00020-job.revoked.json"
+# The leaked row pre-dates the terminal: backdated claim+lease artifacts keep
+# the revoked record the newest event.
+ARBITER_TEST_NOW="2026-10-17T00:00:00Z" arb claim --job qr11-old \
+  --lane old-lane --agent-label old-label --t T1 >/dev/null
+ARBITER_TEST_NOW="2026-10-17T00:00:01Z" arb_lease qr11-old
+[[ "$(quota_rows qr11-old)" == 1 ]] || die3 "QR11 setup: old job needs a live record"
+arb claim --job qr11-unrelated --lane unrelated-lane \
+  --agent-label unrelated-label --t T1 >/dev/null
+arb_lease qr11-unrelated
+[[ "$(quota_rows qr11-unrelated)" == 1 ]] ||
+  die3 "QR11 setup: unrelated job needs its own live record"
+QR_MODEL=builder-sol quota_spawn_ok qr11-new \
+  --role builder --lane qr11-lane --parent director-1 \
+  --takeover-from qr11-old >/dev/null ||
+  die3 "QR11 setup: takeover spawn failed"
+event_count_is "$QR11_OLDEV" job.handed_off 1 ||
+  fail "QR11: takeover must write job.handed_off on the old job"
+assert_quota_released qr11-old "takeover hand-off"
+[[ "$(quota_rows qr11-unrelated)" == 1 ]] ||
+  fail "QR11: takeover must not release an unrelated job's record"
+[[ "$(release_events qr11-unrelated)" == 0 ]] ||
+  fail "QR11: takeover must not write an unrelated job's release event"
+[[ "$(quota_rows qr11-new)" == 1 ]] ||
+  fail "QR11: takeover must leave the new job's record live"
+echo "PASS qr11 takeover-releases-old-job-quota"
+
+# QR12 — released once, re-recorded, then ended: the end still releases
+echo "== QR12: a re-recorded record is released at job end =="
+reset_case qr12
+quota_spawn_ok qr12 || die3 "QR12 setup"
+quota_wait_sentinel_sleep qr12 || die3 "QR12 setup: sentinel did not reach its sleep"
+arb release --job qr12 --resource codex --kind quota_pool >/dev/null ||
+  die3 "QR12 setup: first release"
+arb_lease qr12 || die3 "QR12 setup: re-record"
+[[ "$(quota_rows qr12)" == 1 ]] || die3 "QR12 setup: the re-record must be live"
+REPORT="$TMP/qr12-report.md"; printf 'second round\n' >"$REPORT"
+done_run qr12 --report "$REPORT" >/dev/null 2>&1 ||
+  fail "QR12: done must succeed"
+[[ "$(quota_rows qr12)" == 0 ]] ||
+  fail "QR12: the re-recorded record must be released at end"
+[[ "$(release_events qr12)" -ge 2 ]] ||
+  fail "QR12: expected a second quota_pool.release event"
+echo "PASS qr12 re-recorded-release"
+
+# QR13 — a failed release is logged (rc, job, pool) and the end still lands
+echo "== QR13: release failure is logged and never fails the end path =="
+reset_case qr13
+QR13_ARB="$TMP/qr13-arbiter"
+cat >"$QR13_ARB" <<EOF
+#!/bin/sh
+if [ "\$1" = "release" ]; then
+  echo "fixture release failure" >&2
+  exit 7
+fi
+exec "$ARBITER" "\$@"
+EOF
+chmod +x "$QR13_ARB"
+QR_ARBITER="$QR13_ARB" quota_spawn_ok qr13 || die3 "QR13 setup"
+quota_wait_sentinel_sleep qr13 || die3 "QR13 setup: sentinel did not reach its sleep"
+REPORT="$TMP/qr13-report.md"; printf 'x\n' >"$REPORT"
+QR13_OUT="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$QR13_ARB" \
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+  HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" PANEWIRE_BIN="$PANEWIRE" \
+  "$WRK" 'done' qr13 --report "$REPORT" 2>&1)" ||
+  fail "QR13: a failed release must not fail wrk done: $QR13_OUT"
+grep -q 'quota-release-failed' "$INBOX/qr13/completion-sentinel.log" ||
+  fail "QR13: the sentinel log must carry the release failure"
+grep -q 'rc=7' "$INBOX/qr13/completion-sentinel.log" ||
+  fail "QR13: the logged failure must carry the release rc"
+grep -q 'job=qr13' "$INBOX/qr13/completion-sentinel.log" ||
+  fail "QR13: the logged failure must name the job"
+grep -q 'pool=codex' "$INBOX/qr13/completion-sentinel.log" ||
+  fail "QR13: the logged failure must name the pool"
+[[ "$(grep -c 'action=quota-release-failed' "$INBOX/qr13/completion-sentinel.log")" == 1 ]] ||
+  fail "QR13: one failed release must write exactly one durable log line"
+event_count_is "$INBOX/qr13/events" job.completed 1 ||
+  fail "QR13: job.completed must land despite the release failure"
+echo "PASS qr13 release-failure-logged"
+
+case_live_revival_prune_pane_gone() {
+  reset_case mut-ractive || return 3
+  quota_spawn mut-ractive >/dev/null 2>&1 || return 3
+  quota_wait_sentinel_sleep mut-ractive || return 3
+  ARBITER_TEST_NOW=2099-01-01T00:00:00Z arb release --job mut-ractive \
+    --resource codex --kind quota_pool >/dev/null || return 3
+  ARBITER_TEST_NOW=2099-01-02T00:00:00Z arb event --job mut-ractive --kind job.completed \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive","pane_id":"w:p1"}' >/dev/null ||
+    return 3
+  ARBITER_TEST_NOW=2099-01-03T00:00:00Z arb event --job mut-ractive --kind job.reclaim \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive"}' >/dev/null || return 3
+  ARBITER_TEST_NOW=2099-01-04T00:00:00Z arb event --job mut-ractive --kind job.spawned \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive","pane_id":"w:p2"}' >/dev/null ||
+    return 3
+  ARBITER_TEST_NOW=2099-01-05T00:00:00Z arb_lease mut-ractive || return 3
+  [[ "$(quota_rows mut-ractive)" == 1 ]] || return 3
+  # Point the pidfile sentinel at the NEWEST spawn pane so this case exercises
+  # the pane-gone end-gate; the stale round-one watcher (w:p1) is what the
+  # superseded gate then stops in the sweep pass (hk1798 round 2).
+  REPORT="$TMP/mut-ractive-report.md"; printf 'x\n' >"$REPORT"
+  start_sentinel mut-ractive w:p2 "$REPORT"
+  sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
+  local seq="$TMP/mut-ractive.seq"; printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply --job mut-ractive >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-ractive)" == 1 ]] || return 1
+  event_count_is "$INBOX/mut-ractive/events" job.revoked 0 || return 1
+  [[ "$(release_events mut-ractive)" == 1 ]] || return 1
+  wait_until 8 pid_gone "$SENTINEL_PID" || return 1
+}
+
+case_duplicate_done_after_revival() {
+  reset_case mut-rduplicate || return 3
+  quota_spawn mut-rduplicate >/dev/null 2>&1 || return 3
+  quota_wait_sentinel_sleep mut-rduplicate || return 3
+  local report="$TMP/mut-rduplicate-report.md"
+  printf 'round one report\n' >"$report"
+  done_run mut-rduplicate --report "$report" >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rduplicate)" == 0 ]] || return 3
+  ARBITER_TEST_NOW=2099-02-01T00:00:00Z arb event --job mut-rduplicate \
+    --kind job.reclaim --payload-json '{"owner_lane":"default","label":"lbl-mut-rduplicate"}' >/dev/null ||
+    return 3
+  ARBITER_TEST_NOW=2099-02-02T00:00:00Z arb event --job mut-rduplicate \
+    --kind job.spawned --payload-json \
+    '{"owner_lane":"default","label":"lbl-mut-rduplicate","pane_id":"w:p2"}' >/dev/null || return 3
+  ARBITER_TEST_NOW=2099-02-03T00:00:00Z arb_lease mut-rduplicate || return 3
+  [[ "$(quota_rows mut-rduplicate)" == 1 ]] || return 3
+  done_run mut-rduplicate --report "$report" >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rduplicate)" == 1 ]] || return 1
+  [[ "$(release_events mut-rduplicate)" == 1 ]] || return 1
+}
+
+# QR14 — pane-gone prune must not release a revived job's live round record.
+echo "== QR14: pane-gone prune preserves a revived job's quota row =="
+case_live_revival_prune_pane_gone || fail "QR14: pane-gone prune must preserve a revived round"
+echo "PASS qr14 pane-gone-prune-preserves-revived-record"
+
+# QR15 — a duplicate completion after a revive must not release the new round.
+echo "== QR15: duplicate done after revive preserves the live round record =="
+case_duplicate_done_after_revival ||
+  fail "QR15: duplicate done must preserve the revived round's record"
+echo "PASS qr15 duplicate-done-after-revive-preserves-record"
+
+# A revive with NO work-terminal before it: claim, spawned w:p0, record, a
+# job.lost, the stale record released, then a --reclaim-released claim, a new
+# spawned on a different pane and a fresh live record. No terminal ever lands,
+# so the end-gate alone cannot see that round two is live — only the newest
+# job.spawned pane names it. Shared by QR16 (prune) and QR17 (lost grace).
+revive_noterminal_setup() {
+  local job="$1" oldpane="$2" newpane="$3"
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"pane_id\":\"$oldpane\",\"tab_id\":\"w:t0\"}" >/dev/null ||
+    return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.lost \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"reason\":\"agent_not_found\"}" >/dev/null ||
+    return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"pane_id\":\"$newpane\",\"tab_id\":\"w:t2\"}" >/dev/null ||
+    return 3
+  arb_lease "$job" || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+}
+
+# The stale round-one sentinel kept its pidfile across the respawn and still
+# watches the dead old pane. Prune may stop it, but the watched pane is not
+# the job's newest spawn, so no end declaration or release may follow.
+case_revive_noterminal_prune_superseded() {
+  reset_case mut-rsupp || return 3
+  revive_noterminal_setup mut-rsupp w:p0 w:p2 || return 3
+  REPORT="$TMP/mut-rsupp-report.md"; printf 'x\n' >"$REPORT"
+  start_sentinel mut-rsupp w:p0 "$REPORT"
+  sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
+  local seq="$TMP/mut-rsupp.seq"; printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply --job mut-rsupp >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rsupp)" == 1 ]] || return 1
+  event_count_is "$INBOX/mut-rsupp/events" job.revoked 0 || return 1
+  [[ "$(release_events mut-rsupp)" == 1 ]] || return 1
+  wait_until 8 pid_gone "$SENTINEL_PID" || return 1
+}
+
+# Same revive through the sentinel's own lost grace: the stale watcher
+# records job.lost on the dead pane, the job is reclaimed and respawned on a
+# new pane, and the grace then expires. The superseded sentinel must leave
+# without declaring the end or releasing the live round.
+case_revive_noterminal_lostgrace_superseded() {
+  reset_case mut-rsupg || return 3
+  arb claim --job mut-rsupg --lane lane-a --agent-label lbl-mut-rsupg --t T1 >/dev/null || return 3
+  arb event --job mut-rsupg --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl-mut-rsupg","pane_id":"w:p0","tab_id":"w:t0"}' >/dev/null ||
+    return 3
+  arb_lease mut-rsupg || return 3
+  local seq="$TMP/mut-rsupg.seq"; printf 'not-found\n' >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=5 start_sentinel mut-rsupg w:p0 "$TMP/mut-rsupg-report.md" "$seq"
+  wait_until 15 event_count_is "$INBOX/mut-rsupg/events" job.lost 1 || return 3
+  arb release --job mut-rsupg --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job mut-rsupg --lane lane-a --agent-label lbl-mut-rsupg --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb event --job mut-rsupg --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl-mut-rsupg","pane_id":"w:p1","tab_id":"w:t1"}' >/dev/null ||
+    return 3
+  arb_lease mut-rsupg || return 3
+  [[ "$(quota_rows mut-rsupg)" == 1 ]] || return 3
+  wait_until 15 pid_gone "$SENTINEL_PID" || return 1
+  event_count_is "$INBOX/mut-rsupg/events" job.revoked 0 || return 1
+  [[ "$(quota_rows mut-rsupg)" == 1 ]] || return 1
+  [[ "$(release_events mut-rsupg)" == 1 ]] || return 1
+  grep -q 'superseded' "$INBOX/mut-rsupg/completion-sentinel.log" || return 1
+}
+
+# QR16 — prune must supersede a stale sentinel on a terminal-less revive:
+# stop it without declaring the end or releasing the live round's record.
+echo "== QR16: pane-gone prune supersedes a stale sentinel without ending the revived job =="
+case_revive_noterminal_prune_superseded ||
+  fail "QR16: prune must supersede the stale sentinel, not end the revived job"
+echo "PASS qr16 pane-gone-prune-superseded-preserves-record"
+
+# QR17 — the same revive through the sentinel's own lost grace.
+echo "== QR17: a superseded sentinel's lost grace ends nothing =="
+case_revive_noterminal_lostgrace_superseded ||
+  fail "QR17: the superseded sentinel must exit without end or release"
+echo "PASS qr17 lost-grace-superseded-preserves-record"
+
+# The in-flight respawn window (round-3 CE8): the reclaim and the fresh
+# quota record have landed but the new job.spawned receipt has not — the
+# scan's newest spawned pane is still the stale watcher's own pane, so only
+# the claim-after-spawn half of job_watch_current can catch it. Shared by
+# QR18 (prune) and QR19 (lost grace).
+revive_inflight_setup() {
+  local job="$1"
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"pane_id\":\"w:p0\",\"tab_id\":\"w:t0\"}" >/dev/null ||
+    return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.lost \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"reason\":\"agent_not_found\"}" >/dev/null ||
+    return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease "$job" || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+}
+
+case_revive_inflight_prune_superseded() {
+  reset_case mut-isfp || return 3
+  revive_inflight_setup mut-isfp || return 3
+  REPORT="$TMP/mut-isfp-report.md"; printf 'x\n' >"$REPORT"
+  start_sentinel mut-isfp w:p0 "$REPORT"
+  sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
+  local seq="$TMP/mut-isfp.seq"; printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply --job mut-isfp >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-isfp)" == 1 ]] || return 1
+  event_count_is "$INBOX/mut-isfp/events" job.revoked 0 || return 1
+  [[ "$(release_events mut-isfp)" == 1 ]] || return 1
+  wait_until 8 pid_gone "$SENTINEL_PID" || return 1
+}
+
+case_revive_inflight_lostgrace_superseded() {
+  reset_case mut-isfg || return 3
+  arb claim --job mut-isfg --lane lane-a --agent-label lbl-mut-isfg --t T1 >/dev/null || return 3
+  arb event --job mut-isfg --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl-mut-isfg","pane_id":"w:p0","tab_id":"w:t0"}' >/dev/null ||
+    return 3
+  arb_lease mut-isfg || return 3
+  local seq="$TMP/mut-isfg.seq"; printf 'not-found\n' >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=5 start_sentinel mut-isfg w:p0 "$TMP/mut-isfg-report.md" "$seq"
+  wait_until 15 event_count_is "$INBOX/mut-isfg/events" job.lost 1 || return 3
+  arb release --job mut-isfg --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job mut-isfg --lane lane-a --agent-label lbl-mut-isfg --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease mut-isfg || return 3
+  [[ "$(quota_rows mut-isfg)" == 1 ]] || return 3
+  wait_until 15 pid_gone "$SENTINEL_PID" || return 1
+  event_count_is "$INBOX/mut-isfg/events" job.revoked 0 || return 1
+  [[ "$(quota_rows mut-isfg)" == 1 ]] || return 1
+  [[ "$(release_events mut-isfg)" == 1 ]] || return 1
+  grep -q 'superseded' "$INBOX/mut-isfg/completion-sentinel.log" || return 1
+}
+
+# QR18 — the in-flight respawn window through prune: a stale sentinel whose
+# watched pane still equals the newest spawn is superseded, not terminal.
+echo "== QR18: prune supersedes a stale sentinel during an in-flight respawn =="
+case_revive_inflight_prune_superseded ||
+  fail "QR18: prune must supersede the stale sentinel during the respawn window"
+echo "PASS qr18 pane-gone-prune-superseded-inflight"
+
+# QR19 — the same window through the sentinel's own lost grace.
+echo "== QR19: lost grace during an in-flight respawn ends nothing =="
+case_revive_inflight_lostgrace_superseded ||
+  fail "QR19: the superseded sentinel must exit during the respawn window"
+echo "PASS qr19 lost-grace-superseded-inflight"
+
+# QR20 — an owner lane containing a space must not shift the argv pane
+# parse (round-3 T3): a live job's sentinel stays protected, never stopped.
+echo "== QR20: a space in the owner lane does not stop a live sentinel =="
+reset_case qr20
+arb claim --job qr20 --lane 'lane a' --agent-label lbl-qr20 --t T1 >/dev/null
+arb event --job qr20 --kind job.spawned \
+  --payload-json '{"owner_lane":"lane a","label":"lbl-qr20","pane_id":"w:p1","tab_id":"w:t0"}' >/dev/null
+arb_lease qr20
+REPORT="$TMP/qr20-report.md"; printf 'x\n' >"$REPORT"
+SENT_OWNER='lane a' start_sentinel qr20 w:p1 "$REPORT"
+sentinel_mid_sleep "$SENTINEL_PID" >/dev/null ||
+  fail "QR20: sentinel must reach its interval sleep"
+prune_run --apply --job qr20 >"$TMP/qr20-prune.out" 2>&1 ||
+  fail "QR20: prune --apply must succeed"
+kill -0 "$SENTINEL_PID" 2>/dev/null ||
+  { cat "$TMP/qr20-prune.out"; fail "QR20: a live job's sentinel must not be stopped"; }
+grep -q 'protected' "$TMP/qr20-prune.out" ||
+  { cat "$TMP/qr20-prune.out"; fail "QR20: the verdict must stay protected"; }
+event_count_is "$INBOX/qr20/events" job.revoked 0 ||
+  fail "QR20: a live job must never be ended"
+[[ "$(quota_rows qr20)" == 1 ]] ||
+  fail "QR20: a live job's record must stay leased"
+recovery_stop
+echo "PASS qr20 space-in-owner-sentinel-protected"
 
 # ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants: sed'd copies of bin/wrk (path ends in /wrk —
@@ -2038,7 +2677,8 @@ case_reap() {
   sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
   arb event --job mut-reap --kind job.joined \
     --payload-json '{"owner_lane":"lane-a","label":"mut-reap","pane_id":"w1:p1"}' >/dev/null || return 3
-  env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$XDG" \
+    ARBITER_INBOX_ROOT="$INBOX" WRK_FIXTURE_SCENARIO=reap \
     "$WRK" reap --apply --lane lane-a --grace 0s >/dev/null 2>&1
   wait_until 8 pid_gone "$SENTINEL_PID" || return 1
   [[ ! -e "$INBOX/mut-reap/completion-sentinel.pid" ]] || return 1
@@ -2451,15 +3091,18 @@ case_refresh_stale_start() {
   reset_case mut-rstale || return 3
   mk_job mut-rstale || return 3
   local pf="$INBOX/mut-rstale/quota-refresh.pid"
-  mkdir -p "$INBOX/mut-rstale"
-  python3 - "$SCOPEFUEL" fakepool 60 "$pf" mut-rstale <<'PY' >/dev/null 2>&1 &
-import sys, time
-time.sleep(600)
+  start_fake_supervisor mut-rstale -7200
+  wait_until 10 test -s "$pf" || return 3
+  local sup; sup="$(sed -n 's/^pid=\([0-9]*\).*/\1/p' "$pf")"; own "$sup"
+  local stale_started; stale_started=$(( $(date +%s) - 7200 ))
+  python3 - "$pf" "$stale_started" <<'PY' || return 3
+import pathlib, sys
+path, started = pathlib.Path(sys.argv[1]), sys.argv[2]
+text = path.read_text(encoding="utf-8")
+parts = [token for token in text.split() if not token.startswith("started=")]
+parts.append("started=" + started)
+path.write_text(" ".join(parts) + "\n", encoding="utf-8")
 PY
-  local sup=$!; own "$sup"
-  local now; now=$(date +%s)
-  printf 'pid=%d pool=fakepool job=mut-rstale timeout=60 deadline=%d started=%d\n' \
-    "$sup" "$(( now - 120 ))" "$(( now - 7200 ))" >"$pf"
   prune_run --apply >/dev/null 2>&1
   kill -0 "$sup" 2>/dev/null || return 1
 }
@@ -2809,5 +3452,282 @@ expect_mut_red "I07 ended-pidfile-removal" case_unrelated_pidfile
 # shellcheck disable=SC2016
 mkmut h01-no-prune-stop 's~stop_completion_sentinel "$job" "$pid"~: removed prune stop~g'
 expect_mut_red "H01 combined no-prune-stop" case_prune_apply
+
+# ── hk1798 mutant cases: every end path's release call is load-bearing ────
+
+case_release_done() {
+  reset_case mut-rdone || return 3
+  quota_spawn mut-rdone >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rdone)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rdone || return 3
+  REPORT="$TMP/mut-rdone-report.md"; printf 'x\n' >"$REPORT"
+  done_run mut-rdone --report "$REPORT" >/dev/null 2>&1
+  [[ "$(quota_rows mut-rdone)" == 0 ]] || return 1
+}
+
+case_release_joined() {
+  reset_case mut-rjoined || return 3
+  QR_MODEL=builder-sol quota_spawn mut-rjoined \
+    --role builder --lane mut-rjoined-lane --parent director-1 >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rjoined)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rjoined || return 3
+  REPORT="$TMP/mut-rjoined-report.md"; printf 'x\n' >"$REPORT"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
+    PANEWIRE_BIN="$PANEWIRE" \
+    "$WRK" joined mut-rjoined --pr https://example.invalid/pr/1 \
+      --head deadbeef --report "$REPORT" >/dev/null 2>&1
+  [[ "$(quota_rows mut-rjoined)" == 0 ]] || return 1
+}
+
+case_release_delegate_done() {
+  reset_case mut-rdel || return 3
+  quota_spawn mut-rdel >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rdel)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rdel || return 3
+  REPORT="$TMP/mut-rdel-report.md"; printf 'x\n' >"$REPORT"
+  local stub="$TMP/mut-rdel-panewire"
+  cat >"$stub" <<'EOF'
+#!/bin/sh
+if [ "$1" = "job" ] && [ "$2" = "probe" ]; then echo panewire-job/1; exit 0; fi
+if [ "$1" = "job" ] && [ "$2" = "done" ]; then
+  "$STUB_ARBITER" event --job "$3" --kind job.completed \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-rdel","pane_id":"w:p1"}' >/dev/null 2>&1
+  exit 0
+fi
+exit 42
+EOF
+  chmod +x "$stub" || return 3
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
+    PANEWIRE_BIN="$stub" STUB_ARBITER="$ARBITER" \
+    "$WRK" 'done' mut-rdel --report "$REPORT" >/dev/null 2>&1
+  [[ "$(quota_rows mut-rdel)" == 0 ]] || return 1
+}
+
+case_release_sentinel_completed() {
+  reset_case mut-rsc || return 3
+  QR_GET_SEQUENCE="$TMP/mut-rsc.seq"; printf 'working\n' >"$QR_GET_SEQUENCE"
+  QR_INTERVAL=1 quota_spawn mut-rsc >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rsc)" == 1 ]] || return 3
+  printf 'done\n' >"$QR_GET_SEQUENCE"; : >"${QR_GET_SEQUENCE}.calls"
+  printf 'x\n' >"$INBOX/mut-rsc/report.md"
+  wait_until 20 event_count_is "$INBOX/mut-rsc/events" job.completed 1 || return 3
+  wait_until 15 quota_is_zero mut-rsc || return 1
+}
+
+case_release_watch_exit() {
+  reset_case mut-rwx || return 3
+  QR_INTERVAL=1 quota_spawn mut-rwx >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rwx)" == 1 ]] || return 3
+  arb event --job mut-rwx --kind job.completed \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-rwx"}' >/dev/null || return 3
+  wait_until 15 quota_is_zero mut-rwx || return 1
+}
+
+case_release_lost_grace() {
+  reset_case mut-rlg || return 3
+  QR_GET_SEQUENCE="$TMP/mut-rlg.seq"; printf 'working\n' >"$QR_GET_SEQUENCE"
+  QR_INTERVAL=1 QR_LOST_GRACE=2 quota_spawn mut-rlg >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rlg)" == 1 ]] || return 3
+  printf 'not-found\n' >"$QR_GET_SEQUENCE"; : >"${QR_GET_SEQUENCE}.calls"
+  wait_until 25 event_count_is "$INBOX/mut-rlg/events" job.revoked 1 || return 3
+  wait_until 15 quota_is_zero mut-rlg || return 1
+}
+
+case_release_reap_order() {
+  reset_case mut-rreap || return 3
+  local order="$TMP/mut-rreap-order.log"; : >"$order"
+  local hwrap="$TMP/mut-rreap-herdr" astub="$TMP/mut-rreap-arbiter"
+  cat >"$hwrap" <<EOF || return 3
+#!/bin/sh
+if [ "\$1" = "tab" ] && [ "\$2" = "close" ]; then
+  printf 'tabclose %s\n' "\$3" >>"$order"
+fi
+exec "$HERDR" "\$@"
+EOF
+  cat >"$astub" <<EOF || return 3
+#!/bin/sh
+if [ "\$1" = "release" ]; then
+  printf 'release %s\n' "\$*" >>"$order"
+fi
+exec "$ARBITER" "\$@"
+EOF
+  chmod +x "$hwrap" "$astub" || return 3
+  QR_HERDR="$hwrap" QR_ARBITER="$astub" quota_spawn mut-rreap --owner mutrrlane >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rreap)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rreap || return 3
+  arb event --job mut-rreap --kind job.spawned \
+    --payload-json '{"owner_lane":"mutrrlane","label":"lbl-mut-rreap","pane_id":"w1:p1","tab_id":"w1:t1"}' >/dev/null || return 3
+  arb event --job mut-rreap --kind job.completed \
+    --payload-json '{"owner_lane":"mutrrlane","label":"lbl-mut-rreap","pane_id":"w1:p1"}' >/dev/null || return 3
+  env HERDR_BIN="$hwrap" ARBITER_BIN="$astub" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_SCENARIO=reap WRK_FIXTURE_LOG="$HERDR_LOG" \
+    "$WRK" reap --apply --lane mutrrlane --grace 0s >/dev/null 2>&1
+  [[ "$(quota_rows mut-rreap)" == 0 ]] || return 1
+  python3 - "$order" <<'PY' || return 1
+import sys
+lines = [line.strip() for line in open(sys.argv[1], encoding="utf-8") if line.strip()]
+release_at = next((i for i, line in enumerate(lines) if line.startswith("release ")), None)
+close_at = next((i for i, line in enumerate(lines) if line.startswith("tabclose")), None)
+assert release_at is not None and close_at is not None, lines
+assert release_at < close_at, lines
+PY
+}
+
+case_release_prune_orphan() {
+  reset_case mut-rpo || return 3
+  quota_spawn mut-rpo >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rpo)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rpo || return 3
+  # Interval stays 3600: a waking sentinel would self-release through the
+  # watch-exit path and mask this site's removal (same hazard as H01).
+  arb event --job mut-rpo --kind job.completed \
+    --payload-json '{"owner_lane":"default","label":"lbl-mut-rpo"}' >/dev/null || return 3
+  prune_run --apply >/dev/null 2>&1
+  [[ "$(quota_rows mut-rpo)" == 0 ]] || return 1
+}
+
+case_release_prune_panegone() {
+  reset_case mut-rpg || return 3
+  quota_spawn mut-rpg >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rpg)" == 1 ]] || return 3
+  quota_wait_sentinel_sleep mut-rpg || return 3
+  local seq="$TMP/mut-rpg.seq"; printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply >/dev/null 2>&1
+  [[ "$(quota_rows mut-rpg)" == 0 ]] || return 1
+}
+
+case_release_prune_stale() {
+  reset_case mut-rps || return 3
+  quota_spawn mut-rps >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-rps)" == 1 ]] || return 3
+  local pid; pid="$(head -n 1 "$INBOX/mut-rps/completion-sentinel.pid" 2>/dev/null)"
+  own "$pid"; kill_owned_tree "$pid"; rm -f "$INBOX/mut-rps/completion-sentinel.pid"
+  local seq="$TMP/mut-rps.seq"; printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply --stale-age 0s >/dev/null 2>&1
+  [[ "$(quota_rows mut-rps)" == 0 ]] || return 1
+}
+
+case_release_takeover() {
+  reset_case mut-rtk || return 3
+  HK_STATE="$HK_DB" "$HK" tasks add --id 1 --state claimed \
+    --claimed-by old-label --job-id mut-rtk-old >/dev/null || return 3
+  local oev="$INBOX/mut-rtk-old/events"; mkdir -p "$oev"
+  printf '%s\n' '{"kind":"job.claim","at":"2026-10-18T00:00:00Z","payload":{"job_id":"mut-rtk-old","owner_lane":"old-lane","label":"old-label","role":"builder","task_id":1}}' >"$oev/00001-job.claim.json"
+  printf '%s\n' '{"kind":"job.spawned","at":"2026-10-18T00:00:01Z","payload":{"job_id":"mut-rtk-old","pane_id":"w1:p10","tab_id":"w1:t10"}}' >"$oev/00002-job.spawned.json"
+  printf '%s\n' '{"kind":"job.revoked","at":"2026-10-19T00:00:00Z","payload":{"job_id":"mut-rtk-old","owner_lane":"old-lane"}}' >"$oev/00020-job.revoked.json"
+  ARBITER_TEST_NOW="2026-10-17T00:00:00Z" arb claim --job mut-rtk-old \
+    --lane old-lane --agent-label old-label --t T1 >/dev/null || return 3
+  ARBITER_TEST_NOW="2026-10-17T00:00:01Z" arb_lease mut-rtk-old || return 3
+  [[ "$(quota_rows mut-rtk-old)" == 1 ]] || return 3
+  QR_MODEL=builder-sol quota_spawn mut-rtk-new \
+    --role builder --lane mut-rtk-lane --parent director-1 \
+    --takeover-from mut-rtk-old >/dev/null 2>&1 || return 3
+  event_count_is "$oev" job.handed_off 1 || return 3
+  [[ "$(quota_rows mut-rtk-old)" == 0 ]] || return 1
+}
+
+# R1: the release inside shared job_end_housekeeping — covers wrk done,
+# wrk joined and the delegated panewire path alike.
+mkmut_span r1-no-housekeep-release \
+  'hk1798-housekeeping-release' \
+  '      : removed hk1798 housekeeping release'
+expect_mut_red "R1a done-quota-release" case_release_done
+expect_mut_red "R1b joined-quota-release" case_release_joined
+expect_mut_red "R1c delegated-done-quota-release" case_release_delegate_done
+
+# R2: the sentinel completed path's release
+mkmut_span r2-no-sentinel-release \
+  'hk1798-sentinel-completed-release' \
+  '        : removed hk1798 sentinel-completed release'
+expect_mut_red "R2 sentinel-completed-release" case_release_sentinel_completed
+
+# R3: the sentinel lost-grace release (keep the end record; drop the release)
+mkmut_span r3-no-lostgrace-release \
+  'hk1798-lost-grace-release' \
+  '        created|already-ended) : ;; # removed hk1798 lost-grace release'
+expect_mut_red "R3 lost-grace-release" case_release_lost_grace
+
+# R4: the watch-exit release
+mkmut_span r4-no-watchexit-release \
+  'hk1798-sentinel-watch-exit-release' \
+  '      : removed hk1798 watch-exit release'
+expect_mut_red "R4 watch-exit-release" case_release_watch_exit
+
+# R5: reap's pre-close release — the order assertion is what goes RED (the
+# post-close housekeeping release still drains the row under this mutant).
+mkmut_span r5-no-reap-release \
+  'hk1798-reap-preclose-release' \
+  '      : removed hk1798 reap pre-close release'
+expect_mut_red "R5 reap-release-before-close" case_release_reap_order
+
+# R6: prune's ended-orphan release
+mkmut_span r6-no-orphan-release \
+  'hk1798-prune-orphan-release' \
+  '      : removed hk1798 orphan release'
+expect_mut_red "R6 prune-orphan-release" case_release_prune_orphan
+
+# R7: prune's pane-gone release (keep the end record; drop the release)
+mkmut_span r7-no-panegone-release \
+  'hk1798-pane-gone-release' \
+  '          : removed hk1798 pane-gone release'
+expect_mut_red "R7 prune-pane-gone-release" case_release_prune_panegone
+
+# R8: prune's stale-job release
+mkmut_span r8-no-stale-release \
+  'hk1798-prune-stale-release' \
+  '        : removed hk1798 stale release'
+expect_mut_red "R8 prune-stale-release" case_release_prune_stale
+
+# R9: the takeover hand-off release
+mkmut_span r9-no-takeover-release \
+  'hk1798-takeover-release' \
+  '  : removed hk1798 takeover release'
+expect_mut_red "R9 takeover-release" case_release_takeover
+
+# R10: pane-gone observations cannot end a job revived after its terminal.
+mkmut_span r10-pane-gone-live-guard \
+  'hk1798-pane-gone-end-gate' \
+  '        if true; then # removed hk1798 pane-gone live guard'
+expect_mut_red "R10 pane-gone-live-release-guard" case_live_revival_prune_pane_gone
+
+# R11: housekeeping must not release a round revived after a prior completion.
+mkmut_span r11-housekeeping-active-release \
+  'hk1798-housekeeping-active-guard' \
+  '    active) release_job_quota_pool "$job"; stop_completion_sentinel "$job"; return 0 ;;'
+expect_mut_red "R11 housekeeping-active-revive-guard" case_duplicate_done_after_revival
+
+# R12: prune's pane-gone superseded gate — without it a stale sentinel's dead
+# pane lets prune end and release the terminal-less revived round.
+mkmut_span r12-no-panegone-superseded \
+  'hk1798-pane-gone-superseded' \
+  '        if false; then # removed hk1798 pane-gone superseded gate'
+expect_mut_red "R12 pane-gone-superseded-gate" case_revive_noterminal_prune_superseded
+
+# R13: the sentinel's own lost-grace superseded gate — without it the stale
+# watcher ends and releases the live round when its grace expires.
+mkmut_span r13-no-lostgrace-superseded \
+  'hk1798-lost-grace-superseded' \
+  '        if false; then # removed hk1798 lost-grace superseded gate'
+expect_mut_red "R13 lost-grace-superseded-gate" case_revive_noterminal_lostgrace_superseded
+
+# R14: revert the prune gate to comparing the watched pane with the newest
+# job.spawned pane only — the in-flight reclaim slips past and the release
+# lands, so QR18's case must still go RED.
+mkmut_span r14-pane-gone-oldcheck \
+  'hk1798-pane-gone-superseded' \
+  '        if [[ "$(job_events_scan "$PRUNE_ROOT/$job/events" 2>/dev/null | awk -F'"'"'\\t'"'"' '"'"'{print $10; exit}'"'"')" != "$pane" ]]; then # reverted hk1798-pane-gone-superseded'
+expect_mut_red "R14 pane-gone-revert-old-check" case_revive_inflight_prune_superseded
+
+# R15: the same revert on the sentinel's lost-grace gate.
+mkmut_span r15-lostgrace-oldcheck \
+  'hk1798-lost-grace-superseded' \
+  '        if [[ "$(job_events_scan "$jobdir/events" 2>/dev/null | awk -F'"'"'\\t'"'"' '"'"'{print $10; exit}'"'"')" != "$pane" ]]; then # reverted hk1798-lost-grace-superseded'
+expect_mut_red "R15 lost-grace-revert-old-check" case_revive_inflight_lostgrace_superseded
 
 echo "PASS test-wrk-job-end: all cases"
