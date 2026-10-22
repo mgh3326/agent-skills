@@ -8,6 +8,21 @@ SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 HANDOFFKEEP="$ROOT/tests/fixtures/handoffkeep"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 TMP="$(mktemp -d)"
+# CI pins Python 3.14, but a desktop python3 may predate tomllib (3.11+). The
+# parsed-mode cases below need a TOML parser; the parser-absent header-only
+# fallback is covered explicitly by the NO_TOML sitecustomize fixture further
+# down. Pin python3 to a tomllib-capable interpreter, or fail loudly.
+PYBIN="$TMP/python-bin"
+mkdir -p "$PYBIN"
+PINNED_PY=""
+for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+  p="$(command -v "$candidate" 2>/dev/null || true)"
+  [[ -n "$p" ]] || continue
+  if "$p" -c 'import tomllib' 2>/dev/null; then PINNED_PY="$p"; break; fi
+done
+[[ -n "$PINNED_PY" ]] || { echo "FAIL codex-project-trust: no python3 with tomllib (3.11+) on PATH" >&2; exit 1; }
+ln -s "$PINNED_PY" "$PYBIN/python3"
+export PATH="$PYBIN:$PATH"
 # shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
 export TW_TMP="$TMP"
