@@ -9615,9 +9615,26 @@ mock_mcp_cleanup() {
 refuse_barred_model_id() {
   local model_id="${1:-}" profile="${2:-$MODEL}"
   case "$model_id" in
-    gpt-5.6-terra|gpt-5.6-terra-*)
+    # The bar is on the model, not the spelling: any resolved model id carrying
+    # a -terra segment refuses, so a future alias or catalog row serving a new
+    # terra id (e.g. gpt-9.9-terra) cannot slip past the gpt-5.6-terra literal.
+    terra|*-terra|*-terra-*)
       die "profile $profile refused: $model_id is barred, operator 2026-10-12 noterra; use codex-sol or codex-luna" ;;
   esac
+}
+
+# Every channel a resolved model id can ride into the launcher argv must face
+# the same bar: codex/kiro put it in PROFILE_MODEL, grok in PROFILE_MODEL_ARG,
+# and apply_catalog can write it straight into ARGS as --model <id> (fable).
+refuse_barred_launcher_model() {
+  local i
+  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"
+  refuse_barred_model_id "$PROFILE_MODEL_ARG" "$MODEL"
+  for ((i = 0; i < ${#ARGS[@]} - 1; i++)); do
+    case "${ARGS[$i]}" in
+      -m|--model) refuse_barred_model_id "${ARGS[$((i + 1))]}" "$MODEL" ;;
+    esac
+  done
 }
 
 refuse_known_terra_spelling() {
@@ -9790,7 +9807,7 @@ spawn_cmd() {
   resolve_profile
   # Refuse by the resolved launcher model id, not by the spelling list. Keep
   # this before gate work, quota/arbiter admission, worktree or pane creation.
-  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"
+  refuse_barred_launcher_model
   configure_landing_check "$PROFILE_KIND"
   LANE_ENV=()
   if [[ -n "$LANE" ]]; then
