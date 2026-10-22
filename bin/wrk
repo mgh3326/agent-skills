@@ -6045,6 +6045,46 @@ for events in sys.argv[1:]:
 PY
 }
 
+# job_watch_current EVENTS PANE — exit 0 when PANE is the job's current watch:
+# the newest job.spawned names it AND no job.claim, job.claimed or job.reclaim
+# follows that spawn. A reclaim that lands before its own job.spawned receipt
+# — a respawn still in flight, new record already leased — keeps an older
+# watcher superseded even while the scan's newest spawned pane still equals
+# the pane it watches. job.reprompted deliberately does not count: it reuses
+# the same pane.
+job_watch_current() {
+  wrk_py - "$1" "$2" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+
+events, pane = sys.argv[1:]
+CLAIM = {"job.claim", "job.claimed", "job.reclaim"}
+last_claim = last_spawn = -1
+spawn_pane = ""
+for index, (name, doc, _mtime) in enumerate(wrk_events_ordered(events)):
+    if doc is None:
+        continue
+    payload = doc.get("payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    kind = doc.get("kind") or doc.get("type") or doc.get("event") or ""
+    if kind == "job.spawned":
+        last_spawn = index
+        candidate = payload.get("pane_id") or doc.get("pane_id")
+        if isinstance(candidate, str) and candidate:
+            spawn_pane = candidate
+    elif kind in CLAIM:
+        last_claim = index
+# Current when the newest spawn names this pane and no claim follows it, or
+# when the stream carries neither (a manual sentinel on an unclaimed job —
+# nothing proves another round exists). A claim newer than the newest spawn
+# is an in-flight respawn: superseded even when the panes still match.
+current = (last_spawn != -1 and spawn_pane == pane and last_claim < last_spawn) or \
+          (last_spawn == -1 and last_claim == -1)
+sys.exit(0 if current else 1)
+PY
+}
+
 # job_end_record JOB OWNER OUTCOME REASON SOURCE — append the flat job.revoked
 # end declaration. The hub ends a job only on job.completed/job.revoked, so a
 # job whose newest terminal is joined or lost still counts "active" until this
@@ -6196,14 +6236,34 @@ sentinel_pid_matches() {
 # prove this job's sentinel. Same argv shape as sentinel_pid_matches; the
 # pane the process watches is evidence, not the job's newest job.spawned.
 sentinel_argv_pane() {
-  local pid="$1" job="$2"
+  local pid="$1" job="$2" owner="${3:-}"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 0
-  ps -p "$pid" -o args= 2>/dev/null | awk -v job="$job" '
+  ps -p "$pid" -o args= 2>/dev/null | awk -v job="$job" -v owner="$owner" '
     function is_shell(tok) { sub(/^.*\//, "", tok); return tok ~ /^(sh|bash|zsh|dash|ksh)$/ }
+    function paneish(tok) { return tok ~ /^[A-Za-z0-9_.-]+:[A-Za-z0-9_.-]+$/ }
     {
       for (i = 1; i <= NF; i++)
         if ($i ~ /(^|\/)wrk$/ && $(i + 1) == "sentinel" && $(i + 2) == job &&
-            NF >= i + 5 && (i == 1 || (i == 2 && is_shell($1)))) { print $(i + 5); exit }
+            NF >= i + 5 && (i == 1 || (i == 2 && is_shell($1)))) {
+          # The owner may itself contain spaces; when the caller knows the
+          # expected owner string, match its word count so the pane offset
+          # stays exact. No match, or a non-pane token at that offset, means
+          # the argv layout cannot be trusted — print nothing so the caller
+          # falls back to the scan newest spawned pane.
+          w = 1
+          if (owner != "" && owner != "-") {
+            w = 0
+            for (k = 1; k <= 4 && i + 2 + k <= NF; k++) {
+              joined = $(i + 3)
+              for (m = i + 4; m < i + 3 + k; m++) joined = joined " " $m
+              if (joined == owner) { w = k; break }
+            }
+            if (w == 0) exit
+          }
+          pane = $(i + 4 + w)
+          if (paneish(pane)) { print pane; exit }
+          exit
+        }
     }'
 }
 
@@ -6580,14 +6640,13 @@ PY
       # terminal, so declare the end (newest-revive wins, so a respawned job
       # is left alone) before the sentinel leaves.
       # hk1798: a revive without a work-terminal — a released-record reclaim
-      # or a --job-dup-ok respawn — never trips the revive check, but its
-      # newest job.spawned still names the live round's pane. A watcher
-      # parked on an older pane is superseded: declaring the end here would
-      # release that live round's records, so it leaves quietly instead.
-      local newest_pane=""
-      newest_pane="$(job_events_scan "$jobdir/events" 2>/dev/null | awk -F'\t' '{print $10; exit}')"
-      if [[ -n "$newest_pane" && "$newest_pane" != - && "$newest_pane" != "$pane" ]]; then # hk1798-lost-grace-superseded
-        sentinel_log "$logfile" "$token" "$transient" "superseded" "newest-pane=$newest_pane"
+      # or a --job-dup-ok respawn — never trips the revive check, and a
+      # reclaim still in flight has no job.spawned at all yet. job_watch_current
+      # answers whether this watcher's pane is the live round's; when it is
+      # not, declaring the end would release that round's records, so the
+      # stale sentinel leaves quietly instead.
+      if ! job_watch_current "$jobdir/events" "$pane"; then # hk1798-lost-grace-superseded
+        sentinel_log "$logfile" "$token" "$transient" "superseded" "watched-pane=$pane"
         sentinel_self_exit "$job" 0
       fi
       local end_out=""
@@ -10867,8 +10926,12 @@ prune_sentinel_row() {
   # j_pane is the job's NEWEST spawn, which a terminal-less revive moves past
   # a stale watcher. Probe the watched pane, not the job's.
   local pane="${argv_pane:-}"
+  # A space inside the owner lane shifts the space-joined argv columns; a
+  # non-pane token is never evidence — drop it and re-derive from the pid's
+  # argv with the known owner before trusting the scan's newest pane.
+  [[ -z "$pane" || "$pane" == *:* ]] || pane=""
   if [[ -z "$pane" && "$live" -eq 1 ]]; then
-    pane="$(sentinel_argv_pane "$pid" "$job")"
+    pane="$(sentinel_argv_pane "$pid" "$job" "$owner")"
   fi
   [[ -n "$pane" ]] || pane="$j_pane"
   local probe pclass ptoken
@@ -10883,7 +10946,7 @@ prune_sentinel_row() {
       PRUNE_ORPHANS=$(( PRUNE_ORPHANS + 1 ))
       echo "sentinel job=$job pid=$pid age=${age}s pane=$pane orphan=yes reason=pane-gone($ptoken)"
       if [[ "$PRUNE_APPLY" -eq 1 ]]; then
-        if [[ -n "$j_pane" && "$j_pane" != - && "$pane" != "$j_pane" ]]; then # hk1798-pane-gone-superseded
+        if ! job_watch_current "$PRUNE_ROOT/$job/events" "$pane"; then # hk1798-pane-gone-superseded
           # hk1798: the watched pane is not the job's newest job.spawned pane
           # — a terminal-less revive superseded this sentinel, so ending or
           # releasing here would hit the live round's records.

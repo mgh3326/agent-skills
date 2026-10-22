@@ -171,7 +171,7 @@ start_sentinel() {
     WRK_COMPLETION_INTERVAL_S="${SENT_INTERVAL:-3600}" \
     WRK_SENTINEL_TRANSIENT_MAX="${TRANSIENT_MAX:-10}" \
     WRK_SENTINEL_LOST_GRACE="${LOST_GRACE:-1800}" \
-    "$WRK" sentinel "$job" lane-a lbl "$pane" "$report" >/dev/null 2>&1 &
+    "$WRK" sentinel "$job" "${SENT_OWNER:-lane-a}" lbl "$pane" "$report" >/dev/null 2>&1 &
   SENTINEL_PID=$!
   own "$SENTINEL_PID"
   mkdir -p "$INBOX/$job"
@@ -2399,6 +2399,104 @@ case_revive_noterminal_lostgrace_superseded ||
   fail "QR17: the superseded sentinel must exit without end or release"
 echo "PASS qr17 lost-grace-superseded-preserves-record"
 
+# The in-flight respawn window (round-3 CE8): the reclaim and the fresh
+# quota record have landed but the new job.spawned receipt has not — the
+# scan's newest spawned pane is still the stale watcher's own pane, so only
+# the claim-after-spawn half of job_watch_current can catch it. Shared by
+# QR18 (prune) and QR19 (lost grace).
+revive_inflight_setup() {
+  local job="$1"
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"pane_id\":\"w:p0\",\"tab_id\":\"w:t0\"}" >/dev/null ||
+    return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.lost \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"reason\":\"agent_not_found\"}" >/dev/null ||
+    return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease "$job" || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+}
+
+case_revive_inflight_prune_superseded() {
+  reset_case mut-isfp || return 3
+  revive_inflight_setup mut-isfp || return 3
+  REPORT="$TMP/mut-isfp-report.md"; printf 'x\n' >"$REPORT"
+  start_sentinel mut-isfp w:p0 "$REPORT"
+  sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
+  local seq="$TMP/mut-isfp.seq"; printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply --job mut-isfp >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows mut-isfp)" == 1 ]] || return 1
+  event_count_is "$INBOX/mut-isfp/events" job.revoked 0 || return 1
+  [[ "$(release_events mut-isfp)" == 1 ]] || return 1
+  wait_until 8 pid_gone "$SENTINEL_PID" || return 1
+}
+
+case_revive_inflight_lostgrace_superseded() {
+  reset_case mut-isfg || return 3
+  arb claim --job mut-isfg --lane lane-a --agent-label lbl-mut-isfg --t T1 >/dev/null || return 3
+  arb event --job mut-isfg --kind job.spawned \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl-mut-isfg","pane_id":"w:p0","tab_id":"w:t0"}' >/dev/null ||
+    return 3
+  arb_lease mut-isfg || return 3
+  local seq="$TMP/mut-isfg.seq"; printf 'not-found\n' >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=5 start_sentinel mut-isfg w:p0 "$TMP/mut-isfg-report.md" "$seq"
+  wait_until 15 event_count_is "$INBOX/mut-isfg/events" job.lost 1 || return 3
+  arb release --job mut-isfg --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job mut-isfg --lane lane-a --agent-label lbl-mut-isfg --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease mut-isfg || return 3
+  [[ "$(quota_rows mut-isfg)" == 1 ]] || return 3
+  wait_until 15 pid_gone "$SENTINEL_PID" || return 1
+  event_count_is "$INBOX/mut-isfg/events" job.revoked 0 || return 1
+  [[ "$(quota_rows mut-isfg)" == 1 ]] || return 1
+  [[ "$(release_events mut-isfg)" == 1 ]] || return 1
+  grep -q 'superseded' "$INBOX/mut-isfg/completion-sentinel.log" || return 1
+}
+
+# QR18 — the in-flight respawn window through prune: a stale sentinel whose
+# watched pane still equals the newest spawn is superseded, not terminal.
+echo "== QR18: prune supersedes a stale sentinel during an in-flight respawn =="
+case_revive_inflight_prune_superseded ||
+  fail "QR18: prune must supersede the stale sentinel during the respawn window"
+echo "PASS qr18 pane-gone-prune-superseded-inflight"
+
+# QR19 — the same window through the sentinel's own lost grace.
+echo "== QR19: lost grace during an in-flight respawn ends nothing =="
+case_revive_inflight_lostgrace_superseded ||
+  fail "QR19: the superseded sentinel must exit during the respawn window"
+echo "PASS qr19 lost-grace-superseded-inflight"
+
+# QR20 — an owner lane containing a space must not shift the argv pane
+# parse (round-3 T3): a live job's sentinel stays protected, never stopped.
+echo "== QR20: a space in the owner lane does not stop a live sentinel =="
+reset_case qr20
+arb claim --job qr20 --lane 'lane a' --agent-label lbl-qr20 --t T1 >/dev/null
+arb event --job qr20 --kind job.spawned \
+  --payload-json '{"owner_lane":"lane a","label":"lbl-qr20","pane_id":"w:p1","tab_id":"w:t0"}' >/dev/null
+arb_lease qr20
+REPORT="$TMP/qr20-report.md"; printf 'x\n' >"$REPORT"
+SENT_OWNER='lane a' start_sentinel qr20 w:p1 "$REPORT"
+sentinel_mid_sleep "$SENTINEL_PID" >/dev/null ||
+  fail "QR20: sentinel must reach its interval sleep"
+prune_run --apply --job qr20 >"$TMP/qr20-prune.out" 2>&1 ||
+  fail "QR20: prune --apply must succeed"
+kill -0 "$SENTINEL_PID" 2>/dev/null ||
+  { cat "$TMP/qr20-prune.out"; fail "QR20: a live job's sentinel must not be stopped"; }
+grep -q 'protected' "$TMP/qr20-prune.out" ||
+  { cat "$TMP/qr20-prune.out"; fail "QR20: the verdict must stay protected"; }
+event_count_is "$INBOX/qr20/events" job.revoked 0 ||
+  fail "QR20: a live job must never be ended"
+[[ "$(quota_rows qr20)" == 1 ]] ||
+  fail "QR20: a live job's record must stay leased"
+recovery_stop
+echo "PASS qr20 space-in-owner-sentinel-protected"
+
 # ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants: sed'd copies of bin/wrk (path ends in /wrk —
 # H02 — so every mutant sentinel is judged by the same argv identity rule).
@@ -3617,5 +3715,19 @@ mkmut_span r13-no-lostgrace-superseded \
   'hk1798-lost-grace-superseded' \
   '        if false; then # removed hk1798 lost-grace superseded gate'
 expect_mut_red "R13 lost-grace-superseded-gate" case_revive_noterminal_lostgrace_superseded
+
+# R14: revert the prune gate to comparing the watched pane with the newest
+# job.spawned pane only — the in-flight reclaim slips past and the release
+# lands, so QR18's case must still go RED.
+mkmut_span r14-pane-gone-oldcheck \
+  'hk1798-pane-gone-superseded' \
+  '        if [[ "$(job_events_scan "$PRUNE_ROOT/$job/events" 2>/dev/null | awk -F'"'"'\\t'"'"' '"'"'{print $10; exit}'"'"')" != "$pane" ]]; then # reverted hk1798-pane-gone-superseded'
+expect_mut_red "R14 pane-gone-revert-old-check" case_revive_inflight_prune_superseded
+
+# R15: the same revert on the sentinel's lost-grace gate.
+mkmut_span r15-lostgrace-oldcheck \
+  'hk1798-lost-grace-superseded' \
+  '        if [[ "$(job_events_scan "$jobdir/events" 2>/dev/null | awk -F'"'"'\\t'"'"' '"'"'{print $10; exit}'"'"')" != "$pane" ]]; then # reverted hk1798-lost-grace-superseded'
+expect_mut_red "R15 lost-grace-revert-old-check" case_revive_inflight_lostgrace_superseded
 
 echo "PASS test-wrk-job-end: all cases"
