@@ -10220,7 +10220,8 @@ builder_sol_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sol --rol
 grep -q 'model=builder-sol' <<<"$builder_sol_out"
 grep -q -- '-m gpt-6.1-sol' "$TMP/herdr.log" ||
   fail "builder-sol must launch gpt-6.1-sol (#1026): $(cat "$TMP/herdr.log")"
-# 2026-09-26 (decision 4088 B): a builder seat never takes a max rung —
+# 2026-09-26 (decision 4088 B): builder-sol defaults to the high rung (the
+# no-max seat refusal was repealed by hk 1863/hk 1864; the default stays high) —
 # builder-sol runs codex-sol at effort high and consults the catalog at high.
 grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
   fail "builder-sol must launch codex-sol at effort high: $(cat "$TMP/herdr.log")"

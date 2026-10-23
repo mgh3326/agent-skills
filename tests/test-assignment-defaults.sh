@@ -173,7 +173,7 @@ FILE_FORBIDDEN = [
 # never takes a max rung or that the max spellings are closed.
 WRK_FORBIDDEN = [
     ("wrk-max-seat-closed",
-     r"a builder seat never takes a max rung|builder seats never take a max rung|max-rung E6 spellings\s+\(builder-sonnet-max[^)]*\) are closed"),
+     r"a builder seat never takes a max rung|builder seats never take a max rung|max-rung E6 spellings\s+\(builder-sonnet-max[^)]*\) are closed|no-max rule[^\n]{0,80}?named exception|seat rule's only named exception|inert for builders since the seat rule|seat-rule exemption in resolve_profile"),
 ]
 
 # #748 (post-#740 codex tester finding): on an explicit --effort rung the

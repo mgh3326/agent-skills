@@ -572,8 +572,8 @@ at effort high (was max before 2026-09-26; the no-max builder-seat refusal of
 operator decision 2026-09-26 was removed by hk 1863, the default stays high).
 builder-sonnet (#921, operator report 2026-09-29) = the Sonnet 5.5 experiment seat:
 Claude Sonnet via --model sonnet + --dangerously-skip-permissions (the builder-opus
-argv shape), --effort high|xhigh|max, default xhigh. Its explicit max rung is the
-seat rule's only named exception; builder-sonnet records launch_profile
+argv shape), --effort high|xhigh|max, default xhigh. Its explicit max rung was the
+seat rule's named exception until hk 1863 removed the no-max rule; builder-sonnet records launch_profile
 sonnet@<effort> so the E1/E2 reps attribute to the gated catalog rung.
 codex-astra = gpt-6-astra supports director/architect/operator-requested counsel
 (hk:doc decision/2026-09-21/astra-allowed-purposes-approved). codex-astra xhigh/fable
@@ -648,8 +648,9 @@ that rung's row, and the marker (forwarded through the environment) is what
 opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
 
 kimi-k3@max, grok-hi@xhigh; #737 adds grok-hi@low, grok-hi@medium and
-codex-sol@medium). The @max arms here are inert for builders since the
-seat rule fires first; they still describe worker-side measurement.
+codex-sol@medium). The @max arms apply to builders too since hk 1863 removed
+the no-max seat refusal (they need their exact marker) and to worker-side
+measurement.
 Rungs the gate marks escalation (sonnet@xhigh) are shown with that tag by
 the gate — on an explicit --effort rung it still judges quota rules only,
 so no --operator-request REF is enforced there (scopefuel #716). Which
@@ -10005,7 +10006,7 @@ spawn_cmd() {
       devin-argon|devin-argon-medium|devin-argon-low)
         die "--role builder rejects '$MODEL': the devin Argon trial spellings are worker/tester-only — phase 1 is spawn plumbing, no builder seat (hk 1620, operator decision 2026-10-18)" ;;
       builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings resolve but are refused by the builder-seat no-max rule, operator decision 2026-09-26 — builder-sonnet's explicit max is the named exception, 2026-09-29)" ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23); ultra stays refused)" ;;
     esac
     case "$MODEL" in
       builder-opus|captain-opus)
@@ -10019,8 +10020,8 @@ spawn_cmd() {
         [[ -z "$EFFORT" || "$EFFORT" == xhigh ]] || die "builder-luna requires effort xhigh (#594 E3 sample profile)"
         ;;
       # #921: the Sonnet 5.5 experiment seat takes a closed effort set —
-      # high|xhigh|max (default xhigh). max is admitted for this spelling only
-      # (seat-rule exemption in resolve_profile); low/medium/ultra die here.
+      # high|xhigh|max (default xhigh). low/medium/ultra die here (max is no
+      # longer special to this spelling since hk 1863).
       builder-sonnet)
         case "${EFFORT:-xhigh}" in
           high|xhigh|max) ;;
