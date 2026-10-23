@@ -166,6 +166,10 @@ write_verdict_file() { # path verdict head [body]
   printf '%s\nVERDICT: %s @%s\n' "$body" "$verdict" "$head" >"$path"
 }
 
+write_verdict_first() { # path verdict head — the VERDICT line is line 1
+  printf 'VERDICT: %s @%s\n' "$2" "$3" >"$1"
+}
+
 cat >"$HANDOFFKEEP_BIN" <<'EOF'
 #!/bin/sh
 if [ "$1" = "doc" ] && [ "$2" = "get" ] && [ -n "${3:-}" ] && [ -f "$HK_DOC_DIR/$3" ]; then
@@ -373,16 +377,30 @@ echo "PASS c-waiver-skips-delegate"
 claim_job c-unmatched
 seed_round c-unmatched
 unmatched="$ARBITER_INBOX_ROOT/c-unmatched/stray.md"
-write_verdict_file "$unmatched" BLOCKER "$H4" 'stray verdict'
+write_verdict_first "$unmatched" BLOCKER "$H4"
 unmatched_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$unmatched")"
 run_cmd "$WRK" joined c-unmatched --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
 assert_refused "wrk: joined: unmatched tester verdict file $unmatched_abs"
 [[ "$(kind_count c-unmatched job.joined)" -eq 0 ]] || fail "unmatched verdict file must not write job.joined"
 echo "PASS c-unmatched-file-refused"
 
+# A brief or report that only mentions a VERDICT line later is not a verdict file.
+claim_job c-later-line
+seed_round c-later-line
+later="$ARBITER_INBOX_ROOT/c-later-line/report.md"
+write_verdict_file "$later" PASS "$H1" 'builder report mentions a verdict later'
+run_cmd "$WRK" joined c-later-line --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+assert_rc 0
+grep -q "OK job=c-later-line " "$TMP/run.out" || fail "later-line join stdout: $(cat "$TMP/run.out")"
+[[ "$(kind_count c-later-line job.joined)" -eq 1 ]] || fail "a later VERDICT line must not block the join"
+if grep -q 'unmatched tester verdict file' "$TMP/run.err"; then
+  fail "a later VERDICT line was treated as a verdict file: $(cat "$TMP/run.err")"
+fi
+echo "PASS c-later-line-verdict-ignored"
+
 claim_job c-both
 both="$ARBITER_INBOX_ROOT/c-both/stray.md"
-write_verdict_file "$both" BLOCKER "$H4" 'both stray'
+write_verdict_first "$both" BLOCKER "$H4"
 both_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$both")"
 run_cmd "$WRK" joined c-both --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
 assert_refused "wrk: joined: job c-both has zero non-voided recorded rounds; unmatched tester verdict file $both_abs"
@@ -406,7 +424,7 @@ echo "PASS c-matched-content-sha-allowed"
 
 claim_job c-done-both
 done_stray="$ARBITER_INBOX_ROOT/c-done-both/stray.md"
-write_verdict_file "$done_stray" PASS "$H1" 'done stray'
+write_verdict_first "$done_stray" PASS "$H1"
 done_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$done_stray")"
 run_cmd "$WRK" 'done' c-done-both --report "$REPORT"
 assert_rc 0
@@ -442,10 +460,10 @@ claim_job audit-ended
 write_event "$AUDIT/audit-ended/events/00002-job.revoked.json" <<'EOF'
 {"kind":"job.revoked","job_id":"audit-ended","created_at":"2026-10-23T03:00:00Z"}
 EOF
-write_verdict_file "$AUDIT/audit-ended/ended.md" PASS "$H1" 'ended stray'
+write_verdict_first "$AUDIT/audit-ended/ended.md" PASS "$H1"
 claim_job audit-open
 seed_round audit-open
-write_verdict_file "$AUDIT/audit-open/open.md" BLOCKER "$H2" 'open stray'
+write_verdict_first "$AUDIT/audit-open/open.md" BLOCKER "$H2"
 claim_job audit-matched
 seed_round audit-matched
 write_verdict_file "$AUDIT/audit-matched/ok.md" PASS "$H3" 'recorded bytes'
@@ -766,6 +784,7 @@ for anchor in (
     "if digest in digests:  # hk1449-content-sha",
     '[[ -z "$joined_end" ]] || die "joined: refused after end record $joined_end"',
     "and r.get(\"round\") in voided))  # hk1449-nonvoid-rounds",
+    "if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -853,5 +872,21 @@ run_cmd "$TMP/voided-wrk" joined mut-void-red --pr https://example.invalid/pr/1 
 [[ "$RUN_RC" -eq 0 ]] || fail "void-counting mutant must allow the join, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
 [[ "$(kind_count mut-void-red job.joined)" -eq 1 ]] || fail "void-counting mutant did not write job.joined"
 echo "PASS mutant-zero-rounds-counts-voided-goes-red"
+
+printf '%s\n' 'if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line => if not any(wrk_verdict_line.match(line) for line in lines):  # hk1449-verdict-first-line' >"$TMP/spec-anyline"
+mutant anyline "$TMP/spec-anyline"
+claim_job mut-anyline
+seed_round mut-anyline
+write_verdict_file "$ARBITER_INBOX_ROOT/mut-anyline/report.md" PASS "$H2" 'later line only'
+run_cmd "$WRK" joined mut-anyline --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -eq 0 ]] || fail "real wrk must ignore a VERDICT line after the first line"
+[[ "$(kind_count mut-anyline job.joined)" -eq 1 ]] || fail "real wrk did not join when the VERDICT line was not first"
+claim_job mut-anyline-red
+seed_round mut-anyline-red
+write_verdict_file "$ARBITER_INBOX_ROOT/mut-anyline-red/report.md" PASS "$H2" 'later line only'
+run_cmd "$TMP/anyline-wrk" joined mut-anyline-red --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -ne 0 ]] || fail "any-line mutant must refuse the later VERDICT line, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
+[[ "$(kind_count mut-anyline-red job.joined)" -eq 0 ]] || fail "any-line mutant wrote job.joined"
+echo "PASS mutant-any-line-match-goes-red"
 
 echo "PASS test-wrk-rounds"

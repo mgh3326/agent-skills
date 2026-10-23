@@ -202,8 +202,9 @@ joined_help() {
 Usage: wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
 
 Record job.joined for a builder job. The join is refused when the job has
-zero non-voided recorded rounds, or when the job directory holds a tester
-verdict file that no job.verdict matches by path or content sha256. Both
+zero non-voided recorded rounds, or when the job directory holds a regular
+file whose first line is a VERDICT line and no job.verdict matches that
+file by path or content sha256. A later line does not count. Both
 refusals are waived only by --rounds-waived REF, where REF is hk:doc/<key>
 or hk:task/<id>, and that ref is stored on the job.joined record. An end
 declaration newer than the newest revive is refused and cannot be waived.
@@ -5033,8 +5034,9 @@ wrk_refuse_ended() {
 }
 
 # Print zero-nonvoid-rounds, then unmatched<TAB>abspath lines. A tester
-# verdict file is a regular file directly in the job directory whose content
-# has a round-verdict VERDICT line. Symlinks and subdirectories are ignored.
+# verdict file is a regular file directly in the job directory whose first
+# line is a round-verdict VERDICT line. A later line does not count.
+# Symlinks and subdirectories are ignored.
 # A job.verdict matches by absolute path or by content sha256.
 wrk_join_blocks() {
   local job="$1"
@@ -5076,7 +5078,8 @@ for name in names:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         continue
-    if not any(wrk_verdict_line.match(line) for line in text.splitlines()):
+    lines = text.splitlines()
+    if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line
         continue
     digest = hashlib.sha256(data).hexdigest()
     absolute = os.path.abspath(path)
