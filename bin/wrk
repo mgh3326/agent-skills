@@ -5915,8 +5915,10 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round open failed to inspect $job"
   case "$outcome" in
-    ENDED$'\t'*)
-      die "round open: refused after end record ${outcome#ENDED$'\t'}"
+    # bash 3.2 misparses $'\t' inside a case pattern. Match the prefix and
+    # drop the one-character separator so the filename still reaches the die.
+    ENDED*)
+      die "round open: refused after end record ${outcome#ENDED?}"
       ;;
     OPENED\ round=*)
       echo "OK job=$job ${outcome#OPENED } cap=$ROUND_CAP_DEFAULT head=$head"
@@ -6031,8 +6033,9 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round void failed to inspect $job"
   case "$outcome" in
-    ENDED$'\t'*)
-      die "round void: refused after end record ${outcome#ENDED$'\t'}"
+    # Same bash 3.2 case-pattern constraint as round open.
+    ENDED*)
+      die "round void: refused after end record ${outcome#ENDED?}"
       ;;
     VOIDED\ round=*) echo "OK job=$job $outcome ref=$ref" ;;
     NO_ROUND) die "round void: round $round_number does not exist for job $job" ;;
@@ -6188,7 +6191,9 @@ PY
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
     AMBIGUOUS)
       die "round verdict --file has more than one VERDICT line: $file" ;;
-    ENDED$'\t'*|DUP_PATH$'\t'*|DUP_CONTENT$'\t'*|DUP_HEAD$'\t'*)
+    # Same bash 3.2 case-pattern constraint as round open. The refusal
+    # helper still splits the real tab.
+    ENDED*|DUP_PATH*|DUP_CONTENT*|DUP_HEAD*)
       wrk_verdict_refusal "$outcome" ;;
     RECORDED*)
       local round_no="" verdict_v="" head_v="" used_v="" over_v="" status question tok
