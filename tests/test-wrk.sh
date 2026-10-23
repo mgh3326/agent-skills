@@ -100,7 +100,7 @@ try:
     state = json.load(open(path, encoding="utf-8"))
 except (OSError, ValueError):
     state = {"tasks": {}}
-for i in range(768001, 768800):
+for i in range(768001, 769200):
     state["tasks"][str(i)] = {
         "id": i, "lane": "", "title": "spawn-base pool", "kind": "implement",
         "state": "backlog", "priority": 0, "refs": {}, "claimed_by": "",
@@ -135,11 +135,11 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # command-substitution subshells most spawn callers use.
 mint_task() {
   local id=$(( $(cat "$TMP/mint-seq" 2>/dev/null || echo 768000) + 1 ))
-  # The fixture pool above pre-mints 768001-768799 only; an id past it mints
+  # The fixture pool above pre-mints 768001-769199 only; an id past it mints
   # a task that does not exist and the failure surfaces as a swallowed rc 2
   # in a later spawn, far from the real cause — stop loudly instead (#1010/N7).
-  (( id <= 768799 )) ||
-    fail "mint_task: task pool exhausted (id $id exceeds the pre-minted 768001-768799 range)"
+  (( id <= 769199 )) ||
+    fail "mint_task: task pool exhausted (id $id exceeds the pre-minted 768001-769199 range)"
   printf '%s\n' "$id" >"$TMP/mint-seq"
   printf '%s\n' "$id"
 }
@@ -254,7 +254,8 @@ for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh buil
   builder-sol-high builder-sol-max builder-sol-medium builder-luna-max \
   builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
+  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
 done
 grep -qx 'captain-opus' <<<"$profiles_out"
@@ -4720,10 +4721,10 @@ PY
   echo "PASS 1010-lanes N5: parse failure warns could-not-be-parsed, stderr stays silent"
 
   # N7 — mint_task stops loudly at the end of the pre-minted pool
-  # (768001-768799) instead of minting an id the fixture never created, which
+  # (768001-769199) instead of minting an id the fixture never created, which
   # surfaced as a swallowed rc 2 in a later spawn.
   lanes_mint_saved="$(cat "$TMP/mint-seq" 2>/dev/null || echo 768000)"
-  printf '768799\n' >"$TMP/mint-seq"
+  printf '769199\n' >"$TMP/mint-seq"
   set +e
   lanes_mint_out="$(mint_task 2>&1)"
   lanes_mint_rc=$?
@@ -5008,7 +5009,7 @@ PY
   # appear in stderr. GREEN restores the value-free malformed warning.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-1037-noidcheck \
-    '      if [[ ! "$lanes_machine" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then' \
+    "      if ! ascii_re \"\$lanes_machine\" '^[A-Za-z0-9._-]{1,64}\$'; then" \
     '      if false; then'
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1037-noidcheck" \
     LANES_CFG_OVERRIDE="$LANES_CFG_INLINE" HERDR_SESSION=default \
@@ -10121,7 +10122,8 @@ for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captai
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
   builder-luna-max builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
+  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -10148,7 +10150,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -10218,7 +10220,8 @@ builder_sol_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sol --rol
 grep -q 'model=builder-sol' <<<"$builder_sol_out"
 grep -q -- '-m gpt-6.1-sol' "$TMP/herdr.log" ||
   fail "builder-sol must launch gpt-6.1-sol (#1026): $(cat "$TMP/herdr.log")"
-# 2026-09-26 (decision 4088 B): a builder seat never takes a max rung —
+# 2026-09-26 (decision 4088 B): builder-sol defaults to the high rung (the
+# no-max seat refusal was repealed by hk 1863/hk 1864; the default stays high) —
 # builder-sol runs codex-sol at effort high and consults the catalog at high.
 grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
   fail "builder-sol must launch codex-sol at effort high: $(cat "$TMP/herdr.log")"
@@ -10252,10 +10255,12 @@ sol61_case codex-sol max
 sol61_case codex-max max
 sol61_case builder-sol high --role builder --lane sol61-builder-lane --parent parent-lane
 sol61_case captain-sol high --role builder --lane sol61-captain-lane --parent parent-lane
-# The E6 builder rungs are switched spellings too (builder-sol-max is seat-closed
-# — its refusal is asserted in the #704 block below).
+# The E6 builder rungs are switched spellings too (builder-sol-max included
+# since hk 1864 opened the max builder seat).
 SCOPEFUEL_E6_ARM=codex-sol@high sol61_case builder-sol-high high --role builder --lane sol61-e6h-lane --parent parent-lane
+SCOPEFUEL_E6_ARM=codex-sol@max sol61_case builder-sol-max max --role builder --lane sol61-e6x-lane --parent parent-lane
 SCOPEFUEL_E6_ARM=codex-sol@medium sol61_case builder-sol-medium medium --role builder --lane sol61-e6m-lane --parent parent-lane
+SCOPEFUEL_E6_ARM=codex-sol@low sol61_case builder-sol-low low --role builder --lane sol61-e6l-lane --parent parent-lane
 echo "PASS 1026-AC1-switched-spellings-carry-gpt-6.1-sol"
 
 # AC2 — the rollback spellings pin the literal gpt-6-sol even though the fake
@@ -10496,7 +10501,8 @@ echo "PASS builder-luna E3 profile launches codex-luna argv at xhigh"
 # task #921 (operator report 2026-09-29, Sonnet 5.5 experiments E1/E2):
 # builder-sonnet is the non-rung Sonnet builder seat — the builder-opus argv
 # shape on the sonnet alias, a closed effort set (high|xhigh|max, default
-# xhigh), and the seat rule's only named max exception. It is NOT an E6 rung:
+# xhigh), and (until hk 1864 repealed the no-max seat rule) its only named max
+# exception. It is NOT an E6 rung:
 # no SCOPEFUEL_E6_ARM, no GATE_EFFORT_PIN — the gate sees bare `-m sonnet`
 # (the fixture refuses a sonnet@xhigh/sonnet@max rung gate, so forwarding the
 # effort would close the seat). The catalog consult pins the requested rung so
@@ -10550,7 +10556,7 @@ builder_sonnet_high_start="$(grep '^agent start ' "$TMP/herdr.log")"
   fail "builder-sonnet --effort high must carry the high rung in argv: $builder_sonnet_high_start"
 grep -q 'policy launch sonnet effort=high' "$TMP/launch.log" ||
   fail "builder-sonnet --effort high must pin the catalog consult to high: $(cat "$TMP/launch.log")"
-# --effort max: the seat rule's only named exception (E2). Admitted, argv and
+# --effort max: experiment E2 (no longer an exception since hk 1864). Admitted, argv and
 # record both carry max.
 : >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
 builder_sonnet_max_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sonnet \
@@ -10667,12 +10673,15 @@ mut_wrk "$MUT921/wrk-effortflag" \
 mut_wrk "$MUT921/wrk-launchname" \
   'elif [[ "$MODEL" == builder-sonnet ]]; then' \
   'elif [[ "$MODEL" == builder-sonnet-removed ]]; then'
-# 5. Seat exception scope: dropping the model pin opens max for every builder —
-#    builder-sol --effort max must still die.
+# 5. Seat rule: since hk 1864 the builder seat refuses ultra only (the
+#    builder-sonnet max exception is moot). Dropping the ultra arm opens ultra
+#    for every builder — builder-sol --effort ultra must still die.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
 mut_wrk "$MUT921/wrk-seat" \
-  '[[ "$MODEL" == builder-sonnet && "$seat_effort" == max ]]' \
-  '[[ "$seat_effort" == max ]]'
+  '    case "$seat_effort" in
+      ultra)' \
+  '    case "$seat_effort" in
+      never)'
 # 6. Catalog pin: without the ${EFFORT:-xhigh} pin the consult returns sonnet's
 #    ordinary high default and a bare spawn silently launches high.
 # shellcheck disable=SC2016 # the pattern is bin/wrk source text, not an expansion
@@ -10683,9 +10692,9 @@ expect_red model-swapped-to-opus sonnet_builder_probe "$MUT921/wrk-model" m1 '--
 expect_red effort-set-widened builder_refused_probe "$MUT921/wrk-effortset" builder-sonnet e1 --effort low
 expect_red effort-flag-dropped sonnet_builder_probe "$MUT921/wrk-effortflag" e2 '--model sonnet --dangerously-skip-permissions --effort xhigh'
 expect_red launch-name-literal sonnet_builder_record_probe "$MUT921/wrk-launchname" q1
-expect_red seat-exception-broadened builder_refused_probe "$MUT921/wrk-seat" builder-sol s1 --effort max
+expect_red seat-ultra-arm-dropped builder_refused_probe "$MUT921/wrk-seat" builder-sol s1 --effort ultra
 expect_red catalog-pin-dropped sonnet_builder_probe "$MUT921/wrk-catalogpin" c1 '--model sonnet --dangerously-skip-permissions --effort xhigh'
-echo "PASS 921 mutants assertion-red=6/6 (model map, effort set, effort flag, launch_profile, seat scope, catalog pin)"
+echo "PASS 921 mutants assertion-red=6/6 (model map, effort set, effort flag, launch_profile, seat ultra arm, catalog pin)"
 
 # ---------------------------------------------------------------------------
 # #1026 AC4 — assertion-RED mutants for the gpt-6.1-sol switch.
@@ -10869,43 +10878,52 @@ e6_builder_case builder-sonnet-medium sonnet     medium '--model sonnet --danger
 e6_builder_case builder-haiku-low    haiku      low    '--model haiku --dangerously-skip-permissions --effort low'
 e6_builder_case builder-luna-low     codex-luna low    '--yolo -m gpt-5.6-luna -c model_reasoning_effort=low'
 e6_builder_case builder-luna-medium  codex-luna medium '--yolo -m gpt-6-luna -c model_reasoning_effort=medium'
-echo "PASS 704+737+1796 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
+# hk 1863: the five hk 1786 borrow-down and promote-up spellings on the same
+# pin rule. builder-sol-low takes its model id from the codex-sol catalog row
+# (the fixture serves gpt-6.1-sol) and gates at codex-sol@low; the haiku and
+# sonnet spellings reuse the haiku and sonnet worker argv shape. builder-haiku-max
+# is admitted at max in the max-rung block below (hk 1864). sonnet@low has no
+# canon row in production — the fixture catalog answers it, so this case
+# proves wrk's wiring, not that the real gate admits the rung today.
+e6_builder_case builder-sol-low      codex-sol  low    '--yolo -m gpt-6.1-sol -c model_reasoning_effort=low'
+e6_builder_case builder-haiku-high   haiku      high   '--model haiku --dangerously-skip-permissions --effort high'
+e6_builder_case builder-haiku-xhigh  haiku      xhigh  '--model haiku --dangerously-skip-permissions --effort xhigh'
+e6_builder_case builder-sonnet-low   sonnet     low    '--model sonnet --dangerously-skip-permissions --effort low'
+# builder-sol-low must read its model id from the catalog row, never a launcher
+# literal: serve an id that exists nowhere in bin/wrk and assert the argv
+# carries it, and that the catalog consult asked for codex-sol at low.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
+sol_low_out="$(SCOPEFUEL_E6_ARM=codex-sol@low WRK_LAUNCH_LOG="$TMP/launch.log" \
+  WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-sol \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-sol-low --role builder --lane e6-sol-low-catalog-lane --parent parent-lane \
+  --job e6-sol-low-catalog --t T1 2>&1)" ||
+  fail "builder-sol-low with a catalog-served model id must be admitted: $sol_low_out"
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-9.9-sol -c model_reasoning_effort=low' ]] ||
+  fail "builder-sol-low must carry the catalog row's model id: $(cat "$TMP/herdr.log")"
+grep -q 'policy launch codex-sol effort=low' "$TMP/launch.log" ||
+  fail "builder-sol-low must consult the catalog for codex-sol at low: $(cat "$TMP/launch.log")"
+echo "PASS 704+737+1796+1863 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
-# 2026-09-26 (decision 4088 B): the four max-rung builder spellings are closed —
-# a builder seat never takes a max rung, so the seat rule fires ahead of the
-# E6 marker check and refuses even with the exact SCOPEFUEL_E6_ARM armed.
-for e6_max_model in builder-sonnet-max builder-sol-max builder-luna-max builder-kimi-max; do
-  case "$e6_max_model" in
-    builder-sonnet-max) e6_max_gate=sonnet ;;
-    builder-sol-max)    e6_max_gate=codex-sol ;;
-    builder-luna-max)   e6_max_gate=codex-luna ;;
-    builder-kimi-max)   e6_max_gate=kimi-k3 ;;
-  esac
-  set +e
-  e6_max_out="$(SCOPEFUEL_E6_ARM="$e6_max_gate@max" \
-    KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
-    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
-    spawn_base "$e6_max_model" --role builder --lane "$e6_max_model-lane" --parent parent-lane \
-    --job "e6-max-closed-$e6_max_model" --t T1 2>&1)"
-  e6_max_rc=$?
-  set -e
-  [[ "$e6_max_rc" -eq 2 ]] ||
-    fail "$e6_max_model with its exact marker must still die rc 2 (rc=$e6_max_rc): $e6_max_out"
-  grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
-    fail "$e6_max_model refusal must name the builder-seat rule: $e6_max_out"
-done
-# A non-rung spelling cannot sneak max onto a builder seat either: an explicit
-# --effort max on builder-sol (default high) dies on the same rule.
-set +e
+# hk 1864 (operator 2026-10-23): the no-max builder-seat refusal of the
+# 2026-09-26 decision 4088 B is repealed, so the five max-rung builder spellings
+# are admitted with their exact SCOPEFUEL_E6_ARM marker armed and launch at the
+# max rung (the kimi one through the max clone home).
+e6_builder_case builder-sonnet-max   sonnet     max    '--model sonnet --dangerously-skip-permissions --effort max'
+e6_builder_case builder-sol-max      codex-sol  max    '--yolo -m gpt-6.1-sol -c model_reasoning_effort=max'
+e6_builder_case builder-luna-max     codex-luna max    '--yolo -m gpt-6-luna -c model_reasoning_effort=max'
+e6_builder_case builder-kimi-max     kimi-k3    max    '--auto -m kimi-code/k3'
+e6_builder_case builder-haiku-max    haiku      max    '--model haiku --dangerously-skip-permissions --effort max'
+# A non-rung spelling takes an explicit max on a builder seat too:
+# --effort max on builder-sol (default high) is admitted and launches at max.
+: >"$TMP/herdr.log"
 e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-max-lane --parent parent-lane \
-  --effort max --job e6-builder-sol-effort-max --t T1 2>&1)"
-e6_max_rc=$?
-set -e
-[[ "$e6_max_rc" -eq 2 ]] ||
-  fail "builder-sol --effort max must die rc 2 (rc=$e6_max_rc): $e6_max_out"
-grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
-  fail "builder-sol --effort max refusal must name the builder-seat rule: $e6_max_out"
-# codex `ultra` is the max tier plus subagents — the seat rule refuses it too.
+  --effort max --job e6-builder-sol-effort-max --t T1 2>&1)" ||
+  fail "builder-sol --effort max must be admitted on a builder seat (hk 1864): $e6_max_out"
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-6.1-sol -c model_reasoning_effort=max' ]] ||
+  fail "builder-sol --effort max must launch at the max rung: $(cat "$TMP/herdr.log")"
+# codex `ultra` is the max tier plus subagents — hk 1864 opened max only, so
+# the seat rule still refuses ultra.
 set +e
 e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-ultra-lane --parent parent-lane \
   --effort ultra --job e6-builder-sol-effort-ultra --t T1 2>&1)"
@@ -10913,17 +10931,37 @@ e6_max_rc=$?
 set -e
 [[ "$e6_max_rc" -eq 2 ]] ||
   fail "builder-sol --effort ultra must die rc 2 (rc=$e6_max_rc): $e6_max_out"
-grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
+grep -q 'builder seats never take an ultra rung' <<<"$e6_max_out" ||
   fail "builder-sol --effort ultra refusal must name the builder-seat rule: $e6_max_out"
-echo "PASS 736 max-rung builder spellings closed by the builder-seat rule"
+# Mutant: restoring the repealed max refusal must fail the admitted-max probe.
+# The probe spawns builder-haiku-max with its exact marker; it must pass on the
+# real wrk and go RED (rc 1) on a copy whose seat rule refuses max again.
+builder_max_open_probe() {
+  local wrk="$1" tag="$2"
+  SCOPEFUEL_E6_ARM=haiku@max WRK="$wrk" \
+    ARBITER_INBOX_ROOT="$TMP/mut-inbox-$tag" XDG_DATA_HOME="$TMP/mut-xdg-$tag" \
+    spawn_base builder-haiku-max --role builder --lane "mutm-$tag-lane" \
+    --parent parent-lane --job "mutm-$tag" --t T1 >/dev/null 2>&1 || return 1
+}
+builder_max_open_probe "$WRK" real ||
+  fail "builder-haiku-max probe must be admitted on the real wrk"
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-max-refusal-restored" \
+  '    case "$seat_effort" in
+      ultra)' \
+  '    case "$seat_effort" in
+      max|ultra)'
+expect_red "max-refusal-restored" builder_max_open_probe "$TMP/wrk-max-refusal-restored" restored
+echo "PASS hk 1864 max-rung builder spellings admitted on the builder seat, ultra still refused, restored refusal goes RED"
 
-# #748: the unflagged kimi spellings admitted as builders (builder-kimi,
-# kimi-k3) leave EFFECTIVE_EFFORT empty — the seat rule reads the home's
-# [thinking] effort instead. A home pinned to max is refused on the same
-# seat rule; a home at high is admitted. builder-kimi-max in the loop above
-# is refused by the seat rule itself (exact marker armed AND a valid max
-# clone still refused), not merely by a missing marker.
+# #748 / hk 1864: the unflagged kimi spellings admitted as builders
+# (builder-kimi, kimi-k3) leave EFFECTIVE_EFFORT empty — the seat rule reads
+# the home's [thinking] effort instead. Since hk 1864 a home pinned to max is
+# admitted like any other rung (max is open on the builder seat); the seat rule
+# keeps refusing an ultra-effort home, asserted in the blocks below with
+# hand-built homes (bin/kimi-clone-home itself cannot mint an ultra clone).
 for e6_kimi_builder in builder-kimi kimi-k3; do
+  : >"$TMP/herdr.log"
   set +e
   e6_kmax_out="$(KIMI_CODE_HOME="$E6_KIMI_MAX_HOME" \
     ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
@@ -10931,10 +10969,10 @@ for e6_kimi_builder in builder-kimi kimi-k3; do
     --job "e6-khome-max-$e6_kimi_builder" --t T1 2>&1)"
   e6_kmax_rc=$?
   set -e
-  [[ "$e6_kmax_rc" -eq 2 ]] ||
-    fail "$e6_kimi_builder on a max-effort kimi home must die rc 2 (rc=$e6_kmax_rc): $e6_kmax_out"
-  grep -q 'builder seats never take a max rung' <<<"$e6_kmax_out" ||
-    fail "$e6_kimi_builder max-home refusal must name the builder-seat rule: $e6_kmax_out"
+  [[ "$e6_kmax_rc" -eq 0 ]] ||
+    fail "$e6_kimi_builder on a max-effort kimi home must be admitted (rc=$e6_kmax_rc): $e6_kmax_out"
+  [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
+    fail "$e6_kimi_builder on a max home must reuse the kimi-k3 argv verbatim: $(cat "$TMP/herdr.log")"
 done
 # A high-effort kimi home stays admitted — same argv as before, no --effort
 # anywhere (the CLI has no flag; the rung lives only in the clone config).
@@ -10951,7 +10989,7 @@ set -e
 e6_khigh_start="$(grep '^agent start ' "$TMP/herdr.log")"
 [[ "$e6_khigh_start" == *' -- --auto -m kimi-code/k3' ]] ||
   fail "builder-kimi on a high home must reuse the kimi-k3 argv verbatim: $e6_khigh_start"
-# The seat rule stays builder-scoped: the same max home on a worker spawn is
+# The seat rule stays builder-scoped: the max home on a worker spawn is
 # unaffected (worker max rungs are a separate reservation, not this rule).
 set +e
 e6_kworker_out="$(KIMI_CODE_HOME="$E6_KIMI_MAX_HOME" \
@@ -10961,13 +10999,13 @@ e6_kworker_rc=$?
 set -e
 [[ "$e6_kworker_rc" -eq 0 ]] ||
   fail "kimi-k3 worker on a max-effort home must stay admitted (rc=$e6_kworker_rc): $e6_kworker_out"
-echo "PASS 748 kimi builder spellings refuse a max-effort home on the seat rule"
+echo "PASS 748 kimi builder spellings admit a max-effort home (hk 1864)"
 
 # #748r2 (tester round 1): the seat read must resolve what Kimi Code actually
 # runs, not just a double-quoted [thinking] effort. Valid TOML literal
 # (single-quoted) strings, a missing [thinking] with the spawned model's
-# default_effort = "max", and an unsupported [thinking] value falling back to
-# a max default all resolve to max — each must die on the seat rule. Mutants
+# default_effort = "ultra", and an unsupported [thinking] value falling back to
+# an ultra default all resolve to ultra — each must die on the seat rule. Mutants
 # in test-assignment-defaults.sh pin the resolver itself.
 e6_khome() { # build a minimal kimi home: $1=dest, config.toml on stdin
   local dest="$1"
@@ -10977,30 +11015,30 @@ e6_khome() { # build a minimal kimi home: $1=dest, config.toml on stdin
   printf 'x\n' >"$dest/oauth/kimi-code"
   printf 'x\n' >"$dest/device_id"
 }
-e6_khome "$TMP/kimi-sq-max" <<'EOF'
+e6_khome "$TMP/kimi-sq-ultra" <<'EOF'
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
-effort = 'max'
+effort = 'ultra'
 EOF
-e6_khome "$TMP/kimi-default-max" <<'EOF'
+e6_khome "$TMP/kimi-default-ultra" <<'EOF'
 default_model = "kimi-code/k3"
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-fallback-max" <<'EOF'
+e6_khome "$TMP/kimi-fallback-ultra" <<'EOF'
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 [thinking]
 effort = "xhigh"
 EOF
-for e6_khome_case in kimi-sq-max kimi-default-max kimi-fallback-max; do
+for e6_khome_case in kimi-sq-ultra kimi-default-ultra kimi-fallback-ultra; do
   set +e
   e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
     ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
@@ -11009,17 +11047,17 @@ for e6_khome_case in kimi-sq-max kimi-default-max kimi-fallback-max; do
   e6_krc=$?
   set -e
   [[ "$e6_krc" -eq 2 ]] ||
-    fail "builder-kimi on a home resolving to max ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
-  grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+    fail "builder-kimi on a home resolving to ultra ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
+  grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
     fail "$e6_khome_case refusal must name the builder-seat rule: $e6_kout"
 done
-# The same fallback semantics admit when they resolve below max: a
+# The same fallback semantics admit when they resolve below ultra: a
 # single-quoted 'high' is a valid TOML rung, and an unsupported 'xhigh'
 # request falls back to the model's high default — both launch normally.
 e6_khome "$TMP/kimi-sq-high" <<'EOF'
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 effort = 'high'
@@ -11027,7 +11065,7 @@ EOF
 e6_khome "$TMP/kimi-fallback-high" <<'EOF'
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 effort = "xhigh"
@@ -11042,7 +11080,7 @@ for e6_khome_case in kimi-sq-high kimi-fallback-high; do
   e6_krc=$?
   set -e
   [[ "$e6_krc" -eq 0 ]] ||
-    fail "builder-kimi on a home resolving below max ($e6_khome_case) must be admitted (rc=$e6_krc): $e6_kout"
+    fail "builder-kimi on a home resolving below ultra ($e6_khome_case) must be admitted (rc=$e6_krc): $e6_kout"
   [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
     fail "$e6_khome_case must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
 done
@@ -11054,96 +11092,96 @@ echo "PASS 748r2 kimi seat rule resolves literal strings and model default_effor
 # equivalent spellings Kimi accepts; and KIMI_MODEL_THINKING_EFFORT overrides
 # the effort at runtime. [thinking].enabled=false resolves to off_effort.
 e6_khome "$TMP/kimi-dotted-thinking" <<'EOF'
-thinking.effort = "max"
+thinking.effort = "ultra"
 [models."kimi-code/k3"]
 provider = "x"
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 EOF
 e6_khome "$TMP/kimi-dotted-model" <<'EOF'
 models."kimi-code/k3".provider = "x"
-models."kimi-code/k3".support_efforts = [ "low", "high", "max" ]
-models."kimi-code/k3".default_effort = "max"
+models."kimi-code/k3".support_efforts = [ "low", "high", "ultra" ]
+models."kimi-code/k3".default_effort = "ultra"
 EOF
 e6_khome "$TMP/kimi-inline-models" <<'EOF'
-models = { "kimi-code/k3" = { support_efforts = [ "low", "high", "max" ], default_effort = "max" } }
+models = { "kimi-code/k3" = { support_efforts = [ "low", "high", "ultra" ], default_effort = "ultra" } }
 EOF
-e6_khome "$TMP/kimi-multiline-max" <<'EOF'
+e6_khome "$TMP/kimi-multiline-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
-effort = """max"""
+effort = """ultra"""
 EOF
 # The effort value below is the TOML escape m + ́x: the file literally
-# contains "m\u0061x", which a real TOML decode turns into "max".
-e6_khome "$TMP/kimi-escaped-max" <<'EOF'
+# contains "ultr\u0061", which a real TOML decode turns into "ultra".
+e6_khome "$TMP/kimi-escaped-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
-effort = "m\u0061x"
+effort = "ultr\u0061"
 EOF
-e6_khome "$TMP/kimi-indented-max" <<'EOF'
+e6_khome "$TMP/kimi-indented-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
   [thinking]
-  effort = "max"
+  effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-override-max" <<'EOF'
+e6_khome "$TMP/kimi-override-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [models."kimi-code/k3".overrides]
-default_effort = "max"
+default_effort = "ultra"
 EOF
 e6_khome "$TMP/kimi-comment-support" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ] # "xhigh" intentionally unsupported
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ] # "xhigh" intentionally unsupported
+default_effort = "ultra"
 [thinking]
 effort = "xhigh"
 EOF
-e6_khome "$TMP/kimi-off-effort-max" <<'EOF'
+e6_khome "$TMP/kimi-off-effort-ultra" <<'EOF'
 [models."kimi-code/k3"]
-off_effort = "max"
+off_effort = "ultra"
 [thinking]
 enabled = false
 effort = "high"
 EOF
 # always-thinking also arrives as a capabilities tag or a boolean field —
 # enabled=false does not switch the model off in either shape.
-e6_khome "$TMP/kimi-at-cap-max" <<'EOF'
+e6_khome "$TMP/kimi-at-cap-ultra" <<'EOF'
 [models."kimi-code/k3"]
 capabilities = [ "thinking", "always_thinking" ]
 default_effort = "high"
 [thinking]
 enabled = false
-effort = "max"
+effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-at-field-max" <<'EOF'
+e6_khome "$TMP/kimi-at-field-ultra" <<'EOF'
 [models."kimi-code/k3"]
 always_thinking = true
 default_effort = "high"
 [thinking]
 enabled = false
-effort = "max"
+effort = "ultra"
 EOF
-# A malformed config (duplicate keys) can still carry a max line: the python
+# A malformed config (duplicate keys) can still carry an ultra line: the python
 # parse refuses to decode it, so the awk fallback's scan must stay
 # conservative and refuse.
 e6_khome "$TMP/kimi-dup-invalid" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 effort = "high"
-effort = "max"
+effort = "ultra"
 EOF
 for e6_khome_case in kimi-dotted-thinking kimi-dotted-model kimi-inline-models \
-    kimi-multiline-max kimi-escaped-max kimi-indented-max kimi-override-max \
-    kimi-comment-support kimi-off-effort-max kimi-at-cap-max kimi-at-field-max \
+    kimi-multiline-ultra kimi-escaped-ultra kimi-indented-ultra kimi-override-ultra \
+    kimi-comment-support kimi-off-effort-ultra kimi-at-cap-ultra kimi-at-field-ultra \
     kimi-dup-invalid; do
   set +e
   e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
@@ -11153,44 +11191,44 @@ for e6_khome_case in kimi-dotted-thinking kimi-dotted-model kimi-inline-models \
   e6_krc=$?
   set -e
   [[ "$e6_krc" -eq 2 ]] ||
-    fail "builder-kimi on a home resolving to max ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
-  grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+    fail "builder-kimi on a home resolving to ultra ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
+  grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
     fail "$e6_khome_case refusal must name the builder-seat rule: $e6_kout"
 done
-# The env overlay is the rung when exported — even with a below-max home.
+# The env overlay is the rung when exported — even with a below-ultra home.
 e6_khome "$TMP/kimi-env-below" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 effort = "high"
 EOF
 set +e
-e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-below" KIMI_MODEL_THINKING_EFFORT=MAX \
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-below" KIMI_MODEL_THINKING_EFFORT=ULTRA \
   ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
-  spawn_base builder-kimi --role builder --lane kimi-env-max-lane --parent parent-lane \
-  --job e6-kimi-env-max --t T1 2>&1)"
+  spawn_base builder-kimi --role builder --lane kimi-env-ultra-lane --parent parent-lane \
+  --job e6-kimi-env-ultra --t T1 2>&1)"
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 2 ]] ||
-  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=MAX exported must die rc 2 (rc=$e6_krc): $e6_kout"
-grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
-  fail "env-max refusal must name the builder-seat rule: $e6_kout"
+  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=ULTRA exported must die rc 2 (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
+  fail "env-ultra refusal must name the builder-seat rule: $e6_kout"
 # CodeRabbit #153: the env overlay resolves even with no config file (kimi
 # applies it with an empty home too) — and must normalize like the real parse
-# or MAX bypasses the case-sensitive seat match on spelling alone.
+# or ULTRA bypasses the case-sensitive seat match on spelling alone.
 mkdir -p "$TMP/kimi-no-cfg"
 set +e
-e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-no-cfg" KIMI_MODEL_THINKING_EFFORT=MAX \
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-no-cfg" KIMI_MODEL_THINKING_EFFORT=ULTRA \
   ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
-  spawn_base builder-kimi --role builder --lane kimi-nocfg-max-lane --parent parent-lane \
-  --job e6-kimi-nocfg-max --t T1 2>&1)"
+  spawn_base builder-kimi --role builder --lane kimi-nocfg-ultra-lane --parent parent-lane \
+  --job e6-kimi-nocfg-ultra --t T1 2>&1)"
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 2 ]] ||
-  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=MAX and no config must die rc 2 (rc=$e6_krc): $e6_kout"
-grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
-  fail "no-config env-max refusal must name the builder-seat rule: $e6_kout"
+  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=ULTRA and no config must die rc 2 (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
+  fail "no-config env-ultra refusal must name the builder-seat rule: $e6_kout"
 # An env spelling outside the documented rungs is not a rung — fail-open like
 # an unparseable config, but only after the bounded check sees it.
 : >"$TMP/herdr.log"
@@ -11227,7 +11265,7 @@ printf '#!/bin/sh\nexit 1\n' > "$TMP/nopy3bin/python3"
 chmod +x "$TMP/nopy3bin/python3"
 e6_khome "$TMP/kimi-awk-override" <<'EOF'
 [models."kimi-code/k3".overrides]
-default_effort = "max"
+default_effort = "ultra"
 EOF
 set +e
 e6_kout="$(PATH="$TMP/nopy3bin:$PATH" KIMI_CODE_HOME="$TMP/kimi-awk-override" \
@@ -11237,56 +11275,56 @@ e6_kout="$(PATH="$TMP/nopy3bin:$PATH" KIMI_CODE_HOME="$TMP/kimi-awk-override" \
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 2 ]] ||
-  fail "builder-kimi on an overrides-default max home must die rc 2 via the awk fallback too (rc=$e6_krc): $e6_kout"
-grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
-  fail "awk-path overrides-max refusal must name the builder-seat rule: $e6_kout"
-# Admitted paths: the env overlay wins over the config (max home + high env),
+  fail "builder-kimi on an overrides-default ultra home must die rc 2 via the awk fallback too (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
+  fail "awk-path overrides-ultra refusal must name the builder-seat rule: $e6_kout"
+# Admitted paths: the env overlay wins over the config (ultra home + high env),
 # and disabled Thinking resolves to off_effort (absent → no rung) even when a
-# configured effort or default is max.
-e6_khome "$TMP/kimi-env-over-max" <<'EOF'
+# configured effort or default is ultra.
+e6_khome "$TMP/kimi-env-over-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 [thinking]
-effort = "max"
+effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-disabled-max" <<'EOF'
+e6_khome "$TMP/kimi-disabled-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 enabled = false
-effort = "max"
+effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-disabled-defmax" <<'EOF'
+e6_khome "$TMP/kimi-disabled-defultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 [thinking]
 enabled = false
 EOF
-# effort="off" is a valid off spelling — no rung even with a max default;
+# effort="off" is a valid off spelling — no rung even with an ultra default;
 # an unrecognised env value is not a rung either and falls back to config.
 e6_khome "$TMP/kimi-effort-off" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 [thinking]
 effort = "off"
 EOF
 : >"$TMP/herdr.log"
 set +e
-e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-over-max" KIMI_MODEL_THINKING_EFFORT=high \
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-over-ultra" KIMI_MODEL_THINKING_EFFORT=high \
   ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
   spawn_base builder-kimi --role builder --lane kimi-env-high-lane --parent parent-lane \
   --job e6-kimi-env-high --t T1 2>&1)"
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 0 ]] ||
-  fail "KIMI_MODEL_THINKING_EFFORT=high must override a max home and be admitted (rc=$e6_krc): $e6_kout"
+  fail "KIMI_MODEL_THINKING_EFFORT=high must override an ultra home and be admitted (rc=$e6_krc): $e6_kout"
 [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
   fail "env-high admission must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
-for e6_khome_case in kimi-disabled-max kimi-disabled-defmax kimi-effort-off; do
+for e6_khome_case in kimi-disabled-ultra kimi-disabled-defultra kimi-effort-off; do
   : >"$TMP/herdr.log"
   set +e
   e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
@@ -11305,13 +11343,14 @@ echo "PASS 748r3 kimi seat rule resolves real TOML, env overlay, and disabled Th
 # Marker mutants: no marker, and a marker naming a different rung, both die on
 # wrk's own guard (rc 2, before the gate is asked) — the installed gate then
 # fail-closes the unmeasured C rungs a second time for good measure.
-# The max-rung spellings are absent here: since 2026-09-26 the builder-seat
-# rule refuses them before the marker check (asserted above), so a missing
-# marker is no longer the operative refusal for them.
+# hk 1864: the max-rung spellings are in the loop too — the builder-seat rule
+# no longer refuses them, so a missing marker is the operative refusal.
 for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
   builder-sol-high builder-sol-medium \
   builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
+  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
+  builder-sonnet-max builder-sol-max builder-luna-max builder-kimi-max builder-haiku-max; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
@@ -11410,7 +11449,26 @@ set -e
   fail "builder-luna-medium with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
 grep -q 'SCOPEFUEL_E6_ARM=codex-luna@medium' <<<"$e6_rung_out" ||
   fail "wrong-rung refusal must name the required marker: $e6_rung_out"
-echo "PASS 704+737+1796 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
+# hk 1863: a marker for the wrong rung of the same profile refuses on each of
+# the open new spellings and the max rungs hk 1864 opened.
+for e6_wr in builder-sol-low:codex-sol@high:codex-sol@low \
+  builder-haiku-high:haiku@low:haiku@high builder-haiku-xhigh:haiku@high:haiku@xhigh \
+  builder-sonnet-low:sonnet@medium:sonnet@low \
+  builder-haiku-max:haiku@xhigh:haiku@max builder-sol-max:codex-sol@high:codex-sol@max \
+  builder-sonnet-max:sonnet@xhigh:sonnet@max builder-luna-max:codex-luna@medium:codex-luna@max; do
+  IFS=: read -r e6_wr_model e6_wr_marker e6_wr_want <<<"$e6_wr"
+  set +e
+  e6_rung_out="$(SCOPEFUEL_E6_ARM="$e6_wr_marker" \
+    spawn_base "$e6_wr_model" --role builder --lane "$e6_wr_model-wr-lane" --parent parent-lane \
+    --job "$e6_wr_model-wr" --t T1 2>&1)"
+  e6_rung_rc=$?
+  set -e
+  [[ "$e6_rung_rc" -eq 2 ]] ||
+    fail "$e6_wr_model with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+  grep -q "SCOPEFUEL_E6_ARM=$e6_wr_want" <<<"$e6_rung_out" ||
+    fail "$e6_wr_model wrong-rung refusal must name the required marker: $e6_rung_out"
+done
+echo "PASS 704+737+1796+1863 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
 
 # Escalation rung (fixture default escalation model — strict; NOT the
 # installed gate, whose #716 rule skips the ladder for --effort rungs): the
@@ -11639,6 +11697,23 @@ e6_eff_rc=$?
 set -e
 [[ "$e6_eff_rc" -eq 2 ]] ||
   fail "builder-luna-medium --effort low must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+# hk 1863: off-rung --effort dies on the pin for the five new spellings; the
+# rung spelled out is the allowed restatement (covered by e6_builder_case).
+for e6_ef in builder-sol-low:codex-sol@low:medium builder-haiku-high:haiku@high:low \
+  builder-haiku-xhigh:haiku@xhigh:high builder-haiku-max:haiku@max:xhigh \
+  builder-sonnet-low:sonnet@low:medium; do
+  IFS=: read -r e6_ef_model e6_ef_marker e6_ef_off <<<"$e6_ef"
+  set +e
+  e6_eff_out="$(SCOPEFUEL_E6_ARM="$e6_ef_marker" \
+    spawn_base "$e6_ef_model" --role builder --lane "$e6_ef_model-eff-lane" --parent parent-lane \
+    --effort "$e6_ef_off" --job "$e6_ef_model-eff-mutant" --t T1 2>&1)"
+  e6_eff_rc=$?
+  set -e
+  [[ "$e6_eff_rc" -eq 2 ]] ||
+    fail "$e6_ef_model --effort $e6_ef_off must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+  grep -q "$e6_ef_model is pinned to effort" <<<"$e6_eff_out" ||
+    fail "$e6_ef_model --effort $e6_ef_off must die on the pin rule: $e6_eff_out"
+done
 set +e
 e6_eff_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
   spawn_base builder-kimi-high --role builder --lane e6-kimi-eff-lane --parent parent-lane \
@@ -14517,6 +14592,255 @@ exhaust_after="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.a
 [[ "$exhaust_before" == "$exhaust_after" ]] ||
   fail "exhausted numbering overwrote the existing record"
 echo "PASS hk1750-helper-fallback-and-bounded-exhaustion"
+
+# ------------------------------------------------------------------
+# hk 1137 — the machine/job-id allowlist must be ASCII under any locale
+# ------------------------------------------------------------------
+# bin/wrk gates ids with bash =~ ranges like ^[A-Za-z0-9._-]{1,64}$. Those
+# ranges follow the caller's locale collation: under en_US.UTF-8 they also
+# match ~2000 non-ASCII letters and symbols (e-acute included), and the
+# accepted value can then echo into a warning. Every site must match under
+# LC_ALL=C. These probes drive each site with a non-ASCII id under both
+# locale shapes — LC_ALL=en_US.UTF-8, and LANG=en_US.UTF-8 with LC_ALL
+# unset — and prove refusal plus a message that carries no raw non-ASCII
+# bytes. ASCII boundary ids (64 accepted, 65 refused, . _ - accepted) are
+# unchanged.
+
+T1137_LOCALE=""
+for _t1137_cand in en_US.UTF-8 en_US.utf8; do
+  if locale -a 2>/dev/null | grep -qiF "$_t1137_cand"; then
+    T1137_LOCALE="$_t1137_cand"
+    break
+  fi
+done
+unset _t1137_cand
+
+# A non-ASCII id byte sequence must never appear in stderr/stdout. grep in
+# C locale treats the file as bytes; the pattern is the UTF-8 encoding of
+# U+00E9 (e-acute).
+t1137_no_raw_eacute() {  # FILE TAG — fail when the raw bytes are present
+  ! LC_ALL=C grep -q $'\xc3\xa9' "$1" ||
+    fail "hk1137 $2: raw non-ASCII bytes reached $1: $(cat "$1")"
+}
+
+# Usage-stage probes (--lane-defer/--parent-job/--takeover-from): a minimal
+# spawn env; validation dies before any fixture is needed. The caller sets
+# the locale through the command's env prefix.
+t1137_usage() {
+  set +e
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
+    ARBITER_BIN="$TMP/absent-arbiter" ARBITER_INBOX_ROOT="$TMP/t1137-inbox" \
+    XDG_DATA_HOME="$TMP/t1137-xdg" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$TMP/t1137-usage-herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/t1137-usage-scopefuel.log" \
+    WRK_HOSTS_CONFIG="$TMP/t1137-no-such-hosts.toml" \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m "${T1137_MODEL:-codex-luna}" -p "$PROMPT" \
+    -w w -l t1137-usage --t T1 "$@" >"$T1137_OUT" 2>"$T1137_ERR"
+  T1137_RC=$?
+  set -e
+}
+
+T1137_OUT="$TMP/t1137.out" T1137_ERR="$TMP/t1137.err" T1137_RC=0
+T1137_EACUTE_ID=$'mach\u00e9ne'          # non-ASCII machine-shaped id
+T1137_EACUTE_JOB=$'j\u00e9b'             # non-ASCII job-shaped id
+T1137_ID64="a$(printf 'b%.0s' {1..62})c" # exactly 64 ASCII chars
+T1137_ID65="a$(printf 'b%.0s' {1..63})c" # 65 — one past the bound
+[[ ${#T1137_ID64} -eq 64 && ${#T1137_ID65} -eq 65 ]] ||
+  fail "hk1137: boundary fixtures miscounted"
+
+# Configs for the hub_lane_register sites: a [hub] machine_id fallback with
+# a non-ASCII value, a session_machine_ids entry with a non-ASCII machine,
+# and a lanes node token file whose HUB_MACHINE_ID is non-ASCII.
+T1137_CFG_BADMID="$TMP/t1137-badmid-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_EACUTE_ID" >"$T1137_CFG_BADMID"
+T1137_CFG_BADMAP="$TMP/t1137-badmap-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "%s" }\n' \
+  "$LANES_NODE_FILE" "$T1137_EACUTE_ID" >"$T1137_CFG_BADMAP"
+T1137_NODE_BAD="$TMP/t1137-node-bad.env"
+printf 'HUB_MACHINE_ID=%s\nHUB_TOKEN=fixture-t1137-node-token\n' "$T1137_EACUTE_ID" >"$T1137_NODE_BAD"
+chmod 600 "$T1137_NODE_BAD"
+T1137_CFG_BADNODE="$TMP/t1137-badnode-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$T1137_NODE_BAD" >"$T1137_CFG_BADNODE"
+# Boundary configs: 64-char machine_id (accepted, registers), 65-char
+# (refused), and a lanes node file carrying a 64-char HUB_MACHINE_ID that
+# matches the session machine.
+T1137_CFG_MID64="$TMP/t1137-mid64-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_ID64" >"$T1137_CFG_MID64"
+T1137_CFG_MID65="$TMP/t1137-mid65-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_ID65" >"$T1137_CFG_MID65"
+T1137_NODE_64="$TMP/t1137-node-64.env"
+printf 'HUB_MACHINE_ID=%s\nHUB_TOKEN=fixture-t1137-node64-token\n' "$T1137_ID64" >"$T1137_NODE_64"
+chmod 600 "$T1137_NODE_64"
+T1137_CFG_NODE64="$TMP/t1137-node64-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "%s" }\n' \
+  "$T1137_NODE_64" "$T1137_ID64" >"$T1137_CFG_NODE64"
+T1137_CFG_DOTID="$TMP/t1137-dotid-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "mac.x_y-z"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" >"$T1137_CFG_DOTID"
+
+# ASCII boundary behaviour is locale-independent — run it unconditionally so
+# a runner without en_US.UTF-8 still proves the allowlist kept its shape.
+# Site: --lane-defer (die path).
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-b64 --parent director-x \
+  --task 1 --lane-defer "$T1137_ID64"
+! grep -q 'expects a machine id' "$T1137_ERR" ||
+  fail "hk1137: a 64-char --lane-defer must be accepted: $(cat "$T1137_ERR")"
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-b65 --parent director-x \
+  --task 1 --lane-defer "$T1137_ID65"
+[[ "$T1137_RC" -eq 2 ]] ||
+  fail "hk1137: a 65-char --lane-defer must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+grep -q 'matching \[A-Za-z0-9._-\]' "$T1137_ERR" ||
+  fail "hk1137: the 65-char refusal must name the charset: $(cat "$T1137_ERR")"
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-bdot --parent director-x \
+  --task 1 --lane-defer 'a.b_c-d'
+! grep -q 'expects a machine id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --lane-defer: $(cat "$T1137_ERR")"
+# Site: --parent-job (die path). Job ids have no length cap; only the
+# charset matters.
+LC_ALL=C t1137_usage --role tester --parent-job 'job.a_b-9'
+! grep -q 'must be a job id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --parent-job: $(cat "$T1137_ERR")"
+LC_ALL=C t1137_usage --role tester --parent-job 'job/bad'
+[[ "$T1137_RC" -eq 2 ]] ||
+  fail "hk1137: a slash in --parent-job must still refuse rc 2 (rc=$T1137_RC)"
+# Site: --takeover-from (die path, same job-id charset).
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-tk --parent director-x \
+  --task 1 --takeover-from 'job.a_b-9'
+! grep -q 'must be a job id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --takeover-from: $(cat "$T1137_ERR")"
+# Site: [hub] machine_id fallback — 64 chars registers, 65 warns malformed.
+LANES_CFG_OVERRIDE="$T1137_CFG_MID64" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-m64 --role builder --lane t1137-m64 --parent director-x
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: 64-char machine_id spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-m64@'"$T1137_ID64"'$' "$LANES_OUT" ||
+  fail "hk1137: the 64-char machine_id must register: $(cat "$LANES_OUT")"
+LANES_CFG_OVERRIDE="$T1137_CFG_MID65" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-m65 --role builder --lane t1137-m65 --parent director-x
+grep -q 'machine_id is malformed' "$LANES_ERR" ||
+  fail "hk1137: a 65-char machine_id must warn malformed: $(cat "$LANES_ERR")"
+# Site: '.', '_' and '-' inside machine_id stay accepted.
+LANES_CFG_OVERRIDE="$T1137_CFG_DOTID" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-mdot --role builder --lane t1137-mdot --parent director-x
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: mac.x_y-z machine_id spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-mdot@mac\.x_y-z$' "$LANES_OUT" ||
+  fail "hk1137: mac.x_y-z must register as the machine: $(cat "$LANES_OUT")"
+# Site: lanes_token_env HUB_MACHINE_ID — 64 chars registers, matched against
+# the session machine.
+LANES_CFG_OVERRIDE="$T1137_CFG_NODE64" HERDR_SESSION=default \
+  lanes_spawn t1137-n64 --owner work-kairos
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: 64-char HUB_MACHINE_ID spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-n64@'"$T1137_ID64"'$' "$LANES_OUT" ||
+  fail "hk1137: the 64-char HUB_MACHINE_ID must register: $(cat "$LANES_OUT")"
+echo "PASS hk1137-ascii boundaries: 64 accepted, 65 refused, . _ - accepted"
+
+if [[ -z "$T1137_LOCALE" ]]; then
+  # The refusal probes NEED a UTF-8 locale — under C even an unpinned =~
+  # refuses e-acute, so a green run would be vacuous. Say SKIP with the
+  # reason; never let the section pass silently.
+  echo "SKIP hk1137-ascii refusal probes: no en_US.UTF-8 locale on this runner"
+else
+  # Run every site probe under both locale shapes: LC_ALL pinned, and
+  # LANG-only with LC_ALL unset (the second is the ambient-locale path —
+  # LANG only applies when LC_ALL is absent). The probes are shell
+  # functions, so the locale is set at suite level per mode and restored
+  # after the loop.
+  t1137_had_lc=0; [[ -n "${LC_ALL+x}" ]] && t1137_had_lc=1
+  t1137_had_lang=0; [[ -n "${LANG+x}" ]] && t1137_had_lang=1
+  t1137_saved_lc="${LC_ALL-}" t1137_saved_lang="${LANG-}"
+  for t1137_mode in LC_ALL LANG_ONLY; do
+    if [[ "$t1137_mode" == LC_ALL ]]; then
+      export LC_ALL="$T1137_LOCALE"
+      t1137_tag=lcall
+    else
+      t1137_tag=lang
+      unset LC_ALL
+      export LANG="$T1137_LOCALE"
+    fi
+
+    # Site: --lane-defer. Fixed build: rc 2 + charset message + no raw é.
+    # Unfixed: é passes validation and the spawn proceeds — rc != 2 and no
+    # refusal line.
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-ld --parent director-x \
+      --task "$(mint_task)" --lane-defer "$T1137_EACUTE_ID"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --lane-defer must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'matching \[A-Za-z0-9._-\]' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --lane-defer refusal must name the charset: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "lane-defer/$t1137_mode"
+
+    # Site: --parent-job. Fixed build: rc 2; the die may name the value only
+    # scrubbed — the raw é bytes must not reach stderr.
+    t1137_usage --role tester --parent-job "$T1137_EACUTE_JOB"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --parent-job must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'must be a job id' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --parent-job refusal must name the rule: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "parent-job/$t1137_mode"
+
+    # Site: --takeover-from — same job-id charset, builder-only flag.
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-tk2 --parent director-x \
+      --task 1 --takeover-from "$T1137_EACUTE_JOB"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --takeover-from must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'must be a job id' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --takeover-from refusal must name the rule: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "takeover-from/$t1137_mode"
+
+    # Site: [hub] machine_id fallback. Fixed build: the value-free malformed
+    # warning and no lanes call. Unfixed: é registers a lane on 'machéne'.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADMID" LANES_MODEL=builder-sol \
+      lanes_spawn "t1137-mid-$t1137_tag" --role builder --lane "t1137-mid-$t1137_tag" --parent director-x
+    grep -q 'machine_id is malformed' "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII machine_id must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "machine_id/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-mid-$t1137_tag"
+
+    # Site: session_machine_ids value. Fixed build: refuse closed with a
+    # value-free warning; unfixed, the non-ASCII machine reaches lanes add
+    # and the lane= field.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADMAP" HERDR_SESSION=default \
+      lanes_spawn "t1137-map-$t1137_tag" --owner work-kairos
+    grep -q "session's machine id is malformed" "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII session machine must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "session-map/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-map-$t1137_tag"
+
+    # Site: lanes_token_env HUB_MACHINE_ID. Fixed build: value-free
+    # malformed warning. Unfixed: é passes the charset check and the
+    # mismatch warning echoes 'machéne' verbatim.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADNODE" HERDR_SESSION=default \
+      lanes_spawn "t1137-node-$t1137_tag" --owner work-kairos
+    grep -q 'lanes_token_env HUB_MACHINE_ID is malformed' "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII HUB_MACHINE_ID must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "lanes-machine/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-node-$t1137_tag"
+  done
+  # Restore the suite's original locale env.
+  if (( t1137_had_lc )); then export LC_ALL="$t1137_saved_lc"; else unset LC_ALL; fi
+  if (( t1137_had_lang )); then export LANG="$t1137_saved_lang"; else unset LANG; fi
+  echo "PASS hk1137-ascii refusals: non-ASCII refused at every site under LC_ALL and LANG"
+
+  # Mutant — drop the locale pin at the --lane-defer site and that site's
+  # probe must go RED: é is accepted again, so there is no rc-2 refusal.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1137-unpin \
+    "ascii_re \"\$LANE_DEFER\" '^[A-Za-z0-9._-]{1,64}\$'" \
+    '[[ "$LANE_DEFER" =~ ^[A-Za-z0-9._-]{1,64}$ ]]'
+  LC_ALL="$T1137_LOCALE" WRK_UNDER_TEST="$TMP/mut-wrk-t1137-unpin" \
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-mut --parent director-x \
+    --task "$(mint_task)" --lane-defer "$T1137_EACUTE_ID"
+  [[ "$T1137_RC" -ne 2 || ! -s "$T1137_ERR" ]] ||
+    fail "hk1137 M1 mutant survived: --lane-defer still refused the non-ASCII id without the locale pin"
+  echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
+fi
 
 bash "$ROOT/tests/test-shellcheck-capped.sh"
 # hk 1604: devin gate-profile contract. The real-scopefuel smoke stays opt-in
