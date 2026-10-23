@@ -4253,6 +4253,11 @@ case_lostgrace_guard_skip_removes_pidfile() {
   local gatefile="$TMP/1813-lostgrace-gate" trace="$TMP/1813-lostgrace-trace" pid pidfile
   mk_job "$job" w:p1 || return 3
   arb_lease "$job" || return 3
+  # Re-record a fresh quota row before the loss terminal. The wrapper below
+  # injects only the reclaim receipt after job.revoked, avoiding cross-process
+  # arbiter-root changes in the sentinel fixture.
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb_lease "$job" || return 3
   quota_gate_out >"$gatefile" || return 3
   printf 'not-found\n' >"$seq"
   cat >"$arbwrap" <<EOF || return 3
@@ -4263,20 +4268,45 @@ if [[ "\${1:-}" == status && "\${3:-}" == "$job" && ! -e "$injected" ]] &&
     compgen -G "$INBOX/$job/events/*-job.revoked.json" >/dev/null; then
   printf 'inject\n' >>"$trace"
   : >"$injected"
-  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
-    "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null || {
-    printf 'inject-release-failed\n' >>"$trace"; exit 81;
+  python3 - "$INBOX/$job/events" "$job" <<'PY' || {
+import datetime, fcntl, json, os, sys, tempfile
+events, job = sys.argv[1:]
+os.makedirs(events, exist_ok=True)
+lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
+with open(lock_path, "w", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    seqs = []
+    for name in os.listdir(events):
+        try:
+            seqs.append(int(name.split("-", 1)[0]))
+        except (ValueError, IndexError):
+            pass
+    seq = max(seqs, default=0) + 1
+    record = {
+        "job_id": job,
+        "seq": seq,
+        "kind": "job.reclaim",
+        "payload": {"owner_lane": "lane-a", "label": "lbl"},
+        "created_at": datetime.datetime.now(datetime.timezone.utc)
+        .isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+    }
+    fd, temporary = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=events)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as output:
+            json.dump(record, output, separators=(",", ":"))
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        final = os.path.join(events, f"{seq:05d}-job.reclaim.json")
+        os.link(temporary, final)
+    finally:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+PY
+    printf 'inject-reclaim-failed\n' >>"$trace"; exit 83;
   }
-  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \\
-    "$ARBITER" lease --job "$job" --kind quota_pool --profile codex-luna \\
-    --gate-output "\$(cat "$gatefile")" >/dev/null || {
-      printf 'inject-lease-failed\n' >>"$trace"; exit 82;
-    }
-  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \\
-    "$ARBITER" event --job "$job" --kind job.reclaim \\
-    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || {
-      printf 'inject-reclaim-failed\n' >>"$trace"; exit 83;
-    }
   compgen -G "$INBOX/$job/events/*-job.reclaim.json" >/dev/null || {
     printf 'inject-reclaim-artifact-missing\n' >>"$trace"; exit 84;
   }
