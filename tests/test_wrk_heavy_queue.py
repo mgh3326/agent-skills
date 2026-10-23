@@ -202,7 +202,7 @@ class HeavyQueue(unittest.TestCase):
             if name == "a-new":
                 self.assertEqual(self.position_records(), [], "acquisition did not consume the position")
             self.release(name)
-            self.assertEqual(proc.wait(timeout=5), 0)
+            self.assertEqual(proc.wait(timeout=5), 0, (self.base / (name + ".out")).read_text())
 
     def test_position_reused_within_grace(self):
         self.durable()
@@ -266,6 +266,17 @@ class HeavyQueue(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(victim.read_text(), "unchanged", "position symlink target changed")
         self.assertNotIn("Traceback", self.run_wrk("status").stderr)
+        bad = self.positions / "key-malformed.json"
+        for value in ([], {"key": []}, {"key": "malformed", "ticket": [True, 1], "expiry": 1},
+                      {"key": "malformed", "ticket": [1, 1], "expiry": float("inf")},
+                      {"key": "malformed", "ticket": [1, 1], "expiry": 10**1000}):
+            bad.write_text(json.dumps(value))
+            result = self.run_wrk("--queue-key", "malformed", "--", "true")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        hardlink = self.positions / "key-hard.json"
+        os.link(victim, hardlink)
+        self.assertEqual(self.run_wrk("--queue-key", "hard", "--", "true").returncode, 0)
+        self.assertEqual(victim.read_text(), "unchanged")
 
     def test_untrusted_positions_directory_refused(self):
         self.positions.rmdir()
@@ -279,6 +290,190 @@ class HeavyQueue(unittest.TestCase):
         self.positions.mkdir(mode=0o777)
         self.positions.chmod(0o777)
         self.assertEqual(self.run_wrk("--queue-key", "A", "--", "true").returncode, 78)
+
+    def instrument(self, name, old, new):
+        source = WRK.read_text()
+        self.assertEqual(source.count(old), 1, f"instrumentation anchor changed: {old}")
+        binary = self.base / name
+        binary.write_text(source.replace(old, new, 1))
+        binary.chmod(0o755)
+        return binary
+
+    def test_foreign_owned_position_is_ignored(self):
+        self.start("holder")
+        path = self.positions / "key-A.json"
+        path.write_text(json.dumps({"key": "A", "ticket": [1, 1],
+                                    "expiry": time.time() + 600}))
+        # No privileged chown in CI: change only this inode's fstat uid at
+        # the real read call site; the production ownership predicate runs.
+        binary = self.instrument("foreign-wrk", "            st = os.fstat(f.fileno())\n",
+                                 "            st = os.fstat(f.fileno())\n"
+                                 f"            if st.st_ino == {path.stat().st_ino}:\n"
+                                 "                fields = list(st)\n"
+                                 "                fields[4] = 42424242\n"
+                                 "                st = os.stat_result(fields)\n")
+        self.spawn("foreign", key="A", binary=binary)
+        self.assertGreater(self.ticket(self.queued("foreign")), (1, 1),
+                           "foreign-owned position was reused")
+
+    def test_expiry_boundary_and_wall_clock_ticket_with_monotonic_cap(self):
+        self.start("holder")
+        (self.positions / "key-A.json").write_text(json.dumps(
+            {"key": "A", "ticket": [1, 1], "expiry": 100.0}))
+        binary = self.instrument("clock-wrk", "positions_fd = -1\n",
+                                 "time.time = lambda: 100.0\n"
+                                 "time.time_ns = lambda: 50\npositions_fd = -1\n")
+        proc = self.spawn("boundary", key="A", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        ticket = self.ticket(self.queued("boundary"))
+        self.assertEqual(ticket[0], 50, "ticket did not use the wall clock")
+        self.assertNotEqual(ticket, (1, 1), "position reused exactly at expiry")
+        self.assertEqual(proc.wait(timeout=5), 75, "wall-clock step broke the monotonic cap")
+
+    def test_same_timestamp_uses_enqueue_pid_and_equal_ticket_never_stalls(self):
+        binary = self.instrument("ties-wrk", "ticket = (time.time_ns(), os.getpid())",
+                                 f"ticket = (100, {os.getpid() + 1})")
+        self.plant_lane(os.getpid(), ticket=f"100:{os.getpid()}")
+        self.assertEqual(self.run_wrk("--", "true", binary=binary,
+                                     WRK_HEAVY_WAIT_CAP=".6").returncode, 75)
+        self.plant_lane(os.getpid(), ticket=f"100:{os.getpid() + 1}")
+        self.assertEqual(self.run_wrk("--", "true", binary=binary).returncode, 0,
+                         "equal tickets waited on one another")
+
+    def test_ci_over_older_lane_and_guard_does_not_waive_fifo(self):
+        self.start("holder")
+        self.spawn("lane")
+        self.queued("lane")
+        ci = self.spawn("ci", WRK_HEAVY_CLASS="ci")
+        self.queued("ci")
+        self.release("holder")
+        self.until(lambda: self.started("ci"), "CI did not overtake the older lane")
+        self.assertFalse(self.started("lane"), "lane ran ahead of CI")
+        self.release("ci")
+        self.assertEqual(ci.wait(timeout=5), 0)
+        self.until(lambda: self.started("lane"), "lane did not drain after CI")
+        self.release("lane")
+        # The existing CI guard can be disabled, but older lanes still reserve.
+        self.plant_lane(os.getpid())
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_CI_DEFER_MAX="0",
+                                     WRK_HEAVY_WAIT_CAP=".6").returncode, 75)
+
+    def test_pass_already_scanned_and_new_publish_window(self):
+        # Park exactly after the production lane scan, not for a guessed time.
+        gate, scanned = self.base / "gate", self.base / "scanned"
+        self.files.append(gate)
+        anchor = '            lane_limit = lane_reserved() if hclass == "lane" else 0\n'
+        binary = self.instrument("scan-wrk", anchor, anchor +
+                                 f"            open({str(scanned)!r}, 'w').close()\n"
+                                 f"            while not os.path.exists({str(gate)!r}):\n"
+                                 "                time.sleep(.02)\n")
+        self.spawn("in-flight", binary=binary)
+        self.until(scanned.exists, "pass did not reach the scan barrier")
+        self.plant_lane(os.getpid())
+        gate.touch()
+        self.until(lambda: self.started("in-flight"),
+                   "an already-scanned pass unexpectedly re-read the new record")
+        self.release("in-flight")
+        # A new pass now sees that same visible older record and must defer.
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6").returncode, 75)
+
+    def test_crash_after_position_publish_and_during_publish(self):
+        self.start("holder")
+        anchor = '                end_defer("cap")\n                save_position()\n'
+        binary = self.instrument("crash-after-wrk", anchor, anchor + "                os._exit(75)\n")
+        old = self.spawn("crashed", key="A", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        ticket = self.ticket(self.queued("crashed"))
+        self.assertEqual(old.wait(timeout=5), 75)
+        self.assertTrue(self.position_records(), "crash lost a published position")
+        self.spawn("retry", key="A")
+        self.assertEqual(self.ticket(self.queued("retry")), ticket)
+        # A process crash before rename leaves only a dot file, never a
+        # partially visible position. It cannot reserve a slot or be reused.
+        anchor = "        os.replace(tmp, position_name(queue_key),\n"
+        binary = self.instrument("crash-mid-wrk", anchor,
+                                 "        os._exit(75)\n" + anchor)
+        mid = self.spawn("mid", key="B", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        mid_ticket = self.ticket(self.queued("mid"))
+        self.assertEqual(mid.wait(timeout=5), 75)
+        self.assertTrue(any(p.name.startswith(".") for p in self.positions.iterdir()))
+        self.spawn("fresh-B", key="B")
+        self.assertGreater(self.ticket(self.queued("fresh-B")), mid_ticket)
+        self.release("holder")
+        self.until(lambda: self.started("retry"), "dead crashed waiter blocked its retry")
+
+    def test_simultaneous_keyed_retries_and_env_key(self):
+        self.start("holder")
+        original = (1, 1)
+        (self.positions / "key-A.json").write_text(json.dumps(
+            {"key": "A", "ticket": original, "expiry": time.time() + 600}))
+        # Start both before waiting for either publication. Sharing a key is
+        # allowed; equality must not produce a mutual reservation deadlock.
+        a = self.spawn("same-a", key="A")
+        b = self.spawn("same-b", WRK_HEAVY_QUEUE_KEY="A")
+        self.assertEqual(self.ticket(self.queued("same-a")), original)
+        self.assertEqual(self.ticket(self.queued("same-b")), original)
+        self.release("holder")
+        self.until(lambda: self.started("same-a") or self.started("same-b"),
+                   "equal keyed tickets stalled")
+        first = "same-a" if self.started("same-a") else "same-b"
+        second = "same-b" if first == "same-a" else "same-a"
+        self.assertEqual(self.position_records(), [], "acquisition did not consume the shared place")
+        self.release(first)
+        self.until(lambda: self.started(second), "second same-key waiter did not drain")
+        self.release(second)
+        self.assertEqual(a.wait(timeout=5), 0)
+        self.assertEqual(b.wait(timeout=5), 0)
+
+    def test_status_does_not_remove_a_refreshed_position(self):
+        path = self.positions / "key-A.json"
+        path.write_text(json.dumps({"key": "A", "ticket": [1, 1], "expiry": 1}))
+        renewed = {"key": "A", "ticket": [1, 1], "expiry": time.time() + 600}
+        # Replace after the real expired-record read and before its cleanup.
+        # The inode comparison must preserve the new cap publication.
+        anchor = '                if record["expiry"] <= time.time():\n'
+        binary = self.instrument("refresh-wrk", anchor,
+                                 f"                replacement = {str(self.base / 'replacement')!r}\n"
+                                 f"                open(replacement, 'w').write({json.dumps(renewed)!r})\n"
+                                 "                os.replace(replacement, name, dst_dir_fd=pfd)\n" + anchor)
+        self.assertEqual(self.run_wrk("status", binary=binary).returncode, 0)
+        self.assertEqual(json.loads(path.read_text()), renewed)
+
+    def test_position_publish_uses_the_opened_directory_after_a_swap(self):
+        self.start("holder")
+        opened = self.base / "original-positions"
+        anchor = '    tmp = ".position-" + os.urandom(16).hex()\n'
+        binary = self.instrument("swap-wrk", anchor,
+                                 f"    os.rename(positions_dir, {str(opened)!r})\n"
+                                 "    os.mkdir(positions_dir)\n" + anchor)
+        proc = self.spawn("swapped", key="A", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.queued("swapped")
+        self.assertEqual(proc.wait(timeout=5), 75)
+        self.assertEqual(list(self.positions.iterdir()), [], "publish resolved the replaced path")
+        record = json.loads((opened / "key-A.json").read_text())
+        self.assertEqual(record["key"], "A")
+
+    def test_mutants_break_the_named_invariants(self):
+        mutations = [
+            ("fifo", 'lane_limit = lane_reserved() if hclass == "lane" else 0',
+             'lane_limit = 0', "test_fifo_reserves_only_eligible_slots",
+             "younger lane overtook a live older ticket"),
+            ("reuse", '            ticket = tuple(record["ticket"])',
+             '            pass  # mutant: discard the saved ticket',
+             "test_position_reused_within_grace", "original ticket was not reused within grace"),
+            ("dead", '        if not alive(pid):\n', '        if False:\n',
+             "test_dead_and_mixed_version_records_reserve_nothing",
+             "dead or ticketless record reserved a slot"),
+        ]
+        for name, old, new, case, invariant in mutations:
+            with self.subTest(invariant=invariant):
+                binary = self.instrument("mutant-" + name, old, new)
+                result = subprocess.run(
+                    [sys.executable, str(Path(__file__).resolve()), "HeavyQueue." + case],
+                    env=dict(self.env, WRK_QUEUE_TEST_BIN=str(binary)),
+                    capture_output=True, text=True, timeout=45, check=False)
+                self.assertNotEqual(result.returncode, 0, "mutant survived: " + invariant)
+                self.assertIn("AssertionError:", result.stderr)
+                self.assertIn(invariant, result.stderr)
+                self.assertNotIn("ERROR:", result.stderr, "a crash is not assertion RED")
 
 
 if __name__ == "__main__":
