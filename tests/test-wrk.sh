@@ -5009,7 +5009,7 @@ PY
   # appear in stderr. GREEN restores the value-free malformed warning.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-1037-noidcheck \
-    '      if [[ ! "$lanes_machine" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then' \
+    "      if ! ascii_re \"\$lanes_machine\" '^[A-Za-z0-9._-]{1,64}\$'; then" \
     '      if false; then'
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1037-noidcheck" \
     LANES_CFG_OVERRIDE="$LANES_CFG_INLINE" HERDR_SESSION=default \
@@ -14592,6 +14592,255 @@ exhaust_after="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.a
 [[ "$exhaust_before" == "$exhaust_after" ]] ||
   fail "exhausted numbering overwrote the existing record"
 echo "PASS hk1750-helper-fallback-and-bounded-exhaustion"
+
+# ------------------------------------------------------------------
+# hk 1137 — the machine/job-id allowlist must be ASCII under any locale
+# ------------------------------------------------------------------
+# bin/wrk gates ids with bash =~ ranges like ^[A-Za-z0-9._-]{1,64}$. Those
+# ranges follow the caller's locale collation: under en_US.UTF-8 they also
+# match ~2000 non-ASCII letters and symbols (e-acute included), and the
+# accepted value can then echo into a warning. Every site must match under
+# LC_ALL=C. These probes drive each site with a non-ASCII id under both
+# locale shapes — LC_ALL=en_US.UTF-8, and LANG=en_US.UTF-8 with LC_ALL
+# unset — and prove refusal plus a message that carries no raw non-ASCII
+# bytes. ASCII boundary ids (64 accepted, 65 refused, . _ - accepted) are
+# unchanged.
+
+T1137_LOCALE=""
+for _t1137_cand in en_US.UTF-8 en_US.utf8; do
+  if locale -a 2>/dev/null | grep -qiF "$_t1137_cand"; then
+    T1137_LOCALE="$_t1137_cand"
+    break
+  fi
+done
+unset _t1137_cand
+
+# A non-ASCII id byte sequence must never appear in stderr/stdout. grep in
+# C locale treats the file as bytes; the pattern is the UTF-8 encoding of
+# U+00E9 (e-acute).
+t1137_no_raw_eacute() {  # FILE TAG — fail when the raw bytes are present
+  ! LC_ALL=C grep -q $'\xc3\xa9' "$1" ||
+    fail "hk1137 $2: raw non-ASCII bytes reached $1: $(cat "$1")"
+}
+
+# Usage-stage probes (--lane-defer/--parent-job/--takeover-from): a minimal
+# spawn env; validation dies before any fixture is needed. The caller sets
+# the locale through the command's env prefix.
+t1137_usage() {
+  set +e
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
+    ARBITER_BIN="$TMP/absent-arbiter" ARBITER_INBOX_ROOT="$TMP/t1137-inbox" \
+    XDG_DATA_HOME="$TMP/t1137-xdg" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$TMP/t1137-usage-herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/t1137-usage-scopefuel.log" \
+    WRK_HOSTS_CONFIG="$TMP/t1137-no-such-hosts.toml" \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m "${T1137_MODEL:-codex-luna}" -p "$PROMPT" \
+    -w w -l t1137-usage --t T1 "$@" >"$T1137_OUT" 2>"$T1137_ERR"
+  T1137_RC=$?
+  set -e
+}
+
+T1137_OUT="$TMP/t1137.out" T1137_ERR="$TMP/t1137.err" T1137_RC=0
+T1137_EACUTE_ID=$'mach\u00e9ne'          # non-ASCII machine-shaped id
+T1137_EACUTE_JOB=$'j\u00e9b'             # non-ASCII job-shaped id
+T1137_ID64="a$(printf 'b%.0s' {1..62})c" # exactly 64 ASCII chars
+T1137_ID65="a$(printf 'b%.0s' {1..63})c" # 65 — one past the bound
+[[ ${#T1137_ID64} -eq 64 && ${#T1137_ID65} -eq 65 ]] ||
+  fail "hk1137: boundary fixtures miscounted"
+
+# Configs for the hub_lane_register sites: a [hub] machine_id fallback with
+# a non-ASCII value, a session_machine_ids entry with a non-ASCII machine,
+# and a lanes node token file whose HUB_MACHINE_ID is non-ASCII.
+T1137_CFG_BADMID="$TMP/t1137-badmid-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_EACUTE_ID" >"$T1137_CFG_BADMID"
+T1137_CFG_BADMAP="$TMP/t1137-badmap-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "%s" }\n' \
+  "$LANES_NODE_FILE" "$T1137_EACUTE_ID" >"$T1137_CFG_BADMAP"
+T1137_NODE_BAD="$TMP/t1137-node-bad.env"
+printf 'HUB_MACHINE_ID=%s\nHUB_TOKEN=fixture-t1137-node-token\n' "$T1137_EACUTE_ID" >"$T1137_NODE_BAD"
+chmod 600 "$T1137_NODE_BAD"
+T1137_CFG_BADNODE="$TMP/t1137-badnode-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$T1137_NODE_BAD" >"$T1137_CFG_BADNODE"
+# Boundary configs: 64-char machine_id (accepted, registers), 65-char
+# (refused), and a lanes node file carrying a 64-char HUB_MACHINE_ID that
+# matches the session machine.
+T1137_CFG_MID64="$TMP/t1137-mid64-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_ID64" >"$T1137_CFG_MID64"
+T1137_CFG_MID65="$TMP/t1137-mid65-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_ID65" >"$T1137_CFG_MID65"
+T1137_NODE_64="$TMP/t1137-node-64.env"
+printf 'HUB_MACHINE_ID=%s\nHUB_TOKEN=fixture-t1137-node64-token\n' "$T1137_ID64" >"$T1137_NODE_64"
+chmod 600 "$T1137_NODE_64"
+T1137_CFG_NODE64="$TMP/t1137-node64-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "%s" }\n' \
+  "$T1137_NODE_64" "$T1137_ID64" >"$T1137_CFG_NODE64"
+T1137_CFG_DOTID="$TMP/t1137-dotid-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "mac.x_y-z"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" >"$T1137_CFG_DOTID"
+
+# ASCII boundary behaviour is locale-independent — run it unconditionally so
+# a runner without en_US.UTF-8 still proves the allowlist kept its shape.
+# Site: --lane-defer (die path).
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-b64 --parent director-x \
+  --task 1 --lane-defer "$T1137_ID64"
+! grep -q 'expects a machine id' "$T1137_ERR" ||
+  fail "hk1137: a 64-char --lane-defer must be accepted: $(cat "$T1137_ERR")"
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-b65 --parent director-x \
+  --task 1 --lane-defer "$T1137_ID65"
+[[ "$T1137_RC" -eq 2 ]] ||
+  fail "hk1137: a 65-char --lane-defer must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+grep -q 'matching \[A-Za-z0-9._-\]' "$T1137_ERR" ||
+  fail "hk1137: the 65-char refusal must name the charset: $(cat "$T1137_ERR")"
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-bdot --parent director-x \
+  --task 1 --lane-defer 'a.b_c-d'
+! grep -q 'expects a machine id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --lane-defer: $(cat "$T1137_ERR")"
+# Site: --parent-job (die path). Job ids have no length cap; only the
+# charset matters.
+LC_ALL=C t1137_usage --role tester --parent-job 'job.a_b-9'
+! grep -q 'must be a job id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --parent-job: $(cat "$T1137_ERR")"
+LC_ALL=C t1137_usage --role tester --parent-job 'job/bad'
+[[ "$T1137_RC" -eq 2 ]] ||
+  fail "hk1137: a slash in --parent-job must still refuse rc 2 (rc=$T1137_RC)"
+# Site: --takeover-from (die path, same job-id charset).
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-tk --parent director-x \
+  --task 1 --takeover-from 'job.a_b-9'
+! grep -q 'must be a job id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --takeover-from: $(cat "$T1137_ERR")"
+# Site: [hub] machine_id fallback — 64 chars registers, 65 warns malformed.
+LANES_CFG_OVERRIDE="$T1137_CFG_MID64" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-m64 --role builder --lane t1137-m64 --parent director-x
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: 64-char machine_id spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-m64@'"$T1137_ID64"'$' "$LANES_OUT" ||
+  fail "hk1137: the 64-char machine_id must register: $(cat "$LANES_OUT")"
+LANES_CFG_OVERRIDE="$T1137_CFG_MID65" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-m65 --role builder --lane t1137-m65 --parent director-x
+grep -q 'machine_id is malformed' "$LANES_ERR" ||
+  fail "hk1137: a 65-char machine_id must warn malformed: $(cat "$LANES_ERR")"
+# Site: '.', '_' and '-' inside machine_id stay accepted.
+LANES_CFG_OVERRIDE="$T1137_CFG_DOTID" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-mdot --role builder --lane t1137-mdot --parent director-x
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: mac.x_y-z machine_id spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-mdot@mac\.x_y-z$' "$LANES_OUT" ||
+  fail "hk1137: mac.x_y-z must register as the machine: $(cat "$LANES_OUT")"
+# Site: lanes_token_env HUB_MACHINE_ID — 64 chars registers, matched against
+# the session machine.
+LANES_CFG_OVERRIDE="$T1137_CFG_NODE64" HERDR_SESSION=default \
+  lanes_spawn t1137-n64 --owner work-kairos
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: 64-char HUB_MACHINE_ID spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-n64@'"$T1137_ID64"'$' "$LANES_OUT" ||
+  fail "hk1137: the 64-char HUB_MACHINE_ID must register: $(cat "$LANES_OUT")"
+echo "PASS hk1137-ascii boundaries: 64 accepted, 65 refused, . _ - accepted"
+
+if [[ -z "$T1137_LOCALE" ]]; then
+  # The refusal probes NEED a UTF-8 locale — under C even an unpinned =~
+  # refuses e-acute, so a green run would be vacuous. Say SKIP with the
+  # reason; never let the section pass silently.
+  echo "SKIP hk1137-ascii refusal probes: no en_US.UTF-8 locale on this runner"
+else
+  # Run every site probe under both locale shapes: LC_ALL pinned, and
+  # LANG-only with LC_ALL unset (the second is the ambient-locale path —
+  # LANG only applies when LC_ALL is absent). The probes are shell
+  # functions, so the locale is set at suite level per mode and restored
+  # after the loop.
+  t1137_had_lc=0; [[ -n "${LC_ALL+x}" ]] && t1137_had_lc=1
+  t1137_had_lang=0; [[ -n "${LANG+x}" ]] && t1137_had_lang=1
+  t1137_saved_lc="${LC_ALL-}" t1137_saved_lang="${LANG-}"
+  for t1137_mode in LC_ALL LANG_ONLY; do
+    if [[ "$t1137_mode" == LC_ALL ]]; then
+      export LC_ALL="$T1137_LOCALE"
+      t1137_tag=lcall
+    else
+      t1137_tag=lang
+      unset LC_ALL
+      export LANG="$T1137_LOCALE"
+    fi
+
+    # Site: --lane-defer. Fixed build: rc 2 + charset message + no raw é.
+    # Unfixed: é passes validation and the spawn proceeds — rc != 2 and no
+    # refusal line.
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-ld --parent director-x \
+      --task "$(mint_task)" --lane-defer "$T1137_EACUTE_ID"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --lane-defer must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'matching \[A-Za-z0-9._-\]' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --lane-defer refusal must name the charset: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "lane-defer/$t1137_mode"
+
+    # Site: --parent-job. Fixed build: rc 2; the die may name the value only
+    # scrubbed — the raw é bytes must not reach stderr.
+    t1137_usage --role tester --parent-job "$T1137_EACUTE_JOB"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --parent-job must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'must be a job id' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --parent-job refusal must name the rule: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "parent-job/$t1137_mode"
+
+    # Site: --takeover-from — same job-id charset, builder-only flag.
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-tk2 --parent director-x \
+      --task 1 --takeover-from "$T1137_EACUTE_JOB"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --takeover-from must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'must be a job id' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --takeover-from refusal must name the rule: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "takeover-from/$t1137_mode"
+
+    # Site: [hub] machine_id fallback. Fixed build: the value-free malformed
+    # warning and no lanes call. Unfixed: é registers a lane on 'machéne'.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADMID" LANES_MODEL=builder-sol \
+      lanes_spawn "t1137-mid-$t1137_tag" --role builder --lane "t1137-mid-$t1137_tag" --parent director-x
+    grep -q 'machine_id is malformed' "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII machine_id must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "machine_id/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-mid-$t1137_tag"
+
+    # Site: session_machine_ids value. Fixed build: refuse closed with a
+    # value-free warning; unfixed, the non-ASCII machine reaches lanes add
+    # and the lane= field.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADMAP" HERDR_SESSION=default \
+      lanes_spawn "t1137-map-$t1137_tag" --owner work-kairos
+    grep -q "session's machine id is malformed" "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII session machine must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "session-map/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-map-$t1137_tag"
+
+    # Site: lanes_token_env HUB_MACHINE_ID. Fixed build: value-free
+    # malformed warning. Unfixed: é passes the charset check and the
+    # mismatch warning echoes 'machéne' verbatim.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADNODE" HERDR_SESSION=default \
+      lanes_spawn "t1137-node-$t1137_tag" --owner work-kairos
+    grep -q 'lanes_token_env HUB_MACHINE_ID is malformed' "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII HUB_MACHINE_ID must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "lanes-machine/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-node-$t1137_tag"
+  done
+  # Restore the suite's original locale env.
+  if (( t1137_had_lc )); then export LC_ALL="$t1137_saved_lc"; else unset LC_ALL; fi
+  if (( t1137_had_lang )); then export LANG="$t1137_saved_lang"; else unset LANG; fi
+  echo "PASS hk1137-ascii refusals: non-ASCII refused at every site under LC_ALL and LANG"
+
+  # Mutant — drop the locale pin at the --lane-defer site and that site's
+  # probe must go RED: é is accepted again, so there is no rc-2 refusal.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1137-unpin \
+    "ascii_re \"\$LANE_DEFER\" '^[A-Za-z0-9._-]{1,64}\$'" \
+    '[[ "$LANE_DEFER" =~ ^[A-Za-z0-9._-]{1,64}$ ]]'
+  LC_ALL="$T1137_LOCALE" WRK_UNDER_TEST="$TMP/mut-wrk-t1137-unpin" \
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-mut --parent director-x \
+    --task "$(mint_task)" --lane-defer "$T1137_EACUTE_ID"
+  [[ "$T1137_RC" -ne 2 || ! -s "$T1137_ERR" ]] ||
+    fail "hk1137 M1 mutant survived: --lane-defer still refused the non-ASCII id without the locale pin"
+  echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
+fi
 
 bash "$ROOT/tests/test-shellcheck-capped.sh"
 # hk 1604: devin gate-profile contract. The real-scopefuel smoke stays opt-in
