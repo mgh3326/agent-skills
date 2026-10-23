@@ -46,6 +46,7 @@ class FreeLimitObserverTests(unittest.TestCase):
             "TMPDIR": str(self.root / "tmp"),
             "PATH": os.defpath,
             "LC_ALL": "C.UTF-8",
+            "WRK_TEST_MODE": "1",  # hk 1894
         }
         for directory in self.dirs.values():
             if directory.startswith(str(self.root)):

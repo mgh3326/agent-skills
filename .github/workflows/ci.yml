@@ -104,5 +104,6 @@ jobs:
           python3 tests/test-node-ops.py
           python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
           python3 -m unittest discover -s tests -p 'test_quota_stale_report.py' -v
+          python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
       - name: Mock MCP isolation, project migration and assertion mutants (fake only)
         run: python -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v

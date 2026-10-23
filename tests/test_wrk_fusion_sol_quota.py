@@ -59,6 +59,7 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
             "TMPDIR": str(self.root),
             "HK_TASK_ID": "1729",
             "ARBITER_INBOX_ROOT": str(self.inbox),
+            "WRK_TEST_MODE": "1",  # hk 1894: arbiter claim honours the temp inbox only in test mode
             "ARBITER_BIN": str(ROOT / "bin" / "arbiter"),
             "HANDOFFKEEP_BIN": str(self.root / "missing-handoffkeep-fixture"),
             "SCOPEFUEL_BIN": str(ROOT / "tests" / "fixtures" / "scopefuel"),
