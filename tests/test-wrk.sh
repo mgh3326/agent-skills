@@ -12269,7 +12269,8 @@ R21_DONE_HK_LOG="$TMP/r21-done-handoffkeep.log"
 R21_DONE_PW_LOG="$TMP/r21-done-panewire.log"
 R21_DONE_ERR="$TMP/r21-done.err"
 r21_claim "$R21_DONE_JOB"
-r21_done_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+r21_done_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host \
   HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" HANDOFFKEEP_TOKEN=fixture-token \
   WRK_HANDOFFKEEP_LOG="$R21_DONE_HK_LOG" WRK_PANEWIRE_LOG="$R21_DONE_PW_LOG" \
   "$WRK" 'done' "$R21_DONE_JOB" --report "$R21_DONE_REPORT" 2>"$R21_DONE_ERR")"
@@ -12303,7 +12304,8 @@ R21_LONG_REPORT="$R21_INBOX/$R21_LONG_JOB/report-long.md"
 mkdir -p "$(dirname "$R21_LONG_REPORT")"
 python3 -c 'print("x" * 300)' >"$R21_LONG_REPORT"
 r21_claim "$R21_LONG_JOB"
-env ARBITER_INBOX_ROOT="$R21_INBOX" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   "$WRK" 'done' "$R21_LONG_JOB" --report "$R21_LONG_REPORT" >/dev/null
 PYTHONPATH="$TMP" python3 - "$R21_INBOX/$R21_LONG_JOB/events" <<'PY'
 import sys
@@ -12325,7 +12327,8 @@ R21_FAIL_PW_LOG="$TMP/r21-fail-panewire.log"
 R21_FAIL_ERR="$TMP/r21-fail.err"
 r21_claim "$R21_FAIL_JOB"
 set +e
-r21_fail_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+r21_fail_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host \
   HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_RC=1 \
   WRK_PANEWIRE_LOG="$R21_FAIL_PW_LOG" "$WRK" 'done' "$R21_FAIL_JOB" \
   --report "$R21_FAIL_REPORT" 2>"$R21_FAIL_ERR")"
@@ -12354,7 +12357,8 @@ R21_ABSENT_PW_LOG="$TMP/r21-absent-panewire.log"
 R21_ABSENT_ERR="$TMP/r21-absent.err"
 r21_claim "$R21_ABSENT_JOB"
 set +e
-r21_absent_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+r21_absent_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host \
   HANDOFFKEEP_BIN="$TMP/no-handoffkeep" WRK_PANEWIRE_LOG="$R21_ABSENT_PW_LOG" \
   "$WRK" 'done' "$R21_ABSENT_JOB" --report "$R21_ABSENT_REPORT" 2>"$R21_ABSENT_ERR")"
 r21_absent_rc=$?
@@ -12384,7 +12388,8 @@ R21_SLOW_ERR="$TMP/r21-slow.err"
 r21_claim "$R21_SLOW_JOB"
 r21_slow_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 set +e
-r21_slow_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+r21_slow_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host \
   HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_SLEEP=30 \
   WRK_PANEWIRE_LOG="$R21_SLOW_PW_LOG" "$WRK" 'done' "$R21_SLOW_JOB" \
   --report "$R21_SLOW_REPORT" 2>"$R21_SLOW_ERR")"
@@ -12415,7 +12420,8 @@ R21_JOINED_REPORT="$(r21_report "$R21_JOINED_JOB" joined-report.md 'joined termi
 R21_JOINED_HK_LOG="$TMP/r21-joined-handoffkeep.log"
 R21_JOINED_PW_LOG="$TMP/r21-joined-panewire.log"
 r21_claim "$R21_JOINED_JOB" --role builder --parent-lane parent-a
-env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_JOINED_HK_LOG" WRK_PANEWIRE_LOG="$R21_JOINED_PW_LOG" \
   "$WRK" joined "$R21_JOINED_JOB" --pr https://example.invalid/pr/21 --head deadbeef \
   --report "$R21_JOINED_REPORT" >/dev/null
@@ -12441,7 +12447,8 @@ R21_ESC_REPORT="$(r21_report "$R21_ESC_JOB" escalation.md 'escalation terminal l
 R21_ESC_HK_LOG="$TMP/r21-escalate-handoffkeep.log"
 R21_ESC_PW_LOG="$TMP/r21-escalate-panewire.log"
 r21_claim "$R21_ESC_JOB" --role builder --parent-lane parent-a
-env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_ESC_HK_LOG" WRK_PANEWIRE_LOG="$R21_ESC_PW_LOG" \
   "$WRK" escalate "$R21_ESC_JOB" --question 'need a decision' --report "$R21_ESC_REPORT" >/dev/null
 PYTHONPATH="$TMP" python3 - "$R21_ESC_HK_LOG" "$R21_ESC_PW_LOG" "$R21_INBOX/$R21_ESC_JOB/events" <<'PY'
@@ -12461,7 +12468,8 @@ R21_ESC_EMPTY_JOB="r21-escalate-empty"
 R21_ESC_EMPTY_HK_LOG="$TMP/r21-escalate-empty-handoffkeep.log"
 R21_ESC_EMPTY_PW_LOG="$TMP/r21-escalate-empty-panewire.log"
 r21_claim "$R21_ESC_EMPTY_JOB" --role builder --parent-lane parent-a
-env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_ESC_EMPTY_HK_LOG" WRK_PANEWIRE_LOG="$R21_ESC_EMPTY_PW_LOG" \
   "$WRK" escalate "$R21_ESC_EMPTY_JOB" --question 'need a decision' >/dev/null
 [[ ! -s "$R21_ESC_EMPTY_HK_LOG" ]]
@@ -12480,7 +12488,8 @@ R21_ESC_MISSING_HK_LOG="$TMP/r21-escalate-missing-handoffkeep.log"
 r21_claim "$R21_ESC_MISSING_JOB" --role builder --parent-lane parent-a
 : >"$R21_ESC_MISSING_HK_LOG"
 set +e
-env ARBITER_INBOX_ROOT="$R21_INBOX" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_ESC_MISSING_HK_LOG" "$WRK" escalate "$R21_ESC_MISSING_JOB" \
   --question 'need a decision' --report "$TMP/no-such-report.md" >/dev/null 2>&1
 r21_esc_missing_rc=$?
@@ -12847,7 +12856,7 @@ env ARBITER_INBOX_ROOT="$SENTINEL_INBOX" "$ARBITER" event --job sentinel-idle \
   --kind job.spawned --payload-json '{"owner_lane":"test-lane","label":"test-label","pane_id":"test:pane"}' >/dev/null
 env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
-  "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
+  "$WRK" sentinel sentinel-idle lane worker test:pane "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
 own "$sentinel_idle_pid"
 sleep 2

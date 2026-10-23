@@ -76,6 +76,10 @@ case "$*" in
   *) exit 2 ;;
 esac
 STUB
+cat >"$FAKE_BIN/uname" <<'STUB'
+#!/usr/bin/env bash
+if [[ "$*" == -s ]]; then printf '%s\n' Linux; else exec /usr/bin/uname "$@"; fi
+STUB
 cat >"$FAKE_BIN/ps" <<'STUB'
 #!/usr/bin/env bash
 if [[ -n "${BYSTANDER_PID_FILE:-}" && ! -s "${BYSTANDER_PID_FILE}" ]]; then
@@ -84,7 +88,7 @@ if [[ -n "${BYSTANDER_PID_FILE:-}" && ! -s "${BYSTANDER_PID_FILE}" ]]; then
 fi
 printf '%s\n' "${SHELLCHECK_STUB_RSS_KB:-0}"
 STUB
-chmod +x "$FAKE_BIN/shellcheck" "$FAKE_BIN/systemd-run" "$FAKE_BIN/systemctl" "$FAKE_BIN/ps"
+chmod +x "$FAKE_BIN/shellcheck" "$FAKE_BIN/systemd-run" "$FAKE_BIN/systemctl" "$FAKE_BIN/uname" "$FAKE_BIN/ps"
 TEST_PATH="$FAKE_BIN:$PATH"
 
 ci_command=$(awk '

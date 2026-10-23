@@ -4866,11 +4866,11 @@ delegate_job_cmd() {
   # completion sentinel and release the arbiter quota_pool record. Same as
   # the local path: run it after the record lands, never mask the result.
   if [[ "$sub" == "done" || "$sub" == "joined" ]]; then
-    local d_job="${1:-}" d_meta="" d_owner=""
+    local d_job="${1:-}" d_meta="" d_owner="" d_pane=""
     if [[ -n "$d_job" && "$d_job" != -* ]]; then
       d_meta="$(completion_metadata "$d_job" 2>/dev/null || true)"
-      d_owner="${d_meta%%$'\t'*}"
-      job_end_housekeeping "$d_job" "$d_owner" "$sub" "panewire job $sub" "wrk $sub (delegated)"
+      IFS=$'\t' read -r d_owner _ d_pane _ _ <<<"$d_meta"
+      job_end_housekeeping "$d_job" "$d_owner" "$sub" "panewire job $sub" "wrk $sub (delegated)" "$d_pane"
     fi
   fi
   exit "$rc"
@@ -4915,7 +4915,7 @@ done_cmd() {
     warn "job.completed already recorded for this report; suppressed duplicate (job=$job)"
     # #770: duplicate or not, done means the job is over — stop the sentinel
     # and settle the hub/arbiter records before returning.
-    job_end_housekeeping "$job" "$owner" completed "wrk done (duplicate report)" "wrk done"
+    job_end_housekeeping "$job" "$owner" completed "wrk done (duplicate report)" "wrk done" "$pane"
     echo "OK job=$job report=$report"
     return 0
   fi
@@ -4931,7 +4931,7 @@ done_cmd() {
     # report between the resolve above and this write; its record stands.
     note_duplicate_completion "$job" "$report"
     warn "job.completed already recorded for this report; suppressed duplicate (job=$job)"
-    job_end_housekeeping "$job" "$owner" completed "wrk done (duplicate report)" "wrk done"
+    job_end_housekeeping "$job" "$owner" completed "wrk done (duplicate report)" "wrk done" "$pane"
     echo "OK job=$job report=$report"
     return 0
   fi
@@ -4944,7 +4944,7 @@ done_cmd() {
   # #770: end the hub job, release quota, and stop + wait on the completion
   # sentinel. Runs after the relay emit so the completed record is the first
   # thing panewire sees.
-  job_end_housekeeping "$job" "$owner" completed "wrk done" "wrk done"
+  job_end_housekeeping "$job" "$owner" completed "wrk done" "wrk done" "$pane"
   echo "OK job=$job report=$report$relay_suffix"
 }
 
@@ -5045,7 +5045,7 @@ joined_cmd() {
   joined_term="$(job_events_scan "$(wrk_jobs_root)/$job/events" 2>/dev/null | awk -F'\t' '{print $4}')"
   if [[ "$joined_term" == "job.joined" ]]; then
     warn "job.joined already recorded for $job; suppressed duplicate"
-    job_end_housekeeping "$job" "$owner" joined "wrk joined (duplicate)" "wrk joined"
+    job_end_housekeeping "$job" "$owner" joined "wrk joined (duplicate)" "wrk joined" "$pane"
     echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
     return 0
   fi
@@ -5056,7 +5056,7 @@ joined_cmd() {
   # #770: job.joined is a work-terminal but not a hub-terminal — the hub keeps
   # counting the job until the end declaration lands, and the completion
   # sentinel must not outlive the join.
-  job_end_housekeeping "$job" "$owner" joined "wrk joined" "wrk joined"
+  job_end_housekeeping "$job" "$owner" joined "wrk joined" "wrk joined" "$pane"
   echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
 }
 
@@ -6060,6 +6060,7 @@ exec(os.environ["WRK_EVENTS_PY"])
 events, pane = sys.argv[1:]
 CLAIM = {"job.claim", "job.claimed", "job.reclaim"}
 last_claim = last_spawn = -1
+claim_count = 0
 spawn_pane = ""
 for index, (name, doc, _mtime) in enumerate(wrk_events_ordered(events)):
     if doc is None:
@@ -6070,17 +6071,20 @@ for index, (name, doc, _mtime) in enumerate(wrk_events_ordered(events)):
     kind = doc.get("kind") or doc.get("type") or doc.get("event") or ""
     if kind == "job.spawned":
         last_spawn = index
+        spawn_pane = "" # hk1813-spawn-pane-reset
         candidate = payload.get("pane_id") or doc.get("pane_id")
         if isinstance(candidate, str) and candidate:
             spawn_pane = candidate
     elif kind in CLAIM:
         last_claim = index
+        claim_count += 1
 # Current when the newest spawn names this pane and no claim follows it, or
-# when the stream carries neither (a manual sentinel on an unclaimed job —
-# nothing proves another round exists). A claim newer than the newest spawn
-# is an in-flight respawn: superseded even when the panes still match.
+# when a receipt-less stream is still at its initial claim. A second claim
+# without an intervening spawned receipt means a reclaimed round is in flight,
+# so the older pane watcher is superseded. A claim newer than the newest spawn
+# is likewise an in-flight respawn: superseded even when the panes still match.
 current = (last_spawn != -1 and spawn_pane == pane and last_claim < last_spawn) or \
-          (last_spawn == -1 and last_claim == -1)
+          (last_spawn == -1 and claim_count <= 1) # hk1813-t4-no-spawn-current
 sys.exit(0 if current else 1)
 PY
 }
@@ -6092,14 +6096,15 @@ PY
 # revive (already-ended) or when a revive is newest (the job is live again —
 # ending it would be wrong). Prints created|already-ended|active.
 job_end_record() {
-  local job="$1" owner="$2" outcome="$3" reason="$4" source="$5" events
+  local job="$1" owner="$2" outcome="$3" reason="$4" source="$5" pane="${6:-}" allow_dead_current="${7:-0}" events
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events" || return 1
-  wrk_py - "$events" "$job" "$owner" "$outcome" "$reason" "$source" "${HOSTNAME:-unknown}" <<'PY'
+  wrk_py - "$events" "$job" "$owner" "$outcome" "$reason" "$source" "${HOSTNAME:-unknown}" "$pane" "$allow_dead_current" <<'PY'
 import datetime, fcntl, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 
-events, job, owner, outcome, reason, source, host = sys.argv[1:]
+events, job, owner, outcome, reason, source, host, dead_pane, allow_dead_current = sys.argv[1:]
+allow_dead_current = allow_dead_current == "1"
 WORK_TERMINAL = {"job.completed", "job.completion", "job.joined", "job.revoked", "job.reaped", "job.handed_off"}
 HUB_TERMINAL = {"job.completed", "job.completion", "job.revoked"}
 REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.reprompted"}
@@ -6139,10 +6144,33 @@ with open(lock_path, "w", encoding="utf-8") as lock:
         print("already-ended")
         raise SystemExit(0)
     if last_term > -1 and last_revive > last_term:
-        # Terminal first, then a claim/spawned again — the job was picked up
-        # after it ended and is live work; never end it from housekeeping.
-        print("active")
-        raise SystemExit(0)
+        # Terminal first, then a revive normally means the job was picked up
+        # again. Prune may end that round only after its newest spawned pane
+        # has been confirmed gone past the grace; the locked event reread must
+        # still name the same pane and have no claim after its spawn.
+        last_spawn = last_claim = -1
+        spawn_pane = ""
+        for index, (name, doc, _mtime) in enumerate(wrk_events_ordered(events)):
+            if doc is None:
+                continue
+            kind = doc.get("kind") or doc.get("type") or doc.get("event") or ""
+            payload = doc.get("payload")
+            if not isinstance(payload, dict):
+                payload = {}
+            if kind == "job.spawned":
+                last_spawn = index
+                spawn_pane = ""
+                candidate = payload.get("pane_id") or doc.get("pane_id")
+                if isinstance(candidate, str) and candidate:
+                    spawn_pane = candidate
+            elif kind in ("job.claim", "job.claimed", "job.reclaim"):
+                last_claim = index
+        allow_dead_terminal_then_revive = (
+            allow_dead_current and dead_pane and last_spawn > last_term and
+            spawn_pane == dead_pane and last_claim < last_spawn)
+        if not allow_dead_terminal_then_revive: # hk1813-allow-dead-current-round
+            print("active")
+            raise SystemExit(0)
     record = {"kind": "job.revoked", "job_id": job, "epoch": 1,
               "owner_lane": owner, "outcome": outcome, "reason": reason,
               "source": source, "host": host,
@@ -6154,15 +6182,18 @@ PY
 }
 
 # quota_release_log JOB POOL REASON — one durable line per release failure.
-# Use the job log when available; a sentinel's stderr is already redirected to
-# that same file, so writing both would duplicate the failure. Fall back to
-# stderr when the job log cannot be written.
+# A detached sentinel's stderr is redirected to its job log, so durable logging
+# alone avoids duplicate lines there. Foreground callers also warn on stderr;
+# if the job log cannot be written, all modes fall back to stderr.
 quota_release_log() {
   local job="$1" pool="$2" reason="$3" jobdir line
   jobdir="$(wrk_jobs_root)/$job"
   if [[ -d "$jobdir" ]]; then
     line="$(date -u +%Y-%m-%dT%H:%M:%SZ) status=- transient=0 action=quota-release-failed $reason job=$job pool=$pool"
     if printf '%s\n' "$line" >>"$jobdir/completion-sentinel.log" 2>/dev/null; then
+      if [[ "${WRK_COMPLETION_SENTINEL:-0}" != 1 ]]; then # hk1813-foreground-release-warning
+        warn "arbiter quota_pool release failed (job=$job pool=$pool $reason)"
+      fi
       return 0
     fi
   fi
@@ -6170,16 +6201,48 @@ quota_release_log() {
   return 0
 }
 
-# release_job_quota_pool JOB — release every live quota_pool record this job
+# quota_release_round_current JOB PANE [MODE] — prove that the latest terminal
+# still authorizes this release. The default mode requires the candidate's
+# observed pane to be the current watch round. ended-no-sentinel is reserved
+# for prune pass 4: terminal ordering must prove the job ended and no live
+# completion sentinel may still own cleanup.
+quota_release_round_current() {
+  local job="$1" pane="${2:-}" mode="${3:-current}" jobdir
+  jobdir="$(wrk_jobs_root)/$job"
+  if [[ -z "$pane" || "$pane" == - ]]; then
+    pane="$(job_events_scan "$jobdir/events" 2>/dev/null | awk -F '\t' -v j="$job" '$1==j {print $10; exit}')"
+    [[ "$pane" == - ]] && pane=""
+  fi
+  if ! sentinel_job_ended "$jobdir"; then
+    echo "skip job=$job reason=revived-since-scan"
+    return 2
+  fi
+  if [[ "$mode" == ended-no-sentinel ]]; then # hk1813-ended-no-sentinel-mode
+    if job_has_live_completion_sentinel "$job"; then # hk1813-ended-quota-live-sentinel-check
+      echo "skip job=$job reason=live-sentinel"
+      return 2
+    fi
+    return 0
+  fi
+  if [[ "$mode" != current ]] || ! job_watch_current "$jobdir/events" "$pane"; then
+    echo "skip job=$job reason=revived-since-scan"
+    return 2
+  fi
+}
+
+# release_job_quota_pool JOB [PANE] — release every live quota_pool record this job
 # still holds (any pool) so the arbiter-side job record flips to released.
 # The table holds only unreleased rows, so every row it lists is a record
 # whose last quota_pool.record is newer than its last release — a record
 # released once and re-recorded later (respawn, takeover, a later round) is
 # released here too. Idempotent: a second call finds no rows. Best-effort:
 # an unavailable arbiter, a failed status, or a failed release is logged once
-# (rc, job, pool) via quota_release_log and never fails the end path.
+# (rc, job, pool) via quota_release_log and never fails the end path. Before
+# each release, re-read the terminal and the selected release-mode evidence; a
+# scan snapshot cannot authorize releasing a row after a same-id reclaim or
+# respawn.
 release_job_quota_pool() {
-  local job="$1" arb out pool rc
+  local job="$1" pane="${2:-}" mode="${3:-current}" arb out pool rc
   arb="${ARBITER:-}"
   if [[ -z "$arb" || ! -x "$arb" ]]; then
     arb="$(command -v arbiter 2>/dev/null || true)"
@@ -6195,6 +6258,10 @@ release_job_quota_pool() {
   }
   while IFS= read -r pool; do
     [[ -n "$pool" ]] || continue
+    # This check must follow status and sit immediately before each arbiter
+    # release. A revive after the command's earlier candidate scan leaves the
+    # live round's row untouched and makes the caller leave its paired action.
+    quota_release_round_current "$job" "$pane" "$mode" || return $? # hk1813-release-time-check
     "$arb" release --job "$job" --resource "$pool" --kind quota_pool >/dev/null 2>&1 || {
       rc=$?
       quota_release_log "$job" "$pool" "rc=$rc"
@@ -6389,7 +6456,13 @@ stop_completion_sentinel() {
       done
     fi
   done
-  rm -f "$pidfile" 2>/dev/null || true
+  if [[ -z "$explicit_pid" ]]; then
+    rm -f "$pidfile" 2>/dev/null || true
+  else
+    local current_pid=""
+    IFS=$'\t' read -r current_pid _ <<<"$(sentinel_pidfile_fields "$pidfile")"
+    [[ "$current_pid" != "$explicit_pid" ]] || rm -f "$pidfile" 2>/dev/null || true
+  fi
   return 0
 }
 
@@ -6399,14 +6472,15 @@ stop_completion_sentinel() {
 # the completion sentinel. Every step is best-effort; a housekeeping failure
 # must never mask the record the caller just wrote.
 job_end_housekeeping() {
-  local job="$1" owner="$2" outcome="$3" reason="$4" source="$5" end_out
+  local job="$1" owner="$2" outcome="$3" reason="$4" source="$5" pane="${6:-}" end_out release_rc=0
   end_out="$(job_end_record "$job" "$owner" "$outcome" "$reason" "$source" 2>/dev/null)" || {
     warn "job end declaration write failed for $job; the records stay file-only"
     return 0
   }
   case "$end_out" in
     created|already-ended)
-      release_job_quota_pool "$job" # hk1798-housekeeping-release
+      release_job_quota_pool "$job" "$pane" || release_rc=$? # hk1798-housekeeping-release
+      [[ "$release_rc" != 2 ]] || return 0 # hk1813-housekeeping-release-current
       stop_completion_sentinel "$job"
       ;;
     active) return 0 ;; # hk1798-housekeeping-active-guard
@@ -6466,6 +6540,8 @@ PY
 }
 
 sentinel_cmd() {
+  WRK_COMPLETION_SENTINEL=1
+  export WRK_COMPLETION_SENTINEL
   local job="${1:-}" owner="${2:-}" label="${3:-}" pane="${4:-}" report="${5:-}"
   local pane_kind="${7:-}" observed_rung="${8:-}" scopefuel_bin="${9:-}"
   local timeout="${WRK_COMPLETION_TIMEOUT_S:-21600}"
@@ -6594,7 +6670,9 @@ PY
     if sentinel_job_ended "$jobdir"; then
       # hk1798: another path ended this job; if it left a live quota record
       # behind, this waking sentinel is the last thing that can return it.
-      release_job_quota_pool "$job" # hk1798-sentinel-watch-exit-release
+      local watch_release_rc=0
+      release_job_quota_pool "$job" "$pane" || watch_release_rc=$? # hk1798-sentinel-watch-exit-release
+      [[ "$watch_release_rc" != 2 ]] || sentinel_self_exit "$job" 0
       sentinel_log "$logfile" "$token" "$transient" "watch-exit"
       sentinel_self_exit "$job" 0
     fi
@@ -6607,6 +6685,10 @@ PY
     case "$action" in
       completed)
         local completion_status
+        if ! job_watch_current "$jobdir/events" "$pane"; then # hk1813-sentinel-completed-current-gate
+          sentinel_log "$logfile" "$token" "$transient" "superseded" "watched-pane=$pane"
+          sentinel_self_exit "$job" 0
+        fi
         completion_status="$(completion_event "$job" "$owner" "$label" "$pane" "$candidate")"
         seen="$key"
         if [[ "$completion_status" == duplicate ]]; then
@@ -6616,7 +6698,12 @@ PY
         # hk1798: every live record of the job goes back through the shared
         # helper — the $resource-only release missed re-recorded pools and
         # silently skipped whenever ARBITER never reached the sentinel env.
-        release_job_quota_pool "$job" # hk1798-sentinel-completed-release
+        local release_rc=0
+        release_job_quota_pool "$job" "$pane" || release_rc=$? # hk1798-sentinel-completed-release
+        if [[ "$release_rc" == 2 ]]; then
+          sentinel_log "$logfile" "$token" "$transient" "superseded" "watched-pane=$pane"
+          sentinel_self_exit "$job" 0
+        fi
         # #770: completed — including post-loss completion — ends the job, so
         # the sentinel leaves with it instead of becoming the leftover process
         # this task exists to remove.
@@ -6654,7 +6741,7 @@ PY
       # The end declaration may lose a race to a revive; only a terminal result
       # authorizes releasing that job's quota rows.
       case "$end_out" in
-        created|already-ended) release_job_quota_pool "$job" ;; # hk1798-lost-grace-release
+        created|already-ended) release_job_quota_pool "$job" "$pane" || : ;; # hk1798-lost-grace-release
       esac
       sentinel_self_exit "$job" 0
     fi
@@ -6681,6 +6768,7 @@ build_sentinel_env() {
 start_completion_sentinel() {
   local pidfile="$1"; shift
   local job="${1:-}"
+  local requested_owner="${2:-}" requested_pane="${4:-}" existing_pane=""
   mkdir -p "$(dirname "$pidfile")"
   local existing="" existing_started=""
   if [[ -s "$pidfile" ]]; then
@@ -6692,7 +6780,14 @@ start_completion_sentinel() {
     # argv-verified sentinel for this job — start time agreeing when the file
     # recorded one — suppresses a new start.
     if [[ "$existing" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$existing" "$job" && sentinel_start_matches "$existing" "$existing_started"; then
-      return 0
+      existing_pane="$(sentinel_argv_pane "$existing" "$job" "$requested_owner")"
+      if [[ -z "$existing_pane" || -z "$requested_pane" || "$existing_pane" == "$requested_pane" ]]; then
+        return 0
+      fi
+      # hk1813 N6: the old watcher is proven to belong to this job, but it is
+      # watching a different round. Stop only that pid before installing the
+      # watcher for the new spawn; never sweep or pattern-match here.
+      stop_completion_sentinel "$job" "$existing" # hk1813-replace-sentinel-pane-check
     fi
   fi
   rm -f "$pidfile"
@@ -9561,7 +9656,7 @@ except (ValueError, TypeError, AttributeError) as error:
 hk_task_takeover_rebind() {
   [[ -n "$TAKEOVER_FROM" ]] || return 0
   hk_task_takeover_precheck
-  local handoffkeep out rc=0 verify
+  local handoffkeep out rc=0 verify release_rc=0
   handoffkeep="$(hk_bin)"
   [[ -n "$handoffkeep" ]] || die "takeover refused: handoffkeep binary not found (set HANDOFFKEEP_BIN)"
   set +e
@@ -9589,7 +9684,11 @@ print("ok")
   # hk1798: job.handed_off is the old job's last work-terminal — hand back
   # every quota_pool record it still holds; a re-recorded or never-released
   # pool survives the hand-off otherwise.
-  release_job_quota_pool "$TAKEOVER_FROM" # hk1798-takeover-release
+  release_job_quota_pool "$TAKEOVER_FROM" || release_rc=$? # hk1813-takeover-release-best-effort
+  if (( release_rc != 0 && release_rc != 2 )); then
+    warn "takeover quota cleanup skipped for $TAKEOVER_FROM (rc=$release_rc)"
+  fi
+  return 0
 }
 
 # Commit both local audit records under their event locks. A rebind that the
@@ -10549,7 +10648,7 @@ reap_cmd() {
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
   candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
-  local job owner pane tab age note hub_lane hub_lane_machine lane_role probe class token probe_tab verdict acted=0
+  local job owner pane tab age note hub_lane hub_lane_machine lane_role probe class token probe_tab verdict acted=0 release_rc=0
   while IFS=$'\t' read -r job owner pane tab age note hub_lane hub_lane_machine lane_role; do
     [[ -n "$job" ]] || continue
     if [[ -n "$note" && "$note" != - ]]; then
@@ -10608,13 +10707,19 @@ reap_cmd() {
       # hk1798: release the job's remaining quota_pool records before the tab
       # close — the job already carries a work-terminal, so the records are
       # owed whether or not the close below lands.
-      release_job_quota_pool "$job" # hk1798-reap-preclose-release
+      release_rc=0
+      release_job_quota_pool "$job" "$pane" || release_rc=$? # hk1798-reap-preclose-release
+      if [[ "$release_rc" == 2 ]]; then
+        # The candidate was revived after reap_candidates took its snapshot.
+        # No tab close or follow-up end action belongs to that prior round.
+        continue # hk1813-reap-release-time-check
+      fi
       if "$HERDR" tab close "$tab" >/dev/null 2>&1; then
         reap_event "$job" "$owner" "$pane" "$tab"
         # #770: a reaped job is ended — declare it to the hub (job.reaped is a
         # work terminal but not one the hub ends on), release quota, and stop
         # + wait on the completion sentinel before moving on.
-        job_end_housekeeping "$job" "$owner" abandoned "pane reaped" "wrk reap"
+        job_end_housekeeping "$job" "$owner" abandoned "pane reaped" "wrk reap" "$pane"
         # #965: the lane this pane's spawn registered goes with it — only the
         # recorded lane, only on a confirmed close, and (#994) only while the
         # daemon still shows that row bound to the recorded machine+pane.
@@ -10789,6 +10894,21 @@ PY
 # stopped when the job's own records prove it ended or its pane is provably
 # gone — never on "looks old".
 
+# job_has_live_completion_sentinel JOB — true only when the pidfile proves a
+# live sentinel with its recorded start, or the exact process sweep finds one.
+job_has_live_completion_sentinel() {
+  local job="$1" pidfile pid started
+  pidfile="$(wrk_jobs_root)/$job/completion-sentinel.pid"
+  if [[ -s "$pidfile" ]]; then
+    IFS=$'\t' read -r pid started <<<"$(sentinel_pidfile_fields "$pidfile")"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$pid" "$job" &&
+       sentinel_start_matches "$pid" "$started"; then
+      return 0
+    fi
+  fi
+  sentinel_sweep | awk -F '\t' -v j="$job" '$2==j {found=1} END {exit(found ? 0 : 1)}'
+}
+
 # proc_elapsed_s PID — process age in seconds from ps etime (macOS has no
 # etimes); empty output or an unparseable field fails the call.
 proc_elapsed_s() {
@@ -10835,6 +10955,8 @@ Usage: wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
 Report — and with --apply, remove — what ended or stale jobs leave behind:
   * orphan completion sentinels (pidfile or a live `wrk sentinel JOB`
     process whose job ended, or whose pane is provably gone)
+  * quota_pool rows for already-ended jobs with no live sentinel (dry-run
+    reports would-release; --apply releases the arbiter's current rows)
   * stale jobs (events silent past --stale-age AND pane absent; records are
     never deleted — --apply appends a job.revoked end declaration so the
     hub stops counting them)
@@ -10879,7 +11001,7 @@ prune_sentinel_row() {
   if [[ -n "$row" ]]; then
     IFS=$'\t' read -r _ ended _ terminal _ _ _ owner _ j_pane _ <<<"$row"
   fi
-  local live=0 pidkind="absent" age="-"
+  local live=0 pidkind="absent" age="-" release_rc=0
   if [[ "$pid" =~ ^[0-9]+$ ]]; then
     if sentinel_pid_matches "$pid" "$job" && sentinel_start_matches "$pid" "$started"; then
       live=1; pidkind="live"; age="$(proc_elapsed_s "$pid" 2>/dev/null || echo '?')"
@@ -10917,7 +11039,8 @@ prune_sentinel_row() {
     if [[ "$PRUNE_APPLY" -eq 1 ]]; then
       # hk1798: the job already ended — hand back any quota record its own
       # end path leaked (idempotent: a clean job has no rows to release).
-      release_job_quota_pool "$job" # hk1798-prune-orphan-release
+      release_job_quota_pool "$job" "$j_pane" || release_rc=$? # hk1798-prune-orphan-release
+      [[ "$release_rc" != 2 ]] || return 0 # hk1813-prune-orphan-release-current
       stop_completion_sentinel "$job" "$pid" && echo "  action=stopped"
     fi
     return 0
@@ -10957,7 +11080,8 @@ prune_sentinel_row() {
           # The pane observation can be stale after a revive; only release if
           # job_end_record confirms that this path actually ended the job.
           if [[ "$_end_out" == created || "$_end_out" == already-ended ]]; then # hk1798-pane-gone-end-gate
-            release_job_quota_pool "$job" # hk1798-pane-gone-release
+            release_job_quota_pool "$job" "$pane" || release_rc=$? # hk1798-pane-gone-release
+            [[ "$release_rc" != 2 ]] || return 0 # hk1813-pane-gone-release-current
             stop_completion_sentinel "$job" "$pid" && echo "  action=stopped+ended"
           else
             stop_completion_sentinel "$job" "$pid" && echo "  action=stopped"
@@ -11035,7 +11159,7 @@ prune_cmd() {
 
   # Pass 3 — stale jobs: silent past --stale-age AND pane absent. Records are
   # kept; --apply only appends the hub-visible end declaration.
-  local stale_n=0 _ended _hub _term _age _last _comp _label _tab _pstate
+  local stale_n=0 _ended _hub _term _age _last _comp _label _tab _pstate _end_pane _release_rc
   while IFS=$'\t' read -r job _ended _hub _term _age _last _comp _owner _label _pane _tab; do
     [[ -n "$job" ]] || continue
     [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
@@ -11053,19 +11177,78 @@ prune_cmd() {
     echo "job $job stale=yes last_event_age=${_age}s owner=$_owner pane=$_pane pane_state=$_pstate"
     if (( apply )); then
       local _end_out=""
-      _end_out="$(job_end_record "$job" "$_owner" abandoned "stale: silent ${_age}s, pane absent" "wrk prune" 2>/dev/null)" || true
+      _end_pane="$_pane"
+      [[ "$_end_pane" == - ]] && _end_pane=""
+      _end_out="$(job_end_record "$job" "$_owner" abandoned "stale: silent ${_age}s, pane absent" "wrk prune" "$_end_pane" 1 2>/dev/null)" || true
       if [[ "$_end_out" == created || "$_end_out" == already-ended ]]; then
         echo "  action=end-declaration"
         # hk1798: the end declaration landed (or the job had already ended) —
         # return whatever quota records the dead pane's lease left behind.
-        release_job_quota_pool "$job" # hk1798-prune-stale-release
+        _release_rc=0
+        release_job_quota_pool "$job" "$_end_pane" || _release_rc=$? # hk1798-prune-stale-release
+        [[ "$_release_rc" != 2 ]] || continue
       else
         echo "  action=end-declaration-failed"
       fi
     fi
   done <<<"$PRUNE_SCAN"
 
-  # Pass 4 — quota-refresh supervisors (quota-refresh.pid written by
+  # Pass 4 — quota_pool records on jobs whose newest terminal is still newer
+  # than every revive, and that have no live completion sentinel. The arbiter
+  # table is authoritative for rows: an earlier release event may be followed
+  # by a new record for the same job and pool.
+  local quota_releases=0 _quota_arb="${ARBITER:-}" _quota_status _quota_pools _quota_csv _quota_pane _quota_rc
+  if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
+    _quota_arb="$(command -v arbiter 2>/dev/null || true)"
+  fi
+  while IFS=$'\t' read -r job _ended _hub _term _age _last _comp _owner _label _pane _tab; do
+    [[ -n "$job" ]] || continue
+    [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
+    [[ -z "$lane" || "$_owner" == "$lane" ]] || continue
+    [[ "$_ended" == 1 ]] || continue # hk1813-ended-quota-release-pass
+    job_has_live_completion_sentinel "$job" && continue
+    if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
+      quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"
+      echo "skip job=$job reason=arbiter-unavailable"
+      continue
+    fi
+    _quota_status="$("$_quota_arb" status --job "$job" --json 2>/dev/null)" || {
+      quota_release_log "$job" "-" "rc=$? reason=status-failed"
+      echo "skip job=$job reason=status-failed"
+      continue
+    }
+    _quota_pools="$(python3 - "$_quota_status" <<'PY'
+import json, sys
+try:
+    doc = json.loads(sys.argv[1])
+except ValueError:
+    raise SystemExit(0)
+pools = {row.get("pool") for row in doc.get("quota_pool_records") or []
+         if isinstance(row, dict) and isinstance(row.get("pool"), str) and row["pool"]}
+print("\n".join(sorted(pools)))
+PY
+    )"
+    [[ -n "$_quota_pools" ]] || continue
+    _quota_csv="$(tr '\n' ',' <<<"$_quota_pools")"
+    _quota_csv="${_quota_csv%,}"
+    _quota_pane="$_pane"
+    [[ "$_quota_pane" == - ]] && _quota_pane=""
+    if (( apply )); then
+      _quota_rc=0
+      release_job_quota_pool "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$? # hk1813-ended-quota-release-call
+      [[ "$_quota_rc" != 2 ]] || continue
+      quota_releases=$(( quota_releases + 1 ))
+      echo "release-attempted job=$job pools=$_quota_csv"
+    else
+      _quota_rc=0
+      quota_release_round_current "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$?
+      [[ "$_quota_rc" != 2 ]] || continue
+      quota_releases=$(( quota_releases + 1 ))
+      echo "would-release job=$job pools=$_quota_csv"
+    fi
+  done <<<"$PRUNE_SCAN"
+
+  # Pass 5 — quota-refresh supervisors (quota-refresh.pid written by
   # refresh_quota_pool). A live pid is only a leftover when it verifies
   # (start time matches the record within the pid-reuse window) AND the job
   # ended or the recorded deadline passed.
@@ -11121,7 +11304,7 @@ prune_cmd() {
     fi
   done < <(find "$jobs_root" -maxdepth 2 -name quota-refresh.pid -type f 2>/dev/null | sort)
 
-  echo "prune: orphans=$PRUNE_ORPHANS stale_jobs=$stale_n refresh_leftovers=$left_n ($_mode)"
+  echo "prune: orphans=$PRUNE_ORPHANS stale_jobs=$stale_n quota_release_jobs=$quota_releases refresh_leftovers=$left_n ($_mode)"
 }
 
 find_cmd() {
