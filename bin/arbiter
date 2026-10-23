@@ -91,6 +91,133 @@ def inbox_root() -> Path:
     return Path(raw) if raw else Path.home() / "work" / "herdr-inbox" / "jobs"
 
 
+# hk 1454: arbiter claim mints the claim row wrk's trust path reads later, so
+# it takes the inbox and the DB from the passwd home unless WRK_TEST_MODE=1
+# and each override lies under a temp root. One rule on both sides: the
+# function below is byte-identical in bin/wrk (tests/test_trust_paths.py).
+# >>> trust_paths_decide (hk 1454): byte-identical in bin/wrk and bin/arbiter
+def trust_paths_decide(env, home, uid, fixtures, need):
+    """Pick the paths a trust-bearing operation may read (hk 1454).
+
+    home is the passwd home of uid, passed in so tests never touch the real
+    one. need is a subset of {"inbox", "db", "handoffkeep"}. Returns a dict:
+    "error" (a refusal line, or ""), "warning" (or ""), and the chosen
+    "inbox", "db" and "handoffkeep" paths.
+    """
+    import os, shutil, stat
+    real = os.path.realpath
+
+    def under(path, root):
+        root = root.rstrip("/")
+        return bool(root) and path.startswith(root + "/")
+
+    test_mode = env.get("WRK_TEST_MODE") == "1"
+    env_home = env.get("HOME") or home
+    canonical = {
+        "inbox": os.path.join(home, "work", "herdr-inbox", "jobs"),
+        "db": os.path.join(home, ".local", "share", "arbiter", "state.db"),
+        "handoffkeep": os.path.join(home, ".local", "bin", "handoffkeep"),
+    }
+    effective = {
+        "inbox": (env.get("ARBITER_INBOX_ROOT") or os.path.join(env_home, "work", "herdr-inbox", "jobs"),
+                  "ARBITER_INBOX_ROOT" if env.get("ARBITER_INBOX_ROOT") else "HOME"),
+        "db": (os.path.join(env.get("XDG_DATA_HOME") or os.path.join(env_home, ".local", "share"),
+                            "arbiter", "state.db"),
+               "XDG_DATA_HOME" if env.get("XDG_DATA_HOME") else "HOME"),
+    }
+    result = {"error": "", "warning": "", "inbox": "", "db": "", "handoffkeep": ""}
+
+    def refuse(message):
+        result["error"] = message
+        return result
+
+    for key in ("inbox", "db"):
+        if key in need and "\n" in effective[key][0]:
+            return refuse("%s contains a newline; refused" % effective[key][1])
+    if not test_mode:
+        for key in ("inbox", "db"):
+            if key not in need:
+                continue
+            path, var = effective[key]
+            if real(path) != real(canonical[key]):
+                return refuse("%s does not resolve to the canonical path %s; refused outside WRK_TEST_MODE"
+                              % (var, canonical[key]))
+            result[key] = path
+        if "handoffkeep" in need:
+            chosen = real(canonical["handoffkeep"])
+            override = env.get("HANDOFFKEEP_BIN") or ""
+            if override:
+                found = override if "/" in override else shutil.which(override, path=env.get("PATH") or "")
+                if not found or real(found) != chosen:
+                    return refuse("HANDOFFKEEP_BIN does not resolve to the canonical path %s; refused outside WRK_TEST_MODE"
+                                  % canonical["handoffkeep"])
+            try:
+                info = os.stat(chosen)
+            except OSError:
+                return refuse("canonical handoffkeep %s is missing; refused" % canonical["handoffkeep"])
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                    or info.st_mode & 0o022 or not info.st_mode & 0o100):
+                return refuse("canonical handoffkeep %s is not a regular executable owned by uid %d "
+                              "without group or world write; refused" % (canonical["handoffkeep"], uid))
+            result["handoffkeep"] = chosen
+        return result
+
+    # Test mode: every effective path must lie under a temp root, and none may
+    # resolve under the passwd home (the tripwire), except the repo fixtures.
+    roots = []
+    tmpdir = real(env["TMPDIR"]) if env.get("TMPDIR") else ""
+    if tmpdir and tmpdir != "/" and tmpdir != home.rstrip("/") \
+            and not under(home, tmpdir) and not under(tmpdir, home):
+        roots.append(tmpdir)
+    roots += [real(root) for root in ("/tmp", "/private/tmp", "/var/folders")]
+    fixture_root = real(fixtures) if fixtures else ""
+    named = []
+
+    def admit(path, var, extra):
+        resolved = real(path)
+        allowed = roots + extra
+        if not any(under(resolved, root) for root in extra) and (resolved == home.rstrip("/") or under(resolved, home)):
+            return "tripwire: %s resolves under the passwd home %s; refused in WRK_TEST_MODE" % (var, home)
+        if not any(under(resolved, root) for root in allowed):
+            return "%s resolves outside the test temp roots; refused in WRK_TEST_MODE" % var
+        named.append(var)
+        return ""
+
+    for key in ("inbox", "db"):
+        if key not in need:
+            continue
+        path, var = effective[key]
+        message = admit(path, var, [])
+        if message:
+            return refuse(message)
+        result[key] = path
+    if "handoffkeep" in need:
+        override = env.get("HANDOFFKEEP_BIN") or ""
+        var = "HANDOFFKEEP_BIN" if override else "PATH"
+        found = shutil.which(override or "handoffkeep", path=env.get("PATH") or "")
+        if found:
+            if "\n" in found:
+                return refuse("%s contains a newline; refused" % var)
+            message = admit(found, var, [fixture_root] if fixture_root else [])
+            if message:
+                return refuse(message)
+            result["handoffkeep"] = found
+    if named:
+        result["warning"] = "WRK_TEST_MODE=1: trust paths taken from %s" % " ".join(sorted(set(named)))
+    return result
+# <<< trust_paths_decide
+
+
+def trust_paths_check(need: set) -> None:
+    import pwd
+
+    decision = trust_paths_decide(os.environ, pwd.getpwuid(os.getuid()).pw_dir, os.getuid(), "", need)
+    if decision["error"]:
+        raise ArbiterError(EXIT_USAGE, decision["error"])
+    if decision["warning"]:
+        print(f"{PROG}: warning: {decision['warning']}", file=sys.stderr)
+
+
 def now_dt() -> dt.datetime:
     # Fixtures can make the real artifact writer deterministic without a mock.
     # This is deliberately opt-in and only affects callers that set the test
@@ -1626,6 +1753,7 @@ def main(argv: list[str]) -> int:
     as_json = bool(getattr(args, "json", False))
     try:
         if args.command == "claim":
+            trust_paths_check({"inbox", "db"})
             if args.role == "captain":
                 args.role = "builder"
             if args.role == "builder" and not args.parent_lane:

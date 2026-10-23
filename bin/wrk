@@ -4782,9 +4782,165 @@ record_emit_failure() {
   return 0
 }
 
+# hk 1454: trust-bearing operations (round open/verdict/void/status, joined,
+# the round-extension prechecks, the takeover round read) take the inbox and
+# the handoffkeep binary from the passwd home of the current uid, never from
+# ARBITER_INBOX_ROOT, HOME, HANDOFFKEEP_BIN or PATH -- unless WRK_TEST_MODE=1
+# and every override resolves under a temp root. This narrows, not bounds: the
+# same OS user can still edit the canonical files. The decision function is
+# byte-identical in bin/arbiter (tests/test_trust_paths.py checks that).
+read -r -d '' WRK_TRUST_PY <<'PY' || true
+# >>> trust_paths_decide (hk 1454): byte-identical in bin/wrk and bin/arbiter
+def trust_paths_decide(env, home, uid, fixtures, need):
+    """Pick the paths a trust-bearing operation may read (hk 1454).
+
+    home is the passwd home of uid, passed in so tests never touch the real
+    one. need is a subset of {"inbox", "db", "handoffkeep"}. Returns a dict:
+    "error" (a refusal line, or ""), "warning" (or ""), and the chosen
+    "inbox", "db" and "handoffkeep" paths.
+    """
+    import os, shutil, stat
+    real = os.path.realpath
+
+    def under(path, root):
+        root = root.rstrip("/")
+        return bool(root) and path.startswith(root + "/")
+
+    test_mode = env.get("WRK_TEST_MODE") == "1"
+    env_home = env.get("HOME") or home
+    canonical = {
+        "inbox": os.path.join(home, "work", "herdr-inbox", "jobs"),
+        "db": os.path.join(home, ".local", "share", "arbiter", "state.db"),
+        "handoffkeep": os.path.join(home, ".local", "bin", "handoffkeep"),
+    }
+    effective = {
+        "inbox": (env.get("ARBITER_INBOX_ROOT") or os.path.join(env_home, "work", "herdr-inbox", "jobs"),
+                  "ARBITER_INBOX_ROOT" if env.get("ARBITER_INBOX_ROOT") else "HOME"),
+        "db": (os.path.join(env.get("XDG_DATA_HOME") or os.path.join(env_home, ".local", "share"),
+                            "arbiter", "state.db"),
+               "XDG_DATA_HOME" if env.get("XDG_DATA_HOME") else "HOME"),
+    }
+    result = {"error": "", "warning": "", "inbox": "", "db": "", "handoffkeep": ""}
+
+    def refuse(message):
+        result["error"] = message
+        return result
+
+    for key in ("inbox", "db"):
+        if key in need and "\n" in effective[key][0]:
+            return refuse("%s contains a newline; refused" % effective[key][1])
+    if not test_mode:
+        for key in ("inbox", "db"):
+            if key not in need:
+                continue
+            path, var = effective[key]
+            if real(path) != real(canonical[key]):
+                return refuse("%s does not resolve to the canonical path %s; refused outside WRK_TEST_MODE"
+                              % (var, canonical[key]))
+            result[key] = path
+        if "handoffkeep" in need:
+            chosen = real(canonical["handoffkeep"])
+            override = env.get("HANDOFFKEEP_BIN") or ""
+            if override:
+                found = override if "/" in override else shutil.which(override, path=env.get("PATH") or "")
+                if not found or real(found) != chosen:
+                    return refuse("HANDOFFKEEP_BIN does not resolve to the canonical path %s; refused outside WRK_TEST_MODE"
+                                  % canonical["handoffkeep"])
+            try:
+                info = os.stat(chosen)
+            except OSError:
+                return refuse("canonical handoffkeep %s is missing; refused" % canonical["handoffkeep"])
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != uid
+                    or info.st_mode & 0o022 or not info.st_mode & 0o100):
+                return refuse("canonical handoffkeep %s is not a regular executable owned by uid %d "
+                              "without group or world write; refused" % (canonical["handoffkeep"], uid))
+            result["handoffkeep"] = chosen
+        return result
+
+    # Test mode: every effective path must lie under a temp root, and none may
+    # resolve under the passwd home (the tripwire), except the repo fixtures.
+    roots = []
+    tmpdir = real(env["TMPDIR"]) if env.get("TMPDIR") else ""
+    if tmpdir and tmpdir != "/" and tmpdir != home.rstrip("/") \
+            and not under(home, tmpdir) and not under(tmpdir, home):
+        roots.append(tmpdir)
+    roots += [real(root) for root in ("/tmp", "/private/tmp", "/var/folders")]
+    fixture_root = real(fixtures) if fixtures else ""
+    named = []
+
+    def admit(path, var, extra):
+        resolved = real(path)
+        allowed = roots + extra
+        if not any(under(resolved, root) for root in extra) and (resolved == home.rstrip("/") or under(resolved, home)):
+            return "tripwire: %s resolves under the passwd home %s; refused in WRK_TEST_MODE" % (var, home)
+        if not any(under(resolved, root) for root in allowed):
+            return "%s resolves outside the test temp roots; refused in WRK_TEST_MODE" % var
+        named.append(var)
+        return ""
+
+    for key in ("inbox", "db"):
+        if key not in need:
+            continue
+        path, var = effective[key]
+        message = admit(path, var, [])
+        if message:
+            return refuse(message)
+        result[key] = path
+    if "handoffkeep" in need:
+        override = env.get("HANDOFFKEEP_BIN") or ""
+        var = "HANDOFFKEEP_BIN" if override else "PATH"
+        found = shutil.which(override or "handoffkeep", path=env.get("PATH") or "")
+        if found:
+            if "\n" in found:
+                return refuse("%s contains a newline; refused" % var)
+            message = admit(found, var, [fixture_root] if fixture_root else [])
+            if message:
+                return refuse(message)
+            result["handoffkeep"] = found
+    if named:
+        result["warning"] = "WRK_TEST_MODE=1: trust paths taken from %s" % " ".join(sorted(set(named)))
+    return result
+# <<< trust_paths_decide
+PY
+# Tests that exercise the non-test-mode path patch this one line in a copy.
+read -r -d '' WRK_TRUST_MAIN_PY <<'PY' || true
+import os, pwd, sys
+WRK_TRUST_HOME = pwd.getpwuid(os.getuid()).pw_dir
+script, need = sys.argv[1], set(sys.argv[2].split(","))
+fixtures = os.path.join(os.path.dirname(os.path.dirname(os.path.realpath(script))), "tests", "fixtures")
+decision = trust_paths_decide(os.environ, WRK_TRUST_HOME, os.getuid(), fixtures, need)
+if decision["error"]:
+    print("wrk: " + decision["error"], file=sys.stderr)
+    raise SystemExit(2)
+if decision["warning"]:
+    print("wrk: warning: " + decision["warning"], file=sys.stderr)
+print(decision["inbox"])
+print(decision["handoffkeep"])
+print("end")
+PY
+WRK_TRUST_JOBS_ROOT=""
+WRK_TRUST_HANDOFFKEEP=""
+
+# wrk_trust_enter NEED -- NEED is "inbox" or "inbox,handoffkeep". A refusal
+# exits 2 with the one stderr line the decision printed, before any read or
+# write. On success wrk_jobs_root answers the checked root from here on.
+wrk_trust_enter() {
+  local out line lines=()
+  out="$(python3 -c "$WRK_TRUST_PY"$'\n'"$WRK_TRUST_MAIN_PY" "$0" "$1")" || exit 2
+  while IFS= read -r line; do lines+=("$line"); done <<<"$out"
+  [[ "${#lines[@]}" -eq 3 && "${lines[2]}" == end && -n "${lines[0]}" ]] ||
+    die "trust path check returned malformed output"
+  WRK_TRUST_JOBS_ROOT="${lines[0]}"
+  WRK_TRUST_HANDOFFKEEP="${lines[1]}"
+}
+
 # Keep this exactly aligned with arbiter.inbox_root(): ARBITER_INBOX_ROOT is
 # the jobs directory, rather than its parent.
 wrk_jobs_root() {
+  if [[ -n "$WRK_TRUST_JOBS_ROOT" ]]; then
+    printf '%s\n' "$WRK_TRUST_JOBS_ROOT"
+    return 0
+  fi
   printf '%s\n' "${ARBITER_INBOX_ROOT:-$HOME/work/herdr-inbox/jobs}"
 }
 
@@ -5047,6 +5203,7 @@ escalate_cmd() {
 }
 
 joined_cmd() {
+  wrk_trust_enter inbox
   delegate_job_cmd joined "$@"
   local job="${1:-}" pr="" head="" report="" metadata owner label pane parent role reason
   [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
@@ -5290,7 +5447,7 @@ PY
 # (JSON) on stdout; non-zero when the record is absent or handoffkeep fails.
 round_approval_fetch() {
   local ref="$1" handoffkeep out rc=0
-  handoffkeep="$(command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true)"
+  handoffkeep="$WRK_TRUST_HANDOFFKEEP"
   [[ -n "$handoffkeep" ]] || return 1
   case "$ref" in
     hk:doc/?*)  out="$("$handoffkeep" doc get "${ref#hk:doc/}" 2>/dev/null)" || rc=$? ;;
@@ -5395,7 +5552,7 @@ PY
 # (JSON) on stdout; non-zero when the record is absent or handoffkeep fails.
 round_pa_task_fetch() {
   local task_id="$1" handoffkeep out rc=0
-  handoffkeep="$(command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true)"
+  handoffkeep="$WRK_TRUST_HANDOFFKEEP"
   [[ -n "$handoffkeep" ]] || return 1
   out="$("$handoffkeep" tasks show "$task_id" 2>/dev/null)" || rc=$?
   [[ "$rc" -eq 0 && -n "$out" && "$out" != not_found ]] || return 1
@@ -5503,6 +5660,7 @@ round_open_cmd() {
     esac
   done
   [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] || die "round open --head requires a full 40-hex SHA"
+  if [[ -n "$extend" ]]; then wrk_trust_enter inbox,handoffkeep; else wrk_trust_enter inbox; fi
   head="$(printf '%s' "$head" | tr '[:upper:]' '[:lower:]')"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
@@ -5657,6 +5815,7 @@ round_void_cmd() {
     esac
   done
   [[ -n "$ref" ]] || die "round void requires --by REF"
+  wrk_trust_enter inbox,handoffkeep
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
 
@@ -5743,6 +5902,7 @@ round_verdict_cmd() {
     esac
   done
   [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
+  wrk_trust_enter inbox
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   local outcome rc=0
@@ -5853,6 +6013,7 @@ round_status_cmd() {
   local job="${1:-}"
   [[ -n "$job" && "$job" != -* ]] || die "round status requires a job id"
   [[ $# -eq 1 ]] || die "round status accepts only a job id"
+  wrk_trust_enter inbox
   local scan
   scan="$(round_scan "$job")"
   echo "job=$job cap=$ROUND_CAP_DEFAULT $scan"
@@ -9259,7 +9420,8 @@ round_ext_precheck() {
   [[ -n "$ROUND_EXT_REF" ]] || return 0
   local handoffkeep out grant_job="$PARENT_JOB"
   [[ "$ROLE" != builder ]] || grant_job="$JOB_ID"
-  handoffkeep="$(hk_bin)"
+  wrk_trust_enter inbox,handoffkeep
+  handoffkeep="$WRK_TRUST_HANDOFFKEEP"
   [[ -n "$handoffkeep" ]] || die "--round-ext: handoffkeep unavailable"
   out="$(hk_cmd "$handoffkeep" doc get "${ROUND_EXT_REF#hk:doc/}" 2>/dev/null)" ||
     die "--round-ext: document missing or handoffkeep unreachable"
@@ -9631,6 +9793,7 @@ print("\t".join([d.get("state") or "", d.get("claimed_by") or "",
 # handoffkeep rebinds the task.
 takeover_old_job_check() {
   local old="$1" events scan ended
+  wrk_trust_enter inbox
   events="$(wrk_jobs_root)/$old/events"
   [[ -d "$events" ]] || die "takeover refused: old job '$old' has no event history"
   scan="$(job_events_scan "$events")" || die "takeover refused: cannot inspect old job '$old'"
