@@ -693,6 +693,23 @@ die() { echo "wrk: $*" >&2; exit 2; }
 warn() { echo "wrk: warning: $*" >&2; }
 sleep_for() { [[ -n "${WRK_NO_SLEEP:-}" ]] || sleep "$1"; }
 
+# hk 1137: bash =~ ranges follow the caller's locale collation — under
+# e.g. en_US.UTF-8, [A-Za-z0-9._-] also matches ~2000 non-ASCII letters and
+# symbols (e-acute included), so a locale-pinned match is the only way the
+# id allowlists below accept the same byte set under any locale. Plain
+# ASCII inputs accept and reject exactly as before.
+ascii_re() {  # VALUE ERE — the =~ status under LC_ALL=C
+  local LC_ALL=C
+  [[ $1 =~ $2 ]]
+}
+
+# Echo-safe form of a rejected id for die/warn text: ASCII printable bytes
+# pass through unchanged; each other byte is rendered '?' so a non-ASCII or
+# control byte never reaches stderr (hk 1137).
+scrub_id() {
+  printf '%s' "$1" | LC_ALL=C tr -c '[:print:]' '?'
+}
+
 # Landing is a bounded positive-evidence observation, not a second boot wait.
 # The prompt command already owns its normal wait when supported. A 30-second
 # window covers the normal hand-off; codex gets 60 seconds because its cold
@@ -1419,7 +1436,7 @@ kimi_seed_workspace_trust() {
   # (미지 문자 처리 규칙은 미관측 — worktree 이름은 [A-Za-z0-9._-] 라 이 범위로 충분)
   basename_path="$(printf '%s' "$basename_path" | tr '[:upper:]' '[:lower:]')"
   basename_path="${basename_path:0:40}"
-  while [[ -n "$basename_path" && ! "${basename_path: -1}" =~ [a-z0-9] ]]; do
+  while [[ -n "$basename_path" ]] && ! ascii_re "${basename_path: -1}" '[a-z0-9]'; do
     basename_path="${basename_path%?}"
   done
   if ! digest="$(printf '%s' "$abs_cwd" | shasum -a 256 2>/dev/null | awk '{print $1}')" || [[ ${#digest} -lt 12 ]]; then
@@ -2141,7 +2158,7 @@ quota_hub_policy_gate() {
       pool=*) pool="${field#pool=}"; break ;;
     esac
   done
-  if [[ ! "$pool" =~ ^[a-z][a-z0-9._-]{0,63}$ ]]; then
+  if ! ascii_re "$pool" '^[a-z][a-z0-9._-]{0,63}$'; then
     echo "wrk: scopefuel gate output has no valid pool; hub quota gate failed closed" >&2
     return 70
   fi
@@ -6852,7 +6869,7 @@ spillover_hosts() {
   [[ -r "$config" ]] || return 0
   while IFS= read -r line || [[ -n "$line" ]]; do
     line="$(spillover_trim "$line")"
-    if [[ "$line" =~ ^\[hosts\.([A-Za-z0-9_-]+)\]$ ]]; then
+    if ascii_re "$line" '^\[hosts\.([A-Za-z0-9_-]+)\]$'; then
       printf '%s\n' "${BASH_REMATCH[1]}"
     fi
   done <"$config"
@@ -6958,7 +6975,7 @@ PY
 # ^[a-z0-9-]{1,32}$, enforced on the lanes add/rm operand (lanes_cli.go).
 # A value outside it must never reach panewire argv (#994/N2).
 hub_lane_name_valid() {
-  [[ "$1" =~ ^[a-z0-9-]{1,32}$ ]]
+  ascii_re "$1" '^[a-z0-9-]{1,32}$'
 }
 
 # Print one verdict line for LANE's row in a `panewire lanes ls` envelope,
@@ -7075,11 +7092,18 @@ hub_lane_register() {
       return 0
     fi
   fi
+  # hk 1137: a machine id resolved from session_machine_ids must be ASCII
+  # before it can reach a mismatch warning or a `lanes add` argv — refuse
+  # closed without echoing the value.
+  if [[ -n "$machine" ]] && ! ascii_re "$machine" '^[A-Za-z0-9._-]{1,64}$'; then
+    warn "hub lane not registered (the session's machine id is malformed)"
+    return 0
+  fi
   if [[ -z "$machine" && "$ROLE" == builder ]]; then
     machine="$(spillover_value hub machine_id 2>/dev/null || true)"
     # Same allowlist the lanes-token HUB_MACHINE_ID scan enforces — a
     # malformed value warns once WITHOUT it and skips, never reaching argv.
-    if [[ -n "$machine" && ! "$machine" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+    if [[ -n "$machine" ]] && ! ascii_re "$machine" '^[A-Za-z0-9._-]{1,64}$'; then
       warn "hub lane not registered ([hub] machine_id is malformed)"
       return 0
     fi
@@ -7157,7 +7181,7 @@ hub_lane_register() {
   if [[ -n "$lanes_env" ]]; then
     lanes_machine="$(spillover_env_key "$lanes_env" HUB_MACHINE_ID 2>/dev/null || true)"
     if [[ -n "$lanes_machine" ]]; then
-      if [[ ! "$lanes_machine" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then
+      if ! ascii_re "$lanes_machine" '^[A-Za-z0-9._-]{1,64}$'; then
         warn "hub lane not registered (lanes_token_env HUB_MACHINE_ID is malformed)"
         return 0
       fi
@@ -9205,7 +9229,7 @@ round_ext_validate() {
     *) die "round-extension supports only codex-astra or fable" ;;
   esac
   local pattern='^hk:doc/(round-extension|round-ext|[a-z0-9][a-z0-9-]*/round-ext)/[a-z0-9][a-z0-9._-]*$'
-  [[ ${#ROUND_EXT_REF} -le 128 && "$ROUND_EXT_REF" =~ $pattern ]] ||
+  [[ ${#ROUND_EXT_REF} -le 128 ]] && ascii_re "$ROUND_EXT_REF" "$pattern" ||
     die "--round-ext requires JOB [a-z0-9][a-z0-9._-]* (lowercase JOB starting with a letter/digit), REF at most 128 characters"
   if [[ "$ROLE" == builder ]]; then
     [[ -n "$TASK_ID" && "${ROUND_EXT_REF##*/}" == "$JOB_ID" ]] ||
@@ -9333,12 +9357,12 @@ task_validate() {
   if [[ -n "$TASK_ID" ]] && (( 10#$TASK_ID < 1 )); then
     die "--task must be a positive handoffkeep task id (got '$TASK_ID')"
   fi
-  if [[ -n "$PARENT_JOB" ]] && [[ ! "$PARENT_JOB" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    die "--parent-job must be a job id (got '$PARENT_JOB')"
+  if [[ -n "$PARENT_JOB" ]] && ! ascii_re "$PARENT_JOB" '^[A-Za-z0-9._-]+$'; then
+    die "--parent-job must be a job id (got '$(scrub_id "$PARENT_JOB")')"
   fi
   if [[ -n "${TAKEOVER_FROM:-}" ]]; then
-    [[ "$TAKEOVER_FROM" =~ ^[A-Za-z0-9._-]+$ ]] ||
-      die "--takeover-from must be a job id (got '$TAKEOVER_FROM')"
+    ascii_re "$TAKEOVER_FROM" '^[A-Za-z0-9._-]+$' ||
+      die "--takeover-from must be a job id (got '$(scrub_id "$TAKEOVER_FROM")')"
     [[ "$ROLE" == builder ]] || die "--takeover-from is builder-only; worker and tester roles cannot take over a task"
     [[ -z "$PARENT_JOB" ]] || die "--takeover-from cannot be combined with --parent-job"
     [[ "$TASK_HK_BYPASS" -eq 0 ]] || die "--takeover-from forbids --task-hk-bypass"
@@ -9950,7 +9974,7 @@ spawn_cmd() {
   # — lowercase, ≤32 chars, unique among live agents. herdr rejects violations late
   # and cryptically; retries then mutate the label (2026-08-03: legA-alpha-live vs
   # lega-alpha — one job forked into two ids over the uppercase 'A'). Fail early.
-  [[ "$LABEL" =~ ^[a-z][a-z0-9_-]{0,31}$ ]] || die "invalid label '$LABEL' — herdr agent names must match [a-z][a-z0-9_-]{0,31} (lowercase, ≤32 chars)"
+  ascii_re "$LABEL" '^[a-z][a-z0-9_-]{0,31}$' || die "invalid label '$(scrub_id "$LABEL")' — herdr agent names must match [a-z][a-z0-9_-]{0,31} (lowercase, ≤32 chars)"
   [[ -r "$PROMPT" ]] || die "prompt file is not readable: $PROMPT"
 
   [[ -n "$JOB_ID" ]] || JOB_ID="$LABEL"
@@ -9974,7 +9998,7 @@ spawn_cmd() {
   # the same charset as [hub] machine_id.
   if [[ -n "$LANE_DEFER" ]]; then
     [[ "$ROLE" == builder ]] || die "--lane-defer requires --role builder (it defers a builder lane's hub registration to the --host initiator)"
-    [[ "$LANE_DEFER" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || die "--lane-defer expects a machine id matching [A-Za-z0-9._-]{1,64}"
+    ascii_re "$LANE_DEFER" '^[A-Za-z0-9._-]{1,64}$' || die "--lane-defer expects a machine id matching [A-Za-z0-9._-]{1,64}"
   fi
   case "$BUILDER_LANE" in
     director-*|admiral-*) die "--lane '$BUILDER_LANE' is reserved for director lanes; --role builder/worker cannot claim it" ;;
