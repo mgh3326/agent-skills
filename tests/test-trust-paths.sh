@@ -223,6 +223,19 @@ run env -u WRK_TEST_MODE ARBITER_INBOX_ROOT="$CANON_INBOX" XDG_DATA_HOME="$TMP/b
 run env -u WRK_TEST_MODE -u ARBITER_INBOX_ROOT -u XDG_DATA_HOME HOME="$PW" "$TMP/bin/arbiter" claim --job ac4 --agent-label a --lane a --t T1
 [[ "$RC" -eq 0 && -e "$PW/.local/share/arbiter/state.db" && -d "$CANON_INBOX/ac4/events" ]] ||
   fail "arbiter claim refused the canonical paths (rc=$RC): $OUT"
+# hk 1454 r1 B1: an empty HOME is refused, and claim consumes the checked paths.
+run env -u WRK_TEST_MODE -u ARBITER_INBOX_ROOT -u XDG_DATA_HOME HOME= "$TMP/bin/arbiter" claim --job ac5 --agent-label a --lane a --t T1
+[[ "$RC" -eq 2 ]] && grep -q '^arbiter: HOME does not resolve to the canonical path' <<<"$OUT" ||
+  fail "arbiter claim with an empty HOME was not refused (rc=$RC): $OUT"
+# hk 1454 r1 B2: a passwd home that is a symlink still trips in test mode.
+ln -s "$PW" "$TMP/pw-alias"
+sed "s|trust_paths_decide(os.environ, pwd.getpwuid(os.getuid()).pw_dir,|trust_paths_decide(os.environ, \"$TMP/pw-alias\",|" \
+  "$ROOT/bin/arbiter" >"$TMP/bin/arbiter-alias"
+chmod +x "$TMP/bin/arbiter-alias"
+run env TMPDIR="$PW" HOME="$PW" ARBITER_INBOX_ROOT="$CANON_INBOX" XDG_DATA_HOME="$PW/.local/share" \
+  "$TMP/bin/arbiter-alias" claim --job ac6 --agent-label a --lane a --t T1
+[[ "$RC" -eq 2 ]] && grep -q 'tripwire' <<<"$OUT" || fail "symlinked passwd home did not trip (rc=$RC): $OUT"
+[[ ! -e "$CANON_INBOX/ac6" ]] || fail 'tripped claim wrote under the passwd home'
 echo "PASS arbiter-claim-same-rule"
 
 # ── mutants: each invariant must go RED when its check is removed ────────────

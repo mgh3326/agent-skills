@@ -195,6 +195,25 @@ class TrustPaths(unittest.TestCase):
             result = decide(env, home, self.uid, "", {"inbox"})
             self.assertNotEqual(result["error"], "", tmpdir)
 
+    def test_empty_home_is_not_the_passwd_home(self):
+        # The shell spells an empty HOME as "/work/...", so must the decision.
+        result = self.run_decide(self.env(HOME=""), need=("inbox",))
+        self.assertTrue(result["error"].startswith("HOME "), result)
+        result = self.run_decide(self.env(HOME=""), need=("db",))
+        self.assertTrue(result["error"].startswith("HOME "), result)
+
+    def test_mode_symlinked_passwd_home_still_trips(self):
+        alias = str(self.tmp / "pw-alias")
+        os.symlink(self.home, alias)
+        for tmpdir in (str(self.tmp), self.home, alias):
+            env = {"WRK_TEST_MODE": "1", "TMPDIR": tmpdir, "HOME": self.home, "ARBITER_INBOX_ROOT": self.inbox}
+            result = decide(env, alias, self.uid, "", {"inbox"})
+            self.assertIn("tripwire", result["error"], tmpdir)
+        # TMPDIR at the resolved home is not a temp root for other paths either.
+        env = {"WRK_TEST_MODE": "1", "TMPDIR": self.home, "HOME": str(self.tmp / "h"),
+               "ARBITER_INBOX_ROOT": "/nonexistent-wrk-1454/jobs"}
+        self.assertNotEqual(decide(env, alias, self.uid, "", {"inbox"})["error"], "")
+
     def test_mode_missing_handoffkeep_is_empty_not_canonical(self):
         result = self.run_decide(self.env(WRK_TEST_MODE="1", PATH=str(self.tmp / "nobin"),
                                           ARBITER_INBOX_ROOT=str(self.tmp / "i")),
