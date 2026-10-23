@@ -113,7 +113,8 @@ class PositionGuards(unittest.TestCase):
         target = c.base / "target"
         target.write_text("untouched")
         makers = [lambda: guard.symlink_to(target), lambda: os.mkfifo(guard),
-                  lambda: os.link(target, guard), lambda: guard.touch(mode=0o644)]
+                  lambda: os.link(target, guard),
+                  lambda: (guard.touch(), guard.chmod(0o644))]
         for make in makers:
             with self.subTest(make=make):
                 make()
@@ -152,7 +153,7 @@ class PositionGuards(unittest.TestCase):
         # while its peer successfully created this guard. Reproduce that
         # kernel result at the real open call, then require checked reuse.
         for kind, want in (("regular", 0), ("symlink", 78), ("fifo", 78),
-                           ("hardlink", 78), ("public", 78)):
+                           ("hardlink", 78), ("public", 78), ("missing", 78)):
             with self.subTest(kind=kind):
                 guard = self.guard()
                 anchor = 'if args[0] == "status":\n'
@@ -162,7 +163,8 @@ class PositionGuards(unittest.TestCase):
                     f"    if path == {guard.name!r} and flags & os.O_CREAT and not _guard_raced:\n"
                     "        _guard_raced = True\n"
                     f"        kind = {kind!r}\n"
-                    "        if kind == 'symlink':\n"
+                    "        if kind == 'missing': pass\n"
+                    "        elif kind == 'symlink':\n"
                     f"            os.symlink({str(target)!r}, path, dir_fd=dir_fd)\n"
                     "        elif kind == 'fifo': os.mkfifo(path, dir_fd=dir_fd)\n"
                     "        elif kind == 'hardlink':\n"
@@ -170,6 +172,7 @@ class PositionGuards(unittest.TestCase):
                     "        else:\n"
                     "            fd = _guard_real_open(path, flags | os.O_EXCL,\n"
                     "                0o644 if kind == 'public' else mode, dir_fd=dir_fd)\n"
+                    "            if kind == 'public': os.fchmod(fd, 0o644)\n"
                     "            os.close(fd)\n"
                     "        raise FileNotFoundError(2, 'concurrent guard creation', path)\n"
                     "    return _guard_real_open(path, flags, mode, dir_fd=dir_fd)\n"

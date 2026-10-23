@@ -11958,10 +11958,16 @@ def read_position(dirfd, name):
 def position_guard_open(dirfd, key):
     # A directory flock would also be available to other uids in an allowed
     # root-owned sticky directory. Use a persistent, private owned inode.
+    name = ".guard-" + key.encode("ascii").hex()
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
-        fd = os.open(".guard-" + key.encode("ascii").hex(),
-                     os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
-                     0o600, dir_fd=dirfd)
+        try:
+            fd = os.open(name, flags | os.O_CREAT, 0o600, dir_fd=dirfd)
+        except FileNotFoundError:
+            # macOS can report ENOENT when a peer creates the same guard.
+            # Try that existing inode once, without creating or following
+            # anything; the same fstat checks below still own acceptance.
+            fd = os.open(name, flags, dir_fd=dirfd)
     except OSError:
         return None
     try:
