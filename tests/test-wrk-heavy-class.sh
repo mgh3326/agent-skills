@@ -1018,4 +1018,5 @@ wait "$BG" || fail "mutant slotlink run failed"
 echo "PASS mutant-slotlink"
 
 python3 "$ROOT/tests/test_wrk_heavy_queue.py"
+python3 "$ROOT/tests/test_wrk_heavy_position_guards.py"
 echo 'PASS test-wrk-heavy-class'

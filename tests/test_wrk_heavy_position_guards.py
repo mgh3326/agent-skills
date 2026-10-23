@@ -85,14 +85,19 @@ class PositionGuards(unittest.TestCase):
         path = self.expired()
         guard = self.guard()
         guard.touch(mode=0o600)
+        entered = c.base / "status-lock-entered"
+        anchor = "def position_guard_lock(fd, *, blocking=True):\n"
+        binary = c.instrument("busy-status-wrk", anchor,
+                              anchor + f"    open({str(entered)!r}, 'w').close()\n")
         out = (c.base / "busy-status.out").open("w+")
         with guard.open("r+") as held:
             fcntl.flock(held, fcntl.LOCK_EX)
-            proc = subprocess.Popen([str(fixtures.WRK), "heavy", "status"], env=c.env,
+            proc = subprocess.Popen([str(binary), "heavy", "status"], env=c.env,
                                     stdout=out, stderr=subprocess.STDOUT)
             c.procs.append((proc, out))
             blocked = False
             try:
+                c.until(entered.exists, "status never reached its guard attempt")
                 proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 blocked = True
@@ -125,7 +130,7 @@ class PositionGuards(unittest.TestCase):
         guard = self.guard()
         guard.touch(mode=0o600)
         inode = guard.stat().st_ino
-        anchor = "positions_fd = -1\n"
+        anchor = 'if args[0] == "status":\n'
         injected = ("import types\n_real_guard_fstat = os.fstat\n"
                     "def _foreign_guard_fstat(fd):\n"
                     "    st = _real_guard_fstat(fd)\n"

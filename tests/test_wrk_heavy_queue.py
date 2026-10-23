@@ -180,7 +180,7 @@ class HeavyQueue(unittest.TestCase):
             self.assertIn("key=job-A", status)
             self.assertIn("expiry=", status)
             if expired:
-                for path in self.positions.iterdir():
+                for path in self.positions.glob("key-*.json"):
                     record = json.loads(path.read_text())
                     record["expiry"] = time.time() - 1
                     path.write_text(json.dumps(record))
@@ -421,13 +421,13 @@ class HeavyQueue(unittest.TestCase):
         self.assertEqual(self.ticket(self.queued("retry")), ticket)
         # A process crash before rename leaves only a dot file, never a
         # partially visible position. It cannot reserve a slot or be reused.
-        anchor = "        os.replace(tmp, position_name(queue_key),\n"
+        anchor = "            os.replace(tmp, position_name(queue_key),\n"
         binary = self.instrument("crash-mid-wrk", anchor,
-                                 "        os._exit(75)\n" + anchor)
+                                 "            os._exit(75)\n" + anchor)
         mid = self.spawn("mid", key="B", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
         mid_ticket = self.ticket(self.queued("mid"))
         self.assertEqual(mid.wait(timeout=5), 75)
-        self.assertTrue(any(p.name.startswith(".") for p in self.positions.iterdir()))
+        self.assertTrue(any(p.name.startswith(".position-") for p in self.positions.iterdir()))
         self.spawn("fresh-B", key="B")
         self.assertGreater(self.ticket(self.queued("fresh-B")), mid_ticket)
         self.release("holder")
