@@ -37,10 +37,14 @@ export TMPDIR="$SHORT"
 TMP="$(mktemp -d "$TMPDIR/t.XXXXXX")"
 PIDS=()
 CLEANUP_KEEP_TMP=0
+MAIN_BASHPID=$BASHPID
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
+  # Bash can run an EXIT trap in a subshell. Only the main shell may
+  # kill the jobs it started and remove the temp tree.
+  [[ "${BASHPID:-}" == "$MAIN_BASHPID" ]] || return 0
   local f pid
   for f in "$TMP"/*.sh; do
     [[ -e "$f" ]] && : >"${f%.sh}.rel"
@@ -113,11 +117,13 @@ sys.exit(0 if p(sys.argv[1]) < p(sys.argv[2]) else 1)' "$1" "$2"
 
 new_lock() {
   export WRK_HEAVY_LOCK="$TMP/$1.lock"
-  mkdir -p "$WRK_HEAVY_LOCK.waiters"
   rm -rf "$WRK_HEAVY_LOCK.positions"
   # Mutant re-runs reuse this temp dir. A start file left by the real case
   # would make "started" true before the new holder has the slot.
+  # Remove those markers before creating the waiters dir, so a glob
+  # cannot land on the directory this function just created.
   rm -f "$TMP"/*.start "$TMP"/*.rel "$TMP"/*.done "$TMP"/*.out
+  mkdir -p "$WRK_HEAVY_LOCK.waiters"
   : >"$TMP/order"
 }
 
@@ -750,6 +756,7 @@ sdead=$!
 PIDS+=("$sdead")
 kill "$sdead" 2>/dev/null || true
 wait "$sdead" 2>/dev/null || true
+mkdir -p "$WRK_HEAVY_LOCK.waiters"
 printf 'pid=%s class=lane limit=1 ticket=300:9 since=2026-01-01T00:00:00 job=- cmd=t-third\n' "$s1" \
   >"$WRK_HEAVY_LOCK.waiters/$s1"
 printf 'pid=%s class=lane limit=1 ticket=100:2 since=2026-01-01T00:00:00 job=- cmd=t-first\n' "$s2" \
