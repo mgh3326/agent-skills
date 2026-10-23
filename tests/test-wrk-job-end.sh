@@ -91,6 +91,25 @@ arb() {
     ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$ARBITER" "$@"
 }
 
+# fixture_claim_event JOB KIND PAYLOAD_JSON — writes a claim-kind events artifact
+# straight into JOB's events dir, numbered and shaped the way arbiter's writer
+# does: next prefix, same file name, same sorted JSON body, same clock as
+# ARBITER_TEST_NOW. Only the DB row is skipped, because arbiter event refuses
+# claim kinds. Each call site says why arbiter claim cannot mint its scenario.
+fixture_claim_event() {
+  python3 - "$INBOX/$1/events" "$1" "$2" "$3" <<'PY'
+import datetime, json, os, re, sys
+events, job, kind, payload = sys.argv[1:5]
+fixed = os.environ.get("ARBITER_TEST_NOW") or ""
+moment = datetime.datetime.fromisoformat(fixed) if fixed else datetime.datetime.now(datetime.timezone.utc)
+seq = max((int(name[:5]) for name in os.listdir(events) if re.match(r"\d{5}-", name)), default=0) + 1
+body = json.dumps({"created_at": moment.replace(microsecond=0).isoformat(), "job_id": job, "kind": kind,
+                   "payload": json.loads(payload), "seq": seq}, ensure_ascii=False, sort_keys=True)
+with open(os.path.join(events, "%05d-%s.json" % (seq, kind)), "x", encoding="utf-8") as handle:
+    handle.write(body + "\n")
+PY
+}
+
 # mk_job JOB [PANE] — claim + job.spawned receipt, the smallest live-job record.
 mk_job() {
   arb claim --job "$1" --lane lane-a --agent-label lbl --t T1 >/dev/null
@@ -844,9 +863,10 @@ reset_case je12
 mk_job je12 w:p1
 arb event --job je12 --kind job.completed \
   --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null 2>&1 || true
-# The revived shape: a claim newer than the completed, then a spawned.
-arb event --job je12 --kind job.claim \
-  --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null
+# The revived shape: a claim newer than the completed, then a spawned. arbiter
+# claim mints job.claim only as a first claim, and a re-claim of a released job
+# mints job.reclaim, so this record is written as a fixture file (see above).
+fixture_claim_event je12 job.claim '{"owner_lane":"lane-a","label":"lbl"}'
 arb event --job je12 --kind job.spawned \
   --payload-json '{"owner_lane":"lane-a","label":"lbl","pane_id":"w:p7"}' >/dev/null
 REPORT="$TMP/je12-report.md"; printf 'x\n' >"$REPORT"
@@ -1186,9 +1206,10 @@ reset_case je22
 mk_job je22 w:p5
 arb event --job je22 --kind job.completed \
   --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null 2>&1 || true
-# Newest record is a fresh claim — no spawned after it (P02's shape).
-arb event --job je22 --kind job.claim \
-  --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null
+# Newest record is a fresh claim — no spawned after it (P02's shape). The job is
+# still claimed, so arbiter claim cannot mint this job.claim; it is written as a
+# fixture file (see fixture_claim_event).
+fixture_claim_event je22 job.claim '{"owner_lane":"lane-a","label":"lbl"}'
 REPORT="$TMP/je22-report.md"; printf 'x\n' >"$REPORT"
 start_sentinel je22 w:p5 "$REPORT"
 sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || fail "JE22: sentinel mid-sleep"
@@ -2272,8 +2293,10 @@ case_live_revival_prune_pane_gone() {
   ARBITER_TEST_NOW=2099-01-02T00:00:00Z arb event --job mut-ractive --kind job.completed \
     --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive","pane_id":"w:p1"}' >/dev/null ||
     return 3
-  ARBITER_TEST_NOW=2099-01-03T00:00:00Z arb event --job mut-ractive --kind job.reclaim \
-    --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive"}' >/dev/null || return 3
+  # The release above left the job released, so the re-claim is the production
+  # job.reclaim from arbiter claim --reclaim-released.
+  ARBITER_TEST_NOW=2099-01-03T00:00:00Z arb claim --job mut-ractive --lane default --t T1 \
+    --agent-label lbl-mut-ractive --reclaim-released >/dev/null || return 3
   ARBITER_TEST_NOW=2099-01-04T00:00:00Z arb event --job mut-ractive --kind job.spawned \
     --payload-json '{"owner_lane":"default","label":"lbl-mut-ractive","pane_id":"w:p2"}' >/dev/null ||
     return 3
@@ -2303,9 +2326,10 @@ case_duplicate_done_after_revival() {
   printf 'round one report\n' >"$report"
   done_run mut-rduplicate --report "$report" >/dev/null 2>&1 || return 3
   [[ "$(quota_rows mut-rduplicate)" == 0 ]] || return 3
-  ARBITER_TEST_NOW=2099-02-01T00:00:00Z arb event --job mut-rduplicate \
-    --kind job.reclaim --payload-json '{"owner_lane":"default","label":"lbl-mut-rduplicate"}' >/dev/null ||
-    return 3
+  # done_run released the quota pool, so the job is released and the re-claim is
+  # the production job.reclaim from arbiter claim --reclaim-released.
+  ARBITER_TEST_NOW=2099-02-01T00:00:00Z arb claim --job mut-rduplicate --lane default --t T1 \
+    --agent-label lbl-mut-rduplicate --reclaim-released >/dev/null || return 3
   ARBITER_TEST_NOW=2099-02-02T00:00:00Z arb event --job mut-rduplicate \
     --kind job.spawned --payload-json \
     '{"owner_lane":"default","label":"lbl-mut-rduplicate","pane_id":"w:p2"}' >/dev/null || return 3
@@ -2811,8 +2835,9 @@ case_claim_revive() {
   sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
   arb event --job mut-claimrev --kind job.completed \
     --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null 2>&1 || true
-  arb event --job mut-claimrev --kind job.claim \
-    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || return 3
+  # A job.claim after the completed record cannot come from arbiter claim on an
+  # existing job, so the record is written as a fixture file (see fixture_claim_event).
+  fixture_claim_event mut-claimrev job.claim '{"owner_lane":"lane-a","label":"lbl"}' || return 3
   prune_run --apply >/dev/null 2>&1
   kill -0 "$SENTINEL_PID" 2>/dev/null || return 1
 }
@@ -4098,8 +4123,10 @@ case_respawn_replaces_only_stale_sentinel() {
     "$job" lane-a "lbl-$job" w:p1 "$report" || return 3
   old_pid="$SENTINEL_PID"
   sentinel_mid_sleep "$old_pid" >/dev/null || return 3
-  arb event --job "$job" --kind job.reclaim \
-    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\"}" >/dev/null || return 3
+  # No release is possible here: the job has no lease or quota record, and adding
+  # one would add events this case does not model. The job.reclaim is therefore
+  # written as a fixture file (see fixture_claim_event).
+  fixture_claim_event "$job" job.reclaim "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\"}" || return 3
   arb event --job "$job" --kind job.spawned \
     --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl-$job\",\"pane_id\":\"w:p2\"}" >/dev/null || return 3
   start_completion_from_library "$INBOX/$job/completion-sentinel.pid" \

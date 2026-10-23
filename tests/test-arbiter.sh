@@ -255,6 +255,54 @@ pass "⑨ #1750 explicit seq collision is refused, never overwrites"
 expect_rc 3 event --job nope --kind orphan
 pass "⑨ events for an unclaimed job are refused"
 
+# ------------------------------------------ ⑨ claim kinds come from arbiter claim
+# wrk reads claim events two ways: by the body kind (job.claim, job.claimed, job.reclaim) and
+# by the events file-name suffix claim.json / reclaim.json. event must mint
+# neither, and a refused event must touch neither the DB nor the directory.
+expect_rc 0 claim --job claim-guard --lane guard-lane --t T2
+guard_events="$ARBITER_INBOX_ROOT/claim-guard/events"
+guard_rows() {
+  python3 - "$DB" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+for row in con.execute("SELECT seq, kind FROM events WHERE job_id = 'claim-guard' ORDER BY seq"):
+    print(row[0], row[1])
+PY
+}
+rows_before="$(guard_rows)"
+files_before="$(ls -A "$guard_events")"
+for kind in job.claim job.claimed job.reclaim x.claim "job claim"; do
+  run event --job claim-guard --kind "$kind" --payload-json '{"owner_lane":"forged"}' --seq 40
+  [[ "$RC" -eq 2 ]] || fail "event --kind [$kind] exit $RC, want 2: $ERR"
+  [[ "$(wc -l <<<"$ERR" | tr -d ' ')" -eq 1 ]] || fail "event --kind [$kind] refusal is not one stderr line: $ERR"
+  grep -qF "'$kind'" <<<"$ERR" || fail "event --kind [$kind] refusal does not name the kind: $ERR"
+  grep -qF "arbiter claim" <<<"$ERR" || fail "event --kind [$kind] refusal does not point at arbiter claim: $ERR"
+  [[ "$(guard_rows)" == "$rows_before" ]] || fail "event --kind [$kind] wrote a DB row"
+  [[ "$(ls -A "$guard_events")" == "$files_before" ]] || fail "event --kind [$kind] wrote an events file"
+done
+pass "⑨ event refuses job.claim, job.claimed, job.reclaim, x.claim and 'job claim' (exit 2) with no DB row or file"
+
+# The refusals above passed --seq 40: none of them may move the high-water mark.
+# wrk's suffix check is case-sensitive, so JOB.RECLAIM is accepted and is not a
+# claim file.
+run event --job claim-guard --kind JOB.RECLAIM --payload-json '{"owner_lane":"ok"}' --json
+[[ "$RC" -eq 0 ]] || fail "JOB.RECLAIM was refused: $ERR"
+[[ "$(jget seq <<<"$OUT")" == 2 ]] ||
+  fail "refused events moved the seq high-water mark (JOB.RECLAIM got seq $(jget seq <<<"$OUT"))"
+name="00002-JOB.RECLAIM.json"
+[[ -f "$guard_events/$name" ]] || fail "JOB.RECLAIM artifact missing"
+case "$name" in *claim.json) fail "JOB.RECLAIM file name reads as a claim" ;; esac
+pass "⑨ refused claim kinds leave the seq high-water mark unchanged; JOB.RECLAIM records as a non-claim"
+
+run event --job claim-guard --kind job.spawned --payload-json '{"pane_id":"w2:p1"}' --json
+[[ "$RC" -eq 0 ]] || fail "job.spawned no longer records: $ERR"
+[[ "$(jget seq <<<"$OUT")" == 3 ]] || fail "job.spawned seq is not 3: $OUT"
+run event --job claim-guard --kind job.task_link --payload-json '{"task_id":1453}' --json
+[[ "$RC" -eq 0 ]] || fail "job.task_link no longer records: $ERR"
+[[ "$(jget seq <<<"$OUT")" == 4 ]] || fail "job.task_link seq is not 4: $OUT"
+[[ -f "$guard_events/00004-job.task_link.json" ]] || fail "job.task_link artifact missing"
+pass "⑨ job.spawned and job.task_link still record through event"
+
 # ---------------------------------------------- profile → pool via scopefuel
 "$ARBITER" claim --job pool-a --lane live --t T1 >/dev/null
 "$SCOPEFUEL" gate -m codex-max >"$TMP/gate.out"
