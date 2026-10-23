@@ -156,13 +156,13 @@
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "b1c644bfa7c6875639cadc9f5ae7a212968509542b1f6b135e75398596368658",
-    "bin/wrk": "26872e11ac2faa116149ccbab6df0b6546581443e74ee76d21055273abfb70c7",
+    "bin/wrk": "8a5fa5f1ae7bcf4b814e4362874a09ba2fb3175db099a2ec3e033368638740d9",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
-    "builder/SKILL.md": "23e2a1b63bab9bf01fbcad9b0b1e76149c9598df1c40ee9908e93bebcc050bd1",
+    "builder/SKILL.md": "45b63574aaed6f81749bdcddf011e0e71213bc07a31358141e813e7d573a6fbb",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
-    "director/SKILL.md": "c6b95f71c691d7711aeb9ee55f5e804f889319e99a21987a813eec148135ba42",
+    "director/SKILL.md": "9f32b266095ccf7fa4bd85287a82753733df7ac75c1bc7de6a767c24de44cc4e",
     "director/bin/tester-eligible": "ae323c7defbb8eda295ef9975efd1fcfe054751c0d0c47c7d65a1ec12193159b",
-    "spawn-worker/SKILL.md": "251bdc7e620fe3effd95b3362b99dd1fc31ddb86d4888ceb09f37deee3bb4333",
+    "spawn-worker/SKILL.md": "dc524928b3cbd910bd3923bbee9b6079f4e016a7bdc726e8771405a4feceed8b",
     "bin/wrk_pane_models.py": "856e5ab3c81ea0bdd18543056d7dabe9cee2692eabab718c16f7f318895ff151"
   },
   "profiles": {
@@ -361,6 +361,25 @@
         "T1"
       ]
     },
+    "builder-haiku-high": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "high": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-haiku-low": {
       "default_effort": "low",
       "family": "anthropic",
@@ -368,6 +387,44 @@
       "grade_status": "conflict",
       "grades": {
         "low": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-haiku-max": {
+      "default_effort": "max",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "max": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-haiku-xhigh": {
+      "default_effort": "xhigh",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "xhigh": null
       },
       "launcher": "claude",
       "launcher_model_token": "--model haiku",
@@ -610,6 +667,25 @@
         "T2"
       ]
     },
+    "builder-sol-low": {
+      "default_effort": "low",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "low": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-sol-max": {
       "default_effort": "max",
       "family": "openai",
@@ -679,6 +755,25 @@
         "T1",
         "T2",
         "T3"
+      ]
+    },
+    "builder-sonnet-low": {
+      "default_effort": "low",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "low": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model sonnet",
+      "model": "claude-sonnet-5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
       ]
     },
     "builder-sonnet-max": {

@@ -65,8 +65,7 @@ stays byte-identical. hk 1632 scopefuel admits the same model/effort without thi
 evidence, so wrk must reject that actual old response too. Unavailable, unreadable,
 refusing or unsupported installations fail closed for this builder exception.
 Astra uses builder-sol's Codex sandbox/approval flags at xhigh; fable uses
-builder-opus's permission flags with literal `claude-fable-5-1`. Builder no-max
-rules remain in force. Removed builder-astra/captain-astra aliases stay removed;
+builder-opus's permission flags with literal `claude-fable-5-1`. Removed builder-astra/captain-astra aliases stay removed;
 there is no builder-fable profile. Ordinary defaults and recommendations do not
 change, and recommendation candidates never include these exceptional seats.
 
