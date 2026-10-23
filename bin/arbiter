@@ -579,8 +579,13 @@ def record_event(
     return seq
 
 
+def _safe_kind(kind: str) -> str:
+    """The events file-name form of a kind. cmd_event applies the same rule to refuse claim kinds."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", kind)
+
+
 def _write_artifact(directory: Path, seq: int, kind: str, body: str) -> Path:
-    safe_kind = re.sub(r"[^A-Za-z0-9._-]", "_", kind)
+    safe_kind = _safe_kind(kind)
     final = directory / f"{seq:05d}-{safe_kind}.json"
     handle = tempfile.NamedTemporaryFile(
         "w", encoding="utf-8", dir=directory, prefix=".tmp-", suffix=".json", delete=False
@@ -1582,7 +1587,20 @@ def cmd_job_get(args: argparse.Namespace) -> dict:
     }
 
 
+# Only arbiter claim mints claim events. wrk's body-kind readers match these
+# exact names (job.claimed is in its CLAIM and REVIVE sets); its file readers
+# match the sanitised suffix claim.json / reclaim.json.
+CLAIM_EVENT_KINDS = frozenset(("job.claim", "job.claimed", "job.reclaim"))
+
+
 def cmd_event(args: argparse.Namespace) -> dict:
+    # Refused before connect_rw: a refused claim kind writes no DB row, no lock
+    # file and no events artifact, and leaves the seq high-water mark alone.
+    if args.kind in CLAIM_EVENT_KINDS or _safe_kind(args.kind).endswith("claim"):
+        raise ArbiterError(
+            EXIT_USAGE,
+            f"event kind {args.kind!r} 는 거부된다: claim event 는 'arbiter claim' 만 기록한다",
+        )
     con = connect_rw()
     con.execute("BEGIN IMMEDIATE")
     try:

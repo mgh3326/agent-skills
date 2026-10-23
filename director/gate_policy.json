@@ -155,16 +155,15 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "c66efc67b2bd918d6cf3eb565cc7a5271cdefc1a6550b3abf7c29a46b00d6efe",
-    "bin/arbiter": "529113486b74f2df7a964f7b6cfce27584882d0ce7dd23f48b9d41d4a1be9eef",
-    "bin/wrk": "5c8340e92f6f6bebcc6c3a96aea34c17c56a9f64f9842d6c39938f71b08771a0",
+    ".github/workflows/ci.yml": "b1c644bfa7c6875639cadc9f5ae7a212968509542b1f6b135e75398596368658",
+    "bin/wrk": "169d370d593e6e870b1afef4c824ff69876c1ba32b22ef6b236a0dcbde0228ae",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
+    "bin/wrk_pane_models.py": "856e5ab3c81ea0bdd18543056d7dabe9cee2692eabab718c16f7f318895ff151",
     "builder/SKILL.md": "45b63574aaed6f81749bdcddf011e0e71213bc07a31358141e813e7d573a6fbb",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
     "director/SKILL.md": "9f32b266095ccf7fa4bd85287a82753733df7ac75c1bc7de6a767c24de44cc4e",
     "director/bin/tester-eligible": "ae323c7defbb8eda295ef9975efd1fcfe054751c0d0c47c7d65a1ec12193159b",
-    "spawn-worker/SKILL.md": "dc524928b3cbd910bd3923bbee9b6079f4e016a7bdc726e8771405a4feceed8b",
-    "bin/wrk_pane_models.py": "856e5ab3c81ea0bdd18543056d7dabe9cee2692eabab718c16f7f318895ff151"
+    "spawn-worker/SKILL.md": "dc524928b3cbd910bd3923bbee9b6079f4e016a7bdc726e8771405a4feceed8b"
   },
   "profiles": {
     "agy-flash": {
