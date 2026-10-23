@@ -975,7 +975,7 @@ echo "PASS mutant-nocat"
 
 # invariant mutant: a verdict-carrying void becomes effective if the verdict
 # exclusion is removed, so the status assertion must turn RED.
-printf 'and n not in bound => and True\n' >"$TMP/spec-void-verdict"
+printf 'and v.get("round") not in bound => and True\n' >"$TMP/spec-void-verdict"
 mutant void-verdict "$TMP/spec-void-verdict"
 jmvdv="mut-vd"
 mkjob "$jmvdv"

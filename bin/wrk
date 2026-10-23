@@ -5244,7 +5244,7 @@ USAGE
 }
 
 round_require_live() {
-  local job="$1" command="$2" ended
+  local job="$1" round_command="$2" ended
   ended="$(wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
 import os, sys
 exec(os.environ["WRK_EVENTS_PY"])
@@ -5253,7 +5253,7 @@ if ended:
     print("%s (%s)" % ended)
 PY
   )"
-  [[ -z "$ended" ]] || die "$command refused for $job: ended by $ended"
+  [[ -z "$ended" ]] || die "$round_command refused for $job: ended by $ended"
 }
 
 round_join_issues() {
