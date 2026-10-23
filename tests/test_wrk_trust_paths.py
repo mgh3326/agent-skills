@@ -1040,6 +1040,54 @@ class RealBinaryCase(unittest.TestCase):
         out = w.run(["bash", "-c", snippet, "_", lib], w.env(ARBITER_INBOX_ROOT=w.build))
         self.refusal_line(out, "ARBITER_INBOX_ROOT", w.jobs)
 
+    TASK_JSON = {"id": 77, "state": "in_progress", "claimed_by": "jobx", "project": "agent-skills",
+                 "refs": {"job_id": "jobx"}}
+    RECHECK = ('set -euo pipefail; . "$1"; ROLE=builder JOB_ID=jobx PARENT_JOB="" TASK_ID=77 TASK_LINK_MODE=owner '
+               'TASK_HK_BYPASS=0 LABEL=jobx ROUND_EXT_REF="hk:doc/round-ext/jobx"; %s; printf "status=%%s\\n" "$TASK_LINK_STATUS"')
+
+    def ext_docs(self):
+        return {"round-ext/jobx": {"key": "round-ext/jobx", "created_by": "director-1", "body": "approved"},
+                "77": self.TASK_JSON}
+
+    def repro_task_binding_read(self, lib):
+        """hk_task_precheck, with a round-extension ref, reads the task binding as grant evidence."""
+        w = self.w
+        w.mkjob(w.jobs, "jobx", task=77)
+        w.install_canonical_hk(self.ext_docs())
+        snippet = self.RECHECK % "round_ext_precheck; hk_task_precheck"
+        shim = w.base / "shimbin" / "handoffkeep"
+        shim_log = w.stub(shim, {"*": self.TASK_JSON})[1]
+        out = w.run(["bash", "-c", snippet, "_", lib], w.env(PATH="%s:%s" % (shim.parent, safe_path())))
+        self.assertFalse(shim_log.exists(), "the PATH shim must never answer the task binding")
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "status=already_linked"), out.stderr)
+        self.assertEqual(w.canon_log.read_text().split("\n")[:2], ["doc get round-ext/jobx", "tasks show 77"])
+        forge, forge_log = w.stub(w.base / "forge-hk", {"*": self.TASK_JSON})
+        out = w.run(["bash", "-c", snippet, "_", lib], w.env(HANDOFFKEEP_BIN=forge))
+        self.refusal_line(out, "HANDOFFKEEP_BIN", w.canon_hk)
+        self.assertFalse(forge_log.exists())
+
+    def test_round_extension_task_binding_read_is_guarded(self):
+        self.repro_task_binding_read(self.lib())
+
+    def test_round_extension_builder_recheck_is_guarded(self):
+        w = self.w
+        lib = self.lib()
+        w.mkjob(w.jobs, "jobx", task=77)
+        w.install_canonical_hk(self.ext_docs())
+        snippet = self.RECHECK % "round_ext_builder_recheck"
+        shim = w.base / "shimbin" / "handoffkeep"
+        shim_log = w.stub(shim, {"*": self.TASK_JSON})[1]
+        out = w.run(["bash", "-c", snippet, "_", lib], w.env(PATH="%s:%s" % (shim.parent, safe_path())))
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "status=already_linked"), out.stderr)
+        self.assertFalse(shim_log.exists())
+        self.assertEqual(w.canon_log.read_text().split("\n")[:2], ["doc get round-ext/jobx", "tasks show 77"])
+        tjobs = w.tmp / "jobs"
+        w.mkjob(tjobs, "jobx", task=77)
+        stub = w.stub(w.tmp / "hk", self.ext_docs())[0]
+        out = w.run(["bash", "-c", snippet, "_", lib], w.env(test=True, ARBITER_INBOX_ROOT=tjobs, HOME=w.tmp / "home",
+                                                              XDG_DATA_HOME=w.tmp / "data", HANDOFFKEEP_BIN=stub))
+        self.assertEqual((out.returncode, out.stdout.strip()), (0, "status=already_linked"), out.stderr)
+
     def seed_old_job(self, root, job, rounds):
         events = Path(root) / job / "events"
         events.mkdir(parents=True, exist_ok=True)
@@ -1156,6 +1204,13 @@ class RealBinaryCase(unittest.TestCase):
         with self.assertRaises(AssertionError):
             out = w.run(["bash", "-c", snippet, "_", lib], w.env(HANDOFFKEEP_BIN=forge))
             self.refusal_line(out, "HANDOFFKEEP_BIN", w.canon_hk)
+
+    def test_mutant_task_binding_read_follows_hk_bin(self):
+        mutant = self.mutant(WRK, '    wrk_trust_guard hk\n    handoffkeep=""\n    [[ ! -x "$WRK_TRUST_HK" ]] || handoffkeep="$WRK_TRUST_HK"\n',
+                             '    handoffkeep="$(hk_bin)"\n', "taskbind")
+        lib = self.w.base / "mutant-lib"
+        lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
+        self.red(self.repro_task_binding_read, lib)
 
     def test_mutant_takeover_read_skips_the_guard(self):
         mutant = self.mutant(WRK, '  wrk_trust_guard\n  events="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$old/events"\n',

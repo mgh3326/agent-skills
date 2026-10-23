@@ -9724,7 +9724,16 @@ hk_task_precheck() {
   TASK_LINK_STATUS=""
   [[ -n "$TASK_ID" ]] || die "internal: task_validate must run before hk_task_precheck"
   local handoffkeep out rc=0 fields t_state="" t_claimed="" t_job=""
-  handoffkeep="$(hk_bin)"
+  if [[ -n "${ROUND_EXT_REF:-}" ]]; then
+    # hk 1894: with a round-extension ref the task binding below (project,
+    # refs.job_id) is grant evidence too, so it is read through the guarded
+    # handoffkeep, not HANDOFFKEEP_BIN or a PATH lookup.
+    wrk_trust_guard hk
+    handoffkeep=""
+    [[ ! -x "$WRK_TRUST_HK" ]] || handoffkeep="$WRK_TRUST_HK"
+  else
+    handoffkeep="$(hk_bin)"
+  fi
   if [[ -z "$handoffkeep" ]]; then
     hk_task_gate_failure "handoffkeep binary not found (set HANDOFFKEEP_BIN)"
     return 0
