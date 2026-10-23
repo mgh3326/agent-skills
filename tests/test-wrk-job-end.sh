@@ -4263,11 +4263,18 @@ if [[ "\${1:-}" == status && "\${3:-}" == "$job" && ! -e "$injected" ]] &&
     compgen -G "$INBOX/$job/events/*-job.revoked.json" >/dev/null; then
   printf 'inject\n' >>"$trace"
   : >"$injected"
-  "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null
-  "$ARBITER" event --job "$job" --kind job.reclaim \\
-    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null
+  "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null || {
+    printf 'inject-release-failed\n' >>"$trace"; exit 81;
+  }
   "$ARBITER" lease --job "$job" --kind quota_pool --profile codex-luna \\
-    --gate-output "\$(cat "$gatefile")" >/dev/null
+    --gate-output "\$(cat "$gatefile")" >/dev/null || {
+      printf 'inject-lease-failed\n' >>"$trace"; exit 82;
+    }
+  "$ARBITER" event --job "$job" --kind job.reclaim \\
+    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || {
+      printf 'inject-reclaim-failed\n' >>"$trace"; exit 83;
+    }
+  printf 'inject-complete\n' >>"$trace"
 fi
 exec "$ARBITER" "\$@"
 EOF
@@ -4279,6 +4286,11 @@ EOF
   pid="$SENTINEL_PID"
   pidfile="$INBOX/$job/completion-sentinel.pid"
   wait_until 20 pid_gone "$pid" || return 3
+  grep -Fq 'inject-complete' "$trace" || { cat "$trace" >&2; return 3; }
+  [[ "$(event_count "$INBOX/$job/events" job.reclaim)" == 1 ]] || {
+    cat "$trace" >&2
+    return 3
+  }
   if [[ -s "$pidfile" ]]; then
     assertion_red 'R33 lost-grace guarded release skip removes the sentinel pidfile' || return 1
   fi
