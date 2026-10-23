@@ -144,6 +144,45 @@ class PositionGuards(unittest.TestCase):
         self.assertEqual(c.run_wrk("status", binary=binary).returncode, 0)
         self.assertTrue(c.position_path("A").exists())
 
+    def test_concurrent_guard_creation_reopens_and_checks_the_inode(self):
+        c = self.c
+        target = c.base / "creation-target"
+        target.write_text("untouched")
+        # The macOS two-process reproduction returned ENOENT from O_CREAT
+        # while its peer successfully created this guard. Reproduce that
+        # kernel result at the real open call, then require checked reuse.
+        for kind, want in (("regular", 0), ("symlink", 78), ("fifo", 78),
+                           ("hardlink", 78), ("public", 78)):
+            with self.subTest(kind=kind):
+                guard = self.guard()
+                anchor = 'if args[0] == "status":\n'
+                injection = ("_guard_real_open = os.open\n_guard_raced = False\n"
+                    "def _guard_racing_open(path, flags, mode=0o777, *, dir_fd=None):\n"
+                    "    global _guard_raced\n"
+                    f"    if path == {guard.name!r} and flags & os.O_CREAT and not _guard_raced:\n"
+                    "        _guard_raced = True\n"
+                    f"        kind = {kind!r}\n"
+                    "        if kind == 'symlink':\n"
+                    f"            os.symlink({str(target)!r}, path, dir_fd=dir_fd)\n"
+                    "        elif kind == 'fifo': os.mkfifo(path, dir_fd=dir_fd)\n"
+                    "        elif kind == 'hardlink':\n"
+                    f"            os.link({str(target)!r}, path, dst_dir_fd=dir_fd)\n"
+                    "        else:\n"
+                    "            fd = _guard_real_open(path, flags | os.O_EXCL,\n"
+                    "                0o644 if kind == 'public' else mode, dir_fd=dir_fd)\n"
+                    "            os.close(fd)\n"
+                    "        raise FileNotFoundError(2, 'concurrent guard creation', path)\n"
+                    "    return _guard_real_open(path, flags, mode, dir_fd=dir_fd)\n"
+                    "os.open = _guard_racing_open\n")
+                binary = c.instrument("create-race-" + kind, anchor, injection + anchor)
+                try:
+                    result = c.run_wrk("--queue-key", "A", "--", "true", binary=binary)
+                    self.assertEqual(result.returncode, want,
+                        "concurrent creation must reopen and validate the existing guard: " + result.stderr)
+                    self.assertEqual(target.read_text(), "untouched")
+                finally:
+                    guard.unlink(missing_ok=True)
+
     def test_dead_guard_holder_releases_and_acquisition_consumes(self):
         c = self.c
         guard = self.guard()
