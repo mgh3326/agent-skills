@@ -186,7 +186,16 @@ class HeavyQueue(unittest.TestCase):
                     path.write_text(json.dumps(record))
         else:
             self.assertEqual(records, [], "unkeyed cap must not save a place")
-        b = self.spawn("b", binary=binary)
+        # B must start its first lane scan only after A's new record is
+        # visible. Otherwise the documented already-scanned-pass exception
+        # can legitimately let B acquire while this test releases the holder.
+        gate = self.base / "b-scan-gate"
+        self.files.append(gate)
+        anchor = '            lane_limit = lane_reserved() if hclass == "lane" else 0\n'
+        gated = self.instrument("b-gated-wrk", anchor,
+                                f"            while not os.path.exists({str(gate)!r}):\n"
+                                "                time.sleep(.02)\n" + anchor)
+        b = self.spawn("b", binary=gated)
         bticket = self.ticket(self.queued("b"))
         a = self.spawn("a-new", key="job-A" if keyed else None, binary=binary)
         aticket = self.ticket(self.queued("a-new"))
@@ -197,6 +206,7 @@ class HeavyQueue(unittest.TestCase):
         else:
             self.assertGreater(aticket, bticket, "fresh re-queue jumped ahead of B")
             order = [("b", b), ("a-new", a)]
+        gate.touch()
         self.release("holder")
         for name, proc in order:
             self.until(lambda: self.started(name), f"wrong re-queue acquisition order: {name}")
