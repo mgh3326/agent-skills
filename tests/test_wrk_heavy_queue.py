@@ -127,6 +127,9 @@ class HeavyQueue(unittest.TestCase):
         self.assertIsNotNone(match, "waiter record has no enqueue ticket")
         return tuple(map(int, match.groups()))
 
+    def position_path(self, key):
+        return self.positions / ("key-" + key.encode("ascii").hex() + ".json")
+
     def position_records(self):
         return [json.loads(p.read_text()) for p in self.positions.iterdir()
                 if not p.name.startswith(".") and p.is_file() and not p.is_symlink()]
@@ -225,6 +228,17 @@ class HeavyQueue(unittest.TestCase):
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertFalse((self.waiters / str(dead.pid)).exists(), "status did not clean a dead waiter")
 
+    def test_ticketless_ci_keeps_its_existing_reservation(self):
+        (self.waiters / "legacy-ci").write_text(
+            f"pid={os.getpid()} class=ci limit=1 since=x job=- cmd=old-ci")
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75,
+                         "ticketless live CI record lost its existing reservation")
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_CLASS="ci").returncode, 0,
+                         "CI unexpectedly deferred to another CI waiter")
+        (self.waiters / "legacy-ci").unlink()
+        self.assertEqual(self.run_wrk("--", "true").returncode, 0)
+
     def test_status_ticket_order_and_expiry_cleanup(self):
         self.start("holder")
         for name in ("first", "second", "third"):
@@ -235,10 +249,10 @@ class HeavyQueue(unittest.TestCase):
         self.assertEqual([line.split()[-1] for line in lines], ["first", "second", "third"])
         tickets = [self.ticket(line) for line in lines]
         self.assertEqual(tickets, sorted(tickets))
-        (self.positions / "key-old.json").write_text(json.dumps(
+        (self.position_path("old")).write_text(json.dumps(
             {"key": "old", "ticket": [1, 1], "expiry": time.time() - 1}))
         self.assertNotIn("key=old", self.run_wrk("status").stdout)
-        self.assertFalse((self.positions / "key-old.json").exists())
+        self.assertFalse((self.position_path("old")).exists())
 
     def test_key_validation_and_env_option_precedence(self):
         for key in ("", "." * 65, "a/b", "white space", "é", "\n"):
@@ -258,25 +272,31 @@ class HeavyQueue(unittest.TestCase):
     def test_odd_positions_are_ignored_without_following_or_blocking(self):
         victim = self.base / "victim"
         victim.write_text("unchanged")
-        (self.positions / "key-link.json").symlink_to(victim)
-        os.mkfifo(self.positions / "key-fifo.json")
-        (self.positions / "key-bad.json").write_text("not JSON")
+        (self.position_path("link")).symlink_to(victim)
+        os.mkfifo(self.position_path("fifo"))
+        (self.position_path("bad")).write_text("not JSON")
         for key in ("link", "fifo", "bad"):
             result = self.run_wrk("--queue-key", key, "--", "true")
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(victim.read_text(), "unchanged", "position symlink target changed")
         self.assertNotIn("Traceback", self.run_wrk("status").stderr)
-        bad = self.positions / "key-malformed.json"
+        bad = self.position_path("malformed")
         for value in ([], {"key": []}, {"key": "malformed", "ticket": [True, 1], "expiry": 1},
                       {"key": "malformed", "ticket": [1, 1], "expiry": float("inf")},
                       {"key": "malformed", "ticket": [1, 1], "expiry": 10**1000}):
             bad.write_text(json.dumps(value))
             result = self.run_wrk("--queue-key", "malformed", "--", "true")
             self.assertEqual(result.returncode, 0, result.stderr)
-        hardlink = self.positions / "key-hard.json"
+        hardlink = self.position_path("hard")
         os.link(victim, hardlink)
         self.assertEqual(self.run_wrk("--queue-key", "hard", "--", "true").returncode, 0)
         self.assertEqual(victim.read_text(), "unchanged")
+
+    def test_deeply_nested_position_is_ignored(self):
+        self.position_path("deep").write_text("[" * 1100 + "0" + "]" * 1100)
+        result = self.run_wrk("--queue-key", "deep", "--", "true")
+        self.assertEqual(result.returncode, 0, "nested malformed position crashed the queue reader: " + result.stderr)
+        self.assertNotIn("Traceback", self.run_wrk("status").stderr)
 
     def test_untrusted_positions_directory_refused(self):
         self.positions.rmdir()
@@ -301,7 +321,7 @@ class HeavyQueue(unittest.TestCase):
 
     def test_foreign_owned_position_is_ignored(self):
         self.start("holder")
-        path = self.positions / "key-A.json"
+        path = self.position_path("A")
         path.write_text(json.dumps({"key": "A", "ticket": [1, 1],
                                     "expiry": time.time() + 600}))
         # No privileged chown in CI: change only this inode's fstat uid at
@@ -318,7 +338,7 @@ class HeavyQueue(unittest.TestCase):
 
     def test_expiry_boundary_and_wall_clock_ticket_with_monotonic_cap(self):
         self.start("holder")
-        (self.positions / "key-A.json").write_text(json.dumps(
+        (self.position_path("A")).write_text(json.dumps(
             {"key": "A", "ticket": [1, 1], "expiry": 100.0}))
         binary = self.instrument("clock-wrk", "positions_fd = -1\n",
                                  "time.time = lambda: 100.0\n"
@@ -358,6 +378,7 @@ class HeavyQueue(unittest.TestCase):
                                      WRK_HEAVY_WAIT_CAP=".6").returncode, 75)
 
     def test_pass_already_scanned_and_new_publish_window(self):
+        holder = self.start("holder")
         # Park exactly after the production lane scan, not for a guessed time.
         gate, scanned = self.base / "gate", self.base / "scanned"
         self.files.append(gate)
@@ -369,6 +390,8 @@ class HeavyQueue(unittest.TestCase):
         self.spawn("in-flight", binary=binary)
         self.until(scanned.exists, "pass did not reach the scan barrier")
         self.plant_lane(os.getpid())
+        self.release("holder")
+        self.assertEqual(holder.wait(timeout=5), 0)
         gate.touch()
         self.until(lambda: self.started("in-flight"),
                    "an already-scanned pass unexpectedly re-read the new record")
@@ -403,7 +426,7 @@ class HeavyQueue(unittest.TestCase):
     def test_simultaneous_keyed_retries_and_env_key(self):
         self.start("holder")
         original = (1, 1)
-        (self.positions / "key-A.json").write_text(json.dumps(
+        (self.position_path("A")).write_text(json.dumps(
             {"key": "A", "ticket": original, "expiry": time.time() + 600}))
         # Start both before waiting for either publication. Sharing a key is
         # allowed; equality must not produce a mutual reservation deadlock.
@@ -424,7 +447,7 @@ class HeavyQueue(unittest.TestCase):
         self.assertEqual(b.wait(timeout=5), 0)
 
     def test_status_does_not_remove_a_refreshed_position(self):
-        path = self.positions / "key-A.json"
+        path = self.position_path("A")
         path.write_text(json.dumps({"key": "A", "ticket": [1, 1], "expiry": 1}))
         renewed = {"key": "A", "ticket": [1, 1], "expiry": time.time() + 600}
         # Replace after the real expired-record read and before its cleanup.
@@ -448,8 +471,36 @@ class HeavyQueue(unittest.TestCase):
         self.queued("swapped")
         self.assertEqual(proc.wait(timeout=5), 75)
         self.assertEqual(list(self.positions.iterdir()), [], "publish resolved the replaced path")
-        record = json.loads((opened / "key-A.json").read_text())
+        record = json.loads((opened / self.position_path("A").name).read_text())
         self.assertEqual(record["key"], "A")
+
+    def test_acquisition_consumes_position_published_while_it_was_queued(self):
+        self.start("holder")
+        old = self.spawn("older-A", key="A", WRK_HEAVY_WAIT_CAP="3")
+        original = self.ticket(self.queued("older-A"))
+        retry = self.spawn("queued-A", key="A")
+        self.assertGreater(self.ticket(self.queued("queued-A")), original)
+        self.assertEqual(old.wait(timeout=6), 75)
+        self.assertEqual(tuple(self.position_records()[0]["ticket"]), original)
+        self.release("holder")
+        self.until(lambda: self.started("queued-A"), "queued same-key waiter did not acquire")
+        self.assertEqual(self.position_records(), [],
+                         "acquisition left a same-key position published during its wait")
+        self.release("queued-A")
+        self.assertEqual(retry.wait(timeout=5), 0)
+
+    def test_case_distinct_keys_keep_independent_positions(self):
+        self.start("holder")
+        tickets = {}
+        for key, name in (("A", "upper-capped"), ("a", "lower-capped")):
+            proc = self.spawn(name, key=key, WRK_HEAVY_WAIT_CAP=".6")
+            tickets[key] = self.ticket(self.queued(name))
+            self.assertEqual(proc.wait(timeout=5), 75)
+        self.assertEqual({r["key"] for r in self.position_records()}, {"A", "a"},
+                         "case-distinct queue keys lost an independent position")
+        for key, name in (("A", "upper-retry"), ("a", "lower-retry")):
+            self.spawn(name, key=key)
+            self.assertEqual(self.ticket(self.queued(name)), tickets[key])
 
     def test_mutants_break_the_named_invariants(self):
         mutations = [

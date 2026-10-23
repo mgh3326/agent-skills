@@ -11456,7 +11456,7 @@ on macOS and Linux — macOS has no `flock` command, and flock releases a dead
 holder's slot automatically, unlike shlock pid-files). Slot 0 is the lock
 file itself; slots 1..N-1 are <lock>.slot<i>. The command runs under
 `nice -n 10` and, while the load wait is on (see heavy_load_wait below),
-only starts once load5/ncpu < 1.0. Total wait (slot + load) is capped at
+only starts once load5/ncpu < 1.0. Total wait (slot + load) defaults to a cap of
 20 minutes; on expiry the command is NOT run and wrk exits 75
 (EX_TEMPFAIL). The command inherits the slot fd (nested detection
 needs it — see WRK_HEAVY_HELD_FD), so an orphaned child keeps the slot while
@@ -11509,14 +11509,17 @@ promised: a ci waiter is not queued while wrk and its python half are still
 starting up (before the record exists), and a lane pass that had already
 read the records when the rename happened (one pass, no re-read before its
 slot attempts) can still take a slot that frees in that same pass. Neither
-is preempted afterwards. Waiters of an older wrk ignore classes entirely.
+is preempted afterwards. Waiters from before hk 1533 ignore classes entirely.
 
 Lane FIFO (hk 1407): each published waiter carries a wall-clock enqueue
 ticket, with pid breaking equal-time ties. A lane skips any slot that an
 older live lane ticket could take (index below that waiter's own limit).
 CI reservation and its starvation guard above are unchanged; spending that
 guard never waives lane FIFO. Dead pids and lane records without a ticket
-reserve nothing. Tickets order visible records, not process start times:
+reserve nothing under lane FIFO. CI reservation does not depend on tickets:
+live ci waiters with or without a ticket keep reserving exactly as above.
+Older lane waiters do not honor tickets, so mixed versions can still race.
+Tickets order visible records, not process start times:
 the same starting up window and pass that already scanned described above
 apply to lanes too. A clock step can change wall-clock order; wait caps and
 the CI guard continue to use monotonic time. No holder is preempted.
@@ -11904,8 +11907,9 @@ key_re = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
 
 
 def position_name(key):
-    # A prefix keeps the valid keys '.' and '..' ordinary filenames.
-    return "key-" + key + ".json"
+    # ASCII hex preserves case-distinct keys on case-insensitive filesystems;
+    # the prefix also keeps valid dot keys ordinary filenames.
+    return "key-" + key.encode("ascii").hex() + ".json"
 
 
 def read_position(dirfd, name):
@@ -11933,7 +11937,7 @@ def read_position(dirfd, name):
                 or type(expiry) not in (int, float) or not math.isfinite(expiry)):
             return None
         return record, st
-    except (OSError, ValueError, UnicodeError, OverflowError):
+    except (OSError, ValueError, UnicodeError, OverflowError, RecursionError):
         return None
 
 
@@ -12360,9 +12364,8 @@ def consume_position():
         return
     previous = read_position(positions_fd, position_name(queue_key))
     if previous is not None:
-        record, st = previous
-        if tuple(record["ticket"]) == ticket:
-            remove_position(positions_fd, position_name(queue_key), st)
+        _, st = previous
+        remove_position(positions_fd, position_name(queue_key), st)
 
 
 def end_defer(reason):
