@@ -4966,6 +4966,11 @@ if __name__ == "__main__":
     sys.exit(trust_main(sys.argv))
 '
 
+# Internal guard state. Assigned at load so a value inherited from the caller's
+# environment can neither stand in for the guard (WRK_TRUST_JOBS_ROOT,
+# WRK_TRUST_HK) nor silence the test-mode warning (WRK_TRUST_WARNED).
+WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK="" WRK_TRUST_WARNED=""
+
 # wrk_trust_guard [hk] — sets WRK_TRUST_JOBS_ROOT (and WRK_TRUST_HK when "hk" is
 # passed: the operation will run handoffkeep) or exits 2. Trust-bearing reads use
 # ${WRK_TRUST_JOBS_ROOT:?...} and WRK_TRUST_HK, never wrk_jobs_root or hk_bin, so a

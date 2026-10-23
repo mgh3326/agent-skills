@@ -18,7 +18,6 @@ import os
 import pwd
 import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -351,9 +350,8 @@ class DecisionCase(unittest.TestCase):
 
     def check_test_mode_outside_refused(self, impl):
         with impl.system_roots(()):
-            for var, key in (("ARBITER_INBOX_ROOT", "ARBITER_INBOX_ROOT"), ("XDG_DATA_HOME", "XDG_DATA_HOME"),
-                             ("HOME", "HOME"), ("HANDOFFKEEP_BIN", "HANDOFFKEEP_BIN")):
-                extra = {key: OUTSIDE + "/x"}
+            for var in ("ARBITER_INBOX_ROOT", "XDG_DATA_HOME", "HOME", "HANDOFFKEEP_BIN"):
+                extra = {var: OUTSIDE + "/x"}
                 if var == "HOME":
                     extra.update(ARBITER_INBOX_ROOT=None, XDG_DATA_HOME=None)
                 exc = self.refused(impl, self.temp_env(**extra), var, var, test_mode=True, need_hk=True)
@@ -582,6 +580,14 @@ class DecisionCase(unittest.TestCase):
     def test_mutant_tmpdir_may_contain_the_home(self):
         self.red(('        if resolved != "/" and not (home and trust_under(home, resolved)):',
                   "        if True:"), self.check_test_mode_tmpdir_guards)
+
+
+class PinCase(unittest.TestCase):
+    def test_both_binary_pins_exist_and_match(self):
+        pinned = json.loads((ROOT / "director" / "gate_policy.json").read_text(encoding="utf-8"))["local_sources"]
+        for rel in ("bin/wrk", "bin/arbiter"):
+            self.assertIn(rel, pinned, "design item 8 pins " + rel)
+            self.assertEqual(pinned[rel], hashlib.sha256((ROOT / rel).read_bytes()).hexdigest(), rel)
 
 
 # ---------------------------------------------------------------------------
@@ -971,6 +977,40 @@ class RealBinaryCase(unittest.TestCase):
         self.assertIn("round=4", out.stdout)
         self.assertIn("PATH", out.stderr)
 
+    def repro_inherited_warning_flag(self, wrk):
+        """Internal guard state is assigned at load: nothing inherited can silence the test-mode warning."""
+        w = self.w
+        w.mkjob(w.tmp / "builder", "jobt")
+        env = dict(test=True, ARBITER_INBOX_ROOT=w.tmp / "builder", HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "data")
+        for inherited in (None, "1", "0", "attacker", " "):
+            out = w.wrk(wrk, "round", "status", "jobt", WRK_TRUST_WARNED=inherited, **env)
+            self.assertEqual(out.returncode, 0, out.stderr)
+            lines = [line for line in out.stderr.splitlines() if line.strip()]
+            self.assertEqual(len(lines), 1, "WRK_TRUST_WARNED=%r: %r" % (inherited, out.stderr))
+            self.assertIn("ARBITER_INBOX_ROOT", lines[0])
+            self.assertIn("XDG_DATA_HOME", lines[0])
+
+    def test_inherited_warning_flag_cannot_silence_the_test_mode_warning(self):
+        self.repro_inherited_warning_flag(self.wrk)
+
+    def repro_inherited_guard_state(self, lib):
+        """A forgotten guard fails closed even when the caller pre-seeds the guard variables."""
+        w = self.w
+        w.mkjob(w.build, "jobx")
+        forge, forge_log = w.stub(w.base / "forge-hk", {"*": grant("jobx", 5)})
+        env = w.env(WRK_TRUST_JOBS_ROOT=w.build, WRK_TRUST_HK=forge)
+        out = w.run(["bash", "-c", 'set -euo pipefail; . "$1"; round_scan jobx; echo scanned', "_", lib], env)
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertNotIn("scanned", out.stdout)
+        self.assertIn("trust guard did not run", out.stderr)
+        out = w.run(["bash", "-c", 'set -euo pipefail; . "$1"; round_approval_fetch hk:doc/x; echo fetched', "_", lib], env)
+        self.assertNotEqual(out.returncode, 0, out.stdout)
+        self.assertNotIn("fetched", out.stdout)
+        self.assertFalse(forge_log.exists(), "an inherited WRK_TRUST_HK must not be run")
+
+    def test_inherited_guard_state_cannot_stand_in_for_the_guard(self):
+        self.repro_inherited_guard_state(self.lib())
+
     def test_handoffkeep_is_judged_only_by_operations_that_fetch(self):
         w = self.w
         w.mkjob(w.jobs, "jobq")
@@ -1204,6 +1244,13 @@ class RealBinaryCase(unittest.TestCase):
         with self.assertRaises(AssertionError):
             out = w.run(["bash", "-c", snippet, "_", lib], w.env(HANDOFFKEEP_BIN=forge))
             self.refusal_line(out, "HANDOFFKEEP_BIN", w.canon_hk)
+
+    def test_mutant_guard_state_is_not_initialized_at_load(self):
+        mutant = self.mutant(WRK, 'WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK="" WRK_TRUST_WARNED=""\n', "", "warnedinit")
+        self.red(self.repro_inherited_warning_flag, mutant)
+        lib = self.w.base / "mutant-lib"
+        lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
+        self.red(self.repro_inherited_guard_state, lib)
 
     def test_mutant_task_binding_read_follows_hk_bin(self):
         mutant = self.mutant(WRK, '    wrk_trust_guard hk\n    handoffkeep=""\n    [[ ! -x "$WRK_TRUST_HK" ]] || handoffkeep="$WRK_TRUST_HK"\n',
