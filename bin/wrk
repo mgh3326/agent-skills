@@ -5915,10 +5915,8 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round open failed to inspect $job"
   case "$outcome" in
-    # bash 3.2 misparses $'\t' inside a case pattern. Match the prefix and
-    # drop the one-character separator so the filename still reaches the die.
-    ENDED*)
-      die "round open: refused after end record ${outcome#ENDED?}"
+    ENDED$'\t'*)
+      die "round open: refused after end record ${outcome#ENDED$'\t'}"
       ;;
     OPENED\ round=*)
       echo "OK job=$job ${outcome#OPENED } cap=$ROUND_CAP_DEFAULT head=$head"
@@ -6033,9 +6031,8 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round void failed to inspect $job"
   case "$outcome" in
-    # Same bash 3.2 case-pattern constraint as round open.
-    ENDED*)
-      die "round void: refused after end record ${outcome#ENDED?}"
+    ENDED$'\t'*)
+      die "round void: refused after end record ${outcome#ENDED$'\t'}"
       ;;
     VOIDED\ round=*) echo "OK job=$job $outcome ref=$ref" ;;
     NO_ROUND) die "round void: round $round_number does not exist for job $job" ;;
@@ -6113,7 +6110,9 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                   and v["ref"].startswith(("hk:doc/", "hk:task/")))}
     # Identity refusals name the earliest blocking job.verdict. Path, then
     # exact bytes, then head. A void releases the head even when that round
-    # also carries a verdict; the cap's void set above is unchanged.
+    # also carries a verdict. The cap void set above is unchanged.
+    # Bash 3.2 scans this heredoc for quotes because it sits inside a
+    # command substitution. Do not put an unmatched single quote in this body.
     path_hit = ""
     content_hit = ""
     digests = set()
@@ -6191,9 +6190,7 @@ PY
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
     AMBIGUOUS)
       die "round verdict --file has more than one VERDICT line: $file" ;;
-    # Same bash 3.2 case-pattern constraint as round open. The refusal
-    # helper still splits the real tab.
-    ENDED*|DUP_PATH*|DUP_CONTENT*|DUP_HEAD*)
+    ENDED$'\t'*|DUP_PATH$'\t'*|DUP_CONTENT$'\t'*|DUP_HEAD$'\t'*)
       wrk_verdict_refusal "$outcome" ;;
     RECORDED*)
       local round_no="" verdict_v="" head_v="" used_v="" over_v="" status question tok
