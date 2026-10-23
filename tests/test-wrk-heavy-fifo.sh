@@ -9,7 +9,9 @@
 # on the wait cap keeps its original ticket for WRK_HEAVY_REQUEUE_GRACE
 # seconds. A dead pid reserves nothing. A ticketless lane record is
 # skipped by the lane FIFO rule. A ticketless ci record still reserves:
-# hk 1533 does not read tickets.
+# hk 1533 does not read tickets. A ticket whose digits are not ASCII is
+# not a ticket: it does not crash a lane run or status, and it does not
+# stop a ci waiter from reserving.
 #
 # Stub commands only. HOME, every XDG dir, CODEX_HOME and ARBITER_INBOX_ROOT
 # point into a temp dir. Every lock, waiters dir, positions dir, load file
@@ -185,7 +187,11 @@ wrk_bin() { if [[ -n "$HEAVY_BIN" ]]; then printf '%s' "$HEAVY_BIN"; else printf
 status_out() { "$(wrk_bin)" heavy status; }
 started() { [[ -e "$TMP/$1.start" ]]; }
 queued() {
-  status_out | grep -Eq "^waiter pid=[0-9]+ class=$2 limit=$3 .*cmd=bash $TMP/$1\\.sh\$"
+  # Capture first. A pipe into grep -q closes early, python raises
+  # BrokenPipeError, and pipefail then reports a waiter that is there.
+  local out
+  out="$(status_out)" || return 1
+  grep -Eq "^waiter pid=[0-9]+ class=$2 limit=$3 .*cmd=bash $TMP/$1\\.sh\$" <<<"$out"
 }
 
 kill_own() {
@@ -346,7 +352,9 @@ older_ticket_blocks() {
     n=$((n + 1))
   done
   queued blk-y lane 1 || fail "block: younger never queued"
-  status_out | grep -q '^holder none' || fail "block: the slot was not free"
+  local blk_status
+  blk_status="$(status_out)" || fail "block: status failed: $blk_status"
+  grep -q '^holder none' <<<"$blk_status" || fail "block: the slot was not free: $blk_status"
   rm -f "$WRK_HEAVY_LOCK.waiters/$sleeper"
   release blk-y
   wait_until 10 started blk-y || fail "block: younger never ran after the older ticket was removed"
@@ -430,11 +438,97 @@ dead_pid_reserves_nothing() {
   [[ "$rc" -eq 0 ]] || fail "dead pid blocked the lane (rc=$rc): $(cat "$TMP/dead.out")"
   [[ -e "$TMP/dead-ran" ]] || fail "dead: command did not run"
   fcmp "$(since "$t0")" le 4 || fail "dead: lane waited on a dead pid"
-  status_out | grep -q 'dead-ticket' && fail "status left a dead waiter record"
+  local dead_status
+  dead_status="$(status_out)" || fail "dead: status failed: $dead_status"
+  grep -q 'dead-ticket' <<<"$dead_status" && fail "status left a dead waiter record"
   [[ ! -e "$WRK_HEAVY_LOCK.waiters/$dead" ]] || fail "dead record remains after status"
 }
 dead_pid_reserves_nothing
 echo "PASS heavy-fifo-dead-pid-reserves-nothing"
+
+# ── a non-ASCII digit is not a ticket and must not crash ───────────────────
+nonascii_digit_ignored() {
+  new_lock nad
+  start_sleeper 30
+  local dead=$BG
+  kill "$dead" 2>/dev/null || true
+  wait "$dead" 2>/dev/null || true
+  if kill -0 "$dead" 2>/dev/null; then
+    fail "nad: sleeper is still alive"
+  fi
+  python3 - "$WRK_HEAVY_LOCK.waiters/$dead" "$dead" <<'PY'
+import sys
+path, pid = sys.argv[1:]
+# Arabic-Indic "1" plus superscript "2". Both pass str.isdigit(); int() does not.
+ticket = "\u0661\u00b2"
+open(path, "w", encoding="utf-8").write(
+    "pid=%s class=lane limit=1 ticket=%s:1 since=x job=- cmd=nad-dead\n"
+    % (pid, ticket))
+PY
+  local rc=0
+  WRK_HEAVY_WAIT_CAP=6 "$(wrk_bin)" heavy -- touch "$TMP/nad-dead-ran" \
+    >"$TMP/nad-dead.out" 2>&1 || rc=$?
+  [[ "$rc" -eq 0 ]] ||
+    fail "nad: dead non-ascii ticket blocked or crashed (rc=$rc): $(cat "$TMP/nad-dead.out")"
+  [[ -e "$TMP/nad-dead-ran" ]] || fail "nad: command did not run"
+  if grep -q Traceback "$TMP/nad-dead.out"; then
+    fail "nad: lane run traceback"
+  fi
+
+  start_sleeper 300
+  local live=$BG
+  python3 - "$WRK_HEAVY_LOCK.waiters/$live" "$live" <<'PY'
+import sys
+path, pid = sys.argv[1:]
+open(path, "w", encoding="utf-8").write(
+    "pid=%s class=ci limit=1 ticket=\u00b2:1 since=x job=- cmd=nad-ci\n" % pid)
+PY
+  status_out >"$TMP/nad-status.out" 2>"$TMP/nad-status.err" ||
+    fail "nad: status crashed: $(cat "$TMP/nad-status.err")"
+  if grep -q Traceback "$TMP/nad-status.err"; then
+    fail "nad: status traceback"
+  fi
+  mkhold nad-l
+  bg_heavy nad-l
+  local pl=$BG
+  wait_until 10 queued nad-l lane 1 ||
+    fail "nad: lane never queued behind a bad ci ticket"
+  settle_waiters || fail "nad: ci record was not visible for a full poll"
+  if started nad-l; then
+    fail "nad: a bad ticket stopped the ci reservation"
+  fi
+  kill_own "$live"
+  wait_until 10 started nad-l ||
+    fail "nad: lane did not run after the ci pid died"
+  release nad-l
+  wait "$pl" || fail "nad: lane failed"
+
+  mkdir -p "$WRK_HEAVY_LOCK.positions"
+  python3 - "$WRK_HEAVY_LOCK.positions/nadkey" <<'PY'
+import sys, time
+exp = time.time_ns() + 10**12
+open(sys.argv[1], "w", encoding="utf-8").write(
+    "key=nadkey ticket=\u00b2:1 expiry=%d\n" % exp)
+PY
+  status_out >"$TMP/nad-pos.out" 2>"$TMP/nad-pos.err" ||
+    fail "nad: status crashed on a bad position: $(cat "$TMP/nad-pos.err")"
+  if grep -q Traceback "$TMP/nad-pos.err"; then
+    fail "nad: position status traceback"
+  fi
+  grep -q '^position key=nadkey ' "$TMP/nad-pos.out" &&
+    fail "nad: status listed a non-ascii position ticket"
+  [[ -e "$WRK_HEAVY_LOCK.positions/nadkey" ]] ||
+    fail "nad: status removed a bad position"
+  rc=0
+  "$(wrk_bin)" heavy --queue-key nadkey -- true \
+    >"$TMP/nad-key.out" 2>&1 || rc=$?
+  [[ "$rc" -eq 0 ]] ||
+    fail "nad: keyed run crashed on a bad position (rc=$rc): $(cat "$TMP/nad-key.out")"
+  [[ -e "$WRK_HEAVY_LOCK.positions/nadkey" ]] ||
+    fail "nad: acquire removed a position it did not reuse"
+}
+nonascii_digit_ignored
+echo "PASS heavy-fifo-nonascii-digit-ignored"
 
 # ── a ticketless lane waiter is skipped by lane FIFO ───────────────────────
 new_lock mixed
