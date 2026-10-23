@@ -16,7 +16,7 @@ class RoundExtensionSpawn(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name)
         self.log = self.base / "calls"
-        self.env = {"PATH": os.environ["PATH"], "HOME": str(self.base), "CODEX_HOME": str(self.base / "codex"),
+        self.env = {"PATH": os.environ["PATH"], "HOME": str(self.base), "WRK_TEST_MODE": "1", "CODEX_HOME": str(self.base / "codex"),
                     "HK_TASK_ID": "1632", "ARBITER_INBOX_ROOT": str(self.base / "jobs"),
                     "HANDOFFKEEP_BIN": str(self.base / "hk"),
                     "SCOPEFUEL_BIN": str(self.base / "scopefuel"),

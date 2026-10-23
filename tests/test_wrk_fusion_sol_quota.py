@@ -51,6 +51,7 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
         env = {
             "PATH": os.defpath,
             "HOME": str(self.home),
+            "WRK_TEST_MODE": "1",
             "XDG_CACHE_HOME": str(self.xdg["XDG_CACHE_HOME"]),
             "XDG_CONFIG_HOME": str(self.xdg["XDG_CONFIG_HOME"]),
             "XDG_DATA_HOME": str(self.xdg["XDG_DATA_HOME"]),

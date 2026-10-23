@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# hk 1454: wrk and arbiter honour temp-path overrides on trust reads only here.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"

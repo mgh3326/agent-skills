@@ -5,6 +5,8 @@
 # wait-time JSONL log contract (host/job/task/cmd/wait_s/hold_s) and
 # assertion-RED mutants over the wrk source.
 set -euo pipefail
+# hk 1454: wrk and arbiter honour temp-path overrides on trust reads only here.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"

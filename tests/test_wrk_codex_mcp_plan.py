@@ -44,7 +44,7 @@ class MigrationTests(unittest.TestCase):
         self.base = Path(self.tmp.name).resolve()
         self.home = self.base / "user"
         self.home.mkdir()
-        self.env = {"PATH": os.environ["PATH"], "HOME": str(self.home),
+        self.env = {"PATH": os.environ["PATH"], "HOME": str(self.home), "WRK_TEST_MODE": "1",
                     "CODEX_HOME": str(self.home / ".codex"), "CLAUDE_CONFIG_DIR": str(self.home / ".claude"),
                     "XDG_CONFIG_HOME": str(self.home / ".config"), "XDG_DATA_HOME": str(self.home / ".local/share"),
                     "XDG_STATE_HOME": str(self.home / ".local/state"), "XDG_CACHE_HOME": str(self.home / ".cache")}

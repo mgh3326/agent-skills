@@ -192,6 +192,7 @@ class IsolationTests(unittest.TestCase):
         self.plans = []
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(("ARBITER_", "MOCK_", "WRK_", "HK_", "CODEX_", "CLAUDE_", "KIMI_", "OPENCODE_", "GROK_", "GEMINI_", "DEVIN_"))}
         self.env["HOME"] = str(self.fixture_home)
+        self.env["WRK_TEST_MODE"] = "1"  # hk 1454: temp-path overrides on trust reads
         for name, relative in {
             "CODEX_HOME": ".codex", "CLAUDE_CONFIG_DIR": ".claude",
             "XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share",

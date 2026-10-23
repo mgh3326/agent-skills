@@ -11,6 +11,8 @@
 # process THIS file launched (tracked in OWNED_PID_LOG) — never a real host
 # pid — and the target process stays alive through every negative assertion.
 set -euo pipefail
+# hk 1454: wrk and arbiter honour temp-path overrides on trust reads only here.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="${WRK_TEST_BIN:-$ROOT/bin/wrk}"

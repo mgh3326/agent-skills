@@ -18,6 +18,8 @@
 # forwarded `wrk spawn --host local` for real against the same fixture; the hub
 # case replays the /v1/spawn args as the receiving node's command line.
 set -euo pipefail
+# hk 1454: wrk and arbiter honour temp-path overrides on trust reads only here.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 HERDR="$ROOT/tests/fixtures/herdr"

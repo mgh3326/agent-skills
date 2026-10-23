@@ -3,6 +3,8 @@
 # Every run is hermetic: XDG_DATA_HOME and ARBITER_INBOX_ROOT point into a temp
 # dir, so the real ~/.local/share and ~/work/herdr-inbox are never touched.
 set -euo pipefail
+# hk 1454: wrk and arbiter honour temp-path overrides on trust reads only here.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ARBITER="$ROOT/bin/arbiter"

@@ -5,6 +5,8 @@
 # with a fetched hk approval grant from parent lane or operator, and
 # assertion-RED mutants over the wrk source.
 set -euo pipefail
+# hk 1454: wrk and arbiter honour temp-path overrides on trust reads only here.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
