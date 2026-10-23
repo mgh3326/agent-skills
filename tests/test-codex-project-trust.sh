@@ -361,8 +361,9 @@ for spelling in spaced single comment crlf prefix; do
   mention_home="$TMP/header-$spelling"
   mkdir -p "$mention_home"
   python3 - "$mention_home/config.toml" "$NEW_WORKTREE" "$spelling" <<'PYCASE'
-import sys
+import os, sys
 path, cwd, spelling = sys.argv[1:]
+cwd = os.path.realpath(cwd)
 headers = {
     "spaced": '[ projects."%s" ]\n' % cwd,
     "single": "[projects.'%s']\n" % cwd,
@@ -405,7 +406,7 @@ mkdir -p "$TMP/directory-target"
 ln -s "$TMP/directory-target" "$TMP/directory-link"
 spawn_ok symlink-directory "$WRK" "$WORKTREE" codex-luna "$TMP/directory-link"
 [[ -L "$TMP/directory-link" ]] || fail 'CODEX_HOME directory symlink changed'
-printf '[projects."%s"]\ntrust_level = "trusted"\n' "$WORKTREE" >"$TMP/directory-expected"
+printf '[projects."%s"]\ntrust_level = "trusted"\n' "$(cd "$WORKTREE" && pwd -P)" >"$TMP/directory-expected"
 cmp "$TMP/directory-expected" "$TMP/directory-target/config.toml" || fail 'directory symlink did not seed target'
 grep -q '^wrk: Codex project trust seeded \[validation=' "$TMP/symlink-directory.err" || fail 'directory symlink did not report seeded'
 echo 'PASS leaf-symlinks-skipped-directory-symlink-supported'
