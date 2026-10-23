@@ -4287,8 +4287,13 @@ EOF
   pidfile="$INBOX/$job/completion-sentinel.pid"
   wait_until 20 pid_gone "$pid" || return 3
   grep -Fq 'inject-complete' "$trace" || { cat "$trace" >&2; return 3; }
-  [[ "$(event_count "$INBOX/$job/events" job.reclaim)" == 1 ]] || {
+  local reclaim_count
+  reclaim_count="$(event_count "$INBOX/$job/events" job.reclaim)"
+  [[ "$reclaim_count" == 1 ]] || {
+    printf 'R33 setup: reclaim-count=%s event-dir=%s\n' \
+      "$reclaim_count" "$INBOX/$job/events" >&2
     cat "$trace" >&2
+    find "$INBOX/$job/events" -maxdepth 1 -type f -print >&2
     return 3
   }
   if [[ -s "$pidfile" ]]; then
