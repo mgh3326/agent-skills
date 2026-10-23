@@ -5,6 +5,9 @@
 # a temp root. The non-test-mode path runs a copy of bin/wrk (and bin/arbiter)
 # whose passwd-home line names a fake home under TMP, so no case reads or
 # writes the real passwd home.
+# The A && B || fail form is intended: fail whenever either check is false.
+# Mutant strings are literal source text, so they stay single-quoted.
+# shellcheck disable=SC2015,SC2016
 set -euo pipefail
 # hk 1454: wrk and arbiter honour temp-path overrides on trust reads only here.
 export WRK_TEST_MODE=1
