@@ -140,11 +140,12 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|p
             [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
-  wrk joined JOB --pr URL --head SHA --report PATH
+  wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
   wrk round open JOB --head SHA [--extend REF] [--repo PATH]
   wrk round verdict JOB --file PATH
   wrk round void JOB N --by REF [--reason TEXT]
   wrk round status JOB
+  wrk round audit [--lane LANE]
   wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
@@ -176,6 +177,9 @@ Options:
                      unique and the original file is untouched.
                      If the emit returns non-zero the OK line ends with
                      relay=file-only.
+                     A builder or captain done still completes, and warns once
+                     when wrk joined would refuse for zero non-voided rounds
+                     or an unmatched tester verdict file.
   -h, --help         show this usage
 USAGE
 }
@@ -190,6 +194,19 @@ Options:
   --question TEXT    required escalation question
   --report PATH      optional existing report to attach and upload as a document
   -h, --help         show this usage
+USAGE
+}
+
+joined_help() {
+  cat <<'USAGE'
+Usage: wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
+
+Record job.joined for a builder job. The join is refused when the job has
+zero non-voided recorded rounds, or when the job directory holds a tester
+verdict file that no job.verdict matches by path or content sha256. Both
+refusals are waived only by --rounds-waived REF, where REF is hk:doc/<key>
+or hk:task/<id>, and that ref is stored on the job.joined record. An end
+declaration newer than the newest revive is refused and cannot be waived.
 USAGE
 }
 
@@ -4462,6 +4479,93 @@ def wrk_event_commit(events, kind, record, attempts=100):
     finally:
         if _os.path.exists(temporary):
             _os.unlink(temporary)
+
+
+def wrk_end_declaration(events):
+    """Filename of the newest end declaration when it is later than the newest revive.
+
+    End kinds are job.revoked, job.reaped and job.handed_off. Revive kinds are
+    job.claim, job.reclaim and job.spawned. Later means a higher index in
+    wrk_events_ordered. An end with no revive is later.
+    """
+    last_end = ""
+    last_end_at = -1
+    last_revive_at = -1
+    for index, (name, document, _mtime) in enumerate(wrk_events_ordered(events)):
+        if not isinstance(document, dict):
+            continue
+        kind = document.get("kind")
+        if kind in ("job.revoked", "job.reaped", "job.handed_off"):
+            last_end = name
+            last_end_at = index
+        elif kind in ("job.claim", "job.reclaim", "job.spawned"):
+            last_revive_at = index
+    if last_end and last_end_at > last_revive_at:
+        return last_end
+    return ""
+
+
+def wrk_round_census(events, job):
+    """Return (recorded, nonvoid) round evidence for one job.
+
+    recorded counts every job.round, every unbound job.verdict and inherited
+    takeover rounds. nonvoid drops job.round rows whose round is in the cap
+    void set. That exclusion is the join gate.
+    """
+    records = [document for _name, document, _mtime in wrk_events_ordered(events)
+               if isinstance(document, dict)]
+    rounds = [record for record in records if record.get("kind") == "job.round"]
+    verdicts = [record for record in records if record.get("kind") == "job.verdict"]
+    voids = [record for record in records if record.get("kind") == "job.round_void"]
+    bound = set()
+    for verdict in verdicts:
+        number = verdict.get("round")
+        if isinstance(number, int):
+            bound.add(number)
+    round_numbers = set()
+    for record in rounds:
+        number = record.get("round")
+        if isinstance(number, int):
+            round_numbers.add(number)
+    voided = set()
+    for void in voids:
+        number = void.get("round")
+        ref = void.get("ref")
+        if (void.get("job_id") == job and isinstance(number, int)
+                and number in round_numbers and number not in bound
+                and isinstance(ref, str) and ref.startswith(("hk:doc/", "hk:task/"))):
+            voided.add(number)
+    unbound = 0
+    for verdict in verdicts:
+        if not isinstance(verdict.get("round"), int):
+            unbound += 1
+    inherited = wrk_takeover_rounds(events)
+    recorded = len(rounds) + unbound + inherited
+    nonvoid = sum(1 for r in rounds
+                  if not (isinstance(r.get("round"), int) and r.get("round") in voided))  # hk1449-nonvoid-rounds
+    nonvoid += unbound + inherited
+    return recorded, nonvoid
+
+
+def wrk_claim_role(events):
+    role = ""
+    for _name, document, _mtime in wrk_events_ordered(events):
+        if not isinstance(document, dict):
+            continue
+        if document.get("kind") not in ("job.claim", "job.reclaim"):
+            continue
+        payload = document.get("payload")
+        if not isinstance(payload, dict):
+            payload = document
+        value = payload.get("role")
+        if isinstance(value, str):
+            role = value
+    return role
+
+import re as _re
+# Shared by round verdict and the join/audit file scan. The sha-boundary
+# mutant replaces this one anchor, so a second copy would miss the parser.
+wrk_verdict_line = _re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})\s*$")
 '
 wrk_py() {
   WRK_EVENTS_PY="$WRK_EVENTS_PY" python3 "$@"
@@ -4887,6 +4991,176 @@ delegate_job_cmd() {
   exit "$rc"
 }
 
+# hk 1449: the filename of an end declaration that is later than the newest
+# revive, or empty when the job is still open. End kinds are job.revoked,
+# job.reaped and job.handed_off. Revive kinds are job.claim, job.reclaim and
+# job.spawned. Order is wrk_events_ordered.
+wrk_newer_end_record() {
+  local job="$1"
+  wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+print(wrk_end_declaration(sys.argv[1]))
+PY
+}
+
+wrk_refuse_ended() {
+  local what="$1" job="$2" end
+  end="$(wrk_newer_end_record "$job")"
+  [[ -z "$end" ]] || die "$what: refused after end record $end"
+}
+
+# Print zero-nonvoid-rounds, then unmatched<TAB>abspath lines. A tester
+# verdict file is a regular file directly in the job directory whose content
+# has a round-verdict VERDICT line. Symlinks and subdirectories are ignored.
+# A job.verdict matches by absolute path or by content sha256.
+wrk_join_blocks() {
+  local job="$1"
+  wrk_py - "$(wrk_jobs_root)/$job/events" "$(wrk_jobs_root)/$job" "$job" <<'PY'
+import hashlib, os, stat, sys
+exec(os.environ["WRK_EVENTS_PY"])
+events, job_dir, job = sys.argv[1:]
+_recorded, nonvoid = wrk_round_census(events, job)
+if nonvoid <= 0:
+    print("zero-nonvoid-rounds")
+paths = set()
+digests = set()
+for _name, document, _mtime in wrk_events_ordered(events):
+    if not isinstance(document, dict) or document.get("kind") != "job.verdict":
+        continue
+    recorded_path = document.get("path")
+    if isinstance(recorded_path, str) and recorded_path:
+        paths.add(os.path.abspath(recorded_path))
+    recorded_digest = document.get("content_sha256")
+    if isinstance(recorded_digest, str) and recorded_digest:
+        digests.add(recorded_digest)
+try:
+    names = sorted(os.listdir(job_dir))
+except OSError:
+    names = []
+for name in names:
+    path = os.path.join(job_dir, name)
+    try:
+        info = os.lstat(path)
+    except OSError:
+        continue
+    if not stat.S_ISREG(info.st_mode):
+        continue
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        continue
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        continue
+    if not any(wrk_verdict_line.match(line) for line in text.splitlines()):
+        continue
+    digest = hashlib.sha256(data).hexdigest()
+    absolute = os.path.abspath(path)
+    if absolute in paths or digest in digests:
+        continue
+    print("unmatched\t" + absolute)
+PY
+}
+
+wrk_joined_refuse_blocks() {
+  local job="$1" blocks line tag rest zero=0
+  local -a files=()
+  blocks="$(wrk_join_blocks "$job")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    tag="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    if [[ "$tag" == zero-nonvoid-rounds ]]; then
+      zero=1
+    elif [[ "$tag" == unmatched ]]; then
+      files+=("$rest")
+    fi
+  done <<<"$blocks"
+  [[ "$zero" -eq 0 && ${#files[@]} -eq 0 ]] && return 0
+  local msg="" file
+  if [[ "$zero" -eq 1 ]]; then
+    msg="job $job has zero non-voided recorded rounds"
+  fi
+  for file in "${files[@]}"; do
+    if [[ -n "$msg" ]]; then
+      msg="$msg; unmatched tester verdict file $file"
+    else
+      msg="unmatched tester verdict file $file"
+    fi
+  done
+  die "joined: $msg"
+}
+
+# One loud warning, once per done invocation, for a builder or captain whose
+# wrk joined would refuse. Worker done stays silent. The command still succeeds.
+wrk_builder_rounds_warning() {
+  local job="$1" role="$2"
+  case "$role" in
+    builder|captain) ;;
+    *) return 0 ;;
+  esac
+  local blocks line tag rest zero=0
+  local -a files=()
+  blocks="$(wrk_join_blocks "$job")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    tag="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    if [[ "$tag" == zero-nonvoid-rounds ]]; then
+      zero=1
+    elif [[ "$tag" == unmatched ]]; then
+      files+=("$rest")
+    fi
+  done <<<"$blocks"
+  [[ "$zero" -eq 0 && ${#files[@]} -eq 0 ]] && return 0
+  local msg="ROUNDS job=$job" file
+  if [[ "$zero" -eq 1 ]]; then
+    msg="$msg has zero non-voided recorded rounds"
+  fi
+  for file in "${files[@]}"; do
+    if [[ "$zero" -eq 1 || "$msg" == *"unmatched tester verdict file"* ]]; then
+      msg="$msg; unmatched tester verdict file $file"
+    else
+      msg="$msg unmatched tester verdict file $file"
+    fi
+  done
+  warn "$msg; wrk joined would refuse"
+}
+
+wrk_recorded_rounds() {
+  local job="$1"
+  wrk_py - "$(wrk_jobs_root)/$job/events" "$job" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+events, job = sys.argv[1:]
+recorded, _nonvoid = wrk_round_census(events, job)
+print(recorded)
+PY
+}
+
+wrk_job_role() {
+  local job="$1"
+  wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+print(wrk_claim_role(sys.argv[1]))
+PY
+}
+
+wrk_verdict_refusal() {
+  local tag fname rest
+  IFS=$'\t' read -r tag fname rest <<<"$1"
+  case "$tag" in
+    ENDED) die "round verdict: refused after end record $fname" ;;
+    DUP_PATH) die "round verdict: verdict path already recorded as $fname: $rest" ;;
+    DUP_CONTENT) die "round verdict: verdict content $rest already recorded as $fname" ;;
+    DUP_HEAD) die "round verdict: head $rest already recorded as $fname" ;;
+    *) die "round verdict unexpected outcome: $1" ;;
+  esac
+}
+
 done_cmd() {
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     [[ $# -eq 1 ]] || die "unexpected argument '$2'"
@@ -4902,17 +5176,20 @@ done_cmd() {
       *) die "unknown done option '$1'" ;;
     esac
   done
-  local metadata owner label pane jobs_root
+  local metadata owner label pane role jobs_root
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
   # completion_metadata prints five tab-separated fields; reading into three
   # lets pane_id swallow parent_lane and role ("w1:p1\t\tworker" was recorded
   # on 2026-09-05), which is also what panewire routes on.
-  IFS=$'\t' read -r owner label pane _ <<<"$metadata"
+  IFS=$'\t' read -r owner label pane _ role <<<"$metadata"
   jobs_root="$(wrk_jobs_root)"
   if [[ -z "$report" ]]; then
     report="$(find_latest_report "$jobs_root/$job")"
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
+  # Warn once, before the duplicate branch and before delegation, so both
+  # success paths say it exactly once. A builder done does not refuse.
+  wrk_builder_rounds_warning "$job" "$role"
   # Decide the artifact path before delegating or uploading: a changed report
   # that reuses an earlier round's path is snapshot to <stem>-r<N>.md so its
   # outbox key is fresh. Delegation comes after resolution because
@@ -4960,7 +5237,7 @@ done_cmd() {
 }
 
 builder_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
@@ -4970,10 +5247,10 @@ builder_flat_event() {
   else
     last=""
   fi
-  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
+  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" <<'PY'
 import json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived = sys.argv[1:]
 # wrk escalate/joined publish outside the round writers' lock: take the shared
 # events lock so numbering is serialized with bin/arbiter and wrk done too.
 lock = wrk_events_locked(events)
@@ -4983,6 +5260,7 @@ record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
 if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
+if waived: record["rounds_waived"] = waived
 wrk_event_commit(events, kind, record)
 PY
 }
@@ -5030,8 +5308,12 @@ escalate_cmd() {
 }
 
 joined_cmd() {
-  delegate_job_cmd joined "$@"
-  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent role reason
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+    joined_help
+    return 0
+  fi
+  local job="${1:-}" pr="" head="" report="" waived=""
   [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -5039,14 +5321,34 @@ joined_cmd() {
       --pr) [[ $# -ge 2 && -n "$2" ]] || die "--pr requires a URL"; pr="$2"; shift 2 ;;
       --head) [[ $# -ge 2 && -n "$2" ]] || die "--head requires a SHA"; head="$2"; shift 2 ;;
       --report) [[ $# -ge 2 && -n "$2" ]] || die "--report requires a path"; report="$2"; shift 2 ;;
+      --rounds-waived)
+        [[ $# -ge 2 && -n "$2" ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"
+        waived="$2"; shift 2 ;;
+      -h|--help) die "unexpected argument '$1'" ;;
       *) die "unknown joined option '$1'" ;;
     esac
   done
   [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
+  if [[ -n "$waived" ]]; then
+    case "$waived" in
+      hk:doc/?*|hk:task/?*) ;;
+      *) die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>" ;;
+    esac
+  fi
+  local metadata owner label pane parent role reason joined_end
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
+  # hk1449-joined-end
+  joined_end="$(wrk_newer_end_record "$job")"
+  [[ -z "$joined_end" ]] || die "joined: refused after end record $joined_end"
+  # A waiver is recorded on wrk's own job.joined, so it must not be forwarded
+  # and must not take the delegated path. Without it, delegate exactly as before.
+  if [[ -z "$waived" ]]; then
+    wrk_joined_refuse_blocks "$job"
+    delegate_job_cmd joined "$job" --pr "$pr" --head "$head" --report "$report"
+  fi
   upload_report_document "$job" "$report"
   # #770 tester BLOCKER 1: when the delegated `panewire job joined` landed the
   # record and then failed, the fallback arrives with job.joined already the
@@ -5060,7 +5362,7 @@ joined_cmd() {
     echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
     return 0
   fi
-  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head"
+  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived"
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "" "$pr" "$head"
@@ -5098,7 +5400,7 @@ ROUND_CAP_REASON="tester round cap reached"
 
 round_help() {
   cat <<'USAGE'
-Usage: wrk round <open|verdict|void|status> JOB [options]
+Usage: wrk round <open|verdict|void|status|audit> [JOB] [options]
 
 Formal tester-round bookkeeping for a builder job (#758). A formal round is
 one tester verdict recorded for one head. The count is taken only from the
@@ -5137,12 +5439,21 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
   wrk round verdict JOB --file PATH
       Record the tester's verdict file for the oldest open round that has
       none. PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
+      The record stores that file's content sha256 beside its path. A later
+      verdict is refused when the path, those exact bytes, or that head was
+      already recorded for this job. A repeated head is allowed only when
+      the round that held the earlier verdict was voided.
       A verdict that binds to no open round still counts as a round, so
       verdict files written elsewhere or recorded without an open cannot
       dodge the cap.
   wrk round status JOB
       Print one line: job=… rounds=N cap=N open=… last_verdict=… and any
       voided rounds as 'round N void (hk:doc/…)' or 'round N void (hk:task/…)'.
+  wrk round audit [--lane LANE]
+      Read-only. Print one line per builder job that is not ended and has
+      zero recorded rounds, and one line per job directory that holds a
+      tester verdict file with no matching job.verdict. --lane keeps only
+      that owner lane. Writes nothing.
   wrk round void JOB N --by REF [--reason TEXT]
       Void an existing round without a verdict, using a matching round-void
       grant in hk:doc/<key> or hk:task/<id>. The grant line is the default
@@ -5489,6 +5800,7 @@ round_open_cmd() {
   head="$(printf '%s' "$head" | tr '[:upper:]' '[:lower:]')"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round open" "$job"
   if ! repo="$(round_repo_resolve "$job" "$repo_override")"; then
     if [[ -n "$repo_override" ]]; then
       die "round open: --repo $repo_override is not a usable git repository"
@@ -5553,6 +5865,10 @@ os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
+    end_name = wrk_end_declaration(events)
+    if end_name:
+        print("ENDED\t%s" % end_name)
+        raise SystemExit(0)
     records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
@@ -5599,6 +5915,9 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round open failed to inspect $job"
   case "$outcome" in
+    ENDED$'\t'*)
+      die "round open: refused after end record ${outcome#ENDED$'\t'}"
+      ;;
     OPENED\ round=*)
       echo "OK job=$job ${outcome#OPENED } cap=$ROUND_CAP_DEFAULT head=$head"
       ;;
@@ -5642,6 +5961,7 @@ round_void_cmd() {
   [[ -n "$ref" ]] || die "round void requires --by REF"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round void" "$job"
 
   local tmp_approval grant grant_issuer
   tmp_approval="$(mktemp)"
@@ -5683,6 +6003,10 @@ os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
+    end_name = wrk_end_declaration(events)
+    if end_name:
+        print("ENDED\t%s" % end_name)
+        raise SystemExit(0)
     records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"
               and r.get("job_id") == job and r.get("round") == round_number]
@@ -5707,6 +6031,9 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round void failed to inspect $job"
   case "$outcome" in
+    ENDED$'\t'*)
+      die "round void: refused after end record ${outcome#ENDED$'\t'}"
+      ;;
     VOIDED\ round=*) echo "OK job=$job $outcome ref=$ref" ;;
     NO_ROUND) die "round void: round $round_number does not exist for job $job" ;;
     HAS_VERDICT) die "round void: round $round_number already has a job.verdict" ;;
@@ -5728,21 +6055,21 @@ round_verdict_cmd() {
   [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round verdict" "$job"
   local outcome rc=0
   set +e
   outcome="$(wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
-import fcntl, json, os, re, sys, tempfile
+import fcntl, hashlib, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, label, pane, parent, vfile, cap = sys.argv[1:]
 cap = int(cap)
 os.makedirs(events, exist_ok=True)
 verdict = vsha = None
-VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})\s*$")
 matches = []
 try:
     with open(vfile, encoding="utf-8") as f:
         for line in f:
-            m = VERDICT.match(line)
+            m = wrk_verdict_line.match(line)
             if m:
                 matches.append(m)
 except OSError:
@@ -5754,10 +6081,22 @@ if len(matches) > 1:
     print("AMBIGUOUS")
     raise SystemExit(0)
 verdict, vsha = matches[0].group(1), matches[0].group(2).lower()
+digest = ""
+try:
+    with open(vfile, "rb") as raw:
+        digest = hashlib.sha256(raw.read()).hexdigest()
+except OSError:
+    digest = ""
+abspath = os.path.abspath(vfile)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
+    end_name = wrk_end_declaration(events)
+    if end_name:
+        print("ENDED\t%s" % end_name)
+        raise SystemExit(0)
+    ordered = wrk_events_ordered(events)
+    records = [o for _, o, _ in ordered if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
     voids = [r for r in records if r.get("kind") == "job.round_void"]
@@ -5769,6 +6108,54 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                   and v.get("round") in round_numbers and v.get("round") not in bound
                   and isinstance(v.get("ref"), str)
                   and v["ref"].startswith(("hk:doc/", "hk:task/")))}
+    # Identity refusals name the earliest blocking job.verdict. Path, then
+    # exact bytes, then head. A void releases the head even when that round
+    # also carries a verdict; the cap's void set above is unchanged.
+    path_hit = ""
+    content_hit = ""
+    digests = set()
+    head_hit = ""
+    for name, document, _mtime in ordered:
+        if not isinstance(document, dict) or document.get("kind") != "job.verdict":
+            continue
+        vid = document.get("job_id")
+        if isinstance(vid, str) and vid != job:
+            continue
+        recorded_path = document.get("path")
+        if (path_hit == "" and isinstance(recorded_path, str)
+                and os.path.abspath(recorded_path) == abspath):
+            path_hit = name
+        recorded_digest = document.get("content_sha256")
+        if isinstance(recorded_digest, str) and recorded_digest:
+            digests.add(recorded_digest)
+            if content_hit == "" and recorded_digest == digest:
+                content_hit = name
+        recorded_head = document.get("head")
+        if (head_hit == "" and isinstance(recorded_head, str)
+                and recorded_head.lower() == vsha):
+            number = document.get("round")
+            released = False
+            if isinstance(number, int):
+                for void in voids:
+                    vjob = void.get("job_id")
+                    ref = void.get("ref")
+                    if ((not isinstance(vjob, str) or vjob == job)
+                            and void.get("round") == number
+                            and isinstance(ref, str)
+                            and ref.startswith(("hk:doc/", "hk:task/"))):
+                        released = True
+                        break
+            if not released:
+                head_hit = name
+    if path_hit:
+        print("DUP_PATH\t%s\t%s" % (path_hit, abspath))
+        raise SystemExit(0)
+    if digest in digests:  # hk1449-content-sha
+        print("DUP_CONTENT\t%s\t%s" % (content_hit, digest))
+        raise SystemExit(0)
+    if head_hit:
+        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+        raise SystemExit(0)
     target = None
     for r in rounds:
         if (isinstance(r.get("round"), int) and r.get("round") not in bound
@@ -5784,7 +6171,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     record = {"kind": "job.verdict", "job_id": job, "owner_lane": owner,
               "label": label, "pane_id": pane, "parent_lane": parent,
               "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
-              "round": target, "epoch": 1}
+              "content_sha256": digest, "round": target, "epoch": 1}
     if target is None:
         record["unopened"] = True
     wrk_event_commit(events, "job.verdict", record)
@@ -5801,6 +6188,8 @@ PY
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
     AMBIGUOUS)
       die "round verdict --file has more than one VERDICT line: $file" ;;
+    ENDED$'\t'*|DUP_PATH$'\t'*|DUP_CONTENT$'\t'*|DUP_HEAD$'\t'*)
+      wrk_verdict_refusal "$outcome" ;;
     RECORDED*)
       local round_no="" verdict_v="" head_v="" used_v="" over_v="" status question tok
       for tok in $outcome; do
@@ -5841,6 +6230,59 @@ round_status_cmd() {
   echo "job=$job cap=$ROUND_CAP_DEFAULT $scan"
 }
 
+round_audit_cmd() {
+  local lane=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) round_help; return 0 ;;
+      --lane)
+        [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a lane"
+        lane="$2"
+        shift 2
+        ;;
+      *) die "unknown round audit option '$1'" ;;
+    esac
+  done
+  local jobs_root
+  jobs_root="$(wrk_jobs_root)"
+  [[ -d "$jobs_root" ]] || return 0
+  local job_dir job scan ended owner lane_ok role recorded blocks line tag rest
+  while IFS= read -r job_dir; do
+    [[ -n "$job_dir" && -d "$job_dir" ]] || continue
+    job="$(basename "$job_dir")"
+    scan="$(job_events_scan "$job_dir/events")"
+    ended=""
+    owner=""
+    IFS=$'\t' read -r _ ended _ _ _ _ _ owner _ <<<"$scan"
+    [[ -n "${owner:-}" ]] || owner="-"
+    lane_ok=0
+    if [[ -z "$lane" || "$owner" == "$lane" ]]; then
+      lane_ok=1
+    fi
+    if [[ "$lane_ok" -ne 1 ]]; then
+      continue
+    fi
+    role="$(wrk_job_role "$job")"
+    recorded="$(wrk_recorded_rounds "$job")"
+    case "$role" in
+      builder|captain)
+        if [[ "$ended" == "0" && "$recorded" == "0" ]]; then
+          printf 'zero-rounds job=%s lane=%s\n' "$job" "$owner"
+        fi
+        ;;
+    esac
+    blocks="$(wrk_join_blocks "$job")"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      tag="${line%%$'\t'*}"
+      rest="${line#*$'\t'}"
+      if [[ "$tag" == unmatched ]]; then
+        printf 'unmatched-verdict job=%s file=%s\n' "$job" "$rest"
+      fi
+    done <<<"$blocks"
+  done < <(find "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+}
+
 round_cmd() {
   local sub="${1:-}"
   case "$sub" in
@@ -5849,6 +6291,7 @@ round_cmd() {
     verdict) shift; round_verdict_cmd "$@" ;;
     void) shift; round_void_cmd "$@" ;;
     status) shift; round_status_cmd "$@" ;;
+    audit) shift; round_audit_cmd "$@" ;;
     *) die "unknown round subcommand '$sub' (see 'wrk round --help')" ;;
   esac
 }

@@ -605,10 +605,15 @@ expect_rc 2 "$WRK" round open ju --head "$H2" --extend hk:doc/good2
 echo "PASS extend-before-cap-refused"
 
 # ── orphan verdict at the cap: recorded, escalated, rc 78 ───────────────────
+# Each bound verdict needs its own head and bytes. The same path, the same
+# content, or the same head is refused (hk 1449), so reusing one file would
+# stop before the unbound fourth verdict.
 mkjob jo
 for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jo "$h"; done
-for n in 1 2 3; do
-  write_verdict "$TMP/vo$n.md" BLOCKER "$H1"
+n=0
+for h in "$H1" "$H2" "$H3"; do
+  n=$((n + 1))
+  write_verdict "$TMP/vo$n.md" BLOCKER "$h"
   "$WRK" round verdict jo --file "$TMP/vo$n.md" >/dev/null
 done
 write_verdict "$TMP/vo4.md" BLOCKER "$H4"
@@ -703,8 +708,10 @@ mutant nocount "$TMP/spec-nocount"
 jmn="mut-nc"
 mkjob "$jmn"
 for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/nocount-wrk" "$jmn" "$h"; done
-for n in 1 2 3; do
-  write_verdict "$TMP/vnc$n.md" BLOCKER "$H1"
+n=0
+for h in "$H1" "$H2" "$H3"; do
+  n=$((n + 1))
+  write_verdict "$TMP/vnc$n.md" BLOCKER "$h"
   "$TMP/nocount-wrk" round verdict "$jmn" --file "$TMP/vnc$n.md" >/dev/null 2>&1
 done
 write_verdict "$TMP/vnc4.md" BLOCKER "$H4"
