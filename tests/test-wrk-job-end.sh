@@ -4263,20 +4263,26 @@ if [[ "\${1:-}" == status && "\${3:-}" == "$job" && ! -e "$injected" ]] &&
     compgen -G "$INBOX/$job/events/*-job.revoked.json" >/dev/null; then
   printf 'inject\n' >>"$trace"
   : >"$injected"
-  "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null || {
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null || {
     printf 'inject-release-failed\n' >>"$trace"; exit 81;
   }
-  "$ARBITER" lease --job "$job" --kind quota_pool --profile codex-luna \\
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \\
+    "$ARBITER" lease --job "$job" --kind quota_pool --profile codex-luna \\
     --gate-output "\$(cat "$gatefile")" >/dev/null || {
       printf 'inject-lease-failed\n' >>"$trace"; exit 82;
     }
-  "$ARBITER" event --job "$job" --kind job.reclaim \\
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \\
+    "$ARBITER" event --job "$job" --kind job.reclaim \\
     --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || {
       printf 'inject-reclaim-failed\n' >>"$trace"; exit 83;
     }
+  compgen -G "$INBOX/$job/events/*-job.reclaim.json" >/dev/null || {
+    printf 'inject-reclaim-artifact-missing\n' >>"$trace"; exit 84;
+  }
   printf 'inject-complete\n' >>"$trace"
 fi
-exec "$ARBITER" "\$@"
+exec env ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$ARBITER" "\$@"
 EOF
   chmod +x "$arbwrap" || return 3
   RECOVERY_ARBITER="$arbwrap" SENT_INTERVAL=1 LOST_GRACE=1 \
