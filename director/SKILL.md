@@ -263,7 +263,7 @@ checker 파생 판정:
 - 최종 PR head와 tested SHA가 다르면 BOUNCE
 <!-- openai-independent-verification:end -->
 
-1. 독립 검증 보고의 `VERDICT: JOIN` — tester 급은 워커 이상, 검증 head == PR head.
+1. 독립 검증 보고의 `VERDICT: JOIN` — tester 급은 워커 이상, 검증 head == PR head. 빌더 `wrk joined`는 비무효 라운드가 있고 잡 디렉터리의 verdict 파일이 기록된 job.verdict와 맞을 때만 기록하며, 아니면 `--rounds-waived hk:doc/<key>|hk:task/<id>`가 필요하다. 최신 revive보다 새로운 end declaration은 거절한다.
 2. required CI가 **exact head**에서 초록. G3 `merge_precheck`가 `ci_canonical`의 run/attempt/job
    H/B/M 결속으로 판정하며, `gh pr checks` 출력만 파싱해 false-green을 추정하지 않는다. draft는 CI가 안 돌 수 있다.
 3. base가 CI 이후 전진했으면 update-branch 후 재CI(파일 겹침 무관).
