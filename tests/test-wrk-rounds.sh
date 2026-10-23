@@ -360,6 +360,7 @@ elif sys.argv[1:3] == ["job", "joined"]:
         self.job("completed"); self.event("completed", "job.completed")
         self.job("matched"); self.record("matched", self.verdict("matched"))
         self.job("unmatched"); self.open("unmatched"); path = self.verdict("unmatched")
+        second = self.verdict("unmatched", 1, "verdict2.md")
         self.job("both"); self.verdict("both")
         self.job("ended-file"); self.event("ended-file", "job.revoked"); self.verdict("ended-file")
         self.job("voided"); self.open("voided")
@@ -370,7 +371,7 @@ elif sys.argv[1:3] == ["job", "joined"]:
         lines = result.stdout.splitlines()
         self.assertEqual(set(lines), {"job=zero zero non-voided recorded rounds",
             "job=both zero non-voided recorded rounds", "job=voided zero non-voided recorded rounds",
-            "job=unmatched unmatched verdict file: " + str(path),
+            "job=unmatched unmatched verdict file: " + str(path) + "; " + str(second),
             "job=both unmatched verdict file: " + str(self.jobs / "both/verdict.md"),
             "job=ended-file unmatched verdict file: " + str(self.jobs / "ended-file/verdict.md")})
         self.assertEqual(len(lines), 6)

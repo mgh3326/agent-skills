@@ -6026,8 +6026,9 @@ for job in sorted(os.listdir(root)):
             and job in os.environ["WRK_AUDIT_ACTIVE"].splitlines()
             and wrk_round_used(events) == 0):
         print("job=%s zero non-voided recorded rounds" % job)
-    for path in wrk_unmatched_verdicts(events):
-        print("job=%s unmatched verdict file: %s" % (job, path))
+    unmatched = list(wrk_unmatched_verdicts(events))
+    if unmatched:
+        print("job=%s unmatched verdict file: %s" % (job, "; ".join(unmatched)))
 PY
 }
 
