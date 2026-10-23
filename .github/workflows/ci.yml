@@ -60,6 +60,7 @@ jobs:
             tests/test-fleet-rev.sh \
             tests/test-gate-policy-devin-grades.sh \
             tests/test-codex-project-trust.sh \
+            tests/test-trust-paths.sh \
             tests/fixtures/fleet-rev/fake-ssh \
             tests/fixtures/fleet-rev/fake-gh \
             tests/fixtures/fleet-rev/panewire \
@@ -95,6 +96,8 @@ jobs:
           bash tests/test-t3-split-rule.sh
           bash tests/test-merge-precheck.sh
           bash tests/test-round-cap.sh
+          bash tests/test-trust-paths.sh
+          python3 -m unittest discover -s tests -p 'test_trust_paths.py' -v
           bash tests/test-wrk-heavy-limit.sh
           bash tests/test-wrk-heavy-class.sh
           bash tests/test-wrk-task-link.sh
