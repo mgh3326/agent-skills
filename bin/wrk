@@ -139,11 +139,12 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|p
             [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
-  wrk joined JOB --pr URL --head SHA --report PATH
+  wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
   wrk round open JOB --head SHA [--extend REF] [--repo PATH]
   wrk round verdict JOB --file PATH
   wrk round void JOB N --by REF [--reason TEXT]
   wrk round status JOB
+  wrk round audit [--lane L]
   wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
@@ -163,6 +164,7 @@ Usage: wrk done JOB [--report PATH]
 
 Write a job.completed record for JOB, upload the report as a handoffkeep
 document, and emit the relay event to the owner lane.
+Builder jobs warn once about missing round records or unmatched verdict files.
 
 Options:
   --report PATH      existing report file (default: newest report*.md in the
@@ -4308,6 +4310,10 @@ import datetime as _dt
 import json as _json
 import os as _os
 import tempfile as _tempfile
+import hashlib as _hashlib
+import re as _re
+
+WRK_VERDICT = _re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})\s*$")
 
 
 def wrk_event_moment(value):
@@ -4382,6 +4388,75 @@ def wrk_takeover_rounds(events):
         if isinstance(value, int) and not isinstance(value, bool):
             inherited = max(inherited, value)
     return inherited
+
+
+def wrk_end_declaration(events):
+    """Newest explicit end after the newest claim/reclaim/spawn, in shared order."""
+    ended = None
+    for name, document, _ in wrk_events_ordered(events):
+        if document is None:
+            continue
+        kind = document.get("kind") or document.get("type") or document.get("event")
+        if kind in ("job.claim", "job.reclaim", "job.spawned"):
+            ended = None
+        elif kind in ("job.revoked", "job.reaped", "job.handed_off"):
+            ended = (name, kind)
+    return ended
+
+
+def wrk_round_used(events):
+    """The existing round-scan count, including unopened and inherited rounds."""
+    job = _os.path.basename(_os.path.dirname(events))
+    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
+    rounds = [r for r in records if r.get("kind") == "job.round"]
+    verdicts = [r for r in records if r.get("kind") == "job.verdict"]
+    bound = {v.get("round") for v in verdicts if isinstance(v.get("round"), int)}
+    numbers = {r.get("round") for r in rounds if isinstance(r.get("round"), int)}
+    voided = {v.get("round") for v in records
+              if (v.get("kind") == "job.round_void" and v.get("job_id") == job
+                  and isinstance(v.get("round"), int) and v.get("round") in numbers
+                  and v.get("round") not in bound and isinstance(v.get("ref"), str)
+                  and v["ref"].startswith(("hk:doc/", "hk:task/")))}
+    used = sum(1 for r in rounds
+               if not (isinstance(r.get("round"), int) and r.get("round") in voided))
+    used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+    return used + wrk_takeover_rounds(events)
+
+
+def wrk_verdict_file(path):
+    """Hash the exact file bytes; parse the same lines for verdict and join/audit."""
+    with open(path, "rb") as handle:
+        content = handle.read()
+    matches = [m for line in content.decode("utf-8").splitlines(keepends=True)
+               if (m := WRK_VERDICT.match(line))]
+    return _hashlib.sha256(content).hexdigest(), matches
+
+
+def wrk_unmatched_verdicts(events):
+    verdicts = [o for _, o, _ in wrk_events_ordered(events)
+                if o is not None and o.get("kind") == "job.verdict"]
+    paths = {o.get("path") for o in verdicts}
+    hashes = {o.get("sha256") for o in verdicts if o.get("sha256")}
+    directory = _os.path.dirname(events)
+    with _os.scandir(directory) as entries:
+        candidates = sorted((entry.path for entry in entries
+                             if entry.is_file(follow_symlinks=False)))
+    for path in candidates:
+        try:
+            digest, matches = wrk_verdict_file(path)
+        except (OSError, UnicodeError):
+            continue
+        if matches and _os.path.abspath(path) not in paths and digest not in hashes:
+            yield _os.path.abspath(path)
+
+
+def wrk_round_issues(events):
+    issues = []
+    used = wrk_round_used(events)
+    if used == 0:
+        issues.append("zero non-voided recorded rounds")
+    issues.extend("unmatched verdict file: " + path for path in wrk_unmatched_verdicts(events))
+    return issues
 
 
 def wrk_event_highest(events):
@@ -4902,6 +4977,9 @@ done_cmd() {
     report="$(find_latest_report "$jobs_root/$job")"
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
+  local round_warning
+  round_warning="$(round_join_issues "$job")"
+  [[ -z "$round_warning" ]] || warn "ROUND RECORD WARNING job=$job: $round_warning"
   # Decide the artifact path before delegating or uploading: a changed report
   # that reuses an earlier round's path is snapshot to <stem>-r<N>.md so its
   # outbox key is fresh. Delegation comes after resolution because
@@ -4949,7 +5027,7 @@ done_cmd() {
 }
 
 builder_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" rounds_waived="${12:-}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
@@ -4959,10 +5037,10 @@ builder_flat_event() {
   else
     last=""
   fi
-  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
+  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$rounds_waived" <<'PY'
 import json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, rounds_waived = sys.argv[1:]
 # wrk escalate/joined publish outside the round writers' lock: take the shared
 # events lock so numbering is serialized with bin/arbiter and wrk done too.
 lock = wrk_events_locked(events)
@@ -4972,6 +5050,7 @@ record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
 if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
+if rounds_waived: record["rounds_waived"] = rounds_waived
 wrk_event_commit(events, kind, record)
 PY
 }
@@ -5019,8 +5098,8 @@ escalate_cmd() {
 }
 
 joined_cmd() {
-  delegate_job_cmd joined "$@"
-  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent role reason
+  local -a joined_args=("$@")
+  local job="${1:-}" pr="" head="" report="" rounds_waived="" metadata owner label pane parent role reason
   [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -5028,12 +5107,25 @@ joined_cmd() {
       --pr) [[ $# -ge 2 && -n "$2" ]] || die "--pr requires a URL"; pr="$2"; shift 2 ;;
       --head) [[ $# -ge 2 && -n "$2" ]] || die "--head requires a SHA"; head="$2"; shift 2 ;;
       --report) [[ $# -ge 2 && -n "$2" ]] || die "--report requires a path"; report="$2"; shift 2 ;;
+      --rounds-waived) [[ $# -ge 2 && -n "$2" ]] || die "--rounds-waived requires a hk:doc/<key> or hk:task/<id> ref"; rounds_waived="$2"; shift 2 ;;
       *) die "unknown joined option '$1'" ;;
     esac
   done
   [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  round_require_live "$job" "joined"
+  if [[ -n "$rounds_waived" ]]; then
+    [[ "$rounds_waived" =~ ^hk:doc/[^[:space:]]+$ || "$rounds_waived" =~ ^hk:task/[0-9]+$ ]] ||
+      die "joined --rounds-waived requires a hk:doc/<key> or hk:task/<id> ref"
+  else
+    local issues
+    issues="$(round_join_issues "$job")"
+    [[ -z "$issues" ]] || die "joined $job: $issues; use --rounds-waived hk:doc/<key> or hk:task/<id>"
+    # Old panewire binaries do not carry rounds_waived. A waiver stays on
+    # wrk own write path so the approval reference cannot disappear.
+    delegate_job_cmd joined "${joined_args[@]}"
+  fi
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
   upload_report_document "$job" "$report"
@@ -5049,7 +5141,7 @@ joined_cmd() {
     echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
     return 0
   fi
-  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head"
+  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$rounds_waived"
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "" "$pr" "$head"
@@ -5088,6 +5180,7 @@ ROUND_CAP_REASON="tester round cap reached"
 round_help() {
   cat <<'USAGE'
 Usage: wrk round <open|verdict|void|status> JOB [options]
+       wrk round audit [--lane L]
 
 Formal tester-round bookkeeping for a builder job (#758). A formal round is
 one tester verdict recorded for one head. The count is taken only from the
@@ -5129,6 +5222,9 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       A verdict that binds to no open round still counts as a round, so
       verdict files written elsewhere or recorded without an open cannot
       dodge the cap.
+      Records PATH and the exact content sha256. Reusing a path, content or
+      head is refused with the earlier record name; a voided earlier round
+      permits head reuse (but never path or content reuse).
   wrk round status JOB
       Print one line: job=… rounds=N cap=N open=… last_verdict=… and any
       voided rounds as 'round N void (hk:doc/…)' or 'round N void (hk:task/…)'.
@@ -5136,7 +5232,42 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       Void an existing round without a verdict, using a matching round-void
       grant in hk:doc/<key> or hk:task/<id>. The grant line is the default
       reason; --reason overrides it. Voids release one cap slot.
+  wrk round audit [--lane L]
+      Read-only: list active builder jobs with no non-voided rounds and job
+      directories with unmatched verdict files (direct regular files only).
+
+Open, verdict, void and joined refuse after revoked/reaped/handed_off until
+a later claim/reclaim/spawned. Joined requires recorded rounds and matching
+verdict files; only --rounds-waived hk:doc/<key> or hk:task/<id> waives these
+two requirements, with the reference stored in job.joined.
 USAGE
+}
+
+round_require_live() {
+  local job="$1" command="$2" ended
+  ended="$(wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+ended = wrk_end_declaration(sys.argv[1])
+if ended:
+    print("%s (%s)" % ended)
+PY
+  )"
+  [[ -z "$ended" ]] || die "$command refused for $job: ended by $ended"
+}
+
+round_join_issues() {
+  wrk_py - "$(wrk_jobs_root)/$1/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+events = sys.argv[1]
+role = ""
+for _, o, _ in wrk_events_ordered(events):
+    if o is not None and o.get("kind") in ("job.claim", "job.reclaim"):
+        role = o.get("payload", o).get("role", "")
+if role in ("builder", "captain"):
+    print("; ".join(wrk_round_issues(events)), end="")
+PY
 }
 
 # Resolve the job repository from its newest claim/reclaim metadata. A usable
@@ -5243,10 +5374,7 @@ for v in voids:
 open_rounds = [str(r.get("round")) for r in rounds
                if isinstance(r.get("round"), int) and r.get("round") not in bound
                and r.get("round") not in voided]
-used = sum(1 for r in rounds
-           if not (isinstance(r.get("round"), int) and r.get("round") in voided))
-used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
-used += wrk_takeover_rounds(events)
+used = wrk_round_used(events)
 last = verdicts[-1] if verdicts else {}
 lv = "-"
 if last.get("verdict") and last.get("head"):
@@ -5478,6 +5606,7 @@ round_open_cmd() {
   head="$(printf '%s' "$head" | tr '[:upper:]' '[:lower:]')"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  round_require_live "$job" "round open"
   if ! repo="$(round_repo_resolve "$job" "$repo_override")"; then
     if [[ -n "$repo_override" ]]; then
       die "round open: --repo $repo_override is not a usable git repository"
@@ -5542,6 +5671,10 @@ os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
+    ended = wrk_end_declaration(events)
+    if ended:
+        print("ENDED %s (%s)" % ended)
+        raise SystemExit(0)
     records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
@@ -5588,6 +5721,7 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round open failed to inspect $job"
   case "$outcome" in
+    ENDED\ *) die "round open refused for $job: ended by ${outcome#ENDED }" ;;
     OPENED\ round=*)
       echo "OK job=$job ${outcome#OPENED } cap=$ROUND_CAP_DEFAULT head=$head"
       ;;
@@ -5631,6 +5765,7 @@ round_void_cmd() {
   [[ -n "$ref" ]] || die "round void requires --by REF"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  round_require_live "$job" "round void"
 
   local tmp_approval grant grant_issuer
   tmp_approval="$(mktemp)"
@@ -5672,6 +5807,10 @@ os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
+    ended = wrk_end_declaration(events)
+    if ended:
+        print("ENDED %s (%s)" % ended)
+        raise SystemExit(0)
     records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"
               and r.get("job_id") == job and r.get("round") == round_number]
@@ -5696,6 +5835,7 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round void failed to inspect $job"
   case "$outcome" in
+    ENDED\ *) die "round void refused for $job: ended by ${outcome#ENDED }" ;;
     VOIDED\ round=*) echo "OK job=$job $outcome ref=$ref" ;;
     NO_ROUND) die "round void: round $round_number does not exist for job $job" ;;
     HAS_VERDICT) die "round void: round $round_number already has a job.verdict" ;;
@@ -5717,6 +5857,7 @@ round_verdict_cmd() {
   [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  round_require_live "$job" "round verdict"
   local outcome rc=0
   set +e
   outcome="$(wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
@@ -5725,17 +5866,10 @@ exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, label, pane, parent, vfile, cap = sys.argv[1:]
 cap = int(cap)
 os.makedirs(events, exist_ok=True)
-verdict = vsha = None
-VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})\s*$")
-matches = []
 try:
-    with open(vfile, encoding="utf-8") as f:
-        for line in f:
-            m = VERDICT.match(line)
-            if m:
-                matches.append(m)
-except OSError:
-    pass
+    digest, matches = wrk_verdict_file(vfile)
+except (OSError, UnicodeError):
+    matches = []
 if not matches:
     print("NO_VERDICT")
     raise SystemExit(0)
@@ -5746,7 +5880,29 @@ verdict, vsha = matches[0].group(1), matches[0].group(2).lower()
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
+    ended = wrk_end_declaration(events)
+    if ended:
+        print("ENDED %s (%s)" % ended)
+        raise SystemExit(0)
     records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
+    # Paths and hashes are never reusable; head reuse is permitted only when
+    # the earlier verdict-bearing round has an explicit void record.
+    voided_verdict_rounds = {o.get("round") for o in records
+                            if (o.get("kind") == "job.round_void" and o.get("job_id") == job
+                                and isinstance(o.get("round"), int))}
+    for name, previous, _ in wrk_events_ordered(events):
+        if previous is None or previous.get("kind") != "job.verdict" or previous.get("job_id") != job:
+            continue
+        if previous.get("path") == os.path.abspath(vfile):
+            print("DUPLICATE path already recorded in " + name)
+            raise SystemExit(0)
+        if previous.get("sha256") == digest:
+            print("DUPLICATE content sha256 already recorded in " + name)
+            raise SystemExit(0)
+        if (str(previous.get("head", "")).lower() == vsha
+                and previous.get("round") not in voided_verdict_rounds):
+            print("DUPLICATE head already recorded in " + name)
+            raise SystemExit(0)
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
     voids = [r for r in records if r.get("kind") == "job.round_void"]
@@ -5772,7 +5928,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
         used += 1  # this unbound verdict is itself a round
     record = {"kind": "job.verdict", "job_id": job, "owner_lane": owner,
               "label": label, "pane_id": pane, "parent_lane": parent,
-              "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
+              "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile), "sha256": digest,
               "round": target, "epoch": 1}
     if target is None:
         record["unopened"] = True
@@ -5786,6 +5942,8 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
   case "$outcome" in
+    ENDED\ *) die "round verdict refused for $job: ended by ${outcome#ENDED }" ;;
+    DUPLICATE\ *) die "round verdict refused for $job: ${outcome#DUPLICATE }" ;;
     NO_VERDICT)
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
     AMBIGUOUS)
@@ -5830,6 +5988,49 @@ round_status_cmd() {
   echo "job=$job cap=$ROUND_CAP_DEFAULT $scan"
 }
 
+round_audit_cmd() {
+  local lane="" events active=""
+  local -a event_dirs=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --lane) [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a lane"; lane="$2"; shift 2 ;;
+      *) die "unknown round audit option '$1'" ;;
+    esac
+  done
+  for events in "$(wrk_jobs_root)"/*/events; do
+    [[ ! -d "$events" ]] || event_dirs+=("$events")
+  done
+  if [[ ${#event_dirs[@]} -gt 0 ]]; then
+    active="$(job_events_scan "${event_dirs[@]}" | awk -F'\t' '$2 == 0 { print $1 }')"
+  fi
+  WRK_AUDIT_ACTIVE="$active" wrk_py - "$(wrk_jobs_root)" "$lane" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+root, lane = sys.argv[1:]
+if not os.path.isdir(root):
+    raise SystemExit(0)
+for job in sorted(os.listdir(root)):
+    directory = os.path.join(root, job)
+    if not os.path.isdir(directory):
+        continue
+    events = os.path.join(directory, "events")
+    metadata = {}
+    for _, o, _ in wrk_events_ordered(events):
+        if o is not None and o.get("kind") in ("job.claim", "job.reclaim"):
+            metadata = o.get("payload", o)
+    if lane and metadata.get("owner_lane") != lane:
+        continue
+    # Work-terminal scan also treats completed/joined jobs as ended. Audit
+    # shares that existing scanner via the shell-provided active job list.
+    if (metadata.get("role") in ("builder", "captain")
+            and job in os.environ["WRK_AUDIT_ACTIVE"].splitlines()
+            and wrk_round_used(events) == 0):
+        print("job=%s zero non-voided recorded rounds" % job)
+    for path in wrk_unmatched_verdicts(events):
+        print("job=%s unmatched verdict file: %s" % (job, path))
+PY
+}
+
 round_cmd() {
   local sub="${1:-}"
   case "$sub" in
@@ -5838,6 +6039,7 @@ round_cmd() {
     verdict) shift; round_verdict_cmd "$@" ;;
     void) shift; round_void_cmd "$@" ;;
     status) shift; round_status_cmd "$@" ;;
+    audit) shift; round_audit_cmd "$@" ;;
     *) die "unknown round subcommand '$sub' (see 'wrk round --help')" ;;
   esac
 }

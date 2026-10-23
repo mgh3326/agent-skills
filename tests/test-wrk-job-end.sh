@@ -103,6 +103,9 @@ mk_builder_job() {
     --role builder --parent-lane parent-lane >/dev/null
   arb event --job "$1" --kind job.spawned \
     --payload-json "{\"owner_lane\":\"builder-lane\",\"label\":\"lbl\",\"pane_id\":\"${2:-w:p1}\"}" >/dev/null
+  # hk 1449: these housekeeping cases model a builder with a tester round.
+  printf '{"kind":"job.round","job_id":"%s","round":1}\n' "$1" \
+    >"$INBOX/$1/events/00000-job.round.json"
 }
 
 event_count() { find "$1" -name "*$2.json" 2>/dev/null | wc -l | tr -d ' '; }
@@ -338,7 +341,11 @@ quota_spawn() {
     WRK_REFRESH_LOG="$TMP/refresh-$CASE_SEQ.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh-$CASE_SEQ.pids" WRK_REFRESH_TIMEOUT_S=2 \
     "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m "${QR_MODEL:-codex-luna}" \
-      -p "$PROMPT" -w w -l "lbl-$job" --t T1 --task 1 --job "$job" "$@"
+      -p "$PROMPT" -w w -l "lbl-$job" --t T1 --task 1 --job "$job" "$@" || return $?
+  if [[ " $* " == *" --role builder "* ]]; then
+    printf '{"kind":"job.round","job_id":"%s","round":1}\n' "$job" \
+      >"$INBOX/$job/events/00000-job.round.json"
+  fi
 }
 
 # A live record after spawn is a precondition of every release test, not an

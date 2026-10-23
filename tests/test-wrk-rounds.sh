@@ -141,6 +141,7 @@ if sys.argv[1:3] == ["doc", "get"]:
         path = self.verdict(job)
         self.record(job, path)
         earlier = next((self.jobs / job / "events").glob("*-job.verdict.json"))
+        self.refused(job, ["round", "verdict", job, "--file", path], earlier.name)
         path.write_text("VERDICT: PASS @" + self.heads[1] + "\nchanged\n")
         self.refused(job, ["round", "verdict", job, "--file", path], earlier.name)
 
@@ -178,6 +179,8 @@ if sys.argv[1:3] == ["doc", "get"]:
                     job = self.job(command + end.replace(".", ""))
                     self.open(job)
                     path = self.verdict(job)
+                    if command == "joined":
+                        self.record(job, path)
                     ended = self.event(job, end)
                     args = {"open": ["round", "open", job, "--head", self.heads[1]],
                             "verdict": ["round", "verdict", job, "--file", path],
@@ -324,6 +327,11 @@ elif sys.argv[1:3] == ["job", "joined"]:
         self.open(job, 1)
         self.record(job, self.verdict(job, 1))
         self.assertEqual(self.records(job, "job.verdict")[0]["round"], 1, "hk 1506 binding target must stay unchanged")
+        job = self.job("completed-bookkeeping")
+        self.event(job, "job.completed")
+        self.open(job)
+        self.record(job, self.verdict(job))
+        self.join(job)
 
     def test_file_scope_and_byte_hash(self):
         job = self.job()

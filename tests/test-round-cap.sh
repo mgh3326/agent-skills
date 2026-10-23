@@ -49,6 +49,7 @@ H1="$(git -C "$TEST_REPO" rev-parse HEAD~3)"
 H2="$(git -C "$TEST_REPO" rev-parse HEAD~2)"
 H3="$(git -C "$TEST_REPO" rev-parse HEAD~1)"
 H4="$(git -C "$TEST_REPO" rev-parse HEAD)"
+VERDICT_HEADS=("$H1" "$H2" "$H3")
 BAD_SHA=ffffffffffffffffffffffffffffffffffffffff
 git init -q --bare "$TEST_ORIGIN"
 git -C "$TEST_REPO" remote add origin "$TEST_ORIGIN"
@@ -608,7 +609,7 @@ echo "PASS extend-before-cap-refused"
 mkjob jo
 for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jo "$h"; done
 for n in 1 2 3; do
-  write_verdict "$TMP/vo$n.md" BLOCKER "$H1"
+  write_verdict "$TMP/vo$n.md" BLOCKER "${VERDICT_HEADS[$((n-1))]}"
   "$WRK" round verdict jo --file "$TMP/vo$n.md" >/dev/null
 done
 write_verdict "$TMP/vo4.md" BLOCKER "$H4"
@@ -704,7 +705,7 @@ jmn="mut-nc"
 mkjob "$jmn"
 for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/nocount-wrk" "$jmn" "$h"; done
 for n in 1 2 3; do
-  write_verdict "$TMP/vnc$n.md" BLOCKER "$H1"
+  write_verdict "$TMP/vnc$n.md" BLOCKER "${VERDICT_HEADS[$((n-1))]}"
   "$TMP/nocount-wrk" round verdict "$jmn" --file "$TMP/vnc$n.md" >/dev/null 2>&1
 done
 write_verdict "$TMP/vnc4.md" BLOCKER "$H4"

@@ -459,5 +459,5 @@ PR, head SHA, 보고서가 확정되고 JOIN 판정이 명확할 때만 다음�
 wrk joined <job> --pr <url> --head <sha> --report <path>
 ```
 
-이는 `job.joined` 평면 이벤트를 parent 레인으로 보낸다. `wrk done`은 워커 완료 관측용이며,
+이는 `job.joined` 평면 이벤트를 parent 레인으로 보낸다(유효 라운드·미기록 verdict 검사, 예외는 `--rounds-waived hk:doc/<key>|hk:task/<id>` 기록). `wrk done`은 워커 완료 관측용이며,
 빌더 루프의 완료 선언은 `wrk joined`다.

@@ -3,6 +3,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
+# Existing join/relay cases need round evidence under hk 1449. A reserved
+# fixture filename preserves the golden relay sequence numbers and bytes.
+seed_join_round() {
+  printf '{"kind":"job.round","job_id":"%s","round":1}\n' "$2" \
+    >"$1/$2/events/00000-job.round.json"
+}
 HERDR="$ROOT/tests/fixtures/herdr"
 SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 ARBITER="$ROOT/bin/arbiter"
@@ -9995,6 +10001,7 @@ assert event["payload"] == {
 PY
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" escalate builder-opus-job --question 'need parent decision' >/dev/null
+seed_join_round "$ARBITER_INBOX_ROOT" builder-opus-job
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" joined builder-opus-job --pr https://example.invalid/pr/1 --head deadbeef --report "$BUILDER_REPORT" >/dev/null
 python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events" <<'PY'
@@ -10202,6 +10209,7 @@ arb lease --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind
 arb release --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind path --force >/dev/null
 arb claim --job builder-reclaim-job --lane builder-new-lane --agent-label builder-new-label --t T1 \
   --role builder --parent-lane parent-new --reclaim-released >/dev/null
+seed_join_round "$ARBITER_INBOX_ROOT" builder-reclaim-job
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" joined builder-reclaim-job --pr https://example.invalid/pr/2 --head feedface --report "$BUILDER_REPORT" >/dev/null
 python3 - "$ARBITER_INBOX_ROOT/builder-reclaim-job/events" <<'PY'
@@ -11983,6 +11991,7 @@ r20_claim() {  # a spawned worker job the completion commands can read back
   r20_arb claim --job "$1" --lane lane-a --agent-label wrk-a --t T1 "${@:2}" >/dev/null
   r20_arb event --job "$1" --kind job.spawned \
     --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+  if [[ " $* " == *" --role builder "* ]]; then seed_join_round "$R20_INBOX" "$1"; fi
 }
 
 # TW1 — the exact artifacts the production arbiter and wrk writers emit. The
@@ -11994,6 +12003,7 @@ R20_FIXTURE_LOG="$TMP/r20-fixture-emit.log"
 mkdir -p "$R20_FIXTURE_INBOX/captain-fixture/events"
 cp "$R20_FIXTURE/00001-job.claim.json" "$R20_FIXTURE/00002-job.spawned.json" \
   "$R20_FIXTURE_INBOX/captain-fixture/events/"
+seed_join_round "$R20_FIXTURE_INBOX" captain-fixture
 (
   cd "$R20_FIXTURE"
   env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
@@ -12251,6 +12261,7 @@ r21_claim() {
   r21_arb claim --job "$1" --lane lane-a --agent-label wrk-a --t T1 "${@:2}" >/dev/null
   r21_arb event --job "$1" --kind job.spawned \
     --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+  if [[ " $* " == *" --role builder "* ]]; then seed_join_round "$R21_INBOX" "$1"; fi
 }
 r21_report() {
   local job="$1" name="$2" line="$3"
@@ -13721,6 +13732,7 @@ j499_claim() {
   env ARBITER_INBOX_ROOT="$J499_INBOX" XDG_DATA_HOME="$TMP/xdg-j499" "$ARBITER" event \
     --job "$1" --kind job.spawned \
     --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
+  if [[ " $* " == *" --role builder "* ]]; then seed_join_round "$J499_INBOX" "$1"; fi
 }
 j499_run() {  # j499_run DELEGATE JOB_MODE TAG wrk-args...
   local delegate="$1" mode="$2" tag="$3"
