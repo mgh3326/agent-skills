@@ -1917,6 +1917,10 @@ with os.fdopen(lock_fd, "a+b") as lock_handle:
                 skip("timed out waiting for lock", parser_name)
             time.sleep(0.05)
     try:
+        # Replacing a leaf symlink would destroy the link instead of updating
+        # its target. Directory symlinks in CODEX_HOME remain supported.
+        if os.path.islink(config_path):
+            skip("symlinked-config", parser_name)
         raw = None
         try:
             with open(config_path, "rb") as handle:
@@ -1936,9 +1940,10 @@ with os.fdopen(lock_fd, "a+b") as lock_handle:
 
         header = ('[projects."%s"]' % cwd).encode("ascii")
         if parser is None:
-            if raw is not None and header in raw.splitlines():
-                log("exists", "", parser_name)
-                raise SystemExit(0)
+            # Without a parser, any mention is enough to avoid risking a
+            # duplicate table (including alternate quoting and spacing).
+            if raw is not None and cwd.encode("ascii") in raw:
+                skip("unparsed-mention", parser_name)
         elif raw is not None:
             existing = parse_toml(raw, config_path, parser_name)
             projects = existing.get("projects") if isinstance(existing, dict) else None
