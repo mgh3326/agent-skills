@@ -10944,6 +10944,7 @@ builder_max_open_probe() {
 }
 builder_max_open_probe "$WRK" real ||
   fail "builder-haiku-max probe must be admitted on the real wrk"
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
 mut_wrk "$TMP/wrk-max-refusal-restored" \
   '    case "$seat_effort" in
       ultra)' \
