@@ -116,16 +116,16 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
   **#735 의 측정 rep 이 이 표를 재보정한다** — 규칙이 정본, 수치는 갱신된다). 배정은
   규칙이 고른 `profile@effort` 를 `--effort` 로 명시해 적용한다 — **wrk 철자 기본값은
   정책이 아니다**.
-- **빌더 좌석은 max 런그를 쓰지 않는다**(codex `ultra` = max+서브에이전트 계열, 같은 거부다) —
-  기본은 high 이하 또는 devin 프로필이다(4088 B; 별도 승인된 xhigh 빌더 —
-  `builder-grok`·`builder-luna`·E6 xhigh 철자 — 는 그대로다). 같은 규칙 아래에서도
-  빌더 후보는 max 를 빼고 고른다. Sol 빌더는 Sol high(wrk 기본값 그대로 — Sol high
+- **빌더 좌석의 max 런그 금지는 폐지됐다**(hk 1864, 2026-10-23 운영자 결정이 09-26 4088 B 의 빌더 no-max 규칙을 대체한다; codex `ultra` = max+서브에이전트 계열은 계속 거부한다) —
+  wrk 철자 기본값은 high 이하 또는 devin 프로필이다(4088 B; 별도 승인된 xhigh 빌더 —
+  `builder-grok`·`builder-luna`·E6 xhigh 철자 — 는 그대로다). 같은 규칙 아래에서
+  빌더 후보도 max 를 빼지 않는다. Sol 빌더는 Sol high(wrk 기본값 그대로 — Sol high
   자체는 미측정 C 라 배정 후보가 아니라 좌석 고정값이다), devin 빌더는 effort 플래그
   없이 모델 런그 그대로다. **max effort 는 T3 구현 워커·T3 tester 에만 예약한다
   (4088 B)** — 예외는 devin swe2-max(4088 명시, 무료)·A+ 의 Luna max(note 4098 비용
-  규칙)·워커 E6 측정 런그다(#704). wrk 도 `--role builder` 에서 max 를 거부한다(ultra 도 같은 상한이다).
-  유일한 좌석 예외는 #921 의 `builder-sonnet` — operator 2026-09-29 Sonnet 실험(E2)에서
-  이 철자의 명시 `--effort max` 만 연다(다른 빌더 철자와 E6 max 철자는 그대로 닫힌다).
+  규칙)·워커 E6 측정 런그다(#704). wrk 는 `--role builder` 에서 max 를 거부하지 않는다(ultra 만 거부한다).
+  #921 의 `builder-sonnet` 명시 `--effort max`(operator 2026-09-29 Sonnet 실험 E2)는 더 이상 예외가 아니다 —
+  다른 빌더 철자와 E6 max 철자도 같은 규칙으로 열린다.
 - **T1/T2 구현 기본은 devin 이다.** devin SWE-2 max 변형(`devin-swe2-max`·
   `builder-devin-max`)은 무료이므로 적극 쓴다.
 - **devin fusion 철자는 유료·Claude 계열 worker/tester 전용이다**(2026-10-10 운영자
