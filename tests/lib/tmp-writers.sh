@@ -61,7 +61,15 @@
 # tmp_writers_stop loops until every tracked pid is gone or a ~10s
 # wall-clock deadline passes (TERM for the first half, KILL after), then
 # returns nonzero with TW_LEFTOVER_PIDS set and the caller preserves TMP:
-# no rm while a tracked writer lives.
+# no rm while a tracked writer lives. The leftover pass counts a live
+# pid while any record still positively matches it (a stored start
+# identity equal to the live one, or the live argv is that pidfile's
+# writer shape) or any record is unresolved (no identity, an in-window
+# or unusable started=, an unreadable live identity). A pid PROVEN
+# recycled — a stored identity that differs from the live one, with no
+# matching and no unresolved record — is a different process than the
+# one this run tracked: it is named on its own line in TW_RECYCLED_PIDS
+# for the log, never counted, never signalled.
 #
 # Public API:
 #   TW_TMP=DIR                    — the run's tmp dir (set before teardown)
@@ -72,6 +80,12 @@
 #                                   writers remain (TMP must be kept)
 #   TW_LEFTOVER_PIDS              — tracked pids still alive when the bound
 #                                   ran out (empty on success)
+#   TW_RECYCLED_PIDS              — one pid per line: live pids proven
+#                                   recycled (a stored start identity
+#                                   differs from the live one and no
+#                                   record matches or is unresolved);
+#                                   excluded from TW_LEFTOVER_PIDS,
+#                                   never signalled
 #   tw_register_pid REGISTRY PID  — append PID to REGISTRY after recording
 #                                   its start identity in REGISTRY.identities
 #   tw_kill_pidfile FILE [SIG]    — verify one pidfile (argv + recorded
@@ -87,6 +101,7 @@
 
 TW_TMP=""
 TW_LEFTOVER_PIDS=""
+TW_RECYCLED_PIDS=""
 TW_TRACKED_LOG="${TW_TRACKED_LOG:-}"
 TW_RUN_START="$(date +%s)"
 _TW_LAST_DESC=""
@@ -200,9 +215,11 @@ _tw_pidfile_fields() {
 _tw_start_matches() {
   local pid="$1" started="${2:-}" el skew
   [[ -n "$started" ]] || return 0
-  [[ "$started" =~ ^[0-9]+$ ]] || return 1
+  [[ "$started" =~ ^[0123456789]{1,12}$ ]] || return 1
   el="$(_tw_elapsed_s "$pid" 2>/dev/null)" || return 1
-  skew=$(( $(date +%s) - started - el ))
+  # 10#: a leading-zero started= is decimal, never octal — an invalid
+  # octal literal is a fatal expansion error that would abort the pass.
+  skew=$(( $(date +%s) - 10#$started - el ))
   (( skew >= -120 && skew <= 120 ))
 }
 
@@ -281,26 +298,32 @@ _tw_supervisor_argv_ok() {
   _tw_supervisor_args_ok "$args" "$pidfile"
 }
 
-# _tw_pidfile_verify FILE PID ARGS — the per-kind pidfile check used by
-# both the sweep and tw_kill_pidfile: argv shape plus the recorded start.
-_tw_pidfile_verify() {
-  local file="$1" pid="$2" args="$3" kind job jobdir started
+# _tw_pidfile_argv_ok FILE ARGS — the per-kind argv shape alone, without
+# the recorded-start check: does this live pid carry the writer argv the
+# pidfile names? Unknown pidfile kinds never match.
+_tw_pidfile_argv_ok() {
+  local file="$1" args="$2" kind jobdir job
   kind="${file##*/}"
   jobdir="${file%/"$kind"}"
   case "$kind" in
     completion-sentinel.pid|sentinel.pid)
       job="${jobdir##*/}"
-      IFS=$'\t' read -r _ started <<<"$(_tw_pidfile_fields "$file")"
-      { _tw_sentinel_args_ok "$args" "$job" "$jobdir" &&
-        _tw_start_matches "$pid" "$started"; }
+      _tw_sentinel_args_ok "$args" "$job" "$jobdir"
       ;;
     quota-refresh.pid)
-      IFS=$'\t' read -r _ started <<<"$(_tw_pidfile_fields "$file")"
-      { _tw_supervisor_args_ok "$args" "$file" &&
-        _tw_start_matches "$pid" "$started"; }
+      _tw_supervisor_args_ok "$args" "$file"
       ;;
     *) return 1 ;;
   esac
+}
+
+# _tw_pidfile_verify FILE PID ARGS — the per-kind pidfile check used by
+# both the sweep and tw_kill_pidfile: argv shape plus the recorded start.
+_tw_pidfile_verify() {
+  local file="$1" pid="$2" args="$3" started
+  IFS=$'\t' read -r _ started <<<"$(_tw_pidfile_fields "$file")"
+  _tw_pidfile_argv_ok "$file" "$args" &&
+    _tw_start_matches "$pid" "$started"
 }
 
 # _tw_registered_identity PID FILE — the start identity REGISTRY recorded
@@ -333,6 +356,38 @@ _tw_registry_pid_ok() {
   [[ -n "$ident" ]] || return 1
   cur="$(_tw_pid_identity "$pid" 2>/dev/null)" || return 1
   [[ -n "$cur" && "$cur" == "$ident" ]]
+}
+
+# _tw_identity_verdict PID STORED — one word for the final leftover pass:
+# "match" when a stored start identity exists and equals the live pid's
+# current one (a positive sighting of the tracked writer), "mismatch"
+# when both are readable and differ (positive proof of reuse), and no
+# output when there is no evidence either way — an empty stored identity
+# (never verified) or an unreadable current one.
+_tw_identity_verdict() {
+  local pid="$1" stored="${2:-}" cur
+  [[ -n "$stored" ]] || return 0
+  cur="$(_tw_pid_identity "$pid" 2>/dev/null)" || return 0
+  [[ -n "$cur" ]] || return 0
+  if [[ "$cur" == "$stored" ]]; then
+    printf 'match\n'
+  else
+    printf 'mismatch\n'
+  fi
+}
+
+# _tw_pidfile_recycled PID STARTED — the pidfile form of the same proof:
+# rc 0 only when the file recorded a numeric started= epoch AND the live
+# pid's real elapsed provably disagrees with it (outside the ±120s window
+# _tw_start_matches uses). A missing or malformed started= is no proof.
+_tw_pidfile_recycled() {
+  local pid="$1" started="${2:-}" el skew
+  [[ "$started" =~ ^[0123456789]{1,12}$ ]] || return 1
+  el="$(_tw_elapsed_s "$pid" 2>/dev/null)" || return 1
+  # 10#: a leading-zero started= is decimal, never octal — an invalid
+  # octal literal is a fatal expansion error that would abort the pass.
+  skew=$(( $(date +%s) - 10#$started - el ))
+  (( skew < -120 || skew > 120 ))
 }
 
 # _tw_leftover_argv_ok ARGS — a dead tracked leader's group member still
@@ -530,7 +585,12 @@ _tw_member_id() {
 # a TERM-immune child still takes the KILL and a recycled member pid is
 # never signalled. rc 0 when nothing tracked remains alive; rc 1 with
 # TW_LEFTOVER_PIDS set otherwise — the caller must then preserve $TW_TMP
-# instead of rm -rf'ing it.
+# instead of rm -rf'ing it. Live pids whose stored start identity
+# provably differs with no matching and no unresolved record (the
+# tracked writer died and the number was reused) do not count: they are
+# named one per line on TW_RECYCLED_PIDS instead. A record that still
+# matches, or one with no evidence either way, always keeps the pid a
+# leftover.
 tmp_writers_stop() {
   local round_start sig quiet=0 alive deadline now
   local pf reg pid started kind args stat dp cur
@@ -541,6 +601,10 @@ tmp_writers_stop() {
   local _TW_MEMBERS_NEW="" _TW_MEMBERS_UNVER="" _TW_MEMBER_IDS=""
   local g glist gmembers gm="" mpid margs mstat mident mstored mepoch mlstart
   local next_members kept groups_prev
+  local stored="" recycled="" matched="" mismatched="" sline=""
+  local unresolved=""
+  TW_LEFTOVER_PIDS=""
+  TW_RECYCLED_PIDS=""
   [[ -n "${TW_TMP:-}" && -d "$TW_TMP" ]] || return 0
   round_start="$(date +%s)"
   deadline=$(( round_start + 10 ))
@@ -804,14 +868,119 @@ tmp_writers_stop() {
   done
   # Report leftovers: every live pid found in this run's own pidfiles,
   # registries and session records — including ones verification refused
-  # — plus pending members still alive. A refused live writer shows up
-  # here instead of hiding, and a nonzero return keeps the caller from
-  # rm -rf'ing TMP.
-  TW_LEFTOVER_PIDS=""
+  # — plus pending members still alive. Pass one classifies each record
+  # naming a live pid:
+  #   matched     — a positive sighting: the stored start identity is
+  #                 byte-equal to the live one, or the live argv is that
+  #                 pidfile's writer shape.
+  #   mismatched  — a positive reuse proof: the stored identity provably
+  #                 differs from the live one.
+  #   unresolved  — no evidence either way: no stored identity, an
+  #                 in-window or unusable started=, an empty identity
+  #                 field, or an unreadable live identity.
+  # A pid is recycled only when some record proves reuse and NO record
+  # is a sighting or unresolved: an unresolved claim names a writer that
+  # may still be alive, so another stale record for the same pid number
+  # must not discharge it. Recycled pids are named on their own line in
+  # TW_RECYCLED_PIDS for the log, never counted, and (as in every pass
+  # here) never signalled. A matching sighting always wins: a writer
+  # that is provably still alive must fail teardown. A refused live
+  # writer still shows up as a leftover instead of hiding, and a
+  # nonzero return keeps the caller from rm -rf'ing TMP.
+  while IFS= read -r pf; do
+    IFS=$'\t' read -r pid started <<<"$(_tw_pidfile_fields "$pf")"
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    _tw_pid_alive "$pid" || continue
+    # The writer's own argv is a positive sighting even when the file's
+    # started= is wrong (fake-clock spawns record a falsified start):
+    # that live pid is the mis-recorded writer, not a stranger.
+    args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
+    if _tw_pidfile_argv_ok "$pf" "$args"; then
+      _tw_list_has "$matched" "$pid" || matched="$matched $pid"
+    elif _tw_pidfile_recycled "$pid" "$started"; then
+      _tw_list_has "$mismatched" "$pid" || mismatched="$mismatched $pid"
+    else
+      # In-window or unusable started=: no evidence either way, and an
+      # unresolved claim must never be discharged by another record.
+      _tw_list_has "$unresolved" "$pid" || unresolved="$unresolved $pid"
+    fi
+  done < <(find "$TW_TMP" -type f \
+             \( -name 'completion-sentinel.pid' -o -name 'sentinel.pid' \
+                -o -name 'quota-refresh.pid' \) 2>/dev/null || true)
+  while IFS= read -r reg; do
+    [[ -f "$reg" ]] || continue
+    while IFS= read -r pid; do
+      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      _tw_pid_alive "$pid" || continue
+      stored=""
+      [[ -f "$reg.identities" ]] &&
+        stored="$(_tw_registered_identity "$pid" "$reg.identities")"
+      case "$(_tw_identity_verdict "$pid" "$stored")" in
+        match) _tw_list_has "$matched" "$pid" ||
+                 matched="$matched $pid" ;;
+        mismatch) _tw_list_has "$mismatched" "$pid" ||
+                    mismatched="$mismatched $pid" ;;
+        *) _tw_list_has "$unresolved" "$pid" ||
+             unresolved="$unresolved $pid" ;;
+      esac
+    done <"$reg"
+  done < <(_tw_registries)
+  while IFS= read -r sfile; do
+    # Read the record's fields positionally: IFS= read collapses adjacent
+    # tabs, which would turn an empty identity into the pgid field.
+    IFS= read -r sline <"$sfile" 2>/dev/null || continue
+    # Leading tabs are field separators, not part of the pid: the sweep
+    # and pass two read the row, so pass one must not skip it.
+    sline="${sline#"${sline%%[!$'\t']*}"}"
+    spid="${sline%%$'\t'*}"
+    sident=""
+    if [[ "$sline" == *$'\t'* ]]; then
+      sident="${sline#*$'\t'}"
+      sident="${sident%%$'\t'*}"
+    fi
+    [[ "$spid" =~ ^[0-9]+$ ]] || continue
+    _tw_pid_alive "$spid" || continue
+    case "$(_tw_identity_verdict "$spid" "$sident")" in
+      match) _tw_list_has "$matched" "$spid" ||
+               matched="$matched $spid" ;;
+      mismatch) _tw_list_has "$mismatched" "$spid" ||
+                  mismatched="$mismatched $spid" ;;
+      *) _tw_list_has "$unresolved" "$spid" ||
+           unresolved="$unresolved $spid" ;;
+    esac
+  done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
+  for mpid in $_TW_MEMBERS; do
+    _tw_pid_alive "$mpid" || continue
+    mstored="$(_tw_member_id "$mpid" <<<"$_TW_MEMBER_IDS")"
+    case "$(_tw_identity_verdict "$mpid" "$mstored")" in
+      match) _tw_list_has "$matched" "$mpid" ||
+               matched="$matched $mpid" ;;
+      mismatch) _tw_list_has "$mismatched" "$mpid" ||
+                  mismatched="$mismatched $mpid" ;;
+      *) _tw_list_has "$unresolved" "$mpid" ||
+           unresolved="$unresolved $mpid" ;;
+    esac
+  done
+  # Members whose identity could not be captured were never verified:
+  # their claim is unresolved, so no other record can discharge it.
+  for mpid in $_TW_MEMBERS_UNVER; do
+    _tw_list_has "$unresolved" "$mpid" || unresolved="$unresolved $mpid"
+  done
+  for pid in $mismatched; do
+    _tw_list_has "$matched" "$pid" && continue
+    _tw_list_has "$unresolved" "$pid" && continue
+    recycled="$recycled $pid"
+  done
+  for pid in $recycled; do
+    TW_RECYCLED_PIDS="${TW_RECYCLED_PIDS}${pid}"$'\n'
+  done
+  # Pass two: leftovers are the live tracked pids no record proved
+  # recycled.
   while IFS= read -r pf; do
     IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$pf")"
     [[ "$pid" =~ ^[0-9]+$ ]] || continue
     _tw_pid_alive "$pid" || continue
+    _tw_list_has "$recycled" "$pid" && continue
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
   done < <(find "$TW_TMP" -type f \
              \( -name 'completion-sentinel.pid' -o -name 'sentinel.pid' \
@@ -821,6 +990,7 @@ tmp_writers_stop() {
     while IFS= read -r pid; do
       [[ "$pid" =~ ^[0-9]+$ ]] || continue
       _tw_pid_alive "$pid" || continue
+      _tw_list_has "$recycled" "$pid" && continue
       TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
     done <"$reg"
   done < <(_tw_registries)
@@ -828,10 +998,12 @@ tmp_writers_stop() {
     IFS=$'\t' read -r spid _ _ <"$sfile" 2>/dev/null || continue
     [[ "$spid" =~ ^[0-9]+$ ]] || continue
     _tw_pid_alive "$spid" || continue
+    _tw_list_has "$recycled" "$spid" && continue
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $spid"
   done < <(find "$TW_TMP/tw-own-sessions" -type f 2>/dev/null || true)
   for mpid in $_TW_MEMBERS $_TW_MEMBERS_UNVER; do
     _tw_pid_alive "$mpid" || continue
+    _tw_list_has "$recycled" "$mpid" && continue
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $mpid"
   done
   [[ -z "$TW_LEFTOVER_PIDS" ]]
