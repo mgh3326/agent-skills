@@ -4264,8 +4264,8 @@ if [[ "\${1:-}" == status && "\${3:-}" == "$job" && ! -e "$injected" ]] &&
   printf 'inject\n' >>"$trace"
   : >"$injected"
   "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null
-  "$ARBITER" claim --job "$job" --lane lane-a --agent-label lbl --t T1 \\
-    --reclaim-released >/dev/null
+  "$ARBITER" event --job "$job" --kind job.reclaim \\
+    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null
   "$ARBITER" lease --job "$job" --kind quota_pool --profile codex-luna \\
     --gate-output "\$(cat "$gatefile")" >/dev/null
 fi
