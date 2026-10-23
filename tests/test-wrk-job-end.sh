@@ -4248,9 +4248,12 @@ case_ended_quota_release_requires_no_live_sentinel() {
 # through sentinel_self_exit even though the guarded release returns rc=2.
 case_lostgrace_guard_skip_removes_pidfile() {
   reset_case mut-1813-lostgrace-skip || return 3
-  local job=mut-1813-lostgrace-skip seq="$TMP/1813-lostgrace-seq"
-  local injected="$TMP/1813-lostgrace-injected" arbwrap="$TMP/1813-lostgrace-arbiter"
-  local gatefile="$TMP/1813-lostgrace-gate" trace="$TMP/1813-lostgrace-trace" pid pidfile
+  # Green and mutant cases run in the same test process/TMP root; isolate all
+  # race-control files by reset_case's sequence so the green injection cannot
+  # suppress the mutant's injection or satisfy its trace assertion.
+  local job=mut-1813-lostgrace-skip seq="$TMP/1813-lostgrace-seq-$CASE_SEQ"
+  local injected="$TMP/1813-lostgrace-injected-$CASE_SEQ" arbwrap="$TMP/1813-lostgrace-arbiter-$CASE_SEQ"
+  local gatefile="$TMP/1813-lostgrace-gate-$CASE_SEQ" trace="$TMP/1813-lostgrace-trace-$CASE_SEQ" pid pidfile
   mk_job "$job" w:p1 || return 3
   arb_lease "$job" || return 3
   # Re-record a fresh quota row before the loss terminal. The wrapper below
