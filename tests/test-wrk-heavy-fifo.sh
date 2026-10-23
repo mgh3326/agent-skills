@@ -37,14 +37,22 @@ export TMPDIR="$SHORT"
 TMP="$(mktemp -d "$TMPDIR/t.XXXXXX")"
 PIDS=()
 CLEANUP_KEEP_TMP=0
-MAIN_BASHPID=$BASHPID
+# BASHPID is bash 4+. macOS CI's /bin/bash is 3.2, where the name is unset.
+if [[ -n "${BASHPID+x}" ]]; then
+  MAIN_BASHPID=$BASHPID
+else
+  MAIN_BASHPID=
+fi
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
 cleanup() {
-  # Bash can run an EXIT trap in a subshell. Only the main shell may
-  # kill the jobs it started and remove the temp tree.
-  [[ "${BASHPID:-}" == "$MAIN_BASHPID" ]] || return 0
+  # On bash 4+, a subshell has its own BASHPID. Only the main shell may
+  # kill the jobs it started and remove the temp tree. Bash 3.2 has no
+  # BASHPID and does not run this trap inside a command substitution.
+  if [[ -n "$MAIN_BASHPID" && "${BASHPID:-}" != "$MAIN_BASHPID" ]]; then
+    return 0
+  fi
   local f pid
   for f in "$TMP"/*.sh; do
     [[ -e "$f" ]] && : >"${f%.sh}.rel"
@@ -140,18 +148,34 @@ EOF
 
 release() { local n; for n in "$@"; do : >"$TMP/$n.rel"; done; }
 
+# A bare `cmd &` is a subshell. Bash 3.2 runs the EXIT trap when that
+# subshell exits, and the trap removes the temp tree. Clear the trap and
+# exec so the background pid is the command itself.
+start_sleeper() {
+  ( trap - EXIT; exec sleep "$1" ) &
+  BG=$!
+  PIDS+=("$BG")
+}
+
 bg_heavy() {
-  local name="$1"; shift
-  env "$@" "$(wrk_bin)" heavy -- bash "$TMP/$name.sh" \
-    >"$TMP/$name.out" 2>&1 &
+  local name="$1" bin; shift
+  bin="$(wrk_bin)"
+  (
+    trap - EXIT
+    exec env "$@" "$bin" heavy -- bash "$TMP/$name.sh"
+  ) >"$TMP/$name.out" 2>&1 &
   BG=$!
   PIDS+=("$BG")
 }
 
 bg_key() {
-  local name="$1" key="$2"; shift 2
-  env "$@" "$(wrk_bin)" heavy --queue-key "$key" -- \
-    bash "$TMP/$name.sh" >"$TMP/$name.out" 2>&1 &
+  local name="$1" key="$2" bin; shift 2
+  bin="$(wrk_bin)"
+  (
+    trap - EXIT
+    exec env "$@" "$bin" heavy --queue-key "$key" -- \
+      bash "$TMP/$name.sh"
+  ) >"$TMP/$name.out" 2>&1 &
   BG=$!
   PIDS+=("$BG")
 }
@@ -303,9 +327,8 @@ echo "PASS heavy-fifo-three-lane-order"
 # would let the younger take the slot. The fixed code must not.
 older_ticket_blocks() {
   new_lock blk
-  sleep 300 &
-  local sleeper=$!
-  PIDS+=("$sleeper")
+  start_sleeper 300
+  local sleeper=$BG
   printf 'pid=%s class=lane limit=1 ticket=1:1 since=2020-01-01T00:00:00 job=- cmd=old-ticket\n' \
     "$sleeper" >"$WRK_HEAVY_LOCK.waiters/$sleeper"
   mkhold blk-y
@@ -335,9 +358,8 @@ echo "PASS heavy-fifo-older-ticket-blocks"
 
 # ── a younger waiter may take a slot the older limit does not cover ────────
 new_lock above
-sleep 300 &
-above_sleeper=$!
-PIDS+=("$above_sleeper")
+start_sleeper 300
+above_sleeper=$BG
 printf 'pid=%s class=lane limit=1 ticket=1:1 since=2020-01-01T00:00:00 job=- cmd=limit-one\n' \
   "$above_sleeper" >"$WRK_HEAVY_LOCK.waiters/$above_sleeper"
 mkhold above-y
@@ -374,9 +396,8 @@ echo "PASS heavy-fifo-ci-ahead-of-older-lane"
 
 # ── starvation guard still stops ci deferral (hk 1533, unchanged) ──────────
 new_lock guard
-sleep 300 &
-guard_ci=$!
-PIDS+=("$guard_ci")
+start_sleeper 300
+guard_ci=$BG
 printf 'pid=%s class=ci limit=1 since=2026-01-01T00:00:00 job=- cmd=guard-ci\n' \
   "$guard_ci" >"$WRK_HEAVY_LOCK.waiters/$guard_ci"
 mkhold guard-l
@@ -393,9 +414,8 @@ echo "PASS heavy-fifo-starvation-guard-unchanged"
 # ── a dead pid with an old ticket reserves nothing ─────────────────────────
 dead_pid_reserves_nothing() {
   new_lock deadp
-  sleep 30 &
-  local dead=$!
-  PIDS+=("$dead")
+  start_sleeper 30
+  local dead=$BG
   kill "$dead" 2>/dev/null || true
   wait "$dead" 2>/dev/null || true
   if kill -0 "$dead" 2>/dev/null; then
@@ -418,9 +438,8 @@ echo "PASS heavy-fifo-dead-pid-reserves-nothing"
 
 # ── a ticketless lane waiter is skipped by lane FIFO ───────────────────────
 new_lock mixed
-sleep 300 &
-mixed_old=$!
-PIDS+=("$mixed_old")
+start_sleeper 300
+mixed_old=$BG
 printf 'pid=%s class=lane limit=1 since=2020-01-01T00:00:00 job=- cmd=ticket=1:1 old-wrk\n' \
   "$mixed_old" >"$WRK_HEAVY_LOCK.waiters/$mixed_old"
 mixed_fourth=$(awk '{print $4}' "$WRK_HEAVY_LOCK.waiters/$mixed_old")
@@ -443,9 +462,8 @@ echo "PASS heavy-fifo-old-record-no-ticket"
 
 # ── a ticketless ci waiter still reserves (hk 1533 does not read tickets) ──
 new_lock tci
-sleep 300 &
-tci_ci=$!
-PIDS+=("$tci_ci")
+start_sleeper 300
+tci_ci=$BG
 printf 'pid=%s class=ci limit=1 since=2026-01-01T00:00:00 job=- cmd=ticketless-ci\n' \
   "$tci_ci" >"$WRK_HEAVY_LOCK.waiters/$tci_ci"
 tci_fourth=$(awk '{print $4}' "$WRK_HEAVY_LOCK.waiters/$tci_ci")
@@ -742,18 +760,14 @@ echo "PASS heavy-fifo-untrusted-positions-dir"
 
 # ── status lists live tickets in order and live positions, and cleans stale
 new_lock stat
-sleep 300 &
-s1=$!
-PIDS+=("$s1")
-sleep 300 &
-s2=$!
-PIDS+=("$s2")
-sleep 300 &
-s3=$!
-PIDS+=("$s3")
-sleep 30 &
-sdead=$!
-PIDS+=("$sdead")
+start_sleeper 300
+s1=$BG
+start_sleeper 300
+s2=$BG
+start_sleeper 300
+s3=$BG
+start_sleeper 30
+sdead=$BG
 kill "$sdead" 2>/dev/null || true
 wait "$sdead" 2>/dev/null || true
 mkdir -p "$WRK_HEAVY_LOCK.waiters"
@@ -768,9 +782,8 @@ printf 'pid=%s class=lane limit=1 since=2020-01-01T00:00:00 job=- cmd=t-old\n' "
 # oldfmt uses a live pid too so status does not delete it as dead; the name
 # is not the pid. Give it s1's live pid only if that pid is not already the
 # file name... s1's file is the pid. Use a second live sleeper.
-sleep 300 &
-sold=$!
-PIDS+=("$sold")
+start_sleeper 300
+sold=$BG
 printf 'pid=%s class=lane limit=1 since=2020-01-01T00:00:00 job=- cmd=t-old\n' "$sold" \
   >"$WRK_HEAVY_LOCK.waiters/$sold"
 rm -f "$WRK_HEAVY_LOCK.waiters/oldfmt"
@@ -917,9 +930,8 @@ HEAVY_BIN="$TMP/scanwin-wrk" bg_heavy scan-y \
   WRK_TEST_PASS_MARK="$TMP/scan.mark" WRK_TEST_PASS_GATE="$TMP/scan.gate"
 wait_until 10 queued scan-y lane 1 || fail "scan: lane never queued"
 wait_until 10 test -e "$TMP/scan.mark" || fail "scan: the pass never reached its scan"
-sleep 300 &
-scan_old=$!
-PIDS+=("$scan_old")
+start_sleeper 300
+scan_old=$BG
 printf 'pid=%s class=lane limit=1 ticket=1:1 since=2020-01-01T00:00:00 job=- cmd=mid-scan\n' \
   "$scan_old" >"$WRK_HEAVY_LOCK.waiters/$scan_old"
 # Free the slot while the pass is parked, and wait until the holder has
