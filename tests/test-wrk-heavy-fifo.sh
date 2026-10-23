@@ -7,8 +7,9 @@
 # shape as the hk 1533 ci reservation. ci waiters stay ahead of every lane
 # waiter, and the ci starvation guard is unchanged. A keyed waiter that exits
 # on the wait cap keeps its original ticket for WRK_HEAVY_REQUEUE_GRACE
-# seconds. Records with no ticket and records whose pid is dead reserve
-# nothing.
+# seconds. A dead pid reserves nothing. A ticketless lane record is
+# skipped by the lane FIFO rule. A ticketless ci record still reserves:
+# hk 1533 does not read tickets.
 #
 # Stub commands only. HOME, every XDG dir, CODEX_HOME and ARBITER_INBOX_ROOT
 # point into a temp dir. Every lock, waiters dir, positions dir, load file
@@ -200,7 +201,8 @@ help_out="$("$WRK" heavy --help)"
 for token in --queue-key WRK_HEAVY_QUEUE_KEY WRK_HEAVY_REQUEUE_GRACE 600 \
   Unity 'same-uid' 'does not bound' monotonic 'free-for-all' \
   'renamed into place' 'starting up' 'already read the records' \
-  'class=ci|lane' 'WRK_HEAVY_CI_DEFER_MAX'; do
+  'class=ci|lane' 'WRK_HEAVY_CI_DEFER_MAX' 'lane FIFO rule' \
+  'with or without a ticket'; do
   grep -qF -- "$token" <<<"$help_out" || fail "heavy --help must mention: $token"
 done
 echo "PASS heavy-fifo-help-promises"
@@ -408,13 +410,16 @@ dead_pid_reserves_nothing() {
 dead_pid_reserves_nothing
 echo "PASS heavy-fifo-dead-pid-reserves-nothing"
 
-# ── an older record with no ticket neither reserves nor stalls ─────────────
+# ── a ticketless lane waiter is skipped by lane FIFO ───────────────────────
 new_lock mixed
 sleep 300 &
 mixed_old=$!
 PIDS+=("$mixed_old")
 printf 'pid=%s class=lane limit=1 since=2020-01-01T00:00:00 job=- cmd=ticket=1:1 old-wrk\n' \
   "$mixed_old" >"$WRK_HEAVY_LOCK.waiters/$mixed_old"
+mixed_fourth=$(awk '{print $4}' "$WRK_HEAVY_LOCK.waiters/$mixed_old")
+[[ "$mixed_fourth" == since=* ]] ||
+  fail "mixed: lane fixture is not ticketless ($mixed_fourth)"
 mkhold mixed-h; mkhold mixed-y
 bg_heavy mixed-h; ph=$BG
 wait_until 10 started mixed-h || fail "mixed: holder never started"
@@ -429,6 +434,29 @@ release mixed-y
 wait "$ph" || fail "mixed: holder failed"
 kill_own "$mixed_old"
 echo "PASS heavy-fifo-old-record-no-ticket"
+
+# ── a ticketless ci waiter still reserves (hk 1533 does not read tickets) ──
+new_lock tci
+sleep 300 &
+tci_ci=$!
+PIDS+=("$tci_ci")
+printf 'pid=%s class=ci limit=1 since=2026-01-01T00:00:00 job=- cmd=ticketless-ci\n' \
+  "$tci_ci" >"$WRK_HEAVY_LOCK.waiters/$tci_ci"
+tci_fourth=$(awk '{print $4}' "$WRK_HEAVY_LOCK.waiters/$tci_ci")
+[[ "$tci_fourth" == since=* ]] ||
+  fail "tci: ci fixture is not ticketless ($tci_fourth)"
+mkhold tci-l
+bg_heavy tci-l
+tci_lane=$BG
+wait_until 10 queued tci-l lane 1 || fail "tci: lane never queued"
+settle_waiters || fail "tci: the ticketless ci record was not visible for a full poll"
+started tci-l && fail "tci: a ticketless ci waiter did not reserve the slot"
+kill_own "$tci_ci"
+wait_until 10 started tci-l ||
+  fail "tci: lane did not run after the ticketless ci pid died"
+release tci-l
+wait "$tci_lane" || fail "tci: lane failed"
+echo "PASS heavy-fifo-ticketless-ci-still-reserves"
 
 # ── wall-clock ticket, not a monotonic counter ─────────────────────────────
 python3 - "$yt" <<'PY'

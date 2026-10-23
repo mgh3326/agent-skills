@@ -11516,10 +11516,13 @@ wall-clock time plus pid as the tie-break. Among lane waiters, a lane
 waiter does not take a slot while a live lane waiter with an older ticket
 could take that same slot (a slot index below that waiter's own limit).
 The shape is the ci reservation's. A record whose pid is dead reserves
-nothing. A record with no ticket (an older wrk) reserves nothing and is
-never waited on, so mixed versions degrade to today's free-for-all and
-never to a stall. ci waiters stay ahead of every lane waiter. The ci
-starvation guard is unchanged: it only stops a lane from deferring to ci.
+nothing. Compatibility with an older wrk applies only to the lane FIFO rule:
+a lane record with no ticket is never waited on, so mixed versions
+degrade to today's free-for-all among lanes and never to a stall. The
+hk 1533 ci reservation does not read tickets. A live ci waiter, with or without a ticket,
+keeps reserving exactly as today. ci waiters stay ahead of every lane
+waiter. The ci starvation guard is unchanged: it only stops a lane from
+deferring to ci.
 After it fires, that lane still will not take a slot a live older lane
 ticket could take.
 
@@ -11722,8 +11725,8 @@ def record_head(text):
 def record_ticket(text):
     # Fourth head field only. split(None, 4) keeps the command text out, so
     # a ticket= token inside the command cannot forge a place in line.
-    # None means an older wrk record: it reserves nothing and is never
-    # waited on (mixed versions fall back to a free-for-all, never a stall).
+    # None means an older wrk record. Lane FIFO never waits on it.
+    # ci reservation does not call this function.
     toks = text.split(None, 4)[:4]
     if len(toks) < 4 or not toks[3].startswith("ticket="):
         return None
@@ -12194,8 +12197,10 @@ def load_ratio():
 
 def ci_reserved():
     # hk 1533: how many leading slots (index < N) a live ci waiter other
-    # than this process could take; 0 when none is queued. Liveness is the
-    # rule status uses for stale waiter files (pid alive) — a dead ci
+    # than this process could take; 0 when none is queued. Tickets are
+    # not consulted: a live ci waiter reserves with or without one.
+    # Liveness is the rule status uses for stale waiter files (pid
+    # alive) — a dead ci
     # waiter's leftover record never reserves anything. Read-only: status
     # owns the cleanup of stale files. A ci record with no usable limit
     # reserves nothing — priority degrades to the old free-for-all, it never
