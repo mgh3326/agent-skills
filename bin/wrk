@@ -5083,7 +5083,8 @@ wrk_joined_refuse_blocks() {
   if [[ "$zero" -eq 1 ]]; then
     msg="job $job has zero non-voided recorded rounds"
   fi
-  for file in "${files[@]}"; do
+  # bash 3.2 with set -u rejects "${files[@]}" when the array is empty.
+  for file in ${files[@]+"${files[@]}"}; do
     if [[ -n "$msg" ]]; then
       msg="$msg; unmatched tester verdict file $file"
     else
@@ -5119,7 +5120,8 @@ wrk_builder_rounds_warning() {
   if [[ "$zero" -eq 1 ]]; then
     msg="$msg has zero non-voided recorded rounds"
   fi
-  for file in "${files[@]}"; do
+  # Same bash 3.2 empty-array constraint as wrk_joined_refuse_blocks.
+  for file in ${files[@]+"${files[@]}"}; do
     if [[ "$zero" -eq 1 || "$msg" == *"unmatched tester verdict file"* ]]; then
       msg="$msg; unmatched tester verdict file $file"
     else
