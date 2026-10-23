@@ -294,16 +294,17 @@ hk 1796은 같은 규칙으로 hk 1786 팔의 네 런그를 연다 — `builder-
 (`SCOPEFUEL_E6_ARM=sonnet@medium`), `builder-haiku-low`(`haiku@low`),
 `builder-luna-low`(`codex-luna@low`), `builder-luna-medium`(`codex-luna@medium`).
 넷 다 배치된 canon 행이라 표식은 게이트 판정을 그 행으로만 좁힌다.
-2026-09-26 운영자 결정으로 max 런그 철자 4개(`builder-sonnet-max`·
-`builder-sol-max`·`builder-luna-max`·`builder-kimi-max`)는 닫혔다 —
-빌더 좌석은 max 를 쓰지 않으므로 wrk 가 표식과 무관하게 거부한다.
+hk 1863은 같은 규칙으로 hk 1786 의 borrow-down·promote-up 팔 다섯 런그를 연다 — `builder-sol-low`(`SCOPEFUEL_E6_ARM=codex-sol@low`), `builder-haiku-high`(`haiku@high`), `builder-haiku-xhigh`(`haiku@xhigh`), `builder-haiku-max`(`haiku@max`), `builder-sonnet-low`(`sonnet@low`) — `builder-haiku-max`는 `builder-sol-max`·`builder-sonnet-max`와 같이 열려 있고(hk 1864), canon 에 `sonnet@low` 행이 아직 없어 실게이트의 `builder-sonnet-low`는 행이 푸시될 때까지 거부된다.
+2026-09-26 운영자 결정이 닫았던 max 런그 철자 4개(`builder-sonnet-max`·
+`builder-sol-max`·`builder-luna-max`·`builder-kimi-max`)는 hk 1864(2026-10-23
+운영자 결정, 빌더 좌석 no-max 규칙 폐지)로 열렸다 — 다른 E6 런그와 같이 정확한
+`SCOPEFUEL_E6_ARM` 표식이 필요하고 ultra 는 계속 거부한다.
 #921(2026-09-29 운영자 보고, Sonnet 5.5 실험 E1/E2)은 비-런그 빌더 철자
 `builder-sonnet`을 연다 — `builder-opus`의 argv 모양(`--model sonnet`
 `--dangerously-skip-permissions`)을 쓰고 `--effort`는 high·xhigh·max만 받으며
-기본값은 xhigh다. 이 철자의 명시 max만 위 좌석 규칙의 예외이고, quota pool은
+기본값은 xhigh다. quota pool은
 claude, launch_profile은 canonical `sonnet@<effort>`로 기록된다. E6 철자
-`builder-sonnet-xhigh`·`builder-sonnet-max`는 별도 철자로 그대로다(표식 필요·
-max 좌석 거부).
+`builder-sonnet-xhigh`·`builder-sonnet-max`는 별도 철자로 그대로다(표식 필요).
 
 `devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
 프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). `devin-ds41-max`도
@@ -343,7 +344,7 @@ tester/checker rep 2건을 돌린다. `--role builder`는 세 철자를 거부�
 `captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
 경고 후 builder로 정규화되는 legacy 별칭이다. `builder-devin`(devin-swe2
 argv, A+ 급 작업의 T1·T2 빌더 — `spawn-worker` 급표 행이 정본)와 빌더 파일럿으로 `builder-grok`(grok 4.7, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
-#666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)와 #704·#737·hk 1796 의 E6 측정 런그 철자(`builder-opus-low` 등 20개 — 위 단락 참조, `SCOPEFUEL_E6_ARM` 표식 필수; max 런그 5개는 2026-09-26 좌석 규칙으로 닫힘)도 `--role builder`를 받는다.
+#666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)와 #704·#737·hk 1796·hk 1863 의 E6 측정 런그 철자(`builder-opus-low` 등 25개 — 위 단락 참조, `SCOPEFUEL_E6_ARM` 표식 필수; max 런그는 hk 1864 로 열림)도 `--role builder`를 받는다.
 파일럿이 지목한 워커 철자 `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire
