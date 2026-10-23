@@ -76,17 +76,26 @@ class ArbiterError(Exception):
 # ---------------------------------------------------------------- paths / time
 
 
+# Set by trust_paths_check: a checked command consumes exactly the paths the
+# decision accepted, never a second reading of the environment.
+_TRUSTED_PATHS: dict = {}
+
+
 def data_home() -> Path:
     raw = os.environ.get("XDG_DATA_HOME") or ""
     return Path(raw) if raw else Path.home() / ".local" / "share"
 
 
 def db_path() -> Path:
+    if _TRUSTED_PATHS.get("db"):
+        return Path(_TRUSTED_PATHS["db"])
     return data_home() / PROG / "state.db"
 
 
 def inbox_root() -> Path:
     """신규 job 의 event artifact 루트. 기존 flat inbox 파일은 건드리지 않는다."""
+    if _TRUSTED_PATHS.get("inbox"):
+        return Path(_TRUSTED_PATHS["inbox"])
     raw = os.environ.get("ARBITER_INBOX_ROOT") or ""
     return Path(raw) if raw else Path.home() / "work" / "herdr-inbox" / "jobs"
 
@@ -112,16 +121,18 @@ def trust_paths_decide(env, home, uid, fixtures, need):
         return bool(root) and path.startswith(root + "/")
 
     test_mode = env.get("WRK_TEST_MODE") == "1"
-    env_home = env.get("HOME") or home
+    # Same spelling as the shell and arbiter selectors: a set but empty HOME
+    # yields "/work/...", never the passwd home.
+    env_home = env["HOME"] if "HOME" in env else home
     canonical = {
         "inbox": os.path.join(home, "work", "herdr-inbox", "jobs"),
         "db": os.path.join(home, ".local", "share", "arbiter", "state.db"),
         "handoffkeep": os.path.join(home, ".local", "bin", "handoffkeep"),
     }
     effective = {
-        "inbox": (env.get("ARBITER_INBOX_ROOT") or os.path.join(env_home, "work", "herdr-inbox", "jobs"),
+        "inbox": (env.get("ARBITER_INBOX_ROOT") or env_home + "/work/herdr-inbox/jobs",
                   "ARBITER_INBOX_ROOT" if env.get("ARBITER_INBOX_ROOT") else "HOME"),
-        "db": (os.path.join(env.get("XDG_DATA_HOME") or os.path.join(env_home, ".local", "share"),
+        "db": (os.path.join(env.get("XDG_DATA_HOME") or env_home + "/.local/share",
                             "arbiter", "state.db"),
                "XDG_DATA_HOME" if env.get("XDG_DATA_HOME") else "HOME"),
     }
@@ -164,10 +175,17 @@ def trust_paths_decide(env, home, uid, fixtures, need):
 
     # Test mode: every effective path must lie under a temp root, and none may
     # resolve under the passwd home (the tripwire), except the repo fixtures.
+    # The passwd home is compared both as spelled and resolved, so a passwd
+    # entry naming a symlink cannot hide its target.
+    homes = [h for h in {home.rstrip("/"), real(home)} if h and h != "/"]
+
+    def in_home(path):
+        return any(path == h or under(path, h) for h in homes)
+
     roots = []
     tmpdir = real(env["TMPDIR"]) if env.get("TMPDIR") else ""
-    if tmpdir and tmpdir != "/" and tmpdir != home.rstrip("/") \
-            and not under(home, tmpdir) and not under(tmpdir, home):
+    if tmpdir and tmpdir != "/" and not in_home(tmpdir) \
+            and not any(under(h, tmpdir) for h in homes):
         roots.append(tmpdir)
     roots += [real(root) for root in ("/tmp", "/private/tmp", "/var/folders")]
     fixture_root = real(fixtures) if fixtures else ""
@@ -176,7 +194,7 @@ def trust_paths_decide(env, home, uid, fixtures, need):
     def admit(path, var, extra):
         resolved = real(path)
         allowed = roots + extra
-        if not any(under(resolved, root) for root in extra) and (resolved == home.rstrip("/") or under(resolved, home)):
+        if not any(under(resolved, root) for root in extra) and in_home(resolved):
             return "tripwire: %s resolves under the passwd home %s; refused in WRK_TEST_MODE" % (var, home)
         if not any(under(resolved, root) for root in allowed):
             return "%s resolves outside the test temp roots; refused in WRK_TEST_MODE" % var
@@ -214,6 +232,7 @@ def trust_paths_check(need: set) -> None:
     decision = trust_paths_decide(os.environ, pwd.getpwuid(os.getuid()).pw_dir, os.getuid(), "", need)
     if decision["error"]:
         raise ArbiterError(EXIT_USAGE, decision["error"])
+    _TRUSTED_PATHS.update({key: decision[key] for key in need})
     if decision["warning"]:
         print(f"{PROG}: warning: {decision['warning']}", file=sys.stderr)
 
