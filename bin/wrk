@@ -9229,8 +9229,9 @@ round_ext_validate() {
     *) die "round-extension supports only codex-astra or fable" ;;
   esac
   local pattern='^hk:doc/(round-extension|round-ext|[a-z0-9][a-z0-9-]*/round-ext)/[a-z0-9][a-z0-9._-]*$'
-  [[ ${#ROUND_EXT_REF} -le 128 ]] && ascii_re "$ROUND_EXT_REF" "$pattern" ||
+  if [[ ${#ROUND_EXT_REF} -gt 128 ]] || ! ascii_re "$ROUND_EXT_REF" "$pattern"; then
     die "--round-ext requires JOB [a-z0-9][a-z0-9._-]* (lowercase JOB starting with a letter/digit), REF at most 128 characters"
+  fi
   if [[ "$ROLE" == builder ]]; then
     [[ -n "$TASK_ID" && "${ROUND_EXT_REF##*/}" == "$JOB_ID" ]] ||
       die "--round-ext ownership denied: builder document JOB must equal spawn JOB currently bound to explicit --task"
