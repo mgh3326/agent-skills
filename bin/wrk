@@ -208,6 +208,8 @@ file by path or content sha256. A later line does not count. Both
 refusals are waived only by --rounds-waived REF, where REF is hk:doc/<key>
 or hk:task/<id>, and that ref is stored on the job.joined record. An end
 declaration newer than the newest revive is refused and cannot be waived.
+The end record and the rounds are rechecked under the events lock just before
+wrk writes job.joined; a delegated join is checked just before the hand-off only.
 USAGE
 }
 
@@ -4528,44 +4530,45 @@ def wrk_end_declaration(events):
     return ""
 
 
+def wrk_precommit_test_hook(events, job):
+    """Test seam for the joined recheck, never a production path.
+
+    Runs the script named by WRK_TEST_JOINED_PRECOMMIT_HOOK with the events
+    directory and the job id, under the events lock, but only when
+    WRK_TEST_MODE is exactly 1. Otherwise it does nothing.
+    """
+    hook = _os.environ.get("WRK_TEST_JOINED_PRECOMMIT_HOOK", "")
+    if hook and _os.environ.get("WRK_TEST_MODE") == "1":
+        import subprocess
+        subprocess.run([hook, events, job], check=True, stdout=subprocess.DEVNULL)
+
+
 def wrk_round_census(events, job):
     """Return (recorded, nonvoid) round evidence for one job.
 
     recorded counts every job.round, every unbound job.verdict and inherited
-    takeover rounds. nonvoid drops job.round rows whose round is in the cap
-    void set. That exclusion is the join gate.
+    takeover rounds; it is the round-cap count. nonvoid is the join gate: a
+    job.round counts only when a job.verdict is bound to its number, plus
+    unbound verdicts and inherited takeover rounds. An open round with no
+    verdict does not count, and neither does a voided one, because a void only
+    takes effect on a round that holds no verdict.
     """
     records = [document for _name, document, _mtime in wrk_events_ordered(events)
                if isinstance(document, dict)]
     rounds = [record for record in records if record.get("kind") == "job.round"]
     verdicts = [record for record in records if record.get("kind") == "job.verdict"]
-    voids = [record for record in records if record.get("kind") == "job.round_void"]
     bound = set()
     for verdict in verdicts:
         number = verdict.get("round")
         if isinstance(number, int):
             bound.add(number)
-    round_numbers = set()
-    for record in rounds:
-        number = record.get("round")
-        if isinstance(number, int):
-            round_numbers.add(number)
-    voided = set()
-    for void in voids:
-        number = void.get("round")
-        ref = void.get("ref")
-        if (void.get("job_id") == job and isinstance(number, int)
-                and number in round_numbers and number not in bound
-                and isinstance(ref, str) and ref.startswith(("hk:doc/", "hk:task/"))):
-            voided.add(number)
     unbound = 0
     for verdict in verdicts:
         if not isinstance(verdict.get("round"), int):
             unbound += 1
     inherited = wrk_takeover_rounds(events)
     recorded = len(rounds) + unbound + inherited
-    nonvoid = sum(1 for r in rounds
-                  if not (isinstance(r.get("round"), int) and r.get("round") in voided))  # hk1449-nonvoid-rounds
+    nonvoid = sum(1 for r in rounds if isinstance(r.get("round"), int) and r.get("round") in bound)  # hk1449-nonvoid-rounds
     nonvoid += unbound + inherited
     return recorded, nonvoid
 
@@ -5302,10 +5305,7 @@ for name in names:
         data = open(path, "rb").read()
     except OSError:
         continue
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        continue
+    text = data.decode("utf-8", errors="replace")  # hk1900-utf8-replace
     lines = text.splitlines()
     if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line
         continue
@@ -5504,13 +5504,28 @@ builder_flat_event() {
   else
     last=""
   fi
-  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" <<'PY'
+  # hk 1900: a refused job.joined prints its reason on stdout and exits 3 (end
+  # record) or 4 (zero non-voided rounds) before it writes anything. Bash 3.2
+  # scans this heredoc for quotes because it sits inside a command substitution.
+  # Do not put an unmatched single quote in this body.
+  local outcome rc=0
+  outcome="$(wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" <<'PY'
 import json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived = sys.argv[1:]
-# wrk escalate/joined publish outside the round writers' lock: take the shared
+# wrk escalate/joined publish outside the round writer lock: take the shared
 # events lock so numbering is serialized with bin/arbiter and wrk done too.
 lock = wrk_events_locked(events)
+if kind == "job.joined":
+    # The pre-check in joined_cmd ran before this lock; recheck under it.
+    wrk_precommit_test_hook(events, job)
+    ended = wrk_end_declaration(events)
+    if ended:  # hk1900-inlock-end
+        print("ENDED\t" + ended)
+        sys.exit(3)
+    if not waived and wrk_round_census(events, job)[1] <= 0:  # hk1900-inlock-zero
+        print("ZERO")
+        sys.exit(4)
 record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
           "pane_id": pane, "host": host, "report_path": report,
           "report_last_line": last, "reason": reason, "parent_lane": parent, "epoch": 1}
@@ -5520,6 +5535,11 @@ if head: record["head"] = head
 if waived: record["rounds_waived"] = waived
 wrk_event_commit(events, kind, record)
 PY
+)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    [[ -z "$outcome" ]] || printf '%s\n' "$outcome"
+    return "$rc"
+  fi
 }
 
 builder_metadata() {
@@ -5622,7 +5642,14 @@ joined_cmd() {
     echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
     return 0
   fi
-  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived"
+  local flat_out flat_rc=0
+  flat_out="$(builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived")" || flat_rc=$?
+  case "$flat_rc" in
+    0) ;;
+    3) die "joined: refused after end record ${flat_out#*$'\t'}" ;;
+    4) die "joined: job $job has zero non-voided recorded rounds" ;;
+    *) exit "$flat_rc" ;;
+  esac
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "" "$pr" "$head"
@@ -6337,7 +6364,7 @@ round_verdict_cmd() {
   local outcome rc=0
   set +e
   outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
-import fcntl, hashlib, json, os, sys, tempfile
+import fcntl, hashlib, io, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 events, job, owner, label, pane, parent, vfile, cap = sys.argv[1:]
 cap = int(cap)
@@ -6345,11 +6372,12 @@ os.makedirs(events, exist_ok=True)
 verdict = vsha = None
 matches = []
 try:
-    with open(vfile, encoding="utf-8") as f:
-        for line in f:
-            m = wrk_verdict_line.match(line)
-            if m:
-                matches.append(m)
+    with open(vfile, "rb") as raw:
+        data = raw.read()
+    for line in io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace"):  # hk1900-verdict-decode
+        m = wrk_verdict_line.match(line)
+        if m:
+            matches.append(m)
 except OSError:
     pass
 if not matches:
