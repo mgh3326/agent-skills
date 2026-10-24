@@ -8,6 +8,10 @@
 
 저장소는 `$XDG_DATA_HOME/arbiter/state.db` 로 scopefuel 의 bench.db 와 완전히 분리한다.
 
+claim 은 신뢰 경로 명령이다(hk 1894): ARBITER_INBOX_ROOT·XDG_DATA_HOME·HOME 이 passwd 홈 기준 정본 경로와
+다르면 거부(exit 2)하고, WRK_TEST_MODE=1(테스트 전용)에서는 임시 루트 아래 재정의만 허용한다. wrk 의 신뢰 경로와
+같은 규칙이다(아래 trust paths 블록은 bin/wrk 와 바이트 단위로 같다).
+
 fail-closed 가 핵심 요구사항이다. 배타 lease 획득 실패·quota_pool 기록 실패·DB 접근 실패·
 스키마 불일치는 전부 비-0 exit 이며, "일단 통과"하는 경로는 존재하지 않는다(우회 플래그도
 만들지 않는다). quota_pool 기록 실패를 경고 후 진행할지는 호출자인 wrk의 설치/수명주기
@@ -31,10 +35,12 @@ import datetime as dt
 import fcntl
 import json
 import os
+import pwd
 import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import tempfile
@@ -53,6 +59,13 @@ HERDR_AGENT_STATUSES = frozenset(("idle", "working", "blocked", "done", "unknown
 HERDR_LIVE_STATUS = "working"
 
 BUSY_TIMEOUT_MS = 10000
+
+# hk 1894: commands whose paths must be canonical (or, in test mode, under a temp
+# root). wrk's trust path calls no arbiter command today; hk 1453 half 2 adds
+# job-get here. _TRUSTED is set by enforce_trust() and read by db_path() and
+# inbox_root().
+TRUST_COMMANDS = frozenset(("claim",))
+_TRUSTED: dict | None = None
 
 EXIT_OK = 0
 EXIT_USAGE = 2
@@ -82,13 +95,178 @@ def data_home() -> Path:
 
 
 def db_path() -> Path:
+    if _TRUSTED is not None:
+        return Path(_TRUSTED["db"])
     return data_home() / PROG / "state.db"
 
 
 def inbox_root() -> Path:
     """신규 job 의 event artifact 루트. 기존 flat inbox 파일은 건드리지 않는다."""
+    if _TRUSTED is not None:
+        return Path(_TRUSTED["inbox"])
     raw = os.environ.get("ARBITER_INBOX_ROOT") or ""
     return Path(raw) if raw else Path.home() / "work" / "herdr-inbox" / "jobs"
+
+
+# ---------------------------------------------------------------- trust paths
+
+# --- trust paths: begin (byte-identical in bin/wrk and bin/arbiter; tests/test_wrk_trust_paths.py compares them) ---
+# hk 1894: where one trust-bearing operation may read its events inbox and its
+# grant evidence. Needs os, shutil and stat from the host module. The canonical
+# home is an argument (the passwd home of the uid, never HOME), so the unit tests
+# decide without touching the real one.
+TRUST_SYSTEM_TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/folders")
+
+
+class TrustRefusal(Exception):
+    def __init__(self, var, canonical, detail):
+        Exception.__init__(self, "%s; canonical path: %s" % (detail, canonical))
+        self.var = var
+        self.canonical = canonical
+        self.detail = detail
+
+
+def trust_value(env, name):
+    value = env.get(name)
+    return value if isinstance(value, str) and value else ""
+
+
+def trust_under(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def trust_canonical(home):
+    return {
+        "inbox": os.path.join(home, "work", "herdr-inbox", "jobs"),
+        "db": os.path.join(home, ".local", "share", "arbiter", "state.db"),
+        "hk": os.path.join(home, ".local", "bin", "handoffkeep"),
+    }
+
+
+def trust_homes(home):
+    # The passwd home as spelled and through realpath: a symlinked home reaches
+    # the same places under both names.
+    forms = [home] if home else []
+    if home and os.path.realpath(home) != home:
+        forms.append(os.path.realpath(home))
+    return forms
+
+
+def trust_temp_roots(env, home):
+    roots = []
+    tmpdir = trust_value(env, "TMPDIR")
+    if tmpdir:
+        resolved = os.path.realpath(tmpdir)
+        # TMPDIR naming the filesystem root, the home or a parent of it would
+        # make every path a temp path.
+        if resolved != "/" and not any(trust_under(form, resolved) for form in trust_homes(home)):
+            roots.append(resolved)
+    for fixed in TRUST_SYSTEM_TEMP_ROOTS:
+        for form in (fixed, os.path.realpath(fixed)):
+            if form not in roots:
+                roots.append(form)
+    return roots
+
+
+def trust_secure_binary(canonical, uid):
+    resolved = os.path.realpath(canonical)
+    try:
+        info = os.stat(resolved)
+    except OSError as exc:
+        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep is unusable (%s): %s" % (resolved, exc.strerror or exc))
+    if not stat.S_ISREG(info.st_mode):
+        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is not a regular file" % resolved)
+    if info.st_uid != uid:
+        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is owned by uid %d, not uid %d" % (resolved, info.st_uid, uid))
+    if info.st_mode & 0o022:
+        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is group- or world-writable (mode %04o)" % (resolved, info.st_mode & 0o7777))
+    return resolved
+
+
+def trust_resolve(env, home, uid, test_mode, need_hk, fixtures=""):
+    """Return {"inbox", "db", "hk", "overrides"} or raise TrustRefusal.
+
+    Outside test mode each lever (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME,
+    HANDOFFKEEP_BIN) must resolve to its canonical path under home, and the PATH
+    lookup of handoffkeep is never used: the canonical binary must be a regular
+    file owned by uid and not group- or world-writable. In test mode (a test
+    suite only) no canonical path is consulted or resolved: every path in use
+    must resolve under a temp root, the handoffkeep binary also under fixtures.
+    """
+    home_env = trust_value(env, "HOME")
+    inbox_env = trust_value(env, "ARBITER_INBOX_ROOT")
+    data_env = trust_value(env, "XDG_DATA_HOME")
+    hk_env = trust_value(env, "HANDOFFKEEP_BIN")
+    known = bool(home) and os.path.isabs(home)
+    if not known and not test_mode:
+        raise TrustRefusal("HOME", "(unknown)", "the passwd home of uid %d cannot be determined, so there is no canonical path to compare with" % uid)
+    canon = trust_canonical(home) if known else {"inbox": None, "db": None, "hk": None}
+    roots = trust_temp_roots(env, home if known else "") if test_mode else []
+    hk_roots = list(roots)
+    if test_mode and fixtures:
+        hk_roots.append(os.path.realpath(fixtures))
+    overrides = []
+
+    def judge(var, effective, canonical, label, allowed):
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in effective):
+            raise TrustRefusal(var, canonical, "%s selects a %s path holding a control character" % (var, label))
+        resolved = os.path.realpath(effective)
+        if not test_mode:
+            if resolved == os.path.realpath(canonical):
+                return canonical
+            raise TrustRefusal(var, canonical, "%s selects %s, which is not the canonical %s" % (var, effective, label))
+        if not any(trust_under(resolved, root) for root in allowed):
+            raise TrustRefusal(var, canonical, "%s selects %s, which resolves outside the temp roots (%s)" % (var, effective, " ".join(allowed)))
+        if var not in overrides:
+            overrides.append(var)
+        return effective if os.path.isabs(effective) else resolved
+
+    def under_home(*parts):
+        if home_env:
+            return os.path.join(home_env, *parts)
+        if test_mode:
+            raise TrustRefusal("HOME", canon["inbox"], "HOME is unset, so the default location would be the canonical path, which test mode never uses")
+        return os.path.join(home, *parts)
+
+    if home_env and not test_mode:
+        judge("HOME", home_env, home, "home", ())
+    inbox = judge("ARBITER_INBOX_ROOT" if inbox_env else "HOME",
+                  inbox_env or under_home("work", "herdr-inbox", "jobs"), canon["inbox"], "inbox", roots)
+    db = judge("XDG_DATA_HOME" if data_env else "HOME",
+               os.path.join(data_env or under_home(".local", "share"), "arbiter", "state.db"), canon["db"], "arbiter DB", roots)
+    hk = ""
+    if need_hk:
+        search = env.get("PATH") or os.defpath
+        if test_mode:
+            wanted = hk_env or "handoffkeep"
+            found = wanted if "/" in wanted else (shutil.which(wanted, path=search) or "")
+            if found:
+                hk = judge("HANDOFFKEEP_BIN" if hk_env else "PATH", found, canon["hk"], "handoffkeep", hk_roots)
+        else:
+            if hk_env:
+                found = hk_env if "/" in hk_env else (shutil.which(hk_env, path=search) or hk_env)
+                judge("HANDOFFKEEP_BIN", found, canon["hk"], "handoffkeep", ())
+            hk = trust_secure_binary(canon["hk"], uid)
+    return {"inbox": inbox, "db": db, "hk": hk, "overrides": overrides}
+# --- trust paths: end ---
+
+
+def enforce_trust() -> None:
+    """hk 1894: decide the canonical paths for a trust-bearing command, or refuse (exit 2)."""
+    global _TRUSTED
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        home = ""
+    test_mode = os.environ.get("WRK_TEST_MODE") == "1"
+    try:
+        decision = trust_resolve(os.environ, home, os.getuid(), test_mode, False)
+    except TrustRefusal as exc:
+        raise ArbiterError(EXIT_USAGE, f"refusing a trust-bearing command: {exc}") from exc
+    if decision["overrides"]:
+        print(f"{PROG}: warning: test mode honours overridden {' '.join(decision['overrides'])}; "
+              "the canonical paths are not used", file=sys.stderr)
+    _TRUSTED = decision
 
 
 def now_dt() -> dt.datetime:
@@ -1652,6 +1830,8 @@ def main(argv: list[str]) -> int:
                 raise ArbiterError(EXIT_USAGE, "--parent-lane 은 --role builder 에서만 쓴다 (captain 은 legacy alias)")
         if getattr(args, "ttl_min", None) is not None and args.ttl_min < 0:
             raise ArbiterError(EXIT_USAGE, "--ttl-min 은 0 이상이어야 한다")
+        if args.command in TRUST_COMMANDS:
+            enforce_trust()
         result = HANDLERS[args.command](args)
     except ArbiterError as exc:
         if as_json:
