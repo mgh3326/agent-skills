@@ -120,11 +120,24 @@ mk_job() {
     --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl\",\"pane_id\":\"${2:-w:p1}\"}" >/dev/null
 }
 
+# hk 1449: a builder join needs one non-voided recorded round. The seed file's
+# name is not a numeric prefix, so event numbering is unchanged.
+seed_join_round() {
+  local root="$1" job="$2"
+  local events="$root/$job/events"
+  mkdir -p "$events"
+  if [[ -e "$events/seed-job.round.json" ]]; then
+    return 0
+  fi
+  printf '%s\n' "{\"kind\":\"job.round\",\"job_id\":\"$job\",\"round\":1,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >"$events/seed-job.round.json"
+}
+
 mk_builder_job() {
   arb claim --job "$1" --lane builder-lane --agent-label lbl --t T1 \
     --role builder --parent-lane parent-lane >/dev/null
   arb event --job "$1" --kind job.spawned \
     --payload-json "{\"owner_lane\":\"builder-lane\",\"label\":\"lbl\",\"pane_id\":\"${2:-w:p1}\"}" >/dev/null
+  seed_join_round "$INBOX" "$1"
 }
 
 event_count() { find "$1" -name "*$2.json" 2>/dev/null | wc -l | tr -d ' '; }
@@ -2013,6 +2026,7 @@ QR_MODEL=builder-sol quota_spawn_ok qr2 \
   die3 "QR2 setup: builder spawn did not leave a live record"
 quota_wait_sentinel_sleep qr2 || die3 "QR2 setup: sentinel did not reach its sleep"
 REPORT="$TMP/qr2-report.md"; printf 'joined report\n' >"$REPORT"
+seed_join_round "$INBOX" qr2
 env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
   XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
   PANEWIRE_BIN="$PANEWIRE" \
@@ -3521,6 +3535,7 @@ case_release_joined() {
   [[ "$(quota_rows mut-rjoined)" == 1 ]] || return 3
   quota_wait_sentinel_sleep mut-rjoined || return 3
   REPORT="$TMP/mut-rjoined-report.md"; printf 'x\n' >"$REPORT"
+  seed_join_round "$INBOX" mut-rjoined
   env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
     XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
     PANEWIRE_BIN="$PANEWIRE" \
