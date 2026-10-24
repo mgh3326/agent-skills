@@ -1,0 +1,119 @@
+#!/usr/bin/env python3
+"""Contract tests for the read-only PA-REVIEW scanner."""
+import json
+import os
+import shutil
+import subprocess
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+SCANNER = ROOT / "director/bin/pa-review-scan"
+FIXTURE = ROOT / "tests/fixtures/pa-review-comments.json"
+
+
+class ScanTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="pa-review-")
+        self.addCleanup(self.tmp.cleanup)
+        root = Path(self.tmp.name)
+        self.home = root / "home"
+        self.home.mkdir()
+        for name in ("cache", "config", "data", "state", "codex", "inbox", "tmp"):
+            (root / name).mkdir()
+        bindir = root / "bin"
+        bindir.mkdir()
+        stub = bindir / "handoffkeep"
+        shutil.copyfile(ROOT / "tests/fixtures/pa-review-hk.py", stub)
+        stub.chmod(0o755)
+        fixture = root / "comments.json"
+        shutil.copyfile(FIXTURE, fixture)
+        self.env = os.environ.copy()
+        self.env.update({
+            "HOME": str(self.home), "XDG_CACHE_HOME": str(root / "cache"),
+            "XDG_CONFIG_HOME": str(root / "config"), "XDG_DATA_HOME": str(root / "data"),
+            "XDG_STATE_HOME": str(root / "state"), "CODEX_HOME": str(root / "codex"),
+            "ARBITER_INBOX_ROOT": str(root / "inbox"), "TMPDIR": str(root / "tmp"),
+            "WRK_TEST_MODE": "1", "PA_REVIEW_FIXTURE": str(fixture),
+            "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
+        })
+
+    def run_scan(self, *args):
+        return subprocess.run([str(SCANNER), *args], env=self.env, text=True,
+                              capture_output=True, check=False)
+
+    def test_json_combines_forms_orders_final_and_reports_guards(self):
+        result = self.run_scan("--task", "1935", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["tasks"][0]["task"], 1935)
+        job = data["tasks"][0]["jobs"]["b1935"]
+        self.assertEqual(job["forms"], ["early", "v1"])
+        self.assertEqual(job["rounds"], [1, 1, 2, 3])
+        self.assertEqual(job["final"]["outcome"], "accepted")
+        self.assertEqual(job["final"]["head"], "abcdef1")
+        self.assertEqual(job["reworks"], 2)
+        self.assertTrue(job["counted"])
+        self.assertTrue(job["lines"][0]["round_derived"])
+        self.assertEqual(job["final"]["note"], "detail=clean #좋음")
+        self.assertEqual(data["errors"][0]["comment_id"], 90)
+        self.assertEqual(data["warnings"][0]["comment_id"], 91)
+
+    def test_outcomes_reason_counting_derived_round_and_time_ties(self):
+        result = self.run_scan("--task", "1935", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        jobs = data["tasks"][0]["jobs"]
+        self.assertEqual(jobs["notaccepted"]["final"]["outcome"], "not-accepted")
+        self.assertTrue(jobs["notaccepted"]["counted"])
+        self.assertFalse(jobs["excluded"]["counted"])
+        self.assertFalse(jobs["quota"]["counted"])
+        self.assertFalse(jobs["tooling"]["counted"])
+        self.assertFalse(jobs["host"]["counted"])
+        self.assertFalse(jobs["cancel"]["counted"])
+        self.assertTrue(jobs["scope"]["counted"])
+        self.assertEqual(jobs["derived"]["final"]["round"], 1)
+        self.assertTrue(jobs["derived"]["final"]["round_derived"])
+        self.assertEqual(jobs["clock"]["final"]["comment_id"], 102)
+        self.assertEqual(jobs["clock"]["final"]["round"], 2)
+        self.assertEqual(jobs["outoftime"]["rounds"], [2, 1])
+        self.assertEqual(jobs["outoftime"]["final"]["outcome"], "accepted")
+        self.assertEqual(jobs["free-text"]["final"]["reason"], "equals=a:b and more")
+        self.assertEqual(data["tasks"][0]["deciding_job"], "free-text")
+
+    def test_malformed_prefix_lines_are_errors_but_mentions_and_other_authors_are_ignored(self):
+        result = self.run_scan("--task", "1935", "--json")
+        data = json.loads(result.stdout)
+        ids = [item["comment_id"] for item in data["errors"]]
+        self.assertIn(94, ids)
+        messages = [item["message"] for item in data["errors"]]
+        self.assertIn("unknown v1 reason code", messages)
+        self.assertIn("task id does not match posted task", messages)
+        jobs = data["tasks"][0]["jobs"]
+        self.assertNotIn("ignored", jobs)
+        self.assertEqual(jobs["amb"]["final"]["form"], "early")
+        self.assertIn("v1 task=1935 job=what", jobs["amb"]["final"]["reason"])
+        self.assertNotIn("bad", jobs)  # unknown v1 code is never reinterpreted as early form
+        self.assertNotIn("wrongtask", jobs)
+
+    def test_tsv_is_default(self):
+        result = self.run_scan("--task", "1935")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(result.stdout.startswith("task\tjob\t"))
+
+    def test_project_states_use_one_list_call_per_state(self):
+        result = self.run_scan("--project", "ParkingArcade", "--state", "open",
+                              "--state", "closed", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["tasks_scanned"], [1891, 1935])
+
+    def test_fixture_has_real_early_examples(self):
+        rows = json.loads(FIXTURE.read_text())
+        bodies = [c["body"] for c in rows]
+        self.assertIn("PA-REVIEW task=1935 job=b1935 outcome=accepted reason=RS6 DRL corner clean + F-150 AT tread, tester PASS, QA 0 errors", bodies)
+        self.assertIn("PA-REVIEW task=1891 job=b1891 outcome=accepted reason=f5 PR #397 merged: clusters on RS6/G63/F-150 displays, G90 tips dark metal, CI pure + Unity PASS", bodies)
+
+
+if __name__ == "__main__":
+    unittest.main()
