@@ -6665,7 +6665,7 @@ grep -q 'fixture welcome screen' "$T1895_SCREEN" ||
   fail "1895 screen file lost the fixture screen text"
 grep -q 'ACTUAL SCREEN LAST LINE' "$T1895_SCREEN" ||
   fail "1895 screen file lost the screen tail"
-[[ "$(stat -f %Lp "$T1895_SCREEN" 2>/dev/null || stat -c %a "$T1895_SCREEN")" == 600 ]] ||
+[[ "$(stat -c %a "$T1895_SCREEN" 2>/dev/null || stat -f %Lp "$T1895_SCREEN")" == 600 ]] ||
   fail "1895 screen file must be mode 0600 under a loose umask"
 grep -q "wrk: saved failed pane screen to $T1895_SCREEN" <<<"$t1895_out" ||
   fail "1895 lost the saved-screen line: $t1895_out"
