@@ -53,6 +53,7 @@ jobs:
             tests/test-t3-split-rule.sh \
             tests/test-merge-precheck.sh \
             tests/test-round-cap.sh \
+            tests/test-wrk-rounds.sh \
             tests/test-wrk-heavy-limit.sh \
             tests/test-wrk-heavy-class.sh \
             tests/test-wrk-heavy-fifo.sh \
@@ -96,6 +97,7 @@ jobs:
           bash tests/test-t3-split-rule.sh
           bash tests/test-merge-precheck.sh
           bash tests/test-round-cap.sh
+          bash tests/test-wrk-rounds.sh
           bash tests/test-wrk-heavy-limit.sh
           bash tests/test-wrk-heavy-class.sh
           bash tests/test-wrk-heavy-fifo.sh
