@@ -43,6 +43,18 @@ printf '%s\n' 'fixture prompt' >"$PROMPT"
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 
+# hk 1449: a builder join needs one non-voided recorded round. The seed file's
+# name is not a numeric prefix, so event numbering stays on the golden names.
+seed_join_round() {
+  local root="$1" job="$2"
+  local events="$root/$job/events"
+  mkdir -p "$events"
+  if [[ -e "$events/seed-job.round.json" ]]; then
+    return 0
+  fi
+  printf '%s\n' "{\"kind\":\"job.round\",\"job_id\":\"$job\",\"round\":1,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >"$events/seed-job.round.json"
+}
+
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
@@ -9996,6 +10008,7 @@ assert event["payload"] == {
 PY
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" escalate builder-opus-job --question 'need parent decision' >/dev/null
+seed_join_round "$ARBITER_INBOX_ROOT" builder-opus-job
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" joined builder-opus-job --pr https://example.invalid/pr/1 --head deadbeef --report "$BUILDER_REPORT" >/dev/null
 python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events" <<'PY'
@@ -10204,6 +10217,7 @@ arb lease --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind
 arb release --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind path --force >/dev/null
 arb claim --job builder-reclaim-job --lane builder-new-lane --agent-label builder-new-label --t T1 \
   --role builder --parent-lane parent-new --reclaim-released >/dev/null
+seed_join_round "$ARBITER_INBOX_ROOT" builder-reclaim-job
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" joined builder-reclaim-job --pr https://example.invalid/pr/2 --head feedface --report "$BUILDER_REPORT" >/dev/null
 python3 - "$ARBITER_INBOX_ROOT/builder-reclaim-job/events" <<'PY'
@@ -12074,6 +12088,7 @@ cp "$R20_FIXTURE/00001-job.claim.json" "$R20_FIXTURE/00002-job.spawned.json" \
   env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
     WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" escalate captain-fixture \
     --question 'need parent decision' >/dev/null
+  seed_join_round "$R20_FIXTURE_INBOX" captain-fixture
   env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
     WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" joined captain-fixture \
     --pr https://example.invalid/pr/1 --head deadbeef --report report.md >/dev/null
@@ -12138,6 +12153,7 @@ r20_escalate_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-
   ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" escalate r20-builder \
   --question 'need parent decision')"
+seed_join_round "$R20_INBOX" r20-builder
 r20_joined_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
   ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" joined r20-builder \
@@ -12276,6 +12292,7 @@ env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
   "$WRK" escalate r20-root-builder --question 'need parent decision' \
   2>>"$R20_ROOT_ERR" >/dev/null
+seed_join_round "$R20_INBOX" r20-root-builder
 env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
   ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
@@ -12495,6 +12512,7 @@ R21_JOINED_REPORT="$(r21_report "$R21_JOINED_JOB" joined-report.md 'joined termi
 R21_JOINED_HK_LOG="$TMP/r21-joined-handoffkeep.log"
 R21_JOINED_PW_LOG="$TMP/r21-joined-panewire.log"
 r21_claim "$R21_JOINED_JOB" --role builder --parent-lane parent-a
+seed_join_round "$R21_INBOX" "$R21_JOINED_JOB"
 env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
   XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_JOINED_HK_LOG" WRK_PANEWIRE_LOG="$R21_JOINED_PW_LOG" \
@@ -13914,6 +13932,7 @@ j499_calls() { if [[ -f "$1" ]]; then grep -cx -- '--' "$1" || true; else echo 0
 # present: wrk hands the exact arguments over and writes nothing of its own.
 j499_claim j499-worker
 j499_claim j499-builder --role builder --parent-lane parent-a
+seed_join_round "$J499_INBOX" j499-builder
 out="$(j499_run 1 present present 'done' j499-worker --report "$J499_REPORT")"
 [[ "$out" == "fixture job done j499-worker --report $J499_REPORT" ]] ||
   fail "delegated done must pass panewire's stdout through: $out"
@@ -13962,6 +13981,7 @@ for mode in absent garbage off; do
   worker="j499-$mode-worker" builder="j499-$mode-builder"
   j499_claim "$worker"
   j499_claim "$builder" --role builder --parent-lane parent-a
+  seed_join_round "$J499_INBOX" "$builder"
   out="$(j499_run "$delegate" "$job_mode" "$mode" 'done' "$worker" --report "$J499_REPORT")"
   [[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "$mode: done output changed: $out"
   out="$(j499_run "$delegate" "$job_mode" "$mode" escalate "$builder" --question 'fallback question')"
@@ -13997,6 +14017,7 @@ mode=hang
 worker="j499-$mode-worker" builder="j499-$mode-builder"
 j499_claim "$worker"
 j499_claim "$builder" --role builder --parent-lane parent-a
+seed_join_round "$J499_INBOX" "$builder"
 out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang 'done' "$worker" --report "$J499_REPORT")"
 [[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "hang: done output changed: $out"
 out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang escalate "$builder" --question 'fallback question')"

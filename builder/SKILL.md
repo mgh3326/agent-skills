@@ -458,7 +458,7 @@ JOIN한다. 부관(flag, 당시 flag = 현 checker)은 base 전진을 BOUNCE로 
 PR, head SHA, 보고서가 확정되고 JOIN 판정이 명확할 때만 다음으로 완료를 기록한다.
 
 ```bash
-wrk joined <job> --pr <url> --head <sha> --report <path>
+wrk joined <job> --pr <url> --head <sha> --report <path> [--rounds-waived hk:doc/<key>|hk:task/<id>]
 ```
 
 이는 `job.joined` 평면 이벤트를 parent 레인으로 보낸다. `wrk done`은 워커 완료 관측용이며,
