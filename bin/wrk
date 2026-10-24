@@ -287,7 +287,11 @@ Options:
   --lane-defer NAME  internal to the remote --host builder path: the
                      delegated wrk records lane+machine in its job.spawned
                      receipt without calling panewire, and the initiating
-                     host performs the `lanes add`. Builder-only — a worker
+                     host performs the `lanes add` — unless the execution
+                     host's own lanes_token_env names NAME in its
+                     HUB_MACHINE_ID, in which case the delegated wrk
+                     registers the lane itself and the initiator's add is
+                     skipped. Builder-only — a worker
                      given the flag is refused, because its lane must stay
                      on its own session_machine_ids contract. NAME is the
                      hosts.toml key of the target host (its hub machine id)
@@ -523,15 +527,20 @@ role the lane registered under: builder, or worker for worker, tester,
 reviewer and counsel seats), and `wrk reap --apply` removes the lane with
 `panewire lanes rm`, resolving the credential chain from that lane_role,
 only when `lanes ls` still shows the same machine and pane. For a remote --host NAME BUILDER
-spawn the ssh-delegated wrk on the target cannot reach the hub — PUT
-/v1/lanes wants the operator credential, which stays on the initiating
-host (per-host machine-scoped tokens are the step-4 follow-up) — so the
+spawn the ssh-delegated wrk on the target usually cannot reach the hub —
+PUT /v1/lanes wants the operator credential, which stays on the
+initiating host — so the
 delegation passes --lane-defer NAME and the remote wrk only RECORDS
 lane+machine in its receipt; the initiating host performs `lanes add`
 itself whenever the remote printed an OK pane= line and answered a
 pane-remains-valid rc (0, or 76 landing-unconfirmed — the pane exists, so
 the lane must exist), with machine = the hosts.toml key it reached the
-target by (the key IS the target's hub machine id). Any other remote
+target by (the key IS the target's hub machine id). The exception (hk
+1446): when the execution host's own lanes_token_env file carries
+HUB_MACHINE_ID equal to NAME, the delegated wrk registers the lane itself
+with that node token and marks its OK line lane_registered=self; the
+initiator reads the marker off the OK pane= line only, skips its own add,
+and keeps lane=NAME@HOST. Any other remote
 answer — or a skipped or failed add — rewrites the line's field to
 lane=UNREGISTERED; a remote lane=L@M is never passed through without a
 confirmed add. A remote worker gets no flag and no initiator-side add —
@@ -539,7 +548,7 @@ the execution host runs the ordinary worker lookup against its own
 session_machine_ids. The receipt lives with the job on the execution host
 — the only place `wrk reap` can verify the pane — and reap there removes
 the lane through the same machine+pane check, provided that host holds a
-lanes credential (known gap until the step-4 machine-scoped token);
+lanes credential;
 `lanes rm` being a hub call, any operator-credentialed host can also
 remove the row.
 
@@ -3116,7 +3125,8 @@ arbiter_record_spawn_receipt() {
   # answers nonzero on receipt failure instead: the remote leg's rc stops the
   # initiator's add (and a 2 sits in the remote stop set, so the auto round
   # ends rather than re-placing the job). The still-armed pane trap closes the
-  # pane; an untracked lane is never left behind.
+  # pane; a self-registered deferred lane is removed through its machine+pane
+  # guard first. An initiator-owned deferred row is never removed here.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc lane_role
   # #1438: the role the lane was registered under — the same normalization
@@ -3162,6 +3172,7 @@ PY
 )"; then
     if [[ -n "${LANE_DEFER:-}" ]]; then
       warn "arbiter job.spawned receipt preparation failed under --lane-defer; the deferred lane would be untrackable — failing the spawn so the initiator registers nothing: job_id=$JOB_ID pane_id=$PANE"
+      hub_lane_orphan_remove
       return 2
     fi
     warn "arbiter job.spawned receipt preparation failed; spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
@@ -3175,6 +3186,7 @@ PY
   if [[ "$receipt_rc" -ne 0 ]]; then
     if [[ -n "${LANE_DEFER:-}" ]]; then
       warn "arbiter job.spawned receipt failed under --lane-defer (exit $receipt_rc); the deferred lane would be untrackable — failing the spawn so the initiator registers nothing: job_id=$JOB_ID pane_id=$PANE"
+      hub_lane_orphan_remove
       return 2
     fi
     warn "arbiter job.spawned receipt failed (exit $receipt_rc); spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
@@ -3185,17 +3197,19 @@ PY
 # #994/S1: a lane whose job.spawned receipt was never written is a row
 # `wrk reap` can never attribute to a job — it would sit on the daemon
 # forever. Deregister it while the machine and pane are still in hand (same
-# credentials, same warn-only contract); the spawn still succeeds, and a
-# failed removal is left for `panewire lanes-audit`.
+# credentials and machine+pane guard). An ordinary spawn remains successful
+# on receipt failure; a deferred self-add is compensated before its required
+# rc 2, with removal failure left for `panewire lanes-audit`.
 hub_lane_orphan_remove() {
   [[ -n "${HUB_LANE:-}" ]] || return 0
-  # #1397/(a): under --lane-defer this host never added the row — the ssh
-  # initiator did. A receipt failure here must not reach for `lanes rm`
-  # (the row may not even exist yet); the initiator's lanes-missing audit
-  # and lanes-audit own cleanup instead.
-  [[ -z "${LANE_DEFER:-}" ]] || return 0
+  # #1397/(a): under --lane-defer the initiator owns the deferred row. Only
+  # remove a deferred lane when this execution host set HUB_LANE_SELF after
+  # its own lanes-token add; otherwise the row may belong to the initiator.
+  if [[ -n "${LANE_DEFER:-}" ]]; then
+    [[ "${HUB_LANE_SELF:-0}" -eq 1 ]] || return 0
+  fi
   local lane="$HUB_LANE" machine="$HUB_LANE_MACHINE"
-  HUB_LANE="" HUB_LANE_MACHINE=""
+  HUB_LANE="" HUB_LANE_MACHINE="" HUB_LANE_SELF=""
   warn "hub lane '$lane' was registered but the job.spawned receipt was not written — deregistering it"
   hub_lane_remove "$lane" "$machine" "$PANE" "${ROLE:-worker}"
 }
@@ -7791,16 +7805,17 @@ PY
 # under WRK_LANE_STRICT=1, exit 82 — which is why every builder early-return
 # here warns exactly once.
 hub_lane_register() {
-  HUB_LANE="" HUB_LANE_MACHINE=""
+  HUB_LANE="" HUB_LANE_MACHINE="" HUB_LANE_SELF=""
   # Child seats use the worker lane/credential topology inside this helper.
   local ROLE="$ROLE"
   case "$ROLE" in tester|reviewer|counsel) ROLE=worker ;; esac
   [[ "$ROLE" == worker || "$ROLE" == builder ]] || return 0
   # #1397/(a): a delegated remote spawn defers its lane row to the ssh
-  # initiator — only that host holds the operator credential (per-host
-  # machine-scoped tokens are the step-4 follow-up). --lane-defer carries the
+  # initiator — unless the execution host holds a lanes token bound to the
+  # deferred machine id, in which case hk 1446 self-registers below.
+  # --lane-defer carries the
   # hub machine id the initiator names this host by (its hosts.toml key).
-  # This wrk performs no `lanes add`; it records hub_lane/hub_lane_machine in
+  # Without a matching lanes token this wrk performs no `lanes add`; it records hub_lane/hub_lane_machine in
   # the job.spawned receipt as the claim of what the initiator will register,
   # so `wrk reap` on THIS host — the only place the pane check can pass —
   # removes the row through the same machine+pane guard. If the initiator's
@@ -7813,6 +7828,17 @@ hub_lane_register() {
     if [[ "$ROLE" == builder ]]; then defer_lane="$BUILDER_LANE"; else defer_lane="$LABEL"; fi
     if hub_lane_name_valid "$defer_lane"; then
       HUB_LANE="$defer_lane" HUB_LANE_MACHINE="$LANE_DEFER"
+      # hk 1446: a builder whose execution host holds a lanes token bound to
+      # the very machine id --lane-defer carries registers its own lane right
+      # here — the receipt already names lane+machine, so the same machine+
+      # pane guard reaps it. The marker on the OK line tells the initiator
+      # its add is unnecessary. Every other shape — no lanes token, a token
+      # naming another machine, a refused or failed add — keeps the
+      # deferral untouched (the add only warns, never fails the spawn).
+      if [[ "$ROLE" == builder && "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] &&
+         hub_lane_self_register; then
+        HUB_LANE_SELF=1
+      fi
     fi
     return 0
   fi
@@ -7918,16 +7944,14 @@ hub_lane_register() {
   fi
   # A lanes credential authorizes lanes on its own HUB_MACHINE_ID only — with
   # a different machine the hub refuses the add (lane_machine_mismatch), so
-  # compare first and skip. The file is scanned for that one key through
-  # spillover_env_key, never sourced; HUB_TOKEN is never matched or printed.
-  # The extracted value may reach the compare — and any warning — only as a
-  # bare machine id: spillover_env_key returns the whole post-= tail, so an
-  # unparsed remainder like a same-line HUB_TOKEN would otherwise echo into
-  # the warning. Fail closed: anything outside ^[A-Za-z0-9._-]{1,64}$ warns
-  # once WITHOUT the value and skips. An unreadable file or unset/empty key
-  # still falls through to panewire's own loader error.
+  # compare first and skip. The file is scanned for only HUB_MACHINE_ID,
+  # never sourced; HUB_TOKEN is never matched or printed. Preserve whitespace
+  # in the value so the ASCII check rejects a near-match instead of silently
+  # normalizing it into the target machine id. Fail closed: anything outside
+  # ^[A-Za-z0-9._-]{1,64}$ warns once WITHOUT the value and skips. An unreadable
+  # file or unset/empty key still falls through to panewire's own loader error.
   if [[ -n "$lanes_env" ]]; then
-    lanes_machine="$(spillover_env_key "$lanes_env" HUB_MACHINE_ID 2>/dev/null || true)"
+    lanes_machine="$(spillover_env_machine_id "$lanes_env" 2>/dev/null || true)"
     if [[ -n "$lanes_machine" ]]; then
       if ! ascii_re "$lanes_machine" '^[A-Za-z0-9._-]{1,64}$'; then
         warn "hub lane not registered (lanes_token_env HUB_MACHINE_ID is malformed)"
@@ -7965,10 +7989,62 @@ hub_lane_register() {
   HUB_LANE="$lane_name" HUB_LANE_MACHINE="$machine"
 }
 
-# #1397/(a): the ssh initiator's half of a delegated remote spawn. The
-# execution host cannot register its own lane — PUT /v1/lanes wants the
-# operator credential, which lives on the initiating host (per-host
-# machine-scoped tokens are the step-4 follow-up) — so the initiator runs
+# hk 1446: the execution host's half of a delegated remote builder spawn
+# when it holds its own lanes token. Runs only under --lane-defer for a
+# builder lane: a lanes_token_env file whose HUB_MACHINE_ID IS the deferred
+# machine id (byte equality after the same ascii check the non-deferred
+# path applies) authorizes this host's own machine's lanes, so the lane the
+# initiator would have added is added here instead — same lane name, same
+# --parent, the deferred id as machine, and the spawned pane. Returns 0
+# only on a confirmed add. Anything else — no lanes token, an unreadable
+# file, an unset or mismatched HUB_MACHINE_ID, a missing hub_url or
+# panewire, a refused add — returns 1 and the caller defers exactly as
+# before. operator_token_env and hub_token_env never count: a remote wrk
+# has no business presenting the initiator's credential topology, and a
+# node token bound to another machine would be refused anyway. The scan
+# reads the HUB_MACHINE_ID line only; the token file still reaches panewire
+# as a path, and a malformed id warns once without the value. The parser
+# preserves all value whitespace (stripping only the assignment's line
+# ending and optional surrounding quotes) so a near-match cannot pass.
+hub_lane_self_register() {
+  local hub_url lanes_env lanes_machine cf_env panewire rc=0
+  local args=()
+  lanes_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
+  [[ -n "$lanes_env" ]] || return 1
+  lanes_machine="$(spillover_env_machine_id "$lanes_env" 2>/dev/null || true)"
+  [[ -n "$lanes_machine" ]] || return 1
+  if ! ascii_re "$lanes_machine" '^[A-Za-z0-9._-]{1,64}$'; then
+    warn "hub lane self-registration skipped (lanes_token_env HUB_MACHINE_ID is malformed)"
+    return 1
+  fi
+  [[ "$lanes_machine" == "$LANE_DEFER" ]] || return 1
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  [[ -n "$hub_url" ]] || return 1
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  panewire="${PANEWIRE_BIN:-panewire}"
+  if [[ "$panewire" == */* ]]; then
+    [[ -x "$panewire" ]] || return 1
+  elif ! command -v "$panewire" >/dev/null 2>&1; then
+    return 1
+  fi
+  args=(lanes add "$BUILDER_LANE" --machine "$LANE_DEFER" --pane "$PANE" --parent "$PARENT_LANE"
+        --hub-url "$hub_url" --hub-token-env "$lanes_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  set +e
+  "$panewire" "${args[@]}" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    warn "hub lane self-registration failed (panewire lanes add exited $rc); deferring to the initiator"
+    return 1
+  fi
+  return 0
+}
+
+# #1397/(a): the ssh initiator's half of a delegated remote spawn. An
+# execution host without its own lanes token cannot register its own lane —
+# PUT /v1/lanes wants the operator credential, which lives on the
+# initiating host — so the initiator runs
 # `panewire lanes add` itself once the remote spawn answers rc 0, with
 # machine = the hosts.toml key it reached the host by (that key IS the
 # host's hub machine id: mac-dev, rpi, desktop). The remote wrk already
@@ -8153,6 +8229,37 @@ path, key = sys.argv[1:]
 assignment = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=\s*(.*?)\s*$")
 with open(path, encoding="utf-8") as env_file:
     for line in env_file:
+        match = assignment.match(line)
+        if not match:
+            continue
+        value = match.group(1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            print(value)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Read HUB_MACHINE_ID without trimming the value. Unlike the general
+# credential-key reader above, lane authorization compares this value to a
+# machine id byte-for-byte: only the line ending and optional outer quotes
+# are syntax. A trailing or leading space must fail the ASCII allowlist.
+spillover_env_machine_id() {
+  local file="$1"
+  [[ -r "$file" ]] || return 1
+  python3 - "$file" <<'PY'
+import re, sys
+
+path = sys.argv[1]
+assignment = re.compile(r"^[ \t]*(?:export[ \t]+)?HUB_MACHINE_ID[ \t]*=(.*)$")
+with open(path, encoding="utf-8", newline="") as env_file:
+    for line in env_file:
+        if line.endswith("\n"):
+            line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
         match = assignment.match(line)
         if not match:
             continue
@@ -8996,7 +9103,10 @@ spillover_remote_spawn() {
   # key> so it records hub_lane/hub_lane_machine in its job.spawned receipt
   # without calling panewire, and this host runs `lanes add` itself after the
   # remote answers rc 0 (machine = the hosts.toml key, the host's hub
-  # machine id). A remote WORKER gets neither the flag nor the add: it keeps
+  # machine id). hk 1446 exception: when the remote's own lanes token names
+  # that same machine id it registers the lane itself and answers
+  # lane_registered=self on its OK pane= line — the add below is then
+  # skipped. A remote WORKER gets neither the flag nor the add: it keeps
   # the #965 contract — the execution host checks its own
   # session_machine_ids and registers there, or stays unregistered — because
   # a fleet worker must never land on the hub as a global lane named after
@@ -9079,23 +9189,36 @@ spillover_remote_spawn() {
   # never enters this block — its own lane= field (or its absence) passes
   # through untouched.
   if [[ "$remote_lane_role" == builder && -n "$remote_lane_name" ]]; then
-    local remote_pane="" lane_field="" lane_out
+    local remote_pane="" remote_selfreg="" lane_field="" lane_out
     remote_pane="$(awk '/^OK pane=/{ for (i = 1; i <= NF; i++) if (substr($i, 1, 5) == "pane=") { print substr($i, 6); exit } }' "$out")"
+    # hk 1446: only a lane_registered=self field on the OK pane= line itself
+    # counts — the same marker inside a label value, a warning line or any
+    # other output is not the remote's own registration proof.
+    remote_selfreg="$(awk '/^OK pane=/{ for (i = 1; i <= NF; i++) if ($i == "lane_registered=self") { print "yes"; exit } }' "$out")"
     if [[ -n "$remote_pane" ]]; then
       spillover_remote_step "$host" lane
       HUB_REMOTE_LANE=""
-      case "$rc" in
-        0|"$WRK_EXIT_LANDING_UNCONFIRMED")
-          hub_lane_register_remote "$host" "$remote_pane" "$remote_lane_name" "$remote_lane_route_parent" ;;
-      esac
+      if [[ "$remote_selfreg" == yes ]]; then
+        # The execution host already added the row with its own lanes
+        # token — adding it again would be a harmless idempotent update,
+        # but skipping it keeps the hub traffic honest.
+        HUB_REMOTE_LANE="$remote_lane_name"
+      else
+        case "$rc" in
+          0|"$WRK_EXIT_LANDING_UNCONFIRMED")
+            hub_lane_register_remote "$host" "$remote_pane" "$remote_lane_name" "$remote_lane_route_parent" ;;
+        esac
+      fi
       if [[ -n "$HUB_REMOTE_LANE" ]]; then
         lane_field="lane=$remote_lane_name@$host"
       else
         lane_field="lane=UNREGISTERED"
       fi
       lane_out="$(mktemp)"
+      # The consumed self-registration marker never reaches the operator's
+      # line — it was the remote's word to this host, not lane metadata.
       if awk -v lf="$lane_field" '
-        /^OK pane=/ { sub(/ lane=[^ ]*/, ""); if (lf != "") $0 = $0 " " lf; print; next }
+        /^OK pane=/ { sub(/ lane=[^ ]*/, ""); sub(/ lane_registered=self/, ""); if (lf != "") $0 = $0 " " lf; print; next }
         { print }
       ' "$out" >"$lane_out"; then
         mv "$lane_out" "$out"
@@ -11094,6 +11217,11 @@ print(value if isinstance(value, str) else "")
   elif [[ "$ROLE" == builder ]]; then
     OK_LINE="$OK_LINE lane=UNREGISTERED"
   fi
+  # hk 1446: a deferred builder lane this host registered itself tells the
+  # ssh initiator — through this one field on the OK pane= line — to skip
+  # its own lanes add. Only the remote's own registration sets it, so a
+  # deferred (unconfirmed) lane never carries the marker.
+  [[ -z "${HUB_LANE_SELF:-}" ]] || OK_LINE="$OK_LINE lane_registered=self"
   echo "$OK_LINE"
   if [[ "$LANDING" == no ]]; then
     # Grok's echo can arrive 1-2 minutes after injection — past even its
