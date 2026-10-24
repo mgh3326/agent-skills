@@ -3929,6 +3929,14 @@ chmod 600 "$LANES_NODE_DESKTOP_CASE_FILE"
 LANES_CFG_DEFER_CASE="$TMP/lanes-1446-case-hosts.toml"
 printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nmachine_id = "desktop"\n' \
   "$LANES_NODE_DESKTOP_CASE_FILE" "$LANES_OP_FILE" >"$LANES_CFG_DEFER_CASE"
+# A whitespace-only mismatch must not be normalized into the deferred
+# machine id. The line terminator is syntax; the trailing space is value.
+LANES_NODE_DESKTOP_SPACE_FILE="$TMP/lanes-node-desktop-space.env"
+printf 'HUB_MACHINE_ID=desktop \nHUB_TOKEN=%s\n' "$LANES_NODE_DESKTOP_VALUE" >"$LANES_NODE_DESKTOP_SPACE_FILE"
+chmod 600 "$LANES_NODE_DESKTOP_SPACE_FILE"
+LANES_CFG_DEFER_SPACE="$TMP/lanes-1446-space-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_NODE_DESKTOP_SPACE_FILE" "$LANES_OP_FILE" >"$LANES_CFG_DEFER_SPACE"
 
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
@@ -5970,6 +5978,12 @@ assert meta["hub_lane"] == "b1446-mism" and meta["hub_lane_machine"] == "desktop
   lanes_assert_no_lanes_call b1446-case
   ! grep -q 'lane_registered' "$LANES_OUT" ||
     fail "#1446 AC2: the machine-id compare must be byte-exact"
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SPACE" \
+    lanes_spawn b1446-space --role builder --lane b1446-space --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] || fail "#1446 AC2: a whitespace-mismatched token spawn failed"
+  lanes_assert_no_lanes_call b1446-space
+  ! grep -q 'lane_registered' "$LANES_OUT" ||
+    fail "#1446 AC2: a trailing space in HUB_MACHINE_ID must not be trimmed into a match"
   echo "PASS 1446-lanes AC2: a lanes token naming another machine defers byte-exactly"
 
   # AC3 — no lanes token at all (operator credential only): byte-for-byte

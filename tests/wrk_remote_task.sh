@@ -59,6 +59,7 @@ export HK_STATE="$TMP/hk-state.json"
 "$HK_FIXTURE" tasks add --id 9 --title 'explicit remote task' --lane fixture >/dev/null
 "$HK_FIXTURE" tasks add --id 10 --title 'builder task' --lane fixture >/dev/null
 "$HK_FIXTURE" tasks add --id 11 --title 'second builder task' --lane fixture >/dev/null
+"$HK_FIXTURE" tasks add --id 12 --title 'third builder task' --lane fixture >/dev/null
 
 seed_parent() {
   local job="$1" task_id="${2:-}"
@@ -410,3 +411,45 @@ PY
   cat "$TMP/wake.log" >&2; exit 1;
 }
 printf '%s\n' 'PASS wrk-remote-task T7-tokenless-remote-defers-to-initiator'
+
+# T8 (hk 1446 regression): a remote node token with a trailing space in
+# HUB_MACHINE_ID is not a byte match for the deferred machine id. The remote
+# must defer without adding or printing lane_registered=self; the initiator
+# then performs its ordinary operator-authenticated add.
+T8_TOKEN="$TMP/t8-lanes.env"
+printf 'HUB_MACHINE_ID=desktop \nHUB_TOKEN=fixture-t8-node-token\n' >"$T8_TOKEN"
+chmod 600 "$T8_TOKEN"
+T8_REMOTE_CONFIG="$TMP/t8-remote-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://hub.invalid"' \
+  "lanes_token_env = \"$T8_TOKEN\"" 'machine_id = "desktop"' >"$T8_REMOTE_CONFIG"
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/wake.log"
+t8_out="$(WRK_CASE_MODEL=builder-sol WRK_CASE_LABEL=t8b WRK_CASE_JOB=t8-builder \
+  WRK_CASE_CONFIG="$T7_INIT_CONFIG" WRK_CASE_REMOTE_CONFIG="$T8_REMOTE_CONFIG" \
+  WRK_CASE_REMOTE_PANEWIRE_BIN="$ROOT/tests/fixtures/panewire" \
+  WRK_CASE_REMOTE_LANES_LOG="$TMP/t8-remote-lanes.log" \
+  run_remote "$ROOT/bin/wrk" --host desktop --role builder --lane b1446-t8 --parent director-1 --task 12 2>&1)"
+grep -q ' lane=b1446-t8@desktop$' <<<"$t8_out" || {
+  echo 'FAIL T8 emitted line must end lane=b1446-t8@desktop' >&2; printf '%s\n' "$t8_out" >&2; exit 1;
+}
+! grep -q 'lane_registered=self' <<<"$t8_out" || {
+  echo 'FAIL T8 trailing-space machine id must not self-register' >&2; exit 1;
+}
+[[ ! -s "$TMP/t8-remote-lanes.log" ]] || {
+  echo 'FAIL T8 remote lanes token with trailing-space machine id must defer' >&2
+  cat "$TMP/t8-remote-lanes.log" >&2; exit 1;
+}
+python3 - "$TMP/wake.log" "$T6_OP" <<'PY' || {
+import sys
+log, op = sys.argv[1:]
+lines = [l.split() for l in open(log, encoding="utf-8")]
+adds = [l for l in lines if l[:2] == ["lanes", "add"]]
+assert len(adds) == 1, "the initiator must add exactly once: %r" % lines
+argv = adds[0]
+assert argv[argv.index("--machine") + 1] == "desktop", argv
+assert argv[argv.index("--hub-token-env") + 1] == op, argv
+PY
+  echo 'FAIL T8 the initiator must add the unregistered remote lane' >&2
+  cat "$TMP/wake.log" >&2; exit 1;
+}
+printf '%s\n' 'PASS wrk-remote-task T8-trailing-space-machine-id-defers'

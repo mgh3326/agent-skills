@@ -7656,16 +7656,14 @@ hub_lane_register() {
   fi
   # A lanes credential authorizes lanes on its own HUB_MACHINE_ID only — with
   # a different machine the hub refuses the add (lane_machine_mismatch), so
-  # compare first and skip. The file is scanned for that one key through
-  # spillover_env_key, never sourced; HUB_TOKEN is never matched or printed.
-  # The extracted value may reach the compare — and any warning — only as a
-  # bare machine id: spillover_env_key returns the whole post-= tail, so an
-  # unparsed remainder like a same-line HUB_TOKEN would otherwise echo into
-  # the warning. Fail closed: anything outside ^[A-Za-z0-9._-]{1,64}$ warns
-  # once WITHOUT the value and skips. An unreadable file or unset/empty key
-  # still falls through to panewire's own loader error.
+  # compare first and skip. The file is scanned for only HUB_MACHINE_ID,
+  # never sourced; HUB_TOKEN is never matched or printed. Preserve whitespace
+  # in the value so the ASCII check rejects a near-match instead of silently
+  # normalizing it into the target machine id. Fail closed: anything outside
+  # ^[A-Za-z0-9._-]{1,64}$ warns once WITHOUT the value and skips. An unreadable
+  # file or unset/empty key still falls through to panewire's own loader error.
   if [[ -n "$lanes_env" ]]; then
-    lanes_machine="$(spillover_env_key "$lanes_env" HUB_MACHINE_ID 2>/dev/null || true)"
+    lanes_machine="$(spillover_env_machine_id "$lanes_env" 2>/dev/null || true)"
     if [[ -n "$lanes_machine" ]]; then
       if ! ascii_re "$lanes_machine" '^[A-Za-z0-9._-]{1,64}$'; then
         warn "hub lane not registered (lanes_token_env HUB_MACHINE_ID is malformed)"
@@ -7717,13 +7715,15 @@ hub_lane_register() {
 # has no business presenting the initiator's credential topology, and a
 # node token bound to another machine would be refused anyway. The scan
 # reads the HUB_MACHINE_ID line only; the token file still reaches panewire
-# as a path, and a malformed id warns once without the value.
+# as a path, and a malformed id warns once without the value. The parser
+# preserves all value whitespace (stripping only the assignment's line
+# ending and optional surrounding quotes) so a near-match cannot pass.
 hub_lane_self_register() {
   local hub_url lanes_env lanes_machine cf_env panewire rc=0
   local args=()
   lanes_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
   [[ -n "$lanes_env" ]] || return 1
-  lanes_machine="$(spillover_env_key "$lanes_env" HUB_MACHINE_ID 2>/dev/null || true)"
+  lanes_machine="$(spillover_env_machine_id "$lanes_env" 2>/dev/null || true)"
   [[ -n "$lanes_machine" ]] || return 1
   if ! ascii_re "$lanes_machine" '^[A-Za-z0-9._-]{1,64}$'; then
     warn "hub lane self-registration skipped (lanes_token_env HUB_MACHINE_ID is malformed)"
@@ -7941,6 +7941,37 @@ path, key = sys.argv[1:]
 assignment = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=\s*(.*?)\s*$")
 with open(path, encoding="utf-8") as env_file:
     for line in env_file:
+        match = assignment.match(line)
+        if not match:
+            continue
+        value = match.group(1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            print(value)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Read HUB_MACHINE_ID without trimming the value. Unlike the general
+# credential-key reader above, lane authorization compares this value to a
+# machine id byte-for-byte: only the line ending and optional outer quotes
+# are syntax. A trailing or leading space must fail the ASCII allowlist.
+spillover_env_machine_id() {
+  local file="$1"
+  [[ -r "$file" ]] || return 1
+  python3 - "$file" <<'PY'
+import re, sys
+
+path = sys.argv[1]
+assignment = re.compile(r"^[ \t]*(?:export[ \t]+)?HUB_MACHINE_ID[ \t]*=(.*)$")
+with open(path, encoding="utf-8", newline="") as env_file:
+    for line in env_file:
+        if line.endswith("\n"):
+            line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
         match = assignment.match(line)
         if not match:
             continue
