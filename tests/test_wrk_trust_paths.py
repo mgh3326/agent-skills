@@ -864,9 +864,10 @@ class World:
             "kind": "job.revoked", "job_id": job, "created_at": "2026-10-23T06:00:00Z"}) + "\n")
         return name
 
-    def joined(self, wrk, job, test=False, **extra):
+    def joined(self, wrk, job, test=False, waived=None, **extra):
+        args = ["--rounds-waived", waived] if waived else []
         return self.wrk(wrk, "joined", job, "--pr", "https://example.invalid/pr/242", "--head", self.heads[0],
-                        "--report", self.report, test=test, **extra)
+                        "--report", self.report, *args, test=test, **extra)
 
     def env(self, test=False, **extra):
         env = {"PATH": safe_path(), "HOME": str(self.pw_home), "PYTHONPATH": str(HOOK),
@@ -1186,6 +1187,87 @@ class RealBinaryCase(unittest.TestCase):
         self.assertIn("kind=job.joined", out.stdout)
         warnings = [line for line in out.stderr.splitlines() if "test mode honours" in line]
         self.assertEqual(len(warnings), 1, out.stderr)
+
+    # -- hk 1899: a waiver is fetched from handoffkeep, so joined judges and uses the checked binary --
+
+    def waiver_doc(self, job, by="director-1"):
+        return {"created_by": by, "body": "join-waiver: job=%s by=%s\n" % (job, by)}
+
+    def repro_joined_waiver_hk_bin_stub(self, wrk):
+        """A forged HANDOFFKEEP_BIN or a PATH handoffkeep cannot grant a waiver; the canonical binary decides."""
+        w = self.w
+        w.mkjob(w.jobs, "jobw")
+        before = tree(w.jobs)
+        forge, forge_log = w.stub(w.base / "forge-hk", {"*": self.waiver_doc("jobw")})
+        out = w.joined(wrk, "jobw", waived="hk:doc/forged", HANDOFFKEEP_BIN=forge)
+        self.refusal_line(out, "HANDOFFKEEP_BIN", w.canon_hk)
+        self.assertFalse(forge_log.exists(), "the forged handoffkeep must never run")
+        shim_dir = w.base / "shimbin"
+        shim, shim_log = w.stub(shim_dir / "handoffkeep", {"*": self.waiver_doc("jobw")})
+        out = w.joined(wrk, "jobw", waived="hk:doc/forged", PATH="%s:%s" % (shim_dir, safe_path()))
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("waiver record not found in handoffkeep: hk:doc/forged", out.stderr)
+        self.assertFalse(shim_log.exists(), "the PATH shim must never run")
+        self.assertEqual(w.canon_log.read_text().strip(), "doc get forged")
+        self.assertEqual(tree(w.jobs), before)
+
+    def repro_joined_waiver_canonical(self, wrk):
+        """With no overrides the canonical handoffkeep answers the waiver and the join lands."""
+        w = self.w
+        w.mkjob(w.jobs, "jobv")
+        w.install_canonical_hk({"waiver-jobv": self.waiver_doc("jobv")})
+        out = w.joined(wrk, "jobv", waived="hk:doc/waiver-jobv")
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("kind=job.joined", out.stdout)
+        # the report upload and relay warnings are not trust-bearing; no trust warning appears
+        self.assertNotIn("test mode honours", out.stderr)
+        self.assertNotIn(str(w.canon_hk), out.stderr)
+        self.assertEqual(w.canon_log.read_text().strip(), "doc get waiver-jobv")
+        joined = [json.loads(f.read_text()) for f in (w.jobs / "jobv" / "events").glob("*-job.joined.json")]
+        self.assertEqual([(j["rounds_waived"], j["rounds_waived_issuer"]) for j in joined],
+                         [("hk:doc/waiver-jobv", "director-1")])
+
+    def test_joined_waiver_uses_the_canonical_handoffkeep_only(self):
+        self.repro_joined_waiver_hk_bin_stub(self.wrk)
+
+    def test_joined_waiver_canonical_handoffkeep_answers(self):
+        self.repro_joined_waiver_canonical(self.wrk)
+
+    def test_joined_waiver_honours_a_handoffkeep_stub_in_test_mode(self):
+        w = self.w
+        tbuild = w.tmp / "builder"
+        w.mkjob(tbuild, "jobt")
+        w.stub(w.tmp / "waiver-test-hk", {"*": self.waiver_doc("jobt")})
+        out = w.joined(self.wrk, "jobt", test=True, waived="hk:doc/any", ARBITER_INBOX_ROOT=tbuild,
+                       HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "data", HANDOFFKEEP_BIN=w.tmp / "waiver-test-hk")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        warnings = [line for line in out.stderr.splitlines() if "test mode honours" in line]
+        self.assertEqual(len(warnings), 1, out.stderr)
+        self.assertIn("HANDOFFKEEP_BIN", warnings[0])
+
+    def test_insecure_canonical_handoffkeep_is_refused_for_a_waiver_only(self):
+        w = self.w
+        for label, mutate_hk in {
+            "group-writable": lambda: w.canon_hk.chmod(0o775),
+            "world-writable": lambda: w.canon_hk.chmod(0o757),
+            "missing": lambda: w.canon_hk.unlink(),
+        }.items():
+            with self.subTest(case=label):
+                waived_job, plain_job = "jobw-" + label, "jobp-" + label
+                w.mkjob(w.jobs, waived_job)
+                w.mkjob(w.jobs, plain_job)
+                w.seed_round(w.jobs, plain_job)
+                w.install_canonical_hk({"waiver-" + waived_job: self.waiver_doc(waived_job)})
+                mutate_hk()
+                before = tree(w.jobs)
+                out = w.joined(self.wrk, waived_job, waived="hk:doc/waiver-" + waived_job)
+                self.refusal_line(out, "canonical handoffkeep", w.canon_hk)
+                self.assertEqual(tree(w.jobs), before)
+                # a join without a waiver never judges or runs handoffkeep
+                out = w.joined(self.wrk, plain_job)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertIn("kind=job.joined", out.stdout)
+                self.assertNotIn(str(w.canon_hk), out.stderr)
 
     def repro_end_check_redirect(self, wrk):
         """The end declaration is read from the checked inbox by joined, open, verdict and void."""
@@ -1580,11 +1662,20 @@ class RealBinaryCase(unittest.TestCase):
         lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
         self.red(self.repro_inherited_guard_state, lib)
 
+    JOINED_GUARD = '  if [[ -n "$waived" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi\n'
+
     def test_mutant_joined_skips_the_guard(self):
-        mutant = self.mutant(WRK, '  # lane are read from the checked inbox, never from the environment.\n  wrk_trust_guard\n',
-                             '  # lane are read from the checked inbox, never from the environment.\n' + ENV_FOLLOWING, "joined")
+        mutant = self.mutant(WRK, self.JOINED_GUARD, ENV_FOLLOWING, "joined")
         self.red(self.repro_joined_redirect, mutant)
         self.red(self.repro_end_check_redirect, mutant)
+
+    def test_mutant_joined_waiver_follows_the_environment_handoffkeep(self):
+        mutant = self.mutant(WRK, self.JOINED_GUARD, ENV_FOLLOWING_HK, "joinedwaiverenv")
+        self.red(self.repro_joined_waiver_hk_bin_stub, mutant)
+
+    def test_mutant_joined_waiver_takes_the_plain_guard(self):
+        mutant = self.mutant(WRK, self.JOINED_GUARD, '  wrk_trust_guard\n', "joinedwaiverplain")
+        self.red(self.repro_joined_waiver_canonical, mutant)
 
     def test_mutant_round_audit_skips_the_guard(self):
         mutant = self.mutant(WRK, '  wrk_trust_guard\n  local jobs_root\n', ENV_FOLLOWING + '  local jobs_root\n', "audit")
