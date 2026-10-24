@@ -3125,7 +3125,8 @@ arbiter_record_spawn_receipt() {
   # answers nonzero on receipt failure instead: the remote leg's rc stops the
   # initiator's add (and a 2 sits in the remote stop set, so the auto round
   # ends rather than re-placing the job). The still-armed pane trap closes the
-  # pane; an untracked lane is never left behind.
+  # pane; a self-registered deferred lane is removed through its machine+pane
+  # guard first. An initiator-owned deferred row is never removed here.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc lane_role
   # #1438: the role the lane was registered under — the same normalization
@@ -3171,6 +3172,7 @@ PY
 )"; then
     if [[ -n "${LANE_DEFER:-}" ]]; then
       warn "arbiter job.spawned receipt preparation failed under --lane-defer; the deferred lane would be untrackable — failing the spawn so the initiator registers nothing: job_id=$JOB_ID pane_id=$PANE"
+      hub_lane_orphan_remove
       return 2
     fi
     warn "arbiter job.spawned receipt preparation failed; spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
@@ -3184,6 +3186,7 @@ PY
   if [[ "$receipt_rc" -ne 0 ]]; then
     if [[ -n "${LANE_DEFER:-}" ]]; then
       warn "arbiter job.spawned receipt failed under --lane-defer (exit $receipt_rc); the deferred lane would be untrackable — failing the spawn so the initiator registers nothing: job_id=$JOB_ID pane_id=$PANE"
+      hub_lane_orphan_remove
       return 2
     fi
     warn "arbiter job.spawned receipt failed (exit $receipt_rc); spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
@@ -3194,17 +3197,19 @@ PY
 # #994/S1: a lane whose job.spawned receipt was never written is a row
 # `wrk reap` can never attribute to a job — it would sit on the daemon
 # forever. Deregister it while the machine and pane are still in hand (same
-# credentials, same warn-only contract); the spawn still succeeds, and a
-# failed removal is left for `panewire lanes-audit`.
+# credentials and machine+pane guard). An ordinary spawn remains successful
+# on receipt failure; a deferred self-add is compensated before its required
+# rc 2, with removal failure left for `panewire lanes-audit`.
 hub_lane_orphan_remove() {
   [[ -n "${HUB_LANE:-}" ]] || return 0
-  # #1397/(a): under --lane-defer this host never added the row — the ssh
-  # initiator did. A receipt failure here must not reach for `lanes rm`
-  # (the row may not even exist yet); the initiator's lanes-missing audit
-  # and lanes-audit own cleanup instead.
-  [[ -z "${LANE_DEFER:-}" ]] || return 0
+  # #1397/(a): under --lane-defer the initiator owns the deferred row. Only
+  # remove a deferred lane when this execution host set HUB_LANE_SELF after
+  # its own lanes-token add; otherwise the row may belong to the initiator.
+  if [[ -n "${LANE_DEFER:-}" ]]; then
+    [[ "${HUB_LANE_SELF:-0}" -eq 1 ]] || return 0
+  fi
   local lane="$HUB_LANE" machine="$HUB_LANE_MACHINE"
-  HUB_LANE="" HUB_LANE_MACHINE=""
+  HUB_LANE="" HUB_LANE_MACHINE="" HUB_LANE_SELF=""
   warn "hub lane '$lane' was registered but the job.spawned receipt was not written — deregistering it"
   hub_lane_remove "$lane" "$machine" "$PANE" "${ROLE:-worker}"
 }
@@ -7830,7 +7835,8 @@ hub_lane_register() {
       # its add is unnecessary. Every other shape — no lanes token, a token
       # naming another machine, a refused or failed add — keeps the
       # deferral untouched (the add only warns, never fails the spawn).
-      if [[ "$ROLE" == builder ]] && hub_lane_self_register; then
+      if [[ "$ROLE" == builder && "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] &&
+         hub_lane_self_register; then
         HUB_LANE_SELF=1
       fi
     fi

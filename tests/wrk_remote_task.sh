@@ -63,6 +63,8 @@ export HK_STATE="$TMP/hk-state.json"
 "$HK_FIXTURE" tasks add --id 10 --title 'builder task' --lane fixture >/dev/null
 "$HK_FIXTURE" tasks add --id 11 --title 'second builder task' --lane fixture >/dev/null
 "$HK_FIXTURE" tasks add --id 12 --title 'third builder task' --lane fixture >/dev/null
+"$HK_FIXTURE" tasks add --id 13 --title 'fourth builder task' --lane fixture >/dev/null
+"$HK_FIXTURE" tasks add --id 14 --title 'fifth builder task' --lane fixture >/dev/null
 
 seed_parent() {
   local job="$1" task_id="${2:-}"
@@ -97,7 +99,8 @@ ARBITER_INBOX_ROOT="$tmp/remote-inbox/jobs"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" "$XDG_STATE_HOME" \
   "$XDG_CACHE_HOME" "$ARBITER_INBOX_ROOT"
 export HOME XDG_CONFIG_HOME XDG_DATA_HOME XDG_STATE_HOME XDG_CACHE_HOME ARBITER_INBOX_ROOT
-export ARBITER_BIN="$root/bin/arbiter"
+export ARBITER_BIN="${WRK_REMOTE_ARBITER_BIN:-$root/bin/arbiter}"
+export WRK_T10_REAL_ARBITER="$root/bin/arbiter"
 export HANDOFFKEEP_BIN="$root/tests/fixtures/handoffkeep"
 export HK_STATE="$tmp/hk-state.json"
 export HERDR_BIN="$root/tests/fixtures/spillover-herdr"
@@ -137,6 +140,10 @@ run_remote() {
     WRK_REMOTE_HOSTS_CONFIG="${WRK_CASE_REMOTE_CONFIG:-}" \
     WRK_REMOTE_LANES_LOG="${WRK_CASE_REMOTE_LANES_LOG:-}" \
     WRK_REMOTE_PANEWIRE_BIN="${WRK_CASE_REMOTE_PANEWIRE_BIN:-}" \
+    WRK_REMOTE_ARBITER_BIN="${WRK_CASE_REMOTE_ARBITER_BIN:-}" \
+    WRK_PANEWIRE_LANES_LS="${WRK_CASE_REMOTE_LANES_LS:-}" \
+    WRK_T10_PANEWIRE_FIXTURE="${WRK_CASE_T10_PANEWIRE_FIXTURE:-}" \
+    WRK_T10_PANEWIRE_STATE="${WRK_CASE_T10_PANEWIRE_STATE:-}" \
     "$binary" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w workers -l "$label" --t T1 --job "$job" "$@"
 }
 
@@ -456,3 +463,125 @@ PY
   cat "$TMP/wake.log" >&2; exit 1;
 }
 printf '%s\n' 'PASS wrk-remote-task T8-trailing-space-machine-id-defers'
+
+# T9 (hk 1446 B1): if the execution host has a matching lanes token but no
+# arbiter job record, it must defer exactly as before. The initiator still
+# adds the lane; that pre-existing orphan risk is out of scope.
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/wake.log"
+t9_out="$(WRK_CASE_MODEL=builder-sol WRK_CASE_LABEL=t9b WRK_CASE_JOB=t9-builder \
+  WRK_CASE_CONFIG="$T7_INIT_CONFIG" WRK_CASE_REMOTE_CONFIG="$T6_REMOTE_CONFIG" \
+  WRK_CASE_REMOTE_PANEWIRE_BIN="$ROOT/tests/fixtures/panewire" \
+  WRK_CASE_REMOTE_ARBITER_BIN="$TMP/no-remote-arbiter" \
+  WRK_CASE_REMOTE_LANES_LOG="$TMP/t9-remote-lanes.log" \
+  run_remote "$ROOT/bin/wrk" --host desktop --role builder --lane b1446-t9 --parent director-1 --task 13 2>&1)"
+grep -q ' lane=b1446-t9@desktop$' <<<"$t9_out" || {
+  echo 'FAIL T9 emitted line must end lane=b1446-t9@desktop' >&2; printf '%s\n' "$t9_out" >&2; exit 1;
+}
+! grep -q 'lane_registered=self' <<<"$t9_out" || {
+  echo 'FAIL T9 a remote with no job record must not self-register' >&2; exit 1;
+}
+[[ ! -s "$TMP/t9-remote-lanes.log" ]] || {
+  echo 'FAIL T9 a remote with no job record must make no lanes add' >&2
+  cat "$TMP/t9-remote-lanes.log" >&2; exit 1;
+}
+python3 - "$TMP/wake.log" "$T6_OP" <<'PY' || {
+import sys
+log, op = sys.argv[1:]
+lines = [l.split() for l in open(log, encoding="utf-8")]
+adds = [l for l in lines if l[:2] == ["lanes", "add"]]
+assert len(adds) == 1, "initiator must add once when no marker is returned: %r" % lines
+argv = adds[0]
+assert argv[argv.index("--machine") + 1] == "desktop", argv
+assert argv[argv.index("--hub-token-env") + 1] == op, argv
+PY
+  echo 'FAIL T9 initiator should add the unmarked remote lane' >&2
+  cat "$TMP/wake.log" >&2; exit 1;
+}
+printf '%s\n' 'PASS wrk-remote-task T9-no-job-record-defers-self-registration'
+
+# T10 (hk 1446 B1): if job.spawned receipt creation fails after a successful
+# self-add, the execution host must remove the row with its lanes token after
+# confirming the same machine and pane. The failed spawn answers 2 and leaves
+# no row in the stateful panewire fixture; an initiator-owned row is untouched.
+T10_PANEWIRE="$TMP/t10-stateful-panewire"
+T10_STATE="$TMP/t10-lane-present"
+T10_FAIL_ARBITER="$TMP/t10-fail-spawned-arbiter"
+cat >"$T10_PANEWIRE" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+fixture="${WRK_T10_PANEWIRE_FIXTURE:?}"
+state="${WRK_T10_PANEWIRE_STATE:?}"
+if [[ "${1:-}" == lanes && "${2:-}" == ls ]]; then
+  if [[ -e "$state" ]]; then
+    WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"b1446-t10","machine":"desktop","pane":"w:p1","parent":"director-1","sink":false}]}'
+  else
+    WRK_PANEWIRE_LANES_LS='{"lanes":[]}'
+  fi
+  export WRK_PANEWIRE_LANES_LS
+fi
+set +e
+"$fixture" "$@"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 && "${1:-}" == lanes && "${2:-}" == add ]]; then : >"$state"; fi
+if [[ "$rc" -eq 0 && "${1:-}" == lanes && "${2:-}" == rm ]]; then rm -f "$state"; fi
+exit "$rc"
+SH
+cat >"$T10_FAIL_ARBITER" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1:-}" == event ]]; then
+  for argument in "$@"; do
+    [[ "$argument" != job.spawned ]] || exit 3
+  done
+fi
+exec "${WRK_T10_REAL_ARBITER:?}" "$@"
+SH
+chmod +x "$T10_PANEWIRE" "$T10_FAIL_ARBITER"
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/wake.log"
+set +e
+t10_out="$(WRK_CASE_MODEL=builder-sol WRK_CASE_LABEL=t10b WRK_CASE_JOB=t10-builder \
+  WRK_CASE_CONFIG="$T7_INIT_CONFIG" WRK_CASE_REMOTE_CONFIG="$T6_REMOTE_CONFIG" \
+  WRK_CASE_REMOTE_PANEWIRE_BIN="$T10_PANEWIRE" \
+  WRK_CASE_REMOTE_ARBITER_BIN="$T10_FAIL_ARBITER" \
+  WRK_CASE_REMOTE_LANES_LOG="$TMP/t10-remote-lanes.log" \
+  WRK_CASE_T10_PANEWIRE_FIXTURE="$ROOT/tests/fixtures/panewire" \
+  WRK_CASE_T10_PANEWIRE_STATE="$T10_STATE" \
+  run_remote "$ROOT/bin/wrk" --host desktop --role builder --lane b1446-t10 --parent director-1 --task 14 2>&1)"
+t10_rc=$?
+set -e
+[[ "$t10_rc" -eq 2 ]] || {
+  echo "FAIL T10 receipt failure must answer 2, got $t10_rc" >&2; printf '%s\n' "$t10_out" >&2; exit 1;
+}
+! grep -q '^OK pane=' <<<"$t10_out" || {
+  echo 'FAIL T10 receipt failure must not print an OK line' >&2; exit 1;
+}
+[[ ! -e "$T10_STATE" ]] || {
+  echo 'FAIL T10 guarded removal must leave no lane in the fixture' >&2; exit 1;
+}
+python3 - "$TMP/t10-remote-lanes.log" "$T6_TOKEN" <<'PY' || {
+import sys
+log, token = sys.argv[1:]
+rows = open(log, encoding="utf-8").read().splitlines()
+calls, call = [], []
+for row in rows:
+    if row == "--":
+        calls.append(call)
+        call = []
+    else:
+        call.append(row)
+assert [c[0] for c in calls] == ["add", "ls", "rm"], calls
+add, listing, remove = calls
+assert add[1] == "b1446-t10" and add[add.index("--machine") + 1] == "desktop", add
+assert add[add.index("--pane") + 1] == "w:p1", add
+assert remove[1] == "b1446-t10", remove
+for args in calls:
+    assert args[args.index("--hub-token-env") + 1] == token, args
+PY
+  echo 'FAIL T10 expected one self-add followed by guarded ls and rm with the lanes token' >&2
+  cat "$TMP/t10-remote-lanes.log" >&2; exit 1;
+}
+! grep -q 'lanes add' "$TMP/wake.log" || {
+  echo 'FAIL T10 the initiator must not add after the failed remote receipt' >&2; exit 1;
+}
+printf '%s\n' 'PASS wrk-remote-task T10-receipt-failure-compensates-self-add'

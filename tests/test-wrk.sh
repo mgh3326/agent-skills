@@ -6161,6 +6161,178 @@ SH
   fi
   echo "PASS 1446-lanes M3: ignoring the self-registration marker goes RED"
 
+  # B1 AC1 — the execution host only self-registers once it has a durable
+  # arbiter job record. A missing arbiter leaves the existing deferred lane
+  # outcome unchanged: no remote lanes add and no lane_registered marker.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$TMP/absent-arbiter-b1446" \
+    lanes_spawn b1446-nojob --role builder --lane b1446-nojob --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 B1 AC1: a missing arbiter must not fail the deferred spawn (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call b1446-nojob
+  grep -q ' lane=b1446-nojob@desktop$' "$LANES_OUT" ||
+    fail "#1446 B1 AC1: no-job deferral must keep the ordinary lane field: $(cat "$LANES_OUT")"
+  ! grep -q 'lane_registered=self' "$LANES_OUT" ||
+    fail "#1446 B1 AC1: a deferred lane without a job receipt must not self-register"
+  echo "PASS 1446 B1 AC1: no arbiter job record keeps the remote deferral"
+
+  # B1 AC2 — if the self-add succeeds but job.spawned fails, compensate
+  # through the same builder credential chain and machine+pane guard before
+  # returning rc 2. The stateful fixture marks the row on add and deletes it
+  # only after the guarded rm succeeds.
+  T1446_SELF_LANE_STATE="$TMP/t1446-self-lane-state"
+  T1446_STATEFUL_PANEWIRE="$TMP/t1446-stateful-panewire"
+  cat >"$T1446_STATEFUL_PANEWIRE" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+fixture="${LANES_PANEWIRE_FIXTURE:?}"
+state="${LANES_PANEWIRE_STATE:?}"
+lane="${LANES_PANEWIRE_LANE:?}"
+if [[ "${1:-}" == lanes && "${2:-}" == ls ]]; then
+  if [[ -e "$state" ]]; then
+    WRK_PANEWIRE_LANES_LS="{\"lanes\":[{\"lane\":\"$lane\",\"machine\":\"desktop\",\"pane\":\"w:p1\",\"parent\":\"director-x\",\"sink\":false}]}"
+  else
+    WRK_PANEWIRE_LANES_LS='{"lanes":[]}'
+  fi
+  export WRK_PANEWIRE_LANES_LS
+fi
+set +e
+"$fixture" "$@"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 && "${1:-}" == lanes && "${2:-}" == add ]]; then : >"$state"; fi
+if [[ "$rc" -eq 0 && "${1:-}" == lanes && "${2:-}" == rm ]]; then rm -f "$state"; fi
+exit "$rc"
+SH
+  chmod +x "$T1446_STATEFUL_PANEWIRE"
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$T1397_FAIL_ARBITER" PANEWIRE="$T1446_STATEFUL_PANEWIRE" \
+    LANES_PANEWIRE_FIXTURE="$ROOT/tests/fixtures/panewire" \
+    LANES_PANEWIRE_STATE="$T1446_SELF_LANE_STATE" \
+    LANES_PANEWIRE_LANE=b1446-receipt \
+    lanes_spawn b1446-receipt --role builder --lane b1446-receipt --parent director-x --lane-defer desktop
+  PANEWIRE="$ROOT/tests/fixtures/panewire"
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1446 B1 AC2: a deferred receipt failure must answer 2 (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  if grep -q '^OK pane=' "$LANES_OUT"; then
+    fail "#1446 B1 AC2: no OK line may survive a failed deferred receipt: $(cat "$LANES_OUT")"
+  fi
+  [[ ! -e "$T1446_SELF_LANE_STATE" ]] ||
+    fail "#1446 B1 AC2: the guarded self-add compensation must remove the fixture row"
+  python3 - "$LANES_CALLS" "$LANES_NODE_DESKTOP_FILE" <<'PY' ||
+import sys
+log, token = sys.argv[1:]
+rows = open(log, encoding="utf-8").read().splitlines()
+calls, call = [], []
+for row in rows:
+    if row == "--":
+        calls.append(call)
+        call = []
+    else:
+        call.append(row)
+assert [args[0] for args in calls] == ["add", "ls", "rm"], calls
+add, listing, remove = calls
+assert add[1] == "b1446-receipt", add
+assert add[add.index("--machine") + 1] == "desktop", add
+assert add[add.index("--pane") + 1] == "w:p1", add
+assert remove[1] == "b1446-receipt", remove
+assert all(args[args.index("--hub-token-env") + 1] == token for args in calls), calls
+PY
+    fail "#1446 B1 AC2: one lanes-token add must be followed by guarded ls+rm"
+  echo "PASS 1446 B1 AC2: receipt failure removes the self-added guarded row"
+
+  # B1 AC3 — exercise the receipt-payload preparation failure before the
+  # arbiter event call. It must use the same guarded compensation as an event
+  # write failure.
+  T1446_PYTHON_DIR="$TMP/t1446-python"
+  T1446_FAIL_PYTHON="$T1446_PYTHON_DIR/python3"
+  T1446_REAL_PYTHON="$(command -v python3)"
+  mkdir -p "$T1446_PYTHON_DIR"
+  cat >"$T1446_FAIL_PYTHON" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+real_python="${WRK_T1446_REAL_PYTHON:?}"
+if [[ "${1:-}" == "-" ]]; then
+  script="$(mktemp)"
+  cat >"$script"
+  if grep -qF 'pane_id, label, profile, workspace, tab_id, keep, task_id, hub_lane, hub_lane_machine, lane_role = sys.argv[1:]' "$script"; then
+    rm -f "$script"
+    exit 1
+  fi
+  set +e
+  "$real_python" "$@" <"$script"
+  rc=$?
+  set -e
+  rm -f "$script"
+  exit "$rc"
+fi
+exec "$real_python" "$@"
+SH
+  chmod +x "$T1446_FAIL_PYTHON"
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$ARBITER" PANEWIRE="$T1446_STATEFUL_PANEWIRE" \
+    LANES_PANEWIRE_FIXTURE="$ROOT/tests/fixtures/panewire" \
+    LANES_PANEWIRE_STATE="$T1446_SELF_LANE_STATE" \
+    LANES_PANEWIRE_LANE=b1446-prep-fail \
+    WRK_T1446_REAL_PYTHON="$T1446_REAL_PYTHON" PATH="$T1446_PYTHON_DIR:$PATH" \
+    lanes_spawn b1446-prep-fail --role builder --lane b1446-prep-fail --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1446 B1 AC3: receipt preparation failure must answer 2 (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ ! -e "$T1446_SELF_LANE_STATE" ]] ||
+    fail "#1446 B1 AC3: preparation failure must remove the self-added fixture row"
+  python3 - "$LANES_CALLS" "$LANES_NODE_DESKTOP_FILE" <<'PY' ||
+import sys
+log, token = sys.argv[1:]
+rows = open(log, encoding="utf-8").read().splitlines()
+calls, call = [], []
+for row in rows:
+    if row == "--":
+        calls.append(call)
+        call = []
+    else:
+        call.append(row)
+assert [args[0] for args in calls] == ["add", "ls", "rm"], calls
+assert all(args[args.index("--hub-token-env") + 1] == token for args in calls), calls
+PY
+    fail "#1446 B1 AC3: preparation failure must add then guardedly remove with the lanes token"
+  echo "PASS 1446 B1 AC3: receipt preparation failure compensates the self-add"
+
+  # Mutant B1 M1 — drop the job-record gate. AC1 then observes a remote add
+  # despite the missing receipt.
+# shellcheck disable=SC2016 # these literals are bin/wrk source anchors
+  devin_trust_mutant lanes-1446-no-job-gate \
+    '      if [[ "$ROLE" == builder && "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] &&
+         hub_lane_self_register; then' \
+    '      if [[ "$ROLE" == builder ]] &&
+         hub_lane_self_register; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-no-job-gate" \
+    LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$TMP/absent-arbiter-b1446-mut" \
+    lanes_spawn b1446-m1-job --role builder --lane b1446-m1-job --parent director-x --lane-defer desktop
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#1446 B1 M1 mutant survived: dropping the job-record gate still deferred"
+  fi
+  echo "PASS 1446 B1 M1: dropping the job-record gate goes RED"
+
+  # Mutant B1 M2 — skip removal for a self-registered deferred lane. AC2's
+  # stateful fixture then retains the unreceipted row.
+# shellcheck disable=SC2016 # this literal is a bin/wrk source anchor
+  devin_trust_mutant lanes-1446-skip-self-rm \
+    '    [[ "${HUB_LANE_SELF:-0}" -eq 1 ]] || return 0' \
+    '    return 0'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-skip-self-rm" \
+    LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$T1397_FAIL_ARBITER" PANEWIRE="$T1446_STATEFUL_PANEWIRE" \
+    LANES_PANEWIRE_FIXTURE="$ROOT/tests/fixtures/panewire" \
+    LANES_PANEWIRE_STATE="$T1446_SELF_LANE_STATE" \
+    LANES_PANEWIRE_LANE=b1446-receipt \
+    lanes_spawn b1446-m2-rm --role builder --lane b1446-receipt --parent director-x --lane-defer desktop
+  if [[ ! -e "$T1446_SELF_LANE_STATE" ]]; then
+    fail "#1446 B1 M2 mutant survived: skipping guarded rm still removed the lane"
+  fi
+  rm -f "$T1446_SELF_LANE_STATE"
+  echo "PASS 1446 B1 M2: skipping self-add compensation goes RED"
+
   # ------------------------------------------------------------------
   # #1438 — reap resolves a lane's credential chain from the role that
   # registered it (the job.spawned receipt's lane_role), not from the
