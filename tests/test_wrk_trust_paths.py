@@ -689,13 +689,72 @@ class TripwireCase(unittest.TestCase):
     def test_tripwire_covers_a_symlinked_passwd_home_under_both_names(self):
         self.tripwire_covers_aliased_home(trust_tripwire)
 
-    def test_mutant_tripwire_roots_drop_the_resolved_home(self):
+    def tripwire_covers_resolved_location(self, module, relative):
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        fake = base / "fake-home"
+        location = fake / relative
+        location.parent.mkdir(parents=True)
+        target = base / "resolved-target"
+        target.mkdir()
+        location.symlink_to(target, target_is_directory=True)
+        sibling = base / "resolved-sibling"
+        sibling.mkdir()
+        module.install(home=str(fake))
+        try:
+            with self.assertRaises(AssertionError):
+                with open(target / "touched", "w", encoding="utf-8"):
+                    pass
+            os.stat(str(sibling))
+        finally:
+            module.uninstall()
+
+    def test_tripwire_covers_a_symlinked_local_bin_under_its_target(self):
+        self.tripwire_covers_resolved_location(trust_tripwire, Path(".local") / "bin")
+
+    def test_tripwire_covers_a_symlinked_inbox_under_its_target(self):
+        self.tripwire_covers_resolved_location(trust_tripwire, Path("work") / "herdr-inbox")
+
+    def test_tripwire_adds_no_roots_for_absent_or_plain_locations(self):
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        fake = base / "fake-home"
+        fake.mkdir()
+        for create_locations in (False, True):
+            if create_locations:
+                for rel in trust_tripwire.TRIP_RELATIVE:
+                    (fake / rel).mkdir(parents=True)
+            trust_tripwire.install(home=str(fake))
+            try:
+                expected = tuple(str(fake / rel) for rel in trust_tripwire.TRIP_RELATIVE)
+                self.assertEqual(trust_tripwire._state["roots"], expected)
+            finally:
+                trust_tripwire.uninstall()
+
+    def test_tripwire_roots_include_spelled_and_resolved_home_forms(self):
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        real = base / "real"
+        link = base / "link"
+        link.symlink_to(real)
+        trust_tripwire.install(home=str(link))
+        try:
+            expected = tuple(str(form / rel) for form in (link, real) for rel in trust_tripwire.TRIP_RELATIVE)
+            self.assertEqual(trust_tripwire._state["roots"], expected)
+        finally:
+            trust_tripwire.uninstall()
+
+    def test_mutant_tripwire_roots_drop_the_resolved_locations(self):
         source = (ROOT / "tests" / "lib" / "trust_tripwire.py").read_text(encoding="utf-8")
         mutant = types.ModuleType("trust_tripwire_mutant")
-        exec(compile(mutate(source, "    if os.path.realpath(home) != home:\n        homes.append(os.path.realpath(home))\n", ""),
+        exec(compile(mutate(source,
+                            "    for location in tuple(roots):\n"
+                            "        resolved = os.path.realpath(location)\n"
+                            "        if resolved != location:\n"
+                            "            roots.append(resolved)\n", ""),
                      "trust_tripwire_mutant", "exec"), mutant.__dict__)
         with self.assertRaises(AssertionError):
-            self.tripwire_covers_aliased_home(mutant)
+            self.tripwire_covers_resolved_location(mutant, Path(".local") / "bin")
 
 
 # ---------------------------------------------------------------------------
@@ -793,6 +852,11 @@ class World:
         events.mkdir(parents=True, exist_ok=True)
         (events / ("%05d-job.round.json" % (number + 1))).write_text(json.dumps({
             "kind": "job.round", "job_id": job, "round": number, "head": "a" * 40,
+            "created_at": "2026-10-23T00:00:%02dZ" % number}) + "\n")
+        # hk 1900: a round counts toward the join only with a recorded verdict. The name is not a
+        # numeric prefix, so it never collides with a verdict record a test writes itself.
+        (events / ("seed-%d-job.verdict.json" % number)).write_text(json.dumps({
+            "kind": "job.verdict", "job_id": job, "round": number, "head": "b" * 40, "verdict": "PASS",
             "created_at": "2026-10-23T00:00:%02dZ" % number}) + "\n")
 
     def end_job(self, root, job, name="00009-job.revoked.json"):
