@@ -66,6 +66,8 @@ seed_join_round() {
     return 0
   fi
   printf '%s\n' "{\"kind\":\"job.round\",\"job_id\":\"$job\",\"round\":1,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >"$events/seed-job.round.json"
+  # hk 1900: a round counts toward the join only with a recorded verdict.
+  printf '%s\n' "{\"kind\":\"job.verdict\",\"job_id\":\"$job\",\"round\":1,\"head\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"verdict\":\"PASS\"}" >"$events/seed-job.verdict.json"
 }
 
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
@@ -12272,10 +12274,12 @@ echo "PASS r20-wedged-emit-is-bounded-by-the-timeout-guard"
 # must not emit at all; passing it would only pile up usage warnings.
 R20_LOST_LOG="$TMP/r20-lost-emit.log"
 R20_LOST_INBOX="$TMP/r20-lost-inbox"
+R20_LOST_SEQ="$TMP/r20-lost.seq"
+printf 'not-found\n' >"$R20_LOST_SEQ"
 set +e
 env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-r20" \
   ARBITER_INBOX_ROOT="$R20_LOST_INBOX" WRK_PANEWIRE_LOG="$R20_LOST_LOG" \
-  WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
+  WRK_FIXTURE_GET_SEQUENCE="$R20_LOST_SEQ" WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel r20-lost lane-a wrk-a w1:p1 "$R20_REPORT" >/dev/null 2>&1
 r20_lost_rc=$?
@@ -12940,7 +12944,8 @@ PY
 echo "PASS 1014-s1-snapshot-bytes-match-record-digest"
 
 # R18 completion sentinel: a report alone is never completion evidence. A
-# worker still working must time out/lost rather than emit job.completed.
+# worker still working past the watch window must not emit job.completed, and
+# since hk 1888 the live pane is not job.lost either: the sentinel only leaves.
 SENTINEL_REPORT="$TMP/sentinel-report.md"
 printf 'sentinel final line\n' >"$SENTINEL_REPORT"
 SENTINEL_INBOX="$TMP/sentinel-inbox"
@@ -12956,13 +12961,11 @@ if find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.completed.json' | 
   echo "working agent incorrectly emitted job.completed" >&2
   exit 1
 fi
-find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.lost.json' | grep -q .
-python3 - "$SENTINEL_INBOX/sentinel-working/events" <<'PY'
-import glob, json, sys
-lost = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.lost.json"))]
-assert lost and lost[0].get("reason") == "timeout", (
-    "an expired watch window is job.lost with reason=timeout, got %r" % lost)
-PY
+if find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.lost.json' -o -name '*job.revoked.json' | grep -q .; then
+  echo "an expired watch window on a live pane must not write job.lost or job.revoked" >&2
+  exit 1
+fi
+grep -q 'action=watch-expired elapsed=' "$SENTINEL_INBOX/sentinel-working/completion-sentinel.log"
 echo "PASS r18-sentinel-requires-terminal-status"
 
 # Automatic discovery must work on macOS too, and the observation key must be
