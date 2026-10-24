@@ -39,6 +39,10 @@ export TMPDIR="$SHORT"
 TMP="$(mktemp -d "$TMPDIR/t.XXXXXX")"
 PIDS=()
 CLEANUP_KEEP_TMP=0
+# Bash 3.2 makes the EXIT trap's status the script status. An unbound
+# expansion then exits 0. SUITE_DONE stays 0 unless the last line runs.
+SUITE_DONE=0
+SUITE_ABORTED=0
 # BASHPID is bash 4+. macOS CI's /bin/bash is 3.2, where the name is unset.
 if [[ -n "${BASHPID+x}" ]]; then
   MAIN_BASHPID=$BASHPID
@@ -46,7 +50,7 @@ else
   MAIN_BASHPID=
 fi
 
-fail() { echo "FAIL: $*" >&2; exit 1; }
+fail() { echo "FAIL: $*" >&2; SUITE_ABORTED=1; exit 1; }
 
 cleanup() {
   # On bash 4+, a subshell has its own BASHPID. Only the main shell may
@@ -62,12 +66,17 @@ cleanup() {
   for pid in ${PIDS[@]+"${PIDS[@]}"}; do
     kill "$pid" 2>/dev/null || true
   done
-  if [[ "$CLEANUP_KEEP_TMP" -eq 1 ]]; then
-    return 0
+  if [[ "$CLEANUP_KEEP_TMP" -ne 1 ]]; then
+    rm -rf "$SHORT" 2>/dev/null || { sleep 1; rm -rf "$SHORT" 2>/dev/null || true; }
+    if [[ -n "$PYBIN" ]]; then
+      rm -rf "$PYBIN"
+    fi
   fi
-  rm -rf "$SHORT" 2>/dev/null || { sleep 1; rm -rf "$SHORT" 2>/dev/null || true; }
-  if [[ -n "$PYBIN" ]]; then
-    rm -rf "$PYBIN"
+  # The trap status replaces the script status on bash 3.2. Leave rc 1
+  # when the suite did not reach its last line.
+  if [[ "$SUITE_DONE" -ne 1 ]]; then
+    [[ "$SUITE_ABORTED" -eq 1 ]] || echo "FAIL: suite aborted before the end" >&2
+    exit 1
   fi
 }
 trap cleanup EXIT
@@ -792,9 +801,14 @@ os.stat = stat
 PY
   FOREIGN_PRE=(PYTHONPATH="$TMP/pyhook" WRK_TEST_FOREIGN_NAME=foreignkey)
 fi
+# Bash 3.2 nounset treats "${empty[@]}" as unbound. When sudo -n works,
+# FOREIGN_PRE stays empty and that expansion aborts the suite. The
+# ${name[@]+...} form is the empty-safe prefix, same as the pid loop.
+_empty_pre=()
+env ${_empty_pre[@]+"${_empty_pre[@]}"} true || fail "empty env prefix aborted under nounset"
 # a fifo at the key name must not block the open
 t0="$(now)"
-env "${FOREIGN_PRE[@]}" "$WRK" heavy --queue-key fifokey -- touch "$TMP/odd-fifo-ran" ||
+env ${FOREIGN_PRE[@]+"${FOREIGN_PRE[@]}"} "$WRK" heavy --queue-key fifokey -- touch "$TMP/odd-fifo-ran" ||
   fail "odd: fifo position stalled or refused the queue"
 fcmp "$(since "$t0")" le 4 || fail "odd: fifo position delayed the acquire"
 [[ -e "$TMP/odd-fifo-ran" ]] || fail "odd: fifo key did not run"
@@ -808,7 +822,7 @@ for key in hardkey badkey linkey; do
   grep -q 'ticket=1:1' "$WRK_HEAVY_LOCK" && fail "odd: key $key reused a planted ticket"
 done
 rm -f "$TMP/odd-ran"
-env "${FOREIGN_PRE[@]}" "$WRK" heavy --queue-key foreignkey -- touch "$TMP/odd-ran" ||
+env ${FOREIGN_PRE[@]+"${FOREIGN_PRE[@]}"} "$WRK" heavy --queue-key foreignkey -- touch "$TMP/odd-ran" ||
   fail "odd: foreign position stalled the queue"
 # the foreign file's ancient ticket must not have been the one acquired.
 # An untrusted record is left in place, and the holder carries a fresh ticket.
@@ -1085,3 +1099,4 @@ mutant deadreserves $'        if not alive(pid) or lim is None or lim < 1:\n' \
 run_mutant deadreserves 'dead pid blocked' dead_pid_reserves_nothing
 
 echo 'PASS test-wrk-heavy-fifo'
+SUITE_DONE=1
