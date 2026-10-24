@@ -43,6 +43,18 @@ printf '%s\n' 'fixture prompt' >"$PROMPT"
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
 
+# hk 1449: a builder join needs one non-voided recorded round. The seed file's
+# name is not a numeric prefix, so event numbering stays on the golden names.
+seed_join_round() {
+  local root="$1" job="$2"
+  local events="$root/$job/events"
+  mkdir -p "$events"
+  if [[ -e "$events/seed-job.round.json" ]]; then
+    return 0
+  fi
+  printf '%s\n' "{\"kind\":\"job.round\",\"job_id\":\"$job\",\"round\":1,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >"$events/seed-job.round.json"
+}
+
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
@@ -9996,6 +10008,7 @@ assert event["payload"] == {
 PY
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" escalate builder-opus-job --question 'need parent decision' >/dev/null
+seed_join_round "$ARBITER_INBOX_ROOT" builder-opus-job
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" joined builder-opus-job --pr https://example.invalid/pr/1 --head deadbeef --report "$BUILDER_REPORT" >/dev/null
 python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events" <<'PY'
@@ -10204,6 +10217,7 @@ arb lease --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind
 arb release --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind path --force >/dev/null
 arb claim --job builder-reclaim-job --lane builder-new-lane --agent-label builder-new-label --t T1 \
   --role builder --parent-lane parent-new --reclaim-released >/dev/null
+seed_join_round "$ARBITER_INBOX_ROOT" builder-reclaim-job
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" joined builder-reclaim-job --pr https://example.invalid/pr/2 --head feedface --report "$BUILDER_REPORT" >/dev/null
 python3 - "$ARBITER_INBOX_ROOT/builder-reclaim-job/events" <<'PY'
@@ -12074,6 +12088,7 @@ cp "$R20_FIXTURE/00001-job.claim.json" "$R20_FIXTURE/00002-job.spawned.json" \
   env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
     WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" escalate captain-fixture \
     --question 'need parent decision' >/dev/null
+  seed_join_round "$R20_FIXTURE_INBOX" captain-fixture
   env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
     WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" joined captain-fixture \
     --pr https://example.invalid/pr/1 --head deadbeef --report report.md >/dev/null
@@ -12138,6 +12153,7 @@ r20_escalate_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-
   ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" escalate r20-builder \
   --question 'need parent decision')"
+seed_join_round "$R20_INBOX" r20-builder
 r20_joined_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
   ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" joined r20-builder \
@@ -12278,6 +12294,7 @@ env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
   "$WRK" escalate r20-root-builder --question 'need parent decision' \
   2>>"$R20_ROOT_ERR" >/dev/null
+seed_join_round "$R20_INBOX" r20-root-builder
 env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
   ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
@@ -12497,6 +12514,7 @@ R21_JOINED_REPORT="$(r21_report "$R21_JOINED_JOB" joined-report.md 'joined termi
 R21_JOINED_HK_LOG="$TMP/r21-joined-handoffkeep.log"
 R21_JOINED_PW_LOG="$TMP/r21-joined-panewire.log"
 r21_claim "$R21_JOINED_JOB" --role builder --parent-lane parent-a
+seed_join_round "$R21_INBOX" "$R21_JOINED_JOB"
 env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
   XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_JOINED_HK_LOG" WRK_PANEWIRE_LOG="$R21_JOINED_PW_LOG" \
@@ -13784,6 +13802,110 @@ grep -q '^closed job=reap-unkept ' <<<"$keep_apply_out" ||
   fail "#603: --apply must still close the unprotected control: $keep_apply_out"
 echo "PASS reap-skips-kept-jobs"
 
+# hk1823: explicit job selection must bound both dry-run output and the later
+# close set. Use one shared lane with three exact-name lookalikes.
+printf 'idle\n%.0s' {1..100} >"$TMP/reap-job-idle-sequence"
+export WRK_FIXTURE_GET_SEQUENCE="$TMP/reap-job-idle-sequence"
+reap_job b1 w1:p1 w1:t1 lane-a job.completed
+reap_job b10 w1:p2 w1:t2 lane-a job.completed
+reap_job xb1 w1:p4 w1:t4 lane-a job.completed
+selected_out="$(reap_run --lane lane-a --job b1)"
+grep -q '^would-close job=b1 ' <<<"$selected_out" || fail "--job b1 must select the exact b1 job: $selected_out"
+for unselected in b10 xb1; do
+  grep -q "$unselected" <<<"$selected_out" && fail "--job b1 must omit $unselected entirely: $selected_out"
+done
+multi_out="$(reap_run --lane lane-a --job b10 --job xb1)"
+grep -q '^would-close job=b10 ' <<<"$multi_out" || fail "repeated --job must retain its first id: $multi_out"
+grep -q '^\(would-close\|skip\) job=xb1 ' <<<"$multi_out" || fail "repeated --job must retain its second id: $multi_out"
+comma_out="$(reap_run --lane lane-a --job b10,xb1)"
+if ! grep -q 'job=b10 ' <<<"$comma_out" || ! grep -q 'job=xb1 ' <<<"$comma_out"; then
+  fail "comma-separated --job must select both named jobs: $comma_out"
+fi
+: >"$REAP_LOG"
+selected_apply="$(reap_run --lane lane-a --job b1 --apply)"
+grep -q '^closed job=b1 ' <<<"$selected_apply" || fail "--apply must close selected b1: $selected_apply"
+[[ "$(grep -c '^tab close ' "$REAP_LOG")" -eq 1 ]] || fail "--job b1 must close exactly one tab: $(cat "$REAP_LOG")"
+grep -q '^tab close w1:t1$' "$REAP_LOG" || fail "selected job's tab was not closed: $(cat "$REAP_LOG")"
+for unselected in b10 xb1; do
+  [[ "$(event_count "$REAP_INBOX/$unselected/events" job.reaped)" -eq 0 ]] || fail "unnamed job $unselected was reaped"
+done
+echo "PASS reap-job-filter-exact-and-apply"
+
+if invalid_job_out="$(reap_run --lane lane-a --job '' 2>&1)"; then
+  fail "an empty --job value must fail: $invalid_job_out"
+fi
+grep -q -- '--job requires a non-empty value' <<<"$invalid_job_out" || fail "empty --job error must be clear: $invalid_job_out"
+if invalid_job_out="$(reap_run --lane lane-a --job ,b1 2>&1)"; then
+  fail "an empty id in --job list must fail: $invalid_job_out"
+fi
+grep -q -- '--job contains an empty job id' <<<"$invalid_job_out" || fail "empty list item error must be clear: $invalid_job_out"
+
+# Recheck pane status during --apply. A named job that became working since
+# the dry run is explicitly reported as no longer a candidate and stays open.
+printf 'idle\nworking\n' >"$TMP/reap-job-status-sequence"
+rm -f "$TMP/reap-job-status-sequence.calls"
+reap_job reap-changes w1:p1 w1:t1 lane-a job.completed
+WRK_FIXTURE_GET_SEQUENCE="$TMP/reap-job-status-sequence" reap_run --lane lane-a --job reap-changes >/dev/null
+: >"$REAP_LOG"
+changed_out="$(WRK_FIXTURE_GET_SEQUENCE="$TMP/reap-job-status-sequence" reap_run --lane lane-a --job reap-changes --apply)"
+grep -q '^skip job=reap-changes reason=not-candidate$' <<<"$changed_out" || fail "a selected job that became working must be not-candidate: $changed_out"
+! grep -q '^tab close ' "$REAP_LOG" || fail "a job that became working must remain open: $(cat "$REAP_LOG")"
+echo "PASS reap-job-apply-time-candidate-change"
+
+# hk1823 M1: dropping only the apply-path selector must close the unnamed
+# control job, which the real close log detects.
+reap_job reap-filter-target w1:p1 w1:t1 reap-filter-lane job.completed
+reap_job reap-filter-extra w1:p2 w1:t2 reap-filter-lane job.completed
+M1823_APPLY="$TMP/wrk-reap-no-apply-filter"
+# shellcheck disable=SC2016 # sed source is the literal wrk apply guard.
+sed 's/if ! reap_job_selected "$job_filter" "$job"; then continue; fi # hk1823-apply-job-filter/: # hk1823 mutant drops apply filter/' \
+  "$WRK" >"$M1823_APPLY"
+chmod +x "$M1823_APPLY"
+grep -qF 'hk1823 mutant drops apply filter' "$M1823_APPLY" || fail "hk1823 M1 did not mutate the apply call site"
+: >"$REAP_LOG"
+saved_wrk="$WRK"
+WRK="$M1823_APPLY"
+m1_out="$(reap_run --lane reap-filter-lane --job reap-filter-target --apply)"
+WRK="$saved_wrk"
+grep -q '^closed job=reap-filter-extra ' <<<"$m1_out" || fail "hk1823 M1 survived: dropping the apply filter did not close the unnamed job: $m1_out / $(cat "$REAP_LOG")"
+echo "PASS hk1823 M1: dropping apply-only filter goes RED at the close-log assertion"
+
+# hk1823 M2: a prefix comparison admits b10 when only b1 was named.
+M1823_PREFIX="$TMP/wrk-reap-prefix-match"
+# shellcheck disable=SC2016 # sed source is the literal selector comparison.
+sed 's/\[\[ "$candidate" == "$job" \]\]/[[ "$job" == "$candidate"* ]]/' "$saved_wrk" >"$M1823_PREFIX"
+chmod +x "$M1823_PREFIX"
+# shellcheck disable=SC2016 # the grep pattern is the literal mutant.
+grep -qF '[[ "$job" == "$candidate"* ]]' "$M1823_PREFIX" || fail "hk1823 M2 did not mutate the selector comparison"
+WRK="$M1823_PREFIX"
+m2_out="$(reap_run --lane lane-a --job b1)"
+WRK="$saved_wrk"
+grep -q 'job=b10 ' <<<"$m2_out" || fail "hk1823 M2 survived: prefix mutant did not admit b10: $m2_out"
+echo "PASS hk1823 M2: prefix-match mutant goes RED on exact-id output assertion"
+
+# hk1823 M3: ignoring the second selector must omit xb1 from the repeated form.
+M1823_SECOND="$TMP/wrk-reap-first-job-only"
+# shellcheck disable=SC2016 # sed source is the literal --job parser append.
+sed 's/job_filter+="$job_value"/[[ -n "$job_filter" ]] || job_filter="$job_value"; :/' "$saved_wrk" >"$M1823_SECOND"
+chmod +x "$M1823_SECOND"
+# shellcheck disable=SC2016 # the grep pattern is the literal mutant.
+grep -qF '[[ -n "$job_filter" ]] || job_filter="$job_value"; :' "$M1823_SECOND" || fail "hk1823 M3 did not mutate repeated --job parsing"
+WRK="$M1823_SECOND"
+m3_out="$(reap_run --lane lane-a --job b10 --job xb1)"
+WRK="$saved_wrk"
+if grep -q '^would-close job=xb1 ' <<<"$m3_out"; then fail "hk1823 M3 survived: second --job still appeared: $m3_out"; fi
+echo "PASS hk1823 M3: ignored-second-job mutant goes RED on repeated-id assertion"
+
+# No selector preserves the existing byte output contract.
+baseline_out="$(reap_run --lane lane-a)"
+next_baseline_out="$(reap_run --lane lane-a)"
+baseline_out="$(sed -E 's/ age=[0-9]+s$/ age=AGE/' <<<"$baseline_out")"
+next_baseline_out="$(sed -E 's/ age=[0-9]+s$/ age=AGE/' <<<"$next_baseline_out")"
+[[ "$next_baseline_out" == "$baseline_out" ]] || fail "reap output changed without --job"
+echo "PASS reap-job-filter-default-output"
+
+
+
 # ── #499: done/escalate/joined hand over to `panewire job` only when it exists ──
 # Deployment order must not matter: with a panewire that lacks the command (or
 # no panewire at all) wrk behaves exactly as before, and whichever path runs,
@@ -13811,6 +13933,7 @@ j499_calls() { if [[ -f "$1" ]]; then grep -cx -- '--' "$1" || true; else echo 0
 # present: wrk hands the exact arguments over and writes nothing of its own.
 j499_claim j499-worker
 j499_claim j499-builder --role builder --parent-lane parent-a
+seed_join_round "$J499_INBOX" j499-builder
 out="$(j499_run 1 present present 'done' j499-worker --report "$J499_REPORT")"
 [[ "$out" == "fixture job done j499-worker --report $J499_REPORT" ]] ||
   fail "delegated done must pass panewire's stdout through: $out"
@@ -13859,6 +13982,7 @@ for mode in absent garbage off; do
   worker="j499-$mode-worker" builder="j499-$mode-builder"
   j499_claim "$worker"
   j499_claim "$builder" --role builder --parent-lane parent-a
+  seed_join_round "$J499_INBOX" "$builder"
   out="$(j499_run "$delegate" "$job_mode" "$mode" 'done' "$worker" --report "$J499_REPORT")"
   [[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "$mode: done output changed: $out"
   out="$(j499_run "$delegate" "$job_mode" "$mode" escalate "$builder" --question 'fallback question')"
@@ -13894,6 +14018,7 @@ mode=hang
 worker="j499-$mode-worker" builder="j499-$mode-builder"
 j499_claim "$worker"
 j499_claim "$builder" --role builder --parent-lane parent-a
+seed_join_round "$J499_INBOX" "$builder"
 out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang 'done' "$worker" --report "$J499_REPORT")"
 [[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "hang: done output changed: $out"
 out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang escalate "$builder" --question 'fallback question')"

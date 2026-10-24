@@ -180,7 +180,7 @@ wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE --task HK_TASK
 wrk done JOB [--report PATH]
 wrk escalate JOB --question TEXT [--report PATH]
 wrk joined JOB --pr URL --head SHA --report PATH
-wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders]
+wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders]
 wrk find <이름|라벨> [--pane-only]
 wrk name-sync [--apply|<라벨>...]
 wrk heavy -- <cmd>     # 호스트당 1개, 대기 상한 20분(rc 75), nice -n 10, load5/ncpu<1.0 게이트(hosts.toml [local] heavy_load_wait=false면 그 대기만 생략)
@@ -435,7 +435,13 @@ WRK_SENTINEL_HERDR_SESSION=worker wrk spawn -c ... -m ... --job <id>
 ```bash
 wrk reap --lane REAP_LANE              # dry-run: 닫을 목록만 출력
 wrk reap --lane REAP_LANE --apply      # 실제로 herdr tab close
+wrk reap --lane REAP_LANE --job JOB --apply  # 지정한 job만 실제 회수
 ```
+
+`--job`은 반복하거나 쉼표로 여러 id를 지정할 수 있으며, id 전체가 정확히 일치하는 잡만
+고려한다. 지정되지 않은 잡은 회수 후보와 skip 출력에서 모두 제외된다. `--apply`에서도
+현재 후보를 다시 확인하며, 지정한 잡이 더 이상 후보가 아니면 `reason=not-candidate`를
+출력하고 닫지 않는다. `--apply`에는 계속 `--lane`이 필요하다.
 
 회수 조건(**전부** 충족해야 후보):
 
