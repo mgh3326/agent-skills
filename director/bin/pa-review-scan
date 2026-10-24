@@ -11,6 +11,7 @@ OUTCOMES = {"accepted", "rework", "not-accepted", "excluded"}
 REASONS = {"quality", "scope", "superseded", "quota", "tooling", "host", "operator-cancel"}
 UNCOUNTED = {"quota", "tooling", "host", "operator-cancel"}
 COMMENT_PAGE_SIZE = 100
+TASK_PAGE_SIZE = 500
 V1 = re.compile(
     r"PA-REVIEW v1 task=(?P<task>[0-9]+) job=(?P<job>\S+) head=(?P<head>(?:[0-9a-f]{7,40}|none)) "
     r"outcome=(?P<outcome>accepted|rework|not-accepted|excluded) "
@@ -33,6 +34,8 @@ def cli_json(*args):
 
 
 def field(obj, *names, default=None):
+    if not isinstance(obj, dict):
+        return default
     for name in names:
         if name in obj:
             return obj[name]
@@ -65,10 +68,13 @@ def comments_for(task):
 def tasks_for_project(project, states):
     found = set()
     for state in states:
-        data = cli_json("tasks", "list", "--project", project, "--state", state)
+        data = cli_json("tasks", "list", "--project", project, "--state", state,
+                        "--limit", str(TASK_PAGE_SIZE))
         rows = field(data, "tasks", "items", default=[])
         if not isinstance(rows, list):
             raise RuntimeError(f"state {state}: task list response is not a list")
+        if len(rows) >= TASK_PAGE_SIZE:
+            raise RuntimeError(f"state {state}: task list may be truncated at {TASK_PAGE_SIZE} rows")
         for row in rows:
             task_id = field(row, "id", "task_id")
             if task_id is not None:
@@ -170,10 +176,10 @@ def main():
         parser.error("provide --task (repeatable) or --project")
     if args.project and not args.state:
         parser.error("--project requires at least one --state")
-    tasks = args.task if args.task else tasks_for_project(args.project, args.state)
     try:
+        tasks = args.task if args.task else tasks_for_project(args.project, args.state)
         result = scan(tasks, set(args.author or ["pa-integrator"]))
-    except (RuntimeError, OSError, ValueError) as exc:
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
         print(f"pa-review-scan: {exc}", file=sys.stderr)
         return 2
     if args.json:

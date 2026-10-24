@@ -151,15 +151,38 @@ class ScanTests(unittest.TestCase):
         self.assertIn("1 (derived)", result.stdout)
 
     def test_project_states_use_one_list_call_per_state(self):
-        result = self.run_scan("--project", "ParkingArcade", "--state", "open",
-                              "--state", "closed", "--json")
+        result = self.run_scan("--project", "ParkingArcade", "--state", "merged",
+                              "--state", "claimed", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
         self.assertEqual(data["tasks_scanned"], [1891, 1935])
         self.assertEqual(data["tasks"][0]["jobs"]["b1891"]["final"]["outcome"], "accepted")
         calls = self.call_log.read_text().splitlines()
-        self.assertEqual(calls, ["list|ParkingArcade|open", "list|ParkingArcade|closed",
+        self.assertEqual(calls, ["list|ParkingArcade|merged|500", "list|ParkingArcade|claimed|500",
                                  "1891|100|0", "1935|100|0"])
+
+    def test_project_full_task_list_fails_closed_without_partial_scan(self):
+        result = self.run_scan("--project", "TruncatedProject", "--state", "merged", "--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("state merged: task list may be truncated at 500 rows", result.stderr)
+        self.assertEqual(self.call_log.read_text().splitlines(),
+                         ["list|TruncatedProject|merged|500"])
+
+    def test_project_list_failure_has_clean_error(self):
+        self.env["PA_REVIEW_FAIL_LIST"] = "1"
+        result = self.run_scan("--project", "ParkingArcade", "--state", "merged", "--json")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("pa-review-scan: fixture list failure", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_non_dict_list_and_comment_rows_are_tolerated(self):
+        self.env["PA_REVIEW_NON_DICT"] = "1"
+        result = self.run_scan("--project", "ParkingArcade", "--state", "merged", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data["tasks_scanned"], [1935])
+        self.assertIn("b1935", data["tasks"][0]["jobs"])
 
     def test_comments_are_paged_until_short_page(self):
         fixture = json.loads(Path(self.env["PA_REVIEW_FIXTURE"]).read_text())
