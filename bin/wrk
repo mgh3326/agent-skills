@@ -145,7 +145,7 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|p
   wrk round verdict JOB --file PATH
   wrk round void JOB N --by REF [--reason TEXT]
   wrk round status JOB
-  wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
+  wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
   wrk find <name-or-label> [--pane-only]
@@ -1917,6 +1917,10 @@ with os.fdopen(lock_fd, "a+b") as lock_handle:
                 skip("timed out waiting for lock", parser_name)
             time.sleep(0.05)
     try:
+        # Replacing a leaf symlink would destroy the link instead of updating
+        # its target. Directory symlinks in CODEX_HOME remain supported.
+        if os.path.islink(config_path):
+            skip("symlinked-config", parser_name)
         raw = None
         try:
             with open(config_path, "rb") as handle:
@@ -1936,9 +1940,10 @@ with os.fdopen(lock_fd, "a+b") as lock_handle:
 
         header = ('[projects."%s"]' % cwd).encode("ascii")
         if parser is None:
-            if raw is not None and header in raw.splitlines():
-                log("exists", "", parser_name)
-                raise SystemExit(0)
+            # Without a parser, any mention is enough to avoid risking a
+            # duplicate table (including alternate quoting and spacing).
+            if raw is not None and cwd.encode("ascii") in raw:
+                skip("unparsed-mention", parser_name)
         elif raw is not None:
             existing = parse_toml(raw, config_path, parser_name)
             projects = existing.get("projects") if isinstance(existing, dict) else None
@@ -10540,7 +10545,7 @@ print(value if isinstance(value, str) else "")
 
 reap_help() {
   cat <<'USAGE'
-Usage: wrk reap [--lane LANE] [--grace DURATION] [--apply] [--include-builders|--include-captains]
+Usage: wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace DURATION] [--apply] [--include-builders|--include-captains]
 
 Close the herdr tabs of jobs that already reported a terminal event, so that
 finished worker/tester panes stop accumulating on the herdr server.
@@ -10570,6 +10575,8 @@ role=captain) are excluded unless --include-builders is given.
 
 Options:
   --lane LANE        only jobs whose claim owner_lane is LANE
+  --job JOB          only jobs whose id exactly matches JOB; repeatable or comma-separated.
+                     Unnamed jobs are omitted, including their skip lines.
   --grace DURATION   minimum age of the terminal event (10m, 600s, 2h, 600)
   --apply            actually close the tabs; without it reap only lists them.
                      Requires --lane: a lane-less --apply is refused (nonzero,
@@ -10770,6 +10777,19 @@ for job in jobs:
 PY
 }
 
+# Keep the selector at the output/close boundary: this suppresses every row for
+# unnamed jobs, including candidates with skip reasons, and protects --apply.
+reap_job_selected() {
+  local filter="$1" job="$2" candidate
+  local -a selected=()
+  [[ -n "$filter" ]] || return 0
+  IFS=',' read -r -a selected <<<"$filter"
+  for candidate in "${selected[@]}"; do
+    [[ "$candidate" == "$job" ]] && return 0
+  done
+  return 1
+}
+
 # "tab_id<TAB>pane_count" 목록. 회수는 잡의 탭만 닫아야 하고, pane 이 분할된 탭을
 # 닫으면 옆 pane 이 함께 죽는다(2026-07-20 실사고: 수동 스폰한 캡틴 pane 동반 사망).
 #
@@ -10829,11 +10849,18 @@ PY
 }
 
 reap_cmd() {
-  local lane="" grace="10m" apply=0 include_builders=0
+  local lane="" grace="10m" apply=0 include_builders=0 job_filter="" job_value
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) reap_help; return 0 ;;
       --lane) [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a value"; lane="$2"; shift 2 ;;
+      --job)
+        [[ $# -ge 2 && -n "$2" ]] || die "--job requires a non-empty value"
+        job_value="$2"
+        [[ ",$job_value," != *",,"* ]] || die "--job contains an empty job id"
+        if [[ -n "$job_filter" ]]; then job_filter+=","; fi
+        job_filter+="$job_value"
+        shift 2 ;;
       --grace) [[ $# -ge 2 && -n "$2" ]] || die "--grace requires a value"; grace="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
       --include-builders|--include-captains) include_builders=1; shift ;;
@@ -10857,8 +10884,25 @@ reap_cmd() {
   candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
   local job owner pane tab age note hub_lane hub_lane_machine lane_role probe class token probe_tab verdict acted=0 release_rc=0
+  local -a selected_jobs=()
+  if [[ -n "$job_filter" && "$apply" -eq 1 ]]; then
+    local selected_job selected_seen
+    IFS=',' read -r -a selected_jobs <<<"$job_filter"
+    for selected_job in "${selected_jobs[@]}"; do
+      selected_seen=0
+      while IFS=$'\t' read -r job _; do
+        [[ "$job" == "$selected_job" ]] && selected_seen=1
+      done <<<"$candidates"
+      [[ "$selected_seen" -eq 1 ]] || echo "skip job=$selected_job reason=not-candidate"
+    done
+  fi
   while IFS=$'\t' read -r job owner pane tab age note hub_lane hub_lane_machine lane_role; do
     [[ -n "$job" ]] || continue
+    if [[ "$apply" -eq 1 ]]; then
+      if ! reap_job_selected "$job_filter" "$job"; then continue; fi # hk1823-apply-job-filter
+    else
+      if ! reap_job_selected "$job_filter" "$job"; then continue; fi
+    fi
     if [[ -n "$note" && "$note" != - ]]; then
       echo "skip job=$job reason=$note"
       continue
@@ -10884,7 +10928,13 @@ reap_cmd() {
     fi
     case "$token" in
       idle|done) ;;
-      *) echo "skip job=$job pane=$pane reason=status=$token"; continue ;;
+      *)
+        if [[ -n "$job_filter" && "$apply" -eq 1 ]]; then
+          echo "skip job=$job reason=not-candidate"
+        else
+          echo "skip job=$job pane=$pane reason=status=$token"
+        fi
+        continue ;;
     esac
     [[ -n "$tab" ]] || tab="$probe_tab"
     if [[ -z "$tab" ]]; then
