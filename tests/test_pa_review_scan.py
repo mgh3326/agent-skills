@@ -29,6 +29,7 @@ class ScanTests(unittest.TestCase):
         stub.chmod(0o755)
         fixture = root / "comments.json"
         shutil.copyfile(FIXTURE, fixture)
+        self.call_log = root / "calls.txt"
         self.env = os.environ.copy()
         self.env.update({
             "HOME": str(self.home), "XDG_CACHE_HOME": str(root / "cache"),
@@ -36,6 +37,7 @@ class ScanTests(unittest.TestCase):
             "XDG_STATE_HOME": str(root / "state"), "CODEX_HOME": str(root / "codex"),
             "ARBITER_INBOX_ROOT": str(root / "inbox"), "TMPDIR": str(root / "tmp"),
             "WRK_TEST_MODE": "1", "PA_REVIEW_FIXTURE": str(fixture),
+            "PA_REVIEW_CALL_LOG": str(self.call_log),
             "PATH": str(bindir) + os.pathsep + os.environ.get("PATH", ""),
         })
 
@@ -108,6 +110,17 @@ class ScanTests(unittest.TestCase):
                               "--state", "closed", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["tasks_scanned"], [1891, 1935])
+
+    def test_comments_are_paged_until_short_page(self):
+        fixture = json.loads(Path(self.env["PA_REVIEW_FIXTURE"]).read_text())
+        fixture = [{"id": index, "task_id": 1935, "author": "pa-integrator",
+                    "created_at": f"2026-10-24T10:{index // 60:02d}:{index % 60:02d}Z",
+                    "body": "ordinary note"} for index in range(1, 206)]
+        Path(self.env["PA_REVIEW_FIXTURE"]).write_text(json.dumps(fixture))
+        result = self.run_scan("--task", "1935", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = self.call_log.read_text().splitlines()
+        self.assertEqual(calls, ["1935|100|0", "1935|100|100", "1935|100|200"])
 
     def test_fixture_has_real_early_examples(self):
         rows = json.loads(FIXTURE.read_text())

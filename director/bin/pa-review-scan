@@ -10,6 +10,7 @@ import sys
 OUTCOMES = {"accepted", "rework", "not-accepted", "excluded"}
 REASONS = {"quality", "scope", "superseded", "quota", "tooling", "host", "operator-cancel"}
 UNCOUNTED = {"quota", "tooling", "host", "operator-cancel"}
+COMMENT_PAGE_SIZE = 100
 V1 = re.compile(
     r"PA-REVIEW v1 task=(?P<task>[0-9]+) job=(?P<job>\S+) head=(?P<head>(?:[0-9a-f]{7,40}|none)) "
     r"outcome=(?P<outcome>accepted|rework|not-accepted|excluded) "
@@ -39,11 +40,26 @@ def field(obj, *names, default=None):
 
 
 def comments_for(task):
-    data = cli_json("tasks", "comments", str(task))
-    rows = field(data, "comments", "items", default=[])
-    if not isinstance(rows, list):
-        raise RuntimeError(f"task {task}: comments response is not a list")
-    return rows
+    rows = []
+    after_id = None
+    while True:
+        args = ["tasks", "comments", str(task), "--limit", str(COMMENT_PAGE_SIZE)]
+        if after_id is not None:
+            args.extend(["--after-id", str(after_id)])
+        data = cli_json(*args)
+        page = field(data, "comments", "items", default=[])
+        if not isinstance(page, list):
+            raise RuntimeError(f"task {task}: comments response is not a list")
+        rows.extend(page)
+        if len(page) < COMMENT_PAGE_SIZE:
+            return rows
+        try:
+            next_id = max(int(field(row, "id", "comment_id")) for row in page)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"task {task}: full comments page has no valid ids") from exc
+        if after_id is not None and next_id <= after_id:
+            raise RuntimeError(f"task {task}: comment pagination did not advance")
+        after_id = next_id
 
 
 def tasks_for_project(project, states):
