@@ -19,6 +19,8 @@ class RoundExtensionSpawn(unittest.TestCase):
         self.env = {"PATH": os.environ["PATH"], "HOME": str(self.base), "CODEX_HOME": str(self.base / "codex"),
                     "HK_TASK_ID": "1632", "ARBITER_INBOX_ROOT": str(self.base / "jobs"),
                     "HANDOFFKEEP_BIN": str(self.base / "hk"),
+                    # hk 1894: round_ext_precheck honours these temp overrides only in test mode.
+                    "WRK_TEST_MODE": "1", "TMPDIR": tempfile.gettempdir(),
                     "SCOPEFUEL_BIN": str(self.base / "scopefuel"),
                     "CALL_LOG": str(self.log)}
         old = json.loads((ROOT / "tests/fixtures/scopefuel-hk1632-builder.json").read_text())
