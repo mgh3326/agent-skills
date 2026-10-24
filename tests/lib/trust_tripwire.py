@@ -13,8 +13,9 @@ install() patches the stat, open, listing and rename families of os, builtins
 and io, and subprocess.Popen, so any call whose path (lexically normalized, never
 resolved, so the guard itself touches nothing) lies under a trust location is
 recorded and raises AssertionError before the real call runs. The locations are
-taken under the passwd home as spelled and through realpath, so a symlinked home
-cannot be reached under its other name. With fake_home it also makes
+taken under each home form as spelled and through realpath, so neither a
+symlinked home nor a symlinked location can be reached under another name.
+With fake_home it also makes
 pwd.getpwuid(<own uid>) answer fake_home as the home directory.
 """
 import builtins
@@ -38,7 +39,12 @@ def trust_roots():
     homes = [home]
     if os.path.realpath(home) != home:
         homes.append(os.path.realpath(home))
-    return tuple(os.path.join(form, rel) for form in homes for rel in TRIP_RELATIVE)
+    roots = [os.path.join(form, rel) for form in homes for rel in TRIP_RELATIVE]
+    for location in tuple(roots):
+        resolved = os.path.realpath(location)
+        if resolved != location:
+            roots.append(resolved)
+    return tuple(dict.fromkeys(roots))
 
 
 def trips():
