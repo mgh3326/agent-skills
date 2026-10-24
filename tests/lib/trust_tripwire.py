@@ -12,8 +12,10 @@ loudly instead of by convention.
 install() patches the stat, open, listing and rename families of os, builtins
 and io, and subprocess.Popen, so any call whose path (lexically normalized, never
 resolved, so the guard itself touches nothing) lies under a trust location is
-recorded and raises AssertionError before the real call runs. With fake_home it
-also makes pwd.getpwuid(<own uid>) answer fake_home as the home directory.
+recorded and raises AssertionError before the real call runs. The locations are
+taken under the passwd home as spelled and through realpath, so a symlinked home
+cannot be reached under its other name. With fake_home it also makes
+pwd.getpwuid(<own uid>) answer fake_home as the home directory.
 """
 import builtins
 import io
@@ -33,7 +35,10 @@ def real_home():
 
 def trust_roots():
     home = real_home()
-    return tuple(os.path.join(home, rel) for rel in TRIP_RELATIVE)
+    homes = [home]
+    if os.path.realpath(home) != home:
+        homes.append(os.path.realpath(home))
+    return tuple(os.path.join(form, rel) for form in homes for rel in TRIP_RELATIVE)
 
 
 def trips():
@@ -78,10 +83,11 @@ def _wrap(owner, name, count):
     _state["originals"].append((owner, name, original))
 
 
-def install(log=None, fake_home=None):
+def install(log=None, fake_home=None, home=None):
+    """home overrides the passwd home the locations are taken from (tests only)."""
     if _state["originals"]:
         raise RuntimeError("trust tripwire already installed")
-    _state["real_home"] = pwd.getpwuid(os.getuid()).pw_dir
+    _state["real_home"] = home or pwd.getpwuid(os.getuid()).pw_dir
     _state["roots"] = trust_roots()
     _state["trips"] = []
     _state["log"] = log
@@ -128,3 +134,4 @@ def uninstall():
         setattr(owner, name, original)
     _state["roots"] = ()
     _state["log"] = None
+    _state.pop("real_home", None)

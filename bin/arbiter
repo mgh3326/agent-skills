@@ -143,6 +143,15 @@ def trust_canonical(home):
     }
 
 
+def trust_homes(home):
+    # The passwd home as spelled and through realpath: a symlinked home reaches
+    # the same places under both names.
+    forms = [home] if home else []
+    if home and os.path.realpath(home) != home:
+        forms.append(os.path.realpath(home))
+    return forms
+
+
 def trust_temp_roots(env, home):
     roots = []
     tmpdir = trust_value(env, "TMPDIR")
@@ -150,7 +159,7 @@ def trust_temp_roots(env, home):
         resolved = os.path.realpath(tmpdir)
         # TMPDIR naming the filesystem root, the home or a parent of it would
         # make every path a temp path.
-        if resolved != "/" and not (home and trust_under(home, resolved)):
+        if resolved != "/" and not any(trust_under(form, resolved) for form in trust_homes(home)):
             roots.append(resolved)
     for fixed in TRUST_SYSTEM_TEMP_ROOTS:
         for form in (fixed, os.path.realpath(fixed)):

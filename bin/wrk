@@ -4904,12 +4904,12 @@ wrk_jobs_root() {
 # The round cap, the grant check and the inherited-round read are only as
 # trustworthy as the events inbox and the handoffkeep binary they read, and both
 # used to follow the caller's environment: one variable redirected them (hk 1447
-# r1 N3, r2 S3). A trust-bearing operation (wrk round open/verdict/void/status,
-# round_ext_precheck and its recheck, the takeover round read) calls
-# wrk_trust_guard before its first read. The guard takes the inbox and the grant
-# binary from the passwd home of the current uid, never from HOME, and refuses
-# (rc 2, one stderr line naming the variable and the canonical path) when
-# HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME or HANDOFFKEEP_BIN names anything
+# r1 N3, r2 S3). A trust-bearing operation (wrk round open/verdict/void/status/
+# audit, wrk joined, round_ext_precheck and its recheck, the takeover round
+# read) calls wrk_trust_guard before its first read. The guard takes the inbox
+# and the grant binary from the passwd home of the current uid, never from HOME,
+# and refuses (rc 2, one stderr line naming the variable and the canonical path)
+# when HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME or HANDOFFKEEP_BIN names anything
 # else; the PATH lookup of handoffkeep is never used. WRK_TEST_MODE=1 (test
 # suites only) honours overrides that resolve under a temp root and prints one
 # warning line. This narrows, it does not bound: the same OS user can still edit
@@ -4952,6 +4952,15 @@ def trust_canonical(home):
     }
 
 
+def trust_homes(home):
+    # The passwd home as spelled and through realpath: a symlinked home reaches
+    # the same places under both names.
+    forms = [home] if home else []
+    if home and os.path.realpath(home) != home:
+        forms.append(os.path.realpath(home))
+    return forms
+
+
 def trust_temp_roots(env, home):
     roots = []
     tmpdir = trust_value(env, "TMPDIR")
@@ -4959,7 +4968,7 @@ def trust_temp_roots(env, home):
         resolved = os.path.realpath(tmpdir)
         # TMPDIR naming the filesystem root, the home or a parent of it would
         # make every path a temp path.
-        if resolved != "/" and not (home and trust_under(home, resolved)):
+        if resolved != "/" and not any(trust_under(form, resolved) for form in trust_homes(home)):
             roots.append(resolved)
     for fixed in TRUST_SYSTEM_TEMP_ROOTS:
         for form in (fixed, os.path.realpath(fixed)):
@@ -5232,9 +5241,13 @@ delegate_job_cmd() {
 # revive, or empty when the job is still open. End kinds are job.revoked,
 # job.reaped and job.handed_off. Revive kinds are job.claim, job.reclaim and
 # job.spawned. Order is wrk_events_ordered.
+# hk 1894: ROOT is the checked inbox root. Trust-bearing callers (wrk joined,
+# round open, void, verdict) pass ${WRK_TRUST_JOBS_ROOT:?}; with no ROOT the
+# environment-following wrk_jobs_root is used, as before.
 wrk_newer_end_record() {
-  local job="$1"
-  wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
+  local job="$1" root="${2:-}"
+  [[ -n "$root" ]] || root="$(wrk_jobs_root)"
+  wrk_py - "$root/$job/events" <<'PY'
 import os, sys
 exec(os.environ["WRK_EVENTS_PY"])
 print(wrk_end_declaration(sys.argv[1]))
@@ -5242,8 +5255,8 @@ PY
 }
 
 wrk_refuse_ended() {
-  local what="$1" job="$2" end
-  end="$(wrk_newer_end_record "$job")"
+  local what="$1" job="$2" root="${3:-}" end
+  end="$(wrk_newer_end_record "$job" "$root")"
   [[ -z "$end" ]] || die "$what: refused after end record $end"
 }
 
@@ -5253,8 +5266,9 @@ wrk_refuse_ended() {
 # Symlinks and subdirectories are ignored.
 # A job.verdict matches by absolute path or by content sha256.
 wrk_join_blocks() {
-  local job="$1"
-  wrk_py - "$(wrk_jobs_root)/$job/events" "$(wrk_jobs_root)/$job" "$job" <<'PY'
+  local job="$1" root="${2:-}"
+  [[ -n "$root" ]] || root="$(wrk_jobs_root)"
+  wrk_py - "$root/$job/events" "$root/$job" "$job" <<'PY'
 import hashlib, os, stat, sys
 exec(os.environ["WRK_EVENTS_PY"])
 events, job_dir, job = sys.argv[1:]
@@ -5304,9 +5318,9 @@ PY
 }
 
 wrk_joined_refuse_blocks() {
-  local job="$1" blocks line tag rest zero=0
+  local job="$1" root="${2:-}" blocks line tag rest zero=0
   local -a files=()
-  blocks="$(wrk_join_blocks "$job")"
+  blocks="$(wrk_join_blocks "$job" "$root")"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue
     tag="${line%%$'\t'*}"
@@ -5371,8 +5385,9 @@ wrk_builder_rounds_warning() {
 }
 
 wrk_recorded_rounds() {
-  local job="$1"
-  wrk_py - "$(wrk_jobs_root)/$job/events" "$job" <<'PY'
+  local job="$1" root="${2:-}"
+  [[ -n "$root" ]] || root="$(wrk_jobs_root)"
+  wrk_py - "$root/$job/events" "$job" <<'PY'
 import os, sys
 exec(os.environ["WRK_EVENTS_PY"])
 events, job = sys.argv[1:]
@@ -5382,8 +5397,9 @@ PY
 }
 
 wrk_job_role() {
-  local job="$1"
-  wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
+  local job="$1" root="${2:-}"
+  [[ -n "$root" ]] || root="$(wrk_jobs_root)"
+  wrk_py - "$root/$job/events" <<'PY'
 import os, sys
 exec(os.environ["WRK_EVENTS_PY"])
 print(wrk_claim_role(sys.argv[1]))
@@ -5577,17 +5593,20 @@ joined_cmd() {
     esac
   fi
   local metadata owner label pane parent role reason joined_end
-  metadata="$(builder_metadata "$job")"
+  # hk 1894: the join gate (end record, rounds, verdict files) and the parent
+  # lane are read from the checked inbox, never from the environment.
+  wrk_trust_guard
+  metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
   # hk1449-joined-end
-  joined_end="$(wrk_newer_end_record "$job")"
+  joined_end="$(wrk_newer_end_record "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"
   [[ -z "$joined_end" ]] || die "joined: refused after end record $joined_end"
   # A waiver is recorded on wrk's own job.joined, so it must not be forwarded
   # and must not take the delegated path. Without it, delegate exactly as before.
   if [[ -z "$waived" ]]; then
-    wrk_joined_refuse_blocks "$job"
+    wrk_joined_refuse_blocks "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
     delegate_job_cmd joined "$job" --pr "$pr" --head "$head" --report "$report"
   fi
   upload_report_document "$job" "$report"
@@ -5596,7 +5615,7 @@ joined_cmd() {
   # newest work-terminal — appending again would duplicate it. Same shape as
   # done's duplicate branch: warn, skip the write+emit, still settle the job.
   local joined_term
-  joined_term="$(job_events_scan "$(wrk_jobs_root)/$job/events" 2>/dev/null | awk -F'\t' '{print $4}')"
+  joined_term="$(job_events_scan "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" 2>/dev/null | awk -F'\t' '{print $4}')"
   if [[ "$joined_term" == "job.joined" ]]; then
     warn "job.joined already recorded for $job; suppressed duplicate"
     job_end_housekeeping "$job" "$owner" joined "wrk joined (duplicate)" "wrk joined" "$pane"
@@ -5700,14 +5719,15 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       grant in hk:doc/<key> or hk:task/<id>. The grant line is the default
       reason; --reason overrides it. Voids release one cap slot.
 
-Trust paths (hk 1894). These commands, the --round-ext prechecks and the
-takeover round read take the events inbox (<home>/work/herdr-inbox/jobs), the
-arbiter DB (<home>/.local/share/arbiter/state.db) and the grant-fetching
-handoffkeep (<home>/.local/bin/handoffkeep: a regular file owned by the user,
-not group- or world-writable) from the passwd home of the current user, never
-from $HOME. HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME or HANDOFFKEEP_BIN naming
-anything else is refused with exit 2 (one line naming the variable and the
-canonical path); PATH is never searched for handoffkeep. WRK_TEST_MODE=1 is for
+Trust paths (hk 1894). These commands, wrk joined (its end check and round
+gate), the --round-ext prechecks and the takeover round read take the events
+inbox (<home>/work/herdr-inbox/jobs), the arbiter DB
+(<home>/.local/share/arbiter/state.db) and the grant-fetching handoffkeep
+(<home>/.local/bin/handoffkeep: a regular file owned by the user, not group- or
+world-writable) from the passwd home of the current user, never from $HOME.
+HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME or HANDOFFKEEP_BIN naming anything else
+is refused with exit 2 (one line naming the variable and the canonical path);
+PATH is never searched for handoffkeep. WRK_TEST_MODE=1 is for
 the test suites: it honours overrides that resolve under a temp root and warns
 once. This narrows, it does not bound: the same OS user can still edit files
 under the real home or set WRK_TEST_MODE with temp paths.
@@ -6056,7 +6076,7 @@ round_open_cmd() {
   if [[ -n "$extend" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  wrk_refuse_ended "round open" "$job"
+  wrk_refuse_ended "round open" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   if ! repo="$(round_repo_resolve "$job" "$repo_override")"; then
     if [[ -n "$repo_override" ]]; then
       die "round open: --repo $repo_override is not a usable git repository"
@@ -6218,7 +6238,7 @@ round_void_cmd() {
   wrk_trust_guard hk
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  wrk_refuse_ended "round void" "$job"
+  wrk_refuse_ended "round void" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
 
   local tmp_approval grant grant_issuer
   tmp_approval="$(mktemp)"
@@ -6313,7 +6333,7 @@ round_verdict_cmd() {
   wrk_trust_guard
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  wrk_refuse_ended "round verdict" "$job"
+  wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   local outcome rc=0
   set +e
   outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
@@ -6504,8 +6524,11 @@ round_audit_cmd() {
       *) die "unknown round audit option '$1'" ;;
     esac
   done
+  # hk 1894: the audit reads the canonical inbox, so a redirected inbox cannot
+  # make a builder with no recorded rounds look clean.
+  wrk_trust_guard
   local jobs_root
-  jobs_root="$(wrk_jobs_root)"
+  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   [[ -d "$jobs_root" ]] || return 0
   local job_dir job scan ended owner lane_ok role recorded blocks line tag rest
   while IFS= read -r job_dir; do
@@ -6523,8 +6546,8 @@ round_audit_cmd() {
     if [[ "$lane_ok" -ne 1 ]]; then
       continue
     fi
-    role="$(wrk_job_role "$job")"
-    recorded="$(wrk_recorded_rounds "$job")"
+    role="$(wrk_job_role "$job" "$jobs_root")"
+    recorded="$(wrk_recorded_rounds "$job" "$jobs_root")"
     case "$role" in
       builder|captain)
         if [[ "$ended" == "0" && "$recorded" == "0" ]]; then
@@ -6532,7 +6555,7 @@ round_audit_cmd() {
         fi
         ;;
     esac
-    blocks="$(wrk_join_blocks "$job")"
+    blocks="$(wrk_join_blocks "$job" "$jobs_root")"
     while IFS= read -r line; do
       [[ -n "$line" ]] || continue
       tag="${line%%$'\t'*}"

@@ -11,6 +11,9 @@
 #   flow-parking-arcade-join
 #   hk1506-binding-unchanged
 set -euo pipefail
+# hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
+# (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
@@ -493,7 +496,12 @@ open_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$AU
 snap_tree "$AUDIT" "$TMP/audit-before"
 run_cmd env ARBITER_INBOX_ROOT="$AUDIT" "$WRK" round audit
 assert_rc 0
-[[ ! -s "$TMP/run.err" ]] || fail "audit must write nothing on stderr: $(cat "$TMP/run.err")"
+# hk 1894: audit reads the checked inbox, so in test mode its stderr is the guard's one
+# override warning and nothing else.
+[[ "$(grep -vc '^wrk: warning: test mode honours overridden ' "$TMP/run.err" || true)" -eq 0 ]] ||
+  fail "audit must write nothing but the test-mode warning on stderr: $(cat "$TMP/run.err")"
+[[ "$(grep -c '^wrk: warning: test mode honours overridden ' "$TMP/run.err" || true)" -eq 1 ]] ||
+  fail "audit must print the test-mode override warning once: $(cat "$TMP/run.err")"
 printf '%s\n' \
   "unmatched-verdict job=audit-ended file=$ended_abs" \
   "zero-rounds job=audit-lane-b lane=lane-b" \

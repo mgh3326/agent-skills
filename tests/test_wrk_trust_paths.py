@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -444,6 +445,26 @@ class DecisionCase(unittest.TestCase):
         for expected in ("/tmp", "/private/tmp", "/var/folders", "/private/var/folders"):
             self.assertIn(expected, roots)
 
+    def check_test_mode_symlinked_home_tmpdir(self, impl):
+        real = self.base / "realhome"
+        real.mkdir()
+        link = self.base / "homelink"
+        link.symlink_to(real)
+        with impl.system_roots(()):
+            # the passwd home is spelled through a symlink; TMPDIR is its target or the symlink itself
+            for label, tmpdir in (("the home target", real), ("the home symlink", link)):
+                self.refused(impl, self.temp_env(TMPDIR=tmpdir, ARBITER_INBOX_ROOT=real / "inbox"),
+                             "ARBITER_INBOX_ROOT", "TMPDIR is " + label, test_mode=True, home=str(link))
+            # the home's parent through the same alias
+            self.refused(impl, self.temp_env(TMPDIR=self.base, ARBITER_INBOX_ROOT=self.base / "x"),
+                         "ARBITER_INBOX_ROOT", "TMPDIR is the parent", test_mode=True, home=str(link))
+            # a TMPDIR below an aliased home is still an ordinary temp root
+            below = real / "scratch"
+            below.mkdir()
+            out = self.resolve(impl, self.temp_env(TMPDIR=below, ARBITER_INBOX_ROOT=below / "inbox",
+                                                   XDG_DATA_HOME=below / "data"), test_mode=True, home=str(link))
+            self.assertEqual(out["inbox"], str(below / "inbox"))
+
     def check_test_mode_control_chars(self, impl):
         with impl.system_roots(()):
             exc = self.refused(impl, self.temp_env(ARBITER_INBOX_ROOT="%s/a\nb" % self.tmp),
@@ -508,6 +529,9 @@ class DecisionCase(unittest.TestCase):
 
     def test_test_mode_tmpdir_that_contains_the_home_is_not_a_root(self):
         self.each(self.check_test_mode_tmpdir_guards)
+
+    def test_test_mode_tmpdir_exclusion_covers_a_symlinked_passwd_home(self):
+        self.each(self.check_test_mode_symlinked_home_tmpdir)
 
     def test_test_mode_control_characters_are_refused(self):
         self.each(self.check_test_mode_control_chars)
@@ -577,8 +601,17 @@ class DecisionCase(unittest.TestCase):
                   "        resolved = os.path.realpath(effective)\n        if canonical and resolved == os.path.realpath(canonical):\n            return canonical\n        if not test_mode:"),
                  self.check_test_mode_never_canonical)
 
+    def test_mutant_tmpdir_exclusion_compares_only_the_spelled_home(self):
+        self.red(('        if resolved != "/" and not any(trust_under(form, resolved) for form in trust_homes(home)):',
+                  '        if resolved != "/" and not (home and trust_under(home, resolved)):'),
+                 self.check_test_mode_symlinked_home_tmpdir)
+
+    def test_mutant_home_forms_drop_the_resolved_home(self):
+        self.red(('    if home and os.path.realpath(home) != home:\n        forms.append(os.path.realpath(home))\n',
+                  '    pass\n'), self.check_test_mode_symlinked_home_tmpdir)
+
     def test_mutant_tmpdir_may_contain_the_home(self):
-        self.red(('        if resolved != "/" and not (home and trust_under(home, resolved)):',
+        self.red(('        if resolved != "/" and not any(trust_under(form, resolved) for form in trust_homes(home)):',
                   "        if True:"), self.check_test_mode_tmpdir_guards)
 
 
@@ -635,6 +668,34 @@ class TripwireCase(unittest.TestCase):
         out = subprocess.run([sys.executable, "-c", "import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)"],
                              env=quiet, capture_output=True, text=True, check=True)
         self.assertEqual(out.stdout.strip(), REAL_HOME)
+
+
+    def tripwire_covers_aliased_home(self, module):
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        real = base / "real"
+        (real / ".local" / "bin").mkdir(parents=True)
+        link = base / "link"
+        link.symlink_to(real)
+        module.install(home=str(link))
+        try:
+            for spelled in (link, real):
+                with self.assertRaises(AssertionError):
+                    os.lstat(str(spelled / ".local" / "bin"))
+            os.stat(str(real))
+        finally:
+            module.uninstall()
+
+    def test_tripwire_covers_a_symlinked_passwd_home_under_both_names(self):
+        self.tripwire_covers_aliased_home(trust_tripwire)
+
+    def test_mutant_tripwire_roots_drop_the_resolved_home(self):
+        source = (ROOT / "tests" / "lib" / "trust_tripwire.py").read_text(encoding="utf-8")
+        mutant = types.ModuleType("trust_tripwire_mutant")
+        exec(compile(mutate(source, "    if os.path.realpath(home) != home:\n        homes.append(os.path.realpath(home))\n", ""),
+                     "trust_tripwire_mutant", "exec"), mutant.__dict__)
+        with self.assertRaises(AssertionError):
+            self.tripwire_covers_aliased_home(mutant)
 
 
 # ---------------------------------------------------------------------------
@@ -697,6 +758,8 @@ class World:
         self.tmp = self.base / "tmp"
         self.tmp.mkdir()
         self.trip = self.base / "tripwire.log"
+        self.report = self.base / "report.md"
+        self.report.write_text("report\n")
         self.repo, self.heads = case.repo, case.heads
         self.docs = {}
         self.install_canonical_hk()
@@ -724,6 +787,22 @@ class World:
         (events / "00001-job.claim.json").write_text(json.dumps({
             "created_at": "2026-10-01T00:00:00Z", "job_id": job, "kind": "job.claim", "payload": payload, "seq": 1}) + "\n")
         return events
+
+    def seed_round(self, root, job, number=1):
+        events = Path(root) / job / "events"
+        events.mkdir(parents=True, exist_ok=True)
+        (events / ("%05d-job.round.json" % (number + 1))).write_text(json.dumps({
+            "kind": "job.round", "job_id": job, "round": number, "head": "a" * 40,
+            "created_at": "2026-10-23T00:00:%02dZ" % number}) + "\n")
+
+    def end_job(self, root, job, name="00009-job.revoked.json"):
+        (Path(root) / job / "events" / name).write_text(json.dumps({
+            "kind": "job.revoked", "job_id": job, "created_at": "2026-10-23T06:00:00Z"}) + "\n")
+        return name
+
+    def joined(self, wrk, job, test=False, **extra):
+        return self.wrk(wrk, "joined", job, "--pr", "https://example.invalid/pr/242", "--head", self.heads[0],
+                        "--report", self.report, test=test, **extra)
 
     def env(self, test=False, **extra):
         env = {"PATH": safe_path(), "HOME": str(self.pw_home), "PYTHONPATH": str(HOOK),
@@ -1011,6 +1090,173 @@ class RealBinaryCase(unittest.TestCase):
     def test_inherited_guard_state_cannot_stand_in_for_the_guard(self):
         self.repro_inherited_guard_state(self.lib())
 
+    # -- hk 1449 readers: the join gate, the end check, the audit and the helpers they use --
+
+    def repro_joined_redirect(self, wrk):
+        """wrk joined reads its gate from the checked inbox: a redirect is refused, the canonical stream decides."""
+        w = self.w
+        w.mkjob(w.jobs, "jobj")                       # canonical stream: no rounds, the gate refuses
+        w.mkjob(w.build, "jobj")
+        w.seed_round(w.build, "jobj")              # builder-made copy: a round, nothing unmatched
+        before = (tree(w.jobs), tree(w.build))
+        db = w.pw_home / ".local" / "share" / "arbiter" / "state.db"
+        for var, value, canonical in (("ARBITER_INBOX_ROOT", w.build, w.jobs), ("XDG_DATA_HOME", w.build / "xdg", db),
+                                      ("HOME", w.build / "home", w.pw_home)):
+            out = w.joined(wrk, "jobj", **{var: value})
+            self.refusal_line(out, var, canonical)
+        self.assertEqual((tree(w.jobs), tree(w.build)), before)
+        out = w.joined(wrk, "jobj")
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("job jobj has zero non-voided recorded rounds", out.stderr)
+        self.assertEqual(tree(w.build), before[1])
+
+    def test_joined_redirect_refused_then_honoured_in_test_mode(self):
+        self.repro_joined_redirect(self.wrk)
+        w = self.w
+        tbuild = w.tmp / "builder"
+        w.mkjob(tbuild, "jobt")
+        w.seed_round(tbuild, "jobt")
+        out = w.joined(self.wrk, "jobt", test=True, ARBITER_INBOX_ROOT=tbuild, HOME=w.tmp / "home",
+                       XDG_DATA_HOME=w.tmp / "data")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("kind=job.joined", out.stdout)
+        warnings = [line for line in out.stderr.splitlines() if "test mode honours" in line]
+        self.assertEqual(len(warnings), 1, out.stderr)
+
+    def repro_end_check_redirect(self, wrk):
+        """The end declaration is read from the checked inbox by joined, open, verdict and void."""
+        w = self.w
+        w.mkjob(w.jobs, "jobe")
+        w.seed_round(w.jobs, "jobe")
+        end = w.end_job(w.jobs, "jobe")            # ended in the canonical stream
+        w.mkjob(w.build, "jobe")
+        w.seed_round(w.build, "jobe")              # still open in the builder-made copy
+        verdict = w.base / "verdict.md"
+        verdict.write_text("VERDICT: PASS @%s\n" % w.heads[0])
+        ops = {"joined": ["joined", "jobe", "--pr", "https://example.invalid/pr/242", "--head", w.heads[0],
+                          "--report", str(w.report)],
+               "round open": ["round", "open", "jobe", "--head", w.heads[1]],
+               "round verdict": ["round", "verdict", "jobe", "--file", str(verdict)]}
+        before = (tree(w.jobs), tree(w.build))
+        for label, argv in ops.items():
+            out = w.wrk(wrk, *argv, ARBITER_INBOX_ROOT=w.build)
+            self.refusal_line(out, "ARBITER_INBOX_ROOT", w.jobs)
+            out = w.wrk(wrk, *argv)
+            self.assertEqual(out.returncode, 2, label + ": " + out.stderr)
+            self.assertIn("%s: refused after end record %s" % (label, end), out.stderr)
+        self.assertEqual((tree(w.jobs), tree(w.build)), before)
+
+    def test_end_check_redirect_refused_and_canonical_end_record_refuses(self):
+        self.repro_end_check_redirect(self.wrk)
+
+    def repro_join_gate_checked_root(self, wrk):
+        """The gate matches a verdict file recorded without a content digest by absolute path: it must use the
+        checked root, not the spelling the environment used for the same directory."""
+        w = self.w
+        link = w.base / "pwlink"
+        link.symlink_to(w.pw_home)
+        events = w.mkjob(w.jobs, "jobg")
+        w.seed_round(w.jobs, "jobg")
+        verdict = w.jobs / "jobg" / "verdict.md"
+        verdict.write_text("VERDICT: PASS @%s\n" % w.heads[0])
+        (events / "00003-job.verdict.json").write_text(json.dumps({
+            "kind": "job.verdict", "job_id": "jobg", "round": 1, "verdict": "PASS", "head": w.heads[0],
+            "path": str(verdict), "created_at": "2026-10-23T00:10:00Z"}) + "\n")
+        out = w.joined(wrk, "jobg", ARBITER_INBOX_ROOT="%s/work/herdr-inbox/jobs" % link)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("OK job=jobg", out.stdout)
+
+    def test_join_gate_uses_the_checked_root_not_the_environment_spelling(self):
+        self.repro_join_gate_checked_root(self.wrk)
+
+    def repro_audit_redirect(self, wrk):
+        w = self.w
+        w.mkjob(w.jobs, "jobz")                       # canonical: a builder job with no recorded rounds
+        w.mkjob(w.build, "jobz")
+        w.seed_round(w.build, "jobz")              # builder-made copy that looks clean
+        before = (tree(w.jobs), tree(w.build))
+        out = w.wrk(wrk, "round", "audit", ARBITER_INBOX_ROOT=w.build)
+        self.refusal_line(out, "ARBITER_INBOX_ROOT", w.jobs)
+        out = w.wrk(wrk, "round", "audit")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "zero-rounds job=jobz lane=jobz-lane")
+        self.assertEqual((tree(w.jobs), tree(w.build)), before)
+
+    def test_round_audit_redirect_refused_then_honoured_in_test_mode(self):
+        self.repro_audit_redirect(self.wrk)
+        w = self.w
+        tbuild = w.tmp / "builder"
+        w.mkjob(tbuild, "jobt")
+        out = w.wrk(self.wrk, "round", "audit", test=True, ARBITER_INBOX_ROOT=tbuild, HOME=w.tmp / "home",
+                    XDG_DATA_HOME=w.tmp / "data")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "zero-rounds job=jobt lane=jobt-lane")
+
+    HELPERS = ('set -euo pipefail; . "$1"; r="$2"; '
+               'echo "end=$(wrk_newer_end_record jobr "$r")"; echo "rounds=$(wrk_recorded_rounds jobr "$r")"; '
+               'echo "role=$(wrk_job_role jobr "$r")"; echo "blocks=$(wrk_join_blocks jobr "$r" | tr "\\t\\n" "  ")"; '
+               '( wrk_refuse_ended "gate" jobr "$r" ) 2>&1 || true')
+
+    def repro_checked_root_contract(self, lib):
+        """Each hk 1449 reader reads the root it is handed even when ARBITER_INBOX_ROOT names another inbox."""
+        w = self.w
+        w.mkjob(w.jobs, "jobr")                       # the checked root: builder, two rounds, ended, one unmatched verdict
+        w.seed_round(w.jobs, "jobr", 1)
+        w.seed_round(w.jobs, "jobr", 2)
+        end = w.end_job(w.jobs, "jobr")
+        unmatched = w.jobs / "jobr" / "stray.md"
+        unmatched.write_text("VERDICT: PASS @%s\n" % w.heads[0])
+        other = w.build                                # the environment's inbox: a worker, no rounds, still open
+        events = w.mkjob(other, "jobr")
+        claim = json.loads((events / "00001-job.claim.json").read_text())
+        claim["payload"]["role"] = "worker"
+        (events / "00001-job.claim.json").write_text(json.dumps(claim) + "\n")
+        out = w.run(["bash", "-c", self.HELPERS, "_", lib, str(w.jobs)], w.env(ARBITER_INBOX_ROOT=other))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        lines = out.stdout.splitlines()
+        self.assertEqual(lines[0], "end=" + end, out.stdout)
+        self.assertEqual(lines[1], "rounds=2", out.stdout)
+        self.assertEqual(lines[2], "role=builder", out.stdout)
+        self.assertIn("unmatched %s" % unmatched, lines[3], out.stdout)
+        self.assertNotIn("zero-nonvoid-rounds", lines[3], out.stdout)
+        self.assertEqual(lines[4], "wrk: gate: refused after end record " + end, out.stdout)
+
+    def test_hk1449_helpers_read_the_root_they_are_handed(self):
+        lib = self.lib()
+        self.repro_checked_root_contract(lib)
+        # With no root they keep following the environment: that is what done and its warning still do.
+        w = self.w
+        out = w.run(["bash", "-c", 'set -euo pipefail; . "$1"; wrk_job_role jobr', "_", lib],
+                    w.env(ARBITER_INBOX_ROOT=w.build))
+        self.assertEqual(out.stdout.strip(), "worker", out.stderr)
+
+    CALLS = ("wrk_newer_end_record", "wrk_refuse_ended", "wrk_join_blocks", "wrk_joined_refuse_blocks",
+             "wrk_recorded_rounds", "wrk_job_role")
+    # the helpers themselves, and the one advisory caller that stays environment-following
+    ENV_FOLLOWING_CALLERS = ("wrk_refuse_ended", "wrk_joined_refuse_blocks", "wrk_builder_rounds_warning")
+
+    def repro_call_sites_pass_the_checked_root(self, source):
+        """Static contract: no trust-bearing function calls a converted reader without the checked root."""
+        owner, offenders, seen = None, [], 0
+        for number, line in enumerate(source.splitlines(), 1):
+            match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{", line)
+            if match:
+                owner = match.group(1)
+            if owner is None or owner in self.ENV_FOLLOWING_CALLERS or line.lstrip().startswith("#"):
+                continue
+            for name in self.CALLS:
+                call = re.search(r"\b%s\b[^\n]*" % name, line)
+                if call is None or line.lstrip().startswith(name + "()"):
+                    continue
+                seen += 1
+                if "WRK_TRUST_JOBS_ROOT:?" not in line and '"$jobs_root"' not in line:
+                    offenders.append("%d %s: %s" % (number, owner, line.strip()))
+        self.assertGreaterEqual(seen, 8, "the converted call sites moved; update CALLS")
+        self.assertEqual(offenders, [])
+
+    def test_trust_bearing_call_sites_pass_the_checked_root(self):
+        self.repro_call_sites_pass_the_checked_root(WRK.read_text(encoding="utf-8"))
+
     def test_handoffkeep_is_judged_only_by_operations_that_fetch(self):
         w = self.w
         w.mkjob(w.jobs, "jobq")
@@ -1251,6 +1497,54 @@ class RealBinaryCase(unittest.TestCase):
         lib = self.w.base / "mutant-lib"
         lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
         self.red(self.repro_inherited_guard_state, lib)
+
+    def test_mutant_joined_skips_the_guard(self):
+        mutant = self.mutant(WRK, '  # lane are read from the checked inbox, never from the environment.\n  wrk_trust_guard\n',
+                             '  # lane are read from the checked inbox, never from the environment.\n' + ENV_FOLLOWING, "joined")
+        self.red(self.repro_joined_redirect, mutant)
+        self.red(self.repro_end_check_redirect, mutant)
+
+    def test_mutant_round_audit_skips_the_guard(self):
+        mutant = self.mutant(WRK, '  wrk_trust_guard\n  local jobs_root\n', ENV_FOLLOWING + '  local jobs_root\n', "audit")
+        self.red(self.repro_audit_redirect, mutant)
+
+    def test_mutant_join_gate_reads_the_environment_root(self):
+        mutant = self.mutant(WRK, '    wrk_joined_refuse_blocks "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"\n',
+                             '    wrk_joined_refuse_blocks "$job"\n', "joingate")
+        self.red(self.repro_join_gate_checked_root, mutant)
+
+    def test_mutant_join_blocks_ignores_its_root(self):
+        mutant = self.mutant(WRK, 'wrk_join_blocks() {\n  local job="$1" root="${2:-}"\n  [[ -n "$root" ]] || root="$(wrk_jobs_root)"\n',
+                             'wrk_join_blocks() {\n  local job="$1" root="${2:-}"\n  root="$(wrk_jobs_root)"\n', "blocksroot")
+        lib = self.w.base / "mutant-lib"
+        lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
+        self.red(self.repro_checked_root_contract, lib)
+        self.red(self.repro_join_gate_checked_root, mutant)
+
+    def test_mutant_end_check_ignores_its_root(self):
+        for name, old, new in (
+            ("endroot", 'wrk_newer_end_record() {\n  local job="$1" root="${2:-}"\n  [[ -n "$root" ]] || root="$(wrk_jobs_root)"\n',
+             'wrk_newer_end_record() {\n  local job="$1" root="${2:-}"\n  root="$(wrk_jobs_root)"\n'),
+            ("refusepass", '  end="$(wrk_newer_end_record "$job" "$root")"\n', '  end="$(wrk_newer_end_record "$job")"\n'),
+            ("recordedroot", 'wrk_recorded_rounds() {\n  local job="$1" root="${2:-}"\n  [[ -n "$root" ]] || root="$(wrk_jobs_root)"\n',
+             'wrk_recorded_rounds() {\n  local job="$1" root="${2:-}"\n  root="$(wrk_jobs_root)"\n'),
+            ("roleroot", 'wrk_job_role() {\n  local job="$1" root="${2:-}"\n  [[ -n "$root" ]] || root="$(wrk_jobs_root)"\n',
+             'wrk_job_role() {\n  local job="$1" root="${2:-}"\n  root="$(wrk_jobs_root)"\n'),
+        ):
+            mutant = self.mutant(WRK, old, new, name)
+            lib = self.w.base / ("mutant-lib-" + name)
+            lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
+            self.red(self.repro_checked_root_contract, lib)
+
+    def test_mutant_call_site_drops_the_checked_root(self):
+        for old, new in (
+            ('  wrk_refuse_ended "round open" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"\n',
+             '  wrk_refuse_ended "round open" "$job"\n'),
+            ('  joined_end="$(wrk_newer_end_record "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"\n',
+             '  joined_end="$(wrk_newer_end_record "$job")"\n'),
+            ('    role="$(wrk_job_role "$job" "$jobs_root")"\n', '    role="$(wrk_job_role "$job")"\n'),
+        ):
+            self.red(self.repro_call_sites_pass_the_checked_root, mutate(WRK.read_text(encoding="utf-8"), old, new))
 
     def test_mutant_task_binding_read_follows_hk_bin(self):
         mutant = self.mutant(WRK, '    wrk_trust_guard hk\n    handoffkeep=""\n    [[ ! -x "$WRK_TRUST_HK" ]] || handoffkeep="$WRK_TRUST_HK"\n',
