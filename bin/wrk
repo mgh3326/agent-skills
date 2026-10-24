@@ -4422,10 +4422,10 @@ def wrk_events_ordered(events):
     return [(name, document, mtime) for _, mtime, name, document in rows]
 
 
-def wrk_takeover_rounds(events):
+def wrk_takeover_rounds_ordered(ordered):
     """Round count inherited by this job from its newest takeover record."""
     inherited = 0
-    for _, document, _ in wrk_events_ordered(events):
+    for _, document, _ in ordered:
         if document is None or document.get("kind") != "job.takeover":
             continue
         payload = document.get("payload", document)
@@ -4433,6 +4433,10 @@ def wrk_takeover_rounds(events):
         if isinstance(value, int) and not isinstance(value, bool):
             inherited = max(inherited, value)
     return inherited
+
+
+def wrk_takeover_rounds(events):
+    return wrk_takeover_rounds_ordered(wrk_events_ordered(events))
 
 
 def wrk_event_highest(events):
@@ -4528,14 +4532,14 @@ def wrk_end_declaration(events):
     return ""
 
 
-def wrk_round_census(events, job):
+def wrk_round_census_ordered(ordered, job):
     """Return (recorded, nonvoid) round evidence for one job.
 
     recorded counts every job.round, every unbound job.verdict and inherited
     takeover rounds. nonvoid drops job.round rows whose round is in the cap
     void set. That exclusion is the join gate.
     """
-    records = [document for _name, document, _mtime in wrk_events_ordered(events)
+    records = [document for _name, document, _mtime in ordered
                if isinstance(document, dict)]
     rounds = [record for record in records if record.get("kind") == "job.round"]
     verdicts = [record for record in records if record.get("kind") == "job.verdict"]
@@ -4562,7 +4566,7 @@ def wrk_round_census(events, job):
     for verdict in verdicts:
         if not isinstance(verdict.get("round"), int):
             unbound += 1
-    inherited = wrk_takeover_rounds(events)
+    inherited = wrk_takeover_rounds_ordered(ordered)
     recorded = len(rounds) + unbound + inherited
     nonvoid = sum(1 for r in rounds
                   if not (isinstance(r.get("round"), int) and r.get("round") in voided))  # hk1449-nonvoid-rounds
@@ -4570,9 +4574,13 @@ def wrk_round_census(events, job):
     return recorded, nonvoid
 
 
-def wrk_claim_role(events):
+def wrk_round_census(events, job):
+    return wrk_round_census_ordered(wrk_events_ordered(events), job)
+
+
+def wrk_claim_role_ordered(ordered):
     role = ""
-    for _name, document, _mtime in wrk_events_ordered(events):
+    for _name, document, _mtime in ordered:
         if not isinstance(document, dict):
             continue
         if document.get("kind") not in ("job.claim", "job.reclaim"):
@@ -4585,10 +4593,45 @@ def wrk_claim_role(events):
             role = value
     return role
 
+
+def wrk_claim_role(events):
+    return wrk_claim_role_ordered(wrk_events_ordered(events))
+
 import re as _re
 # Shared by round verdict and the join/audit file scan. The sha-boundary
 # mutant replaces this one anchor, so a second copy would miss the parser.
 wrk_verdict_line = _re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})\s*$")
+
+def wrk_verdict_files(job_dir):
+    """Return (absolute path, sha256) for first-line verdict files in one job."""
+    import hashlib, os, stat
+    verdicts = []
+    try:
+        names = sorted(os.listdir(job_dir), key=os.fsencode)
+    except OSError:
+        return verdicts
+    for name in names:
+        path = os.path.join(job_dir, name)
+        try:
+            info = os.lstat(path)
+        except OSError:
+            continue
+        if not stat.S_ISREG(info.st_mode):
+            continue
+        try:
+            with open(path, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        lines = text.splitlines()
+        if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line
+            continue
+        verdicts.append((os.path.abspath(path), hashlib.sha256(data).hexdigest()))
+    return verdicts
 '
 wrk_py() {
   WRK_EVENTS_PY="$WRK_EVENTS_PY" python3 "$@"
@@ -5269,7 +5312,7 @@ wrk_join_blocks() {
   local job="$1" root="${2:-}"
   [[ -n "$root" ]] || root="$(wrk_jobs_root)"
   wrk_py - "$root/$job/events" "$root/$job" "$job" <<'PY'
-import hashlib, os, stat, sys
+import os, sys
 exec(os.environ["WRK_EVENTS_PY"])
 events, job_dir, job = sys.argv[1:]
 _recorded, nonvoid = wrk_round_census(events, job)
@@ -5286,31 +5329,7 @@ for _name, document, _mtime in wrk_events_ordered(events):
     recorded_digest = document.get("content_sha256")
     if isinstance(recorded_digest, str) and recorded_digest:
         digests.add(recorded_digest)
-try:
-    names = sorted(os.listdir(job_dir))
-except OSError:
-    names = []
-for name in names:
-    path = os.path.join(job_dir, name)
-    try:
-        info = os.lstat(path)
-    except OSError:
-        continue
-    if not stat.S_ISREG(info.st_mode):
-        continue
-    try:
-        data = open(path, "rb").read()
-    except OSError:
-        continue
-    try:
-        text = data.decode("utf-8")
-    except UnicodeDecodeError:
-        continue
-    lines = text.splitlines()
-    if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line
-        continue
-    digest = hashlib.sha256(data).hexdigest()
-    absolute = os.path.abspath(path)
+for absolute, digest in wrk_verdict_files(job_dir):
     if absolute in paths or digest in digests:
         continue
     print("unmatched\t" + absolute)
@@ -5712,8 +5731,9 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
   wrk round audit [--lane LANE]
       Read-only. Print one line per builder job that is not ended and has
       zero recorded rounds, and one line per job directory that holds a
-      tester verdict file with no matching job.verdict. --lane keeps only
-      that owner lane. Writes nothing.
+      tester verdict file with no matching job.verdict. The audit matches
+      verdict files against job.verdict records of all jobs. --lane keeps
+      only that owner lane. Writes nothing.
   wrk round void JOB N --by REF [--reason TEXT]
       Void an existing round without a verdict, using a matching round-void
       grant in hk:doc/<key> or hk:task/<id>. The grant line is the default
@@ -6530,43 +6550,71 @@ round_audit_cmd() {
   local jobs_root
   jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   [[ -d "$jobs_root" ]] || return 0
-  local job_dir job scan ended owner lane_ok role recorded blocks line tag rest
-  # find -H below: the checked inbox may itself be a symlink (the guard returns the
-  # canonical spelling); without -H find walks nothing and the audit looks clean.
-  while IFS= read -r job_dir; do
-    [[ -n "$job_dir" && -d "$job_dir" ]] || continue
-    job="$(basename "$job_dir")"
-    scan="$(job_events_scan "$job_dir/events")"
-    ended=""
-    owner=""
-    IFS=$'\t' read -r _ ended _ _ _ _ _ owner _ <<<"$scan"
-    [[ -n "${owner:-}" ]] || owner="-"
-    lane_ok=0
-    if [[ -z "$lane" || "$owner" == "$lane" ]]; then
-      lane_ok=1
-    fi
-    if [[ "$lane_ok" -ne 1 ]]; then
-      continue
-    fi
-    role="$(wrk_job_role "$job" "$jobs_root")"
-    recorded="$(wrk_recorded_rounds "$job" "$jobs_root")"
-    case "$role" in
-      builder|captain)
-        if [[ "$ended" == "0" && "$recorded" == "0" ]]; then
-          printf 'zero-rounds job=%s lane=%s\n' "$job" "$owner"
-        fi
-        ;;
-    esac
-    blocks="$(wrk_join_blocks "$job" "$jobs_root")"
-    while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      tag="${line%%$'\t'*}"
-      rest="${line#*$'\t'}"
-      if [[ "$tag" == unmatched ]]; then
-        printf 'unmatched-verdict job=%s file=%s\n' "$job" "$rest"
-      fi
-    done <<<"$blocks"
-  done < <(find -H "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+  local event_dir audit_rc
+  local -a event_dirs=()
+  # find -H below follows the checked root when it is itself a symlink; job
+  # directories and their contents remain non-following scans.
+  while IFS= read -r event_dir; do
+    [[ -n "$event_dir" ]] && event_dirs+=("$event_dir")
+  done < <(find -H "$jobs_root" -mindepth 2 -maxdepth 2 -type d -name events | LC_ALL=C sort)
+  exec 3< <(job_events_scan "${event_dirs[@]}")
+  wrk_py - "$jobs_root" "$lane" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+jobs_root, lane = sys.argv[1:]
+scan = {}
+with os.fdopen(3, encoding="utf-8") as scan_file:
+    scan_rows = scan_file.read().splitlines()
+for row in scan_rows:
+    fields = row.split("\t")
+    if len(fields) >= 8:
+        scan[fields[0]] = (fields[1], fields[7] or "-")
+
+jobs = []
+try:
+    entries = list(os.scandir(jobs_root))
+except OSError:
+    entries = []
+entries.sort(key=lambda entry: os.fsencode(entry.name))
+for entry in entries:
+    try:
+        if entry.is_dir(follow_symlinks=False):
+            jobs.append((entry.name, entry.path))
+    except OSError:
+        continue
+
+recorded_paths = set()
+recorded_digests = set()
+job_events = {}
+for job, job_dir in jobs:
+    ordered = wrk_events_ordered(os.path.join(job_dir, "events"))
+    job_events[job] = ordered
+    for _name, document, _mtime in ordered:
+        if not isinstance(document, dict) or document.get("kind") != "job.verdict":
+            continue
+        path = document.get("path")
+        digest = document.get("content_sha256")
+        if isinstance(path, str) and path:
+            recorded_paths.add(os.path.abspath(path))
+        if isinstance(digest, str) and digest:
+            recorded_digests.add(digest)
+
+for job, job_dir in jobs:
+    ended, owner = scan.get(job, ("1", "-"))
+    if lane and owner != lane:
+        continue
+    ordered = job_events[job]
+    if ended == "0" and wrk_claim_role_ordered(ordered) in ("builder", "captain"):
+        recorded, _nonvoid = wrk_round_census_ordered(ordered, job)
+        if recorded == 0:
+            print("zero-rounds job=%s lane=%s" % (job, owner))
+    for path, digest in wrk_verdict_files(job_dir):
+        if path not in recorded_paths and digest not in recorded_digests:
+            print("unmatched-verdict job=%s file=%s" % (job, path))
+PY
+  audit_rc=$?
+  exec 3<&-
+  return "$audit_rc"
 }
 
 round_cmd() {
