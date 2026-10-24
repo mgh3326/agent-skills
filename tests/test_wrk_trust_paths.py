@@ -2022,6 +2022,15 @@ class ArbiterDbClaimCase(RealBinaryCase):
         self.assertIn("claim mismatch", out.stderr)
         self.assertIn("director-1", out.stderr)
         w.open_rounds(self.wrk, w.env(), "jdn", 1)
+        events = w.jobs / "jdn" / "events"
+        (events / "00090-job.verdict.json").write_text(
+            json.dumps({
+                "kind": "job.verdict", "job_id": "jdn", "round": 1,
+                "head": w.heads[0], "verdict": "PASS",
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }) + "\n",
+            encoding="utf-8",
+        )
         out = w.joined(self.wrk, "jdn", **env)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("claim mismatch", out.stderr)
