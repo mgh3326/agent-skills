@@ -491,6 +491,9 @@ ln -s "$TMP/audit-link-target.md" "$AUDIT/audit-symlink-job/link.md"
 claim_job audit-symlink-job
 seed_round audit-symlink-job
 claim_job audit-lane-b director-1 2026-10-23T00:00:00Z builder lane-b
+claim_job audit-lane-prefix director-1 2026-10-23T00:00:00Z builder lane-a-extra
+seed_round audit-lane-prefix
+write_verdict_first "$AUDIT/audit-lane-prefix/prefix.md" PASS "$H4"
 ended_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$AUDIT/audit-ended/ended.md")"
 open_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$AUDIT/audit-open/open.md")"
 snap_tree "$AUDIT" "$TMP/audit-before"
@@ -505,13 +508,10 @@ assert_rc 0
 printf '%s\n' \
   "unmatched-verdict job=audit-ended file=$ended_abs" \
   "zero-rounds job=audit-lane-b lane=lane-b" \
+  "unmatched-verdict job=audit-lane-prefix file=$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$AUDIT/audit-lane-prefix/prefix.md")" \
   "unmatched-verdict job=audit-open file=$open_abs" \
   "zero-rounds job=audit-zero lane=lane-a" >"$TMP/audit-want"
-# Sort both sides so a stable per-job order is what we lock, and the
-# comparison stays exact.
-sort "$TMP/run.out" >"$TMP/audit-got"
-sort "$TMP/audit-want" >"$TMP/audit-want-sorted"
-cmp "$TMP/audit-want-sorted" "$TMP/audit-got" || fail "audit listing: $(cat "$TMP/run.out")"
+cmp "$TMP/audit-want" "$TMP/run.out" || fail "audit listing order: $(cat "$TMP/run.out")"
 snap_tree "$AUDIT" "$TMP/audit-after"
 cmp "$TMP/audit-before" "$TMP/audit-after" || fail "audit changed the job dirs"
 run_cmd env ARBITER_INBOX_ROOT="$AUDIT" "$WRK" round audit --lane lane-b
@@ -527,13 +527,110 @@ printf '%s\n' \
   "unmatched-verdict job=audit-ended file=$ended_abs" \
   "unmatched-verdict job=audit-open file=$open_abs" \
   "zero-rounds job=audit-zero lane=lane-a" >"$TMP/audit-lane-a-want"
-sort "$TMP/run.out" >"$TMP/audit-lane-a-got"
-sort "$TMP/audit-lane-a-want" >"$TMP/audit-lane-a-want-sorted"
-cmp "$TMP/audit-lane-a-want-sorted" "$TMP/audit-lane-a-got" || fail "lane-a filter: $(cat "$TMP/run.out")"
+cmp "$TMP/audit-lane-a-want" "$TMP/run.out" || fail "lane-a exact filter/order: $(cat "$TMP/run.out")"
 snap_tree "$AUDIT" "$TMP/audit-after-lane"
 cmp "$TMP/audit-before" "$TMP/audit-after-lane" || fail "lane audit changed the job dirs"
 ARBITER_INBOX_ROOT="$save_inbox"
 echo "PASS d-audit-lists-planted-jobs-and-writes-nothing"
+
+# ── D2: verdict matching is global across all jobs ──────────────────────
+AUDIT_GLOBAL="$TMP/audit-global"
+mkdir -p "$AUDIT_GLOBAL"
+save_inbox="$ARBITER_INBOX_ROOT"
+ARBITER_INBOX_ROOT="$AUDIT_GLOBAL"
+claim_job audit-builder-path
+seed_round audit-builder-path
+claim_job audit-tester-path director-1 2026-10-23T00:00:00Z tester
+write_verdict_first "$AUDIT_GLOBAL/audit-tester-path/verdict.md" PASS "$H3"
+path_match="$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], os.getcwd()))' "$AUDIT_GLOBAL/audit-tester-path/verdict.md")"
+write_event "$AUDIT_GLOBAL/audit-builder-path/events/00002-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"audit-builder-path","path":"$path_match","content_sha256":"different-digest","created_at":"2026-10-23T00:00:02Z"}
+EOF
+claim_job audit-builder-digest
+seed_round audit-builder-digest
+claim_job audit-tester-digest director-1 2026-10-23T00:00:00Z tester
+write_verdict_first "$AUDIT_GLOBAL/audit-tester-digest/verdict.md" PASS "$H3"
+digest_match="$(file_sha "$AUDIT_GLOBAL/audit-tester-digest/verdict.md")"
+cp "$AUDIT_GLOBAL/audit-tester-digest/verdict.md" "$AUDIT_GLOBAL/audit-builder-digest/copy.md"
+write_event "$AUDIT_GLOBAL/audit-builder-digest/events/00002-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"audit-builder-digest","path":"$AUDIT_GLOBAL/audit-builder-digest/copy.md","content_sha256":"$digest_match","created_at":"2026-10-23T00:00:02Z"}
+EOF
+claim_job audit-builder-trailing
+seed_round audit-builder-trailing
+claim_job audit-tester-trailing director-1 2026-10-23T00:00:00Z tester
+write_verdict_first "$AUDIT_GLOBAL/audit-tester-trailing/verdict.md" PASS "$H3"
+trailing_path="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$AUDIT_GLOBAL/audit-tester-trailing/verdict.md")/"
+write_event "$AUDIT_GLOBAL/audit-builder-trailing/events/00002-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"audit-builder-trailing","path":"$trailing_path","content_sha256":"different-digest","created_at":"2026-10-23T00:00:02Z"}
+EOF
+claim_job audit-later-line
+seed_round audit-later-line
+printf 'unrelated first line\nVERDICT: PASS @%s\n' "$H3" >"$AUDIT_GLOBAL/audit-later-line/later.md"
+claim_job audit-planted
+seed_round audit-planted
+write_verdict_first "$AUDIT_GLOBAL/audit-planted/planted.md" PASS "$H4"
+mkdir -p "$TMP/audit-symlink-target"
+write_verdict_first "$TMP/audit-symlink-target/linked.md" PASS "$H4"
+ln -s "$TMP/audit-symlink-target" "$AUDIT_GLOBAL/audit-symlink-job"
+planted_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$AUDIT_GLOBAL/audit-planted/planted.md")"
+run_cmd env ARBITER_INBOX_ROOT="$AUDIT_GLOBAL" "$WRK" round audit
+assert_rc 0
+grep -qxF "unmatched-verdict job=audit-planted file=$planted_abs" "$TMP/run.out" || fail "unrecorded first-line verdict must remain listed: $(cat "$TMP/run.out")"
+if grep -q 'audit-tester-path\|audit-tester-digest\|audit-later-line' "$TMP/run.out"; then
+  fail "global path and digest matches, and later-line files, must be omitted: $(cat "$TMP/run.out")"
+fi
+[[ "$(cat "$TMP/run.out")" == "unmatched-verdict job=audit-planted file=$planted_abs" ]] || fail "audit must print only the unmatched planted file: $(cat "$TMP/run.out")"
+echo "PASS d2-audit-global-verdict-matching"
+ARBITER_INBOX_ROOT="$save_inbox"
+
+AUDIT_EMPTY="$TMP/audit-empty"
+mkdir -p "$AUDIT_EMPTY"
+run_cmd env ARBITER_INBOX_ROOT="$AUDIT_EMPTY" "$WRK" round audit
+assert_rc 0
+[[ ! -s "$TMP/run.out" ]] || fail "empty audit inbox must stay empty: $(cat "$TMP/run.out")"
+echo "PASS d2b-audit-empty-inbox"
+
+# ── D3: audit Python process count is constant and at most three ────────
+PY_WRAPPER="$TMP/python-wrapper"
+mkdir -p "$PY_WRAPPER"
+REAL_PYTHON3="$(command -v python3)"
+cat >"$PY_WRAPPER/python3" <<'EOF'
+#!/bin/sh
+printf 'call\n' >>"$PY_COUNT"
+exec "$REAL_PYTHON3" "$@"
+EOF
+chmod +x "$PY_WRAPPER/python3"
+for job_count in 5 50; do
+  COUNT_AUDIT="$TMP/count-audit-$job_count"
+  mkdir -p "$COUNT_AUDIT"
+  python3 - "$COUNT_AUDIT" "$job_count" <<'PY'
+import json, os, sys
+root, count = sys.argv[1], int(sys.argv[2])
+for index in range(count):
+    job = "job-%03d" % index
+    events = os.path.join(root, job, "events")
+    os.makedirs(events)
+    record = {"kind": "job.claim", "job_id": job, "role": "builder",
+              "owner_lane": "lane-count", "created_at": "2026-10-23T00:00:00Z"}
+    with open(os.path.join(events, "00001-job.claim.json"), "w", encoding="utf-8") as handle:
+        json.dump(record, handle)
+        handle.write("\n")
+PY
+  PY_COUNT="$TMP/python-count-$job_count"
+  : >"$PY_COUNT"
+  run_cmd env PATH="$PY_WRAPPER:$PATH" PY_COUNT="$PY_COUNT" REAL_PYTHON3="$REAL_PYTHON3" \
+    ARBITER_INBOX_ROOT="$COUNT_AUDIT" "$WRK" round audit
+  assert_rc 0
+  call_count="$(wc -l <"$PY_COUNT" | tr -d ' ')"
+  [[ "$call_count" -le 3 ]] || fail "audit must use at most 3 python3 calls per run; jobs=$job_count calls=$call_count"
+  if [[ "$job_count" == 5 ]]; then
+    count_five="$call_count"
+  else
+    [[ "$call_count" -eq "$count_five" ]] || fail "audit python3 calls must stay constant: 5 jobs=$count_five, 50 jobs=$call_count"
+  fi
+done
+echo "AUDIT python3 calls per run: 5 jobs=$count_five; 50 jobs=$call_count"
+echo "PASS d3-audit-python-process-bound"
 
 # ── legitimate flows ────────────────────────────────────────────────────
 echo "== flow-normal-1-to-3-rounds =="
@@ -812,6 +909,57 @@ open(out_path, "w", encoding="utf-8").write(src)
 PY
   chmod +x "$TMP/$name-wrk"
 }
+
+# A standalone synthetic inbox fixes the requested before/after line-count
+# sample at ten recorded tester directories.
+AUDIT_TEN="$TMP/audit-ten-testers"
+mkdir -p "$AUDIT_TEN"
+save_inbox="$ARBITER_INBOX_ROOT"
+ARBITER_INBOX_ROOT="$AUDIT_TEN"
+for i in 0 1 2 3 4 5 6 7 8 9; do
+  builder="ten-builder-$i" tester="ten-tester-$i"
+  claim_job "$builder"
+  seed_round "$builder"
+  claim_job "$tester" director-1 2026-10-23T00:00:00Z tester
+  write_verdict_first "$AUDIT_TEN/$tester/verdict.md" PASS "$H3"
+  ten_path="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$AUDIT_TEN/$tester/verdict.md")"
+  ten_sha="$(file_sha "$AUDIT_TEN/$tester/verdict.md")"
+  write_event "$AUDIT_TEN/$builder/events/00002-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"$builder","path":"$ten_path","content_sha256":"$ten_sha","created_at":"2026-10-23T00:00:02Z"}
+EOF
+done
+ARBITER_INBOX_ROOT="$save_inbox"
+run_cmd env ARBITER_INBOX_ROOT="$AUDIT_TEN" "$WRK" round audit
+assert_rc 0
+[[ ! -s "$TMP/run.out" ]] || fail "ten globally matched tester directories must produce no lines: $(cat "$TMP/run.out")"
+
+# These audit mutants violate named invariants: builder-owned verdict records
+# must match tester files globally, one audit must stay within three Python
+# processes regardless of inbox size, and only a first-line VERDICT counts.
+printf '%s\n' 'if path not in recorded_paths and digest not in recorded_digests: => if not any(isinstance(d, dict) and d.get("kind") == "job.verdict" and (os.path.abspath(d.get("path", "")) == path or d.get("content_sha256") == digest) for _, d, _ in ordered):' >"$TMP/spec-per-job-audit"
+mutant per-job-audit "$TMP/spec-per-job-audit"
+run_cmd env ARBITER_INBOX_ROOT="$AUDIT_TEN" "$TMP/per-job-audit-wrk" round audit
+assert_rc 0
+[[ "$(grep -c '^unmatched-verdict job=ten-tester-' "$TMP/run.out")" -eq 10 ]] || fail "per-job-only audit mutant did not make all ten recorded tester directories RED"
+echo "AUDIT ten recorded tester dirs: before=$(grep -c '^unmatched-verdict job=ten-tester-' "$TMP/run.out") lines; after=0 lines"
+echo "PASS mutant-per-job-audit-breaks-global-verdict-invariant"
+
+# shellcheck disable=SC2016 # mutant source is literal shell code, not an expansion.
+printf '%s\n' 'exec 3< <(job_events_scan ${event_dirs[@]+"${event_dirs[@]}"}) => exec 3< <(for event_dir in ${event_dirs[@]+"${event_dirs[@]}"}; do job_events_scan "$event_dir" >/dev/null; done; job_events_scan ${event_dirs[@]+"${event_dirs[@]}"})' >"$TMP/spec-per-job-process"
+mutant per-job-process "$TMP/spec-per-job-process"
+: >"$TMP/process-mutant-count"
+run_cmd env PATH="$PY_WRAPPER:$PATH" PY_COUNT="$TMP/process-mutant-count" REAL_PYTHON3="$REAL_PYTHON3" \
+  ARBITER_INBOX_ROOT="$TMP/count-audit-5" "$TMP/per-job-process-wrk" round audit
+assert_rc 0
+[[ "$(wc -l <"$TMP/process-mutant-count" | tr -d ' ')" -gt 3 ]] || fail "per-job process mutant did not make the process-bound case RED"
+echo "PASS mutant-per-job-python-breaks-process-bound-invariant"
+
+printf '%s\n' 'if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line => if not lines:  # hk1449-verdict-first-line' >"$TMP/spec-drop-first-line"
+mutant drop-first-line "$TMP/spec-drop-first-line"
+run_cmd env ARBITER_INBOX_ROOT="$AUDIT_GLOBAL" "$TMP/drop-first-line-wrk" round audit
+assert_rc 0
+grep -q 'unmatched-verdict job=audit-later-line ' "$TMP/run.out" || fail "drop-first-line audit mutant did not make the later-line case RED"
+echo "PASS mutant-drop-first-line-breaks-first-line-invariant"
 
 printf '%s\n' 'if digest in digests:  # hk1449-content-sha => if False:  # hk1449-content-sha' >"$TMP/spec-hash"
 mutant hash "$TMP/spec-hash"
