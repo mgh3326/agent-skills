@@ -3894,6 +3894,42 @@ LANES_CFG_WBOTH="$TMP/lanes-1397-wboth-hosts.toml"
 printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
   "$LANES_TOKEN_FILE" "$LANES_OP_FILE" "$LANES_CF_FILE" >"$LANES_CFG_WBOTH"
 
+# hk 1446: a lanes token bound to the DEFERRED machine id — the hosts.toml
+# key the initiator reaches the execution host by (desktop) — lets the
+# delegated remote builder register its own lane. The config also carries
+# operator_token_env so the argv pin proves the self-add took the node
+# token and never the operator credential.
+LANES_NODE_DESKTOP_FILE="$TMP/lanes-node-desktop.env"
+LANES_NODE_DESKTOP_VALUE="fixture-lanes-desktop-token-must-not-leak"
+printf 'HUB_MACHINE_ID=desktop\nHUB_TOKEN=%s\n' "$LANES_NODE_DESKTOP_VALUE" >"$LANES_NODE_DESKTOP_FILE"
+chmod 600 "$LANES_NODE_DESKTOP_FILE"
+LANES_CFG_DEFER_SELF="$TMP/lanes-1446-self-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_NODE_DESKTOP_FILE" "$LANES_OP_FILE" "$LANES_CF_FILE" >"$LANES_CFG_DEFER_SELF"
+# Same shape but the token names another machine: the deferred spawn must
+# behave exactly as it does without a token.
+LANES_CFG_DEFER_MISMATCH="$TMP/lanes-1446-mismatch-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_NODE_OTHER_FILE" "$LANES_OP_FILE" >"$LANES_CFG_DEFER_MISMATCH"
+# An OPERATOR credential that also carries HUB_MACHINE_ID: the remote side
+# never resolves operator_token_env, so a deferred spawn on this config
+# still makes zero lanes calls — while a mutant that falls back to the
+# operator file would find a matching id and self-register.
+LANES_OP_ID_FILE="$TMP/lanes-1446-opid.env"
+printf 'OPERATOR_TOKEN=%s\nHUB_MACHINE_ID=desktop\n' "$LANES_OP_VALUE" >"$LANES_OP_ID_FILE"
+chmod 600 "$LANES_OP_ID_FILE"
+LANES_CFG_OPID="$TMP/lanes-1446-opid-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_OP_ID_FILE" "$LANES_CF_FILE" >"$LANES_CFG_OPID"
+# A lanes token whose machine id differs only by case/whitespace — the
+# equality is byte-exact, so these defer too.
+LANES_NODE_DESKTOP_CASE_FILE="$TMP/lanes-node-desktop-case.env"
+printf 'HUB_MACHINE_ID=Desktop \nHUB_TOKEN=%s\n' "$LANES_NODE_DESKTOP_VALUE" >"$LANES_NODE_DESKTOP_CASE_FILE"
+chmod 600 "$LANES_NODE_DESKTOP_CASE_FILE"
+LANES_CFG_DEFER_CASE="$TMP/lanes-1446-case-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_NODE_DESKTOP_CASE_FILE" "$LANES_OP_FILE" >"$LANES_CFG_DEFER_CASE"
+
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
   # stdout/stderr, both panewire logs and the inbox land in per-case paths;
@@ -3955,7 +3991,7 @@ t1397_remote_spawn() {
     WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
     WRK_FIXTURE_LOG="$TMP/t1397-$name-herdr.log" \
     WRK_SCOPEFUEL_LOG="$TMP/t1397-$name-scopefuel.log" \
-    WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
+    WRK_SSH_BIN="${T1397_SSH_BIN:-$ROOT/tests/fixtures/spillover-ssh}" \
     WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
     WRK_SSH_LOG="$T1397_SSH" WRK_SCP_LOG="$TMP/t1397-$name-scp.log" \
     WRK_SSH_SCENARIO="${T1397_SSH_SCENARIO:-ok}" \
@@ -5868,6 +5904,245 @@ PY
     fail "#1397 M13 mutant survived: the worker reap still skips operator_token_env"
   fi
   echo "PASS 1397-lanes M13: re-widening the worker chain goes RED (register + reap)"
+
+  # ------------------------------------------------------------------
+  # hk 1446 — a remote --host builder whose execution host holds a lanes
+  # token bound to the deferred machine id registers its own hub lane: the
+  # remote wrk runs `lanes add` itself, marks its OK line
+  # lane_registered=self, and the initiator skips its add. Every other
+  # shape defers exactly as before.
+  # ------------------------------------------------------------------
+  # AC1 — the execution host holds a matching lanes token: exactly one
+  # `lanes add` runs on THIS side of the defer, carrying the lanes file
+  # (never the operator credential the same config also holds), the
+  # deferred machine id, the spawned pane and --parent. The OK line ends
+  # with lane=L@HOST lane_registered=self and the receipt records the same
+  # lane+machine the deferral would have.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    lanes_spawn b1446-self --role builder --lane b1446-self --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC1: self-registering deferred spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_CALLS" "$LANES_NODE_DESKTOP_FILE" "$LANES_OP_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+log, lanes_file, op_file, cf_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+want = ["add", "b1446-self", "--machine", "desktop", "--pane", "w:p1",
+        "--parent", "director-x", "--hub-url", "https://hub.invalid",
+        "--hub-token-env", lanes_file, "--hub-cf-env", cf_file, "--"]
+assert got == want, "self-registration argv mismatch: got=%r want=%r" % (got, want)
+assert op_file not in got, "operator_token_env must never reach the remote side: %r" % got
+PY
+    fail "#1446 AC1: the self-add must run once with the lanes token, never the operator file"
+  grep -q ' lane=b1446-self@desktop lane_registered=self$' "$LANES_OUT" ||
+    fail "#1446 AC1: the OK line must end lane=L@desktop lane_registered=self: $(cat "$LANES_OUT")"
+  lanes_spawned_payload b1446-self | python3 -c '
+import json, sys
+meta = json.loads(sys.stdin.read())
+assert meta["hub_lane"] == "b1446-self" and meta["hub_lane_machine"] == "desktop", meta' ||
+    fail "#1446 AC1: the receipt must still record lane+deferred machine"
+  echo "PASS 1446-lanes AC1: a matching lanes token self-registers the deferred builder lane"
+
+  # AC2 — the token's HUB_MACHINE_ID names another machine (or only differs
+  # by case/whitespace): identical to no token at all — zero lanes calls,
+  # no marker, no warning, and the receipt still records the deferral.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_MISMATCH" \
+    lanes_spawn b1446-mism --role builder --lane b1446-mism --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC2: a mismatched-token deferred spawn must still succeed (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call b1446-mism
+  grep -q ' lane=b1446-mism@desktop$' "$LANES_OUT" ||
+    fail "#1446 AC2: the deferred OK line must be unchanged: $(cat "$LANES_OUT")"
+  ! grep -q 'lane_registered' "$LANES_OUT" ||
+    fail "#1446 AC2: no marker may appear on a mismatched token"
+  ! grep -q 'self-registration' "$LANES_ERR" ||
+    fail "#1446 AC2: a mismatch defers silently: $(cat "$LANES_ERR")"
+  lanes_spawned_payload b1446-mism | python3 -c '
+import json, sys
+meta = json.loads(sys.stdin.read())
+assert meta["hub_lane"] == "b1446-mism" and meta["hub_lane_machine"] == "desktop", meta' ||
+    fail "#1446 AC2: the receipt must still record the deferred lane"
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_CASE" \
+    lanes_spawn b1446-case --role builder --lane b1446-case --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] || fail "#1446 AC2: a case-mismatched token spawn failed"
+  lanes_assert_no_lanes_call b1446-case
+  ! grep -q 'lane_registered' "$LANES_OUT" ||
+    fail "#1446 AC2: the machine-id compare must be byte-exact"
+  echo "PASS 1446-lanes AC2: a lanes token naming another machine defers byte-exactly"
+
+  # AC3 — no lanes token at all (operator credential only): byte-for-byte
+  # today's behavior — zero lanes calls, lane=L@HOST ending the OK line,
+  # the deferred receipt. A tester role carrying the flag is refused
+  # outright, so a non-builder seat can never self-register either.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_OP" \
+    lanes_spawn b1446-notok --role builder --lane b1446-notok --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC3: a tokenless deferred spawn must succeed (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call b1446-notok
+  grep -q ' lane=b1446-notok@desktop$' "$LANES_OUT" ||
+    fail "#1446 AC3: the OK line must be identical to today's: $(cat "$LANES_OUT")"
+  # An operator file that DOES carry HUB_MACHINE_ID still cannot
+  # self-register: only lanes_token_env counts on the remote side.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_OPID" \
+    lanes_spawn b1446-opid --role builder --lane b1446-opid --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC3: an operator-credential spawn must succeed (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call b1446-opid
+  ! grep -q 'lane_registered' "$LANES_OUT" ||
+    fail "#1446 AC3: operator_token_env must never self-register"
+  # A tester seat can never self-register either: --lane-defer is
+  # builder-only even on a host holding a matching token.
+  HERDR_SESSION=default LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    lanes_spawn t1446-self --role tester --owner work-kairos --lane-defer desktop
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1446 AC3: --lane-defer on a tester must refuse rc 2 (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call t1446-self
+  echo "PASS 1446-lanes AC3: no lanes token keeps the deferral byte-identical"
+
+  # AC4 — the self-add is refused by panewire: exactly one warning naming
+  # the failure, the deferral stands (receipt + OK line unchanged), the
+  # spawn still answers 0. The initiator then adds the lane as today.
+  WRK_PANEWIRE_LANES_RC=5 LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    lanes_spawn b1446-addfail --role builder --lane b1446-addfail --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC4: a refused self-add must never fail the spawn (rc=$LANES_RC)"
+  [[ "$(grep -cxF 'add' "$LANES_CALLS")" -eq 1 ]] ||
+    fail "#1446 AC4: the self-add must still be attempted once: $(cat "$LANES_CALLS")"
+  [[ "$(grep -c 'self-registration failed' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#1446 AC4: exactly one self-registration warning expected: $(cat "$LANES_ERR")"
+  grep -q ' lane=b1446-addfail@desktop$' "$LANES_OUT" ||
+    fail "#1446 AC4: a failed self-add falls back to the plain deferral: $(cat "$LANES_OUT")"
+  echo "PASS 1446-lanes AC4: a refused self-add warns once and defers"
+
+  # AC5 — the initiator half: the remote OK pane= line carries
+  # lane_registered=self, so THIS host runs zero lanes calls and still
+  # emits lane=L@HOST. The consumed marker never reaches the operator's
+  # line. The stub answers the spawn leg itself and delegates every other
+  # leg to the shared fixture.
+  T1446_SSH_SELFREG="$TMP/t1446-ssh-selfreg"
+  cat >"$T1446_SSH_SELFREG" <<'SH'
+#!/usr/bin/env bash
+remote="${*: -1}"
+if [[ "$remote" == *'wrk spawn'* ]]; then
+  printf '%s\n' "$*" >>"${WRK_SSH_LOG:?}"
+  printf 'OK pane=desktop:p7 host=local model=builder-sol label=fixture status=working landed=yes job=fixture lane=fixture@desktop lane_registered=self\n'
+  exit "${WRK_REMOTE_RC:-0}"
+fi
+exec "${T1446_FIXTURE_SSH:?}" "$@"
+SH
+  chmod +x "$T1446_SSH_SELFREG"
+  T1446_FIXTURE_SSH="$ROOT/tests/fixtures/spillover-ssh" T1397_SSH_BIN="$T1446_SSH_SELFREG" \
+    t1397_remote_spawn b1446-initskip
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1446 AC5: a self-registered remote spawn failed (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  [[ ! -s "$T1397_CALLS" ]] ||
+    fail "#1446 AC5: the initiator must make zero lanes calls after lane_registered=self: $(cat "$T1397_CALLS")"
+  grep -q ' lane=b1446-initskip@desktop$' "$T1397_OUT" ||
+    fail "#1446 AC5: the emitted line must keep lane=L@desktop: $(cat "$T1397_OUT")"
+  ! grep -q 'lane_registered' "$T1397_OUT" ||
+    fail "#1446 AC5: the consumed marker must not reach the emitted line: $(cat "$T1397_OUT")"
+  echo "PASS 1446-lanes AC5: lane_registered=self skips the initiator add"
+
+  # AC6 — a forged marker never counts: the same text on a non-OK stdout
+  # line and inside an OK-line field VALUE leaves the initiator's add
+  # untouched. Only the OK pane= line's own lane_registered=self field is
+  # the remote's word.
+  T1446_SSH_FORGED="$TMP/t1446-ssh-forged"
+  cat >"$T1446_SSH_FORGED" <<'SH'
+#!/usr/bin/env bash
+remote="${*: -1}"
+if [[ "$remote" == *'wrk spawn'* ]]; then
+  printf '%s\n' "$*" >>"${WRK_SSH_LOG:?}"
+  printf 'lane_registered=self\n'
+  printf 'wrk: note: lane_registered=self in a warning-shaped line\n'
+  printf 'OK pane=desktop:p7 host=local model=builder-sol label=lane_registered=self-ish status=working landed=yes job=fixture note=lane_registered=self lane=fixture@desktop\n'
+  exit 0
+fi
+exec "${T1446_FIXTURE_SSH:?}" "$@"
+SH
+  chmod +x "$T1446_SSH_FORGED"
+  T1446_FIXTURE_SSH="$ROOT/tests/fixtures/spillover-ssh" T1397_SSH_BIN="$T1446_SSH_FORGED" \
+    t1397_remote_spawn b1446-forged
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1446 AC6: the forged-marker spawn failed (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -qxF 'add' "$T1397_CALLS" ||
+    fail "#1446 AC6: a forged marker must not suppress the initiator add: $(cat "$T1397_CALLS")"
+  grep -q ' lane=b1446-forged@desktop$' "$T1397_OUT" ||
+    fail "#1446 AC6: the confirmed add keeps lane=L@desktop: $(cat "$T1397_OUT")"
+  echo "PASS 1446-lanes AC6: only the OK line's own marker field counts"
+
+  # AC7 — WRK_LANE_STRICT=1: a self-registered lane is confirmed, so the
+  # strict gate must not fire.
+  WRK_LANE_STRICT=1 \
+    T1446_FIXTURE_SSH="$ROOT/tests/fixtures/spillover-ssh" T1397_SSH_BIN="$T1446_SSH_SELFREG" \
+    t1397_remote_spawn b1446-strict
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1446 AC7: a self-registered lane must not strict-exit (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -q ' lane=b1446-strict@desktop$' "$T1397_OUT" ||
+    fail "#1446 AC7: the emitted line must keep lane=L@desktop: $(cat "$T1397_OUT")"
+  echo "PASS 1446-lanes AC7: WRK_LANE_STRICT accepts a self-registered lane"
+
+  # AC8 — reap on the execution host removes the self-registered lane
+  # through the same machine+pane guard, carrying the node lanes token the
+  # builder chain resolves first.
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1446"
+  lanes_reap_job j1446-reap w1:p14 w1:t14 b1446-x lane-1446-self lbl-1446 desktop builder
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1446-self","machine":"desktop","pane":"w1:p14","parent":"director-x","sink":false}]}' \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    lanes_reap_run 1446-reap --lane b1446-x --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1446 AC8: apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_NODE_DESKTOP_FILE" "$LANES_OP_FILE" lane-1446-self ||
+    fail "#1446 AC8: reap must remove the self-registered lane with its lanes token"
+  echo "PASS 1446-lanes AC8: reap removes a self-registered lane with the lanes token"
+
+  # M1 'the machine-id equality check guards the self-add': dropping it
+  # lets a token bound to another machine self-register — AC2's zero-call
+  # assertion would then go RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1446-nomatch \
+    '  [[ "$lanes_machine" == "$LANE_DEFER" ]] || return 1' \
+    '  :'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-nomatch" \
+    LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_MISMATCH" \
+    lanes_spawn b1446-m1 --role builder --lane b1446-m1 --parent director-x --lane-defer desktop
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#1446 M1 mutant survived: the mismatched token still defers"
+  fi
+  echo "PASS 1446-lanes M1: dropping the machine-id check goes RED"
+
+  # M2 'the remote side never reads operator_token_env': a mutant that
+  # falls back to the operator file self-registers on a tokenless host —
+  # AC3's zero-call assertion would then go RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1446-opcred \
+    '  [[ -n "$lanes_env" ]] || return 1' \
+    '  [[ -n "$lanes_env" ]] || lanes_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  [[ -n "$lanes_env" ]] || return 1'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-opcred" \
+    LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_OPID" \
+    lanes_spawn b1446-m2 --role builder --lane b1446-m2 --parent director-x --lane-defer desktop
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#1446 M2 mutant survived: operator_token_env still cannot self-register"
+  fi
+  echo "PASS 1446-lanes M2: an operator fallback on the remote goes RED"
+
+  # M3 'the initiator honors the marker': a mutant that ignores
+  # lane_registered=self adds the lane a second time — AC5's zero-call
+  # assertion would then go RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1446-nomarker \
+    '      if [[ "$remote_selfreg" == yes ]]; then' \
+    '      if false; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-nomarker" \
+    T1446_FIXTURE_SSH="$ROOT/tests/fixtures/spillover-ssh" T1397_SSH_BIN="$T1446_SSH_SELFREG" \
+    t1397_remote_spawn b1446-m3
+  if [[ ! -s "$T1397_CALLS" ]]; then
+    fail "#1446 M3 mutant survived: the initiator still skips the marked lane"
+  fi
+  echo "PASS 1446-lanes M3: ignoring the self-registration marker goes RED"
 
   # ------------------------------------------------------------------
   # #1438 — reap resolves a lane's credential chain from the role that

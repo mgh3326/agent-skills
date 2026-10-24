@@ -58,6 +58,7 @@ export HK_STATE="$TMP/hk-state.json"
 "$HK_FIXTURE" tasks add --id 1489 --title 'remote inherited task' --lane fixture >/dev/null
 "$HK_FIXTURE" tasks add --id 9 --title 'explicit remote task' --lane fixture >/dev/null
 "$HK_FIXTURE" tasks add --id 10 --title 'builder task' --lane fixture >/dev/null
+"$HK_FIXTURE" tasks add --id 11 --title 'second builder task' --lane fixture >/dev/null
 
 seed_parent() {
   local job="$1" task_id="${2:-}"
@@ -97,8 +98,9 @@ export HANDOFFKEEP_BIN="$root/tests/fixtures/handoffkeep"
 export HK_STATE="$tmp/hk-state.json"
 export HERDR_BIN="$root/tests/fixtures/spillover-herdr"
 export SCOPEFUEL_BIN="$root/tests/fixtures/scopefuel"
-export PANEWIRE_BIN="$root/tests/fixtures/spillover-panewire"
-export WRK_HOSTS_CONFIG="$tmp/hosts.toml"
+export PANEWIRE_BIN="${WRK_REMOTE_PANEWIRE_BIN:-$root/tests/fixtures/spillover-panewire}"
+export WRK_HOSTS_CONFIG="${WRK_REMOTE_HOSTS_CONFIG:-$tmp/hosts.toml}"
+export WRK_PANEWIRE_LANES_LOG="${WRK_REMOTE_LANES_LOG:-}"
 export WRK_PROC_LOADAVG="$tmp/loadavg" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_NO_SLEEP=1
 export WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$tmp/remote-herdr.log"
 export WRK_SPILLOVER_LOG="$tmp/remote-spillover.log"
@@ -128,6 +130,9 @@ run_remote() {
     WRK_REMOTE_PROMPT_PATH="$REMOTE_PROMPT_PATH" WRK_REMOTE_ROOT="$ROOT" WRK_REMOTE_TMP="$TMP" \
     WRK_SSH_EXEC_REMOTE="${WRK_CASE_EXEC_REMOTE:-1}" WRK_REMOTE_WRK_LOG="${WRK_CASE_REMOTE_LOG:-$TMP/remote-wrk.log}" \
     WRK_PLACE_LOG="$TMP/place.log" PATH="$TMP/remote-bin:$PATH" \
+    WRK_REMOTE_HOSTS_CONFIG="${WRK_CASE_REMOTE_CONFIG:-}" \
+    WRK_REMOTE_LANES_LOG="${WRK_CASE_REMOTE_LANES_LOG:-}" \
+    WRK_REMOTE_PANEWIRE_BIN="${WRK_CASE_REMOTE_PANEWIRE_BIN:-}" \
     "$binary" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w workers -l "$label" --t T1 --job "$job" "$@"
 }
 
@@ -302,3 +307,106 @@ grep -q "parent job 'P-no-task' has no task_id" <<<"$mut_late_out" || {
 printf '%s\n' 'PASS wrk-remote-task M2-late-resolution-red-then-restored-green'
 
 printf '%s\n' 'PASS wrk-remote-task mutants-red=2/2'
+
+# T6 (hk 1446): a REAL remote wrk on the target holds a lanes token bound
+# to the hosts.toml key the initiator reached it by — it self-registers
+# the builder lane with that node token, prints lane_registered=self on
+# its OK pane= line, and the initiator makes no lanes call of its own.
+# The initiator keeps a fully configured [hub] (operator credential) so
+# the zero lanes traffic is attributable to the marker alone.
+T6_TOKEN="$TMP/t6-lanes.env"
+printf 'HUB_MACHINE_ID=desktop\nHUB_TOKEN=fixture-t6-node-token\n' >"$T6_TOKEN"
+chmod 600 "$T6_TOKEN"
+T6_OP="$TMP/t6-operator.env"
+printf 'OPERATOR_TOKEN=fixture-t6-operator-token\n' >"$T6_OP"
+chmod 000 "$T6_OP"
+T6_REMOTE_CONFIG="$TMP/t6-remote-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://hub.invalid"' \
+  "lanes_token_env = \"$T6_TOKEN\"" 'machine_id = "desktop"' >"$T6_REMOTE_CONFIG"
+T6_INIT_CONFIG="$TMP/t6-init-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://hub.invalid"' \
+  "operator_token_env = \"$T6_OP\"" 'machine_id = "mac-personal"' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"$REMOTE_CWD\"}" 'capacity = 3' >"$T6_INIT_CONFIG"
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/wake.log"
+t6_out="$(WRK_CASE_MODEL=builder-sol WRK_CASE_LABEL=t6b WRK_CASE_JOB=t6-builder \
+  WRK_CASE_CONFIG="$T6_INIT_CONFIG" WRK_CASE_REMOTE_CONFIG="$T6_REMOTE_CONFIG" \
+  WRK_CASE_REMOTE_PANEWIRE_BIN="$ROOT/tests/fixtures/panewire" \
+  WRK_CASE_REMOTE_LANES_LOG="$TMP/t6-remote-lanes.log" \
+  run_remote "$ROOT/bin/wrk" --host desktop --role builder --lane b1446-t6 --parent director-1 --task 10 2>&1)"
+grep -q ' lane=b1446-t6@desktop$' <<<"$t6_out" || {
+  echo 'FAIL T6 emitted line must end lane=b1446-t6@desktop' >&2; printf '%s\n' "$t6_out" >&2; exit 1;
+}
+! grep -q 'lane_registered' <<<"$t6_out" || {
+  echo 'FAIL T6 the consumed marker reached the emitted line' >&2; exit 1;
+}
+grep -q -- '--lane-defer desktop' "$TMP/ssh.log" || {
+  echo 'FAIL T6 the delegated spawn must carry --lane-defer desktop' >&2; exit 1;
+}
+! grep -q 'lanes' "$TMP/wake.log" || {
+  echo 'FAIL T6 the initiator made a lanes call despite the marker' >&2
+  cat "$TMP/wake.log" >&2; exit 1;
+}
+python3 - "$TMP/t6-remote-lanes.log" "$T6_TOKEN" <<'PY' || {
+import sys
+log, token = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("the remote wrk made no lanes call")
+want = ["add", "b1446-t6", "--machine", "desktop", "--pane", "w:p1",
+        "--parent", "director-1", "--hub-url", "https://hub.invalid",
+        "--hub-token-env", token, "--"]
+assert got == want, "remote self-add argv mismatch: got=%r want=%r" % (got, want)
+PY
+  echo 'FAIL T6 the remote wrk must self-add once with its lanes token' >&2; exit 1;
+}
+# The remote job's receipt records the same lane+machine the deferral
+# would, so reap on the execution host removes it through the same guard.
+python3 - "$TMP/remote-inbox/jobs" <<'PY' || {
+import glob, json, sys
+paths = glob.glob(sys.argv[1] + "/t6-builder/events/*job.spawned.json")
+assert len(paths) == 1, paths
+meta = json.load(open(paths[0]))["payload"]
+assert meta.get("hub_lane") == "b1446-t6" and meta.get("hub_lane_machine") == "desktop", meta
+PY
+  echo 'FAIL T6 remote receipt must record lane+machine' >&2; exit 1;
+}
+printf '%s\n' 'PASS wrk-remote-task T6-remote-self-registers-with-lanes-token'
+
+# T7 (hk 1446): the same end-to-end delegation WITHOUT a lanes token on
+# the target keeps today's contract byte-for-byte — the remote wrk
+# defers and the initiator registers the lane itself.
+T7_INIT_CONFIG="$TMP/t7-init-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://hub.invalid"' \
+  "operator_token_env = \"$T6_OP\"" 'machine_id = "mac-personal"' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"$REMOTE_CWD\"}" 'capacity = 3' >"$T7_INIT_CONFIG"
+T7_REMOTE_CONFIG="$TMP/t7-remote-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://hub.invalid"' 'machine_id = "desktop"' >"$T7_REMOTE_CONFIG"
+: >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/wake.log"
+t7_out="$(WRK_CASE_MODEL=builder-sol WRK_CASE_LABEL=t7b WRK_CASE_JOB=t7-builder \
+  WRK_CASE_CONFIG="$T7_INIT_CONFIG" WRK_CASE_REMOTE_CONFIG="$T7_REMOTE_CONFIG" \
+  WRK_CASE_REMOTE_PANEWIRE_BIN="$ROOT/tests/fixtures/panewire" \
+  run_remote "$ROOT/bin/wrk" --host desktop --role builder --lane b1446-t7 --parent director-1 --task 11 2>&1)"
+grep -q ' lane=b1446-t7@desktop$' <<<"$t7_out" || {
+  echo 'FAIL T7 emitted line must end lane=b1446-t7@desktop' >&2; printf '%s\n' "$t7_out" >&2; exit 1;
+}
+python3 - "$TMP/wake.log" "$T6_OP" <<'PY' || {
+import sys
+log, op = sys.argv[1:]
+lines = [l.split() for l in open(log, encoding="utf-8")]
+adds = [l for l in lines if l[:2] == ["lanes", "add"]]
+assert len(adds) == 1, "exactly one initiator lanes add expected: %r" % lines
+argv = adds[0]
+assert argv[argv.index("--machine") + 1] == "desktop", argv
+assert argv[argv.index("--hub-token-env") + 1] == op, argv
+PY
+  echo 'FAIL T7 the initiator must add the deferred lane itself' >&2
+  cat "$TMP/wake.log" >&2; exit 1;
+}
+printf '%s\n' 'PASS wrk-remote-task T7-tokenless-remote-defers-to-initiator'
