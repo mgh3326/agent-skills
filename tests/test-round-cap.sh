@@ -282,23 +282,28 @@ expect_rc 78 "$WRK" round open jh --head "$H1"   # same head again still capped
 expect_rc 78 "$WRK" round open jh --head "$H4"   # a new head is not a new budget
 echo "PASS head-change-keeps-count"
 
-# ── sub-round naming: a verdict without an open round still counts ──────────
+# ── unopened verdict is refused, consumes nothing, and emits no escalate ──
 mkjob js
 write_verdict "$TMP/vs.md" BLOCKER "$H1"
-out="$("$WRK" round verdict js --file "$TMP/vs.md")"
-grep -q 'round=unopened' <<<"$out" || fail "unbound verdict must report unopened: $out"
+set +e
+"$WRK" round verdict js --file "$TMP/vs.md" >"$TMP/vs.out" 2>"$TMP/vs.err"
+rc=$?
+set -e
+[[ "$rc" -eq 2 ]] || fail "unopened verdict must refuse rc 2: $rc"
+grep -qxF "wrk: round verdict: job js has no open round; open one with wrk round open js --head $H1" "$TMP/vs.err" || fail "missing NO_OPEN_ROUND refusal"
 status="$("$WRK" round status js)"
-grep -q 'rounds=1' <<<"$status" || fail "unopened verdict must consume a round: $status"
+grep -q 'rounds=0' <<<"$status" || fail "refused verdict must consume no round: $status"
+[[ "$(escalate_count "$ARBITER_INBOX_ROOT/js/events")" == 0 ]] || fail "refused verdict emitted cap escalate"
+python3 - "$ARBITER_INBOX_ROOT/js/events" <<'PY2'
+import json, pathlib, sys
+assert not any(json.loads(p.read_text()).get("kind")=="job.verdict"
+               for p in pathlib.Path(sys.argv[1]).glob("*.json")), "refused verdict wrote a record"
+PY2
+open_ok "$WRK" js "$H1"
 open_ok "$WRK" js "$H2"
 open_ok "$WRK" js "$H3"
-expect_rc 78 "$WRK" round open js --head "$H4"   # 1 verdict + 2 opens = 3
-python3 - "$ARBITER_INBOX_ROOT/js/events" <<'PY'
-import json, pathlib, sys
-evs = [json.loads(p.read_text()) for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json"))]
-v = next(e for e in evs if e["kind"] == "job.verdict")
-assert v.get("unopened") is True and v["round"] is None, v
-PY
-echo "PASS unopened-verdict-counts-as-round"
+expect_rc 78 "$WRK" round open js --head "$H4"
+echo "PASS unopened-verdict-counts-as-round-refused"
 
 # ── void: a director-1 server-set grant releases one cap slot ───────────────
 mkjob jvoid
@@ -607,7 +612,7 @@ open_ok "$WRK" ju "$H1"
 expect_rc 2 "$WRK" round open ju --head "$H2" --extend hk:doc/good2
 echo "PASS extend-before-cap-refused"
 
-# ── orphan verdict at the cap: recorded, escalated, rc 78 ───────────────────
+# ── orphan verdict at the cap: refused, no record or escalate ──────────────
 # Each bound verdict needs its own head and bytes. The same path, the same
 # content, or the same head is refused (hk 1449), so reusing one file would
 # stop before the unbound fourth verdict.
@@ -620,18 +625,24 @@ for h in "$H1" "$H2" "$H3"; do
   "$WRK" round verdict jo --file "$TMP/vo$n.md" >/dev/null
 done
 write_verdict "$TMP/vo4.md" BLOCKER "$H4"
-expect_rc 78 "$WRK" round verdict jo --file "$TMP/vo4.md"
+set +e
+"$WRK" round verdict jo --file "$TMP/vo4.md" >"$TMP/vo4.out" 2>"$TMP/vo4.err"
+rc=$?
+set -e
+[[ "$rc" -eq 2 ]] || fail "over-cap orphan verdict must refuse rc 2: $rc"
+grep -qxF "wrk: round verdict: job jo has no open round; open one with wrk round open jo --head $H4" "$TMP/vo4.err" || fail "missing NO_OPEN_ROUND refusal at cap"
 status="$("$WRK" round status jo)"
-grep -q 'rounds=4' <<<"$status" || fail "over-cap verdict must still count: $status"
-[[ "$(escalate_count "$ARBITER_INBOX_ROOT/jo/events")" == 1 ]] ||
-  fail "over-cap orphan verdict must emit the cap escalate"
+grep -q 'rounds=3' <<<"$status" || fail "refused over-cap verdict changed count: $status"
+[[ "$(escalate_count "$ARBITER_INBOX_ROOT/jo/events")" == 0 ]] ||
+  fail "refused over-cap orphan verdict must not emit cap escalate"
 python3 - "$ARBITER_INBOX_ROOT/jo/events" <<'PY'
 import json, pathlib, sys
 evs = [json.loads(p.read_text()) for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json"))]
-v = [e for e in evs if e["kind"] == "job.verdict"][-1]
-assert v.get("unopened") is True, v
+verdicts = [e for e in evs if e["kind"] == "job.verdict"]
+assert len(verdicts) == 3, verdicts
+assert all(isinstance(v.get("round"), int) and not v.get("unopened") for v in verdicts), verdicts
 PY
-echo "PASS over-cap-orphan-verdict"
+echo "PASS over-cap-orphan-verdict-refused"
 
 # ── assertion-RED mutants over the wrk source ────────────────────────────────
 mutant() { # mutant <name> <spec-file>; spec lines are 'OLD => NEW' (first match)
@@ -657,7 +668,6 @@ src = open(__import__("sys").argv[1], encoding="utf-8").read()
 for anchor in (
     "if used >= cap:",
     '"reason": "tester round cap reached", "question": question,',
-    "        used += 1  # this unbound verdict is itself a round",
     "        if issuer not in allowed_issuers or issuer != identity:",
     'r"^round-extension: job=(\\S+) extra=(\\d+) by=(\\S+)$"',
     "{40})\\s*$",
@@ -703,29 +713,6 @@ set -e
   fail "mutant noesc still emitted a reasoned cap escalate"
 echo "PASS mutant-noesc"
 
-# mutant: an unopened verdict no longer counts as a round. RED proof: at the
-# cap the mutant must let the over-cap verdict through with rc 0 — the rc 78
-# assertion is what credits the counting.
-printf '        used += 1  # this unbound verdict is itself a round =>         pass\n' >"$TMP/spec-nocount"
-mutant nocount "$TMP/spec-nocount"
-jmn="mut-nc"
-mkjob "$jmn"
-for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/nocount-wrk" "$jmn" "$h"; done
-n=0
-for h in "$H1" "$H2" "$H3"; do
-  n=$((n + 1))
-  write_verdict "$TMP/vnc$n.md" BLOCKER "$h"
-  "$TMP/nocount-wrk" round verdict "$jmn" --file "$TMP/vnc$n.md" >/dev/null 2>&1
-done
-write_verdict "$TMP/vnc4.md" BLOCKER "$H4"
-set +e
-"$TMP/nocount-wrk" round verdict "$jmn" --file "$TMP/vnc4.md" >/dev/null 2>&1
-rc=$?
-set -e
-[[ "$rc" -eq 0 ]] ||
-  fail "mutant nocount still refused the over-cap verdict (rc=$rc) — verdict-cap assertion is vacuous"
-echo "PASS mutant-nocount"
-
 # mutant: approval issuer no longer checked against session/author
 printf '        if issuer not in allowed_issuers or issuer != identity: =>         if issuer not in allowed_issuers:\n' >"$TMP/spec-noforge"
 mutant noforge "$TMP/spec-noforge"
@@ -765,6 +752,7 @@ printf '{40})\\s*$ => {40})\n' >"$TMP/spec-noshaend"
 mutant noshaend "$TMP/spec-noshaend"
 jml="mut-long"
 mkjob "$jml"
+open_ok "$WRK" "$jml" "$H1"
 printf 'VERDICT: PASS @%sF\n' "$H1" >"$TMP/vlong41.md"
 set +e
 "$TMP/noshaend-wrk" round verdict "$jml" --file "$TMP/vlong41.md" >/dev/null 2>&1
@@ -780,6 +768,7 @@ printf 'if len(matches) > 1: => if False:\n' >"$TMP/spec-multi"
 mutant multi "$TMP/spec-multi"
 jmm="mut-mv"
 mkjob "$jmm"
+open_ok "$WRK" "$jmm" "$H1"
 write_verdict "$TMP/vmulti.md" BLOCKER "$H1"
 printf 'VERDICT: PASS @%s\n' "$H2" >>"$TMP/vmulti.md"
 set +e

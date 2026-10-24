@@ -5728,15 +5728,12 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       job.claim/job.reclaim repo, worktree or cwd field. If none is usable,
       pass --repo PATH. A missing commit triggers one bounded fetch of origin.
   wrk round verdict JOB --file PATH
-      Record the tester's verdict file for the oldest open round that has
-      none. PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
+      A verdict binds to the oldest open round on its own head and is refused when there is none.
+      PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
       The record stores that file's content sha256 beside its path. A later
       verdict is refused when the path, those exact bytes, or that head was
       already recorded for this job. A repeated head is allowed only when
       the round that held the earlier verdict was voided.
-      A verdict that binds to no open round still counts as a round, so
-      verdict files written elsewhere or recorded without an open cannot
-      dodge the cap.
   wrk round status JOB
       Print one line: job=… rounds=N cap=N open=… last_verdict=… and any
       voided rounds as 'round N void (hk:doc/…)' or 'round N void (hk:task/…)'.
@@ -6367,11 +6364,10 @@ round_verdict_cmd() {
   wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   local outcome rc=0
   set +e
-  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
+  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" <<'PY'
 import fcntl, hashlib, io, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, vfile, cap = sys.argv[1:]
-cap = int(cap)
+events, job, owner, label, pane, parent, vfile = sys.argv[1:]
 os.makedirs(events, exist_ok=True)
 verdict = vsha = None
 matches = []
@@ -6471,25 +6467,32 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     target = None
     for r in rounds:
         if (isinstance(r.get("round"), int) and r.get("round") not in bound
-                and r.get("round") not in voided):
+                and r.get("round") not in voided
+                and isinstance(r.get("head"), str)
+                and r["head"].lower() == vsha):  # hk1506-head-bind
             target = r["round"]
             break
+    if target is None:
+        opens = [r for r in rounds if isinstance(r.get("round"), int)
+                 and r["round"] not in bound and r["round"] not in voided]
+        if opens:
+            listing = ", ".join("%d@%s" % (r["round"], r["head"][:7]
+                               if isinstance(r.get("head"), str) else "?") for r in opens)
+            print("NO_HEAD_ROUND\t%s\t%s" % (vsha, listing))
+        else:
+            print("NO_OPEN_ROUND\t%s" % vsha)
+        raise SystemExit(0)
     used = sum(1 for r in rounds
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
     used += wrk_takeover_rounds(events)
-    if target is None:
-        used += 1  # this unbound verdict is itself a round
     record = {"kind": "job.verdict", "job_id": job, "owner_lane": owner,
               "label": label, "pane_id": pane, "parent_lane": parent,
               "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
               "content_sha256": digest, "round": target, "epoch": 1}
-    if target is None:
-        record["unopened"] = True
     wrk_event_commit(events, "job.verdict", record)
-    over = target is None and used > cap
-    print("RECORDED round=%s verdict=%s head=%s used=%d over=%d" %
-          (target if target is not None else "unopened", verdict, vsha, used, int(over)))
+    print("RECORDED round=%s verdict=%s head=%s used=%d" %
+          (target, verdict, vsha, used))
 PY
 )"
   rc=$?
@@ -6502,31 +6505,22 @@ PY
       die "round verdict --file has more than one VERDICT line: $file" ;;
     ENDED$'\t'*|DUP_PATH$'\t'*|DUP_CONTENT$'\t'*|DUP_HEAD$'\t'*)
       wrk_verdict_refusal "$outcome" ;;
+    NO_HEAD_ROUND$'\t'*)
+      local refused_head open_list
+      IFS=$'\t' read -r _ refused_head open_list <<<"$outcome"
+      die "round verdict: no open round for head $refused_head on job $job (open: $open_list); open one with wrk round open $job --head $refused_head" ;;
+    NO_OPEN_ROUND$'\t'*)
+      die "round verdict: job $job has no open round; open one with wrk round open $job --head ${outcome#*$'\t'}" ;;
     RECORDED*)
-      local round_no="" verdict_v="" head_v="" used_v="" over_v="" status question tok
+      local round_no="" verdict_v="" head_v="" used_v="" tok
       for tok in $outcome; do
         case "$tok" in
           round=*) round_no="${tok#round=}" ;;
           verdict=*) verdict_v="${tok#verdict=}" ;;
           head=*) head_v="${tok#head=}" ;;
           used=*) used_v="${tok#used=}" ;;
-          over=*) over_v="${tok#over=}" ;;
         esac
       done
-      if [[ "$round_no" == unopened ]]; then
-        warn "verdict bound to no open round; counted as a round itself (job=$job rounds=$used_v)"
-        if [[ "$over_v" == 1 ]]; then
-          status="$(round_cap_event "$job" "$owner" "$label" "$pane" "$parent" "$head_v" "$ROUND_CAP_DEFAULT")"
-          if [[ "$status" == emitted* ]]; then
-            question="tester round cap $ROUND_CAP_DEFAULT reached at $used_v rounds; builder must stop and wait for the parent; extension needs a hk approval record naming this job (wrk round open --extend REF)"
-            emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
-              "$file" "$verdict_v@$head_v" "$ROUND_CAP_REASON" "$question" "" "$head_v"
-            warn "round cap $ROUND_CAP_DEFAULT reached for $job ($used_v rounds); emitted job.escalate to parent $parent"
-          fi
-          echo "OK job=$job verdict=$verdict_v head=$head_v round=unopened rounds=$used_v cap=$ROUND_CAP_DEFAULT"
-          exit "$WRK_EXIT_ROUND_CAP"
-        fi
-      fi
       echo "OK job=$job verdict=$verdict_v head=$head_v round=$round_no rounds=$used_v cap=$ROUND_CAP_DEFAULT"
       ;;
     *) die "round verdict unexpected outcome: $outcome" ;;
