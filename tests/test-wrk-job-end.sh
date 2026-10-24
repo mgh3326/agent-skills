@@ -1952,6 +1952,14 @@ echo "== JE43: herdr answering gone rearms agent_not_found =="
 case_recovery_herdr_gone || fail "JE43 herdr gone answer must rearm the loss"
 echo "PASS je43 herdr-unreachable-rearms-on-gone"
 
+# live_quota_still_held JOB — the real arbiter row seeded by arb_lease is still
+# unreleased and no quota_pool.release event landed. A stub that always answers
+# "one row" proves a release call, but only a real row proves the row survived
+# (hk1888 round 2: the call-only release mutant survived the stub-only check).
+live_quota_still_held() {
+  [[ "$(quota_rows "$1")" == 1 && "$(release_events "$1")" -eq 0 ]]
+}
+
 # A strict gone/ok flap must not postpone the watch window. The sequence is
 # long enough that the run ends while the lines are still alternating: the
 # fixture repeats only its last line. hk1888: the window now ends at the first
@@ -1960,7 +1968,8 @@ echo "PASS je43 herdr-unreachable-rearms-on-gone"
 case_recovery_window_flap() {
   reset_case je44 || return 3
   mk_job je44 || return 3
-  recovery_arm_stub
+  arb_lease je44 || return 3
+  [[ "$(quota_rows je44)" == 1 ]] || return 3
   local seq="$TMP/je44-$CASE_SEQ.seq" events="$INBOX/je44/events" reasons i
   : >"$seq"
   for ((i = 0; i < 40; i++)); do
@@ -1977,8 +1986,8 @@ case_recovery_window_flap() {
   if event_count_is "$events" job.recovered 0; then
     recovery_fail "the flap must recover the absence episodes" || return
   fi
-  [[ "$(recovery_release_count)" -eq 0 ]] ||
-    recovery_fail "a live flap must not release quota" || return
+  live_quota_still_held je44 ||
+    recovery_fail "a live flap must leave the job's quota row in place" || return
   if grep -q 'watch-exit' "$INBOX/je44/completion-sentinel.log"; then
     recovery_fail "the windowed flap must not watch-exit" || return
   fi
@@ -2000,7 +2009,8 @@ live_window_case() {
   local job="$1" scenario="$2" events
   reset_case "$job" || return 3
   mk_job "$job" || return 3
-  recovery_arm_stub
+  arb_lease "$job" || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
   events="$INBOX/$job/events"
   SCENARIO="$scenario" SENT_INTERVAL=1 LOST_GRACE=2 SENT_TIMEOUT=3 \
     start_sentinel "$job" w:p1 "$TMP/$job-report.md"
@@ -2012,8 +2022,8 @@ live_window_case() {
     recovery_fail "$job: a live pane past the window must not be revoked" || return
   event_count_is "$events" job.recovered 0 ||
     recovery_fail "$job: watch-expired is not a recovery" || return
-  [[ "$(recovery_release_count)" -eq 0 ]] ||
-    recovery_fail "$job: a live pane past the window must not release quota" || return
+  live_quota_still_held "$job" ||
+    recovery_fail "$job: a live pane past the window must leave the job's quota row in place" || return
   grep -q 'action=watch-expired elapsed=[0-9]*s' "$INBOX/$job/completion-sentinel.log" ||
     recovery_fail "$job: the log must carry watch-expired with the elapsed seconds" || return
   if grep -q 'action=lost:' "$INBOX/$job/completion-sentinel.log"; then
@@ -4830,5 +4840,19 @@ mkmut_span r34-unconditional-lost-timeout \
   '      if false; then # reverted hk1888 live-pane guard'
 expect_mut_red "R34 live pane past the window is not lost" live_window_working_case \
   'FAIL: je45: a live pane past the window must not write job.lost'
+
+# R35: hk1888 round 2 — a release in the watch-expired exit must lose the live
+# job's real quota row. The mutant calls the arbiter directly: a call-only
+# release_job_quota_pool is an equivalent mutant for a live job, because its
+# quota_release_round_current guard (hk 1813, #229) refuses to release a job
+# with no work-terminal record, so that call leaves the row and writes nothing.
+# expect_mut_red runs the case in a subshell, so CASE_SEQ does not advance: the
+# case gets its own job name or it would reuse R34's inbox.
+live_window_working_quota_case() { live_window_case je45q sentinel-working; }
+mkmut_span r35-watch-expired-releases-quota \
+  'hk1888-watch-expired-exit' \
+  '    if [[ -n "$watch_expired" ]]; then "${ARBITER:-arbiter}" release --job "$job" --resource codex --kind quota_pool >/dev/null 2>&1 || : # reverted: watch-expired releases quota'
+expect_mut_red "R35 watch-expired must not release the live job's quota row" live_window_working_quota_case \
+  "FAIL: je45q: a live pane past the window must leave the job's quota row in place"
 
 echo "PASS test-wrk-job-end: all cases"

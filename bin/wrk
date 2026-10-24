@@ -7183,7 +7183,7 @@ PY
       lost_reason=""
       lost_at=0
     fi
-    if [[ -n "$watch_expired" ]]; then
+    if [[ -n "$watch_expired" ]]; then # hk1888-watch-expired-exit
       # A recovery poll already logged recovered:*; the watch end gets its own
       # line. The job stays live: done, joined, reap and prune end it as usual.
       [[ "$action" == watch-expired ]] ||
