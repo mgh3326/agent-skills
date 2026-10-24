@@ -3,6 +3,11 @@ set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
 export WRK_TEST_MODE=1
+# hk 1897: scrub the ambient pane env — a suite run from inside a spawned job
+# would otherwise leak ARBITER_JOB into every spawn and its parent claim is
+# resolved from the arbiter DB now, so a foreign parent must not steer the
+# task resolution of these fixtures.
+unset ARBITER_JOB ARBITER_JOB_REGISTERED
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"

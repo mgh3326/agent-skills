@@ -15,6 +15,11 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 export ARBITER_INBOX_ROOT="$TMP/inbox"
+# hk 1897: the claim helpers run the arbiter the guard selects; a copy under
+# the temp root is honoured in test mode for $WRK and for the $TMP mutants.
+cp "$ROOT/bin/arbiter" "$TMP/arbiter"
+chmod 700 "$TMP/arbiter"
+export ARBITER_BIN="$TMP/arbiter"
 export HOME="$TMP/home"
 export XDG_CONFIG_HOME="$TMP/xdg/config"
 export XDG_CACHE_HOME="$TMP/xdg/cache"
@@ -72,22 +77,46 @@ fi
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
-mkjob() { # mkjob <name> [parent-lane] [task-id] [repo|worktree|cwd|none]
-  local events="$ARBITER_INBOX_ROOT/$1/events" tid="" repo_field="${4:-repo}" repo_meta=""
-  mkdir -p "$events"
-  [[ -z "${3:-}" ]] || tid=",\"task_id\":$3"
-  [[ "$repo_field" == none ]] || repo_meta=",\"$repo_field\":\"$TEST_REPO\""
-  cat >"$events/00001-job.claim.json" <<EOF
-{"created_at":"2026-09-27T00:00:00Z","job_id":"$1","kind":"job.claim","payload":{"agent_label":"$1","owner_lane":"$1-lane","pane_id":"w:p1","parent_lane":"${2:-director-1}"${tid}${repo_meta},"role":"builder","t_level":"T2"},"seq":1}
-EOF
+# hk 1897: claim identity is minted by `arbiter claim` in the DB (which writes
+# the events-dir file too); the file is only patched afterwards with fields
+# the payload never carried (repo/worktree/cwd, pane_id), never with
+# owner_lane/parent_lane/task_id.
+patch_claim() { # patch_claim <claim-file> <extra-json-object>
+  python3 - "$1" "$2" <<'PY'
+import json, sys
+p = sys.argv[1]
+doc = json.loads(open(p, encoding="utf-8").read())
+doc["payload"].update(json.loads(sys.argv[2]))
+open(p, "w", encoding="utf-8").write(json.dumps(doc) + "\n")
+PY
 }
 
-reclaim() { # reclaim <job> <parent-lane> [task-id] — a later event rewriting the recorded meta
-  local tid=""
-  [[ -z "${3:-}" ]] || tid=",\"task_id\":$3"
-  cat >"$ARBITER_INBOX_ROOT/$1/events/00002-job.reclaim.json" <<EOF
-{"created_at":"2026-10-12T00:00:00Z","job_id":"$1","kind":"job.reclaim","payload":{"agent_label":"$1","owner_lane":"$1-lane","pane_id":"w:p1","parent_lane":"$2"${tid},"repo":"$TEST_REPO","role":"builder","t_level":"T2"},"seq":2}
-EOF
+mkjob() { # mkjob <name> [parent-lane] [task-id] [repo|worktree|cwd|none]
+  local repo_field="${4:-repo}" tid=()
+  [[ -z "${3:-}" ]] || tid=(--task-id "$3")
+  "$ARBITER_BIN" claim --job "$1" --lane "$1-lane" --t T2 --role builder \
+    --parent-lane "${2:-director-1}" --agent-label "$1" ${tid[@]+"${tid[@]}"} >/dev/null ||
+    fail "arbiter claim failed for $1"
+  if [[ "$repo_field" == none ]]; then
+    patch_claim "$ARBITER_INBOX_ROOT/$1/events/00001-job.claim.json" '{"pane_id":"w:p1"}'
+  else
+    patch_claim "$ARBITER_INBOX_ROOT/$1/events/00001-job.claim.json" \
+      "{\"pane_id\":\"w:p1\",\"$repo_field\":\"$TEST_REPO\"}"
+  fi
+}
+
+reclaim() { # reclaim <job> <parent-lane> [task-id] — a real arbiter reclaim row
+  local tid=() latest
+  [[ -z "${3:-}" ]] || tid=(--task-id "$3")
+  "$ARBITER_BIN" lease --job "$1" --resource "$TMP/respawn-$1" --kind path >/dev/null ||
+    fail "arbiter lease failed for $1"
+  "$ARBITER_BIN" release --job "$1" --resource "$TMP/respawn-$1" --kind path --force >/dev/null ||
+    fail "arbiter release failed for $1"
+  "$ARBITER_BIN" claim --reclaim-released --job "$1" --lane "$1-lane" --t T2 --role builder \
+    --parent-lane "$2" --agent-label "$1" ${tid[@]+"${tid[@]}"} >/dev/null ||
+    fail "arbiter reclaim failed for $1"
+  latest="$(find "$ARBITER_INBOX_ROOT/$1/events" -name '*-job.reclaim.json' | sort | tail -1)"
+  patch_claim "$latest" "{\"pane_id\":\"w:p1\",\"repo\":\"$TEST_REPO\"}"
 }
 
 expect_rc() { # expect_rc <want> <cmd...>

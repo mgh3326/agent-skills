@@ -30,10 +30,20 @@ class RoundExtensionSpawn(unittest.TestCase):
         source = (ROOT / "bin/wrk").read_text().rsplit('case "${1:-}" in', 1)[0]
         self.lib = self.base / "wrk-lib"
         self.lib.write_text(source)
+        # hk 1897: the claim identity wrk trusts lives in the arbiter DB claim
+        # row — mint it for real (the events file comes along) instead of
+        # hand-writing one. ARBITER_BIN must sit under this temp root.
+        self.arbiter = self.base / "arbiter"
+        self.arbiter.write_bytes((ROOT / "bin/arbiter").read_bytes())
+        self.arbiter.chmod(0o700)
+        self.env["ARBITER_BIN"] = str(self.arbiter)
         events = self.base / "jobs/b1632-sol/events"
         events.mkdir(parents=True)
-        (events / "00001-job.claim.json").write_text(json.dumps({"job_id": "b1632-sol",
-            "kind": "job.claim", "payload": {"task_id": "1632", "parent_lane": "director-1"}}))
+        claim = subprocess.run([str(self.arbiter), "claim", "--job", "b1632-sol",
+            "--lane", "fixture-builder", "--t", "T2", "--role", "builder",
+            "--parent-lane", "director-1", "--agent-label", "b1632-sol",
+            "--task-id", "1632"], env=self.env, capture_output=True, text=True)
+        assert claim.returncode == 0, claim.stderr
         self.prompt = self.base / "brief.md"
         self.prompt.write_text("inert fixture")
         self.stub("hk", '''import json, os, sys
@@ -88,6 +98,21 @@ else: raise SystemExit("unexpected scopefuel command")
         path = self.base / name
         path.write_text("#!/usr/bin/env python3\n" + text)
         path.chmod(0o700)
+
+    def dbreclaim(self, *, parent_lane="pa-integrator", task_id="1632"):
+        # hk 1897: the parent/task identity a grant consults is the arbiter DB
+        # claim row — a rewritten events file alone changes nothing. Simulating
+        # a parent change mints a real reclaim (lease -> force-release ->
+        # claim --reclaim-released), which also writes the events file.
+        res = str(self.base / "reclaim-res")
+        for argv in (["lease", "--job", "b1632-sol", "--resource", res, "--kind", "path"],
+                     ["release", "--job", "b1632-sol", "--resource", res, "--kind", "path", "--force"],
+                     ["claim", "--reclaim-released", "--job", "b1632-sol", "--lane", "fixture-builder",
+                      "--t", "T2", "--role", "builder", "--parent-lane", parent_lane,
+                      "--agent-label", "b1632-sol", "--task-id", task_id]):
+            out = subprocess.run([str(self.arbiter), *argv], env=self.env,
+                                 capture_output=True, text=True)
+            assert out.returncode == 0, out.stderr
 
     def run_spawn(self, *, model="codex-astra", role="tester", ref=REF,
                   purpose="round-extension", extra=(), environment=None, router=False, launch=False):
@@ -292,9 +317,8 @@ mock_mcp_verify() { :; }
             with self.subTest(issuer=issuer):
                 process, _ = self.run_spawn(environment={"DOC_ISSUER": issuer})
                 self.assertEqual(process.returncode, 91, process.stderr)
-        claim = self.base / "jobs/b1632-sol/events/00001-job.claim.json"
-        claim.write_text(json.dumps({"kind": "job.claim", "payload": {
-            "task_id": "1632", "parent_lane": "pa-integrator"}}))
+        # A reclaimed parent identity comes from a real DB reclaim row.
+        self.dbreclaim(parent_lane="pa-integrator")
         reply = {"state": "claimed", "claimed_by": "", "project": "ParkingArcade",
                  "refs": {"job_id": "b1632-sol"}}
         process, _ = self.run_spawn(environment={"DOC_ISSUER": "pa-integrator",
@@ -370,10 +394,10 @@ mock_mcp_verify() { :; }
                 environment={"TASK_REPLY": json.dumps(valid)})
 
     def test_builder_newest_recorded_parent_and_parkingarcade_restriction(self):
+        # The newest DB claim row is authoritative; its reclaim file agrees.
+        self.dbreclaim(parent_lane="pa-integrator")
         events = self.base / "jobs/b1632-sol/events"
-        newest = events / "00002-job.reclaim.json"
-        newest.write_text(json.dumps({"kind": "job.reclaim", "payload": {
-            "task_id": "1632", "parent_lane": "pa-integrator"}}))
+        newest = sorted(events.glob("*-job.reclaim.json"))[-1]
         self.assert_denied(role="builder")  # Old director-1 parent no longer authorizes.
         for issuer in ("operator", "operator-desk", "pa-integrator"):
             process, _ = self.run_spawn(role="builder", environment={"DOC_ISSUER": issuer})
@@ -382,6 +406,7 @@ mock_mcp_verify() { :; }
         self.assert_denied(role="builder", environment={"DOC_ISSUER": "pa-integrator", "TASK_REPLY": json.dumps(reply)})
         newest.write_text("not JSON")
         self.assert_denied(role="builder")
+        # A forged newest file disagreeing with the DB row refuses too.
         newest.write_text(json.dumps({"kind": "job.reclaim", "payload": {
             "task_id": "1633", "parent_lane": "director-1"}}))
         for issuer in ("operator", "director-1"):

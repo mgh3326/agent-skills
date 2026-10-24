@@ -173,6 +173,9 @@ scopefuel 정책이며 이 문서에는 두 번째 급표를 만들지 않는다
    issuer 는 operator·operator-desk·director-1·pa-integrator 뿐이다(뒤 둘은 그 job 의
    parent lane 일 때만 — 기록된 parent lane 은 그 고정 집합 밖에서 신뢰하지 않는다);
    by=pa-integrator 는 서버상 그 job 에 묶인 ParkingArcade task 에서만 유효하다.
+   hk 1897: job 의 parent lane·owner·task id 는 events-dir 파일이 아니라 arbiter 가 민팅한
+   DB claim row 에서 읽는다 — 같은 OS 사용자가 sqlite 를 고치거나 스스로 arbiter claim 을
+   돌릴 수는 있으므로 좁힐 뿐 경계는 아니다(hk 525).
    기존 verdict 가 없는 라운드는 `wrk round void JOB N --by REF [--reason TEXT]` 로 폐기할 수 있다.
    승인 문서는 `round-void: job=JOB round=N by=<parent-lane|operator>` 줄을 포함해야 하며,
    기존 extension 과 같은 서버 identity·parent-lane·pa-integrator task 검증을 거친다. 유효한 void 는

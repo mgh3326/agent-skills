@@ -4949,6 +4949,7 @@ def trust_canonical(home):
         "inbox": os.path.join(home, "work", "herdr-inbox", "jobs"),
         "db": os.path.join(home, ".local", "share", "arbiter", "state.db"),
         "hk": os.path.join(home, ".local", "bin", "handoffkeep"),
+        "arbiter": os.path.join(home, ".local", "bin", "arbiter"),
     }
 
 
@@ -4977,43 +4978,50 @@ def trust_temp_roots(env, home):
     return roots
 
 
-def trust_secure_binary(canonical, uid):
+def trust_secure_binary(canonical, uid, name):
     resolved = os.path.realpath(canonical)
     try:
         info = os.stat(resolved)
     except OSError as exc:
-        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep is unusable (%s): %s" % (resolved, exc.strerror or exc))
+        raise TrustRefusal(name, canonical, "the canonical %s is unusable (%s): %s" % (name, resolved, exc.strerror or exc))
     if not stat.S_ISREG(info.st_mode):
-        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is not a regular file" % resolved)
+        raise TrustRefusal(name, canonical, "the canonical %s %s is not a regular file" % (name, resolved))
     if info.st_uid != uid:
-        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is owned by uid %d, not uid %d" % (resolved, info.st_uid, uid))
+        raise TrustRefusal(name, canonical, "the canonical %s %s is owned by uid %d, not uid %d" % (name, resolved, info.st_uid, uid))
     if info.st_mode & 0o022:
-        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is group- or world-writable (mode %04o)" % (resolved, info.st_mode & 0o7777))
+        raise TrustRefusal(name, canonical, "the canonical %s %s is group- or world-writable (mode %04o)" % (name, resolved, info.st_mode & 0o7777))
     return resolved
 
 
-def trust_resolve(env, home, uid, test_mode, need_hk, fixtures=""):
-    """Return {"inbox", "db", "hk", "overrides"} or raise TrustRefusal.
+def trust_resolve(env, home, uid, test_mode, need_hk, fixtures="", need_arbiter=False, script_dir=""):
+    """Return {"inbox", "db", "hk", "arbiter", "overrides"} or raise TrustRefusal.
 
     Outside test mode each lever (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME,
-    HANDOFFKEEP_BIN) must resolve to its canonical path under home, and the PATH
-    lookup of handoffkeep is never used: the canonical binary must be a regular
-    file owned by uid and not group- or world-writable. In test mode (a test
-    suite only) no canonical path is consulted or resolved: every path in use
-    must resolve under a temp root, the handoffkeep binary also under fixtures.
+    HANDOFFKEEP_BIN, ARBITER_BIN) must resolve to its canonical path under
+    home, and the PATH lookup of handoffkeep or arbiter is never used: the
+    canonical binary must be a regular file owned by uid and not group- or
+    world-writable. In test mode (a test suite only) no canonical path is
+    consulted or resolved: every path in use must resolve under a temp root,
+    the handoffkeep binary also under fixtures, and the arbiter binary also
+    under the directory of the wrk being exercised (hk 1897).
     """
     home_env = trust_value(env, "HOME")
     inbox_env = trust_value(env, "ARBITER_INBOX_ROOT")
     data_env = trust_value(env, "XDG_DATA_HOME")
     hk_env = trust_value(env, "HANDOFFKEEP_BIN")
+    arb_env = trust_value(env, "ARBITER_BIN")
     known = bool(home) and os.path.isabs(home)
     if not known and not test_mode:
         raise TrustRefusal("HOME", "(unknown)", "the passwd home of uid %d cannot be determined, so there is no canonical path to compare with" % uid)
-    canon = trust_canonical(home) if known else {"inbox": None, "db": None, "hk": None}
+    canon = trust_canonical(home) if known else {"inbox": None, "db": None, "hk": None, "arbiter": None}
     roots = trust_temp_roots(env, home if known else "") if test_mode else []
     hk_roots = list(roots)
+    arb_roots = list(roots)
     if test_mode and fixtures:
         hk_roots.append(os.path.realpath(fixtures))
+        arb_roots.append(os.path.realpath(fixtures))
+    if test_mode and script_dir:
+        arb_roots.append(os.path.realpath(script_dir))
     overrides = []
 
     def judge(var, effective, canonical, label, allowed):
@@ -5044,8 +5052,9 @@ def trust_resolve(env, home, uid, test_mode, need_hk, fixtures=""):
     db = judge("XDG_DATA_HOME" if data_env else "HOME",
                os.path.join(data_env or under_home(".local", "share"), "arbiter", "state.db"), canon["db"], "arbiter DB", roots)
     hk = ""
+    arb = ""
+    search = env.get("PATH") or os.defpath
     if need_hk:
-        search = env.get("PATH") or os.defpath
         if test_mode:
             wanted = hk_env or "handoffkeep"
             found = wanted if "/" in wanted else (shutil.which(wanted, path=search) or "")
@@ -5055,29 +5064,44 @@ def trust_resolve(env, home, uid, test_mode, need_hk, fixtures=""):
             if hk_env:
                 found = hk_env if "/" in hk_env else (shutil.which(hk_env, path=search) or hk_env)
                 judge("HANDOFFKEEP_BIN", found, canon["hk"], "handoffkeep", ())
-            hk = trust_secure_binary(canon["hk"], uid)
-    return {"inbox": inbox, "db": db, "hk": hk, "overrides": overrides}
+            hk = trust_secure_binary(canon["hk"], uid, "handoffkeep")
+    if need_arbiter:
+        if test_mode:
+            wanted = arb_env or "arbiter"
+            found = wanted if "/" in wanted else (shutil.which(wanted, path=search) or "")
+            if found:
+                arb = judge("ARBITER_BIN" if arb_env else "PATH", found, canon["arbiter"], "arbiter", arb_roots)
+        else:
+            if arb_env:
+                found = arb_env if "/" in arb_env else (shutil.which(arb_env, path=search) or arb_env)
+                judge("ARBITER_BIN", found, canon["arbiter"], "arbiter", ())
+            arb = trust_secure_binary(canon["arbiter"], uid, "arbiter")
+    return {"inbox": inbox, "db": db, "hk": hk, "arbiter": arb, "overrides": overrides}
 # --- trust paths: end ---
 
 
 def trust_main(argv):
-    need_hk = len(argv) > 1 and argv[1] == "hk"
+    needs = (argv[1] if len(argv) > 1 else "").split()
     test_mode = os.environ.get("WRK_TEST_MODE") == "1"
     try:
         home = pwd.getpwuid(os.getuid()).pw_dir
     except (KeyError, OSError):
         home = ""
     fixtures = ""
+    script_dir = ""
     if test_mode and len(argv) > 2 and argv[2]:
-        candidate = os.path.join(os.path.dirname(os.path.realpath(argv[2])), "..", "tests", "fixtures")
+        script_dir = os.path.dirname(os.path.realpath(argv[2]))
+        candidate = os.path.join(script_dir, "..", "tests", "fixtures")
         if os.path.isdir(candidate):
             fixtures = os.path.realpath(candidate)
     try:
-        decision = trust_resolve(os.environ, home, os.getuid(), test_mode, need_hk, fixtures)
+        decision = trust_resolve(os.environ, home, os.getuid(), test_mode, "hk" in needs, fixtures,
+                                 "arbiter" in needs, script_dir)
     except TrustRefusal as exc:
         sys.stderr.write("wrk: refusing a trust-bearing operation: %s\n" % exc)
         return 2
-    sys.stdout.write("inbox=%s\nhk=%s\noverrides=%s\n" % (decision["inbox"], decision["hk"], " ".join(decision["overrides"])))
+    sys.stdout.write("inbox=%s\nhk=%s\narbiter=%s\noverrides=%s\n" % (
+        decision["inbox"], decision["hk"], decision["arbiter"], " ".join(decision["overrides"])))
     return 0
 
 
@@ -5087,23 +5111,26 @@ if __name__ == "__main__":
 
 # Internal guard state. Assigned at load so a value inherited from the caller's
 # environment can neither stand in for the guard (WRK_TRUST_JOBS_ROOT,
-# WRK_TRUST_HK) nor silence the test-mode warning (WRK_TRUST_WARNED).
-WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK="" WRK_TRUST_WARNED=""
+# WRK_TRUST_HK, WRK_TRUST_ARBITER) nor silence the test-mode warning
+# (WRK_TRUST_WARNED).
+WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK="" WRK_TRUST_ARBITER="" WRK_TRUST_WARNED=""
 
-# wrk_trust_guard [hk] — sets WRK_TRUST_JOBS_ROOT (and WRK_TRUST_HK when "hk" is
-# passed: the operation will run handoffkeep) or exits 2. Trust-bearing reads use
-# ${WRK_TRUST_JOBS_ROOT:?...} and WRK_TRUST_HK, never wrk_jobs_root or hk_bin, so a
-# forgotten guard fails closed instead of following the environment. Call it from
-# the main shell flow, not from inside a command substitution (the exit would only
-# leave the subshell).
+# wrk_trust_guard [hk] [arbiter] — sets WRK_TRUST_JOBS_ROOT (and WRK_TRUST_HK /
+# WRK_TRUST_ARBITER when "hk" / "arbiter" are passed: the operation will run
+# handoffkeep / the canonical arbiter) or exits 2. Trust-bearing reads use
+# ${WRK_TRUST_JOBS_ROOT:?...}, WRK_TRUST_HK and WRK_TRUST_ARBITER, never
+# wrk_jobs_root, hk_bin or a PATH lookup, so a forgotten guard fails closed
+# instead of following the environment. Call it from the main shell flow, not
+# from inside a command substitution (the exit would only leave the subshell).
 wrk_trust_guard() {
   local out line
-  WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK=""
-  out="$(python3 -c "$WRK_TRUST_PY" "${1:-}" "${BASH_SOURCE[0]}")" || exit 2
+  WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK="" WRK_TRUST_ARBITER=""
+  out="$(python3 -c "$WRK_TRUST_PY" "$*" "${BASH_SOURCE[0]}")" || exit 2
   while IFS= read -r line; do
     case "$line" in
       inbox=*) WRK_TRUST_JOBS_ROOT="${line#inbox=}" ;;
       hk=*) WRK_TRUST_HK="${line#hk=}" ;;
+      arbiter=*) WRK_TRUST_ARBITER="${line#arbiter=}" ;;
       overrides=?*)
         if [[ -z "${WRK_TRUST_WARNED:-}" ]]; then
           WRK_TRUST_WARNED=1
@@ -5112,6 +5139,154 @@ wrk_trust_guard() {
     esac
   done <<<"$out"
   [[ -n "$WRK_TRUST_JOBS_ROOT" ]] || exit 2
+}
+
+# hk 1897 (hk 1453 half 2): the claim identity a trust use consults —
+# owner_lane, parent_lane, task_id — lives in the arbiter DB. Only
+# `arbiter claim` mints job.claim/job.reclaim rows, and job-get is a trust
+# command, so the row comes from the canonical DB through the canonical
+# binary the guard selected — never through ARBITER_INBOX_ROOT,
+# XDG_DATA_HOME, HOME or a PATH lookup outside test mode. The events-dir
+# copy is still compared so a forged or stale file is caught: disagreement
+# on owner_lane, parent_lane or task_id refuses the use (rc 2, one stderr
+# line naming the field and both values — the hk 525 O2(c) warning). A job
+# with no DB claim row is refused the same way. Prints
+# "owner\tparent\ttask_id" (the DB values). Requires
+# `wrk_trust_guard arbiter` first. With --missing-ok an absent DB/job/claim
+# row prints nothing and returns 0 (the caller's env fallback applies, as
+# remote delegation relies on); a mismatch or malformed row still refuses.
+job_claim_db_fields() {
+  local job="$1" missing_ok="${2:-}" out rc=0
+  local arbiter="${WRK_TRUST_ARBITER:-}"
+  local root="${WRK_TRUST_JOBS_ROOT:-}"
+  [[ -n "$root" && -n "$arbiter" && -x "$arbiter" ]] ||
+    die "claim for $job unreadable: wrk_trust_guard arbiter did not run"
+  out="$("$arbiter" job-get --job "$job" --json 2>/dev/null)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    [[ "$missing_ok" == --missing-ok ]] && return 0
+    if [[ "$rc" -eq 7 ]]; then
+      die "job $job has no arbiter claim row; refusing the trust use"
+    fi
+    die "claim for $job unreadable: canonical arbiter job-get failed (rc=$rc)"
+  fi
+  WRK_JOBGET_JSON="$out" WRK_MISSING_OK="$missing_ok" wrk_py - "$job" "$root/$job/events" <<'PY'
+import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+job, events = sys.argv[1], sys.argv[2]
+missing_ok = os.environ.get("WRK_MISSING_OK") == "--missing-ok"
+def refuse(msg):
+    sys.stderr.write("wrk: %s\n" % msg)
+    raise SystemExit(2)
+try:
+    doc = json.loads(os.environ["WRK_JOBGET_JSON"])
+except ValueError:
+    refuse("claim for %s unreadable: arbiter job-get output was not JSON" % job)
+claim = doc.get("claim") if isinstance(doc, dict) else None
+if claim is None:
+    if missing_ok:
+        raise SystemExit(0)
+    refuse("job %s has no arbiter claim row; refusing the trust use" % job)
+if not isinstance(claim, dict):
+    refuse("arbiter claim row for %s is malformed" % job)
+file_claim = {}
+names = [n for n, _, _ in wrk_events_ordered(events)
+         if n.endswith(("claim.json", "reclaim.json"))]
+if names:
+    try:
+        with open(os.path.join(events, names[-1]), encoding="utf-8") as f:
+            o = json.load(f)
+    except (OSError, ValueError):
+        refuse("newest claim/reclaim event for %s is unreadable" % job)
+    p = o.get("payload", o)
+    if not isinstance(p, dict):
+        refuse("newest claim/reclaim event for %s is malformed" % job)
+    file_claim = p
+def norm(v):
+    if v is None or isinstance(v, bool):
+        return ""
+    return str(v)
+for field in ("owner_lane", "parent_lane", "task_id"):
+    db_v = norm(claim.get(field))
+    file_v = norm(file_claim.get(field))
+    if db_v != file_v:
+        refuse("claim mismatch on %s for %s: arbiter=%s events=%s; refusing the trust use"
+               % (field, job, db_v or "(none)", file_v or "(none)"))
+print("%s\t%s\t%s" % (norm(claim.get("owner_lane")),
+                      norm(claim.get("parent_lane")), norm(claim.get("task_id"))))
+PY
+}
+
+# job_claims_db_map JOB [JOB ...] — best-effort DB claim read for non-trust
+# scans. Prints a compact JSON map {job: {"o": owner, "p": parent, "t":
+# task_id}} covering the jobs whose claim row a readable arbiter reports.
+# Any failure prints an empty map so callers keep the events-dir values.
+job_claims_db_map() {
+  local bin="${WRK_TRUST_ARBITER:-$ARBITER}"
+  [[ -n "$bin" ]] || bin="$(command -v arbiter 2>/dev/null || true)"
+  [[ -n "$bin" && -x "$bin" ]] || { echo "{}"; return 0; }
+  wrk_py - "$bin" "$@" <<'PY'
+import json, subprocess, sys
+out = {}
+for job in sys.argv[2:]:
+    try:
+        proc = subprocess.run([sys.argv[1], "job-get", "--job", job, "--json"],
+                              capture_output=True, text=True, timeout=15)
+        doc = json.loads(proc.stdout) if proc.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        doc = None
+    claim = doc.get("claim") if isinstance(doc, dict) else None
+    if isinstance(claim, dict):
+        out[job] = {"o": claim.get("owner_lane"),
+                    "p": claim.get("parent_lane"), "t": claim.get("task_id")}
+print(json.dumps(out))
+PY
+}
+
+# job_claims_db_map_root ROOT — job_claims_db_map over every job dir in ROOT,
+# for the non-trust scans (reap, prune, lanes-missing) that read whole roots.
+job_claims_db_map_root() {
+  local root="$1" dir
+  local ids=()
+  for dir in "$root"/*/; do
+    [[ -d "$dir" ]] && ids+=("$(basename "$dir")")
+  done
+  if ((${#ids[@]})); then
+    job_claims_db_map "${ids[@]}"
+  else
+    echo "{}"
+  fi
+}
+
+# job_claim_prefer_db JOB OWNER PARENT — non-trust uses (done/escalate/joined
+# routing, emit, upload): keep the events-dir values, except that when a
+# readable arbiter DB claim disagrees on owner_lane or parent_lane the DB
+# value wins and one warning line is printed (hk 1897). A missing or
+# unreadable DB or claim row changes nothing. Prints "owner\tparent".
+job_claim_prefer_db() {
+  local job="$1" owner="$2" parent="$3" map
+  map="$(job_claims_db_map "$job")"
+  WRK_CLAIM_DB="$map" wrk_py - "$job" "$owner" "$parent" <<'PY'
+import json, os, sys
+job, owner, parent = sys.argv[1:4]
+try:
+    m = json.loads(os.environ["WRK_CLAIM_DB"])
+except ValueError:
+    m = {}
+claim = m.get(job)
+def norm(v):
+    return "" if v is None or isinstance(v, bool) else str(v)
+if isinstance(claim, dict):
+    db_owner, db_parent = norm(claim.get("o")), norm(claim.get("p"))
+    diffs = ["%s arbiter=%s events=%s" % (field, db_v or "(none)", file_v or "(none)")
+             for field, db_v, file_v in (("owner_lane", db_owner, owner),
+                                         ("parent_lane", db_parent, parent))
+             if db_v != file_v]
+    if diffs:
+        sys.stderr.write("wrk: warning: claim mismatch for %s: %s; using the arbiter claim\n"
+                         % (job, "; ".join(diffs)))
+        owner, parent = db_owner, db_parent
+print("%s\t%s" % (owner, parent))
+PY
 }
 
 completion_metadata() {
@@ -5433,12 +5608,15 @@ done_cmd() {
       *) die "unknown done option '$1'" ;;
     esac
   done
-  local metadata owner label pane role jobs_root
+  local metadata owner label pane parent role jobs_root
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
   # completion_metadata prints five tab-separated fields; reading into three
   # lets pane_id swallow parent_lane and role ("w1:p1\t\tworker" was recorded
   # on 2026-09-05), which is also what panewire routes on.
-  IFS=$'\t' read -r owner label pane _ role <<<"$metadata"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
+  # owner/parent, with one warning line on a mismatch (non-trust merge).
+  IFS=$'\t' read -r owner parent <<<"$(job_claim_prefer_db "$job" "$owner" "$parent")"
   jobs_root="$(wrk_jobs_root)"
   if [[ -z "$report" ]]; then
     report="$(find_latest_report "$jobs_root/$job")"
@@ -5554,6 +5732,9 @@ escalate_cmd() {
   [[ -z "$report" || -f "$report" ]] || die "escalate requires an existing --report"
   metadata="$(builder_metadata "$job")"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
+  # owner/parent, with one warning line on a mismatch (non-trust merge).
+  IFS=$'\t' read -r owner parent <<<"$(job_claim_prefer_db "$job" "$owner" "$parent")"
   reason="builder escalation"
   [[ "$role" == captain ]] && reason="captain escalation"
   [[ -z "$report" ]] || upload_report_document "$job" "$report"
@@ -5598,6 +5779,9 @@ joined_cmd() {
   wrk_trust_guard
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
+  # owner/parent, with one warning line on a mismatch (non-trust merge).
+  IFS=$'\t' read -r owner parent <<<"$(job_claim_prefer_db "$job" "$owner" "$parent")"
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
   # hk1449-joined-end
@@ -5651,10 +5835,11 @@ ROUND_CAP_DEFAULT=3
 # set through its own environment, or it could approve its own records.
 ROUND_CAP_OPERATORS="operator operator-desk"
 # Parent lanes accepted as the job's parent issuer on top of the operator
-# set. The recorded parent lane is builder-writable through
-# job.claim/job.reclaim events, so it is honoured only inside this fixed
-# set — a rewritten parent, a host or client id, or a builder lane never
-# grants. Fixed in the source for the same reason as the operator set.
+# set. The parent lane now comes from the arbiter-minted DB claim row
+# (hk 1897), not the builder-writable events file, so it is honoured only
+# inside this fixed set — a rewritten parent, a host or client id, or a
+# builder lane never grants. Fixed in the source for the same reason as
+# the operator set.
 ROUND_CAP_PARENT_ISSUERS="director-1 pa-integrator"
 ROUND_CAP_REASON="tester round cap reached"
 
@@ -5685,7 +5870,11 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       Grants need the server-set identity of operator, operator-desk,
       director-1 or pa-integrator — the last two only as the job's parent
       lane — whose tokens live only in the mbp lane wrappers. The job's
-      recorded parent lane is not trusted beyond that fixed set.
+      parent lane, owner lane and task id are read from the arbiter-minted
+      claim row in the arbiter DB, never from the builder-writable events
+      file (hk 1897); the same OS user can still edit the sqlite file or
+      run arbiter claim with a chosen parent, so this narrows, not bounds
+      (hk 525). The parent lane is not trusted beyond that fixed set.
       A by=pa-integrator grant counts only on ParkingArcade tasks bound to
       the job on the server (refs.job_id must equal the job); task project
       and refs are writable by any hk client, so this narrows, not bounds.
@@ -5937,29 +6126,6 @@ raise SystemExit(1)
 PY
 }
 
-# The job's recorded task id, taken the same way as task linkage: the newest
-# claim/reclaim payload.task_id. Prints it or nothing; rc 1 when the meta is
-# unreadable so a broken record fails closed instead of falling back to an
-# older claim the newest event superseded.
-round_job_task_id() {
-  wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$1/events" <<'PY'
-import json, os, sys
-exec(os.environ["WRK_EVENTS_PY"])
-names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
-         if name.endswith(("claim.json", "reclaim.json"))]
-if not names:
-    raise SystemExit(0)
-try:
-    with open(os.path.join(sys.argv[1], names[-1]), encoding="utf-8") as f:
-        o = json.load(f)
-except (OSError, ValueError):
-    raise SystemExit(1)
-p = o.get("payload", o)
-v = p.get("task_id")
-print(v if isinstance(v, (int, str)) else "")
-PY
-}
-
 # Fetch the job's hk task record from the server. Echoes the raw record text
 # (JSON) on stdout; non-zero when the record is absent or handoffkeep fails.
 round_pa_task_fetch() {
@@ -6073,9 +6239,19 @@ round_open_cmd() {
   done
   [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] || die "round open --head requires a full 40-hex SHA"
   head="$(printf '%s' "$head" | tr '[:upper:]' '[:lower:]')"
-  if [[ -n "$extend" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
+  if [[ -n "$extend" ]]; then wrk_trust_guard hk arbiter; else wrk_trust_guard; fi
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  local db_task=""
+  if [[ -n "$extend" ]]; then
+    # hk 1897: the grant-issuing parent lane and the pa-integrator task id
+    # come from the arbiter DB claim row, not the builder-writable events
+    # file — a disagreement or a missing row refuses here (rc 2).
+    local db_claim db_owner db_parent
+    db_claim="$(job_claim_db_fields "$job")"
+    IFS=$'\t' read -r db_owner db_parent db_task <<<"$db_claim"
+    owner="$db_owner" parent="$db_parent"
+  fi
   wrk_refuse_ended "round open" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   if ! repo="$(round_repo_resolve "$job" "$repo_override")"; then
     if [[ -n "$repo_override" ]]; then
@@ -6111,7 +6287,7 @@ round_open_cmd() {
     # closed. director-1, operator and operator-desk grants skip this check.
     if [[ "$grant_issuer" == "pa-integrator" ]]; then
       local task_id tmp_task
-      task_id="$(round_job_task_id "$job" || true)"
+      task_id="$db_task"
       [[ -n "$task_id" ]] ||
         die "round open --extend: pa-integrator grants need the job's hk task on the server; $job records no task_id"
       tmp_task="$(mktemp)"
@@ -6235,9 +6411,16 @@ round_void_cmd() {
     esac
   done
   [[ -n "$ref" ]] || die "round void requires --by REF"
-  wrk_trust_guard hk
+  wrk_trust_guard hk arbiter
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  # hk 1897: the grant-issuing parent lane and the pa-integrator task id come
+  # from the arbiter DB claim row; a forged events-dir copy or a missing row
+  # refuses here (rc 2).
+  local db_claim db_owner db_parent db_task
+  db_claim="$(job_claim_db_fields "$job")"
+  IFS=$'\t' read -r db_owner db_parent db_task <<<"$db_claim"
+  owner="$db_owner" parent="$db_parent"
   wrk_refuse_ended "round void" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
 
   local tmp_approval grant grant_issuer
@@ -6253,7 +6436,7 @@ round_void_cmd() {
   grant_issuer="${grant##*issuer=}"
   if [[ "$grant_issuer" == "pa-integrator" ]]; then
     local task_id tmp_task
-    task_id="$(round_job_task_id "$job" || true)"
+    task_id="$db_task"
     [[ -n "$task_id" ]] ||
       die "round void --by: pa-integrator grants need the job's hk task on the server; $job records no task_id"
     tmp_task="$(mktemp)"
@@ -6723,6 +6906,15 @@ if NEUTRAL & (WORK_TERMINAL | HUB_TERMINAL | REVIVE):
     raise SystemExit("neutral event kind is also terminal or revive")
 now = time.time()
 
+# hk 1897: non-trust scans keep events-dir values, except that a readable
+# arbiter DB claim wins and prints one warning line on a mismatch.
+dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+def claim_db(job):
+    claim = dbmap.get(job)
+    return claim if isinstance(claim, dict) else None
+def db_norm(v):
+    return "" if v is None or isinstance(v, bool) else str(v)
+
 
 def field(doc, payload, key):
     for source in (doc, payload):
@@ -6762,6 +6954,13 @@ for events in sys.argv[1:]:
         if kind == "job.spawned":
             pane = field(doc, payload, "pane_id")
             tab = field(doc, payload, "tab_id")
+    db = claim_db(job)
+    if db is not None:
+        db_owner = db_norm(db.get("o"))
+        if db_owner != owner:
+            sys.stderr.write("wrk: warning: claim mismatch for %s: owner_lane arbiter=%s events=%s; using the arbiter claim\n"
+                             % (job, db_owner or "(none)", owner or "(none)"))
+            owner = db_owner
     last_revive = -1
     for index, kind in enumerate(kinds):
         if kind in REVIVE:
@@ -9973,11 +10172,17 @@ round_ext_precheck() {
   [[ "$ROLE" != builder ]] || grant_job="$JOB_ID"
   # hk 1894: the grant document and the parent lane come from the canonical
   # binary and inbox, not from HANDOFFKEEP_BIN, PATH or ARBITER_INBOX_ROOT.
-  wrk_trust_guard hk
+  # hk 1897: that parent lane (and, for a builder, its task id) comes from
+  # the arbiter DB claim row — the events-dir copy is only compared, and a
+  # disagreement or missing row refuses here.
+  wrk_trust_guard hk arbiter
   handoffkeep="$WRK_TRUST_HK"
   [[ -n "$handoffkeep" && -x "$handoffkeep" ]] || die "--round-ext: handoffkeep unavailable"
   out="$(hk_cmd "$handoffkeep" doc get "${ROUND_EXT_REF#hk:doc/}" 2>/dev/null)" ||
     die "--round-ext: document missing or handoffkeep unreachable"
+  local db_claim db_owner db_parent db_task
+  db_claim="$(job_claim_db_fields "$grant_job")"
+  IFS=$'\t' read -r db_owner db_parent db_task <<<"$db_claim"
   # A successful transport with an error/empty/malformed body is not existence.
   ROUND_EXT_ISSUER="$(printf '%s' "$out" | wrk_py -c '
 import json, os, sys
@@ -9999,25 +10204,18 @@ try:
         raise ValueError("not a document")
     issuer = doc["created_by"]
     allowed = set(sys.argv[2].split())
+    parent_lane = sys.argv[4]
     if issuer not in allowed or sys.argv[5] == "builder":
-        events = Path(sys.argv[4])
-        claims = [name for name, _, _ in wrk_events_ordered(str(events))
-                  if name.endswith(("claim.json", "reclaim.json"))]
-        if not claims:
-            raise ValueError("issuer requires recorded parent lane")
-        record = json.loads((events / claims[-1]).read_text(), object_pairs_hook=unique_object)
-        payload = record.get("payload", record)
-        parent = payload.get("parent_lane")
-        if sys.argv[5] == "builder" and str(payload.get("task_id")) != sys.argv[6]:
+        if sys.argv[5] == "builder" and sys.argv[7] != sys.argv[6]:
             raise ValueError("newest job claim belongs to another task")
-        if issuer not in allowed and (issuer not in set(sys.argv[3].split()) or issuer != parent):
+        if issuer not in allowed and (issuer not in set(sys.argv[3].split()) or issuer != parent_lane):
             raise ValueError("created_by is not an authorized issuer for this parent job")
     print(issuer)
 except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
     print("--round-ext: document/issuer verification failed: " + str(error), file=sys.stderr)
     raise SystemExit(1)
 ' "${ROUND_EXT_REF#hk:doc/}" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" \
-    "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$grant_job/events" "$ROLE" "$TASK_ID")" || die "--round-ext: document missing, unreadable or issuer denied"
+    "$db_parent" "$ROLE" "$TASK_ID" "$db_task")" || die "--round-ext: document missing, unreadable or issuer denied"
 }
 
 # Fresh server reads at each builder launch/handoff boundary; never a takeover.
@@ -10028,38 +10226,17 @@ round_ext_builder_recheck() {
 }
 
 # task_resolve_parent — TASK_INHERITED_FROM is set by the caller to a parent
-# job id; fill TASK_ID from its newest claim/reclaim payload. Local read only:
-# the job registry under wrk_jobs_root is the same one the claim landed in.
-# The newest claim/reclaim event is authoritative: an unreadable one dies
-# rather than letting a stale older task_id through (tester finding).
+# job id; fill TASK_ID from the parent's claim. hk 1897: the task id is read
+# from the arbiter-minted claim row in the canonical DB — the events-dir copy
+# is only compared against it, so a forged or stale file refuses the spawn.
+# A parent this arbiter has no claim row for (the remote target in SSH
+# delegation never knew it) leaves TASK_ID empty so the forwarded HK_TASK_ID
+# fallback applies — env sources were already the caller's to choose.
 task_resolve_parent() {
-  local parent="$1" dir rc
-  dir="$(wrk_jobs_root)/$parent/events"
-  if TASK_ID="$(wrk_py - "$dir" <<'PY'
-import json, os, sys
-exec(os.environ["WRK_EVENTS_PY"])
-names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
-         if name.endswith(("claim.json", "reclaim.json"))]
-if not names:
-    raise SystemExit(0)
-# The newest claim/reclaim by (event time, mtime, name) is authoritative.
-try:
-    o = json.load(open(os.path.join(sys.argv[1], names[-1]), encoding="utf-8"))
-except (OSError, json.JSONDecodeError):
-    raise SystemExit(2)
-p = o.get("payload", o)
-v = p.get("task_id")
-print(v if isinstance(v, int) else (v if isinstance(v, str) else ""))
-PY
-)"; then
-    :
-  else
-    rc=$?
-    if [[ "$rc" -eq 2 ]]; then
-      die "parent job '$parent' newest claim/reclaim event is unreadable — refusing to guess the task from older events$(task_remote_hint)"
-    fi
-    TASK_ID=""
-  fi
+  local parent="$1" db_claim
+  wrk_trust_guard arbiter
+  db_claim="$(job_claim_db_fields "$parent" --missing-ok)"
+  TASK_ID="${db_claim##*$'\t'}"
 }
 
 # Remote SSH delegation runs this same inheritance check on the initiator,
@@ -11201,6 +11378,10 @@ if NEUTRAL & (TERMINAL | REVIVE):
     raise SystemExit("neutral event kind is also terminal or revive")
 now = time.time()
 
+# hk 1897: non-trust scans keep events-dir values, except that a readable
+# arbiter DB claim wins and prints one warning line on a mismatch.
+dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+
 
 try:
     jobs = sorted(os.listdir(root))
@@ -11274,6 +11455,13 @@ for job in jobs:
         if kind in TERMINAL:
             revived = False
             terminal_at = wrk_event_time(document, mtime if mtime else now)
+    db = dbmap.get(job)
+    if isinstance(db, dict):
+        db_owner = "" if db.get("o") is None or isinstance(db.get("o"), bool) else str(db["o"])
+        if db_owner != owner:
+            sys.stderr.write("wrk: warning: claim mismatch for %s: owner_lane arbiter=%s events=%s; using the arbiter claim\n"
+                             % (job, db_owner or "(none)", owner or "(none)"))
+            owner = db_owner
     # 스폰 영수증이 pane/tab 의 정본이다. 완료 이벤트의 pane_id 를 그대로 믿으면
     # be4dad1 이전 `wrk done` 이 남긴 오염 레코드("w1:p1\t\tworker")를 집는다 —
     # 실 인박스에 23건 남아 있다.
@@ -11430,7 +11618,9 @@ reap_cmd() {
     return 0
   fi
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
-  candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
+  # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
+  # owner, with one warning line on a mismatch (non-trust merge).
+  candidates="$(WRK_CLAIM_DB="$(job_claims_db_map_root "$jobs_root")" reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
   local job owner pane tab age note hub_lane hub_lane_machine lane_role probe class token probe_tab verdict acted=0 release_rc=0
   local -a selected_jobs=()
@@ -11615,6 +11805,9 @@ lanes_missing_cmd() {
   # reclaim/spawned/reprompted reopen it, job.reaped closes it for good.
   # job.lost and job.recovered are neutral: they neither close nor reopen.
   # Findings print as key=value lines; the summary is the last line.
+  # hk 1897: the audit prefers a readable arbiter DB claim over the
+  # events-dir copy for owner/parent, with one warning line on a mismatch.
+  WRK_CLAIM_DB="$(job_claims_db_map_root "$jobs_root")" \
   wrk_py - "$jobs_root" "$listing" <<'PY'
 import json, os, sys
 exec(os.environ["WRK_EVENTS_PY"])
@@ -11645,6 +11838,12 @@ try:
 except OSError:
     jobs = []
 
+# hk 1897: non-trust audit keeps events-dir values, except that a readable
+# arbiter DB claim wins and prints one warning line on a mismatch.
+dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+def db_norm(v):
+    return "" if v is None or isinstance(v, bool) else str(v)
+
 open_jobs = []
 for job in jobs:
     events_dir = os.path.join(root, job, "events")
@@ -11672,6 +11871,16 @@ for job in jobs:
             is_open = True
         elif kind in TERMINAL or kind == "job.reaped":
             is_open = False
+    db = dbmap.get(job)
+    if isinstance(db, dict):
+        db_owner, db_parent = db_norm(db.get("o")), db_norm(db.get("p"))
+        diffs = ["%s arbiter=%s events=%s" % (f, a or "(none)", b or "(none)")
+                 for f, a, b in (("owner_lane", db_owner, owner),
+                                 ("parent_lane", db_parent, parent)) if a != b]
+        if diffs:
+            sys.stderr.write("wrk: warning: claim mismatch for %s: %s; using the arbiter claim\n"
+                             % (job, "; ".join(diffs)))
+            owner, parent = db_owner, db_parent
     if is_open and owner:
         open_jobs.append((job, owner, parent, role))
 
@@ -11933,7 +12142,9 @@ prune_cmd() {
     scan_dirs+=("${_d%/}/events")
   done
   PRUNE_SCAN=""
-  (( ${#scan_dirs[@]} )) && PRUNE_SCAN="$(job_events_scan "${scan_dirs[@]}")"
+  # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
+  # owner, with one warning line on a mismatch (non-trust merge).
+  (( ${#scan_dirs[@]} )) && PRUNE_SCAN="$(WRK_CLAIM_DB="$(job_claims_db_map_root "$jobs_root")" job_events_scan "${scan_dirs[@]}")"
 
   local _mode="dry-run" pf job pid jdir
   (( apply )) && _mode="apply"

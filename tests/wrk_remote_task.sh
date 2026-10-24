@@ -58,6 +58,9 @@ cleanup() {
 trap cleanup EXIT
 
 export HK_STATE="$TMP/hk-state.json"
+# hk 1897: mutant wrk copies live under $TMP, so their script_dir allowance
+# never covers the repo's bin/arbiter — hand every spawn a temp copy.
+cp "$ROOT/bin/arbiter" "$TMP/arbiter" && chmod 700 "$TMP/arbiter"
 "$HK_FIXTURE" tasks add --id 1489 --title 'remote inherited task' --lane fixture >/dev/null
 "$HK_FIXTURE" tasks add --id 9 --title 'explicit remote task' --lane fixture >/dev/null
 "$HK_FIXTURE" tasks add --id 10 --title 'builder task' --lane fixture >/dev/null
@@ -118,7 +121,7 @@ run_remote() {
   env HOME="$HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_DATA_HOME="$XDG_DATA_HOME" \
     XDG_STATE_HOME="$XDG_STATE_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
     ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" \
-    SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" \
+    SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$TMP/arbiter" \
     HANDOFFKEEP_BIN="$HK_FIXTURE" HK_STATE="$HK_STATE" WRK_NO_SLEEP=1 \
     WRK_COMPLETION_INTERVAL_S=3600 WRK_REFRESH_TIMEOUT_S=1 \
     WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$TMP/loadavg" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 \

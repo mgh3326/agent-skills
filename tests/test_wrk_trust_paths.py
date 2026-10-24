@@ -12,6 +12,7 @@ Three layers, each hermetic:
 * mutants applied at the real call sites: each invariant must go RED.
 """
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -559,13 +560,13 @@ class DecisionCase(unittest.TestCase):
     def test_mutant_handoffkeep_bin_is_honoured_outside_test_mode(self):
         self.red(('            if hk_env:\n                found = hk_env if "/" in hk_env else (shutil.which(hk_env, path=search) or hk_env)\n'
                   '                judge("HANDOFFKEEP_BIN", found, canon["hk"], "handoffkeep", ())\n'
-                  '            hk = trust_secure_binary(canon["hk"], uid)',
-                  '            hk = hk_env or trust_secure_binary(canon["hk"], uid)'),
+                  '            hk = trust_secure_binary(canon["hk"], uid, "handoffkeep")',
+                  '            hk = trust_secure_binary(hk_env if hk_env and "/" in hk_env else canon["hk"], uid, "handoffkeep")'),
                  self.check_hk_env_redirect)
 
     def test_mutant_path_lookup_is_used_outside_test_mode(self):
-        self.red(('            hk = trust_secure_binary(canon["hk"], uid)',
-                  '            hk = shutil.which("handoffkeep", path=search) or trust_secure_binary(canon["hk"], uid)'),
+        self.red(('            hk = trust_secure_binary(canon["hk"], uid, "handoffkeep")',
+                  '            hk = trust_secure_binary(shutil.which("handoffkeep", path=search) or canon["hk"], uid, "handoffkeep")'),
                  self.check_path_shim_ignored)
 
     def test_mutant_home_is_not_compared(self):
@@ -760,6 +761,10 @@ class World:
         self.trip = self.base / "tripwire.log"
         self.report = self.base / "report.md"
         self.report.write_text("report\n")
+        self.canon_arbiter = self.pw_home / ".local" / "bin" / "arbiter"
+        self.canon_arbiter.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(ARBITER, self.canon_arbiter)
+        self.canon_arbiter.chmod(0o700)
         self.repo, self.heads = case.repo, case.heads
         self.docs = {}
         self.install_canonical_hk()
@@ -777,7 +782,48 @@ class World:
         write_hk_stub(path, log, docs)
         return path, log
 
-    def mkjob(self, root, job, parent="director-1", task=None):
+    def dbclaim(self, job, parent="director-1", task=None, env=None, lane=None):
+        """Mint a real arbiter claim row (and its events file) under env."""
+        args = ["claim", "--job", job, "--lane", lane or job + "-lane", "--t", "T2", "--role", "builder",
+                "--parent-lane", parent, "--agent-label", job]
+        if task is not None:
+            args += ["--task-id", str(task)]
+        out = subprocess.run([str(self.canon_arbiter), *args], env=env or self.env(),
+                             capture_output=True, text=True)
+        self.case.assertEqual(out.returncode, 0, out.stderr)
+
+    def claim_files(self, root, job):
+        events = Path(root) / job / "events"
+        return sorted(p for p in events.glob("*-job.claim.json")) + \
+            sorted(p for p in events.glob("*-job.reclaim.json"))
+
+    def rewrite_claim(self, root, job, **fields):
+        """Patch payload fields of the newest events-dir claim/reclaim file."""
+        path = self.claim_files(root, job)[-1]
+        doc = json.loads(path.read_text())
+        for key, value in fields.items():
+            if value is None:
+                doc["payload"].pop(key, None)
+            else:
+                doc["payload"][key] = value
+        path.write_text(json.dumps(doc) + "\n")
+        return path
+
+    def tmp_arbiter(self):
+        """An arbiter copy under the temp root for WRK_TEST_MODE envs."""
+        path = self.tmp / "arbiter-bin"
+        if not path.exists():
+            shutil.copy(ARBITER, path)
+            path.chmod(0o700)
+        return path
+
+    def mkjob(self, root, job, parent="director-1", task=None, db=True):
+        # A canonical-inbox job mints a real arbiter claim (file + DB row); jobs
+        # under other roots, and db=False legacy fixtures, get a file only.
+        if db and Path(root) == self.jobs:
+            self.dbclaim(job, parent, task)
+            self.rewrite_claim(root, job, pane_id="w:p1", repo=str(self.repo))
+            return Path(root) / job / "events"
         events = Path(root) / job / "events"
         events.mkdir(parents=True, exist_ok=True)
         payload = {"agent_label": job, "owner_lane": job + "-lane", "pane_id": "w:p1", "parent_lane": parent,
@@ -796,8 +842,9 @@ class World:
             "created_at": "2026-10-23T00:00:%02dZ" % number}) + "\n")
 
     def end_job(self, root, job, name="00009-job.revoked.json"):
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         (Path(root) / job / "events" / name).write_text(json.dumps({
-            "kind": "job.revoked", "job_id": job, "created_at": "2026-10-23T06:00:00Z"}) + "\n")
+            "kind": "job.revoked", "job_id": job, "created_at": now}) + "\n")
         return name
 
     def joined(self, wrk, job, test=False, **extra):
@@ -1028,8 +1075,10 @@ class RealBinaryCase(unittest.TestCase):
         self.repro_hk_bin_stub_grant(self.wrk)
         w = self.w
         tbuild = w.tmp / "builder"
-        w.mkjob(tbuild, "jobt")
-        env = dict(test=True, ARBITER_INBOX_ROOT=tbuild, HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "data")
+        env = dict(test=True, ARBITER_INBOX_ROOT=tbuild, HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "data",
+                   ARBITER_BIN=w.tmp_arbiter())
+        w.dbclaim("jobt", env=w.env(**env))
+        w.rewrite_claim(tbuild, "jobt", repo=str(w.repo), pane_id="w:p1")
         w.open_rounds(self.wrk, w.env(**env), "jobt", 3)
         w.stub(w.tmp / "forge-test-hk", {"*": grant("jobt", 5)})
         out = w.wrk(self.wrk, "round", "open", "jobt", "--head", w.heads[3], "--extend", "hk:doc/forged",
@@ -1044,9 +1093,10 @@ class RealBinaryCase(unittest.TestCase):
         self.repro_path_shim(self.wrk)
         w = self.w
         tbuild = w.tmp / "builder"
-        w.mkjob(tbuild, "jobt")
         env = dict(test=True, ARBITER_INBOX_ROOT=tbuild, HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "data",
-                   HANDOFFKEEP_BIN=None)
+                   HANDOFFKEEP_BIN=None, ARBITER_BIN=w.tmp_arbiter())
+        w.dbclaim("jobt", env=w.env(**env))
+        w.rewrite_claim(tbuild, "jobt", repo=str(w.repo), pane_id="w:p1")
         w.open_rounds(self.wrk, w.env(**env), "jobt", 3)
         shim_dir = w.tmp / "shimbin"
         w.stub(shim_dir / "handoffkeep", {"*": grant("jobt", 5)})
@@ -1316,6 +1366,9 @@ class RealBinaryCase(unittest.TestCase):
         self.assertIn("outside the temp roots", out.stderr)
         # tests/fixtures of the repo is a root for the binary only
         env["ARBITER_INBOX_ROOT"] = w.tmp / "builder"
+        env["ARBITER_BIN"] = w.tmp_arbiter()
+        w.dbclaim("jobt", env=w.env(**env))
+        w.rewrite_claim(w.tmp / "builder", "jobt", repo=str(w.repo))
         w.open_rounds(self.wrk, w.env(**env), "jobt", 3)
         args = ["round", "open", "jobt", "--head", w.heads[3], "--extend", "hk:doc/x"]
         out = w.wrk(self.wrk, *args, HANDOFFKEEP_BIN=ROOT / "tests" / "fixtures" / "handoffkeep", **env)
@@ -1386,10 +1439,11 @@ class RealBinaryCase(unittest.TestCase):
         self.assertFalse(shim_log.exists())
         self.assertEqual(w.canon_log.read_text().split("\n")[:2], ["doc get round-ext/jobx", "tasks show 77"])
         tjobs = w.tmp / "jobs"
-        w.mkjob(tjobs, "jobx", task=77)
         stub = w.stub(w.tmp / "hk", self.ext_docs())[0]
-        out = w.run(["bash", "-c", snippet, "_", lib], w.env(test=True, ARBITER_INBOX_ROOT=tjobs, HOME=w.tmp / "home",
-                                                              XDG_DATA_HOME=w.tmp / "data", HANDOFFKEEP_BIN=stub))
+        tenv = w.env(test=True, ARBITER_INBOX_ROOT=tjobs, HOME=w.tmp / "home",
+                     XDG_DATA_HOME=w.tmp / "data", HANDOFFKEEP_BIN=stub, ARBITER_BIN=w.tmp_arbiter())
+        w.dbclaim("jobx", "director-1", 77, env=tenv)
+        out = w.run(["bash", "-c", snippet, "_", lib], tenv)
         self.assertEqual((out.returncode, out.stdout.strip()), (0, "status=already_linked"), out.stderr)
 
     def seed_old_job(self, root, job, rounds):
@@ -1477,7 +1531,7 @@ class RealBinaryCase(unittest.TestCase):
             repro(*args)
 
     def test_mutant_round_open_skips_the_guard(self):
-        mutant = self.mutant(WRK, '  if [[ -n "$extend" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi\n', ENV_FOLLOWING_HK, "open")
+        mutant = self.mutant(WRK, '  if [[ -n "$extend" ]]; then wrk_trust_guard hk arbiter; else wrk_trust_guard; fi\n', ENV_FOLLOWING_HK, "open")
         self.red(self.repro_inbox_redirect, mutant)
 
     def test_mutant_round_verdict_skips_the_guard(self):
@@ -1491,12 +1545,12 @@ class RealBinaryCase(unittest.TestCase):
         self.red(self.repro_data_home_redirect, mutant)
 
     def test_mutant_round_void_skips_the_guard(self):
-        mutant = self.mutant(WRK, '  [[ -n "$ref" ]] || die "round void requires --by REF"\n  wrk_trust_guard hk\n',
+        mutant = self.mutant(WRK, '  [[ -n "$ref" ]] || die "round void requires --by REF"\n  wrk_trust_guard hk arbiter\n',
                              '  [[ -n "$ref" ]] || die "round void requires --by REF"\n' + ENV_FOLLOWING_HK, "void")
         self.red(self.repro_inbox_redirect, mutant)
 
     def test_mutant_round_extension_precheck_skips_the_guard(self):
-        mutant = self.mutant(WRK, '  wrk_trust_guard hk\n  handoffkeep="$WRK_TRUST_HK"\n',
+        mutant = self.mutant(WRK, '  wrk_trust_guard hk arbiter\n  handoffkeep="$WRK_TRUST_HK"\n',
                              ENV_FOLLOWING_HK + '  handoffkeep="$WRK_TRUST_HK"\n', "ext")
         lib = self.w.base / "mutant-lib"
         lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
@@ -1510,7 +1564,7 @@ class RealBinaryCase(unittest.TestCase):
             self.refusal_line(out, "HANDOFFKEEP_BIN", w.canon_hk)
 
     def test_mutant_guard_state_is_not_initialized_at_load(self):
-        mutant = self.mutant(WRK, 'WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK="" WRK_TRUST_WARNED=""\n', "", "warnedinit")
+        mutant = self.mutant(WRK, 'WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK="" WRK_TRUST_ARBITER="" WRK_TRUST_WARNED=""\n', "", "warnedinit")
         self.red(self.repro_inherited_warning_flag, mutant)
         lib = self.w.base / "mutant-lib"
         lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
@@ -1590,13 +1644,13 @@ class RealBinaryCase(unittest.TestCase):
     def test_mutant_handoffkeep_bin_honoured_outside_test_mode(self):
         mutant = self.mutant(WRK, '            if hk_env:\n                found = hk_env if "/" in hk_env else (shutil.which(hk_env, path=search) or hk_env)\n'
                              '                judge("HANDOFFKEEP_BIN", found, canon["hk"], "handoffkeep", ())\n'
-                             '            hk = trust_secure_binary(canon["hk"], uid)',
-                             '            hk = hk_env or trust_secure_binary(canon["hk"], uid)', "hkenv")
+                             '            hk = trust_secure_binary(canon["hk"], uid, "handoffkeep")',
+                             '            hk = hk_env or trust_secure_binary(canon["hk"], uid, "handoffkeep")', "hkenv")
         self.red(self.repro_hk_bin_stub_grant, mutant)
 
     def test_mutant_path_handoffkeep_used_outside_test_mode(self):
-        mutant = self.mutant(WRK, '            hk = trust_secure_binary(canon["hk"], uid)',
-                             '            hk = shutil.which("handoffkeep", path=search) or trust_secure_binary(canon["hk"], uid)', "hkpath")
+        mutant = self.mutant(WRK, '            hk = trust_secure_binary(canon["hk"], uid, "handoffkeep")',
+                             '            hk = shutil.which("handoffkeep", path=search) or trust_secure_binary(canon["hk"], uid, "handoffkeep")', "hkpath")
         self.red(self.repro_path_shim, mutant)
 
     def test_mutant_test_mode_accepts_a_path_outside_the_temp_roots(self):
@@ -1617,6 +1671,356 @@ class RealBinaryCase(unittest.TestCase):
         self.assertEqual(out.returncode, 0)
         for word in ("WRK_TEST_MODE", "canonical", "HANDOFFKEEP_BIN", "narrows"):
             self.assertIn(word, out.stdout)
+
+
+# ---------------------------------------------------------------------------
+# 4. hk 1897: the arbiter-minted claim row is the parent/owner/task source
+
+
+class ArbiterDbClaimCase(RealBinaryCase):
+    """job-get exposes the newest DB claim/reclaim row; every wrk trust use of
+    owner, parent lane or task id reads that row and refuses to proceed when
+    the events-dir claim file disagrees."""
+
+    def arbiter(self, *args, **env):
+        return subprocess.run([str(self.w.canon_arbiter), *[str(a) for a in args]],
+                              env=self.w.env(**env), capture_output=True, text=True)
+
+    def dbreclaim(self, job, parent, lane="reclaimer", task=None, env=None):
+        e = env or self.w.env()
+        steps = (["lease", "--job", job, "--resource", "/tmp/r-%s" % job, "--kind", "path"],
+                 ["release", "--job", job, "--resource", "/tmp/r-%s" % job, "--kind", "path", "--force"],
+                 ["claim", "--reclaim-released", "--job", job, "--lane", lane, "--t", "T2",
+                  "--role", "builder", "--parent-lane", parent, "--agent-label", job]
+                 + (["--task-id", str(task)] if task is not None else []))
+        for args in steps:
+            out = subprocess.run([str(self.w.canon_arbiter), *args], env=e,
+                                 capture_output=True, text=True)
+            self.assertEqual(out.returncode, 0, out.stderr)
+
+    def forge_reclaim(self, job, **payload):
+        """B1's move: a hand-written job.reclaim file dropped in the events dir."""
+        events = self.w.jobs / job / "events"
+        seqs = [int(p.name.split("-", 1)[0]) for p in events.glob("[0-9]*.json")]
+        path = events / ("%05d-job.reclaim.json" % (max(seqs or [0]) + 1))
+        body = {"agent_label": job, "owner_lane": job + "-lane", "role": "builder", "t_level": "T2"}
+        body.update(payload)
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        path.write_text(json.dumps({"created_at": now, "job_id": job,
+                                    "kind": "job.reclaim", "payload": body, "seq": len(seqs or [0]) + 1}) + "\n")
+        return path
+
+    def extend(self, wrk, job, by="director-1", docs=None):
+        w = self.w
+        grant_doc = docs if docs is not None else {"*": grant(job, 5, by)}
+        w.install_canonical_hk(grant_doc)
+        return w.wrk(wrk, "round", "open", job, "--head", w.heads[3], "--extend", "hk:doc/g")
+
+    # -- arbiter job-get claim object --
+
+    def test_job_get_claim_object_claim_reclaim_and_none(self):
+        w = self.w
+        w.dbclaim("jobg", task=77)
+        out = self.arbiter("job-get", "--job", "absent", "--json")
+        self.assertEqual(out.returncode, 7)
+        claim = json.loads(self.arbiter("job-get", "--job", "jobg", "--json").stdout)["claim"]
+        self.assertEqual((claim["kind"], claim["seq"], claim["owner_lane"],
+                          claim["parent_lane"], claim["task_id"]),
+                         ("job.claim", 1, "jobg-lane", "director-1", 77))
+        self.dbreclaim("jobg", "pa-integrator", task=99)
+        claim = json.loads(self.arbiter("job-get", "--job", "jobg", "--json").stdout)["claim"]
+        self.assertEqual((claim["kind"], claim["parent_lane"], claim["task_id"]),
+                         ("job.reclaim", "pa-integrator", 99))
+        self.assertGreater(claim["seq"], 1)
+        # a job row with no claim event yields claim:null
+        import sqlite3
+        db = w.pw_home / ".local" / "share" / "arbiter" / "state.db"
+        with contextlib.closing(sqlite3.connect(db)) as con:
+            con.execute("INSERT INTO jobs (job_id, owner_lane, t_level, state, created_at, updated_at) "
+                        "VALUES ('legacy', 'legacy-lane', 'T2', 'open', 'x', 'x')")
+            con.commit()
+        claim = json.loads(self.arbiter("job-get", "--job", "legacy", "--json").stdout)["claim"]
+        self.assertIsNone(claim)
+
+    def test_job_get_claim_ordered_by_seq_not_created_at(self):
+        w = self.w
+        w.dbclaim("jobsq")
+        self.dbreclaim("jobsq", "pa-integrator")
+        import sqlite3
+        db = w.pw_home / ".local" / "share" / "arbiter" / "state.db"
+        with contextlib.closing(sqlite3.connect(db)) as con:
+            con.execute("UPDATE events SET created_at='2026-01-01T00:00:00+00:00' WHERE job_id='jobsq'")
+        claim = json.loads(self.arbiter("job-get", "--job", "jobsq", "--json").stdout)["claim"]
+        self.assertEqual(claim["kind"], "job.reclaim")
+
+    def repro_job_get_redirect(self, arbiter_bin):
+        w = self.w
+        w.dbclaim("jred")
+        canon_db = w.pw_home / ".local" / "share" / "arbiter" / "state.db"
+        for extra, var, canonical in (
+                (dict(XDG_DATA_HOME=w.tmp / "xdg"), "XDG_DATA_HOME", canon_db),
+                (dict(ARBITER_INBOX_ROOT=w.tmp / "inbox"), "ARBITER_INBOX_ROOT", w.jobs),
+                (dict(HOME=w.tmp / "home"), "HOME", w.pw_home)):
+            out = subprocess.run([str(arbiter_bin), "job-get", "--job", "jred", "--json"],
+                                 env=w.env(**extra), capture_output=True, text=True)
+            # --json puts the refusal in the stdout envelope; rc 2 either way
+            self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+            self.assertIn(var, out.stdout + out.stderr)
+            self.assertIn(str(canonical), out.stdout + out.stderr)
+            self.assertNotIn('"ok": true', out.stdout)
+        # a redirected but populated DB is never read either
+        (w.tmp / "xdg" / "arbiter").mkdir(parents=True)
+        shutil.copy(canon_db, w.tmp / "xdg" / "arbiter" / "state.db")
+        out = subprocess.run([str(arbiter_bin), "job-get", "--job", "jred", "--json"],
+                             env=w.env(XDG_DATA_HOME=w.tmp / "xdg"), capture_output=True, text=True)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+
+    def test_job_get_redirects_refused_outside_test_mode(self):
+        self.repro_job_get_redirect(self.w.canon_arbiter)
+        # in test mode under a temp root the same reads work
+        w = self.w
+        tenv = dict(test=True, HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "xdg",
+                    ARBITER_INBOX_ROOT=w.tmp / "inbox")
+        w.dbclaim("jtm", parent="pa-integrator", env=w.env(**tenv))
+        out = subprocess.run([str(self.w.canon_arbiter), "job-get", "--job", "jtm", "--json"],
+                             env=w.env(**tenv), capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(json.loads(out.stdout)["claim"]["parent_lane"], "pa-integrator")
+
+    def test_job_get_missing_locked_db_and_odd_job_fail_closed(self):
+        w = self.w
+        env = w.env(test=True, HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "xdg",
+                    ARBITER_INBOX_ROOT=w.tmp / "inbox")
+        out = subprocess.run([str(w.canon_arbiter), "job-get", "--job", "x", "--json"],
+                             env=env, capture_output=True, text=True)
+        self.assertEqual(out.returncode, 6)
+        (w.tmp / "xdg" / "arbiter").mkdir(parents=True)
+        db = w.tmp / "xdg" / "arbiter" / "state.db"
+        w.dbclaim("jlock", env=env)
+        import sqlite3
+        locker = subprocess.Popen([sys.executable, "-c",
+                                   "import sqlite3, time, sys; c=sqlite3.connect(sys.argv[1]); "
+                                   "c.execute('PRAGMA locking_mode=EXCLUSIVE'); "
+                                   "c.execute('CREATE TABLE IF NOT EXISTS hold(x)'); time.sleep(30)", str(db)],
+                                  env={"PATH": os.environ["PATH"]})
+        try:
+            import time
+            time.sleep(1)
+            out = subprocess.run([str(w.canon_arbiter), "job-get", "--job", "jlock", "--json"],
+                                 env=env, capture_output=True, text=True)
+            self.assertEqual(out.returncode, 6)
+        finally:
+            locker.terminate()
+            locker.wait()
+        for odd in ("od d", "jo'b", "../escape", "j*b"):
+            out = subprocess.run([str(w.canon_arbiter), "job-get", "--job", odd, "--json"],
+                                 env=env, capture_output=True, text=True)
+            self.assertIn(out.returncode, (2, 6, 7), odd)
+            self.assertNotIn('"ok": true', out.stdout, odd)
+
+    # -- wrk trust uses of the DB claim --
+
+    def capped(self, job, **kw):
+        self.w.mkjob(self.w.jobs, job, **kw)
+        self.w.open_rounds(self.wrk, self.w.env(), job, 3)
+
+    def mismatch_line(self, out, field, db_v, file_v):
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn(field, out.stderr)
+        self.assertIn(db_v, out.stderr)
+        self.assertIn(file_v, out.stderr)
+
+    def repro_forged_reclaim(self, wrk):
+        """B1 repro: a forged job.reclaim file naming mac-dev as parent."""
+        w = self.w
+        self.capped("jb1")
+        self.forge_reclaim("jb1", parent_lane="mac-dev")
+        out = self.extend(wrk, "jb1", by="mac-dev")
+        self.mismatch_line(out, "parent_lane", "director-1", "mac-dev")
+        self.assertEqual(len(list((w.jobs / "jb1" / "events").glob("*-job.round.json"))), 3)
+
+    def test_b1_forged_reclaim_refused(self):
+        self.repro_forged_reclaim(self.wrk)
+
+    def repro_file_parent_director_vs_db_pa(self, wrk):
+        """The forged file names a fixed operator while the DB says pa-integrator."""
+        w = self.w
+        self.capped("jdv", parent="pa-integrator")
+        w.rewrite_claim(w.jobs, "jdv", parent_lane="director-1")
+        out = self.extend(wrk, "jdv", by="director-1")
+        self.mismatch_line(out, "parent_lane", "pa-integrator", "director-1")
+
+    def test_file_parent_vs_db_parent_refused(self):
+        self.repro_file_parent_director_vs_db_pa(self.wrk)
+
+    def test_extend_honest_claim_still_works(self):
+        w = self.w
+        self.capped("jok")
+        out = self.extend(self.wrk, "jok")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("round=4", out.stdout)
+
+    def test_extend_pa_grant_uses_db_task_id(self):
+        w = self.w
+        self.capped("jpa", parent="pa-integrator", task=701)
+        docs = {"701": {"project": "ParkingArcade", "refs": {"job_id": "jpa"}},
+                "*": grant("jpa", 5, "pa-integrator")}
+        out = self.extend(self.wrk, "jpa", docs=docs)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("round=4", out.stdout)
+        # the same grant against a file-side task id the DB never minted refuses
+        self.capped("jpaf", parent="pa-integrator")
+        w.rewrite_claim(w.jobs, "jpaf", task_id=701)
+        out = self.extend(self.wrk, "jpaf", docs={"701": {"project": "ParkingArcade",
+                                                        "refs": {"job_id": "jpaf"}},
+                                                "*": grant("jpaf", 5, "pa-integrator")})
+        self.mismatch_line(out, "task_id", "(none)", "701")
+
+    def repro_extend_no_db_claim_row(self, wrk):
+        w = self.w
+        w.dbclaim("other")                    # the DB exists; jleg just has no row
+        w.mkjob(w.jobs, "jleg", db=False)
+        w.open_rounds(wrk, w.env(), "jleg", 3)
+        w.install_canonical_hk({"*": grant("jleg", 5)})
+        out = w.wrk(wrk, "round", "open", "jleg", "--head", w.heads[3], "--extend", "hk:doc/g")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("no arbiter claim row", out.stderr)
+        # a plain open on the same legacy job is refused only by the cap, never by the claim
+        out = w.wrk(wrk, "round", "open", "jleg", "--head", w.heads[3])
+        self.assertNotEqual(out.returncode, 2)
+        self.assertNotIn("claim row", out.stderr)
+
+    def test_extend_no_db_claim_row_refused(self):
+        self.repro_extend_no_db_claim_row(self.wrk)
+
+    def test_extend_owner_mismatch_refused(self):
+        w = self.w
+        self.capped("jown")
+        w.rewrite_claim(w.jobs, "jown", owner_lane="other-lane")
+        out = self.extend(self.wrk, "jown")
+        self.mismatch_line(out, "owner_lane", "jown-lane", "other-lane")
+
+    def test_takeover_reclaim_inherits_db_parent(self):
+        w = self.w
+        docs = lambda j: {"88": {"project": "ParkingArcade", "refs": {"job_id": j}},
+                          "*": grant(j, 5, "pa-integrator")}
+        # a real takeover mints job.reclaim in the DB; the new parent is trusted
+        self.capped("jtak", parent="builder-x")
+        self.dbreclaim("jtak", "pa-integrator", task=88)
+        w.rewrite_claim(w.jobs, "jtak", repo=str(w.repo), pane_id="w:p1")
+        out = self.extend(self.wrk, "jtak", docs=docs("jtak"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("round=4", out.stdout)
+        # the pre-reclaim parent lane no longer counts once the row is replaced
+        self.capped("jtak2", parent="builder-x")
+        self.dbreclaim("jtak2", "pa-integrator", task=88)
+        w.rewrite_claim(w.jobs, "jtak2", repo=str(w.repo))
+        w.install_canonical_hk({"*": grant("jtak2", 5, "builder-x")})
+        out = w.wrk(self.wrk, "round", "open", "jtak2", "--head", w.heads[3], "--extend", "hk:doc/g")
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+
+    def test_done_and_joined_warn_and_route_on_db_parent(self):
+        w = self.w
+        w.mkjob(w.jobs, "jdn")
+        w.rewrite_claim(w.jobs, "jdn", parent_lane="mac-dev")
+        env = dict(ARBITER_BIN=w.canon_arbiter)
+        out = w.wrk(self.wrk, "done", "jdn", "--report", w.report, **env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("claim mismatch", out.stderr)
+        self.assertIn("director-1", out.stderr)
+        w.open_rounds(self.wrk, w.env(), "jdn", 1)
+        out = w.joined(self.wrk, "jdn", **env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("claim mismatch", out.stderr)
+        record = json.loads(next((w.jobs / "jdn" / "events").glob("*-job.joined.json")).read_text())
+        self.assertEqual(record["parent_lane"], "director-1")
+
+    def test_helper_fails_closed_on_odd_and_missing(self):
+        w = self.w
+        lib = self.lib()
+        env = w.env(test=True, HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "xdg",
+                    ARBITER_INBOX_ROOT=w.tmp / "inbox", ARBITER_BIN=w.canon_arbiter)
+        w.dbclaim("jh", env=env)
+        body = 'set -uo pipefail; . "$1"; wrk_trust_guard arbiter 2>/dev/null; job_claim_db_fields "$2"'
+        for job, rc in (("jh", 0), ("missing", 2), ("od d", 2)):
+            out = w.run(["bash", "-c", body, "_", lib, job], env)
+            self.assertEqual(out.returncode, rc, job + ": " + out.stdout + out.stderr)
+        # outside test mode a PATH shim is never the arbiter that answers
+        w.dbclaim("jh2")
+        shim_dir = w.tmp / "shim"
+        shim_dir.mkdir()
+        log = w.tmp / "shim.log"
+        write_exec(shim_dir / "arbiter", "#!/bin/sh\necho ran >>\"%s\"\necho '{}'\n" % log)
+        out = w.run(["bash", "-c", 'set -euo pipefail; . "$1"; wrk_trust_guard arbiter; '
+                                   'job_claim_db_fields jh2', "_", lib],
+                    w.env(PATH="%s:%s" % (shim_dir, safe_path())))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("jh2-lane", out.stdout)
+        self.assertFalse(log.exists(), "the PATH shim must never run")
+
+    # -- mutants, stated as invariants --
+
+    def test_mutant_job_get_outside_trust_commands_reads_redirected_db(self):
+        mutant = self.mutant(ARBITER, 'TRUST_COMMANDS = frozenset(("claim", "job-get"))',
+                             'TRUST_COMMANDS = frozenset(("claim",))', "nojobget")
+        self.red(self.repro_job_get_redirect, mutant)
+
+    def test_mutant_claim_helper_echoes_file_fields(self):
+        # "read the parent from the events dir again": compare file to itself
+        # and print the file fields — the DB row stops being authoritative.
+        mutant = self.mutant(WRK,
+                             'for field in ("owner_lane", "parent_lane", "task_id"):\n'
+                             '    db_v = norm(claim.get(field))\n'
+                             '    file_v = norm(file_claim.get(field))\n'
+                             '    if db_v != file_v:\n'
+                             '        refuse("claim mismatch on %s for %s: arbiter=%s events=%s; refusing the trust use"\n'
+                             '               % (field, job, db_v or "(none)", file_v or "(none)"))\n'
+                             'print("%s\\t%s\\t%s" % (norm(claim.get("owner_lane")),\n'
+                             '                      norm(claim.get("parent_lane")), norm(claim.get("task_id"))))',
+                             'for field in ("owner_lane", "parent_lane", "task_id"):\n'
+                             '    db_v = norm(file_claim.get(field))\n'
+                             '    file_v = norm(file_claim.get(field))\n'
+                             '    if db_v != file_v:\n'
+                             '        refuse("claim mismatch on %s for %s: arbiter=%s events=%s; refusing the trust use"\n'
+                             '               % (field, job, db_v or "(none)", file_v or "(none)"))\n'
+                             'print("%s\\t%s\\t%s" % (norm(file_claim.get("owner_lane")),\n'
+                             '                      norm(file_claim.get("parent_lane")), norm(file_claim.get("task_id"))))',
+                             "fileparent")
+        self.red(self.repro_file_parent_director_vs_db_pa, mutant)
+
+    def test_mutant_claim_helper_skips_the_mismatch_check(self):
+        mutant = self.mutant(WRK,
+                             '    if db_v != file_v:\n'
+                             '        refuse("claim mismatch on %s for %s: arbiter=%s events=%s; refusing the trust use"\n'
+                             '               % (field, job, db_v or "(none)", file_v or "(none)"))',
+                             '    if False:\n        refuse("x")', "nomismatch")
+        self.red(self.repro_file_parent_director_vs_db_pa, mutant)
+
+    def test_mutant_no_db_row_still_grants(self):
+        mutant = self.mutant(WRK, '      die "job $job has no arbiter claim row; refusing the trust use"\n',
+                             '      echo "\\t\\t"; return 0\n', "norow")
+        self.red(self.repro_extend_no_db_claim_row, mutant)
+
+    def test_mutant_helper_uses_a_path_arbiter(self):
+        w = self.w
+        w.dbclaim("jp")
+        shim_dir = w.tmp / "shim"
+        shim_dir.mkdir()
+        log = w.tmp / "shim.log"
+        write_exec(shim_dir / "arbiter", "#!/bin/sh\necho ran >>\"%s\"\necho '{}'\n" % log)
+        env = w.env(PATH="%s:%s" % (shim_dir, safe_path()), ARBITER_BIN=None)
+        lib = self.lib()
+        body = 'set -uo pipefail; . "$1"; wrk_trust_guard arbiter; job_claim_db_fields jp >/dev/null'
+        out = w.run(["bash", "-c", body, "_", lib], env)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(log.exists(), "the PATH shim must never run")
+        mutant = self.mutant(WRK, '  local arbiter="${WRK_TRUST_ARBITER:-}"',
+                             '  local arbiter; arbiter="$(command -v arbiter)"', "patharb")
+        mlib = w.base / "plib"
+        mlib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
+        out = w.run(["bash", "-c", body, "_", mlib], env)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertTrue(log.exists(), "the mutant ran the PATH shim")
 
 
 if __name__ == "__main__":

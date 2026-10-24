@@ -53,11 +53,14 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # Per-case sandbox roots so claim events and the fixture db never bleed
 # between cases. reset_case NAME rotates them.
-INBOX="" HK_DB="" HK_LOG="" HERDR_LOG=""
+INBOX="" HK_DB="" HK_LOG="" HERDR_LOG="" CASE_XDG=""
 reset_case() {
   INBOX="$TMP/inbox-$1"; HK_DB="$TMP/hk-$1.json"; HK_LOG="$TMP/hk-$1.log"
   HERDR_LOG="$TMP/herdr-$1.log"
-  mkdir -p "$INBOX"
+  # hk 1897: the claim DB is per-case too, so parent claims minted here are
+  # the rows the spawn's guarded arbiter reads.
+  CASE_XDG="$TMP/xdg-$1"
+  mkdir -p "$INBOX" "$CASE_XDG"
   HK_STATE="$HK_DB" "$HK" tasks add --id 1 --title "case task" --lane fixture >/dev/null
 }
 
@@ -92,7 +95,7 @@ spawn_try() {
   # itself a spawned job and would otherwise inherit ARBITER_JOB/HK_TASK_ID.
   env -u ARBITER_JOB -u HK_TASK_ID \
     HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
-    XDG_DATA_HOME="$TMP/xdg-$RANDOM" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="${CASE_XDG:?reset_case did not run}" ARBITER_INBOX_ROOT="$INBOX" \
     HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" HK_MODE="${HK_MODE:-new}" \
     HK_LOG="$HK_LOG" PANEWIRE_BIN="$PANEWIRE" \
     WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
@@ -129,6 +132,29 @@ else:
     print("")
 PY
 }
+# hk 1897: a parent job's task id is read from its arbiter-minted claim row,
+# so the fixture mints real claims/reclaims into the case DB (arbiter claim
+# writes the events-dir file at the same time).
+mkparent() { # mkparent <job> [task-id]
+  local tid=()
+  [[ -z "${2:-}" ]] || tid=(--task-id "$2")
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$CASE_XDG" "$ARBITER" claim \
+    --job "$1" --lane old-lane --t T2 --role builder --parent-lane director-1 \
+    --agent-label "$1" ${tid[@]+"${tid[@]}"} >/dev/null || fail "mkparent $1"
+}
+
+mkparent_reclaim() { # mkparent_reclaim <job> [task-id] — a real DB reclaim row
+  local tid=()
+  [[ -z "${2:-}" ]] || tid=(--task-id "$2")
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$CASE_XDG" "$ARBITER" lease \
+    --job "$1" --resource "$TMP/respawn-$1" --kind path >/dev/null || fail "lease $1"
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$CASE_XDG" "$ARBITER" release \
+    --job "$1" --resource "$TMP/respawn-$1" --kind path --force >/dev/null || fail "release $1"
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$CASE_XDG" "$ARBITER" claim --reclaim-released \
+    --job "$1" --lane old-lane --t T2 --role builder --parent-lane director-1 \
+    --agent-label "$1" ${tid[@]+"${tid[@]}"} >/dev/null || fail "reclaim $1"
+}
+
 seed_old_job() {
   local job="$1" mode="$2" rounds="${3:-0}" dir="$INBOX/$1/events"
   mkdir -p "$dir"
@@ -399,11 +425,9 @@ echo "PASS c10 bypass cannot launder a reachable verify failure"
 
 echo "== AC1 inheritance: tester/advisory spawns take the parent task =="
 
-# D1: --parent-job inheritance — task id comes from the parent's claim meta.
+# D1: --parent-job inheritance — task id comes from the parent's DB claim row.
 reset_case d1
-mkdir -p "$INBOX/parent-job-1/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9009,"owner_lane":"b-parent"}}' \
-  >"$INBOX/parent-job-1/events/00001-job.claim.json"
+mkparent parent-job-1 9009
 hk_add --id 9009 >/dev/null
 spawn_try -- --parent-job parent-job-1 --job d1-tester
 expect_rc 0 "tester spawn inherits via --parent-job"
@@ -431,11 +455,9 @@ no_claim "env inheritance never claims"
 echo "PASS d2 HK_TASK_ID env inheritance"
 
 # D3: ARBITER_JOB env — a spawn from inside a registered pane inherits the
-# calling job's task through the local claim record.
+# calling job's task through its arbiter claim row.
 reset_case d3
-mkdir -p "$INBOX/parent-job-3/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9011}}' \
-  >"$INBOX/parent-job-3/events/00001-job.claim.json"
+mkparent parent-job-3 9011
 hk_add --id 9011 >/dev/null
 spawn_try -e ARBITER_JOB=parent-job-3 -- --job d3-worker
 expect_rc 0 "worker spawn inherits via ARBITER_JOB"
@@ -448,9 +470,7 @@ echo "PASS d3 ARBITER_JOB pane-env inheritance"
 
 # D4: parent claim with no task_id refuses to guess.
 reset_case d4
-mkdir -p "$INBOX/parent-job-4/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"owner_lane":"b-old"}}' \
-  >"$INBOX/parent-job-4/events/00001-job.claim.json"
+mkparent parent-job-4
 spawn_try -- --parent-job parent-job-4 --job d4-worker
 expect_rc 2 "parent without task_id must not be guessed"
 expect_grep 'no task_id\|--task' "$TMP/stderr.txt" "error must direct to --task"
@@ -459,9 +479,7 @@ echo "PASS d4 taskless parent job refuses to guess"
 
 # D5: a contradicting env pair refuses rather than guessing.
 reset_case d5
-mkdir -p "$INBOX/parent-job-5/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9012}}' \
-  >"$INBOX/parent-job-5/events/00001-job.claim.json"
+mkparent parent-job-5 9012
 hk_add --id 9012 >/dev/null; hk_add --id 9099 >/dev/null
 spawn_try -e HK_TASK_ID=9099 -- --parent-job parent-job-5 --job d5-worker
 expect_rc 2 "parent task vs HK_TASK_ID mismatch must refuse"
@@ -472,9 +490,7 @@ echo "PASS d5 contradicting task sources refuse"
 # authoritative and an unreadable one must not fall back to a stale older
 # task_id (tester attack surface).
 reset_case d6
-mkdir -p "$INBOX/parent-job-6/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9013}}' \
-  >"$INBOX/parent-job-6/events/00001-job.claim.json"
+mkparent parent-job-6 9013
 printf '%s\n' 'not-json{{{' \
   >"$INBOX/parent-job-6/events/00002-job.reclaim.json"
 hk_add --id 9013 >/dev/null
@@ -484,12 +500,14 @@ expect_grep 'unreadable' "$TMP/stderr.txt" "corrupt newest must be named"
 no_job_dir d6-worker "no job for an unreadable parent event"
 echo "PASS d6 corrupt newest parent event refuses"
 
-# D7: a corrupt OLDER event is ignored when a valid newer one is authoritative.
+# D7: a corrupt OLDER claim-kind event is ignored — only the newest claim/
+# reclaim file is compared against the DB row (a stale-seq file carrying an
+# old timestamp and a malformed payload is never the one consulted).
 reset_case d7
-mkdir -p "$INBOX/parent-job-7/events"
-printf '%s\n' 'garbage' >"$INBOX/parent-job-7/events/00001-job.claim.json"
-printf '%s\n' '{"kind":"job.reclaim","payload":{"task_id":9014}}' \
-  >"$INBOX/parent-job-7/events/00002-job.reclaim.json"
+mkparent parent-job-7 9014
+mkparent_reclaim parent-job-7 9014
+printf '%s\n' '{"kind":"job.claim","created_at":"2026-01-01T00:00:00Z","payload":"garbage"}' \
+  >"$INBOX/parent-job-7/events/00000-job.claim.json"
 hk_add --id 9014 >/dev/null
 spawn_try -- --parent-job parent-job-7 --job d7-worker
 expect_rc 0 "a valid newest event wins over a corrupt older one"
@@ -498,16 +516,21 @@ grep -qE '"task_id" *: *9014' <<<"$claim_payload" ||
   fail "newest-wins must inherit 9014, not the corrupt older file: $claim_payload"
 echo "PASS d7 valid newest event wins over corrupt older"
 
-# D8: a malformed inherited task id is a usage error — never laundered
-# through --task-hk-bypass into an hk_unreachable override (tester finding:
+# D8: a task_id written only into the events file is a forged field the
+# DB-row compare refuses before it could ever be laundered (tester finding:
 # task_id "oops" bypassed as unreachable and spawned rc 0).
 reset_case d8
-mkdir -p "$INBOX/parent-job-8/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":"oops"}}' \
-  >"$INBOX/parent-job-8/events/00001-job.claim.json"
+mkparent parent-job-8
+python3 - "$INBOX/parent-job-8/events/00001-job.claim.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+doc = json.loads(open(p, encoding="utf-8").read())
+doc["payload"]["task_id"] = "oops"
+open(p, "w", encoding="utf-8").write(json.dumps(doc) + "\n")
+PY
 spawn_try -- --parent-job parent-job-8 --task-hk-bypass --job d8-worker
-expect_rc 2 "malformed inherited task id must refuse despite bypass"
-expect_grep 'not a positive task id' "$TMP/stderr.txt" "malformed id must be named"
+expect_rc 2 "file-only task id must refuse despite bypass"
+expect_grep 'claim mismatch' "$TMP/stderr.txt" "the forged field must be named"
 no_job_dir d8-worker "no job for a malformed inherited task"
 echo "PASS d8 malformed inherited task id refuses despite bypass"
 

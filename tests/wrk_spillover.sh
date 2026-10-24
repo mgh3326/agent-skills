@@ -4,6 +4,9 @@ set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
 export WRK_TEST_MODE=1
+# hk 1897: scrub the ambient pane env — a suite run from inside a spawned job
+# would otherwise leak ARBITER_JOB into every spawn's parent-claim lookup.
+unset ARBITER_JOB ARBITER_JOB_REGISTERED
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
@@ -71,8 +74,11 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
 
 # A readable arbiter database is the normal routing precondition. Individual
 # cases below replace this with an absent or lookup-failing arbiter explicitly.
+# hk 1897: mutant wrk copies live under $TMP, so their script_dir allowance
+# never covers the repo's bin/arbiter — hand every spawn a temp copy.
 hub_require_isolation
-XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-seed --agent-label seed --lane seed --t T1 >/dev/null
+cp "$ROOT/bin/arbiter" "$TMP/arbiter" && chmod 700 "$TMP/arbiter"
+XDG_DATA_HOME="$TMP/xdg" ARBITER_BIN="$TMP/arbiter" "$TMP/arbiter" claim --job spillover-seed --agent-label seed --lane seed --t T1 >/dev/null
 
 # #768: spawns bind an hk task. The fixture stands in for handoffkeep and the
 # seeded HK_TASK_ID lets these worker-role spawns inherit through the env path
@@ -86,7 +92,7 @@ run_wrk() {
   hub_require_isolation
   local binary="$1"; shift
   env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" \
-    SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="${WRK_TEST_ARBITER_BIN:-$ROOT/bin/arbiter}" XDG_DATA_HOME="$TMP/xdg" \
+    SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="${WRK_TEST_ARBITER_BIN:-$TMP/arbiter}" XDG_DATA_HOME="$TMP/xdg" \
     HANDOFFKEEP_BIN="$HK_FIXTURE" \
     WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="${WRK_TEST_HOSTS_CONFIG:-$CONFIG}" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
     WRK_TEST_THROTTLED=0 \
@@ -151,7 +157,7 @@ run_hub() {
   # ordinary worker cases an explicit task so the remote-task guard does not
   # intentionally refuse the via=hub requests covered by the separate test.
   if [[ "$has_task_link" -eq 0 ]]; then task_args+=(--task "$HK_TASK_ID"); fi
-  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="$ROOT/bin/arbiter" XDG_DATA_HOME="$TMP/xdg" HANDOFFKEEP_BIN="$HK_FIXTURE" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a ${task_args[@]+"${task_args[@]}"} "$@"
+  env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$ROOT/tests/fixtures/scopefuel" ARBITER_BIN="${WRK_TEST_ARBITER_BIN:-$TMP/arbiter}" XDG_DATA_HOME="$TMP/xdg" HANDOFFKEEP_BIN="$HK_FIXTURE" WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$config" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SPILLOVER_LOG="$TMP/spillover.log" WRK_CURL_BIN="$ROOT/tests/fixtures/spillover-hub-curl" WRK_HUB_CURL_LOG="$TMP/hub.log" PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$TMP/ssh.log" WRK_SCP_LOG="$TMP/scp.log" WRK_WAKE_LOG="$TMP/wake.log" WRK_HUB_SCENARIO="${WRK_HUB_SCENARIO:-hub200}" "$binary" spawn -c "${WRK_TEST_CWD:-$ROOT}" -m codex-luna -p "$PROMPT" -w worker -l fixture --t T1 --job "hub-$RANDOM-$RANDOM" --host machine-a ${task_args[@]+"${task_args[@]}"} "$@"
 }
 
 assert_no_hub_leak() {

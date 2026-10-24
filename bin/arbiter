@@ -61,10 +61,10 @@ HERDR_LIVE_STATUS = "working"
 BUSY_TIMEOUT_MS = 10000
 
 # hk 1894: commands whose paths must be canonical (or, in test mode, under a temp
-# root). wrk's trust path calls no arbiter command today; hk 1453 half 2 adds
-# job-get here. _TRUSTED is set by enforce_trust() and read by db_path() and
-# inbox_root().
-TRUST_COMMANDS = frozenset(("claim",))
+# root). hk 1453 half 2 (hk 1897) adds job-get here: wrk's trust reads take the
+# claim row only from the canonical DB. _TRUSTED is set by enforce_trust() and
+# read by db_path() and inbox_root().
+TRUST_COMMANDS = frozenset(("claim", "job-get"))
 _TRUSTED: dict | None = None
 
 EXIT_OK = 0
@@ -140,6 +140,7 @@ def trust_canonical(home):
         "inbox": os.path.join(home, "work", "herdr-inbox", "jobs"),
         "db": os.path.join(home, ".local", "share", "arbiter", "state.db"),
         "hk": os.path.join(home, ".local", "bin", "handoffkeep"),
+        "arbiter": os.path.join(home, ".local", "bin", "arbiter"),
     }
 
 
@@ -168,43 +169,50 @@ def trust_temp_roots(env, home):
     return roots
 
 
-def trust_secure_binary(canonical, uid):
+def trust_secure_binary(canonical, uid, name):
     resolved = os.path.realpath(canonical)
     try:
         info = os.stat(resolved)
     except OSError as exc:
-        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep is unusable (%s): %s" % (resolved, exc.strerror or exc))
+        raise TrustRefusal(name, canonical, "the canonical %s is unusable (%s): %s" % (name, resolved, exc.strerror or exc))
     if not stat.S_ISREG(info.st_mode):
-        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is not a regular file" % resolved)
+        raise TrustRefusal(name, canonical, "the canonical %s %s is not a regular file" % (name, resolved))
     if info.st_uid != uid:
-        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is owned by uid %d, not uid %d" % (resolved, info.st_uid, uid))
+        raise TrustRefusal(name, canonical, "the canonical %s %s is owned by uid %d, not uid %d" % (name, resolved, info.st_uid, uid))
     if info.st_mode & 0o022:
-        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is group- or world-writable (mode %04o)" % (resolved, info.st_mode & 0o7777))
+        raise TrustRefusal(name, canonical, "the canonical %s %s is group- or world-writable (mode %04o)" % (name, resolved, info.st_mode & 0o7777))
     return resolved
 
 
-def trust_resolve(env, home, uid, test_mode, need_hk, fixtures=""):
-    """Return {"inbox", "db", "hk", "overrides"} or raise TrustRefusal.
+def trust_resolve(env, home, uid, test_mode, need_hk, fixtures="", need_arbiter=False, script_dir=""):
+    """Return {"inbox", "db", "hk", "arbiter", "overrides"} or raise TrustRefusal.
 
     Outside test mode each lever (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME,
-    HANDOFFKEEP_BIN) must resolve to its canonical path under home, and the PATH
-    lookup of handoffkeep is never used: the canonical binary must be a regular
-    file owned by uid and not group- or world-writable. In test mode (a test
-    suite only) no canonical path is consulted or resolved: every path in use
-    must resolve under a temp root, the handoffkeep binary also under fixtures.
+    HANDOFFKEEP_BIN, ARBITER_BIN) must resolve to its canonical path under
+    home, and the PATH lookup of handoffkeep or arbiter is never used: the
+    canonical binary must be a regular file owned by uid and not group- or
+    world-writable. In test mode (a test suite only) no canonical path is
+    consulted or resolved: every path in use must resolve under a temp root,
+    the handoffkeep binary also under fixtures, and the arbiter binary also
+    under the directory of the wrk being exercised (hk 1897).
     """
     home_env = trust_value(env, "HOME")
     inbox_env = trust_value(env, "ARBITER_INBOX_ROOT")
     data_env = trust_value(env, "XDG_DATA_HOME")
     hk_env = trust_value(env, "HANDOFFKEEP_BIN")
+    arb_env = trust_value(env, "ARBITER_BIN")
     known = bool(home) and os.path.isabs(home)
     if not known and not test_mode:
         raise TrustRefusal("HOME", "(unknown)", "the passwd home of uid %d cannot be determined, so there is no canonical path to compare with" % uid)
-    canon = trust_canonical(home) if known else {"inbox": None, "db": None, "hk": None}
+    canon = trust_canonical(home) if known else {"inbox": None, "db": None, "hk": None, "arbiter": None}
     roots = trust_temp_roots(env, home if known else "") if test_mode else []
     hk_roots = list(roots)
+    arb_roots = list(roots)
     if test_mode and fixtures:
         hk_roots.append(os.path.realpath(fixtures))
+        arb_roots.append(os.path.realpath(fixtures))
+    if test_mode and script_dir:
+        arb_roots.append(os.path.realpath(script_dir))
     overrides = []
 
     def judge(var, effective, canonical, label, allowed):
@@ -235,8 +243,9 @@ def trust_resolve(env, home, uid, test_mode, need_hk, fixtures=""):
     db = judge("XDG_DATA_HOME" if data_env else "HOME",
                os.path.join(data_env or under_home(".local", "share"), "arbiter", "state.db"), canon["db"], "arbiter DB", roots)
     hk = ""
+    arb = ""
+    search = env.get("PATH") or os.defpath
     if need_hk:
-        search = env.get("PATH") or os.defpath
         if test_mode:
             wanted = hk_env or "handoffkeep"
             found = wanted if "/" in wanted else (shutil.which(wanted, path=search) or "")
@@ -246,8 +255,19 @@ def trust_resolve(env, home, uid, test_mode, need_hk, fixtures=""):
             if hk_env:
                 found = hk_env if "/" in hk_env else (shutil.which(hk_env, path=search) or hk_env)
                 judge("HANDOFFKEEP_BIN", found, canon["hk"], "handoffkeep", ())
-            hk = trust_secure_binary(canon["hk"], uid)
-    return {"inbox": inbox, "db": db, "hk": hk, "overrides": overrides}
+            hk = trust_secure_binary(canon["hk"], uid, "handoffkeep")
+    if need_arbiter:
+        if test_mode:
+            wanted = arb_env or "arbiter"
+            found = wanted if "/" in wanted else (shutil.which(wanted, path=search) or "")
+            if found:
+                arb = judge("ARBITER_BIN" if arb_env else "PATH", found, canon["arbiter"], "arbiter", arb_roots)
+        else:
+            if arb_env:
+                found = arb_env if "/" in arb_env else (shutil.which(arb_env, path=search) or arb_env)
+                judge("ARBITER_BIN", found, canon["arbiter"], "arbiter", ())
+            arb = trust_secure_binary(canon["arbiter"], uid, "arbiter")
+    return {"inbox": inbox, "db": db, "hk": hk, "arbiter": arb, "overrides": overrides}
 # --- trust paths: end ---
 
 
@@ -1576,6 +1596,41 @@ def cmd_job_get(args: argparse.Namespace) -> dict:
     ).fetchone()
     if row is None:
         raise ArbiterError(EXIT_NOT_FOUND, f"job not found: {args.job}", job_id=args.job)
+    # hk 1897: the newest arbiter-minted job.claim/job.reclaim row is the
+    # durable claim identity wrk's trust reads consult. seq — the minted
+    # ordering — decides, so two rows in the same second still order.
+    claim_row = con.execute(
+        "SELECT kind, seq, payload, created_at FROM events"
+        " WHERE job_id = ? AND kind IN ('job.claim', 'job.reclaim')"
+        " ORDER BY seq DESC LIMIT 1",
+        (args.job,),
+    ).fetchone()
+    claim = None
+    if claim_row is not None:
+        try:
+            claim_event = json.loads(claim_row[2])
+        except ValueError as exc:
+            raise ArbiterError(
+                EXIT_STORAGE, f"claim event payload 깨짐: {args.job}"
+            ) from exc
+        claim_payload = (
+            claim_event.get("payload") if isinstance(claim_event, dict) else None
+        )
+        if not isinstance(claim_payload, dict):
+            raise ArbiterError(
+                EXIT_STORAGE, f"claim event payload 가 객체가 아니다: {args.job}"
+            )
+        claim = {
+            "kind": claim_row[0],
+            "seq": claim_row[1],
+            "created_at": claim_row[3],
+            "owner_lane": claim_payload.get("owner_lane"),
+            "parent_lane": claim_payload.get("parent_lane"),
+            "role": claim_payload.get("role"),
+            "agent_label": claim_payload.get("agent_label"),
+            "task_id": claim_payload.get("task_id"),
+            "task_inherited_from": claim_payload.get("task_inherited_from"),
+        }
     recent = con.execute(
         "SELECT kind FROM events WHERE job_id = ? ORDER BY seq DESC LIMIT 10",
         (args.job,),
@@ -1589,6 +1644,7 @@ def cmd_job_get(args: argparse.Namespace) -> dict:
         "created_at": row[4],
         "updated_at": row[5],
         "agent_label": _claim_agent_label(con, args.job),
+        "claim": claim,
         "receipt": _spawn_receipt(con, args.job),
         # Return the retained window in chronological order for consumers that
         # need to tell a reclaim from a first claim without replaying artifacts.

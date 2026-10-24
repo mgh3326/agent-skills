@@ -1008,8 +1008,11 @@ block 밖의 문장은 이 IDs를 약화·재정의할 수 없으며, prose-cont
      PR 생성 순서(scopefuel #154 → agent-skills #209)와 설치/merge 승인은 별개다.
      builder 전용 family 제한은 counsel/prescription의 기존 T1/T2 동일-family 예외를 바꾸지 않는다.
      승인 가능한 issuer 는 operator·operator-desk·director-1·pa-integrator 뿐이다(뒤 둘은
-     그 job 의 parent lane 일 때만; 토큰은 mbp 레인 래퍼에만 존재) — job 에 기록된 parent
-     lane 은 그 고정 집합 밖에서는 신뢰하지 않는다. by=pa-integrator 승인은 서버상 그 job 에
+     그 job 의 parent lane 일 때만; 토큰은 mbp 레인 래퍼에만 존재) — job 의 parent
+     lane·owner·task id 는 events-dir 파일이 아니라 arbiter 가 민팅한 DB claim row 에서
+     읽는다(hk 1897); 같은 OS 사용자가 sqlite 를 고치거나 스스로 arbiter claim 을 돌릴 수는
+     있으므로 좁힐 뿐 경계는 아니다(hk 525). 기록된 parent lane 은 그 고정 집합 밖에서는
+     신뢰하지 않는다. by=pa-integrator 승인은 서버상 그 job 에
      묶인 ParkingArcade task 에서만 유효하다(task 의 project·refs 는 아무 hk 클라이언트나
      쓸 수 있어 좁힐 뿐 경계가 아니다). mbp 레인 래퍼(hk-desk·hk-director-1·
      hk-pa-integrator)는 모든 mbp pane 과 같은 OS 사용자로 돌아 위조 표면을 mbp 상주

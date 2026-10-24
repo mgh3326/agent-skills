@@ -36,6 +36,10 @@ export WRK_NO_SLEEP=1
 export WRK_JOB_DELEGATE=0
 export PANEWIRE_BIN="$TMP/absent-panewire"
 export HANDOFFKEEP_BIN="$TMP/hk"
+# hk 1897: round void/extend read the claim identity from the arbiter DB row;
+# give every wrk/arbiter call a temp-root canonical binary.
+cp "$ROOT/bin/arbiter" "$TMP/arbiter" && chmod 700 "$TMP/arbiter"
+export ARBITER_BIN="$TMP/arbiter"
 export HK_DOC_DIR="$TMP/hk-docs"
 mkdir -p "$HK_DOC_DIR"
 export GIT_CONFIG_NOSYSTEM=1
@@ -57,9 +61,47 @@ claim_job() { # claim_job job [parent] [created_at] [role] [owner]
   local role="${4:-builder}" owner="${5:-lane-a}"
   local events="$ARBITER_INBOX_ROOT/$job/events"
   mkdir -p "$events" "$ARBITER_INBOX_ROOT/$job"
-  write_event "$events/00001-job.claim.json" <<EOF
-{"kind":"job.claim","job_id":"$job","created_at":"$at","owner_lane":"$owner","label":"lbl","pane_id":"w:p1","parent_lane":"$parent","role":"$role"}
-EOF
+  # hk 1897: mint the DB claim row; the events file arbiter writes stays
+  # byte-identical on the identity fields — only created_at and the
+  # informational label/pane_id fields are patched afterwards.
+  local claim_args=(claim --job "$job" --lane "$owner" --t T2 --role "$role" --agent-label lbl)
+  # --parent-lane is only valid for --role builder in arbiter claim.
+  [[ "$role" == "builder" ]] && claim_args+=(--parent-lane "$parent")
+  "$ARBITER_BIN" "${claim_args[@]}" >/dev/null || fail "claim_job $job mint failed"
+  python3 - "$events/00001-job.claim.json" "$at" <<'PY'
+import json, sys
+p, at = sys.argv[1], sys.argv[2]
+doc = json.load(open(p, encoding="utf-8"))
+doc["created_at"] = at
+doc["payload"]["label"] = "lbl"
+doc["payload"]["pane_id"] = "w:p1"
+open(p, "w", encoding="utf-8").write(json.dumps(doc, separators=(",", ":")) + "\n")
+PY
+}
+
+# reclaim_job — a real arbiter reclaim row + events file, with created_at
+# patched to the planted timestamp (identity fields stay arbiter-minted).
+reclaim_job() { # reclaim_job job created_at [owner] [parent]
+  local job="$1" at="$2" owner="${3:-lane-a}" parent="${4:-director-1}"
+  local res="$TMP/reclaim-res-$job"
+  "$ARBITER_BIN" lease --job "$job" --resource "$res" --kind path >/dev/null ||
+    fail "reclaim_job $job lease failed"
+  "$ARBITER_BIN" release --job "$job" --resource "$res" --kind path --force >/dev/null ||
+    fail "reclaim_job $job release failed"
+  "$ARBITER_BIN" claim --reclaim-released --job "$job" --lane "$owner" --t T2 \
+    --role builder --parent-lane "$parent" --agent-label lbl >/dev/null ||
+    fail "reclaim_job $job mint failed"
+  python3 - "$ARBITER_INBOX_ROOT/$job/events" "$at" <<'PY'
+import json, sys, os
+events, at = sys.argv[1], sys.argv[2]
+name = sorted(n for n in os.listdir(events) if n.endswith("-job.reclaim.json"))[-1]
+p = os.path.join(events, name)
+doc = json.load(open(p, encoding="utf-8"))
+doc["created_at"] = at
+doc["payload"]["label"] = "lbl"
+doc["payload"]["pane_id"] = "w:p1"
+open(p, "w", encoding="utf-8").write(json.dumps(doc, separators=(",", ":")) + "\n")
+PY
 }
 
 seed_round() { # seed_round job [round] [created_at]
@@ -298,9 +340,8 @@ assert_refused "wrk: joined: refused after end record $END_NAME"
 [[ "$(kind_count b-ended job.verdict)" -eq 0 ]] || fail "verdict after revoke wrote a record"
 [[ "$(kind_count b-ended job.round_void)" -eq 0 ]] || fail "void after revoke wrote a record"
 [[ "$(kind_count b-ended job.joined)" -eq 0 ]] || fail "joined after revoke wrote a record"
-write_event "$ARBITER_INBOX_ROOT/b-ended/events/00003-job.reclaim.json" <<EOF
-{"kind":"job.reclaim","job_id":"b-ended","created_at":"2026-10-23T02:00:00Z","owner_lane":"lane-a","label":"lbl","pane_id":"w:p1","parent_lane":"director-1","role":"builder"}
-EOF
+# A reclaim after the end record is a real arbiter-minted row now (hk 1897).
+reclaim_job b-ended 2026-10-23T02:00:00Z
 open_ok b-ended "$H1"
 open_ok b-ended "$H2"
 grant_doc void-b "$(printf 'round-void: job=b-ended round=2 by=director-1\n')"
