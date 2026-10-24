@@ -1192,6 +1192,24 @@ class RealBinaryCase(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertEqual(out.stdout.strip(), "zero-rounds job=jobt lane=jobt-lane")
 
+    def repro_audit_symlinked_inbox(self, wrk):
+        """The checked inbox may itself be a symlink (round 3 B1): the audit still walks it, however the environment names it."""
+        w = self.w
+        physical = w.base / "physical-inbox"
+        shutil.move(str(w.jobs), str(physical))
+        w.jobs.symlink_to(physical)                   # <passwd home>/work/herdr-inbox/jobs -> physical-inbox
+        w.mkjob(physical, "jobl")                     # a builder job with no recorded rounds
+        want = "zero-rounds job=jobl lane=jobl-lane"
+        for label, extra in (("env unset", {}),
+                             ("env spelled as the canonical path", {"ARBITER_INBOX_ROOT": w.jobs}),
+                             ("env names the symlink target", {"ARBITER_INBOX_ROOT": physical})):
+            out = w.wrk(wrk, "round", "audit", **extra)
+            self.assertEqual(out.returncode, 0, label + ": " + out.stderr)
+            self.assertEqual(out.stdout.strip(), want, label)
+
+    def test_round_audit_walks_a_symlinked_canonical_inbox(self):
+        self.repro_audit_symlinked_inbox(self.wrk)
+
     HELPERS = ('set -euo pipefail; . "$1"; r="$2"; '
                'echo "end=$(wrk_newer_end_record jobr "$r")"; echo "rounds=$(wrk_recorded_rounds jobr "$r")"; '
                'echo "role=$(wrk_job_role jobr "$r")"; echo "blocks=$(wrk_join_blocks jobr "$r" | tr "\\t\\n" "  ")"; '
@@ -1507,6 +1525,11 @@ class RealBinaryCase(unittest.TestCase):
     def test_mutant_round_audit_skips_the_guard(self):
         mutant = self.mutant(WRK, '  wrk_trust_guard\n  local jobs_root\n', ENV_FOLLOWING + '  local jobs_root\n', "audit")
         self.red(self.repro_audit_redirect, mutant)
+
+    def test_mutant_audit_find_does_not_follow_a_symlinked_inbox(self):
+        mutant = self.mutant(WRK, 'done < <(find -H "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)',
+                             'done < <(find "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)', "auditfind")
+        self.red(self.repro_audit_symlinked_inbox, mutant)
 
     def test_mutant_join_gate_reads_the_environment_root(self):
         mutant = self.mutant(WRK, '    wrk_joined_refuse_blocks "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"\n',

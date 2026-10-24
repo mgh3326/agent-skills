@@ -5116,8 +5116,8 @@ wrk_trust_guard() {
 
 completion_metadata() {
   local job="$1" root
-  # "trusted" (round open/verdict/void, after wrk_trust_guard) reads the guarded
-  # root; done, escalate and joined keep following the environment.
+  # "trusted" (round open/verdict/void and joined, after wrk_trust_guard) reads the
+  # guarded root; done and escalate keep following the environment.
   if [[ "${2:-}" == trusted ]]; then
     root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   else
@@ -6531,6 +6531,8 @@ round_audit_cmd() {
   jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   [[ -d "$jobs_root" ]] || return 0
   local job_dir job scan ended owner lane_ok role recorded blocks line tag rest
+  # find -H below: the checked inbox may itself be a symlink (the guard returns the
+  # canonical spelling); without -H find walks nothing and the audit looks clean.
   while IFS= read -r job_dir; do
     [[ -n "$job_dir" && -d "$job_dir" ]] || continue
     job="$(basename "$job_dir")"
@@ -6564,7 +6566,7 @@ round_audit_cmd() {
         printf 'unmatched-verdict job=%s file=%s\n' "$job" "$rest"
       fi
     done <<<"$blocks"
-  done < <(find "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
+  done < <(find -H "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
 }
 
 round_cmd() {
