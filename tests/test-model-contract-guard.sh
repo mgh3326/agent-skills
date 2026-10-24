@@ -20,6 +20,9 @@
 # Update both in one PR — this guard exists to fail loudly on drift, so it must
 # never be "fixed" by relaxing an assertion without a matching scopefuel change.
 set -euo pipefail
+# hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
+# (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"

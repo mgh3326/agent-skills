@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2034,SC2016,SC2030,SC2031
 set -euo pipefail
+# hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
+# (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"

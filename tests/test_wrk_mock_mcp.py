@@ -619,7 +619,7 @@ class IsolationTests(unittest.TestCase):
                    WRK_HOSTS_CONFIG=str(self.base / "hosts.toml"), WRK_NO_SLEEP="1", WRK_FIXTURE_SCENARIO="spawn",
                    WRK_FIXTURE_LOG=str(self.base / "herdr.log"), MOCK_MCP_PROFILE=PROFILE,
                    WRK_MOCK_MCP_CONFIG=str(self.config), PANEWIRE_BIN=str(self.base / "absent-panewire"),
-                   WRK_REFRESH_TIMEOUT_S="1", ARBITER_INBOX_ROOT=str(self.base / "inbox"))
+                   WRK_REFRESH_TIMEOUT_S="1", ARBITER_INBOX_ROOT=str(self.base / "inbox"), WRK_TEST_MODE="1")
         r = subprocess.run(([shell] if shell else []) + [str(self.wrk),"spawn","-c",str(self.cwd),"-m",model,"-p",str(prompt),"-w","w","-l","fixture",
                             "-L","mock","--t","T1","--task","872","--task-hk-bypass","--host",host],
                            env=env,text=True,capture_output=True,timeout=25)
