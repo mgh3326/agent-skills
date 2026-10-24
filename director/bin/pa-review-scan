@@ -183,7 +183,9 @@ def main():
         for task in result["tasks"]:
             for job_id, job in task["jobs"].items():
                 final = job["final"]
-                vals = [task["task"], job_id, ",".join(job["forms"]), ",".join(map(str, job["rounds"])),
+                rounds = ",".join(f"{item['round']} (derived)" if item["round_derived"] else str(item["round"])
+                                   for item in job["lines"])
+                vals = [task["task"], job_id, ",".join(job["forms"]), rounds,
                         job["reworks"], final["outcome"], final["reason"], final["head"] or "",
                         final["note"] or "", "counted" if job["counted"] else "uncounted",
                         final["comment_id"], final["created_at"], "yes" if task["deciding_job"] == job_id else "no"]

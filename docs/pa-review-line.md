@@ -46,6 +46,6 @@ PA-REVIEW task=<hk id> job=<job id> outcome=<outcome> reason=<free text to end o
 
 ## Scanner
 
-Run `director/bin/pa-review-scan --task 1942` for TSV or add `--json` for the structured output consumed by K4. Repeat `--task` for several tasks, or use `--project ParkingArcade --state <state>` once for every state; each state is queried separately because a list response can truncate. Comments are fetched in pages of 100 with the read-only CLI's `--after-id` cursor until a short page is returned.
+Run `director/bin/pa-review-scan --task 1942` for TSV or add `--json` for the structured output consumed by K4. Derived TSV rounds are marked with “(derived)”; JSON marks them with round_derived. Repeat `--task` for several tasks, or use `--project ParkingArcade --state <state>` once for every state; each state is queried separately because a list response can truncate. Comments are fetched in pages of 100 with the read-only CLI's `--after-id` cursor until a short page is returned.
 
 Only exact lines at the start of a comment or one of its lines, from an allowed author (default `pa-integrator`), and whose task id matches the posted task count. Other lines beginning with PA-REVIEW from an allowed author appear in the error output. Mentions elsewhere and lines by other authors are ignored.

@@ -104,6 +104,7 @@ class ScanTests(unittest.TestCase):
         result = self.run_scan("--task", "1935")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(result.stdout.startswith("task\tjob\t"))
+        self.assertIn("1 (derived)", result.stdout)
 
     def test_project_states_use_one_list_call_per_state(self):
         result = self.run_scan("--project", "ParkingArcade", "--state", "open",
