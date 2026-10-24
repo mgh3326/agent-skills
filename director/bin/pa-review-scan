@@ -100,7 +100,7 @@ def scan(tasks, authors):
             comment_id = field(comment, "id", "comment_id")
             created = field(comment, "created_at", "createdAt", default="")
             body = str(field(comment, "body", "text", default=""))
-            for line_pos, line in enumerate(body.splitlines(), 1):
+            for line_pos, line in enumerate(re.split(r"\r\n|\r|\n", body), 1):
                 if not line.startswith("PA-REVIEW"):
                     continue
                 v1_prefix = line.startswith("PA-REVIEW v1")
@@ -119,14 +119,14 @@ def scan(tasks, authors):
                     errors.append({"task": task, "comment_id": comment_id, "line": line_pos,
                                    "message": "unknown v1 reason code"})
                     continue
-                job_id = values["job"]
-                job = jobs.setdefault(job_id, {"forms": set(), "rounds": [], "lines": []})
-                job["forms"].add(form)
                 derived = values.get("round") is None
                 if not derived and int(values["round"]) < 1:
                     errors.append({"task": task, "comment_id": comment_id, "line": line_pos,
                                    "message": "round must be positive"})
                     continue
+                job_id = values["job"]
+                job = jobs.setdefault(job_id, {"forms": set(), "rounds": [], "lines": []})
+                job["forms"].add(form)
                 round_no = int(values["round"]) if not derived else len(job["lines"]) + 1
                 outcome, reason = values["outcome"], values["reason"]
                 counted = outcome != "excluded" and not (form == "v1" and reason in UNCOUNTED)

@@ -79,6 +79,7 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(jobs["derived"]["final"]["round"], 1)
         self.assertTrue(jobs["derived"]["final"]["round_derived"])
         self.assertEqual(jobs["clock"]["final"]["comment_id"], 102)
+        self.assertEqual(jobs["clock"]["final"]["outcome"], "rework")
         self.assertEqual(jobs["clock"]["final"]["round"], 2)
         self.assertEqual(jobs["outoftime"]["rounds"], [2, 1])
         self.assertEqual(jobs["outoftime"]["final"]["outcome"], "accepted")
@@ -100,6 +101,49 @@ class ScanTests(unittest.TestCase):
         self.assertNotIn("bad", jobs)  # unknown v1 code is never reinterpreted as early form
         self.assertNotIn("wrongtask", jobs)
 
+    def test_strict_near_matches_are_individually_reported_as_errors(self):
+        result = self.run_scan("--task", "1935", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        errors = [item for item in data["errors"] if item["comment_id"] == 94]
+        self.assertEqual([item["line"] for item in errors], list(range(1, 8)) + list(range(9, 22)))
+        jobs = data["tasks"][0]["jobs"]
+        self.assertNotIn("lower-tag", jobs)
+        for name in ("badspace", "tab", "trail", "case", "dash", "upper", "order",
+                     "outcome", "empty", "unknown", "version", "zero", "doublezero",
+                     "lowercasekey", "longhead", "shorthead", "earlyempty"):
+            self.assertNotIn(name, jobs)
+
+    def test_zero_round_is_an_error_and_does_not_abort_other_jobs(self):
+        result = self.run_scan("--task", "1935", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        zero_errors = [item for item in data["errors"]
+                       if item["comment_id"] == 94 and item["message"] == "round must be positive"]
+        self.assertEqual([item["line"] for item in zero_errors], [16, 17])
+        jobs = data["tasks"][0]["jobs"]
+        self.assertNotIn("zero", jobs)
+        self.assertNotIn("doublezero", jobs)
+        self.assertEqual(jobs["b1935"]["final"]["outcome"], "accepted")
+
+    def test_early_rounds_derive_from_job_line_order_and_unicode_separator_stays_in_note(self):
+        result = self.run_scan("--task", "1935", "--task", "1891", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        tasks_by_id = {item["task"]: item for item in data["tasks"]}
+        task1935, task1891 = tasks_by_id[1935], tasks_by_id[1891]
+        early = task1935["jobs"]["early-sequence"]
+        self.assertEqual(early["rounds"], [1, 2])
+        self.assertTrue(all(item["round_derived"] for item in early["lines"]))
+        self.assertEqual(early["final"]["reason"], "second")
+        unicode_job = task1935["jobs"]["unicode-line"]
+        self.assertIn("\u2028PA-REVIEW v1", unicode_job["final"]["note"])
+        self.assertNotIn("not-a-line", task1935["jobs"])
+        real_early = task1891["jobs"]["b1891"]
+        self.assertEqual(real_early["final"]["reason"],
+                         "f5 PR #397 merged: clusters on RS6/G63/F-150 displays, G90 tips dark metal, CI pure + Unity PASS")
+        self.assertTrue(real_early["final"]["round_derived"])
+
     def test_tsv_is_default(self):
         result = self.run_scan("--task", "1935")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -110,7 +154,12 @@ class ScanTests(unittest.TestCase):
         result = self.run_scan("--project", "ParkingArcade", "--state", "open",
                               "--state", "closed", "--json")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(json.loads(result.stdout)["tasks_scanned"], [1891, 1935])
+        data = json.loads(result.stdout)
+        self.assertEqual(data["tasks_scanned"], [1891, 1935])
+        self.assertEqual(data["tasks"][0]["jobs"]["b1891"]["final"]["outcome"], "accepted")
+        calls = self.call_log.read_text().splitlines()
+        self.assertEqual(calls, ["list|ParkingArcade|open", "list|ParkingArcade|closed",
+                                 "1891|100|0", "1935|100|0"])
 
     def test_comments_are_paged_until_short_page(self):
         fixture = json.loads(Path(self.env["PA_REVIEW_FIXTURE"]).read_text())
