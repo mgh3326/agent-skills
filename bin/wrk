@@ -6557,7 +6557,7 @@ round_audit_cmd() {
   while IFS= read -r event_dir; do
     [[ -n "$event_dir" ]] && event_dirs+=("$event_dir")
   done < <(find -H "$jobs_root" -mindepth 2 -maxdepth 2 -type d -name events | LC_ALL=C sort)
-  exec 3< <(job_events_scan "${event_dirs[@]}")
+  exec 3< <(job_events_scan ${event_dirs[@]+"${event_dirs[@]}"})
   wrk_py - "$jobs_root" "$lane" <<'PY'
 import os, sys
 exec(os.environ["WRK_EVENTS_PY"])

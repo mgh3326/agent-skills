@@ -583,6 +583,13 @@ fi
 echo "PASS d2-audit-global-verdict-matching"
 ARBITER_INBOX_ROOT="$save_inbox"
 
+AUDIT_EMPTY="$TMP/audit-empty"
+mkdir -p "$AUDIT_EMPTY"
+run_cmd env ARBITER_INBOX_ROOT="$AUDIT_EMPTY" "$WRK" round audit
+assert_rc 0
+[[ ! -s "$TMP/run.out" ]] || fail "empty audit inbox must stay empty: $(cat "$TMP/run.out")"
+echo "PASS d2b-audit-empty-inbox"
+
 # ── D3: audit Python process count is constant and at most three ────────
 PY_WRAPPER="$TMP/python-wrapper"
 mkdir -p "$PY_WRAPPER"
@@ -937,7 +944,8 @@ assert_rc 0
 echo "AUDIT ten recorded tester dirs: before=$(grep -c '^unmatched-verdict job=ten-tester-' "$TMP/run.out") lines; after=0 lines"
 echo "PASS mutant-per-job-audit-breaks-global-verdict-invariant"
 
-printf '%s\n' 'exec 3< <(job_events_scan "${event_dirs[@]}") => exec 3< <(for event_dir in "${event_dirs[@]}"; do job_events_scan "$event_dir" >/dev/null; done; job_events_scan "${event_dirs[@]}")' >"$TMP/spec-per-job-process"
+# shellcheck disable=SC2016 # mutant source is literal shell code, not an expansion.
+printf '%s\n' 'exec 3< <(job_events_scan ${event_dirs[@]+"${event_dirs[@]}"}) => exec 3< <(for event_dir in ${event_dirs[@]+"${event_dirs[@]}"}; do job_events_scan "$event_dir" >/dev/null; done; job_events_scan ${event_dirs[@]+"${event_dirs[@]}"})' >"$TMP/spec-per-job-process"
 mutant per-job-process "$TMP/spec-per-job-process"
 : >"$TMP/process-mutant-count"
 run_cmd env PATH="$PY_WRAPPER:$PATH" PY_COUNT="$TMP/process-mutant-count" REAL_PYTHON3="$REAL_PYTHON3" \
