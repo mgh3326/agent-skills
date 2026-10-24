@@ -5327,8 +5327,12 @@ for name, o, _ in wrk_events_ordered(sys.argv[1]):
         parent=p.get('parent_lane') if isinstance(p.get('parent_lane'), str) else ''
         role=p.get('role') if isinstance(p.get('role'), str) else ''
     pane=p.get('pane_id') if isinstance(p.get('pane_id'), str) else pane
-if owner and label and pane: print(owner, label, pane, parent, role, sep='\t')
-else: raise SystemExit(1)
+values = (owner, label, pane, parent, role)
+if (owner and label and pane
+        and not any(any(ord(char) < 0x20 for char in value) for value in values)):
+    print(*values, sep="\x1f")
+else:
+    raise SystemExit(1)
 PY
 }
 
@@ -5418,7 +5422,7 @@ delegate_job_cmd() {
     local d_job="${1:-}" d_meta="" d_owner="" d_pane=""
     if [[ -n "$d_job" && "$d_job" != -* ]]; then
       d_meta="$(completion_metadata "$d_job" 2>/dev/null || true)"
-      IFS=$'\t' read -r d_owner _ d_pane _ _ <<<"$d_meta"
+      IFS=$'\x1f' read -r d_owner _ d_pane _ _ <<<"$d_meta"
       job_end_housekeeping "$d_job" "$d_owner" "$sub" "panewire job $sub" "wrk $sub (delegated)" "$d_pane"
     fi
   fi
@@ -5623,10 +5627,8 @@ done_cmd() {
   done
   local metadata owner label pane parent role jobs_root
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
-  # completion_metadata prints five tab-separated fields; reading into three
-  # lets pane_id swallow parent_lane and role ("w1:p1\t\tworker" was recorded
-  # on 2026-09-05), which is also what panewire routes on.
-  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  # Use a non-whitespace separator so empty parent/role fields stay distinct.
+  IFS=$'\x1f' read -r owner label pane parent role <<<"$metadata"
   # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
   # owner/parent, with one warning line on a mismatch (non-trust merge).
   IFS=$'\t' read -r owner parent <<<"$(job_claim_prefer_db "$job" "$owner" "$parent")"
@@ -5716,7 +5718,7 @@ PY
 builder_metadata() {
   local job="$1" metadata owner label pane parent role
   metadata="$(completion_metadata "$job" "${2:-}")" || die "cannot find job.claim/job.spawned metadata: $job"
-  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  IFS=$'\x1f' read -r owner label pane parent role <<<"$metadata"
   case "$role" in builder|captain) ;; *) die "$job is not a builder claim with a parent lane (legacy captain alias is accepted)" ;; esac
   [[ -n "$parent" ]] || die "$job is not a builder claim with a parent lane (legacy captain alias is accepted)"
   # owner_lane is the builder's own lane. parent_lane is informational only;

@@ -30,11 +30,16 @@ own() { [[ "$1" =~ ^[0-9]+$ ]] || return 0; tw_register_pid "$OWNED_PIDS" "$1"; 
 # 만으로 각 writer 를 정확한 pid 로 거둔다 — 다른 프로세스의 환경을 읽거나
 # 패턴 매치로 죽이지 않는다.
 cleanup() {
-  local tw_rc=0
+  local rc=$? tw_rc=0
   tmp_writers_stop || tw_rc=$?
+  # Keep failed-run evidence even when every writer has stopped.
+  if (( tw_rc == 0 && rc == 0 )); then
+    rm -rf "$TMP"
+  elif (( rc != 0 && tw_rc == 0 )); then
+    echo "test-wrk: preserving fixture root after failure: $TMP" >&2
+  fi
   # A refused or unkillable tracked writer keeps TMP and fails the suite —
   # never rm -rf while one lives.
-  (( tw_rc == 0 )) && rm -rf "$TMP"
   # 회귀 게이트: teardown 이 추적한 writer 를 놓치면 조용히 새는 게 아니라
   # 스위트가 실패해야 한다.
   if [[ "$tw_rc" -ne 0 || -n "${TW_LEFTOVER_PIDS:-}" ]]; then
@@ -11878,15 +11883,16 @@ echo "PASS builder profiles, own-lane escalation/JOIN, reclaim metadata, fixture
 # ⑤ a broken state db is a quota-record failure: warn and still spawn.
 rm -f "$TMP/herdr.log"
 export TEST_ARBITER_BIN="$ARBITER"
-printf 'not a database\n' >"$TMP/xdg/arbiter/state.db"
-rm -f "$TMP/xdg/arbiter/state.db-wal" "$TMP/xdg/arbiter/state.db-shm"
-schema_failed_out="$(spawn_base grok --job arb-broken --t T1 2>&1)"
-grep -q 'arbiter quota-pool claim failed' <<<"$schema_failed_out"
-grep -q 'continuing spawn' <<<"$schema_failed_out"
-[[ -e "$TMP/herdr.log" ]]
-tmp_writers_stop ||
-  fail "tracked writers survived the mid-case teardown:${TW_LEFTOVER_PIDS:-}"
-rm -rf "$TMP/xdg/arbiter"
+mkdir -p "$TMP/xdg-broken/arbiter"
+printf 'not a database\n' >"$TMP/xdg-broken/arbiter/state.db"
+rm -f "$TMP/xdg-broken/arbiter/state.db-wal" "$TMP/xdg-broken/arbiter/state.db-shm"
+schema_failed_out="$(XDG_DATA_HOME="$TMP/xdg-broken" spawn_base grok --job arb-broken --t T1 2>&1)" ||
+  fail "broken state db spawn exited early: $schema_failed_out"
+grep -q 'arbiter quota-pool claim failed' <<<"$schema_failed_out" ||
+  fail "broken state db warning missing: $schema_failed_out"
+grep -q 'continuing spawn' <<<"$schema_failed_out" ||
+  fail "broken state db stopped spawn: $schema_failed_out"
+[[ -e "$TMP/herdr.log" ]] || fail "broken state db prevented the fixture spawn"
 unset TEST_ARBITER_BIN
 
 # ROB-1198 §③: an unclassified job is refused outright — no default T, and the
