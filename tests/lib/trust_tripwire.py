@@ -13,8 +13,9 @@ install() patches the stat, open, listing and rename families of os, builtins
 and io, and subprocess.Popen, so any call whose path (lexically normalized, never
 resolved, so the guard itself touches nothing) lies under a trust location is
 recorded and raises AssertionError before the real call runs. The locations are
-taken under each home form as spelled and through realpath, so neither a
-symlinked home nor a symlinked location can be reached under another name.
+taken under each home form as spelled, through each link of their chain and
+through realpath, so neither a symlinked home nor a symlinked location can be
+reached under another name.
 With fake_home it also makes
 pwd.getpwuid(<own uid>) answer fake_home as the home directory.
 """
@@ -34,12 +35,35 @@ def real_home():
     return _state.get("real_home") or pwd.getpwuid(os.getuid()).pw_dir
 
 
+def _chain(path):
+    """The absolute, normalised path of each link of the symlink chain at path."""
+    seen = {path}
+    hops = []
+    for _ in range(40):
+        try:
+            target = os.readlink(path)
+        except OSError:
+            break
+        if not os.path.isabs(target):
+            target = os.path.join(os.path.dirname(path), target)
+        path = os.path.normpath(target)
+        if path in seen:
+            break
+        seen.add(path)
+        hops.append(path)
+    return hops
+
+
 def trust_roots():
     home = real_home()
     homes = [home]
     if os.path.realpath(home) != home:
         homes.append(os.path.realpath(home))
     roots = [os.path.join(form, rel) for form in homes for rel in TRIP_RELATIVE]
+    for location in tuple(roots):
+        roots.extend(_chain(location))
+    for hop in _chain(home):
+        roots.extend(os.path.join(hop, rel) for rel in TRIP_RELATIVE)
     for location in tuple(roots):
         resolved = os.path.realpath(location)
         if resolved != location:
