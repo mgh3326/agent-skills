@@ -11983,7 +11983,7 @@ PY
 
 heavy_help() {
   cat <<'USAGE'
-Usage: wrk heavy -- <command> [args...]
+Usage: wrk heavy [--queue-key KEY] -- <command> [args...]
        wrk heavy status
 
 Serialize heavy (>1 minute) local test/build runs: up to `heavy_max` holders
@@ -12047,13 +12047,72 @@ read the records when the rename happened (one pass, no re-read before its
 slot attempts) can still take a slot that frees in that same pass. Neither
 is preempted afterwards. Waiters of an older wrk ignore classes entirely.
 
+Lane FIFO (hk 1407): the same publish also writes an enqueue ticket,
+wall-clock time plus pid as the tie-break. Among lane waiters, a lane
+waiter does not take a slot while a live lane waiter with an older ticket
+could take that same slot (a slot index below that waiter's own limit).
+The shape is the ci reservation's. A record whose pid is dead reserves
+nothing. A ticket that is not ASCII decimal digits is not a ticket, so
+lane FIFO does not wait on it, and a position with one is ignored and
+left in place. Compatibility with an older wrk applies only to the lane FIFO rule:
+a lane record with no ticket is never waited on, so mixed versions
+degrade to today's free-for-all among lanes and never to a stall. The
+hk 1533 ci reservation does not read tickets. A live ci waiter, with or without a ticket,
+keeps reserving exactly as today. ci waiters stay ahead of every lane
+waiter. The ci starvation guard is unchanged: it only stops a lane from
+deferring to ci.
+After it fires, that lane still will not take a slot a live older lane
+ticket could take.
+
+Durable place: `wrk heavy --queue-key KEY -- <command>` (or
+WRK_HEAVY_QUEUE_KEY) keeps a place across a wait-cap exit. KEY matches
+ASCII [A-Za-z0-9._-]{1,64} under any locale; '.' and '..' are refused.
+A keyed waiter that exits on the wait cap (rc 75) writes a position
+record — the key, the original ticket, and expiry = now +
+WRK_HEAVY_REQUEUE_GRACE (default 600 s) — into <lock>.positions, the
+directory next to the waiters dir. The file name is the key. Trust checks
+match the waiters dir: not a symlink, owner uid or root, a regular file,
+one link. A later keyed waiter with the same key reuses that ticket while
+now < expiry. The record is consumed when a slot is acquired; a later
+wait-cap exit writes it again, because the command did not run. It is
+ignored at or after expiry. A waiter with no key takes a fresh ticket and
+writes no position. The wait cap stays one per-run value
+(WRK_HEAVY_WAIT_CAP). There is no per-class or per-host cap. Long runs
+(Unity, about 40 min) should pass a larger WRK_HEAVY_WAIT_CAP together
+with --queue-key, so a cap exit keeps their place.
+
+Exactly what the lane order promises (same kind of promise as the ci
+paragraph: a queue order read from a directory, not a lock): a lane
+waiter is ordered from the moment its record is visible. The record is
+written under a dot name and renamed into place before the first slot
+attempt, so a pass reads a whole record or none. Every lane pass that
+starts after that rename skips the slots an older live ticket could take,
+and the next such slot to free goes to the older ticket. Not promised: a
+waiter is not ordered while wrk and its python half are still starting up
+(before the record exists), and a pass that had already read the records
+when the rename happened (one pass, no re-read before its slot attempts)
+can still take a slot that frees in that same pass. Not promised: tickets
+and position expiry use the wall clock, so a step of that clock can invert
+order or move a position across the grace boundary. The wait cap uses a
+monotonic clock and does not move with the wall clock. Not promised: a
+same-uid process can write a position for any allowed key. A forged key
+can at most give that process the original ticket within the grace. It
+narrows who takes a free slot; it does not bound a same-uid peer. Equal
+tickets do not reserve against each other, so two waiters that reused one
+position cannot deadlock on it.
+
 `wrk heavy status` prints the lock path, this host, the effective limit,
 the load-wait switch (`load_wait true|false|error (...)`), one `holder`
-line per occupied slot, and queued waiters (holder pids are the
+line per occupied slot, and queued waiters in ticket order, oldest first
+(a record with no ticket is listed after them). Holder pids are the
 wrk heavy python processes; killing one frees its slot once the command
-tree that inherited the slot fd is also gone). Every holder and waiter line
-carries `class=ci|lane` (and the limit it queued under). status never
-creates slot files and is never refused.
+tree that inherited the slot fd is also gone. Every holder and waiter line
+carries `class=ci|lane` (and the limit it queued under). Live position
+records follow, each with its expiry (`position key=... ticket=...
+expiry=...`); `positions none` when there are none. status removes a
+waiter record whose pid is dead and a position record whose expiry has
+passed, and removes nothing else. It never creates slot files and is
+never refused.
 
 Every acquisition appends one JSON record to the heavy log (default
 ~/.local/state/wrk/heavy.log): ts, kind=run, host, job (ARBITER_JOB or -),
@@ -12091,7 +12150,14 @@ Environment:
   WRK_HEAVY_CI_DEFER_MAX
                         seconds a lane waiter defers to a live ci waiter
                         before it stops (default 1800, 0 = never defer)
-  WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
+  WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200).
+                        Long runs (Unity) should raise this and pass
+                        --queue-key so a cap exit keeps their place
+  WRK_HEAVY_QUEUE_KEY   same as --queue-key. ASCII [A-Za-z0-9._-]{1,64};
+                        unset means a fresh ticket and no durable place
+  WRK_HEAVY_REQUEUE_GRACE
+                        seconds a saved place stays reusable after a
+                        wait-cap exit (default 600)
   WRK_HEAVY_LOAD_FILE   file re-read each poll whose first field is used as
                         load5/ncpu (default: os.getloadavg()[1]/cpu_count)
   WRK_HEAVY_LOG         acquisition log path
@@ -12194,6 +12260,44 @@ def record_head(text):
     return pid, cls, lim
 
 
+def ascii_digits(s):
+    # str.isdigit() is true for "²" and for Arabic-Indic digits, and int()
+    # then raises ValueError. A ticket is ASCII decimal digits or it is
+    # not a ticket. Returning false lets the caller ignore the record.
+    return s.isascii() and s.isdigit()
+
+
+def record_ticket(text):
+    # Fourth head field only. split(None, 4) keeps the command text out, so
+    # a ticket= token inside the command cannot forge a place in line.
+    # None means an older wrk record or a ticket that is not ASCII digits.
+    # Lane FIFO never waits on it. ci reservation does not call this function.
+    toks = text.split(None, 4)[:4]
+    if len(toks) < 4 or not toks[3].startswith("ticket="):
+        return None
+    ns_s, sep, pid_s = toks[3][7:].partition(":")
+    # 19 digits: a wall-clock nanosecond count is 19 digits until year 2286.
+    if (not sep or not ascii_digits(ns_s) or not ascii_digits(pid_s)
+            or len(ns_s) > 19 or len(pid_s) > 10 or int(pid_s) < 1):
+        return None
+    return (int(ns_s), int(pid_s))
+
+
+def queue_key_ok(key):
+    # ASCII class, not a locale class: str.isalnum() would accept "é" under
+    # en_US.UTF-8. "." and ".." match the character class but are not file
+    # names we can use inside the positions dir.
+    if not isinstance(key, str) or key in (".", "..") or not 1 <= len(key) <= 64:
+        return False
+    for ch in key:
+        if ord(ch) > 127:
+            return False
+        if not (("A" <= ch <= "Z") or ("a" <= ch <= "z") or
+                ("0" <= ch <= "9") or ch in "._-"):
+            return False
+    return True
+
+
 def with_class(text):
     # status prints the class of every record; one an older wrk wrote carries
     # none, so it is shown as the lane it behaves as.
@@ -12207,12 +12311,41 @@ def with_class(text):
 
 args = sys.argv[1:]
 if not args:
-    fail("usage: wrk heavy -- <command> [args...] | wrk heavy status", 2)
+    fail("usage: wrk heavy [--queue-key KEY] -- <command> [args...] | "
+         "wrk heavy status", 2)
+
+
+def pop_queue_key(argv):
+    # --queue-key KEY is only legal before the '--' that starts the command.
+    # status takes no options. A missing KEY is a usage error (rc 2).
+    key = None
+    i = 0
+    while i < len(argv) and argv[i] not in ("--", "status"):
+        if argv[i] != "--queue-key":
+            fail("unexpected argument %s (see 'wrk heavy --help')" % argv[i], 2)
+        if i + 1 >= len(argv) or argv[i + 1] in ("--", "status"):
+            fail("--queue-key requires a KEY", 2)
+        key = argv[i + 1]
+        i += 2
+    return key, argv[i:]
+
+
+cli_queue_key, args = pop_queue_key(args)
+if not args:
+    fail("usage: wrk heavy [--queue-key KEY] -- <command> [args...] | "
+         "wrk heavy status", 2)
+if cli_queue_key is not None:
+    queue_key = cli_queue_key
+elif "WRK_HEAVY_QUEUE_KEY" in os.environ:
+    queue_key = os.environ["WRK_HEAVY_QUEUE_KEY"]
+else:
+    queue_key = None
 
 host = socket.gethostname()
 lock_path = os.environ.get("WRK_HEAVY_LOCK") or (
     "/tmp/wrk-heavy-%s.lock" % host)
 waiters_dir = lock_path + ".waiters"
+positions_dir = lock_path + ".positions"
 
 # The bash half resolves the limit from WRK_HEAVY_MAX or hosts.toml [local]
 # heavy_max. Invalid (non-integer or negative) refuses the run rc 78; status
@@ -12375,6 +12508,47 @@ def read_waiter_record(dirfd, name):
         return ""
 
 
+def parse_position(text, expect_key):
+    # Fixed three-token head: key, ticket, expiry. Anything else is ignored
+    # and never stalls the queue. The key must equal the file name so a
+    # record planted under a different name is not this waiter's place.
+    toks = text.split()
+    if len(toks) < 3:
+        return None
+    if not (toks[0].startswith("key=") and toks[1].startswith("ticket=")
+            and toks[2].startswith("expiry=")):
+        return None
+    key = toks[0][4:]
+    if key != expect_key:
+        return None
+    ns_s, sep, pid_s = toks[1][7:].partition(":")
+    exp = toks[2][7:]
+    # Same 19-digit wall-clock bound as record_ticket, for the ns and expiry.
+    # Non-ASCII digits are not a place: int() would raise, and the file
+    # must be ignored and left in place.
+    if (not sep or not ascii_digits(ns_s) or not ascii_digits(pid_s)
+            or not ascii_digits(exp)
+            or len(ns_s) > 19 or len(pid_s) > 10 or len(exp) > 19
+            or int(pid_s) < 1):
+        return None
+    return (int(ns_s), int(pid_s), int(exp))
+
+
+def position_usable(dirfd, name):
+    # Same trust as a waiter record, plus owner and a single link: a
+    # symlink, fifo, hardlink or foreign-owned file is not a place.
+    # None means ignore it. Callers decide whether an expired place is
+    # deleted; this function only parses a trusted record.
+    try:
+        st = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+    except OSError:
+        return None
+    if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and
+            owner_trusted(st) and st.st_size <= 4096):
+        return None
+    return parse_position(read_waiter_record(dirfd, name), name)
+
+
 if args[0] == "status":
     if len(args) != 1:
         fail("status takes no arguments", 2)
@@ -12441,13 +12615,66 @@ if args[0] == "status":
             except OSError:
                 pass
             continue
-        waiters.append(with_class(info) if info else name)
+        line = with_class(info) if info else name
+        ticket = record_ticket(info) if info else None
+        if ticket is None:
+            order = (1, 0, 0, name)
+        else:
+            order = (0, ticket[0], ticket[1], name)
+        waiters.append((order, line))
     if wfd is not None:
         os.close(wfd)
-    for w in waiters:
+    waiters.sort(key=lambda item: item[0])
+    for _, w in waiters:
         print("waiter " + w)
     if not waiters:
         print("waiters none")
+    # Live positions, oldest ticket first. Expired trusted records are
+    # stale and removed, the same way a dead waiter pid is. A symlink,
+    # fifo, foreign file, dotfile or malformed record is left in place
+    # and not listed. status never creates the positions dir.
+    positions = []
+    pfd = None
+    try:
+        pfd = os.open(positions_dir,
+                      os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        pfd = None
+    if pfd is not None:
+        try:
+            pst = os.fstat(pfd)
+            p_ok = (stat.S_ISDIR(pst.st_mode) and owner_trusted(pst) and
+                    not (pst.st_mode & 0o022 and
+                         not pst.st_mode & stat.S_ISVTX))
+        except OSError:
+            p_ok = False
+        pnames = []
+        if p_ok:
+            try:
+                pnames = os.listdir(pfd)
+            except OSError:
+                pnames = []
+        now_ns = time.time_ns()
+        for name in pnames:
+            if name.startswith("."):
+                continue
+            parsed = position_usable(pfd, name)
+            if parsed is None:
+                continue
+            ns, pid, exp = parsed
+            if now_ns >= exp:
+                try:
+                    os.remove(name, dir_fd=pfd)
+                except OSError:
+                    pass
+                continue
+            positions.append((ns, pid, name, exp))
+        os.close(pfd)
+    positions.sort()
+    for ns, pid, name, exp in positions:
+        print("position key=%s ticket=%d:%d expiry=%d" % (name, ns, pid, exp))
+    if not positions:
+        print("positions none")
     raise SystemExit(0)
 
 if args[0] != "--":
@@ -12469,13 +12696,22 @@ except ValueError:
     defer_max = -1.0
 if not defer_max >= 0:
     fail("WRK_HEAVY_CI_DEFER_MAX is not a non-negative number", 2)
+try:
+    grace_s = float(os.environ.get("WRK_HEAVY_REQUEUE_GRACE", "600"))
+except ValueError:
+    grace_s = -1.0
+try:
+    grace_ns = int(round(grace_s * 1000000000))
+except (ValueError, OverflowError):
+    grace_ns = -1
+if not grace_s >= 0 or grace_ns < 0:
+    fail("WRK_HEAVY_REQUEUE_GRACE is not a non-negative number", 2)
 cmd_summary = " ".join(cmd)
-# class and limit stay in the fixed head of the record (record_head): a ci
-# waiter's limit tells a lane waiter which slots that ci waiter could take.
-info = "pid=%d class=%s limit=%d since=%s job=%s cmd=%s" % (
-    os.getpid(), hclass, limit,
-    datetime.datetime.now().isoformat(timespec="seconds"),
-    os.environ.get("ARBITER_JOB") or "-", cmd_summary)
+# The ticket is filled in after a saved place is read. class and limit
+# stay in the fixed head (record_head); the ticket is the fourth field
+# (record_ticket) so the command text cannot forge either.
+info = ""
+my_ticket = None
 started_at = time.monotonic()
 
 if not limit_ok:
@@ -12484,6 +12720,9 @@ if not limit_ok:
 if not hclass_ok:
     fail("invalid WRK_HEAVY_CLASS '%s' (want ci or lane; unset = lane)"
          % hclass_raw, EXIT_REFUSED)
+if queue_key is not None and not queue_key_ok(queue_key):
+    fail("invalid queue key %s (want ASCII [A-Za-z0-9._-]{1,64}, "
+         "not '.' or '..')" % ascii(queue_key), EXIT_REFUSED)
 if limit == 0:
     log_event({"kind": "refused", "cmd": cmd_summary[:200],
                "limit": 0, "limit_src": limit_src})
@@ -12506,8 +12745,10 @@ def load_ratio():
 
 def ci_reserved():
     # hk 1533: how many leading slots (index < N) a live ci waiter other
-    # than this process could take; 0 when none is queued. Liveness is the
-    # rule status uses for stale waiter files (pid alive) — a dead ci
+    # than this process could take; 0 when none is queued. Tickets are
+    # not consulted: a live ci waiter reserves with or without one.
+    # Liveness is the rule status uses for stale waiter files (pid
+    # alive) — a dead ci
     # waiter's leftover record never reserves anything. Read-only: status
     # owns the cleanup of stale files. A ci record with no usable limit
     # reserves nothing — priority degrades to the old free-for-all, it never
@@ -12533,6 +12774,41 @@ def ci_reserved():
             continue
         reserved = max(reserved, lim)
     return reserved
+
+
+def lane_reserved(my_ticket):
+    # hk 1407: slots a live lane waiter with a strictly older ticket could
+    # take (index below that waiter's own limit). Same shape as ci_reserved.
+    # No ticket, a dead pid, or an unusable limit reserves nothing. Equal
+    # tickets do not reserve: two waiters that reused one position must not
+    # deadlock on each other. Scanned once per pass, like ci_reserved.
+    if my_ticket is None:
+        return 0
+    try:
+        names = os.listdir(waiters_fd)
+    except OSError:
+        return 0
+    held = 0
+    for name in names:
+        if name.startswith("."):
+            continue
+        try:
+            if not stat.S_ISREG(os.stat(name, dir_fd=waiters_fd,
+                                        follow_symlinks=False).st_mode):
+                continue
+        except OSError:
+            continue
+        text = read_waiter_record(waiters_fd, name)
+        pid, cls, lim = record_head(text)
+        ticket = record_ticket(text)
+        if cls != "lane" or pid <= 0 or pid == os.getpid():
+            continue
+        if not alive(pid) or lim is None or lim < 1:
+            continue
+        if ticket is None or not ticket < my_ticket:
+            continue
+        held = max(held, lim)
+    return held
 
 
 def fd_is_open(fd):
@@ -12696,6 +12972,8 @@ defer_seen = False   # held back at least once: a defer row is owed
 defer_over = False   # guard fired: no more deferral for the rest of the wait
 defer_logged = False
 record_tmp = None    # mkstemp path mid-publish; every exit path drops it
+position_tmp = None
+positions_fd = -1
 
 
 def end_defer(reason):
@@ -12744,6 +13022,84 @@ def publish_record():
             record_tmp = None
 
 
+def positions_dir_open():
+    # Same trust rule as waiters_dir_open, on <lock>.positions. A symlink
+    # at the name is not followed. The spelling of the check stays distinct
+    # from waiters_dir_open so that function's refusal stays one anchor.
+    try:
+        fd = os.open(positions_dir,
+                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        return -1
+    try:
+        st = os.fstat(fd)
+        ok = (stat.S_ISDIR(st.st_mode) and owner_trusted(st) and
+              not (st.st_mode & 0o022 and not st.st_mode & stat.S_ISVTX))
+    except OSError:
+        ok = False
+    if ok:
+        return fd
+    os.close(fd)
+    return -1
+
+
+def load_saved_ticket():
+    # Reuse the original ticket while now < expiry. At or after expiry the
+    # record is ignored and removed. An untrusted or malformed file is
+    # ignored and left in place, so it cannot stall the queue.
+    if not queue_key or positions_fd < 0:
+        return None
+    parsed = position_usable(positions_fd, queue_key)
+    if parsed is None:
+        return None
+    ns, pid, exp = parsed
+    if time.time_ns() >= exp:
+        try:
+            os.remove(queue_key, dir_fd=positions_fd)
+        except OSError:
+            pass
+        return None
+    return (ns, pid)
+
+
+def waiter_info(ticket):
+    return "pid=%d class=%s limit=%d ticket=%d:%d since=%s job=%s cmd=%s" % (
+        os.getpid(), hclass, limit, ticket[0], ticket[1],
+        datetime.datetime.now().isoformat(timespec="seconds"),
+        os.environ.get("ARBITER_JOB") or "-", cmd_summary)
+
+
+def save_position():
+    # Wait-cap exit only. Original ticket, expiry = now + grace. Dot name
+    # then rename: a crash mid-write leaves a dotfile the scans skip, never
+    # a half record that could be read as a place. A failed write must not
+    # turn the wait-cap exit into a traceback.
+    global position_tmp
+    if not queue_key or my_ticket is None or positions_fd < 0:
+        return
+    exp = time.time_ns() + grace_ns
+    body = "key=%s ticket=%d:%d expiry=%d\n" % (
+        queue_key, my_ticket[0], my_ticket[1], exp)
+    try:
+        fd, tmp = tempfile.mkstemp(dir=positions_dir, prefix=".")
+        position_tmp = os.path.basename(tmp)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(body)
+            os.replace(position_tmp, queue_key,
+                       src_dir_fd=positions_fd, dst_dir_fd=positions_fd)
+            position_tmp = None
+        finally:
+            if position_tmp is not None:
+                try:
+                    os.remove(position_tmp, dir_fd=positions_fd)
+                except OSError:
+                    pass
+                position_tmp = None
+    except OSError:
+        return
+
+
 # PEP 446: os.open returns non-inheritable fds; the acquired slot fd is
 # re-inherited into the command only via run_command's pass_fds so nested
 # runs can prove they are inside the holder's tree (nested_held_fd). A slot
@@ -12777,6 +13133,25 @@ for _sp in slot_paths:
              EXIT_REFUSED)
     slot_fds.append(_fd)
 try:
+    if queue_key:
+        try:
+            # mode=0o700: same as the waiters dir. An existing dir is untouched.
+            os.makedirs(positions_dir, mode=0o700, exist_ok=True)
+        except OSError as e:
+            fail("cannot create positions dir %s: %s" % (positions_dir, e),
+                 EXIT_REFUSED)
+        positions_fd = positions_dir_open()
+        if positions_fd < 0:
+            fail("refusing untrusted positions dir %s (must be owned by uid "
+                 "%d or root and not be a symlink; a group/other-writable "
+                 "dir must carry the sticky bit)"
+                 % (positions_dir, os.getuid()), EXIT_REFUSED)
+    saved = load_saved_ticket()
+    if saved is None:
+        my_ticket = (time.time_ns(), os.getpid())
+    else:
+        my_ticket = saved
+    info = waiter_info(my_ticket)
     publish_record()
     while True:
         try:
@@ -12789,9 +13164,9 @@ try:
             # waiter itself never defers. This is a queue order read from the
             # waiters dir, not a lock: the records are scanned once per pass
             # and not re-read before the slot attempts, so a pass already
-            # past its scan when a ci record is renamed into place may still
-            # take a slot that frees in that pass, and a ci waiter is not
-            # queued before its record is visible (see wrk heavy --help).
+            # past its scan when a ci or lane record is renamed into place
+            # may still take a slot that frees in that pass, and a waiter is
+            # not ordered before its record is visible (see wrk heavy --help).
             reserved = 0
             if hclass != "ci" and defer_max > 0 and not defer_over:
                 reserved = ci_reserved()
@@ -12809,6 +13184,13 @@ try:
                 elif defer_mark is not None:
                     defer_total += now - defer_mark
                     defer_mark = None
+            # Lane FIFO is separate from the ci guard. The guard may zero
+            # the ci reservation; an older lane ticket still holds its slots.
+            # A ci waiter does not consult lane tickets.
+            lane_hold = 0
+            if hclass != "ci":
+                lane_hold = lane_reserved(my_ticket)
+            reserved = max(reserved, lane_hold)
             for i, sfd in enumerate(slot_fds):
                 if i < reserved:
                     continue
@@ -12825,6 +13207,7 @@ try:
                 log_event({"kind": "wait_cap", "phase": "slot",
                            "cmd": cmd_summary[:200], "limit": limit,
                            "wait_s": round(time.monotonic() - started_at, 3)})
+                save_position()
                 fail("wait cap %.0fs exceeded waiting for a heavy slot on %s "
                      "-- command not run" % (cap, lock_path), EXIT_WAIT_CAP)
             time.sleep(0.5)
@@ -12838,6 +13221,15 @@ try:
         os.remove(me_name, dir_fd=waiters_fd)
     except OSError:
         pass
+    # Consumed on acquisition, and only when this run actually reused a
+    # trusted place. An ignored file (symlink, fifo, hardlink, foreign
+    # owner, malformed) stays where it is. A later wait-cap exit writes
+    # the place again: the command did not run.
+    if saved is not None and positions_fd >= 0:
+        try:
+            os.remove(queue_key, dir_fd=positions_fd)
+        except OSError:
+            pass
     os.ftruncate(held_fd, 0)
     os.write(held_fd, (info + "\n").encode())
     # #1241 r2: the load loop below doubles as the post-acquire cap gate —
@@ -12849,6 +13241,7 @@ try:
         log_event({"kind": "wait_cap", "phase": "slot",
                    "cmd": cmd_summary[:200], "limit": limit,
                    "wait_s": round(time.monotonic() - started_at, 3)})
+        save_position()
         fail("wait cap %.0fs exceeded waiting for a heavy slot on %s "
              "-- command not run" % (cap, lock_path), EXIT_WAIT_CAP)
     # heavy_load_wait = false skips only this wait — the slot above is
@@ -12862,6 +13255,7 @@ try:
                 log_event({"kind": "wait_cap", "phase": "load",
                            "cmd": cmd_summary[:200], "limit": limit,
                            "wait_s": round(time.monotonic() - started_at, 3)})
+                save_position()
                 fail("wait cap %.0fs exceeded waiting for load5/ncpu %.2f "
                      "< 1.0 -- command not run" % (cap, ratio), EXIT_WAIT_CAP)
             time.sleep(1)
@@ -12886,6 +13280,8 @@ finally:
         except OSError:
             pass
     os.close(waiters_fd)
+    if positions_fd >= 0:
+        os.close(positions_fd)
     if held_fd is not None:
         if run_at is not None:
             log_event({"kind": "run", "cmd": cmd_summary[:200],
