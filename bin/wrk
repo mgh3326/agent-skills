@@ -206,7 +206,14 @@ zero non-voided recorded rounds, or when the job directory holds a regular
 file whose first line is a VERDICT line and no job.verdict matches that
 file by path or content sha256. A later line does not count. Both
 refusals are waived only by --rounds-waived REF, where REF is hk:doc/<key>
-or hk:task/<id>, and that ref is stored on the job.joined record. An end
+or hk:task/<digits>. REF is fetched from handoffkeep and must hold the line
+  join-waiver: job=<job> by=<issuer>
+for this job, one exact line with single spaces and nothing after it. The
+issuer must be the parent lane or an operator and must equal the created_by of
+the doc or the author of the task comment that holds the line. A pa-integrator
+grant also needs the job's server task to be project ParkingArcade with
+refs.job_id equal to the job. The ref and the issuer are stored on the
+job.joined record as rounds_waived and rounds_waived_issuer. An end
 declaration newer than the newest revive is refused and cannot be waived.
 The end record and the rounds are rechecked under the events lock just before
 wrk writes job.joined; a delegated join is checked just before the hand-off only.
@@ -5498,7 +5505,7 @@ done_cmd() {
 }
 
 builder_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}" waiver_issuer="${13:-}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
@@ -5513,10 +5520,10 @@ builder_flat_event() {
   # scans this heredoc for quotes because it sits inside a command substitution.
   # Do not put an unmatched single quote in this body.
   local outcome rc=0
-  outcome="$(wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" <<'PY'
+  outcome="$(wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" "$waiver_issuer" <<'PY'
 import json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived = sys.argv[1:]
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived, waiver_issuer = sys.argv[1:]
 # wrk escalate/joined publish outside the round writer lock: take the shared
 # events lock so numbering is serialized with bin/arbiter and wrk done too.
 lock = wrk_events_locked(events)
@@ -5537,6 +5544,7 @@ if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
 if waived: record["rounds_waived"] = waived
+if waiver_issuer: record["rounds_waived_issuer"] = waiver_issuer
 wrk_event_commit(events, kind, record)
 PY
 )" || rc=$?
@@ -5611,15 +5619,14 @@ joined_cmd() {
   done
   [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
   if [[ -n "$waived" ]]; then
-    case "$waived" in
-      hk:doc/?*|hk:task/?*) ;;
-      *) die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>" ;;
-    esac
+    [[ "$waived" =~ ^hk:doc/[^[:space:]]+$ || "$waived" =~ ^hk:task/[0-9]+$ ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"  # hk1899-waiver-shape
   fi
   local metadata owner label pane parent role reason joined_end
+  local waiver_issuer="" waiver_grant tmp_waiver task_id tmp_task
   # hk 1894: the join gate (end record, rounds, verdict files) and the parent
-  # lane are read from the checked inbox, never from the environment.
-  wrk_trust_guard
+  # lane are read from the checked inbox, never from the environment. hk 1899:
+  # a waiver is fetched from handoffkeep, so that guard also judges the binary.
+  if [[ -n "$waived" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   reason="builder joined PR"
@@ -5627,6 +5634,37 @@ joined_cmd() {
   # hk1449-joined-end
   joined_end="$(wrk_newer_end_record "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"
   [[ -z "$joined_end" ]] || die "joined: refused after end record $joined_end"
+  # hk 1899: a waiver counts only with a join-waiver grant for this job in a
+  # record fetched from handoffkeep, issued by the parent lane or an operator
+  # and equal to the record's server-set identity. Verified here, before the
+  # refusals are skipped and before the events lock is taken.
+  if [[ -n "$waived" ]]; then
+    tmp_waiver="$(mktemp)"
+    if ! round_approval_fetch "$waived" >"$tmp_waiver"; then
+      rm -f "$tmp_waiver"
+      die "joined: waiver record not found in handoffkeep: $waived"
+    fi
+    waiver_grant="$(round_approval_verify "$waived" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_waiver" join-waiver || true)"  # hk1899-waiver-fetch
+    rm -f "$tmp_waiver"
+    [[ -n "$waiver_grant" ]] ||
+      die "joined: $waived has no 'join-waiver: job=$job by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
+    waiver_issuer="${waiver_grant##*issuer=}"
+    if [[ "$waiver_issuer" == "pa-integrator" ]]; then
+      task_id="$(round_job_task_id "$job" || true)"
+      [[ -n "$task_id" ]] ||
+        die "joined: pa-integrator grants need the job's hk task on the server; $job records no task_id"
+      tmp_task="$(mktemp)"
+      if ! round_pa_task_fetch "$task_id" >"$tmp_task"; then
+        rm -f "$tmp_task"
+        die "joined: pa-integrator grants need the job's hk task on the server; cannot fetch task $task_id"
+      fi
+      if ! round_pa_task_verify "$job" "$tmp_task"; then
+        rm -f "$tmp_task"
+        die "joined: pa-integrator grants count only when the server task for $job is project ParkingArcade with refs.job_id=$job"
+      fi
+      rm -f "$tmp_task"
+    fi
+  fi
   # A waiver is recorded on wrk's own job.joined, so it must not be forwarded
   # and must not take the delegated path. Without it, delegate exactly as before.
   if [[ -z "$waived" ]]; then
@@ -5647,7 +5685,7 @@ joined_cmd() {
     return 0
   fi
   local flat_out flat_rc=0
-  flat_out="$(builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived")" || flat_rc=$?
+  flat_out="$(builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived" "$waiver_issuer")" || flat_rc=$?
   case "$flat_rc" in
     0) ;;
     3) die "joined: refused after end record ${flat_out#*$'\t'}" ;;
@@ -5924,11 +5962,13 @@ except ValueError:
     raise SystemExit(1)
 # Each grant type has one canonical line form; whitespace variants are
 # malformed and rejected. The identity and parent-lane checks below are
-# shared by round extensions and voids.
+# shared by round extensions, voids and join waivers.
 if grant_kind == "round-extension":
     GRANT = re.compile(r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
 elif grant_kind == "round-void":
     GRANT = re.compile(r"^round-void: job=(\S+) round=(\d+) by=(\S+)$")
+elif grant_kind == "join-waiver":
+    GRANT = re.compile(r"^join-waiver: job=(\S+) by=(\S+)$")
 else:
     raise SystemExit(1)
 # The issuer written into the grant line must equal the record's server-set
@@ -5955,7 +5995,10 @@ for identity, body in sources:
         m = GRANT.match(line)
         if not m or m.group(1) != job:
             continue
-        amount, issuer = int(m.group(2)), m.group(3)
+        if grant_kind == "join-waiver":
+            amount, issuer = 1, m.group(2)
+        else:
+            amount, issuer = int(m.group(2)), m.group(3)
         if (grant_kind == "round-extension" and amount < 1) or (
                 grant_kind == "round-void" and str(amount) != round_number):
             continue
