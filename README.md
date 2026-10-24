@@ -380,6 +380,7 @@ action 이 `recovered:` 가 아닌 회복 폴(pending, completed)은 줄 끝에 
 | 정상 상태(`working`/`idle`/`done`) | 관측 성공 | 일시 장애 카운터 리셋. `idle`·`done` + 새 report면 `job.completed` — 단 report의 관측 키가 한 interval 동안 그대로일 때만(첫 관측은 `action=pending`). 부분 작성 중인 파일로 먼저 나가지 않기 위함이다 |
 | `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과, 에이전트 부재·불명 | 감시 창 만료 | `job.lost` (`reason=timeout`) |
 | `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과, 에이전트 존재(class=ok) | 감시 창 만료 | `action=watch-expired` 로그 후 센티널만 종료. `job.lost`·종료 기록·쿼타 해제 없음, 잡은 `wrk done`·`joined`·`reap`·`prune` 이 평소대로 끝낸다 |
+| `WRK_COMPLETION_TIMEOUT_S` 경과 뒤 report 첫 관측(에이전트 `idle`/`done`) | 늦은 첫 관측 | `action=pending late=1` 한 번 — 같은 관측 키가 다음 폴까지 유지되면 평소대로 `job.completed`+쿼타 해제, 아니면 그 폴에서 `watch-expired` |
 
 `job.completed` 레코드는 report 본문의 sha256(`report_sha256` 필드)으로 라운드를
 식별한다. 같은 내용의 report에 대한 완료 기록이 이미 있으면 `wrk done`·센티널 어느
