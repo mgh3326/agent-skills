@@ -59,6 +59,7 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(job["final"]["note"], "detail=clean #좋음")
         self.assertEqual(data["errors"][0]["comment_id"], 90)
         self.assertEqual(data["warnings"][0]["comment_id"], 91)
+        self.assertFalse(data["tasks"][0]["jobs"]["warn"]["counted"])
 
     def test_outcomes_reason_counting_derived_round_and_time_ties(self):
         result = self.run_scan("--task", "1935", "--json")
