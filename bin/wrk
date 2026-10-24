@@ -332,6 +332,7 @@ Options:
                      When the watch window (WRK_COMPLETION_TIMEOUT_S) expires with
                      the agent still present, the sentinel logs action=watch-expired
                      and exits; the job stays live, no job.lost, no quota release.
+                     A report first seen after the deadline gets one confirmation poll (action=pending late=1).
   --keep             protection marker: record "keep": true on the job.spawned
                      receipt so no session cleanup ever closes this pane — use it
                      for resident, director, installer and consult sessions.
@@ -6901,6 +6902,7 @@ PY
 # 폴에 겹치면 action 은 그 판정을 유지하고 끝에 recovered=<reason> 만 붙는다.
 # 감시 창이 에이전트가 살아 있는 폴에서 만료되면 action=watch-expired
 # elapsed=<n>s 한 줄을 남기고 센티널만 끝난다(job.lost·종료 기록·쿼타 해제 없음).
+# 마감 뒤에 처음 관측된 report 는 확인 폴 한 번을 받는다 — 그 폴은 action=pending late=1 이다.
 sentinel_log() {
   local logfile="$1" token="$2" transient="$3" action="$4" extra="${5:-}"
   if [[ -n "$extra" ]]; then
@@ -7556,6 +7558,7 @@ PY
   started="$(date +%s)"
   seen=""
   pending=""
+  late_pending=""
   transient=0
   lost=0
   lost_at=0
@@ -7640,10 +7643,14 @@ PY
     # the agent present (class=ok) ends the watch without a verdict: no
     # job.lost, no end record, no quota release. Anything else keeps the old
     # lost:timeout so a dead job is still cleaned up through the grace.
-    if [[ "$action" == none && ( "$lost" -eq 0 || -n "$recover_reason" ) ]] && (( now - started >= timeout )); then
+    if [[ ( "$action" == none || "$action" == pending ) && ( "$lost" -eq 0 || -n "$recover_reason" ) ]] && (( now - started >= timeout )); then
       if [[ "$class" == ok ]]; then # hk1888-watch-expired-live-guard
-        watch_expired=1
-        [[ -n "$recover_reason" ]] || action="watch-expired"
+        if [[ "$action" == pending && -z "$late_pending" ]]; then # hk1959-late-pending
+          late_pending=1
+        else
+          watch_expired=1
+          [[ -n "$recover_reason" ]] || action="watch-expired"
+        fi
       else
         action="lost:timeout"
       fi
@@ -7658,6 +7665,9 @@ PY
     log_extra=""
     if [[ -n "$recover_reason" && "$action" != recovered:* ]]; then
       log_extra="recovered=$recover_reason"
+    fi
+    if [[ "$action" == pending && -n "$late_pending" ]]; then
+      log_extra="${log_extra:+$log_extra }late=1"
     fi
     if [[ "$action" == watch-expired ]]; then
       log_extra="elapsed=$(( now - started ))s"
