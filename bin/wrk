@@ -5155,6 +5155,7 @@ wrk_trust_guard() {
 # `wrk_trust_guard arbiter` first. With --missing-ok an absent DB/job/claim
 # row prints nothing and returns 0 (the caller's env fallback applies, as
 # remote delegation relies on); a mismatch or malformed row still refuses.
+# Other read failures, including a locked DB, always refuse.
 job_claim_db_fields() {
   local job="$1" missing_ok="${2:-}" out rc=0
   local arbiter="${WRK_TRUST_ARBITER:-}"
@@ -5163,8 +5164,20 @@ job_claim_db_fields() {
     die "claim for $job unreadable: wrk_trust_guard arbiter did not run"
   out="$("$arbiter" job-get --job "$job" --json 2>/dev/null)" || rc=$?
   if [[ "$rc" -ne 0 ]]; then
-    [[ "$missing_ok" == --missing-ok ]] && return 0
+    if [[ "$rc" -eq 6 && "$missing_ok" == --missing-ok ]] &&
+      WRK_JOBGET_JSON="$out" wrk_py -c '
+import json, os, sys
+try:
+    doc = json.loads(os.environ["WRK_JOBGET_JSON"])
+except (KeyError, ValueError):
+    raise SystemExit(1)
+error = doc.get("error") if isinstance(doc, dict) else None
+raise SystemExit(0 if isinstance(error, str) and error.startswith("state db 가 없다:") else 1)
+'; then
+      return 0
+    fi
     if [[ "$rc" -eq 7 ]]; then
+      [[ "$missing_ok" == --missing-ok ]] && return 0
       die "job $job has no arbiter claim row; refusing the trust use"
     fi
     die "claim for $job unreadable: canonical arbiter job-get failed (rc=$rc)"

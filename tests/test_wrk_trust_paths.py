@@ -1818,6 +1818,35 @@ class ArbiterDbClaimCase(RealBinaryCase):
             self.assertIn(out.returncode, (2, 6, 7), odd)
             self.assertNotIn('"ok": true', out.stdout, odd)
 
+    def test_parent_task_resolution_does_not_downgrade_arbiter_read_errors(self):
+        w = self.w
+        lib = w.base / "wrk-lib"
+        lib.write_text(WRK.read_text(encoding="utf-8").rsplit('case "${1:-}" in', 1)[0])
+        failing_arbiter = w.tmp / "failing-arbiter"
+        failing_arbiter.write_text(
+            '#!/bin/sh\n'
+            'if [ "$1" = job-get ]; then\n'
+            '  printf \'%s\\n\' \'{"ok":false,"code":6,"error":"state db 를 열 수 없다: database is locked"}\'\n'
+            '  exit 6\n'
+            'fi\n'
+            'exit 99\n',
+            encoding="utf-8",
+        )
+        failing_arbiter.chmod(0o700)
+        snippet = (
+            'set -euo pipefail; . "$1"; '
+            'ROLE=worker JOB_ID=child TASK_ID="" PARENT_JOB=remote-parent; '
+            'TASK_HK_BYPASS=0; task_validate'
+        )
+        out = w.run(
+            ["bash", "-c", snippet, "_", str(lib)],
+            w.env(test=True, HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "xdg",
+                  ARBITER_INBOX_ROOT=w.tmp / "inbox", ARBITER_BIN=failing_arbiter,
+                  HK_TASK_ID="77"),
+        )
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("canonical arbiter job-get failed (rc=6)", out.stderr)
+
     # -- wrk trust uses of the DB claim --
 
     def capped(self, job, **kw):

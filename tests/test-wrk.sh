@@ -9164,55 +9164,66 @@ echo "PASS 568-devin-fold-collision-not-marker"
 
 rm -f "$TMP/herdr.log"
 blocked3="$(WRK_GATE_MODE=3 spawn_base codex-luna 2>&1 || true)"
-grep -q 'gate blocked' <<<"$blocked3"
-[[ ! -e "$TMP/herdr.log" ]]
+grep -q 'gate blocked' <<<"$blocked3" || fail "gate refusal must stop codex-luna before Herdr: $blocked3"
+[[ ! -e "$TMP/herdr.log" ]] || fail "blocked gate reached Herdr"
 blocked4="$(WRK_GATE_MODE=4 spawn_base codex-luna 2>&1 || true)"
-grep -q 'measurement unavailable' <<<"$blocked4"
-[[ ! -e "$TMP/herdr.log" ]]
+grep -q 'measurement unavailable' <<<"$blocked4" || fail "measurement refusal must name the missing observation: $blocked4"
+[[ ! -e "$TMP/herdr.log" ]] || fail "unavailable measurement reached Herdr"
 rm -f "$TMP/herdr.log"
-unsupported="$(WRK_GATE_MODE=unsupported spawn_base codex-luna 2>&1)"
-grep -q 'no gate subcommand' <<<"$unsupported"
-[[ -e "$TMP/herdr.log" ]]
+unsupported="$(WRK_GATE_MODE=unsupported spawn_base codex-luna 2>&1)" ||
+  fail "unsupported gate transition must remain warn-only"
+grep -q 'no gate subcommand' <<<"$unsupported" || fail "unsupported gate warning missing: $unsupported"
+[[ -e "$TMP/herdr.log" ]] || fail "unsupported gate transition should continue to Herdr"
 rm -f "$TMP/herdr.log"
 run_fail env WRK_GATE_MODE=broken HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \
   "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture --t T1
 SCOPEFUEL_BIN="$TMP/missing-scopefuel" HERDR_BIN="$HERDR" WRK_NO_SLEEP=1 \
   WRK_FIXTURE_SCENARIO=spawn "$WRK" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -w w -l fixture \
-  --t T1 >"$TMP/missing.out" 2>&1
-grep -q 'scopefuel unavailable; quota gate skipped' "$TMP/missing.out"
-grep -q 'scopefuel refresh skipped; gate/arbiter did not provide a pool' "$TMP/missing.out"
-grep -q 'model=codex-luna' "$TMP/missing.out"
+  --t T1 >"$TMP/missing.out" 2>&1 || fail "missing scopefuel must stay warn-only"
+grep -q 'scopefuel unavailable; quota gate skipped' "$TMP/missing.out" ||
+  fail "missing scopefuel warning missing: $(cat "$TMP/missing.out")"
+grep -q 'scopefuel refresh skipped; gate/arbiter did not provide a pool' "$TMP/missing.out" ||
+  fail "missing-pool refresh warning missing: $(cat "$TMP/missing.out")"
+grep -q 'model=codex-luna' "$TMP/missing.out" || fail "missing scopefuel blocked the spawn"
 
 # ROB-1227 D4: refresh is detached, uses the gate-provided pool, and exposes
 # failure/timeout warnings without changing the successful spawn.
 : >"$TMP/refresh.log"
 start_ns="$(python3 -c 'import time; print(time.time_ns())')"
-success_out="$(spawn_base codex-luna 2>&1)"
+success_out="$(spawn_base codex-luna 2>&1)" || fail "normal scopefuel refresh blocked spawn"
 elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - start_ns) / 1000000 ))"
-grep -q 'model=codex-luna' <<<"$success_out"
-[[ "$elapsed_ms" -lt 1800 ]]  # 동일 flake 계열 — 위 timeout 케이스와 같은 근거로 완화
+grep -q 'model=codex-luna' <<<"$success_out" || fail "normal scopefuel refresh lost the successful spawn: $success_out"
+[[ "$elapsed_ms" -lt 2500 ]] ||
+  fail "1227 detached refresh blocked spawn too long: ${elapsed_ms}ms"
 for _ in {1..20}; do
   grep -q '^refresh codex --background$' "$TMP/refresh.log" && break
   sleep 0.05
 done
-grep -q '^refresh codex --background$' "$TMP/refresh.log"
+grep -q '^refresh codex --background$' "$TMP/refresh.log" ||
+  fail "1227 detached refresh was not started"
 
-failed_out="$(WRK_REFRESH_MODE=fail spawn_base codex-luna 2>&1)"
-grep -q 'scopefuel refresh failed for pool=codex; spawn already succeeded' <<<"$failed_out"
-grep -q 'model=codex-luna' <<<"$failed_out"
+failed_out="$(WRK_REFRESH_MODE=fail spawn_base codex-luna 2>&1)" ||
+  fail "1227 failed detached refresh changed spawn success"
+grep -q 'scopefuel refresh failed for pool=codex; spawn already succeeded' <<<"$failed_out" ||
+  fail "1227 failed-refresh warning missing: $failed_out"
+grep -q 'model=codex-luna' <<<"$failed_out" || fail "1227 failed refresh hid the successful spawn"
 
 timeout_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 : >"$TMP/refresh.pids"
-timeout_out="$(WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=2 WRK_REFRESH_TIMEOUT_S=0.2 spawn_base codex-luna 2>&1)"
+timeout_out="$(WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=5 WRK_REFRESH_TIMEOUT_S=0.2 spawn_base codex-luna 2>&1)" ||
+  fail "1227 timed-out refresh changed spawn success"
 timeout_elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - timeout_start_ns) / 1000000 ))"
-# 2s hang 을 기다리지 않았음을 증명하면 충분하다 — 1000ms 는 부하 있는 머신에서
-# 오탐(실측 1075ms flake)이라 hang(2000ms) 대비 명확히 짧은 1800ms 로 완화.
-[[ "$timeout_elapsed_ms" -lt 1800 ]]
-grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' <<<"$timeout_out"
-grep -q 'model=codex-luna' <<<"$timeout_out"
+# Keep 1s of scheduler margin while staying below the 5s delay a blocking
+# regression would incur.
+[[ "$timeout_elapsed_ms" -lt 4000 ]] ||
+  fail "1227 timed-out refresh blocked spawn too long: ${timeout_elapsed_ms}ms"
+grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' <<<"$timeout_out" ||
+  fail "1227 timeout warning missing: $timeout_out"
+grep -q 'model=codex-luna' <<<"$timeout_out" || fail "1227 timeout hid the successful spawn"
 while IFS= read -r refresh_pid; do
-  [[ -z "$refresh_pid" ]] || ! ps -p "$refresh_pid" -o pid= | grep -q '[0-9]'
+  [[ -z "$refresh_pid" ]] || ! ps -p "$refresh_pid" -o pid= | grep -q '[0-9]' ||
+    fail "1227 timed-out refresh process survived: $refresh_pid"
 done <"$TMP/refresh.pids"
 
 cp "$SCOPEFUEL" "$TMP/non-executable-scopefuel"
