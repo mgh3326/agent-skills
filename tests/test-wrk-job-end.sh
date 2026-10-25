@@ -5167,7 +5167,7 @@ case_hk1860_housekeeping_stdout() {
   }
 }
 
-case_hk1860_pass4_calls || fail "hk1860: pass 4 must take one ps sweep and one unscoped arbiter status per run"
+case_hk1860_pass4_calls || fail "hk1860: pass 4 must take one sentinel sweep and one unscoped arbiter status per run"
 echo "PASS hk1860 pass4-one-sweep-one-status"
 case_hk1860_pane_alive || fail "hk1860: pass 4 must skip an ended job whose spawn pane is alive, dry-run and apply"
 echo "PASS hk1860 pane-alive-skip"
