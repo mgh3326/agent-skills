@@ -13,9 +13,12 @@ install() patches the stat, open, listing and rename families of os, builtins
 and io, and subprocess.Popen, so any call whose path (lexically normalized, never
 resolved, so the guard itself touches nothing) lies under a trust location is
 recorded and raises AssertionError before the real call runs. The locations are
-taken under each home form as spelled, through each link of their chain and
-through realpath, so neither a symlinked home nor a symlinked location can be
-reached under another name.
+taken under each home form as spelled and through realpath, then expanded to a
+fixed point: every leading prefix of every root that is itself a symlink
+contributes each link of its chain joined with the rest of that root. The
+expansion is capped at 512 roots and reaching the cap fails closed, so neither
+a symlinked home, a symlinked parent nor a symlinked location can be reached
+under another name.
 With fake_home it also makes
 pwd.getpwuid(<own uid>) answer fake_home as the home directory.
 """
@@ -23,10 +26,12 @@ import builtins
 import io
 import os
 import pwd
+import stat
 import subprocess
 import sys
 
 TRIP_RELATIVE = ("work/herdr-inbox", ".local/share/arbiter", ".local/bin")
+ROOT_CAP = 512
 
 _state = {"originals": [], "trips": [], "roots": (), "log": None}
 
@@ -54,21 +59,43 @@ def _chain(path):
     return hops
 
 
+def _prefixes(root):
+    """Each leading prefix of an absolute path, with the suffix beneath it."""
+    parts = [part for part in root.split(os.sep) if part]
+    for end in range(1, len(parts) + 1):
+        yield os.sep + os.path.join(*parts[:end]), os.sep.join(parts[end:])
+
+
 def trust_roots():
     home = real_home()
     homes = [home]
     if os.path.realpath(home) != home:
         homes.append(os.path.realpath(home))
     roots = [os.path.join(form, rel) for form in homes for rel in TRIP_RELATIVE]
-    for location in tuple(roots):
-        roots.extend(_chain(location))
-    for hop in _chain(home):
-        roots.extend(os.path.join(hop, rel) for rel in TRIP_RELATIVE)
-    for location in tuple(roots):
-        resolved = os.path.realpath(location)
-        if resolved != location:
-            roots.append(resolved)
-    return tuple(dict.fromkeys(roots))
+    seen = set(roots)
+    index = 0
+    while index < len(roots):
+        root = roots[index]
+        index += 1
+        pending = []
+        for prefix, suffix in _prefixes(root):
+            try:
+                linked = stat.S_ISLNK(os.lstat(prefix).st_mode)
+            except OSError:
+                continue
+            if not linked:
+                continue
+            pending.extend(os.path.normpath(os.path.join(hop, suffix)) for hop in _chain(prefix))
+        resolved = os.path.realpath(root)
+        if resolved != root:
+            pending.append(resolved)
+        for candidate in pending:
+            if candidate not in seen:
+                if len(roots) >= ROOT_CAP:
+                    raise AssertionError("trust tripwire root cap %d reached" % ROOT_CAP)
+                seen.add(candidate)
+                roots.append(candidate)
+    return tuple(roots)
 
 
 def trips():

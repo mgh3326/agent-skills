@@ -21,6 +21,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -829,15 +830,193 @@ class TripwireCase(unittest.TestCase):
     def test_tripwire_covers_a_location_under_a_symlinked_parent(self):
         self.tripwire_covers_a_resolved_parent(trust_tripwire)
 
-    def test_mutant_tripwire_roots_drop_the_chain_hops(self):
+    def tripwire_covers_a_chained_parent(self, module):
+        """Each link of a chained parent component is a root, not only the resolved parent."""
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        fake = base / "fake-home"
+        fake.mkdir()
+        real = base / "real-parent"
+        (real / "bin").mkdir(parents=True)
+        (real / "other").mkdir()
+        middle = base / "middle"
+        middle.symlink_to(real, target_is_directory=True)
+        (fake / ".local").symlink_to(middle, target_is_directory=True)
+        module.install(home=str(fake))
+        try:
+            with self.assertRaises(AssertionError):
+                with open(middle / "bin" / "touched", "w", encoding="utf-8"):
+                    pass
+            os.stat(str(middle / "other"))
+        finally:
+            module.uninstall()
+
+    def test_tripwire_covers_a_location_under_a_chained_parent(self):
+        self.tripwire_covers_a_chained_parent(trust_tripwire)
+
+    def tripwire_covers_location_links_under_a_chained_home(self, module):
+        """A location chain is walked under every home spelling, including each home hop."""
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        real = base / "real-home"
+        local = real / ".local"
+        (local / "target").mkdir(parents=True)
+        (local / "sibling").mkdir()
+        (local / "location-hop").symlink_to("target", target_is_directory=True)
+        (local / "bin").symlink_to("location-hop", target_is_directory=True)
+        hop = base / "home-hop"
+        hop.symlink_to(real, target_is_directory=True)
+        link = base / "home-link"
+        link.symlink_to(hop, target_is_directory=True)
+        module.install(home=str(link))
+        try:
+            for home_form in (link, hop, real):
+                for leaf in ("bin", "location-hop", "target"):
+                    spelled = home_form / ".local" / leaf
+                    with self.assertRaises(AssertionError, msg=str(spelled)):
+                        os.lstat(str(spelled))
+                os.stat(str(home_form / ".local" / "sibling"))
+        finally:
+            module.uninstall()
+
+    def test_tripwire_covers_location_links_under_a_chained_home(self):
+        self.tripwire_covers_location_links_under_a_chained_home(trust_tripwire)
+
+    def tripwire_covers_a_dotdot_link_target_that_escapes_a_symlink(self, module):
+        """A '..' link target escapes through the resolved parent, which only realpath sees."""
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        fake = base / "fake-home"
+        local = fake / ".local"
+        local.mkdir(parents=True)
+        elsewhere = base / "elsewhere"
+        elsewhere.mkdir()
+        escaped = base / "escaped"
+        escaped.mkdir()
+        (local / "sub").symlink_to(elsewhere, target_is_directory=True)
+        (local / "bin").symlink_to(os.path.join("sub", "..", "escaped"), target_is_directory=True)
+        module.install(home=str(fake))
+        try:
+            with self.assertRaises(AssertionError):
+                with open(escaped / "touched", "w", encoding="utf-8"):
+                    pass
+        finally:
+            module.uninstall()
+
+    def test_tripwire_covers_a_dotdot_link_target_that_escapes_a_symlink(self):
+        self.tripwire_covers_a_dotdot_link_target_that_escapes_a_symlink(trust_tripwire)
+
+    def test_tripwire_install_survives_looping_and_dangling_parents(self):
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        for label in ("dangling", "looping"):
+            with self.subTest(chain=label):
+                fake = base / label / "fake-home"
+                fake.mkdir(parents=True)
+                first = base / label / "hop1"
+                (fake / ".local").symlink_to(first, target_is_directory=True)
+                if label == "dangling":
+                    missing = base / label / "missing"
+                    first.symlink_to(missing, target_is_directory=True)
+                    expected = (first / "bin", missing / "bin")
+                else:
+                    second = base / label / "hop2"
+                    first.symlink_to(second, target_is_directory=True)
+                    second.symlink_to(first, target_is_directory=True)
+                    expected = (first / "bin", second / "bin")
+                trust_tripwire.install(home=str(fake))
+                try:
+                    for root in expected:
+                        self.assertIn(str(root), trust_tripwire._state["roots"], label)
+                finally:
+                    trust_tripwire.uninstall()
+
+    def test_tripwire_install_stays_bounded_on_a_deep_mixed_chain(self):
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        real = base / "real-home"
+        real.mkdir()
+        previous = base / "home-link"
+        for step in range(8):
+            nxt = base / ("home-hop-%d" % step)
+            previous.symlink_to(nxt, target_is_directory=True)
+            previous = nxt
+        previous.symlink_to(real, target_is_directory=True)
+        final = real / "final"
+        (final / "bin-target").mkdir(parents=True)
+        (final / "share" / "arbiter").mkdir(parents=True)
+        (final / "bin-hop").symlink_to("bin-target", target_is_directory=True)
+        (final / "bin").symlink_to("bin-hop", target_is_directory=True)
+        (real / ".local").symlink_to("middle-0", target_is_directory=True)
+        for step in range(4):
+            (real / ("middle-%d" % step)).symlink_to("middle-%d" % (step + 1), target_is_directory=True)
+        (real / "middle-4").symlink_to("final", target_is_directory=True)
+        start = time.monotonic()
+        trust_tripwire.install(home=str(base / "home-link"))
+        elapsed = time.monotonic() - start
+        try:
+            roots = trust_tripwire._state["roots"]
+            self.assertLessEqual(len(roots), trust_tripwire.ROOT_CAP)
+            self.assertLess(elapsed, 10)
+            hop_form = base / "home-hop-3" / "middle-2" / "bin-hop"
+            self.assertIn(str(hop_form), roots)
+            with self.assertRaises(AssertionError):
+                os.lstat(str(hop_form))
+        finally:
+            trust_tripwire.uninstall()
+
+    def test_tripwire_install_raises_when_the_root_cap_is_reached(self):
+        base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
+        self.addCleanup(shutil.rmtree, base, True)
+        real = base / "real-home"
+        real.mkdir()
+        previous = base / "home-link"
+        for step in range(10):
+            nxt = base / ("home-hop-%d" % step)
+            previous.symlink_to(nxt, target_is_directory=True)
+            previous = nxt
+        previous.symlink_to(real, target_is_directory=True)
+        (real / ".local").symlink_to("middle-0", target_is_directory=True)
+        for step in range(19):
+            (real / ("middle-%d" % step)).symlink_to("middle-%d" % (step + 1), target_is_directory=True)
+        (real / "middle-19").symlink_to("final", target_is_directory=True)
+        (real / "final").mkdir()
+        try:
+            with self.assertRaises(AssertionError) as caught:
+                trust_tripwire.install(home=str(base / "home-link"))
+            self.assertIn(str(trust_tripwire.ROOT_CAP), str(caught.exception))
+        finally:
+            trust_tripwire.uninstall()
+
+    def test_mutant_tripwire_roots_drop_the_prefix_walk(self):
         source = (ROOT / "tests" / "lib" / "trust_tripwire.py").read_text(encoding="utf-8")
         mutant = types.ModuleType("trust_tripwire_mutant")
         exec(compile(mutate(source,
-                            "    for location in tuple(roots):\n"
-                            "        roots.extend(_chain(location))\n", ""),
+                            "        for prefix, suffix in _prefixes(root):\n"
+                            "            try:\n"
+                            "                linked = stat.S_ISLNK(os.lstat(prefix).st_mode)\n"
+                            "            except OSError:\n"
+                            "                continue\n"
+                            "            if not linked:\n"
+                            "                continue\n"
+                            "            pending.extend(os.path.normpath(os.path.join(hop, suffix)) for hop in _chain(prefix))\n",
+                            ""),
                      "trust_tripwire_mutant", "exec"), mutant.__dict__)
         with self.assertRaises(AssertionError):
-            self.tripwire_covers_a_chained_location(mutant, Path(".local") / "bin")
+            self.tripwire_covers_a_chained_parent(mutant)
+
+    def test_mutant_tripwire_roots_run_a_single_pass(self):
+        source = (ROOT / "tests" / "lib" / "trust_tripwire.py").read_text(encoding="utf-8")
+        mutant = types.ModuleType("trust_tripwire_mutant")
+        exec(compile(mutate(source,
+                            "    index = 0\n"
+                            "    while index < len(roots):\n"
+                            "        root = roots[index]\n"
+                            "        index += 1\n",
+                            "    for root in tuple(roots):\n"),
+                     "trust_tripwire_mutant", "exec"), mutant.__dict__)
+        with self.assertRaises(AssertionError):
+            self.tripwire_covers_location_links_under_a_chained_home(mutant)
 
     def test_tripwire_adds_no_roots_for_absent_or_plain_locations(self):
         base = Path(os.path.realpath(tempfile.mkdtemp(prefix="trust-trip-")))
@@ -872,13 +1051,12 @@ class TripwireCase(unittest.TestCase):
         source = (ROOT / "tests" / "lib" / "trust_tripwire.py").read_text(encoding="utf-8")
         mutant = types.ModuleType("trust_tripwire_mutant")
         exec(compile(mutate(source,
-                            "    for location in tuple(roots):\n"
-                            "        resolved = os.path.realpath(location)\n"
-                            "        if resolved != location:\n"
-                            "            roots.append(resolved)\n", ""),
+                            "        resolved = os.path.realpath(root)\n"
+                            "        if resolved != root:\n"
+                            "            pending.append(resolved)\n", ""),
                      "trust_tripwire_mutant", "exec"), mutant.__dict__)
         with self.assertRaises(AssertionError):
-            self.tripwire_covers_a_resolved_parent(mutant)
+            self.tripwire_covers_a_dotdot_link_target_that_escapes_a_symlink(mutant)
 
 
 # ---------------------------------------------------------------------------
