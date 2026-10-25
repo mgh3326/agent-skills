@@ -703,6 +703,29 @@ for anchor in (
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
 
+# mutant: historical unbound verdicts stop counting toward the open cap.
+# RED proof: with one seeded legacy verdict and two opened rounds, a third
+# open must be refused; the mutant drops the legacy slot and allows it.
+printf '%s\n' '    used += sum(1 for v in verdicts if not isinstance(v.get("round"), int)) =>     pass' >"$TMP/spec-nocount-unbound"
+mutant nocount-unbound "$TMP/spec-nocount-unbound"
+jmu="mut-unbound-count"
+mkjob "$jmu"
+cat >"$ARBITER_INBOX_ROOT/$jmu/events/00002-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"$jmu","round":null,"head":"$H1","verdict":"PASS","created_at":"2026-09-27T00:00:01Z"}
+EOF
+open_ok "$TMP/nocount-unbound-wrk" "$jmu" "$H2"
+open_ok "$TMP/nocount-unbound-wrk" "$jmu" "$H3"
+set +e
+"$TMP/nocount-unbound-wrk" round open "$jmu" --head "$H4" >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant nocount-unbound did not drop the historical cap slot (third open rc=$rc)"
+status="$("$TMP/nocount-unbound-wrk" round status "$jmu")"
+grep -q 'rounds=4' <<<"$status" ||
+  fail "mutant nocount-unbound did not expose the over-cap open: $status"
+echo "PASS mutant-nocount-unbound"
+
 # mutant: the cap check in round open is removed. RED proof: the 4th open
 # must succeed under the mutant — if it still fails, the cap test cannot be
 # crediting the check.
