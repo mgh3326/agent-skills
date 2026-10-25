@@ -4394,7 +4394,12 @@ case_prune_terminal_quota_dry_run() {
   reset_case mut-1813-prune-dry || return 3
   local job=mut-1813-prune-dry out
   seed_ended_rerecorded_quota "$job" || return $?
-  out="$(prune_run --job "$job" --stale-age 0s 2>&1)" || return 3
+  # hk 1860: an ended job whose newest spawn pane probes alive is skipped as
+  # pane-alive, so this fixture models the ended job's pane as gone.
+  local seq="$TMP/1813-prune-dry.seq"; printf 'not-found\n' >"$seq"
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" "$WRK" prune --job "$job" \
+    --stale-age 0s 2>&1)" || return 3
   if ! grep -Fq "would-release job=$job" <<<"$out"; then
     assertion_red 'R23 prune dry-run lists ended live quota rows' || return 1
   fi
@@ -4992,5 +4997,219 @@ mkmut r39-completed-becomes-watch-expired \
   's~( "\$action" == none || "\$action" == pending )~( "$action" == none || "$action" == pending || "$action" == completed )~'
 expect_mut_red "R39 completed must never become watch-expired" case_late_stable_r39 \
   'FAIL: je51m39: the confirmed late report must complete'
+
+# ── hk 1860: prune pass 4 cost, live-pane skip, pane source, stdout contract,
+# dry-run purity. Item 5 (row-less recheck) is deferred until hk 1933 lands.
+
+# hk1860_ended_jobs ROOT COUNT — COUNT ended jobs (claim, spawn on w:p1,
+# job.completed) written straight into their event streams: no arbiter row,
+# no completion sentinel.
+hk1860_ended_jobs() {
+  python3 - "$1" "$2" <<'PY'
+import json, os, sys
+root, count = sys.argv[1], int(sys.argv[2])
+for n in range(count):
+    job = "hk1860-ended-%03d" % n
+    events = os.path.join(root, job, "events")
+    os.makedirs(events, exist_ok=True)
+    rows = [("job.claim", {"owner_lane": "lane-a", "label": "lbl-" + job}),
+            ("job.spawned", {"owner_lane": "lane-a", "label": "lbl-" + job, "pane_id": "w:p1"}),
+            ("job.completed", {"owner_lane": "lane-a", "label": "lbl-" + job})]
+    for seq, (kind, payload) in enumerate(rows, 1):
+        body = {"created_at": "2099-01-01T00:00:%02dZ" % seq, "job_id": job,
+                "kind": kind, "payload": payload, "seq": seq}
+        with open(os.path.join(events, "%05d-%s.json" % (seq, kind)), "x", encoding="utf-8") as handle:
+            handle.write(json.dumps(body, sort_keys=True) + "\n")
+PY
+}
+
+# Pass 4 reads one ps sweep and one unscoped arbiter status per run, however
+# many ended jobs the inbox holds. A row-less ended job costs no per-job call.
+case_hk1860_pass4_calls() {
+  reset_case hk1860-calls || return 3
+  hk1860_ended_jobs "$INBOX" 300 || return 3
+  # status is read-only and never creates the state DB; a claim bootstraps it.
+  arb claim --job hk1860-bootstrap --lane lane-a --agent-label lbl --t T1 >/dev/null || return 3
+  local calls="$TMP/hk1860-calls.log" bin="$TMP/hk1860-bin" arb_wrap="$TMP/hk1860-arbiter"
+  local real_ps out ps_n status_n
+  mkdir -p "$bin"; : >"$calls"
+  real_ps="$(command -v ps)"
+  printf '#!/bin/bash\nprintf "ps %%s\\n" "$*" >>"%s"\nexec "%s" "$@"\n' "$calls" "$real_ps" >"$bin/ps"
+  printf '#!/bin/bash\n[[ "${1:-}" != status ]] || printf "status\\n" >>"%s"\nexec "%s" "$@"\n' \
+    "$calls" "$ARBITER" >"$arb_wrap"
+  chmod +x "$bin/ps" "$arb_wrap"
+  out="$(env PATH="$bin:$PATH" HERDR_BIN="$HERDR" ARBITER_BIN="$arb_wrap" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$WRK" prune 2>&1)" || return 3
+  # Only the sentinel sweep (ps axo …) is counted; other ps readers on PATH are not.
+  ps_n="$(grep -c '^ps axo ' "$calls" || true)"
+  status_n="$(grep -c '^status$' "$calls" || true)"
+  [[ "$ps_n" == 1 ]] || {
+    assertion_red "hk1860 prune dry-run takes one sentinel sweep per run (sweeps=$ps_n)"; return 1
+  }
+  [[ "$status_n" == 1 ]] || {
+    assertion_red "hk1860 prune dry-run takes one unscoped arbiter status per run (status=$status_n)"; return 1
+  }
+  grep -Fq 'quota_release_jobs=0' <<<"$out" || {
+    assertion_red 'hk1860 the 300 row-less ended jobs release nothing'; return 1
+  }
+}
+
+# A newest job.spawned pane that probes alive keeps an ended job's quota rows,
+# in dry-run and under --apply alike.
+case_hk1860_pane_alive() {
+  reset_case hk1860-alive || return 3
+  local job=hk1860-alive seq="$TMP/hk1860-alive.seq" out
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl\"}" >/dev/null || return 3
+  printf 'working\n' >"$seq"
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" "$WRK" prune 2>&1)" || return 3
+  grep -Fq "skip job=$job reason=pane-alive" <<<"$out" || {
+    assertion_red 'hk1860 dry-run skips an ended job whose spawn pane is alive'; return 1
+  }
+  [[ "$(quota_rows "$job")" == 1 ]] || {
+    assertion_red 'hk1860 dry-run leaves the pane-alive row in place'; return 1
+  }
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" "$WRK" prune --apply 2>&1)" || return 3
+  grep -Fq "skip job=$job reason=pane-alive" <<<"$out" || {
+    assertion_red 'hk1860 --apply skips an ended job whose spawn pane is alive'; return 1
+  }
+  [[ "$(quota_rows "$job")" == 1 ]] || {
+    assertion_red 'hk1860 --apply leaves the pane-alive row in place'; return 1
+  }
+  [[ "$(release_events "$job")" == 0 ]] || {
+    assertion_red 'hk1860 --apply releases nothing for a pane-alive job'; return 1
+  }
+}
+
+# wrk done takes the pane from the newest job.spawned. A stale watcher's
+# job.lost naming an older pane must not send done down the skip path.
+case_hk1860_pane_source() {
+  reset_case hk1860-source || return 3
+  local job=hk1860-source report="$TMP/hk1860-source-report.md" out
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.lost \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl\",\"pane_id\":\"w:p0\"}" >/dev/null || return 3
+  printf 'source report\n' >"$report"
+  out="$(done_run "$job" --report "$report" 2>/dev/null)" || return 3
+  [[ "$(wc -l <<<"$out" | tr -d ' ')" == 1 && "$out" == "OK job=$job "* ]] || {
+    assertion_red 'hk1860 wrk done after a stale job.lost prints exactly one OK line'; return 1
+  }
+  [[ "$(quota_rows "$job")" == 0 ]] || {
+    assertion_red 'hk1860 wrk done releases the row after a stale job.lost'; return 1
+  }
+  [[ "$(release_events "$job")" == 1 ]] || {
+    assertion_red 'hk1860 wrk done releases exactly once after a stale job.lost'; return 1
+  }
+}
+
+# The revived duplicate done keeps stdout to its one OK line: the skip reason
+# is a diagnostic and belongs on stderr.
+case_hk1860_duplicate_stdout() {
+  reset_case hk1860-dup || return 3
+  local job=hk1860-dup report="$TMP/hk1860-dup-report.md" out
+  QR_INTERVAL=3600 quota_spawn "$job" >/dev/null 2>&1 || return 3
+  quota_wait_sentinel_sleep "$job" || return 3
+  printf 'round one report\n' >"$report"
+  done_run "$job" --report "$report" >/dev/null 2>&1 || return 3
+  ARBITER_TEST_NOW=2099-02-01T00:00:00Z arb claim --job "$job" --lane default --t T1 \
+    --agent-label "lbl-$job" --reclaim-released >/dev/null || return 3
+  ARBITER_TEST_NOW=2099-02-02T00:00:00Z arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"default\",\"label\":\"lbl-$job\",\"pane_id\":\"w:p2\"}" >/dev/null || return 3
+  ARBITER_TEST_NOW=2099-02-03T00:00:00Z arb_lease "$job" || return 3
+  out="$(done_run "$job" --report "$report" 2>/dev/null)" || return 3
+  [[ "$(wc -l <<<"$out" | tr -d ' ')" == 1 && "$out" == "OK job=$job "* ]] || {
+    assertion_red 'hk1860 revived duplicate done prints exactly one stdout line'; return 1
+  }
+}
+
+# Dry-run is pure: an arbiter-unavailable skip prints on stdout, and writes no
+# durable release-failure line to the job's completion-sentinel.log.
+case_hk1860_dryrun_pure() {
+  reset_case hk1860-dryrun || return 3
+  local job=hk1860-dryrun stub="$TMP/hk1860-nobin" out log
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl\"}" >/dev/null || return 3
+  make_stub_path "$stub" arbiter || return 3
+  out="$(env PATH="$stub" HERDR_BIN="$HERDR" ARBITER_BIN="$TMP/hk1860-missing-arbiter" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$WRK" prune 2>&1)" || return 3
+  grep -Fq "skip job=$job reason=arbiter-unavailable" <<<"$out" || {
+    assertion_red 'hk1860 dry-run keeps the arbiter-unavailable stdout skip'; return 1
+  }
+  log="$INBOX/$job/completion-sentinel.log"
+  if [[ -e "$log" ]] && grep -q 'action=quota-release-failed' "$log"; then
+    assertion_red 'hk1860 dry-run appends no completion-sentinel.log line'; return 1
+  fi
+}
+
+# Housekeeping's release diagnostics go to stderr: a release that skips on the
+# round check must leave the end path's stdout untouched. The stub returns the
+# skip rc directly, so the case pins the call-site redirect, not the fixture.
+case_hk1860_housekeeping_stdout() {
+  reset_case hk1860-hk || return 3
+  local job=hk1860-hk lib out
+  mk_job "$job" w:p1 || return 3
+  lib="$(wrk_test_library)" || return 3
+  out="$(env WRK_LIBFILE="$lib" HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" bash -c '
+      . "$WRK_LIBFILE"
+      release_job_quota_pool() { echo "skip job=$1 reason=revived-since-scan"; return 2; }
+      job_end_housekeeping "$1" lane-a completed "wrk done" "wrk done" w:p1
+    ' _ "$job" 2>/dev/null)" || return 3
+  [[ -z "$out" ]] || {
+    assertion_red 'hk1860 housekeeping keeps release diagnostics off stdout'; return 1
+  }
+}
+
+case_hk1860_pass4_calls || fail "hk1860: pass 4 must take one ps sweep and one unscoped arbiter status per run"
+echo "PASS hk1860 pass4-one-sweep-one-status"
+case_hk1860_pane_alive || fail "hk1860: pass 4 must skip an ended job whose spawn pane is alive, dry-run and apply"
+echo "PASS hk1860 pane-alive-skip"
+case_hk1860_pane_source || fail "hk1860: wrk done must take the pane from the newest job.spawned"
+echo "PASS hk1860 done-pane-from-spawn"
+case_hk1860_duplicate_stdout || fail "hk1860: a revived duplicate done must keep stdout to one OK line"
+echo "PASS hk1860 duplicate-done-stdout"
+case_hk1860_housekeeping_stdout || fail "hk1860: housekeeping must keep release diagnostics off stdout"
+echo "PASS hk1860 housekeeping-stdout"
+case_hk1860_dryrun_pure || fail "hk1860: a dry-run prune must not write a release-failure log line"
+echo "PASS hk1860 dryrun-pure"
+
+# Mutants: each reverts one hk 1860 invariant on the shipped call site and must
+# turn its named case RED for that invariant.
+mkmut_span hk1860-per-job-status \
+  '    _quota_pools=""' \
+  '    _quota_status="$("$_quota_arb" status --job "$job" --json 2>/dev/null)" || true; _quota_pools=""'
+expect_mut_red "hk1860 per-job arbiter status is one status per run" case_hk1860_pass4_calls \
+  'ASSERT-RED: hk1860 prune dry-run takes one unscoped arbiter status per run'
+
+mkmut_span hk1860-no-pane-alive-skip \
+  'ok) echo "skip job=$job reason=pane-alive"; continue ;;' \
+  'ok) ;;'
+expect_mut_red "hk1860 pane-alive skip" case_hk1860_pane_alive \
+  'ASSERT-RED: hk1860 dry-run skips an ended job whose spawn pane is alive'
+
+mkmut_span hk1860-pane-from-any-event \
+  'pane=spawn_pane or pane' \
+  'pane=pane'
+expect_mut_red "hk1860 done takes the pane from the newest pane_id event" case_hk1860_pane_source \
+  'ASSERT-RED: hk1860 wrk done releases the row after a stale job.lost'
+
+mkmut_span hk1860-housekeeping-stdout \
+  'release_job_quota_pool "$job" "$pane" >&2 || release_rc=$?' \
+  'release_job_quota_pool "$job" "$pane" || release_rc=$?'
+expect_mut_red "hk1860 housekeeping release diagnostics on stdout" case_hk1860_housekeeping_stdout \
+  'ASSERT-RED: hk1860 housekeeping keeps release diagnostics off stdout'
+
+mkmut_span hk1860-dryrun-log \
+  'if (( apply )); then quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"; fi' \
+  'quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"'
+expect_mut_red "hk1860 dry-run writes a release-failure log line" case_hk1860_dryrun_pure \
+  'ASSERT-RED: hk1860 dry-run appends no completion-sentinel.log line'
 
 echo "PASS test-wrk-job-end: all cases"
