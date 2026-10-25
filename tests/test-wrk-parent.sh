@@ -16,6 +16,12 @@ ARBITER="$ROOT/bin/arbiter"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/wp2042.XXXXXX")"
+# Keep an injected mutant inside THIS run's root so tmp-writers can prove
+# ownership and stop its sentinels without a teardown failure masking RED.
+if [[ -n "${WRK_UNDER_TEST:-}" ]]; then
+  cp "$WRK" "$TMP/wrk-under-test"
+  WRK="$TMP/wrk-under-test"
+fi
 # shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
 export TW_TMP="$TMP"
@@ -267,7 +273,13 @@ MUT
     mutant_rc=0
     WRK_PARENT_MUTANT=1 WRK_UNDER_TEST="$mutant_path" bash "$ROOT/tests/test-wrk-parent.sh" >"$TMP/mutant-$mutant.log" 2>&1 || mutant_rc=$?
     [[ "$mutant_rc" -ne 0 ]] || fail "$mutant mutant survived"
-    grep -q '^FAIL:' "$TMP/mutant-$mutant.log" || fail "$mutant mutant did not reach an assertion: $(tail -n 5 "$TMP/mutant-$mutant.log")"
+    case "$mutant" in
+      owner) expected='FAIL: hk2042 parent owner must use newest reclaim' ;;
+      required) expected='FAIL: missing report for worker: expected rc 2, got 0' ;;
+      containment) expected='FAIL: report outside allowed job directories: /tmp/hk2042-verdict.md: expected rc 2, got 0' ;;
+    esac
+    grep -qF "$expected" "$TMP/mutant-$mutant.log" || fail "$mutant mutant missed its contract assertion: $(tail -n 5 "$TMP/mutant-$mutant.log")"
+    ! grep -q 'tracked writers survived teardown' "$TMP/mutant-$mutant.log" || fail "$mutant left writers alive"
     echo "PASS hk2042 $mutant mutant assertion RED"
   done
 fi

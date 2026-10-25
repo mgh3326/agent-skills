@@ -10531,6 +10531,8 @@ root = pathlib.Path(root).resolve()
 def refuse(message):
     sys.stderr.write("wrk: " + message + "\n")
     raise SystemExit(2)
+# Explicit ownership lets an SSH target run without a parent claim. Report
+# containment below is unconditional and is repeated on the target host.
 if not owner or require_claim == "1":
     if (root / parent).resolve() != root / parent:
         refuse("parent job directory must stay in the trusted inbox")
