@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""Read-only summary of PA-REVIEW lines on handoffkeep tasks."""
+import argparse
+import datetime as dt
+import json
+import re
+import subprocess
+import sys
+
+OUTCOMES = {"accepted", "rework", "not-accepted", "excluded"}
+REASONS = {"quality", "scope", "superseded", "quota", "tooling", "host", "operator-cancel"}
+UNCOUNTED = {"quota", "tooling", "host", "operator-cancel"}
+COMMENT_PAGE_SIZE = 100
+TASK_PAGE_SIZE = 500
+V1 = re.compile(
+    r"PA-REVIEW v1 task=(?P<task>[0-9]+) job=(?P<job>\S+) head=(?P<head>(?:[0-9a-f]{7,40}|none)) "
+    r"outcome=(?P<outcome>accepted|rework|not-accepted|excluded) "
+    r"(?:round=(?P<round>[0-9]+) )?reason=(?P<reason>[a-z-]+)(?: note=(?P<note>.*))?"
+)
+EARLY = re.compile(
+    r"PA-REVIEW task=(?P<task>[0-9]+) job=(?P<job>\S+) "
+    r"outcome=(?P<outcome>accepted|rework|not-accepted|excluded) reason=(?P<reason>.+)"
+)
+
+
+def cli_json(*args):
+    proc = subprocess.run(["handoffkeep", *args], text=True, capture_output=True, check=False)
+    if proc.returncode:
+        raise RuntimeError(proc.stderr.strip() or f"handoffkeep exited {proc.returncode}")
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"handoffkeep returned invalid JSON: {exc}") from exc
+
+
+def field(obj, *names, default=None):
+    if not isinstance(obj, dict):
+        return default
+    for name in names:
+        if name in obj:
+            return obj[name]
+    return default
+
+
+def comments_for(task):
+    rows = []
+    after_id = None
+    while True:
+        args = ["tasks", "comments", str(task), "--limit", str(COMMENT_PAGE_SIZE)]
+        if after_id is not None:
+            args.extend(["--after-id", str(after_id)])
+        data = cli_json(*args)
+        page = field(data, "comments", "items", default=[])
+        if not isinstance(page, list):
+            raise RuntimeError(f"task {task}: comments response is not a list")
+        rows.extend(page)
+        if len(page) < COMMENT_PAGE_SIZE:
+            return rows
+        try:
+            next_id = max(int(field(row, "id", "comment_id")) for row in page)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError(f"task {task}: full comments page has no valid ids") from exc
+        if after_id is not None and next_id <= after_id:
+            raise RuntimeError(f"task {task}: comment pagination did not advance")
+        after_id = next_id
+
+
+def tasks_for_project(project, states):
+    found = set()
+    for state in states:
+        data = cli_json("tasks", "list", "--project", project, "--state", state,
+                        "--limit", str(TASK_PAGE_SIZE))
+        rows = field(data, "tasks", "items", default=[])
+        if not isinstance(rows, list):
+            raise RuntimeError(f"state {state}: task list response is not a list")
+        if len(rows) >= TASK_PAGE_SIZE:
+            raise RuntimeError(f"state {state}: task list may be truncated at {TASK_PAGE_SIZE} rows")
+        for row in rows:
+            task_id = field(row, "id", "task_id")
+            if task_id is not None:
+                found.add(int(task_id))
+    return sorted(found)
+
+
+def sort_key(row):
+    created = str(field(row, "created_at", "createdAt", default=""))
+    try:
+        stamp = dt.datetime.fromisoformat(created.replace("Z", "+00:00"))
+    except ValueError:
+        stamp = dt.datetime.min.replace(tzinfo=dt.timezone.utc)
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=dt.timezone.utc)
+    return stamp, int(field(row, "id", "comment_id", default=0))
+
+
+def scan(tasks, authors):
+    errors, warnings, per_task = [], [], []
+    for task in sorted(set(tasks)):
+        rows = sorted(comments_for(task), key=sort_key)
+        jobs = {}
+        for comment in rows:
+            author = str(field(comment, "author", "author_name", default=""))
+            if author not in authors:
+                continue
+            comment_task = int(field(comment, "task_id", "task", default=task))
+            comment_id = field(comment, "id", "comment_id")
+            created = field(comment, "created_at", "createdAt", default="")
+            body = str(field(comment, "body", "text", default=""))
+            for line_pos, line in enumerate(re.split(r"\r\n|\r|\n", body), 1):
+                if not line.startswith("PA-REVIEW"):
+                    continue
+                v1_prefix = line.startswith("PA-REVIEW v1")
+                match = None if line.endswith((" ", "\t")) else (V1.fullmatch(line) if v1_prefix else EARLY.fullmatch(line))
+                if not match:
+                    errors.append({"task": task, "comment_id": comment_id, "line": line_pos,
+                                   "message": "malformed PA-REVIEW line"})
+                    continue
+                values = match.groupdict()
+                if int(values["task"]) < 1 or int(values["task"]) != comment_task or comment_task != task:
+                    errors.append({"task": task, "comment_id": comment_id, "line": line_pos,
+                                   "message": "task id does not match posted task"})
+                    continue
+                form = "v1" if v1_prefix else "early"
+                if form == "v1" and values["reason"] not in REASONS:
+                    errors.append({"task": task, "comment_id": comment_id, "line": line_pos,
+                                   "message": "unknown v1 reason code"})
+                    continue
+                derived = values.get("round") is None
+                if not derived and int(values["round"]) < 1:
+                    errors.append({"task": task, "comment_id": comment_id, "line": line_pos,
+                                   "message": "round must be positive"})
+                    continue
+                job_id = values["job"]
+                job = jobs.setdefault(job_id, {"forms": set(), "rounds": [], "lines": []})
+                job["forms"].add(form)
+                round_no = int(values["round"]) if not derived else len(job["lines"]) + 1
+                outcome, reason = values["outcome"], values["reason"]
+                counted = outcome != "excluded" and not (form == "v1" and reason in UNCOUNTED)
+                if form == "v1" and ((outcome == "excluded") != (reason in UNCOUNTED)):
+                    warnings.append({"task": task, "job": job_id, "comment_id": comment_id,
+                                     "message": "outcome and reason disagree; uncounted reading wins"})
+                    counted = False
+                item = {"form": form, "round": round_no, "round_derived": derived,
+                        "outcome": outcome, "reason": reason,
+                        "head": values.get("head") if form == "v1" else None,
+                        "note": values.get("note") if form == "v1" else None,
+                        "counted": counted, "comment_id": comment_id, "created_at": created,
+                        "line": line_pos}
+                job["lines"].append(item)
+                job["rounds"].append(round_no)
+        for job in jobs.values():
+            job["forms"] = sorted(job["forms"])
+            job["reworks"] = sum(item["outcome"] == "rework" for item in job["lines"])
+            final = job["lines"][-1]
+            job["final"] = final
+            job["counted"] = final["counted"]
+        ordered = sorted(jobs.items(), key=lambda pair: (sort_key({"created_at": pair[1]["final"]["created_at"],
+                                                                  "id": pair[1]["final"]["comment_id"]}),
+                                                         pair[1]["final"]["line"]))
+        chosen = ordered[-1][0] if ordered else None
+        decision = ({"job": chosen, "final": jobs[chosen]["final"]} if chosen else None)
+        per_task.append({"task": task, "deciding_job": chosen, "decision": decision,
+                         "jobs": {name: value for name, value in sorted(jobs.items())}})
+    return {"tasks_scanned": sorted(set(tasks)), "tasks": per_task, "errors": errors, "warnings": warnings}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--task", type=int, action="append")
+    parser.add_argument("--project")
+    parser.add_argument("--state", action="append")
+    parser.add_argument("--author", action="append", default=[])
+    parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    if bool(args.task) == bool(args.project):
+        parser.error("provide --task (repeatable) or --project")
+    if args.project and not args.state:
+        parser.error("--project requires at least one --state")
+    try:
+        tasks = args.task if args.task else tasks_for_project(args.project, args.state)
+        result = scan(tasks, set(args.author or ["pa-integrator"]))
+    except (RuntimeError, OSError, ValueError, TypeError) as exc:
+        print(f"pa-review-scan: {exc}", file=sys.stderr)
+        return 2
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    else:
+        print("task\tjob\tforms\trounds\treworks\toutcome\treason\thead\tnote\tcounted\tcomment_id\tcreated_at\tdeciding_job")
+        for task in result["tasks"]:
+            for job_id, job in task["jobs"].items():
+                final = job["final"]
+                rounds = ",".join(f"{item['round']} (derived)" if item["round_derived"] else str(item["round"])
+                                   for item in job["lines"])
+                vals = [task["task"], job_id, ",".join(job["forms"]), rounds,
+                        job["reworks"], final["outcome"], final["reason"], final["head"] or "",
+                        final["note"] or "", "counted" if job["counted"] else "uncounted",
+                        final["comment_id"], final["created_at"], "yes" if task["deciding_job"] == job_id else "no"]
+                print("\t".join(str(value).replace("\t", " ").replace("\n", " ") for value in vals))
+        for item in result["errors"]:
+            print(f"ERROR\t{item['task']}\t{item['comment_id']}\t{item['message']}", file=sys.stderr)
+        for item in result["warnings"]:
+            print(f"WARNING\t{item['task']}\t{item['comment_id']}\t{item['message']}", file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
