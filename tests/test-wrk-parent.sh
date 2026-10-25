@@ -151,10 +151,11 @@ spawn_try -- --role tester --parent-job parent --job child --report "$INBOX/pare
 expect_rc 0 "parent-job tester with parent report"
 python3 - "$INBOX/child/completion-sentinel.pid" "$INBOX/parent/verdict.md" <<'LOCAL_PATH'
 from pathlib import Path
-import subprocess, sys
+import shlex, subprocess, sys
 pid = Path(sys.argv[1]).read_text().split()[0]
 command = subprocess.check_output(["ps", "-p", pid, "-o", "command="], text=True)
-assert sys.argv[2] in command, "local sentinel report path: " + command
+args = shlex.split(command)
+assert args[args.index("sentinel") + 5] == sys.argv[2], "local sentinel report path: " + command
 LOCAL_PATH
 claim_payload="$(event_payload child job.claim)"
 grep -qE '"owner_lane" *: *"builder-current"' <<<"$claim_payload" ||

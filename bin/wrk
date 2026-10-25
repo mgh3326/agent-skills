@@ -10589,16 +10589,21 @@ PYCODE
 spillover_resolve_remote_task() {
   SPILL_REMOTE_HK_TASK="" SPILL_REMOTE_OWNER="" SPILL_REMOTE_REPORT_REL=""
   local role=worker explicit_task=0 parent_job="" owner="" report="" relative=0 job="" label="" arg i=0 args=("$@")
+  local model="" purpose="" operator_request="" round_ext="" role_explicit=0
   while [[ "$i" -lt "${#args[@]}" ]]; do
     arg="${args[$i]}"
     case "$arg" in
-      --role|--task|--parent-job|--owner|--report|--report-relative|--job|-l)
+      --role|--task|--parent-job|--owner|--report|--report-relative|--job|-l|-m|--profile|--purpose|--operator-request|--round-ext)
         ((i+=1))
         # Malformed options remain the target wrk's usage error; only valid
         # inheritance requests need an initiator-side lookup here.
         [[ "$i" -lt "${#args[@]}" ]] || return 0
         case "$arg" in
-          --role) role="${args[$i]}" ;;
+          --role) role="${args[$i]}"; role_explicit=1 ;;
+          -m|--profile) model="${args[$i]}" ;;
+          --purpose) purpose="${args[$i]}" ;;
+          --operator-request) operator_request="${args[$i]}" ;;
+          --round-ext) round_ext="${args[$i]}" ;;
           --task) explicit_task=1 ;;
           --parent-job) parent_job="${args[$i]}" ;;
           --owner) owner="${args[$i]}" ;;
@@ -10613,10 +10618,14 @@ spillover_resolve_remote_task() {
   done
   [[ "$role" != builder && "$role" != captain && "$explicit_task" -eq 0 ]] || return 0
 
-  local saved_role="${ROLE:-}" saved_task="${TASK_ID:-}" saved_parent="${PARENT_JOB:-}"
-  local saved_link_mode="${TASK_LINK_MODE:-}" saved_inherited_from="${TASK_INHERITED_FROM:-}"
+  # Match the target's effective role before imposing the leaf report rule;
+  # implicit astra/fable counsel seats retain their existing report contract.
+  local ROLE="$role" ROLE_EXPLICIT="$role_explicit" MODEL="$model" PURPOSE="$purpose"
+  local OPERATOR_REQUEST="$operator_request" ROUND_EXT_REF="$round_ext"
+  local TASK_ID="" PARENT_JOB="$parent_job" TASK_LINK_MODE="" TASK_INHERITED_FROM=""
   local TASK_REMOTE_INITIATOR=1
-  ROLE="$role" TASK_ID="" PARENT_JOB="$parent_job"
+  normalize_implicit_counsel_role
+  role="$ROLE"
   task_validate
   SPILL_REMOTE_HK_TASK="$TASK_ID"
   if [[ -n "$parent_job" ]]; then
@@ -10624,8 +10633,6 @@ spillover_resolve_remote_task() {
     SPILL_REMOTE_OWNER="$PARENT_SPAWN_OWNER"
     SPILL_REMOTE_REPORT_REL="$PARENT_SPAWN_RELATIVE"
   fi
-  ROLE="$saved_role" TASK_ID="$saved_task" PARENT_JOB="$saved_parent"
-  TASK_LINK_MODE="$saved_link_mode" TASK_INHERITED_FROM="$saved_inherited_from"
 }
 
 # hk_task_gate_failure — the hk-unreachable/undecidable funnel. The override

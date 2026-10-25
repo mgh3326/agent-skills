@@ -170,10 +170,11 @@ assert argv.count("--report-relative") == 1 and argv[argv.index("--report-relati
 PY
 # The actual target sentinel, not just the wire argv, watches the target path.
 python3 - "$TMP/remote-inbox/jobs/t1-remote/completion-sentinel.pid" "$TMP/remote-inbox/jobs/P/verdict.md" <<'PATHCHECK'
-import pathlib, subprocess, sys
+import pathlib, shlex, subprocess, sys
 pid = pathlib.Path(sys.argv[1]).read_text().split()[0]
 command = subprocess.check_output(["ps", "-p", pid, "-o", "command="], text=True)
-assert sys.argv[2] in command, "hk2042 target sentinel report path: " + command
+args = shlex.split(command)
+assert args[args.index("sentinel") + 5] == sys.argv[2], "hk2042 target sentinel report path: " + command
 PATHCHECK
 printf '%s\n' 'PASS wrk-remote-task T1-remote-env-and-empty-target-arbiter'
 

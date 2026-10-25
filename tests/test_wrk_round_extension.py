@@ -90,7 +90,8 @@ else: raise SystemExit("unexpected scopefuel command")
         path.chmod(0o700)
 
     def run_spawn(self, *, model="codex-astra", role="tester", ref=REF,
-                  purpose="round-extension", extra=(), environment=None, router=False, launch=False):
+                  purpose="round-extension", extra=(), environment=None, router=False, launch=False,
+                  report=True, remote_preflight=False):
         self.log.unlink(missing_ok=True)
         args = ["-c", str(self.base), "-m", model, "-p", str(self.prompt), "-w", "fixture",
                 "-l", "fixture-tester", "--t", "T3"]
@@ -99,8 +100,9 @@ else: raise SystemExit("unexpected scopefuel command")
         if role == "builder":
             args += ["--task", "1632", "--job", "b1632-sol", "--lane", "fixture-builder", "--parent", "director-1"]
         else:
-            args += ["--parent-job", "b1632-sol",
-                     "--report", str(self.base / "jobs/b1632-sol/tester-report.md")]
+            args += ["--parent-job", "b1632-sol"]
+            if report:
+                args += ["--report", str(self.base / "jobs/b1632-sol/tester-report.md")]
         if ref is not None:
             args += ["--round-ext", ref]
         if purpose is not None:
@@ -149,7 +151,10 @@ refresh_quota_pool() { :; }
 mock_mcp_prepare() { :; }
 mock_mcp_verify() { :; }
 '''
-        harness += 'spawn_router_cmd --host local "$@"' if router else 'spawn_cmd "$@"'
+        if remote_preflight:
+            harness += 'spillover_resolve_remote_task "$@"; exit 91'
+        else:
+            harness += 'spawn_router_cmd --host local "$@"' if router else 'spawn_cmd "$@"'
         process = subprocess.run(["bash", "-c", harness, "fixture", str(self.lib), *args],
             env={**self.env, **(environment or {})}, capture_output=True, text=True, timeout=60)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -194,6 +199,23 @@ mock_mcp_verify() { :; }
                     self.assertEqual(len(paths), 2, calls)
                     for args in paths:
                         self.assertEqual(args[args.index("--role") + 1], "counsel")
+
+    def test_remote_preflight_preserves_implicit_counsel_without_report(self):
+        for model, purpose, extra in (
+            ("codex-astra", None, ()),
+            ("codex-astra", "architect", ()),
+            ("fable", None, ("--operator-request", "hk:doc/ordinary/request",
+                              "--requested-by", "operator")),
+        ):
+            with self.subTest(model=model, purpose=purpose):
+                process, calls = self.run_spawn(model=model, role=None, ref=None,
+                    purpose=purpose, extra=extra, report=False, remote_preflight=True)
+                self.assertEqual(process.returncode, 91, process.stderr)
+                self.assertEqual(calls, [])
+        process, _ = self.run_spawn(model="codex-luna", role="worker", ref=None,
+            purpose=None, report=False, remote_preflight=True)
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertIn("requires --report", process.stderr)
 
     def test_implicit_round_extension_requires_explicit_role(self):
         for model in ("codex-astra", "fable"):
