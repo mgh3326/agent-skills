@@ -5543,7 +5543,8 @@ Restore records no quota row (the revoke already released it). After the receipt
 copy it starts one completion sentinel for the job, the same way spawn does, so
 a pane that dies after the checks is recorded as job.lost by that sentinel. The
 sentinel then leaves after the lost grace without ending the revived job; wrk
-prune declares the end once the pane is absent and the job is stale. A live
+prune declares the end (job.revoked) and releases the job's quota row, once the
+pane is absent and the job is stale. A live
 sentinel for the job that already watches this pane, proven by its pidfile and
 argv, is kept, and no second one starts.
 
