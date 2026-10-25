@@ -370,14 +370,17 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 `herdr agent get <pane>` 관측을 **3분류**하고, 판정 1건마다 잡 디렉토리의
 `completion-sentinel.log`에 한 줄씩 남긴다
 (`<ts> status=<상태|empty|err:code> transient=<n> action=<none|pending|completed|lost:reason|recovered:reason>`).
-action 이 `recovered:` 가 아닌 회복 폴(pending, completed, 또는 창 만료의 `lost:timeout`)은 줄 끝에 `recovered=<reason>` 이 붙는다.
+action 이 `recovered:` 가 아닌 회복 폴(pending, completed)은 줄 끝에 `recovered=<reason>` 이 붙는다.
+창이 에이전트가 살아 있는 폴에서 만료되면 `action=watch-expired elapsed=<n>s` 한 줄을 남기고 센티널만 끝난다.
 
 | 관측 | 분류 | 판정 |
 |---|---|---|
 | `agent_not_found` 등 pane/terminal 부재 에러 코드 | 확정 소멸 | 즉시 `job.lost` (`reason=agent_not_found`) |
 | 빈 출력 · 비정상 종료 · JSON 파싱 실패 · 소켓 에러 | 일시 장애 | `WRK_COMPLETION_INTERVAL_S`(기본 30s) 간격 재시도. **연속** `WRK_SENTINEL_TRANSIENT_MAX`(기본 10회 ≈5분) 초과 시에만 `job.lost` (`reason=herdr_unreachable`) |
 | 정상 상태(`working`/`idle`/`done`) | 관측 성공 | 일시 장애 카운터 리셋. `idle`·`done` + 새 report면 `job.completed` — 단 report의 관측 키가 한 interval 동안 그대로일 때만(첫 관측은 `action=pending`). 부분 작성 중인 파일로 먼저 나가지 않기 위함이다 |
-| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과 | 감시 창 만료 | `job.lost` (`reason=timeout`) |
+| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과, 에이전트 부재·불명 | 감시 창 만료 | `job.lost` (`reason=timeout`) |
+| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과, 에이전트 존재(class=ok) | 감시 창 만료 | `action=watch-expired` 로그 후 센티널만 종료. `job.lost`·종료 기록·쿼타 해제 없음, 잡은 `wrk done`·`joined`·`reap`·`prune` 이 평소대로 끝낸다 |
+| `WRK_COMPLETION_TIMEOUT_S` 경과 뒤 report 첫 관측(에이전트 `idle`/`done`) | 늦은 첫 관측 | `action=pending late=1` 한 번 — 같은 관측 키가 다음 폴까지 유지되면 평소대로 `job.completed`+쿼타 해제, 아니면 그 폴에서 `watch-expired` |
 
 `job.completed` 레코드는 report 본문의 sha256(`report_sha256` 필드)으로 라운드를
 식별한다. 같은 내용의 report에 대한 완료 기록이 이미 있으면 `wrk done`·센티널 어느
@@ -411,8 +414,8 @@ action 이 `recovered:` 가 아닌 회복 폴(pending, completed, 또는 창 만
 있는 응답)일 때만 풀린다. pane만 있고 상태가 없는 응답은 회복이 아니다.
 `herdr_unreachable`은 herdr가 다시 답하면(class가 transient가 아니면) 풀리고, 그 답이
 gone이면 같은 폴에서 `agent_not_found` 에피소드를 새로 연다. `timeout`은 감시 창이라
-class=ok로 풀리지 않는다. 창이 이미 지난 회복 폴도 `job.lost`(`reason=timeout`)를
-남긴다. 그 폴은 부재 에피소드의 `job.recovered`를 쓴 뒤 timeout 에피소드를 연다.
+class=ok로 풀리지 않는다. 창이 이미 지난 회복 폴은 부재 에피소드의 `job.recovered`를
+쓴 뒤 `watch-expired` 로 센티널만 끝낸다(에이전트가 보이므로 `job.lost` 없음).
 gone과 ok가 한 폴씩 번갈아 와도 창을 뒤로 미루지 못한다. 한 에피소드의 `job.lost`는 한 건이고, 같은 상태가 이어지는
 폴은 이벤트를 더 쓰지 않는다. `job.recovered`는 terminal도 revive도 아니다.
 

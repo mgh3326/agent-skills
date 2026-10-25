@@ -130,6 +130,8 @@ seed_join_round() {
     return 0
   fi
   printf '%s\n' "{\"kind\":\"job.round\",\"job_id\":\"$job\",\"round\":1,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >"$events/seed-job.round.json"
+  # hk 1900: a round counts toward the join only with a recorded verdict.
+  printf '%s\n' "{\"kind\":\"job.verdict\",\"job_id\":\"$job\",\"round\":1,\"head\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"verdict\":\"PASS\"}" >"$events/seed-job.verdict.json"
 }
 
 mk_builder_job() {
@@ -1955,14 +1957,24 @@ echo "== JE43: herdr answering gone rearms agent_not_found =="
 case_recovery_herdr_gone || fail "JE43 herdr gone answer must rearm the loss"
 echo "PASS je43 herdr-unreachable-rearms-on-gone"
 
+# live_quota_still_held JOB — the real arbiter row seeded by arb_lease is still
+# unreleased and no quota_pool.release event landed. A stub that always answers
+# "one row" proves a release call, but only a real row proves the row survived
+# (hk1888 round 2: the call-only release mutant survived the stub-only check).
+live_quota_still_held() {
+  [[ "$(quota_rows "$1")" == 1 && "$(release_events "$1")" -eq 0 ]]
+}
+
 # A strict gone/ok flap must not postpone the watch window. The sequence is
 # long enough that the run ends while the lines are still alternating: the
-# fixture repeats only its last line, and a trailing working line would let
-# the old check time out for the wrong reason.
+# fixture repeats only its last line. hk1888: the window now ends at the first
+# poll past it that sees the agent, so the flap ends in watch-expired with the
+# job live, not in a timeout loss.
 case_recovery_window_flap() {
   reset_case je44 || return 3
   mk_job je44 || return 3
-  recovery_arm_stub
+  arb_lease je44 || return 3
+  [[ "$(quota_rows je44)" == 1 ]] || return 3
   local seq="$TMP/je44-$CASE_SEQ.seq" events="$INBOX/je44/events" reasons i
   : >"$seq"
   for ((i = 0; i < 40; i++)); do
@@ -1970,37 +1982,232 @@ case_recovery_window_flap() {
   done
   SENT_INTERVAL=1 LOST_GRACE=3 SENT_TIMEOUT=4 TRANSIENT_MAX=10 \
     start_sentinel je44 w:p1 "$TMP/je44-report.md" "$seq"
-  wait_until 40 event_count_is "$events" job.revoked 1 ||
-    recovery_fail "a gone/ok flap past the watch window must revoke" || return
-  wait_until 10 pid_gone "$SENTINEL_PID" ||
-    recovery_fail "the sentinel must leave after the windowed flap" || return
-  event_count_is "$events" job.revoked 1 ||
-    recovery_fail "the windowed flap revokes once" || return
+  wait_until 20 pid_gone "$SENTINEL_PID" ||
+    recovery_fail "the sentinel must leave at the first live poll past the window" || return
+  grep -q 'action=watch-expired elapsed=' "$INBOX/je44/completion-sentinel.log" ||
+    recovery_fail "the windowed flap must end in watch-expired" || return
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "a live flap must not revoke" || return
   if event_count_is "$events" job.recovered 0; then
     recovery_fail "the flap must recover the absence episodes" || return
   fi
-  wait_until 15 recovery_release_count_is 1 ||
-    recovery_fail "the windowed flap releases quota once (got $(recovery_release_count))" || return
+  live_quota_still_held je44 ||
+    recovery_fail "a live flap must leave the job's quota row in place" || return
   if grep -q 'watch-exit' "$INBOX/je44/completion-sentinel.log"; then
     recovery_fail "the windowed flap must not watch-exit" || return
   fi
-  grep -q 'action=lost:timeout recovered=' "$INBOX/je44/completion-sentinel.log" ||
-    recovery_fail "the timeout poll must also log the recovery" || return
   reasons="$(recovery_lost_reasons "$events")"
-  python3 - "$reasons" <<'PY' || recovery_fail "the flap must end in one timeout loss ($reasons)" || return
-import sys
-reasons = sys.argv[1].split()
-assert reasons, reasons
-assert reasons.count("timeout") == 1, reasons
-assert reasons[-1] == "timeout", reasons
-assert "agent_not_found" in reasons, reasons
-PY
+  case " $reasons " in
+    *" timeout "*) recovery_fail "the live flap must not write a timeout loss ($reasons)" || return ;;
+  esac
   recovery_stop
 }
 
 echo "== JE44: a gone/ok flap still hits the watch window =="
 case_recovery_window_flap || fail "JE44 gone/ok flap must not postpone the watch window"
 echo "PASS je44 flap-cannot-postpone-watch-window"
+
+# hk1888: the watch window is not an absence. A live pane past the window ends
+# the watch only: no job.lost, no end record, no quota release, no recovered.
+# live_window_case JOB SCENARIO — the pane keeps answering SCENARIO.
+live_window_case() {
+  local job="$1" scenario="$2" events
+  reset_case "$job" || return 3
+  mk_job "$job" || return 3
+  arb_lease "$job" || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+  events="$INBOX/$job/events"
+  SCENARIO="$scenario" SENT_INTERVAL=1 LOST_GRACE=2 SENT_TIMEOUT=3 \
+    start_sentinel "$job" w:p1 "$TMP/$job-report.md"
+  wait_until 20 pid_gone "$SENTINEL_PID" ||
+    recovery_fail "$job: the sentinel must leave after the window" || return
+  event_count_is "$events" job.lost 0 ||
+    recovery_fail "$job: a live pane past the window must not write job.lost" || return
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "$job: a live pane past the window must not be revoked" || return
+  event_count_is "$events" job.recovered 0 ||
+    recovery_fail "$job: watch-expired is not a recovery" || return
+  live_quota_still_held "$job" ||
+    recovery_fail "$job: a live pane past the window must leave the job's quota row in place" || return
+  grep -q 'action=watch-expired elapsed=[0-9]*s' "$INBOX/$job/completion-sentinel.log" ||
+    recovery_fail "$job: the log must carry watch-expired with the elapsed seconds" || return
+  if grep -q 'action=lost:' "$INBOX/$job/completion-sentinel.log"; then
+    recovery_fail "$job: no lost action may be logged for a live pane" || return
+  fi
+  recovery_stop
+}
+
+live_window_working_case() { live_window_case je45 sentinel-working; }
+echo "== JE45: a live working pane past the window is not lost =="
+live_window_working_case || fail "JE45 live working pane must keep its job"
+echo "PASS je45 live-working-pane-watch-expired"
+
+echo "== JE46: a live idle pane with no report past the window is not lost =="
+live_window_case je46 sentinel-idle || fail "JE46 live idle pane must keep its job"
+echo "PASS je46 live-idle-pane-watch-expired"
+
+# dead_window_case JOB LAST_REASON TRANSIENT_MAX LINES… — the pane is working
+# for the first poll and then answers the given lines (the fixture repeats the
+# last one). One leading working keeps the case independent of poll timing:
+# the first poll is always inside the window. The loss must still end in a revoke and a release.
+dead_window_case() {
+  local job="$1" want="$2" tmax="$3" seq events reasons
+  shift 3
+  reset_case "$job" || return 3
+  mk_job "$job" || return 3
+  recovery_arm_stub
+  events="$INBOX/$job/events"
+  seq="$TMP/$job-$CASE_SEQ.seq"
+  printf '%s\n' working "$@" >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=2 SENT_TIMEOUT=2 TRANSIENT_MAX="$tmax" \
+    start_sentinel "$job" w:p1 "$TMP/$job-report.md" "$seq"
+  wait_until 30 event_count_is "$events" job.revoked 1 ||
+    recovery_fail "$job: a dead pane past the window must still be revoked" || return
+  wait_until 10 pid_gone "$SENTINEL_PID" ||
+    recovery_fail "$job: the sentinel must leave after the revoke" || return
+  wait_until 15 recovery_release_count_is 1 ||
+    recovery_fail "$job: a dead pane releases quota once (got $(recovery_release_count))" || return
+  reasons="$(recovery_lost_reasons "$events")"
+  [[ "$reasons" == "$want" ]] ||
+    recovery_fail "$job: lost reason must be $want (got $reasons)" || return
+  if grep -q 'watch-expired' "$INBOX/$job/completion-sentinel.log"; then
+    recovery_fail "$job: a dead pane must not log watch-expired" || return
+  fi
+  recovery_stop
+}
+
+echo "== JE47: a gone pane at the window still revokes and releases =="
+dead_window_case je47 agent_not_found 10 not-found || fail "JE47 gone pane must be cleaned up"
+echo "PASS je47 gone-pane-past-window-revokes"
+
+echo "== JE48: an unknown answer at the window is still lost:timeout =="
+dead_window_case je48 timeout 10 empty || fail "JE48 unknown answer at the window must stay lost:timeout"
+echo "PASS je48 unknown-at-window-is-lost-timeout"
+
+echo "== JE49: herdr unreachable past the window revokes and releases =="
+dead_window_case je49 herdr_unreachable 0 socket || fail "JE49 herdr unreachable must be cleaned up"
+echo "PASS je49 herdr-unreachable-past-window-revokes"
+
+# A flap that ends dead: the pane flaps once and then stays gone while the
+# window passes. No poll past the window saw the agent, so the dead job is
+# revoked through the grace. Only one ok poll, early, keeps this independent of
+# poll timing (a later ok poll past the window would correctly watch-expire).
+case_flap_then_dead() {
+  reset_case je50 || return 3
+  mk_job je50 || return 3
+  recovery_arm_stub
+  local seq="$TMP/je50-$CASE_SEQ.seq" events="$INBOX/je50/events"
+  printf '%s\n' not-found working not-found >"$seq"
+  SENT_INTERVAL=1 LOST_GRACE=2 SENT_TIMEOUT=4 TRANSIENT_MAX=10 \
+    start_sentinel je50 w:p1 "$TMP/je50-report.md" "$seq"
+  wait_until 30 event_count_is "$events" job.revoked 1 ||
+    recovery_fail "a flap that ends dead must still be revoked" || return
+  wait_until 10 pid_gone "$SENTINEL_PID" ||
+    recovery_fail "the sentinel must leave after the revoke" || return
+  wait_until 15 recovery_release_count_is 1 ||
+    recovery_fail "a flap that ends dead releases quota once (got $(recovery_release_count))" || return
+  if grep -q 'watch-expired' "$INBOX/je50/completion-sentinel.log"; then
+    recovery_fail "no poll past the window saw the agent, so no watch-expired" || return
+  fi
+  recovery_stop
+}
+
+echo "== JE50: a flap that ends dead is still cleaned up =="
+case_flap_then_dead || fail "JE50 a flap that ends dead must be revoked"
+echo "PASS je50 flap-then-dead-revokes"
+
+# ── hk1959: a report first seen after the watch deadline gets one
+# confirmation poll, then the watch expires ──────────────────────────────
+# The pane answers working through the window — the first three 2s polls all
+# land inside the 6s deadline — and turns idle only from the fourth poll on,
+# which three full interval sleeps always place past it. The report's first
+# observation is therefore itself a late one: action=pending once with
+# late=1, and the next poll decides.
+
+# quota_fully_released JOB — wait_until-able form of the released-row check.
+quota_fully_released() {
+  [[ "$(quota_rows "$1")" == 0 && "$(release_events "$1")" -ge 1 ]]
+}
+
+# late_window_case JOB VARIANT — stable keeps the report identical so the
+# confirmation poll completes; unstable rewrites it under every poll so the
+# second post-deadline pending takes the watch-expired exit; working-again
+# flips the token back to working right after the late pending.
+late_window_case() {
+  local job="$1" variant="$2" events seq report log
+  reset_case "$job" || return 3
+  mk_job "$job" || return 3
+  arb_lease "$job" || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+  events="$INBOX/$job/events"
+  seq="$TMP/$job-$CASE_SEQ.seq"
+  report="$TMP/$job-report.md"
+  log="$INBOX/$job/completion-sentinel.log"
+  printf 'late report\n' >"$report"
+  case "$variant" in
+    working-again) printf '%s\n' working working working idle working >"$seq" ;;
+    *) printf '%s\n' working working working idle >"$seq" ;;
+  esac
+  SENT_INTERVAL=2 LOST_GRACE=3 SENT_TIMEOUT=6 TRANSIENT_MAX=10 \
+    start_sentinel "$job" w:p1 "$report" "$seq"
+  if [[ "$variant" == unstable ]]; then
+    # A new observation key on every poll: the file grows under the sentinel.
+    # Self-bounded and self-stopping — on main (the RED shape) the sentinel
+    # never leaves, so the recovery_stop kill is what ends this loop.
+    ( for _ in $(seq 1 300); do
+        kill -0 "$SENTINEL_PID" 2>/dev/null || break
+        printf 'churn\n' >>"$report"
+        sleep 0.3
+      done ) &
+    own "$!"
+  fi
+  wait_until 30 pid_gone "$SENTINEL_PID" ||
+    recovery_fail "$job: the sentinel must leave once the late pending resolves" || return
+  [[ "$(grep -c 'action=pending late=1' "$log" || true)" == 1 ]] ||
+    recovery_fail "$job: the late sighting must log exactly one action=pending late=1" || return
+  [[ "$(grep -c 'action=pending' "$log" || true)" == 1 ]] ||
+    recovery_fail "$job: exactly one pending line is expected" || return
+  if [[ "$variant" == stable ]]; then
+    event_count_is "$events" job.completed 1 ||
+      recovery_fail "$job: the confirmed late report must complete" || return
+    event_count_is "$events" job.lost 0 ||
+      recovery_fail "$job: a completed late report must not write job.lost" || return
+    event_count_is "$events" job.revoked 0 ||
+      recovery_fail "$job: a completed late report must not be revoked" || return
+    if grep -q 'watch-expired' "$log"; then
+      recovery_fail "$job: a confirmed late report must not watch-expire" || return
+    fi
+    wait_until 15 quota_fully_released "$job" ||
+      recovery_fail "$job: a completed late report releases the quota row" || return
+  else
+    grep -q 'action=watch-expired elapsed=[0-9]*s' "$log" ||
+      recovery_fail "$job: the next poll after the late pending must log watch-expired with elapsed" || return
+    event_count_is "$events" job.completed 0 ||
+      recovery_fail "$job: an unconfirmed late report must not complete" || return
+    event_count_is "$events" job.lost 0 ||
+      recovery_fail "$job: a live pane past the deadline must not write job.lost" || return
+    event_count_is "$events" job.revoked 0 ||
+      recovery_fail "$job: watch-expired is not an end record" || return
+    live_quota_still_held "$job" ||
+      recovery_fail "$job: watch-expired must leave the job's quota row in place" || return
+  fi
+  recovery_stop
+}
+
+echo "== JE51: a report first seen past the deadline completes on its confirmation poll =="
+late_window_case je51 stable ||
+  fail "JE51 confirmed late report must complete and release"
+echo "PASS je51 late-report-confirmed-completes"
+
+echo "== JE52: an unstable late report watch-expires after one confirmation poll =="
+late_window_case je52 unstable ||
+  fail "JE52 unstable late report must end the watch"
+echo "PASS je52 late-report-unstable-watch-expires"
+
+echo "== JE53: a late pending followed by a working poll watch-expires =="
+late_window_case je53 working-again ||
+  fail "JE53 late pending then working must end the watch"
+echo "PASS je53 late-pending-then-working-watch-expires"
 
 # ════════════════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════════════════
@@ -4723,5 +4930,67 @@ mkmut_span r33-strand-lostgrace-sentinel-pidfile \
   '        created|already-ended) release_job_quota_pool "$job" "$pane" ;; # reverted lost-grace rc handling'
 expect_mut_red "R33 lost-grace guard skip removes sentinel pidfile" case_lostgrace_guard_skip_removes_pidfile \
   'ASSERT-RED: R33 lost-grace guarded release skip removes the sentinel pidfile'
+
+# R34: hk1888 — restoring the unconditional lost:timeout makes a live pane
+# past the watch window write job.lost again.
+mkmut_span r34-unconditional-lost-timeout \
+  'hk1888-watch-expired-live-guard' \
+  '      if false; then # reverted hk1888 live-pane guard'
+expect_mut_red "R34 live pane past the window is not lost" live_window_working_case \
+  'FAIL: je45: a live pane past the window must not write job.lost'
+
+# R35: hk1888 round 2 — a release in the watch-expired exit must lose the live
+# job's real quota row. The mutant calls the arbiter directly: a call-only
+# release_job_quota_pool is an equivalent mutant for a live job, because its
+# quota_release_round_current guard (hk 1813, #229) refuses to release a job
+# with no work-terminal record, so that call leaves the row and writes nothing.
+# expect_mut_red runs the case in a subshell, so CASE_SEQ does not advance: the
+# case gets its own job name or it would reuse R34's inbox.
+live_window_working_quota_case() { live_window_case je45q sentinel-working; }
+mkmut_span r35-watch-expired-releases-quota \
+  'hk1888-watch-expired-exit' \
+  '    if [[ -n "$watch_expired" ]]; then "${ARBITER:-arbiter}" release --job "$job" --resource codex --kind quota_pool >/dev/null 2>&1 || : # reverted: watch-expired releases quota'
+expect_mut_red "R35 watch-expired must not release the live job's quota row" live_window_working_quota_case \
+  "FAIL: je45q: a live pane past the window must leave the job's quota row in place"
+
+# ── hk1959 mutants: the one-confirmation-poll rule for late reports ──────
+# Same subshell rule as R34/R35: each mutant case body needs its own job
+# name so the reused case does not collide with an earlier run's inbox.
+case_late_unstable_r36() { late_window_case je52m36 unstable; }
+case_late_unstable_r37() { late_window_case je52m37 unstable; }
+case_late_stable_r38() { late_window_case je51m38 stable; }
+case_late_stable_r39() { late_window_case je51m39 stable; }
+
+# R36: keying the deadline on action=none alone again makes every late
+# pending skip the check — an unstable late report holds the watch forever
+# instead of expiring after one confirmation poll.
+mkmut r36-deadline-on-action-none \
+  's~( "\$action" == none || "\$action" == pending )~( "$action" == none )~'
+expect_mut_red "R36 the deadline must also gate late pendings" case_late_unstable_r36 \
+  'FAIL: je52m36: the sentinel must leave once the late pending resolves'
+
+# R37: the allowance is exactly one late pending. Letting every pending take
+# the branch keeps an unstable late report's sentinel alive forever.
+mkmut_span r37-every-late-pending \
+  'if [[ "$action" == pending && -z "$late_pending" ]]; then # hk1959-late-pending' \
+  '        if [[ "$action" == pending ]]; then # removed hk1959 once-only gate'
+expect_mut_red "R37 only the first late pending is allowed" case_late_unstable_r37 \
+  'FAIL: je52m37: the sentinel must leave once the late pending resolves'
+
+# R38: the late pending still needs its confirmation poll. Expiring on the
+# first sighting turns a stable late report into a watch-expired exit.
+mkmut_span r38-expire-on-first-late-pending \
+  'if [[ "$action" == pending && -z "$late_pending" ]]; then # hk1959-late-pending' \
+  '        if false; then # removed hk1959 late-pending confirmation'
+expect_mut_red "R38 the first late pending must not expire" case_late_stable_r38 \
+  'FAIL: je51m38: the late sighting must log exactly one action=pending late=1'
+
+# R39: a completed poll past the deadline is never turned into
+# watch-expired — including the confirmation poll that ends a stable late
+# report's watch.
+mkmut r39-completed-becomes-watch-expired \
+  's~( "\$action" == none || "\$action" == pending )~( "$action" == none || "$action" == pending || "$action" == completed )~'
+expect_mut_red "R39 completed must never become watch-expired" case_late_stable_r39 \
+  'FAIL: je51m39: the confirmed late report must complete'
 
 echo "PASS test-wrk-job-end: all cases"
