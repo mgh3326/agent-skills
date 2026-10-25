@@ -33,7 +33,7 @@ class RoundExtensionSpawn(unittest.TestCase):
         events = self.base / "jobs/b1632-sol/events"
         events.mkdir(parents=True)
         (events / "00001-job.claim.json").write_text(json.dumps({"job_id": "b1632-sol",
-            "kind": "job.claim", "payload": {"task_id": "1632", "parent_lane": "director-1"}}))
+            "kind": "job.claim", "payload": {"task_id": "1632", "owner_lane": "fixture-builder", "parent_lane": "director-1"}}))
         self.prompt = self.base / "brief.md"
         self.prompt.write_text("inert fixture")
         self.stub("hk", '''import json, os, sys
@@ -99,7 +99,8 @@ else: raise SystemExit("unexpected scopefuel command")
         if role == "builder":
             args += ["--task", "1632", "--job", "b1632-sol", "--lane", "fixture-builder", "--parent", "director-1"]
         else:
-            args += ["--parent-job", "b1632-sol"]
+            args += ["--parent-job", "b1632-sol",
+                     "--report", str(self.base / "jobs/b1632-sol/tester-report.md")]
         if ref is not None:
             args += ["--round-ext", ref]
         if purpose is not None:

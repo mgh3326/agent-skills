@@ -322,6 +322,8 @@ Options:
                      (no job without its task link) unless --task-hk-bypass.
   --parent-job JOB   tester/advisory inheritance: take the task id from the
                      parent job's recorded claim meta instead of --task.
+                     Without --owner, inherit the newest claim/reclaim owner lane;
+                     a missing/unreadable parent claim refuses on the initiator.
                      Mutually exclusive with --task. When neither is given, a
                      worker spawn tries the calling pane's ARBITER_JOB meta
                      and then the HK_TASK_ID env (propagated into every
