@@ -2,7 +2,13 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+
+# Never re-run a superseded head's CI run; if it cancels the newest head's run, re-run the newest head.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -104,6 +110,7 @@ jobs:
           bash tests/test-fleet-rev.sh
           bash tests/test-gate-policy-devin-grades.sh
           python3 tests/test-node-ops.py
+          python3 -m unittest tests/test_pa_review_scan.py -v
           python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
           python3 -m unittest discover -s tests -p 'test_quota_stale_report.py' -v
           python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v

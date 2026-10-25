@@ -977,6 +977,11 @@ class World:
         (events / ("%05d-job.round.json" % (number + 1))).write_text(json.dumps({
             "kind": "job.round", "job_id": job, "round": number, "head": "a" * 40,
             "created_at": "2026-10-23T00:00:%02dZ" % number}) + "\n")
+        # hk 1900: a round counts toward the join only with a recorded verdict. The name is not a
+        # numeric prefix, so it never collides with a verdict record a test writes itself.
+        (events / ("seed-%d-job.verdict.json" % number)).write_text(json.dumps({
+            "kind": "job.verdict", "job_id": job, "round": number, "head": "b" * 40, "verdict": "PASS",
+            "created_at": "2026-10-23T00:00:%02dZ" % number}) + "\n")
 
     def end_job(self, root, job, name="00009-job.revoked.json"):
         (Path(root) / job / "events" / name).write_text(json.dumps({
