@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
+# (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd -P)"
 WRK="$ROOT/bin/wrk"
@@ -8,6 +11,21 @@ SCOPEFUEL="$ROOT/tests/fixtures/scopefuel"
 HANDOFFKEEP="$ROOT/tests/fixtures/handoffkeep"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 TMP="$(mktemp -d)"
+# CI pins Python 3.14, but a desktop python3 may predate tomllib (3.11+). The
+# parsed-mode cases below need a TOML parser; the parser-absent header-only
+# fallback is covered explicitly by the NO_TOML sitecustomize fixture further
+# down. Pin python3 to a tomllib-capable interpreter, or fail loudly.
+PYBIN="$TMP/python-bin"
+mkdir -p "$PYBIN"
+PINNED_PY=""
+for candidate in python3 python3.14 python3.13 python3.12 python3.11; do
+  p="$(command -v "$candidate" 2>/dev/null || true)"
+  [[ -n "$p" ]] || continue
+  if "$p" -c 'import tomllib' 2>/dev/null; then PINNED_PY="$p"; break; fi
+done
+[[ -n "$PINNED_PY" ]] || { echo "FAIL codex-project-trust: no python3 with tomllib (3.11+) on PATH" >&2; exit 1; }
+ln -s "$PINNED_PY" "$PYBIN/python3"
+export PATH="$PYBIN:$PATH"
 # shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
 export TW_TMP="$TMP"
@@ -335,10 +353,66 @@ grep -q 'Codex project trust seeded .*validation=header-only' "$TMP/header-only.
   fail 'parser-unavailable run did not report header-only validation'
 HEADER_SHA="$(sha256_file "$HEADER_HOME/config.toml")"
 spawn_ok header-only-exists "$WRK" "$NEW_WORKTREE" codex-luna "$HEADER_HOME" "$HOME_FIXTURE" '' "$NO_TOML"
-grep -q 'Codex project trust exists .*validation=header-only' "$TMP/header-only-exists.err" ||
-  fail 'header-only mode did not detect an exact existing header'
+grep -q '^wrk: Codex project trust skipped (unparsed-mention) \[validation=header-only\]$' "$TMP/header-only-exists.err" ||
+  fail 'header-only mode did not skip an exact existing mention'
 [[ "$(sha256_file "$HEADER_HOME/config.toml")" == "$HEADER_SHA" ]] || fail 'header-only exists check changed config'
 echo 'PASS header-only-validation-and-exists'
+
+# Alternate valid table spellings and conservative prefix mentions must never
+# cause a second table when no TOML parser is available.
+for spelling in spaced single comment crlf prefix; do
+  mention_home="$TMP/header-$spelling"
+  mkdir -p "$mention_home"
+  python3 - "$mention_home/config.toml" "$NEW_WORKTREE" "$spelling" <<'PYCASE'
+import os, sys
+path, cwd, spelling = sys.argv[1:]
+cwd = os.path.realpath(cwd)
+headers = {
+    "spaced": '[ projects."%s" ]\n' % cwd,
+    "single": "[projects.'%s']\n" % cwd,
+    "comment": '[projects."%s"] # existing project\n' % cwd,
+    "crlf": '[projects."%s"]\r\n' % cwd,
+    "prefix": '[projects."%s-other"]\n' % cwd,
+}
+with open(path, "wb") as handle:
+    handle.write((headers[spelling] + 'trust_level = "untrusted"\n').encode("ascii"))
+PYCASE
+  mention_sha="$(sha256_file "$mention_home/config.toml")"
+  spawn_ok "mention-$spelling" "$WRK" "$NEW_WORKTREE" codex-luna "$mention_home" "$HOME_FIXTURE" '' "$NO_TOML"
+  grep -q '^wrk: Codex project trust skipped (unparsed-mention) \[validation=header-only\]$' "$TMP/mention-$spelling.err" ||
+    fail "$spelling mention did not report skipped unparsed-mention"
+  [[ "$(sha256_file "$mention_home/config.toml")" == "$mention_sha" ]] || fail "$spelling mention changed config bytes"
+done
+echo 'PASS header-only-alternate-spellings-and-prefix'
+
+for link_kind in real dangling; do
+  link_home="$TMP/leaf-$link_kind"
+  link_target="$TMP/target-$link_kind.toml"
+  mkdir -p "$link_home"
+  if [[ "$link_kind" == real ]]; then
+    printf '%s\n' '# target must remain unchanged' >"$link_target"
+    target_sha="$(sha256_file "$link_target")"
+  fi
+  ln -s "$link_target" "$link_home/config.toml"
+  spawn_ok "symlink-$link_kind" "$WRK" "$WORKTREE" codex-luna "$link_home"
+  [[ -L "$link_home/config.toml" ]] || fail "$link_kind config symlink was replaced"
+  [[ "$(readlink "$link_home/config.toml")" == "$link_target" ]] || fail "$link_kind config link changed"
+  grep -q '^wrk: Codex project trust skipped (symlinked-config) \[validation=' "$TMP/symlink-$link_kind.err" ||
+    fail "$link_kind symlink did not report skipped symlinked-config"
+  if [[ "$link_kind" == real ]]; then
+    [[ "$(sha256_file "$link_target")" == "$target_sha" ]] || fail 'symlink target changed'
+  else
+    [[ ! -e "$link_target" && ! -e "$link_home/config.toml" ]] || fail 'dangling link created a file'
+  fi
+done
+mkdir -p "$TMP/directory-target"
+ln -s "$TMP/directory-target" "$TMP/directory-link"
+spawn_ok symlink-directory "$WRK" "$WORKTREE" codex-luna "$TMP/directory-link"
+[[ -L "$TMP/directory-link" ]] || fail 'CODEX_HOME directory symlink changed'
+printf '[projects."%s"]\ntrust_level = "trusted"\n' "$(cd "$WORKTREE" && pwd -P)" >"$TMP/directory-expected"
+cmp "$TMP/directory-expected" "$TMP/directory-target/config.toml" || fail 'directory symlink did not seed target'
+grep -q '^wrk: Codex project trust seeded \[validation=' "$TMP/symlink-directory.err" || fail 'directory symlink did not report seeded'
+echo 'PASS leaf-symlinks-skipped-directory-symlink-supported'
 
 RACE_HOME="$TMP/codex-race"
 RACE_A="$TMP/race-worktree-a"

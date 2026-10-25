@@ -4,6 +4,9 @@
 # assertion-RED mutants — sed'd copies of bin/wrk that drop each call site —
 # so a silently removed linkage step fails the suite instead of drifting.
 set -euo pipefail
+# hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
+# (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
@@ -114,6 +117,51 @@ expect_grep() { grep -q -- "$1" "$2" || fail "$3 (missing '$1' in $2: $(tail -n 
 no_job_dir() { [[ ! -d "$INBOX/$1" ]] || fail "$2 (unexpected job dir $INBOX/$1)"; }
 no_pane() { [[ ! -s "$HERDR_LOG" ]] || fail "$1 (unexpected herdr calls: $(cat "$HERDR_LOG"))"; }
 no_claim() { [[ "$(claim_count)" -eq 0 ]] || fail "$1 (hk claim ran: $(cat "$HK_LOG"))"; }
+rebind_count() { if [[ -f "$HK_LOG" ]]; then grep -c '^rebind ' "$HK_LOG" || true; else echo 0; fi; }
+job_event_doc() {
+  python3 - "$INBOX/$1/events" "$2" <<'PY'
+import glob, json, sys
+files = sorted(glob.glob(sys.argv[1] + "/*-" + sys.argv[2] + ".json"))
+if files:
+    doc = json.load(open(files[-1]))
+    print(json.dumps(doc.get("payload", doc)))
+else:
+    print("")
+PY
+}
+seed_old_job() {
+  local job="$1" mode="$2" rounds="${3:-0}" dir="$INBOX/$1/events"
+  mkdir -p "$dir"
+  printf '%s\n' '{"kind":"job.claim","at":"2026-10-18T00:00:00Z","payload":{"job_id":"'"$job"'","owner_lane":"old-lane","label":"old-label","role":"builder","task_id":1}}' >"$dir/00001-job.claim.json"
+  printf '%s\n' '{"kind":"job.spawned","at":"2026-10-18T00:00:01Z","payload":{"job_id":"'"$job"'","pane_id":"w1:p10","tab_id":"w1:t10"}}' >"$dir/00002-job.spawned.json"
+  local i
+  for ((i=1; i<=rounds; i++)); do
+    printf '{"kind":"job.round","job_id":"%s","round":%d,"at":"2026-10-18T00:00:%02dZ"}\n' "$job" "$i" "$((i+1))" >"$dir/$(printf '%05d' "$((i+2))")-job.round.json"
+  done
+  if [[ "$mode" == ended ]]; then
+    printf '%s\n' '{"kind":"job.revoked","at":"2026-10-19T00:00:00Z","payload":{"job_id":"'"$job"'","owner_lane":"old-lane"}}' >"$dir/00020-job.revoked.json"
+  elif [[ "$mode" == live ]]; then
+    printf '%s\n' '{"kind":"job.revoked","at":"2026-10-18T00:00:02Z","payload":{"job_id":"'"$job"'","owner_lane":"old-lane"}}' >"$dir/00020-job.revoked.json"
+    printf '%s\n' '{"kind":"job.spawned","at":"2026-10-19T00:00:00Z","payload":{"job_id":"'"$job"'","pane_id":"w1:p10","tab_id":"w1:t10"}}' >"$dir/00021-job.spawned.json"
+  fi
+}
+
+seed_old_verdict() {
+  local job="$1" path="$2" dir="$INBOX/$1/events"
+  python3 - "$job" "$path" "$dir/00010-job.verdict.json" <<'PY'
+import json, sys
+job, path, output = sys.argv[1:]
+with open(output, "w", encoding="utf-8") as handle:
+    json.dump({"kind": "job.verdict", "job_id": job, "round": 2,
+               "verdict": "PASS", "head": "a" * 40, "path": path,
+               "at": "2026-10-18T00:00:04Z"}, handle)
+    handle.write("\n")
+PY
+}
+
+takeover_spawn() {
+  MODEL=builder-sol LABEL=new-builder spawn_try -- "$@" --role builder --lane new-lane --parent director-1
+}
 
 echo "== AC1: --task required / usage errors before any side effect =="
 
@@ -509,11 +557,189 @@ echo "== hub forwarding: task options survive spill-over arg rebuild =="
 
 # F1: spillover hub args must forward --task/--parent-job/--task-hk-bypass;
 # --job-dup-ok stays refused. Static check on the forwarding case arms.
-grep -q -- '--task|--parent-job)' "$WRK" ||
-  fail "spillover hub args must forward --task and --parent-job"
+grep -q -- '--task|--parent-job|--takeover-from)' "$WRK" ||
+  fail "spillover hub args must forward task, inheritance and takeover options"
 grep -q -- '--task-hk-bypass)' "$WRK" ||
   fail "spillover hub args must forward --task-hk-bypass"
 echo "PASS f1 hub arg forwarding covers the task flags"
+
+echo "== AC4: builder takeover rebinds only an ended task owner and carries rounds =="
+
+# G1: a terminal old job is rebound through hk, creates paired audit records,
+# inherits round two, and opens round three for the new job.
+reset_case g1
+hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
+seed_old_job old-job ended 2
+seed_old_verdict old-job /work/review/rounds=0/verdict.md
+takeover_spawn --task 1 --job new-job --takeover-from old-job
+expect_rc 0 "takeover of ended old job"
+[[ "$(hk_refs_job 1)" == new-job && "$(hk_field 1 claimed_by)" == new-builder ]] ||
+  fail "takeover must bind new job and label: $(hk_show 1)"
+[[ "$(rebind_count)" -eq 1 ]] || fail "takeover must issue exactly one hk rebind"
+no_claim "takeover must use rebind, never claim"
+takeover_doc="$(job_event_doc new-job job.takeover)"
+grep -qE '"from_job" *: *"old-job"' <<<"$takeover_doc" || fail "job.takeover must name OLD: $takeover_doc"
+grep -qE '"task_id" *: *1' <<<"$takeover_doc" || fail "job.takeover must name the task: $takeover_doc"
+grep -qE '"rounds_used" *: *2' <<<"$takeover_doc" || fail "job.takeover must carry two rounds: $takeover_doc"
+task_link_payload="$(event_payload new-job job.task_link)"
+grep -qE '"status" *: *"takeover"' <<<"$task_link_payload" ||
+  fail "takeover must record its task link outcome: $task_link_payload"
+! grep -q "unknown status 'takeover'" "$TMP/stderr.txt" ||
+  fail "takeover task-link outcome must not be treated as unknown"
+handed_doc="$(job_event_doc old-job job.handed_off)"
+grep -qE '"to_job" *: *"new-job"' <<<"$handed_doc" || fail "old job must record handoff destination: $handed_doc"
+new_head="$(git -C "$ROOT" rev-parse HEAD)"
+set +e
+env -u ARBITER_JOB -u HK_TASK_ID ARBITER_INBOX_ROOT="$INBOX" ARBITER_BIN="$ARBITER" \
+  HANDOFFKEEP_BIN="$HK" HOME="$HOME" XDG_DATA_HOME="$TMP/round-xdg" \
+  TMPDIR="$TMP" PANEWIRE_BIN="$PANEWIRE" WRK_NO_SLEEP=1 \
+  "$WRK" round open new-job --head "$new_head" --repo "$ROOT" >"$TMP/round-open.out" 2>"$TMP/round-open.err"
+ROUND_RC=$?
+set -e
+[[ "$ROUND_RC" -eq 0 ]] || fail "inherited round count must allow round three: $(cat "$TMP/round-open.err")"
+grep -q 'round=3' "$TMP/round-open.out" || fail "new job must open round three: $(cat "$TMP/round-open.out")"
+set +e
+env -u ARBITER_JOB -u HK_TASK_ID ARBITER_INBOX_ROOT="$INBOX" ARBITER_BIN="$ARBITER" \
+  HANDOFFKEEP_BIN="$HK" HOME="$HOME" XDG_DATA_HOME="$TMP/round-xdg" \
+  TMPDIR="$TMP" PANEWIRE_BIN="$PANEWIRE" WRK_NO_SLEEP=1 \
+  "$WRK" round open new-job --head "$new_head" --repo "$ROOT" >"$TMP/round-cap.out" 2>"$TMP/round-cap.err"
+ROUND_RC=$?
+set -e
+[[ "$ROUND_RC" -eq 78 ]] || fail "fourth round must refuse at task cap three (rc=$ROUND_RC)"
+grep -q 'round cap 3 reached' "$TMP/round-cap.err" || fail "round cap refusal must name inherited count"
+round_escalate="$(job_event_doc new-job job.escalate)"
+grep -qE '"job_id" *: *"new-job"' <<<"$round_escalate" || fail "round-cap escalation must belong to NEW: $round_escalate"
+
+# A tester inheriting from NEW reads the task_id recorded by NEW's arbiter
+# claim and does not change the binding.
+spawn_try -- --role tester --parent-job new-job --job new-job-tester
+expect_rc 0 "tester inheritance from takeover job"
+child_claim="$(event_payload new-job-tester job.claim)"
+grep -qE '"task_id" *: *1' <<<"$child_claim" || fail "tester child must inherit NEW task: $child_claim"
+grep -qE '"task_inherited_from" *: *"new-job"' <<<"$child_claim" || fail "tester child must name NEW as parent: $child_claim"
+no_claim "tester inheritance from NEW must not re-claim the task"
+[[ "$(hk_refs_job 1)" == new-job ]] || fail "tester inheritance must preserve NEW's binding"
+echo "PASS g1 ended-job takeover rebinds task and carries the round cap"
+
+# G2: a terminal older than the newest revive is live by the shared event
+# order. Refuse before any hk write, job directory, or pane.
+reset_case g2
+hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
+seed_old_job old-job live
+takeover_spawn --task 1 --job live-new --takeover-from old-job
+expect_rc 2 "takeover of a live old job"
+expect_grep 'still live' "$TMP/stderr.txt" "live takeover refusal must name the old job"
+no_pane "live old job refusal precedes pane creation"
+no_job_dir live-new "live old job refusal precedes a new job record"
+no_claim "live old job refusal never calls claim"
+[[ "$(rebind_count)" -eq 0 ]] || fail "live old job must not reach hk rebind"
+echo "PASS g2 a revive newer than terminal blocks takeover before side effects"
+
+# G3: task conflict or an old server route leaves no pane and no takeover
+# event, even though unrelated admission metadata may already exist.
+for mode in rejectrebind oldroute; do
+  reset_case "g3-$mode"
+  hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
+  seed_old_job old-job ended
+  HK_MODE="$mode" takeover_spawn --task 1 --job "refused-$mode" --takeover-from old-job
+  [[ "$SPAWN_RC" -ne 0 ]] || fail "$mode must refuse takeover"
+  no_pane "$mode refusal precedes pane creation"
+  no_job_dir "refused-$mode" "$mode refusal precedes local job records"
+  [[ "$(hk_refs_job 1)" == old-job ]] || fail "$mode refusal must leave the task bound to OLD"
+  [[ -z "$(job_event_doc "refused-$mode" job.takeover)" ]] || fail "$mode refusal must not write job.takeover"
+done
+echo "PASS g3 hk refusal and old route version never spawn or record takeover"
+
+# G3b: only builder role can enter takeover mode; worker and tester refusals
+# precede the handoffkeep write and pane creation.
+for role in worker tester; do
+  reset_case "g3b-$role"
+  hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
+  seed_old_job old-job ended
+  spawn_try -- --task 1 --job "refused-role-$role" --takeover-from old-job --role "$role"
+  [[ "$SPAWN_RC" -eq 2 ]] || fail "$role takeover must be a usage refusal"
+  no_pane "$role takeover refusal precedes pane creation"
+  [[ "$(rebind_count)" -eq 0 ]] || fail "$role takeover must not reach hk rebind"
+done
+echo "PASS g3b only builder role may take over"
+
+# G4: handed-off OLD is a reap candidate only after grace with an idle pane;
+# the live NEW job is never listed.
+reset_case g4
+mkdir -p "$INBOX/old-reap/events" "$INBOX/new-reap/events"
+printf '%s\n' '{"kind":"job.claim","at":"2020-01-01T00:00:00Z","payload":{"owner_lane":"old-lane","role":"builder"}}' >"$INBOX/old-reap/events/00001-job.claim.json"
+printf '%s\n' '{"kind":"job.spawned","at":"2020-01-01T00:00:01Z","payload":{"pane_id":"w1:p10","tab_id":"w1:t10"}}' >"$INBOX/old-reap/events/00002-job.spawned.json"
+printf '%s\n' '{"kind":"job.handed_off","at":"2020-01-01T00:00:02Z","payload":{"to_job":"new-reap"}}' >"$INBOX/old-reap/events/00003-job.handed_off.json"
+printf '%s\n' '{"kind":"job.claim","at":"2020-01-01T00:00:00Z","payload":{"owner_lane":"new-lane","role":"builder"}}' >"$INBOX/new-reap/events/00001-job.claim.json"
+printf '%s\n' '{"kind":"job.spawned","at":"2020-01-01T00:00:01Z","payload":{"pane_id":"w1:p11","tab_id":"w1:t11"}}' >"$INBOX/new-reap/events/00002-job.spawned.json"
+reap_out="$(env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$INBOX" \
+  WRK_FIXTURE_SCENARIO=reap WRK_FIXTURE_REAP_TABS=ok \
+  HOME="$HOME" XDG_DATA_HOME="$TMP/reap-xdg" TMPDIR="$TMP" \
+  "$WRK" reap --grace 1s --include-builders 2>&1)"
+grep -q 'would-close job=old-reap pane=w1:p10 tab=w1:t10 status=idle' <<<"$reap_out" ||
+  fail "aged idle handed-off OLD must appear in reap dry-run: $reap_out"
+! grep -q 'job=new-reap\|job=old-reap.*new-reap' <<<"$reap_out" ||
+  fail "reap dry-run must never list live NEW: $reap_out"
+echo "PASS g4 handed-off old job is reapable after grace; new job is not"
+
+# G5: two hops. C's rounds_used is every round A consumed plus every round B
+# consumed, and C's own open refuses at the cap. Returns 1 on an assertion
+# miss so the chain mutant below stays assertion-RED.
+case_takeover_chain() {
+  G5_SEQ=$(( ${G5_SEQ:-0} + 1 ))
+  reset_case "g5-$G5_SEQ"
+  hk_add --id 1 --state claimed --claimed-by old-label --job-id job-a >/dev/null
+  seed_old_job job-a ended 2
+  takeover_spawn --task 1 --job job-b --takeover-from job-a
+  [[ "$SPAWN_RC" -eq 0 ]] || { echo "FAIL: A to B takeover rc=$SPAWN_RC" >&2; return 1; }
+  local b_takeover
+  b_takeover="$(job_event_doc job-b job.takeover)"
+  grep -qE '"rounds_used" *: *2' <<<"$b_takeover" ||
+    { echo "FAIL: B must inherit A's two rounds: $b_takeover" >&2; return 1; }
+  local head rc
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  set +e
+  env -u ARBITER_JOB -u HK_TASK_ID ARBITER_INBOX_ROOT="$INBOX" ARBITER_BIN="$ARBITER" \
+    HANDOFFKEEP_BIN="$HK" HOME="$HOME" XDG_DATA_HOME="$TMP/g5-xdg-$G5_SEQ" \
+    TMPDIR="$TMP" PANEWIRE_BIN="$PANEWIRE" WRK_NO_SLEEP=1 \
+    "$WRK" round open job-b --head "$head" --repo "$ROOT" >"$TMP/g5-b-open.out" 2>"$TMP/g5-b-open.err"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || { echo "FAIL: B must open a round: $(cat "$TMP/g5-b-open.err")" >&2; return 1; }
+  grep -q 'round=3' "$TMP/g5-b-open.out" ||
+    { echo "FAIL: B must open round three: $(cat "$TMP/g5-b-open.out")" >&2; return 1; }
+  python3 - "$INBOX/job-b/events/90000-job.revoked.json" <<'PY' || return 1
+import json, sys
+doc = {"kind": "job.revoked", "job_id": "job-b", "owner_lane": "new-lane",
+       "outcome": "abandoned", "reason": "fixture end",
+       "at": "2099-01-01T00:00:00.000Z"}
+with open(sys.argv[1], "w", encoding="utf-8") as handle:
+    json.dump(doc, handle)
+    handle.write("\n")
+PY
+  takeover_spawn --task 1 --job job-c --takeover-from job-b
+  [[ "$SPAWN_RC" -eq 0 ]] || { echo "FAIL: B to C takeover rc=$SPAWN_RC" >&2; return 1; }
+  local c_takeover
+  c_takeover="$(job_event_doc job-c job.takeover)"
+  grep -qE '"rounds_used" *: *3' <<<"$c_takeover" ||
+    { echo "FAIL: C rounds_used must be A's 2 plus B's 1: $c_takeover" >&2; return 1; }
+  set +e
+  env -u ARBITER_JOB -u HK_TASK_ID ARBITER_INBOX_ROOT="$INBOX" ARBITER_BIN="$ARBITER" \
+    HANDOFFKEEP_BIN="$HK" HOME="$HOME" XDG_DATA_HOME="$TMP/g5-xdg-$G5_SEQ" \
+    TMPDIR="$TMP" PANEWIRE_BIN="$PANEWIRE" WRK_NO_SLEEP=1 \
+    "$WRK" round open job-c --head "$head" --repo "$ROOT" >"$TMP/g5-c-open.out" 2>"$TMP/g5-c-open.err"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 78 ]] ||
+    { echo "FAIL: C must refuse at the cap (rc=$rc): $(cat "$TMP/g5-c-open.err")" >&2; return 1; }
+  grep -q 'round cap 3 reached' "$TMP/g5-c-open.err" ||
+    { echo "FAIL: C cap refusal must name the cap" >&2; return 1; }
+  return 0
+}
+
+echo "== G5: two takeovers accumulate rounds and the third job refuses at the cap =="
+case_takeover_chain || fail "G5 a takeover chain must sum rounds_used"
+echo "PASS g5 two-hop takeover rounds accumulate and refuse at the cap"
 
 echo "== MUT: assertion-RED mutants per call site =="
 
@@ -563,13 +789,45 @@ case_meta() {
   [[ "$SPAWN_RC" -eq 0 ]] &&
     grep -qE '"task_id" *: *1' <<<"$(event_payload mut-m-job job.claim)"
 }
+case_takeover_live() {
+  reset_case mut-take-live
+  hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
+  seed_old_job old-job live
+  takeover_spawn --task 1 --job mutant-live --takeover-from old-job
+  [[ "$SPAWN_RC" -ne 0 && ! -s "$HERDR_LOG" && -z "$(job_event_doc mutant-live job.takeover)" ]]
+}
+case_takeover_refusal() {
+  reset_case mut-take-refusal
+  hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
+  seed_old_job old-job ended
+  HK_MODE=rejectrebind takeover_spawn --task 1 --job mutant-refusal --takeover-from old-job
+  [[ "$SPAWN_RC" -ne 0 && ! -s "$HERDR_LOG" && ! -d "$INBOX/mutant-refusal" &&
+     -z "$(job_event_doc mutant-refusal job.takeover)" ]]
+}
+case_takeover_rounds() {
+  reset_case mut-take-rounds
+  hk_add --id 1 --state claimed --claimed-by old-label --job-id old-job >/dev/null
+  seed_old_job old-job ended 2
+  takeover_spawn --task 1 --job mutant-rounds --takeover-from old-job
+  [[ "$SPAWN_RC" -eq 0 ]] || return 1
+  local head rc
+  head="$(git -C "$ROOT" rev-parse HEAD)"
+  set +e
+  env -u ARBITER_JOB -u HK_TASK_ID ARBITER_INBOX_ROOT="$INBOX" ARBITER_BIN="$ARBITER" \
+    HANDOFFKEEP_BIN="$HK" HOME="$HOME" XDG_DATA_HOME="$TMP/mut-round-xdg" \
+    TMPDIR="$TMP" PANEWIRE_BIN="$PANEWIRE" WRK_NO_SLEEP=1 \
+    "$WRK" round open mutant-rounds --head "$head" --repo "$ROOT" >"$TMP/mut-round.out" 2>"$TMP/mut-round.err"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] && grep -q 'round=3' "$TMP/mut-round.out"
+}
 
 # Neutralizing the required-task check must let a taskless spawn proceed —
 # the mutant substitutes a valid id so the internal guard is bypassed too.
 mkmut no-validate 's/  die "--task <hk task id> is required for --role worker.*/  TASK_ID=1/'
 expect_mut_red "task_validate removal" case_usage
 
-mkmut no-precheck 's/^  hk_task_precheck$/  : hk_task_precheck removed by mutant/'
+mkmut no-precheck 's/^[[:space:]]*hk_task_precheck$/  : hk_task_precheck removed by mutant/'
 expect_mut_red "hk_task_precheck removal" case_hkdown
 
 mkmut no-link 's/^  hk_task_link$/  : hk_task_link removed by mutant/'
@@ -581,5 +839,19 @@ expect_mut_red "post-claim verify removal" case_verify
 # shellcheck disable=SC2016 # the $TASK_ID is literal sed pattern text for the wrk source line
 mkmut no-claimargs 's/^  ARBITER_CLAIM_TASK_ARGS=(--task-id "$TASK_ID")$/  ARBITER_CLAIM_TASK_ARGS=()/'
 expect_mut_red "claim task_id arg removal" case_meta
+
+mkmut no-terminal-check 's/die "takeover refused: old job.*still live; no work-terminal follows its newest revive"/: # terminal guard removed by mutant/'
+expect_mut_red "live old-job terminal check removal" case_takeover_live
+
+mkmut no-rebind-call 's/^  hk_task_takeover_rebind$/  : rebind call removed by mutant/'
+expect_mut_red "refused rebind leaves no pane or partial record" case_takeover_refusal
+
+mkmut no-round-inheritance 's/used += wrk_takeover_rounds(events)/# takeover inheritance removed by mutant/'
+expect_mut_red "takeover round baseline removal" case_takeover_rounds
+
+# Every hop stores 0 instead of the predecessor's full round_scan. Valid
+# python, so the miss is the rounds_used / cap assertion, not an exception.
+mkmut no-round-chain 's/used += wrk_takeover_rounds(events)/used += 0/g'
+expect_mut_red "takeover chain under-count" case_takeover_chain
 
 echo "PASS test-wrk-task-link: all cases"

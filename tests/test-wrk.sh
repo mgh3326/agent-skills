@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
+# hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
+# (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
@@ -42,6 +45,20 @@ printf '%s\n' 'fixture prompt' >"$PROMPT"
 # spawn time (never from ~/.claude/); point it at a harmless fixture value.
 export CLINEPASS_GATE_KEY_FILE="$TMP/clinepass-gate-key.txt"
 printf 'fixture-gate-key\n' >"$CLINEPASS_GATE_KEY_FILE"
+
+# hk 1449: a builder join needs one non-voided recorded round. The seed file's
+# name is not a numeric prefix, so event numbering stays on the golden names.
+seed_join_round() {
+  local root="$1" job="$2"
+  local events="$root/$job/events"
+  mkdir -p "$events"
+  if [[ -e "$events/seed-job.round.json" ]]; then
+    return 0
+  fi
+  printf '%s\n' "{\"kind\":\"job.round\",\"job_id\":\"$job\",\"round\":1,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >"$events/seed-job.round.json"
+  # hk 1900: a round counts toward the join only with a recorded verdict.
+  printf '%s\n' "{\"kind\":\"job.verdict\",\"job_id\":\"$job\",\"round\":1,\"head\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"verdict\":\"PASS\"}" >"$events/seed-job.verdict.json"
+}
 
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
@@ -100,7 +117,7 @@ try:
     state = json.load(open(path, encoding="utf-8"))
 except (OSError, ValueError):
     state = {"tasks": {}}
-for i in range(768001, 768800):
+for i in range(768001, 769200):
     state["tasks"][str(i)] = {
         "id": i, "lane": "", "title": "spawn-base pool", "kind": "implement",
         "state": "backlog", "priority": 0, "refs": {}, "claimed_by": "",
@@ -135,11 +152,11 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # command-substitution subshells most spawn callers use.
 mint_task() {
   local id=$(( $(cat "$TMP/mint-seq" 2>/dev/null || echo 768000) + 1 ))
-  # The fixture pool above pre-mints 768001-768799 only; an id past it mints
+  # The fixture pool above pre-mints 768001-769199 only; an id past it mints
   # a task that does not exist and the failure surfaces as a swallowed rc 2
   # in a later spawn, far from the real cause — stop loudly instead (#1010/N7).
-  (( id <= 768799 )) ||
-    fail "mint_task: task pool exhausted (id $id exceeds the pre-minted 768001-768799 range)"
+  (( id <= 769199 )) ||
+    fail "mint_task: task pool exhausted (id $id exceeds the pre-minted 768001-769199 range)"
   printf '%s\n' "$id" >"$TMP/mint-seq"
   printf '%s\n' "$id"
 }
@@ -249,11 +266,13 @@ grep -qx 'builder-kimi' <<<"$profiles_out"
 grep -qx 'builder-luna' <<<"$profiles_out"
 grep -qx 'builder-sonnet' <<<"$profiles_out" ||
   fail "wrk profiles lost builder-sonnet (#921)"
-# #704 (#594 E6) + #737 (decision 4088): the per-rung builder spellings.
+# #704 (#594 E6) + #737 (decision 4088) + hk 1796: the per-rung builder spellings.
 for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max \
   builder-sol-high builder-sol-max builder-sol-medium builder-luna-max \
   builder-kimi-high builder-kimi-max \
-  builder-grok-low builder-grok-medium builder-grok-xhigh; do
+  builder-grok-low builder-grok-medium builder-grok-xhigh \
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
+  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
 done
 grep -qx 'captain-opus' <<<"$profiles_out"
@@ -293,7 +312,7 @@ if grep -qx 'codex-luna-ultra' <<<"$profiles_out"; then exit 1; fi
 TERRA_PROBE_SEQ=0
 terra_refusal_probe() {
   local executable="$1" profile="$2" role_path="$3" case_name="$4"
-  local profile_flag="${5:--m}"
+  local profile_flag="${5:--m}" expected_model="${6:-gpt-5.6-terra}" extra_opt="${7:-}"
   local root="$TMP/noterra/$case_name" home data cache config state inbox
   local out err herdr_log scopefuel_log panewire_log db before_tree after_tree before_hk after_hk task_id job rc=0
   TERRA_PROBE_SEQ=$((TERRA_PROBE_SEQ + 1))
@@ -311,8 +330,14 @@ terra_refusal_probe() {
     worker) args+=(--role worker --task "$task_id") ;;
     builder) args+=(--role builder --lane "nr-lane-$TERRA_PROBE_SEQ" --parent parent-lane --task "$task_id") ;;
     tester) args+=(--parent-job "$HK_TASK_ID") ;;
+    counsel) args+=(--role counsel) ;;
     *) return 1 ;;
   esac
+  if [[ -n "$extra_opt" ]]; then
+    local extra_arr=()
+    read -ra extra_arr <<<"$extra_opt"
+    args+=("${extra_arr[@]}")
+  fi
   set +e
   env HOME="$home" XDG_DATA_HOME="$data" XDG_CACHE_HOME="$cache" \
     XDG_CONFIG_HOME="$config" XDG_STATE_HOME="$state" \
@@ -339,7 +364,7 @@ if path.exists():
 PY
   [[ ! -s "$herdr_log" && ! -s "$scopefuel_log" && ! -s "$panewire_log" ]] || { echo "T-A1 fixture was called for $profile/$role_path" >&2; return 1; }
   [[ "$(wc -l <"$err" | tr -d ' ')" == 1 ]] || { echo "T-A1 expected one stderr line for $profile/$role_path: $(<"$err")" >&2; return 1; }
-  grep -q "profile $profile refused: gpt-5.6-terra is barred" "$err" || { echo "T-A1 missing named refusal: $(<"$err")" >&2; return 1; }
+  grep -q "profile $profile refused: $expected_model is barred" "$err" || { echo "T-A1 missing named refusal: $(<"$err")" >&2; return 1; }
   grep -q 'operator 2026-10-12 noterra; use codex-sol or codex-luna' "$err" || { echo "T-A1 missing decision/replacements: $(<"$err")" >&2; return 1; }
   [[ -z "$(find "$inbox" -type f -print -quit)" ]] || { echo "T-A1 inbox changed for $profile/$role_path" >&2; return 1; }
   after_tree="$(git -C "$ROOT" worktree list --porcelain | sha256sum | awk '{print $1}')"
@@ -366,6 +391,10 @@ SCOPEFUEL_E6_ARM=codex-terra@high terra_refusal_probe "$WRK" builder-terra-high 
 echo "PASS T-A2: Terra E6 markers cannot reach gate or spawn"
 
 # T-A1 model-id guard pin: inject an unlisted alias into a throwaway wrk copy.
+# The alias resolves to gpt-9.9-terra — a terra model id the original
+# gpt-5.6-terra-only enumeration did not know — and gets no catalog mapping, so
+# the resolver literal is exactly the model id the guard sees. A guard that
+# matches only the enumerated literal spawns it: this is the hk 1810 gap.
 make_future_terra_wrk() {
   local output="$1" move_after_claim="${2:-0}"
   python3 - "$WRK" "$output" "$move_after_claim" <<'PY'
@@ -375,10 +404,8 @@ src = Path(sys.argv[1]).read_text()
 dst = Path(sys.argv[2])
 dst.parent.mkdir(parents=True, exist_ok=True)
 replacements = (
-    ("codex-terra|codex-med) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;",
-     "codex-terra|codex-med|future-terra-alias) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;") ,
     ("codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;",
-     "codex-terra|codex-med|future-terra-alias) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;"),
+     "codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;\n    future-terra-alias) PROFILE_KIND=codex; PROFILE_MODEL=gpt-9.9-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;"),
     ("codex-terra|codex-med|codex-terra-max) GATE_PROFILE=codex-terra-max ;;",
      "codex-terra|codex-med|codex-terra-max|future-terra-alias) GATE_PROFILE=codex-terra-max ;;"),
 )
@@ -387,7 +414,7 @@ for old, new in replacements:
         raise SystemExit(f"expected one resolver clause: {old}")
     src = src.replace(old, new, 1)
 if sys.argv[3] == "1":
-    guard = '  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"\n'
+    guard = '  refuse_barred_launcher_model\n'
     claim = '  arbiter_admit\n'
     if src.count(guard) != 1 or src.count(claim) != 1:
         raise SystemExit("resolved guard or arbiter admission call is not unique")
@@ -398,40 +425,87 @@ PY
 }
 FUTURE_TERRA_WRK="$TMP/noterra/future-terra-wrk"
 make_future_terra_wrk "$FUTURE_TERRA_WRK"
-terra_refusal_probe "$FUTURE_TERRA_WRK" future-terra-alias worker model-id-alias ||
+terra_refusal_probe "$FUTURE_TERRA_WRK" future-terra-alias worker model-id-alias -m gpt-9.9-terra ||
   fail "T-A1 model-id guard must refuse a future alias that resolves to Terra"
 echo "PASS T-A1 model-id pin: unlisted Terra-resolving alias is refused"
+# The same bar holds when the canon — not the resolver table — is what hands a
+# non-Terra spelling a terra model id (WRK_LAUNCH_MODEL_OVERRIDE on the fixture
+# scopefuel is the catalog injection surface, hk 1810 repro).
+WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-terra \
+  terra_refusal_probe "$WRK" codex-luna worker catalog-terra-override -m gpt-9.9-terra ||
+  fail "T-A1 catalog-served terra model id must be refused for a non-Terra spelling"
+echo "PASS T-A1 catalog pin: a canon-served Terra model id is refused on codex-luna"
+# The bar also covers the non-codex launch channels: grok consumes the canon
+# model id via PROFILE_MODEL_ARG -> argv -m, fable via --model in ARGS.
+WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-terra \
+  terra_refusal_probe "$WRK" grok-hi worker catalog-terra-grok -m gpt-9.9-terra ||
+  fail "T-A1 catalog-served terra model id must be refused on the grok argv channel"
+echo "PASS T-A1 catalog pin: a canon-served Terra model id is refused on grok-hi"
+WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-terra \
+  terra_refusal_probe "$WRK" fable counsel catalog-terra-fable -m gpt-9.9-terra "--operator-request hk:doc/decision/2026-09-21/astra-allowed-purposes-approved" ||
+  fail "T-A1 catalog-served terra model id must be refused on the fable ARGS channel"
+echo "PASS T-A1 catalog pin: a canon-served Terra model id is refused on fable"
 
-# Named mutants: dropping the model-id check, or moving it beyond arbiter
-# admission, makes the alias refusal assertion red. Only fixtures are reachable.
+# Named mutants: dropping the model-id check, moving it beyond arbiter
+# admission, or re-narrowing it to the old literal enumeration must each make a
+# named probe assertion red. Probe output is captured per mutant and the
+# specific tripped assertion is pinned — a probe that dies on an unrelated
+# check (syntax error, missing refusal text) cannot count as a caught mutant,
+# and expected-RED diagnostics stop leaking into passing logs looking like a
+# real failed assertion. Only fixtures are reachable.
+expect_probe_red() {
+  local log="$1" want_line="$2" label="$3"
+  grep -qF "$want_line" "$log" ||
+    fail "$label must trip the '$want_line' assertion, not a different check: $(<"$log")"
+}
+
 M1_FUTURE_TERRA_WRK="$TMP/noterra/m1-no-model-check-wrk"
 python3 - "$FUTURE_TERRA_WRK" "$M1_FUTURE_TERRA_WRK" <<'PY'
 from pathlib import Path
 import sys
 src = Path(sys.argv[1]).read_text()
-guard = '  refuse_barred_model_id "$PROFILE_MODEL" "$MODEL"\n'
+guard = '  refuse_barred_launcher_model\n'
 if src.count(guard) != 1:
     raise SystemExit("m1 target guard is not unique")
 Path(sys.argv[2]).write_text(src.replace(guard, "", 1))
 Path(sys.argv[2]).chmod(0o755)
 PY
-if terra_refusal_probe "$M1_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m1; then
-  m1_red_rc=0
-else
-  m1_red_rc=$?
+m1_probe_log="$TMP/noterra/m1-probe.log"
+if terra_refusal_probe "$M1_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m1 -m gpt-9.9-terra >"$m1_probe_log" 2>&1; then
+  fail "m1 mutant survived the resolved-model refusal pin"
 fi
-[[ "$m1_red_rc" -ne 0 ]] || fail "m1 mutant survived the resolved-model refusal pin"
-echo "PASS mutant m1: resolved-model refusal assertion goes RED (rc=$m1_red_rc)"
+expect_probe_red "$m1_probe_log" "T-A1 future-terra-alias/worker unexpectedly spawned" "mutant m1"
+echo "PASS mutant m1: resolved-model refusal assertion goes RED"
 
 M2_FUTURE_TERRA_WRK="$TMP/noterra/m2-post-claim-wrk"
 make_future_terra_wrk "$M2_FUTURE_TERRA_WRK" 1
-if terra_refusal_probe "$M2_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m2; then
-  m2_red_rc=0
-else
-  m2_red_rc=$?
+m2_probe_log="$TMP/noterra/m2-probe.log"
+if terra_refusal_probe "$M2_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m2 -m gpt-9.9-terra >"$m2_probe_log" 2>&1; then
+  fail "m2 mutant survived the no-side-effect refusal pin"
 fi
-[[ "$m2_red_rc" -ne 0 ]] || fail "m2 mutant survived the no-side-effect refusal pin"
-echo "PASS mutant m2: no-side-effect assertion goes RED (rc=$m2_red_rc)"
+expect_probe_red "$m2_probe_log" "T-A1 arbiter gained a job or quota record" "mutant m2"
+echo "PASS mutant m2: no-side-effect assertion goes RED"
+
+# m3: the pre-hk-1810 enumeration knows gpt-5.6-terra only — restoring it lets
+# the alias spawn, so the unexpected-spawn assertion must be the one that trips.
+M3_FUTURE_TERRA_WRK="$TMP/noterra/m3-literal-only-wrk"
+python3 - "$FUTURE_TERRA_WRK" "$M3_FUTURE_TERRA_WRK" <<'PY'
+from pathlib import Path
+import sys
+src = Path(sys.argv[1]).read_text()
+widened = "    terra|*-terra|*-terra-*)\n"
+narrowed = "    gpt-5.6-terra|gpt-5.6-terra-*)\n"
+if src.count(widened) != 1:
+    raise SystemExit("m3 target pattern is not unique")
+Path(sys.argv[2]).write_text(src.replace(widened, narrowed, 1))
+Path(sys.argv[2]).chmod(0o755)
+PY
+m3_probe_log="$TMP/noterra/m3-probe.log"
+if terra_refusal_probe "$M3_FUTURE_TERRA_WRK" future-terra-alias worker mutant-m3 -m gpt-9.9-terra >"$m3_probe_log" 2>&1; then
+  fail "m3 mutant (literal-only enumeration) survived the terra model-id pin"
+fi
+expect_probe_red "$m3_probe_log" "T-A1 future-terra-alias/worker unexpectedly spawned" "mutant m3"
+echo "PASS mutant m3: the literal-only enumeration goes RED"
 
 # T-A3: permitted Sol and Luna profiles still traverse this fixture-backed path.
 for allowed_codex in codex-sol codex-luna; do
@@ -3825,6 +3899,50 @@ LANES_CFG_WBOTH="$TMP/lanes-1397-wboth-hosts.toml"
 printf '[hub]\nhub_url = "https://hub.invalid"\nhub_token_env = "%s"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
   "$LANES_TOKEN_FILE" "$LANES_OP_FILE" "$LANES_CF_FILE" >"$LANES_CFG_WBOTH"
 
+# hk 1446: a lanes token bound to the DEFERRED machine id — the hosts.toml
+# key the initiator reaches the execution host by (desktop) — lets the
+# delegated remote builder register its own lane. The config also carries
+# operator_token_env so the argv pin proves the self-add took the node
+# token and never the operator credential.
+LANES_NODE_DESKTOP_FILE="$TMP/lanes-node-desktop.env"
+LANES_NODE_DESKTOP_VALUE="fixture-lanes-desktop-token-must-not-leak"
+printf 'HUB_MACHINE_ID=desktop\nHUB_TOKEN=%s\n' "$LANES_NODE_DESKTOP_VALUE" >"$LANES_NODE_DESKTOP_FILE"
+chmod 600 "$LANES_NODE_DESKTOP_FILE"
+LANES_CFG_DEFER_SELF="$TMP/lanes-1446-self-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_NODE_DESKTOP_FILE" "$LANES_OP_FILE" "$LANES_CF_FILE" >"$LANES_CFG_DEFER_SELF"
+# Same shape but the token names another machine: the deferred spawn must
+# behave exactly as it does without a token.
+LANES_CFG_DEFER_MISMATCH="$TMP/lanes-1446-mismatch-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_NODE_OTHER_FILE" "$LANES_OP_FILE" >"$LANES_CFG_DEFER_MISMATCH"
+# An OPERATOR credential that also carries HUB_MACHINE_ID: the remote side
+# never resolves operator_token_env, so a deferred spawn on this config
+# still makes zero lanes calls — while a mutant that falls back to the
+# operator file would find a matching id and self-register.
+LANES_OP_ID_FILE="$TMP/lanes-1446-opid.env"
+printf 'OPERATOR_TOKEN=%s\nHUB_MACHINE_ID=desktop\n' "$LANES_OP_VALUE" >"$LANES_OP_ID_FILE"
+chmod 600 "$LANES_OP_ID_FILE"
+LANES_CFG_OPID="$TMP/lanes-1446-opid-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_OP_ID_FILE" "$LANES_CF_FILE" >"$LANES_CFG_OPID"
+# A lanes token whose machine id differs only by case/whitespace — the
+# equality is byte-exact, so these defer too.
+LANES_NODE_DESKTOP_CASE_FILE="$TMP/lanes-node-desktop-case.env"
+printf 'HUB_MACHINE_ID=Desktop \nHUB_TOKEN=%s\n' "$LANES_NODE_DESKTOP_VALUE" >"$LANES_NODE_DESKTOP_CASE_FILE"
+chmod 600 "$LANES_NODE_DESKTOP_CASE_FILE"
+LANES_CFG_DEFER_CASE="$TMP/lanes-1446-case-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_NODE_DESKTOP_CASE_FILE" "$LANES_OP_FILE" >"$LANES_CFG_DEFER_CASE"
+# A whitespace-only mismatch must not be normalized into the deferred
+# machine id. The line terminator is syntax; the trailing space is value.
+LANES_NODE_DESKTOP_SPACE_FILE="$TMP/lanes-node-desktop-space.env"
+printf 'HUB_MACHINE_ID=desktop \nHUB_TOKEN=%s\n' "$LANES_NODE_DESKTOP_VALUE" >"$LANES_NODE_DESKTOP_SPACE_FILE"
+chmod 600 "$LANES_NODE_DESKTOP_SPACE_FILE"
+LANES_CFG_DEFER_SPACE="$TMP/lanes-1446-space-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\noperator_token_env = "%s"\nmachine_id = "desktop"\n' \
+  "$LANES_NODE_DESKTOP_SPACE_FILE" "$LANES_OP_FILE" >"$LANES_CFG_DEFER_SPACE"
+
 lanes_spawn() {
   # NAME [spawn args...] — a forced-local spawn against the #965 hosts.toml.
   # stdout/stderr, both panewire logs and the inbox land in per-case paths;
@@ -3886,7 +4004,7 @@ t1397_remote_spawn() {
     WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
     WRK_FIXTURE_LOG="$TMP/t1397-$name-herdr.log" \
     WRK_SCOPEFUEL_LOG="$TMP/t1397-$name-scopefuel.log" \
-    WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
+    WRK_SSH_BIN="${T1397_SSH_BIN:-$ROOT/tests/fixtures/spillover-ssh}" \
     WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
     WRK_SSH_LOG="$T1397_SSH" WRK_SCP_LOG="$TMP/t1397-$name-scp.log" \
     WRK_SSH_SCENARIO="${T1397_SSH_SCENARIO:-ok}" \
@@ -3980,16 +4098,22 @@ lanes_reap_run() {
 }
 
 lanes_reap_job() {
-  # JOB PANE TAB LANE HUB_LANE [LABEL [MACHINE [ROLE]]] — claim + job.spawned
-  # (+hub_lane/hub_lane_machine when nonempty) + job.completed, all backdated
-  # past the default grace. LABEL defaults to JOB (#994 needs lane != job !=
-  # label so a remove-by-job-id regression cannot pass silently). ROLE
-  # defaults to worker — the claim records it, reap's per-role credential
-  # chain and the --include-builders filter both read it (#1397).
+  # JOB PANE TAB LANE HUB_LANE [LABEL [MACHINE [ROLE [LANE_ROLE]]]] — claim +
+  # job.spawned (+hub_lane/hub_lane_machine/lane_role when HUB_LANE is
+  # nonempty) + job.completed, all backdated past the default grace. LABEL
+  # defaults to JOB (#994 needs lane != job != label so a remove-by-job-id
+  # regression cannot pass silently). ROLE defaults to worker — the claim
+  # records it, and the --include-builders filter reads it (#1397). The
+  # credential chain reads the receipt's lane_role instead (#1438): LANE_ROLE
+  # defaults to ROLE, as a real spawn registers a lane under its own role,
+  # and "-" writes the legacy receipt that carries none.
   local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5" label="${6:-$1}" machine="${7:-mac-work-default}" role="${8:-worker}"
+  local lane_role="${9:-$role}"
   local spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\"}"
   if [[ -n "$hub_lane" ]]; then
-    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"$machine\"}"
+    spawned="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"$machine\""
+    [[ "$lane_role" == - ]] || spawned+=",\"lane_role\":\"$lane_role\""
+    spawned+="}"
   fi
   local claim_role=(--role "$role")
   [[ "$role" == builder ]] && claim_role+=(--parent-lane director-x)
@@ -4002,6 +4126,65 @@ lanes_reap_job() {
     --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
   unset ARBITER_TEST_NOW
 }
+
+lanes_reap_reused_job() {
+  # JOB PANE TAB LANE HUB_LANE LABEL MACHINE LANE_ROLE... — a job id first
+  # claimed as a builder, released, reclaimed by a worker spawn (#1438; the
+  # reap_builder_reclaimed_job shape), whose job.spawned receipts then land in
+  # order, one per LANE_ROLE argument ("-" writes a legacy receipt with no
+  # lane_role), each naming HUB_LANE on MACHINE — then job.completed. The
+  # cumulative claim role stays builder; only the receipts say what the
+  # lane is.
+  local job="$1" pane="$2" tab="$3" lane="$4" hub_lane="$5" label="$6" machine="$7"
+  shift 7
+  local lane_role receipt
+  export ARBITER_TEST_NOW="$LANES_REAP_NOW"
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" claim \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 \
+    --role builder --parent-lane director-x >/dev/null
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" lease \
+    --job "$job" --resource "$TMP/reap-$job" --kind path >/dev/null
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" release \
+    --job "$job" --resource "$TMP/reap-$job" --kind path --force >/dev/null
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" claim --reclaim-released \
+    --job "$job" --lane "$lane" --agent-label "$job" --t T1 >/dev/null
+  for lane_role in "$@"; do
+    receipt="{\"owner_lane\":\"$lane\",\"label\":\"$label\",\"pane_id\":\"$pane\",\"tab_id\":\"$tab\",\"hub_lane\":\"$hub_lane\",\"hub_lane_machine\":\"$machine\""
+    [[ "$lane_role" == - ]] || receipt+=",\"lane_role\":\"$lane_role\""
+    env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.spawned \
+      --payload-json "$receipt}" >/dev/null
+  done
+  env ARBITER_INBOX_ROOT="$LANES_REAP_INBOX" "$ARBITER" event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"$job\",\"pane_id\":\"$pane\"}" >/dev/null
+  unset ARBITER_TEST_NOW
+}
+
+# Asserts one `lanes ls` + `lanes rm LANE` pair reached panewire, each
+# carrying WANT as its only hub token path and never OTHER.
+t1438_assert_rm_chain() {  # LOG WANT OTHER LANE
+  python3 - "$@" <<'PY'
+import sys
+log, want, other, lane = sys.argv[1:5]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+envs = [got[i + 1] for i, x in enumerate(got) if x == "--hub-token-env"]
+assert envs == [want, want], "ls+rm must each carry %r, got %r" % (want, got)
+assert other not in got, "the other credential reached panewire argv: %r" % got
+assert got.count("rm") == 1 and got[got.index("rm") + 1] == lane, \
+    "exactly one rm of %r expected: %r" % (lane, got)
+PY
+}
+# The lane_role the single spawn receipt of NAME carries, or "absent".
+t1438_receipt_lane_role() {  # NAME
+  lanes_spawned_payload "$1" | python3 -c '
+import json, sys
+print(json.loads(sys.stdin.read()).get("lane_role", "absent"))'
+}
+T1438_LS='{"lanes":[{"lane":"%s","machine":"%s","pane":"%s","parent":"work-kairos","sink":false}]}'
+# shellcheck disable=SC2059 # the template is the fixture's own format string
+t1438_ls() { printf "$T1438_LS" "$1" "$2" "$3"; }  # LANE MACHINE PANE
 
 run_lanes_tests() {
   # AC1 — mapped session + --owner: exactly one `lanes add` carrying the
@@ -4599,10 +4782,10 @@ PY
   echo "PASS 1010-lanes N5: parse failure warns could-not-be-parsed, stderr stays silent"
 
   # N7 — mint_task stops loudly at the end of the pre-minted pool
-  # (768001-768799) instead of minting an id the fixture never created, which
+  # (768001-769199) instead of minting an id the fixture never created, which
   # surfaced as a swallowed rc 2 in a later spawn.
   lanes_mint_saved="$(cat "$TMP/mint-seq" 2>/dev/null || echo 768000)"
-  printf '768799\n' >"$TMP/mint-seq"
+  printf '769199\n' >"$TMP/mint-seq"
   set +e
   lanes_mint_out="$(mint_task 2>&1)"
   lanes_mint_rc=$?
@@ -4887,7 +5070,7 @@ PY
   # appear in stderr. GREEN restores the value-free malformed warning.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
   devin_trust_mutant lanes-1037-noidcheck \
-    '      if [[ ! "$lanes_machine" =~ ^[A-Za-z0-9._-]{1,64}$ ]]; then' \
+    "      if ! ascii_re \"\$lanes_machine\" '^[A-Za-z0-9._-]{1,64}\$'; then" \
     '      if false; then'
   WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1037-noidcheck" \
     LANES_CFG_OVERRIDE="$LANES_CFG_INLINE" HERDR_SESSION=default \
@@ -5734,6 +5917,613 @@ PY
     fail "#1397 M13 mutant survived: the worker reap still skips operator_token_env"
   fi
   echo "PASS 1397-lanes M13: re-widening the worker chain goes RED (register + reap)"
+
+  # ------------------------------------------------------------------
+  # hk 1446 — a remote --host builder whose execution host holds a lanes
+  # token bound to the deferred machine id registers its own hub lane: the
+  # remote wrk runs `lanes add` itself, marks its OK line
+  # lane_registered=self, and the initiator skips its add. Every other
+  # shape defers exactly as before.
+  # ------------------------------------------------------------------
+  # AC1 — the execution host holds a matching lanes token: exactly one
+  # `lanes add` runs on THIS side of the defer, carrying the lanes file
+  # (never the operator credential the same config also holds), the
+  # deferred machine id, the spawned pane and --parent. The OK line ends
+  # with lane=L@HOST lane_registered=self and the receipt records the same
+  # lane+machine the deferral would have.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    lanes_spawn b1446-self --role builder --lane b1446-self --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC1: self-registering deferred spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  python3 - "$LANES_CALLS" "$LANES_NODE_DESKTOP_FILE" "$LANES_OP_FILE" "$LANES_CF_FILE" <<'PY' ||
+import sys
+log, lanes_file, op_file, cf_file = sys.argv[1:]
+try:
+    got = open(log, encoding="utf-8").read().splitlines()
+except OSError:
+    raise SystemExit("no lanes call recorded")
+want = ["add", "b1446-self", "--machine", "desktop", "--pane", "w:p1",
+        "--parent", "director-x", "--hub-url", "https://hub.invalid",
+        "--hub-token-env", lanes_file, "--hub-cf-env", cf_file, "--"]
+assert got == want, "self-registration argv mismatch: got=%r want=%r" % (got, want)
+assert op_file not in got, "operator_token_env must never reach the remote side: %r" % got
+PY
+    fail "#1446 AC1: the self-add must run once with the lanes token, never the operator file"
+  grep -q ' lane=b1446-self@desktop lane_registered=self$' "$LANES_OUT" ||
+    fail "#1446 AC1: the OK line must end lane=L@desktop lane_registered=self: $(cat "$LANES_OUT")"
+  lanes_spawned_payload b1446-self | python3 -c '
+import json, sys
+meta = json.loads(sys.stdin.read())
+assert meta["hub_lane"] == "b1446-self" and meta["hub_lane_machine"] == "desktop", meta' ||
+    fail "#1446 AC1: the receipt must still record lane+deferred machine"
+  echo "PASS 1446-lanes AC1: a matching lanes token self-registers the deferred builder lane"
+
+  # AC2 — the token's HUB_MACHINE_ID names another machine (or only differs
+  # by case/whitespace): identical to no token at all — zero lanes calls,
+  # no marker, no warning, and the receipt still records the deferral.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_MISMATCH" \
+    lanes_spawn b1446-mism --role builder --lane b1446-mism --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC2: a mismatched-token deferred spawn must still succeed (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call b1446-mism
+  grep -q ' lane=b1446-mism@desktop$' "$LANES_OUT" ||
+    fail "#1446 AC2: the deferred OK line must be unchanged: $(cat "$LANES_OUT")"
+  ! grep -q 'lane_registered' "$LANES_OUT" ||
+    fail "#1446 AC2: no marker may appear on a mismatched token"
+  ! grep -q 'self-registration' "$LANES_ERR" ||
+    fail "#1446 AC2: a mismatch defers silently: $(cat "$LANES_ERR")"
+  lanes_spawned_payload b1446-mism | python3 -c '
+import json, sys
+meta = json.loads(sys.stdin.read())
+assert meta["hub_lane"] == "b1446-mism" and meta["hub_lane_machine"] == "desktop", meta' ||
+    fail "#1446 AC2: the receipt must still record the deferred lane"
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_CASE" \
+    lanes_spawn b1446-case --role builder --lane b1446-case --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] || fail "#1446 AC2: a case-mismatched token spawn failed"
+  lanes_assert_no_lanes_call b1446-case
+  ! grep -q 'lane_registered' "$LANES_OUT" ||
+    fail "#1446 AC2: the machine-id compare must be byte-exact"
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SPACE" \
+    lanes_spawn b1446-space --role builder --lane b1446-space --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] || fail "#1446 AC2: a whitespace-mismatched token spawn failed"
+  lanes_assert_no_lanes_call b1446-space
+  ! grep -q 'lane_registered' "$LANES_OUT" ||
+    fail "#1446 AC2: a trailing space in HUB_MACHINE_ID must not be trimmed into a match"
+  echo "PASS 1446-lanes AC2: a lanes token naming another machine defers byte-exactly"
+
+  # AC3 — no lanes token at all (operator credential only): byte-for-byte
+  # today's behavior — zero lanes calls, lane=L@HOST ending the OK line,
+  # the deferred receipt. A tester role carrying the flag is refused
+  # outright, so a non-builder seat can never self-register either.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_OP" \
+    lanes_spawn b1446-notok --role builder --lane b1446-notok --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC3: a tokenless deferred spawn must succeed (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call b1446-notok
+  grep -q ' lane=b1446-notok@desktop$' "$LANES_OUT" ||
+    fail "#1446 AC3: the OK line must be identical to today's: $(cat "$LANES_OUT")"
+  # An operator file that DOES carry HUB_MACHINE_ID still cannot
+  # self-register: only lanes_token_env counts on the remote side.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_OPID" \
+    lanes_spawn b1446-opid --role builder --lane b1446-opid --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC3: an operator-credential spawn must succeed (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call b1446-opid
+  ! grep -q 'lane_registered' "$LANES_OUT" ||
+    fail "#1446 AC3: operator_token_env must never self-register"
+  # A tester seat can never self-register either: --lane-defer is
+  # builder-only even on a host holding a matching token.
+  HERDR_SESSION=default LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    lanes_spawn t1446-self --role tester --owner work-kairos --lane-defer desktop
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1446 AC3: --lane-defer on a tester must refuse rc 2 (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_assert_no_lanes_call t1446-self
+  echo "PASS 1446-lanes AC3: no lanes token keeps the deferral byte-identical"
+
+  # AC4 — the self-add is refused by panewire: exactly one warning naming
+  # the failure, the deferral stands (receipt + OK line unchanged), the
+  # spawn still answers 0. The initiator then adds the lane as today.
+  WRK_PANEWIRE_LANES_RC=5 LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    lanes_spawn b1446-addfail --role builder --lane b1446-addfail --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 AC4: a refused self-add must never fail the spawn (rc=$LANES_RC)"
+  [[ "$(grep -cxF 'add' "$LANES_CALLS")" -eq 1 ]] ||
+    fail "#1446 AC4: the self-add must still be attempted once: $(cat "$LANES_CALLS")"
+  [[ "$(grep -c 'self-registration failed' "$LANES_ERR")" -eq 1 ]] ||
+    fail "#1446 AC4: exactly one self-registration warning expected: $(cat "$LANES_ERR")"
+  grep -q ' lane=b1446-addfail@desktop$' "$LANES_OUT" ||
+    fail "#1446 AC4: a failed self-add falls back to the plain deferral: $(cat "$LANES_OUT")"
+  echo "PASS 1446-lanes AC4: a refused self-add warns once and defers"
+
+  # AC5 — the initiator half: the remote OK pane= line carries
+  # lane_registered=self, so THIS host runs zero lanes calls and still
+  # emits lane=L@HOST. The consumed marker never reaches the operator's
+  # line. The stub answers the spawn leg itself and delegates every other
+  # leg to the shared fixture.
+  T1446_SSH_SELFREG="$TMP/t1446-ssh-selfreg"
+  cat >"$T1446_SSH_SELFREG" <<'SH'
+#!/usr/bin/env bash
+remote="${*: -1}"
+if [[ "$remote" == *'wrk spawn'* ]]; then
+  printf '%s\n' "$*" >>"${WRK_SSH_LOG:?}"
+  printf 'OK pane=desktop:p7 host=local model=builder-sol label=fixture status=working landed=yes job=fixture lane=fixture@desktop lane_registered=self\n'
+  exit "${WRK_REMOTE_RC:-0}"
+fi
+exec "${T1446_FIXTURE_SSH:?}" "$@"
+SH
+  chmod +x "$T1446_SSH_SELFREG"
+  T1446_FIXTURE_SSH="$ROOT/tests/fixtures/spillover-ssh" T1397_SSH_BIN="$T1446_SSH_SELFREG" \
+    t1397_remote_spawn b1446-initskip
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1446 AC5: a self-registered remote spawn failed (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  [[ ! -s "$T1397_CALLS" ]] ||
+    fail "#1446 AC5: the initiator must make zero lanes calls after lane_registered=self: $(cat "$T1397_CALLS")"
+  grep -q ' lane=b1446-initskip@desktop$' "$T1397_OUT" ||
+    fail "#1446 AC5: the emitted line must keep lane=L@desktop: $(cat "$T1397_OUT")"
+  ! grep -q 'lane_registered' "$T1397_OUT" ||
+    fail "#1446 AC5: the consumed marker must not reach the emitted line: $(cat "$T1397_OUT")"
+  echo "PASS 1446-lanes AC5: lane_registered=self skips the initiator add"
+
+  # AC6 — a forged marker never counts: the same text on a non-OK stdout
+  # line and inside an OK-line field VALUE leaves the initiator's add
+  # untouched. Only the OK pane= line's own lane_registered=self field is
+  # the remote's word.
+  T1446_SSH_FORGED="$TMP/t1446-ssh-forged"
+  cat >"$T1446_SSH_FORGED" <<'SH'
+#!/usr/bin/env bash
+remote="${*: -1}"
+if [[ "$remote" == *'wrk spawn'* ]]; then
+  printf '%s\n' "$*" >>"${WRK_SSH_LOG:?}"
+  printf 'lane_registered=self\n'
+  printf 'wrk: note: lane_registered=self in a warning-shaped line\n'
+  printf 'OK pane=desktop:p7 host=local model=builder-sol label=lane_registered=self-ish status=working landed=yes job=fixture note=lane_registered=self lane=fixture@desktop\n'
+  exit 0
+fi
+exec "${T1446_FIXTURE_SSH:?}" "$@"
+SH
+  chmod +x "$T1446_SSH_FORGED"
+  T1446_FIXTURE_SSH="$ROOT/tests/fixtures/spillover-ssh" T1397_SSH_BIN="$T1446_SSH_FORGED" \
+    t1397_remote_spawn b1446-forged
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1446 AC6: the forged-marker spawn failed (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -qxF 'add' "$T1397_CALLS" ||
+    fail "#1446 AC6: a forged marker must not suppress the initiator add: $(cat "$T1397_CALLS")"
+  grep -q ' lane=b1446-forged@desktop$' "$T1397_OUT" ||
+    fail "#1446 AC6: the confirmed add keeps lane=L@desktop: $(cat "$T1397_OUT")"
+  echo "PASS 1446-lanes AC6: only the OK line's own marker field counts"
+
+  # AC7 — WRK_LANE_STRICT=1: a self-registered lane is confirmed, so the
+  # strict gate must not fire.
+  WRK_LANE_STRICT=1 \
+    T1446_FIXTURE_SSH="$ROOT/tests/fixtures/spillover-ssh" T1397_SSH_BIN="$T1446_SSH_SELFREG" \
+    t1397_remote_spawn b1446-strict
+  [[ "$T1397_RC" -eq 0 ]] ||
+    fail "#1446 AC7: a self-registered lane must not strict-exit (rc=$T1397_RC): $(cat "$T1397_ERR")"
+  grep -q ' lane=b1446-strict@desktop$' "$T1397_OUT" ||
+    fail "#1446 AC7: the emitted line must keep lane=L@desktop: $(cat "$T1397_OUT")"
+  echo "PASS 1446-lanes AC7: WRK_LANE_STRICT accepts a self-registered lane"
+
+  # AC8 — reap on the execution host removes the self-registered lane
+  # through the same machine+pane guard, carrying the node lanes token the
+  # builder chain resolves first.
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1446"
+  lanes_reap_job j1446-reap w1:p14 w1:t14 b1446-x lane-1446-self lbl-1446 desktop builder
+  WRK_PANEWIRE_LANES_LS='{"lanes":[{"lane":"lane-1446-self","machine":"desktop","pane":"w1:p14","parent":"director-x","sink":false}]}' \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    lanes_reap_run 1446-reap --lane b1446-x --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1446 AC8: apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_NODE_DESKTOP_FILE" "$LANES_OP_FILE" lane-1446-self ||
+    fail "#1446 AC8: reap must remove the self-registered lane with its lanes token"
+  echo "PASS 1446-lanes AC8: reap removes a self-registered lane with the lanes token"
+
+  # M1 'the machine-id equality check guards the self-add': dropping it
+  # lets a token bound to another machine self-register — AC2's zero-call
+  # assertion would then go RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1446-nomatch \
+    '  [[ "$lanes_machine" == "$LANE_DEFER" ]] || return 1' \
+    '  :'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-nomatch" \
+    LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_MISMATCH" \
+    lanes_spawn b1446-m1 --role builder --lane b1446-m1 --parent director-x --lane-defer desktop
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#1446 M1 mutant survived: the mismatched token still defers"
+  fi
+  echo "PASS 1446-lanes M1: dropping the machine-id check goes RED"
+
+  # M2 'the remote side never reads operator_token_env': a mutant that
+  # falls back to the operator file self-registers on a tokenless host —
+  # AC3's zero-call assertion would then go RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1446-opcred \
+    '  [[ -n "$lanes_env" ]] || return 1' \
+    '  [[ -n "$lanes_env" ]] || lanes_env="$(spillover_value hub operator_token_env 2>/dev/null || true)"
+  [[ -n "$lanes_env" ]] || return 1'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-opcred" \
+    LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_OPID" \
+    lanes_spawn b1446-m2 --role builder --lane b1446-m2 --parent director-x --lane-defer desktop
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#1446 M2 mutant survived: operator_token_env still cannot self-register"
+  fi
+  echo "PASS 1446-lanes M2: an operator fallback on the remote goes RED"
+
+  # M3 'the initiator honors the marker': a mutant that ignores
+  # lane_registered=self adds the lane a second time — AC5's zero-call
+  # assertion would then go RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1446-nomarker \
+    '      if [[ "$remote_selfreg" == yes ]]; then' \
+    '      if false; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-nomarker" \
+    T1446_FIXTURE_SSH="$ROOT/tests/fixtures/spillover-ssh" T1397_SSH_BIN="$T1446_SSH_SELFREG" \
+    t1397_remote_spawn b1446-m3
+  if [[ ! -s "$T1397_CALLS" ]]; then
+    fail "#1446 M3 mutant survived: the initiator still skips the marked lane"
+  fi
+  echo "PASS 1446-lanes M3: ignoring the self-registration marker goes RED"
+
+  # B1 AC1 — the execution host only self-registers once it has a durable
+  # arbiter job record. A missing arbiter leaves the existing deferred lane
+  # outcome unchanged: no remote lanes add and no lane_registered marker.
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$TMP/absent-arbiter-b1446" \
+    lanes_spawn b1446-nojob --role builder --lane b1446-nojob --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1446 B1 AC1: a missing arbiter must not fail the deferred spawn (rc=$LANES_RC)"
+  lanes_assert_no_lanes_call b1446-nojob
+  grep -q ' lane=b1446-nojob@desktop$' "$LANES_OUT" ||
+    fail "#1446 B1 AC1: no-job deferral must keep the ordinary lane field: $(cat "$LANES_OUT")"
+  ! grep -q 'lane_registered=self' "$LANES_OUT" ||
+    fail "#1446 B1 AC1: a deferred lane without a job receipt must not self-register"
+  echo "PASS 1446 B1 AC1: no arbiter job record keeps the remote deferral"
+
+  # B1 AC2 — if the self-add succeeds but job.spawned fails, compensate
+  # through the same builder credential chain and machine+pane guard before
+  # returning rc 2. The stateful fixture marks the row on add and deletes it
+  # only after the guarded rm succeeds.
+  T1446_SELF_LANE_STATE="$TMP/t1446-self-lane-state"
+  T1446_STATEFUL_PANEWIRE="$TMP/t1446-stateful-panewire"
+  cat >"$T1446_STATEFUL_PANEWIRE" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+fixture="${LANES_PANEWIRE_FIXTURE:?}"
+state="${LANES_PANEWIRE_STATE:?}"
+lane="${LANES_PANEWIRE_LANE:?}"
+if [[ "${1:-}" == lanes && "${2:-}" == ls ]]; then
+  if [[ -e "$state" ]]; then
+    WRK_PANEWIRE_LANES_LS="{\"lanes\":[{\"lane\":\"$lane\",\"machine\":\"desktop\",\"pane\":\"w:p1\",\"parent\":\"director-x\",\"sink\":false}]}"
+  else
+    WRK_PANEWIRE_LANES_LS='{"lanes":[]}'
+  fi
+  export WRK_PANEWIRE_LANES_LS
+fi
+set +e
+"$fixture" "$@"
+rc=$?
+set -e
+if [[ "$rc" -eq 0 && "${1:-}" == lanes && "${2:-}" == add ]]; then : >"$state"; fi
+if [[ "$rc" -eq 0 && "${1:-}" == lanes && "${2:-}" == rm ]]; then rm -f "$state"; fi
+exit "$rc"
+SH
+  chmod +x "$T1446_STATEFUL_PANEWIRE"
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$T1397_FAIL_ARBITER" PANEWIRE="$T1446_STATEFUL_PANEWIRE" \
+    LANES_PANEWIRE_FIXTURE="$ROOT/tests/fixtures/panewire" \
+    LANES_PANEWIRE_STATE="$T1446_SELF_LANE_STATE" \
+    LANES_PANEWIRE_LANE=b1446-receipt \
+    lanes_spawn b1446-receipt --role builder --lane b1446-receipt --parent director-x --lane-defer desktop
+  PANEWIRE="$ROOT/tests/fixtures/panewire"
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1446 B1 AC2: a deferred receipt failure must answer 2 (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  if grep -q '^OK pane=' "$LANES_OUT"; then
+    fail "#1446 B1 AC2: no OK line may survive a failed deferred receipt: $(cat "$LANES_OUT")"
+  fi
+  [[ ! -e "$T1446_SELF_LANE_STATE" ]] ||
+    fail "#1446 B1 AC2: the guarded self-add compensation must remove the fixture row"
+  python3 - "$LANES_CALLS" "$LANES_NODE_DESKTOP_FILE" <<'PY' ||
+import sys
+log, token = sys.argv[1:]
+rows = open(log, encoding="utf-8").read().splitlines()
+calls, call = [], []
+for row in rows:
+    if row == "--":
+        calls.append(call)
+        call = []
+    else:
+        call.append(row)
+assert [args[0] for args in calls] == ["add", "ls", "rm"], calls
+add, listing, remove = calls
+assert add[1] == "b1446-receipt", add
+assert add[add.index("--machine") + 1] == "desktop", add
+assert add[add.index("--pane") + 1] == "w:p1", add
+assert remove[1] == "b1446-receipt", remove
+assert all(args[args.index("--hub-token-env") + 1] == token for args in calls), calls
+PY
+    fail "#1446 B1 AC2: one lanes-token add must be followed by guarded ls+rm"
+  echo "PASS 1446 B1 AC2: receipt failure removes the self-added guarded row"
+
+  # B1 AC3 — exercise the receipt-payload preparation failure before the
+  # arbiter event call. It must use the same guarded compensation as an event
+  # write failure.
+  T1446_PYTHON_DIR="$TMP/t1446-python"
+  T1446_FAIL_PYTHON="$T1446_PYTHON_DIR/python3"
+  T1446_REAL_PYTHON="$(command -v python3)"
+  mkdir -p "$T1446_PYTHON_DIR"
+  cat >"$T1446_FAIL_PYTHON" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+real_python="${WRK_T1446_REAL_PYTHON:?}"
+if [[ "${1:-}" == "-" ]]; then
+  script="$(mktemp)"
+  cat >"$script"
+  if grep -qF 'pane_id, label, profile, workspace, tab_id, keep, task_id, hub_lane, hub_lane_machine, lane_role = sys.argv[1:]' "$script"; then
+    rm -f "$script"
+    exit 1
+  fi
+  set +e
+  "$real_python" "$@" <"$script"
+  rc=$?
+  set -e
+  rm -f "$script"
+  exit "$rc"
+fi
+exec "$real_python" "$@"
+SH
+  chmod +x "$T1446_FAIL_PYTHON"
+  LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$ARBITER" PANEWIRE="$T1446_STATEFUL_PANEWIRE" \
+    LANES_PANEWIRE_FIXTURE="$ROOT/tests/fixtures/panewire" \
+    LANES_PANEWIRE_STATE="$T1446_SELF_LANE_STATE" \
+    LANES_PANEWIRE_LANE=b1446-prep-fail \
+    WRK_T1446_REAL_PYTHON="$T1446_REAL_PYTHON" PATH="$T1446_PYTHON_DIR:$PATH" \
+    lanes_spawn b1446-prep-fail --role builder --lane b1446-prep-fail --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 2 ]] ||
+    fail "#1446 B1 AC3: receipt preparation failure must answer 2 (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ ! -e "$T1446_SELF_LANE_STATE" ]] ||
+    fail "#1446 B1 AC3: preparation failure must remove the self-added fixture row"
+  python3 - "$LANES_CALLS" "$LANES_NODE_DESKTOP_FILE" <<'PY' ||
+import sys
+log, token = sys.argv[1:]
+rows = open(log, encoding="utf-8").read().splitlines()
+calls, call = [], []
+for row in rows:
+    if row == "--":
+        calls.append(call)
+        call = []
+    else:
+        call.append(row)
+assert [args[0] for args in calls] == ["add", "ls", "rm"], calls
+assert all(args[args.index("--hub-token-env") + 1] == token for args in calls), calls
+PY
+    fail "#1446 B1 AC3: preparation failure must add then guardedly remove with the lanes token"
+  echo "PASS 1446 B1 AC3: receipt preparation failure compensates the self-add"
+
+  # Mutant B1 M1 — drop the job-record gate. AC1 then observes a remote add
+  # despite the missing receipt.
+# shellcheck disable=SC2016 # these literals are bin/wrk source anchors
+  devin_trust_mutant lanes-1446-no-job-gate \
+    '      if [[ "$ROLE" == builder && "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] &&
+         hub_lane_self_register; then' \
+    '      if [[ "$ROLE" == builder ]] &&
+         hub_lane_self_register; then'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-no-job-gate" \
+    LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$TMP/absent-arbiter-b1446-mut" \
+    lanes_spawn b1446-m1-job --role builder --lane b1446-m1-job --parent director-x --lane-defer desktop
+  if [[ ! -s "$LANES_CALLS" ]]; then
+    fail "#1446 B1 M1 mutant survived: dropping the job-record gate still deferred"
+  fi
+  echo "PASS 1446 B1 M1: dropping the job-record gate goes RED"
+
+  # Mutant B1 M2 — skip removal for a self-registered deferred lane. AC2's
+  # stateful fixture then retains the unreceipted row.
+# shellcheck disable=SC2016 # this literal is a bin/wrk source anchor
+  devin_trust_mutant lanes-1446-skip-self-rm \
+    '    [[ "${HUB_LANE_SELF:-0}" -eq 1 ]] || return 0' \
+    '    return 0'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1446-skip-self-rm" \
+    LANES_MODEL=builder-sol LANES_CFG_OVERRIDE="$LANES_CFG_DEFER_SELF" \
+    LANES_ARBITER_BIN="$T1397_FAIL_ARBITER" PANEWIRE="$T1446_STATEFUL_PANEWIRE" \
+    LANES_PANEWIRE_FIXTURE="$ROOT/tests/fixtures/panewire" \
+    LANES_PANEWIRE_STATE="$T1446_SELF_LANE_STATE" \
+    LANES_PANEWIRE_LANE=b1446-receipt \
+    lanes_spawn b1446-m2-rm --role builder --lane b1446-receipt --parent director-x --lane-defer desktop
+  if [[ ! -e "$T1446_SELF_LANE_STATE" ]]; then
+    fail "#1446 B1 M2 mutant survived: skipping guarded rm still removed the lane"
+  fi
+  rm -f "$T1446_SELF_LANE_STATE"
+  echo "PASS 1446 B1 M2: skipping self-add compensation goes RED"
+
+  # ------------------------------------------------------------------
+  # #1438 — reap resolves a lane's credential chain from the role that
+  # registered it (the job.spawned receipt's lane_role), not from the
+  # cumulative claim role: a job id first claimed as builder, released and
+  # reused by a worker spawn must never lose its worker lane to the
+  # operator credential
+  # ------------------------------------------------------------------
+  # AC1 — claim as builder, release, reclaim as worker: the cumulative role
+  # is builder (so --include-builders is needed), but the receipt says the
+  # lane is a worker lane. Both the ls confirmation and the rm carry the
+  # hub_token file of the worker chain — never the operator credential the
+  # same config also holds.
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1438"
+  lanes_reap_reused_job j1438-reuse w1:p10 w1:t10 own-1438a lane-1438-reuse lbl-1438a mac-work-default worker
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-reuse mac-work-default w1:p10)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac1 --lane own-1438a --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC1: apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j1438-reuse ' "$LANES_REAP_OUT" ||
+    fail "#1438 AC1: the reused job must close: $(cat "$LANES_REAP_OUT")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_OP_FILE" lane-1438-reuse ||
+    fail "#1438 AC1: a builder-then-worker job id must remove its worker lane with the hub_token file, never the operator credential"
+  echo "PASS 1438-lanes AC1: a reused job id's worker lane is removed with the worker chain"
+
+  # AC2 — the reverse: a builder spawn receipt (lane_role builder) keeps the
+  # builder chain on the same config, so the narrower reading never reaches a
+  # real builder lane. (AC1c pins the operator-only host.)
+  lanes_reap_job j1438-bld w1:p11 w1:t11 own-1438b lane-1438-bld lbl-1438b mac-work-default builder
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-bld mac-work-default w1:p11)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac2 --lane own-1438b --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC2: apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_OP_FILE" "$LANES_TOKEN_FILE" lane-1438-bld ||
+    fail "#1438 AC2: a builder lane receipt must keep the operator credential"
+  echo "PASS 1438-lanes AC2: a builder receipt still removes with the builder chain"
+
+  # AC3 — a legacy receipt (hub_lane, no lane_role) is the worker chain even
+  # when the claim says builder: on a host holding both credentials it takes
+  # the hub_token file; on an operator-only host nothing is called, the
+  # existing worker warning names the missing credential, and the job still
+  # closes — the row stays for the lanes-missing audit.
+  lanes_reap_job j1438-legacy w1:p12 w1:t12 own-1438c lane-1438-legacy lbl-1438c mac-work-default builder -
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-legacy mac-work-default w1:p12)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac3a --lane own-1438c --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC3: legacy apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_OP_FILE" lane-1438-legacy ||
+    fail "#1438 AC3: a legacy receipt must use the worker chain"
+  lanes_reap_job j1438-legacy-op w1:p13 w1:t13 own-1438e lane-1438-legacy-op lbl-1438e mac-personal builder -
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-legacy-op mac-personal w1:p13)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_OP" \
+    lanes_reap_run 1438-ac3b --lane own-1438e --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC3: legacy operator-only apply failed: $(cat "$LANES_REAP_ERR")"
+  grep -q '^closed job=j1438-legacy-op ' "$LANES_REAP_OUT" ||
+    fail "#1438 AC3: the legacy job must still close: $(cat "$LANES_REAP_OUT")"
+  [[ ! -s "$LANES_RM_LOG" ]] ||
+    fail "#1438 AC3: an operator-only host must not ls/rm a legacy lane: $(cat "$LANES_RM_LOG")"
+  grep -q "hub lane 'lane-1438-legacy-op' not removed (hub_url missing or neither hub_token_env nor lanes_token_env set" "$LANES_REAP_ERR" ||
+    fail "#1438 AC3: the existing worker warning must name the skipped removal: $(cat "$LANES_REAP_ERR")"
+  echo "PASS 1438-lanes AC3: a legacy receipt takes the worker chain (operator-only host skips with the warning)"
+
+  # AC4 — a respawned job carries two receipts for one lane: the newest one
+  # owns the live lane, in both orders. builder-then-worker takes the worker
+  # chain, worker-then-builder the builder chain.
+  lanes_reap_reused_job j1438-respawn-w w1:p14 w1:t14 own-1438d lane-1438-respawn-w lbl-1438d mac-work-default builder worker
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-respawn-w mac-work-default w1:p14)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac4a --lane own-1438d --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC4: respawn apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_TOKEN_FILE" "$LANES_OP_FILE" lane-1438-respawn-w ||
+    fail "#1438 AC4: the newest (worker) receipt must win over the older builder one"
+  lanes_reap_reused_job j1438-respawn-b w1:p15 w1:t15 own-1438f lane-1438-respawn-b lbl-1438f mac-work-default worker builder
+  WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-respawn-b mac-work-default w1:p15)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-ac4b --lane own-1438f --apply --include-builders
+  [[ "$LANES_REAP_RC" -eq 0 ]] ||
+    fail "#1438 AC4: respawn apply failed: $(cat "$LANES_REAP_ERR")"
+  t1438_assert_rm_chain "$LANES_RM_LOG" "$LANES_OP_FILE" "$LANES_TOKEN_FILE" lane-1438-respawn-b ||
+    fail "#1438 AC4: the newest (builder) receipt must win over the older worker one"
+  echo "PASS 1438-lanes AC4: the newest job.spawned receipt decides the chain, in both orders"
+
+  # AC5 — the receipt writer. lane_role is the normalized registration role,
+  # and rides only with a hub_lane: a worker, a tester seat (leaf worker lane),
+  # a builder and a --lane-defer builder (the remote execution host's path)
+  # each record theirs; a spawn that registered no lane leaves the receipt
+  # exactly as before.
+  HERDR_SESSION=default lanes_spawn w1438-worker --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: worker spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$(t1438_receipt_lane_role w1438-worker)" == worker ]] ||
+    fail "#1438 AC5: a worker receipt must record lane_role worker"
+  HERDR_SESSION=default lanes_spawn w1438-tester --owner work-kairos --role tester
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: tester spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$(t1438_receipt_lane_role w1438-tester)" == worker ]] ||
+    fail "#1438 AC5: a tester seat registers a worker lane and must record lane_role worker"
+  LANES_CFG_OVERRIDE="$LANES_CFG_OP" LANES_MODEL=builder-sol \
+    lanes_spawn b1438-builder --role builder --lane b1438-builder --parent director-x
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: builder spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$(t1438_receipt_lane_role b1438-builder)" == builder ]] ||
+    fail "#1438 AC5: a builder receipt must record lane_role builder"
+  LANES_MODEL=builder-sol HERDR_SESSION=default \
+    lanes_spawn b1438-defer --role builder --lane b1438-defer --parent director-x --lane-defer desktop
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: deferred builder spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  [[ "$(t1438_receipt_lane_role b1438-defer)" == builder ]] ||
+    fail "#1438 AC5: a --lane-defer builder receipt must record lane_role builder"
+  HERDR_SESSION=worker lanes_spawn w1438-nolane --owner work-kairos
+  [[ "$LANES_RC" -eq 0 ]] ||
+    fail "#1438 AC5: unmapped worker spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+  lanes_spawned_payload w1438-nolane | python3 -c '
+import json, sys
+payload = json.loads(sys.stdin.read())
+assert set(payload) == {"pane_id", "label", "profile", "workspace", "tab_id", "task_id"}, payload' ||
+    fail "#1438 AC5: a receipt without a hub_lane must keep exactly its pre-change fields"
+  echo "PASS 1438-lanes AC5: lane_role is recorded with the lane, by every receipt writer path"
+
+  # -- #1438 assertion-RED mutants -----------------------------------------
+  # M1: the cumulative claim role printed as the 9th field again — AC1's
+  # reused worker lane then carries the operator credential.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1438-cumulative \
+    'spawned_hub_lane_machine or "-", spawned_lane_role if spawned_hub_lane else "-", sep="\t")' \
+    'spawned_hub_lane_machine or "-", role or "-", sep="\t")'
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1438-m1"
+  lanes_reap_reused_job j1438-m1 w1:p10 w1:t10 own-1438m1 lane-1438-m1 lbl-1438m1 mac-work-default worker
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1438-cumulative" \
+    WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-m1 mac-work-default w1:p10)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-m1 --lane own-1438m1 --apply --include-builders
+  if ! grep -qxF "$LANES_OP_FILE" "$LANES_RM_LOG"; then
+    fail "#1438 M1 mutant survived: the cumulative role no longer reaches the worker lane"
+  fi
+  echo "PASS 1438-lanes M1: printing the cumulative role as the 9th field goes RED"
+
+  # M2: lane_role dropped from the receipt — every spawn then writes a
+  # receipt AC5 rejects, and reap would read every builder lane as legacy.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1438-nolanerole \
+    '    receipt["lane_role"] = lane_role' \
+    '    pass'
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1438-nolanerole" \
+    LANES_CFG_OVERRIDE="$LANES_CFG_OP" LANES_MODEL=builder-sol \
+    lanes_spawn b1438-m2 --role builder --lane b1438-m2 --parent director-x
+  [[ "$LANES_RC" -eq 0 ]] || fail "#1438 M2: mutant builder spawn failed: $(cat "$LANES_ERR")"
+  if [[ "$(t1438_receipt_lane_role b1438-m2)" != absent ]]; then
+    fail "#1438 M2 mutant survived: the receipt still carries lane_role"
+  fi
+  echo "PASS 1438-lanes M2: dropping lane_role from the receipt goes RED"
+
+  # M3: lane_role read from the oldest job.spawned instead of the newest —
+  # AC4's builder-then-worker respawn then removes the lane with operator.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1438-oldest \
+    '            spawned_lane_role = "builder" if payload.get("lane_role") == "builder" else "worker"' \
+    '            spawned_lane_role = spawned_lane_role or ("builder" if payload.get("lane_role") == "builder" else "worker")'
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1438-m3"
+  lanes_reap_reused_job j1438-m3 w1:p14 w1:t14 own-1438m3 lane-1438-m3 lbl-1438m3 mac-work-default builder worker
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1438-oldest" \
+    WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-m3 mac-work-default w1:p14)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-m3 --lane own-1438m3 --apply --include-builders
+  if ! grep -qxF "$LANES_OP_FILE" "$LANES_RM_LOG"; then
+    fail "#1438 M3 mutant survived: the oldest receipt no longer decides the chain"
+  fi
+  echo "PASS 1438-lanes M3: reading lane_role from the oldest receipt goes RED"
+
+  # M4: a legacy receipt inheriting the cumulative claim role — AC3's legacy
+  # builder-claimed lane then takes the operator credential again.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant lanes-1438-legacyrole \
+    'spawned_lane_role = "builder" if payload.get("lane_role") == "builder" else "worker"' \
+    'spawned_lane_role = "builder" if payload.get("lane_role", role) == "builder" else "worker"'
+  LANES_REAP_INBOX="$TMP/lanes-reap-inbox-1438-m4"
+  lanes_reap_job j1438-m4 w1:p12 w1:t12 own-1438m4 lane-1438-m4 lbl-1438m4 mac-work-default builder -
+  WRK_UNDER_TEST="$TMP/mut-wrk-lanes-1438-legacyrole" \
+    WRK_PANEWIRE_LANES_LS="$(t1438_ls lane-1438-m4 mac-work-default w1:p12)" \
+    LANES_REAP_CFG_OVERRIDE="$LANES_CFG_WBOTH" \
+    lanes_reap_run 1438-m4 --lane own-1438m4 --apply --include-builders
+  if ! grep -qxF "$LANES_OP_FILE" "$LANES_RM_LOG"; then
+    fail "#1438 M4 mutant survived: a legacy receipt no longer inherits the claim role"
+  fi
+  echo "PASS 1438-lanes M4: a legacy receipt inheriting the claim role goes RED"
 }
 
 if [[ "${WRK_TEST_ONLY_LANES:-0}" -eq 1 ]]; then
@@ -6323,6 +7113,100 @@ for shell_err_pair in "start-not-ready:1:agent_not_ready" "start-pane-unavailabl
   grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "$shell_err_scenario leaked its pane"
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "$shell_err_scenario delivered a brief"; fi
 done
+
+# hk 1895: a failed spawn saves the pane's screen into the job dir (mode 0600,
+# never echoed to stdout/stderr), still closes the pane and keeps rc=1.
+T1895_JOBDIR="$TMP/inbox/fixture"
+T1895_SCREEN="$T1895_JOBDIR/spawn-failure-screen.txt"
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_out="$(umask 002; TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_rc=$?
+set -e
+[[ "$t1895_rc" -eq 1 ]] || fail "1895 screen case expected rc=1, got $t1895_rc: $t1895_out"
+[[ -f "$T1895_SCREEN" ]] ||
+  fail "1895 failed spawn left no spawn-failure-screen.txt: $t1895_out"
+grep -q 'fixture welcome screen' "$T1895_SCREEN" ||
+  fail "1895 screen file lost the fixture screen text"
+grep -q 'ACTUAL SCREEN LAST LINE' "$T1895_SCREEN" ||
+  fail "1895 screen file lost the screen tail"
+[[ "$(stat -c %a "$T1895_SCREEN" 2>/dev/null || stat -f %Lp "$T1895_SCREEN")" == 600 ]] ||
+  fail "1895 screen file must be mode 0600 under a loose umask"
+grep -q "wrk: saved failed pane screen to $T1895_SCREEN" <<<"$t1895_out" ||
+  fail "1895 lost the saved-screen line: $t1895_out"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "1895 must still close the failed pane"
+if grep -q 'fixture welcome screen\|ACTUAL SCREEN LAST LINE' <<<"$t1895_out"; then
+  fail "1895 leaked the pane screen to stdout/stderr"
+fi
+
+# WRK_KEEP_FAILED_PANE=1 captures the same file but leaves the pane up.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_keep_out="$(WRK_KEEP_FAILED_PANE=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_keep_rc=$?
+set -e
+[[ "$t1895_keep_rc" -eq 1 ]] ||
+  fail "1895 keep case expected rc=1, got $t1895_keep_rc: $t1895_keep_out"
+[[ -f "$T1895_SCREEN" ]] ||
+  fail "1895 keep case left no spawn-failure-screen.txt: $t1895_keep_out"
+if grep -q '^pane close ' "$TMP/herdr.log"; then
+  fail "WRK_KEEP_FAILED_PANE=1 still closed the pane"
+fi
+grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close w:t1' <<<"$t1895_keep_out" ||
+  fail "1895 keep case lost the kept-pane line: $t1895_keep_out"
+
+# Any other value behaves as unset: the pane is closed.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_yes_out="$(WRK_KEEP_FAILED_PANE=yes TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_yes_rc=$?
+set -e
+[[ "$t1895_yes_rc" -eq 1 ]] || fail "1895 keep=yes case expected rc=1, got $t1895_yes_rc"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+  fail "WRK_KEEP_FAILED_PANE=yes must behave as unset and close the pane"
+if grep -q 'kept failed pane' <<<"$t1895_yes_out"; then
+  fail "WRK_KEEP_FAILED_PANE=yes must not print the kept-pane line"
+fi
+
+# A pane read that fails is best-effort: rc and the close are unchanged and at
+# most one warn line is printed; the saved-screen line is absent.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_readfail_out="$(WRK_FIXTURE_PANE_READ200_FAIL=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_readfail_rc=$?
+set -e
+[[ "$t1895_readfail_rc" -eq 1 ]] ||
+  fail "1895 read-fail case expected rc=1, got $t1895_readfail_rc: $t1895_readfail_out"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+  fail "1895 read-fail case must still close the pane"
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -le 1 ]] ||
+  fail "1895 read-fail case printed more than one warn line: $t1895_readfail_out"
+if grep -q 'saved failed pane screen' <<<"$t1895_readfail_out"; then
+  fail "1895 read-fail case must not claim a saved screen"
+fi
+
+# Two failures of the same job id keep both files, the first untouched.
+T1895_DUP_JOBDIR="$TMP/inbox/t1895-dup"
+rm -rf "$T1895_DUP_JOBDIR"
+for t1895_n in 1 2; do
+  : >"$TMP/herdr.log"
+  set +e
+  TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus --job t1895-dup >/dev/null 2>&1
+  t1895_dup_rc=$?
+  set -e
+  [[ "$t1895_dup_rc" -eq 1 ]] || fail "1895 dup failure $t1895_n expected rc=1, got $t1895_dup_rc"
+done
+[[ -f "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" &&
+   -f "$T1895_DUP_JOBDIR/spawn-failure-screen-2.txt" ]] ||
+  fail "1895 second failure must write spawn-failure-screen-2.txt"
+grep -q 'fixture welcome screen' "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" ||
+  fail "1895 first screen file was overwritten"
+echo "PASS hk1895 failed-pane screen capture and WRK_KEEP_FAILED_PANE"
+
 
 # #609: an accepted `agent start` whose binary never reaches the pane
 # foreground — the m1b shape, zsh answered "command not found: codex" — must
@@ -9684,6 +10568,7 @@ assert event["payload"] == {
 PY
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" escalate builder-opus-job --question 'need parent decision' >/dev/null
+seed_join_round "$ARBITER_INBOX_ROOT" builder-opus-job
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" joined builder-opus-job --pr https://example.invalid/pr/1 --head deadbeef --report "$BUILDER_REPORT" >/dev/null
 python3 - "$ARBITER_INBOX_ROOT/builder-opus-job/events" <<'PY'
@@ -9809,7 +10694,9 @@ echo "PASS builder-parent-and-director-lane-guards"
 for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
   builder-luna-max builder-kimi-high builder-kimi-max \
-  builder-grok-low builder-grok-medium builder-grok-xhigh; do
+  builder-grok-low builder-grok-medium builder-grok-xhigh \
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
+  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -9836,7 +10723,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -9890,6 +10777,7 @@ arb lease --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind
 arb release --job builder-reclaim-job --resource builder-reclaim-resource-2 --kind path --force >/dev/null
 arb claim --job builder-reclaim-job --lane builder-new-lane --agent-label builder-new-label --t T1 \
   --role builder --parent-lane parent-new --reclaim-released >/dev/null
+seed_join_round "$ARBITER_INBOX_ROOT" builder-reclaim-job
 env ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" XDG_DATA_HOME="$XDG_DATA_HOME" \
   "$WRK" joined builder-reclaim-job --pr https://example.invalid/pr/2 --head feedface --report "$BUILDER_REPORT" >/dev/null
 python3 - "$ARBITER_INBOX_ROOT/builder-reclaim-job/events" <<'PY'
@@ -9906,7 +10794,8 @@ builder_sol_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sol --rol
 grep -q 'model=builder-sol' <<<"$builder_sol_out"
 grep -q -- '-m gpt-6.1-sol' "$TMP/herdr.log" ||
   fail "builder-sol must launch gpt-6.1-sol (#1026): $(cat "$TMP/herdr.log")"
-# 2026-09-26 (decision 4088 B): a builder seat never takes a max rung —
+# 2026-09-26 (decision 4088 B): builder-sol defaults to the high rung (the
+# no-max seat refusal was repealed by hk 1863/hk 1864; the default stays high) —
 # builder-sol runs codex-sol at effort high and consults the catalog at high.
 grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
   fail "builder-sol must launch codex-sol at effort high: $(cat "$TMP/herdr.log")"
@@ -9940,10 +10829,12 @@ sol61_case codex-sol max
 sol61_case codex-max max
 sol61_case builder-sol high --role builder --lane sol61-builder-lane --parent parent-lane
 sol61_case captain-sol high --role builder --lane sol61-captain-lane --parent parent-lane
-# The E6 builder rungs are switched spellings too (builder-sol-max is seat-closed
-# — its refusal is asserted in the #704 block below).
+# The E6 builder rungs are switched spellings too (builder-sol-max included
+# since hk 1864 opened the max builder seat).
 SCOPEFUEL_E6_ARM=codex-sol@high sol61_case builder-sol-high high --role builder --lane sol61-e6h-lane --parent parent-lane
+SCOPEFUEL_E6_ARM=codex-sol@max sol61_case builder-sol-max max --role builder --lane sol61-e6x-lane --parent parent-lane
 SCOPEFUEL_E6_ARM=codex-sol@medium sol61_case builder-sol-medium medium --role builder --lane sol61-e6m-lane --parent parent-lane
+SCOPEFUEL_E6_ARM=codex-sol@low sol61_case builder-sol-low low --role builder --lane sol61-e6l-lane --parent parent-lane
 echo "PASS 1026-AC1-switched-spellings-carry-gpt-6.1-sol"
 
 # AC2 — the rollback spellings pin the literal gpt-6-sol even though the fake
@@ -10184,7 +11075,8 @@ echo "PASS builder-luna E3 profile launches codex-luna argv at xhigh"
 # task #921 (operator report 2026-09-29, Sonnet 5.5 experiments E1/E2):
 # builder-sonnet is the non-rung Sonnet builder seat — the builder-opus argv
 # shape on the sonnet alias, a closed effort set (high|xhigh|max, default
-# xhigh), and the seat rule's only named max exception. It is NOT an E6 rung:
+# xhigh), and (until hk 1864 repealed the no-max seat rule) its only named max
+# exception. It is NOT an E6 rung:
 # no SCOPEFUEL_E6_ARM, no GATE_EFFORT_PIN — the gate sees bare `-m sonnet`
 # (the fixture refuses a sonnet@xhigh/sonnet@max rung gate, so forwarding the
 # effort would close the seat). The catalog consult pins the requested rung so
@@ -10238,7 +11130,7 @@ builder_sonnet_high_start="$(grep '^agent start ' "$TMP/herdr.log")"
   fail "builder-sonnet --effort high must carry the high rung in argv: $builder_sonnet_high_start"
 grep -q 'policy launch sonnet effort=high' "$TMP/launch.log" ||
   fail "builder-sonnet --effort high must pin the catalog consult to high: $(cat "$TMP/launch.log")"
-# --effort max: the seat rule's only named exception (E2). Admitted, argv and
+# --effort max: experiment E2 (no longer an exception since hk 1864). Admitted, argv and
 # record both carry max.
 : >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
 builder_sonnet_max_out="$(WRK_LAUNCH_LOG="$TMP/launch.log" spawn_base builder-sonnet \
@@ -10355,12 +11247,15 @@ mut_wrk "$MUT921/wrk-effortflag" \
 mut_wrk "$MUT921/wrk-launchname" \
   'elif [[ "$MODEL" == builder-sonnet ]]; then' \
   'elif [[ "$MODEL" == builder-sonnet-removed ]]; then'
-# 5. Seat exception scope: dropping the model pin opens max for every builder —
-#    builder-sol --effort max must still die.
+# 5. Seat rule: since hk 1864 the builder seat refuses ultra only (the
+#    builder-sonnet max exception is moot). Dropping the ultra arm opens ultra
+#    for every builder — builder-sol --effort ultra must still die.
 # shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
 mut_wrk "$MUT921/wrk-seat" \
-  '[[ "$MODEL" == builder-sonnet && "$seat_effort" == max ]]' \
-  '[[ "$seat_effort" == max ]]'
+  '    case "$seat_effort" in
+      ultra)' \
+  '    case "$seat_effort" in
+      never)'
 # 6. Catalog pin: without the ${EFFORT:-xhigh} pin the consult returns sonnet's
 #    ordinary high default and a bare spawn silently launches high.
 # shellcheck disable=SC2016 # the pattern is bin/wrk source text, not an expansion
@@ -10371,9 +11266,9 @@ expect_red model-swapped-to-opus sonnet_builder_probe "$MUT921/wrk-model" m1 '--
 expect_red effort-set-widened builder_refused_probe "$MUT921/wrk-effortset" builder-sonnet e1 --effort low
 expect_red effort-flag-dropped sonnet_builder_probe "$MUT921/wrk-effortflag" e2 '--model sonnet --dangerously-skip-permissions --effort xhigh'
 expect_red launch-name-literal sonnet_builder_record_probe "$MUT921/wrk-launchname" q1
-expect_red seat-exception-broadened builder_refused_probe "$MUT921/wrk-seat" builder-sol s1 --effort max
+expect_red seat-ultra-arm-dropped builder_refused_probe "$MUT921/wrk-seat" builder-sol s1 --effort ultra
 expect_red catalog-pin-dropped sonnet_builder_probe "$MUT921/wrk-catalogpin" c1 '--model sonnet --dangerously-skip-permissions --effort xhigh'
-echo "PASS 921 mutants assertion-red=6/6 (model map, effort set, effort flag, launch_profile, seat scope, catalog pin)"
+echo "PASS 921 mutants assertion-red=6/6 (model map, effort set, effort flag, launch_profile, seat ultra arm, catalog pin)"
 
 # ---------------------------------------------------------------------------
 # #1026 AC4 — assertion-RED mutants for the gpt-6.1-sol switch.
@@ -10548,43 +11443,61 @@ e6_builder_case builder-kimi-high    kimi-k3     high   '--auto -m kimi-code/k3'
 e6_builder_case builder-grok-low     grok-hi     low    '--always-approve -m grok-4.7 --effort low'
 e6_builder_case builder-grok-medium  grok-hi     medium '--always-approve -m grok-4.7 --effort medium'
 e6_builder_case builder-grok-xhigh   grok-hi     xhigh  '--always-approve -m grok-4.7 --effort xhigh'
-echo "PASS 704+737 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
+# hk 1796: the four hk 1786 arms on the same pin rule. All four are placed
+# canon rows — no --operator-request anywhere. The luna pair must gate at
+# codex-luna@<rung> (NOT codex-luna-max) and take its model id from the
+# catalog row: the fixture serves gpt-5.6-luna for codex-luna@low, so a
+# launcher that hard-coded gpt-6-luna on the low spelling goes RED here.
+e6_builder_case builder-sonnet-medium sonnet     medium '--model sonnet --dangerously-skip-permissions --effort medium'
+e6_builder_case builder-haiku-low    haiku      low    '--model haiku --dangerously-skip-permissions --effort low'
+e6_builder_case builder-luna-low     codex-luna low    '--yolo -m gpt-5.6-luna -c model_reasoning_effort=low'
+e6_builder_case builder-luna-medium  codex-luna medium '--yolo -m gpt-6-luna -c model_reasoning_effort=medium'
+# hk 1863: the five hk 1786 borrow-down and promote-up spellings on the same
+# pin rule. builder-sol-low takes its model id from the codex-sol catalog row
+# (the fixture serves gpt-6.1-sol) and gates at codex-sol@low; the haiku and
+# sonnet spellings reuse the haiku and sonnet worker argv shape. builder-haiku-max
+# is admitted at max in the max-rung block below (hk 1864). sonnet@low has no
+# canon row in production — the fixture catalog answers it, so this case
+# proves wrk's wiring, not that the real gate admits the rung today.
+e6_builder_case builder-sol-low      codex-sol  low    '--yolo -m gpt-6.1-sol -c model_reasoning_effort=low'
+e6_builder_case builder-haiku-high   haiku      high   '--model haiku --dangerously-skip-permissions --effort high'
+e6_builder_case builder-haiku-xhigh  haiku      xhigh  '--model haiku --dangerously-skip-permissions --effort xhigh'
+e6_builder_case builder-sonnet-low   sonnet     low    '--model sonnet --dangerously-skip-permissions --effort low'
+# builder-sol-low must read its model id from the catalog row, never a launcher
+# literal: serve an id that exists nowhere in bin/wrk and assert the argv
+# carries it, and that the catalog consult asked for codex-sol at low.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log" "$TMP/launch.log"
+sol_low_out="$(SCOPEFUEL_E6_ARM=codex-sol@low WRK_LAUNCH_LOG="$TMP/launch.log" \
+  WRK_LAUNCH_MODEL_OVERRIDE=gpt-9.9-sol \
+  ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+  spawn_base builder-sol-low --role builder --lane e6-sol-low-catalog-lane --parent parent-lane \
+  --job e6-sol-low-catalog --t T1 2>&1)" ||
+  fail "builder-sol-low with a catalog-served model id must be admitted: $sol_low_out"
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-9.9-sol -c model_reasoning_effort=low' ]] ||
+  fail "builder-sol-low must carry the catalog row's model id: $(cat "$TMP/herdr.log")"
+grep -q 'policy launch codex-sol effort=low' "$TMP/launch.log" ||
+  fail "builder-sol-low must consult the catalog for codex-sol at low: $(cat "$TMP/launch.log")"
+echo "PASS 704+737+1796+1863 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
-# 2026-09-26 (decision 4088 B): the four max-rung builder spellings are closed —
-# a builder seat never takes a max rung, so the seat rule fires ahead of the
-# E6 marker check and refuses even with the exact SCOPEFUEL_E6_ARM armed.
-for e6_max_model in builder-sonnet-max builder-sol-max builder-luna-max builder-kimi-max; do
-  case "$e6_max_model" in
-    builder-sonnet-max) e6_max_gate=sonnet ;;
-    builder-sol-max)    e6_max_gate=codex-sol ;;
-    builder-luna-max)   e6_max_gate=codex-luna ;;
-    builder-kimi-max)   e6_max_gate=kimi-k3 ;;
-  esac
-  set +e
-  e6_max_out="$(SCOPEFUEL_E6_ARM="$e6_max_gate@max" \
-    KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
-    ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
-    spawn_base "$e6_max_model" --role builder --lane "$e6_max_model-lane" --parent parent-lane \
-    --job "e6-max-closed-$e6_max_model" --t T1 2>&1)"
-  e6_max_rc=$?
-  set -e
-  [[ "$e6_max_rc" -eq 2 ]] ||
-    fail "$e6_max_model with its exact marker must still die rc 2 (rc=$e6_max_rc): $e6_max_out"
-  grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
-    fail "$e6_max_model refusal must name the builder-seat rule: $e6_max_out"
-done
-# A non-rung spelling cannot sneak max onto a builder seat either: an explicit
-# --effort max on builder-sol (default high) dies on the same rule.
-set +e
+# hk 1864 (operator 2026-10-23): the no-max builder-seat refusal of the
+# 2026-09-26 decision 4088 B is repealed, so the five max-rung builder spellings
+# are admitted with their exact SCOPEFUEL_E6_ARM marker armed and launch at the
+# max rung (the kimi one through the max clone home).
+e6_builder_case builder-sonnet-max   sonnet     max    '--model sonnet --dangerously-skip-permissions --effort max'
+e6_builder_case builder-sol-max      codex-sol  max    '--yolo -m gpt-6.1-sol -c model_reasoning_effort=max'
+e6_builder_case builder-luna-max     codex-luna max    '--yolo -m gpt-6-luna -c model_reasoning_effort=max'
+e6_builder_case builder-kimi-max     kimi-k3    max    '--auto -m kimi-code/k3'
+e6_builder_case builder-haiku-max    haiku      max    '--model haiku --dangerously-skip-permissions --effort max'
+# A non-rung spelling takes an explicit max on a builder seat too:
+# --effort max on builder-sol (default high) is admitted and launches at max.
+: >"$TMP/herdr.log"
 e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-max-lane --parent parent-lane \
-  --effort max --job e6-builder-sol-effort-max --t T1 2>&1)"
-e6_max_rc=$?
-set -e
-[[ "$e6_max_rc" -eq 2 ]] ||
-  fail "builder-sol --effort max must die rc 2 (rc=$e6_max_rc): $e6_max_out"
-grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
-  fail "builder-sol --effort max refusal must name the builder-seat rule: $e6_max_out"
-# codex `ultra` is the max tier plus subagents — the seat rule refuses it too.
+  --effort max --job e6-builder-sol-effort-max --t T1 2>&1)" ||
+  fail "builder-sol --effort max must be admitted on a builder seat (hk 1864): $e6_max_out"
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-6.1-sol -c model_reasoning_effort=max' ]] ||
+  fail "builder-sol --effort max must launch at the max rung: $(cat "$TMP/herdr.log")"
+# codex `ultra` is the max tier plus subagents — hk 1864 opened max only, so
+# the seat rule still refuses ultra.
 set +e
 e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-ultra-lane --parent parent-lane \
   --effort ultra --job e6-builder-sol-effort-ultra --t T1 2>&1)"
@@ -10592,17 +11505,37 @@ e6_max_rc=$?
 set -e
 [[ "$e6_max_rc" -eq 2 ]] ||
   fail "builder-sol --effort ultra must die rc 2 (rc=$e6_max_rc): $e6_max_out"
-grep -q 'builder seats never take a max rung' <<<"$e6_max_out" ||
+grep -q 'builder seats never take an ultra rung' <<<"$e6_max_out" ||
   fail "builder-sol --effort ultra refusal must name the builder-seat rule: $e6_max_out"
-echo "PASS 736 max-rung builder spellings closed by the builder-seat rule"
+# Mutant: restoring the repealed max refusal must fail the admitted-max probe.
+# The probe spawns builder-haiku-max with its exact marker; it must pass on the
+# real wrk and go RED (rc 1) on a copy whose seat rule refuses max again.
+builder_max_open_probe() {
+  local wrk="$1" tag="$2"
+  SCOPEFUEL_E6_ARM=haiku@max WRK="$wrk" \
+    ARBITER_INBOX_ROOT="$TMP/mut-inbox-$tag" XDG_DATA_HOME="$TMP/mut-xdg-$tag" \
+    spawn_base builder-haiku-max --role builder --lane "mutm-$tag-lane" \
+    --parent parent-lane --job "mutm-$tag" --t T1 >/dev/null 2>&1 || return 1
+}
+builder_max_open_probe "$WRK" real ||
+  fail "builder-haiku-max probe must be admitted on the real wrk"
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-max-refusal-restored" \
+  '    case "$seat_effort" in
+      ultra)' \
+  '    case "$seat_effort" in
+      max|ultra)'
+expect_red "max-refusal-restored" builder_max_open_probe "$TMP/wrk-max-refusal-restored" restored
+echo "PASS hk 1864 max-rung builder spellings admitted on the builder seat, ultra still refused, restored refusal goes RED"
 
-# #748: the unflagged kimi spellings admitted as builders (builder-kimi,
-# kimi-k3) leave EFFECTIVE_EFFORT empty — the seat rule reads the home's
-# [thinking] effort instead. A home pinned to max is refused on the same
-# seat rule; a home at high is admitted. builder-kimi-max in the loop above
-# is refused by the seat rule itself (exact marker armed AND a valid max
-# clone still refused), not merely by a missing marker.
+# #748 / hk 1864: the unflagged kimi spellings admitted as builders
+# (builder-kimi, kimi-k3) leave EFFECTIVE_EFFORT empty — the seat rule reads
+# the home's [thinking] effort instead. Since hk 1864 a home pinned to max is
+# admitted like any other rung (max is open on the builder seat); the seat rule
+# keeps refusing an ultra-effort home, asserted in the blocks below with
+# hand-built homes (bin/kimi-clone-home itself cannot mint an ultra clone).
 for e6_kimi_builder in builder-kimi kimi-k3; do
+  : >"$TMP/herdr.log"
   set +e
   e6_kmax_out="$(KIMI_CODE_HOME="$E6_KIMI_MAX_HOME" \
     ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
@@ -10610,10 +11543,10 @@ for e6_kimi_builder in builder-kimi kimi-k3; do
     --job "e6-khome-max-$e6_kimi_builder" --t T1 2>&1)"
   e6_kmax_rc=$?
   set -e
-  [[ "$e6_kmax_rc" -eq 2 ]] ||
-    fail "$e6_kimi_builder on a max-effort kimi home must die rc 2 (rc=$e6_kmax_rc): $e6_kmax_out"
-  grep -q 'builder seats never take a max rung' <<<"$e6_kmax_out" ||
-    fail "$e6_kimi_builder max-home refusal must name the builder-seat rule: $e6_kmax_out"
+  [[ "$e6_kmax_rc" -eq 0 ]] ||
+    fail "$e6_kimi_builder on a max-effort kimi home must be admitted (rc=$e6_kmax_rc): $e6_kmax_out"
+  [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
+    fail "$e6_kimi_builder on a max home must reuse the kimi-k3 argv verbatim: $(cat "$TMP/herdr.log")"
 done
 # A high-effort kimi home stays admitted — same argv as before, no --effort
 # anywhere (the CLI has no flag; the rung lives only in the clone config).
@@ -10630,7 +11563,7 @@ set -e
 e6_khigh_start="$(grep '^agent start ' "$TMP/herdr.log")"
 [[ "$e6_khigh_start" == *' -- --auto -m kimi-code/k3' ]] ||
   fail "builder-kimi on a high home must reuse the kimi-k3 argv verbatim: $e6_khigh_start"
-# The seat rule stays builder-scoped: the same max home on a worker spawn is
+# The seat rule stays builder-scoped: the max home on a worker spawn is
 # unaffected (worker max rungs are a separate reservation, not this rule).
 set +e
 e6_kworker_out="$(KIMI_CODE_HOME="$E6_KIMI_MAX_HOME" \
@@ -10640,13 +11573,13 @@ e6_kworker_rc=$?
 set -e
 [[ "$e6_kworker_rc" -eq 0 ]] ||
   fail "kimi-k3 worker on a max-effort home must stay admitted (rc=$e6_kworker_rc): $e6_kworker_out"
-echo "PASS 748 kimi builder spellings refuse a max-effort home on the seat rule"
+echo "PASS 748 kimi builder spellings admit a max-effort home (hk 1864)"
 
 # #748r2 (tester round 1): the seat read must resolve what Kimi Code actually
 # runs, not just a double-quoted [thinking] effort. Valid TOML literal
 # (single-quoted) strings, a missing [thinking] with the spawned model's
-# default_effort = "max", and an unsupported [thinking] value falling back to
-# a max default all resolve to max — each must die on the seat rule. Mutants
+# default_effort = "ultra", and an unsupported [thinking] value falling back to
+# an ultra default all resolve to ultra — each must die on the seat rule. Mutants
 # in test-assignment-defaults.sh pin the resolver itself.
 e6_khome() { # build a minimal kimi home: $1=dest, config.toml on stdin
   local dest="$1"
@@ -10656,30 +11589,30 @@ e6_khome() { # build a minimal kimi home: $1=dest, config.toml on stdin
   printf 'x\n' >"$dest/oauth/kimi-code"
   printf 'x\n' >"$dest/device_id"
 }
-e6_khome "$TMP/kimi-sq-max" <<'EOF'
+e6_khome "$TMP/kimi-sq-ultra" <<'EOF'
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
-effort = 'max'
+effort = 'ultra'
 EOF
-e6_khome "$TMP/kimi-default-max" <<'EOF'
+e6_khome "$TMP/kimi-default-ultra" <<'EOF'
 default_model = "kimi-code/k3"
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-fallback-max" <<'EOF'
+e6_khome "$TMP/kimi-fallback-ultra" <<'EOF'
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 [thinking]
 effort = "xhigh"
 EOF
-for e6_khome_case in kimi-sq-max kimi-default-max kimi-fallback-max; do
+for e6_khome_case in kimi-sq-ultra kimi-default-ultra kimi-fallback-ultra; do
   set +e
   e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
     ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
@@ -10688,17 +11621,17 @@ for e6_khome_case in kimi-sq-max kimi-default-max kimi-fallback-max; do
   e6_krc=$?
   set -e
   [[ "$e6_krc" -eq 2 ]] ||
-    fail "builder-kimi on a home resolving to max ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
-  grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+    fail "builder-kimi on a home resolving to ultra ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
+  grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
     fail "$e6_khome_case refusal must name the builder-seat rule: $e6_kout"
 done
-# The same fallback semantics admit when they resolve below max: a
+# The same fallback semantics admit when they resolve below ultra: a
 # single-quoted 'high' is a valid TOML rung, and an unsupported 'xhigh'
 # request falls back to the model's high default — both launch normally.
 e6_khome "$TMP/kimi-sq-high" <<'EOF'
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 effort = 'high'
@@ -10706,7 +11639,7 @@ EOF
 e6_khome "$TMP/kimi-fallback-high" <<'EOF'
 [models."kimi-code/k3"]
 provider = "managed:kimi-code"
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 effort = "xhigh"
@@ -10721,7 +11654,7 @@ for e6_khome_case in kimi-sq-high kimi-fallback-high; do
   e6_krc=$?
   set -e
   [[ "$e6_krc" -eq 0 ]] ||
-    fail "builder-kimi on a home resolving below max ($e6_khome_case) must be admitted (rc=$e6_krc): $e6_kout"
+    fail "builder-kimi on a home resolving below ultra ($e6_khome_case) must be admitted (rc=$e6_krc): $e6_kout"
   [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
     fail "$e6_khome_case must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
 done
@@ -10733,96 +11666,96 @@ echo "PASS 748r2 kimi seat rule resolves literal strings and model default_effor
 # equivalent spellings Kimi accepts; and KIMI_MODEL_THINKING_EFFORT overrides
 # the effort at runtime. [thinking].enabled=false resolves to off_effort.
 e6_khome "$TMP/kimi-dotted-thinking" <<'EOF'
-thinking.effort = "max"
+thinking.effort = "ultra"
 [models."kimi-code/k3"]
 provider = "x"
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 EOF
 e6_khome "$TMP/kimi-dotted-model" <<'EOF'
 models."kimi-code/k3".provider = "x"
-models."kimi-code/k3".support_efforts = [ "low", "high", "max" ]
-models."kimi-code/k3".default_effort = "max"
+models."kimi-code/k3".support_efforts = [ "low", "high", "ultra" ]
+models."kimi-code/k3".default_effort = "ultra"
 EOF
 e6_khome "$TMP/kimi-inline-models" <<'EOF'
-models = { "kimi-code/k3" = { support_efforts = [ "low", "high", "max" ], default_effort = "max" } }
+models = { "kimi-code/k3" = { support_efforts = [ "low", "high", "ultra" ], default_effort = "ultra" } }
 EOF
-e6_khome "$TMP/kimi-multiline-max" <<'EOF'
+e6_khome "$TMP/kimi-multiline-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
-effort = """max"""
+effort = """ultra"""
 EOF
 # The effort value below is the TOML escape m + ́x: the file literally
-# contains "m\u0061x", which a real TOML decode turns into "max".
-e6_khome "$TMP/kimi-escaped-max" <<'EOF'
+# contains "ultr\u0061", which a real TOML decode turns into "ultra".
+e6_khome "$TMP/kimi-escaped-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
-effort = "m\u0061x"
+effort = "ultr\u0061"
 EOF
-e6_khome "$TMP/kimi-indented-max" <<'EOF'
+e6_khome "$TMP/kimi-indented-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
   [thinking]
-  effort = "max"
+  effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-override-max" <<'EOF'
+e6_khome "$TMP/kimi-override-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [models."kimi-code/k3".overrides]
-default_effort = "max"
+default_effort = "ultra"
 EOF
 e6_khome "$TMP/kimi-comment-support" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ] # "xhigh" intentionally unsupported
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ] # "xhigh" intentionally unsupported
+default_effort = "ultra"
 [thinking]
 effort = "xhigh"
 EOF
-e6_khome "$TMP/kimi-off-effort-max" <<'EOF'
+e6_khome "$TMP/kimi-off-effort-ultra" <<'EOF'
 [models."kimi-code/k3"]
-off_effort = "max"
+off_effort = "ultra"
 [thinking]
 enabled = false
 effort = "high"
 EOF
 # always-thinking also arrives as a capabilities tag or a boolean field —
 # enabled=false does not switch the model off in either shape.
-e6_khome "$TMP/kimi-at-cap-max" <<'EOF'
+e6_khome "$TMP/kimi-at-cap-ultra" <<'EOF'
 [models."kimi-code/k3"]
 capabilities = [ "thinking", "always_thinking" ]
 default_effort = "high"
 [thinking]
 enabled = false
-effort = "max"
+effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-at-field-max" <<'EOF'
+e6_khome "$TMP/kimi-at-field-ultra" <<'EOF'
 [models."kimi-code/k3"]
 always_thinking = true
 default_effort = "high"
 [thinking]
 enabled = false
-effort = "max"
+effort = "ultra"
 EOF
-# A malformed config (duplicate keys) can still carry a max line: the python
+# A malformed config (duplicate keys) can still carry an ultra line: the python
 # parse refuses to decode it, so the awk fallback's scan must stay
 # conservative and refuse.
 e6_khome "$TMP/kimi-dup-invalid" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 effort = "high"
-effort = "max"
+effort = "ultra"
 EOF
 for e6_khome_case in kimi-dotted-thinking kimi-dotted-model kimi-inline-models \
-    kimi-multiline-max kimi-escaped-max kimi-indented-max kimi-override-max \
-    kimi-comment-support kimi-off-effort-max kimi-at-cap-max kimi-at-field-max \
+    kimi-multiline-ultra kimi-escaped-ultra kimi-indented-ultra kimi-override-ultra \
+    kimi-comment-support kimi-off-effort-ultra kimi-at-cap-ultra kimi-at-field-ultra \
     kimi-dup-invalid; do
   set +e
   e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
@@ -10832,44 +11765,44 @@ for e6_khome_case in kimi-dotted-thinking kimi-dotted-model kimi-inline-models \
   e6_krc=$?
   set -e
   [[ "$e6_krc" -eq 2 ]] ||
-    fail "builder-kimi on a home resolving to max ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
-  grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
+    fail "builder-kimi on a home resolving to ultra ($e6_khome_case) must die rc 2 (rc=$e6_krc): $e6_kout"
+  grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
     fail "$e6_khome_case refusal must name the builder-seat rule: $e6_kout"
 done
-# The env overlay is the rung when exported — even with a below-max home.
+# The env overlay is the rung when exported — even with a below-ultra home.
 e6_khome "$TMP/kimi-env-below" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 effort = "high"
 EOF
 set +e
-e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-below" KIMI_MODEL_THINKING_EFFORT=MAX \
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-below" KIMI_MODEL_THINKING_EFFORT=ULTRA \
   ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
-  spawn_base builder-kimi --role builder --lane kimi-env-max-lane --parent parent-lane \
-  --job e6-kimi-env-max --t T1 2>&1)"
+  spawn_base builder-kimi --role builder --lane kimi-env-ultra-lane --parent parent-lane \
+  --job e6-kimi-env-ultra --t T1 2>&1)"
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 2 ]] ||
-  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=MAX exported must die rc 2 (rc=$e6_krc): $e6_kout"
-grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
-  fail "env-max refusal must name the builder-seat rule: $e6_kout"
+  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=ULTRA exported must die rc 2 (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
+  fail "env-ultra refusal must name the builder-seat rule: $e6_kout"
 # CodeRabbit #153: the env overlay resolves even with no config file (kimi
 # applies it with an empty home too) — and must normalize like the real parse
-# or MAX bypasses the case-sensitive seat match on spelling alone.
+# or ULTRA bypasses the case-sensitive seat match on spelling alone.
 mkdir -p "$TMP/kimi-no-cfg"
 set +e
-e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-no-cfg" KIMI_MODEL_THINKING_EFFORT=MAX \
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-no-cfg" KIMI_MODEL_THINKING_EFFORT=ULTRA \
   ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
-  spawn_base builder-kimi --role builder --lane kimi-nocfg-max-lane --parent parent-lane \
-  --job e6-kimi-nocfg-max --t T1 2>&1)"
+  spawn_base builder-kimi --role builder --lane kimi-nocfg-ultra-lane --parent parent-lane \
+  --job e6-kimi-nocfg-ultra --t T1 2>&1)"
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 2 ]] ||
-  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=MAX and no config must die rc 2 (rc=$e6_krc): $e6_kout"
-grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
-  fail "no-config env-max refusal must name the builder-seat rule: $e6_kout"
+  fail "builder-kimi with KIMI_MODEL_THINKING_EFFORT=ULTRA and no config must die rc 2 (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
+  fail "no-config env-ultra refusal must name the builder-seat rule: $e6_kout"
 # An env spelling outside the documented rungs is not a rung — fail-open like
 # an unparseable config, but only after the bounded check sees it.
 : >"$TMP/herdr.log"
@@ -10906,7 +11839,7 @@ printf '#!/bin/sh\nexit 1\n' > "$TMP/nopy3bin/python3"
 chmod +x "$TMP/nopy3bin/python3"
 e6_khome "$TMP/kimi-awk-override" <<'EOF'
 [models."kimi-code/k3".overrides]
-default_effort = "max"
+default_effort = "ultra"
 EOF
 set +e
 e6_kout="$(PATH="$TMP/nopy3bin:$PATH" KIMI_CODE_HOME="$TMP/kimi-awk-override" \
@@ -10916,56 +11849,56 @@ e6_kout="$(PATH="$TMP/nopy3bin:$PATH" KIMI_CODE_HOME="$TMP/kimi-awk-override" \
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 2 ]] ||
-  fail "builder-kimi on an overrides-default max home must die rc 2 via the awk fallback too (rc=$e6_krc): $e6_kout"
-grep -q 'builder seats never take a max rung' <<<"$e6_kout" ||
-  fail "awk-path overrides-max refusal must name the builder-seat rule: $e6_kout"
-# Admitted paths: the env overlay wins over the config (max home + high env),
+  fail "builder-kimi on an overrides-default ultra home must die rc 2 via the awk fallback too (rc=$e6_krc): $e6_kout"
+grep -q 'builder seats never take an ultra rung' <<<"$e6_kout" ||
+  fail "awk-path overrides-ultra refusal must name the builder-seat rule: $e6_kout"
+# Admitted paths: the env overlay wins over the config (ultra home + high env),
 # and disabled Thinking resolves to off_effort (absent → no rung) even when a
-# configured effort or default is max.
-e6_khome "$TMP/kimi-env-over-max" <<'EOF'
+# configured effort or default is ultra.
+e6_khome "$TMP/kimi-env-over-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 [thinking]
-effort = "max"
+effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-disabled-max" <<'EOF'
+e6_khome "$TMP/kimi-disabled-ultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
+support_efforts = [ "low", "high", "ultra" ]
 default_effort = "high"
 [thinking]
 enabled = false
-effort = "max"
+effort = "ultra"
 EOF
-e6_khome "$TMP/kimi-disabled-defmax" <<'EOF'
+e6_khome "$TMP/kimi-disabled-defultra" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 [thinking]
 enabled = false
 EOF
-# effort="off" is a valid off spelling — no rung even with a max default;
+# effort="off" is a valid off spelling — no rung even with an ultra default;
 # an unrecognised env value is not a rung either and falls back to config.
 e6_khome "$TMP/kimi-effort-off" <<'EOF'
 [models."kimi-code/k3"]
-support_efforts = [ "low", "high", "max" ]
-default_effort = "max"
+support_efforts = [ "low", "high", "ultra" ]
+default_effort = "ultra"
 [thinking]
 effort = "off"
 EOF
 : >"$TMP/herdr.log"
 set +e
-e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-over-max" KIMI_MODEL_THINKING_EFFORT=high \
+e6_kout="$(KIMI_CODE_HOME="$TMP/kimi-env-over-ultra" KIMI_MODEL_THINKING_EFFORT=high \
   ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
   spawn_base builder-kimi --role builder --lane kimi-env-high-lane --parent parent-lane \
   --job e6-kimi-env-high --t T1 2>&1)"
 e6_krc=$?
 set -e
 [[ "$e6_krc" -eq 0 ]] ||
-  fail "KIMI_MODEL_THINKING_EFFORT=high must override a max home and be admitted (rc=$e6_krc): $e6_kout"
+  fail "KIMI_MODEL_THINKING_EFFORT=high must override an ultra home and be admitted (rc=$e6_krc): $e6_kout"
 [[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --auto -m kimi-code/k3' ]] ||
   fail "env-high admission must launch the unchanged kimi-k3 argv: $(cat "$TMP/herdr.log")"
-for e6_khome_case in kimi-disabled-max kimi-disabled-defmax kimi-effort-off; do
+for e6_khome_case in kimi-disabled-ultra kimi-disabled-defultra kimi-effort-off; do
   : >"$TMP/herdr.log"
   set +e
   e6_kout="$(KIMI_CODE_HOME="$TMP/$e6_khome_case" \
@@ -10984,12 +11917,14 @@ echo "PASS 748r3 kimi seat rule resolves real TOML, env overlay, and disabled Th
 # Marker mutants: no marker, and a marker naming a different rung, both die on
 # wrk's own guard (rc 2, before the gate is asked) — the installed gate then
 # fail-closes the unmeasured C rungs a second time for good measure.
-# The max-rung spellings are absent here: since 2026-09-26 the builder-seat
-# rule refuses them before the marker check (asserted above), so a missing
-# marker is no longer the operative refusal for them.
+# hk 1864: the max-rung spellings are in the loop too — the builder-seat rule
+# no longer refuses them, so a missing marker is the operative refusal.
 for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
   builder-sol-high builder-sol-medium \
-  builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh; do
+  builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh \
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
+  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
+  builder-sonnet-max builder-sol-max builder-luna-max builder-kimi-max builder-haiku-max; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
@@ -11045,7 +11980,69 @@ set -e
   fail "builder-sol-medium with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
 grep -q 'SCOPEFUEL_E6_ARM=codex-sol@medium' <<<"$e6_rung_out" ||
   fail "wrong-rung refusal must name the required marker: $e6_rung_out"
-echo "PASS 704+737 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
+# hk 1796: same-profile wrong-rung markers refuse on each of the four new
+# spellings too — a marker for a different rung of the same gate profile
+# does not open the pinned rung.
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=sonnet@xhigh \
+  spawn_base builder-sonnet-medium --role builder --lane e6-smed-wrong-rung-lane --parent parent-lane \
+  --job e6-smed-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-sonnet-medium with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=sonnet@medium' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=haiku@medium \
+  spawn_base builder-haiku-low --role builder --lane e6-hkw-wrong-rung-lane --parent parent-lane \
+  --job e6-hkw-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-haiku-low with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=haiku@low' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=codex-luna@medium \
+  spawn_base builder-luna-low --role builder --lane e6-llow-wrong-rung-lane --parent parent-lane \
+  --job e6-llow-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-luna-low with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=codex-luna@low' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+set +e
+e6_rung_out="$(SCOPEFUEL_E6_ARM=codex-luna@low \
+  spawn_base builder-luna-medium --role builder --lane e6-lmed-wrong-rung-lane --parent parent-lane \
+  --job e6-lmed-wrong-rung --t T1 2>&1)"
+e6_rung_rc=$?
+set -e
+[[ "$e6_rung_rc" -eq 2 ]] ||
+  fail "builder-luna-medium with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+grep -q 'SCOPEFUEL_E6_ARM=codex-luna@medium' <<<"$e6_rung_out" ||
+  fail "wrong-rung refusal must name the required marker: $e6_rung_out"
+# hk 1863: a marker for the wrong rung of the same profile refuses on each of
+# the open new spellings and the max rungs hk 1864 opened.
+for e6_wr in builder-sol-low:codex-sol@high:codex-sol@low \
+  builder-haiku-high:haiku@low:haiku@high builder-haiku-xhigh:haiku@high:haiku@xhigh \
+  builder-sonnet-low:sonnet@medium:sonnet@low \
+  builder-haiku-max:haiku@xhigh:haiku@max builder-sol-max:codex-sol@high:codex-sol@max \
+  builder-sonnet-max:sonnet@xhigh:sonnet@max builder-luna-max:codex-luna@medium:codex-luna@max; do
+  IFS=: read -r e6_wr_model e6_wr_marker e6_wr_want <<<"$e6_wr"
+  set +e
+  e6_rung_out="$(SCOPEFUEL_E6_ARM="$e6_wr_marker" \
+    spawn_base "$e6_wr_model" --role builder --lane "$e6_wr_model-wr-lane" --parent parent-lane \
+    --job "$e6_wr_model-wr" --t T1 2>&1)"
+  e6_rung_rc=$?
+  set -e
+  [[ "$e6_rung_rc" -eq 2 ]] ||
+    fail "$e6_wr_model with a same-profile wrong-rung marker must die rc 2 (rc=$e6_rung_rc): $e6_rung_out"
+  grep -q "SCOPEFUEL_E6_ARM=$e6_wr_want" <<<"$e6_rung_out" ||
+    fail "$e6_wr_model wrong-rung refusal must name the required marker: $e6_rung_out"
+done
+echo "PASS 704+737+1796+1863 E6 marker mutants refuse missing and mismatched SCOPEFUEL_E6_ARM"
 
 # Escalation rung (fixture default escalation model — strict; NOT the
 # installed gate, whose #716 rule skips the ladder for --effort rungs): the
@@ -11241,6 +12238,56 @@ e6_eff_rc=$?
 set -e
 [[ "$e6_eff_rc" -eq 2 ]] ||
   fail "builder-sol-medium --effort high must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+# hk 1796: off-rung --effort dies on the pin for the four new spellings too.
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=sonnet@medium \
+  spawn_base builder-sonnet-medium --role builder --lane e6-smed-eff-lane --parent parent-lane \
+  --effort high --job e6-smed-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-sonnet-medium --effort high must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=haiku@low \
+  spawn_base builder-haiku-low --role builder --lane e6-hkw-eff-lane --parent parent-lane \
+  --effort medium --job e6-hkw-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-haiku-low --effort medium must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-luna@low \
+  spawn_base builder-luna-low --role builder --lane e6-llow-eff-lane --parent parent-lane \
+  --effort medium --job e6-llow-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-luna-low --effort medium must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+set +e
+e6_eff_out="$(SCOPEFUEL_E6_ARM=codex-luna@medium \
+  spawn_base builder-luna-medium --role builder --lane e6-lmed-eff-lane --parent parent-lane \
+  --effort low --job e6-lmed-eff-mutant --t T1 2>&1)"
+e6_eff_rc=$?
+set -e
+[[ "$e6_eff_rc" -eq 2 ]] ||
+  fail "builder-luna-medium --effort low must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+# hk 1863: off-rung --effort dies on the pin for the five new spellings; the
+# rung spelled out is the allowed restatement (covered by e6_builder_case).
+for e6_ef in builder-sol-low:codex-sol@low:medium builder-haiku-high:haiku@high:low \
+  builder-haiku-xhigh:haiku@xhigh:high builder-haiku-max:haiku@max:xhigh \
+  builder-sonnet-low:sonnet@low:medium; do
+  IFS=: read -r e6_ef_model e6_ef_marker e6_ef_off <<<"$e6_ef"
+  set +e
+  e6_eff_out="$(SCOPEFUEL_E6_ARM="$e6_ef_marker" \
+    spawn_base "$e6_ef_model" --role builder --lane "$e6_ef_model-eff-lane" --parent parent-lane \
+    --effort "$e6_ef_off" --job "$e6_ef_model-eff-mutant" --t T1 2>&1)"
+  e6_eff_rc=$?
+  set -e
+  [[ "$e6_eff_rc" -eq 2 ]] ||
+    fail "$e6_ef_model --effort $e6_ef_off must die on the pin (rc=$e6_eff_rc): $e6_eff_out"
+  grep -q "$e6_ef_model is pinned to effort" <<<"$e6_eff_out" ||
+    fail "$e6_ef_model --effort $e6_ef_off must die on the pin rule: $e6_eff_out"
+done
 set +e
 e6_eff_out="$(SCOPEFUEL_E6_ARM=kimi-k3@high KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" \
   spawn_base builder-kimi-high --role builder --lane e6-kimi-eff-lane --parent parent-lane \
@@ -11601,6 +12648,7 @@ cp "$R20_FIXTURE/00001-job.claim.json" "$R20_FIXTURE/00002-job.spawned.json" \
   env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
     WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" escalate captain-fixture \
     --question 'need parent decision' >/dev/null
+  seed_join_round "$R20_FIXTURE_INBOX" captain-fixture
   env ARBITER_INBOX_ROOT="$R20_FIXTURE_INBOX" HOSTNAME=fixture-host \
     WRK_PANEWIRE_LOG="$R20_FIXTURE_LOG" "$WRK" joined captain-fixture \
     --pr https://example.invalid/pr/1 --head deadbeef --report report.md >/dev/null
@@ -11636,7 +12684,8 @@ echo "PASS r20-emit-on-real-arbiter-fixture-artifacts"
 # TW2 — `wrk done` emits job.completed carrying the record's own values.
 R20_DONE_LOG="$TMP/r20-done-emit.log"
 r20_claim r20-done
-r20_done_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+r20_done_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_DONE_LOG" "$WRK" 'done' r20-done --report "$R20_REPORT")"
 PYTHONPATH="$TMP" python3 - "$R20_DONE_LOG" "$R20_INBOX/r20-done/events" <<'PY'
 import sys
@@ -11660,10 +12709,13 @@ echo "PASS r20-emit-argv-matches-done-record"
 # the record's reason verbatim.
 R20_BUILDER_LOG="$TMP/r20-builder-emit.log"
 r20_claim r20-builder --role builder --parent-lane parent-a
-r20_escalate_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+r20_escalate_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" escalate r20-builder \
   --question 'need parent decision')"
-r20_joined_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+seed_join_round "$R20_INBOX" r20-builder
+r20_joined_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_LOG="$R20_BUILDER_LOG" "$WRK" joined r20-builder \
   --pr https://example.invalid/pr/1 --head deadbeef --report "$R20_REPORT")"
 PYTHONPATH="$TMP" python3 - "$R20_BUILDER_LOG" "$R20_INBOX/r20-builder/events" <<'PY'
@@ -11687,7 +12739,8 @@ echo "PASS r20-emit-argv-matches-builder-escalate-and-joined-records"
 R20_ABSENT_ERR="$TMP/r20-absent.err"
 r20_claim r20-absent
 set +e
-r20_absent_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" PANEWIRE_BIN="$TMP/absent-panewire" \
+r20_absent_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" PANEWIRE_BIN="$TMP/absent-panewire" \
   HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' r20-absent --report "$R20_REPORT" 2>"$R20_ABSENT_ERR")"
 r20_absent_rc=$?
@@ -11708,7 +12761,8 @@ echo "PASS r20-missing-panewire-warns-without-changing-exit-or-stdout"
 R20_FAIL_ERR="$TMP/r20-fail.err"
 r20_claim r20-fail
 set +e
-r20_fail_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" WRK_PANEWIRE_RC=3 \
+r20_fail_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" WRK_PANEWIRE_RC=3 \
   HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
   "$WRK" 'done' r20-fail --report "$R20_REPORT" 2>"$R20_FAIL_ERR")"
 r20_fail_rc=$?
@@ -11734,7 +12788,8 @@ R20_SLOW_ERR="$TMP/r20-slow.err"
 r20_claim r20-slow
 r20_slow_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 set +e
-r20_slow_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" WRK_PANEWIRE_SLEEP=30 \
+r20_slow_out="$(env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" WRK_PANEWIRE_SLEEP=30 \
   "$WRK" 'done' r20-slow --report "$R20_REPORT" 2>"$R20_SLOW_ERR")"
 r20_slow_rc=$?
 set -e
@@ -11752,9 +12807,12 @@ echo "PASS r20-wedged-emit-is-bounded-by-the-timeout-guard"
 # must not emit at all; passing it would only pile up usage warnings.
 R20_LOST_LOG="$TMP/r20-lost-emit.log"
 R20_LOST_INBOX="$TMP/r20-lost-inbox"
+R20_LOST_SEQ="$TMP/r20-lost.seq"
+printf 'not-found\n' >"$R20_LOST_SEQ"
 set +e
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$R20_LOST_INBOX" WRK_PANEWIRE_LOG="$R20_LOST_LOG" \
-  WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_INBOX_ROOT="$R20_LOST_INBOX" WRK_PANEWIRE_LOG="$R20_LOST_LOG" \
+  WRK_FIXTURE_GET_SEQUENCE="$R20_LOST_SEQ" WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel r20-lost lane-a wrk-a w1:p1 "$R20_REPORT" >/dev/null 2>&1
 r20_lost_rc=$?
@@ -11787,14 +12845,18 @@ R20_ROOT_LOG="$TMP/r20-inbox-root-emit.log"
 R20_ROOT_ERR="$TMP/r20-inbox-root.err"
 r20_claim r20-root-done
 r20_claim r20-root-builder --role builder --parent-lane parent-a
-env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
   "$WRK" 'done' r20-root-done --report "$R20_REPORT" 2>"$R20_ROOT_ERR" >/dev/null
-env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
   "$WRK" escalate r20-root-builder --question 'need parent decision' \
   2>>"$R20_ROOT_ERR" >/dev/null
-env ARBITER_INBOX_ROOT="$R20_INBOX" HOSTNAME=fixture-host \
+seed_join_round "$R20_INBOX" r20-root-builder
+env ARBITER_INBOX_ROOT="$R20_INBOX" XDG_DATA_HOME="$TMP/xdg-r20" \
+  ARBITER_BIN="$ARBITER" HOSTNAME=fixture-host \
   WRK_PANEWIRE_REQUIRE_INBOX_ROOT=1 WRK_PANEWIRE_LOG="$R20_ROOT_LOG" \
   "$WRK" joined r20-root-builder --pr https://example.invalid/pr/1 \
   --head deadbeef --report "$R20_REPORT" 2>>"$R20_ROOT_ERR" >/dev/null
@@ -11861,7 +12923,8 @@ R21_DONE_HK_LOG="$TMP/r21-done-handoffkeep.log"
 R21_DONE_PW_LOG="$TMP/r21-done-panewire.log"
 R21_DONE_ERR="$TMP/r21-done.err"
 r21_claim "$R21_DONE_JOB"
-r21_done_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+r21_done_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host \
   HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" HANDOFFKEEP_TOKEN=fixture-token \
   WRK_HANDOFFKEEP_LOG="$R21_DONE_HK_LOG" WRK_PANEWIRE_LOG="$R21_DONE_PW_LOG" \
   "$WRK" 'done' "$R21_DONE_JOB" --report "$R21_DONE_REPORT" 2>"$R21_DONE_ERR")"
@@ -11895,7 +12958,8 @@ R21_LONG_REPORT="$R21_INBOX/$R21_LONG_JOB/report-long.md"
 mkdir -p "$(dirname "$R21_LONG_REPORT")"
 python3 -c 'print("x" * 300)' >"$R21_LONG_REPORT"
 r21_claim "$R21_LONG_JOB"
-env ARBITER_INBOX_ROOT="$R21_INBOX" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   "$WRK" 'done' "$R21_LONG_JOB" --report "$R21_LONG_REPORT" >/dev/null
 PYTHONPATH="$TMP" python3 - "$R21_INBOX/$R21_LONG_JOB/events" <<'PY'
 import sys
@@ -11917,7 +12981,8 @@ R21_FAIL_PW_LOG="$TMP/r21-fail-panewire.log"
 R21_FAIL_ERR="$TMP/r21-fail.err"
 r21_claim "$R21_FAIL_JOB"
 set +e
-r21_fail_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+r21_fail_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host \
   HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_RC=1 \
   WRK_PANEWIRE_LOG="$R21_FAIL_PW_LOG" "$WRK" 'done' "$R21_FAIL_JOB" \
   --report "$R21_FAIL_REPORT" 2>"$R21_FAIL_ERR")"
@@ -11946,7 +13011,8 @@ R21_ABSENT_PW_LOG="$TMP/r21-absent-panewire.log"
 R21_ABSENT_ERR="$TMP/r21-absent.err"
 r21_claim "$R21_ABSENT_JOB"
 set +e
-r21_absent_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+r21_absent_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host \
   HANDOFFKEEP_BIN="$TMP/no-handoffkeep" WRK_PANEWIRE_LOG="$R21_ABSENT_PW_LOG" \
   "$WRK" 'done' "$R21_ABSENT_JOB" --report "$R21_ABSENT_REPORT" 2>"$R21_ABSENT_ERR")"
 r21_absent_rc=$?
@@ -11976,7 +13042,8 @@ R21_SLOW_ERR="$TMP/r21-slow.err"
 r21_claim "$R21_SLOW_JOB"
 r21_slow_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 set +e
-r21_slow_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host \
+r21_slow_out="$(env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host \
   HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" WRK_HANDOFFKEEP_SLEEP=30 \
   WRK_PANEWIRE_LOG="$R21_SLOW_PW_LOG" "$WRK" 'done' "$R21_SLOW_JOB" \
   --report "$R21_SLOW_REPORT" 2>"$R21_SLOW_ERR")"
@@ -12007,7 +13074,9 @@ R21_JOINED_REPORT="$(r21_report "$R21_JOINED_JOB" joined-report.md 'joined termi
 R21_JOINED_HK_LOG="$TMP/r21-joined-handoffkeep.log"
 R21_JOINED_PW_LOG="$TMP/r21-joined-panewire.log"
 r21_claim "$R21_JOINED_JOB" --role builder --parent-lane parent-a
-env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+seed_join_round "$R21_INBOX" "$R21_JOINED_JOB"
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_JOINED_HK_LOG" WRK_PANEWIRE_LOG="$R21_JOINED_PW_LOG" \
   "$WRK" joined "$R21_JOINED_JOB" --pr https://example.invalid/pr/21 --head deadbeef \
   --report "$R21_JOINED_REPORT" >/dev/null
@@ -12033,7 +13102,8 @@ R21_ESC_REPORT="$(r21_report "$R21_ESC_JOB" escalation.md 'escalation terminal l
 R21_ESC_HK_LOG="$TMP/r21-escalate-handoffkeep.log"
 R21_ESC_PW_LOG="$TMP/r21-escalate-panewire.log"
 r21_claim "$R21_ESC_JOB" --role builder --parent-lane parent-a
-env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_ESC_HK_LOG" WRK_PANEWIRE_LOG="$R21_ESC_PW_LOG" \
   "$WRK" escalate "$R21_ESC_JOB" --question 'need a decision' --report "$R21_ESC_REPORT" >/dev/null
 PYTHONPATH="$TMP" python3 - "$R21_ESC_HK_LOG" "$R21_ESC_PW_LOG" "$R21_INBOX/$R21_ESC_JOB/events" <<'PY'
@@ -12053,7 +13123,8 @@ R21_ESC_EMPTY_JOB="r21-escalate-empty"
 R21_ESC_EMPTY_HK_LOG="$TMP/r21-escalate-empty-handoffkeep.log"
 R21_ESC_EMPTY_PW_LOG="$TMP/r21-escalate-empty-panewire.log"
 r21_claim "$R21_ESC_EMPTY_JOB" --role builder --parent-lane parent-a
-env ARBITER_INBOX_ROOT="$R21_INBOX" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HOSTNAME=fixture-host HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_ESC_EMPTY_HK_LOG" WRK_PANEWIRE_LOG="$R21_ESC_EMPTY_PW_LOG" \
   "$WRK" escalate "$R21_ESC_EMPTY_JOB" --question 'need a decision' >/dev/null
 [[ ! -s "$R21_ESC_EMPTY_HK_LOG" ]]
@@ -12072,7 +13143,8 @@ R21_ESC_MISSING_HK_LOG="$TMP/r21-escalate-missing-handoffkeep.log"
 r21_claim "$R21_ESC_MISSING_JOB" --role builder --parent-lane parent-a
 : >"$R21_ESC_MISSING_HK_LOG"
 set +e
-env ARBITER_INBOX_ROOT="$R21_INBOX" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
+env ARBITER_INBOX_ROOT="$R21_INBOX" ARBITER_BIN="$ARBITER" \
+  XDG_DATA_HOME="$TMP/xdg-r21" HANDOFFKEEP_BIN="$R21_HANDOFFKEEP" \
   WRK_HANDOFFKEEP_LOG="$R21_ESC_MISSING_HK_LOG" "$WRK" escalate "$R21_ESC_MISSING_JOB" \
   --question 'need a decision' --report "$TMP/no-such-report.md" >/dev/null 2>&1
 r21_esc_missing_rc=$?
@@ -12234,7 +13306,8 @@ env ARBITER_INBOX_ROOT="$RND_JOBS" HANDOFFKEEP_BIN="$TMP/absent-handoffkeep" \
 rnd_arb event --job "$RND4_JOB" --kind job.spawned \
   --payload-json '{"owner_lane":"lane-a","label":"wrk-a","pane_id":"w1:p1"}' >/dev/null
 printf 'round two terminal line\n' >"$rnd4_report"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$RND_JOBS" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-rnd" \
+  ARBITER_INBOX_ROOT="$RND_JOBS" \
   WRK_FIXTURE_SCENARIO=sentinel-done WRK_COMPLETION_TIMEOUT_S=30 \
   WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel "$RND4_JOB" lane-a wrk-a w1:p1 "$rnd4_report" >/dev/null 2>&1 &
@@ -12404,12 +13477,13 @@ PY
 echo "PASS 1014-s1-snapshot-bytes-match-record-digest"
 
 # R18 completion sentinel: a report alone is never completion evidence. A
-# worker still working must time out/lost rather than emit job.completed.
+# worker still working past the watch window must not emit job.completed, and
+# since hk 1888 the live pane is not job.lost either: the sentinel only leaves.
 SENTINEL_REPORT="$TMP/sentinel-report.md"
 printf 'sentinel final line\n' >"$SENTINEL_REPORT"
 SENTINEL_INBOX="$TMP/sentinel-inbox"
 set +e
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-working WRK_COMPLETION_TIMEOUT_S=1 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_LOST_GRACE=0 \
   "$WRK" sentinel sentinel-working lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1
@@ -12420,13 +13494,11 @@ if find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.completed.json' | 
   echo "working agent incorrectly emitted job.completed" >&2
   exit 1
 fi
-find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.lost.json' | grep -q .
-python3 - "$SENTINEL_INBOX/sentinel-working/events" <<'PY'
-import glob, json, sys
-lost = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.lost.json"))]
-assert lost and lost[0].get("reason") == "timeout", (
-    "an expired watch window is job.lost with reason=timeout, got %r" % lost)
-PY
+if find "$SENTINEL_INBOX/sentinel-working/events" -name '*job.lost.json' -o -name '*job.revoked.json' | grep -q .; then
+  echo "an expired watch window on a live pane must not write job.lost or job.revoked" >&2
+  exit 1
+fi
+grep -q 'action=watch-expired elapsed=' "$SENTINEL_INBOX/sentinel-working/completion-sentinel.log"
 echo "PASS r18-sentinel-requires-terminal-status"
 
 # Automatic discovery must work on macOS too, and the observation key must be
@@ -12436,9 +13508,9 @@ env ARBITER_INBOX_ROOT="$SENTINEL_INBOX" "$ARBITER" claim \
   --job sentinel-idle --lane test-lane --agent-label test-label --t T1 >/dev/null
 env ARBITER_INBOX_ROOT="$SENTINEL_INBOX" "$ARBITER" event --job sentinel-idle \
   --kind job.spawned --payload-json '{"owner_lane":"test-lane","label":"test-label","pane_id":"test:pane"}' >/dev/null
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
-  "$WRK" sentinel sentinel-idle lane worker w:p1 "" >/dev/null 2>&1 &
+  "$WRK" sentinel sentinel-idle lane worker test:pane "" >/dev/null 2>&1 &
 sentinel_idle_pid=$!
 own "$sentinel_idle_pid"
 sleep 2
@@ -12463,7 +13535,7 @@ echo "PASS r18-sentinel-portable-discovery-and-dedupe"
 # Both terminal statuses are accepted; `done` is tested separately so this is
 # an explicit status-set contract rather than an idle-only implementation.
 SENTINEL_INBOX="$TMP/sentinel-done-inbox"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$SENTINEL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-done WRK_COMPLETION_TIMEOUT_S=20 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel sentinel-done lane worker w:p1 "$SENTINEL_REPORT" >/dev/null 2>&1 &
 sentinel_done_pid=$!
@@ -12483,7 +13555,7 @@ echo "PASS r18-sentinel-accepts-done-status"
 TRANSIENT_INBOX="$TMP/sentinel-transient-inbox"
 TRANSIENT_SEQ="$TMP/sentinel-transient.seq"
 printf '%s\n' empty exit1 garbage socket working idle >"$TRANSIENT_SEQ"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$TRANSIENT_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$TRANSIENT_INBOX" \
   WRK_FIXTURE_GET_SEQUENCE="$TRANSIENT_SEQ" \
   WRK_COMPLETION_TIMEOUT_S=120 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_TRANSIENT_MAX=10 WRK_SENTINEL_LOST_GRACE=0 \
@@ -12521,7 +13593,7 @@ GRACE_SEQ="$TMP/sentinel-grace.seq"
 printf '%s\n' empty empty empty empty idle >"$GRACE_SEQ"
 GRACE_REPORT="$TMP/sentinel-grace-report.md"
 rm -f "$GRACE_REPORT"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$GRACE_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$GRACE_INBOX" \
   WRK_FIXTURE_GET_SEQUENCE="$GRACE_SEQ" \
   WRK_COMPLETION_TIMEOUT_S=300 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_TRANSIENT_MAX=3 WRK_SENTINEL_LOST_GRACE=120 \
@@ -12556,7 +13628,7 @@ echo "PASS sentinel-lost-grace-still-completes"
 GONE_INBOX="$TMP/sentinel-gone-inbox"
 GONE_SEQ="$TMP/sentinel-gone.seq"
 printf '%s\n' not-found >"$GONE_SEQ"
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$GONE_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$GONE_INBOX" \
   WRK_FIXTURE_GET_SEQUENCE="$GONE_SEQ" \
   WRK_COMPLETION_TIMEOUT_S=300 WRK_COMPLETION_INTERVAL_S=1 \
   WRK_SENTINEL_TRANSIENT_MAX=10 WRK_SENTINEL_LOST_GRACE=0 \
@@ -12692,7 +13764,8 @@ idem_claim idem-race
 IDEM_RACE_REPORT="$TMP/idem-race-report.md"
 printf 'race verdict line\n' >"$IDEM_RACE_REPORT"
 env ARBITER_INBOX_ROOT="$IDEM_INBOX" "$WRK" 'done' idem-race --report "$IDEM_RACE_REPORT" >/dev/null 2>&1
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-idem" \
+  ARBITER_INBOX_ROOT="$IDEM_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=30 WRK_COMPLETION_INTERVAL_S=1 \
   "$WRK" sentinel idem-race lane-a wrk-a w1:p1 "$IDEM_RACE_REPORT" >/dev/null 2>&1 &
 idem_race_pid=$!
@@ -12739,7 +13812,8 @@ IDEM_PARTIAL_REPORT="$TMP/idem-partial-report.md"
 printf 'partial draft\n' >"$IDEM_PARTIAL_REPORT"
 # The 3s interval leaves a whole settle window between the pending sighting and
 # the completion decision — enough to swap in the final content deterministically.
-env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$IDEM_PARTIAL_INBOX" \
+env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" XDG_DATA_HOME="$TMP/xdg-idem" \
+  ARBITER_INBOX_ROOT="$IDEM_PARTIAL_INBOX" \
   WRK_FIXTURE_SCENARIO=sentinel-idle WRK_COMPLETION_TIMEOUT_S=60 WRK_COMPLETION_INTERVAL_S=3 \
   "$WRK" sentinel idem-partial lane-a wrk-a w1:p1 "$IDEM_PARTIAL_REPORT" >/dev/null 2>&1 &
 idem_partial_pid=$!
@@ -13288,6 +14362,110 @@ grep -q '^closed job=reap-unkept ' <<<"$keep_apply_out" ||
   fail "#603: --apply must still close the unprotected control: $keep_apply_out"
 echo "PASS reap-skips-kept-jobs"
 
+# hk1823: explicit job selection must bound both dry-run output and the later
+# close set. Use one shared lane with three exact-name lookalikes.
+printf 'idle\n%.0s' {1..100} >"$TMP/reap-job-idle-sequence"
+export WRK_FIXTURE_GET_SEQUENCE="$TMP/reap-job-idle-sequence"
+reap_job b1 w1:p1 w1:t1 lane-a job.completed
+reap_job b10 w1:p2 w1:t2 lane-a job.completed
+reap_job xb1 w1:p4 w1:t4 lane-a job.completed
+selected_out="$(reap_run --lane lane-a --job b1)"
+grep -q '^would-close job=b1 ' <<<"$selected_out" || fail "--job b1 must select the exact b1 job: $selected_out"
+for unselected in b10 xb1; do
+  grep -q "$unselected" <<<"$selected_out" && fail "--job b1 must omit $unselected entirely: $selected_out"
+done
+multi_out="$(reap_run --lane lane-a --job b10 --job xb1)"
+grep -q '^would-close job=b10 ' <<<"$multi_out" || fail "repeated --job must retain its first id: $multi_out"
+grep -q '^\(would-close\|skip\) job=xb1 ' <<<"$multi_out" || fail "repeated --job must retain its second id: $multi_out"
+comma_out="$(reap_run --lane lane-a --job b10,xb1)"
+if ! grep -q 'job=b10 ' <<<"$comma_out" || ! grep -q 'job=xb1 ' <<<"$comma_out"; then
+  fail "comma-separated --job must select both named jobs: $comma_out"
+fi
+: >"$REAP_LOG"
+selected_apply="$(reap_run --lane lane-a --job b1 --apply)"
+grep -q '^closed job=b1 ' <<<"$selected_apply" || fail "--apply must close selected b1: $selected_apply"
+[[ "$(grep -c '^tab close ' "$REAP_LOG")" -eq 1 ]] || fail "--job b1 must close exactly one tab: $(cat "$REAP_LOG")"
+grep -q '^tab close w1:t1$' "$REAP_LOG" || fail "selected job's tab was not closed: $(cat "$REAP_LOG")"
+for unselected in b10 xb1; do
+  [[ "$(event_count "$REAP_INBOX/$unselected/events" job.reaped)" -eq 0 ]] || fail "unnamed job $unselected was reaped"
+done
+echo "PASS reap-job-filter-exact-and-apply"
+
+if invalid_job_out="$(reap_run --lane lane-a --job '' 2>&1)"; then
+  fail "an empty --job value must fail: $invalid_job_out"
+fi
+grep -q -- '--job requires a non-empty value' <<<"$invalid_job_out" || fail "empty --job error must be clear: $invalid_job_out"
+if invalid_job_out="$(reap_run --lane lane-a --job ,b1 2>&1)"; then
+  fail "an empty id in --job list must fail: $invalid_job_out"
+fi
+grep -q -- '--job contains an empty job id' <<<"$invalid_job_out" || fail "empty list item error must be clear: $invalid_job_out"
+
+# Recheck pane status during --apply. A named job that became working since
+# the dry run is explicitly reported as no longer a candidate and stays open.
+printf 'idle\nworking\n' >"$TMP/reap-job-status-sequence"
+rm -f "$TMP/reap-job-status-sequence.calls"
+reap_job reap-changes w1:p1 w1:t1 lane-a job.completed
+WRK_FIXTURE_GET_SEQUENCE="$TMP/reap-job-status-sequence" reap_run --lane lane-a --job reap-changes >/dev/null
+: >"$REAP_LOG"
+changed_out="$(WRK_FIXTURE_GET_SEQUENCE="$TMP/reap-job-status-sequence" reap_run --lane lane-a --job reap-changes --apply)"
+grep -q '^skip job=reap-changes reason=not-candidate$' <<<"$changed_out" || fail "a selected job that became working must be not-candidate: $changed_out"
+! grep -q '^tab close ' "$REAP_LOG" || fail "a job that became working must remain open: $(cat "$REAP_LOG")"
+echo "PASS reap-job-apply-time-candidate-change"
+
+# hk1823 M1: dropping only the apply-path selector must close the unnamed
+# control job, which the real close log detects.
+reap_job reap-filter-target w1:p1 w1:t1 reap-filter-lane job.completed
+reap_job reap-filter-extra w1:p2 w1:t2 reap-filter-lane job.completed
+M1823_APPLY="$TMP/wrk-reap-no-apply-filter"
+# shellcheck disable=SC2016 # sed source is the literal wrk apply guard.
+sed 's/if ! reap_job_selected "$job_filter" "$job"; then continue; fi # hk1823-apply-job-filter/: # hk1823 mutant drops apply filter/' \
+  "$WRK" >"$M1823_APPLY"
+chmod +x "$M1823_APPLY"
+grep -qF 'hk1823 mutant drops apply filter' "$M1823_APPLY" || fail "hk1823 M1 did not mutate the apply call site"
+: >"$REAP_LOG"
+saved_wrk="$WRK"
+WRK="$M1823_APPLY"
+m1_out="$(reap_run --lane reap-filter-lane --job reap-filter-target --apply)"
+WRK="$saved_wrk"
+grep -q '^closed job=reap-filter-extra ' <<<"$m1_out" || fail "hk1823 M1 survived: dropping the apply filter did not close the unnamed job: $m1_out / $(cat "$REAP_LOG")"
+echo "PASS hk1823 M1: dropping apply-only filter goes RED at the close-log assertion"
+
+# hk1823 M2: a prefix comparison admits b10 when only b1 was named.
+M1823_PREFIX="$TMP/wrk-reap-prefix-match"
+# shellcheck disable=SC2016 # sed source is the literal selector comparison.
+sed 's/\[\[ "$candidate" == "$job" \]\]/[[ "$job" == "$candidate"* ]]/' "$saved_wrk" >"$M1823_PREFIX"
+chmod +x "$M1823_PREFIX"
+# shellcheck disable=SC2016 # the grep pattern is the literal mutant.
+grep -qF '[[ "$job" == "$candidate"* ]]' "$M1823_PREFIX" || fail "hk1823 M2 did not mutate the selector comparison"
+WRK="$M1823_PREFIX"
+m2_out="$(reap_run --lane lane-a --job b1)"
+WRK="$saved_wrk"
+grep -q 'job=b10 ' <<<"$m2_out" || fail "hk1823 M2 survived: prefix mutant did not admit b10: $m2_out"
+echo "PASS hk1823 M2: prefix-match mutant goes RED on exact-id output assertion"
+
+# hk1823 M3: ignoring the second selector must omit xb1 from the repeated form.
+M1823_SECOND="$TMP/wrk-reap-first-job-only"
+# shellcheck disable=SC2016 # sed source is the literal --job parser append.
+sed 's/job_filter+="$job_value"/[[ -n "$job_filter" ]] || job_filter="$job_value"; :/' "$saved_wrk" >"$M1823_SECOND"
+chmod +x "$M1823_SECOND"
+# shellcheck disable=SC2016 # the grep pattern is the literal mutant.
+grep -qF '[[ -n "$job_filter" ]] || job_filter="$job_value"; :' "$M1823_SECOND" || fail "hk1823 M3 did not mutate repeated --job parsing"
+WRK="$M1823_SECOND"
+m3_out="$(reap_run --lane lane-a --job b10 --job xb1)"
+WRK="$saved_wrk"
+if grep -q '^would-close job=xb1 ' <<<"$m3_out"; then fail "hk1823 M3 survived: second --job still appeared: $m3_out"; fi
+echo "PASS hk1823 M3: ignored-second-job mutant goes RED on repeated-id assertion"
+
+# No selector preserves the existing byte output contract.
+baseline_out="$(reap_run --lane lane-a)"
+next_baseline_out="$(reap_run --lane lane-a)"
+baseline_out="$(sed -E 's/ age=[0-9]+s$/ age=AGE/' <<<"$baseline_out")"
+next_baseline_out="$(sed -E 's/ age=[0-9]+s$/ age=AGE/' <<<"$next_baseline_out")"
+[[ "$next_baseline_out" == "$baseline_out" ]] || fail "reap output changed without --job"
+echo "PASS reap-job-filter-default-output"
+
+
+
 # ── #499: done/escalate/joined hand over to `panewire job` only when it exists ──
 # Deployment order must not matter: with a panewire that lacks the command (or
 # no panewire at all) wrk behaves exactly as before, and whichever path runs,
@@ -13315,6 +14493,7 @@ j499_calls() { if [[ -f "$1" ]]; then grep -cx -- '--' "$1" || true; else echo 0
 # present: wrk hands the exact arguments over and writes nothing of its own.
 j499_claim j499-worker
 j499_claim j499-builder --role builder --parent-lane parent-a
+seed_join_round "$J499_INBOX" j499-builder
 out="$(j499_run 1 present present 'done' j499-worker --report "$J499_REPORT")"
 [[ "$out" == "fixture job done j499-worker --report $J499_REPORT" ]] ||
   fail "delegated done must pass panewire's stdout through: $out"
@@ -13363,6 +14542,7 @@ for mode in absent garbage off; do
   worker="j499-$mode-worker" builder="j499-$mode-builder"
   j499_claim "$worker"
   j499_claim "$builder" --role builder --parent-lane parent-a
+  seed_join_round "$J499_INBOX" "$builder"
   out="$(j499_run "$delegate" "$job_mode" "$mode" 'done' "$worker" --report "$J499_REPORT")"
   [[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "$mode: done output changed: $out"
   out="$(j499_run "$delegate" "$job_mode" "$mode" escalate "$builder" --question 'fallback question')"
@@ -13398,6 +14578,7 @@ mode=hang
 worker="j499-$mode-worker" builder="j499-$mode-builder"
 j499_claim "$worker"
 j499_claim "$builder" --role builder --parent-lane parent-a
+seed_join_round "$J499_INBOX" "$builder"
 out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang 'done' "$worker" --report "$J499_REPORT")"
 [[ "$out" == "OK job=$worker report=$J499_REPORT" ]] || fail "hang: done output changed: $out"
 out="$(WRK_JOB_DELEGATE_TIMEOUT_S=2 j499_run 1 hang hang escalate "$builder" --question 'fallback question')"
@@ -13744,6 +14925,91 @@ scan="$(order_scan b1729-nospawn)"
   fail "job_events_scan must report ended 1 without the respawn: $scan"
 echo "PASS hk1750-completed-without-respawn-stays-a-candidate"
 
+# hk 1770: job.recovered closes a loss episode. It is not a terminal and not a
+# revive, so a finished job stays finished and a live job stays live.
+[[ "$(grep -c 'NEUTRAL = {"job.lost", "job.recovered"}' "$WRK")" -eq 4 ]] ||
+  fail "job.lost and job.recovered must be on the neutral allowlist of all four readers"
+[[ "$(grep -c 'neutral event kind is also terminal or revive' "$WRK")" -eq 4 ]] ||
+  fail "each neutral allowlist must reject a kind that is also terminal or revive"
+RECOV_INBOX="$TMP/recovered-inbox"
+python3 - "$RECOV_INBOX" <<'PY'
+import json, os, sys
+root = sys.argv[1]
+
+def write(job, name, doc):
+    directory = os.path.join(root, job, "events")
+    os.makedirs(directory, exist_ok=True)
+    with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+        json.dump(doc, handle)
+        handle.write("\n")
+
+write("recov-ended", "00001-job.claim.json",
+      {"kind": "job.claim", "at": "2020-01-01T00:00:00Z",
+       "payload": {"owner_lane": "w1", "label": "lbl", "role": "worker"}})
+write("recov-ended", "00002-job.spawned.json",
+      {"kind": "job.spawned", "at": "2020-01-01T00:00:01Z",
+       "payload": {"pane_id": "w1:p1", "tab_id": "w1:t1"}})
+write("recov-ended", "00003-job.completed.json",
+      {"kind": "job.completed", "at": "2020-01-02T00:00:00Z",
+       "payload": {"owner_lane": "w1", "pane_id": "w1:p1"}})
+write("recov-ended", "00004-job.recovered.json",
+      {"kind": "job.recovered", "at": "2020-06-01T00:00:00Z",
+       "job_id": "recov-ended", "owner_lane": "w1", "reason": "agent_not_found",
+       "lost_duration_s": 3})
+write("recov-live", "00001-job.claim.json",
+      {"kind": "job.claim", "at": "2020-01-01T00:00:00Z",
+       "payload": {"owner_lane": "w1", "label": "lbl"}})
+write("recov-live", "00002-job.spawned.json",
+      {"kind": "job.spawned", "at": "2020-01-01T00:00:01Z",
+       "payload": {"pane_id": "w1:p3", "tab_id": "w1:t3"}})
+write("recov-live", "00003-job.lost.json",
+      {"kind": "job.lost", "at": "2020-01-01T00:01:00Z", "reason": "agent_not_found"})
+write("recov-live", "00004-job.recovered.json",
+      {"kind": "job.recovered", "at": "2020-01-01T00:02:00Z",
+       "reason": "agent_not_found", "lost_duration_s": 60})
+PY
+# shellcheck disable=SC2016 # $1..$3 are the child shell's argv
+recov_scan() {
+  env ARBITER_INBOX_ROOT="$RECOV_INBOX" \
+    bash -c 'set -euo pipefail; . "$1"; job_events_scan "$2/$3/events"' _ \
+    "$ORDER_LIB" "$RECOV_INBOX" "$1"
+}
+scan="$(recov_scan recov-ended)"
+[[ "$(cut -f2 <<<"$scan")" == 1 ]] ||
+  fail "job.recovered after completed must stay ended: $scan"
+[[ "$(cut -f4 <<<"$scan")" == job.completed ]] ||
+  fail "job.recovered must not replace the terminal kind: $scan"
+[[ "$(cut -f6 <<<"$scan")" == job.recovered ]] ||
+  fail "job.recovered may be the newest kind without ending or reviving: $scan"
+scan="$(recov_scan recov-live)"
+[[ "$(cut -f2 <<<"$scan")" == 0 ]] ||
+  fail "claim, lost, and recovered with no terminal must stay not ended: $scan"
+[[ "$(cut -f4 <<<"$scan")" == "-" ]] ||
+  fail "job.recovered must not become a terminal kind: $scan"
+[[ "$(cut -f6 <<<"$scan")" == job.recovered ]] ||
+  fail "the live job's newest kind is job.recovered: $scan"
+recov_reap="$(env HERDR_BIN="$HERDR" ARBITER_INBOX_ROOT="$RECOV_INBOX" \
+  WRK_FIXTURE_SCENARIO=reap "$WRK" reap --lane w1 --grace 0 2>&1)" ||
+  fail "reap over recovered fixtures failed: $recov_reap"
+grep -q '^would-close job=recov-ended ' <<<"$recov_reap" ||
+  fail "completed then recovered stays a reap candidate: $recov_reap"
+if grep -q 'job=recov-live' <<<"$recov_reap"; then
+  fail "lost plus recovered with no terminal is not a reap candidate: $recov_reap"
+fi
+# shellcheck disable=SC2016 # $1 and $2 are the child shell's argv
+recov_end="$(env ARBITER_INBOX_ROOT="$RECOV_INBOX" \
+  bash -c 'set -euo pipefail; . "$1"; job_end_record "$2" w1 abandoned probe test' _ \
+  "$ORDER_LIB" recov-live)"
+[[ "$recov_end" == created ]] ||
+  fail "job.recovered must not block a later end declaration: $recov_end"
+# shellcheck disable=SC2016 # $1 and $2 are the child shell's argv
+recov_end="$(env ARBITER_INBOX_ROOT="$RECOV_INBOX" \
+  bash -c 'set -euo pipefail; . "$1"; job_end_record "$2" w1 abandoned probe test' _ \
+  "$ORDER_LIB" recov-ended)"
+[[ "$recov_end" == already-ended ]] ||
+  fail "a completed job stays ended after job.recovered: $recov_end"
+echo "PASS hk1770-recovered-is-neutral"
+
 # Two wrk writers of the same kind racing on one directory: both records land
 # and neither overwrites the other (exclusive create + bounded retry).
 CONC_DIR="$ORDER_INBOX/order-conc/events"
@@ -14013,8 +15279,259 @@ exhaust_after="$(python3 -c 'import hashlib,sys; print(hashlib.sha256(open(sys.a
   fail "exhausted numbering overwrote the existing record"
 echo "PASS hk1750-helper-fallback-and-bounded-exhaustion"
 
+# ------------------------------------------------------------------
+# hk 1137 — the machine/job-id allowlist must be ASCII under any locale
+# ------------------------------------------------------------------
+# bin/wrk gates ids with bash =~ ranges like ^[A-Za-z0-9._-]{1,64}$. Those
+# ranges follow the caller's locale collation: under en_US.UTF-8 they also
+# match ~2000 non-ASCII letters and symbols (e-acute included), and the
+# accepted value can then echo into a warning. Every site must match under
+# LC_ALL=C. These probes drive each site with a non-ASCII id under both
+# locale shapes — LC_ALL=en_US.UTF-8, and LANG=en_US.UTF-8 with LC_ALL
+# unset — and prove refusal plus a message that carries no raw non-ASCII
+# bytes. ASCII boundary ids (64 accepted, 65 refused, . _ - accepted) are
+# unchanged.
+
+T1137_LOCALE=""
+for _t1137_cand in en_US.UTF-8 en_US.utf8; do
+  if locale -a 2>/dev/null | grep -qiF "$_t1137_cand"; then
+    T1137_LOCALE="$_t1137_cand"
+    break
+  fi
+done
+unset _t1137_cand
+
+# A non-ASCII id byte sequence must never appear in stderr/stdout. grep in
+# C locale treats the file as bytes; the pattern is the UTF-8 encoding of
+# U+00E9 (e-acute).
+t1137_no_raw_eacute() {  # FILE TAG — fail when the raw bytes are present
+  ! LC_ALL=C grep -q $'\xc3\xa9' "$1" ||
+    fail "hk1137 $2: raw non-ASCII bytes reached $1: $(cat "$1")"
+}
+
+# Usage-stage probes (--lane-defer/--parent-job/--takeover-from): a minimal
+# spawn env; validation dies before any fixture is needed. The caller sets
+# the locale through the command's env prefix.
+t1137_usage() {
+  set +e
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
+    ARBITER_BIN="$TMP/absent-arbiter" ARBITER_INBOX_ROOT="$TMP/t1137-inbox" \
+    XDG_DATA_HOME="$TMP/t1137-xdg" WRK_NO_SLEEP=1 \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_LOG="$TMP/t1137-usage-herdr.log" \
+    WRK_SCOPEFUEL_LOG="$TMP/t1137-usage-scopefuel.log" \
+    WRK_HOSTS_CONFIG="$TMP/t1137-no-such-hosts.toml" \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m "${T1137_MODEL:-codex-luna}" -p "$PROMPT" \
+    -w w -l t1137-usage --t T1 "$@" >"$T1137_OUT" 2>"$T1137_ERR"
+  T1137_RC=$?
+  set -e
+}
+
+T1137_OUT="$TMP/t1137.out" T1137_ERR="$TMP/t1137.err" T1137_RC=0
+T1137_EACUTE_ID=$'mach\u00e9ne'          # non-ASCII machine-shaped id
+T1137_EACUTE_JOB=$'j\u00e9b'             # non-ASCII job-shaped id
+T1137_ID64="a$(printf 'b%.0s' {1..62})c" # exactly 64 ASCII chars
+T1137_ID65="a$(printf 'b%.0s' {1..63})c" # 65 — one past the bound
+[[ ${#T1137_ID64} -eq 64 && ${#T1137_ID65} -eq 65 ]] ||
+  fail "hk1137: boundary fixtures miscounted"
+
+# Configs for the hub_lane_register sites: a [hub] machine_id fallback with
+# a non-ASCII value, a session_machine_ids entry with a non-ASCII machine,
+# and a lanes node token file whose HUB_MACHINE_ID is non-ASCII.
+T1137_CFG_BADMID="$TMP/t1137-badmid-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_EACUTE_ID" >"$T1137_CFG_BADMID"
+T1137_CFG_BADMAP="$TMP/t1137-badmap-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "%s" }\n' \
+  "$LANES_NODE_FILE" "$T1137_EACUTE_ID" >"$T1137_CFG_BADMAP"
+T1137_NODE_BAD="$TMP/t1137-node-bad.env"
+printf 'HUB_MACHINE_ID=%s\nHUB_TOKEN=fixture-t1137-node-token\n' "$T1137_EACUTE_ID" >"$T1137_NODE_BAD"
+chmod 600 "$T1137_NODE_BAD"
+T1137_CFG_BADNODE="$TMP/t1137-badnode-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "mac-work-default" }\n' \
+  "$T1137_NODE_BAD" >"$T1137_CFG_BADNODE"
+# Boundary configs: 64-char machine_id (accepted, registers), 65-char
+# (refused), and a lanes node file carrying a 64-char HUB_MACHINE_ID that
+# matches the session machine.
+T1137_CFG_MID64="$TMP/t1137-mid64-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_ID64" >"$T1137_CFG_MID64"
+T1137_CFG_MID65="$TMP/t1137-mid65-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "%s"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" "$T1137_ID65" >"$T1137_CFG_MID65"
+T1137_NODE_64="$TMP/t1137-node-64.env"
+printf 'HUB_MACHINE_ID=%s\nHUB_TOKEN=fixture-t1137-node64-token\n' "$T1137_ID64" >"$T1137_NODE_64"
+chmod 600 "$T1137_NODE_64"
+T1137_CFG_NODE64="$TMP/t1137-node64-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\nlanes_token_env = "%s"\nsession_machine_ids = { "default" = "%s" }\n' \
+  "$T1137_NODE_64" "$T1137_ID64" >"$T1137_CFG_NODE64"
+T1137_CFG_DOTID="$TMP/t1137-dotid-hosts.toml"
+printf '[hub]\nhub_url = "https://hub.invalid"\noperator_token_env = "%s"\nhub_cf_env = "%s"\nmachine_id = "mac.x_y-z"\n' \
+  "$LANES_OP_FILE" "$LANES_CF_FILE" >"$T1137_CFG_DOTID"
+
+# ASCII boundary behaviour is locale-independent — run it unconditionally so
+# a runner without en_US.UTF-8 still proves the allowlist kept its shape.
+# Site: --lane-defer (die path).
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-b64 --parent director-x \
+  --task 1 --lane-defer "$T1137_ID64"
+! grep -q 'expects a machine id' "$T1137_ERR" ||
+  fail "hk1137: a 64-char --lane-defer must be accepted: $(cat "$T1137_ERR")"
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-b65 --parent director-x \
+  --task 1 --lane-defer "$T1137_ID65"
+[[ "$T1137_RC" -eq 2 ]] ||
+  fail "hk1137: a 65-char --lane-defer must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+grep -q 'matching \[A-Za-z0-9._-\]' "$T1137_ERR" ||
+  fail "hk1137: the 65-char refusal must name the charset: $(cat "$T1137_ERR")"
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-bdot --parent director-x \
+  --task 1 --lane-defer 'a.b_c-d'
+! grep -q 'expects a machine id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --lane-defer: $(cat "$T1137_ERR")"
+# Site: --parent-job (die path). Job ids have no length cap; only the
+# charset matters.
+LC_ALL=C t1137_usage --role tester --parent-job 'job.a_b-9'
+! grep -q 'must be a job id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --parent-job: $(cat "$T1137_ERR")"
+LC_ALL=C t1137_usage --role tester --parent-job 'job/bad'
+[[ "$T1137_RC" -eq 2 ]] ||
+  fail "hk1137: a slash in --parent-job must still refuse rc 2 (rc=$T1137_RC)"
+# Site: --takeover-from (die path, same job-id charset).
+LC_ALL=C T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-tk --parent director-x \
+  --task 1 --takeover-from 'job.a_b-9'
+! grep -q 'must be a job id' "$T1137_ERR" ||
+  fail "hk1137: . _ - must stay accepted in --takeover-from: $(cat "$T1137_ERR")"
+# Site: [hub] machine_id fallback — 64 chars registers, 65 warns malformed.
+LANES_CFG_OVERRIDE="$T1137_CFG_MID64" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-m64 --role builder --lane t1137-m64 --parent director-x
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: 64-char machine_id spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-m64@'"$T1137_ID64"'$' "$LANES_OUT" ||
+  fail "hk1137: the 64-char machine_id must register: $(cat "$LANES_OUT")"
+LANES_CFG_OVERRIDE="$T1137_CFG_MID65" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-m65 --role builder --lane t1137-m65 --parent director-x
+grep -q 'machine_id is malformed' "$LANES_ERR" ||
+  fail "hk1137: a 65-char machine_id must warn malformed: $(cat "$LANES_ERR")"
+# Site: '.', '_' and '-' inside machine_id stay accepted.
+LANES_CFG_OVERRIDE="$T1137_CFG_DOTID" LANES_MODEL=builder-sol \
+  lanes_spawn t1137-mdot --role builder --lane t1137-mdot --parent director-x
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: mac.x_y-z machine_id spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-mdot@mac\.x_y-z$' "$LANES_OUT" ||
+  fail "hk1137: mac.x_y-z must register as the machine: $(cat "$LANES_OUT")"
+# Site: lanes_token_env HUB_MACHINE_ID — 64 chars registers, matched against
+# the session machine.
+LANES_CFG_OVERRIDE="$T1137_CFG_NODE64" HERDR_SESSION=default \
+  lanes_spawn t1137-n64 --owner work-kairos
+[[ "$LANES_RC" -eq 0 ]] ||
+  fail "hk1137: 64-char HUB_MACHINE_ID spawn failed (rc=$LANES_RC): $(cat "$LANES_ERR")"
+grep -q ' lane=t1137-n64@'"$T1137_ID64"'$' "$LANES_OUT" ||
+  fail "hk1137: the 64-char HUB_MACHINE_ID must register: $(cat "$LANES_OUT")"
+echo "PASS hk1137-ascii boundaries: 64 accepted, 65 refused, . _ - accepted"
+
+if [[ -z "$T1137_LOCALE" ]]; then
+  # The refusal probes NEED a UTF-8 locale — under C even an unpinned =~
+  # refuses e-acute, so a green run would be vacuous. Say SKIP with the
+  # reason; never let the section pass silently.
+  echo "SKIP hk1137-ascii refusal probes: no en_US.UTF-8 locale on this runner"
+else
+  # Run every site probe under both locale shapes: LC_ALL pinned, and
+  # LANG-only with LC_ALL unset (the second is the ambient-locale path —
+  # LANG only applies when LC_ALL is absent). The probes are shell
+  # functions, so the locale is set at suite level per mode and restored
+  # after the loop.
+  t1137_had_lc=0; [[ -n "${LC_ALL+x}" ]] && t1137_had_lc=1
+  t1137_had_lang=0; [[ -n "${LANG+x}" ]] && t1137_had_lang=1
+  t1137_saved_lc="${LC_ALL-}" t1137_saved_lang="${LANG-}"
+  for t1137_mode in LC_ALL LANG_ONLY; do
+    if [[ "$t1137_mode" == LC_ALL ]]; then
+      export LC_ALL="$T1137_LOCALE"
+      t1137_tag=lcall
+    else
+      t1137_tag=lang
+      unset LC_ALL
+      export LANG="$T1137_LOCALE"
+    fi
+
+    # Site: --lane-defer. Fixed build: rc 2 + charset message + no raw é.
+    # Unfixed: é passes validation and the spawn proceeds — rc != 2 and no
+    # refusal line.
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-ld --parent director-x \
+      --task "$(mint_task)" --lane-defer "$T1137_EACUTE_ID"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --lane-defer must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'matching \[A-Za-z0-9._-\]' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --lane-defer refusal must name the charset: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "lane-defer/$t1137_mode"
+
+    # Site: --parent-job. Fixed build: rc 2; the die may name the value only
+    # scrubbed — the raw é bytes must not reach stderr.
+    t1137_usage --role tester --parent-job "$T1137_EACUTE_JOB"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --parent-job must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'must be a job id' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --parent-job refusal must name the rule: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "parent-job/$t1137_mode"
+
+    # Site: --takeover-from — same job-id charset, builder-only flag.
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-tk2 --parent director-x \
+      --task 1 --takeover-from "$T1137_EACUTE_JOB"
+    [[ "$T1137_RC" -eq 2 ]] ||
+      fail "hk1137/$t1137_mode: non-ASCII --takeover-from must refuse rc 2 (rc=$T1137_RC): $(cat "$T1137_ERR")"
+    grep -q 'must be a job id' "$T1137_ERR" ||
+      fail "hk1137/$t1137_mode: the --takeover-from refusal must name the rule: $(cat "$T1137_ERR")"
+    t1137_no_raw_eacute "$T1137_ERR" "takeover-from/$t1137_mode"
+
+    # Site: [hub] machine_id fallback. Fixed build: the value-free malformed
+    # warning and no lanes call. Unfixed: é registers a lane on 'machéne'.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADMID" LANES_MODEL=builder-sol \
+      lanes_spawn "t1137-mid-$t1137_tag" --role builder --lane "t1137-mid-$t1137_tag" --parent director-x
+    grep -q 'machine_id is malformed' "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII machine_id must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "machine_id/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-mid-$t1137_tag"
+
+    # Site: session_machine_ids value. Fixed build: refuse closed with a
+    # value-free warning; unfixed, the non-ASCII machine reaches lanes add
+    # and the lane= field.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADMAP" HERDR_SESSION=default \
+      lanes_spawn "t1137-map-$t1137_tag" --owner work-kairos
+    grep -q "session's machine id is malformed" "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII session machine must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "session-map/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-map-$t1137_tag"
+
+    # Site: lanes_token_env HUB_MACHINE_ID. Fixed build: value-free
+    # malformed warning. Unfixed: é passes the charset check and the
+    # mismatch warning echoes 'machéne' verbatim.
+    LANES_CFG_OVERRIDE="$T1137_CFG_BADNODE" HERDR_SESSION=default \
+      lanes_spawn "t1137-node-$t1137_tag" --owner work-kairos
+    grep -q 'lanes_token_env HUB_MACHINE_ID is malformed' "$LANES_ERR" ||
+      fail "hk1137/$t1137_mode: a non-ASCII HUB_MACHINE_ID must warn malformed: $(cat "$LANES_ERR")"
+    t1137_no_raw_eacute "$LANES_ERR" "lanes-machine/$t1137_mode"
+    lanes_assert_no_lanes_call "t1137-node-$t1137_tag"
+  done
+  # Restore the suite's original locale env.
+  if (( t1137_had_lc )); then export LC_ALL="$t1137_saved_lc"; else unset LC_ALL; fi
+  if (( t1137_had_lang )); then export LANG="$t1137_saved_lang"; else unset LANG; fi
+  echo "PASS hk1137-ascii refusals: non-ASCII refused at every site under LC_ALL and LANG"
+
+  # Mutant — drop the locale pin at the --lane-defer site and that site's
+  # probe must go RED: é is accepted again, so there is no rc-2 refusal.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+  devin_trust_mutant t1137-unpin \
+    "ascii_re \"\$LANE_DEFER\" '^[A-Za-z0-9._-]{1,64}\$'" \
+    '[[ "$LANE_DEFER" =~ ^[A-Za-z0-9._-]{1,64}$ ]]'
+  LC_ALL="$T1137_LOCALE" WRK_UNDER_TEST="$TMP/mut-wrk-t1137-unpin" \
+    T1137_MODEL=builder-sol t1137_usage --role builder --lane t1137-mut --parent director-x \
+    --task "$(mint_task)" --lane-defer "$T1137_EACUTE_ID"
+  [[ "$T1137_RC" -ne 2 || ! -s "$T1137_ERR" ]] ||
+    fail "hk1137 M1 mutant survived: --lane-defer still refused the non-ASCII id without the locale pin"
+  echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
+fi
+
 bash "$ROOT/tests/test-shellcheck-capped.sh"
 # hk 1604: devin gate-profile contract. The real-scopefuel smoke stays opt-in
 # (SCOPEFUEL_SMOKE_REPO), so this CI invocation does not need a checkout.
 bash "$ROOT/tests/test-devin-gate-profile.sh"
+# hk 1990: preserve durable operator refs at the actual apply_catalog call site.
+python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
 echo 'PASS test-wrk'

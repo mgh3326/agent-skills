@@ -15,11 +15,75 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import types
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = "hermes-paper-kis"
+
+
+def find_toml_python():
+    """Return an interpreter providing stdlib tomllib (Python 3.11+), or None.
+
+    bin/wrk and bin/wrk-mock-mcp refuse Codex config inspection without a TOML
+    parser. CI runs these tests under Python 3.14, but a desktop python3 may be
+    older (macOS system python3 is 3.9), so the fixture PATH must pin a capable
+    interpreter instead of assuming sys.executable qualifies.
+    """
+    candidates = [sys.executable]
+    candidates += [p for p in (shutil.which(name) for name in
+                               ("python3.14", "python3.13", "python3.12", "python3.11")) if p]
+    for candidate in dict.fromkeys(candidates):
+        if subprocess.run([candidate, "-c", "import tomllib"], capture_output=True).returncode == 0:
+            return candidate
+    return None
+
+
+PYTHON = find_toml_python()
+
+
+def require_toml_python():
+    if PYTHON is None:
+        raise RuntimeError("no Python 3.11+ interpreter (tomllib) found on PATH or as "
+                           "sys.executable; wrk refuses Codex config inspection without one")
+
+
+def setUpModule():
+    require_toml_python()
+
+
+def _install_tomli_shim():
+    """Delegate tomli to PYTHON when this interpreter lacks a TOML parser.
+
+    Guard mutants load wrk-mock-mcp in-process and its isolation() parses
+    fixture Codex TOML; with no parser those probes refuse early and could
+    never expose a mutation. Subprocesses already run under PYTHON. Values are
+    JSON-round-tripped, which covers every fixture type used here.
+    """
+    if (PYTHON is None or importlib.util.find_spec("tomllib") is not None
+            or importlib.util.find_spec("tomli") is not None):
+        return
+    shim = types.ModuleType("tomli")
+
+    def loads(text):
+        out = subprocess.run(
+            [PYTHON, "-c", "import json,sys,tomllib;json.dump(tomllib.loads(sys.stdin.read()),sys.stdout)"],
+            input=text, text=True, capture_output=True)
+        if out.returncode != 0:
+            raise ValueError(out.stderr.strip() or "TOML parse failed")
+        return json.loads(out.stdout)
+
+    def load(fh):
+        data = fh.read()
+        return loads(data.decode("utf-8") if isinstance(data, bytes) else data)
+
+    shim.loads = loads
+    shim.load = load
+    sys.modules["tomli"] = shim
+
+
+_install_tomli_shim()
 FAKE = r'''#!/usr/bin/env python3
 import json,os,sys
 from pathlib import Path
@@ -150,7 +214,7 @@ class IsolationTests(unittest.TestCase):
             json.dumps({"trusted_paths": [str(self.cwd.resolve())]}))
         python_bin = self.base / "python-bin"
         python_bin.mkdir()
-        (python_bin / "python3").symlink_to(sys.executable)
+        (python_bin / "python3").symlink_to(PYTHON)
         self.env["PATH"] = str(python_bin) + os.pathsep + self.env["PATH"]
         # Direct module probes must use the same isolated homes as subprocesses.
         self.environment = patch.dict(os.environ, self.env, clear=True)
@@ -158,7 +222,7 @@ class IsolationTests(unittest.TestCase):
 
     def tearDown(self):
         for p in self.plans:
-            subprocess.run([sys.executable, str(self.helper), "stop", "--plan", p],
+            subprocess.run([PYTHON, str(self.helper), "stop", "--plan", p],
                            env=self.env, capture_output=True, timeout=15)
             shutil.rmtree(Path(p).parent, ignore_errors=True)
         self.tmp.cleanup()
@@ -176,7 +240,7 @@ class IsolationTests(unittest.TestCase):
                      str(self.repo / "wrk-mcp/profiles.json"), str(extra_log), "--ignore-env"])]
         python = self.base / "python-bin/python3"
         python.unlink()
-        python.write_text("#!" + sys.executable + "\nimport json,os,sys\nfrom pathlib import Path\n"
+        python.write_text("#!" + PYTHON + "\nimport json,os,sys\nfrom pathlib import Path\n"
                           "if len(sys.argv)>3 and sys.argv[1]=='-c' and "
                           "'print(json.load(open(sys.argv[1]))[\"cwd\"])' in sys.argv[2]:\n"
                           " p=Path(sys.argv[3]); data=json.loads(p.read_text()); data['argv'].extend(" + repr(extra) + "); p.write_text(json.dumps(data))\n"
@@ -318,7 +382,7 @@ class IsolationTests(unittest.TestCase):
         asyncio.run(exercise())
 
     def run_helper(self, *args):
-        return subprocess.run([sys.executable, str(self.helper), *args], env=self.env,
+        return subprocess.run([PYTHON, str(self.helper), *args], env=self.env,
                               text=True, capture_output=True, timeout=20)
 
     def prepare(self, kind="codex", profile=PROFILE):
@@ -555,7 +619,7 @@ class IsolationTests(unittest.TestCase):
                    WRK_HOSTS_CONFIG=str(self.base / "hosts.toml"), WRK_NO_SLEEP="1", WRK_FIXTURE_SCENARIO="spawn",
                    WRK_FIXTURE_LOG=str(self.base / "herdr.log"), MOCK_MCP_PROFILE=PROFILE,
                    WRK_MOCK_MCP_CONFIG=str(self.config), PANEWIRE_BIN=str(self.base / "absent-panewire"),
-                   WRK_REFRESH_TIMEOUT_S="1", ARBITER_INBOX_ROOT=str(self.base / "inbox"))
+                   WRK_REFRESH_TIMEOUT_S="1", ARBITER_INBOX_ROOT=str(self.base / "inbox"), WRK_TEST_MODE="1")
         r = subprocess.run(([shell] if shell else []) + [str(self.wrk),"spawn","-c",str(self.cwd),"-m",model,"-p",str(prompt),"-w","w","-l","fixture",
                             "-L","mock","--t","T1","--task","872","--task-hk-bypass","--host",host],
                            env=env,text=True,capture_output=True,timeout=25)

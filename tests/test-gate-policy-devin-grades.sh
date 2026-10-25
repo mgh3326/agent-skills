@@ -64,6 +64,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sys
+import tempfile
 from unittest import mock
 
 root = Path(sys.argv[1])
@@ -76,6 +77,16 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 eligible = importlib.util.module_from_spec(spec)
 sys.modules[loader.name] = eligible
 loader.exec_module(eligible)
+
+# hk 1730 B1: grade-only fixtures also need a resolvable contributor record.
+# Keep their audit history empty, using a real temporary spawn receipt rather
+# than weakening or mocking the missing-job verification check.
+record_temp = tempfile.TemporaryDirectory(prefix="devin-grade-record-")
+record_dir = Path(record_temp.name) / "pin-job"
+(record_dir / "events").mkdir(parents=True)
+(record_dir / "events/00001-job.spawned.json").write_text(json.dumps({
+    "job_id": "pin-job", "kind": "job.spawned",
+    "payload": {"pane_id": "pin-session"}}))
 
 # devin --model id -> catalog grade (scopefuel 5e9177b, table above).
 EXPECTED = {
@@ -147,7 +158,8 @@ def grade_verdict(policy: dict, policy_check: dict, alias: str, model: str,
         "implementation_grade": assigned,
         "contributors": [{"profile": alias, "model": model, "effort": "",
                           "role": role, "kind": "initial",
-                          "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+                          "session": "pin-session", "worktree": "/tmp/pin-wt",
+                          "job_record_dir": str(record_dir)}],
         "tester": {"planned_profile": "opus", "planned_effort": "high"},
     }
     checks, _ = eligible.evaluate(evidence, "pre-spawn", policy, policy_check,
@@ -196,7 +208,8 @@ def check_gate(policy: dict, policy_check: dict) -> None:
             "implementation_grade": "A+",
             "contributors": [{"profile": "devin-swe2", "model": "swe-2", "effort": "",
                               "role": "worker", "kind": "initial",
-                              "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+                              "session": "pin-session", "worktree": "/tmp/pin-wt",
+                          "job_record_dir": str(record_dir)}],
             "tester": {"planned_profile": alias, "planned_effort": ""},
         }
         checks, _ = eligible.evaluate(evidence, "pre-spawn", policy, policy_check,
@@ -215,7 +228,8 @@ def check_gate(policy: dict, policy_check: dict) -> None:
         "implementation_grade": "A+",
         "contributors": [{"profile": "devin-argon", "model": "gemini-4-argon-high",
                           "effort": "", "role": "worker", "kind": "initial",
-                          "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+                          "session": "pin-session", "worktree": "/tmp/pin-wt",
+                          "job_record_dir": str(record_dir)}],
         "tester": {"planned_profile": "sonnet", "planned_effort": "high"},
     }
     checks, _ = eligible.evaluate(evidence, "pre-spawn", policy, policy_check,
@@ -241,7 +255,8 @@ def check_gate(policy: dict, policy_check: dict) -> None:
             "implementation_grade": "A",
             "contributors": [{"profile": "devin-swe2", "model": "swe-2", "effort": "",
                               "role": "worker", "kind": "initial",
-                              "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+                              "session": "pin-session", "worktree": "/tmp/pin-wt",
+                          "job_record_dir": str(record_dir)}],
             "tester": {"planned_profile": "devin-argon", "planned_effort": "",
                        "session": "other-session", "worktree": "/tmp/other-wt"},
         }
@@ -260,7 +275,8 @@ def check_gate(policy: dict, policy_check: dict) -> None:
         "implementation_grade": "A+",
         "contributors": [{"profile": "devin-swe2", "model": "swe-2", "effort": "",
                           "role": "worker", "kind": "initial",
-                          "session": "pin-session", "worktree": "/tmp/pin-wt"}],
+                          "session": "pin-session", "worktree": "/tmp/pin-wt",
+                          "job_record_dir": str(record_dir)}],
         "tester": {"planned_profile": "devin-argon", "planned_effort": ""},
     }
     try:
@@ -331,4 +347,5 @@ for name, doc in mutants.items():
         continue
     raise SystemExit(f"mutant {name} did not go RED")
 print(f"PASS mutants assertion-red={len(mutants)}/{len(mutants)}")
+record_temp.cleanup()
 PY

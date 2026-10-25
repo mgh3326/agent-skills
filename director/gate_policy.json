@@ -155,14 +155,16 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "32191d9e8f996c87a49960b4eb334ad068853b6ba6bed625e9bf5345310fce61",
-    "bin/wrk": "01ba1f2f5a9d0bdad80872d33adae40af23f7ade5b91664765422075917596cc",
-    "bin/wrk_free_limit_observer.py": "e2528721f311aec13e1dc5ae7689d213293e9ca2c4068ad02771531b0ed3d9df",
-    "builder/SKILL.md": "91cdb4c1d22177fc219db5b876ecc52b852122bc37128a0180def3668c8c38e8",
+    ".github/workflows/ci.yml": "1a43de792598f671ae99bdbb08fa939fde37e5776253af9a36b2621510011b34",
+    "bin/arbiter": "ac2349402cbbd066bd1bdd18b6de5e57e42c902b339cc24c8a9b35d38a49be97",
+    "bin/wrk": "ef832bd6f213c0ace5dec5211038ba4d64702262bfe12fd6d453d9d6c10e97ac",
+    "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
+    "builder/SKILL.md": "c7243059394c7739944b21da4a137b39615a600dcec614c9d803e2a967de7089",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
-    "director/SKILL.md": "c6b95f71c691d7711aeb9ee55f5e804f889319e99a21987a813eec148135ba42",
-    "director/bin/tester-eligible": "ab27e81b2f1c9d12c5be4e5681b94c9c1a0b6699971b0ca8d9c7168a66a9f231",
-    "spawn-worker/SKILL.md": "3e01a09573fd57b2697b8ddb81381e42512401cfb26acc3e3c6ed885d0b2e0e9"
+    "director/SKILL.md": "129ecf20bfaf6a132ac4d77c805f309d047aa35c5aaa28ad1f078da3409bc264",
+    "director/bin/tester-eligible": "ae323c7defbb8eda295ef9975efd1fcfe054751c0d0c47c7d65a1ec12193159b",
+    "spawn-worker/SKILL.md": "b15ab71ec93e913bab1b5bce784fdae459b90f6a7260454edb39968aa81a028a",
+    "bin/wrk_pane_models.py": "856e5ab3c81ea0bdd18543056d7dabe9cee2692eabab718c16f7f318895ff151"
   },
   "profiles": {
     "agy-flash": {
@@ -360,6 +362,82 @@
         "T1"
       ]
     },
+    "builder-haiku-high": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "high": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-haiku-low": {
+      "default_effort": "low",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "low": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-haiku-max": {
+      "default_effort": "max",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "max": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-haiku-xhigh": {
+      "default_effort": "xhigh",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "xhigh": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-kimi": {
       "default_effort": "",
       "family": "moonshot",
@@ -433,6 +511,25 @@
         "T2"
       ]
     },
+    "builder-luna-low": {
+      "default_effort": "low",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "low": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-5.6-luna",
+      "model": "gpt-5.6-luna",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-luna-max": {
       "default_effort": "max",
       "family": "openai",
@@ -440,6 +537,25 @@
       "grade_status": "conflict",
       "grades": {
         "max": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
+      "model": "gpt-6-luna",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-luna-medium": {
+      "default_effort": "medium",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "medium": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
@@ -552,6 +668,25 @@
         "T2"
       ]
     },
+    "builder-sol-low": {
+      "default_effort": "low",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "low": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-sol-max": {
       "default_effort": "max",
       "family": "openai",
@@ -623,6 +758,25 @@
         "T3"
       ]
     },
+    "builder-sonnet-low": {
+      "default_effort": "low",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "low": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model sonnet",
+      "model": "claude-sonnet-5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-sonnet-max": {
       "default_effort": "max",
       "family": "anthropic",
@@ -630,6 +784,25 @@
       "grade_status": "conflict",
       "grades": {
         "max": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model sonnet",
+      "model": "claude-sonnet-5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-sonnet-medium": {
+      "default_effort": "medium",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "medium": null
       },
       "launcher": "claude",
       "launcher_model_token": "--model sonnet",

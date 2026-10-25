@@ -9,10 +9,12 @@
 #   HK_MODE            new (default: claim+job_id atomically)
 #                      old      deployed skew: claim drops --job-id silently
 #                      oldflag  older still: --job-id is an unknown flag
+#                      oldroute no tasks rebind route (version skew)
+#                      rejectrebind rebind route returns task_conflict
 #                      down     every call: 'handoffkeep: connection refused' rc1
 #                      garbage  tasks show prints non-JSON rc0
 #   HK_FIXTURE_HANG    seconds to stall before answering (timeout probes)
-#   HK_LOG             append one line per claim: 'claim id=<n> by=<x> job=<y>'
+#   HK_LOG             append task mutations: claim/rebind id=<n> ...
 #
 # `show` mirrors the real CLI verbatim: task JSON to stdout, or
 # 'handoffkeep: not_found' on stderr rc1, 'handoffkeep: task id must be
@@ -94,6 +96,25 @@ def parse_claim(argv):
     return tid, by, job
 
 
+def parse_rebind(argv):
+    if len(argv) < 1:
+        die("task command requires id", 2)
+    tid = task_id_arg(argv, 0)
+    values = {}
+    i = 1
+    while i < len(argv):
+        flag = argv[i]
+        if flag not in ("--from-job", "--to-job", "--by", "--reason"):
+            die(f"flag provided but not defined: {flag.lstrip('-')}", 2)
+        if i + 1 >= len(argv):
+            die(f"flag needs an argument: {flag}", 2)
+        values[flag] = argv[i + 1]
+        i += 2
+    if any(not values.get(flag) for flag in ("--from-job", "--to-job", "--by", "--reason")):
+        die("required flags --from-job, --to-job, --by and --reason not set", 2)
+    return tid, values["--from-job"], values["--to-job"], values["--by"], values["--reason"]
+
+
 MODE = os.environ.get("HK_MODE", "new")
 STATE = os.environ.get("HK_STATE")
 LOG = os.environ.get("HK_LOG")
@@ -162,6 +183,40 @@ def main():
                 if job is not None:
                     refs["job_id"] = job
                     t["refs"] = refs
+                save(STATE, db)
+            print(json.dumps(t, separators=(",", ":")))
+            return
+
+    if cmd == "rebind":
+        if MODE == "oldroute":
+            die("404 page not found")
+        if MODE == "rejectrebind":
+            die("task_conflict: current job is old-job")
+        tid, old, new, by, reason = parse_rebind(argv[2:])
+        if LOG:
+            with open(LOG, "a", encoding="utf-8") as f:
+                f.write(f"rebind id={tid} from={old} to={new} by={by}\n")
+        lock_path = STATE + ".lock"
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            db = load(STATE)
+            t = task_or_not_found(db, tid)
+            refs = t.get("refs") or {}
+            bound = refs.get("job_id") or ""
+            replay = any(e.get("rebind", {}).get("from_job") == old
+                         and e.get("rebind", {}).get("to_job") == new
+                         and e.get("rebind", {}).get("by") == by
+                         for e in t.get("events", []) if isinstance(e, dict))
+            if (t.get("state") not in ("claimed", "in_progress")
+                    or not ((bound == old) or (bound == new and t.get("claimed_by") == by and replay))):
+                die(f"task_conflict: current job is {bound or '(none)'}")
+            if bound == old:
+                refs["job_id"] = new
+                t["refs"] = refs
+                t["claimed_by"] = by
+                t.setdefault("events", []).append({"kind": "transition", "from": t["state"],
+                    "to": t["state"], "by": by, "note": reason,
+                    "rebind": {"from_job": old, "to_job": new, "by": by, "reason": reason}})
                 save(STATE, db)
             print(json.dumps(t, separators=(",", ":")))
             return

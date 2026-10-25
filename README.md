@@ -180,7 +180,7 @@ wrk spawn --role builder --lane BUILDER_LANE --parent PARENT_LANE --task HK_TASK
 wrk done JOB [--report PATH]
 wrk escalate JOB --question TEXT [--report PATH]
 wrk joined JOB --pr URL --head SHA --report PATH
-wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders]
+wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders]
 wrk find <이름|라벨> [--pane-only]
 wrk name-sync [--apply|<라벨>...]
 wrk heavy -- <cmd>     # 호스트당 1개, 대기 상한 20분(rc 75), nice -n 10, load5/ncpu<1.0 게이트(hosts.toml [local] heavy_load_wait=false면 그 대기만 생략)
@@ -290,16 +290,21 @@ herdr agent start wrk-devin-probe --kind devin --pane "$PANE_ID" --timeout 30000
 각각 `SCOPEFUEL_E6_ARM=grok-hi@low|medium|xhigh` 표식이 필요하고, grok·sol-medium 런그는
 에스컬레이션이 아니므로 `--operator-request`는 불요다. 기존 `builder-grok`은 그대로
 무표식(게이트는 `grok-hi` 기본 런그 판정), `builder-sol-high`도 #704 그대로다.
-2026-09-26 운영자 결정으로 max 런그 철자 4개(`builder-sonnet-max`·
-`builder-sol-max`·`builder-luna-max`·`builder-kimi-max`)는 닫혔다 —
-빌더 좌석은 max 를 쓰지 않으므로 wrk 가 표식과 무관하게 거부한다.
+hk 1796은 같은 규칙으로 hk 1786 팔의 네 런그를 연다 — `builder-sonnet-medium`
+(`SCOPEFUEL_E6_ARM=sonnet@medium`), `builder-haiku-low`(`haiku@low`),
+`builder-luna-low`(`codex-luna@low`), `builder-luna-medium`(`codex-luna@medium`).
+넷 다 배치된 canon 행이라 표식은 게이트 판정을 그 행으로만 좁힌다.
+hk 1863은 같은 규칙으로 hk 1786 의 borrow-down·promote-up 팔 다섯 런그를 연다 — `builder-sol-low`(`SCOPEFUEL_E6_ARM=codex-sol@low`), `builder-haiku-high`(`haiku@high`), `builder-haiku-xhigh`(`haiku@xhigh`), `builder-haiku-max`(`haiku@max`), `builder-sonnet-low`(`sonnet@low`) — `builder-haiku-max`는 `builder-sol-max`·`builder-sonnet-max`와 같이 열려 있고(hk 1864), canon 에 `sonnet@low` 행이 아직 없어 실게이트의 `builder-sonnet-low`는 행이 푸시될 때까지 거부된다.
+2026-09-26 운영자 결정이 닫았던 max 런그 철자 4개(`builder-sonnet-max`·
+`builder-sol-max`·`builder-luna-max`·`builder-kimi-max`)는 hk 1864(2026-10-23
+운영자 결정, 빌더 좌석 no-max 규칙 폐지)로 열렸다 — 다른 E6 런그와 같이 정확한
+`SCOPEFUEL_E6_ARM` 표식이 필요하고 ultra 는 계속 거부한다.
 #921(2026-09-29 운영자 보고, Sonnet 5.5 실험 E1/E2)은 비-런그 빌더 철자
 `builder-sonnet`을 연다 — `builder-opus`의 argv 모양(`--model sonnet`
 `--dangerously-skip-permissions`)을 쓰고 `--effort`는 high·xhigh·max만 받으며
-기본값은 xhigh다. 이 철자의 명시 max만 위 좌석 규칙의 예외이고, quota pool은
+기본값은 xhigh다. quota pool은
 claude, launch_profile은 canonical `sonnet@<effort>`로 기록된다. E6 철자
-`builder-sonnet-xhigh`·`builder-sonnet-max`는 별도 철자로 그대로다(표식 필요·
-max 좌석 거부).
+`builder-sonnet-xhigh`·`builder-sonnet-max`는 별도 철자로 그대로다(표식 필요).
 
 `devin-glm52`·`devin-swe17`·`devin-ds41`은 같은 무인 argv에서 모델명만 바꾼 Devin
 프로필이다(각각 `glm-5-2`·`swe-1-7`·`deepseek-v4-1-flash-high`). `devin-ds41-max`도
@@ -339,7 +344,7 @@ tester/checker rep 2건을 돌린다. `--role builder`는 세 철자를 거부�
 `captain-sol`은 같은 프로필의 legacy 별칭이고, `--role captain`도 deprecation
 경고 후 builder로 정규화되는 legacy 별칭이다. `builder-devin`(devin-swe2
 argv, A+ 급 작업의 T1·T2 빌더 — `spawn-worker` 급표 행이 정본)와 빌더 파일럿으로 `builder-grok`(grok 4.7, effort xhigh)·`builder-kimi`(kimi-k3 argv)가 추가로 열려 있으며,
-#666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)와 #704·#737 의 E6 측정 런그 철자(`builder-opus-low` 등 16개 — 위 단락 참조, `SCOPEFUEL_E6_ARM` 표식 필수; max 런그 5개는 2026-09-26 좌석 규칙으로 닫힘)도 `--role builder`를 받는다.
+#666 의 런그별 devin 빌더 철자 `builder-devin-medium`·`builder-devin-max`·`builder-ds41`·`builder-ds41-max`(각각 워커 변형과 동일 argv)와 #704·#737·hk 1796·hk 1863 의 E6 측정 런그 철자(`builder-opus-low` 등 25개 — 위 단락 참조, `SCOPEFUEL_E6_ARM` 표식 필수; max 런그는 hk 1864 로 열림)도 `--role builder`를 받는다.
 파일럿이 지목한 워커 철자 `devin-swe2`·`devin-swe2-medium`·`devin-swe2-max`·`grok`/`grok-hi`·`kimi-k3`도 `--role builder`를 받는다. 빌더 spawn의 `--lane`은 arbiter claim의
 `owner_lane`, `--parent`는 상위 보고 레인으로 기록된다. `wrk escalate`와 `wrk joined`는 완료
 이벤트와 같은 평면 레코드를 남기되 `owner_lane`을 빌더 자신의 레인으로 설정한다. panewire
@@ -364,14 +369,18 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 `wrk spawn`은 job이 arbiter에 등록되면 완료 센티널을 분리 기동한다. 센티널은
 `herdr agent get <pane>` 관측을 **3분류**하고, 판정 1건마다 잡 디렉토리의
 `completion-sentinel.log`에 한 줄씩 남긴다
-(`<ts> status=<상태|empty|err:code> transient=<n> action=<none|pending|completed|lost:reason>`).
+(`<ts> status=<상태|empty|err:code> transient=<n> action=<none|pending|completed|lost:reason|recovered:reason>`).
+action 이 `recovered:` 가 아닌 회복 폴(pending, completed)은 줄 끝에 `recovered=<reason>` 이 붙는다.
+창이 에이전트가 살아 있는 폴에서 만료되면 `action=watch-expired elapsed=<n>s` 한 줄을 남기고 센티널만 끝난다.
 
 | 관측 | 분류 | 판정 |
 |---|---|---|
 | `agent_not_found` 등 pane/terminal 부재 에러 코드 | 확정 소멸 | 즉시 `job.lost` (`reason=agent_not_found`) |
 | 빈 출력 · 비정상 종료 · JSON 파싱 실패 · 소켓 에러 | 일시 장애 | `WRK_COMPLETION_INTERVAL_S`(기본 30s) 간격 재시도. **연속** `WRK_SENTINEL_TRANSIENT_MAX`(기본 10회 ≈5분) 초과 시에만 `job.lost` (`reason=herdr_unreachable`) |
 | 정상 상태(`working`/`idle`/`done`) | 관측 성공 | 일시 장애 카운터 리셋. `idle`·`done` + 새 report면 `job.completed` — 단 report의 관측 키가 한 interval 동안 그대로일 때만(첫 관측은 `action=pending`). 부분 작성 중인 파일로 먼저 나가지 않기 위함이다 |
-| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과 | 감시 창 만료 | `job.lost` (`reason=timeout`) |
+| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과, 에이전트 부재·불명 | 감시 창 만료 | `job.lost` (`reason=timeout`) |
+| `WRK_COMPLETION_TIMEOUT_S`(기본 6h) 경과, 에이전트 존재(class=ok) | 감시 창 만료 | `action=watch-expired` 로그 후 센티널만 종료. `job.lost`·종료 기록·쿼타 해제 없음, 잡은 `wrk done`·`joined`·`reap`·`prune` 이 평소대로 끝낸다 |
+| `WRK_COMPLETION_TIMEOUT_S` 경과 뒤 report 첫 관측(에이전트 `idle`/`done`) | 늦은 첫 관측 | `action=pending late=1` 한 번 — 같은 관측 키가 다음 폴까지 유지되면 평소대로 `job.completed`+쿼타 해제, 아니면 그 폴에서 `watch-expired` |
 
 `job.completed` 레코드는 report 본문의 sha256(`report_sha256` 필드)으로 라운드를
 식별한다. 같은 내용의 report에 대한 완료 기록이 이미 있으면 `wrk done`·센티널 어느
@@ -399,6 +408,17 @@ wrk 경로를 강제한다(golden 재생성·롤백용).
 (기본 1800초) 동안 계속 감시해 그 사이 report가 생기고 상태가 `done`/`idle`이 되면
 `job.completed`를 **추가로** 쓰고 종료한다(panewire가 completed를 relay한다).
 
+유예는 **연속 부재**만 센다. lost 상태에서 나중 폴이 에이전트를 다시 보면 `lost`를
+지우고 `job.recovered` 한 건을 남긴다(`reason`은 직전 lost 사유, `lost_duration_s`는
+그 에피소드의 초). `agent_not_found`는 `herdr_agent_probe`가 class=ok(agent_status가
+있는 응답)일 때만 풀린다. pane만 있고 상태가 없는 응답은 회복이 아니다.
+`herdr_unreachable`은 herdr가 다시 답하면(class가 transient가 아니면) 풀리고, 그 답이
+gone이면 같은 폴에서 `agent_not_found` 에피소드를 새로 연다. `timeout`은 감시 창이라
+class=ok로 풀리지 않는다. 창이 이미 지난 회복 폴은 부재 에피소드의 `job.recovered`를
+쓴 뒤 `watch-expired` 로 센티널만 끝낸다(에이전트가 보이므로 `job.lost` 없음).
+gone과 ok가 한 폴씩 번갈아 와도 창을 뒤로 미루지 못한다. 한 에피소드의 `job.lost`는 한 건이고, 같은 상태가 이어지는
+폴은 이벤트를 더 쓰지 않는다. `job.recovered`는 terminal도 revive도 아니다.
+
 분리된 센티널은 터미널에서 유도되는 herdr 세션 컨텍스트를 잃는다. 그래서 wrk는
 스폰 시점의 `HERDR_SESSION`·`HERDR_SOCKET_PATH`·`HERDR_BIN(_PATH)`를 센티널 환경에
 명시적으로 박아 넣는다. 서버가 비기본 세션에 사는 호스트에서는
@@ -416,14 +436,20 @@ WRK_SENTINEL_HERDR_SESSION=worker wrk spawn -c ... -m ... --job <id>
 ```bash
 wrk reap --lane REAP_LANE              # dry-run: 닫을 목록만 출력
 wrk reap --lane REAP_LANE --apply      # 실제로 herdr tab close
+wrk reap --lane REAP_LANE --job JOB --apply  # 지정한 job만 실제 회수
 ```
+
+`--job`은 반복하거나 쉼표로 여러 id를 지정할 수 있으며, id 전체가 정확히 일치하는 잡만
+고려한다. 지정되지 않은 잡은 회수 후보와 skip 출력에서 모두 제외된다. `--apply`에서도
+현재 후보를 다시 확인하며, 지정한 잡이 더 이상 후보가 아니면 `reason=not-candidate`를
+출력하고 닫지 않는다. `--apply`에는 계속 `--lane`이 필요하다.
 
 회수 조건(**전부** 충족해야 후보):
 
 - terminal 이벤트(`job.completed`·`job.joined`·`job.revoked`)가 있다
 - 가장 늦은 terminal 이벤트 **뒤에** `job.claim`·`job.reclaim`·`job.spawned`(·`job.reprompted`)가
   없다 — 끝난 뒤 다시 잡힌 잡은 살아 있는 작업이다(`skip … reason=reclaimed-after-terminal`).
-  `job.lost`·`quota_pool.*`는 되살림이 아니다
+  `job.lost`·`job.recovered`·`quota_pool.*`는 되살림이 아니다
 - 그 terminal 이벤트가 `--grace`(기본 10m)보다 오래됐다
 - **가장 늦은** `job.spawned` 영수증의 `pane_id`가 herdr에 살아 있고 상태가 `idle`·`done`이다.
   pane·tab은 그 영수증 하나에서 **한 벌로** 읽는다(앞선 영수증의 tab과 섞지 않고, 깨진 최신

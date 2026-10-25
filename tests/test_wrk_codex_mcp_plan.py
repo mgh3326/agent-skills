@@ -10,13 +10,23 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import tomllib
+try:
+    import tomllib
+except ImportError:
+    tomllib = None
 import unittest
 from unittest.mock import patch
 
 import test_wrk_mock_mcp as mock_fixtures
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def setUpModule():
+    mock_fixtures.require_toml_python()
+    if tomllib is None:
+        raise unittest.SkipTest("test_wrk_codex_mcp_plan needs tomllib in the running "
+                                "interpreter (Python 3.11+, as pinned by CI)")
 
 
 def load(path):
@@ -88,7 +98,7 @@ class MigrationTests(unittest.TestCase):
         self.put("selection.json", json.dumps(self.data))
 
     def run_cli(self):
-        return subprocess.run([sys.executable, str(ROOT / "bin/wrk-codex-mcp-plan"),
+        return subprocess.run([mock_fixtures.PYTHON, str(ROOT / "bin/wrk-codex-mcp-plan"),
                                "--input-dir", str(self.bundle), "--stage", str(self.stage)],
                               env=self.env, text=True, capture_output=True, timeout=10)
 
@@ -216,7 +226,7 @@ class MigrationTests(unittest.TestCase):
         # enumeration to the installed binary with isolated homes. This proves
         # version portability without pretending to install/run 0.158.0 here.
         proxy = self.base / "codex-version-proxy"
-        proxy.write_text("#!" + sys.executable + "\nimport os,sys\n"
+        proxy.write_text("#!" + mock_fixtures.PYTHON + "\nimport os,sys\n"
                          "if sys.argv[1:]==['--version']:\n print('codex-cli 0.158.0');sys.exit(0)\n"
                          "os.execv(" + repr(codex) + ",[" + repr(codex) + ",*sys.argv[1:]])\n")
         proxy.chmod(0o700)

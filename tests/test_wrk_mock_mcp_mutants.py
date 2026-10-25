@@ -11,6 +11,10 @@ import test_wrk_mock_mcp as fixtures
 from test_wrk_mock_mcp import PROFILE, load
 
 
+def setUpModule():
+    fixtures.require_toml_python()
+
+
 class GuardMutants(unittest.TestCase):
     def test_stalled_call_disconnect_cleanup_mutant(self):
         rig = self.rig()

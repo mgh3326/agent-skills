@@ -1,0 +1,169 @@
+#!/usr/bin/env python3
+"""Read-only stale quota_pool record report (hk 1798 companion, b953).
+
+Reads the JSON of `arbiter status --json` on stdin plus --jobs-root PATH
+(the inbox jobs dir) and prints one TSV row per quota_pool record with a
+staleness category derived from the job's events/ stream, then a summary
+line per pool and category. Never runs arbiter, never opens state.db,
+never writes anything.
+
+When the status object carries an `ok` key that is not exactly true, the
+report prints one stderr line and exits 2 with nothing on stdout, since
+arbiter could not read its state and an empty report would be a lie.
+"""
+
+from __future__ import annotations
+
+import argparse
+from datetime import datetime, timezone
+import json
+import re
+import sys
+from pathlib import Path
+
+EVENT_NAME = re.compile(r"^(\d+)-(.+)\.json$")
+
+# Terminal kinds grouped by report bucket. job.lost counts as terminal here
+# (unlike wrk's NEUTRAL set) because a lost pane will not release its record.
+TERMINAL_CATEGORY = {
+    "job.completed": "completed_no_release",
+    "job.completion": "completed_no_release",
+    "job.joined": "completed_no_release",
+    "job.handed_off": "completed_no_release",
+    "job.reaped": "reaped_no_release",
+    "job.lost": "lost_or_revoked_no_release",
+    "job.revoked": "lost_or_revoked_no_release",
+}
+REVIVAL_KINDS = {
+    "job.claim",
+    "job.reclaim",
+    "job.spawned",
+    "job.reprompted",
+}
+
+
+def parse_time(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def read_events(events_dir: Path) -> list[str]:
+    """Event kinds in stream order (file names NNNNN-KIND.json, newest last)."""
+    kinds: list[tuple[int, str, str]] = []
+    try:
+        names = sorted(events_dir.iterdir())
+    except OSError:
+        return []
+    for path in names:
+        match = EVENT_NAME.match(path.name)
+        if match is None:
+            continue
+        kind = ""
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            document = None
+        if isinstance(document, dict):
+            raw = document.get("kind") or document.get("type") or document.get("event")
+            if isinstance(raw, str):
+                kind = raw
+        kinds.append((int(match.group(1)), path.name, kind or match.group(2)))
+    kinds.sort(key=lambda item: (item[0], item[1]))
+    return [kind for _, _, kind in kinds]
+
+
+def revived_after_terminal(kinds: list[str]) -> bool:
+    last_terminal = max(
+        (i for i, kind in enumerate(kinds) if kind in TERMINAL_CATEGORY),
+        default=-1,
+    )
+    last_revival = max((i for i, kind in enumerate(kinds) if kind in REVIVAL_KINDS), default=-1)
+    return last_terminal >= 0 and last_revival > last_terminal
+
+
+def categorize(kinds: list[str], has_events_dir: bool) -> str:
+    if not has_events_dir:
+        return "no_events_dir"
+    last_record = max((i for i, k in enumerate(kinds) if k == "quota_pool.record"), default=-1)
+    last_release = max((i for i, k in enumerate(kinds) if k == "quota_pool.release"), default=-1)
+    released_after_record = last_release > last_record
+    terminal = ""
+    for kind in kinds:
+        if kind in TERMINAL_CATEGORY:
+            terminal = TERMINAL_CATEGORY[kind]
+    if revived_after_terminal(kinds):
+        return "no_terminal"
+    if terminal and not released_after_record:
+        return terminal
+    if last_release >= 0 and last_record > last_release:
+        return "rerecorded_after_release"
+    return "no_terminal"
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.strip().splitlines()[0])
+    parser.add_argument("--jobs-root", required=True, type=Path,
+                        help="inbox jobs dir containing <job_id>/events")
+    parser.add_argument("--since-hours", type=float, default=8.0,
+                        help="records started within this many hours count as recent (default 8)")
+    args = parser.parse_args()
+
+    try:
+        status = json.load(sys.stdin)
+    except ValueError as exc:
+        print(f"quota-stale-report: cannot parse status JSON on stdin: {exc}", file=sys.stderr)
+        return 2
+    if not isinstance(status, dict):
+        print("quota-stale-report: status JSON on stdin is not an object", file=sys.stderr)
+        return 2
+    if status.get("ok", True) is not True:
+        detail = status.get("error")
+        flat = " ".join(detail.split()) if isinstance(detail, str) else ""
+        suffix = f": {flat[:200]}" if flat else ""
+        print(f"quota-stale-report: arbiter status reported ok false{suffix}",
+              file=sys.stderr)
+        return 2
+
+    now = parse_time(status.get("now")) or datetime.now(timezone.utc)
+    records = status.get("quota_pool_records") or []
+
+    counts: dict[tuple[str, str], int] = {}
+    for record in sorted(records, key=lambda r: (str(r.get("job_id", "")), str(r.get("pool", "")))):
+        if not isinstance(record, dict):
+            continue
+        job_id = str(record.get("job_id", ""))
+        pool = str(record.get("pool", ""))
+        profile = str(record.get("profile", ""))
+        started_raw = record.get("started_at")
+        started = parse_time(started_raw)
+        age_h = (now - started).total_seconds() / 3600.0 if started else float("nan")
+
+        events_dir = args.jobs_root / job_id / "events"
+        has_events_dir = events_dir.is_dir()
+        kinds = read_events(events_dir) if has_events_dir else []
+
+        if (started is not None and age_h < args.since_hours
+                and not revived_after_terminal(kinds)):
+            category = "recent"
+        else:
+            category = categorize(kinds, has_events_dir)
+        last_event = kinds[-1] if kinds else "-"
+
+        age_text = f"{age_h:.2f}" if age_h == age_h else "-"
+        print(job_id, pool, profile, str(started_raw or "-"), age_text, category, last_event, sep="\t")
+        counts[(pool, category)] = counts.get((pool, category), 0) + 1
+
+    for (pool, category), count in sorted(counts.items()):
+        print("summary", pool, category, count, sep="\t")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

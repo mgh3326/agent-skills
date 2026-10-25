@@ -5,6 +5,9 @@
 # with a fetched hk approval grant from parent lane or operator, and
 # assertion-RED mutants over the wrk source.
 set -euo pipefail
+# hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
+# (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
@@ -18,9 +21,10 @@ export XDG_CACHE_HOME="$TMP/xdg/cache"
 export XDG_DATA_HOME="$TMP/xdg/data"
 export XDG_STATE_HOME="$TMP/xdg/state"
 export XDG_RUNTIME_DIR="$TMP/xdg/runtime"
+export CODEX_HOME="$TMP/codex"
 export TMPDIR="$TMP/tmp"
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" "$XDG_DATA_HOME" \
-  "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$TMPDIR"
+  "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$CODEX_HOME" "$TMPDIR"
 chmod 700 "$XDG_RUNTIME_DIR"
 export WRK_NO_SLEEP=1
 export WRK_JOB_DELEGATE=0
@@ -95,6 +99,17 @@ expect_rc() { # expect_rc <want> <cmd...>
   rc=$?
   set -e
   [[ "$rc" -eq "$want" ]] || fail "expected rc=$want got rc=$rc: $*"
+}
+
+expect_refusal() { # expect_refusal <exact stderr line> <cmd...>
+  local want="$1" rc=0 out
+  shift
+  set +e
+  out="$("$@" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 2 ]] || fail "expected refusal rc=2 got rc=$rc: $* output=$out"
+  grep -qxF "$want" <<<"$out" || fail "expected stderr line $want: $out"
 }
 
 open_ok() { # open_ok <wrk> <job> <head> — must succeed
@@ -225,7 +240,7 @@ status="$("$WRK" round status jbad)"
 grep -q 'rounds=1' <<<"$status" || fail "missing commit changed round count: $status"
 echo "PASS missing-commit-refused-without-round"
 
-# ── counting: rounds open in order, verdict binds oldest unverdicted round ──
+# ── counting: rounds open in order, verdict binds oldest matching round ─────
 mkjob jc
 open_ok "$WRK" jc "$H1"
 open_ok "$WRK" jc "$H2"
@@ -279,23 +294,43 @@ expect_rc 78 "$WRK" round open jh --head "$H1"   # same head again still capped
 expect_rc 78 "$WRK" round open jh --head "$H4"   # a new head is not a new budget
 echo "PASS head-change-keeps-count"
 
-# ── sub-round naming: a verdict without an open round still counts ──────────
+# ── wrong-head refusal leaves stale open rounds counted toward the cap ──────
 mkjob js
-write_verdict "$TMP/vs.md" BLOCKER "$H1"
-out="$("$WRK" round verdict js --file "$TMP/vs.md")"
-grep -q 'round=unopened' <<<"$out" || fail "unbound verdict must report unopened: $out"
+open_ok "$WRK" js "$H1"
+write_verdict "$TMP/vs.md" BLOCKER "$H2"
+expect_refusal "wrk: round verdict: no open round for head $H2 on job js (open: 1@${H1:0:7}); open one with wrk round open js --head $H2" \
+  "$WRK" round verdict js --file "$TMP/vs.md"
+[[ "$(find "$ARBITER_INBOX_ROOT/js/events" -name '*-job.verdict.json' | wc -l | tr -d ' ')" -eq 0 ]] ||
+  fail "wrong-head refusal wrote a job.verdict"
+[[ "$(escalate_count "$ARBITER_INBOX_ROOT/js/events")" == 0 ]] ||
+  fail "wrong-head refusal emitted a cap escalation"
 status="$("$WRK" round status js)"
-grep -q 'rounds=1' <<<"$status" || fail "unopened verdict must consume a round: $status"
+grep -q 'rounds=1' <<<"$status" || fail "stale open round must remain in the count: $status"
+grep -q 'open=1' <<<"$status" || fail "stale round must remain open: $status"
 open_ok "$WRK" js "$H2"
+"$WRK" round verdict js --file "$TMP/vs.md" >/dev/null
 open_ok "$WRK" js "$H3"
-expect_rc 78 "$WRK" round open js --head "$H4"   # 1 verdict + 2 opens = 3
-python3 - "$ARBITER_INBOX_ROOT/js/events" <<'PY'
-import json, pathlib, sys
-evs = [json.loads(p.read_text()) for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json"))]
-v = next(e for e in evs if e["kind"] == "job.verdict")
-assert v.get("unopened") is True and v["round"] is None, v
-PY
-echo "PASS unopened-verdict-counts-as-round"
+expect_rc 78 "$WRK" round open js --head "$H4"   # stale H1 + bound H2 + open H3 = cap
+status="$("$WRK" round status js)"
+grep -q 'rounds=3' <<<"$status" || fail "stale open round must still cost one cap slot: $status"
+grep -q 'open=1,3' <<<"$status" || fail "wrong-head round must remain open after retry: $status"
+echo "PASS wrong-head-refused-stale-open-still-counts-toward-cap"
+
+# Existing unbound records remain counted by round status and round open's cap.
+mkjob junbound
+cat >"$ARBITER_INBOX_ROOT/junbound/events/00002-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"junbound","round":null,"head":"$H1","verdict":"PASS","created_at":"2026-09-27T00:00:01Z"}
+EOF
+status="$("$WRK" round status junbound)"
+grep -q 'rounds=1' <<<"$status" || fail "historical unbound verdict must count in status: $status"
+open_ok "$WRK" junbound "$H2"
+open_ok "$WRK" junbound "$H3"
+expect_rc 78 "$WRK" round open junbound --head "$H4"
+status="$("$WRK" round status junbound)"
+grep -q 'rounds=3' <<<"$status" || fail "historical unbound verdict must count toward cap: $status"
+[[ "$(find "$ARBITER_INBOX_ROOT/junbound/events" -name '*-job.round.json' | wc -l | tr -d ' ')" -eq 2 ]] ||
+  fail "the historical unbound verdict must leave only two opened rounds"
+echo "PASS historical-unbound-verdict-still-counts-toward-cap"
 
 # ── void: a director-1 server-set grant releases one cap slot ───────────────
 mkjob jvoid
@@ -604,26 +639,30 @@ open_ok "$WRK" ju "$H1"
 expect_rc 2 "$WRK" round open ju --head "$H2" --extend hk:doc/good2
 echo "PASS extend-before-cap-refused"
 
-# ── orphan verdict at the cap: recorded, escalated, rc 78 ───────────────────
+# ── no open round at the cap: refuse without recording or escalation ───────
+# Three distinct bound verdicts exhaust the cap. The next verdict must refuse
+# because no open round remains and must not write a fourth job.verdict.
 mkjob jo
 for h in "$H1" "$H2" "$H3"; do open_ok "$WRK" jo "$h"; done
-for n in 1 2 3; do
-  write_verdict "$TMP/vo$n.md" BLOCKER "$H1"
+n=0
+for h in "$H1" "$H2" "$H3"; do
+  n=$((n + 1))
+  write_verdict "$TMP/vo$n.md" BLOCKER "$h"
   "$WRK" round verdict jo --file "$TMP/vo$n.md" >/dev/null
 done
 write_verdict "$TMP/vo4.md" BLOCKER "$H4"
-expect_rc 78 "$WRK" round verdict jo --file "$TMP/vo4.md"
+expect_refusal "wrk: round verdict: job jo has no open round; open one with wrk round open jo --head $H4" \
+  "$WRK" round verdict jo --file "$TMP/vo4.md"
 status="$("$WRK" round status jo)"
-grep -q 'rounds=4' <<<"$status" || fail "over-cap verdict must still count: $status"
-[[ "$(escalate_count "$ARBITER_INBOX_ROOT/jo/events")" == 1 ]] ||
-  fail "over-cap orphan verdict must emit the cap escalate"
+grep -q 'rounds=3' <<<"$status" || fail "no-open refusal must not increase the round count: $status"
+[[ "$(escalate_count "$ARBITER_INBOX_ROOT/jo/events")" == 0 ]] ||
+  fail "no-open refusal must not emit a cap escalation"
 python3 - "$ARBITER_INBOX_ROOT/jo/events" <<'PY'
 import json, pathlib, sys
 evs = [json.loads(p.read_text()) for p in sorted(pathlib.Path(sys.argv[1]).glob("*.json"))]
-v = [e for e in evs if e["kind"] == "job.verdict"][-1]
-assert v.get("unopened") is True, v
+assert len([e for e in evs if e["kind"] == "job.verdict"]) == 3, evs
 PY
-echo "PASS over-cap-orphan-verdict"
+echo "PASS no-open-verdict-refused-at-cap"
 
 # ── assertion-RED mutants over the wrk source ────────────────────────────────
 mutant() { # mutant <name> <spec-file>; spec lines are 'OLD => NEW' (first match)
@@ -649,7 +688,6 @@ src = open(__import__("sys").argv[1], encoding="utf-8").read()
 for anchor in (
     "if used >= cap:",
     '"reason": "tester round cap reached", "question": question,',
-    "        used += 1  # this unbound verdict is itself a round",
     "        if issuer not in allowed_issuers or issuer != identity:",
     'r"^round-extension: job=(\\S+) extra=(\\d+) by=(\\S+)$"',
     "{40})\\s*$",
@@ -664,6 +702,29 @@ for anchor in (
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
+
+# mutant: historical unbound verdicts stop counting toward the open cap.
+# RED proof: with one seeded legacy verdict and two opened rounds, a third
+# open must be refused; the mutant drops the legacy slot and allows it.
+printf '%s\n' '    used += sum(1 for v in verdicts if not isinstance(v.get("round"), int)) =>     pass' >"$TMP/spec-nocount-unbound"
+mutant nocount-unbound "$TMP/spec-nocount-unbound"
+jmu="mut-unbound-count"
+mkjob "$jmu"
+cat >"$ARBITER_INBOX_ROOT/$jmu/events/00002-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"$jmu","round":null,"head":"$H1","verdict":"PASS","created_at":"2026-09-27T00:00:01Z"}
+EOF
+open_ok "$TMP/nocount-unbound-wrk" "$jmu" "$H2"
+open_ok "$TMP/nocount-unbound-wrk" "$jmu" "$H3"
+set +e
+"$TMP/nocount-unbound-wrk" round open "$jmu" --head "$H4" >/dev/null 2>&1
+rc=$?
+set -e
+[[ "$rc" -eq 0 ]] ||
+  fail "mutant nocount-unbound did not drop the historical cap slot (third open rc=$rc)"
+status="$("$TMP/nocount-unbound-wrk" round status "$jmu")"
+grep -q 'rounds=4' <<<"$status" ||
+  fail "mutant nocount-unbound did not expose the over-cap open: $status"
+echo "PASS mutant-nocount-unbound"
 
 # mutant: the cap check in round open is removed. RED proof: the 4th open
 # must succeed under the mutant — if it still fails, the cap test cannot be
@@ -694,27 +755,6 @@ set -e
 [[ "$(escalate_count "$ARBITER_INBOX_ROOT/$jme/events")" == 0 ]] ||
   fail "mutant noesc still emitted a reasoned cap escalate"
 echo "PASS mutant-noesc"
-
-# mutant: an unopened verdict no longer counts as a round. RED proof: at the
-# cap the mutant must let the over-cap verdict through with rc 0 — the rc 78
-# assertion is what credits the counting.
-printf '        used += 1  # this unbound verdict is itself a round =>         pass\n' >"$TMP/spec-nocount"
-mutant nocount "$TMP/spec-nocount"
-jmn="mut-nc"
-mkjob "$jmn"
-for h in "$H1" "$H2" "$H3"; do open_ok "$TMP/nocount-wrk" "$jmn" "$h"; done
-for n in 1 2 3; do
-  write_verdict "$TMP/vnc$n.md" BLOCKER "$H1"
-  "$TMP/nocount-wrk" round verdict "$jmn" --file "$TMP/vnc$n.md" >/dev/null 2>&1
-done
-write_verdict "$TMP/vnc4.md" BLOCKER "$H4"
-set +e
-"$TMP/nocount-wrk" round verdict "$jmn" --file "$TMP/vnc4.md" >/dev/null 2>&1
-rc=$?
-set -e
-[[ "$rc" -eq 0 ]] ||
-  fail "mutant nocount still refused the over-cap verdict (rc=$rc) — verdict-cap assertion is vacuous"
-echo "PASS mutant-nocount"
 
 # mutant: approval issuer no longer checked against session/author
 printf '        if issuer not in allowed_issuers or issuer != identity: =>         if issuer not in allowed_issuers:\n' >"$TMP/spec-noforge"
@@ -755,6 +795,7 @@ printf '{40})\\s*$ => {40})\n' >"$TMP/spec-noshaend"
 mutant noshaend "$TMP/spec-noshaend"
 jml="mut-long"
 mkjob "$jml"
+open_ok "$TMP/noshaend-wrk" "$jml" "$H1"
 printf 'VERDICT: PASS @%sF\n' "$H1" >"$TMP/vlong41.md"
 set +e
 "$TMP/noshaend-wrk" round verdict "$jml" --file "$TMP/vlong41.md" >/dev/null 2>&1
@@ -770,6 +811,7 @@ printf 'if len(matches) > 1: => if False:\n' >"$TMP/spec-multi"
 mutant multi "$TMP/spec-multi"
 jmm="mut-mv"
 mkjob "$jmm"
+open_ok "$TMP/multi-wrk" "$jmm" "$H1"
 write_verdict "$TMP/vmulti.md" BLOCKER "$H1"
 printf 'VERDICT: PASS @%s\n' "$H2" >>"$TMP/vmulti.md"
 set +e
