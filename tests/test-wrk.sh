@@ -56,6 +56,8 @@ seed_join_round() {
     return 0
   fi
   printf '%s\n' "{\"kind\":\"job.round\",\"job_id\":\"$job\",\"round\":1,\"head\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}" >"$events/seed-job.round.json"
+  # hk 1900: a round counts toward the join only with a recorded verdict.
+  printf '%s\n' "{\"kind\":\"job.verdict\",\"job_id\":\"$job\",\"round\":1,\"head\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"verdict\":\"PASS\"}" >"$events/seed-job.verdict.json"
 }
 
 # ROB-1199: the suite must never reach a real arbiter state db or the real inbox.

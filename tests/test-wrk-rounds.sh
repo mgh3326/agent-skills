@@ -10,6 +10,20 @@
 #   flow-delegated-panewire-joined
 #   flow-parking-arcade-join
 #   hk1506-binding-unchanged
+# hk 1900: a round counts toward the join only once a verdict is recorded for it,
+# the join rechecks the end record and the gate inside the events lock, and a
+# verdict file with a non-UTF-8 byte is read with replacement, not skipped.
+#   e-open-round-without-verdict-cannot-join
+#   e-open-round-done-warns-once-and-succeeds
+#   f-inlock-end-record-refused
+#   f-inlock-zero-rounds-refused
+#   f-hook-inert-outside-test-mode
+#   g-non-utf8-copy-refused-then-recorded
+#   flow-normal-1-round / flow-normal-2-rounds (and flow-normal-1-to-3-rounds)
+#   flow-voided-round-then-verdict-then-joined
+#   flow-takeover-own-verdict / flow-takeover-inherited-rounds
+#   flow-round-extension-verdict-then-joined
+#   flow-delegated-joined-gated-before-handoff
 set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
@@ -62,12 +76,23 @@ claim_job() { # claim_job job [parent] [created_at] [role] [owner]
 EOF
 }
 
-seed_round() { # seed_round job [round] [created_at]
+seed_open_round() { # seed_open_round job [round] [created_at] — a round with no verdict
   local job="$1" round="${2:-1}" at="${3:-2026-10-23T00:00:01Z}"
   local events="$ARBITER_INBOX_ROOT/$job/events"
   mkdir -p "$events"
   write_event "$events/seed-job.round.json" <<EOF
 {"kind":"job.round","job_id":"$job","round":$round,"head":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","created_at":"$at"}
+EOF
+}
+
+# hk 1900: a round counts toward the join only with a recorded verdict, so the
+# seeded round carries a matching job.verdict (no path or sha, so it matches no file).
+seed_round() { # seed_round job [round] [created_at]
+  local job="$1" round="${2:-1}" at="${3:-2026-10-23T00:00:01Z}"
+  local events="$ARBITER_INBOX_ROOT/$job/events"
+  seed_open_round "$job" "$round" "$at"
+  write_event "$events/seed-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"$job","round":$round,"head":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","verdict":"PASS","created_at":"$at"}
 EOF
 }
 
@@ -475,7 +500,7 @@ write_event "$AUDIT/audit-matched/events/00080-job.verdict.json" <<EOF
 {"kind":"job.verdict","job_id":"audit-matched","round":1,"head":"$H3","path":"$matched_abs","content_sha256":"$(file_sha "$AUDIT/audit-matched/ok.md")","verdict":"PASS","created_at":"2026-10-23T00:00:02Z"}
 EOF
 claim_job audit-void
-seed_round audit-void
+seed_open_round audit-void
 write_event "$AUDIT/audit-void/events/00081-job.round_void.json" <<'EOF'
 {"kind":"job.round_void","job_id":"audit-void","round":1,"ref":"hk:task/4","created_at":"2026-10-23T00:00:03Z"}
 EOF
@@ -537,6 +562,21 @@ echo "PASS d-audit-lists-planted-jobs-and-writes-nothing"
 
 # ── legitimate flows ────────────────────────────────────────────────────
 echo "== flow-normal-1-to-3-rounds =="
+claim_job flow-normal-1
+open_ok flow-normal-1 "$H1"
+write_verdict_file "$TMP/flow-1n1.md" PASS "$H1" 'only round'
+verdict_ok flow-normal-1 "$TMP/flow-1n1.md"
+join_ok flow-normal-1
+echo "PASS flow-normal-1-round"
+claim_job flow-normal-2
+open_ok flow-normal-2 "$H1"
+write_verdict_file "$TMP/flow-2n1.md" BLOCKER "$H1" 'round one'
+verdict_ok flow-normal-2 "$TMP/flow-2n1.md"
+open_ok flow-normal-2 "$H2"
+write_verdict_file "$TMP/flow-2n2.md" PASS "$H2" 'round two'
+verdict_ok flow-normal-2 "$TMP/flow-2n2.md"
+join_ok flow-normal-2
+echo "PASS flow-normal-2-rounds"
 claim_job flow-normal
 open_ok flow-normal "$H1"
 write_verdict_file "$TMP/flow-n1.md" PASS "$H1" 'round one'
@@ -566,14 +606,25 @@ status="$("$WRK" round status flow-void)"
 grep -q 'round 2 void (hk:doc/void-flow)' <<<"$status" || fail "void must show on status: $status"
 open_ok flow-void "$H4"
 echo "PASS flow-voided-round"
+# Rounds 1 and 3 are still open with no verdict: the join waits for one.
+run_cmd "$WRK" joined flow-void --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: job flow-void has zero non-voided recorded rounds"
+write_verdict_file "$TMP/flow-void-v.md" PASS "$H4" 'verdict after the void'
+verdict_ok flow-void "$TMP/flow-void-v.md"
+join_ok flow-void
+echo "PASS flow-voided-round-then-verdict-then-joined"
 claim_job flow-void-only
-seed_round flow-void-only
+seed_open_round flow-void-only
 write_event "$ARBITER_INBOX_ROOT/flow-void-only/events/00082-job.round_void.json" <<'EOF'
 {"kind":"job.round_void","job_id":"flow-void-only","round":1,"ref":"hk:doc/void-only","created_at":"2026-10-23T00:00:04Z"}
 EOF
 run_cmd "$WRK" joined flow-void-only --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
 assert_refused "wrk: joined: job flow-void-only has zero non-voided recorded rounds"
 open_ok flow-void-only "$H1"
+run_cmd "$WRK" joined flow-void-only --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: job flow-void-only has zero non-voided recorded rounds"
+write_verdict_file "$TMP/flow-void-only.md" PASS "$H2" 'verdict on the new round'
+verdict_ok flow-void-only "$TMP/flow-void-only.md"
 join_ok flow-void-only
 echo "PASS flow-voided-only-cannot-join-until-a-new-round"
 
@@ -591,12 +642,33 @@ run_cmd "$WRK" round open flow-take --head "$H1" --repo "$TEST_REPO"
 assert_rc 78
 join_ok flow-take
 echo "PASS flow-takeover-inherited-rounds"
+claim_job flow-take-own
+write_event "$ARBITER_INBOX_ROOT/flow-take-own/events/00002-job.takeover.json" <<'EOF'
+{"kind":"job.takeover","job_id":"flow-take-own","created_at":"2026-10-23T00:00:05Z","payload":{"from_job":"old-job","rounds_used":1}}
+EOF
+open_ok flow-take-own "$H1"
+write_verdict_file "$TMP/flow-take-own.md" PASS "$H1" 'the new builder own verdict'
+verdict_ok flow-take-own "$TMP/flow-take-own.md"
+join_ok flow-take-own
+claim_job flow-take-open
+write_event "$ARBITER_INBOX_ROOT/flow-take-open/events/00002-job.takeover.json" <<'EOF'
+{"kind":"job.takeover","job_id":"flow-take-open","created_at":"2026-10-23T00:00:05Z","payload":{"from_job":"old-job","rounds_used":1}}
+EOF
+open_ok flow-take-open "$H1"
+join_ok flow-take-open
+echo "PASS flow-takeover-own-verdict"
 
 echo "== flow-round-extension =="
 claim_job flow-ext
 open_ok flow-ext "$H1"
+write_verdict_file "$TMP/flow-ext-1.md" BLOCKER "$H1" 'ext round one'
+verdict_ok flow-ext "$TMP/flow-ext-1.md"
 open_ok flow-ext "$H2"
+write_verdict_file "$TMP/flow-ext-2.md" BLOCKER "$H2" 'ext round two'
+verdict_ok flow-ext "$TMP/flow-ext-2.md"
 open_ok flow-ext "$H3"
+write_verdict_file "$TMP/flow-ext-3.md" BLOCKER "$H3" 'ext round three'
+verdict_ok flow-ext "$TMP/flow-ext-3.md"
 run_cmd "$WRK" round open flow-ext --head "$H4" --repo "$TEST_REPO"
 assert_rc 78
 grant_doc ext-flow "$(printf 'round-extension: job=flow-ext extra=1 by=director-1\n')"
@@ -604,6 +676,11 @@ run_cmd "$WRK" round open flow-ext --head "$H4" --repo "$TEST_REPO" --extend hk:
 assert_rc 0
 grep -q 'round=4' "$TMP/run.out" || fail "extension must open round 4: $(cat "$TMP/run.out")"
 echo "PASS flow-round-extension"
+write_verdict_file "$TMP/flow-ext-4.md" PASS "$H4" 'ext round four'
+verdict_ok flow-ext "$TMP/flow-ext-4.md"
+[[ "$(verdict_field flow-ext 3 round | tail -n 1)" == "4" ]] || fail "the extension verdict must bind to round 4"
+join_ok flow-ext
+echo "PASS flow-round-extension-verdict-then-joined"
 
 echo "== flow-duplicate-join-after-delegated =="
 claim_job flow-dup
@@ -663,6 +740,16 @@ fi
 grep -q -- '--pr' "$TMP/pw-ok.log" || fail "delegated argv lost --pr: $(cat "$TMP/pw-ok.log")"
 [[ "$(kind_count flow-del job.revoked)" -eq 1 ]] || fail "delegated join must still declare the hub end"
 echo "PASS flow-delegated-panewire-joined"
+
+claim_job flow-del-open
+open_ok flow-del-open "$H1"
+: >"$TMP/pw-gate.log"
+run_cmd env WRK_JOB_DELEGATE=1 PANEWIRE_BIN="$TMP/pw-ok" PW_LOG="$TMP/pw-gate.log" \
+  "$WRK" joined flow-del-open --pr https://example.invalid/pr/8 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: job flow-del-open has zero non-voided recorded rounds"
+[[ ! -s "$TMP/pw-gate.log" ]] || fail "a refused join must not reach panewire: $(cat "$TMP/pw-gate.log")"
+[[ "$(kind_count flow-del-open job.joined)" -eq 0 ]] || fail "refused delegated join wrote job.joined"
+echo "PASS flow-delegated-joined-gated-before-handoff"
 
 echo "== flow-parking-arcade-join =="
 claim_job flow-pa pa-integrator
@@ -772,6 +859,175 @@ run_cmd "$WRK" joined dodge-deny-n --pr https://example.invalid/pr/1 --head "$H1
 assert_refused "wrk: joined: refused after end record 00003-job.revoked.json"
 echo "PASS dodge-same-second-name-end-wins"
 
+# ── hk 1900 (a): an open round with no verdict is not a join round ──────
+echo "== e-open-round-without-verdict =="
+claim_job e-open
+open_ok e-open "$H1"
+run_cmd "$WRK" joined e-open --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: job e-open has zero non-voided recorded rounds"
+[[ "$(kind_count e-open job.joined)" -eq 0 ]] || fail "open-then-join wrote job.joined"
+write_verdict_file "$TMP/e-open.md" PASS "$H2" 'verdict recorded after the open'
+verdict_ok e-open "$TMP/e-open.md"
+join_ok e-open
+echo "PASS e-open-round-without-verdict-cannot-join"
+
+# A verdict-bound round whose void record was planted later still counts: a void
+# only takes effect on a round that holds no verdict.
+claim_job e-bound-void
+open_ok e-bound-void "$H1"
+write_verdict_file "$TMP/e-bound-void.md" PASS "$H2" 'bound before the void'
+verdict_ok e-bound-void "$TMP/e-bound-void.md"
+write_event "$ARBITER_INBOX_ROOT/e-bound-void/events/00093-job.round_void.json" <<'EOF'
+{"kind":"job.round_void","job_id":"e-bound-void","round":1,"ref":"hk:task/1900","created_at":"2026-10-23T00:40:00Z"}
+EOF
+join_ok e-bound-void
+echo "PASS e-verdict-bound-round-later-voided-still-counts"
+
+# wrk done for a builder that opened a round and never recorded a verdict: one
+# warning, and the done still lands.
+claim_job e-open-done
+open_ok e-open-done "$H1"
+run_cmd "$WRK" 'done' e-open-done --report "$REPORT"
+assert_rc 0
+grep -q "OK job=e-open-done " "$TMP/run.out" || fail "done stdout: $(cat "$TMP/run.out")"
+[[ "$(grep -c 'ROUNDS job=' "$TMP/run.err")" -eq 1 ]] || fail "done must warn once: $(cat "$TMP/run.err")"
+grep -q "wrk: warning: ROUNDS job=e-open-done has zero non-voided recorded rounds; wrk joined would refuse" "$TMP/run.err" ||
+  fail "open-only done warning text: $(cat "$TMP/run.err")"
+[[ "$(kind_count e-open-done job.completed)" -eq 1 ]] || fail "open-only done must still write job.completed"
+echo "PASS e-open-round-done-warns-once-and-succeeds"
+
+# ── hk 1900 (b): the end record and the gate are rechecked inside the lock ──
+# WRK_TEST_JOINED_PRECOMMIT_HOOK names a script that wrk runs under the events
+# lock, after the pre-check and before the commit, and only with WRK_TEST_MODE=1.
+echo "== f-inlock-recheck =="
+RACE_HOOK="$TMP/race-revoke-hook"
+cat >"$RACE_HOOK" <<'EOF'
+#!/bin/sh
+# $1 = events dir, $2 = job id: an end record lands after the pre-check.
+printf '{"kind":"job.revoked","job_id":"%s","created_at":"2026-10-23T09:00:00Z"}\n' "$2" >"$1/00099-job.revoked.json"
+EOF
+chmod +x "$RACE_HOOK"
+ZERO_HOOK="$TMP/race-zero-hook"
+cat >"$ZERO_HOOK" <<'EOF'
+#!/bin/sh
+# $1 = events dir: the only verdict is removed after the pre-check.
+rm -f "$1/seed-job.verdict.json"
+EOF
+chmod +x "$ZERO_HOOK"
+
+claim_job f-race-ok
+seed_round f-race-ok
+join_ok f-race-ok
+echo "PASS f-same-flow-joins-without-the-hook"
+
+claim_job f-race
+seed_round f-race
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$RACE_HOOK" \
+  "$WRK" joined f-race --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: refused after end record 00099-job.revoked.json"
+[[ "$(kind_count f-race job.joined)" -eq 0 ]] || fail "a join racing an end record wrote job.joined"
+[[ "$(kind_count f-race job.revoked)" -eq 1 ]] || fail "the racing end record must be the only terminal"
+echo "PASS f-inlock-end-record-refused"
+
+claim_job f-race-waived
+seed_round f-race-waived
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$RACE_HOOK" \
+  "$WRK" joined f-race-waived --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT" --rounds-waived hk:task/1900
+assert_refused "wrk: joined: refused after end record 00099-job.revoked.json"
+[[ "$(kind_count f-race-waived job.joined)" -eq 0 ]] || fail "a waiver must not override an end record"
+echo "PASS f-inlock-end-record-not-waivable"
+
+claim_job f-race-zero
+seed_round f-race-zero
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$ZERO_HOOK" \
+  "$WRK" joined f-race-zero --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: job f-race-zero has zero non-voided recorded rounds"
+[[ "$(kind_count f-race-zero job.joined)" -eq 0 ]] || fail "a join that lost its last verdict wrote job.joined"
+echo "PASS f-inlock-zero-rounds-refused"
+
+claim_job f-race-zero-waived
+seed_round f-race-zero-waived
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$ZERO_HOOK" \
+  "$WRK" joined f-race-zero-waived --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT" --rounds-waived hk:task/1900
+assert_rc 0
+[[ "$(kind_count f-race-zero-waived job.joined)" -eq 1 ]] || fail "a waived join skips the zero-rounds recheck"
+echo "PASS f-inlock-zero-recheck-skipped-with-waiver"
+
+# The hook is a test seam: outside WRK_TEST_MODE=1 it must not run at all.
+python3 - "$WRK" "$TMP" <<'PY'
+import os, re, sys
+wrk, tmp = sys.argv[1:]
+src = open(wrk, encoding="utf-8").read()
+match = re.search(r"^WRK_EVENTS_PY='\n(.*?)\n'$", src, re.S | re.M)
+assert match, "WRK_EVENTS_PY block not found"
+space = {}
+exec(match.group(1), space)
+hook = os.path.join(tmp, "marker-hook")
+marker = os.path.join(tmp, "marker-ran")
+with open(hook, "w", encoding="utf-8") as handle:
+    handle.write("#!/bin/sh\n: >%s\n" % marker)
+os.chmod(hook, 0o755)
+events = os.path.join(tmp, "marker-events")
+os.makedirs(events, exist_ok=True)
+call = space["wrk_precommit_test_hook"]
+os.environ["WRK_TEST_JOINED_PRECOMMIT_HOOK"] = hook
+for mode in (None, "", "0", "true", "yes", "2"):
+    if mode is None:
+        os.environ.pop("WRK_TEST_MODE", None)
+    else:
+        os.environ["WRK_TEST_MODE"] = mode
+    call(events, "job-x")
+    assert not os.path.exists(marker), "hook ran with WRK_TEST_MODE=%r" % (mode,)
+os.environ["WRK_TEST_MODE"] = "1"
+call(events, "job-x")
+assert os.path.exists(marker), "hook must run under WRK_TEST_MODE=1"
+os.unlink(marker)
+del os.environ["WRK_TEST_JOINED_PRECOMMIT_HOOK"]
+call(events, "job-x")
+assert not os.path.exists(marker), "no hook variable, nothing to run"
+PY
+echo "PASS f-hook-inert-outside-test-mode"
+
+# ── hk 1900 (c): a verdict file with a non-UTF-8 byte is read, not skipped ──
+echo "== g-non-utf8-verdict-file =="
+claim_job g-badbyte
+open_ok g-badbyte "$H1"
+write_verdict_file "$TMP/g-clean.md" PASS "$H1" 'clean first verdict'
+verdict_ok g-badbyte "$TMP/g-clean.md"
+open_ok g-badbyte "$H2"
+BAD_COPY="$ARBITER_INBOX_ROOT/g-badbyte/copy.md"
+printf 'VERDICT: PASS @%s\nlater line with a bad byte \377 here\n' "$H2" >"$BAD_COPY"
+bad_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$BAD_COPY")"
+run_cmd "$WRK" joined g-badbyte --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: unmatched tester verdict file $bad_abs"
+[[ "$(kind_count g-badbyte job.joined)" -eq 0 ]] || fail "a non-UTF-8 copied verdict file must block the join"
+run_cmd "$WRK" round verdict g-badbyte --file "$BAD_COPY"
+assert_rc 0
+grep -q "OK job=g-badbyte verdict=PASS head=$H2 round=2 " "$TMP/run.out" || fail "non-UTF-8 verdict file not recorded: $(cat "$TMP/run.out")"
+[[ "$(kind_count g-badbyte job.verdict)" -eq 2 ]] || fail "the non-UTF-8 verdict file must be recorded as a job.verdict"
+[[ "$(verdict_field g-badbyte 1 content_sha256 | tail -n 1)" == "$(file_sha "$BAD_COPY")" ]] ||
+  fail "content_sha256 must stay over the raw bytes"
+join_ok g-badbyte
+echo "PASS g-non-utf8-copy-refused-then-recorded"
+
+# CRLF line ends keep a VERDICT first line. A UTF-8 BOM in front of it does not:
+# the line no longer starts with VERDICT, so the file is not a verdict file and
+# round verdict finds no VERDICT line in it.
+claim_job g-crlf
+seed_round g-crlf
+printf 'VERDICT: PASS @%s\r\nfindings\r\n' "$H3" >"$ARBITER_INBOX_ROOT/g-crlf/crlf.md"
+crlf_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$ARBITER_INBOX_ROOT/g-crlf/crlf.md")"
+run_cmd "$WRK" joined g-crlf --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: unmatched tester verdict file $crlf_abs"
+echo "PASS g-crlf-verdict-first-line-counts"
+claim_job g-bom
+seed_round g-bom
+printf '\357\273\277VERDICT: PASS @%s\nfindings\n' "$H3" >"$ARBITER_INBOX_ROOT/g-bom/bom.md"
+run_cmd "$WRK" round verdict g-bom --file "$ARBITER_INBOX_ROOT/g-bom/bom.md"
+assert_refused "wrk: round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $ARBITER_INBOX_ROOT/g-bom/bom.md"
+join_ok g-bom
+echo "PASS g-bom-is-not-a-verdict-first-line"
+
 # ── help and the one skill line each ───────────────────────────────────
 "$WRK" --help >"$TMP/usage.txt"
 grep -q 'round audit' "$TMP/usage.txt" || fail "usage must name round audit"
@@ -791,8 +1047,12 @@ src = open(sys.argv[1], encoding="utf-8").read()
 for anchor in (
     "if digest in digests:  # hk1449-content-sha",
     '[[ -z "$joined_end" ]] || die "joined: refused after end record $joined_end"',
-    "and r.get(\"round\") in voided))  # hk1449-nonvoid-rounds",
+    "and r.get(\"round\") in bound)  # hk1449-nonvoid-rounds",
     "if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line",
+    "if ended:  # hk1900-inlock-end",
+    "if not waived and wrk_round_census(events, job)[1] <= 0:  # hk1900-inlock-zero",
+    "text = data.decode(\"utf-8\", errors=\"replace\")  # hk1900-utf8-replace",
+    "errors=\"replace\"):  # hk1900-verdict-decode",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -843,12 +1103,18 @@ echo "PASS mutant-drop-content-hash-goes-red"
 # shellcheck disable=SC2016 # the mutant spec is a literal source span, not an expansion
 printf '%s\n' '[[ -z "$joined_end" ]] || die "joined: refused after end record $joined_end" => :' >"$TMP/spec-end"
 mutant end "$TMP/spec-end"
+# hk 1900: wrk own write path rechecks the end record under the events lock, so
+# dropping the pre-check no longer shows there. The delegated path has no
+# in-lock recheck, so this case runs through the panewire stub: only the
+# pre-check stands between an ended job and the hand-off.
 claim_job mut-end
 seed_round mut-end
 write_event "$ARBITER_INBOX_ROOT/mut-end/events/00009-job.revoked.json" <<'EOF'
 {"kind":"job.revoked","job_id":"mut-end","created_at":"2026-10-23T06:00:00Z"}
 EOF
-run_cmd "$WRK" joined mut-end --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+: >"$TMP/pw-end.log"
+run_cmd env WRK_JOB_DELEGATE=1 PANEWIRE_BIN="$TMP/pw-ok" PW_LOG="$TMP/pw-end.log" \
+  "$WRK" joined mut-end --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
 [[ "$RUN_RC" -ne 0 ]] || fail "real wrk must still refuse a join after revoke"
 [[ "$(kind_count mut-end job.joined)" -eq 0 ]] || fail "real wrk wrote job.joined after revoke"
 claim_job mut-end-red
@@ -856,15 +1122,16 @@ seed_round mut-end-red
 write_event "$ARBITER_INBOX_ROOT/mut-end-red/events/00009-job.revoked.json" <<'EOF'
 {"kind":"job.revoked","job_id":"mut-end-red","created_at":"2026-10-23T06:00:00Z"}
 EOF
-run_cmd "$TMP/end-wrk" joined mut-end-red --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+run_cmd env WRK_JOB_DELEGATE=1 PANEWIRE_BIN="$TMP/pw-ok" PW_LOG="$TMP/pw-end.log" \
+  "$TMP/end-wrk" joined mut-end-red --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
 [[ "$RUN_RC" -eq 0 ]] || fail "joined-end mutant must allow the join, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
 [[ "$(kind_count mut-end-red job.joined)" -eq 1 ]] || fail "joined-end mutant did not write job.joined"
 echo "PASS mutant-drop-joined-end-goes-red"
 
-printf '%s\n' 'and r.get("round") in voided))  # hk1449-nonvoid-rounds => and False))  # hk1449-nonvoid-rounds' >"$TMP/spec-void"
+printf '%s\n' 'and r.get("round") in bound)  # hk1449-nonvoid-rounds => and r.get("round") is not None)  # hk1449-nonvoid-rounds' >"$TMP/spec-void"
 mutant voided "$TMP/spec-void"
 claim_job mut-void
-seed_round mut-void
+seed_open_round mut-void
 write_event "$ARBITER_INBOX_ROOT/mut-void/events/00083-job.round_void.json" <<'EOF'
 {"kind":"job.round_void","job_id":"mut-void","round":1,"ref":"hk:task/7","created_at":"2026-10-23T00:00:06Z"}
 EOF
@@ -872,7 +1139,7 @@ run_cmd "$WRK" joined mut-void --pr https://example.invalid/pr/1 --head "$H1" --
 [[ "$RUN_RC" -ne 0 ]] || fail "real wrk must refuse a voided-only join"
 [[ "$(kind_count mut-void job.joined)" -eq 0 ]] || fail "real wrk wrote job.joined for a voided-only job"
 claim_job mut-void-red
-seed_round mut-void-red
+seed_open_round mut-void-red
 write_event "$ARBITER_INBOX_ROOT/mut-void-red/events/00083-job.round_void.json" <<'EOF'
 {"kind":"job.round_void","job_id":"mut-void-red","round":1,"ref":"hk:task/7","created_at":"2026-10-23T00:00:06Z"}
 EOF
@@ -880,6 +1147,21 @@ run_cmd "$TMP/voided-wrk" joined mut-void-red --pr https://example.invalid/pr/1 
 [[ "$RUN_RC" -eq 0 ]] || fail "void-counting mutant must allow the join, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
 [[ "$(kind_count mut-void-red job.joined)" -eq 1 ]] || fail "void-counting mutant did not write job.joined"
 echo "PASS mutant-zero-rounds-counts-voided-goes-red"
+
+# ── hk 1900 mutants ─────────────────────────────────────────────────────
+# The mutant above, which counts every numbered round, also counts an open round
+# that never got a verdict: the open-then-join case must go RED under it.
+claim_job mut-open
+open_ok mut-open "$H1"
+run_cmd "$WRK" joined mut-open --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -ne 0 ]] || fail "real wrk must refuse a join with only an open round"
+[[ "$(kind_count mut-open job.joined)" -eq 0 ]] || fail "real wrk wrote job.joined for an open round with no verdict"
+claim_job mut-open-red
+open_ok mut-open-red "$H1"
+run_cmd "$TMP/voided-wrk" joined mut-open-red --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -eq 0 ]] || fail "open-round-counting mutant must allow the join, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
+[[ "$(kind_count mut-open-red job.joined)" -eq 1 ]] || fail "open-round-counting mutant did not write job.joined"
+echo "PASS mutant-open-round-counts-goes-red"
 
 printf '%s\n' 'if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line => if not any(wrk_verdict_line.match(line) for line in lines):  # hk1449-verdict-first-line' >"$TMP/spec-anyline"
 mutant anyline "$TMP/spec-anyline"
@@ -896,5 +1178,68 @@ run_cmd "$TMP/anyline-wrk" joined mut-anyline-red --pr https://example.invalid/p
 [[ "$RUN_RC" -ne 0 ]] || fail "any-line mutant must refuse the later VERDICT line, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
 [[ "$(kind_count mut-anyline-red job.joined)" -eq 0 ]] || fail "any-line mutant wrote job.joined"
 echo "PASS mutant-any-line-match-goes-red"
+
+printf '%s\n' 'if ended:  # hk1900-inlock-end => if False:  # hk1900-inlock-end' >"$TMP/spec-inlock-end"
+mutant inlock-end "$TMP/spec-inlock-end"
+claim_job mut-inlock-end
+seed_round mut-inlock-end
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$RACE_HOOK" \
+  "$WRK" joined mut-inlock-end --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -ne 0 ]] || fail "real wrk must refuse a join that races an end record"
+[[ "$(kind_count mut-inlock-end job.joined)" -eq 0 ]] || fail "real wrk wrote job.joined after the racing end record"
+claim_job mut-inlock-end-red
+seed_round mut-inlock-end-red
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$RACE_HOOK" \
+  "$TMP/inlock-end-wrk" joined mut-inlock-end-red --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -eq 0 ]] || fail "in-lock-end mutant must allow the racing join, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
+[[ "$(kind_count mut-inlock-end-red job.joined)" -eq 1 ]] || fail "in-lock-end mutant did not write job.joined"
+echo "PASS mutant-drop-inlock-end-recheck-goes-red"
+
+printf '%s\n' 'if not waived and wrk_round_census(events, job)[1] <= 0:  # hk1900-inlock-zero => if False:  # hk1900-inlock-zero' >"$TMP/spec-inlock-zero"
+mutant inlock-zero "$TMP/spec-inlock-zero"
+claim_job mut-inlock-zero
+seed_round mut-inlock-zero
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$ZERO_HOOK" \
+  "$WRK" joined mut-inlock-zero --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -ne 0 ]] || fail "real wrk must refuse a join that lost its last verdict"
+[[ "$(kind_count mut-inlock-zero job.joined)" -eq 0 ]] || fail "real wrk wrote job.joined with zero rounds"
+claim_job mut-inlock-zero-red
+seed_round mut-inlock-zero-red
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$ZERO_HOOK" \
+  "$TMP/inlock-zero-wrk" joined mut-inlock-zero-red --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -eq 0 ]] || fail "in-lock-zero mutant must allow the join, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
+[[ "$(kind_count mut-inlock-zero-red job.joined)" -eq 1 ]] || fail "in-lock-zero mutant did not write job.joined"
+echo "PASS mutant-drop-inlock-zero-recheck-goes-red"
+
+printf '%s\n' 'text = data.decode("utf-8", errors="replace")  # hk1900-utf8-replace => text = data.decode("utf-8", errors="replace") if data.decode("utf-8", errors="replace").encode("utf-8") == data else ""  # hk1900-utf8-replace' >"$TMP/spec-utf8"
+mutant utf8 "$TMP/spec-utf8"
+claim_job mut-utf8
+seed_round mut-utf8
+printf 'VERDICT: PASS @%s\nbad byte \377 here\n' "$H2" >"$ARBITER_INBOX_ROOT/mut-utf8/copy.md"
+run_cmd "$WRK" joined mut-utf8 --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -ne 0 ]] || fail "real wrk must refuse a join past a non-UTF-8 copied verdict file"
+[[ "$(kind_count mut-utf8 job.joined)" -eq 0 ]] || fail "real wrk wrote job.joined past a non-UTF-8 verdict file"
+claim_job mut-utf8-red
+seed_round mut-utf8-red
+printf 'VERDICT: PASS @%s\nbad byte \377 here\n' "$H2" >"$ARBITER_INBOX_ROOT/mut-utf8-red/copy.md"
+run_cmd "$TMP/utf8-wrk" joined mut-utf8-red --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
+[[ "$RUN_RC" -eq 0 ]] || fail "skip-non-UTF-8 mutant must allow the join, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
+[[ "$(kind_count mut-utf8-red job.joined)" -eq 1 ]] || fail "skip-non-UTF-8 mutant did not write job.joined"
+echo "PASS mutant-skip-non-utf8-files-goes-red"
+
+printf '%s\n' 'errors="replace"):  # hk1900-verdict-decode => errors="strict"):  # hk1900-verdict-decode' >"$TMP/spec-vdecode"
+mutant vdecode "$TMP/spec-vdecode"
+claim_job mut-vdecode
+open_ok mut-vdecode "$H1"
+printf 'VERDICT: PASS @%s\nbad byte \377 here\n' "$H2" >"$TMP/mut-vdecode.md"
+run_cmd "$WRK" round verdict mut-vdecode --file "$TMP/mut-vdecode.md"
+assert_rc 0
+claim_job mut-vdecode-red
+open_ok mut-vdecode-red "$H1"
+run_cmd "$TMP/vdecode-wrk" round verdict mut-vdecode-red --file "$TMP/mut-vdecode.md"
+[[ "$RUN_RC" -ne 0 ]] || fail "strict-decode mutant must fail to record the non-UTF-8 verdict file"
+[[ "$(kind_count mut-vdecode-red job.verdict)" -eq 0 ]] || fail "strict-decode mutant wrote a job.verdict"
+echo "PASS mutant-strict-verdict-decode-goes-red"
+
 
 echo "PASS test-wrk-rounds"
