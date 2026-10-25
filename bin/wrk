@@ -5539,17 +5539,26 @@ event, so the reclaim is no longer newer than its receipt and the watch reads
 as current again. The copy keeps the receipt's payload; arbiter stores payloads
 with sorted keys.
 
-Restore records no quota row (the revoke already released it) and starts no
-sentinel. It does not look at the job's terminal kind: a completed, joined or
-handed-off job whose pane still passes the checks is revived the same way and
-is live work again until wrk done runs. The herdr checks are a snapshot taken
-just before the reclaim. A completion sentinel still running for the job can
-read the reclaim as superseded and exit before the receipt lands.
+Restore records no quota row (the revoke already released it). After the receipt
+copy it starts one completion sentinel for the job, the same way spawn does, so
+a pane that dies after the checks is recorded as job.lost by that sentinel. The
+sentinel then leaves after the lost grace without ending the revived job; wrk
+prune declares the end once the pane is absent and the job is stale. A live
+sentinel for the job that already watches this pane, proven by its pidfile and
+argv, is kept, and no second one starts.
+
+It does not look at the job's terminal kind: a completed, joined or handed-off
+job whose pane still passes the checks is revived the same way and is live work
+again until wrk done runs. The herdr checks are a snapshot taken just before the
+reclaim; the sentinel is what watches the pane after it. A completion sentinel
+still running for the job can read the reclaim as superseded and exit before the
+receipt lands.
 
 Exit codes: 0 restored. 2 refused before any write, nothing changed. 1 the
 reclaim landed but the receipt write failed; the one stderr line then names the
-exact arbiter event command that completes the restore. Run that command. Do
-not run the claim again.
+exact arbiter event command that completes the restore. Run that command, and
+do not run the claim again. Or the receipt landed but no sentinel started; the
+stderr line says so, and the job is unwatched until one is started.
 
 Options:
   -h, --help         show this usage
@@ -5557,9 +5566,9 @@ USAGE
 }
 
 # The restore planner reads the job's own events, in wrk's event order. It
-# prints NUL-separated items: REFUSE check detail, or OK pane label tab receipt
-# followed by the reclaim arguments. The receipt JSON is ASCII-only, so it can
-# never carry a NUL into argv.
+# prints NUL-separated items: REFUSE check detail, or OK pane label tab owner
+# receipt followed by the reclaim arguments. The receipt JSON is ASCII-only, so
+# it can never carry a NUL into argv.
 RESTORE_PLAN_PY='
 import json, os, sys
 exec(os.environ["WRK_EVENTS_PY"])
@@ -5614,7 +5623,7 @@ for key, flag in (("task_link_override", "--task-link-override"), ("task_inherit
             emit("REFUSE", "claim", "the first job.claim %s is not a string" % key)
         argv += [flag, claim[key]]
 receipt_json = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
-emit("OK", receipt["pane_id"], receipt["label"], receipt["tab_id"], receipt_json, *argv)
+emit("OK", receipt["pane_id"], receipt["label"], receipt["tab_id"], claim["owner_lane"], receipt_json, *argv)
 '
 
 # The herdr check reads `herdr agent list` on stdin and prints one line: OK, or
@@ -5664,7 +5673,7 @@ restore_cmd() {
     restore_help
     return 0
   fi
-  local job="${1:-}" arb events state item herdr_out pane label tab receipt verdict check detail cmd rc
+  local job="${1:-}" arb events state item herdr_out pane label tab owner receipt verdict check detail cmd rc
   local -a plan=() reclaim=()
   [[ -n "$job" && "$job" != -* ]] || die "restore requires a job id"
   shift || true
@@ -5695,8 +5704,9 @@ restore_cmd() {
   pane="${plan[1]}"
   label="${plan[2]}"
   tab="${plan[3]}"
-  receipt="${plan[4]}"
-  reclaim=("${plan[@]:5}")
+  owner="${plan[4]}"
+  receipt="${plan[5]}"
+  reclaim=("${plan[@]:6}")
 
   # Checks 3 to 6: herdr must list the receipt's pane as one agent, in the
   # receipt's tab, with a live status, under the receipt's label.
@@ -5729,6 +5739,16 @@ restore_cmd() {
   if [[ "$rc" -ne 0 ]]; then
     cmd="$(restore_quote "$arb" event --job "$job" --kind job.spawned --payload-json "$receipt")"
     echo "wrk: restore job=$job: reclaimed, but the job.spawned receipt write failed (exit $rc); complete the restore with: $cmd" >&2
+    return 1
+  fi
+  # The restored job gets the watcher a spawn gives it, so a pane that dies after
+  # the checks above is recorded as lost by that sentinel. start_completion_sentinel
+  # keeps a live sentinel that its pidfile and argv tie to this job and pane, and
+  # starts none in that case.
+  rc=0
+  start_completion_sentinel "$(wrk_jobs_root)/$job/completion-sentinel.pid" "$job" "$owner" "$label" "$pane" "" "" "" "" "" || rc=$? # hk1933-restore-sentinel
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: restore job=$job: restored, but its completion sentinel did not start; the job is unwatched" >&2
     return 1
   fi
   echo "OK job=$job restored pane=$pane tab=$tab label=$label"
