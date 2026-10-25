@@ -4993,4 +4993,443 @@ mkmut r39-completed-becomes-watch-expired \
 expect_mut_red "R39 completed must never become watch-expired" case_late_stable_r39 \
   'FAIL: je51m39: the confirmed late report must complete'
 
+# ── hk1933: wrk restore — a same-pane restore after a false loss ──────────
+# The 10-23 false loss was restored by hand: arbiter claim --reclaim-released,
+# then a copy of the newest job.spawned payload written as an event. wrk
+# restore does both in one step, after checks that prove the job is released
+# and that herdr still shows the newest receipt's pane, in its tab, under its
+# label. The herdr stub answers agent list, tab list and agent get from the
+# JSON state file each case writes into RESTORE_STATE.
+restore_stub_write() {
+  cat >"$TMP/restore-herdr" <<'PY' || return 3
+#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["RESTORE_STATE"], encoding="utf-8") as handle:
+    state = json.load(handle)
+args = sys.argv[1:]
+if args == ["agent", "list"]:
+    print(json.dumps({"id": "cli:agent:list", "result": {"agents": state["agents"]}}))
+elif args == ["tab", "list"]:
+    print(json.dumps({"id": "cli:tab:list", "result": {"tabs": state["tabs"]}}))
+elif len(args) == 3 and args[:2] == ["agent", "get"]:
+    hits = [a for a in state["agents"] if a.get("pane_id") == args[2]]
+    if not hits:
+        print(json.dumps({"error": {"code": "agent_not_found", "message": "no such agent"}}))
+        sys.exit(1)
+    print(json.dumps({"id": "cli:agent:get", "result": {"agent": hits[0], "type": "agent_info"}}))
+else:
+    print(json.dumps({"error": {"code": "unsupported", "message": "restore stub"}}))
+    sys.exit(1)
+PY
+  chmod +x "$TMP/restore-herdr" || return 3
+}
+
+# restore_live_state FILE PANE TAB LABEL STATUS — one agent in PANE and TAB,
+# named LABEL with STATUS, and a tab list in which TAB holds exactly that pane.
+restore_live_state() {
+  printf '%s\n' "{\"agents\":[{\"agent\":\"codex\",\"agent_status\":\"$5\",\"name\":\"$4\",\"pane_id\":\"$2\",\"tab_id\":\"$3\",\"workspace_id\":\"w1\"}],\"tabs\":[{\"label\":\"$4\",\"pane_count\":1,\"tab_id\":\"$3\",\"workspace_id\":\"w1\"}]}" >"$1"
+}
+
+# restore_empty_state FILE — herdr reports no agent and no tab: the pane is gone.
+restore_empty_state() {
+  printf '%s\n' '{"agents":[],"tabs":[]}' >"$1"
+}
+
+# restore_seed JOB PANE TAB LABEL — the claim and the spawn receipt the spawn
+# path writes for a T1 worker on PANE in TAB.
+restore_seed() {
+  arb claim --job "$1" --lane lane-a --agent-label "$4" --t T1 >/dev/null || return 3
+  arb event --job "$1" --kind job.spawned --payload-json \
+    "{\"label\":\"$4\",\"pane_id\":\"$2\",\"profile\":\"codex-luna\",\"tab_id\":\"$3\",\"workspace\":\"w1\"}" \
+    >/dev/null || return 3
+}
+
+# restore_false_loss JOB PANE LABEL — the sentinel's false loss: job.lost, then
+# job.revoked, then the quota release that leaves the job released.
+restore_false_loss() {
+  arb_lease "$1" || return 3
+  arb event --job "$1" --kind job.lost \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"$3\",\"pane_id\":\"$2\"}" >/dev/null || return 3
+  arb event --job "$1" --kind job.revoked \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"$3\",\"pane_id\":\"$2\",\"outcome\":\"abandoned\",\"source\":\"sentinel\",\"reason\":\"lost-grace\"}" \
+    >/dev/null || return 3
+  arb release --job "$1" --resource codex --kind quota_pool >/dev/null || return 3
+}
+
+restore_state_of() {
+  arb job-get --job "$1" --json | python3 -c 'import json, sys; print(json.load(sys.stdin)["state"])'
+}
+
+# restore_receipts EVENTS — one canonical payload line per job.spawned artifact,
+# oldest first. The arbiter stores payloads with sorted keys, so equal lines
+# mean byte-equal stored payloads.
+restore_receipts() {
+  python3 - "$1" <<'PY'
+import glob, json, os, sys
+for path in sorted(glob.glob(os.path.join(sys.argv[1], "*job.spawned.json"))):
+    with open(path, encoding="utf-8") as handle:
+        print(json.dumps(json.load(handle)["payload"], ensure_ascii=False, sort_keys=True))
+PY
+}
+
+# restore_run JOB — wrk restore against the case's arbiter (RESTORE_ARBITER
+# overrides it for one case) and the herdr stub reading RESTORE_STATE.
+restore_run() {
+  env HERDR_BIN="$TMP/restore-herdr" RESTORE_STATE="$RESTORE_STATE" \
+    ARBITER_BIN="${RESTORE_ARBITER:-$ARBITER}" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" "$WRK" restore "$@"
+}
+
+restore_reap() {
+  env HERDR_BIN="$TMP/restore-herdr" RESTORE_STATE="$RESTORE_STATE" \
+    ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    "$WRK" reap --lane lane-a --grace "$1" 2>&1
+}
+
+# restore_snapshot JOB — the arbiter state and every event file name. A refusal
+# must leave both exactly as they were.
+restore_snapshot() {
+  printf 'state=%s\n' "$(restore_state_of "$1")"
+  ls -1 "$INBOX/$1/events"
+}
+
+# restore_expect_refused JOB CHECK — wrk restore must refuse, name check=CHECK
+# on stderr, and change nothing.
+restore_expect_refused() {
+  local job="$1" check="$2" rc=0 before after
+  before="$(restore_snapshot "$job")"
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || rc=$?
+  if [[ "$rc" -eq 0 ]]; then
+    assertion_red "hk1933 restore must refuse ($check)" || return 1
+  fi
+  if ! grep -Fq "check=$check" "$TMP/restore-err"; then
+    cat "$TMP/restore-err" >&2
+    assertion_red "hk1933 restore refusal must name check=$check" || return 1
+  fi
+  after="$(restore_snapshot "$job")"
+  if [[ "$before" != "$after" ]]; then
+    assertion_red "hk1933 restore refusal ($check) must change nothing" || return 1
+  fi
+}
+
+# The 10-23 sequence, end to end: claim, spawn, false loss, quota release, then
+# restore on the same live pane. Done and reap follow the restored run.
+case_hk1933_restore_10_23() {
+  reset_case hk1933-10-23 || return 3
+  local job=hk1933-10-23 pane=w1:p1 tab=w1:t1 label=lbl-hk1933-10-23 receipts
+  local report="$TMP/hk1933-10-23-report.md" reap_out
+  printf 'x\n' >"$report"
+  restore_seed "$job" "$pane" "$tab" "$label" || return 3
+  restore_false_loss "$job" "$pane" "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" "$pane" "$tab" "$label" idle || return 3
+  [[ "$(restore_state_of "$job")" == released ]] || return 3
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || {
+    cat "$TMP/restore-err" >&2
+    assertion_red 'hk1933 a false loss on its live pane must restore' || return 1
+  }
+  [[ "$(restore_state_of "$job")" == claimed ]] ||
+    { assertion_red 'hk1933 restore must leave the job claimed'; return 1; }
+  [[ "$(event_count "$INBOX/$job/events" job.reclaim)" == 1 ]] ||
+    { assertion_red 'hk1933 restore must add exactly one job.reclaim'; return 1; }
+  [[ "$(event_count "$INBOX/$job/events" job.spawned)" == 2 ]] ||
+    { assertion_red 'hk1933 restore must add exactly one job.spawned receipt'; return 1; }
+  receipts="$(restore_receipts "$INBOX/$job/events")"
+  [[ "$(head -n 1 <<<"$receipts")" == "$(tail -n 1 <<<"$receipts")" ]] ||
+    { assertion_red 'hk1933 the copied receipt must equal the newest receipt'; return 1; }
+  arb_lease "$job" || return 3
+  done_run "$job" --report "$report" >"$TMP/restore-done-out" 2>&1 || {
+    cat "$TMP/restore-done-out" >&2
+    assertion_red 'hk1933 wrk done after a restore must complete with rc 0' || return 1
+  }
+  [[ "$(quota_rows "$job")" == 0 ]] ||
+    { assertion_red 'hk1933 wrk done after a restore must leave no leased row'; return 1; }
+  [[ "$(event_count "$INBOX/$job/events" job.completed)" == 1 ]] ||
+    { assertion_red 'hk1933 wrk done after a restore must write one job.completed'; return 1; }
+  reap_out="$(restore_reap 0s)"
+  grep -Fq "would-close job=$job pane=$pane tab=$tab" <<<"$reap_out" ||
+    { printf '%s\n' "$reap_out" >&2; assertion_red 'hk1933 reap must list the restored, completed job after its grace'; return 1; }
+}
+
+case_hk1933_restore_done_releases_row() {
+  reset_case hk1933-done || return 3
+  local job=hk1933-done pane=w1:p1 tab=w1:t1 label=lbl-hk1933-done report="$TMP/hk1933-done-report.md"
+  printf 'x\n' >"$report"
+  restore_seed "$job" "$pane" "$tab" "$label" || return 3
+  restore_false_loss "$job" "$pane" "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" "$pane" "$tab" "$label" idle || return 3
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || {
+    cat "$TMP/restore-err" >&2
+    assertion_red 'hk1933 restore for the done check must succeed' || return 1
+  }
+  arb_lease "$job" || return 3
+  done_run "$job" --report "$report" >/dev/null 2>&1 || return 1
+  [[ "$(quota_rows "$job")" == 0 ]] ||
+    { assertion_red 'hk1933 wrk done after a restore must release the row the restored run holds'; return 1; }
+}
+
+case_hk1933_restore_done_no_row() {
+  reset_case hk1933-norow || return 3
+  local job=hk1933-norow pane=w1:p1 tab=w1:t1 label=lbl-hk1933-norow report="$TMP/hk1933-norow-report.md"
+  printf 'x\n' >"$report"
+  restore_seed "$job" "$pane" "$tab" "$label" || return 3
+  restore_false_loss "$job" "$pane" "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" "$pane" "$tab" "$label" idle || return 3
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || {
+    cat "$TMP/restore-err" >&2
+    assertion_red 'hk1933 restore with no quota row must succeed' || return 1
+  }
+  done_run "$job" --report "$report" >"$TMP/restore-done-out" 2>&1 || {
+    cat "$TMP/restore-done-out" >&2
+    assertion_red 'hk1933 wrk done with no quota row after a restore must complete with rc 0' || return 1
+  }
+  # The handoffkeep fixture has no `doc put`, so every done here warns about its
+  # document upload. Any other warning, or any quota mention, is the failure.
+  if grep 'wrk: warning:' "$TMP/restore-done-out" | grep -vq 'handoffkeep document upload failed' ||
+    grep -Fiq quota "$TMP/restore-done-out"; then
+    cat "$TMP/restore-done-out" >&2
+    assertion_red 'hk1933 wrk done with no quota row after a restore must not warn' || return 1
+  fi
+}
+
+# A respawn history: the first receipt's pane is gone, the second is live.
+# The copy must be the newest receipt, so the restore lands on the live pane.
+case_hk1933_restore_newest_receipt() {
+  reset_case hk1933-newest || return 3
+  local job=hk1933-newest label=lbl-hk1933-newest receipts
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "$label" --t T1 --reclaim-released >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned --payload-json \
+    "{\"label\":\"$label\",\"pane_id\":\"w1:p2\",\"profile\":\"codex-luna\",\"tab_id\":\"w1:t2\",\"workspace\":\"w1\"}" \
+    >/dev/null || return 3
+  restore_false_loss "$job" w1:p2 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p2 w1:t2 "$label" idle || return 3
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || {
+    cat "$TMP/restore-err" >&2
+    assertion_red 'hk1933 restore must use the newest receipt and its live pane' || return 1
+  }
+  [[ "$(event_count "$INBOX/$job/events" job.reclaim)" == 2 ]] ||
+    { assertion_red 'hk1933 newest-receipt restore must add exactly one job.reclaim'; return 1; }
+  receipts="$(restore_receipts "$INBOX/$job/events")"
+  [[ "$(tail -n 1 <<<"$receipts")" == "$(sed -n 2p <<<"$receipts")" ]] ||
+    { assertion_red 'hk1933 the copied receipt must be the newest receipt, not the first'; return 1; }
+}
+
+# The receipt write fails after the reclaim lands: one stderr line carries the
+# arbiter event command that completes the restore, and nothing retries.
+case_hk1933_restore_partial() {
+  reset_case hk1933-partial || return 3
+  local job=hk1933-partial label=lbl-hk1933-partial wrap="$TMP/restore-arb-partial-$CASE_SEQ"
+  local err="$TMP/restore-partial-err-$CASE_SEQ" rc=0 line cmd receipts
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" idle || return 3
+  printf '%s\n' '#!/bin/bash' \
+    'if [[ "${1:-}" == event && " $* " == *" --kind job.spawned "* ]]; then exit 1; fi' \
+    "exec \"$ARBITER\" \"\$@\"" >"$wrap" || return 3
+  chmod +x "$wrap" || return 3
+  RESTORE_ARBITER="$wrap"
+  restore_run "$job" >/dev/null 2>"$err" || rc=$?
+  RESTORE_ARBITER=""
+  [[ "$rc" -ne 0 ]] || { assertion_red 'hk1933 a failed receipt write must exit non-zero'; return 1; }
+  [[ "$(grep -c '^wrk: restore job=' "$err")" == 1 ]] ||
+    { cat "$err" >&2; assertion_red 'hk1933 a failed receipt write must print exactly one wrk stderr line'; return 1; }
+  [[ "$(event_count "$INBOX/$job/events" job.reclaim)" == 1 ]] ||
+    { assertion_red 'hk1933 a failed receipt write must not retry the reclaim'; return 1; }
+  [[ "$(event_count "$INBOX/$job/events" job.spawned)" == 1 ]] ||
+    { assertion_red 'hk1933 a failed receipt write must leave the receipt count alone'; return 1; }
+  line="$(cat "$err")"
+  cmd="${line#*complete the restore with: }"
+  [[ "$cmd" != "$line" ]] || { assertion_red 'hk1933 the stderr line must carry the completion command'; return 1; }
+  cmd="${cmd//"$wrap"/"$ARBITER"}"
+  env ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" bash -c "$cmd" >/dev/null 2>&1 ||
+    { assertion_red 'hk1933 the printed command must complete the restore'; return 1; }
+  receipts="$(restore_receipts "$INBOX/$job/events")"
+  [[ "$(head -n 1 <<<"$receipts")" == "$(tail -n 1 <<<"$receipts")" ]] ||
+    { assertion_red 'hk1933 the printed command must copy the newest receipt'; return 1; }
+}
+
+# The copy keeps every receipt field (keep, hub-lane fields, non-ASCII), and the
+# reclaim carries every field of the first claim it was built from.
+case_hk1933_restore_fields_and_copy() {
+  reset_case hk1933-fields || return 3
+  local job=hk1933-fields label=lbl-hk1933-fields receipts
+  arb claim --job "$job" --lane builder-lane --agent-label "$label" --t T2 --role builder \
+    --parent-lane parent-lane --task-id 1933 --task-link-override declared \
+    --task-inherited-from hk1932-parent >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned --payload-json \
+    "{\"label\":\"$label\",\"pane_id\":\"w1:p1\",\"profile\":\"codex-luna\",\"tab_id\":\"w1:t1\",\"workspace\":\"작업-w1\",\"keep\":true,\"hub_lane\":\"lane-ü\",\"hub_lane_machine\":\"m1\",\"lane_role\":\"builder\"}" \
+    >/dev/null || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" idle || return 3
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || {
+    cat "$TMP/restore-err" >&2
+    assertion_red 'hk1933 a builder receipt with keep and hub-lane fields must restore' || return 1
+  }
+  receipts="$(restore_receipts "$INBOX/$job/events")"
+  [[ "$(head -n 1 <<<"$receipts")" == "$(tail -n 1 <<<"$receipts")" ]] ||
+    { assertion_red 'hk1933 the copy must keep every receipt field, keep and hub-lane included'; return 1; }
+  python3 - "$INBOX/$job/events" <<'PY' || { assertion_red 'hk1933 the reclaim must carry every field of the first claim'; return 1; }
+import glob, json, os, sys
+events = sys.argv[1]
+keys = ("owner_lane", "t_level", "role", "parent_lane", "agent_label",
+        "task_id", "task_link_override", "task_inherited_from")
+
+
+def fields(kind):
+    (path,) = sorted(glob.glob(os.path.join(events, "*-job.%s.json" % kind)))
+    with open(path, encoding="utf-8") as handle:
+        payload = json.load(handle)["payload"]
+    return {key: payload.get(key, "<absent>") for key in keys}
+
+
+claim, reclaim = fields("claim"), fields("reclaim")
+if claim != reclaim:
+    raise SystemExit("claim %r != reclaim %r" % (claim, reclaim))
+PY
+}
+
+case_hk1933_refuse_state() {
+  reset_case hk1933-state || return 3
+  local job=hk1933-state label=lbl-hk1933-state
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" idle || return 3
+  restore_expect_refused "$job" state
+}
+
+case_hk1933_refuse_dead_pane() {
+  reset_case hk1933-dead || return 3
+  local job=hk1933-dead label=lbl-hk1933-dead
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_empty_state "$RESTORE_STATE" || return 3
+  restore_expect_refused "$job" herdr-pane
+}
+
+case_hk1933_refuse_other_tab() {
+  reset_case hk1933-tab || return 3
+  local job=hk1933-tab label=lbl-hk1933-tab
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t9 "$label" idle || return 3
+  restore_expect_refused "$job" herdr-tab
+}
+
+case_hk1933_refuse_other_name() {
+  reset_case hk1933-name || return 3
+  local job=hk1933-name label=lbl-hk1933-name
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 lbl-someone-else idle || return 3
+  restore_expect_refused "$job" herdr-name
+}
+
+case_hk1933_refuse_unknown_status() {
+  reset_case hk1933-status || return 3
+  local job=hk1933-status label=lbl-hk1933-status
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" unknown || return 3
+  restore_expect_refused "$job" herdr-status
+}
+
+case_hk1933_refuse_no_receipt() {
+  reset_case hk1933-nospawn || return 3
+  local job=hk1933-nospawn label=lbl-hk1933-nospawn
+  arb claim --job "$job" --lane lane-a --agent-label "$label" --t T1 >/dev/null || return 3
+  arb_lease "$job" || return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" idle || return 3
+  restore_expect_refused "$job" receipt
+}
+
+case_hk1933_refuse_receipt_without_tab() {
+  reset_case hk1933-notab || return 3
+  local job=hk1933-notab label=lbl-hk1933-notab
+  arb claim --job "$job" --lane lane-a --agent-label "$label" --t T1 >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"label\":\"$label\",\"pane_id\":\"w1:p1\",\"profile\":\"codex-luna\",\"workspace\":\"w1\"}" \
+    >/dev/null || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" idle || return 3
+  restore_expect_refused "$job" receipt
+}
+
+# Unchanged by hk1933: a bare reclaim with no receipt is a respawn in flight,
+# so the old watcher still reads superseded (hk 1813).
+case_hk1933_bare_reclaim_superseded() {
+  reset_case hk1933-bare || return 3
+  local job=hk1933-bare label=lbl-hk1933-bare lib
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  lib="$(wrk_test_library)" || return 3
+  job_watch_current_from_library "$lib" "$INBOX/$job/events" w1:p1 ||
+    { assertion_red 'hk1933 the lost job watch is current before any reclaim'; return 1; }
+  arb claim --job "$job" --lane lane-a --agent-label "$label" --t T1 --reclaim-released >/dev/null || return 3
+  if job_watch_current_from_library "$lib" "$INBOX/$job/events" w1:p1; then
+    assertion_red 'hk1933 a bare reclaim with no receipt must still read superseded' || return 1
+  fi
+}
+
+case_hk1933_marker_once() {
+  [[ "$(grep -cF 'hk1933-restore-receipt' "$WRK")" == 1 ]] ||
+    { assertion_red 'hk1933 bin/wrk must carry hk1933-restore-receipt exactly once'; return 1; }
+}
+
+# run_hk1933_case DESC FN — FN must pass on the change under test.
+run_hk1933_case() {
+  local desc="$1" fn="$2" output="$TMP/hk1933-$CASE_SEQ.out"
+  if ! "$fn" >"$output" 2>&1; then
+    cat "$output" >&2
+    fail "hk1933 $desc: contract assertion failed"
+  fi
+  printf 'PASS hk1933 %s\n' "$desc"
+}
+
+echo "== hk1933: wrk restore restores a released job onto its live pane =="
+restore_stub_write || die3 "restore herdr stub"
+run_hk1933_case "10-23 false loss restores, done completes, reap lists it" case_hk1933_restore_10_23
+run_hk1933_case "restored run's done releases the row it holds" case_hk1933_restore_done_releases_row
+run_hk1933_case "done with no quota row after a restore completes silently" case_hk1933_restore_done_no_row
+run_hk1933_case "a respawned job restores from its newest receipt" case_hk1933_restore_newest_receipt
+run_hk1933_case "a failed receipt write prints one completion command" case_hk1933_restore_partial
+run_hk1933_case "the copy and reclaim keep every receipt and claim field" case_hk1933_restore_fields_and_copy
+run_hk1933_case "refuses a job that is not released" case_hk1933_refuse_state
+run_hk1933_case "refuses a dead pane" case_hk1933_refuse_dead_pane
+run_hk1933_case "refuses a pane in another tab" case_hk1933_refuse_other_tab
+run_hk1933_case "refuses a herdr name that differs from the label" case_hk1933_refuse_other_name
+run_hk1933_case "refuses an unknown agent status" case_hk1933_refuse_unknown_status
+run_hk1933_case "refuses a job with no job.spawned receipt" case_hk1933_refuse_no_receipt
+run_hk1933_case "refuses a receipt without tab_id" case_hk1933_refuse_receipt_without_tab
+run_hk1933_case "a bare reclaim with no receipt still reads superseded" case_hk1933_bare_reclaim_superseded
+run_hk1933_case "the receipt marker is in bin/wrk exactly once" case_hk1933_marker_once
+
+# hk1933 mutants: each invariant, applied at its real call site, turns its named
+# case RED with its own assertion.
+mkmut_span hk1933-m1-no-receipt-copy 'hk1933-restore-receipt' '  : # removed hk1933 receipt copy'
+expect_mut_red "hk1933 M1 skipping the receipt copy leaves wrk done with the row" case_hk1933_restore_done_releases_row \
+  'ASSERT-RED: hk1933 wrk done after a restore must release the row the restored run holds'
+mkmut_span hk1933-m2-accept-dead-pane 'hk1933-pane-reported' 'matches = matches or [{"name": label, "tab_id": tab, "agent_status": "idle"}]  # removed hk1933 pane check'
+expect_mut_red "hk1933 M2 accepting a dead pane must fail the dead-pane refusal" case_hk1933_refuse_dead_pane \
+  'ASSERT-RED: hk1933 restore must refuse (herdr-pane)'
+mkmut_span hk1933-m3-first-receipt 'hk1933-newest-receipt' 'receipt = payload_of(spawned[0])'
+expect_mut_red "hk1933 M3 copying the first receipt must fail the respawn case" case_hk1933_restore_newest_receipt \
+  'ASSERT-RED: hk1933 restore must use the newest receipt and its live pane'
+mkmut m4-every-reclaim-current 's~spawn_pane == pane and last_claim < last_spawn) or~spawn_pane == pane) or~'
+expect_mut_red "hk1933 M4 treating every reclaim as current must fail the bare-reclaim case" case_hk1933_bare_reclaim_superseded \
+  'ASSERT-RED: hk1933 a bare reclaim with no receipt must still read superseded'
+
 echo "PASS test-wrk-job-end: all cases"
