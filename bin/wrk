@@ -344,6 +344,9 @@ Options:
                      why. Never a silent skip: a reachable hk that refuses
                      the claim still fails the spawn.
   --report PATH      report acceptance-criterion path watched by the completion sentinel
+                     Required with --parent-job for worker/tester/reviewer. Use an
+                     absolute path under the parent or new job dir; no .. or escape
+                     through symlinks. SSH re-roots --report-relative on the target.
                      When the watch window (WRK_COMPLETION_TIMEOUT_S) expires with
                      the agent still present, the sentinel logs action=watch-expired
                      and exits; the job stays live, no job.lost, no quota release.

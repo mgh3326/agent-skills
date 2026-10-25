@@ -187,7 +187,7 @@ printf 'tester relay report\n' >"$INBOX/parent/relay.md"
 env HERDR_BIN="$HERDR" PANEWIRE_BIN="$PANEWIRE" ARBITER_BIN="$ARBITER" \
   ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$TMP/relay-xdg" \
   WRK_PANEWIRE_LOG="$TMP/relay.log" \
-  "$WRK" done relay-child --report "$INBOX/parent/relay.md" >"$TMP/done.out" 2>"$TMP/done.err"
+  "$WRK" 'done' relay-child --report "$INBOX/parent/relay.md" >"$TMP/done.out" 2>"$TMP/done.err"
 python3 - "$TMP/relay.log" <<'RELAY'
 from pathlib import Path
 import sys
