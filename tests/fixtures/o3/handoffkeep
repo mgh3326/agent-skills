@@ -1,0 +1,661 @@
+#!/usr/bin/env python3
+"""hk 1926 test transport: a stub of the canonical `handoffkeep wrk` CLI (6b).
+
+It answers exactly the five subcommands with the 6b output contract (one JSON
+object on stdout for success; one `handoffkeep wrk: CODE` stderr line and the
+mapped exit for failure) over a small in-process model of the section 5
+journal. Every other handoffkeep command is handed to tests/fixtures/handoffkeep
+(the #768 tasks fixture), so one binary serves a whole spawn.
+
+Test-only and hermetic: it refuses to run without WRK_TEST_MODE=1 and with a
+state or log path outside a temp root. It records, per call, its argv, the
+sha256 and base64 of stdin, and the NAMES of the environment keys it received
+(never their values). It lives in tests/fixtures/o3/ so the top-level
+shellcheck sweep of executable fixtures does not take it for a shell script.
+
+  O3_STUB_STATE   JSON state file (created on first use)
+  O3_STUB_LOG     JSONL call log
+  O3_STUB_CLIENT  authenticated client id for this call (default: state client_id);
+                  the central wrapper fixture sets director-1 / operator-desk
+
+State keys: client_id, generation, namespace (false: every wrk call answers
+o3_unsupported), jobs{job:{records,keys}}, faults[], hosts{job:client}.
+A fault is {"op", "kind"?, "page"?, "action", "times"?}; actions are
+error:CODE, commit_then:CODE, garbage, noisy_stderr, unknown_code, hang,
+tamper_hash, snapshot_shift, gap, generation, html, respond_file:PATH. page_limit caps a records
+page so later cursor pages are exercised.
+"""
+import base64
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+import re
+import sys
+import time
+import uuid
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+EXIT = {"round_cap": 78, "wrk_unavailable": 75, "wrk_recovery_required": 75, "unauthorized": 77,
+        "scope_denied": 77, "host_mismatch": 77, "not_found": 66, "cli_usage": 2, "transport_unavailable": 75,
+        "transport_indeterminate": 75, "protocol_invalid": 75, "o3_unsupported": 75}
+for code in ("invalid_request", "invalid_cursor", "invalid_verdict", "invalid_path", "grant_before_cap",
+             "request_too_large", "method_not_allowed", "unsupported_media_type"):
+    EXIT[code] = 65
+for code in ("idempotency_conflict", "sequence_conflict", "claim_conflict", "job_ended", "review_sealed",
+             "round_not_open", "round_has_verdict", "round_voided", "head_mismatch", "duplicate_path",
+             "duplicate_content", "duplicate_head", "grant_invalid", "grant_consumed", "grant_expired",
+             "zero_rounds", "review_incomplete", "blocker_unresolved", "wrk_receipt_required", "import_unsealed",
+             "import_sealed", "migration_frozen"):
+    EXIT[code] = 73
+CENTRAL = ("director-1", "operator-desk")
+HOSTS = ("desktop", "mac-dev", "mac-work", "rpi", "mac-personal")
+REVIEW = ("tester", "reviewer", "counsel")
+JOB_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+NUM_RE = re.compile(r"^(0|[1-9][0-9]{0,15})$")
+VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})[ \t]*\r?$")
+INPUT_KEYS = {
+    "claim": {"job_id", "owner_lane", "parent_lane", "task_id", "host_client_id", "role", "tier", "review_of",
+              "predecessor_job_id", "supersedes"},
+    "activate": {"reason_code", "seal_seq"},
+    "round_open": {"head", "tester_job_id", "extension_grant_seq", "repeat_grant_seq"},
+    "verdict": {"round_no", "head", "verdict", "path", "content_sha256", "content_b64", "tester_job_id"},
+    "void": {"round_no", "grant_seq", "reason_code"},
+    "joined": {"head", "pr", "report_b64", "report_sha256", "waiver_grant_seq"},
+    "completed": {"report_b64", "report_sha256"},
+    "grant": {"grant_type", "round_no", "head", "extra", "earlier_round_no", "tester_job_id", "expires_at",
+              "reason_code"},
+    "grant_cancel": {"grant_seq", "reason_code"},
+    "end": {"end_type", "reason_code"},
+    "import": {"source_locator", "source_sha256", "original_actor_client_id", "original_at", "legacy_kind",
+               "content_b64"},
+    "import_begin": {"reason_code"},
+    "import_seal": {"begin_seq", "expected_import_count", "manifest_sha256", "reason_code"},
+}
+
+
+class Refuse(Exception):
+    def __init__(self, code):
+        Exception.__init__(self, code)
+        self.code = code
+
+
+def out_fail(code):
+    sys.stderr.write("handoffkeep wrk: %s\n" % code)
+    sys.exit(EXIT[code])
+
+
+def canonical(value):
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, list):
+        return "[" + ",".join(canonical(v) for v in value) + "]"
+    keys = sorted(value, key=lambda k: k.encode("utf-16-be"))
+    return "{" + ",".join(json.dumps(k, ensure_ascii=False) + ":" + canonical(value[k]) for k in keys) + "}"
+
+
+def sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def under_temp(path):
+    real = os.path.realpath(path)
+    roots = [os.path.realpath(r) for r in ("/tmp", "/private/tmp", "/var/folders", os.environ.get("TMPDIR", "/tmp"))]
+    return any(real == r or real.startswith(r.rstrip("/") + "/") for r in roots if r and r != "/")
+
+
+def unique(pairs):
+    result = {}
+    for k, v in pairs:
+        if k in result:
+            raise ValueError("dup")
+        result[k] = v
+    return result
+
+
+def now():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+# ── journal model ─────────────────────────────────────────────────────────────
+
+def nonimported(records, kind):
+    return [r for r in records if r["kind"] == kind and not r["imported"]]
+
+
+def summary(state, job, records):
+    claims = nonimported(records, "claim")
+    activate = nonimported(records, "activate")
+    act_seq = activate[0]["seq"] if activate else 0
+    st = "shadow"
+    for r in records:
+        if r["kind"] == "import_begin":
+            st = "importing"
+        elif r["kind"] == "import_seal":
+            st = "sealed"
+        elif r["kind"] == "activate":
+            st = "active"
+        elif r["kind"] == "joined":
+            st = "joined"
+        elif r["kind"] == "end":
+            st = "ended"
+    opens = [r for r in nonimported(records, "round_open") if r["seq"] > act_seq]
+    verdict_rounds = {r["payload"]["round_no"] for r in nonimported(records, "verdict")}
+    void_rounds = {r["payload"]["round_no"] for r in nonimported(records, "void")}
+    baseline = activate[0]["payload"]["baseline_used"] if activate else 0
+    used = baseline + sum(1 for r in opens if r["payload"]["round_no"] not in void_rounds)
+    floor = 0
+    for r in records:
+        if r["kind"] == "import_seal":
+            floor = r["payload"]["numbering_floor"]
+    numbers = [r["payload"]["round_no"] for r in nonimported(records, "round_open")]
+    open_rounds = [r["payload"]["round_no"] for r in opens
+                   if r["payload"]["round_no"] not in verdict_rounds | void_rounds]
+    verdicts = nonimported(records, "verdict")
+    consumed = set()
+    for r in records:
+        p = r["payload"]
+        for key in ("extension_grant_seq", "repeat_grant_seq", "waiver_grant_seq"):
+            if r["kind"] in ("round_open", "joined") and p.get(key):
+                consumed.add(p[key])
+        if r["kind"] in ("void", "grant_cancel"):
+            consumed.add(p["grant_seq"])
+    grants = [r["seq"] for r in nonimported(records, "grant") if r["seq"] not in consumed]
+    return {"job_id": job, "claim_seq": claims[-1]["seq"] if claims else 1,
+            "snapshot_seq": records[-1]["seq"], "state": st, "baseline_used": baseline, "used": used, "cap": 3,
+            "next_round_no": 1 + max([floor, baseline] + numbers), "open_rounds": open_rounds,
+            "last_verdict_seq": verdicts[-1]["seq"] if verdicts else None, "active_grants": grants,
+            "warnings": [], "store_generation": state["generation"], "tail_hash": records[-1]["record_hash"]}
+
+
+def receipt_required(records):
+    if nonimported(records, "activate"):
+        return True
+    return any(r["payload"]["role"] in REVIEW and r["payload"]["review_of"] for r in nonimported(records, "claim"))
+
+
+def job_of(state, job):
+    return state["jobs"].get(job)
+
+
+def claim_of(records):
+    return nonimported(records, "claim")[-1]["payload"]
+
+
+def append(state, job, kind, key, expected, claim_seq, payload, client, request_sha):
+    entry = state["jobs"].get(job)
+    if entry and key in entry["keys"]:
+        stored = entry["keys"][key]
+        if stored["sha"] != request_sha:
+            raise Refuse("idempotency_conflict")
+        return False, entry["records"][stored["seq"] - 1], stored["summary"]
+    if set(payload) != INPUT_KEYS[kind]:
+        raise Refuse("invalid_request")
+    central = client in CENTRAL
+    if entry is None:
+        if kind != "claim":
+            raise Refuse("not_found")
+        if claim_seq != 0 or expected != 0:
+            raise Refuse("sequence_conflict")
+        if payload["job_id"] != job:
+            raise Refuse("invalid_request")
+        if not central:
+            if payload["role"] not in REVIEW:
+                raise Refuse("scope_denied")
+            review = payload["review_of"]
+            if not review or review["job_id"] == job:
+                raise Refuse("claim_conflict")
+            target = state["jobs"].get(review["job_id"])
+            if target is None:
+                raise Refuse("not_found")
+            tclaim = claim_of(target["records"])
+            if tclaim["host_client_id"] != client or payload["host_client_id"] != client:
+                raise Refuse("host_mismatch")
+            tsum = summary(state, review["job_id"], target["records"])
+            if tsum["state"] == "ended":
+                raise Refuse("job_ended")
+            if tsum["state"] == "joined":
+                raise Refuse("review_sealed")
+            if tsum["state"] != "active" or tclaim["role"] not in ("builder", "worker"):
+                raise Refuse("claim_conflict")
+            derived = {"task_id": tclaim["task_id"], "tier": tclaim["tier"], "owner_lane": tclaim["owner_lane"],
+                       "parent_lane": tclaim["owner_lane"], "predecessor_job_id": None, "supersedes": None}
+            if any(payload[k] != v for k, v in derived.items()):
+                raise Refuse("claim_conflict")
+            if review["round_no"] not in tsum["open_rounds"] + [tsum["next_round_no"]]:
+                raise Refuse("claim_conflict")
+        entry = state["jobs"][job] = {"records": [], "keys": {}}
+    else:
+        records = entry["records"]
+        if expected != records[-1]["seq"]:
+            raise Refuse("sequence_conflict")
+        cur = summary(state, job, records)
+        if claim_seq != cur["claim_seq"]:
+            raise Refuse("sequence_conflict")
+        if cur["state"] == "ended":
+            raise Refuse("job_ended")
+        cl = claim_of(records)
+        review_role = cl["role"] in REVIEW
+        if kind in ("activate", "grant", "grant_cancel", "import", "import_begin", "import_seal", "claim"):
+            if not central or (review_role and kind in ("activate", "import", "import_begin", "import_seal")):
+                raise Refuse("scope_denied")
+        elif kind != "end":
+            if central:
+                raise Refuse("scope_denied")
+            if review_role and kind in ("round_open", "void", "joined"):
+                raise Refuse("scope_denied")
+            if cl["host_client_id"] != client:
+                raise Refuse("host_mismatch")
+        if cur["state"] == "importing" and kind not in ("import", "import_seal", "end"):
+            raise Refuse("migration_frozen")
+        if cur["state"] == "sealed" and kind not in ("activate", "end"):
+            raise Refuse("import_sealed")
+        if cur["state"] == "joined" and kind in ("round_open", "verdict", "void", "joined"):
+            raise Refuse("review_sealed")
+        rules(state, job, kind, payload, records, cur)
+    records = entry["records"]
+    seq = len(records) + 1
+    stored_payload = persisted(state, job, kind, payload, records)
+    record = {"job_id": job, "seq": seq, "record_id": str(uuid.uuid4()), "store_generation": state["generation"],
+              "claim_seq": seq if kind == "claim" else summary(state, job, records)["claim_seq"],
+              "actor_client_id": client, "idempotency_key": key, "request_sha256": request_sha,
+              "imported": kind == "import", "source": None, "received_at": now(),
+              "previous_hash": records[-1]["record_hash"] if records else "0" * 64, "kind": kind,
+              "payload": stored_payload}
+    if kind == "import":
+        record["source"] = {"source_locator": payload["source_locator"], "source_sha256": payload["source_sha256"]}
+    record["record_hash"] = sha(canonical({k: v for k, v in record.items() if k != "record_hash"}).encode())
+    content = payload.get("content_b64") or payload.get("report_b64")
+    if content:
+        state.setdefault("contents", {})["%s/%d" % (job, seq)] = content
+    records.append(record)
+    summ = summary(state, job, records)
+    entry["keys"][key] = {"sha": request_sha, "seq": seq, "summary": summ}
+    return True, record, summ
+
+
+def decode(b64):
+    try:
+        data = base64.b64decode(b64.encode("ascii"), validate=True)
+    except ValueError:
+        raise Refuse("invalid_request")
+    if not data:
+        raise Refuse("invalid_request")
+    return data
+
+
+def grant_ok(records, seq, gtype, consumed_check=True):
+    grants = [r for r in nonimported(records, "grant") if r["seq"] == seq]
+    if not grants or grants[0]["payload"]["grant_type"] != gtype:
+        raise Refuse("grant_invalid")
+    for r in records:
+        p = r["payload"]
+        if r["kind"] in ("round_open", "joined") and seq in (p.get("extension_grant_seq"), p.get("repeat_grant_seq"),
+                                                              p.get("waiver_grant_seq")):
+            raise Refuse("grant_consumed")
+        if r["kind"] in ("void", "grant_cancel") and p["grant_seq"] == seq:
+            raise Refuse("grant_consumed")
+    return grants[0]["payload"]
+
+
+def rules(state, job, kind, payload, records, cur):
+    activate = nonimported(records, "activate")
+    act_seq = activate[0]["seq"] if activate else 0
+    opens = {r["payload"]["round_no"]: r for r in nonimported(records, "round_open")}
+    verdicts = nonimported(records, "verdict")
+    voids = {r["payload"]["round_no"] for r in nonimported(records, "void")}
+    if kind == "round_open":
+        head = payload["head"]
+        if payload["tester_job_id"]:
+            reviewer = state["jobs"].get(payload["tester_job_id"])
+            if reviewer is None or nonimported(reviewer["records"], "end"):
+                raise Refuse("round_not_open")
+            rc = claim_of(reviewer["records"])
+            if not rc["review_of"] or rc["review_of"]["job_id"] != job:
+                raise Refuse("round_not_open")
+        if payload["repeat_grant_seq"]:
+            g = grant_ok(records, payload["repeat_grant_seq"], "head_repeat")
+            if g["head"] != head or g["tester_job_id"] != payload["tester_job_id"]:
+                raise Refuse("grant_invalid")
+        else:
+            live = [r for n, r in opens.items() if r["seq"] > act_seq and n in cur["open_rounds"]
+                    and r["payload"]["head"] == head]
+            if live or any(v["payload"]["head"] == head for v in verdicts):
+                raise Refuse("duplicate_head")
+        if cur["used"] >= 3:
+            if not payload["extension_grant_seq"]:
+                raise Refuse("round_cap")
+            g = grant_ok(records, payload["extension_grant_seq"], "extension")
+            if g["head"] != head or g["round_no"] != cur["next_round_no"]:
+                raise Refuse("grant_invalid")
+        elif payload["extension_grant_seq"]:
+            raise Refuse("grant_before_cap")
+    elif kind == "verdict":
+        number = payload["round_no"]
+        if number not in opens or opens[number]["seq"] <= act_seq and activate:
+            raise Refuse("round_not_open")
+        if number in voids:
+            raise Refuse("round_voided")
+        if any(v["payload"]["round_no"] == number for v in verdicts):
+            raise Refuse("round_has_verdict")
+        if opens[number]["payload"]["head"] != payload["head"]:
+            raise Refuse("head_mismatch")
+        named = opens[number]["payload"]["tester_job_id"]
+        if named and payload["tester_job_id"] != named:
+            raise Refuse("round_not_open")
+        if payload["tester_job_id"]:
+            reviewer = state["jobs"].get(payload["tester_job_id"])
+            if reviewer is None or nonimported(reviewer["records"], "end"):
+                raise Refuse("round_not_open")
+        data = decode(payload["content_b64"])
+        if sha(data) != payload["content_sha256"]:
+            raise Refuse("invalid_request")
+        try:
+            text = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise Refuse("invalid_verdict")
+        lines = text.split("\n")
+        m = VERDICT.match(lines[0])
+        if text.startswith("﻿") or not m or any(l.startswith("VERDICT:") for l in lines[1:]):
+            raise Refuse("invalid_verdict")
+        if m.group(1) != payload["verdict"] or m.group(2).lower() != payload["head"]:
+            raise Refuse("invalid_request")
+        if not payload["path"].startswith("/"):
+            raise Refuse("invalid_path")
+        if any(v["payload"]["path"] == payload["path"] for v in verdicts):
+            raise Refuse("duplicate_path")
+        if any(v["payload"]["content_sha256"] == payload["content_sha256"] for v in verdicts):
+            raise Refuse("duplicate_content")
+    elif kind == "void":
+        number = payload["round_no"]
+        if number not in opens:
+            raise Refuse("round_not_open")
+        if any(v["payload"]["round_no"] == number for v in verdicts):
+            raise Refuse("round_has_verdict")
+        if number in voids:
+            raise Refuse("round_voided")
+        g = grant_ok(records, payload["grant_seq"], "void")
+        if g["round_no"] != number:
+            raise Refuse("grant_invalid")
+    elif kind in ("completed", "joined"):
+        data = decode(payload["report_b64"])
+        if sha(data) != payload["report_sha256"]:
+            raise Refuse("invalid_request")
+        if kind == "joined":
+            if cur["open_rounds"]:
+                raise Refuse("review_incomplete")
+            bound = [v for v in verdicts if v["seq"] > act_seq]
+            if payload["waiver_grant_seq"]:
+                g = grant_ok(records, payload["waiver_grant_seq"], "join_waiver")
+                if g["head"] != payload["head"] or bound:
+                    raise Refuse("grant_invalid")
+            elif not bound:
+                raise Refuse("zero_rounds")
+            elif bound[-1]["payload"]["verdict"] != "PASS" or bound[-1]["payload"]["head"] != payload["head"]:
+                raise Refuse("blocker_unresolved")
+    elif kind == "activate":
+        work = any(r["kind"] not in ("claim", "import_begin", "import_seal") for r in records)
+        seals = [r for r in records if r["kind"] == "import_seal"]
+        if activate:
+            raise Refuse("claim_conflict")
+        if work and (not seals or payload["seal_seq"] != seals[-1]["seq"]):
+            raise Refuse("import_unsealed")
+    elif kind == "import_seal":
+        begins = [r for r in records if r["kind"] == "import_begin"]
+        imports = [r for r in records if r["kind"] == "import"]
+        manifest = [{"seq": r["seq"], "source_locator": r["payload"]["source_locator"],
+                     "source_sha256": r["payload"]["source_sha256"]} for r in imports]
+        if (not begins or begins[0]["seq"] != payload["begin_seq"] or len(imports) != payload["expected_import_count"]
+                or sha(canonical(manifest).encode()) != payload["manifest_sha256"]):
+            raise Refuse("import_unsealed")
+    elif kind == "import":
+        if sha(decode(payload["content_b64"])) != payload["source_sha256"]:
+            raise Refuse("invalid_request")
+
+
+def persisted(state, job, kind, payload, records):
+    p = {k: v for k, v in payload.items() if k not in ("content_b64", "report_b64")}
+    if kind == "claim":
+        p["policy_sha256"] = state["policy_sha256"]
+        p["created_at"] = now()
+    elif kind == "round_open":
+        cur = summary(state, job, records)
+        p["round_no"] = cur["next_round_no"]
+    elif kind == "verdict":
+        p["size_bytes"] = len(decode(payload["content_b64"]))
+    elif kind == "activate":
+        seals = [r for r in records if r["kind"] == "import_seal"]
+        p["mode"] = "enforced"
+        p["baseline_used"] = seals[-1]["payload"]["baseline_used"] if seals else 0
+    elif kind in ("completed", "joined"):
+        p["report_size_bytes"] = len(decode(payload["report_b64"]))
+        if kind == "completed":
+            p["warnings"] = []
+        else:
+            p["verdict_seqs"] = [r["seq"] for r in nonimported(records, "verdict")]
+    elif kind == "import_begin":
+        p["shadow_cutoff_seq"] = len(records)
+    elif kind == "import_seal":
+        begin = [r for r in records if r["kind"] == "import_begin"][0]
+        rounds = sum(1 for r in records if r["kind"] == "import" and r["payload"]["legacy_kind"] == "job.round")
+        rounds += sum(1 for r in nonimported(records, "round_open"))
+        baseline = max(3, rounds)
+        p.update({"shadow_cutoff_seq": begin["payload"]["shadow_cutoff_seq"], "baseline_used": baseline,
+                  "numbering_floor": baseline})
+    return p
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def take_fault(state, op, kind=None, page=None):
+    for fault in state.get("faults", []):
+        if fault.get("op") != op or fault.get("times", 1) <= 0:
+            continue
+        if fault.get("kind") and fault["kind"] != kind:
+            continue
+        if fault.get("page") and fault["page"] != page:
+            continue
+        fault["times"] = fault.get("times", 1) - 1
+        return fault["action"]
+    return None
+
+
+def parse_args(argv, positional, flags):
+    if len(argv) < positional:
+        out_fail("cli_usage")
+    pos, opts = argv[:positional], {}
+    rest = argv[positional:]
+    i = 0
+    while i < len(rest):
+        if rest[i] not in flags or rest[i] in opts or i + 1 >= len(rest):
+            out_fail("cli_usage")
+        opts[rest[i]] = rest[i + 1]
+        i += 2
+    return pos, opts
+
+
+def number(value, positive=False):
+    if value is None or not NUM_RE.match(value) or (positive and value == "0"):
+        out_fail("cli_usage")
+    return int(value)
+
+
+def main():
+    if os.environ.get("WRK_TEST_MODE") != "1":
+        sys.stderr.write("o3 stub: refusing to run outside WRK_TEST_MODE=1\n")
+        sys.exit(97)
+    state_path = os.environ.get("O3_STUB_STATE", "")
+    log_path = os.environ.get("O3_STUB_LOG", "")
+    if not state_path or not under_temp(state_path) or (log_path and not under_temp(log_path)):
+        sys.stderr.write("o3 stub: state and log must live under a temp root\n")
+        sys.exit(97)
+    argv = sys.argv[1:]
+    stdin = sys.stdin.buffer.read() if argv[:1] == ["wrk"] else b""
+    if log_path:
+        with open(log_path, "a", encoding="utf-8") as log:
+            log.write(json.dumps({"exe": sys.argv[0], "argv": argv, "stdin_sha256": sha(stdin),
+                                  "stdin_b64": base64.b64encode(stdin).decode(), "env_keys": sorted(os.environ),
+                                  "client": os.environ.get("O3_STUB_CLIENT", "")}) + "\n")
+    if argv[:1] != ["wrk"]:
+        legacy = os.path.join(HERE, "..", "handoffkeep")
+        os.execv(legacy, [legacy] + argv)
+    lock = open(state_path + ".lock", "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    except FileNotFoundError:
+        state = {}
+    state.setdefault("client_id", "desktop")
+    state.setdefault("generation", str(uuid.uuid4()))
+    state.setdefault("policy_sha256", sha(b"policy"))
+    state.setdefault("jobs", {})
+    state.setdefault("namespace", True)
+    client = os.environ.get("O3_STUB_CLIENT") or state["client_id"]
+
+    def save():
+        with open(state_path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(state, f)
+        os.replace(state_path + ".tmp", state_path)
+
+    def respond(obj):
+        save()
+        sys.stdout.write(json.dumps(obj, separators=(",", ":")) + "\n")
+        sys.exit(0)
+
+    sub = argv[1] if len(argv) > 1 else ""
+    if not state["namespace"]:
+        out_fail("o3_unsupported")
+    if sub == "capabilities":
+        parse_args(argv[2:], 0, ())
+        action = take_fault(state, "capabilities")
+        if action:
+            save()
+            fail_action(action)
+        respond({"contract": "hk1873.v1", "store_generation": state["generation"], "client_id": client,
+                 "policy_sha256": state["policy_sha256"], "writes_available": True})
+    if sub == "job":
+        (job,), _ = parse_args(argv[2:], 1, ())
+        action = take_fault(state, "job")
+        if action:
+            save()
+            fail_action(action)
+        entry = job_of(state, job)
+        if entry is None:
+            out_fail("not_found")
+        summ = summary(state, job, entry["records"])
+        respond({"contract": "hk1873.v1", "claim": entry["records"][summ["claim_seq"] - 1], "summary": summ})
+    if sub == "records":
+        (job,), opts = parse_args(argv[2:], 1, ("--after-seq", "--snapshot-seq", "--limit"))
+        after = number(opts.get("--after-seq", "0"))
+        limit = number(opts.get("--limit", "100"), True)
+        entry = job_of(state, job)
+        if entry is None:
+            out_fail("not_found")
+        records = entry["records"]
+        snapshot = number(opts["--snapshot-seq"], True) if "--snapshot-seq" in opts else len(records)
+        if snapshot > len(records) or after > snapshot or limit > 500:
+            out_fail("invalid_cursor")
+        limit = min(limit, state.get("page_limit", 500))
+        page = [dict(r) for r in records[after:snapshot][:limit]]
+        page_no = 1 + (after // limit if limit else 0)
+        action = take_fault(state, "records", page=page_no)
+        obj = {"contract": "hk1873.v1", "snapshot_seq": snapshot,
+               "next_after_seq": page[-1]["seq"] if page else after,
+               "has_more": bool(page) and page[-1]["seq"] < snapshot, "records": page,
+               "summary": summary(state, job, records[:snapshot])}
+        if action == "tamper_hash" and page:
+            page[0]["record_hash"] = "f" * 64
+        elif action == "snapshot_shift":
+            obj["snapshot_seq"] = snapshot + 1
+        elif action == "gap" and len(page) > 1:
+            del page[0]
+        elif action == "generation":
+            obj["summary"]["store_generation"] = str(uuid.uuid4())
+        elif action:
+            save()
+            fail_action(action)
+        respond(obj)
+    if sub == "content":
+        (job, seq), _ = parse_args(argv[2:], 2, ())
+        seqn = number(seq, True)
+        content = state.get("contents", {}).get("%s/%d" % (job, seqn))
+        if content is None:
+            out_fail("not_found")
+        data = base64.b64decode(content)
+        respond({"job_id": job, "seq": seqn, "content_b64": content, "content_sha256": sha(data),
+                 "size_bytes": len(data)})
+    if sub == "append":
+        (job,), opts = parse_args(argv[2:], 1, ("--kind", "--idempotency-key", "--expected-seq", "--claim-seq"))
+        if set(opts) != {"--kind", "--idempotency-key", "--expected-seq", "--claim-seq"}:
+            out_fail("cli_usage")
+        kind, key = opts["--kind"], opts["--idempotency-key"]
+        if kind not in INPUT_KEYS or not UUID_RE.match(key) or not JOB_RE.match(job):
+            out_fail("cli_usage")
+        expected, claim_seq = number(opts["--expected-seq"]), number(opts["--claim-seq"])
+        try:
+            payload = json.loads(stdin.decode("utf-8"), object_pairs_hook=unique)
+        except (UnicodeDecodeError, ValueError):
+            out_fail("invalid_request")
+        if not isinstance(payload, dict):
+            out_fail("invalid_request")
+        request = {"kind": kind, "claim_seq": claim_seq, "expected_seq": expected, "payload": payload}
+        request_sha = sha(canonical({"method": "POST", "path": "/v1/wrk/jobs/%s/records" % job,
+                                     "body": request}).encode("utf-8"))
+        action = take_fault(state, "append", kind=kind)
+        if action and action.startswith("respond_file:"):
+            # A test-built WriteResponse, printed as-is (contract-shape vectors).
+            save()
+            with open(action.split(":", 1)[1], encoding="utf-8") as f:
+                sys.stdout.write(f.read().strip() + "\n")
+            sys.exit(0)
+        if action and not action.startswith("commit_then:"):
+            save()
+            fail_action(action)
+        try:
+            created, record, summ = append(state, job, kind, key, expected, claim_seq, payload, client, request_sha)
+        except Refuse as exc:
+            save()
+            out_fail(exc.code)
+        if action:
+            save()
+            fail_action(action.split(":", 1)[1] if ":" in action else action)
+        respond({"contract": "hk1873.v1", "created": created, "record": record, "summary": summ})
+    out_fail("cli_usage")
+
+
+def fail_action(action):
+    if action.startswith("error:"):
+        out_fail(action.split(":", 1)[1])
+    if action in EXIT:
+        out_fail(action)
+    if action == "garbage":
+        sys.stdout.write("<html>proxy error</html>\n")
+        sys.exit(0)
+    if action == "html":
+        sys.stderr.write("<html>502 Bad Gateway</html>\n")
+        sys.exit(1)
+    if action == "unknown_code":
+        sys.stderr.write("handoffkeep wrk: brand_new_code\n")
+        sys.exit(73)
+    if action == "noisy_stderr":
+        sys.stderr.write("handoffkeep wrk: transport_unavailable\nLocation: https://elsewhere\n")
+        sys.exit(75)
+    if action == "hang":
+        time.sleep(60)
+        sys.exit(0)
+    out_fail("protocol_invalid")
+
+
+if __name__ == "__main__":
+    main()

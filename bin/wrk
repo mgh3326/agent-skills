@@ -133,7 +133,7 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
+Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy|o3> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
@@ -141,11 +141,12 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|p
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
-  wrk round open JOB --head SHA [--extend REF] [--repo PATH]
-  wrk round verdict JOB --file PATH
-  wrk round void JOB N --by REF [--reason TEXT]
+  wrk round open JOB --head SHA [--extend REF | --extension-grant SEQ] [--repeat-grant SEQ] [--tester JOB] [--repo PATH]
+  wrk round verdict JOB --file PATH [--tester JOB]
+  wrk round void JOB N (--by REF [--reason TEXT] | --grant SEQ [--reason-code CODE])
   wrk round status JOB
   wrk round audit [--lane LANE]
+  wrk o3 central OP JOB --as director-1|operator-desk [options]
   wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
@@ -331,6 +332,18 @@ Options:
                      before sending a request. The inherited task is recorded
                      in job meta (task_id + task_inherited_from) and the child
                      never re-claims it — the owning job's hk record stands.
+  --head SHA, --extension-grant SEQ, --repeat-grant SEQ
+                     O3 review spawn (hk 1926): with --role tester|reviewer|
+                     counsel and --parent-job SUBJECT of an enrolled subject,
+                     the spawn reads the subject, mints the scoped assignment
+                     (or verifies a central one), GET-verifies it and appends
+                     the subject's round_open on SHA naming this job (with the
+                     typed grants when the cap or a repeated head needs them),
+                     all before the local claim and the pane. Outside legacy
+                     records mode every spawn first GET-verifies its precreated
+                     canonical claim (task, host, lanes, tier, activation) and
+                     skips the legacy task probe and link; it never mints a
+                     central claim (see wrk o3 --help).
   --takeover-from OLD_JOB
                     builder-only task takeover. Requires --task and an ended
                     old job; rebinds through handoffkeep and carries its round
@@ -5211,6 +5224,42 @@ wrk_trust_guard() {
   [[ -n "$WRK_TRUST_JOBS_ROOT" ]] || exit 2
 }
 
+# ── hk 1926: the O3 adapter (bin/wrk_o3.py) ─────────────────────────────────
+# Every handoffkeep wrk journal call goes through bin/wrk_o3.py, next to this
+# file: it re-runs the guard above before each exec, strips the four
+# HANDOFFKEEP_* override keys from the child, keeps durable intents in the
+# canonical job directory and maps every stable code to its exit (round_cap 78,
+# unavailable 75, refusals 73/77/65/66, intents 74). The records mode
+# (<account home>/.config/wrk/records-mode: legacy, shadow or required; legacy
+# when absent) decides whether a command consults the server at all; in
+# legacy mode every command below keeps its O2 behaviour unchanged. The adapter
+# path is assigned here, never taken from the caller's environment.
+WRK_O3_PY=""
+O3_OUT="" O3_RC=0
+wrk_o3() {
+  if [[ -z "$WRK_O3_PY" ]]; then
+    WRK_O3_PY="$(python3 -c 'import os, sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "wrk_o3.py"))' "${BASH_SOURCE[0]}")"
+  fi
+  [[ -f "$WRK_O3_PY" ]] || { echo "wrk: o3 adapter missing: $WRK_O3_PY" >&2; return 2; }
+  python3 "$WRK_O3_PY" "$@"
+}
+
+# o3_call OP ARGS... — sets O3_OUT (stdout) and O3_RC; stderr passes through.
+# O3_OUT=LEGACY means the job is not enrolled (or the mode is legacy) and the
+# caller continues on its O2 path.
+o3_call() {
+  O3_RC=0
+  O3_OUT="$(wrk_o3 "$@" </dev/null)" || O3_RC=$?
+}
+
+# Exit with the adapter's code after a refused O3 command.
+o3_exit_on_error() {
+  if [[ "$O3_RC" -ne 0 ]]; then
+    [[ -z "$O3_OUT" ]] || printf '%s\n' "$O3_OUT"
+    exit "$O3_RC"
+  fi
+}
+
 completion_metadata() {
   local job="$1" root
   # "trusted" (round open/verdict/void and joined, after wrk_trust_guard) reads the
@@ -5888,6 +5937,27 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       grant in hk:doc/<key> or hk:task/<id>. The grant line is the default
       reason; --reason overrides it. Voids release one cap slot.
 
+O3 jobs (hk 1926, design hk1873 r4). Outside legacy records mode
+(<account home>/.config/wrk/records-mode holds shadow or required) a job the
+handoffkeep server has enrolled is an O3 job: open, verdict and void are
+appended to the server through bin/wrk_o3.py first, and today's job.round,
+job.verdict and job.round_void events are written after the receipt as
+projections (o3_mode, wrk_receipt, idempotency_key). The server holds the cap,
+the grants and the identity checks; its stable code keeps its exit (round_cap
+78, unavailable or unknown outcome 75, refusals 73/77/65/66, intents 74). An
+unknown outcome keeps a durable intent (<job dir>/o3-intents.json) that the next
+run resends with its original key and bytes. An O3 job takes typed grants,
+never a free ref:
+  wrk round open JOB --head SHA [--extension-grant SEQ] [--repeat-grant SEQ] [--tester JOB]
+  wrk round verdict JOB --file PATH [--tester JOB]
+      the verdict file's first line names the head; it binds the oldest open
+      round on that head and the bytes are read once
+  wrk round void JOB N --grant SEQ [--reason-code CODE]
+status prints the canonical summary (o3=enforced|shadow); offline it prints the
+last canonical read only with stale=true and label=O2-unverified. In legacy
+mode, and for a job the server has not enrolled in shadow mode, every command
+keeps its O2 behaviour above.
+
 Trust paths (hk 1894). These commands, wrk joined (its end check and round
 gate), the --round-ext prechecks and the takeover round read take the events
 inbox (<home>/work/herdr-inbox/jobs), the arbiter DB
@@ -6246,8 +6316,29 @@ print("emitted\trounds=%d\tlast_verdict=%s\tfindings=%s" % (used, lv, findings o
 PY
 }
 
+# The cap refusal is itself an event the parent must see: emit the escalate
+# (deduped per job); the caller then stops with rc 78. Shared by the O2 cap and
+# the server's round_cap for an O3 job (hk 1926).
+round_cap_escalate() {
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" head="$6"
+  local rounds last_v findings status question
+  status="$(round_cap_event "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT")"
+  if [[ "$status" == emitted* ]]; then
+    IFS=$'\t' read -r _ rounds last_v findings <<<"$status"
+    findings="${findings#findings=}"
+    [[ "$findings" == "-" ]] && findings=""
+    question="tester round cap $ROUND_CAP_DEFAULT reached at ${rounds#rounds=} rounds; builder must stop and wait for the parent; extension needs a hk approval record naming this job (wrk round open --extend REF)"
+    emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
+      "$findings" "${last_v#last_verdict=}" "$ROUND_CAP_REASON" "$question" "" "$head"
+    warn "round cap $ROUND_CAP_DEFAULT reached for $job (${rounds#rounds=} rounds); emitted job.escalate to parent $parent"
+  else
+    warn "round cap $ROUND_CAP_DEFAULT still reached for $job; job.escalate already recorded"
+  fi
+}
+
 round_open_cmd() {
   local job="${1:-}" head="" extend="" repo_override="" repo="" metadata owner label pane parent role
+  local ext_grant="" rep_grant="" tester=""
   [[ -n "$job" && "$job" != -* ]] || die "round open requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -6255,6 +6346,9 @@ round_open_cmd() {
       --head) [[ $# -ge 2 && -n "$2" ]] || die "--head requires a SHA"; head="$2"; shift 2 ;;
       --extend) [[ $# -ge 2 && -n "$2" ]] || die "--extend requires a hk:doc/<key> or hk:task/<id> ref"; extend="$2"; shift 2 ;;
       --repo) [[ $# -ge 2 && -n "$2" ]] || die "--repo requires a path"; repo_override="$2"; shift 2 ;;
+      --extension-grant) [[ $# -ge 2 && -n "$2" ]] || die "--extension-grant requires a grant record seq"; ext_grant="$2"; shift 2 ;;
+      --repeat-grant) [[ $# -ge 2 && -n "$2" ]] || die "--repeat-grant requires a grant record seq"; rep_grant="$2"; shift 2 ;;
+      --tester) [[ $# -ge 2 && -n "$2" ]] || die "--tester requires a job id"; tester="$2"; shift 2 ;;
       *) die "unknown round open option '$1'" ;;
     esac
   done
@@ -6273,6 +6367,25 @@ round_open_cmd() {
   if ! round_head_check "$repo" "$head"; then
     die "round open: --head $head is not a commit in $repo"
   fi
+  # hk 1926: an enrolled job opens its round on the server; the receipt comes
+  # first and today's job.round is written after it as a projection.
+  local o3_args=(round-open "$job" --head "$head" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
+  [[ -z "$ext_grant" ]] || o3_args+=(--extension-grant "$ext_grant")
+  [[ -z "$rep_grant" ]] || o3_args+=(--repeat-grant "$rep_grant")
+  [[ -z "$tester" ]] || o3_args+=(--tester "$tester")
+  [[ -z "$extend" ]] || o3_args+=(--o2-ref "$extend")
+  o3_call "${o3_args[@]}"
+  if [[ "$O3_RC" -eq "$WRK_EXIT_ROUND_CAP" ]]; then
+    round_cap_escalate "$job" "$owner" "$label" "$pane" "$parent" "$head"
+    exit "$WRK_EXIT_ROUND_CAP"
+  fi
+  o3_exit_on_error
+  if [[ "$O3_OUT" != LEGACY ]]; then
+    printf '%s\n' "$O3_OUT"
+    return 0
+  fi
+  [[ -z "$ext_grant$rep_grant$tester" ]] ||
+    die "round open: --extension-grant, --repeat-grant and --tester are for an O3 job; job $job is on the O2 path (use --extend REF)"
 
   # An extension is approved before the count is consulted: the fetched hk
   # record must carry a valid grant line for this job from an allowed issuer.
@@ -6388,21 +6501,7 @@ PY
       die "round open --extend is only valid once the cap ($ROUND_CAP_DEFAULT) is reached"
       ;;
     CAP\ rounds=*)
-      # The refusal is itself an event the parent must see: emit the
-      # escalate (deduped per job) and then stop the caller with rc 78.
-      local rounds last_v findings status question
-      status="$(round_cap_event "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT")"
-      if [[ "$status" == emitted* ]]; then
-        IFS=$'\t' read -r _ rounds last_v findings <<<"$status"
-        findings="${findings#findings=}"
-        [[ "$findings" == "-" ]] && findings=""
-        question="tester round cap $ROUND_CAP_DEFAULT reached at ${rounds#rounds=} rounds; builder must stop and wait for the parent; extension needs a hk approval record naming this job (wrk round open --extend REF)"
-        emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
-          "$findings" "${last_v#last_verdict=}" "$ROUND_CAP_REASON" "$question" "" "$head"
-        warn "round cap $ROUND_CAP_DEFAULT reached for $job (${rounds#rounds=} rounds); emitted job.escalate to parent $parent"
-      else
-        warn "round cap $ROUND_CAP_DEFAULT still reached for $job; job.escalate already recorded"
-      fi
+      round_cap_escalate "$job" "$owner" "$label" "$pane" "$parent" "$head"
       exit "$WRK_EXIT_ROUND_CAP"
       ;;
     *) die "round open unexpected outcome: $outcome" ;;
@@ -6411,6 +6510,7 @@ PY
 
 round_void_cmd() {
   local job="${1:-}" round_number="${2:-}" ref="" reason="" metadata owner label pane parent role
+  local grant="" reason_code=""
   [[ -n "$job" && "$job" != -* ]] || die "round void requires a job id"
   [[ "$round_number" =~ ^[1-9][0-9]*$ ]] || die "round void requires a positive round number"
   shift 2 || true
@@ -6418,14 +6518,29 @@ round_void_cmd() {
     case "$1" in
       --by) [[ $# -ge 2 && -n "$2" ]] || die "--by requires a hk:doc/<key> or hk:task/<id> ref"; ref="$2"; shift 2 ;;
       --reason) [[ $# -ge 2 && -n "$2" ]] || die "--reason requires text"; reason="$2"; shift 2 ;;
+      --grant) [[ $# -ge 2 && -n "$2" ]] || die "--grant requires a void grant record seq"; grant="$2"; shift 2 ;;
+      --reason-code) [[ $# -ge 2 && -n "$2" ]] || die "--reason-code requires a code"; reason_code="$2"; shift 2 ;;
       *) die "unknown round void option '$1'" ;;
     esac
   done
-  [[ -n "$ref" ]] || die "round void requires --by REF"
-  wrk_trust_guard hk
+  [[ -n "$ref" || -n "$grant" ]] || die "round void requires --by REF (O2) or --grant SEQ (O3)"
+  if [[ -n "$ref" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   wrk_refuse_ended "round void" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  # hk 1926: an enrolled job voids on the server with a typed void grant.
+  local o3_args=(round-void "$job" --round "$round_number" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
+  [[ -z "$grant" ]] || o3_args+=(--grant "$grant")
+  [[ -z "$reason_code" ]] || o3_args+=(--reason-code "$reason_code")
+  [[ -z "$ref" ]] || o3_args+=(--o2-ref "$ref")
+  o3_call "${o3_args[@]}"
+  o3_exit_on_error
+  if [[ "$O3_OUT" != LEGACY ]]; then
+    printf '%s\n' "$O3_OUT"
+    return 0
+  fi
+  [[ -z "$grant$reason_code" ]] || die "round void: --grant and --reason-code are for an O3 job; job $job is on the O2 path (use --by REF)"
+  [[ -n "$ref" ]] || die "round void requires --by REF"
 
   local tmp_approval grant grant_issuer
   tmp_approval="$(mktemp)"
@@ -6507,12 +6622,13 @@ PY
 }
 
 round_verdict_cmd() {
-  local job="${1:-}" file="" metadata owner label pane parent role
+  local job="${1:-}" file="" metadata owner label pane parent role tester=""
   [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --file) [[ $# -ge 2 && -n "$2" ]] || die "--file requires a path"; file="$2"; shift 2 ;;
+      --tester) [[ $# -ge 2 && -n "$2" ]] || die "--tester requires a job id"; tester="$2"; shift 2 ;;
       *) die "unknown round verdict option '$1'" ;;
     esac
   done
@@ -6521,6 +6637,17 @@ round_verdict_cmd() {
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  # hk 1926: an enrolled job submits the verdict bytes (read once) to the
+  # server; the job.verdict below is written only after the receipt.
+  local o3_args=(round-verdict "$job" --file "$file" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
+  [[ -z "$tester" ]] || o3_args+=(--tester "$tester")
+  o3_call "${o3_args[@]}"
+  o3_exit_on_error
+  if [[ "$O3_OUT" != LEGACY ]]; then
+    printf '%s\n' "$O3_OUT"
+    return 0
+  fi
+  [[ -z "$tester" ]] || die "round verdict: --tester is for an O3 job; job $job is on the O2 path"
   local outcome rc=0
   set +e
   outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" <<'PY'
@@ -6702,9 +6829,33 @@ round_status_cmd() {
   [[ -n "$job" && "$job" != -* ]] || die "round status requires a job id"
   [[ $# -eq 1 ]] || die "round status accepts only a job id"
   wrk_trust_guard
-  local scan
+  # hk 1926: an enrolled job reports the canonical summary; offline, a cached
+  # snapshot prints only with stale=true and the O2 label.
+  o3_call round-status "$job"
+  o3_exit_on_error
+  case "$O3_OUT" in
+    O3\ *|STALE\ *)
+      echo "job=$job cap=$ROUND_CAP_DEFAULT ${O3_OUT#* }"
+      o3_unmatched_warnings "$job"
+      return 0 ;;
+  esac
+  local scan suffix=""
+  if [[ "$O3_OUT" == UNSUPPORTED\ * ]]; then
+    warn "o3 server has no usable wrk namespace (${O3_OUT#UNSUPPORTED }); local O2 status only, unverified"
+    suffix=$'\to3=unsupported\tlabel=O2-unverified'
+  fi
   scan="$(round_scan "$job")"
-  echo "job=$job cap=$ROUND_CAP_DEFAULT $scan"
+  echo "job=$job cap=$ROUND_CAP_DEFAULT $scan$suffix"
+}
+
+# Local evidence the server cannot see: a tester verdict file in the job
+# directory with no matching job.verdict is a warning beside the canonical status.
+o3_unmatched_warnings() {
+  local job="$1" line
+  while IFS= read -r line; do
+    [[ "$line" == unmatched$'\t'* ]] || continue
+    warn "unmatched tester verdict file ${line#*$'\t'} (local evidence, not on the server)"
+  done <<<"$(wrk_join_blocks "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"
 }
 
 round_audit_cmd() {
@@ -6723,10 +6874,13 @@ round_audit_cmd() {
   # hk 1894: the audit reads the canonical inbox, so a redirected inbox cannot
   # make a builder with no recorded rounds look clean.
   wrk_trust_guard
-  local jobs_root
+  local jobs_root o3_mode
   jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   [[ -d "$jobs_root" ]] || return 0
-  local job_dir job scan ended owner lane_ok role recorded blocks line tag rest
+  # hk 1926: outside legacy mode a job directory holding O3 state is audited
+  # from the server (labelled), every other row stays the O2 census.
+  o3_mode="$(wrk_o3 mode)" || exit $?
+  local job_dir job scan ended owner lane_ok role recorded blocks line tag rest o3_row
   # find -H below: the checked inbox may itself be a symlink (the guard returns the
   # canonical spelling); without -H find walks nothing and the audit looks clean.
   while IFS= read -r job_dir; do
@@ -6744,15 +6898,27 @@ round_audit_cmd() {
     if [[ "$lane_ok" -ne 1 ]]; then
       continue
     fi
-    role="$(wrk_job_role "$job" "$jobs_root")"
-    recorded="$(wrk_recorded_rounds "$job" "$jobs_root")"
-    case "$role" in
-      builder|captain)
-        if [[ "$ended" == "0" && "$recorded" == "0" ]]; then
-          printf 'zero-rounds job=%s lane=%s\n' "$job" "$owner"
-        fi
-        ;;
-    esac
+    o3_row=""
+    if [[ "$o3_mode" != legacy && ( -e "$job_dir/o3-intents.json" || -e "$job_dir/o3-snapshot.json" ) ]]; then
+      o3_call audit-job "$job"
+      o3_exit_on_error
+      [[ "$O3_OUT" == LEGACY ]] || o3_row="$O3_OUT"
+    fi
+    if [[ "$o3_row" == O3\ * ]]; then
+      [[ "$o3_row" != *" zero=1 "* ]] || printf 'zero-rounds job=%s lane=%s o3=canonical\n' "$job" "$owner"
+    elif [[ "$o3_row" == STALE\ * ]]; then
+      printf 'o3-stale job=%s lane=%s %s label=O2-unverified\n' "$job" "$owner" "${o3_row#STALE }"
+    else
+      role="$(wrk_job_role "$job" "$jobs_root")"
+      recorded="$(wrk_recorded_rounds "$job" "$jobs_root")"
+      case "$role" in
+        builder|captain)
+          if [[ "$ended" == "0" && "$recorded" == "0" ]]; then
+            printf 'zero-rounds job=%s lane=%s\n' "$job" "$owner"
+          fi
+          ;;
+      esac
+    fi
     blocks="$(wrk_join_blocks "$job" "$jobs_root")"
     while IFS= read -r line; do
       [[ -n "$line" ]] || continue
@@ -8771,7 +8937,7 @@ spillover_wake_request() {
 # a flag and remains a perfectly valid --requested-by value.
 wrk_option_token() {
   case "$1" in
-    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|--head|--extension-grant|--repeat-grant|-h|--help) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -9510,7 +9676,7 @@ spawn_router_cmd() {
   for ((i = 0; i < ${#args[@]}; i++)); do
     case "${args[$i]}" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--host|--lane-defer) ((i += 1)) ;;
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--host|--lane-defer|--head|--extension-grant|--repeat-grant) ((i += 1)) ;;
       --task-hk-bypass|--job-dup-ok|--landing-strict|--keep) ;;
       *) break ;;
     esac
@@ -10991,6 +11157,102 @@ refuse_known_terra_spelling() {
   esac
 }
 
+# hk 1926: the section 6 spawn handshake. Outside legacy records mode the
+# adapter GET-verifies a precreated canonical claim (task, host, lanes, tier,
+# role, activation) before the local arbiter claim and pane; it never mints a
+# central claim or activation (those are wrk o3 central desk commands). A
+# tester/reviewer/counsel with --parent-job of an enrolled subject follows the
+# reviewer order: read the subject, mint the scoped assignment in the new job's
+# directory (or verify a central one), GET-verify it, and append the subject's
+# round_open naming it, all before the local claim and pane. The legacy task
+# link and the quota release are unchanged here (hk 1927 owns them).
+#
+# Two phases: "verify" runs before the legacy task probe and only reads; on a
+# verified canonical claim it sets O3_SPAWN_VERIFIED=1 and TASK_LINK_STATUS
+# from that claim, so the spawn skips hk_task_precheck and hk_task_link (the
+# unguarded hk_bin path). "commit" runs just before the local arbiter claim and
+# does the reviewer mint and the subject round_open. A legacy-mode or
+# not-enrolled spawn keeps every legacy call exactly as before.
+O3_SPAWN_VERIFIED=0
+o3_spawn_handshake() {
+  local phase="$1" mode
+  if [[ "$phase" == commit ]]; then
+    [[ "$O3_SPAWN_VERIFIED" == 1 ]] || return 0
+  else
+    O3_SPAWN_VERIFIED=0
+  fi
+  mode="$(wrk_o3 mode </dev/null)" || exit $?
+  if [[ "$mode" == legacy ]]; then
+    [[ -z "$SPAWN_O3_HEAD$SPAWN_O3_EXT$SPAWN_O3_REP" ]] ||
+      die "--head, --extension-grant and --repeat-grant are for an O3 review spawn; records mode is legacy"
+    return 0
+  fi
+  local args=(spawn-verify "$JOB_ID" --phase "$phase" --role "$ROLE" --task "$TASK_ID" --lane "$JOB_LANE" --tier "$JOB_T")
+  [[ "$ROLE" != builder ]] || args+=(--parent "$PARENT_LANE")
+  case "$ROLE" in
+    tester|reviewer|counsel) [[ -z "$PARENT_JOB" ]] || args+=(--subject "$PARENT_JOB") ;;
+  esac
+  [[ -z "$SPAWN_O3_HEAD" ]] || args+=(--head "$SPAWN_O3_HEAD")
+  [[ -z "$SPAWN_O3_EXT" ]] || args+=(--extension-grant "$SPAWN_O3_EXT")
+  [[ -z "$SPAWN_O3_REP" ]] || args+=(--repeat-grant "$SPAWN_O3_REP")
+  o3_call "${args[@]}"
+  o3_exit_on_error
+  if [[ "$O3_OUT" == LEGACY ]]; then
+    [[ -z "$SPAWN_O3_HEAD$SPAWN_O3_EXT$SPAWN_O3_REP" ]] ||
+      die "--head, --extension-grant and --repeat-grant are for an O3 review spawn; $JOB_ID is not enrolled"
+    return 0
+  fi
+  if [[ "$phase" == verify ]]; then
+    O3_SPAWN_VERIFIED=1
+    if [[ "$TASK_LINK_MODE" == inherited || -n "$TAKEOVER_FROM" ]]; then
+      TASK_LINK_STATUS="inherited"
+    else
+      TASK_LINK_STATUS="already_linked"
+    fi
+  fi
+  warn "o3 spawn handshake ($phase): $O3_OUT"
+}
+
+o3_help() {
+  cat <<'USAGE'
+Usage: wrk o3 central OP JOB --as director-1|operator-desk [options]
+
+Central-role desk tooling for O3 (hk 1873, design r4 section 6). Each write runs
+only <account home>/.local/bin/hk-<role>, the fixed central wrapper, checked
+like the canonical handoffkeep (a regular file owned by this user, not group- or
+world-writable), with HANDOFFKEEP_URL, HANDOFFKEEP_TOKEN and the two
+HANDOFFKEEP_CF_ACCESS_* keys removed from its environment. wrk reads no
+credential. Reads use the guarded canonical handoffkeep. Every write keeps a
+durable intent in the job's canonical directory and is retried with its
+original key after an unknown outcome. Nothing written locally is authority.
+
+  claim JOB --as R --owner-lane L --parent-lane P --task N --host H --role builder|worker
+            --tier T [--predecessor JOB] [--supersedes SEQ]
+  assign JOB --as R --target SUBJECT --round N --role tester|reviewer|counsel [--host H]
+  activate JOB --as R [--seal-seq N] [--reason-code CODE]
+  import-begin JOB --as R [--reason-code CODE]
+  import JOB --as R --events-dir DIR      one import record per archived event file
+  import-seal JOB --as R --events-dir DIR [--reason-code CODE]
+            the manifest is the server's import records, checked against DIR
+
+Records mode: <account home>/.config/wrk/records-mode holds legacy (default when
+absent), shadow or required; anything else refuses with exit 2.
+USAGE
+}
+
+o3_cmd() {
+  case "${1:-}" in
+    -h|--help|"") o3_help ;;
+    central)
+      shift
+      [[ "${1:-}" != -h && "${1:-}" != --help ]] || { o3_help; return 0; }
+      o3_call central "$@"
+      o3_exit_on_error
+      printf '%s\n' "$O3_OUT" ;;
+    *) die "unknown o3 subcommand '$1' (see 'wrk o3 --help')" ;;
+  esac
+}
+
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
@@ -10998,6 +11260,7 @@ spawn_cmd() {
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
   MOCK_MCP_PLAN="" MOCK_MCP_HELPER="" SPAWN_MOCK_MCP_RETAIN=0
+  SPAWN_O3_HEAD="" SPAWN_O3_EXT="" SPAWN_O3_REP="" O3_SPAWN_VERIFIED=0
   # Armed once for the whole spawn: both cleanup actions are guarded (pane
   # only when SPAWN_PANE_OPEN/PANE are set, quota release only when
   # ARBITER_HELD=1), so a die anywhere after the pane opens cannot leak it —
@@ -11006,7 +11269,7 @@ spawn_cmd() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--lane-defer)
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--lane-defer|--head|--extension-grant|--repeat-grant)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m|--profile) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
@@ -11018,6 +11281,7 @@ spawn_cmd() {
           --round-ext) ROUND_EXT_REF="$2" ;;
           --purpose) PURPOSE="$2" ;; --task) TASK_ID="$2" ;; --parent-job) PARENT_JOB="$2" ;; --takeover-from) TAKEOVER_FROM="$2" ;;
           --lane-defer) LANE_DEFER="$2" ;;
+          --head) SPAWN_O3_HEAD="$2" ;; --extension-grant) SPAWN_O3_EXT="$2" ;; --repeat-grant) SPAWN_O3_REP="$2" ;;
         esac
         shift 2 ;;
       --task-hk-bypass) TASK_HK_BYPASS=1; shift ;;
@@ -11183,11 +11447,14 @@ spawn_cmd() {
     die "NEEDS_CLASSIFICATION: --t T0..T3 is required (job '$JOB_ID'); classify it, do not guess"
   case "$JOB_T" in T0|T1|T2|T3) ;; *) die "--t accepts only T0, T1, T2 or T3" ;; esac
 
+  # hk 1926: an enrolled job is GET-verified on the server first; a verified
+  # canonical claim sets TASK_LINK_STATUS and the legacy probe is skipped.
+  o3_spawn_handshake verify
   # #768: read-only hk task probe — fail closed before the quota gate measures
   # anything, before any pane, before any hk write. Sets TASK_LINK_STATUS.
   if [[ -n "$TAKEOVER_FROM" ]]; then
     hk_task_takeover_precheck
-  else
+  elif [[ "$O3_SPAWN_VERIFIED" != 1 ]]; then
     hk_task_precheck
   fi
 
@@ -11213,6 +11480,9 @@ spawn_cmd() {
   # The catalog's own refusal, held back so the quota gate could speak first.
   [[ "${CATALOG_REFUSED:-0}" -ne 1 ]] ||
     die "scopefuel policy launch refused profile '$MODEL' (catalog profile '$CATALOG_PROFILE'): ${CATALOG_REFUSE_REASON:-no reason reported}"
+  # hk 1926: the reviewer mint and the subject round_open land here, after the
+  # quota gate and before any local claim or pane (section 6 spawn order).
+  o3_spawn_handshake commit
   # A takeover route refusal must precede the arbiter claim as well as pane
   # creation, so no failed rebind can leave partial local job records.
   hk_task_takeover_rebind
@@ -11364,7 +11634,13 @@ print(value if isinstance(value, str) else "")
   # never touches hk. A refusal here dies before the success receipt and while
   # SPAWN_PANE_OPEN is still armed: the EXIT trap closes the pane and releases
   # the quota record — no job without its task link.
-  hk_task_link
+  # hk 1926: a verified O3 spawn is bound by its canonical claim; only the local
+  # task_link audit record is kept, and no hk_bin call is made.
+  if [[ "$O3_SPAWN_VERIFIED" == 1 ]]; then
+    hk_task_link_event "$TASK_LINK_STATUS" "o3 canonical claim verified"
+  else
+    hk_task_link
+  fi
   # #965/#1397: with the pane provably up and the spawn committed to its OK
   # line, register the lane on the daemon serving this herdr session —
   # worker label under --owner, builder --lane under --parent — before the
@@ -13567,6 +13843,7 @@ case "${1:-}" in
   profiles) shift; profiles_cmd "$@" ;;
   hosts) shift; hosts_cmd "$@" ;;
   heavy) shift; heavy_cmd "$@" ;;
+  o3) shift; o3_cmd "$@" ;;
   "") usage >&2; exit 2 ;;
   *) die "unknown command '$1' (see 'wrk --help')" ;;
 esac
