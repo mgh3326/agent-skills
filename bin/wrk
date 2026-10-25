@@ -7371,7 +7371,8 @@ PY
     [[ -d "$jobdir/events" ]] && events_seen=1
     # hk1892: a removed job tree is not ours to re-create. Leave quietly: no log,
     # no event, no release, no mkdir.
-    if [[ ! -d "$jobdir" || ( -n "$events_seen" && ! -d "$jobdir/events" ) ]]; then # hk1892-jobdir-gone
+    # A symlink in place of either dir is a replacement, not our tree: -d follows it.
+    if [[ ! -d "$jobdir" || -L "$jobdir" || ( -n "$events_seen" && ( ! -d "$jobdir/events" || -L "$jobdir/events" ) ) ]]; then # hk1892-jobdir-gone
       gone=$(( gone + 1 ))
       (( gone < SENTINEL_GONE_POLLS )) || sentinel_self_exit "$job" 0
       sleep "$interval"

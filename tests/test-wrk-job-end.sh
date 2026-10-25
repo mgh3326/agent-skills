@@ -5098,6 +5098,27 @@ case_gone_flap() {
   recovery_stop
 }
 
+# case_gone_symlink JOB jobdir|events — a symlink to a live directory replaces
+# the dir: -d follows it, so the sentinel must count it as gone and leave.
+case_gone_symlink() {
+  local job="$1" what="$2" target="$TMP/$1-target"
+  reset_case "$job" || return 3
+  mkdir -p "$INBOX/$job/events"
+  gone_start_after_reset "$job" || return 3
+  mkdir -p "$target"
+  if [[ "$what" == jobdir ]]; then
+    mv "$INBOX/$job" "$target/real" && ln -s "$target/real" "$INBOX/$job"
+  else
+    mv "$INBOX/$job/events" "$target/real" && ln -s "$target/real" "$INBOX/$job/events"
+  fi
+  if ! wait_until 8 pid_gone "$SENTINEL_PID"; then
+    echo "FAIL: $job: a symlink replacing the $what must count as gone" >&2
+    recovery_stop; return 1
+  fi
+  gone_no_job_lost "$job" || { echo "FAIL: $job: a job.lost was written" >&2; recovery_stop; return 1; }
+  recovery_stop
+}
+
 echo "== JE54: a sentinel with a gone job dir exits quietly =="
 case_gone_root je54a || fail "JE54 removed root"
 echo "PASS je54 removed-root"
@@ -5107,15 +5128,21 @@ case_gone_never_events je54c || fail "JE54 never-created events dir"
 echo "PASS je54 never-created-events"
 case_gone_flap je54d || fail "JE54 flap"
 echo "PASS je54 flap"
+case_gone_symlink je54e jobdir || fail "JE54 symlinked job dir"
+echo "PASS je54 symlinked-jobdir"
+case_gone_symlink je54f events || fail "JE54 symlinked events dir"
+echo "PASS je54 symlinked-events"
 
 case_gone_root_m40() { case_gone_root je54m40; }
 case_gone_flap_m41() { case_gone_flap je54m41; }
 case_gone_never_events_m42() { case_gone_never_events je54m42; }
 case_gone_root_m43() { case_gone_root je54m43; }
+case_gone_symlink_m44() { case_gone_symlink je54m44 jobdir; }
+case_gone_symlink_m45() { case_gone_symlink je54m45 events; }
 
 # hk1892 mutants: each load-bearing piece of the rule is pinned to its case.
 mkmut_span r40-no-check \
-  'if [[ ! -d "$jobdir" || ( -n "$events_seen" && ! -d "$jobdir/events" ) ]]; then # hk1892-jobdir-gone' \
+  'if [[ ! -d "$jobdir" || -L "$jobdir" || ( -n "$events_seen" && ( ! -d "$jobdir/events" || -L "$jobdir/events" ) ) ]]; then # hk1892-jobdir-gone' \
   '    if false; then # removed hk1892 check'
 expect_mut_red "R40 the gone check must exist" case_gone_root_m40 \
   'FAIL: je54m40: the sentinel must exit once its job root is gone'
@@ -5126,7 +5153,7 @@ expect_mut_red "R41 one missing poll must not end the sentinel" case_gone_flap_m
   'FAIL: je54m41: one missing poll must not end the sentinel'
 
 mkmut r42-never-created-is-gone \
-  's~( -n "\$events_seen" \&\& ! -d "\$jobdir/events" )~( ! -d "$jobdir/events" )~'
+  's~( -n "\$events_seen" \&\& ( ! -d~( ( ! -d~'
 expect_mut_red "R42 a never-created events dir is not absence" case_gone_never_events_m42 \
   'FAIL: je54m42: a never-created events dir is not absence'
 
@@ -5134,5 +5161,15 @@ mkmut r43-release-before-exit \
   's~(( gone < SENTINEL_GONE_POLLS )) || sentinel_self_exit "\$job" 0~(( gone < SENTINEL_GONE_POLLS )) || { "$ARBITER_BIN" release --job "$job" --resource claude --kind quota_pool; sentinel_self_exit "$job" 0; }~'
 expect_mut_red "R43 no release before the exit" case_gone_root_m43 \
   'FAIL: je54m43: a release ran before the exit'
+
+mkmut r44-follow-jobdir-symlink \
+  's~ || -L "\$jobdir" ||~ ||~'
+expect_mut_red "R44 a symlinked job dir counts as gone" case_gone_symlink_m44 \
+  'FAIL: je54m44: a symlink replacing the jobdir must count as gone'
+
+mkmut r45-follow-events-symlink \
+  's~ || -L "\$jobdir/events" ) )~ ) )~'
+expect_mut_red "R45 a symlinked events dir counts as gone" case_gone_symlink_m45 \
+  'FAIL: je54m45: a symlink replacing the events must count as gone'
 
 echo "PASS test-wrk-job-end: all cases"
