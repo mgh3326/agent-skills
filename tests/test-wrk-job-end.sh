@@ -5374,9 +5374,13 @@ case_hk1933_restore_live_sentinel_starts_none() {
 
 # A pane that disappears right after the restore ends in the normal lost path:
 # job.lost, then job.revoked with outcome abandoned once the lost grace expires.
-case_hk1933_restore_pane_gone_ends_lost() {
-  reset_case hk1933-gone || return 3
-  local job=hk1933-gone label=lbl-hk1933-gone pid
+# One pane-gone case body. Each caller names its own job: a mutant runs its case
+# in a subshell where CASE_SEQ does not advance, so two mutants that shared a
+# job name would reuse one inbox.
+hk1933_pane_gone_case() {
+  local job="$1" label pid lost_before revoked_before releases_before
+  label="lbl-$job"
+  reset_case "$job" || return 3
   local RESTORE_INTERVAL=1 RESTORE_LOST_GRACE=1
   restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
   restore_false_loss "$job" w1:p1 "$label" || return 3
@@ -5390,7 +5394,11 @@ case_hk1933_restore_pane_gone_ends_lost() {
     cat "$TMP/restore-err" >&2
     assertion_red 'hk1933 restore must succeed before its pane disappears' || return 1
   }
+  # The restored run holds its own quota row, as its gate lease would give it.
+  # The end declaration and that row's release come from prune, not the sentinel.
+  arb_lease "$job" || return 3
   pid="$(restore_sentinel_pid "$job")"
+  releases_before="$(release_events "$job")"
   restore_empty_state "$RESTORE_STATE" || return 3
   wait_until 20 event_count_is "$INBOX/$job/events" job.lost $((lost_before + 1)) ||
     { assertion_red 'hk1933 a pane that disappears right after restore must end in job.lost'; return 1; }
@@ -5398,15 +5406,19 @@ case_hk1933_restore_pane_gone_ends_lost() {
     { assertion_red 'hk1933 the restored job sentinel must leave after the lost grace'; return 1; }
   [[ ! -e "$INBOX/$job/completion-sentinel.pid" ]] ||
     { assertion_red 'hk1933 the restored job sentinel must remove its pidfile on the lost path'; return 1; }
-  # A revived round is the one case the sentinel never ends itself: wrk prune
-  # declares the end once the pane is absent and the job is stale.
+  # A revived round is the one case the sentinel never ends itself.
   event_count_is "$INBOX/$job/events" job.revoked "$revoked_before" ||
     { assertion_red 'hk1933 the sentinel must not end the revived round itself'; return 1; }
+  # The full chain: prune declares the end and releases the quota row.
   env HERDR_BIN="$TMP/restore-herdr" RESTORE_STATE="$RESTORE_STATE" ARBITER_BIN="$ARBITER" \
     ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$WRK" prune --apply --job "$job" --stale-age 0s \
     >"$TMP/restore-prune-out" 2>&1 || true
   event_count_is "$INBOX/$job/events" job.revoked $((revoked_before + 1)) ||
-    { cat "$TMP/restore-prune-out" >&2; assertion_red 'hk1933 the lost path must end the dead restored round with job.revoked'; return 1; }
+    { cat "$TMP/restore-prune-out" >&2; assertion_red 'hk1933 prune must end the dead restored round with job.revoked'; return 1; }
+  [[ "$(release_events "$job")" == $((releases_before + 1)) ]] ||
+    { cat "$TMP/restore-prune-out" >&2; assertion_red 'hk1933 prune must release the restored quota row with quota_pool.release'; return 1; }
+  [[ "$(quota_rows "$job")" == 0 ]] ||
+    { assertion_red 'hk1933 prune must leave no leased quota row for the restored job'; return 1; }
   python3 - "$INBOX/$job/events" <<'PY' || { assertion_red 'hk1933 the prune end must be abandoned, stale'; return 1; }
 import glob, json, sys
 records = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.revoked.json"))]
@@ -5414,6 +5426,9 @@ assert records[-1].get("outcome") == "abandoned", records
 assert records[-1].get("reason", "").startswith("stale"), records
 PY
 }
+
+case_hk1933_restore_pane_gone_ends_lost() { hk1933_pane_gone_case hk1933-gone; }
+case_hk1933_restore_pane_gone_chain_m7() { hk1933_pane_gone_case hk1933-gone-m7; }
 
 case_hk1933_refuse_state() {
   reset_case hk1933-state || return 3
@@ -5531,7 +5546,7 @@ run_hk1933_case "a failed receipt write prints one completion command" case_hk19
 run_hk1933_case "the copy and reclaim keep every receipt and claim field" case_hk1933_restore_fields_and_copy
 run_hk1933_case "a successful restore starts one completion sentinel for the job" case_hk1933_restore_starts_sentinel
 run_hk1933_case "a restore over a live sentinel for the job starts none" case_hk1933_restore_live_sentinel_starts_none
-run_hk1933_case "a pane that disappears right after restore ends in job.lost" case_hk1933_restore_pane_gone_ends_lost
+run_hk1933_case "a pane that disappears after restore ends in job.lost, then prune revokes and releases" case_hk1933_restore_pane_gone_ends_lost
 run_hk1933_case "refuses a job that is not released" case_hk1933_refuse_state
 run_hk1933_case "refuses a dead pane" case_hk1933_refuse_dead_pane
 run_hk1933_case "refuses a pane in another tab" case_hk1933_refuse_other_tab
@@ -5562,5 +5577,8 @@ expect_mut_red "hk1933 M5 skipping the sentinel start must leave a restored pane
 mkmut_span hk1933-m6-second-sentinel 'if [[ -z "$existing_pane" || -z "$requested_pane" || "$existing_pane" == "$requested_pane" ]]; then' '      if false; then'
 expect_mut_red "hk1933 M6 starting a second sentinel over a live one must fail the live-sentinel case" case_hk1933_restore_live_sentinel_starts_none \
   'ASSERT-RED: hk1933 a restore with a live sentinel for the job must start none'
+mkmut_span hk1933-m7-prune-no-release 'hk1798-prune-stale-release' '        : # removed hk1798 prune stale release'
+expect_mut_red "hk1933 M7 prune ending a dead restored round without its quota release must fail the chain case" case_hk1933_restore_pane_gone_chain_m7 \
+  'ASSERT-RED: hk1933 prune must release the restored quota row with quota_pool.release'
 
 echo "PASS test-wrk-job-end: all cases"
