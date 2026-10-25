@@ -331,6 +331,8 @@ Options:
                      before sending a request. The inherited task is recorded
                      in job meta (task_id + task_inherited_from) and the child
                      never re-claims it — the owning job's hk record stands.
+  --report-relative P jobs-root-relative report for SSH; no absolute part or ..;
+                     re-rooted and checked under the target inbox.
   --takeover-from OLD_JOB
                     builder-only task takeover. Requires --task and an ended
                     old job; rebinds through handoffkeep and carries its round
@@ -8771,7 +8773,7 @@ spillover_wake_request() {
 # a flag and remains a perfectly valid --requested-by value.
 wrk_option_token() {
   case "$1" in
-    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--report-relative|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -9328,6 +9330,8 @@ spillover_remote_spawn() {
   local remote_args=(env "HERDR_SESSION=$session")
   [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
   remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
+  [[ -z "${SPILL_REMOTE_OWNER:-}" ]] || remote_args+=(--owner "$SPILL_REMOTE_OWNER") # hk2042-ssh-owner
+  [[ -z "${SPILL_REMOTE_REPORT_REL:-}" ]] || remote_args+=(--report-relative "$SPILL_REMOTE_REPORT_REL")
   # Builders only — forwarding the flag to a worker would mute the execution
   # host's own session-machine_ids check while this host then named the
   # worker's lane on machine=<host key>.
@@ -9342,6 +9346,14 @@ spillover_remote_spawn() {
         ((i+=1))
         { [[ "$i" -lt "${#args[@]}" ]] && ! wrk_option_token "${args[$i]:-}"; } ||
           die "$arg requires a value"
+        ;;
+      --owner)
+        ((i+=1))
+        [[ -n "${SPILL_REMOTE_OWNER:-}" ]] || remote_args+=(--owner "${args[$i]}")
+        ;;
+      --report|--report-relative)
+        ((i+=1))
+        [[ -n "${SPILL_REMOTE_REPORT_REL:-}" ]] || remote_args+=("$arg" "${args[$i]}")
         ;;
       -w)
         ((i+=1))
@@ -9510,7 +9522,7 @@ spawn_router_cmd() {
   for ((i = 0; i < ${#args[@]}; i++)); do
     case "${args[$i]}" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--host|--lane-defer) ((i += 1)) ;;
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--report-relative|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--host|--lane-defer) ((i += 1)) ;;
       --task-hk-bypass|--job-dup-ok|--landing-strict|--keep) ;;
       *) break ;;
     esac
@@ -10490,16 +10502,85 @@ task_validate() {
   die "--task <hk task id> is required for --role worker (decision/2026-09-27/task-job-linkage). Tester/advisory spawns may instead inherit the parent task: pass --parent-job <job>, or spawn from a registered job's pane where ARBITER_JOB/HK_TASK_ID is set$(task_remote_hint)"
 }
 
+# hk2042: resolve ownership where the parent claim lives, and validate reports
+# on each host. SSH carries only a jobs-root-relative path; the target re-roots
+# it and repeats containment, including resolution of existing symlinks.
+parent_spawn_validate() {
+  local parent="$1" job="$2" role="$3" owner="$4" report="$5" relative="$6" require_claim="${7:-0}"
+  [[ -n "$parent" ]] || {
+    [[ "$relative" == 0 ]] || die "--report-relative requires --parent-job"
+    return 0
+  }
+  ascii_re "$parent" '^[A-Za-z0-9._-]+$' && [[ "$parent" != . && "$parent" != .. ]] || die "--parent-job must be a job id"
+  ascii_re "$job" '^[A-Za-z0-9._-]+$' && [[ "$job" != . && "$job" != .. ]] || die "--job must be a job id"
+  case "$role" in
+    worker|tester|reviewer) [[ -n "$report" ]] || die "--parent-job $parent requires --report for --role $role" ;; # hk2042-report-required
+  esac
+  wrk_trust_guard
+  local resolved
+  resolved="$(wrk_py - "$WRK_TRUST_JOBS_ROOT" "$parent" "$job" "$owner" "$report" "$relative" "$require_claim" <<'PYCODE'
+import json, os, pathlib, sys
+exec(os.environ["WRK_EVENTS_PY"])
+root, parent, job, owner, report, relative, require_claim = sys.argv[1:]
+root = pathlib.Path(root).resolve()
+def refuse(message):
+    sys.stderr.write("wrk: " + message + "\n")
+    raise SystemExit(2)
+if not owner or require_claim == "1":
+    if (root / parent).resolve() != root / parent:
+        refuse("parent job directory must stay in the trusted inbox")
+    events = root / parent / "events"
+    # A corrupt newest claim must not revive an older owner.
+    claims = [(name, doc) for name, doc, _ in wrk_events_ordered(str(events))
+              if (doc or {}).get("kind") in ("job.claim", "job.reclaim")
+              or name.endswith(("-job.claim.json", "-job.reclaim.json"))]
+    doc = claims[-1][1] if claims else None
+    payload = doc.get("payload", doc) if isinstance(doc, dict) else None
+    if not isinstance(payload, dict):
+        refuse("parent job '%s' has no readable newest claim/reclaim" % parent)
+    inherited_owner = payload.get("owner_lane")
+    if not owner:
+        if not isinstance(inherited_owner, str) or not inherited_owner or any(ord(c) < 32 or ord(c) == 127 for c in inherited_owner):
+            refuse("parent job '%s' newest claim/reclaim has no readable owner_lane" % parent)
+        owner = inherited_owner
+if report:
+    path = pathlib.Path(report)
+    if ".." in path.parts or any(ord(c) < 32 or ord(c) == 127 for c in report):
+        refuse("--report must have no .. or control characters")
+    if relative == "1":
+        if path.is_absolute():
+            refuse("--report-relative must have no absolute part")
+        path = root / path
+    elif not path.is_absolute():
+        refuse("--report must be absolute (SSH uses --report-relative)")
+    try:
+        path = path.resolve()
+    except (OSError, RuntimeError):
+        refuse("--report cannot be resolved")
+    allowed = (root / parent, root / job)
+    if not any(base in path.parents for base in allowed): # hk2042-target-containment
+        refuse("--report must resolve under the parent or new job directory in the target inbox")
+    report = str(path)
+print(owner)
+print(report)
+print(os.path.relpath(path, root) if report else "")
+PYCODE
+)" || exit 2
+  PARENT_SPAWN_OWNER="$(sed -n '1p' <<<"$resolved")"
+  PARENT_SPAWN_REPORT="$(sed -n '2p' <<<"$resolved")"
+  PARENT_SPAWN_RELATIVE="$(sed -n '3p' <<<"$resolved")"
+}
+
 # Resolve inheritance on the initiating host before remote placement probes.
 # Explicit --task and builder spawns keep their existing argv unchanged; an
 # inherited worker task is forwarded by the SSH transport as one env argv item.
 spillover_resolve_remote_task() {
-  SPILL_REMOTE_HK_TASK=""
-  local role=worker explicit_task=0 parent_job="" arg i=0 args=("$@")
+  SPILL_REMOTE_HK_TASK="" SPILL_REMOTE_OWNER="" SPILL_REMOTE_REPORT_REL=""
+  local role=worker explicit_task=0 parent_job="" owner="" report="" relative=0 job="" label="" arg i=0 args=("$@")
   while [[ "$i" -lt "${#args[@]}" ]]; do
     arg="${args[$i]}"
     case "$arg" in
-      --role|--task|--parent-job)
+      --role|--task|--parent-job|--owner|--report|--report-relative|--job|-l)
         ((i+=1))
         # Malformed options remain the target wrk's usage error; only valid
         # inheritance requests need an initiator-side lookup here.
@@ -10508,6 +10589,11 @@ spillover_resolve_remote_task() {
           --role) role="${args[$i]}" ;;
           --task) explicit_task=1 ;;
           --parent-job) parent_job="${args[$i]}" ;;
+          --owner) owner="${args[$i]}" ;;
+          --report) report="${args[$i]}"; relative=0 ;;
+          --report-relative) report="${args[$i]}"; relative=1 ;;
+          --job) job="${args[$i]}" ;;
+          -l) label="${args[$i]}" ;;
         esac
         ;;
     esac
@@ -10521,6 +10607,11 @@ spillover_resolve_remote_task() {
   ROLE="$role" TASK_ID="" PARENT_JOB="$parent_job"
   task_validate
   SPILL_REMOTE_HK_TASK="$TASK_ID"
+  if [[ -n "$parent_job" ]]; then
+    parent_spawn_validate "$parent_job" "${job:-$label}" "$role" "$owner" "$report" "$relative" 1
+    SPILL_REMOTE_OWNER="$PARENT_SPAWN_OWNER"
+    SPILL_REMOTE_REPORT_REL="$PARENT_SPAWN_RELATIVE"
+  fi
   ROLE="$saved_role" TASK_ID="$saved_task" PARENT_JOB="$saved_parent"
   TASK_LINK_MODE="$saved_link_mode" TASK_INHERITED_FROM="$saved_inherited_from"
 }
@@ -10993,7 +11084,7 @@ refuse_known_terra_spelling() {
 
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
-  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
+  CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" REPORT_RELATIVE=0 JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
   OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
@@ -11006,14 +11097,15 @@ spawn_cmd() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--lane-defer)
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--report-relative|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--lane-defer)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m|--profile) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
           -l) LABEL="$2" ;; -L) LANE="$2" ;; --effort) EFFORT="$2" ;;
           --job) JOB_ID="$2" ;; --t) JOB_T="$2" ;; --owner) OWNER="$2" ;;
           --role) ROLE="$2"; ROLE_EXPLICIT=1 ;; --lane) BUILDER_LANE="$2" ;; --parent) PARENT_LANE="$2" ;;
-          --report) REPORT_PATH="$2" ;;
+          --report) REPORT_PATH="$2"; REPORT_RELATIVE=0 ;;
+          --report-relative) REPORT_PATH="$2"; REPORT_RELATIVE=1 ;;
           --operator-request) OPERATOR_REQUEST="$2" ;; --requested-by) REQUESTED_BY="$2" ;;
           --round-ext) ROUND_EXT_REF="$2" ;;
           --purpose) PURPOSE="$2" ;; --task) TASK_ID="$2" ;; --parent-job) PARENT_JOB="$2" ;; --takeover-from) TAKEOVER_FROM="$2" ;;
@@ -11136,7 +11228,13 @@ spawn_cmd() {
 
   # #768: task binding is decided here, still before any side effect — a
   # missing/unresolvable task id is a usage error, never a partial spawn.
+  local requested_parent_job="$PARENT_JOB"
   task_validate
+  if [[ -n "$requested_parent_job" || "$REPORT_RELATIVE" == 1 ]]; then
+    parent_spawn_validate "$requested_parent_job" "$JOB_ID" "$ROLE" "$OWNER" "$REPORT_PATH" "$REPORT_RELATIVE"
+    OWNER="$PARENT_SPAWN_OWNER"
+    REPORT_PATH="$PARENT_SPAWN_REPORT"
+  fi
   if [[ -n "$TAKEOVER_FROM" ]]; then
     hk_task_takeover_precheck
   fi

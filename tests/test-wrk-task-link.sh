@@ -163,6 +163,8 @@ takeover_spawn() {
   MODEL=builder-sol LABEL=new-builder spawn_try -- "$@" --role builder --lane new-lane --parent director-1
 }
 
+bash "$ROOT/tests/test-wrk-parent.sh"
+
 echo "== AC1: --task required / usage errors before any side effect =="
 
 # A1: --role builder without --task dies at usage, nothing reached.
@@ -405,7 +407,7 @@ mkdir -p "$INBOX/parent-job-1/events"
 printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9009,"owner_lane":"b-parent"}}' \
   >"$INBOX/parent-job-1/events/00001-job.claim.json"
 hk_add --id 9009 >/dev/null
-spawn_try -- --parent-job parent-job-1 --job d1-tester
+spawn_try -- --parent-job parent-job-1 --report "$INBOX/parent-job-1/verdict.md" --job d1-tester
 expect_rc 0 "tester spawn inherits via --parent-job"
 claim_payload="$(event_payload d1-tester job.claim)"
 grep -qE '"task_id" *: *9009' <<<"$claim_payload" ||
@@ -451,7 +453,7 @@ reset_case d4
 mkdir -p "$INBOX/parent-job-4/events"
 printf '%s\n' '{"kind":"job.claim","payload":{"owner_lane":"b-old"}}' \
   >"$INBOX/parent-job-4/events/00001-job.claim.json"
-spawn_try -- --parent-job parent-job-4 --job d4-worker
+spawn_try -- --parent-job parent-job-4 --report "$INBOX/parent-job-4/verdict.md" --job d4-worker
 expect_rc 2 "parent without task_id must not be guessed"
 expect_grep 'no task_id\|--task' "$TMP/stderr.txt" "error must direct to --task"
 no_job_dir d4-worker "no job for an unresolvable task"
@@ -463,7 +465,7 @@ mkdir -p "$INBOX/parent-job-5/events"
 printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9012}}' \
   >"$INBOX/parent-job-5/events/00001-job.claim.json"
 hk_add --id 9012 >/dev/null; hk_add --id 9099 >/dev/null
-spawn_try -e HK_TASK_ID=9099 -- --parent-job parent-job-5 --job d5-worker
+spawn_try -e HK_TASK_ID=9099 -- --parent-job parent-job-5 --report "$INBOX/parent-job-5/verdict.md" --job d5-worker
 expect_rc 2 "parent task vs HK_TASK_ID mismatch must refuse"
 expect_grep 'refusing to guess' "$TMP/stderr.txt" "mismatch must fail closed"
 echo "PASS d5 contradicting task sources refuse"
@@ -478,7 +480,7 @@ printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9013}}' \
 printf '%s\n' 'not-json{{{' \
   >"$INBOX/parent-job-6/events/00002-job.reclaim.json"
 hk_add --id 9013 >/dev/null
-spawn_try -- --parent-job parent-job-6 --job d6-worker
+spawn_try -- --parent-job parent-job-6 --report "$INBOX/parent-job-6/verdict.md" --job d6-worker
 expect_rc 2 "corrupt newest parent event must refuse"
 expect_grep 'unreadable' "$TMP/stderr.txt" "corrupt newest must be named"
 no_job_dir d6-worker "no job for an unreadable parent event"
@@ -488,10 +490,10 @@ echo "PASS d6 corrupt newest parent event refuses"
 reset_case d7
 mkdir -p "$INBOX/parent-job-7/events"
 printf '%s\n' 'garbage' >"$INBOX/parent-job-7/events/00001-job.claim.json"
-printf '%s\n' '{"kind":"job.reclaim","payload":{"task_id":9014}}' \
+printf '%s\n' '{"kind":"job.reclaim","payload":{"task_id":9014,"owner_lane":"b-parent"}}' \
   >"$INBOX/parent-job-7/events/00002-job.reclaim.json"
 hk_add --id 9014 >/dev/null
-spawn_try -- --parent-job parent-job-7 --job d7-worker
+spawn_try -- --parent-job parent-job-7 --report "$INBOX/parent-job-7/verdict.md" --job d7-worker
 expect_rc 0 "a valid newest event wins over a corrupt older one"
 claim_payload="$(event_payload d7-worker job.claim)"
 grep -qE '"task_id" *: *9014' <<<"$claim_payload" ||
@@ -505,7 +507,7 @@ reset_case d8
 mkdir -p "$INBOX/parent-job-8/events"
 printf '%s\n' '{"kind":"job.claim","payload":{"task_id":"oops"}}' \
   >"$INBOX/parent-job-8/events/00001-job.claim.json"
-spawn_try -- --parent-job parent-job-8 --task-hk-bypass --job d8-worker
+spawn_try -- --parent-job parent-job-8 --report "$INBOX/parent-job-8/verdict.md" --task-hk-bypass --job d8-worker
 expect_rc 2 "malformed inherited task id must refuse despite bypass"
 expect_grep 'not a positive task id' "$TMP/stderr.txt" "malformed id must be named"
 no_job_dir d8-worker "no job for a malformed inherited task"
@@ -612,7 +614,7 @@ grep -qE '"job_id" *: *"new-job"' <<<"$round_escalate" || fail "round-cap escala
 
 # A tester inheriting from NEW reads the task_id recorded by NEW's arbiter
 # claim and does not change the binding.
-spawn_try -- --role tester --parent-job new-job --job new-job-tester
+spawn_try -- --role tester --parent-job new-job --report "$INBOX/new-job/verdict.md" --job new-job-tester
 expect_rc 0 "tester inheritance from takeover job"
 child_claim="$(event_payload new-job-tester job.claim)"
 grep -qE '"task_id" *: *1' <<<"$child_claim" || fail "tester child must inherit NEW task: $child_claim"
