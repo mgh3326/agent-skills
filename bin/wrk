@@ -7328,6 +7328,9 @@ finally:
 PY
 }
 
+# hk1892: consecutive polls with the job dir gone before a sentinel leaves.
+SENTINEL_GONE_POLLS=2
+
 sentinel_cmd() {
   WRK_COMPLETION_SENTINEL=1
   export WRK_COMPLETION_SENTINEL
@@ -7363,7 +7366,18 @@ PY
   lost=0
   lost_at=0
   lost_reason=""
+  local gone=0 events_seen=""
   while :; do
+    [[ -d "$jobdir/events" ]] && events_seen=1
+    # hk1892: a removed job tree is not ours to re-create. Leave quietly: no log,
+    # no event, no release, no mkdir.
+    if [[ ! -d "$jobdir" || ( -n "$events_seen" && ! -d "$jobdir/events" ) ]]; then # hk1892-jobdir-gone
+      gone=$(( gone + 1 ))
+      (( gone < SENTINEL_GONE_POLLS )) || sentinel_self_exit "$job" 0
+      sleep "$interval"
+      continue
+    fi
+    gone=0
     local now probe class token candidate key action recover_reason rearm_loss log_extra watch_expired
     now="$(date +%s)"
     probe="$(herdr_agent_probe "$pane")"
