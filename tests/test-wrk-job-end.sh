@@ -5002,11 +5002,15 @@ expect_mut_red "R39 completed must never become watch-expired" case_late_stable_
 # gone_new_sleep PID OLD — wait for a sleep child other than OLD (a poll ran
 # and the sentinel went back to sleep) or for the sentinel to be gone.
 gone_new_sleep() {
-  local pid="$1" old="$2" c deadline=$(( $(date +%s) + 8 ))
+  local pid="$1" old="$2" k comm deadline=$(( $(date +%s) + 20 ))
   while (( $(date +%s) <= deadline )); do
     pid_gone "$pid" && return 0
-    c="$(sentinel_mid_sleep "$pid" 2>/dev/null || true)"
-    [[ -n "$c" && "$c" != "$old" ]] && return 0
+    # One non-blocking scan: sentinel_mid_sleep waits up to 10s for a child,
+    # which a sentinel that just exited would turn into a false timeout.
+    for k in $(pgrep -P "$pid" 2>/dev/null); do
+      comm="$(ps -p "$k" -o comm= 2>/dev/null || true)"
+      [[ "$comm" == *sleep* && "$k" != "$old" ]] && return 0
+    done
     sleep 0.1
   done
   return 1
