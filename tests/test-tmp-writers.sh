@@ -670,7 +670,9 @@ track "$member"
 IFS=$'\t' read -r record_pid record_ident record_pgid <"$record"
 [[ "$record_pid" == "$proxy" && "$record_pgid" == "$proxy" &&
    -n "$record_ident" ]] || fail "T17 negative: malformed proxy record"
-printf '%s\t%s\t%s\n' "$proxy" "mismatched-$record_ident" "$proxy" >"$record"
+# A well-formed identity that differs from the live one: a malformed token
+# would be unresolved, not proof of reuse.
+printf '%s\t%s\t%s\n' "$proxy" "0" "$proxy" >"$record"
 t17_rc=0
 tmp_writers_stop || t17_rc=$?
 [[ "$t17_rc" -eq 0 ]] ||
@@ -1046,7 +1048,7 @@ mkdir -p "$TW_TMP/tw-own-sessions"
 ids=""; ones=""
 for i in 1 2 3 4; do
   sleep 60 & p=$!; track "$p"; ids="$ids $p"
-  printf '%s\t%s\t%s\n' "$p" "bogus-ident-$i" "$p" >"$TW_TMP/tw-own-sessions/id$i"
+  printf '%s\t%s\t%s\n' "$p" "0$i" "$p" >"$TW_TMP/tw-own-sessions/id$i"
   sleep 60 & q=$!; track "$q"; ones="$ones $q"
   printf '%s\n' "$q" >"$TW_TMP/tw-own-sessions/one$i"
 done
@@ -1155,6 +1157,183 @@ else
   pass "T28 non-ASCII-digit started= does not abort the pass ($t28_loc)"
 fi
 
+
+# ── T35-T38 (hk1746 r2): ASCII digits only, whatever the locale ─────────
+# In a UTF-8 locale a [0-9] range or [[:digit:]] can match Arabic-Indic,
+# fullwidth and Devanagari digits. A pid or a stored start identity built
+# from them must be NO pid and NO proof of reuse: a malformed stored
+# identity is unresolved, so the live pid stays in TW_LEFTOVER_PIDS.
+UNI_IDS=("٣" "３" "३" "12٣")
+
+uni_locale() { # FAMILY — the installed UTF-8 spelling of en_US / C, if any
+  local l want
+  want="$(printf '%s' "$1" | tr 'A-Z' 'a-z')"
+  while IFS= read -r l; do
+    case "$(printf '%s' "$l" | tr 'A-Z' 'a-z')" in
+      "$want.utf8"|"$want.utf-8") printf '%s\n' "$l"; return 0 ;;
+    esac
+  done < <(locale -a 2>/dev/null || true)
+  return 1
+}
+
+# uni_unit_checks LIB LOCALE — rc 0 only when every ASCII-digit invariant
+# holds for the library at LIB under LOCALE (a subshell: the library and
+# the stubs never leak). A distinct rc names the first violated invariant.
+uni_unit_checks() {
+  (
+    ut="$TW_TMP"   # sourcing the library resets TW_TMP
+    LC_ALL="$2"
+    export LC_ALL
+    # shellcheck disable=SC1090
+    . "$1"
+    sleep 60 & upid=$!
+    trap 'builtin kill -9 "$upid" 2>/dev/null || true' EXIT
+    real="$(_tw_pid_identity "$upid")" || exit 90
+    kill() { return 0; }   # every number looks live to kill -0
+    for d in "${UNI_IDS[@]}"; do
+      _tw_pid_alive "$d" && exit 91
+      _tw_pid_identity "$d" 2>/dev/null && exit 92
+      tw_register_pid "$ut/uni-$$.pids" "$d" 2>/dev/null && exit 93
+      f="$ut/uni-$$.pf"
+      printf '%s\nstarted=5\n' "$d" >"$f"
+      p="$(_tw_pidfile_fields "$f")"; p="${p%%$'\t'*}"
+      [[ "$p" == - ]] || exit 94
+      IFS=$'\t' read -r p q <<<"$(_tw_pidfile_fields "$f")"
+      [[ "$p" == - && "$q" == 5 ]] || exit 94   # started= must not become the pid
+      _tw_pidfile_recycled "$upid" "$d" && exit 95
+      _tw_start_matches "$upid" "$d" && exit 96
+      [[ -z "$(_tw_identity_verdict "$upid" "$d")" ]] || exit 97
+      [[ -z "$(_tw_identity_verdict "$upid" "Mon Oct  ${d} 09:03:01 2026")" ]] || exit 98
+      ( _tw_pid_identity() { printf '%s\n' "$d"; }
+        [[ -z "$(_tw_identity_verdict "$upid" 0)" ]] ) || exit 99
+    done
+    for d in "${UNI_IDS[@]:0:3}"; do   # the glob tests the first character only
+      _tw_leftover_argv_ok "sleep $d" && exit 104
+    done
+    _tw_leftover_argv_ok "sleep 60" || exit 105
+    ( ps() { printf '٠٠:٠٣\n'; }; _tw_elapsed_s "$upid" >/dev/null 2>&1 && exit 1; exit 0 ) || exit 100
+    # The well-formed shapes stay evidence: ASCII ticks and both ps lstart
+    # spellings (two-space single-digit day on macOS).
+    [[ "$(_tw_identity_verdict "$upid" 0)" == mismatch ]] || exit 101
+    [[ "$(_tw_identity_verdict "$upid" "$real")" == match ]] || exit 102
+    [[ "$(_tw_identity_verdict "$upid" 'Mon Oct  5 09:03:01 2026')" == mismatch ]] || exit 103
+    [[ "$(_tw_identity_verdict "$upid" 'Tue Oct 20 19:35:52 2026')" == mismatch ]] || exit 103
+    exit 0
+  )
+}
+
+# T35: the unit invariants hold in both UTF-8 locales the spec names.
+new_run
+t35_n=0
+for _fam in en_US C; do
+  _loc="$(uni_locale "$_fam" || true)"
+  [[ -n "$_loc" ]] || continue
+  t35_n=$(( t35_n + 1 ))
+  rc=0; uni_unit_checks "$ROOT/tests/lib/tmp-writers.sh" "$_loc" || rc=$?
+  [[ "$rc" -eq 0 ]] || fail "T35: ASCII-digit invariant $rc violated under $_loc"
+done
+if (( t35_n == 0 )); then
+  pass "T35 skipped (no en_US or C UTF-8 locale installed)"
+else
+  pass "T35 non-ASCII digits are no pid and no identity ($t35_n locale(s))"
+fi
+
+# T36: a malformed stored identity is unresolved, never proof of reuse —
+# the live pid stays a leftover under both locales, for registry and
+# session records alike; a genuinely mismatched ASCII identity is still
+# proven recycled in the same run.
+t36_n=0
+for _fam in en_US C; do
+  _loc="$(uni_locale "$_fam" || true)"
+  [[ -n "$_loc" ]] || continue
+  t36_n=$(( t36_n + 1 ))
+  new_run
+  mkdir -p "$TW_TMP/tw-own-sessions"
+  t36_pids=""
+  for _d in "${UNI_IDS[@]}"; do
+    sleep 60 & rp=$!; track "$rp"; t36_pids="$t36_pids $rp"
+    printf '%s\t%s\n' "$rp" "$_d" >>"$TW_TMP/own.pids.identities"
+    printf '%s\n' "$rp" >>"$TW_TMP/own.pids"
+    sleep 60 & sp=$!; track "$sp"; t36_pids="$t36_pids $sp"
+    printf '%s\t%s\t%s\n' "$sp" "$_d" "$sp" >"$TW_TMP/tw-own-sessions/$sp"
+  done
+  sleep 60 & cp=$!; track "$cp"
+  printf '%s\t%s\n' "$cp" "0" >>"$TW_TMP/ctl.pids.identities"
+  printf '%s\n' "$cp" >>"$TW_TMP/ctl.pids"
+  t36_out="$(LC_ALL="$_loc"; rc=99; tmp_writers_stop || rc=$?
+             printf '%s|%s|%s\n' "$rc" "${TW_LEFTOVER_PIDS:-}" \
+               "$(tr '\n' ' ' <<<"${TW_RECYCLED_PIDS:-}")")" || true
+  IFS='|' read -r t36_rc t36_left t36_rec <<<"$t36_out"
+  [[ "$t36_rc" == 1 ]] || fail "T36: malformed stored identity must fail teardown under $_loc (got $t36_out)"
+  for _p in $t36_pids; do
+    [[ " $t36_left " == *" $_p "* ]] || fail "T36: pid $_p (malformed identity) missing from leftovers under $_loc"
+    [[ " $t36_rec " != *" $_p "* ]] || fail "T36: pid $_p (malformed identity) named recycled under $_loc"
+    alive "$_p" || fail "T36: pid $_p was signalled under $_loc"
+  done
+  [[ " $t36_rec " == *" $cp "* ]] || fail "T36: ASCII-mismatch control not proven recycled under $_loc"
+  [[ " $t36_left " != *" $cp "* ]] || fail "T36: recycled control stayed a leftover under $_loc"
+  for _p in $t36_pids $cp; do stray_kill "$_p"; done
+  for _p in $t36_pids $cp; do pid_gone "$_p"; untrack "$_p"; done
+done
+if (( t36_n == 0 )); then
+  pass "T36 skipped (no en_US or C UTF-8 locale installed)"
+else
+  pass "T36 malformed stored identity stays a leftover ($t36_n locale(s))"
+fi
+
+# T37: a registry line or pidfile pid that is not an ASCII-digit pid is
+# skipped by the whole pass, even when kill -0 would call the number live.
+t37_n=0
+for _fam in en_US C; do
+  _loc="$(uni_locale "$_fam" || true)"
+  [[ -n "$_loc" ]] || continue
+  t37_n=$(( t37_n + 1 ))
+  new_run
+  for _d in "${UNI_IDS[@]}"; do
+    printf '%s\t%s\n' "$_d" "$_d" >>"$TW_TMP/uni.pids.identities"
+    printf '%s\n' "$_d" >>"$TW_TMP/uni.pids"
+    mkdir -p "$TW_TMP/inbox/uni-bare-$_d" "$TW_TMP/inbox/uni-flat-$_d" "$TW_TMP/tw-own-sessions"
+    printf '%s\t%s\t%s\n' "$_d" "$_d" "$_d" >"$TW_TMP/tw-own-sessions/uni-$_d"
+    printf '%s\nstarted=5\n' "$_d" >"$TW_TMP/inbox/uni-bare-$_d/completion-sentinel.pid"
+    printf 'pid=%s started=5\n' "$_d" >"$TW_TMP/inbox/uni-flat-$_d/completion-sentinel.pid"
+  done
+  t37_out="$(LC_ALL="$_loc"; kill() { return 0; }; rc=0; tmp_writers_stop || rc=$?
+             printf '%s|%s\n' "$rc" "${TW_LEFTOVER_PIDS:-}")" || true
+  [[ "${t37_out%%|*}" == 0 && -z "${t37_out#*|}" ]] ||
+    fail "T37: non-ASCII registry pid treated as a live writer under $_loc (got $t37_out)"
+done
+if (( t37_n == 0 )); then
+  pass "T37 skipped (no en_US or C UTF-8 locale installed)"
+else
+  pass "T37 non-ASCII registry pid is no writer ($t37_n locale(s))"
+fi
+
+# T38: mutants that restore the old behaviour must be caught by the T35
+# invariants. Locale-sensitive match: the explicit digit class is turned
+# back into a [0-9] range. Identity gate: the well-formed check in the
+# verdict is removed. Each mutant is a throw-away copy; a sed that changed
+# nothing fails the test instead of passing it.
+t38_loc=""
+for _l in $(uni_locale en_US || true) $(locale -a 2>/dev/null | grep -i 'utf-\?8' || true); do
+  if LC_ALL="$_l" bash -c '[[ "٣" =~ ^[0-9]+$ ]]' 2>/dev/null; then t38_loc="$_l"; break; fi
+done
+if [[ -z "$t38_loc" ]]; then
+  pass "T38 skipped (no locale where [0-9] matches non-ASCII digits)"
+else
+  new_run
+  sed 's/\[0123456789\]/[0-9]/g' "$ROOT/tests/lib/tmp-writers.sh" >"$TW_TMP/mut-range.sh"
+  cmp -s "$ROOT/tests/lib/tmp-writers.sh" "$TW_TMP/mut-range.sh" &&
+    fail "T38: range mutant is a no-op"
+  rc=0; uni_unit_checks "$TW_TMP/mut-range.sh" "$t38_loc" || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "T38: locale-sensitive [0-9] mutant survived under $t38_loc"
+  sed '/_tw_identity_wellformed "\$stored" || return 0/d; /_tw_identity_wellformed "\$cur" || return 0/d' \
+    "$ROOT/tests/lib/tmp-writers.sh" >"$TW_TMP/mut-gate.sh"
+  cmp -s "$ROOT/tests/lib/tmp-writers.sh" "$TW_TMP/mut-gate.sh" &&
+    fail "T38: identity-gate mutant is a no-op"
+  rc=0; uni_unit_checks "$TW_TMP/mut-gate.sh" "$t38_loc" || rc=$?
+  [[ "$rc" -ne 0 ]] || fail "T38: identity-gate mutant survived under $t38_loc"
+  pass "T38 locale-range and identity-gate mutants are killed ($t38_loc)"
+fi
 
 
 echo "PASS test-tmp-writers"

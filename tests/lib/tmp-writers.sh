@@ -64,12 +64,13 @@
 # no rm while a tracked writer lives. The leftover pass counts a live
 # pid while any record still positively matches it (a stored start
 # identity equal to the live one, or the live argv is that pidfile's
-# writer shape) or any record is unresolved (no identity, an in-window
-# or unusable started=, an unreadable live identity). A pid PROVEN
-# recycled — a stored identity that differs from the live one, with no
-# matching and no unresolved record — is a different process than the
-# one this run tracked: it is named on its own line in TW_RECYCLED_PIDS
-# for the log, never counted, never signalled.
+# writer shape) or any record is unresolved (no identity, a malformed or
+# non-ASCII identity, an in-window or unusable started=, an unreadable
+# live identity). A pid PROVEN recycled — a well-formed stored identity
+# that differs from the live one, with no matching and no unresolved
+# record — is a different process than the one this run tracked: it is
+# named on its own line in TW_RECYCLED_PIDS for the log, never counted,
+# never signalled.
 #
 # Public API:
 #   TW_TMP=DIR                    — the run's tmp dir (set before teardown)
@@ -120,7 +121,7 @@ _tw_track() {
 # corpse is not a writer.
 _tw_pid_alive() {
   local pid="$1" state
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pid" =~ ^[0123456789]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
   state="$(ps -p "$pid" -o stat= 2>/dev/null || true)"
   state="${state//[[:space:]]/}"
@@ -136,7 +137,7 @@ _tw_elapsed_s() {
   [[ -n "$etime" ]] || return 1
   python3 - "$etime" <<'PY'
 import re, sys
-match = re.fullmatch(r"(?:(\d+)-)?(?:(\d+):)?(\d+):(\d+)", sys.argv[1])
+match = re.fullmatch(r"(?:([0-9]+)-)?(?:([0-9]+):)?([0-9]+):([0-9]+)", sys.argv[1], re.ASCII)
 if not match:
     raise SystemExit(1)
 days, hours, minutes, seconds = (int(g) if g else 0 for g in match.groups())
@@ -150,14 +151,14 @@ PY
 # callers treat that as unverifiable, never as a fallback to file mtimes.
 _tw_pid_identity() {
   local pid="$1" stat rest ident
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pid" =~ ^[0123456789]+$ ]] || return 1
   if [[ -d /proc ]]; then
     [[ -r "/proc/$pid/stat" ]] || return 1
     stat="$(<"/proc/$pid/stat")" || return 1
     rest="${stat##*) }"
     set -- $rest
     ident="${20:-}"
-    [[ "$ident" =~ ^[0-9]+$ ]] || return 1
+    [[ "$ident" =~ ^[0123456789]+$ ]] || return 1
     printf '%s\n' "$ident"
     return 0
   fi
@@ -179,7 +180,7 @@ _tw_pid_identity() {
 # must not fail silently.
 tw_register_pid() {
   local reg="$1" pid="$2" ident="" pgid="" extra=""
-  [[ -n "$reg" && "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -n "$reg" && "$pid" =~ ^[0123456789]+$ ]] || return 1
   ident="$(_tw_pid_identity "$pid" 2>/dev/null || true)"
   pgid="$( { ps -o pgid= -p "$pid" 2>/dev/null || true; } | tr -d '[:space:]')"
   [[ -n "$pgid" && "$pgid" == "$pid" ]] && extra=$'\t'"$pgid"
@@ -202,10 +203,14 @@ _tw_pidfile_fields() {
         pid=*) pid="${tok#pid=}" ;;
         started=*) started="${tok#started=}" ;;
         *)
-          if [[ -z "$pid" && "$tok" =~ ^[0-9]+$ ]]; then pid="$tok"; fi ;;
+          if [[ -z "$pid" && "$tok" =~ ^[0123456789]+$ ]]; then pid="$tok"; fi ;;
       esac
     done
   fi
+  # A missing or non-ASCII pid prints as "-": read -r with a tab IFS
+  # collapses an empty first field, which would hand started= to the
+  # caller as the pid. Every caller rejects a non-numeric pid.
+  [[ "$pid" =~ ^[0123456789]+$ ]] || pid="-"
   printf '%s\t%s\n' "$pid" "$started"
 }
 
@@ -266,7 +271,7 @@ _tw_sentinel_args_ok() {
 
 _tw_sentinel_argv_ok() {
   local pid="$1" job="$2" jobdir="${3:-}" args
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ "$pid" =~ ^[0123456789]+$ ]] || return 1
   args="$(ps -p "$pid" -o args= 2>/dev/null)" || return 1
   _tw_sentinel_args_ok "$args" "$job" "$jobdir"
 }
@@ -358,17 +363,35 @@ _tw_registry_pid_ok() {
   [[ -n "$cur" && "$cur" == "$ident" ]]
 }
 
+# _tw_identity_wellformed ID — rc 0 only when ID has a shape
+# _tw_pid_identity can produce: ASCII-digit start ticks (Linux /proc) or a
+# C-locale ps lstart ("Www Mmm DD HH:MM:SS YYYY", the day space-padded to
+# two columns on BSD ps). Every digit class is spelled out and the names
+# are enumerated: a [0-9] range or [[:digit:]] can match Arabic-Indic,
+# fullwidth or Devanagari digits in a UTF-8 locale. A token of any other
+# shape is not an identity, so a difference from the live one proves
+# nothing.
+_tw_identity_wellformed() {
+  local id="${1:-}" re
+  [[ "$id" =~ ^[0123456789]+$ ]] && return 0
+  re='^(Mon|Tue|Wed|Thu|Fri|Sat|Sun) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [ 0123456789]{1,2} [0123456789]{2}:[0123456789]{2}:[0123456789]{2} [0123456789]{4}$'
+  [[ "$id" =~ $re ]]
+}
+
 # _tw_identity_verdict PID STORED — one word for the final leftover pass:
 # "match" when a stored start identity exists and equals the live pid's
 # current one (a positive sighting of the tracked writer), "mismatch"
-# when both are readable and differ (positive proof of reuse), and no
-# output when there is no evidence either way — an empty stored identity
-# (never verified) or an unreadable current one.
+# when both are well-formed identities and differ (positive proof of
+# reuse), and no output when there is no evidence either way — an empty
+# or malformed stored identity (never verified), or an unreadable or
+# malformed current one. No output means unresolved, never recycled.
 _tw_identity_verdict() {
   local pid="$1" stored="${2:-}" cur
   [[ -n "$stored" ]] || return 0
+  _tw_identity_wellformed "$stored" || return 0
   cur="$(_tw_pid_identity "$pid" 2>/dev/null)" || return 0
   [[ -n "$cur" ]] || return 0
+  _tw_identity_wellformed "$cur" || return 0
   if [[ "$cur" == "$stored" ]]; then
     printf 'match\n'
   else
@@ -396,7 +419,7 @@ _tw_pidfile_recycled() {
 _tw_leftover_argv_ok() {
   local margs="$1"
   case "$margs" in
-    "sleep "[0-9]*) return 0 ;;
+    "sleep "[0123456789]*) return 0 ;;
   esac
   if [[ -n "${TW_TMP:-}" && "$margs" == *"$TW_TMP"* ]]; then return 0; fi
   if [[ -n "${ROOT:-}" && "$margs" == *"$ROOT"* ]]; then return 0; fi
@@ -415,7 +438,7 @@ _tw_descendants() {
     p="${queue[0]}"
     queue=("${queue[@]:1}")
     while IFS= read -r c; do
-      [[ "$c" =~ ^[0-9]+$ ]] || continue
+      [[ "$c" =~ ^[0123456789]+$ ]] || continue
       kill -STOP "$c" 2>/dev/null || true
       _tw_track "$c"
       printf '%s\n' "$c"
@@ -436,7 +459,7 @@ _tw_descendants() {
 # group ledger reaps dead leaders' groups. SIG defaults to -TERM.
 tw_kill_tree() {
   local pid="$1" sig="${2:--TERM}" desc d pgid
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  [[ "$pid" =~ ^[0123456789]+$ ]] || return 0
   _TW_LAST_DESC=""
   _TW_LAST_PGID=""
   if _tw_pid_alive "$pid"; then
@@ -471,7 +494,7 @@ tw_kill_pidfile() {
   # is refused even when its contents would otherwise verify.
   [[ -n "${TW_TMP:-}" && "$file" == "$TW_TMP/"* ]] || return 1
   IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$file")"
-  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  [[ "$pid" =~ ^[0123456789]+$ ]] || return 0
   _tw_track "$pid"
   _tw_pid_alive "$pid" || return 0
   args="$(ps -p "$pid" -o args= 2>/dev/null || true)"
@@ -625,7 +648,7 @@ tmp_writers_stop() {
     gm=""
     while IFS= read -r pf; do
       IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$pf")"
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      [[ "$pid" =~ ^[0123456789]+$ ]] || continue
       _tw_track "$pid"
       _tw_list_has "$_TW_DEAD" "$pid" || tracked="$tracked $pid"
     done < <(find "$TW_TMP" -type f \
@@ -634,22 +657,22 @@ tmp_writers_stop() {
     while IFS= read -r reg; do
       [[ -f "$reg" ]] || continue
       while IFS= read -r pid; do
-        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [[ "$pid" =~ ^[0123456789]+$ ]] || continue
         _tw_list_has "$_TW_DEAD" "$pid" || tracked="$tracked $pid"
       done <"$reg"
       if [[ -f "$reg.identities" ]]; then
         while IFS= read -r g; do
-          [[ "$g" =~ ^[0-9]+$ ]] || continue
+          [[ "$g" =~ ^[0123456789]+$ ]] || continue
           _tw_list_has "$group_candidates" "$g" ||
             group_candidates="$group_candidates $g"
         done < <(awk -F '\t' \
-          '$1 ~ /^[0-9]+$/ && $2 != "" && $3 ~ /^[0-9]+$/ && $1 == $3 { print $3 }' \
+          '$1 ~ /^[0123456789]+$/ && $2 != "" && $3 ~ /^[0123456789]+$/ && $1 == $3 { print $3 }' \
           "$reg.identities" 2>/dev/null)
       fi
     done < <(_tw_registries)
     while IFS= read -r sfile; do
       IFS=$'\t' read -r spid sident spgid <"$sfile" 2>/dev/null || continue
-      [[ "$spid" =~ ^[0-9]+$ ]] || continue
+      [[ "$spid" =~ ^[0123456789]+$ ]] || continue
       _tw_track "$spid"
       _tw_list_has "$_TW_DEAD" "$spid" || tracked="$tracked $spid"
       if [[ "$spid" == "$spgid" && -n "$sident" ]]; then
@@ -661,7 +684,7 @@ tmp_writers_stop() {
     # Candidates only add PIDs to that snapshot; step 5 still requires the
     # independent authorized _TW_GROUPS ledger before signalling members.
     for g in $group_candidates; do
-      [[ "$g" =~ ^[0-9]+$ ]] || continue
+      [[ "$g" =~ ^[0123456789]+$ ]] || continue
       gmembers="$(pgrep -g "$g" 2>/dev/null | tr -s ' \n' ',,' || true)"
       gmembers="${gmembers#,}"; gmembers="${gmembers%,}"
       [[ -n "$gmembers" ]] || continue
@@ -685,7 +708,7 @@ tmp_writers_stop() {
     while IFS= read -r pf; do
       kind="${pf##*/}"
       IFS=$'\t' read -r pid started <<<"$(_tw_pidfile_fields "$pf")"
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      [[ "$pid" =~ ^[0123456789]+$ ]] || continue
       _tw_list_has "$_TW_DEAD" "$pid" && continue
       stat="$(_tw_snap_field "$snap" "$pid" 2)"
       if [[ -n "$stat" && "$stat" != Z* ]]; then
@@ -724,7 +747,7 @@ tmp_writers_stop() {
     while IFS= read -r reg; do
       [[ -f "$reg" ]] || continue
       while IFS= read -r pid; do
-        [[ "$pid" =~ ^[0-9]+$ ]] || continue
+        [[ "$pid" =~ ^[0123456789]+$ ]] || continue
         _tw_list_has "$_TW_DEAD" "$pid" && continue
         stat="$(_tw_snap_field "$snap" "$pid" 2)"
         if [[ -n "$stat" && "$stat" != Z* ]]; then
@@ -765,7 +788,7 @@ tmp_writers_stop() {
     #    checked individually through the group pass).
     while IFS= read -r sfile; do
       IFS=$'\t' read -r spid sident spgid <"$sfile" 2>/dev/null || continue
-      [[ "$spid" =~ ^[0-9]+$ && "$spgid" =~ ^[0-9]+$ ]] || continue
+      [[ "$spid" =~ ^[0123456789]+$ && "$spgid" =~ ^[0123456789]+$ ]] || continue
       _tw_list_has "$_TW_DEAD" "$spid" && continue
       stat="$(_tw_snap_field "$snap" "$spid" 2)"
       if [[ -n "$stat" && "$stat" != Z* ]]; then
@@ -804,7 +827,7 @@ tmp_writers_stop() {
       g="${gtok%%:*}"; glist="${gtok#*:}"
       _tw_list_has "$_TW_GROUPS" "$g" || continue
       for mpid in ${glist//,/ }; do
-        [[ "$mpid" =~ ^[0-9]+$ ]] || continue
+        [[ "$mpid" =~ ^[0123456789]+$ ]] || continue
         [[ "$mpid" == "$g" ]] && continue
         mstat="$(_tw_snap_field "$snap" "$mpid" 2)"
         [[ -n "$mstat" && "$mstat" != Z* ]] || continue
@@ -875,7 +898,8 @@ tmp_writers_stop() {
   #                 pidfile's writer shape.
   #   mismatched  — a positive reuse proof: the stored identity provably
   #                 differs from the live one.
-  #   unresolved  — no evidence either way: no stored identity, an
+  #   unresolved  — no evidence either way: no stored identity, a
+  #                 malformed (e.g. non-ASCII-digit) identity, an
   #                 in-window or unusable started=, an empty identity
   #                 field, or an unreadable live identity.
   # A pid is recycled only when some record proves reuse and NO record
@@ -889,7 +913,7 @@ tmp_writers_stop() {
   # nonzero return keeps the caller from rm -rf'ing TMP.
   while IFS= read -r pf; do
     IFS=$'\t' read -r pid started <<<"$(_tw_pidfile_fields "$pf")"
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" =~ ^[0123456789]+$ ]] || continue
     _tw_pid_alive "$pid" || continue
     # The writer's own argv is a positive sighting even when the file's
     # started= is wrong (fake-clock spawns record a falsified start):
@@ -910,7 +934,7 @@ tmp_writers_stop() {
   while IFS= read -r reg; do
     [[ -f "$reg" ]] || continue
     while IFS= read -r pid; do
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      [[ "$pid" =~ ^[0123456789]+$ ]] || continue
       _tw_pid_alive "$pid" || continue
       stored=""
       [[ -f "$reg.identities" ]] &&
@@ -938,7 +962,7 @@ tmp_writers_stop() {
       sident="${sline#*$'\t'}"
       sident="${sident%%$'\t'*}"
     fi
-    [[ "$spid" =~ ^[0-9]+$ ]] || continue
+    [[ "$spid" =~ ^[0123456789]+$ ]] || continue
     _tw_pid_alive "$spid" || continue
     case "$(_tw_identity_verdict "$spid" "$sident")" in
       match) _tw_list_has "$matched" "$spid" ||
@@ -978,7 +1002,7 @@ tmp_writers_stop() {
   # recycled.
   while IFS= read -r pf; do
     IFS=$'\t' read -r pid _ <<<"$(_tw_pidfile_fields "$pf")"
-    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    [[ "$pid" =~ ^[0123456789]+$ ]] || continue
     _tw_pid_alive "$pid" || continue
     _tw_list_has "$recycled" "$pid" && continue
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
@@ -988,7 +1012,7 @@ tmp_writers_stop() {
   while IFS= read -r reg; do
     [[ -f "$reg" ]] || continue
     while IFS= read -r pid; do
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
+      [[ "$pid" =~ ^[0123456789]+$ ]] || continue
       _tw_pid_alive "$pid" || continue
       _tw_list_has "$recycled" "$pid" && continue
       TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $pid"
@@ -996,7 +1020,7 @@ tmp_writers_stop() {
   done < <(_tw_registries)
   while IFS= read -r sfile; do
     IFS=$'\t' read -r spid _ _ <"$sfile" 2>/dev/null || continue
-    [[ "$spid" =~ ^[0-9]+$ ]] || continue
+    [[ "$spid" =~ ^[0123456789]+$ ]] || continue
     _tw_pid_alive "$spid" || continue
     _tw_list_has "$recycled" "$spid" && continue
     TW_LEFTOVER_PIDS="$TW_LEFTOVER_PIDS $spid"
