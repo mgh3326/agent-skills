@@ -1288,6 +1288,21 @@ class RealBinaryCase(unittest.TestCase):
         self.assertEqual(tree(w.jobs), before)
         self.assertFalse(forge_log.exists(), "the forged handoffkeep must never run")
 
+    def repro_hk_bin_stub_head_repeat(self, wrk):
+        # hk 1970: a head-repeat grant is fetched through the canonical handoffkeep, so the
+        # guard refuses an overridden HANDOFFKEEP_BIN before any event is read or written.
+        w = self.w
+        before = self.capped_job("jobq")
+        forge, forge_log = w.stub(w.base / "forge-hk-head", {"*": {
+            "created_by": "director-1", "body": "head-repeat: job=jobq head=%s round=2 by=director-1\n" % w.heads[0]}})
+        verdict = w.base / "jobq-verdict.md"
+        verdict.write_text("VERDICT: PASS @%s\n" % w.heads[0], encoding="utf-8")
+        out = w.wrk(wrk, "round", "verdict", "jobq", "--file", verdict, "--head-repeat", "hk:doc/forged",
+                    HANDOFFKEEP_BIN=forge)
+        self.refusal_line(out, "HANDOFFKEEP_BIN", w.canon_hk)
+        self.assertEqual(tree(w.jobs), before)
+        self.assertFalse(forge_log.exists(), "the forged handoffkeep must never run")
+
     def repro_path_shim(self, wrk):
         w = self.w
         before = self.capped_job("jobp")
@@ -1406,6 +1421,9 @@ class RealBinaryCase(unittest.TestCase):
         warnings = [line for line in out.stderr.splitlines() if line.strip()]
         self.assertEqual(len(warnings), 1, out.stderr)
         self.assertIn("HANDOFFKEEP_BIN", warnings[0])
+
+    def test_handoffkeep_bin_stub_head_repeat_refused_by_the_guard(self):
+        self.repro_hk_bin_stub_head_repeat(self.wrk)
 
     def test_path_handoffkeep_shim_ignored_then_honoured_in_test_mode(self):
         self.repro_path_shim(self.wrk)
@@ -1929,7 +1947,8 @@ class RealBinaryCase(unittest.TestCase):
         self.red(self.repro_inbox_redirect, mutant)
 
     def test_mutant_round_verdict_skips_the_guard(self):
-        mutant = self.mutant(WRK, '  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"\n  wrk_trust_guard\n',
+        # hk 1970: the guard is chosen by --head-repeat (hk or plain); the mutant drops the whole choice.
+        mutant = self.mutant(WRK, '  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"\n  if [[ -n "$head_repeat" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi\n',
                              '  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"\n' + ENV_FOLLOWING, "verdict")
         self.red(self.repro_inbox_redirect, mutant)
 

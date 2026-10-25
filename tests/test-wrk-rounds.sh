@@ -2045,6 +2045,7 @@ assert_refused "wrk: joined: job mut-late-red has zero non-voided recorded round
 echo "PASS mutant-verify-after-the-refusal-check-goes-red"
 
 # hk 1970 mutants: each applied to the real anchor, each turns its case RED.
+# shellcheck disable=SC2016 # the mutant spec is a literal source span, not an expansion
 printf '%s\n' 'if ! round_approval_fetch "$head_repeat" >"$tmp_approval"; then => if false; then' >"$TMP/spec-hr-nofetch"
 mutant hr-nofetch "$TMP/spec-hr-nofetch"
 hr_seed hr-mut-nofetch
