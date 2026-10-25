@@ -15454,7 +15454,8 @@ fi
 # restored to its prior content so the end-of-suite check still means something.
 tw_job=tripwire-deliberate
 "$ARBITER" claim --job "$tw_job" --agent-label fixture --lane fixture --t T1 >/dev/null
-: >"$TMP/tw-gate.txt"
+# the gate text must carry a pool so resolve_pool goes on to known_pools (scopefuel --json)
+printf '%s\n' 'profile=codex-luna-max pool=codex' >"$TMP/tw-gate.txt"
 tw_rc=0
 cp "$TRIPWIRE_LOG" "$TMP/tripwire.before"
 ( unset SCOPEFUEL_BIN
@@ -15463,7 +15464,7 @@ cp "$TRIPWIRE_LOG" "$TMP/tripwire.before"
 [[ "$tw_rc" -ne 0 ]] || fail "hk1439: lease without SCOPEFUEL_BIN unexpectedly succeeded"
 [[ "$(wc -l <"$TRIPWIRE_LOG")" -gt "$(wc -l <"$TMP/tripwire.before")" ]] ||
   fail "hk1439: tripwire did not fire for a lease without SCOPEFUEL_BIN: $(cat "$TMP/tw-lease.err")"
-grep -q '99' "$TMP/tw-lease.err" "$TMP/tw-lease.out" ||
+grep -q 'exit 99' "$TMP/tw-lease.err" "$TMP/tw-lease.out" ||
   fail "hk1439: lease error did not show the tripwire rc 99: $(cat "$TMP/tw-lease.err")"
 cp "$TMP/tripwire.before" "$TRIPWIRE_LOG" # drop only this case's own line
 echo "PASS hk1439 tripwire fires when SCOPEFUEL_BIN is unset"
