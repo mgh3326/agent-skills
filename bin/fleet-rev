@@ -47,6 +47,9 @@ PATH="$HOME/.local/bin:$HOME/go/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 export PATH
 GIT_OPTIONAL_LOCKS=0
 export GIT_OPTIONAL_LOCKS
+# fd 9 keeps the probe's stderr for the kill log lines below, since the
+# watchdog and sweeper subshells send their fd 2 to /dev/null.
+exec 9>&2
 TOOL_T=3
 KILL_GRACE=1
 # Whole-probe budget: the sum of every tool call must stay inside the
@@ -75,6 +78,62 @@ descendants() {
     descendants "$2"
     printf '%s\n' "$2"
   done
+}
+
+# ident PID — PID's start time (ps lstart), or nothing when it cannot be
+# read: no such pid, a ps without -p (busybox), or more than one line. lstart
+# is the identity: it survives exec (comm does not, so a snapshot taken
+# before a child execs would never match again) and it changes when a pid is
+# reused. Its resolution is one second.
+ident() {
+  _id_o=$(ps -p "$1" -o lstart= 2>/dev/null) || _id_o=
+  case "$_id_o" in
+    *"
+"*) _id_o= ;;
+  esac
+  # re-split on blanks (no glob) so leading and trailing blanks drop out
+  set -f
+  # shellcheck disable=SC2086 # the split is the point; globbing is off
+  set -- $_id_o
+  set +f
+  printf '%s\n' "$*"
+}
+
+# snap PID — every descendant of PID as a "pid identity" line, deepest
+# first. An identity that cannot be read is left empty, and kill_known never
+# signals an empty one.
+snap() {
+  for _sn_p in $(descendants "$1"); do
+    printf '%s %s\n' "$_sn_p" "$(ident "$_sn_p")"
+  done
+}
+
+# kill_known SIG LIST — SIG to each "pid identity" line of LIST whose pid
+# still has that identity, re-read now. A pid that is already gone is not
+# signalled and not logged. A pid whose identity is empty, or no longer the
+# one recorded (it was reused after the snapshot), is not signalled and
+# gets one line on stderr (fd 9 is the probe's own stderr, set below).
+# Every identity is checked first and the verified pids go out in ONE kill:
+# signalling a deep pid, then ident-checking its parent, would let the
+# parent fork a fresh child in between (a wrapper's interior loop does),
+# and that child is not on the list.
+kill_known() {
+  _kk_sig=$1
+  _kk_go=$(printf '%s\n' "$2" | while read -r _kk_p _kk_id; do
+    [ -n "$_kk_p" ] || continue
+    kill -0 "$_kk_p" 2>/dev/null || continue
+    _kk_now=$(ident "$_kk_p")
+    if [ -z "$_kk_id" ] || [ -z "$_kk_now" ]; then
+      printf 'fleet-rev: kill skipped for pid %s: identity unreadable\n' "$_kk_p" >&9
+    elif [ "$_kk_now" != "$_kk_id" ]; then
+      printf 'fleet-rev: kill skipped for pid %s: identity changed\n' "$_kk_p" >&9
+    else
+      printf '%s ' "$_kk_p"
+    fi
+  done)
+  # shellcheck disable=SC2086 # pids only, one kill call (see above)
+  [ -z "$_kk_go" ] || kill -"$_kk_sig" $_kk_go 2>/dev/null
+  return 0
 }
 
 # next_tool_bound — seconds the next tool call may run: TOOL_T, or less
@@ -114,7 +173,13 @@ budget_unknown() {
 # descendants and exit, so a grandchild orphaned by a finished wrapper
 # cannot keep the caller's output pipe open (the snapshot is at most a
 # second stale — a child spawned and detached in that gap is the
-# residual, as is a pid freed and reused inside it).
+# residual). Every pid in those lists carries its identity from the same
+# snapshot (ident), and every kill goes through kill_known, which signals
+# only a pid whose identity still matches: a pid freed after the snapshot
+# and reused by an unrelated process is skipped and logged, never signalled.
+# Residuals: a pid reused within the same second as the original's start
+# (lstart has one-second resolution), and the gap between the pgrep that
+# lists a child and the ident that reads it.
 # Both helpers' fds go to /dev/null so neither they nor their sleeps can
 # hold the caller's output pipe open. (A separate process group would
 # cover all of this, but a non-interactive sh without a tty refuses
@@ -129,26 +194,31 @@ run_tool() {
   _rt_t=$1; shift
   "$@" </dev/null &
   _rt_p=$!
+  _rt_me="$_rt_p $(ident "$_rt_p")"
   ( sleep "$_rt_t"
-    _rt_k=$(descendants "$_rt_p")
-    kill -TERM "$_rt_p" $_rt_k 2>/dev/null
+    _rt_k=$(snap "$_rt_p")
+    kill_known TERM "$_rt_me
+$_rt_k"
     sleep "$KILL_GRACE"
-    kill -KILL "$_rt_p" $_rt_k $(descendants "$_rt_p") 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+    kill_known KILL "$_rt_me
+$_rt_k
+$(snap "$_rt_p")" ) </dev/null >/dev/null 2>&1 &
   _rt_w=$!
   ( _rt_k=
     _rt_nap=
-    trap 'kill -KILL $_rt_k $_rt_nap 2>/dev/null; exit' USR1
+    trap 'kill_known KILL "$_rt_k"; kill -KILL $_rt_nap 2>/dev/null; exit' USR1
     while kill -0 "$_rt_p" 2>/dev/null; do
-      _rt_k=$(descendants "$_rt_p")
+      _rt_k=$(snap "$_rt_p")
       sleep 1 &
       _rt_nap=$!
       wait "$_rt_nap" 2>/dev/null
     done
-    kill -KILL $_rt_k 2>/dev/null ) </dev/null >/dev/null 2>&1 &
+    kill_known KILL "$_rt_k" ) </dev/null >/dev/null 2>&1 &
   _rt_s=$!
   wait "$_rt_p" 2>/dev/null
   _rt_rc=$?
   _rt_c=$(pgrep -P "$_rt_w" 2>/dev/null || true)
+  # shellcheck disable=SC2086 # pids only
   kill -KILL "$_rt_w" $_rt_c 2>/dev/null
   wait "$_rt_w" 2>/dev/null
   # wake the sweeper for its last kill; it exits right after (untrapped
@@ -446,6 +516,11 @@ def probe_host(host: Host, timeout: float) -> tuple[dict[str, str] | None, str]:
         return None, "timeout after %ss" % timeout
     except OSError as exc:
         return None, "probe failed: %s" % exc
+    # kill-skip log lines from the probe's kill helpers (fd 9); nothing else
+    # the probe writes to stderr is forwarded.
+    for line in proc.stderr.splitlines():
+        if line.startswith("fleet-rev: kill skipped for pid "):
+            eprint(line)
     if proc.returncode != 0:
         return None, "rc=%d" % proc.returncode
     kv: dict[str, str] = {}
