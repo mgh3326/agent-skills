@@ -6,6 +6,9 @@
 # Stub scopefuel and herdr only. The real-scopefuel smoke runs only when
 # SCOPEFUEL_SMOKE_REPO is set, so CI does not need a scopefuel checkout.
 set -euo pipefail
+# hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
+# (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
+export WRK_TEST_MODE=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"

@@ -108,7 +108,11 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) shift ;;
-      --operator-request) launch_operator=1; shift ;;
+      --operator-request)
+        launch_operator=1; shift
+        # Match policy launch's optional REF while retaining legacy bare flags.
+        if [[ $# -gt 0 && "${1:-}" != --* ]]; then shift; fi
+        ;;
       --purpose) launch_purpose="${2:-}"; shift 2 ;;
       --role) shift 2 ;; # New seat argument; grant semantics are tested against real scopefuel.
       --effort) launch_effort="${2:-}"; shift 2 ;;
