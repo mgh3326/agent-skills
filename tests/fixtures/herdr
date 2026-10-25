@@ -799,6 +799,12 @@ case "${1:-}" in
           exit 9
         fi
       fi
+      # hk 1895: fail only the failed-pane screen capture shape (--lines 200),
+      # never the readiness probe's --lines 60 read.
+      if [[ -n "${WRK_FIXTURE_PANE_READ200_FAIL:-}" && " $* " == *" --lines 200 "* ]]; then
+        printf 'fixture: pane read unavailable\n' >&2
+        exit 9
+      fi
       # devin-slow-rc: the modelled rc finishes on the
       # ${WRK_FIXTURE_RC_READS:-6}-th pane read — every input line queued
       # behind it now runs in order with the full environment.
