@@ -3642,7 +3642,7 @@ apply_catalog() {
   if [[ -n "${ROUND_EXT_REF:-}" ]]; then
     launch_args+=(--operator-request "$ROUND_EXT_REF")
   elif [[ -n "${OPERATOR_REQUEST:-}" ]]; then
-    launch_args+=(--operator-request)
+    launch_args+=(--operator-request "$OPERATOR_REQUEST")
   fi
   # task #527 + #593: the declared purpose reaches the catalog too, not only the
   # quota gate. A bare `-m codex-astra` is the architect counsel path (PURPOSE is

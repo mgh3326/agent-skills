@@ -15438,4 +15438,6 @@ bash "$ROOT/tests/test-shellcheck-capped.sh"
 # hk 1604: devin gate-profile contract. The real-scopefuel smoke stays opt-in
 # (SCOPEFUEL_SMOKE_REPO), so this CI invocation does not need a checkout.
 bash "$ROOT/tests/test-devin-gate-profile.sh"
+# hk 1990: preserve durable operator refs at the actual apply_catalog call site.
+python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
 echo 'PASS test-wrk'
