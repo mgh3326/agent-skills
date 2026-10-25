@@ -5192,7 +5192,7 @@ completion_metadata() {
   wrk_py - "$root/$job/events" <<'PY'
 import json, os, sys
 exec(os.environ["WRK_EVENTS_PY"])
-owner=label=pane=parent=role=''
+owner=label=pane=parent=role=spawn_pane=''
 for name, o, _ in wrk_events_ordered(sys.argv[1]):
     if o is None: continue
     p=o.get('payload',o)
@@ -5205,6 +5205,13 @@ for name, o, _ in wrk_events_ordered(sys.argv[1]):
         parent=p.get('parent_lane') if isinstance(p.get('parent_lane'), str) else ''
         role=p.get('role') if isinstance(p.get('role'), str) else ''
     pane=p.get('pane_id') if isinstance(p.get('pane_id'), str) else pane
+    # hk1860: the newest job.spawned names this job's pane. A later stale
+    # watcher's job.lost names an older pane, so it must not win. Any pane_id
+    # stays the fallback for a stream with no usable spawn receipt.
+    if o.get('kind') == 'job.spawned':
+        candidate=p.get('pane_id')
+        spawn_pane=candidate if isinstance(candidate, str) and candidate else ''
+pane=spawn_pane or pane
 if owner and label and pane: print(owner, label, pane, parent, role, sep='\t')
 else: raise SystemExit(1)
 PY
@@ -7354,7 +7361,9 @@ job_end_housekeeping() {
   }
   case "$end_out" in
     created|already-ended)
-      release_job_quota_pool "$job" "$pane" || release_rc=$? # hk1798-housekeeping-release
+      # hk1860: the release's skip diagnostics go to stderr, so wrk done and
+      # wrk joined keep their one OK line on stdout.
+      release_job_quota_pool "$job" "$pane" >&2 || release_rc=$? # hk1798-housekeeping-release
       [[ "$release_rc" != 2 ]] || return 0 # hk1813-housekeeping-release-current
       stop_completion_sentinel "$job"
       ;;
@@ -12230,6 +12239,8 @@ prune_cmd() {
   # ones that never had (or lost) a pidfile. A pidfile pass already covers
   # the pair when its pid matches; a different live pid for the same job is
   # a second sentinel and is judged on its own.
+  # hk1860: the one sentinel sweep of this run; pass 4 reads the same snapshot.
+  PRUNE_SWEEP="$(sentinel_sweep 2>/dev/null || true)"
   local _pid _job _owner _label _pane _report _pfpid
   while IFS=$'\t' read -r _pid _job _owner _label _pane _report; do
     [[ -n "$_job" ]] || continue
@@ -12239,7 +12250,7 @@ prune_cmd() {
       [[ "$_pfpid" == "$_pid" ]] && continue
     fi
     prune_sentinel_row "$_job" "$_pid" - "$_pane" "$_owner"
-  done < <(sentinel_sweep)
+  done <<<"$PRUNE_SWEEP"
 
   # Pass 3 — stale jobs: silent past --stale-age AND pane absent. Records are
   # kept; --apply only appends the hub-visible end declaration.
@@ -12281,52 +12292,86 @@ prune_cmd() {
   # than every revive, and that have no live completion sentinel. The arbiter
   # table is authoritative for rows: an earlier release event may be followed
   # by a new record for the same job and pool.
-  local quota_releases=0 _quota_arb="${ARBITER:-}" _quota_status _quota_pools _quota_csv _quota_pane _quota_rc
+  # hk1860: the run takes ONE unscoped arbiter status. Its rows are keyed by
+  # job_id; each ended job reads its pools from that map, and its liveness from
+  # the pass-2 sweep. The release still rechecks the round and the sentinel
+  # right before each release, so a sentinel that starts after the sweep is
+  # still refused there.
+  local quota_releases=0 _quota_arb="${ARBITER:-}" _quota_status="" _quota_map="" _quota_rc=0
+  local _quota_pools _quota_csv _quota_pane _quota_rc2 _live_jobs _probe _pclass _ptoken _qj _qp
   if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
     _quota_arb="$(command -v arbiter 2>/dev/null || true)"
   fi
+  # hk1860 round 3: the status document is read from stdin by this script. It
+  # is never an argv word, since Linux caps one argument at 128 KiB. A parse
+  # failure exits 3 and an exec failure exits with its own rc; both take the
+  # status-failed skip path below.
+  local _quota_map_py='
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(3)
+if not isinstance(doc, dict):
+    raise SystemExit(3)
+for row in doc.get("quota_pool_records") or []:
+    if (isinstance(row, dict) and isinstance(row.get("job_id"), str) and row["job_id"]
+            and isinstance(row.get("pool"), str) and row["pool"]):
+        print(row["job_id"] + "\t" + row["pool"])
+'
+  if [[ -n "$_quota_arb" && -x "$_quota_arb" ]]; then
+    _quota_status="$("$_quota_arb" status --json 2>/dev/null)" || _quota_rc=$?
+    if (( _quota_rc == 0 )); then
+      _quota_map="$(printf '%s' "$_quota_status" | python3 -c "$_quota_map_py")" || _quota_rc=$?
+    fi
+  fi
+  _live_jobs="$(awk -F '\t' 'NF >= 2 {print $2}' <<<"$PRUNE_SWEEP")"
   while IFS=$'\t' read -r job _ended _hub _term _age _last _comp _owner _label _pane _tab; do
     [[ -n "$job" ]] || continue
     [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
     [[ -z "$lane" || "$_owner" == "$lane" ]] || continue
     [[ "$_ended" == 1 ]] || continue # hk1813-ended-quota-release-pass
-    job_has_live_completion_sentinel "$job" && continue
+    [[ $'\n'"$_live_jobs"$'\n' != *$'\n'"$job"$'\n'* ]] || continue
     if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
-      quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"
+      if (( apply )); then quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"; fi
       echo "skip job=$job reason=arbiter-unavailable"
       continue
     fi
-    _quota_status="$("$_quota_arb" status --job "$job" --json 2>/dev/null)" || {
-      quota_release_log "$job" "-" "rc=$? reason=status-failed"
+    if (( _quota_rc != 0 )); then
+      if (( apply )); then quota_release_log "$job" "-" "rc=$_quota_rc reason=status-failed"; fi
       echo "skip job=$job reason=status-failed"
       continue
-    }
-    _quota_pools="$(python3 - "$_quota_status" <<'PY'
-import json, sys
-try:
-    doc = json.loads(sys.argv[1])
-except ValueError:
-    raise SystemExit(0)
-pools = {row.get("pool") for row in doc.get("quota_pool_records") or []
-         if isinstance(row, dict) and isinstance(row.get("pool"), str) and row["pool"]}
-print("\n".join(sorted(pools)))
-PY
-    )"
+    fi
+    _quota_pools=""
+    while IFS=$'\t' read -r _qj _qp; do
+      [[ "$_qj" == "$job" && -n "$_qp" ]] || continue
+      _quota_pools+="$_qp"$'\n'
+    done <<<"$_quota_map"
     [[ -n "$_quota_pools" ]] || continue
-    _quota_csv="$(tr '\n' ',' <<<"$_quota_pools")"
-    _quota_csv="${_quota_csv%,}"
+    _quota_csv="$(printf '%s' "$_quota_pools" | sort -u | paste -sd, -)"
     _quota_pane="$_pane"
     [[ "$_quota_pane" == - ]] && _quota_pane=""
+    # hk1860: the newest job.spawned pane must not be alive. The probe classes
+    # match prune pass 2; an unverifiable probe skips too (fail safe).
+    if [[ -n "$_quota_pane" ]]; then
+      _probe="$(herdr_agent_probe "$_quota_pane")"
+      IFS=$'\t' read -r _pclass _ptoken _ <<<"$_probe"
+      case "$_pclass" in
+        gone) ;;
+        ok) echo "skip job=$job reason=pane-alive"; continue ;;
+        *) echo "skip job=$job reason=pane-unverified($_ptoken)"; continue ;;
+      esac
+    fi
     if (( apply )); then
-      _quota_rc=0
-      release_job_quota_pool "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$? # hk1813-ended-quota-release-call
-      [[ "$_quota_rc" != 2 ]] || continue
+      _quota_rc2=0
+      release_job_quota_pool "$job" "$_quota_pane" ended-no-sentinel || _quota_rc2=$? # hk1813-ended-quota-release-call
+      [[ "$_quota_rc2" != 2 ]] || continue
       quota_releases=$(( quota_releases + 1 ))
       echo "release-attempted job=$job pools=$_quota_csv"
     else
-      _quota_rc=0
-      quota_release_round_current "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$?
-      [[ "$_quota_rc" != 2 ]] || continue
+      _quota_rc2=0
+      quota_release_round_current "$job" "$_quota_pane" ended-no-sentinel || _quota_rc2=$?
+      [[ "$_quota_rc2" != 2 ]] || continue
       quota_releases=$(( quota_releases + 1 ))
       echo "would-release job=$job pools=$_quota_csv"
     fi
