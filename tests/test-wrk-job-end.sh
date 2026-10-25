@@ -5228,4 +5228,54 @@ mkmut_span hk1860-dryrun-log \
 expect_mut_red "hk1860 dry-run writes a release-failure log line" case_hk1860_dryrun_pure \
   'ASSERT-RED: hk1860 dry-run appends no completion-sentinel.log line'
 
+# hk 1860 round 3: a status document beyond the Linux per-argument cap (and the
+# macOS ARG_MAX) must still reach pass 4. The document is piped on stdin, so one
+# ended job with a row is still listed by dry-run, rc 0, after one status call.
+case_hk1860_oversized_status() {
+  reset_case hk1860-big || return 3
+  local job=hk1860-big calls="$TMP/hk1860-big.calls" arb_wrap="$TMP/hk1860-big-arbiter"
+  local seq="$TMP/hk1860-big.seq" out
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"lane-a\",\"label\":\"lbl\"}" >/dev/null || return 3
+  : >"$calls"
+  printf 'not-found\n' >"$seq"
+  cat >"$arb_wrap" <<EOF
+#!/bin/bash
+set -euo pipefail
+if [[ "\${1:-}" == status && "\${2:-}" == --json ]]; then
+  printf 'status\n' >>"$calls"
+  "$ARBITER" status --json | python3 -c 'import json, sys
+doc = json.load(sys.stdin)
+doc["padding"] = "x" * 1200000
+print(json.dumps(doc))'
+  exit 0
+fi
+exec "$ARBITER" "\$@"
+EOF
+  chmod +x "$arb_wrap" || return 3
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$arb_wrap" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" "$WRK" prune 2>&1)" || {
+    assertion_red 'hk1860 prune completes with rc 0 on an oversized status document'; return 1
+  }
+  [[ "$(grep -c '^status$' "$calls" || true)" == 1 ]] || {
+    assertion_red 'hk1860 an oversized status is read with exactly one status call'; return 1
+  }
+  grep -Fq "would-release job=$job" <<<"$out" || {
+    assertion_red 'hk1860 oversized status still yields the ended job would-release'; return 1
+  }
+}
+
+case_hk1860_oversized_status || fail "hk1860: an oversized status document must still reach pass 4"
+echo "PASS hk1860 oversized-status-stdin"
+
+# Mutant: the status document back on argv. The oversized argument fails the
+# exec, the status is treated as failed, and the would-release line is lost.
+mkmut_span hk1860-status-argv \
+  '| python3 -c "$_quota_map_py")" || _quota_rc=$?' \
+  '      _quota_map="$(python3 -c "$_quota_map_py" "$_quota_status")" || _quota_rc=$?'
+expect_mut_red "hk1860 status document on argv" case_hk1860_oversized_status \
+  'ASSERT-RED: hk1860 oversized status still yields the ended job would-release'
+
 echo "PASS test-wrk-job-end: all cases"

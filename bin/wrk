@@ -12302,23 +12302,27 @@ prune_cmd() {
   if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
     _quota_arb="$(command -v arbiter 2>/dev/null || true)"
   fi
-  if [[ -n "$_quota_arb" && -x "$_quota_arb" ]]; then
-    _quota_status="$("$_quota_arb" status --json 2>/dev/null)" || _quota_rc=$?
-    if (( _quota_rc == 0 )); then
-      _quota_map="$(python3 - "$_quota_status" <<'PY'
+  # hk1860 round 3: the status document is read from stdin by this script. It
+  # is never an argv word, since Linux caps one argument at 128 KiB. A parse
+  # failure exits 3 and an exec failure exits with its own rc; both take the
+  # status-failed skip path below.
+  local _quota_map_py='
 import json, sys
 try:
-    doc = json.loads(sys.argv[1])
+    doc = json.load(sys.stdin)
 except ValueError:
-    raise SystemExit(0)
+    raise SystemExit(3)
 if not isinstance(doc, dict):
-    raise SystemExit(0)
+    raise SystemExit(3)
 for row in doc.get("quota_pool_records") or []:
     if (isinstance(row, dict) and isinstance(row.get("job_id"), str) and row["job_id"]
             and isinstance(row.get("pool"), str) and row["pool"]):
         print(row["job_id"] + "\t" + row["pool"])
-PY
-      )"
+'
+  if [[ -n "$_quota_arb" && -x "$_quota_arb" ]]; then
+    _quota_status="$("$_quota_arb" status --json 2>/dev/null)" || _quota_rc=$?
+    if (( _quota_rc == 0 )); then
+      _quota_map="$(printf '%s' "$_quota_status" | python3 -c "$_quota_map_py")" || _quota_rc=$?
     fi
   fi
   _live_jobs="$(awk -F '\t' 'NF >= 2 {print $2}' <<<"$PRUNE_SWEEP")"
