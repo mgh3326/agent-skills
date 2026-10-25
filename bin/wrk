@@ -712,6 +712,10 @@ is the only way to change its thinking effort). Refresh the clone with
 fable does not accept --effort in this scope.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
+
+Environment:
+  WRK_KEEP_FAILED_PANE=1  keep a failed spawn's pane for a manual look (the
+                          pane screen is always saved to <jobdir>/spawn-failure-screen.txt)
 USAGE
 }
 
@@ -2249,9 +2253,43 @@ quota_hub_policy_gate() {
 # panes in w16, krb0-v alone retried into 3 tabs) — invisible to agent-list
 # based sweeps because the agent process is gone. Armed after tab create,
 # disarmed at the success line alongside ARBITER_HELD=0.
+# hk 1895: a failed spawn's screen explains WHY it failed (the 2026-10-24
+# agent_not_ready wave was an "Update available" prompt nobody could see —
+# the pane was closed on every failure). Before closing, capture what the
+# pane still shows into the job directory. The read runs under run_bounded
+# so a herdr that never returns cannot hang a spawn EXIT trap. The screen
+# can carry account, model or path text, so it is written 0600 and never
+# echoed to stdout/stderr. A second failure of the same job writes
+# spawn-failure-screen-2.txt, then -3, never overwriting.
+spawn_capture_failed_pane_screen() {
+  [[ -n "${JOB_ID:-}" && -n "${PANE:-}" ]] || return 0
+  local dir screen n=1
+  dir="$(wrk_jobs_root)/$JOB_ID"
+  mkdir -p "$dir" 2>/dev/null || {
+    warn "failed-pane screen capture skipped: job dir $dir could not be created"
+    return 0
+  }
+  screen="$dir/spawn-failure-screen.txt"
+  while [[ -e "$screen" ]]; do
+    n=$((n + 1))
+    screen="$dir/spawn-failure-screen-$n.txt"
+  done
+  if ( umask 077; run_bounded 5 "$HERDR" pane read "$PANE" --source recent-unwrapped --lines 200 >"$screen" ) 2>/dev/null &&
+    [[ -s "$screen" ]]; then
+    echo "wrk: saved failed pane screen to $screen" >&2
+  else
+    warn "failed-pane screen capture failed for pane $PANE"
+  fi
+}
+
 spawn_pane_cleanup() {
   [[ "${SPAWN_PANE_OPEN:-0}" -eq 1 && -n "${PANE:-}" ]] || return 0
   SPAWN_PANE_OPEN=0
+  spawn_capture_failed_pane_screen
+  if [[ "${WRK_KEEP_FAILED_PANE:-}" == 1 ]]; then
+    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close ${TAB_ID:-its tab}" >&2
+    return 0
+  fi
   "$HERDR" pane close "$PANE" >/dev/null 2>&1     && echo "wrk: closed leftover pane $PANE after spawn failure" >&2     || echo "wrk: failed to close leftover pane $PANE — close it manually" >&2
 }
 

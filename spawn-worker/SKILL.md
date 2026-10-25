@@ -1099,6 +1099,8 @@ herdr pane list → 해당 workspace pane 전수
   ② terminal_title 이 셸 프롬프트(mgh3326@…)          → 죽은 탭. 닫는다
   ③ 그 외 (판별 불가)                                 → 화면을 읽고 판단
 ```
+- 스폰이 실패하면 job 디렉토리(`jobs/<id>/spawn-failure-screen.txt`)에 실패 pane 의
+  화면 캡처가 남고, `WRK_KEEP_FAILED_PANE=1` 이면 수동 확인용으로 pane 자체도 닫지 않고 남는다.
 - ②를 닫아도 잃는 것은 종료된 에이전트의 스크롤백뿐이다 — 산출물 정본은
   `jobs/<id>/` 파일이다(§6-2 조건 2 가 이래서 선행한다).
 - worktree 는 pane 과 별개다 — pane 을 닫아도 worktree 는 남는다(정리는 별도 판단).
