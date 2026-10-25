@@ -7114,6 +7114,100 @@ for shell_err_pair in "start-not-ready:1:agent_not_ready" "start-pane-unavailabl
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "$shell_err_scenario delivered a brief"; fi
 done
 
+# hk 1895: a failed spawn saves the pane's screen into the job dir (mode 0600,
+# never echoed to stdout/stderr), still closes the pane and keeps rc=1.
+T1895_JOBDIR="$TMP/inbox/fixture"
+T1895_SCREEN="$T1895_JOBDIR/spawn-failure-screen.txt"
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_out="$(umask 002; TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_rc=$?
+set -e
+[[ "$t1895_rc" -eq 1 ]] || fail "1895 screen case expected rc=1, got $t1895_rc: $t1895_out"
+[[ -f "$T1895_SCREEN" ]] ||
+  fail "1895 failed spawn left no spawn-failure-screen.txt: $t1895_out"
+grep -q 'fixture welcome screen' "$T1895_SCREEN" ||
+  fail "1895 screen file lost the fixture screen text"
+grep -q 'ACTUAL SCREEN LAST LINE' "$T1895_SCREEN" ||
+  fail "1895 screen file lost the screen tail"
+[[ "$(stat -c %a "$T1895_SCREEN" 2>/dev/null || stat -f %Lp "$T1895_SCREEN")" == 600 ]] ||
+  fail "1895 screen file must be mode 0600 under a loose umask"
+grep -q "wrk: saved failed pane screen to $T1895_SCREEN" <<<"$t1895_out" ||
+  fail "1895 lost the saved-screen line: $t1895_out"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "1895 must still close the failed pane"
+if grep -q 'fixture welcome screen\|ACTUAL SCREEN LAST LINE' <<<"$t1895_out"; then
+  fail "1895 leaked the pane screen to stdout/stderr"
+fi
+
+# WRK_KEEP_FAILED_PANE=1 captures the same file but leaves the pane up.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_keep_out="$(WRK_KEEP_FAILED_PANE=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_keep_rc=$?
+set -e
+[[ "$t1895_keep_rc" -eq 1 ]] ||
+  fail "1895 keep case expected rc=1, got $t1895_keep_rc: $t1895_keep_out"
+[[ -f "$T1895_SCREEN" ]] ||
+  fail "1895 keep case left no spawn-failure-screen.txt: $t1895_keep_out"
+if grep -q '^pane close ' "$TMP/herdr.log"; then
+  fail "WRK_KEEP_FAILED_PANE=1 still closed the pane"
+fi
+grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close w:t1' <<<"$t1895_keep_out" ||
+  fail "1895 keep case lost the kept-pane line: $t1895_keep_out"
+
+# Any other value behaves as unset: the pane is closed.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_yes_out="$(WRK_KEEP_FAILED_PANE=yes TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_yes_rc=$?
+set -e
+[[ "$t1895_yes_rc" -eq 1 ]] || fail "1895 keep=yes case expected rc=1, got $t1895_yes_rc"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+  fail "WRK_KEEP_FAILED_PANE=yes must behave as unset and close the pane"
+if grep -q 'kept failed pane' <<<"$t1895_yes_out"; then
+  fail "WRK_KEEP_FAILED_PANE=yes must not print the kept-pane line"
+fi
+
+# A pane read that fails is best-effort: rc and the close are unchanged and at
+# most one warn line is printed; the saved-screen line is absent.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_readfail_out="$(WRK_FIXTURE_PANE_READ200_FAIL=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_readfail_rc=$?
+set -e
+[[ "$t1895_readfail_rc" -eq 1 ]] ||
+  fail "1895 read-fail case expected rc=1, got $t1895_readfail_rc: $t1895_readfail_out"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+  fail "1895 read-fail case must still close the pane"
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -le 1 ]] ||
+  fail "1895 read-fail case printed more than one warn line: $t1895_readfail_out"
+if grep -q 'saved failed pane screen' <<<"$t1895_readfail_out"; then
+  fail "1895 read-fail case must not claim a saved screen"
+fi
+
+# Two failures of the same job id keep both files, the first untouched.
+T1895_DUP_JOBDIR="$TMP/inbox/t1895-dup"
+rm -rf "$T1895_DUP_JOBDIR"
+for t1895_n in 1 2; do
+  : >"$TMP/herdr.log"
+  set +e
+  TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus --job t1895-dup >/dev/null 2>&1
+  t1895_dup_rc=$?
+  set -e
+  [[ "$t1895_dup_rc" -eq 1 ]] || fail "1895 dup failure $t1895_n expected rc=1, got $t1895_dup_rc"
+done
+[[ -f "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" &&
+   -f "$T1895_DUP_JOBDIR/spawn-failure-screen-2.txt" ]] ||
+  fail "1895 second failure must write spawn-failure-screen-2.txt"
+grep -q 'fixture welcome screen' "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" ||
+  fail "1895 first screen file was overwritten"
+echo "PASS hk1895 failed-pane screen capture and WRK_KEEP_FAILED_PANE"
+
+
 # #609: an accepted `agent start` whose binary never reaches the pane
 # foreground — the m1b shape, zsh answered "command not found: codex" — must
 # not receive a brief. Before any injection wrk polls process-info until a
