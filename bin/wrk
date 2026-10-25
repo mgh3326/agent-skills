@@ -2270,6 +2270,23 @@ quota_hub_policy_gate() {
 # can carry account, model or path text, so it is written 0600 and never
 # echoed to stdout/stderr. A second failure of the same job writes
 # spawn-failure-screen-2.txt, then -3, never overwriting.
+# hk 2011 test seam: only a WRK_TEST_MODE=1 run that sets WRK_TEST_PAUSE_AT=
+# capture-name and WRK_TEST_PAUSE_DIR reaches it. The first capture that picks
+# a file name parks until $WRK_TEST_PAUSE_DIR/release exists (or 30 s pass), so
+# a test can start a second capture inside the name-pick window. Production
+# never sets WRK_TEST_MODE, so the check below is the whole cost.
+capture_test_pause() {
+  [[ "${WRK_TEST_MODE:-}" == 1 && "${WRK_TEST_PAUSE_AT:-}" == capture-name &&
+     -n "${WRK_TEST_PAUSE_DIR:-}" ]] || return 0
+  local waited=0
+  mkdir "$WRK_TEST_PAUSE_DIR/paused.lock" 2>/dev/null || return 0
+  : >"$WRK_TEST_PAUSE_DIR/paused"
+  while [[ ! -e "$WRK_TEST_PAUSE_DIR/release" && "$waited" -lt 300 ]]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+}
+
 spawn_capture_failed_pane_screen() {
   [[ -n "${JOB_ID:-}" && -n "${PANE:-}" ]] || return 0
   local dir screen n=1
@@ -2283,6 +2300,7 @@ spawn_capture_failed_pane_screen() {
     n=$((n + 1))
     screen="$dir/spawn-failure-screen-$n.txt"
   done
+  capture_test_pause
   if ( umask 077; run_bounded 5 "$HERDR" pane read "$PANE" --source recent-unwrapped --lines 200 >"$screen" ) 2>/dev/null &&
     [[ -s "$screen" ]]; then
     echo "wrk: saved failed pane screen to $screen" >&2
