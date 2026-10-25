@@ -140,12 +140,13 @@ Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|p
             [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
   wrk done JOB [--report PATH]
   wrk escalate JOB --question TEXT [--report PATH]
-  wrk joined JOB --pr URL --head SHA --report PATH
+  wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
   wrk round open JOB --head SHA [--extend REF] [--repo PATH]
   wrk round verdict JOB --file PATH
   wrk round void JOB N --by REF [--reason TEXT]
   wrk round status JOB
-  wrk reap [--lane LANE] [--grace 10m] [--apply] [--include-builders|--include-captains]
+  wrk round audit [--lane LANE]
+  wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
   wrk find <name-or-label> [--pane-only]
@@ -176,6 +177,9 @@ Options:
                      unique and the original file is untouched.
                      If the emit returns non-zero the OK line ends with
                      relay=file-only.
+                     A builder or captain done still completes, and warns once
+                     when wrk joined would refuse for zero non-voided rounds
+                     or an unmatched tester verdict file.
   -h, --help         show this usage
 USAGE
 }
@@ -190,6 +194,31 @@ Options:
   --question TEXT    required escalation question
   --report PATH      optional existing report to attach and upload as a document
   -h, --help         show this usage
+USAGE
+}
+
+joined_help() {
+  cat <<'USAGE'
+Usage: wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
+
+Record job.joined for a builder job. The join is refused when the job has
+zero non-voided recorded rounds, or when the job directory holds a regular
+file whose first line is a VERDICT line and no job.verdict matches that
+file by path or content sha256. A later line does not count. Both
+refusals are waived only by --rounds-waived REF, where REF is hk:doc/<key>
+or hk:task/<digits>. REF is fetched from handoffkeep and must hold the line
+  join-waiver: job=<job> by=<issuer>
+for this job, one exact line with single spaces and nothing after it. The
+issuer must be the parent lane or an operator and must equal the created_by of
+the doc or the author of the task comment that holds the line. A pa-integrator
+grant also needs the job's server task to be project ParkingArcade with
+refs.job_id equal to the job. The ref and the issuer are stored on the
+job.joined record as rounds_waived and rounds_waived_issuer. An end
+declaration newer than the newest revive is refused and cannot be waived.
+The end record and the rounds are rechecked under the events lock just before
+wrk writes job.joined; a verified waiver's claim facts (parent lane, task id
+and the newest claim/reclaim event) are rechecked there too, and a delegated
+join is checked just before the hand-off only.
 USAGE
 }
 
@@ -269,7 +298,11 @@ Options:
   --lane-defer NAME  internal to the remote --host builder path: the
                      delegated wrk records lane+machine in its job.spawned
                      receipt without calling panewire, and the initiating
-                     host performs the `lanes add`. Builder-only — a worker
+                     host performs the `lanes add` — unless the execution
+                     host's own lanes_token_env names NAME in its
+                     HUB_MACHINE_ID, in which case the delegated wrk
+                     registers the lane itself and the initiator's add is
+                     skipped. Builder-only — a worker
                      given the flag is refused, because its lane must stay
                      on its own session_machine_ids contract. NAME is the
                      hosts.toml key of the target host (its hub machine id)
@@ -309,6 +342,10 @@ Options:
                      why. Never a silent skip: a reachable hk that refuses
                      the claim still fails the spawn.
   --report PATH      report acceptance-criterion path watched by the completion sentinel
+                     When the watch window (WRK_COMPLETION_TIMEOUT_S) expires with
+                     the agent still present, the sentinel logs action=watch-expired
+                     and exits; the job stays live, no job.lost, no quota release.
+                     A report first seen after the deadline gets one confirmation poll (action=pending late=1).
   --keep             protection marker: record "keep": true on the job.spawned
                      receipt so no session cleanup ever closes this pane — use it
                      for resident, director, installer and consult sessions.
@@ -502,15 +539,20 @@ role the lane registered under: builder, or worker for worker, tester,
 reviewer and counsel seats), and `wrk reap --apply` removes the lane with
 `panewire lanes rm`, resolving the credential chain from that lane_role,
 only when `lanes ls` still shows the same machine and pane. For a remote --host NAME BUILDER
-spawn the ssh-delegated wrk on the target cannot reach the hub — PUT
-/v1/lanes wants the operator credential, which stays on the initiating
-host (per-host machine-scoped tokens are the step-4 follow-up) — so the
+spawn the ssh-delegated wrk on the target usually cannot reach the hub —
+PUT /v1/lanes wants the operator credential, which stays on the
+initiating host — so the
 delegation passes --lane-defer NAME and the remote wrk only RECORDS
 lane+machine in its receipt; the initiating host performs `lanes add`
 itself whenever the remote printed an OK pane= line and answered a
 pane-remains-valid rc (0, or 76 landing-unconfirmed — the pane exists, so
 the lane must exist), with machine = the hosts.toml key it reached the
-target by (the key IS the target's hub machine id). Any other remote
+target by (the key IS the target's hub machine id). The exception (hk
+1446): when the execution host's own lanes_token_env file carries
+HUB_MACHINE_ID equal to NAME, the delegated wrk registers the lane itself
+with that node token and marks its OK line lane_registered=self; the
+initiator reads the marker off the OK pane= line only, skips its own add,
+and keeps lane=NAME@HOST. Any other remote
 answer — or a skipped or failed add — rewrites the line's field to
 lane=UNREGISTERED; a remote lane=L@M is never passed through without a
 confirmed add. A remote worker gets no flag and no initiator-side add —
@@ -518,7 +560,7 @@ the execution host runs the ordinary worker lookup against its own
 session_machine_ids. The receipt lives with the job on the execution host
 — the only place `wrk reap` can verify the pane — and reap there removes
 the lane through the same machine+pane check, provided that host holds a
-lanes credential (known gap until the step-4 machine-scoped token);
+lanes credential;
 `lanes rm` being a hub call, any operator-credentialed host can also
 remove the row.
 
@@ -679,6 +721,10 @@ is the only way to change its thinking effort). Refresh the clone with
 fable does not accept --effort in this scope.
 Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
+
+Environment:
+  WRK_KEEP_FAILED_PANE=1  keep a failed spawn's pane for a manual look (the
+                          pane screen is always saved to <jobdir>/spawn-failure-screen.txt)
 USAGE
 }
 
@@ -1917,6 +1963,10 @@ with os.fdopen(lock_fd, "a+b") as lock_handle:
                 skip("timed out waiting for lock", parser_name)
             time.sleep(0.05)
     try:
+        # Replacing a leaf symlink would destroy the link instead of updating
+        # its target. Directory symlinks in CODEX_HOME remain supported.
+        if os.path.islink(config_path):
+            skip("symlinked-config", parser_name)
         raw = None
         try:
             with open(config_path, "rb") as handle:
@@ -1936,9 +1986,10 @@ with os.fdopen(lock_fd, "a+b") as lock_handle:
 
         header = ('[projects."%s"]' % cwd).encode("ascii")
         if parser is None:
-            if raw is not None and header in raw.splitlines():
-                log("exists", "", parser_name)
-                raise SystemExit(0)
+            # Without a parser, any mention is enough to avoid risking a
+            # duplicate table (including alternate quoting and spacing).
+            if raw is not None and cwd.encode("ascii") in raw:
+                skip("unparsed-mention", parser_name)
         elif raw is not None:
             existing = parse_toml(raw, config_path, parser_name)
             projects = existing.get("projects") if isinstance(existing, dict) else None
@@ -2211,9 +2262,43 @@ quota_hub_policy_gate() {
 # panes in w16, krb0-v alone retried into 3 tabs) — invisible to agent-list
 # based sweeps because the agent process is gone. Armed after tab create,
 # disarmed at the success line alongside ARBITER_HELD=0.
+# hk 1895: a failed spawn's screen explains WHY it failed (the 2026-10-24
+# agent_not_ready wave was an "Update available" prompt nobody could see —
+# the pane was closed on every failure). Before closing, capture what the
+# pane still shows into the job directory. The read runs under run_bounded
+# so a herdr that never returns cannot hang a spawn EXIT trap. The screen
+# can carry account, model or path text, so it is written 0600 and never
+# echoed to stdout/stderr. A second failure of the same job writes
+# spawn-failure-screen-2.txt, then -3, never overwriting.
+spawn_capture_failed_pane_screen() {
+  [[ -n "${JOB_ID:-}" && -n "${PANE:-}" ]] || return 0
+  local dir screen n=1
+  dir="$(wrk_jobs_root)/$JOB_ID"
+  mkdir -p "$dir" 2>/dev/null || {
+    warn "failed-pane screen capture skipped: job dir $dir could not be created"
+    return 0
+  }
+  screen="$dir/spawn-failure-screen.txt"
+  while [[ -e "$screen" ]]; do
+    n=$((n + 1))
+    screen="$dir/spawn-failure-screen-$n.txt"
+  done
+  if ( umask 077; run_bounded 5 "$HERDR" pane read "$PANE" --source recent-unwrapped --lines 200 >"$screen" ) 2>/dev/null &&
+    [[ -s "$screen" ]]; then
+    echo "wrk: saved failed pane screen to $screen" >&2
+  else
+    warn "failed-pane screen capture failed for pane $PANE"
+  fi
+}
+
 spawn_pane_cleanup() {
   [[ "${SPAWN_PANE_OPEN:-0}" -eq 1 && -n "${PANE:-}" ]] || return 0
   SPAWN_PANE_OPEN=0
+  spawn_capture_failed_pane_screen
+  if [[ "${WRK_KEEP_FAILED_PANE:-}" == 1 ]]; then
+    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close ${TAB_ID:-its tab}" >&2
+    return 0
+  fi
   "$HERDR" pane close "$PANE" >/dev/null 2>&1     && echo "wrk: closed leftover pane $PANE after spawn failure" >&2     || echo "wrk: failed to close leftover pane $PANE — close it manually" >&2
 }
 
@@ -3090,7 +3175,8 @@ arbiter_record_spawn_receipt() {
   # answers nonzero on receipt failure instead: the remote leg's rc stops the
   # initiator's add (and a 2 sits in the remote stop set, so the auto round
   # ends rather than re-placing the job). The still-armed pane trap closes the
-  # pane; an untracked lane is never left behind.
+  # pane; a self-registered deferred lane is removed through its machine+pane
+  # guard first. An initiator-owned deferred row is never removed here.
   [[ "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] || return 0
   local payload receipt_rc lane_role
   # #1438: the role the lane was registered under — the same normalization
@@ -3136,6 +3222,7 @@ PY
 )"; then
     if [[ -n "${LANE_DEFER:-}" ]]; then
       warn "arbiter job.spawned receipt preparation failed under --lane-defer; the deferred lane would be untrackable — failing the spawn so the initiator registers nothing: job_id=$JOB_ID pane_id=$PANE"
+      hub_lane_orphan_remove
       return 2
     fi
     warn "arbiter job.spawned receipt preparation failed; spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
@@ -3149,6 +3236,7 @@ PY
   if [[ "$receipt_rc" -ne 0 ]]; then
     if [[ -n "${LANE_DEFER:-}" ]]; then
       warn "arbiter job.spawned receipt failed under --lane-defer (exit $receipt_rc); the deferred lane would be untrackable — failing the spawn so the initiator registers nothing: job_id=$JOB_ID pane_id=$PANE"
+      hub_lane_orphan_remove
       return 2
     fi
     warn "arbiter job.spawned receipt failed (exit $receipt_rc); spawn remains successful: job_id=$JOB_ID pane_id=$PANE"
@@ -3159,17 +3247,19 @@ PY
 # #994/S1: a lane whose job.spawned receipt was never written is a row
 # `wrk reap` can never attribute to a job — it would sit on the daemon
 # forever. Deregister it while the machine and pane are still in hand (same
-# credentials, same warn-only contract); the spawn still succeeds, and a
-# failed removal is left for `panewire lanes-audit`.
+# credentials and machine+pane guard). An ordinary spawn remains successful
+# on receipt failure; a deferred self-add is compensated before its required
+# rc 2, with removal failure left for `panewire lanes-audit`.
 hub_lane_orphan_remove() {
   [[ -n "${HUB_LANE:-}" ]] || return 0
-  # #1397/(a): under --lane-defer this host never added the row — the ssh
-  # initiator did. A receipt failure here must not reach for `lanes rm`
-  # (the row may not even exist yet); the initiator's lanes-missing audit
-  # and lanes-audit own cleanup instead.
-  [[ -z "${LANE_DEFER:-}" ]] || return 0
+  # #1397/(a): under --lane-defer the initiator owns the deferred row. Only
+  # remove a deferred lane when this execution host set HUB_LANE_SELF after
+  # its own lanes-token add; otherwise the row may belong to the initiator.
+  if [[ -n "${LANE_DEFER:-}" ]]; then
+    [[ "${HUB_LANE_SELF:-0}" -eq 1 ]] || return 0
+  fi
   local lane="$HUB_LANE" machine="$HUB_LANE_MACHINE"
-  HUB_LANE="" HUB_LANE_MACHINE=""
+  HUB_LANE="" HUB_LANE_MACHINE="" HUB_LANE_SELF=""
   warn "hub lane '$lane' was registered but the job.spawned receipt was not written — deregistering it"
   hub_lane_remove "$lane" "$machine" "$PANE" "${ROLE:-worker}"
 }
@@ -3599,7 +3689,7 @@ apply_catalog() {
   if [[ -n "${ROUND_EXT_REF:-}" ]]; then
     launch_args+=(--operator-request "$ROUND_EXT_REF")
   elif [[ -n "${OPERATOR_REQUEST:-}" ]]; then
-    launch_args+=(--operator-request)
+    launch_args+=(--operator-request "$OPERATOR_REQUEST")
   fi
   # task #527 + #593: the declared purpose reaches the catalog too, not only the
   # quota gate. A bare `-m codex-astra` is the architect counsel path (PURPOSE is
@@ -4479,6 +4569,123 @@ def wrk_event_commit(events, kind, record, attempts=100):
     finally:
         if _os.path.exists(temporary):
             _os.unlink(temporary)
+
+
+def wrk_end_declaration(events):
+    """Filename of the newest end declaration when it is later than the newest revive.
+
+    End kinds are job.revoked, job.reaped and job.handed_off. Revive kinds are
+    job.claim, job.reclaim and job.spawned. Later means a higher index in
+    wrk_events_ordered. An end with no revive is later.
+    """
+    last_end = ""
+    last_end_at = -1
+    last_revive_at = -1
+    for index, (name, document, _mtime) in enumerate(wrk_events_ordered(events)):
+        if not isinstance(document, dict):
+            continue
+        kind = document.get("kind")
+        if kind in ("job.revoked", "job.reaped", "job.handed_off"):
+            last_end = name
+            last_end_at = index
+        elif kind in ("job.claim", "job.reclaim", "job.spawned"):
+            last_revive_at = index
+    if last_end and last_end_at > last_revive_at:
+        return last_end
+    return ""
+
+
+def wrk_precommit_test_hook(events, job):
+    """Test seam for the joined recheck, never a production path.
+
+    Runs the script named by WRK_TEST_JOINED_PRECOMMIT_HOOK with the events
+    directory and the job id, under the events lock, but only when
+    WRK_TEST_MODE is exactly 1. Otherwise it does nothing.
+    """
+    hook = _os.environ.get("WRK_TEST_JOINED_PRECOMMIT_HOOK", "")
+    if hook and _os.environ.get("WRK_TEST_MODE") == "1":
+        import subprocess
+        subprocess.run([hook, events, job], check=True, stdout=subprocess.DEVNULL)
+
+
+def wrk_joined_claim_change(events, parent, task_id, version):
+    """Newest claim fact that moved since a join waiver was verified.
+
+    Re-reads the newest job.claim/job.reclaim under the events lock and
+    returns "field OLD -> NEW" for the first of parent_lane, task_id and the
+    claim event name that differs from the verified values, else "".
+    """
+    name, document = "", None
+    for cand, doc, _mtime in wrk_events_ordered(events):
+        if isinstance(doc, dict) and doc.get("kind") in ("job.claim", "job.reclaim"):
+            name, document = cand, doc
+    payload = document.get("payload") if isinstance(document, dict) else None
+    if not isinstance(payload, dict):
+        payload = document if isinstance(document, dict) else {}
+    now_parent = payload.get("parent_lane")
+    now_parent = now_parent if isinstance(now_parent, str) else ""
+    now_task = payload.get("task_id")
+    now_task = (str(now_task)
+                if isinstance(now_task, (int, str))
+                and not isinstance(now_task, bool) else "")
+    if now_parent != parent:
+        return "parent_lane %s -> %s" % (parent or "-", now_parent or "-")
+    if now_task != task_id:
+        return "task_id %s -> %s" % (task_id or "-", now_task or "-")
+    if name != version:
+        return "claim_version %s -> %s" % (version or "-", name or "-")
+    return ""
+
+
+def wrk_round_census(events, job):
+    """Return (recorded, nonvoid) round evidence for one job.
+
+    recorded counts every job.round, every unbound job.verdict and inherited
+    takeover rounds; it is the round-cap count. nonvoid is the join gate: a
+    job.round counts only when a job.verdict is bound to its number, plus
+    unbound verdicts and inherited takeover rounds. An open round with no
+    verdict does not count, and neither does a voided one, because a void only
+    takes effect on a round that holds no verdict.
+    """
+    records = [document for _name, document, _mtime in wrk_events_ordered(events)
+               if isinstance(document, dict)]
+    rounds = [record for record in records if record.get("kind") == "job.round"]
+    verdicts = [record for record in records if record.get("kind") == "job.verdict"]
+    bound = set()
+    for verdict in verdicts:
+        number = verdict.get("round")
+        if isinstance(number, int):
+            bound.add(number)
+    unbound = 0
+    for verdict in verdicts:
+        if not isinstance(verdict.get("round"), int):
+            unbound += 1
+    inherited = wrk_takeover_rounds(events)
+    recorded = len(rounds) + unbound + inherited
+    nonvoid = sum(1 for r in rounds if isinstance(r.get("round"), int) and r.get("round") in bound)  # hk1449-nonvoid-rounds
+    nonvoid += unbound + inherited
+    return recorded, nonvoid
+
+
+def wrk_claim_role(events):
+    role = ""
+    for _name, document, _mtime in wrk_events_ordered(events):
+        if not isinstance(document, dict):
+            continue
+        if document.get("kind") not in ("job.claim", "job.reclaim"):
+            continue
+        payload = document.get("payload")
+        if not isinstance(payload, dict):
+            payload = document
+        value = payload.get("role")
+        if isinstance(value, str):
+            role = value
+    return role
+
+import re as _re
+# Shared by round verdict and the join/audit file scan. The sha-boundary
+# mutant replaces this one anchor, so a second copy would miss the parser.
+wrk_verdict_line = _re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})\s*$")
 '
 wrk_py() {
   WRK_EVENTS_PY="$WRK_EVENTS_PY" python3 "$@"
@@ -4783,17 +4990,240 @@ record_emit_failure() {
 }
 
 # Keep this exactly aligned with arbiter.inbox_root(): ARBITER_INBOX_ROOT is
-# the jobs directory, rather than its parent.
+# the jobs directory, rather than its parent. This is the environment-following
+# root of everything outside the trust path (spawn, done, reap, prune, the
+# sentinel); trust-bearing operations use wrk_trust_guard instead.
 wrk_jobs_root() {
   printf '%s\n' "${ARBITER_INBOX_ROOT:-$HOME/work/herdr-inbox/jobs}"
 }
 
+# ── hk 1894: canonical trust paths ───────────────────────────────────────────
+# The round cap, the grant check and the inherited-round read are only as
+# trustworthy as the events inbox and the handoffkeep binary they read, and both
+# used to follow the caller's environment: one variable redirected them (hk 1447
+# r1 N3, r2 S3). A trust-bearing operation (wrk round open/verdict/void/status/
+# audit, wrk joined, round_ext_precheck and its recheck, the takeover round
+# read) calls wrk_trust_guard before its first read. The guard takes the inbox
+# and the grant binary from the passwd home of the current uid, never from HOME,
+# and refuses (rc 2, one stderr line naming the variable and the canonical path)
+# when HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME or HANDOFFKEEP_BIN names anything
+# else; the PATH lookup of handoffkeep is never used. WRK_TEST_MODE=1 (test
+# suites only) honours overrides that resolve under a temp root and prints one
+# warning line. This narrows, it does not bound: the same OS user can still edit
+# files under the real home or set WRK_TEST_MODE with temp paths.
+# The block between the markers is byte-identical in bin/arbiter (the shared
+# test tests/test_wrk_trust_paths.py compares them), so one rule stands on both
+# sides. It must hold no single quote: it lives in a single-quoted string.
+WRK_TRUST_PY='
+import os, pwd, shutil, stat, sys
+# --- trust paths: begin (byte-identical in bin/wrk and bin/arbiter; tests/test_wrk_trust_paths.py compares them) ---
+# hk 1894: where one trust-bearing operation may read its events inbox and its
+# grant evidence. Needs os, shutil and stat from the host module. The canonical
+# home is an argument (the passwd home of the uid, never HOME), so the unit tests
+# decide without touching the real one.
+TRUST_SYSTEM_TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/folders")
+
+
+class TrustRefusal(Exception):
+    def __init__(self, var, canonical, detail):
+        Exception.__init__(self, "%s; canonical path: %s" % (detail, canonical))
+        self.var = var
+        self.canonical = canonical
+        self.detail = detail
+
+
+def trust_value(env, name):
+    value = env.get(name)
+    return value if isinstance(value, str) and value else ""
+
+
+def trust_under(path, root):
+    return path == root or path.startswith(root.rstrip("/") + "/")
+
+
+def trust_canonical(home):
+    return {
+        "inbox": os.path.join(home, "work", "herdr-inbox", "jobs"),
+        "db": os.path.join(home, ".local", "share", "arbiter", "state.db"),
+        "hk": os.path.join(home, ".local", "bin", "handoffkeep"),
+    }
+
+
+def trust_homes(home):
+    # The passwd home as spelled and through realpath: a symlinked home reaches
+    # the same places under both names.
+    forms = [home] if home else []
+    if home and os.path.realpath(home) != home:
+        forms.append(os.path.realpath(home))
+    return forms
+
+
+def trust_temp_roots(env, home):
+    roots = []
+    tmpdir = trust_value(env, "TMPDIR")
+    if tmpdir:
+        resolved = os.path.realpath(tmpdir)
+        # TMPDIR naming the filesystem root, the home or a parent of it would
+        # make every path a temp path.
+        if resolved != "/" and not any(trust_under(form, resolved) for form in trust_homes(home)):
+            roots.append(resolved)
+    for fixed in TRUST_SYSTEM_TEMP_ROOTS:
+        for form in (fixed, os.path.realpath(fixed)):
+            if form not in roots:
+                roots.append(form)
+    return roots
+
+
+def trust_secure_binary(canonical, uid):
+    resolved = os.path.realpath(canonical)
+    try:
+        info = os.stat(resolved)
+    except OSError as exc:
+        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep is unusable (%s): %s" % (resolved, exc.strerror or exc))
+    if not stat.S_ISREG(info.st_mode):
+        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is not a regular file" % resolved)
+    if info.st_uid != uid:
+        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is owned by uid %d, not uid %d" % (resolved, info.st_uid, uid))
+    if info.st_mode & 0o022:
+        raise TrustRefusal("handoffkeep", canonical, "the canonical handoffkeep %s is group- or world-writable (mode %04o)" % (resolved, info.st_mode & 0o7777))
+    return resolved
+
+
+def trust_resolve(env, home, uid, test_mode, need_hk, fixtures=""):
+    """Return {"inbox", "db", "hk", "overrides"} or raise TrustRefusal.
+
+    Outside test mode each lever (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME,
+    HANDOFFKEEP_BIN) must resolve to its canonical path under home, and the PATH
+    lookup of handoffkeep is never used: the canonical binary must be a regular
+    file owned by uid and not group- or world-writable. In test mode (a test
+    suite only) no canonical path is consulted or resolved: every path in use
+    must resolve under a temp root, the handoffkeep binary also under fixtures.
+    """
+    home_env = trust_value(env, "HOME")
+    inbox_env = trust_value(env, "ARBITER_INBOX_ROOT")
+    data_env = trust_value(env, "XDG_DATA_HOME")
+    hk_env = trust_value(env, "HANDOFFKEEP_BIN")
+    known = bool(home) and os.path.isabs(home)
+    if not known and not test_mode:
+        raise TrustRefusal("HOME", "(unknown)", "the passwd home of uid %d cannot be determined, so there is no canonical path to compare with" % uid)
+    canon = trust_canonical(home) if known else {"inbox": None, "db": None, "hk": None}
+    roots = trust_temp_roots(env, home if known else "") if test_mode else []
+    hk_roots = list(roots)
+    if test_mode and fixtures:
+        hk_roots.append(os.path.realpath(fixtures))
+    overrides = []
+
+    def judge(var, effective, canonical, label, allowed):
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in effective):
+            raise TrustRefusal(var, canonical, "%s selects a %s path holding a control character" % (var, label))
+        resolved = os.path.realpath(effective)
+        if not test_mode:
+            if resolved == os.path.realpath(canonical):
+                return canonical
+            raise TrustRefusal(var, canonical, "%s selects %s, which is not the canonical %s" % (var, effective, label))
+        if not any(trust_under(resolved, root) for root in allowed):
+            raise TrustRefusal(var, canonical, "%s selects %s, which resolves outside the temp roots (%s)" % (var, effective, " ".join(allowed)))
+        if var not in overrides:
+            overrides.append(var)
+        return effective if os.path.isabs(effective) else resolved
+
+    def under_home(*parts):
+        if home_env:
+            return os.path.join(home_env, *parts)
+        if test_mode:
+            raise TrustRefusal("HOME", canon["inbox"], "HOME is unset, so the default location would be the canonical path, which test mode never uses")
+        return os.path.join(home, *parts)
+
+    if home_env and not test_mode:
+        judge("HOME", home_env, home, "home", ())
+    inbox = judge("ARBITER_INBOX_ROOT" if inbox_env else "HOME",
+                  inbox_env or under_home("work", "herdr-inbox", "jobs"), canon["inbox"], "inbox", roots)
+    db = judge("XDG_DATA_HOME" if data_env else "HOME",
+               os.path.join(data_env or under_home(".local", "share"), "arbiter", "state.db"), canon["db"], "arbiter DB", roots)
+    hk = ""
+    if need_hk:
+        search = env.get("PATH") or os.defpath
+        if test_mode:
+            wanted = hk_env or "handoffkeep"
+            found = wanted if "/" in wanted else (shutil.which(wanted, path=search) or "")
+            if found:
+                hk = judge("HANDOFFKEEP_BIN" if hk_env else "PATH", found, canon["hk"], "handoffkeep", hk_roots)
+        else:
+            if hk_env:
+                found = hk_env if "/" in hk_env else (shutil.which(hk_env, path=search) or hk_env)
+                judge("HANDOFFKEEP_BIN", found, canon["hk"], "handoffkeep", ())
+            hk = trust_secure_binary(canon["hk"], uid)
+    return {"inbox": inbox, "db": db, "hk": hk, "overrides": overrides}
+# --- trust paths: end ---
+
+
+def trust_main(argv):
+    need_hk = len(argv) > 1 and argv[1] == "hk"
+    test_mode = os.environ.get("WRK_TEST_MODE") == "1"
+    try:
+        home = pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        home = ""
+    fixtures = ""
+    if test_mode and len(argv) > 2 and argv[2]:
+        candidate = os.path.join(os.path.dirname(os.path.realpath(argv[2])), "..", "tests", "fixtures")
+        if os.path.isdir(candidate):
+            fixtures = os.path.realpath(candidate)
+    try:
+        decision = trust_resolve(os.environ, home, os.getuid(), test_mode, need_hk, fixtures)
+    except TrustRefusal as exc:
+        sys.stderr.write("wrk: refusing a trust-bearing operation: %s\n" % exc)
+        return 2
+    sys.stdout.write("inbox=%s\nhk=%s\noverrides=%s\n" % (decision["inbox"], decision["hk"], " ".join(decision["overrides"])))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(trust_main(sys.argv))
+'
+
+# Internal guard state. Assigned at load so a value inherited from the caller's
+# environment can neither stand in for the guard (WRK_TRUST_JOBS_ROOT,
+# WRK_TRUST_HK) nor silence the test-mode warning (WRK_TRUST_WARNED).
+WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK="" WRK_TRUST_WARNED=""
+
+# wrk_trust_guard [hk] — sets WRK_TRUST_JOBS_ROOT (and WRK_TRUST_HK when "hk" is
+# passed: the operation will run handoffkeep) or exits 2. Trust-bearing reads use
+# ${WRK_TRUST_JOBS_ROOT:?...} and WRK_TRUST_HK, never wrk_jobs_root or hk_bin, so a
+# forgotten guard fails closed instead of following the environment. Call it from
+# the main shell flow, not from inside a command substitution (the exit would only
+# leave the subshell).
+wrk_trust_guard() {
+  local out line
+  WRK_TRUST_JOBS_ROOT="" WRK_TRUST_HK=""
+  out="$(python3 -c "$WRK_TRUST_PY" "${1:-}" "${BASH_SOURCE[0]}")" || exit 2
+  while IFS= read -r line; do
+    case "$line" in
+      inbox=*) WRK_TRUST_JOBS_ROOT="${line#inbox=}" ;;
+      hk=*) WRK_TRUST_HK="${line#hk=}" ;;
+      overrides=?*)
+        if [[ -z "${WRK_TRUST_WARNED:-}" ]]; then
+          WRK_TRUST_WARNED=1
+          warn "test mode honours overridden ${line#overrides=}; the canonical paths are not used"
+        fi ;;
+    esac
+  done <<<"$out"
+  [[ -n "$WRK_TRUST_JOBS_ROOT" ]] || exit 2
+}
+
 completion_metadata() {
-  local job="$1"
-  wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
+  local job="$1" root
+  # "trusted" (round open/verdict/void and joined, after wrk_trust_guard) reads the
+  # guarded root; done and escalate keep following the environment.
+  if [[ "${2:-}" == trusted ]]; then
+    root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  else
+    root="$(wrk_jobs_root)"
+  fi
+  wrk_py - "$root/$job/events" <<'PY'
 import json, os, sys
 exec(os.environ["WRK_EVENTS_PY"])
-owner=label=pane=parent=role=''
+owner=label=pane=parent=role=spawn_pane=''
 for name, o, _ in wrk_events_ordered(sys.argv[1]):
     if o is None: continue
     p=o.get('payload',o)
@@ -4806,6 +5236,13 @@ for name, o, _ in wrk_events_ordered(sys.argv[1]):
         parent=p.get('parent_lane') if isinstance(p.get('parent_lane'), str) else ''
         role=p.get('role') if isinstance(p.get('role'), str) else ''
     pane=p.get('pane_id') if isinstance(p.get('pane_id'), str) else pane
+    # hk1860: the newest job.spawned names this job's pane. A later stale
+    # watcher's job.lost names an older pane, so it must not win. Any pane_id
+    # stays the fallback for a stream with no usable spawn receipt.
+    if o.get('kind') == 'job.spawned':
+        candidate=p.get('pane_id')
+        spawn_pane=candidate if isinstance(candidate, str) and candidate else ''
+pane=spawn_pane or pane
 if owner and label and pane: print(owner, label, pane, parent, role, sep='\t')
 else: raise SystemExit(1)
 PY
@@ -4904,6 +5341,184 @@ delegate_job_cmd() {
   exit "$rc"
 }
 
+# hk 1449: the filename of an end declaration that is later than the newest
+# revive, or empty when the job is still open. End kinds are job.revoked,
+# job.reaped and job.handed_off. Revive kinds are job.claim, job.reclaim and
+# job.spawned. Order is wrk_events_ordered.
+# hk 1894: ROOT is the checked inbox root. Trust-bearing callers (wrk joined,
+# round open, void, verdict) pass ${WRK_TRUST_JOBS_ROOT:?}; with no ROOT the
+# environment-following wrk_jobs_root is used, as before.
+wrk_newer_end_record() {
+  local job="$1" root="${2:-}"
+  [[ -n "$root" ]] || root="$(wrk_jobs_root)"
+  wrk_py - "$root/$job/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+print(wrk_end_declaration(sys.argv[1]))
+PY
+}
+
+wrk_refuse_ended() {
+  local what="$1" job="$2" root="${3:-}" end
+  end="$(wrk_newer_end_record "$job" "$root")"
+  [[ -z "$end" ]] || die "$what: refused after end record $end"
+}
+
+# Print zero-nonvoid-rounds, then unmatched<TAB>abspath lines. A tester
+# verdict file is a regular file directly in the job directory whose first
+# line is a round-verdict VERDICT line. A later line does not count.
+# Symlinks and subdirectories are ignored.
+# A job.verdict matches by absolute path or by content sha256.
+wrk_join_blocks() {
+  local job="$1" root="${2:-}"
+  [[ -n "$root" ]] || root="$(wrk_jobs_root)"
+  wrk_py - "$root/$job/events" "$root/$job" "$job" <<'PY'
+import hashlib, os, stat, sys
+exec(os.environ["WRK_EVENTS_PY"])
+events, job_dir, job = sys.argv[1:]
+_recorded, nonvoid = wrk_round_census(events, job)
+if nonvoid <= 0:
+    print("zero-nonvoid-rounds")
+paths = set()
+digests = set()
+for _name, document, _mtime in wrk_events_ordered(events):
+    if not isinstance(document, dict) or document.get("kind") != "job.verdict":
+        continue
+    recorded_path = document.get("path")
+    if isinstance(recorded_path, str) and recorded_path:
+        paths.add(os.path.abspath(recorded_path))
+    recorded_digest = document.get("content_sha256")
+    if isinstance(recorded_digest, str) and recorded_digest:
+        digests.add(recorded_digest)
+try:
+    names = sorted(os.listdir(job_dir))
+except OSError:
+    names = []
+for name in names:
+    path = os.path.join(job_dir, name)
+    try:
+        info = os.lstat(path)
+    except OSError:
+        continue
+    if not stat.S_ISREG(info.st_mode):
+        continue
+    try:
+        data = open(path, "rb").read()
+    except OSError:
+        continue
+    text = data.decode("utf-8", errors="replace")  # hk1900-utf8-replace
+    lines = text.splitlines()
+    if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line
+        continue
+    digest = hashlib.sha256(data).hexdigest()
+    absolute = os.path.abspath(path)
+    if absolute in paths or digest in digests:
+        continue
+    print("unmatched\t" + absolute)
+PY
+}
+
+wrk_joined_refuse_blocks() {
+  local job="$1" root="${2:-}" blocks line tag rest zero=0
+  local -a files=()
+  blocks="$(wrk_join_blocks "$job" "$root")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    tag="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    if [[ "$tag" == zero-nonvoid-rounds ]]; then
+      zero=1
+    elif [[ "$tag" == unmatched ]]; then
+      files+=("$rest")
+    fi
+  done <<<"$blocks"
+  [[ "$zero" -eq 0 && ${#files[@]} -eq 0 ]] && return 0
+  local msg="" file
+  if [[ "$zero" -eq 1 ]]; then
+    msg="job $job has zero non-voided recorded rounds"
+  fi
+  # bash 3.2 with set -u rejects "${files[@]}" when the array is empty.
+  for file in ${files[@]+"${files[@]}"}; do
+    if [[ -n "$msg" ]]; then
+      msg="$msg; unmatched tester verdict file $file"
+    else
+      msg="unmatched tester verdict file $file"
+    fi
+  done
+  die "joined: $msg"
+}
+
+# One loud warning, once per done invocation, for a builder or captain whose
+# wrk joined would refuse. Worker done stays silent. The command still succeeds.
+wrk_builder_rounds_warning() {
+  local job="$1" role="$2"
+  case "$role" in
+    builder|captain) ;;
+    *) return 0 ;;
+  esac
+  local blocks line tag rest zero=0
+  local -a files=()
+  blocks="$(wrk_join_blocks "$job")"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    tag="${line%%$'\t'*}"
+    rest="${line#*$'\t'}"
+    if [[ "$tag" == zero-nonvoid-rounds ]]; then
+      zero=1
+    elif [[ "$tag" == unmatched ]]; then
+      files+=("$rest")
+    fi
+  done <<<"$blocks"
+  [[ "$zero" -eq 0 && ${#files[@]} -eq 0 ]] && return 0
+  local msg="ROUNDS job=$job" file
+  if [[ "$zero" -eq 1 ]]; then
+    msg="$msg has zero non-voided recorded rounds"
+  fi
+  # Same bash 3.2 empty-array constraint as wrk_joined_refuse_blocks.
+  for file in ${files[@]+"${files[@]}"}; do
+    if [[ "$zero" -eq 1 || "$msg" == *"unmatched tester verdict file"* ]]; then
+      msg="$msg; unmatched tester verdict file $file"
+    else
+      msg="$msg unmatched tester verdict file $file"
+    fi
+  done
+  warn "$msg; wrk joined would refuse"
+}
+
+wrk_recorded_rounds() {
+  local job="$1" root="${2:-}"
+  [[ -n "$root" ]] || root="$(wrk_jobs_root)"
+  wrk_py - "$root/$job/events" "$job" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+events, job = sys.argv[1:]
+recorded, _nonvoid = wrk_round_census(events, job)
+print(recorded)
+PY
+}
+
+wrk_job_role() {
+  local job="$1" root="${2:-}"
+  [[ -n "$root" ]] || root="$(wrk_jobs_root)"
+  wrk_py - "$root/$job/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+print(wrk_claim_role(sys.argv[1]))
+PY
+}
+
+wrk_verdict_refusal() {
+  local tag fname rest
+  IFS=$'\t' read -r tag fname rest <<<"$1"
+  case "$tag" in
+    ENDED) die "round verdict: refused after end record $fname" ;;
+    DUP_PATH) die "round verdict: verdict path already recorded as $fname: $rest" ;;
+    DUP_CONTENT) die "round verdict: verdict content $rest already recorded as $fname" ;;
+    DUP_HEAD) die "round verdict: head $rest already recorded as $fname" ;;
+    *) die "round verdict unexpected outcome: $1" ;;
+  esac
+}
+
 done_cmd() {
   if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
     [[ $# -eq 1 ]] || die "unexpected argument '$2'"
@@ -4919,17 +5534,20 @@ done_cmd() {
       *) die "unknown done option '$1'" ;;
     esac
   done
-  local metadata owner label pane jobs_root
+  local metadata owner label pane role jobs_root
   metadata="$(completion_metadata "$job")" || die "done cannot find job.claim/job.spawned metadata: $job"
   # completion_metadata prints five tab-separated fields; reading into three
   # lets pane_id swallow parent_lane and role ("w1:p1\t\tworker" was recorded
   # on 2026-09-05), which is also what panewire routes on.
-  IFS=$'\t' read -r owner label pane _ <<<"$metadata"
+  IFS=$'\t' read -r owner label pane _ role <<<"$metadata"
   jobs_root="$(wrk_jobs_root)"
   if [[ -z "$report" ]]; then
     report="$(find_latest_report "$jobs_root/$job")"
   fi
   [[ -n "$report" && -f "$report" ]] || die "done requires an existing --report or report*.md in the job directory"
+  # Warn once, before the duplicate branch and before delegation, so both
+  # success paths say it exactly once. A builder done does not refuse.
+  wrk_builder_rounds_warning "$job" "$role"
   # Decide the artifact path before delegating or uploading: a changed report
   # that reuses an earlier round's path is snapshot to <stem>-r<N>.md so its
   # outbox key is fresh. Delegation comes after resolution because
@@ -4977,7 +5595,7 @@ done_cmd() {
 }
 
 builder_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}" waiver_issuer="${13:-}" check_parent="${14:-}" check_task="${15:-}" check_version="${16:-}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
@@ -4987,26 +5605,53 @@ builder_flat_event() {
   else
     last=""
   fi
-  wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" <<'PY'
+  # hk 1900: a refused job.joined prints its reason on stdout and exits 3 (end
+  # record) or 4 (zero non-voided rounds) before it writes anything. Bash 3.2
+  # scans this heredoc for quotes because it sits inside a command substitution.
+  # Do not put an unmatched single quote in this body.
+  local outcome rc=0
+  outcome="$(wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" "$waiver_issuer" "$check_parent" "$check_task" "$check_version" <<'PY'
 import json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head = sys.argv[1:]
-# wrk escalate/joined publish outside the round writers' lock: take the shared
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived, waiver_issuer, check_parent, check_task, check_version = sys.argv[1:]
+# wrk escalate/joined publish outside the round writer lock: take the shared
 # events lock so numbering is serialized with bin/arbiter and wrk done too.
 lock = wrk_events_locked(events)
+if kind == "job.joined":
+    # The pre-check in joined_cmd ran before this lock; recheck under it.
+    wrk_precommit_test_hook(events, job)
+    ended = wrk_end_declaration(events)
+    if ended:  # hk1900-inlock-end
+        print("ENDED\t" + ended)
+        sys.exit(3)
+    if waived:  # hk2024-claim-recheck
+        changed = wrk_joined_claim_change(events, check_parent, check_task, check_version)
+        if changed:
+            print("CLAIM\t" + changed)
+            sys.exit(5)
+    if not waived and wrk_round_census(events, job)[1] <= 0:  # hk1900-inlock-zero
+        print("ZERO")
+        sys.exit(4)
 record = {"kind": kind, "job_id": job, "owner_lane": owner, "label": label,
           "pane_id": pane, "host": host, "report_path": report,
           "report_last_line": last, "reason": reason, "parent_lane": parent, "epoch": 1}
 if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
+if waived: record["rounds_waived"] = waived
+if waiver_issuer: record["rounds_waived_issuer"] = waiver_issuer
 wrk_event_commit(events, kind, record)
 PY
+)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    [[ -z "$outcome" ]] || printf '%s\n' "$outcome"
+    return "$rc"
+  fi
 }
 
 builder_metadata() {
   local job="$1" metadata owner label pane parent role
-  metadata="$(completion_metadata "$job")" || die "cannot find job.claim/job.spawned metadata: $job"
+  metadata="$(completion_metadata "$job" "${2:-}")" || die "cannot find job.claim/job.spawned metadata: $job"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   case "$role" in builder|captain) ;; *) die "$job is not a builder claim with a parent lane (legacy captain alias is accepted)" ;; esac
   [[ -n "$parent" ]] || die "$job is not a builder claim with a parent lane (legacy captain alias is accepted)"
@@ -5047,8 +5692,12 @@ escalate_cmd() {
 }
 
 joined_cmd() {
-  delegate_job_cmd joined "$@"
-  local job="${1:-}" pr="" head="" report="" metadata owner label pane parent role reason
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+    joined_help
+    return 0
+  fi
+  local job="${1:-}" pr="" head="" report="" waived=""
   [[ -n "$job" && "$job" != -* ]] || die "joined requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -5056,28 +5705,96 @@ joined_cmd() {
       --pr) [[ $# -ge 2 && -n "$2" ]] || die "--pr requires a URL"; pr="$2"; shift 2 ;;
       --head) [[ $# -ge 2 && -n "$2" ]] || die "--head requires a SHA"; head="$2"; shift 2 ;;
       --report) [[ $# -ge 2 && -n "$2" ]] || die "--report requires a path"; report="$2"; shift 2 ;;
+      --rounds-waived)
+        [[ $# -ge 2 && -n "$2" ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"
+        waived="$2"; shift 2 ;;
+      -h|--help) die "unexpected argument '$1'" ;;
       *) die "unknown joined option '$1'" ;;
     esac
   done
   [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
-  metadata="$(builder_metadata "$job")"
+  if [[ -n "$waived" ]]; then
+    [[ "$waived" =~ ^hk:doc/[^[:space:]]+$ || "$waived" =~ ^hk:task/[0-9]+$ ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"  # hk1899-waiver-shape
+  fi
+  local metadata owner label pane parent role reason joined_end
+  local waiver_issuer="" waiver_grant tmp_waiver task_id tmp_task
+  local claim_parent="" claim_task="" claim_version=""
+  # hk 1894: the join gate (end record, rounds, verdict files) and the parent
+  # lane are read from the checked inbox, never from the environment. hk 1899:
+  # a waiver is fetched from handoffkeep, so that guard also judges the binary.
+  if [[ -n "$waived" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
+  metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
+  # hk1449-joined-end
+  joined_end="$(wrk_newer_end_record "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"
+  [[ -z "$joined_end" ]] || die "joined: refused after end record $joined_end"
+  # hk 1899: a waiver counts only with a join-waiver grant for this job in a
+  # record fetched from handoffkeep, issued by the parent lane or an operator
+  # and equal to the record's server-set identity. Verified here, before the
+  # refusals are skipped and before the events lock is taken.
+  if [[ -n "$waived" ]]; then
+    # hk 2024: keep the claim facts the waiver is verified against — parent
+    # lane, task_id and the newest claim/reclaim event — so the commit under
+    # the events lock can refuse a job released and reclaimed in between.
+    claim_parent="$parent"  # hk2024-claim-facts
+    claim_task="$(round_job_task_id "$job" || true)"
+    claim_version="$(joined_claim_version "$job")"
+    tmp_waiver="$(mktemp)"
+    if ! round_approval_fetch "$waived" >"$tmp_waiver"; then
+      rm -f "$tmp_waiver"
+      die "joined: waiver record not found in handoffkeep: $waived"
+    fi
+    waiver_grant="$(round_approval_verify "$waived" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_waiver" join-waiver || true)"  # hk1899-waiver-fetch
+    rm -f "$tmp_waiver"
+    [[ -n "$waiver_grant" ]] ||
+      die "joined: $waived has no 'join-waiver: job=$job by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
+    waiver_issuer="${waiver_grant##*issuer=}"
+    if [[ "$waiver_issuer" == "pa-integrator" ]]; then
+      task_id="$claim_task"
+      [[ -n "$task_id" ]] ||
+        die "joined: pa-integrator grants need the job's hk task on the server; $job records no task_id"
+      tmp_task="$(mktemp)"
+      if ! round_pa_task_fetch "$task_id" >"$tmp_task"; then
+        rm -f "$tmp_task"
+        die "joined: pa-integrator grants need the job's hk task on the server; cannot fetch task $task_id"
+      fi
+      if ! round_pa_task_verify "$job" "$tmp_task"; then
+        rm -f "$tmp_task"
+        die "joined: pa-integrator grants count only when the server task for $job is project ParkingArcade with refs.job_id=$job"
+      fi
+      rm -f "$tmp_task"
+    fi
+  fi
+  # A waiver is recorded on wrk's own job.joined, so it must not be forwarded
+  # and must not take the delegated path. Without it, delegate exactly as before.
+  if [[ -z "$waived" ]]; then
+    wrk_joined_refuse_blocks "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+    delegate_job_cmd joined "$job" --pr "$pr" --head "$head" --report "$report"
+  fi
   upload_report_document "$job" "$report"
   # #770 tester BLOCKER 1: when the delegated `panewire job joined` landed the
   # record and then failed, the fallback arrives with job.joined already the
   # newest work-terminal — appending again would duplicate it. Same shape as
   # done's duplicate branch: warn, skip the write+emit, still settle the job.
   local joined_term
-  joined_term="$(job_events_scan "$(wrk_jobs_root)/$job/events" 2>/dev/null | awk -F'\t' '{print $4}')"
+  joined_term="$(job_events_scan "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" 2>/dev/null | awk -F'\t' '{print $4}')"
   if [[ "$joined_term" == "job.joined" ]]; then
     warn "job.joined already recorded for $job; suppressed duplicate"
     job_end_housekeeping "$job" "$owner" joined "wrk joined (duplicate)" "wrk joined" "$pane"
     echo "OK job=$job owner_lane=$owner kind=job.joined pr=$pr head=$head report=$report"
     return 0
   fi
-  builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head"
+  local flat_out flat_rc=0
+  flat_out="$(builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived" "$waiver_issuer" "$claim_parent" "$claim_task" "$claim_version")" || flat_rc=$?
+  case "$flat_rc" in
+    0) ;;
+    3) die "joined: refused after end record ${flat_out#*$'\t'}" ;;
+    4) die "joined: job $job has zero non-voided recorded rounds" ;;
+    5) die "joined: claim changed since the waiver was verified (${flat_out#*$'\t'}); re-run wrk joined" ;;
+    *) exit "$flat_rc" ;;
+  esac
   set_report_last_line "$report"
   emit_relay_event job.joined "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
     "$report" "$EMIT_REPORT_LAST_LINE" "$reason" "" "$pr" "$head"
@@ -5115,7 +5832,7 @@ ROUND_CAP_REASON="tester round cap reached"
 
 round_help() {
   cat <<'USAGE'
-Usage: wrk round <open|verdict|void|status> JOB [options]
+Usage: wrk round <open|verdict|void|status|audit> [JOB] [options]
 
 Formal tester-round bookkeeping for a builder job (#758). A formal round is
 one tester verdict recorded for one head. The count is taken only from the
@@ -5152,18 +5869,37 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       job.claim/job.reclaim repo, worktree or cwd field. If none is usable,
       pass --repo PATH. A missing commit triggers one bounded fetch of origin.
   wrk round verdict JOB --file PATH
-      Record the tester's verdict file for the oldest open round that has
-      none. PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
-      A verdict that binds to no open round still counts as a round, so
-      verdict files written elsewhere or recorded without an open cannot
-      dodge the cap.
+      Record the tester's verdict file. It binds to the oldest open round on its own head and is refused when there is none.
+      PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
+      The record stores that file's content sha256 beside its path. A later
+      verdict is refused when the path, those exact bytes, or that head was
+      already recorded for this job. A repeated head is allowed only when
+      the round that held the earlier verdict was voided.
   wrk round status JOB
       Print one line: job=… rounds=N cap=N open=… last_verdict=… and any
       voided rounds as 'round N void (hk:doc/…)' or 'round N void (hk:task/…)'.
+  wrk round audit [--lane LANE]
+      Read-only. Print one line per builder job that is not ended and has
+      zero recorded rounds, and one line per job directory that holds a
+      tester verdict file with no matching job.verdict. --lane keeps only
+      that owner lane. Writes nothing.
   wrk round void JOB N --by REF [--reason TEXT]
       Void an existing round without a verdict, using a matching round-void
       grant in hk:doc/<key> or hk:task/<id>. The grant line is the default
       reason; --reason overrides it. Voids release one cap slot.
+
+Trust paths (hk 1894). These commands, wrk joined (its end check and round
+gate), the --round-ext prechecks and the takeover round read take the events
+inbox (<home>/work/herdr-inbox/jobs), the arbiter DB
+(<home>/.local/share/arbiter/state.db) and the grant-fetching handoffkeep
+(<home>/.local/bin/handoffkeep: a regular file owned by the user, not group- or
+world-writable) from the passwd home of the current user, never from $HOME.
+HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME or HANDOFFKEEP_BIN naming anything else
+is refused with exit 2 (one line naming the variable and the canonical path);
+PATH is never searched for handoffkeep. WRK_TEST_MODE=1 is for
+the test suites: it honours overrides that resolve under a temp root and warns
+once. This narrows, it does not bound: the same OS user can still edit files
+under the real home or set WRK_TEST_MODE with temp paths.
 USAGE
 }
 
@@ -5171,7 +5907,7 @@ USAGE
 # recorded repo/worktree/cwd takes precedence over the command-line fallback.
 round_repo_resolve() {
   local job="$1" fallback="$2"
-  wrk_py - "$(wrk_jobs_root)/$job/events" "$fallback" <<'PY'
+  wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$fallback" <<'PY'
 import json, os, subprocess, sys
 exec(os.environ["WRK_EVENTS_PY"])
 events, fallback = sys.argv[1:]
@@ -5242,7 +5978,7 @@ PY
 # the round commands need, including the effective voids and their refs.
 round_scan() {
   local job="$1"
-  wrk_py - "$(wrk_jobs_root)/$job/events" <<'PY'
+  wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" <<'PY'
 import json, os, sys
 exec(os.environ["WRK_EVENTS_PY"])
 events = sys.argv[1]
@@ -5290,8 +6026,10 @@ PY
 # (JSON) on stdout; non-zero when the record is absent or handoffkeep fails.
 round_approval_fetch() {
   local ref="$1" handoffkeep out rc=0
-  handoffkeep="$(command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true)"
-  [[ -n "$handoffkeep" ]] || return 1
+  # hk 1894: the binary wrk_trust_guard chose (the canonical one outside test
+  # mode); never HANDOFFKEEP_BIN or a PATH lookup.
+  handoffkeep="${WRK_TRUST_HK:-}"
+  [[ -n "$handoffkeep" && -x "$handoffkeep" ]] || return 1
   case "$ref" in
     hk:doc/?*)  out="$("$handoffkeep" doc get "${ref#hk:doc/}" 2>/dev/null)" || rc=$? ;;
     hk:task/?*) out="$("$handoffkeep" tasks comments "${ref#hk:task/}" 2>/dev/null)" || rc=$? ;;
@@ -5324,11 +6062,13 @@ except ValueError:
     raise SystemExit(1)
 # Each grant type has one canonical line form; whitespace variants are
 # malformed and rejected. The identity and parent-lane checks below are
-# shared by round extensions and voids.
+# shared by round extensions, voids and join waivers.
 if grant_kind == "round-extension":
     GRANT = re.compile(r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
 elif grant_kind == "round-void":
     GRANT = re.compile(r"^round-void: job=(\S+) round=(\d+) by=(\S+)$")
+elif grant_kind == "join-waiver":
+    GRANT = re.compile(r"^join-waiver: job=(\S+) by=(\S+)$")
 else:
     raise SystemExit(1)
 # The issuer written into the grant line must equal the record's server-set
@@ -5355,7 +6095,10 @@ for identity, body in sources:
         m = GRANT.match(line)
         if not m or m.group(1) != job:
             continue
-        amount, issuer = int(m.group(2)), m.group(3)
+        if grant_kind == "join-waiver":
+            amount, issuer = 1, m.group(2)
+        else:
+            amount, issuer = int(m.group(2)), m.group(3)
         if (grant_kind == "round-extension" and amount < 1) or (
                 grant_kind == "round-void" and str(amount) != round_number):
             continue
@@ -5373,7 +6116,7 @@ PY
 # unreadable so a broken record fails closed instead of falling back to an
 # older claim the newest event superseded.
 round_job_task_id() {
-  wrk_py - "$(wrk_jobs_root)/$1/events" <<'PY'
+  wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$1/events" <<'PY'
 import json, os, sys
 exec(os.environ["WRK_EVENTS_PY"])
 names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
@@ -5391,12 +6134,25 @@ print(v if isinstance(v, (int, str)) else "")
 PY
 }
 
+# The job's newest claim/reclaim event file name, taken the same way as
+# round_job_task_id: the claim version a verified join waiver binds to.
+# Prints it or nothing when there is no claim.
+joined_claim_version() {
+  wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$1/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
+         if name.endswith(("claim.json", "reclaim.json"))]
+print(names[-1] if names else "")
+PY
+}
+
 # Fetch the job's hk task record from the server. Echoes the raw record text
 # (JSON) on stdout; non-zero when the record is absent or handoffkeep fails.
 round_pa_task_fetch() {
   local task_id="$1" handoffkeep out rc=0
-  handoffkeep="$(command -v "${HANDOFFKEEP_BIN:-handoffkeep}" 2>/dev/null || true)"
-  [[ -n "$handoffkeep" ]] || return 1
+  handoffkeep="${WRK_TRUST_HK:-}"
+  [[ -n "$handoffkeep" && -x "$handoffkeep" ]] || return 1
   out="$("$handoffkeep" tasks show "$task_id" 2>/dev/null)" || rc=$?
   [[ "$rc" -eq 0 && -n "$out" && "$out" != not_found ]] || return 1
   printf '%s' "$out"
@@ -5430,7 +6186,7 @@ PY
 round_cap_event() {
   local job="$1" owner="$2" label="$3" pane="$4" parent="$5" head="$6" cap="$7"
   local events
-  events="$(wrk_jobs_root)/$job/events"
+  events="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events"
   mkdir -p "$events"
   wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "${HOSTNAME:-unknown}" "$head" "$cap" <<'PY'
 import fcntl, json, os, sys, tempfile
@@ -5504,8 +6260,10 @@ round_open_cmd() {
   done
   [[ "$head" =~ ^[0-9a-fA-F]{40}$ ]] || die "round open --head requires a full 40-hex SHA"
   head="$(printf '%s' "$head" | tr '[:upper:]' '[:lower:]')"
-  metadata="$(builder_metadata "$job")"
+  if [[ -n "$extend" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
+  metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round open" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   if ! repo="$(round_repo_resolve "$job" "$repo_override")"; then
     if [[ -n "$repo_override" ]]; then
       die "round open: --repo $repo_override is not a usable git repository"
@@ -5560,7 +6318,7 @@ round_open_cmd() {
   # concurrently cannot slip a second open past the cap.
   local outcome rc=0
   set +e
-  outcome="$(wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend" "$grant_extra" "$grant_issuer" <<'PY'
+  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend" "$grant_extra" "$grant_issuer" <<'PY'
 import fcntl, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 (events, job, owner, label, pane, parent, head, cap,
@@ -5570,6 +6328,10 @@ os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
+    end_name = wrk_end_declaration(events)
+    if end_name:
+        print("ENDED\t%s" % end_name)
+        raise SystemExit(0)
     records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
@@ -5616,6 +6378,9 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round open failed to inspect $job"
   case "$outcome" in
+    ENDED$'\t'*)
+      die "round open: refused after end record ${outcome#ENDED$'\t'}"
+      ;;
     OPENED\ round=*)
       echo "OK job=$job ${outcome#OPENED } cap=$ROUND_CAP_DEFAULT head=$head"
       ;;
@@ -5657,8 +6422,10 @@ round_void_cmd() {
     esac
   done
   [[ -n "$ref" ]] || die "round void requires --by REF"
-  metadata="$(builder_metadata "$job")"
+  wrk_trust_guard hk
+  metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round void" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
 
   local tmp_approval grant grant_issuer
   tmp_approval="$(mktemp)"
@@ -5691,7 +6458,7 @@ round_void_cmd() {
 
   local outcome rc=0
   set +e
-  outcome="$(wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$round_number" "$ref" "$reason" "$grant_issuer" <<'PY'
+  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$round_number" "$ref" "$reason" "$grant_issuer" <<'PY'
 import fcntl, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 events, job, round_text, ref, reason, issuer = sys.argv[1:]
@@ -5700,6 +6467,10 @@ os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
+    end_name = wrk_end_declaration(events)
+    if end_name:
+        print("ENDED\t%s" % end_name)
+        raise SystemExit(0)
     records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"
               and r.get("job_id") == job and r.get("round") == round_number]
@@ -5724,6 +6495,9 @@ PY
   set -e
   [[ "$rc" -eq 0 ]] || die "round void failed to inspect $job"
   case "$outcome" in
+    ENDED$'\t'*)
+      die "round void: refused after end record ${outcome#ENDED$'\t'}"
+      ;;
     VOIDED\ round=*) echo "OK job=$job $outcome ref=$ref" ;;
     NO_ROUND) die "round void: round $round_number does not exist for job $job" ;;
     HAS_VERDICT) die "round void: round $round_number already has a job.verdict" ;;
@@ -5743,25 +6517,26 @@ round_verdict_cmd() {
     esac
   done
   [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
-  metadata="$(builder_metadata "$job")"
+  wrk_trust_guard
+  metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   local outcome rc=0
   set +e
-  outcome="$(wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$ROUND_CAP_DEFAULT" <<'PY'
-import fcntl, json, os, re, sys, tempfile
+  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" <<'PY'
+import fcntl, hashlib, io, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, vfile, cap = sys.argv[1:]
-cap = int(cap)
+events, job, owner, label, pane, parent, vfile = sys.argv[1:]
 os.makedirs(events, exist_ok=True)
 verdict = vsha = None
-VERDICT = re.compile(r"^VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})\s*$")
 matches = []
 try:
-    with open(vfile, encoding="utf-8") as f:
-        for line in f:
-            m = VERDICT.match(line)
-            if m:
-                matches.append(m)
+    with open(vfile, "rb") as raw:
+        data = raw.read()
+    for line in io.TextIOWrapper(io.BytesIO(data), encoding="utf-8", errors="replace"):  # hk1900-verdict-decode
+        m = wrk_verdict_line.match(line)
+        if m:
+            matches.append(m)
 except OSError:
     pass
 if not matches:
@@ -5771,10 +6546,22 @@ if len(matches) > 1:
     print("AMBIGUOUS")
     raise SystemExit(0)
 verdict, vsha = matches[0].group(1), matches[0].group(2).lower()
+digest = ""
+try:
+    with open(vfile, "rb") as raw:
+        digest = hashlib.sha256(raw.read()).hexdigest()
+except OSError:
+    digest = ""
+abspath = os.path.abspath(vfile)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
 with open(lock_path, "w", encoding="utf-8") as lock:
     fcntl.flock(lock, fcntl.LOCK_EX)
-    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
+    end_name = wrk_end_declaration(events)
+    if end_name:
+        print("ENDED\t%s" % end_name)
+        raise SystemExit(0)
+    ordered = wrk_events_ordered(events)
+    records = [o for _, o, _ in ordered if o is not None]
     rounds = [r for r in records if r.get("kind") == "job.round"]
     verdicts = [r for r in records if r.get("kind") == "job.verdict"]
     voids = [r for r in records if r.get("kind") == "job.round_void"]
@@ -5786,28 +6573,94 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                   and v.get("round") in round_numbers and v.get("round") not in bound
                   and isinstance(v.get("ref"), str)
                   and v["ref"].startswith(("hk:doc/", "hk:task/")))}
+    # Identity refusals name the earliest blocking job.verdict. Path, then
+    # exact bytes, then head. A void releases the head even when that round
+    # also carries a verdict. The cap void set above is unchanged.
+    # Bash 3.2 scans this heredoc for quotes because it sits inside a
+    # command substitution. Do not put an unmatched single quote in this body.
+    path_hit = ""
+    content_hit = ""
+    digests = set()
+    head_hit = ""
+    for name, document, _mtime in ordered:
+        if not isinstance(document, dict) or document.get("kind") != "job.verdict":
+            continue
+        vid = document.get("job_id")
+        if isinstance(vid, str) and vid != job:
+            continue
+        recorded_path = document.get("path")
+        if (path_hit == "" and isinstance(recorded_path, str)
+                and os.path.abspath(recorded_path) == abspath):
+            path_hit = name
+        recorded_digest = document.get("content_sha256")
+        if isinstance(recorded_digest, str) and recorded_digest:
+            digests.add(recorded_digest)
+            if content_hit == "" and recorded_digest == digest:
+                content_hit = name
+        recorded_head = document.get("head")
+        if (head_hit == "" and isinstance(recorded_head, str)
+                and recorded_head.lower() == vsha):
+            number = document.get("round")
+            released = False
+            if isinstance(number, int):
+                for void in voids:
+                    vjob = void.get("job_id")
+                    ref = void.get("ref")
+                    if ((not isinstance(vjob, str) or vjob == job)
+                            and void.get("round") == number
+                            and isinstance(ref, str)
+                            and ref.startswith(("hk:doc/", "hk:task/"))):
+                        released = True
+                        break
+            if not released:
+                head_hit = name
+    if path_hit:
+        print("DUP_PATH\t%s\t%s" % (path_hit, abspath))
+        raise SystemExit(0)
+    if digest in digests:  # hk1449-content-sha
+        print("DUP_CONTENT\t%s\t%s" % (content_hit, digest))
+        raise SystemExit(0)
+    if head_hit:
+        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+        raise SystemExit(0)
+    open_rounds = [r for r in rounds
+                   if (isinstance(r.get("round"), int) and r.get("round") not in bound
+                       and r.get("round") not in voided)]
     target = None
-    for r in rounds:
+    for r in open_rounds:
+        round_head = r.get("head")
         if (isinstance(r.get("round"), int) and r.get("round") not in bound
-                and r.get("round") not in voided):
+                and r.get("round") not in voided and isinstance(round_head, str)
+                and round_head.lower() == vsha):  # hk1506-head-bind
             target = r["round"]
             break
+    if target is None:
+        if open_rounds:
+            labels = []
+            for r in open_rounds:
+                round_head = r.get("head")
+                if isinstance(round_head, str) and round_head:
+                    short_head = round_head[:7].lower()
+                    if any(ch in short_head for ch in "\t\r\n,"):
+                        short_head = "<invalid-head>"
+                else:
+                    short_head = "<no-head>"
+                labels.append("%s@%s" % (r["round"], short_head))
+            print("NO_HEAD_ROUND\t%s\t%s" % (vsha, ", ".join(labels)))
+        else:
+            print("NO_OPEN_ROUND\t%s" % vsha)
+        raise SystemExit(0)
     used = sum(1 for r in rounds
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
     used += wrk_takeover_rounds(events)
-    if target is None:
-        used += 1  # this unbound verdict is itself a round
     record = {"kind": "job.verdict", "job_id": job, "owner_lane": owner,
               "label": label, "pane_id": pane, "parent_lane": parent,
               "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
-              "round": target, "epoch": 1}
-    if target is None:
-        record["unopened"] = True
+              "content_sha256": digest, "round": target, "epoch": 1}
     wrk_event_commit(events, "job.verdict", record)
-    over = target is None and used > cap
-    print("RECORDED round=%s verdict=%s head=%s used=%d over=%d" %
-          (target if target is not None else "unopened", verdict, vsha, used, int(over)))
+    print("RECORDED round=%s verdict=%s head=%s used=%d" %
+          (target, verdict, vsha, used))
 PY
 )"
   rc=$?
@@ -5818,31 +6671,26 @@ PY
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
     AMBIGUOUS)
       die "round verdict --file has more than one VERDICT line: $file" ;;
+    ENDED$'\t'*|DUP_PATH$'\t'*|DUP_CONTENT$'\t'*|DUP_HEAD$'\t'*)
+      wrk_verdict_refusal "$outcome" ;;
+    NO_HEAD_ROUND$'\t'*)
+      local no_head_v no_open_list
+      IFS=$'\t' read -r _ no_head_v no_open_list <<<"$outcome"
+      die "round verdict: no open round for head $no_head_v on job $job (open: $no_open_list); open one with wrk round open $job --head $no_head_v" ;;
+    NO_OPEN_ROUND$'\t'*)
+      local no_open_head
+      IFS=$'\t' read -r _ no_open_head <<<"$outcome"
+      die "round verdict: job $job has no open round; open one with wrk round open $job --head $no_open_head" ;;
     RECORDED*)
-      local round_no="" verdict_v="" head_v="" used_v="" over_v="" status question tok
+      local round_no="" verdict_v="" head_v="" used_v="" tok
       for tok in $outcome; do
         case "$tok" in
           round=*) round_no="${tok#round=}" ;;
           verdict=*) verdict_v="${tok#verdict=}" ;;
           head=*) head_v="${tok#head=}" ;;
           used=*) used_v="${tok#used=}" ;;
-          over=*) over_v="${tok#over=}" ;;
         esac
       done
-      if [[ "$round_no" == unopened ]]; then
-        warn "verdict bound to no open round; counted as a round itself (job=$job rounds=$used_v)"
-        if [[ "$over_v" == 1 ]]; then
-          status="$(round_cap_event "$job" "$owner" "$label" "$pane" "$parent" "$head_v" "$ROUND_CAP_DEFAULT")"
-          if [[ "$status" == emitted* ]]; then
-            question="tester round cap $ROUND_CAP_DEFAULT reached at $used_v rounds; builder must stop and wait for the parent; extension needs a hk approval record naming this job (wrk round open --extend REF)"
-            emit_relay_event job.escalate "$job" "$owner" "$label" "$pane" "${HOSTNAME:-unknown}" \
-              "$file" "$verdict_v@$head_v" "$ROUND_CAP_REASON" "$question" "" "$head_v"
-            warn "round cap $ROUND_CAP_DEFAULT reached for $job ($used_v rounds); emitted job.escalate to parent $parent"
-          fi
-          echo "OK job=$job verdict=$verdict_v head=$head_v round=unopened rounds=$used_v cap=$ROUND_CAP_DEFAULT"
-          exit "$WRK_EXIT_ROUND_CAP"
-        fi
-      fi
       echo "OK job=$job verdict=$verdict_v head=$head_v round=$round_no rounds=$used_v cap=$ROUND_CAP_DEFAULT"
       ;;
     *) die "round verdict unexpected outcome: $outcome" ;;
@@ -5853,9 +6701,68 @@ round_status_cmd() {
   local job="${1:-}"
   [[ -n "$job" && "$job" != -* ]] || die "round status requires a job id"
   [[ $# -eq 1 ]] || die "round status accepts only a job id"
+  wrk_trust_guard
   local scan
   scan="$(round_scan "$job")"
   echo "job=$job cap=$ROUND_CAP_DEFAULT $scan"
+}
+
+round_audit_cmd() {
+  local lane=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) round_help; return 0 ;;
+      --lane)
+        [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a lane"
+        lane="$2"
+        shift 2
+        ;;
+      *) die "unknown round audit option '$1'" ;;
+    esac
+  done
+  # hk 1894: the audit reads the canonical inbox, so a redirected inbox cannot
+  # make a builder with no recorded rounds look clean.
+  wrk_trust_guard
+  local jobs_root
+  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  [[ -d "$jobs_root" ]] || return 0
+  local job_dir job scan ended owner lane_ok role recorded blocks line tag rest
+  # find -H below: the checked inbox may itself be a symlink (the guard returns the
+  # canonical spelling); without -H find walks nothing and the audit looks clean.
+  while IFS= read -r job_dir; do
+    [[ -n "$job_dir" && -d "$job_dir" ]] || continue
+    job="$(basename "$job_dir")"
+    scan="$(job_events_scan "$job_dir/events")"
+    ended=""
+    owner=""
+    IFS=$'\t' read -r _ ended _ _ _ _ _ owner _ <<<"$scan"
+    [[ -n "${owner:-}" ]] || owner="-"
+    lane_ok=0
+    if [[ -z "$lane" || "$owner" == "$lane" ]]; then
+      lane_ok=1
+    fi
+    if [[ "$lane_ok" -ne 1 ]]; then
+      continue
+    fi
+    role="$(wrk_job_role "$job" "$jobs_root")"
+    recorded="$(wrk_recorded_rounds "$job" "$jobs_root")"
+    case "$role" in
+      builder|captain)
+        if [[ "$ended" == "0" && "$recorded" == "0" ]]; then
+          printf 'zero-rounds job=%s lane=%s\n' "$job" "$owner"
+        fi
+        ;;
+    esac
+    blocks="$(wrk_join_blocks "$job" "$jobs_root")"
+    while IFS= read -r line; do
+      [[ -n "$line" ]] || continue
+      tag="${line%%$'\t'*}"
+      rest="${line#*$'\t'}"
+      if [[ "$tag" == unmatched ]]; then
+        printf 'unmatched-verdict job=%s file=%s\n' "$job" "$rest"
+      fi
+    done <<<"$blocks"
+  done < <(find -H "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)
 }
 
 round_cmd() {
@@ -5866,6 +6773,7 @@ round_cmd() {
     verdict) shift; round_verdict_cmd "$@" ;;
     void) shift; round_void_cmd "$@" ;;
     status) shift; round_status_cmd "$@" ;;
+    audit) shift; round_audit_cmd "$@" ;;
     *) die "unknown round subcommand '$sub' (see 'wrk round --help')" ;;
   esac
 }
@@ -5958,6 +6866,9 @@ PY
 # 판정 1건 = 로그 1줄. 회전은 없다(잡 디렉토리 수명과 같다).
 # extra 가 비어 있으면 줄은 네 칸 그대로다. 회복이 pending·completed 와 같은
 # 폴에 겹치면 action 은 그 판정을 유지하고 끝에 recovered=<reason> 만 붙는다.
+# 감시 창이 에이전트가 살아 있는 폴에서 만료되면 action=watch-expired
+# elapsed=<n>s 한 줄을 남기고 센티널만 끝난다(job.lost·종료 기록·쿼타 해제 없음).
+# 마감 뒤에 처음 관측된 report 는 확인 폴 한 번을 받는다 — 그 폴은 action=pending late=1 이다.
 sentinel_log() {
   local logfile="$1" token="$2" transient="$3" action="$4" extra="${5:-}"
   if [[ -n "$extra" ]]; then
@@ -6507,7 +7418,9 @@ job_end_housekeeping() {
   }
   case "$end_out" in
     created|already-ended)
-      release_job_quota_pool "$job" "$pane" || release_rc=$? # hk1798-housekeeping-release
+      # hk1860: the release's skip diagnostics go to stderr, so wrk done and
+      # wrk joined keep their one OK line on stdout.
+      release_job_quota_pool "$job" "$pane" >&2 || release_rc=$? # hk1798-housekeeping-release
       [[ "$release_rc" != 2 ]] || return 0 # hk1813-housekeeping-release-current
       stop_completion_sentinel "$job"
       ;;
@@ -6597,12 +7510,13 @@ PY
   started="$(date +%s)"
   seen=""
   pending=""
+  late_pending=""
   transient=0
   lost=0
   lost_at=0
   lost_reason=""
   while :; do
-    local now probe class token candidate key action recover_reason rearm_loss log_extra
+    local now probe class token candidate key action recover_reason rearm_loss log_extra watch_expired
     now="$(date +%s)"
     probe="$(herdr_agent_probe "$pane")"
     IFS=$'\t' read -r class token _ <<<"$probe"
@@ -6611,6 +7525,7 @@ PY
     key=""
     recover_reason=""
     rearm_loss=""
+    watch_expired=""
     case "$class" in
       gone)
         transient=0
@@ -6676,8 +7591,21 @@ PY
     # Count that poll toward the watch window. Otherwise a gone/ok flap
     # never has action=none while lost=0, the window never expires, and
     # the grace never accumulates either.
-    if [[ "$action" == none && ( "$lost" -eq 0 || -n "$recover_reason" ) ]] && (( now - started >= timeout )); then
-      action="lost:timeout"
+    # hk1888: the window is a watch window, not an absence. A poll that sees
+    # the agent present (class=ok) ends the watch without a verdict: no
+    # job.lost, no end record, no quota release. Anything else keeps the old
+    # lost:timeout so a dead job is still cleaned up through the grace.
+    if [[ ( "$action" == none || "$action" == pending ) && ( "$lost" -eq 0 || -n "$recover_reason" ) ]] && (( now - started >= timeout )); then
+      if [[ "$class" == ok ]]; then # hk1888-watch-expired-live-guard
+        if [[ "$action" == pending && -z "$late_pending" ]]; then # hk1959-late-pending
+          late_pending=1
+        else
+          watch_expired=1
+          [[ -n "$recover_reason" ]] || action="watch-expired"
+        fi
+      else
+        action="lost:timeout"
+      fi
     fi
     # Recovery is applied after this poll's classification and after the
     # record-watch, and before the grace check. A wake that slept across the
@@ -6689,6 +7617,12 @@ PY
     log_extra=""
     if [[ -n "$recover_reason" && "$action" != recovered:* ]]; then
       log_extra="recovered=$recover_reason"
+    fi
+    if [[ "$action" == pending && -n "$late_pending" ]]; then
+      log_extra="${log_extra:+$log_extra }late=1"
+    fi
+    if [[ "$action" == watch-expired ]]; then
+      log_extra="elapsed=$(( now - started ))s"
     fi
     sentinel_log "$logfile" "$token" "$transient" "$action" "$log_extra"
     # #770: the job may have ended by another path while the sentinel slept —
@@ -6709,6 +7643,13 @@ PY
       lost=0 # hk1770 clear
       lost_reason=""
       lost_at=0
+    fi
+    if [[ -n "$watch_expired" ]]; then # hk1888-watch-expired-exit
+      # A recovery poll already logged recovered:*; the watch end gets its own
+      # line. The job stays live: done, joined, reap and prune end it as usual.
+      [[ "$action" == watch-expired ]] ||
+        sentinel_log "$logfile" "$token" "$transient" "watch-expired" "elapsed=$(( now - started ))s"
+      sentinel_self_exit "$job" 0
     fi
     case "$action" in
       completed)
@@ -7054,16 +7995,17 @@ PY
 # under WRK_LANE_STRICT=1, exit 82 — which is why every builder early-return
 # here warns exactly once.
 hub_lane_register() {
-  HUB_LANE="" HUB_LANE_MACHINE=""
+  HUB_LANE="" HUB_LANE_MACHINE="" HUB_LANE_SELF=""
   # Child seats use the worker lane/credential topology inside this helper.
   local ROLE="$ROLE"
   case "$ROLE" in tester|reviewer|counsel) ROLE=worker ;; esac
   [[ "$ROLE" == worker || "$ROLE" == builder ]] || return 0
   # #1397/(a): a delegated remote spawn defers its lane row to the ssh
-  # initiator — only that host holds the operator credential (per-host
-  # machine-scoped tokens are the step-4 follow-up). --lane-defer carries the
+  # initiator — unless the execution host holds a lanes token bound to the
+  # deferred machine id, in which case hk 1446 self-registers below.
+  # --lane-defer carries the
   # hub machine id the initiator names this host by (its hosts.toml key).
-  # This wrk performs no `lanes add`; it records hub_lane/hub_lane_machine in
+  # Without a matching lanes token this wrk performs no `lanes add`; it records hub_lane/hub_lane_machine in
   # the job.spawned receipt as the claim of what the initiator will register,
   # so `wrk reap` on THIS host — the only place the pane check can pass —
   # removes the row through the same machine+pane guard. If the initiator's
@@ -7076,6 +8018,17 @@ hub_lane_register() {
     if [[ "$ROLE" == builder ]]; then defer_lane="$BUILDER_LANE"; else defer_lane="$LABEL"; fi
     if hub_lane_name_valid "$defer_lane"; then
       HUB_LANE="$defer_lane" HUB_LANE_MACHINE="$LANE_DEFER"
+      # hk 1446: a builder whose execution host holds a lanes token bound to
+      # the very machine id --lane-defer carries registers its own lane right
+      # here — the receipt already names lane+machine, so the same machine+
+      # pane guard reaps it. The marker on the OK line tells the initiator
+      # its add is unnecessary. Every other shape — no lanes token, a token
+      # naming another machine, a refused or failed add — keeps the
+      # deferral untouched (the add only warns, never fails the spawn).
+      if [[ "$ROLE" == builder && "${ARBITER_JOB_REGISTERED:-0}" -eq 1 ]] &&
+         hub_lane_self_register; then
+        HUB_LANE_SELF=1
+      fi
     fi
     return 0
   fi
@@ -7181,16 +8134,14 @@ hub_lane_register() {
   fi
   # A lanes credential authorizes lanes on its own HUB_MACHINE_ID only — with
   # a different machine the hub refuses the add (lane_machine_mismatch), so
-  # compare first and skip. The file is scanned for that one key through
-  # spillover_env_key, never sourced; HUB_TOKEN is never matched or printed.
-  # The extracted value may reach the compare — and any warning — only as a
-  # bare machine id: spillover_env_key returns the whole post-= tail, so an
-  # unparsed remainder like a same-line HUB_TOKEN would otherwise echo into
-  # the warning. Fail closed: anything outside ^[A-Za-z0-9._-]{1,64}$ warns
-  # once WITHOUT the value and skips. An unreadable file or unset/empty key
-  # still falls through to panewire's own loader error.
+  # compare first and skip. The file is scanned for only HUB_MACHINE_ID,
+  # never sourced; HUB_TOKEN is never matched or printed. Preserve whitespace
+  # in the value so the ASCII check rejects a near-match instead of silently
+  # normalizing it into the target machine id. Fail closed: anything outside
+  # ^[A-Za-z0-9._-]{1,64}$ warns once WITHOUT the value and skips. An unreadable
+  # file or unset/empty key still falls through to panewire's own loader error.
   if [[ -n "$lanes_env" ]]; then
-    lanes_machine="$(spillover_env_key "$lanes_env" HUB_MACHINE_ID 2>/dev/null || true)"
+    lanes_machine="$(spillover_env_machine_id "$lanes_env" 2>/dev/null || true)"
     if [[ -n "$lanes_machine" ]]; then
       if ! ascii_re "$lanes_machine" '^[A-Za-z0-9._-]{1,64}$'; then
         warn "hub lane not registered (lanes_token_env HUB_MACHINE_ID is malformed)"
@@ -7228,10 +8179,62 @@ hub_lane_register() {
   HUB_LANE="$lane_name" HUB_LANE_MACHINE="$machine"
 }
 
-# #1397/(a): the ssh initiator's half of a delegated remote spawn. The
-# execution host cannot register its own lane — PUT /v1/lanes wants the
-# operator credential, which lives on the initiating host (per-host
-# machine-scoped tokens are the step-4 follow-up) — so the initiator runs
+# hk 1446: the execution host's half of a delegated remote builder spawn
+# when it holds its own lanes token. Runs only under --lane-defer for a
+# builder lane: a lanes_token_env file whose HUB_MACHINE_ID IS the deferred
+# machine id (byte equality after the same ascii check the non-deferred
+# path applies) authorizes this host's own machine's lanes, so the lane the
+# initiator would have added is added here instead — same lane name, same
+# --parent, the deferred id as machine, and the spawned pane. Returns 0
+# only on a confirmed add. Anything else — no lanes token, an unreadable
+# file, an unset or mismatched HUB_MACHINE_ID, a missing hub_url or
+# panewire, a refused add — returns 1 and the caller defers exactly as
+# before. operator_token_env and hub_token_env never count: a remote wrk
+# has no business presenting the initiator's credential topology, and a
+# node token bound to another machine would be refused anyway. The scan
+# reads the HUB_MACHINE_ID line only; the token file still reaches panewire
+# as a path, and a malformed id warns once without the value. The parser
+# preserves all value whitespace (stripping only the assignment's line
+# ending and optional surrounding quotes) so a near-match cannot pass.
+hub_lane_self_register() {
+  local hub_url lanes_env lanes_machine cf_env panewire rc=0
+  local args=()
+  lanes_env="$(spillover_value hub lanes_token_env 2>/dev/null || true)"
+  [[ -n "$lanes_env" ]] || return 1
+  lanes_machine="$(spillover_env_machine_id "$lanes_env" 2>/dev/null || true)"
+  [[ -n "$lanes_machine" ]] || return 1
+  if ! ascii_re "$lanes_machine" '^[A-Za-z0-9._-]{1,64}$'; then
+    warn "hub lane self-registration skipped (lanes_token_env HUB_MACHINE_ID is malformed)"
+    return 1
+  fi
+  [[ "$lanes_machine" == "$LANE_DEFER" ]] || return 1
+  hub_url="$(spillover_value hub hub_url 2>/dev/null || true)"
+  [[ -n "$hub_url" ]] || return 1
+  cf_env="$(spillover_value hub hub_cf_env 2>/dev/null || true)"
+  panewire="${PANEWIRE_BIN:-panewire}"
+  if [[ "$panewire" == */* ]]; then
+    [[ -x "$panewire" ]] || return 1
+  elif ! command -v "$panewire" >/dev/null 2>&1; then
+    return 1
+  fi
+  args=(lanes add "$BUILDER_LANE" --machine "$LANE_DEFER" --pane "$PANE" --parent "$PARENT_LANE"
+        --hub-url "$hub_url" --hub-token-env "$lanes_env")
+  [[ -z "$cf_env" ]] || args+=(--hub-cf-env "$cf_env")
+  set +e
+  "$panewire" "${args[@]}" >/dev/null 2>&1
+  rc=$?
+  set -e
+  if [[ "$rc" -ne 0 ]]; then
+    warn "hub lane self-registration failed (panewire lanes add exited $rc); deferring to the initiator"
+    return 1
+  fi
+  return 0
+}
+
+# #1397/(a): the ssh initiator's half of a delegated remote spawn. An
+# execution host without its own lanes token cannot register its own lane —
+# PUT /v1/lanes wants the operator credential, which lives on the
+# initiating host — so the initiator runs
 # `panewire lanes add` itself once the remote spawn answers rc 0, with
 # machine = the hosts.toml key it reached the host by (that key IS the
 # host's hub machine id: mac-dev, rpi, desktop). The remote wrk already
@@ -7416,6 +8419,37 @@ path, key = sys.argv[1:]
 assignment = re.compile(r"^\s*(?:export\s+)?" + re.escape(key) + r"\s*=\s*(.*?)\s*$")
 with open(path, encoding="utf-8") as env_file:
     for line in env_file:
+        match = assignment.match(line)
+        if not match:
+            continue
+        value = match.group(1)
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            print(value)
+            raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+# Read HUB_MACHINE_ID without trimming the value. Unlike the general
+# credential-key reader above, lane authorization compares this value to a
+# machine id byte-for-byte: only the line ending and optional outer quotes
+# are syntax. A trailing or leading space must fail the ASCII allowlist.
+spillover_env_machine_id() {
+  local file="$1"
+  [[ -r "$file" ]] || return 1
+  python3 - "$file" <<'PY'
+import re, sys
+
+path = sys.argv[1]
+assignment = re.compile(r"^[ \t]*(?:export[ \t]+)?HUB_MACHINE_ID[ \t]*=(.*)$")
+with open(path, encoding="utf-8", newline="") as env_file:
+    for line in env_file:
+        if line.endswith("\n"):
+            line = line[:-1]
+        if line.endswith("\r"):
+            line = line[:-1]
         match = assignment.match(line)
         if not match:
             continue
@@ -8259,7 +9293,10 @@ spillover_remote_spawn() {
   # key> so it records hub_lane/hub_lane_machine in its job.spawned receipt
   # without calling panewire, and this host runs `lanes add` itself after the
   # remote answers rc 0 (machine = the hosts.toml key, the host's hub
-  # machine id). A remote WORKER gets neither the flag nor the add: it keeps
+  # machine id). hk 1446 exception: when the remote's own lanes token names
+  # that same machine id it registers the lane itself and answers
+  # lane_registered=self on its OK pane= line — the add below is then
+  # skipped. A remote WORKER gets neither the flag nor the add: it keeps
   # the #965 contract — the execution host checks its own
   # session_machine_ids and registers there, or stays unregistered — because
   # a fleet worker must never land on the hub as a global lane named after
@@ -8342,23 +9379,36 @@ spillover_remote_spawn() {
   # never enters this block — its own lane= field (or its absence) passes
   # through untouched.
   if [[ "$remote_lane_role" == builder && -n "$remote_lane_name" ]]; then
-    local remote_pane="" lane_field="" lane_out
+    local remote_pane="" remote_selfreg="" lane_field="" lane_out
     remote_pane="$(awk '/^OK pane=/{ for (i = 1; i <= NF; i++) if (substr($i, 1, 5) == "pane=") { print substr($i, 6); exit } }' "$out")"
+    # hk 1446: only a lane_registered=self field on the OK pane= line itself
+    # counts — the same marker inside a label value, a warning line or any
+    # other output is not the remote's own registration proof.
+    remote_selfreg="$(awk '/^OK pane=/{ for (i = 1; i <= NF; i++) if ($i == "lane_registered=self") { print "yes"; exit } }' "$out")"
     if [[ -n "$remote_pane" ]]; then
       spillover_remote_step "$host" lane
       HUB_REMOTE_LANE=""
-      case "$rc" in
-        0|"$WRK_EXIT_LANDING_UNCONFIRMED")
-          hub_lane_register_remote "$host" "$remote_pane" "$remote_lane_name" "$remote_lane_route_parent" ;;
-      esac
+      if [[ "$remote_selfreg" == yes ]]; then
+        # The execution host already added the row with its own lanes
+        # token — adding it again would be a harmless idempotent update,
+        # but skipping it keeps the hub traffic honest.
+        HUB_REMOTE_LANE="$remote_lane_name"
+      else
+        case "$rc" in
+          0|"$WRK_EXIT_LANDING_UNCONFIRMED")
+            hub_lane_register_remote "$host" "$remote_pane" "$remote_lane_name" "$remote_lane_route_parent" ;;
+        esac
+      fi
       if [[ -n "$HUB_REMOTE_LANE" ]]; then
         lane_field="lane=$remote_lane_name@$host"
       else
         lane_field="lane=UNREGISTERED"
       fi
       lane_out="$(mktemp)"
+      # The consumed self-registration marker never reaches the operator's
+      # line — it was the remote's word to this host, not lane metadata.
       if awk -v lf="$lane_field" '
-        /^OK pane=/ { sub(/ lane=[^ ]*/, ""); if (lf != "") $0 = $0 " " lf; print; next }
+        /^OK pane=/ { sub(/ lane=[^ ]*/, ""); sub(/ lane_registered=self/, ""); if (lf != "") $0 = $0 " " lf; print; next }
         { print }
       ' "$out" >"$lane_out"; then
         mv "$lane_out" "$out"
@@ -9259,8 +10309,11 @@ round_ext_precheck() {
   [[ -n "$ROUND_EXT_REF" ]] || return 0
   local handoffkeep out grant_job="$PARENT_JOB"
   [[ "$ROLE" != builder ]] || grant_job="$JOB_ID"
-  handoffkeep="$(hk_bin)"
-  [[ -n "$handoffkeep" ]] || die "--round-ext: handoffkeep unavailable"
+  # hk 1894: the grant document and the parent lane come from the canonical
+  # binary and inbox, not from HANDOFFKEEP_BIN, PATH or ARBITER_INBOX_ROOT.
+  wrk_trust_guard hk
+  handoffkeep="$WRK_TRUST_HK"
+  [[ -n "$handoffkeep" && -x "$handoffkeep" ]] || die "--round-ext: handoffkeep unavailable"
   out="$(hk_cmd "$handoffkeep" doc get "${ROUND_EXT_REF#hk:doc/}" 2>/dev/null)" ||
     die "--round-ext: document missing or handoffkeep unreachable"
   # A successful transport with an error/empty/malformed body is not existence.
@@ -9302,7 +10355,7 @@ except (OSError, ValueError, TypeError, AttributeError, KeyError) as error:
     print("--round-ext: document/issuer verification failed: " + str(error), file=sys.stderr)
     raise SystemExit(1)
 ' "${ROUND_EXT_REF#hk:doc/}" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" \
-    "$(wrk_jobs_root)/$grant_job/events" "$ROLE" "$TASK_ID")" || die "--round-ext: document missing, unreadable or issuer denied"
+    "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$grant_job/events" "$ROLE" "$TASK_ID")" || die "--round-ext: document missing, unreadable or issuer denied"
 }
 
 # Fresh server reads at each builder launch/handoff boundary; never a takeover.
@@ -9494,7 +10547,16 @@ hk_task_precheck() {
   TASK_LINK_STATUS=""
   [[ -n "$TASK_ID" ]] || die "internal: task_validate must run before hk_task_precheck"
   local handoffkeep out rc=0 fields t_state="" t_claimed="" t_job=""
-  handoffkeep="$(hk_bin)"
+  if [[ -n "${ROUND_EXT_REF:-}" ]]; then
+    # hk 1894: with a round-extension ref the task binding below (project,
+    # refs.job_id) is grant evidence too, so it is read through the guarded
+    # handoffkeep, not HANDOFFKEEP_BIN or a PATH lookup.
+    wrk_trust_guard hk
+    handoffkeep=""
+    [[ ! -x "$WRK_TRUST_HK" ]] || handoffkeep="$WRK_TRUST_HK"
+  else
+    handoffkeep="$(hk_bin)"
+  fi
   if [[ -z "$handoffkeep" ]]; then
     hk_task_gate_failure "handoffkeep binary not found (set HANDOFFKEEP_BIN)"
     return 0
@@ -9631,7 +10693,9 @@ print("\t".join([d.get("state") or "", d.get("claimed_by") or "",
 # handoffkeep rebinds the task.
 takeover_old_job_check() {
   local old="$1" events scan ended
-  events="$(wrk_jobs_root)/$old/events"
+  # hk 1894: the inherited round count is read from the canonical inbox only.
+  wrk_trust_guard
+  events="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$old/events"
   [[ -d "$events" ]] || die "takeover refused: old job '$old' has no event history"
   scan="$(job_events_scan "$events")" || die "takeover refused: cannot inspect old job '$old'"
   IFS=$'\t' read -r _ ended _ _ <<<"$scan"
@@ -10343,6 +11407,11 @@ print(value if isinstance(value, str) else "")
   elif [[ "$ROLE" == builder ]]; then
     OK_LINE="$OK_LINE lane=UNREGISTERED"
   fi
+  # hk 1446: a deferred builder lane this host registered itself tells the
+  # ssh initiator — through this one field on the OK pane= line — to skip
+  # its own lanes add. Only the remote's own registration sets it, so a
+  # deferred (unconfirmed) lane never carries the marker.
+  [[ -z "${HUB_LANE_SELF:-}" ]] || OK_LINE="$OK_LINE lane_registered=self"
   echo "$OK_LINE"
   if [[ "$LANDING" == no ]]; then
     # Grok's echo can arrive 1-2 minutes after injection — past even its
@@ -10368,7 +11437,7 @@ print(value if isinstance(value, str) else "")
 
 reap_help() {
   cat <<'USAGE'
-Usage: wrk reap [--lane LANE] [--grace DURATION] [--apply] [--include-builders|--include-captains]
+Usage: wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace DURATION] [--apply] [--include-builders|--include-captains]
 
 Close the herdr tabs of jobs that already reported a terminal event, so that
 finished worker/tester panes stop accumulating on the herdr server.
@@ -10398,6 +11467,8 @@ role=captain) are excluded unless --include-builders is given.
 
 Options:
   --lane LANE        only jobs whose claim owner_lane is LANE
+  --job JOB          only jobs whose id exactly matches JOB; repeatable or comma-separated.
+                     Unnamed jobs are omitted, including their skip lines.
   --grace DURATION   minimum age of the terminal event (10m, 600s, 2h, 600)
   --apply            actually close the tabs; without it reap only lists them.
                      Requires --lane: a lane-less --apply is refused (nonzero,
@@ -10598,6 +11669,19 @@ for job in jobs:
 PY
 }
 
+# Keep the selector at the output/close boundary: this suppresses every row for
+# unnamed jobs, including candidates with skip reasons, and protects --apply.
+reap_job_selected() {
+  local filter="$1" job="$2" candidate
+  local -a selected=()
+  [[ -n "$filter" ]] || return 0
+  IFS=',' read -r -a selected <<<"$filter"
+  for candidate in "${selected[@]}"; do
+    [[ "$candidate" == "$job" ]] && return 0
+  done
+  return 1
+}
+
 # "tab_id<TAB>pane_count" 목록. 회수는 잡의 탭만 닫아야 하고, pane 이 분할된 탭을
 # 닫으면 옆 pane 이 함께 죽는다(2026-07-20 실사고: 수동 스폰한 캡틴 pane 동반 사망).
 #
@@ -10657,11 +11741,18 @@ PY
 }
 
 reap_cmd() {
-  local lane="" grace="10m" apply=0 include_builders=0
+  local lane="" grace="10m" apply=0 include_builders=0 job_filter="" job_value
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) reap_help; return 0 ;;
       --lane) [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a value"; lane="$2"; shift 2 ;;
+      --job)
+        [[ $# -ge 2 && -n "$2" ]] || die "--job requires a non-empty value"
+        job_value="$2"
+        [[ ",$job_value," != *",,"* ]] || die "--job contains an empty job id"
+        if [[ -n "$job_filter" ]]; then job_filter+=","; fi
+        job_filter+="$job_value"
+        shift 2 ;;
       --grace) [[ $# -ge 2 && -n "$2" ]] || die "--grace requires a value"; grace="$2"; shift 2 ;;
       --apply) apply=1; shift ;;
       --include-builders|--include-captains) include_builders=1; shift ;;
@@ -10685,8 +11776,25 @@ reap_cmd() {
   candidates="$(reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
   local job owner pane tab age note hub_lane hub_lane_machine lane_role probe class token probe_tab verdict acted=0 release_rc=0
+  local -a selected_jobs=()
+  if [[ -n "$job_filter" && "$apply" -eq 1 ]]; then
+    local selected_job selected_seen
+    IFS=',' read -r -a selected_jobs <<<"$job_filter"
+    for selected_job in "${selected_jobs[@]}"; do
+      selected_seen=0
+      while IFS=$'\t' read -r job _; do
+        [[ "$job" == "$selected_job" ]] && selected_seen=1
+      done <<<"$candidates"
+      [[ "$selected_seen" -eq 1 ]] || echo "skip job=$selected_job reason=not-candidate"
+    done
+  fi
   while IFS=$'\t' read -r job owner pane tab age note hub_lane hub_lane_machine lane_role; do
     [[ -n "$job" ]] || continue
+    if [[ "$apply" -eq 1 ]]; then
+      if ! reap_job_selected "$job_filter" "$job"; then continue; fi # hk1823-apply-job-filter
+    else
+      if ! reap_job_selected "$job_filter" "$job"; then continue; fi
+    fi
     if [[ -n "$note" && "$note" != - ]]; then
       echo "skip job=$job reason=$note"
       continue
@@ -10712,7 +11820,13 @@ reap_cmd() {
     fi
     case "$token" in
       idle|done) ;;
-      *) echo "skip job=$job pane=$pane reason=status=$token"; continue ;;
+      *)
+        if [[ -n "$job_filter" && "$apply" -eq 1 ]]; then
+          echo "skip job=$job reason=not-candidate"
+        else
+          echo "skip job=$job pane=$pane reason=status=$token"
+        fi
+        continue ;;
     esac
     [[ -n "$tab" ]] || tab="$probe_tab"
     if [[ -z "$tab" ]]; then
@@ -11182,6 +12296,8 @@ prune_cmd() {
   # ones that never had (or lost) a pidfile. A pidfile pass already covers
   # the pair when its pid matches; a different live pid for the same job is
   # a second sentinel and is judged on its own.
+  # hk1860: the one sentinel sweep of this run; pass 4 reads the same snapshot.
+  PRUNE_SWEEP="$(sentinel_sweep 2>/dev/null || true)"
   local _pid _job _owner _label _pane _report _pfpid
   while IFS=$'\t' read -r _pid _job _owner _label _pane _report; do
     [[ -n "$_job" ]] || continue
@@ -11191,7 +12307,7 @@ prune_cmd() {
       [[ "$_pfpid" == "$_pid" ]] && continue
     fi
     prune_sentinel_row "$_job" "$_pid" - "$_pane" "$_owner"
-  done < <(sentinel_sweep)
+  done <<<"$PRUNE_SWEEP"
 
   # Pass 3 — stale jobs: silent past --stale-age AND pane absent. Records are
   # kept; --apply only appends the hub-visible end declaration.
@@ -11233,52 +12349,86 @@ prune_cmd() {
   # than every revive, and that have no live completion sentinel. The arbiter
   # table is authoritative for rows: an earlier release event may be followed
   # by a new record for the same job and pool.
-  local quota_releases=0 _quota_arb="${ARBITER:-}" _quota_status _quota_pools _quota_csv _quota_pane _quota_rc
+  # hk1860: the run takes ONE unscoped arbiter status. Its rows are keyed by
+  # job_id; each ended job reads its pools from that map, and its liveness from
+  # the pass-2 sweep. The release still rechecks the round and the sentinel
+  # right before each release, so a sentinel that starts after the sweep is
+  # still refused there.
+  local quota_releases=0 _quota_arb="${ARBITER:-}" _quota_status="" _quota_map="" _quota_rc=0
+  local _quota_pools _quota_csv _quota_pane _quota_rc2 _live_jobs _probe _pclass _ptoken _qj _qp
   if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
     _quota_arb="$(command -v arbiter 2>/dev/null || true)"
   fi
+  # hk1860 round 3: the status document is read from stdin by this script. It
+  # is never an argv word, since Linux caps one argument at 128 KiB. A parse
+  # failure exits 3 and an exec failure exits with its own rc; both take the
+  # status-failed skip path below.
+  local _quota_map_py='
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(3)
+if not isinstance(doc, dict):
+    raise SystemExit(3)
+for row in doc.get("quota_pool_records") or []:
+    if (isinstance(row, dict) and isinstance(row.get("job_id"), str) and row["job_id"]
+            and isinstance(row.get("pool"), str) and row["pool"]):
+        print(row["job_id"] + "\t" + row["pool"])
+'
+  if [[ -n "$_quota_arb" && -x "$_quota_arb" ]]; then
+    _quota_status="$("$_quota_arb" status --json 2>/dev/null)" || _quota_rc=$?
+    if (( _quota_rc == 0 )); then
+      _quota_map="$(printf '%s' "$_quota_status" | python3 -c "$_quota_map_py")" || _quota_rc=$?
+    fi
+  fi
+  _live_jobs="$(awk -F '\t' 'NF >= 2 {print $2}' <<<"$PRUNE_SWEEP")"
   while IFS=$'\t' read -r job _ended _hub _term _age _last _comp _owner _label _pane _tab; do
     [[ -n "$job" ]] || continue
     [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
     [[ -z "$lane" || "$_owner" == "$lane" ]] || continue
     [[ "$_ended" == 1 ]] || continue # hk1813-ended-quota-release-pass
-    job_has_live_completion_sentinel "$job" && continue
+    [[ $'\n'"$_live_jobs"$'\n' != *$'\n'"$job"$'\n'* ]] || continue
     if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
-      quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"
+      if (( apply )); then quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"; fi
       echo "skip job=$job reason=arbiter-unavailable"
       continue
     fi
-    _quota_status="$("$_quota_arb" status --job "$job" --json 2>/dev/null)" || {
-      quota_release_log "$job" "-" "rc=$? reason=status-failed"
+    if (( _quota_rc != 0 )); then
+      if (( apply )); then quota_release_log "$job" "-" "rc=$_quota_rc reason=status-failed"; fi
       echo "skip job=$job reason=status-failed"
       continue
-    }
-    _quota_pools="$(python3 - "$_quota_status" <<'PY'
-import json, sys
-try:
-    doc = json.loads(sys.argv[1])
-except ValueError:
-    raise SystemExit(0)
-pools = {row.get("pool") for row in doc.get("quota_pool_records") or []
-         if isinstance(row, dict) and isinstance(row.get("pool"), str) and row["pool"]}
-print("\n".join(sorted(pools)))
-PY
-    )"
+    fi
+    _quota_pools=""
+    while IFS=$'\t' read -r _qj _qp; do
+      [[ "$_qj" == "$job" && -n "$_qp" ]] || continue
+      _quota_pools+="$_qp"$'\n'
+    done <<<"$_quota_map"
     [[ -n "$_quota_pools" ]] || continue
-    _quota_csv="$(tr '\n' ',' <<<"$_quota_pools")"
-    _quota_csv="${_quota_csv%,}"
+    _quota_csv="$(printf '%s' "$_quota_pools" | sort -u | paste -sd, -)"
     _quota_pane="$_pane"
     [[ "$_quota_pane" == - ]] && _quota_pane=""
+    # hk1860: the newest job.spawned pane must not be alive. The probe classes
+    # match prune pass 2; an unverifiable probe skips too (fail safe).
+    if [[ -n "$_quota_pane" ]]; then
+      _probe="$(herdr_agent_probe "$_quota_pane")"
+      IFS=$'\t' read -r _pclass _ptoken _ <<<"$_probe"
+      case "$_pclass" in
+        gone) ;;
+        ok) echo "skip job=$job reason=pane-alive"; continue ;;
+        *) echo "skip job=$job reason=pane-unverified($_ptoken)"; continue ;;
+      esac
+    fi
     if (( apply )); then
-      _quota_rc=0
-      release_job_quota_pool "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$? # hk1813-ended-quota-release-call
-      [[ "$_quota_rc" != 2 ]] || continue
+      _quota_rc2=0
+      release_job_quota_pool "$job" "$_quota_pane" ended-no-sentinel || _quota_rc2=$? # hk1813-ended-quota-release-call
+      [[ "$_quota_rc2" != 2 ]] || continue
       quota_releases=$(( quota_releases + 1 ))
       echo "release-attempted job=$job pools=$_quota_csv"
     else
-      _quota_rc=0
-      quota_release_round_current "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$?
-      [[ "$_quota_rc" != 2 ]] || continue
+      _quota_rc2=0
+      quota_release_round_current "$job" "$_quota_pane" ended-no-sentinel || _quota_rc2=$?
+      [[ "$_quota_rc2" != 2 ]] || continue
       quota_releases=$(( quota_releases + 1 ))
       echo "would-release job=$job pools=$_quota_csv"
     fi
