@@ -64,6 +64,21 @@ seed_join_round() {
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
 export ARBITER_BIN="$TMP/absent-arbiter"
+# hk 1439: the suite never reaches the real scopefuel through bin/arbiter's PATH
+# fallback (scopefuel_bin). SCOPEFUEL_BIN is suite-wide; per-command overrides stay.
+# Tripwire: scopefuel/devin/kimi shims sit first on PATH, log their argv and exit 99,
+# and the end-of-suite check fails on any logged call. Every PATH edit below only
+# prepends, so the shim dir stays reachable.
+export SCOPEFUEL_BIN="$SCOPEFUEL"
+TRIPWIRE_LOG="$TMP/tripwire.log"; : >"$TRIPWIRE_LOG"
+export TRIPWIRE_LOG
+mkdir -p "$TMP/tripwire-bin"
+for tw_name in scopefuel devin kimi; do
+  printf '%s\n' '#!/bin/sh' \
+    "printf '%s\\n' \"$tw_name \$*\" >>\"\$TRIPWIRE_LOG\"" 'exit 99' >"$TMP/tripwire-bin/$tw_name"
+  chmod +x "$TMP/tripwire-bin/$tw_name"
+done
+export PATH="$TMP/tripwire-bin:$PATH"
 export XDG_DATA_HOME="$TMP/xdg"
 export XDG_CACHE_HOME="$TMP/xdg-cache"
 export XDG_CONFIG_HOME="$TMP/xdg-config"
@@ -15526,6 +15541,31 @@ else
   [[ "$T1137_RC" -ne 2 || ! -s "$T1137_ERR" ]] ||
     fail "hk1137 M1 mutant survived: --lane-defer still refused the non-ASCII id without the locale pin"
   echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
+fi
+
+# hk 1439: deliberate check — with SCOPEFUEL_BIN unset, a profile lease falls back
+# to PATH, must hit the tripwire shim (rc 99 via the lease error), then the log is
+# restored to its prior content so the end-of-suite check still means something.
+tw_job=tripwire-deliberate
+"$ARBITER" claim --job "$tw_job" --agent-label fixture --lane fixture --t T1 >/dev/null
+# the gate text must carry a pool so resolve_pool goes on to known_pools (scopefuel --json)
+printf '%s\n' 'profile=codex-luna-max pool=codex' >"$TMP/tw-gate.txt"
+tw_rc=0
+cp "$TRIPWIRE_LOG" "$TMP/tripwire.before"
+( unset SCOPEFUEL_BIN
+  "$ARBITER" lease --job "$tw_job" --kind quota_pool --profile codex-luna-max \
+    --gate-output "$TMP/tw-gate.txt" --json >"$TMP/tw-lease.out" 2>"$TMP/tw-lease.err" ) || tw_rc=$?
+[[ "$tw_rc" -ne 0 ]] || fail "hk1439: lease without SCOPEFUEL_BIN unexpectedly succeeded"
+[[ "$(wc -l <"$TRIPWIRE_LOG")" -gt "$(wc -l <"$TMP/tripwire.before")" ]] ||
+  fail "hk1439: tripwire did not fire for a lease without SCOPEFUEL_BIN: $(cat "$TMP/tw-lease.err")"
+grep -q 'exit 99' "$TMP/tw-lease.err" "$TMP/tw-lease.out" ||
+  fail "hk1439: lease error did not show the tripwire rc 99: $(cat "$TMP/tw-lease.err")"
+cp "$TMP/tripwire.before" "$TRIPWIRE_LOG" # drop only this case's own line
+echo "PASS hk1439 tripwire fires when SCOPEFUEL_BIN is unset"
+if [[ -s "$TRIPWIRE_LOG" ]]; then
+  echo "FAIL: hk1439 real-binary tripwire hit (caller argv):" >&2
+  cat "$TRIPWIRE_LOG" >&2
+  exit 1
 fi
 
 bash "$ROOT/tests/test-shellcheck-capped.sh"
