@@ -116,5 +116,17 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
           python3 -m unittest discover -s tests -p 'test_quota_stale_report.py' -v
           python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
+      - name: O3 canonical adapter, intents and projections (fake only)
+        shell: bash
+        run: |
+          O3_TMP="$(mktemp -d /tmp/o3ci.XXXXXX)"
+          trap 'python3 -c '\''import shutil,sys; shutil.rmtree(sys.argv[1])'\'' "$O3_TMP"' EXIT
+          mkdir -p "$O3_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
+          HOME="$O3_TMP/home" XDG_CONFIG_HOME="$O3_TMP/config" \
+            XDG_DATA_HOME="$O3_TMP/data" XDG_CACHE_HOME="$O3_TMP/cache" \
+            XDG_STATE_HOME="$O3_TMP/state" XDG_RUNTIME_DIR="$O3_TMP/runtime" \
+            CODEX_HOME="$O3_TMP/codex" ARBITER_INBOX_ROOT="$O3_TMP/jobs" \
+            TMPDIR="$O3_TMP" WRK_TEST_MODE=1 \
+            python3 -m unittest discover -s tests/o3 -p 'test_*.py' -v
       - name: Mock MCP isolation, project migration and assertion mutants (fake only)
         run: python -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
