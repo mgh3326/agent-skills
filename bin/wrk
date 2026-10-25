@@ -4720,10 +4720,7 @@ def wrk_verdict_files(job_dir):
                 data = handle.read()
         except OSError:
             continue
-        try:
-            text = data.decode("utf-8")
-        except UnicodeDecodeError:
-            continue
+        text = data.decode("utf-8", errors="replace")  # hk1900-utf8-replace
         lines = text.splitlines()
         if not lines or wrk_verdict_line.match(lines[0]) is None:  # hk1449-verdict-first-line
             continue
