@@ -288,6 +288,11 @@ def check_payload(kind, payload):
         _need(isinstance(payload["source_locator"], str) and isinstance(payload["source_sha256"], str))
     elif kind == "import_begin":
         _need(_int(payload["shadow_cutoff_seq"]))
+    elif kind == "import_seal":
+        # 5: numbering_floor = max(baseline_used, ...); a seal below its own
+        # baseline is not a server answer this client can trust.
+        _need(_int(payload["baseline_used"]) and _int(payload["numbering_floor"]))
+        _need(payload["numbering_floor"] >= payload["baseline_used"])
     elif kind == "end":
         _need(payload["end_type"] in ("revoked", "reaped", "handed_off"))
 
@@ -873,6 +878,33 @@ def load_snapshot(directory, job):
     return document
 
 
+def advance_snapshot(directory, job, outcome):
+    """After an accepted write, move the cached read forward by that one record
+    when it is the next seq (display and offline routing only)."""
+    try:
+        snapshot = load_snapshot(directory, job)
+    except Fail:
+        return
+    record = outcome.record
+    if snapshot is None or snapshot.get("snapshot_seq") != record["seq"] - 1 or not outcome.created:
+        return
+    if snapshot.get("tail_hash") != record["previous_hash"]:
+        return
+    heads, testers = dict(snapshot.get("open_heads", {})), dict(snapshot.get("open_testers", {}))
+    if record["kind"] == "round_open":
+        heads[str(record["payload"]["round_no"])] = record["payload"]["head"]
+        testers[str(record["payload"]["round_no"])] = record["payload"]["tester_job_id"]
+    open_rounds = {str(n) for n in outcome.summary["open_rounds"]}
+    snapshot.update({"read_at": now_utc(), "snapshot_seq": record["seq"], "tail_hash": record["record_hash"],
+                     "summary": outcome.summary, "claim_seq": outcome.summary["claim_seq"],
+                     "open_heads": {k: v for k, v in heads.items() if k in open_rounds},
+                     "open_testers": {k: v for k, v in testers.items() if k in open_rounds}})
+    try:
+        atomic_write(directory, SNAPSHOT, snapshot)
+    except Fail:
+        pass
+
+
 def snapshot_regressed(snapshot, state):
     """The cached read is a retained witness too."""
     if snapshot is None:
@@ -1213,13 +1245,15 @@ class Route(object):
         self.code = code
 
 
-def route(ctx, job, operation, store=None):
+def route(ctx, job, operation, store=None, offline_formed=False):
     """legacy, o3 (with a fresh canonical state) or offline_shadow; else Fail.
 
     offline_shadow is the section 6 step-2 P1 branch: shadow mode, server
     unreachable, and the last canonical read showed an unactivated
     builder/worker subject. No cached read, or one that showed
-    receipt_required, fails closed."""
+    receipt_required, fails closed; with offline_formed the caller gets the
+    cached read (offline_formed) to form its exact request as a pending intent
+    before it fails closed (director-1 offline-verdict ruling)."""
     if ctx.mode == "legacy":
         return Route("legacy")
     try:
@@ -1235,6 +1269,8 @@ def route(ctx, job, operation, store=None):
                     and not snapshot.get("activated") and snapshot.get("role") in ("builder", "worker")
                     and snapshot.get("summary", {}).get("state") == "shadow"):
                 return Route("offline_shadow", snapshot=snapshot, code=exc.code)
+            if offline_formed and snapshot is not None:
+                return Route("offline_formed", snapshot=snapshot, code=exc.code)
             raise Fail(exc.code, "%s: no canonical read; refusing" % operation)
         raise Fail(exc.code)
     if state is None:
@@ -1252,8 +1288,10 @@ def meta_from(opts):
             "parent": opts.get("--parent", "")}
 
 
-def finish_projection(ctx, job, state_or_records, mode, meta, provenance, ok_line):
+def finish_projection(ctx, job, state_or_records, mode, meta, provenance, ok_line, outcome=None):
     records = state_or_records
+    if outcome is not None:
+        advance_snapshot(ctx.jobdir(job), job, outcome)
     if not write_projections(ctx.inbox, job, records, mode, meta, provenance):
         emit("projection_pending job=%s" % job)
         raise Fail("projection_pending", "the receipt is stored; the local event is repaired from server records "
@@ -1326,7 +1364,8 @@ def round_open(ctx, job, opts):
              % outcome.intent["idempotency_key"])
     finish_projection(ctx, job, [record], mode, meta, "receipt",
                       "OK job=%s round=%d cap=3 head=%s o3=%s seq=%d%s" % (
-                          job, record["payload"]["round_no"], record["payload"]["head"], mode, record["seq"], note))
+                          job, record["payload"]["round_no"], record["payload"]["head"], mode, record["seq"], note),
+                      outcome)
 
 
 def verdict_round(state, head):
@@ -1343,7 +1382,7 @@ def round_verdict(ctx, job, opts):
     tester_flag = job_arg(opts.get("--tester"), "--tester")
     meta = meta_from(opts)
     with Intents(ctx.inbox, job) as store:
-        decision = route(ctx, job, "round verdict", store)
+        decision = route(ctx, job, "round verdict", store, offline_formed=True)
         if decision.kind == "legacy":
             emit("LEGACY")
             return
@@ -1357,12 +1396,25 @@ def round_verdict(ctx, job, opts):
         return {"round_no": number, "head": head, "verdict": verdict, "path": vpath,
                 "content_sha256": sha256_hex(data), "content_b64": b64(data),
                 "tester_job_id": tester_flag if tester_flag is not None else tester}
-    if decision.kind == "offline_shadow":
+    if decision.kind in ("offline_shadow", "offline_formed"):
         snapshot = decision.snapshot
         numbers = sorted(int(n) for n, h in snapshot.get("open_heads", {}).items() if h == head)
-        if not numbers:
-            raise Fail(decision.code, "round verdict: no canonical read and no cached open round for head %s" % head)
-        tester = snapshot.get("open_testers", {}).get(str(numbers[0]))
+        testers = snapshot.get("open_testers", {})
+        if not numbers or str(numbers[0]) not in testers:
+            # No complete request can be formed without inventing a field: no intent.
+            raise Fail(decision.code, "round verdict: no canonical read and no cached open round for head %s; "
+                       "nothing recorded" % head)
+        tester = testers[str(numbers[0])]
+        if decision.kind == "offline_formed":
+            # Enforced: the exact request is formed from the last canonical read
+            # and kept pending; nothing is sent and nothing is accepted.
+            with Intents(ctx.inbox, job) as store:
+                request = {"kind": "verdict", "claim_seq": snapshot["claim_seq"],
+                           "expected_seq": snapshot["snapshot_seq"], "payload": payload_for(numbers[0], tester)}
+                intent = store.new(request)
+                store.save()
+            raise Fail(decision.code, "round verdict: no canonical read; the verdict bytes are kept in pending "
+                       "intent %s for the next run" % intent["idempotency_key"])
         outcome = offline_intent(ctx, job, "verdict", lambda _s: payload_for(numbers[0], tester), "round verdict")
         if outcome is None:
             return
@@ -1391,7 +1443,8 @@ def round_verdict(ctx, job, opts):
     payload = record["payload"]
     finish_projection(ctx, job, [record], mode, meta, "receipt",
                       "OK job=%s verdict=%s head=%s round=%d o3=%s seq=%d" % (
-                          job, payload["verdict"], payload["head"], payload["round_no"], mode, record["seq"]))
+                          job, payload["verdict"], payload["head"], payload["round_no"], mode, record["seq"]),
+                      outcome)
 
 
 def round_void(ctx, job, opts):
@@ -1421,7 +1474,8 @@ def round_void(ctx, job, opts):
     record = outcome.record
     finish_projection(ctx, job, [record], o3_mode_name(state), meta, "receipt",
                       "OK job=%s VOIDED round=%d grant=%d o3=%s seq=%d" % (
-                          job, record["payload"]["round_no"], grant, o3_mode_name(state), record["seq"]))
+                          job, record["payload"]["round_no"], grant, o3_mode_name(state), record["seq"]),
+                      outcome)
 
 
 def status_line(state):

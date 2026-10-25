@@ -894,6 +894,33 @@ class MatrixCase(O3Case):
         self.assertEqual(base64.b64decode(pending["request"]["payload"]["content_b64"]), vfile.read_bytes())
         self.assertEqual(w.events("job-a", "job.verdict"), [])
 
+    def test_verdict_D_unreadable_server_forms_the_intent_only_from_a_cached_round(self):
+        w = self.world()
+        w.enforced_builder()
+        vfile = w.verdict_file("v.md", w.heads[0])
+        # No snapshot holds the round head: fail closed and record no intent.
+        w.fault("job", "error:transport_unavailable")
+        self.assertRc(w.run("round", "verdict", "job-a", "--file", vfile), 75, "transport_unavailable")
+        self.assertEqual(w.intents("job-a"), [])
+        # A cached open round on this head (and its tester): the exact request is
+        # formed and stays pending; nothing is sent or projected.
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+        before = len(w.appends())
+        w.fault("job", "error:transport_unavailable")
+        self.assertRc(w.run("round", "verdict", "job-a", "--file", vfile), 75, "transport_unavailable")
+        pending = [i for i in w.intents("job-a") if i["state"] == "pending"]
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]["request"]["payload"]["round_no"], 1)
+        self.assertIsNone(pending[0]["request"]["payload"]["tester_job_id"])
+        self.assertEqual(base64.b64decode(pending[0]["request"]["payload"]["content_b64"]), vfile.read_bytes())
+        self.assertEqual(len(w.appends()), before)
+        self.assertEqual(w.events("job-a", "job.verdict"), [])
+        # Recovery resends that exact intent by its key.
+        out = w.run("round", "verdict", "job-a", "--file", vfile)
+        self.assertRc(out, 0)
+        self.assertEqual(w.appends("verdict")[-1]["argv"][w.appends("verdict")[-1]["argv"].index("--idempotency-key") + 1],
+                         pending[0]["idempotency_key"])
+
     # -- round void --
     def test_void_A_typed_grant_then_projection(self):
         w = self.world()
@@ -1440,6 +1467,66 @@ class RuleCase(O3Case):
         self.assertRc(out, 73, "duplicate_path")
         self.assertEqual(len(w.events("job-a", "job.verdict")), 1)
 
+    def test_r2_reviewer_end_after_an_accepted_pass_does_not_block_joined(self):
+        w = self.world()
+        w.enforced_builder()
+        w.seed("rev-b", "claim", {"job_id": "rev-b", "owner_lane": "b2400-a", "parent_lane": "b2400-a",
+                                  "task_id": 2400, "host_client_id": "desktop", "role": "tester", "tier": "T2",
+                                  "review_of": {"job_id": "job-a", "round_no": 1}, "predecessor_job_id": None,
+                                  "supersedes": None}, client="desktop")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0], "--tester", "rev-b"), 0)
+        self.assertRc(w.run("round", "verdict", "job-a", "--file", w.verdict_file("p.md", w.heads[0])), 0)
+        w.seed("rev-b", "end", {"end_type": "reaped", "reason_code": "test_end"})
+        report = w.base / "report.md"
+        report.write_text("joined after reviewer cleanup\n")
+        out = w.adapter("joined", "job-a", "--pr", "https://github.com/o/r/pull/1", "--head", w.heads[0],
+                        "--report", report)
+        self.assertRc(out, 0)
+        self.assertIn("RECEIPT", out.stdout)
+
+    def seal_world(self):
+        w = self.world()
+        w.mode("required")
+        w.set_stub()
+        w.seed("job-n", "claim", {"job_id": "job-n", "owner_lane": "b2400-a", "parent_lane": "director-1",
+                                  "task_id": 2400, "host_client_id": "desktop", "role": "builder", "tier": "T2",
+                                  "review_of": None, "predecessor_job_id": None, "supersedes": None})
+        archive = w.base / "archive"
+        shutil.copytree(PACK / "legacy" / "inflight" / "events", archive)
+        for args in (["import-begin"], ["import", "--events-dir", archive], ["import-seal", "--events-dir", archive]):
+            self.assertRc(w.run("o3", "central", args[0], "job-n", "--as", "director-1", *args[1:]), 0)
+        seal = [r for r in w.records("job-n") if r["kind"] == "import_seal"][0]
+        self.assertRc(w.run("o3", "central", "activate", "job-n", "--as", "director-1", "--seal-seq", seal["seq"]), 0)
+        w.local_claim("job-n")
+        return w, seal
+
+    def test_r10_post_import_numbering_round_4_with_the_extension(self):
+        w, seal = self.seal_world()
+        self.assertEqual((seal["payload"]["baseline_used"], seal["payload"]["numbering_floor"]), (3, 3))
+        self.assertRc(w.run("round", "open", "job-n", "--head", w.heads[0]), 78, "round_cap")
+        ext = w.grant("job-n", "extension", round_no=4, head=w.heads[0])
+        out = w.run("round", "open", "job-n", "--head", w.heads[0], "--extension-grant", ext["seq"])
+        self.assertRc(out, 0)
+        self.assertIn("round=4", out.stdout)
+        self.assertEqual(w.events("job-n", "job.round")[-1]["round"], 4)
+
+    def test_r10_a_seal_with_floor_below_baseline_fails_closed(self):
+        w, seal = self.seal_world()
+        state = w.stub()
+        records = state["jobs"]["job-n"]["records"]
+        records[seal["seq"] - 1]["payload"]["numbering_floor"] = 2
+        previous = records[seal["seq"] - 2]["record_hash"]
+        for record in records[seal["seq"] - 1:]:
+            record["previous_hash"] = previous
+            record["record_hash"] = ADAPTER.record_hash(record)
+            previous = record["record_hash"]
+        w.set_stub(**state)
+        (w.inbox / "job-n" / "o3-snapshot.json").unlink()
+        (w.inbox / "job-n" / "o3-intents.json").unlink()
+        out = w.run("round", "open", "job-n", "--head", w.heads[0])
+        self.assertRc(out, 75, "protocol_invalid")
+        self.assertEqual(w.events("job-n", "job.round"), [])
+
     def test_r4_consumed_extension_grant_is_grant_consumed(self):
         w = self.world()
         w.enforced_builder()
@@ -1517,7 +1604,7 @@ class RuleCase(O3Case):
         self.assertRc(out, 73, "round_not_open")
         self.assertEqual(w.events("job-a", "job.verdict"), [])
 
-    def test_r3_reused_job_id_and_self_reference_are_claim_conflict_without_a_mint(self):
+    def test_r3_reused_job_id_and_self_reference_reach_the_server_and_map_its_code(self):
         w = self.world()
         w.mode("required")
         w.enroll("job-a", tier="T1")

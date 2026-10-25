@@ -118,3 +118,5 @@ jobs:
           python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
       - name: Mock MCP isolation, project migration and assertion mutants (fake only)
         run: python -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
+      - name: O3 wrk journal adapter, projections and import tooling (hk 1926)
+        run: python3 -m unittest discover -s tests -p 'test_wrk_o3.py' -v
