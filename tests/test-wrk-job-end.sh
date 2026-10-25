@@ -5268,6 +5268,9 @@ case_hk1933_restore_partial() {
     { assertion_red 'hk1933 a failed receipt write must not retry the reclaim'; return 1; }
   [[ "$(event_count "$INBOX/$job/events" job.spawned)" == 1 ]] ||
     { assertion_red 'hk1933 a failed receipt write must leave the receipt count alone'; return 1; }
+  # The sentinel starts only after the receipt lands: no receipt, no watcher.
+  [[ ! -e "$INBOX/$job/completion-sentinel.pid" ]] ||
+    { assertion_red 'hk1933 a failed receipt write must start no sentinel'; return 1; }
   line="$(cat "$err")"
   cmd="${line#*complete the restore with: }"
   [[ "$cmd" != "$line" ]] || { assertion_red 'hk1933 the stderr line must carry the completion command'; return 1; }
@@ -5580,5 +5583,9 @@ expect_mut_red "hk1933 M6 starting a second sentinel over a live one must fail t
 mkmut_span hk1933-m7-prune-no-release 'hk1798-prune-stale-release' '        : # removed hk1798 prune stale release'
 expect_mut_red "hk1933 M7 prune ending a dead restored round without its quota release must fail the chain case" case_hk1933_restore_pane_gone_chain_m7 \
   'ASSERT-RED: hk1933 prune must release the restored quota row with quota_pool.release'
+
+mkmut_span hk1933-m8-sentinel-before-receipt 'hk1933-restore-receipt' '  start_completion_sentinel "$(wrk_jobs_root)/$job/completion-sentinel.pid" "$job" "$owner" "$label" "$pane" "" "" "" "" "" || true; "$arb" event --job "$job" --kind job.spawned --payload-json "$receipt" >/dev/null 2>&1 || rc=$?'
+expect_mut_red "hk1933 M8 starting the sentinel before the receipt copy must fail the failed-receipt case" case_hk1933_restore_partial \
+  'ASSERT-RED: hk1933 a failed receipt write must start no sentinel'
 
 echo "PASS test-wrk-job-end: all cases"
