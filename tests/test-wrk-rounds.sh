@@ -9,7 +9,10 @@
 #   flow-duplicate-join-after-delegated
 #   flow-delegated-panewire-joined
 #   flow-parking-arcade-join
-#   hk1506-binding-unchanged
+#   hk1506-head-binding
+#   hk1506-no-head-round-refused
+#   hk1506-no-open-round-refused
+#   hk1506-unbound-verdict-readers-unchanged
 # hk 1900: a round counts toward the join only once a verdict is recorded for it,
 # the join rechecks the end record and the gate inside the events lock, and a
 # verdict file with a non-UTF-8 byte is read with replacement, not skipped.
@@ -175,6 +178,11 @@ open_ok() { # open_ok job head
   assert_rc 0
 }
 
+open_with() { # open_with wrk-path job head
+  run_cmd "$1" round open "$2" --head "$3" --repo "$TEST_REPO"
+  assert_rc 0
+}
+
 verdict_ok() { # verdict_ok job file
   run_cmd "$WRK" round verdict "$1" --file "$2"
   assert_rc 0
@@ -232,6 +240,7 @@ printf 'builder report\n' >"$REPORT"
 
 # ── A: distinct verdicts ────────────────────────────────────────────────
 claim_job a-path
+open_ok a-path "$H1"
 write_verdict_file "$TMP/a-path.md" PASS "$H1" 'path body'
 verdict_ok a-path "$TMP/a-path.md"
 run_cmd "$WRK" round verdict a-path --file "$TMP/a-path.md"
@@ -250,6 +259,7 @@ stored_sha="$(verdict_field a-path 0 content_sha256 | tail -n 1)"
 echo "PASS a-same-path-refused"
 
 claim_job a-bytes
+open_ok a-bytes "$H1"
 cp "$TMP/a-path.md" "$TMP/a-bytes-1.md"
 cp "$TMP/a-path.md" "$TMP/a-bytes-2.md"
 verdict_ok a-bytes "$TMP/a-bytes-1.md"
@@ -266,6 +276,7 @@ assert_refused "wrk: round verdict: verdict content $(file_sha "$TMP/a-bytes-1.m
 echo "PASS a-same-content-refused"
 
 claim_job a-head
+open_ok a-head "$H2"
 write_verdict_file "$TMP/a-head-1.md" PASS "$H2" 'head body one'
 write_verdict_file "$TMP/a-head-2.md" BLOCKER "$H2" 'head body two'
 verdict_ok a-head "$TMP/a-head-1.md"
@@ -284,7 +295,7 @@ echo "PASS a-same-head-refused"
 # Same head after a planted void is allowed and binds to the next open round.
 # The void command itself still refuses a round that already has a verdict.
 claim_job a-voided
-open_ok a-voided "$H1"
+open_ok a-voided "$H3"
 write_verdict_file "$TMP/a-void-a.md" PASS "$H3" 'voided head A'
 verdict_ok a-voided "$TMP/a-void-a.md"
 write_verdict_file "$TMP/a-void-b.md" PASS "$H3" 'voided head B'
@@ -297,7 +308,7 @@ grep -q 'already has a job.verdict' "$TMP/run.err" || fail "HAS_VERDICT refusal 
 write_event "$ARBITER_INBOX_ROOT/a-voided/events/00090-job.round_void.json" <<EOF
 {"kind":"job.round_void","job_id":"a-voided","round":1,"ref":"hk:task/9","created_at":"2026-10-23T00:10:00Z"}
 EOF
-open_ok a-voided "$H2"
+open_ok a-voided "$H3"
 write_verdict_file "$TMP/a-void-c.md" PASS "$H3" 'voided head C'
 verdict_ok a-voided "$TMP/a-void-c.md"
 [[ "$(kind_count a-voided job.verdict)" -eq 2 ]] || fail "same head after a void must be recorded"
@@ -328,6 +339,7 @@ write_event "$ARBITER_INBOX_ROOT/b-ended/events/00003-job.reclaim.json" <<EOF
 EOF
 open_ok b-ended "$H1"
 open_ok b-ended "$H2"
+open_ok b-ended "$H4"
 grant_doc void-b "$(printf 'round-void: job=b-ended round=2 by=director-1\n')"
 run_cmd "$WRK" round void b-ended 2 --by hk:doc/void-b
 assert_rc 0
@@ -435,7 +447,7 @@ assert_refused "wrk: joined: job c-both has zero non-voided recorded rounds; unm
 echo "PASS c-zero-and-unmatched-one-line"
 
 claim_job c-matched
-open_ok c-matched "$H1"
+open_ok c-matched "$H2"
 matched="$ARBITER_INBOX_ROOT/c-matched/verdict.md"
 write_verdict_file "$matched" PASS "$H2" 'matched in the job dir'
 verdict_ok c-matched "$matched"
@@ -443,7 +455,7 @@ join_ok c-matched
 echo "PASS c-matched-path-allowed"
 
 claim_job c-copy
-open_ok c-copy "$H1"
+open_ok c-copy "$H3"
 write_verdict_file "$TMP/c-copy-src.md" PASS "$H3" 'bytes that will be copied'
 verdict_ok c-copy "$TMP/c-copy-src.md"
 cp "$TMP/c-copy-src.md" "$ARBITER_INBOX_ROOT/c-copy/copy.md"
@@ -614,7 +626,9 @@ verdict_ok flow-void "$TMP/flow-void-v.md"
 join_ok flow-void
 echo "PASS flow-voided-round-then-verdict-then-joined"
 claim_job flow-void-only
-seed_open_round flow-void-only
+write_event "$ARBITER_INBOX_ROOT/flow-void-only/events/00002-job.round.json" <<EOF
+{"kind":"job.round","job_id":"flow-void-only","round":1,"head":"$H1","created_at":"2026-10-23T00:00:01Z"}
+EOF
 write_event "$ARBITER_INBOX_ROOT/flow-void-only/events/00082-job.round_void.json" <<'EOF'
 {"kind":"job.round_void","job_id":"flow-void-only","round":1,"ref":"hk:doc/void-only","created_at":"2026-10-23T00:00:04Z"}
 EOF
@@ -623,8 +637,10 @@ assert_refused "wrk: joined: job flow-void-only has zero non-voided recorded rou
 open_ok flow-void-only "$H1"
 run_cmd "$WRK" joined flow-void-only --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT"
 assert_refused "wrk: joined: job flow-void-only has zero non-voided recorded rounds"
-write_verdict_file "$TMP/flow-void-only.md" PASS "$H2" 'verdict on the new round'
+write_verdict_file "$TMP/flow-void-only.md" PASS "$H1" 'verdict on the new round'
 verdict_ok flow-void-only "$TMP/flow-void-only.md"
+bound_round="$(verdict_field flow-void-only 0 round | tail -n 1)"
+[[ "$bound_round" == "2" ]] || fail "verdict must skip the voided matching round, got $bound_round"
 join_ok flow-void-only
 echo "PASS flow-voided-only-cannot-join-until-a-new-round"
 
@@ -649,6 +665,8 @@ EOF
 open_ok flow-take-own "$H1"
 write_verdict_file "$TMP/flow-take-own.md" PASS "$H1" 'the new builder own verdict'
 verdict_ok flow-take-own "$TMP/flow-take-own.md"
+bound_round="$(verdict_field flow-take-own 0 round | tail -n 1)"
+[[ "$bound_round" == "2" ]] || fail "takeover builder verdict must bind to its own round 2, got $bound_round"
 join_ok flow-take-own
 claim_job flow-take-open
 write_event "$ARBITER_INBOX_ROOT/flow-take-open/events/00002-job.takeover.json" <<'EOF'
@@ -753,7 +771,11 @@ echo "PASS flow-delegated-joined-gated-before-handoff"
 
 echo "== flow-parking-arcade-join =="
 claim_job flow-pa pa-integrator
-seed_round flow-pa
+open_ok flow-pa "$H2"
+write_verdict_file "$TMP/flow-pa.md" PASS "$H2" 'pa-integrator builder own round'
+verdict_ok flow-pa "$TMP/flow-pa.md"
+bound_round="$(verdict_field flow-pa 0 round | tail -n 1)"
+[[ "$bound_round" == "1" ]] || fail "ParkingArcade builder verdict must bind to its own round 1, got $bound_round"
 join_ok flow-pa
 python3 -c 'import json,os,sys
 root=sys.argv[1]
@@ -766,18 +788,106 @@ raise SystemExit("missing joined")
 ' "$ARBITER_INBOX_ROOT"
 echo "PASS flow-parking-arcade-join"
 
-echo "== hk1506-binding-unchanged =="
-claim_job flow-bind
-open_ok flow-bind "$H1"
-open_ok flow-bind "$H2"
-write_verdict_file "$TMP/flow-bind.md" PASS "$H4" 'binds to the oldest open round'
-verdict_ok flow-bind "$TMP/flow-bind.md"
-bound="$(verdict_field flow-bind 0 round | tail -n 1)"
-[[ "$bound" == "1" ]] || fail "verdict must still bind to the oldest open round, got $bound"
-echo "PASS hk1506-binding-unchanged"
+echo "== hk1506-head-binding =="
+claim_job bind-wrong-head
+open_ok bind-wrong-head "$H1"
+write_verdict_file "$TMP/bind-wrong-head.md" PASS "$H2" 'wrong-head round must stay open'
+run_cmd "$WRK" round verdict bind-wrong-head --file "$TMP/bind-wrong-head.md"
+assert_rc 2
+assert_refused "wrk: round verdict: no open round for head $H2 on job bind-wrong-head (open: 1@${H1:0:7}); open one with wrk round open bind-wrong-head --head $H2"
+[[ "$(kind_count bind-wrong-head job.verdict)" -eq 0 ]] || fail "wrong-head verdict wrote a job.verdict"
+status="$("$WRK" round status bind-wrong-head)"
+grep -q 'rounds=1' <<<"$status" || fail "wrong-head refusal must preserve the stale round count: $status"
+grep -q 'open=1' <<<"$status" || fail "wrong-head refusal must leave round 1 open: $status"
+open_ok bind-wrong-head "$H2"
+verdict_ok bind-wrong-head "$TMP/bind-wrong-head.md"
+bound="$(verdict_field bind-wrong-head 0 round | tail -n 1)"
+[[ "$bound" == "2" ]] || fail "same file must bind to the later matching round, got $bound"
+echo "PASS hk1506-wrong-head-refused-then-retried"
+
+claim_job bind-x-y
+open_ok bind-x-y "$H1"
+open_ok bind-x-y "$H2"
+write_verdict_file "$TMP/bind-x-y.md" PASS "$H2" 'the matching second round'
+verdict_ok bind-x-y "$TMP/bind-x-y.md"
+bound="$(verdict_field bind-x-y 0 round | tail -n 1)"
+[[ "$bound" == "2" ]] || fail "X/Y verdict must bind to matching round 2, got $bound"
+status="$("$WRK" round status bind-x-y)"
+grep -q 'open=1' <<<"$status" || fail "the nonmatching X round must remain open: $status"
+echo "PASS hk1506-x-y-binds-matching-round"
+
+claim_job bind-same-head
+open_ok bind-same-head "$H1"
+open_ok bind-same-head "$H1"
+write_verdict_file "$TMP/bind-same-head.md" PASS "$H1" 'oldest matching round wins'
+verdict_ok bind-same-head "$TMP/bind-same-head.md"
+bound="$(verdict_field bind-same-head 0 round | tail -n 1)"
+[[ "$bound" == "1" ]] || fail "same-head verdict must bind to oldest round 1, got $bound"
+status="$("$WRK" round status bind-same-head)"
+grep -q 'open=2' <<<"$status" || fail "newer same-head round must remain open: $status"
+echo "PASS hk1506-two-same-heads-oldest-wins"
+
+claim_job bind-uppercase
+upper_h1="$(printf '%s' "$H1" | tr '[:lower:]' '[:upper:]')"
+open_ok bind-uppercase "$upper_h1"
+write_verdict_file "$TMP/bind-uppercase.md" PASS "$upper_h1" 'case folds on both heads'
+verdict_ok bind-uppercase "$TMP/bind-uppercase.md"
+bound="$(verdict_field bind-uppercase 0 round | tail -n 1)"
+[[ "$bound" == "1" ]] || fail "upper-case head must bind round 1, got $bound"
+stored_head="$(verdict_field bind-uppercase 0 head | tail -n 1)"
+[[ "$stored_head" == "$H1" ]] || fail "verdict head must stay normalized: $stored_head"
+echo "PASS hk1506-uppercase-heads-match"
+
+claim_job bind-none
+write_verdict_file "$TMP/bind-none.md" PASS "$H1" 'no open round'
+run_cmd "$WRK" round verdict bind-none --file "$TMP/bind-none.md"
+assert_rc 2
+assert_refused "wrk: round verdict: job bind-none has no open round; open one with wrk round open bind-none --head $H1"
+[[ "$(kind_count bind-none job.verdict)" -eq 0 ]] || fail "no-open refusal wrote a job.verdict"
+[[ "$(kind_count bind-none job.escalate)" -eq 0 ]] || fail "no-open refusal emitted a cap escalation"
+echo "PASS hk1506-no-open-round-refused"
+
+claim_job bind-no-head
+write_event "$ARBITER_INBOX_ROOT/bind-no-head/events/00002-job.round.json" <<'EOF'
+{"kind":"job.round","job_id":"bind-no-head","round":1,"created_at":"2026-10-23T00:00:01Z"}
+EOF
+write_verdict_file "$TMP/bind-no-head.md" PASS "$H1" 'round without a head must not match'
+run_cmd "$WRK" round verdict bind-no-head --file "$TMP/bind-no-head.md"
+assert_rc 2
+assert_refused "wrk: round verdict: no open round for head $H1 on job bind-no-head (open: 1@<no-head>); open one with wrk round open bind-no-head --head $H1"
+[[ "$(kind_count bind-no-head job.verdict)" -eq 0 ]] || fail "headless round must not bind"
+echo "PASS hk1506-round-without-head-never-matches"
+
+claim_job bind-voided-no-later
+open_ok bind-voided-no-later "$H1"
+write_event "$ARBITER_INBOX_ROOT/bind-voided-no-later/events/00003-job.round_void.json" <<'EOF'
+{"kind":"job.round_void","job_id":"bind-voided-no-later","round":1,"ref":"hk:task/1981","created_at":"2026-10-23T00:00:02Z"}
+EOF
+write_verdict_file "$TMP/bind-voided-no-later.md" PASS "$H1" 'voided round cannot bind'
+run_cmd "$WRK" round verdict bind-voided-no-later --file "$TMP/bind-voided-no-later.md"
+assert_rc 2
+assert_refused "wrk: round verdict: job bind-voided-no-later has no open round; open one with wrk round open bind-voided-no-later --head $H1"
+[[ "$(kind_count bind-voided-no-later job.verdict)" -eq 0 ]] || fail "voided-only round must not bind"
+echo "PASS hk1506-voided-only-round-refused"
+
+# A historical unbound verdict remains visible to census, cap, status, audit,
+# and join readers even though new verdict commands cannot create one.
+claim_job unbound-reader
+write_event "$ARBITER_INBOX_ROOT/unbound-reader/events/00002-job.verdict.json" <<EOF
+{"kind":"job.verdict","job_id":"unbound-reader","round":null,"head":"$H1","verdict":"PASS","created_at":"2026-10-23T00:00:02Z"}
+EOF
+status="$("$WRK" round status unbound-reader)"
+grep -q 'rounds=1' <<<"$status" || fail "round status must count the historical unbound verdict: $status"
+audit="$("$WRK" round audit --lane lane-a)"
+if grep -q 'zero-rounds job=unbound-reader' <<<"$audit"; then
+  fail "round audit must count the historical unbound verdict: $audit"
+fi
+join_ok unbound-reader
+echo "PASS hk1506-unbound-verdict-readers-unchanged"
 
 # ── dodges named by the tester brief ───────────────────────────────────
 claim_job dodge-crlf
+open_ok dodge-crlf "$H1"
 write_verdict_file "$TMP/dodge-lf.md" PASS "$H1" 'crlf body'
 verdict_ok dodge-crlf "$TMP/dodge-lf.md"
 python3 -c 'import sys; data=open(sys.argv[1],"rb").read().replace(b"\n", b"\r\n"); open(sys.argv[2],"wb").write(data)' \
@@ -793,6 +903,7 @@ for name in sorted(os.listdir(os.path.join(root,"dodge-crlf","events"))):
 echo "PASS dodge-crlf-same-head-refused"
 
 claim_job dodge-ws
+open_ok dodge-ws "$H2"
 write_verdict_file "$TMP/dodge-ws-1.md" PASS "$H2" 'ws body'
 verdict_ok dodge-ws "$TMP/dodge-ws-1.md"
 printf 'ws body\nVERDICT: PASS @%s   \n' "$H2" >"$TMP/dodge-ws-2.md"
@@ -862,7 +973,7 @@ echo "PASS dodge-same-second-name-end-wins"
 # ── hk 1900 (a): an open round with no verdict is not a join round ──────
 echo "== e-open-round-without-verdict =="
 claim_job e-open
-open_ok e-open "$H1"
+open_ok e-open "$H2"
 run_cmd "$WRK" joined e-open --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT"
 assert_refused "wrk: joined: job e-open has zero non-voided recorded rounds"
 [[ "$(kind_count e-open job.joined)" -eq 0 ]] || fail "open-then-join wrote job.joined"
@@ -874,7 +985,7 @@ echo "PASS e-open-round-without-verdict-cannot-join"
 # A verdict-bound round whose void record was planted later still counts: a void
 # only takes effect on a round that holds no verdict.
 claim_job e-bound-void
-open_ok e-bound-void "$H1"
+open_ok e-bound-void "$H2"
 write_verdict_file "$TMP/e-bound-void.md" PASS "$H2" 'bound before the void'
 verdict_ok e-bound-void "$TMP/e-bound-void.md"
 write_event "$ARBITER_INBOX_ROOT/e-bound-void/events/00093-job.round_void.json" <<'EOF'
@@ -1034,6 +1145,8 @@ grep -q 'round audit' "$TMP/usage.txt" || fail "usage must name round audit"
 grep -q -- '--rounds-waived' "$TMP/usage.txt" || fail "usage must name --rounds-waived"
 "$WRK" round --help >"$TMP/round-help.txt"
 grep -q 'audit' "$TMP/round-help.txt" || fail "round help must name audit"
+grep -q 'oldest open round on its own head and is refused when there is none' "$TMP/round-help.txt" ||
+  fail "round help must explain per-head verdict binding"
 builder_hits="$(grep -c 'rounds-waived' "$ROOT/builder/SKILL.md" || true)"
 director_hits="$(grep -c 'rounds-waived' "$ROOT/director/SKILL.md" || true)"
 [[ "$builder_hits" -eq 1 ]] || fail "builder skill must mention rounds-waived on exactly one line"
@@ -1053,6 +1166,7 @@ for anchor in (
     "if not waived and wrk_round_census(events, job)[1] <= 0:  # hk1900-inlock-zero",
     "text = data.decode(\"utf-8\", errors=\"replace\")  # hk1900-utf8-replace",
     "errors=\"replace\"):  # hk1900-verdict-decode",
+    "and round_head.lower() == vsha):  # hk1506-head-bind",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -1073,28 +1187,84 @@ PY
   chmod +x "$TMP/$name-wrk"
 }
 
+# Dropping the head comparison makes the X/Y case bind the oldest X round.
+printf '%s\n' 'and round_head.lower() == vsha):  # hk1506-head-bind => and True):  # hk1506-head-bind' >"$TMP/spec-drop-head"
+mutant drop-head "$TMP/spec-drop-head"
+claim_job mut-drop-head
+open_with "$TMP/drop-head-wrk" mut-drop-head "$H1"
+open_with "$TMP/drop-head-wrk" mut-drop-head "$H2"
+write_verdict_file "$TMP/mut-drop-head.md" PASS "$H2" 'X/Y head comparison mutant'
+run_cmd "$TMP/drop-head-wrk" round verdict mut-drop-head --file "$TMP/mut-drop-head.md"
+assert_rc 0
+bound="$(verdict_field mut-drop-head 0 round | tail -n 1)"
+[[ "$bound" == "1" ]] || fail "dropping head comparison did not break the X/Y case: $bound"
+echo "PASS mutant-drop-head-match-goes-red"
+
+# Reversing the candidate order makes the same-head case bind newest.
+printf '%s\n' 'open_rounds = [r for r in rounds => open_rounds = [r for r in reversed(rounds)' >"$TMP/spec-newest"
+mutant newest "$TMP/spec-newest"
+claim_job mut-newest
+open_with "$TMP/newest-wrk" mut-newest "$H1"
+open_with "$TMP/newest-wrk" mut-newest "$H1"
+write_verdict_file "$TMP/mut-newest.md" PASS "$H1" 'newest matching round mutant'
+run_cmd "$TMP/newest-wrk" round verdict mut-newest --file "$TMP/mut-newest.md"
+assert_rc 0
+bound="$(verdict_field mut-newest 0 round | tail -n 1)"
+[[ "$bound" == "2" ]] || fail "newest-matching mutant did not break the same-head case: $bound"
+echo "PASS mutant-newest-matching-round-goes-red"
+
+# Skipping verdict-head lowercasing makes upper-case verdict bytes miss the
+# lower-case head written by round open.
+printf '%s\n' 'verdict, vsha = matches[0].group(1), matches[0].group(2).lower() => verdict, vsha = matches[0].group(1), matches[0].group(2)' >"$TMP/spec-no-fold"
+mutant no-fold "$TMP/spec-no-fold"
+claim_job mut-no-fold
+upper_h1="$(printf '%s' "$H1" | tr '[:lower:]' '[:upper:]')"
+open_with "$TMP/no-fold-wrk" mut-no-fold "$upper_h1"
+write_verdict_file "$TMP/mut-no-fold.md" PASS "$upper_h1" 'case-sensitive head mutant'
+run_cmd "$TMP/no-fold-wrk" round verdict mut-no-fold --file "$TMP/mut-no-fold.md"
+assert_rc 2
+[[ "$(kind_count mut-no-fold job.verdict)" -eq 0 ]] || fail "case-sensitive mutant unexpectedly bound an upper-case verdict"
+echo "PASS mutant-head-without-lowercasing-goes-red"
+
+# Bypassing the no-open refusal writes a historical unbound verdict again.
+printf '%s\n' 'if target is None: => if target is None and False:' >"$TMP/spec-write-unbound"
+mutant write-unbound "$TMP/spec-write-unbound"
+claim_job mut-write-unbound
+write_verdict_file "$TMP/mut-write-unbound.md" PASS "$H1" 'no-open write mutant'
+run_cmd "$TMP/write-unbound-wrk" round verdict mut-write-unbound --file "$TMP/mut-write-unbound.md"
+assert_rc 0
+python3 - "$ARBITER_INBOX_ROOT/mut-write-unbound/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+verdict = next(row for row in events if row.get("kind") == "job.verdict")
+assert verdict.get("round") is None, verdict
+PY
+echo "PASS mutant-no-open-round-writes-unbound-goes-red"
+
 printf '%s\n' 'if digest in digests:  # hk1449-content-sha => if False:  # hk1449-content-sha' >"$TMP/spec-hash"
 mutant hash "$TMP/spec-hash"
 # Identical bytes after the head is voided: the head check would allow the
 # second file, so only the content hash still refuses it.
 claim_job mut-hash
-open_ok mut-hash "$H1"
+open_ok mut-hash "$H2"
 write_verdict_file "$TMP/mut-hash-1.md" PASS "$H2" 'mutant bytes'
 verdict_ok mut-hash "$TMP/mut-hash-1.md"
 write_event "$ARBITER_INBOX_ROOT/mut-hash/events/00092-job.round_void.json" <<'EOF'
 {"kind":"job.round_void","job_id":"mut-hash","round":1,"ref":"hk:task/8","created_at":"2026-10-23T00:30:00Z"}
 EOF
+open_ok mut-hash "$H2"
 cp "$TMP/mut-hash-1.md" "$TMP/mut-hash-2.md"
 run_cmd "$WRK" round verdict mut-hash --file "$TMP/mut-hash-2.md"
 [[ "$RUN_RC" -ne 0 ]] || fail "real wrk must still refuse duplicate content after the head is voided"
 [[ "$(kind_count mut-hash job.verdict)" -eq 1 ]] || fail "real wrk wrote a second verdict for the same bytes"
 claim_job mut-hash-red
-open_ok mut-hash-red "$H1"
+open_ok mut-hash-red "$H2"
 run_cmd "$TMP/hash-wrk" round verdict mut-hash-red --file "$TMP/mut-hash-1.md"
 assert_rc 0
 write_event "$ARBITER_INBOX_ROOT/mut-hash-red/events/00092-job.round_void.json" <<'EOF'
 {"kind":"job.round_void","job_id":"mut-hash-red","round":1,"ref":"hk:task/8","created_at":"2026-10-23T00:30:00Z"}
 EOF
+open_with "$TMP/hash-wrk" mut-hash-red "$H2"
 run_cmd "$TMP/hash-wrk" round verdict mut-hash-red --file "$TMP/mut-hash-2.md"
 [[ "$RUN_RC" -eq 0 ]] || fail "content-hash mutant must record the second file, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
 [[ "$(kind_count mut-hash-red job.verdict)" -eq 2 ]] || fail "content-hash mutant did not write the second verdict"
@@ -1230,12 +1400,12 @@ echo "PASS mutant-skip-non-utf8-files-goes-red"
 printf '%s\n' 'errors="replace"):  # hk1900-verdict-decode => errors="strict"):  # hk1900-verdict-decode' >"$TMP/spec-vdecode"
 mutant vdecode "$TMP/spec-vdecode"
 claim_job mut-vdecode
-open_ok mut-vdecode "$H1"
+open_ok mut-vdecode "$H2"
 printf 'VERDICT: PASS @%s\nbad byte \377 here\n' "$H2" >"$TMP/mut-vdecode.md"
 run_cmd "$WRK" round verdict mut-vdecode --file "$TMP/mut-vdecode.md"
 assert_rc 0
 claim_job mut-vdecode-red
-open_ok mut-vdecode-red "$H1"
+open_ok mut-vdecode-red "$H2"
 run_cmd "$TMP/vdecode-wrk" round verdict mut-vdecode-red --file "$TMP/mut-vdecode.md"
 [[ "$RUN_RC" -ne 0 ]] || fail "strict-decode mutant must fail to record the non-UTF-8 verdict file"
 [[ "$(kind_count mut-vdecode-red job.verdict)" -eq 0 ]] || fail "strict-decode mutant wrote a job.verdict"
