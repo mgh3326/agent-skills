@@ -216,7 +216,9 @@ refs.job_id equal to the job. The ref and the issuer are stored on the
 job.joined record as rounds_waived and rounds_waived_issuer. An end
 declaration newer than the newest revive is refused and cannot be waived.
 The end record and the rounds are rechecked under the events lock just before
-wrk writes job.joined; a delegated join is checked just before the hand-off only.
+wrk writes job.joined; a verified waiver's claim facts (parent lane, task id
+and the newest claim/reclaim event) are rechecked there too, and a delegated
+join is checked just before the hand-off only.
 USAGE
 }
 
@@ -4606,6 +4608,35 @@ def wrk_precommit_test_hook(events, job):
         subprocess.run([hook, events, job], check=True, stdout=subprocess.DEVNULL)
 
 
+def wrk_joined_claim_change(events, parent, task_id, version):
+    """Newest claim fact that moved since a join waiver was verified.
+
+    Re-reads the newest job.claim/job.reclaim under the events lock and
+    returns "field OLD -> NEW" for the first of parent_lane, task_id and the
+    claim event name that differs from the verified values, else "".
+    """
+    name, document = "", None
+    for cand, doc, _mtime in wrk_events_ordered(events):
+        if isinstance(doc, dict) and doc.get("kind") in ("job.claim", "job.reclaim"):
+            name, document = cand, doc
+    payload = document.get("payload") if isinstance(document, dict) else None
+    if not isinstance(payload, dict):
+        payload = document if isinstance(document, dict) else {}
+    now_parent = payload.get("parent_lane")
+    now_parent = now_parent if isinstance(now_parent, str) else ""
+    now_task = payload.get("task_id")
+    now_task = (str(now_task)
+                if isinstance(now_task, (int, str))
+                and not isinstance(now_task, bool) else "")
+    if now_parent != parent:
+        return "parent_lane %s -> %s" % (parent or "-", now_parent or "-")
+    if now_task != task_id:
+        return "task_id %s -> %s" % (task_id or "-", now_task or "-")
+    if name != version:
+        return "claim_version %s -> %s" % (version or "-", name or "-")
+    return ""
+
+
 def wrk_round_census(events, job):
     """Return (recorded, nonvoid) round evidence for one job.
 
@@ -5557,7 +5588,7 @@ done_cmd() {
 }
 
 builder_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}" waiver_issuer="${13:-}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}" waiver_issuer="${13:-}" check_parent="${14:-}" check_task="${15:-}" check_version="${16:-}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
@@ -5572,10 +5603,10 @@ builder_flat_event() {
   # scans this heredoc for quotes because it sits inside a command substitution.
   # Do not put an unmatched single quote in this body.
   local outcome rc=0
-  outcome="$(wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" "$waiver_issuer" <<'PY'
+  outcome="$(wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" "$waiver_issuer" "$check_parent" "$check_task" "$check_version" <<'PY'
 import json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived, waiver_issuer = sys.argv[1:]
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived, waiver_issuer, check_parent, check_task, check_version = sys.argv[1:]
 # wrk escalate/joined publish outside the round writer lock: take the shared
 # events lock so numbering is serialized with bin/arbiter and wrk done too.
 lock = wrk_events_locked(events)
@@ -5586,6 +5617,11 @@ if kind == "job.joined":
     if ended:  # hk1900-inlock-end
         print("ENDED\t" + ended)
         sys.exit(3)
+    if waived:  # hk2024-claim-recheck
+        changed = wrk_joined_claim_change(events, check_parent, check_task, check_version)
+        if changed:
+            print("CLAIM\t" + changed)
+            sys.exit(5)
     if not waived and wrk_round_census(events, job)[1] <= 0:  # hk1900-inlock-zero
         print("ZERO")
         sys.exit(4)
@@ -5675,6 +5711,7 @@ joined_cmd() {
   fi
   local metadata owner label pane parent role reason joined_end
   local waiver_issuer="" waiver_grant tmp_waiver task_id tmp_task
+  local claim_parent="" claim_task="" claim_version=""
   # hk 1894: the join gate (end record, rounds, verdict files) and the parent
   # lane are read from the checked inbox, never from the environment. hk 1899:
   # a waiver is fetched from handoffkeep, so that guard also judges the binary.
@@ -5691,6 +5728,12 @@ joined_cmd() {
   # and equal to the record's server-set identity. Verified here, before the
   # refusals are skipped and before the events lock is taken.
   if [[ -n "$waived" ]]; then
+    # hk 2024: keep the claim facts the waiver is verified against — parent
+    # lane, task_id and the newest claim/reclaim event — so the commit under
+    # the events lock can refuse a job released and reclaimed in between.
+    claim_parent="$parent"  # hk2024-claim-facts
+    claim_task="$(round_job_task_id "$job" || true)"
+    claim_version="$(joined_claim_version "$job")"
     tmp_waiver="$(mktemp)"
     if ! round_approval_fetch "$waived" >"$tmp_waiver"; then
       rm -f "$tmp_waiver"
@@ -5702,7 +5745,7 @@ joined_cmd() {
       die "joined: $waived has no 'join-waiver: job=$job by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
     waiver_issuer="${waiver_grant##*issuer=}"
     if [[ "$waiver_issuer" == "pa-integrator" ]]; then
-      task_id="$(round_job_task_id "$job" || true)"
+      task_id="$claim_task"
       [[ -n "$task_id" ]] ||
         die "joined: pa-integrator grants need the job's hk task on the server; $job records no task_id"
       tmp_task="$(mktemp)"
@@ -5737,11 +5780,12 @@ joined_cmd() {
     return 0
   fi
   local flat_out flat_rc=0
-  flat_out="$(builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived" "$waiver_issuer")" || flat_rc=$?
+  flat_out="$(builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived" "$waiver_issuer" "$claim_parent" "$claim_task" "$claim_version")" || flat_rc=$?
   case "$flat_rc" in
     0) ;;
     3) die "joined: refused after end record ${flat_out#*$'\t'}" ;;
     4) die "joined: job $job has zero non-voided recorded rounds" ;;
+    5) die "joined: claim changed since the waiver was verified (${flat_out#*$'\t'}); re-run wrk joined" ;;
     *) exit "$flat_rc" ;;
   esac
   set_report_last_line "$report"
@@ -6080,6 +6124,19 @@ except (OSError, ValueError):
 p = o.get("payload", o)
 v = p.get("task_id")
 print(v if isinstance(v, (int, str)) else "")
+PY
+}
+
+# The job's newest claim/reclaim event file name, taken the same way as
+# round_job_task_id: the claim version a verified join waiver binds to.
+# Prints it or nothing when there is no claim.
+joined_claim_version() {
+  wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$1/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
+         if name.endswith(("claim.json", "reclaim.json"))]
+print(names[-1] if names else "")
 PY
 }
 
