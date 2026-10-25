@@ -68,6 +68,7 @@ jobs:
             tests/test-fleet-rev.sh \
             tests/test-gate-policy-devin-grades.sh \
             tests/test-codex-project-trust.sh \
+            tests/test-area-propose.sh \
             tests/fixtures/fleet-rev/fake-ssh \
             tests/fixtures/fleet-rev/fake-gh \
             tests/fixtures/fleet-rev/panewire \
@@ -110,6 +111,7 @@ jobs:
           bash tests/test-wrk-job-end.sh
           bash tests/test-fleet-rev.sh
           bash tests/test-gate-policy-devin-grades.sh
+          bash tests/test-area-propose.sh
           python3 tests/test-node-ops.py
           python3 -m unittest tests/test_pa_review_scan.py -v
           python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
