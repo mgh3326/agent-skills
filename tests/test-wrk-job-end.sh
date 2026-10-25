@@ -324,6 +324,17 @@ prune_run() {
     "$WRK" prune "$@"
 }
 
+# hk 1860: prune_gone_run is prune_run with every herdr probe answering
+# not-found, so an ended job's spawn pane reads as gone and the release path
+# (not the pane-alive skip) is what the case exercises.
+prune_gone_run() {
+  local seq="$TMP/prune-gone-$CASE_SEQ.seq"
+  printf 'not-found\n' >"$seq"
+  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune "$@"
+}
+
 # ── hk1798: quota_pool record release at every job end path ──────────────
 # The "stub arbiter" is the real bin/arbiter bound to the per-case
 # XDG_DATA_HOME/ARBITER_INBOX_ROOT temp dirs: a release it "saw" is the
@@ -4438,7 +4449,7 @@ for path in sorted(paths, key=lambda value: int(os.path.basename(value).split("-
         rows.append((event.get("kind"), event.get("payload", {}).get("pool")))
 assert rows[-2:] == [("quota_pool.release", "codex"), ("quota_pool.record", "codex")], rows
 PY
-  out="$(prune_run --apply --job "$job" --stale-age 0s 2>&1)" || return 3
+  out="$(prune_gone_run --apply --job "$job" --stale-age 0s 2>&1)" || return 3
   if [[ "$(quota_rows "$job")" != 0 ]]; then
     assertion_red 'R25 a historical release does not hide a newer live record' || return 1
   fi
@@ -4464,12 +4475,12 @@ case_prune_receiptless_ended_quota() {
   arb event --job "$job" --kind job.completed \
     --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || return 3
   [[ "$(quota_rows "$job")" == 1 ]] || return 3
-  out="$(prune_run --job "$job" --stale-age 0s 2>&1)" || return 3
+  out="$(prune_gone_run --job "$job" --stale-age 0s 2>&1)" || return 3
   if ! grep -Fq "would-release job=$job" <<<"$out"; then
     assertion_red 'R31 prune dry-run includes an ended receipt-less reclaimed quota row' || return 1
   fi
   [[ "$(quota_rows "$job")" == 1 ]] || return 3
-  out="$(prune_run --apply --job "$job" --stale-age 0s 2>&1)" || return 3
+  out="$(prune_gone_run --apply --job "$job" --stale-age 0s 2>&1)" || return 3
   if [[ "$(quota_rows "$job")" != 0 ]]; then
     assertion_red 'R31 prune apply releases an ended receipt-less reclaimed quota row' || return 1
   fi
@@ -4614,7 +4625,9 @@ case_prune_revived_during_release_scan() {
 set -euo pipefail
 if [[ "\${1:-}" == status ]]; then
   status_out="\$("$ARBITER" "\$@")" || exit \$?
-  if [[ "\${3:-}" == "$job" && ! -e "$injected" ]]; then
+  # hk 1860: pass 4 reads one unscoped status, so the first status call inside
+  # the prune run is the scan; the revive lands after that snapshot.
+  if [[ ! -e "$injected" ]]; then
     : >"$injected"
     "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null
     "$ARBITER" claim --job "$job" --lane lane-a --agent-label "lbl-$job" \
@@ -4628,8 +4641,11 @@ fi
 exec "$ARBITER" "\$@"
 EOF
   chmod +x "$arbwrap" || return 3
+  # hk 1860: model the ended job's pane as gone, so the probe passes through to
+  # the release-time round check that this race is about.
+  local seq="$TMP/1813-prune-race.seq"; printf 'not-found\n' >"$seq"
   out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$arbwrap" \
-    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" WRK_FIXTURE_GET_SEQUENCE="$seq" \
     "$WRK" prune --apply --job "$job" --stale-age 0s 2>&1)" || return 3
   if ! grep -Fq "skip job=$job reason=revived-since-scan" <<<"$out"; then
     assertion_red 'R24 prune skips a job revived after its release scan' || return 1
