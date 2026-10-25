@@ -597,6 +597,20 @@ sort "$TMP/run.out" >"$TMP/audit-lane-a-got"
 sort "$TMP/audit-lane-a-want" >"$TMP/audit-lane-a-want-sorted"
 cmp "$TMP/audit-lane-a-want-sorted" "$TMP/audit-lane-a-got" || fail "lane-a filter: $(cat "$TMP/run.out")"
 snap_tree "$AUDIT" "$TMP/audit-after-lane"
+# hk 1897 B-1: an ambient WRK_CLAIM_DB must never reach the audit's scan —
+# the audit is trust-bearing and reports events-dir owner values only.
+run_cmd env ARBITER_INBOX_ROOT="$AUDIT" \
+  WRK_CLAIM_DB='{"audit-zero":{"o":"ghost-lane","p":"forged-parent","t":"9999"},"audit-lane-b":{"o":"lane-a"}}' \
+  "$WRK" round audit
+assert_rc 0
+grep -qxF 'zero-rounds job=audit-zero lane=lane-a' "$TMP/run.out" ||
+  fail "ambient WRK_CLAIM_DB relabelled the audit: $(cat "$TMP/run.out")"
+grep -qxF 'zero-rounds job=audit-lane-b lane=lane-b' "$TMP/run.out" ||
+  fail "ambient WRK_CLAIM_DB hid or moved audit-lane-b: $(cat "$TMP/run.out")"
+run_cmd env ARBITER_INBOX_ROOT="$AUDIT" WRK_CLAIM_DB='not-json{{{' "$WRK" round audit
+assert_rc 0
+grep -qxF 'zero-rounds job=audit-zero lane=lane-a' "$TMP/run.out" ||
+  fail "malformed WRK_CLAIM_DB changed the audit: $(cat "$TMP/run.out")"
 cmp "$TMP/audit-before" "$TMP/audit-after-lane" || fail "lane audit changed the job dirs"
 ARBITER_INBOX_ROOT="$save_inbox"
 echo "PASS d-audit-lists-planted-jobs-and-writes-nothing"

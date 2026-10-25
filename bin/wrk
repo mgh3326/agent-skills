@@ -6948,7 +6948,7 @@ sentinel_log() {
 #                   un-ends it — the newest record wins, as in wrk reap.
 #                   job.recovered is not a revive)
 
-# job_events_scan EVENTS_DIR... — one TSV row per job:
+# job_events_scan [--claim-db JSON] EVENTS_DIR... — one TSV row per job:
 #   job \t ended \t hub_ended \t terminal_kind \t last_event_age_s \t last_kind
 #       \t completed_n \t owner \t label \t pane \t tab
 # ended         a work-terminal record exists after the newest revive
@@ -6958,7 +6958,13 @@ sentinel_log() {
 # pane/tab      the newest job.spawned receipt's values — same source of truth
 #               as wrk reap; "-" when the job never spawned
 job_events_scan() {
-  wrk_py - "$@" <<'PY'
+  # hk 1897 B-1: the DB map is an explicit opt-in — an ambient WRK_CLAIM_DB
+  # must never reach a trust-bearing caller (round audit, joined, takeover).
+  local claim_db="{}"
+  if [[ "${1:-}" == --claim-db ]]; then
+    claim_db="$2"; shift 2
+  fi
+  WRK_CLAIM_DB="$claim_db" wrk_py - "$@" <<'PY'
 import json, os, sys, time
 exec(os.environ["WRK_EVENTS_PY"])
 
@@ -6972,7 +6978,10 @@ now = time.time()
 
 # hk 1897: non-trust scans keep events-dir values, except that a readable
 # arbiter DB claim wins and prints one warning line on a mismatch.
-dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+try:
+    dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+except ValueError:
+    dbmap = {}
 def claim_db(job):
     claim = dbmap.get(job)
     return claim if isinstance(claim, dict) else None
@@ -11586,7 +11595,10 @@ now = time.time()
 
 # hk 1897: non-trust scans keep events-dir values, except that a readable
 # arbiter DB claim wins and prints one warning line on a mismatch.
-dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+try:
+    dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+except ValueError:
+    dbmap = {}
 
 
 try:
@@ -12046,7 +12058,10 @@ except OSError:
 
 # hk 1897: non-trust audit keeps events-dir values, except that a readable
 # arbiter DB claim wins and prints one warning line on a mismatch.
-dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+try:
+    dbmap = json.loads(os.environ.get("WRK_CLAIM_DB") or "{}")
+except ValueError:
+    dbmap = {}
 def db_norm(v):
     return "" if v is None or isinstance(v, bool) else str(v)
 
@@ -12350,7 +12365,7 @@ prune_cmd() {
   PRUNE_SCAN=""
   # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
   # owner, with one warning line on a mismatch (non-trust merge).
-  (( ${#scan_dirs[@]} )) && PRUNE_SCAN="$(WRK_CLAIM_DB="$(job_claims_db_map_root "$jobs_root")" job_events_scan "${scan_dirs[@]}")"
+  (( ${#scan_dirs[@]} )) && PRUNE_SCAN="$(job_events_scan --claim-db "$(job_claims_db_map_root "$jobs_root")" "${scan_dirs[@]}")"
 
   local _mode="dry-run" pf job pid jdir
   (( apply )) && _mode="apply"
