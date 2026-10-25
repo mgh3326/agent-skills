@@ -239,7 +239,8 @@ Options:
   --effort LEVEL     override codex/Kiro/Grok/Claude(opus,sonnet) profile effort
   --job ID           arbiter job id (default: LABEL)
   --owner NAME       spawning session name, recorded as the arbiter owner_lane
-                     (default: default). Lets that session later run
+                     (parent's newest owner with --parent-job; default otherwise).
+                     Lets that session later run
                      `arbiter status --lane NAME` to find and reclaim its workers,
                      and (--role worker only) is where that worker's own
                      job.completed is delivered directly. It is reclaim/direct-

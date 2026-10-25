@@ -295,7 +295,7 @@ mock_mcp_verify() { :; }
                 self.assertEqual(process.returncode, 91, process.stderr)
         claim = self.base / "jobs/b1632-sol/events/00001-job.claim.json"
         claim.write_text(json.dumps({"kind": "job.claim", "payload": {
-            "task_id": "1632", "parent_lane": "pa-integrator"}}))
+            "task_id": "1632", "owner_lane": "fixture-builder", "parent_lane": "pa-integrator"}}))
         reply = {"state": "claimed", "claimed_by": "", "project": "ParkingArcade",
                  "refs": {"job_id": "b1632-sol"}}
         process, _ = self.run_spawn(environment={"DOC_ISSUER": "pa-integrator",
@@ -374,7 +374,7 @@ mock_mcp_verify() { :; }
         events = self.base / "jobs/b1632-sol/events"
         newest = events / "00002-job.reclaim.json"
         newest.write_text(json.dumps({"kind": "job.reclaim", "payload": {
-            "task_id": "1632", "parent_lane": "pa-integrator"}}))
+            "task_id": "1632", "owner_lane": "fixture-builder", "parent_lane": "pa-integrator"}}))
         self.assert_denied(role="builder")  # Old director-1 parent no longer authorizes.
         for issuer in ("operator", "operator-desk", "pa-integrator"):
             process, _ = self.run_spawn(role="builder", environment={"DOC_ISSUER": issuer})
