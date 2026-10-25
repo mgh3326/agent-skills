@@ -5073,11 +5073,35 @@ PY
 }
 
 # restore_run JOB — wrk restore against the case's arbiter (RESTORE_ARBITER
-# overrides it for one case) and the herdr stub reading RESTORE_STATE.
+# overrides it for one case) and the herdr stub reading RESTORE_STATE. The
+# sentinel a restore starts inherits the tuning: RESTORE_INTERVAL and
+# RESTORE_LOST_GRACE. Any sentinel it left is owned, so teardown stops it.
 restore_run() {
+  local rc=0
   env HERDR_BIN="$TMP/restore-herdr" RESTORE_STATE="$RESTORE_STATE" \
     ARBITER_BIN="${RESTORE_ARBITER:-$ARBITER}" ARBITER_INBOX_ROOT="$INBOX" \
-    XDG_DATA_HOME="$XDG" "$WRK" restore "$@"
+    XDG_DATA_HOME="$XDG" WRK_COMPLETION_INTERVAL_S="${RESTORE_INTERVAL:-30}" \
+    WRK_SENTINEL_LOST_GRACE="${RESTORE_LOST_GRACE:-1800}" \
+    "$WRK" restore "$@" || rc=$?
+  if [[ -s "$INBOX/$1/completion-sentinel.pid" ]]; then
+    own "$(head -n 1 "$INBOX/$1/completion-sentinel.pid")"
+  fi
+  return "$rc"
+}
+
+# restore_sentinel_pid JOB — the pid in the job's completion-sentinel pidfile,
+# or nothing when there is none.
+restore_sentinel_pid() {
+  head -n 1 "$INBOX/$1/completion-sentinel.pid" 2>/dev/null || true
+}
+
+# restore_stop_sentinel JOB — stop the sentinel a restore started, if it runs.
+restore_stop_sentinel() {
+  local pid
+  pid="$(restore_sentinel_pid "$1")"
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 0
+  kill_owned_tree "$pid" || true
+  wait_until 10 pid_gone "$pid"
 }
 
 restore_reap() {
@@ -5217,6 +5241,7 @@ case_hk1933_restore_newest_receipt() {
   receipts="$(restore_receipts "$INBOX/$job/events")"
   [[ "$(tail -n 1 <<<"$receipts")" == "$(sed -n 2p <<<"$receipts")" ]] ||
     { assertion_red 'hk1933 the copied receipt must be the newest receipt, not the first'; return 1; }
+  restore_stop_sentinel "$job"
 }
 
 # The receipt write fails after the reclaim lands: one stderr line carries the
@@ -5292,6 +5317,101 @@ def fields(kind):
 claim, reclaim = fields("claim"), fields("reclaim")
 if claim != reclaim:
     raise SystemExit("claim %r != reclaim %r" % (claim, reclaim))
+PY
+  restore_stop_sentinel "$job"
+}
+
+# A successful restore starts one completion sentinel for the job, as spawn does.
+case_hk1933_restore_starts_sentinel() {
+  reset_case hk1933-sentinel || return 3
+  local job=hk1933-sentinel label=lbl-hk1933-sentinel pid
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" idle || return 3
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || {
+    cat "$TMP/restore-err" >&2
+    assertion_red 'hk1933 restore must succeed when it starts the sentinel' || return 1
+  }
+  pid="$(restore_sentinel_pid "$job")"
+  [[ "$pid" =~ ^[0-9]+$ ]] ||
+    { assertion_red 'hk1933 a successful restore must write the sentinel pidfile'; return 1; }
+  kill -0 "$pid" 2>/dev/null ||
+    { assertion_red 'hk1933 the restored job sentinel must be running'; return 1; }
+  ps -p "$pid" -o args= | grep -q "sentinel $job" ||
+    { assertion_red 'hk1933 the restored job sentinel argv must name the job'; return 1; }
+  restore_stop_sentinel "$job"
+}
+
+# A live sentinel for the job on the same pane, proven by pidfile and argv, is
+# kept: the restore starts none and the pidfile still names it.
+case_hk1933_restore_live_sentinel_starts_none() {
+  reset_case hk1933-live || return 3
+  local job=hk1933-live label=lbl-hk1933-live before after
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  # The sentinel is live on the pane before the job is released. The quota
+  # release is not a terminal record, so the sentinel keeps running through it.
+  start_completion_from_library "$INBOX/$job/completion-sentinel.pid" "$job" lane-a "$label" w1:p1 \
+    "$TMP/hk1933-live-report.md" || return 3
+  arb_lease "$job" || return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" idle || return 3
+  [[ "$(restore_state_of "$job")" == released ]] || return 3
+  kill -0 "$SENTINEL_PID" 2>/dev/null || return 3
+  before="$(cat "$INBOX/$job/completion-sentinel.pid")"
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || {
+    cat "$TMP/restore-err" >&2
+    assertion_red 'hk1933 restore over a live sentinel must succeed' || return 1
+  }
+  after="$(cat "$INBOX/$job/completion-sentinel.pid")"
+  [[ "$before" == "$after" ]] ||
+    { assertion_red 'hk1933 a restore with a live sentinel for the job must start none'; return 1; }
+  kill -0 "$SENTINEL_PID" 2>/dev/null ||
+    { assertion_red 'hk1933 the live sentinel must still run after the restore'; return 1; }
+  restore_stop_sentinel "$job"
+}
+
+# A pane that disappears right after the restore ends in the normal lost path:
+# job.lost, then job.revoked with outcome abandoned once the lost grace expires.
+case_hk1933_restore_pane_gone_ends_lost() {
+  reset_case hk1933-gone || return 3
+  local job=hk1933-gone label=lbl-hk1933-gone pid
+  local RESTORE_INTERVAL=1 RESTORE_LOST_GRACE=1
+  restore_seed "$job" w1:p1 w1:t1 "$label" || return 3
+  restore_false_loss "$job" w1:p1 "$label" || return 3
+  RESTORE_STATE="$TMP/restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" w1:p1 w1:t1 "$label" idle || return 3
+  # The false loss already wrote job.lost and job.revoked, so the lost path
+  # is judged by the records the restored sentinel adds after them.
+  lost_before="$(event_count "$INBOX/$job/events" job.lost)"
+  revoked_before="$(event_count "$INBOX/$job/events" job.revoked)"
+  restore_run "$job" >"$TMP/restore-out" 2>"$TMP/restore-err" || {
+    cat "$TMP/restore-err" >&2
+    assertion_red 'hk1933 restore must succeed before its pane disappears' || return 1
+  }
+  pid="$(restore_sentinel_pid "$job")"
+  restore_empty_state "$RESTORE_STATE" || return 3
+  wait_until 20 event_count_is "$INBOX/$job/events" job.lost $((lost_before + 1)) ||
+    { assertion_red 'hk1933 a pane that disappears right after restore must end in job.lost'; return 1; }
+  wait_until 15 pid_gone "$pid" ||
+    { assertion_red 'hk1933 the restored job sentinel must leave after the lost grace'; return 1; }
+  [[ ! -e "$INBOX/$job/completion-sentinel.pid" ]] ||
+    { assertion_red 'hk1933 the restored job sentinel must remove its pidfile on the lost path'; return 1; }
+  # A revived round is the one case the sentinel never ends itself: wrk prune
+  # declares the end once the pane is absent and the job is stale.
+  event_count_is "$INBOX/$job/events" job.revoked "$revoked_before" ||
+    { assertion_red 'hk1933 the sentinel must not end the revived round itself'; return 1; }
+  env HERDR_BIN="$TMP/restore-herdr" RESTORE_STATE="$RESTORE_STATE" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" "$WRK" prune --apply --job "$job" --stale-age 0s \
+    >"$TMP/restore-prune-out" 2>&1 || true
+  event_count_is "$INBOX/$job/events" job.revoked $((revoked_before + 1)) ||
+    { cat "$TMP/restore-prune-out" >&2; assertion_red 'hk1933 the lost path must end the dead restored round with job.revoked'; return 1; }
+  python3 - "$INBOX/$job/events" <<'PY' || { assertion_red 'hk1933 the prune end must be abandoned, stale'; return 1; }
+import glob, json, sys
+records = [json.load(open(p)) for p in sorted(glob.glob(sys.argv[1] + "/*job.revoked.json"))]
+assert records[-1].get("outcome") == "abandoned", records
+assert records[-1].get("reason", "").startswith("stale"), records
 PY
 }
 
@@ -5387,6 +5507,8 @@ case_hk1933_bare_reclaim_superseded() {
 case_hk1933_marker_once() {
   [[ "$(grep -cF 'hk1933-restore-receipt' "$WRK")" == 1 ]] ||
     { assertion_red 'hk1933 bin/wrk must carry hk1933-restore-receipt exactly once'; return 1; }
+  [[ "$(grep -cF 'hk1933-restore-sentinel' "$WRK")" == 1 ]] ||
+    { assertion_red 'hk1933 bin/wrk must carry hk1933-restore-sentinel exactly once'; return 1; }
 }
 
 # run_hk1933_case DESC FN — FN must pass on the change under test.
@@ -5407,6 +5529,9 @@ run_hk1933_case "done with no quota row after a restore completes silently" case
 run_hk1933_case "a respawned job restores from its newest receipt" case_hk1933_restore_newest_receipt
 run_hk1933_case "a failed receipt write prints one completion command" case_hk1933_restore_partial
 run_hk1933_case "the copy and reclaim keep every receipt and claim field" case_hk1933_restore_fields_and_copy
+run_hk1933_case "a successful restore starts one completion sentinel for the job" case_hk1933_restore_starts_sentinel
+run_hk1933_case "a restore over a live sentinel for the job starts none" case_hk1933_restore_live_sentinel_starts_none
+run_hk1933_case "a pane that disappears right after restore ends in job.lost" case_hk1933_restore_pane_gone_ends_lost
 run_hk1933_case "refuses a job that is not released" case_hk1933_refuse_state
 run_hk1933_case "refuses a dead pane" case_hk1933_refuse_dead_pane
 run_hk1933_case "refuses a pane in another tab" case_hk1933_refuse_other_tab
@@ -5431,5 +5556,11 @@ expect_mut_red "hk1933 M3 copying the first receipt must fail the respawn case" 
 mkmut m4-every-reclaim-current 's~spawn_pane == pane and last_claim < last_spawn) or~spawn_pane == pane) or~'
 expect_mut_red "hk1933 M4 treating every reclaim as current must fail the bare-reclaim case" case_hk1933_bare_reclaim_superseded \
   'ASSERT-RED: hk1933 a bare reclaim with no receipt must still read superseded'
+mkmut_span hk1933-m5-skip-sentinel-start 'hk1933-restore-sentinel' '  : # removed hk1933 sentinel start'
+expect_mut_red "hk1933 M5 skipping the sentinel start must leave a restored pane gone with no lost path" case_hk1933_restore_pane_gone_ends_lost \
+  'ASSERT-RED: hk1933 a pane that disappears right after restore must end in job.lost'
+mkmut_span hk1933-m6-second-sentinel 'if [[ -z "$existing_pane" || -z "$requested_pane" || "$existing_pane" == "$requested_pane" ]]; then' '      if false; then'
+expect_mut_red "hk1933 M6 starting a second sentinel over a live one must fail the live-sentinel case" case_hk1933_restore_live_sentinel_starts_none \
+  'ASSERT-RED: hk1933 a restore with a live sentinel for the job must start none'
 
 echo "PASS test-wrk-job-end: all cases"
