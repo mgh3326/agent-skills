@@ -157,7 +157,7 @@
   "local_sources": {
     ".github/workflows/ci.yml": "ecabd8ae0e7fb2c47e81e4f8ecf796e9be12fe4556dde63691b2db4cb34ac4bd",
     "bin/arbiter": "ac2349402cbbd066bd1bdd18b6de5e57e42c902b339cc24c8a9b35d38a49be97",
-    "bin/wrk": "404d32de535cbe87f7b0a8eccf2e735b36a36ef313641d4fa960ff7a60463510",
+    "bin/wrk": "8858228f1bbc14385f13ddfb8d5448cf948d38d7e930d76156c0e828721fbd26",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
     "builder/SKILL.md": "c7243059394c7739944b21da4a137b39615a600dcec614c9d803e2a967de7089",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
