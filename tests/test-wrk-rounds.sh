@@ -212,15 +212,19 @@ write_verdict_first() { # path verdict head — the VERDICT line is line 1
 
 # The stub serves doc get from HK_DOC_DIR, tasks comments from HK_TASK_DIR/comments-N and
 # tasks show from HK_TASK_DIR/show-N, and records every call it receives (hk 1899).
+# HK_FETCH_HOOK, when set, runs inside the waiver-record fetch — the window hk 2024
+# races: after verify, before the events-lock commit.
 cat >"$HANDOFFKEEP_BIN" <<'EOF'
 #!/bin/sh
 [ -z "${HK_CALL_LOG:-}" ] || printf '%s\n' "$*" >>"$HK_CALL_LOG"
 if [ "$1" = "doc" ] && [ "$2" = "get" ] && [ -n "${3:-}" ] && [ -f "$HK_DOC_DIR/$3" ]; then
   cat "$HK_DOC_DIR/$3"
+  [ -z "${HK_FETCH_HOOK:-}" ] || "$HK_FETCH_HOOK" "$@"
   exit 0
 fi
 if [ "$1" = "tasks" ] && [ "$2" = "comments" ] && [ -n "${3:-}" ] && [ -f "$HK_TASK_DIR/comments-$3" ]; then
   cat "$HK_TASK_DIR/comments-$3"
+  [ -z "${HK_FETCH_HOOK:-}" ] || "$HK_FETCH_HOOK" "$@"
   exit 0
 fi
 if [ "$1" = "tasks" ] && [ "$2" = "show" ] && [ -n "${3:-}" ] && [ -f "$HK_TASK_DIR/show-$3" ]; then
@@ -1433,6 +1437,78 @@ grep -q 'fetched from handoffkeep' "$TMP/joined-help.txt" || fail "joined help m
 grep -q 'parent lane or an operator' "$TMP/joined-help.txt" || fail "joined help must name who may issue the grant"
 echo "PASS h-joined-help-names-the-grant"
 
+# ── hk 2024: the claim a waiver was verified against is rechecked under the lock ──
+# HK_FETCH_HOOK runs inside the waiver-record fetch: the window between the
+# grant verify and the events-lock commit. The hook below models the job being
+# released and reclaimed in that window — a quota_pool.release then a
+# job.reclaim — so a waiver verified for the old claim must not land on the
+# new one. A refused join writes nothing.
+echo "== i-waiver-claim-recheck =="
+CLAIM_RACE_HOOK="$TMP/claim-race-hook"
+cat >"$CLAIM_RACE_HOOK" <<'EOF'
+#!/bin/sh
+# Runs once (RACE_MARKER): append a release to RACE_JOB's events and, when
+# RACE_PARENT is set, a reclaim under that parent lane. RACE_TASK sets the
+# reclaim's task_id; empty means none.
+[ -f "$RACE_MARKER" ] && exit 0
+: >"$RACE_MARKER"
+ev="$ARBITER_INBOX_ROOT/$RACE_JOB/events"
+printf '%s\n' "{\"kind\":\"quota_pool.release\",\"job_id\":\"$RACE_JOB\",\"created_at\":\"2026-10-23T05:00:00Z\",\"payload\":{\"job_id\":\"$RACE_JOB\",\"pool\":\"codex\"}}" \
+  >"$ev/00090-quota_pool.release.json"
+[ -n "${RACE_PARENT:-}" ] || exit 0
+task=""
+[ -z "${RACE_TASK:-}" ] || task=",\"task_id\":\"$RACE_TASK\""
+printf '%s\n' "{\"kind\":\"job.reclaim\",\"job_id\":\"$RACE_JOB\",\"created_at\":\"2026-10-23T05:00:01Z\",\"owner_lane\":\"lane-a\",\"label\":\"lbl\",\"pane_id\":\"w:p1\",\"parent_lane\":\"$RACE_PARENT\",\"role\":\"builder\"$task}" \
+  >"$ev/00091-job.reclaim.json"
+EOF
+chmod +x "$CLAIM_RACE_HOOK"
+
+# Reclaimed under a different parent lane during the fetch: the verified
+# parent_lane no longer matches, so the join is refused.
+claim_job i-race-parent
+grant_doc i-race-parent-grant "join-waiver: job=i-race-parent by=director-1"
+run_cmd env HK_FETCH_HOOK="$CLAIM_RACE_HOOK" RACE_MARKER="$TMP/i-race-parent.done" \
+  RACE_JOB=i-race-parent RACE_PARENT=rogue-lane \
+  "$WRK" joined i-race-parent --pr https://example.invalid/pr/2024 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/i-race-parent-grant
+assert_refused "wrk: joined: claim changed since the waiver was verified (parent_lane director-1 -> rogue-lane); re-run wrk joined"
+[[ "$(kind_count i-race-parent job.joined)" -eq 0 ]] || fail "a claim-change race wrote job.joined"
+echo "PASS i-parent-lane-race-refused"
+
+# Same parent lane, but the reclaim binds a different task_id: a pa-integrator
+# grant verified against task 8001 must not land on the claim for task 8002.
+claim_job i-race-task pa-integrator 2026-10-23T00:00:00Z builder lane-a 8001
+task_record 8001 ParkingArcade i-race-task
+grant_doc i-race-task-grant "join-waiver: job=i-race-task by=pa-integrator" pa-integrator
+run_cmd env HK_FETCH_HOOK="$CLAIM_RACE_HOOK" RACE_MARKER="$TMP/i-race-task.done" \
+  RACE_JOB=i-race-task RACE_PARENT=pa-integrator RACE_TASK=8002 \
+  "$WRK" joined i-race-task --pr https://example.invalid/pr/2024 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/i-race-task-grant
+assert_refused "wrk: joined: claim changed since the waiver was verified (task_id 8001 -> 8002); re-run wrk joined"
+[[ "$(kind_count i-race-task job.joined)" -eq 0 ]] || fail "a task_id race wrote job.joined"
+echo "PASS i-task-id-race-refused"
+
+# A reclaim by the same parent lane still replaces the claim: the claim
+# version (the newest claim/reclaim event) changed, so the join is refused.
+claim_job i-race-version
+grant_doc i-race-version-grant "join-waiver: job=i-race-version by=director-1"
+run_cmd env HK_FETCH_HOOK="$CLAIM_RACE_HOOK" RACE_MARKER="$TMP/i-race-version.done" \
+  RACE_JOB=i-race-version RACE_PARENT=director-1 \
+  "$WRK" joined i-race-version --pr https://example.invalid/pr/2024 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/i-race-version-grant
+assert_refused "wrk: joined: claim changed since the waiver was verified (claim_version 00001-job.claim.json -> 00091-job.reclaim.json); re-run wrk joined"
+[[ "$(kind_count i-race-version job.joined)" -eq 0 ]] || fail "a same-parent reclaim wrote job.joined"
+echo "PASS i-claim-version-race-refused"
+
+# A release with no reclaim leaves the recorded claim untouched: the verified
+# facts still hold and the waived join lands.
+claim_job i-race-release-only
+grant_doc i-race-release-only-grant "join-waiver: job=i-race-release-only by=director-1"
+run_cmd env HK_FETCH_HOOK="$CLAIM_RACE_HOOK" RACE_MARKER="$TMP/i-race-release-only.done" \
+  RACE_JOB=i-race-release-only RACE_PARENT= \
+  "$WRK" joined i-race-release-only --pr https://example.invalid/pr/2024 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/i-race-release-only-grant
+assert_rc 0
+[[ "$(kind_count i-race-release-only job.joined)" -eq 1 ]] || fail "release-only join must write job.joined"
+[[ "$(joined_field i-race-release-only rounds_waived_issuer)" == "director-1" ]] || fail "rounds_waived_issuer: $(joined_field i-race-release-only rounds_waived_issuer)"
+echo "PASS i-release-without-reclaim-joins"
+
 # ── help and the one skill line each ───────────────────────────────────
 "$WRK" --help >"$TMP/usage.txt"
 grep -q 'round audit' "$TMP/usage.txt" || fail "usage must name round audit"
@@ -1462,6 +1538,8 @@ for anchor in (
     "errors=\"replace\"):  # hk1900-verdict-decode",
     '[[ "$waived" =~ ^hk:doc/[^[:space:]]+$ || "$waived" =~ ^hk:task/[0-9]+$ ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"  # hk1899-waiver-shape',
     '"$tmp_waiver" join-waiver || true)"  # hk1899-waiver-fetch',
+    'claim_parent="$parent"  # hk2024-claim-facts',
+    "if waived:  # hk2024-claim-recheck",
     "and round_head.lower() == vsha):  # hk1506-head-bind",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
