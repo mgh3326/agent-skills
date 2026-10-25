@@ -309,6 +309,26 @@ class MergePrecheckTests(unittest.TestCase):
         s["ci_jobs"][10][0]["conclusion"] = "failure"
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
 
+    def test_dispatch_only_ci_is_missing_with_assertion_red_mutant(self) -> None:
+        s = snapshot()
+        s["ci_runs"][0]["event"] = "workflow_dispatch"
+        expected = ("UNVERIFIED", "CI_RUN_MISSING")
+
+        canonical = evaluate_canonical_ci(s["repo"], s["ci_runs"])
+        self.assertEqual(expected, (canonical["status"], canonical["reason_code"]))
+        assert_check(self, s, "G3", *expected)
+
+        accepts_dispatch = canonical_ci_mutant([
+            ('run.get("event") == "pull_request"',
+             'run.get("event") in ("pull_request", "workflow_dispatch")')])
+        mutant_canonical = evaluate_canonical_ci(s["repo"], s["ci_runs"], accepts_dispatch)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(expected, (mutant_canonical["status"], mutant_canonical["reason_code"]))
+        with patch.object(gate, "evaluate_required_ci", accepts_dispatch):
+            mutant_merge = gate.evaluate(s, policy())["G3"]
+        with self.assertRaises(AssertionError):
+            self.assertEqual(expected, (mutant_merge["status"], mutant_merge["reason_code"]))
+
     def test_ci_red_rerun_is_not_met_with_assertion_red_mutant(self) -> None:
         s = snapshot()
         s["ci_runs"][0].update({"run_attempt": 2, "conclusion": "failure"})
