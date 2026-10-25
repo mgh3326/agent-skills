@@ -10516,8 +10516,12 @@ parent_spawn_validate() {
     [[ "$relative" == 0 ]] || die "--report-relative requires --parent-job"
     return 0
   }
-  ascii_re "$parent" '^[A-Za-z0-9._-]+$' && [[ "$parent" != . && "$parent" != .. ]] || die "--parent-job must be a job id"
-  ascii_re "$job" '^[A-Za-z0-9._-]+$' && [[ "$job" != . && "$job" != .. ]] || die "--job must be a job id"
+  if ! ascii_re "$parent" '^[A-Za-z0-9._-]+$' || [[ "$parent" == . || "$parent" == .. ]]; then
+    die "--parent-job must be a job id"
+  fi
+  if ! ascii_re "$job" '^[A-Za-z0-9._-]+$' || [[ "$job" == . || "$job" == .. ]]; then
+    die "--job must be a job id"
+  fi
   case "$role" in
     worker|tester|reviewer) [[ -n "$report" ]] || die "--parent-job $parent requires --report for --role $role" ;; # hk2042-report-required
   esac
