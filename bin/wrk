@@ -10520,7 +10520,8 @@ local_spawn_scan() {
           true) LOCAL_PI_ANTHROPIC=1 ;;
           false) ;;
           *) LOCAL_SPAWN_ERROR="$config line $n: [local] pi_anthropic accepts only the bare TOML booleans true or false"
-             return "$WRK_EXIT_CONFIG_REFUSED" ;;
+             return "$WRK_EXIT_CONFIG_REFUSED"
+             ;;
         esac
         continue ;;
     esac
