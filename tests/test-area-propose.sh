@@ -134,6 +134,8 @@ HK2012_SCOPED = [
     (137, "auto_trader", "deploy the Prefect flow for the desk"),
     (138, "ParkingArcade", "read-only capture of the parked-car layout"),
     (139, "handoffkeep", "deploy the hub relay fix"),
+    (163, "fleet-ops", "tester probe for the queue"),
+    (164, "handoffkeep", "README update for the relay notes"),
 ]
 for i, project, title in HK2012_SCOPED:
     tasks[str(i)] = {"id": i, "state": "backlog", "project": project,
@@ -282,10 +284,12 @@ want = [
     (136, "trading", ""),                      # 주문 keeps the trading default
     (137, "trading", "project:auto_trader"),   # deploy (ops) must not beat a product default
     (138, "unity", "project:ParkingArcade"),   # read-only (research) must not beat it either
-    (139, "ops", "title:\\bdeploy\\b"),        # fleet repo: generic ops rule still applies
+    (139, "go-backend", "project:handoffkeep"),  # fleet default holds against a generic ops term
     (160, "research", "tag:[research]"),      # exact leading tag beats the python default
     (161, "python", "project:experiment"),    # untagged experiment task stays python
     (162, "python", "project:experiment"),    # a loose research word does not count
+    (163, "", "-"),                           # unmapped project: no shell-wrk term applies
+    (164, "go-backend", "project:handoffkeep"),  # fleet default holds against a generic docs term
 ]
 for tid, area, rule in want:
     r = rows.get(str(tid)) or sys.exit(f"missing row for task {tid}")

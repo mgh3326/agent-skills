@@ -14,7 +14,8 @@ truncates — and applies the section-1 mapping rule in order:
      is the projectless task (hk 2012: fleet terms stay off product repos);
      a product repo (a project default outside fleet_projects) keeps its
      default unless the title area is in project_areas for that project,
-     or the title opens with an exact [area] tag naming a known area;
+     or the title opens with an exact [area] tag naming a known area; a
+     fleet repo's default holds unless the title area is shell-wrk;
   4. the project default from the same file.
 
 Smoke/throwaway titles are excluded before the files stage — the packet
@@ -239,6 +240,10 @@ def classify(task: dict, rules: dict, with_files: bool, gh: str,
     # title order.
     product = bool(default) and project not in rules["fleet_projects"]
     specific = {default} | set(rules["project_areas"].get(project, []))
+    # hk 2012 rule 1 (fleet): a fleet default holds against generic terms;
+    # only a shell-wrk term may override it.
+    if default and project in rules["fleet_projects"]:
+        specific = {default, "shell-wrk"}
     # hk 2012 tag rule: an exact leading [area] tag naming a known area
     # states the area outright and overrides a product default.
     tag = TAG_RE.match(title)
@@ -248,7 +253,7 @@ def classify(task: dict, rules: dict, with_files: bool, gh: str,
         scope = entry.get("projects")
         if scope is not None and project not in scope:
             continue
-        if product and entry["area"] not in specific:
+        if default and entry["area"] not in specific:
             continue
         for pattern in entry["_re"]:
             if pattern.search(title):
