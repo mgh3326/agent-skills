@@ -58,9 +58,26 @@ KO_OPERATOR = re.compile(r"운영자")
 KO_CLAIM = re.compile(r"확인|승인|보고|컨펌|오케이|전달|\bOK\b", re.I)
 EN_CLAIM = re.compile(
     r"\boperator\b(?!-desk|-request)[^.;\n]{0,30}?"
-    r"\b(?:confirm(?:ed|s)?|approv(?:ed|es|al)|verified|said|told|reported|OK)\b",
+    r"(?P<verb>\b(?:confirm(?:ed|s)?|approv(?:ed|es|al)|verified|said|told|reported|OK)\b)",
     re.I,
 )
+# A claim directly governed by a negation is not a claim (hk 2040 r2: real
+# tester lines denying operator approval were flagged RED). The lists stay
+# small and narrow on purpose:
+#   EN: not, no, never, without, nor, or a word ending in n't — inside the
+#       three words before "operator" or before the matched verb, with no
+#       break in between (a break is . ; : , or the words and, but), so
+#       "not an operator approval" and "without operator approval" clear
+#       while "Not a blocker: the operator approved it." does not.
+#   KO: 없음, 없다, 없이, 않, 아님, 아니 after 운영자 in the same clause (a
+#       clause ends at . ; or a line break) — "운영자 승인 아님" clears.
+EN_NEGATION = re.compile(r"not|no|never|without|nor|\w+n['’]t", re.I)
+EN_BREAK_WORD = re.compile(r"and|but", re.I)
+EN_BREAK_CHAR = re.compile(r"[.;:,]")
+KO_NEGATION = re.compile(r"없음|없다|없이|않|아님|아니")
+KO_CLAUSE_END = re.compile(r"[.;]")
+# Wrapping punctuation that does not break adjacency ("(not an operator …)").
+WORD_WRAP = "\"'()[]{}*_`“”‘’"
 # The two accepted provenance tags (contract block): an operator-desk relay
 # header, or a cited hk:doc key.
 PROVENANCE_TAG = re.compile(r"출처:\s*operator-desk\b|hk:doc[\s/]+[^\s`)]+", re.I)
@@ -118,8 +135,33 @@ def declares_pass(lines: list[str], switches: bool = True) -> bool:
     return False
 
 
+def _en_negated(line: str, pos: int) -> bool:
+    """A negation in the three words before pos, with no break in between."""
+    window = []
+    for token in reversed(line[:pos].split()):
+        if len(window) == 3:
+            break
+        word = token.strip(WORD_WRAP)
+        if EN_BREAK_CHAR.search(token) or EN_BREAK_WORD.fullmatch(word):
+            break
+        window.append(word)
+    return any(EN_NEGATION.fullmatch(word) for word in window)
+
+
+def _ko_operator_claim(line: str) -> bool:
+    if not (KO_OPERATOR.search(line) and KO_CLAIM.search(line)):
+        return False
+    return any(
+        not KO_NEGATION.search(KO_CLAUSE_END.split(line[m.end() :], 1)[0])
+        for m in KO_OPERATOR.finditer(line)
+    )
+
+
 def is_operator_claim(line: str) -> bool:
-    return bool((KO_OPERATOR.search(line) and KO_CLAIM.search(line)) or EN_CLAIM.search(line))
+    for m in EN_CLAIM.finditer(line):
+        if not (_en_negated(line, m.start()) or _en_negated(line, m.start("verb"))):
+            return True
+    return _ko_operator_claim(line)
 
 
 def extract_block(text: str) -> str:
@@ -394,6 +436,25 @@ ADJACENT_ONLY = re.compile(
 )
 
 
+def _claim_without_negation(line: str) -> bool:
+    return bool(
+        EN_CLAIM.search(line) or (KO_OPERATOR.search(line) and KO_CLAIM.search(line))
+    )
+
+
+def _claim_unbounded_negation(line: str) -> bool:
+    """Mutant shape: a negation anywhere before the match clears it — no
+    three-word window and no break rule, so ':' or 'and' protect nothing."""
+    for m in EN_CLAIM.finditer(line):
+        if not any(
+            EN_NEGATION.fullmatch(token.strip(WORD_WRAP))
+            for pos in (m.start(), m.start("verb"))
+            for token in line[:pos].split()
+        ):
+            return True
+    return _ko_operator_claim(line)
+
+
 def lint_variant(**overrides):
     return lambda text: untagged_operator_basis(text, **overrides)
 
@@ -413,6 +474,10 @@ mutants = [
     ("switch-detection-removed", lambda: assert_verdict_cases(lint_variant(switches=False))),
     ("adjacent-claim-only", lambda: assert_verdict_cases(
         lint_variant(claim=lambda line: bool(ADJACENT_ONLY.search(line))))),
+    ("negation-check-dropped", lambda: assert_verdict_cases(
+        lint_variant(claim=_claim_without_negation))),
+    ("negation-breaks-ignored", lambda: assert_verdict_cases(
+        lint_variant(claim=_claim_unbounded_negation))),
 ]
 for label, callback in mutants:
     expect_assertion(label, callback)
