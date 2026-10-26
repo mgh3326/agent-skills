@@ -10546,7 +10546,8 @@ try:
     parent_path = (root / parent).resolve()
 except (OSError, RuntimeError):
     refuse("parent job directory must stay in the trusted inbox")
-if parent_path != root / parent:
+# Non-strict resolve may preserve a loop on newer Python versions.
+if (root / parent).is_symlink() or parent_path != root / parent:
     refuse("parent job directory must stay in the trusted inbox")
 if not owner or require_claim == "1":
     events = root / parent / "events"
