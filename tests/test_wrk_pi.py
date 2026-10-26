@@ -1,12 +1,14 @@
 """Hermetic pi spawns and assertion mutants at real wrk call sites."""
 import json
 import os
-import signal
+import shlex
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILES = {f"pi-{name}55": f"anthropic/claude-{name}-5-5"
@@ -17,7 +19,7 @@ class PiSpawnTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="p2080-", dir="/tmp")
         self.keep_tmp = False
-        self.addCleanup(lambda: None if self.keep_tmp else self.temp.cleanup())
+        self.addCleanup(self.cleanup_tmp)
         self.tmp = Path(self.temp.name)
         bindir = self.tmp / "bin"
         bindir.mkdir()
@@ -39,6 +41,8 @@ class PiSpawnTests(unittest.TestCase):
             directory = self.tmp / key.lower()
             directory.mkdir()
             self.env[key] = str(directory)
+        self.env["XDG_CONFIG_DIRS"] = self.env["XDG_CONFIG_HOME"]
+        self.env["XDG_DATA_DIRS"] = self.env["XDG_DATA_HOME"]
         self.hosts('[local]\npi_anthropic = true\n[hub]\nmachine_id = "fixture-host"\n')
         self.brief = self.tmp / "brief.md"
         self.brief.write_text("fixture prompt\n")
@@ -46,7 +50,54 @@ class PiSpawnTests(unittest.TestCase):
         self.executable(self.tmp / "arbiter", '#!/bin/bash\ncase "$1" in job-get) exit 7 ;; claim|lease) printf "%s\\n" "$*" >>"' +
                         str(self.tmp / "claims.log") + '"; exit 1 ;; esac\nexit 1\n')
         self.wrk = ROOT / "bin/wrk"
-        self.groups = []
+        # hk2096/9751b80: use the shipped exact-pid stop even when the
+        # fixture sentinel has its own session; never kill its process group.
+        self.wrk_lib = self.tmp / "wrk-lib.sh"
+        wrk_source = self.wrk.read_text(encoding="utf-8")
+        self.wrk_lib.write_text(wrk_source.split('\ncase "${1:-}" in', 1)[0] + "\n",
+                                encoding="utf-8")
+
+    def stop_fixture_sentinels(self):
+        for pidfile in sorted(Path(self.env["ARBITER_INBOX_ROOT"]).glob("*/completion-sentinel.pid")):
+            pid = int(pidfile.read_text().splitlines()[0])
+            check = subprocess.run(["ps", "-p", str(pid), "-o", "state=", "-o", "args="],
+                                   capture_output=True, text=True)
+            if check.returncode:
+                continue
+            fields = check.stdout.split(None, 1)
+            self.assertTrue(fields, "unreadable fixture pid state")
+            if fields[0].startswith("Z"):
+                continue
+            self.assertEqual(len(fields), 2, "unreadable fixture pid argv")
+            argv = shlex.split(fields[1])
+            shell = Path(argv[0]).name in ("sh", "bash", "zsh", "dash", "ksh")
+            executable = argv[1] if shell else argv[0]
+            self.assertEqual(Path(executable).resolve(), self.wrk.resolve(),
+                             "refusing to stop a foreign fixture pid")
+            stop = subprocess.run(
+                ["bash", "-c", '. "$WRK_LIBFILE"; stop_completion_sentinel "$1" "$2"; ! sentinel_pid_alive "$2"',
+                 "wrk-test-cleanup", pidfile.parent.name, str(pid)],
+                env=dict(self.env, WRK_LIBFILE=str(self.wrk_lib)),
+                capture_output=True, text=True, timeout=30)
+            self.assertEqual(stop.returncode, 0,
+                             f"exact-pid sentinel stop failed for {pid}: {stop.stdout}{stop.stderr}")
+
+    def cleanup_tmp(self):
+        # Local and replayed SSH spawns can both detach writers. Stop every
+        # verified writer before TemporaryDirectory removes any part of root.
+        try:
+            self.stop_fixture_sentinels()
+            stopped = subprocess.run(
+                ["bash", "-c", '. "$1"; TW_TMP="$2"; ROOT="$3"; tmp_writers_stop; rc=$?; printf "leftovers=%s\\n" "$TW_LEFTOVER_PIDS"; exit "$rc"',
+                 "cleanup", str(ROOT / "tests/lib/tmp-writers.sh"), str(self.tmp), str(ROOT)],
+                env=self.env, capture_output=True, text=True, timeout=30)
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+        except BaseException:
+            self.keep_tmp = True
+            self.temp._finalizer.detach()  # retain evidence and live writers
+            raise
+        if not self.keep_tmp:
+            self.temp.cleanup()
 
     def executable(self, path, content):
         path.write_text(content)
@@ -67,7 +118,6 @@ class PiSpawnTests(unittest.TestCase):
             command += ["--lane", "pi-builder", "--parent", "director-1"]
         process = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True)
-        self.groups.append(process.pid)
         stdout, stderr = process.communicate(timeout=40)
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
@@ -270,39 +320,106 @@ else:
         self.assertIn("OK pane=", allowed.stdout)
 
     def test_anthropic_api_quota_record(self):
+        result = self.spawn(ARBITER_BIN=str(ROOT / "bin/arbiter"),
+                            WRK_COMPLETION_INTERVAL_S="3600")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        events = Path(self.env["ARBITER_INBOX_ROOT"]) / "pi-fixture/events"
+        records = list(events.glob("*-quota_pool.record.json"))
+        self.assertEqual(len(records), 1, result.stdout + result.stderr)
+        payload = json.loads(records[0].read_text())["payload"]
+        self.assertEqual((payload["profile"], payload["launch_profile"], payload["pool"]),
+                         ("pi-sonnet55", "pi-sonnet55@high", "anthropic-api"))
+
+
+class PiCleanupTests(unittest.TestCase):
+    def test_detached_sentinel_stops_by_exact_pid_before_shared_cleanup(self):
+        case = PiSpawnTests("test_ultra_refused")
+        case.setUp()
+        cleanup, args, kwargs = case._cleanups.pop()
+        remove = case.temp.cleanup
+        run = subprocess.run
+        library = case.tmp / "cleanup-wrk-lib.sh"
+        library.write_text(case.wrk.read_text().split('\ncase "${1:-}" in', 1)[0] + "\n")
+        job = "pi-detached"
+        jobdir = Path(case.env["ARBITER_INBOX_ROOT"]) / job
+        jobdir.mkdir()
+        env = dict(case.env, WRK_NO_SLEEP="0", WRK_COMPLETION_INTERVAL_S="3600")
+        process = subprocess.Popen(["bash", str(case.wrk), "sentinel", job, "owner", "label", "w:p1", ""],
+                                   env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   start_new_session=True)
+        (jobdir / "completion-sentinel.pid").write_text(f"{process.pid}\nstarted={int(time.time())}\n")
+
+        def dispatch(command, **options):
+            if command[:2] == ["bash", "-c"] and "tmp_writers_stop" in command[2]:
+                self.assertIsNotNone(process.poll(), "shared cleanup must not hide a failed exact-pid stop")
+            return run(command, **options)
+
+        def delete():
+            self.assertIsNotNone(process.poll(), "detached sentinel must stop before temp removal")
+            remove()
+
         try:
-            result = self.spawn(ARBITER_BIN=str(ROOT / "bin/arbiter"),
-                                WRK_COMPLETION_INTERVAL_S="3600")
-            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-            events = Path(self.env["ARBITER_INBOX_ROOT"]) / "pi-fixture/events"
-            records = list(events.glob("*-quota_pool.record.json"))
-            self.assertEqual(len(records), 1, result.stdout + result.stderr)
-            payload = json.loads(records[0].read_text())["payload"]
-            self.assertEqual((payload["profile"], payload["launch_profile"], payload["pool"]),
-                             ("pi-sonnet55", "pi-sonnet55@high", "anthropic-api"))
+            deadline = time.monotonic() + 10
+            while not (jobdir / "completion-sentinel.log").exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue((jobdir / "completion-sentinel.log").exists())
+            self.assertEqual(os.getpgid(process.pid), process.pid, "fixture must have a separate session")
+            with mock.patch.object(subprocess, "run", side_effect=dispatch), \
+                    mock.patch.object(case.temp, "cleanup", side_effect=delete):
+                cleanup(*args, **kwargs)
+            process.wait(timeout=10)
         finally:
-            pidfile = Path(self.env["ARBITER_INBOX_ROOT"]) / "pi-fixture/completion-sentinel.pid"
-            if pidfile.exists():
-                pid = int(pidfile.read_text().splitlines()[0])
-                check = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
-                                       capture_output=True, text=True)
-                if "sentinel pi-fixture " in check.stdout and str(ROOT / "bin/wrk") in check.stdout:
-                    try:
-                        group = os.getpgid(pid)
-                        if group in self.groups:
-                            os.killpg(group, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
-            # This test owns every writer under its root. Verify exact pids
-            # with the shared library before TemporaryDirectory removes it.
-            stopped = subprocess.run(
-                ["bash", "-c", '. "$1"; TW_TMP="$2"; tmp_writers_stop; rc=$?; printf "leftovers=%s\\n" "$TW_LEFTOVER_PIDS"; exit "$rc"', "cleanup",
-                 str(ROOT / "tests/lib/tmp-writers.sh"), str(self.tmp)],
-                env=self.env, capture_output=True, text=True, timeout=30)
-            if stopped.returncode:
-                self.keep_tmp = True
-                self.temp._finalizer.detach()  # preserve evidence for live writers
-            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            # Also safe for the RED/main control: only this Popen's verified
+            # exact pid is stopped, never a group, before removing the root.
+            if process.poll() is None:
+                stopped = run(["bash", "-c", '. "$WRK_LIBFILE"; stop_completion_sentinel "$1" "$2"; ! sentinel_pid_alive "$2"',
+                               "wrk-test-cleanup", job, str(process.pid)],
+                              env=dict(env, WRK_LIBFILE=str(library)), capture_output=True,
+                              text=True, timeout=30)
+                if stopped.returncode:
+                    case.temp._finalizer.detach()
+                    self.fail("retained fixture root after exact-pid stop failure: " + str(case.tmp))
+            process.wait(timeout=10)
+            remove()
+
+    def test_writers_stop_before_delete_and_failure_preserves_root(self):
+        for exit_code in (0, 1):
+            with self.subTest(stop_exit=exit_code):
+                case = PiSpawnTests("test_ultra_refused")
+                case.setUp()
+                cleanup, args, kwargs = case._cleanups.pop()
+                remove = case.temp.cleanup
+                observed = {"stopped": False, "removed": False}
+
+                def stop(command, **options):
+                    self.assertIn("tmp_writers_stop", command[2])
+                    self.assertIn(str(case.tmp), command)
+                    self.assertIn(str(ROOT), command)
+                    observed["stopped"] = True
+                    return subprocess.CompletedProcess(command, exit_code, "", "")
+
+                def delete():
+                    self.assertTrue(observed["stopped"], "writers must stop before temp removal")
+                    self.assertEqual(exit_code, 0, "failed stop must retain the temp root")
+                    observed["removed"] = True
+                    remove()
+
+                try:
+                    with mock.patch.object(case.temp, "cleanup", side_effect=delete), \
+                            mock.patch.object(subprocess, "run", side_effect=stop):
+                        if exit_code:
+                            with self.assertRaises(AssertionError):
+                                cleanup(*args, **kwargs)
+                            self.assertTrue(case.keep_tmp)
+                            self.assertTrue(case.tmp.exists())
+                            self.assertFalse(observed["removed"])
+                        else:
+                            cleanup(*args, **kwargs)
+                            self.assertTrue(observed["removed"])
+                finally:
+                    # This ordering test starts no processes; the stop failure
+                    # is injected at the shared helper boundary only.
+                    remove()
 
 
 class PiMutantTests(unittest.TestCase):
@@ -345,7 +462,7 @@ class PiMutantTests(unittest.TestCase):
                 case = PiSpawnTests(method)
                 case.setUp()
                 try:
-                    mutant = case.tmp / "wrk-mutant"
+                    mutant = case.tmp / "bin/wrk"
                     mutated = source.replace(old, new, 1)
                     if name == "host":
                         # Disable both execution-local entry points; an
