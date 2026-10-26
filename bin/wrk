@@ -7922,6 +7922,12 @@ sentinel_exit_log() {
   fi
 }
 
+sentinel_exit_trap() {
+  local code="$1"
+  trap - DEBUG EXIT
+  sentinel_exit_log "$code" "$SENTINEL_EXIT_LOGFILE" "${SENTINEL_LAST_COMMAND_LINE:-0}"
+}
+
 # job_recovered_record JOB OWNER LABEL PANE REASON LOST_DURATION_S
 # One flat job.recovered for the end of a lost episode. Not a terminal and
 # not a revive. Not emitted through panewire, same as job.lost.
@@ -7967,11 +7973,16 @@ sentinel_cmd() {
   mkdir -p "$jobdir"
   logfile="$jobdir/completion-sentinel.log"
   SENTINEL_EXIT_LOGFILE="$logfile"
-  trap 'sentinel_exit_log "$?" "$SENTINEL_EXIT_LOGFILE" "${BASH_LINENO[0]:-${LINENO:-0}}"' EXIT
+  SENTINEL_LAST_COMMAND_LINE=0
+  trap 'sentinel_exit_trap "$?"' EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 131' QUIT
   trap 'exit 143' TERM
+  # Bash emits a synthetic DEBUG callback while dispatching EXIT (and may
+  # repeat the failed command's callback during errexit); keep only callbacks
+  # that precede a successful command in this function.
+  trap 'if (( $? == 0 && LINENO > 1 )); then SENTINEL_LAST_COMMAND_LINE=$LINENO; fi' DEBUG
   if [[ "$pane_kind" == devin && -n "$observed_rung" ]]; then
     wrk_path="$(python3 - "$0" <<'PY'
 from pathlib import Path
@@ -8243,11 +8254,11 @@ start_completion_sentinel() {
   # prove the pid still belongs to the process it launched — a bare pid is
   # silently recyclable by the kernel.
   if [[ "${#SENTINEL_ENV[@]}" -gt 0 ]]; then
-    ( nohup python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    ( nohup python3 -c 'import os, signal, sys; [signal.signal(sig, signal.SIG_DFL) for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
       env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 &
       printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   else
-    ( nohup python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+    ( nohup python3 -c 'import os, signal, sys; [signal.signal(sig, signal.SIG_DFL) for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
       "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 &
       printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   fi

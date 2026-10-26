@@ -215,7 +215,7 @@ setup_sentinel_job() {
 }
 
 case_exit_normal() {
-  local job report log
+  local job report log tail_lines exit_line expected_line
   job="hk2096-exit-normal-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   report="$TMPROOT/$job-report.md"; log="$ARBITER_INBOX_ROOT/$job/completion-sentinel.log"
   mkdir -p "$ARBITER_INBOX_ROOT/$job"; printf 'complete\n' >"$report"; setup_sentinel_job "$job" || return 3
@@ -228,12 +228,24 @@ case_exit_normal() {
   [[ "$(sed -n '1p' <<<"$tail_lines")" == *'action=completed'* ]] || {
     assertion_red 'normal sentinel completion writes its action line before the EXIT line'; return 1
   }
+  exit_line="$(sed -n 's/.*sentinel-exit code=0 line=\([0-9][0-9]*\)$/\1/p' <<<"$tail_lines")"
+  expected_line="$(awk '/^      completed\)/ { in_completed=1; next } in_completed && index($0, "sentinel_self_exit \"$job\" 0") { expected=NR } /^      lost:\*/ { in_completed=0 } END { print expected+0 }' "$WRK")"
+  [[ -n "$expected_line" && "$exit_line" == "$expected_line" ]] || {
+    assertion_red "normal EXIT record line=$exit_line expected completion command line=$expected_line"; return 1
+  }
   printf 'PASS hk2096 normal completion EXIT record follows action\n'
 }
 
 case_exit_signal() {
-  local job report pidfile lib pid log
-  job="hk2096-exit-term-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  local signal_name="$1" signal_code job report pidfile lib pid log exit_line sentinel_start sentinel_end
+  case "$signal_name" in
+    HUP) signal_code=129 ;;
+    INT) signal_code=130 ;;
+    QUIT) signal_code=131 ;;
+    TERM) signal_code=143 ;;
+    *) return 3 ;;
+  esac
+  job="hk2096-exit-signal-$signal_name-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   report="$TMPROOT/$job-report.md"
   pidfile="$ARBITER_INBOX_ROOT/$job/completion-sentinel.pid"
   log="$ARBITER_INBOX_ROOT/$job/completion-sentinel.log"
@@ -244,16 +256,25 @@ case_exit_signal() {
       "$WRK" "$pidfile" "$job" "lane-$job" "lbl-$job" w:p1 "$report" || return 3
   pid="$(sed -n '1p' "$pidfile")"; own "$pid"
   wait_until 8 test -s "$log" || return 3
-  kill -TERM "$pid" 2>/dev/null || return 3
-  wait_until 8 grep -Eq 'sentinel-exit code=143 line=[0-9]+ signal=TERM$' "$log" || {
-    assertion_red 'TERM to the sentinel logs its signal name, exit status, and command line'; return 1
+  kill -"$signal_name" "$pid" 2>/dev/null || return 3
+  wait_until 8 grep -Eq "sentinel-exit code=$signal_code line=[0-9]+ signal=$signal_name\$" "$log" || {
+    assertion_red "$signal_name to the sentinel logs its signal name, exit status, and command line"; return 1
   }
+  exit_line="$(sed -n "s/.*sentinel-exit code=$signal_code line=\\([0-9][0-9]*\\) signal=$signal_name$/\\1/p" "$log")"
+  sentinel_start="$(awk '/^sentinel_cmd\(\) \{$/ { print NR; exit }' "$WRK")"
+  sentinel_end="$(awk -v start="$sentinel_start" 'NR > start && /^}/ { print NR; exit }' "$WRK")"
+  if [[ "$exit_line" =~ ^[0-9]+$ && "$sentinel_start" =~ ^[0-9]+$ && "$sentinel_end" =~ ^[0-9]+$ ]] &&
+    (( exit_line >= sentinel_start && exit_line <= sentinel_end )); then
+    :
+  else
+    assertion_red "$signal_name EXIT record line=$exit_line is outside sentinel_cmd"; return 1
+  fi
   tw_kill_pidfile "$pidfile" || true
-  printf 'PASS hk2096 TERM EXIT record names TERM\n'
+  printf 'PASS hk2096 %s EXIT record names %s\n' "$signal_name" "$signal_name"
 }
 
 case_exit_failure() {
-  local job report log rc=0
+  local job report log rc=0 exit_line expected_line
   job="hk2096-exit-failure-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
   report="$TMPROOT/$job-report.md"
   log="$ARBITER_INBOX_ROOT/$job/completion-sentinel.log"
@@ -266,6 +287,11 @@ case_exit_failure() {
     cat "$log" >&2 2>/dev/null || true
     cat "$TMPROOT/failure.out" >&2 2>/dev/null || true
     assertion_red 'forced failing sentinel command logs a nonzero exit code and command line'; return 1
+  }
+  exit_line="$(sed -n 's/.*sentinel-exit code=[1-9][0-9]* line=\([0-9][0-9]*\)$/\1/p' "$log" | tail -n 1)"
+  expected_line="$(awk '$0 == "    sleep \"$interval\"" { print NR }' "$WRK")"
+  [[ -n "$expected_line" && "$exit_line" == "$expected_line" ]] || {
+    assertion_red "failing EXIT record line=$exit_line expected failing command line=$expected_line"; return 1
   }
   printf 'PASS hk2096 failing command EXIT record has nonzero status and line\n'
 }
@@ -321,7 +347,9 @@ run_case builder-group-kill case_group_survival builder hk2096-builder
 run_case tester-group-kill case_group_survival tester hk2096-tester
 run_case no-env-launch case_no_env_launch_survival
 run_case normal-exit case_exit_normal
-run_case signal-exit case_exit_signal
+for signal_name in HUP INT QUIT TERM; do
+  run_case "signal-exit-$signal_name" case_exit_signal "$signal_name"
+done
 run_case failing-exit case_exit_failure
 
 # The mutants are intentionally source-level drops of only the new invariant.
@@ -350,7 +378,7 @@ MUTANT="$TMPROOT/wrk-no-exit-trap"
 python3 - "$WRK" "$MUTANT" <<'PY'
 import pathlib, sys
 source = pathlib.Path(sys.argv[1]).read_text().splitlines(keepends=True)
-mutant = [line for line in source if not ("trap 'sentinel_exit_log " in line and " EXIT" in line)]
+mutant = [line for line in source if not ("trap 'sentinel_exit_trap " in line and " EXIT" in line)]
 assert len(mutant) < len(source), "sentinel EXIT trap installer not found"
 pathlib.Path(sys.argv[2]).write_text("".join(mutant))
 PY
@@ -359,7 +387,7 @@ ORIGINAL_WRK="$WRK"; WRK="$MUTANT"
 expect_red 'drop EXIT trap normal' case_exit_normal \
   'ASSERT-RED: normal completed sentinel logs time, exit code, and last command line'
 expect_red 'drop EXIT trap TERM' case_exit_signal \
-  'ASSERT-RED: TERM to the sentinel logs its signal name, exit status, and command line'
+  'ASSERT-RED: TERM to the sentinel logs its signal name, exit status, and command line' TERM
 expect_red 'drop EXIT trap failure' case_exit_failure \
   'ASSERT-RED: forced failing sentinel command logs a nonzero exit code and command line'
 WRK="$ORIGINAL_WRK"

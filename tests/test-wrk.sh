@@ -205,16 +205,23 @@ PY
 # --t is required by wrk; supply one unless the case under test provides its own.
 track_test_spawn_sentinel() {
   local job="$1" jobdir="$ARBITER_INBOX_ROOT/$1"
-  local pidfile="$jobdir/completion-sentinel.pid" pid=""
-  [[ -s "$pidfile" ]] || return 0
-  IFS= read -r pid <"$pidfile" || return 0
-  [[ "$pid" =~ ^[0123456789]+$ ]] || return 0
-  _tw_pid_alive "$pid" || return 0
-  _tw_sentinel_argv_ok "$pid" "$job" "$jobdir" || return 0
-  # Fake-clock cases intentionally make the pidfile's started= fail the
-  # production age check. Capture this exact test-owned PID's real start
-  # identity and process group so teardown can reap its new detached session.
-  tw_register_pid "$OWNED_PIDS" "$pid"
+  local pidfile="$jobdir/completion-sentinel.pid" pid="" attempt
+  [[ -s "$pidfile" ]] || { echo "expected sentinel pidfile for $job" >&2; return 1; }
+  IFS= read -r pid <"$pidfile" || { echo "could not read sentinel pid for $job" >&2; return 1; }
+  [[ "$pid" =~ ^[0123456789]+$ ]] || { echo "malformed sentinel pid for $job" >&2; return 1; }
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    _tw_pid_alive "$pid" || return 0
+    if _tw_sentinel_argv_ok "$pid" "$job" "$jobdir"; then
+      # Fake-clock cases intentionally make the pidfile's started= fail the
+      # production age check. Capture this exact test-owned PID's real start
+      # identity and process group so teardown can reap its detached session.
+      tw_register_pid "$OWNED_PIDS" "$pid"
+      return
+    fi
+    sleep 0.2
+  done
+  echo "sentinel $pid for $job stayed alive without its final argv" >&2
+  return 1
 }
 
 spawn_base() {
@@ -14109,10 +14116,10 @@ wait_until 15 bash -c "! kill -0 $grace_pid 2>/dev/null" ||
   fail "the sentinel must exit once it has completed a job it had already reported lost"
 wait "$grace_pid" 2>/dev/null || true
 grace_log="$GRACE_INBOX/sentinel-grace/completion-sentinel.log"
-grace_lines="$(awk 'END{print NR}' "$grace_log")"
+grace_lines="$(awk '/ status=/ { n++ } END { print n+0 }' "$grace_log")"
 grace_calls="$(awk 'END{print NR}' "$GRACE_SEQ.calls")"
 [[ "$grace_lines" -eq "$grace_calls" ]] ||
-  fail "completion-sentinel.log must hold exactly one line per decision: $grace_lines lines for $grace_calls observations"
+  fail "completion-sentinel.log must hold exactly one decision per observation: $grace_lines decisions for $grace_calls observations"
 grep -q 'action=lost:herdr_unreachable' "$grace_log" ||
   fail "the decision log must name the lost reason it wrote (action=lost:herdr_unreachable)"
 grep -q 'action=completed' "$grace_log" ||
@@ -14134,8 +14141,8 @@ GONE_EVENTS="$GONE_INBOX/sentinel-gone/events"
 [[ "$(sentinel_lost_reason "$GONE_EVENTS")" == "agent_not_found" ]] ||
   fail "job.lost must carry reason=agent_not_found, got '$(sentinel_lost_reason "$GONE_EVENTS")'"
 gone_log="$GONE_INBOX/sentinel-gone/completion-sentinel.log"
-[[ "$(awk 'END{print NR}' "$gone_log")" -eq 1 ]] ||
-  fail "one observation is one decision is one log line"
+[[ "$(awk '/ status=/ { n++ } END { print n+0 }' "$gone_log")" -eq 1 ]] ||
+  fail "one observation is one decision log entry"
 grep -q 'status=err:agent_not_found transient=0 action=lost:agent_not_found' "$gone_log" ||
   fail "the decision log must show the error code that proved the loss"
 echo "PASS sentinel-agent-not-found-is-immediate-loss"
