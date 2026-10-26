@@ -12034,10 +12034,10 @@ spawn_cmd() {
 
   # #768: task binding is decided here, still before any side effect — a
   # missing/unresolvable task id is a usage error, never a partial spawn.
-  local requested_parent_job="$PARENT_JOB" requested_owner="$OWNER" inherited_parent_owner=""
+  local requested_parent_job="$PARENT_JOB" requested_owner="$OWNER" effective_parent_owner=""
   if [[ -n "$requested_parent_job" || "$REPORT_RELATIVE" == 1 ]]; then
     parent_spawn_validate "$requested_parent_job" "$JOB_ID" "$ROLE" "$OWNER" "$REPORT_PATH" "$REPORT_RELATIVE"
-    [[ -n "$requested_owner" ]] || inherited_parent_owner="$PARENT_SPAWN_OWNER"
+    effective_parent_owner="$PARENT_SPAWN_OWNER"
     OWNER="$PARENT_SPAWN_OWNER"
     REPORT_PATH="$PARENT_SPAWN_REPORT"
   fi
@@ -12051,9 +12051,9 @@ spawn_cmd() {
     fi
     local o3_args=(spawn-check "$JOB_ID" --role "$ROLE" --tier "$JOB_T")
     [[ -z "$TASK_ID" ]] || o3_args+=(--task "$TASK_ID")
-    # An inherited O2 owner cannot pre-empt canonical verification. Compare
-    # it with the verified O3 owner below, before local admission or a pane.
-    [[ -z "${BUILDER_LANE:-$requested_owner}" ]] || o3_args+=(--owner "${BUILDER_LANE:-$requested_owner}")
+    # Parent owners, explicit or forwarded, cannot pre-empt canonical
+    # verification. Compare the effective owner with O3 before admission.
+    [[ -n "$requested_parent_job" || -z "${BUILDER_LANE:-$requested_owner}" ]] || o3_args+=(--owner "${BUILDER_LANE:-$requested_owner}")
     [[ -z "$PARENT_LANE" ]] || o3_args+=(--parent "$PARENT_LANE")
     [[ -z "$PARENT_JOB" ]] || o3_args+=(--parent-job "$PARENT_JOB")
     [[ -z "$O3_SPAWN_HEAD" ]] || o3_args+=(--head "$O3_SPAWN_HEAD" --repo "$CWD")
@@ -12064,8 +12064,8 @@ spawn_cmd() {
     if [[ "$o3_rc" -eq 0 ]]; then
       IFS=$'\t' read -r TASK_ID o3_owner o3_parent TASK_LINK_STATUS <<<"$o3_meta"
       [[ -n "$TASK_ID" && -n "$o3_owner" && -n "$o3_parent" && -n "$TASK_LINK_STATUS" ]] || die "O3 spawn claim verification returned incomplete metadata"
-      if [[ -n "$inherited_parent_owner" && "$inherited_parent_owner" != "$o3_owner" ]]; then
-        die "parent inherited owner '$inherited_parent_owner' disagrees with O3 canonical owner '$o3_owner'"
+      if [[ -n "$effective_parent_owner" && "$effective_parent_owner" != "$o3_owner" ]]; then
+        die "parent effective owner '$effective_parent_owner' disagrees with O3 canonical owner '$o3_owner'"
       fi
       O3_SPAWN_VERIFIED=1
       [[ "$ROLE" == builder ]] || OWNER="$o3_owner"

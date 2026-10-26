@@ -1215,6 +1215,46 @@ class SpawnIntegrationTests(Harness):
                 "--role", "tester", "--parent-job", "job-a", "--head", head,
                 "--report", str(self.intent_file().parent / "verdict.md")]
 
+    def owner_target(self, owner, relative=False, mode="required"):
+        args = self.reviewer() + ["--owner", owner]
+        if relative:
+            pos = args.index("--report")
+            args[pos:pos + 2] = ["--report-relative", "job-a/verdict.md"]
+        self.mode(mode)
+        self.seed(*({"action": "accept"} for _ in range(8)))
+        return self.run_wrk(*args)
+
+    def owner_refusal(self, result):
+        self.assertEqual(result.returncode, 2, result.stderr)
+        lines = [line for line in result.stderr.splitlines()
+                 if not line.startswith("wrk: warning: test mode honours overridden ")]
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn("different-owner", lines[0])
+        self.assertIn("b2400-a", lines[0])
+        self.assertFalse((self.root / "herdr.log").exists())
+        self.assertFalse(any(e["kind"] == "job.claim" for e in self.events("job-review")))
+
+    def test_explicit_parent_owner_mismatch_refuses(self):
+        self.owner_refusal(self.owner_target("different-owner"))
+
+    def test_shadow_explicit_parent_owner_mismatch_refuses(self):
+        self.owner_refusal(self.owner_target("different-owner", mode="shadow"))
+
+    def test_ssh_forwarded_owner_mismatch_refuses_on_target(self):
+        # Exact receiving argv from spillover_remote_spawn: forwarded owner
+        # plus jobs-root-relative report. SSH itself remains a fixture only.
+        self.owner_refusal(self.owner_target("different-owner", relative=True))
+
+    def test_explicit_parent_owner_match_spawns(self):
+        result = self.owner_target("b2400-a")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tab create", (self.root / "herdr.log").read_text())
+
+    def test_ssh_forwarded_owner_match_spawns_on_target(self):
+        result = self.owner_target("b2400-a", relative=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("tab create", (self.root / "herdr.log").read_text())
+
     def agreeing_owners(self, mode):
         args = self.reviewer()
         self.mode(mode)
@@ -2198,8 +2238,12 @@ class MutantTests(Harness):
         adapter_source = ADAPTER.read_text()
         wrk_source = WRK.read_text()
         mutations = [
+            ("owner-only-when-absent", "wrk",
+             '    effective_parent_owner="$PARENT_SPAWN_OWNER"',
+             '    [[ -n "$requested_owner" ]] || effective_parent_owner="$PARENT_SPAWN_OWNER"',
+             "SpawnIntegrationTests.test_explicit_parent_owner_mismatch_refuses"),
             ("parent-owner-disagreement", "wrk",
-             '      if [[ -n "$inherited_parent_owner" && "$inherited_parent_owner" != "$o3_owner" ]]; then',
+             '      if [[ -n "$effective_parent_owner" && "$effective_parent_owner" != "$o3_owner" ]]; then',
              '      if false; then # mutant: ignore inherited/canonical owner disagreement',
              "SpawnIntegrationTests.test_records_disagreeing_newest_parent_owner_refuses_before_pane"),
             ("records-skips-parent-report-checks", "wrk",
