@@ -155,9 +155,9 @@ class HeavyQueue(unittest.TestCase):
     def process_start(self, pid):
         if sys.platform == "darwin":
             result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                                    env=dict(self.env, LC_ALL="C"),
+                                    env=dict(self.env, LC_ALL="C", TZ="UTC"),
                                     capture_output=True, text=True, check=False)
-            return "ps:" + "_".join(result.stdout.split())
+            return result.stdout
         stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
         boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
         return "proc:" + boot + ":" + stat[19]
@@ -169,7 +169,7 @@ class HeavyQueue(unittest.TestCase):
             except OSError:
                 start = "gone"
         (self.waiters / str(pid)).write_text(
-            f"pid={pid} class={cls} limit={limit} ticket={ticket} start={start} since=x job=- cmd=fixture")
+            f"pid={pid} class={cls} limit={limit} ticket={ticket} start={json.dumps(start)} since=x job=- cmd=fixture")
 
     def owner_events(self, kind):
         path = self.base / "heavy.log"
@@ -294,9 +294,14 @@ class HeavyQueue(unittest.TestCase):
         exec(compile(source[begin:end], str(WRK), "exec"), namespace)
         read_start = namespace["process_start"]
         result = subprocess.CompletedProcess([], 0, "  Mon Oct 26  01:02:03 2026  \n")
+        head = "pid=123 class=lane limit=1 ticket=1:1 start=" + json.dumps(result.stdout)
+        self.assertEqual(namespace["record_start"](head + " since=x cmd=start=forged"), result.stdout)
+        self.assertIsNone(namespace["record_start"]("pid=123 class=lane limit=1 ticket=1:1 since=x cmd=start=forged"))
         with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", return_value=result) as run:
-            self.assertEqual(read_start(123), "ps:Mon_Oct_26_01:02:03_2026")
+            self.assertEqual(read_start(123), result.stdout, "ps start text was normalized")
             self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+            self.assertEqual(run.call_args.kwargs["env"].get("TZ"), "UTC",
+                             "reader timezone changed process identity")
             self.assertEqual(run.call_args.args[0], ["ps", "-o", "lstart=", "-p", "123"])
         with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
             self.assertIsNone(read_start(123), "slow ps must be unknown")

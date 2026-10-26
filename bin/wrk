@@ -12846,16 +12846,17 @@ def alive(pid):
 
 
 def process_start(pid):
-    # Stable, whitespace-free identity. Force C locale for macOS lstart;
+    # macOS lstart has one-second precision (known limit); keep its exact
+    # text, with locale/timezone pinned equally in writers and readers.
     # Linux field 22 follows the final ')' even when comm contains spaces.
     try:
         if sys.platform == "darwin":
             result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
-                                    env=dict(os.environ, LC_ALL="C"),
+                                    env=dict(os.environ, LC_ALL="C", TZ="UTC"),
                                     capture_output=True, text=True, timeout=5)
             if result.returncode or not result.stdout.strip():
                 return None
-            return "ps:" + "_".join(result.stdout.split())
+            return result.stdout
         with open("/proc/%d/stat" % pid, encoding="utf-8") as f:
             ticks = f.read().rsplit(")", 1)[1].split()[19]
         with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
@@ -12890,9 +12891,18 @@ def owner_alive(pid, start):
 
 
 def record_start(text):
-    fields = text.split(None, 5)
+    fields = text.split(None, 4)
     if len(fields) > 4 and fields[4].startswith("start="):
-        return fields[4][6:] or "unknown"
+        # JSON quoting preserves the exact ps text (including whitespace)
+        # while keeping a single fixed head field ahead of free-form cmd.
+        try:
+            tail = fields[4][6:]
+            start, end = json.JSONDecoder().raw_decode(tail)
+            if end < len(tail) and not tail[end].isspace():
+                return "unknown"
+            return start if isinstance(start, str) and start else "unknown"
+        except (ValueError, RecursionError):
+            return "unknown"
     return None
 
 
@@ -13655,7 +13665,7 @@ if queue_key is not None:
             remove_position(positions_fd, position_name(queue_key), st, key=queue_key)
 # Keep the class/limit head byte-compatible for older wrk and CI reservation.
 info = info.replace(" since=", " ticket=%d:%d start=%s since=" %
-                    (*ticket, process_start(os.getpid()) or "unknown"), 1)
+                    (*ticket, json.dumps(process_start(os.getpid()) or "unknown")), 1)
 me_name = str(os.getpid())
 held_slot = -1
 acquired_at = None
