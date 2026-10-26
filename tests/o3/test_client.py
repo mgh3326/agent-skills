@@ -2062,5 +2062,77 @@ class P1MappingTests(Harness):
         self.assertEqual([e['round'] for e in self.events() if e['kind']=='job.verdict'],[1])
 
 
+
+
+class ModeAncestorTests(Harness):
+    discover_shell=ModeShellTests.discover_shell
+    def assert_refused(self, component):
+        result=self.discover_shell()
+        self.assertEqual(result.returncode,2,result.stderr+result.stdout)
+        self.assertEqual(result.stdout,'')
+        self.assertIn(str(component),result.stderr)
+        self.assertEqual(len(result.stderr.splitlines()),1)
+    def test_inaccessible_parent_is_not_absence(self):
+        self.mode('required');directory=self.home/'.config/wrk';directory.chmod(0)
+        try:self.assert_refused(directory)
+        finally:directory.chmod(0o700)
+    def test_non_directory_config_refuses(self):
+        component=self.home/'.config';component.write_text('ordinary file\n')
+        self.assert_refused(component)
+    def test_truly_absent_wrk_under_searchable_config_is_legacy(self):
+        (self.home/'.config').mkdir()
+        result=self.discover_shell()
+        self.assertEqual((result.returncode,result.stdout),(0,'legacy\n'),result.stderr)
+    def test_symlink_ancestors_refuse_even_when_target_is_searchable(self):
+        for relative in ('.config','.config/wrk'):
+            with self.subTest(component=relative):
+                other=ModeAncestorTests();other.setUp()
+                try:
+                    component=other.home/relative;component.parent.mkdir(parents=True,exist_ok=True)
+                    target=other.root/'real-directory';target.mkdir();component.symlink_to(target,target_is_directory=True)
+                    other.assert_refused(component)
+                finally:other.doCleanups()
+    def test_inaccessible_home_is_not_absence(self):
+        self.home.chmod(0)
+        try:self.assert_refused(self.home)
+        finally:self.home.chmod(0o700)
+
+
+class ModeParityTests(Harness):
+    def discover_working_shell(self):
+        source=WRK.read_text()
+        function='wrk_o3_mode() {'+source.split('wrk_o3_mode() {',1)[1].split('\n}\n',1)[0]+'\n}\n'
+        guard=ModeDiscoveryTests.mode_block(self)[1]
+        env=dict(self.env,WRK_TRUST_PY=guard)
+        return subprocess.run(['bash','-c',function+'\nwrk_o3_mode\n'],env=env,capture_output=True,text=True)
+    def test_shell_and_python_discovery_decide_same_fixture_set(self):
+        for case in ('blocked','file-config','symlink','absent','present'):
+            with self.subTest(case=case):
+                other=ModeParityTests();other.setUp();blocked=None
+                try:
+                    if case=='blocked':
+                        other.mode('required');blocked=other.home/'.config/wrk';blocked.chmod(0)
+                    elif case=='file-config':(other.home/'.config').write_text('not a directory')
+                    elif case=='symlink':
+                        target=other.root/'real-config';target.mkdir();(other.home/'.config').symlink_to(target,target_is_directory=True)
+                    elif case=='absent':(other.home/'.config').mkdir()
+                    else:other.mode('required')
+                    # A working interpreter lets the shell take its real parse path.
+                    shell=other.discover_working_shell()
+                    with other.client() as client:
+                        try:value=other.module.records_mode(client.resolver)
+                        except other.module.Refusal as error:
+                            self.assertEqual(error.code,'cli_usage')
+                            self.assertEqual(error.exit,2)
+                            self.assertEqual(shell.returncode,2,shell.stderr)
+                            self.assertEqual(shell.stderr,error.line())
+                        else:
+                            if case=='present':self.assertEqual((value,shell.returncode,shell.stdout),('required',0,'required\n'),shell.stderr)
+                            else:self.assertEqual((value,shell.returncode,shell.stdout),('legacy',0,'legacy\n'))
+                finally:
+                    if blocked is not None:blocked.chmod(0o700)
+                    other.doCleanups()
+
+
 if __name__ == "__main__":
     unittest.main()

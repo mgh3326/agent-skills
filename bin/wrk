@@ -5253,7 +5253,7 @@ wrk_trust_guard() {
 # hermetic copies of wrk need no adapter until O3 is explicitly enabled.
 # No environment variable/flag chooses the records mode.
 wrk_o3_mode() {
-  local mode_home mode_path mode_uid passwd_entry field value
+  local mode_home mode_path mode_uid passwd_entry field value mode_component mode_parent
   if [[ "${WRK_TEST_MODE:-}" == 1 ]]; then
     # Discovery with no test HOME reads no path (hk951 ruling).
     [[ -n "${HOME:-}" ]] || { echo legacy; return; }
@@ -5275,6 +5275,24 @@ wrk_o3_mode() {
     fi
     [[ "$mode_home" == /* ]] || return 2
   fi
+  # Prove absence only through searchable real directory ancestors.
+  mode_parent="${mode_home%/*}"
+  [[ -n "$mode_parent" ]] || mode_parent=/
+  if [[ ! -d "$mode_parent" || ! -x "$mode_parent" ]]; then
+    printf 'wrk o3: cli_usage component=%q\n' "$mode_parent" >&2
+    return 2
+  fi
+  for mode_component in "$mode_home" "$mode_home/.config" "$mode_home/.config/wrk"; do
+    if [[ -L "$mode_component" || ( -e "$mode_component" &&
+          ( ! -d "$mode_component" || ! -x "$mode_component" ) ) ]]; then
+      printf 'wrk o3: cli_usage component=%q\n' "$mode_component" >&2
+      return 2
+    fi
+    if [[ ! -e "$mode_component" ]]; then
+      echo legacy
+      return
+    fi
+  done
   mode_path="$mode_home/.config/wrk/records-mode"
   # Absence alone needs no parser. A dangling symlink still needs validation.
   if [[ ! -e "$mode_path" && ! -L "$mode_path" ]]; then

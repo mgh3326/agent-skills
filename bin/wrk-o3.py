@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import pwd
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -60,6 +61,16 @@ class Refusal(Exception):
         self.code = code
         self.exit = EXIT_CODES[code]
         super().__init__(code)
+
+
+class ModeRefusal(Refusal):
+    def __init__(self, component):
+        super().__init__("cli_usage")
+        self.component = str(component)
+
+    def line(self):
+        quoted = shlex.quote(self.component).replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t")
+        return "wrk o3: cli_usage component=" + quoted + "\n"
 
 
 def strict_json(raw, code="protocol_invalid"):
@@ -271,6 +282,19 @@ def records_mode(resolver):
         home = resolver.resolve(need_hk=False)["home"] if test else pwd.getpwuid(os.getuid()).pw_dir
     except (KeyError, OSError):
         raise Refusal("cli_usage") from None
+    directory = Path(home)
+    parent = directory.parent
+    if not parent.is_dir() or not os.access(parent, os.X_OK):
+        raise ModeRefusal(parent)
+    for component in (directory, directory / ".config", directory / ".config/wrk"):
+        try:
+            info = component.lstat()
+        except FileNotFoundError:
+            return "legacy"  # its preceding parent was proved searchable
+        except OSError:
+            raise ModeRefusal(component) from None
+        if not stat.S_ISDIR(info.st_mode) or not os.access(component, os.X_OK):
+            raise ModeRefusal(component)
     path = Path(home) / ".config/wrk/records-mode"
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -1742,6 +1766,9 @@ commands and delegated consumers. These operations do no local cleanup.
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except ModeRefusal as error:
+        sys.stderr.write(error.line())
+        raise SystemExit(error.exit)
     except LocalRefusal as error:
         sys.stderr.write("wrk: " + error.message + "\n")
         raise SystemExit(error.exit)
