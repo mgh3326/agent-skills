@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import shlex
 import stat
 import subprocess
 import sys
@@ -1179,7 +1180,8 @@ class SpawnHandshakeTests(Harness):
                         WRK_FIXTURE_LOG=str(self.root / "herdr.log"))
         result = self.run_wrk("spawn", "--host", "local", "-c", str(workspace), "-m", "opus",
                               "-p", str(brief), "-w", "fixture", "-l", "job-review", "--t", "T2",
-                              "--role", "tester", "--parent-job", "job-a", "--head", head)
+                              "--role", "tester", "--parent-job", "job-a", "--owner", "b2400-a", "--head", head,
+                              "--report", str(self.intent_file().parent / "verdict.md"))
         self.assertEqual(result.returncode, 75, result.stderr)
         data = json.loads(self.script.read_text())
         self.assertEqual(data["journals"]["job-review"][0]["kind"], "claim")
@@ -1187,6 +1189,177 @@ class SpawnHandshakeTests(Harness):
         log = self.root / "herdr.log"
         self.assertFalse(log.exists() and "tab create" in log.read_text())
         self.assertTrue(all(x["argv"][0] == "wrk" for x in self.calls()), "no hk_bin legacy task call in O3 spawn")
+
+
+class SpawnIntegrationTests(Harness):
+    """Director-1's hk2042/C1 integration and three promoted review Minors."""
+    def reviewer(self, owner="b2400-a"):
+        SpawnHandshakeTests.spawn_environment(self)
+        workspace = self.root / "workspace"
+        subprocess.run(["git", "-C", str(workspace), "-c", "user.name=Fixture",
+                        "-c", "user.email=fixture@example.test", "commit", "--allow-empty", "-qm", "fixture"],
+                       env=self.env, check=True)
+        head = subprocess.check_output(["git", "-C", str(workspace), "rev-parse", "HEAD"],
+                                       env=self.env, text=True).strip()
+        parent_events = self.intent_file().parent / "events"
+        parent_events.mkdir(parents=True)
+        # Newest reclaim wins. Deliberately different local task: O3's task
+        # must survive, rather than being replaced by legacy task_validate.
+        for seq, lane in ((1, "older-owner"), (2, owner)):
+            kind = "job.claim" if seq == 1 else "job.reclaim"
+            (parent_events / ("%05d-%s.json" % (seq, kind))).write_text(json.dumps(
+                dict(kind=kind, job_id="job-a", owner_lane=lane, task_id=9999,
+                     role="builder", t="T2")))
+        return ["spawn", "--host", "local", "-c", str(workspace), "-m", "opus", "--effort", "high",
+                "-p", str(self.root / "brief.md"), "-w", "fixture", "-l", "job-review", "--t", "T2",
+                "--role", "tester", "--parent-job", "job-a", "--head", head,
+                "--report", str(self.intent_file().parent / "verdict.md")]
+
+    def agreeing_owners(self, mode):
+        args = self.reviewer()
+        self.mode(mode)
+        self.seed(*({"action": "accept"} for _ in range(8)))
+        result = self.run_wrk(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        claim = [e for e in self.events("job-review") if e["kind"] == "job.claim"][-1]
+        payload = claim.get("payload", claim)
+        self.assertEqual(payload["owner_lane"], "b2400-a")
+        self.assertEqual(payload["task_id"], 2400)
+        self.assertIn("tab create", (self.root / "herdr.log").read_text())
+
+    def test_legacy_parent_keeps_newest_owner_task_probe_and_link_projection(self):
+        args = self.reviewer()
+        pos = args.index("--head")
+        del args[pos:pos + 2]
+        log = self.root / "legacy-calls.jsonl"
+        fixture = ROOT / "tests/fixtures/handoffkeep"
+        self.hk.write_text("#!/usr/bin/env python3\nimport json,os,sys\n"
+                           f"with open({str(log)!r},'a') as f: f.write(json.dumps(sys.argv[1:])+'\\n')\n"
+                           f"os.execv({str(fixture)!r},[{str(fixture)!r},*sys.argv[1:]])\n")
+        self.env["HK_STATE"] = str(self.root / "legacy-state.json")
+        subprocess.run([str(self.hk), "tasks", "add", "--id", "9999", "--title", "fixture", "--lane", "fixture",
+                        "--state", "claimed", "--claimed-by", "b2400-a", "--job-id", "job-a"],
+                       env=self.env, capture_output=True, check=True)
+        result = self.run_wrk(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        self.assertTrue(any(c[:3] == ["tasks", "show", "9999"] for c in calls))
+        events = self.events("job-review")
+        claim_event = next(e for e in events if e["kind"] == "job.claim")
+        claim = claim_event.get("payload", claim_event)
+        self.assertEqual(claim["owner_lane"], "b2400-a")
+        self.assertEqual(claim["task_id"], 9999)
+        self.assertTrue(any(e["kind"] == "job.task_link" and e.get("payload", e)["status"] == "inherited" for e in events))
+
+    def test_records_agreeing_owners_keep_canonical_task_and_spawn(self):
+        self.agreeing_owners("required")
+
+    def test_shadow_agreeing_owners_keep_canonical_task_and_spawn(self):
+        self.agreeing_owners("shadow")
+
+    def disagreeing_owners(self, mode):
+        args = self.reviewer(owner="different-owner")
+        self.mode(mode)
+        self.seed(*({"action": "accept"} for _ in range(8)))
+        result = self.run_wrk(*args)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        # The PR242 test-override diagnostic is mandatory and unchanged;
+        # the production owner refusal itself is exactly one line.
+        refusal = [line for line in result.stderr.splitlines()
+                   if not line.startswith("wrk: warning: test mode honours overridden ")]
+        self.assertEqual(len(refusal), 1, result.stderr)
+        self.assertIn("different-owner", result.stderr)
+        self.assertIn("b2400-a", result.stderr)
+        self.assertFalse((self.root / "herdr.log").exists())
+        self.assertFalse(any(e["kind"] == "job.claim" for e in self.events("job-review")))
+
+    def test_records_disagreeing_newest_parent_owner_refuses_before_pane(self):
+        self.disagreeing_owners("required")
+
+    def test_shadow_disagreeing_newest_parent_owner_refuses_before_pane(self):
+        self.disagreeing_owners("shadow")
+
+    def test_records_parent_report_is_required_and_contained_even_with_explicit_owner(self):
+        args = self.reviewer() + ["--owner", "b2400-a"]
+        escape = self.intent_file().parent / "escape"
+        escape.symlink_to(self.root)
+        for index, report in enumerate((None, str(self.root / "outside.md"), str(escape / "outside.md"))):
+            with self.subTest(report=report):
+                candidate = args[:]
+                candidate[candidate.index("-l") + 1] = "job-review-%d" % index
+                pos = candidate.index("--report")
+                candidate[pos:pos + 2] = [] if report is None else ["--report", report]
+                self.mode("required")
+                self.seed(*({"action": "accept"} for _ in range(8)))
+                result = self.run_wrk(*candidate)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--report", result.stderr)
+                self.assertEqual(self.calls(), [], "report refusal precedes canonical mutation")
+                self.assertFalse((self.root / "herdr.log").exists())
+
+    def test_records_relative_report_is_rerooted_under_target_inbox(self):
+        args = self.reviewer()
+        args[args.index("--report"): ] = ["--report-relative", "job-a/verdict.md"]
+        self.mode("required")
+        self.seed(*({"action": "accept"} for _ in range(8)))
+        result = self.run_wrk(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        pid = (self.intent_file("job-review").parent / "completion-sentinel.pid").read_text().split()[0]
+        command = subprocess.check_output(["ps", "-p", pid, "-o", "command="], env=self.env, text=True)
+        sentinel = shlex.split(command)
+        self.assertEqual(sentinel[sentinel.index("sentinel") + 5], str(self.intent_file().parent / "verdict.md"))
+
+    def test_tier_refuses_before_any_o3_read(self):
+        args = SpawnHandshakeTests.spawn_environment(self)
+        self.mode("required")
+        for tier in (None, "T4"):
+            with self.subTest(tier=tier):
+                candidate = args[:]
+                pos = candidate.index("--t")
+                candidate[pos:pos + 2] = [] if tier is None else ["--t", tier]
+                self.seed(*({"action": "read"} for _ in range(3)))
+                result = self.run_wrk(*candidate)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--t", result.stderr)
+                self.assertEqual(self.calls(), [])
+                self.assertFalse((self.root / "herdr.log").exists())
+
+    def test_missing_task_link_status_is_incomplete_metadata(self):
+        args = SpawnHandshakeTests.spawn_environment(self)
+        self.mode("required")
+        self.responses()
+        binary = self.root / "metadata-bin"
+        binary.mkdir()
+        entry = binary / "wrk"
+        shutil.copyfile(WRK, entry)
+        # Exercise the shell's adapter-output boundary with a truncated
+        # successful response; no alternate transport or real server runs.
+        for helper in (ROOT / "bin").iterdir():
+            if helper.is_file() and helper.name not in ("wrk", "wrk-o3.py"):
+                (binary / helper.name).symlink_to(helper)
+        for line in ("2400\tb2400-a\tdirector-1", "2400\t\tdirector-1\talready_linked",
+                     "2400\tb2400-a\t\talready_linked"):
+            with self.subTest(metadata=line):
+                (binary / "wrk-o3.py").write_text("print(%r)\n" % line)
+                result = subprocess.run(["bash", str(entry), *args], text=True, capture_output=True,
+                                        env=self.env, timeout=180)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("incomplete metadata", result.stderr)
+                self.assertFalse((self.root / "herdr.log").exists())
+
+    def test_policy_lanes_requires_min_properties(self):
+        with self.client() as client:
+            lanes = client.schema.bundle["$defs"]["Policy"]["properties"]["lanes"]
+            self.assertTrue(client.schema.matches(lanes, {"builder-a": None}))
+            self.assertFalse(client.schema.matches(lanes, {}))
+
+    def test_policy_lanes_validates_property_names(self):
+        with self.client() as client:
+            lanes = client.schema.bundle["$defs"]["Policy"]["properties"]["lanes"]
+            self.assertTrue(client.schema.matches(lanes, {"builder-a": "director-1"}))
+            for key in ("", "Bad_Lane", "a" * 65):
+                with self.subTest(key=key):
+                    self.assertFalse(client.schema.matches(lanes, {key: None}))
 
 
 class AuditTests(Harness):
@@ -1924,7 +2097,7 @@ class RealFailure(Harness):
         head = subprocess.check_output(['git', '-C', str(workspace), 'rev-parse', 'HEAD'], env=self.env, text=True).strip()
         self.mode('required')
         self.seed(*[{'action': 'read'}] * 7, dict(exit=75, stderr='handoffkeep wrk: wrk_unavailable\n'))
-        result = self.run_wrk('spawn', '--host', 'local', '-c', str(workspace), '-m', 'opus', '--effort', 'high', '-p', str(self.root / 'brief.md'), '-w', 'fixture', '-l', 'job-review', '--t', 'T2', '--role', 'tester', '--owner', 'b2400-a', '--parent-job', 'job-a', '--head', head, '--report', str(self.root / 'review.md'))
+        result = self.run_wrk('spawn', '--host', 'local', '-c', str(workspace), '-m', 'opus', '--effort', 'high', '-p', str(self.root / 'brief.md'), '-w', 'fixture', '-l', 'job-review', '--t', 'T2', '--role', 'tester', '--owner', 'b2400-a', '--parent-job', 'job-a', '--head', head, '--report', str(self.intent_file().parent / 'review.md'))
         self.assertEqual(result.returncode, 75, result.stderr)
         data = json.loads(self.script.read_text())
         self.assertEqual(data['journals']['job-review'][0]['kind'], 'claim')
@@ -2025,6 +2198,30 @@ class MutantTests(Harness):
         adapter_source = ADAPTER.read_text()
         wrk_source = WRK.read_text()
         mutations = [
+            ("parent-owner-disagreement", "wrk",
+             '      if [[ -n "$inherited_parent_owner" && "$inherited_parent_owner" != "$o3_owner" ]]; then',
+             '      if false; then # mutant: ignore inherited/canonical owner disagreement',
+             "SpawnIntegrationTests.test_records_disagreeing_newest_parent_owner_refuses_before_pane"),
+            ("records-skips-parent-report-checks", "wrk",
+             '  if [[ -n "$requested_parent_job" || "$REPORT_RELATIVE" == 1 ]]; then',
+             '  if [[ "$(wrk_o3_mode)" == legacy && ( -n "$requested_parent_job" || "$REPORT_RELATIVE" == 1 ) ]]; then',
+             "SpawnIntegrationTests.test_records_parent_report_is_required_and_contained_even_with_explicit_owner"),
+            ("tier-after-o3", "wrk",
+             '  case "$JOB_T" in T0|T1|T2|T3) ;; *) die "--t accepts only T0, T1, T2 or T3" ;; esac',
+             '  : # mutant: skip valid tier check before O3',
+             "SpawnIntegrationTests.test_tier_refuses_before_any_o3_read"),
+            ("missing-link-status", "wrk",
+             '&& -n "$o3_parent" && -n "$TASK_LINK_STATUS" ]] || die "O3 spawn claim verification returned incomplete metadata"',
+             '&& -n "$o3_parent" ]] || die "O3 spawn claim verification returned incomplete metadata"',
+             "SpawnIntegrationTests.test_missing_task_link_status_is_incomplete_metadata"),
+            ("schema-min-properties", "adapter",
+             '            if len(v) < s.get("minProperties", 0):',
+             '            if False: # mutant: accept empty required object',
+             "SpawnIntegrationTests.test_policy_lanes_requires_min_properties"),
+            ("schema-property-names", "adapter",
+             '            if "propertyNames" in s and not all(self.matches(s["propertyNames"], k) for k in v):',
+             '            if False: # mutant: ignore property-name grammar',
+             "SpawnIntegrationTests.test_policy_lanes_validates_property_names"),
             ("later-page-path", "adapter",
              '        chosen = self.resolver.resolve(self.central)\n        # Index only retained keys:',
              '        chosen = ({"hk": "handoffkeep", "home": os.environ["HOME"]} if args[0] == "records" and "--snapshot-seq" in args else self.resolver.resolve(self.central))\n        # Index only retained keys:',

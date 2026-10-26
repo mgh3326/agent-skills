@@ -238,6 +238,10 @@ class Schema:
         if "type" in s and type(v) is not kinds[s["type"]]:
             return False
         if isinstance(v, dict):
+            if len(v) < s.get("minProperties", 0):
+                return False
+            if "propertyNames" in s and not all(self.matches(s["propertyNames"], k) for k in v):
+                return False
             props = s.get("properties", {})
             if not set(s.get("required", ())).issubset(v):
                 return False
