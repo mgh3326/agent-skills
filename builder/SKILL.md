@@ -65,7 +65,7 @@ hk 2043은 r1026luna down arm(L-A+ luna@high 대 sonnet@xhigh)을 위해
 `builder-luna-high`(`codex-luna@high`)를 같은 luna 계열에 더한다 — low/medium 과
 같은 E6 측정 철자이므로 `SCOPEFUEL_E6_ARM=codex-luna@high` 표식이 필요하고
 `codex-luna@high`로 기록된다.
-넷 다 배치된 canon 행이라 표식은 게이트 판정을 그 행으로만 좁히고,
+다섯 다 배치된 canon 행이라 표식은 게이트 판정을 그 행으로만 좁히고,
 luna 쌍은 `codex-luna@<런그>`로 게이트되며 모델 id는 카탈로그 행에서 온다
 (오늘 codex-luna@low 는 gpt-5.6-luna).
 hk 1863은 같은 규칙으로 hk 1786 의 borrow-down·promote-up 팔 다섯 런그를 연다 — `builder-sol-low`(`SCOPEFUEL_E6_ARM=codex-sol@low`), `builder-haiku-high`(`haiku@high`), `builder-haiku-xhigh`(`haiku@xhigh`), `builder-haiku-max`(`haiku@max`), `builder-sonnet-low`(`sonnet@low`) — `builder-haiku-max`는 `builder-sol-max`·`builder-sonnet-max`와 같이 열려 있고(hk 1864), canon 에 `sonnet@low` 행이 아직 없어 실게이트의 `builder-sonnet-low`는 행이 푸시될 때까지 거부된다.

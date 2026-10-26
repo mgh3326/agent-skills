@@ -709,10 +709,8 @@
     "builder-sol-max": {
       "default_effort": "max",
       "family": "openai",
-      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
-      "grade_status": "conflict",
       "grades": {
-        "max": null
+        "max": "S+"
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
@@ -2189,6 +2187,10 @@
     "task/704": {
       "id": 704,
       "scope": "E6 builder effort variants and launch role; source pinned by bin/wrk hash"
+    },
+    "decision/r1026solmax": {
+      "id": "r1026solmax",
+      "scope": "codex-sol@max is the placed S+ gate=default canon row; builder-sol-max is a normal pinned builder spelling"
     },
     "task/712": {
       "id": 712,
