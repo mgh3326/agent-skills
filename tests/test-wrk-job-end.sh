@@ -1342,6 +1342,7 @@ make_stub_path "$JE27_PATH" timeout gtimeout
 cat >"$JE27_PATH/timeout" <<'EOF'
 #!/bin/sh
 printf 'timeout %s\n' "$*" >> "$WRAPPER_LOG"
+if [ "$1" = "-k" ]; then shift 2; fi
 secs="$1"; shift
 exec "$@"
 EOF
@@ -1354,6 +1355,8 @@ env PATH="$JE27_PATH" WRAPPER_LOG="$WRAPPER_LOG" \
   fail "JE27: done must complete under the timeout guard"
 grep -q 'job done' "$WRAPPER_LOG" ||
   fail "JE27: run_bounded must invoke the timeout wrapper for the delegated call"
+grep -q '^timeout -k 2 ' "$WRAPPER_LOG" ||
+  fail "JE27: run_bounded must pass -k 2 so a TERM-ignoring delegate is killed: $(cat "$WRAPPER_LOG")"
 event_count_is "$INBOX/je27-timeout/events" job.completed 1 ||
   fail "JE27: the local fallback still writes the record"
 echo "PASS je27 timeout-selected"
@@ -1370,6 +1373,7 @@ make_stub_path "$JE28_PATH" timeout gtimeout
 cat >"$JE28_PATH/gtimeout" <<'EOF'
 #!/bin/sh
 printf 'gtimeout %s\n' "$*" >> "$WRAPPER_LOG"
+if [ "$1" = "-k" ]; then shift 2; fi
 secs="$1"; shift
 exec "$@"
 EOF
@@ -3145,6 +3149,7 @@ EOF
   cat >"$spath/timeout" <<'EOF'
 #!/bin/sh
 printf 'timeout %s\n' "$*" >> "$WRAPPER_LOG"
+if [ "$1" = "-k" ]; then shift 2; fi
 secs="$1"; shift
 exec "$@"
 EOF
@@ -3173,6 +3178,7 @@ EOF
   cat >"$spath/gtimeout" <<'EOF'
 #!/bin/sh
 printf 'gtimeout %s\n' "$*" >> "$WRAPPER_LOG"
+if [ "$1" = "-k" ]; then shift 2; fi
 secs="$1"; shift
 exec "$@"
 EOF

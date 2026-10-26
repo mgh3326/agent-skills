@@ -77,15 +77,16 @@ ALL_PROFILES=(
   devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
   devin-fusion-opus55 devin-fusion-sonnet55
   devin-fusion-sol61 devin-fusion-sol61-xhigh
+  pi-haiku55 pi-sonnet55 pi-opus55
   devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
   codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
   codex-sol56 codex-luna56 codex-sol6 builder-sol6
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max
-  builder-sol-high builder-sol-max builder-sol-medium builder-luna-max
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low
+  builder-sol-high builder-sol-xhigh builder-sol-max builder-sol-medium builder-luna-max
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low
   kiro kiro-opus kiro-sonnet kiro-sol kiro-luna kiro-cheap kiro-glm kiro-deepseek
   kiro-minimax kiro-minimax21 kiro-haiku kiro-opus-xhigh kiro-opus-max
   kiro-sol-xhigh kiro-sol-max
@@ -98,6 +99,41 @@ ALL_PROFILES=(
   builder-grok-low builder-grok-medium builder-grok-xhigh
   cc-qwen38 cc-glm cc-dsflash cc-dspro cc-glm53
 )
+
+# hk 2043 (operator r1026solmax for builder-sol-max, this brief for
+# builder-sol-xhigh): the NORMAL pinned builder spellings. Each pins one rung
+# exactly like a #704 E6 spelling — catalog and gate consult at the rung, the
+# model id, the default effort and the different-effort refusal — but, unlike
+# the E6 measurement spellings, spawn does not require SCOPEFUEL_E6_ARM: both
+# are placed canon rows. builder-sol-max is the S+ gate=default row (operator
+# decision r1026solmax, desk, on hk 1786) and builder-sol-xhigh is the S+
+# escalation row the gate still decides (hk 2043). This is the one place the
+# set is named.
+NORMAL_PINNED_BUILDERS=(builder-sol-xhigh builder-sol-max)
+normal_pinned_builder() {
+  local pinned
+  for pinned in "${NORMAL_PINNED_BUILDERS[@]}"; do
+    [[ "$pinned" == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# hk 2043 item 4: an unpinned builder spelling whose catalog consult is one
+# fixed rung refuses a different --effort. The refusal names the pinned
+# spelling for that rung when the family has one (builder-sol -> builder-sol-xhigh
+# for --effort xhigh); an empty family means the rung has no builder spelling
+# and the line names the pin instead.
+pinned_builder_hint() {
+  local family="$1" pin="$2" effort="$3" spelling candidate
+  spelling="builder-$family-$effort"
+  if [[ -n "$effort" ]]; then
+    for candidate in "${ALL_PROFILES[@]}"; do
+      [[ "$candidate" == "$spelling" ]] &&
+        { printf 'use %s for --effort %s' "$spelling" "$effort"; return 0; }
+    done
+  fi
+  printf 'use --effort %s' "$pin"
+}
 
 profiles_help() {
   cat <<'USAGE'
@@ -256,23 +292,30 @@ Options:
                      builder-luna, builder-sonnet, builder-opus-low,
                      builder-opus-medium, builder-sonnet-xhigh,
                      builder-sonnet-max, builder-sol-high,
-
-                     builder-sol-max, builder-sol-medium, builder-luna-max,
+                     builder-sol-xhigh, builder-sol-max, builder-sol-medium,
+                     builder-luna-max,
                      builder-kimi-high, builder-kimi-max, builder-grok-low,
                      builder-grok-medium, builder-grok-xhigh,
                      builder-sonnet-medium, builder-haiku-low,
-                     builder-luna-low, builder-luna-medium, builder-sol-low,
+                     builder-haiku-medium, builder-luna-low, builder-luna-high,
+                     builder-luna-medium,
+                     builder-sol-low,
                      builder-haiku-high, builder-haiku-xhigh, builder-haiku-max
                      or builder-sonnet-low profiles; legacy
                      captain-opus and captain-sol aliases and the pilot worker
                      spellings devin-swe2, devin-swe2-medium, devin-swe2-max,
                      grok/grok-hi and kimi-k3 remain accepted. The max-rung E6 spellings
-                     (builder-sonnet-max, builder-sol-max, builder-luna-max,
-                     builder-kimi-max, builder-haiku-max) are open builder
+                     (builder-sonnet-max, builder-luna-max, builder-kimi-max,
+                     builder-haiku-max) are open builder
                      seats since hk 1863 (the 2026-09-26 no-max refusal is
                      removed) and need their exact SCOPEFUEL_E6_ARM marker;
-                     under --role builder a resolved ultra rung is still
+                     builder-sol-xhigh and builder-sol-max are normal pinned
+                     spellings (hk 2043, operator r1026solmax): they pin their
+                     rung the same way but take no SCOPEFUEL_E6_ARM marker.
+                     Under --role builder a resolved ultra rung is still
                      refused before the marker check.
+                     pi-* seats have no MCP (--no-mcp) and must not be placed
+                     on MCP-needing tasks. Worker/tester only; default effort high.
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
                      builder refuses them pending hk 1382. Fusion-Sol
@@ -613,6 +656,13 @@ haiku default=low; all support an explicit --effort override.
 Builder profiles: builder-opus = Claude Opus at effort high; builder-sol = codex-sol
 at effort high (was max before 2026-09-26; the no-max builder-seat refusal of
 operator decision 2026-09-26 was removed by hk 1863, the default stays high).
+hk 2043: an unpinned builder spelling whose catalog consult is one fixed rung
+(builder-sol/captain-sol/builder-sol6 at codex-sol@high, builder-opus at
+opus@high, builder-luna at codex-luna@xhigh, builder-grok at grok-hi@xhigh)
+refuses a different --effort with one line naming the matching pinned spelling
+(for example: use builder-sol-xhigh for --effort xhigh) instead of consulting
+the pin while launching another rung. builder-sonnet follows the requested
+effort, so it has no such pin.
 builder-sonnet (#921, operator report 2026-09-29) = the Sonnet 5.5 experiment seat:
 Claude Sonnet via --model sonnet + --dangerously-skip-permissions (the builder-opus
 argv shape), --effort high|xhigh|max, default xhigh. Its explicit max rung was the
@@ -661,13 +711,14 @@ stays `devin` (account Daily/Weekly, never a SWE-2 Free bucket). No builder
 seat exists — the --role builder allowlist refuses all three spellings.
 Phase 1 is spawn plumbing only: no grade placement; trial reps pending.
 E6 measurement builders (#704, #594): builder-opus-low, builder-opus-medium,
-builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max,
+builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high,
 builder-luna-max, builder-kimi-high and builder-kimi-max each pin exactly one effort rung (the
 suffix IS the rung; --effort is refused off-rung, allowed spelled the same).
-hk 1796 adds four more on the same pin rule for the hk 1786 arms:
+hk 1796 adds five more on the same pin rule for the hk 1786 arms:
 builder-sonnet-medium (sonnet@medium), builder-haiku-low (haiku@low),
-builder-luna-low (codex-luna@low) and builder-luna-medium
-(codex-luna@medium). All four are placed canon rows, so the
+builder-luna-low (codex-luna@low), builder-luna-medium
+(codex-luna@medium) and, for the r1026luna down arm (director-1, 2026-10-26),
+builder-luna-high (codex-luna@high). All are placed canon rows, so the
 SCOPEFUEL_E6_ARM marker only narrows the gate's judgement to that row —
 it does not open an unmeasured one.
 hk 1863 adds five more on the same pin rule for the hk 1786 borrow-down and
@@ -677,13 +728,27 @@ promote-up arms: builder-sol-low (codex-sol@low), builder-haiku-high
 model id from the codex-sol catalog row like builder-sol-medium. There is no
 canon sonnet@low row today, so a real gate call for builder-sonnet-low
 refuses until the director pushes one.
+hk 2043 adds builder-haiku-medium (haiku@medium) on the same pin rule for
+the r1026effdown arm B (haiku@high vs haiku@medium; director-1, 2026-10-26):
+it is an E6 measurement spelling like builder-haiku-low, so spawn requires
+SCOPEFUEL_E6_ARM=haiku@medium and the quota record reads haiku@medium.
 2026-09-26 (decision 4088 B): the max-rung members (builder-sonnet-max,
-builder-sol-max, builder-luna-max, builder-kimi-max, and hk 1863's
+builder-luna-max, builder-kimi-max, and hk 1863's
 builder-haiku-max) were closed by that decision; hk 1863 (operator decision
 on hk 1864) removed the no-max builder-seat refusal for every model, so they
 are open and take the marker like the other pinned rungs (ultra stays refused).
 They exist only to measure that rung, so the spellings refuse to
-spawn without SCOPEFUEL_E6_ARM=<gate profile>@<effort> naming exactly it. The
+spawn without SCOPEFUEL_E6_ARM=<gate profile>@<effort> naming exactly it.
+hk 2043 (operator r1026solmax, revision 3): builder-sol-max and the new
+builder-sol-xhigh are the normal pinned spellings named once in
+NORMAL_PINNED_BUILDERS. They pin their rung exactly like the E6 spellings
+(catalog and gate consult, model, default effort, different-effort refusal)
+but spawn without SCOPEFUEL_E6_ARM — both are placed canon rows, so there is
+no unmeasured rung for the marker to open. builder-sol-max is the S+
+gate=default row (r1026solmax), so the gate demands no REF; builder-sol-xhigh
+is the S+ escalation row, so the gate still decides admission there. A stale
+marker in the environment is ignored and never recorded: the quota record
+reads the canonical rung (codex-sol@max, codex-sol@xhigh). The
 Terra E6 spellings builder-terra-high, builder-terra-xhigh and builder-terra-max
 are refused by operator 2026-10-12 noterra. For the remaining profiles
 wrk passes the pinned rung as `scopefuel gate --effort` so the gate judges
@@ -724,8 +789,9 @@ Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
 
 Environment:
-  WRK_KEEP_FAILED_PANE=1  keep a failed spawn's pane for a manual look (the
-                          pane screen is always saved to <jobdir>/spawn-failure-screen.txt)
+  WRK_KEEP_FAILED_PANE=1  keep a failed spawn's pane for a manual look (wrk
+                          attempts to save the pane screen best-effort to
+                          <jobdir>/spawn-failure-screen.txt, then -2, -3, ...)
 USAGE
 }
 
@@ -806,12 +872,15 @@ PANEWIRE_PROMPT_CODEX_TIMEOUT_SECONDS=60
 # (#770: JE15b on macOS CI blocked 60s under a 2s bound).
 run_bounded() {
   local secs="$1"; shift
+  # hk 2011: a child that ignores TERM is KILLed this many seconds after the
+  # bound, so the total bound is secs plus this grace. Every caller gets it.
+  local kill_grace=2
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    timeout -k "$kill_grace" "$secs" "$@"
     return
   fi
   if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
+    gtimeout -k "$kill_grace" "$secs" "$@"
     return
   fi
   python3 -c 'import os, signal, subprocess, sys
@@ -1179,6 +1248,7 @@ spawn_panewire_prompt() {
 # opencode needs a separate return after the paste to submit (pre-#498
 # behavior, kept verbatim). Only after a delivery that may have been pasted.
 spawn_opencode_submit() {
+  # pi uses herdr's normal submit; it does not need opencode's extra Return.
   [[ "$PROFILE_KIND" == opencode ]] || return 0
   case "$SPAWN_SUBMIT" in proven|accepted|unconfirmed) ;; *) return 0 ;; esac
   sleep_for 2
@@ -1200,6 +1270,64 @@ spawn_herdr_fallback() {
     --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
     "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
   fi
+}
+
+# hk 2080: prove pi runtime selection from the current pane, never argv.
+pi_model_proven() {
+  local screen
+  screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || return 1
+  # herdr exposes no model field for pi; pi get_state is RPC-only and cannot
+  # attest this interactive pane. pi 1.4.0 renders its footer immediately
+  # BELOW the editor bottom border: cwd, stats, optional extension status.
+  # Never search the transcript or pasted input for model-looking text.
+  # Unknown/custom layouts, missing provider and truncated lines fail closed.
+  printf '%s' "$screen" | python3 -c '
+import os, re, sys
+expected, effort, cwd, home, prompt = sys.argv[1:]
+def clean(text):
+    return [line.rstrip() for line in
+            re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).splitlines()]
+lines = clean(sys.stdin.read())
+while lines and not lines[-1]:
+    lines.pop()
+bottoms = [i for i, line in enumerate(lines)
+           if re.fullmatch(r"─{3,}|─+ ↓ \d+ more ─+", line)]
+if not bottoms:
+    sys.exit(1)
+bottom = bottoms[-1]
+tops = [i for i in range(bottom)
+        if re.fullmatch(r"──(?:.*─)?", lines[i])]
+if not tops or bottom - tops[-1] < 2:
+    sys.exit(1)
+footer = lines[bottom + 1:]
+if len(footer) not in (2, 3):
+    sys.exit(1)
+# Compare the evidence rows themselves, never the frame through screen end:
+# an echoed brief may be followed by an unrelated shell/extension row. Any
+# quoted cwd+stats evidence is ambiguous, including after whitespace reflow.
+with open(prompt) as brief:
+    injected = "\n".join(clean(brief.read()))
+candidate = re.sub(r"\s+", " ", "\n".join(footer[:2])).strip()
+quoted = re.sub(r"\s+", " ", injected).strip()
+if candidate in quoted:
+    sys.exit(1)
+# footer.js may abbreviate HOME and append a branch/session name. Checking
+# the launch cwd also prevents an arbitrary post-editor stats row proving it.
+paths = {cwd, os.path.realpath(cwd)}
+for path in list(paths):
+    if path == home:
+        paths.add("~")
+    elif path.startswith(home.rstrip("/") + "/"):
+        paths.add("~" + path[len(home):])
+pwd_pattern = (r"(?:" + "|".join(re.escape(p) for p in paths) +
+               r")(?: \([^\r\n]*\))?(?: • [^\r\n]+)?")
+if not re.fullmatch(pwd_pattern, footer[0]):
+    sys.exit(1)
+provider, model = expected.split("/", 1)
+pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(provider) +
+           r"\) " + re.escape(model) + r" • " + re.escape(effort) + r"$")
+sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
+' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
 
 # spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not
@@ -2271,6 +2399,23 @@ quota_hub_policy_gate() {
 # can carry account, model or path text, so it is written 0600 and never
 # echoed to stdout/stderr. A second failure of the same job writes
 # spawn-failure-screen-2.txt, then -3, never overwriting.
+# hk 2011 test seam: only a WRK_TEST_MODE=1 run that sets WRK_TEST_PAUSE_AT=
+# capture-name and WRK_TEST_PAUSE_DIR reaches it. The first capture that picks
+# a file name parks until $WRK_TEST_PAUSE_DIR/release exists (or 30 s pass), so
+# a test can start a second capture inside the name-pick window. Production
+# never sets WRK_TEST_MODE, so the check below is the whole cost.
+capture_test_pause() {
+  [[ "${WRK_TEST_MODE:-}" == 1 && "${WRK_TEST_PAUSE_AT:-}" == capture-name &&
+     -n "${WRK_TEST_PAUSE_DIR:-}" ]] || return 0
+  local waited=0
+  mkdir "$WRK_TEST_PAUSE_DIR/paused.lock" 2>/dev/null || return 0
+  : >"$WRK_TEST_PAUSE_DIR/paused"
+  while [[ ! -e "$WRK_TEST_PAUSE_DIR/release" && "$waited" -lt 300 ]]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+}
+
 spawn_capture_failed_pane_screen() {
   [[ -n "${JOB_ID:-}" && -n "${PANE:-}" ]] || return 0
   local dir screen n=1
@@ -2281,6 +2426,16 @@ spawn_capture_failed_pane_screen() {
   }
   screen="$dir/spawn-failure-screen.txt"
   while [[ -e "$screen" ]]; do
+    n=$((n + 1))
+    screen="$dir/spawn-failure-screen-$n.txt"
+  done
+  capture_test_pause
+  # hk 2011: the name is created exclusively (noclobber). A concurrent capture
+  # that took this name between the check above and here makes the create fail,
+  # and the next suffix is tried. Any other create failure falls through to the
+  # read below, which then reports as before.
+  until ( umask 077; set -C; : >"$screen" ) 2>/dev/null; do
+    [[ -e "$screen" ]] || break
     n=$((n + 1))
     screen="$dir/spawn-failure-screen-$n.txt"
   done
@@ -2297,7 +2452,7 @@ spawn_pane_cleanup() {
   SPAWN_PANE_OPEN=0
   spawn_capture_failed_pane_screen
   if [[ "${WRK_KEEP_FAILED_PANE:-}" == 1 ]]; then
-    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close ${TAB_ID:-its tab}" >&2
+    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close $PANE" >&2
     return 0
   fi
   "$HERDR" pane close "$PANE" >/dev/null 2>&1     && echo "wrk: closed leftover pane $PANE after spawn failure" >&2     || echo "wrk: failed to close leftover pane $PANE — close it manually" >&2
@@ -2535,6 +2690,7 @@ agent_foreground_exes() {
     kimi)     echo "kimi-code kimi" ;;
     kiro)     echo "kiro-cli kiro" ;;
     opencode) echo "open-code opencode" ;;
+    pi)       echo "pi" ;;
     agy)      echo "antigravity agy" ;;
     *)        echo "$1" ;;
   esac
@@ -3593,8 +3749,9 @@ resolve_catalog_profile() {
     builder-opus-low|builder-opus-medium) CATALOG_PROFILE=opus; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     builder-sonnet-xhigh|builder-sonnet-max|builder-sonnet-medium|builder-sonnet-low) CATALOG_PROFILE=sonnet; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     # hk 1796: builder-haiku-low (hk 1786 L4 arm) consults haiku@low; hk 1863
-    # adds the high/xhigh/max rungs of the same profile.
-    builder-haiku-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max) CATALOG_PROFILE=haiku; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
+    # adds the high/xhigh/max rungs of the same profile and hk 2043 adds
+    # builder-haiku-medium (r1026effdown arm B).
+    builder-haiku-low|builder-haiku-medium|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max) CATALOG_PROFILE=haiku; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     # #921: the non-rung Sonnet builder consults the canon at the rung it will
     # actually take — an unpinned consult answers sonnet's own high default and
     # apply_catalog would silently overwrite this profile's xhigh default.
@@ -3627,12 +3784,15 @@ resolve_catalog_profile() {
     # their pinned effort, so the quota record's launch_profile is the exact
     # catalog rung (codex-sol@high, codex-luna@max ...).
     # #737 adds builder-sol-medium (codex-sol@medium) on the same pin rule.
-    builder-sol-high|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
+    # hk 2043 adds builder-sol-xhigh (codex-sol@xhigh) — a normal pinned
+    # spelling, pinned here exactly like the E6 rungs.
+    builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     builder-luna-max) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=max ;;
     # hk 1796: the luna E6 pair consults the canonical codex-luna catalog row
     # at its pinned rung — the model id comes back from that row (today
-    # codex-luna@low serves gpt-5.6-luna), never a launcher literal.
-    builder-luna-low|builder-luna-medium) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
+    # codex-luna@low serves gpt-5.6-luna), never a launcher literal. hk 2043
+    # adds builder-luna-high (codex-luna@high) to the same pin rule.
+    builder-luna-low|builder-luna-high|builder-luna-medium) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     codex-astra) CATALOG_PROFILE=codex-astra ;;
 
@@ -3849,8 +4009,9 @@ resolve_profile() {
     builder-opus-low|builder-opus-medium) PROFILE_KIND=claude; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1; ARGS=(--model opus --dangerously-skip-permissions) ;;
     builder-sonnet-xhigh|builder-sonnet-max|builder-sonnet-medium|builder-sonnet-low) PROFILE_KIND=claude; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1; ARGS=(--model sonnet --dangerously-skip-permissions) ;;
     # hk 1796: the haiku builder rung (hk 1786 L4 arm) — the same argv shape
-    # as the haiku worker, pinned to low; hk 1863 adds high, xhigh and max.
-    builder-haiku-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max) PROFILE_KIND=claude; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
+    # as the haiku worker, pinned to low; hk 1863 adds high, xhigh and max and
+    # hk 2043 adds medium.
+    builder-haiku-low|builder-haiku-medium|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max) PROFILE_KIND=claude; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1; ARGS=(--model haiku --dangerously-skip-permissions) ;;
     # #921: Sonnet 5.5 builder seat — the builder-opus argv shape on the sonnet
     # alias. The closed effort set (high|xhigh|max) is enforced in the --role
     # builder arm below; default xhigh (E1 rung).
@@ -3970,15 +4131,16 @@ resolve_profile() {
     builder-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=xhigh; EFFORT_SUPPORTED=1 ;;
     # #704 (#594 E6): per-rung codex builder spellings. PROFILE_MODEL is the
     # catalog-unreachable literal; apply_catalog replaces it with the canon's
-    # model id for that rung (codex-terra@high etc.).
-    builder-sol-high|builder-sol-max|builder-sol-medium|builder-sol-low) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
+    # model id for that rung (codex-terra@high etc.). hk 2043 adds
+    # builder-sol-xhigh — a normal pinned spelling on the same pin rule.
+    builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-sol-low) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-sol; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     builder-luna-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     # hk 1796: the luna E6 pair (hk 1786 L5/L6 arms). PROFILE_MODEL is the
     # catalog-unreachable literal for that row — gpt-5.6-luna on the low
     # rung, gpt-6-luna on medium; apply_catalog replaces it with the canon's
     # model id when the canon answers.
     builder-luna-low) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-luna; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
-    builder-luna-medium) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
+    builder-luna-high|builder-luna-medium) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     # task #527 요건 ⑦: codex-astra default effort is xhigh, unified with
     # ARCHITECT.md's spawn command and the consult-advisor SKILL.md note
@@ -4048,6 +4210,11 @@ resolve_profile() {
       PROFILE_KIND=kimi; KIMI_TRUST_HOME="$KIMI_CODE_LOW_HOME"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/k3)
       PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_LOW_HOME") ;;
 
+    # hk 2080: literal provider/model, like opencode; every seat disables MCP.
+    pi-haiku55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-haiku-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    pi-sonnet55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-sonnet-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    pi-opus55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-opus-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+
     oc-kimi-code) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k2.7-code) ;;
     oc-glm) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/glm-5.2) ;;
     oc-kimi-k3) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k3) ;;
@@ -4108,8 +4275,8 @@ resolve_profile() {
     haiku) GATE_PROFILE=haiku ;;
     # hk 1796: builder-haiku-low gates at the placed haiku@low row — same pin
     # rule as the other E6 rungs (SCOPEFUEL_E6_ARM=haiku@low); hk 1863 adds
-    # the high, xhigh and max rungs (haiku@<rung>).
-    builder-haiku-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max) GATE_PROFILE=haiku; GATE_EFFORT_PIN="${MODEL##*-}" ;;
+    # the high, xhigh and max rungs (haiku@<rung>); hk 2043 adds medium.
+    builder-haiku-low|builder-haiku-medium|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max) GATE_PROFILE=haiku; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     fable) GATE_PROFILE=fable ;;
     devin-swe2|builder-devin) GATE_PROFILE=devin-swe2 ;;
     # hk 1604: scopefuel gate -m accepts every GRADE_TABLE profile, so each
@@ -4134,6 +4301,7 @@ resolve_profile() {
     # The quota pool is still scopefuel's single `devin` pool — wrk owns no
     # pool mapping, the gate answer names the pool.
     devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;
+    pi-haiku55|pi-sonnet55|pi-opus55) GATE_PROFILE="$MODEL" ;;
     # hk 1729: Fusion-Sol profiles also gate at their exact catalog rows;
     # scopefuel supplies the codex pool recorded by arbiter.
     devin-fusion-sol61|devin-fusion-sol61-xhigh) GATE_PROFILE="$MODEL" ;;
@@ -4152,11 +4320,14 @@ resolve_profile() {
     # effort rung (codex-sol@high, codex-luna@max) — not the
     # flat codex-max/codex-luna-max spellings the old builders
     # use, because scopefuel #692's E6 marker is profile@effort-exact.
-    builder-sol-high|builder-sol-max|builder-sol-medium|builder-sol-low) GATE_PROFILE=codex-sol; GATE_EFFORT_PIN="${MODEL##*-}" ;;
+    # hk 2043 adds builder-sol-xhigh on the same pin (normal pinned spelling:
+    # the rung pin applies, the marker does not).
+    builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-sol-low) GATE_PROFILE=codex-sol; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     builder-luna-max) GATE_PROFILE=codex-luna; GATE_EFFORT_PIN=max ;;
     # hk 1796: the luna pair gates at codex-luna@<rung> like builder-luna-max —
     # NOT the flat codex-luna-max gate profile the worker spellings below use.
-    builder-luna-low|builder-luna-medium) GATE_PROFILE=codex-luna; GATE_EFFORT_PIN="${MODEL##*-}" ;;
+    # hk 2043 adds builder-luna-high to the same pin.
+    builder-luna-low|builder-luna-high|builder-luna-medium) GATE_PROFILE=codex-luna; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) GATE_PROFILE=codex-terra; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     # task #527: the gate role-denies astra without an allowed --purpose, so the
     # counsel spawn path defaults it to `architect` (the wrk-side counsel use).
@@ -4208,6 +4379,22 @@ resolve_profile() {
     EFFECTIVE_EFFORT="$DEFAULT_EFFORT"
   fi
 
+  if [[ "$PROFILE_KIND" == pi ]]; then
+    # pi 1.4.0 --help thinking table (director-1, hk 2080):
+    # wrk effort | pi thinking
+    # low        | low
+    # medium     | medium
+    # high       | high
+    # xhigh      | xhigh
+    # max        | max
+    # ultra is unsupported; pi off/minimal are not wrk efforts.
+    case "$EFFECTIVE_EFFORT" in
+      low|medium|high|xhigh|max) PI_THINKING="$EFFECTIVE_EFFORT" ;;
+      *) die "$MODEL: pi does not support effort '$EFFECTIVE_EFFORT'" ;;
+    esac
+    GATE_EFFORT_PIN="$PI_THINKING"
+  fi
+
   # hk 1863 (operator decision on hk 1864, recorded on hk 1863): the
   # 2026-09-26 no-max builder-seat refusal (decision 4088 B) is removed for
   # every model — max is a legal builder rung, so builder-sonnet-max,
@@ -4250,27 +4437,36 @@ resolve_profile() {
   # above). They exist to measure exactly that rung, so spawn is refused
   # unless SCOPEFUEL_E6_ARM names GATE_PROFILE@<rung> verbatim: scopefuel #692
   # opens the unmeasured C rungs only for that marker, and pinning it here
-  # keeps an unlabeled or mislabeled launch out of the E6 sample.
+  # keeps an unlabeled or mislabeled launch out of the E6 sample. hk 2043: the
+  # normal pinned spellings carry the same pin but not the marker rule.
   if [[ -n "$GATE_EFFORT_PIN" ]]; then
     [[ "$EFFECTIVE_EFFORT" == "$GATE_EFFORT_PIN" ]] ||
       die "$MODEL is pinned to effort $GATE_EFFORT_PIN (#594 E6 rung); --effort $EFFECTIVE_EFFORT is a different rung"
-    [[ "${SCOPEFUEL_E6_ARM:-}" == "$GATE_PROFILE@$GATE_EFFORT_PIN" ]] ||
-      die "$MODEL is an E6 measurement profile (#594): spawn requires SCOPEFUEL_E6_ARM=$GATE_PROFILE@$GATE_EFFORT_PIN (got '${SCOPEFUEL_E6_ARM:-<unset>}')"
-    if [[ "$PROFILE_KIND" == kimi ]]; then
-      # The kimi CLI has no --effort flag: the pinned clone home's
-      # [thinking] effort is the only place this rung exists, so a missing or
-      # mismatched clone would silently launch the wrong rung. Fail closed —
-      # the env overlay must not stand in for a missing clone file.
-      [[ -r "$KIMI_TRUST_HOME/config.toml" ]] ||
-        die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (config.toml missing); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"
-      local local_clone_effort
-      local_clone_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"
-      [[ "$local_clone_effort" == "$GATE_EFFORT_PIN" ]] ||
-        die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (found '${local_clone_effort:-<none>}'); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"
+    # hk 2043: the normal pinned spellings (NORMAL_PINNED_BUILDERS) keep the
+    # rung pin and the different-effort refusal but are placed canon rows, so
+    # the E6 marker neither gates them nor labels them. A stale marker in the
+    # environment is ignored; the quota record below still reads
+    # GATE_PROFILE@GATE_EFFORT_PIN, never an E6 arm.
+    if ! normal_pinned_builder "$MODEL"; then
+      [[ "${SCOPEFUEL_E6_ARM:-}" == "$GATE_PROFILE@$GATE_EFFORT_PIN" ]] ||
+        die "$MODEL is an E6 measurement profile (#594): spawn requires SCOPEFUEL_E6_ARM=$GATE_PROFILE@$GATE_EFFORT_PIN (got '${SCOPEFUEL_E6_ARM:-<unset>}')"
+      if [[ "$PROFILE_KIND" == kimi ]]; then
+        # The kimi CLI has no --effort flag: the pinned clone home's
+        # [thinking] effort is the only place this rung exists, so a missing or
+        # mismatched clone would silently launch the wrong rung. Fail closed —
+        # the env overlay must not stand in for a missing clone file.
+        [[ -r "$KIMI_TRUST_HOME/config.toml" ]] ||
+          die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (config.toml missing); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"
+        local local_clone_effort
+        local_clone_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"
+        [[ "$local_clone_effort" == "$GATE_EFFORT_PIN" ]] ||
+          die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (found '${local_clone_effort:-<none>}'); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"
+      fi
     fi
   fi
 
   case "$PROFILE_KIND" in
+    pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING") ;;
     codex) ARGS=(--yolo -m "$PROFILE_MODEL" -c "model_reasoning_effort=$EFFECTIVE_EFFORT") ;;
     kiro)
       ARGS=(chat --v3 --trust-all-tools --require-mcp-startup)
@@ -5306,7 +5502,8 @@ delegate_job_cmd() {
   if [[ "$prc" -ne 0 ]]; then
     # A probe killed by its own guard means the daemon is wedged, not absent —
     # emit_relay_event must not re-enter it inside this same invocation.
-    if [[ "$prc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: 137 is the KILL that run_bounded sends after its TERM grace.
+    if [[ "$prc" == 124 || "$prc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     return 0
   fi
   [[ "$probe" == "$JOB_PROBE_TOKEN" ]] || return 0
@@ -5323,7 +5520,8 @@ delegate_job_cmd() {
     # the local path's completion dedup suppresses the second write. On a
     # timeout the daemon is wedged — mark it so emit_relay_event does not
     # stall this invocation on another doomed panewire call.
-    if [[ "$rc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: 137 is the KILL that run_bounded sends after its TERM grace.
+    if [[ "$rc" == 124 || "$rc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     warn "panewire job $sub delegation failed or timed out (rc=$rc); using wrk's own path"
     return 0
   fi
@@ -9666,6 +9864,7 @@ spillover_remote_spawn() {
   fi
   local remote_args=(env "HERDR_SESSION=$session")
   [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
+  [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")
   remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   # Builders only — forwarding the flag to a worker would mute the execution
   # host's own session-machine_ids check while this host then named the
@@ -9704,6 +9903,14 @@ spillover_remote_spawn() {
   "${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" "$remote_cmd; rc=\$?; rm -f -- $(printf '%q' "$remote_prompt"); exit \$rc" >"$out" 2>"$remote_err"
   rc=$?
   set -e
+  # hk 2011: a remote wrk that kept its failed pane (WRK_KEEP_FAILED_PANE is
+  # forwarded from this host) left a pane open. The auto round must end there
+  # rather than spawn the job again on another host or locally.
+  SPILL_REMOTE_PANE_KEPT=0
+  if [[ "$rc" -ne 0 && "${WRK_KEEP_FAILED_PANE:-}" == 1 ]] &&
+     grep -q '^wrk: kept failed pane ' "$remote_err"; then
+    SPILL_REMOTE_PANE_KEPT=1
+  fi
   # A failed remote spawn must answer with the remote's own words: stderr is
   # relayed verbatim and non-OK stdout follows it onto the local stderr.
   spillover_relay_remote_err "$remote_err"
@@ -9808,7 +10015,11 @@ spillover_try_candidate() {
   else
     if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "$@"; then rc=0; else rc=$?; fi
     if [[ "$rc" -ne 0 && -n "${SPILL_CANDIDATE_CLASS_FILE:-}" ]]; then
-      printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      if [[ "${SPILL_REMOTE_PANE_KEPT:-0}" == 1 ]]; then
+        printf 'kept-pane\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      else
+        printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      fi
     fi
   fi
   if [[ "$rc" -ne 0 && "$hold_diag" == 1 ]]; then
@@ -9866,6 +10077,9 @@ spawn_router_cmd() {
   # is different — the hub runs `wrk spawn` on the target without --host,
   # which is this auto path: a closed target lands no local pane, but the
   # round may still place on that target's own remotes.
+  # The explicit local leg (including SSH delegation) must name the pi
+  # profile/host/key even when the TOML itself is malformed.
+  if [[ "$requested" == local ]]; then pi_host_precheck "$router_profile"; fi
   local_spawn_resolve || return
   if [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 && "$requested" == local ]]; then
     echo "wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local" >&2
@@ -10044,6 +10258,7 @@ spawn_router_cmd() {
   # remote_full_seen latches the positive capacity evidence the post-round
   # wake requires — a round with no remote-full answer never wakes.
   local wake_pending="" remote_full_seen=0 wake_target=""
+  local kept_pane_round=0 kept_pane=""
   # --host auto holds every per-candidate diagnostic until the round settles:
   # a successful spawn must print nothing about the hosts it skipped, while an
   # all-fail round owes the operator one attributed line per host plus whatever
@@ -10111,9 +10326,20 @@ spawn_router_cmd() {
           if [[ "$(spillover_value "hosts.$candidate" wake 2>/dev/null || true)" == panewire ]]; then
             wake_pending+="$candidate "
           fi ;;
+        kept-pane)
+          kept_pane_round=1
+          kept_pane="$(sed -n 's/^wrk: kept failed pane \([^ ]*\) .*/\1/p' "$cand_err" | head -1)" ;;
       esac
       cat "$cand_err" >>"$auto_diag"
       rm -f "$cand_err" "$cand_class"
+      if [[ "$kept_pane_round" == 1 ]]; then
+        # The remote pane is still up: a second spawn elsewhere would give the
+        # job two panes, so the round ends here with the remote's rc.
+        [[ -s "$auto_diag" ]] && cat "$auto_diag" >&2
+        rm -f "$auto_diag"
+        echo "wrk: remote host '$candidate' left failed pane ${kept_pane:-unknown} open (WRK_KEEP_FAILED_PANE=1); not trying another host or the local fallback" >&2
+        return "$last_rc"
+      fi
     else
       if spillover_try_candidate 0 "$candidate" "$cwd" "$prompt" "${filtered[@]}"; then
         return 0
@@ -10277,6 +10503,22 @@ spawn_router_cmd() {
 # one bare integer from 30000 through 300000 and is used as a floor for each
 # kind's existing shell readiness window. An absent key leaves each default
 # unchanged; a malformed or out-of-range assignment refuses before spawn.
+# hk 2080: only the execution host calls this, before admission. Use the
+# shared strict hosts scanner, with no newer host Python requirement. Quoted
+# strings, integers, duplicates and malformed assignments are never opt-ins.
+# No caller-side host name or pi configuration grants permission.
+pi_host_precheck() {
+  local profile="${1:-${MODEL:-}}" config host
+  case "$profile" in pi-haiku55|pi-sonnet55|pi-opus55) ;; *) return 0 ;; esac
+  config="$(spillover_config)"
+  host="$(spillover_value hub machine_id 2>/dev/null || true)"
+  [[ -n "$host" ]] || host="$(hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
+  if ! local_spawn_scan || [[ "$LOCAL_PI_ANTHROPIC" -ne 1 ]]; then
+    die "$profile refused on host $host: hosts.toml [local] pi_anthropic must be literal true"
+  fi
+}
+
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -10296,13 +10538,14 @@ local_spawn_table_name() {
 
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
+  LOCAL_PI_ANTHROPIC=0
   LOCAL_HEAVY_LOAD_WAIT=1
   LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SHELL_READY_TIMEOUT_MS=0
   LOCAL_SHELL_READY_TIMEOUT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -10371,6 +10614,34 @@ local_spawn_scan() {
       return "$WRK_EXIT_CONFIG_REFUSED"
     fi
     [[ "$current" == local ]] || continue
+    # hk 2080: default-off API seat capability, using the same literal-only
+    # grammar as spawn/heavy_load_wait. Keep this in bash: execution hosts
+    # may have Python 3.9 without tomllib (director-1, 2026-10-26).
+    case "$line" in
+      pi_anthropic[A-Za-z0-9_-]*) ;; # a different bare key
+      pi_anthropic* | '"pi_anthropic"'* | "'pi_anthropic'"*)
+        if [[ "$line" =~ ^pi_anthropic[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed pi_anthropic assignment in [local] (expected 'pi_anthropic = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        pi_seen=$((pi_seen + 1))
+        if [[ "$pi_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate pi_anthropic key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) LOCAL_PI_ANTHROPIC=1 ;;
+          false) ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] pi_anthropic accepts only the bare TOML booleans true or false"
+             return "$WRK_EXIT_CONFIG_REFUSED"
+             ;;
+        esac
+        continue ;;
+    esac
     # #1492: a bare integer, with the same one-key, one-clean-assignment
     # grammar as the other strict [local] settings. Check the decimal length
     # before arithmetic so an arbitrarily large integer cannot wrap in bash.
@@ -11371,6 +11642,7 @@ spawn_cmd() {
   # routing or any spawn preparation. The resolved-model check below covers
   # future aliases too.
   refuse_known_terra_spelling
+  pi_host_precheck
   # #1155: several router paths reach spawn_cmd directly (an unclassified
   # spawn, an unreadable arbiter, a hosts.toml-less auto). The flag gate
   # repeats here so no local spawn path runs on a host whose own [local]
@@ -11429,23 +11701,49 @@ spawn_cmd() {
       codex-astra|fable) ;; # Paired round-extension flags verified before catalog.
       devin-fusion-opus55|devin-fusion-sonnet55)
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
+      pi-haiku55|pi-sonnet55|pi-opus55)
+        die "--role builder rejects '$MODEL': pi seats are worker/tester-only until reps exist (hk 2080)" ;;
       devin-fusion-sol61|devin-fusion-sol61-xhigh)
         die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
         die "--role builder rejects '$MODEL': the devin Argon trial spellings are worker/tester-only — phase 1 is spawn plumbing, no builder seat (hk 1620, operator decision 2026-10-18)" ;;
-      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-sol-max, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23); ultra stays refused)" ;;
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-luna-high, builder-haiku-medium (hk 2043), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) plus the normal pinned spellings builder-sol-xhigh and builder-sol-max (hk 2043, operator r1026solmax) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23) while builder-sol-max takes no marker (hk 2043); ultra stays refused)" ;;
     esac
     case "$MODEL" in
+      # hk 2043 item 4: every unpinned builder spelling whose catalog consult
+      # is one fixed rung refuses a different --effort. Without this the
+      # spelling consulted (and recorded) the pinned rung while the pane ran
+      # another one — the 2026-09-25 builder-sol xhigh record was exactly that
+      # shape. The line names the pinned spelling for that rung when the family
+      # has one. builder-sonnet is deliberately absent: its consult follows the
+      # requested effort (#921). ultra is let through so the builder-seat rule
+      # in resolve_profile keeps its own refusal line.
       builder-opus|captain-opus)
-        [[ -z "$EFFORT" || "$EFFORT" == high ]] || die "builder-opus (legacy captain-opus alias) requires effort high"
+        [[ -z "$EFFORT" || "$EFFORT" == high || "$EFFORT" == ultra ]] ||
+          die "$MODEL consults opus@high; $(pinned_builder_hint opus high "$EFFORT")"
         ;;
       # #633: the catalog grades codex-luna per effort (medium=B, max=A+). The
       # E3 sample is defined at xhigh only — a lower or higher --effort would
       # move the rung the ceiling was rated at, so the guard reuses the
       # builder-opus pin and refuses rather than silently relaunch.
       builder-luna)
-        [[ -z "$EFFORT" || "$EFFORT" == xhigh ]] || die "builder-luna requires effort xhigh (#594 E3 sample profile)"
+        [[ -z "$EFFORT" || "$EFFORT" == xhigh || "$EFFORT" == ultra ]] ||
+          die "$MODEL consults codex-luna@xhigh (#594 E3 sample profile); $(pinned_builder_hint luna xhigh "$EFFORT")"
+        ;;
+      builder-sol|captain-sol)
+        [[ -z "$EFFORT" || "$EFFORT" == high || "$EFFORT" == ultra ]] ||
+          die "$MODEL consults codex-sol@high; $(pinned_builder_hint sol high "$EFFORT")"
+        ;;
+      # #1026: builder-sol6 keeps the gpt-6-sol literal, so its consult rung has
+      # no matching spelling — the line names the pin.
+      builder-sol6)
+        [[ -z "$EFFORT" || "$EFFORT" == high || "$EFFORT" == ultra ]] ||
+          die "$MODEL consults codex-sol@high; $(pinned_builder_hint '' high "$EFFORT")"
+        ;;
+      builder-grok)
+        [[ -z "$EFFORT" || "$EFFORT" == xhigh || "$EFFORT" == ultra ]] ||
+          die "$MODEL consults grok-hi@xhigh; $(pinned_builder_hint grok xhigh "$EFFORT")"
         ;;
       # #921: the Sonnet 5.5 experiment seat takes a closed effort set —
       # high|xhigh|max (default xhigh). low/medium/ultra die here (max is no
@@ -11459,15 +11757,16 @@ spawn_cmd() {
       # #704: the E6 rungs pin their effort in the name's last segment.
       # resolve_profile repeats the check against GATE_EFFORT_PIN and enforces
       # the SCOPEFUEL_E6_ARM marker; refusing here too keeps the failure on the
-      # same die path the other pinned builders use.
-      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low)
+      # same die path the other pinned builders use. hk 2043 adds the normal
+      # pinned spellings and the luna-high rung to the same pin.
+      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low)
         [[ -z "$EFFORT" || "$EFFORT" == "${MODEL##*-}" ]] || die "$MODEL is pinned to effort ${MODEL##*-} (#594 E6 rung)"
         ;;
     esac
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
@@ -11652,6 +11951,7 @@ print(value if isinstance(value, str) else "")
   [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
   [[ "$PROFILE_KIND" == codex ]] && START_TIMEOUT=120000 && BOOT_SETTLE=20
+  [[ "$PROFILE_KIND" == pi ]] && START_TIMEOUT=30000 && BOOT_SETTLE=12
   if [[ "$PROFILE_KIND" == kimi || "$PROFILE_KIND" == codex ]]; then
     START_TIMEOUT_SOURCE="$PROFILE_KIND kind default"
   fi
@@ -11692,6 +11992,11 @@ print(value if isinstance(value, str) else "")
   mock_mcp_verify --require-attached || return "$WRK_EXIT_MOCK_MCP_REFUSED"
   round_ext_builder_recheck
   spawn_deliver_brief
+  if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then
+    echo "wrk: $MODEL pi model not proven: expected $PROFILE_MODEL:$PI_THINKING" >&2
+    spawn_pane_cleanup
+    return 1
+  fi
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # An older herdr may not report the tab in `tab create`; the agent knows it.
