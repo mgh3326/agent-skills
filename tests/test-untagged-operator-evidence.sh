@@ -197,6 +197,29 @@ TAG_ELSEWHERE = """판정: PASS
 - 참고 문서: hk:doc task/2026-09-24/phantom-suggestion-submitted
 - AC3: 운영자 승인 받음
 """
+# Still claims: a negation elsewhere on the line does not clear them when a
+# break (. ; : , or and/but) separates it from "operator"/the verb.
+EN_PLAIN_APPROVAL = """Verdict: PASS
+- Operator approved the merge.
+"""
+KO_PLAIN_CONFIRM = """판정: PASS
+- AC3 확인 근거: 운영자가 확인함
+"""
+EN_SEMICOLON_TAIL = """Verdict: PASS
+- The operator confirmed it; nothing else.
+"""
+EN_COLON_BREAK = """Verdict: PASS
+- Not a blocker: the operator approved it.
+"""
+EN_AND_BREAK = """Verdict: PASS
+- The operator did not object and approved it.
+"""
+EN_COLON_NO = """Verdict: PASS
+- No objection: operator approved.
+"""
+EN_PATH_TOKENS = """Verdict: PASS
+- noted in notes.md, nothing-else: the operator approved it.
+"""
 # The t312 PASS-switch section as it stood before it was voided (trimmed).
 REAL_SWITCH = """# PASS 전환 — 라운드 2 head `9e3f7cb` (2026-09-24)
 
@@ -240,6 +263,13 @@ red_cases = {
     "english": ENGLISH,
     "english-operator-approved": ENGLISH_HYPHEN,
     "tag-on-another-line": TAG_ELSEWHERE,
+    "english-plain-approval": EN_PLAIN_APPROVAL,
+    "korean-plain-confirm": KO_PLAIN_CONFIRM,
+    "english-semicolon-tail": EN_SEMICOLON_TAIL,
+    "english-colon-break": EN_COLON_BREAK,
+    "english-and-break": EN_AND_BREAK,
+    "english-colon-no-objection": EN_COLON_NO,
+    "english-path-tokens": EN_PATH_TOKENS,
 }
 
 HK_TAGGED = """판정: PASS
@@ -306,6 +336,20 @@ ENGLISH_ROLE = """Verdict: PASS
 - `GET /v1/placement/slots`: operator bearer auth (401 unauthenticated; verified against the fixture)
 RISKS: the operator's advertised `relay test` is a stub, so routing/delivery can be reported read-only
 """
+# hk 2040 verdict-r2 real tester lines that DENY operator approval — a
+# negation directly governing the match clears the claim.
+HK2040_DENIAL_BUILDER = """판정: PASS
+- Builder job: b2040-solxh2 (arm-S builder); parent director-1. This is a builder verification request, not an operator approval.
+"""
+HK2040_DENIAL_VERDICT = """판정: PASS
+- No untagged operator phrases were received. This verdict uses no operator confirmation (태그 없는 운영자 문구 수신 없음). The director ruling used is the builder-relayed director-replay-summary-ruling.md, which is a fixed-design interpretation, not an operator approval.
+"""
+EN_WITHOUT_APPROVAL = """Verdict: PASS
+- the exception stayed pending without operator approval
+"""
+KO_DENIAL = """판정: PASS
+- 운영자 승인 아님 — 코드·테스트 근거로 판정
+"""
 green_cases = {
     "real-t312-restored": REAL_RESTORED,
     "english-operator-role": ENGLISH_ROLE,
@@ -317,6 +361,10 @@ green_cases = {
     "rejected": REJECTED,
     "not-pass": NOT_PASS,
     "clean-pass": CLEAN_PASS,
+    "hk2040-denial-builder": HK2040_DENIAL_BUILDER,
+    "hk2040-denial-verdict": HK2040_DENIAL_VERDICT,
+    "english-without-approval": EN_WITHOUT_APPROVAL,
+    "korean-denial": KO_DENIAL,
 }
 
 
