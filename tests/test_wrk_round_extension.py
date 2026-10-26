@@ -217,6 +217,32 @@ mock_mcp_verify() { :; }
         self.assertEqual(process.returncode, 2, process.stderr)
         self.assertIn("requires --report", process.stderr)
 
+    def test_parent_symlink_refuses_before_claim_read(self):
+        parent = self.base / "jobs/b1632-sol"
+        outside = self.base / "outside-parent"
+        parent.rename(outside)
+        parent.symlink_to(outside, target_is_directory=True)
+        for preflight in (False, True):
+            for owner in ((), ("--owner", "desk")):
+                with self.subTest(preflight=preflight, owner=owner):
+                    process, calls = self.run_spawn(remote_preflight=preflight,
+                        extra=(*owner, "--report", str(self.base / "jobs/fixture-tester/report.md")))
+                    self.assertEqual(process.returncode, 2, process.stderr)
+                    self.assertIn("parent job directory must stay in the trusted inbox", process.stderr)
+                    self.assertEqual(calls, [])
+        # A malformed outside claim must not be read before containment either.
+        (outside / "events/00001-job.claim.json").write_text("not JSON")
+        process, calls = self.run_spawn(extra=("--owner", "desk"))
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertIn("parent job directory must stay in the trusted inbox", process.stderr)
+        self.assertEqual(calls, [])
+        parent.unlink()
+        parent.symlink_to(parent, target_is_directory=True)
+        process, calls = self.run_spawn(extra=("--owner", "desk"))
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertIn("parent job directory must stay in the trusted inbox", process.stderr)
+        self.assertEqual(calls, [])
+
     def test_parent_owner_controls_cannot_reframe_report(self):
         for preflight in (False, True):
             with self.subTest(preflight=preflight):

@@ -10542,9 +10542,13 @@ if any(ord(c) < 32 or ord(c) == 127 for c in owner):
     refuse("--owner must have no control characters")
 # Explicit ownership lets an SSH target run without a parent claim. Report
 # containment below is unconditional and is repeated on the target host.
+try:
+    parent_path = (root / parent).resolve()
+except (OSError, RuntimeError):
+    refuse("parent job directory must stay in the trusted inbox")
+if parent_path != root / parent:
+    refuse("parent job directory must stay in the trusted inbox")
 if not owner or require_claim == "1":
-    if (root / parent).resolve() != root / parent:
-        refuse("parent job directory must stay in the trusted inbox")
     events = root / parent / "events"
     # A corrupt newest claim must not revive an older owner.
     claims = [(name, doc) for name, doc, _ in wrk_events_ordered(str(events))
@@ -10553,7 +10557,7 @@ if not owner or require_claim == "1":
     doc = claims[-1][1] if claims else None
     payload = doc.get("payload", doc) if isinstance(doc, dict) else None
     if not isinstance(payload, dict):
-        refuse("parent job '%s' has no readable newest claim/reclaim" % parent)
+        refuse("parent job '%s' has no readable newest claim/reclaim (missing or unreadable)" % parent)
     inherited_owner = payload.get("owner_lane")
     if not owner:
         if not isinstance(inherited_owner, str) or not inherited_owner or any(ord(c) < 32 or ord(c) == 127 for c in inherited_owner):
@@ -10632,13 +10636,13 @@ spillover_resolve_remote_task() {
   local TASK_REMOTE_INITIATOR=1
   normalize_implicit_counsel_role
   role="$ROLE"
-  task_validate
-  SPILL_REMOTE_HK_TASK="$TASK_ID"
   if [[ -n "$parent_job" ]]; then
     parent_spawn_validate "$parent_job" "${job:-$label}" "$role" "$owner" "$report" "$relative" 1
     SPILL_REMOTE_OWNER="$PARENT_SPAWN_OWNER"
     SPILL_REMOTE_REPORT_REL="$PARENT_SPAWN_RELATIVE"
   fi
+  task_validate
+  SPILL_REMOTE_HK_TASK="$TASK_ID"
 }
 
 # hk_task_gate_failure — the hk-unreachable/undecidable funnel. The override
@@ -11254,12 +11258,12 @@ spawn_cmd() {
   # #768: task binding is decided here, still before any side effect — a
   # missing/unresolvable task id is a usage error, never a partial spawn.
   local requested_parent_job="$PARENT_JOB"
-  task_validate
   if [[ -n "$requested_parent_job" || "$REPORT_RELATIVE" == 1 ]]; then
     parent_spawn_validate "$requested_parent_job" "$JOB_ID" "$ROLE" "$OWNER" "$REPORT_PATH" "$REPORT_RELATIVE"
     OWNER="$PARENT_SPAWN_OWNER"
     REPORT_PATH="$PARENT_SPAWN_REPORT"
   fi
+  task_validate
   if [[ -n "$TAKEOVER_FROM" ]]; then
     hk_task_takeover_precheck
   fi
