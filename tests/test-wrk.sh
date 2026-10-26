@@ -15873,7 +15873,7 @@ t2092_host_key() {  # the sanitised host key wrk uses for state/event ids
 
 t2092_home="$TMP/t2092-h1"; t2092_fixture "$t2092_home"
 t2092_work="$t2092_home/work"; t2092_jobs="$t2092_work/herdr-inbox/jobs"
-T2092_CONFIG= T2092_PANEWIRE_LOG="$TMP/t2092-p0.log"; : >"$T2092_PANEWIRE_LOG"
+T2092_CONFIG="" T2092_PANEWIRE_LOG="$TMP/t2092-p0.log"; : >"$T2092_PANEWIRE_LOG"
 
 # Case: the report matches the fixture tree (numbers recomputed with the
 # same du the implementation calls — no cross-OS dir-overhead constants).
@@ -15954,7 +15954,7 @@ echo "PASS hk2092 --alert emits one director-1 event, dedups 24h, re-arms after"
 
 # Case: under the threshold --alert sends nothing and writes no state.
 t2092_home3="$TMP/t2092-h3"; t2092_fixture "$t2092_home3"
-T2092_CONFIG= T2092_PANEWIRE_LOG="$TMP/t2092-p3.log"; : >"$T2092_PANEWIRE_LOG"
+T2092_CONFIG="" T2092_PANEWIRE_LOG="$TMP/t2092-p3.log"; : >"$T2092_PANEWIRE_LOG"
 t2092_run "$t2092_home3" --alert
 grep -q "over_threshold=no" "$T2092_OUT" ||
   fail "hk2092: the tiny fixture must read under the default 100: $(cat "$T2092_OUT")"
@@ -15967,6 +15967,7 @@ compgen -G "$t2092_home3/work/herdr-inbox/jobs/.fleet-usage-alert-*" >/dev/null 
 echo "PASS hk2092 under threshold emits nothing and writes no state"
 
 # Case: a hosts.toml threshold overrides the default on the print path too.
+T2092_CONFIG="$TMP/t2092-hosts-999.toml"
 printf '[local]\nfleet_usage_alert_gb = 999\n' >"$T2092_CONFIG"
 t2092_run "$t2092_home3"
 grep -q "fleet_usage_alert_gb=999 .*over_threshold=no" "$T2092_OUT" ||
