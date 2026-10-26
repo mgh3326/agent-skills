@@ -221,6 +221,13 @@ fi
 if [[ "${1:-}" == refresh ]]; then
   pool="${2:-}"
   [[ "${3:-}" == --background ]] || { echo 'fixture scopefuel: refresh requires --background' >&2; exit 2; }
+  # Arm a file-controlled barrier before announcing readiness. Opening the
+  # fifo read/write keeps this fixture from blocking in open, and lets the
+  # test release it without racing a reader that has not opened it yet.
+  if [[ "${WRK_REFRESH_MODE:-ok}" == hold ]]; then
+    exec 7<>"${WRK_REFRESH_RELEASE_FIFO:?fixture release fifo required}"
+    printf '%s\n' "$$" >"${WRK_REFRESH_READY_FILE:?fixture ready file required}"
+  fi
   # Every refresh child names itself to the suite: the pid log is the
   # teardown's exact-pid handle on this process when its supervisor is
   # already gone (the child runs in its own session, so a pgrep -P walk off
@@ -234,6 +241,10 @@ if [[ "${1:-}" == refresh ]]; then
     tw_register_pid "$WRK_REFRESH_PID_LOG" "$$"
   fi
   case "${WRK_REFRESH_MODE:-ok}" in
+    hold)
+      IFS= read -r _ <&7
+      exec 7>&-
+      ;;
     fail)
       echo "fixture scopefuel: refresh failed for pool=$pool" >&2
       exit 23

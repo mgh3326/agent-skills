@@ -64,6 +64,21 @@ seed_join_round() {
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
 export ARBITER_BIN="$TMP/absent-arbiter"
+# hk 1439: the suite never reaches the real scopefuel through bin/arbiter's PATH
+# fallback (scopefuel_bin). SCOPEFUEL_BIN is suite-wide; per-command overrides stay.
+# Tripwire: scopefuel/devin/kimi shims sit first on PATH, log their argv and exit 99,
+# and the end-of-suite check fails on any logged call. Every PATH edit below only
+# prepends, so the shim dir stays reachable.
+export SCOPEFUEL_BIN="$SCOPEFUEL"
+TRIPWIRE_LOG="$TMP/tripwire.log"; : >"$TRIPWIRE_LOG"
+export TRIPWIRE_LOG
+mkdir -p "$TMP/tripwire-bin"
+for tw_name in scopefuel devin kimi; do
+  printf '%s\n' '#!/bin/sh' \
+    "printf '%s\\n' \"$tw_name \$*\" >>\"\$TRIPWIRE_LOG\"" 'exit 99' >"$TMP/tripwire-bin/$tw_name"
+  chmod +x "$TMP/tripwire-bin/$tw_name"
+done
+export PATH="$TMP/tripwire-bin:$PATH"
 export XDG_DATA_HOME="$TMP/xdg"
 export XDG_CACHE_HOME="$TMP/xdg-cache"
 export XDG_CONFIG_HOME="$TMP/xdg-config"
@@ -9743,34 +9758,92 @@ grep -q 'model=codex-luna' "$TMP/missing.out"
 
 # ROB-1227 D4: refresh is detached, uses the gate-provided pool, and exposes
 # failure/timeout warnings without changing the successful spawn.
+# A total-spawn stopwatch also measures trust/gate/task setup, which made the
+# old 1800ms assertions fail on both main and the heavy-queue head. Instead,
+# hold the refresh fixture at a fifo and observe spawn/refresh events. The
+# shared loose deadline still rejects a gross delay or a missing timeout.
+refresh_bound_s=10
+refresh_start_case() {
+  local name="$1" timeout="$2"
+  refresh_ready="$TMP/refresh-$name.ready"
+  refresh_fifo="$TMP/refresh-$name.release"
+  refresh_done="$TMP/refresh-$name.done"
+  refresh_rc="$TMP/refresh-$name.rc"
+  refresh_out="$TMP/refresh-$name.out"
+  mkfifo "$refresh_fifo"
+  refresh_deadline=$(( SECONDS + refresh_bound_s ))
+  (
+    set +e
+    TEST_OWN_SESSION=0 WRK_REFRESH_MODE=hold WRK_REFRESH_TIMEOUT_S="$timeout" \
+      WRK_REFRESH_READY_FILE="$refresh_ready" WRK_REFRESH_RELEASE_FIFO="$refresh_fifo" \
+      spawn_base codex-luna >"$refresh_out" 2>&1
+    printf '%s\n' "$?" >"$refresh_rc"
+    : >"$refresh_done"
+  ) &
+  refresh_spawn_pid=$!
+  own "$refresh_spawn_pid"
+}
+refresh_wait() {
+  local failure="$1"; shift
+  local remaining=$(( refresh_deadline - SECONDS ))
+  if (( remaining <= 0 )) || ! wait_until "$remaining" "$@"; then
+    fail "D4 $failure (loose ${refresh_bound_s}s bound)"
+  fi
+}
+refresh_spawn_ready() {
+  [[ -s "$refresh_ready" && -e "$refresh_done" ]]
+}
+refresh_child_dead() {
+  ! ps -p "$(cat "$refresh_ready")" -o pid= | grep -q '[0-9]'
+}
+refresh_timeout_finished() {
+  refresh_spawn_ready &&
+    grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' "$refresh_out" &&
+    refresh_child_dead
+}
 : >"$TMP/refresh.log"
-start_ns="$(python3 -c 'import time; print(time.time_ns())')"
-success_out="$(spawn_base codex-luna 2>&1)"
-elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - start_ns) / 1000000 ))"
+refresh_start_case detached 30
+refresh_wait 'spawn did not return while refresh was held' refresh_spawn_ready
+wait "$refresh_spawn_pid"
+[[ "$(cat "$refresh_rc")" -eq 0 ]] || fail 'D4 detached spawn failed'
+success_out="$(cat "$refresh_out")"
 grep -q 'model=codex-luna' <<<"$success_out"
-[[ "$elapsed_ms" -lt 1800 ]]  # 동일 flake 계열 — 위 timeout 케이스와 같은 근거로 완화
-for _ in {1..20}; do
-  grep -q '^refresh codex --background$' "$TMP/refresh.log" && break
-  sleep 0.05
-done
-grep -q '^refresh codex --background$' "$TMP/refresh.log"
+ps -p "$(cat "$refresh_ready")" -o pid= | grep -q '[0-9]' ||
+  fail 'D4 spawn did not return while refresh was held at the fifo'
+[[ ! -s "$TMP/refresh.log" ]] || fail 'D4 held refresh completed before release'
+python3 - "$refresh_fifo" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+try:
+    os.write(fd, b"\n")
+finally:
+    os.close(fd)
+PY
+refresh_wait 'released refresh did not log its pool/background arguments' \
+  grep -q '^refresh codex --background$' "$TMP/refresh.log"
+refresh_wait 'released refresh child did not exit' refresh_child_dead
+echo 'PASS D4-refresh-detached-until-fixture-release'
 
 failed_out="$(WRK_REFRESH_MODE=fail spawn_base codex-luna 2>&1)"
 grep -q 'scopefuel refresh failed for pool=codex; spawn already succeeded' <<<"$failed_out"
 grep -q 'model=codex-luna' <<<"$failed_out"
 
-timeout_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 : >"$TMP/refresh.pids"
-timeout_out="$(WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=2 WRK_REFRESH_TIMEOUT_S=0.2 spawn_base codex-luna 2>&1)"
-timeout_elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - timeout_start_ns) / 1000000 ))"
-# 2s hang 을 기다리지 않았음을 증명하면 충분하다 — 1000ms 는 부하 있는 머신에서
-# 오탐(실측 1075ms flake)이라 hang(2000ms) 대비 명확히 짧은 1800ms 로 완화.
-[[ "$timeout_elapsed_ms" -lt 1800 ]]
+: >"$TMP/refresh.log"
+refresh_start_case timeout 0.2
+refresh_wait 'refresh did not time out and reap its unreleased fixture' refresh_timeout_finished
+wait "$refresh_spawn_pid"
+[[ "$(cat "$refresh_rc")" -eq 0 ]] || fail 'D4 timed-out refresh changed spawn success'
+timeout_out="$(cat "$refresh_out")"
 grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' <<<"$timeout_out"
 grep -q 'model=codex-luna' <<<"$timeout_out"
+# No writer ever released this fifo: the supervisor timed out and reaped the
+# blocked fixture, rather than waiting for a chosen sleep duration to finish.
+[[ ! -s "$TMP/refresh.log" ]] || fail 'D4 timed-out fixture passed the unreleased fifo'
 while IFS= read -r refresh_pid; do
   [[ -z "$refresh_pid" ]] || ! ps -p "$refresh_pid" -o pid= | grep -q '[0-9]'
 done <"$TMP/refresh.pids"
+echo 'PASS D4-refresh-timeout-reaps-unreleased-fixture'
 
 cp "$SCOPEFUEL" "$TMP/non-executable-scopefuel"
 chmod -x "$TMP/non-executable-scopefuel"
@@ -15702,6 +15775,31 @@ else
   [[ "$T1137_RC" -ne 2 || ! -s "$T1137_ERR" ]] ||
     fail "hk1137 M1 mutant survived: --lane-defer still refused the non-ASCII id without the locale pin"
   echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
+fi
+
+# hk 1439: deliberate check — with SCOPEFUEL_BIN unset, a profile lease falls back
+# to PATH, must hit the tripwire shim (rc 99 via the lease error), then the log is
+# restored to its prior content so the end-of-suite check still means something.
+tw_job=tripwire-deliberate
+"$ARBITER" claim --job "$tw_job" --agent-label fixture --lane fixture --t T1 >/dev/null
+# the gate text must carry a pool so resolve_pool goes on to known_pools (scopefuel --json)
+printf '%s\n' 'profile=codex-luna-max pool=codex' >"$TMP/tw-gate.txt"
+tw_rc=0
+cp "$TRIPWIRE_LOG" "$TMP/tripwire.before"
+( unset SCOPEFUEL_BIN
+  "$ARBITER" lease --job "$tw_job" --kind quota_pool --profile codex-luna-max \
+    --gate-output "$TMP/tw-gate.txt" --json >"$TMP/tw-lease.out" 2>"$TMP/tw-lease.err" ) || tw_rc=$?
+[[ "$tw_rc" -ne 0 ]] || fail "hk1439: lease without SCOPEFUEL_BIN unexpectedly succeeded"
+[[ "$(wc -l <"$TRIPWIRE_LOG")" -gt "$(wc -l <"$TMP/tripwire.before")" ]] ||
+  fail "hk1439: tripwire did not fire for a lease without SCOPEFUEL_BIN: $(cat "$TMP/tw-lease.err")"
+grep -q 'exit 99' "$TMP/tw-lease.err" "$TMP/tw-lease.out" ||
+  fail "hk1439: lease error did not show the tripwire rc 99: $(cat "$TMP/tw-lease.err")"
+cp "$TMP/tripwire.before" "$TRIPWIRE_LOG" # drop only this case's own line
+echo "PASS hk1439 tripwire fires when SCOPEFUEL_BIN is unset"
+if [[ -s "$TRIPWIRE_LOG" ]]; then
+  echo "FAIL: hk1439 real-binary tripwire hit (caller argv):" >&2
+  cat "$TRIPWIRE_LOG" >&2
+  exit 1
 fi
 
 bash "$ROOT/tests/test-shellcheck-capped.sh"
