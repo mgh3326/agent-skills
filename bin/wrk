@@ -133,12 +133,13 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
+Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
             [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
   wrk done JOB [--report PATH]
+  wrk restore JOB
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
   wrk round open JOB --head SHA [--extend REF] [--repo PATH]
@@ -5592,6 +5593,249 @@ done_cmd() {
   # thing panewire sees.
   job_end_housekeeping "$job" "$owner" completed "wrk done" "wrk done" "$pane"
   echo "OK job=$job report=$report$relay_suffix"
+}
+
+restore_help() {
+  cat <<'USAGE'
+Usage: wrk restore JOB
+
+Restore a released job onto its own live pane in one step. This is the
+supported way to reverse a false loss on a live pane: a job whose sentinel
+recorded job.lost and job.revoked while its herdr pane kept running. Nothing
+changes unless every check passes.
+
+Checks, in order. The first that fails is named (check=NAME on stderr):
+  state         arbiter job-get reports state=released
+  receipt       the newest job.spawned receipt has pane_id, label and tab_id
+  claim         the first job.claim has the owner lane, T level, role and
+                agent label that the reclaim needs
+  herdr-pane    herdr lists that pane as exactly one agent
+  herdr-tab     that agent is in the receipt's tab
+  herdr-status  that agent's status is not unknown or gone
+  herdr-name    that agent's name equals the receipt's label
+
+When every check passes, wrk runs arbiter claim --reclaim-released with the
+first job.claim's fields: owner lane, T level, role and agent label always;
+parent lane, task id, task link override and task inheritance when the claim
+has them. Then it copies the newest job.spawned receipt back as one job.spawned
+event, so the reclaim is no longer newer than its receipt and the watch reads
+as current again. The copy keeps the receipt's payload; arbiter stores payloads
+with sorted keys.
+
+Restore records no quota row (the revoke already released it). After the receipt
+copy it starts one completion sentinel for the job, the same way spawn does, so
+a pane that dies after the checks is recorded as job.lost by that sentinel. The
+sentinel then leaves after the lost grace without ending the revived job; wrk
+prune declares the end (job.revoked) and releases the job's quota row, once the
+pane is absent and the job is stale. A live
+sentinel for the job that already watches this pane, proven by its pidfile and
+argv, is kept, and no second one starts.
+
+It does not look at the job's terminal kind: a completed, joined or handed-off
+job whose pane still passes the checks is revived the same way and is live work
+again until wrk done runs. The herdr checks are a snapshot taken just before the
+reclaim; the sentinel is what watches the pane after it. A completion sentinel
+still running for the job can read the reclaim as superseded and exit before the
+receipt lands.
+
+Exit codes: 0 restored. 2 refused before any write, nothing changed. 1 the
+reclaim landed but the receipt write failed; the one stderr line then names the
+exact arbiter event command that completes the restore. Run that command, and
+do not run the claim again. Or the receipt landed but no sentinel started; the
+stderr line says so, and the job is unwatched until one is started.
+
+Options:
+  -h, --help         show this usage
+USAGE
+}
+
+# The restore planner reads the job's own events, in wrk's event order. It
+# prints NUL-separated items: REFUSE check detail, or OK pane label tab owner
+# receipt followed by the reclaim arguments. The receipt JSON is ASCII-only, so
+# it can never carry a NUL into argv.
+RESTORE_PLAN_PY='
+import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+
+ROLES = ("worker", "builder", "captain")
+docs = [doc for _, doc, _ in wrk_events_ordered(sys.argv[1]) if doc is not None]
+
+
+def emit(*items):
+    sys.stdout.write("".join(item + "\0" for item in items))
+    raise SystemExit(0)
+
+
+def kind_of(doc):
+    return doc.get("kind") or doc.get("type") or doc.get("event") or ""
+
+
+def payload_of(doc):
+    payload = doc.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def text(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+spawned = [doc for doc in docs if kind_of(doc) == "job.spawned"]
+if not spawned:
+    emit("REFUSE", "receipt", "no job.spawned receipt")
+receipt = payload_of(spawned[-1])  # hk1933-newest-receipt
+if not (text(receipt.get("pane_id")) and text(receipt.get("label")) and text(receipt.get("tab_id"))):
+    emit("REFUSE", "receipt", "the newest job.spawned receipt lacks pane_id, label or tab_id")
+claims = [doc for doc in docs if kind_of(doc) == "job.claim"]
+if not claims:
+    emit("REFUSE", "claim", "no job.claim event to take the reclaim fields from")
+claim = payload_of(claims[0])
+if not (text(claim.get("owner_lane")) and text(claim.get("t_level")) and text(claim.get("agent_label"))):
+    emit("REFUSE", "claim", "the first job.claim lacks owner_lane, t_level or agent_label")
+if claim.get("role") not in ROLES:
+    emit("REFUSE", "claim", "the first job.claim has no usable role")
+argv = ["--lane", claim["owner_lane"], "--t", claim["t_level"], "--role", claim["role"],
+        "--agent-label", claim["agent_label"]]
+if text(claim.get("parent_lane")):
+    argv += ["--parent-lane", claim["parent_lane"]]
+if claim.get("task_id") is not None:
+    if isinstance(claim["task_id"], bool) or not isinstance(claim["task_id"], (int, str)):
+        emit("REFUSE", "claim", "the first job.claim task_id is neither an integer nor a string")
+    argv += ["--task-id", str(claim["task_id"])]
+for key, flag in (("task_link_override", "--task-link-override"), ("task_inherited_from", "--task-inherited-from")):
+    if claim.get(key) is not None:
+        if not isinstance(claim[key], str):
+            emit("REFUSE", "claim", "the first job.claim %s is not a string" % key)
+        argv += [flag, claim[key]]
+receipt_json = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+emit("OK", receipt["pane_id"], receipt["label"], receipt["tab_id"], claim["owner_lane"], receipt_json, *argv)
+'
+
+# The herdr check reads `herdr agent list` on stdin and prints one line: OK, or
+# REFUSE<TAB>check<TAB>detail for the first check that fails.
+RESTORE_HERDR_PY='
+import json, sys
+pane, tab, label = sys.argv[1:4]
+
+
+def refuse(check, detail):
+    sys.stdout.write("REFUSE\t%s\t%s\n" % (check, detail))
+    raise SystemExit(0)
+
+
+try:
+    document = json.load(sys.stdin)
+except ValueError:
+    refuse("herdr-pane", "herdr agent list did not answer with JSON")
+result = document.get("result", document) if isinstance(document, dict) else {}
+agents = result.get("agents") if isinstance(result, dict) else None
+if not isinstance(agents, list):
+    refuse("herdr-pane", "herdr agent list has no agents array")
+matches = [a for a in agents if isinstance(a, dict) and a.get("pane_id") == pane]
+if len(matches) != 1: refuse("herdr-pane", "herdr does not report pane %s as exactly one agent" % pane)  # hk1933-pane-reported
+agent = matches[0]
+if agent.get("tab_id") != tab:
+    refuse("herdr-tab", "pane %s is in tab %s, not the receipt tab %s" % (pane, agent.get("tab_id"), tab))
+status = agent.get("agent_status")
+if not isinstance(status, str) or status.strip() in ("", "unknown", "gone"):
+    refuse("herdr-status", "pane %s reports agent status %s" % (pane, status))
+if agent.get("name") != label:
+    refuse("herdr-name", "herdr agent name for pane %s is %s, not the receipt label %s" % (pane, agent.get("name"), label))
+sys.stdout.write("OK\n")
+'
+
+restore_refuse() {
+  echo "wrk: restore refused job=$1 check=$2: $3; nothing was changed" >&2
+}
+
+restore_quote() {
+  python3 -c 'import shlex, sys; print(" ".join(shlex.quote(word) for word in sys.argv[1:]))' "$@"
+}
+
+restore_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+    restore_help
+    return 0
+  fi
+  local job="${1:-}" arb events state item herdr_out pane label tab owner receipt verdict check detail cmd rc
+  local -a plan=() reclaim=()
+  [[ -n "$job" && "$job" != -* ]] || die "restore requires a job id"
+  shift || true
+  [[ $# -eq 0 ]] || die "unexpected argument '$1'"
+  arb="${ARBITER:-}"
+  if [[ -z "$arb" || ! -x "$arb" ]]; then
+    arb="$(command -v arbiter 2>/dev/null || true)"
+  fi
+  [[ -n "$arb" && -x "$arb" ]] || die "restore needs the arbiter binary (ARBITER_BIN or arbiter on PATH)"
+  events="$(wrk_jobs_root)/$job/events"
+
+  # Check 1, state: the arbiter must read the job as released. An unreadable
+  # record refuses too, so the check never passes on a guess.
+  state="$("$arb" job-get --job "$job" --json 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin).get("state", ""))' 2>/dev/null || true)"
+  if [[ "$state" != released ]]; then
+    restore_refuse "$job" state "arbiter state is '${state:-unreadable}', not released"
+    return 2
+  fi
+
+  # Check 2, receipt: the newest receipt and the first claim, from the job's own
+  # events. The planner refuses with the check it failed.
+  while IFS= read -r -d '' item; do plan+=("$item"); done < <(wrk_py -c "$RESTORE_PLAN_PY" "$events" 2>/dev/null)
+  if [[ "${plan[0]:-}" != OK ]]; then
+    restore_refuse "$job" "${plan[1]:-receipt}" "${plan[2]:-the job events could not be read}"
+    return 2
+  fi
+  pane="${plan[1]}"
+  label="${plan[2]}"
+  tab="${plan[3]}"
+  owner="${plan[4]}"
+  receipt="${plan[5]}"
+  reclaim=("${plan[@]:6}")
+
+  # Checks 3 to 6: herdr must list the receipt's pane as one agent, in the
+  # receipt's tab, with a live status, under the receipt's label.
+  rc=0
+  herdr_out="$("$HERDR" agent list 2>/dev/null)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    restore_refuse "$job" herdr-pane "herdr agent list failed (exit $rc)"
+    return 2
+  fi
+  verdict="$(printf '%s\n' "$herdr_out" | python3 -c "$RESTORE_HERDR_PY" "$pane" "$tab" "$label" 2>/dev/null || true)"
+  if [[ "$verdict" != OK ]]; then
+    IFS=$'\t' read -r _ check detail <<<"$verdict" || true
+    restore_refuse "$job" "${check:-herdr-pane}" "${detail:-herdr answer could not be read}"
+    return 2
+  fi
+
+  # The reclaim. A failure here wrote nothing, so the caller may fix the cause
+  # and run restore again.
+  rc=0
+  "$arb" claim --reclaim-released --job "$job" "${reclaim[@]}" >/dev/null || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: restore job=$job: arbiter reclaim refused (exit $rc); nothing was written" >&2
+    return 2
+  fi
+
+  # The receipt copy. A reclaim without this receipt reads as a respawn in
+  # flight, so a failed write must never be retried as a second reclaim.
+  rc=0
+  "$arb" event --job "$job" --kind job.spawned --payload-json "$receipt" >/dev/null 2>&1 || rc=$? # hk1933-restore-receipt
+  if [[ "$rc" -ne 0 ]]; then
+    cmd="$(restore_quote "$arb" event --job "$job" --kind job.spawned --payload-json "$receipt")"
+    echo "wrk: restore job=$job: reclaimed, but the job.spawned receipt write failed (exit $rc); complete the restore with: $cmd" >&2
+    return 1
+  fi
+  # The restored job gets the watcher a spawn gives it, so a pane that dies after
+  # the checks above is recorded as lost by that sentinel. start_completion_sentinel
+  # keeps a live sentinel that its pidfile and argv tie to this job and pane, and
+  # starts none in that case.
+  rc=0
+  start_completion_sentinel "$(wrk_jobs_root)/$job/completion-sentinel.pid" "$job" "$owner" "$label" "$pane" "" "" "" "" "" || rc=$? # hk1933-restore-sentinel
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: restore job=$job: restored, but its completion sentinel did not start; the job is unwatched" >&2
+    return 1
+  fi
+  echo "OK job=$job restored pane=$pane tab=$tab label=$label"
 }
 
 builder_flat_event() {
@@ -14094,6 +14338,7 @@ case "${1:-}" in
   -h|--help) usage ;;
   spawn) shift; spawn_router_cmd "$@" ;;
   done) shift; done_cmd "$@" ;;
+  restore) shift; restore_cmd "$@" ;;
   escalate) shift; escalate_cmd "$@" ;;
   joined) shift; joined_cmd "$@" ;;
   round) shift; round_cmd "$@" ;;
