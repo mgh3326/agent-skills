@@ -157,13 +157,13 @@
   "local_sources": {
     ".github/workflows/ci.yml": "cf352bd05a9920972d90c69075cdce16f7dc70d7ec977bfc77a9c6c6a292b038",
     "bin/arbiter": "ac2349402cbbd066bd1bdd18b6de5e57e42c902b339cc24c8a9b35d38a49be97",
-    "bin/wrk": "19de9bc8d2581b862ddfa34933166565231341dc1c901e5b44fbddb4dcb09d42",
+    "bin/wrk": "056fa2dd1eda9d6781f2f2010519325f7b8a1609b55885f227fcf8ff7ce5cccb",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
-    "builder/SKILL.md": "470afcec951213adda05926ddc76019535446a6b7166d268d1854167de670372",
+    "builder/SKILL.md": "116315fcfcff000c4933b62068b128e7bfecf820e7b72f238c1bd8c227722713",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
     "director/SKILL.md": "129ecf20bfaf6a132ac4d77c805f309d047aa35c5aaa28ad1f078da3409bc264",
     "director/bin/tester-eligible": "ae323c7defbb8eda295ef9975efd1fcfe054751c0d0c47c7d65a1ec12193159b",
-    "spawn-worker/SKILL.md": "85ea1889930e1f3a7bf991fc566c8f1047951d62bf24988be57373c559f60634",
+    "spawn-worker/SKILL.md": "04d476e4a25c0c4d3e2d36d5bfa456489b979c05e2c8c409e3da477e5cb423d9",
     "bin/wrk_pane_models.py": "856e5ab3c81ea0bdd18543056d7dabe9cee2692eabab718c16f7f318895ff151"
   },
   "profiles": {
