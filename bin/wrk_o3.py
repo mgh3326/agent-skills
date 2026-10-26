@@ -959,8 +959,24 @@ def projected_keys(events):
     return keys
 
 
-def projection(record, mode, meta, provenance):
-    """Today's event for an accepted record, plus o3_mode, wrk_receipt and the key."""
+def grant_context(state):
+    """The subject task id and each grant's authenticated issuer, for typed
+    grant projections in today's O2 shape (director-1 projection ruling)."""
+    if state is None:
+        return {"task_id": None, "issuers": {}}
+    return {"task_id": state.claim_payload["task_id"],
+            "issuers": {r["seq"]: r["actor_client_id"] for r in state.kinds("grant")}}
+
+
+def task_ref(grants):
+    return "hk:task/%s" % grants["task_id"] if grants.get("task_id") is not None else ""
+
+
+def projection(record, mode, meta, provenance, grants=None):
+    """Today's event for an accepted record, plus o3_mode, wrk_receipt and the
+    key. A typed extension or void keeps today's O2 fields (ref hk:task/<task>,
+    reason, issuer) so the O2 readers count it unchanged (design 6, L4142)."""
+    grants = grants or {"task_id": None, "issuers": {}}
     payload = record["payload"]
     base = {"job_id": record["job_id"], "owner_lane": meta.get("owner", ""), "label": meta.get("label", ""),
             "pane_id": meta.get("pane", ""), "parent_lane": meta.get("parent", ""), "epoch": 1,
@@ -971,6 +987,9 @@ def projection(record, mode, meta, provenance):
         for key in ("tester_job_id", "extension_grant_seq", "repeat_grant_seq"):
             if payload[key] is not None:
                 base[key] = payload[key]
+        if payload["extension_grant_seq"] is not None:
+            base["approval"] = {"ref": task_ref(grants), "extra": 1,
+                                "issuer": grants["issuers"].get(payload["extension_grant_seq"], "")}
         return "job.round", base
     if record["kind"] == "verdict":
         base.update({"kind": "job.verdict", "verdict": payload["verdict"], "head": payload["head"],
@@ -981,7 +1000,8 @@ def projection(record, mode, meta, provenance):
         return "job.verdict", base
     if record["kind"] == "void":
         base.update({"kind": "job.round_void", "round": payload["round_no"], "reason": payload["reason_code"],
-                     "ref": "o3:grant/%d" % payload["grant_seq"], "grant_seq": payload["grant_seq"]})
+                     "ref": task_ref(grants), "issuer": grants["issuers"].get(payload["grant_seq"], ""),
+                     "grant_seq": payload["grant_seq"]})
         return "job.round_void", base
     return None, None
 
@@ -989,7 +1009,7 @@ def projection(record, mode, meta, provenance):
 PROJECTED_KINDS = ("round_open", "verdict", "void")
 
 
-def write_projections(inbox, job, records, mode, meta, provenance):
+def write_projections(inbox, job, records, mode, meta, provenance, grants=None):
     """Project accepted records not yet projected; True when all landed."""
     events = os.path.join(safe_job_dir(inbox, job), "events")
     ns = events_ns()
@@ -1003,7 +1023,7 @@ def write_projections(inbox, job, records, mode, meta, provenance):
             for record in records:
                 if record["kind"] not in PROJECTED_KINDS or record["idempotency_key"] in done:
                     continue
-                kind, event = projection(record, mode, meta, provenance)
+                kind, event = projection(record, mode, meta, provenance, grants)
                 ns["wrk_event_commit"](events, kind, event)
                 done.add(record["idempotency_key"])
         finally:
@@ -1274,7 +1294,10 @@ class Route(object):
         self.code = code
 
 
-def route(ctx, job, operation, store=None, offline_formed=False):
+UNAVAILABLE = ("transport_unavailable", "transport_indeterminate", "wrk_unavailable", "wrk_recovery_required")
+
+
+def route(ctx, job, operation, store=None, offline_formed=False, unknown_ok=False):
     """legacy, o3 (with a fresh canonical state) or offline_shadow; else Fail.
 
     offline_shadow is the section 6 step-2 P1 branch: shadow mode, server
@@ -1298,7 +1321,12 @@ def route(ctx, job, operation, store=None, offline_formed=False):
                     and not snapshot.get("activated") and snapshot.get("role") in ("builder", "worker")
                     and snapshot.get("summary", {}).get("state") == "shadow"):
                 return Route("offline_shadow", snapshot=snapshot, code=exc.code)
-            if offline_formed and snapshot is not None:
+            protected = snapshot is not None and snapshot.get("receipt_required")
+            if unknown_ok and exc.code in UNAVAILABLE and not protected:
+                # No protected witness: the class is unknown; the caller runs the
+                # O2 guards as a veto and then fails closed (director-1 ruling).
+                return Route("unknown", snapshot=snapshot, code=exc.code)
+            if offline_formed and protected:
                 return Route("offline_formed", snapshot=snapshot, code=exc.code)
             raise Fail(exc.code, "%s: no canonical read; refusing" % operation)
         raise Fail(exc.code)
@@ -1317,15 +1345,17 @@ def meta_from(opts):
             "parent": opts.get("--parent", "")}
 
 
-def finish_projection(ctx, job, state_or_records, mode, meta, provenance, ok_line, outcome=None):
+def finish_projection(ctx, job, state_or_records, mode, meta, provenance, ok_line, outcome=None, grants=None):
     records = state_or_records
     if outcome is not None:
         advance_snapshot(ctx.jobdir(job), job, outcome)
-    end = local_end(ctx.inbox, job)
+    # For a shadow job a local end refuses the projection; for a receipt_required
+    # job the server decides and a local end neither authorizes nor blocks.
+    end = local_end(ctx.inbox, job) if mode == "shadow" else ""
     if end:
         raise Fail("usage", "the receipt is stored (seq %d) but the local end record %s refuses the local "
                    "projection" % (records[-1]["seq"], end))
-    if not write_projections(ctx.inbox, job, records, mode, meta, provenance):
+    if not write_projections(ctx.inbox, job, records, mode, meta, provenance, grants):
         emit("projection_pending job=%s" % job)
         raise Fail("projection_pending", "the receipt is stored; the local event is repaired from server records "
                    "on the next run")
@@ -1335,11 +1365,12 @@ def finish_projection(ctx, job, state_or_records, mode, meta, provenance, ok_lin
 def repair(ctx, job, store, state, meta):
     """Read repair: project every accepted intent of this job still missing its
     event. A local end refuses every projection (director-1 ruling)."""
-    if local_end(ctx.inbox, job):
+    if not state.receipt_required and local_end(ctx.inbox, job):
         return
     accepted = {i["receipt"]["seq"] for i in store.intents if i["state"] == "accepted"}
     records = [r for r in state.records if r["seq"] in accepted]
-    if records and not write_projections(ctx.inbox, job, records, o3_mode_name(state), meta, "server_repair"):
+    if records and not write_projections(ctx.inbox, job, records, o3_mode_name(state), meta, "server_repair",
+                                         grant_context(state)):
         raise Fail("projection_pending", "read repair could not write the local events")
 
 
@@ -1354,11 +1385,17 @@ def route_op(ctx, job, opts):
     ENFORCED goes to the server first; SHADOW and OFFLINE_SHADOW run the O2
     guards first and append only when they pass; LEGACY stays O2."""
     with Intents(ctx.inbox, job) as store:
-        decision = route(ctx, job, opts.get("--operation", "round"), store)
+        decision = route(ctx, job, opts.get("--operation", "round"), store, offline_formed=True, unknown_ok=True)
     if decision.kind == "legacy":
         emit("LEGACY")
     elif decision.kind == "offline_shadow":
         emit("OFFLINE_SHADOW")
+    elif decision.kind == "offline_formed":
+        # A protected witness: the command goes to its O3 path, which fails
+        # closed (a verdict may keep its formed intent).
+        emit("OFFLINE_PROTECTED %s" % decision.code)
+    elif decision.kind == "unknown":
+        emit("UNKNOWN %s" % decision.code)
     else:
         emit("ENFORCED" if decision.state.receipt_required else "SHADOW")
 
@@ -1411,7 +1448,8 @@ def offline_intent(ctx, job, kind, payload_from_snapshot, operation):
             write_warning(ctx.inbox, job, exc.code, operation, intent["idempotency_key"])
             warn("o3 server unavailable (%s) for shadow job %s: intent %s stays pending; O2 local event only"
                  % (exc.code, job, intent["idempotency_key"]))
-            emit("LEGACY")
+            # The O2 event carries this key, so a later replay writes no second one.
+            emit("LEGACY_WARNED %s" % intent["idempotency_key"])
             return None
 
 
@@ -1451,7 +1489,7 @@ def round_open(ctx, job, opts):
     finish_projection(ctx, job, [record], mode, meta, "receipt",
                       "OK job=%s round=%d cap=3 head=%s o3=%s seq=%d%s" % (
                           job, record["payload"]["round_no"], record["payload"]["head"], mode, record["seq"], note),
-                      outcome)
+                      outcome, grant_context(decision.state) if decision.kind == "o3" else None)
 
 
 def verdict_round(state, head):
@@ -1530,7 +1568,7 @@ def round_verdict(ctx, job, opts):
     finish_projection(ctx, job, [record], mode, meta, "receipt",
                       "OK job=%s verdict=%s head=%s round=%d o3=%s seq=%d" % (
                           job, payload["verdict"], payload["head"], payload["round_no"], mode, record["seq"]),
-                      outcome)
+                      outcome, grant_context(decision.state) if decision.kind == "o3" else None)
 
 
 def round_void(ctx, job, opts):
@@ -1561,7 +1599,7 @@ def round_void(ctx, job, opts):
     finish_projection(ctx, job, [record], o3_mode_name(state), meta, "receipt",
                       "OK job=%s VOIDED round=%d grant=%d o3=%s seq=%d" % (
                           job, record["payload"]["round_no"], grant, o3_mode_name(state), record["seq"]),
-                      outcome)
+                      outcome, grant_context(state))
 
 
 def status_line(state):
@@ -1788,7 +1826,8 @@ def spawn_reviewer(ctx, job, opts, write):
             raise Fail("claim_conflict", "spawn: the accepted round_open names %s, not %s"
                        % (record["payload"]["tester_job_id"], job))
         opened = record["payload"]["round_no"]
-        if not write_projections(ctx.inbox, subject, [record], o3_mode_name(target), meta, "receipt"):
+        if not write_projections(ctx.inbox, subject, [record], o3_mode_name(target), meta, "receipt",
+                                 grant_context(target)):
             raise Fail("projection_pending", "round_open receipt stored for %s" % subject)
     emit("OK o3=reviewer job=%s subject=%s round=%d" % (job, subject, opened))
 

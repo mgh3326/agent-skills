@@ -911,15 +911,18 @@ class MatrixCase(O3Case):
         w = self.world()
         w.enforced_builder()
         vfile = w.verdict_file("v.md", w.heads[0])
-        # No snapshot holds the round head: fail closed and record no intent.
+        # No snapshot holds the round head (and no protected witness): the O2
+        # guards veto (no local open round) and no intent is recorded.
         w.fault("job", "error:transport_unavailable")
-        self.assertRc(w.run("round", "verdict", "job-a", "--file", vfile), 75, "transport_unavailable")
+        out = w.run("round", "verdict", "job-a", "--file", vfile)
+        self.assertRc(out, 2)
+        self.assertIn("has no open round", out.stderr)
         self.assertEqual(w.intents("job-a"), [])
         # A cached open round on this head (and its tester): the exact request is
         # formed and stays pending; nothing is sent or projected.
         self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
         before = len(w.appends())
-        w.fault("job", "error:transport_unavailable")
+        w.fault("job", "error:transport_unavailable", times=2)
         self.assertRc(w.run("round", "verdict", "job-a", "--file", vfile), 75, "transport_unavailable")
         pending = [i for i in w.intents("job-a") if i["state"] == "pending"]
         self.assertEqual(len(pending), 1)
@@ -1003,7 +1006,7 @@ class MatrixCase(O3Case):
             self.assertIn(token, out.stdout)
         self.assertEqual(len(w.events("job-a", "job.o3_warning")), 1)
         # Never used for a decision: an open still fails closed.
-        w.fault("job", "error:transport_unavailable")
+        w.fault("job", "error:transport_unavailable", times=2)
         self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75)
 
     def test_audit_reads_the_server_only_for_o3_job_dirs(self):
@@ -1115,7 +1118,7 @@ class ShadowCase(O3Case):
 
     def test_unavailable_shadow_subject_takes_the_p1_warning_branch(self):
         w = self.shadow_subject()
-        w.fault("job", "error:transport_unavailable")
+        w.fault("job", "error:transport_unavailable", times=2)
         w.fault("append", "error:transport_unavailable", kind="round_open")
         out = w.run("round", "open", "job-a", "--head", w.heads[0])
         self.assertRc(out, 0)
@@ -1155,7 +1158,7 @@ class ShadowCase(O3Case):
         snapshot = json.loads((w.inbox / "rev-a" / "o3-snapshot.json").read_text())
         self.assertTrue(snapshot["receipt_required"])
         self.assertEqual(snapshot["summary"]["state"], "shadow")
-        w.fault("job", "error:transport_unavailable")
+        w.fault("job", "error:transport_unavailable", times=2)
         w.fault("append", "error:transport_unavailable", kind="round_open")
         out = w.run("round", "open", "rev-a", "--head", w.heads[0])
         return w, out
@@ -1330,13 +1333,15 @@ class DualWriteOrderCase(O3Case):
     def wrk_calls(self, w):
         return [c for c in w.calls() if c["argv"][:1] == ["wrk"]]
 
-    def test_shadow_job_locally_revoked_refuses_before_any_rpc(self):
+    def test_shadow_job_locally_revoked_refuses_before_any_append(self):
         w = self.shadow_job()
         self.revoke(w)
         out = w.run("round", "open", "job-a", "--head", w.heads[0])
         self.assertRc(out, 2)
         self.assertIn("refused after end record", out.stderr)
-        self.assertEqual(self.wrk_calls(w), [], "no RPC once the O2 end guard refuses")
+        # Only the read-only classification GET runs; no mutation RPC (director-1 clarification).
+        self.assertEqual({tuple(c["argv"][:2]) for c in self.wrk_calls(w)}, {("wrk", "job"), ("wrk", "records")})
+        self.assertEqual(w.appends(), [])
         self.assertEqual(w.intents("job-a"), [])
         self.assertEqual(w.events("job-a", "job.round"), [])
 
@@ -1385,6 +1390,84 @@ class DualWriteOrderCase(O3Case):
 
     def key_of(self, call):
         return call["argv"][call["argv"].index("--idempotency-key") + 1]
+
+    # -- director-1 classification clarification --
+    def test_activated_job_with_a_planted_local_end_and_no_snapshot_is_the_servers(self):
+        w = self.world()
+        w.enforced_builder()
+        local_event(w, "job-a", "00090-job.revoked.json",
+                    {"kind": "job.revoked", "job_id": "job-a", "at": "2030-01-01T00:00:00.000Z"})
+        self.assertFalse((w.inbox / "job-a" / "o3-snapshot.json").exists())
+        out = w.run("round", "open", "job-a", "--head", w.heads[0])
+        self.assertRc(out, 0)
+        self.assertEqual(len(w.appends("round_open")), 1, "a local end neither authorizes nor blocks")
+        self.assertEqual(len(w.events("job-a", "job.round")), 1)
+        # The server's answer decides a refusal too.
+        w.fault("append", "error:job_ended", kind="round_open")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 73, "job_ended")
+
+    def test_unknown_class_runs_the_o2_guards_as_a_veto_then_fails_closed(self):
+        w = self.world()
+        w.mode("shadow")
+        w.enroll("job-a", activate=False)
+        w.local_claim("job-a")
+        w.fault("job", "error:transport_unavailable")
+        out = w.run("round", "open", "job-a", "--head", w.heads[0])
+        self.assertRc(out, 75)
+        self.assertIn("class is unknown", out.stderr)
+        self.assertEqual(w.appends(), [])
+        self.assertEqual(w.intents("job-a"), [])
+        self.assertEqual(w.events("job-a", "job.round"), [])
+        local_event(w, "job-a", "00090-job.revoked.json",
+                    {"kind": "job.revoked", "job_id": "job-a", "at": "2030-01-01T00:00:00.000Z"})
+        w.fault("job", "error:transport_unavailable")
+        out = w.run("round", "open", "job-a", "--head", w.heads[0])
+        self.assertRc(out, 2)
+        self.assertIn("refused after end record", out.stderr)
+        self.assertEqual(w.appends(), [])
+
+    def test_typed_void_and_extension_projections_keep_the_o2_shape(self):
+        w = self.world()
+        w.enforced_builder()
+        for i in range(3):
+            self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[i]), 0)
+        void = w.grant("job-a", "void", round_no=3)
+        self.assertRc(w.run("round", "void", "job-a", "3", "--grant", void["seq"]), 0)
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[3]), 0)
+        ext = w.grant("job-a", "extension", round_no=5, head=w.heads[4])
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[4], "--extension-grant", ext["seq"]), 0)
+        event = w.events("job-a", "job.round_void")[0]
+        record = [r for r in w.records("job-a") if r["kind"] == "void"][0]
+        self.assertEqual((event["ref"], event["reason"], event["issuer"], event["grant_seq"]),
+                         ("hk:task/2400", "builder_void", "director-1", void["seq"]))
+        self.assertEqual(event["wrk_receipt"]["record_hash"], record["record_hash"])
+        self.assertEqual(event["idempotency_key"], record["idempotency_key"])
+        rounds = w.events("job-a", "job.round")
+        self.assertEqual(rounds[-1]["approval"], {"ref": "hk:task/2400", "issuer": "director-1", "extra": 1})
+        # The unchanged O2 reader counts them: the void refunds, the extension adds one.
+        w.mode(None)
+        out = w.run("round", "status", "job-a")
+        self.assertRc(out, 0)
+        self.assertIn("round 3 void (hk:task/2400)", out.stdout)
+        self.assertIn("rounds=4", out.stdout)
+
+    def test_a_warning_branch_event_with_the_key_is_not_written_twice_on_replay(self):
+        w = self.world()
+        w.mode("shadow")
+        w.enroll("job-a", activate=False)
+        w.local_claim("job-a")
+        self.assertRc(w.run("round", "status", "job-a"), 0)
+        w.fault("job", "error:transport_unavailable", times=2)
+        w.fault("append", "error:transport_unavailable", kind="round_open")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+        key = w.intents("job-a")[0]["idempotency_key"]
+        rounds = w.events("job-a", "job.round")
+        self.assertEqual([(r["idempotency_key"], r["o3_provenance"]) for r in rounds], [(key, "o2_warning")])
+        out = w.run("round", "open", "job-a", "--head", w.heads[0])
+        self.assertRc(out, 0)
+        self.assertIn("resent=pending", out.stdout)
+        self.assertEqual(len(w.events("job-a", "job.round")), 1, "the replay keeps the old observation")
+        self.assertEqual(w.intents("job-a")[0]["state"], "accepted")
 
     def test_pending_intent_after_a_local_end_is_resent_once_and_not_projected(self):
         w = self.shadow_job()
