@@ -799,6 +799,10 @@ case "${1:-}" in
           exit 9
         fi
       fi
+      # hk 2011: hold the failed-pane screen capture so concurrent captures overlap.
+      if [[ -n "${WRK_FIXTURE_PANE_READ200_HOLD:-}" && " $* " == *" --lines 200 "* ]]; then
+        sleep "$WRK_FIXTURE_PANE_READ200_HOLD"
+      fi
       # hk 1895: fail only the failed-pane screen capture shape (--lines 200),
       # never the readiness probe's --lines 60 read.
       if [[ -n "${WRK_FIXTURE_PANE_READ200_FAIL:-}" && " $* " == *" --lines 200 "* ]]; then

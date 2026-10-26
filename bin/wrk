@@ -805,12 +805,15 @@ PANEWIRE_PROMPT_CODEX_TIMEOUT_SECONDS=60
 # (#770: JE15b on macOS CI blocked 60s under a 2s bound).
 run_bounded() {
   local secs="$1"; shift
+  # hk 2011: a child that ignores TERM is KILLed this many seconds after the
+  # bound, so the total bound is secs plus this grace.
+  local kill_grace=2
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    timeout -k "$kill_grace" "$secs" "$@"
     return
   fi
   if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
+    gtimeout -k "$kill_grace" "$secs" "$@"
     return
   fi
   python3 -c 'import os, signal, subprocess, sys
@@ -2269,7 +2272,9 @@ quota_hub_policy_gate() {
 # so a herdr that never returns cannot hang a spawn EXIT trap. The screen
 # can carry account, model or path text, so it is written 0600 and never
 # echoed to stdout/stderr. A second failure of the same job writes
-# spawn-failure-screen-2.txt, then -3, never overwriting.
+# spawn-failure-screen-2.txt, then -3, never overwriting. hk 2011: the name is
+# claimed with an exclusive create (noclobber), so two concurrent failures of
+# one job cannot pick the same file.
 spawn_capture_failed_pane_screen() {
   [[ -n "${JOB_ID:-}" && -n "${PANE:-}" ]] || return 0
   local dir screen n=1
@@ -2279,7 +2284,11 @@ spawn_capture_failed_pane_screen() {
     return 0
   }
   screen="$dir/spawn-failure-screen.txt"
-  while [[ -e "$screen" ]]; do
+  until ( umask 077; set -C; : >"$screen" ) 2>/dev/null; do
+    [[ -e "$screen" ]] || {
+      warn "failed-pane screen capture skipped: $screen could not be created"
+      return 0
+    }
     n=$((n + 1))
     screen="$dir/spawn-failure-screen-$n.txt"
   done
@@ -2296,7 +2305,7 @@ spawn_pane_cleanup() {
   SPAWN_PANE_OPEN=0
   spawn_capture_failed_pane_screen
   if [[ "${WRK_KEEP_FAILED_PANE:-}" == 1 ]]; then
-    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close ${TAB_ID:-its tab}" >&2
+    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close $PANE" >&2
     return 0
   fi
   "$HERDR" pane close "$PANE" >/dev/null 2>&1     && echo "wrk: closed leftover pane $PANE after spawn failure" >&2     || echo "wrk: failed to close leftover pane $PANE — close it manually" >&2
@@ -5305,7 +5314,8 @@ delegate_job_cmd() {
   if [[ "$prc" -ne 0 ]]; then
     # A probe killed by its own guard means the daemon is wedged, not absent —
     # emit_relay_event must not re-enter it inside this same invocation.
-    if [[ "$prc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: a TERM-ignoring child now ends in KILL (137), a wedge all the same.
+    if [[ "$prc" == 124 || "$prc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     return 0
   fi
   [[ "$probe" == "$JOB_PROBE_TOKEN" ]] || return 0
@@ -5322,7 +5332,7 @@ delegate_job_cmd() {
     # the local path's completion dedup suppresses the second write. On a
     # timeout the daemon is wedged — mark it so emit_relay_event does not
     # stall this invocation on another doomed panewire call.
-    if [[ "$rc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    if [[ "$rc" == 124 || "$rc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     warn "panewire job $sub delegation failed or timed out (rc=$rc); using wrk's own path"
     return 0
   fi
@@ -9327,6 +9337,7 @@ spillover_remote_spawn() {
   fi
   local remote_args=(env "HERDR_SESSION=$session")
   [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
+  [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")
   remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   # Builders only — forwarding the flag to a worker would mute the execution
   # host's own session-machine_ids check while this host then named the

@@ -7154,7 +7154,7 @@ set -e
 if grep -q '^pane close ' "$TMP/herdr.log"; then
   fail "WRK_KEEP_FAILED_PANE=1 still closed the pane"
 fi
-grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close w:t1' <<<"$t1895_keep_out" ||
+grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close w:p1' <<<"$t1895_keep_out" ||
   fail "1895 keep case lost the kept-pane line: $t1895_keep_out"
 
 # Any other value behaves as unset: the pane is closed.
@@ -7183,7 +7183,7 @@ set -e
   fail "1895 read-fail case expected rc=1, got $t1895_readfail_rc: $t1895_readfail_out"
 grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
   fail "1895 read-fail case must still close the pane"
-[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -le 1 ]] ||
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -eq 1 ]] ||
   fail "1895 read-fail case printed more than one warn line: $t1895_readfail_out"
 if grep -q 'saved failed pane screen' <<<"$t1895_readfail_out"; then
   fail "1895 read-fail case must not claim a saved screen"
@@ -7206,6 +7206,71 @@ done
 grep -q 'fixture welcome screen' "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" ||
   fail "1895 first screen file was overwritten"
 echo "PASS hk1895 failed-pane screen capture and WRK_KEEP_FAILED_PANE"
+
+# hk 2011: four follow-ups to hk 1895. run_bounded bounds a TERM-ignoring child
+# (timeout -k), concurrent failed-pane captures of one job never share a file,
+# the remote spawn leg forwards WRK_KEEP_FAILED_PANE, the kept-pane hint names
+# herdr pane close, and the read-failure case warns exactly once.
+HK2011_RB_FN="$TMP/hk2011-run-bounded.sh"
+sed -n '/^run_bounded() {/,/^}/p' "$WRK" >"$HK2011_RB_FN"
+[[ -s "$HK2011_RB_FN" ]] || fail "hk 2011: run_bounded is missing from bin/wrk"
+printf '%s\n' 'trap "" TERM' 'sleep 30' >"$TMP/hk2011-term-ignore.sh"
+hk2011_start="$(date +%s)"
+set +e
+( . "$HK2011_RB_FN"; run_bounded 1 bash "$TMP/hk2011-term-ignore.sh" ) >"$TMP/hk2011-rb.out" 2>&1
+hk2011_rb_rc=$?
+set -e
+hk2011_rb_elapsed=$(( $(date +%s) - hk2011_start ))
+[[ "$hk2011_rb_rc" -eq 124 || "$hk2011_rb_rc" -eq 137 ]] ||
+  fail "hk 2011: TERM-ignoring child under run_bounded 1 expected rc 124 or 137, got $hk2011_rb_rc"
+[[ "$hk2011_rb_elapsed" -le 6 ]] ||
+  fail "hk 2011: TERM-ignoring child held run_bounded 1 for ${hk2011_rb_elapsed}s (ceiling 6s)"
+echo "PASS hk2011 run_bounded kills a TERM-ignoring child"
+
+# Two failed spawns of one job, started together: the capture holds the read,
+# so both reach the capture window; each must get its own screen file.
+HK2011_JOBDIR="$TMP/inbox/hk2011-dup"
+rm -rf "$HK2011_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+WRK_FIXTURE_PANE_READ200_HOLD=3 TEST_FIXTURE_SCENARIO=start-not-ready \
+  spawn_base opus --job hk2011-dup --job-dup-ok >"$TMP/hk2011-dup-1.out" 2>&1 &
+hk2011_dup_1=$!
+WRK_FIXTURE_PANE_READ200_HOLD=3 TEST_FIXTURE_SCENARIO=start-not-ready \
+  spawn_base opus --job hk2011-dup --job-dup-ok >"$TMP/hk2011-dup-2.out" 2>&1 &
+hk2011_dup_2=$!
+wait "$hk2011_dup_1"; hk2011_dup_1_rc=$?
+wait "$hk2011_dup_2"; hk2011_dup_2_rc=$?
+set -e
+[[ "$hk2011_dup_1_rc" -eq 1 && "$hk2011_dup_2_rc" -eq 1 ]] ||
+  fail "hk 2011 concurrent failures expected rc=1 twice, got $hk2011_dup_1_rc and $hk2011_dup_2_rc"
+[[ "$(find "$HK2011_JOBDIR" -maxdepth 1 -name 'spawn-failure-screen*.txt' -size +0 | wc -l)" -eq 2 ]] ||
+  fail "hk 2011 concurrent captures must leave two non-empty distinct screen files: $(ls -la "$HK2011_JOBDIR" 2>&1)"
+echo "PASS hk2011 concurrent failed-pane captures keep distinct files"
+
+# WRK_KEEP_FAILED_PANE reaches the remote leg of a --host spawn.
+HK2011_HOSTS="$TMP/hk2011-hosts.toml"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >"$HK2011_HOSTS"
+printf '0.20 0.10 0.10 1/1 1\n' >"$TMP/hk2011-loadavg"
+# The router refuses remote placement while the arbiter lookup is unreadable;
+# a seeded claim in a block-private inbox makes it readable (as the t1090 block).
+HK2011_INBOX="$TMP/hk2011-inbox" HK2011_XDG="$TMP/hk2011-xdg"
+env ARBITER_INBOX_ROOT="$HK2011_INBOX" XDG_DATA_HOME="$HK2011_XDG" \
+  "$ARBITER" claim --job hk2011-seed --agent-label hk2011-seed --lane hk2011 --t T1 >/dev/null
+HK2011_SSH_LOG="$TMP/hk2011-ssh.log"
+: >"$HK2011_SSH_LOG"
+set +e
+TEST_ARBITER_BIN="$ARBITER" WRK_KEEP_FAILED_PANE=1 WRK_HOSTS_CONFIG="$HK2011_HOSTS" WRK_PROC_LOADAVG="$TMP/hk2011-loadavg" \
+  WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 ARBITER_INBOX_ROOT="$HK2011_INBOX" XDG_DATA_HOME="$HK2011_XDG" \
+  WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" \
+  WRK_SSH_LOG="$HK2011_SSH_LOG" WRK_SSH_SCENARIO=ok WRK_SCP_SCENARIO=ok WRK_SCP_LOG="$TMP/hk2011-scp.log" \
+  spawn_base opus --host desktop --job hk2011-fwd >"$TMP/hk2011-fwd.out" 2>&1
+set -e
+grep -q 'WRK_KEEP_FAILED_PANE=1' "$HK2011_SSH_LOG" ||
+  fail "hk 2011: WRK_KEEP_FAILED_PANE=1 must reach the remote leg: $(cat "$HK2011_SSH_LOG") $(cat "$TMP/hk2011-fwd.out")"
+echo "PASS hk2011 WRK_KEEP_FAILED_PANE is forwarded to the remote leg"
 
 
 # #609: an accepted `agent start` whose binary never reaches the pane
