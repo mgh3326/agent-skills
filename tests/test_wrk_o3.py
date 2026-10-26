@@ -1509,11 +1509,38 @@ class DualWriteOrderCase(O3Case):
         key = w.intents("job-a")[0]["idempotency_key"]
         rounds = w.events("job-a", "job.round")
         self.assertEqual([(r["idempotency_key"], r["o3_provenance"]) for r in rounds], [(key, "o2_warning")])
-        out = w.run("round", "open", "job-a", "--head", w.heads[0])
+        # The next round command first replays the pending intent by its key
+        # (server round 1, no second event for it), then appends the new open
+        # as server round 2 (director-1 P1 ruling: one round numbering).
+        out = w.run("round", "open", "job-a", "--head", w.heads[1])
         self.assertRc(out, 0)
-        self.assertIn("resent=pending", out.stdout)
-        self.assertEqual(len(w.events("job-a", "job.round")), 1, "the replay keeps the old observation")
-        self.assertEqual(w.intents("job-a")[0]["state"], "accepted")
+        self.assertIn("round=2", out.stdout)
+        rounds = w.events("job-a", "job.round")
+        self.assertEqual([r["round"] for r in rounds], [1, 2])
+        self.assertEqual(rounds[0]["idempotency_key"], key)
+        self.assertEqual(rounds[1]["wrk_receipt"]["seq"], 3)
+        self.assertEqual(sorted(r["payload"]["round_no"] for r in w.records("job-a") if r["kind"] == "round_open"),
+                         [1, 2])
+        self.assertEqual([i["state"] for i in w.intents("job-a")], ["accepted", "accepted"])
+
+    def test_p1_round_numbers_that_differ_after_replay_fail_closed(self):
+        w = self.world()
+        w.mode("shadow")
+        w.enroll("job-a", activate=False)
+        w.local_claim("job-a")
+        self.assertRc(w.run("round", "status", "job-a"), 0)
+        w.fault("job", "error:transport_unavailable", times=2)
+        w.fault("append", "error:transport_unavailable", kind="round_open")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+        # The replay is a definite rejection: the local O2 round 1 is orphaned.
+        w.fault("append", "error:sequence_conflict", kind="round_open")
+        out = w.run("round", "open", "job-a", "--head", w.heads[1])
+        self.assertRc(out, 75, "round_mismatch")
+        self.assertIn("job job-a local O2 next round 2 differs from the server next_round_no 1", out.stderr)
+        self.assertIn("orphaned local round(s) 1", out.stderr)
+        self.assertEqual(len(w.appends("round_open")), 2, "the original and its replay only; nothing new appended")
+        self.assertEqual([r for r in w.records("job-a") if r["kind"] == "round_open"], [])
+        self.assertEqual(len(w.events("job-a", "job.round")), 1)
 
     def test_pending_intent_after_a_local_end_is_resent_once_and_not_projected(self):
         w = self.shadow_job()

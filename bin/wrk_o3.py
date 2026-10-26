@@ -73,11 +73,14 @@ EXIT["records_mode_invalid"] = 2
 EXIT["usage"] = 2
 # 6 step 3: the receipt is stored but the local projection did not land.
 EXIT["projection_pending"] = 75
+# A P1 job whose local O2 next round differs from the server's next_round_no
+# after every pending replay: a director decision, never an automatic fix.
+EXIT["round_mismatch"] = 75
 # Codes the server returns with an HTTP 4xx: a validated one is a definite
 # rejection. 503 codes and every local transport/protocol code are not.
 SERVER_CODES = set(EXIT) - {"cli_usage", "transport_unavailable", "transport_indeterminate", "protocol_invalid",
                             "o3_unsupported", "history_regressed", "intent_invalid", "intent_io", "trust_path",
-                            "records_mode_invalid", "usage", "projection_pending"}
+                            "records_mode_invalid", "usage", "projection_pending", "round_mismatch"}
 DEFINITE = SERVER_CODES - {"wrk_unavailable", "wrk_recovery_required"}
 CLI_CODES = SERVER_CODES | {"cli_usage", "transport_unavailable", "transport_indeterminate", "protocol_invalid",
                             "o3_unsupported", "history_regressed", "intent_invalid", "intent_io"}
@@ -1395,10 +1398,53 @@ def local_end(inbox, job):
     return events_ns()["wrk_end_declaration"](events) if os.path.isdir(events) else ""
 
 
+def local_o2_rounds(inbox, job):
+    """(next round, local round numbers) by today's O2 rule in round open."""
+    events = os.path.join(safe_job_dir(inbox, job), "events")
+    ns = events_ns()
+    records = [o for _n, o, _m in ns["wrk_events_ordered"](events) if o is not None] if os.path.isdir(events) else []
+    rounds = [r for r in records if r.get("kind") == "job.round"]
+    verdicts = [r for r in records if r.get("kind") == "job.verdict"]
+    bound = {v.get("round") for v in verdicts if isinstance(v.get("round"), int)}
+    numbers = {r.get("round") for r in rounds if isinstance(r.get("round"), int)}
+    voided = {v.get("round") for v in records
+              if (v.get("kind") == "job.round_void" and v.get("job_id") == job and isinstance(v.get("round"), int)
+                  and v.get("round") in numbers and v.get("round") not in bound
+                  and isinstance(v.get("ref"), str) and v["ref"].startswith(("hk:doc/", "hk:task/")))}
+    used = sum(1 for r in rounds if not (isinstance(r.get("round"), int) and r.get("round") in voided))
+    used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
+    used += ns["wrk_takeover_rounds"](events) if os.path.isdir(events) else 0
+    return max(used, max(numbers) if numbers else 0) + 1, numbers
+
+
+def check_round_numbers(ctx, job, state, operation):
+    """A P1 job keeps one round numbering (director-1 ruling): after every
+    pending replay the local O2 next round must equal the server's
+    next_round_no, or the command fails closed before its append."""
+    if state.receipt_required:
+        return
+    local_next, local_numbers = local_o2_rounds(ctx.inbox, job)
+    server_next = state.summary["next_round_no"]
+    if local_next != server_next:
+        server_numbers = {r["payload"]["round_no"] for r in state.kinds("round_open")}
+        orphaned = ",".join(str(n) for n in sorted(local_numbers - server_numbers)) or "-"
+        raise Fail("round_mismatch", "%s: job %s local O2 next round %d differs from the server next_round_no %d; "
+                   "orphaned local round(s) %s; needs a director decision, nothing appended"
+                   % (operation, job, local_next, server_next, orphaned))
+
+
 def route_op(ctx, job, opts):
     """Tell bin/wrk how to run a round command (director-1 dual-write ruling):
     ENFORCED goes to the server first; SHADOW and OFFLINE_SHADOW run the O2
-    guards first and append only when they pass; LEGACY stays O2."""
+    guards first and append only when they pass; LEGACY stays O2. Every
+    pending intent of the job is replayed by its key before classifying; one
+    still indeterminate fails closed with 75 (director-1 P1 ruling)."""
+    if ctx.mode != "legacy" and os.path.exists(os.path.join(ctx.jobdir(job), INTENTS)):
+        with Intents(ctx.inbox, job) as store:
+            if store.pending():
+                for outcome in resume(store):
+                    warn("o3 pending %s %s replayed by its key: accepted seq %d" % (
+                        outcome.intent["request"]["kind"], outcome.intent["idempotency_key"], outcome.record["seq"]))
     with Intents(ctx.inbox, job) as store:
         decision = route(ctx, job, opts.get("--operation", "round"), store, offline_formed=True, unknown_ok=True)
     if decision.kind == "legacy":
@@ -1501,6 +1547,7 @@ def round_open(ctx, job, opts):
             repair(ctx, job, store, state, meta)
 
             def build(fresh):
+                check_round_numbers(ctx, job, fresh, "round open")
                 return fresh.summary["claim_seq"], fresh.snapshot_seq, payload
             outcome = cli_guard(transact)(store, "round_open", build,
                                           state_reader=cli_guard(lambda: ctx.state(job, store)))
@@ -1573,6 +1620,7 @@ def round_verdict(ctx, job, opts):
             repair(ctx, job, store, state, meta)
 
             def build(fresh):
+                check_round_numbers(ctx, job, fresh, "round verdict")
                 number, tester = verdict_round(fresh, head)
                 if number is None:
                     # No open round on this head: the server answers (round_not_open
@@ -1616,6 +1664,7 @@ def round_void(ctx, job, opts):
         repair(ctx, job, store, state, meta)
 
         def build(fresh):
+            check_round_numbers(ctx, job, fresh, "round void")
             return fresh.summary["claim_seq"], fresh.snapshot_seq, payload
         outcome = cli_guard(transact)(store, "void", build, state_reader=cli_guard(lambda: ctx.state(job, store)))
     record = outcome.record
