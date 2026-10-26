@@ -10169,6 +10169,9 @@ assert d["state"] == "leased", d
 assert d["recent_event_kinds"].count("job.orphan_release") == 1, d
 assert d["recent_event_kinds"].count("job.reclaim") == 1, d
 '
+  # This case owns its detached sentinel; reap it before returning to the
+  # long suite so it cannot add pressure to the later global teardown.
+  TW_TMP="$ARBITER_INBOX_ROOT" tmp_writers_stop || fail "hk1991 fixture writer did not stop"
 }
 orphan_respawn_1991
 echo "PASS hk1991 orphan-gc-wrk-respawn-without-override"

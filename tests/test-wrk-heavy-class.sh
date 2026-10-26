@@ -155,10 +155,85 @@ import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 start = src.index("heavy_cmd() {")
 half = src[start:src.index('\ncase "${1:-}" in', start)]
-sig = re.findall(r"os\.(?:kill|killpg)\([^)]*\)|\.(?:kill|terminate|send_signal)\(|"
-                 r"import[^\n]*\bsignal\b|from signal\b", half)
-# alive() probes with signal 0; nothing in the heavy path may signal a holder
-assert sig == ["os.kill(pid, 0)"], ("a signal path exists in wrk heavy", sig)
+# hk1991: handlers receive HUP/TERM; no heavy path may signal a holder.
+# Inspect the actual embedded Python, so imports/comments cannot hide a send.
+def signal_allowlist(code):
+    import ast
+    tree = ast.parse(code)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    constants = {"SIGHUP", "SIGTERM", "SIG_DFL", "SIG_IGN"}
+    def constant(node):
+        return (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id == "signal" and node.attr in {"SIGHUP", "SIGTERM"})
+    def target_ok(call, saved):
+        if len(call.args) != 2 or call.keywords:
+            return False
+        first = call.args[0]
+        if constant(first):
+            return True
+        if not isinstance(first, ast.Name):
+            return False
+        parent = call
+        while parent in parents:
+            parent = parents[parent]
+            if not isinstance(parent, ast.For):
+                continue
+            if (isinstance(parent.target, ast.Name) and parent.target.id == first.id
+                    and isinstance(parent.iter, (ast.Tuple, ast.List))
+                    and parent.iter.elts and all(constant(n) for n in parent.iter.elts)):
+                return True
+            iterator = parent.iter
+            if (isinstance(parent.target, ast.Tuple) and parent.target.elts
+                    and isinstance(parent.target.elts[0], ast.Name)
+                    and parent.target.elts[0].id == first.id
+                    and isinstance(iterator, ast.Call) and not iterator.args and not iterator.keywords
+                    and isinstance(iterator.func, ast.Attribute) and iterator.func.attr == "items"
+                    and isinstance(iterator.func.value, ast.Name) and iterator.func.value.id in saved):
+                return True
+        return False
+    registrations = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
+                     and n.func.value.id == "signal" and n.func.attr == "signal"]
+    saved = set()
+    for call in registrations:
+        parent = parents.get(call)
+        if target_ok(call, set()) and isinstance(parent, ast.Assign):
+            for target in parent.targets:
+                if isinstance(target, ast.Subscript) and isinstance(target.value, ast.Name):
+                    saved.add(target.value.id)
+    probes = 0
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            assert all(n.name != "signal" or n.asname in (None, "signal") for n in node.names)
+        if isinstance(node, ast.ImportFrom):
+            assert node.module != "signal", "signal aliases are not allowlisted"
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "signal":
+            assert node.attr in constants | {"signal"}, ("signal attribute not allowlisted", node.attr)
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        func = node.func
+        if isinstance(func.value, ast.Name) and func.value.id == "os" and func.attr == "kill":
+            assert (len(node.args) == 2 and not node.keywords
+                    and isinstance(node.args[1], ast.Constant) and type(node.args[1].value) is int
+                    and node.args[1].value == 0), "heavy path may only probe with literal signal 0"
+            probes += 1
+        else:
+            assert func.attr not in {"killpg", "kill", "terminate", "send_signal"}, "holder-signalling call"
+        if isinstance(func.value, ast.Name) and func.value.id == "signal":
+            assert func.attr == "signal" and target_ok(node, saved), "signal call not allowlisted"
+    assert probes >= 1, "heavy path has no liveness probe"
+
+code = half[half.index("import datetime,"):half.rindex("\nPY")]
+signal_allowlist(code)
+for replacement in ("os.kill(pid, signal.SIGTERM)", "os.killpg(pid, 0)"):
+    assert "os.kill(pid, 0)" in code
+    mutant = code.replace("os.kill(pid, 0)", replacement, 1)
+    try:
+        signal_allowlist(mutant)
+    except AssertionError:
+        pass  # assertion-RED at the real production liveness call site
+    else:
+        raise AssertionError("holder-signalling mutant survived: " + replacement)
 # the waiter record is published by rename, never by open-then-write in place
 assert "os.replace(record_tmp, me_name" in half, \
     "waiter record is not renamed into place"
