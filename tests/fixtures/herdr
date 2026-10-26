@@ -13,6 +13,7 @@ fi
 # `pane run` record the foregrounded kind here; `pane process-info`
 # reports it. Keyed by WRK_RUN_ID (one wrk process = one spawn attempt).
 fixture_foreground_file="${TMPDIR:-/tmp}/wrk-fixture-fg-${WRK_RUN_ID:-standalone}"
+fixture_cwd_file="$fixture_foreground_file.cwd"
 fixture_set_foreground() { printf '%s\n' "$1" >"$fixture_foreground_file"; }
 fixture_foreground() { cat "$fixture_foreground_file" 2>/dev/null || true; }
 
@@ -564,7 +565,8 @@ case "${1:-}" in
         if [[ "$start_kind" == pi ]]; then
           pi_args=("$@")
           while [[ "${pi_args[0]}" != -- ]]; do pi_args=("${pi_args[@]:1}"); done
-          "$(dirname "$0")/pi" "${pi_args[@]:1}" >"$fixture_foreground_file.pi-footer"
+          WRK_PI_CWD="$(cat "$fixture_cwd_file")" \
+            "$(dirname "$0")/pi" "${pi_args[@]:1}" >"$fixture_foreground_file.pi-footer"
         fi
         start_argv="$*"
         agent_line="$start_kind"
@@ -623,6 +625,10 @@ case "${1:-}" in
         # A fresh tab holds a fresh shell — clear any foreground and screen
         # state a same-PID predecessor run left behind.
         rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file"
+        tab_args=("$@")
+        for ((i=0; i+1<${#tab_args[@]}; i++)); do
+          [[ "${tab_args[i]}" != --cwd ]] || printf '%s\n' "${tab_args[i+1]}" >"$fixture_cwd_file"
+        done
         printf '%s\n' '{"result":{"tab_id":"w:t1","root_pane":{"pane_id":"w:p1"}}}'
         ;;
       close)

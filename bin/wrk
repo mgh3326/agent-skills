@@ -1214,20 +1214,55 @@ spawn_herdr_fallback() {
 pi_model_proven() {
   local screen
   screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || return 1
-  # pi 1.4.0 footer.js renders '(provider) model.id • thinking'. Only the
-  # latest stats footer proves the running selection. A CLI echo, prompt,
-  # earlier footer, missing provider or truncated line is not proof.
+  # herdr exposes no model field for pi; pi get_state is RPC-only and cannot
+  # attest this interactive pane. pi 1.4.0 renders its footer immediately
+  # BELOW the editor bottom border: cwd, stats, optional extension status.
+  # Never search the transcript or pasted input for model-looking text.
+  # Unknown/custom layouts, missing provider and truncated lines fail closed.
   printf '%s' "$screen" | python3 -c '
-import re, sys
-expected, effort = sys.argv[1:]
-screen = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", sys.stdin.read())
-footers = [line.strip() for line in screen.splitlines()
-           if re.match(r"^.*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+", line.strip())]
+import os, re, sys
+expected, effort, cwd, home, prompt = sys.argv[1:]
+def clean(text):
+    return [line.rstrip() for line in
+            re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).splitlines()]
+lines = clean(sys.stdin.read())
+while lines and not lines[-1]:
+    lines.pop()
+bottoms = [i for i, line in enumerate(lines)
+           if re.fullmatch(r"─{3,}|─+ ↓ \d+ more ─+", line)]
+if not bottoms:
+    sys.exit(1)
+bottom = bottoms[-1]
+tops = [i for i in range(bottom)
+        if re.fullmatch(r"──(?:.*─)?", lines[i])]
+if not tops or bottom - tops[-1] < 2:
+    sys.exit(1)
+footer = lines[bottom + 1:]
+if len(footer) not in (2, 3):
+    sys.exit(1)
+# A pasted imitation of the entire editor/footer is still untrusted. If
+# that same frame occurs in our brief, its provenance is ambiguous: refuse.
+with open(prompt) as brief:
+    injected = "\n".join(clean(brief.read()))
+if "\n".join(lines[tops[-1]:]) in injected:
+    sys.exit(1)
+# footer.js may abbreviate HOME and append a branch/session name. Checking
+# the launch cwd also prevents an arbitrary post-editor stats row proving it.
+paths = {cwd, os.path.realpath(cwd)}
+for path in list(paths):
+    if path == home:
+        paths.add("~")
+    elif path.startswith(home.rstrip("/") + "/"):
+        paths.add("~" + path[len(home):])
+pwd_pattern = (r"(?:" + "|".join(re.escape(p) for p in paths) +
+               r")(?: \([^\r\n]*\))?(?: • [^\r\n]+)?")
+if not re.fullmatch(pwd_pattern, footer[0]):
+    sys.exit(1)
 provider, model = expected.split("/", 1)
-pattern = (r"^.*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(provider) +
+pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(provider) +
            r"\) " + re.escape(model) + r" • " + re.escape(effort) + r"$")
-sys.exit(0 if footers and re.fullmatch(pattern, footers[-1]) else 1)
-' "$PROFILE_MODEL" "$PI_THINKING"
+sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
+' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
 
 # spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not

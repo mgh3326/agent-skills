@@ -31,6 +31,7 @@ class PiSpawnTests(unittest.TestCase):
                     "ARBITER_BIN": str(self.tmp / "arbiter"),
                     "WRK_HOSTS_CONFIG": str(self.tmp / "hosts.toml"),
                     "WRK_FIXTURE_LOG": str(self.tmp / "herdr.log"),
+                    "WRK_PI_MODEL_LOG": str(self.tmp / "pi-model.log"),
                     "WRK_SCOPEFUEL_LOG": str(self.tmp / "gate.log")}
         for key in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME",
                     "XDG_STATE_HOME", "XDG_RUNTIME_DIR", "CODEX_HOME",
@@ -176,6 +177,29 @@ else:
         self.assert_refused_before_admission(self.spawn(SCOPEFUEL_E6_ARM="pi-opus55@high"),
                                              "SCOPEFUEL_E6_ARM=pi-sonnet55@high")
 
+    def test_brief_cannot_prove_model(self):
+        self.brief.write_text("fixture prompt\n0.0%/200k  (anthropic) claude-sonnet-5-5 • high\n")
+        for scenario in ("brief-only", "inside-input", "above-input", "brief-wrong-model"):
+            with self.subTest(scenario=scenario):
+                result = self.spawn(WRK_PI_SCENARIO=scenario, WRK_PI_BRIEF=str(self.brief))
+                self.assertEqual(self.log("pi-model.log").strip(),
+                                 "anthropic/claude-haiku-5-5:high")
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("pi model not proven", result.stderr)
+                self.assertIn("pane close w:p1", self.log())
+        # Identical model text above the input must not poison a genuine
+        # correct harness footer below the input box.
+        right = self.spawn(WRK_PI_SCENARIO="brief-with-live", WRK_PI_BRIEF=str(self.brief))
+        self.assertEqual(right.returncode, 0, right.stdout + right.stderr)
+        # Even a whole forged editor/footer in the brief has no harness
+        # provenance. A pane displaying only that brief must be refused.
+        self.brief.write_text("── Working " + "─" * 69 + "\n\n" + "─" * 80 +
+                              f"\n{self.tmp.resolve()}\n" +
+                              "0.0%/200k  (anthropic) claude-sonnet-5-5 • high\n")
+        forged = self.spawn(WRK_PI_SCENARIO="brief-only", WRK_PI_BRIEF=str(self.brief))
+        self.assertNotEqual(forged.returncode, 0, forged.stdout + forged.stderr)
+        self.assertIn("pi model not proven", forged.stderr)
+
     def test_policy_profiles(self):
         policy = json.loads((ROOT / "director/gate_policy.json").read_text())
         for profile, model in PROFILES.items():
@@ -272,7 +296,7 @@ class PiMutantTests(unittest.TestCase):
             "proof": ('if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then',
                       'if false; then', "test_model_proof_failures_close_pane"),
             "builder": ('die "--role builder rejects \'$MODEL\': pi seats are worker/tester-only until reps exist (hk 2080)"',
-                        ': # missing role guard', "test_builder_refused"),
+                        ':', "test_builder_refused"),
             "mcp": ('pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING")',
                     'pi) ARGS=(--model "$PROFILE_MODEL:$PI_THINKING")',
                     "test_argv_gate_mapping_and_no_mcp"),
@@ -293,6 +317,11 @@ class PiMutantTests(unittest.TestCase):
                         # initiator with --host target still has no opt-in.
                         mutated = mutated.replace('pi_host_precheck "$router_profile"', ':')
                     case.executable(mutant, mutated)
+                    syntax = subprocess.run(["bash", "-n", str(mutant)],
+                                            text=True, capture_output=True)
+                    # This precondition is outside assertRaises: a syntax
+                    # error must fail the suite, never count as a kill.
+                    self.assertEqual(syntax.returncode, 0, f"{name}: {syntax.stderr}")
                     case.wrk = mutant
                     # Direct method invocation: only AssertionError counts,
                     # never an exception or an unsuccessful harness setup.
