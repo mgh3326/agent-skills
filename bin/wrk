@@ -168,12 +168,13 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
+Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
             [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
   wrk done JOB [--report PATH]
+  wrk restore JOB
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
   wrk round open JOB --head SHA [--extend REF] [--repo PATH]
@@ -5666,6 +5667,249 @@ done_cmd() {
   echo "OK job=$job report=$report$relay_suffix"
 }
 
+restore_help() {
+  cat <<'USAGE'
+Usage: wrk restore JOB
+
+Restore a released job onto its own live pane in one step. This is the
+supported way to reverse a false loss on a live pane: a job whose sentinel
+recorded job.lost and job.revoked while its herdr pane kept running. Nothing
+changes unless every check passes.
+
+Checks, in order. The first that fails is named (check=NAME on stderr):
+  state         arbiter job-get reports state=released
+  receipt       the newest job.spawned receipt has pane_id, label and tab_id
+  claim         the first job.claim has the owner lane, T level, role and
+                agent label that the reclaim needs
+  herdr-pane    herdr lists that pane as exactly one agent
+  herdr-tab     that agent is in the receipt's tab
+  herdr-status  that agent's status is not unknown or gone
+  herdr-name    that agent's name equals the receipt's label
+
+When every check passes, wrk runs arbiter claim --reclaim-released with the
+first job.claim's fields: owner lane, T level, role and agent label always;
+parent lane, task id, task link override and task inheritance when the claim
+has them. Then it copies the newest job.spawned receipt back as one job.spawned
+event, so the reclaim is no longer newer than its receipt and the watch reads
+as current again. The copy keeps the receipt's payload; arbiter stores payloads
+with sorted keys.
+
+Restore records no quota row (the revoke already released it). After the receipt
+copy it starts one completion sentinel for the job, the same way spawn does, so
+a pane that dies after the checks is recorded as job.lost by that sentinel. The
+sentinel then leaves after the lost grace without ending the revived job; wrk
+prune declares the end (job.revoked) and releases the job's quota row, once the
+pane is absent and the job is stale. A live
+sentinel for the job that already watches this pane, proven by its pidfile and
+argv, is kept, and no second one starts.
+
+It does not look at the job's terminal kind: a completed, joined or handed-off
+job whose pane still passes the checks is revived the same way and is live work
+again until wrk done runs. The herdr checks are a snapshot taken just before the
+reclaim; the sentinel is what watches the pane after it. A completion sentinel
+still running for the job can read the reclaim as superseded and exit before the
+receipt lands.
+
+Exit codes: 0 restored. 2 refused before any write, nothing changed. 1 the
+reclaim landed but the receipt write failed; the one stderr line then names the
+exact arbiter event command that completes the restore. Run that command, and
+do not run the claim again. Or the receipt landed but no sentinel started; the
+stderr line says so, and the job is unwatched until one is started.
+
+Options:
+  -h, --help         show this usage
+USAGE
+}
+
+# The restore planner reads the job's own events, in wrk's event order. It
+# prints NUL-separated items: REFUSE check detail, or OK pane label tab owner
+# receipt followed by the reclaim arguments. The receipt JSON is ASCII-only, so
+# it can never carry a NUL into argv.
+RESTORE_PLAN_PY='
+import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+
+ROLES = ("worker", "builder", "captain")
+docs = [doc for _, doc, _ in wrk_events_ordered(sys.argv[1]) if doc is not None]
+
+
+def emit(*items):
+    sys.stdout.write("".join(item + "\0" for item in items))
+    raise SystemExit(0)
+
+
+def kind_of(doc):
+    return doc.get("kind") or doc.get("type") or doc.get("event") or ""
+
+
+def payload_of(doc):
+    payload = doc.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def text(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+spawned = [doc for doc in docs if kind_of(doc) == "job.spawned"]
+if not spawned:
+    emit("REFUSE", "receipt", "no job.spawned receipt")
+receipt = payload_of(spawned[-1])  # hk1933-newest-receipt
+if not (text(receipt.get("pane_id")) and text(receipt.get("label")) and text(receipt.get("tab_id"))):
+    emit("REFUSE", "receipt", "the newest job.spawned receipt lacks pane_id, label or tab_id")
+claims = [doc for doc in docs if kind_of(doc) == "job.claim"]
+if not claims:
+    emit("REFUSE", "claim", "no job.claim event to take the reclaim fields from")
+claim = payload_of(claims[0])
+if not (text(claim.get("owner_lane")) and text(claim.get("t_level")) and text(claim.get("agent_label"))):
+    emit("REFUSE", "claim", "the first job.claim lacks owner_lane, t_level or agent_label")
+if claim.get("role") not in ROLES:
+    emit("REFUSE", "claim", "the first job.claim has no usable role")
+argv = ["--lane", claim["owner_lane"], "--t", claim["t_level"], "--role", claim["role"],
+        "--agent-label", claim["agent_label"]]
+if text(claim.get("parent_lane")):
+    argv += ["--parent-lane", claim["parent_lane"]]
+if claim.get("task_id") is not None:
+    if isinstance(claim["task_id"], bool) or not isinstance(claim["task_id"], (int, str)):
+        emit("REFUSE", "claim", "the first job.claim task_id is neither an integer nor a string")
+    argv += ["--task-id", str(claim["task_id"])]
+for key, flag in (("task_link_override", "--task-link-override"), ("task_inherited_from", "--task-inherited-from")):
+    if claim.get(key) is not None:
+        if not isinstance(claim[key], str):
+            emit("REFUSE", "claim", "the first job.claim %s is not a string" % key)
+        argv += [flag, claim[key]]
+receipt_json = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+emit("OK", receipt["pane_id"], receipt["label"], receipt["tab_id"], claim["owner_lane"], receipt_json, *argv)
+'
+
+# The herdr check reads `herdr agent list` on stdin and prints one line: OK, or
+# REFUSE<TAB>check<TAB>detail for the first check that fails.
+RESTORE_HERDR_PY='
+import json, sys
+pane, tab, label = sys.argv[1:4]
+
+
+def refuse(check, detail):
+    sys.stdout.write("REFUSE\t%s\t%s\n" % (check, detail))
+    raise SystemExit(0)
+
+
+try:
+    document = json.load(sys.stdin)
+except ValueError:
+    refuse("herdr-pane", "herdr agent list did not answer with JSON")
+result = document.get("result", document) if isinstance(document, dict) else {}
+agents = result.get("agents") if isinstance(result, dict) else None
+if not isinstance(agents, list):
+    refuse("herdr-pane", "herdr agent list has no agents array")
+matches = [a for a in agents if isinstance(a, dict) and a.get("pane_id") == pane]
+if len(matches) != 1: refuse("herdr-pane", "herdr does not report pane %s as exactly one agent" % pane)  # hk1933-pane-reported
+agent = matches[0]
+if agent.get("tab_id") != tab:
+    refuse("herdr-tab", "pane %s is in tab %s, not the receipt tab %s" % (pane, agent.get("tab_id"), tab))
+status = agent.get("agent_status")
+if not isinstance(status, str) or status.strip() in ("", "unknown", "gone"):
+    refuse("herdr-status", "pane %s reports agent status %s" % (pane, status))
+if agent.get("name") != label:
+    refuse("herdr-name", "herdr agent name for pane %s is %s, not the receipt label %s" % (pane, agent.get("name"), label))
+sys.stdout.write("OK\n")
+'
+
+restore_refuse() {
+  echo "wrk: restore refused job=$1 check=$2: $3; nothing was changed" >&2
+}
+
+restore_quote() {
+  python3 -c 'import shlex, sys; print(" ".join(shlex.quote(word) for word in sys.argv[1:]))' "$@"
+}
+
+restore_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+    restore_help
+    return 0
+  fi
+  local job="${1:-}" arb events state item herdr_out pane label tab owner receipt verdict check detail cmd rc
+  local -a plan=() reclaim=()
+  [[ -n "$job" && "$job" != -* ]] || die "restore requires a job id"
+  shift || true
+  [[ $# -eq 0 ]] || die "unexpected argument '$1'"
+  arb="${ARBITER:-}"
+  if [[ -z "$arb" || ! -x "$arb" ]]; then
+    arb="$(command -v arbiter 2>/dev/null || true)"
+  fi
+  [[ -n "$arb" && -x "$arb" ]] || die "restore needs the arbiter binary (ARBITER_BIN or arbiter on PATH)"
+  events="$(wrk_jobs_root)/$job/events"
+
+  # Check 1, state: the arbiter must read the job as released. An unreadable
+  # record refuses too, so the check never passes on a guess.
+  state="$("$arb" job-get --job "$job" --json 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin).get("state", ""))' 2>/dev/null || true)"
+  if [[ "$state" != released ]]; then
+    restore_refuse "$job" state "arbiter state is '${state:-unreadable}', not released"
+    return 2
+  fi
+
+  # Check 2, receipt: the newest receipt and the first claim, from the job's own
+  # events. The planner refuses with the check it failed.
+  while IFS= read -r -d '' item; do plan+=("$item"); done < <(wrk_py -c "$RESTORE_PLAN_PY" "$events" 2>/dev/null)
+  if [[ "${plan[0]:-}" != OK ]]; then
+    restore_refuse "$job" "${plan[1]:-receipt}" "${plan[2]:-the job events could not be read}"
+    return 2
+  fi
+  pane="${plan[1]}"
+  label="${plan[2]}"
+  tab="${plan[3]}"
+  owner="${plan[4]}"
+  receipt="${plan[5]}"
+  reclaim=("${plan[@]:6}")
+
+  # Checks 3 to 6: herdr must list the receipt's pane as one agent, in the
+  # receipt's tab, with a live status, under the receipt's label.
+  rc=0
+  herdr_out="$("$HERDR" agent list 2>/dev/null)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    restore_refuse "$job" herdr-pane "herdr agent list failed (exit $rc)"
+    return 2
+  fi
+  verdict="$(printf '%s\n' "$herdr_out" | python3 -c "$RESTORE_HERDR_PY" "$pane" "$tab" "$label" 2>/dev/null || true)"
+  if [[ "$verdict" != OK ]]; then
+    IFS=$'\t' read -r _ check detail <<<"$verdict" || true
+    restore_refuse "$job" "${check:-herdr-pane}" "${detail:-herdr answer could not be read}"
+    return 2
+  fi
+
+  # The reclaim. A failure here wrote nothing, so the caller may fix the cause
+  # and run restore again.
+  rc=0
+  "$arb" claim --reclaim-released --job "$job" "${reclaim[@]}" >/dev/null || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: restore job=$job: arbiter reclaim refused (exit $rc); nothing was written" >&2
+    return 2
+  fi
+
+  # The receipt copy. A reclaim without this receipt reads as a respawn in
+  # flight, so a failed write must never be retried as a second reclaim.
+  rc=0
+  "$arb" event --job "$job" --kind job.spawned --payload-json "$receipt" >/dev/null 2>&1 || rc=$? # hk1933-restore-receipt
+  if [[ "$rc" -ne 0 ]]; then
+    cmd="$(restore_quote "$arb" event --job "$job" --kind job.spawned --payload-json "$receipt")"
+    echo "wrk: restore job=$job: reclaimed, but the job.spawned receipt write failed (exit $rc); complete the restore with: $cmd" >&2
+    return 1
+  fi
+  # The restored job gets the watcher a spawn gives it, so a pane that dies after
+  # the checks above is recorded as lost by that sentinel. start_completion_sentinel
+  # keeps a live sentinel that its pidfile and argv tie to this job and pane, and
+  # starts none in that case.
+  rc=0
+  start_completion_sentinel "$(wrk_jobs_root)/$job/completion-sentinel.pid" "$job" "$owner" "$label" "$pane" "" "" "" "" "" || rc=$? # hk1933-restore-sentinel
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: restore job=$job: restored, but its completion sentinel did not start; the job is unwatched" >&2
+    return 1
+  fi
+  echo "OK job=$job restored pane=$pane tab=$tab label=$label"
+}
+
 builder_flat_event() {
   local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}" waiver_issuer="${13:-}" check_parent="${14:-}" check_task="${15:-}" check_version="${16:-}"
   local events host="${HOSTNAME:-unknown}" last
@@ -5940,13 +6184,17 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       Before opening, wrk checks HEAD^{commit} in the repo from the newest
       job.claim/job.reclaim repo, worktree or cwd field. If none is usable,
       pass --repo PATH. A missing commit triggers one bounded fetch of origin.
-  wrk round verdict JOB --file PATH
+  wrk round verdict JOB --file PATH [--head-repeat REF]
       Record the tester's verdict file. It binds to the oldest open round on its own head and is refused when there is none.
       PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
       The record stores that file's content sha256 beside its path. A later
       verdict is refused when the path, those exact bytes, or that head was
       already recorded for this job. A repeated head is allowed only when
-      the round that held the earlier verdict was voided.
+      the round that held the earlier verdict was voided, or when --head-repeat REF
+      (hk:doc/<key> or hk:task/<id>) names an approval record with the grant line
+      'head-repeat: job=JOB head=SHA round=N by=ISSUER' for that head and the round
+      it binds to; a grant is used once per job and never releases the path or
+      content identity.
   wrk round status JOB
       Print one line: job=… rounds=N cap=N open=… last_verdict=… and any
       voided rounds as 'round N void (hk:doc/…)' or 'round N void (hk:task/…)'.
@@ -6113,14 +6361,15 @@ round_approval_fetch() {
 
 # Verify a fetched round approval record for the grant type and optional round.
 # Args: ref, job, parent lane, operators, trusted parent lanes (both space
-# separated), record file, grant type (default round-extension), round number.
+# separated), record file, grant type (default round-extension), round number,
+# head (head-repeat only: the verdict head the grant line must name).
 # Prints "granted=<N> issuer=<name>" — nothing else — on success.
 round_approval_verify() {
   local ref="$1" job="$2" parent="$3" operators="$4" parent_issuers="$5" record="$6"
-  local grant_kind="${7:-round-extension}" round_number="${8:-}"
-  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" "$grant_kind" "$round_number" <<'PY'
+  local grant_kind="${7:-round-extension}" round_number="${8:-}" head_sha="${9:-}"
+  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" "$grant_kind" "$round_number" "$head_sha" <<'PY'
 import json, re, sys
-ref, job, parent, operators, parent_issuers, path, grant_kind, round_number = sys.argv[1:]
+ref, job, parent, operators, parent_issuers, path, grant_kind, round_number, head_sha = sys.argv[1:]
 ops = set(operators.split())
 trusted_parents = set(parent_issuers.split())
 try:
@@ -6134,13 +6383,15 @@ except ValueError:
     raise SystemExit(1)
 # Each grant type has one canonical line form; whitespace variants are
 # malformed and rejected. The identity and parent-lane checks below are
-# shared by round extensions, voids and join waivers.
+# shared by round extensions, voids, join waivers and head repeats.
 if grant_kind == "round-extension":
     GRANT = re.compile(r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
 elif grant_kind == "round-void":
     GRANT = re.compile(r"^round-void: job=(\S+) round=(\d+) by=(\S+)$")
 elif grant_kind == "join-waiver":
     GRANT = re.compile(r"^join-waiver: job=(\S+) by=(\S+)$")
+elif grant_kind == "head-repeat":
+    GRANT = re.compile(r"^head-repeat: job=(\S+) head=([0-9a-f]{40}) round=([1-9][0-9]*) by=(\S+)$")
 else:
     raise SystemExit(1)
 # The issuer written into the grant line must equal the record's server-set
@@ -6169,6 +6420,11 @@ for identity, body in sources:
             continue
         if grant_kind == "join-waiver":
             amount, issuer = 1, m.group(2)
+        elif grant_kind == "head-repeat":
+            # The line must name this verdict's head and the round it binds to.
+            if m.group(2) != head_sha or m.group(3) != round_number:
+                continue
+            amount, issuer = 1, m.group(4)
         else:
             amount, issuer = int(m.group(2)), m.group(3)
         if (grant_kind == "round-extension" and amount < 1) or (
@@ -6578,27 +6834,14 @@ PY
   esac
 }
 
-round_verdict_cmd() {
-  local job="${1:-}" file="" metadata owner label pane parent role
-  [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
-  shift || true
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --file) [[ $# -ge 2 && -n "$2" ]] || die "--file requires a path"; file="$2"; shift 2 ;;
-      *) die "unknown round verdict option '$1'" ;;
-    esac
-  done
-  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
-  wrk_trust_guard
-  metadata="$(builder_metadata "$job" trusted)"
-  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
-  local outcome rc=0
-  set +e
-  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" <<'PY'
+# round_verdict_decide: the verdict decision, run under the events lock. Mode plan reports
+# the identity refusals and the round the verdict would bind to, and writes nothing. Mode
+# commit records the verdict. The grant arguments are empty unless --head-repeat was given.
+round_verdict_decide() { # events job owner label pane parent file mode grant_ref grant_issuer grant_round
+  wrk_py - "$@" <<'PY'
 import fcntl, hashlib, io, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, vfile = sys.argv[1:]
+events, job, owner, label, pane, parent, vfile, mode, grant_ref, grant_issuer, grant_round = sys.argv[1:]
 os.makedirs(events, exist_ok=True)
 verdict = vsha = None
 matches = []
@@ -6692,8 +6935,14 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     if digest in digests:  # hk1449-content-sha
         print("DUP_CONTENT\t%s\t%s" % (content_hit, digest))
         raise SystemExit(0)
-    if head_hit:
-        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+    # A grant is used once per job and binds only a repeated head. Both checks run
+    # before the target round, so a refusal here never fetches or writes anything.
+    head_repeat_used = bool(grant_ref) and any(v.get("head_repeat") == grant_ref for v in verdicts)
+    if head_repeat_used:
+        print("HEAD_REPEAT_USED\t%s" % grant_ref)
+        raise SystemExit(0)
+    if grant_ref and not head_hit:
+        print("HEAD_REPEAT_NOT_NEEDED\t%s" % vsha)
         raise SystemExit(0)
     open_rounds = [r for r in rounds
                    if (isinstance(r.get("round"), int) and r.get("round") not in bound
@@ -6706,6 +6955,12 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                 and round_head.lower() == vsha):  # hk1506-head-bind
             target = r["round"]
             break
+    if head_hit and (not grant_ref or target is None):
+        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+        raise SystemExit(0)
+    if mode == "plan":
+        print("PLAN_BIND\t%s\t%s" % (vsha, target))
+        raise SystemExit(0)
     if target is None:
         if open_rounds:
             labels = []
@@ -6722,6 +6977,9 @@ with open(lock_path, "w", encoding="utf-8") as lock:
         else:
             print("NO_OPEN_ROUND\t%s" % vsha)
         raise SystemExit(0)
+    if grant_ref and str(target) != grant_round:
+        print("HEAD_REPEAT_MOVED\t%s\t%s" % (grant_round, target))
+        raise SystemExit(0)
     used = sum(1 for r in rounds
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
@@ -6730,14 +6988,83 @@ with open(lock_path, "w", encoding="utf-8") as lock:
               "label": label, "pane_id": pane, "parent_lane": parent,
               "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
               "content_sha256": digest, "round": target, "epoch": 1}
+    if grant_ref:
+        record["head_repeat"] = grant_ref
+        record["head_repeat_issuer"] = grant_issuer
     wrk_event_commit(events, "job.verdict", record)
     print("RECORDED round=%s verdict=%s head=%s used=%d" %
           (target, verdict, vsha, used))
 PY
-)"
-  rc=$?
-  set -e
-  [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+}
+
+round_verdict_cmd() {
+  local job="${1:-}" file="" head_repeat="" metadata owner label pane parent role
+  [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file) [[ $# -ge 2 && -n "$2" ]] || die "--file requires a path"; file="$2"; shift 2 ;;
+      --head-repeat) [[ $# -ge 2 && -n "$2" ]] || die "--head-repeat requires a hk:doc/<key> or hk:task/<id> ref"; head_repeat="$2"; shift 2 ;;
+      *) die "unknown round verdict option '$1'" ;;
+    esac
+  done
+  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
+  if [[ -n "$head_repeat" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
+  metadata="$(builder_metadata "$job" trusted)"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  local events="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events"
+  local outcome rc=0 run_commit=1 grant_issuer="" bind_head="" bind_round=""
+  if [[ -n "$head_repeat" ]]; then
+    # The plan run reads the events under the lock and writes nothing. It refuses the
+    # identity cases and reports the round this verdict would bind to, so the grant is
+    # fetched and checked against that round before anything is recorded.
+    set +e
+    outcome="$(round_verdict_decide "$events" "$job" "$owner" "$label" "$pane" "$parent" "$file" plan "$head_repeat" "" "")"
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+    if [[ "$outcome" == PLAN_BIND$'\t'* ]]; then
+      IFS=$'\t' read -r _ bind_head bind_round <<<"$outcome"
+      local tmp_approval grant_line
+      tmp_approval="$(mktemp)"
+      if ! round_approval_fetch "$head_repeat" >"$tmp_approval"; then
+        rm -f "$tmp_approval"
+        die "round verdict: head-repeat record not found in handoffkeep: $head_repeat"
+      fi
+      grant_line="$(round_approval_verify "$head_repeat" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_approval" head-repeat "$bind_round" "$bind_head" || true)"  # hk1970-head-repeat
+      rm -f "$tmp_approval"
+      [[ -n "$grant_line" ]] ||
+        die "round verdict: $head_repeat has no 'head-repeat: job=$job head=$bind_head round=$bind_round by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
+      grant_issuer="${grant_line##*issuer=}"
+      # A pa-integrator grant counts only on ParkingArcade work, checked on the server.
+      if [[ "$grant_issuer" == "pa-integrator" ]]; then
+        local task_id tmp_task
+        task_id="$(round_job_task_id "$job" || true)"
+        [[ -n "$task_id" ]] ||
+          die "round verdict --head-repeat: pa-integrator grants need the job's hk task on the server; $job records no task_id"
+        tmp_task="$(mktemp)"
+        if ! round_pa_task_fetch "$task_id" >"$tmp_task"; then
+          rm -f "$tmp_task"
+          die "round verdict --head-repeat: pa-integrator grants need the job's hk task on the server; cannot fetch task $task_id"
+        fi
+        if ! round_pa_task_verify "$job" "$tmp_task"; then
+          rm -f "$tmp_task"
+          die "round verdict --head-repeat: pa-integrator grants count only when the server task for $job is project ParkingArcade with refs.job_id=$job"
+        fi
+        rm -f "$tmp_task"
+      fi
+    else
+      run_commit=0
+    fi
+  fi
+  if [[ "$run_commit" -eq 1 ]]; then
+    set +e
+    outcome="$(round_verdict_decide "$events" "$job" "$owner" "$label" "$pane" "$parent" "$file" commit "$head_repeat" "$grant_issuer" "$bind_round")"
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+  fi
   case "$outcome" in
     NO_VERDICT)
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
@@ -6745,6 +7072,18 @@ PY
       die "round verdict --file has more than one VERDICT line: $file" ;;
     ENDED$'\t'*|DUP_PATH$'\t'*|DUP_CONTENT$'\t'*|DUP_HEAD$'\t'*)
       wrk_verdict_refusal "$outcome" ;;
+    HEAD_REPEAT_USED$'\t'*)
+      local used_ref
+      IFS=$'\t' read -r _ used_ref <<<"$outcome"
+      die "round verdict: head_repeat_used $used_ref: already recorded on a job.verdict of $job" ;;
+    HEAD_REPEAT_NOT_NEEDED$'\t'*)
+      local idle_head
+      IFS=$'\t' read -r _ idle_head <<<"$outcome"
+      die "round verdict: head_repeat_not_needed: head $idle_head has no earlier job.verdict on $job; drop --head-repeat" ;;
+    HEAD_REPEAT_MOVED$'\t'*)
+      local moved_from moved_to
+      IFS=$'\t' read -r _ moved_from moved_to <<<"$outcome"
+      die "round verdict: head_repeat_round_moved: the grant names round $moved_from but the head now binds to round $moved_to; retry" ;;
     NO_HEAD_ROUND$'\t'*)
       local no_head_v no_open_list
       IFS=$'\t' read -r _ no_head_v no_open_list <<<"$outcome"
@@ -13949,6 +14288,7 @@ case "${1:-}" in
   -h|--help) usage ;;
   spawn) shift; spawn_router_cmd "$@" ;;
   done) shift; done_cmd "$@" ;;
+  restore) shift; restore_cmd "$@" ;;
   escalate) shift; escalate_cmd "$@" ;;
   joined) shift; joined_cmd "$@" ;;
   round) shift; round_cmd "$@" ;;
