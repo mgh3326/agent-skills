@@ -259,47 +259,106 @@ def check_summary(summary, job):
     return summary
 
 
+DATETIME_RE = re.compile(r"^(\d{4})-(\d{2})-(\d{2})[Tt](\d{2}):(\d{2}):(\d{2})(\.\d+)?([Zz]|[+-](\d{2}):(\d{2}))$")
+URI_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.-]*:[^\x00-\x20\x7f]*$")
+HOSTS = ("desktop", "mac-dev", "mac-work", "rpi", "mac-personal")
+
+
+def _datetime(value):
+    """RFC 3339 date-time (the schema's format), with its field ranges."""
+    match = isinstance(value, str) and DATETIME_RE.match(value)
+    if not match:
+        return False
+    year, month, day, hour, minute, second = (int(match.group(i)) for i in range(1, 7))
+    try:
+        datetime.date(year, month, day)
+    except ValueError:
+        return False
+    if match.group(9) is not None and (int(match.group(9)) > 23 or int(match.group(10)) > 59):
+        return False
+    return hour <= 23 and minute <= 59 and second <= 60
+
+
+def _text(value, low, high):
+    return isinstance(value, str) and low <= len(value) <= high
+
+
+def _match(pattern):
+    return lambda v: isinstance(v, str) and pattern.match(v) is not None
+
+
+def _opt(check):
+    return lambda v: v is None or check(v)
+
+
+def _int_from(low):
+    return lambda v: _int(v, low)
+
+
+def _enum(*values):
+    return lambda v: any(v == x and type(v) is type(x) for x in values)
+
+
+def _list_of(check):
+    return lambda v: isinstance(v, list) and all(check(item) for item in v)
+
+
+_SEQ = _int_from(1)
+_COUNT = _int_from(0)
+_HEX64 = _match(HEX64_RE)
+_HEAD = _match(HEAD_RE)
+_JOB = _match(JOB_RE)
+_LANE = _match(LANE_RE)
+_CODE = _match(CODE_RE)
+
+
+def _review_of(value):
+    return value is None or (isinstance(value, dict) and set(value) == {"job_id", "round_no"}
+                             and _JOB(value["job_id"]) and _SEQ(value["round_no"]))
+
+
+# Every Payload_<kind> constraint of the contract schema (types, patterns,
+# enums, bounds, nullability, formats), field by field: a success reply whose
+# payload breaks one is protocol_invalid, never a receipt (6b).
+PAYLOAD_SCHEMA = {
+    "claim": {"job_id": _JOB, "owner_lane": _LANE, "parent_lane": _LANE, "task_id": _SEQ,
+              "host_client_id": _enum(*HOSTS), "role": _enum("builder", "worker", *REVIEW_ROLES),
+              "tier": _enum("T0", "T1", "T2", "T3"), "review_of": _review_of, "predecessor_job_id": _opt(_JOB),
+              "supersedes": _opt(_SEQ), "policy_sha256": _HEX64, "created_at": _datetime},
+    "activate": {"baseline_used": _COUNT, "mode": _enum("enforced"), "reason_code": _CODE, "seal_seq": _opt(_SEQ)},
+    "round_open": {"round_no": _SEQ, "head": _HEAD, "tester_job_id": _opt(_JOB),
+                   "extension_grant_seq": _opt(_SEQ), "repeat_grant_seq": _opt(_SEQ)},
+    "verdict": {"round_no": _SEQ, "head": _HEAD, "verdict": _enum("PASS", "BLOCKER"),
+                "path": lambda v: _text(v, 1, 4096), "content_sha256": _HEX64, "tester_job_id": _opt(_JOB),
+                "size_bytes": _SEQ},
+    "void": {"round_no": _SEQ, "grant_seq": _SEQ, "reason_code": _CODE},
+    "joined": {"head": _HEAD, "pr": lambda v: _text(v, 1, 4096) and URI_RE.match(v) is not None,
+               "report_sha256": _HEX64, "report_size_bytes": _SEQ, "verdict_seqs": _list_of(_SEQ),
+               "waiver_grant_seq": _opt(_SEQ)},
+    "completed": {"report_sha256": _HEX64, "report_size_bytes": _SEQ, "warnings": _list_of(_CODE)},
+    "grant": {"grant_type": _enum("extension", "void", "head_repeat", "join_waiver"), "round_no": _opt(_SEQ),
+              "head": _opt(_HEAD), "extra": _enum(0, 1), "earlier_round_no": _opt(_SEQ),
+              "tester_job_id": _opt(_JOB), "expires_at": _datetime, "reason_code": _CODE},
+    "grant_cancel": {"grant_seq": _SEQ, "reason_code": _CODE},
+    "end": {"end_type": _enum("revoked", "reaped", "handed_off"), "reason_code": _CODE},
+    "import": {"source_locator": lambda v: _text(v, 1, 4096), "source_sha256": _HEX64,
+               "original_actor_client_id": _opt(_JOB), "original_at": _opt(_datetime),
+               "legacy_kind": lambda v: _text(v, 1, 64)},
+    "import_begin": {"reason_code": _CODE, "shadow_cutoff_seq": _SEQ},
+    "import_seal": {"begin_seq": _SEQ, "expected_import_count": _COUNT, "manifest_sha256": _HEX64,
+                    "reason_code": _CODE, "shadow_cutoff_seq": _SEQ, "baseline_used": _COUNT,
+                    "numbering_floor": _COUNT},
+}
+
+
 def check_payload(kind, payload):
     _need(isinstance(payload, dict) and set(payload) == PAYLOAD_KEYS[kind])
-    if kind == "claim":
-        _need(isinstance(payload["job_id"], str) and JOB_RE.match(payload["job_id"]))
-        _need(payload["role"] in ("builder", "worker") + REVIEW_ROLES)
-        _need(_int(payload["task_id"], 1) and payload["tier"] in ("T0", "T1", "T2", "T3"))
-        _need(isinstance(payload["owner_lane"], str) and isinstance(payload["parent_lane"], str))
-        _need(isinstance(payload["host_client_id"], str))
-        review = payload["review_of"]
-        _need(review is None or (isinstance(review, dict) and set(review) == {"job_id", "round_no"}
-                                 and _opt_job(review["job_id"]) and _int(review["round_no"], 1)))
-    elif kind == "round_open":
-        _need(_int(payload["round_no"], 1) and isinstance(payload["head"], str) and HEAD_RE.match(payload["head"]))
-        _need(_opt_job(payload["tester_job_id"]))
-        _need(_opt_int(payload["extension_grant_seq"]) and _opt_int(payload["repeat_grant_seq"]))
-    elif kind == "verdict":
-        _need(_int(payload["round_no"], 1) and isinstance(payload["head"], str) and HEAD_RE.match(payload["head"]))
-        _need(payload["verdict"] in ("PASS", "BLOCKER") and isinstance(payload["path"], str))
-        _need(isinstance(payload["content_sha256"], str) and HEX64_RE.match(payload["content_sha256"]))
-        _need(_int(payload["size_bytes"], 1) and _opt_job(payload["tester_job_id"]))
-    elif kind == "void":
-        _need(_int(payload["round_no"], 1) and _int(payload["grant_seq"], 1))
-    elif kind == "grant":
-        _need(payload["grant_type"] in ("extension", "void", "head_repeat", "join_waiver"))
-        _need(_opt_int(payload["round_no"]) and _opt_int(payload["earlier_round_no"]))
-        _need(payload["head"] is None or (isinstance(payload["head"], str) and HEAD_RE.match(payload["head"])))
-        _need(_opt_job(payload["tester_job_id"]))
-    elif kind == "joined":
-        _need(isinstance(payload["verdict_seqs"], list) and all(_int(n, 1) for n in payload["verdict_seqs"]))
-        _need(_opt_int(payload["waiver_grant_seq"]))
-    elif kind == "import":
-        _need(isinstance(payload["source_locator"], str) and isinstance(payload["source_sha256"], str))
-    elif kind == "import_begin":
-        _need(_int(payload["shadow_cutoff_seq"]))
-    elif kind == "import_seal":
+    for field, check in PAYLOAD_SCHEMA[kind].items():
+        _need(check(payload[field]))
+    if kind == "import_seal":
         # 5: numbering_floor = max(baseline_used, ...); a seal below its own
         # baseline is not a server answer this client can trust.
-        _need(_int(payload["baseline_used"]) and _int(payload["numbering_floor"]))
         _need(payload["numbering_floor"] >= payload["baseline_used"])
-    elif kind == "end":
-        _need(payload["end_type"] in ("revoked", "reaped", "handed_off"))
 
 
 def check_record(record, job):
@@ -310,11 +369,12 @@ def check_record(record, job):
     for key in ("request_sha256", "previous_hash", "record_hash"):
         _need(isinstance(record[key], str) and HEX64_RE.match(record[key]) is not None)
     _need(isinstance(record["actor_client_id"], str) and JOB_RE.match(record["actor_client_id"]))
-    _need(isinstance(record["imported"], bool) and isinstance(record["received_at"], str))
+    _need(isinstance(record["imported"], bool) and _datetime(record["received_at"]))
     _need(record["kind"] in PAYLOAD_KEYS)
     source = record["source"]
     if record["kind"] == "import":
         _need(isinstance(source, dict) and set(source) == {"source_locator", "source_sha256"})
+        _need(_text(source["source_locator"], 0, 4096) and _HEX64(source["source_sha256"]))
     else:
         _need(source is None)
     check_payload(record["kind"], record["payload"])
@@ -367,7 +427,7 @@ def check_content(obj, job, seq):
     except (ValueError, UnicodeEncodeError):
         raise CliFail("protocol_invalid")
     _need(base64.b64encode(data).decode("ascii") == obj["content_b64"])
-    _need(len(data) == obj["size_bytes"] and sha256_hex(data) == obj["content_sha256"])
+    _need(_SEQ(obj["size_bytes"]) and len(data) == obj["size_bytes"] and sha256_hex(data) == obj["content_sha256"])
     return data
 
 
@@ -510,7 +570,9 @@ def records_mode():
         return "legacy"
     path = os.path.join(home, ".config", "wrk", "records-mode")
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        # O_NONBLOCK: a FIFO at the path is refused by the fstat below instead
+        # of blocking the open on a writer.
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return "legacy"
     except OSError as exc:
@@ -554,8 +616,11 @@ def run_cli(args, stdin=b"", write=False, binary=None):
     """One handoffkeep wrk invocation. Returns the stdout object or raises CliFail.
 
     binary None means the guard-selected canonical handoffkeep, resolved now;
-    the central desk commands pass their checked wrapper instead."""
+    the central desk commands pass a resolver that re-checks their wrapper
+    now, before this exec (every append, retry and replay)."""
     decision = guard(need_hk=True)
+    if callable(binary):
+        binary = binary()
     if binary is None:
         binary = decision.hk
         if not binary:
@@ -785,7 +850,14 @@ def atomic_write(directory, name, document):
     try:
         fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
         try:
-            os.write(fd, data)
+            # os.write may write fewer bytes than asked: the whole document is
+            # on disk before the fsync, or nothing is renamed and nothing sent.
+            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short write")
+                view = view[written:]
             if name == INTENTS and test_hook("fsync_fail"):
                 raise OSError(errno.EIO, "injected fsync failure")
             os.fsync(fd)
@@ -806,9 +878,10 @@ def atomic_write(directory, name, document):
 
 
 def read_private(path):
-    """Bytes of a 0600 regular file owned by this uid, or None when absent."""
+    """Bytes of a 0600 regular file owned by this uid, or None when absent.
+    O_NONBLOCK keeps a FIFO from blocking the open; fstat then refuses it."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     except FileNotFoundError:
         return None
     except OSError as exc:
@@ -843,7 +916,7 @@ class Intents(object):
     def __enter__(self):
         ensure_dir(self.dir)
         try:
-            self.lock_fd = os.open(os.path.join(self.dir, INTENTS_LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+            self.lock_fd = os.open(os.path.join(self.dir, INTENTS_LOCK), os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
             if not stat.S_ISREG(os.fstat(self.lock_fd).st_mode):
                 raise Fail("intent_invalid", "o3-intents.lock is not a regular file")
             fcntl.flock(self.lock_fd, fcntl.LOCK_EX)
@@ -1722,16 +1795,25 @@ def round_verdict(ctx, job, opts):
             emit("LEGACY")
             return
     # Bytes are read once: the digest, the base64 and the asserted head all come
-    # from this one read. A pending original is resent unchanged (6b).
-    data = read_once(path, "verdict file")
-    verdict, head = parse_verdict(data)
+    # from this one read. A pending original is resent unchanged (6b) before
+    # the current file is read at all, so its replay never depends on it.
+    source = {}
+
+    def current():
+        if not source:
+            data = read_once(path, "verdict file")
+            source["data"] = data
+            source["verdict"], source["head"] = parse_verdict(data)
+        return source["data"], source["verdict"], source["head"]
     vpath = lexical_path(path)
 
     def payload_for(number, tester):
+        data, verdict, head = current()
         return {"round_no": number, "head": head, "verdict": verdict, "path": vpath,
                 "content_sha256": sha256_hex(data), "content_b64": b64(data),
                 "tester_job_id": tester_flag if tester_flag is not None else tester}
     if decision.kind in ("offline_shadow", "offline_formed"):
+        head = current()[2]
         snapshot = decision.snapshot
         numbers = sorted(int(n) for n, h in snapshot.get("open_heads", {}).items() if h == head)
         testers = snapshot.get("open_testers", {})
@@ -1763,6 +1845,7 @@ def round_verdict(ctx, job, opts):
             repair(ctx, job, store, state, meta)
 
             def build(fresh):
+                head = current()[2]
                 check_round_numbers(ctx, job, fresh, "round verdict")
                 number, tester = verdict_round(fresh, head)
                 if not fresh.receipt_required:
@@ -1945,6 +2028,35 @@ def live_review_claim(state, subject, role, task_id):
             and payload["task_id"] == task_id and not state.ended())
 
 
+def review_input_problems(expected, opts):
+    """The launch inputs the shell passes (the task the local claim and the
+    pane carry, the owner lane and the tier) must be the canonical review
+    claim's own, or nothing is minted and no pane starts (section 6)."""
+    problems = []
+    if str(expected["task_id"]) != opts.get("--task", ""):
+        problems.append("task %s != %s" % (expected["task_id"], opts.get("--task") or "-"))
+    if expected["owner_lane"] != opts.get("--lane", ""):
+        problems.append("owner_lane %s != %s" % (expected["owner_lane"], opts.get("--lane") or "-"))
+    if expected["tier"] != opts.get("--tier", ""):
+        problems.append("tier %s != %s" % (expected["tier"], opts.get("--tier") or "-"))
+    return problems
+
+
+def review_attach(heads, review_round, head, job, subject):
+    """The round an existing assignment names is attached only when it is open
+    on the requested head with no other frozen tester; a round that is not
+    open is opened by the server, which judges it."""
+    if review_round not in heads:
+        return None
+    if heads[review_round]["head"] != head:
+        raise Fail("head_mismatch", "spawn: round %d of %s is open on head %s, not the requested head %s; no "
+                   "reviewer pane" % (review_round, subject, heads[review_round]["head"], head))
+    if heads[review_round]["tester_job_id"] not in (None, job):
+        raise Fail("claim_conflict", "spawn: round %d of %s is frozen to tester %s, not %s; no reviewer pane"
+                   % (review_round, subject, heads[review_round]["tester_job_id"], job))
+    return review_round
+
+
 def spawn_reviewer(ctx, job, opts, write):
     """The section 6 reviewer order. write=False (the verify phase, before any
     legacy task probe) reads and checks only; write=True (the commit phase,
@@ -1989,6 +2101,10 @@ def spawn_reviewer(ctx, job, opts, write):
     if matching and existing.claim_payload["host_client_id"] != caps["client_id"]:
         raise Fail("host_mismatch", "spawn: assignment %s is placed on host %s, not this host %s"
                    % (job, existing.claim_payload["host_client_id"], caps["client_id"]))
+    problems = review_input_problems(existing.claim_payload if matching else target_claim, opts)
+    if problems:
+        raise Fail("claim_conflict", "spawn: the launch inputs for reviewer %s do not match the canonical %s: %s"
+                   % (job, "assignment" if matching else "subject claim", "; ".join(problems)))
     if target.summary["state"] == "shadow":
         # P1 (6): a central precreated assignment is required; a host never mints
         # against a shadow subject and never falls back after a 409.
@@ -1996,11 +2112,8 @@ def spawn_reviewer(ctx, job, opts, write):
             raise Fail("claim_conflict", "spawn: subject %s is a P1 shadow job; reviewer %s needs a centrally "
                        "precreated live %s assignment before its pane starts" % (subject, job, role))
         review_round = existing.claim_payload["review_of"]["round_no"]
-        if review_round in heads:
-            attach = review_round
-        elif review_round == target.summary["next_round_no"]:
-            attach = None
-        else:
+        attach = review_attach(heads, review_round, head, job, subject)
+        if attach is None and review_round != target.summary["next_round_no"]:
             raise Fail("claim_conflict", "spawn: assignment %s names round %d of %s, which is neither open nor next"
                        % (job, review_round, subject))
     elif not matching:
@@ -2023,10 +2136,10 @@ def spawn_reviewer(ctx, job, opts, write):
         if existing is None or not live_review_claim(existing, subject, role, target_claim["task_id"]):
             raise Fail("claim_conflict", "spawn: the canonical assignment %s does not match subject %s" % (job, subject))
         review_round = existing.claim_payload["review_of"]["round_no"]
-        attach = review_round if review_round in heads else None
+        attach = review_attach(heads, review_round, head, job, subject)
     else:
         review_round = existing.claim_payload["review_of"]["round_no"]
-        attach = review_round if review_round in heads else None
+        attach = review_attach(heads, review_round, head, job, subject)
     if not write:
         emit("OK o3=reviewer-verified job=%s subject=%s round=%d" % (job, subject, review_round))
         return
@@ -2042,6 +2155,10 @@ def spawn_reviewer(ctx, job, opts, write):
         if record["payload"]["tester_job_id"] != job:
             raise Fail("claim_conflict", "spawn: the accepted round_open names %s, not %s"
                        % (record["payload"]["tester_job_id"], job))
+        if record["payload"]["round_no"] != review_round or record["payload"]["head"] != head:
+            raise Fail("claim_conflict", "spawn: the accepted round_open is round %d on head %s, not the assigned "
+                       "round %d on %s; no reviewer pane" % (record["payload"]["round_no"], record["payload"]["head"],
+                                                            review_round, head))
         opened = record["payload"]["round_no"]
         if not write_projections(ctx.inbox, subject, [record], o3_mode_name(target), meta, "receipt",
                                  grant_context(target)):
@@ -2117,7 +2234,10 @@ def joined(ctx, job, opts):
 
 def central(ctx, op, job, opts):
     role = opts.get("--as", "")
-    wrapper = central_wrapper(role)
+    central_wrapper(role)
+
+    def wrapper():
+        return central_wrapper(role)
 
     def write(kind, build, read=True):
         with Intents(ctx.inbox, job) as store:

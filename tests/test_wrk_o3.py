@@ -2099,8 +2099,10 @@ class SpawnCase(O3Case):
         w.enroll("job-a", owner=owner, tier="T1")
         w.local_claim("job-a", owner=owner)
 
-    def spawn_tester(self, w, *extra, job="rev-a", head=None):
+    def spawn_tester(self, w, *extra, job="rev-a", head=None, owner="b2400-a"):
+        # A reviewer's launch lane is the subject's canonical owner lane (B2).
         return w.spawn("--role", "tester", "--parent-job", "job-a", "--job", job, "--head", head or w.heads[0],
+                       "--owner", owner,
                        *extra, label=job)
 
     def test_reviewer_order_mint_verify_open_then_pane(self):
@@ -2459,7 +2461,7 @@ class RuleCase(O3Case):
             with self.subTest(job):
                 before = len(w.appends("claim"))
                 out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", job, "--head", w.heads[0],
-                              label=job)
+                              "--owner", "b2400-a", label=job)
                 # The server answers (stale zero CAS on an existing id gives
                 # sequence_conflict first, else claim_conflict); wrk reports it.
                 self.assertEqual(out.returncode, 73, out.stderr)
@@ -2475,7 +2477,7 @@ class RuleCase(O3Case):
         w.local_claim("job-a")
         w.local_claim("job-missing")
         out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", "rev-a", "--head", w.heads[0],
-                      label="rev-a")
+                      "--owner", "b2400-a", label="rev-a")
         self.assertRc(out, 77, "host_mismatch")
         self.assertEqual(len(w.appends("claim")), 1)
         out = w.spawn("--role", "tester", "--parent-job", "job-missing", "--job", "rev-m", "--head", w.heads[0],
@@ -2801,6 +2803,281 @@ class AdapterUnitCase(O3Case):
 # ── 7. mutants at the real call sites ─────────────────────────────────────────
 
 
+# ── round 1 tester findings (B1 to B5, S1, S2) ──────────────────────────────
+
+
+def scenario_b1_assignment_on_another_head(case, bindir=BIN):
+    """Round 1 is open on head A with no tester; rev-a is centrally assigned to
+    it; rev-a is spawned for head B."""
+    w = World(case, bindir=bindir)
+    SpawnCase.subject_with_head(case, w)
+    case.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+    case.assertRc(w.run("o3", "central", "assign", "rev-a", "--as", "director-1", "--target", "job-a", "--round", "1",
+                        "--role", "tester"), 0)
+    out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", "rev-a", "--head", w.heads[1],
+                  "--owner", "b2400-a", label="rev-a")
+    return w, out
+
+
+def scenario_b2_local_task_differs(case, bindir=BIN):
+    """The subject's local job.claim names task 9999 and the spawn asks for
+    T0 under an unrelated lane; the canonical subject is task 2400, T1, b2400-a."""
+    w = World(case, bindir=bindir)
+    SpawnCase.subject_with_head(case, w)
+    claim = w.inbox / "job-a" / "events" / "00001-job.claim.json"
+    doc = json.loads(claim.read_text())
+    doc["task_id"] = 9999
+    claim.write_text(json.dumps(doc) + "\n")
+    out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", "rev-a", "--head", w.heads[0],
+                  "--owner", "unrelated-lane", label="rev-a", tier="T0")
+    return w, out
+
+
+def scenario_b3_wrapper_turns_writable(case, bindir=BIN):
+    """The central wrapper makes itself world-writable during its first exec."""
+    w = World(case, bindir=bindir, production=True)
+    w.mode("required")
+    w.enroll("job-i", activate=False, tier="T1")
+    w.seed("job-i", "import_begin", {"reason_code": "test_import"})
+    archive = w.base / "archive"
+    archive.mkdir()
+    for number in range(2):
+        (archive / ("%d.json" % number)).write_text(json.dumps({"kind": "job.round", "round": number + 1}))
+    wrapper = w.home / ".local" / "bin" / "hk-director-1"
+    write_exec(wrapper, "#!/bin/sh\nchmod 777 '%s'\nO3_STUB_CLIENT=director-1 exec '%s' \"$@\"\n" % (wrapper, w.hk))
+    out = w.run("o3", "central", "import", "job-i", "--as", "director-1", "--events-dir", archive)
+    return w, out
+
+
+def scenario_b4_malformed_joined_reply(case, bindir=BIN):
+    """The canonical CLI forwards the stub's joined reply with a payload that
+    breaks the schema (head, pr, report_sha256), re-hashed so only the schema
+    check can catch it."""
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    write_exec(w.hk, """#!/usr/bin/env python3
+import json, subprocess, sys
+sys.path.insert(0, %r)
+import wrk_o3
+proc = subprocess.run([sys.executable, %r] + sys.argv[1:], input=sys.stdin.buffer.read(), stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE)
+if proc.returncode == 0 and sys.argv[1:3] == ["wrk", "append"] and "joined" in sys.argv:
+    reply = json.loads(proc.stdout)
+    reply["record"]["payload"].update({"head": "not-a-sha", "pr": ["invalid-pr"], "report_sha256": "bad-digest"})
+    reply["record"]["record_hash"] = wrk_o3.record_hash(reply["record"])
+    reply["summary"]["tail_hash"] = reply["record"]["record_hash"]
+    sys.stdout.write(json.dumps(reply) + "\\n")
+else:
+    sys.stdout.buffer.write(proc.stdout)
+    sys.stderr.buffer.write(proc.stderr)
+sys.exit(proc.returncode)
+""" % (str(bindir), str(STUB)))
+    waiver = w.grant("job-a", "join_waiver", head=w.heads[0])
+    report = w.base / "report.md"
+    report.write_text("report bytes\n")
+    out = w.adapter("joined", "job-a", "--head", w.heads[0], "--pr", "https://example.invalid/pr/1", "--report", report,
+                    "--waiver-grant", waiver["seq"])
+    return w, out
+
+
+def scenario_b5_short_write(case, bindir=BIN):
+    """The real adapter with os.write returning a half-length write for the
+    intent document, then the crash after send."""
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    loader = w.base / "short.py"
+    loader.write_text("""import os, sys
+sys.path.insert(0, %r)
+import wrk_o3
+real = wrk_o3.os.write
+def short(fd, data):
+    data = bytes(data)
+    if b'"intents"' in data:
+        return real(fd, data[:len(data) // 2])
+    return real(fd, data)
+wrk_o3.os.write = short
+sys.exit(wrk_o3.main(sys.argv[1:]))
+""" % str(bindir))
+    out = subprocess.run([sys.executable, str(loader), "round-open", "job-a", "--head", w.heads[0]],
+                         env=w.env(WRK_O3_TEST_FAULT="crash_after_send"), stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True, timeout=240)
+    return w, out
+
+
+def scenario_s1_replay_without_the_file(case, bindir=BIN):
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    case.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+    vfile = w.verdict_file("v.md", w.heads[0])
+    original = vfile.read_bytes()
+    w.fault("append", "commit_then:transport_indeterminate", kind="verdict")
+    case.assertRc(w.run("round", "verdict", "job-a", "--file", vfile), 75, "transport_indeterminate")
+    vfile.unlink()
+    before = len(w.appends("verdict"))
+    out = w.adapter("round-verdict", "job-a", "--file", vfile)
+    return w, out, original, before
+
+
+def scenario_s2_fifo_intents(case, bindir=BIN, timeout=60):
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    os.mkfifo(str(w.inbox / "job-a" / "o3-intents.json"), 0o600)
+    out = subprocess.run([sys.executable, str(w.adapter_py), "round-open", "job-a", "--head", w.heads[0]],
+                         env=w.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=timeout)
+    return w, out
+
+
+SCHEMA_PROBES = [None, True, False, 0, 1, 3, -1, 2 ** 53, "", "a", "x" * 65, "x" * 4097, "T1", "0" * 40, "A" * 40,
+                 "0" * 64, "2026-10-24T00:00:00Z", "2026-10-24T00:00:00.5+09:00", "2026-13-01T00:00:00Z",
+                 "2026-10-24 00:00:00Z", "https://e.example/p", "x:y", "not a uri", [], [1], [0], ["a"], ["A"], {},
+                 {"job_id": "a", "round_no": 1}, {"job_id": "a", "round_no": 0}, "desktop", "PASS", "enforced",
+                 "extension", "revoked", "builder", "tester", "job-a", "b2400-a"]
+
+
+def schema_accepts(schema, value, defs):
+    """The subset of JSON Schema the contract uses, for the equivalence test."""
+    if "$ref" in schema:
+        return schema_accepts(defs[schema["$ref"].split("/")[-1]], value, defs)
+    if "anyOf" in schema:
+        return any(schema_accepts(s, value, defs) for s in schema["anyOf"])
+    if "oneOf" in schema:
+        return sum(1 for s in schema["oneOf"] if schema_accepts(s, value, defs)) == 1
+
+    def same(a, b):
+        return a == b and type(a) is type(b)
+    if "const" in schema and not same(value, schema["const"]):
+        return False
+    if "enum" in schema and not any(same(value, e) for e in schema["enum"]):
+        return False
+    kind = schema.get("type")
+    checks = {"object": lambda v: isinstance(v, dict), "array": lambda v: isinstance(v, list),
+              "string": lambda v: isinstance(v, str), "boolean": lambda v: isinstance(v, bool),
+              "null": lambda v: v is None, "integer": lambda v: isinstance(v, int) and not isinstance(v, bool)}
+    if kind is not None and not checks[kind](value):
+        return False
+    if isinstance(value, str):
+        import re as _re
+        if "pattern" in schema and not _re.search(schema["pattern"], value):
+            return False
+        if len(value) < schema.get("minLength", 0) or len(value) > schema.get("maxLength", len(value)):
+            return False
+        if schema.get("format") == "date-time":
+            import datetime as _dt
+            if not _re.match(r"^\d{4}-\d{2}-\d{2}[Tt]\d{2}:\d{2}:\d{2}(\.\d+)?([Zz]|[+-]\d{2}:\d{2})$", value):
+                return False
+            try:
+                _dt.datetime.fromisoformat(value.replace("Z", "+00:00").replace("z", "+00:00"))
+            except ValueError:
+                return False
+        if schema.get("format") == "uri" and not _re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:\S*$", value):
+            return False
+    if isinstance(value, int) and not isinstance(value, bool):
+        if value < schema.get("minimum", value) or value > schema.get("maximum", value):
+            return False
+    if isinstance(value, list) and "items" in schema:
+        return all(schema_accepts(schema["items"], item, defs) for item in value)
+    if isinstance(value, dict) and kind == "object":
+        if set(schema.get("required", [])) - set(value):
+            return False
+        if schema.get("additionalProperties") is False and set(value) - set(schema.get("properties", {})):
+            return False
+        return all(schema_accepts(schema["properties"][k], v, defs) for k, v in value.items()
+                   if k in schema.get("properties", {}))
+    return True
+
+
+class Round1FindingCase(O3Case):
+    def test_b1_assignment_on_another_head_refuses_before_any_pane(self):
+        w, out = scenario_b1_assignment_on_another_head(self)
+        self.assertRc(out, 73, "head_mismatch")
+        self.assertEqual(w.herdr_calls(), [], "no pane for a round open on another head")
+        self.assertEqual(len([r for r in w.records("job-a") if r["kind"] == "round_open"]), 1)
+        self.assertEqual(w.events("rev-a", "job.claim"), [])
+        # Control: the same assignment on the round's own head attaches and panes.
+        out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", "rev-a", "--head", w.heads[0],
+                      "--owner", "b2400-a", label="rev-a")
+        self.assertRc(out, 0)
+        self.assertTrue(w.herdr_calls())
+
+    def test_b2_reviewer_launch_inputs_must_match_the_canonical_claim(self):
+        w, out = scenario_b2_local_task_differs(self)
+        self.assertRc(out, 73, "claim_conflict")
+        self.assertIn("task 2400 != 9999", out.stderr)
+        self.assertEqual(w.herdr_calls(), [])
+        self.assertEqual(w.appends(), [], "nothing is minted for mismatched launch inputs")
+        self.assertEqual(w.events("rev-a", "job.claim"), [])
+
+    def test_b3_central_wrapper_is_rechecked_before_every_exec(self):
+        w, out = scenario_b3_wrapper_turns_writable(self)
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("group- or world-writable", out.stderr)
+        self.assertEqual(len([r for r in w.records("job-i") if r["kind"] == "import"]), 1)
+
+    def test_b4_schema_invalid_joined_reply_is_protocol_invalid(self):
+        w, out = scenario_b4_malformed_joined_reply(self)
+        self.assertRc(out, 75, "protocol_invalid")
+        self.assertEqual(out.stdout, "")
+        joined = [i for i in w.intents("job-a") if i["request"]["kind"] == "joined"]
+        self.assertEqual([i["state"] for i in joined], ["pending"])
+
+    def test_b4_payload_checks_match_the_contract_schema_field_by_field(self):
+        defs = json.loads((PACK / "contract.json").read_text())["$defs"]
+        bases = {}
+        for path in sorted((PACK / "vectors").glob("*.json")):
+            for case in json.loads(path.read_text())["cases"]:
+                for record in (case.get("given") or {}).get("records") or []:
+                    ADAPTER.check_record(record, record["job_id"])
+                    bases.setdefault(record["kind"], record["payload"])
+        # The pack holds no grant_cancel record; every other kind is a pack payload.
+        bases.setdefault("grant_cancel", {"grant_seq": 3, "reason_code": "test_cancel"})
+        self.assertEqual(set(bases), set(ADAPTER.PAYLOAD_KEYS))
+        compared = 0
+        for kind, base in sorted(bases.items()):
+            schema = defs["Payload_" + kind]
+            self.assertTrue(schema_accepts(schema, base, defs), kind)
+            for field in sorted(base):
+                for probe in SCHEMA_PROBES:
+                    payload = dict(base, **{field: probe})
+                    want = schema_accepts(schema, payload, defs)
+                    try:
+                        ADAPTER.check_payload(kind, payload)
+                        got = True
+                    except ADAPTER.CliFail:
+                        got = False
+                    if kind == "import_seal" and want and not got:
+                        # The one cross-field rule beyond the schema (5).
+                        self.assertLess(payload["numbering_floor"], payload["baseline_used"])
+                        continue
+                    self.assertEqual(got, want, (kind, field, probe))
+                    compared += 1
+        self.assertGreater(compared, 2000)
+
+    def test_b5_short_write_still_leaves_a_complete_replayable_intent(self):
+        w, out = scenario_b5_short_write(self)
+        self.assertEqual(out.returncode, 137, out.stderr)
+        intents = json.loads((w.inbox / "job-a" / "o3-intents.json").read_text())["intents"]
+        self.assertEqual([i["state"] for i in intents], ["pending"])
+        again = w.run("round", "open", "job-a", "--head", w.heads[0])
+        self.assertRc(again, 0)
+        self.assertEqual(len([r for r in w.records("job-a") if r["kind"] == "round_open"]), 1)
+        sends = w.appends("round_open")
+        self.assertEqual(len(sends), 2)
+        self.assertEqual(sends[0]["stdin_sha256"], sends[1]["stdin_sha256"])
+
+    def test_s1_pending_verdict_replays_without_the_current_file(self):
+        w, out, original, before = scenario_s1_replay_without_the_file(self)
+        self.assertRc(out, 0)
+        self.assertEqual(len(w.appends("verdict")) - before, 1)
+        verdicts = [r for r in w.records("job-a") if r["kind"] == "verdict"]
+        self.assertEqual([v["payload"]["content_sha256"] for v in verdicts], [hashlib.sha256(original).hexdigest()])
+        self.assertEqual([i["state"] for i in w.intents("job-a") if i["request"]["kind"] == "verdict"], ["accepted"])
+
+    def test_s2_fifo_intent_file_refuses_without_blocking(self):
+        w, out = scenario_s2_fifo_intents(self)
+        self.assertRc(out, 74, "intent_invalid")
+        self.assertEqual(w.appends(), [])
+
+
 class MutantCase(O3Case):
     def mutant_bin(self, mutations):
         root = Path(os.path.realpath(tempfile.mkdtemp(prefix="o3m-", dir=os.environ.get("TMPDIR") or "/tmp")))
@@ -2959,6 +3236,72 @@ class MutantCase(O3Case):
         w, shadow, e, enforced = scenario_r3_raw_append(self, bindir)
         self.assertNotIn("o3 cli_usage", shadow.stderr)
         self.assertNotIn("use wrk round verdict;", enforced["verdict"].stderr)
+
+
+    def test_m14_assignment_attach_without_the_head_check_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", """    if review_round not in heads:
+        return None
+""", """    if review_round not in heads:
+        return None
+    return review_round
+""")])
+        w, out = scenario_b1_assignment_on_another_head(self, bindir)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(w.herdr_calls(), "the mutant starts a pane on a round open on another head")
+
+    def test_m15_reviewer_launch_inputs_unchecked_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", "    problems = review_input_problems(existing.claim_payload if matching "
+                                   "else target_claim, opts)\n", "    problems = []\n")])
+        w, out = scenario_b2_local_task_differs(self, bindir)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(w.herdr_calls())
+
+    def test_m16_central_wrapper_checked_once_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", """    central_wrapper(role)
+
+    def wrapper():
+        return central_wrapper(role)
+""", """    wrapper = central_wrapper(role)
+""")])
+        w, out = scenario_b3_wrapper_turns_writable(self, bindir)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(len([r for r in w.records("job-i") if r["kind"] == "import"]), 2)
+
+    def test_m17_joined_payload_fields_unchecked_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", "    for field, check in PAYLOAD_SCHEMA[kind].items():\n",
+                                   "    for field, check in (PAYLOAD_SCHEMA[kind].items() if kind != \"joined\" "
+                                   "else ()):\n")])
+        w, out = scenario_b4_malformed_joined_reply(self, bindir)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("RECEIPT", out.stdout)
+
+    def test_m18_single_short_write_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", """            view = memoryview(data)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short write")
+                view = view[written:]
+""", """            os.write(fd, data)
+""")])
+        w, out = scenario_b5_short_write(self, bindir)
+        with self.assertRaises(ValueError):
+            json.loads((w.inbox / "job-a" / "o3-intents.json").read_text())
+
+    def test_m19_verdict_file_read_before_the_replay_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", "    vpath = lexical_path(path)\n\n    def payload_for(",
+                                   "    vpath = lexical_path(path)\n    current()\n\n    def payload_for(")])
+        w, out, original, before = scenario_s1_replay_without_the_file(self, bindir)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(len(w.appends("verdict")), before)
+
+    def test_m20_blocking_open_of_the_intent_file_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", "        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)\n"
+                                   "    except FileNotFoundError:\n        return None",
+                                   "        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)\n"
+                                   "    except FileNotFoundError:\n        return None")])
+        with self.assertRaises(subprocess.TimeoutExpired):
+            scenario_s2_fifo_intents(self, bindir, timeout=10)
 
 
 if __name__ == "__main__":
