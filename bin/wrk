@@ -77,6 +77,7 @@ ALL_PROFILES=(
   devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
   devin-fusion-opus55 devin-fusion-sonnet55
   devin-fusion-sol61 devin-fusion-sol61-xhigh
+  pi-haiku55 pi-sonnet55 pi-opus55
   devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
@@ -313,6 +314,8 @@ Options:
                      rung the same way but take no SCOPEFUEL_E6_ARM marker.
                      Under --role builder a resolved ultra rung is still
                      refused before the marker check.
+                     pi-* seats have no MCP (--no-mcp) and must not be placed
+                     on MCP-needing tasks. Worker/tester only; default effort high.
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
                      builder refuses them pending hk 1382. Fusion-Sol
@@ -1245,6 +1248,7 @@ spawn_panewire_prompt() {
 # opencode needs a separate return after the paste to submit (pre-#498
 # behavior, kept verbatim). Only after a delivery that may have been pasted.
 spawn_opencode_submit() {
+  # pi uses herdr's normal submit; it does not need opencode's extra Return.
   [[ "$PROFILE_KIND" == opencode ]] || return 0
   case "$SPAWN_SUBMIT" in proven|accepted|unconfirmed) ;; *) return 0 ;; esac
   sleep_for 2
@@ -1266,6 +1270,64 @@ spawn_herdr_fallback() {
     --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
     "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
   fi
+}
+
+# hk 2080: prove pi runtime selection from the current pane, never argv.
+pi_model_proven() {
+  local screen
+  screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || return 1
+  # herdr exposes no model field for pi; pi get_state is RPC-only and cannot
+  # attest this interactive pane. pi 1.4.0 renders its footer immediately
+  # BELOW the editor bottom border: cwd, stats, optional extension status.
+  # Never search the transcript or pasted input for model-looking text.
+  # Unknown/custom layouts, missing provider and truncated lines fail closed.
+  printf '%s' "$screen" | python3 -c '
+import os, re, sys
+expected, effort, cwd, home, prompt = sys.argv[1:]
+def clean(text):
+    return [line.rstrip() for line in
+            re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).splitlines()]
+lines = clean(sys.stdin.read())
+while lines and not lines[-1]:
+    lines.pop()
+bottoms = [i for i, line in enumerate(lines)
+           if re.fullmatch(r"─{3,}|─+ ↓ \d+ more ─+", line)]
+if not bottoms:
+    sys.exit(1)
+bottom = bottoms[-1]
+tops = [i for i in range(bottom)
+        if re.fullmatch(r"──(?:.*─)?", lines[i])]
+if not tops or bottom - tops[-1] < 2:
+    sys.exit(1)
+footer = lines[bottom + 1:]
+if len(footer) not in (2, 3):
+    sys.exit(1)
+# Compare the evidence rows themselves, never the frame through screen end:
+# an echoed brief may be followed by an unrelated shell/extension row. Any
+# quoted cwd+stats evidence is ambiguous, including after whitespace reflow.
+with open(prompt) as brief:
+    injected = "\n".join(clean(brief.read()))
+candidate = re.sub(r"\s+", " ", "\n".join(footer[:2])).strip()
+quoted = re.sub(r"\s+", " ", injected).strip()
+if candidate in quoted:
+    sys.exit(1)
+# footer.js may abbreviate HOME and append a branch/session name. Checking
+# the launch cwd also prevents an arbitrary post-editor stats row proving it.
+paths = {cwd, os.path.realpath(cwd)}
+for path in list(paths):
+    if path == home:
+        paths.add("~")
+    elif path.startswith(home.rstrip("/") + "/"):
+        paths.add("~" + path[len(home):])
+pwd_pattern = (r"(?:" + "|".join(re.escape(p) for p in paths) +
+               r")(?: \([^\r\n]*\))?(?: • [^\r\n]+)?")
+if not re.fullmatch(pwd_pattern, footer[0]):
+    sys.exit(1)
+provider, model = expected.split("/", 1)
+pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(provider) +
+           r"\) " + re.escape(model) + r" • " + re.escape(effort) + r"$")
+sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
+' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
 
 # spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not
@@ -2628,6 +2690,7 @@ agent_foreground_exes() {
     kimi)     echo "kimi-code kimi" ;;
     kiro)     echo "kiro-cli kiro" ;;
     opencode) echo "open-code opencode" ;;
+    pi)       echo "pi" ;;
     agy)      echo "antigravity agy" ;;
     *)        echo "$1" ;;
   esac
@@ -4147,6 +4210,11 @@ resolve_profile() {
       PROFILE_KIND=kimi; KIMI_TRUST_HOME="$KIMI_CODE_LOW_HOME"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/k3)
       PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_LOW_HOME") ;;
 
+    # hk 2080: literal provider/model, like opencode; every seat disables MCP.
+    pi-haiku55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-haiku-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    pi-sonnet55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-sonnet-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    pi-opus55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-opus-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+
     oc-kimi-code) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k2.7-code) ;;
     oc-glm) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/glm-5.2) ;;
     oc-kimi-k3) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k3) ;;
@@ -4233,6 +4301,7 @@ resolve_profile() {
     # The quota pool is still scopefuel's single `devin` pool — wrk owns no
     # pool mapping, the gate answer names the pool.
     devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;
+    pi-haiku55|pi-sonnet55|pi-opus55) GATE_PROFILE="$MODEL" ;;
     # hk 1729: Fusion-Sol profiles also gate at their exact catalog rows;
     # scopefuel supplies the codex pool recorded by arbiter.
     devin-fusion-sol61|devin-fusion-sol61-xhigh) GATE_PROFILE="$MODEL" ;;
@@ -4310,6 +4379,22 @@ resolve_profile() {
     EFFECTIVE_EFFORT="$DEFAULT_EFFORT"
   fi
 
+  if [[ "$PROFILE_KIND" == pi ]]; then
+    # pi 1.4.0 --help thinking table (director-1, hk 2080):
+    # wrk effort | pi thinking
+    # low        | low
+    # medium     | medium
+    # high       | high
+    # xhigh      | xhigh
+    # max        | max
+    # ultra is unsupported; pi off/minimal are not wrk efforts.
+    case "$EFFECTIVE_EFFORT" in
+      low|medium|high|xhigh|max) PI_THINKING="$EFFECTIVE_EFFORT" ;;
+      *) die "$MODEL: pi does not support effort '$EFFECTIVE_EFFORT'" ;;
+    esac
+    GATE_EFFORT_PIN="$PI_THINKING"
+  fi
+
   # hk 1863 (operator decision on hk 1864, recorded on hk 1863): the
   # 2026-09-26 no-max builder-seat refusal (decision 4088 B) is removed for
   # every model — max is a legal builder rung, so builder-sonnet-max,
@@ -4381,6 +4466,7 @@ resolve_profile() {
   fi
 
   case "$PROFILE_KIND" in
+    pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING") ;;
     codex) ARGS=(--yolo -m "$PROFILE_MODEL" -c "model_reasoning_effort=$EFFECTIVE_EFFORT") ;;
     kiro)
       ARGS=(chat --v3 --trust-all-tools --require-mcp-startup)
@@ -9991,6 +10077,9 @@ spawn_router_cmd() {
   # is different — the hub runs `wrk spawn` on the target without --host,
   # which is this auto path: a closed target lands no local pane, but the
   # round may still place on that target's own remotes.
+  # The explicit local leg (including SSH delegation) must name the pi
+  # profile/host/key even when the TOML itself is malformed.
+  if [[ "$requested" == local ]]; then pi_host_precheck "$router_profile"; fi
   local_spawn_resolve || return
   if [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 && "$requested" == local ]]; then
     echo "wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local" >&2
@@ -10414,6 +10503,22 @@ spawn_router_cmd() {
 # one bare integer from 30000 through 300000 and is used as a floor for each
 # kind's existing shell readiness window. An absent key leaves each default
 # unchanged; a malformed or out-of-range assignment refuses before spawn.
+# hk 2080: only the execution host calls this, before admission. Use the
+# shared strict hosts scanner, with no newer host Python requirement. Quoted
+# strings, integers, duplicates and malformed assignments are never opt-ins.
+# No caller-side host name or pi configuration grants permission.
+pi_host_precheck() {
+  local profile="${1:-${MODEL:-}}" config host
+  case "$profile" in pi-haiku55|pi-sonnet55|pi-opus55) ;; *) return 0 ;; esac
+  config="$(spillover_config)"
+  host="$(spillover_value hub machine_id 2>/dev/null || true)"
+  [[ -n "$host" ]] || host="$(hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
+  if ! local_spawn_scan || [[ "$LOCAL_PI_ANTHROPIC" -ne 1 ]]; then
+    die "$profile refused on host $host: hosts.toml [local] pi_anthropic must be literal true"
+  fi
+}
+
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -10433,13 +10538,14 @@ local_spawn_table_name() {
 
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
+  LOCAL_PI_ANTHROPIC=0
   LOCAL_HEAVY_LOAD_WAIT=1
   LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SHELL_READY_TIMEOUT_MS=0
   LOCAL_SHELL_READY_TIMEOUT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -10508,6 +10614,34 @@ local_spawn_scan() {
       return "$WRK_EXIT_CONFIG_REFUSED"
     fi
     [[ "$current" == local ]] || continue
+    # hk 2080: default-off API seat capability, using the same literal-only
+    # grammar as spawn/heavy_load_wait. Keep this in bash: execution hosts
+    # may have Python 3.9 without tomllib (director-1, 2026-10-26).
+    case "$line" in
+      pi_anthropic[A-Za-z0-9_-]*) ;; # a different bare key
+      pi_anthropic* | '"pi_anthropic"'* | "'pi_anthropic'"*)
+        if [[ "$line" =~ ^pi_anthropic[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed pi_anthropic assignment in [local] (expected 'pi_anthropic = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        pi_seen=$((pi_seen + 1))
+        if [[ "$pi_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate pi_anthropic key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) LOCAL_PI_ANTHROPIC=1 ;;
+          false) ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] pi_anthropic accepts only the bare TOML booleans true or false"
+             return "$WRK_EXIT_CONFIG_REFUSED"
+             ;;
+        esac
+        continue ;;
+    esac
     # #1492: a bare integer, with the same one-key, one-clean-assignment
     # grammar as the other strict [local] settings. Check the decimal length
     # before arithmetic so an arbitrarily large integer cannot wrap in bash.
@@ -11508,6 +11642,7 @@ spawn_cmd() {
   # routing or any spawn preparation. The resolved-model check below covers
   # future aliases too.
   refuse_known_terra_spelling
+  pi_host_precheck
   # #1155: several router paths reach spawn_cmd directly (an unclassified
   # spawn, an unreadable arbiter, a hosts.toml-less auto). The flag gate
   # repeats here so no local spawn path runs on a host whose own [local]
@@ -11566,6 +11701,8 @@ spawn_cmd() {
       codex-astra|fable) ;; # Paired round-extension flags verified before catalog.
       devin-fusion-opus55|devin-fusion-sonnet55)
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
+      pi-haiku55|pi-sonnet55|pi-opus55)
+        die "--role builder rejects '$MODEL': pi seats are worker/tester-only until reps exist (hk 2080)" ;;
       devin-fusion-sol61|devin-fusion-sol61-xhigh)
         die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
@@ -11814,6 +11951,7 @@ print(value if isinstance(value, str) else "")
   [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
   [[ "$PROFILE_KIND" == codex ]] && START_TIMEOUT=120000 && BOOT_SETTLE=20
+  [[ "$PROFILE_KIND" == pi ]] && START_TIMEOUT=30000 && BOOT_SETTLE=12
   if [[ "$PROFILE_KIND" == kimi || "$PROFILE_KIND" == codex ]]; then
     START_TIMEOUT_SOURCE="$PROFILE_KIND kind default"
   fi
@@ -11854,6 +11992,11 @@ print(value if isinstance(value, str) else "")
   mock_mcp_verify --require-attached || return "$WRK_EXIT_MOCK_MCP_REFUSED"
   round_ext_builder_recheck
   spawn_deliver_brief
+  if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then
+    echo "wrk: $MODEL pi model not proven: expected $PROFILE_MODEL:$PI_THINKING" >&2
+    spawn_pane_cleanup
+    return 1
+  fi
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # An older herdr may not report the tab in `tab create`; the agent knows it.

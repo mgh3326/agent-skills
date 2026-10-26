@@ -16020,4 +16020,5 @@ bash "$ROOT/tests/test-shellcheck-capped.sh"
 bash "$ROOT/tests/test-devin-gate-profile.sh"
 # hk 1990: preserve durable operator refs at the actual apply_catalog call site.
 python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
+bash "$ROOT/tests/test-pi-launcher.sh"
 echo 'PASS test-wrk'
