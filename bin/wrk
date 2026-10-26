@@ -5294,6 +5294,13 @@ PY
 # Any failure prints an empty map so callers keep the events-dir values.
 job_claims_db_map() {
   local bin="${WRK_TRUST_ARBITER:-$ARBITER}"
+  if [[ -n "${WRK_TRUST_JOBS_ROOT:-}" && -z "${WRK_TRUST_ARBITER:-}" ]]; then
+    # A trust-guarded caller that ran the guard without 'arbiter' selected no
+    # binary at all: falling back to the caller's ARBITER_BIN or PATH would
+    # let the environment choose the identity source inside the checked
+    # boundary (hk 1897).
+    echo "{}"; return 0
+  fi
   [[ -n "$bin" ]] || bin="$(command -v arbiter 2>/dev/null || true)"
   [[ -n "$bin" && -x "$bin" ]] || { echo "{}"; return 0; }
   wrk_py - "$bin" "$@" <<'PY'
@@ -5867,7 +5874,7 @@ joined_cmd() {
   local metadata owner label pane parent role reason joined_end
   # hk 1894: the join gate (end record, rounds, verdict files) and the parent
   # lane are read from the checked inbox, never from the environment.
-  wrk_trust_guard
+  wrk_trust_guard arbiter
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   # hk 1897: a readable arbiter DB claim wins over the events-dir copy for

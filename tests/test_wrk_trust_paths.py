@@ -1635,7 +1635,7 @@ class RealBinaryCase(unittest.TestCase):
         self.red(self.repro_inherited_guard_state, lib)
 
     def test_mutant_joined_skips_the_guard(self):
-        mutant = self.mutant(WRK, '  # lane are read from the checked inbox, never from the environment.\n  wrk_trust_guard\n',
+        mutant = self.mutant(WRK, '  # lane are read from the checked inbox, never from the environment.\n  wrk_trust_guard arbiter\n',
                              '  # lane are read from the checked inbox, never from the environment.\n' + ENV_FOLLOWING, "joined")
         self.red(self.repro_joined_redirect, mutant)
         self.red(self.repro_end_check_redirect, mutant)
@@ -2059,6 +2059,43 @@ class ArbiterDbClaimCase(RealBinaryCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertIn("jh2-lane", out.stdout)
         self.assertFalse(log.exists(), "the PATH shim must never run")
+
+    def test_joined_db_read_uses_only_the_guard_selected_binary(self):
+        # hk 1897 B-2: joined is trust-guarded, so its prefer-DB consult must
+        # come from the canonical arbiter — a caller-chosen ARBITER_BIN or a
+        # PATH shim must never supply the identity map.
+        w = self.w
+        w.mkjob(w.jobs, "jb2")
+        w.rewrite_claim(w.jobs, "jb2", parent_lane="mac-dev")
+        w.open_rounds(self.wrk, w.env(), "jb2", 1)
+        events = w.jobs / "jb2" / "events"
+        (events / "00090-job.verdict.json").write_text(
+            json.dumps({
+                "kind": "job.verdict", "job_id": "jb2", "round": 1,
+                "head": w.heads[0], "verdict": "PASS",
+                "created_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            }) + "\n",
+            encoding="utf-8",
+        )
+        fake = w.tmp / "fake-arbiter"
+        write_exec(fake, '#!/bin/sh\nprintf \'{"claim":{"owner_lane":"elsewhere",'
+                         '"parent_lane":"pa-integrator","task_id":1}}\'\n')
+        out = w.joined(self.wrk, "jb2", ARBITER_BIN=fake)
+        self.assertEqual(out.returncode, 2)
+        self.assertFalse(list(events.glob("*-job.joined.json")), out.stderr)
+        shim_dir = w.tmp / "shim2"
+        shim_dir.mkdir()
+        log = w.tmp / "shim2.log"
+        write_exec(shim_dir / "arbiter", '#!/bin/sh\necho ran >>"%s"\nprintf \'{"claim":{"owner_lane":"elsewhere","parent_lane":"pa-integrator","task_id":1}}\'\n' % log)
+        out = w.joined(self.wrk, "jb2", ARBITER_BIN=None,
+                       PATH="%s:%s" % (shim_dir, safe_path()))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        # The shim may still run for non-identity housekeeping (quota release,
+        # as on main); what matters is it can never supply the identity map.
+        self.assertNotIn("pa-integrator", out.stderr)
+        record = json.loads(next(events.glob("*-job.joined.json")).read_text())
+        self.assertEqual(record["parent_lane"], "director-1")
+        self.assertEqual(record["owner_lane"], "jb2-lane")
 
     # -- mutants, stated as invariants --
 
