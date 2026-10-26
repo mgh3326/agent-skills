@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Offline pi 1.4.0 footer fixture; no config/auth reads or network.
+set -euo pipefail
+python3 - "$@" <<'PY'
+import os
+import sys
+
+args = sys.argv[1:]
+token = args[args.index("--model") + 1]
+model, thinking = token.rsplit(":", 1)
+provider, model = model.split("/", 1)
+scenario = os.environ.get("WRK_PI_SCENARIO", "ok")
+if scenario == "missing":
+    sys.exit(0)
+if scenario == "wrong-model":
+    model = "claude-haiku-5-5"
+elif scenario == "wrong-thinking":
+    thinking = "low"
+elif scenario == "wrong-provider":
+    provider = "openrouter"
+if scenario == "stale":
+    print(f"0.0%/200k  ({provider}) {model} • {thinking}")
+    model = "claude-haiku-5-5"
+if scenario == "echo":
+    print("pi " + " ".join(args))
+else:
+    prefix = "" if scenario == "no-provider" else f"({provider}) "
+    print(f"0.0%/200k  {prefix}{model} • {thinking}")
+
+PY

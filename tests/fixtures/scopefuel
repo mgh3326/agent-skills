@@ -5,6 +5,7 @@ set -euo pipefail
 # (fixture 전용 — 프로덕션 매핑은 scopefuel 하나가 소유한다).
 pool_for() {
   case "$1" in
+    pi-haiku55|pi-sonnet55|pi-opus55) echo anthropic-api ;;
     opus|sonnet|fable|haiku) echo claude ;;
     # hk 1604: each devin gate spelling stays in scopefuel's single devin pool.
     # Builder seats are not gate names; wrk asks for the runtime profile.
@@ -185,7 +186,7 @@ fi
 if [[ "${1:-}" == --json ]]; then
   json_rc=0
   schema_value=scopefuel.v1
-  providers='[{"id":"claude"},{"id":"devin"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"},{"id":"kimi"}]'
+  providers='[{"id":"anthropic-api"},{"id":"claude"},{"id":"devin"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"},{"id":"kimi"}]'
   case "${WRK_SCOPEFUEL_JSON_MODE:-ok}" in
     broken) echo 'scopefuel: json fetch failed' >&2; exit 7 ;;
     garbage) echo 'not json at all'; exit 0 ;;

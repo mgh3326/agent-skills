@@ -439,6 +439,20 @@ class EligibilityFixtures(unittest.TestCase):
         self.assert_case(checks, "independence", "FAIL", "DS41_T3_SOLE_TESTER")
         self.assert_case(checks, "surface_permission", "FAIL", "PROFILE_SURFACE_DENIED")
 
+    def test_pi_tester_is_claude_family_and_unqualified(self) -> None:
+        evidence = self.evidence(self.make_head(), declared_t="T3")
+        evidence["contributors"][0].update(
+            profile="builder-opus", model="claude-opus-5-5", effort="high")
+        evidence["tester"] = {"planned_profile": "pi-opus55", "planned_effort": "high"}
+        spec = self.policy["profiles"]["pi-opus55"]
+        self.assertEqual((spec["family"], spec["roles"], spec["role_status"]),
+                         ("anthropic", [], "unknown"))
+        self.assert_case(self.check(evidence), "tester", "UNVERIFIED", "PROFILE_ROLE_UNKNOWN")
+        # Grant role/grade only in this fixture to reach the independent
+        # family check; production pi roles remain unknown pending reps.
+        spec.update(roles=["tester"], surfaces=["T3"], grades={"high": "S"})
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_T3")
+
     def test_devin_fusion_tester_is_claude_family(self) -> None:
         # hk 1380: the devin fusion spellings carry the Claude family, so a
         # fusion tester against a claude builder is same-family (never the

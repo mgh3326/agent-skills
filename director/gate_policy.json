@@ -2064,6 +2064,57 @@
         "T1",
         "T2"
       ]
+    },
+    "pi-haiku55": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null,
+        "medium": null,
+        "xhigh": null
+      },
+      "launcher": "pi",
+      "launcher_model_token": "PROFILE_MODEL=anthropic/claude-haiku-5-5",
+      "model": "claude-haiku-5-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "pi-sonnet55": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null,
+        "medium": null,
+        "xhigh": null
+      },
+      "launcher": "pi",
+      "launcher_model_token": "PROFILE_MODEL=anthropic/claude-sonnet-5-5",
+      "model": "claude-sonnet-5-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "pi-opus55": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null,
+        "medium": null,
+        "xhigh": null
+      },
+      "launcher": "pi",
+      "launcher_model_token": "PROFILE_MODEL=anthropic/claude-opus-5-5",
+      "model": "claude-opus-5-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
     }
   },
   "required_ci_jobs_by_repo": {
