@@ -146,6 +146,22 @@ def positive_seq_arg(value):
     return result
 
 
+def cursor_arg(value):
+    # Cursor meaning belongs to the server; only wire representability is local.
+    if type(value) is int:
+        result = value
+    elif isinstance(value, str) and re.fullmatch(r"[+-]?[0-9]+", value, re.ASCII):
+        digits = value.lstrip("+-").lstrip("0") or "0"
+        if len(digits) > 16:
+            raise Refusal("cli_usage")
+        result = int(digits) * (-1 if value.startswith("-") else 1)
+    else:
+        raise Refusal("cli_usage")
+    if not -SAFE_INT <= result <= SAFE_INT:
+        raise Refusal("cli_usage")
+    return result
+
+
 class Schema:
     """The exact fixed contract, with its finite JSON-Schema keyword subset.
 
@@ -497,7 +513,7 @@ class Client:
         return {"contract": CONTRACT, "claim": canonical_claim,
                 "summary": history["summary"], "records": history["records"]}
 
-    def records(self, job, limit=100):
+    def records(self, job, limit=None):
         snapshot, receipts = self.enrollment_witnesses(job)
         try:
             return self.read_records(job, limit)
@@ -509,17 +525,12 @@ class Client:
                 self.history_warning(job)
             raise
 
-    def read_records(self, job, limit=100):
+    def read_records(self, job, limit=None):
         job_name(job)
-        if type(limit) is not int or not 1 <= limit <= 1000:
-            raise Refusal("cli_usage")
-        after, snapshot, generation, previous = 0, None, None, ZERO_HASH
+        after, cursor_after, snapshot, generation, previous = 0, None, None, None, ZERO_HASH
         records = []
         while True:
-            args = ["records", job, "--after-seq", str(after), "--limit", str(limit)]
-            if snapshot is not None:
-                args.extend(["--snapshot-seq", str(snapshot)])
-            page = self.call(args, "RecordsResponse")
+            page = self._record_page(job, after_seq=cursor_after, snapshot_seq=snapshot, limit=limit)
             summary = page["summary"]
             if snapshot is None:
                 snapshot, generation = page["snapshot_seq"], summary["store_generation"]
@@ -540,6 +551,13 @@ class Client:
                 if previous != summary["tail_hash"]:
                     raise Refusal("history_regressed")
                 break
+            cursor_after = after
+        self.cache_history(job, records, frozen_summary)
+        return {"contract": CONTRACT, "snapshot_seq": snapshot, "summary": frozen_summary,
+                "records": records}
+
+    def cache_history(self, job, records, summary):
+        generation, snapshot, previous = summary["store_generation"], summary["snapshot_seq"], summary["tail_hash"]
         store = IntentStore(self, job)
         with store.locked() as intents:
             cached = self.snapshot_locked(store)
@@ -557,16 +575,64 @@ class Client:
                             or records[seq - 1]["record_hash"] != receipt["record_hash"]):
                         raise Refusal("history_regressed")
             claims = [r for r in records if r["kind"] == "claim"]
-            if not claims or claims[-1]["seq"] != frozen_summary["claim_seq"]:
+            if not claims or claims[-1]["seq"] != summary["claim_seq"]:
                 raise Refusal("protocol_invalid")
-            snapshot_value = dict(summary=frozen_summary, store_generation=generation,
+            snapshot_value = dict(summary=summary, store_generation=generation,
                                   snapshot_seq=snapshot, tail_hash=previous,
                                   receipt_required=receipt_required(records),
                                   role=claims[-1]["payload"]["role"],
                                   read_at=datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"))
             self.save_snapshot(job, snapshot_value)
-        return {"contract": CONTRACT, "snapshot_seq": snapshot, "summary": frozen_summary,
-                "records": records}
+
+    def _record_page(self, job, after_seq=None, snapshot_seq=None, limit=None):
+        args = ["records", job_name(job)]
+        for flag, value in (("--after-seq", after_seq), ("--limit", limit), ("--snapshot-seq", snapshot_seq)):
+            if value is not None:
+                args.extend([flag, str(cursor_arg(value))])
+        return self.call(args, "RecordsResponse")
+
+    def record_page(self, job, after_seq=None, snapshot_seq=None, limit=None):
+        """Wire/display page. Decisions use records(), which verifies every page."""
+        cached, receipts = self.enrollment_witnesses(job)
+        try:
+            page = self._record_page(job, after_seq=after_seq, snapshot_seq=snapshot_seq, limit=limit)
+            summary, snapshot = page["summary"], page["snapshot_seq"]
+            after = 0 if after_seq is None else cursor_arg(after_seq)
+            if (summary["job_id"] != job or summary["snapshot_seq"] != snapshot
+                    or snapshot_seq is not None and cursor_arg(snapshot_seq) != snapshot
+                    or after < 0 or after > snapshot):
+                raise Refusal("protocol_invalid")
+            previous, end = ZERO_HASH if after == 0 else None, after
+            for record in page["records"]:
+                self.check_record(record, job, summary["store_generation"])
+                if (record["seq"] != end + 1 or record["seq"] > snapshot
+                        or previous is not None and record["previous_hash"] != previous):
+                    raise Refusal("history_regressed")
+                end, previous = record["seq"], record["record_hash"]
+            if (page["next_after_seq"] != end or page["has_more"] != (end < snapshot)
+                    or page["has_more"] and not page["records"]):
+                raise Refusal("protocol_invalid")
+            if page["records"] and not page["has_more"] and previous != summary["tail_hash"]:
+                raise Refusal("history_regressed")
+            witnesses = list(receipts)
+            if cached is not None:
+                witnesses.append(dict(store_generation=cached["store_generation"], seq=cached["snapshot_seq"],
+                                      record_hash=cached["tail_hash"]))
+            hashes = {record["seq"]: record["record_hash"] for record in page["records"]}
+            for witness in witnesses:
+                if (witness["store_generation"] != summary["store_generation"] or witness["seq"] > snapshot
+                        or witness["seq"] in hashes and hashes[witness["seq"]] != witness["record_hash"]):
+                    raise Refusal("history_regressed")
+            if after == 0 and not page["has_more"]:
+                self.cache_history(job, page["records"], summary)
+            return page
+        except Refusal as exc:
+            if exc.code == "not_found" and (cached is not None or receipts):
+                self.history_warning(job)
+                raise Refusal("history_regressed") from None
+            if exc.code == "history_regressed":
+                self.history_warning(job)
+            raise
 
     def save_snapshot(self, job, snapshot):
         # Caller holds the intents lock; obtain the same canonical directory,
@@ -1330,7 +1396,8 @@ def spawn_cli(argv):
 def main(argv=None):
     argv = list(sys.argv[1:] if argv is None else argv)
     if argv in (["--help"], ["-h"], []):
-        sys.stdout.write("""Usage: wrk o3 capabilities | job JOB | records JOB [--limit N] | content JOB SEQ
+        sys.stdout.write("""Usage: wrk o3 capabilities | job JOB | content JOB SEQ
+       wrk o3 records JOB [--after-seq N] [--snapshot-seq S] [--limit L]
        wrk o3 completed JOB --file REPORT
        wrk o3 joined JOB --file REPORT --head SHA --pr HTTPS_URL [--waiver-grant SEQ]
        wrk o3 central claim|activate|assign|import-begin JOB
@@ -1346,6 +1413,7 @@ def main(argv=None):
 Central commands use only the fixed account-home hk-director-1 or
 hk-operator-desk wrapper. Import seal hashes all server import records in
 the fixed snapshot; it never treats local event files as authority.
+Records prints one cursor page; follow snapshot_seq and next_after_seq.
 Completed/joined are typed adapter operations; C2 wires the main done/joined
 commands and delegated consumers. These operations do no local cleanup.
 """)
@@ -1376,7 +1444,9 @@ commands and delegated consumers. These operations do no local cleanup.
     parser.add_argument("job", nargs="?")
     parser.add_argument("seq", nargs="?", type=int)
     parser.add_argument("--resume")
-    parser.add_argument("--limit", type=int, default=100)
+    parser.add_argument("--limit", type=cursor_arg)
+    parser.add_argument("--after-seq", type=cursor_arg)
+    parser.add_argument("--snapshot-seq", type=cursor_arg)
     args = parser.parse_args(argv)
     client = Client()
     if args.operation != "append" and not sys.stdin.isatty() and sys.stdin.buffer.read(1):
@@ -1384,6 +1454,8 @@ commands and delegated consumers. These operations do no local cleanup.
     if args.operation != "content" and args.seq is not None:
         raise Refusal("cli_usage")
     if args.operation != "append" and args.resume is not None:
+        raise Refusal("cli_usage")
+    if args.operation != "records" and any(value is not None for value in (args.limit, args.after_seq, args.snapshot_seq)):
         raise Refusal("cli_usage")
     if args.operation == "capabilities":
         if args.job is not None:
@@ -1394,7 +1466,7 @@ commands and delegated consumers. These operations do no local cleanup.
         if args.operation == "job":
             value = client.job(args.job)
         elif args.operation == "records":
-            value = client.records(args.job, args.limit)
+            value = client.record_page(args.job, limit=args.limit, after_seq=args.after_seq, snapshot_seq=args.snapshot_seq)
         elif args.operation == "content":
             value = client.content(args.job, args.seq)
         else:

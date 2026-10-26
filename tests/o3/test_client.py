@@ -529,7 +529,7 @@ class ReadTests(Harness):
         with self.client() as client:
             result = client.records("job-a", limit=1)
         self.assertEqual(result["records"], records)
-        self.assertEqual(self.calls()[0]["argv"], ["wrk", "records", "job-a", "--after-seq", "0", "--limit", "1"])
+        self.assertEqual(self.calls()[0]["argv"], ["wrk", "records", "job-a", "--limit", "1"])
         self.assertEqual(self.calls()[1]["argv"], ["wrk", "records", "job-a", "--after-seq", "1", "--limit", "1", "--snapshot-seq", "2"])
         cache = self.intent_file().with_name("o3-snapshot.json")
         self.assertTrue(cache.is_file(), "a complete validated read must durably retain its offline snapshot")
@@ -1015,7 +1015,7 @@ class PackClientVectorTests(Harness):
                         self.assertEqual(result["snapshot_seq"], expected["snapshot_seq"])
                         pages = [c["argv"] for c in self.calls()]
                         position = query["after_seq"]
-                        self.assertEqual(pages[position][pages[position].index("--after-seq") + 1], str(position))
+                        self.assertEqual(pages[position][pages[position].index("--after-seq") + 1] if "--after-seq" in pages[position] else "0", str(position))
                         self.assertEqual(result["records"][position]["seq"], expected["record_seqs"][0])
         self.assertEqual(exercised, 3)
 
@@ -1548,6 +1548,80 @@ class HarnessPathTests(unittest.TestCase):
             self.assertEqual(result.testsRun, 1)
             self.assertEqual(result.errors, [])
             self.assertEqual(result.failures, [])
+
+
+
+class CursorArgumentTests(Harness):
+    # Director-1, b2041-solxh cursor ruling: shape/safe range is local;
+    # semantic cursor limits belong to the canonical server (design L159).
+    def isolate(self, label):
+        self.env["ARBITER_INBOX_ROOT"] = str(self.root / label)
+
+    def test_safe_integer_boundaries_reach_the_canonical_cli(self):
+        values = (0, -1, 1, 500, 501, 9007199254740991)
+        for field in ("limit", "after-seq", "snapshot-seq"):
+            for value in values:
+                with self.subTest(field=field, value=value):
+                    self.isolate(field + "-" + str(value))
+                    valid = (1 <= value <= 500 if field == "limit" else
+                             0 <= value <= 2 if field == "after-seq" else 1 <= value <= 2)
+                    response = {"action": "read"} if valid else dict(exit=65, stderr="handoffkeep wrk: invalid_cursor\n")
+                    self.seed(response)
+                    result = self.run_adapter("records", "job-a", "--" + field, str(value))
+                    self.assertEqual(result.returncode, 0 if valid else 65, result.stderr)
+                    calls = self.calls()
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0]["argv"], ["wrk", "records", "job-a", "--" + field, str(value)])
+                    if not valid:
+                        self.assertEqual(result.stderr, "wrk o3: invalid_cursor\n")
+
+    def test_invalid_literals_and_unsafe_integers_send_nothing(self):
+        for field in ("limit", "after-seq", "snapshot-seq"):
+            for literal in ("", "1.5", "1e3", "0x10", " 1", "1 ", "1 2", "9007199254740992", "-9007199254740992"):
+                with self.subTest(field=field, literal=literal):
+                    self.responses()
+                    result = self.run_adapter("records", "job-a", "--" + field, literal)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertEqual(self.calls(), [])
+
+    def test_omitted_cursor_fields_stay_omitted(self):
+        self.seed({"action": "read"}, {"action": "read"})
+        with self.client() as client:
+            self.assertEqual(len(client.records("job-a")["records"]), 2)
+        result = self.run_adapter("records", "job-a")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c["argv"] for c in self.calls()], [["wrk", "records", "job-a"]] * 2)
+        self.assertFalse(json.loads(result.stdout)["has_more"])
+
+    def test_partial_page_is_never_cached_as_complete_history(self):
+        self.seed({"action": "read"})
+        result = self.run_adapter("records", "job-a", "--after-seq", "1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        page = json.loads(result.stdout)
+        self.assertEqual([r["seq"] for r in page["records"]], [2])
+        self.assertFalse(self.intent_file().with_name("o3-snapshot.json").exists())
+
+    def test_page_not_found_after_receipt_is_history_regressed(self):
+        self.seed({"action": "accept"})
+        with self.client() as client:
+            client.append("job-a", self.round_request())
+        before = self.intent_file().read_bytes()
+        self.more_responses(dict(exit=66, stderr="handoffkeep wrk: not_found\n"))
+        result = self.run_adapter("records", "job-a", "--after-seq", "1")
+        self.assertEqual(result.returncode, 75, result.stderr)
+        self.assertEqual(result.stderr, "wrk o3: history_regressed\n")
+        self.assertEqual(self.intent_file().read_bytes(), before)
+        self.assertEqual([e["code"] for e in self.events()], ["history_regressed"])
+
+    def test_complete_history_helper_preserves_server_cursor_errors(self):
+        for value in (0, -1, 501, 9007199254740991):
+            with self.subTest(value=value):
+                self.responses(dict(exit=65, stderr="handoffkeep wrk: invalid_cursor\n"))
+                with self.client() as client:
+                    with self.assertRaises(self.module.Refusal) as error:
+                        client.records("job-a", limit=value)
+                self.assertEqual((error.exception.code, error.exception.exit), ("invalid_cursor", 65))
+                self.assertEqual(self.calls()[0]["argv"], ["wrk", "records", "job-a", "--limit", str(value)])
 
 
 class MutantTests(Harness):
