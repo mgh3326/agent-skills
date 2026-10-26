@@ -1935,11 +1935,37 @@ def import_payload(path, data):
 
 # ── entry point ──────────────────────────────────────────────────────────────
 
+def cursor_arg(value, flag):
+    """director-1 cursor ruling: a base-10 integer literal within the safe
+    integer range passes unchanged (the server judges invalid_cursor); anything
+    else is local cli_usage with nothing sent."""
+    if value is None:
+        return None
+    if not re.match(r"^-?[0-9]+$", value) or abs(int(value)) > SAFE_MAX:
+        raise Fail("cli_usage", "%s requires a base-10 integer within the safe-integer range" % flag)
+    return value
+
+
+def records_page(ctx, job, opts):
+    """One records page through the guarded CLI, as the 6b subcommand takes it:
+    omitted cursor flags are not sent, so the server defaults apply."""
+    args = ["records", job]
+    for flag in ("--after-seq", "--snapshot-seq", "--limit"):
+        value = cursor_arg(opts.get(flag), flag)
+        if value is not None:
+            args += [flag, value]
+    try:
+        page = check_records(run_cli(args), job)
+    except CliFail as exc:
+        raise Fail(exc.code)
+    emit(json.dumps(page, sort_keys=True))
+
+
 FLAGS = {"--head", "--extension-grant", "--repeat-grant", "--tester", "--file", "--grant", "--reason-code",
          "--round", "--owner", "--label", "--pane", "--parent", "--role", "--task", "--lane", "--tier",
          "--subject", "--report", "--pr", "--waiver-grant", "--rounds-waived", "--as", "--owner-lane",
          "--parent-lane", "--host", "--predecessor", "--supersedes", "--target", "--seal-seq", "--events-dir",
-         "--o2-ref", "--phase"}
+         "--o2-ref", "--phase", "--after-seq", "--snapshot-seq", "--limit"}
 
 
 def parse(argv):
@@ -1962,7 +1988,7 @@ def parse(argv):
 
 OPS = {"round-open": round_open, "round-verdict": round_verdict, "round-void": round_void,
        "round-status": round_status, "audit-job": audit_job, "spawn-verify": spawn_verify,
-       "completed": completed, "joined": joined}
+       "completed": completed, "joined": joined, "records": records_page}
 
 
 def main(argv):

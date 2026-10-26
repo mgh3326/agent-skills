@@ -1987,6 +1987,41 @@ class PackHttpVectorCase(O3Case):
 # ── 6. adapter unit checks ────────────────────────────────────────────────────
 
 
+class CursorCase(O3Case):
+    """director-1 cursor ruling: limit, after_seq and snapshot_seq pass through
+    unchanged when they are safe integers; the server answers invalid_cursor."""
+
+    def test_cursor_boundaries(self):
+        w = self.world()
+        w.mode("required")
+        w.enroll("job-a")
+        cases = [("--limit", "0", 65), ("--limit", "-1", 65), ("--limit", "1", 0), ("--limit", "500", 0),
+                 ("--limit", "501", 65), ("--limit", str(2 ** 53 - 1), 65), ("--limit", str(2 ** 53), 2),
+                 ("--limit", "1.5", 2), ("--limit", "1e3", 2), ("--limit", "0x10", 2), ("--limit", " 5", 2),
+                 ("--limit", "", 2), ("--limit", str(-(2 ** 53 - 1)), 65), ("--limit", str(-(2 ** 53)), 2),
+                 ("--after-seq", "-1", 65), ("--after-seq", "0", 0), ("--after-seq", str(2 ** 53), 2),
+                 ("--snapshot-seq", "0", 65), ("--snapshot-seq", "1", 0), ("--snapshot-seq", "1.0", 2)]
+        for flag, value, rc in cases:
+            with self.subTest((flag, value)):
+                before = len(w.calls())
+                out = w.adapter("records", "job-a", flag, value)
+                self.assertEqual(out.returncode, rc, out.stderr)
+                sent = w.calls()[before:]
+                if rc == 2:
+                    self.assertIn("o3 cli_usage", out.stderr)
+                    self.assertEqual(sent, [], "nothing is sent for an unsendable cursor")
+                else:
+                    self.assertEqual(len(sent), 1)
+                    self.assertEqual(sent[0]["argv"], ["wrk", "records", "job-a", flag, value], "passed unchanged")
+                    if rc == 65:
+                        self.assertIn("o3 invalid_cursor", out.stderr)
+        before = len(w.calls())
+        out = w.adapter("records", "job-a")
+        self.assertRc(out, 0)
+        self.assertEqual(w.calls()[before]["argv"], ["wrk", "records", "job-a"], "omitted flags are not sent")
+        self.assertEqual(json.loads(out.stdout)["snapshot_seq"], 2)
+
+
 class AdapterUnitCase(O3Case):
     def test_canonical_json_sorts_by_utf16_and_rejects_floats(self):
         self.assertEqual(ADAPTER.canonical({"b": 1, "a": [True, None, "é"], "\U0001f600": 0, "￿": 1}),

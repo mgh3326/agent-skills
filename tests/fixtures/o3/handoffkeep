@@ -557,14 +557,23 @@ def main():
         respond({"contract": "hk1873.v1", "claim": entry["records"][summ["claim_seq"] - 1], "summary": summ})
     if sub == "records":
         (job,), opts = parse_args(argv[2:], 1, ("--after-seq", "--snapshot-seq", "--limit"))
-        after = number(opts.get("--after-seq", "0"))
-        limit = number(opts.get("--limit", "100"), True)
+        # Cursor values are the server's check (5): any integer outside its range
+        # is invalid_cursor; a non-integer is the CLI's own cli_usage.
+        cursor = {}
+        for flag in ("--after-seq", "--snapshot-seq", "--limit"):
+            if flag in opts:
+                if not re.match(r"^-?[0-9]+$", opts[flag]):
+                    out_fail("cli_usage")
+                cursor[flag] = int(opts[flag])
+        after = cursor.get("--after-seq", 0)
+        limit = cursor.get("--limit", 100)
         entry = job_of(state, job)
         if entry is None:
             out_fail("not_found")
         records = entry["records"]
-        snapshot = number(opts["--snapshot-seq"], True) if "--snapshot-seq" in opts else len(records)
-        if snapshot > len(records) or after > snapshot or limit > 500:
+        snapshot = cursor.get("--snapshot-seq", len(records))
+        if (snapshot > len(records) or snapshot < 1 or after < 0 or after > snapshot or limit < 1
+                or limit > 500):
             out_fail("invalid_cursor")
         limit = min(limit, state.get("page_limit", 500))
         page = [dict(r) for r in records[after:snapshot][:limit]]
