@@ -5879,4 +5879,5 @@ mkmut_span hk1860-status-argv \
 expect_mut_red "hk1860 status document on argv" case_hk1860_oversized_status \
   'ASSERT-RED: hk1860 oversized status still yields the ended job would-release'
 
+bash "$ROOT/tests/test-wrk-sentinel-detach.sh"
 echo "PASS test-wrk-job-end: all cases"
