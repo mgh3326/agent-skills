@@ -77,6 +77,13 @@ def strict_json(raw, code="protocol_invalid"):
         raise Refusal(code) from None
 
 
+def read_request_stdin():
+    raw = sys.stdin.buffer.read(1048577)
+    if len(raw) > 1048576:
+        raise Refusal("request_too_large")
+    return strict_json(raw, "invalid_request")
+
+
 def canonical(value):
     """RFC8785 for this contract's closed, safe-integer JSON vocabulary.
 
@@ -239,7 +246,13 @@ class Resolver:
 
 
 def records_mode(resolver):
-    home = resolver.resolve(need_hk=False)["home"]
+    test = os.environ.get("WRK_TEST_MODE") == "1"
+    if test and not os.environ.get("HOME"):
+        return "legacy"  # discovery only; Client.call still runs the guard
+    try:
+        home = resolver.resolve(need_hk=False)["home"] if test else pwd.getpwuid(os.getuid()).pw_dir
+    except (KeyError, OSError):
+        raise Refusal("cli_usage") from None
     path = Path(home) / ".config/wrk/records-mode"
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
@@ -432,7 +445,38 @@ class Client:
                 # a defective fixture by max(floor,baseline).
                 raise Refusal("protocol_invalid")
 
+    def enrollment_witnesses(self, job):
+        # Retained receipts and complete snapshots can only veto a read.
+        # They never supply positive authority or replace fresh records.
+        store = IntentStore(self, job)
+        with store.locked() as intents:
+            return (self.snapshot_locked(store),
+                    [item["receipt"] for item in intents["intents"] if item["receipt"] is not None])
+
+    def protected_witness(self, job):
+        store = IntentStore(self, job)
+        with store.locked() as intents:
+            snapshot = self.snapshot_locked(store)
+            return (snapshot is not None and snapshot["receipt_required"]
+                    or any(item["state"] == "accepted" and receipt_required([item["request"]])
+                           for item in intents["intents"]))
+
+    def history_warning(self, job):
+        self.warning(job, "history_regressed", "history")
+
     def job(self, job):
+        snapshot, receipts = self.enrollment_witnesses(job)
+        try:
+            return self.read_job(job)
+        except Refusal as exc:
+            if exc.code == "not_found" and (snapshot is not None or receipts):
+                self.history_warning(job)
+                raise Refusal("history_regressed") from None
+            if exc.code == "history_regressed":
+                self.history_warning(job)
+            raise
+
+    def read_job(self, job):
         job_name(job)
         value = self.call(["job", job], "JobResponse")
         self.check_record(value["claim"], job, value["summary"]["store_generation"])
@@ -453,6 +497,18 @@ class Client:
                 "summary": history["summary"], "records": history["records"]}
 
     def records(self, job, limit=100):
+        snapshot, receipts = self.enrollment_witnesses(job)
+        try:
+            return self.read_records(job, limit)
+        except Refusal as exc:
+            if exc.code == "not_found" and (receipts or snapshot is not None):
+                self.history_warning(job)
+                raise Refusal("history_regressed") from None
+            if exc.code == "history_regressed":
+                self.history_warning(job)
+            raise
+
+    def read_records(self, job, limit=100):
         job_name(job)
         if type(limit) is not int or not 1 <= limit <= 1000:
             raise Refusal("cli_usage")
@@ -483,7 +539,15 @@ class Client:
                 if previous != summary["tail_hash"]:
                     raise Refusal("history_regressed")
                 break
-        with IntentStore(self, job).locked() as intents:
+        store = IntentStore(self, job)
+        with store.locked() as intents:
+            cached = self.snapshot_locked(store)
+            if cached is not None:
+                seq = cached["snapshot_seq"]
+                if (cached["store_generation"] != generation or seq > snapshot
+                        or records[seq - 1]["record_hash"] != cached["tail_hash"]
+                        or cached["receipt_required"] and not receipt_required(records)):
+                    raise Refusal("history_regressed")
             for item in intents["intents"]:
                 receipt = item["receipt"]
                 if receipt is not None:
@@ -520,27 +584,30 @@ class Client:
             os.close(fd)
 
     def snapshot(self, job):
-        """Offline routing/display only. This value can never authorize a write."""
+        """Routing/display or a negative witness; never authorizes a write."""
         store = IntentStore(self, job)
         with store.locked():
-            try:
-                fd = secure_open("o3-snapshot.json", os.O_RDONLY, store.dir_fd)
-            except FileNotFoundError:
-                return None
-            with os.fdopen(fd, "rb") as stream:
-                value = strict_json(stream.read(), "intent_invalid")
-            fields = {"summary", "store_generation", "snapshot_seq", "tail_hash",
-                      "receipt_required", "role", "read_at"}
-            if not isinstance(value, dict) or set(value) != fields:
-                raise Refusal("intent_invalid")
-            self.schema.check("Summary", value["summary"], "intent_invalid")
-            if (value["summary"]["job_id"] != job
-                    or type(value["receipt_required"]) is not bool
-                    or value["role"] not in ("builder", "worker", "tester", "reviewer", "counsel")
-                    or not isinstance(value["read_at"], str)
-                    or any(value[k] != value["summary"][k] for k in ("store_generation", "snapshot_seq", "tail_hash"))):
-                raise Refusal("intent_invalid")
-            return value
+            return self.snapshot_locked(store)
+
+    def snapshot_locked(self, store):
+        try:
+            fd = secure_open("o3-snapshot.json", os.O_RDONLY, store.dir_fd)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(fd, "rb") as stream:
+            value = strict_json(stream.read(), "intent_invalid")
+        fields = {"summary", "store_generation", "snapshot_seq", "tail_hash",
+                  "receipt_required", "role", "read_at"}
+        if not isinstance(value, dict) or set(value) != fields:
+            raise Refusal("intent_invalid")
+        self.schema.check("Summary", value["summary"], "intent_invalid")
+        if (value["summary"]["job_id"] != store.job
+                or type(value["receipt_required"]) is not bool
+                or value["role"] not in ("builder", "worker", "tester", "reviewer", "counsel")
+                or not isinstance(value["read_at"], str)
+                or any(value[k] != value["summary"][k] for k in ("store_generation", "snapshot_seq", "tail_hash"))):
+            raise Refusal("intent_invalid")
+        return value
 
     def content(self, job, seq, record=None):
         job_name(job)
@@ -594,6 +661,8 @@ class Client:
                 if (record["kind"] != req["kind"] or record["request_sha256"] != item["request_sha256"]
                         or record["idempotency_key"] != item["idempotency_key"]
                         or record["seq"] != req["expected_seq"] + 1
+                        or record["claim_seq"] != (record["seq"] if req["kind"] == "claim" else req["claim_seq"])
+                        or response["summary"]["claim_seq"] != record["claim_seq"]
                         or response["summary"]["job_id"] != job
                         or response["summary"]["snapshot_seq"] != record["seq"]
                         or response["summary"]["tail_hash"] != record["record_hash"]):
@@ -617,6 +686,13 @@ class Client:
         # Called with the intent lock held; avoid recursive records() locking.
         page = self.call(["records", job, "--after-seq", str(receipt["seq"] - 1),
                           "--snapshot-seq", str(receipt["seq"]), "--limit", "1"], "RecordsResponse")
+        if (page["snapshot_seq"] != receipt["seq"]
+                or page["summary"]["snapshot_seq"] != receipt["seq"]
+                or page["summary"]["job_id"] != job
+                or page["summary"]["store_generation"] != receipt["store_generation"]
+                or page["summary"]["tail_hash"] != receipt["record_hash"]
+                or page["next_after_seq"] != receipt["seq"] or page["has_more"]):
+            raise Refusal("protocol_invalid")
         if len(page["records"]) != 1:
             raise Refusal("history_regressed")
         record = page["records"][0]
@@ -723,8 +799,18 @@ class Client:
         self.event(job, dict(kind="job.o3_warning", job_id=job, code=code,
                              operation=operation, idempotency_key=key, o3_mode="shadow", epoch=1))
 
+    def retry_pending(self, job, kind, **identity):
+        # Only an existing operational intent selects this branch. Absence
+        # never infers enrollment or creates a local claim/pane reservation.
+        directory = Path(self.resolver.resolve(self.central)["inbox"]) / job_name(job)
+        if os.path.lexists(directory / "o3-intents.json"):
+            pending = self.pending(job, kind, **identity)
+            if pending:
+                return self.append(job, resume=pending)
+        return None
+
     def spawn_check(self, job, role, tier, task=None, owner=None, parent=None,
-                    subject=None, head=None, extension=None, repeat=None, mode="required", predecessor=None):
+                    subject=None, head=None, extension=None, repeat=None, mode="required", predecessor=None, repo=None):
         """C1 admission handshake only; no quota, pane, link/rebind or release.
 
         Central claim/activation are desk operations. A host may mint only
@@ -734,7 +820,11 @@ class Client:
         if role in ("tester", "reviewer", "counsel") and subject:
             if subject == job:
                 raise Refusal("claim_conflict")  # before target lookup
-            target = self.job(job_name(subject))
+            # A prior unknown claim/open must reconcile before fresh target
+            # liveness, CAS or local Git checks can refuse the new attempt.
+            self.retry_pending(job, "claim", job_id=job)
+            self.retry_pending(job_name(subject), "round_open", head=head, tester_job_id=job)
+            target = self.job(subject)
             canonical = target["claim"]["payload"]
             state = target["summary"]["state"]
             if canonical["role"] not in ("builder", "worker") or state not in ("active", "shadow"):
@@ -745,6 +835,8 @@ class Client:
                 raise Refusal("claim_conflict")
             if not isinstance(head, str) or not re.fullmatch(r"[0-9a-f]{40}", head):
                 raise Refusal("cli_usage")
+            if repo is not None:
+                validate_head(self, subject, head, repo)
             live = [r for r in target["records"] if r["kind"] == "round_open"
                     and r["payload"]["round_no"] in target["summary"]["open_rounds"]
                     and r["payload"]["head"] == head
@@ -851,7 +943,7 @@ def route_job(client, job, mode):
         if exc.code not in TEMPORARY:
             raise
         snapshot = client.snapshot(job)
-        if (snapshot is None or mode != "shadow" or snapshot["receipt_required"]
+        if (snapshot is None or mode != "shadow" or client.protected_witness(job)
                 or snapshot["role"] not in ("builder", "worker") or snapshot["summary"]["state"] != "shadow"):
             raise Refusal("transport_unavailable") from None
         return dict(summary=snapshot["summary"], records=[], offline=True)
@@ -971,10 +1063,7 @@ def round_cli(client, argv, mode):
             raise Refusal("cli_usage")
         # Unknown writes replay BEFORE any fresh CAS, terminal or claim read.
         response = client.append(job, resume=unfinished)
-        try:
-            fresh = client.job(job)
-        except Refusal:
-            raise ProjectionPending() from None
+        fresh = client.job(job)
         projection_mode = "enforced" if receipt_required(fresh["records"]) else "shadow"
         client.project(response, projection_mode)
         record = response["record"]
@@ -1056,14 +1145,16 @@ def decode_content(value, code="invalid_request"):
 
 
 def verdict_header(raw):
+    # Extract only fields needed to form Input_verdict. Body UTF-8, extra
+    # headers and all semantic evidence checks belong to the canonical
+    # server, after its authentication/permission ordering.
+    first, lf, _body = raw.partition(b"\n")
     try:
-        text = raw.decode("utf-8", "strict")
+        line = first.decode("ascii", "strict")
     except UnicodeError:
         raise Refusal("invalid_verdict") from None
-    first, *rest = text.split("\n")
-    match = re.fullmatch(r"VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})[ \t]*(?:\r)?", first, re.ASCII)
-    if (match is None or first.endswith("\r") and b"\n" not in raw
-            or any(line.startswith("VERDICT:") for line in rest)):
+    match = re.fullmatch(r"VERDICT: (PASS|BLOCKER) @([0-9a-fA-F]{40})[ \t]*(?:\r)?", line, re.ASCII)
+    if match is None or first.endswith(b"\r") and not lf:
         raise Refusal("invalid_verdict")
     return match[1], match[2].lower()
 
@@ -1162,6 +1253,9 @@ def central_cli(argv):
                                source_locator=args.source_locator, legacy_kind=args.legacy_kind,
                                original_actor_client_id=args.original_actor, original_at=args.original_at)
     if kind == "import_seal":
+        pending = client.retry_pending(args.job, kind, begin_seq=args.begin_seq)
+        if pending is not None:
+            return pending
         history = client.records(args.job)
         if history["snapshot_seq"] != args.expected_seq:
             raise Refusal("sequence_conflict")
@@ -1174,7 +1268,7 @@ def central_cli(argv):
         payload = dict(begin_seq=args.begin_seq, expected_import_count=len(manifest),
                        manifest_sha256=digest(manifest), reason_code=args.reason_code)
     else:
-        payload = strict_json(sys.stdin.buffer.read(), "invalid_request")
+        payload = read_request_stdin()
         if args.command == "assign" and (payload.get("role") not in ("tester", "reviewer", "counsel") or payload.get("review_of") is None):
             raise Refusal("invalid_request")
     return client.append(args.job, dict(kind=kind, expected_seq=args.expected_seq,
@@ -1209,6 +1303,7 @@ def typed_completion_cli(argv):
 def spawn_cli(argv):
     parser = Parser(prog="wrk o3 spawn-check", allow_abbrev=False)
     parser.add_argument("job")
+    parser.add_argument("--repo")
     parser.add_argument("--role", required=True, choices=("builder", "worker", "tester", "reviewer", "counsel"))
     parser.add_argument("--tier", required=True)
     parser.add_argument("--task", type=int)
@@ -1224,7 +1319,7 @@ def spawn_cli(argv):
     result = client.spawn_check(args.job, args.role, args.tier, task=args.task,
                                 owner=args.owner, parent=args.parent, subject=args.parent_job,
                                 head=(args.head or "").lower() or None, extension=args.extension_grant,
-                                repeat=args.repeat_grant, mode=records_mode(client.resolver), predecessor=args.takeover_from)
+                                repeat=args.repeat_grant, mode=records_mode(client.resolver), predecessor=args.takeover_from, repo=args.repo)
     if result is None:
         return LEGACY_ROUTE
     return "%d\t%s\t%s\t%s" % (result["task_id"], result["owner_lane"], result["parent_lane"],
@@ -1302,7 +1397,7 @@ commands and delegated consumers. These operations do no local cleanup.
         elif args.operation == "content":
             value = client.content(args.job, args.seq)
         else:
-            value = client.append(args.job, strict_json(sys.stdin.buffer.read(), "invalid_request")
+            value = client.append(args.job, read_request_stdin()
                                   if args.resume is None else None, resume=args.resume)
     sys.stdout.buffer.write(canonical(value) + b"\n")
     return 0

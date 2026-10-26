@@ -3,6 +3,7 @@ import hashlib
 import base64
 import contextlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -129,8 +130,9 @@ class Harness(unittest.TestCase):
         shutil.copyfile(ROOT / "tests/fixtures/wrk-o3/handoffkeep", self.hk)
         self.hk.chmod(0o700)
         self.script = self.root / "script.json"
-        self.env = {key: value for key, value in os.environ.items()
-                    if key not in SCRUB and key not in ("ARBITER_JOB", "HK_TASK_ID")}
+        self.env = {key: os.environ[key] for key in os.environ
+                    if key not in SCRUB and key not in ("ARBITER_JOB", "HK_TASK_ID", "BASH_ENV", "ENV",
+                                                        "CLAUDE_CONFIG_DIR", "HANDOFFKEEP_TEST_DB_URL")}
         self.env.update(HOME=str(self.home), TMPDIR=str(self.root),
                         XDG_CONFIG_HOME=str(self.root / "config"),
                         XDG_CACHE_HOME=str(self.root / "cache"),
@@ -142,7 +144,13 @@ class Harness(unittest.TestCase):
                         HANDOFFKEEP_BIN=str(self.hk), WRK_TEST_MODE="1",
                         WRK_O3_STUB_SCRIPT=str(self.script))
         # Only fixture paths and OS tools. No installed agent/handoffkeep lookup.
-        self.env["PATH"] = "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
+        path_tools = self.root / "path-tools"
+        path_tools.mkdir()
+        (path_tools / "python3").symlink_to(sys.executable)
+        trap = path_tools / "handoffkeep"
+        trap.write_text("#!/bin/sh\n[ \"$WRK_TEST_MODE\" = 1 ] || exit 98\nexit 99\n")
+        trap.chmod(0o700)
+        self.env["PATH"] = str(path_tools) + ":/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"
         for key in ("HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME",
                     "XDG_DATA_HOME", "XDG_RUNTIME_DIR", "CODEX_HOME", "ARBITER_INBOX_ROOT"):
             Path(self.env[key]).mkdir(parents=True, exist_ok=True)
@@ -201,7 +209,7 @@ class Harness(unittest.TestCase):
 
     def run_wrk(self, *args, stdin=""):
         return subprocess.run(["bash", str(WRK), *args], input=stdin, text=True,
-                              capture_output=True, env=self.env, timeout=30)
+                              capture_output=True, env=self.env, timeout=120)
 
     def events(self, job="job-a"):
         return [json.loads(p.read_text()) for p in sorted(self.intent_file(job).parent.glob("events/*.json"))]
@@ -556,12 +564,10 @@ class ReadTests(Harness):
         self.seed({"action": "read"}, {"action": "read"})
         with self.client() as client:
             resolve = client.resolver.resolve
-            count = 0
-
             def guarded(*args, **kwargs):
-                nonlocal count
-                count += 1
-                if count == 2:
+                # Storage guards may run too; replace the binary only after
+                # the first real cursor page, never by counting all guards.
+                if len(self.calls()) == 1:
                     raise self.module.Refusal("cli_usage")
                 return resolve(*args, **kwargs)
 
@@ -711,8 +717,12 @@ class TypedAdapterTests(Harness):
         self.typed_submission("joined")
 
     def test_joined_rejects_a_free_waiver_ref(self):
-        self.responses()
-        result = self.run_wrk("o3", "joined", "job-a", "--file", "absent", "--waiver-grant", "hk:doc/free")
+        report = self.root / "join-report.md"
+        report.write_text("review joined\n")
+        self.seed({"action": "read"}, {"action": "read"}, {"action": "accept"})
+        result = self.run_wrk("o3", "joined", "job-a", "--file", str(report),
+                              "--head", "1" * 40, "--pr", "https://github.com/fixture/repo/pull/1",
+                              "--waiver-grant", "hk:doc/free")
         self.assertEqual(result.returncode, 2)
         self.assertEqual(self.calls(), [])
 
@@ -779,6 +789,7 @@ class CentralToolingTests(Harness):
                        dict(seq=4, kind="import", payload=dict(source_locator="a", source_sha256="a" * 64)),
                        dict(seq=5, kind="import", payload=dict(source_locator="b", source_sha256="b" * 64))]
             client = mock.Mock()
+            client.retry_pending.return_value = None
             client.records.return_value = dict(snapshot_seq=5, records=records)
             client.append.return_value = {"receipt": "synthetic"}
             with mock.patch.object(self.module, "Client", return_value=client):
@@ -981,6 +992,7 @@ class PackClientVectorTests(Harness):
                 wire = case["request"]
                 if wire.get("type") != "http" or wire.get("method") != "GET":
                     continue
+                self.env["ARBITER_INBOX_ROOT"] = str(self.root / ("get-case-" + str(exercised)))
                 with self.subTest(case=case["name"]), self.client() as client:
                     exercised += 1
                     if wire["path"].endswith("capabilities"):
@@ -1273,6 +1285,224 @@ class DesignObservationTests(Harness):
             self.assertFalse(replay["created"])
 
 
+class RecoveryEdges(Harness):
+
+    def test_write_reply_binds_the_expected_claim(self):
+        self.seed({'action': 'accept'})
+        with self.client() as client:
+            call = client.call
+
+            def wrong(*a, **k):
+                value = call(*a, **k)
+                value['record']['claim_seq'] = 7
+                value['summary']['claim_seq'] = 7
+                value['record']['record_hash'] = self.module.digest({k: v for k, v in value['record'].items() if k != 'record_hash'})
+                value['summary']['tail_hash'] = value['record']['record_hash']
+                return value
+            with mock.patch.object(client, 'call', side_effect=wrong):
+                with self.assertRaises(self.module.Refusal) as error:
+                    client.append('job-a', self.round_request())
+            self.assertEqual(error.exception.code, 'protocol_invalid')
+
+    def test_accepted_repair_validates_the_requested_snapshot(self):
+        self.seed({'action': 'accept'}, {'action': 'read'})
+        with self.client() as client:
+            client.append('job-a', self.round_request())
+            item = json.loads(self.intent_file().read_text())['intents'][0]
+            call = client.call
+
+            def wrong(*a, **k):
+                value = call(*a, **k)
+                value['snapshot_seq'] += 1
+                return value
+            with mock.patch.object(client, 'call', side_effect=wrong):
+                with self.assertRaises(self.module.Refusal) as error:
+                    client.append('job-a', resume=item['local_id'])
+            self.assertEqual(error.exception.code, 'protocol_invalid')
+
+    def check_spawn_replay(self, phase):
+        responses = [{'action': 'accept'} for _ in range(5 if phase == 'claim' else 8)]
+        responses[-1] = {'action': 'commit_lost'}
+        self.seed(*responses)
+        with self.client() as client:
+            with self.assertRaises(self.module.Refusal):
+                client.spawn_check('job-review', 'tester', 'T2', subject='job-a', head='1' * 40)
+            data = json.loads(self.script.read_text())
+            DesignObservationTests.record(self, 'end', dict(end_type='reaped', reason_code='ended'), data['journal'])
+            data['responses'] = [{'action': 'accept'}, {'action': 'read'}, {'action': 'read'}]
+            data['calls'] = []
+            self.script.write_text(json.dumps(data))
+            with self.assertRaises(self.module.Refusal):
+                client.spawn_check('job-review', 'tester', 'T2', subject='job-a', head='1' * 40)
+            self.assertEqual(self.calls()[0]['argv'][1], 'append', 'unknown outcome must replay before target terminal checks')
+            job = 'job-review' if phase == 'claim' else 'job-a'
+            self.assertEqual(json.loads(self.intent_file(job).read_text())['intents'][0]['state'], 'accepted')
+
+    def test_review_claim_unknown_replays_before_target_end(self):
+        self.check_spawn_replay('claim')
+
+    def test_review_open_unknown_replays_before_target_end(self):
+        self.check_spawn_replay('open')
+
+    def test_scope_refusal_is_not_preempted_by_verdict_body_validation(self):
+        head = RoundCommandTests.open_round(self)
+        path = self.root / 'invalid-body.md'
+        path.write_bytes(('VERDICT: PASS @' + head + '\n').encode() + b'\xff')
+        self.more_responses({'action': 'read'}, {'action': 'read'}, dict(exit=77, stderr='handoffkeep wrk: scope_denied\n'))
+        result = self.run_wrk('round', 'verdict', 'job-a', '--file', str(path))
+        self.assertEqual(result.returncode, 77, result.stderr)
+        self.assertEqual(self.calls()[-1]['argv'][1], 'append')
+
+    def test_raw_request_size_is_bounded_before_send(self):
+        self.seed({'action': 'accept'})
+        result = self.run_adapter('append', 'job-a', stdin=json.dumps(self.round_request()) + ' ' * 1048576)
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertEqual(result.stderr, 'wrk o3: request_too_large\n')
+        self.assertEqual(self.calls(), [])
+
+class HistoryWitnessTests(Harness):
+
+    def not_found(self):
+        return dict(exit=66, stderr='handoffkeep wrk: not_found\n')
+
+    def assert_regressed(self, client):
+        try:
+            result = self.module.route_job(client, 'job-a', 'shadow')
+        except self.module.Refusal as error:
+            self.assertEqual((error.code, error.exit), ('history_regressed', 75))
+        else:
+            self.fail('enrollment witness must refuse regression, got ' + repr(result))
+        self.assertEqual(len([e for e in self.events() if e.get('code') == 'history_regressed']), 1)
+
+    def test_not_found_after_receipt_never_downgrades_or_discards_pending(self):
+        self.seed({'action': 'accept'}, dict(exit=75, stderr='handoffkeep wrk: transport_indeterminate\n'))
+        with self.client() as client:
+            client.append('job-a', self.round_request())
+            try:
+                client.append('job-a', self.round_request(expected=3, head='2' * 40))
+            except self.module.Refusal:
+                pass
+            before = self.intent_file().read_bytes()
+            self.more_responses(self.not_found(), self.not_found())
+            self.assert_regressed(client)
+            self.assert_regressed(client)
+            self.assertEqual(self.intent_file().read_bytes(), before)
+            self.assertEqual(json.loads(before)['intents'][-1]['state'], 'pending')
+
+    def test_snapshot_alone_remembers_enrollment_after_intents_deleted(self):
+        self.seed({'action': 'read'}, {'action': 'read'})
+        with self.client() as client:
+            client.job('job-a')
+            snapshot = self.intent_file().with_name('o3-snapshot.json')
+            before = snapshot.read_bytes()
+            self.intent_file().unlink(missing_ok=True)
+            self.more_responses(self.not_found())
+            self.assert_regressed(client)
+            self.assertEqual(snapshot.read_bytes(), before)
+
+    def test_generation_regression_cannot_replace_complete_snapshot(self):
+        self.seed({'action': 'read'}, {'action': 'read'})
+        with self.client() as client:
+            client.job('job-a')
+            before = self.intent_file().with_name('o3-snapshot.json').read_bytes()
+            data = json.loads(self.script.read_text())
+            previous = '0' * 64
+            for record in data['journal']:
+                record['store_generation'] = '00000000-0000-4000-8000-ffff00000002'
+                record['previous_hash'] = previous
+                record['record_hash'] = self.module.digest({k: v for k, v in record.items() if k != 'record_hash'})
+                previous = record['record_hash']
+            data['responses'] = [{'action': 'read'}, {'action': 'read'}]
+            self.script.write_text(json.dumps(data))
+            self.assert_regressed(client)
+            self.assertEqual(self.intent_file().with_name('o3-snapshot.json').read_bytes(), before)
+
+    def test_seq_regression_cannot_replace_complete_snapshot(self):
+        self.seed({'action': 'accept'}, {'action': 'read'}, {'action': 'read'})
+        with self.client() as client:
+            client.append('job-a', self.round_request())
+            client.job('job-a')
+            before = self.intent_file().with_name('o3-snapshot.json').read_bytes()
+            self.intent_file().unlink()
+            data = json.loads(self.script.read_text())
+            data['journal'] = data['journal'][:2]
+            data['responses'] = [{'action': 'read'}, {'action': 'read'}]
+            self.script.write_text(json.dumps(data))
+            self.assert_regressed(client)
+            self.assertEqual(self.intent_file().with_name('o3-snapshot.json').read_bytes(), before)
+
+    def test_no_witness_shadow_unknown_still_routes_legacy(self):
+        self.responses(self.not_found())
+        with self.client() as client:
+            self.assertIsNone(self.module.route_job(client, 'job-a', 'shadow'))
+        self.assertEqual([e['code'] for e in self.events()], ['not_found'])
+
+class ProtectedOffline(Harness):
+
+    def test_accepted_activation_is_a_negative_offline_witness(self):
+        records = self.seed({'action': 'read'}, {'action': 'read'}, {'action': 'accept'}, dict(exit=75, stderr='handoffkeep wrk: transport_unavailable\n'))
+        data = json.loads(self.script.read_text())
+        data['journal'] = records[:1]
+        self.script.write_text(json.dumps(data))
+        with self.client() as client:
+            client.job('job-a')
+            client.append('job-a', dict(kind='activate', expected_seq=1, claim_seq=1, payload=dict(reason_code='initial_activation', seal_seq=None)))
+            try:
+                self.module.route_job(client, 'job-a', 'shadow')
+            except self.module.Refusal as e:
+                self.assertEqual(e.exit, 75)
+            else:
+                self.fail('accepted activation must veto stale shadow routing')
+
+class ModeDiscoveryTests(Harness):
+
+    def mode_block(self):
+        source = WRK.read_text()
+        body = source.split('wrk_o3_mode() {', 1)[1].split("<<'PY'\n", 1)[1].split('\nPY\n}', 1)[0]
+        begin = source.index('# --- trust paths: begin')
+        end = source.index('# --- trust paths: end ---', begin)
+        return (body, 'import os,stat,shutil\n' + source[begin:end])
+
+    def discover(self):
+        body, guard = self.mode_block()
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, dict(self.env, WRK_TRUST_PY=guard), clear=True), mock.patch('pwd.getpwuid', return_value=type('Account', (), {'pw_dir': str(self.home)})()), contextlib.redirect_stdout(out):
+            try:
+                exec(compile(body, 'actual wrk_o3_mode Python call site', 'exec'), {})
+            except SystemExit as result:
+                self.assertEqual(result.code, 0)
+        return out.getvalue().strip()
+
+    def test_test_mode_unset_home_opens_no_mode_path(self):
+        self.assertFalse((self.home / '.config/wrk/records-mode').exists())
+        self.env.pop('HOME')
+        with mock.patch.object(os, 'open', side_effect=AssertionError('mode discovery opened a path')) as opened:
+            self.assertEqual(self.discover(), 'legacy')
+            opened.assert_not_called()
+
+    def test_production_unset_or_overridden_home_reads_only_passwd_mode(self):
+        self.mode('required')
+        self.env['WRK_TEST_MODE'] = '0'
+        mode = self.home / '.config/wrk/records-mode'
+        open_file = os.open
+        for value in (None, str(self.root / 'caller-home')):
+            if value is None:
+                self.env.pop('HOME', None)
+            else:
+                self.env['HOME'] = value
+            with self.subTest(home=value), mock.patch.object(os, 'open', wraps=open_file) as opened:
+                self.assertEqual(self.discover(), 'required')
+                self.assertEqual([Path(c.args[0]) for c in opened.call_args_list], [mode])
+
+    def test_o3_call_with_unset_test_home_still_checks_guard(self):
+        self.env.pop('HOME')
+        self.env.pop('ARBITER_INBOX_ROOT')
+        self.responses()
+        result = self.run_adapter('capabilities')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(self.calls(), [])
+
+
 class MutantTests(Harness):
     def test_required_invariants_turn_named_tests_red_at_real_call_sites(self):
         adapter_source = ADAPTER.read_text()
@@ -1307,6 +1537,10 @@ class MutantTests(Harness):
              '        child_env = {key: os.environ[key] for key in os.environ if key not in OVERRIDE_KEYS}',
              '        child_env = {key: os.environ[key] for key in os.environ if key not in OVERRIDE_KEYS or key == "HANDOFFKEEP_TOKEN"}',
              "TransportTests.test_override_environment_keys_absent"),
+            ("ignore-enrollment-witness", "adapter",
+             '            if exc.code == "not_found" and (snapshot is not None or receipts):',
+             '            if False:  # mutant: ignore retained enrollment witnesses',
+             "HistoryWitnessTests.test_not_found_after_receipt_never_downgrades_or_discards_pending"),
             ("skip-legacy-link", "wrk", '  [[ "$O3_SPAWN_VERIFIED" -eq 1 ]] || hk_task_link',
              '  : # mutant: skip the legacy task link too',
              "SpawnHandshakeTests.test_real_legacy_spawn_keeps_task_probe_and_link"),

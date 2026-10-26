@@ -5226,9 +5226,15 @@ import os, pwd, stat, sys
 ns = {"__name__": "wrk_mode_guard"}
 exec(os.environ["WRK_TRUST_PY"], ns)
 try:
-    home = pwd.getpwuid(os.getuid()).pw_dir
     test = os.environ.get("WRK_TEST_MODE") == "1"
-    ns["trust_resolve"](os.environ, home, os.getuid(), test, False)
+    if test and not os.environ.get("HOME"):
+        # Director-1 hk951 ruling: discovery only, no path read. Adapter
+        # operations still require the unchanged full PR242 guard.
+        print("legacy")
+        raise SystemExit(0)
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    if test:
+        ns["trust_resolve"](os.environ, home, os.getuid(), True, False)
     checked_home = os.environ["HOME"] if test else home
     path = os.path.join(checked_home, ".config", "wrk", "records-mode")
     try:
@@ -11208,14 +11214,13 @@ spawn_cmd() {
       die "O3 spawn refuses legacy --round-ext and --task-hk-bypass; use typed grants"
     if [[ -n "$O3_SPAWN_HEAD" ]]; then
       [[ "$O3_SPAWN_HEAD" =~ ^[0-9a-fA-F]{40}$ ]] || die "O3 reviewer --head requires a full 40-hex SHA"
-      round_head_check "$CWD" "$O3_SPAWN_HEAD" || die "O3 reviewer --head is not a commit in the spawn worktree"
     fi
     local o3_args=(spawn-check "$JOB_ID" --role "$ROLE" --tier "$JOB_T")
     [[ -z "$TASK_ID" ]] || o3_args+=(--task "$TASK_ID")
     [[ -z "${BUILDER_LANE:-$OWNER}" ]] || o3_args+=(--owner "${BUILDER_LANE:-$OWNER}")
     [[ -z "$PARENT_LANE" ]] || o3_args+=(--parent "$PARENT_LANE")
     [[ -z "$PARENT_JOB" ]] || o3_args+=(--parent-job "$PARENT_JOB")
-    [[ -z "$O3_SPAWN_HEAD" ]] || o3_args+=(--head "$O3_SPAWN_HEAD")
+    [[ -z "$O3_SPAWN_HEAD" ]] || o3_args+=(--head "$O3_SPAWN_HEAD" --repo "$CWD")
     [[ -z "$O3_EXTENSION_GRANT" ]] || o3_args+=(--extension-grant "$O3_EXTENSION_GRANT")
     [[ -z "$O3_REPEAT_GRANT" ]] || o3_args+=(--repeat-grant "$O3_REPEAT_GRANT")
     [[ -z "$TAKEOVER_FROM" ]] || o3_args+=(--takeover-from "$TAKEOVER_FROM")
