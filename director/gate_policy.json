@@ -419,6 +419,25 @@
         "T2"
       ]
     },
+    "builder-haiku-medium": {
+      "default_effort": "medium",
+      "family": "anthropic",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "medium": null
+      },
+      "launcher": "claude",
+      "launcher_model_token": "--model haiku",
+      "model": "claude-haiku-4.5",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-haiku-xhigh": {
       "default_effort": "xhigh",
       "family": "anthropic",

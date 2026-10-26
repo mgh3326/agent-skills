@@ -1126,7 +1126,7 @@ class EligibilityFixtures(unittest.TestCase):
     def test_e6_builder_grades_conflict_and_grok_model_must_match_wrk(self) -> None:
         variants = ("builder-opus-low", "builder-opus-medium", "builder-sonnet-xhigh", "builder-sonnet-max",
                     "builder-sol-high", "builder-sol-medium", "builder-sol-xhigh",
-                    "builder-luna-max", "builder-luna-high",
+                    "builder-luna-max", "builder-luna-high", "builder-haiku-medium",
                     "builder-kimi-high", "builder-kimi-max",
                     "builder-grok-low", "builder-grok-medium", "builder-grok-xhigh")
         for alias in variants:
@@ -1166,6 +1166,11 @@ class EligibilityFixtures(unittest.TestCase):
         self.assert_case(checks, "surface_permission", "PASS", "PROFILE_SURFACE_ALLOWED")
         self.assert_case(checks, "independence", "PASS", "CROSS_FAMILY")
         self.assert_case(checks, "grade", "PASS", "GRADE_SUFFICIENT")
+        # merge-precheck on a T3 task demands every eligibility check be PASS or
+        # N/A (director/merge_precheck.py ELIGIBILITY_NOT_PASS), so assert that
+        # whole predicate, not just the five checks named above.
+        self.assertEqual({name: check["reason_code"] for name, check in checks.items()
+                          if check["status"] not in ("PASS", "N/A")}, {})
 
     def test_every_terra_profile_is_denied_to_testers(self) -> None:
         barred = ("codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",

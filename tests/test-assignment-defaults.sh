@@ -977,6 +977,31 @@ grep -q 'policy launch codex-luna effort=high' "$TMP/launch.log" ||
   fail "builder-luna-high must consult codex-luna at high: $(cat "$TMP/launch.log")"
 echo "PASS builder-luna-high is marker-gated and records codex-luna@high"
 
+# hk 2043 item 5b: builder-haiku-medium (r1026effdown arm B, haiku@high vs
+# haiku@medium) is an E6 measurement spelling like builder-haiku-low — without
+# SCOPEFUEL_E6_ARM=haiku@medium it is refused; with it the spawn gates and
+# consults at haiku@medium.
+set +e
+out="$(SCOPEFUEL_E6_ARM='' \
+  spawn_t736 builder-haiku-medium --role builder --lane builder-lane --parent parent-lane \
+  --job t736-haiku-medium-bare 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 2 ]] || fail "unmarked builder-haiku-medium must die rc 2 (rc=$rc): $out"
+grep -q 'SCOPEFUEL_E6_ARM=haiku@medium' <<<"$out" ||
+  fail "unmarked builder-haiku-medium refusal must name the marker: $out"
+: >"$TMP/herdr.log" "$TMP/launch.log" "$TMP/scopefuel.log"
+out="$(SCOPEFUEL_E6_ARM=haiku@medium \
+  spawn_t736 builder-haiku-medium --role builder --lane builder-lane --parent parent-lane \
+  --job t736-haiku-medium 2>&1)" || fail "armed builder-haiku-medium must be admitted: $out"
+grep -q -- '--effort medium' "$TMP/herdr.log" ||
+  fail "builder-haiku-medium must launch at effort medium: $(cat "$TMP/herdr.log")"
+grep -q 'policy launch haiku effort=medium' "$TMP/launch.log" ||
+  fail "builder-haiku-medium must consult haiku at medium: $(cat "$TMP/launch.log")"
+grep -qF 'gate -m haiku --effort medium' "$TMP/scopefuel.log" ||
+  fail "builder-haiku-medium must ask the gate about haiku@medium: $(cat "$TMP/scopefuel.log")"
+echo "PASS builder-haiku-medium is marker-gated and records haiku@medium"
+
 # Worker-side names keep working: a bare codex-sol worker spawn still resolves
 # (the seat rule is builder-scoped), running the Sol model argv.
 spawn_t736 codex-sol --job t736-worker-sol >/dev/null

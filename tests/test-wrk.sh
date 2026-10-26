@@ -290,9 +290,10 @@ for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh buil
   builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
 done
-# hk 2043: builder-sol-xhigh is a normal pinned spelling (no E6 marker) and
-# builder-luna-high is the luna family's high E6 rung.
-for pinned_profile in builder-sol-xhigh builder-luna-high; do
+# hk 2043: builder-sol-xhigh is a normal pinned spelling (no E6 marker),
+# builder-luna-high is the luna family's high E6 rung and builder-haiku-medium
+# is the haiku family's medium E6 rung.
+for pinned_profile in builder-sol-xhigh builder-luna-high builder-haiku-medium; do
   grep -qx "$pinned_profile" <<<"$profiles_out" || fail "wrk profiles lost $pinned_profile"
 done
 grep -qx 'captain-opus' <<<"$profiles_out"
@@ -10779,7 +10780,7 @@ for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captai
   builder-luna-max builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh \
   builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -10806,7 +10807,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -11544,6 +11545,10 @@ e6_builder_case builder-luna-medium  codex-luna medium '--yolo -m gpt-6-luna -c 
 # rule and marker as the low/medium pair (director-1, 2026-10-26, for the
 # r1026luna L-A+ arm).
 e6_builder_case builder-luna-high    codex-luna high   '--yolo -m gpt-6-luna -c model_reasoning_effort=high'
+# hk 2043: builder-haiku-medium is the haiku family's medium E6 rung (the
+# r1026effdown arm B haiku@high vs haiku@medium) on the same pin rule and
+# marker as builder-haiku-low.
+e6_builder_case builder-haiku-medium haiku      medium '--model haiku --dangerously-skip-permissions --effort medium'
 # hk 1863: the five hk 1786 borrow-down and promote-up spellings on the same
 # pin rule. builder-sol-low takes its model id from the codex-sol catalog row
 # (the fixture serves gpt-6.1-sol) and gates at codex-sol@low; the haiku and
@@ -12175,7 +12180,7 @@ for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
   builder-sol-high builder-sol-medium \
   builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh \
   builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
   builder-sonnet-max builder-luna-max builder-kimi-max builder-haiku-max; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
@@ -12281,6 +12286,7 @@ for e6_wr in builder-sol-low:codex-sol@high:codex-sol@low \
   builder-haiku-high:haiku@low:haiku@high builder-haiku-xhigh:haiku@high:haiku@xhigh \
   builder-sonnet-low:sonnet@medium:sonnet@low \
   builder-haiku-max:haiku@xhigh:haiku@max builder-luna-high:codex-luna@medium:codex-luna@high \
+  builder-haiku-medium:haiku@high:haiku@medium \
   builder-sonnet-max:sonnet@xhigh:sonnet@max builder-luna-max:codex-luna@medium:codex-luna@max; do
   IFS=: read -r e6_wr_model e6_wr_marker e6_wr_want <<<"$e6_wr"
   set +e
@@ -12527,7 +12533,7 @@ set -e
 # rung spelled out is the allowed restatement (covered by e6_builder_case).
 for e6_ef in builder-sol-low:codex-sol@low:medium builder-haiku-high:haiku@high:low \
   builder-haiku-xhigh:haiku@xhigh:high builder-haiku-max:haiku@max:xhigh \
-  builder-sonnet-low:sonnet@low:medium; do
+  builder-sonnet-low:sonnet@low:medium builder-haiku-medium:haiku@medium:high; do
   IFS=: read -r e6_ef_model e6_ef_marker e6_ef_off <<<"$e6_ef"
   set +e
   e6_eff_out="$(SCOPEFUEL_E6_ARM="$e6_ef_marker" \
