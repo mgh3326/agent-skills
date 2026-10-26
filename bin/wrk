@@ -6891,7 +6891,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
     used += wrk_takeover_rounds(events)
     if typed_seq:
-        # hk 1926: an O3 typed extension shares the subject's hk:task/<task> ref;
+        # hk 1926: an O3 typed extension shares the subject hk:task/<task> ref;
         # its extra is one per distinct grant seq, so a replayed seq adds nothing.
         seen = {r.get("extension_grant_seq") for r in rounds
                 if (r.get("approval") or {}).get("ref") == extend_ref
@@ -6998,7 +6998,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     record = {"kind": "job.round_void", "job_id": job, "round": round_number,
               "reason": reason, "ref": ref, "issuer": issuer, "epoch": 1}
     if o2_mode == "check":
-        # hk 1926: the O2 guards passed for a shadow job's typed void.
+        # hk 1926: the O2 guards passed for the typed void of a shadow job.
         print("VOIDED round=%d" % round_number)
         raise SystemExit(0)
     wrk_event_commit(events, "job.round_void", record)

@@ -748,9 +748,20 @@ class ErrorMapCase(O3Case):
             with self.subTest(code):
                 w.fault("append", "error:" + code, kind="round_open")
                 out = w.run("round", "open", "job-a", "--head", w.heads[0])
-                self.assertEqual(out.returncode, ADAPTER.EXIT[code], out.stderr)
-                self.assertIn("o3 %s" % code, out.stderr)
+                if code != "not_found":
+                    self.assertEqual(out.returncode, ADAPTER.EXIT[code], out.stderr)
+                    self.assertIn("o3 %s" % code, out.stderr)
                 last = w.intents("job-a")[-1]
+                if code == "not_found":
+                    # A witnessed job answering not_found is history_regressed (75)
+                    # and its intent stays pending (director-1 rulings).
+                    self.assertEqual(out.returncode, 75, out.stderr)
+                    self.assertEqual(last["state"], "pending")
+                    self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+                    self.assertRc(w.run("round", "verdict", "job-a", "--file",
+                                        w.verdict_file("v-%s.md" % code, w.heads[0])), 0)
+                    w.heads = w.heads[1:] + w.heads[:1]
+                    continue
                 if code in ("wrk_unavailable", "wrk_recovery_required"):
                     self.assertEqual(last["state"], "pending")
                     # Settle the pending intent so the next code starts clean.
@@ -760,7 +771,8 @@ class ErrorMapCase(O3Case):
                     w.heads = w.heads[1:] + w.heads[:1]
                 else:
                     self.assertEqual((last["state"], last["error"]), ("rejected", code))
-                self.assertEqual(w.events("job-a", "job.o3_warning"), [])
+                self.assertEqual([e for e in w.events("job-a", "job.o3_warning")
+                                  if e["code"] != "history_regressed"], [], "no fallback warning")
 
     def test_every_errmap_code_through_reads(self):
         w = self.world()
@@ -1612,15 +1624,20 @@ class DualWriteOrderCase(O3Case):
         self.assertEqual(w.intents("job-a"), [])
         self.assertEqual(len(w.events("job-a", "job.escalate")), 1)
 
-    def test_shadow_job_o2_duplicate_path_refuses_before_any_append(self):
-        w = self.shadow_job()
-        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+    def scenario_shadow_duplicate_path(self, bindir):
+        """Local and server round numbers agree; only the O2 path guard refuses."""
+        w = shadow_world(self, bindir)
+        assert w.run("round", "open", "job-a", "--head", w.heads[0]).returncode == 0
         vfile = w.verdict_file("v.md", w.heads[0])
-        self.local_event(w, "job-a", "00050-job.verdict.json",
-                         {"kind": "job.verdict", "job_id": "job-a", "round": 9, "head": w.heads[5], "path": str(vfile),
-                          "verdict": "PASS", "at": "2026-10-24T00:00:09.000Z"})
+        local_event(w, "job-a", "00050-job.verdict.json",
+                    {"kind": "job.verdict", "job_id": "job-a", "round": 9, "head": w.heads[5], "path": str(vfile),
+                     "verdict": "PASS", "at": "2026-10-24T00:00:09.000Z"})
         before = len(w.appends())
         out = w.run("round", "verdict", "job-a", "--file", vfile)
+        return w, out, before
+
+    def test_shadow_job_o2_duplicate_path_refuses_before_any_append(self):
+        w, out, before = self.scenario_shadow_duplicate_path(BIN)
         self.assertRc(out, 2)
         self.assertIn("verdict path already recorded", out.stderr)
         self.assertEqual(len(w.appends()), before)
@@ -2802,7 +2819,7 @@ class MutantCase(O3Case):
             repair(ctx, job, store, state, meta)
 
             def build(fresh):
-                number, tester = verdict_round(fresh, head)''', '''        with Intents(ctx.inbox, job) as store:
+                check_round_numbers(ctx, job, fresh, "round verdict")''', '''        with Intents(ctx.inbox, job) as store:
             state = decision.state
             mode = o3_mode_name(state)
             repair(ctx, job, store, state, meta)
@@ -2812,7 +2829,7 @@ class MutantCase(O3Case):
             write_projections(ctx.inbox, job, [_fake], mode, meta, "early")
 
             def build(fresh):
-                number, tester = verdict_round(fresh, head)''')])
+                check_round_numbers(ctx, job, fresh, "round verdict")''')])
         w, out = MatrixCase.scenario_refused_verdict_writes_no_event(self, bindir)
         self.assertNotEqual(w.events("job-a", "job.verdict"), [], "the mutant wrote job.verdict before the receipt")
 
@@ -2848,9 +2865,8 @@ class MutantCase(O3Case):
 
     def test_m11_shadow_routed_as_enforced_skips_the_o2_guards_goes_red(self):
         bindir = self.mutant_bin([("wrk", "    SHADOW) O3_ROUTE=shadow ;;\n", "    SHADOW) O3_ROUTE=enforced ;;\n")])
-        w, out = DualWriteOrderCase.scenario_shadow_local_cap(self, bindir)
-        self.assertEqual(out.returncode, 0, "the mutant appended past the O2 cap")
-        self.assertEqual(len(w.appends("round_open")), 1)
+        w, out, before = DualWriteOrderCase.scenario_shadow_duplicate_path(self, bindir)
+        self.assertEqual(len(w.appends()), before + 1, "the mutant skipped the O2 path guard and appended")
 
     def test_m9_legacy_spawn_skipping_the_legacy_task_calls_goes_red(self):
         bindir = self.mutant_bin([("wrk", '''  elif [[ "$O3_SPAWN_VERIFIED" != 1 ]]; then
