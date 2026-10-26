@@ -138,7 +138,10 @@ class World(object):
         return heads
 
     def cleanup(self):
-        script = ". '%s'; TW_TMP='%s'; tmp_writers_stop" % (ROOT / "tests" / "lib" / "tmp-writers.sh", self.base)
+        # ROOT names the tree whose bin/wrk ran (a mutant copy included), so the
+        # sentinels it started are recognized and stopped before removal.
+        script = "ROOT='%s'; . '%s'; TW_TMP='%s'; tmp_writers_stop" % (
+            self.bindir.parent, ROOT / "tests" / "lib" / "tmp-writers.sh", self.base)
         subprocess.run(["bash", "-c", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         shutil.rmtree(self.base, True)
 
