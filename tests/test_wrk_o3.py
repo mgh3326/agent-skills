@@ -1417,6 +1417,65 @@ class RegressedHistoryCase(O3Case):
         self.assertEqual(snapshot["snapshot_seq"], 2, "the cached read is never downgraded")
         self.assertRc(w.run("round", "status", "job-a"), 75, "history_regressed")
 
+    def pending_then_lost(self, ended):
+        w = self.witnessed()
+        w.fault("append", "error:transport_unavailable", kind="round_open")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75)
+        key = [i for i in w.intents("job-a") if i["state"] == "pending"][0]["idempotency_key"]
+        if ended:
+            local_event(w, "job-a", "00090-job.revoked.json",
+                        {"kind": "job.revoked", "job_id": "job-a", "at": "2030-01-01T00:00:00.000Z"})
+        state = w.stub()
+        del state["jobs"]["job-a"]
+        w.set_stub(**state)
+        before = sorted(p.name for p in (w.inbox / "job-a" / "events").iterdir())
+        out = w.run("round", "open", "job-a", "--head", w.heads[2])
+        return w, key, before, out
+
+    def test_locally_ended_job_records_the_regression_on_the_intent_not_in_events(self):
+        w, key, before, out = self.pending_then_lost(ended=True)
+        self.assertRc(out, 75, "history_regressed")
+        line = [l for l in out.stderr.splitlines() if "o3 history_regressed" in l][0]
+        self.assertIn("job job-a intent ", line)
+        self.assertIn(key, line)
+        self.assertIn(": local end event 00090-job.revoked.json; the server GET returned not_found", line)
+        self.assertEqual(sorted(p.name for p in (w.inbox / "job-a" / "events").iterdir()), before,
+                         "nothing is written to an ended job's events")
+        intent = [i for i in w.intents("job-a") if i["idempotency_key"] == key][0]
+        self.assertEqual(intent["state"], "pending")
+        self.assertEqual(intent["history_regressed"]["get_result"], "not_found")
+        first = intent["history_regressed"]["observed_at"]
+        accepted = [i for i in w.intents("job-a") if i["state"] == "accepted"][0]
+        self.assertIn("history_regressed", accepted, "an accepted entry keeps its state and gets the note")
+        self.assertIsNotNone(accepted["receipt"])
+        # A later observation does not overwrite the first.
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[2]), 75, "history_regressed")
+        intent = [i for i in w.intents("job-a") if i["idempotency_key"] == key][0]
+        self.assertEqual(intent["history_regressed"]["observed_at"], first)
+
+    def test_locally_ended_job_with_no_intent_writes_nothing_and_invents_none(self):
+        w = self.witnessed()
+        (w.inbox / "job-a" / "o3-intents.json").unlink()
+        local_event(w, "job-a", "00090-job.revoked.json",
+                    {"kind": "job.revoked", "job_id": "job-a", "at": "2030-01-01T00:00:00.000Z"})
+        state = w.stub()
+        del state["jobs"]["job-a"]
+        w.set_stub(**state)
+        before = sorted(p.name for p in (w.inbox / "job-a" / "events").iterdir())
+        out = w.run("round", "status", "job-a")
+        self.assertRc(out, 75, "history_regressed")
+        self.assertIn("job job-a intent none: local end event 00090-job.revoked.json; the server GET returned "
+                      "not_found", out.stderr)
+        self.assertEqual(sorted(p.name for p in (w.inbox / "job-a" / "events").iterdir()), before)
+        self.assertFalse((w.inbox / "job-a" / "o3-intents.json").exists(), "no intent is invented")
+
+    def test_not_ended_job_still_writes_the_warning_event(self):
+        w, key, before, out = self.pending_then_lost(ended=False)
+        self.assertRc(out, 75, "history_regressed")
+        self.assertEqual([e["code"] for e in w.events("job-a", "job.o3_warning")], ["history_regressed"])
+        intent = [i for i in w.intents("job-a") if i["idempotency_key"] == key][0]
+        self.assertEqual(intent["state"], "pending", "a regressed not_found never rejects the intent")
+
     def test_not_found_with_only_a_snapshot_witness_also_refuses(self):
         w = self.witnessed()
         (w.inbox / "job-a" / "o3-intents.json").unlink()
@@ -1433,7 +1492,10 @@ class RegressedHistoryCase(O3Case):
         w.rewrite_records("job-a", lambda records: [dict(r, store_generation=generation) for r in records])
         w.set_stub(generation=generation)
         self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75, "history_regressed")
-        self.assertEqual([i["state"] for i in w.intents("job-a")], ["accepted", "pending"])
+        # The pending intent is replayed by its key first (P1 ruling), then the
+        # classification read refuses the regressed generation; states never
+        # move backwards.
+        self.assertEqual([i["state"] for i in w.intents("job-a")], ["accepted", "accepted"])
         self.assertEqual(len(w.events("job-a", "job.o3_warning")), 1)
 
     def test_seq_regression_refuses(self):

@@ -718,9 +718,14 @@ def check_intents_doc(document, job):
         raise Fail("intent_invalid", "o3-intents.json intents is not a list")
     keys = set()
     for intent in document["intents"]:
+        base_keys = {"local_id", "job_id", "idempotency_key", "request", "request_sha256", "state", "receipt",
+                     "error"}
         ok = (isinstance(intent, dict)
-              and set(intent) == {"local_id", "job_id", "idempotency_key", "request", "request_sha256",
-                                  "state", "receipt", "error"}
+              and set(intent) in (base_keys, base_keys | {"history_regressed"})
+              and (("history_regressed" not in intent) or (
+                  isinstance(intent["history_regressed"], dict)
+                  and set(intent["history_regressed"]) == {"observed_at", "get_result"}
+                  and all(isinstance(v, str) for v in intent["history_regressed"].values())))
               and intent["job_id"] == job
               and isinstance(intent["local_id"], str) and UUID_RE.match(intent["local_id"])
               and isinstance(intent["idempotency_key"], str) and UUID_RE.match(intent["idempotency_key"])
@@ -939,6 +944,40 @@ def advance_snapshot(directory, job, outcome):
         pass
 
 
+def history_regression(inbox, job, store, observed):
+    """Refuse with history_regressed (75). A job that is not locally ended
+    gets one job.o3_warning. A locally ended job gets no new event at all; the
+    observation goes on each pending or accepted intent of the job as the
+    optional history_regressed field (first observation kept, states never move
+    backwards), and no intent is invented when there is none (director-1)."""
+    end = local_end(inbox, job)
+    if not end:
+        write_warning(inbox, job, "history_regressed", "canonical read")
+        raise Fail("history_regressed", "job %s: the server history regressed (%s)" % (job, observed))
+
+    def note(st):
+        keys, changed = [], False
+        for intent in st.intents:
+            if intent["state"] not in ("pending", "accepted"):
+                continue
+            if "history_regressed" not in intent:
+                intent["history_regressed"] = {"observed_at": now_utc(), "get_result": observed}
+                changed = True
+            keys.append(intent["idempotency_key"])
+        if changed:
+            st.save()
+        return keys
+    if store is not None:
+        keys = note(store)
+    elif os.path.exists(os.path.join(safe_job_dir(inbox, job), INTENTS)):
+        with Intents(inbox, job) as st:
+            keys = note(st)
+    else:
+        keys = []
+    raise Fail("history_regressed", "job %s intent %s: local end event %s; the server GET returned %s; nothing "
+               "written to the events log" % (job, ",".join(keys) or "none", end, observed))
+
+
 def retained_receipts(directory, job):
     """Accepted receipts of this job's intents, read without the lock (a
     witness only; a broken file is refused where intents are used)."""
@@ -1121,6 +1160,10 @@ def send(store, intent, binary=None):
     try:
         obj = run_cli(args, body, write=True, binary=binary)
     except CliFail as exc:
+        if exc.code == "not_found" and (store.receipts() or os.path.exists(os.path.join(store.dir, SNAPSHOT))):
+            # A job a witness shows enrolled now reads not_found: history
+            # regressed; the intent stays pending (director-1 rulings).
+            history_regression(os.path.dirname(store.dir), store.job, store, "not_found")
         if exc.code in DEFINITE or exc.code == "cli_usage":
             intent["state"], intent["error"] = "rejected", exc.code
             store.save()
@@ -1201,15 +1244,17 @@ class Ctx(object):
         directory = self.jobdir(job)
         retained = store.receipts() if store is not None else retained_receipts(directory, job)
         snapshot = load_snapshot(directory, job) if os.path.isdir(directory) else None
+        observed = "regressed"
         try:
             state = read_state(job, retained)
             if state is None and (retained or snapshot is not None):
+                observed = "not_found"
                 raise CliFail("history_regressed")
             if state is not None and snapshot_regressed(snapshot, state):
                 raise CliFail("history_regressed")
         except CliFail as exc:
             if exc.code == "history_regressed":
-                write_warning(self.inbox, job, "history_regressed", "canonical read")
+                history_regression(self.inbox, job, store, observed)
             raise
         if state is not None:
             ensure_dir(directory)
