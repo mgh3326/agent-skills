@@ -3045,7 +3045,12 @@ case_prune_live() {
   REPORT="$TMP/mut-plive-report.md"; printf 'x\n' >"$REPORT"
   start_sentinel mut-plive w:p2 "$REPORT"
   sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
-  prune_run --apply >/dev/null 2>&1
+  local pout
+  pout="$(prune_run --apply 2>&1)" || return 3
+  # hk1860 item 5: the row-less recheck now saves the sentinel even when the
+  # mutant's forged ended flag reaches the release — the surviving
+  # observable is the wrongly-reported orphan verdict, not the stop.
+  grep -q "job=mut-plive .*protected" <<<"$pout" || return 1
   kill -0 "$SENTINEL_PID" 2>/dev/null || return 1
 }
 
@@ -3088,7 +3093,11 @@ case_stopped_sentinel() {
   start_sentinel mut-stopd w:p1 "$REPORT"
   sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
   kill -STOP "$SENTINEL_PID" || return 3
-  prune_run --apply >/dev/null 2>&1
+  local pout
+  pout="$(prune_run --apply 2>&1)" || return 3
+  # hk1860 item 5: same row-less recheck cover as case_prune_live — the
+  # forged-ended mutant now reads through its orphan verdict instead.
+  grep -q "job=mut-stopd .*protected" <<<"$pout" || return 1
   local alive=0
   kill -0 "$SENTINEL_PID" 2>/dev/null && alive=1
   kill -CONT "$SENTINEL_PID" 2>/dev/null || true
@@ -5878,6 +5887,250 @@ mkmut_span hk1860-status-argv \
   '      _quota_map="$(python3 -c "$_quota_map_py" "$_quota_status")" || _quota_rc=$?'
 expect_mut_red "hk1860 status document on argv" case_hk1860_oversized_status \
   'ASSERT-RED: hk1860 oversized status still yields the ended job would-release'
+
+# ── hk 1860 item 5: the row-less recheck in release_job_quota_pool ────────
+# When the arbiter is available and status succeeds but lists no quota_pool
+# rows, the function used to return 0 with no round check at all — a job
+# that ended, released and then took a bare same-pane reclaim (respawn in
+# flight) had its paired end action taken unchecked. The zero-row path now
+# runs quota_release_round_current once with the caller's job, pane and
+# mode, and returns its rc.
+
+# N3 — the respawn-in-flight shape, both end actions the zero-row path used
+# to take unchecked. The reap half injects the bare reclaim between the
+# candidate scan and the release, inside the herdr tab-list call; the
+# housekeeping half models a stale wrk done landing after the reclaim.
+case_hk1860_rowless_n3() {
+  reset_case hk1860-n3-reap || return 3
+  local job=hk1860-n3-reap lane=n3reap
+  local injected="$TMP/n3-reap-injected" hwrap="$TMP/n3-reap-herdr"
+  local close_log="$TMP/n3-reap-close.log" out
+  arb claim --job "$job" --lane "$lane" --agent-label "lbl-$job" --t T1 >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"lbl-$job\",\"pane_id\":\"w1:p1\",\"tab_id\":\"w1:t1\"}" \
+    >/dev/null || return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"lbl-$job\"}" >/dev/null || return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  [[ "$(quota_rows "$job")" == 0 ]] || return 3
+  : >"$close_log"
+  cat >"$hwrap" <<EOF || return 3
+#!/bin/bash
+set -euo pipefail
+if [[ "\${1:-}" == tab && "\${2:-}" == list && ! -e "$injected" ]]; then
+  : >"$injected"
+  "$ARBITER" claim --job "$job" --lane "$lane" --agent-label "lbl-$job" --t T1 --reclaim-released >/dev/null
+fi
+if [[ "\${1:-}" == tab && "\${2:-}" == close ]]; then printf '%s\n' "close \$3" >>"$close_log"; fi
+exec "$HERDR" "\$@"
+EOF
+  chmod +x "$hwrap" || return 3
+  out="$(env HERDR_BIN="$hwrap" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    WRK_FIXTURE_SCENARIO=reap "$WRK" reap --apply --lane "$lane" --grace 0s 2>&1)" || return 3
+  if ! grep -Fq "skip job=$job reason=revived-since-scan" <<<"$out"; then
+    printf '%s\n' "$out" >&2
+    assertion_red 'hk1860 N3 reap prints its skip line when the row-less recheck refuses' || return 1
+  fi
+  if grep -Fq "closed job=$job" <<<"$out" || [[ -s "$close_log" ]]; then
+    printf '%s\n' "$out" >&2
+    assertion_red 'hk1860 N3 reap does not close the reclaimed job tab' || return 1
+  fi
+
+  reset_case hk1860-n3-housekeep || return 3
+  job=hk1860-n3-housekeep
+  local report="$TMP/n3-hk-report.md" err="$TMP/n3-hk-err" done_out pid
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  printf 'row-less housekeeping report\n' >"$report"
+  start_sentinel "$job" w:p1 "$report" || return 3
+  pid="$SENTINEL_PID"
+  sentinel_mid_sleep "$pid" >/dev/null || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  done_out="$(done_run "$job" --report "$report" 2>"$err")" || return 3
+  [[ "$(wc -l <<<"$done_out" | tr -d ' ')" == 1 && "$done_out" == "OK job=$job "* ]] || {
+    assertion_red 'hk1860 N3 wrk done on a reclaimed job keeps its one OK line'; return 1
+  }
+  grep -Fq "skip job=$job reason=revived-since-scan" "$err" || {
+    cat "$err" >&2
+    assertion_red 'hk1860 N3 housekeeping prints its skip line on stderr'; return 1
+  }
+  kill -0 "$pid" 2>/dev/null || {
+    assertion_red 'hk1860 N3 housekeeping does not stop the reclaimed job sentinel'; return 1
+  }
+}
+
+# Normal — a job that completed through wrk done, rows released, no reclaim.
+# The row-less recheck must return 0 for it: reap still closes the tab after
+# the grace, with no skip line.
+case_hk1860_rowless_normal() {
+  reset_case hk1860-n3-normal || return 3
+  local job=hk1860-n3-normal lane=n3normal
+  local report="$TMP/n3-normal-report.md" out
+  arb claim --job "$job" --lane "$lane" --agent-label "lbl-$job" --t T1 >/dev/null || return 3
+  arb event --job "$job" --kind job.spawned \
+    --payload-json "{\"owner_lane\":\"$lane\",\"label\":\"lbl-$job\",\"pane_id\":\"w1:p1\",\"tab_id\":\"w1:t1\"}" \
+    >/dev/null || return 3
+  arb_lease "$job" || return 3
+  printf 'row-less normal report\n' >"$report"
+  done_run "$job" --report "$report" >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows "$job")" == 0 ]] || return 3
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    WRK_FIXTURE_SCENARIO=reap "$WRK" reap --apply --lane "$lane" --grace 0s 2>&1)" || return 3
+  grep -Fq "closed job=$job" <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    assertion_red 'hk1860 row-less recheck still lets a normal ended job close its tab'; return 1
+  }
+  if grep -Fq "reason=revived-since-scan" <<<"$out"; then
+    assertion_red 'hk1860 row-less recheck prints no skip for a normal ended job' || return 1
+  fi
+}
+
+# Restored — the hk 1933 10-23 sequence followed by wrk done. The restore
+# copies the newest receipt, so the reclaimed round reads current again and
+# the row-less recheck must not block reap's close.
+case_hk1860_rowless_restored() {
+  reset_case hk1860-n3-restored || return 3
+  local job=hk1860-n3-restored pane=w1:p1 tab=w1:t1 label=lbl-hk1860-restored
+  local report="$TMP/n3-restored-report.md" out
+  printf 'row-less restored report\n' >"$report"
+  restore_seed "$job" "$pane" "$tab" "$label" || return 3
+  restore_false_loss "$job" "$pane" "$label" || return 3
+  RESTORE_STATE="$TMP/n3-restore-state-$CASE_SEQ.json"
+  restore_live_state "$RESTORE_STATE" "$pane" "$tab" "$label" idle || return 3
+  RESTORE_INTERVAL=3600 restore_run "$job" >"$TMP/n3-restore-out" 2>"$TMP/n3-restore-err" || {
+    cat "$TMP/n3-restore-err" >&2
+    return 3
+  }
+  arb_lease "$job" || return 3
+  done_run "$job" --report "$report" >/dev/null 2>&1 || return 3
+  [[ "$(quota_rows "$job")" == 0 ]] || return 3
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    WRK_FIXTURE_SCENARIO=reap "$WRK" reap --apply --lane lane-a --grace 0s 2>&1)" || return 3
+  grep -Fq "closed job=$job pane=$pane tab=$tab" <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    assertion_red 'hk1860 row-less recheck does not block a restored job close'; return 1
+  }
+}
+
+# Takeover — the old job's job.handed_off is its last work-terminal and it
+# holds no quota_pool rows. The row-less recheck reads the pane from the
+# events scan (the caller passes none) and the takeover completes as today.
+case_hk1860_rowless_takeover() {
+  reset_case hk1860-n3-takeover || return 3
+  HK_STATE="$HK_DB" "$HK" tasks add --id 1 --state claimed \
+    --claimed-by old-label --job-id hk1860-n3-tk-old >/dev/null || return 3
+  local oev="$INBOX/hk1860-n3-tk-old/events"; mkdir -p "$oev"
+  printf '%s\n' '{"kind":"job.claim","at":"2026-10-18T00:00:00Z","payload":{"job_id":"hk1860-n3-tk-old","owner_lane":"old-lane","label":"old-label","role":"builder","task_id":1}}' >"$oev/00001-job.claim.json"
+  printf '%s\n' '{"kind":"job.spawned","at":"2026-10-18T00:00:01Z","payload":{"job_id":"hk1860-n3-tk-old","pane_id":"w1:p10","tab_id":"w1:t10"}}' >"$oev/00002-job.spawned.json"
+  printf '%s\n' '{"kind":"job.revoked","at":"2026-10-19T00:00:00Z","payload":{"job_id":"hk1860-n3-tk-old","owner_lane":"old-lane"}}' >"$oev/00020-job.revoked.json"
+  ARBITER_TEST_NOW="2026-10-17T00:00:00Z" arb claim --job hk1860-n3-tk-old \
+    --lane old-lane --agent-label old-label --t T1 >/dev/null || return 3
+  ARBITER_TEST_NOW="2026-10-17T00:00:01Z" arb_lease hk1860-n3-tk-old || return 3
+  arb release --job hk1860-n3-tk-old --resource codex --kind quota_pool >/dev/null || return 3
+  [[ "$(quota_rows hk1860-n3-tk-old)" == 0 ]] || return 3
+  QR_MODEL=builder-sol quota_spawn hk1860-n3-tk-new \
+    --role builder --lane hk1860-n3-tk-lane --parent director-1 \
+    --takeover-from hk1860-n3-tk-old >/dev/null 2>&1 || return 3
+  event_count_is "$oev" job.handed_off 1 || return 3
+}
+
+# Ended-no-sentinel mode — pass 4 selected the job on one live row, and an
+# injected release drains it before release_job_quota_pool's own status.
+# The row-less recheck must keep the caller's mode: under ended-no-sentinel
+# a receipt-less reclaimed ended round still authorizes the release.
+case_hk1860_rowless_ended_mode() {
+  reset_case hk1860-n3-ended || return 3
+  # Mirror case_prune_receiptless_ended_quota's terminal receipt-less reclaim
+  # shape. The pass-4 scan selects its live row, then this wrapper drains it
+  # before release_job_quota_pool's status so the row-less recheck runs. Keep
+  # the injection files case-scoped: this case also runs under its mutant, and
+  # a marker left by the green run would silently leave the row in place.
+  local job=hk1860-n3-ended
+  local injected="$TMP/n3-ended-injected-$CASE_SEQ" arbwrap="$TMP/n3-ended-arbiter-$CASE_SEQ"
+  local seq="$TMP/n3-ended.seq-$CASE_SEQ" out
+  mk_job "$job" w:p1 || return 3
+  arb_lease "$job" || return 3
+  arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
+  arb claim --job "$job" --lane lane-a --agent-label "lbl-$job" --t T1 \
+    --reclaim-released >/dev/null || return 3
+  arb_lease "$job" || return 3
+  arb event --job "$job" --kind job.completed \
+    --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+  printf 'not-found\n' >"$seq"
+  cat >"$arbwrap" <<EOF || return 3
+#!/bin/bash
+set -euo pipefail
+if [[ "\${1:-}" == status && " \$* " == *" --job "* && ! -e "$injected" ]]; then
+  : >"$injected"
+  "$ARBITER" release --job "$job" --resource codex --kind quota_pool >/dev/null
+fi
+exec "$ARBITER" "\$@"
+EOF
+  chmod +x "$arbwrap" || return 3
+  out="$(env HERDR_BIN="$HERDR" ARBITER_BIN="$arbwrap" \
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
+    WRK_FIXTURE_GET_SEQUENCE="$seq" \
+    "$WRK" prune --apply --job "$job" --stale-age 0s 2>&1)" || return 3
+  [[ -e "$injected" ]] || return 3
+  [[ "$(quota_rows "$job")" == 0 ]] || return 3
+  grep -Fq "release-attempted job=$job" <<<"$out" || {
+    printf '%s\n' "$out" >&2
+    assertion_red 'hk1860 row-less recheck keeps the caller ended-no-sentinel mode'; return 1
+  }
+}
+
+case_hk1860_rowless_marker_once() {
+  [[ "$(grep -cF 'hk1860-rowless-recheck' "$WRK")" == 1 ]] ||
+    { assertion_red 'hk1860 bin/wrk must carry hk1860-rowless-recheck exactly once'; return 1; }
+}
+
+case_hk1860_rowless_n3 ||
+  fail "hk1860 item 5: a bare-reclaim job must lose its paired reap and housekeeping actions"
+echo "PASS hk1860 row-less recheck skips a respawn-in-flight job"
+case_hk1860_rowless_normal ||
+  fail "hk1860 item 5: the row-less recheck must return 0 for a normal ended job"
+echo "PASS hk1860 row-less recheck passes a normal ended job"
+case_hk1860_rowless_restored ||
+  fail "hk1860 item 5: the row-less recheck must not block a restored job"
+echo "PASS hk1860 row-less recheck passes a restored job"
+case_hk1860_rowless_takeover ||
+  fail "hk1860 item 5: a row-less handed-off job must not block the takeover"
+echo "PASS hk1860 row-less recheck leaves takeover unchanged"
+case_hk1860_rowless_ended_mode ||
+  fail "hk1860 item 5: the row-less recheck must run in the caller's mode"
+echo "PASS hk1860 row-less recheck keeps ended-no-sentinel mode"
+case_hk1860_rowless_marker_once ||
+  fail "hk1860 item 5: the marker must appear exactly once in bin/wrk"
+echo "PASS hk1860 row-less recheck marker is unique"
+
+# Mutants: each reverts one item-5 invariant on the shipped call site and
+# must turn its named case RED for that invariant.
+mkmut_span hk1860-no-rowless-recheck \
+  'hk1860-rowless-recheck' \
+  '  : # removed hk1860 row-less recheck'
+expect_mut_red "hk1860 row-less recheck dropped" case_hk1860_rowless_n3 \
+  'ASSERT-RED: hk1860 N3 reap prints its skip line when the row-less recheck refuses'
+
+mkmut_span hk1860-rowless-always-skip \
+  'hk1860-rowless-recheck' \
+  '  return 2 # reverted hk1860 row-less recheck'
+expect_mut_red "hk1860 row-less recheck always skips" case_hk1860_rowless_normal \
+  'ASSERT-RED: hk1860 row-less recheck still lets a normal ended job close its tab'
+
+mkmut_span hk1860-rowless-mode-current \
+  'hk1860-rowless-recheck' \
+  '  quota_release_round_current "$job" "$pane" current || return $? # reverted hk1860 row-less recheck mode'
+expect_mut_red "hk1860 row-less recheck in current mode" case_hk1860_rowless_ended_mode \
+  'ASSERT-RED: hk1860 row-less recheck keeps the caller ended-no-sentinel mode'
 
 bash "$ROOT/tests/test-wrk-sentinel-detach.sh"
 echo "PASS test-wrk-job-end: all cases"
