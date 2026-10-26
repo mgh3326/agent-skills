@@ -107,6 +107,7 @@ HK2012_TITLES = [
     (157, "experiment sweep notes"),
     (158, "experiments planned notes"),
     (159, "admirable notes"),
+    (169, "tester SKILL.md wording for the spawn contract"),
 ]
 # hk 2012 tag rule: an exact leading [area] tag overrides a product default;
 # a loose area word in the title does not.
@@ -140,6 +141,7 @@ HK2012_SCOPED = [
     (166, "panewire", "wrk follow-up on the hub lane stall"),
     (167, "agent-skills", "tester follow-up on the spawn loop"),
     (168, "handoffkeep", "[shell-wrk] relay retry follow-up"),
+    (170, "handoffkeep", "worktree cleanup for the relay"),
 ]
 for i, project, title in HK2012_SCOPED:
     tasks[str(i)] = {"id": i, "state": "backlog", "project": project,
@@ -261,6 +263,7 @@ want = [
     (157, "python", "title:\\bexperiment\\b"),
     (158, "", "-"),                       # near-miss: experiments is not experiment
     (159, "", "-"),                       # near-miss: admirable is not admiral
+    (169, "shell-wrk", "title:\\btester\\b"),  # tester beats SKILL.md on a projectless title
 ]
 for tid, area, rule in want:
     r = rows.get(str(tid)) or sys.exit(f"missing row for task {tid}")
@@ -298,6 +301,7 @@ want = [
     (166, "go-backend", "project:panewire"),     # a wrk term never overrides go-backend
     (167, "shell-wrk", "title:\\btester\\b"),    # agent-skills default is shell-wrk: tester applies
     (168, "shell-wrk", "tag:[shell-wrk]"),       # an exact leading tag applies on a fleet repo
+    (170, "shell-wrk", "title:\\bworktree\\b"),  # a fleet repo takes a shell-wrk term (guard allowance)
 ]
 for tid, area, rule in want:
     r = rows.get(str(tid)) or sys.exit(f"missing row for task {tid}")

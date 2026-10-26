@@ -235,17 +235,14 @@ def classify(task: dict, rules: dict, with_files: bool, gh: str,
                 return area, "files", f"files:{pct}%"
     project = clean(task.get("project"))
     default = rules["project_defaults"].get(project)
-    # hk 2012 rule 1: a product repo's default holds unless a title term
-    # names one of that project's own specific areas; fleet repos keep the
-    # title order.
-    product = bool(default) and project not in rules["fleet_projects"]
+    # hk 2012 rule 1: a repo default holds unless a title term names an area
+    # it allows: a product repo's own specific areas, or shell-wrk on a
+    # fleet repo.
     specific = {default} | set(rules["project_areas"].get(project, []))
-    # hk 2012 rule 1 (fleet): a fleet default holds against generic terms;
-    # only a shell-wrk term may override it.
     if default and project in rules["fleet_projects"]:
         specific = {default, "shell-wrk"}
     # hk 2012 tag rule: an exact leading [area] tag naming a known area
-    # states the area outright and overrides a product default.
+    # states the area outright and overrides a repo default.
     tag = TAG_RE.match(title)
     if default and tag and tag.group(1) in rules["_areas"]:
         return tag.group(1), "title", f"tag:[{tag.group(1)}]"
