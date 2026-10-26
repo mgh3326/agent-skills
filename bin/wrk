@@ -206,10 +206,19 @@ zero non-voided recorded rounds, or when the job directory holds a regular
 file whose first line is a VERDICT line and no job.verdict matches that
 file by path or content sha256. A later line does not count. Both
 refusals are waived only by --rounds-waived REF, where REF is hk:doc/<key>
-or hk:task/<id>, and that ref is stored on the job.joined record. An end
+or hk:task/<digits>. REF is fetched from handoffkeep and must hold the line
+  join-waiver: job=<job> by=<issuer>
+for this job, one exact line with single spaces and nothing after it. The
+issuer must be the parent lane or an operator and must equal the created_by of
+the doc or the author of the task comment that holds the line. A pa-integrator
+grant also needs the job's server task to be project ParkingArcade with
+refs.job_id equal to the job. The ref and the issuer are stored on the
+job.joined record as rounds_waived and rounds_waived_issuer. An end
 declaration newer than the newest revive is refused and cannot be waived.
 The end record and the rounds are rechecked under the events lock just before
-wrk writes job.joined; a delegated join is checked just before the hand-off only.
+wrk writes job.joined; a verified waiver's claim facts (parent lane, task id
+and the newest claim/reclaim event) are rechecked there too, and a delegated
+join is checked just before the hand-off only.
 USAGE
 }
 
@@ -3680,7 +3689,7 @@ apply_catalog() {
   if [[ -n "${ROUND_EXT_REF:-}" ]]; then
     launch_args+=(--operator-request "$ROUND_EXT_REF")
   elif [[ -n "${OPERATOR_REQUEST:-}" ]]; then
-    launch_args+=(--operator-request)
+    launch_args+=(--operator-request "$OPERATOR_REQUEST")
   fi
   # task #527 + #593: the declared purpose reaches the catalog too, not only the
   # quota gate. A bare `-m codex-astra` is the architect counsel path (PURPOSE is
@@ -4599,6 +4608,35 @@ def wrk_precommit_test_hook(events, job):
         subprocess.run([hook, events, job], check=True, stdout=subprocess.DEVNULL)
 
 
+def wrk_joined_claim_change(events, parent, task_id, version):
+    """Newest claim fact that moved since a join waiver was verified.
+
+    Re-reads the newest job.claim/job.reclaim under the events lock and
+    returns "field OLD -> NEW" for the first of parent_lane, task_id and the
+    claim event name that differs from the verified values, else "".
+    """
+    name, document = "", None
+    for cand, doc, _mtime in wrk_events_ordered(events):
+        if isinstance(doc, dict) and doc.get("kind") in ("job.claim", "job.reclaim"):
+            name, document = cand, doc
+    payload = document.get("payload") if isinstance(document, dict) else None
+    if not isinstance(payload, dict):
+        payload = document if isinstance(document, dict) else {}
+    now_parent = payload.get("parent_lane")
+    now_parent = now_parent if isinstance(now_parent, str) else ""
+    now_task = payload.get("task_id")
+    now_task = (str(now_task)
+                if isinstance(now_task, (int, str))
+                and not isinstance(now_task, bool) else "")
+    if now_parent != parent:
+        return "parent_lane %s -> %s" % (parent or "-", now_parent or "-")
+    if now_task != task_id:
+        return "task_id %s -> %s" % (task_id or "-", now_task or "-")
+    if name != version:
+        return "claim_version %s -> %s" % (version or "-", name or "-")
+    return ""
+
+
 def wrk_round_census(events, job):
     """Return (recorded, nonvoid) round evidence for one job.
 
@@ -5380,7 +5418,7 @@ completion_metadata() {
   wrk_py - "$root/$job/events" <<'PY'
 import json, os, sys
 exec(os.environ["WRK_EVENTS_PY"])
-owner=label=pane=parent=role=''
+owner=label=pane=parent=role=spawn_pane=''
 for name, o, _ in wrk_events_ordered(sys.argv[1]):
     if o is None: continue
     p=o.get('payload',o)
@@ -5393,6 +5431,13 @@ for name, o, _ in wrk_events_ordered(sys.argv[1]):
         parent=p.get('parent_lane') if isinstance(p.get('parent_lane'), str) else ''
         role=p.get('role') if isinstance(p.get('role'), str) else ''
     pane=p.get('pane_id') if isinstance(p.get('pane_id'), str) else pane
+    # hk1860: the newest job.spawned names this job's pane. A later stale
+    # watcher's job.lost names an older pane, so it must not win. Any pane_id
+    # stays the fallback for a stream with no usable spawn receipt.
+    if o.get('kind') == 'job.spawned':
+        candidate=p.get('pane_id')
+        spawn_pane=candidate if isinstance(candidate, str) and candidate else ''
+pane=spawn_pane or pane
 values = (owner, label, pane, parent, role)
 if (owner and label and pane
         and not any(any(ord(char) < 0x20 for char in value) for value in values)):
@@ -5750,7 +5795,7 @@ done_cmd() {
 }
 
 builder_flat_event() {
-  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}"
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" kind="$6" report="$7" reason="$8" question="$9" pr="${10}" head="${11}" waived="${12:-}" waiver_issuer="${13:-}" check_parent="${14:-}" check_task="${15:-}" check_version="${16:-}"
   local events host="${HOSTNAME:-unknown}" last
   events="$(wrk_jobs_root)/$job/events"
   mkdir -p "$events"
@@ -5765,10 +5810,10 @@ builder_flat_event() {
   # scans this heredoc for quotes because it sits inside a command substitution.
   # Do not put an unmatched single quote in this body.
   local outcome rc=0
-  outcome="$(wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" <<'PY'
+  outcome="$(wrk_py - "$events" "$job" "$owner" "$label" "$pane" "$parent" "$host" "$report" "$last" "$kind" "$reason" "$question" "$pr" "$head" "$waived" "$waiver_issuer" "$check_parent" "$check_task" "$check_version" <<'PY'
 import json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived = sys.argv[1:]
+events, job, owner, label, pane, parent, host, report, last, kind, reason, question, pr, head, waived, waiver_issuer, check_parent, check_task, check_version = sys.argv[1:]
 # wrk escalate/joined publish outside the round writer lock: take the shared
 # events lock so numbering is serialized with bin/arbiter and wrk done too.
 lock = wrk_events_locked(events)
@@ -5779,6 +5824,11 @@ if kind == "job.joined":
     if ended:  # hk1900-inlock-end
         print("ENDED\t" + ended)
         sys.exit(3)
+    if waived:  # hk2024-claim-recheck
+        changed = wrk_joined_claim_change(events, check_parent, check_task, check_version)
+        if changed:
+            print("CLAIM\t" + changed)
+            sys.exit(5)
     if not waived and wrk_round_census(events, job)[1] <= 0:  # hk1900-inlock-zero
         print("ZERO")
         sys.exit(4)
@@ -5789,6 +5839,7 @@ if question: record["question"] = question
 if pr: record["pr"] = pr
 if head: record["head"] = head
 if waived: record["rounds_waived"] = waived
+if waiver_issuer: record["rounds_waived_issuer"] = waiver_issuer
 wrk_event_commit(events, kind, record)
 PY
 )" || rc=$?
@@ -5866,15 +5917,17 @@ joined_cmd() {
   done
   [[ -n "$pr" && -n "$head" && -n "$report" && -f "$report" ]] || die "joined requires --pr, --head and an existing --report"
   if [[ -n "$waived" ]]; then
-    case "$waived" in
-      hk:doc/?*|hk:task/?*) ;;
-      *) die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>" ;;
-    esac
+    [[ "$waived" =~ ^hk:doc/[^[:space:]]+$ || "$waived" =~ ^hk:task/[0-9]+$ ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"  # hk1899-waiver-shape
   fi
   local metadata owner label pane parent role reason joined_end
+  local waiver_issuer="" waiver_grant tmp_waiver task_id tmp_task
+  local claim_parent="" claim_task="" claim_version=""
   # hk 1894: the join gate (end record, rounds, verdict files) and the parent
-  # lane are read from the checked inbox, never from the environment.
-  wrk_trust_guard arbiter
+  # lane are read from the checked inbox, never from the environment. hk 1899:
+  # a waiver is fetched from handoffkeep, so that guard also judges the binary.
+  # hk 1897: the prefer-DB consult below must come through the guard-selected
+  # arbiter binary, so both branches judge it as well.
+  if [[ -n "$waived" ]]; then wrk_trust_guard hk arbiter; else wrk_trust_guard arbiter; fi
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
@@ -5885,6 +5938,43 @@ joined_cmd() {
   # hk1449-joined-end
   joined_end="$(wrk_newer_end_record "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"
   [[ -z "$joined_end" ]] || die "joined: refused after end record $joined_end"
+  # hk 1899: a waiver counts only with a join-waiver grant for this job in a
+  # record fetched from handoffkeep, issued by the parent lane or an operator
+  # and equal to the record's server-set identity. Verified here, before the
+  # refusals are skipped and before the events lock is taken.
+  if [[ -n "$waived" ]]; then
+    # hk 2024: keep the claim facts the waiver is verified against — parent
+    # lane, task_id and the newest claim/reclaim event — so the commit under
+    # the events lock can refuse a job released and reclaimed in between.
+    claim_parent="$parent"  # hk2024-claim-facts
+    claim_task="$(round_job_task_id "$job" || true)"
+    claim_version="$(joined_claim_version "$job")"
+    tmp_waiver="$(mktemp)"
+    if ! round_approval_fetch "$waived" >"$tmp_waiver"; then
+      rm -f "$tmp_waiver"
+      die "joined: waiver record not found in handoffkeep: $waived"
+    fi
+    waiver_grant="$(round_approval_verify "$waived" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_waiver" join-waiver || true)"  # hk1899-waiver-fetch
+    rm -f "$tmp_waiver"
+    [[ -n "$waiver_grant" ]] ||
+      die "joined: $waived has no 'join-waiver: job=$job by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
+    waiver_issuer="${waiver_grant##*issuer=}"
+    if [[ "$waiver_issuer" == "pa-integrator" ]]; then
+      task_id="$claim_task"
+      [[ -n "$task_id" ]] ||
+        die "joined: pa-integrator grants need the job's hk task on the server; $job records no task_id"
+      tmp_task="$(mktemp)"
+      if ! round_pa_task_fetch "$task_id" >"$tmp_task"; then
+        rm -f "$tmp_task"
+        die "joined: pa-integrator grants need the job's hk task on the server; cannot fetch task $task_id"
+      fi
+      if ! round_pa_task_verify "$job" "$tmp_task"; then
+        rm -f "$tmp_task"
+        die "joined: pa-integrator grants count only when the server task for $job is project ParkingArcade with refs.job_id=$job"
+      fi
+      rm -f "$tmp_task"
+    fi
+  fi
   # A waiver is recorded on wrk's own job.joined, so it must not be forwarded
   # and must not take the delegated path. Without it, delegate exactly as before.
   if [[ -z "$waived" ]]; then
@@ -5905,11 +5995,12 @@ joined_cmd() {
     return 0
   fi
   local flat_out flat_rc=0
-  flat_out="$(builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived")" || flat_rc=$?
+  flat_out="$(builder_flat_event "$job" "$owner" "$label" "$pane" "$parent" job.joined "$report" "$reason" "" "$pr" "$head" "$waived" "$waiver_issuer" "$claim_parent" "$claim_task" "$claim_version")" || flat_rc=$?
   case "$flat_rc" in
     0) ;;
     3) die "joined: refused after end record ${flat_out#*$'\t'}" ;;
     4) die "joined: job $job has zero non-voided recorded rounds" ;;
+    5) die "joined: claim changed since the waiver was verified (${flat_out#*$'\t'}); re-run wrk joined" ;;
     *) exit "$flat_rc" ;;
   esac
   set_report_last_line "$report"
@@ -6184,11 +6275,13 @@ except ValueError:
     raise SystemExit(1)
 # Each grant type has one canonical line form; whitespace variants are
 # malformed and rejected. The identity and parent-lane checks below are
-# shared by round extensions and voids.
+# shared by round extensions, voids and join waivers.
 if grant_kind == "round-extension":
     GRANT = re.compile(r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
 elif grant_kind == "round-void":
     GRANT = re.compile(r"^round-void: job=(\S+) round=(\d+) by=(\S+)$")
+elif grant_kind == "join-waiver":
+    GRANT = re.compile(r"^join-waiver: job=(\S+) by=(\S+)$")
 else:
     raise SystemExit(1)
 # The issuer written into the grant line must equal the record's server-set
@@ -6215,7 +6308,10 @@ for identity, body in sources:
         m = GRANT.match(line)
         if not m or m.group(1) != job:
             continue
-        amount, issuer = int(m.group(2)), m.group(3)
+        if grant_kind == "join-waiver":
+            amount, issuer = 1, m.group(2)
+        else:
+            amount, issuer = int(m.group(2)), m.group(3)
         if (grant_kind == "round-extension" and amount < 1) or (
                 grant_kind == "round-void" and str(amount) != round_number):
             continue
@@ -6225,6 +6321,42 @@ for identity, body in sources:
               (amount if grant_kind == "round-extension" else 1, issuer))
         raise SystemExit(0)
 raise SystemExit(1)
+PY
+}
+
+# The job's recorded task id, taken the same way as task linkage: the newest
+# claim/reclaim payload.task_id. Prints it or nothing; rc 1 when the meta is
+# unreadable so a broken record fails closed instead of falling back to an
+# older claim the newest event superseded.
+round_job_task_id() {
+  wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$1/events" <<'PY'
+import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
+         if name.endswith(("claim.json", "reclaim.json"))]
+if not names:
+    raise SystemExit(0)
+try:
+    with open(os.path.join(sys.argv[1], names[-1]), encoding="utf-8") as f:
+        o = json.load(f)
+except (OSError, ValueError):
+    raise SystemExit(1)
+p = o.get("payload", o)
+v = p.get("task_id")
+print(v if isinstance(v, (int, str)) else "")
+PY
+}
+
+# The job's newest claim/reclaim event file name, taken the same way as
+# round_job_task_id: the claim version a verified join waiver binds to.
+# Prints it or nothing when there is no claim.
+joined_claim_version() {
+  wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$1/events" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
+         if name.endswith(("claim.json", "reclaim.json"))]
+print(names[-1] if names else "")
 PY
 }
 
@@ -7541,7 +7673,9 @@ job_end_housekeeping() {
   }
   case "$end_out" in
     created|already-ended)
-      release_job_quota_pool "$job" "$pane" || release_rc=$? # hk1798-housekeeping-release
+      # hk1860: the release's skip diagnostics go to stderr, so wrk done and
+      # wrk joined keep their one OK line on stdout.
+      release_job_quota_pool "$job" "$pane" >&2 || release_rc=$? # hk1798-housekeeping-release
       [[ "$release_rc" != 2 ]] || return 0 # hk1813-housekeeping-release-current
       stop_completion_sentinel "$job"
       ;;
@@ -12435,6 +12569,8 @@ prune_cmd() {
   # ones that never had (or lost) a pidfile. A pidfile pass already covers
   # the pair when its pid matches; a different live pid for the same job is
   # a second sentinel and is judged on its own.
+  # hk1860: the one sentinel sweep of this run; pass 4 reads the same snapshot.
+  PRUNE_SWEEP="$(sentinel_sweep 2>/dev/null || true)"
   local _pid _job _owner _label _pane _report _pfpid
   while IFS=$'\t' read -r _pid _job _owner _label _pane _report; do
     [[ -n "$_job" ]] || continue
@@ -12444,7 +12580,7 @@ prune_cmd() {
       [[ "$_pfpid" == "$_pid" ]] && continue
     fi
     prune_sentinel_row "$_job" "$_pid" - "$_pane" "$_owner"
-  done < <(sentinel_sweep)
+  done <<<"$PRUNE_SWEEP"
 
   # Pass 3 — stale jobs: silent past --stale-age AND pane absent. Records are
   # kept; --apply only appends the hub-visible end declaration.
@@ -12486,52 +12622,86 @@ prune_cmd() {
   # than every revive, and that have no live completion sentinel. The arbiter
   # table is authoritative for rows: an earlier release event may be followed
   # by a new record for the same job and pool.
-  local quota_releases=0 _quota_arb="${ARBITER:-}" _quota_status _quota_pools _quota_csv _quota_pane _quota_rc
+  # hk1860: the run takes ONE unscoped arbiter status. Its rows are keyed by
+  # job_id; each ended job reads its pools from that map, and its liveness from
+  # the pass-2 sweep. The release still rechecks the round and the sentinel
+  # right before each release, so a sentinel that starts after the sweep is
+  # still refused there.
+  local quota_releases=0 _quota_arb="${ARBITER:-}" _quota_status="" _quota_map="" _quota_rc=0
+  local _quota_pools _quota_csv _quota_pane _quota_rc2 _live_jobs _probe _pclass _ptoken _qj _qp
   if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
     _quota_arb="$(command -v arbiter 2>/dev/null || true)"
   fi
+  # hk1860 round 3: the status document is read from stdin by this script. It
+  # is never an argv word, since Linux caps one argument at 128 KiB. A parse
+  # failure exits 3 and an exec failure exits with its own rc; both take the
+  # status-failed skip path below.
+  local _quota_map_py='
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    raise SystemExit(3)
+if not isinstance(doc, dict):
+    raise SystemExit(3)
+for row in doc.get("quota_pool_records") or []:
+    if (isinstance(row, dict) and isinstance(row.get("job_id"), str) and row["job_id"]
+            and isinstance(row.get("pool"), str) and row["pool"]):
+        print(row["job_id"] + "\t" + row["pool"])
+'
+  if [[ -n "$_quota_arb" && -x "$_quota_arb" ]]; then
+    _quota_status="$("$_quota_arb" status --json 2>/dev/null)" || _quota_rc=$?
+    if (( _quota_rc == 0 )); then
+      _quota_map="$(printf '%s' "$_quota_status" | python3 -c "$_quota_map_py")" || _quota_rc=$?
+    fi
+  fi
+  _live_jobs="$(awk -F '\t' 'NF >= 2 {print $2}' <<<"$PRUNE_SWEEP")"
   while IFS=$'\t' read -r job _ended _hub _term _age _last _comp _owner _label _pane _tab; do
     [[ -n "$job" ]] || continue
     [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
     [[ -z "$lane" || "$_owner" == "$lane" ]] || continue
     [[ "$_ended" == 1 ]] || continue # hk1813-ended-quota-release-pass
-    job_has_live_completion_sentinel "$job" && continue
+    [[ $'\n'"$_live_jobs"$'\n' != *$'\n'"$job"$'\n'* ]] || continue
     if [[ -z "$_quota_arb" || ! -x "$_quota_arb" ]]; then
-      quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"
+      if (( apply )); then quota_release_log "$job" "-" "rc=- reason=arbiter-unavailable"; fi
       echo "skip job=$job reason=arbiter-unavailable"
       continue
     fi
-    _quota_status="$("$_quota_arb" status --job "$job" --json 2>/dev/null)" || {
-      quota_release_log "$job" "-" "rc=$? reason=status-failed"
+    if (( _quota_rc != 0 )); then
+      if (( apply )); then quota_release_log "$job" "-" "rc=$_quota_rc reason=status-failed"; fi
       echo "skip job=$job reason=status-failed"
       continue
-    }
-    _quota_pools="$(python3 - "$_quota_status" <<'PY'
-import json, sys
-try:
-    doc = json.loads(sys.argv[1])
-except ValueError:
-    raise SystemExit(0)
-pools = {row.get("pool") for row in doc.get("quota_pool_records") or []
-         if isinstance(row, dict) and isinstance(row.get("pool"), str) and row["pool"]}
-print("\n".join(sorted(pools)))
-PY
-    )"
+    fi
+    _quota_pools=""
+    while IFS=$'\t' read -r _qj _qp; do
+      [[ "$_qj" == "$job" && -n "$_qp" ]] || continue
+      _quota_pools+="$_qp"$'\n'
+    done <<<"$_quota_map"
     [[ -n "$_quota_pools" ]] || continue
-    _quota_csv="$(tr '\n' ',' <<<"$_quota_pools")"
-    _quota_csv="${_quota_csv%,}"
+    _quota_csv="$(printf '%s' "$_quota_pools" | sort -u | paste -sd, -)"
     _quota_pane="$_pane"
     [[ "$_quota_pane" == - ]] && _quota_pane=""
+    # hk1860: the newest job.spawned pane must not be alive. The probe classes
+    # match prune pass 2; an unverifiable probe skips too (fail safe).
+    if [[ -n "$_quota_pane" ]]; then
+      _probe="$(herdr_agent_probe "$_quota_pane")"
+      IFS=$'\t' read -r _pclass _ptoken _ <<<"$_probe"
+      case "$_pclass" in
+        gone) ;;
+        ok) echo "skip job=$job reason=pane-alive"; continue ;;
+        *) echo "skip job=$job reason=pane-unverified($_ptoken)"; continue ;;
+      esac
+    fi
     if (( apply )); then
-      _quota_rc=0
-      release_job_quota_pool "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$? # hk1813-ended-quota-release-call
-      [[ "$_quota_rc" != 2 ]] || continue
+      _quota_rc2=0
+      release_job_quota_pool "$job" "$_quota_pane" ended-no-sentinel || _quota_rc2=$? # hk1813-ended-quota-release-call
+      [[ "$_quota_rc2" != 2 ]] || continue
       quota_releases=$(( quota_releases + 1 ))
       echo "release-attempted job=$job pools=$_quota_csv"
     else
-      _quota_rc=0
-      quota_release_round_current "$job" "$_quota_pane" ended-no-sentinel || _quota_rc=$?
-      [[ "$_quota_rc" != 2 ]] || continue
+      _quota_rc2=0
+      quota_release_round_current "$job" "$_quota_pane" ended-no-sentinel || _quota_rc2=$?
+      [[ "$_quota_rc2" != 2 ]] || continue
       quota_releases=$(( quota_releases + 1 ))
       echo "would-release job=$job pools=$_quota_csv"
     fi
@@ -12736,7 +12906,7 @@ PY
 
 heavy_help() {
   cat <<'USAGE'
-Usage: wrk heavy -- <command> [args...]
+Usage: wrk heavy [--queue-key KEY] -- <command> [args...]
        wrk heavy status
 
 Serialize heavy (>1 minute) local test/build runs: up to `heavy_max` holders
@@ -12745,7 +12915,7 @@ on macOS and Linux — macOS has no `flock` command, and flock releases a dead
 holder's slot automatically, unlike shlock pid-files). Slot 0 is the lock
 file itself; slots 1..N-1 are <lock>.slot<i>. The command runs under
 `nice -n 10` and, while the load wait is on (see heavy_load_wait below),
-only starts once load5/ncpu < 1.0. Total wait (slot + load) is capped at
+only starts once load5/ncpu < 1.0. Total wait (slot + load) defaults to a cap of
 20 minutes; on expiry the command is NOT run and wrk exits 75
 (EX_TEMPFAIL). The command inherits the slot fd (nested detection
 needs it — see WRK_HEAVY_HELD_FD), so an orphaned child keeps the slot while
@@ -12798,7 +12968,37 @@ promised: a ci waiter is not queued while wrk and its python half are still
 starting up (before the record exists), and a lane pass that had already
 read the records when the rename happened (one pass, no re-read before its
 slot attempts) can still take a slot that frees in that same pass. Neither
-is preempted afterwards. Waiters of an older wrk ignore classes entirely.
+is preempted afterwards. Waiters from before hk 1533 ignore classes entirely.
+
+Lane FIFO (hk 1407): each published waiter carries a wall-clock enqueue
+ticket, with pid breaking equal-time ties. A lane skips any slot that an
+older live lane ticket could take (index below that waiter's own limit).
+CI reservation and its starvation guard above are unchanged; spending that
+guard never waives lane FIFO. Dead pids and lane records without a ticket
+reserve nothing under lane FIFO. CI reservation does not depend on tickets:
+live ci waiters with or without a ticket keep reserving exactly as above.
+Older lane waiters do not honor tickets, so mixed versions can still race.
+Tickets order visible records, not process start times:
+the same starting up window and pass that already scanned described above
+apply to lanes too. A clock step can change wall-clock order; wait caps and
+the CI guard continue to use monotonic time. No holder is preempted.
+
+Use --queue-key KEY (or WRK_HEAVY_QUEUE_KEY) to keep a place across a wait-cap
+exit (75). KEY is ASCII [A-Za-z0-9._-]{1,64}; the option overrides the env.
+The position stores the original ticket until now + WRK_HEAVY_REQUEUE_GRACE
+(default 600 seconds). A retry before expiry reuses it; at expiry or later
+it is ignored. Acquisition consumes the position. Positions alone reserve
+no slots, and unkeyed retries always get a fresh ticket. Same-key concurrent
+retries can share a ticket; no order between equal tickets is promised.
+Position files use the same directory trust checks as waiters, and must be
+regular files owned by this uid, without symlinks or hardlinks. A same-uid
+process can write a position for any key, so a forged key can at most give
+that process the original ticket within the grace. This narrows; it does
+not bound. Owned per-key guards coordinate position publication and removal:
+this is a same-uid cooperation convention, not a security boundary. Status
+skips stale-position cleanup while a guard is busy, rather than waiting.
+Long runs (Unity) should pass a larger WRK_HEAVY_WAIT_CAP together
+with --queue-key to keep their place. The cap remains one per-run value.
 
 `wrk heavy status` prints the lock path, this host, the effective limit,
 the load-wait switch (`load_wait true|false|error (...)`), one `holder`
@@ -12806,7 +13006,8 @@ line per occupied slot, and queued waiters (holder pids are the
 wrk heavy python processes; killing one frees its slot once the command
 tree that inherited the slot fd is also gone). Every holder and waiter line
 carries `class=ci|lane` (and the limit it queued under). status never
-creates slot files and is never refused.
+creates slot files and is never refused. Live waiter tickets print in order;
+live positions print their key, ticket and expiry. Stale records are cleaned.
 
 Every acquisition appends one JSON record to the heavy log (default
 ~/.local/state/wrk/heavy.log): ts, kind=run, host, job (ARBITER_JOB or -),
@@ -12845,6 +13046,9 @@ Environment:
                         seconds a lane waiter defers to a live ci waiter
                         before it stops (default 1800, 0 = never defer)
   WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
+  WRK_HEAVY_QUEUE_KEY   durable re-queue key (overridden by --queue-key)
+  WRK_HEAVY_REQUEUE_GRACE
+                        seconds a capped keyed ticket survives (default 600)
   WRK_HEAVY_LOAD_FILE   file re-read each poll whose first field is used as
                         load5/ncpu (default: os.getloadavg()[1]/cpu_count)
   WRK_HEAVY_LOG         acquisition log path
@@ -12893,7 +13097,7 @@ heavy_cmd() {
     WRK_HEAVY_LOAD_WAIT_SRC="$heavy_load_wait_src" \
     WRK_HEAVY_LOAD_WAIT_ERR="$heavy_load_wait_err" \
     python3 - "$@" <<'PY'
-import datetime, fcntl, glob, json, os, re, socket, stat, subprocess, sys, tempfile, time
+import datetime, fcntl, glob, json, math, os, re, socket, stat, subprocess, sys, tempfile, time
 
 EXIT_WAIT_CAP = 75  # EX_TEMPFAIL: transient, worth reporting and retrying later
 EXIT_REFUSED = 78   # EX_CONFIG: this host's configuration forbids the run
@@ -12958,6 +13162,19 @@ def with_class(text):
     return toks[0] + " class=lane" + text[len(toks[0]):]
 
 
+def record_ticket(text):
+    # Only field four is metadata: ticket= inside a legacy cmd is free text.
+    fields = text.split(None, 4)
+    if len(fields) < 4:
+        return None
+    match = re.fullmatch(r"ticket=([0-9]{1,20}):([0-9]{1,20})", fields[3])
+    if match:
+        ticket = tuple(map(int, match.groups()))
+        if all(n > 0 for n in ticket):
+            return ticket
+    return None
+
+
 args = sys.argv[1:]
 if not args:
     fail("usage: wrk heavy -- <command> [args...] | wrk heavy status", 2)
@@ -12966,6 +13183,7 @@ host = socket.gethostname()
 lock_path = os.environ.get("WRK_HEAVY_LOCK") or (
     "/tmp/wrk-heavy-%s.lock" % host)
 waiters_dir = lock_path + ".waiters"
+positions_dir = lock_path + ".positions"
 
 # The bash half resolves the limit from WRK_HEAVY_MAX or hosts.toml [local]
 # heavy_max. Invalid (non-integer or negative) refuses the run rc 78; status
@@ -13097,7 +13315,7 @@ def flock_held(path):
     return True
 
 
-def waiters_dir_fd():
+def waiters_dir_fd(path=None):
     # Open the waiters dir itself, never through a link: O_DIRECTORY pins
     # the object to a real directory and O_NOFOLLOW refuses a symlink at
     # the waiters name — a repointable link is exactly the foreign-party-
@@ -13105,7 +13323,7 @@ def waiters_dir_fd():
     # Callers that then listdir/open/rename/remove through this fd cannot
     # have their operations redirected by a same-name path swap either.
     try:
-        return os.open(waiters_dir,
+        return os.open(waiters_dir if path is None else path,
                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         return None
@@ -13126,6 +13344,135 @@ def read_waiter_record(dirfd, name):
             return f.read()
     except OSError:
         return ""
+
+
+def waiters_dir_open(path=None):
+    # Pin a trusted directory; all subsequent operations use its fd. Shared
+    # root-owned sticky dirs remain usable, as on the desktop waiters path.
+    fd = waiters_dir_fd(path)
+    if fd is None:
+        return -1
+    try:
+        st = os.fstat(fd)
+        trusted = (owner_trusted(st) and
+                   not (st.st_mode & 0o022 and
+                        not st.st_mode & stat.S_ISVTX))
+    except OSError:
+        trusted = False
+    if not trusted:
+        os.close(fd)
+        return -1
+    return fd
+
+
+key_re = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
+
+
+def position_name(key):
+    # ASCII hex preserves case-distinct keys on case-insensitive filesystems;
+    # the prefix also keeps valid dot keys ordinary filenames.
+    return "key-" + key.encode("ascii").hex() + ".json"
+
+
+def read_position(dirfd, name):
+    # Check the opened inode, not a path that could be swapped after stat.
+    # Nonblocking open prevents even a racing fifo from hanging the queue.
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=dirfd)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, encoding="utf-8") as f:
+            st = os.fstat(f.fileno())
+            if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+                    and st.st_uid == os.getuid() and st.st_size <= 8192):
+                return None
+            record = json.loads(f.read(8193))
+        if not isinstance(record, dict):
+            return None
+        key, ticket, expiry = (record.get(k) for k in ("key", "ticket", "expiry"))
+        if (not isinstance(key, str) or not key_re.fullmatch(key)
+                or name != position_name(key)
+                or not isinstance(ticket, list) or len(ticket) != 2
+                or any(type(n) is not int or not 0 < n < 10**20 for n in ticket)
+                or type(expiry) not in (int, float) or not math.isfinite(expiry)):
+            return None
+        return record, st
+    except (OSError, ValueError, UnicodeError, OverflowError, RecursionError):
+        return None
+
+
+def position_guard_open(dirfd, key):
+    # A directory flock would also be available to other uids in an allowed
+    # root-owned sticky directory. Use a persistent, private owned inode.
+    name = ".guard-" + key.encode("ascii").hex()
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        try:
+            fd = os.open(name, flags | os.O_CREAT, 0o600, dir_fd=dirfd)
+        except FileNotFoundError:
+            # macOS can report ENOENT when a peer creates the same guard.
+            # Try that existing inode once, without creating or following
+            # anything; the same fstat checks below still own acceptance.
+            fd = os.open(name, flags, dir_fd=dirfd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+                and st.st_nlink == 1 and not st.st_mode & 0o077):
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def position_guard_lock(fd, *, blocking=True):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return True
+    except OSError:
+        return False
+
+
+def position_guard_unlock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def remove_position_locked(dirfd, name, st):
+    # The guard spans stat/unlink, so a cooperating cap publisher cannot
+    # replace the observed inode in between. Keep replacements from before
+    # we acquired the guard (e.g. a renewed expiry seen by status).
+    try:
+        current = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) == (st.st_dev, st.st_ino):
+            os.remove(name, dir_fd=dirfd)
+    except OSError:
+        pass
+
+
+def remove_position(dirfd, name, st, *, key, blocking=True):
+    guardfd = position_guard_open(dirfd, key)
+    if guardfd is None:
+        return
+    try:
+        if not position_guard_lock(guardfd, blocking=blocking):
+            return
+        try:
+            current = read_position(dirfd, name)
+            if current is not None:
+                _, observed = current
+                if (observed.st_dev, observed.st_ino) == (st.st_dev, st.st_ino):
+                    remove_position_locked(dirfd, name, observed)
+        finally:
+            position_guard_unlock(guardfd)
+    finally:
+        os.close(guardfd)
 
 
 if args[0] == "status":
@@ -13194,16 +13541,53 @@ if args[0] == "status":
             except OSError:
                 pass
             continue
-        waiters.append(with_class(info) if info else name)
+        waiters.append((record_ticket(info), with_class(info) if info else name))
     if wfd is not None:
         os.close(wfd)
-    for w in waiters:
+    for _, w in sorted(waiters, key=lambda item: (item[0] is None, item[0] or (0, 0), item[1])):
         print("waiter " + w)
     if not waiters:
         print("waiters none")
+    pfd = waiters_dir_open(positions_dir)
+    positions = []
+    if pfd >= 0:
+        try:
+            try:
+                names = os.listdir(pfd)
+            except OSError:
+                names = []
+            for name in names:
+                result = read_position(pfd, name)
+                if result is None:
+                    continue
+                record, st = result
+                if record["expiry"] <= time.time():
+                    remove_position(pfd, name, st, key=record["key"], blocking=False)
+                else:
+                    positions.append(record)
+        finally:
+            os.close(pfd)
+    for record in sorted(positions, key=lambda r: (r["ticket"], r["key"])):
+        print("position key=%s ticket=%d:%d expiry=%s" %
+              (record["key"], *record["ticket"], record["expiry"]))
     raise SystemExit(0)
 
-if args[0] != "--":
+queue_key = os.environ.get("WRK_HEAVY_QUEUE_KEY") or None
+if args[0] == "--queue-key":
+    if len(args) < 2:
+        fail("--queue-key requires KEY", 2)
+    queue_key = args[1]
+    args = args[2:]
+if queue_key is not None and not key_re.fullmatch(queue_key):
+    fail("invalid queue key (want ASCII [A-Za-z0-9._-]{1,64})", EXIT_REFUSED)
+try:
+    requeue_grace = float(os.environ.get("WRK_HEAVY_REQUEUE_GRACE", "600"))
+except ValueError:
+    requeue_grace = -1
+if not math.isfinite(requeue_grace) or requeue_grace < 0:
+    fail("WRK_HEAVY_REQUEUE_GRACE is not a finite non-negative number", 2)
+
+if not args or args[0] != "--":
     fail("expected '--' before the command (see 'wrk heavy --help')", 2)
 cmd = args[1:]
 if not cmd:
@@ -13283,6 +13667,36 @@ def ci_reserved():
         if cls != "ci" or pid <= 0 or pid == os.getpid():
             continue
         if lim is None or lim < 1 or not alive(pid):
+            continue
+        reserved = max(reserved, lim)
+    return reserved
+
+
+def lane_reserved():
+    # Shape of ci_reserved, but only strictly older live lane tickets count.
+    # A mixed-version record lacking a ticket can never leave a slot idle.
+    try:
+        names = os.listdir(waiters_fd)
+    except OSError:
+        return 0
+    reserved = 0
+    for name in names:
+        if name.startswith("."):
+            continue
+        try:
+            if not stat.S_ISREG(os.stat(name, dir_fd=waiters_fd,
+                                        follow_symlinks=False).st_mode):
+                continue
+        except OSError:
+            continue
+        text = read_waiter_record(waiters_fd, name)
+        pid, cls, lim = record_head(text)
+        older = record_ticket(text)
+        if cls != "lane" or pid <= 0 or pid == os.getpid():
+            continue
+        if older is None or older >= ticket or lim is None or lim < 1:
+            continue
+        if not alive(pid):
             continue
         reserved = max(reserved, lim)
     return reserved
@@ -13388,39 +13802,6 @@ if nested_fd is not None:
                "rc": nrc})
     raise SystemExit(nrc)
 
-def waiters_dir_open():
-    # hk 1545: the waiters dir sits next to the lock, which defaults under
-    # /tmp, so before a record is published the dir must not hand another
-    # local user control over names in it. Fail closed: the open itself
-    # refuses a symlink at the waiters name (its owner could repoint it
-    # after any path check — waiters_dir_fd), and fstat then checks the
-    # object the fd holds: a dir owned by a uid that is neither ours nor
-    # root is refused (its owner can rename or delete entries even under
-    # the sticky bit), and a group/other-writable dir without the sticky
-    # bit is refused (any local user could then remove or replace
-    # records). A writable dir WITH the sticky bit stays usable: files in
-    # it are still only removable by their owner, and mkstemp's
-    # unpredictable O_EXCL tmp name is what closes the plant-a-symlink
-    # hole. The returned fd is kept for the run: every later record
-    # create-target, rename, list and unlink goes through dir_fd, so no
-    # path re-resolution can move a publish or a cleanup into a
-    # swapped-in dir.
-    fd = waiters_dir_fd()
-    if fd is None:
-        return -1
-    try:
-        st = os.fstat(fd)
-        trusted = (owner_trusted(st) and
-                   not (st.st_mode & 0o022 and
-                        not st.st_mode & stat.S_ISVTX))
-    except OSError:
-        trusted = False
-    if not trusted:
-        os.close(fd)
-        return -1
-    return fd
-
-
 try:
     # mode=0o700: a liberal umask (002) must not mint a group-writable dir
     # this same run then refuses (hk 1545 r3); an existing dir is untouched
@@ -13433,6 +13814,30 @@ if waiters_fd < 0:
          "root and not be a symlink; a group/other-writable dir must "
          "carry the sticky bit)" % (waiters_dir, os.getuid()),
          EXIT_REFUSED)
+positions_fd = -1
+position_guard_fd = -1
+ticket = (time.time_ns(), os.getpid())
+if queue_key is not None:
+    try:
+        os.makedirs(positions_dir, mode=0o700, exist_ok=True)
+    except OSError as e:
+        fail("cannot create positions dir %s: %s" % (positions_dir, e), EXIT_REFUSED)
+    positions_fd = waiters_dir_open(positions_dir)
+    if positions_fd < 0:
+        fail("refusing untrusted positions dir %s (same trust rules as waiters dir)"
+             % positions_dir, EXIT_REFUSED)
+    position_guard_fd = position_guard_open(positions_fd, queue_key)
+    if position_guard_fd is None:
+        fail("refusing unsafe queue position guard for key %s" % queue_key, EXIT_REFUSED)
+    previous = read_position(positions_fd, position_name(queue_key))
+    if previous is not None:
+        record, st = previous
+        if record["expiry"] > time.time():
+            ticket = tuple(record["ticket"])
+        else:
+            remove_position(positions_fd, position_name(queue_key), st, key=queue_key)
+# Keep the class/limit head byte-compatible for older wrk and CI reservation.
+info = info.replace(" since=", " ticket=%d:%d since=" % ticket, 1)
 me_name = str(os.getpid())
 held_slot = -1
 acquired_at = None
@@ -13449,6 +13854,55 @@ defer_seen = False   # held back at least once: a defer row is owed
 defer_over = False   # guard fired: no more deferral for the rest of the wait
 defer_logged = False
 record_tmp = None    # mkstemp path mid-publish; every exit path drops it
+
+
+def save_position():
+    if positions_fd < 0:
+        return
+    record = {"key": queue_key, "ticket": ticket,
+              "expiry": time.time() + requeue_grace}
+    tmp = ".position-" + os.urandom(16).hex()
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=positions_fd)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+            f.flush()
+            os.fsync(f.fileno())
+        if not position_guard_lock(position_guard_fd):
+            raise OSError("cannot lock queue position guard")
+        try:
+            os.replace(tmp, position_name(queue_key),
+                       src_dir_fd=positions_fd, dst_dir_fd=positions_fd)
+        finally:
+            position_guard_unlock(position_guard_fd)
+        # Some filesystems do not support directory fsync; atomic rename
+        # still ensures readers see a complete record after a process crash.
+        try:
+            os.fsync(positions_fd)
+        except OSError:
+            pass
+    except OSError as e:
+        print("wrk heavy: cannot save queue position: %s" % e, file=sys.stderr)
+    finally:
+        try:
+            os.remove(tmp, dir_fd=positions_fd)
+        except OSError:
+            pass
+
+
+def consume_position():
+    if positions_fd < 0:
+        return
+    if not position_guard_lock(position_guard_fd):
+        fail("cannot lock queue position guard", EXIT_REFUSED)
+    try:
+        previous = read_position(positions_fd, position_name(queue_key))
+        if previous is not None:
+            _, st = previous
+            remove_position_locked(positions_fd, position_name(queue_key), st)
+    finally:
+        position_guard_unlock(position_guard_fd)
 
 
 def end_defer(reason):
@@ -13562,8 +14016,13 @@ try:
                 elif defer_mark is not None:
                     defer_total += now - defer_mark
                     defer_mark = None
+            # CI keeps its existing guard and log clock; lane FIFO is a
+            # separate reservation and is never waived by spending it.
+            lane_limit = lane_reserved() if hclass == "lane" else 0
             for i, sfd in enumerate(slot_fds):
                 if i < reserved:
+                    continue
+                if i < lane_limit:
                     continue
                 try:
                     fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -13575,6 +14034,7 @@ try:
                 break
             if time.monotonic() >= deadline:
                 end_defer("cap")
+                save_position()
                 log_event({"kind": "wait_cap", "phase": "slot",
                            "cmd": cmd_summary[:200], "limit": limit,
                            "wait_s": round(time.monotonic() - started_at, 3)})
@@ -13586,6 +14046,7 @@ try:
             fail("interrupted while waiting for a heavy slot on %s "
                  "-- command not run" % lock_path, 130)
     acquired_at = time.monotonic()
+    consume_position()
     end_defer("acquired")
     try:
         os.remove(me_name, dir_fd=waiters_fd)
@@ -13599,6 +14060,7 @@ try:
     # runs. With the wait off there is no second gate: refuse the late slot
     # exactly like a slot-wait expiry (same message, same wait_cap event).
     if not load_wait and acquired_at >= deadline:
+        save_position()
         log_event({"kind": "wait_cap", "phase": "slot",
                    "cmd": cmd_summary[:200], "limit": limit,
                    "wait_s": round(time.monotonic() - started_at, 3)})
@@ -13612,6 +14074,7 @@ try:
             if ratio is None or ratio < 1.0:
                 break
             if time.monotonic() >= deadline:
+                save_position()
                 log_event({"kind": "wait_cap", "phase": "load",
                            "cmd": cmd_summary[:200], "limit": limit,
                            "wait_s": round(time.monotonic() - started_at, 3)})
@@ -13639,6 +14102,10 @@ finally:
         except OSError:
             pass
     os.close(waiters_fd)
+    if positions_fd >= 0:
+        os.close(positions_fd)
+    if position_guard_fd >= 0:
+        os.close(position_guard_fd)
     if held_fd is not None:
         if run_at is not None:
             log_event({"kind": "run", "cmd": cmd_summary[:200],

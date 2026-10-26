@@ -564,8 +564,11 @@ print(re.search(r'PROBE = r"""(.*?)"""', src, re.S).group(1))
 PY
 bad="$(grep -nE '(^|[ ;&|])(systemctl|launchctl|scp|rsync|tee|sed -i|cp|mv|rm|mkdir|chmod|ln|brew|apt|pip)([ ;&|]|$)|(^|[ ;&|])install([ ;&|]|$)|uv tool|git (config|remote|pull|push|fetch|checkout|clean|reset|commit|clone)' "$TMP/probe.sh" || true)"
 [[ -z "$bad" ]] || fail "AC9 probe write/install command: $bad"
-bad="$(grep -oE '>[0-9A-Za-z&/_.-]*' "$TMP/probe.sh" | grep -vE '^>(/dev/null|&[12])$' || true)"
+# fd 9 is the probe's own stderr (dup'd once at the top, for the kill log
+# lines); any other redirect target, file or fd, is refused.
+bad="$(grep -oE '>[0-9A-Za-z&/_.-]*' "$TMP/probe.sh" | grep -vE '^>(/dev/null|&[129])$' || true)"
 [[ -z "$bad" ]] || fail "AC9 probe redirect: $bad"
+[[ "$(grep -c '9>&2' "$TMP/probe.sh")" == 1 ]] || fail "AC9 probe fd 9 is not the single exec 9>&2 dup"
 bad="$(grep -inE 'token|secret|\.env|id_rsa|netrc|\.aws|password|credential' "$TMP/probe.sh" || true)"
 [[ -z "$bad" ]] || fail "AC9 probe secret read: $bad"
 envnames="$(grep -oE 'environ\.get\("[A-Z_]+"|environ\["[A-Z_]+"\]' "$ROOT/bin/fleet-rev" | grep -oE '"[A-Z_]+"' | tr -d '"' | sort -u | tr '\n' ' ')"
@@ -1014,5 +1017,94 @@ done
   fail "AC18 panewire.installed: $(printf '%s\n' "$PROBE_OUT" | grep panewire)"
 [[ $ELA -lt 10 ]] || fail "AC18 probe stalled: ${ELA}s"
 pass "AC18 tool reading stdin gets 0 bytes; every probe key still prints"
+
+# ================================================================ AC19 (1015 K1)
+# Kill safety: each snapshotted pid carries its identity (ps lstart) and is
+# signalled only while the live pid still has exactly that identity. A pid
+# freed after the snapshot and taken by an unrelated process must survive,
+# and the skip is logged. A real pid reuse cannot be forced portably, so the
+# test hands kill_known the record a reuse leaves behind (an identity that is
+# no longer the live one) for a victim this test started. The victims exit
+# on their own when this shell is gone, so a failed run leaves nothing behind.
+reset_env
+python3 - "$FLEET_REV" >"$TMP/probe-ac19.sh" <<'PY'
+import re, sys
+src = open(sys.argv[1], encoding="utf-8").read()
+print(re.search(r'PROBE = r"""(.*?)"""', src, re.S).group(1))
+PY
+: >"$TMP/ident-fns.sh"
+for fn in descendants ident snap kill_known; do
+  sed -n "/^$fn()/,/^}/p" "$TMP/probe-ac19.sh" >>"$TMP/ident-fns.sh"
+done
+cat >"$TMP/victim.sh" <<'EOF'
+#!/bin/sh
+# fixture owned by the test: TERM leaves a marker file; exits when $2 (the
+# test shell) is gone.
+trap 'printf signalled >"$1"; exit 0' TERM
+while kill -0 "$2" 2>/dev/null; do sleep 1; done
+EOF
+run_fn() { # FN ARGS...: run one probe function; its fd 9 log is $TMP/ident.log
+  sh -c '. "$1"; exec 9>>"$2"; shift 2; "$@"' sh "$TMP/ident-fns.sh" "$TMP/ident.log" "$@"
+}
+: >"$TMP/ident.log"
+sh "$TMP/victim.sh" "$TMP/u.marker" "$$" </dev/null >/dev/null 2>&1 &
+U_PID=$!
+sh "$TMP/victim.sh" "$TMP/v.marker" "$$" </dev/null >/dev/null 2>&1 &
+V_PID=$!
+U_ID="$(run_fn ident "$U_PID")"
+[[ -n "$U_ID" && "$(printf '%s\n' "$U_ID" | wc -l | tr -d ' ')" == 1 ]] ||
+  fail "AC19 ident of a live pid is not one non-empty line: '$U_ID'"
+[[ "$(run_fn ident "$U_PID")" == "$U_ID" ]] || fail "AC19 ident not stable across reads"
+sleep 0 &
+D_PID=$!
+wait "$D_PID" || true
+[[ -z "$(run_fn ident "$D_PID")" ]] || fail "AC19 ident of a reaped pid is not empty"
+# a changed identity (the pid was reused after the snapshot): no signal
+run_fn kill_known TERM "$U_PID Thu Jan  1 00:00:00 1970" || true
+sleep 2
+[[ ! -e "$TMP/u.marker" ]] || fail "AC19 signalled a pid whose identity changed"
+kill -0 "$U_PID" 2>/dev/null || fail "AC19 victim gone after a changed-identity record"
+grep -q "kill skipped for pid $U_PID: identity changed" "$TMP/ident.log" ||
+  fail "AC19 no log line for a changed identity: $(cat "$TMP/ident.log")"
+# positive control: the same victim with its live identity is signalled
+run_fn kill_known TERM "$U_PID $U_ID" || true
+sleep 2
+[[ -e "$TMP/u.marker" ]] || fail "AC19 matching identity was not signalled (positive control)"
+# an unreadable identity (empty record) is never signalled
+run_fn kill_known TERM "$V_PID " || true
+sleep 2
+[[ ! -e "$TMP/v.marker" ]] || fail "AC19 signalled a pid with an unreadable identity"
+kill -0 "$V_PID" 2>/dev/null || fail "AC19 victim gone after an unreadable-identity record"
+grep -q "kill skipped for pid $V_PID: identity unreadable" "$TMP/ident.log" ||
+  fail "AC19 no log line for an unreadable identity: $(cat "$TMP/ident.log")"
+kill -KILL "$V_PID" 2>/dev/null || true
+wait "$V_PID" 2>/dev/null || true
+pass "AC19 kill only on exact identity: changed or unreadable pids survive and are logged (1015 K1)"
+
+# ================================================================ AC20 (1015 K2)
+# An identity that cannot be read fails safe. Here ps is unusable (as busybox
+# ps without -p looks), so nothing can be identified and the 3s bound must not
+# kill a 5s tool: it finishes and reports, and the skip is logged.
+reset_env
+mk_home "$LOCAL_HOME"
+cat >"$LOCAL_HOME/.local/bin/ps" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+cat >"$LOCAL_HOME/.local/bin/panewire" <<'EOF'
+#!/bin/sh
+sleep 5
+printf 'pw-deadbee\n'
+EOF
+chmod +x "$LOCAL_HOME/.local/bin/ps" "$LOCAL_HOME/.local/bin/panewire"
+SECONDS=0
+run_fleet --only local --timeout 30
+ELA=$SECONDS
+[[ "$(cell local panewire)" != *"tool timed out"* ]] ||
+  fail "AC20 unreadable identity killed the tool at the bound: $(cell local panewire)"
+[[ $ELA -ge 5 ]] || fail "AC20 tool did not run to completion: ${ELA}s"
+[[ "$ERR" == *"fleet-rev: kill skipped for pid"*"identity unreadable"* ]] ||
+  fail "AC20 no log line for the unreadable identity: $ERR"
+pass "AC20 unreadable identity fails safe: tool not killed at the bound, skip logged (1015 K2)"
 
 pass "all fleet-rev acceptance tests"

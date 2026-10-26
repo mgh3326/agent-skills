@@ -58,7 +58,10 @@ export HANDOFFKEEP_BIN="$TMP/hk"
 cp "$ROOT/bin/arbiter" "$TMP/arbiter" && chmod 700 "$TMP/arbiter"
 export ARBITER_BIN="$TMP/arbiter"
 export HK_DOC_DIR="$TMP/hk-docs"
-mkdir -p "$HK_DOC_DIR"
+export HK_TASK_DIR="$TMP/hk-tasks"
+export HK_CALL_LOG="$TMP/hk-calls.log"
+mkdir -p "$HK_DOC_DIR" "$HK_TASK_DIR"
+: >"$HK_CALL_LOG"
 export GIT_CONFIG_NOSYSTEM=1
 export GIT_CONFIG_GLOBAL=/dev/null
 
@@ -73,10 +76,11 @@ write_event() {
   python3 -c 'import json,sys; p=sys.argv[1]; d=json.load(sys.stdin); f=open(p,"w",encoding="utf-8"); json.dump(d,f,separators=(",",":")); f.write("\n"); f.close()' "$1"
 }
 
-claim_job() { # claim_job job [parent] [created_at] [role] [owner]
+claim_job() { # claim_job job [parent] [created_at] [role] [owner] [task_id]
   local job="$1" parent="${2:-director-1}" at="${3:-2026-10-23T00:00:00Z}"
-  local role="${4:-builder}" owner="${5:-lane-a}"
+  local role="${4:-builder}" owner="${5:-lane-a}" task_id="${6:-}" task_field=""
   local events="$ARBITER_INBOX_ROOT/$job/events"
+  [[ -z "$task_id" ]] || task_field=",\"task_id\":\"$task_id\""
   mkdir -p "$events" "$ARBITER_INBOX_ROOT/$job"
   # hk 1897: mint the DB claim row; the events file arbiter writes stays
   # byte-identical on the identity fields — only created_at and the
@@ -248,19 +252,49 @@ write_verdict_first() { # path verdict head — the VERDICT line is line 1
   printf 'VERDICT: %s @%s\n' "$2" "$3" >"$1"
 }
 
+# The stub serves doc get from HK_DOC_DIR, tasks comments from HK_TASK_DIR/comments-N and
+# tasks show from HK_TASK_DIR/show-N, and records every call it receives (hk 1899).
+# HK_FETCH_HOOK, when set, runs inside the waiver-record fetch — the window hk 2024
+# races: after verify, before the events-lock commit.
 cat >"$HANDOFFKEEP_BIN" <<'EOF'
 #!/bin/sh
+[ -z "${HK_CALL_LOG:-}" ] || printf '%s\n' "$*" >>"$HK_CALL_LOG"
 if [ "$1" = "doc" ] && [ "$2" = "get" ] && [ -n "${3:-}" ] && [ -f "$HK_DOC_DIR/$3" ]; then
   cat "$HK_DOC_DIR/$3"
+  [ -z "${HK_FETCH_HOOK:-}" ] || "$HK_FETCH_HOOK" "$@"
+  exit 0
+fi
+if [ "$1" = "tasks" ] && [ "$2" = "comments" ] && [ -n "${3:-}" ] && [ -f "$HK_TASK_DIR/comments-$3" ]; then
+  cat "$HK_TASK_DIR/comments-$3"
+  [ -z "${HK_FETCH_HOOK:-}" ] || "$HK_FETCH_HOOK" "$@"
+  exit 0
+fi
+if [ "$1" = "tasks" ] && [ "$2" = "show" ] && [ -n "${3:-}" ] && [ -f "$HK_TASK_DIR/show-$3" ]; then
+  cat "$HK_TASK_DIR/show-$3"
   exit 0
 fi
 exit 1
 EOF
 chmod +x "$HANDOFFKEEP_BIN"
 
-grant_doc() { # grant_doc key body
-  python3 -c 'import json,sys; json.dump({"created_by":"director-1","body":sys.argv[2]}, open(sys.argv[1],"w"))' \
-    "$HK_DOC_DIR/$1" "$2"
+grant_doc() { # grant_doc key body [created_by]
+  python3 -c 'import json,sys; json.dump({"created_by":sys.argv[3],"body":sys.argv[2]}, open(sys.argv[1],"w"))' \
+    "$HK_DOC_DIR/$1" "$2" "${3:-director-1}"
+}
+
+grant_task() { # grant_task id author body — appends one comment to the task comments record
+  python3 -c 'import json,os,sys
+path,author,body=sys.argv[1:]
+doc={"comments":[]}
+if os.path.exists(path):
+    doc=json.load(open(path,encoding="utf-8"))
+doc["comments"].append({"author":author,"body":body})
+json.dump(doc,open(path,"w",encoding="utf-8"))' "$HK_TASK_DIR/comments-$1" "$2" "$3"
+}
+
+task_record() { # task_record id project job_id — the server task a pa-integrator grant is checked against
+  python3 -c 'import json,sys; json.dump({"id":sys.argv[2],"project":sys.argv[3],"refs":{"job_id":sys.argv[4]}}, open(sys.argv[1],"w"))' \
+    "$HK_TASK_DIR/show-$1" "$1" "$2" "$3"
 }
 
 TEST_REPO="$TMP/repo"
@@ -397,6 +431,7 @@ assert_refused "wrk: joined: job c-zero has zero non-voided recorded rounds"
 echo "PASS c-zero-rounds-refused"
 
 claim_job c-waive
+grant_task 1 director-1 "join-waiver: job=c-waive by=director-1"
 run_cmd "$WRK" joined c-waive --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT" --rounds-waived hk:task/1
 assert_rc 0
 python3 -c 'import json,os,sys
@@ -407,11 +442,13 @@ for name in os.listdir(os.path.join(root,job,"events")):
     if doc.get("kind")=="job.joined":
         found=True
         assert doc.get("rounds_waived")=="hk:task/1", doc
+        assert doc.get("rounds_waived_issuer")=="director-1", doc
 assert found
 ' "$ARBITER_INBOX_ROOT" c-waive
 echo "PASS c-waiver-hk-task-recorded"
 
 claim_job c-waive-doc
+grant_doc waiver-key "join-waiver: job=c-waive-doc by=director-1"
 run_cmd "$WRK" joined c-waive-doc --pr https://example.invalid/pr/1 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/waiver-key
 assert_rc 0
 python3 -c 'import json,os,sys
@@ -420,6 +457,7 @@ for name in os.listdir(os.path.join(root,"c-waive-doc","events")):
     doc=json.load(open(os.path.join(root,"c-waive-doc","events",name),encoding="utf-8"))
     if doc.get("kind")=="job.joined":
         assert doc.get("rounds_waived")=="hk:doc/waiver-key", doc
+        assert doc.get("rounds_waived_issuer")=="director-1", doc
         raise SystemExit(0)
 raise SystemExit("missing joined")
 ' "$ARBITER_INBOX_ROOT"
@@ -435,6 +473,7 @@ echo "PASS c-waiver-shape-refused"
 
 # Waiver must not be forwarded to panewire.
 claim_job c-waive-local
+grant_task 1 director-1 "join-waiver: job=c-waive-local by=director-1"
 cat >"$TMP/pw-waive" <<'EOF'
 #!/bin/sh
 printf '%s\n' "$*" >>"$PW_LOG"
@@ -1097,6 +1136,7 @@ echo "PASS f-inlock-end-record-refused"
 
 claim_job f-race-waived
 seed_round f-race-waived
+grant_task 1900 director-1 "join-waiver: job=f-race-waived by=director-1"
 run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$RACE_HOOK" \
   "$WRK" joined f-race-waived --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT" --rounds-waived hk:task/1900
 assert_refused "wrk: joined: refused after end record 00099-job.revoked.json"
@@ -1113,6 +1153,7 @@ echo "PASS f-inlock-zero-rounds-refused"
 
 claim_job f-race-zero-waived
 seed_round f-race-zero-waived
+grant_task 1900 director-1 "join-waiver: job=f-race-zero-waived by=director-1"
 run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$ZERO_HOOK" \
   "$WRK" joined f-race-zero-waived --pr https://example.invalid/pr/1900 --head "$H1" --report "$REPORT" --rounds-waived hk:task/1900
 assert_rc 0
@@ -1194,6 +1235,335 @@ assert_refused "wrk: round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex
 join_ok g-bom
 echo "PASS g-bom-is-not-a-verdict-first-line"
 
+# ── hk 1899: --rounds-waived fetches REF and verifies a join-waiver grant ──
+# Grant line form, one exact line in the record:
+#   join-waiver: job=<job> by=<issuer>
+# The issuer must be an operator or the job parent lane (from the fixed set) and must
+# equal the record server-set identity: a doc created_by or a task comment author.
+echo "== h-waiver-grant =="
+joined_waived() { # joined_waived job ref
+  run_cmd "$WRK" joined "$1" --pr https://example.invalid/pr/1899 --head "$H1" --report "$REPORT" --rounds-waived "$2"
+}
+
+joined_field() { # joined_field job field
+  python3 -c 'import json,os,sys
+job,field,root=sys.argv[1:]
+events=os.path.join(root,job,"events")
+for name in sorted(os.listdir(events)):
+    if not name.endswith(".json"):
+        continue
+    doc=json.load(open(os.path.join(events,name),encoding="utf-8"))
+    if isinstance(doc,dict) and doc.get("kind")=="job.joined":
+        print(doc.get(field,"<absent>"))
+        raise SystemExit(0)
+print("<no job.joined>")' "$1" "$2" "$ARBITER_INBOX_ROOT"
+}
+
+SHAPE_MSG="wrk: joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"
+nogrant_msg() { # nogrant_msg job ref
+  printf "wrk: joined: %s has no 'join-waiver: job=%s by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)" "$2" "$1"
+}
+
+assert_waiver_refused() { # assert_waiver_refused job ref message
+  joined_waived "$1" "$2"
+  assert_refused "$3"
+  [[ "$(kind_count "$1" job.joined)" -eq 0 ]] || fail "a refused waiver wrote job.joined for $1 ($2)"
+}
+
+# A made-up ref: the stub has no such record, so the fetch fails and nothing is written.
+claim_job h-made-up
+: >"$HK_CALL_LOG"
+assert_waiver_refused h-made-up hk:doc/made-up-key "wrk: joined: waiver record not found in handoffkeep: hk:doc/made-up-key"
+grep -qxF 'doc get made-up-key' "$HK_CALL_LOG" || fail "a well-shaped ref must be fetched: $(cat "$HK_CALL_LOG")"
+assert_waiver_refused h-made-up hk:task/4040 "wrk: joined: waiver record not found in handoffkeep: hk:task/4040"
+grep -qxF 'tasks comments 4040' "$HK_CALL_LOG" || fail "a task ref must be fetched with tasks comments: $(cat "$HK_CALL_LOG")"
+echo "PASS h-made-up-ref-refused"
+
+# A real doc whose body holds the grant line and whose created_by is the issuer.
+claim_job h-doc
+grant_doc h-doc-grant "join-waiver: job=h-doc by=director-1"
+joined_waived h-doc hk:doc/h-doc-grant
+assert_rc 0
+grep -q "OK job=h-doc " "$TMP/run.out" || fail "waived join stdout: $(cat "$TMP/run.out")"
+[[ "$(kind_count h-doc job.joined)" -eq 1 ]] || fail "a verified waiver must write one job.joined"
+[[ "$(joined_field h-doc rounds_waived)" == "hk:doc/h-doc-grant" ]] || fail "rounds_waived: $(joined_field h-doc rounds_waived)"
+[[ "$(joined_field h-doc rounds_waived_issuer)" == "director-1" ]] || fail "rounds_waived_issuer: $(joined_field h-doc rounds_waived_issuer)"
+echo "PASS h-doc-waiver-accepted-on-zero-rounds"
+
+# Several lines: only a later one is the grant line.
+claim_job h-doc-later
+grant_doc h-doc-later-grant "$(printf 'reason: the tester host was down\njoin-waiver: job=other-job by=director-1\njoin-waiver: job=h-doc-later by=director-1\n')"
+joined_waived h-doc-later hk:doc/h-doc-later-grant
+assert_rc 0
+[[ "$(joined_field h-doc-later rounds_waived_issuer)" == "director-1" ]] || fail "a later grant line must count"
+echo "PASS h-doc-waiver-later-line-accepted"
+
+# The same through a task comment.
+claim_job h-task
+grant_task 5101 someone-else "a comment from another author"
+grant_task 5101 director-1 "$(printf 'join-waiver: job=h-task by=director-1')"
+joined_waived h-task hk:task/5101
+assert_rc 0
+[[ "$(joined_field h-task rounds_waived)" == "hk:task/5101" ]] || fail "rounds_waived: $(joined_field h-task rounds_waived)"
+[[ "$(joined_field h-task rounds_waived_issuer)" == "director-1" ]] || fail "rounds_waived_issuer: $(joined_field h-task rounds_waived_issuer)"
+grep -qxF 'tasks comments 5101' "$HK_CALL_LOG" || fail "task waiver must be fetched with tasks comments"
+echo "PASS h-task-waiver-accepted"
+
+# Operators are accepted wherever the record is server-stamped by the same identity.
+claim_job h-operator
+grant_doc h-operator-grant "join-waiver: job=h-operator by=operator" operator
+joined_waived h-operator hk:doc/h-operator-grant
+assert_rc 0
+[[ "$(joined_field h-operator rounds_waived_issuer)" == "operator" ]] || fail "operator issuer not recorded"
+echo "PASS h-operator-waiver-accepted"
+
+# Refused, each with no job.joined.
+claim_job h-other-job
+grant_doc h-other-job-grant "join-waiver: job=h-another by=director-1"
+assert_waiver_refused h-other-job hk:doc/h-other-job-grant "$(nogrant_msg h-other-job hk:doc/h-other-job-grant)"
+echo "PASS h-grant-for-another-job-refused"
+
+claim_job h-forged
+grant_doc h-forged-grant "join-waiver: job=h-forged by=director-1" the-builder
+assert_waiver_refused h-forged hk:doc/h-forged-grant "$(nogrant_msg h-forged hk:doc/h-forged-grant)"
+grant_task 5102 the-builder "join-waiver: job=h-forged by=director-1"
+assert_waiver_refused h-forged hk:task/5102 "$(nogrant_msg h-forged hk:task/5102)"
+echo "PASS h-issuer-not-the-server-identity-refused"
+
+claim_job h-outsider
+grant_doc h-outsider-grant "join-waiver: job=h-outsider by=the-builder" the-builder
+assert_waiver_refused h-outsider hk:doc/h-outsider-grant "$(nogrant_msg h-outsider hk:doc/h-outsider-grant)"
+# pa-integrator is trusted only as the recorded parent lane of the job, not as a bystander.
+grant_doc h-outsider-pa "join-waiver: job=h-outsider by=pa-integrator" pa-integrator
+assert_waiver_refused h-outsider hk:doc/h-outsider-pa "$(nogrant_msg h-outsider hk:doc/h-outsider-pa)"
+echo "PASS h-issuer-outside-the-allowed-set-refused"
+
+claim_job h-other-kind
+grant_doc h-void-line "round-void: job=h-other-kind round=1 by=director-1"
+assert_waiver_refused h-other-kind hk:doc/h-void-line "$(nogrant_msg h-other-kind hk:doc/h-void-line)"
+grant_doc h-ext-line "round-extension: job=h-other-kind extra=1 by=director-1"
+assert_waiver_refused h-other-kind hk:doc/h-ext-line "$(nogrant_msg h-other-kind hk:doc/h-ext-line)"
+echo "PASS h-other-grant-kinds-refused"
+
+claim_job h-spaces
+SP_LINE="join-waiver: job=h-spaces by=director-1"
+SP_VARIANTS=(
+  "join-waiver:  job=h-spaces by=director-1"
+  "join-waiver: job=h-spaces  by=director-1"
+  " $SP_LINE"
+  "$SP_LINE "
+  "$SP_LINE and more"
+  "$(printf 'join-waiver:\tjob=h-spaces by=director-1')"
+  "see $SP_LINE"
+  "> $SP_LINE"
+  "Join-Waiver: job=h-spaces by=director-1"
+  "join-waiver job=h-spaces by=director-1"
+  "join-waiver: job=h-spaces by="
+  "join-waiver: by=director-1 job=h-spaces"
+)
+n=0
+for variant in "${SP_VARIANTS[@]}"; do
+  n=$((n + 1))
+  grant_doc "h-spaces-$n" "$variant"
+  assert_waiver_refused h-spaces "hk:doc/h-spaces-$n" "$(nogrant_msg h-spaces "hk:doc/h-spaces-$n")"
+done
+[[ "$n" -eq 12 ]] || fail "expected 12 whitespace and shape variants, ran $n"
+echo "PASS h-whitespace-variants-refused"
+
+# A join-waiver line is not a grant for the other two kinds.
+claim_job h-cross
+open_ok h-cross "$H1"
+grant_doc h-cross-grant "join-waiver: job=h-cross by=director-1"
+run_cmd "$WRK" round void h-cross 1 --by hk:doc/h-cross-grant
+[[ "$RUN_RC" -ne 0 ]] || fail "a join-waiver line must not void a round"
+grep -q "round void --by: hk:doc/h-cross-grant has no matching 'round-void: job=h-cross round=1 by=" "$TMP/run.err" || fail "round void on a join-waiver doc: $(cat "$TMP/run.err")"
+echo "PASS h-join-waiver-does-not-void-or-extend"
+
+# pa-integrator grants also need the ParkingArcade server task, as round void does.
+echo "== h-waiver-pa-integrator =="
+PA_HEAD="wrk: joined: pa-integrator grants need the job's hk task on the server;"
+claim_job h-pa-ok pa-integrator 2026-10-23T00:00:00Z builder lane-a 7001
+task_record 7001 ParkingArcade h-pa-ok
+grant_doc h-pa-ok-grant "join-waiver: job=h-pa-ok by=pa-integrator" pa-integrator
+joined_waived h-pa-ok hk:doc/h-pa-ok-grant
+assert_rc 0
+[[ "$(joined_field h-pa-ok rounds_waived_issuer)" == "pa-integrator" ]] || fail "pa-integrator issuer not recorded"
+grep -qxF 'tasks show 7001' "$HK_CALL_LOG" || fail "the pa-integrator check must read the server task"
+echo "PASS h-pa-integrator-waiver-accepted"
+
+claim_job h-pa-notask pa-integrator
+grant_doc h-pa-notask-grant "join-waiver: job=h-pa-notask by=pa-integrator" pa-integrator
+assert_waiver_refused h-pa-notask hk:doc/h-pa-notask-grant "$PA_HEAD h-pa-notask records no task_id"
+claim_job h-pa-nofetch pa-integrator 2026-10-23T00:00:00Z builder lane-a 7002
+grant_doc h-pa-nofetch-grant "join-waiver: job=h-pa-nofetch by=pa-integrator" pa-integrator
+assert_waiver_refused h-pa-nofetch hk:doc/h-pa-nofetch-grant "$PA_HEAD cannot fetch task 7002"
+claim_job h-pa-project pa-integrator 2026-10-23T00:00:00Z builder lane-a 7003
+task_record 7003 SomethingElse h-pa-project
+grant_doc h-pa-project-grant "join-waiver: job=h-pa-project by=pa-integrator" pa-integrator
+assert_waiver_refused h-pa-project hk:doc/h-pa-project-grant "wrk: joined: pa-integrator grants count only when the server task for h-pa-project is project ParkingArcade with refs.job_id=h-pa-project"
+claim_job h-pa-refs pa-integrator 2026-10-23T00:00:00Z builder lane-a 7004
+task_record 7004 ParkingArcade some-other-job
+grant_doc h-pa-refs-grant "join-waiver: job=h-pa-refs by=pa-integrator" pa-integrator
+assert_waiver_refused h-pa-refs hk:doc/h-pa-refs-grant "wrk: joined: pa-integrator grants count only when the server task for h-pa-refs is project ParkingArcade with refs.job_id=h-pa-refs"
+echo "PASS h-pa-integrator-needs-the-parking-arcade-task"
+
+# Shapes refused before any fetch. Each ref has a valid grant behind it in the stub, so only
+# the shape check can refuse it; the stub records no call.
+echo "== h-waiver-shape =="
+claim_job h-shape
+SHAPE_GRANT="join-waiver: job=h-shape by=director-1"
+grant_doc 'a b' "$SHAPE_GRANT"
+grant_doc 'a ' "$SHAPE_GRANT"
+grant_doc ' a' "$SHAPE_GRANT"
+grant_doc "$(printf 'a\nb')" "$SHAPE_GRANT"
+grant_doc shape-key "$SHAPE_GRANT"
+grant_task abc director-1 "$SHAPE_GRANT"
+grant_task '1x' director-1 "$SHAPE_GRANT"
+grant_task '-1' director-1 "$SHAPE_GRANT"
+grant_task '12 ' director-1 "$SHAPE_GRANT"
+grant_task ' 12' director-1 "$SHAPE_GRANT"
+n=0
+for bad in 'hk:task/abc' 'hk:task/' 'hk:doc/' 'hk:doc/a b' 'hk:doc/a ' 'hk:doc/ a' "$(printf 'hk:doc/a\nb')" \
+  'hk:task/1x' 'hk:task/-1' 'hk:task/12 ' 'hk:task/ 12' 'shape-key' ' hk:doc/shape-key' 'hk:docs/shape-key' 'HK:DOC/shape-key'; do
+  n=$((n + 1))
+  : >"$HK_CALL_LOG"
+  joined_waived h-shape "$bad"
+  assert_refused "$SHAPE_MSG"
+  [[ ! -s "$HK_CALL_LOG" ]] || fail "a malformed ref reached handoffkeep ($bad): $(cat "$HK_CALL_LOG")"
+  [[ "$(kind_count h-shape job.joined)" -eq 0 ]] || fail "a malformed ref wrote job.joined ($bad)"
+done
+[[ "$n" -eq 15 ]] || fail "expected 15 malformed refs, ran $n"
+echo "PASS h-malformed-refs-refused-before-any-fetch"
+
+# An end record is checked before the fetch and cannot be waived.
+claim_job h-ended
+write_event "$ARBITER_INBOX_ROOT/h-ended/events/00002-job.revoked.json" <<'EOF'
+{"kind":"job.revoked","job_id":"h-ended","created_at":"2026-10-23T01:00:00Z"}
+EOF
+grant_doc h-ended-grant "join-waiver: job=h-ended by=director-1"
+: >"$HK_CALL_LOG"
+joined_waived h-ended hk:doc/h-ended-grant
+assert_refused "wrk: joined: refused after end record 00002-job.revoked.json"
+[[ ! -s "$HK_CALL_LOG" ]] || fail "the end check must come before the fetch: $(cat "$HK_CALL_LOG")"
+[[ "$(kind_count h-ended job.joined)" -eq 0 ]] || fail "a valid waiver must not override an end record"
+echo "PASS h-end-record-still-refuses-a-valid-waiver"
+
+# The waiver is verified before the events lock is taken: the test hook runs under the
+# lock, so a refused waiver never reaches it and a verified one does.
+WAIVER_HOOK="$TMP/waiver-lock-hook"
+cat >"$WAIVER_HOOK" <<'EOF'
+#!/bin/sh
+: >"$WAIVER_MARKER"
+EOF
+chmod +x "$WAIVER_HOOK"
+claim_job h-lock-refused
+rm -f "$TMP/waiver-marker"
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$WAIVER_HOOK" WAIVER_MARKER="$TMP/waiver-marker" \
+  "$WRK" joined h-lock-refused --pr https://example.invalid/pr/1899 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/made-up-key
+[[ "$RUN_RC" -ne 0 ]] || fail "a refused waiver must fail the join"
+[[ ! -e "$TMP/waiver-marker" ]] || fail "a refused waiver reached the events lock"
+claim_job h-lock-ok
+grant_doc h-lock-ok-grant "join-waiver: job=h-lock-ok by=director-1"
+run_cmd env WRK_TEST_JOINED_PRECOMMIT_HOOK="$WAIVER_HOOK" WAIVER_MARKER="$TMP/waiver-marker" \
+  "$WRK" joined h-lock-ok --pr https://example.invalid/pr/1899 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/h-lock-ok-grant
+assert_rc 0
+[[ -e "$TMP/waiver-marker" ]] || fail "a verified waiver must reach the events lock"
+echo "PASS h-waiver-verified-before-the-lock"
+
+# A verified waiver skips both refusals even on a job that has rounds and verdict files,
+# which is what the usage text says: both refusals are waived only by a verified REF.
+claim_job h-has-rounds
+seed_round h-has-rounds
+STRAY="$ARBITER_INBOX_ROOT/h-has-rounds/stray.md"
+write_verdict_first "$STRAY" BLOCKER "$H4"
+stray_abs="$(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$STRAY")"
+run_cmd "$WRK" joined h-has-rounds --pr https://example.invalid/pr/1899 --head "$H1" --report "$REPORT"
+assert_refused "wrk: joined: unmatched tester verdict file $stray_abs"
+grant_doc h-has-rounds-grant "join-waiver: job=h-has-rounds by=director-1"
+joined_waived h-has-rounds hk:doc/h-has-rounds-grant
+assert_rc 0
+[[ "$(joined_field h-has-rounds rounds_waived_issuer)" == "director-1" ]] || fail "waived join on a job with rounds"
+echo "PASS h-waiver-skips-unmatched-file-on-a-job-with-rounds"
+
+# The usage text names the fetch, the line form and who may issue it.
+"$WRK" joined --help >"$TMP/joined-help.txt"
+grep -qF 'join-waiver: job=<job> by=<issuer>' "$TMP/joined-help.txt" || fail "joined help must give the join-waiver line form"
+grep -q 'fetched from handoffkeep' "$TMP/joined-help.txt" || fail "joined help must say the ref is fetched from handoffkeep"
+grep -q 'parent lane or an operator' "$TMP/joined-help.txt" || fail "joined help must name who may issue the grant"
+echo "PASS h-joined-help-names-the-grant"
+
+# ── hk 2024: the claim a waiver was verified against is rechecked under the lock ──
+# HK_FETCH_HOOK runs inside the waiver-record fetch: the window between the
+# grant verify and the events-lock commit. The hook below models the job being
+# released and reclaimed in that window — a quota_pool.release then a
+# job.reclaim — so a waiver verified for the old claim must not land on the
+# new one. A refused join writes nothing.
+echo "== i-waiver-claim-recheck =="
+CLAIM_RACE_HOOK="$TMP/claim-race-hook"
+cat >"$CLAIM_RACE_HOOK" <<'EOF'
+#!/bin/sh
+# Runs once (RACE_MARKER): append a release to RACE_JOB's events and, when
+# RACE_PARENT is set, a reclaim under that parent lane. RACE_TASK sets the
+# reclaim's task_id; empty means none.
+[ -f "$RACE_MARKER" ] && exit 0
+: >"$RACE_MARKER"
+ev="$ARBITER_INBOX_ROOT/$RACE_JOB/events"
+printf '%s\n' "{\"kind\":\"quota_pool.release\",\"job_id\":\"$RACE_JOB\",\"created_at\":\"2026-10-23T05:00:00Z\",\"payload\":{\"job_id\":\"$RACE_JOB\",\"pool\":\"codex\"}}" \
+  >"$ev/00090-quota_pool.release.json"
+[ -n "${RACE_PARENT:-}" ] || exit 0
+task=""
+[ -z "${RACE_TASK:-}" ] || task=",\"task_id\":\"$RACE_TASK\""
+printf '%s\n' "{\"kind\":\"job.reclaim\",\"job_id\":\"$RACE_JOB\",\"created_at\":\"2026-10-23T05:00:01Z\",\"owner_lane\":\"lane-a\",\"label\":\"lbl\",\"pane_id\":\"w:p1\",\"parent_lane\":\"$RACE_PARENT\",\"role\":\"builder\"$task}" \
+  >"$ev/00091-job.reclaim.json"
+EOF
+chmod +x "$CLAIM_RACE_HOOK"
+
+# Reclaimed under a different parent lane during the fetch: the verified
+# parent_lane no longer matches, so the join is refused.
+claim_job i-race-parent
+grant_doc i-race-parent-grant "join-waiver: job=i-race-parent by=director-1"
+run_cmd env HK_FETCH_HOOK="$CLAIM_RACE_HOOK" RACE_MARKER="$TMP/i-race-parent.done" \
+  RACE_JOB=i-race-parent RACE_PARENT=rogue-lane \
+  "$WRK" joined i-race-parent --pr https://example.invalid/pr/2024 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/i-race-parent-grant
+assert_refused "wrk: joined: claim changed since the waiver was verified (parent_lane director-1 -> rogue-lane); re-run wrk joined"
+[[ "$(kind_count i-race-parent job.joined)" -eq 0 ]] || fail "a claim-change race wrote job.joined"
+echo "PASS i-parent-lane-race-refused"
+
+# Same parent lane, but the reclaim binds a different task_id: a pa-integrator
+# grant verified against task 8001 must not land on the claim for task 8002.
+claim_job i-race-task pa-integrator 2026-10-23T00:00:00Z builder lane-a 8001
+task_record 8001 ParkingArcade i-race-task
+grant_doc i-race-task-grant "join-waiver: job=i-race-task by=pa-integrator" pa-integrator
+run_cmd env HK_FETCH_HOOK="$CLAIM_RACE_HOOK" RACE_MARKER="$TMP/i-race-task.done" \
+  RACE_JOB=i-race-task RACE_PARENT=pa-integrator RACE_TASK=8002 \
+  "$WRK" joined i-race-task --pr https://example.invalid/pr/2024 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/i-race-task-grant
+assert_refused "wrk: joined: claim changed since the waiver was verified (task_id 8001 -> 8002); re-run wrk joined"
+[[ "$(kind_count i-race-task job.joined)" -eq 0 ]] || fail "a task_id race wrote job.joined"
+echo "PASS i-task-id-race-refused"
+
+# A reclaim by the same parent lane still replaces the claim: the claim
+# version (the newest claim/reclaim event) changed, so the join is refused.
+claim_job i-race-version
+grant_doc i-race-version-grant "join-waiver: job=i-race-version by=director-1"
+run_cmd env HK_FETCH_HOOK="$CLAIM_RACE_HOOK" RACE_MARKER="$TMP/i-race-version.done" \
+  RACE_JOB=i-race-version RACE_PARENT=director-1 \
+  "$WRK" joined i-race-version --pr https://example.invalid/pr/2024 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/i-race-version-grant
+assert_refused "wrk: joined: claim changed since the waiver was verified (claim_version 00001-job.claim.json -> 00091-job.reclaim.json); re-run wrk joined"
+[[ "$(kind_count i-race-version job.joined)" -eq 0 ]] || fail "a same-parent reclaim wrote job.joined"
+echo "PASS i-claim-version-race-refused"
+
+# A release with no reclaim leaves the recorded claim untouched: the verified
+# facts still hold and the waived join lands.
+claim_job i-race-release-only
+grant_doc i-race-release-only-grant "join-waiver: job=i-race-release-only by=director-1"
+run_cmd env HK_FETCH_HOOK="$CLAIM_RACE_HOOK" RACE_MARKER="$TMP/i-race-release-only.done" \
+  RACE_JOB=i-race-release-only RACE_PARENT= \
+  "$WRK" joined i-race-release-only --pr https://example.invalid/pr/2024 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/i-race-release-only-grant
+assert_rc 0
+[[ "$(kind_count i-race-release-only job.joined)" -eq 1 ]] || fail "release-only join must write job.joined"
+[[ "$(joined_field i-race-release-only rounds_waived_issuer)" == "director-1" ]] || fail "rounds_waived_issuer: $(joined_field i-race-release-only rounds_waived_issuer)"
+echo "PASS i-release-without-reclaim-joins"
+
 # ── help and the one skill line each ───────────────────────────────────
 "$WRK" --help >"$TMP/usage.txt"
 grep -q 'round audit' "$TMP/usage.txt" || fail "usage must name round audit"
@@ -1221,6 +1591,10 @@ for anchor in (
     "if not waived and wrk_round_census(events, job)[1] <= 0:  # hk1900-inlock-zero",
     "text = data.decode(\"utf-8\", errors=\"replace\")  # hk1900-utf8-replace",
     "errors=\"replace\"):  # hk1900-verdict-decode",
+    '[[ "$waived" =~ ^hk:doc/[^[:space:]]+$ || "$waived" =~ ^hk:task/[0-9]+$ ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"  # hk1899-waiver-shape',
+    '"$tmp_waiver" join-waiver || true)"  # hk1899-waiver-fetch',
+    'claim_parent="$parent"  # hk2024-claim-facts',
+    "if waived:  # hk2024-claim-recheck",
     "and round_head.lower() == vsha):  # hk1506-head-bind",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
@@ -1466,5 +1840,72 @@ run_cmd "$TMP/vdecode-wrk" round verdict mut-vdecode-red --file "$TMP/mut-vdecod
 [[ "$(kind_count mut-vdecode-red job.verdict)" -eq 0 ]] || fail "strict-decode mutant wrote a job.verdict"
 echo "PASS mutant-strict-verdict-decode-goes-red"
 
+# ── hk 1899 mutants: each applied at the real call site, each turns its invariant RED ──
+# Invariant 1: a ref that is not backed by a fetched record never waives.
+# shellcheck disable=SC2016 # the mutant spec is a literal source span, not an expansion
+printf '%s\n' \
+  'if ! round_approval_fetch "$waived" >"$tmp_waiver"; then => if false; then' \
+  'waiver_grant="$(round_approval_verify "$waived" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_waiver" join-waiver || true)"  # hk1899-waiver-fetch => waiver_grant="granted=1 issuer=director-1"  # hk1899-waiver-fetch' \
+  >"$TMP/spec-nofetch"
+mutant nofetch "$TMP/spec-nofetch"
+claim_job mut-nofetch
+assert_waiver_refused mut-nofetch hk:doc/mut-made-up "wrk: joined: waiver record not found in handoffkeep: hk:doc/mut-made-up"
+claim_job mut-nofetch-red
+run_cmd "$TMP/nofetch-wrk" joined mut-nofetch-red --pr https://example.invalid/pr/1899 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/mut-made-up
+[[ "$RUN_RC" -eq 0 ]] || fail "no-fetch mutant must accept a made-up ref, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
+[[ "$(kind_count mut-nofetch-red job.joined)" -eq 1 ]] || fail "no-fetch mutant did not write job.joined"
+echo "PASS mutant-trust-the-shape-goes-red"
+
+# Invariant 2: the issuer in the line must equal the record's server-set identity.
+printf '%s\n' 'if issuer not in allowed_issuers or issuer != identity: => if issuer not in allowed_issuers or (issuer != identity and grant_kind != "join-waiver"):' >"$TMP/spec-noident"
+mutant noident "$TMP/spec-noident"
+claim_job mut-noident
+grant_doc mut-noident-grant "join-waiver: job=mut-noident by=director-1" the-builder
+assert_waiver_refused mut-noident hk:doc/mut-noident-grant "$(nogrant_msg mut-noident hk:doc/mut-noident-grant)"
+claim_job mut-noident-red
+grant_doc mut-noident-red-grant "join-waiver: job=mut-noident-red by=director-1" the-builder
+run_cmd "$TMP/noident-wrk" joined mut-noident-red --pr https://example.invalid/pr/1899 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/mut-noident-red-grant
+[[ "$RUN_RC" -eq 0 ]] || fail "no-identity mutant must accept a forged issuer, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
+[[ "$(kind_count mut-noident-red job.joined)" -eq 1 ]] || fail "no-identity mutant did not write job.joined"
+# The mutant is scoped to join-waiver: a forged round-void grant is still refused by it.
+claim_job mut-noident-void
+open_ok mut-noident-void "$H1"
+grant_doc mut-noident-void-grant "round-void: job=mut-noident-void round=1 by=director-1" the-builder
+run_cmd "$TMP/noident-wrk" round void mut-noident-void 1 --by hk:doc/mut-noident-void-grant
+[[ "$RUN_RC" -ne 0 ]] || fail "the identity check must still hold for round void under the mutant"
+echo "PASS mutant-drop-waiver-identity-check-goes-red"
+
+# Invariant 3: only hk:doc/<non-space key> and hk:task/<digits> are accepted refs.
+# shellcheck disable=SC2016 # the mutant spec is a literal source span, not an expansion
+printf '%s\n' '[[ "$waived" =~ ^hk:doc/[^[:space:]]+$ || "$waived" =~ ^hk:task/[0-9]+$ ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"  # hk1899-waiver-shape => [[ "$waived" == hk:doc/?* || "$waived" == hk:task/?* ]] || die "joined: --rounds-waived requires hk:doc/<key> or hk:task/<id>"  # hk1899-waiver-shape' >"$TMP/spec-loose"
+mutant loose "$TMP/spec-loose"
+claim_job mut-loose
+grant_task abc director-1 "join-waiver: job=mut-loose by=director-1"
+: >"$HK_CALL_LOG"
+assert_waiver_refused mut-loose hk:task/abc "$SHAPE_MSG"
+[[ ! -s "$HK_CALL_LOG" ]] || fail "real wrk fetched a malformed ref: $(cat "$HK_CALL_LOG")"
+claim_job mut-loose-red
+grant_task abc director-1 "join-waiver: job=mut-loose-red by=director-1"
+run_cmd "$TMP/loose-wrk" joined mut-loose-red --pr https://example.invalid/pr/1899 --head "$H1" --report "$REPORT" --rounds-waived hk:task/abc
+[[ "$RUN_RC" -eq 0 ]] || fail "loose-shape mutant must accept hk:task/abc, rc=$RUN_RC stderr=$(cat "$TMP/run.err")"
+[[ "$(kind_count mut-loose-red job.joined)" -eq 1 ]] || fail "loose-shape mutant did not write job.joined"
+echo "PASS mutant-loosen-the-shape-goes-red"
+
+# Invariant 4: the waiver is verified before the refusals are decided, so a verified waiver
+# joins a job with zero rounds. The mutant runs the refusal check ahead of the verification.
+# shellcheck disable=SC2016 # the mutant spec is a literal source span, not an expansion
+printf '%s\n' 'tmp_waiver="$(mktemp)" => wrk_joined_refuse_blocks "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"; tmp_waiver="$(mktemp)"' >"$TMP/spec-lateverify"
+mutant lateverify "$TMP/spec-lateverify"
+claim_job mut-late
+grant_doc mut-late-grant "join-waiver: job=mut-late by=director-1"
+joined_waived mut-late hk:doc/mut-late-grant
+assert_rc 0
+[[ "$(kind_count mut-late job.joined)" -eq 1 ]] || fail "real wrk must join a zero-round job on a verified waiver"
+claim_job mut-late-red
+grant_doc mut-late-red-grant "join-waiver: job=mut-late-red by=director-1"
+run_cmd "$TMP/lateverify-wrk" joined mut-late-red --pr https://example.invalid/pr/1899 --head "$H1" --report "$REPORT" --rounds-waived hk:doc/mut-late-red-grant
+assert_refused "wrk: joined: job mut-late-red has zero non-voided recorded rounds"
+[[ "$(kind_count mut-late-red job.joined)" -eq 0 ]] || fail "late-verify mutant wrote job.joined"
+echo "PASS mutant-verify-after-the-refusal-check-goes-red"
 
 echo "PASS test-wrk-rounds"
