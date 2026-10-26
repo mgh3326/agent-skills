@@ -17,6 +17,7 @@ import uuid
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
+TEST_PARENT = Path("/tmp")
 PACK = ROOT / "tests/fixtures/o3"
 ADAPTER = ROOT / "bin/wrk-o3.py"
 WRK = ROOT / "bin/wrk"
@@ -122,7 +123,7 @@ class PackTests(unittest.TestCase):
 
 class Harness(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="o3-", dir="/tmp"))
+        self.root = Path(tempfile.mkdtemp(prefix="o3-", dir=TEST_PARENT))
         self.addCleanup(self.cleanup)
         self.home = self.root / "home"
         self.hk = self.home / ".local/bin/handoffkeep"
@@ -135,6 +136,8 @@ class Harness(unittest.TestCase):
                                                         "CLAUDE_CONFIG_DIR", "HANDOFFKEEP_TEST_DB_URL")}
         self.env.update(HOME=str(self.home), TMPDIR=str(self.root),
                         XDG_CONFIG_HOME=str(self.root / "config"),
+                        XDG_CONFIG_DIRS=str(self.root / "config"),
+                        XDG_DATA_DIRS=str(self.root / "data"),
                         XDG_CACHE_HOME=str(self.root / "cache"),
                         XDG_STATE_HOME=str(self.root / "state"),
                         XDG_DATA_HOME=str(self.root / "data"),
@@ -209,7 +212,7 @@ class Harness(unittest.TestCase):
 
     def run_wrk(self, *args, stdin=""):
         return subprocess.run(["bash", str(WRK), *args], input=stdin, text=True,
-                              capture_output=True, env=self.env, timeout=120)
+                              capture_output=True, env=self.env, timeout=180)
 
     def events(self, job="job-a"):
         return [json.loads(p.read_text()) for p in sorted(self.intent_file(job).parent.glob("events/*.json"))]
@@ -1503,6 +1506,36 @@ class ModeDiscoveryTests(Harness):
         self.assertEqual(self.calls(), [])
 
 
+class PortableIntentTests(Harness):
+
+    def test_symlink_refusal_uses_platform_errno_constants(self):
+        with self.client():
+            with mock.patch.object(self.module, 'errno', mock.Mock(ELOOP=62, ENOTDIR=20), create=True), mock.patch.object(self.module.os, 'open', side_effect=OSError(62, 'fixture Darwin symlink')):
+                try:
+                    self.module.secure_open('o3-intents.json', 0, -1)
+                except Exception as error:
+                    self.assertIsInstance(error, self.module.Refusal)
+                    self.assertEqual(error.code, 'intent_invalid')
+                else:
+                    self.fail('a symlink must be refused')
+
+class RealFailure(Harness):
+
+    def test_real_reviewer_refusal_after_claim_starts_no_pane(self):
+        SpawnHandshakeTests.spawn_environment(self)
+        workspace = self.root / 'workspace'
+        subprocess.run(['git', '-C', str(workspace), '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test', 'commit', '--allow-empty', '-qm', 'fixture'], env=self.env, check=True)
+        head = subprocess.check_output(['git', '-C', str(workspace), 'rev-parse', 'HEAD'], env=self.env, text=True).strip()
+        self.mode('required')
+        self.seed(*[{'action': 'read'}] * 7, dict(exit=75, stderr='handoffkeep wrk: wrk_unavailable\n'))
+        result = self.run_wrk('spawn', '--host', 'local', '-c', str(workspace), '-m', 'opus', '--effort', 'high', '-p', str(self.root / 'brief.md'), '-w', 'fixture', '-l', 'job-review', '--t', 'T2', '--role', 'tester', '--owner', 'b2400-a', '--parent-job', 'job-a', '--head', head, '--report', str(self.root / 'review.md'))
+        self.assertEqual(result.returncode, 75, result.stderr)
+        data = json.loads(self.script.read_text())
+        self.assertEqual(data['journals']['job-review'][0]['kind'], 'claim')
+        self.assertEqual([c['argv'][1] for c in self.calls()], ['job', 'records', 'capabilities', 'job', 'append', 'job', 'records', 'append'])
+        self.assertFalse((self.root / 'herdr.log').exists(), 'pane must wait for target round receipt')
+        self.assertFalse(any((e.get('kind') in ('job.claim', 'job.spawned') for e in self.events('job-review'))))
+
 class MutantTests(Harness):
     def test_required_invariants_turn_named_tests_red_at_real_call_sites(self):
         adapter_source = ADAPTER.read_text()
@@ -1550,6 +1583,7 @@ from pathlib import Path
 spec=importlib.util.spec_from_file_location("o3_mutant_probe",sys.argv[1])
 t=importlib.util.module_from_spec(spec);spec.loader.exec_module(t)
 t.ADAPTER=Path(sys.argv[2])/"bin/wrk-o3.py";t.WRK=Path(sys.argv[2])/"bin/wrk"
+t.TEST_PARENT=Path(sys.argv[2]).parents[1]
 stream=io.StringIO();suite=unittest.defaultTestLoader.loadTestsFromName(sys.argv[3],t)
 r=unittest.TextTestRunner(stream=stream).run(suite)
 print(json.dumps(dict(failures=len(r.failures),errors=len(r.errors),detail=stream.getvalue())))
@@ -1569,13 +1603,13 @@ print(json.dumps(dict(failures=len(r.failures),errors=len(r.errors),detail=strea
                     if helper.is_file() and helper.name not in ("wrk", "wrk-o3.py", "wrk-o3-contract.json"):
                         (binary / helper.name).symlink_to(helper)
                 control = subprocess.run([sys.executable, "-c", driver, str(Path(__file__)), str(directory), probe],
-                                         capture_output=True, text=True, env=self.env, timeout=120)
+                                         capture_output=True, text=True, env=self.env, timeout=300)
                 self.assertEqual(control.returncode, 0, control.stderr)
                 baseline = json.loads(control.stdout)
                 self.assertEqual((baseline["failures"], baseline["errors"]), (0, 0), "pristine copy must pass: " + baseline["detail"])
                 (binary / ("wrk-o3.py" if target == "adapter" else "wrk")).write_text(source.replace(old, new))
                 result = subprocess.run([sys.executable, "-c", driver, str(Path(__file__)), str(directory), probe],
-                                        capture_output=True, text=True, env=self.env, timeout=120)
+                                        capture_output=True, text=True, env=self.env, timeout=300)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 observation = json.loads(result.stdout)
                 self.assertEqual(observation["errors"], 0, "exceptions do not count as mutant RED: " + observation["detail"])

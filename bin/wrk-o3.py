@@ -10,6 +10,7 @@ import base64
 import binascii
 from contextlib import contextmanager
 from datetime import datetime, timezone
+import errno
 import fcntl
 import hashlib
 import json
@@ -277,7 +278,7 @@ def secure_open(name, flags, dir_fd, create=False):
         fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK,
                      0o600, dir_fd=dir_fd)
     except OSError as exc:
-        if exc.errno in (40, 20):
+        if exc.errno in (errno.ELOOP, errno.ENOTDIR):
             raise Refusal("intent_invalid") from None
         raise
     info = os.fstat(fd)

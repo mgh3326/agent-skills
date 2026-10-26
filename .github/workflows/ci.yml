@@ -124,6 +124,7 @@ jobs:
           mkdir -p "$O3_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
           HOME="$O3_TMP/home" XDG_CONFIG_HOME="$O3_TMP/config" \
             XDG_DATA_HOME="$O3_TMP/data" XDG_CACHE_HOME="$O3_TMP/cache" \
+            XDG_CONFIG_DIRS="$O3_TMP/config" XDG_DATA_DIRS="$O3_TMP/data" \
             XDG_STATE_HOME="$O3_TMP/state" XDG_RUNTIME_DIR="$O3_TMP/runtime" \
             CODEX_HOME="$O3_TMP/codex" ARBITER_INBOX_ROOT="$O3_TMP/jobs" \
             TMPDIR="$O3_TMP" WRK_TEST_MODE=1 \
