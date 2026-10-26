@@ -106,6 +106,54 @@ def event_kinds(binary: Path, env: dict[str, str], job: str) -> list[str]:
     return json.loads(result.stdout)["recent_event_kinds"]
 
 
+def assert_gc_retains_listed_idle_agent(
+    binary: Path, env: dict[str, str], agents: Path, job: str
+) -> None:
+    gc = call(binary, env, "gc", "--herdr-agent-list", str(agents), "--json")
+    if gc.returncode != 0:
+        raise AssertionError(f"gc failed for a listed idle agent: {gc.stderr}")
+    current = status(binary, env, job)
+    if current["jobs"][0]["state"] != "leased":
+        raise AssertionError("gc released listed idle agent pane")
+    if {row["job_id"] for row in current["quota_pool_records"]} != {job}:
+        raise AssertionError("gc deleted quota capacity for a listed idle agent")
+    if "job.orphan_release" in event_kinds(binary, env, job):
+        raise AssertionError("gc wrote orphan_release for a listed idle agent")
+
+
+def prove_working_only_mutant_goes_red(root: Path) -> None:
+    control_env, control_agents, control_job = seed(
+        root / "control", ARBITER_SOURCE, "idle-control", "idle"
+    )
+    assert_gc_retains_listed_idle_agent(
+        ARBITER_SOURCE, control_env, control_agents, control_job
+    )
+
+    mutant = mutate(
+        root / "working-only-mutant",
+        "gc-working-only",
+        '            if any(status != "unknown" for status in statuses):\n'
+        '                # Any exact listed agent with a known status owns its pane,\n'
+        '                # whether it is working, idle, blocked, or done.\n'
+        '                continue\n',
+        '            if HERDR_LIVE_STATUS in statuses:\n'
+        '                continue\n',
+    )
+    mutant_env, mutant_agents, mutant_job = seed(
+        root / "mutant-state", mutant, "idle-mutant", "idle"
+    )
+    try:
+        assert_gc_retains_listed_idle_agent(
+            mutant, mutant_env, mutant_agents, mutant_job
+        )
+    except AssertionError as exc:
+        if str(exc) != "gc released listed idle agent pane":
+            raise
+    else:
+        raise AssertionError("working-only gc mutant survived the idle-pane assertion")
+    print("PASS mutant-gc-working-only-goes-red-on-idle")
+
+
 def exercise(root: Path, name: str, old: str, new: str, mode: str) -> None:
     binary = mutate(root, name, old, new)
     agent_status = "unknown" if mode == "unknown" else None
@@ -151,6 +199,7 @@ def exercise(root: Path, name: str, old: str, new: str, mode: str) -> None:
 def main() -> None:
     with tempfile.TemporaryDirectory(prefix="arbiter-orphan-mutants-") as temp:
         root = Path(temp)
+        prove_working_only_mutant_goes_red(root / "working-only-proof")
         exercise(
             root / "missing-transition",
             "gc-no-transition",

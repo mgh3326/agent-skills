@@ -400,22 +400,35 @@ run gc --herdr-agent-list "$TMP/agents.json" --json
 pycheck "$OUT" <<'PY' || fail "stale cleanup did not report the dead job"
 import json, sys
 d = json.load(sys.stdin)
-assert [r["job_id"] for r in d["stale_quota_pool"]] == ["gc-row-left", "orphan-gc", "quota-blocked", "quota-dead", "quota-done", "quota-idle"], d
-assert {tuple(r["herdr_status"]) for r in d["stale_quota_pool"]} == {(), ("blocked",), ("done",), ("idle",)}, d
+assert [r["job_id"] for r in d["stale_quota_pool"]] == ["gc-row-left", "orphan-gc", "quota-dead"], d
+assert {tuple(r["herdr_status"]) for r in d["stale_quota_pool"]} == {()}, d
 PY
 pycheck "$("$ARBITER" status --json)" <<'PY' || fail "stale quota record remains"
 import json, sys
 d = json.load(sys.stdin)
-assert {r["job_id"] for r in d["quota_pool_records"]} >= {"pool-a", "pool-b", "quota-live", "quota-custom-job"}, d
+assert {r["job_id"] for r in d["quota_pool_records"]} >= {"pool-a", "pool-b", "quota-live", "quota-custom-job", "quota-idle", "quota-done", "quota-blocked"}, d
 assert "quota-dead" not in {r["job_id"] for r in d["quota_pool_records"]}, d
-assert not {"quota-blocked", "quota-done", "quota-idle"} & {r["job_id"] for r in d["quota_pool_records"]}, d
 PY
-for stale_job in gc-row-left orphan-gc quota-blocked quota-dead quota-done quota-idle; do
+for stale_job in gc-row-left orphan-gc quota-dead; do
   stale_seq=00003
   [[ "$stale_job" != gc-row-left ]] || stale_seq=00004
   [[ -f "$ARBITER_INBOX_ROOT/$stale_job/events/${stale_seq}-quota_pool.stale_cleanup.json" ]] \
     || fail "stale cleanup event artifact missing for $stale_job"
 done
+for retained_job in quota-idle quota-done quota-blocked; do
+  pycheck "$("$ARBITER" status --job "$retained_job" --json)" <<'PY' || fail "gc released a listed idle/done/blocked pane"
+import json, sys
+d = json.load(sys.stdin)
+assert d["jobs"][0]["state"] == "leased", d
+assert len(d["quota_pool_records"]) == 1, d
+PY
+  pycheck "$("$ARBITER" job-get --job "$retained_job" --json)" <<'PY' || fail "gc wrote an orphan event for a listed idle/done/blocked pane"
+import json, sys
+d = json.load(sys.stdin)
+assert "job.orphan_release" not in d["recent_event_kinds"], d
+PY
+done
+pass "gc retains jobs for listed idle, done, and blocked panes"
 pycheck "$("$ARBITER" status --job orphan-gc --json)" <<'PY' || fail "orphan gc left the stale job leased"
 import json, sys
 d = json.load(sys.stdin)
@@ -548,6 +561,48 @@ import json, sys
 d = json.load(sys.stdin)
 assert "job.orphan_release" not in d["recent_event_kinds"], d
 PY
+
+for agent_state in idle "done"; do
+  job="manual-$agent_state"
+  agent="$job-agent"
+  "$ARBITER" claim --job "$job" --agent-label "$agent" --lane live --t T1 >/dev/null
+  expect_rc 0 lease --job "$job" --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+  drop_quota_rows "$job"
+  printf '{"result":{"agents":[{"name":"%s","agent_status":"%s"}]}}\n' \
+    "$agent" "$agent_state" >"$TMP/$job.json"
+  expect_rc 5 release --force --job "$job" --herdr-agent-list "$TMP/$job.json"
+  grep -q "$agent_state" <<<"$ERR" \
+    || fail "$agent_state pane refusal did not name its status: $ERR"
+  pycheck "$("$ARBITER" status --job "$job" --json)" <<'PY' || fail "$agent_state pane without rows was released"
+import json, sys
+d = json.load(sys.stdin)
+assert d["jobs"][0]["state"] == "leased", d
+assert d["leases"] == [] and d["quota_pool_records"] == [], d
+PY
+  pycheck "$("$ARBITER" job-get --job "$job" --json)" <<'PY' || fail "$agent_state pane wrote an orphan event"
+import json, sys
+d = json.load(sys.stdin)
+assert "job.orphan_release" not in d["recent_event_kinds"], d
+PY
+done
+pass "release --force --job retains listed idle and done panes even without rows"
+
+"$ARBITER" claim --job manual-unreadable --agent-label manual-unreadable-agent --lane live --t T1 >/dev/null
+expect_rc 0 lease --job manual-unreadable --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+drop_quota_rows manual-unreadable
+expect_rc 6 release --force --job manual-unreadable --herdr-agent-list "$TMP/no-such-agents.json"
+pycheck "$("$ARBITER" status --job manual-unreadable --json)" <<'PY' || fail "unreadable Herdr list changed the orphan job"
+import json, sys
+d = json.load(sys.stdin)
+assert d["jobs"][0]["state"] == "leased", d
+assert d["leases"] == [] and d["quota_pool_records"] == [], d
+PY
+pycheck "$("$ARBITER" job-get --job manual-unreadable --json)" <<'PY' || fail "unreadable Herdr list wrote an orphan event"
+import json, sys
+d = json.load(sys.stdin)
+assert "job.orphan_release" not in d["recent_event_kinds"], d
+PY
+pass "release --force --job refuses an unreadable Herdr list"
 
 "$ARBITER" claim --job manual-quota-left --agent-label manual-quota-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job manual-quota-left --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"

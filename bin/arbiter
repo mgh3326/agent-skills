@@ -1356,12 +1356,13 @@ def _release_orphan_job(args: argparse.Namespace) -> dict:
         blockers = []
         if prior_state != "leased":
             blockers.append(f"job state={prior_state} (expected leased)")
-        if HERDR_LIVE_STATUS in statuses:
-            blockers.append(
-                f"agent={agent_label} herdr_status={','.join(sorted(statuses))} (live)"
-            )
         if "unknown" in statuses:
             blockers.append(f"agent={agent_label} herdr_status=unknown")
+        elif matched:
+            blockers.append(
+                f"agent={agent_label} herdr_status={','.join(sorted(statuses))} "
+                "(pane exists)"
+            )
         blockers.extend(f"lease={resource}/{kind}" for resource, kind in lease_rows)
         blockers.extend(f"quota_pool={pool}" for (pool,) in quota_rows)
         if blockers:
@@ -1467,8 +1468,6 @@ def cmd_gc(args: argparse.Namespace) -> dict:
             statuses, matched = _matched_agent_statuses(
                 herdr_agents, job_id=row[0], agent_label=agent_label
             )
-            if HERDR_LIVE_STATUS in statuses:
-                continue
             if "unknown" in statuses:
                 unsafe_quota_pool.append(
                     {
@@ -1479,6 +1478,10 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                         "reason": "herdr agent status=unknown is not stale evidence",
                     }
                 )
+                continue
+            if any(status != "unknown" for status in statuses):
+                # Any exact listed agent with a known status owns its pane,
+                # whether it is working, idle, blocked, or done.
                 continue
             stale_decisions.append((row, agent_label, sorted(statuses), matched))
 
