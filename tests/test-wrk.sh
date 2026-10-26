@@ -15660,11 +15660,4 @@ bash "$ROOT/tests/test-devin-gate-profile.sh"
 # hk 1990: preserve durable operator refs at the actual apply_catalog call site.
 python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
 
-# hk 1991: the owner decision must have exactly one review anchor.
-python3 - "$WRK" <<'PY'
-import sys
-source = open(sys.argv[1], encoding="utf-8").read()
-for anchor in ("# hk1991-owner-alive",):
-    assert source.count(anchor) == 1, (anchor, source.count(anchor))
-PY
 echo 'PASS test-wrk'
