@@ -360,6 +360,31 @@ class HeavyQueue(unittest.TestCase):
                 self.release("holder-" + str(sig))
                 self.assertEqual(holder.wait(timeout=5), 0)
 
+    def test_run_preserves_inherited_ignored_signal_dispositions(self):
+        child = (
+            "import os, signal\n"
+            "assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN\n"
+            "assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN\n"
+            "os.kill(os.getpid(), signal.SIGHUP)\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n"
+            "print('child survived inherited ignored signals')\n"
+        )
+        launcher = self.base / "ignored-signal-launcher.py"
+        launcher.write_text(
+            "import os, signal, sys\n"
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "child = " + repr(child) + "\n"
+            "os.execv(sys.argv[1], [sys.argv[1], 'heavy', '--', "
+            "sys.executable, '-c', child])\n"
+        )
+        result = subprocess.run([sys.executable, str(launcher), str(WRK)],
+                                env=self.env, capture_output=True, text=True,
+                                timeout=15, check=False)
+        self.assertEqual(result.returncode, 0,
+                         "run reset inherited ignored signal dispositions: " + result.stderr)
+        self.assertIn("child survived inherited ignored signals", result.stdout)
+
     def test_lane_defer_configuration_rejects_invalid_values(self):
         for value in ("bad", "-1", "nan"):
             result = self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX=value)
@@ -437,7 +462,8 @@ class HeavyQueue(unittest.TestCase):
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait(timeout=5)
         (self.waiters / str(dead.pid)).write_text(
-            f"pid={dead.pid} class=lane limit=1 since=x job=- cmd=dead-legacy")
+            f"pid={dead.pid} class=lane limit=1 ticket=1:1 since=x "
+            "job=- cmd=dead-legacy")
         (self.waiters / "legacy").write_text(
             f"pid={os.getpid()} class=lane limit=1 since=x job=- cmd=old ticket=1:1")
         result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
@@ -764,12 +790,17 @@ class HeavyQueue(unittest.TestCase):
              "signal.signal(signal.SIGHUP, signal.SIG_DFL)",
              "test_sighup_and_sigterm_remove_waiter_records_with_signal_exit_codes",
              "signal 1 leaked its waiter record"),
+            ("run-signal-ignore",
+             "        signal.signal(signal.SIGHUP, signal.SIG_IGN)\n",
+             "        signal.signal(signal.SIGHUP, signal.SIG_DFL)\n",
+             "test_run_preserves_inherited_ignored_signal_dispositions",
+             "run reset inherited ignored signal dispositions"),
             ("reuse", '            ticket = tuple(record["ticket"])',
              '            pass  # mutant: discard the saved ticket',
              "test_position_reused_within_grace", "original ticket was not reused within grace"),
-            ("dead", '        elif pid > 0 and not alive(pid):\n', '        elif False:\n',
+            ("dead", '        if not alive(pid):\n', '        if False:\n',
              "test_dead_and_mixed_version_records_reserve_nothing",
-             "status did not clean a dead waiter"),
+             "dead or ticketless record reserved a slot"),
         ]
         for name, old, new, case, invariant in mutations:
             with self.subTest(invariant=invariant):

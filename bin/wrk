@@ -14265,8 +14265,8 @@ for _sp in slot_paths:
              "with one link owned by uid %d or root)" % (_sp, os.getuid()),
              EXIT_REFUSED)
     slot_fds.append(_fd)
-signal.signal(signal.SIGHUP, wait_signal)
-signal.signal(signal.SIGTERM, wait_signal)
+previous_sighup = signal.signal(signal.SIGHUP, wait_signal)
+previous_sigterm = signal.signal(signal.SIGTERM, wait_signal)
 try:
     publish_record()
     while True:
@@ -14390,8 +14390,17 @@ try:
             fail("interrupted while waiting for load to drop "
                  "-- command not run", 130)
     run_at = time.monotonic()
-    signal.signal(signal.SIGHUP, signal.SIG_DFL)
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    # Preserve inherited ignored dispositions (for example, from nohup) for
+    # the child. Caught handlers cannot survive exec, so the other inherited
+    # disposition is SIG_DFL.
+    if previous_sighup == signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    else:
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    if previous_sigterm == signal.SIG_IGN:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    else:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
     try:
         rc = run_command()
     except SystemExit as e:
