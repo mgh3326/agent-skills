@@ -1302,11 +1302,14 @@ if not tops or bottom - tops[-1] < 2:
 footer = lines[bottom + 1:]
 if len(footer) not in (2, 3):
     sys.exit(1)
-# A pasted imitation of the entire editor/footer is still untrusted. If
-# that same frame occurs in our brief, its provenance is ambiguous: refuse.
+# Compare the evidence rows themselves, never the frame through screen end:
+# an echoed brief may be followed by an unrelated shell/extension row. Any
+# quoted cwd+stats evidence is ambiguous, including after whitespace reflow.
 with open(prompt) as brief:
     injected = "\n".join(clean(brief.read()))
-if "\n".join(lines[tops[-1]:]) in injected:
+candidate = re.sub(r"\s+", " ", "\n".join(footer[:2])).strip()
+quoted = re.sub(r"\s+", " ", injected).strip()
+if candidate in quoted:
     sys.exit(1)
 # footer.js may abbreviate HOME and append a branch/session name. Checking
 # the launch cwd also prevents an arbitrary post-editor stats row proving it.

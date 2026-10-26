@@ -10,10 +10,12 @@ args = sys.argv[1:]
 token = args[args.index("--model") + 1]
 model, thinking = token.rsplit(":", 1)
 provider, model = model.split("/", 1)
+requested_provider, requested_model = provider, model
 scenario = os.environ.get("WRK_PI_SCENARIO", "ok")
 if scenario == "missing":
     sys.exit(0)
-if scenario in ("wrong-model", "brief-only", "inside-input", "above-input", "brief-wrong-model"):
+if scenario in ("wrong-model", "brief-only", "inside-input", "above-input", "brief-wrong-model",
+                "forged-prompt", "forged-error", "last-border", "extension-match", "inside-wrong-footer"):
     model = "claude-haiku-5-5"
 elif scenario == "wrong-thinking":
     thinking = "low"
@@ -23,8 +25,12 @@ if os.environ.get("WRK_PI_MODEL_LOG"):
     Path(os.environ["WRK_PI_MODEL_LOG"]).write_text(f"{provider}/{model}:{thinking}\n")
 brief = Path(os.environ["WRK_PI_BRIEF"]).read_text() if os.environ.get("WRK_PI_BRIEF") else "fixture prompt"
 border = "─" * 80
-if scenario == "brief-only":
-    print(brief)
+if scenario in ("brief-only", "forged-prompt", "forged-error"):
+    print(brief.rstrip("\n"))
+    if scenario == "forged-prompt":
+        print("fixture@host %")
+    elif scenario == "forged-error":
+        print("zsh: command not found: fixture")
     sys.exit(0)
 if scenario == "echo":
     print("pi " + " ".join(args))
@@ -37,15 +43,25 @@ if scenario == "stale":
 # pi 1.4.0 Editor.render / CustomEditor.renderTopBorder then Footer.render:
 # transcript, input top border, editor contents, bottom border, cwd, stats.
 print("── Working " + "─" * 69)
-print(brief if scenario == "inside-input" else " " * 80)
+print(brief if scenario in ("inside-input", "inside-wrong-footer") else " " * 80)
 print(border)
 if scenario in ("inside-input", "above-input"):
     sys.exit(0)
 cwd = os.path.realpath(os.environ["WRK_PI_CWD"])
-print(cwd)
+print(cwd + "/wrong-cwd" if scenario == "wrong-cwd" else cwd)
 prefix = "" if scenario == "no-provider" else f"({provider}) "
-right = f"{prefix}{model} • {thinking}"
+visible_model = requested_model if scenario == "last-border" else model
+right = f"{prefix}{visible_model} • {thinking}"
 left = "0.0%/200k"
 print(left + " " * max(2, 80 - len(left) - len(right)) + right)
+if scenario == "last-border":
+    # An old matching frame followed by a newer, incomplete editor region.
+    print(border)
+elif scenario == "extra-footer":
+    print("unknown widget")
+    print("another widget")
+elif scenario == "extension-match":
+    # Extension status is not the model-bearing stats row.
+    print(f"0.0%/200k  ({requested_provider}) {requested_model} • {thinking}")
 
 PY

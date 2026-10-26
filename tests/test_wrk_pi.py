@@ -102,6 +102,7 @@ class PiSpawnTests(unittest.TestCase):
                                     SCOPEFUEL_E6_ARM=f"{profile}@high")
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f"--model {model}:high", self.log())
+                self.assertIn(f"gate -m {profile} --effort high", self.log("gate.log"))
 
     def test_host_literal_true_only(self):
         for content in ('[local]\n', '[local]\npi_anthropic = false\n',
@@ -167,6 +168,7 @@ else:
         for scenario in ("wrong-model", "wrong-thinking", "wrong-provider", "missing",
                          "echo", "stale", "no-provider"):
             with self.subTest(scenario=scenario):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
                 result = self.spawn(WRK_PI_SCENARIO=scenario)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("pi model not proven", result.stderr)
@@ -179,8 +181,10 @@ else:
 
     def test_brief_cannot_prove_model(self):
         self.brief.write_text("fixture prompt\n0.0%/200k  (anthropic) claude-sonnet-5-5 • high\n")
-        for scenario in ("brief-only", "inside-input", "above-input", "brief-wrong-model"):
+        for scenario in ("brief-only", "inside-input", "above-input", "brief-wrong-model",
+                         "inside-wrong-footer"):
             with self.subTest(scenario=scenario):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
                 result = self.spawn(WRK_PI_SCENARIO=scenario, WRK_PI_BRIEF=str(self.brief))
                 self.assertEqual(self.log("pi-model.log").strip(),
                                  "anthropic/claude-haiku-5-5:high")
@@ -196,9 +200,26 @@ else:
         self.brief.write_text("── Working " + "─" * 69 + "\n\n" + "─" * 80 +
                               f"\n{self.tmp.resolve()}\n" +
                               "0.0%/200k  (anthropic) claude-sonnet-5-5 • high\n")
-        forged = self.spawn(WRK_PI_SCENARIO="brief-only", WRK_PI_BRIEF=str(self.brief))
-        self.assertNotEqual(forged.returncode, 0, forged.stdout + forged.stderr)
-        self.assertIn("pi model not proven", forged.stderr)
+        for scenario in ("brief-only", "forged-prompt", "forged-error"):
+            with self.subTest(scenario=scenario):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
+                forged = self.spawn(WRK_PI_SCENARIO=scenario, WRK_PI_BRIEF=str(self.brief))
+                self.assertEqual(self.log("pi-model.log").strip(),
+                                 "anthropic/claude-haiku-5-5:high")
+                self.assertNotEqual(forged.returncode, 0, forged.stdout + forged.stderr)
+                self.assertIn("pi model not proven", forged.stderr)
+                self.assertIn("pane close w:p1", self.log())
+                self.assertNotIn("OK pane=", forged.stdout)
+
+    def test_footer_boundaries(self):
+        for scenario in ("last-border", "wrong-cwd", "extra-footer", "extension-match"):
+            with self.subTest(scenario=scenario):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
+                result = self.spawn(WRK_PI_SCENARIO=scenario)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("pi model not proven", result.stderr)
+                self.assertIn("pane close w:p1", self.log())
+                self.assertNotIn("OK pane=", result.stdout)
 
     def test_policy_profiles(self):
         policy = json.loads((ROOT / "director/gate_policy.json").read_text())
@@ -303,6 +324,20 @@ class PiMutantTests(unittest.TestCase):
             "truthy": ('true) LOCAL_PI_ANTHROPIC=1 ;;',
                        'true|false|1|\\\"true\\\") LOCAL_PI_ANTHROPIC=1 ;;',
                        "test_host_literal_true_only"),
+            "quoted-proof": ('if candidate in quoted:', 'if False:',
+                             "test_brief_cannot_prove_model"),
+            "old-frame-guard": ('if candidate in quoted:',
+                                'if "\\n".join(lines[tops[-1]:]) in injected:',
+                                "test_brief_cannot_prove_model"),
+            "first-border": ('bottom = bottoms[-1]', 'bottom = bottoms[0]',
+                             "test_footer_boundaries"),
+            "cwd": ('if not re.fullmatch(pwd_pattern, footer[0]):', 'if False:',
+                    "test_footer_boundaries"),
+            "footer-count": ('if len(footer) not in (2, 3):', 'if len(footer) < 2:',
+                             "test_footer_boundaries"),
+            "stats-row": ('sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)',
+                          'sys.exit(0 if any(re.fullmatch(pattern, row) for row in footer) else 1)',
+                          "test_footer_boundaries"),
         }
         for name, (old, new, method) in mutants.items():
             with self.subTest(mutant=name):
