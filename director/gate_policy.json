@@ -165,7 +165,7 @@
     "director/bin/tester-eligible": "ae323c7defbb8eda295ef9975efd1fcfe054751c0d0c47c7d65a1ec12193159b",
     "spawn-worker/SKILL.md": "04d476e4a25c0c4d3e2d36d5bfa456489b979c05e2c8c409e3da477e5cb423d9",
     "bin/wrk_pane_models.py": "856e5ab3c81ea0bdd18543056d7dabe9cee2692eabab718c16f7f318895ff151",
-    "bin/wrk_o3.py": "31f360d5824ce3bc86dcd42fbf3e0529ab96d4efe149d3e6f55efe5da7b8e5a8"
+    "bin/wrk_o3.py": "cb112bcc736cae01105431899e7d49140569e519c0b223c79f858311abccfbdf"
   },
   "profiles": {
     "agy-flash": {
