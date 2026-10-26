@@ -963,20 +963,22 @@ def grant_context(state):
     """The subject task id and each grant's authenticated issuer, for typed
     grant projections in today's O2 shape (director-1 projection ruling)."""
     if state is None:
-        return {"task_id": None, "issuers": {}}
+        return {"task_id": None, "issuers": {}, "hashes": {}}
+    grants = state.kinds("grant")
     return {"task_id": state.claim_payload["task_id"],
-            "issuers": {r["seq"]: r["actor_client_id"] for r in state.kinds("grant")}}
+            "issuers": {r["seq"]: r["actor_client_id"] for r in grants},
+            "hashes": {r["seq"]: r["record_hash"] for r in grants}}
 
 
 def task_ref(grants):
     return "hk:task/%s" % grants["task_id"] if grants.get("task_id") is not None else ""
 
 
-def projection(record, mode, meta, provenance, grants=None):
+def projection(record, mode, meta, provenance, grants=None, prior_extensions=()):
     """Today's event for an accepted record, plus o3_mode, wrk_receipt and the
     key. A typed extension or void keeps today's O2 fields (ref hk:task/<task>,
     reason, issuer) so the O2 readers count it unchanged (design 6, L4142)."""
-    grants = grants or {"task_id": None, "issuers": {}}
+    grants = grants or {"task_id": None, "issuers": {}, "hashes": {}}
     payload = record["payload"]
     base = {"job_id": record["job_id"], "owner_lane": meta.get("owner", ""), "label": meta.get("label", ""),
             "pane_id": meta.get("pane", ""), "parent_lane": meta.get("parent", ""), "epoch": 1,
@@ -987,9 +989,14 @@ def projection(record, mode, meta, provenance, grants=None):
         for key in ("tester_job_id", "extension_grant_seq", "repeat_grant_seq"):
             if payload[key] is not None:
                 base[key] = payload[key]
-        if payload["extension_grant_seq"] is not None:
-            base["approval"] = {"ref": task_ref(grants), "extra": 1,
-                                "issuer": grants["issuers"].get(payload["extension_grant_seq"], "")}
+        seq = payload["extension_grant_seq"]
+        if seq is not None:
+            # Every extension of a subject shares ref hk:task/<task>, so extra is
+            # cumulative: one per distinct one-use grant, deduplicated by
+            # grant_seq (director-1 detail ruling); a replay never adds again.
+            base["approval"] = {"ref": task_ref(grants), "extra": len(set(prior_extensions) - {seq}) + 1,
+                                "issuer": grants["issuers"].get(seq, "")}
+            base["grant_record_hash"] = grants["hashes"].get(seq, "")
         return "job.round", base
     if record["kind"] == "verdict":
         base.update({"kind": "job.verdict", "verdict": payload["verdict"], "head": payload["head"],
@@ -1001,7 +1008,8 @@ def projection(record, mode, meta, provenance, grants=None):
     if record["kind"] == "void":
         base.update({"kind": "job.round_void", "round": payload["round_no"], "reason": payload["reason_code"],
                      "ref": task_ref(grants), "issuer": grants["issuers"].get(payload["grant_seq"], ""),
-                     "grant_seq": payload["grant_seq"]})
+                     "grant_seq": payload["grant_seq"],
+                     "grant_record_hash": grants["hashes"].get(payload["grant_seq"], "")})
         return "job.round_void", base
     return None, None
 
@@ -1020,10 +1028,17 @@ def write_projections(inbox, job, records, mode, meta, provenance, grants=None):
         lock = ns["wrk_events_locked"](events)
         try:
             done = projected_keys(events)
+            ref = task_ref(grants or {"task_id": None})
+            prior = {doc.get("extension_grant_seq") for _n, doc, _m in ns["wrk_events_ordered"](events)
+                     if isinstance(doc, dict) and doc.get("kind") == "job.round" and ref
+                     and (doc.get("approval") or {}).get("ref") == ref
+                     and isinstance(doc.get("extension_grant_seq"), int)}
             for record in records:
                 if record["kind"] not in PROJECTED_KINDS or record["idempotency_key"] in done:
                     continue
-                kind, event = projection(record, mode, meta, provenance, grants)
+                kind, event = projection(record, mode, meta, provenance, grants, prior)
+                if kind == "job.round" and record["payload"]["extension_grant_seq"] is not None:
+                    prior.add(record["payload"]["extension_grant_seq"])
                 ns["wrk_event_commit"](events, kind, event)
                 done.add(record["idempotency_key"])
         finally:
@@ -1440,11 +1455,19 @@ def offline_intent(ctx, job, kind, payload_from_snapshot, operation):
         intent = store.new(request)
         store.save()
         crash_point("before_send")
+        payload = request["payload"]
+        consumes_grant = kind == "void" or any(payload.get(k) is not None
+                                                for k in ("extension_grant_seq", "repeat_grant_seq"))
         try:
             return send(store, intent)
         except Fail as exc:
             if intent["state"] == "rejected":
                 raise
+            if consumes_grant:
+                # A grant use is authority: its consumption is unknown until the
+                # original key is replayed, so there is no O2 fallback (director-1).
+                raise Fail(exc.code, "%s consumes a typed grant; intent %s stays pending, no O2 fallback"
+                           % (operation, intent["idempotency_key"]))
             write_warning(ctx.inbox, job, exc.code, operation, intent["idempotency_key"])
             warn("o3 server unavailable (%s) for shadow job %s: intent %s stays pending; O2 local event only"
                  % (exc.code, job, intent["idempotency_key"]))

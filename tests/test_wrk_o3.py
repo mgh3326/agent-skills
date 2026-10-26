@@ -1440,16 +1440,62 @@ class DualWriteOrderCase(O3Case):
         record = [r for r in w.records("job-a") if r["kind"] == "void"][0]
         self.assertEqual((event["ref"], event["reason"], event["issuer"], event["grant_seq"]),
                          ("hk:task/2400", "builder_void", "director-1", void["seq"]))
-        self.assertEqual(event["wrk_receipt"]["record_hash"], record["record_hash"])
+        # wrk_receipt stays the four-field tuple; the grant has its own fields.
+        self.assertEqual(event["wrk_receipt"], {"job_id": "job-a", "seq": record["seq"],
+                                                "record_hash": record["record_hash"],
+                                                "store_generation": record["store_generation"]})
+        self.assertEqual(event["grant_record_hash"], void["record_hash"])
         self.assertEqual(event["idempotency_key"], record["idempotency_key"])
         rounds = w.events("job-a", "job.round")
         self.assertEqual(rounds[-1]["approval"], {"ref": "hk:task/2400", "issuer": "director-1", "extra": 1})
+        self.assertEqual(rounds[-1]["grant_record_hash"], ext["record_hash"])
+        self.assertEqual(set(rounds[-1]["wrk_receipt"]), {"job_id", "seq", "record_hash", "store_generation"})
         # The unchanged O2 reader counts them: the void refunds, the extension adds one.
         w.mode(None)
         out = w.run("round", "status", "job-a")
         self.assertRc(out, 0)
         self.assertIn("round 3 void (hk:task/2400)", out.stdout)
         self.assertIn("rounds=4", out.stdout)
+
+    def test_extension_extra_is_cumulative_per_distinct_grant_and_a_replay_adds_nothing(self):
+        w = self.world()
+        w.enforced_builder()
+        for i in range(3):
+            self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[i]), 0)
+        first = w.grant("job-a", "extension", round_no=4, head=w.heads[3])
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[3], "--extension-grant", first["seq"]), 0)
+        second = w.grant("job-a", "extension", round_no=5, head=w.heads[4])
+        out = w.run("round", "open", "job-a", "--head", w.heads[4], "--extension-grant", second["seq"],
+                    WRK_O3_TEST_FAULT="crash_after_accept")
+        self.assertEqual(out.returncode, 137)
+        # A replay of the first grant: the server refuses it, read repair projects
+        # the second, and the first grant never adds again.
+        out = w.run("round", "open", "job-a", "--head", w.heads[5], "--extension-grant", first["seq"])
+        self.assertRc(out, 73, "grant_consumed")
+        approvals = {r["extension_grant_seq"]: r["approval"]["extra"]
+                     for r in w.events("job-a", "job.round") if "approval" in r}
+        self.assertEqual(approvals, {first["seq"]: 1, second["seq"]: 2})
+        self.assertEqual(len(w.events("job-a", "job.round")), 5)
+        w.mode(None)
+        self.assertIn("rounds=5", w.run("round", "status", "job-a").stdout)
+
+    def test_p1_grant_consuming_append_with_an_unknown_outcome_never_falls_back(self):
+        w = self.world()
+        w.mode("shadow")
+        w.enroll("job-a", activate=False)
+        w.local_claim("job-a")
+        for i in range(3):
+            self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[i]), 0)
+        grant = w.grant("job-a", "extension", round_no=4, head=w.heads[3])
+        self.assertRc(w.run("round", "status", "job-a"), 0)
+        w.fault("job", "error:transport_unavailable", times=2)
+        w.fault("append", "error:wrk_unavailable", kind="round_open")
+        out = w.run("round", "open", "job-a", "--head", w.heads[3], "--extension-grant", grant["seq"])
+        self.assertRc(out, 75, "wrk_unavailable")
+        self.assertIn("no O2 fallback", out.stderr)
+        self.assertEqual(len(w.events("job-a", "job.round")), 3, "no projection and no O2 event")
+        self.assertEqual(w.events("job-a", "job.o3_warning"), [])
+        self.assertEqual([i["state"] for i in w.intents("job-a")][-1], "pending")
 
     def test_a_warning_branch_event_with_the_key_is_not_written_twice_on_replay(self):
         w = self.world()

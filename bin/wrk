@@ -6480,9 +6480,9 @@ round_open_cmd() {
     [[ -z "$extend" ]] ||
       die "round open: an O3 job takes a typed server grant (--extension-grant SEQ), never the free ref $extend"
     [[ "$O3_ROUTE" == forced_o2 ]] || o2_mode=check
-    # The typed grant is the server's to judge; locally it stands for the
-    # one extra open the O2 cap would otherwise refuse.
-    [[ -z "$ext_grant" ]] || { grant_extra=1; grant_issuer=o3-typed-grant; }
+    # The typed grant is the server's to judge; locally it is one more extra on
+    # the subject's hk:task/<task> ref, counted once per distinct grant seq.
+    [[ -z "$ext_grant" ]] || grant_issuer=o3-typed-grant
   fi
   if [[ -n "$extend" ]]; then
     local tmp_approval
@@ -6525,13 +6525,15 @@ round_open_cmd() {
   # concurrently cannot slip a second open past the cap.
   local outcome rc=0
   set +e
-  local extend_ref="$extend"
-  [[ -z "$ext_grant" || "$O3_ROUTE" == legacy ]] || extend_ref="o3:typed-grant/$ext_grant"
-  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend_ref" "$grant_extra" "$grant_issuer" "$o2_mode" "$O3_FORCE_O2_KEY" <<'PY'
+  local extend_ref="$extend" typed_seq=""
+  if [[ -n "$ext_grant" && "$O3_ROUTE" != legacy ]]; then
+    extend_ref="hk:task/$(round_job_task_id "$job" || true)" typed_seq="$ext_grant"
+  fi
+  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend_ref" "$grant_extra" "$grant_issuer" "$o2_mode" "$O3_FORCE_O2_KEY" "$typed_seq" <<'PY'
 import fcntl, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 (events, job, owner, label, pane, parent, head, cap,
- extend_ref, grant_extra, grant_issuer, o2_mode, o3_key) = sys.argv[1:]
+ extend_ref, grant_extra, grant_issuer, o2_mode, o3_key, typed_seq) = sys.argv[1:]
 cap, grant_extra = int(cap), int(grant_extra)
 os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
@@ -6557,6 +6559,13 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
     used += wrk_takeover_rounds(events)
+    if typed_seq:
+        # hk 1926: an O3 typed extension shares the subject's hk:task/<task> ref;
+        # its extra is one per distinct grant seq, so a replayed seq adds nothing.
+        seen = {r.get("extension_grant_seq") for r in rounds
+                if (r.get("approval") or {}).get("ref") == extend_ref
+                and isinstance(r.get("extension_grant_seq"), int)}
+        grant_extra = len(seen - {int(typed_seq)}) + (0 if int(typed_seq) in seen else 1)
     approval = None
     if used >= cap:
         if not extend_ref:
