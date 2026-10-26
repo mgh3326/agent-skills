@@ -247,7 +247,7 @@ def classify(task: dict, rules: dict, with_files: bool, gh: str,
     # hk 2012 tag rule: an exact leading [area] tag naming a known area
     # states the area outright and overrides a product default.
     tag = TAG_RE.match(title)
-    if product and tag and tag.group(1) in rules["_areas"]:
+    if default and tag and tag.group(1) in rules["_areas"]:
         return tag.group(1), "title", f"tag:[{tag.group(1)}]"
     for entry in rules["title_keywords"]:
         scope = entry.get("projects")

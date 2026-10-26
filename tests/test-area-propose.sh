@@ -136,6 +136,10 @@ HK2012_SCOPED = [
     (139, "handoffkeep", "deploy the hub relay fix"),
     (163, "fleet-ops", "tester probe for the queue"),
     (164, "handoffkeep", "README update for the relay notes"),
+    (165, "handoffkeep", "tester follow-up on the relay retry"),
+    (166, "panewire", "wrk follow-up on the hub lane stall"),
+    (167, "agent-skills", "tester follow-up on the spawn loop"),
+    (168, "handoffkeep", "[shell-wrk] relay retry follow-up"),
 ]
 for i, project, title in HK2012_SCOPED:
     tasks[str(i)] = {"id": i, "state": "backlog", "project": project,
@@ -279,7 +283,7 @@ want = [
     (131, "unity", "project:ParkingArcade"),   # tester term must not beat a product default
     (132, "python", "project:scopefuel"),      # wrk term must not beat scopefuel's default
     (133, "shell-wrk", "title:"),              # fleet repo: tester term applies
-    (134, "shell-wrk", "title:"),              # fleet repo: wrk round beats go-backend default
+    (134, "go-backend", "project:handoffkeep"),  # wrk round never overrides a go-backend default
     (135, "trading", "project:auto_trader"),   # 콘솔 is web-frontend only on fleet repos
     (136, "trading", ""),                      # 주문 keeps the trading default
     (137, "trading", "project:auto_trader"),   # deploy (ops) must not beat a product default
@@ -290,6 +294,10 @@ want = [
     (162, "python", "project:experiment"),    # a loose research word does not count
     (163, "", "-"),                           # unmapped project: no shell-wrk term applies
     (164, "go-backend", "project:handoffkeep"),  # fleet default holds against a generic docs term
+    (165, "go-backend", "project:handoffkeep"),  # a tester term never overrides go-backend
+    (166, "go-backend", "project:panewire"),     # a wrk term never overrides go-backend
+    (167, "shell-wrk", "title:\\btester\\b"),    # agent-skills default is shell-wrk: tester applies
+    (168, "shell-wrk", "tag:[shell-wrk]"),       # an exact leading tag applies on a fleet repo
 ]
 for tid, area, rule in want:
     r = rows.get(str(tid)) or sys.exit(f"missing row for task {tid}")
