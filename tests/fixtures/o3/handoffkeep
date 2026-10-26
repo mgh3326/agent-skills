@@ -22,7 +22,7 @@ State keys: client_id, generation, namespace (false: every wrk call answers
 o3_unsupported), jobs{job:{records,keys}}, faults[], hosts{job:client}.
 A fault is {"op", "kind"?, "page"?, "action", "times"?}; actions are
 error:CODE, commit_then:CODE, garbage, noisy_stderr, unknown_code, hang,
-tamper_hash, snapshot_shift, gap, generation, html, respond_file:PATH. page_limit caps a records
+tamper_hash, snapshot_shift, gap, generation, html, respond_file:PATH, regress_seq. page_limit caps a records
 page so later cursor pages are exercised.
 """
 import base64
@@ -628,7 +628,7 @@ def main():
             with open(action.split(":", 1)[1], encoding="utf-8") as f:
                 sys.stdout.write(f.read().strip() + "\n")
             sys.exit(0)
-        if action and not action.startswith("commit_then:"):
+        if action and not action.startswith("commit_then:") and action != "regress_seq":
             save()
             fail_action(action)
         try:
@@ -636,7 +636,10 @@ def main():
         except Refuse as exc:
             save()
             out_fail(exc.code)
-        if action:
+        if action == "regress_seq":
+            # The answer claims a history that ends at seq 1 (a regressed server).
+            summ = dict(summ, snapshot_seq=1, tail_hash=state["jobs"][job]["records"][0]["record_hash"])
+        elif action:
             save()
             fail_action(action.split(":", 1)[1] if ":" in action else action)
         respond({"contract": "hk1873.v1", "created": created, "record": record, "summary": summ})

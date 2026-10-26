@@ -143,9 +143,11 @@ class Fail(Exception):
 
 
 class CliFail(Exception):
-    def __init__(self, code):
+    def __init__(self, code, observed=""):
         Exception.__init__(self, code)
         self.code = code
+        # For history_regressed: not_found, generation_regressed, seq_regressed or hash_changed.
+        self.observed = observed
 
 
 def test_mode():
@@ -668,7 +670,7 @@ def read_state(job, retained=()):
         elif page["snapshot_seq"] != snapshot or page["summary"]["snapshot_seq"] != snapshot:
             raise CliFail("protocol_invalid")
         if page["summary"]["store_generation"] != summary["store_generation"]:
-            raise CliFail("history_regressed")
+            raise CliFail("history_regressed", "generation_regressed")
         for record in page["records"]:
             expected = len(records) + 1
             if record["seq"] != expected:
@@ -693,7 +695,7 @@ def read_state(job, retained=()):
     if claim is None or claim["kind"] != "claim":
         raise CliFail("protocol_invalid")
     if job_obj["summary"]["store_generation"] != summary["store_generation"]:
-        raise CliFail("history_regressed")
+        raise CliFail("history_regressed", "generation_regressed")
     state = State(job, claim, summary, records)
     check_history(state, retained)
     return state
@@ -703,10 +705,12 @@ def check_history(state, retained):
     """5: a retained receipt outside, absent from or different in the returned
     history is local history_regressed and stops authority use."""
     for receipt in retained:
-        if receipt["store_generation"] != state.generation or receipt["seq"] > state.snapshot_seq:
-            raise CliFail("history_regressed")
+        if receipt["store_generation"] != state.generation:
+            raise CliFail("history_regressed", "generation_regressed")
+        if receipt["seq"] > state.snapshot_seq:
+            raise CliFail("history_regressed", "seq_regressed")
         if state.records[receipt["seq"] - 1]["record_hash"] != receipt["record_hash"]:
-            raise CliFail("history_regressed")
+            raise CliFail("history_regressed", "hash_changed")
 
 
 # ── durable intents ──────────────────────────────────────────────────────────
@@ -944,38 +948,28 @@ def advance_snapshot(directory, job, outcome):
         pass
 
 
-def history_regression(inbox, job, store, observed):
+NOTE_RESULTS = ("not_found", "generation_regressed", "seq_regressed")
+
+
+def history_regression(inbox, job, store, observed, intent=None):
     """Refuse with history_regressed (75). A job that is not locally ended
     gets one job.o3_warning. A locally ended job gets no new event at all; the
-    observation goes on each pending or accepted intent of the job as the
-    optional history_regressed field (first observation kept, states never move
-    backwards), and no intent is invented when there is none (director-1)."""
+    observation goes only on the intent whose own replay saw it, as the optional
+    history_regressed field {observed_at, get_result} (get_result one of
+    NOTE_RESULTS, first observation kept, states never move backwards). A read
+    with no replay names key none and writes no note (director-1 rulings)."""
     end = local_end(inbox, job)
     if not end:
         write_warning(inbox, job, "history_regressed", "canonical read")
         raise Fail("history_regressed", "job %s: the server history regressed (%s)" % (job, observed))
-
-    def note(st):
-        keys, changed = [], False
-        for intent in st.intents:
-            if intent["state"] not in ("pending", "accepted"):
-                continue
-            if "history_regressed" not in intent:
-                intent["history_regressed"] = {"observed_at": now_utc(), "get_result": observed}
-                changed = True
-            keys.append(intent["idempotency_key"])
-        if changed:
-            st.save()
-        return keys
-    if store is not None:
-        keys = note(store)
-    elif os.path.exists(os.path.join(safe_job_dir(inbox, job), INTENTS)):
-        with Intents(inbox, job) as st:
-            keys = note(st)
-    else:
-        keys = []
+    key = "none"
+    if intent is not None and store is not None:
+        key = intent["idempotency_key"]
+        if "history_regressed" not in intent and observed in NOTE_RESULTS:
+            intent["history_regressed"] = {"observed_at": now_utc(), "get_result": observed}
+            store.save()
     raise Fail("history_regressed", "job %s intent %s: local end event %s; the server GET returned %s; nothing "
-               "written to the events log" % (job, ",".join(keys) or "none", end, observed))
+               "written to the events log" % (job, key, end, observed))
 
 
 def retained_receipts(directory, job):
@@ -992,13 +986,15 @@ def retained_receipts(directory, job):
 
 
 def snapshot_regressed(snapshot, state):
-    """The cached read is a retained witness too."""
+    """The cached read is a retained witness too: the regression it shows, or ""."""
     if snapshot is None:
-        return False
+        return ""
     seq = snapshot.get("snapshot_seq")
-    if snapshot.get("store_generation") != state.generation or not _int(seq, 1) or seq > state.snapshot_seq:
-        return True
-    return state.records[seq - 1]["record_hash"] != snapshot.get("tail_hash")
+    if snapshot.get("store_generation") != state.generation:
+        return "generation_regressed"
+    if not _int(seq, 1) or seq > state.snapshot_seq:
+        return "seq_regressed"
+    return "hash_changed" if state.records[seq - 1]["record_hash"] != snapshot.get("tail_hash") else ""
 
 
 # ── local event projections (6 step 3) ───────────────────────────────────────
@@ -1163,7 +1159,7 @@ def send(store, intent, binary=None):
         if exc.code == "not_found" and (store.receipts() or os.path.exists(os.path.join(store.dir, SNAPSHOT))):
             # A job a witness shows enrolled now reads not_found: history
             # regressed; the intent stays pending (director-1 rulings).
-            history_regression(os.path.dirname(store.dir), store.job, store, "not_found")
+            history_regression(os.path.dirname(store.dir), store.job, store, "not_found", intent)
         if exc.code in DEFINITE or exc.code == "cli_usage":
             intent["state"], intent["error"] = "rejected", exc.code
             store.save()
@@ -1178,6 +1174,14 @@ def send(store, intent, binary=None):
         _need(record["request_sha256"] == intent["request_sha256"])
     except CliFail as exc:
         raise Fail(exc.code, "%s %s" % (request["kind"], intent["idempotency_key"]))
+    # The answer is compared with the retained receipts before it is trusted: a
+    # changed generation or a lower snapshot is regression seen by this replay.
+    retained = [r for r in store.receipts() if r is not None]
+    if retained:
+        if any(r["store_generation"] != record["store_generation"] for r in retained):
+            history_regression(os.path.dirname(store.dir), store.job, store, "generation_regressed", intent)
+        if obj["summary"]["snapshot_seq"] < max(r["seq"] for r in retained):
+            history_regression(os.path.dirname(store.dir), store.job, store, "seq_regressed", intent)
     intent["state"], intent["receipt"] = "accepted", receipt_of(record)
     try:
         store.save()
@@ -1244,17 +1248,16 @@ class Ctx(object):
         directory = self.jobdir(job)
         retained = store.receipts() if store is not None else retained_receipts(directory, job)
         snapshot = load_snapshot(directory, job) if os.path.isdir(directory) else None
-        observed = "regressed"
         try:
             state = read_state(job, retained)
             if state is None and (retained or snapshot is not None):
-                observed = "not_found"
-                raise CliFail("history_regressed")
+                raise CliFail("history_regressed", "not_found")
             if state is not None and snapshot_regressed(snapshot, state):
-                raise CliFail("history_regressed")
+                raise CliFail("history_regressed", snapshot_regressed(snapshot, state))
         except CliFail as exc:
             if exc.code == "history_regressed":
-                history_regression(self.inbox, job, store, observed)
+                # A read, not a replay: no intent note (director-1 ruling).
+                history_regression(self.inbox, job, None, exc.observed or "regressed")
             raise
         if state is not None:
             ensure_dir(directory)
@@ -1515,7 +1518,19 @@ def route_op(ctx, job, opts):
     guards first and append only when they pass; LEGACY stays O2. Every
     pending intent of the job is replayed by its key before classifying; one
     still indeterminate fails closed with 75 (director-1 P1 ruling)."""
-    if ctx.mode != "legacy" and os.path.exists(os.path.join(ctx.jobdir(job), INTENTS)):
+    directory = ctx.jobdir(job)
+    if ctx.mode != "legacy" and os.path.exists(os.path.join(directory, INTENTS)):
+        # P1 only: for a job the last canonical read showed receipt_required the
+        # command's own resume keeps the 6b rule (a same-kind pending original
+        # is the answer and nothing new is sent).
+        cached = load_snapshot(directory, job)
+        if cached is not None and cached.get("receipt_required"):
+            store_pending = False
+        else:
+            store_pending = True
+    else:
+        store_pending = False
+    if store_pending:
         with Intents(ctx.inbox, job) as store:
             if store.pending():
                 for outcome in resume(store):
