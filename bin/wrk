@@ -11670,11 +11670,9 @@ print(value if isinstance(value, str) else "")
   # the quota record — no job without its task link.
   # hk 1926: a verified O3 spawn is bound by its canonical claim; only the local
   # task_link audit record is kept, and no hk_bin call is made.
-  if [[ "$O3_SPAWN_VERIFIED" == 1 ]]; then
-    hk_task_link_event "$TASK_LINK_STATUS" "o3 canonical claim verified"
-  else
-    hk_task_link
-  fi
+  [[ "$O3_SPAWN_VERIFIED" != 1 ]] || hk_task_link_event "$TASK_LINK_STATUS" "o3 canonical claim verified"
+  [[ "$O3_SPAWN_VERIFIED" == 1 ]] ||
+  hk_task_link
   # #965/#1397: with the pane provably up and the spawn committed to its OK
   # line, register the lane on the daemon serving this herdr session —
   # worker label under --owner, builder --lane under --parent — before the

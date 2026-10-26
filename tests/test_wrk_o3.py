@@ -2203,11 +2203,8 @@ class MutantCase(O3Case):
     hk_task_precheck
   else
     TASK_LINK_STATUS=already_linked
-  fi'''), ("wrk", '''  if [[ "$O3_SPAWN_VERIFIED" == 1 ]]; then
-    hk_task_link_event "$TASK_LINK_STATUS" "o3 canonical claim verified"
-  else
-    hk_task_link
-  fi''', '''  hk_task_link_event "$TASK_LINK_STATUS" "o3 canonical claim verified"''')])
+  fi'''), ("wrk", '''  [[ "$O3_SPAWN_VERIFIED" == 1 ]] ||
+  hk_task_link''', '''  :''')])
         w, out = SpawnCase.scenario_legacy_spawn_makes_both_task_calls(self, bindir)
         log = w.tasks_log.read_text() if w.tasks_log.exists() else ""
         self.assertNotIn("claim id=2400", log, "the mutant must have skipped the legacy link")
