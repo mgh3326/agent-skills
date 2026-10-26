@@ -5413,7 +5413,13 @@ PY
 }
 
 wrk_o3_cmd() {
-  python3 "$(dirname "${BASH_SOURCE[0]}")/wrk-o3.py" "$@"
+  local adapter
+  adapter="$(python3 - "${BASH_SOURCE[0]}" <<'PY'
+import os, sys
+print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "wrk-o3.py"))
+PY
+  )" || return 2
+  python3 "$adapter" "$@"
 }
 
 completion_metadata() {
@@ -6291,6 +6297,8 @@ O3 (records-mode shadow/required): open JOB --head SHA [--repo PATH]
 Enrolled jobs refuse legacy --extend/--by refs. Canonical receipts precede
 round projections; projection_pending exits 75 and a retry repairs from the
 server. Offline cached status is stale=true and labelled O2-unverified.
+Audit queries only job dirs holding O3 intents or a snapshot. Other findings
+keep the O2 audit and --lane filter, with label=O2-unverified on every row.
 Use wrk o3 --help for typed completed/joined adapter and central desk tooling.
 
 Formal tester-round bookkeeping for a builder job (#758). A formal round is

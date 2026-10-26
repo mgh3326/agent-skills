@@ -54,6 +54,9 @@ CLI_VECTOR_TESTS = {
     "caller-env-overrides-scrubbed": "TransportTests.test_override_environment_keys_absent",
     "commit-then-proxy-5xx-pending-intent": "IntentTests.test_only_definite_refusals_reject_intents",
 }
+REVIEW_CLI_TESTS = {
+    "r-done-5xx-intent-pending-exit-75": "TypedAdapterTests.test_review_completed_5xx_retains_original_bytes_without_local_completion",
+}
 MATRIX_TESTS = {
     "claim/spawn": ("SpawnHandshakeTests.test_real_o3_spawn_never_calls_legacy_hk_bin",
                     "MatrixModeTests.test_local_o2_files_do_not_prove_enrollment",
@@ -71,10 +74,10 @@ MATRIX_TESTS = {
                    "MatrixModeTests.test_local_o2_files_do_not_prove_enrollment",
                    "MatrixModeTests.test_old_namespace_fails_closed_for_every_command",
                    "MatrixModeTests.test_first_get_outage_creates_no_invented_intent"),
-    "round status/audit": ("ReadTests.test_pagination_is_fixed_snapshot_and_cache_is_not_authority",
-                           "MatrixModeTests.test_local_o2_files_do_not_prove_enrollment",
-                           "MatrixModeTests.test_old_namespace_fails_closed_for_every_command",
-                           "RoundCommandTests.test_offline_status_is_explicitly_stale_and_unverified"),
+    "round status/audit": ("AuditTests.test_marked_audit_reads_canonical_history_and_filters_its_canonical_lane",
+                           "AuditTests.test_unmarked_audit_preserves_o2_findings_lane_and_labels_without_get",
+                           "AuditTests.test_marked_unsupported_server_refuses_without_o2_fallback",
+                           "AuditTests.test_offline_audit_keeps_stale_label_and_filters_by_local_lane"),
     "joined": ("TypedAdapterTests.test_joined_is_adapter_only",
                "MatrixModeTests.test_local_o2_files_do_not_prove_enrollment",
                "MatrixModeTests.test_old_namespace_fails_closed_for_every_command",
@@ -93,7 +96,9 @@ class PackTests(unittest.TestCase):
         self.assertTrue(all(len(tests) == len(matrix["mode_columns"]) == 4 for tests in MATRIX_TESTS.values()))
         cli = json.loads((PACK / "vectors/transport-intents.json").read_text())
         self.assertEqual(set(CLI_VECTOR_TESTS), {c["name"] for c in cli["cases"]})
-        for name in set(CLI_VECTOR_TESTS.values()) | {x for row in MATRIX_TESTS.values() for x in row}:
+        lifecycle = json.loads((PACK / "vectors/r4-review-lifecycle.json").read_text())
+        self.assertEqual(set(REVIEW_CLI_TESTS), {c["name"] for c in lifecycle["cases"] if c["request"]["type"] == "cli"})
+        for name in set(CLI_VECTOR_TESTS.values()) | set(REVIEW_CLI_TESTS.values()) | {x for row in MATRIX_TESTS.values() for x in row}:
             klass, method = name.split(".")
             self.assertTrue(callable(getattr(globals()[klass], method)), name)
     def test_manifest_pins_every_byte(self):
@@ -177,6 +182,23 @@ class Harness(unittest.TestCase):
     def run_adapter(self, *args, stdin=""):
         return subprocess.run([sys.executable, str(ADAPTER), *args], input=stdin,
                               text=True, capture_output=True, env=self.env, timeout=15)
+
+    def internal_append_command(self, job="job-a", resume=None):
+        # Transport/crash probes call the shared module directly. The public
+        # raw CLI intentionally refuses these projecting Request kinds.
+        driver = '''import importlib.util,sys
+spec=importlib.util.spec_from_file_location("internal_append_probe",sys.argv[1])
+m=importlib.util.module_from_spec(spec);spec.loader.exec_module(m)
+try:
+    resume=sys.argv[4] or None
+    request=None if resume else m.strict_json(sys.stdin.buffer.read(),"invalid_request")
+    result=m.Client().append(sys.argv[3],request,resume=resume)
+    sys.stdout.buffer.write(m.canonical(result)+b"\\n")
+except m.Refusal as error:
+    sys.stderr.write("wrk o3: "+error.code+"\\n")
+    raise SystemExit(error.exit)
+'''
+        return [sys.executable, "-c", driver, str(ADAPTER), "append", job, resume or ""]
 
     def calls(self):
         return json.loads(self.script.read_text())["calls"]
@@ -473,7 +495,7 @@ class IntentTests(Harness):
         processes = []
         try:
             for head in ("a" * 40, "b" * 40):
-                process = subprocess.Popen([sys.executable, str(ADAPTER), "append", "job-a"],
+                process = subprocess.Popen(self.internal_append_command(),
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                            text=True, env=self.env)
                 process.stdin.write(json.dumps(self.round_request(head=head)))
@@ -516,7 +538,8 @@ os._exit(99)
                 self.assertEqual(crash.returncode, 99, crash.stderr)
                 item = json.loads(self.intent_file().read_text())["intents"][0]
                 self.assertEqual(item["state"], "accepted" if phase == "after_accepted_fsync" else "pending")
-                replay = self.run_adapter("append", "job-a", "--resume", item["local_id"])
+                replay = subprocess.run(self.internal_append_command(resume=item["local_id"]),
+                                        text=True, capture_output=True, env=self.env, timeout=30)
                 self.assertEqual(replay.returncode, 0, replay.stderr)
                 calls = self.calls()
                 if phase != "before_send":
@@ -703,6 +726,178 @@ class RoundCommandTests(Harness):
             self.assertEqual(self.events(), [], "receipt-required reviewer never publishes an O2 warning success")
 
 
+class VerdictServerOrderTests(Harness):
+    def verdict_file(self, head="f" * 40):
+        path = self.root / "ordered-verdict.md"
+        path.write_text("VERDICT: PASS @" + head + "\noriginal evidence\n")
+        return path
+
+    def test_no_open_still_sends_next_round_and_reports_the_server_code(self):
+        self.mode("required")
+        path = self.verdict_file()
+        for code, rc in (("duplicate_path", 73), ("duplicate_content", 73),
+                         ("scope_denied", 77), ("round_not_open", 73), ("head_mismatch", 73)):
+            with self.subTest(code=code):
+                self.seed({"action": "read"}, {"action": "read"},
+                          dict(exit=rc, stderr="handoffkeep wrk: " + code + "\n"))
+                result = self.run_wrk("round", "verdict", "job-a", "--file", str(path))
+                self.assertEqual(result.returncode, rc, result.stderr)
+                self.assertEqual(result.stderr, "wrk o3: " + code + "\n")
+                self.assertEqual([c["argv"][1] for c in self.calls()], ["job", "records", "append"])
+                payload = json.loads(self.calls()[-1]["stdin"])
+                self.assertEqual(payload["round_no"], 1)
+                self.assertIsNone(payload["tester_job_id"])
+                self.assertEqual(base64.b64decode(payload["content_b64"]), path.read_bytes())
+                self.assertFalse(any(e["kind"] == "job.verdict" for e in self.events()))
+
+    def two_opens(self):
+        self.mode("required")
+        self.seed({"action": "accept"}, {"action": "accept"})
+        with self.client() as client:
+            for number, head in enumerate(("a" * 40, "b" * 40), 1):
+                request = self.round_request(expected=number + 1, head=head)
+                request["payload"]["tester_job_id"] = "tester-" + str(number)
+                client.append("job-a", request)
+
+    def test_unmatched_head_uses_oldest_open_and_its_assigned_tester(self):
+        self.two_opens()
+        path = self.verdict_file()
+        self.more_responses({"action": "read"}, {"action": "read"},
+                            dict(exit=73, stderr="handoffkeep wrk: head_mismatch\n"))
+        result = self.run_wrk("round", "verdict", "job-a", "--file", str(path))
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertEqual(result.stderr, "wrk o3: head_mismatch\n")
+        payload = json.loads(self.calls()[-1]["stdin"])
+        self.assertEqual((payload["round_no"], payload["head"], payload["tester_job_id"]),
+                         (1, "f" * 40, "tester-1"))
+
+    def test_matching_head_keeps_its_own_oldest_open(self):
+        self.two_opens()
+        path = self.verdict_file("b" * 40)
+        self.more_responses({"action": "read"}, {"action": "read"},
+                            dict(exit=77, stderr="handoffkeep wrk: scope_denied\n"))
+        result = self.run_wrk("round", "verdict", "job-a", "--file", str(path))
+        self.assertEqual(result.returncode, 77, result.stderr)
+        payload = json.loads(self.calls()[-1]["stdin"])
+        self.assertEqual((payload["round_no"], payload["tester_job_id"]), (2, "tester-2"))
+
+    def test_unsendable_verdict_has_no_append_or_intent(self):
+        self.mode("required")
+        self.seed({"action": "read"}, {"action": "read"})
+        path = self.verdict_file()
+        path.write_text("no verdict or head\n")
+        result = self.run_wrk("round", "verdict", "job-a", "--file", str(path))
+        self.assertEqual(result.returncode, 65, result.stderr)
+        self.assertEqual(result.stderr, "wrk o3: invalid_verdict\n")
+        self.assertFalse(any(c["argv"][1] == "append" for c in self.calls()))
+        self.assertFalse(self.intent_file().exists())
+
+
+class PublicAppendTests(Harness):
+    def end_request(self, expected=2):
+        return dict(kind="end", claim_seq=1, expected_seq=expected,
+                    payload=dict(end_type="reaped", reason_code="fixture_cleanup"))
+
+    def test_shadow_raw_round_refuses_with_typed_command_guidance(self):
+        self.mode("shadow")
+        records = self.seed({"action": "accept"})
+        data = json.loads(self.script.read_text()); data["journal"] = records[:1]
+        self.script.write_text(json.dumps(data))
+        request = self.round_request(expected=1)
+        result = self.run_wrk("o3", "append", "job-a", stdin=json.dumps(request))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("cli_usage", result.stderr)
+        self.assertIn("wrk round open", result.stderr)
+        self.assertFalse(any(c["argv"][1] == "append" for c in self.calls()))
+        self.assertFalse(self.intent_file().exists())
+
+    def test_activated_projecting_kinds_refuse_even_with_option_separator(self):
+        self.mode("required")
+        raw = b"VERDICT: PASS @" + b"1" * 40 + b"\nfixture\n"
+        report = dict(report_b64=base64.b64encode(raw).decode(), report_sha256=hashlib.sha256(raw).hexdigest())
+        payloads = {
+            "round_open": (self.round_request()["payload"], "wrk round open"),
+            "verdict": (dict(round_no=1, head="1" * 40, verdict="PASS", path=str(self.root / "review.md"),
+                             content_b64=base64.b64encode(raw).decode(), content_sha256=hashlib.sha256(raw).hexdigest(),
+                             tester_job_id=None), "wrk round verdict"),
+            "void": (dict(round_no=1, grant_seq=4, reason_code="builder_void"), "wrk round void"),
+            "completed": (report, "wrk o3 completed"),
+            "joined": (dict(report, head="1" * 40, pr="https://example.test/pr/1", waiver_grant_seq=None), "wrk o3 joined"),
+        }
+        for kind, (payload, command) in payloads.items():
+            with self.subTest(kind=kind):
+                self.seed({"action": "accept"})
+                request = dict(kind=kind, claim_seq=1, expected_seq=2, payload=payload)
+                result = self.run_wrk("o3", "--", "append", "job-a", stdin=json.dumps(request))
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("cli_usage", result.stderr)
+                self.assertIn(command, result.stderr)
+                self.assertFalse(any(c["argv"][1] == "append" for c in self.calls()))
+                self.assertFalse(self.intent_file().exists())
+
+    def test_shadow_nonprojecting_raw_append_requires_the_typed_path_too(self):
+        self.mode("shadow")
+        records = self.seed({"action": "read"}, {"action": "read"})
+        data = json.loads(self.script.read_text()); data["journal"] = records[:1]
+        self.script.write_text(json.dumps(data))
+        result = self.run_wrk("o3", "append", "job-a", stdin=json.dumps(self.end_request(1)))
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("cli_usage", result.stderr)
+        self.assertIn("typed", result.stderr)
+        self.assertIn("wrk", result.stderr)
+        self.assertEqual([c["argv"][1] for c in self.calls()], ["job", "records"])
+        self.assertFalse(self.intent_file().exists())
+
+    def test_activated_nonprojecting_append_keeps_the_guard_and_durable_intent(self):
+        self.mode("required")
+        self.seed({"action": "read"}, {"action": "read"}, {"action": "accept"})
+        result = self.run_wrk("o3", "append", "job-a", stdin=json.dumps(self.end_request()))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([c["argv"][1] for c in self.calls()], ["job", "records", "append"])
+        self.assertEqual(json.loads(result.stdout)["record"]["kind"], "end")
+        self.assertEqual(json.loads(self.intent_file().read_text())["intents"][0]["state"], "accepted")
+        self.assertEqual(self.events(), [])
+
+    def test_projecting_resume_keeps_original_intent_and_requires_typed_repair(self):
+        self.mode("required")
+        self.seed({"action": "commit_lost"})
+        with self.client() as client:
+            with self.assertRaises(self.module.Refusal):
+                client.append("job-a", self.round_request())
+        before = self.intent_file().read_bytes()
+        item = json.loads(before)["intents"][0]
+        self.more_responses({"action": "accept"})
+        result = self.run_wrk("o3", "append", "job-a", "--resume", item["local_id"])
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("wrk round open", result.stderr)
+        self.assertEqual(self.intent_file().read_bytes(), before)
+        self.assertEqual(sum(c["argv"][1] == "append" for c in self.calls()), 1)
+
+    def test_resume_rechecks_the_actual_kind_under_the_send_lock(self):
+        self.seed({"action": "commit_lost"}, {"action": "read"}, {"action": "read"}, {"action": "accept"})
+        with self.client() as client:
+            with self.assertRaises(self.module.Refusal):
+                client.append("job-a", self.end_request())
+            item = json.loads(self.intent_file().read_text())["intents"][0]
+            read_job = client.job
+
+            def change_after_classification(job):
+                current = read_job(job)
+                store = self.module.IntentStore(client, job)
+                with store.locked() as data:
+                    changed = data["intents"][0]
+                    changed["request"] = self.round_request(expected=current["summary"]["snapshot_seq"])
+                    changed["request_sha256"] = self.module.request_digest(job, changed["request"])
+                    store.save(data)
+                return current
+
+            client.job = change_after_classification
+            with self.assertRaises(self.module.Refusal) as refused:
+                client.append_public("job-a", resume=item["local_id"])
+            self.assertEqual((refused.exception.code, refused.exception.exit), ("cli_usage", 2))
+        self.assertEqual([c["argv"][1] for c in self.calls()], ["append", "job", "records"])
+
+
 class TypedAdapterTests(Harness):
     def typed_submission(self, kind):
         self.seed({"action": "read"}, {"action": "read"}, {"action": "accept"})
@@ -721,6 +916,37 @@ class TypedAdapterTests(Harness):
 
     def test_completed_is_adapter_only(self):
         self.typed_submission("completed")
+
+    def test_review_completed_5xx_retains_original_bytes_without_local_completion(self):
+        cases = json.loads((PACK / "vectors/r4-review-lifecycle.json").read_text())["cases"]
+        case = next(c for c in cases if c["name"] == "r-done-5xx-intent-pending-exit-75")
+        journals = {}
+        for record in case["given"]["records"]:
+            journals.setdefault(record["job_id"], []).append(record)
+        request = json.loads(base64.b64decode(case["request"]["stdin"]["$b64"]))
+        original = base64.b64decode(request["report_b64"])
+        self.script.write_text(json.dumps(dict(journals=journals, calls=[], responses=[
+            {"action": "read"}, {"action": "read"},
+            dict(exit=case["expect"]["exit_code"], stderr="handoffkeep wrk: " + case["expect"]["stderr_code"] + "\n")])))
+        report = self.root / "review-completion.md"
+        report.write_bytes(original)
+        result = self.run_wrk("o3", "completed", "job-a-t1", "--file", str(report))
+        self.assertEqual(result.returncode, case["expect"]["exit_code"], result.stderr)
+        self.assertEqual(result.stderr, "wrk o3: " + case["expect"]["stderr_code"] + "\n")
+        intent = json.loads(self.intent_file("job-a-t1").read_text())["intents"][0]
+        self.assertEqual(intent["state"], "pending")
+        self.assertEqual(self.events("job-a-t1"), [])
+        report.write_bytes(b"changed after the unknown outcome\n")
+        self.more_responses({"action": "accept"})
+        replay = self.run_wrk("o3", "completed", "job-a-t1", "--file", str(report))
+        self.assertEqual(replay.returncode, 0, replay.stderr)
+        appends = [c for c in self.calls() if c["argv"][1] == "append"]
+        self.assertEqual(len(appends), 2)
+        self.assertEqual(appends[0]["argv"], appends[1]["argv"])
+        self.assertEqual(appends[0]["stdin"], appends[1]["stdin"])
+        self.assertEqual(base64.b64decode(json.loads(appends[1]["stdin"])["report_b64"]), original)
+        self.assertEqual(self.events("job-a-t1"), [])
+        self.assertEqual(json.loads(self.intent_file("job-a-t1").read_text())["intents"][0]["state"], "accepted")
 
     def test_joined_is_adapter_only(self):
         self.typed_submission("joined")
@@ -961,6 +1187,166 @@ class SpawnHandshakeTests(Harness):
         log = self.root / "herdr.log"
         self.assertFalse(log.exists() and "tab create" in log.read_text())
         self.assertTrue(all(x["argv"][0] == "wrk" for x in self.calls()), "no hk_bin legacy task call in O3 spawn")
+
+
+class AuditTests(Harness):
+    def local_job(self, job, lane, opened=False, stray=False):
+        directory = self.intent_file(job).parent
+        events = directory / "events"
+        events.mkdir(parents=True)
+        claim = dict(kind="job.claim", job_id=job, role="builder", owner_lane=lane,
+                     parent_lane="director-1", t_level="T2", task_id=2400)
+        (events / "00001-job.claim.json").write_text(json.dumps(claim))
+        if opened:
+            (events / "00002-job.round.json").write_text(json.dumps(
+                dict(kind="job.round", job_id=job, round=1, head="1" * 40)))
+        if stray:
+            (directory / "stray-verdict.md").write_text("VERDICT: PASS @" + "1" * 40 + "\nfixture\n")
+        return directory
+
+    def mark(self, job):
+        path = self.intent_file(job)
+        path.write_text(json.dumps(dict(version=1, intents=[])))
+        path.chmod(0o600)
+
+    def test_unmarked_audit_preserves_o2_findings_lane_and_labels_without_get(self):
+        self.local_job("job-a", "lane-a", opened=True, stray=True)
+        self.local_job("job-b", "lane-b")
+        self.responses()
+        baseline = self.run_wrk("round", "audit")
+        self.assertEqual(baseline.returncode, 0, baseline.stderr)
+        expected = baseline.stdout.splitlines()
+        self.assertTrue(any(line.startswith("unmatched-verdict job=job-a ") for line in expected))
+        self.assertIn("zero-rounds job=job-b lane=lane-b", expected)
+        for mode in ("shadow", "required"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                result = self.run_wrk("round", "audit")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), [line + " label=O2-unverified" for line in expected])
+                lane = self.run_wrk("round", "audit", "--lane", "lane-a")
+                self.assertEqual(lane.returncode, 0, lane.stderr)
+                self.assertEqual(lane.stdout.splitlines(), [line + " label=O2-unverified" for line in expected
+                                                          if "job=job-a " in line])
+                self.assertEqual(self.calls(), [], "unmarked audit routes no canonical read")
+                for job in ("job-a", "job-b"):
+                    self.assertFalse(any(e["kind"] == "job.o3_warning" for e in self.events(job)))
+                    self.assertFalse(self.intent_file(job).exists())
+
+    def test_marked_audit_reads_canonical_history_and_filters_its_canonical_lane(self):
+        self.local_job("job-a", "untrusted-local-lane")
+        self.mark("job-a")
+        self.mode("shadow")
+        self.seed(*({"action": "read"} for _ in range(2)))
+        result = self.run_wrk("round", "audit", "--lane", "b2400-a")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("job=job-a lane=b2400-a", result.stdout)
+        self.assertIn("stale=false label=O3", result.stdout)
+        self.assertNotIn("zero-rounds", result.stdout)
+        self.assertEqual([c["argv"][1] for c in self.calls()], ["job", "records"])
+        self.seed(*({"action": "read"} for _ in range(2)))
+        excluded = self.run_wrk("round", "audit", "--lane", "untrusted-local-lane")
+        self.assertEqual(excluded.returncode, 0, excluded.stderr)
+        self.assertEqual(excluded.stdout.strip(), "")
+
+    def test_marked_unknown_audit_warns_after_get_and_preserves_o2_findings(self):
+        self.local_job("job-a", "lane-a", opened=True, stray=True)
+        self.mark("job-a")
+        self.mode("shadow")
+        self.responses(dict(exit=66, stderr="handoffkeep wrk: not_found\n"))
+        result = self.run_wrk("round", "audit", "--lane", "lane-a")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("unmatched-verdict job=job-a ", result.stdout)
+        self.assertTrue(all(line.endswith(" label=O2-unverified") for line in result.stdout.splitlines()))
+        self.assertEqual([c["argv"][1] for c in self.calls()], ["job"])
+        warnings = [e for e in self.events() if e["kind"] == "job.o3_warning"]
+        self.assertEqual([e["code"] for e in warnings], ["not_found"])
+
+    def test_offline_audit_keeps_stale_label_and_filters_by_local_lane(self):
+        self.local_job("job-a", "lane-a")
+        self.local_job("job-b", "lane-b")
+        self.mode("required")
+        self.seed(*({"action": "read"} for _ in range(2)))
+        cached = self.run_wrk("round", "status", "job-a")
+        self.assertEqual(cached.returncode, 0, cached.stderr)
+        self.responses(dict(exit=75, stderr="handoffkeep wrk: wrk_unavailable\n"))
+        result = self.run_wrk("round", "audit", "--lane", "lane-a")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("job=job-a", result.stdout)
+        self.assertIn("stale=true", result.stdout)
+        self.assertTrue(all(line.endswith(" label=O2-unverified") for line in result.stdout.splitlines()))
+        self.assertNotIn("job=job-b", result.stdout)
+        self.assertEqual([c["argv"][1] for c in self.calls()], ["job"])
+        self.assertEqual([e["code"] for e in self.events() if e["kind"] == "job.o3_warning"], ["wrk_unavailable"])
+
+    def test_marked_unsupported_server_refuses_without_o2_fallback(self):
+        self.local_job("job-a", "lane-a", opened=True, stray=True)
+        self.mark("job-a")
+        for mode in ("shadow", "required"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                self.responses(dict(exit=75, stderr="handoffkeep wrk: o3_unsupported\n"))
+                result = self.run_wrk("round", "audit")
+                self.assertEqual(result.returncode, 75, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertEqual(result.stderr, "wrk o3: o3_unsupported\n")
+                self.assertEqual([c["argv"][1] for c in self.calls()], ["job"])
+
+
+class SymlinkEntrypointTests(Harness):
+    def setUp(self):
+        super().setUp()
+        linkbin = self.root / "linkbin"
+        linkbin.mkdir()
+        (linkbin / "source-wrk").symlink_to(WRK)
+        self.entry = linkbin / "wrk"
+        self.entry.symlink_to("source-wrk")
+
+    def linked_wrk(self, *args):
+        return subprocess.run(["bash", str(self.entry), *args], text=True,
+                              capture_output=True, env=self.env, timeout=180)
+
+    def test_capabilities_resolves_source_and_ignores_invocation_directory_helper(self):
+        decoy_ran = self.root / "decoy-ran"
+        (self.entry.parent / "wrk-o3.py").write_text(
+            "from pathlib import Path\nPath(%r).touch()\nraise SystemExit(99)\n" % str(decoy_ran))
+        self.responses(self.success(self.capabilities()))
+        result = self.linked_wrk("o3", "capabilities")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), self.capabilities())
+        self.assertFalse(decoy_ran.exists())
+        self.assertEqual([x["argv"][1] for x in self.calls()], ["capabilities"])
+
+    def test_shadow_and_required_round_status_use_the_source_adapter(self):
+        for mode in ("shadow", "required"):
+            with self.subTest(mode=mode):
+                self.mode(mode)
+                self.seed(*({"action": "read"} for _ in range(2)))
+                result = self.linked_wrk("round", "status", "job-a")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("job=job-a", result.stdout)
+                self.assertIn("stale=false label=O3", result.stdout)
+                self.assertEqual([x["argv"][1] for x in self.calls()], ["job", "records"])
+
+    def linked_spawn(self, mode):
+        self.mode(mode)
+        records = self.seed(*({"action": "read"} for _ in range(3)))
+        if mode == "shadow":
+            data = json.loads(self.script.read_text())
+            data["journal"] = records[:1]  # enrolled, unactivated P1 subject
+            self.script.write_text(json.dumps(data))
+        args = SpawnHandshakeTests.spawn_environment(self)
+        result = self.linked_wrk(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([x["argv"][1] for x in self.calls()], ["capabilities", "job", "records"])
+        self.assertIn("tab create", (self.root / "herdr.log").read_text())
+        self.assertTrue(any(e["kind"] == "job.claim" for e in self.events()))
+
+    def test_required_spawn_via_symlink_completes_the_guarded_handshake(self):
+        self.linked_spawn("required")
+
+    def test_shadow_spawn_via_symlink_completes_the_guarded_handshake(self):
+        self.linked_spawn("shadow")
 
 
 class PackClientVectorTests(Harness):
@@ -1695,6 +2081,26 @@ class MutantTests(Harness):
             ("skip-legacy-link", "wrk", '  [[ "$O3_SPAWN_VERIFIED" -eq 1 ]] || hk_task_link',
              '  : # mutant: skip the legacy task link too',
              "SpawnHandshakeTests.test_real_legacy_spawn_keeps_task_probe_and_link"),
+            ("unresolved-adapter-entrypoint", "wrk",
+             'print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "wrk-o3.py"))',
+             'print(os.path.join(os.path.dirname(sys.argv[1]), "wrk-o3.py"))',
+             "SymlinkEntrypointTests.test_capabilities_resolves_source_and_ignores_invocation_directory_helper"),
+            ("audit-drops-o2-label", "adapter",
+             '        return owner, [line + " label=O2-unverified" for line in lines]',
+             '        return owner, lines',
+             "AuditTests.test_unmarked_audit_preserves_o2_findings_lane_and_labels_without_get"),
+            ("verdict-preempts-server-order", "adapter",
+             '        target = min(matching or opens, key=lambda r: r["payload"]["round_no"], default=None)',
+             '        if not matching:\n            raise Refusal("round_not_open")\n        target = min(matching, key=lambda r: r["payload"]["round_no"], default=None)',
+             "VerdictServerOrderTests.test_no_open_still_sends_next_round_and_reports_the_server_code"),
+            ("public-append-bypasses-typed-route", "adapter",
+             '            value = client.append_public(args.job, read_request_stdin()',
+             '            value = client.append(args.job, read_request_stdin()',
+             "PublicAppendTests.test_shadow_raw_round_refuses_with_typed_command_guidance"),
+            ("public-resume-kind-not-rechecked", "adapter",
+             '            if public and item["request"]["kind"] in PROJECTED_COMMANDS:',
+             '            if False and item["request"]["kind"] in PROJECTED_COMMANDS:',
+             "PublicAppendTests.test_resume_rechecks_the_actual_kind_under_the_send_lock"),
         ]
         driver = '''import importlib.util,io,json,sys,unittest
 from pathlib import Path
@@ -1732,6 +2138,13 @@ print(json.dumps(dict(failures=len(r.failures),errors=len(r.errors),detail=strea
                 observation = json.loads(result.stdout)
                 self.assertEqual(observation["errors"], 0, "exceptions do not count as mutant RED: " + observation["detail"])
                 self.assertGreater(observation["failures"], 0, "surviving mutant: " + name + " " + observation["detail"])
+                (binary / ("wrk-o3.py" if target == "adapter" else "wrk")).write_text(source)
+                restored = subprocess.run([sys.executable, "-c", driver, str(Path(__file__)), str(directory), probe],
+                                          capture_output=True, text=True, env=self.env, timeout=300)
+                self.assertEqual(restored.returncode, 0, restored.stderr)
+                restored_result = json.loads(restored.stdout)
+                self.assertEqual((restored_result["failures"], restored_result["errors"]), (0, 0),
+                                 "restored copy must pass: " + restored_result["detail"])
 
 
 

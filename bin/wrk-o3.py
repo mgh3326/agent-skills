@@ -55,6 +55,10 @@ EXIT_CODES = {
 # All protocol/transport/503 outcomes remain pending, regardless of process exit.
 DEFINITE = frozenset(k for k, v in EXIT_CODES.items() if v in (65, 66, 73, 77, 78))
 HISTORY_RESULTS = frozenset(("not_found", "generation_regressed", "seq_regressed"))
+PROJECTED_COMMANDS = {
+    "round_open": "wrk round open", "verdict": "wrk round verdict", "void": "wrk round void",
+    "completed": "wrk o3 completed", "joined": "wrk o3 joined",
+}
 
 
 class Refusal(Exception):
@@ -62,6 +66,16 @@ class Refusal(Exception):
         self.code = code
         self.exit = EXIT_CODES[code]
         super().__init__(code)
+
+
+class TypedCommandRequired(Refusal):
+    def __init__(self, kind):
+        super().__init__("cli_usage")
+        self.command = PROJECTED_COMMANDS.get(
+            kind, "the typed wrk command (wrk round, wrk o3 completed/joined, or central desk tooling)")
+
+    def line(self):
+        return "wrk o3: cli_usage; use " + self.command + "\n"
 
 
 class HistoryFault(Refusal):
@@ -809,15 +823,40 @@ class Client:
                 raise HistoryFault("seq_regressed")
         return value
 
-    def append(self, job, request=None, resume=None, replay_accepted=False):
+    def append_public(self, job, request=None, resume=None):
+        """Raw CLI writes cannot replace a typed C1 command or its O2 veto."""
+        self._current_intents.pop(job, None)
+        if resume is not None:
+            with IntentStore(self, job).locked() as data:
+                item = next((x for x in data["intents"] if x["local_id"] == resume), None)
+                if item is None:
+                    raise Refusal("intent_invalid")
+                checked = item["request"]
+                self._current_intents[job] = resume
+        else:
+            checked = request
+            self.schema.check("Request", checked, "invalid_request")
+        if checked["kind"] in PROJECTED_COMMANDS:
+            raise TypedCommandRequired(checked["kind"])
         try:
-            return self._append(job, request, resume, replay_accepted)
+            current = self.job(job)
+        except Refusal as exc:
+            if exc.code != "not_found":
+                raise
+            raise TypedCommandRequired(checked["kind"]) from None
+        if not receipt_required(current["records"]):
+            raise TypedCommandRequired(checked["kind"])
+        return self.append(job, request, resume=resume, public=True)
+
+    def append(self, job, request=None, resume=None, replay_accepted=False, public=False):
+        try:
+            return self._append(job, request, resume, replay_accepted, public)
         except HistoryFault as exc:
             if not isinstance(exc, EndedHistoryFault):
                 self.history_warning(job, exc.result)
             raise
 
-    def _append(self, job, request=None, resume=None, replay_accepted=False):
+    def _append(self, job, request=None, resume=None, replay_accepted=False, public=False):
         """One durable send. No implicit network retry, CAS refresh or key rewrite."""
         job_name(job)
         store = IntentStore(self, job)
@@ -837,6 +876,11 @@ class Client:
                                 idempotency_key=str(uuid.uuid4()), request=request,
                                 request_sha256=sha, state="pending", receipt=None, error=None)
                     data["intents"].append(item)
+            # Recheck the actual retained request under the send lock: a
+            # concurrent edit must not switch an approved raw replay to a
+            # projecting kind between classification and this locked read.
+            if public and item["request"]["kind"] in PROJECTED_COMMANDS:
+                raise TypedCommandRequired(item["request"]["kind"])
             self._current_intents[job] = item["local_id"]
             if item["state"] == "rejected":
                 raise Refusal(item["error"])
@@ -1220,6 +1264,22 @@ class LocalRounds:
     def has_key(self, key, kind):
         return any(r.get("idempotency_key") == key and r.get("kind") == kind for r in self.records())
 
+    def audit(self):
+        # Reuse the unchanged O2 readers. These observations are display
+        # findings only; they never establish enrollment or supply a receipt.
+        _, _, scan = self.run_guard("job_events_scan", [])
+        owner = scan["owner"] or "-"
+        lines = []
+        recorded, _ = self.ns["wrk_round_census"](self.events, self.job)
+        if (self.ns["wrk_claim_role"](self.events) in ("builder", "captain")
+                and not scan["ended"] and recorded == 0):
+            lines.append("zero-rounds job=%s lane=%s" % (self.job, owner))
+        _, blocks, _ = self.run_guard("wrk_join_blocks", [str(Path(self.events).parent), self.job])
+        for line in blocks.splitlines():
+            if line.startswith("unmatched\t"):
+                lines.append("unmatched-verdict job=%s file=%s" % (self.job, line.split("\t", 1)[1]))
+        return owner, [line + " label=O2-unverified" for line in lines]
+
     def end(self, operation, key=None):
         name = self.ns["wrk_end_declaration"](self.events)
         if name:
@@ -1442,14 +1502,24 @@ def round_cli(client, argv, mode):
         for directory in sorted(root.iterdir()) if root.is_dir() else []:
             if not directory.is_dir() or directory.is_symlink():
                 continue
+            result = LEGACY_ROUTE
+            # Q3 markers select audit reads only; their absence never proves
+            # non-enrollment. Unqueried observations remain explicitly O2.
             if any((directory / marker).exists() for marker in ("o3-intents.json", "o3-snapshot.json")):
                 result = round_cli(client, ["status", directory.name], mode)
-                if args.lane and isinstance(result, str) and "stale=true" not in result and "lane=" + args.lane not in result.split():
+            if result == LEGACY_ROUTE or "stale=true" in result.split():
+                with client.events_locked(directory.name) as local:
+                    owner, findings = local.audit()
+                # The local lane filters display/offline routing only. Every
+                # positive canonical line below still needs the complete GET.
+                if args.lane and owner != args.lane:
+                    continue
+                lines.extend(findings if result == LEGACY_ROUTE else [result])
+            else:
+                if args.lane and "lane=" + args.lane not in result.split():
                     continue
                 lines.append(result)
-            else:
-                lines.append("job=" + directory.name + " label=O2-unverified")
-        return "\n".join(x for x in lines if isinstance(x, str))
+        return "\n".join(lines)
     job = job_name(args.job)
     client._current_intents.pop(job, None)
     if args.command == "status":
@@ -1558,12 +1628,15 @@ def round_mutation(client, local, args, mode):
         raw = read_evidence(path)  # Exact bytes captured ONCE.
         verdict, head = verdict_header(raw)
         opens = [r for r in current["records"] if r["kind"] == "round_open"
-                 and r["payload"]["round_no"] in summary["open_rounds"] and r["payload"]["head"] == head]
-        if not opens:
-            raise Refusal("round_not_open")
-        target = min(opens, key=lambda r: r["payload"]["round_no"])
-        tester = args.tester if args.tester is not None else target["payload"]["tester_job_id"]
-        payload = dict(round_no=target["payload"]["round_no"], head=head, verdict=verdict,
+                 and r["payload"]["round_no"] in summary["open_rounds"]]
+        matching = [r for r in opens if r["payload"]["head"] == head]
+        target = min(matching or opens, key=lambda r: r["payload"]["round_no"], default=None)
+        # An absent matching open is semantic evidence for the server. A
+        # complete canonical read still supplies the exact fallback round.
+        number = target["payload"]["round_no"] if target else summary["next_round_no"]
+        assigned = target["payload"]["tester_job_id"] if target else None
+        tester = args.tester if args.tester is not None else assigned
+        payload = dict(round_no=number, head=head, verdict=verdict,
                        path=path, content_b64=base64.b64encode(raw).decode("ascii"),
                        content_sha256=hashlib.sha256(raw).hexdigest(), tester_job_id=tester)
     candidate = None
@@ -1813,6 +1886,8 @@ Central commands use only the fixed account-home hk-director-1 or
 hk-operator-desk wrapper. Import seal hashes all server import records in
 the fixed snapshot; it never treats local event files as authority.
 Records prints one cursor page; follow snapshot_seq and next_after_seq.
+Raw append requires a receipt_required job and a kind without a C1 local
+projection. Rounds and completed/joined must use their typed commands.
 Completed/joined are typed adapter operations; C2 wires the main done/joined
 commands and delegated consumers. These operations do no local cleanup.
 """)
@@ -1869,8 +1944,8 @@ commands and delegated consumers. These operations do no local cleanup.
         elif args.operation == "content":
             value = client.content(args.job, args.seq)
         else:
-            value = client.append(args.job, read_request_stdin()
-                                  if args.resume is None else None, resume=args.resume)
+            value = client.append_public(args.job, read_request_stdin()
+                                         if args.resume is None else None, resume=args.resume)
     sys.stdout.buffer.write(canonical(value) + b"\n")
     return 0
 
@@ -1882,6 +1957,9 @@ if __name__ == "__main__":
         sys.stderr.write(error.line())
         raise SystemExit(error.exit)
     except ModeRefusal as error:
+        sys.stderr.write(error.line())
+        raise SystemExit(error.exit)
+    except TypedCommandRequired as error:
         sys.stderr.write(error.line())
         raise SystemExit(error.exit)
     except LocalRefusal as error:
