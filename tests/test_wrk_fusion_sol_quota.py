@@ -34,16 +34,31 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
         self.inbox = self.root / "jobs"
         self.scopefuel_log = self.root / "scopefuel.log"
         self.launch_log = self.root / "launch.log"
-        self.groups: list[tuple[int, Path]] = []
+        self.wrk_lib = self.root / "wrk-lib.sh"
+        wrk_source = (ROOT / "bin" / "wrk").read_text(encoding="utf-8")
+        self.wrk_lib.write_text(wrk_source.split('\ncase "${1:-}" in', 1)[0] + "\n",
+                                encoding="utf-8")
+        self.sentinels: list[tuple[str, Path, dict[str, str]]] = []
 
     def tearDown(self) -> None:
-        for group, pidfile in self.groups:
+        for job, pidfile, env in self.sentinels:
             try:
                 sentinel_pid = int(pidfile.read_text(encoding="utf-8").splitlines()[0])
-                if os.getpgid(sentinel_pid) == group:
-                    os.killpg(group, signal.SIGTERM)
-            except (OSError, ValueError, IndexError):
-                pass
+                stop_env = {**env, "WRK_LIBFILE": str(self.wrk_lib)}
+                subprocess.run(
+                    ["/bin/bash", "-c",
+                     '. "$WRK_LIBFILE"; stop_completion_sentinel "$1" "$2"',
+                     "wrk-test-cleanup", job, str(sentinel_pid)],
+                    cwd=ROOT,
+                    env=stop_env,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=10,
+                    check=True,
+                )
+            except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
+                raise AssertionError(f"failed to stop fixture sentinel for {job}: {exc}") from exc
         self.tmp.cleanup()
 
     def spawn(self, profile: str) -> dict:
@@ -87,7 +102,8 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
-        self.groups.append((process.pid, self.inbox / job / "completion-sentinel.pid"))
+        pidfile = self.inbox / job / "completion-sentinel.pid"
+        self.sentinels.append((job, pidfile, env))
         try:
             stdout, stderr = process.communicate(timeout=45)
         except subprocess.TimeoutExpired:
