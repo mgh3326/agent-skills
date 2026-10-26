@@ -65,6 +65,7 @@ jobs:
             tests/test-wrk-heavy-class.sh \
             tests/test-wrk-task-link.sh \
             tests/test-wrk-job-end.sh \
+            tests/test-worktree-reap.sh \
             tests/test-fleet-rev.sh \
             tests/test-gate-policy-devin-grades.sh \
             tests/test-codex-project-trust.sh \
@@ -109,6 +110,7 @@ jobs:
           bash tests/test-wrk-heavy-class.sh
           bash tests/test-wrk-task-link.sh
           bash tests/test-wrk-job-end.sh
+          bash tests/test-worktree-reap.sh
           bash tests/test-fleet-rev.sh
           bash tests/test-gate-policy-devin-grades.sh
           bash tests/test-area-propose.sh
