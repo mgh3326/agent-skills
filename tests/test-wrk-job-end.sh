@@ -6042,9 +6042,14 @@ case_hk1860_rowless_takeover() {
 # a receipt-less reclaimed ended round still authorizes the release.
 case_hk1860_rowless_ended_mode() {
   reset_case hk1860-n3-ended || return 3
+  # Mirror case_prune_receiptless_ended_quota's terminal receipt-less reclaim
+  # shape. The pass-4 scan selects its live row, then this wrapper drains it
+  # before release_job_quota_pool's status so the row-less recheck runs. Keep
+  # the injection files case-scoped: this case also runs under its mutant, and
+  # a marker left by the green run would silently leave the row in place.
   local job=hk1860-n3-ended
-  local injected="$TMP/n3-ended-injected" arbwrap="$TMP/n3-ended-arbiter"
-  local seq="$TMP/n3-ended.seq" out
+  local injected="$TMP/n3-ended-injected-$CASE_SEQ" arbwrap="$TMP/n3-ended-arbiter-$CASE_SEQ"
+  local seq="$TMP/n3-ended.seq-$CASE_SEQ" out
   mk_job "$job" w:p1 || return 3
   arb_lease "$job" || return 3
   arb release --job "$job" --resource codex --kind quota_pool >/dev/null || return 3
@@ -6069,6 +6074,7 @@ EOF
     ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
     WRK_FIXTURE_GET_SEQUENCE="$seq" \
     "$WRK" prune --apply --job "$job" --stale-age 0s 2>&1)" || return 3
+  [[ -e "$injected" ]] || return 3
   [[ "$(quota_rows "$job")" == 0 ]] || return 3
   grep -Fq "release-attempted job=$job" <<<"$out" || {
     printf '%s\n' "$out" >&2
