@@ -19,8 +19,9 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/wp2042.XXXXXX")"
 # Keep an injected mutant inside THIS run's root so tmp-writers can prove
 # ownership and stop its sentinels without a teardown failure masking RED.
 if [[ -n "${WRK_UNDER_TEST:-}" ]]; then
-  cp "$WRK" "$TMP/wrk-under-test"
-  WRK="$TMP/wrk-under-test"
+  mkdir -p "$TMP/under-test"
+  cp "$WRK" "$TMP/under-test/wrk"
+  WRK="$TMP/under-test/wrk"
 fi
 # shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
