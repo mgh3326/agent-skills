@@ -334,6 +334,10 @@ esac
 escalation_rung=0
 case "$profile@$effort" in
   opus@max|sonnet@xhigh) escalation_rung=1 ;;
+  # hk 2043: the canon row codex-sol@xhigh is the S+ escalation rung, so the
+  # normal pinned builder-sol-xhigh spelling is gate-decided (REF required).
+  # codex-sol@max stays a gate=default row (builder-sol-max needs no REF).
+  codex-sol@xhigh) escalation_rung=1 ;;
   opus@low) [[ "${WRK_GATE_738:-0}" == 1 ]] || escalation_rung=1 ;;
 esac
 # task483: the installed scopefuel's fail-closed operator-request refusals,
