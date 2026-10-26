@@ -77,6 +77,7 @@ ALL_PROFILES=(
   devin-glm52 devin-swe17 devin-ds41 devin-ds41-max
   devin-fusion-opus55 devin-fusion-sonnet55
   devin-fusion-sol61 devin-fusion-sol61-xhigh
+  pi-haiku55 pi-sonnet55 pi-opus55
   devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
@@ -313,6 +314,8 @@ Options:
                      rung the same way but take no SCOPEFUEL_E6_ARM marker.
                      Under --role builder a resolved ultra rung is still
                      refused before the marker check.
+                     pi-* seats have no MCP (--no-mcp) and must not be placed
+                     on MCP-needing tasks. Worker/tester only; default effort high.
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
                      builder refuses them pending hk 1382. Fusion-Sol
@@ -1245,6 +1248,7 @@ spawn_panewire_prompt() {
 # opencode needs a separate return after the paste to submit (pre-#498
 # behavior, kept verbatim). Only after a delivery that may have been pasted.
 spawn_opencode_submit() {
+  # pi uses herdr's normal submit; it does not need opencode's extra Return.
   [[ "$PROFILE_KIND" == opencode ]] || return 0
   case "$SPAWN_SUBMIT" in proven|accepted|unconfirmed) ;; *) return 0 ;; esac
   sleep_for 2
@@ -1266,6 +1270,64 @@ spawn_herdr_fallback() {
     --until working --until idle --until "done" --until blocked --timeout 40000 >/dev/null 2>&1; then
     "$HERDR" agent send-keys "$PANE" return >/dev/null 2>&1 || true
   fi
+}
+
+# hk 2080: prove pi runtime selection from the current pane, never argv.
+pi_model_proven() {
+  local screen
+  screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || return 1
+  # herdr exposes no model field for pi; pi get_state is RPC-only and cannot
+  # attest this interactive pane. pi 1.4.0 renders its footer immediately
+  # BELOW the editor bottom border: cwd, stats, optional extension status.
+  # Never search the transcript or pasted input for model-looking text.
+  # Unknown/custom layouts, missing provider and truncated lines fail closed.
+  printf '%s' "$screen" | python3 -c '
+import os, re, sys
+expected, effort, cwd, home, prompt = sys.argv[1:]
+def clean(text):
+    return [line.rstrip() for line in
+            re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).splitlines()]
+lines = clean(sys.stdin.read())
+while lines and not lines[-1]:
+    lines.pop()
+bottoms = [i for i, line in enumerate(lines)
+           if re.fullmatch(r"─{3,}|─+ ↓ \d+ more ─+", line)]
+if not bottoms:
+    sys.exit(1)
+bottom = bottoms[-1]
+tops = [i for i in range(bottom)
+        if re.fullmatch(r"──(?:.*─)?", lines[i])]
+if not tops or bottom - tops[-1] < 2:
+    sys.exit(1)
+footer = lines[bottom + 1:]
+if len(footer) not in (2, 3):
+    sys.exit(1)
+# Compare the evidence rows themselves, never the frame through screen end:
+# an echoed brief may be followed by an unrelated shell/extension row. Any
+# quoted cwd+stats evidence is ambiguous, including after whitespace reflow.
+with open(prompt) as brief:
+    injected = "\n".join(clean(brief.read()))
+candidate = re.sub(r"\s+", " ", "\n".join(footer[:2])).strip()
+quoted = re.sub(r"\s+", " ", injected).strip()
+if candidate in quoted:
+    sys.exit(1)
+# footer.js may abbreviate HOME and append a branch/session name. Checking
+# the launch cwd also prevents an arbitrary post-editor stats row proving it.
+paths = {cwd, os.path.realpath(cwd)}
+for path in list(paths):
+    if path == home:
+        paths.add("~")
+    elif path.startswith(home.rstrip("/") + "/"):
+        paths.add("~" + path[len(home):])
+pwd_pattern = (r"(?:" + "|".join(re.escape(p) for p in paths) +
+               r")(?: \([^\r\n]*\))?(?: • [^\r\n]+)?")
+if not re.fullmatch(pwd_pattern, footer[0]):
+    sys.exit(1)
+provider, model = expected.split("/", 1)
+pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(provider) +
+           r"\) " + re.escape(model) + r" • " + re.escape(effort) + r"$")
+sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
+' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
 
 # spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not
@@ -2628,6 +2690,7 @@ agent_foreground_exes() {
     kimi)     echo "kimi-code kimi" ;;
     kiro)     echo "kiro-cli kiro" ;;
     opencode) echo "open-code opencode" ;;
+    pi)       echo "pi" ;;
     agy)      echo "antigravity agy" ;;
     *)        echo "$1" ;;
   esac
@@ -4147,6 +4210,11 @@ resolve_profile() {
       PROFILE_KIND=kimi; KIMI_TRUST_HOME="$KIMI_CODE_LOW_HOME"; EFFORT_SUPPORTED=0; ARGS=(--auto -m kimi-code/k3)
       PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_LOW_HOME") ;;
 
+    # hk 2080: literal provider/model, like opencode; every seat disables MCP.
+    pi-haiku55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-haiku-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    pi-sonnet55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-sonnet-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+    pi-opus55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-opus-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+
     oc-kimi-code) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k2.7-code) ;;
     oc-glm) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/glm-5.2) ;;
     oc-kimi-k3) PROFILE_KIND=opencode; ARGS=(--auto --model cline-pass/cline-pass/kimi-k3) ;;
@@ -4233,6 +4301,7 @@ resolve_profile() {
     # The quota pool is still scopefuel's single `devin` pool — wrk owns no
     # pool mapping, the gate answer names the pool.
     devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;
+    pi-haiku55|pi-sonnet55|pi-opus55) GATE_PROFILE="$MODEL" ;;
     # hk 1729: Fusion-Sol profiles also gate at their exact catalog rows;
     # scopefuel supplies the codex pool recorded by arbiter.
     devin-fusion-sol61|devin-fusion-sol61-xhigh) GATE_PROFILE="$MODEL" ;;
@@ -4310,6 +4379,22 @@ resolve_profile() {
     EFFECTIVE_EFFORT="$DEFAULT_EFFORT"
   fi
 
+  if [[ "$PROFILE_KIND" == pi ]]; then
+    # pi 1.4.0 --help thinking table (director-1, hk 2080):
+    # wrk effort | pi thinking
+    # low        | low
+    # medium     | medium
+    # high       | high
+    # xhigh      | xhigh
+    # max        | max
+    # ultra is unsupported; pi off/minimal are not wrk efforts.
+    case "$EFFECTIVE_EFFORT" in
+      low|medium|high|xhigh|max) PI_THINKING="$EFFECTIVE_EFFORT" ;;
+      *) die "$MODEL: pi does not support effort '$EFFECTIVE_EFFORT'" ;;
+    esac
+    GATE_EFFORT_PIN="$PI_THINKING"
+  fi
+
   # hk 1863 (operator decision on hk 1864, recorded on hk 1863): the
   # 2026-09-26 no-max builder-seat refusal (decision 4088 B) is removed for
   # every model — max is a legal builder rung, so builder-sonnet-max,
@@ -4381,6 +4466,7 @@ resolve_profile() {
   fi
 
   case "$PROFILE_KIND" in
+    pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING") ;;
     codex) ARGS=(--yolo -m "$PROFILE_MODEL" -c "model_reasoning_effort=$EFFECTIVE_EFFORT") ;;
     kiro)
       ARGS=(chat --v3 --trust-all-tools --require-mcp-startup)
@@ -10033,6 +10119,9 @@ spawn_router_cmd() {
   # is different — the hub runs `wrk spawn` on the target without --host,
   # which is this auto path: a closed target lands no local pane, but the
   # round may still place on that target's own remotes.
+  # The explicit local leg (including SSH delegation) must name the pi
+  # profile/host/key even when the TOML itself is malformed.
+  if [[ "$requested" == local ]]; then pi_host_precheck "$router_profile"; fi
   local_spawn_resolve || return
   if [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 && "$requested" == local ]]; then
     echo "wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local" >&2
@@ -10456,6 +10545,22 @@ spawn_router_cmd() {
 # one bare integer from 30000 through 300000 and is used as a floor for each
 # kind's existing shell readiness window. An absent key leaves each default
 # unchanged; a malformed or out-of-range assignment refuses before spawn.
+# hk 2080: only the execution host calls this, before admission. Use the
+# shared strict hosts scanner, with no newer host Python requirement. Quoted
+# strings, integers, duplicates and malformed assignments are never opt-ins.
+# No caller-side host name or pi configuration grants permission.
+pi_host_precheck() {
+  local profile="${1:-${MODEL:-}}" config host
+  case "$profile" in pi-haiku55|pi-sonnet55|pi-opus55) ;; *) return 0 ;; esac
+  config="$(spillover_config)"
+  host="$(spillover_value hub machine_id 2>/dev/null || true)"
+  [[ -n "$host" ]] || host="$(hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
+  if ! local_spawn_scan || [[ "$LOCAL_PI_ANTHROPIC" -ne 1 ]]; then
+    die "$profile refused on host $host: hosts.toml [local] pi_anthropic must be literal true"
+  fi
+}
+
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -10475,13 +10580,14 @@ local_spawn_table_name() {
 
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
+  LOCAL_PI_ANTHROPIC=0
   LOCAL_HEAVY_LOAD_WAIT=1
   LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SHELL_READY_TIMEOUT_MS=0
   LOCAL_SHELL_READY_TIMEOUT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -10550,6 +10656,34 @@ local_spawn_scan() {
       return "$WRK_EXIT_CONFIG_REFUSED"
     fi
     [[ "$current" == local ]] || continue
+    # hk 2080: default-off API seat capability, using the same literal-only
+    # grammar as spawn/heavy_load_wait. Keep this in bash: execution hosts
+    # may have Python 3.9 without tomllib (director-1, 2026-10-26).
+    case "$line" in
+      pi_anthropic[A-Za-z0-9_-]*) ;; # a different bare key
+      pi_anthropic* | '"pi_anthropic"'* | "'pi_anthropic'"*)
+        if [[ "$line" =~ ^pi_anthropic[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed pi_anthropic assignment in [local] (expected 'pi_anthropic = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        pi_seen=$((pi_seen + 1))
+        if [[ "$pi_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate pi_anthropic key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) LOCAL_PI_ANTHROPIC=1 ;;
+          false) ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] pi_anthropic accepts only the bare TOML booleans true or false"
+             return "$WRK_EXIT_CONFIG_REFUSED"
+             ;;
+        esac
+        continue ;;
+    esac
     # #1492: a bare integer, with the same one-key, one-clean-assignment
     # grammar as the other strict [local] settings. Check the decimal length
     # before arithmetic so an arbitrarily large integer cannot wrap in bash.
@@ -11550,6 +11684,7 @@ spawn_cmd() {
   # routing or any spawn preparation. The resolved-model check below covers
   # future aliases too.
   refuse_known_terra_spelling
+  pi_host_precheck
   # #1155: several router paths reach spawn_cmd directly (an unclassified
   # spawn, an unreadable arbiter, a hosts.toml-less auto). The flag gate
   # repeats here so no local spawn path runs on a host whose own [local]
@@ -11608,6 +11743,8 @@ spawn_cmd() {
       codex-astra|fable) ;; # Paired round-extension flags verified before catalog.
       devin-fusion-opus55|devin-fusion-sonnet55)
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
+      pi-haiku55|pi-sonnet55|pi-opus55)
+        die "--role builder rejects '$MODEL': pi seats are worker/tester-only until reps exist (hk 2080)" ;;
       devin-fusion-sol61|devin-fusion-sol61-xhigh)
         die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
@@ -11856,6 +11993,7 @@ print(value if isinstance(value, str) else "")
   [[ "$PROFILE_KIND" == kiro ]] && START_TIMEOUT=120000 && BOOT_SETTLE=25
   [[ "$PROFILE_KIND" == kimi ]] && START_TIMEOUT=90000 && BOOT_SETTLE=20
   [[ "$PROFILE_KIND" == codex ]] && START_TIMEOUT=120000 && BOOT_SETTLE=20
+  [[ "$PROFILE_KIND" == pi ]] && START_TIMEOUT=30000 && BOOT_SETTLE=12
   if [[ "$PROFILE_KIND" == kimi || "$PROFILE_KIND" == codex ]]; then
     START_TIMEOUT_SOURCE="$PROFILE_KIND kind default"
   fi
@@ -11896,6 +12034,11 @@ print(value if isinstance(value, str) else "")
   mock_mcp_verify --require-attached || return "$WRK_EXIT_MOCK_MCP_REFUSED"
   round_ext_builder_recheck
   spawn_deliver_brief
+  if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then
+    echo "wrk: $MODEL pi model not proven: expected $PROFILE_MODEL:$PI_THINKING" >&2
+    spawn_pane_cleanup
+    return 1
+  fi
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # An older herdr may not report the tab in `tab create`; the agent knows it.
@@ -13251,7 +13394,22 @@ Older lane waiters do not honor tickets, so mixed versions can still race.
 Tickets order visible records, not process start times:
 the same starting up window and pass that already scanned described above
 apply to lanes too. A clock step can change wall-clock order; wait caps and
-the CI guard continue to use monotonic time. No holder is preempted.
+both defer guards use monotonic time. No holder is preempted. A lane waiter
+that has spent WRK_HEAVY_LANE_DEFER_MAX seconds deferring to older live lane
+waiters stops deferring for the rest of that wait (default 1800; 0 disables
+lane deferral). The bound lets a younger waiter progress past a SIGSTOPped
+older process whose identity still matches.
+
+Waiter-owner identity: current records add the process start identity after
+the established pid/class/limit prefix in the fixed head. macOS reads exact
+`ps -o lstart= -p PID` text under a fixed locale and timezone; its one-second
+precision is a known limit, with the lane deferral bound capping residual
+lane waits. Linux reads `/proc/PID/stat` field 22 with the boot id. A dead or
+mismatched owner no longer reserves capacity; `heavy status` retires it and
+audits the record, pid and reason. An unreadable identity is logged once per
+run and retained. Records written before this identity field keep their
+mixed-version rules: ticketless lane records do not reserve, while ticketless
+CI records keep their original pid-only reservation.
 
 Use --queue-key KEY (or WRK_HEAVY_QUEUE_KEY) to keep a place across a wait-cap
 exit (75). KEY is ASCII [A-Za-z0-9._-]{1,64}; the option overrides the env.
@@ -13315,6 +13473,9 @@ Environment:
   WRK_HEAVY_CI_DEFER_MAX
                         seconds a lane waiter defers to a live ci waiter
                         before it stops (default 1800, 0 = never defer)
+  WRK_HEAVY_LANE_DEFER_MAX
+                        seconds a lane waiter defers to older live lane
+                        waiters before it stops (default 1800, 0 = no deferral)
   WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
   WRK_HEAVY_QUEUE_KEY   durable re-queue key (overridden by --queue-key)
   WRK_HEAVY_REQUEUE_GRACE
@@ -13367,7 +13528,7 @@ heavy_cmd() {
     WRK_HEAVY_LOAD_WAIT_SRC="$heavy_load_wait_src" \
     WRK_HEAVY_LOAD_WAIT_ERR="$heavy_load_wait_err" \
     python3 - "$@" <<'PY'
-import datetime, fcntl, glob, json, math, os, re, socket, stat, subprocess, sys, tempfile, time
+import base64, datetime, errno, fcntl, glob, json, math, os, re, signal, socket, stat, subprocess, sys, tempfile, time
 
 EXIT_WAIT_CAP = 75  # EX_TEMPFAIL: transient, worth reporting and retrying later
 EXIT_REFUSED = 78   # EX_CONFIG: this host's configuration forbids the run
@@ -13397,12 +13558,22 @@ def read_text(path):
 
 
 def record_head(text):
-    # (pid, class, limit) of a holder/waiter record, which this process
-    # writes as `pid=N class=ci|lane limit=N since=... job=... cmd=...`. Only
-    # the first three fields are read: job and cmd are free text, and a pid=
-    # or class= token inside the command must never forge a live waiter or a
-    # ci class. A record an older wrk wrote has no class or limit: it reads
-    # as a lane waiter of unknown limit. pid -1 = unparsable.
+    # (pid, class, limit) of a holder/waiter record. New records keep the
+    # owner's start identity in the fixed head after the established
+    # pid/class/limit fields. Old records keep their original three-field
+    # meaning, including ticketless CI priority.
+    # Job/cmd are free text and can never forge a head field. pid -1 means
+    # unparsable or a start identity that no longer matches this pid.
+    pid, cls, lim = record_head_raw(text)
+    start = record_owner_start(text)
+    if pid > 0 and start is not None and owner_alive(pid, start) is False:  # hk1991-owner-alive
+        pid = -1
+    return pid, cls, lim
+
+
+def record_head_raw(text):
+    # Parse the compatible fixed prefix `pid class limit`; current records
+    # add `start=` as field four. Later fields remain free text.
     pid, cls, lim = -1, "lane", None
     toks = text.split(None, 3)[:3]
     if toks and toks[0].startswith("pid="):
@@ -13410,7 +13581,15 @@ def record_head(text):
             pid = int(toks[0][4:])
         except ValueError:
             pass
-    for tok in toks[1:]:
+    start_at = 1 if len(toks) > 1 and toks[1].startswith("start=") else None
+    if start_at is not None:
+        toks = text.split(None, 5)
+        head_tokens = toks[1:4]
+    else:
+        # Legacy fixed-head parsing deliberately scans only the first three
+        # fields; command text must remain unable to forge class or limit.
+        head_tokens = toks[1:]
+    for tok in head_tokens:
         if tok.startswith("class=") and tok[6:] in ("ci", "lane"):
             cls = tok[6:]
         elif tok.startswith("limit="):
@@ -13421,23 +13600,41 @@ def record_head(text):
     return pid, cls, lim
 
 
+def record_owner_start(text):
+    toks = text.split(None, 4)
+    if len(toks) > 3 and toks[3].startswith("start="):
+        return toks[3][6:]
+    return None
+
+
 def with_class(text):
     # status prints the class of every record; one an older wrk wrote carries
     # none, so it is shown as the lane it behaves as.
-    toks = text.split(None, 3)[:3]
+    toks = text.split(None, 5)
     if not toks or not toks[0].startswith("pid="):
         return text
-    if any(t.startswith("class=") for t in toks[1:]):
+    if len(toks) > 3 and toks[3].startswith("start="):
+        # Keep the established status line shape while the on-disk fixed head
+        # carries its owner identity after the compatible pid/class/limit.
+        start_pos = text.find(toks[3], len(toks[0]))
+        tail = text[start_pos + len(toks[3]):].lstrip()
+        prefix = text[:start_pos].rstrip()
+        return prefix + (" " + tail if tail else "")
+    if any(t.startswith("class=") for t in toks[1:3]):
         return text
     return toks[0] + " class=lane" + text[len(toks[0]):]
 
 
 def record_ticket(text):
-    # Only field four is metadata: ticket= inside a legacy cmd is free text.
-    fields = text.split(None, 4)
+    # Ticket is the first field after the fixed head in either version.
+    # ticket= inside a legacy cmd is free text.
+    fields = text.split(None, 5)
     if len(fields) < 4:
         return None
-    match = re.fullmatch(r"ticket=([0-9]{1,20}):([0-9]{1,20})", fields[3])
+    ticket_at = 4 if len(fields) > 3 and fields[3].startswith("start=") else 3
+    if len(fields) <= ticket_at:
+        return None
+    match = re.fullmatch(r"ticket=([0-9]{1,20}):([0-9]{1,20})", fields[ticket_at])
     if match:
         ticket = tuple(map(int, match.groups()))
         if all(n > 0 for n in ticket):
@@ -13525,7 +13722,7 @@ def log_event(rec):
         "host": host,
         "job": os.environ.get("ARBITER_JOB") or "-",
         "task": os.environ.get("HK_TASK_ID") or "-",
-        "pid": os.getpid(),
+        "pid": rec.get("pid", os.getpid()),
         "class": hclass,
     })
     try:
@@ -13535,6 +13732,119 @@ def log_event(rec):
     except OSError as e:
         print("wrk heavy: cannot write heavy log %s: %s" % (log_path, e),
               file=sys.stderr)
+
+
+owner_unknown_logged = False
+owner_last_reason = ""
+
+
+def process_start_identity(pid):
+    # macOS lstart is locale/timezone dependent and has leading padding on
+    # some ps versions. Pin both settings and base64 the full text (minus only
+    # its line ending) into one record-head token, then compare it by string
+    # equality. lstart has one-second precision; the lane deferral bound caps
+    # any residual wait from same-second PID reuse. Linux keeps the kernel
+    # starttime ticks (field 22) and boot id, never a rounded wall-clock second.
+    if sys.platform == "darwin":
+        try:
+            proc = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                env={"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
+                capture_output=True, text=True, timeout=2, check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        value = proc.stdout
+        if value.endswith("\n"):
+            value = value[:-1]
+        if value.endswith("\r"):
+            value = value[:-1]
+        if proc.returncode != 0 or not value.strip():
+            return None
+        exact_text = base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+        return "mac-" + exact_text
+    if sys.platform.startswith("linux"):
+        try:
+            with open("/proc/%d/stat" % pid, encoding="ascii") as f:
+                stat_text = f.read()
+            # comm is parenthesized and may itself contain spaces or ')'.
+            fields = stat_text[stat_text.rfind(")") + 1:].split()
+            if len(fields) <= 19:
+                return None
+            start_ticks = fields[19]  # proc stat field 22; preserve its precision
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+                boot_id = f.read().strip()
+            if not boot_id or not start_ticks.isdigit():
+                return None
+            return "linux-%s-%s" % (boot_id, start_ticks)
+        except (OSError, UnicodeError, IndexError):
+            return None
+    return None
+
+
+def owner_unknown(pid, reason):
+    global owner_unknown_logged
+    if not owner_unknown_logged:
+        owner_unknown_logged = True
+        log_event({"kind": "owner_identity_unknown", "pid": pid,
+                   "reason": reason})
+
+
+def owner_alive(pid, start):
+    # True means kill(0) succeeded and the current process start identity
+    # exactly matches the fixed record head. False is proof of death, EPERM,
+    # or a different process at this pid. None is unreadable/unknown and must
+    # retain today's reservation behavior. Records without start= never call
+    # this helper; their mixed-version semantics stay unchanged.
+    global owner_last_reason
+    owner_last_reason = ""
+    if pid <= 0:
+        owner_last_reason = "invalid owner pid"
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        owner_last_reason = "owner process is gone"
+        return False
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            owner_last_reason = "owner process is gone"
+            return False
+        if exc.errno == errno.EPERM:
+            owner_last_reason = "kill(pid, 0) returned EPERM"
+            return False
+        owner_last_reason = "kill(pid, 0) failed: %s" % exc
+        owner_unknown(pid, owner_last_reason)
+        return None
+
+    if start == "unknown":
+        owner_last_reason = "record start identity was unavailable when published"
+        owner_unknown(pid, owner_last_reason)
+        return None
+    actual = process_start_identity(pid)
+    if actual is None:
+        # Close the common exit race without treating a live but unreadable
+        # /proc or ps result as proof of death.
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            owner_last_reason = "owner process exited during identity lookup"
+            return False
+        except OSError as exc:
+            if exc.errno in (errno.ESRCH, errno.EPERM):
+                owner_last_reason = (
+                    "owner process is gone" if exc.errno == errno.ESRCH
+                    else "kill(pid, 0) returned EPERM"
+                )
+                return False
+        owner_last_reason = "process start identity could not be read"
+        owner_unknown(pid, owner_last_reason)
+        return None
+    if actual != start:
+        owner_last_reason = "start identity mismatch"
+        return False
+    owner_last_reason = "start identity matches"
+    return True
 
 
 def owner_trusted(st):
@@ -13801,11 +14111,19 @@ if args[0] == "status":
         except OSError:
             continue
         info = read_waiter_record(wfd, name)
-        # The pid is the first field of the record we write — never scan
-        # later fields, or a `pid=` token inside the command text would make
-        # a live waiter look dead here (record_head reads the head only).
-        pid = record_head(info)[0]
-        if pid > 0 and not alive(pid):
+        # Parse the fixed head only. Current records prove owner identity;
+        # pre-change records retain their pid-only cleanup rule.
+        pid = record_head_raw(info)[0]
+        start = record_owner_start(info)
+        reason = None
+        if pid > 0 and start is not None:
+            if owner_alive(pid, start) is False:
+                reason = owner_last_reason or "owner identity no longer matches"
+        elif pid > 0 and not alive(pid):
+            reason = "legacy record owner process is gone"
+        if reason is not None:
+            log_event({"kind": "waiter.retired", "record": name,
+                       "pid": pid, "reason": reason})
             try:
                 os.remove(name, dir_fd=wfd)
             except OSError:
@@ -13876,11 +14194,23 @@ except ValueError:
     defer_max = -1.0
 if not defer_max >= 0:
     fail("WRK_HEAVY_CI_DEFER_MAX is not a non-negative number", 2)
+# Lane FIFO has its own starvation bound. It measures only time spent
+# deferring to an older live lane record, on this waiter's monotonic clock.
+try:
+    lane_defer_max = float(os.environ.get("WRK_HEAVY_LANE_DEFER_MAX", "1800"))
+except ValueError:
+    lane_defer_max = -1.0
+if not lane_defer_max >= 0:
+    fail("WRK_HEAVY_LANE_DEFER_MAX is not a non-negative number", 2)
 cmd_summary = " ".join(cmd)
-# class and limit stay in the fixed head of the record (record_head): a ci
-# waiter's limit tells a lane waiter which slots that ci waiter could take.
-info = "pid=%d class=%s limit=%d since=%s job=%s cmd=%s" % (
-    os.getpid(), hclass, limit,
+# Keep the established pid/class/limit prefix and add owner identity as the
+# fourth fixed-head field; the ticket follows that complete head.
+owner_start = process_start_identity(os.getpid())
+if owner_start is None:
+    owner_start = "unknown"
+    owner_unknown(os.getpid(), "writer process start identity could not be read")
+info = "pid=%d class=%s limit=%d start=%s since=%s job=%s cmd=%s" % (
+    os.getpid(), hclass, limit, owner_start,
     datetime.datetime.now().isoformat(timespec="seconds"),
     os.environ.get("ARBITER_JOB") or "-", cmd_summary)
 started_at = time.monotonic()
@@ -14123,6 +14453,13 @@ defer_mark = None
 defer_seen = False   # held back at least once: a defer row is owed
 defer_over = False   # guard fired: no more deferral for the rest of the wait
 defer_logged = False
+# Separate monotonic accounting for a lane waiter deferred to older lane
+# tickets; spending this guard never changes the CI reservation guard above.
+lane_defer_total = 0.0
+lane_defer_mark = None
+lane_defer_seen = False
+lane_defer_over = False
+lane_defer_logged = False
 record_tmp = None    # mkstemp path mid-publish; every exit path drops it
 
 
@@ -14192,6 +14529,28 @@ def end_defer(reason):
                "reason": reason})
 
 
+def end_lane_defer(reason):
+    global lane_defer_logged
+    if not lane_defer_seen or lane_defer_logged:
+        return
+    lane_defer_logged = True
+    now = time.monotonic()
+    spent = lane_defer_total + (
+        (now - lane_defer_mark) if lane_defer_mark is not None else 0
+    )
+    log_event({"kind": "lane_defer", "cmd": cmd_summary[:200],
+               "limit": limit, "wait_s": round(now - started_at, 3),
+               "defer_s": round(spent, 3), "reason": reason})
+
+
+def wait_signal(signum, frame):
+    # The finally block removes this waiter's record and releases any held
+    # descriptors. Reset to the prior shell-style signal exit code.
+    end_defer("signal")
+    end_lane_defer("signal")
+    raise SystemExit(128 + signum)
+
+
 def publish_record():
     # The waiter record is published atomically: written under a dot name
     # that status and the ci scan skip, then renamed into place, so a lane
@@ -14253,6 +14612,8 @@ for _sp in slot_paths:
              "with one link owned by uid %d or root)" % (_sp, os.getuid()),
              EXIT_REFUSED)
     slot_fds.append(_fd)
+previous_sighup = signal.signal(signal.SIGHUP, wait_signal)
+previous_sigterm = signal.signal(signal.SIGTERM, wait_signal)
 try:
     publish_record()
     while True:
@@ -14287,8 +14648,26 @@ try:
                     defer_total += now - defer_mark
                     defer_mark = None
             # CI keeps its existing guard and log clock; lane FIFO is a
-            # separate reservation and is never waived by spending it.
+            # separate reservation and is never waived by spending the CI
+            # guard. Its independent bound is measured on this waiter's clock.
             lane_limit = lane_reserved() if hclass == "lane" else 0
+            if hclass == "lane":
+                now = time.monotonic()
+                if lane_limit and lane_defer_max > 0 and not lane_defer_over:
+                    if lane_defer_mark is None:
+                        lane_defer_mark = now
+                        lane_defer_seen = True
+                    if lane_defer_total + (now - lane_defer_mark) >= lane_defer_max:
+                        lane_defer_total += now - lane_defer_mark
+                        lane_defer_mark = None
+                        lane_defer_over = True
+                        lane_limit = 0
+                        end_lane_defer("guard")
+                elif lane_defer_mark is not None:
+                    lane_defer_total += now - lane_defer_mark
+                    lane_defer_mark = None
+                if lane_defer_max == 0 or lane_defer_over:
+                    lane_limit = 0
             for i, sfd in enumerate(slot_fds):
                 if i < reserved:
                     continue
@@ -14303,6 +14682,7 @@ try:
             if held_fd is not None:
                 break
             if time.monotonic() >= deadline:
+                end_lane_defer("cap")
                 end_defer("cap")
                 save_position()
                 log_event({"kind": "wait_cap", "phase": "slot",
@@ -14313,11 +14693,13 @@ try:
             time.sleep(0.5)
         except KeyboardInterrupt:
             end_defer("interrupt")
+            end_lane_defer("interrupt")
             fail("interrupted while waiting for a heavy slot on %s "
                  "-- command not run" % lock_path, 130)
     acquired_at = time.monotonic()
     consume_position()
     end_defer("acquired")
+    end_lane_defer("acquired")
     try:
         os.remove(me_name, dir_fd=waiters_fd)
     except OSError:
@@ -14355,6 +14737,17 @@ try:
             fail("interrupted while waiting for load to drop "
                  "-- command not run", 130)
     run_at = time.monotonic()
+    # Preserve inherited ignored dispositions (for example, from nohup) for
+    # the child. Caught handlers cannot survive exec, so the other inherited
+    # disposition is SIG_DFL.
+    if previous_sighup == signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    else:
+        signal.signal(signal.SIGHUP, signal.SIG_DFL)
+    if previous_sigterm == signal.SIG_IGN:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    else:
+        signal.signal(signal.SIGTERM, signal.SIG_DFL)
     try:
         rc = run_command()
     except SystemExit as e:
@@ -14363,6 +14756,7 @@ try:
     raise SystemExit(rc)
 finally:
     end_defer("exit")
+    end_lane_defer("exit")
     for leftover in (me_name, record_tmp,
                      ".%d.tmp" % os.getpid()):
         if leftover is None:

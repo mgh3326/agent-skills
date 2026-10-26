@@ -156,8 +156,8 @@
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
     ".github/workflows/ci.yml": "cf352bd05a9920972d90c69075cdce16f7dc70d7ec977bfc77a9c6c6a292b038",
-    "bin/arbiter": "ac2349402cbbd066bd1bdd18b6de5e57e42c902b339cc24c8a9b35d38a49be97",
-    "bin/wrk": "0ffb28d4304f684f2df10eaa2e94044fea670b45289d86be08475ec9595a2e23",
+    "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
+    "bin/wrk": "1dd76d75d858a04cbc690ade8c75abb2b62b10dac3e7bdc4f955f68ae27b327a",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
     "builder/SKILL.md": "116315fcfcff000c4933b62068b128e7bfecf820e7b72f238c1bd8c227722713",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
@@ -2120,6 +2120,57 @@
         "T1",
         "T2"
       ]
+    },
+    "pi-haiku55": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null,
+        "medium": null,
+        "xhigh": null
+      },
+      "launcher": "pi",
+      "launcher_model_token": "PROFILE_MODEL=anthropic/claude-haiku-5-5",
+      "model": "claude-haiku-5-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "pi-sonnet55": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null,
+        "medium": null,
+        "xhigh": null
+      },
+      "launcher": "pi",
+      "launcher_model_token": "PROFILE_MODEL=anthropic/claude-sonnet-5-5",
+      "model": "claude-sonnet-5-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
+    },
+    "pi-opus55": {
+      "default_effort": "high",
+      "family": "anthropic",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null,
+        "medium": null,
+        "xhigh": null
+      },
+      "launcher": "pi",
+      "launcher_model_token": "PROFILE_MODEL=anthropic/claude-opus-5-5",
+      "model": "claude-opus-5-5",
+      "role_status": "unknown",
+      "roles": [],
+      "surfaces": []
     }
   },
   "required_ci_jobs_by_repo": {
