@@ -5244,11 +5244,31 @@ wrk_o3() {
   python3 "$WRK_O3_PY" "$@"
 }
 
+# True when this account has a records-mode file. Without one every command is
+# legacy and the adapter is never consulted, so the O2 paths (and a copy of
+# this file run on its own) behave exactly as before. The adapter itself
+# validates the file and the account home whenever it is consulted.
+o3_mode_file_present() {
+  local home
+  if [[ "${WRK_TEST_MODE:-}" == 1 ]]; then
+    home="${HOME:-}"
+  else
+    home="$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)" || home=""
+  fi
+  # An undeterminable home is not legacy: the adapter decides, fail closed.
+  [[ -n "$home" ]] || return 0
+  [[ -e "$home/.config/wrk/records-mode" || -L "$home/.config/wrk/records-mode" ]]
+}
+
 # o3_call OP ARGS... — sets O3_OUT (stdout) and O3_RC; stderr passes through.
 # O3_OUT=LEGACY means the job is not enrolled (or the mode is legacy) and the
-# caller continues on its O2 path.
+# caller continues on its O2 path. Central desk commands always run.
 o3_call() {
   O3_RC=0
+  if [[ "${1:-}" != central ]] && ! o3_mode_file_present; then
+    O3_OUT=LEGACY
+    return 0
+  fi
   O3_OUT="$(wrk_o3 "$@" </dev/null)" || O3_RC=$?
 }
 
@@ -6508,9 +6528,24 @@ PY
   esac
 }
 
+# hk 1926: the typed void of an enrolled job (wrk round void JOB N --grant SEQ).
+round_void_o3() {
+  local job="$1" round_number="$2" void_grant="$3" reason_code="$4" metadata owner label pane parent role
+  wrk_trust_guard
+  metadata="$(builder_metadata "$job" trusted)"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round void" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  local o3_args=(round-void "$job" --round "$round_number" --grant "$void_grant" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
+  [[ -z "$reason_code" ]] || o3_args+=(--reason-code "$reason_code")
+  o3_call "${o3_args[@]}"
+  o3_exit_on_error
+  [[ "$O3_OUT" != LEGACY ]] || die "round void: --grant and --reason-code are for an O3 job; job $job is on the O2 path (use --by REF)"
+  printf '%s\n' "$O3_OUT"
+}
+
 round_void_cmd() {
   local job="${1:-}" round_number="${2:-}" ref="" reason="" metadata owner label pane parent role
-  local grant="" reason_code=""
+  local void_grant="" reason_code=""
   [[ -n "$job" && "$job" != -* ]] || die "round void requires a job id"
   [[ "$round_number" =~ ^[1-9][0-9]*$ ]] || die "round void requires a positive round number"
   shift 2 || true
@@ -6518,29 +6553,25 @@ round_void_cmd() {
     case "$1" in
       --by) [[ $# -ge 2 && -n "$2" ]] || die "--by requires a hk:doc/<key> or hk:task/<id> ref"; ref="$2"; shift 2 ;;
       --reason) [[ $# -ge 2 && -n "$2" ]] || die "--reason requires text"; reason="$2"; shift 2 ;;
-      --grant) [[ $# -ge 2 && -n "$2" ]] || die "--grant requires a void grant record seq"; grant="$2"; shift 2 ;;
+      --grant) [[ $# -ge 2 && -n "$2" ]] || die "--grant requires a void grant record seq"; void_grant="$2"; shift 2 ;;
       --reason-code) [[ $# -ge 2 && -n "$2" ]] || die "--reason-code requires a code"; reason_code="$2"; shift 2 ;;
       *) die "unknown round void option '$1'" ;;
     esac
   done
-  [[ -n "$ref" || -n "$grant" ]] || die "round void requires --by REF (O2) or --grant SEQ (O3)"
-  if [[ -n "$ref" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
+  [[ -z "$ref" || -z "$void_grant$reason_code" ]] || die "round void takes --by REF (O2) or --grant SEQ (O3), not both"
+  if [[ -z "$ref" && -n "$void_grant" ]]; then
+    round_void_o3 "$job" "$round_number" "$void_grant" "$reason_code"
+    return 0
+  fi
+  [[ -n "$ref" ]] || die "round void requires --by REF"
+  wrk_trust_guard hk
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
   wrk_refuse_ended "round void" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
-  # hk 1926: an enrolled job voids on the server with a typed void grant.
-  local o3_args=(round-void "$job" --round "$round_number" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
-  [[ -z "$grant" ]] || o3_args+=(--grant "$grant")
-  [[ -z "$reason_code" ]] || o3_args+=(--reason-code "$reason_code")
-  [[ -z "$ref" ]] || o3_args+=(--o2-ref "$ref")
-  o3_call "${o3_args[@]}"
+  # hk 1926: an enrolled job never voids with a free ref; the adapter refuses it.
+  o3_call round-void "$job" --round "$round_number" --o2-ref "$ref"
   o3_exit_on_error
-  if [[ "$O3_OUT" != LEGACY ]]; then
-    printf '%s\n' "$O3_OUT"
-    return 0
-  fi
-  [[ -z "$grant$reason_code" ]] || die "round void: --grant and --reason-code are for an O3 job; job $job is on the O2 path (use --by REF)"
-  [[ -n "$ref" ]] || die "round void requires --by REF"
+  [[ "$O3_OUT" == LEGACY ]] || die "round void: unexpected O3 answer for a free ref: $O3_OUT"
 
   local tmp_approval grant grant_issuer
   tmp_approval="$(mktemp)"
@@ -6874,12 +6905,13 @@ round_audit_cmd() {
   # hk 1894: the audit reads the canonical inbox, so a redirected inbox cannot
   # make a builder with no recorded rounds look clean.
   wrk_trust_guard
-  local jobs_root o3_mode
+  local jobs_root
+  local o3_mode=legacy
   jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   [[ -d "$jobs_root" ]] || return 0
   # hk 1926: outside legacy mode a job directory holding O3 state is audited
   # from the server (labelled), every other row stays the O2 census.
-  o3_mode="$(wrk_o3 mode)" || exit $?
+  if o3_mode_file_present; then o3_mode="$(wrk_o3 mode)" || exit $?; fi
   local job_dir job scan ended owner lane_ok role recorded blocks line tag rest o3_row
   # find -H below: the checked inbox may itself be a symlink (the guard returns the
   # canonical spelling); without -H find walks nothing and the audit looks clean.
@@ -11175,13 +11207,13 @@ refuse_known_terra_spelling() {
 # not-enrolled spawn keeps every legacy call exactly as before.
 O3_SPAWN_VERIFIED=0
 o3_spawn_handshake() {
-  local phase="$1" mode
+  local phase="$1" mode=legacy
   if [[ "$phase" == commit ]]; then
     [[ "$O3_SPAWN_VERIFIED" == 1 ]] || return 0
   else
     O3_SPAWN_VERIFIED=0
   fi
-  mode="$(wrk_o3 mode </dev/null)" || exit $?
+  if o3_mode_file_present; then mode="$(wrk_o3 mode </dev/null)" || exit $?; fi
   if [[ "$mode" == legacy ]]; then
     [[ -z "$SPAWN_O3_HEAD$SPAWN_O3_EXT$SPAWN_O3_REP" ]] ||
       die "--head, --extension-grant and --repeat-grant are for an O3 review spawn; records mode is legacy"
