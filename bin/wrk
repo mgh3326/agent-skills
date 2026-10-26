@@ -12886,7 +12886,7 @@ def record_head_raw(text):
     # Parse only the fixed prefix: legacy `pid class limit` or current
     # `pid start class limit`. A later pid=/class=/limit= token is free text.
     pid, cls, lim = -1, "lane", None
-    toks = text.split(None, 5)
+    toks = text.split(None, 3)[:3]
     if toks and toks[0].startswith("pid="):
         try:
             pid = int(toks[0][4:])
@@ -12894,6 +12894,8 @@ def record_head_raw(text):
             pass
     start_at = 1 if len(toks) > 1 and toks[1].startswith("start=") else None
     head_end = 4 if start_at is not None else 3
+    if start_at is not None:
+        toks = text.split(None, 5)
     for tok in toks[1:head_end]:
         if tok.startswith("class=") and tok[6:] in ("ci", "lane"):
             cls = tok[6:]
