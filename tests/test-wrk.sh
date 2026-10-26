@@ -10360,6 +10360,89 @@ assert d["recent_event_kinds"].count("job.reclaim") == 1, d
 '
 echo "PASS ROB-1326 AC2 released duplicate reclaimed then spawned: $released_dup_out"
 
+# hk 2105: wrk must recover both the same-run quota cleanup shape and the
+# row-less shape left after an earlier gc removed quota while a path lease
+# still protected the job. Both paths use an old claim so hk 1992's grace is
+# honored, then exercise wrk's ordinary released-job reclaim without an override.
+age_arbiter_claim() {
+  python3 - "$XDG_DATA_HOME/arbiter/state.db" "$1" <<'PY'
+import datetime, json, sqlite3, sys
+db, job = sys.argv[1], sys.argv[2]
+created_at = (datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+              - datetime.timedelta(minutes=11)).isoformat()
+with sqlite3.connect(db) as con:
+    rows = con.execute(
+        "SELECT seq, payload FROM events WHERE job_id = ?"
+        " AND kind IN ('job.claim', 'job.reclaim', 'job.spawned')", (job,)
+    ).fetchall()
+    for seq, body in rows:
+        event = json.loads(body)
+        event["created_at"] = created_at
+        con.execute("UPDATE events SET created_at = ?, payload = ? WHERE job_id = ? AND seq = ?",
+                    (created_at, json.dumps(event, ensure_ascii=False, sort_keys=True), job, seq))
+    con.execute("UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+                (created_at, created_at, job))
+PY
+}
+orphan_respawn_2105() {
+  local variant="$1"
+  local job="orphan-2105-$variant"
+  local XDG_DATA_HOME="$TMP/$job-data"
+  local ARBITER_INBOX_ROOT="$TMP/$job-inbox"
+  local TEST_ARBITER_BIN="$ARBITER"
+  local orphan_spawn orphan_spawn_rc
+  export XDG_DATA_HOME ARBITER_INBOX_ROOT TEST_ARBITER_BIN
+  "$ARBITER" claim --job "$job" --agent-label "gone-$variant" \
+    --lane fixture --t T2 >/dev/null
+  "$SCOPEFUEL" gate -m codex-luna-max >"$TMP/$job-gate"
+  "$ARBITER" lease --job "$job" --kind quota_pool --profile codex-luna-max \
+    --gate-output "$TMP/$job-gate" >/dev/null
+  printf '%s\n' '{"result":{"agents":[]}}' >"$TMP/$job-agents.json"
+  age_arbiter_claim "$job"
+  if [[ "$variant" == "prior-gc-rowless" ]]; then
+    "$ARBITER" lease --job "$job" --resource recovery-path --kind path >/dev/null
+    "$ARBITER" gc --herdr-agent-list "$TMP/$job-agents.json" >/dev/null
+    "$ARBITER" status --job "$job" --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["jobs"][0]["state"] == "leased" and d["quota_pool_records"] == [] and len(d["leases"]) == 1, d
+'
+    # The ordinary path-release command also marks the job released. Remove
+    # this fixture lease row directly to model the persisted row-less leased
+    # shape left after the earlier gc, without changing the job state.
+    python3 - "$XDG_DATA_HOME/arbiter/state.db" "$job" <<'PY'
+import sqlite3, sys
+with sqlite3.connect(sys.argv[1]) as con:
+    con.execute("DELETE FROM leases WHERE job_id = ? AND kind = 'path'", (sys.argv[2],))
+PY
+    "$ARBITER" status --job "$job" --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["jobs"][0]["state"] == "leased" and d["quota_pool_records"] == [] and d["leases"] == [], d
+'
+  fi
+  "$ARBITER" gc --herdr-agent-list "$TMP/$job-agents.json" >/dev/null
+  set +e
+  orphan_spawn="$(spawn_base codex-luna --job "$job" --t T2 2>&1)"
+  orphan_spawn_rc=$?
+  set -e
+  TW_TMP="$ARBITER_INBOX_ROOT" tmp_writers_stop || \
+    fail "hk2105 $variant fixture writer did not stop"
+  [[ "$orphan_spawn_rc" -eq 0 ]] || fail "hk2105 $variant respawn failed: $orphan_spawn"
+  grep -q '^OK ' <<<"$orphan_spawn" || fail "hk2105 $variant respawn failed: $orphan_spawn"
+  "$ARBITER" job-get --job "$job" --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["state"] == "leased", d
+assert d["recent_event_kinds"].count("job.orphan_release") == 1, d
+assert d["recent_event_kinds"].count("job.reclaim") == 1, d
+'
+}
+orphan_respawn_2105 same-run
+echo "PASS hk2105 same-run orphan gc respawn without duplicate override"
+orphan_respawn_2105 prior-gc-rowless
+echo "PASS hk2105 prior-gc row-less orphan respawn without duplicate override"
+
 # AC3: once a live arbiter reported duplicate, an unreadable state is itself a
 # fail-closed condition.  The proxy fails only the actual lookup, not --help.
 arb claim --job idem-unknown --agent-label unknown-owner --lane unknown-lane --t T1 >/dev/null
