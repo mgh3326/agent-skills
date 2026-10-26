@@ -5251,7 +5251,9 @@ wrk_o3() {
 o3_mode_file_present() {
   local home
   if [[ "${WRK_TEST_MODE:-}" == 1 ]]; then
-    home="${HOME:-}"
+    # Test mode with HOME unset is legacy and reads no path.
+    [[ -n "${HOME:-}" ]] || return 1
+    home="$HOME"
   else
     home="$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)" || home=""
   fi

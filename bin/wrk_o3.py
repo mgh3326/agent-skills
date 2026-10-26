@@ -471,7 +471,10 @@ def account_home():
 
 def records_mode():
     """Q2 (esc-1 ruling): one word in <account home>/.config/wrk/records-mode.
-    Missing means legacy; unreadable or unknown fails closed."""
+    Missing means legacy; unreadable or unknown fails closed. In test mode with
+    HOME unset the mode is legacy and no path is read (director-1 parity note)."""
+    if test_mode() and not os.environ.get("HOME"):
+        return "legacy"
     path = os.path.join(account_home(), ".config", "wrk", "records-mode")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)

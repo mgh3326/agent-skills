@@ -1194,6 +1194,31 @@ class ShadowCase(O3Case):
         w.mode("required")
         self.assertRc(w.run("round", "open", "job-z", "--head", w.heads[1]), 66, "not_found")
 
+    def test_test_mode_with_home_unset_is_legacy_and_reads_no_path(self):
+        """director-1 parity note. bin/wrk itself needs HOME (line 5 predates
+        O3), so the two mode readers are run directly: the adapter's and the
+        bash mode-file check extracted from bin/wrk."""
+        w = self.world()
+        w.mode("enforce-please")
+        out = w.adapter("mode", HOME=None)
+        self.assertRc(out, 0)
+        self.assertEqual(out.stdout.strip(), "legacy")
+        text = (BIN / "wrk").read_text()
+        start = text.index("o3_mode_file_present() {")
+        function = text[start:text.index("\n}\n", start) + 3]
+        probe = subprocess.run(["bash", "-c", function + "o3_mode_file_present"], env=w.env(HOME=None),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(probe.returncode, 1, probe.stderr)
+        probe = subprocess.run(["bash", "-c", function + "o3_mode_file_present"], env=w.env(),
+                               stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.assertEqual(probe.returncode, 0, "with HOME set the mode file is found")
+        # Outside test mode only the passwd home decides, whatever HOME says.
+        p = self.world(production=True)
+        p.mode("enforce-please")
+        out = p.adapter("mode", HOME=p.base / "elsewhere")
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("records_mode_invalid", out.stderr)
+
     def test_records_mode_file_fails_closed(self):
         w = self.world()
         w.local_claim("job-a")
