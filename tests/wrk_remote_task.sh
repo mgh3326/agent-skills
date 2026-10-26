@@ -174,7 +174,8 @@ import pathlib, shlex, subprocess, sys
 pid = pathlib.Path(sys.argv[1]).read_text().split()[0]
 command = subprocess.check_output(["ps", "-p", pid, "-o", "command="], text=True)
 args = shlex.split(command)
-assert args[args.index("sentinel") + 5] == sys.argv[2], "hk2042 target sentinel report path: " + command
+# wrk resolves the inbox; macOS /var and /tmp are aliases of /private paths.
+assert args[args.index("sentinel") + 5] == str(pathlib.Path(sys.argv[2]).resolve()), "hk2042 target sentinel report path: " + command
 PATHCHECK
 printf '%s\n' 'PASS wrk-remote-task T1-remote-env-and-empty-target-arbiter'
 

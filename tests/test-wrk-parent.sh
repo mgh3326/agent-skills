@@ -155,7 +155,8 @@ import shlex, subprocess, sys
 pid = Path(sys.argv[1]).read_text().split()[0]
 command = subprocess.check_output(["ps", "-p", pid, "-o", "command="], text=True)
 args = shlex.split(command)
-assert args[args.index("sentinel") + 5] == sys.argv[2], "local sentinel report path: " + command
+# wrk resolves the inbox; macOS /var and /tmp are aliases of /private paths.
+assert args[args.index("sentinel") + 5] == str(Path(sys.argv[2]).resolve()), "local sentinel report path: " + command
 LOCAL_PATH
 claim_payload="$(event_payload child job.claim)"
 grep -qE '"owner_lane" *: *"builder-current"' <<<"$claim_payload" ||
