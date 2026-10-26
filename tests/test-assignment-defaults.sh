@@ -923,7 +923,7 @@ echo "PASS builder-sol --effort ultra still dies on the builder-seat rule"
 # gate=default row), launches max and consults the catalog at max. builder-sol-xhigh
 # is the other normal pinned spelling; codex-sol@xhigh is an escalation rung at
 # S+, so the gate still decides admission and the spawn carries a REF.
-: >"$TMP/herdr.log" "$TMP/launch.log" "$TMP/scopefuel.log"
+: >"$TMP/herdr.log"; : >"$TMP/launch.log"; : >"$TMP/scopefuel.log"
 out="$(SCOPEFUEL_E6_ARM='' \
   spawn_t736 builder-sol-max --role builder --lane builder-lane --parent parent-lane \
   --job t736-e6-max 2>&1)" || fail "unmarked builder-sol-max must be admitted: $out"
@@ -935,7 +935,7 @@ grep -qF 'gate -m codex-sol --effort max' "$TMP/scopefuel.log" ||
   fail "builder-sol-max must ask the gate about codex-sol@max: $(cat "$TMP/scopefuel.log")"
 echo "PASS builder-sol-max spawns unmarked at the S+ gate=default row and records codex-sol@max"
 
-: >"$TMP/herdr.log" "$TMP/launch.log" "$TMP/scopefuel.log"
+: >"$TMP/herdr.log"; : >"$TMP/launch.log"; : >"$TMP/scopefuel.log"
 set +e
 out="$(SCOPEFUEL_E6_ARM='' \
   spawn_t736 builder-sol-xhigh --role builder --lane builder-lane --parent parent-lane \
@@ -944,6 +944,9 @@ rc=$?
 set -e
 [[ "$rc" -eq 3 ]] ||
   fail "builder-sol-xhigh without --operator-request must hit the gate escalation refusal (rc=$rc): $out"
+# The refused run wrote its own consult and gate lines; clear every log so the
+# admitted-run assertions below can only be satisfied by the admitted run.
+: >"$TMP/herdr.log"; : >"$TMP/launch.log"; : >"$TMP/scopefuel.log"
 out="$(SCOPEFUEL_E6_ARM='' \
   spawn_t736 builder-sol-xhigh --role builder --lane builder-lane --parent parent-lane \
   --operator-request hk:task/2043 --job t736-sol-xhigh 2>&1)" ||
@@ -967,7 +970,7 @@ set -e
 [[ "$rc" -eq 2 ]] || fail "unmarked builder-luna-high must die rc 2 (rc=$rc): $out"
 grep -q 'SCOPEFUEL_E6_ARM=codex-luna@high' <<<"$out" ||
   fail "unmarked builder-luna-high refusal must name the marker: $out"
-: >"$TMP/herdr.log" "$TMP/launch.log"
+: >"$TMP/herdr.log"; : >"$TMP/launch.log"
 out="$(SCOPEFUEL_E6_ARM=codex-luna@high \
   spawn_t736 builder-luna-high --role builder --lane builder-lane --parent parent-lane \
   --job t736-luna-high 2>&1)" || fail "armed builder-luna-high must be admitted: $out"
@@ -990,7 +993,7 @@ set -e
 [[ "$rc" -eq 2 ]] || fail "unmarked builder-haiku-medium must die rc 2 (rc=$rc): $out"
 grep -q 'SCOPEFUEL_E6_ARM=haiku@medium' <<<"$out" ||
   fail "unmarked builder-haiku-medium refusal must name the marker: $out"
-: >"$TMP/herdr.log" "$TMP/launch.log" "$TMP/scopefuel.log"
+: >"$TMP/herdr.log"; : >"$TMP/launch.log"; : >"$TMP/scopefuel.log"
 out="$(SCOPEFUEL_E6_ARM=haiku@medium \
   spawn_t736 builder-haiku-medium --role builder --lane builder-lane --parent parent-lane \
   --job t736-haiku-medium 2>&1)" || fail "armed builder-haiku-medium must be admitted: $out"
