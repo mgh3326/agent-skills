@@ -64,6 +64,21 @@ seed_join_round() {
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
 export ARBITER_BIN="$TMP/absent-arbiter"
+# hk 1439: the suite never reaches the real scopefuel through bin/arbiter's PATH
+# fallback (scopefuel_bin). SCOPEFUEL_BIN is suite-wide; per-command overrides stay.
+# Tripwire: scopefuel/devin/kimi shims sit first on PATH, log their argv and exit 99,
+# and the end-of-suite check fails on any logged call. Every PATH edit below only
+# prepends, so the shim dir stays reachable.
+export SCOPEFUEL_BIN="$SCOPEFUEL"
+TRIPWIRE_LOG="$TMP/tripwire.log"; : >"$TRIPWIRE_LOG"
+export TRIPWIRE_LOG
+mkdir -p "$TMP/tripwire-bin"
+for tw_name in scopefuel devin kimi; do
+  printf '%s\n' '#!/bin/sh' \
+    "printf '%s\\n' \"$tw_name \$*\" >>\"\$TRIPWIRE_LOG\"" 'exit 99' >"$TMP/tripwire-bin/$tw_name"
+  chmod +x "$TMP/tripwire-bin/$tw_name"
+done
+export PATH="$TMP/tripwire-bin:$PATH"
 export XDG_DATA_HOME="$TMP/xdg"
 export XDG_CACHE_HOME="$TMP/xdg-cache"
 export XDG_CONFIG_HOME="$TMP/xdg-config"
@@ -7154,7 +7169,7 @@ set -e
 if grep -q '^pane close ' "$TMP/herdr.log"; then
   fail "WRK_KEEP_FAILED_PANE=1 still closed the pane"
 fi
-grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close w:t1' <<<"$t1895_keep_out" ||
+grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close w:p1' <<<"$t1895_keep_out" ||
   fail "1895 keep case lost the kept-pane line: $t1895_keep_out"
 
 # Any other value behaves as unset: the pane is closed.
@@ -7183,7 +7198,7 @@ set -e
   fail "1895 read-fail case expected rc=1, got $t1895_readfail_rc: $t1895_readfail_out"
 grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
   fail "1895 read-fail case must still close the pane"
-[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -le 1 ]] ||
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -eq 1 ]] ||
   fail "1895 read-fail case printed more than one warn line: $t1895_readfail_out"
 if grep -q 'saved failed pane screen' <<<"$t1895_readfail_out"; then
   fail "1895 read-fail case must not claim a saved screen"
@@ -7206,6 +7221,209 @@ done
 grep -q 'fixture welcome screen' "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" ||
   fail "1895 first screen file was overwritten"
 echo "PASS hk1895 failed-pane screen capture and WRK_KEEP_FAILED_PANE"
+
+# ---------------------------------------------------------------------------
+# hk 2011: run_bounded kills a TERM-ignoring child, the failed-pane capture
+# name is exclusive under a race, WRK_KEEP_FAILED_PANE reaches a remote leg,
+# and the kept-pane hint names herdr pane close.
+# ---------------------------------------------------------------------------
+# t2011_term_case FILE — run_bounded 1 on a child that traps TERM and sleeps
+# 30 s, extracted from FILE. Prints "RC ELAPSED_SECONDS". Main holds the whole
+# 30 s; the bound is secs plus the kill grace, so 6 s is a generous ceiling.
+t2011_term_case() {
+  local file="$1" start rc=0
+  start="$SECONDS"
+  # shellcheck disable=SC1090 # FILE is the run_bounded extract from bin/wrk
+  ( . "$file"; run_bounded 1 sh -c 'trap "" TERM; sleep 30' ) >/dev/null 2>&1 || rc=$?
+  printf '%s %s\n' "$rc" "$((SECONDS - start))"
+}
+T2011_RB="$TMP/run-bounded-2011.sh"
+sed -n '/^run_bounded() {/,/^}/p' "$WRK" >"$T2011_RB"
+grep -q '^run_bounded() {' "$T2011_RB" || fail "hk2011: run_bounded is not in bin/wrk"
+read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$T2011_RB")"
+if [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )); then
+  fail "hk2011: run_bounded 1 left a TERM-ignoring child running (rc=$t2011_rc, ${t2011_elapsed}s; bound 1s plus kill grace)"
+fi
+# The same case with only gtimeout on PATH (a shim that execs the real timeout),
+# so the gtimeout branch is the one that runs. macOS has no timeout binary and
+# uses the python fallback, so the case is skipped there.
+if T2011_REAL_TIMEOUT="$(command -v timeout)"; then
+  T2011_GT="$TMP/gtimeout-only"
+  rm -rf "$T2011_GT"
+  mkdir -p "$T2011_GT"
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$T2011_REAL_TIMEOUT" >"$T2011_GT/gtimeout"
+  chmod +x "$T2011_GT/gtimeout"
+  ln -s "$(command -v sh)" "$T2011_GT/sh"
+  ln -s "$(command -v sleep)" "$T2011_GT/sleep"
+  read -r t2011_rc t2011_elapsed <<<"$(PATH="$T2011_GT" t2011_term_case "$T2011_RB")"
+  if [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )); then
+    fail "hk2011: gtimeout path left a TERM-ignoring child running (rc=$t2011_rc, ${t2011_elapsed}s)"
+  fi
+else
+  echo "SKIP hk2011 gtimeout branch: no timeout binary on this host"
+fi
+echo "PASS hk2011 run_bounded bound holds for a TERM-ignoring child"
+
+# t2011_capture_pair JOB WRK — two failed-pane captures of one job. The first
+# parks inside the name-pick window (capture-name seam); the second runs to
+# completion meanwhile. Returns 0 only when both screens survive as two files.
+t2011_capture_pair() {
+  local job="$1" bin="$2" pause dir a_pid a_rc b_rc i
+  pause="$TMP/pause-$job"
+  rm -rf "$pause"
+  mkdir -p "$pause"
+  dir="$TMP/inbox/$job"
+  rm -rf "$dir"
+  set +e
+  WRK_UNDER_TEST="$bin" TEST_FIXTURE_SCENARIO=start-not-ready \
+    WRK_TEST_PAUSE_AT=capture-name WRK_TEST_PAUSE_DIR="$pause" \
+    spawn_base opus --job "$job" --job-dup-ok >"$pause/a.out" 2>&1 &
+  a_pid=$!
+  own "$a_pid"
+  i=0
+  while [[ ! -e "$pause/paused" && "$i" -lt 200 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [[ ! -e "$pause/paused" ]]; then
+    : >"$pause/release"
+    wait "$a_pid"
+    set -e
+    return 1
+  fi
+  WRK_UNDER_TEST="$bin" TEST_FIXTURE_SCENARIO=start-not-ready \
+    spawn_base opus --job "$job" --job-dup-ok >"$pause/b.out" 2>&1
+  b_rc=$?
+  : >"$pause/release"
+  wait "$a_pid"
+  a_rc=$?
+  set -e
+  [[ "$a_rc" -eq 1 && "$b_rc" -eq 1 ]] || return 1
+  [[ -f "$dir/spawn-failure-screen.txt" && -f "$dir/spawn-failure-screen-2.txt" ]] || return 1
+  grep -q 'fixture welcome screen' "$dir/spawn-failure-screen.txt" || return 1
+  grep -q 'fixture welcome screen' "$dir/spawn-failure-screen-2.txt"
+}
+t2011_capture_pair concurrent-capture "$WRK" ||
+  fail "hk2011: two failed-pane captures of one job collided on spawn-failure-screen.txt"
+echo "PASS hk2011 concurrent failed-pane captures keep two files"
+
+# hk 2011 forwarding: a spill-over spawn carries WRK_KEEP_FAILED_PANE to the
+# remote leg (only when set), next to HERDR_SESSION.
+T2011_FWD="$TMP/fwd-2011"
+rm -rf "$T2011_FWD"
+mkdir -p "$T2011_FWD"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://example.invalid"' 'hub_token_env = "/tmp/example-token.env"' 'hub_cf_env = "/tmp/example-cf.env"' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >"$T2011_FWD/hosts.toml"
+printf '%s\n' '0.20 0.10 0.10 1/1 1' >"$T2011_FWD/loadavg"
+# t2011_fwd_spawn JOB [KEEP] — a spawn that spills to the desktop host.
+t2011_fwd_spawn() {
+  local job="$1" keep="${2:-}" task keep_env=()
+  [[ -z "$keep" ]] || keep_env=(WRK_KEEP_FAILED_PANE="$keep")
+  task="$(mint_task)"
+  : >"$T2011_FWD/ssh.log"
+  env -u WRK_KEEP_FAILED_PANE ${keep_env[@]+"${keep_env[@]}"} \
+    WRK_TEST_MODE=1 ARBITER_INBOX_ROOT="$TMP/inbox" XDG_DATA_HOME="$TMP/xdg" ARBITER_BIN="$ARBITER" \
+    HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$SCOPEFUEL" \
+    WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="${T2011_HOSTS:-$T2011_FWD/hosts.toml}" WRK_PROC_LOADAVG="$T2011_FWD/loadavg" \
+    WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$T2011_FWD/herdr.log" WRK_SPILLOVER_LOG="$T2011_FWD/spill.log" \
+    PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
+    WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$T2011_FWD/ssh.log" WRK_SCP_LOG="$T2011_FWD/scp.log" \
+    WRK_WAKE_LOG="$T2011_FWD/wake.log" WRK_PLACE_LOG="$T2011_FWD/place.log" \
+    WRK_SPILLOVER_CANDIDATES_LOG="$T2011_FWD/cand.log" WRK_COMPLETION_INTERVAL_S=3600 \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -l fixture -w w --t T1 \
+    --job "$job" --task "$task"
+}
+t2011_fwd_spawn fwd-keep 1 >"$T2011_FWD/keep.out" 2>&1 ||
+  fail "hk2011 forward: spill-over spawn failed: $(cat "$T2011_FWD/keep.out")"
+grep -q '^OK pane=desktop:p7 host=desktop ' "$T2011_FWD/keep.out" ||
+  fail "hk2011 forward: spawn did not land on the desktop host: $(cat "$T2011_FWD/keep.out")"
+grep -q 'HERDR_SESSION=worker .*WRK_KEEP_FAILED_PANE=1 wrk spawn' "$T2011_FWD/ssh.log" ||
+  fail "hk2011: WRK_KEEP_FAILED_PANE=1 was not forwarded to the remote leg: $(cat "$T2011_FWD/ssh.log")"
+t2011_fwd_spawn fwd-plain >"$T2011_FWD/plain.out" 2>&1 ||
+  fail "hk2011 forward: unset-variable spawn failed: $(cat "$T2011_FWD/plain.out")"
+if grep -q 'WRK_KEEP_FAILED_PANE' "$T2011_FWD/ssh.log"; then
+  fail "hk2011: an unset WRK_KEEP_FAILED_PANE must not be forwarded: $(cat "$T2011_FWD/ssh.log")"
+fi
+echo "PASS hk2011 WRK_KEEP_FAILED_PANE forwards to the remote leg"
+
+# hk 2011 kept pane: a remote leg that kept its failed pane (WRK_KEEP_FAILED_PANE
+# is forwarded) ends the auto round at that host. The second candidate and the
+# local fallback must never spawn: one pane, one remote spawn leg.
+T2011_TWO="$T2011_FWD/hosts-two.toml"
+cp "$T2011_FWD/hosts.toml" "$T2011_TWO"
+printf '%s\n' '' '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >>"$T2011_TWO"
+set +e
+t2011_kept_out="$(T2011_HOSTS="$T2011_TWO" WRK_SSH_SCENARIO_DESKTOP=remote-die-stderr WRK_REMOTE_RC=1 \
+  WRK_REMOTE_STDERR_LINE='wrk: kept failed pane desktop:p7 (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close desktop:p7' \
+  t2011_fwd_spawn fwd-kept 1 2>&1)"
+t2011_kept_rc=$?
+set -e
+[[ "$t2011_kept_rc" -ne 0 ]] ||
+  fail "hk2011 kept pane: the remote failure must fail the auto spawn: $t2011_kept_out"
+[[ "$(grep -c 'kept failed pane' <<<"$t2011_kept_out")" -eq 1 ]] ||
+  fail "hk2011 kept pane: the kept pane must be printed exactly once: $t2011_kept_out"
+grep -q "left failed pane desktop:p7 open" <<<"$t2011_kept_out" ||
+  fail "hk2011 kept pane: the round must say the pane is still open: $t2011_kept_out"
+[[ "$(grep -c '^OK pane=' <<<"$t2011_kept_out")" -eq 0 ]] ||
+  fail "hk2011 kept pane: no candidate may land a second pane: $t2011_kept_out"
+[[ "$(grep -c 'wrk spawn' "$T2011_FWD/ssh.log")" -eq 1 ]] ||
+  fail "hk2011 kept pane: exactly one remote spawn leg is allowed: $(cat "$T2011_FWD/ssh.log")"
+if grep -q 'mac-work' "$T2011_FWD/ssh.log"; then
+  fail "hk2011 kept pane: the second candidate must not be tried: $(cat "$T2011_FWD/ssh.log")"
+fi
+echo "PASS hk2011 kept remote pane ends the auto round: one pane, no second candidate"
+
+# The kept-pane hint names the pane to close (herdr pane close PANE), never a tab.
+T2011_HINT="$(WRK_KEEP_FAILED_PANE=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)" || true
+grep -q 'close it with herdr pane close w:p1' <<<"$T2011_HINT" ||
+  fail "hk2011: kept-pane hint must name herdr pane close w:p1: $T2011_HINT"
+if grep -q 'herdr tab close' <<<"$T2011_HINT"; then
+  fail "hk2011: kept-pane hint must not name herdr tab close"
+fi
+rm -f "$TMP/herdr.log"
+echo "PASS hk2011 kept-pane hint names herdr pane close"
+
+# Mutants: each must make its named case fail.
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+# nokill needs timeout or gtimeout on PATH: the python fallback kills on its own
+# (SIGKILL), so the mutant cannot differ there and the check is skipped. The
+# extract is the mutant's run_bounded block only; the whole mutant file ends in
+# a dispatcher that exits 2 before run_bounded exists.
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  devin_trust_mutant nokill '    timeout -k "$kill_grace" "$secs" "$@"' '    timeout "$secs" "$@"'
+  sed -n '/^run_bounded() {/,/^}/p' "$TMP/mut-wrk-nokill" >"$TMP/run-bounded-nokill.sh"
+  [[ -s "$TMP/run-bounded-nokill.sh" ]] ||
+    fail "hk2011 mutant nokill: run_bounded is not in the mutant copy"
+  read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$TMP/run-bounded-nokill.sh")"
+  # RED for the right reason: the TERM-ignoring child outlived the bound (rc 124
+  # after the full sleep), not a non-124 rc from a broken extract.
+  if [[ "$t2011_rc" -ne 124 ]] || (( t2011_elapsed <= 6 )); then
+    fail "hk2011 mutant nokill (no -k) must go RED on the timing: rc=$t2011_rc elapsed=${t2011_elapsed}s"
+  fi
+else
+  echo "SKIP hk2011 mutant nokill: no timeout or gtimeout on this host"
+fi
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant nonexcl 'set -C; : >"$screen"' ': >"$screen"'
+t2011_capture_pair mut-nonexcl "$TMP/mut-wrk-nonexcl" &&
+  fail "hk2011 mutant nonexcl (non-exclusive create) must fail the concurrent case"
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant noforward '  [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")' '  :'
+WRK_UNDER_TEST="$TMP/mut-wrk-noforward" t2011_fwd_spawn fwd-mut 1 >/dev/null 2>&1 || true
+grep -q 'HERDR_SESSION=worker .*WRK_KEEP_FAILED_PANE=1 wrk spawn' "$T2011_FWD/ssh.log" &&
+  fail "hk2011 mutant noforward (no forward) must fail the forwarding case"
+# A capture that prints no warning for a failed read must fail the
+# exactly-one-warning assertion above.
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant nowarn 'warn "failed-pane screen capture failed for pane $PANE"' ': "failed-pane screen capture failed for pane $PANE"'
+t2011_rf_out="$(WRK_UNDER_TEST="$TMP/mut-wrk-nowarn" WRK_FIXTURE_PANE_READ200_FAIL=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)" || true
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t2011_rf_out")" -eq 1 ]] &&
+  fail "hk2011 mutant nowarn (zero warnings) must fail the exactly-one-warning case"
+echo "PASS hk2011 mutants applied"
 
 
 # #609: an accepted `agent start` whose binary never reaches the pane
@@ -9738,34 +9956,92 @@ grep -q 'model=codex-luna' "$TMP/missing.out"
 
 # ROB-1227 D4: refresh is detached, uses the gate-provided pool, and exposes
 # failure/timeout warnings without changing the successful spawn.
+# A total-spawn stopwatch also measures trust/gate/task setup, which made the
+# old 1800ms assertions fail on both main and the heavy-queue head. Instead,
+# hold the refresh fixture at a fifo and observe spawn/refresh events. The
+# shared loose deadline still rejects a gross delay or a missing timeout.
+refresh_bound_s=10
+refresh_start_case() {
+  local name="$1" timeout="$2"
+  refresh_ready="$TMP/refresh-$name.ready"
+  refresh_fifo="$TMP/refresh-$name.release"
+  refresh_done="$TMP/refresh-$name.done"
+  refresh_rc="$TMP/refresh-$name.rc"
+  refresh_out="$TMP/refresh-$name.out"
+  mkfifo "$refresh_fifo"
+  refresh_deadline=$(( SECONDS + refresh_bound_s ))
+  (
+    set +e
+    TEST_OWN_SESSION=0 WRK_REFRESH_MODE=hold WRK_REFRESH_TIMEOUT_S="$timeout" \
+      WRK_REFRESH_READY_FILE="$refresh_ready" WRK_REFRESH_RELEASE_FIFO="$refresh_fifo" \
+      spawn_base codex-luna >"$refresh_out" 2>&1
+    printf '%s\n' "$?" >"$refresh_rc"
+    : >"$refresh_done"
+  ) &
+  refresh_spawn_pid=$!
+  own "$refresh_spawn_pid"
+}
+refresh_wait() {
+  local failure="$1"; shift
+  local remaining=$(( refresh_deadline - SECONDS ))
+  if (( remaining <= 0 )) || ! wait_until "$remaining" "$@"; then
+    fail "D4 $failure (loose ${refresh_bound_s}s bound)"
+  fi
+}
+refresh_spawn_ready() {
+  [[ -s "$refresh_ready" && -e "$refresh_done" ]]
+}
+refresh_child_dead() {
+  ! ps -p "$(cat "$refresh_ready")" -o pid= | grep -q '[0-9]'
+}
+refresh_timeout_finished() {
+  refresh_spawn_ready &&
+    grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' "$refresh_out" &&
+    refresh_child_dead
+}
 : >"$TMP/refresh.log"
-start_ns="$(python3 -c 'import time; print(time.time_ns())')"
-success_out="$(spawn_base codex-luna 2>&1)"
-elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - start_ns) / 1000000 ))"
+refresh_start_case detached 30
+refresh_wait 'spawn did not return while refresh was held' refresh_spawn_ready
+wait "$refresh_spawn_pid"
+[[ "$(cat "$refresh_rc")" -eq 0 ]] || fail 'D4 detached spawn failed'
+success_out="$(cat "$refresh_out")"
 grep -q 'model=codex-luna' <<<"$success_out"
-[[ "$elapsed_ms" -lt 1800 ]]  # 동일 flake 계열 — 위 timeout 케이스와 같은 근거로 완화
-for _ in {1..20}; do
-  grep -q '^refresh codex --background$' "$TMP/refresh.log" && break
-  sleep 0.05
-done
-grep -q '^refresh codex --background$' "$TMP/refresh.log"
+ps -p "$(cat "$refresh_ready")" -o pid= | grep -q '[0-9]' ||
+  fail 'D4 spawn did not return while refresh was held at the fifo'
+[[ ! -s "$TMP/refresh.log" ]] || fail 'D4 held refresh completed before release'
+python3 - "$refresh_fifo" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+try:
+    os.write(fd, b"\n")
+finally:
+    os.close(fd)
+PY
+refresh_wait 'released refresh did not log its pool/background arguments' \
+  grep -q '^refresh codex --background$' "$TMP/refresh.log"
+refresh_wait 'released refresh child did not exit' refresh_child_dead
+echo 'PASS D4-refresh-detached-until-fixture-release'
 
 failed_out="$(WRK_REFRESH_MODE=fail spawn_base codex-luna 2>&1)"
 grep -q 'scopefuel refresh failed for pool=codex; spawn already succeeded' <<<"$failed_out"
 grep -q 'model=codex-luna' <<<"$failed_out"
 
-timeout_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 : >"$TMP/refresh.pids"
-timeout_out="$(WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=2 WRK_REFRESH_TIMEOUT_S=0.2 spawn_base codex-luna 2>&1)"
-timeout_elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - timeout_start_ns) / 1000000 ))"
-# 2s hang 을 기다리지 않았음을 증명하면 충분하다 — 1000ms 는 부하 있는 머신에서
-# 오탐(실측 1075ms flake)이라 hang(2000ms) 대비 명확히 짧은 1800ms 로 완화.
-[[ "$timeout_elapsed_ms" -lt 1800 ]]
+: >"$TMP/refresh.log"
+refresh_start_case timeout 0.2
+refresh_wait 'refresh did not time out and reap its unreleased fixture' refresh_timeout_finished
+wait "$refresh_spawn_pid"
+[[ "$(cat "$refresh_rc")" -eq 0 ]] || fail 'D4 timed-out refresh changed spawn success'
+timeout_out="$(cat "$refresh_out")"
 grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' <<<"$timeout_out"
 grep -q 'model=codex-luna' <<<"$timeout_out"
+# No writer ever released this fifo: the supervisor timed out and reaped the
+# blocked fixture, rather than waiting for a chosen sleep duration to finish.
+[[ ! -s "$TMP/refresh.log" ]] || fail 'D4 timed-out fixture passed the unreleased fifo'
 while IFS= read -r refresh_pid; do
   [[ -z "$refresh_pid" ]] || ! ps -p "$refresh_pid" -o pid= | grep -q '[0-9]'
 done <"$TMP/refresh.pids"
+echo 'PASS D4-refresh-timeout-reaps-unreleased-fixture'
 
 cp "$SCOPEFUEL" "$TMP/non-executable-scopefuel"
 chmod -x "$TMP/non-executable-scopefuel"
@@ -15526,6 +15802,31 @@ else
   [[ "$T1137_RC" -ne 2 || ! -s "$T1137_ERR" ]] ||
     fail "hk1137 M1 mutant survived: --lane-defer still refused the non-ASCII id without the locale pin"
   echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
+fi
+
+# hk 1439: deliberate check — with SCOPEFUEL_BIN unset, a profile lease falls back
+# to PATH, must hit the tripwire shim (rc 99 via the lease error), then the log is
+# restored to its prior content so the end-of-suite check still means something.
+tw_job=tripwire-deliberate
+"$ARBITER" claim --job "$tw_job" --agent-label fixture --lane fixture --t T1 >/dev/null
+# the gate text must carry a pool so resolve_pool goes on to known_pools (scopefuel --json)
+printf '%s\n' 'profile=codex-luna-max pool=codex' >"$TMP/tw-gate.txt"
+tw_rc=0
+cp "$TRIPWIRE_LOG" "$TMP/tripwire.before"
+( unset SCOPEFUEL_BIN
+  "$ARBITER" lease --job "$tw_job" --kind quota_pool --profile codex-luna-max \
+    --gate-output "$TMP/tw-gate.txt" --json >"$TMP/tw-lease.out" 2>"$TMP/tw-lease.err" ) || tw_rc=$?
+[[ "$tw_rc" -ne 0 ]] || fail "hk1439: lease without SCOPEFUEL_BIN unexpectedly succeeded"
+[[ "$(wc -l <"$TRIPWIRE_LOG")" -gt "$(wc -l <"$TMP/tripwire.before")" ]] ||
+  fail "hk1439: tripwire did not fire for a lease without SCOPEFUEL_BIN: $(cat "$TMP/tw-lease.err")"
+grep -q 'exit 99' "$TMP/tw-lease.err" "$TMP/tw-lease.out" ||
+  fail "hk1439: lease error did not show the tripwire rc 99: $(cat "$TMP/tw-lease.err")"
+cp "$TMP/tripwire.before" "$TRIPWIRE_LOG" # drop only this case's own line
+echo "PASS hk1439 tripwire fires when SCOPEFUEL_BIN is unset"
+if [[ -s "$TRIPWIRE_LOG" ]]; then
+  echo "FAIL: hk1439 real-binary tripwire hit (caller argv):" >&2
+  cat "$TRIPWIRE_LOG" >&2
+  exit 1
 fi
 
 bash "$ROOT/tests/test-shellcheck-capped.sh"

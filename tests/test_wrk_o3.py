@@ -1508,7 +1508,8 @@ class DualWriteOrderCase(O3Case):
         self.assertEqual(event["idempotency_key"], record["idempotency_key"])
         rounds = w.events("job-a", "job.round")
         self.assertEqual(rounds[-1]["approval"], {"ref": "hk:task/2400", "issuer": "director-1", "extra": 1})
-        self.assertEqual(rounds[-1]["grant_record_hash"], ext["record_hash"])
+        self.assertEqual(rounds[-1]["extension_grant_record_hash"], ext["record_hash"])
+        self.assertNotIn("repeat_grant_record_hash", rounds[-1], "a pair is absent when not consumed")
         self.assertEqual(set(rounds[-1]["wrk_receipt"]), {"job_id", "seq", "record_hash", "store_generation"})
         # The unchanged O2 reader counts them: the void refunds, the extension adds one.
         w.mode(None)
@@ -1631,6 +1632,102 @@ class DualWriteOrderCase(O3Case):
         self.assertIn("refuses its projection", out.stderr)
         self.assertEqual(len(w.appends()), before, "an accepted intent is not resent and no new key is made")
         self.assertEqual(w.events("job-a", "job.round"), [])
+
+
+class HeadRepeatCase(O3Case):
+    """director-1 head_repeat rulings: in P1 the typed head_repeat consumed by
+    a round's round_open is the local O2 repeat permission for that round only;
+    a round_open projection carries one field pair per consumed grant kind."""
+
+    def round_four(self):
+        w = self.world()
+        w.mode("shadow")
+        w.enroll("job-a", activate=False)
+        w.local_claim("job-a")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+        self.assertRc(w.run("round", "verdict", "job-a", "--file", w.verdict_file("v1.md", w.heads[0])), 0)
+        for i in (1, 2):
+            self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[i]), 0)
+        w.seed("rev-r", "claim", {"job_id": "rev-r", "owner_lane": "b2400-a", "parent_lane": "b2400-a",
+                                  "task_id": 2400, "host_client_id": "desktop", "role": "tester", "tier": "T2",
+                                  "review_of": {"job_id": "job-a", "round_no": 4}, "predecessor_job_id": None,
+                                  "supersedes": None})
+        ext = w.grant("job-a", "extension", round_no=4, head=w.heads[0])
+        rep = w.grant("job-a", "head_repeat", round_no=4, head=w.heads[0], earlier=1, tester="rev-r")
+        out = w.run("round", "open", "job-a", "--head", w.heads[0], "--tester", "rev-r", "--extension-grant",
+                    ext["seq"], "--repeat-grant", rep["seq"])
+        self.assertRc(out, 0)
+        self.assertIn("round=4", out.stdout)
+        return w, ext, rep
+
+    def test_round_four_consuming_both_grants_projects_both_pairs_and_passes_the_repeat_check(self):
+        w, ext, rep = self.round_four()
+        event = [e for e in w.events("job-a", "job.round") if e.get("round") == 4][0]
+        self.assertEqual((event["extension_grant_seq"], event["extension_grant_record_hash"]),
+                         (ext["seq"], ext["record_hash"]))
+        self.assertEqual((event["repeat_grant_seq"], event["repeat_grant_record_hash"]),
+                         (rep["seq"], rep["record_hash"]))
+        self.assertNotIn("grant_record_hash", event)
+        self.assertEqual(event["approval"]["extra"], 1, "extra counts only the extension grant")
+        self.assertEqual(set(event["wrk_receipt"]), {"job_id", "seq", "record_hash", "store_generation"})
+        out = w.run("round", "verdict", "job-a", "--file", w.verdict_file("v4.md", w.heads[0], body="second\n"),
+                    "--tester", "rev-r")
+        self.assertRc(out, 0)
+        self.assertIn("round=4", out.stdout)
+
+    def tamper_grant(self, w, rep, **frozen):
+        """Rewrite the grant's frozen fields on the server (re-chained) and keep
+        the local projection's repeat pair pointing at the new grant hash."""
+        w.rewrite_records("job-a", lambda records: [
+            dict(r, payload=dict(r["payload"], **frozen)) if r["seq"] == rep["seq"] else r for r in records])
+        grant = [r for r in w.records("job-a") if r["seq"] == rep["seq"]][0]
+        for path in (w.inbox / "job-a" / "events").glob("*-job.round.json"):
+            doc = json.loads(path.read_text())
+            if doc.get("repeat_grant_seq") == rep["seq"]:
+                doc["repeat_grant_record_hash"] = grant["record_hash"]
+                path.write_text(json.dumps(doc) + "\n")
+        for name in ("o3-snapshot.json", "o3-intents.json"):
+            (w.inbox / "job-a" / name).unlink()
+
+    def refused_verdict(self, w):
+        before = len(w.appends("verdict"))
+        out = w.run("round", "verdict", "job-a", "--file", w.verdict_file("v4.md", w.heads[0], body="second\n"),
+                    "--tester", "rev-r")
+        self.assertRc(out, 2)
+        self.assertIn("head %s already recorded" % w.heads[0], out.stderr)
+        self.assertEqual(len(w.appends("verdict")), before, "an O2 refusal sends nothing")
+
+    def test_a_mismatched_round_refuses(self):
+        w, ext, rep = self.round_four()
+        for path in (w.inbox / "job-a" / "events").glob("*-job.round.json"):
+            doc = json.loads(path.read_text())
+            if doc.get("round") == 4:
+                doc["round"] = 7
+                path.write_text(json.dumps(doc) + "\n")
+        self.refused_verdict(w)
+
+    def test_a_mismatched_head_refuses(self):
+        w, ext, rep = self.round_four()
+        self.tamper_grant(w, rep, head=w.heads[5])
+        self.refused_verdict(w)
+
+    def test_a_mismatched_earlier_round_refuses(self):
+        w, ext, rep = self.round_four()
+        self.tamper_grant(w, rep, earlier_round_no=2)
+        self.refused_verdict(w)
+
+    def test_a_free_head_repeat_ref_on_an_enrolled_job_refuses(self):
+        for mode, activate in (("shadow", False), ("required", True)):
+            with self.subTest(mode):
+                w = self.world()
+                w.mode(mode)
+                w.enroll("job-a", activate=activate)
+                w.local_claim("job-a")
+                out = w.run("round", "verdict", "job-a", "--file", w.verdict_file("v.md", w.heads[0]),
+                            "--head-repeat", "hk:doc/repeat-grant")
+                self.assertRc(out, 2)
+                self.assertIn("never takes the free --head-repeat ref", out.stderr)
+                self.assertEqual(w.appends(), [])
 
 
 # ── 3. spawn orders ───────────────────────────────────────────────────────────

@@ -999,7 +999,10 @@ def projection(record, mode, meta, provenance, grants=None, prior_extensions=())
             # grant_seq (director-1 detail ruling); a replay never adds again.
             base["approval"] = {"ref": task_ref(grants), "extra": len(set(prior_extensions) - {seq}) + 1,
                                 "issuer": grants["issuers"].get(seq, "")}
-            base["grant_record_hash"] = grants["hashes"].get(seq, "")
+            base["extension_grant_record_hash"] = grants["hashes"].get(seq, "")
+        # One field pair per grant kind, present only when that grant was consumed.
+        if payload["repeat_grant_seq"] is not None:
+            base["repeat_grant_record_hash"] = grants["hashes"].get(payload["repeat_grant_seq"], "")
         return "job.round", base
     if record["kind"] == "verdict":
         base.update({"kind": "job.verdict", "verdict": payload["verdict"], "head": payload["head"],
@@ -1459,6 +1462,44 @@ def route_op(ctx, job, opts):
         emit("UNKNOWN %s" % decision.code)
     else:
         emit("ENFORCED" if decision.state.receipt_required else "SHADOW")
+
+
+def repeat_permission(ctx, job, opts):
+    """The typed head_repeat permission for a P1 shadow verdict (director-1
+    ruling): only when the server round_open of the round this verdict binds to
+    consumed a head_repeat grant, the projected job.round for that round carries
+    that repeat pair (seq and grant record_hash), and the grant's frozen round
+    and head equal this verdict's. Prints PERMIT<TAB>round<TAB>earlier<TAB>ref
+    <TAB>issuer, or NONE; anything else refuses under O2 as today."""
+    try:
+        _verdict, head = parse_verdict(read_once(opts.get("--file"), "verdict file"))
+        state = ctx.state(job)
+    except (Fail, CliFail):
+        emit("NONE")
+        return
+    if state is None or state.receipt_required:
+        emit("NONE")
+        return
+    heads = state.open_heads()
+    numbers = sorted(n for n, p in heads.items() if p["head"] == head)
+    seq = heads[numbers[0]]["repeat_grant_seq"] if numbers else None
+    grants = {r["seq"]: r for r in state.kinds("grant")}
+    grant = grants.get(seq)
+    if grant is None or grant["payload"]["grant_type"] != "head_repeat":
+        emit("NONE")
+        return
+    frozen = grant["payload"]
+    events = os.path.join(ctx.jobdir(job), "events")
+    projected = [d for _n, d, _m in events_ns()["wrk_events_ordered"](events)
+                 if isinstance(d, dict) and d.get("kind") == "job.round" and d.get("round") == numbers[0]] \
+        if os.path.isdir(events) else []
+    carries = any(d.get("repeat_grant_seq") == seq and d.get("repeat_grant_record_hash") == grant["record_hash"]
+                  for d in projected)
+    if not carries or frozen["round_no"] != numbers[0] or frozen["head"] != head or not frozen["earlier_round_no"]:
+        emit("NONE")
+        return
+    emit("PERMIT\t%d\t%d\to3:head_repeat/%d\t%s" % (numbers[0], frozen["earlier_round_no"], seq,
+                                                       grant["actor_client_id"]))
 
 
 def end_reconcile(ctx, job, opts):
@@ -2154,7 +2195,7 @@ def parse(argv):
     return opts, positional
 
 
-OPS = {"route": route_op, "end-reconcile": end_reconcile, "round-open": round_open, "round-verdict": round_verdict, "round-void": round_void,
+OPS = {"route": route_op, "end-reconcile": end_reconcile, "repeat-permission": repeat_permission, "round-open": round_open, "round-verdict": round_verdict, "round-void": round_void,
        "round-status": round_status, "audit-job": audit_job, "spawn-verify": spawn_verify,
        "completed": completed, "joined": joined, "records": records_page}
 

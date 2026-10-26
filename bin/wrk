@@ -133,12 +133,13 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy|o3> [options]
+Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy|o3> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
             [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
   wrk done JOB [--report PATH]
+  wrk restore JOB
   wrk escalate JOB --question TEXT [--report PATH]
   wrk joined JOB --pr URL --head SHA --report PATH [--rounds-waived REF]
   wrk round open JOB --head SHA [--extend REF | --extension-grant SEQ] [--repeat-grant SEQ] [--tester JOB] [--repo PATH]
@@ -736,8 +737,9 @@ Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
 
 Environment:
-  WRK_KEEP_FAILED_PANE=1  keep a failed spawn's pane for a manual look (the
-                          pane screen is always saved to <jobdir>/spawn-failure-screen.txt)
+  WRK_KEEP_FAILED_PANE=1  keep a failed spawn's pane for a manual look (wrk
+                          attempts to save the pane screen best-effort to
+                          <jobdir>/spawn-failure-screen.txt, then -2, -3, ...)
 USAGE
 }
 
@@ -818,12 +820,15 @@ PANEWIRE_PROMPT_CODEX_TIMEOUT_SECONDS=60
 # (#770: JE15b on macOS CI blocked 60s under a 2s bound).
 run_bounded() {
   local secs="$1"; shift
+  # hk 2011: a child that ignores TERM is KILLed this many seconds after the
+  # bound, so the total bound is secs plus this grace. Every caller gets it.
+  local kill_grace=2
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    timeout -k "$kill_grace" "$secs" "$@"
     return
   fi
   if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
+    gtimeout -k "$kill_grace" "$secs" "$@"
     return
   fi
   python3 -c 'import os, signal, subprocess, sys
@@ -2283,6 +2288,23 @@ quota_hub_policy_gate() {
 # can carry account, model or path text, so it is written 0600 and never
 # echoed to stdout/stderr. A second failure of the same job writes
 # spawn-failure-screen-2.txt, then -3, never overwriting.
+# hk 2011 test seam: only a WRK_TEST_MODE=1 run that sets WRK_TEST_PAUSE_AT=
+# capture-name and WRK_TEST_PAUSE_DIR reaches it. The first capture that picks
+# a file name parks until $WRK_TEST_PAUSE_DIR/release exists (or 30 s pass), so
+# a test can start a second capture inside the name-pick window. Production
+# never sets WRK_TEST_MODE, so the check below is the whole cost.
+capture_test_pause() {
+  [[ "${WRK_TEST_MODE:-}" == 1 && "${WRK_TEST_PAUSE_AT:-}" == capture-name &&
+     -n "${WRK_TEST_PAUSE_DIR:-}" ]] || return 0
+  local waited=0
+  mkdir "$WRK_TEST_PAUSE_DIR/paused.lock" 2>/dev/null || return 0
+  : >"$WRK_TEST_PAUSE_DIR/paused"
+  while [[ ! -e "$WRK_TEST_PAUSE_DIR/release" && "$waited" -lt 300 ]]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+}
+
 spawn_capture_failed_pane_screen() {
   [[ -n "${JOB_ID:-}" && -n "${PANE:-}" ]] || return 0
   local dir screen n=1
@@ -2293,6 +2315,16 @@ spawn_capture_failed_pane_screen() {
   }
   screen="$dir/spawn-failure-screen.txt"
   while [[ -e "$screen" ]]; do
+    n=$((n + 1))
+    screen="$dir/spawn-failure-screen-$n.txt"
+  done
+  capture_test_pause
+  # hk 2011: the name is created exclusively (noclobber). A concurrent capture
+  # that took this name between the check above and here makes the create fail,
+  # and the next suffix is tried. Any other create failure falls through to the
+  # read below, which then reports as before.
+  until ( umask 077; set -C; : >"$screen" ) 2>/dev/null; do
+    [[ -e "$screen" ]] || break
     n=$((n + 1))
     screen="$dir/spawn-failure-screen-$n.txt"
   done
@@ -2309,7 +2341,7 @@ spawn_pane_cleanup() {
   SPAWN_PANE_OPEN=0
   spawn_capture_failed_pane_screen
   if [[ "${WRK_KEEP_FAILED_PANE:-}" == 1 ]]; then
-    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close ${TAB_ID:-its tab}" >&2
+    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close $PANE" >&2
     return 0
   fi
   "$HERDR" pane close "$PANE" >/dev/null 2>&1     && echo "wrk: closed leftover pane $PANE after spawn failure" >&2     || echo "wrk: failed to close leftover pane $PANE — close it manually" >&2
@@ -5439,7 +5471,8 @@ delegate_job_cmd() {
   if [[ "$prc" -ne 0 ]]; then
     # A probe killed by its own guard means the daemon is wedged, not absent —
     # emit_relay_event must not re-enter it inside this same invocation.
-    if [[ "$prc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: 137 is the KILL that run_bounded sends after its TERM grace.
+    if [[ "$prc" == 124 || "$prc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     return 0
   fi
   [[ "$probe" == "$JOB_PROBE_TOKEN" ]] || return 0
@@ -5456,7 +5489,8 @@ delegate_job_cmd() {
     # the local path's completion dedup suppresses the second write. On a
     # timeout the daemon is wedged — mark it so emit_relay_event does not
     # stall this invocation on another doomed panewire call.
-    if [[ "$rc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: 137 is the KILL that run_bounded sends after its TERM grace.
+    if [[ "$rc" == 124 || "$rc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     warn "panewire job $sub delegation failed or timed out (rc=$rc); using wrk's own path"
     return 0
   fi
@@ -5726,6 +5760,249 @@ done_cmd() {
   # thing panewire sees.
   job_end_housekeeping "$job" "$owner" completed "wrk done" "wrk done" "$pane"
   echo "OK job=$job report=$report$relay_suffix"
+}
+
+restore_help() {
+  cat <<'USAGE'
+Usage: wrk restore JOB
+
+Restore a released job onto its own live pane in one step. This is the
+supported way to reverse a false loss on a live pane: a job whose sentinel
+recorded job.lost and job.revoked while its herdr pane kept running. Nothing
+changes unless every check passes.
+
+Checks, in order. The first that fails is named (check=NAME on stderr):
+  state         arbiter job-get reports state=released
+  receipt       the newest job.spawned receipt has pane_id, label and tab_id
+  claim         the first job.claim has the owner lane, T level, role and
+                agent label that the reclaim needs
+  herdr-pane    herdr lists that pane as exactly one agent
+  herdr-tab     that agent is in the receipt's tab
+  herdr-status  that agent's status is not unknown or gone
+  herdr-name    that agent's name equals the receipt's label
+
+When every check passes, wrk runs arbiter claim --reclaim-released with the
+first job.claim's fields: owner lane, T level, role and agent label always;
+parent lane, task id, task link override and task inheritance when the claim
+has them. Then it copies the newest job.spawned receipt back as one job.spawned
+event, so the reclaim is no longer newer than its receipt and the watch reads
+as current again. The copy keeps the receipt's payload; arbiter stores payloads
+with sorted keys.
+
+Restore records no quota row (the revoke already released it). After the receipt
+copy it starts one completion sentinel for the job, the same way spawn does, so
+a pane that dies after the checks is recorded as job.lost by that sentinel. The
+sentinel then leaves after the lost grace without ending the revived job; wrk
+prune declares the end (job.revoked) and releases the job's quota row, once the
+pane is absent and the job is stale. A live
+sentinel for the job that already watches this pane, proven by its pidfile and
+argv, is kept, and no second one starts.
+
+It does not look at the job's terminal kind: a completed, joined or handed-off
+job whose pane still passes the checks is revived the same way and is live work
+again until wrk done runs. The herdr checks are a snapshot taken just before the
+reclaim; the sentinel is what watches the pane after it. A completion sentinel
+still running for the job can read the reclaim as superseded and exit before the
+receipt lands.
+
+Exit codes: 0 restored. 2 refused before any write, nothing changed. 1 the
+reclaim landed but the receipt write failed; the one stderr line then names the
+exact arbiter event command that completes the restore. Run that command, and
+do not run the claim again. Or the receipt landed but no sentinel started; the
+stderr line says so, and the job is unwatched until one is started.
+
+Options:
+  -h, --help         show this usage
+USAGE
+}
+
+# The restore planner reads the job's own events, in wrk's event order. It
+# prints NUL-separated items: REFUSE check detail, or OK pane label tab owner
+# receipt followed by the reclaim arguments. The receipt JSON is ASCII-only, so
+# it can never carry a NUL into argv.
+RESTORE_PLAN_PY='
+import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+
+ROLES = ("worker", "builder", "captain")
+docs = [doc for _, doc, _ in wrk_events_ordered(sys.argv[1]) if doc is not None]
+
+
+def emit(*items):
+    sys.stdout.write("".join(item + "\0" for item in items))
+    raise SystemExit(0)
+
+
+def kind_of(doc):
+    return doc.get("kind") or doc.get("type") or doc.get("event") or ""
+
+
+def payload_of(doc):
+    payload = doc.get("payload")
+    return payload if isinstance(payload, dict) else {}
+
+
+def text(value):
+    return isinstance(value, str) and value.strip() != ""
+
+
+spawned = [doc for doc in docs if kind_of(doc) == "job.spawned"]
+if not spawned:
+    emit("REFUSE", "receipt", "no job.spawned receipt")
+receipt = payload_of(spawned[-1])  # hk1933-newest-receipt
+if not (text(receipt.get("pane_id")) and text(receipt.get("label")) and text(receipt.get("tab_id"))):
+    emit("REFUSE", "receipt", "the newest job.spawned receipt lacks pane_id, label or tab_id")
+claims = [doc for doc in docs if kind_of(doc) == "job.claim"]
+if not claims:
+    emit("REFUSE", "claim", "no job.claim event to take the reclaim fields from")
+claim = payload_of(claims[0])
+if not (text(claim.get("owner_lane")) and text(claim.get("t_level")) and text(claim.get("agent_label"))):
+    emit("REFUSE", "claim", "the first job.claim lacks owner_lane, t_level or agent_label")
+if claim.get("role") not in ROLES:
+    emit("REFUSE", "claim", "the first job.claim has no usable role")
+argv = ["--lane", claim["owner_lane"], "--t", claim["t_level"], "--role", claim["role"],
+        "--agent-label", claim["agent_label"]]
+if text(claim.get("parent_lane")):
+    argv += ["--parent-lane", claim["parent_lane"]]
+if claim.get("task_id") is not None:
+    if isinstance(claim["task_id"], bool) or not isinstance(claim["task_id"], (int, str)):
+        emit("REFUSE", "claim", "the first job.claim task_id is neither an integer nor a string")
+    argv += ["--task-id", str(claim["task_id"])]
+for key, flag in (("task_link_override", "--task-link-override"), ("task_inherited_from", "--task-inherited-from")):
+    if claim.get(key) is not None:
+        if not isinstance(claim[key], str):
+            emit("REFUSE", "claim", "the first job.claim %s is not a string" % key)
+        argv += [flag, claim[key]]
+receipt_json = json.dumps(receipt, ensure_ascii=True, sort_keys=True, separators=(",", ":"))
+emit("OK", receipt["pane_id"], receipt["label"], receipt["tab_id"], claim["owner_lane"], receipt_json, *argv)
+'
+
+# The herdr check reads `herdr agent list` on stdin and prints one line: OK, or
+# REFUSE<TAB>check<TAB>detail for the first check that fails.
+RESTORE_HERDR_PY='
+import json, sys
+pane, tab, label = sys.argv[1:4]
+
+
+def refuse(check, detail):
+    sys.stdout.write("REFUSE\t%s\t%s\n" % (check, detail))
+    raise SystemExit(0)
+
+
+try:
+    document = json.load(sys.stdin)
+except ValueError:
+    refuse("herdr-pane", "herdr agent list did not answer with JSON")
+result = document.get("result", document) if isinstance(document, dict) else {}
+agents = result.get("agents") if isinstance(result, dict) else None
+if not isinstance(agents, list):
+    refuse("herdr-pane", "herdr agent list has no agents array")
+matches = [a for a in agents if isinstance(a, dict) and a.get("pane_id") == pane]
+if len(matches) != 1: refuse("herdr-pane", "herdr does not report pane %s as exactly one agent" % pane)  # hk1933-pane-reported
+agent = matches[0]
+if agent.get("tab_id") != tab:
+    refuse("herdr-tab", "pane %s is in tab %s, not the receipt tab %s" % (pane, agent.get("tab_id"), tab))
+status = agent.get("agent_status")
+if not isinstance(status, str) or status.strip() in ("", "unknown", "gone"):
+    refuse("herdr-status", "pane %s reports agent status %s" % (pane, status))
+if agent.get("name") != label:
+    refuse("herdr-name", "herdr agent name for pane %s is %s, not the receipt label %s" % (pane, agent.get("name"), label))
+sys.stdout.write("OK\n")
+'
+
+restore_refuse() {
+  echo "wrk: restore refused job=$1 check=$2: $3; nothing was changed" >&2
+}
+
+restore_quote() {
+  python3 -c 'import shlex, sys; print(" ".join(shlex.quote(word) for word in sys.argv[1:]))' "$@"
+}
+
+restore_cmd() {
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+    [[ $# -eq 1 ]] || die "unexpected argument '$2'"
+    restore_help
+    return 0
+  fi
+  local job="${1:-}" arb events state item herdr_out pane label tab owner receipt verdict check detail cmd rc
+  local -a plan=() reclaim=()
+  [[ -n "$job" && "$job" != -* ]] || die "restore requires a job id"
+  shift || true
+  [[ $# -eq 0 ]] || die "unexpected argument '$1'"
+  arb="${ARBITER:-}"
+  if [[ -z "$arb" || ! -x "$arb" ]]; then
+    arb="$(command -v arbiter 2>/dev/null || true)"
+  fi
+  [[ -n "$arb" && -x "$arb" ]] || die "restore needs the arbiter binary (ARBITER_BIN or arbiter on PATH)"
+  events="$(wrk_jobs_root)/$job/events"
+
+  # Check 1, state: the arbiter must read the job as released. An unreadable
+  # record refuses too, so the check never passes on a guess.
+  state="$("$arb" job-get --job "$job" --json 2>/dev/null |
+    python3 -c 'import json, sys; print(json.load(sys.stdin).get("state", ""))' 2>/dev/null || true)"
+  if [[ "$state" != released ]]; then
+    restore_refuse "$job" state "arbiter state is '${state:-unreadable}', not released"
+    return 2
+  fi
+
+  # Check 2, receipt: the newest receipt and the first claim, from the job's own
+  # events. The planner refuses with the check it failed.
+  while IFS= read -r -d '' item; do plan+=("$item"); done < <(wrk_py -c "$RESTORE_PLAN_PY" "$events" 2>/dev/null)
+  if [[ "${plan[0]:-}" != OK ]]; then
+    restore_refuse "$job" "${plan[1]:-receipt}" "${plan[2]:-the job events could not be read}"
+    return 2
+  fi
+  pane="${plan[1]}"
+  label="${plan[2]}"
+  tab="${plan[3]}"
+  owner="${plan[4]}"
+  receipt="${plan[5]}"
+  reclaim=("${plan[@]:6}")
+
+  # Checks 3 to 6: herdr must list the receipt's pane as one agent, in the
+  # receipt's tab, with a live status, under the receipt's label.
+  rc=0
+  herdr_out="$("$HERDR" agent list 2>/dev/null)" || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    restore_refuse "$job" herdr-pane "herdr agent list failed (exit $rc)"
+    return 2
+  fi
+  verdict="$(printf '%s\n' "$herdr_out" | python3 -c "$RESTORE_HERDR_PY" "$pane" "$tab" "$label" 2>/dev/null || true)"
+  if [[ "$verdict" != OK ]]; then
+    IFS=$'\t' read -r _ check detail <<<"$verdict" || true
+    restore_refuse "$job" "${check:-herdr-pane}" "${detail:-herdr answer could not be read}"
+    return 2
+  fi
+
+  # The reclaim. A failure here wrote nothing, so the caller may fix the cause
+  # and run restore again.
+  rc=0
+  "$arb" claim --reclaim-released --job "$job" "${reclaim[@]}" >/dev/null || rc=$?
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: restore job=$job: arbiter reclaim refused (exit $rc); nothing was written" >&2
+    return 2
+  fi
+
+  # The receipt copy. A reclaim without this receipt reads as a respawn in
+  # flight, so a failed write must never be retried as a second reclaim.
+  rc=0
+  "$arb" event --job "$job" --kind job.spawned --payload-json "$receipt" >/dev/null 2>&1 || rc=$? # hk1933-restore-receipt
+  if [[ "$rc" -ne 0 ]]; then
+    cmd="$(restore_quote "$arb" event --job "$job" --kind job.spawned --payload-json "$receipt")"
+    echo "wrk: restore job=$job: reclaimed, but the job.spawned receipt write failed (exit $rc); complete the restore with: $cmd" >&2
+    return 1
+  fi
+  # The restored job gets the watcher a spawn gives it, so a pane that dies after
+  # the checks above is recorded as lost by that sentinel. start_completion_sentinel
+  # keeps a live sentinel that its pidfile and argv tie to this job and pane, and
+  # starts none in that case.
+  rc=0
+  start_completion_sentinel "$(wrk_jobs_root)/$job/completion-sentinel.pid" "$job" "$owner" "$label" "$pane" "" "" "" "" "" || rc=$? # hk1933-restore-sentinel
+  if [[ "$rc" -ne 0 ]]; then
+    echo "wrk: restore job=$job: restored, but its completion sentinel did not start; the job is unwatched" >&2
+    return 1
+  fi
+  echo "OK job=$job restored pane=$pane tab=$tab label=$label"
 }
 
 builder_flat_event() {
@@ -6002,13 +6279,17 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       Before opening, wrk checks HEAD^{commit} in the repo from the newest
       job.claim/job.reclaim repo, worktree or cwd field. If none is usable,
       pass --repo PATH. A missing commit triggers one bounded fetch of origin.
-  wrk round verdict JOB --file PATH
+  wrk round verdict JOB --file PATH [--head-repeat REF]
       Record the tester's verdict file. It binds to the oldest open round on its own head and is refused when there is none.
       PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
       The record stores that file's content sha256 beside its path. A later
       verdict is refused when the path, those exact bytes, or that head was
       already recorded for this job. A repeated head is allowed only when
-      the round that held the earlier verdict was voided.
+      the round that held the earlier verdict was voided, or when --head-repeat REF
+      (hk:doc/<key> or hk:task/<id>) names an approval record with the grant line
+      'head-repeat: job=JOB head=SHA round=N by=ISSUER' for that head and the round
+      it binds to; a grant is used once per job and never releases the path or
+      content identity.
   wrk round status JOB
       Print one line: job=… rounds=N cap=N open=… last_verdict=… and any
       voided rounds as 'round N void (hk:doc/…)' or 'round N void (hk:task/…)'.
@@ -6196,14 +6477,15 @@ round_approval_fetch() {
 
 # Verify a fetched round approval record for the grant type and optional round.
 # Args: ref, job, parent lane, operators, trusted parent lanes (both space
-# separated), record file, grant type (default round-extension), round number.
+# separated), record file, grant type (default round-extension), round number,
+# head (head-repeat only: the verdict head the grant line must name).
 # Prints "granted=<N> issuer=<name>" — nothing else — on success.
 round_approval_verify() {
   local ref="$1" job="$2" parent="$3" operators="$4" parent_issuers="$5" record="$6"
-  local grant_kind="${7:-round-extension}" round_number="${8:-}"
-  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" "$grant_kind" "$round_number" <<'PY'
+  local grant_kind="${7:-round-extension}" round_number="${8:-}" head_sha="${9:-}"
+  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" "$grant_kind" "$round_number" "$head_sha" <<'PY'
 import json, re, sys
-ref, job, parent, operators, parent_issuers, path, grant_kind, round_number = sys.argv[1:]
+ref, job, parent, operators, parent_issuers, path, grant_kind, round_number, head_sha = sys.argv[1:]
 ops = set(operators.split())
 trusted_parents = set(parent_issuers.split())
 try:
@@ -6217,13 +6499,15 @@ except ValueError:
     raise SystemExit(1)
 # Each grant type has one canonical line form; whitespace variants are
 # malformed and rejected. The identity and parent-lane checks below are
-# shared by round extensions, voids and join waivers.
+# shared by round extensions, voids, join waivers and head repeats.
 if grant_kind == "round-extension":
     GRANT = re.compile(r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
 elif grant_kind == "round-void":
     GRANT = re.compile(r"^round-void: job=(\S+) round=(\d+) by=(\S+)$")
 elif grant_kind == "join-waiver":
     GRANT = re.compile(r"^join-waiver: job=(\S+) by=(\S+)$")
+elif grant_kind == "head-repeat":
+    GRANT = re.compile(r"^head-repeat: job=(\S+) head=([0-9a-f]{40}) round=([1-9][0-9]*) by=(\S+)$")
 else:
     raise SystemExit(1)
 # The issuer written into the grant line must equal the record's server-set
@@ -6252,6 +6536,11 @@ for identity, body in sources:
             continue
         if grant_kind == "join-waiver":
             amount, issuer = 1, m.group(2)
+        elif grant_kind == "head-repeat":
+            # The line must name this verdict's head and the round it binds to.
+            if m.group(2) != head_sha or m.group(3) != round_number:
+                continue
+            amount, issuer = 1, m.group(4)
         else:
             amount, issuer = int(m.group(2)), m.group(3)
         if (grant_kind == "round-extension" and amount < 1) or (
@@ -6792,48 +7081,17 @@ round_void_cmd() {
   round_void_o2 "$job" "$round_number" "$ref" "$reason" "$grant_issuer" commit
 }
 
-round_verdict_cmd() {
-  local job="${1:-}" file="" metadata owner label pane parent role tester="" o2_mode=commit
-  local -a o3_orig=("$@")
-  [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
-  shift || true
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --file) [[ $# -ge 2 && -n "$2" ]] || die "--file requires a path"; file="$2"; shift 2 ;;
-      --tester) [[ $# -ge 2 && -n "$2" ]] || die "--tester requires a job id"; tester="$2"; shift 2 ;;
-      *) die "unknown round verdict option '$1'" ;;
-    esac
-  done
-  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
-  wrk_trust_guard
-  metadata="$(builder_metadata "$job" trusted)"
-  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  o3_route "$job" "round verdict"
-  if ! o3_server_decides; then
-    o3_reconcile_ended "$job"
-    wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
-  fi
-  # hk 1926: an enforced job submits the verdict bytes (read once) to the
-  # server and the job.verdict below is written only after the receipt. A
-  # shadow job runs the O2 guards below first and is appended only when they
-  # pass (director-1 dual-write ruling).
-  local o3_args=(round-verdict "$job" --file "$file" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
-  [[ -z "$tester" ]] || o3_args+=(--tester "$tester")
-  case "$O3_ROUTE" in
-    enforced|offline_protected)
-      o3_call "${o3_args[@]}"
-      o3_exit_on_error
-      printf '%s\n' "$O3_OUT"
-      return 0 ;;
-    shadow|offline_shadow|unknown) o2_mode=check ;;
-    legacy) [[ -z "$tester" ]] || die "round verdict: --tester is for an O3 job; job $job is on the O2 path" ;;
-  esac
-  local outcome rc=0
-  set +e
-  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$o2_mode" "$O3_FORCE_O2_KEY" <<'PY'
+# round_verdict_decide: the verdict decision, run under the events lock. Mode plan reports
+# the identity refusals and the round the verdict would bind to, and writes nothing. Mode
+# commit records the verdict. The grant arguments are empty unless --head-repeat was given.
+# hk 1926: mode check runs the same guards for a shadow job and writes nothing; a typed
+# head_repeat permission arrives as the grant arguments plus grant_earlier (the earlier
+# verdict's round the grant names); o3_key marks a P1 warning-branch event.
+round_verdict_decide() { # events job owner label pane parent file mode grant_ref grant_issuer grant_round grant_earlier o3_key
+  wrk_py - "$@" <<'PY'
 import fcntl, hashlib, io, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, vfile, o2_mode, o3_key = sys.argv[1:]
+events, job, owner, label, pane, parent, vfile, mode, grant_ref, grant_issuer, grant_round, grant_earlier, o3_key = sys.argv[1:]
 os.makedirs(events, exist_ok=True)
 verdict = vsha = None
 matches = []
@@ -6889,6 +7147,7 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     content_hit = ""
     digests = set()
     head_hit = ""
+    head_hit_round = None
     for name, document, _mtime in ordered:
         if not isinstance(document, dict) or document.get("kind") != "job.verdict":
             continue
@@ -6921,14 +7180,21 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                         break
             if not released:
                 head_hit = name
+                head_hit_round = number
     if path_hit:
         print("DUP_PATH\t%s\t%s" % (path_hit, abspath))
         raise SystemExit(0)
     if digest in digests:  # hk1449-content-sha
         print("DUP_CONTENT\t%s\t%s" % (content_hit, digest))
         raise SystemExit(0)
-    if head_hit:
-        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+    # A grant is used once per job and binds only a repeated head. Both checks run
+    # before the target round, so a refusal here never fetches or writes anything.
+    head_repeat_used = bool(grant_ref) and any(v.get("head_repeat") == grant_ref for v in verdicts)
+    if head_repeat_used:
+        print("HEAD_REPEAT_USED\t%s" % grant_ref)
+        raise SystemExit(0)
+    if grant_ref and not head_hit:
+        print("HEAD_REPEAT_NOT_NEEDED\t%s" % vsha)
         raise SystemExit(0)
     open_rounds = [r for r in rounds
                    if (isinstance(r.get("round"), int) and r.get("round") not in bound
@@ -6941,6 +7207,16 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                 and round_head.lower() == vsha):  # hk1506-head-bind
             target = r["round"]
             break
+    if head_hit and (not grant_ref or target is None):
+        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+        raise SystemExit(0)
+    if head_hit and grant_earlier and str(head_hit_round) != grant_earlier:
+        # hk 1926: a typed head_repeat grant names the earlier round it repeats.
+        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+        raise SystemExit(0)
+    if mode == "plan":
+        print("PLAN_BIND\t%s\t%s" % (vsha, target))
+        raise SystemExit(0)
     if target is None:
         if open_rounds:
             labels = []
@@ -6957,6 +7233,9 @@ with open(lock_path, "w", encoding="utf-8") as lock:
         else:
             print("NO_OPEN_ROUND\t%s" % vsha)
         raise SystemExit(0)
+    if grant_ref and str(target) != grant_round:
+        print("HEAD_REPEAT_MOVED\t%s\t%s" % (grant_round, target))
+        raise SystemExit(0)
     used = sum(1 for r in rounds
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
@@ -6965,10 +7244,13 @@ with open(lock_path, "w", encoding="utf-8") as lock:
               "label": label, "pane_id": pane, "parent_lane": parent,
               "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
               "content_sha256": digest, "round": target, "epoch": 1}
+    if grant_ref:
+        record["head_repeat"] = grant_ref
+        record["head_repeat_issuer"] = grant_issuer
     if o3_key:
         # The P1 warning branch carries the pending intent key (no second event later).
         record.update({"idempotency_key": o3_key, "o3_mode": "shadow", "o3_provenance": "o2_warning"})
-    if o2_mode == "check":
+    if mode == "check":
         # hk 1926: the O2 guards passed for a shadow job; the server append
         # comes next and writes the projection.
         print("RECORDED round=%s verdict=%s head=%s used=%d" % (target, verdict, vsha, used))
@@ -6977,10 +7259,115 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     print("RECORDED round=%s verdict=%s head=%s used=%d" %
           (target, verdict, vsha, used))
 PY
-)"
-  rc=$?
-  set -e
-  [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+}
+
+round_verdict_cmd() {
+  local job="${1:-}" file="" head_repeat="" metadata owner label pane parent role tester="" o2_mode=commit
+  local typed_ref="" typed_issuer="" typed_round="" typed_earlier=""
+  local -a o3_orig=("$@")
+  [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file) [[ $# -ge 2 && -n "$2" ]] || die "--file requires a path"; file="$2"; shift 2 ;;
+      --head-repeat) [[ $# -ge 2 && -n "$2" ]] || die "--head-repeat requires a hk:doc/<key> or hk:task/<id> ref"; head_repeat="$2"; shift 2 ;;
+      --tester) [[ $# -ge 2 && -n "$2" ]] || die "--tester requires a job id"; tester="$2"; shift 2 ;;
+      *) die "unknown round verdict option '$1'" ;;
+    esac
+  done
+  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
+  if [[ -n "$head_repeat" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
+  metadata="$(builder_metadata "$job" trusted)"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  o3_route "$job" "round verdict"
+  if ! o3_server_decides; then
+    o3_reconcile_ended "$job"
+    wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  fi
+  # hk 1926: an enforced job submits the verdict bytes (read once) to the
+  # server and the job.verdict below is written only after the receipt. A
+  # shadow job runs the O2 guards below first and is appended only when they
+  # pass (director-1 dual-write ruling); its repeated head is allowed only by
+  # the typed head_repeat its round consumed, never by a free ref.
+  local o3_args=(round-verdict "$job" --file "$file" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
+  [[ -z "$tester" ]] || o3_args+=(--tester "$tester")
+  case "$O3_ROUTE" in
+    legacy) [[ -z "$tester" ]] || die "round verdict: --tester is for an O3 job; job $job is on the O2 path" ;;
+    forced_o2) ;;
+    *)
+      [[ -z "$head_repeat" ]] ||
+        die "round verdict: an O3 job never takes the free --head-repeat ref $head_repeat; a repeated head needs the typed head_repeat grant its round consumed"
+      if o3_server_decides; then
+        o3_call "${o3_args[@]}"
+        o3_exit_on_error
+        printf '%s\n' "$O3_OUT"
+        return 0
+      fi
+      o2_mode=check
+      if [[ "$O3_ROUTE" == shadow ]]; then
+        o3_call repeat-permission "$job" --file "$file"
+        o3_exit_on_error
+        if [[ "$O3_OUT" == PERMIT$'\t'* ]]; then
+          IFS=$'\t' read -r _ typed_round typed_earlier typed_ref typed_issuer <<<"$O3_OUT"
+        fi
+      fi ;;
+  esac
+  local events="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events"
+  local outcome rc=0 run_commit=1 grant_issuer="" bind_head="" bind_round=""
+  if [[ -n "$head_repeat" ]]; then
+    # The plan run reads the events under the lock and writes nothing. It refuses the
+    # identity cases and reports the round this verdict would bind to, so the grant is
+    # fetched and checked against that round before anything is recorded.
+    set +e
+    outcome="$(round_verdict_decide "$events" "$job" "$owner" "$label" "$pane" "$parent" "$file" plan "$head_repeat" "" "" "" "")"
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+    if [[ "$outcome" == PLAN_BIND$'\t'* ]]; then
+      IFS=$'\t' read -r _ bind_head bind_round <<<"$outcome"
+      local tmp_approval grant_line
+      tmp_approval="$(mktemp)"
+      if ! round_approval_fetch "$head_repeat" >"$tmp_approval"; then
+        rm -f "$tmp_approval"
+        die "round verdict: head-repeat record not found in handoffkeep: $head_repeat"
+      fi
+      grant_line="$(round_approval_verify "$head_repeat" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_approval" head-repeat "$bind_round" "$bind_head" || true)"  # hk1970-head-repeat
+      rm -f "$tmp_approval"
+      [[ -n "$grant_line" ]] ||
+        die "round verdict: $head_repeat has no 'head-repeat: job=$job head=$bind_head round=$bind_round by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
+      grant_issuer="${grant_line##*issuer=}"
+      # A pa-integrator grant counts only on ParkingArcade work, checked on the server.
+      if [[ "$grant_issuer" == "pa-integrator" ]]; then
+        local task_id tmp_task
+        task_id="$(round_job_task_id "$job" || true)"
+        [[ -n "$task_id" ]] ||
+          die "round verdict --head-repeat: pa-integrator grants need the job's hk task on the server; $job records no task_id"
+        tmp_task="$(mktemp)"
+        if ! round_pa_task_fetch "$task_id" >"$tmp_task"; then
+          rm -f "$tmp_task"
+          die "round verdict --head-repeat: pa-integrator grants need the job's hk task on the server; cannot fetch task $task_id"
+        fi
+        if ! round_pa_task_verify "$job" "$tmp_task"; then
+          rm -f "$tmp_task"
+          die "round verdict --head-repeat: pa-integrator grants count only when the server task for $job is project ParkingArcade with refs.job_id=$job"
+        fi
+        rm -f "$tmp_task"
+      fi
+    else
+      run_commit=0
+    fi
+  fi
+  if [[ "$run_commit" -eq 1 ]]; then
+    set +e
+    if [[ -n "$typed_ref" ]]; then
+      outcome="$(round_verdict_decide "$events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$o2_mode" "$typed_ref" "$typed_issuer" "$typed_round" "$typed_earlier" "$O3_FORCE_O2_KEY")"
+    else
+      outcome="$(round_verdict_decide "$events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$o2_mode" "$head_repeat" "$grant_issuer" "$bind_round" "" "$O3_FORCE_O2_KEY")"
+    fi
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+  fi
   case "$outcome" in
     NO_VERDICT)
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
@@ -6988,6 +7375,18 @@ PY
       die "round verdict --file has more than one VERDICT line: $file" ;;
     ENDED$'\t'*|DUP_PATH$'\t'*|DUP_CONTENT$'\t'*|DUP_HEAD$'\t'*)
       wrk_verdict_refusal "$outcome" ;;
+    HEAD_REPEAT_USED$'\t'*)
+      local used_ref
+      IFS=$'\t' read -r _ used_ref <<<"$outcome"
+      die "round verdict: head_repeat_used $used_ref: already recorded on a job.verdict of $job" ;;
+    HEAD_REPEAT_NOT_NEEDED$'\t'*)
+      local idle_head
+      IFS=$'\t' read -r _ idle_head <<<"$outcome"
+      die "round verdict: head_repeat_not_needed: head $idle_head has no earlier job.verdict on $job; drop --head-repeat" ;;
+    HEAD_REPEAT_MOVED$'\t'*)
+      local moved_from moved_to
+      IFS=$'\t' read -r _ moved_from moved_to <<<"$outcome"
+      die "round verdict: head_repeat_round_moved: the grant names round $moved_from but the head now binds to round $moved_to; retry" ;;
     NO_HEAD_ROUND$'\t'*)
       local no_head_v no_open_list
       IFS=$'\t' read -r _ no_head_v no_open_list <<<"$outcome"
@@ -9694,6 +10093,7 @@ spillover_remote_spawn() {
   fi
   local remote_args=(env "HERDR_SESSION=$session")
   [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
+  [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")
   remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   # Builders only — forwarding the flag to a worker would mute the execution
   # host's own session-machine_ids check while this host then named the
@@ -9732,6 +10132,14 @@ spillover_remote_spawn() {
   "${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" "$remote_cmd; rc=\$?; rm -f -- $(printf '%q' "$remote_prompt"); exit \$rc" >"$out" 2>"$remote_err"
   rc=$?
   set -e
+  # hk 2011: a remote wrk that kept its failed pane (WRK_KEEP_FAILED_PANE is
+  # forwarded from this host) left a pane open. The auto round must end there
+  # rather than spawn the job again on another host or locally.
+  SPILL_REMOTE_PANE_KEPT=0
+  if [[ "$rc" -ne 0 && "${WRK_KEEP_FAILED_PANE:-}" == 1 ]] &&
+     grep -q '^wrk: kept failed pane ' "$remote_err"; then
+    SPILL_REMOTE_PANE_KEPT=1
+  fi
   # A failed remote spawn must answer with the remote's own words: stderr is
   # relayed verbatim and non-OK stdout follows it onto the local stderr.
   spillover_relay_remote_err "$remote_err"
@@ -9836,7 +10244,11 @@ spillover_try_candidate() {
   else
     if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "$@"; then rc=0; else rc=$?; fi
     if [[ "$rc" -ne 0 && -n "${SPILL_CANDIDATE_CLASS_FILE:-}" ]]; then
-      printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      if [[ "${SPILL_REMOTE_PANE_KEPT:-0}" == 1 ]]; then
+        printf 'kept-pane\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      else
+        printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      fi
     fi
   fi
   if [[ "$rc" -ne 0 && "$hold_diag" == 1 ]]; then
@@ -10072,6 +10484,7 @@ spawn_router_cmd() {
   # remote_full_seen latches the positive capacity evidence the post-round
   # wake requires — a round with no remote-full answer never wakes.
   local wake_pending="" remote_full_seen=0 wake_target=""
+  local kept_pane_round=0 kept_pane=""
   # --host auto holds every per-candidate diagnostic until the round settles:
   # a successful spawn must print nothing about the hosts it skipped, while an
   # all-fail round owes the operator one attributed line per host plus whatever
@@ -10139,9 +10552,20 @@ spawn_router_cmd() {
           if [[ "$(spillover_value "hosts.$candidate" wake 2>/dev/null || true)" == panewire ]]; then
             wake_pending+="$candidate "
           fi ;;
+        kept-pane)
+          kept_pane_round=1
+          kept_pane="$(sed -n 's/^wrk: kept failed pane \([^ ]*\) .*/\1/p' "$cand_err" | head -1)" ;;
       esac
       cat "$cand_err" >>"$auto_diag"
       rm -f "$cand_err" "$cand_class"
+      if [[ "$kept_pane_round" == 1 ]]; then
+        # The remote pane is still up: a second spawn elsewhere would give the
+        # job two panes, so the round ends here with the remote's rc.
+        [[ -s "$auto_diag" ]] && cat "$auto_diag" >&2
+        rm -f "$auto_diag"
+        echo "wrk: remote host '$candidate' left failed pane ${kept_pane:-unknown} open (WRK_KEEP_FAILED_PANE=1); not trying another host or the local fallback" >&2
+        return "$last_rc"
+      fi
     else
       if spillover_try_candidate 0 "$candidate" "$cwd" "$prompt" "${filtered[@]}"; then
         return 0
@@ -13108,7 +13532,7 @@ PY
 
 heavy_help() {
   cat <<'USAGE'
-Usage: wrk heavy -- <command> [args...]
+Usage: wrk heavy [--queue-key KEY] -- <command> [args...]
        wrk heavy status
 
 Serialize heavy (>1 minute) local test/build runs: up to `heavy_max` holders
@@ -13117,7 +13541,7 @@ on macOS and Linux — macOS has no `flock` command, and flock releases a dead
 holder's slot automatically, unlike shlock pid-files). Slot 0 is the lock
 file itself; slots 1..N-1 are <lock>.slot<i>. The command runs under
 `nice -n 10` and, while the load wait is on (see heavy_load_wait below),
-only starts once load5/ncpu < 1.0. Total wait (slot + load) is capped at
+only starts once load5/ncpu < 1.0. Total wait (slot + load) defaults to a cap of
 20 minutes; on expiry the command is NOT run and wrk exits 75
 (EX_TEMPFAIL). The command inherits the slot fd (nested detection
 needs it — see WRK_HEAVY_HELD_FD), so an orphaned child keeps the slot while
@@ -13170,7 +13594,37 @@ promised: a ci waiter is not queued while wrk and its python half are still
 starting up (before the record exists), and a lane pass that had already
 read the records when the rename happened (one pass, no re-read before its
 slot attempts) can still take a slot that frees in that same pass. Neither
-is preempted afterwards. Waiters of an older wrk ignore classes entirely.
+is preempted afterwards. Waiters from before hk 1533 ignore classes entirely.
+
+Lane FIFO (hk 1407): each published waiter carries a wall-clock enqueue
+ticket, with pid breaking equal-time ties. A lane skips any slot that an
+older live lane ticket could take (index below that waiter's own limit).
+CI reservation and its starvation guard above are unchanged; spending that
+guard never waives lane FIFO. Dead pids and lane records without a ticket
+reserve nothing under lane FIFO. CI reservation does not depend on tickets:
+live ci waiters with or without a ticket keep reserving exactly as above.
+Older lane waiters do not honor tickets, so mixed versions can still race.
+Tickets order visible records, not process start times:
+the same starting up window and pass that already scanned described above
+apply to lanes too. A clock step can change wall-clock order; wait caps and
+the CI guard continue to use monotonic time. No holder is preempted.
+
+Use --queue-key KEY (or WRK_HEAVY_QUEUE_KEY) to keep a place across a wait-cap
+exit (75). KEY is ASCII [A-Za-z0-9._-]{1,64}; the option overrides the env.
+The position stores the original ticket until now + WRK_HEAVY_REQUEUE_GRACE
+(default 600 seconds). A retry before expiry reuses it; at expiry or later
+it is ignored. Acquisition consumes the position. Positions alone reserve
+no slots, and unkeyed retries always get a fresh ticket. Same-key concurrent
+retries can share a ticket; no order between equal tickets is promised.
+Position files use the same directory trust checks as waiters, and must be
+regular files owned by this uid, without symlinks or hardlinks. A same-uid
+process can write a position for any key, so a forged key can at most give
+that process the original ticket within the grace. This narrows; it does
+not bound. Owned per-key guards coordinate position publication and removal:
+this is a same-uid cooperation convention, not a security boundary. Status
+skips stale-position cleanup while a guard is busy, rather than waiting.
+Long runs (Unity) should pass a larger WRK_HEAVY_WAIT_CAP together
+with --queue-key to keep their place. The cap remains one per-run value.
 
 `wrk heavy status` prints the lock path, this host, the effective limit,
 the load-wait switch (`load_wait true|false|error (...)`), one `holder`
@@ -13178,7 +13632,8 @@ line per occupied slot, and queued waiters (holder pids are the
 wrk heavy python processes; killing one frees its slot once the command
 tree that inherited the slot fd is also gone). Every holder and waiter line
 carries `class=ci|lane` (and the limit it queued under). status never
-creates slot files and is never refused.
+creates slot files and is never refused. Live waiter tickets print in order;
+live positions print their key, ticket and expiry. Stale records are cleaned.
 
 Every acquisition appends one JSON record to the heavy log (default
 ~/.local/state/wrk/heavy.log): ts, kind=run, host, job (ARBITER_JOB or -),
@@ -13217,6 +13672,9 @@ Environment:
                         seconds a lane waiter defers to a live ci waiter
                         before it stops (default 1800, 0 = never defer)
   WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
+  WRK_HEAVY_QUEUE_KEY   durable re-queue key (overridden by --queue-key)
+  WRK_HEAVY_REQUEUE_GRACE
+                        seconds a capped keyed ticket survives (default 600)
   WRK_HEAVY_LOAD_FILE   file re-read each poll whose first field is used as
                         load5/ncpu (default: os.getloadavg()[1]/cpu_count)
   WRK_HEAVY_LOG         acquisition log path
@@ -13265,7 +13723,7 @@ heavy_cmd() {
     WRK_HEAVY_LOAD_WAIT_SRC="$heavy_load_wait_src" \
     WRK_HEAVY_LOAD_WAIT_ERR="$heavy_load_wait_err" \
     python3 - "$@" <<'PY'
-import datetime, fcntl, glob, json, os, re, socket, stat, subprocess, sys, tempfile, time
+import datetime, fcntl, glob, json, math, os, re, socket, stat, subprocess, sys, tempfile, time
 
 EXIT_WAIT_CAP = 75  # EX_TEMPFAIL: transient, worth reporting and retrying later
 EXIT_REFUSED = 78   # EX_CONFIG: this host's configuration forbids the run
@@ -13330,6 +13788,19 @@ def with_class(text):
     return toks[0] + " class=lane" + text[len(toks[0]):]
 
 
+def record_ticket(text):
+    # Only field four is metadata: ticket= inside a legacy cmd is free text.
+    fields = text.split(None, 4)
+    if len(fields) < 4:
+        return None
+    match = re.fullmatch(r"ticket=([0-9]{1,20}):([0-9]{1,20})", fields[3])
+    if match:
+        ticket = tuple(map(int, match.groups()))
+        if all(n > 0 for n in ticket):
+            return ticket
+    return None
+
+
 args = sys.argv[1:]
 if not args:
     fail("usage: wrk heavy -- <command> [args...] | wrk heavy status", 2)
@@ -13338,6 +13809,7 @@ host = socket.gethostname()
 lock_path = os.environ.get("WRK_HEAVY_LOCK") or (
     "/tmp/wrk-heavy-%s.lock" % host)
 waiters_dir = lock_path + ".waiters"
+positions_dir = lock_path + ".positions"
 
 # The bash half resolves the limit from WRK_HEAVY_MAX or hosts.toml [local]
 # heavy_max. Invalid (non-integer or negative) refuses the run rc 78; status
@@ -13469,7 +13941,7 @@ def flock_held(path):
     return True
 
 
-def waiters_dir_fd():
+def waiters_dir_fd(path=None):
     # Open the waiters dir itself, never through a link: O_DIRECTORY pins
     # the object to a real directory and O_NOFOLLOW refuses a symlink at
     # the waiters name — a repointable link is exactly the foreign-party-
@@ -13477,7 +13949,7 @@ def waiters_dir_fd():
     # Callers that then listdir/open/rename/remove through this fd cannot
     # have their operations redirected by a same-name path swap either.
     try:
-        return os.open(waiters_dir,
+        return os.open(waiters_dir if path is None else path,
                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     except OSError:
         return None
@@ -13498,6 +13970,135 @@ def read_waiter_record(dirfd, name):
             return f.read()
     except OSError:
         return ""
+
+
+def waiters_dir_open(path=None):
+    # Pin a trusted directory; all subsequent operations use its fd. Shared
+    # root-owned sticky dirs remain usable, as on the desktop waiters path.
+    fd = waiters_dir_fd(path)
+    if fd is None:
+        return -1
+    try:
+        st = os.fstat(fd)
+        trusted = (owner_trusted(st) and
+                   not (st.st_mode & 0o022 and
+                        not st.st_mode & stat.S_ISVTX))
+    except OSError:
+        trusted = False
+    if not trusted:
+        os.close(fd)
+        return -1
+    return fd
+
+
+key_re = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
+
+
+def position_name(key):
+    # ASCII hex preserves case-distinct keys on case-insensitive filesystems;
+    # the prefix also keeps valid dot keys ordinary filenames.
+    return "key-" + key.encode("ascii").hex() + ".json"
+
+
+def read_position(dirfd, name):
+    # Check the opened inode, not a path that could be swapped after stat.
+    # Nonblocking open prevents even a racing fifo from hanging the queue.
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                     dir_fd=dirfd)
+    except OSError:
+        return None
+    try:
+        with os.fdopen(fd, encoding="utf-8") as f:
+            st = os.fstat(f.fileno())
+            if not (stat.S_ISREG(st.st_mode) and st.st_nlink == 1
+                    and st.st_uid == os.getuid() and st.st_size <= 8192):
+                return None
+            record = json.loads(f.read(8193))
+        if not isinstance(record, dict):
+            return None
+        key, ticket, expiry = (record.get(k) for k in ("key", "ticket", "expiry"))
+        if (not isinstance(key, str) or not key_re.fullmatch(key)
+                or name != position_name(key)
+                or not isinstance(ticket, list) or len(ticket) != 2
+                or any(type(n) is not int or not 0 < n < 10**20 for n in ticket)
+                or type(expiry) not in (int, float) or not math.isfinite(expiry)):
+            return None
+        return record, st
+    except (OSError, ValueError, UnicodeError, OverflowError, RecursionError):
+        return None
+
+
+def position_guard_open(dirfd, key):
+    # A directory flock would also be available to other uids in an allowed
+    # root-owned sticky directory. Use a persistent, private owned inode.
+    name = ".guard-" + key.encode("ascii").hex()
+    flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        try:
+            fd = os.open(name, flags | os.O_CREAT, 0o600, dir_fd=dirfd)
+        except FileNotFoundError:
+            # macOS can report ENOENT when a peer creates the same guard.
+            # Try that existing inode once, without creating or following
+            # anything; the same fstat checks below still own acceptance.
+            fd = os.open(name, flags, dir_fd=dirfd)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if (stat.S_ISREG(st.st_mode) and st.st_uid == os.getuid()
+                and st.st_nlink == 1 and not st.st_mode & 0o077):
+            return fd
+    except OSError:
+        pass
+    os.close(fd)
+    return None
+
+
+def position_guard_lock(fd, *, blocking=True):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | (0 if blocking else fcntl.LOCK_NB))
+        return True
+    except OSError:
+        return False
+
+
+def position_guard_unlock(fd):
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+def remove_position_locked(dirfd, name, st):
+    # The guard spans stat/unlink, so a cooperating cap publisher cannot
+    # replace the observed inode in between. Keep replacements from before
+    # we acquired the guard (e.g. a renewed expiry seen by status).
+    try:
+        current = os.stat(name, dir_fd=dirfd, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) == (st.st_dev, st.st_ino):
+            os.remove(name, dir_fd=dirfd)
+    except OSError:
+        pass
+
+
+def remove_position(dirfd, name, st, *, key, blocking=True):
+    guardfd = position_guard_open(dirfd, key)
+    if guardfd is None:
+        return
+    try:
+        if not position_guard_lock(guardfd, blocking=blocking):
+            return
+        try:
+            current = read_position(dirfd, name)
+            if current is not None:
+                _, observed = current
+                if (observed.st_dev, observed.st_ino) == (st.st_dev, st.st_ino):
+                    remove_position_locked(dirfd, name, observed)
+        finally:
+            position_guard_unlock(guardfd)
+    finally:
+        os.close(guardfd)
 
 
 if args[0] == "status":
@@ -13566,16 +14167,53 @@ if args[0] == "status":
             except OSError:
                 pass
             continue
-        waiters.append(with_class(info) if info else name)
+        waiters.append((record_ticket(info), with_class(info) if info else name))
     if wfd is not None:
         os.close(wfd)
-    for w in waiters:
+    for _, w in sorted(waiters, key=lambda item: (item[0] is None, item[0] or (0, 0), item[1])):
         print("waiter " + w)
     if not waiters:
         print("waiters none")
+    pfd = waiters_dir_open(positions_dir)
+    positions = []
+    if pfd >= 0:
+        try:
+            try:
+                names = os.listdir(pfd)
+            except OSError:
+                names = []
+            for name in names:
+                result = read_position(pfd, name)
+                if result is None:
+                    continue
+                record, st = result
+                if record["expiry"] <= time.time():
+                    remove_position(pfd, name, st, key=record["key"], blocking=False)
+                else:
+                    positions.append(record)
+        finally:
+            os.close(pfd)
+    for record in sorted(positions, key=lambda r: (r["ticket"], r["key"])):
+        print("position key=%s ticket=%d:%d expiry=%s" %
+              (record["key"], *record["ticket"], record["expiry"]))
     raise SystemExit(0)
 
-if args[0] != "--":
+queue_key = os.environ.get("WRK_HEAVY_QUEUE_KEY") or None
+if args[0] == "--queue-key":
+    if len(args) < 2:
+        fail("--queue-key requires KEY", 2)
+    queue_key = args[1]
+    args = args[2:]
+if queue_key is not None and not key_re.fullmatch(queue_key):
+    fail("invalid queue key (want ASCII [A-Za-z0-9._-]{1,64})", EXIT_REFUSED)
+try:
+    requeue_grace = float(os.environ.get("WRK_HEAVY_REQUEUE_GRACE", "600"))
+except ValueError:
+    requeue_grace = -1
+if not math.isfinite(requeue_grace) or requeue_grace < 0:
+    fail("WRK_HEAVY_REQUEUE_GRACE is not a finite non-negative number", 2)
+
+if not args or args[0] != "--":
     fail("expected '--' before the command (see 'wrk heavy --help')", 2)
 cmd = args[1:]
 if not cmd:
@@ -13655,6 +14293,36 @@ def ci_reserved():
         if cls != "ci" or pid <= 0 or pid == os.getpid():
             continue
         if lim is None or lim < 1 or not alive(pid):
+            continue
+        reserved = max(reserved, lim)
+    return reserved
+
+
+def lane_reserved():
+    # Shape of ci_reserved, but only strictly older live lane tickets count.
+    # A mixed-version record lacking a ticket can never leave a slot idle.
+    try:
+        names = os.listdir(waiters_fd)
+    except OSError:
+        return 0
+    reserved = 0
+    for name in names:
+        if name.startswith("."):
+            continue
+        try:
+            if not stat.S_ISREG(os.stat(name, dir_fd=waiters_fd,
+                                        follow_symlinks=False).st_mode):
+                continue
+        except OSError:
+            continue
+        text = read_waiter_record(waiters_fd, name)
+        pid, cls, lim = record_head(text)
+        older = record_ticket(text)
+        if cls != "lane" or pid <= 0 or pid == os.getpid():
+            continue
+        if older is None or older >= ticket or lim is None or lim < 1:
+            continue
+        if not alive(pid):
             continue
         reserved = max(reserved, lim)
     return reserved
@@ -13760,39 +14428,6 @@ if nested_fd is not None:
                "rc": nrc})
     raise SystemExit(nrc)
 
-def waiters_dir_open():
-    # hk 1545: the waiters dir sits next to the lock, which defaults under
-    # /tmp, so before a record is published the dir must not hand another
-    # local user control over names in it. Fail closed: the open itself
-    # refuses a symlink at the waiters name (its owner could repoint it
-    # after any path check — waiters_dir_fd), and fstat then checks the
-    # object the fd holds: a dir owned by a uid that is neither ours nor
-    # root is refused (its owner can rename or delete entries even under
-    # the sticky bit), and a group/other-writable dir without the sticky
-    # bit is refused (any local user could then remove or replace
-    # records). A writable dir WITH the sticky bit stays usable: files in
-    # it are still only removable by their owner, and mkstemp's
-    # unpredictable O_EXCL tmp name is what closes the plant-a-symlink
-    # hole. The returned fd is kept for the run: every later record
-    # create-target, rename, list and unlink goes through dir_fd, so no
-    # path re-resolution can move a publish or a cleanup into a
-    # swapped-in dir.
-    fd = waiters_dir_fd()
-    if fd is None:
-        return -1
-    try:
-        st = os.fstat(fd)
-        trusted = (owner_trusted(st) and
-                   not (st.st_mode & 0o022 and
-                        not st.st_mode & stat.S_ISVTX))
-    except OSError:
-        trusted = False
-    if not trusted:
-        os.close(fd)
-        return -1
-    return fd
-
-
 try:
     # mode=0o700: a liberal umask (002) must not mint a group-writable dir
     # this same run then refuses (hk 1545 r3); an existing dir is untouched
@@ -13805,6 +14440,30 @@ if waiters_fd < 0:
          "root and not be a symlink; a group/other-writable dir must "
          "carry the sticky bit)" % (waiters_dir, os.getuid()),
          EXIT_REFUSED)
+positions_fd = -1
+position_guard_fd = -1
+ticket = (time.time_ns(), os.getpid())
+if queue_key is not None:
+    try:
+        os.makedirs(positions_dir, mode=0o700, exist_ok=True)
+    except OSError as e:
+        fail("cannot create positions dir %s: %s" % (positions_dir, e), EXIT_REFUSED)
+    positions_fd = waiters_dir_open(positions_dir)
+    if positions_fd < 0:
+        fail("refusing untrusted positions dir %s (same trust rules as waiters dir)"
+             % positions_dir, EXIT_REFUSED)
+    position_guard_fd = position_guard_open(positions_fd, queue_key)
+    if position_guard_fd is None:
+        fail("refusing unsafe queue position guard for key %s" % queue_key, EXIT_REFUSED)
+    previous = read_position(positions_fd, position_name(queue_key))
+    if previous is not None:
+        record, st = previous
+        if record["expiry"] > time.time():
+            ticket = tuple(record["ticket"])
+        else:
+            remove_position(positions_fd, position_name(queue_key), st, key=queue_key)
+# Keep the class/limit head byte-compatible for older wrk and CI reservation.
+info = info.replace(" since=", " ticket=%d:%d since=" % ticket, 1)
 me_name = str(os.getpid())
 held_slot = -1
 acquired_at = None
@@ -13821,6 +14480,55 @@ defer_seen = False   # held back at least once: a defer row is owed
 defer_over = False   # guard fired: no more deferral for the rest of the wait
 defer_logged = False
 record_tmp = None    # mkstemp path mid-publish; every exit path drops it
+
+
+def save_position():
+    if positions_fd < 0:
+        return
+    record = {"key": queue_key, "ticket": ticket,
+              "expiry": time.time() + requeue_grace}
+    tmp = ".position-" + os.urandom(16).hex()
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                     0o600, dir_fd=positions_fd)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(record, f)
+            f.flush()
+            os.fsync(f.fileno())
+        if not position_guard_lock(position_guard_fd):
+            raise OSError("cannot lock queue position guard")
+        try:
+            os.replace(tmp, position_name(queue_key),
+                       src_dir_fd=positions_fd, dst_dir_fd=positions_fd)
+        finally:
+            position_guard_unlock(position_guard_fd)
+        # Some filesystems do not support directory fsync; atomic rename
+        # still ensures readers see a complete record after a process crash.
+        try:
+            os.fsync(positions_fd)
+        except OSError:
+            pass
+    except OSError as e:
+        print("wrk heavy: cannot save queue position: %s" % e, file=sys.stderr)
+    finally:
+        try:
+            os.remove(tmp, dir_fd=positions_fd)
+        except OSError:
+            pass
+
+
+def consume_position():
+    if positions_fd < 0:
+        return
+    if not position_guard_lock(position_guard_fd):
+        fail("cannot lock queue position guard", EXIT_REFUSED)
+    try:
+        previous = read_position(positions_fd, position_name(queue_key))
+        if previous is not None:
+            _, st = previous
+            remove_position_locked(positions_fd, position_name(queue_key), st)
+    finally:
+        position_guard_unlock(position_guard_fd)
 
 
 def end_defer(reason):
@@ -13934,8 +14642,13 @@ try:
                 elif defer_mark is not None:
                     defer_total += now - defer_mark
                     defer_mark = None
+            # CI keeps its existing guard and log clock; lane FIFO is a
+            # separate reservation and is never waived by spending it.
+            lane_limit = lane_reserved() if hclass == "lane" else 0
             for i, sfd in enumerate(slot_fds):
                 if i < reserved:
+                    continue
+                if i < lane_limit:
                     continue
                 try:
                     fcntl.flock(sfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -13947,6 +14660,7 @@ try:
                 break
             if time.monotonic() >= deadline:
                 end_defer("cap")
+                save_position()
                 log_event({"kind": "wait_cap", "phase": "slot",
                            "cmd": cmd_summary[:200], "limit": limit,
                            "wait_s": round(time.monotonic() - started_at, 3)})
@@ -13958,6 +14672,7 @@ try:
             fail("interrupted while waiting for a heavy slot on %s "
                  "-- command not run" % lock_path, 130)
     acquired_at = time.monotonic()
+    consume_position()
     end_defer("acquired")
     try:
         os.remove(me_name, dir_fd=waiters_fd)
@@ -13971,6 +14686,7 @@ try:
     # runs. With the wait off there is no second gate: refuse the late slot
     # exactly like a slot-wait expiry (same message, same wait_cap event).
     if not load_wait and acquired_at >= deadline:
+        save_position()
         log_event({"kind": "wait_cap", "phase": "slot",
                    "cmd": cmd_summary[:200], "limit": limit,
                    "wait_s": round(time.monotonic() - started_at, 3)})
@@ -13984,6 +14700,7 @@ try:
             if ratio is None or ratio < 1.0:
                 break
             if time.monotonic() >= deadline:
+                save_position()
                 log_event({"kind": "wait_cap", "phase": "load",
                            "cmd": cmd_summary[:200], "limit": limit,
                            "wait_s": round(time.monotonic() - started_at, 3)})
@@ -14011,6 +14728,10 @@ finally:
         except OSError:
             pass
     os.close(waiters_fd)
+    if positions_fd >= 0:
+        os.close(positions_fd)
+    if position_guard_fd >= 0:
+        os.close(position_guard_fd)
     if held_fd is not None:
         if run_at is not None:
             log_event({"kind": "run", "cmd": cmd_summary[:200],
@@ -14030,6 +14751,7 @@ case "${1:-}" in
   -h|--help) usage ;;
   spawn) shift; spawn_router_cmd "$@" ;;
   done) shift; done_cmd "$@" ;;
+  restore) shift; restore_cmd "$@" ;;
   escalate) shift; escalate_cmd "$@" ;;
   joined) shift; joined_cmd "$@" ;;
   round) shift; round_cmd "$@" ;;

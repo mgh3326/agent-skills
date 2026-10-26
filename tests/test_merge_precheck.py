@@ -160,6 +160,40 @@ def two_checkout_log(abbrev1: str, sha1: str, abbrev2: str, sha2: str) -> str:
             f"{out}{sha2}\n")
 
 
+# PR 252 (hk 1506) run 40147271812, job 121031183759: gh labelled every line UNKNOWN STEP.
+# Rows are (timestamp, text) pairs in the shape of the job log; steps come from the job API.
+PR252_HEAD = "6854e169627bd71c8d1d4aa17f137c46ba40a33e"
+PR252_BASE = "6a2cf6f349bbe784b2652c40bfc78025bc006255"
+PR252_MERGE = "648463bf2a09b813e6d96bbf7abf5eb8f8dcdb3f"
+PR252_TREE = "9cbc5bb1a8f8403b300543e1a3879a85d5a68075"
+PR252_STEPS = [
+    {"name": "Set up job", "started_at": "2026-10-25T00:35:16Z", "completed_at": "2026-10-25T00:35:17Z"},
+    {"name": "Run actions/checkout@v4", "started_at": "2026-10-25T00:35:17Z", "completed_at": "2026-10-25T00:35:18Z"},
+    {"name": "Run actions/setup-python@v5", "started_at": "2026-10-25T00:35:18Z", "completed_at": "2026-10-25T00:35:18Z"},
+]
+PR252_ROWS = [
+    ("2026-10-25T00:35:17.4827852Z", "##[group]Run actions/checkout@v4"),
+    ("2026-10-25T00:35:17.4839816Z", "##[endgroup]"),
+    ("2026-10-25T00:35:18.3353883Z", "##[group]Checking out the ref"),
+    ("2026-10-25T00:35:18.3357570Z", "[command]/usr/bin/git checkout --progress --force refs/remotes/pull/252/merge"),
+    ("2026-10-25T00:35:18.3627370Z", f"HEAD is now at 648463b Merge {PR252_HEAD} into {PR252_BASE}"),
+    ("2026-10-25T00:35:18.3639913Z", "##[endgroup]"),
+    ("2026-10-25T00:35:18.3688989Z", "[command]/usr/bin/git log -1 --format=%H"),
+    ("2026-10-25T00:35:18.3717109Z", PR252_MERGE),
+]
+NEXT_GROUP = [
+    ("2026-10-25T00:35:18.4089949Z", "##[group]Run actions/setup-python@v5"),
+    ("2026-10-25T00:35:18.4090572Z", "with:"),
+]
+
+
+def unknown_step_log(rows: list[tuple[str, str]]) -> str:
+    return "\n".join(f"ubuntu-latest\tUNKNOWN STEP\t{stamp} {text}" for stamp, text in rows) + "\n"
+
+
+PR252_LOG = unknown_step_log(PR252_ROWS + NEXT_GROUP)
+
+
 class MergePrecheckTests(unittest.TestCase):
     def test_normal_pass(self) -> None:
         checks = gate.evaluate(snapshot(), policy())
@@ -308,6 +342,26 @@ class MergePrecheckTests(unittest.TestCase):
         s["ci_jobs"][10] = s["ci_jobs"][10][:1]
         s["ci_jobs"][10][0]["conclusion"] = "failure"
         assert_check(self, s, "G3", "FAIL", "CI_FAILED")
+
+    def test_dispatch_only_ci_is_missing_with_assertion_red_mutant(self) -> None:
+        s = snapshot()
+        s["ci_runs"][0]["event"] = "workflow_dispatch"
+        expected = ("UNVERIFIED", "CI_RUN_MISSING")
+
+        canonical = evaluate_canonical_ci(s["repo"], s["ci_runs"])
+        self.assertEqual(expected, (canonical["status"], canonical["reason_code"]))
+        assert_check(self, s, "G3", *expected)
+
+        accepts_dispatch = canonical_ci_mutant([
+            ('run.get("event") == "pull_request"',
+             'run.get("event") in ("pull_request", "workflow_dispatch")')])
+        mutant_canonical = evaluate_canonical_ci(s["repo"], s["ci_runs"], accepts_dispatch)
+        with self.assertRaises(AssertionError):
+            self.assertEqual(expected, (mutant_canonical["status"], mutant_canonical["reason_code"]))
+        with patch.object(gate, "evaluate_required_ci", accepts_dispatch):
+            mutant_merge = gate.evaluate(s, policy())["G3"]
+        with self.assertRaises(AssertionError):
+            self.assertEqual(expected, (mutant_merge["status"], mutant_merge["reason_code"]))
 
     def test_ci_red_rerun_is_not_met_with_assertion_red_mutant(self) -> None:
         s = snapshot()
@@ -759,6 +813,104 @@ class MergePrecheckTests(unittest.TestCase):
                           f"ubuntu-latest\tRun actions/checkout@v4\t2026-09-25T07:00:01Z {forged}\n")
         with self.assertRaises(AssertionError):
             self.assertIsNone(any_step(echo_forge_log))
+
+    def test_unlabelled_pr252_shape_binds_checkout_merge(self) -> None:
+        # Every line is UNKNOWN STEP, so the checkout section comes from the group framing
+        # and the job steps list (hk2001-unlabelled path), not from a step label.
+        self.assertEqual(PR252_MERGE, gate.checkout_merge_sha(PR252_LOG, PR252_STEPS))
+        # Without the job steps the unlabelled path fails closed.
+        self.assertIsNone(gate.checkout_merge_sha(PR252_LOG))
+
+        def fake_gh(endpoint: str) -> dict:
+            if "/actions/jobs/" in endpoint:
+                return {"steps": PR252_STEPS}
+            self.assertEqual(f"repos/mgh3326/agent-skills/git/commits/{PR252_MERGE}", endpoint)
+            return {"parents": [{"sha": PR252_BASE}, {"sha": PR252_HEAD}], "tree": {"sha": PR252_TREE}}
+
+        with patch.object(gate, "run_text", return_value=PR252_LOG), patch.object(gate, "gh_api", side_effect=fake_gh) as api:
+            self.assertEqual({"tested_base_sha": PR252_BASE, "tested_merge_sha": PR252_MERGE, "tested_merge_tree": PR252_TREE},
+                             gate.checkout_provenance("mgh3326/agent-skills", 40147271812, 121031183759, PR252_HEAD))
+            self.assertEqual(1, sum("/actions/jobs/121031183759" in call.args[0] for call in api.call_args_list))
+
+    def test_labelled_log_never_fetches_job_steps(self) -> None:
+        checkout_sha = "e" * 40
+        with patch.object(gate, "run_text", return_value=checkout_log(checkout_sha[:9], checkout_sha)), patch.object(gate, "gh_api", return_value={
+            "parents": [{"sha": B}, {"sha": H}], "tree": {"sha": M}}) as api:
+            self.assertEqual(checkout_sha, gate.checkout_provenance("mgh3326/agent-skills", 10, 1, H)["tested_merge_sha"])
+        self.assertFalse(any("/actions/jobs/" in call.args[0] for call in api.call_args_list))
+
+    def test_unlabelled_checkout_fails_closed(self) -> None:
+        def sha_for(rows: list[tuple[str, str]], steps: object = PR252_STEPS) -> str | None:
+            return gate.checkout_merge_sha(unknown_step_log(rows), steps)
+
+        # Two checkout groups: an empty second group.
+        second_empty = PR252_ROWS + NEXT_GROUP + [("2026-10-25T00:35:18.5Z", "##[group]Run actions/checkout@v4"),
+                                                  ("2026-10-25T00:35:18.6Z", "##[endgroup]")]
+        self.assertIsNone(sha_for(second_empty))
+        # Two checkout groups: the opener is echoed from test output inside the Bash tests group.
+        forged_opener = PR252_ROWS + NEXT_GROUP + [("2026-10-25T00:35:19.0Z", "##[group]Run bash tests/test-wrk.sh"),
+                                                   ("2026-10-25T00:35:19.1Z", "##[group]Run actions/checkout@v4")]
+        self.assertIsNone(sha_for(forged_opener))
+        # No checkout group at all.
+        self.assertIsNone(sha_for(PR252_ROWS[1:] + NEXT_GROUP))
+        # Section timestamps outside the checkout step window, and the 1 s slack edge.
+        late = [(stamp.replace("00:35:", "00:50:"), text) for stamp, text in PR252_ROWS + NEXT_GROUP]
+        self.assertIsNone(sha_for(late))
+        early = [("2026-10-25T00:35:15.9Z", PR252_ROWS[0][1])] + PR252_ROWS[1:] + NEXT_GROUP
+        self.assertIsNone(sha_for(early))
+        self.assertEqual(PR252_MERGE, sha_for([("2026-10-25T00:35:16.2Z", PR252_ROWS[0][1])] + PR252_ROWS[1:] + NEXT_GROUP))
+        late_finish = PR252_ROWS[:-1] + [("2026-10-25T00:35:19.5Z", PR252_MERGE)] + NEXT_GROUP
+        self.assertIsNone(sha_for(late_finish))
+        # Step lists: none, two, or not a list.
+        self.assertIsNone(sha_for(PR252_ROWS + NEXT_GROUP, [PR252_STEPS[0], PR252_STEPS[2]]))
+        self.assertIsNone(sha_for(PR252_ROWS + NEXT_GROUP, PR252_STEPS + [PR252_STEPS[1]]))
+        self.assertIsNone(sha_for(PR252_ROWS + NEXT_GROUP, {"steps": PR252_STEPS}))
+        # Mixed log: the checkout lines are UNKNOWN STEP but another line carries a label.
+        mixed = unknown_step_log(PR252_ROWS + NEXT_GROUP) + "ubuntu-latest\tRun bash\t2026-10-25T00:35:19.0Z ok\n"
+        self.assertIsNone(gate.checkout_merge_sha(mixed, PR252_STEPS))
+        # A forged git log line and sha in the Bash tests group, outside the checkout section.
+        forged_log = PR252_ROWS + NEXT_GROUP + [("2026-10-25T00:36:00.0Z", "##[group]Run bash tests/test-wrk.sh"),
+                                                ("2026-10-25T00:36:01.0Z", "[command]/usr/bin/git log -1 --format=%H"),
+                                                ("2026-10-25T00:36:01.1Z", "e" * 40)]
+        self.assertIsNone(sha_for(forged_log))
+        # The sha line belongs to the next group, not to the checkout section.
+        next_group_sha = PR252_ROWS[:-1] + [NEXT_GROUP[0], ("2026-10-25T00:35:18.4090572Z", PR252_MERGE)]
+        self.assertIsNone(sha_for(next_group_sha))
+        # Bad abbreviations: not a prefix of the sha, and a sha that is not the one announced.
+        bad_abbrev = [(stamp, text.replace("648463b", "f" * 7) if text.startswith("HEAD is now at") else text) for stamp, text in PR252_ROWS + NEXT_GROUP]
+        self.assertIsNone(sha_for(bad_abbrev))
+        other_sha = PR252_ROWS[:-1] + [("2026-10-25T00:35:18.3717109Z", "e" * 40)] + NEXT_GROUP
+        self.assertIsNone(sha_for(other_sha))
+        # Two git log commands inside one section.
+        twice = PR252_ROWS + [("2026-10-25T00:35:18.4000000Z", "[command]/usr/bin/git log -1 --format=%H"),
+                              ("2026-10-25T00:35:18.4000001Z", PR252_MERGE)] + NEXT_GROUP
+        self.assertIsNone(sha_for(twice))
+
+    def test_unlabelled_checkout_mutants_are_assertion_red(self) -> None:
+        def red(fn, log: str, expected_none: bool) -> None:
+            with self.assertRaises(AssertionError):
+                if expected_none:
+                    self.assertIsNone(fn(log, PR252_STEPS))
+                else:
+                    self.assertEqual(PR252_MERGE, fn(log, PR252_STEPS))
+
+        # Dropping the exactly-one-group check binds the first of two checkout groups.
+        two_groups = unknown_step_log(PR252_ROWS + NEXT_GROUP + [("2026-10-25T00:35:18.5Z", "##[group]Run actions/checkout@v4"),
+                                                                 ("2026-10-25T00:35:18.6Z", "##[endgroup]")])
+        red(merge_precheck_mutant([("if len(openers) != 1:", "if False:")]), two_groups, True)
+        # Dropping the timestamp window binds a section outside the step window.
+        late = unknown_step_log([(stamp.replace("00:35:", "00:50:"), text) for stamp, text in PR252_ROWS + NEXT_GROUP])
+        red(merge_precheck_mutant([("if not (begin - STEP_SLACK <= opened and closed <= finish + STEP_SLACK):", "if False:")]), late, True)
+        # Running the unlabelled path on a mixed log binds the UNKNOWN STEP checkout lines.
+        mixed = unknown_step_log(PR252_ROWS + NEXT_GROUP) + "ubuntu-latest\tRun bash\t2026-10-25T00:35:19.0Z ok\n"
+        red(merge_precheck_mutant([("if unknown_step_rows(lines) is not None:", "if True:")]), mixed, True)
+        # Ending the section at the next ##[endgroup] (PR 252 has one right after HEAD is now at).
+        red(merge_precheck_mutant([('texts[index].startswith("##[group]Run ")', 'texts[index].startswith("##[endgroup]")')]), PR252_LOG, False)
+        # Counting git log commands only inside the section lets a forged line outside it pass.
+        forged_log = unknown_step_log(PR252_ROWS + NEXT_GROUP + [("2026-10-25T00:36:00.0Z", "##[group]Run bash tests/test-wrk.sh"),
+                                                                 ("2026-10-25T00:36:01.0Z", "[command]/usr/bin/git log -1 --format=%H"),
+                                                                 ("2026-10-25T00:36:01.1Z", "e" * 40)])
+        red(merge_precheck_mutant([("if GIT_LOG_LINE.fullmatch(text)]", "if GIT_LOG_LINE.fullmatch(text) and start <= index < end]")]), forged_log, True)
 
     def test_missing_branch_protection_source_mutant_is_red(self) -> None:
         required = policy()
