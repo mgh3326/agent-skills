@@ -100,6 +100,13 @@ HK2012_TITLES = [
     (150, "scopefuel tester probe"),
     (151, "scopefuel 콘솔 note"),
     (152, "panewire 콘솔 queue note"),
+    (153, "admiral audit notes"),
+    (154, "robin-prefect-automations sync notes"),
+    (155, "strategy-lab backtest notes"),
+    (156, "fillwire ingest notes"),
+    (157, "experiment sweep notes"),
+    (158, "experiments planned notes"),
+    (159, "admirable notes"),
 ]
 for i, title in HK2012_TITLES:
     tasks[str(i)] = {"id": i, "state": "backlog", "project": None,
@@ -231,6 +238,13 @@ want = [
     (150, "python", "title:\\bscopefuel\\b"),  # a product name beats the fleet tester term
     (151, "python", "title:\\bscopefuel\\b"),  # a product name beats the Korean console term
     (152, "go-backend", "title:\\bpanewire\\b"),  # a fleet name beats the Korean console term
+    (153, "go-backend", "title:\\badmiral\\b"),
+    (154, "trading", "title:\\brobin-prefect-automations\\b"),
+    (155, "trading", "title:\\bstrategy-lab\\b"),
+    (156, "trading", "title:\\bfillwire\\b"),
+    (157, "python", "title:\\bexperiment\\b"),
+    (158, "", "-"),                       # near-miss: experiments is not experiment
+    (159, "", "-"),                       # near-miss: admirable is not admiral
 ]
 for tid, area, rule in want:
     r = rows.get(str(tid)) or sys.exit(f"missing row for task {tid}")
