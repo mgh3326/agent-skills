@@ -5238,28 +5238,42 @@ WRK_O3_PY=""
 O3_OUT="" O3_RC=0
 wrk_o3() {
   if [[ -z "$WRK_O3_PY" ]]; then
-    WRK_O3_PY="$(python3 -c 'import os, sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "wrk_o3.py"))' "${BASH_SOURCE[0]}")"
+    WRK_O3_PY="$(python3 -c 'import os, sys; print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "wrk_o3.py"))' "${BASH_SOURCE[0]}")" ||
+      { WRK_O3_PY=""; echo "wrk: o3 adapter unavailable: python3 failed" >&2; return 2; }
   fi
   [[ -f "$WRK_O3_PY" ]] || { echo "wrk: o3 adapter missing: $WRK_O3_PY" >&2; return 2; }
   python3 "$WRK_O3_PY" "$@"
 }
 
-# True when this account has a records-mode file. Without one every command is
-# legacy and the adapter is never consulted, so the O2 paths (and a copy of
-# this file run on its own) behave exactly as before. The adapter itself
-# validates the file and the account home whenever it is consulted.
+# True when something exists at this account's records-mode path. When
+# nothing does (no file, no symlink, nothing else) every command is legacy and
+# neither the adapter nor Python runs, in production and test mode alike, so
+# the O2 paths (and a copy of this file run on its own, or a host with a
+# broken python3) behave exactly as before. Anything there goes to the adapter,
+# which parses it and fails closed (director-1 discovery ruling). The passwd
+# home comes from the shell's own ~user expansion; HOME is looked at too, which
+# only ever makes the adapter (reading the passwd home alone) decide.
 o3_mode_file_present() {
-  local home
+  local user home candidate
+  local -a homes=()
   if [[ "${WRK_TEST_MODE:-}" == 1 ]]; then
     # Test mode with HOME unset is legacy and reads no path.
     [[ -n "${HOME:-}" ]] || return 1
-    home="$HOME"
+    homes+=("$HOME")
   else
-    home="$(python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)' 2>/dev/null)" || home=""
+    user="$(id -un 2>/dev/null)" || user=""
+    # An undeterminable passwd home is not legacy: the adapter decides, fail closed.
+    [[ "$user" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
+    eval "home=~$user"
+    [[ "$home" == /* ]] || return 0
+    homes+=("$home")
+    [[ -z "${HOME:-}" ]] || homes+=("$HOME")
   fi
-  # An undeterminable home is not legacy: the adapter decides, fail closed.
-  [[ -n "$home" ]] || return 0
-  [[ -e "$home/.config/wrk/records-mode" || -L "$home/.config/wrk/records-mode" ]]
+  for home in "${homes[@]}"; do
+    candidate="$home/.config/wrk/records-mode"
+    [[ -e "$candidate" || -L "$candidate" ]] && return 0
+  done
+  return 1
 }
 
 # o3_call OP ARGS... — sets O3_OUT (stdout) and O3_RC; stderr passes through.

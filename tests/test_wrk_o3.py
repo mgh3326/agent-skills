@@ -1222,6 +1222,66 @@ class ShadowCase(O3Case):
         self.assertEqual(out.returncode, 2, out.stderr)
         self.assertIn("records_mode_invalid", out.stderr)
 
+    def discovery(self, w, production):
+        """The bin/wrk discovery path with an exit-1 python3 stub first on PATH."""
+        text = (BIN / "wrk").read_text()
+
+        def function(name):
+            start = text.index(name + "() {")
+            return text[start:text.index("\n}\n", start) + 3]
+        script = "\n".join(['set -euo pipefail', 'WRK_O3_PY="" O3_OUT="" O3_RC=0',
+                            function("wrk_o3"), function("o3_mode_file_present"), function("o3_call"),
+                            function("o3_exit_on_error"), 'o3_call round-status job-a', 'o3_exit_on_error',
+                            'printf "%s\\n" "$O3_OUT"'])
+        stub_dir, log = w.base / "nopy3", w.base / "nopy3.log"
+        write_exec(stub_dir / "python3", "#!/bin/sh\necho called >>'%s'\nexit 1\n" % log)
+        env = w.env(PATH="%s:%s" % (stub_dir, safe_path()), HOME=w.home)
+        if production:
+            env.pop("WRK_TEST_MODE", None)
+        out = subprocess.run(["bash", "-c", script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        return out, log
+
+    def test_discovery_absent_file_is_legacy_without_python(self):
+        real = Path(REAL_HOME) / ".config" / "wrk" / "records-mode"
+        for production in (False, True):
+            if production and (real.exists() or real.is_symlink()):
+                self.skipTest("this account has a real records-mode file")
+            with self.subTest(production=production):
+                w = self.world()
+                w.mode(None)
+                out, log = self.discovery(w, production)
+                self.assertEqual(out.returncode, 0, out.stderr)
+                self.assertEqual(out.stdout.strip(), "LEGACY")
+                self.assertFalse(log.exists(), "no Python runs when nothing is at the path")
+
+    def test_discovery_present_file_with_a_broken_python_refuses(self):
+        for production in (False, True):
+            with self.subTest(production=production):
+                w = self.world()
+                w.mode("shadow")
+                out, log = self.discovery(w, production)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertNotIn("LEGACY", out.stdout)
+                self.assertTrue(log.exists(), "the parse path ran")
+
+    def test_discovery_dangling_symlink_takes_the_parse_path_and_refuses(self):
+        for production in (False, True):
+            with self.subTest(production=production):
+                w = self.world()
+                path = w.home / ".config" / "wrk" / "records-mode"
+                path.symlink_to(w.base / "no-such-target")
+                out, log = self.discovery(w, production)
+                self.assertNotEqual(out.returncode, 0)
+                self.assertNotIn("LEGACY", out.stdout)
+                self.assertTrue(log.exists())
+        # With a working python3 the adapter refuses the dangling link too.
+        w = self.world()
+        (w.home / ".config" / "wrk" / "records-mode").symlink_to(w.base / "no-such-target")
+        w.local_claim("job-a")
+        out = w.run("round", "status", "job-a")
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("records_mode_invalid", out.stderr)
+
     def test_records_mode_file_fails_closed(self):
         w = self.world()
         w.local_claim("job-a")
