@@ -786,8 +786,9 @@ Retired TUI agy profiles are rejected. Emergency headless backup:
   agy -p "$(cat PROMPT_FILE)"
 
 Environment:
-  WRK_KEEP_FAILED_PANE=1  keep a failed spawn's pane for a manual look (the
-                          pane screen is always saved to <jobdir>/spawn-failure-screen.txt)
+  WRK_KEEP_FAILED_PANE=1  keep a failed spawn's pane for a manual look (wrk
+                          attempts to save the pane screen best-effort to
+                          <jobdir>/spawn-failure-screen.txt, then -2, -3, ...)
 USAGE
 }
 
@@ -868,12 +869,15 @@ PANEWIRE_PROMPT_CODEX_TIMEOUT_SECONDS=60
 # (#770: JE15b on macOS CI blocked 60s under a 2s bound).
 run_bounded() {
   local secs="$1"; shift
+  # hk 2011: a child that ignores TERM is KILLed this many seconds after the
+  # bound, so the total bound is secs plus this grace. Every caller gets it.
+  local kill_grace=2
   if command -v timeout >/dev/null 2>&1; then
-    timeout "$secs" "$@"
+    timeout -k "$kill_grace" "$secs" "$@"
     return
   fi
   if command -v gtimeout >/dev/null 2>&1; then
-    gtimeout "$secs" "$@"
+    gtimeout -k "$kill_grace" "$secs" "$@"
     return
   fi
   python3 -c 'import os, signal, subprocess, sys
@@ -2333,6 +2337,23 @@ quota_hub_policy_gate() {
 # can carry account, model or path text, so it is written 0600 and never
 # echoed to stdout/stderr. A second failure of the same job writes
 # spawn-failure-screen-2.txt, then -3, never overwriting.
+# hk 2011 test seam: only a WRK_TEST_MODE=1 run that sets WRK_TEST_PAUSE_AT=
+# capture-name and WRK_TEST_PAUSE_DIR reaches it. The first capture that picks
+# a file name parks until $WRK_TEST_PAUSE_DIR/release exists (or 30 s pass), so
+# a test can start a second capture inside the name-pick window. Production
+# never sets WRK_TEST_MODE, so the check below is the whole cost.
+capture_test_pause() {
+  [[ "${WRK_TEST_MODE:-}" == 1 && "${WRK_TEST_PAUSE_AT:-}" == capture-name &&
+     -n "${WRK_TEST_PAUSE_DIR:-}" ]] || return 0
+  local waited=0
+  mkdir "$WRK_TEST_PAUSE_DIR/paused.lock" 2>/dev/null || return 0
+  : >"$WRK_TEST_PAUSE_DIR/paused"
+  while [[ ! -e "$WRK_TEST_PAUSE_DIR/release" && "$waited" -lt 300 ]]; do
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+}
+
 spawn_capture_failed_pane_screen() {
   [[ -n "${JOB_ID:-}" && -n "${PANE:-}" ]] || return 0
   local dir screen n=1
@@ -2343,6 +2364,16 @@ spawn_capture_failed_pane_screen() {
   }
   screen="$dir/spawn-failure-screen.txt"
   while [[ -e "$screen" ]]; do
+    n=$((n + 1))
+    screen="$dir/spawn-failure-screen-$n.txt"
+  done
+  capture_test_pause
+  # hk 2011: the name is created exclusively (noclobber). A concurrent capture
+  # that took this name between the check above and here makes the create fail,
+  # and the next suffix is tried. Any other create failure falls through to the
+  # read below, which then reports as before.
+  until ( umask 077; set -C; : >"$screen" ) 2>/dev/null; do
+    [[ -e "$screen" ]] || break
     n=$((n + 1))
     screen="$dir/spawn-failure-screen-$n.txt"
   done
@@ -2359,7 +2390,7 @@ spawn_pane_cleanup() {
   SPAWN_PANE_OPEN=0
   spawn_capture_failed_pane_screen
   if [[ "${WRK_KEEP_FAILED_PANE:-}" == 1 ]]; then
-    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close ${TAB_ID:-its tab}" >&2
+    echo "wrk: kept failed pane $PANE (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close $PANE" >&2
     return 0
   fi
   "$HERDR" pane close "$PANE" >/dev/null 2>&1     && echo "wrk: closed leftover pane $PANE after spawn failure" >&2     || echo "wrk: failed to close leftover pane $PANE — close it manually" >&2
@@ -5385,7 +5416,8 @@ delegate_job_cmd() {
   if [[ "$prc" -ne 0 ]]; then
     # A probe killed by its own guard means the daemon is wedged, not absent —
     # emit_relay_event must not re-enter it inside this same invocation.
-    if [[ "$prc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: 137 is the KILL that run_bounded sends after its TERM grace.
+    if [[ "$prc" == 124 || "$prc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     return 0
   fi
   [[ "$probe" == "$JOB_PROBE_TOKEN" ]] || return 0
@@ -5402,7 +5434,8 @@ delegate_job_cmd() {
     # the local path's completion dedup suppresses the second write. On a
     # timeout the daemon is wedged — mark it so emit_relay_event does not
     # stall this invocation on another doomed panewire call.
-    if [[ "$rc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: 137 is the KILL that run_bounded sends after its TERM grace.
+    if [[ "$rc" == 124 || "$rc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     warn "panewire job $sub delegation failed or timed out (rc=$rc); using wrk's own path"
     return 0
   fi
@@ -9745,6 +9778,7 @@ spillover_remote_spawn() {
   fi
   local remote_args=(env "HERDR_SESSION=$session")
   [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
+  [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")
   remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   # Builders only — forwarding the flag to a worker would mute the execution
   # host's own session-machine_ids check while this host then named the
@@ -9783,6 +9817,14 @@ spillover_remote_spawn() {
   "${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" "$remote_cmd; rc=\$?; rm -f -- $(printf '%q' "$remote_prompt"); exit \$rc" >"$out" 2>"$remote_err"
   rc=$?
   set -e
+  # hk 2011: a remote wrk that kept its failed pane (WRK_KEEP_FAILED_PANE is
+  # forwarded from this host) left a pane open. The auto round must end there
+  # rather than spawn the job again on another host or locally.
+  SPILL_REMOTE_PANE_KEPT=0
+  if [[ "$rc" -ne 0 && "${WRK_KEEP_FAILED_PANE:-}" == 1 ]] &&
+     grep -q '^wrk: kept failed pane ' "$remote_err"; then
+    SPILL_REMOTE_PANE_KEPT=1
+  fi
   # A failed remote spawn must answer with the remote's own words: stderr is
   # relayed verbatim and non-OK stdout follows it onto the local stderr.
   spillover_relay_remote_err "$remote_err"
@@ -9887,7 +9929,11 @@ spillover_try_candidate() {
   else
     if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "$@"; then rc=0; else rc=$?; fi
     if [[ "$rc" -ne 0 && -n "${SPILL_CANDIDATE_CLASS_FILE:-}" ]]; then
-      printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      if [[ "${SPILL_REMOTE_PANE_KEPT:-0}" == 1 ]]; then
+        printf 'kept-pane\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      else
+        printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      fi
     fi
   fi
   if [[ "$rc" -ne 0 && "$hold_diag" == 1 ]]; then
@@ -10123,6 +10169,7 @@ spawn_router_cmd() {
   # remote_full_seen latches the positive capacity evidence the post-round
   # wake requires — a round with no remote-full answer never wakes.
   local wake_pending="" remote_full_seen=0 wake_target=""
+  local kept_pane_round=0 kept_pane=""
   # --host auto holds every per-candidate diagnostic until the round settles:
   # a successful spawn must print nothing about the hosts it skipped, while an
   # all-fail round owes the operator one attributed line per host plus whatever
@@ -10190,9 +10237,20 @@ spawn_router_cmd() {
           if [[ "$(spillover_value "hosts.$candidate" wake 2>/dev/null || true)" == panewire ]]; then
             wake_pending+="$candidate "
           fi ;;
+        kept-pane)
+          kept_pane_round=1
+          kept_pane="$(sed -n 's/^wrk: kept failed pane \([^ ]*\) .*/\1/p' "$cand_err" | head -1)" ;;
       esac
       cat "$cand_err" >>"$auto_diag"
       rm -f "$cand_err" "$cand_class"
+      if [[ "$kept_pane_round" == 1 ]]; then
+        # The remote pane is still up: a second spawn elsewhere would give the
+        # job two panes, so the round ends here with the remote's rc.
+        [[ -s "$auto_diag" ]] && cat "$auto_diag" >&2
+        rm -f "$auto_diag"
+        echo "wrk: remote host '$candidate' left failed pane ${kept_pane:-unknown} open (WRK_KEEP_FAILED_PANE=1); not trying another host or the local fallback" >&2
+        return "$last_rc"
+      fi
     else
       if spillover_try_candidate 0 "$candidate" "$cwd" "$prompt" "${filtered[@]}"; then
         return 0
