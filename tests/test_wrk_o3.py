@@ -1344,6 +1344,45 @@ class SpawnCase(O3Case):
         self.assertEqual(w.herdr_calls(), [])
         self.assertEqual(len(w.records("new-builder")), 2, "the central claim stays visible")
 
+    def test_o3_refusals_name_their_code_and_legacy_74_75_name_none(self):
+        """esc-3 I6: 74 and 75 are shared with the legacy spawn exits, so every
+        O3 refusal names its code and the legacy paths name none."""
+        cases = {66: ("not_found", dict(enroll=False)), 73: ("claim_conflict", dict(tier="T3")),
+                 75: ("o3_unsupported", dict(namespace=False)), 77: ("host_mismatch", dict(reviewer=True))}
+        for rc, (code, spec) in cases.items():
+            with self.subTest(rc):
+                w = self.world()
+                w.mode("required")
+                w.set_stub(namespace=spec.get("namespace", True))
+                if spec.get("reviewer"):
+                    w.enroll("job-a", host="mac-dev", tier="T1")
+                    w.local_claim("job-a")
+                    out = self.spawn_tester(w)
+                elif spec.get("enroll", True):
+                    if spec.get("namespace", True):
+                        w.enroll("new-builder", owner="new-lane", tier=spec.get("tier", "T1"))
+                    out = self.builder(w)
+                else:
+                    out = self.builder(w)
+                self.assertRc(out, rc, code)
+                self.assertIn("wrk: o3 %s" % code, out.stderr)
+        # Legacy 74: an active arbiter duplicate.
+        w = self.world()
+        w.mode(None)
+        env = w.env(ARBITER_BIN=BIN / "arbiter")
+        subprocess.run([str(BIN / "arbiter"), "claim", "--job", "dup-a", "--agent-label", "incumbent", "--lane",
+                        "incumbent-lane", "--t", "T1"], env=env, check=True, stdout=subprocess.DEVNULL)
+        out = w.spawn("--task", "2400", "--job", "dup-a")
+        self.assertEqual(out.returncode, 74, out.stderr)
+        self.assertNotIn("wrk: o3 ", out.stderr)
+        # Legacy 75: the duplicate state lookup is unreadable.
+        subprocess.run([str(BIN / "arbiter"), "claim", "--job", "dup-b", "--agent-label", "incumbent", "--lane",
+                        "incumbent-lane", "--t", "T1"], env=env, check=True, stdout=subprocess.DEVNULL)
+        out = w.spawn("--task", "2400", "--job", "dup-b", ARBITER_BIN=ROOT / "tests" / "fixtures" / "arbiter-proxy",
+                      REAL_ARBITER=BIN / "arbiter", WRK_ARBITER_PROXY_MODE="job-get-fails")
+        self.assertEqual(out.returncode, 75, out.stderr)
+        self.assertNotIn("wrk: o3 ", out.stderr)
+
     def scenario_legacy_spawn_makes_both_task_calls(self, bindir):
         w = self.world(bindir=bindir)
         w.mode(None)
@@ -1509,6 +1548,34 @@ class CentralCase(O3Case):
         status = w.run("round", "status", "job-i")
         self.assertIn("rounds=3", status.stdout)
         self.assertIn("state=active", status.stdout)
+
+    def test_import_seal_names_each_file_present_on_one_side_only(self):
+        for direction in ("dir has extra", "server has extra"):
+            with self.subTest(direction):
+                w = self.world()
+                w.mode("required")
+                w.set_stub()
+                w.seed("job-i", "claim", {"job_id": "job-i", "owner_lane": "b2400-a", "parent_lane": "director-1",
+                                          "task_id": 2400, "host_client_id": "desktop", "role": "builder",
+                                          "tier": "T2", "review_of": None, "predecessor_job_id": None,
+                                          "supersedes": None})
+                archive = w.base / "archive"
+                shutil.copytree(PACK / "legacy" / "planted" / "events", archive)
+                self.assertRc(w.run("o3", "central", "import-begin", "job-i", "--as", "director-1"), 0)
+                self.assertRc(w.run("o3", "central", "import", "job-i", "--as", "director-1", "--events-dir",
+                                    archive), 0)
+                if direction == "dir has extra":
+                    odd = archive / "00009-job.round.json"
+                    odd.write_text('{"kind":"job.round","round":9}\n')
+                    want = "only in --events-dir: %s" % odd
+                else:
+                    odd = sorted(archive.glob("*.json"))[0]
+                    odd.unlink()
+                    want = "only on the server: %s" % odd
+                out = w.run("o3", "central", "import-seal", "job-i", "--as", "director-1", "--events-dir", archive)
+                self.assertRc(out, 2)
+                self.assertIn(want, out.stderr)
+                self.assertEqual([r for r in w.records("job-i") if r["kind"] == "import_seal"], [])
 
     def test_import_seal_refuses_when_the_archive_differs(self):
         w = self.world()

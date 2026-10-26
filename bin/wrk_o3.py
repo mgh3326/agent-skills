@@ -1882,8 +1882,11 @@ def central(ctx, op, job, opts):
             if server != local:
                 # Desk safety, not the server's import_unsealed: a seal pins only the
                 # archive actually supplied, so an incomplete import is not sealed.
-                raise Fail("usage", "central import-seal: the server's imports (%d) differ from the archive in "
-                           "--events-dir (%d); import the missing events first" % (len(server), len(local)))
+                # Each file present on one side only is named (esc-3 I5).
+                lines = ["only on the server: %s (sha256 %s)" % item for item in sorted(server - local)]
+                lines += ["only in --events-dir: %s (sha256 %s)" % item for item in sorted(local - server)]
+                raise Fail("usage", "central import-seal: the server's imports differ from the archive in "
+                           "--events-dir; nothing sealed\n  " + "\n  ".join(lines))
             return fresh.summary["claim_seq"], fresh.snapshot_seq, {
                 "begin_seq": begins[0]["seq"], "expected_import_count": len(manifest),
                 "manifest_sha256": sha256_hex(canonical(manifest).encode("utf-8")), "reason_code": reason}
