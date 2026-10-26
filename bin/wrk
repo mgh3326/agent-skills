@@ -12920,11 +12920,15 @@ def with_class(text):
     toks = text.split(None, 5)
     if not toks or not toks[0].startswith("pid="):
         return text
-    if any(t.startswith("class=") for t in toks[1:4]):
-        return text
     if len(toks) > 1 and toks[1].startswith("start="):
-        return (toks[0] + " " + toks[1] + " class=lane "
-                + text[len(toks[0]) + len(toks[1]) + 2:])
+        # Keep the established status line shape while the on-disk fixed head
+        # carries its owner identity beside pid.
+        tail = text[len(toks[0]) + len(toks[1]) + 2:]
+        if any(t.startswith("class=") for t in toks[2:4]):
+            return toks[0] + " " + tail
+        return toks[0] + " class=lane " + tail
+    if any(t.startswith("class=") for t in toks[1:3]):
+        return text
     return toks[0] + " class=lane" + text[len(toks[0]):]
 
 
