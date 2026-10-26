@@ -905,6 +905,19 @@ def advance_snapshot(directory, job, outcome):
         pass
 
 
+def retained_receipts(directory, job):
+    """Accepted receipts of this job's intents, read without the lock (a
+    witness only; a broken file is refused where intents are used)."""
+    try:
+        raw = read_private(os.path.join(directory, INTENTS))
+        if raw is None:
+            return []
+        document = check_intents_doc(strict_loads(raw.decode("utf-8")), job)
+    except (Fail, UnicodeDecodeError, ValueError):
+        return []
+    return [i["receipt"] for i in document["intents"] if i["state"] == "accepted"]
+
+
 def snapshot_regressed(snapshot, state):
     """The cached read is a retained witness too."""
     if snapshot is None:
@@ -1108,12 +1121,25 @@ class Ctx(object):
         return safe_job_dir(self.inbox, job)
 
     def state(self, job, store=None):
+        """A fresh complete canonical read, checked against the negative
+        witnesses: retained receipts and the last complete snapshot. A witness
+        can only refuse (director-1 regressed-history ruling): a job it shows
+        enrolled that now reads not_found, or a changed generation or lower seq,
+        is history_regressed with one job.o3_warning and no legacy fallback."""
         directory = self.jobdir(job)
-        retained = store.receipts() if store is not None else []
-        state = read_state(job, retained)
-        if state is not None:
-            if snapshot_regressed(load_snapshot(directory, job) if os.path.isdir(directory) else None, state):
+        retained = store.receipts() if store is not None else retained_receipts(directory, job)
+        snapshot = load_snapshot(directory, job) if os.path.isdir(directory) else None
+        try:
+            state = read_state(job, retained)
+            if state is None and (retained or snapshot is not None):
                 raise CliFail("history_regressed")
+            if state is not None and snapshot_regressed(snapshot, state):
+                raise CliFail("history_regressed")
+        except CliFail as exc:
+            if exc.code == "history_regressed":
+                write_warning(self.inbox, job, "history_regressed", "canonical read")
+            raise
+        if state is not None:
             ensure_dir(directory)
             write_snapshot(directory, state)
         return state

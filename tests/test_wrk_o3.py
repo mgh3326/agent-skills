@@ -236,6 +236,19 @@ class World(object):
                 rows.append(call)
         return rows
 
+    def rewrite_records(self, job, change):
+        """Apply change(records) to the stub's journal and re-chain every hash,
+        as a restored or regressed server would serve it."""
+        state = self.stub()
+        records = change(state["jobs"][job]["records"])
+        previous = "0" * 64
+        for record in records:
+            record["previous_hash"] = previous
+            record["record_hash"] = ADAPTER.record_hash(record)
+            previous = record["record_hash"]
+        state["jobs"][job]["records"] = records
+        self.set_stub(**state)
+
     def records(self, job):
         return self.stub().get("jobs", {}).get(job, {}).get("records", [])
 
@@ -1190,6 +1203,75 @@ class ShadowCase(O3Case):
         self.assertIn("records_mode_invalid", out.stderr)
 
 
+class RegressedHistoryCase(O3Case):
+    """director-1 regressed-history ruling: retained intents and the last
+    complete snapshot are negative witnesses; they can only refuse."""
+
+    def witnessed(self, mode="shadow"):
+        w = self.world()
+        w.mode(mode)
+        w.enroll("job-a", activate=False)
+        w.local_claim("job-a")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+        return w
+
+    def scenario_not_found_after_a_receipt(self, bindir):
+        w = self.world(bindir=bindir)
+        w.mode("shadow")
+        w.enroll("job-a", activate=False)
+        w.local_claim("job-a")
+        assert w.run("round", "open", "job-a", "--head", w.heads[0]).returncode == 0
+        state = w.stub()
+        del state["jobs"]["job-a"]
+        w.set_stub(**state)
+        out = w.run("round", "open", "job-a", "--head", w.heads[1])
+        return w, out
+
+    def test_not_found_after_a_receipt_is_history_regressed_never_legacy(self):
+        w, out = self.scenario_not_found_after_a_receipt(BIN)
+        self.assertRc(out, 75, "history_regressed")
+        self.assertEqual(len(w.events("job-a", "job.round")), 1, "no legacy fallback for a witnessed job")
+        self.assertEqual([e["code"] for e in w.events("job-a", "job.o3_warning")], ["history_regressed"])
+        snapshot = json.loads((w.inbox / "job-a" / "o3-snapshot.json").read_text())
+        self.assertEqual(snapshot["snapshot_seq"], 2, "the cached read is never downgraded")
+        self.assertRc(w.run("round", "status", "job-a"), 75, "history_regressed")
+
+    def test_not_found_with_only_a_snapshot_witness_also_refuses(self):
+        w = self.witnessed()
+        (w.inbox / "job-a" / "o3-intents.json").unlink()
+        state = w.stub()
+        del state["jobs"]["job-a"]
+        w.set_stub(**state)
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75, "history_regressed")
+
+    def test_generation_regression_keeps_the_pending_intent(self):
+        w = self.witnessed(mode="required")
+        w.fault("append", "error:wrk_unavailable", kind="round_open")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75, "wrk_unavailable")
+        generation = str(uuid.uuid4())
+        w.rewrite_records("job-a", lambda records: [dict(r, store_generation=generation) for r in records])
+        w.set_stub(generation=generation)
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75, "history_regressed")
+        self.assertEqual([i["state"] for i in w.intents("job-a")], ["accepted", "pending"])
+        self.assertEqual(len(w.events("job-a", "job.o3_warning")), 1)
+
+    def test_seq_regression_refuses(self):
+        w = self.witnessed()
+        w.rewrite_records("job-a", lambda records: records[:1])
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75, "history_regressed")
+        self.assertEqual(len(w.events("job-a", "job.round")), 1)
+
+    def test_no_witness_shadow_unknown_job_still_takes_the_legacy_path(self):
+        w = self.world()
+        w.mode("shadow")
+        w.set_stub()
+        w.local_claim("job-z")
+        out = w.run("round", "open", "job-z", "--head", w.heads[0])
+        self.assertRc(out, 0)
+        self.assertNotIn("wrk_receipt", w.events("job-z", "job.round")[0])
+        self.assertEqual([e["code"] for e in w.events("job-z", "job.o3_warning")], ["not_enrolled"])
+
+
 # ── 3. spawn orders ───────────────────────────────────────────────────────────
 
 
@@ -1978,6 +2060,14 @@ class MutantCase(O3Case):
          "HANDOFFKEEP_CF_ACCESS_CLIENT_SECRET")''')])
         w, out = TransportVectorCase.scenario_env_keys_scrubbed(self, bindir)
         self.assertTrue(any("HANDOFFKEEP_TOKEN" in c["env_keys"] for c in w.calls()))
+
+    def test_m10_ignoring_the_enrollment_witness_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py",
+                                   "            if state is None and (retained or snapshot is not None):\n",
+                                   "            if state is None and False:\n")])
+        w, out = RegressedHistoryCase.scenario_not_found_after_a_receipt(self, bindir)
+        self.assertEqual(out.returncode, 0, "the mutant fell back to the legacy path")
+        self.assertEqual(len(w.events("job-a", "job.round")), 2)
 
     def test_m9_legacy_spawn_skipping_the_legacy_task_calls_goes_red(self):
         bindir = self.mutant_bin([("wrk", '''  elif [[ "$O3_SPAWN_VERIFIED" != 1 ]]; then
