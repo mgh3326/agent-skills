@@ -1256,7 +1256,11 @@ class ShadowCase(O3Case):
         env = w.env(PATH="%s:%s" % (stub_dir, safe_path()), HOME=w.home)
         if production:
             env.pop("WRK_TEST_MODE", None)
-        out = subprocess.run(["bash", "-c", script], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        # Run from a file: bash 3.2 leaves BASH_SOURCE unset under bash -c.
+        script_path = w.base / "discovery.sh"
+        script_path.write_text(script + "\n")
+        out = subprocess.run(["bash", str(script_path)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True)
         return out, log
 
     def test_discovery_absent_file_is_legacy_without_python(self):
