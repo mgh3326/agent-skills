@@ -994,6 +994,41 @@ class EligibilityFixtures(unittest.TestCase):
              mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, live_jobs, live_check)):
             self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_BASE_STALE")
 
+    def test_dispatch_only_ci_is_refused_with_assertion_red_mutant(self) -> None:
+        evidence = self.evidence(self.make_head("src/dispatch-only-ci.py"))
+        evidence["pr"] = 99
+        tree = git(self.repo, "merge-tree", "--write-tree", evidence["base"], evidence["head"])
+        evidence["trial_merge_tree"] = tree
+        evidence["ci"] = {"run_id": 123, "attempt": 1, "status": "success",
+                          "head": evidence["head"], "base": evidence["base"],
+                          "trial_merge_tree": tree}
+        dispatch = {"id": 123, "run_attempt": 1, "event": "workflow_dispatch",
+                    "head_sha": evidence["head"], "status": "completed", "conclusion": "success",
+                    "pull_requests": [{"number": 99, "head": {"sha": evidence["head"]},
+                                        "base": {"sha": evidence["base"]}}]}
+        jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"}
+                          for name in ("ubuntu-latest", "macos-latest")]}
+        lookup = common.result("PASS", "CI_ATTEMPT_READ", "task:723")
+        expected = ("UNVERIFIED", "CI_ATTEMPT_MISMATCH")
+        with mock.patch.object(eligible, "read_ci_attempt", return_value=(dispatch, jobs, lookup)):
+            baseline = eligible._ci_binding(evidence, self.policy)
+        self.assertEqual(expected, (baseline["status"], baseline["reason_code"]))
+
+        source_path = ROOT / "director/bin/tester-eligible"
+        source = source_path.read_text()
+        guard = 'run.get("event") != "pull_request"'
+        self.assertEqual(1, source.count(guard))
+        mutant_source = source.replace(
+            guard, 'run.get("event") not in ("pull_request", "workflow_dispatch")')
+        namespace = {"__name__": "tester_eligible_dispatch_assertion_red_mutant",
+                     "__file__": str(source_path)}
+        exec(compile(mutant_source, str(source_path), "exec"), namespace)
+        with mock.patch.dict(namespace, {"read_ci_attempt": lambda *_args: (dispatch, jobs, lookup)}):
+            mutant = namespace["_ci_binding"](evidence, self.policy)
+        self.assertEqual(("PASS", "CI_BOUND"), (mutant["status"], mutant["reason_code"]))
+        with self.assertRaises(AssertionError):
+            self.assert_case({"ci_binding": mutant}, "ci_binding", *expected)
+
     def test_actual_model_fallback_and_observation_hash(self) -> None:
         evidence = self.landed(self.evidence(self.make_head()))
         self.add_actual_source(evidence)
