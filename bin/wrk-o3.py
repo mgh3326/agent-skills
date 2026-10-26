@@ -484,8 +484,8 @@ class Client:
         if (value["claim"]["kind"] != "claim" or value["summary"]["job_id"] != job
                 or value["claim"]["seq"] != value["summary"]["claim_seq"]):
             raise Refusal("protocol_invalid")
-        # Fetch complete fixed-snapshot history to validate retained receipts
-        # before a summary can drive a decision. No local enrollment marker.
+        # Fetch complete fixed-snapshot history before a summary drives a
+        # decision. Retained receipts/snapshots can only veto that fresh read.
         history = self.records(job)
         if (history["summary"]["snapshot_seq"] < value["summary"]["snapshot_seq"]
                 or history["summary"]["store_generation"] != value["summary"]["store_generation"]):

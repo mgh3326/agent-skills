@@ -123,7 +123,7 @@ class PackTests(unittest.TestCase):
 
 class Harness(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp(prefix="o3-", dir=TEST_PARENT))
+        self.root = Path(tempfile.mkdtemp(prefix="o3-", dir=TEST_PARENT)).resolve()
         self.addCleanup(self.cleanup)
         self.home = self.root / "home"
         self.hk = self.home / ".local/bin/handoffkeep"
@@ -1535,6 +1535,20 @@ class RealFailure(Harness):
         self.assertEqual([c['argv'][1] for c in self.calls()], ['job', 'records', 'capabilities', 'job', 'append', 'job', 'records', 'append'])
         self.assertFalse((self.root / 'herdr.log').exists(), 'pane must wait for target round receipt')
         self.assertFalse(any((e.get('kind') in ('job.claim', 'job.spawned') for e in self.events('job-review'))))
+
+class HarnessPathTests(unittest.TestCase):
+    def test_symlinked_temp_parent_preserves_canonical_guard_expectations(self):
+        with tempfile.TemporaryDirectory(prefix="p-", dir="/tmp") as directory:
+            parent = Path(directory)
+            (parent / "r").mkdir()
+            (parent / "a").symlink_to(parent / "r", target_is_directory=True)
+            result = unittest.TestResult()
+            with mock.patch.dict(globals(), {"TEST_PARENT": parent / "a"}):
+                TransportTests("test_production_resolver_ignores_path_and_refuses_unsafe_binary").run(result)
+            self.assertEqual(result.testsRun, 1)
+            self.assertEqual(result.errors, [])
+            self.assertEqual(result.failures, [])
+
 
 class MutantTests(Harness):
     def test_required_invariants_turn_named_tests_red_at_real_call_sites(self):
