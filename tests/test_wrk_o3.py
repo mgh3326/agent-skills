@@ -1587,6 +1587,32 @@ class DualWriteOrderCase(O3Case):
                          [1, 2])
         self.assertEqual([i["state"] for i in w.intents("job-a")], ["accepted", "accepted"])
 
+    def test_p1_divergent_head_to_round_mapping_refuses_and_a_matching_one_appends(self):
+        w = shadow_world(self)
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 0)
+        # Same count, swapped heads: local O2 round 2 holds h0, the server's round 1 does.
+        swap = {1: w.heads[1], 2: w.heads[0]}
+        for path in (w.inbox / "job-a" / "events").glob("*-job.round.json"):
+            doc = json.loads(path.read_text())
+            doc["head"] = swap[doc["round"]]
+            path.write_text(json.dumps(doc) + "\n")
+        out = w.run("round", "verdict", "job-a", "--file", w.verdict_file("v.md", w.heads[0]))
+        self.assertRc(out, 75, "round_mismatch")
+        self.assertIn("job job-a head %s local O2 target round 2 differs from the server target round 1"
+                      % w.heads[0], out.stderr)
+        self.assertIn("orphaned local round 2", out.stderr)
+        self.assertEqual(w.appends("verdict"), [], "nothing appended")
+        self.assertEqual(w.events("job-a", "job.verdict"), [])
+        # The matching mapping still appends with the server round_no.
+        m = shadow_world(self)
+        self.assertRc(m.run("round", "open", "job-a", "--head", m.heads[0]), 0)
+        self.assertRc(m.run("round", "open", "job-a", "--head", m.heads[1]), 0)
+        out = m.run("round", "verdict", "job-a", "--file", m.verdict_file("v.md", m.heads[1]))
+        self.assertRc(out, 0)
+        self.assertIn("round=2", out.stdout)
+        self.assertEqual(m.events("job-a", "job.verdict")[0]["round"], 2)
+
     def test_p1_round_numbers_that_differ_after_replay_fail_closed(self):
         w = self.world()
         w.mode("shadow")

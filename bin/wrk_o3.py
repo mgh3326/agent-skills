@@ -1612,8 +1612,20 @@ def verdict_round(state, head):
     return None, None
 
 
+def check_head_round(job, head, o2_round, server_round):
+    """A P1 verdict keeps one head-to-round mapping (director-1 ruling): the
+    round the unchanged O2 guard selected for this head must equal the round
+    the canonical records select, or the command fails closed before append."""
+    if o2_round is None or str(server_round) == o2_round:
+        return
+    raise Fail("round_mismatch", "round verdict: job %s head %s local O2 target round %s differs from the server "
+               "target round %s; orphaned local round %s; needs a director decision, nothing appended"
+               % (job, head, o2_round, server_round if server_round is not None else "-", o2_round))
+
+
 def round_verdict(ctx, job, opts):
     path = opts.get("--file")
+    o2_round = opts.get("--o2-round")
     tester_flag = job_arg(opts.get("--tester"), "--tester")
     meta = meta_from(opts)
     with Intents(ctx.inbox, job) as store:
@@ -1640,6 +1652,8 @@ def round_verdict(ctx, job, opts):
             raise Fail(decision.code, "round verdict: no canonical read and no cached open round for head %s; "
                        "nothing recorded" % head)
         tester = testers[str(numbers[0])]
+        if decision.kind == "offline_shadow":
+            check_head_round(job, head, o2_round, numbers[0])
         if decision.kind == "offline_formed":
             # Enforced: the exact request is formed from the last canonical read
             # and kept pending; nothing is sent and nothing is accepted.
@@ -1663,6 +1677,8 @@ def round_verdict(ctx, job, opts):
             def build(fresh):
                 check_round_numbers(ctx, job, fresh, "round verdict")
                 number, tester = verdict_round(fresh, head)
+                if not fresh.receipt_required:
+                    check_head_round(job, head, o2_round, number)
                 if number is None:
                     # No open round on this head: the server answers (round_not_open
                     # or head_mismatch); the client never pre-empts it.
@@ -2174,7 +2190,7 @@ FLAGS = {"--head", "--extension-grant", "--repeat-grant", "--tester", "--file", 
          "--round", "--owner", "--label", "--pane", "--parent", "--role", "--task", "--lane", "--tier",
          "--subject", "--report", "--pr", "--waiver-grant", "--rounds-waived", "--as", "--owner-lane",
          "--parent-lane", "--host", "--predecessor", "--supersedes", "--target", "--seal-seq", "--events-dir",
-         "--o2-ref", "--phase", "--after-seq", "--snapshot-seq", "--limit", "--operation", "--end"}
+         "--o2-ref", "--phase", "--after-seq", "--snapshot-seq", "--limit", "--operation", "--end", "--o2-round"}
 
 
 def parse(argv):

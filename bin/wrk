@@ -7398,7 +7398,9 @@ round_verdict_cmd() {
     RECORDED*)
       if [[ "$o2_mode" == check ]]; then
         [[ "$O3_ROUTE" != unknown ]] || o3_unknown_refuse "round verdict"
-        o3_call "${o3_args[@]}"
+        # The round the O2 guard selected must be the server's round for this head.
+        local o2_round="${outcome#RECORDED round=}"
+        o3_call "${o3_args[@]}" --o2-round "${o2_round%% *}"
         o3_exit_on_error
         if [[ "$O3_OUT" == LEGACY_WARNED\ * ]]; then
           # The P1 warning branch: the intent stays pending; the O2 event lands.
