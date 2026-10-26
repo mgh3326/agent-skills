@@ -12714,14 +12714,16 @@ waiters stops deferring for the rest of that wait (default 1800; 0 disables
 lane deferral). The bound lets a younger waiter progress past a SIGSTOPped
 older process whose identity still matches.
 
-Waiter-owner identity: current records keep the process start identity beside
-the pid. macOS reads `ps -o lstart= -p PID` with a fixed locale and timezone;
-Linux reads `/proc/PID/stat` field 22 with the boot id. A dead or mismatched
-owner no longer reserves capacity; `heavy status` retires it and audits the
-record, pid and reason. An unreadable identity is logged once per run and
-retained. Records written before this identity field keep their mixed-version
-rules: ticketless lane records do not reserve, while ticketless CI records
-keep their original pid-only reservation.
+Waiter-owner identity: current records add the process start identity after
+the established pid/class/limit prefix in the fixed head. macOS reads exact
+`ps -o lstart= -p PID` text under a fixed locale and timezone; its one-second
+precision is a known limit, with the lane deferral bound capping residual
+lane waits. Linux reads `/proc/PID/stat` field 22 with the boot id. A dead or
+mismatched owner no longer reserves capacity; `heavy status` retires it and
+audits the record, pid and reason. An unreadable identity is logged once per
+run and retained. Records written before this identity field keep their
+mixed-version rules: ticketless lane records do not reserve, while ticketless
+CI records keep their original pid-only reservation.
 
 Use --queue-key KEY (or WRK_HEAVY_QUEUE_KEY) to keep a place across a wait-cap
 exit (75). KEY is ASCII [A-Za-z0-9._-]{1,64}; the option overrides the env.
@@ -12871,8 +12873,9 @@ def read_text(path):
 
 def record_head(text):
     # (pid, class, limit) of a holder/waiter record. New records keep the
-    # owner's start identity in the fixed head next to pid. Old records keep
-    # their original three-field meaning, including ticketless CI priority.
+    # owner's start identity in the fixed head after the established
+    # pid/class/limit fields. Old records keep their original three-field
+    # meaning, including ticketless CI priority.
     # Job/cmd are free text and can never forge a head field. pid -1 means
     # unparsable or a start identity that no longer matches this pid.
     pid, cls, lim = record_head_raw(text)
@@ -12883,8 +12886,8 @@ def record_head(text):
 
 
 def record_head_raw(text):
-    # Parse only the fixed prefix: legacy `pid class limit` or current
-    # `pid start class limit`. A later pid=/class=/limit= token is free text.
+    # Parse the compatible fixed prefix `pid class limit`; current records
+    # add `start=` as field four. Later fields remain free text.
     pid, cls, lim = -1, "lane", None
     toks = text.split(None, 3)[:3]
     if toks and toks[0].startswith("pid="):
@@ -12912,9 +12915,9 @@ def record_head_raw(text):
 
 
 def record_owner_start(text):
-    toks = text.split(None, 2)
-    if len(toks) > 1 and toks[1].startswith("start="):
-        return toks[1][6:]
+    toks = text.split(None, 4)
+    if len(toks) > 3 and toks[3].startswith("start="):
+        return toks[3][6:]
     return None
 
 
@@ -12924,13 +12927,13 @@ def with_class(text):
     toks = text.split(None, 5)
     if not toks or not toks[0].startswith("pid="):
         return text
-    if len(toks) > 1 and toks[1].startswith("start="):
+    if len(toks) > 3 and toks[3].startswith("start="):
         # Keep the established status line shape while the on-disk fixed head
-        # carries its owner identity beside pid.
-        tail = text[len(toks[0]) + len(toks[1]) + 2:]
-        if any(t.startswith("class=") for t in toks[2:4]):
-            return toks[0] + " " + tail
-        return toks[0] + " class=lane " + tail
+        # carries its owner identity after the compatible pid/class/limit.
+        start_pos = text.find(toks[3], len(toks[0]))
+        tail = text[start_pos + len(toks[3]):].lstrip()
+        prefix = text[:start_pos].rstrip()
+        return prefix + (" " + tail if tail else "")
     if any(t.startswith("class=") for t in toks[1:3]):
         return text
     return toks[0] + " class=lane" + text[len(toks[0]):]
@@ -12942,7 +12945,7 @@ def record_ticket(text):
     fields = text.split(None, 5)
     if len(fields) < 4:
         return None
-    ticket_at = 4 if len(fields) > 1 and fields[1].startswith("start=") else 3
+    ticket_at = 4 if len(fields) > 3 and fields[3].startswith("start=") else 3
     if len(fields) <= ticket_at:
         return None
     match = re.fullmatch(r"ticket=([0-9]{1,20}):([0-9]{1,20})", fields[ticket_at])
@@ -13514,14 +13517,14 @@ except ValueError:
 if not lane_defer_max >= 0:
     fail("WRK_HEAVY_LANE_DEFER_MAX is not a non-negative number", 2)
 cmd_summary = " ".join(cmd)
-# PID, start identity, class, and limit are the fixed record head. Keep the
-# ticket immediately after that head for ordered lane reservations.
+# Keep the established pid/class/limit prefix and add owner identity as the
+# fourth fixed-head field; the ticket follows that complete head.
 owner_start = process_start_identity(os.getpid())
 if owner_start is None:
     owner_start = "unknown"
     owner_unknown(os.getpid(), "writer process start identity could not be read")
-info = "pid=%d start=%s class=%s limit=%d since=%s job=%s cmd=%s" % (
-    os.getpid(), owner_start, hclass, limit,
+info = "pid=%d class=%s limit=%d start=%s since=%s job=%s cmd=%s" % (
+    os.getpid(), hclass, limit, owner_start,
     datetime.datetime.now().isoformat(timespec="seconds"),
     os.environ.get("ARBITER_JOB") or "-", cmd_summary)
 started_at = time.monotonic()

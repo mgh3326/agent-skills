@@ -162,7 +162,7 @@ class HeavyQueue(unittest.TestCase):
     def plant_lane(self, pid, ticket="1:1", limit=1):
         start = self.process_start_identity(pid)
         (self.waiters / str(pid)).write_text(
-            f"pid={pid} start={start} class=lane limit={limit} "
+            f"pid={pid} class=lane limit={limit} start={start} "
             f"ticket={ticket} since=x job=- cmd=fixture")
 
     def process_start_identity(self, pid):
@@ -239,7 +239,7 @@ class HeavyQueue(unittest.TestCase):
     def test_pid_reuse_does_not_reserve_and_status_retires_with_one_audit_line(self):
         pid = os.getpid()
         (self.waiters / str(pid)).write_text(
-            f"pid={pid} start=forged-start class=lane limit=1 ticket=1:1 "
+            f"pid={pid} class=lane limit=1 start=forged-start ticket=1:1 "
             "since=x job=- cmd=fixture")
         result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP="1")
         self.assertEqual(result.returncode, 0,
