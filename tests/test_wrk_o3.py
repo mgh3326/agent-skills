@@ -1210,8 +1210,10 @@ class ShadowCase(O3Case):
         self.assertRc(out, 0)
         self.assertEqual(out.stdout.strip(), "legacy")
         text = (BIN / "wrk").read_text()
-        start = text.index("o3_mode_file_present() {")
-        function = text[start:text.index("\n}\n", start) + 3]
+        function = ""
+        for name in ("o3_mode_file_present", "o3_mode_walk"):
+            start = text.index(name + "() {")
+            function += text[start:text.index("\n}\n", start) + 3]
         probe = subprocess.run(["bash", "-c", function + "o3_mode_file_present"], env=w.env(HOME=None),
                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.assertEqual(probe.returncode, 1, probe.stderr)
@@ -1233,7 +1235,8 @@ class ShadowCase(O3Case):
             start = text.index(name + "() {")
             return text[start:text.index("\n}\n", start) + 3]
         script = "\n".join(['set -euo pipefail', 'WRK_O3_PY="" O3_OUT="" O3_RC=0',
-                            function("wrk_o3"), function("o3_mode_file_present"), function("o3_call"),
+                            function("wrk_o3"), function("o3_mode_file_present"), function("o3_mode_walk"),
+                            function("o3_call"),
                             function("o3_exit_on_error"), 'o3_call round-status job-a', 'o3_exit_on_error',
                             'printf "%s\\n" "$O3_OUT"'])
         stub_dir, log = w.base / "nopy3", w.base / "nopy3.log"
@@ -1266,6 +1269,44 @@ class ShadowCase(O3Case):
                 self.assertNotEqual(out.returncode, 0)
                 self.assertNotIn("LEGACY", out.stdout)
                 self.assertTrue(log.exists(), "the parse path ran")
+
+    def test_discovery_unsearchable_config_refuses_naming_it(self):
+        w = self.world()
+        config = w.home / ".config"
+        config.chmod(0)
+        self.addCleanup(config.chmod, 0o755)
+        out, log = self.discovery(w, False)
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("%s is not a searchable directory" % config, out.stderr)
+        self.assertFalse(log.exists(), "refused in the shell, before any Python")
+
+    def test_discovery_non_directory_config_refuses_naming_it(self):
+        w = self.world()
+        config = w.home / ".config"
+        shutil.rmtree(config)
+        config.write_text("not a directory\n")
+        out, log = self.discovery(w, False)
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("%s is not a searchable directory" % config, out.stderr)
+        self.assertFalse(log.exists())
+
+    def test_discovery_symlinked_ancestor_refuses(self):
+        w = self.world()
+        wrk_dir = w.home / ".config" / "wrk"
+        shutil.rmtree(wrk_dir)
+        (w.base / "elsewhere").mkdir()
+        wrk_dir.symlink_to(w.base / "elsewhere")
+        out, log = self.discovery(w, False)
+        self.assertEqual(out.returncode, 2, out.stderr)
+        self.assertIn("%s is a symlink" % wrk_dir, out.stderr)
+
+    def test_discovery_missing_wrk_dir_under_a_searchable_config_is_legacy(self):
+        w = self.world()
+        shutil.rmtree(w.home / ".config" / "wrk")
+        out, log = self.discovery(w, False)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(out.stdout.strip(), "LEGACY")
+        self.assertFalse(log.exists(), "no Python for a proven absence")
 
     def test_discovery_dangling_symlink_takes_the_parse_path_and_refuses(self):
         for production in (False, True):

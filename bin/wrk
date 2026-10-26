@@ -5286,26 +5286,54 @@ wrk_o3() {
 # home comes from the shell's own ~user expansion; HOME is looked at too, which
 # only ever makes the adapter (reading the passwd home alone) decide.
 o3_mode_file_present() {
-  local user home candidate
-  local -a homes=()
+  local user home
   if [[ "${WRK_TEST_MODE:-}" == 1 ]]; then
     # Test mode with HOME unset is legacy and reads no path.
     [[ -n "${HOME:-}" ]] || return 1
-    homes+=("$HOME")
-  else
-    user="$(id -un 2>/dev/null)" || user=""
-    # An undeterminable passwd home is not legacy: the adapter decides, fail closed.
-    [[ "$user" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
-    eval "home=~$user"
-    [[ "$home" == /* ]] || return 0
-    homes+=("$home")
-    [[ -z "${HOME:-}" ]] || homes+=("$HOME")
+    o3_mode_walk "$HOME"
+    return
   fi
-  for home in "${homes[@]}"; do
-    candidate="$home/.config/wrk/records-mode"
-    [[ -e "$candidate" || -L "$candidate" ]] && return 0
+  user="$(id -un 2>/dev/null)" || user=""
+  # An undeterminable passwd home is not legacy: the adapter decides, fail closed.
+  [[ "$user" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
+  eval "home=~$user"
+  [[ "$home" == /* ]] || return 0
+  # HOME naming another place only ever sends the decision to the adapter.
+  if [[ -n "${HOME:-}" && ( -e "$HOME/.config/wrk/records-mode" || -L "$HOME/.config/wrk/records-mode" ) ]]; then
+    return 0
+  fi
+  o3_mode_walk "$home"
+}
+
+# o3_mode_walk HOME — absence is proven, never assumed (director-1 discovery
+# refinement): HOME, HOME/.config and HOME/.config/wrk must each be a real
+# (not symlinked) searchable directory where they exist, or discovery refuses
+# with exit 2 naming the component. A component that is truly absent under a
+# searchable parent means no mode file: legacy (1). Anything at the mode-file
+# path itself goes to the adapter's parse (0).
+o3_mode_walk() {
+  local base="$1" component parent
+  for component in "$base" "$base/.config" "$base/.config/wrk"; do
+    if [[ -L "$component" ]]; then
+      echo "wrk: o3 records_mode_invalid: $component is a symlink; refusing (records-mode discovery)" >&2
+      exit 2
+    fi
+    if [[ -e "$component" ]]; then
+      if [[ ! -d "$component" || ! -x "$component" ]]; then
+        echo "wrk: o3 records_mode_invalid: $component is not a searchable directory; refusing (records-mode discovery)" >&2
+        exit 2
+      fi
+      continue
+    fi
+    parent="${component%/*}"
+    [[ -n "$parent" ]] || parent=/
+    if [[ ! -d "$parent" || ! -x "$parent" ]]; then
+      echo "wrk: o3 records_mode_invalid: $parent is not a searchable directory; refusing (records-mode discovery)" >&2
+      exit 2
+    fi
+    return 1
   done
-  return 1
+  [[ -e "$base/.config/wrk/records-mode" || -L "$base/.config/wrk/records-mode" ]]
 }
 
 # o3_call OP ARGS... — sets O3_OUT (stdout) and O3_RC; stderr passes through.
