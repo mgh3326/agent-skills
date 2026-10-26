@@ -78,9 +78,8 @@ write_event() {
 
 claim_job() { # claim_job job [parent] [created_at] [role] [owner] [task_id]
   local job="$1" parent="${2:-director-1}" at="${3:-2026-10-23T00:00:00Z}"
-  local role="${4:-builder}" owner="${5:-lane-a}" task_id="${6:-}" task_field=""
+  local role="${4:-builder}" owner="${5:-lane-a}" task_id="${6:-}"
   local events="$ARBITER_INBOX_ROOT/$job/events"
-  [[ -z "$task_id" ]] || task_field=",\"task_id\":\"$task_id\""
   mkdir -p "$events" "$ARBITER_INBOX_ROOT/$job"
   # hk 1897: mint the DB claim row; the events file arbiter writes stays
   # byte-identical on the identity fields — only created_at and the
@@ -88,6 +87,7 @@ claim_job() { # claim_job job [parent] [created_at] [role] [owner] [task_id]
   local claim_args=(claim --job "$job" --lane "$owner" --t T2 --role "$role" --agent-label lbl)
   # --parent-lane is only valid for --role builder in arbiter claim.
   [[ "$role" == "builder" ]] && claim_args+=(--parent-lane "$parent")
+  [[ -z "$task_id" ]] || claim_args+=(--task-id "$task_id")
   "$ARBITER_BIN" "${claim_args[@]}" >/dev/null || fail "claim_job $job mint failed"
   python3 - "$events/00001-job.claim.json" "$at" <<'PY'
 import json, sys
