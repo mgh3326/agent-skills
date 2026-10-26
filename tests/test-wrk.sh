@@ -7318,7 +7318,7 @@ t2011_fwd_spawn() {
     WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$T2011_FWD/ssh.log" WRK_SCP_LOG="$T2011_FWD/scp.log" \
     WRK_WAKE_LOG="$T2011_FWD/wake.log" WRK_PLACE_LOG="$T2011_FWD/place.log" \
     WRK_SPILLOVER_CANDIDATES_LOG="$T2011_FWD/cand.log" WRK_COMPLETION_INTERVAL_S=3600 \
-    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -l fixture --t T1 \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -l fixture -w w --t T1 \
     --job "$job" --task "$task"
 }
 t2011_fwd_spawn fwd-keep 1 >"$T2011_FWD/keep.out" 2>&1 ||
