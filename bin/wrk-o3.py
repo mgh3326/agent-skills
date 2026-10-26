@@ -863,19 +863,27 @@ class Client:
                 # An O2 observation remains the same observation after replay.
                 if local.has_key(record["idempotency_key"], projection["kind"]):
                     return
-                grant_seq = (record["payload"].get("grant_seq") if record["kind"] == "void"
-                             else record["payload"].get("extension_grant_seq"))
-                if grant_seq:
+                grants = (("extension_grant_seq", "extension_grant_record_hash"),
+                          ("repeat_grant_seq", "repeat_grant_record_hash")) if record["kind"] == "round_open" else (("grant_seq", "grant_record_hash"),) if record["kind"] == "void" else ()
+                for seq_field, hash_field in grants:
+                    grant_seq = record["payload"].get(seq_field)
+                    if grant_seq is None:
+                        projection.pop(seq_field, None)
+                        continue
                     history = history or self.records(record["job_id"])
                     fields = local.grant_fields(history["records"], record["claim_seq"], grant_seq)
-                    projection.update(grant_seq=grant_seq, grant_record_hash=fields["hash"])
+                    projection.update({seq_field: grant_seq, hash_field: fields["hash"]})
                     if record["kind"] == "void":
                         projection.update(ref=fields["ref"], issuer=fields["issuer"],
                                           reason=record["payload"]["reason_code"])
-                    else:
+                    elif seq_field == "extension_grant_seq":
                         projection["approval"] = dict(ref=fields["ref"], issuer=fields["issuer"],
                                                       extra=fields["extra"])
                         projection["reason"] = fields["reason"]
+                if record["kind"] == "verdict" and history is not None:
+                    permission = local.repeat_permission(history, record["payload"])
+                    if permission:
+                        projection.update(head_repeat=permission[0], head_repeat_issuer=permission[1])
                 self.event(record["job_id"], projection)
         except (OSError, Refusal):
             raise ProjectionPending() from None
@@ -1121,13 +1129,42 @@ class LocalRounds:
         if grant is None or claim is None or grant["actor_client_id"] not in ("director-1", "operator-desk"):
             raise Refusal("protocol_invalid")
         ref = "hk:task/" + str(claim["payload"]["task_id"])
-        consumed = {r.get("grant_seq") for r in self.records()
+        consumed = {r.get("extension_grant_seq") for r in self.records()
                     if r.get("kind") == "job.round" and (r.get("approval") or {}).get("ref") == ref}
         consumed.discard(None)
         return dict(ref=ref, issuer=grant["actor_client_id"], hash=grant["record_hash"],
                     reason=grant["payload"]["reason_code"], extra=len(consumed - {grant_seq}) + 1 + sum(1 for r in self.records()
-                          if r.get("kind") == "job.round" and not r.get("grant_seq")
+                          if r.get("kind") == "job.round" and not r.get("extension_grant_seq")
                           and (r.get("approval") or {}).get("ref") == ref))
+
+    def repeat_permission(self, history, payload):
+        local = self.records()
+        number, head = payload["round_no"], payload["head"]
+        opened = next((r for r in local if r.get("kind") == "job.round" and r.get("round") == number), None)
+        if not opened or not opened.get("repeat_grant_seq") or not opened.get("repeat_grant_record_hash"):
+            return None
+        grant = next((r for r in history["records"] if r["kind"] == "grant" and r["seq"] == opened["repeat_grant_seq"]), None)
+        if (grant is None or grant["record_hash"] != opened["repeat_grant_record_hash"]
+                or grant["actor_client_id"] not in ("director-1", "operator-desk")):
+            return None
+        earlier = []
+        for verdict in local:
+            if verdict.get("kind") != "job.verdict" or verdict.get("head") != head:
+                continue
+            if any(r.get("kind") == "job.round_void" and r.get("round") == verdict.get("round")
+                   and isinstance(r.get("ref"), str) and r["ref"].startswith(("hk:task/", "hk:doc/")) for r in local):
+                continue
+            earlier.append(verdict.get("round"))
+        consumed = next((r for r in history["records"] if r["kind"] == "round_open"
+                         and r["payload"]["round_no"] == number and r["payload"]["head"] == head
+                         and r["payload"]["repeat_grant_seq"] == grant["seq"]), None)
+        frozen = grant["payload"]
+        if (consumed is None or not earlier or frozen["grant_type"] != "head_repeat" or frozen["round_no"] != number
+                or frozen["head"] != head or frozen["earlier_round_no"] != earlier[0]):
+            return None
+        # An opaque canonical record hash identifies this one-use permission;
+        # it is never a caller-supplied approval reference.
+        return "o3:" + grant["record_hash"], grant["actor_client_id"], str(number)
 
     def validate(self, operation, payload, history=None, raw=None):
         self.end(operation)
@@ -1150,8 +1187,10 @@ class LocalRounds:
         elif operation == "void":
             args = [self.job, payload["round_no"], ref, payload["reason_code"], issuer]
         else:
-            args = [self.job, owner, label, pane, parent, payload["path"]]
-        candidates, result, _ = self.run_guard("round_" + operation + "_cmd", args, raw)
+            permission = self.repeat_permission(history, payload) if history is not None else None
+            args = [self.job, owner, label, pane, parent, payload["path"], "commit", *(permission or ("", "", ""))]
+        function = "round_verdict_decide" if operation == "verdict" else "round_" + operation + "_cmd"
+        candidates, result, _ = self.run_guard(function, args, raw)
         if candidates:
             return candidates[0]
         if result.startswith("CAP "):
@@ -1257,6 +1296,7 @@ def round_cli(client, argv, mode):
     # its existing O2 path. They are refused for every canonical enrollment.
     parser.add_argument("--extend")
     parser.add_argument("--by")
+    parser.add_argument("--head-repeat")
     parser.add_argument("--reason")
     args = parser.parse_args(argv)
     if args.command == "audit":
@@ -1315,10 +1355,11 @@ def round_mutation(client, local, args, mode):
     unfinished = client.unfinished(job, operation, **identity)
     with IntentStore(client, job).locked() as data:
         pending = [dict(x) for x in data["intents"] if x["state"] == "pending"]
-    replayed, matched, matched_error = [], None, None
+    replayed, matched, matched_error, attempt_keys = [], None, None, []
     # Resolve the entire ordered backlog before classification or a new append.
     # A definite refusal can leave an orphaned O2 observation; never renumber it.
     for item in pending:
+        attempt_keys.append(item["idempotency_key"])
         try:
             response = client.append(job, resume=item["local_id"])
         except Refusal as exc:
@@ -1333,6 +1374,8 @@ def round_mutation(client, local, args, mode):
     if unfinished and not matched and not matched_error:
         # A stored acceptance after a local end must be replayed, too. Ordinary
         # accepted read repair still uses records, with its original receipt.
+        with IntentStore(client, job).locked() as data:
+            attempt_keys.append(next(x["idempotency_key"] for x in data["intents"] if x["local_id"] == unfinished))
         response = client.append(job, resume=unfinished,
                                  replay_accepted=bool(local.ns["wrk_end_declaration"](local.events)))
         replayed.append(response)
@@ -1346,12 +1389,12 @@ def round_mutation(client, local, args, mode):
     if current is None:
         local.end(args.command)
         return LEGACY_ROUTE
-    if args.extend is not None or args.by is not None or args.reason is not None:
+    if args.extend is not None or args.by is not None or args.reason is not None or args.head_repeat is not None:
         raise Refusal("cli_usage")
     enforced = not current.get("offline") and receipt_required(current["records"])
     projection_mode = "enforced" if enforced else "shadow"
     if not enforced:
-        key = replayed[0]["record"]["idempotency_key"] if replayed else None
+        key = attempt_keys[0] if attempt_keys else None
         local.end(args.command, key)
     if current.get("offline"):
         # A stale shadow cache cannot classify a new mutation. O2 guards are
@@ -1392,6 +1435,9 @@ def round_mutation(client, local, args, mode):
         # Same O2 guards and same lock as legacy commands, before intent/send.
         candidate = local.validate(args.command, payload, current, raw)
         local.check_number(summary["next_round_no"])
+        if args.command == "verdict" and candidate["round"] != payload["round_no"]:
+            raise LocalRefusal("job=%s head=%s local_target_round=%d server_target_round=%d orphaned local round=%d; director decision required" %
+                               (job, payload["head"], candidate["round"], payload["round_no"], candidate["round"]), 75)
     request = dict(kind=operation, claim_seq=summary["claim_seq"],
                    expected_seq=summary["snapshot_seq"], payload=payload)
     try:

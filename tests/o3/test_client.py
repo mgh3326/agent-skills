@@ -833,7 +833,10 @@ class MatrixModeTests(Harness):
                 response = dict(exit=rc, stderr="handoffkeep wrk: " + code + "\n")
                 self.responses(*([{"action": "read"}] if spawn else []), response)
                 result = self.run_wrk(*args)
-                self.assertEqual(result.returncode, rc, result.stderr)
+                # Director P1 clarification: an unavailable first classification
+                # permits O2 as a veto only; these fixtures have no local open.
+                expected = 2 if code == "transport_unavailable" and args[:2] in (["round", "verdict"], ["round", "void"]) else rc
+                self.assertEqual(result.returncode, expected, result.stderr)
                 self.assertEqual(len(self.events()), 1, "unreceipted O2 claim must not create accepted transitions")
                 self.assertFalse(any(x["argv"][1] == "append" for x in self.calls()))
                 self.assertFalse(self.intent_file().exists(), "no complete canonical binding means no invented Request")
@@ -1667,6 +1670,26 @@ class MutantTests(Harness):
              '            if exc.code == "not_found" and (snapshot is not None or receipts):',
              '            if False:  # mutant: ignore retained enrollment witnesses',
              "HistoryWitnessTests.test_not_found_after_receipt_never_downgrades_or_discards_pending"),
+            ("p1-no-local-veto", "adapter",
+             '        candidate = local.validate(args.command, payload, current, raw)',
+             '        candidate = {}  # mutant: bypass existing O2 guards',
+             "P1ReconciliationTests.test_fresh_shadow_cap_and_oldest_head_guard_are_unchanged"),
+            ("p1-skip-backlog", "adapter",
+             '        pending = [dict(x) for x in data["intents"] if x["state"] == "pending"]',
+             '        pending = []  # mutant: skip the older unknown operation',
+             "P1ReconciliationTests.test_replay_dedupes_shadow_observation_and_round_numbers_match"),
+            ("p1-grant-fallback", "adapter",
+             'and exc.code in TEMPORARY and not uses_grant):',
+             'and exc.code in TEMPORARY):',
+             "P1ReconciliationTests.test_typed_grant_5xx_never_takes_p1_warning_fallback"),
+            ("repeat-ignore-frozen-binding", "adapter",
+             '        if (consumed is None or not earlier or frozen["grant_type"] != "head_repeat"',
+             '        if False and (consumed is None or not earlier or frozen["grant_type"] != "head_repeat"',
+             "TypedRepeatTests.test_mismatched_frozen_round_head_or_earlier_round_refuses"),
+            ("p1-ignore-head-mapping", "adapter",
+             '        if args.command == "verdict" and candidate["round"] != payload["round_no"]:',
+             '        if False:  # mutant: conflate equal counts with equal head mappings',
+             "P1MappingTests.test_same_count_divergent_head_mapping_refuses_without_append"),
             ("skip-legacy-link", "wrk", '  [[ "$O3_SPAWN_VERIFIED" -eq 1 ]] || hk_task_link',
              '  : # mutant: skip the legacy task link too',
              "SpawnHandshakeTests.test_real_legacy_spawn_keeps_task_probe_and_link"),
@@ -1709,8 +1732,6 @@ print(json.dumps(dict(failures=len(r.failures),errors=len(r.errors),detail=strea
                 self.assertGreater(observation["failures"], 0, "surviving mutant: " + name + " " + observation["detail"])
 
 
-if __name__ == "__main__":
-    unittest.main()
 
 
 class P1ReconciliationTests(Harness):
@@ -1879,8 +1900,8 @@ class P1ReconciliationTests(Harness):
                 self.assertEqual(event['approval']['ref'],'hk:task/901')
                 self.assertEqual(event['approval']['issuer'],'director-1')
                 self.assertEqual(event['reason'],'desk_approved')
-                self.assertEqual(event['grant_seq'],grant['seq'])
-                self.assertEqual(event['grant_record_hash'],grant['record_hash'])
+                self.assertEqual(event['extension_grant_seq'],grant['seq'])
+                self.assertEqual(event['extension_grant_record_hash'],grant['record_hash'])
                 self.assertEqual(set(event['wrk_receipt']),{'job_id','seq','record_hash','store_generation'})
 
     def test_typed_void_projection_is_readable_by_unchanged_o2_counter(self):
@@ -1902,13 +1923,38 @@ class P1ReconciliationTests(Harness):
 
 
 class ModeShellTests(Harness):
-    def discover_shell(self):
+    def discover_shell(self, production=False, darwin=False):
         stub=self.root/'mode-tools';stub.mkdir(exist_ok=True)
         python=stub/'python3';python.write_text('#!/bin/sh\nexit 1\n');python.chmod(0o700)
         env=dict(self.env,PATH=str(stub)+':/usr/bin:/bin',WRK_TRUST_PY='')
         source=WRK.read_text()
         function='wrk_o3_mode() {'+source.split('wrk_o3_mode() {',1)[1].split('\n}\n',1)[0]+'\n}\n'
+        if production:
+            env['WRK_TEST_MODE']='0'
+            caller=self.root/'caller-home'; caller.mkdir(exist_ok=True)
+            caller_mode=caller/'.config/wrk/records-mode';caller_mode.parent.mkdir(parents=True,exist_ok=True)
+            caller_mode.write_text('required\n')
+            env['HOME']=str(caller)
+            lookup=self.root/'mode-getent'
+            darwin_lookup=self.root/'mode-dscacheutil'
+            lookup.write_text("#!/bin/sh\nprintf 'fixture:x:%d:1:Fixture:%s:/bin/sh\\n'\n" % (os.getuid(),self.home))
+            darwin_lookup.write_text("#!/bin/sh\nprintf 'uid: %d\\ndir: %s\\n'\n" % (os.getuid(),self.home))
+            lookup.chmod(0o700);darwin_lookup.chmod(0o700)
+            function=function.replace('/usr/bin/getent',str(self.root/'missing-getent') if darwin else str(lookup))
+            function=function.replace('/usr/bin/dscacheutil',str(darwin_lookup))
         return subprocess.run(['bash','-c',function+'\nwrk_o3_mode\n'],env=env,capture_output=True,text=True)
+    def test_production_absence_and_parse_routing_ignore_caller_home_on_both_os(self):
+        for darwin in (False, True):
+            with self.subTest(darwin=darwin):
+                mode=self.home/'.config/wrk/records-mode'
+                mode.unlink(missing_ok=True)
+                result=self.discover_shell(production=True,darwin=darwin)
+                self.assertEqual((result.returncode,result.stdout),(0,'legacy\n'),result.stderr)
+                self.mode('required')
+                self.assertNotEqual(self.discover_shell(production=True,darwin=darwin).returncode,0)
+                mode.unlink();mode.symlink_to(self.root/'absent-mode')
+                self.assertNotEqual(self.discover_shell(production=True,darwin=darwin).returncode,0)
+                mode.unlink()
     def test_absent_file_needs_no_python(self):
         result=self.discover_shell()
         self.assertEqual(result.returncode,0,result.stderr)
@@ -1924,3 +1970,97 @@ class ModeShellTests(Harness):
         result=self.discover_shell()
         self.assertNotEqual(result.returncode,0)
         self.assertEqual(result.stdout,'')
+
+
+class TypedRepeatTests(Harness):
+    record=DesignObservationTests.record
+    grant=P1ReconciliationTests.grant
+    head=P1ReconciliationTests.head
+    appends=P1ReconciliationTests.appends
+    def prepare(self, mismatch=None):
+        records=self.seed(*[{'action':'read'}]*2,{'action':'accept'},*[{'action':'read'}]*2,{'action':'accept'})[:1]
+        self.mode('shadow'); head=self.head()
+        with self.client() as client:
+            for n in range(1,4):
+                opened=self.record('round_open',dict(round_no=n,head=head if n==1 else str(n)*40,tester_job_id=None,extension_grant_seq=None,repeat_grant_seq=None),records)
+                client.event('job-a',dict(kind='job.round',job_id='job-a',round=n,head=opened['payload']['head']))
+            old=b'VERDICT: PASS @'+head.encode()+b'\nfirst independent review\n'
+            verdict=dict(round_no=1,head=head,verdict='PASS',path=str(self.root/'old-review.md'),content_sha256=hashlib.sha256(old).hexdigest(),size_bytes=len(old),tester_job_id=None)
+            self.record('verdict',verdict,records)
+            client.event('job-a',dict(kind='job.verdict',job_id='job-a',round=1,**{k:v for k,v in verdict.items() if k!='round_no'}))
+            extension=self.grant(records,'extension',4)
+            repeat=self.grant(records,'head_repeat',4)
+            repeat['payload'].update(head=head,earlier_round_no=1)
+            if mismatch: repeat['payload'].update(mismatch)
+            repeat['record_hash']=self.module.digest({k:v for k,v in repeat.items() if k!='record_hash'})
+        data=json.loads(self.script.read_text());data['journal']=records;self.script.write_text(json.dumps(data))
+        result=self.run_wrk('round','open','job-a','--head',head,'--repo',str(ROOT),'--extension-grant',str(extension['seq']),'--repeat-grant',str(repeat['seq']))
+        self.assertEqual(result.returncode,0,result.stderr)
+        return extension,repeat
+    def verdict(self, *flags):
+        review=self.root/'new-review.md';review.write_text('VERDICT: PASS @'+self.head()+'\nsecond independent review\n')
+        return self.run_wrk('round','verdict','job-a','--file',str(review),*flags)
+    def test_both_grants_project_independently_and_allow_same_round_repeat(self):
+        extension,repeat=self.prepare()
+        opened=[e for e in self.events() if e['kind']=='job.round'][-1]
+        self.assertEqual(opened['round'],4)
+        self.assertEqual(opened['approval']['extra'],1)
+        for prefix,grant in (('extension',extension),('repeat',repeat)):
+            self.assertEqual(opened[prefix+'_grant_seq'],grant['seq'])
+            self.assertEqual(opened[prefix+'_grant_record_hash'],grant['record_hash'])
+        self.assertNotIn('grant_seq',opened)
+        self.assertEqual(set(opened['wrk_receipt']),{'job_id','seq','record_hash','store_generation'})
+        result=self.verdict();self.assertEqual(result.returncode,0,result.stderr)
+        verdict=[e for e in self.events() if e['kind']=='job.verdict'][-1]
+        self.assertEqual(verdict['round'],4)
+        self.assertEqual(verdict['head_repeat'],'o3:'+repeat['record_hash'])
+    def test_mismatched_frozen_round_head_or_earlier_round_refuses(self):
+        for mismatch in ({'round_no':3},{'head':'f'*40},{'earlier_round_no':2}):
+            with self.subTest(mismatch=mismatch):
+                other=TypedRepeatTests();other.setUp()
+                try:
+                    other.prepare(mismatch)
+                    result=other.verdict()
+                    self.assertEqual(result.returncode,2,result.stderr)
+                    self.assertIn('DUP_HEAD',result.stderr)
+                    self.assertEqual(len(other.appends()),1)
+                finally:other.doCleanups()
+    def test_free_head_repeat_reference_on_enrolled_job_refuses(self):
+        self.prepare()
+        result=self.verdict('--head-repeat','hk:task/2400')
+        self.assertEqual(result.returncode,2,result.stderr)
+        self.assertEqual(len(self.appends()),1)
+
+
+class P1MappingTests(Harness):
+    record=DesignObservationTests.record
+    head=P1ReconciliationTests.head
+    appends=P1ReconciliationTests.appends
+    def mapping(self, mismatch):
+        records=self.seed(*[{'action':'read'}]*2,{'action':'accept'})[:1]
+        head,other=self.head(),self.head('HEAD^')
+        self.mode('shadow')
+        with self.client() as client:
+            for n,h in ((1,head),(2,other)):
+                self.record('round_open',dict(round_no=n,head=h,tester_job_id=None,extension_grant_seq=None,repeat_grant_seq=None),records)
+                client.event('job-a',dict(kind='job.round',job_id='job-a',round=n,head=(other if n==1 else head) if mismatch else h))
+        data=json.loads(self.script.read_text());data['journal']=records;self.script.write_text(json.dumps(data))
+        review=self.root/'mapping-review.md';review.write_text('VERDICT: PASS @'+head+'\nmapping check\n')
+        return self.run_wrk('round','verdict','job-a','--file',str(review)),head
+    def test_same_count_divergent_head_mapping_refuses_without_append(self):
+        result,head=self.mapping(True)
+        self.assertEqual(result.returncode,75,result.stderr)
+        for value in ('job-a',head,'local_target_round=2','server_target_round=1','orphaned local round=2'):
+            self.assertIn(value,result.stderr)
+        self.assertEqual(self.appends(),[])
+        self.assertFalse(self.intent_file().exists())
+        self.assertFalse(any(e['kind']=='job.verdict' for e in self.events()))
+    def test_matching_mapping_appends_with_server_round(self):
+        result,head=self.mapping(False)
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(json.loads(self.appends()[0]['stdin'])['round_no'],1)
+        self.assertEqual([e['round'] for e in self.events() if e['kind']=='job.verdict'],[1])
+
+
+if __name__ == "__main__":
+    unittest.main()
