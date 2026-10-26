@@ -166,7 +166,9 @@ class PositionGuards(unittest.TestCase):
                     "        if kind == 'missing': pass\n"
                     "        elif kind == 'symlink':\n"
                     f"            os.symlink({str(target)!r}, path, dir_fd=dir_fd)\n"
-                    "        elif kind == 'fifo': os.mkfifo(path, dir_fd=dir_fd)\n"
+                    # macOS exposes dir_fd for open but not mkfifo; the
+                    # fixture path is already the same temp positions dir.
+                    "        elif kind == 'fifo': os.mkfifo(os.path.join(positions_dir, path))\n"
                     "        elif kind == 'hardlink':\n"
                     f"            os.link({str(target)!r}, path, dst_dir_fd=dir_fd)\n"
                     "        else:\n"
