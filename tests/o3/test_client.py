@@ -635,6 +635,10 @@ class RoundCommandTests(Harness):
 
     def test_real_typed_void_projects_only_after_acceptance(self):
         self.open_round()
+        with self.client():
+            data = json.loads(self.script.read_text())
+            P1ReconciliationTests.grant(self, data["journal"], "void", 1)
+            self.script.write_text(json.dumps(data))
         self.more_responses({"action": "read"}, {"action": "read"}, {"action": "accept"})
         result = self.run_wrk("round", "void", "job-a", "1", "--grant", "4")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1245,6 +1249,7 @@ class DesignObservationTests(Harness):
         self.mode("required")
         with self.client() as client:
             records = self.own_history(imported=True)
+            P1ReconciliationTests.grant(self, records)
             self.script_history(records, [{"action": "read"}, {"action": "read"}, {"action": "accept"}])
             head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
             self.module.round_cli(client, ["open", "job-a", "--head", head, "--repo", str(ROOT), "--extension-grant", "5"], "required")
@@ -1641,8 +1646,8 @@ class MutantTests(Harness):
              'args = ["append", job, "--kind", req["kind"], "--idempotency-key", item["idempotency_key"],',
              'args = ["append", job, "--kind", req["kind"], "--idempotency-key", str(uuid.uuid4()),',
              "IntentTests.test_unknown_reply_retains_key_body_and_original_evidence"),
-            ("reject-indeterminate", "adapter", '                if exc.code in DEFINITE:',
-             '                if exc.code in DEFINITE or exc.code in ("wrk_unavailable", "protocol_invalid"):',
+            ("reject-indeterminate", "adapter", '                if exc.code in DEFINITE and item["state"] != "accepted":',
+             '                if (exc.code in DEFINITE or exc.code in ("wrk_unavailable", "protocol_invalid")) and item["state"] != "accepted":',
              "IntentTests.test_only_definite_refusals_reject_intents"),
             ("verdict-before-receipt", "adapter", '            req = item["request"]\n            args = ["append",',
              '            req = item["request"]\n            if req["kind"] == "verdict":\n                self.event(job, dict(kind="job.verdict", job_id=job))\n            args = ["append",',
@@ -1706,3 +1711,216 @@ print(json.dumps(dict(failures=len(r.failures),errors=len(r.errors),detail=strea
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class P1ReconciliationTests(Harness):
+    record = DesignObservationTests.record
+    def shadow(self, *responses):
+        records = self.seed(*responses)
+        data = json.loads(self.script.read_text()); data['journal'] = records[:1]
+        self.script.write_text(json.dumps(data)); self.mode('shadow')
+        return records[:1]
+
+    def head(self, ref='HEAD'):
+        return subprocess.check_output(['git', 'rev-parse', ref], cwd=ROOT, env=self.env, text=True).strip()
+
+    def open(self, ref='HEAD'):
+        return self.run_wrk('round', 'open', 'job-a', '--head', self.head(ref), '--repo', str(ROOT))
+
+    def ended(self):
+        events = self.intent_file().parent / 'events'; events.mkdir(parents=True, exist_ok=True)
+        (events/'00099-job.revoked.json').write_text(json.dumps(dict(kind='job.revoked',job_id='job-a',created_at='2099-01-01T00:00:00Z')))
+
+    def appends(self):
+        return [{k:c[k] for k in ('argv','stdin')} for c in self.calls() if c['argv'][1] == 'append']
+
+    def test_fresh_local_end_veto_precedes_intent_and_append(self):
+        self.shadow(*[{'action':'read'}]*2, {'action':'accept'}); self.ended()
+        result = self.open()
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('refused after end record', result.stderr)
+        self.assertEqual(self.appends(), [])
+        self.assertFalse(self.intent_file().exists())
+        self.assertEqual(len(self.events()),1)
+
+    def test_pending_and_accepted_after_end_replay_original_then_refuse_all_projection(self):
+        for action in ('commit_lost','accept'):
+            with self.subTest(state=action):
+                # Each branch has its own job/temp state.
+                other = P1ReconciliationTests(); other.setUp()
+                try:
+                    other.shadow({'action':action})
+                    with other.client() as client:
+                        request = other.round_request(expected=1, head=other.head())
+                        try: client.append('job-a', request)
+                        except other.module.Refusal as exc: self.assertEqual(exc.exit,75)
+                    original = other.appends()[0]
+                    other.ended(); before=other.events()
+                    other.more_responses({'action':'accept'}, *[{'action':'read'}]*2)
+                    result=other.open()
+                    self.assertEqual(result.returncode,2,result.stderr)
+                    self.assertEqual(other.events(),before)
+                    self.assertEqual(other.appends(),[original,original])
+                    key=original['argv'][original['argv'].index('--idempotency-key')+1]
+                    self.assertIn(key,result.stderr)
+                    self.assertEqual(result.stderr.count('warning key='),1)
+                finally: other.doCleanups()
+
+    def test_activated_job_ignores_planted_local_end_without_snapshot(self):
+        self.seed(*[{'action':'read'}]*2, {'action':'accept'}); self.mode('required'); self.ended()
+        self.assertFalse(self.intent_file().with_name('o3-snapshot.json').exists())
+        result=self.open()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(len(self.appends()),1)
+        self.assertEqual(sum(e['kind']=='job.round' for e in self.events()),1)
+
+    def test_unavailable_classification_uses_local_end_only_as_veto(self):
+        self.shadow(dict(exit=75,stderr='handoffkeep wrk: transport_unavailable\n')); self.ended()
+        result=self.open()
+        self.assertEqual(result.returncode,2,result.stderr)
+        self.assertEqual(self.appends(),[])
+        self.assertFalse(self.intent_file().exists())
+
+    def test_stale_shadow_snapshot_cannot_authorize_append(self):
+        self.shadow(*[{'action':'read'}]*2)
+        with self.client() as client: client.job('job-a')
+        self.more_responses(dict(exit=75,stderr='handoffkeep wrk: transport_unavailable\n'),{'action':'accept'})
+        result=self.open()
+        self.assertEqual(result.returncode,75,result.stderr)
+        self.assertEqual(self.appends(),[])
+        self.assertFalse(self.intent_file().exists())
+
+    def test_replay_dedupes_shadow_observation_and_round_numbers_match(self):
+        self.shadow(*[{'action':'read'}]*2,dict(exit=75,stderr='handoffkeep wrk: wrk_unavailable\n'))
+        result=self.open('HEAD^'); self.assertEqual(result.returncode,0,result.stderr)
+        original=self.appends()[0]
+        first=[e for e in self.events() if e['kind']=='job.round'][0]
+        self.more_responses({'action':'accept'}, *[{'action':'read'}]*2, {'action':'accept'})
+        result=self.open(); self.assertEqual(result.returncode,0,result.stderr)
+        rounds=[e for e in self.events() if e['kind']=='job.round']
+        self.assertEqual([e['round'] for e in rounds],[1,2])
+        self.assertEqual(rounds[0],first)
+        self.assertEqual(self.appends()[:2],[original,original])
+        data=json.loads(self.script.read_text())
+        self.assertEqual([r['payload']['round_no'] for r in data['journal'] if r['kind']=='round_open'],[1,2])
+        self.assertTrue(all(i['state']=='accepted' for i in json.loads(self.intent_file().read_text())['intents']))
+
+    def test_definite_replay_rejection_leaves_orphan_and_fails_closed(self):
+        self.shadow(*[{'action':'read'}]*2,dict(exit=75,stderr='handoffkeep wrk: wrk_unavailable\n'))
+        result=self.open('HEAD^'); self.assertEqual(result.returncode,0,result.stderr)
+        original=self.appends()[0]
+        self.more_responses(dict(exit=73,stderr='handoffkeep wrk: sequence_conflict\n'),*[{'action':'read'}]*2,{'action':'accept'})
+        result=self.open()
+        self.assertEqual(result.returncode,75,result.stderr)
+        for value in ('job-a','local_next_round=2','server_next_round=1','orphaned local round=1'):
+            self.assertIn(value,result.stderr)
+        self.assertEqual(self.appends(),[original,original])
+        self.assertEqual([e['round'] for e in self.events() if e['kind']=='job.round'],[1])
+
+    def test_indeterminate_backlog_blocks_new_append(self):
+        self.shadow(*[{'action':'read'}]*2,dict(exit=75,stderr='handoffkeep wrk: wrk_unavailable\n'))
+        self.assertEqual(self.open('HEAD^').returncode,0)
+        original=self.appends()[0]
+        self.more_responses(dict(exit=75,stderr='handoffkeep wrk: transport_indeterminate\n'))
+        result=self.open()
+        self.assertEqual(result.returncode,75,result.stderr)
+        self.assertEqual(self.appends(),[original,original])
+        self.assertEqual(len(json.loads(self.intent_file().read_text())['intents']),1)
+
+    def test_fresh_shadow_cap_and_oldest_head_guard_are_unchanged(self):
+        self.shadow(*[{'action':'read'}]*2)
+        directory=self.intent_file().parent/'events'; directory.mkdir(parents=True,exist_ok=True)
+        for n in range(1,4):
+            (directory/('%05d-job.round.json'%n)).write_text(json.dumps(dict(kind='job.round',job_id='job-a',round=n,head=str(n)*40)))
+        result=self.open()
+        self.assertEqual(result.returncode,78,result.stderr)
+        self.assertEqual(self.appends(),[])
+        self.assertFalse(self.intent_file().exists())
+
+    def grant(self, records, kind='extension', round_no=None):
+        payload=dict(grant_type=kind,round_no=round_no,head=None,extra=1 if kind=='extension' else 0,
+                     earlier_round_no=None,tester_job_id=None,expires_at='2099-01-01T00:00:00Z',reason_code='desk_approved')
+        record=DesignObservationTests.record(self,'grant',payload,records)
+        record['actor_client_id']='director-1'
+        record['record_hash']=self.module.digest({k:v for k,v in record.items() if k!='record_hash'})
+        return record
+
+    def test_typed_grant_5xx_never_takes_p1_warning_fallback(self):
+        self.shadow(*[{'action':'read'}]*2,dict(exit=75,stderr='handoffkeep wrk: wrk_unavailable\n'))
+        with self.client():
+            data=json.loads(self.script.read_text())
+            for n in range(1,4):
+                self.record('round_open',dict(round_no=n,head=str(n)*40,tester_job_id=None,extension_grant_seq=None,repeat_grant_seq=None),data['journal'])
+            grant=self.grant(data['journal'])
+            self.script.write_text(json.dumps(data))
+        events=self.intent_file().parent/'events'; events.mkdir(parents=True,exist_ok=True)
+        for n in range(1,4):
+            (events/('%05d-job.round.json'%n)).write_text(json.dumps(dict(kind='job.round',job_id='job-a',round=n,head=str(n)*40)))
+        result=self.run_wrk('round','open','job-a','--head',self.head(),'--repo',str(ROOT),'--extension-grant',str(grant['seq']))
+        self.assertEqual(result.returncode,75,result.stderr)
+        self.assertEqual(len(self.appends()),1)
+        self.assertEqual(len(self.events()),3)
+        self.assertEqual(json.loads(self.intent_file().read_text())['intents'][0]['state'],'pending')
+
+    def test_two_extension_grants_and_replay_keep_o2_cumulative_shape(self):
+        self.mode('required')
+        with self.client() as client:
+            records=DesignObservationTests.own_history(self,imported=True)
+            first_grant=self.grant(records)
+            first=DesignObservationTests.record(self,'round_open',dict(round_no=4,head='a'*40,tester_job_id=None,extension_grant_seq=first_grant['seq'],repeat_grant_seq=None),records)
+            second_grant=self.grant(records)
+            second=DesignObservationTests.record(self,'round_open',dict(round_no=5,head='b'*40,tester_job_id=None,extension_grant_seq=second_grant['seq'],repeat_grant_seq=None),records)
+            history=dict(records=records,summary={'claim_seq':1})
+            for record in (first,second,first):
+                client.project(dict(created=False,record=record),'enforced',history)
+            rounds=[e for e in self.events() if e['kind']=='job.round']
+            self.assertEqual([e['approval']['extra'] for e in rounds],[1,2])
+            for event,grant in zip(rounds,(first_grant,second_grant)):
+                self.assertEqual(event['approval']['ref'],'hk:task/901')
+                self.assertEqual(event['approval']['issuer'],'director-1')
+                self.assertEqual(event['reason'],'desk_approved')
+                self.assertEqual(event['grant_seq'],grant['seq'])
+                self.assertEqual(event['grant_record_hash'],grant['record_hash'])
+                self.assertEqual(set(event['wrk_receipt']),{'job_id','seq','record_hash','store_generation'})
+
+    def test_typed_void_projection_is_readable_by_unchanged_o2_counter(self):
+        self.shadow(*[{'action':'read'}]*2,{'action':'accept'},*[{'action':'read'}]*2,{'action':'accept'})
+        self.assertEqual(self.open().returncode,0)
+        with self.client():
+            data=json.loads(self.script.read_text()); grant=self.grant(data['journal'],'void',1)
+            self.script.write_text(json.dumps(data))
+        result=self.run_wrk('round','void','job-a','1','--grant',str(grant['seq']))
+        self.assertEqual(result.returncode,0,result.stderr)
+        event=[e for e in self.events() if e['kind']=='job.round_void'][0]
+        self.assertEqual((event['ref'],event['issuer'],event['reason']),('hk:task/2400','director-1','builder_void'))
+        self.assertEqual(event['grant_record_hash'],grant['record_hash'])
+        with self.client() as client:
+            with client.events_locked('job-a') as local:
+                _,_,scan=local.run_guard('round_scan',[])
+                self.assertEqual(scan['used'],0)
+
+
+
+class ModeShellTests(Harness):
+    def discover_shell(self):
+        stub=self.root/'mode-tools';stub.mkdir(exist_ok=True)
+        python=stub/'python3';python.write_text('#!/bin/sh\nexit 1\n');python.chmod(0o700)
+        env=dict(self.env,PATH=str(stub)+':/usr/bin:/bin',WRK_TRUST_PY='')
+        source=WRK.read_text()
+        function='wrk_o3_mode() {'+source.split('wrk_o3_mode() {',1)[1].split('\n}\n',1)[0]+'\n}\n'
+        return subprocess.run(['bash','-c',function+'\nwrk_o3_mode\n'],env=env,capture_output=True,text=True)
+    def test_absent_file_needs_no_python(self):
+        result=self.discover_shell()
+        self.assertEqual(result.returncode,0,result.stderr)
+        self.assertEqual(result.stdout,'legacy\n')
+    def test_present_file_with_broken_python_refuses(self):
+        self.mode('required')
+        result=self.discover_shell()
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(result.stdout,'')
+    def test_dangling_symlink_requires_parser_and_refuses(self):
+        mode=self.home/'.config/wrk/records-mode';mode.parent.mkdir(parents=True)
+        mode.symlink_to(self.root/'absent')
+        result=self.discover_shell()
+        self.assertNotEqual(result.returncode,0)
+        self.assertEqual(result.stdout,'')

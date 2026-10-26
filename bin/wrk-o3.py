@@ -8,11 +8,12 @@ Contract: designs/hk1873/b1873a-sol-r4, sections 2, 5, 6 and 6b.
 import argparse
 import base64
 import binascii
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext, redirect_stdout
 from datetime import datetime, timezone
 import errno
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -416,6 +417,7 @@ def receipt_for(record):
 
 class Client:
     def __init__(self, central=None):
+        self._event_contexts = {}
         self.central = central
         self.resolver, self.schema = Resolver(), Schema()
 
@@ -692,7 +694,7 @@ class Client:
                 raise Refusal("history_regressed")
         return value
 
-    def append(self, job, request=None, resume=None):
+    def append(self, job, request=None, resume=None, replay_accepted=False):
         """One durable send. No implicit network retry, CAS refresh or key rewrite."""
         job_name(job)
         store = IntentStore(self, job)
@@ -714,8 +716,9 @@ class Client:
                     data["intents"].append(item)
             if item["state"] == "rejected":
                 raise Refusal(item["error"])
-            if item["state"] == "accepted":
-                # Never resubmit accepted operations: repair through fresh reads.
+            if item["state"] == "accepted" and not replay_accepted:
+                # Normally repair through fresh reads; P1 end reconciliation
+                # explicitly resends the original acceptance before refusing.
                 return self.repair_record(job, item["receipt"])
             store.save(data)  # MUST complete file+directory fsync before send.
             req = item["request"]
@@ -741,7 +744,7 @@ class Client:
                        for x in data["intents"]):
                     raise Refusal("history_regressed")
             except Refusal as exc:
-                if exc.code in DEFINITE:
+                if exc.code in DEFINITE and item["state"] != "accepted":
                     item.update(state="rejected", error=exc.code)
                     store.save(data)
                 raise
@@ -785,7 +788,7 @@ class Client:
             for path in events.glob("*.json"):
                 try:
                     record = strict_json(path.read_bytes())
-                    if isinstance(record, dict) and valid_receipt(record.get("wrk_receipt"), job):
+                    if isinstance(record, dict) and record.get("idempotency_key"):
                         projected.add(record["idempotency_key"])
                 except (OSError, Refusal, KeyError):
                     continue
@@ -817,7 +820,30 @@ class Client:
         payload[("source" if kind == "import" else prefix) + "_sha256"] = hashlib.sha256(raw).hexdigest()
         return self.append(job, dict(kind=kind, expected_seq=expected_seq, claim_seq=claim_seq, payload=payload))
 
-    def project(self, response, mode):
+    @contextmanager
+    def events_locked(self, job):
+        """Share the unchanged O2 events lock with validation and projection."""
+        if job in self._event_contexts:
+            yield self._event_contexts[job]
+            return
+        chosen = self.resolver.resolve(self.central)
+        events = Path(chosen["inbox"]) / job_name(job) / "events"
+        events.mkdir(parents=True, exist_ok=True)
+        source = Path(__file__).with_name("wrk").read_text(encoding="utf-8")
+        code = re.search(r"^WRK_EVENTS_PY='\n(.*?)^'$", source, re.M | re.S)
+        if code is None:
+            raise Refusal("protocol_invalid")
+        ns = {}
+        exec(compile(code[1], "wrk shared events", "exec"), ns)
+        with ns["wrk_events_locked"](str(events)):
+            context = LocalRounds(str(events), ns, source, job)
+            self._event_contexts[job] = context
+            try:
+                yield context
+            finally:
+                del self._event_contexts[job]
+
+    def project(self, response, mode, history=None):
         """After durable acceptance only; C2 owns done/joined consumer wiring."""
         record = response["record"]
         kinds = {"round_open": "job.round", "verdict": "job.verdict", "void": "job.round_void",
@@ -833,34 +859,43 @@ class Client:
         if not response["created"]:
             projection["provenance"] = "server_repair"
         try:
-            self.event(record["job_id"], projection)
+            with self.events_locked(record["job_id"]) as local:
+                # An O2 observation remains the same observation after replay.
+                if local.has_key(record["idempotency_key"], projection["kind"]):
+                    return
+                grant_seq = (record["payload"].get("grant_seq") if record["kind"] == "void"
+                             else record["payload"].get("extension_grant_seq"))
+                if grant_seq:
+                    history = history or self.records(record["job_id"])
+                    fields = local.grant_fields(history["records"], record["claim_seq"], grant_seq)
+                    projection.update(grant_seq=grant_seq, grant_record_hash=fields["hash"])
+                    if record["kind"] == "void":
+                        projection.update(ref=fields["ref"], issuer=fields["issuer"],
+                                          reason=record["payload"]["reason_code"])
+                    else:
+                        projection["approval"] = dict(ref=fields["ref"], issuer=fields["issuer"],
+                                                      extra=fields["extra"])
+                        projection["reason"] = fields["reason"]
+                self.event(record["job_id"], projection)
         except (OSError, Refusal):
-            # A local projection failure cannot erase the accepted intent.
             raise ProjectionPending() from None
 
     def event(self, job, record):
-        chosen = self.resolver.resolve(self.central)
-        events = Path(chosen["inbox"]) / job_name(job) / "events"
-        events.mkdir(parents=True, exist_ok=True)
-        source = Path(__file__).with_name("wrk").read_text(encoding="utf-8")
-        code = re.search(r"^WRK_EVENTS_PY='\n(.*?)^'$", source, re.M | re.S)
-        if code is None:
-            raise Refusal("protocol_invalid")
-        ns = {}
-        exec(compile(code[1], "wrk shared events", "exec"), ns)
-        with ns["wrk_events_locked"](str(events)):
-            local = [r for _, r, _ in ns["wrk_events_ordered"](str(events)) if isinstance(r, dict)]
+        with self.events_locked(job) as local:
+            if record.get("idempotency_key") and local.has_key(record["idempotency_key"], record["kind"]):
+                return
+            records = local.records()
             if record.get("wrk_receipt"):
-                if any(r.get("wrk_receipt") == record["wrk_receipt"] and r.get("kind") == record["kind"] for r in local):
+                if any(r.get("wrk_receipt") == record["wrk_receipt"] and r.get("kind") == record["kind"] for r in records):
                     return
             if record["kind"] == "job.o3_warning":
-                if any(all(r.get(k) == record.get(k) for k in ("kind", "code", "operation", "idempotency_key")) for r in local):
+                if any(all(r.get(k) == record.get(k) for k in ("kind", "code", "operation", "idempotency_key")) for r in records):
                     return
-            claims = [r.get("payload", r) for r in local if r.get("kind") in ("job.claim", "job.reclaim")]
+            claims = [r.get("payload", r) for r in records if r.get("kind") in ("job.claim", "job.reclaim")]
             meta = claims[-1] if claims else {}
             for field in ("owner_lane", "parent_lane", "label", "pane_id"):
                 record.setdefault(field, meta.get(field, ""))
-            ns["wrk_event_commit"](str(events), record["kind"], record)
+            local.ns["wrk_event_commit"](local.events, record["kind"], record)
 
     def warning(self, job, code, operation, key=None):
         self.event(job, dict(kind="job.o3_warning", job_id=job, code=code,
@@ -878,6 +913,15 @@ class Client:
 
     def spawn_check(self, job, role, tier, task=None, owner=None, parent=None,
                     subject=None, head=None, extension=None, repeat=None, mode="required", predecessor=None, repo=None):
+        if role in ("tester", "reviewer", "counsel") and subject:
+            with self.events_locked(job_name(subject)):
+                return self._spawn_check(job, role, tier, task, owner, parent,
+                                         subject, head, extension, repeat, mode, predecessor, repo)
+        return self._spawn_check(job, role, tier, task, owner, parent,
+                                 subject, head, extension, repeat, mode, predecessor, repo)
+
+    def _spawn_check(self, job, role, tier, task=None, owner=None, parent=None,
+                     subject=None, head=None, extension=None, repeat=None, mode="required", predecessor=None, repo=None):
         """C1 admission handshake only; no quota, pane, link/rebind or release.
 
         Central claim/activation are desk operations. A host may mint only
@@ -890,8 +934,23 @@ class Client:
             # A prior unknown claim/open must reconcile before fresh target
             # liveness, CAS or local Git checks can refuse the new attempt.
             self.retry_pending(job, "claim", job_id=job)
-            self.retry_pending(job_name(subject), "round_open", head=head, tester_job_id=job)
+            with IntentStore(self, subject).locked() as data:
+                backlog = [x["local_id"] for x in data["intents"] if x["state"] == "pending"]
+            recovered = []
+            for intent in backlog:
+                try:
+                    recovered.append(self.append(subject, resume=intent))
+                except Refusal as exc:
+                    if exc.code not in DEFINITE:
+                        raise
             target = self.job(subject)
+            target_enforced = receipt_required(target["records"])
+            local = self._event_contexts[subject]
+            if not target_enforced:
+                local.end("open", recovered[0]["record"]["idempotency_key"] if recovered else None)
+            for response in recovered:
+                if response["record"]["kind"] in ("round_open", "verdict", "void"):
+                    self.project(response, "enforced" if target_enforced else "shadow", target)
             canonical = target["claim"]["payload"]
             state = target["summary"]["state"]
             if canonical["role"] not in ("builder", "worker") or state not in ("active", "shadow"):
@@ -952,11 +1011,14 @@ class Client:
                                claim_seq=target["summary"]["claim_seq"],
                                payload=dict(head=head, tester_job_id=job,
                                             extension_grant_seq=extension, repeat_grant_seq=repeat))
+                if not target_enforced:
+                    local.validate("open", request["payload"], target)
+                    local.check_number(target["summary"]["next_round_no"])
                 pending = self.unfinished(subject, "round_open", head=head, tester_job_id=job)
                 opened = self.append(subject, resume=pending) if pending else self.append(subject, request)
             else:
                 opened = dict(contract=CONTRACT, created=False, record=existing_open, summary=target["summary"])
-            self.project(opened, "enforced" if receipt_required(target["records"]) else "shadow")
+            self.project(opened, "enforced" if target_enforced else "shadow", target)
             return dict(task_id=assigned["task_id"], owner_lane=assigned["owner_lane"],
                         parent_lane=assigned["parent_lane"], inherited=True, receipt_required=True,
                         claim_receipt=receipt_for(assignment["claim"]))
@@ -989,6 +1051,124 @@ class Client:
         return dict(task_id=claim["task_id"], owner_lane=claim["owner_lane"],
                     parent_lane=claim["parent_lane"], inherited=claim["predecessor_job_id"] is not None,
                     receipt_required=receipt_required(current["records"]), claim_receipt=receipt_for(current["claim"]))
+
+
+class LocalRefusal(Refusal):
+    def __init__(self, message, exit_code=2):
+        self.code, self.exit = "local_o2_refusal", exit_code
+        Exception.__init__(self, message)
+        self.message = message
+
+
+class LocalRounds:
+    """Execute the existing O2 validators without changing their decisions.
+
+    The fixed sibling wrk owns these validators. Only their lock wrapper and
+    commit sink are substituted: the caller already holds that same lock and
+    the candidate must wait for the canonical append. Verdict bytes come from
+    the one captured request, never a second read of the reviewer's file.
+    """
+    def __init__(self, events, ns, source, job):
+        self.events, self.ns, self.source, self.job = events, ns, source, job
+
+    def records(self):
+        return [r for _, r, _ in self.ns["wrk_events_ordered"](self.events) if isinstance(r, dict)]
+
+    def has_key(self, key, kind):
+        return any(r.get("idempotency_key") == key and r.get("kind") == kind for r in self.records())
+
+    def end(self, operation, key=None):
+        name = self.ns["wrk_end_declaration"](self.events)
+        if name:
+            prefix = "warning key=%s " % key if key else ""
+            raise LocalRefusal(prefix + "round %s: refused after end record %s" % (operation, name))
+
+    def run_guard(self, function, args, raw=None):
+        body = self.source.split(function + "() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        body = body.replace('exec(os.environ["WRK_EVENTS_PY"])', '')
+        body = body.replace('with open(lock_path, "w", encoding="utf-8") as lock:\n    fcntl.flock(lock, fcntl.LOCK_EX)',
+                            'with nullcontext():')
+        body = body.replace('with open(vfile, "rb") as raw:', 'with io.BytesIO(_o3_evidence) as raw:')
+        captured, output = [], io.StringIO()
+        ns = dict(self.ns, nullcontext=nullcontext, _o3_evidence=raw,
+                  wrk_event_commit=lambda events, kind, record: captured.append(record))
+        original = sys.argv
+        try:
+            sys.argv = ["wrk O2 validation", self.events, *map(str, args)]
+            with redirect_stdout(output):
+                try:
+                    exec(compile(body, "wrk existing " + function, "exec"), ns)
+                except SystemExit as exc:
+                    if exc.code:
+                        raise Refusal("protocol_invalid") from None
+        finally:
+            sys.argv = original
+        return captured, output.getvalue().strip(), ns
+
+    def next_round(self):
+        _, _, ns = self.run_guard("round_scan", [])
+        return max(ns["used"], max(ns["round_numbers"], default=0)) + 1
+
+    def check_number(self, server_next):
+        local_next = self.next_round()
+        if local_next != server_next:
+            raise LocalRefusal("job=%s local_next_round=%d server_next_round=%d orphaned local round=%d; director decision required" %
+                               (self.job, local_next, server_next, local_next - 1), 75)
+
+    def grant_fields(self, records, claim_seq, grant_seq):
+        grant = next((r for r in records if r["seq"] == grant_seq and r["kind"] == "grant"), None)
+        claim = next((r for r in records if r["seq"] == claim_seq and r["kind"] == "claim"), None)
+        if grant is None or claim is None or grant["actor_client_id"] not in ("director-1", "operator-desk"):
+            raise Refusal("protocol_invalid")
+        ref = "hk:task/" + str(claim["payload"]["task_id"])
+        consumed = {r.get("grant_seq") for r in self.records()
+                    if r.get("kind") == "job.round" and (r.get("approval") or {}).get("ref") == ref}
+        consumed.discard(None)
+        return dict(ref=ref, issuer=grant["actor_client_id"], hash=grant["record_hash"],
+                    reason=grant["payload"]["reason_code"], extra=len(consumed - {grant_seq}) + 1 + sum(1 for r in self.records()
+                          if r.get("kind") == "job.round" and not r.get("grant_seq")
+                          and (r.get("approval") or {}).get("ref") == ref))
+
+    def validate(self, operation, payload, history=None, raw=None):
+        self.end(operation)
+        meta = [r.get("payload", r) for r in self.records() if r.get("kind") in ("job.claim", "job.reclaim")]
+        meta = meta[-1] if meta else {}
+        owner, label, pane, parent = [meta.get(k, "") for k in ("owner_lane", "label", "pane_id", "parent_lane")]
+        ref, issuer, extra = "", "", 0
+        grant = payload.get("extension_grant_seq") if operation == "open" else payload.get("grant_seq")
+        if grant:
+            # O2 needs a compatible reference/count for its local veto only.
+            # The server validates the typed grant and its issuer/consumption.
+            task = meta.get("task_id", "unknown")
+            if history is not None:
+                claim = next(r for r in history["records"] if r["seq"] == history["summary"]["claim_seq"])
+                task = claim["payload"]["task_id"]
+            ref = "hk:task/" + str(task)
+            extra = 1 + sum(1 for r in self.records() if (r.get("approval") or {}).get("ref") == ref)
+        if operation == "open":
+            args = [self.job, owner, label, pane, parent, payload["head"], 3, ref, extra, issuer]
+        elif operation == "void":
+            args = [self.job, payload["round_no"], ref, payload["reason_code"], issuer]
+        else:
+            args = [self.job, owner, label, pane, parent, payload["path"]]
+        candidates, result, _ = self.run_guard("round_" + operation + "_cmd", args, raw)
+        if candidates:
+            return candidates[0]
+        if result.startswith("CAP "):
+            raise LocalRefusal("round cap 3 reached for " + self.job, 78)
+        raise LocalRefusal("round %s: %s" % (operation, result))
+
+    def veto(self, args):
+        self.end(args.command)
+        raw = None
+        if args.command == "open":
+            payload = dict(head=(args.head or "").lower(), extension_grant_seq=args.extension_grant)
+        elif args.command == "void":
+            payload = dict(round_no=args.number, grant_seq=args.grant, reason_code=args.reason_code)
+        else:
+            raw = read_evidence(os.path.abspath(args.file))
+            payload = dict(path=os.path.abspath(args.file))
+        self.validate(args.command, payload, raw=raw)
 
 
 class ProjectionPending(Refusal):
@@ -1116,89 +1296,126 @@ def round_cli(client, argv, mode):
         return "job=%s lane=%s cap=3 rounds=%d open=%s generation=%s seq=%d stale=false label=O3 unmatched_verdicts=%d" % (
             job, current["claim"]["payload"]["owner_lane"], s["used"], ",".join(map(str, s["open_rounds"])) or "-",
             s["store_generation"], s["snapshot_seq"], unmatched_evidence(client, job, current["records"]))
+    with client.events_locked(job) as local:
+        return round_mutation(client, local, args, mode)
+
+
+def round_mutation(client, local, args, mode):
+    job = local.job
     operation = {"open": "round_open", "verdict": "verdict", "void": "void"}[args.command]
     if args.command == "verdict" and not args.file:
         raise Refusal("cli_usage")
     if args.command == "open" and not re.fullmatch(r"[0-9a-fA-F]{40}", args.head or ""):
         raise Refusal("cli_usage")
-    retry_identity = ({"head": (args.head or "").lower(), "tester_job_id": args.tester} if args.command == "open"
-                      else {"round_no": args.number, "grant_seq": args.grant} if args.command == "void"
-                      else {"path": os.path.abspath(args.file)} if args.file else {})
-    unfinished = client.unfinished(job, operation, **retry_identity)
-    if unfinished:
-        if args.extend is not None or args.by is not None or args.reason is not None:
-            raise Refusal("cli_usage")
-        # Unknown writes replay BEFORE any fresh CAS, terminal or claim read.
-        response = client.append(job, resume=unfinished)
-        fresh = client.job(job)
-        projection_mode = "enforced" if receipt_required(fresh["records"]) else "shadow"
-        client.project(response, projection_mode)
-        record = response["record"]
-        return "OK job=%s round=%s kind=%s seq=%d o3_mode=%s" % (
-            job, record["payload"].get("round_no", "-"), record["kind"], record["seq"], projection_mode)
-    current = route_job(client, job, mode)
+    if args.command == "void" and (args.number is None or args.grant is None):
+        raise Refusal("cli_usage")
+    identity = ({"head": (args.head or "").lower(), "tester_job_id": args.tester} if args.command == "open"
+                else {"round_no": args.number, "grant_seq": args.grant} if args.command == "void"
+                else {"path": os.path.abspath(args.file)})
+    unfinished = client.unfinished(job, operation, **identity)
+    with IntentStore(client, job).locked() as data:
+        pending = [dict(x) for x in data["intents"] if x["state"] == "pending"]
+    replayed, matched, matched_error = [], None, None
+    # Resolve the entire ordered backlog before classification or a new append.
+    # A definite refusal can leave an orphaned O2 observation; never renumber it.
+    for item in pending:
+        try:
+            response = client.append(job, resume=item["local_id"])
+        except Refusal as exc:
+            if exc.code not in DEFINITE:
+                raise
+            if item["local_id"] == unfinished:
+                matched_error = exc
+        else:
+            replayed.append(response)
+            if item["local_id"] == unfinished:
+                matched = response
+    if unfinished and not matched and not matched_error:
+        # A stored acceptance after a local end must be replayed, too. Ordinary
+        # accepted read repair still uses records, with its original receipt.
+        response = client.append(job, resume=unfinished,
+                                 replay_accepted=bool(local.ns["wrk_end_declaration"](local.events)))
+        replayed.append(response)
+        matched = response
+    try:
+        current = route_job(client, job, mode)
+    except Refusal as exc:
+        if exc.code in TEMPORARY and not client.protected_witness(job):
+            local.veto(args)
+        raise
     if current is None:
+        local.end(args.command)
         return LEGACY_ROUTE
     if args.extend is not None or args.by is not None or args.reason is not None:
         raise Refusal("cli_usage")
-    if args.command == "void" and (args.number is None or args.grant is None):
-        raise Refusal("cli_usage")
-    s = current["summary"]
     enforced = not current.get("offline") and receipt_required(current["records"])
     projection_mode = "enforced" if enforced else "shadow"
+    if not enforced:
+        key = replayed[0]["record"]["idempotency_key"] if replayed else None
+        local.end(args.command, key)
+    if current.get("offline"):
+        # A stale shadow cache cannot classify a new mutation. O2 guards are
+        # only a veto, and a snapshot never supplies positive authority.
+        local.veto(args)
+        raise Refusal("transport_unavailable")
+    for response in replayed:
+        if response["record"]["kind"] in ("round_open", "verdict", "void"):
+            client.project(response, projection_mode, current)
+    if matched_error:
+        raise matched_error
+    if matched:
+        return round_result(job, matched, projection_mode)
+    summary = current["summary"]
+    raw = None
     if args.command == "open":
         head = (args.head or "").lower()
         validate_head(client, job, head, args.repo)
         payload = dict(head=head, tester_job_id=args.tester,
                        extension_grant_seq=args.extension_grant, repeat_grant_seq=args.repeat_grant)
-        identity = dict(head=head, tester_job_id=args.tester)
     elif args.command == "void":
         payload = dict(round_no=args.number, grant_seq=args.grant, reason_code=args.reason_code)
-        identity = dict(round_no=args.number, grant_seq=args.grant)
     else:
-        if not args.file:
-            raise Refusal("cli_usage")
         path = os.path.abspath(args.file)
-        identity = dict(path=path)
-        payload = None
-    unfinished = client.unfinished(job, operation, **identity)
+        raw = read_evidence(path)  # Exact bytes captured ONCE.
+        verdict, head = verdict_header(raw)
+        opens = [r for r in current["records"] if r["kind"] == "round_open"
+                 and r["payload"]["round_no"] in summary["open_rounds"] and r["payload"]["head"] == head]
+        if not opens:
+            raise Refusal("round_not_open")
+        target = min(opens, key=lambda r: r["payload"]["round_no"])
+        tester = args.tester if args.tester is not None else target["payload"]["tester_job_id"]
+        payload = dict(round_no=target["payload"]["round_no"], head=head, verdict=verdict,
+                       path=path, content_b64=base64.b64encode(raw).decode("ascii"),
+                       content_sha256=hashlib.sha256(raw).hexdigest(), tester_job_id=tester)
+    candidate = None
+    if not enforced:
+        # Same O2 guards and same lock as legacy commands, before intent/send.
+        candidate = local.validate(args.command, payload, current, raw)
+        local.check_number(summary["next_round_no"])
+    request = dict(kind=operation, claim_seq=summary["claim_seq"],
+                   expected_seq=summary["snapshot_seq"], payload=payload)
     try:
-        if unfinished:
-            response = client.append(job, resume=unfinished)
-        elif args.command == "verdict":
-            raw = read_evidence(path)  # Exact bytes captured ONCE.
-            verdict, head = verdict_header(raw)
-            opens = [r for r in current["records"] if r["kind"] == "round_open"
-                     and r["payload"]["round_no"] in s["open_rounds"] and r["payload"]["head"] == head]
-            if not opens:
-                raise Refusal("round_not_open")
-            target = min(opens, key=lambda r: r["payload"]["round_no"])
-            tester = args.tester if args.tester is not None else target["payload"]["tester_job_id"]
-            payload = dict(round_no=target["payload"]["round_no"], head=head, verdict=verdict,
-                           path=path, content_b64=base64.b64encode(raw).decode("ascii"),
-                           content_sha256=hashlib.sha256(raw).hexdigest(), tester_job_id=tester)
-            response = client.append(job, dict(kind=operation, claim_seq=s["claim_seq"], expected_seq=s["snapshot_seq"], payload=payload))
-        else:
-            response = client.append(job, dict(kind=operation, claim_seq=s["claim_seq"], expected_seq=s["snapshot_seq"], payload=payload))
+        response = client.append(job, request)
     except Refusal as exc:
-        if not enforced and mode == "shadow" and current["summary"]["state"] == "shadow" and exc.code in TEMPORARY:
-            pending = client.pending(job, operation, **identity)
+        uses_grant = any(payload.get(k) is not None for k in ("grant_seq", "extension_grant_seq", "repeat_grant_seq"))
+        if (not enforced and mode == "shadow" and summary["state"] == "shadow"
+                and exc.code in TEMPORARY and not uses_grant):
+            pending_id = client.pending(job, operation, **identity)
             with IntentStore(client, job).locked() as data:
-                item = next(x for x in data["intents"] if x["local_id"] == pending)
-                original = item["request"]["payload"]
-                projected = dict(original)
-                projected.pop("content_b64", None)
-                projected.update(kind={"open": "job.round", "verdict": "job.verdict", "void": "job.round_void"}[args.command],
-                                 job_id=job, o3_mode="shadow", wrk_receipt=None,
-                                 idempotency_key=item["idempotency_key"], round=original.get("round_no", s["next_round_no"]))
-                client.event(job, projected)
+                item = next(x for x in data["intents"] if x["local_id"] == pending_id)
+                candidate.update(o3_mode="shadow", wrk_receipt=None, idempotency_key=item["idempotency_key"])
+                client.event(job, candidate)
                 client.warning(job, exc.code, operation, item["idempotency_key"])
             return "OK job=%s label=O2-unverified pending=true" % job
         raise
-    client.project(response, projection_mode)
+    client.project(response, projection_mode, current)
+    return round_result(job, response, projection_mode)
+
+
+def round_result(job, response, mode):
     record = response["record"]
     return "OK job=%s round=%s kind=%s seq=%d o3_mode=%s" % (
-        job, record["payload"].get("round_no", "-"), record["kind"], record["seq"], projection_mode)
+        job, record["payload"].get("round_no", "-"), record["kind"], record["seq"], mode)
 
 
 def decode_content(value, code="invalid_request"):
@@ -1479,6 +1696,9 @@ commands and delegated consumers. These operations do no local cleanup.
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except LocalRefusal as error:
+        sys.stderr.write("wrk: " + error.message + "\n")
+        raise SystemExit(error.exit)
     except ProjectionPending:
         sys.stderr.write("wrk o3: projection_pending\n")
         raise SystemExit(75)

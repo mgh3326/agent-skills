@@ -5221,6 +5221,34 @@ wrk_trust_guard() {
 # hermetic copies of wrk need no adapter until O3 is explicitly enabled.
 # No environment variable/flag chooses the records mode.
 wrk_o3_mode() {
+  local mode_home mode_path mode_uid passwd_entry field value
+  if [[ "${WRK_TEST_MODE:-}" == 1 ]]; then
+    # Discovery with no test HOME reads no path (hk951 ruling).
+    [[ -n "${HOME:-}" ]] || { echo legacy; return; }
+    mode_home="$HOME"
+  else
+    mode_uid="$(/usr/bin/id -u)" || return 2
+    if [[ -x /usr/bin/getent ]]; then
+      passwd_entry="$(/usr/bin/getent passwd "$mode_uid")" || return 2
+      IFS=: read -r field field value field field mode_home field <<<"$passwd_entry"
+      [[ "$value" == "$mode_uid" ]] || return 2
+    elif [[ -x /usr/bin/dscacheutil ]]; then
+      passwd_entry="$(/usr/bin/dscacheutil -q user -a uid "$mode_uid")" || return 2
+      mode_home=""
+      while IFS=' ' read -r field value; do
+        [[ "$field" != dir: ]] || mode_home="$value"
+      done <<<"$passwd_entry"
+    else
+      return 2
+    fi
+    [[ "$mode_home" == /* ]] || return 2
+  fi
+  mode_path="$mode_home/.config/wrk/records-mode"
+  # Absence alone needs no parser. A dangling symlink still needs validation.
+  if [[ ! -e "$mode_path" && ! -L "$mode_path" ]]; then
+    echo legacy
+    return
+  fi
   WRK_TRUST_PY="$WRK_TRUST_PY" python3 - <<'PY'
 import os, pwd, stat, sys
 ns = {"__name__": "wrk_mode_guard"}
