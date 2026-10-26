@@ -6120,13 +6120,17 @@ sub-rounds (r5b) cannot hide: wrk numbers every round itself.
       Before opening, wrk checks HEAD^{commit} in the repo from the newest
       job.claim/job.reclaim repo, worktree or cwd field. If none is usable,
       pass --repo PATH. A missing commit triggers one bounded fetch of origin.
-  wrk round verdict JOB --file PATH
+  wrk round verdict JOB --file PATH [--head-repeat REF]
       Record the tester's verdict file. It binds to the oldest open round on its own head and is refused when there is none.
       PATH must contain a line 'VERDICT: PASS|BLOCKER @<40-hex sha>'.
       The record stores that file's content sha256 beside its path. A later
       verdict is refused when the path, those exact bytes, or that head was
       already recorded for this job. A repeated head is allowed only when
-      the round that held the earlier verdict was voided.
+      the round that held the earlier verdict was voided, or when --head-repeat REF
+      (hk:doc/<key> or hk:task/<id>) names an approval record with the grant line
+      'head-repeat: job=JOB head=SHA round=N by=ISSUER' for that head and the round
+      it binds to; a grant is used once per job and never releases the path or
+      content identity.
   wrk round status JOB
       Print one line: job=… rounds=N cap=N open=… last_verdict=… and any
       voided rounds as 'round N void (hk:doc/…)' or 'round N void (hk:task/…)'.
@@ -6293,14 +6297,15 @@ round_approval_fetch() {
 
 # Verify a fetched round approval record for the grant type and optional round.
 # Args: ref, job, parent lane, operators, trusted parent lanes (both space
-# separated), record file, grant type (default round-extension), round number.
+# separated), record file, grant type (default round-extension), round number,
+# head (head-repeat only: the verdict head the grant line must name).
 # Prints "granted=<N> issuer=<name>" — nothing else — on success.
 round_approval_verify() {
   local ref="$1" job="$2" parent="$3" operators="$4" parent_issuers="$5" record="$6"
-  local grant_kind="${7:-round-extension}" round_number="${8:-}"
-  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" "$grant_kind" "$round_number" <<'PY'
+  local grant_kind="${7:-round-extension}" round_number="${8:-}" head_sha="${9:-}"
+  python3 - "$ref" "$job" "$parent" "$operators" "$parent_issuers" "$record" "$grant_kind" "$round_number" "$head_sha" <<'PY'
 import json, re, sys
-ref, job, parent, operators, parent_issuers, path, grant_kind, round_number = sys.argv[1:]
+ref, job, parent, operators, parent_issuers, path, grant_kind, round_number, head_sha = sys.argv[1:]
 ops = set(operators.split())
 trusted_parents = set(parent_issuers.split())
 try:
@@ -6314,13 +6319,15 @@ except ValueError:
     raise SystemExit(1)
 # Each grant type has one canonical line form; whitespace variants are
 # malformed and rejected. The identity and parent-lane checks below are
-# shared by round extensions, voids and join waivers.
+# shared by round extensions, voids, join waivers and head repeats.
 if grant_kind == "round-extension":
     GRANT = re.compile(r"^round-extension: job=(\S+) extra=(\d+) by=(\S+)$")
 elif grant_kind == "round-void":
     GRANT = re.compile(r"^round-void: job=(\S+) round=(\d+) by=(\S+)$")
 elif grant_kind == "join-waiver":
     GRANT = re.compile(r"^join-waiver: job=(\S+) by=(\S+)$")
+elif grant_kind == "head-repeat":
+    GRANT = re.compile(r"^head-repeat: job=(\S+) head=([0-9a-f]{40}) round=([1-9][0-9]*) by=(\S+)$")
 else:
     raise SystemExit(1)
 # The issuer written into the grant line must equal the record's server-set
@@ -6349,6 +6356,11 @@ for identity, body in sources:
             continue
         if grant_kind == "join-waiver":
             amount, issuer = 1, m.group(2)
+        elif grant_kind == "head-repeat":
+            # The line must name this verdict's head and the round it binds to.
+            if m.group(2) != head_sha or m.group(3) != round_number:
+                continue
+            amount, issuer = 1, m.group(4)
         else:
             amount, issuer = int(m.group(2)), m.group(3)
         if (grant_kind == "round-extension" and amount < 1) or (
@@ -6758,27 +6770,14 @@ PY
   esac
 }
 
-round_verdict_cmd() {
-  local job="${1:-}" file="" metadata owner label pane parent role
-  [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
-  shift || true
-  while [[ $# -gt 0 ]]; do
-    case "$1" in
-      --file) [[ $# -ge 2 && -n "$2" ]] || die "--file requires a path"; file="$2"; shift 2 ;;
-      *) die "unknown round verdict option '$1'" ;;
-    esac
-  done
-  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
-  wrk_trust_guard
-  metadata="$(builder_metadata "$job" trusted)"
-  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
-  local outcome rc=0
-  set +e
-  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" <<'PY'
+# round_verdict_decide: the verdict decision, run under the events lock. Mode plan reports
+# the identity refusals and the round the verdict would bind to, and writes nothing. Mode
+# commit records the verdict. The grant arguments are empty unless --head-repeat was given.
+round_verdict_decide() { # events job owner label pane parent file mode grant_ref grant_issuer grant_round
+  wrk_py - "$@" <<'PY'
 import fcntl, hashlib, io, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, vfile = sys.argv[1:]
+events, job, owner, label, pane, parent, vfile, mode, grant_ref, grant_issuer, grant_round = sys.argv[1:]
 os.makedirs(events, exist_ok=True)
 verdict = vsha = None
 matches = []
@@ -6872,8 +6871,14 @@ with open(lock_path, "w", encoding="utf-8") as lock:
     if digest in digests:  # hk1449-content-sha
         print("DUP_CONTENT\t%s\t%s" % (content_hit, digest))
         raise SystemExit(0)
-    if head_hit:
-        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+    # A grant is used once per job and binds only a repeated head. Both checks run
+    # before the target round, so a refusal here never fetches or writes anything.
+    head_repeat_used = bool(grant_ref) and any(v.get("head_repeat") == grant_ref for v in verdicts)
+    if head_repeat_used:
+        print("HEAD_REPEAT_USED\t%s" % grant_ref)
+        raise SystemExit(0)
+    if grant_ref and not head_hit:
+        print("HEAD_REPEAT_NOT_NEEDED\t%s" % vsha)
         raise SystemExit(0)
     open_rounds = [r for r in rounds
                    if (isinstance(r.get("round"), int) and r.get("round") not in bound
@@ -6886,6 +6891,12 @@ with open(lock_path, "w", encoding="utf-8") as lock:
                 and round_head.lower() == vsha):  # hk1506-head-bind
             target = r["round"]
             break
+    if head_hit and (not grant_ref or target is None):
+        print("DUP_HEAD\t%s\t%s" % (head_hit, vsha))
+        raise SystemExit(0)
+    if mode == "plan":
+        print("PLAN_BIND\t%s\t%s" % (vsha, target))
+        raise SystemExit(0)
     if target is None:
         if open_rounds:
             labels = []
@@ -6902,6 +6913,9 @@ with open(lock_path, "w", encoding="utf-8") as lock:
         else:
             print("NO_OPEN_ROUND\t%s" % vsha)
         raise SystemExit(0)
+    if grant_ref and str(target) != grant_round:
+        print("HEAD_REPEAT_MOVED\t%s\t%s" % (grant_round, target))
+        raise SystemExit(0)
     used = sum(1 for r in rounds
                if not (isinstance(r.get("round"), int) and r.get("round") in voided))
     used += sum(1 for v in verdicts if not isinstance(v.get("round"), int))
@@ -6910,14 +6924,83 @@ with open(lock_path, "w", encoding="utf-8") as lock:
               "label": label, "pane_id": pane, "parent_lane": parent,
               "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
               "content_sha256": digest, "round": target, "epoch": 1}
+    if grant_ref:
+        record["head_repeat"] = grant_ref
+        record["head_repeat_issuer"] = grant_issuer
     wrk_event_commit(events, "job.verdict", record)
     print("RECORDED round=%s verdict=%s head=%s used=%d" %
           (target, verdict, vsha, used))
 PY
-)"
-  rc=$?
-  set -e
-  [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+}
+
+round_verdict_cmd() {
+  local job="${1:-}" file="" head_repeat="" metadata owner label pane parent role
+  [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
+  shift || true
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --file) [[ $# -ge 2 && -n "$2" ]] || die "--file requires a path"; file="$2"; shift 2 ;;
+      --head-repeat) [[ $# -ge 2 && -n "$2" ]] || die "--head-repeat requires a hk:doc/<key> or hk:task/<id> ref"; head_repeat="$2"; shift 2 ;;
+      *) die "unknown round verdict option '$1'" ;;
+    esac
+  done
+  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
+  if [[ -n "$head_repeat" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
+  metadata="$(builder_metadata "$job" trusted)"
+  IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  local events="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events"
+  local outcome rc=0 run_commit=1 grant_issuer="" bind_head="" bind_round=""
+  if [[ -n "$head_repeat" ]]; then
+    # The plan run reads the events under the lock and writes nothing. It refuses the
+    # identity cases and reports the round this verdict would bind to, so the grant is
+    # fetched and checked against that round before anything is recorded.
+    set +e
+    outcome="$(round_verdict_decide "$events" "$job" "$owner" "$label" "$pane" "$parent" "$file" plan "$head_repeat" "" "")"
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+    if [[ "$outcome" == PLAN_BIND$'\t'* ]]; then
+      IFS=$'\t' read -r _ bind_head bind_round <<<"$outcome"
+      local tmp_approval grant_line
+      tmp_approval="$(mktemp)"
+      if ! round_approval_fetch "$head_repeat" >"$tmp_approval"; then
+        rm -f "$tmp_approval"
+        die "round verdict: head-repeat record not found in handoffkeep: $head_repeat"
+      fi
+      grant_line="$(round_approval_verify "$head_repeat" "$job" "$parent" "$ROUND_CAP_OPERATORS" "$ROUND_CAP_PARENT_ISSUERS" "$tmp_approval" head-repeat "$bind_round" "$bind_head" || true)"  # hk1970-head-repeat
+      rm -f "$tmp_approval"
+      [[ -n "$grant_line" ]] ||
+        die "round verdict: $head_repeat has no 'head-repeat: job=$job head=$bind_head round=$bind_round by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)"
+      grant_issuer="${grant_line##*issuer=}"
+      # A pa-integrator grant counts only on ParkingArcade work, checked on the server.
+      if [[ "$grant_issuer" == "pa-integrator" ]]; then
+        local task_id tmp_task
+        task_id="$(round_job_task_id "$job" || true)"
+        [[ -n "$task_id" ]] ||
+          die "round verdict --head-repeat: pa-integrator grants need the job's hk task on the server; $job records no task_id"
+        tmp_task="$(mktemp)"
+        if ! round_pa_task_fetch "$task_id" >"$tmp_task"; then
+          rm -f "$tmp_task"
+          die "round verdict --head-repeat: pa-integrator grants need the job's hk task on the server; cannot fetch task $task_id"
+        fi
+        if ! round_pa_task_verify "$job" "$tmp_task"; then
+          rm -f "$tmp_task"
+          die "round verdict --head-repeat: pa-integrator grants count only when the server task for $job is project ParkingArcade with refs.job_id=$job"
+        fi
+        rm -f "$tmp_task"
+      fi
+    else
+      run_commit=0
+    fi
+  fi
+  if [[ "$run_commit" -eq 1 ]]; then
+    set +e
+    outcome="$(round_verdict_decide "$events" "$job" "$owner" "$label" "$pane" "$parent" "$file" commit "$head_repeat" "$grant_issuer" "$bind_round")"
+    rc=$?
+    set -e
+    [[ "$rc" -eq 0 ]] || die "round verdict failed to inspect $job"
+  fi
   case "$outcome" in
     NO_VERDICT)
       die "round verdict --file has no 'VERDICT: PASS|BLOCKER @<40-hex sha>' line: $file" ;;
@@ -6925,6 +7008,18 @@ PY
       die "round verdict --file has more than one VERDICT line: $file" ;;
     ENDED$'\t'*|DUP_PATH$'\t'*|DUP_CONTENT$'\t'*|DUP_HEAD$'\t'*)
       wrk_verdict_refusal "$outcome" ;;
+    HEAD_REPEAT_USED$'\t'*)
+      local used_ref
+      IFS=$'\t' read -r _ used_ref <<<"$outcome"
+      die "round verdict: head_repeat_used $used_ref: already recorded on a job.verdict of $job" ;;
+    HEAD_REPEAT_NOT_NEEDED$'\t'*)
+      local idle_head
+      IFS=$'\t' read -r _ idle_head <<<"$outcome"
+      die "round verdict: head_repeat_not_needed: head $idle_head has no earlier job.verdict on $job; drop --head-repeat" ;;
+    HEAD_REPEAT_MOVED$'\t'*)
+      local moved_from moved_to
+      IFS=$'\t' read -r _ moved_from moved_to <<<"$outcome"
+      die "round verdict: head_repeat_round_moved: the grant names round $moved_from but the head now binds to round $moved_to; retry" ;;
     NO_HEAD_ROUND$'\t'*)
       local no_head_v no_open_list
       IFS=$'\t' read -r _ no_head_v no_open_list <<<"$outcome"
