@@ -1,4 +1,6 @@
 """C1 transport, journal-intent and projection contracts (no network/agents)."""
+import ast
+import copy
 import hashlib
 import base64
 import contextlib
@@ -1742,11 +1744,23 @@ class P1ReconciliationTests(Harness):
         self.script.write_text(json.dumps(data)); self.mode('shadow')
         return records[:1]
 
+    def repo(self):
+        directory = self.root / 'head-repo'
+        if not (directory / '.git').is_dir():
+            directory.mkdir()
+            env = dict(self.env, GIT_CONFIG_NOSYSTEM='1')
+            subprocess.run(['git', 'init', '-q', str(directory)], env=env, check=True)
+            for message in ('fixture first', 'fixture second'):
+                subprocess.run(['git', '-C', str(directory), '-c', 'user.name=Fixture',
+                                '-c', 'user.email=fixture@example.test', '-c', 'commit.gpgsign=false',
+                                'commit', '--allow-empty', '-qm', message], env=env, check=True)
+        return directory
+
     def head(self, ref='HEAD'):
-        return subprocess.check_output(['git', 'rev-parse', ref], cwd=ROOT, env=self.env, text=True).strip()
+        return subprocess.check_output(['git', 'rev-parse', ref], cwd=P1ReconciliationTests.repo(self), env=self.env, text=True).strip()
 
     def open(self, ref='HEAD'):
-        return self.run_wrk('round', 'open', 'job-a', '--head', self.head(ref), '--repo', str(ROOT))
+        return self.run_wrk('round', 'open', 'job-a', '--head', self.head(ref), '--repo', str(P1ReconciliationTests.repo(self)))
 
     def ended(self):
         events = self.intent_file().parent / 'events'; events.mkdir(parents=True, exist_ok=True)
@@ -1877,7 +1891,7 @@ class P1ReconciliationTests(Harness):
         events=self.intent_file().parent/'events'; events.mkdir(parents=True,exist_ok=True)
         for n in range(1,4):
             (events/('%05d-job.round.json'%n)).write_text(json.dumps(dict(kind='job.round',job_id='job-a',round=n,head=str(n)*40)))
-        result=self.run_wrk('round','open','job-a','--head',self.head(),'--repo',str(ROOT),'--extension-grant',str(grant['seq']))
+        result=self.run_wrk('round','open','job-a','--head',self.head(),'--repo',str(P1ReconciliationTests.repo(self)),'--extension-grant',str(grant['seq']))
         self.assertEqual(result.returncode,75,result.stderr)
         self.assertEqual(len(self.appends()),1)
         self.assertEqual(len(self.events()),3)
@@ -1994,7 +2008,7 @@ class TypedRepeatTests(Harness):
             if mismatch: repeat['payload'].update(mismatch)
             repeat['record_hash']=self.module.digest({k:v for k,v in repeat.items() if k!='record_hash'})
         data=json.loads(self.script.read_text());data['journal']=records;self.script.write_text(json.dumps(data))
-        result=self.run_wrk('round','open','job-a','--head',head,'--repo',str(ROOT),'--extension-grant',str(extension['seq']),'--repeat-grant',str(repeat['seq']))
+        result=self.run_wrk('round','open','job-a','--head',head,'--repo',str(P1ReconciliationTests.repo(self)),'--extension-grant',str(extension['seq']),'--repeat-grant',str(repeat['seq']))
         self.assertEqual(result.returncode,0,result.stderr)
         return extension,repeat
     def verdict(self, *flags):
@@ -2132,6 +2146,171 @@ class ModeParityTests(Harness):
                 finally:
                     if blocked is not None:blocked.chmod(0o700)
                     other.doCleanups()
+
+
+
+
+class EndedHistoryTests(Harness):
+    head=P1ReconciliationTests.head
+    ended=P1ReconciliationTests.ended
+    appends=P1ReconciliationTests.appends
+
+    def accepted(self):
+        P1ReconciliationTests.shadow(self,{'action':'accept'})
+        with self.client() as client:
+            client.append('job-a',self.round_request(expected=1,head=self.head()))
+        return copy.deepcopy(json.loads(self.intent_file().read_text())['intents'][0])
+
+    def prefix_response(self,records):
+        source=ROOT/'tests/fixtures/wrk-o3/handoffkeep'
+        tree=ast.parse(source.read_text())
+        fn=next(n for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=='summary')
+        ns={};exec(compile(ast.Module(body=[fn],type_ignores=[]),str(source),'exec'),ns)
+        summary=ns['summary'](records)
+        return (dict(contract='hk1873.v1',claim=records[0],summary=summary),
+                dict(contract='hk1873.v1',snapshot_seq=summary['snapshot_seq'],next_after_seq=summary['snapshot_seq'],has_more=False,records=records,summary=summary))
+
+    def retry(self):
+        return self.run_wrk('round','open','job-a','--head',self.head(),'--repo',str(P1ReconciliationTests.repo(self)))
+
+    def assert_observation(self,result,before,original,kind):
+        self.assertEqual(result.returncode,75,result.stderr)
+        self.assertEqual(self.events(),before)
+        self.assertEqual(len(result.stderr.splitlines()),1,result.stderr)
+        for word in ('history_regressed','job-a',original['idempotency_key'],'00099-job.revoked.json',kind):
+            self.assertIn(word,result.stderr)
+        current=json.loads(self.intent_file().read_text())['intents'][0]
+        self.assertEqual(current['state'],'accepted')
+        self.assertEqual(current['receipt'],original['receipt'])
+        self.assertEqual(current['request'],original['request'])
+        self.assertEqual(current['idempotency_key'],original['idempotency_key'])
+        self.assertEqual(set(current['history_regressed']),{'observed_at','get_result'})
+        self.assertEqual(current['history_regressed']['get_result'],kind)
+        self.assertTrue(current['history_regressed']['observed_at'].endswith('Z'))
+        return current['history_regressed']
+
+    def test_ended_replay_not_found_notes_without_event_and_preserves_acceptance(self):
+        original=self.accepted();self.ended();before=self.events()
+        self.more_responses({'action':'accept'},dict(exit=66,stderr='handoffkeep wrk: not_found\n'))
+        first=self.assert_observation(self.retry(),before,original,'not_found')
+        self.more_responses({'action':'accept'},dict(exit=66,stderr='handoffkeep wrk: not_found\n'))
+        self.assertEqual(self.assert_observation(self.retry(),before,original,'not_found'),first)
+        self.assertEqual(self.appends(),[self.appends()[0]]*3)
+
+    def test_not_ended_history_still_writes_warning_event(self):
+        self.accepted();before=self.intent_file().read_bytes()
+        self.more_responses(dict(exit=66,stderr='handoffkeep wrk: not_found\n'))
+        result=self.run_wrk('round','status','job-a')
+        self.assertEqual(result.returncode,75,result.stderr)
+        self.assertEqual([e['kind'] for e in self.events()],['job.o3_warning'])
+        self.assertEqual(self.intent_file().read_bytes(),before)
+
+    def test_fresh_status_with_old_intents_uses_none_and_never_notes_old_entry(self):
+        self.accepted();self.ended();before=self.events();intents=self.intent_file().read_bytes()
+        self.more_responses(dict(exit=66,stderr='handoffkeep wrk: not_found\n'))
+        result=self.run_wrk('round','status','job-a')
+        self.assertEqual(result.returncode,75,result.stderr)
+        self.assertEqual(self.events(),before)
+        self.assertEqual(self.intent_file().read_bytes(),intents)
+        self.assertIn('key=none',result.stderr)
+        self.assertIn('GET_result=not_found',result.stderr)
+
+    def test_snapshot_only_ended_status_never_invents_an_intent(self):
+        self.seed(*[{'action':'read'}]*2);self.mode('required')
+        with self.client() as client:client.job('job-a')
+        self.assertFalse(self.intent_file().exists());self.ended();before=self.events()
+        self.more_responses(dict(exit=66,stderr='handoffkeep wrk: not_found\n'))
+        result=self.run_wrk('round','status','job-a')
+        self.assertEqual(result.returncode,75,result.stderr)
+        self.assertEqual(self.events(),before);self.assertFalse(self.intent_file().exists())
+        self.assertIn('key=none',result.stderr)
+        self.assertIn('00099-job.revoked.json',result.stderr)
+
+    def test_seq_regression_during_replay_notes_the_current_intent(self):
+        original=self.accepted();self.ended();before=self.events()
+        records=json.loads(self.script.read_text())['journal'][:1]
+        job,page=self.prefix_response(records)
+        self.more_responses({'action':'accept'},self.success(job),self.success(page))
+        self.assert_observation(self.retry(),before,original,'seq_regressed')
+
+    def test_generation_regression_during_replay_notes_actual_result(self):
+        original=self.accepted();self.ended();before=self.events()
+        records=copy.deepcopy(json.loads(self.script.read_text())['journal'])
+        with self.client():
+            previous='0'*64
+            for record in records:
+                record['store_generation']='00000000-0000-4000-8000-ffff00000002'
+                record['previous_hash']=previous
+                record['record_hash']=self.module.digest({k:v for k,v in record.items() if k!='record_hash'})
+                previous=record['record_hash']
+        job,page=self.prefix_response(records)
+        self.more_responses({'action':'accept'},self.success(job),self.success(page))
+        self.assert_observation(self.retry(),before,original,'generation_regressed')
+
+    def test_note_is_fsynced_before_integrity_refusal(self):
+        self.accepted();self.ended()
+        self.more_responses(dict(exit=66,stderr='handoffkeep wrk: not_found\n'))
+        with self.client() as client:
+            data=json.loads(self.intent_file().read_text());client._current_intents['job-a']=data['intents'][0]['local_id']
+            calls=[];save=self.module.os.fsync
+            def fsync(fd):calls.append(fd);return save(fd)
+            with mock.patch.object(self.module.os,'fsync',side_effect=fsync):
+                with self.assertRaises(self.module.EndedHistoryFault):client.job('job-a')
+            self.assertGreaterEqual(len(calls),4)
+            self.assertIn('history_regressed',json.loads(self.intent_file().read_text())['intents'][0])
+
+    def test_accepted_replay_never_replaces_its_retained_receipt(self):
+        original=self.accepted();self.ended();before=self.events()
+        record=copy.deepcopy(json.loads(self.script.read_text())['journal'][-1])
+        record['received_at']='2026-10-26T00:00:00.000002Z'
+        with self.client():
+            record['record_hash']=self.module.digest({k:v for k,v in record.items() if k!='record_hash'})
+        records=copy.deepcopy(json.loads(self.script.read_text())['journal']);records[-1]=record
+        response=dict(contract='hk1873.v1',created=False,record=record,summary=self.prefix_response(records)[0]['summary'])
+        self.more_responses(self.success(response))
+        self.assert_observation(self.retry(),before,original,'seq_regressed')
+
+    def test_bad_note_shape_refuses_without_sending(self):
+        original=self.accepted()
+        for note in ({'observed_at':'2026-10-26T00:00:00Z','get_result':'other'},
+                     {'observed_at':'2026-10-26T00:00:00Z','get_result':[]},
+                     {'observed_at':'not a date','get_result':'not_found'},
+                     {'observed_at':'2026-10-26T00:00:00Z','get_result':'not_found','extra':True}):
+            with self.subTest(note=note):
+                data=json.loads(self.intent_file().read_text());data['intents'][0]['history_regressed']=note;self.intent_file().write_text(json.dumps(data));before=len(self.calls())
+                result=self.retry()
+                self.assertEqual(result.returncode,74,result.stderr)
+                self.assertEqual(len(self.calls()),before)
+
+
+
+class FixtureHistoryTests(Harness):
+    def test_two_heads_are_owned_fixtures_without_source_history(self):
+        original=subprocess.check_output
+        def check(*args,**kwargs):
+            if Path(kwargs.get('cwd',Path.cwd())).resolve()==ROOT.resolve():
+                raise subprocess.CalledProcessError(128,args[0])
+            return original(*args,**kwargs)
+        with mock.patch.object(subprocess,'check_output',side_effect=check):
+            try:
+                first=P1ReconciliationTests.head(self,'HEAD^')
+                second=P1ReconciliationTests.head(self,'HEAD')
+            except subprocess.CalledProcessError:
+                self.fail('two-head fixture depends on source-checkout history')
+        self.assertNotEqual(first,second)
+        self.assertTrue(P1ReconciliationTests.repo(self).is_relative_to(self.root))
+
+
+class RegularIOTests(Harness):
+    def test_validated_regular_descriptor_uses_blocking_io(self):
+        file=self.root/'regular';file.write_text('{}\n');file.chmod(0o600)
+        directory=os.open(self.root,os.O_RDONLY|os.O_DIRECTORY)
+        try:
+            with self.client():
+                fd=self.module.secure_open('regular',os.O_RDONLY,directory)
+                try:self.assertTrue(os.get_blocking(fd),'validated regular IO remained nonblocking')
+                finally:os.close(fd)
+        finally:os.close(directory)
 
 
 if __name__ == "__main__":

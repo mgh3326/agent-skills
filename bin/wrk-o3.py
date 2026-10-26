@@ -54,6 +54,7 @@ EXIT_CODES = {
 # These are completely validated CLI representations of definite HTTP 4xx.
 # All protocol/transport/503 outcomes remain pending, regardless of process exit.
 DEFINITE = frozenset(k for k, v in EXIT_CODES.items() if v in (65, 66, 73, 77, 78))
+HISTORY_RESULTS = frozenset(("not_found", "generation_regressed", "seq_regressed"))
 
 
 class Refusal(Exception):
@@ -61,6 +62,23 @@ class Refusal(Exception):
         self.code = code
         self.exit = EXIT_CODES[code]
         super().__init__(code)
+
+
+class HistoryFault(Refusal):
+    def __init__(self, result):
+        super().__init__("history_regressed")
+        self.result = result
+
+
+class EndedHistoryFault(HistoryFault):
+    def __init__(self, job, key, end, result):
+        super().__init__(result)
+        self.job, self.key, self.end = job, key, end
+
+    def line(self):
+        fields = (self.job, self.key or "none", self.end, self.result)
+        return "wrk o3: history_regressed job=%s key=%s local_end=%s GET_result=%s\n" % tuple(
+            shlex.quote(str(value)).replace("\n", "\\n").replace("\r", "\\r") for value in fields)
 
 
 class ModeRefusal(Refusal):
@@ -326,6 +344,13 @@ def secure_open(name, flags, dir_fd, create=False):
     if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600 or info.st_uid != os.getuid():
         os.close(fd)
         raise Refusal("intent_invalid")
+    # Nonblocking open protects the type check from a planted FIFO. Once
+    # this descriptor is proven regular, its reads and locking use blocking IO.
+    try:
+        os.set_blocking(fd, True)
+    except OSError:
+        os.close(fd)
+        raise
     return fd
 
 
@@ -356,20 +381,26 @@ class IntentStore:
         root = Path(self.client.resolver.resolve(self.client.central)["inbox"])
         directory = root / self.job
         dir_fd = lock_fd = None
+        self.io_stage = "mkdir"
         try:
             root.mkdir(parents=True, exist_ok=True)
             directory.mkdir(mode=0o700, exist_ok=True)
+            self.io_stage = "open_directory"
             dir_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
             # Persist a new reviewer intent directory before the first send.
             parent_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
             try:
+                self.io_stage = "fsync_parent"
                 os.fsync(parent_fd)
             finally:
                 os.close(parent_fd)
+            self.io_stage = "open_lock"
             lock_fd = secure_open("o3-intents.lock", os.O_RDWR | os.O_CREAT, dir_fd)
+            self.io_stage = "flock"
             fcntl.flock(lock_fd, fcntl.LOCK_EX)
             self.dir_fd = dir_fd
             try:
+                self.io_stage = "read_intents"
                 fd = secure_open("o3-intents.json", os.O_RDONLY, dir_fd)
             except FileNotFoundError:
                 data = {"version": 1, "intents": []}
@@ -377,11 +408,14 @@ class IntentStore:
                 with os.fdopen(fd, "rb") as stream:
                     data = strict_json(stream.read(), "intent_invalid")
             self.validate(data)
+            self.io_stage = "transaction"
             yield data
         except Refusal:
             raise
-        except OSError:
-            raise Refusal("intent_io") from None
+        except OSError as exc:
+            failure = Refusal("intent_io")
+            failure.io_stage, failure.os_errno = self.io_stage, exc.errno
+            raise failure from None
         finally:
             if lock_fd is not None:
                 os.close(lock_fd)
@@ -397,12 +431,24 @@ class IntentStore:
         for item in data["intents"]:
             fields = {"local_id", "job_id", "idempotency_key", "request", "request_sha256",
                       "state", "receipt", "error"}
-            if not isinstance(item, dict) or set(item) != fields:
+            if not isinstance(item, dict) or set(item) not in (fields, fields | {"history_regressed"}):
                 raise Refusal("intent_invalid")
             if (not valid_uuid(item["local_id"]) or not valid_uuid(item["idempotency_key"])
                     or item["local_id"] in ids or item["idempotency_key"] in keys
                     or item["job_id"] != self.job):
                 raise Refusal("intent_invalid")
+            if "history_regressed" in item:
+                note = item["history_regressed"]
+                if (not isinstance(note, dict) or set(note) != {"observed_at", "get_result"}
+                        or not isinstance(note["get_result"], str)
+                        or note["get_result"] not in HISTORY_RESULTS
+                        or not isinstance(note["observed_at"], str)
+                        or not re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|\+00:00)", note["observed_at"])):
+                    raise Refusal("intent_invalid")
+                try:
+                    datetime.fromisoformat(note["observed_at"].replace("Z", "+00:00"))
+                except ValueError:
+                    raise Refusal("intent_invalid") from None
             ids.add(item["local_id"]); keys.add(item["idempotency_key"])
             self.client.schema.check("Request", item["request"], "intent_invalid")
             if request_digest(self.job, item["request"]) != item["request_sha256"]:
@@ -422,6 +468,7 @@ class IntentStore:
 
     def save(self, data):
         self.validate(data)
+        self.io_stage = "write_intents"
         atomic_json(self.dir_fd, "o3-intents.json", data)
 
 
@@ -442,6 +489,7 @@ def receipt_for(record):
 class Client:
     def __init__(self, central=None):
         self._event_contexts = {}
+        self._current_intents = {}
         self.central = central
         self.resolver, self.schema = Resolver(), Schema()
 
@@ -477,10 +525,12 @@ class Client:
 
     def check_record(self, record, job, generation=None):
         self.schema.check("Record", record)
+        if generation is not None and record["store_generation"] != generation:
+            raise HistoryFault("generation_regressed")
         unhashed = {key: value for key, value in record.items() if key != "record_hash"}
         if (record["job_id"] != job or record["record_hash"] != digest(unhashed)
                 or generation is not None and record["store_generation"] != generation):
-            raise Refusal("history_regressed")
+            raise HistoryFault("seq_regressed")
         if record["kind"] == "import_seal":
             seal = record["payload"]
             if seal["numbering_floor"] < seal["baseline_used"]:
@@ -504,19 +554,39 @@ class Client:
                     or any(item["state"] == "accepted" and receipt_required([item["request"]])
                            for item in intents["intents"]))
 
-    def history_warning(self, job):
-        self.warning(job, "history_regressed", "history")
+    def history_warning(self, job, result="seq_regressed"):
+        with self.events_locked(job) as local:
+            end = local.ns["wrk_end_declaration"](local.events)
+            if not end:
+                self.warning(job, "history_regressed", "history")
+                return
+            key = None
+            current = self._current_intents.get(job)
+            if current is not None:
+                store = IntentStore(self, job)
+                with store.locked() as data:
+                    item = next((x for x in data["intents"] if x["local_id"] == current), None)
+                    if item is not None:
+                        key = item["idempotency_key"]
+                        if "history_regressed" not in item:
+                            item["history_regressed"] = dict(
+                                observed_at=datetime.now(timezone.utc).isoformat(timespec="microseconds").replace("+00:00", "Z"),
+                                get_result=result)
+                            store.save(data)  # durable observation, never an event or a state rollback
+            raise EndedHistoryFault(job, key, end, result)
 
     def job(self, job):
         snapshot, receipts = self.enrollment_witnesses(job)
         try:
             return self.read_job(job)
         except Refusal as exc:
+            if isinstance(exc, EndedHistoryFault):
+                raise
             if exc.code == "not_found" and (snapshot is not None or receipts):
-                self.history_warning(job)
-                raise Refusal("history_regressed") from None
+                self.history_warning(job, "not_found")
+                raise HistoryFault("not_found") from None
             if exc.code == "history_regressed":
-                self.history_warning(job)
+                self.history_warning(job, getattr(exc, "result", "seq_regressed"))
             raise
 
     def read_job(self, job):
@@ -529,9 +599,11 @@ class Client:
         # Fetch complete fixed-snapshot history before a summary drives a
         # decision. Retained receipts/snapshots can only veto that fresh read.
         history = self.records(job)
+        if history["summary"]["store_generation"] != value["summary"]["store_generation"]:
+            raise HistoryFault("generation_regressed")
         if (history["summary"]["snapshot_seq"] < value["summary"]["snapshot_seq"]
                 or history["summary"]["store_generation"] != value["summary"]["store_generation"]):
-            raise Refusal("history_regressed")
+            raise HistoryFault("seq_regressed")
         canonical_claim = next((r for r in history["records"]
                                 if r["seq"] == history["summary"]["claim_seq"]), None)
         if canonical_claim is None or canonical_claim["kind"] != "claim":
@@ -544,11 +616,13 @@ class Client:
         try:
             return self.read_records(job, limit)
         except Refusal as exc:
+            if isinstance(exc, EndedHistoryFault):
+                raise
             if exc.code == "not_found" and (receipts or snapshot is not None):
-                self.history_warning(job)
-                raise Refusal("history_regressed") from None
+                self.history_warning(job, "not_found")
+                raise HistoryFault("not_found") from None
             if exc.code == "history_regressed":
-                self.history_warning(job)
+                self.history_warning(job, getattr(exc, "result", "seq_regressed"))
             raise
 
     def read_records(self, job, limit=None):
@@ -568,14 +642,14 @@ class Client:
             for record in page["records"]:
                 self.check_record(record, job, generation)
                 if record["seq"] != after + 1 or record["previous_hash"] != previous or record["seq"] > snapshot:
-                    raise Refusal("history_regressed")
+                    raise HistoryFault("seq_regressed")
                 records.append(record)
                 after, previous = record["seq"], record["record_hash"]
             if page["next_after_seq"] != after or page["has_more"] != (after < snapshot):
                 raise Refusal("protocol_invalid")
             if not page["has_more"]:
                 if previous != summary["tail_hash"]:
-                    raise Refusal("history_regressed")
+                    raise HistoryFault("seq_regressed")
                 break
             cursor_after = after
         self.cache_history(job, records, frozen_summary)
@@ -588,18 +662,22 @@ class Client:
         with store.locked() as intents:
             cached = self.snapshot_locked(store)
             if cached is not None:
+                if cached["store_generation"] != generation:
+                    raise HistoryFault("generation_regressed")
                 seq = cached["snapshot_seq"]
                 if (cached["store_generation"] != generation or seq > snapshot
                         or records[seq - 1]["record_hash"] != cached["tail_hash"]
                         or cached["receipt_required"] and not receipt_required(records)):
-                    raise Refusal("history_regressed")
+                    raise HistoryFault("seq_regressed")
             for item in intents["intents"]:
                 receipt = item["receipt"]
                 if receipt is not None:
+                    if receipt["store_generation"] != generation:
+                        raise HistoryFault("generation_regressed")
                     seq = receipt["seq"]
                     if (receipt["store_generation"] != generation or seq > snapshot
                             or records[seq - 1]["record_hash"] != receipt["record_hash"]):
-                        raise Refusal("history_regressed")
+                        raise HistoryFault("seq_regressed")
             claims = [r for r in records if r["kind"] == "claim"]
             if not claims or claims[-1]["seq"] != summary["claim_seq"]:
                 raise Refusal("protocol_invalid")
@@ -633,31 +711,35 @@ class Client:
                 self.check_record(record, job, summary["store_generation"])
                 if (record["seq"] != end + 1 or record["seq"] > snapshot
                         or previous is not None and record["previous_hash"] != previous):
-                    raise Refusal("history_regressed")
+                    raise HistoryFault("seq_regressed")
                 end, previous = record["seq"], record["record_hash"]
             if (page["next_after_seq"] != end or page["has_more"] != (end < snapshot)
                     or page["has_more"] and not page["records"]):
                 raise Refusal("protocol_invalid")
             if page["records"] and not page["has_more"] and previous != summary["tail_hash"]:
-                raise Refusal("history_regressed")
+                raise HistoryFault("seq_regressed")
             witnesses = list(receipts)
             if cached is not None:
                 witnesses.append(dict(store_generation=cached["store_generation"], seq=cached["snapshot_seq"],
                                       record_hash=cached["tail_hash"]))
             hashes = {record["seq"]: record["record_hash"] for record in page["records"]}
             for witness in witnesses:
+                if witness["store_generation"] != summary["store_generation"]:
+                    raise HistoryFault("generation_regressed")
                 if (witness["store_generation"] != summary["store_generation"] or witness["seq"] > snapshot
                         or witness["seq"] in hashes and hashes[witness["seq"]] != witness["record_hash"]):
-                    raise Refusal("history_regressed")
+                    raise HistoryFault("seq_regressed")
             if after == 0 and not page["has_more"]:
                 self.cache_history(job, page["records"], summary)
             return page
         except Refusal as exc:
+            if isinstance(exc, EndedHistoryFault):
+                raise
             if exc.code == "not_found" and (cached is not None or receipts):
-                self.history_warning(job)
-                raise Refusal("history_regressed") from None
+                self.history_warning(job, "not_found")
+                raise HistoryFault("not_found") from None
             if exc.code == "history_regressed":
-                self.history_warning(job)
+                self.history_warning(job, getattr(exc, "result", "seq_regressed"))
             raise
 
     def save_snapshot(self, job, snapshot):
@@ -715,10 +797,18 @@ class Client:
             payload = record["payload"]
             expected = payload.get("content_sha256", payload.get("report_sha256", payload.get("source_sha256")))
             if expected != value["content_sha256"]:
-                raise Refusal("history_regressed")
+                raise HistoryFault("seq_regressed")
         return value
 
     def append(self, job, request=None, resume=None, replay_accepted=False):
+        try:
+            return self._append(job, request, resume, replay_accepted)
+        except HistoryFault as exc:
+            if not isinstance(exc, EndedHistoryFault):
+                self.history_warning(job, exc.result)
+            raise
+
+    def _append(self, job, request=None, resume=None, replay_accepted=False):
         """One durable send. No implicit network retry, CAS refresh or key rewrite."""
         job_name(job)
         store = IntentStore(self, job)
@@ -738,6 +828,7 @@ class Client:
                                 idempotency_key=str(uuid.uuid4()), request=request,
                                 request_sha256=sha, state="pending", receipt=None, error=None)
                     data["intents"].append(item)
+            self._current_intents[job] = item["local_id"]
             if item["state"] == "rejected":
                 raise Refusal(item["error"])
             if item["state"] == "accepted" and not replay_accepted:
@@ -766,7 +857,9 @@ class Client:
                     raise Refusal("protocol_invalid")
                 if any(x["receipt"] is not None and x["receipt"]["store_generation"] != record["store_generation"]
                        for x in data["intents"]):
-                    raise Refusal("history_regressed")
+                    raise HistoryFault("generation_regressed")
+                if item["receipt"] is not None and receipt_for(record) != item["receipt"]:
+                    raise HistoryFault("seq_regressed")
             except Refusal as exc:
                 if exc.code in DEFINITE and item["state"] != "accepted":
                     item.update(state="rejected", error=exc.code)
@@ -778,8 +871,15 @@ class Client:
 
     def repair_record(self, job, receipt):
         # Called with the intent lock held; avoid recursive records() locking.
-        page = self.call(["records", job, "--after-seq", str(receipt["seq"] - 1),
-                          "--snapshot-seq", str(receipt["seq"]), "--limit", "1"], "RecordsResponse")
+        try:
+            page = self.call(["records", job, "--after-seq", str(receipt["seq"] - 1),
+                              "--snapshot-seq", str(receipt["seq"]), "--limit", "1"], "RecordsResponse")
+        except Refusal as exc:
+            if exc.code == "not_found":
+                raise HistoryFault("not_found") from None
+            raise
+        if page["summary"]["store_generation"] != receipt["store_generation"]:
+            raise HistoryFault("generation_regressed")
         if (page["snapshot_seq"] != receipt["seq"]
                 or page["summary"]["snapshot_seq"] != receipt["seq"]
                 or page["summary"]["job_id"] != job
@@ -788,11 +888,11 @@ class Client:
                 or page["next_after_seq"] != receipt["seq"] or page["has_more"]):
             raise Refusal("protocol_invalid")
         if len(page["records"]) != 1:
-            raise Refusal("history_regressed")
+            raise HistoryFault("seq_regressed")
         record = page["records"][0]
         self.check_record(record, job, receipt["store_generation"])
         if receipt_for(record) != receipt:
-            raise Refusal("history_regressed")
+            raise HistoryFault("seq_regressed")
         return {"contract": CONTRACT, "created": False, "record": record, "summary": page["summary"]}
 
     def pending(self, job, kind, **identity):
@@ -914,6 +1014,8 @@ class Client:
 
     def event(self, job, record):
         with self.events_locked(job) as local:
+            if record["kind"] == "job.o3_warning" and local.ns["wrk_end_declaration"](local.events):
+                return
             if record.get("idempotency_key") and local.has_key(record["idempotency_key"], record["kind"]):
                 return
             records = local.records()
@@ -1340,6 +1442,7 @@ def round_cli(client, argv, mode):
                 lines.append("job=" + directory.name + " label=O2-unverified")
         return "\n".join(x for x in lines if isinstance(x, str))
     job = job_name(args.job)
+    client._current_intents.pop(job, None)
     if args.command == "status":
         try:
             current = client.job(job)
@@ -1766,6 +1869,9 @@ commands and delegated consumers. These operations do no local cleanup.
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except EndedHistoryFault as error:
+        sys.stderr.write(error.line())
+        raise SystemExit(error.exit)
     except ModeRefusal as error:
         sys.stderr.write(error.line())
         raise SystemExit(error.exit)
@@ -1776,7 +1882,9 @@ if __name__ == "__main__":
         sys.stderr.write("wrk o3: projection_pending\n")
         raise SystemExit(75)
     except Refusal as error:
-        sys.stderr.write("wrk o3: " + error.code + "\n")
+        detail = (" stage=%s errno=%s" % (error.io_stage, error.os_errno)
+                  if hasattr(error, "io_stage") else "")
+        sys.stderr.write("wrk o3: " + error.code + detail + "\n")
         raise SystemExit(error.exit)
     except Exception:
         sys.stderr.write("wrk o3: protocol_invalid\n")
