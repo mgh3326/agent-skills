@@ -108,6 +108,16 @@ HK2012_TITLES = [
     (158, "experiments planned notes"),
     (159, "admirable notes"),
 ]
+# hk 2012 tag rule: an exact leading [area] tag overrides a product default;
+# a loose area word in the title does not.
+HK2012_TAGGED = [
+    (160, "experiment", "[research] sweep of the scalping grid"),
+    (161, "experiment", "sweep of the scalping grid"),
+    (162, "experiment", "research sweep of the scalping grid"),
+]
+for i, project, title in HK2012_TAGGED:
+    tasks[str(i)] = {"id": i, "state": "backlog", "project": project,
+                     "title": title, "area": None, "refs": {}}
 for i, title in HK2012_TITLES:
     tasks[str(i)] = {"id": i, "state": "backlog", "project": None,
                      "title": title, "area": None, "refs": {}}
@@ -273,6 +283,9 @@ want = [
     (137, "trading", "project:auto_trader"),   # deploy (ops) must not beat a product default
     (138, "unity", "project:ParkingArcade"),   # read-only (research) must not beat it either
     (139, "ops", "title:\\bdeploy\\b"),        # fleet repo: generic ops rule still applies
+    (160, "research", "tag:[research]"),      # exact leading tag beats the python default
+    (161, "python", "project:experiment"),    # untagged experiment task stays python
+    (162, "python", "project:experiment"),    # a loose research word does not count
 ]
 for tid, area, rule in want:
     r = rows.get(str(tid)) or sys.exit(f"missing row for task {tid}")

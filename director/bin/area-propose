@@ -13,7 +13,8 @@ truncates — and applies the section-1 mapping rule in order:
      entry with a "projects" list applies only to those projects, where ""
      is the projectless task (hk 2012: fleet terms stay off product repos);
      a product repo (a project default outside fleet_projects) keeps its
-     default unless the title area is in project_areas for that project;
+     default unless the title area is in project_areas for that project,
+     or the title opens with an exact [area] tag naming a known area;
   4. the project default from the same file.
 
 Smoke/throwaway titles are excluded before the files stage — the packet
@@ -55,6 +56,7 @@ STATES = ("backlog", "claimed", "in_progress", "verifying", "join",
 LIST_LIMIT = 1000  # the server's accepted maximum
 TITLE_WIDTH = 60
 FILE_RULE_MIN_SHARE = 0.6
+TAG_RE = re.compile(r"\[([^\[\]]+)\]")
 COLUMNS = ("id", "project", "title", "current_area", "proposed_area",
            "source", "rule", "confirm")
 
@@ -146,6 +148,7 @@ def load_rules(path: Path, vocabulary: list[str]) -> dict:
     if named - known:
         die(f"rules file names specific areas outside the hk vocabulary: "
             f"{sorted(named - known)}")
+    rules["_areas"] = known
     try:
         rules["_exclude"] = [re.compile(p, re.IGNORECASE)
                              for p in rules["exclude_title_patterns"]]
@@ -236,6 +239,11 @@ def classify(task: dict, rules: dict, with_files: bool, gh: str,
     # title order.
     product = bool(default) and project not in rules["fleet_projects"]
     specific = {default} | set(rules["project_areas"].get(project, []))
+    # hk 2012 tag rule: an exact leading [area] tag naming a known area
+    # states the area outright and overrides a product default.
+    tag = TAG_RE.match(title)
+    if product and tag and tag.group(1) in rules["_areas"]:
+        return tag.group(1), "title", f"tag:[{tag.group(1)}]"
     for entry in rules["title_keywords"]:
         scope = entry.get("projects")
         if scope is not None and project not in scope:
