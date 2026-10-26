@@ -109,10 +109,10 @@ run_remote() {
   local binary="$1"; shift
   local model="${WRK_CASE_MODEL:-codex-luna}" label="${WRK_CASE_LABEL:-remote-child}"
   local job="${WRK_CASE_JOB:-remote-$RANDOM-$RANDOM}" config="${WRK_CASE_CONFIG:-$CONFIG}"
-  local report_args=() arg
-  for arg in "$@"; do
-    if [[ "$arg" == --parent-job ]]; then
-      report_args=(--report "$ARBITER_INBOX_ROOT/P/verdict.md"); break
+  local report_args=() args=("$@") i
+  for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == --parent-job ]]; then
+      report_args=(--report "$ARBITER_INBOX_ROOT/${args[$((i + 1))]}/verdict.md"); break
     fi
   done
   env HOME="$HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_DATA_HOME="$XDG_DATA_HOME" \
