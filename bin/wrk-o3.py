@@ -334,8 +334,17 @@ def records_mode(resolver):
 
 def secure_open(name, flags, dir_fd, create=False):
     try:
-        fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK,
-                     0o600, dir_fd=dir_fd)
+        try:
+            fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         0o600, dir_fd=dir_fd)
+        except FileNotFoundError:
+            if not flags & os.O_CREAT or flags & os.O_EXCL:
+                raise
+            # Match wrk's position_guard_open: a peer creating the same
+            # lock can race with O_CREAT on macOS. Reopen the existing inode
+            # once, without creation or symlink following; validate it below.
+            fd = os.open(name, (flags & ~os.O_CREAT) | os.O_NOFOLLOW | os.O_NONBLOCK,
+                         dir_fd=dir_fd)
     except OSError as exc:
         if exc.errno in (errno.ELOOP, errno.ENOTDIR):
             raise Refusal("intent_invalid") from None

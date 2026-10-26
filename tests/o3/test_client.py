@@ -2313,5 +2313,95 @@ class RegularIOTests(Harness):
         finally:os.close(directory)
 
 
+class LockCreateRaceTests(Harness):
+    def race(self, peer, observed):
+        original = self.module.os.open
+        observed["flags"] = []
+
+        def opening(name, flags, mode=0o777, *, dir_fd=None):
+            if name == "o3-intents.lock":
+                observed["flags"].append(flags)
+                if flags & os.O_CREAT and not observed.get("raised"):
+                    observed["raised"] = True
+                    if peer in ("regular", "wrong-mode"):
+                        fd = original(name, os.O_RDWR | os.O_CREAT, 0o600, dir_fd=dir_fd)
+                        try:
+                            os.fchmod(fd, 0o644 if peer == "wrong-mode" else 0o600)
+                            observed["peer_inode"] = os.fstat(fd).st_ino
+                        finally:
+                            os.close(fd)
+                    elif peer == "symlink":
+                        os.symlink(self.root / "lock-target", name, dir_fd=dir_fd)
+                    elif peer == "fifo":
+                        os.mkfifo(name, 0o600, dir_fd=dir_fd)
+                    raise FileNotFoundError(self.module.errno.ENOENT, "fixture peer creation race", name)
+            return original(name, flags, mode, dir_fd=dir_fd)
+
+        return opening
+
+    def test_peer_creation_enoent_reopens_and_locks_the_existing_inode(self):
+        self.seed({"action": "accept"})
+        observed = {}
+        locked = []
+        with self.client() as client:
+            original_flock = self.module.fcntl.flock
+
+            def flock(fd, operation):
+                locked.append(os.fstat(fd).st_ino)
+                return original_flock(fd, operation)
+
+            with mock.patch.object(self.module.os, "open", side_effect=self.race("regular", observed)), \
+                    mock.patch.object(self.module.fcntl, "flock", side_effect=flock):
+                try:
+                    client.append("job-a", self.round_request())
+                    outcome = "accepted"
+                except self.module.Refusal as error:
+                    outcome = error.code
+        self.assertEqual(outcome, "accepted", "a peer-created valid lock must be usable")
+        self.assertTrue(observed["flags"][0] & os.O_CREAT)
+        self.assertFalse(observed["flags"][1] & os.O_CREAT)
+        self.assertTrue(all(flags & os.O_NOFOLLOW and flags & os.O_NONBLOCK for flags in observed["flags"]))
+        self.assertEqual(set(locked), {observed["peer_inode"]})
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(json.loads(self.intent_file().read_text())["intents"][0]["state"], "accepted")
+
+    def test_raced_symlink_mode_and_fifo_refuse_before_any_send(self):
+        target = self.root / "lock-target"
+        target.write_bytes(b"unchanged fixture target")
+        target.chmod(0o600)
+        for peer in ("symlink", "wrong-mode", "fifo"):
+            with self.subTest(peer=peer):
+                self.seed({"action": "accept"})
+                observed = {}
+                with self.client() as client:
+                    with mock.patch.object(self.module.os, "open", side_effect=self.race(peer, observed)):
+                        try:
+                            client.append("bad-" + peer, self.round_request())
+                            outcome = "accepted"
+                        except self.module.Refusal as error:
+                            outcome = error.code
+                self.assertEqual(outcome, "intent_invalid")
+                self.assertEqual(self.calls(), [])
+                self.assertFalse(observed["flags"][1] & os.O_CREAT)
+                self.assertTrue(observed["flags"][1] & os.O_NOFOLLOW)
+                self.assertEqual(target.read_bytes(), b"unchanged fixture target")
+
+    def test_enoent_without_an_existing_peer_never_recreates_or_sends(self):
+        self.seed({"action": "accept"})
+        observed = {}
+        with self.client() as client:
+            with mock.patch.object(self.module.os, "open", side_effect=self.race("absent", observed)):
+                try:
+                    client.append("job-a", self.round_request())
+                    outcome = "accepted"
+                except self.module.Refusal as error:
+                    outcome = error.code
+        self.assertEqual(outcome, "intent_io")
+        self.assertEqual(len(observed["flags"]), 2)
+        self.assertFalse(observed["flags"][1] & os.O_CREAT)
+        self.assertFalse(self.intent_file().exists())
+        self.assertEqual(self.calls(), [])
+
+
 if __name__ == "__main__":
     unittest.main()
