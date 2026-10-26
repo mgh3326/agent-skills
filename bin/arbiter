@@ -787,6 +787,22 @@ def _quota_pool_row(con: sqlite3.Connection, job_id: str, pool: str):
     ).fetchone()
 
 
+def _orphan_state(con: sqlite3.Connection, job_id: str):
+    job = con.execute(
+        "SELECT state FROM jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    leases = con.execute(
+        "SELECT resource, kind FROM leases WHERE job_id = ? ORDER BY resource, kind",
+        (job_id,),
+    ).fetchall()
+    quotas = con.execute(
+        "SELECT pool FROM quota_pool_records WHERE job_id = ? ORDER BY pool",
+        (job_id,),
+    ).fetchall()
+    eligible = bool(job and job[0] == "leased" and not leases and not quotas)  # hk1991-orphan-release
+    return job, leases, quotas, eligible
+
+
 def _archive(con: sqlite3.Connection, row, state: str, moment: dt.datetime) -> bool:
     cur = con.execute(
         "INSERT OR IGNORE INTO lease_history"
@@ -1061,6 +1077,14 @@ def cmd_lease(args: argparse.Namespace) -> dict:
 
 
 def cmd_release(args: argparse.Namespace) -> dict:
+    if args.resource is None:
+        if not args.force or args.kind is not None or args.token is not None:
+            raise ArbiterError(
+                EXIT_USAGE,
+                "--resource may be omitted only for --force --job orphan release",
+            )
+        return _release_orphan_job(args)
+
     con = connect_rw()
     moment = now_dt()
     con.execute("BEGIN IMMEDIATE")
@@ -1306,6 +1330,95 @@ def _matched_agent_statuses(
     return statuses, matched
 
 
+def _release_orphan_job(args: argparse.Namespace) -> dict:
+    # The agent list is a hermetic fixture seam, matching gc. Read it before
+    # BEGIN IMMEDIATE; all database ownership checks and the transition then
+    # serialize with gc and reclaim under the same write lock.
+    herdr_agents = _herdr_agents(args.herdr_agent_list)
+    con = connect_rw()
+    moment = now_dt()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        job, lease_rows, quota_rows, eligible = _orphan_state(con, args.job)
+        if job is None:
+            raise ArbiterError(EXIT_NOT_FOUND, f"job not found: {args.job}", job_id=args.job)
+        prior_state = job[0]
+        agent_label = _claim_agent_label(con, args.job)
+        if agent_label is None:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                "orphan release identity reconciliation refused; job.claim has no exact "
+                f"agent_label mapping (unmapped={args.job})",
+            )
+        statuses, matched = _matched_agent_statuses(
+            herdr_agents, job_id=args.job, agent_label=agent_label
+        )
+        blockers = []
+        if prior_state != "leased":
+            blockers.append(f"job state={prior_state} (expected leased)")
+        if HERDR_LIVE_STATUS in statuses:
+            blockers.append(
+                f"agent={agent_label} herdr_status={','.join(sorted(statuses))} (live)"
+            )
+        if "unknown" in statuses:
+            blockers.append(f"agent={agent_label} herdr_status=unknown")
+        blockers.extend(f"lease={resource}/{kind}" for resource, kind in lease_rows)
+        blockers.extend(f"quota_pool={pool}" for (pool,) in quota_rows)
+        if blockers:
+            code = EXIT_STORAGE if "unknown" in statuses else EXIT_FENCING
+            raise ArbiterError(
+                code,
+                f"orphan release refused: job={args.job} leaves " + ", ".join(blockers),
+                job_id=args.job,
+                agent_label=agent_label,
+                herdr_status=sorted(statuses),
+            )
+        if not eligible:
+            raise ArbiterError(
+                EXIT_FENCING,
+                f"orphan release refused: job={args.job} is not an eligible leased orphan",
+                job_id=args.job,
+            )
+        reason = (
+            "job absent from herdr agent list"
+            if not matched
+            else f"herdr agent status={','.join(sorted(statuses))}"
+        )
+        con.execute(
+            "UPDATE jobs SET state = 'released', updated_at = ?"
+            " WHERE job_id = ? AND state = 'leased'",
+            (iso(moment), args.job),
+        )
+        seq = record_event(
+            con,
+            args.job,
+            "job.orphan_release",
+            {
+                "job_id": args.job,
+                "prior_state": prior_state,
+                "agent_label": agent_label,
+                "herdr_status": sorted(statuses),
+                "reason": reason,
+                "forced": True,
+            },
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    return {
+        "ok": True,
+        "job_id": args.job,
+        "prior_state": prior_state,
+        "agent_label": agent_label,
+        "herdr_status": sorted(statuses),
+        "reason": reason,
+        "released_at": iso(moment),
+        "forced": True,
+        "event_seq": seq,
+    }
+
+
 def cmd_gc(args: argparse.Namespace) -> dict:
     # GC always reconciles quota_pool_records against a current Herdr list.
     # ``--herdr-agent-list PATH`` is the hermetic fixture seam; omitting PATH
@@ -1386,6 +1499,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
             )
 
         stale_quota_pool = []
+        orphan_candidates = {}
         for row, agent_label, statuses, matched in stale_decisions:
             reason = (
                 "job absent from herdr agent list"
@@ -1420,6 +1534,42 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                     "herdr_status": statuses,
                 }
             )
+            orphan_candidates[row[0]] = (agent_label, statuses, reason)
+
+        orphan_released = []
+        for job_id, (agent_label, statuses, reason) in sorted(orphan_candidates.items()):
+            job, lease_rows, quota_rows, eligible = _orphan_state(con, job_id)
+            if not eligible:
+                continue
+            prior_state = job[0]
+            con.execute(
+                "UPDATE jobs SET state = 'released', updated_at = ?"
+                " WHERE job_id = ? AND state = 'leased'",
+                (iso(moment), job_id),
+            )
+            seq = record_event(
+                con,
+                job_id,
+                "job.orphan_release",
+                {
+                    "job_id": job_id,
+                    "prior_state": prior_state,
+                    "agent_label": agent_label,
+                    "herdr_status": statuses,
+                    "reason": reason,
+                    "forced": False,
+                },
+            )
+            orphan_released.append(
+                {
+                    "job_id": job_id,
+                    "prior_state": prior_state,
+                    "agent_label": agent_label,
+                    "herdr_status": statuses,
+                    "reason": reason,
+                    "event_seq": seq,
+                }
+            )
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
@@ -1431,6 +1581,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
         "transitioned": transitions,
         "retained": len(rows),
         "stale_quota_pool": stale_quota_pool,
+        "orphan_released": orphan_released,
         "unresolved_quota_pool": unresolved_quota_pool,
         "unsafe_quota_pool": unsafe_quota_pool,
         "live_agents": sum(
@@ -1769,9 +1920,13 @@ def build_parser() -> argparse.ArgumentParser:
         "release", parents=[common], help="lease/실행 기록 반납. --force 는 운영자 강제 반납"
     )
     release.add_argument("--job", required=True, help="job id")
-    release.add_argument("--resource", required=True, help="자원 이름")
+    release.add_argument("--resource", help="자원 이름; 생략은 --force orphan release 전용")
     release.add_argument("--token", help="획득 시 발급된 fencing token (배타 lease 일반 반납용)")
     release.add_argument("--kind", choices=KINDS, help="같은 resource 에 kind 가 여럿일 때만 필요")
+    release.add_argument(
+        "--herdr-agent-list",
+        help="orphan release identity fixture (omit to read the installed Herdr list)",
+    )
     release.add_argument(
         "--force",
         action="store_true",

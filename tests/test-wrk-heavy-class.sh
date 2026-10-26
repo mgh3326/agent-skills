@@ -151,14 +151,74 @@ for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 kind=defer \
     fail "spawn-worker/SKILL.md heavy section must mention: $token"
 done
 python3 - "$WRK" <<'PY'
-import re, sys
+import ast, re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 start = src.index("heavy_cmd() {")
 half = src[start:src.index('\ncase "${1:-}" in', start)]
-sig = re.findall(r"os\.(?:kill|killpg)\([^)]*\)|\.(?:kill|terminate|send_signal)\(|"
-                 r"import[^\n]*\bsignal\b|from signal\b", half)
-# alive() probes with signal 0; nothing in the heavy path may signal a holder
-assert sig == ["os.kill(pid, 0)"], ("a signal path exists in wrk heavy", sig)
+def signal_violations(source):
+    match = re.search(r'python3 - "\$@" <<\'PY\'\n(.*?)\nPY', source, re.S)
+    assert match, "heavy_cmd Python body not found"
+    try:
+        tree = ast.parse(match.group(1))
+    except SyntaxError as exc:
+        return ["heavy_cmd Python body does not parse: %s" % exc]
+    errors = []
+    kill_probes = 0
+    allowed_signal_attrs = {"signal", "SIGHUP", "SIGTERM", "SIG_DFL", "SIG_IGN"}
+    allowed_signal_numbers = {"SIGHUP", "SIGTERM"}
+    allowed_signal_handlers = {"wait_signal", "SIG_DFL", "SIG_IGN"}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                if alias.name == "signal" and alias.asname not in (None, "signal"):
+                    errors.append("signal module aliases are not allowed")
+        elif isinstance(node, ast.ImportFrom) and node.module == "signal":
+            errors.append("from-signal imports are not allowed")
+        if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name) and node.value.id == "signal":
+            if node.attr not in allowed_signal_attrs:
+                errors.append("signal.%s is outside the allowlist" % node.attr)
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        func = node.func
+        receiver_is_os = isinstance(func.value, ast.Name) and func.value.id == "os"
+        receiver_is_signal = isinstance(func.value, ast.Name) and func.value.id == "signal"
+        if receiver_is_os and func.attr == "kill":
+            kill_probes += 1
+            if (len(node.args) != 2 or node.keywords or
+                    not isinstance(node.args[1], ast.Constant) or node.args[1].value != 0):
+                errors.append("every os.kill call must use literal signal 0")
+        elif receiver_is_os and func.attr == "killpg":
+            errors.append("os.killpg is forbidden in heavy_cmd")
+        elif func.attr in {"kill", "terminate", "send_signal"} and not (receiver_is_os and func.attr == "kill"):
+            errors.append(".%s is forbidden in heavy_cmd" % func.attr)
+        if receiver_is_signal:
+            valid_signal = (len(node.args) == 2 and not node.keywords and
+                            isinstance(node.args[0], ast.Attribute) and
+                            isinstance(node.args[0].value, ast.Name) and
+                            node.args[0].value.id == "signal" and
+                            node.args[0].attr in allowed_signal_numbers)
+            handler = node.args[1] if len(node.args) == 2 else None
+            valid_handler = (
+                isinstance(handler, ast.Name) and handler.id in allowed_signal_handlers
+            ) or (
+                isinstance(handler, ast.Attribute) and
+                isinstance(handler.value, ast.Name) and handler.value.id == "signal" and
+                handler.attr in {"SIG_DFL", "SIG_IGN"}
+            )
+            if func.attr != "signal" or not valid_signal or not valid_handler:
+                errors.append("signal calls must register/restore SIGHUP or SIGTERM handlers")
+    if kill_probes < 1:
+        errors.append("heavy_cmd must retain at least one os.kill(pid, 0) probe")
+    return errors
+
+# Allowlist owner-liveness probes and wait-only HUP/TERM cleanup; never permit
+# the heavy path to signal a slot holder or use any other signal API.
+assert not signal_violations(half), signal_violations(half)
+for injected in ("    os.kill(pid, signal.SIGTERM)\n", "    os.killpg(pid, signal.SIGTERM)\n"):
+    anchor = "def alive(pid):\n"
+    assert half.count(anchor) == 1, "heavy signal mutant anchor must be unique"
+    mutant = half.replace(anchor, anchor + injected, 1)
+    assert signal_violations(mutant), ("heavy signal allowlist accepted mutant", injected)
 # the waiter record is published by rename, never by open-then-write in place
 assert "os.replace(record_tmp, me_name" in half, \
     "waiter record is not renamed into place"
