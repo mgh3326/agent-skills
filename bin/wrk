@@ -5315,12 +5315,12 @@ o3_mode_walk() {
   local base="$1" component parent
   for component in "$base" "$base/.config" "$base/.config/wrk"; do
     if [[ -L "$component" ]]; then
-      echo "wrk: o3 records_mode_invalid: $component is a symlink; refusing (records-mode discovery)" >&2
+      echo "wrk: o3 cli_usage: $component is a symlink; refusing (records-mode discovery)" >&2
       exit 2
     fi
     if [[ -e "$component" ]]; then
       if [[ ! -d "$component" || ! -x "$component" ]]; then
-        echo "wrk: o3 records_mode_invalid: $component is not a searchable directory; refusing (records-mode discovery)" >&2
+        echo "wrk: o3 cli_usage: $component is not a searchable directory; refusing (records-mode discovery)" >&2
         exit 2
       fi
       continue
@@ -5328,7 +5328,7 @@ o3_mode_walk() {
     parent="${component%/*}"
     [[ -n "$parent" ]] || parent=/
     if [[ ! -d "$parent" || ! -x "$parent" ]]; then
-      echo "wrk: o3 records_mode_invalid: $parent is not a searchable directory; refusing (records-mode discovery)" >&2
+      echo "wrk: o3 cli_usage: $parent is not a searchable directory; refusing (records-mode discovery)" >&2
       exit 2
     fi
     return 1

@@ -472,13 +472,41 @@ def account_home():
     return candidate
 
 
+def mode_walk(home):
+    """The same walk as bin/wrk's o3_mode_walk (director-1 discovery rulings):
+    home, home/.config and home/.config/wrk must each be a real (not
+    symlinked), searchable directory where they exist; a violation is
+    cli_usage (exit 2) naming the component. True when a component is truly
+    absent under a searchable parent (no mode file)."""
+    for component in (home, os.path.join(home, ".config"), os.path.join(home, ".config", "wrk")):
+        try:
+            info = os.lstat(component)
+        except FileNotFoundError:
+            parent = os.path.dirname(component) or "/"
+            if not (os.path.isdir(parent) and os.access(parent, os.X_OK)):
+                raise Fail("cli_usage", "%s is not a searchable directory; refusing (records-mode discovery)" % parent)
+            return True
+        except OSError:
+            raise Fail("cli_usage", "%s is not a searchable directory; refusing (records-mode discovery)" % component)
+        if stat.S_ISLNK(info.st_mode):
+            raise Fail("cli_usage", "%s is a symlink; refusing (records-mode discovery)" % component)
+        if not stat.S_ISDIR(info.st_mode) or not os.access(component, os.X_OK):
+            raise Fail("cli_usage", "%s is not a searchable directory; refusing (records-mode discovery)" % component)
+    return False
+
+
 def records_mode():
     """Q2 (esc-1 ruling): one word in <account home>/.config/wrk/records-mode.
     Missing means legacy; unreadable or unknown fails closed. In test mode with
-    HOME unset the mode is legacy and no path is read (director-1 parity note)."""
+    HOME unset the mode is legacy and no path is read (director-1 parity note).
+    The ancestor walk runs first; the file is then opened with no symlink
+    following, so it cannot race the walk."""
     if test_mode() and not os.environ.get("HOME"):
         return "legacy"
-    path = os.path.join(account_home(), ".config", "wrk", "records-mode")
+    home = account_home()
+    if mode_walk(home):
+        return "legacy"
+    path = os.path.join(home, ".config", "wrk", "records-mode")
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except FileNotFoundError:

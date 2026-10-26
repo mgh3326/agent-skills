@@ -1308,6 +1308,55 @@ class ShadowCase(O3Case):
         self.assertEqual(out.stdout.strip(), "LEGACY")
         self.assertFalse(log.exists(), "no Python for a proven absence")
 
+    def test_discovery_shell_and_python_walks_agree(self):
+        """director-1: one rule in both places. Each fixture gives the same
+        decision, exit and line through bin/wrk's walk and wrk_o3.py's."""
+        text = (BIN / "wrk").read_text()
+        functions = ""
+        for name in ("o3_mode_file_present", "o3_mode_walk"):
+            start = text.index(name + "() {")
+            functions += text[start:text.index("\n}\n", start) + 3]
+
+        def unsearchable(w):
+            (w.home / ".config").chmod(0)
+            self.addCleanup((w.home / ".config").chmod, 0o755)
+
+        def not_a_directory(w):
+            shutil.rmtree(w.home / ".config")
+            (w.home / ".config").write_text("x\n")
+
+        def ancestor_symlink(w):
+            shutil.rmtree(w.home / ".config" / "wrk")
+            (w.base / "elsewhere").mkdir()
+            (w.home / ".config" / "wrk").symlink_to(w.base / "elsewhere")
+
+        def absent(w):
+            shutil.rmtree(w.home / ".config" / "wrk")
+
+        def present(w):
+            w.mode("shadow")
+
+        fixtures = {"chmod 000 parent": (unsearchable, "refuse"), "non-directory .config": (not_a_directory, "refuse"),
+                    "ancestor symlink": (ancestor_symlink, "refuse"), "true absence": (absent, "legacy"),
+                    "present file": (present, "parse")}
+        for label, (prepare, want) in fixtures.items():
+            with self.subTest(label):
+                w = self.world()
+                prepare(w)
+                shell = subprocess.run(["bash", "-c", functions + "\no3_mode_file_present\necho rc=$?"],
+                                       env=w.env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                python = w.adapter("mode")
+                if want == "refuse":
+                    self.assertEqual((shell.returncode, python.returncode), (2, 2), (shell.stderr, python.stderr))
+                    self.assertEqual(shell.stderr.strip(), python.stderr.strip())
+                    self.assertIn("wrk: o3 cli_usage: ", python.stderr)
+                elif want == "legacy":
+                    self.assertEqual(shell.stdout.strip(), "rc=1")
+                    self.assertEqual((python.returncode, python.stdout.strip()), (0, "legacy"))
+                else:
+                    self.assertEqual(shell.stdout.strip(), "rc=0", "the shell takes the parse path")
+                    self.assertEqual((python.returncode, python.stdout.strip()), (0, "shadow"))
+
     def test_discovery_dangling_symlink_takes_the_parse_path_and_refuses(self):
         for production in (False, True):
             with self.subTest(production=production):
