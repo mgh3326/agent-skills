@@ -10149,10 +10149,11 @@ echo "PASS ROB-1326 AC2 released duplicate reclaimed then spawned: $released_dup
 # hk 1991: the power-off shape must also recover through wrk's actual
 # duplicate/reclaim boundary, without the --job-dup-ok override. The existing
 # suite sentinel registry owns this spawn and stops it before TMP removal.
-(
-  export XDG_DATA_HOME="$TMP/orphan-1991-data"
-  export ARBITER_INBOX_ROOT="$TMP/orphan-1991-inbox"
-  export TEST_ARBITER_BIN="$ARBITER"
+orphan_respawn_1991() {
+  local XDG_DATA_HOME="$TMP/orphan-1991-data"
+  local ARBITER_INBOX_ROOT="$TMP/orphan-1991-inbox"
+  local TEST_ARBITER_BIN="$ARBITER" orphan_spawn
+  export XDG_DATA_HOME ARBITER_INBOX_ROOT TEST_ARBITER_BIN
   "$ARBITER" claim --job orphan-1991 --agent-label gone-1991 --lane fixture --t T2 >/dev/null
   "$SCOPEFUEL" gate -m codex-luna-max >"$TMP/orphan-1991-gate"
   "$ARBITER" lease --job orphan-1991 --kind quota_pool --profile codex-luna-max \
@@ -10168,7 +10169,8 @@ assert d["state"] == "leased", d
 assert d["recent_event_kinds"].count("job.orphan_release") == 1, d
 assert d["recent_event_kinds"].count("job.reclaim") == 1, d
 '
-)
+}
+orphan_respawn_1991
 echo "PASS hk1991 orphan-gc-wrk-respawn-without-override"
 
 # AC3: once a live arbiter reported duplicate, an unreadable state is itself a
