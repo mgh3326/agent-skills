@@ -10386,9 +10386,10 @@ spawn_router_cmd() {
 # one bare integer from 30000 through 300000 and is used as a floor for each
 # kind's existing shell readiness window. An absent key leaves each default
 # unchanged; a malformed or out-of-range assignment refuses before spawn.
-# hk 2080: only the execution host calls this, before admission. Parse TOML
-# strictly: quoted strings, integers, duplicates and malformed files are never
-# an opt-in. No caller-side host name or pi configuration grants permission.
+# hk 2080: only the execution host calls this, before admission. Use the
+# shared strict hosts scanner, with no newer host Python requirement. Quoted
+# strings, integers, duplicates and malformed assignments are never opt-ins.
+# No caller-side host name or pi configuration grants permission.
 pi_host_precheck() {
   local profile="${1:-${MODEL:-}}" config host
   case "$profile" in pi-haiku55|pi-sonnet55|pi-opus55) ;; *) return 0 ;; esac
@@ -10396,17 +10397,7 @@ pi_host_precheck() {
   host="$(spillover_value hub machine_id 2>/dev/null || true)"
   [[ -n "$host" ]] || host="$(hostname)"
   host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
-  if ! python3 - "$config" 2>/dev/null <<'PY'
-import sys
-try:
-    import tomllib
-    with open(sys.argv[1], 'rb') as stream:
-        value = tomllib.load(stream).get('local', {}).get('pi_anthropic')
-    sys.exit(0 if value is True else 1)
-except (ImportError, OSError, ValueError, AttributeError):
-    sys.exit(1)
-PY
-  then
+  if ! local_spawn_scan || [[ "$LOCAL_PI_ANTHROPIC" -ne 1 ]]; then
     die "$profile refused on host $host: hosts.toml [local] pi_anthropic must be literal true"
   fi
 }
@@ -10430,13 +10421,14 @@ local_spawn_table_name() {
 
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
+  LOCAL_PI_ANTHROPIC=0
   LOCAL_HEAVY_LOAD_WAIT=1
   LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SHELL_READY_TIMEOUT_MS=0
   LOCAL_SHELL_READY_TIMEOUT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -10505,6 +10497,33 @@ local_spawn_scan() {
       return "$WRK_EXIT_CONFIG_REFUSED"
     fi
     [[ "$current" == local ]] || continue
+    # hk 2080: default-off API seat capability, using the same literal-only
+    # grammar as spawn/heavy_load_wait. Keep this in bash: execution hosts
+    # may have Python 3.9 without tomllib (director-1, 2026-10-26).
+    case "$line" in
+      pi_anthropic[A-Za-z0-9_-]*) ;; # a different bare key
+      pi_anthropic* | '"pi_anthropic"'* | "'pi_anthropic'"*)
+        if [[ "$line" =~ ^pi_anthropic[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed pi_anthropic assignment in [local] (expected 'pi_anthropic = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        pi_seen=$((pi_seen + 1))
+        if [[ "$pi_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate pi_anthropic key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) LOCAL_PI_ANTHROPIC=1 ;;
+          false) ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] pi_anthropic accepts only the bare TOML booleans true or false"
+             return "$WRK_EXIT_CONFIG_REFUSED" ;;
+        esac
+        continue ;;
+    esac
     # #1492: a bare integer, with the same one-key, one-clean-assignment
     # grammar as the other strict [local] settings. Check the decimal length
     # before arithmetic so an arbitrarily large integer cannot wrap in bash.

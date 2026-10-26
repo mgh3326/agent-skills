@@ -121,6 +121,41 @@ class PiSpawnTests(unittest.TestCase):
             with self.subTest(effort=effort):
                 self.assert_refused_before_admission(self.spawn(effort=effort), effort)
 
+    def test_gate_without_tomllib(self):
+        # Python 3.9 compatibility: reject importing tomllib at the actual
+        # interpreter boundary, delegating everything else to this suite's
+        # >=3.11 interpreter. No real host config or agent is involved.
+        shim = self.tmp / "bin/python3"
+        shim.unlink()
+        self.executable(shim, '#!/bin/bash\n' +
+            f'exec "{sys.executable}" "{self.tmp / "without-tomllib.py"}" "$@"\n')
+        (self.tmp / "without-tomllib.py").write_text('''import builtins, runpy, sys
+original = builtins.__import__
+def no_tomllib(name, *args, **kwargs):
+    if name == "tomllib":
+        raise ModuleNotFoundError("No module named tomllib (Python 3.9 fixture)")
+    return original(name, *args, **kwargs)
+builtins.__import__ = no_tomllib
+args = sys.argv[1:]
+if args[0] == "-c":
+    sys.argv = ["-c"] + args[2:]
+    exec(compile(args[1], "<string>", "exec"), {"__name__": "__main__"})
+elif args[0] == "-":
+    sys.argv = args
+    exec(compile(sys.stdin.read(), "<stdin>", "exec"), {"__name__": "__main__"})
+else:
+    sys.argv = args
+    runpy.run_path(args[0], run_name="__main__")
+''')
+        probe = subprocess.run([str(shim), "-c", "import tomllib"], env=self.env,
+                               text=True, capture_output=True)
+        self.assertNotEqual(probe.returncode, 0)
+        admitted = self.spawn()
+        self.assertEqual(admitted.returncode, 0, admitted.stdout + admitted.stderr)
+        (self.tmp / "herdr.log").unlink()
+        (self.tmp / "claims.log").unlink(missing_ok=True)
+        self.test_host_literal_true_only()
+
     def test_builder_refused(self):
         for profile in PROFILES:
             with self.subTest(profile=profile):
@@ -241,6 +276,9 @@ class PiMutantTests(unittest.TestCase):
             "mcp": ('pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING")',
                     'pi) ARGS=(--model "$PROFILE_MODEL:$PI_THINKING")',
                     "test_argv_gate_mapping_and_no_mcp"),
+            "truthy": ('true) LOCAL_PI_ANTHROPIC=1 ;;',
+                       'true|false|1|\\\"true\\\") LOCAL_PI_ANTHROPIC=1 ;;',
+                       "test_host_literal_true_only"),
         }
         for name, (old, new, method) in mutants.items():
             with self.subTest(mutant=name):
