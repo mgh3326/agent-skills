@@ -66,6 +66,35 @@ tasks = {
     "113": {"id": 113, "state": "merged", "project": "ParkingArcade",
             "title": "level flow tune", "area": None,
             "refs": {"pr": "https://github.com/mgh3326/ParkingArcade/pull/56"}},
+    # hk 2012: shell-wrk title terms must beat docs/ops titles (hk 296, hk 1934
+    # shapes); near-misses keep their docs/ops or no-area result.
+    "120": {"id": 120, "state": "backlog", "project": None,
+            "title": "SKILL.md wording for tester worktree handoff", "area": None,
+            "refs": {}},
+    "121": {"id": 121, "state": "backlog", "project": None,
+            "title": "SKILL.md wording clarification", "area": None, "refs": {}},
+    "122": {"id": 122, "state": "backlog", "project": None,
+            "title": "trust_tripwire tests and install check", "area": None,
+            "refs": {}},
+    "123": {"id": 123, "state": "backlog", "project": None,
+            "title": "plain install script refresh", "area": None, "refs": {}},
+    "124": {"id": 124, "state": "backlog", "project": None,
+            "title": "wrk round cap extension note", "area": None, "refs": {}},
+    "125": {"id": 125, "state": "backlog", "project": None,
+            "title": "funding round summary", "area": None, "refs": {}},
+    # hk 2012 Korean keywords: one positive and one near-miss each.
+    "126": {"id": 126, "state": "backlog", "project": None,
+            "title": "콘솔 패널 정렬", "area": None, "refs": {}},
+    "127": {"id": 127, "state": "backlog", "project": None,
+            "title": "콘서트 일정 정리", "area": None, "refs": {}},
+    "128": {"id": 128, "state": "backlog", "project": None,
+            "title": "[hk /ui 홈 전환] 순서 재정렬", "area": None, "refs": {}},
+    "129": {"id": 129, "state": "backlog", "project": None,
+            "title": "홈 화면 디자인 검토", "area": None, "refs": {}},
+    "130": {"id": 130, "state": "backlog", "project": None,
+            "title": "함대 pane 전수 조사 보고", "area": None, "refs": {}},
+    "131": {"id": 131, "state": "backlog", "project": None,
+            "title": "조사 보고서 정리", "area": None, "refs": {}},
 }
 db = {"areas": ["blender", "unity", "web-qa", "ui-design", "image",
                 "web-frontend", "go-backend", "python", "trading",
@@ -126,6 +155,36 @@ assert all(len(line.split("\t")) == 8
            for line in open(sys.argv[1]).read().splitlines()[1:]), "bad column count"
 assert rows["106"]["source"] == "-", rows["106"]
 PY
+
+echo "== title rules: shell-wrk terms beat docs/ops, Korean keywords =="
+
+python3 - "$TMP/propose.tsv" <<'PY'
+import csv, sys
+rows = {r["id"]: r for r in csv.DictReader(open(sys.argv[1], newline=""), delimiter="\t")}
+want = [
+    # id, proposed_area, rule-prefix; "" means no proposal
+    ("120", "shell-wrk", "title:"),  # hk 296 shape: SKILL.md + tester worktree
+    ("121", "docs", "title:"),       # docs-only SKILL.md title keeps docs
+    ("122", "shell-wrk", "title:"),  # hk 1934 shape: tripwire + install
+    ("123", "ops", "title:"),        # plain install title keeps ops
+    ("124", "shell-wrk", "title:"),  # 'wrk round cap' phrase
+    ("125", "", "-"),                # bare 'round' must not match
+    ("126", "web-frontend", "title:"),  # 콘솔 positive
+    ("127", "", "-"),                # 콘서트 near-miss
+    ("128", "web-frontend", "title:"),  # 홈 전환 positive
+    ("129", "", "-"),                # 홈 화면 near-miss
+    ("130", "research", "title:"),   # 전수 조사 positive
+    ("131", "", "-"),                # 조사 alone near-miss
+]
+for tid, area, rule in want:
+    r = rows.get(tid) or sys.exit(f"missing row for task {tid}")
+    assert r["proposed_area"] == area, (tid, r["title"], r["proposed_area"], area)
+    if area:
+        assert r["rule"].startswith(rule), (tid, r["rule"], rule)
+    else:
+        assert r["source"] == "-", (tid, r["source"])
+PY
+echo "PASS shell-wrk order and Korean keyword cases"
 
 # Mutant invariant: propose never calls set-area (read-only).
 ! grep -q 'call tasks set-area' "$HK_LOG" 2>/dev/null \
