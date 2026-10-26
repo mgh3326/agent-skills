@@ -511,6 +511,25 @@
         "T2"
       ]
     },
+    "builder-luna-high": {
+      "default_effort": "high",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "high": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6-luna",
+      "model": "gpt-6-luna",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-luna-low": {
       "default_effort": "low",
       "family": "openai",
@@ -703,7 +722,8 @@
       ],
       "surfaces": [
         "T1",
-        "T2"
+        "T2",
+        "T3"
       ]
     },
     "builder-sol-medium": {
@@ -713,6 +733,25 @@
       "grade_status": "conflict",
       "grades": {
         "medium": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",
+      "model": "gpt-6.1-sol",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-sol-xhigh": {
+      "default_effort": "xhigh",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "xhigh": null
       },
       "launcher": "codex",
       "launcher_model_token": "PROFILE_MODEL=gpt-6.1-sol",

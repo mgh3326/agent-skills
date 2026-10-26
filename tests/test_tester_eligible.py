@@ -1090,7 +1090,8 @@ class EligibilityFixtures(unittest.TestCase):
 
     def test_e6_builder_grades_conflict_and_grok_model_must_match_wrk(self) -> None:
         variants = ("builder-opus-low", "builder-opus-medium", "builder-sonnet-xhigh", "builder-sonnet-max",
-                    "builder-sol-high", "builder-sol-max", "builder-sol-medium", "builder-luna-max",
+                    "builder-sol-high", "builder-sol-max", "builder-sol-medium", "builder-sol-xhigh",
+                    "builder-luna-max", "builder-luna-high",
                     "builder-kimi-high", "builder-kimi-max",
                     "builder-grok-low", "builder-grok-medium", "builder-grok-xhigh")
         for alias in variants:
@@ -1107,6 +1108,25 @@ class EligibilityFixtures(unittest.TestCase):
         changed["profiles"]["codex-sol"]["family"] = "xai"
         _, check = common.resolve_profile("codex-sol", changed, actual_effort="max", role="tester")
         self.assertEqual((check["status"], check["reason_code"]), ("UNVERIFIED", "PROFILE_FAMILY_CONFLICT"))
+
+    def test_builder_sol_max_permits_the_s_plus_t3_surface(self) -> None:
+        # hk 2043 item 3: builder-sol-max is the S+ gate=default normal pinned
+        # spelling, so its policy row must cover T3 as well as T1/T2. The
+        # surface permission tester-eligible applies is the policy row's; a T3
+        # task built by builder-sol-max must not be denied on surface grounds.
+        # (The row's grade_status=conflict is a separate, pre-existing state.)
+        resolved, _ = common.resolve_profile(
+            "builder-sol-max", self.policy, actual_effort="max", role="builder")
+        self.assertEqual(resolved["surfaces"], ["T1", "T2", "T3"])
+        evidence = self.evidence(self.make_head("live/guard.py"), declared_t="T3",
+            required_grade="S+", implementation_grade="S+",
+            contributors=[{"profile": "builder-sol-max", "model": "gpt-6.1-sol",
+                           "effort": "max", "role": "builder", "kind": "initial",
+                           "session": "builder-session", "worktree": "/tmp/builder"}],
+            tester={"planned_profile": "grok", "planned_effort": "xhigh"})
+        checks = self.check(evidence)
+        self.assert_case(checks, "tier", "PASS", "T_MEETS_FLOOR")
+        self.assert_case(checks, "surface_permission", "PASS", "PROFILE_SURFACE_ALLOWED")
 
     def test_every_terra_profile_is_denied_to_testers(self) -> None:
         barred = ("codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",

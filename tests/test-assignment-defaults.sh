@@ -584,8 +584,8 @@ mutants["wrk-help-max-closed-back"] = mutate(
 )
 mutants["wrk-help-max-closed-list-back"] = mutate(
     "wrk",
-    "builder-kimi-max, builder-haiku-max) are open builder\n                     seats since hk 1863 (the 2026-09-26 no-max refusal is\n                     removed)",
-    "builder-kimi-max, builder-haiku-max) are closed builder\n                     seats (the 2026-09-26 no-max refusal is\n                     removed)",
+    "builder-kimi-max,\n                     builder-haiku-max) are open builder\n                     seats since hk 1863 (the 2026-09-26 no-max refusal is\n                     removed)",
+    "builder-kimi-max,\n                     builder-haiku-max) are closed builder\n                     seats (the 2026-09-26 no-max refusal is\n                     removed)",
 )
 mutants["telemetry-citation-dropped"] = mutate(
     "builder", "`pinion05.github.io/aa-model-telemetry`, 수집 2026-09-23", ""
@@ -739,8 +739,8 @@ mutants["wrk-seat-rule-env-unbounded-nocfg"] = mutate(
 )
 mutants["wrk-e6-clone-env-standin"] = mutate(
     "wrk",
-    '      [[ -r "$KIMI_TRUST_HOME/config.toml" ]] ||\n'
-    '        die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (config.toml missing); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"\n',
+    '        [[ -r "$KIMI_TRUST_HOME/config.toml" ]] ||\n'
+    '          die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (config.toml missing); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"\n',
     "",
 )
 mutants["wrk-seat-rule-env-raw-nocfg"] = mutate(
@@ -885,19 +885,26 @@ grep -q 'policy launch codex-sol effort=high' "$TMP/launch.log" ||
   fail "builder-sol must consult codex-sol at effort high: $(cat "$TMP/launch.log")"
 echo "PASS builder-sol launches codex-sol@high and consults the catalog at high"
 
-# hk 1864: an explicit --effort max on a builder seat is admitted — the 09-26
-# no-max refusal is repealed. builder-sol carries no rung pin, so it launches
-# at the max rung and consults the catalog at max.
-: >"$TMP/launch.log"
+# hk 2043 item 4: builder-sol consults codex-sol@high, so an explicit --effort
+# other than high is refused with one line naming the matching pinned spelling.
+# This closes the silent override the hk 1864 seat-rule admission left open.
 set +e
 out="$(spawn_t736 builder-sol --role builder --lane builder-lane --parent parent-lane \
   --effort max --job t736-builder-sol-max 2>&1)"
 rc=$?
 set -e
-[[ "$rc" -eq 0 ]] || fail "builder-sol --effort max must be admitted (rc=$rc): $out"
-grep -q 'model_reasoning_effort=max' "$TMP/herdr.log" ||
-  fail "builder-sol --effort max must launch at effort max: $(cat "$TMP/herdr.log")"
-echo "PASS builder-sol --effort max is admitted on a builder seat (hk 1864)"
+[[ "$rc" -eq 2 ]] || fail "builder-sol --effort max must be refused (rc=$rc): $out"
+grep -qF 'use builder-sol-max for --effort max' <<<"$out" ||
+  fail "builder-sol --effort max refusal must name builder-sol-max: $out"
+set +e
+out="$(spawn_t736 builder-sol --role builder --lane builder-lane --parent parent-lane \
+  --effort xhigh --job t736-builder-sol-xhigh 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 2 ]] || fail "builder-sol --effort xhigh must be refused (rc=$rc): $out"
+grep -qF 'use builder-sol-xhigh for --effort xhigh' <<<"$out" ||
+  fail "builder-sol --effort xhigh refusal must name builder-sol-xhigh: $out"
+echo "PASS builder-sol refuses an off-consult --effort and names the pinned spelling (hk 2043)"
 
 # codex `ultra` is the max tier plus subagents — the seat rule still refuses
 # it (hk 1864 opened max only).
@@ -911,23 +918,64 @@ grep -q 'builder seats never take an ultra rung' <<<"$out" ||
   fail "builder-sol --effort ultra refusal must name the seat rule: $out"
 echo "PASS builder-sol --effort ultra still dies on the builder-seat rule"
 
-# The E6 max-rung spelling is open: with its exact marker armed it spawns, and
-# without the marker it dies on the marker rule (not on a seat rule).
-out="$(SCOPEFUEL_E6_ARM=codex-sol@max \
-  spawn_t736 builder-sol-max --role builder --lane builder-lane --parent parent-lane \
-  --job t736-e6-max 2>&1)" || fail "armed builder-sol-max must be admitted: $out"
-grep -q 'model_reasoning_effort=max' "$TMP/herdr.log" ||
-  fail "builder-sol-max must launch at effort max: $(cat "$TMP/herdr.log")"
-set +e
+# hk 2043 (operator r1026solmax): builder-sol-max is a NORMAL pinned spelling.
+# It spawns with SCOPEFUEL_E6_ARM unset, gates at codex-sol@max (the S+
+# gate=default row), launches max and consults the catalog at max. builder-sol-xhigh
+# is the other normal pinned spelling; codex-sol@xhigh is an escalation rung at
+# S+, so the gate still decides admission and the spawn carries a REF.
+: >"$TMP/herdr.log" "$TMP/launch.log" "$TMP/scopefuel.log"
 out="$(SCOPEFUEL_E6_ARM='' \
   spawn_t736 builder-sol-max --role builder --lane builder-lane --parent parent-lane \
-  --job t736-e6-max-nomarker 2>&1)"
+  --job t736-e6-max 2>&1)" || fail "unmarked builder-sol-max must be admitted: $out"
+grep -q 'model_reasoning_effort=max' "$TMP/herdr.log" ||
+  fail "builder-sol-max must launch at effort max: $(cat "$TMP/herdr.log")"
+grep -q 'policy launch codex-sol effort=max' "$TMP/launch.log" ||
+  fail "builder-sol-max must consult codex-sol at max: $(cat "$TMP/launch.log")"
+grep -qF 'gate -m codex-sol --effort max' "$TMP/scopefuel.log" ||
+  fail "builder-sol-max must ask the gate about codex-sol@max: $(cat "$TMP/scopefuel.log")"
+echo "PASS builder-sol-max spawns unmarked at the S+ gate=default row and records codex-sol@max"
+
+: >"$TMP/herdr.log" "$TMP/launch.log" "$TMP/scopefuel.log"
+set +e
+out="$(SCOPEFUEL_E6_ARM='' \
+  spawn_t736 builder-sol-xhigh --role builder --lane builder-lane --parent parent-lane \
+  --job t736-sol-xhigh-bare 2>&1)"
 rc=$?
 set -e
-[[ "$rc" -eq 2 ]] || fail "unarmed builder-sol-max must die rc 2 (rc=$rc): $out"
-grep -q 'SCOPEFUEL_E6_ARM=codex-sol@max' <<<"$out" ||
-  fail "unarmed builder-sol-max refusal must name the marker: $out"
-echo "PASS builder-sol-max is admitted with SCOPEFUEL_E6_ARM=codex-sol@max and marker-gated"
+[[ "$rc" -eq 3 ]] ||
+  fail "builder-sol-xhigh without --operator-request must hit the gate escalation refusal (rc=$rc): $out"
+out="$(SCOPEFUEL_E6_ARM='' \
+  spawn_t736 builder-sol-xhigh --role builder --lane builder-lane --parent parent-lane \
+  --operator-request hk:task/2043 --job t736-sol-xhigh 2>&1)" ||
+  fail "builder-sol-xhigh with an operator REF must be admitted: $out"
+grep -q 'model_reasoning_effort=xhigh' "$TMP/herdr.log" ||
+  fail "builder-sol-xhigh must launch at effort xhigh: $(cat "$TMP/herdr.log")"
+grep -q 'policy launch codex-sol effort=xhigh' "$TMP/launch.log" ||
+  fail "builder-sol-xhigh must consult codex-sol at xhigh: $(cat "$TMP/launch.log")"
+grep -qF 'gate -m codex-sol --effort xhigh' "$TMP/scopefuel.log" ||
+  fail "builder-sol-xhigh must ask the gate about codex-sol@xhigh: $(cat "$TMP/scopefuel.log")"
+echo "PASS builder-sol-xhigh spawns unmarked, records codex-sol@xhigh, and stays gate-decided at S+"
+
+# hk 2043: builder-luna-high is an E6 measurement spelling like the low/medium
+# pair — without SCOPEFUEL_E6_ARM=codex-luna@high it is refused.
+set +e
+out="$(SCOPEFUEL_E6_ARM='' \
+  spawn_t736 builder-luna-high --role builder --lane builder-lane --parent parent-lane \
+  --job t736-luna-high-bare 2>&1)"
+rc=$?
+set -e
+[[ "$rc" -eq 2 ]] || fail "unmarked builder-luna-high must die rc 2 (rc=$rc): $out"
+grep -q 'SCOPEFUEL_E6_ARM=codex-luna@high' <<<"$out" ||
+  fail "unmarked builder-luna-high refusal must name the marker: $out"
+: >"$TMP/herdr.log" "$TMP/launch.log"
+out="$(SCOPEFUEL_E6_ARM=codex-luna@high \
+  spawn_t736 builder-luna-high --role builder --lane builder-lane --parent parent-lane \
+  --job t736-luna-high 2>&1)" || fail "armed builder-luna-high must be admitted: $out"
+grep -q 'model_reasoning_effort=high' "$TMP/herdr.log" ||
+  fail "builder-luna-high must launch at effort high: $(cat "$TMP/herdr.log")"
+grep -q 'policy launch codex-luna effort=high' "$TMP/launch.log" ||
+  fail "builder-luna-high must consult codex-luna at high: $(cat "$TMP/launch.log")"
+echo "PASS builder-luna-high is marker-gated and records codex-luna@high"
 
 # Worker-side names keep working: a bare codex-sol worker spawn still resolves
 # (the seat rule is builder-scoped), running the Sol model argv.
