@@ -462,7 +462,7 @@ echo "PASS d4 taskless parent job refuses to guess"
 # D5: a contradicting env pair refuses rather than guessing.
 reset_case d5
 mkdir -p "$INBOX/parent-job-5/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9012}}' \
+printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9012,"owner_lane":"b-parent"}}' \
   >"$INBOX/parent-job-5/events/00001-job.claim.json"
 hk_add --id 9012 >/dev/null; hk_add --id 9099 >/dev/null
 spawn_try -e HK_TASK_ID=9099 -- --parent-job parent-job-5 --report "$INBOX/parent-job-5/verdict.md" --job d5-worker
@@ -475,7 +475,7 @@ echo "PASS d5 contradicting task sources refuse"
 # task_id (tester attack surface).
 reset_case d6
 mkdir -p "$INBOX/parent-job-6/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9013}}' \
+printf '%s\n' '{"kind":"job.claim","payload":{"task_id":9013,"owner_lane":"b-parent"}}' \
   >"$INBOX/parent-job-6/events/00001-job.claim.json"
 printf '%s\n' 'not-json{{{' \
   >"$INBOX/parent-job-6/events/00002-job.reclaim.json"
@@ -505,7 +505,7 @@ echo "PASS d7 valid newest event wins over corrupt older"
 # task_id "oops" bypassed as unreachable and spawned rc 0).
 reset_case d8
 mkdir -p "$INBOX/parent-job-8/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":"oops"}}' \
+printf '%s\n' '{"kind":"job.claim","payload":{"task_id":"oops","owner_lane":"b-parent"}}' \
   >"$INBOX/parent-job-8/events/00001-job.claim.json"
 spawn_try -- --parent-job parent-job-8 --report "$INBOX/parent-job-8/verdict.md" --task-hk-bypass --job d8-worker
 expect_rc 2 "malformed inherited task id must refuse despite bypass"
