@@ -3091,8 +3091,12 @@ class MutantCase(O3Case):
 
     def test_m1_later_cursor_page_through_path_goes_red(self):
         bindir = self.mutant_bin([("wrk_o3.py", '''    decision = guard(need_hk=True)
+    if callable(binary):
+        binary = binary()
     if binary is None:
         binary = decision.hk''', '''    decision = guard(need_hk=True)
+    if callable(binary):
+        binary = binary()
     if binary is None:
         binary = decision.hk
         if "--snapshot-seq" in args:
@@ -3103,6 +3107,8 @@ class MutantCase(O3Case):
 
     def test_m1b_hk_bin_helper_for_reads_goes_red(self):
         bindir = self.mutant_bin([("wrk_o3.py", '''    decision = guard(need_hk=True)
+    if callable(binary):
+        binary = binary()
     if binary is None:
         binary = decision.hk''', '''    decision = guard(need_hk=True)
     if binary is None:
@@ -3155,16 +3161,18 @@ class MutantCase(O3Case):
             repair(ctx, job, store, state, meta)
 
             def build(fresh):
+                head = current()[2]
                 check_round_numbers(ctx, job, fresh, "round verdict")''', '''        with Intents(ctx.inbox, job) as store:
             state = decision.state
             mode = o3_mode_name(state)
             repair(ctx, job, store, state, meta)
-            _n, _t = verdict_round(state, head)
+            _n, _t = verdict_round(state, current()[2])
             _fake = {"kind": "verdict", "job_id": job, "seq": 0, "record_hash": "0" * 64, "store_generation": "",
                      "idempotency_key": "early", "payload": dict(payload_for(_n or 1, _t), size_bytes=1)}
             write_projections(ctx.inbox, job, [_fake], mode, meta, "early")
 
             def build(fresh):
+                head = current()[2]
                 check_round_numbers(ctx, job, fresh, "round verdict")''')])
         w, out = MatrixCase.scenario_refused_verdict_writes_no_event(self, bindir)
         self.assertNotEqual(w.events("job-a", "job.verdict"), [], "the mutant wrote job.verdict before the receipt")
