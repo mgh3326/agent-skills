@@ -15804,6 +15804,194 @@ else
   echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
 fi
 
+# ---------------------------------------------------------------- hk 2092 fleet usage
+# r1026m1bdisk item 4: `wrk usage` measures this host's fleet output under
+# ~/work (du at one level, nothing read into or moved) and `wrk usage
+# --alert` emits at most one lane.event to director-1 per host per 24h once
+# the total exceeds [local] fleet_usage_alert_gb (default 100).
+t2092_blob() { dd if=/dev/zero of="$1" bs=1024 count="$2" 2>/dev/null; }
+
+t2092_fixture() {  # ROOT — build $ROOT/work with jobs, worktrees, webqa, rest
+  local home="$1" work jobs j size=10
+  work="$home/work" jobs="$work/herdr-inbox/jobs"
+  mkdir -p "$work/webqa-runner/run" "$work/misc" "$work/repo.main/.git" \
+    "$work/repo.alpha" "$work/repo.beta"
+  for j in a b c d e f g; do
+    mkdir -p "$jobs/job-$j"
+    size=$((size + 10))
+    t2092_blob "$jobs/job-$j/blob" "$size"
+  done
+  # job sizes 20..80 step 10 — the du ordering is g f e d c for the top 5.
+  mkdir -p "$work/herdr-inbox/logs"
+  t2092_blob "$work/herdr-inbox/logs/x" 7
+  # A linked worktree carries a .git FILE (gitdir pointer); a main checkout
+  # carries a .git dir, so repo.main must not count.
+  printf 'gitdir: /fixture/gitdir\n' >"$work/repo.alpha/.git"
+  t2092_blob "$work/repo.alpha/blob" 111
+  printf 'gitdir: /fixture/gitdir\n' >"$work/repo.beta/.git"
+  t2092_blob "$work/repo.beta/blob" 55
+  t2092_blob "$work/repo.main/blob" 222
+  t2092_blob "$work/webqa-runner/run/blob" 33
+  t2092_blob "$work/misc/blob" 44
+  t2092_blob "$work/top-file" 9
+}
+
+t2092_run() {  # HOME [wrk usage args...] — fills T2092_OUT/ERR/RC
+  local home="$1"; shift
+  T2092_OUT="$TMP/t2092.out" T2092_ERR="$TMP/t2092.err" T2092_RC=0
+  set +e
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
+    ARBITER_BIN="$TMP/absent-arbiter" HOME="$home" \
+    ARBITER_INBOX_ROOT="$home/work/herdr-inbox/jobs" \
+    WRK_HOSTS_CONFIG="${T2092_CONFIG:-$TMP/no-such-hosts.toml}" \
+    WRK_PANEWIRE_LOG="${T2092_PANEWIRE_LOG:-$TMP/t2092-panewire.log}" \
+    "${WRK_UNDER_TEST:-$WRK}" usage "$@" >"$T2092_OUT" 2>"$T2092_ERR"
+  T2092_RC=$?
+  set -e
+}
+
+t2092_du() { du -sk "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
+
+t2092_exp_top5() {  # JOBS_DIR — expected jobs_top5= value, du-ordered
+  local d kib name
+  for d in "$1"/*/; do
+    [[ -d "$d" ]] || continue
+    kib="$(t2092_du "$d")"
+    name="${d%/}"; name="${name##*/}"
+    printf '%s\t%s\n' "$kib" "$name"
+  done | sort -rn | head -5 | awk -F'\t' '{printf "%s%s:%s",(NR>1?",":""),$2,$1}'
+}
+
+t2092_emits() {  # count the emit calls recorded in the fixture panewire log
+  grep -cx 'emit' "$1" 2>/dev/null || true
+}
+
+t2092_host_key() {  # the sanitised host key wrk uses for state/event ids
+  printf '%s' "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}" \
+    | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c 'a-z0-9.-' '-'
+}
+
+t2092_home="$TMP/t2092-h1"; t2092_fixture "$t2092_home"
+t2092_work="$t2092_home/work"; t2092_jobs="$t2092_work/herdr-inbox/jobs"
+T2092_CONFIG= T2092_PANEWIRE_LOG="$TMP/t2092-p0.log"; : >"$T2092_PANEWIRE_LOG"
+
+# Case: the report matches the fixture tree (numbers recomputed with the
+# same du the implementation calls — no cross-OS dir-overhead constants).
+t2092_run "$t2092_home"
+[[ "$T2092_RC" -eq 0 ]] || fail "hk2092: wrk usage rc=$T2092_RC: $(cat "$T2092_ERR")"
+t2092_total="$(t2092_du "$t2092_work")"
+t2092_jobs_kib="$(t2092_du "$t2092_jobs")"
+t2092_wt=$(( $(t2092_du "$t2092_work/repo.alpha") + $(t2092_du "$t2092_work/repo.beta") ))
+t2092_webqa="$(t2092_du "$t2092_work/webqa-runner")"
+t2092_rest=$(( t2092_total - t2092_jobs_kib - t2092_wt - t2092_webqa ))
+grep -q "host=.* work_root=$t2092_work total_kib=$t2092_total " "$T2092_OUT" ||
+  fail "hk2092: work total mismatch: $(cat "$T2092_OUT")"
+grep -q "jobs_root=$t2092_jobs jobs_kib=$t2092_jobs_kib" "$T2092_OUT" ||
+  fail "hk2092: jobs total mismatch: $(cat "$T2092_OUT")"
+grep -q "jobs_top5=$(t2092_exp_top5 "$t2092_jobs")" "$T2092_OUT" ||
+  fail "hk2092: top5 mismatch: $(grep jobs_top5 "$T2092_OUT")"
+grep -q "worktrees_count=2 worktrees_kib=$t2092_wt" "$T2092_OUT" ||
+  fail "hk2092: worktree bucket mismatch (repo.main must not count): $(cat "$T2092_OUT")"
+grep -q "webqa_runner_kib=$t2092_webqa" "$T2092_OUT" ||
+  fail "hk2092: webqa-runner mismatch: $(cat "$T2092_OUT")"
+grep -q "rest_kib=$t2092_rest" "$T2092_OUT" ||
+  fail "hk2092: rest bucket mismatch: $(cat "$T2092_OUT")"
+grep -q "fleet_usage_alert_gb=100 .*over_threshold=no" "$T2092_OUT" ||
+  fail "hk2092: default threshold must be 100 and unexceeded: $(cat "$T2092_OUT")"
+# Without --alert the command only prints: no alert line, no state file,
+# and not one panewire call.
+! grep -q '^alert=' "$T2092_OUT" ||
+  fail "hk2092: plain usage must not report alert state: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 0 ]] ||
+  fail "hk2092: plain usage emitted events: $(cat "$T2092_PANEWIRE_LOG")"
+compgen -G "$t2092_jobs/.fleet-usage-alert-*" >/dev/null &&
+  fail "hk2092: plain usage must not write alert state"
+echo "PASS hk2092 usage report matches the fixture tree"
+
+# Case: over the threshold with --alert emits exactly one lane.event to
+# director-1 carrying host, totals and top5; a second run inside 24h sends
+# none; a backdated state re-arms the alert.
+T2092_CONFIG="$TMP/t2092-hosts.toml"
+printf '[local]\nfleet_usage_alert_gb = 0\n' >"$T2092_CONFIG"
+T2092_PANEWIRE_LOG="$TMP/t2092-p2.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_home" --alert
+[[ "$T2092_RC" -eq 0 ]] || fail "hk2092: usage --alert rc=$T2092_RC: $(cat "$T2092_ERR")"
+grep -q "fleet_usage_alert_gb=0 .*over_threshold=yes" "$T2092_OUT" ||
+  fail "hk2092: gb=0 config must measure over threshold: $(cat "$T2092_OUT")"
+grep -q 'alert=emitted .*lane=director-1' "$T2092_OUT" ||
+  fail "hk2092: over-threshold --alert must emit to director-1: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 1 ]] ||
+  fail "hk2092: expected exactly one emit call: $(cat "$T2092_PANEWIRE_LOG")"
+python3 - "$T2092_PANEWIRE_LOG" <<'PY'
+import sys
+calls = [c.split("\n") for c in open(sys.argv[1]).read().split("--\n") if c.strip()]
+emit = [c for c in calls if c and c[0] == "emit"]
+assert len(emit) == 1, emit
+args = emit[0]
+def opt(name):
+    return args[args.index(name) + 1] if name in args else ""
+assert opt("--kind") == "lane.event", args
+assert opt("--lane") == "director-1", args
+assert opt("--event-id"), args
+text = opt("--text")
+for token in ("host=", "total_kib=", "jobs_kib=", "worktrees_count=",
+              "webqa_runner_kib=", "rest_kib=", "threshold_gb=", "top5="):
+    assert token in text, (token, text)
+assert "job-g:" in text and "job-f:" in text, text
+PY
+[[ -f "$t2092_jobs/.fleet-usage-alert-$(t2092_host_key)" ]] ||
+  fail "hk2092: the 24h state must land under the jobs root"
+t2092_run "$t2092_home" --alert
+grep -q 'alert=dedup' "$T2092_OUT" ||
+  fail "hk2092: a second run inside 24h must report dedup: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 1 ]] ||
+  fail "hk2092: a second run inside 24h must not re-emit: $(cat "$T2092_PANEWIRE_LOG")"
+printf '%s\n' "$(( $(date +%s) - 90000 ))" >"$t2092_jobs/.fleet-usage-alert-$(t2092_host_key)"
+t2092_run "$t2092_home" --alert
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 2 ]] ||
+  fail "hk2092: an expired (>24h) state must re-emit: $(cat "$T2092_PANEWIRE_LOG")"
+echo "PASS hk2092 --alert emits one director-1 event, dedups 24h, re-arms after"
+
+# Case: under the threshold --alert sends nothing and writes no state.
+t2092_home3="$TMP/t2092-h3"; t2092_fixture "$t2092_home3"
+T2092_CONFIG= T2092_PANEWIRE_LOG="$TMP/t2092-p3.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_home3" --alert
+grep -q "over_threshold=no" "$T2092_OUT" ||
+  fail "hk2092: the tiny fixture must read under the default 100: $(cat "$T2092_OUT")"
+grep -q 'alert=under-threshold' "$T2092_OUT" ||
+  fail "hk2092: under-threshold --alert must say so: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 0 ]] ||
+  fail "hk2092: under threshold must not emit: $(cat "$T2092_PANEWIRE_LOG")"
+compgen -G "$t2092_home3/work/herdr-inbox/jobs/.fleet-usage-alert-*" >/dev/null &&
+  fail "hk2092: under threshold must not write alert state"
+echo "PASS hk2092 under threshold emits nothing and writes no state"
+
+# Case: a hosts.toml threshold overrides the default on the print path too.
+printf '[local]\nfleet_usage_alert_gb = 999\n' >"$T2092_CONFIG"
+t2092_run "$t2092_home3"
+grep -q "fleet_usage_alert_gb=999 .*over_threshold=no" "$T2092_OUT" ||
+  fail "hk2092: a configured 999 must override the default 100: $(cat "$T2092_OUT")"
+unset T2092_CONFIG
+echo "PASS hk2092 hosts.toml threshold overrides the default"
+
+# Mutant — drop the 24h dedup and the second-run case goes RED: on a fresh
+# fixture the real wrk sends one event across two runs, the mutant sends two.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+devin_trust_mutant t2092-nodedup 'now - last < 86400' '0'
+t2092_home4="$TMP/t2092-h4"; t2092_fixture "$t2092_home4"
+T2092_CONFIG="$TMP/t2092-hosts.toml"
+printf '[local]\nfleet_usage_alert_gb = 0\n' >"$T2092_CONFIG"
+T2092_PANEWIRE_LOG="$TMP/t2092-p4.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_home4" --alert
+t2092_run "$t2092_home4" --alert
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 1 ]] ||
+  fail "hk2092: two --alert runs inside 24h must emit once: $(cat "$T2092_PANEWIRE_LOG")"
+WRK_UNDER_TEST="$TMP/mut-wrk-t2092-nodedup" t2092_run "$t2092_home4" --alert
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 2 ]] ||
+  fail "hk2092 M1 mutant survived: dropping the 24h dedup must re-emit on the second run"
+echo "PASS hk2092 M1: dropping the 24h dedup goes RED on the second run"
+unset T2092_CONFIG WRK_UNDER_TEST
+
 # hk 1439: deliberate check — with SCOPEFUEL_BIN unset, a profile lease falls back
 # to PATH, must hit the tripwire shim (rc 99 via the lease error), then the log is
 # restored to its prior content so the end-of-suite check still means something.
