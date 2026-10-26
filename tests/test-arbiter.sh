@@ -58,6 +58,28 @@ con.commit()
 con.close()
 PY
 }
+age_job() {
+  python3 - "$DB" "$1" "$2" <<'PY'
+import datetime, json, sqlite3, sys
+db, job_id, minutes = sys.argv[1], sys.argv[2], int(sys.argv[3])
+created_at = (datetime.datetime.now(datetime.timezone.utc).replace(microsecond=0)
+              - datetime.timedelta(minutes=minutes)).isoformat()
+con = sqlite3.connect(db)
+rows = con.execute(
+    "SELECT seq, payload FROM events WHERE job_id = ?"
+    " AND kind IN ('job.claim', 'job.reclaim', 'job.spawned')", (job_id,)
+).fetchall()
+for seq, body in rows:
+    event = json.loads(body)
+    event["created_at"] = created_at
+    con.execute("UPDATE events SET created_at = ?, payload = ? WHERE job_id = ? AND seq = ?",
+                (created_at, json.dumps(event, ensure_ascii=False, sort_keys=True), job_id, seq))
+con.execute("UPDATE jobs SET created_at = ?, updated_at = ? WHERE job_id = ?",
+            (created_at, created_at, job_id))
+con.commit()
+con.close()
+PY
+}
 
 # ---------------------------------------------------------------- ⑤ fail-closed
 # DB 없음: bootstrap 이 허용된 claim 을 뺀 모든 경로는 비-0 로 거부한다.
@@ -391,9 +413,12 @@ expect_rc 0 lease --job quota-blocked --kind quota_pool --profile codex-max --ga
 expect_rc 0 lease --job quota-custom-job --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 "$ARBITER" claim --job orphan-gc --agent-label orphan-gc-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job orphan-gc --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+age_job orphan-gc 11
 "$ARBITER" claim --job gc-row-left --agent-label gc-row-left-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job gc-row-left --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 expect_rc 0 lease --job gc-row-left --resource path-left --kind path
+age_job quota-dead 11
+age_job gc-row-left 11
 printf '%s\n' '{"result":{"agents":[{"name":"pool-a","agent_status":"working"},{"name":"pool-b","agent_status":"working"},{"name":"pool-c","agent_status":"working"},{"name":"pool-d","agent_status":"working"},{"name":"quota-live","agent_status":"working"},{"name":"quota-custom-agent","agent_status":"working"},{"name":"quota-idle","agent_status":"idle"},{"name":"quota-done","agent_status":"done"},{"name":"quota-blocked","agent_status":"blocked"}]}}' >"$TMP/agents.json"
 run gc --herdr-agent-list "$TMP/agents.json" --json
 [[ "$RC" -eq 0 ]] || fail "stale quota cleanup failed: $ERR"
@@ -467,6 +492,45 @@ run claim --reclaim-released --job orphan-gc --agent-label orphan-gc-retry --lan
 [[ "$RC" -eq 0 ]] || fail "job released by gc could not be reclaimed without duplicate override: $ERR"
 pass "gc stale cleanup atomically releases an orphaned job, audits once, and permits reclaim"
 pass "gc leaves a stale job leased while any path lease remains"
+
+# An absent pane during the spawn startup grace is not proof that its owner is
+# gone. Keep both the quota reservation and leased job for a recent claim.
+"$ARBITER" claim --job orphan-young --agent-label orphan-young-agent --lane live --t T1 >/dev/null
+expect_rc 0 lease --job orphan-young --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+age_job orphan-young 1
+printf '%s\n' '{"result":{"agents":[]}}' >"$TMP/absent-agents.json"
+run gc --herdr-agent-list "$TMP/absent-agents.json" --json
+[[ "$RC" -eq 0 ]] || fail "gc failed for a recently claimed absent pane: $ERR"
+grep -q 'gc skipped orphan cleanup' <<<"$ERR" || fail "startup grace skip was not logged: $ERR"
+pycheck "$OUT" <<'PY' || fail "gc retired a job still inside startup grace"
+import json, sys
+d = json.load(sys.stdin)
+assert "orphan-young" not in {r["job_id"] for r in d["stale_quota_pool"]}, d
+assert any(r["job_id"] == "orphan-young" and "startup grace" in r["reason"]
+           for r in d["skipped"]), d
+PY
+pycheck "$("$ARBITER" status --job orphan-young --json)" <<'PY' || fail "startup grace deleted the quota reservation"
+import json, sys
+d = json.load(sys.stdin)
+assert d["jobs"][0]["state"] == "leased", d
+assert len(d["quota_pool_records"]) == 1, d
+PY
+pass "gc preserves a recent claimed job and quota reservation during the 10-minute startup grace"
+
+"$ARBITER" claim --job orphan-spawn-young --agent-label orphan-spawn-young-agent --lane live --t T1 >/dev/null
+expect_rc 0 lease --job orphan-spawn-young --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+age_job orphan-spawn-young 11
+expect_rc 0 event --job orphan-spawn-young --kind job.spawned --payload-json '{"pane_id":"w2:p-new"}'
+run gc --herdr-agent-list "$TMP/absent-agents.json" --json
+[[ "$RC" -eq 0 ]] || fail "gc failed for a recent spawn receipt: $ERR"
+pycheck "$OUT" <<'PY' || fail "gc ignored the recent spawn receipt startup grace"
+import json, sys
+d = json.load(sys.stdin)
+assert "orphan-spawn-young" not in {r["job_id"] for r in d["stale_quota_pool"]}, d
+assert any(r["job_id"] == "orphan-spawn-young" and "latest spawn" in r["reason"]
+           for r in d["skipped"]), d
+PY
+pass "gc preserves a recent spawn receipt during startup grace"
 expect_rc 0 release --job quota-live --resource codex --kind quota_pool
 pass "normal quota release and herdr-list stale cleanup leave event evidence"
 
@@ -504,6 +568,7 @@ printf '%s\n' '{"result":{"agents":[]}}' >"$TMP/absent-agents.json"
 "$ARBITER" claim --job manual-orphan --agent-label manual-orphan-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job manual-orphan --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 drop_quota_rows manual-orphan
+age_job manual-orphan 11
 run release --force --job manual-orphan --herdr-agent-list "$TMP/absent-agents.json" --json
 [[ "$RC" -eq 0 ]] || fail "manual orphan release failed: $ERR"
 pycheck "$OUT" <<'PY' || fail "manual orphan release did not report forced=true"
@@ -527,9 +592,28 @@ assert d["jobs"][0]["state"] == "released", d
 PY
 pass "release --force --job atomically releases an absent-agent orphan with forced audit evidence"
 
+"$ARBITER" claim --job manual-young --agent-label manual-young-agent --lane live --t T1 >/dev/null
+expect_rc 0 lease --job manual-young --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+drop_quota_rows manual-young
+age_job manual-young 1
+expect_rc 5 release --force --job manual-young --herdr-agent-list "$TMP/absent-agents.json"
+grep -q 'startup grace' <<<"$ERR" || fail "young manual orphan refusal omitted startup grace: $ERR"
+pycheck "$("$ARBITER" status --job manual-young --json)" <<'PY' || fail "manual release retired a recent claim"
+import json, sys
+d = json.load(sys.stdin)
+assert d["jobs"][0]["state"] == "leased", d
+PY
+pycheck "$("$ARBITER" job-get --job manual-young --json)" <<'PY' || fail "young manual refusal wrote an orphan event"
+import json, sys
+d = json.load(sys.stdin)
+assert "job.orphan_release" not in d["recent_event_kinds"], d
+PY
+pass "release --force --job refuses an absent owner inside startup grace"
+
 "$ARBITER" claim --job manual-live --agent-label manual-live-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job manual-live --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 drop_quota_rows manual-live
+age_job manual-live 11
 printf '%s\n' '{"result":{"agents":[{"name":"manual-live-agent","agent_status":"working"}]}}' >"$TMP/manual-live.json"
 expect_rc 5 release --force --job manual-live --herdr-agent-list "$TMP/manual-live.json"
 grep -q 'manual-live-agent' <<<"$ERR" || fail "live-agent refusal did not name its owner: $ERR"
@@ -548,6 +632,7 @@ PY
 "$ARBITER" claim --job manual-unknown --agent-label manual-unknown-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job manual-unknown --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 drop_quota_rows manual-unknown
+age_job manual-unknown 11
 printf '%s\n' '{"result":{"agents":[{"name":"manual-unknown-agent","agent_status":"unknown"}]}}' >"$TMP/manual-unknown.json"
 expect_rc 6 release --force --job manual-unknown --herdr-agent-list "$TMP/manual-unknown.json"
 grep -q 'unknown' <<<"$ERR" || fail "unknown-agent refusal was not explained: $ERR"
@@ -568,6 +653,7 @@ for agent_state in idle "done"; do
   "$ARBITER" claim --job "$job" --agent-label "$agent" --lane live --t T1 >/dev/null
   expect_rc 0 lease --job "$job" --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
   drop_quota_rows "$job"
+  age_job "$job" 11
   printf '{"result":{"agents":[{"name":"%s","agent_status":"%s"}]}}\n' \
     "$agent" "$agent_state" >"$TMP/$job.json"
   expect_rc 5 release --force --job "$job" --herdr-agent-list "$TMP/$job.json"
@@ -590,6 +676,7 @@ pass "release --force --job retains listed idle and done panes even without rows
 "$ARBITER" claim --job manual-unreadable --agent-label manual-unreadable-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job manual-unreadable --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 drop_quota_rows manual-unreadable
+age_job manual-unreadable 11
 expect_rc 6 release --force --job manual-unreadable --herdr-agent-list "$TMP/no-such-agents.json"
 pycheck "$("$ARBITER" status --job manual-unreadable --json)" <<'PY' || fail "unreadable Herdr list changed the orphan job"
 import json, sys
@@ -619,6 +706,7 @@ PY
 expect_rc 0 lease --job manual-lease-left --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
 expect_rc 0 lease --job manual-lease-left --resource manual-path-left --kind path
 drop_quota_rows manual-lease-left
+age_job manual-lease-left 11
 expect_rc 5 release --force --job manual-lease-left --herdr-agent-list "$TMP/absent-agents.json"
 grep -q 'manual-path-left' <<<"$ERR" || fail "remaining lease refusal did not name its row: $ERR"
 pycheck "$("$ARBITER" status --job manual-lease-left --json)" <<'PY' || fail "manual release deleted a remaining lease"
@@ -638,6 +726,7 @@ pass "release --force --job refuses live, unknown, quota-left, and lease-left jo
 # permits one orphan event and one released row, then a normal reclaim works.
 "$ARBITER" claim --job orphan-race --agent-label orphan-race-agent --lane live --t T1 >/dev/null
 expect_rc 0 lease --job orphan-race --kind quota_pool --profile codex-max --gate-output "$TMP/gate.out"
+age_job orphan-race 11
 set +e
 "$ARBITER" gc --herdr-agent-list "$TMP/absent-agents.json" --json >"$TMP/race-gc.out" 2>&1 &
 gc_pid=$!
