@@ -11969,6 +11969,9 @@ original key after an unknown outcome. Nothing written locally is authority.
   import-seal JOB --as R --events-dir DIR [--reason-code CODE]
             the manifest is the server's import records, checked against DIR
 
+There is no raw append: wrk o3 append refuses with exit 2 and names the typed
+command (wrk round open|verdict|void, wrk done, wrk joined, wrk o3 central).
+
 Records mode: <account home>/.config/wrk/records-mode holds legacy (default when
 absent), shadow or required; anything else refuses with exit 2.
 USAGE
@@ -11983,8 +11986,38 @@ o3_cmd() {
       o3_call central "$@"
       o3_exit_on_error
       printf '%s\n' "$O3_OUT" ;;
+    append) shift; o3_append_refuse "$@" ;;
     *) die "unknown o3 subcommand '$1' (see 'wrk o3 --help')" ;;
   esac
+}
+
+# director-1 C1 ruling R3: a raw append is not an alternative mutation route.
+# The typed commands carry the O2 veto, the projection and the dedupe, and the
+# central desk commands carry the role wrapper, so wrk offers no public raw
+# append: every kind refuses with cli_usage before any read, exec or intent.
+o3_append_refuse() {
+  local kind="" typed
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --kind) kind="${2:-}"; shift; [[ $# -eq 0 ]] || shift ;;
+      *) shift ;;
+    esac
+  done
+  case "$kind" in
+    round_open) typed="wrk round open" ;;
+    verdict) typed="wrk round verdict" ;;
+    void) typed="wrk round void" ;;
+    completed) typed="wrk done" ;;
+    joined) typed="wrk joined" ;;
+    claim) typed="wrk o3 central claim (wrk o3 central assign for a review role)" ;;
+    activate) typed="wrk o3 central activate" ;;
+    import) typed="wrk o3 central import" ;;
+    import_begin) typed="wrk o3 central import-begin" ;;
+    import_seal) typed="wrk o3 central import-seal" ;;
+    *) typed="the typed wrk command for the record kind" ;;
+  esac
+  echo "wrk: o3 cli_usage: o3 append: a raw append is not a mutation route; use $typed; nothing sent" >&2
+  exit 2
 }
 
 spawn_cmd() {

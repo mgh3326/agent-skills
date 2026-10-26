@@ -2512,6 +2512,33 @@ class RuleCase(O3Case):
         self.assertRc(out, 73, "job_ended")
 
 
+def scenario_r2_unmatched_verdict(case, bindir=BIN):
+    """An enforced verdict with no open round at all, then one on a head no
+    open round holds: each is sent with the ruled round_no."""
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    none_open = w.run("round", "verdict", "job-a", "--file", w.verdict_file("v1.md", w.heads[0]))
+    case.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+    other_head = w.run("round", "verdict", "job-a", "--file", w.verdict_file("v2.md", w.heads[1]))
+    return w, none_open, other_head
+
+
+def scenario_r3_raw_append(case, bindir=BIN):
+    """A shadow job raw-appends a round; an activated job raw-appends each
+    kind that has a local projection."""
+    w = shadow_world(case, bindir)
+    calls = len(w.calls())
+    shadow = w.run("o3", "append", "job-a", "--kind", "round_open", "--payload", "{}")
+    case.assertEqual(len(w.calls()), calls, "a raw append reads and sends nothing")
+    e = World(case, bindir=bindir)
+    e.enforced_builder()
+    calls = len(e.calls())
+    enforced = {kind: e.run("o3", "append", "job-a", "--kind", kind, "--payload", "{}")
+                for kind in ("round_open", "verdict", "void", "completed", "joined")}
+    case.assertEqual(len(e.calls()), calls, "a raw append reads and sends nothing")
+    return w, shadow, e, enforced
+
+
 class ServerOrderCase(O3Case):
     """director-1 C1 ruling: path/content identity, digest and scope checks are
     the server's; the client sends the request and reports the server's code."""
@@ -2542,6 +2569,34 @@ class ServerOrderCase(O3Case):
 
     def test_same_bytes_fresh_path_is_the_servers_duplicate_content(self):
         self.verdict_vector_reaches_the_server("same-bytes-fresh-path-duplicate-content", "transition.json")
+
+    def test_r2_verdict_with_no_matching_local_open_round_is_sent_and_the_servers_code_reported(self):
+        # director-1 C1 ruling R2: no local refusal for a missing open round;
+        # round_no is the oldest open round, or next_round_no when none is open.
+        w, none_open, other_head = scenario_r2_unmatched_verdict(self)
+        self.assertRc(none_open, 73, "round_not_open")
+        self.assertRc(other_head, 73, "head_mismatch")
+        sent = [json.loads(base64.b64decode(c["stdin_b64"])) for c in w.appends("verdict")]
+        self.assertEqual(len(sent), 2, "both requests reached the server")
+        self.assertEqual([p["round_no"] for p in sent], [1, 1])
+        self.assertEqual([p["head"] for p in sent], [w.heads[0], w.heads[1]])
+        self.assertEqual([i["error"] for i in w.intents("job-a") if i["request"]["kind"] == "verdict"],
+                         ["round_not_open", "head_mismatch"])
+        self.assertEqual(w.events("job-a", "job.verdict"), [])
+
+    def test_r3_raw_append_refuses_with_cli_usage_and_names_the_typed_command(self):
+        # director-1 C1 ruling R3: wrk o3 append is not a mutation route.
+        w, shadow, e, enforced = scenario_r3_raw_append(self)
+        self.assertRc(shadow, 2, "cli_usage")
+        self.assertIn("use wrk round open", shadow.stderr)
+        typed = {"round_open": "wrk round open", "verdict": "wrk round verdict", "void": "wrk round void",
+                 "completed": "wrk done", "joined": "wrk joined"}
+        for kind, out in enforced.items():
+            self.assertRc(out, 2, "cli_usage")
+            self.assertIn("use %s;" % typed[kind], out.stderr)
+        self.assertEqual(w.appends() + e.appends(), [])
+        self.assertEqual(w.events("job-a", "job.round"), [])
+        self.assertEqual(w.intents("job-a") + e.intents("job-a"), [])
 
     def test_reviewer_import_is_the_servers_scope_denied(self):
         vec = self.vector("r-import-scope-denied", "r4-review-lifecycle.json")
@@ -2884,6 +2939,26 @@ class MutantCase(O3Case):
         w, out = SpawnCase.scenario_legacy_spawn_makes_both_task_calls(self, bindir)
         log = w.tasks_log.read_text() if w.tasks_log.exists() else ""
         self.assertNotIn("claim id=2400", log, "the mutant must have skipped the legacy link")
+
+
+    def test_m12_local_refusal_of_an_unmatched_verdict_goes_red(self):
+        # R2 at the real call site: the build step refuses locally instead of
+        # sending the request with the ruled round_no.
+        bindir = self.mutant_bin([("wrk_o3.py", """                if number is None:
+                    # No open round on this head""", """                if number is None:
+                    raise Fail("round_not_open", "no local open round on head %s" % head)
+                if number is None:
+                    # No open round on this head""")])
+        w, none_open, other_head = scenario_r2_unmatched_verdict(self, bindir)
+        self.assertEqual(w.appends("verdict"), [], "the mutant must pre-empt the server")
+
+    def test_m13_raw_append_route_goes_red(self):
+        # R3 at the real call site: o3_cmd no longer refuses the raw append.
+        bindir = self.mutant_bin([("wrk", """    append) shift; o3_append_refuse "$@" ;;
+""", "")])
+        w, shadow, e, enforced = scenario_r3_raw_append(self, bindir)
+        self.assertNotIn("o3 cli_usage", shadow.stderr)
+        self.assertNotIn("use wrk round verdict;", enforced["verdict"].stderr)
 
 
 if __name__ == "__main__":
