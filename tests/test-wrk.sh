@@ -7326,7 +7326,7 @@ t2011_fwd_spawn() {
   env -u WRK_KEEP_FAILED_PANE ${keep_env[@]+"${keep_env[@]}"} \
     WRK_TEST_MODE=1 ARBITER_INBOX_ROOT="$TMP/inbox" XDG_DATA_HOME="$TMP/xdg" ARBITER_BIN="$ARBITER" \
     HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$SCOPEFUEL" \
-    WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="$T2011_FWD/hosts.toml" WRK_PROC_LOADAVG="$T2011_FWD/loadavg" \
+    WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="${T2011_HOSTS:-$T2011_FWD/hosts.toml}" WRK_PROC_LOADAVG="$T2011_FWD/loadavg" \
     WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$T2011_FWD/herdr.log" WRK_SPILLOVER_LOG="$T2011_FWD/spill.log" \
     PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
@@ -7349,6 +7349,34 @@ if grep -q 'WRK_KEEP_FAILED_PANE' "$T2011_FWD/ssh.log"; then
 fi
 echo "PASS hk2011 WRK_KEEP_FAILED_PANE forwards to the remote leg"
 
+# hk 2011 kept pane: a remote leg that kept its failed pane (WRK_KEEP_FAILED_PANE
+# is forwarded) ends the auto round at that host. The second candidate and the
+# local fallback must never spawn: one pane, one remote spawn leg.
+T2011_TWO="$T2011_FWD/hosts-two.toml"
+cp "$T2011_FWD/hosts.toml" "$T2011_TWO"
+printf '%s\n' '' '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >>"$T2011_TWO"
+set +e
+t2011_kept_out="$(T2011_HOSTS="$T2011_TWO" WRK_SSH_SCENARIO_DESKTOP=remote-die-stderr WRK_REMOTE_RC=1 \
+  WRK_REMOTE_STDERR_LINE='wrk: kept failed pane desktop:p7 (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close desktop:p7' \
+  t2011_fwd_spawn fwd-kept 1 2>&1)"
+t2011_kept_rc=$?
+set -e
+[[ "$t2011_kept_rc" -ne 0 ]] ||
+  fail "hk2011 kept pane: the remote failure must fail the auto spawn: $t2011_kept_out"
+[[ "$(grep -c 'kept failed pane' <<<"$t2011_kept_out")" -eq 1 ]] ||
+  fail "hk2011 kept pane: the kept pane must be printed exactly once: $t2011_kept_out"
+grep -q "left failed pane desktop:p7 open" <<<"$t2011_kept_out" ||
+  fail "hk2011 kept pane: the round must say the pane is still open: $t2011_kept_out"
+[[ "$(grep -c '^OK pane=' <<<"$t2011_kept_out")" -eq 0 ]] ||
+  fail "hk2011 kept pane: no candidate may land a second pane: $t2011_kept_out"
+[[ "$(grep -c 'wrk spawn' "$T2011_FWD/ssh.log")" -eq 1 ]] ||
+  fail "hk2011 kept pane: exactly one remote spawn leg is allowed: $(cat "$T2011_FWD/ssh.log")"
+if grep -q 'mac-work' "$T2011_FWD/ssh.log"; then
+  fail "hk2011 kept pane: the second candidate must not be tried: $(cat "$T2011_FWD/ssh.log")"
+fi
+echo "PASS hk2011 kept remote pane ends the auto round: one pane, no second candidate"
+
 # The kept-pane hint names the pane to close (herdr pane close PANE), never a tab.
 T2011_HINT="$(WRK_KEEP_FAILED_PANE=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)" || true
 grep -q 'close it with herdr pane close w:p1' <<<"$T2011_HINT" ||
@@ -7361,10 +7389,24 @@ echo "PASS hk2011 kept-pane hint names herdr pane close"
 
 # Mutants: each must make its named case fail.
 # shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
-devin_trust_mutant nokill '    timeout -k "$kill_grace" "$secs" "$@"' '    timeout "$secs" "$@"'
-read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$TMP/mut-wrk-nokill" 2>/dev/null)" || true
-[[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )) ||
-  fail "hk2011 mutant nokill (no -k) must fail the TERM-ignoring case"
+# nokill needs timeout or gtimeout on PATH: the python fallback kills on its own
+# (SIGKILL), so the mutant cannot differ there and the check is skipped. The
+# extract is the mutant's run_bounded block only; the whole mutant file ends in
+# a dispatcher that exits 2 before run_bounded exists.
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  devin_trust_mutant nokill '    timeout -k "$kill_grace" "$secs" "$@"' '    timeout "$secs" "$@"'
+  sed -n '/^run_bounded() {/,/^}/p' "$TMP/mut-wrk-nokill" >"$TMP/run-bounded-nokill.sh"
+  [[ -s "$TMP/run-bounded-nokill.sh" ]] ||
+    fail "hk2011 mutant nokill: run_bounded is not in the mutant copy"
+  read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$TMP/run-bounded-nokill.sh")"
+  # RED for the right reason: the TERM-ignoring child outlived the bound (rc 124
+  # after the full sleep), not a non-124 rc from a broken extract.
+  if [[ "$t2011_rc" -ne 124 ]] || (( t2011_elapsed <= 6 )); then
+    fail "hk2011 mutant nokill (no -k) must go RED on the timing: rc=$t2011_rc elapsed=${t2011_elapsed}s"
+  fi
+else
+  echo "SKIP hk2011 mutant nokill: no timeout or gtimeout on this host"
+fi
 # shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
 devin_trust_mutant nonexcl 'set -C; : >"$screen"' ': >"$screen"'
 t2011_capture_pair mut-nonexcl "$TMP/mut-wrk-nonexcl" &&

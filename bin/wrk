@@ -9399,6 +9399,14 @@ spillover_remote_spawn() {
   "${WRK_SSH_BIN:-ssh}" -o BatchMode=yes "$ssh_name" "$remote_cmd; rc=\$?; rm -f -- $(printf '%q' "$remote_prompt"); exit \$rc" >"$out" 2>"$remote_err"
   rc=$?
   set -e
+  # hk 2011: a remote wrk that kept its failed pane (WRK_KEEP_FAILED_PANE is
+  # forwarded from this host) left a pane open. The auto round must end there
+  # rather than spawn the job again on another host or locally.
+  SPILL_REMOTE_PANE_KEPT=0
+  if [[ "$rc" -ne 0 && "${WRK_KEEP_FAILED_PANE:-}" == 1 ]] &&
+     grep -q '^wrk: kept failed pane ' "$remote_err"; then
+    SPILL_REMOTE_PANE_KEPT=1
+  fi
   # A failed remote spawn must answer with the remote's own words: stderr is
   # relayed verbatim and non-OK stdout follows it onto the local stderr.
   spillover_relay_remote_err "$remote_err"
@@ -9503,7 +9511,11 @@ spillover_try_candidate() {
   else
     if spillover_remote_spawn "$candidate" "$cwd" "$prompt" "$@"; then rc=0; else rc=$?; fi
     if [[ "$rc" -ne 0 && -n "${SPILL_CANDIDATE_CLASS_FILE:-}" ]]; then
-      printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      if [[ "${SPILL_REMOTE_PANE_KEPT:-0}" == 1 ]]; then
+        printf 'kept-pane\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      else
+        printf 'refused\n' >"$SPILL_CANDIDATE_CLASS_FILE"
+      fi
     fi
   fi
   if [[ "$rc" -ne 0 && "$hold_diag" == 1 ]]; then
@@ -9739,6 +9751,7 @@ spawn_router_cmd() {
   # remote_full_seen latches the positive capacity evidence the post-round
   # wake requires — a round with no remote-full answer never wakes.
   local wake_pending="" remote_full_seen=0 wake_target=""
+  local kept_pane_round=0 kept_pane=""
   # --host auto holds every per-candidate diagnostic until the round settles:
   # a successful spawn must print nothing about the hosts it skipped, while an
   # all-fail round owes the operator one attributed line per host plus whatever
@@ -9806,9 +9819,20 @@ spawn_router_cmd() {
           if [[ "$(spillover_value "hosts.$candidate" wake 2>/dev/null || true)" == panewire ]]; then
             wake_pending+="$candidate "
           fi ;;
+        kept-pane)
+          kept_pane_round=1
+          kept_pane="$(sed -n 's/^wrk: kept failed pane \([^ ]*\) .*/\1/p' "$cand_err" | head -1)" ;;
       esac
       cat "$cand_err" >>"$auto_diag"
       rm -f "$cand_err" "$cand_class"
+      if [[ "$kept_pane_round" == 1 ]]; then
+        # The remote pane is still up: a second spawn elsewhere would give the
+        # job two panes, so the round ends here with the remote's rc.
+        [[ -s "$auto_diag" ]] && cat "$auto_diag" >&2
+        rm -f "$auto_diag"
+        echo "wrk: remote host '$candidate' left failed pane ${kept_pane:-unknown} open (WRK_KEEP_FAILED_PANE=1); not trying another host or the local fallback" >&2
+        return "$last_rc"
+      fi
     else
       if spillover_try_candidate 0 "$candidate" "$cwd" "$prompt" "${filtered[@]}"; then
         return 0
