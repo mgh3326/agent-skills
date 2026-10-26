@@ -155,10 +155,10 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "b32fcb9083c7a079ae3bc1a27d0a305447d76a46fbf1aae9930d7c9cfe64102b",
+    ".github/workflows/ci.yml": "e034a683da1f12f774281d09f942ac3472a3e83c3f37c975a6673ff24f7647e0",
     "bin/arbiter": "ac2349402cbbd066bd1bdd18b6de5e57e42c902b339cc24c8a9b35d38a49be97",
-    "bin/wrk": "7aced03b2a0c36cfb578669095b406e633f9bcb6df35a33db0be845d2287e242",
-    "bin/wrk-o3.py": "93d46ead2f69dda2f01bc8bdf2ed29b878fb251a9496ea6876bfbb95e140d8c8",
+    "bin/wrk": "3d804d8c8ae4dc81fdd270b89d2a96364a1db6194f81da4fd565d00135852cb7",
+    "bin/wrk-o3.py": "0a23de3b0bdb1d63c5ae94771f05a7b712ef78e41e3aaf331f1a3b2ea4ae99a4",
     "bin/wrk-o3-contract.json": "99e78d7e326f598174ee3f3cf47827ce9a32454105b599f0af5c9b65879bc9f4",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
     "builder/SKILL.md": "c7243059394c7739944b21da4a137b39615a600dcec614c9d803e2a967de7089",
