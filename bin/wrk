@@ -7425,7 +7425,7 @@ quota_release_round_current() {
 # scan snapshot cannot authorize releasing a row after a same-id reclaim or
 # respawn.
 release_job_quota_pool() {
-  local job="$1" pane="${2:-}" mode="${3:-current}" arb out pool rc
+  local job="$1" pane="${2:-}" mode="${3:-current}" arb out pool rc rows=""
   arb="${ARBITER:-}"
   if [[ -z "$arb" || ! -x "$arb" ]]; then
     arb="$(command -v arbiter 2>/dev/null || true)"
@@ -7441,6 +7441,7 @@ release_job_quota_pool() {
   }
   while IFS= read -r pool; do
     [[ -n "$pool" ]] || continue
+    rows=1
     # This check must follow status and sit immediately before each arbiter
     # release. A revive after the command's earlier candidate scan leaves the
     # live round's row untouched and makes the caller leave its paired action.
@@ -7458,6 +7459,11 @@ for row in doc.get("quota_pool_records") or []:
     pool = row.get("pool")
     if isinstance(pool, str) and pool:
         print(pool)' "$out" 2>/dev/null || true)
+  [[ -n "$rows" ]] && return 0
+  # Status listed no live rows, so the loop's per-release recheck never ran.
+  # The caller's paired action still needs the same proof once here; rc 2
+  # leaves that action to the live round, exactly as the row path does.
+  quota_release_round_current "$job" "$pane" "$mode" || return $? # hk1860-rowless-recheck
   return 0
 }
 
