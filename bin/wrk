@@ -13136,7 +13136,11 @@ def owner_alive(pid, start):
 
 def record_start(text):
     fields = text.split(None, 4)
-    if len(fields) > 4 and fields[4].startswith("start="):
+    # Field five is metadata only after our complete fixed head. In an
+    # older pid/since/job/cmd record it can still be command text.
+    if (len(fields) > 4 and fields[0].startswith("pid=")
+            and fields[1].startswith("class=") and fields[2].startswith("limit=")
+            and fields[3].startswith("ticket=") and fields[4].startswith("start=")):
         # JSON quoting preserves the exact ps text (including whitespace)
         # while keeping a single fixed head field ahead of free-form cmd.
         try:

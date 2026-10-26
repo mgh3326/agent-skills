@@ -221,6 +221,14 @@ class HeavyQueue(unittest.TestCase):
         path.write_text(f"pid={os.getpid()} class=lane limit=1 ticket=1:1 since=x cmd=start=forged")
         self.assertEqual(self.run_wrk("--", "true").returncode, 0)
 
+    def test_legacy_command_cannot_forge_start_identity(self):
+        path = self.waiters / "old-command"
+        path.write_text(f'pid={os.getpid()} since=x job=- cmd=echo start="forged"')
+        result = self.run_wrk("status")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(path.exists(), "legacy command forged identity and retired a live owner")
+        self.assertIn("waiter pid=", result.stdout)
+
     def signal_waiter(self, info, sig):
         pid = int(info.split()[0].split("=")[1])
         check = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
@@ -697,6 +705,10 @@ class HeavyQueue(unittest.TestCase):
             ("sighup", '    for signum in (signal.SIGHUP, signal.SIGTERM):',
              '    for signum in (signal.SIGTERM,):',
              "test_wait_sighup_and_sigterm_remove_own_record", "signal leaked waiter"),
+            ("legacy-start", 'and fields[1].startswith("class=") and fields[2].startswith("limit=")\n'
+             '            and fields[3].startswith("ticket=") and fields[4].startswith("start=")):',
+             'and fields[4].startswith("start=")):', "test_legacy_command_cannot_forge_start_identity",
+             "legacy command forged identity and retired a live owner"),
         ]
         for name, old, new, case, invariant in mutations:
             with self.subTest(invariant=invariant):
