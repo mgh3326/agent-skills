@@ -1332,9 +1332,13 @@ def _orphan_release(con, job_id, agents, moment, *, forced=False):
     if label is None:
         raise ArbiterError(EXIT_STORAGE, f"job={job_id} has no exact agent_label mapping")
     statuses, matched = _matched_agent_statuses(agents, job_id=job_id, agent_label=label)
-    if HERDR_LIVE_STATUS in statuses or "unknown" in statuses:
-        if forced or "unknown" in statuses and HERDR_LIVE_STATUS not in statuses:
+    # Agent-list presence proves ownership even when the pane is idle/done/blocked.
+    # Only absence is gone evidence here; unknown remains a refusal.
+    if matched:
+        if "unknown" in statuses:
             raise ArbiterError(EXIT_STORAGE, f"job={job_id} agent={label} live/unknown status={sorted(statuses)}")
+        if forced:
+            raise ArbiterError(EXIT_STORAGE, f"job={job_id} agent={label} is present/live status={sorted(statuses)}")
         return None
     leases = con.execute("SELECT resource, kind FROM leases WHERE job_id = ?", (job_id,)).fetchall()
     quota = con.execute("SELECT pool FROM quota_pool_records WHERE job_id = ?", (job_id,)).fetchall()
@@ -1342,7 +1346,7 @@ def _orphan_release(con, job_id, agents, moment, *, forced=False):
         if forced:
             raise ArbiterError(EXIT_STORAGE, f"job={job_id} rows left: leases={leases} quota_pool={quota}")
         return None
-    reason = "job absent from herdr agent list" if not matched else f"herdr agent status={','.join(sorted(statuses))}"
+    reason = "job absent from herdr agent list"
     payload = {"job_id": job_id, "prior_state": row[0], "agent_label": label,
                "herdr_status": sorted(statuses), "reason": reason}
     if forced:
@@ -1400,8 +1404,6 @@ def cmd_gc(args: argparse.Namespace) -> dict:
             statuses, matched = _matched_agent_statuses(
                 herdr_agents, job_id=row[0], agent_label=agent_label
             )
-            if HERDR_LIVE_STATUS in statuses:
-                continue
             if "unknown" in statuses:
                 unsafe_quota_pool.append(
                     {
@@ -1412,6 +1414,9 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                         "reason": "herdr agent status=unknown is not stale evidence",
                     }
                 )
+                continue
+            # A non-working pane still owns its quota; retire only absent agents.
+            if matched:
                 continue
             stale_decisions.append((row, agent_label, sorted(statuses), matched))
 
@@ -1433,11 +1438,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
 
         stale_quota_pool = []
         for row, agent_label, statuses, matched in stale_decisions:
-            reason = (
-                "job absent from herdr agent list"
-                if not matched
-                else f"herdr agent status={','.join(statuses)}"
-            )
+            reason = "job absent from herdr agent list"
             con.execute(
                 "DELETE FROM quota_pool_records WHERE job_id = ? AND pool = ?",
                 (row[0], row[1]),
@@ -1491,6 +1492,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
         "orphan_released": orphan_released,
         "unresolved_quota_pool": unresolved_quota_pool,
         "unsafe_quota_pool": unsafe_quota_pool,
+        # Historical working-only telemetry, never a retirement predicate.
         "live_agents": sum(
             1 for agent in herdr_agents if agent["status"] == HERDR_LIVE_STATUS
         ),

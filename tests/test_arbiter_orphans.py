@@ -98,6 +98,56 @@ class Orphans(unittest.TestCase):
         self.assertEqual(self.events(), [])
         self.assertIn('live', self.manual(want=6))
 
+    def assert_present_rowless_agent_kept(self, status):
+        self.claim()
+        with sqlite3.connect(self.db) as con:
+            con.execute('DELETE FROM quota_pool_records')
+        self.agent_list([status])
+        self.gc()
+        self.assertEqual(self.state(), 'leased', status + ' rowless agent was released')
+        self.assertEqual(self.events(), [])
+        self.assertIn(status, self.manual(want=6))
+        self.assertEqual(self.state(), 'leased')
+        self.assertEqual(self.events(), [])
+
+    def test_idle_rowless_agent_is_not_released(self):
+        self.assert_present_rowless_agent_kept('idle')
+
+    def test_done_rowless_agent_is_not_released(self):
+        self.assert_present_rowless_agent_kept('done')
+
+    def test_blocked_rowless_agent_is_not_released(self):
+        self.assert_present_rowless_agent_kept('blocked')
+
+    def test_present_nonworking_agents_keep_quota_records(self):
+        self.claim()
+        for status in ('idle', 'done', 'blocked'):
+            with self.subTest(status=status):
+                self.agent_list([status])
+                self.gc()
+                self.assertEqual(len(self.rows('SELECT * FROM quota_pool_records')), 1,
+                                 status + ' present agent lost quota')
+                self.assertEqual(self.state(), 'leased')
+                self.assertEqual(self.events(), [])
+                self.assertEqual(self.rows("SELECT * FROM events WHERE kind='quota_pool.stale_cleanup'"), [])
+
+    def test_absent_rowless_agent_is_released(self):
+        self.claim()
+        with sqlite3.connect(self.db) as con:
+            con.execute('DELETE FROM quota_pool_records')
+        self.gc()
+        self.assert_released()
+
+    def test_unreadable_agent_list_refuses_rowless_release(self):
+        self.claim()
+        with sqlite3.connect(self.db) as con:
+            con.execute('DELETE FROM quota_pool_records')
+        self.agents.unlink()
+        self.gc(want=6)
+        self.manual(want=6)
+        self.assertEqual(self.state(), 'leased')
+        self.assertEqual(self.events(), [])
+
     def test_unknown_agent_refuses_and_rolls_back(self):
         self.claim()
         self.agent_list(['unknown'])
@@ -173,12 +223,17 @@ class Orphans(unittest.TestCase):
             ('gc-transition', '            result = _orphan_release(con, job_id, herdr_agents, moment)',
              '            result = None', 'test_gc_10_12_releases_once_and_reclaim_succeeds',
              'orphan job stayed leased'),
-            # Bypass both unknown checks at the real reconciliation call sites.
-            ('unknown', 'if "unknown" in statuses:', 'if False:',
+            ('unknown', '\n            if "unknown" in statuses:', '\n            if False:',
              'test_unknown_agent_refuses_and_rolls_back', '0 != 6'),
+            ('unknown-orphan', '\n        if "unknown" in statuses:', '\n        if False:',
+             'test_rowless_unknown_live_and_unmapped_refuse', '0 != 6'),
             ('lease-left', '            if con.execute("SELECT 1 FROM leases WHERE job_id = ?", (job_id,)).fetchone():',
              '            if False:', 'test_remaining_path_lease_blocks_transition',
              'remaining lease was ignored'),
+            ('working-only', '\n    if matched:\n', '\n    if HERDR_LIVE_STATUS in statuses:\n',
+             'test_idle_rowless_agent_is_not_released', 'idle rowless agent was released'),
+            ('working-only-quota', '\n            if matched:\n', '\n            if HERDR_LIVE_STATUS in statuses:\n',
+             'test_present_nonworking_agents_keep_quota_records', 'idle present agent lost quota'),
         ]
         for name, old, new, case, invariant in mutations:
             with self.subTest(mutant=name):
@@ -186,8 +241,10 @@ class Orphans(unittest.TestCase):
                 self.assertEqual(source.count(old), 1)
                 source = source.replace(old, new, 1)
                 if name == 'unknown':
-                    source = source.replace('if HERDR_LIVE_STATUS in statuses or "unknown" in statuses:',
-                                            'if HERDR_LIVE_STATUS in statuses:')
+                    source = source.replace('\n        if "unknown" in statuses:', '\n        if False:')
+                if name == 'working-only':
+                    source = source.replace('\n            if matched:\n',
+                                            '\n            if HERDR_LIVE_STATUS in statuses:\n')
                 if name == 'lease-left':
                     source = source.replace('    if leases or quota:', '    if quota:')
                 binary = self.base / ('mutant-' + name)

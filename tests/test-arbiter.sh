@@ -386,19 +386,22 @@ run gc --herdr-agent-list "$TMP/agents.json" --json
 pycheck "$OUT" <<'PY' || fail "stale cleanup did not report the dead job"
 import json, sys
 d = json.load(sys.stdin)
-assert [r["job_id"] for r in d["stale_quota_pool"]] == ["quota-blocked", "quota-dead", "quota-done", "quota-idle"], d
-assert {tuple(r["herdr_status"]) for r in d["stale_quota_pool"]} == {(), ("blocked",), ("done",), ("idle",)}, d
+assert [r["job_id"] for r in d["stale_quota_pool"]] == ["quota-dead"], d
+assert {tuple(r["herdr_status"]) for r in d["stale_quota_pool"]} == {()}, d
 PY
 pycheck "$("$ARBITER" status --json)" <<'PY' || fail "stale quota record remains"
 import json, sys
 d = json.load(sys.stdin)
 assert {r["job_id"] for r in d["quota_pool_records"]} >= {"pool-a", "pool-b", "quota-live", "quota-custom-job"}, d
 assert "quota-dead" not in {r["job_id"] for r in d["quota_pool_records"]}, d
-assert not {"quota-blocked", "quota-done", "quota-idle"} & {r["job_id"] for r in d["quota_pool_records"]}, d
+assert {"quota-blocked", "quota-done", "quota-idle"} <= {r["job_id"] for r in d["quota_pool_records"]}, d
+assert all(j["state"] == "leased" for j in d["jobs"] if j["job"] in {"quota-blocked", "quota-done", "quota-idle"}), d
 PY
-for stale_job in quota-blocked quota-dead quota-done quota-idle; do
-  [[ -f "$ARBITER_INBOX_ROOT/$stale_job/events/00003-quota_pool.stale_cleanup.json" ]] \
-    || fail "stale cleanup event artifact missing for $stale_job"
+[[ -f "$ARBITER_INBOX_ROOT/quota-dead/events/00003-quota_pool.stale_cleanup.json" ]] \
+  || fail "stale cleanup event artifact missing for quota-dead"
+for present_job in quota-blocked quota-done quota-idle; do
+  [[ ! -f "$ARBITER_INBOX_ROOT/$present_job/events/00003-quota_pool.stale_cleanup.json" ]] \
+    || fail "listed live agent lost quota via stale cleanup: $present_job"
 done
 expect_rc 0 release --job quota-live --resource codex --kind quota_pool
 pass "normal quota release and herdr-list stale cleanup leave event evidence"
