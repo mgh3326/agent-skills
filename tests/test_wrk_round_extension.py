@@ -217,6 +217,26 @@ mock_mcp_verify() { :; }
         self.assertEqual(process.returncode, 2, process.stderr)
         self.assertIn("requires --report", process.stderr)
 
+    def test_parent_owner_controls_cannot_reframe_report(self):
+        for preflight in (False, True):
+            with self.subTest(preflight=preflight):
+                process, _ = self.run_spawn(extra=("--owner", "desk"), remote_preflight=preflight)
+                self.assertEqual(process.returncode, 91, process.stderr)
+                for owner in ("desk\n" + str(self.base / "outside.md"), "desk\tbad"):
+                    process, _ = self.run_spawn(extra=("--owner", owner), remote_preflight=preflight)
+                    self.assertEqual(process.returncode, 2, process.stderr)
+                    self.assertIn("--owner", process.stderr)
+
+    def test_parent_report_symlink_control_characters_are_refused(self):
+        alias = self.base / "jobs/b1632-sol/report-alias.md"
+        target = self.base / "jobs/b1632-sol/name\npart.md"
+        alias.symlink_to(target)
+        for preflight in (False, True):
+            with self.subTest(preflight=preflight):
+                process, _ = self.run_spawn(extra=("--report", str(alias)), remote_preflight=preflight)
+                self.assertEqual(process.returncode, 2, process.stderr)
+                self.assertIn("--report", process.stderr)
+
     def test_implicit_round_extension_requires_explicit_role(self):
         for model in ("codex-astra", "fable"):
             for purpose, ref in (("round-extension", None), (None, REF), ("round-extension", REF),

@@ -10536,6 +10536,10 @@ root = pathlib.Path(root).resolve()
 def refuse(message):
     sys.stderr.write("wrk: " + message + "\n")
     raise SystemExit(2)
+# The shell reader consumes one field per line. Explicit owners must not
+# shift the validated report into another field.
+if any(ord(c) < 32 or ord(c) == 127 for c in owner):
+    refuse("--owner must have no control characters")
 # Explicit ownership lets an SSH target run without a parent claim. Report
 # containment below is unconditional and is repeated on the target host.
 if not owner or require_claim == "1":
@@ -10569,6 +10573,8 @@ if report:
         path = path.resolve()
     except (OSError, RuntimeError):
         refuse("--report cannot be resolved")
+    if any(ord(c) < 32 or ord(c) == 127 for c in str(path)):
+        refuse("--report must resolve without control characters")
     allowed = (root / parent, root / job)
     if not any(base in path.parents for base in allowed): # hk2042-target-containment
         refuse("--report must resolve under the parent or new job directory in the target inbox")
