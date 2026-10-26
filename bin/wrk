@@ -5336,7 +5336,8 @@ delegate_job_cmd() {
   if [[ "$prc" -ne 0 ]]; then
     # A probe killed by its own guard means the daemon is wedged, not absent —
     # emit_relay_event must not re-enter it inside this same invocation.
-    if [[ "$prc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: 137 is the KILL that run_bounded sends after its TERM grace.
+    if [[ "$prc" == 124 || "$prc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     return 0
   fi
   [[ "$probe" == "$JOB_PROBE_TOKEN" ]] || return 0
@@ -5353,7 +5354,8 @@ delegate_job_cmd() {
     # the local path's completion dedup suppresses the second write. On a
     # timeout the daemon is wedged — mark it so emit_relay_event does not
     # stall this invocation on another doomed panewire call.
-    if [[ "$rc" == 124 ]]; then PANEWIRE_WEDGED=1; fi
+    # hk 2011: 137 is the KILL that run_bounded sends after its TERM grace.
+    if [[ "$rc" == 124 || "$rc" == 137 ]]; then PANEWIRE_WEDGED=1; fi
     warn "panewire job $sub delegation failed or timed out (rc=$rc); using wrk's own path"
     return 0
   fi
