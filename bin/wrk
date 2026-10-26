@@ -12893,10 +12893,14 @@ def record_head_raw(text):
         except ValueError:
             pass
     start_at = 1 if len(toks) > 1 and toks[1].startswith("start=") else None
-    head_end = 4 if start_at is not None else 3
     if start_at is not None:
         toks = text.split(None, 5)
-    for tok in toks[1:head_end]:
+        head_tokens = toks[1:4]
+    else:
+        # Legacy fixed-head parsing deliberately scans only the first three
+        # fields; command text must remain unable to forge class or limit.
+        head_tokens = toks[1:]
+    for tok in head_tokens:
         if tok.startswith("class=") and tok[6:] in ("ci", "lane"):
             cls = tok[6:]
         elif tok.startswith("limit="):
