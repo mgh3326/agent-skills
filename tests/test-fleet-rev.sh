@@ -929,6 +929,11 @@ pass "AC16 non-exec wrapper (child, sleep-&-wait, depth-3 and late-child forms) 
 # fallback all wedged). Invariant I-M2: the probe's worst case fits the
 # host timeout — the run ends at most 25s after sh start and the local
 # row does not read unreachable. Its own outer bound is --timeout 30.
+# Leftover tracking: each stub appends its own pid ($$, unchanged across
+# exec) to $AC17_PIDFILE, and the check trusts only that file — a listed
+# pid still alive with argv exactly 'sleep 7N' is a leftover. No host-wide
+# argv pattern: an unrelated 'sleep 7200' (seen on mbp as a watcher loop's
+# child) or a reused pid must not fail this test.
 reset_env
 S_MAIN="$(sha40 s-main)"; HK_MAIN="$(sha40 hk-main)"
 PW7="bb64078"; PW_MAIN="${PW7}$(sha40 pw-main | cut -c8-40)"
@@ -938,6 +943,41 @@ set_main panewire "$PW_MAIN";   set_main handoffkeep "$HK_MAIN"
 mk_home "$LOCAL_HOME"
 give_scopefuel "$LOCAL_HOME" "$S_MAIN"
 mkdir -p "$LOCAL_HOME/.agents/skills"
+AC17_PIDFILE="$TMP/ac17-pids"
+: >"$AC17_PIDFILE"
+ac17_argv() { # empty + rc 0 for dead or unreadable pids; ps races the reaper
+  ps -o args= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' || true
+}
+ac17_leftovers() { # one 'pid (argv)' line per recorded stub still wedged
+  local pid args
+  while IFS= read -r pid; do
+    [[ "$pid" =~ ^[0-9]+$ ]] || continue
+    kill -0 "$pid" 2>/dev/null || continue
+    args="$(ac17_argv "$pid")"
+    case "$args" in
+      "sleep 7"[1234]) printf '%s (%s)\n' "$pid" "$args" ;;
+    esac
+  done <"$AC17_PIDFILE"
+}
+ac17_assert_no_leftovers() {
+  local left; left="$(ac17_leftovers)"
+  [[ -z "$left" ]] || fail "AC17 left wedged tools behind: $left"
+}
+# The unrelated process that used to trip the unanchored pgrep: a 'sleep
+# 7200' that merely contains 'sleep 72' (the real one was audit-watch.sh's
+# child on mbp). Started by this test in its own session; stopped by exact
+# pid after an argv recheck, below and on exit.
+AC17_EXT_PID="$(python3 -c 'import subprocess; p = subprocess.Popen(["sleep", "7200"], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True); print(p.pid)')"
+ac17_stop_ext() {
+  [[ -n "${AC17_EXT_PID:-}" && "$(ac17_argv "$AC17_EXT_PID")" == "sleep 7200" ]] &&
+    kill -KILL "$AC17_EXT_PID" 2>/dev/null
+  [[ -n "${AC17_PLANTED:-}" && "$(ac17_argv "$AC17_PLANTED")" == "sleep 72" ]] &&
+    kill -KILL "$AC17_PLANTED" 2>/dev/null
+  return 0
+}
+trap 'ac17_stop_ext; rm -rf "$TMP"' EXIT
+[[ "$(ac17_argv "$AC17_EXT_PID")" == "sleep 7200" ]] ||
+  fail "AC17 unrelated-sleep fixture broken: pid $AC17_EXT_PID"
 # fake git: rev-parse answers just under the bound; status wedges.
 # trap '' TERM is inherited across exec, so every hang needs the KILL.
 cat >"$LOCAL_HOME/.local/bin/git" <<EOF
@@ -947,13 +987,15 @@ if [ "\$3" = "rev-parse" ]; then
   sleep 2
   printf '%s\n' "$AS_MAIN"
 else
+  printf '%s\n' "\$\$" >>"$AC17_PIDFILE"
   exec sleep 71
 fi
 EOF
 chmod +x "$LOCAL_HOME/.local/bin/git"
 for t in panewire handoffkeep go; do
   case "$t" in panewire) n=72 ;; handoffkeep) n=73 ;; *) n=74 ;; esac
-  printf '#!/bin/sh\ntrap "" TERM\nexec sleep %s\n' "$n" >"$LOCAL_HOME/.local/bin/$t"
+  printf '#!/bin/sh\ntrap "" TERM\nprintf "%%s\\n" "$$" >>"%s"\nexec sleep %s\n' \
+    "$AC17_PIDFILE" "$n" >"$LOCAL_HOME/.local/bin/$t"
   chmod +x "$LOCAL_HOME/.local/bin/$t"
 done
 SECONDS=0
@@ -974,8 +1016,28 @@ assert_cell local agent-skills "current"
   fail "AC17 handoffkeep detail: $(cell local handoffkeep)"
 [[ $RC -eq 3 ]] || fail "AC17 rc: want 3 got $RC :: $OUT"
 [[ $ELA -le 25 ]] || fail "AC17 probe worst case over the host window: ${ELA}s"
-pgrep -f 'sleep 7[1-4]' >/dev/null 2>&1 &&
-  fail "AC17 left wedged tools behind: $(pgrep -fl 'sleep 7[1-4]')"
+ac17_assert_no_leftovers
+# a recorded pid whose argv is not exactly 'sleep 7N' is not a leftover —
+# even one a 'sleep 7[1-4]' pattern would prefix-match, like the ext sleep
+printf '%s\n' "$AC17_EXT_PID" >>"$AC17_PIDFILE"
+ac17_assert_no_leftovers
+ac17_stop_ext
+AC17_EXT_PID=""
+# and it still fires on a real leftover: plant one recorded pid that stays
+# wedged; the failure must name it, then stop it by exact pid after an
+# argv recheck
+sleep 72 &
+AC17_PLANTED=$!
+printf '%s\n' "$AC17_PLANTED" >>"$AC17_PIDFILE"
+AC17_PLANT_MSG="$(ac17_assert_no_leftovers 2>&1)" || true
+[[ "$AC17_PLANT_MSG" == *"FAIL AC17 left wedged tools behind:"* &&
+   "$AC17_PLANT_MSG" == *"$AC17_PLANTED"* ]] ||
+  fail "AC17 check did not name a live stub pid: '$AC17_PLANT_MSG'"
+if [[ "$(ac17_argv "$AC17_PLANTED")" == "sleep 72" ]]; then
+  kill -KILL "$AC17_PLANTED" 2>/dev/null || true
+  wait "$AC17_PLANTED" 2>/dev/null || true
+fi
+AC17_PLANTED=""
 pass "AC17 all five calls wedged ignoring TERM: local reachable, run ${ELA}s (<= 25s)"
 
 # ================================================================ AC18 (1007 B3)
