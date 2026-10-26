@@ -575,4 +575,7 @@ expect_rc 0 status
 [[ "$before" == "$(mtime "$DB")" ]] || fail "read-only status wrote to a sidecar-less db"
 pass "⑧ status reads a db that has no -wal/-shm sidecar without writing to it"
 
+
+# hk 1991: isolated CLI orphan lifecycle and assertion mutants.
+python3 "$ROOT/tests/test_arbiter_orphans.py"
 echo 'PASS test-arbiter'

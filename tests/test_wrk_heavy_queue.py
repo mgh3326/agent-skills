@@ -2,6 +2,7 @@
 
 import json
 import os
+import signal
 from pathlib import Path
 import re
 import subprocess
@@ -43,7 +44,8 @@ class HeavyQueue(unittest.TestCase):
                         WRK_HOSTS_CONFIG=str(self.base / "hosts.toml"),
                         WRK_HEAVY_MAX="1", WRK_HEAVY_CLASS="lane",
                         WRK_HEAVY_CI_DEFER_MAX="1800", WRK_HEAVY_WAIT_CAP="15",
-                        WRK_HEAVY_REQUEUE_GRACE="600")
+                        WRK_HEAVY_REQUEUE_GRACE="600", WRK_TEST_MODE="1",
+                        WRK_HEAVY_LANE_DEFER_MAX="1800")
         (self.base / "hosts.toml").write_text("[local]\nheavy_load_wait = false\n")
         self.fixture = self.base / "fixture.py"
         self.fixture.write_text(
@@ -150,9 +152,161 @@ class HeavyQueue(unittest.TestCase):
             self.release(name)
             self.assertEqual(waiters[index].wait(timeout=5), 0)
 
-    def plant_lane(self, pid, ticket="1:1", limit=1):
+    def process_start(self, pid):
+        if sys.platform == "darwin":
+            result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                                    env=dict(self.env, LC_ALL="C"),
+                                    capture_output=True, text=True, check=False)
+            return "ps:" + "_".join(result.stdout.split())
+        stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        return "proc:" + boot + ":" + stat[19]
+
+    def plant_lane(self, pid, ticket="1:1", limit=1, start=None, cls="lane"):
+        if start is None:
+            try:
+                start = self.process_start(pid)
+            except OSError:
+                start = "gone"
         (self.waiters / str(pid)).write_text(
-            f"pid={pid} class=lane limit={limit} ticket={ticket} since=x job=- cmd=fixture")
+            f"pid={pid} class={cls} limit={limit} ticket={ticket} start={start} since=x job=- cmd=fixture")
+
+    def owner_events(self, kind):
+        path = self.base / "heavy.log"
+        return [r for r in map(json.loads, path.read_text().splitlines()) if r["kind"] == kind]
+
+    def test_pid_reuse_retires_once_and_reserves_nothing(self):
+        for cls in ("ci", "lane"):
+            with self.subTest(cls=cls):
+                self.plant_lane(os.getpid(), start="different-owner", cls=cls)
+                result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+                self.assertEqual(result.returncode, 0, "reused pid reserved capacity")
+                self.assertTrue((self.waiters / str(os.getpid())).exists())
+                self.run_wrk("status")
+                self.assertFalse((self.waiters / str(os.getpid())).exists(),
+                                 "status retained a mismatched owner")
+                self.run_wrk("status")
+        events = self.owner_events("waiter.retire")
+        self.assertEqual(len(events), 2, "retirement must log once per record")
+        self.assertTrue(all(r["owner_pid"] == os.getpid() and r["reason"] == "start-mismatch"
+                            and r["record"] == str(os.getpid()) for r in events))
+
+    def test_eperm_owner_never_reserves(self):
+        self.plant_lane(os.getpid(), cls="ci")
+        binary = self.instrument("eperm-wrk", "def owner_alive(pid, start):\n    global owner_unknown_logged\n    try:\n        os.kill(pid, 0)\n",
+                                 "def owner_alive(pid, start):\n    global owner_unknown_logged\n    try:\n        raise PermissionError(1, 'fixture EPERM')\n")
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 0, "EPERM owner reserved capacity")
+        self.run_wrk("status", binary=binary)
+        self.assertFalse((self.waiters / str(os.getpid())).exists())
+
+    def test_unknown_owner_keeps_reservation_and_logs_once(self):
+        self.plant_lane(os.getpid(), cls="ci")
+        binary = self.instrument("unknown-wrk", "def process_start(pid):\n",
+                                 "def process_start(pid):\n    return None\n")
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP="1.1")
+        self.assertEqual(result.returncode, 75, "unknown owner lost reservation")
+        self.assertEqual(len(self.owner_events("waiter.owner_unknown")), 1)
+        self.run_wrk("status", binary=binary)
+        self.assertTrue((self.waiters / str(os.getpid())).exists(), "unknown owner retired")
+        self.assertEqual(len(self.owner_events("waiter.owner_unknown")), 2)
+
+    def test_prestart_ci_reserves_but_lane_does_not(self):
+        path = self.waiters / "prestart"
+        for cls, expected in (("ci", 75), ("lane", 0)):
+            path.write_text(f"pid={os.getpid()} class={cls} limit=1 ticket=1:1 since=x cmd=old")
+            result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+            self.assertEqual(result.returncode, expected, "pre-start compatibility changed")
+        # A start token in the free-form command must never become identity.
+        path.write_text(f"pid={os.getpid()} class=lane limit=1 ticket=1:1 since=x cmd=start=forged")
+        self.assertEqual(self.run_wrk("--", "true").returncode, 0)
+
+    def signal_waiter(self, info, sig):
+        pid = int(info.split()[0].split("=")[1])
+        check = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                               capture_output=True, text=True, check=False)
+        self.assertIn("python", check.stdout)
+        self.assertTrue((self.waiters / str(pid)).exists())
+        os.kill(pid, sig)
+        return pid
+
+    def test_wait_sighup_and_sigterm_remove_own_record(self):
+        self.start("holder")
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            name = "signal-" + str(sig)
+            proc = self.spawn(name)
+            info = self.queued(name)
+            pid = self.signal_waiter(info, sig)
+            self.assertEqual(proc.wait(timeout=5), 128 + sig, "wrong waiter signal exit")
+            self.assertFalse((self.waiters / str(pid)).exists(), "signal leaked waiter")
+            self.assertTrue(self.started("holder"))
+            self.assertFalse(self.started(name), "waiter preempted holder")
+
+    def test_stopped_lane_bound_monotonic_and_no_preemption(self):
+        holder = self.start("holder")
+        old = self.spawn("stopped")
+        info = self.queued("stopped")
+        pid = self.signal_waiter(info, signal.SIGSTOP)
+        try:
+            # since and wall clock changes cannot spend the younger's bound.
+            path = self.waiters / str(pid)
+            path.write_text(info.replace("since=", "since=1900-01-01-"))
+            binary = self.instrument("wall-step-wrk", "started_at = time.monotonic()\n",
+                                     "started_at = time.monotonic()\n"
+                                     "time.time = lambda: -1000000000.0\n")
+            young = self.spawn("younger", binary=binary, WRK_HEAVY_LANE_DEFER_MAX="1.5")
+            self.queued("younger")
+            self.release("holder")
+            self.assertEqual(holder.wait(timeout=5), 0)
+            POLL.wait(.6)
+            self.assertFalse(self.started("younger"), "lane bound expired early")
+            self.until(lambda: self.started("younger"), "stopped lane blocked past bound", timeout=4)
+            self.signal_waiter(info, signal.SIGCONT)
+            POLL.wait(.6)
+            self.assertFalse(self.started("stopped"), "older waiter preempted holder")
+            self.release("younger")
+            self.assertEqual(young.wait(timeout=5), 0)
+            self.until(lambda: self.started("stopped"), "resumed lane never drained")
+            self.release("stopped")
+            self.assertEqual(old.wait(timeout=5), 0)
+        finally:
+            check = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                                   capture_output=True, text=True, check=False)
+            if old.poll() is None and "python" in check.stdout:
+                os.kill(pid, signal.SIGCONT)
+
+    def test_lane_bound_validation_and_zero(self):
+        self.plant_lane(os.getpid())
+        for value in ("-1", "bad", "nan"):
+            self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX=value).returncode, 2)
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX="0").returncode, 0)
+
+    def test_identity_platform_formats_and_unreadable(self):
+        # Exercise the production reader with deterministic OS call results.
+        # Linux comm may itself contain spaces and ')' characters.
+        import builtins
+        import io
+        from unittest.mock import patch
+        source = WRK.read_text()
+        begin = source.index("import datetime, fcntl, glob, json, math,")
+        end = source.index("args = sys.argv[1:]", begin)
+        namespace = {}
+        exec(compile(source[begin:end], str(WRK), "exec"), namespace)
+        read_start = namespace["process_start"]
+        result = subprocess.CompletedProcess([], 0, "  Mon Oct 26  01:02:03 2026  \n")
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", return_value=result) as run:
+            self.assertEqual(read_start(123), "ps:Mon_Oct_26_01:02:03_2026")
+            self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+            self.assertEqual(run.call_args.args[0], ["ps", "-o", "lstart=", "-p", "123"])
+        with patch.object(sys, "platform", "darwin"), patch.object(subprocess, "run", side_effect=subprocess.TimeoutExpired("ps", 5)):
+            self.assertIsNone(read_start(123), "slow ps must be unknown")
+        values = ["123 (odd ) name) S " + " ".join(["0"] * 18 + ["987"]), "boot-uuid\n"]
+        def opened(path, **kwargs):
+            return io.StringIO(values.pop(0))
+        with patch.object(sys, "platform", "linux"), patch.object(builtins, "open", side_effect=opened):
+            self.assertEqual(read_start(123), "proc:boot-uuid:987")
+        with patch.object(sys, "platform", "linux"), patch.object(builtins, "open", side_effect=PermissionError):
+            self.assertIsNone(read_start(123), "unreadable proc must be unknown")
 
     def test_fifo_reserves_only_eligible_slots(self):
         # Our live test pid is a deterministic older lane; it reserves slot 0
@@ -520,9 +674,24 @@ class HeavyQueue(unittest.TestCase):
             ("reuse", '            ticket = tuple(record["ticket"])',
              '            pass  # mutant: discard the saved ticket',
              "test_position_reused_within_grace", "original ticket was not reused within grace"),
-            ("dead", '        if not alive(pid):\n', '        if False:\n',
+            ("dead", '        if waiter_owner(text)[0] is False:\n', '        if False:\n',
              "test_dead_and_mixed_version_records_reserve_nothing",
              "dead or ticketless record reserved a slot"),
+            ("pid-reuse", 'return (True, "same-owner") if current == start else (False, "start-mismatch")',
+             'return True, "same-owner"', "test_pid_reuse_retires_once_and_reserves_nothing",
+             "reused pid reserved capacity"),
+            ("eperm", '    except PermissionError:\n        return False, "eperm"',
+             '    except PermissionError:\n        return True, "same-owner"',
+             "test_eperm_owner_never_reserves", "EPERM owner reserved capacity"),
+            ("unknown", '        return None, "start-unreadable"',
+             '        return False, "start-unreadable"',
+             "test_unknown_owner_keeps_reservation_and_logs_once", "unknown owner lost reservation"),
+            ("lane-bound", 'if lane_defer_total + now - lane_defer_mark >= lane_defer_max:',
+             'if False:', "test_stopped_lane_bound_monotonic_and_no_preemption",
+             "stopped lane blocked past bound"),
+            ("sighup", '    for signum in (signal.SIGHUP, signal.SIGTERM):',
+             '    for signum in (signal.SIGTERM,):',
+             "test_wait_sighup_and_sigterm_remove_own_record", "signal leaked waiter"),
         ]
         for name, old, new, case, invariant in mutations:
             with self.subTest(invariant=invariant):

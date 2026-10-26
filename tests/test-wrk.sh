@@ -10146,6 +10146,31 @@ assert d["recent_event_kinds"].count("job.reclaim") == 1, d
 '
 echo "PASS ROB-1326 AC2 released duplicate reclaimed then spawned: $released_dup_out"
 
+# hk 1991: the power-off shape must also recover through wrk's actual
+# duplicate/reclaim boundary, without the --job-dup-ok override. The existing
+# suite sentinel registry owns this spawn and stops it before TMP removal.
+(
+  export XDG_DATA_HOME="$TMP/orphan-1991-data"
+  export ARBITER_INBOX_ROOT="$TMP/orphan-1991-inbox"
+  export TEST_ARBITER_BIN="$ARBITER"
+  "$ARBITER" claim --job orphan-1991 --agent-label gone-1991 --lane fixture --t T2 >/dev/null
+  "$SCOPEFUEL" gate -m codex-luna-max >"$TMP/orphan-1991-gate"
+  "$ARBITER" lease --job orphan-1991 --kind quota_pool --profile codex-luna-max \
+    --gate-output "$TMP/orphan-1991-gate" >/dev/null
+  printf '%s\n' '{"result":{"agents":[]}}' >"$TMP/orphan-1991-agents.json"
+  "$ARBITER" gc --herdr-agent-list "$TMP/orphan-1991-agents.json" >/dev/null
+  orphan_spawn="$(spawn_base codex-luna --job orphan-1991 --t T2 2>&1)"
+  grep -q '^OK ' <<<"$orphan_spawn" || fail "hk1991 respawn failed: $orphan_spawn"
+  "$ARBITER" job-get --job orphan-1991 --json | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+assert d["state"] == "leased", d
+assert d["recent_event_kinds"].count("job.orphan_release") == 1, d
+assert d["recent_event_kinds"].count("job.reclaim") == 1, d
+'
+)
+echo "PASS hk1991 orphan-gc-wrk-respawn-without-override"
+
 # AC3: once a live arbiter reported duplicate, an unreadable state is itself a
 # fail-closed condition.  The proxy fails only the actual lookup, not --help.
 arb claim --job idem-unknown --agent-label unknown-owner --lane unknown-lane --t T1 >/dev/null
@@ -15632,4 +15657,12 @@ bash "$ROOT/tests/test-shellcheck-capped.sh"
 bash "$ROOT/tests/test-devin-gate-profile.sh"
 # hk 1990: preserve durable operator refs at the actual apply_catalog call site.
 python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
+
+# hk 1991: the owner decision must have exactly one review anchor.
+python3 - "$WRK" <<'PY'
+import sys
+source = open(sys.argv[1], encoding="utf-8").read()
+for anchor in ("# hk1991-owner-alive",):
+    assert source.count(anchor) == 1, (anchor, source.count(anchor))
+PY
 echo 'PASS test-wrk'
