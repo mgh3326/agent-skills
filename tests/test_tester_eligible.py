@@ -1125,7 +1125,8 @@ class EligibilityFixtures(unittest.TestCase):
 
     def test_e6_builder_grades_conflict_and_grok_model_must_match_wrk(self) -> None:
         variants = ("builder-opus-low", "builder-opus-medium", "builder-sonnet-xhigh", "builder-sonnet-max",
-                    "builder-sol-high", "builder-sol-max", "builder-sol-medium", "builder-luna-max",
+                    "builder-sol-high", "builder-sol-medium", "builder-sol-xhigh",
+                    "builder-luna-max", "builder-luna-high", "builder-haiku-medium",
                     "builder-kimi-high", "builder-kimi-max",
                     "builder-grok-low", "builder-grok-medium", "builder-grok-xhigh")
         for alias in variants:
@@ -1142,6 +1143,34 @@ class EligibilityFixtures(unittest.TestCase):
         changed["profiles"]["codex-sol"]["family"] = "xai"
         _, check = common.resolve_profile("codex-sol", changed, actual_effort="max", role="tester")
         self.assertEqual((check["status"], check["reason_code"]), ("UNVERIFIED", "PROFILE_FAMILY_CONFLICT"))
+
+    def test_builder_sol_max_accepts_the_s_plus_t3_task(self) -> None:
+        # hk 2043 item 3: builder-sol-max is the S+ gate=default normal pinned
+        # spelling. Its policy row must cover T3 and carry the placed S+ grade,
+        # or tester-eligible answers contributors UNVERIFIED
+        # PROFILE_GRADE_CONFLICT and never accepts an S+ T3 task built by it.
+        resolved, check = common.resolve_profile(
+            "builder-sol-max", self.policy, actual_effort="max", role="builder")
+        self.assertEqual((check["status"], check["reason_code"]), ("PASS", "PROFILE_RESOLVED"))
+        self.assertEqual(resolved["surfaces"], ["T1", "T2", "T3"])
+        self.assertEqual(resolved["grade"], "S+")
+        evidence = self.evidence(self.make_head("live/guard.py"), declared_t="T3",
+            required_grade="S+", implementation_grade="S+",
+            contributors=[{"profile": "builder-sol-max", "model": "gpt-6.1-sol",
+                           "effort": "max", "role": "builder", "kind": "initial",
+                           "session": "builder-session", "worktree": "/tmp/builder"}],
+            tester={"planned_profile": "opus", "planned_effort": "high"})
+        checks = self.check(evidence)
+        self.assert_case(checks, "tier", "PASS", "T_MEETS_FLOOR")
+        self.assert_case(checks, "contributors", "PASS", "CONTRIBUTOR_UNION_RESOLVED")
+        self.assert_case(checks, "surface_permission", "PASS", "PROFILE_SURFACE_ALLOWED")
+        self.assert_case(checks, "independence", "PASS", "CROSS_FAMILY")
+        self.assert_case(checks, "grade", "PASS", "GRADE_SUFFICIENT")
+        # merge-precheck on a T3 task demands every eligibility check be PASS or
+        # N/A (director/merge_precheck.py ELIGIBILITY_NOT_PASS), so assert that
+        # whole predicate, not just the five checks named above.
+        self.assertEqual({name: check["reason_code"] for name, check in checks.items()
+                          if check["status"] not in ("PASS", "N/A")}, {})
 
     def test_every_terra_profile_is_denied_to_testers(self) -> None:
         barred = ("codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",
