@@ -7218,6 +7218,7 @@ echo "PASS hk1895 failed-pane screen capture and WRK_KEEP_FAILED_PANE"
 t2011_term_case() {
   local file="$1" start rc=0
   start="$SECONDS"
+  # shellcheck disable=SC1090 # FILE is the run_bounded extract from bin/wrk
   ( . "$file"; run_bounded 1 sh -c 'trap "" TERM; sleep 30' ) >/dev/null 2>&1 || rc=$?
   printf '%s %s\n' "$rc" "$((SECONDS - start))"
 }
@@ -7225,8 +7226,9 @@ T2011_RB="$TMP/run-bounded-2011.sh"
 sed -n '/^run_bounded() {/,/^}/p' "$WRK" >"$T2011_RB"
 grep -q '^run_bounded() {' "$T2011_RB" || fail "hk2011: run_bounded is not in bin/wrk"
 read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$T2011_RB")"
-[[ "$t2011_rc" -eq 124 || "$t2011_rc" -eq 137 ]] && (( t2011_elapsed <= 6 )) ||
+if [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )); then
   fail "hk2011: run_bounded 1 left a TERM-ignoring child running (rc=$t2011_rc, ${t2011_elapsed}s; bound 1s plus kill grace)"
+fi
 # The same case with only gtimeout on PATH (a shim that execs the real timeout),
 # so the gtimeout branch is the one that runs. macOS has no timeout binary and
 # uses the python fallback, so the case is skipped there.
@@ -7239,8 +7241,9 @@ if T2011_REAL_TIMEOUT="$(command -v timeout)"; then
   ln -s "$(command -v sh)" "$T2011_GT/sh"
   ln -s "$(command -v sleep)" "$T2011_GT/sleep"
   read -r t2011_rc t2011_elapsed <<<"$(PATH="$T2011_GT" t2011_term_case "$T2011_RB")"
-  [[ "$t2011_rc" -eq 124 || "$t2011_rc" -eq 137 ]] && (( t2011_elapsed <= 6 )) ||
+  if [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )); then
     fail "hk2011: gtimeout path left a TERM-ignoring child running (rc=$t2011_rc, ${t2011_elapsed}s)"
+  fi
 else
   echo "SKIP hk2011 gtimeout branch: no timeout binary on this host"
 fi
@@ -7342,19 +7345,23 @@ rm -f "$TMP/herdr.log"
 echo "PASS hk2011 kept-pane hint names herdr pane close"
 
 # Mutants: each must make its named case fail.
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
 devin_trust_mutant nokill '    timeout -k "$kill_grace" "$secs" "$@"' '    timeout "$secs" "$@"'
 read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$TMP/mut-wrk-nokill" 2>/dev/null)" || true
 [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )) ||
   fail "hk2011 mutant nokill (no -k) must fail the TERM-ignoring case"
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
 devin_trust_mutant nonexcl 'set -C; : >"$screen"' ': >"$screen"'
 t2011_capture_pair mut-nonexcl "$TMP/mut-wrk-nonexcl" &&
   fail "hk2011 mutant nonexcl (non-exclusive create) must fail the concurrent case"
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
 devin_trust_mutant noforward '  [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")' '  :'
 WRK_UNDER_TEST="$TMP/mut-wrk-noforward" t2011_fwd_spawn fwd-mut 1 >/dev/null 2>&1 || true
 grep -q 'HERDR_SESSION=worker .*WRK_KEEP_FAILED_PANE=1 wrk spawn' "$T2011_FWD/ssh.log" &&
   fail "hk2011 mutant noforward (no forward) must fail the forwarding case"
 # A capture that prints no warning for a failed read must fail the
 # exactly-one-warning assertion above.
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
 devin_trust_mutant nowarn 'warn "failed-pane screen capture failed for pane $PANE"' ': "failed-pane screen capture failed for pane $PANE"'
 t2011_rf_out="$(WRK_UNDER_TEST="$TMP/mut-wrk-nowarn" WRK_FIXTURE_PANE_READ200_FAIL=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)" || true
 [[ "$(grep -c 'failed-pane screen capture failed' <<<"$t2011_rf_out")" -eq 1 ]] &&
