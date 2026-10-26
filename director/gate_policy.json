@@ -159,7 +159,7 @@
     "bin/arbiter": "ac2349402cbbd066bd1bdd18b6de5e57e42c902b339cc24c8a9b35d38a49be97",
     "bin/wrk": "34f28b03533b71d386ddb575ff3ef3b830797493ab09ea3fe4f741e5d12939a8",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
-    "builder/SKILL.md": "c01ec964313726e4cd800d1879a212e3739ba61fac279928f842eb58e9e5b91f",
+    "builder/SKILL.md": "470afcec951213adda05926ddc76019535446a6b7166d268d1854167de670372",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
     "director/SKILL.md": "129ecf20bfaf6a132ac4d77c805f309d047aa35c5aaa28ad1f078da3409bc264",
     "director/bin/tester-eligible": "ae323c7defbb8eda295ef9975efd1fcfe054751c0d0c47c7d65a1ec12193159b",
