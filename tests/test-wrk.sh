@@ -290,6 +290,12 @@ for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh buil
   builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
 done
+# hk 2043: builder-sol-xhigh is a normal pinned spelling (no E6 marker),
+# builder-luna-high is the luna family's high E6 rung and builder-haiku-medium
+# is the haiku family's medium E6 rung.
+for pinned_profile in builder-sol-xhigh builder-luna-high builder-haiku-medium; do
+  grep -qx "$pinned_profile" <<<"$profiles_out" || fail "wrk profiles lost $pinned_profile"
+done
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
@@ -7169,7 +7175,7 @@ set -e
 if grep -q '^pane close ' "$TMP/herdr.log"; then
   fail "WRK_KEEP_FAILED_PANE=1 still closed the pane"
 fi
-grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr tab close w:t1' <<<"$t1895_keep_out" ||
+grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close w:p1' <<<"$t1895_keep_out" ||
   fail "1895 keep case lost the kept-pane line: $t1895_keep_out"
 
 # Any other value behaves as unset: the pane is closed.
@@ -7198,7 +7204,7 @@ set -e
   fail "1895 read-fail case expected rc=1, got $t1895_readfail_rc: $t1895_readfail_out"
 grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
   fail "1895 read-fail case must still close the pane"
-[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -le 1 ]] ||
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -eq 1 ]] ||
   fail "1895 read-fail case printed more than one warn line: $t1895_readfail_out"
 if grep -q 'saved failed pane screen' <<<"$t1895_readfail_out"; then
   fail "1895 read-fail case must not claim a saved screen"
@@ -7221,6 +7227,209 @@ done
 grep -q 'fixture welcome screen' "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" ||
   fail "1895 first screen file was overwritten"
 echo "PASS hk1895 failed-pane screen capture and WRK_KEEP_FAILED_PANE"
+
+# ---------------------------------------------------------------------------
+# hk 2011: run_bounded kills a TERM-ignoring child, the failed-pane capture
+# name is exclusive under a race, WRK_KEEP_FAILED_PANE reaches a remote leg,
+# and the kept-pane hint names herdr pane close.
+# ---------------------------------------------------------------------------
+# t2011_term_case FILE — run_bounded 1 on a child that traps TERM and sleeps
+# 30 s, extracted from FILE. Prints "RC ELAPSED_SECONDS". Main holds the whole
+# 30 s; the bound is secs plus the kill grace, so 6 s is a generous ceiling.
+t2011_term_case() {
+  local file="$1" start rc=0
+  start="$SECONDS"
+  # shellcheck disable=SC1090 # FILE is the run_bounded extract from bin/wrk
+  ( . "$file"; run_bounded 1 sh -c 'trap "" TERM; sleep 30' ) >/dev/null 2>&1 || rc=$?
+  printf '%s %s\n' "$rc" "$((SECONDS - start))"
+}
+T2011_RB="$TMP/run-bounded-2011.sh"
+sed -n '/^run_bounded() {/,/^}/p' "$WRK" >"$T2011_RB"
+grep -q '^run_bounded() {' "$T2011_RB" || fail "hk2011: run_bounded is not in bin/wrk"
+read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$T2011_RB")"
+if [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )); then
+  fail "hk2011: run_bounded 1 left a TERM-ignoring child running (rc=$t2011_rc, ${t2011_elapsed}s; bound 1s plus kill grace)"
+fi
+# The same case with only gtimeout on PATH (a shim that execs the real timeout),
+# so the gtimeout branch is the one that runs. macOS has no timeout binary and
+# uses the python fallback, so the case is skipped there.
+if T2011_REAL_TIMEOUT="$(command -v timeout)"; then
+  T2011_GT="$TMP/gtimeout-only"
+  rm -rf "$T2011_GT"
+  mkdir -p "$T2011_GT"
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$T2011_REAL_TIMEOUT" >"$T2011_GT/gtimeout"
+  chmod +x "$T2011_GT/gtimeout"
+  ln -s "$(command -v sh)" "$T2011_GT/sh"
+  ln -s "$(command -v sleep)" "$T2011_GT/sleep"
+  read -r t2011_rc t2011_elapsed <<<"$(PATH="$T2011_GT" t2011_term_case "$T2011_RB")"
+  if [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )); then
+    fail "hk2011: gtimeout path left a TERM-ignoring child running (rc=$t2011_rc, ${t2011_elapsed}s)"
+  fi
+else
+  echo "SKIP hk2011 gtimeout branch: no timeout binary on this host"
+fi
+echo "PASS hk2011 run_bounded bound holds for a TERM-ignoring child"
+
+# t2011_capture_pair JOB WRK — two failed-pane captures of one job. The first
+# parks inside the name-pick window (capture-name seam); the second runs to
+# completion meanwhile. Returns 0 only when both screens survive as two files.
+t2011_capture_pair() {
+  local job="$1" bin="$2" pause dir a_pid a_rc b_rc i
+  pause="$TMP/pause-$job"
+  rm -rf "$pause"
+  mkdir -p "$pause"
+  dir="$TMP/inbox/$job"
+  rm -rf "$dir"
+  set +e
+  WRK_UNDER_TEST="$bin" TEST_FIXTURE_SCENARIO=start-not-ready \
+    WRK_TEST_PAUSE_AT=capture-name WRK_TEST_PAUSE_DIR="$pause" \
+    spawn_base opus --job "$job" --job-dup-ok >"$pause/a.out" 2>&1 &
+  a_pid=$!
+  own "$a_pid"
+  i=0
+  while [[ ! -e "$pause/paused" && "$i" -lt 200 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [[ ! -e "$pause/paused" ]]; then
+    : >"$pause/release"
+    wait "$a_pid"
+    set -e
+    return 1
+  fi
+  WRK_UNDER_TEST="$bin" TEST_FIXTURE_SCENARIO=start-not-ready \
+    spawn_base opus --job "$job" --job-dup-ok >"$pause/b.out" 2>&1
+  b_rc=$?
+  : >"$pause/release"
+  wait "$a_pid"
+  a_rc=$?
+  set -e
+  [[ "$a_rc" -eq 1 && "$b_rc" -eq 1 ]] || return 1
+  [[ -f "$dir/spawn-failure-screen.txt" && -f "$dir/spawn-failure-screen-2.txt" ]] || return 1
+  grep -q 'fixture welcome screen' "$dir/spawn-failure-screen.txt" || return 1
+  grep -q 'fixture welcome screen' "$dir/spawn-failure-screen-2.txt"
+}
+t2011_capture_pair concurrent-capture "$WRK" ||
+  fail "hk2011: two failed-pane captures of one job collided on spawn-failure-screen.txt"
+echo "PASS hk2011 concurrent failed-pane captures keep two files"
+
+# hk 2011 forwarding: a spill-over spawn carries WRK_KEEP_FAILED_PANE to the
+# remote leg (only when set), next to HERDR_SESSION.
+T2011_FWD="$TMP/fwd-2011"
+rm -rf "$T2011_FWD"
+mkdir -p "$T2011_FWD"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://example.invalid"' 'hub_token_env = "/tmp/example-token.env"' 'hub_cf_env = "/tmp/example-cf.env"' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >"$T2011_FWD/hosts.toml"
+printf '%s\n' '0.20 0.10 0.10 1/1 1' >"$T2011_FWD/loadavg"
+# t2011_fwd_spawn JOB [KEEP] — a spawn that spills to the desktop host.
+t2011_fwd_spawn() {
+  local job="$1" keep="${2:-}" task keep_env=()
+  [[ -z "$keep" ]] || keep_env=(WRK_KEEP_FAILED_PANE="$keep")
+  task="$(mint_task)"
+  : >"$T2011_FWD/ssh.log"
+  env -u WRK_KEEP_FAILED_PANE ${keep_env[@]+"${keep_env[@]}"} \
+    WRK_TEST_MODE=1 ARBITER_INBOX_ROOT="$TMP/inbox" XDG_DATA_HOME="$TMP/xdg" ARBITER_BIN="$ARBITER" \
+    HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$SCOPEFUEL" \
+    WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="${T2011_HOSTS:-$T2011_FWD/hosts.toml}" WRK_PROC_LOADAVG="$T2011_FWD/loadavg" \
+    WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$T2011_FWD/herdr.log" WRK_SPILLOVER_LOG="$T2011_FWD/spill.log" \
+    PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
+    WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$T2011_FWD/ssh.log" WRK_SCP_LOG="$T2011_FWD/scp.log" \
+    WRK_WAKE_LOG="$T2011_FWD/wake.log" WRK_PLACE_LOG="$T2011_FWD/place.log" \
+    WRK_SPILLOVER_CANDIDATES_LOG="$T2011_FWD/cand.log" WRK_COMPLETION_INTERVAL_S=3600 \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -l fixture -w w --t T1 \
+    --job "$job" --task "$task"
+}
+t2011_fwd_spawn fwd-keep 1 >"$T2011_FWD/keep.out" 2>&1 ||
+  fail "hk2011 forward: spill-over spawn failed: $(cat "$T2011_FWD/keep.out")"
+grep -q '^OK pane=desktop:p7 host=desktop ' "$T2011_FWD/keep.out" ||
+  fail "hk2011 forward: spawn did not land on the desktop host: $(cat "$T2011_FWD/keep.out")"
+grep -q 'HERDR_SESSION=worker .*WRK_KEEP_FAILED_PANE=1 wrk spawn' "$T2011_FWD/ssh.log" ||
+  fail "hk2011: WRK_KEEP_FAILED_PANE=1 was not forwarded to the remote leg: $(cat "$T2011_FWD/ssh.log")"
+t2011_fwd_spawn fwd-plain >"$T2011_FWD/plain.out" 2>&1 ||
+  fail "hk2011 forward: unset-variable spawn failed: $(cat "$T2011_FWD/plain.out")"
+if grep -q 'WRK_KEEP_FAILED_PANE' "$T2011_FWD/ssh.log"; then
+  fail "hk2011: an unset WRK_KEEP_FAILED_PANE must not be forwarded: $(cat "$T2011_FWD/ssh.log")"
+fi
+echo "PASS hk2011 WRK_KEEP_FAILED_PANE forwards to the remote leg"
+
+# hk 2011 kept pane: a remote leg that kept its failed pane (WRK_KEEP_FAILED_PANE
+# is forwarded) ends the auto round at that host. The second candidate and the
+# local fallback must never spawn: one pane, one remote spawn leg.
+T2011_TWO="$T2011_FWD/hosts-two.toml"
+cp "$T2011_FWD/hosts.toml" "$T2011_TWO"
+printf '%s\n' '' '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >>"$T2011_TWO"
+set +e
+t2011_kept_out="$(T2011_HOSTS="$T2011_TWO" WRK_SSH_SCENARIO_DESKTOP=remote-die-stderr WRK_REMOTE_RC=1 \
+  WRK_REMOTE_STDERR_LINE='wrk: kept failed pane desktop:p7 (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close desktop:p7' \
+  t2011_fwd_spawn fwd-kept 1 2>&1)"
+t2011_kept_rc=$?
+set -e
+[[ "$t2011_kept_rc" -ne 0 ]] ||
+  fail "hk2011 kept pane: the remote failure must fail the auto spawn: $t2011_kept_out"
+[[ "$(grep -c 'kept failed pane' <<<"$t2011_kept_out")" -eq 1 ]] ||
+  fail "hk2011 kept pane: the kept pane must be printed exactly once: $t2011_kept_out"
+grep -q "left failed pane desktop:p7 open" <<<"$t2011_kept_out" ||
+  fail "hk2011 kept pane: the round must say the pane is still open: $t2011_kept_out"
+[[ "$(grep -c '^OK pane=' <<<"$t2011_kept_out")" -eq 0 ]] ||
+  fail "hk2011 kept pane: no candidate may land a second pane: $t2011_kept_out"
+[[ "$(grep -c 'wrk spawn' "$T2011_FWD/ssh.log")" -eq 1 ]] ||
+  fail "hk2011 kept pane: exactly one remote spawn leg is allowed: $(cat "$T2011_FWD/ssh.log")"
+if grep -q 'mac-work' "$T2011_FWD/ssh.log"; then
+  fail "hk2011 kept pane: the second candidate must not be tried: $(cat "$T2011_FWD/ssh.log")"
+fi
+echo "PASS hk2011 kept remote pane ends the auto round: one pane, no second candidate"
+
+# The kept-pane hint names the pane to close (herdr pane close PANE), never a tab.
+T2011_HINT="$(WRK_KEEP_FAILED_PANE=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)" || true
+grep -q 'close it with herdr pane close w:p1' <<<"$T2011_HINT" ||
+  fail "hk2011: kept-pane hint must name herdr pane close w:p1: $T2011_HINT"
+if grep -q 'herdr tab close' <<<"$T2011_HINT"; then
+  fail "hk2011: kept-pane hint must not name herdr tab close"
+fi
+rm -f "$TMP/herdr.log"
+echo "PASS hk2011 kept-pane hint names herdr pane close"
+
+# Mutants: each must make its named case fail.
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+# nokill needs timeout or gtimeout on PATH: the python fallback kills on its own
+# (SIGKILL), so the mutant cannot differ there and the check is skipped. The
+# extract is the mutant's run_bounded block only; the whole mutant file ends in
+# a dispatcher that exits 2 before run_bounded exists.
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  devin_trust_mutant nokill '    timeout -k "$kill_grace" "$secs" "$@"' '    timeout "$secs" "$@"'
+  sed -n '/^run_bounded() {/,/^}/p' "$TMP/mut-wrk-nokill" >"$TMP/run-bounded-nokill.sh"
+  [[ -s "$TMP/run-bounded-nokill.sh" ]] ||
+    fail "hk2011 mutant nokill: run_bounded is not in the mutant copy"
+  read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$TMP/run-bounded-nokill.sh")"
+  # RED for the right reason: the TERM-ignoring child outlived the bound (rc 124
+  # after the full sleep), not a non-124 rc from a broken extract.
+  if [[ "$t2011_rc" -ne 124 ]] || (( t2011_elapsed <= 6 )); then
+    fail "hk2011 mutant nokill (no -k) must go RED on the timing: rc=$t2011_rc elapsed=${t2011_elapsed}s"
+  fi
+else
+  echo "SKIP hk2011 mutant nokill: no timeout or gtimeout on this host"
+fi
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant nonexcl 'set -C; : >"$screen"' ': >"$screen"'
+t2011_capture_pair mut-nonexcl "$TMP/mut-wrk-nonexcl" &&
+  fail "hk2011 mutant nonexcl (non-exclusive create) must fail the concurrent case"
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant noforward '  [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")' '  :'
+WRK_UNDER_TEST="$TMP/mut-wrk-noforward" t2011_fwd_spawn fwd-mut 1 >/dev/null 2>&1 || true
+grep -q 'HERDR_SESSION=worker .*WRK_KEEP_FAILED_PANE=1 wrk spawn' "$T2011_FWD/ssh.log" &&
+  fail "hk2011 mutant noforward (no forward) must fail the forwarding case"
+# A capture that prints no warning for a failed read must fail the
+# exactly-one-warning assertion above.
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant nowarn 'warn "failed-pane screen capture failed for pane $PANE"' ': "failed-pane screen capture failed for pane $PANE"'
+t2011_rf_out="$(WRK_UNDER_TEST="$TMP/mut-wrk-nowarn" WRK_FIXTURE_PANE_READ200_FAIL=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)" || true
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t2011_rf_out")" -eq 1 ]] &&
+  fail "hk2011 mutant nowarn (zero warnings) must fail the exactly-one-warning case"
+echo "PASS hk2011 mutants applied"
 
 
 # #609: an accepted `agent start` whose binary never reaches the pane
@@ -9981,6 +10190,11 @@ launch_profile_case builder-sonnet builder-sonnet-canon 'sonnet@xhigh' --role bu
 launch_profile_case builder-sonnet builder-sonnet-canon-max 'sonnet@max' --role builder --lane builder-sonnet-canon-max-lane --parent parent-lane --effort max
 launch_profile_case builder-sonnet builder-sonnet-canon-high 'sonnet@high' --role builder --lane builder-sonnet-canon-high-lane --parent parent-lane --effort high
 launch_profile_case codex-astra codex-astra-canon 'codex-astra@xhigh'
+# hk 2043: the normal pinned sol spelling records its canonical rung — no E6
+# marker, but the gate judges codex-sol@xhigh (an escalation rung, so the
+# fixture gate takes the operator REF).
+launch_profile_case builder-sol-xhigh builder-sol-xhigh-canon 'codex-sol@xhigh' \
+  --role builder --lane builder-sol-xhigh-lane --parent parent-lane --operator-request hk:task/2043
 # Other pools keep their literal spelling@effort — no other pool's record moves.
 launch_profile_case devin-swe2 devin-launch-literal 'devin-swe2'
 launch_profile_case builder-opus builder-opus-launch-literal 'builder-opus@high' --role builder --lane builder-opus-lane --parent parent-lane
@@ -10765,11 +10979,11 @@ expect_exit 2 spawn_base codex-luna --role worker --lane worker-lane --parent pa
 echo "PASS builder-parent-and-director-lane-guards"
 
 for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
-  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
+  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-xhigh builder-sol-max builder-sol-medium \
   builder-luna-max builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -10796,7 +11010,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -10902,12 +11116,17 @@ sol61_case codex-sol max
 sol61_case codex-max max
 sol61_case builder-sol high --role builder --lane sol61-builder-lane --parent parent-lane
 sol61_case captain-sol high --role builder --lane sol61-captain-lane --parent parent-lane
-# The E6 builder rungs are switched spellings too (builder-sol-max included
-# since hk 1864 opened the max builder seat).
+# The E6 builder rungs are switched spellings too. hk 2043 made
+# builder-sol-max a normal pinned spelling, so it is spawned here with no
+# SCOPEFUEL_E6_ARM marker (its own case is below).
 SCOPEFUEL_E6_ARM=codex-sol@high sol61_case builder-sol-high high --role builder --lane sol61-e6h-lane --parent parent-lane
-SCOPEFUEL_E6_ARM=codex-sol@max sol61_case builder-sol-max max --role builder --lane sol61-e6x-lane --parent parent-lane
+sol61_case builder-sol-max max --role builder --lane sol61-e6x-lane --parent parent-lane
 SCOPEFUEL_E6_ARM=codex-sol@medium sol61_case builder-sol-medium medium --role builder --lane sol61-e6m-lane --parent parent-lane
 SCOPEFUEL_E6_ARM=codex-sol@low sol61_case builder-sol-low low --role builder --lane sol61-e6l-lane --parent parent-lane
+# hk 2043: builder-sol-xhigh is the normal pinned xhigh spelling — same canon
+# model id, xhigh rung, no E6 marker (the S+ escalation row still takes a REF).
+sol61_case builder-sol-xhigh xhigh --role builder --lane sol61-xhigh-lane --parent parent-lane \
+  --operator-request hk:task/2043
 echo "PASS 1026-AC1-switched-spellings-carry-gpt-6.1-sol"
 
 # AC2 — the rollback spellings pin the literal gpt-6-sol even though the fake
@@ -11525,6 +11744,14 @@ e6_builder_case builder-sonnet-medium sonnet     medium '--model sonnet --danger
 e6_builder_case builder-haiku-low    haiku      low    '--model haiku --dangerously-skip-permissions --effort low'
 e6_builder_case builder-luna-low     codex-luna low    '--yolo -m gpt-5.6-luna -c model_reasoning_effort=low'
 e6_builder_case builder-luna-medium  codex-luna medium '--yolo -m gpt-6-luna -c model_reasoning_effort=medium'
+# hk 2043: builder-luna-high is the luna family's high E6 rung — the same pin
+# rule and marker as the low/medium pair (director-1, 2026-10-26, for the
+# r1026luna L-A+ arm).
+e6_builder_case builder-luna-high    codex-luna high   '--yolo -m gpt-6-luna -c model_reasoning_effort=high'
+# hk 2043: builder-haiku-medium is the haiku family's medium E6 rung (the
+# r1026effdown arm B haiku@high vs haiku@medium) on the same pin rule and
+# marker as builder-haiku-low.
+e6_builder_case builder-haiku-medium haiku      medium '--model haiku --dangerously-skip-permissions --effort medium'
 # hk 1863: the five hk 1786 borrow-down and promote-up spellings on the same
 # pin rule. builder-sol-low takes its model id from the codex-sol catalog row
 # (the fixture serves gpt-6.1-sol) and gates at codex-sol@low; the haiku and
@@ -11553,22 +11780,182 @@ grep -q 'policy launch codex-sol effort=low' "$TMP/launch.log" ||
 echo "PASS 704+737+1796+1863 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
 # hk 1864 (operator 2026-10-23): the no-max builder-seat refusal of the
-# 2026-09-26 decision 4088 B is repealed, so the five max-rung builder spellings
-# are admitted with their exact SCOPEFUEL_E6_ARM marker armed and launch at the
-# max rung (the kimi one through the max clone home).
+# 2026-09-26 decision 4088 B is repealed, so the max-rung builder spellings are
+# admitted with their exact SCOPEFUEL_E6_ARM marker armed and launch at the max
+# rung (the kimi one through the max clone home). builder-sol-max left this E6
+# set in hk 2043 (normal pinned spelling — its own case below).
 e6_builder_case builder-sonnet-max   sonnet     max    '--model sonnet --dangerously-skip-permissions --effort max'
-e6_builder_case builder-sol-max      codex-sol  max    '--yolo -m gpt-6.1-sol -c model_reasoning_effort=max'
 e6_builder_case builder-luna-max     codex-luna max    '--yolo -m gpt-6-luna -c model_reasoning_effort=max'
 e6_builder_case builder-kimi-max     kimi-k3    max    '--auto -m kimi-code/k3'
 e6_builder_case builder-haiku-max    haiku      max    '--model haiku --dangerously-skip-permissions --effort max'
-# A non-rung spelling takes an explicit max on a builder seat too:
-# --effort max on builder-sol (default high) is admitted and launches at max.
+# hk 2043 (operator r1026solmax, revision 3): builder-sol-xhigh and
+# builder-sol-max are NORMAL pinned spellings — the rung is pinned exactly like
+# an E6 spelling (catalog and gate consult, model, default effort, different
+# effort refusal) but spawn takes no SCOPEFUEL_E6_ARM marker. builder-sol-max
+# is the S+ gate=default row, so it also takes no --operator-request;
+# builder-sol-xhigh is an escalation rung, so the gate still demands a REF.
+normal_pinned_spawn() {
+  # The brief's case is "SCOPEFUEL_E6_ARM unset", not merely empty: a stale
+  # ambient marker must not be read as an E6 arm.
+  unset SCOPEFUEL_E6_ARM
+  spawn_base "$@"
+}
+normal_pinned_case() {
+  local model="$1" gate="$2" rung="$3" argv_tail="$4"; shift 4
+  local job="np-${model}-job" out rc start
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  set +e
+  out="$(ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    normal_pinned_spawn "$model" --role builder --lane "$model-lane" --parent parent-lane \
+    --job "$job" --t T1 "$@" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] ||
+    fail "$model must be admitted with SCOPEFUEL_E6_ARM unset (rc=$rc): $out"
+  start="$(grep '^agent start ' "$TMP/herdr.log")"
+  [[ "$start" == *" -- $argv_tail" ]] ||
+    fail "$model must launch the exact $rung rung argv: $start"
+  grep -qF "gate -m $gate --effort $rung" "$TMP/scopefuel.log" ||
+    fail "$model must ask the gate about the $rung rung: $(cat "$TMP/scopefuel.log")"
+  python3 - "$E6_INBOX/$job/events" "$gate@$rung" "$model" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert record["payload"]["launch_profile"] == sys.argv[2], (sys.argv[3], record)
+PY
+}
+
+normal_pinned_case builder-sol-xhigh codex-sol xhigh \
+  '--yolo -m gpt-6.1-sol -c model_reasoning_effort=xhigh' --operator-request hk:task/2043
+normal_pinned_case builder-sol-max codex-sol max \
+  '--yolo -m gpt-6.1-sol -c model_reasoning_effort=max'
+
+# hk 2043 item 6: the gate still decides admission. codex-sol@xhigh is an
+# escalation rung at S+, so a bare spawn is refused by the gate (rc 3) and the
+# same spawn with a valid operator REF is admitted (the case above).
 : >"$TMP/herdr.log"
-e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-max-lane --parent parent-lane \
-  --effort max --job e6-builder-sol-effort-max --t T1 2>&1)" ||
-  fail "builder-sol --effort max must be admitted on a builder seat (hk 1864): $e6_max_out"
-[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-6.1-sol -c model_reasoning_effort=max' ]] ||
-  fail "builder-sol --effort max must launch at the max rung: $(cat "$TMP/herdr.log")"
+set +e
+np_esc_out="$(normal_pinned_spawn builder-sol-xhigh --role builder --lane np-xhigh-esc-lane \
+  --parent parent-lane --job np-xhigh-esc --t T1 2>&1)"
+np_esc_rc=$?
+set -e
+[[ "$np_esc_rc" -eq 3 ]] ||
+  fail "builder-sol-xhigh without --operator-request must hit the gate escalation refusal (rc=$np_esc_rc): $np_esc_out"
+grep -q 'escalation' <<<"$np_esc_out" ||
+  fail "builder-sol-xhigh refusal must be the gate's escalation denial: $np_esc_out"
+
+# A stale marker (another rung of the same profile) must not gate or label a
+# normal pinned spelling: the spawn is admitted and the record still reads
+# codex-sol@max — never an E6 arm.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+np_stale_out="$(SCOPEFUEL_E6_ARM=codex-sol@high ARBITER_INBOX_ROOT="$E6_INBOX" \
+  XDG_DATA_HOME="$E6_XDG" spawn_base builder-sol-max --role builder \
+  --lane np-sol-max-stale-lane --parent parent-lane --job np-sol-max-stale --t T1 2>&1)" ||
+  fail "a stale SCOPEFUEL_E6_ARM must not refuse builder-sol-max: $np_stale_out"
+python3 - "$E6_INBOX/np-sol-max-stale/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert record["payload"]["launch_profile"] == "codex-sol@max", record
+PY
+echo "PASS hk 2043 normal pinned sol spellings take no marker, record their canon rung, and stay gate-decided"
+
+# hk 2043 item 4: an unpinned builder spelling whose catalog consult is pinned
+# to one rung refuses a different --effort instead of silently consulting the
+# pin while launching another rung. The line names the matching pinned
+# spelling when the family has one.
+np_mismatch_case() {
+  local model="$1" effort="$2" want="$3"
+  local out rc
+  set +e
+  out="$(normal_pinned_spawn "$model" --role builder --lane "np-mm-$model-lane" \
+    --parent parent-lane --job "np-mm-$model-$effort" --t T1 --effort "$effort" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 2 ]] ||
+    fail "$model --effort $effort must die rc 2 (rc=$rc): $out"
+  grep -qF "$want" <<<"$out" ||
+    fail "$model --effort $effort refusal must name '$want': $out"
+}
+np_mismatch_case builder-sol xhigh 'use builder-sol-xhigh for --effort xhigh'
+np_mismatch_case builder-sol max 'use builder-sol-max for --effort max'
+np_mismatch_case builder-sol medium 'use builder-sol-medium for --effort medium'
+np_mismatch_case builder-sol6 max 'use --effort high'
+np_mismatch_case builder-grok low 'use builder-grok-low for --effort low'
+# builder-sol --effort high is unchanged (no refusal, launches high).
+: >"$TMP/herdr.log"
+normal_pinned_spawn builder-sol --role builder --lane np-sol-high-lane \
+  --parent parent-lane --job np-sol-high --t T1 --effort high >/dev/null
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-6.1-sol -c model_reasoning_effort=high' ]] ||
+  fail "builder-sol --effort high must still launch the high rung: $(cat "$TMP/herdr.log")"
+echo "PASS hk 2043 unpinned builder spellings refuse an off-consult effort and name the pinned spelling"
+
+# Mutants, each applied at the real call site (bin/wrk source), never to the
+# repository file. Every mutant must turn its probe RED.
+np_probe() {  # $1=wrk path, $2=tag, $3=model; extra spawn flags after
+  local wrk="$1" tag="$2" model="$3"; shift 3
+  WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn "$model" --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 "$@" >/dev/null 2>&1 || return 1
+}
+np_marker_required_probe() {  # 0 iff the no-marker spawn is refused
+  local wrk="$1" tag="$2" model="$3"
+  ! WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn "$model" --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 >/dev/null 2>&1
+}
+np_consult_probe() {  # 0 iff builder-sol-xhigh's catalog consult asks xhigh
+  local wrk="$1" tag="$2"
+  : >"$TMP/launch.log"
+  WRK="$wrk" WRK_LAUNCH_LOG="$TMP/launch.log" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" \
+    XDG_DATA_HOME="$TMP/npm-xdg-$tag" normal_pinned_spawn builder-sol-xhigh \
+    --role builder --lane "npm-$tag-lane" --parent parent-lane --job "npm-$tag" \
+    --t T1 --operator-request hk:task/2043 >/dev/null 2>&1 || return 1
+  grep -q 'policy launch codex-sol effort=xhigh' "$TMP/launch.log"
+}
+np_mismatch_probe() {  # 0 iff builder-sol --effort xhigh is refused
+  local wrk="$1" tag="$2"
+  ! WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn builder-sol --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 --effort xhigh >/dev/null 2>&1
+}
+np_probe "$WRK" real-solmax builder-sol-max ||
+  fail "builder-sol-max probe must be admitted on the real wrk"
+np_marker_required_probe "$WRK" real-haikumax builder-haiku-max ||
+  fail "builder-haiku-max probe must be refused without a marker on the real wrk"
+np_consult_probe "$WRK" real-consult ||
+  fail "builder-sol-xhigh probe must consult codex-sol@xhigh on the real wrk"
+np_mismatch_probe "$WRK" real-mismatch ||
+  fail "builder-sol --effort xhigh probe must be refused on the real wrk"
+# Invariant: requiring the marker for builder-sol-max turns the no-marker case
+# RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-marker-required" \
+  'if ! normal_pinned_builder "$MODEL"; then' 'if true; then'
+expect_red "normal-pinned-marker-required" np_probe "$TMP/wrk-np-marker-required" mut-solmax builder-sol-max
+# Invariant: exempting every pinned spelling from the marker turns the
+# builder-haiku-max marker case RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-marker-exempt-all" \
+  'if ! normal_pinned_builder "$MODEL"; then' 'if false; then'
+expect_red "normal-pinned-marker-exempt-all" np_marker_required_probe \
+  "$TMP/wrk-np-marker-exempt-all" mut-haikumax builder-haiku-max
+# Invariant: mapping builder-sol-xhigh's catalog consult to high turns the
+# consult case RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-consult-high" \
+  '    builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;' \
+  '    builder-sol-xhigh) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high ;;
+    builder-sol-high|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;'
+expect_red "normal-pinned-consult-high" np_consult_probe "$TMP/wrk-np-consult-high" mut-consult
+# Invariant: dropping the unpinned-mismatch refusal turns the builder-sol
+# --effort xhigh case RED.
+mut_wrk "$TMP/wrk-np-mismatch-dropped" \
+  '      builder-sol|captain-sol)' '      captain-sol)'
+expect_red "normal-pinned-mismatch-dropped" np_mismatch_probe \
+  "$TMP/wrk-np-mismatch-dropped" mut-mismatch
+echo "PASS hk 2043 normal-pinned and unpinned-mismatch mutants go RED"
+
 # codex `ultra` is the max tier plus subagents — hk 1864 opened max only, so
 # the seat rule still refuses ultra.
 set +e
@@ -11995,9 +12382,9 @@ echo "PASS 748r3 kimi seat rule resolves real TOML, env overlay, and disabled Th
 for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
   builder-sol-high builder-sol-medium \
   builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
-  builder-sonnet-max builder-sol-max builder-luna-max builder-kimi-max builder-haiku-max; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
+  builder-sonnet-max builder-luna-max builder-kimi-max builder-haiku-max; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
@@ -12101,7 +12488,8 @@ grep -q 'SCOPEFUEL_E6_ARM=codex-luna@medium' <<<"$e6_rung_out" ||
 for e6_wr in builder-sol-low:codex-sol@high:codex-sol@low \
   builder-haiku-high:haiku@low:haiku@high builder-haiku-xhigh:haiku@high:haiku@xhigh \
   builder-sonnet-low:sonnet@medium:sonnet@low \
-  builder-haiku-max:haiku@xhigh:haiku@max builder-sol-max:codex-sol@high:codex-sol@max \
+  builder-haiku-max:haiku@xhigh:haiku@max builder-luna-high:codex-luna@medium:codex-luna@high \
+  builder-haiku-medium:haiku@high:haiku@medium \
   builder-sonnet-max:sonnet@xhigh:sonnet@max builder-luna-max:codex-luna@medium:codex-luna@max; do
   IFS=: read -r e6_wr_model e6_wr_marker e6_wr_want <<<"$e6_wr"
   set +e
@@ -12348,7 +12736,7 @@ set -e
 # rung spelled out is the allowed restatement (covered by e6_builder_case).
 for e6_ef in builder-sol-low:codex-sol@low:medium builder-haiku-high:haiku@high:low \
   builder-haiku-xhigh:haiku@xhigh:high builder-haiku-max:haiku@max:xhigh \
-  builder-sonnet-low:sonnet@low:medium; do
+  builder-sonnet-low:sonnet@low:medium builder-haiku-medium:haiku@medium:high; do
   IFS=: read -r e6_ef_model e6_ef_marker e6_ef_off <<<"$e6_ef"
   set +e
   e6_eff_out="$(SCOPEFUEL_E6_ARM="$e6_ef_marker" \

@@ -67,6 +67,86 @@ tasks = {
             "title": "level flow tune", "area": None,
             "refs": {"pr": "https://github.com/mgh3326/ParkingArcade/pull/56"}},
 }
+# hk 2012 title cases: hk 296 and hk 1934 shapes, plus one Korean pattern
+# and one near-miss per Korean pattern (near-misses must stay unproposed).
+HK2012_TITLES = [
+    (114, "tester runs in a detached verify worktree; SKILL.md wording for the spawn loop"),
+    (115, "SKILL.md wording for the handoff section"),
+    (116, "trust_tripwire tests fail after install"),
+    (117, "install the backup timer"),
+    (118, "deploy the hub to the m1 box"),
+    (119, "계좌 주문 어댑터 점검"),
+    (120, "주말 점검 메모"),
+    (121, "종목 마스터 동기화 점검"),
+    (122, "종이 목록 정리"),
+    (123, "시장별 실패 원인 확정"),
+    (124, "시작 점검 메모"),
+    (125, "[콘솔] 검색 개선"),
+    (126, "콘텐츠 정리 메모"),
+    (127, "[hk 홈 전환] 순서 재정렬"),
+    (128, "홈 화면 정리"),
+    (129, "pane 전수 조사를 읽기 전용으로"),
+    (130, "읽기 쉬운 메모 정리"),
+    (140, "scopefuel quota probe timing"),
+    (141, "handoffkeep relay retry notes"),
+    (142, "panewire hub lane stall notes"),
+    (143, "auto_trader Toss sync notes"),
+    (144, "agent-skills spawn notes"),
+    (145, "ParkingArcade seat camera notes"),
+    (146, "scopefuelish notes"),
+    (147, "builder profile notes"),
+    (148, "builders wanted notes"),
+    (149, "scopefuel builder rep grade"),
+    (150, "scopefuel tester probe"),
+    (151, "scopefuel 콘솔 note"),
+    (152, "panewire 콘솔 queue note"),
+    (153, "admiral audit notes"),
+    (154, "robin-prefect-automations sync notes"),
+    (155, "strategy-lab backtest notes"),
+    (156, "fillwire ingest notes"),
+    (157, "experiment sweep notes"),
+    (158, "experiments planned notes"),
+    (159, "admirable notes"),
+    (169, "tester SKILL.md wording for the spawn contract"),
+]
+# hk 2012 tag rule: an exact leading [area] tag overrides a product default;
+# a loose area word in the title does not.
+HK2012_TAGGED = [
+    (160, "experiment", "[research] sweep of the scalping grid"),
+    (161, "experiment", "sweep of the scalping grid"),
+    (162, "experiment", "research sweep of the scalping grid"),
+]
+for i, project, title in HK2012_TAGGED:
+    tasks[str(i)] = {"id": i, "state": "backlog", "project": project,
+                     "title": title, "area": None, "refs": {}}
+for i, title in HK2012_TITLES:
+    tasks[str(i)] = {"id": i, "state": "backlog", "project": None,
+                     "title": title, "area": None, "refs": {}}
+# hk 2012 scope: a product repo's default holds against generic and fleet
+# title terms; fleet terms reach only agent-skills, handoffkeep, panewire,
+# admiral and projectless tasks.
+HK2012_SCOPED = [
+    (131, "ParkingArcade", "tester follow-up on the seat camera"),
+    (132, "scopefuel", "wrk gate contract guard"),
+    (133, "agent-skills", "tester worktree rule"),
+    (134, "handoffkeep", "wrk round cap follow-up"),
+    (135, "auto_trader", "[콘솔] 태스크 본문 정리"),
+    (136, "auto_trader", "운영 주문 점검"),
+    (137, "auto_trader", "deploy the Prefect flow for the desk"),
+    (138, "ParkingArcade", "read-only capture of the parked-car layout"),
+    (139, "handoffkeep", "deploy the hub relay fix"),
+    (163, "fleet-ops", "tester probe for the queue"),
+    (164, "handoffkeep", "README update for the relay notes"),
+    (165, "handoffkeep", "tester follow-up on the relay retry"),
+    (166, "panewire", "wrk follow-up on the hub lane stall"),
+    (167, "agent-skills", "tester follow-up on the spawn loop"),
+    (168, "handoffkeep", "[shell-wrk] relay retry follow-up"),
+    (170, "handoffkeep", "worktree cleanup for the relay"),
+]
+for i, project, title in HK2012_SCOPED:
+    tasks[str(i)] = {"id": i, "state": "backlog", "project": project,
+                     "title": title, "area": None, "refs": {}}
+
 db = {"areas": ["blender", "unity", "web-qa", "ui-design", "image",
                 "web-frontend", "go-backend", "python", "trading",
                 "shell-wrk", "docs", "research", "ops"],
@@ -139,6 +219,96 @@ PY
 [[ "$(grep -c 'call pr view' "$GH_LOG")" -eq 2 ]] \
   || fail "gh pr view call count: $(cat "$GH_LOG")"
 echo "PASS propose rule order + read-only + per-state + files"
+
+echo "== hk 2012 title cases: shell-wrk terms, docs/ops kept, Korean patterns =="
+python3 - "$TMP/propose.tsv" <<'PY'
+import csv, sys
+rows = {r["id"]: r for r in csv.DictReader(open(sys.argv[1], newline=""), delimiter="\t")}
+# id, proposed_area, rule ("" = any title rule; "-" = no proposal)
+want = [
+    (114, "shell-wrk", ""),              # hk 296 shape: tester/worktree beat SKILL.md
+    (115, "docs", "title:\\bskill\\.md\\b"),  # docs-only SKILL.md title stays docs
+    (116, "shell-wrk", ""),              # hk 1934 shape: trust_tripwire beats install
+    (117, "ops", "title:\\binstall\\b"),  # plain install stays ops
+    (118, "ops", "title:\\bdeploy\\b"),   # plain deploy stays ops
+    (119, "trading", "title:주문"),
+    (120, "", "-"),                       # near-miss: no 주문
+    (121, "trading", "title:종목"),
+    (122, "", "-"),                       # near-miss: no 종목
+    (123, "trading", "title:시장"),
+    (124, "", "-"),                       # near-miss: no 시장
+    (125, "web-frontend", "title:콘솔"),
+    (126, "", "-"),                       # near-miss: no 콘솔
+    (127, "web-frontend", "title:홈 전환"),
+    (128, "", "-"),                       # near-miss: no 홈 전환
+    (129, "", "-"),                       # 읽기 전용 dropped: too generic (director-1)
+    (130, "", "-"),                       # near-miss: no 읽기 전용
+    (140, "python", "title:\\bscopefuel\\b"),      # project name on a projectless task
+    (141, "go-backend", "title:\\bhandoffkeep\\b"),
+    (142, "go-backend", "title:\\bpanewire\\b"),
+    (143, "trading", "title:\\bauto_trader\\b"),
+    (144, "shell-wrk", "title:\\bagent-skills\\b"),
+    (145, "unity", "title:\\bparkingarcade\\b"),
+    (146, "", "-"),                       # near-miss: scopefuelish is not scopefuel
+    (147, "shell-wrk", "title:\\bbuilder\\b"),
+    (148, "", "-"),                       # near-miss: builders is not builder
+    (149, "python", "title:\\bscopefuel\\b"),  # a project name beats the builder word
+    (150, "python", "title:\\bscopefuel\\b"),  # a product name beats the fleet tester term
+    (151, "python", "title:\\bscopefuel\\b"),  # a product name beats the Korean console term
+    (152, "go-backend", "title:\\bpanewire\\b"),  # a fleet name beats the Korean console term
+    (153, "go-backend", "title:\\badmiral\\b"),
+    (154, "trading", "title:\\brobin-prefect-automations\\b"),
+    (155, "trading", "title:\\bstrategy-lab\\b"),
+    (156, "trading", "title:\\bfillwire\\b"),
+    (157, "python", "title:\\bexperiment\\b"),
+    (158, "", "-"),                       # near-miss: experiments is not experiment
+    (159, "", "-"),                       # near-miss: admirable is not admiral
+    (169, "shell-wrk", "title:\\btester\\b"),  # tester beats SKILL.md on a projectless title
+]
+for tid, area, rule in want:
+    r = rows.get(str(tid)) or sys.exit(f"missing row for task {tid}")
+    assert r["proposed_area"] == area, (tid, r["proposed_area"], area, r["rule"])
+    if area:
+        assert r["source"] == "title", (tid, r["source"])
+    if rule == "-":
+        assert r["source"] == "-", (tid, r["source"], r["rule"])
+    elif rule:
+        assert r["rule"] == rule, (tid, r["rule"], rule)
+PY
+echo "PASS hk 2012 title cases"
+
+echo "== hk 2012 scope: product defaults hold; fleet terms only on fleet repos =="
+python3 - "$TMP/propose.tsv" <<'PY'
+import csv, sys
+rows = {r["id"]: r for r in csv.DictReader(open(sys.argv[1], newline=""), delimiter="\t")}
+# id, proposed_area, rule prefix
+want = [
+    (131, "unity", "project:ParkingArcade"),   # tester term must not beat a product default
+    (132, "python", "project:scopefuel"),      # wrk term must not beat scopefuel's default
+    (133, "shell-wrk", "title:"),              # fleet repo: tester term applies
+    (134, "go-backend", "project:handoffkeep"),  # wrk round never overrides a go-backend default
+    (135, "trading", "project:auto_trader"),   # 콘솔 is web-frontend only on fleet repos
+    (136, "trading", ""),                      # 주문 keeps the trading default
+    (137, "trading", "project:auto_trader"),   # deploy (ops) must not beat a product default
+    (138, "unity", "project:ParkingArcade"),   # read-only (research) must not beat it either
+    (139, "go-backend", "project:handoffkeep"),  # fleet default holds against a generic ops term
+    (160, "research", "tag:[research]"),      # exact leading tag beats the python default
+    (161, "python", "project:experiment"),    # untagged experiment task stays python
+    (162, "python", "project:experiment"),    # a loose research word does not count
+    (163, "", "-"),                           # unmapped project: no shell-wrk term applies
+    (164, "go-backend", "project:handoffkeep"),  # fleet default holds against a generic docs term
+    (165, "go-backend", "project:handoffkeep"),  # a tester term never overrides go-backend
+    (166, "go-backend", "project:panewire"),     # a wrk term never overrides go-backend
+    (167, "shell-wrk", "title:\\btester\\b"),    # agent-skills default is shell-wrk: tester applies
+    (168, "shell-wrk", "tag:[shell-wrk]"),       # an exact leading tag applies on a fleet repo
+    (170, "shell-wrk", "title:\\bworktree\\b"),  # a fleet repo takes a shell-wrk term (guard allowance)
+]
+for tid, area, rule in want:
+    r = rows.get(str(tid)) or sys.exit(f"missing row for task {tid}")
+    assert r["proposed_area"] == area, (tid, r["proposed_area"], area, r["rule"])
+    assert r["rule"].startswith(rule), (tid, r["rule"], rule)
+PY
+echo "PASS hk 2012 scope cases"
 
 echo "== propose without --with-files: files rule skipped =="
 : >"$HK_LOG"; : >"$GH_LOG"
