@@ -11721,17 +11721,20 @@ np_mismatch_probe "$WRK" real-mismatch ||
   fail "builder-sol --effort xhigh probe must be refused on the real wrk"
 # Invariant: requiring the marker for builder-sol-max turns the no-marker case
 # RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
 mut_wrk "$TMP/wrk-np-marker-required" \
   'if ! normal_pinned_builder "$MODEL"; then' 'if true; then'
 expect_red "normal-pinned-marker-required" np_probe "$TMP/wrk-np-marker-required" mut-solmax builder-sol-max
 # Invariant: exempting every pinned spelling from the marker turns the
 # builder-haiku-max marker case RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
 mut_wrk "$TMP/wrk-np-marker-exempt-all" \
   'if ! normal_pinned_builder "$MODEL"; then' 'if false; then'
 expect_red "normal-pinned-marker-exempt-all" np_marker_required_probe \
   "$TMP/wrk-np-marker-exempt-all" mut-haikumax builder-haiku-max
 # Invariant: mapping builder-sol-xhigh's catalog consult to high turns the
 # consult case RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
 mut_wrk "$TMP/wrk-np-consult-high" \
   '    builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;' \
   '    builder-sol-xhigh) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high ;;
