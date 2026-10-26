@@ -1,9 +1,11 @@
 """hk 1407: real heavy entry-point tests, using only file-controlled fixtures."""
 
 import json
+import base64
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -23,6 +25,7 @@ class HeavyQueue(unittest.TestCase):
         self.base = Path(self.tmp.name)
         self.procs = []
         self.files = []
+        self.stopped_waiters = []
         self.lock = self.base / "lock"
         self.waiters = Path(str(self.lock) + ".waiters")
         self.positions = Path(str(self.lock) + ".positions")
@@ -59,6 +62,12 @@ class HeavyQueue(unittest.TestCase):
     def tearDown(self):
         for path in self.files:
             path.touch()
+        # A SIGSTOPped waiter is one of this test's own descendants. Resume
+        # it before waiting for its wrapper so even a failed assertion cannot
+        # leave a stopped process behind.
+        for pid, start, parent in self.stopped_waiters:
+            if self.owned_process(pid, start, parent):
+                os.kill(pid, signal.SIGCONT)
         # A failed assertion cannot leave a holder behind: release all fixture
         # commands, then wait for their own per-run caps. No pattern signals.
         for proc, out in self.procs:
@@ -151,8 +160,59 @@ class HeavyQueue(unittest.TestCase):
             self.assertEqual(waiters[index].wait(timeout=5), 0)
 
     def plant_lane(self, pid, ticket="1:1", limit=1):
+        start = self.process_start_identity(pid)
         (self.waiters / str(pid)).write_text(
-            f"pid={pid} class=lane limit={limit} ticket={ticket} since=x job=- cmd=fixture")
+            f"pid={pid} class=lane limit={limit} start={start} "
+            f"ticket={ticket} since=x job=- cmd=fixture")
+
+    def process_start_identity(self, pid):
+        if sys.platform == "darwin":
+            result = subprocess.run(
+                ["ps", "-o", "lstart=", "-p", str(pid)],
+                env={"LC_ALL": "C", "LANG": "C", "TZ": "UTC"},
+                capture_output=True, text=True, check=False)
+            value = result.stdout
+            if value.endswith("\n"):
+                value = value[:-1]
+            if value.endswith("\r"):
+                value = value[:-1]
+            if result.returncode or not value.strip():
+                return "unavailable"
+            return "mac-" + base64.urlsafe_b64encode(value.encode("utf-8")).decode("ascii")
+        if sys.platform.startswith("linux"):
+            try:
+                stat_text = Path(f"/proc/{pid}/stat").read_text()
+                tail = stat_text[stat_text.rfind(")") + 1:].split()
+                start_ticks = tail[19]
+                boot_id = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+                return f"linux-{boot_id}-{start_ticks}"
+            except (OSError, IndexError):
+                return "unavailable"
+        return "unavailable"
+
+    def record_pid(self, info):
+        match = re.match(r"pid=(\d+)", info)
+        self.assertIsNotNone(match, "waiter record has no pid")
+        return int(match.group(1))
+
+    def owned_process(self, pid, start, parent):
+        ppid = subprocess.run(["ps", "-p", str(pid), "-o", "ppid="],
+                              capture_output=True, text=True, check=False)
+        if ppid.returncode or ppid.stdout.strip() != str(parent):
+            return False
+        return self.process_start_identity(pid) == start
+
+    def signal_waiter(self, proc, info, sig):
+        pid = self.record_pid(info)
+        start_match = re.search(r"(?:^| )start=([^ ]+)", info)
+        self.assertIsNotNone(start_match, "waiter record has no owner start identity")
+        start = start_match.group(1)
+        self.assertTrue(self.owned_process(pid, start, proc.pid),
+                        "refusing to signal a waiter not verified as this test's child")
+        if sig == signal.SIGSTOP:
+            self.stopped_waiters.append((pid, start, proc.pid))
+        os.kill(pid, sig)
+        return pid
 
     def test_fifo_reserves_only_eligible_slots(self):
         # Our live test pid is a deterministic older lane; it reserves slot 0
@@ -164,6 +224,178 @@ class HeavyQueue(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         (self.waiters / str(os.getpid())).unlink()
         self.assertEqual(self.run_wrk("--", "true").returncode, 0)
+
+    def test_published_waiter_records_include_the_live_owner_identity(self):
+        self.start("holder")
+        waiter = self.spawn("identified")
+        info = self.queued("identified")
+        pid = self.record_pid(info)
+        match = re.search(r"(?:^| )start=([^ ]+)", info)
+        self.assertIsNotNone(match, "waiter record omitted its owner start identity")
+        self.assertEqual(match.group(1), self.process_start_identity(pid),
+                         "waiter record does not carry the writer's process identity")
+        self.assertIsNone(waiter.poll())
+
+    def test_pid_reuse_does_not_reserve_and_status_retires_with_one_audit_line(self):
+        pid = os.getpid()
+        (self.waiters / str(pid)).write_text(
+            f"pid={pid} class=lane limit=1 start=forged-start ticket=1:1 "
+            "since=x job=- cmd=fixture")
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP="1")
+        self.assertEqual(result.returncode, 0,
+                         "a live pid with a different start identity reserved a slot")
+        self.assertTrue((self.waiters / str(pid)).exists(),
+                        "reservation reader performed cleanup instead of status")
+        status = self.run_wrk("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertFalse((self.waiters / str(pid)).exists(),
+                         "status did not retire a reused-pid waiter")
+        events = [json.loads(line) for line in (self.base / "heavy.log").read_text().splitlines()]
+        retired = [event for event in events if event.get("kind") == "waiter.retired"]
+        self.assertEqual(len(retired), 1, events)
+        self.assertEqual(retired[0].get("record"), str(pid), retired[0])
+        self.assertEqual(retired[0].get("pid"), pid, retired[0])
+        self.assertIn("mismatch", retired[0].get("reason", ""))
+
+    def test_eperm_is_not_alive_for_reservation(self):
+        pid = os.getpid()
+        self.plant_lane(pid)
+        source = WRK.read_text()
+        self.assertIn("def owner_alive(pid, start):", source,
+                      "reservation code has no owner identity check")
+        binary = self.instrument_function(
+            "eperm-wrk", "def owner_alive(pid, start):",
+            "        os.kill(pid, 0)\n    except ProcessLookupError:\n",
+            "        raise PermissionError(1, 'Operation not permitted')\n"
+            "    except ProcessLookupError:\n")
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP="1")
+        self.assertEqual(result.returncode, 0,
+                         "EPERM was treated as a live owner that reserves capacity")
+
+    def test_unknown_start_identity_keeps_record_and_reserves_once_per_run(self):
+        pid = os.getpid()
+        self.plant_lane(pid)
+        source = WRK.read_text()
+        self.assertIn("def owner_alive(pid, start):", source,
+                      "reservation code has no owner identity check")
+        anchor = "    actual = process_start_identity(pid)\n"
+        self.assertEqual(source.count(anchor), 1, "owner identity probe anchor changed")
+        binary = self.instrument(
+            "unknown-wrk", anchor,
+            f"    actual = None if pid == {pid} else process_start_identity(pid)\n")
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75,
+                         "unknown owner identity stopped reserving its slot")
+        events = [json.loads(line) for line in (self.base / "heavy.log").read_text().splitlines()]
+        unknown = [event for event in events if event.get("kind") == "owner_identity_unknown"]
+        self.assertEqual(len(unknown), 1, events)
+        self.assertEqual(unknown[0].get("pid"), pid, unknown[0])
+        self.assertTrue((self.waiters / str(pid)).exists(),
+                        "unknown identity was retired instead of retained")
+
+    def test_pre_change_record_without_identity_remains_non_reserving(self):
+        pid = os.getpid()
+        (self.waiters / str(pid)).write_text(
+            f"pid={pid} class=lane limit=1 since=x job=- cmd=legacy")
+        result = self.run_wrk("--", "true")
+        self.assertEqual(result.returncode, 0,
+                         "pre-change record without owner identity reserved a slot")
+        self.assertTrue((self.waiters / str(pid)).exists(),
+                        "legacy record was retired without owner-death evidence")
+
+    def test_pre_change_ci_reserves_while_pre_change_lane_does_not(self):
+        pid = os.getpid()
+        (self.waiters / "legacy-ci").write_text(
+            f"pid={pid} class=ci limit=1 since=x job=- cmd=legacy-ci")
+        (self.waiters / "legacy-lane").write_text(
+            f"pid={pid} class=lane limit=1 since=x job=- cmd=legacy-lane")
+        lane = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(lane.returncode, 75,
+                         "pre-change CI reservation was lost for a mixed-version waiter")
+        (self.waiters / "legacy-ci").unlink()
+        lane = self.run_wrk("--", "true")
+        self.assertEqual(lane.returncode, 0,
+                         "ticketless pre-change lane record unexpectedly reserved")
+
+    def test_lane_waiter_stops_deferring_after_monotonic_bound_without_preemption(self):
+        holder = self.start("holder")
+        older = self.spawn("older")
+        older_info = self.queued("older")
+        older_pid = self.record_pid(older_info)
+        older_start = re.search(r"(?:^| )start=([^ ]+)", older_info).group(1)
+        self.assertTrue(self.owned_process(older_pid, older_start, older.pid))
+        self.signal_waiter(older, older_info, signal.SIGSTOP)
+
+        anchor = "started_at = time.monotonic()\n"
+        binary = self.instrument("wall-step-wrk", anchor,
+                                 anchor + "time.time = lambda: -1000000000.0\n")
+        younger = self.spawn("younger", binary=binary,
+                             WRK_HEAVY_LANE_DEFER_MAX=".9", WRK_HEAVY_WAIT_CAP="5")
+        self.queued("younger")
+        self.assertIsNone(holder.poll(), "a lane waiter preempted the active slot holder")
+        self.release("holder")
+        self.assertEqual(holder.wait(timeout=5), 0)
+        self.assertFalse(self.started("younger"),
+                         "younger lane passed an older live waiter before its bound")
+        self.assertIsNone(older.poll(), "SIGSTOPped older waiter unexpectedly exited")
+        self.assertTrue(self.owned_process(older_pid, older_start, older.pid),
+                        "older waiter identity changed while stopped")
+        self.until(lambda: self.started("younger"),
+                   "lane deferral did not expire on the waiter's monotonic clock", timeout=4)
+        self.release("younger")
+        self.assertEqual(younger.wait(timeout=5), 0)
+        self.assertIsNone(older.poll(), "the lane bound preempted or killed its older waiter")
+
+    def test_sighup_and_sigterm_remove_waiter_records_with_signal_exit_codes(self):
+        for sig, want in ((signal.SIGHUP, 129), (signal.SIGTERM, 143)):
+            with self.subTest(signal=sig):
+                holder = self.start("holder-" + str(sig))
+                waiter = self.spawn("signal-" + str(sig))
+                info = self.queued("signal-" + str(sig))
+                pid = self.signal_waiter(waiter, info, sig)
+                self.assertEqual(waiter.wait(timeout=5), want,
+                                 f"signal {sig} did not preserve shell-style exit status")
+                self.assertFalse((self.waiters / str(pid)).exists(),
+                                 f"signal {sig} leaked its waiter record")
+                self.release("holder-" + str(sig))
+                self.assertEqual(holder.wait(timeout=5), 0)
+
+    def test_run_preserves_inherited_ignored_signal_dispositions(self):
+        child = (
+            "import os, signal\n"
+            "assert signal.getsignal(signal.SIGHUP) == signal.SIG_IGN\n"
+            "assert signal.getsignal(signal.SIGTERM) == signal.SIG_IGN\n"
+            "os.kill(os.getpid(), signal.SIGHUP)\n"
+            "os.kill(os.getpid(), signal.SIGTERM)\n"
+            "print('child survived inherited ignored signals')\n"
+        )
+        launcher = self.base / "ignored-signal-launcher.py"
+        launcher.write_text(
+            "import os, signal, sys\n"
+            "signal.signal(signal.SIGHUP, signal.SIG_IGN)\n"
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN)\n"
+            "child = " + repr(child) + "\n"
+            "os.execv(sys.argv[1], [sys.argv[1], 'heavy', '--', "
+            "sys.executable, '-c', child])\n"
+        )
+        result = subprocess.run([sys.executable, str(launcher), str(WRK)],
+                                env=self.env, capture_output=True, text=True,
+                                timeout=15, check=False)
+        self.assertEqual(result.returncode, 0,
+                         "run reset inherited ignored signal dispositions: " + result.stderr)
+        self.assertIn("child survived inherited ignored signals", result.stdout)
+
+    def test_lane_defer_configuration_rejects_invalid_values(self):
+        for value in ("bad", "-1", "nan"):
+            result = self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX=value)
+            self.assertEqual(result.returncode, 2,
+                             f"invalid WRK_HEAVY_LANE_DEFER_MAX accepted: {value}")
+
+    def test_lane_defer_zero_disables_deferral(self):
+        self.plant_lane(os.getpid())
+        result = self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX="0")
+        self.assertEqual(result.returncode, 0,
+                         "WRK_HEAVY_LANE_DEFER_MAX=0 did not turn lane deferral off")
 
     def durable(self, expired=False, keyed=True, binary=WRK):
         self.start("holder")
@@ -229,7 +461,9 @@ class HeavyQueue(unittest.TestCase):
     def test_dead_and_mixed_version_records_reserve_nothing(self):
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
         dead.wait(timeout=5)
-        self.plant_lane(dead.pid)
+        (self.waiters / str(dead.pid)).write_text(
+            f"pid={dead.pid} class=lane limit=1 ticket=1:1 since=x "
+            "job=- cmd=dead-legacy")
         (self.waiters / "legacy").write_text(
             f"pid={os.getpid()} class=lane limit=1 since=x job=- cmd=old ticket=1:1")
         result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
@@ -326,6 +560,20 @@ class HeavyQueue(unittest.TestCase):
         self.assertEqual(source.count(old), 1, f"instrumentation anchor changed: {old}")
         binary = self.base / name
         binary.write_text(source.replace(old, new, 1))
+        binary.chmod(0o755)
+        return binary
+
+    def instrument_function(self, name, function, old, new):
+        source = WRK.read_text()
+        start = source.index(function)
+        end = source.find("\ndef ", start + len(function))
+        if end < 0:
+            end = len(source)
+        body = source[start:end]
+        self.assertEqual(body.count(old), 1,
+                         f"instrumentation anchor changed in {function}: {old}")
+        binary = self.base / name
+        binary.write_text(source[:start] + body.replace(old, new, 1) + source[end:])
         binary.chmod(0o755)
         return binary
 
@@ -514,9 +762,39 @@ class HeavyQueue(unittest.TestCase):
 
     def test_mutants_break_the_named_invariants(self):
         mutations = [
+            ("owner-identity",
+             "    if pid > 0 and start is not None and owner_alive(pid, start) is False:",
+             "    if False:", "test_pid_reuse_does_not_reserve_and_status_retires_with_one_audit_line",
+             "a live pid with a different start identity reserved a slot"),
+            ("eperm",
+             "if exc.errno == errno.EPERM:\n            owner_last_reason = \"kill(pid, 0) returned EPERM\"\n            return False\n",
+             "if exc.errno == errno.EPERM:\n            owner_last_reason = \"kill(pid, 0) returned EPERM\"\n            return True\n",
+             "test_eperm_is_not_alive_for_reservation",
+             "EPERM was treated as a live owner that reserves capacity"),
+            ("unknown-retire",
+             "        owner_last_reason = \"process start identity could not be read\"\n"
+             "        owner_unknown(pid, owner_last_reason)\n        return None\n",
+             "        owner_last_reason = \"process start identity could not be read\"\n"
+             "        owner_unknown(pid, owner_last_reason)\n        return False\n",
+             "test_unknown_start_identity_keeps_record_and_reserves_once_per_run",
+             "unknown owner identity stopped reserving its slot"),
             ("fifo", 'lane_limit = lane_reserved() if hclass == "lane" else 0',
              'lane_limit = 0', "test_fifo_reserves_only_eligible_slots",
              "younger lane overtook a live older ticket"),
+            ("lane-bound",
+             "if lane_defer_total + (now - lane_defer_mark) >= lane_defer_max:",
+             "if False:", "test_lane_waiter_stops_deferring_after_monotonic_bound_without_preemption",
+             "lane deferral did not expire on the waiter's monotonic clock"),
+            ("sighup-cleanup",
+             "signal.signal(signal.SIGHUP, wait_signal)",
+             "signal.signal(signal.SIGHUP, signal.SIG_DFL)",
+             "test_sighup_and_sigterm_remove_waiter_records_with_signal_exit_codes",
+             "signal 1 leaked its waiter record"),
+            ("run-signal-ignore",
+             "        signal.signal(signal.SIGHUP, signal.SIG_IGN)\n",
+             "        signal.signal(signal.SIGHUP, signal.SIG_DFL)\n",
+             "test_run_preserves_inherited_ignored_signal_dispositions",
+             "run reset inherited ignored signal dispositions"),
             ("reuse", '            ticket = tuple(record["ticket"])',
              '            pass  # mutant: discard the saved ticket',
              "test_position_reused_within_grace", "original ticket was not reused within grace"),
