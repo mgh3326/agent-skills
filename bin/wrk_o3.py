@@ -1321,6 +1321,10 @@ def finish_projection(ctx, job, state_or_records, mode, meta, provenance, ok_lin
     records = state_or_records
     if outcome is not None:
         advance_snapshot(ctx.jobdir(job), job, outcome)
+    end = local_end(ctx.inbox, job)
+    if end:
+        raise Fail("usage", "the receipt is stored (seq %d) but the local end record %s refuses the local "
+                   "projection" % (records[-1]["seq"], end))
     if not write_projections(ctx.inbox, job, records, mode, meta, provenance):
         emit("projection_pending job=%s" % job)
         raise Fail("projection_pending", "the receipt is stored; the local event is repaired from server records "
@@ -1329,11 +1333,64 @@ def finish_projection(ctx, job, state_or_records, mode, meta, provenance, ok_lin
 
 
 def repair(ctx, job, store, state, meta):
-    """Read repair: project every accepted intent of this job still missing its event."""
+    """Read repair: project every accepted intent of this job still missing its
+    event. A local end refuses every projection (director-1 ruling)."""
+    if local_end(ctx.inbox, job):
+        return
     accepted = {i["receipt"]["seq"] for i in store.intents if i["state"] == "accepted"}
     records = [r for r in state.records if r["seq"] in accepted]
     if records and not write_projections(ctx.inbox, job, records, o3_mode_name(state), meta, "server_repair"):
         raise Fail("projection_pending", "read repair could not write the local events")
+
+
+def local_end(inbox, job):
+    """The newest local end declaration later than the newest revive, or ""."""
+    events = os.path.join(safe_job_dir(inbox, job), "events")
+    return events_ns()["wrk_end_declaration"](events) if os.path.isdir(events) else ""
+
+
+def route_op(ctx, job, opts):
+    """Tell bin/wrk how to run a round command (director-1 dual-write ruling):
+    ENFORCED goes to the server first; SHADOW and OFFLINE_SHADOW run the O2
+    guards first and append only when they pass; LEGACY stays O2."""
+    with Intents(ctx.inbox, job) as store:
+        decision = route(ctx, job, opts.get("--operation", "round"), store)
+    if decision.kind == "legacy":
+        emit("LEGACY")
+    elif decision.kind == "offline_shadow":
+        emit("OFFLINE_SHADOW")
+    else:
+        emit("ENFORCED" if decision.state.receipt_required else "SHADOW")
+
+
+def end_reconcile(ctx, job, opts):
+    """A local end after an intent was formed (director-1 ruling): each pending
+    intent is resent once with its original key and body to learn the outcome,
+    never with a new key; no local projection is written for any accepted
+    intent; one warning per key names it and the local end."""
+    if ctx.mode == "legacy":
+        emit("LEGACY")
+        return
+    end = opts.get("--end", "")
+    directory = ctx.jobdir(job)
+    if not os.path.exists(os.path.join(directory, INTENTS)):
+        return
+    with Intents(ctx.inbox, job) as store:
+        for intent in list(store.pending()):
+            try:
+                send(store, intent)
+                outcome = "accepted"
+            except Fail as exc:
+                outcome = ("rejected %s" % exc.code) if intent["state"] == "rejected" else ("pending %s" % exc.code)
+            warn("o3 intent %s (%s) resent once after the local end record %s: %s; no local projection"
+                 % (intent["idempotency_key"], intent["request"]["kind"], end, outcome))
+        events = os.path.join(directory, "events")
+        done = projected_keys(events) if os.path.isdir(events) else set()
+        for intent in store.intents:
+            if (intent["state"] == "accepted" and intent["request"]["kind"] in PROJECTED_KINDS
+                    and intent["idempotency_key"] not in done):
+                warn("o3 intent %s (%s) is accepted but the local end record %s refuses its projection"
+                     % (intent["idempotency_key"], intent["request"]["kind"], end))
 
 
 def offline_intent(ctx, job, kind, payload_from_snapshot, operation):
@@ -1965,7 +2022,7 @@ FLAGS = {"--head", "--extension-grant", "--repeat-grant", "--tester", "--file", 
          "--round", "--owner", "--label", "--pane", "--parent", "--role", "--task", "--lane", "--tier",
          "--subject", "--report", "--pr", "--waiver-grant", "--rounds-waived", "--as", "--owner-lane",
          "--parent-lane", "--host", "--predecessor", "--supersedes", "--target", "--seal-seq", "--events-dir",
-         "--o2-ref", "--phase", "--after-seq", "--snapshot-seq", "--limit"}
+         "--o2-ref", "--phase", "--after-seq", "--snapshot-seq", "--limit", "--operation", "--end"}
 
 
 def parse(argv):
@@ -1986,7 +2043,7 @@ def parse(argv):
     return opts, positional
 
 
-OPS = {"round-open": round_open, "round-verdict": round_verdict, "round-void": round_void,
+OPS = {"route": route_op, "end-reconcile": end_reconcile, "round-open": round_open, "round-verdict": round_verdict, "round-void": round_void,
        "round-status": round_status, "audit-job": audit_job, "spawn-verify": spawn_verify,
        "completed": completed, "joined": joined, "records": records_page}
 

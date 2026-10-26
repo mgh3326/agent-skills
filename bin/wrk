@@ -5274,6 +5274,37 @@ o3_call() {
   O3_OUT="$(wrk_o3 "$@" </dev/null)" || O3_RC=$?
 }
 
+# o3_route JOB — sets O3_ROUTE (director-1 dual-write ruling): enforced (the
+# server first), shadow or offline_shadow (the O2 guards first, then the
+# append), forced_o2 (the P1 warning branch writing its O2 event) or legacy.
+# O3_FORCE_O2 is internal and assigned at load, never taken from the caller.
+O3_ROUTE="" O3_FORCE_O2=""
+o3_route() {
+  O3_ROUTE=legacy
+  if [[ -n "$O3_FORCE_O2" ]]; then
+    O3_ROUTE=forced_o2
+    return 0
+  fi
+  o3_call route "$1" --operation "$2"
+  o3_exit_on_error
+  case "$O3_OUT" in
+    ENFORCED) O3_ROUTE=enforced ;;
+    SHADOW) O3_ROUTE=shadow ;;
+    OFFLINE_SHADOW) O3_ROUTE=offline_shadow ;;
+  esac
+}
+
+# A local end refuses the round command (O2). An O3 intent formed before that
+# end is first resent once by its own key to learn its outcome, and no local
+# projection is written (director-1 ruling); the caller's end refusal follows.
+o3_reconcile_ended() {
+  local job="$1" end
+  end="$(wrk_newer_end_record "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"
+  [[ -n "$end" ]] || return 0
+  o3_call end-reconcile "$job" --end "$end"
+  [[ "$O3_RC" -eq 0 ]] || warn "o3 end reconcile for $job exited $O3_RC"
+}
+
 # Exit with the adapter's code after a refused O3 command.
 o3_exit_on_error() {
   if [[ "$O3_RC" -ne 0 ]]; then
@@ -6358,9 +6389,24 @@ round_cap_escalate() {
   fi
 }
 
+# o3_round_open_submit JOB OWNER LABEL PANE PARENT HEAD ADAPTER-ARGS... — the
+# server append of a round open; round_cap escalates to the parent and exits 78.
+o3_round_open_submit() {
+  local job="$1" owner="$2" label="$3" pane="$4" parent="$5" head="$6"
+  shift 6
+  o3_call "$@"
+  if [[ "$O3_RC" -eq "$WRK_EXIT_ROUND_CAP" ]]; then
+    round_cap_escalate "$job" "$owner" "$label" "$pane" "$parent" "$head"
+    exit "$WRK_EXIT_ROUND_CAP"
+  fi
+  o3_exit_on_error
+  [[ "$O3_OUT" == LEGACY ]] || printf '%s\n' "$O3_OUT"
+}
+
 round_open_cmd() {
   local job="${1:-}" head="" extend="" repo_override="" repo="" metadata owner label pane parent role
-  local ext_grant="" rep_grant="" tester=""
+  local ext_grant="" rep_grant="" tester="" o2_mode=commit
+  local -a o3_orig=("$@")
   [[ -n "$job" && "$job" != -* ]] || die "round open requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -6379,6 +6425,7 @@ round_open_cmd() {
   if [[ -n "$extend" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  o3_reconcile_ended "$job"
   wrk_refuse_ended "round open" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   if ! repo="$(round_repo_resolve "$job" "$repo_override")"; then
     if [[ -n "$repo_override" ]]; then
@@ -6389,29 +6436,34 @@ round_open_cmd() {
   if ! round_head_check "$repo" "$head"; then
     die "round open: --head $head is not a commit in $repo"
   fi
-  # hk 1926: an enrolled job opens its round on the server; the receipt comes
-  # first and today's job.round is written after it as a projection.
+  # hk 1926: an enforced job opens its round on the server; the receipt comes
+  # first and today's job.round is written after it as a projection. A shadow
+  # job (receipt_required false) runs the O2 guards below first, under the
+  # events lock, and is appended only when they pass (director-1 ruling).
   local o3_args=(round-open "$job" --head "$head" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
   [[ -z "$ext_grant" ]] || o3_args+=(--extension-grant "$ext_grant")
   [[ -z "$rep_grant" ]] || o3_args+=(--repeat-grant "$rep_grant")
   [[ -z "$tester" ]] || o3_args+=(--tester "$tester")
   [[ -z "$extend" ]] || o3_args+=(--o2-ref "$extend")
-  o3_call "${o3_args[@]}"
-  if [[ "$O3_RC" -eq "$WRK_EXIT_ROUND_CAP" ]]; then
-    round_cap_escalate "$job" "$owner" "$label" "$pane" "$parent" "$head"
-    exit "$WRK_EXIT_ROUND_CAP"
-  fi
-  o3_exit_on_error
-  if [[ "$O3_OUT" != LEGACY ]]; then
-    printf '%s\n' "$O3_OUT"
+  o3_route "$job" "round open"
+  if [[ "$O3_ROUTE" == enforced ]]; then
+    o3_round_open_submit "$job" "$owner" "$label" "$pane" "$parent" "$head" "${o3_args[@]}"
     return 0
   fi
-  [[ -z "$ext_grant$rep_grant$tester" ]] ||
-    die "round open: --extension-grant, --repeat-grant and --tester are for an O3 job; job $job is on the O2 path (use --extend REF)"
-
   # An extension is approved before the count is consulted: the fetched hk
   # record must carry a valid grant line for this job from an allowed issuer.
   local grant="" grant_extra=0 grant_issuer=""
+  if [[ "$O3_ROUTE" == legacy ]]; then
+    [[ -z "$ext_grant$rep_grant$tester" ]] ||
+      die "round open: --extension-grant, --repeat-grant and --tester are for an O3 job; job $job is on the O2 path (use --extend REF)"
+  else
+    [[ -z "$extend" ]] ||
+      die "round open: an O3 job takes a typed server grant (--extension-grant SEQ), never the free ref $extend"
+    [[ "$O3_ROUTE" == forced_o2 ]] || o2_mode=check
+    # The typed grant is the server's to judge; locally it stands for the
+    # one extra open the O2 cap would otherwise refuse.
+    [[ -z "$ext_grant" ]] || { grant_extra=1; grant_issuer=o3-typed-grant; }
+  fi
   if [[ -n "$extend" ]]; then
     local tmp_approval
     tmp_approval="$(mktemp)"
@@ -6453,11 +6505,13 @@ round_open_cmd() {
   # concurrently cannot slip a second open past the cap.
   local outcome rc=0
   set +e
-  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend" "$grant_extra" "$grant_issuer" <<'PY'
+  local extend_ref="$extend"
+  [[ -z "$ext_grant" || "$O3_ROUTE" == legacy ]] || extend_ref="o3:typed-grant/$ext_grant"
+  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$head" "$ROUND_CAP_DEFAULT" "$extend_ref" "$grant_extra" "$grant_issuer" "$o2_mode" <<'PY'
 import fcntl, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
 (events, job, owner, label, pane, parent, head, cap,
- extend_ref, grant_extra, grant_issuer) = sys.argv[1:]
+ extend_ref, grant_extra, grant_issuer, o2_mode) = sys.argv[1:]
 cap, grant_extra = int(cap), int(grant_extra)
 os.makedirs(events, exist_ok=True)
 lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
@@ -6505,6 +6559,11 @@ with open(lock_path, "w", encoding="utf-8") as lock:
               "head": head.lower(), "round": next_round, "epoch": 1}
     if approval:
         record["approval"] = approval
+    if o2_mode == "check":
+        # hk 1926: the O2 guards passed for a shadow job; the server append
+        # comes next and writes the projection.
+        print("OPENED round=%d" % next_round)
+        raise SystemExit(0)
     wrk_event_commit(events, "job.round", record)
     print("OPENED round=%d" % next_round)
 PY
@@ -6517,6 +6576,14 @@ PY
       die "round open: refused after end record ${outcome#ENDED$'\t'}"
       ;;
     OPENED\ round=*)
+      if [[ "$o2_mode" == check ]]; then
+        o3_round_open_submit "$job" "$owner" "$label" "$pane" "$parent" "$head" "${o3_args[@]}"
+        if [[ "$O3_OUT" == LEGACY ]]; then
+          # The P1 warning branch: the intent stays pending; the O2 event lands.
+          O3_FORCE_O2=1 round_open_cmd "${o3_orig[@]}"
+        fi
+        return 0
+      fi
       echo "OK job=$job ${outcome#OPENED } cap=$ROUND_CAP_DEFAULT head=$head"
       ;;
     EXTEND_BEFORE_CAP)
@@ -6530,15 +6597,80 @@ PY
   esac
 }
 
+# The O2 void guards and record under the events lock; mode check runs the
+# same guards for a shadow job's typed void and writes nothing.
+round_void_o2() {
+  local job="$1" round_number="$2" ref="$3" reason="$4" grant_issuer="$5" o2_mode="$6"
+  local outcome rc=0
+  set +e
+  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$round_number" "$ref" "$reason" "$grant_issuer" "$o2_mode" <<'PY'
+import fcntl, json, os, sys, tempfile
+exec(os.environ["WRK_EVENTS_PY"])
+events, job, round_text, ref, reason, issuer, o2_mode = sys.argv[1:]
+round_number = int(round_text)
+os.makedirs(events, exist_ok=True)
+lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
+with open(lock_path, "w", encoding="utf-8") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    end_name = wrk_end_declaration(events)
+    if end_name:
+        print("ENDED\t%s" % end_name)
+        raise SystemExit(0)
+    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
+    rounds = [r for r in records if r.get("kind") == "job.round"
+              and r.get("job_id") == job and r.get("round") == round_number]
+    if not rounds:
+        print("NO_ROUND")
+        raise SystemExit(0)
+    if any(r.get("kind") == "job.verdict" and r.get("job_id") == job
+           and r.get("round") == round_number for r in records):
+        print("HAS_VERDICT")
+        raise SystemExit(0)
+    if any(r.get("kind") == "job.round_void" and r.get("job_id") == job
+           and r.get("round") == round_number for r in records):
+        print("ALREADY_VOID")
+        raise SystemExit(0)
+    record = {"kind": "job.round_void", "job_id": job, "round": round_number,
+              "reason": reason, "ref": ref, "issuer": issuer, "epoch": 1}
+    if o2_mode == "check":
+        # hk 1926: the O2 guards passed for a shadow job's typed void.
+        print("VOIDED round=%d" % round_number)
+        raise SystemExit(0)
+    wrk_event_commit(events, "job.round_void", record)
+    print("VOIDED round=%d" % round_number)
+PY
+  )"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || die "round void failed to inspect $job"
+  case "$outcome" in
+    ENDED$'\t'*)
+      die "round void: refused after end record ${outcome#ENDED$'\t'}"
+      ;;
+    VOIDED\ round=*) [[ "$o2_mode" == check ]] || echo "OK job=$job $outcome ref=$ref" ;;
+    NO_ROUND) die "round void: round $round_number does not exist for job $job" ;;
+    HAS_VERDICT) die "round void: round $round_number already has a job.verdict" ;;
+    ALREADY_VOID) die "round void: round $round_number is already voided" ;;
+    *) die "round void unexpected outcome: $outcome" ;;
+  esac
+}
+
 # hk 1926: the typed void of an enrolled job (wrk round void JOB N --grant SEQ).
 round_void_o3() {
   local job="$1" round_number="$2" void_grant="$3" reason_code="$4" metadata owner label pane parent role
   wrk_trust_guard
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  o3_reconcile_ended "$job"
   wrk_refuse_ended "round void" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   local o3_args=(round-void "$job" --round "$round_number" --grant "$void_grant" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
   [[ -z "$reason_code" ]] || o3_args+=(--reason-code "$reason_code")
+  o3_route "$job" "round void"
+  case "$O3_ROUTE" in
+    legacy) die "round void: --grant and --reason-code are for an O3 job; job $job is on the O2 path (use --by REF)" ;;
+    # A shadow job's typed void first passes the O2 guards (director-1 ruling).
+    shadow) round_void_o2 "$job" "$round_number" "o3:grant/$void_grant" "${reason_code:-builder_void}" o3 check ;;
+  esac
   o3_call "${o3_args[@]}"
   o3_exit_on_error
   [[ "$O3_OUT" != LEGACY ]] || die "round void: --grant and --reason-code are for an O3 job; job $job is on the O2 path (use --by REF)"
@@ -6569,6 +6701,7 @@ round_void_cmd() {
   wrk_trust_guard hk
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  o3_reconcile_ended "$job"
   wrk_refuse_ended "round void" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
   # hk 1926: an enrolled job never voids with a free ref; the adapter refuses it.
   o3_call round-void "$job" --round "$round_number" --o2-ref "$ref"
@@ -6604,58 +6737,12 @@ round_void_cmd() {
   fi
   [[ -n "$reason" ]] || reason="round-void: job=$job round=$round_number by=$grant_issuer"
 
-  local outcome rc=0
-  set +e
-  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$round_number" "$ref" "$reason" "$grant_issuer" <<'PY'
-import fcntl, json, os, sys, tempfile
-exec(os.environ["WRK_EVENTS_PY"])
-events, job, round_text, ref, reason, issuer = sys.argv[1:]
-round_number = int(round_text)
-os.makedirs(events, exist_ok=True)
-lock_path = os.path.join(os.path.dirname(events), ".wrk-events.lock")
-with open(lock_path, "w", encoding="utf-8") as lock:
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    end_name = wrk_end_declaration(events)
-    if end_name:
-        print("ENDED\t%s" % end_name)
-        raise SystemExit(0)
-    records = [o for _, o, _ in wrk_events_ordered(events) if o is not None]
-    rounds = [r for r in records if r.get("kind") == "job.round"
-              and r.get("job_id") == job and r.get("round") == round_number]
-    if not rounds:
-        print("NO_ROUND")
-        raise SystemExit(0)
-    if any(r.get("kind") == "job.verdict" and r.get("job_id") == job
-           and r.get("round") == round_number for r in records):
-        print("HAS_VERDICT")
-        raise SystemExit(0)
-    if any(r.get("kind") == "job.round_void" and r.get("job_id") == job
-           and r.get("round") == round_number for r in records):
-        print("ALREADY_VOID")
-        raise SystemExit(0)
-    record = {"kind": "job.round_void", "job_id": job, "round": round_number,
-              "reason": reason, "ref": ref, "issuer": issuer, "epoch": 1}
-    wrk_event_commit(events, "job.round_void", record)
-    print("VOIDED round=%d" % round_number)
-PY
-  )"
-  rc=$?
-  set -e
-  [[ "$rc" -eq 0 ]] || die "round void failed to inspect $job"
-  case "$outcome" in
-    ENDED$'\t'*)
-      die "round void: refused after end record ${outcome#ENDED$'\t'}"
-      ;;
-    VOIDED\ round=*) echo "OK job=$job $outcome ref=$ref" ;;
-    NO_ROUND) die "round void: round $round_number does not exist for job $job" ;;
-    HAS_VERDICT) die "round void: round $round_number already has a job.verdict" ;;
-    ALREADY_VOID) die "round void: round $round_number is already voided" ;;
-    *) die "round void unexpected outcome: $outcome" ;;
-  esac
+  round_void_o2 "$job" "$round_number" "$ref" "$reason" "$grant_issuer" commit
 }
 
 round_verdict_cmd() {
-  local job="${1:-}" file="" metadata owner label pane parent role tester=""
+  local job="${1:-}" file="" metadata owner label pane parent role tester="" o2_mode=commit
+  local -a o3_orig=("$@")
   [[ -n "$job" && "$job" != -* ]] || die "round verdict requires a job id"
   shift || true
   while [[ $# -gt 0 ]]; do
@@ -6669,24 +6756,30 @@ round_verdict_cmd() {
   wrk_trust_guard
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
+  o3_reconcile_ended "$job"
   wrk_refuse_ended "round verdict" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
-  # hk 1926: an enrolled job submits the verdict bytes (read once) to the
-  # server; the job.verdict below is written only after the receipt.
+  # hk 1926: an enforced job submits the verdict bytes (read once) to the
+  # server and the job.verdict below is written only after the receipt. A
+  # shadow job runs the O2 guards below first and is appended only when they
+  # pass (director-1 dual-write ruling).
   local o3_args=(round-verdict "$job" --file "$file" --owner "$owner" --label "$label" --pane "$pane" --parent "$parent")
   [[ -z "$tester" ]] || o3_args+=(--tester "$tester")
-  o3_call "${o3_args[@]}"
-  o3_exit_on_error
-  if [[ "$O3_OUT" != LEGACY ]]; then
-    printf '%s\n' "$O3_OUT"
-    return 0
-  fi
-  [[ -z "$tester" ]] || die "round verdict: --tester is for an O3 job; job $job is on the O2 path"
+  o3_route "$job" "round verdict"
+  case "$O3_ROUTE" in
+    enforced)
+      o3_call "${o3_args[@]}"
+      o3_exit_on_error
+      printf '%s\n' "$O3_OUT"
+      return 0 ;;
+    shadow|offline_shadow) o2_mode=check ;;
+    legacy) [[ -z "$tester" ]] || die "round verdict: --tester is for an O3 job; job $job is on the O2 path" ;;
+  esac
   local outcome rc=0
   set +e
-  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" <<'PY'
+  outcome="$(wrk_py - "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events" "$job" "$owner" "$label" "$pane" "$parent" "$file" "$o2_mode" <<'PY'
 import fcntl, hashlib, io, json, os, sys, tempfile
 exec(os.environ["WRK_EVENTS_PY"])
-events, job, owner, label, pane, parent, vfile = sys.argv[1:]
+events, job, owner, label, pane, parent, vfile, o2_mode = sys.argv[1:]
 os.makedirs(events, exist_ok=True)
 verdict = vsha = None
 matches = []
@@ -6818,6 +6911,11 @@ with open(lock_path, "w", encoding="utf-8") as lock:
               "label": label, "pane_id": pane, "parent_lane": parent,
               "verdict": verdict, "head": vsha, "path": os.path.abspath(vfile),
               "content_sha256": digest, "round": target, "epoch": 1}
+    if o2_mode == "check":
+        # hk 1926: the O2 guards passed for a shadow job; the server append
+        # comes next and writes the projection.
+        print("RECORDED round=%s verdict=%s head=%s used=%d" % (target, verdict, vsha, used))
+        raise SystemExit(0)
     wrk_event_commit(events, "job.verdict", record)
     print("RECORDED round=%s verdict=%s head=%s used=%d" %
           (target, verdict, vsha, used))
@@ -6842,6 +6940,17 @@ PY
       IFS=$'\t' read -r _ no_open_head <<<"$outcome"
       die "round verdict: job $job has no open round; open one with wrk round open $job --head $no_open_head" ;;
     RECORDED*)
+      if [[ "$o2_mode" == check ]]; then
+        o3_call "${o3_args[@]}"
+        o3_exit_on_error
+        if [[ "$O3_OUT" == LEGACY ]]; then
+          # The P1 warning branch: the intent stays pending; the O2 event lands.
+          O3_FORCE_O2=1 round_verdict_cmd "${o3_orig[@]}"
+        else
+          printf '%s\n' "$O3_OUT"
+        fi
+        return 0
+      fi
       local round_no="" verdict_v="" head_v="" used_v="" tok
       for tok in $outcome; do
         case "$tok" in

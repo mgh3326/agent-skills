@@ -1297,6 +1297,126 @@ class RegressedHistoryCase(O3Case):
         self.assertEqual([e["code"] for e in w.events("job-z", "job.o3_warning")], ["not_enrolled"])
 
 
+def shadow_world(case, bindir=BIN):
+    w = World(case, bindir=bindir)
+    w.mode("shadow")
+    w.enroll("job-a", activate=False)
+    w.local_claim("job-a")
+    return w
+
+
+def local_event(w, job, name, document):
+    events = w.inbox / job / "events"
+    events.mkdir(parents=True, exist_ok=True)
+    (events / name).write_text(json.dumps(document) + "\n")
+
+
+class DualWriteOrderCase(O3Case):
+    """director-1 dual-write ruling (design 6, lines 4134 and 4140-4141): a job
+    with receipt_required false runs the O2 round guards first and nothing is
+    sent when they refuse; an intent formed before a later local end is resent
+    once by its key and never projected."""
+
+    def shadow_job(self, bindir=BIN):
+        return shadow_world(self, bindir)
+
+    def local_event(self, w, job, name, document):
+        local_event(w, job, name, document)
+
+    def revoke(self, w, job="job-a"):
+        self.local_event(w, job, "00090-job.revoked.json",
+                         {"kind": "job.revoked", "job_id": job, "at": "2030-01-01T00:00:00.000Z"})
+
+    def wrk_calls(self, w):
+        return [c for c in w.calls() if c["argv"][:1] == ["wrk"]]
+
+    def test_shadow_job_locally_revoked_refuses_before_any_rpc(self):
+        w = self.shadow_job()
+        self.revoke(w)
+        out = w.run("round", "open", "job-a", "--head", w.heads[0])
+        self.assertRc(out, 2)
+        self.assertIn("refused after end record", out.stderr)
+        self.assertEqual(self.wrk_calls(w), [], "no RPC once the O2 end guard refuses")
+        self.assertEqual(w.intents("job-a"), [])
+        self.assertEqual(w.events("job-a", "job.round"), [])
+
+    def scenario_shadow_local_cap(self, bindir):
+        w = shadow_world(self, bindir)
+        for n in (1, 2, 3):
+            local_event(w, "job-a", "0001%d-job.round.json" % n,
+                             {"kind": "job.round", "job_id": "job-a", "round": n, "head": w.heads[n - 1],
+                              "at": "2026-10-24T00:00:0%d.000Z" % n})
+        out = w.run("round", "open", "job-a", "--head", w.heads[3])
+        return w, out
+
+    def test_shadow_job_o2_cap_refuses_before_any_append(self):
+        w, out = self.scenario_shadow_local_cap(BIN)
+        self.assertEqual(out.returncode, 78, out.stderr)
+        self.assertEqual(w.appends(), [], "nothing is sent when the O2 cap refuses")
+        self.assertEqual(w.intents("job-a"), [])
+        self.assertEqual(len(w.events("job-a", "job.escalate")), 1)
+
+    def test_shadow_job_o2_duplicate_path_refuses_before_any_append(self):
+        w = self.shadow_job()
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+        vfile = w.verdict_file("v.md", w.heads[0])
+        self.local_event(w, "job-a", "00050-job.verdict.json",
+                         {"kind": "job.verdict", "job_id": "job-a", "round": 9, "head": w.heads[5], "path": str(vfile),
+                          "verdict": "PASS", "at": "2026-10-24T00:00:09.000Z"})
+        before = len(w.appends())
+        out = w.run("round", "verdict", "job-a", "--file", vfile)
+        self.assertRc(out, 2)
+        self.assertIn("verdict path already recorded", out.stderr)
+        self.assertEqual(len(w.appends()), before)
+
+    def test_shadow_typed_void_runs_the_o2_guards_first(self):
+        w = self.shadow_job()
+        out = w.run("round", "void", "job-a", "4", "--grant", "9")
+        self.assertRc(out, 2)
+        self.assertIn("round 4 does not exist", out.stderr)
+        self.assertEqual(w.appends(), [])
+
+    def test_shadow_job_passing_the_o2_guards_is_appended_then_projected(self):
+        w = self.shadow_job()
+        out = w.run("round", "open", "job-a", "--head", w.heads[0])
+        self.assertRc(out, 0)
+        self.assertEqual(len(w.appends("round_open")), 1)
+        self.assertEqual(w.events("job-a", "job.round")[0]["o3_mode"], "shadow")
+
+    def key_of(self, call):
+        return call["argv"][call["argv"].index("--idempotency-key") + 1]
+
+    def test_pending_intent_after_a_local_end_is_resent_once_and_not_projected(self):
+        w = self.shadow_job()
+        w.fault("append", "commit_then:transport_indeterminate", kind="round_open")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 75)
+        key = w.intents("job-a")[0]["idempotency_key"]
+        self.revoke(w)
+        out = w.run("round", "open", "job-a", "--head", w.heads[0])
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn("refused after end record 00090-job.revoked.json", out.stderr)
+        sends = w.appends("round_open")
+        self.assertEqual([self.key_of(c) for c in sends], [key, key], "resent once with the original key")
+        self.assertIn(key, out.stderr)
+        self.assertIn("00090-job.revoked.json", out.stderr)
+        self.assertEqual(w.events("job-a", "job.round"), [], "no projection after a local end")
+        self.assertEqual([i["state"] for i in w.intents("job-a")], ["accepted"])
+
+    def test_accepted_intent_after_a_local_end_is_not_projected(self):
+        w = self.shadow_job()
+        out = w.run("round", "open", "job-a", "--head", w.heads[0], WRK_O3_TEST_FAULT="crash_after_accept")
+        self.assertEqual(out.returncode, 137)
+        key = w.intents("job-a")[0]["idempotency_key"]
+        self.revoke(w)
+        before = len(w.appends())
+        out = w.run("round", "open", "job-a", "--head", w.heads[1])
+        self.assertNotEqual(out.returncode, 0)
+        self.assertIn(key, out.stderr)
+        self.assertIn("refuses its projection", out.stderr)
+        self.assertEqual(len(w.appends()), before, "an accepted intent is not resent and no new key is made")
+        self.assertEqual(w.events("job-a", "job.round"), [])
+
+
 # ── 3. spawn orders ───────────────────────────────────────────────────────────
 
 
@@ -2195,6 +2315,12 @@ class MutantCase(O3Case):
         w, out = RegressedHistoryCase.scenario_not_found_after_a_receipt(self, bindir)
         self.assertEqual(out.returncode, 0, "the mutant fell back to the legacy path")
         self.assertEqual(len(w.events("job-a", "job.round")), 2)
+
+    def test_m11_shadow_routed_as_enforced_skips_the_o2_guards_goes_red(self):
+        bindir = self.mutant_bin([("wrk", "    SHADOW) O3_ROUTE=shadow ;;\n", "    SHADOW) O3_ROUTE=enforced ;;\n")])
+        w, out = DualWriteOrderCase.scenario_shadow_local_cap(self, bindir)
+        self.assertEqual(out.returncode, 0, "the mutant appended past the O2 cap")
+        self.assertEqual(len(w.appends("round_open")), 1)
 
     def test_m9_legacy_spawn_skipping_the_legacy_task_calls_goes_red(self):
         bindir = self.mutant_bin([("wrk", '''  elif [[ "$O3_SPAWN_VERIFIED" != 1 ]]; then
