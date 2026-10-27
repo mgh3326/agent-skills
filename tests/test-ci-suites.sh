@@ -14,7 +14,7 @@ assert workflow.count('"git", "diff", "--name-only", "--no-renames"') == 1, "PR 
 assert 'git diff --name-only --no-renames "${{ github.event.before }}"' in workflow, "push docs-only diff must include rename source paths"
 manifest = root / "tests/ci-suites.txt"
 manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
-assert manifest_sha256 == "911508d6e671a480bce82826068bd8f076fde1719d0d3e2e362fcdcc35ca1197", "suite list changed; review all shard coverage deliberately"
+assert manifest_sha256 == "92cc9d8888ae99e4b3ffe941949574369966940d080b87cc672f8fb320698d99", "suite list changed; review all shard coverage deliberately"
 rows = []
 for raw in manifest.read_text(encoding="utf-8").splitlines():
     line = raw.strip()
@@ -26,10 +26,10 @@ for raw in manifest.read_text(encoding="utf-8").splitlines():
 commands = [command for _shard, command in rows]
 counts = Counter(commands)
 assert all(count == 1 for count in counts.values()), "every CI suite command must appear exactly once"
-assert len(commands) == 45, f"today's CI suite list changed unexpectedly: {len(commands)} commands"
+assert len(commands) == 46, f"today's CI suite list changed unexpectedly: {len(commands)} commands"
 assert Counter(shard for shard, _command in rows) == Counter({
     "wrk": 1,
-    "suites-a": 10,
+    "suites-a": 11,
     "suites-b": 25,
     "python": 9,
 }), "suite coverage changed: review the shard assignment and update this contract deliberately"
