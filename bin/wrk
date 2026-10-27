@@ -10632,32 +10632,57 @@ the jobs directory. Without --alert the command only prints.
 USAGE
 }
 
-usage_du_kib() {  # DIR — du KiB of DIR (0 when absent or unreadable)
-  local kib
-  kib="$(du -sk "$1" 2>/dev/null | awk 'NR==1{print $1}')" || kib=""
-  [[ "$kib" =~ ^[0-9]+$ ]] || kib=0
-  printf '%s\n' "$kib"
+usage_du_kib() {  # DIR — du KiB of DIR; rc 1 when DIR exists but du failed
+  local out rc=0
+  [[ -e "$1" || -L "$1" ]] || { printf '0\n'; return 0; }
+  out="$(du -sk "$1" 2>/dev/null)" || rc=$?
+  if [[ $rc -eq 0 && ${out%%[[:space:]]*} =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "${out%%[[:space:]]*}"
+  else
+    return 1
+  fi
 }
 
 usage_measure() {  # WORK_ROOT — fill the USAGE_* bucket fields
-  local work="$1" d name
+  local work d name kib rows
+  # Resolve a symlinked work root to its real path so du measures the
+  # target, never the link itself (a link would read near-zero).
+  work="$1"
+  if [[ -e "$work" || -L "$work" ]]; then
+    work="$(cd "$work" 2>/dev/null && pwd -P)" || work="$1"
+  fi
   USAGE_WORK="$work"
   USAGE_HOST="${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
   USAGE_JOBS="$work/herdr-inbox/jobs"
   USAGE_WEBQA="$work/webqa-runner"
-  USAGE_TOTAL_KIB="$(usage_du_kib "$work")"
-  USAGE_JOBS_KIB="$(usage_du_kib "$USAGE_JOBS")"
+  USAGE_INCOMPLETE=0
+  USAGE_TOTAL_KIB="$(usage_du_kib "$work")" ||
+    { USAGE_INCOMPLETE=1; USAGE_TOTAL_KIB=0; }
+  USAGE_JOBS_KIB="$(usage_du_kib "$USAGE_JOBS")" ||
+    { USAGE_INCOMPLETE=1; USAGE_JOBS_KIB=0; }
   USAGE_WT_COUNT=0 USAGE_WT_KIB=0
   USAGE_WEBQA_PRESENT=0 USAGE_WEBQA_KIB=0
   USAGE_TOP5=""
   if [[ -d "$USAGE_JOBS" ]]; then
-    USAGE_TOP5="$(
-      for d in "$USAGE_JOBS"/*/; do
-        [[ -d "$d" ]] || continue
-        name="${d%/}"; name="${name##*/}"
-        printf '%s\t%s\n' "$(usage_du_kib "$d")" "$name"
-      done | sort -rn | head -5 | awk -F'\t' '{printf "%s%s:%s",(NR>1?",":""),$2,$1}'
-    )"
+    # Collect the rows in the parent (not inside a pipe) so a failed du
+    # flags the run incomplete, then sort once and keep the first five
+    # with awk NR<=5 — reading the whole stream, never closing it early
+    # (an early head close would SIGPIPE sort and fail the command under
+    # set -o pipefail).
+    rows=""
+    for d in "$USAGE_JOBS"/*/; do
+      [[ -d "$d" ]] || continue
+      name="${d%/}"; name="${name##*/}"
+      if kib="$(usage_du_kib "$d")"; then
+        rows+="$kib"$'\t'"$name"$'\n'
+      else
+        USAGE_INCOMPLETE=1
+      fi
+    done
+    if [[ -n "$rows" ]]; then
+      USAGE_TOP5="$(printf '%s' "$rows" | sort -rn |
+        awk -F'\t' 'NR<=5{printf "%s%s:%s",(NR>1?",":""),$2,$1}')"
+    fi
   fi
   # Linked worktrees: a top-level dir whose .git is a FILE (a gitdir
   # pointer), never a .git dir — the file type alone decides, no content
@@ -10668,15 +10693,22 @@ usage_measure() {  # WORK_ROOT — fill the USAGE_* bucket fields
     case "$name" in herdr-inbox|webqa-runner) continue ;; esac
     if [[ -f "$d.git" ]]; then
       USAGE_WT_COUNT=$((USAGE_WT_COUNT + 1))
-      USAGE_WT_KIB=$((USAGE_WT_KIB + $(usage_du_kib "$d")))
+      if kib="$(usage_du_kib "$d")"; then
+        USAGE_WT_KIB=$((USAGE_WT_KIB + kib))
+      else
+        USAGE_INCOMPLETE=1
+      fi
     fi
   done
   if [[ -e "$USAGE_WEBQA" || -L "$USAGE_WEBQA" ]]; then
     USAGE_WEBQA_PRESENT=1
-    USAGE_WEBQA_KIB="$(usage_du_kib "$USAGE_WEBQA")"
+    USAGE_WEBQA_KIB="$(usage_du_kib "$USAGE_WEBQA")" ||
+      { USAGE_INCOMPLETE=1; USAGE_WEBQA_KIB=0; }
   fi
   USAGE_REST_KIB=$((USAGE_TOTAL_KIB - USAGE_JOBS_KIB - USAGE_WT_KIB - USAGE_WEBQA_KIB))
   if ((USAGE_REST_KIB < 0)); then USAGE_REST_KIB=0; fi
+  ((USAGE_INCOMPLETE == 0)) ||
+    warn "wrk usage: one or more du measurements failed; totals are incomplete (work=$USAGE_WORK)"
 }
 
 usage_threshold() {  # fill USAGE_THRESHOLD_GB and USAGE_THRESHOLD_SRC
@@ -10709,8 +10741,10 @@ usage_report() {
     printf 'webqa_runner=absent\n'
   fi
   printf 'rest_kib=%s\n' "$USAGE_REST_KIB"
-  local over=no
+  local over=no complete=yes
   usage_over_threshold && over=yes
+  ((USAGE_INCOMPLETE == 0)) || complete=no
+  printf 'measurement=%s\n' "$complete"
   printf 'fleet_usage_alert_gb=%s threshold_src=%s over_threshold=%s\n' \
     "$USAGE_THRESHOLD_GB" "$USAGE_THRESHOLD_SRC" "$over"
 }
@@ -10720,6 +10754,10 @@ usage_alert_host_key() {
 }
 
 usage_alert() {
+  if ((USAGE_INCOMPLETE)); then
+    printf 'alert=skipped reason=incomplete-measurement\n'
+    return 0
+  fi
   if ! usage_over_threshold; then
     printf 'alert=under-threshold\n'
     return 0

@@ -15884,9 +15884,13 @@ t2092_jobs_kib="$(t2092_du "$t2092_jobs")"
 t2092_wt=$(( $(t2092_du "$t2092_work/repo.alpha") + $(t2092_du "$t2092_work/repo.beta") ))
 t2092_webqa="$(t2092_du "$t2092_work/webqa-runner")"
 t2092_rest=$(( t2092_total - t2092_jobs_kib - t2092_wt - t2092_webqa ))
-grep -q "host=.* work_root=$t2092_work total_kib=$t2092_total " "$T2092_OUT" ||
+# The report prints the resolved (physical) work root and jobs root — on
+# macOS a /var TMPDIR resolves to /private/var — so compare resolved paths.
+t2092_work_res="$(cd "$t2092_work" && pwd -P)"
+t2092_jobs_res="$(cd "$t2092_jobs" && pwd -P)"
+grep -q "host=.* work_root=$t2092_work_res total_kib=$t2092_total " "$T2092_OUT" ||
   fail "hk2092: work total mismatch: $(cat "$T2092_OUT")"
-grep -q "jobs_root=$t2092_jobs jobs_kib=$t2092_jobs_kib" "$T2092_OUT" ||
+grep -q "jobs_root=$t2092_jobs_res jobs_kib=$t2092_jobs_kib" "$T2092_OUT" ||
   fail "hk2092: jobs total mismatch: $(cat "$T2092_OUT")"
 grep -q "jobs_top5=$(t2092_exp_top5 "$t2092_jobs")" "$T2092_OUT" ||
   fail "hk2092: top5 mismatch: $(grep jobs_top5 "$T2092_OUT")"
@@ -15992,6 +15996,58 @@ WRK_UNDER_TEST="$TMP/mut-wrk-t2092-nodedup" t2092_run "$t2092_home4" --alert
   fail "hk2092 M1 mutant survived: dropping the 24h dedup must re-emit on the second run"
 echo "PASS hk2092 M1: dropping the 24h dedup goes RED on the second run"
 unset T2092_CONFIG WRK_UNDER_TEST
+
+# Case: many job dirs must not SIGPIPE the report. The old top-5 ran
+# `sort -rn | head -5`, so once the sorted stream outgrew the pipe buffer
+# head exited early, sort took SIGPIPE and, under set -o pipefail, the
+# command died (rc 141) before printing. awk NR<=5 reads the whole stream.
+t2092_hmany="$TMP/t2092-hmany"
+mkdir -p "$t2092_hmany/work/herdr-inbox/jobs"
+( cd "$t2092_hmany/work/herdr-inbox/jobs" &&
+  for i in $(seq 1 6000); do mkdir "job-$i"; done )
+T2092_CONFIG="" T2092_PANEWIRE_LOG="$TMP/t2092-many.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_hmany"
+[[ "$T2092_RC" -eq 0 ]] ||
+  fail "hk2092: usage over many job dirs must not SIGPIPE (rc=$T2092_RC): $(cat "$T2092_ERR")"
+grep -q '^jobs_top5=' "$T2092_OUT" ||
+  fail "hk2092: many-dir run must still print jobs_top5: $(cat "$T2092_OUT")"
+echo "PASS hk2092 many job dirs do not SIGPIPE the report (rc 0)"
+
+# Case: a failed du marks the run incomplete, warns and never alerts — a
+# silent 0 would have compared a false total against the threshold.
+t2092_hbad="$TMP/t2092-hbad"; t2092_fixture "$t2092_hbad"
+mkdir -p "$t2092_hbad/work/herdr-inbox/jobs/job-locked"
+t2092_blob "$t2092_hbad/work/herdr-inbox/jobs/job-locked/blob" 5
+chmod 000 "$t2092_hbad/work/herdr-inbox/jobs/job-locked"
+T2092_CONFIG="" T2092_PANEWIRE_LOG="$TMP/t2092-bad.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_hbad" --alert
+[[ "$T2092_RC" -eq 0 ]] || fail "hk2092: a failed du must not crash (rc=$T2092_RC)"
+grep -q 'measurement=no' "$T2092_OUT" ||
+  fail "hk2092: a failed du must report measurement=no: $(cat "$T2092_OUT")"
+grep -qi 'incomplete' "$T2092_ERR" ||
+  fail "hk2092: a failed du must warn: $(cat "$T2092_ERR")"
+grep -q 'alert=skipped reason=incomplete-measurement' "$T2092_OUT" ||
+  fail "hk2092: an incomplete measurement must skip the alert: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 0 ]] ||
+  fail "hk2092: an incomplete measurement must not emit: $(cat "$T2092_PANEWIRE_LOG")"
+chmod 755 "$t2092_hbad/work/herdr-inbox/jobs/job-locked"
+echo "PASS hk2092 a failed du reports incomplete and never alerts"
+
+# Case: a symlinked ~/work resolves to its target before du — measuring the
+# link itself would read near-zero and could sit under the threshold.
+t2092_hsym="$TMP/t2092-hsym"
+mkdir -p "$t2092_hsym/realwork/herdr-inbox/jobs/j1"
+t2092_blob "$t2092_hsym/realwork/herdr-inbox/jobs/j1/blob" 50
+ln -s "$t2092_hsym/realwork" "$t2092_hsym/work"
+T2092_PANEWIRE_LOG="$TMP/t2092-sym.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_hsym"
+[[ "$T2092_RC" -eq 0 ]] || fail "hk2092: symlinked work root rc=$T2092_RC"
+t2092_resolved="$(cd "$t2092_hsym/work" && pwd -P)"
+grep -q "work_root=$t2092_resolved" "$T2092_OUT" ||
+  fail "hk2092: a symlinked ~/work must report the resolved target: $(cat "$T2092_OUT")"
+grep -q "jobs_kib=$(t2092_du "$t2092_hsym/realwork/herdr-inbox/jobs")" "$T2092_OUT" ||
+  fail "hk2092: a symlinked ~/work must measure the target, not the link: $(cat "$T2092_OUT")"
+echo "PASS hk2092 a symlinked work root resolves to its target"
 
 # hk 1439: deliberate check — with SCOPEFUEL_BIN unset, a profile lease falls back
 # to PATH, must hit the tripwire shim (rc 99 via the lease error), then the log is
