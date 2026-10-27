@@ -39,6 +39,11 @@ DISPOSITION = re.compile(r"\bdisposition(?:_ref)?:\s*([^\s,;]+)", re.I)
 ISSUE = re.compile(r"^\s*(?:[-*]\s*)?(?:\*\*)?(BLOCKER|RISK)(?:\*\*)?(?:[- ]\d+)?\s*(?::|[—–-])\s*(.*)$", re.I)
 ARTIFACT_SHA = re.compile(r"(?i)(?<![0-9a-f])([0-9a-f]{64})(?![0-9a-f])")
 CHECKOUT_STEP = re.compile(r"^[^\t]+\tRun actions/checkout@[^\t]*\t")
+CHECKOUT_OPEN = re.compile(r"##\[group\]Run actions/checkout@\S+")
+GIT_LOG_LINE = re.compile(r"\[command\](?:\S*/git|git) log -1 --format=%H")
+HEAD_AT = re.compile(r"HEAD is now at (?P<abbrev>[0-9a-f]{7,40})\b")
+SHA_END = re.compile(r"\b(?P<sha>[0-9a-f]{40})\s*$")
+STEP_SLACK = timedelta(seconds=1)
 SENSITIVE = {
     "private_address": re.compile(r"\b(?:10\.(?:\d{1,3}\.){2}\d{1,3}|192\.168\.(?:\d{1,3}\.)\d{1,3}|172\.(?:1[6-9]|2\d|3[01])\.(?:\d{1,3}\.)\d{1,3})\b"),
     "pane_identifier": re.compile(r"\bw[A-Za-z0-9]+:p[A-Za-z0-9]+\b"),
@@ -77,10 +82,64 @@ def gh_api(endpoint: str) -> Any:
     return run_json(["gh", "api", endpoint])
 
 
-def checkout_merge_sha(log: str) -> str | None:
+def log_rows(lines: list[str]) -> list[tuple[str, str]]:
+    """(timestamp, text) per `job TAB step TAB timestamp text` line."""
+    rows: list[tuple[str, str]] = []
+    for line in lines:
+        stamp, _, text = line.split("\t", 2)[-1].partition(" ")
+        rows.append((stamp, text))
+    return rows
+
+
+def unknown_step_rows(lines: list[str]) -> list[tuple[str, str]] | None:
+    """Rows when every line is `job TAB UNKNOWN STEP TAB timestamp text`, else None."""
+    if not lines or any(line.count("\t") < 2 or line.split("\t", 2)[1] != "UNKNOWN STEP" for line in lines):
+        return None
+    return log_rows(lines)
+
+
+def unlabelled_checkout_sha(lines: list[str], steps: Any) -> str | None:
+    """Checkout commit from the checkout group framing, cross-checked against the job steps list."""
+    if not isinstance(steps, list):
+        return None
+    rows = log_rows(lines)
+    texts = [text for _, text in rows]
+    openers = [index for index, text in enumerate(texts) if CHECKOUT_OPEN.fullmatch(text)]
+    if len(openers) != 1:
+        return None
+    start = openers[0]
+    end = next((index for index in range(start + 1, len(texts)) if texts[index].startswith("##[group]Run ")), len(texts))
+    commands = [index for index, text in enumerate(texts) if GIT_LOG_LINE.fullmatch(text)]
+    if len(commands) != 1 or not start < commands[0] < end - 1:
+        return None
+    command = commands[0]
+    announced = {found.group("abbrev") for text in texts[max(start, command - 20):command] for found in HEAD_AT.finditer(text)}
+    sha = SHA_END.search(texts[command + 1])
+    if not announced or not sha:
+        return None
+    full = sha.group("sha")
+    if not all(full.startswith(abbrev) for abbrev in announced):
+        return None
+    checkout = [step for step in steps if isinstance(step, dict) and str(step.get("name", "")).startswith("Run actions/checkout@")]
+    if len(checkout) != 1:
+        return None
+    try:
+        opened, closed = parse_time(rows[start][0]), parse_time(rows[end - 1][0])
+        begin, finish = parse_time(checkout[0]["started_at"]), parse_time(checkout[0]["completed_at"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    if not (begin - STEP_SLACK <= opened and closed <= finish + STEP_SLACK):
+        return None
+    return full
+
+
+def checkout_merge_sha(log: str, steps: Any = None) -> str | None:
     """Extract one full checkout commit from an immutable Actions job log."""
     candidates: list[str] = []
     lines = log.splitlines()
+    # Every line is UNKNOWN STEP, so no step label can find the checkout; bind from the group framing and job steps. hk2001-unlabelled
+    if unknown_step_rows(lines) is not None:
+        return unlabelled_checkout_sha(lines, steps)
     for index, line in enumerate(lines[:-1]):
         if not CHECKOUT_STEP.search(line) or not re.search(r"\[command\](?:\S*/git|git) log -1 --format=%H\s*$", line):
             continue
@@ -103,7 +162,11 @@ def checkout_merge_sha(log: str) -> str | None:
 
 def checkout_provenance(repo: str, run_id: int, job_id: int, H: str) -> dict[str, str]:
     log = run_text(["gh", "run", "view", str(run_id), "-R", repo, "--job", str(job_id), "--log"], timeout=90)
-    merge_sha = checkout_merge_sha(log)
+    steps = None
+    if unknown_step_rows(log.splitlines()) is not None:
+        job = gh_api(f"repos/{repo}/actions/jobs/{job_id}")
+        steps = job.get("steps") if isinstance(job, dict) else None
+    merge_sha = checkout_merge_sha(log, steps)
     if not merge_sha:
         return {}
     commit = gh_api(f"repos/{repo}/git/commits/{merge_sha}")
