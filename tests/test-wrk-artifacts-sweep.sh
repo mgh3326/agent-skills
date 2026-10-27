@@ -841,4 +841,83 @@ assert not rows, rows' ||
   fail "sw16 recorded a deleted row for a kept file"
 echo "PASS sw16-toctou-kept"
 
+# ─────────────────────────────────────────────────────────────────────────────
+echo "== sw17: a record cannot point its source at a sibling job dir =="
+reset_case sw17
+write_hosts
+write_policy
+mk_ended_job sw17 211 w:p9
+mk_task 211 merged proj sw17
+# The sibling job is live (its task is still claimed) and holds the victim.
+mk_ended_job sw17b 212 w:p9
+mk_task 212 claimed proj sw17b
+B="$INBOX/sw17b"
+mkdir -p "$B/evidence"
+printf 'victim\n' >"$B/evidence/v.png"
+R="$(mk_row evidence/v.png "$B/evidence/v.png")"
+# The record sits under sw17's key but names sw17b's directory as its source.
+mk_record "artifacts/proj/211/sw17" test-host sw17 211 proj "$B" drive_confirmed "[$R]"
+sweep --job sw17 --apply
+[[ "$SWEEP_RC" == 0 ]] || fail "sw17 rc=$SWEEP_RC: $SWEEP_OUT"
+[[ -f "$B/evidence/v.png" ]] || fail "sw17 deleted a sibling job's file"
+have "skip reason=source-other-job" ||
+  fail "sw17 must skip source-other-job: $SWEEP_OUT"
+echo "PASS sw17-source-other-job"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "== sw18: the newest claim is chosen by event time, not file name =="
+reset_case sw18
+write_hosts
+write_policy
+mk_ended_job sw18 201 w:p9
+mk_task 201 merged proj sw18
+mk_task 202 claimed proj sw18
+# A higher-numbered claim with an older timestamp and a higher seq: name order
+# and seq-only order both pick task 202; event time picks task 201.
+OLD6="$(python3 -c 'import datetime
+print((datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=6)).replace(microsecond=0).isoformat())')"
+cat >"$INBOX/sw18/events/00010-job.claim.json" <<EOF
+{"created_at":"$OLD6","job_id":"sw18","kind":"job.claim","payload":{"task_id":202,"owner_lane":"lane-a","agent_label":"lbl"},"seq":99}
+EOF
+JD="$INBOX/sw18"
+mkdir -p "$JD/evidence"
+printf 'claim-order\n' >"$JD/evidence/c.png"
+R="$(mk_row evidence/c.png "$JD/evidence/c.png")"
+mk_record "artifacts/proj/201/sw18" test-host sw18 201 proj "$JD" drive_confirmed "[$R]"
+sweep --job sw18 --apply
+[[ "$SWEEP_RC" == 0 ]] || fail "sw18 rc=$SWEEP_RC: $SWEEP_OUT"
+[[ ! -e "$JD/evidence/c.png" ]] ||
+  fail "sw18 picked the higher-named older claim: $SWEEP_OUT"
+echo "PASS sw18-claim-event-time"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "== sw19: a non-JSON doc get is a record-fetch failure, not a traceback =="
+reset_case sw19
+write_hosts
+write_policy
+mk_ended_job sw19 221 w:p9
+mk_task 221 merged proj sw19
+JD="$INBOX/sw19"
+mkdir -p "$JD/evidence"
+printf 'x\n' >"$JD/evidence/x.png"
+R="$(mk_row evidence/x.png "$JD/evidence/x.png")"
+mk_record "artifacts/proj/221/sw19" test-host sw19 221 proj "$JD" drive_confirmed "[$R]"
+WRAP="$TMP/badjson-hk"
+cat >"$WRAP" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-} ${2:-}" == "doc get" ]]; then
+  printf 'not-json garbage\n'
+  exit 0
+fi
+exec "$WRK_ARTIFACTS_BADJSON_HK" "$@"
+SH
+chmod +x "$WRAP"
+sweep HANDOFFKEEP_BIN="$WRAP" WRK_ARTIFACTS_BADJSON_HK="$HK" --job sw19 --apply
+[[ "$SWEEP_RC" == 0 ]] || fail "sw19 rc=$SWEEP_RC: $SWEEP_OUT"
+have "skip reason=record-fetch-failed" ||
+  fail "sw19 must report record-fetch-failed: $SWEEP_OUT"
+have_not "Traceback" || fail "sw19 leaked a traceback: $SWEEP_OUT"
+[[ -f "$JD/evidence/x.png" ]] || fail "sw19 deleted without a readable record"
+echo "PASS sw19-bad-doc-json"
+
 echo "ALL PASS"

@@ -14043,31 +14043,64 @@ artifacts_host_ids() {
 }
 
 # Newest task_id named by the job's claim/reclaim events; empty on none.
+# "Newest" is event time, not file name: a claim can be written at a higher
+# file number with an older timestamp. seq then the name break ties.
 artifacts_job_task_id() {
   local job="$1" jr
   jr="$(wrk_jobs_root)" || return 0
   [[ -d "$jr/$job" ]] || return 0
   wrk_py - "$jr" "$job" <<'PY'
-import json, os, sys
+import datetime, json, os, sys
 jobs_root, job = sys.argv[1], sys.argv[2]
 d = os.path.join(jobs_root, job, "events")
+
+
+def claim_key(doc, name):
+    ts = doc.get("created_at") or doc.get("at") or ""
+    when = None
+    if isinstance(ts, str) and ts:
+        try:
+            when = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except ValueError:
+            when = None
+    if when is not None and when.tzinfo is None:
+        when = when.replace(tzinfo=datetime.timezone.utc)
+    seq = doc.get("seq")
+    try:
+        seq = int(seq)
+    except (TypeError, ValueError):
+        seq = -1
+    return (when is not None,
+            when or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
+            seq, name)
+
+
 best = ""
+best_key = None
 if os.path.isdir(d):
-    for name in sorted(os.listdir(d)):
+    for name in os.listdir(d):
         if not name.endswith(".json"):
             continue
         try:
             doc = json.load(open(os.path.join(d, name), encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if not isinstance(doc, dict):
+            continue
         kind = str(doc.get("kind", ""))
         if "claim" not in kind and "reclaim" not in kind:
             continue
-        pl = doc.get("payload") or {}
+        pl = doc.get("payload") if isinstance(doc.get("payload"), dict) else {}
         tid = pl.get("task_id") or doc.get("task_id")
         if isinstance(tid, int) and tid > 0:
-            best = str(tid)
+            tid = str(tid)
         elif isinstance(tid, str) and tid.isdigit():
+            pass
+        else:
+            continue
+        key = claim_key(doc, name)
+        if best_key is None or key > best_key:
+            best_key = key
             best = tid
 print(best)
 PY
@@ -14108,6 +14141,8 @@ job, jobdir, work_root, docs_path, plan_dir, ldel = sys.argv[1:7]
 host_ids = set(sys.argv[7].split("|")) if sys.argv[7] else set()
 policy_path, project, task_id = sys.argv[8:11]
 os.makedirs(plan_dir, exist_ok=True)
+jobs_root_real = os.path.realpath(os.path.dirname(jobdir))
+selected_real = os.path.realpath(jobdir)
 
 NEVER = {"record-text", "protected", "cache", "intermediate-build", "worktree"}
 UPLOAD = {"evidence", "final-build"}
@@ -14251,9 +14286,11 @@ for d in docs:
         line("dataset=%s skip reason=source-not-dir" % key)
         continue
     base = None
+    matched_jobs_root = False
     for rname, (rroot, rkind) in root_order:
         rr = os.path.realpath(rroot)
         if real_source == rr or real_source.startswith(rr + os.sep):
+            matched_jobs_root = rr == jobs_root_real
             if rkind == "flat":
                 base = rr
                 base_root_name = rname
@@ -14268,6 +14305,13 @@ for d in docs:
             break
     if base is None:
         line("dataset=%s skip reason=source-outside-roots" % key)
+        continue
+    # The selected job's gates only cover this job. A record under this job's
+    # key must not point its source at a sibling job dir under the jobs inbox,
+    # or it could delete a live job's files. Other named roots keep today's
+    # behaviour.
+    if matched_jobs_root and os.path.realpath(base) != selected_real:
+        line("dataset=%s skip reason=source-other-job" % key)
         continue
     contents = {}
     for r in archive.get("contents") or []:
@@ -14542,10 +14586,17 @@ print("\n".join(sorted(out)[:64]))
       else
         printf '%s' "$get_out" | python3 -c '
 import json, sys
-doc = json.loads(sys.stdin.read())
+key = sys.argv[1]
+try:
+    doc = json.loads(sys.stdin.read())
+except ValueError:
+    doc = None
+if not isinstance(doc, dict):
+    print(json.dumps({"key": key, "kind": "note", "body": "", "_error": True}))
+    raise SystemExit(0)
 print(json.dumps({"key": doc.get("key") or "", "kind": doc.get("kind") or "note",
                   "body": doc.get("body") or ""}))
-' >>"$docs_jsonl"
+' "$key" >>"$docs_jsonl"
       fi
     done <<<"$keys"
 
