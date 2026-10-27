@@ -205,14 +205,35 @@ PY
 }
 
 # --t is required by wrk; supply one unless the case under test provides its own.
+track_test_spawn_sentinel() {
+  local job="$1" jobdir="$ARBITER_INBOX_ROOT/$1"
+  local pidfile="$jobdir/completion-sentinel.pid" pid="" attempt
+  [[ -s "$pidfile" ]] || { echo "expected sentinel pidfile for $job" >&2; return 1; }
+  IFS= read -r pid <"$pidfile" || { echo "could not read sentinel pid for $job" >&2; return 1; }
+  [[ "$pid" =~ ^[0123456789]+$ ]] || { echo "malformed sentinel pid for $job" >&2; return 1; }
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    _tw_pid_alive "$pid" || return 0
+    if _tw_sentinel_argv_ok "$pid" "$job" "$jobdir"; then
+      # Fake-clock cases intentionally make the pidfile's started= fail the
+      # production age check. Capture this exact test-owned PID's real start
+      # identity and process group so teardown can reap its detached session.
+      tw_register_pid "$OWNED_PIDS" "$pid"
+      return
+    fi
+    sleep 0.2
+  done
+  echo "sentinel $pid for $job stayed alive without its final argv" >&2
+  return 1
+}
+
 spawn_base() {
   local model="$1"; shift
   local extra=("$@")
+  local spawn_rc=0 session_job="" session_pid="" i
+  local -a spawn_cmd=()
   # The fake clock records started=1000, which correctly fails the real
   # process-start check. In the opt-in cases, the self-recorded session
   # keeps the orphan sentinel owned independently of that pidfile.
-  local -a own_session=()
-  [[ "${TEST_OWN_SESSION:-0}" == 1 ]] && own_session=(tw_own_session)
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
   # #768: every spawn binds an hk task. Mint a fresh fixture task per spawn so
   # owner-mode claims stay claimable; a case that supplies --task/--parent-job
@@ -229,9 +250,12 @@ spawn_base() {
   # Record the effective --task each call carries. spawn_base often runs
   # inside $(...), so a global is lost to the parent shell — a log file is
   # the subshell-safe channel (tail -1 after a call = that call's task).
-  local resolved_task="" i
+  local resolved_task=""
   for ((i = 0; i < ${#extra[@]}; i++)); do
     [[ "${extra[$i]}" == "--task" ]] && resolved_task="${extra[$((i + 1))]}"
+    if [[ "${extra[$i]}" == "--job" && $((i + 1)) -lt ${#extra[@]} ]]; then
+      session_job="${extra[$((i + 1))]}"
+    fi
   done
   [[ -n "$resolved_task" ]] && printf '%s\n' "$resolved_task" >>"$TMP/spawn-task.log"
   # A registered job leaves a detached sentinel behind, and that sentinel keeps
@@ -240,7 +264,7 @@ spawn_base() {
   # once in three runs, between a case's `rm -f "$TMP/herdr.log"` and its
   # `[[ ! -e "$TMP/herdr.log" ]]`, and the suite dies there with no message.
   # Park the probes past the end of the run instead.
-  "${own_session[@]+"${own_session[@]}"}" env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  spawn_cmd=(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_COMPLETION_INTERVAL_S="${WRK_COMPLETION_INTERVAL_S:-3600}" \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
@@ -248,7 +272,24 @@ spawn_base() {
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S="${WRK_REFRESH_TIMEOUT_S:-5}" \
     "${WRK_UNDER_TEST:-$WRK}" spawn \
-    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
+    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}")
+  if [[ "${TEST_OWN_SESSION:-0}" == 1 ]]; then
+    tw_own_session "${spawn_cmd[@]}" &
+    session_pid=$!
+    if wait "$session_pid"; then
+      :
+    else
+      spawn_rc=$?
+    fi
+  elif "${spawn_cmd[@]}"; then
+    :
+  else
+    spawn_rc=$?
+  fi
+  if [[ "${TEST_OWN_SESSION:-0}" == 1 && -n "$session_job" ]]; then
+    track_test_spawn_sentinel "$session_job" || return 1
+  fi
+  return "$spawn_rc"
 }
 
 run_terra_refusal_tests() {
@@ -14333,10 +14374,10 @@ wait_until 15 bash -c "! kill -0 $grace_pid 2>/dev/null" ||
   fail "the sentinel must exit once it has completed a job it had already reported lost"
 wait "$grace_pid" 2>/dev/null || true
 grace_log="$GRACE_INBOX/sentinel-grace/completion-sentinel.log"
-grace_lines="$(awk 'END{print NR}' "$grace_log")"
+grace_lines="$(awk '/ status=/ { n++ } END { print n+0 }' "$grace_log")"
 grace_calls="$(awk 'END{print NR}' "$GRACE_SEQ.calls")"
 [[ "$grace_lines" -eq "$grace_calls" ]] ||
-  fail "completion-sentinel.log must hold exactly one line per decision: $grace_lines lines for $grace_calls observations"
+  fail "completion-sentinel.log must hold exactly one decision per observation: $grace_lines decisions for $grace_calls observations"
 grep -q 'action=lost:herdr_unreachable' "$grace_log" ||
   fail "the decision log must name the lost reason it wrote (action=lost:herdr_unreachable)"
 grep -q 'action=completed' "$grace_log" ||
@@ -14358,8 +14399,8 @@ GONE_EVENTS="$GONE_INBOX/sentinel-gone/events"
 [[ "$(sentinel_lost_reason "$GONE_EVENTS")" == "agent_not_found" ]] ||
   fail "job.lost must carry reason=agent_not_found, got '$(sentinel_lost_reason "$GONE_EVENTS")'"
 gone_log="$GONE_INBOX/sentinel-gone/completion-sentinel.log"
-[[ "$(awk 'END{print NR}' "$gone_log")" -eq 1 ]] ||
-  fail "one observation is one decision is one log line"
+[[ "$(awk '/ status=/ { n++ } END { print n+0 }' "$gone_log")" -eq 1 ]] ||
+  fail "one observation is one decision log entry"
 grep -q 'status=err:agent_not_found transient=0 action=lost:agent_not_found' "$gone_log" ||
   fail "the decision log must show the error code that proved the loss"
 echo "PASS sentinel-agent-not-found-is-immediate-loss"
@@ -16246,6 +16287,251 @@ else
     fail "hk1137 M1 mutant survived: --lane-defer still refused the non-ASCII id without the locale pin"
   echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
 fi
+
+# ---------------------------------------------------------------- hk 2092 fleet usage
+# r1026m1bdisk item 4: `wrk usage` measures this host's fleet output under
+# ~/work (du at one level, nothing read into or moved) and `wrk usage
+# --alert` emits at most one lane.event to director-1 per host per 24h once
+# the total exceeds [local] fleet_usage_alert_gb (default 100).
+t2092_blob() { dd if=/dev/zero of="$1" bs=1024 count="$2" 2>/dev/null; }
+
+t2092_fixture() {  # ROOT — build $ROOT/work with jobs, worktrees, webqa, rest
+  local home="$1" work jobs j size=10
+  work="$home/work" jobs="$work/herdr-inbox/jobs"
+  mkdir -p "$work/webqa-runner/run" "$work/misc" "$work/repo.main/.git" \
+    "$work/repo.alpha" "$work/repo.beta"
+  for j in a b c d e f g; do
+    mkdir -p "$jobs/job-$j"
+    size=$((size + 10))
+    t2092_blob "$jobs/job-$j/blob" "$size"
+  done
+  # job sizes 20..80 step 10 — the du ordering is g f e d c for the top 5.
+  mkdir -p "$work/herdr-inbox/logs"
+  t2092_blob "$work/herdr-inbox/logs/x" 7
+  # A linked worktree carries a .git FILE (gitdir pointer); a main checkout
+  # carries a .git dir, so repo.main must not count.
+  printf 'gitdir: /fixture/gitdir\n' >"$work/repo.alpha/.git"
+  t2092_blob "$work/repo.alpha/blob" 111
+  printf 'gitdir: /fixture/gitdir\n' >"$work/repo.beta/.git"
+  t2092_blob "$work/repo.beta/blob" 55
+  t2092_blob "$work/repo.main/blob" 222
+  t2092_blob "$work/webqa-runner/run/blob" 33
+  t2092_blob "$work/misc/blob" 44
+  t2092_blob "$work/top-file" 9
+}
+
+t2092_run() {  # HOME [wrk usage args...] — fills T2092_OUT/ERR/RC
+  local home="$1"; shift
+  T2092_OUT="$TMP/t2092.out" T2092_ERR="$TMP/t2092.err" T2092_RC=0
+  set +e
+  env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" PANEWIRE_BIN="$PANEWIRE" \
+    ARBITER_BIN="$TMP/absent-arbiter" HOME="$home" \
+    ARBITER_INBOX_ROOT="$home/work/herdr-inbox/jobs" \
+    WRK_HOSTS_CONFIG="${T2092_CONFIG:-$TMP/no-such-hosts.toml}" \
+    WRK_PANEWIRE_LOG="${T2092_PANEWIRE_LOG:-$TMP/t2092-panewire.log}" \
+    "${WRK_UNDER_TEST:-$WRK}" usage "$@" >"$T2092_OUT" 2>"$T2092_ERR"
+  T2092_RC=$?
+  set -e
+}
+
+t2092_du() { du -sk "$1" 2>/dev/null | awk 'NR==1{print $1}'; }
+
+t2092_exp_top5() {  # JOBS_DIR — expected jobs_top5= value, du-ordered
+  local d kib name
+  for d in "$1"/*/; do
+    [[ -d "$d" ]] || continue
+    kib="$(t2092_du "$d")"
+    name="${d%/}"; name="${name##*/}"
+    printf '%s\t%s\n' "$kib" "$name"
+  done | sort -rn | head -5 | awk -F'\t' '{printf "%s%s:%s",(NR>1?",":""),$2,$1}'
+}
+
+t2092_emits() {  # count the emit calls recorded in the fixture panewire log
+  grep -cx 'emit' "$1" 2>/dev/null || true
+}
+
+t2092_host_key() {  # the sanitised host key wrk uses for state/event ids
+  printf '%s' "${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}" \
+    | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c 'a-z0-9.-' '-'
+}
+
+t2092_home="$TMP/t2092-h1"; t2092_fixture "$t2092_home"
+t2092_work="$t2092_home/work"; t2092_jobs="$t2092_work/herdr-inbox/jobs"
+T2092_CONFIG="" T2092_PANEWIRE_LOG="$TMP/t2092-p0.log"; : >"$T2092_PANEWIRE_LOG"
+
+# Case: the report matches the fixture tree (numbers recomputed with the
+# same du the implementation calls — no cross-OS dir-overhead constants).
+t2092_run "$t2092_home"
+[[ "$T2092_RC" -eq 0 ]] || fail "hk2092: wrk usage rc=$T2092_RC: $(cat "$T2092_ERR")"
+t2092_total="$(t2092_du "$t2092_work")"
+t2092_jobs_kib="$(t2092_du "$t2092_jobs")"
+t2092_wt=$(( $(t2092_du "$t2092_work/repo.alpha") + $(t2092_du "$t2092_work/repo.beta") ))
+t2092_webqa="$(t2092_du "$t2092_work/webqa-runner")"
+t2092_rest=$(( t2092_total - t2092_jobs_kib - t2092_wt - t2092_webqa ))
+# The report prints the resolved (physical) work root and jobs root — on
+# macOS a /var TMPDIR resolves to /private/var — so compare resolved paths.
+t2092_work_res="$(cd "$t2092_work" && pwd -P)"
+t2092_jobs_res="$(cd "$t2092_jobs" && pwd -P)"
+grep -q "host=.* work_root=$t2092_work_res total_kib=$t2092_total " "$T2092_OUT" ||
+  fail "hk2092: work total mismatch: $(cat "$T2092_OUT")"
+grep -q "jobs_root=$t2092_jobs_res jobs_kib=$t2092_jobs_kib" "$T2092_OUT" ||
+  fail "hk2092: jobs total mismatch: $(cat "$T2092_OUT")"
+grep -q "jobs_top5=$(t2092_exp_top5 "$t2092_jobs")" "$T2092_OUT" ||
+  fail "hk2092: top5 mismatch: $(grep jobs_top5 "$T2092_OUT")"
+grep -q "worktrees_count=2 worktrees_kib=$t2092_wt" "$T2092_OUT" ||
+  fail "hk2092: worktree bucket mismatch (repo.main must not count): $(cat "$T2092_OUT")"
+grep -q "webqa_runner_kib=$t2092_webqa" "$T2092_OUT" ||
+  fail "hk2092: webqa-runner mismatch: $(cat "$T2092_OUT")"
+grep -q "rest_kib=$t2092_rest" "$T2092_OUT" ||
+  fail "hk2092: rest bucket mismatch: $(cat "$T2092_OUT")"
+grep -q "fleet_usage_alert_gb=100 .*over_threshold=no" "$T2092_OUT" ||
+  fail "hk2092: default threshold must be 100 and unexceeded: $(cat "$T2092_OUT")"
+# Without --alert the command only prints: no alert line, no state file,
+# and not one panewire call.
+! grep -q '^alert=' "$T2092_OUT" ||
+  fail "hk2092: plain usage must not report alert state: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 0 ]] ||
+  fail "hk2092: plain usage emitted events: $(cat "$T2092_PANEWIRE_LOG")"
+compgen -G "$t2092_jobs/.fleet-usage-alert-*" >/dev/null &&
+  fail "hk2092: plain usage must not write alert state"
+echo "PASS hk2092 usage report matches the fixture tree"
+
+# Case: over the threshold with --alert emits exactly one lane.event to
+# director-1 carrying host, totals and top5; a second run inside 24h sends
+# none; a backdated state re-arms the alert.
+T2092_CONFIG="$TMP/t2092-hosts.toml"
+printf '[local]\nfleet_usage_alert_gb = 0\n' >"$T2092_CONFIG"
+T2092_PANEWIRE_LOG="$TMP/t2092-p2.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_home" --alert
+[[ "$T2092_RC" -eq 0 ]] || fail "hk2092: usage --alert rc=$T2092_RC: $(cat "$T2092_ERR")"
+grep -q "fleet_usage_alert_gb=0 .*over_threshold=yes" "$T2092_OUT" ||
+  fail "hk2092: gb=0 config must measure over threshold: $(cat "$T2092_OUT")"
+grep -q 'alert=emitted .*lane=director-1' "$T2092_OUT" ||
+  fail "hk2092: over-threshold --alert must emit to director-1: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 1 ]] ||
+  fail "hk2092: expected exactly one emit call: $(cat "$T2092_PANEWIRE_LOG")"
+python3 - "$T2092_PANEWIRE_LOG" <<'PY'
+import sys
+calls = [c.split("\n") for c in open(sys.argv[1]).read().split("--\n") if c.strip()]
+emit = [c for c in calls if c and c[0] == "emit"]
+assert len(emit) == 1, emit
+args = emit[0]
+def opt(name):
+    return args[args.index(name) + 1] if name in args else ""
+assert opt("--kind") == "lane.event", args
+assert opt("--lane") == "director-1", args
+assert opt("--event-id"), args
+text = opt("--text")
+for token in ("host=", "total_kib=", "jobs_kib=", "worktrees_count=",
+              "webqa_runner_kib=", "rest_kib=", "threshold_gb=", "top5="):
+    assert token in text, (token, text)
+assert "job-g:" in text and "job-f:" in text, text
+PY
+[[ -f "$t2092_jobs/.fleet-usage-alert-$(t2092_host_key)" ]] ||
+  fail "hk2092: the 24h state must land under the jobs root"
+t2092_run "$t2092_home" --alert
+grep -q 'alert=dedup' "$T2092_OUT" ||
+  fail "hk2092: a second run inside 24h must report dedup: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 1 ]] ||
+  fail "hk2092: a second run inside 24h must not re-emit: $(cat "$T2092_PANEWIRE_LOG")"
+printf '%s\n' "$(( $(date +%s) - 90000 ))" >"$t2092_jobs/.fleet-usage-alert-$(t2092_host_key)"
+t2092_run "$t2092_home" --alert
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 2 ]] ||
+  fail "hk2092: an expired (>24h) state must re-emit: $(cat "$T2092_PANEWIRE_LOG")"
+echo "PASS hk2092 --alert emits one director-1 event, dedups 24h, re-arms after"
+
+# Case: under the threshold --alert sends nothing and writes no state.
+t2092_home3="$TMP/t2092-h3"; t2092_fixture "$t2092_home3"
+T2092_CONFIG="" T2092_PANEWIRE_LOG="$TMP/t2092-p3.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_home3" --alert
+grep -q "over_threshold=no" "$T2092_OUT" ||
+  fail "hk2092: the tiny fixture must read under the default 100: $(cat "$T2092_OUT")"
+grep -q 'alert=under-threshold' "$T2092_OUT" ||
+  fail "hk2092: under-threshold --alert must say so: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 0 ]] ||
+  fail "hk2092: under threshold must not emit: $(cat "$T2092_PANEWIRE_LOG")"
+compgen -G "$t2092_home3/work/herdr-inbox/jobs/.fleet-usage-alert-*" >/dev/null &&
+  fail "hk2092: under threshold must not write alert state"
+echo "PASS hk2092 under threshold emits nothing and writes no state"
+
+# Case: a hosts.toml threshold overrides the default on the print path too.
+T2092_CONFIG="$TMP/t2092-hosts-999.toml"
+printf '[local]\nfleet_usage_alert_gb = 999\n' >"$T2092_CONFIG"
+t2092_run "$t2092_home3"
+grep -q "fleet_usage_alert_gb=999 .*over_threshold=no" "$T2092_OUT" ||
+  fail "hk2092: a configured 999 must override the default 100: $(cat "$T2092_OUT")"
+unset T2092_CONFIG
+echo "PASS hk2092 hosts.toml threshold overrides the default"
+
+# Mutant — drop the 24h dedup and the second-run case goes RED: on a fresh
+# fixture the real wrk sends one event across two runs, the mutant sends two.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+devin_trust_mutant t2092-nodedup 'now - last < 86400' '0'
+t2092_home4="$TMP/t2092-h4"; t2092_fixture "$t2092_home4"
+T2092_CONFIG="$TMP/t2092-hosts.toml"
+printf '[local]\nfleet_usage_alert_gb = 0\n' >"$T2092_CONFIG"
+T2092_PANEWIRE_LOG="$TMP/t2092-p4.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_home4" --alert
+t2092_run "$t2092_home4" --alert
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 1 ]] ||
+  fail "hk2092: two --alert runs inside 24h must emit once: $(cat "$T2092_PANEWIRE_LOG")"
+WRK_UNDER_TEST="$TMP/mut-wrk-t2092-nodedup" t2092_run "$t2092_home4" --alert
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 2 ]] ||
+  fail "hk2092 M1 mutant survived: dropping the 24h dedup must re-emit on the second run"
+echo "PASS hk2092 M1: dropping the 24h dedup goes RED on the second run"
+unset T2092_CONFIG WRK_UNDER_TEST
+
+# Case: many job dirs must not SIGPIPE the report. The old top-5 ran
+# `sort -rn | head -5`, so once the sorted stream outgrew the pipe buffer
+# head exited early, sort took SIGPIPE and, under set -o pipefail, the
+# command died (rc 141) before printing. awk NR<=5 reads the whole stream.
+t2092_hmany="$TMP/t2092-hmany"
+mkdir -p "$t2092_hmany/work/herdr-inbox/jobs"
+( cd "$t2092_hmany/work/herdr-inbox/jobs" &&
+  for i in $(seq 1 6000); do mkdir "job-$i"; done )
+T2092_CONFIG="" T2092_PANEWIRE_LOG="$TMP/t2092-many.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_hmany"
+[[ "$T2092_RC" -eq 0 ]] ||
+  fail "hk2092: usage over many job dirs must not SIGPIPE (rc=$T2092_RC): $(cat "$T2092_ERR")"
+grep -q '^jobs_top5=' "$T2092_OUT" ||
+  fail "hk2092: many-dir run must still print jobs_top5: $(cat "$T2092_OUT")"
+echo "PASS hk2092 many job dirs do not SIGPIPE the report (rc 0)"
+
+# Case: a failed du marks the run incomplete, warns and never alerts — a
+# silent 0 would have compared a false total against the threshold.
+t2092_hbad="$TMP/t2092-hbad"; t2092_fixture "$t2092_hbad"
+mkdir -p "$t2092_hbad/work/herdr-inbox/jobs/job-locked"
+t2092_blob "$t2092_hbad/work/herdr-inbox/jobs/job-locked/blob" 5
+chmod 000 "$t2092_hbad/work/herdr-inbox/jobs/job-locked"
+T2092_CONFIG="" T2092_PANEWIRE_LOG="$TMP/t2092-bad.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_hbad" --alert
+[[ "$T2092_RC" -eq 0 ]] || fail "hk2092: a failed du must not crash (rc=$T2092_RC)"
+grep -q 'measurement=no' "$T2092_OUT" ||
+  fail "hk2092: a failed du must report measurement=no: $(cat "$T2092_OUT")"
+grep -qi 'incomplete' "$T2092_ERR" ||
+  fail "hk2092: a failed du must warn: $(cat "$T2092_ERR")"
+grep -q 'alert=skipped reason=incomplete-measurement' "$T2092_OUT" ||
+  fail "hk2092: an incomplete measurement must skip the alert: $(cat "$T2092_OUT")"
+[[ "$(t2092_emits "$T2092_PANEWIRE_LOG")" -eq 0 ]] ||
+  fail "hk2092: an incomplete measurement must not emit: $(cat "$T2092_PANEWIRE_LOG")"
+chmod 755 "$t2092_hbad/work/herdr-inbox/jobs/job-locked"
+echo "PASS hk2092 a failed du reports incomplete and never alerts"
+
+# Case: a symlinked ~/work resolves to its target before du — measuring the
+# link itself would read near-zero and could sit under the threshold.
+t2092_hsym="$TMP/t2092-hsym"
+mkdir -p "$t2092_hsym/realwork/herdr-inbox/jobs/j1"
+t2092_blob "$t2092_hsym/realwork/herdr-inbox/jobs/j1/blob" 50
+ln -s "$t2092_hsym/realwork" "$t2092_hsym/work"
+T2092_PANEWIRE_LOG="$TMP/t2092-sym.log"; : >"$T2092_PANEWIRE_LOG"
+t2092_run "$t2092_hsym"
+[[ "$T2092_RC" -eq 0 ]] || fail "hk2092: symlinked work root rc=$T2092_RC"
+t2092_resolved="$(cd "$t2092_hsym/work" && pwd -P)"
+grep -q "work_root=$t2092_resolved" "$T2092_OUT" ||
+  fail "hk2092: a symlinked ~/work must report the resolved target: $(cat "$T2092_OUT")"
+grep -q "jobs_kib=$(t2092_du "$t2092_hsym/realwork/herdr-inbox/jobs")" "$T2092_OUT" ||
+  fail "hk2092: a symlinked ~/work must measure the target, not the link: $(cat "$T2092_OUT")"
+echo "PASS hk2092 a symlinked work root resolves to its target"
 
 # hk 1439: deliberate check — with SCOPEFUEL_BIN unset, a profile lease falls back
 # to PATH, must hit the tripwire shim (rc 99 via the lease error), then the log is

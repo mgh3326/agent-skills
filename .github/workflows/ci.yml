@@ -4,29 +4,31 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '0 18 * * *'
   workflow_dispatch:
+    inputs:
+      full_macos:
+        description: Run the complete suite on macOS
+        required: false
+        default: false
+        type: boolean
 
-# Dispatch runs have a run-specific group; push/PR groups retain their existing head identity.
 concurrency:
-  group: ci-${{ github.workflow }}-${{ github.event_name == 'workflow_dispatch' && 'dispatch-' || '' }}${{ github.event_name == 'workflow_dispatch' && github.run_id || github.event.pull_request.number || github.sha }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ci-${{ github.workflow }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' || github.event_name == 'push' }}
 
 permissions:
   contents: read
+  actions: read
+  pull-requests: read
 
 jobs:
-  shell-and-bash-tests:
-    name: ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.14'
       - name: Install ShellCheck
         shell: bash
         run: |
@@ -69,66 +71,264 @@ jobs:
             tests/test-gate-policy-devin-grades.sh \
             tests/test-codex-project-trust.sh \
             tests/test-area-propose.sh \
+            tests/test-ci-suites.sh \
+            tests/needs-full-macos.sh \
+            scripts/needs-full-macos \
             tests/fixtures/fleet-rev/fake-ssh \
             tests/fixtures/fleet-rev/fake-gh \
             tests/fixtures/fleet-rev/panewire \
             tests/fixtures/fleet-rev/handoffkeep \
             tests/fixtures/fleet-rev/go \
-            $(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' ! -name 'handoffkeep' -perm -111 -print)
-      - name: Bash tests
+            tests/fixtures/arbiter-legacy \
+            tests/fixtures/arbiter-proxy \
+            tests/fixtures/herdr \
+            tests/fixtures/panewire \
+            tests/fixtures/pi \
+            tests/fixtures/scopefuel \
+            tests/fixtures/spillover-herdr \
+            tests/fixtures/spillover-hub-curl \
+            tests/fixtures/spillover-panewire \
+            tests/fixtures/spillover-scp \
+            tests/fixtures/spillover-ssh
+
+  changes:
+    name: changes
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      needs_full_macos: ${{ steps.macos.outputs.needs_full_macos }}
+      sensitive_paths: ${{ steps.macos.outputs.sensitive_paths }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: classify
+        name: Classify docs-only changes
+        shell: bash
         env:
-          SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
+          GH_TOKEN: ${{ github.token }}
         run: |
-          bash tests/test-wrk.sh
-          bash tests/test-codex-project-trust.sh
-          bash tests/wrk_spillover.sh
-          bash tests/test-arbiter.sh
-          bash tests/test-acp-runner-process-group.sh
-          bash tests/test-openai-independent-gate.sh
-          bash tests/test-builder-path.sh
-          bash tests/test-followup-injection.sh
-          bash tests/test-report-outside-worktree.sh
-          bash tests/test-model-contract-guard.sh
-          bash tests/test-installer-route.sh
-          bash tests/test-installer-deploy-record.sh
-          bash tests/test-prompt-suggestion-off.sh
-          bash tests/test-resume-settings.sh
-          bash tests/test-untagged-operator-evidence.sh
-          bash tests/test-event-monitor-doc.sh
-          bash tests/test-decision-request-doc.sh
-          bash tests/test-input-line-not-evidence.sh
-          bash tests/test-tester-family-policy.sh
-          bash tests/test-tester-eligible.sh
-          bash tests/test-ci-canonical-prose.sh
-          bash tests/test-assignment-defaults.sh
-          bash tests/test-t3-split-rule.sh
-          bash tests/test-merge-precheck.sh
-          bash tests/test-round-cap.sh
-          bash tests/test-wrk-rounds.sh
-          bash tests/test-wrk-heavy-limit.sh
-          bash tests/test-wrk-heavy-class.sh
-          bash tests/test-wrk-task-link.sh
-          bash tests/test-wrk-job-end.sh
-          bash tests/test-fleet-rev.sh
-          bash tests/test-gate-policy-devin-grades.sh
-          bash tests/test-area-propose.sh
-          python3 tests/test-node-ops.py
-          python3 -m unittest tests/test_pa_review_scan.py -v
-          python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -v
-          python3 -m unittest discover -s tests -p 'test_quota_stale_report.py' -v
-          python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
-      - name: O3 canonical adapter, intents and projections (fake only)
+          if [[ "$GITHUB_EVENT_NAME" == pull_request ]]; then
+            python3 - "${{ github.event.pull_request.base.sha }}" "$GITHUB_SHA" "$GITHUB_REPOSITORY" "$GITHUB_HEAD_REF" "$GITHUB_RUN_ID" "$RUNNER_TEMP/changed-paths" <<'PY'
+          import json
+          import subprocess
+          import sys
+
+          base_sha, head_sha, repository, branch, current_run, changed_file = sys.argv[1:]
+          required = {
+              "lint", "ubuntu (wrk)", "ubuntu (suites-a)", "ubuntu (suites-b)",
+              "ubuntu (python)", "macos-smoke", "ci-ok",
+          }
+
+          def gh_json(*args):
+              result = subprocess.run(["gh", "api", *args], check=True, text=True,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+              return json.loads(result.stdout)
+
+          def is_ancestor(candidate):
+              return subprocess.run(["git", "merge-base", "--is-ancestor", candidate, head_sha],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
+
+          baseline = None
+          try:
+              runs = gh_json("-X", "GET", f"repos/{repository}/actions/runs",
+                             "-f", f"branch={branch}", "-f", "event=pull_request",
+                             "-f", "status=success", "-f", "per_page=100")["workflow_runs"]
+              for run in runs:
+                  if str(run["id"]) == current_run or not is_ancestor(run["head_sha"]):
+                      continue
+                  jobs = gh_json("-X", "GET", f"repos/{repository}/actions/runs/{run['id']}/jobs",
+                                 "-f", "per_page=100")["jobs"]
+                  successful = {job["name"] for job in jobs
+                                if job.get("status") == "completed" and job.get("conclusion") == "success"}
+                  if required <= successful:
+                      baseline = run["head_sha"]
+                      break
+          except (KeyError, OSError, subprocess.CalledProcessError, json.JSONDecodeError):
+              # On API trouble, use the complete PR diff; it can skip only if every changed path is docs-only.
+              baseline = None
+
+          start = baseline or base_sha
+          diff = ["git", "diff", "--name-only", "--no-renames", f"{start}...{head_sha}"]
+          paths = subprocess.check_output(diff, text=True).splitlines()
+          with open(changed_file, "w", encoding="utf-8") as handle:
+              handle.write("\n".join(paths) + ("\n" if paths else ""))
+          print(f"Docs-only comparison baseline: {baseline or base_sha}")
+          PY
+          elif [[ "$GITHUB_EVENT_NAME" == push && "${{ github.event.before }}" != 0000000000000000000000000000000000000000 ]]; then
+            git diff --name-only --no-renames "${{ github.event.before }}" "$GITHUB_SHA" > "$RUNNER_TEMP/changed-paths"
+          else
+            : > "$RUNNER_TEMP/changed-paths"
+          fi
+          python3 - director/gate_policy.json "$RUNNER_TEMP/changed-paths" "$GITHUB_EVENT_NAME" <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          import sys
+          from pathlib import Path
+
+          policy = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
+          changed = [line for line in Path(sys.argv[2]).read_text(encoding="utf-8").splitlines() if line]
+          event = sys.argv[3]
+          pinned = set(policy.get("local_sources", {}))
+          docs_only = bool(changed) and event in {"pull_request", "push"} and all(
+              path.endswith(".md") or path.startswith("docs/") for path in changed
+          ) and not any(
+              path in pinned or path.startswith(".github/") for path in changed
+          )
+          print(f"docs_only={'true' if docs_only else 'false'}")
+          PY
+      - id: macos
+        name: Report Darwin-sensitive coverage
         shell: bash
         run: |
-          O3_TMP="$(mktemp -d /tmp/o3ci.XXXXXX)"
-          trap 'python3 -c '\''import shutil,sys; shutil.rmtree(sys.argv[1])'\'' "$O3_TMP"' EXIT
-          mkdir -p "$O3_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
-          HOME="$O3_TMP/home" XDG_CONFIG_HOME="$O3_TMP/config" \
-            XDG_DATA_HOME="$O3_TMP/data" XDG_CACHE_HOME="$O3_TMP/cache" \
-            XDG_CONFIG_DIRS="$O3_TMP/config" XDG_DATA_DIRS="$O3_TMP/data" \
-            XDG_STATE_HOME="$O3_TMP/state" XDG_RUNTIME_DIR="$O3_TMP/runtime" \
-            CODEX_HOME="$O3_TMP/codex" ARBITER_INBOX_ROOT="$O3_TMP/jobs" \
-            TMPDIR="$O3_TMP" WRK_TEST_MODE=1 \
-            python3 -m unittest discover -s tests/o3 -p 'test_*.py' -v
-      - name: Mock MCP isolation, project migration and assertion mutants (fake only)
-        run: python -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
+          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before || github.sha }}"
+          RESULT="$(scripts/needs-full-macos "$BASE_SHA" "$GITHUB_SHA")"
+          printf '%s\n' "$RESULT"
+          NEEDS="$(printf '%s\n' "$RESULT" | sed -n '1p')"
+          PATHS="$(printf '%s\n' "$RESULT" | sed -n '2,$p' | paste -sd, -)"
+          echo "needs_full_macos=$NEEDS" >> "$GITHUB_OUTPUT"
+          echo "sensitive_paths=$PATHS" >> "$GITHUB_OUTPUT"
+          {
+            echo '### Darwin-sensitive changes'
+            echo
+            if [[ "$NEEDS" == yes ]]; then
+              echo 'Full macOS verification is required before READY for these changed paths:'
+              printf '%s\n' "$RESULT" | tail -n +2 | sed 's/^/- `/' | sed 's/$/`/'
+            else
+              echo 'No uncovered Darwin-sensitive paths changed.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  ubuntu:
+    name: ubuntu (${{ matrix.shard }})
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [wrk, suites-a, suites-b, python]
+    env:
+      SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Run suite shard
+        shell: bash
+        run: |
+          if [[ "${{ matrix.shard }}" == python ]]; then
+            CI_PY_TMP="$(mktemp -d /tmp/wrkci.XXXXXX)"
+            mkdir -p "$CI_PY_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
+            export HOME="$CI_PY_TMP/home" XDG_CONFIG_HOME="$CI_PY_TMP/config"
+            export XDG_DATA_HOME="$CI_PY_TMP/data" XDG_CACHE_HOME="$CI_PY_TMP/cache"
+            export XDG_STATE_HOME="$CI_PY_TMP/state" XDG_RUNTIME_DIR="$CI_PY_TMP/runtime"
+            export XDG_CONFIG_DIRS="$CI_PY_TMP/config" XDG_DATA_DIRS="$CI_PY_TMP/data"
+            export CODEX_HOME="$CI_PY_TMP/codex" ARBITER_INBOX_ROOT="$CI_PY_TMP/jobs"
+            export TMPDIR="$CI_PY_TMP" WRK_TEST_MODE=1
+            cleanup_python_shard() {
+              local original_rc=$? cleanup_rc=0
+              . "$GITHUB_WORKSPACE/tests/lib/tmp-writers.sh"
+              TW_TMP="$CI_PY_TMP" ROOT="$GITHUB_WORKSPACE" tmp_writers_stop || cleanup_rc=$?
+              if (( cleanup_rc == 0 )); then rm -rf "$CI_PY_TMP"; else original_rc=$cleanup_rc; fi
+              exit "$original_rc"
+            }
+            trap cleanup_python_shard EXIT
+          fi
+          while IFS='|' read -r shard command; do
+            [[ -n "$shard" && "$shard" != \#* ]] || continue
+            if [[ "$shard" == "${{ matrix.shard }}" ]]; then
+              echo "::group::$command"
+              bash -c "$command"
+              echo '::endgroup::'
+            fi
+          done < tests/ci-suites.txt
+
+  macos-smoke:
+    name: macos-smoke
+    needs: changes
+    if: needs.changes.outputs.docs_only != 'true'
+    runs-on: macos-latest
+    env:
+      SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Run curated Darwin-sensitive suites
+        shell: bash
+        run: |
+          awk 'BEGIN { section = "" } /^\[/ { section = $0; next } section == "[smoke]" && NF && $0 !~ /^#/ { print }' .github/macos-smoke.txt |
+          while IFS= read -r command; do
+            echo "::group::$command"
+            bash -c "$command"
+            echo '::endgroup::'
+          done
+
+  macos-full:
+    name: macos-full
+    if: github.ref == 'refs/heads/main' && github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.full_macos == true)
+    runs-on: macos-latest
+    env:
+      SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: Run complete suite list
+        shell: bash
+        run: |
+          while IFS='|' read -r shard command; do
+            [[ -n "$shard" && "$shard" != \#* ]] || continue
+            if [[ "$shard" == python && -z "${CI_PY_TMP:-}" ]]; then
+              CI_PY_TMP="$(mktemp -d /tmp/wrkci.XXXXXX)"
+              mkdir -p "$CI_PY_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
+              export HOME="$CI_PY_TMP/home" XDG_CONFIG_HOME="$CI_PY_TMP/config"
+              export XDG_DATA_HOME="$CI_PY_TMP/data" XDG_CACHE_HOME="$CI_PY_TMP/cache"
+              export XDG_STATE_HOME="$CI_PY_TMP/state" XDG_RUNTIME_DIR="$CI_PY_TMP/runtime"
+              export XDG_CONFIG_DIRS="$CI_PY_TMP/config" XDG_DATA_DIRS="$CI_PY_TMP/data"
+              export CODEX_HOME="$CI_PY_TMP/codex" ARBITER_INBOX_ROOT="$CI_PY_TMP/jobs"
+              export TMPDIR="$CI_PY_TMP" WRK_TEST_MODE=1
+              cleanup_python_shard() {
+                local original_rc=$? cleanup_rc=0
+                . "$GITHUB_WORKSPACE/tests/lib/tmp-writers.sh"
+                TW_TMP="$CI_PY_TMP" ROOT="$GITHUB_WORKSPACE" tmp_writers_stop || cleanup_rc=$?
+                if (( cleanup_rc == 0 )); then rm -rf "$CI_PY_TMP"; else original_rc=$cleanup_rc; fi
+              exit "$original_rc"
+              }
+              trap cleanup_python_shard EXIT
+            fi
+            echo "::group::$shard: $command"
+            bash -c "$command"
+            echo '::endgroup::'
+          done < tests/ci-suites.txt
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [lint, changes, ubuntu, macos-smoke]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check required results
+        env:
+          LINT: ${{ needs.lint.result }}
+          CHANGES: ${{ needs.changes.result }}
+          DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
+          UBUNTU: ${{ needs.ubuntu.result }}
+          MACOS_SMOKE: ${{ needs.macos-smoke.result }}
+        run: |
+          if [[ "$LINT" != success || "$CHANGES" != success ]]; then
+            echo "ci-ok failed: lint=$LINT changes=$CHANGES" >&2
+            exit 1
+          fi
+          if [[ "$UBUNTU" == failure || "$UBUNTU" == cancelled || "$MACOS_SMOKE" == failure || "$MACOS_SMOKE" == cancelled ]]; then
+            echo "ci-ok failed: ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE" >&2
+            exit 1
+          fi
+          if [[ "$DOCS_ONLY" != true && ( "$UBUNTU" != success || "$MACOS_SMOKE" != success ) ]]; then
+            echo "ci-ok failed: unexpected skip ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE docs_only=$DOCS_ONLY" >&2
+            exit 1
+          fi
+          echo "ci-ok passed: lint=$LINT changes=$CHANGES docs_only=$DOCS_ONLY ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE"

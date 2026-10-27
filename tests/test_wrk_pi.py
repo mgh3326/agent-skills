@@ -72,6 +72,9 @@ class PiSpawnTests(unittest.TestCase):
             argv = shlex.split(fields[1])
             shell = Path(argv[0]).name in ("sh", "bash", "zsh", "dash", "ksh")
             executable = argv[1] if shell else argv[0]
+            self.assertIn("sentinel", argv, "refusing a non-sentinel fixture pid")
+            self.assertIn("sentinel " + pidfile.parent.name + " ", fields[1],
+                          "refusing a different fixture job pid")
             self.assertEqual(Path(executable).resolve(), self.wrk.resolve(),
                              "refusing to stop a foreign fixture pid")
             stop = subprocess.run(

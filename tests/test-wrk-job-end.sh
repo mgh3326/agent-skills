@@ -6133,4 +6133,5 @@ mkmut_span hk1860-rowless-mode-current \
 expect_mut_red "hk1860 row-less recheck in current mode" case_hk1860_rowless_ended_mode \
   'ASSERT-RED: hk1860 row-less recheck keeps the caller ended-no-sentinel mode'
 
+bash "$ROOT/tests/test-wrk-sentinel-detach.sh"
 echo "PASS test-wrk-job-end: all cases"
