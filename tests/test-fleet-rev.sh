@@ -945,7 +945,7 @@ give_scopefuel "$LOCAL_HOME" "$S_MAIN"
 mkdir -p "$LOCAL_HOME/.agents/skills"
 AC17_PIDFILE="$TMP/ac17-pids"
 : >"$AC17_PIDFILE"
-ac17_argv() { # empty + rc 0 for dead or unreadable pids; ps races the reaper
+ac17_argv() { # empty + rc 0 for dead or unreadable pids (the read can race a reap)
   ps -o args= -p "$1" 2>/dev/null | sed 's/^ *//; s/ *$//' || true
 }
 ac17_leftovers() { # one 'pid (argv)' line per recorded stub still wedged
