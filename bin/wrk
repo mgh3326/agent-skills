@@ -78,6 +78,7 @@ ALL_PROFILES=(
   devin-fusion-opus55 devin-fusion-sonnet55
   devin-fusion-sol61 devin-fusion-sol61-xhigh
   pi-haiku55 pi-sonnet55 pi-opus55
+  cmd-dsflash41
   devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
@@ -171,7 +172,7 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
+Usage: wrk <spawn|done|restore|escalate|joined|round|reap|worktree-reap|lanes-missing|find|name-sync|profiles|hosts|heavy|usage> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
@@ -186,6 +187,7 @@ Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|nam
   wrk round status JOB
   wrk round audit [--lane LANE]
   wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders|--include-captains]
+  wrk worktree-reap [--age 3d] [--apply]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--heavy-age AGE] [--job JOB] [--lane LANE] [--policy PATH]
   wrk find <name-or-label> [--pane-only]
@@ -193,6 +195,7 @@ Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|nam
   wrk profiles
   wrk heavy -- <command> [args...]
   wrk heavy status
+  wrk usage [--alert]
 
 Run 'wrk <command> --help' for command-specific usage.
 USAGE
@@ -268,8 +271,14 @@ Usage: wrk spawn -c CWD -m|--profile MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL 
                  [--landing-strict] [--role builder --lane BUILDER_LANE --parent PARENT_LANE] [--host auto|local|NAME]
                  [--operator-request REF] [--requested-by NAME] [--purpose PURPOSE] [--round-ext REF] [--keep]
                  [--task HK_TASK_ID | --parent-job JOB_ID] [--takeover-from OLD_JOB] [--task-hk-bypass]
+                 [--head SHA] [--extension-grant SEQ] [--repeat-grant SEQ]
 
 Options:
+  O3 records mode    <account home>/.config/wrk/records-mode: legacy (default),
+                     shadow or required. O3 spawns verify a precreated canonical
+                     claim before local admission and pane creation. Reviewer
+                     spawns use --parent-job SUBJECT --head SHA and typed grants;
+                     a missing P1 central assignment pauses with claim_conflict.
   -c CWD, -m|--profile MODEL, -p PROMPT_FILE, -w WORKSPACE, -l LABEL
   --t T0..T3         job scale; required — an unclassified job is not spawned
   -L live|mock       select lane; mock requires MOCK_MCP_PROFILE and
@@ -319,6 +328,11 @@ Options:
                      refused before the marker check.
                      pi-* seats have no MCP (--no-mcp) and must not be placed
                      on MCP-needing tasks. Worker/tester only; default effort high.
+                     cmd-dsflash41 is the Command Code CLI profile
+                     (deepseek-v4.1-flash, effort low|high|max, default high).
+                     cmd 1.88.0 has no no-MCP launch flag, so the seat relies on
+                     the cmd accounts carrying no persisted MCP servers.
+                     Worker/tester only; --role builder refuses it.
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
                      builder refuses them pending hk 1382. Fusion-Sol
@@ -1349,6 +1363,77 @@ sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
 ' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
 
+# hk 2140: prove the cmd session's model and effort from the visible screen,
+# never the argv or the transcript. cmd 1.88.0 prints its selection in the
+# welcome banner — the mbp captures show exactly:
+#   # Command Code v1.88.0
+#   # models: deepseek-v4.1-flash-(latest) with high effort · taste-1
+#   # /private/tmp/cmdcap2140
+# A wrong model or a refused effort never reaches the TUI at all (the shell
+# prints the refusal instead), so the banner block is the only place the
+# running session states them. Every `# models:` line on the screen must match
+# (a stale contradicting line is a failure), the line must sit inside the
+# banner block — the version line above, the launch cwd below — and the whole
+# candidate block must not appear in the injected brief (a brief quoting the
+# model line is not the session's own statement). Unknown layouts, a missing
+# banner and truncated rows all fail closed.
+# hk 2174: cmd abbreviates HOME in the cwd row ("# ~/work/x"), so that row is
+# accepted as the absolute launch cwd or as the same cwd with a leading $HOME
+# replaced by "~" — HOME exactly, or HOME followed by "/", never a substring.
+cmd_model_proven() {
+  local screen
+  screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || return 1
+  # shellcheck disable=SC2016
+  printf '%s' "$screen" | python3 -c '
+import os, re, sys
+expected_model, effort, cwd, home, prompt = sys.argv[1:]
+def clean(text):
+    return [line.rstrip() for line in
+            re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).splitlines()]
+lines = clean(sys.stdin.read())
+shown_cwds = {"# " + cwd}
+home = home.rstrip("/")
+if home.startswith("/"):
+    if cwd == home:
+        shown_cwds.add("# ~")
+    elif cwd.startswith(home + "/"):
+        shown_cwds.add("# ~" + cwd[len(home):])
+# Every models row must be the expected one, inside a banner block.
+want = ("# models: " + expected_model + " with " + effort + " effort")
+blocks = 0
+block_i = -1
+for i, line in enumerate(lines):
+    if not line.startswith("# models: "):
+        continue
+    # Full row, never a truncated one: the effort field is followed by the
+    # ` · <tag>` tail the captures all carry.
+    if not re.fullmatch(re.escape(want) + r" · \S.*", line):
+        sys.exit(1)
+    if i < 1 or i + 1 >= len(lines):
+        sys.exit(1)
+    if not re.fullmatch(r"# Command Code v\S+", lines[i - 1]):
+        sys.exit(1)
+    if lines[i + 1] not in shown_cwds:
+        sys.exit(1)
+    blocks += 1
+    block_i = i
+if blocks != 1:
+    sys.exit(1)
+# The candidate block must not be a copy of the injected brief — same
+# normalized-whitespace comparison pi_model_proven uses.
+try:
+    with open(prompt) as brief:
+        injected = "\n".join(clean(brief.read()))
+except OSError:
+    sys.exit(1)
+candidate = re.sub(r"\s+", " ", "\n".join(lines[block_i - 1:block_i + 2])).strip()
+quoted = re.sub(r"\s+", " ", injected).strip()
+if candidate in quoted:
+    sys.exit(1)
+sys.exit(0)
+' "$CMD_SCREEN_MODEL" "$CMD_EFFORT" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
+}
+
 # hk 2109: the Terra 6.1 model id alone does not prove Codex selected the
 # intended model. Read only the visible screen and extract the bottom-most
 # Codex status/footer row (the row with the cwd and Context indicator). The
@@ -1375,6 +1460,44 @@ else:
 ' 'GPT-6.1 Terra' "$EFFECTIVE_EFFORT"
 }
 
+# hk 2140: cmd panes cannot be prompted through `agent prompt` or panewire —
+# herdr refuses a detected-but-not-started agent with agent_not_ready (mbp
+# capture). The delivery that works is the one a human uses: `pane send-text`
+# fills the composer (a multi-line brief lands whole, un-submitted) and
+# `pane send-keys return` submits it. After the submit, the same marker/landing
+# corroboration every kind uses judges the result.
+spawn_cmd_prompt() {
+  # $1 is unused; the parameter keeps the call shape parallel to
+  # spawn_panewire_prompt's attempt argument.
+  SPAWN_SUBMIT=unconfirmed
+  SPAWN_PANEWIRE_RC=""
+  SPAWN_PANEWIRE_ERR=""
+  local send_rc keys_rc
+  set +e
+  "$HERDR" pane send-text "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
+  send_rc=$?
+  set -e
+  if [[ "$send_rc" -ne 0 ]]; then
+    SPAWN_SUBMIT=unsent
+    SPAWN_PANEWIRE_RC="send-text-$send_rc"
+    SPAWN_PANEWIRE_ERR="cmd pane send-text exited $send_rc"
+    return 0
+  fi
+  set +e
+  "$HERDR" pane send-keys "$PANE" return >/dev/null 2>&1
+  keys_rc=$?
+  set -e
+  # A failed submit after a delivered paste is unconfirmed: the text may be
+  # sitting in the composer, so it is never re-sent blindly — only the
+  # confirmed non-landing retry below may inject a second copy.
+  [[ "$keys_rc" -eq 0 ]] || {
+    SPAWN_PANEWIRE_RC="send-keys-$keys_rc"
+    SPAWN_PANEWIRE_ERR="cmd pane send-keys exited $keys_rc"
+    return 0
+  }
+  SPAWN_SUBMIT=accepted
+}
+
 # spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not
 # landed, LANDING_NO_DETAIL.
 spawn_deliver_brief() {
@@ -1386,6 +1509,43 @@ spawn_deliver_brief() {
   PROMPT_PAYLOAD="$(<"$PROMPT")"
   PROMPT_MARKER="$(prompt_marker "$PROMPT")"
   SPAWN_EXPECT_CWD="$(spawn_expect_cwd "$CWD" "$PANE")"
+
+  if [[ "$PROFILE_KIND" == cmd ]]; then
+    SPAWN_VIA=herdr-pane
+    spawn_cmd_prompt 1
+    local first="submit=$SPAWN_SUBMIT"
+    [[ -z "$SPAWN_PANEWIRE_ERR" ]] || first="$first err=\"$SPAWN_PANEWIRE_ERR\""
+    case "$SPAWN_SUBMIT" in
+      unsent)
+        LANDING_NO_DETAIL="phase=initial $first action=landed-no retry=skipped reason=send-text-refused"
+        return 0 ;;
+    esac
+    if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
+      LANDING=yes
+      return 0
+    fi
+    detail="$(landing_check_detail)"
+    # One re-injection only when the window proved the first copy never
+    # landed — the same rule the panewire lane applies to an accepted submit.
+    if [[ "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
+      warn "landing window expired; pane=$PANE phase=initial $first $detail action=reinject-once"
+      spawn_cmd_prompt 2
+      local second="submit=$SPAWN_SUBMIT"
+      [[ -z "$SPAWN_PANEWIRE_ERR" ]] || second="$second err=\"$SPAWN_PANEWIRE_ERR\""
+      if [[ "$SPAWN_SUBMIT" != unsent ]] &&
+         landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
+        LANDING=retry
+        return 0
+      fi
+      detail="$(landing_check_detail)"
+      LANDING_NO_DETAIL="phase=retry $second $detail action=landed-no"
+      return 0
+    fi
+    retry_skip_reason='non-landing-not-confirmed'
+    [[ "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]] || retry_skip_reason='ambiguous-observation'
+    LANDING_NO_DETAIL="phase=initial $first $detail action=landed-no retry=skipped reason=$retry_skip_reason"
+    return 0
+  fi
 
   spawn_panewire_prompt 1
   spawn_opencode_submit
@@ -2313,7 +2473,9 @@ quota_gate() {
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
   # hk 2079: E6_WORKER_TESTER_ONLY_PROFILES = PI_CREDIT_MODELS (pi-haiku55/pi-sonnet55/pi-opus55), all PROFILE_KIND=pi; devin-fusion-* are outside the set.
-  if [[ "$PROFILE_KIND" == pi || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
+  # hk 2140: cmd-dsflash41 joins the same worker/tester-only set — the gate
+  # hears the seat's role so a non-worker/tester role can be role-denied.
+  if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
     gate_args+=(--role "$ROLE")
   fi
   local out rc
@@ -2737,6 +2899,7 @@ agent_foreground_exes() {
     kiro)     echo "kiro-cli kiro" ;;
     opencode) echo "open-code opencode" ;;
     pi)       echo "pi" ;;
+    cmd)      echo "command-code cmd" ;;
     agy)      echo "antigravity agy" ;;
     *)        echo "$1" ;;
   esac
@@ -2984,7 +3147,7 @@ devin_wait_shell_ready() {
   # `agent start`) types it: `pane run` for devin, `agent start` for every
   # other kind (#1016).
   local start_action=pane\ run
-  [[ "$PROFILE_KIND" == devin ]] || start_action=agent\ start
+  [[ "$PROFILE_KIND" == devin || "$PROFILE_KIND" == cmd ]] || start_action=agent\ start
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
   while :; do
     attempts=$(( attempts + 1 ))
@@ -3247,6 +3410,66 @@ devin_start_in_pane() {
     devin_spawn_diagnostics "agent rename exited $rename_rc" 1
     spawn_pane_cleanup
     return "$rename_rc"
+  fi
+}
+
+# hk 2140: Command Code CLI panes. herdr 0.9.1 has no `cmd` start kind, so the
+# pane is launched exactly like a manual run: `pane run` types the argv, the
+# detector picks the pane up as agent=cmd (measured on mbp: agent get reports
+# agent cmd and tracks idle/working/done), the label is registered with
+# `agent rename`, and the bounded idle wait confirms the TUI came up. There is
+# no identity rule for cmd the way devin has welcome_prompt_footer — the
+# model/effort proof is the cmd_model_proven screen check after the brief.
+cmd_start_in_pane() {
+  local run_rc wait_rc rename_rc
+  local started_at remaining_ms
+
+  started_at="$(date +%s)"
+  if ! devin_wait_shell_ready "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
+  set +e
+  "$HERDR" pane run "$PANE" cmd "${ARGS[@]}" >/dev/null
+  run_rc=$?
+  set -e
+  if [[ "$run_rc" -ne 0 ]]; then
+    shell_ready_diagnostics "cmd pane run exited $run_rc"
+    spawn_pane_cleanup
+    return "$run_rc"
+  fi
+
+  if ! devin_wait_detected "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
+
+  # The label first: `agent wait` accepts a detected pane, but rename is what
+  # registers this spawn's name under it (measured on mbp, hk 2140).
+  set +e
+  "$HERDR" agent rename "$PANE" "$LABEL" >/dev/null
+  rename_rc=$?
+  set -e
+  if [[ "$rename_rc" -ne 0 ]]; then
+    shell_ready_diagnostics "cmd agent rename exited $rename_rc"
+    spawn_pane_cleanup
+    return "$rename_rc"
+  fi
+
+  remaining_ms=$(( START_TIMEOUT - ($(date +%s) - started_at) * 1000 ))
+  if (( remaining_ms <= 0 )); then
+    shell_ready_diagnostics "cmd agent detected after the ${START_TIMEOUT}ms window"
+    spawn_pane_cleanup
+    return 1
+  fi
+  set +e
+  "$HERDR" agent wait "$PANE" --until idle --timeout "$remaining_ms" >/dev/null
+  wait_rc=$?
+  set -e
+  if [[ "$wait_rc" -ne 0 ]]; then
+    shell_ready_diagnostics "cmd idle wait exited $wait_rc"
+    spawn_pane_cleanup
+    return "$wait_rc"
   fi
 }
 
@@ -4061,6 +4284,8 @@ resolve_profile() {
   CATALOG_REFUSED=0
   CATALOG_REFUSE_REASON=""
   GATE_EFFORT_PIN=""
+  CMD_EFFORT=""
+  CMD_SCREEN_MODEL=""
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
@@ -4279,6 +4504,13 @@ resolve_profile() {
       PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_LOW_HOME") ;;
 
     # hk 2080: literal provider/model, like opencode; every seat disables MCP.
+    # hk 2140: Command Code CLI (cmd 1.88.0). PROFILE_MODEL is the literal
+    # -m argument; CMD_SCREEN_MODEL is how the welcome banner displays the
+    # model the session actually selected — the proof compares the screen,
+    # never the argv. herdr has no `cmd` start kind (0.9.1): the pane is
+    # launched with `pane run` and detected, never agent-started.
+    cmd-dsflash41) PROFILE_KIND=cmd; PROFILE_MODEL=deepseek/deepseek-v4.1-flash; CMD_SCREEN_MODEL='deepseek-v4.1-flash-(latest)'; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+
     pi-haiku55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-haiku-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     pi-sonnet55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-sonnet-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     pi-opus55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-opus-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
@@ -4370,6 +4602,7 @@ resolve_profile() {
     # pool mapping, the gate answer names the pool.
     devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;
     pi-haiku55|pi-sonnet55|pi-opus55) GATE_PROFILE="$MODEL" ;;
+    cmd-dsflash41) GATE_PROFILE="$MODEL" ;;
     # hk 1729: Fusion-Sol profiles also gate at their exact catalog rows;
     # scopefuel supplies the codex pool recorded by arbiter.
     devin-fusion-sol61|devin-fusion-sol61-xhigh) GATE_PROFILE="$MODEL" ;;
@@ -4470,6 +4703,19 @@ resolve_profile() {
     GATE_EFFORT_PIN="$PI_THINKING"
   fi
 
+  if [[ "$PROFILE_KIND" == cmd ]]; then
+    # cmd 1.88.0 effort table for deepseek-v4.1-flash, measured on mbp
+    # (hk 2140 capture): `Unknown effort "ultra". Supported: off, low, high,
+    # max.` — wrk low->low, high->high, max->max; medium/xhigh/ultra are
+    # refused here because the model does not accept them, and off is not a
+    # wrk effort.
+    case "$EFFECTIVE_EFFORT" in
+      low|high|max) CMD_EFFORT="$EFFECTIVE_EFFORT" ;;
+      *) die "$MODEL: deepseek-v4.1-flash accepts cmd effort low|high|max only, not '$EFFECTIVE_EFFORT'" ;;
+    esac
+    GATE_EFFORT_PIN="$CMD_EFFORT"
+  fi
+
   # hk 1863 (operator decision on hk 1864, recorded on hk 1863): the
   # 2026-09-26 no-max builder-seat refusal (decision 4088 B) is removed for
   # every model — max is a legal builder rung, so builder-sonnet-max,
@@ -4542,6 +4788,11 @@ resolve_profile() {
 
   case "$PROFILE_KIND" in
     pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING") ;;
+    # hk 2140: cmd 1.88.0 has no no-MCP launch flag and `cmd mcp` only edits
+    # persisted config (forbidden to touch) — director-1 ruling: launch with
+    # no MCP flag; the no-MCP property is the desk-confirmed absence of any
+    # persisted MCP servers on the cmd accounts.
+    cmd) ARGS=(-m "$PROFILE_MODEL" --effort "$CMD_EFFORT" --yolo --skip-onboarding --no-session) ;;
     codex) ARGS=(--yolo -m "$PROFILE_MODEL" -c "model_reasoning_effort=$EFFECTIVE_EFFORT") ;;
     kiro)
       ARGS=(chat --v3 --trust-all-tools --require-mcp-startup)
@@ -5483,6 +5734,100 @@ wrk_trust_guard() {
   [[ -n "$WRK_TRUST_JOBS_ROOT" ]] || exit 2
 }
 
+# Mode discovery is kept with the existing guard so legacy installations and
+# hermetic copies of wrk need no adapter until O3 is explicitly enabled.
+# No environment variable/flag chooses the records mode.
+wrk_o3_mode() {
+  local mode_home mode_path mode_uid passwd_entry field value mode_component mode_parent
+  if [[ "${WRK_TEST_MODE:-}" == 1 ]]; then
+    # Discovery with no test HOME reads no path (hk951 ruling).
+    [[ -n "${HOME:-}" ]] || { echo legacy; return; }
+    mode_home="$HOME"
+  else
+    mode_uid="$(/usr/bin/id -u)" || return 2
+    if [[ -x /usr/bin/getent ]]; then
+      passwd_entry="$(/usr/bin/getent passwd "$mode_uid")" || return 2
+      IFS=: read -r field field value field field mode_home field <<<"$passwd_entry"
+      [[ "$value" == "$mode_uid" ]] || return 2
+    elif [[ -x /usr/bin/dscacheutil ]]; then
+      passwd_entry="$(/usr/bin/dscacheutil -q user -a uid "$mode_uid")" || return 2
+      mode_home=""
+      while IFS=' ' read -r field value; do
+        [[ "$field" != dir: ]] || mode_home="$value"
+      done <<<"$passwd_entry"
+    else
+      return 2
+    fi
+    [[ "$mode_home" == /* ]] || return 2
+  fi
+  # Prove absence only through searchable real directory ancestors.
+  mode_parent="${mode_home%/*}"
+  [[ -n "$mode_parent" ]] || mode_parent=/
+  if [[ ! -d "$mode_parent" || ! -x "$mode_parent" ]]; then
+    printf 'wrk o3: cli_usage component=%q\n' "$mode_parent" >&2
+    return 2
+  fi
+  for mode_component in "$mode_home" "$mode_home/.config" "$mode_home/.config/wrk"; do
+    if [[ -L "$mode_component" || ( -e "$mode_component" &&
+          ( ! -d "$mode_component" || ! -x "$mode_component" ) ) ]]; then
+      printf 'wrk o3: cli_usage component=%q\n' "$mode_component" >&2
+      return 2
+    fi
+    if [[ ! -e "$mode_component" ]]; then
+      echo legacy
+      return
+    fi
+  done
+  mode_path="$mode_home/.config/wrk/records-mode"
+  # Absence alone needs no parser. A dangling symlink still needs validation.
+  if [[ ! -e "$mode_path" && ! -L "$mode_path" ]]; then
+    echo legacy
+    return
+  fi
+  WRK_TRUST_PY="$WRK_TRUST_PY" python3 - <<'PY'
+import os, pwd, stat, sys
+ns = {"__name__": "wrk_mode_guard"}
+exec(os.environ["WRK_TRUST_PY"], ns)
+try:
+    test = os.environ.get("WRK_TEST_MODE") == "1"
+    if test and not os.environ.get("HOME"):
+        # Director-1 hk951 ruling: discovery only, no path read. Adapter
+        # operations still require the unchanged full PR242 guard.
+        print("legacy")
+        raise SystemExit(0)
+    home = pwd.getpwuid(os.getuid()).pw_dir
+    if test:
+        ns["trust_resolve"](os.environ, home, os.getuid(), True, False)
+    checked_home = os.environ["HOME"] if test else home
+    path = os.path.join(checked_home, ".config", "wrk", "records-mode")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        print("legacy")
+        raise SystemExit(0)
+    with os.fdopen(fd, "rb") as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise ValueError()
+        mode = f.read(32).decode("ascii").strip()
+    if mode not in ("legacy", "shadow", "required"):
+        raise ValueError()
+    print(mode)
+except (OSError, ValueError, KeyError, ns["TrustRefusal"]):
+    sys.stderr.write("wrk o3: cli_usage\n")
+    raise SystemExit(2)
+PY
+}
+
+wrk_o3_cmd() {
+  local adapter
+  adapter="$(python3 - "${BASH_SOURCE[0]}" <<'PY'
+import os, sys
+print(os.path.join(os.path.dirname(os.path.realpath(sys.argv[1])), "wrk-o3.py"))
+PY
+  )" || return 2
+  python3 "$adapter" "$@"
+}
+
 completion_metadata() {
   local job="$1" root
   # "trusted" (round open/verdict/void and joined, after wrk_trust_guard) reads the
@@ -6350,6 +6695,17 @@ ROUND_CAP_REASON="tester round cap reached"
 round_help() {
   cat <<'USAGE'
 Usage: wrk round <open|verdict|void|status|audit> [JOB] [options]
+
+O3 (records-mode shadow/required): open JOB --head SHA [--repo PATH]
+  [--extension-grant SEQ] [--repeat-grant SEQ] [--tester JOB];
+  verdict JOB --file FILE [--tester JOB];
+  void JOB N --grant SEQ [--reason-code CODE] (default builder_void).
+Enrolled jobs refuse legacy --extend/--by refs. Canonical receipts precede
+round projections; projection_pending exits 75 and a retry repairs from the
+server. Offline cached status is stale=true and labelled O2-unverified.
+Audit queries only job dirs holding O3 intents or a snapshot. Other findings
+keep the O2 audit and --lane filter, with label=O2-unverified on every row.
+Use wrk o3 --help for typed completed/joined adapter and central desk tooling.
 
 Formal tester-round bookkeeping for a builder job (#758). A formal round is
 one tester verdict recorded for one head. The count is taken only from the
@@ -7380,6 +7736,16 @@ round_audit_cmd() {
 round_cmd() {
   local sub="${1:-}"
   case "$sub" in
+    open|verdict|void|status|audit)
+      local o3_mode o3_rc=0
+      o3_mode="$(wrk_o3_mode)" || return "$?"
+      if [[ "$o3_mode" != legacy ]]; then
+        wrk_o3_cmd round "$@" </dev/null || o3_rc=$?
+        [[ "$o3_rc" -eq 90 ]] || return "$o3_rc"
+      fi
+      ;;
+  esac
+  case "$sub" in
     -h|--help|"") round_help ;;
     open) shift; round_open_cmd "$@" ;;
     verdict) shift; round_verdict_cmd "$@" ;;
@@ -7515,6 +7881,8 @@ sentinel_log() {
 # job_events_scan EVENTS_DIR... — one TSV row per job:
 #   job \t ended \t hub_ended \t terminal_kind \t last_event_age_s \t last_kind
 #       \t completed_n \t owner \t label \t pane \t tab
+# last_event_age_s / last_kind  housekeeping records (job.artifacts_pruned)
+#               are not job activity and never count for either
 # ended         a work-terminal record exists after the newest revive
 # hub_ended     a hub-terminal record exists after the newest revive
 # terminal_kind the newest work-terminal kind ("-" when not ended)
@@ -7532,6 +7900,13 @@ REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.repromp
 NEUTRAL = {"job.lost", "job.recovered"}
 if NEUTRAL & (WORK_TERMINAL | HUB_TERMINAL | REVIVE):
     raise SystemExit("neutral event kind is also terminal or revive")
+# Housekeeping records are the fleet's own bookkeeping about a job, not job
+# activity: wrk prune appends job.artifacts_pruned for each removal, and
+# counting it would restart the --heavy-age clock of a job's cache rows and
+# the --stale-age clock of a job that has not ended on every prune.
+HOUSEKEEPING = {"job.artifacts_pruned"}
+if HOUSEKEEPING & (WORK_TERMINAL | HUB_TERMINAL | REVIVE):
+    raise SystemExit("housekeeping event kind is also terminal or revive")
 now = time.time()
 
 
@@ -7562,6 +7937,8 @@ for events in sys.argv[1:]:
         if not isinstance(payload, dict):
             payload = {}
         kind = doc.get("kind") or doc.get("type") or doc.get("event") or ""
+        if kind in HOUSEKEEPING:
+            continue
         # The loop is already in the shared order, so the last readable row is
         # the newest kind; only the raw time is a max for the age field.
         last_t = max(last_t, when)
@@ -8125,6 +8502,9 @@ finally:
 PY
 }
 
+# hk1892: consecutive polls with the job dir gone before a sentinel leaves.
+SENTINEL_GONE_POLLS=2
+
 sentinel_cmd() {
   WRK_COMPLETION_SENTINEL=1
   export WRK_COMPLETION_SENTINEL
@@ -8171,7 +8551,21 @@ PY
   lost=0
   lost_at=0
   lost_reason=""
+  local gone=0 events_seen=""
   while :; do
+    [[ -d "$jobdir/events" ]] && events_seen=1
+    # hk1892: a removed job tree is not ours to re-create. Leave quietly: no log,
+    # no event, no release, no mkdir.
+    # A symlink in place of either dir is a replacement, not our tree: -d follows it.
+    if [[ ! -d "$jobdir" || -L "$jobdir" || ( -n "$events_seen" && ( ! -d "$jobdir/events" || -L "$jobdir/events" ) ) ]]; then # hk1892-jobdir-gone
+      gone=$(( gone + 1 ))
+      # The EXIT record would append through a symlinked dir into a tree that is
+      # not ours; this exit writes no log line.
+      (( gone < SENTINEL_GONE_POLLS )) || { SENTINEL_EXIT_LOGFILE=/dev/null; sentinel_self_exit "$job" 0; }
+      sleep "$interval"
+      continue
+    fi
+    gone=0
     local now probe class token candidate key action recover_reason rearm_loss log_extra watch_expired
     now="$(date +%s)"
     probe="$(herdr_agent_probe "$pane")"
@@ -9437,7 +9831,7 @@ spillover_wake_request() {
 # a flag and remains a perfectly valid --requested-by value.
 wrk_option_token() {
   case "$1" in
-    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--report-relative|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
+    -c|-m|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--report-relative|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--head|--extension-grant|--repeat-grant|--task-hk-bypass|--job-dup-ok|--landing-strict|--keep|--host|-h|--help) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -10218,7 +10612,10 @@ spawn_router_cmd() {
   # round may still place on that target's own remotes.
   # The explicit local leg (including SSH delegation) must name the pi
   # profile/host/key even when the TOML itself is malformed.
-  if [[ "$requested" == local ]]; then pi_host_precheck "$router_profile"; fi
+  if [[ "$requested" == local ]]; then
+    pi_host_precheck "$router_profile"
+    cmd_host_precheck "$router_profile"
+  fi
   local_spawn_resolve || return
   if [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 && "$requested" == local ]]; then
     echo "wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local" >&2
@@ -10612,11 +11009,15 @@ spawn_router_cmd() {
 #     its own line: '[local] # note', '[ local ]', '["local"]', '[[local]]',
 #     a truncated '[local', or '[local]' with trailing text;
 #   - a second [local] table header;
-#   - inside [local], a second spawn key whatever its value, or a line
-#     starting a would-be spawn key that is not 'spawn = <value>' (bare
-#     'spawn', 'spawn: false', 'spawn == false', a quoted "spawn" key);
-#   - a spawn value other than bare true/false after stripping a trailing
-#     '#' comment and whitespace;
+#   - inside [local], duplicate capability keys (pi_anthropic or
+#     cmd_dsflash41) whatever their value, or any line starting a would-be
+#     spelling that is not a clean assignment; each accepts only bare
+#     true|false booleans;
+#   - a second spawn key whatever its value, or a line starting a would-be
+#     spawn key that is not 'spawn = <value>' (bare 'spawn', 'spawn: false',
+#     'spawn == false', a quoted "spawn" key);
+#   - a capability or spawn value other than bare true/false after stripping
+#     a trailing '#' comment and whitespace;
 #   - any content before the first table header — the root table must be
 #     empty, so 'local.spawn = false', '"local".spawn = false' or
 #     'local = { spawn = false }' there are root keys, not the flag;
@@ -10658,6 +11059,28 @@ pi_host_precheck() {
   fi
 }
 
+# hk 2140 desk gate: Command Code accounts with no configured MCP servers are
+# known only on mbp, desktop and m1b. Require an explicit local capability flag
+# and an execution-host identity in that desk-approved set; caller placement
+# options never grant this capability.
+cmd_host_precheck() {
+  local profile="${1:-${MODEL:-}}" host
+  [[ "$profile" == cmd-dsflash41 ]] || return 0
+  host="$(spillover_value hub machine_id 2>/dev/null || true)"
+  [[ -n "$host" ]] || host="$(hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
+  case "$host" in
+    mbp|desktop|m1b) ;;
+    *) die "$profile refused on host $host: approved hosts are mbp, desktop, m1b (desk 2026-10-27; m1 has MCP servers)" ;;
+  esac
+  if ! local_spawn_scan; then
+    die "$profile refused on host $host: $LOCAL_SPAWN_ERROR"
+  fi
+  if [[ "$LOCAL_CMD_DSFLASH41" -ne 1 ]]; then
+    die "$profile refused on host $host: hosts.toml [local] cmd_dsflash41 must be literal true"
+  fi
+}
+
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -10678,13 +11101,14 @@ local_spawn_table_name() {
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
   LOCAL_PI_ANTHROPIC=0
+  LOCAL_CMD_DSFLASH41=0
   LOCAL_HEAVY_LOAD_WAIT=1
   LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SHELL_READY_TIMEOUT_MS=0
   LOCAL_SHELL_READY_TIMEOUT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0 cmd_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -10757,6 +11181,29 @@ local_spawn_scan() {
     # grammar as spawn/heavy_load_wait. Keep this in bash: execution hosts
     # may have Python 3.9 without tomllib (director-1, 2026-10-26).
     case "$line" in
+      cmd_dsflash41[A-Za-z0-9_-]*) ;; # a different bare key
+      cmd_dsflash41* | '"cmd_dsflash41"'* | "'cmd_dsflash41'"*)
+        if [[ "$line" =~ ^cmd_dsflash41[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed cmd_dsflash41 assignment in [local] (expected 'cmd_dsflash41 = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        cmd_seen=$((cmd_seen + 1))
+        if [[ "$cmd_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate cmd_dsflash41 key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) LOCAL_CMD_DSFLASH41=1 ;;
+          false) ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] cmd_dsflash41 accepts only the bare TOML booleans true or false"
+             return "$WRK_EXIT_CONFIG_REFUSED"
+             ;;
+        esac
+        continue ;;
       pi_anthropic[A-Za-z0-9_-]*) ;; # a different bare key
       pi_anthropic* | '"pi_anthropic"'* | "'pi_anthropic'"*)
         if [[ "$line" =~ ^pi_anthropic[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
@@ -10955,6 +11402,211 @@ hosts_cmd() {
       printf '%s\t%s\t%s\t%s\n' "$host" "$SPILL_PROBE_REASON" "${SPILL_REMOTE_LOAD:-unknown}" "${SPILL_REMOTE_ACTIVE:-unknown}"
     fi
   done
+}
+
+usage_help() {
+  cat <<'USAGE'
+Usage: wrk usage [--alert]
+
+Measure this host's fleet output under ~/work and print per-bucket totals.
+The command is read-only: sizes come from du at one level, no file contents
+are read, and nothing is deleted or moved.
+
+Buckets:
+  jobs        ~/work/herdr-inbox/jobs total, plus the top 5 job dirs by size
+  worktrees   linked worktrees under ~/work — a top-level dir whose .git is
+              a file — with their count and total
+  webqa       ~/work/webqa-runner when present
+  rest        the rest of ~/work (the total minus the buckets above)
+
+With --alert, when the measured total exceeds the threshold — hosts.toml
+[local] fleet_usage_alert_gb, default 100 when absent — one lane.event is
+emitted to director-1 with the host, the totals and the top 5. At most one
+alert per host per 24h; the dedup state is .fleet-usage-alert-<host> under
+the jobs directory. Without --alert the command only prints.
+
+  --alert    emit the director-1 lane event when over threshold
+  -h, --help show this usage
+USAGE
+}
+
+usage_du_kib() {  # DIR — du KiB of DIR; rc 1 when DIR exists but du failed
+  local out rc=0
+  [[ -e "$1" || -L "$1" ]] || { printf '0\n'; return 0; }
+  out="$(du -sk "$1" 2>/dev/null)" || rc=$?
+  if [[ $rc -eq 0 && ${out%%[[:space:]]*} =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "${out%%[[:space:]]*}"
+  else
+    return 1
+  fi
+}
+
+usage_measure() {  # WORK_ROOT — fill the USAGE_* bucket fields
+  local work d name kib rows
+  # Resolve a symlinked work root to its real path so du measures the
+  # target, never the link itself (a link would read near-zero).
+  work="$1"
+  if [[ -e "$work" || -L "$work" ]]; then
+    work="$(cd "$work" 2>/dev/null && pwd -P)" || work="$1"
+  fi
+  USAGE_WORK="$work"
+  USAGE_HOST="${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+  USAGE_JOBS="$work/herdr-inbox/jobs"
+  USAGE_WEBQA="$work/webqa-runner"
+  USAGE_INCOMPLETE=0
+  USAGE_TOTAL_KIB="$(usage_du_kib "$work")" ||
+    { USAGE_INCOMPLETE=1; USAGE_TOTAL_KIB=0; }
+  USAGE_JOBS_KIB="$(usage_du_kib "$USAGE_JOBS")" ||
+    { USAGE_INCOMPLETE=1; USAGE_JOBS_KIB=0; }
+  USAGE_WT_COUNT=0 USAGE_WT_KIB=0
+  USAGE_WEBQA_PRESENT=0 USAGE_WEBQA_KIB=0
+  USAGE_TOP5=""
+  if [[ -d "$USAGE_JOBS" ]]; then
+    # Collect the rows in the parent (not inside a pipe) so a failed du
+    # flags the run incomplete, then sort once and keep the first five
+    # with awk NR<=5 — reading the whole stream, never closing it early
+    # (an early head close would SIGPIPE sort and fail the command under
+    # set -o pipefail).
+    rows=""
+    for d in "$USAGE_JOBS"/*/; do
+      [[ -d "$d" ]] || continue
+      name="${d%/}"; name="${name##*/}"
+      if kib="$(usage_du_kib "$d")"; then
+        rows+="$kib"$'\t'"$name"$'\n'
+      else
+        USAGE_INCOMPLETE=1
+      fi
+    done
+    if [[ -n "$rows" ]]; then
+      USAGE_TOP5="$(printf '%s' "$rows" | sort -rn |
+        awk -F'\t' 'NR<=5{printf "%s%s:%s",(NR>1?",":""),$2,$1}')"
+    fi
+  fi
+  # Linked worktrees: a top-level dir whose .git is a FILE (a gitdir
+  # pointer), never a .git dir — the file type alone decides, no content
+  # is read. herdr-inbox and webqa-runner keep their own buckets.
+  for d in "$work"/*/; do
+    [[ -d "$d" ]] || continue
+    name="${d%/}"; name="${name##*/}"
+    case "$name" in herdr-inbox|webqa-runner) continue ;; esac
+    if [[ -f "$d.git" ]]; then
+      USAGE_WT_COUNT=$((USAGE_WT_COUNT + 1))
+      if kib="$(usage_du_kib "$d")"; then
+        USAGE_WT_KIB=$((USAGE_WT_KIB + kib))
+      else
+        USAGE_INCOMPLETE=1
+      fi
+    fi
+  done
+  if [[ -e "$USAGE_WEBQA" || -L "$USAGE_WEBQA" ]]; then
+    USAGE_WEBQA_PRESENT=1
+    USAGE_WEBQA_KIB="$(usage_du_kib "$USAGE_WEBQA")" ||
+      { USAGE_INCOMPLETE=1; USAGE_WEBQA_KIB=0; }
+  fi
+  USAGE_REST_KIB=$((USAGE_TOTAL_KIB - USAGE_JOBS_KIB - USAGE_WT_KIB - USAGE_WEBQA_KIB))
+  if ((USAGE_REST_KIB < 0)); then USAGE_REST_KIB=0; fi
+  ((USAGE_INCOMPLETE == 0)) ||
+    warn "wrk usage: one or more du measurements failed; totals are incomplete (work=$USAGE_WORK)"
+}
+
+usage_threshold() {  # fill USAGE_THRESHOLD_GB and USAGE_THRESHOLD_SRC
+  local value
+  USAGE_THRESHOLD_GB=100
+  USAGE_THRESHOLD_SRC=default
+  if value="$(spillover_value local fleet_usage_alert_gb 2>/dev/null)"; then
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+      die "$(spillover_config): [local] fleet_usage_alert_gb must be a bare non-negative integer (got '$value')"
+    USAGE_THRESHOLD_GB="$value"
+    USAGE_THRESHOLD_SRC="$(spillover_config) [local] fleet_usage_alert_gb"
+  fi
+}
+
+usage_over_threshold() {
+  awk -v t="$USAGE_TOTAL_KIB" -v g="$USAGE_THRESHOLD_GB" \
+    'BEGIN{exit !(t > g*1048576)}'
+}
+
+usage_report() {
+  printf 'host=%s work_root=%s total_kib=%s total_gib=%s\n' \
+    "$USAGE_HOST" "$USAGE_WORK" "$USAGE_TOTAL_KIB" \
+    "$(awk -v k="$USAGE_TOTAL_KIB" 'BEGIN{printf "%.3f", k/1048576}')"
+  printf 'jobs_root=%s jobs_kib=%s\n' "$USAGE_JOBS" "$USAGE_JOBS_KIB"
+  printf 'jobs_top5=%s\n' "$USAGE_TOP5"
+  printf 'worktrees_count=%s worktrees_kib=%s\n' "$USAGE_WT_COUNT" "$USAGE_WT_KIB"
+  if ((USAGE_WEBQA_PRESENT)); then
+    printf 'webqa_runner_kib=%s\n' "$USAGE_WEBQA_KIB"
+  else
+    printf 'webqa_runner=absent\n'
+  fi
+  printf 'rest_kib=%s\n' "$USAGE_REST_KIB"
+  local over=no complete=yes
+  usage_over_threshold && over=yes
+  ((USAGE_INCOMPLETE == 0)) || complete=no
+  printf 'measurement=%s\n' "$complete"
+  printf 'fleet_usage_alert_gb=%s threshold_src=%s over_threshold=%s\n' \
+    "$USAGE_THRESHOLD_GB" "$USAGE_THRESHOLD_SRC" "$over"
+}
+
+usage_alert_host_key() {
+  printf '%s' "$USAGE_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c 'a-z0-9.-' '-'
+}
+
+usage_alert() {
+  if ((USAGE_INCOMPLETE)); then
+    printf 'alert=skipped reason=incomplete-measurement\n'
+    return 0
+  fi
+  if ! usage_over_threshold; then
+    printf 'alert=under-threshold\n'
+    return 0
+  fi
+  local state now last=""
+  state="$USAGE_JOBS/.fleet-usage-alert-$(usage_alert_host_key)"
+  now="$(date +%s)"
+  if [[ -f "$state" ]]; then
+    last="$(awk 'NR==1{print $1}' "$state" 2>/dev/null || true)"
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < 86400 )); then
+      printf 'alert=dedup state=%s\n' "$state"
+      return 0
+    fi
+  fi
+  local panewire
+  panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
+  if [[ -z "$panewire" ]]; then
+    warn "panewire not found; fleet usage alert not emitted (host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB)"
+    printf 'alert=failed reason=panewire-not-found\n'
+    return 0
+  fi
+  local text
+  text="fleet_usage_alert host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB total_gib=$(awk -v k="$USAGE_TOTAL_KIB" 'BEGIN{printf "%.3f", k/1048576}') jobs_kib=$USAGE_JOBS_KIB worktrees_count=$USAGE_WT_COUNT worktrees_kib=$USAGE_WT_KIB webqa_runner_kib=$USAGE_WEBQA_KIB rest_kib=$USAGE_REST_KIB threshold_gb=$USAGE_THRESHOLD_GB top5=$USAGE_TOP5"
+  if run_bounded 5 "$panewire" emit --kind lane.event --lane director-1 \
+      --event-id "fleet-usage-$(usage_alert_host_key)-$now" \
+      --text "$text" --inbox-root "$(dirname "$USAGE_JOBS")" >/dev/null 2>&1; then
+    mkdir -p "$USAGE_JOBS" 2>/dev/null || true
+    printf '%s\n' "$now" >"$state" 2>/dev/null ||
+      warn "fleet usage alert state could not be written: $state"
+    printf 'alert=emitted lane=director-1 event_id=fleet-usage-%s-%s\n' \
+      "$(usage_alert_host_key)" "$now"
+  else
+    warn "panewire emit failed; fleet usage alert left unstamped (host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB)"
+    printf 'alert=failed reason=emit-rc\n'
+  fi
+}
+
+usage_cmd() {
+  local alert=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) [[ $# -eq 1 ]] || die "unexpected argument '$2'"; usage_help; return 0 ;;
+      --alert) alert=1; shift ;;
+      *) die "unknown usage option '$1'" ;;
+    esac
+  done
+  usage_measure "$HOME/work"
+  usage_threshold
+  usage_report
+  ((alert)) || return 0
+  usage_alert
 }
 
 
@@ -11850,6 +12502,7 @@ spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" REPORT_RELATIVE=0 JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
   OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
+  O3_SPAWN_VERIFIED=0 O3_SPAWN_HEAD="" O3_EXTENSION_GRANT="" O3_REPEAT_GRANT=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
   MOCK_MCP_PLAN="" MOCK_MCP_HELPER="" SPAWN_MOCK_MCP_RETAIN=0
@@ -11861,7 +12514,7 @@ spawn_cmd() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) spawn_help; return 0 ;;
-      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--report-relative|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--lane-defer)
+      -c|-m|--profile|-p|-w|-l|-L|--effort|--job|--t|--owner|--role|--lane|--parent|--report|--report-relative|--operator-request|--round-ext|--requested-by|--purpose|--task|--parent-job|--takeover-from|--lane-defer|--head|--extension-grant|--repeat-grant)
         { [[ $# -ge 2 && -n "$2" ]] && ! wrk_option_token "$2"; } || die "$1 requires a value"
         case "$1" in
           -c) CWD="$2" ;; -m|--profile) MODEL="$2" ;; -p) PROMPT="$2" ;; -w) WS="$2" ;;
@@ -11874,6 +12527,9 @@ spawn_cmd() {
           --round-ext) ROUND_EXT_REF="$2" ;;
           --purpose) PURPOSE="$2" ;; --task) TASK_ID="$2" ;; --parent-job) PARENT_JOB="$2" ;; --takeover-from) TAKEOVER_FROM="$2" ;;
           --lane-defer) LANE_DEFER="$2" ;;
+          --head) [[ -z "$O3_SPAWN_HEAD" ]] || die "duplicate --head"; O3_SPAWN_HEAD="$2" ;;
+          --extension-grant) [[ -z "$O3_EXTENSION_GRANT" ]] || die "duplicate --extension-grant"; O3_EXTENSION_GRANT="$2" ;;
+          --repeat-grant) [[ -z "$O3_REPEAT_GRANT" ]] || die "duplicate --repeat-grant"; O3_REPEAT_GRANT="$2" ;;
         esac
         shift 2 ;;
       --task-hk-bypass) TASK_HK_BYPASS=1; shift ;;
@@ -11889,6 +12545,7 @@ spawn_cmd() {
   # future aliases too.
   refuse_known_terra_spelling
   pi_host_precheck
+  cmd_host_precheck
   # #1155: several router paths reach spawn_cmd directly (an unclassified
   # spawn, an unreadable arbiter, a hosts.toml-less auto). The flag gate
   # repeats here so no local spawn path runs on a host whose own [local]
@@ -11949,6 +12606,8 @@ spawn_cmd() {
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
       pi-haiku55|pi-sonnet55|pi-opus55)
         die "--role builder rejects '$MODEL': pi seats are worker/tester-only until reps exist (hk 2080)" ;;
+      cmd-dsflash41)
+        die "--role builder rejects '$MODEL': cmd seats are worker/tester-only until reps exist (hk 2140)" ;;
       devin-fusion-sol61|devin-fusion-sol61-xhigh)
         die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
@@ -12018,16 +12677,66 @@ spawn_cmd() {
     esac
   fi
 
+  # ROB-1198 §③ / ROB-1199 claim contract: an unclassified job is not spawned.
+  # There is no default T — a blank one would be recorded as fact by arbiter.
+  # Checked before the quota gate, so nothing is measured, claimed or spawned.
+  [[ -n "$JOB_T" ]] ||
+    die "NEEDS_CLASSIFICATION: --t T0..T3 is required (job '$JOB_ID'); classify it, do not guess"
+  case "$JOB_T" in T0|T1|T2|T3) ;; *) die "--t accepts only T0, T1, T2 or T3" ;; esac
+
   # #768: task binding is decided here, still before any side effect — a
   # missing/unresolvable task id is a usage error, never a partial spawn.
-  local requested_parent_job="$PARENT_JOB"
+  local requested_parent_job="$PARENT_JOB" requested_owner="$OWNER" effective_parent_owner=""
   if [[ -n "$requested_parent_job" || "$REPORT_RELATIVE" == 1 ]]; then
     parent_spawn_validate "$requested_parent_job" "$JOB_ID" "$ROLE" "$OWNER" "$REPORT_PATH" "$REPORT_RELATIVE"
+    effective_parent_owner="$PARENT_SPAWN_OWNER"
     OWNER="$PARENT_SPAWN_OWNER"
     REPORT_PATH="$PARENT_SPAWN_REPORT"
   fi
-  task_validate
-  if [[ -n "$TAKEOVER_FROM" ]]; then
+  local o3_spawn_mode o3_meta="" o3_rc=0 o3_owner="" o3_parent=""
+  o3_spawn_mode="$(wrk_o3_mode)" || return "$?"
+  if [[ "$o3_spawn_mode" != legacy ]]; then
+    [[ -z "$ROUND_EXT_REF" && "$TASK_HK_BYPASS" -eq 0 ]] ||
+      die "O3 spawn refuses legacy --round-ext and --task-hk-bypass; use typed grants"
+    if [[ -n "$O3_SPAWN_HEAD" ]]; then
+      [[ "$O3_SPAWN_HEAD" =~ ^[0-9a-fA-F]{40}$ ]] || die "O3 reviewer --head requires a full 40-hex SHA"
+    fi
+    local o3_args=(spawn-check "$JOB_ID" --role "$ROLE" --tier "$JOB_T")
+    [[ -z "$TASK_ID" ]] || o3_args+=(--task "$TASK_ID")
+    # The builder's lane always binds to its canonical claim. Parent owners,
+    # explicit or forwarded, are compared after verification for exit 2.
+    if [[ -n "$BUILDER_LANE" ]]; then
+      o3_args+=(--owner "$BUILDER_LANE")
+    elif [[ -z "$requested_parent_job" && -n "$requested_owner" ]]; then
+      o3_args+=(--owner "$requested_owner")
+    fi
+    [[ -z "$PARENT_LANE" ]] || o3_args+=(--parent "$PARENT_LANE")
+    [[ -z "$PARENT_JOB" ]] || o3_args+=(--parent-job "$PARENT_JOB")
+    [[ -z "$O3_SPAWN_HEAD" ]] || o3_args+=(--head "$O3_SPAWN_HEAD" --repo "$CWD")
+    [[ -z "$O3_EXTENSION_GRANT" ]] || o3_args+=(--extension-grant "$O3_EXTENSION_GRANT")
+    [[ -z "$O3_REPEAT_GRANT" ]] || o3_args+=(--repeat-grant "$O3_REPEAT_GRANT")
+    [[ -z "$TAKEOVER_FROM" ]] || o3_args+=(--takeover-from "$TAKEOVER_FROM")
+    o3_meta="$(wrk_o3_cmd "${o3_args[@]}" </dev/null)" || o3_rc=$?
+    if [[ "$o3_rc" -eq 0 ]]; then
+      IFS=$'\t' read -r TASK_ID o3_owner o3_parent TASK_LINK_STATUS <<<"$o3_meta"
+      [[ -n "$TASK_ID" && -n "$o3_owner" && -n "$o3_parent" && -n "$TASK_LINK_STATUS" ]] || die "O3 spawn claim verification returned incomplete metadata"
+      if [[ -n "$effective_parent_owner" && "$effective_parent_owner" != "$o3_owner" ]]; then
+        die "parent effective owner '$effective_parent_owner' disagrees with O3 canonical owner '$o3_owner'"
+      fi
+      O3_SPAWN_VERIFIED=1
+      [[ "$ROLE" == builder ]] || OWNER="$o3_owner"
+      TASK_LINK_MODE=owner TASK_INHERITED_FROM=""
+      if [[ "$TASK_LINK_STATUS" == inherited ]]; then
+        TASK_LINK_MODE=inherited TASK_INHERITED_FROM="${PARENT_JOB:-$TAKEOVER_FROM}"
+      fi
+    elif [[ "$o3_rc" -ne 90 ]]; then
+      return "$o3_rc"
+    fi
+  elif [[ -n "$O3_SPAWN_HEAD$O3_EXTENSION_GRANT$O3_REPEAT_GRANT" ]]; then
+    die "typed reviewer spawn flags require shadow or required records mode"
+  fi
+  [[ "$O3_SPAWN_VERIFIED" -eq 1 ]] || task_validate
+  if [[ "$O3_SPAWN_VERIFIED" -eq 0 && -n "$TAKEOVER_FROM" ]]; then
     hk_task_takeover_precheck
   fi
   round_ext_precheck
@@ -12065,16 +12774,11 @@ spawn_cmd() {
     ARBITER_CLAIM_ROLE_ARGS+=(--parent-lane "$PARENT_LANE")
   fi
 
-  # ROB-1198 §③ / ROB-1199 claim contract: an unclassified job is not spawned.
-  # There is no default T — a blank one would be recorded as fact by arbiter.
-  # Checked before the quota gate, so nothing is measured, claimed or spawned.
-  [[ -n "$JOB_T" ]] ||
-    die "NEEDS_CLASSIFICATION: --t T0..T3 is required (job '$JOB_ID'); classify it, do not guess"
-  case "$JOB_T" in T0|T1|T2|T3) ;; *) die "--t accepts only T0, T1, T2 or T3" ;; esac
-
   # #768: read-only hk task probe — fail closed before the quota gate measures
   # anything, before any pane, before any hk write. Sets TASK_LINK_STATUS.
-  if [[ -n "$TAKEOVER_FROM" ]]; then
+  if [[ "$O3_SPAWN_VERIFIED" -eq 1 ]]; then
+    : # Canonical handshake already verified the task/host/lane binding.
+  elif [[ -n "$TAKEOVER_FROM" ]]; then
     hk_task_takeover_precheck
   else
     hk_task_precheck
@@ -12104,8 +12808,11 @@ spawn_cmd() {
     die "scopefuel policy launch refused profile '$MODEL' (catalog profile '$CATALOG_PROFILE'): ${CATALOG_REFUSE_REASON:-no reason reported}"
   # A takeover route refusal must precede the arbiter claim as well as pane
   # creation, so no failed rebind can leave partial local job records.
-  hk_task_takeover_rebind
+  [[ "$O3_SPAWN_VERIFIED" -eq 1 ]] || hk_task_takeover_rebind
   arbiter_admit
+  if [[ "$O3_SPAWN_VERIFIED" -eq 1 && "$ARBITER_JOB_REGISTERED" -ne 1 ]]; then
+    die "O3 spawn requires its local arbiter claim before pane creation"
+  fi
   quota_hub_policy_gate
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
 
@@ -12215,6 +12922,8 @@ print(value if isinstance(value, str) else "")
 
   if [[ "$PROFILE_KIND" == devin ]]; then
     devin_start_in_pane
+  elif [[ "$PROFILE_KIND" == cmd ]]; then
+    cmd_start_in_pane
   else
     agent_start_in_pane
   fi
@@ -12248,6 +12957,11 @@ print(value if isinstance(value, str) else "")
     spawn_pane_cleanup
     return 1
   fi
+  if [[ "$PROFILE_KIND" == cmd ]] && ! cmd_model_proven; then
+    echo "wrk: $MODEL cmd model not proven: expected $CMD_SCREEN_MODEL with $CMD_EFFORT effort" >&2
+    spawn_pane_cleanup
+    return 1
+  fi
   STATUS="unknown"
   if STATUS="$(agent_status_for_pane "$PANE")"; then :; else STATUS=unknown; fi
   # An older herdr may not report the tab in `tab create`; the agent knows it.
@@ -12259,7 +12973,7 @@ print(value if isinstance(value, str) else "")
   # never touches hk. A refusal here dies before the success receipt and while
   # SPAWN_PANE_OPEN is still armed: the EXIT trap closes the pane and releases
   # the quota record — no job without its task link.
-  hk_task_link
+  [[ "$O3_SPAWN_VERIFIED" -eq 1 ]] || hk_task_link
   # #965/#1397: with the pane provably up and the spawn committed to its OK
   # line, register the lane on the daemon serving this herdr session —
   # worker label under --owner, builder --lane under --parent — before the
@@ -12788,6 +13502,401 @@ reap_cmd() {
   fi
 }
 
+worktree_reap_help() {
+  cat <<'USAGE'
+Usage: wrk worktree-reap [--age DURATION] [--apply]
+
+List the git worktrees of the repositories under ~/work and remove the ones
+provably done with: dry-run by default, --apply to remove. A worktree is
+removed only when ALL of these are measured at run time:
+
+  1. It is a linked worktree, never a main checkout (`git worktree list`
+     marks the main one). ~/work/ParkingArcade and
+     ~/work/ParkingArcade.pa-unity are additionally protected by exact path.
+  2. Its task is merged or dropped in handoffkeep, matched through a job
+     receipt or task link that names that worktree as its cwd (a payload
+     cwd/worktree/repo field naming the path exactly). A worktree no such
+     record names is skipped, never guessed from its name.
+  3. `git status --porcelain` is empty, untracked files included.
+  4. 0 unpushed: either HEAD equals the remote branch head from
+     `git ls-remote` (not a local tracking ref), or HEAD is an ancestor of
+     origin/main after a fresh fetch of main. A detached HEAD must satisfy
+     the second test. An unreachable remote keeps the worktree: unpushed
+     cannot be proven.
+  5. No live herdr pane has its cwd inside the worktree, and no live
+     completion sentinel belongs to a job bound to it.
+  6. The merge or drop is older than --age (default 3d).
+
+Removal uses `git worktree remove` only — never --force and never rm. A
+failure skips that worktree and continues. One line per worktree prints the
+reason it is kept, or that it would be / was removed.
+
+Options:
+  --age DURATION   minimum age of the merge or drop (3d, 600, 600s, 10m, 2h)
+  --apply          actually remove; without it the command only lists.
+  -h, --help       show this usage
+USAGE
+}
+
+# worktree_reap_scan ROOT JOBS_ROOT HK AGENTS_FILE SENT_FILE AGE_S NOW PA_MAIN PA_WT
+#
+# One TSV row per listed worktree:
+#   path <TAB> verdict(keep|remove) <TAB> reason <TAB> main <TAB> task <TAB> jobs
+# All conditions are measured inside: the event scan binds worktree paths to
+# jobs only through payload cwd/worktree/repo fields that name the path, the
+# task is read from handoffkeep, and the git checks run bounded. Anything not
+# provable emits keep with the reason instead of guessing.
+worktree_reap_scan() {
+  local root="$1" jobs_root="$2" hk="$3" agents_file="$4" sent_file="$5" age_s="$6" now="$7" pa_main="$8" pa_wt="$9"
+  wrk_py - "$root" "$jobs_root" "$hk" "$agents_file" "$sent_file" "$age_s" "$now" "$pa_main" "$pa_wt" <<'PY'
+import json, os, subprocess, sys
+exec(os.environ["WRK_EVENTS_PY"])
+
+root, jobs_root, hk, agents_file, sent_file, age_s, now_s, pa_main, pa_wt = sys.argv[1:10]
+age_s = int(age_s)
+now = float(now_s)
+env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+
+def norm(p):
+    p = os.path.expanduser(p.strip())
+    if not p or not p.startswith("/"):
+        return ""
+    return os.path.realpath(p)
+
+
+protected = set()
+for p in (pa_main, pa_wt):
+    n = norm(p)
+    if n:
+        protected.add(n)
+
+
+def git_out(args, timeout):
+    """(rc, stdout) — rc None when the call could not run or timed out."""
+    try:
+        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           env=env, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def git_rc(args, timeout):
+    try:
+        r = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           env=env, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.returncode
+
+
+# ── worktree inventory ────────────────────────────────────────────────────
+entries = {}
+try:
+    repo_names = sorted(os.listdir(root))
+except OSError:
+    repo_names = []
+for name in repo_names:
+    rdir = os.path.join(root, name)
+    if not os.path.isdir(rdir):
+        continue
+    rc, out = git_out(["git", "-C", rdir, "worktree", "list", "--porcelain"], 15)
+    if rc != 0:
+        continue
+    rc2, common = git_out(["git", "-C", rdir, "rev-parse", "--path-format=absolute",
+                           "--git-common-dir"], 10)
+    main_path = ""
+    if rc2 == 0:
+        c = common.strip()
+        if os.path.basename(c) == ".git":
+            main_path = os.path.dirname(c)
+    cur = None
+    for line in out.splitlines() + [""]:
+        if line.startswith("worktree "):
+            cur = {"path": line[len("worktree "):], "head": "", "branch": "",
+                   "bare": False, "main": main_path}
+        elif cur is None:
+            continue
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            if ref.startswith("refs/heads/"):
+                cur["branch"] = ref[len("refs/heads/"):]
+        elif line.startswith("detached"):
+            cur["branch"] = ""
+        elif line.startswith("bare"):
+            cur["bare"] = True
+        elif line == "" and cur is not None:
+            rp = norm(cur["path"])
+            if rp and rp not in entries:
+                entries[rp] = cur
+            cur = None
+
+# ── job → worktree binding through receipt/task-link payload paths ────────
+# Only receipts and task links may bind a worktree to a task: an unrelated
+# event (note, log, heartbeat …) carrying cwd/task_id must not establish the
+# association.
+BINDING_KINDS = {"job.claim", "job.reclaim", "job.attached", "job.spawned", "job.task_link"}
+bound_jobs = {}
+job_task = {}
+try:
+    job_names = sorted(os.listdir(jobs_root))
+except OSError:
+    job_names = []
+for job in job_names:
+    evdir = os.path.join(jobs_root, job, "events")
+    if not os.path.isdir(evdir):
+        continue
+    paths = set()
+    for _name, document, _mtime in wrk_events_ordered(evdir):
+        if document is None or document.get("kind") not in BINDING_KINDS:
+            continue
+        payload = document.get("payload", document)
+        if not isinstance(payload, dict):
+            continue
+        v = payload.get("task_id")
+        if isinstance(v, (int, str)) and not isinstance(v, bool) and str(v).strip():
+            job_task[job] = str(v).strip()
+        for field in ("cwd", "worktree", "repo"):
+            value = payload.get(field)
+            if isinstance(value, str):
+                n = norm(value)
+                if n:
+                    paths.add(n)
+    for p in paths:
+        bound_jobs.setdefault(p, []).append(job)
+
+# ── handoffkeep task state (read-only) ────────────────────────────────────
+task_state = {}
+
+
+def task_info(tid):
+    if not hk:
+        return None
+    try:
+        r = subprocess.run([hk, "tasks", "show", tid], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        t = json.loads(r.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(t, dict) or not isinstance(t.get("state"), str):
+        return None
+    at = None
+    events = t.get("events")
+    if isinstance(events, list):
+        for e in events:
+            if isinstance(e, dict) and e.get("to") in ("merged", "dropped"):
+                m = wrk_event_moment(e.get("at"))
+                if m is not None and (at is None or m > at):
+                    at = m
+    if at is None:
+        at = wrk_event_moment(t.get("updated_at"))
+    return {"state": t["state"], "at": at}
+
+
+# ── live panes and live completion sentinels ──────────────────────────────
+panes_ok = False
+pane_rows = []
+try:
+    with open(agents_file, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    result = doc.get("result", doc) if isinstance(doc, dict) else {}
+    agents = result.get("agents") if isinstance(result, dict) else None
+    if isinstance(agents, list):
+        panes_ok = True
+        for a in agents:
+            if not isinstance(a, dict):
+                panes_ok = False
+                break
+            pid = a.get("pane_id")
+            cw = a.get("cwd")
+            pane_rows.append((pid if isinstance(pid, str) else "",
+                              cw if isinstance(cw, str) else ""))
+except (OSError, ValueError, AttributeError):
+    panes_ok = False
+
+live_sentinels = set()
+sentinels_ok = False
+try:
+    with open(sent_file, encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2 and parts[1]:
+                live_sentinels.add(parts[1])
+    sentinels_ok = True
+except OSError:
+    sentinels_ok = False
+
+
+# ── verdicts ──────────────────────────────────────────────────────────────
+for rp in sorted(entries):
+    w = entries[rp]
+    path = w["path"]
+    verdict = "keep"
+    reason = ""
+    task = ""
+    jobs = bound_jobs.get(rp, [])
+    while True:
+        if rp in protected:
+            reason = "protected"
+            break
+        if w["bare"]:
+            reason = "bare"
+            break
+        if not os.path.isdir(path):
+            reason = "missing"
+            break
+        if os.path.isdir(os.path.join(path, ".git")):
+            reason = "main-checkout"
+            break
+        tasks = sorted({job_task[j] for j in jobs if job_task.get(j)})
+        if not tasks:
+            reason = "no-task-link"
+            break
+        if len(tasks) > 1:
+            reason = "task-ambiguous"
+            break
+        task = tasks[0]
+        if task not in task_state:
+            task_state[task] = task_info(task)
+        info = task_state[task]
+        if info is None:
+            reason = "task-unverifiable"
+            break
+        if info["state"] not in ("merged", "dropped"):
+            reason = "task-open(state=%s)" % info["state"]
+            break
+        if info["at"] is None:
+            reason = "task-age-unknown"
+            break
+        if info["at"] + age_s > now:
+            reason = "within-age"
+            break
+        rc, out = git_out(["git", "-C", path, "status", "--porcelain"], 15)
+        if rc != 0:
+            reason = "status-failed"
+            break
+        if out.strip():
+            reason = "dirty"
+            break
+        head = w["head"]
+        branch = w["branch"]
+        pushed = False
+        if branch:
+            rc, out = git_out(["git", "-C", path, "ls-remote", "origin", "refs/heads/" + branch], 25)
+            if rc != 0:
+                reason = "remote-unreachable"
+                break
+            fields = out.split()
+            if fields and fields[0] == head:
+                pushed = True
+        if not pushed:
+            rc, _ = git_out(["git", "-C", path, "fetch", "--quiet", "origin", "main"], 60)
+            if rc != 0:
+                reason = "remote-unreachable"
+                break
+            rc = git_rc(["git", "-C", path, "merge-base", "--is-ancestor", head,
+                         "FETCH_HEAD"], 10)
+            if rc != 0:
+                reason = "unpushed"
+                break
+        if not panes_ok:
+            reason = "panes-unknown"
+            break
+        blocked = ""
+        for pane_id, pcwd in pane_rows:
+            if not pcwd:
+                blocked = blocked or "pane-cwd-unknown"
+                continue
+            pnorm = norm(pcwd)
+            if pnorm and (pnorm == rp or pnorm.startswith(rp + os.sep)):
+                blocked = "pane-inside(pane=%s)" % pane_id
+                break
+        if blocked:
+            reason = blocked
+            break
+        if not sentinels_ok:
+            reason = "sentinels-unknown"
+            break
+        bound_live = [j for j in jobs if j in live_sentinels]
+        if bound_live:
+            reason = "sentinel-live(job=%s)" % sorted(bound_live)[0]
+            break
+        verdict = "remove"
+        break
+    # Empty fields emit the "-" placeholder: IFS=tab read collapses
+    # consecutive separators, so a blank column would shift the later ones
+    # (same shape as reap_candidates).
+    print(path, verdict, reason or "-", w["main"] or "-", task or "-",
+          ",".join(jobs) or "-", sep="\t")
+PY
+}
+
+worktree_reap_cmd() {
+  local apply=0 age="3d" age_s
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) worktree_reap_help; return 0 ;;
+      --age) [[ $# -ge 2 && -n "$2" ]] || die "--age requires a value"; age="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      -*) die "unknown worktree-reap option '$1'" ;;
+      *) die "unexpected argument '$1'" ;;
+    esac
+  done
+  age_s="$(parse_duration_s "$age")" || die "invalid --age '$age' (use 600, 600s, 10m, 2h or 3d)"
+  wrk_trust_guard hk
+  local root="$HOME/work" jobs_root agents_file sent_file rows removed=0 kept=0
+  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  if [[ ! -d "$root" ]]; then
+    echo "worktree-reap: no work root at $root"
+    return 0
+  fi
+  agents_file="$(mktemp "${TMPDIR:-/tmp}/wrk-wt-agents.XXXXXX")"
+  sent_file="$(mktemp "${TMPDIR:-/tmp}/wrk-wt-sentinels.XXXXXX")"
+  "$HERDR" agent list >"$agents_file" 2>/dev/null || true
+  sentinel_sweep >"$sent_file" 2>/dev/null || true
+  rows="$(worktree_reap_scan "$root" "$jobs_root" "${WRK_TRUST_HK:-}" "$agents_file" "$sent_file" \
+    "$age_s" "$(date +%s)" "$root/ParkingArcade" "$root/ParkingArcade.pa-unity")"
+  local path verdict reason main task jobs
+  while IFS=$'\t' read -r path verdict reason main task jobs; do
+    [[ -n "$path" ]] || continue
+    case "$verdict" in
+      keep)
+        echo "keep $path reason=$reason"
+        kept=$((kept + 1)) ;;
+      remove)
+        [[ "$task" != - ]] || task=""
+        [[ "$jobs" != - ]] || jobs=""
+        [[ "$main" != - ]] || main=""
+        if [[ "$apply" -eq 1 ]]; then
+          if git -C "$main" worktree remove "$path" >/dev/null 2>&1; then
+            echo "removed $path"
+            removed=$((removed + 1))
+          else
+            echo "keep $path reason=remove-failed"
+            kept=$((kept + 1))
+          fi
+        else
+          echo "would-remove $path task=$task job=$jobs"
+          removed=$((removed + 1))
+        fi ;;
+    esac
+  done <<<"$rows"
+  rm -f "$agents_file" "$sent_file"
+  if [[ "$apply" -eq 1 ]]; then
+    echo "worktree-reap: removed $removed, kept $kept"
+  else
+    echo "worktree-reap: $removed candidate(s), $kept kept (dry-run; re-run with --apply to remove)"
+  fi
+}
+
 lanes_missing_help() {
   cat <<'USAGE'
 Usage: wrk lanes-missing
@@ -12994,7 +14103,8 @@ PY
 }
 
 prune_help() {
-  cat <<'USAGE'
+  local text
+  IFS= read -r -d '' text <<'USAGE' || true
 Usage: wrk prune [--apply] [--stale-age AGE] [--heavy-age AGE]
                  [--job JOB] [--lane LANE] [--policy PATH]
 
@@ -13025,16 +14135,30 @@ Report — and with --apply, remove — what ended or stale jobs leave behind:
         or when an mtime is unreadable
     Other classes — evidence, final-build, record text — are out of scope
     and rejected on load: the artifact-store sweeper uploads them first
-    (design hk:doc designs/b953/artifact-store). A symlinked match is
-    unlinked, never traversed; a match whose real path leaves the job dir
-    is refused; a unity path is skipped while the pa unity lock
-    (/tmp/pa-m1-unity.lock) is held; any path a live process still has open
-    (lsof) is skipped; a job's events dir, any refs dir and the jobs-root
-    asset-store-packs entry are never touched. Every removal prints its
-    class and bytes, appends a job.artifacts_pruned event for a jobs-root
-    match, and logs to <jobs-root>/prune.log for the other roots. An
-    invalid policy (unknown keys, an absolute or .. glob, a glob that
-    leaves the job dir) refuses the whole pass.
+    (design hk:doc designs/b953/artifact-store). A symlinked match inside
+    the job dir is unlinked, never traversed; a match whose real path
+    leaves the job dir is refused; a unity path is skipped while the pa
+    unity lock (/tmp/pa-m1-unity.lock) is held; any path a live process
+    still has open (lsof) is skipped. Every removal prints its class and
+    bytes, appends a job.artifacts_pruned event for a jobs-root match,
+    and logs to <jobs-root>/prune.log for the other roots. An invalid
+    policy (unknown keys, an absolute or .. glob, a glob that leaves the
+    job dir) refuses the whole pass.
+    Never touched, whatever the policy rows say: at any depth under a job
+    dir, a path whose own name or any ancestor name matches one of
+      @NEVER_TOUCH@
+    (names are matched case-insensitively; a job dir of such a name is
+    wholly guarded). A match that is such a path, sits under one, or is a
+    directory holding one (or a link to one, or another refused match) is
+    refused, and a refused match takes no keep_newest slot. A symlink
+    match is held to the same rule and to the job-dir containment: it is
+    checked where it physically sits and at its resolved target, and a
+    link whose either end hits the set or leaves the job dir is refused,
+    not unlinked. A name with a control character cannot be framed in the
+    scan record and is refused (unsafe-path). Under a recursive glob a
+    dropped match that holds a kept match, or sits inside one, stays. A
+    glob with more than 20000 matches in one job dir (a symlink cycle
+    under ** does that) skips the job (scan-failed).
 
 Dry-run is the default and prints one line per item with job id, pid, age,
 pane state and the exact reason it is or is not an orphan. --apply stops
@@ -13058,6 +14182,12 @@ Periodic hook: WRK_PRUNE_ON_SPAWN=1 runs this same --apply pass detached at
 the end of every `wrk spawn`. Off by default; enable only after director-1
 approves. Output appends to <jobs-root>/prune.log.
 USAGE
+  # The never-touch set is one definition (PRUNE_NEVER_TOUCH); the text
+  # above carries a placeholder so help can never drift from the scanner.
+  local set_text
+  set_text="$(printf '%s\n' "$PRUNE_NEVER_TOUCH" | fold -s -w 60 |
+    sed -e 's/ *$//' -e '2,$s/^/      /')"
+  printf '%s' "${text//@NEVER_TOUCH@/$set_text}"
 }
 
 # prune_sentinel_row JOB PID PIDFILE ARGV_PANE ARGV_OWNER STARTED — classify
@@ -13181,6 +14311,16 @@ prune_sentinel_row() {
 # refused. Evidence, final builds and record text are out of scope — the
 # artifact-store sweeper (designs/b953/artifact-store) uploads them first.
 
+# The never-touch set: the ONE definition. The scanner enforces it on every
+# match — file, directory or link — and wrk prune --help prints it. Names,
+# not paths: a hit on a path's own name or on any ancestor name (below the
+# job dir, or the job dir itself) guards the path; fnmatch patterns, matched
+# case-insensitively. Record text (events, reports, briefs, verdicts, state,
+# final reports), run evidence (run.log, meta.txt), liveness (sentinel and
+# pid files) and the asset store are never this pass's to remove, whatever a
+# policy row (runtime data, extended by pa-integrator) globs.
+PRUNE_NEVER_TOUCH='events refs asset-store-packs report*.md brief*.md spawn-brief* verdict*.md run.log meta.txt completion-sentinel.* *.pid state.md final-report*'
+
 # prune_artifact_policy_default — the shipped policy next to this script's
 # real location (a symlinked ~/.local/bin/wrk resolves to the repo clone).
 prune_artifact_policy_default() {
@@ -13194,6 +14334,7 @@ print(os.path.join(os.path.dirname(os.path.dirname(
 # one TSV row per rule: class, root name, resolved absolute root, glob and
 # keep_newest ("" for cache). Any violation prints REFUSE<TAB>reason and
 # exits 3: a broken policy must refuse the whole pass, never be half-applied.
+# Rows print only once every row has passed, so a refusal is that one line.
 prune_artifact_policy_load() {
   python3 - "$1" "$2" <<'PY'
 import json, os, re, sys
@@ -13234,6 +14375,7 @@ for name, rel in roots.items():
 rows = doc["rows"]
 if not isinstance(rows, list):
     refuse("rows must be a list")
+out = []   # printed only after every row passes: a refusal prints nothing else
 for index, row in enumerate(rows):
     if not isinstance(row, dict):
         refuse("row %d is not an object" % index)
@@ -13261,21 +14403,48 @@ for index, row in enumerate(rows):
             refuse("row %d keep_newest must be 1 or 2" % index)
     elif keep is not None:
         refuse("row %d keep_newest is only valid for intermediate-build" % index)
-    print("\t".join((cls, root, resolved[root], pat,
-                     "" if keep is None else str(keep))))
+    out.append("\t".join((cls, root, resolved[root], pat,
+                          "" if keep is None else str(keep))))
+for line in out:
+    print(line)
 PY
 }
 
 # prune_artifact_scan JOBDIR GLOB — one TSV per match:
-#   kind(real|link|outside)  path  newest-mtime-inside(- if unreadable)  bytes
-# A symlink match is "link" (unlink it, never traverse). A non-symlink match
-# whose realpath escapes the job dir — through a symlinked ancestor — is
-# "outside" and must be refused, never removed. The job dir itself can never
-# be a match.
+#   kind  path  newest-mtime-inside(- if unreadable)  bytes
+# A candidate (real, link) is named by its physical seat: its parent resolved,
+# its own name kept, written under JOBDIR with no . component, no symlinked
+# ancestor and no trailing slash. glob returns one entry under several names (a
+# **/./* pattern, a symlinked directory inside the job dir); the pass compares
+# paths as strings, so the scan collapses those names to one record and lets a
+# refusal of any name refuse the seat. A refused record keeps the matched name.
+# kind is one of
+#   real     a file or directory inside the job dir, nothing on it never-touch
+#   link     a symlink match (unlink it, never traverse): the link and its
+#            resolved target are both inside the job dir and hit nothing
+#   outside  the real path (a link: where it sits or where it points) leaves
+#            the job dir — through a symlinked ancestor or a link target
+#   guarded  the path hits PRUNE_NEVER_TOUCH: its own name or any ancestor
+#            name, lexically or physically (a link: where it sits and where
+#            it points), or the job dir itself carries such a name
+#   holds    a directory match whose subtree holds a never-touch name, a link
+#            that points at one, or another refused match (or cannot be
+#            read to prove it does not): removing it would remove it
+#   unsafe   a name with a control character (newline, tab ...): it cannot
+#            be framed in this tab-separated record, so it is refused and
+#            printed escaped; a record must never be forgeable from a name
+# outside, guarded, holds and unsafe are refused, never removed; they print
+# "-" and 0.
+# The never-touch contract lives in this scanner so no policy row — runtime
+# data, extended by pa-integrator — can widen what the pass may delete. The
+# job dir itself can never be a match.
 prune_artifact_scan() {
-  python3 - "$1" "$2" <<'PY'
-import glob, os, sys
+  python3 - "$1" "$2" "$PRUNE_NEVER_TOUCH" <<'PY'
+import fnmatch, glob, itertools, os, sys
 jobdir, pattern = sys.argv[1], sys.argv[2]
+NEVER = [pat.casefold() for pat in sys.argv[3].split()]
+if not NEVER:
+    raise SystemExit(1)   # no set to enforce: fail closed, scan nothing
 try:
     job_real = os.path.realpath(jobdir)
 except OSError:
@@ -13322,28 +14491,164 @@ def newest_mtime(root):
     return newest
 
 
-# A match under the job's events stream, a refs dir, or a root entry named
-# asset-store-packs is on the never-touch list (record text and the asset
-# store are the sweeper's, not this pass's); "guarded" matches are refused.
-jobbase = os.path.basename(job_real)
-for match in sorted(glob.glob(os.path.join(jobdir, pattern), recursive=True)):
+def hits(names):
+    """Any of NAMES matches the never-touch set (case-insensitive)."""
+    return any(fnmatch.fnmatchcase(name.casefold(), pat)
+               for name in names for pat in NEVER)
+
+
+def below(real):
+    """The components of REAL under the job dir; None when REAL is outside."""
+    if real == job_real:
+        return []
+    if real.startswith(job_real + os.sep):
+        return real[len(job_real) + 1:].split(os.sep)
+    return None
+
+
+def guard(match, ends):
+    """The refusal kind for MATCH, or None. ENDS are the physical places it
+    touches: a file or directory, its real path; a link, where it sits and
+    where it points. Files, directories and links all go through here."""
+    if hits(os.path.relpath(match, jobdir).split(os.sep)) or \
+            hits([os.path.basename(job_real)]):
+        return "guarded"
+    inside = [below(end) for end in ends]
+    if any(parts is None for parts in inside):
+        return "outside"
+    if any(hits(parts) for parts in inside):
+        return "guarded"
+    return None
+
+
+def holds_never_touch(root):
+    """A never-touch name anywhere below ROOT, a link below ROOT that points
+    at one, or a subtree that cannot be read to prove there is none. Links
+    are listed and resolved, never traversed; a link out of the job dir only
+    loses the link when ROOT goes, so only a target inside it counts."""
+    unreadable = []
+    for base, dirs, files in os.walk(root, onerror=unreadable.append):
+        if hits(dirs + files):
+            return True
+        for name in dirs + files:
+            full = os.path.join(base, name)
+            if os.path.islink(full):
+                parts = below(os.path.realpath(full))
+                if parts is not None and hits(parts):
+                    return True
+    return bool(unreadable)
+
+
+def seat_of(match):
+    """The physical place MATCH names: its parent resolved, its own name kept
+    (a link is not followed). normpath first, so a trailing slash or a . in the
+    glob result cannot change the answer."""
+    norm = os.path.normpath(match)
+    return os.path.join(os.path.realpath(os.path.dirname(norm)),
+                        os.path.basename(norm))
+
+
+def classify(match):
+    """(kind, seat): real, link, outside, guarded, holds or unsafe; kind is
+    None for the job dir itself."""
+    seat = seat_of(match)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in match):
+        return "unsafe", seat
     if os.path.islink(match):
-        kind = "link"
+        # The seat is where the link sits (its ancestors resolved): unlinking
+        # refs/x through a symlinked ancestor unlinks the real refs/x.
+        return guard(match, (seat, os.path.realpath(match))) or "link", seat
+    real = os.path.realpath(match)
+    refused = guard(match, (real,))
+    if refused:
+        return refused, seat
+    if real == job_real:
+        return None, seat
+    if os.path.isdir(match) and holds_never_touch(match):
+        return "holds", seat
+    return "real", seat
+
+
+def named(seat):
+    """SEAT written under JOBDIR (the form the pass compares), or None."""
+    parts = below(seat)
+    return os.path.join(top, *parts) if parts else None
+
+
+REFUSED = ("outside", "guarded", "holds", "unsafe")
+top = os.path.normpath(jobdir)
+found = []
+# glob follows a symlink to a directory under **, so a link cycle inside the job
+# dir (or two links pointing at each other) makes the match list effectively
+# endless. Take at most MAX_MATCHES lazily; a pattern that wide is not a match
+# list worth acting on, and the pass skips the job (scan-failed).
+MAX_MATCHES = 20000
+raw = list(itertools.islice(
+    glob.iglob(os.path.join(jobdir, pattern), recursive=True), MAX_MATCHES + 1))
+if len(raw) > MAX_MATCHES:
+    raise SystemExit(1)
+for match in sorted(raw):
+    # glob("X/**") yields "X/" even when X does not exist; that is no match.
+    if not os.path.lexists(match):
+        continue
+    kind, seat = classify(match)
+    if kind is not None:
+        found.append((match, kind, seat))
+# One physical entry, one verdict: a refusal of any name for a seat refuses the
+# seat (refs/payload and cache/payload may be the same file).
+refused_seats = {seat for _, kind, seat in found if kind in REFUSED}
+# A directory that contains a refused seat cannot be removed whole: the removal
+# would take the refused entry with it. Every physical ancestor, up to the job
+# dir, is held.
+held = set()
+for _, kind, seat in found:
+    if kind in REFUSED:
+        ancestor = os.path.dirname(seat)
+        while ancestor.startswith(job_real + os.sep) and ancestor not in held:
+            held.add(ancestor)
+            ancestor = os.path.dirname(ancestor)
+emitted = set()
+for match, kind, seat in found:
+    if kind == "unsafe":
+        print("unsafe\t%s\t-\t0" % ascii(match)[1:-1])
+    elif kind in ("outside", "guarded"):
+        print("%s\t%s\t-\t0" % (kind, match))
+    elif seat in emitted or (kind in ("real", "link") and seat in refused_seats):
+        continue
     else:
-        try:
-            real = os.path.realpath(match)
-        except OSError:
-            real = ""
-        if real.startswith(job_real + os.sep):
-            rel = real[len(job_real):].split(os.sep)
-            kind = ("guarded" if jobbase == "asset-store-packs" or
-                    rel[1] in ("events", "refs") else "real")
+        emitted.add(seat)
+        path = named(seat)
+        if kind == "real" and seat in held:
+            kind = "holds"
+        if kind == "holds":
+            print("holds\t%s\t-\t0" % path)
         else:
-            kind = "outside"
-    stamp = newest_mtime(match)
-    print("%s\t%s\t%s\t%d" % (kind, match,
-          "-" if stamp is None else str(int(stamp)), tree_size(match)))
+            stamp = newest_mtime(path)
+            print("%s\t%s\t%s\t%d" % (kind, path,
+                  "-" if stamp is None else str(int(stamp)), tree_size(path)))
 PY
+}
+
+# prune_artifact_record_ok JOBDIR KIND PATH MTIME BYTES — the scanner's record,
+# re-checked before anything is done with it: a known kind, an absolute path
+# under JOBDIR, a numeric (or "-") mtime and numeric bytes. A candidate (real,
+# link) is also a normalized path: the scanner names it by its physical seat,
+# so a . or .. component, an empty one or a trailing slash is a forged or broken
+# record. A malformed record fails closed; the removal path never trusts the
+# framing alone. This is the framing layer only: the never-touch set is
+# enforced once, in the scanner.
+prune_artifact_record_ok() {
+  local jobdir="$1" kind="$2" path="$3" mtime="$4" bytes="$5"
+  case "$kind" in
+    real|link) case "$path" in
+                 */./*|*/../*|*//*|*/.|*/..) return 1 ;;
+               esac ;;
+    outside|guarded|holds|unsafe) ;;
+    *) return 1 ;;
+  esac
+  [[ "$path" == "$jobdir"/* ]] || return 1
+  [[ "$mtime" == - || "$mtime" =~ ^[0-9]+$ ]] || return 1
+  [[ "$bytes" =~ ^[0-9]+$ ]]
 }
 
 # prune_artifact_remove PATH — unlink a link or a file, rmtree a real dir.
@@ -13542,15 +14847,17 @@ prune_artifact_pass() {
   work_root="$(dirname "$(dirname "$jobs_root")")"
   parsed="$(prune_artifact_policy_load "$policy" "$work_root")" || rc=$?
   if (( rc != 0 )); then
-    echo "artifact-prune refused: $policy — ${parsed#REFUSE	}"
+    local why="${parsed#REFUSE	}"
+    [[ "$parsed" == REFUSE$'\t'* ]] || why="policy loader failed (rc=$rc)"
+    echo "artifact-prune refused: $policy — $why"
     return 2
   fi
   local jobs_real cls root_name abs_root pattern keep
   jobs_real="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$jobs_root")"
   local job jobdir entry real_root is_jobs reason state
   local scan_out kind match mtime bytes
-  local -a m_kind m_path m_mtime m_bytes todo drop_list
-  local n i k idx poison owner
+  local -a m_kind m_path m_mtime m_bytes todo drop_list kept_list safe_todo is_drop
+  local n i j k idx poison owner held
   while IFS=$'\t' read -r cls root_name abs_root pattern keep; do
     [[ -n "$cls" ]] || continue
     PRUNE_ARTIFACT_ROWS=$(( PRUNE_ARTIFACT_ROWS + 1 ))
@@ -13579,15 +14886,30 @@ prune_artifact_pass() {
       }
       while IFS=$'\t' read -r kind match mtime bytes; do
         [[ -n "$match" ]] || continue
+        prune_artifact_record_ok "$jobdir" "$kind" "$match" "$mtime" "$bytes" || {
+          echo "artifact job=$job class=$cls action=refused reason=malformed-record"
+          continue
+        }
+        # A refused match is reported and is no candidate: it takes no
+        # keep_newest slot, so a never-touch file cannot push the newest real
+        # build out of the keep window.
+        case "$kind" in
+          unsafe)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=unsafe-path"
+            continue ;;
+          outside)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=outside-job-dir"
+            continue ;;
+          guarded)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=never-touch"
+            continue ;;
+          holds)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=holds-never-touch"
+            continue ;;
+        esac
         m_kind+=("$kind") m_path+=("$match")
         m_mtime+=("$mtime") m_bytes+=("$bytes")
         n=$(( n + 1 ))
-        case "$kind" in
-          outside)
-            echo "artifact job=$job class=$cls path=$match action=refused reason=outside-job-dir" ;;
-          guarded)
-            echo "artifact job=$job class=$cls path=$match action=refused reason=never-touch" ;;
-        esac
       done <<<"$scan_out"
       (( n )) || continue
       todo=()
@@ -13622,11 +14944,43 @@ prune_artifact_pass() {
                  done | sort -rn | cut -f2)
         todo=(${drop_list[@]+"${drop_list[@]}"})
       fi
+      # Under a recursive glob the matches nest. A removal takes its whole
+      # subtree, so a dropped match that holds a kept match (an ancestor), sits
+      # inside one, or is the same path stays: the kept match must come through
+      # intact. The scanner names every candidate by its physical seat, so these
+      # string comparisons are exact.
+      is_drop=() kept_list=()
+      for i in ${todo[@]+"${todo[@]}"}; do is_drop[i]=1; done
+      for ((i = 0; i < n; i++)); do
+        [[ "${is_drop[$i]:-0}" == 1 ]] || kept_list+=("$i")
+      done
+      if (( ${#kept_list[@]} && ${#todo[@]} )); then
+        safe_todo=()
+        for i in "${todo[@]}"; do
+          held=0
+          for j in "${kept_list[@]}"; do
+            if [[ "${m_path[$i]}" == "${m_path[$j]}" ||
+                  "${m_path[$j]}" == "${m_path[$i]%/}"/* ||
+                  "${m_path[$i]}" == "${m_path[$j]%/}"/* ]]; then
+              held=1; break
+            fi
+          done
+          if (( held )); then
+            echo "artifact job=$job class=$cls path=${m_path[$i]} action=skipped reason=nested-with-kept-match"
+          else
+            safe_todo+=("$i")
+          fi
+        done
+        todo=(${safe_todo[@]+"${safe_todo[@]}"})
+      fi
       for i in ${todo[@]+"${todo[@]}"}; do
         kind="${m_kind[$i]}"; match="${m_path[$i]}"; bytes="${m_bytes[$i]}"
-        case "$kind" in
-          outside|guarded) continue ;;   # already reported refused above
-        esac
+        # A glob like ** matches a directory and what is inside it; once the
+        # directory went, the inner match is already gone.
+        if [[ ! -e "$match" && ! -L "$match" ]]; then
+          echo "artifact job=$job class=$cls path=$match action=skipped reason=already-gone"
+          continue
+        fi
         if [[ "$match" == */unity/* || "$match" == */unity ]] &&
            prune_artifact_unity_lock_held; then
           echo "artifact job=$job class=$cls path=$match action=skipped reason=unity-lock-held"
@@ -15537,9 +16891,11 @@ case "${1:-}" in
   restore) shift; restore_cmd "$@" ;;
   escalate) shift; escalate_cmd "$@" ;;
   joined) shift; joined_cmd "$@" ;;
+  o3) shift; wrk_o3_cmd "$@" ;;
   round) shift; round_cmd "$@" ;;
   sentinel) shift; sentinel_cmd "$@" ;;
   reap) shift; reap_cmd "$@" ;;
+  worktree-reap) shift; worktree_reap_cmd "$@" ;;
   lanes-missing) shift; lanes_missing_cmd "$@" ;;
   prune) shift; prune_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
@@ -15547,6 +16903,7 @@ case "${1:-}" in
   profiles) shift; profiles_cmd "$@" ;;
   hosts) shift; hosts_cmd "$@" ;;
   heavy) shift; heavy_cmd "$@" ;;
+  usage) shift; usage_cmd "$@" ;;
   "") usage >&2; exit 2 ;;
   *) die "unknown command '$1' (see 'wrk --help')" ;;
 esac

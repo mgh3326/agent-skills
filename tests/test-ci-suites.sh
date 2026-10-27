@@ -14,7 +14,7 @@ assert workflow.count('"git", "diff", "--name-only", "--no-renames"') == 1, "PR 
 assert 'git diff --name-only --no-renames "${{ github.event.before }}"' in workflow, "push docs-only diff must include rename source paths"
 manifest = root / "tests/ci-suites.txt"
 manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
-assert manifest_sha256 == "0f86450bc19227c00420319b9f0934ae98f9facd58283c46978040fd5f65214c", "suite list changed; review all shard coverage deliberately"
+assert manifest_sha256 == "911508d6e671a480bce82826068bd8f076fde1719d0d3e2e362fcdcc35ca1197", "suite list changed; review all shard coverage deliberately"
 rows = []
 for raw in manifest.read_text(encoding="utf-8").splitlines():
     line = raw.strip()
@@ -26,12 +26,12 @@ for raw in manifest.read_text(encoding="utf-8").splitlines():
 commands = [command for _shard, command in rows]
 counts = Counter(commands)
 assert all(count == 1 for count in counts.values()), "every CI suite command must appear exactly once"
-assert len(commands) == 42, f"today's CI suite list changed unexpectedly: {len(commands)} commands"
+assert len(commands) == 45, f"today's CI suite list changed unexpectedly: {len(commands)} commands"
 assert Counter(shard for shard, _command in rows) == Counter({
     "wrk": 1,
-    "suites-a": 9,
+    "suites-a": 10,
     "suites-b": 25,
-    "python": 7,
+    "python": 9,
 }), "suite coverage changed: review the shard assignment and update this contract deliberately"
 assert rows[0] == ("wrk", "bash tests/test-wrk.sh"), "test-wrk.sh must stay alone in its shard"
 for _shard, command in rows:
@@ -39,9 +39,10 @@ for _shard, command in rows:
     if command.startswith("bash "):
         path = command.split()[1]
         assert (root / path).is_file(), f"suite command target is missing: {path}"
-    elif " -s tests " in command:
+    elif " -m unittest discover " in command:
         pattern = command.split(" -p ", 1)[1].split()[0].strip("'\"")
-        assert list((root / "tests").glob(pattern)), f"unittest discovery target is missing: {pattern}"
+        directory = command.split(" -s ", 1)[1].split()[0]
+        assert list((root / directory).glob(pattern)), f"unittest discovery target is missing: {pattern}"
     else:
         target = next((part for part in command.split() if part.startswith("tests/")), None)
         assert target and (root / target).is_file(), f"suite command target is missing: {command}"
