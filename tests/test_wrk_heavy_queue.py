@@ -682,6 +682,14 @@ class HeavyQueue(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - start, .9)
         self.assertLess(time.monotonic() - start, 4)
 
+    def test_ancient_command_cannot_forge_start_identity(self):
+        path = self.waiters / "ancient"
+        path.write_text(f"pid={os.getpid()} since=x job=- cmd=env start=forged")
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6").returncode, 0)
+        self.assertEqual(self.run_wrk("status").returncode, 0)
+        self.assertTrue(path.exists(), "ancient command forged start identity and retired a live owner")
+        self.assertEqual(self.events("waiter.retired"), [])
+
     def test_base_reader_accepts_new_record(self):
         # These two unchanged functions are the in-repo 1a9ded3 reader logic:
         # record_head reads exactly three tokens; record_ticket reads token four.
@@ -783,6 +791,8 @@ class HeavyQueue(unittest.TestCase):
 
     def test_owner_mutants_break_invariants(self):
         mutations = [
+            ("legacy-context", "    if record_ticket(text) is None:\n", "    if False:\n",
+             "test_ancient_command_cannot_forge_start_identity", "ancient command forged start identity"),
             ("identity", "    if observed != start:\n", "    if False:\n",
              "test_owner_pid_reuse_retires_and_audits_once", "different process identity reserved capacity"),
             ("eperm-dead", 'return (True, "process-exists") if strict else True',
