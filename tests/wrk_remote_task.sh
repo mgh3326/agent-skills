@@ -365,6 +365,7 @@ ln -s "$TMP/target-outside" "$TMP/remote-inbox/jobs/P/escape"
 target_containment_probe() {
   local binary="$1" rc=0
   WRK_CASE_REMOTE_BINARY="$binary" WRK_CASE_JOB=target-containment \
+    ${2:+WRK_CASE_REMOTE_ARBITER_BIN="$2"} \
     run_remote "$ROOT/bin/wrk" --host desktop --parent-job P \
     --report-relative P/escape/verdict.md >"$TMP/target-containment.out" 2>&1 || rc=$?
   [[ "$rc" -eq 2 ]] || { echo 'FAIL target-only symlink containment was skipped' >&2; return 1; }
@@ -383,13 +384,14 @@ assert source.count(old) == 1
 Path(sys.argv[2]).write_text(source.replace(old, '    if False: # target containment mutant\n', 1))
 TARGET_MUT
 chmod +x "$MUT_TARGET"
-if target_containment_probe "$MUT_TARGET" >"$TMP/target-mutant.log" 2>&1; then
+# The mutant binary lives under TMP, outside the repo: give its remote run an
+# arbiter copy inside the temp roots so the only difference from the contract
+# run is the skipped containment check itself.
+cp "$ROOT/bin/arbiter" "$TMP/arbiter-target-mut"
+if target_containment_probe "$MUT_TARGET" "$TMP/arbiter-target-mut" >"$TMP/target-mutant.log" 2>&1; then
   echo 'FAIL target containment mutant survived' >&2; exit 1
 fi
-# The mutant evading containment can surface either as a non-2 rc (spawn
-# proceeded) or as an rc 2 refusal that is NOT the containment message —
-# both prove the contract assertion fired.
-grep -qE '^FAIL (target-only symlink containment was skipped|target containment refusal was missing)' "$TMP/target-mutant.log" || {
+grep -q '^FAIL target-only symlink containment was skipped' "$TMP/target-mutant.log" || {
   echo 'FAIL target containment mutant did not fail the contract assertion' >&2; exit 1;
 }
 printf '%s\n' 'PASS wrk-remote-task target-containment-mutant-RED'
