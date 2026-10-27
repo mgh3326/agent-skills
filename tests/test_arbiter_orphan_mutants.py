@@ -221,12 +221,15 @@ def run_herdr_fifo_race(
     )
 
 
-def assert_gc_skips_reclaimed_snapshot(root: Path, binary: Path, name: str) -> None:
+def assert_gc_skips_reclaimed_snapshot(
+    root: Path, binary: Path, name: str, *, rowless: bool = False
+) -> None:
     env, _agents = make_released_job(root, binary, name)
 
     def reclaim_and_age() -> None:
         reclaim_and_lease(binary, env, name)
-        drop_quota(env, name)
+        if rowless:
+            drop_quota(env, name)
         age_job(env, name, 11)
 
     gc = run_herdr_fifo_race(
@@ -239,7 +242,11 @@ def assert_gc_skips_reclaimed_snapshot(root: Path, binary: Path, name: str) -> N
     current = status(binary, env, name)
     if gc.returncode != 0:
         raise AssertionError(f"gc failed in reclaim snapshot race: {gc.stderr}")
-    if current["jobs"][0]["state"] != "leased" or current["quota_pool_records"]:
+    if current["jobs"][0]["state"] != "leased":
+        raise AssertionError(f"gc retired a job reclaimed after its Herdr snapshot: {current}")
+    if rowless and current["quota_pool_records"]:
+        raise AssertionError(f"row-less reclaim race unexpectedly kept quota rows: {current}")
+    if not rowless and not current["quota_pool_records"]:
         raise AssertionError(f"gc retired a job reclaimed after its Herdr snapshot: {current}")
     output = json.loads(gc.stdout)
     skipped = [row for row in output.get("skipped", []) if row.get("job_id") == name]
@@ -283,6 +290,21 @@ def event_kinds(binary: Path, env: dict[str, str], job: str) -> list[str]:
     if result.returncode != 0:
         raise AssertionError(f"job-get failed for {job}: {result.stderr}")
     return json.loads(result.stdout)["recent_event_kinds"]
+
+
+def assert_gc_retains_listed_idle_agent(
+    binary: Path, env: dict[str, str], agents: Path, job: str
+) -> None:
+    gc = call(binary, env, "gc", "--herdr-agent-list", str(agents), "--json")
+    if gc.returncode != 0:
+        raise AssertionError(f"gc failed for a listed idle agent: {gc.stderr}")
+    current = status(binary, env, job)
+    if current["jobs"][0]["state"] != "leased":
+        raise AssertionError("gc released listed idle agent pane")
+    if {row["job_id"] for row in current["quota_pool_records"]} != {job}:
+        raise AssertionError("gc deleted quota capacity for a listed idle agent")
+    if "job.orphan_release" in event_kinds(binary, env, job):
+        raise AssertionError("gc wrote orphan_release for a listed idle agent")
 
 
 def assert_gc_releases_rowless(binary: Path, env: dict[str, str], agents: Path,
@@ -481,14 +503,13 @@ def prove_idle_is_gone_mutant_goes_red(root: Path) -> None:
     control_env, control_agents, control_job = seed(
         root / "control", ARBITER_SOURCE, "idle-control", "idle"
     )
-    drop_quota(control_env, control_job)
     age_job(control_env, control_job, 11)
-    assert_gc_retains_rowless_listed(
+    assert_gc_retains_listed_idle_agent(
         ARBITER_SOURCE, control_env, control_agents, control_job
     )
 
     mutant = mutate(
-        root / "working-only-mutant",
+        root / "idle-as-gone-mutant",
         "gc-idle-is-gone",
         '            if any(status != "unknown" for status in statuses):\n',
         '            if any(status in {"working", "blocked", "done"} for status in statuses):\n',
@@ -496,25 +517,46 @@ def prove_idle_is_gone_mutant_goes_red(root: Path) -> None:
     mutant_env, mutant_agents, mutant_job = seed(
         root / "mutant-state", mutant, "idle-mutant", "idle"
     )
-    drop_quota(mutant_env, mutant_job)
     age_job(mutant_env, mutant_job, 11)
     try:
-        assert_gc_retains_rowless_listed(
+        assert_gc_retains_listed_idle_agent(
             mutant, mutant_env, mutant_agents, mutant_job
+        )
+    except AssertionError as exc:
+        if str(exc) != "gc released listed idle agent pane":
+            raise
+    else:
+        raise AssertionError("idle-as-gone gc mutant survived the idle-pane assertion")
+
+    rowless_env, rowless_agents, rowless_job = seed(
+        root / "rowless-control", ARBITER_SOURCE, "idle-rowless-control", "idle"
+    )
+    drop_quota(rowless_env, rowless_job)
+    age_job(rowless_env, rowless_job, 11)
+    assert_gc_retains_rowless_listed(
+        ARBITER_SOURCE, rowless_env, rowless_agents, rowless_job
+    )
+    rowless_mutant_env, rowless_mutant_agents, rowless_mutant_job = seed(
+        root / "rowless-mutant-state", mutant, "idle-rowless-mutant", "idle"
+    )
+    drop_quota(rowless_mutant_env, rowless_mutant_job)
+    age_job(rowless_mutant_env, rowless_mutant_job, 11)
+    try:
+        assert_gc_retains_rowless_listed(
+            mutant, rowless_mutant_env, rowless_mutant_agents, rowless_mutant_job
         )
     except AssertionError as exc:
         if str(exc) != "gc released listed row-less agent pane":
             raise
     else:
-        raise AssertionError("working-only gc mutant survived the idle-pane assertion")
-    print("PASS mutant-gc-treats-idle-as-gone-goes-red-on-rowless-job")
+        raise AssertionError("idle-as-gone gc mutant survived the row-less idle assertion")
+    print("PASS mutant-gc-treats-idle-as-gone-goes-red-on-quota-and-rowless-jobs")
 
 
 def prove_startup_grace_mutant_goes_red(root: Path) -> None:
     control_env, control_agents, control_job = seed(
         root / "control", ARBITER_SOURCE, "young-control", None
     )
-    drop_quota(control_env, control_job)
     age_job(control_env, control_job, 1)
     gc = call(
         ARBITER_SOURCE,
@@ -530,6 +572,8 @@ def prove_startup_grace_mutant_goes_red(root: Path) -> None:
         != "leased"
     ):
         raise AssertionError("startup grace control did not retain the young job")
+    if "10-minute startup grace" not in gc.stderr:
+        raise AssertionError("quota-backed startup grace skip was not logged")
 
     mutant = mutate(
         root / "startup-grace-mutant",
@@ -540,7 +584,6 @@ def prove_startup_grace_mutant_goes_red(root: Path) -> None:
     mutant_env, mutant_agents, mutant_job = seed(
         root / "mutant-state", mutant, "young-mutant", None
     )
-    drop_quota(mutant_env, mutant_job)
     age_job(mutant_env, mutant_job, 1)
     gc = call(
         mutant,
@@ -557,7 +600,72 @@ def prove_startup_grace_mutant_goes_red(root: Path) -> None:
     ):
         raise AssertionError("startup-grace mutant did not release the young test job")
 
-    print("PASS mutant-gc-skips-rowless-startup-grace-goes-red")
+    rowless_control_env, rowless_agents, rowless_job = seed(
+        root / "rowless-control", ARBITER_SOURCE, "young-rowless-control", None
+    )
+    drop_quota(rowless_control_env, rowless_job)
+    age_job(rowless_control_env, rowless_job, 1)
+    rowless_gc = call(
+        ARBITER_SOURCE, rowless_control_env, "gc", "--herdr-agent-list",
+        str(rowless_agents), "--json",
+    )
+    if (rowless_gc.returncode != 0
+            or status(ARBITER_SOURCE, rowless_control_env, rowless_job)["jobs"][0]["state"]
+            != "leased"
+            or "10-minute startup grace" not in rowless_gc.stderr):
+        raise AssertionError("row-less startup grace control did not retain and log the young job")
+    rowless_mutant_env, rowless_mutant_agents, rowless_mutant_job = seed(
+        root / "rowless-mutant-state", mutant, "young-rowless-mutant", None
+    )
+    drop_quota(rowless_mutant_env, rowless_mutant_job)
+    age_job(rowless_mutant_env, rowless_mutant_job, 1)
+    rowless_gc = call(
+        mutant, rowless_mutant_env, "gc", "--herdr-agent-list",
+        str(rowless_mutant_agents), "--json",
+    )
+    if (rowless_gc.returncode != 0
+            or status(mutant, rowless_mutant_env, rowless_mutant_job)["jobs"][0]["state"]
+            != "released"):
+        raise AssertionError(
+            "row-less startup-grace call-site mutant did not release the young job"
+        )
+
+    force_control_env, force_agents, force_job = seed(
+        root / "force-control", ARBITER_SOURCE, "young-force-control", None
+    )
+    drop_quota(force_control_env, force_job)
+    age_job(force_control_env, force_job, 1)
+    force_control = call(
+        ARBITER_SOURCE, force_control_env, "release", "--force", "--job", force_job,
+        "--herdr-agent-list", str(force_agents),
+    )
+    if (force_control.returncode != 5
+            or "10-minute startup grace" not in force_control.stderr
+            or status(ARBITER_SOURCE, force_control_env, force_job)["jobs"][0]["state"]
+            != "leased"):
+        raise AssertionError("force-release startup grace control did not refuse the young job")
+    force_mutant = mutate(
+        root / "force-startup-grace-mutant",
+        "force-no-startup-grace",
+        "            startup_blocker = _orphan_startup_blocker(con, args.job, moment)\n",
+        "            startup_blocker = None\n",
+    )
+    force_mutant_env, force_mutant_agents, force_mutant_job = seed(
+        root / "force-mutant-state", force_mutant, "young-force-mutant", None
+    )
+    drop_quota(force_mutant_env, force_mutant_job)
+    age_job(force_mutant_env, force_mutant_job, 1)
+    force = call(
+        force_mutant, force_mutant_env, "release", "--force", "--job", force_mutant_job,
+        "--herdr-agent-list", str(force_mutant_agents),
+    )
+    if (force.returncode != 0
+            or status(force_mutant, force_mutant_env, force_mutant_job)["jobs"][0]["state"]
+            != "released"):
+        raise AssertionError(
+            "force-release startup-grace call-site mutant did not release the young job"
+        )
+    print("PASS mutant-without-claim-startup-grace-goes-red-on-gc-and-force-release")
 
 
 def prove_rowless_candidate_mutant_goes_red(root: Path) -> None:
@@ -593,12 +701,17 @@ def prove_snapshot_mutant_goes_red(root: Path) -> None:
     control_root = root / "control"
     control_root.mkdir(parents=True, exist_ok=True)
     assert_gc_skips_reclaimed_snapshot(control_root, ARBITER_SOURCE, "snapshot-control")
+    rowless_control_root = root / "rowless-control"
+    rowless_control_root.mkdir(parents=True, exist_ok=True)
+    assert_gc_skips_reclaimed_snapshot(
+        rowless_control_root, ARBITER_SOURCE, "snapshot-rowless-control", rowless=True
+    )
 
     mutant = mutate(
         root / "snapshot-mutant",
         "gc-ignores-job-snapshot",
-        '    return before is not None and before == current\n',
-        '    return True\n',
+        '            if not _job_claim_snapshot_matches(snapshots.get(job_id), current_snapshot):\n',
+        '            if False and not _job_claim_snapshot_matches(snapshots.get(job_id), current_snapshot):\n',
     )
     mutant_root = root / "mutant-state"
     mutant_root.mkdir(parents=True, exist_ok=True)
@@ -611,11 +724,36 @@ def prove_snapshot_mutant_goes_red(root: Path) -> None:
         raise AssertionError("snapshot-check mutant survived the reclaimed-job assertion")
     print("PASS mutant-gc-ignores-job-snapshot-goes-red")
 
+    rowless_mutant_root = root / "rowless-mutant-state"
+    rowless_mutant_root.mkdir(parents=True, exist_ok=True)
+    try:
+        assert_gc_skips_reclaimed_snapshot(
+            rowless_mutant_root, mutant, "snapshot-rowless-mutant", rowless=True
+        )
+    except AssertionError as exc:
+        if "retired a job reclaimed" not in str(exc):
+            raise
+    else:
+        raise AssertionError(
+            "snapshot call-site mutant survived the row-less reclaimed-job assertion"
+        )
+
+    force_control_root = root / "force-control"
+    force_control_root.mkdir(parents=True, exist_ok=True)
+    assert_force_refuses_reclaimed_snapshot(
+        force_control_root, ARBITER_SOURCE, "snapshot-force-control"
+    )
+    force_mutant = mutate(
+        root / "force-snapshot-mutant",
+        "force-ignores-job-snapshot",
+        "_job_claim_snapshot_matches(\n            snapshot, current_snapshot\n        )",
+        "True",
+    )
     force_root = root / "mutant-force-state"
     force_root.mkdir(parents=True, exist_ok=True)
     try:
         assert_force_refuses_reclaimed_snapshot(
-            force_root, mutant, "snapshot-force-mutant"
+            force_root, force_mutant, "snapshot-force-mutant"
         )
     except AssertionError as exc:
         if "force release did not refuse the stale snapshot" not in str(exc):
