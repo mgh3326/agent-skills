@@ -10730,7 +10730,9 @@ assert d["jobs"][0]["state"] == "leased" and d["quota_pool_records"] == [] and d
   orphan_spawn="$(spawn_base codex-luna --job "$job" --t T2 2>&1)"
   orphan_spawn_rc=$?
   set -e
-  TW_TMP="$ARBITER_INBOX_ROOT" tmp_writers_stop || {
+  # The pidfiles live under ARBITER_INBOX_ROOT but the run's wrk copy sits at
+  # $TMP/wrk; TW_TMP must cover the copy or the argv check refuses the kill.
+  tmp_writers_stop || {
     local leftover_pid
     for leftover_pid in $TW_LEFTOVER_PIDS; do
       ps -o pid=,ppid=,pgid=,stat=,lstart=,args= -p "$leftover_pid" >&2 2>/dev/null || true
