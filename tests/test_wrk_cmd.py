@@ -53,11 +53,11 @@ class CmdSpawnTests(unittest.TestCase):
         Path(self.env["WRK_HOSTS_CONFIG"]).write_text(content)
 
     def spawn(self, profile="cmd-dsflash41", effort="high", role="worker",
-              purpose=None, operator_request=None, arm=None, **overrides):
+              purpose=None, operator_request=None, arm=None, cwd=None, **overrides):
         env = dict(self.env,
                    SCOPEFUEL_E6_ARM=arm if arm is not None else f"{profile}@{effort or 'high'}")
         env.update(overrides)
-        command = [str(self.wrk), "spawn", "--host", "local", "-c", str(self.tmp),
+        command = [str(self.wrk), "spawn", "--host", "local", "-c", str(cwd or self.tmp),
                    "-m", profile, "-p", str(self.brief), "-w", "w", "-l", "cmd-fixture",
                    "--role", role, "--task", "2140", "--task-hk-bypass", "--t", "T1"]
         if purpose is not None:
@@ -244,6 +244,82 @@ class CmdSpawnTests(unittest.TestCase):
         result = self.spawn(WRK_CMD_SCREEN_FILE=str(screen))
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
+    def home_dir(self, *parts):
+        # The pane cwd is physical (/private/tmp on macOS), so the fake HOME is
+        # too: wrk compares the banner against $HOME byte for byte.
+        home = Path(self.env["HOME"]).resolve().joinpath(*parts)
+        home.mkdir(parents=True, exist_ok=True)
+        self.env["HOME"] = str(Path(self.env["HOME"]).resolve())
+        return home
+
+    def cwd_line_screen(self, line):
+        # The real capture with its cwd row rewritten to exactly `line`.
+        cap = (ROOT / "tests/fixtures/cmd-screens/cap-high-answered.txt").read_text()
+        self.assertEqual(cap.count("# /private/tmp/cmdcap2140"), 1)
+        screen = self.tmp / "cap-screen"
+        screen.write_text(cap.replace("# /private/tmp/cmdcap2140", line))
+        return {"WRK_CMD_SCREEN_FILE": str(screen)}
+
+    def assert_cwd_row(self, cwd, line, proven):
+        (self.tmp / "herdr.log").unlink(missing_ok=True)
+        result = self.spawn(cwd=cwd, **self.cwd_line_screen(line))
+        if proven:
+            self.assertEqual(result.returncode, 0, f"{line!r}\n" + result.stdout + result.stderr)
+            return
+        self.assertNotEqual(result.returncode, 0, f"{line!r}\n" + result.stdout + result.stderr)
+        self.assertIn("cmd model not proven", result.stderr)
+        self.assertIn("pane close w:p1", self.log())
+
+    def test_home_abbreviated_cwd_passes(self):
+        # hk 2174: real cmd prints "# ~/work/<dir>" for a cwd under HOME.
+        project = self.home_dir("work", "cmd-smoke")
+        for scenario in ("ok", "home-abbrev"):
+            with self.subTest(scenario=scenario):
+                result = self.spawn(cwd=project, WRK_CMD_SCENARIO=scenario)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assert_cwd_row(project, "# ~/work/cmd-smoke", True)
+        self.assert_cwd_row(project, f"# {project}", True)
+        # HOME itself is shown as a bare "~".
+        home = self.home_dir()
+        self.assert_cwd_row(home, "# ~", True)
+        self.assert_cwd_row(home, f"# {home}", True)
+
+    def test_cwd_outside_home_needs_absolute_form(self):
+        home = self.home_dir()
+        outside = self.tmp / "outside" / "proj"
+        outside.mkdir(parents=True)
+        self.assert_cwd_row(outside, f"# {outside.resolve()}", True)
+        for line in ("# ~/outside/proj", "# ~/../outside/proj", "# ~", "# ~/proj"):
+            with self.subTest(line=line):
+                self.assert_cwd_row(outside, line, False)
+        # Nor is a HOME-looking directory elsewhere the real HOME.
+        elsewhere = self.tmp / "elsewhere" / home.name / "proj"
+        elsewhere.mkdir(parents=True)
+        self.assert_cwd_row(elsewhere, "# ~/proj", False)
+
+    def test_other_tilde_path_refused(self):
+        project = self.home_dir("work", "cmd-smoke")
+        self.home_dir("work", "sibling")
+        for line in ("# ~/work/sibling", "# ~/work/cmd-smoke/sub", "# ~/work",
+                     "# ~", "# ~/work/cmd-smoke/", "# ~/cmd-smoke",
+                     "# ~other/work/cmd-smoke"):
+            with self.subTest(line=line):
+                self.assert_cwd_row(project, line, False)
+
+    def test_home_prefix_needs_path_boundary(self):
+        # HOME=<root>/a must not abbreviate <root>/ab/x as "~b/x".
+        root = self.home_dir()
+        self.env["HOME"] = str(self.home_dir("a"))
+        inside = root / "a" / "x"
+        inside.mkdir()
+        sibling = root / "ab" / "x"
+        sibling.mkdir(parents=True)
+        self.assert_cwd_row(inside, "# ~/x", True)
+        self.assert_cwd_row(sibling, f"# {sibling}", True)
+        for line in ("# ~b/x", "# ~/b/x", "# ~/../ab/x", "# ~/x"):
+            with self.subTest(line=line):
+                self.assert_cwd_row(sibling, line, False)
+
     def test_policy_profile(self):
         policy = json.loads((ROOT / "director/gate_policy.json").read_text())
         spec = policy["profiles"]["cmd-dsflash41"]
@@ -284,6 +360,22 @@ class CmdMutantTests(unittest.TestCase):
                 'if [[ "$PROFILE_KIND" == cmd ]] && ! cmd_model_proven; then',
                 'if false; then',
                 "test_model_proof_failures_close_pane"),
+            "tilde-any-path": (
+                '    if lines[i + 1] not in shown_cwds:\n',
+                '    if lines[i + 1] not in shown_cwds and not lines[i + 1].startswith("# ~"):\n',
+                "test_other_tilde_path_refused"),
+            "tilde-no-boundary": (
+                '    elif cwd.startswith(home + "/"):\n',
+                '    elif cwd.startswith(home):\n',
+                "test_home_prefix_needs_path_boundary"),
+            "tilde-below-home-dropped": (
+                '        shown_cwds.add("# ~" + cwd[len(home):])\n',
+                '        pass\n',
+                "test_home_abbreviated_cwd_passes"),
+            "tilde-home-exact-dropped": (
+                '        shown_cwds.add("# ~")\n',
+                '        pass\n',
+                "test_home_abbreviated_cwd_passes"),
             "quoted-proof": (
                 'if candidate in quoted:\n    sys.exit(1)\nsys.exit(0)\n',
                 'if False:\n    sys.exit(1)\nsys.exit(0)\n',
