@@ -34,26 +34,14 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
   'workspace = "workers"' "cwd_map = {\"$ROOT\"=\"$REMOTE_CWD\"}" \
   "cwd_keys = {\"$ROOT\"=\"repo-a\"}" 'capacity = 3' >"$HUB_CONFIG"
 
-stop_owned_sentinels() {
-  local root pidfile pid command_line job
-  for root in "$ARBITER_INBOX_ROOT" "$TMP/remote-inbox/jobs"; do
-    [[ -d "$root" ]] || continue
-    while IFS= read -r pidfile; do
-      [[ -r "$pidfile" ]] || continue
-      read -r pid <"$pidfile" || continue
-      [[ "$pid" =~ ^[0-9]+$ ]] || continue
-      job="${pidfile%/completion-sentinel.pid}"
-      job="${job##*/}"
-      command_line="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-      [[ "$command_line" == *"$ROOT/bin/wrk sentinel $job "* ]] || continue
-      kill "$pid" 2>/dev/null || true
-    done < <(find "$root" -type f -name completion-sentinel.pid -print 2>/dev/null || true)
-  done
-}
-
+# shellcheck disable=SC1091
+. "$ROOT/tests/lib/tmp-writers.sh"
+export TW_TMP="$TMP"
 cleanup() {
-  stop_owned_sentinels
-  rm -rf "$TMP"
+  local rc=0
+  tmp_writers_stop || rc=$?
+  (( rc == 0 )) && rm -rf "$TMP"
+  if (( rc != 0 )); then exit 1; fi
 }
 trap cleanup EXIT
 
@@ -116,7 +104,7 @@ export WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$tmp/remote-herdr.log"
 export WRK_SPILLOVER_LOG="$tmp/remote-spillover.log"
 export WRK_SSH_BIN="$root/tests/fixtures/spillover-ssh" WRK_SCP_BIN="$root/tests/fixtures/spillover-scp"
 export WRK_SSH_LOG="$tmp/remote-ssh.log" WRK_SCP_LOG="$tmp/remote-scp.log"
-exec "$root/bin/wrk" "$@"
+exec "${WRK_REMOTE_BINARY:-$root/bin/wrk}" "$@"
 REMOTE_WRK
 chmod +x "$TMP/remote-bin/wrk"
 
@@ -124,6 +112,12 @@ run_remote() {
   local binary="$1"; shift
   local model="${WRK_CASE_MODEL:-codex-luna}" label="${WRK_CASE_LABEL:-remote-child}"
   local job="${WRK_CASE_JOB:-remote-$RANDOM-$RANDOM}" config="${WRK_CASE_CONFIG:-$CONFIG}"
+  local report_args=() args=("$@") i
+  for ((i = 0; i + 1 < ${#args[@]}; i++)); do
+    if [[ "${args[$i]}" == --parent-job ]]; then
+      report_args=(--report "$ARBITER_INBOX_ROOT/${args[$((i + 1))]}/verdict.md"); break
+    fi
+  done
   env HOME="$HOME" XDG_CONFIG_HOME="$XDG_CONFIG_HOME" XDG_DATA_HOME="$XDG_DATA_HOME" \
     XDG_STATE_HOME="$XDG_STATE_HOME" XDG_CACHE_HOME="$XDG_CACHE_HOME" \
     ARBITER_INBOX_ROOT="$ARBITER_INBOX_ROOT" HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" \
@@ -140,6 +134,7 @@ run_remote() {
     WRK_REMOTE_PROMPT_PATH="$REMOTE_PROMPT_PATH" WRK_REMOTE_ROOT="$ROOT" WRK_REMOTE_TMP="$TMP" \
     WRK_SSH_EXEC_REMOTE="${WRK_CASE_EXEC_REMOTE:-1}" WRK_REMOTE_WRK_LOG="${WRK_CASE_REMOTE_LOG:-$TMP/remote-wrk.log}" \
     WRK_PLACE_LOG="$TMP/place.log" PATH="$TMP/remote-bin:$PATH" \
+    WRK_REMOTE_BINARY="${WRK_CASE_REMOTE_BINARY:-}" \
     WRK_REMOTE_HOSTS_CONFIG="${WRK_CASE_REMOTE_CONFIG:-}" \
     WRK_REMOTE_LANES_LOG="${WRK_CASE_REMOTE_LANES_LOG:-}" \
     WRK_REMOTE_PANEWIRE_BIN="${WRK_CASE_REMOTE_PANEWIRE_BIN:-}" \
@@ -147,7 +142,7 @@ run_remote() {
     WRK_PANEWIRE_LANES_LS="${WRK_CASE_REMOTE_LANES_LS:-}" \
     WRK_T10_PANEWIRE_FIXTURE="${WRK_CASE_T10_PANEWIRE_FIXTURE:-}" \
     WRK_T10_PANEWIRE_STATE="${WRK_CASE_T10_PANEWIRE_STATE:-}" \
-    "$binary" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w workers -l "$label" --t T1 --job "$job" "$@"
+    "$binary" spawn -c "$ROOT" -m "$model" -p "$PROMPT" -w workers -l "$label" --t T1 --job "$job" "${report_args[@]+"${report_args[@]}"}" "$@"
 }
 
 # T1: the initiator resolves P locally, forwards one HK_TASK_ID env argv, and
@@ -163,7 +158,7 @@ grep -q -- '--parent-job P' "$TMP/ssh.log" || { echo 'FAIL T1 parent job was dro
 grep -q '^HK_TASK_ID=1489$' "$TMP/remote-wrk.log" || { echo 'FAIL T1 target did not receive HK_TASK_ID' >&2; exit 1; }
 grep -q -- '--parent-job><P>' "$TMP/remote-wrk.log" || { echo 'FAIL T1 target argv lost parent job' >&2; exit 1; }
 [[ ! -e "$TMP/remote-inbox/jobs/P" ]] || { echo 'FAIL T1 remote arbiter unexpectedly knew P' >&2; exit 1; }
-python3 - "$TMP/ssh.argv0" <<'PY'
+python3 - "$TMP/ssh.argv0" "$TMP/remote-inbox/jobs/P/verdict.md" <<'PY'
 import shlex, sys
 
 records = [record.split(b"\0") for record in open(sys.argv[1], "rb").read().split(b"\0\0") if record]
@@ -173,7 +168,18 @@ argv = shlex.split(command)
 assert argv[:3] == ["env", "HERDR_SESSION=worker", "HK_TASK_ID=1489"], argv
 assert argv.count("HK_TASK_ID=1489") == 1, argv
 assert argv[argv.index("--parent-job") + 1] == "P", argv
+assert argv.count("--owner") == 1 and argv[argv.index("--owner") + 1] == "fixture", "hk2042 missing transported parent owner: %r" % argv
+assert argv.count("--report-relative") == 1 and argv[argv.index("--report-relative") + 1] == "P/verdict.md", "hk2042 relative report changed: %r" % argv
 PY
+# The actual target sentinel, not just the wire argv, watches the target path.
+python3 - "$TMP/remote-inbox/jobs/t1-remote/completion-sentinel.pid" "$TMP/remote-inbox/jobs/P/verdict.md" <<'PATHCHECK'
+import pathlib, shlex, subprocess, sys
+pid = pathlib.Path(sys.argv[1]).read_text().split()[0]
+command = subprocess.check_output(["ps", "-p", pid, "-o", "command="], text=True)
+args = shlex.split(command)
+# wrk resolves the inbox; macOS /var and /tmp are aliases of /private paths.
+assert args[args.index("sentinel") + 5] == str(pathlib.Path(sys.argv[2]).resolve()), "hk2042 target sentinel report path: " + command
+PATHCHECK
 printf '%s\n' 'PASS wrk-remote-task T1-remote-env-and-empty-target-arbiter'
 
 # The same pre-resolution applies to --host auto candidates which use SSH.
@@ -320,7 +326,72 @@ grep -q "parent job 'P-no-task' has no task_id" <<<"$mut_late_out" || {
 }
 printf '%s\n' 'PASS wrk-remote-task M2-late-resolution-red-then-restored-green'
 
-printf '%s\n' 'PASS wrk-remote-task mutants-red=2/2'
+MUT_OWNER="$TMP/wrk-owner-dropped"
+python3 - "$ROOT/bin/wrk" "$MUT_OWNER" <<'OWNER_MUT'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+line = '  [[ -z "${SPILL_REMOTE_OWNER:-}" ]] || remote_args+=(--owner "$SPILL_REMOTE_OWNER") # hk2042-ssh-owner\n'
+assert source.count(line) == 1
+Path(sys.argv[2]).write_text(source.replace(line, "", 1))
+OWNER_MUT
+chmod +x "$MUT_OWNER"
+set +e
+owner_out="$(WRK_CASE_JOB=owner-dropped run_remote "$MUT_OWNER" --host desktop --parent-job P 2>&1)"
+owner_rc=$?
+set -e
+[[ "$owner_rc" -ne 0 ]] || { echo 'FAIL owner-drop mutant survived' >&2; exit 1; }
+grep -q "parent job 'P' has no readable newest claim/reclaim" <<<"$owner_out" || {
+  echo 'FAIL owner-drop mutant missed parent-owner refusal' >&2; exit 1;
+}
+printf '%s\n' 'PASS wrk-remote-task owner-transport-mutant-RED'
+
+# Invalid wire paths and outside absolute reports refuse on the initiator.
+for path in P/../escape.md /tmp/absolute.md; do
+  : >"$TMP/ssh.log"
+  rc=0
+  run_remote "$ROOT/bin/wrk" --host desktop --parent-job P --report-relative "$path" >"$TMP/bad-relative.out" 2>&1 || rc=$?
+  [[ "$rc" -eq 2 && ! -s "$TMP/ssh.log" ]] || { echo 'FAIL invalid relative report reached SSH' >&2; exit 1; }
+done
+: >"$TMP/ssh.log"
+rc=0
+run_remote "$ROOT/bin/wrk" --host desktop --parent-job P --report /tmp/outside.md >"$TMP/bad-report.out" 2>&1 || rc=$?
+[[ "$rc" -eq 2 && ! -s "$TMP/ssh.log" ]] || { echo 'FAIL /tmp report reached SSH' >&2; exit 1; }
+printf '%s\n' 'PASS wrk-remote-task report-refusals-before-SSH'
+# An initiator-safe path can escape through a TARGET-only symlink. The target
+# must repeat containment; this mutant changes only the target executable.
+mkdir -p "$TMP/remote-inbox/jobs/P" "$TMP/target-outside"
+ln -s "$TMP/target-outside" "$TMP/remote-inbox/jobs/P/escape"
+target_containment_probe() {
+  local binary="$1" rc=0
+  WRK_CASE_REMOTE_BINARY="$binary" WRK_CASE_JOB=target-containment \
+    run_remote "$ROOT/bin/wrk" --host desktop --parent-job P \
+    --report-relative P/escape/verdict.md >"$TMP/target-containment.out" 2>&1 || rc=$?
+  [[ "$rc" -eq 2 ]] || { echo 'FAIL target-only symlink containment was skipped' >&2; return 1; }
+  grep -q 'must resolve under the parent or new job directory' "$TMP/target-containment.out" || {
+    echo 'FAIL target containment refusal was missing' >&2; return 1;
+  }
+}
+target_containment_probe "$ROOT/bin/wrk"
+MUT_TARGET="$TMP/wrk-target-containment"
+python3 - "$ROOT/bin/wrk" "$MUT_TARGET" <<'TARGET_MUT'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+old = '    if not any(base in path.parents for base in allowed): # hk2042-target-containment\n'
+assert source.count(old) == 1
+Path(sys.argv[2]).write_text(source.replace(old, '    if False: # target containment mutant\n', 1))
+TARGET_MUT
+chmod +x "$MUT_TARGET"
+if target_containment_probe "$MUT_TARGET" >"$TMP/target-mutant.log" 2>&1; then
+  echo 'FAIL target containment mutant survived' >&2; exit 1
+fi
+grep -q '^FAIL target-only symlink containment was skipped' "$TMP/target-mutant.log" || {
+  echo 'FAIL target containment mutant did not fail the contract assertion' >&2; exit 1;
+}
+printf '%s\n' 'PASS wrk-remote-task target-containment-mutant-RED'
+
+printf '%s\n' 'PASS wrk-remote-task mutants-red=4/4'
 
 # T6 (hk 1446): a REAL remote wrk on the target holds a lanes token bound
 # to the hosts.toml key the initiator reached it by — it self-registers

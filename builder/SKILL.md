@@ -36,7 +36,7 @@ worker/tester 전용이다 — fusion 빌더 사용은 hk 1382 이후 결정이�
 **정식 등재와 T2 확대는 프로필당 표본 3(빌더 역할 reps)에서 재판단**하며, 라운드 상한 초과나 게이트
 BOUNCE 2회면 워커 전용으로 되돌린다(`builder-devin`도 같은 되돌리기 조건이다).
 #704(#594 E6 측정 런그)는 런그별 빌더 철자 `builder-opus-low`·`builder-opus-medium`·
-`builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·`builder-sol-max`·
+`builder-sonnet-xhigh`·`builder-sonnet-max`·`builder-sol-high`·
 `builder-luna-max`·
 `builder-kimi-high`·`builder-kimi-max`를 연다. 각 철자는 이름 마지막 구간의 런그 하나만 고정하며
 (그 외 `--effort`는 거부), spawn은 `SCOPEFUEL_E6_ARM=<게이트 프로필>@<런그>` 표식이 정확히
@@ -61,14 +61,31 @@ kimi 런그(`builder-kimi-high`·`builder-kimi-max`)는 CLI에 `--effort`가 없
 hk 1796은 같은 규칙으로 hk 1786 팔의 네 런그를 연다 — `builder-sonnet-medium`
 (`SCOPEFUEL_E6_ARM=sonnet@medium`), `builder-haiku-low`(`haiku@low`),
 `builder-luna-low`(`codex-luna@low`), `builder-luna-medium`(`codex-luna@medium`).
-넷 다 배치된 canon 행이라 표식은 게이트 판정을 그 행으로만 좁히고,
+hk 2043은 r1026luna down arm(L-A+ luna@high 대 sonnet@xhigh)을 위해
+`builder-luna-high`(`codex-luna@high`)를 같은 luna 계열에 더한다 — low/medium 과
+같은 E6 측정 철자이므로 `SCOPEFUEL_E6_ARM=codex-luna@high` 표식이 필요하고
+`codex-luna@high`로 기록된다.
+다섯 다 배치된 canon 행이라 표식은 게이트 판정을 그 행으로만 좁히고,
 luna 쌍은 `codex-luna@<런그>`로 게이트되며 모델 id는 카탈로그 행에서 온다
 (오늘 codex-luna@low 는 gpt-5.6-luna).
+hk 2043은 r1026effdown arm B(haiku@high 대 haiku@medium)를 위해
+`builder-haiku-medium`(`haiku@medium`)을 haiku 계열에 더한다 — haiku-low 와 같은
+E6 측정 철자이므로 `SCOPEFUEL_E6_ARM=haiku@medium` 표식이 필요하고
+`haiku@medium`으로 기록된다.
 hk 1863은 같은 규칙으로 hk 1786 의 borrow-down·promote-up 팔 다섯 런그를 연다 — `builder-sol-low`(`SCOPEFUEL_E6_ARM=codex-sol@low`), `builder-haiku-high`(`haiku@high`), `builder-haiku-xhigh`(`haiku@xhigh`), `builder-haiku-max`(`haiku@max`), `builder-sonnet-low`(`sonnet@low`) — `builder-haiku-max`는 `builder-sol-max`·`builder-sonnet-max`와 같이 열려 있고(hk 1864), canon 에 `sonnet@low` 행이 아직 없어 실게이트의 `builder-sonnet-low`는 행이 푸시될 때까지 거부된다.
-**2026-09-26 운영자 결정이 닫았던 max 런그 철자(`builder-sonnet-max`·`builder-sol-max`·
+**2026-09-26 운영자 결정이 닫았던 max 런그 철자(`builder-sonnet-max`·
 `builder-luna-max`·`builder-kimi-max`)는 hk 1864(2026-10-23 운영자 결정, 빌더 좌석
 no-max 규칙 폐지)로 열렸다** — 다른 E6 런그와 같이 정확한 `SCOPEFUEL_E6_ARM` 표식이
 필요하고 ultra 는 계속 거부한다.
+hk 2043(운영자 r1026solmax, revision 3)은 **정상 pinned 철자** `builder-sol-xhigh`(신규)와
+`builder-sol-max`를 연다. 둘은 런그 고정 규칙(카탈로그·게이트 상담, 모델, 기본 effort,
+다른 `--effort` 거부)은 E6 철자와 같지만 **`SCOPEFUEL_E6_ARM` 표식을 요구하지 않는다** —
+이미 배치된 canon 행이기 때문이다. `builder-sol-max`는 S+ gate=default 행(r1026solmax)이라
+게이트가 REF를 요구하지 않고, `builder-sol-xhigh`는 S+ escalation 행이라 게이트가 입장을
+계속 결정한다. 상담·기록은 각각 `codex-sol@max`·`codex-sol@xhigh`다. 같은 PR에서
+상담 런그가 하나로 고정된 비-pinned 철자(`builder-sol`·`builder-sol6`·`builder-grok` 등)는
+그 외 `--effort`를 거부하며, 거부 줄은 해당 런그의 pinned 철자를 지목한다(예:
+`--effort xhigh` → `builder-sol-xhigh`).
 #921(operator 2026-09-29 Sonnet 5.5 실험 보고)은 비-런그 빌더 철자
 `builder-sonnet`을 연다 — `builder-opus` 의 argv 모양(`--model sonnet`
 `--dangerously-skip-permissions`)에 `--effort` 는 high·xhigh·max 만 받고 생략 시

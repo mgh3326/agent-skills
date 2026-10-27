@@ -13,6 +13,9 @@
 #   hk1506-no-head-round-refused
 #   hk1506-no-open-round-refused
 #   hk1506-unbound-verdict-readers-unchanged
+# hk 1970: round verdict --head-repeat REF binds a second verdict to a repeated head once per
+# REF per job; identity refusals come first and a grant binds only the oldest open round.
+#   hk1970-head-repeat (the hk 1964 sequence, refusals, used-once, pa-integrator, mutants)
 # hk 1900: a round counts toward the join only once a verdict is recorded for it,
 # the join rechecks the end record and the gate inside the events lock, and a
 # verdict file with a non-UTF-8 byte is read with replacement, not skipped.
@@ -1578,6 +1581,193 @@ director_hits="$(grep -c 'rounds-waived' "$ROOT/director/SKILL.md" || true)"
 [[ "$director_hits" -eq 1 ]] || fail "director skill must mention rounds-waived on exactly one line"
 echo "PASS help-and-skill-lines"
 
+# ── hk 1970: a head-repeat grant lets a second verdict bind to a repeated head ──
+echo "== hk1970-head-repeat =="
+grep -q -- '--head-repeat REF' "$TMP/round-help.txt" || fail "round help must name --head-repeat REF"
+grep -q 'head-repeat: job=JOB head=SHA round=N by=ISSUER' "$TMP/round-help.txt" || fail "round help must give the head-repeat line form"
+hr_seed() { # hr_seed job [parent] [task_id]: round 1 BLOCKER and round 2 open on H1, PASS staged
+  local job="$1" parent="${2:-director-1}" task_id="${3:-}"
+  claim_job "$job" "$parent" 2026-10-23T00:00:00Z builder lane-a "$task_id"
+  open_ok "$job" "$H1"
+  write_verdict_file "$TMP/$job-block.md" BLOCKER "$H1" "$job round one"
+  verdict_ok "$job" "$TMP/$job-block.md"
+  open_ok "$job" "$H1"
+  write_verdict_file "$TMP/$job-pass.md" PASS "$H1" "$job round two"
+}
+hr_verdict() { # hr_verdict job file ref
+  run_cmd "$WRK" round verdict "$1" --file "$2" --head-repeat "$3"
+}
+hr_nogrant() { # hr_nogrant job head round ref: the exact no-grant refusal line
+  printf "wrk: round verdict: %s has no 'head-repeat: job=%s head=%s round=%s by=<parent-lane|operator>' grant backed by the record's server-set created_by (doc) or comment author (task)" "$4" "$1" "$2" "$3"
+}
+hr_count() { kind_count "$1" job.verdict; }
+
+# The hk 1964 sequence: round 1 BLOCKER at X, round 2 open at X, PASS at X.
+hr_seed hr-seq
+run_cmd "$WRK" round verdict hr-seq --file "$TMP/hr-seq-pass.md"
+assert_refused "wrk: round verdict: head $H1 already recorded as $(verdict_field hr-seq 0 round | head -n 1)"
+[[ "$(hr_count hr-seq)" -eq 1 ]] || fail "DUP_HEAD without the flag wrote a verdict"
+hr_verdict hr-seq "$TMP/hr-seq-pass.md" hk:doc/hr-seq-made-up
+assert_refused "wrk: round verdict: head-repeat record not found in handoffkeep: hk:doc/hr-seq-made-up"
+grep -qxF 'doc get hr-seq-made-up' "$HK_CALL_LOG" || fail "a head-repeat ref must be fetched: $(cat "$HK_CALL_LOG")"
+[[ "$(hr_count hr-seq)" -eq 1 ]] || fail "a made-up ref wrote a verdict"
+echo "PASS hk1970-without-flag-and-made-up-ref-refused"
+
+grant_doc hr-seq-grant "$(printf 'head-repeat: job=hr-seq head=%s round=2 by=director-1' "$H1")"
+hr_verdict hr-seq "$TMP/hr-seq-pass.md" hk:doc/hr-seq-grant
+assert_rc 0
+grep -q "OK job=hr-seq verdict=PASS head=$H1 round=2 " "$TMP/run.out" || fail "head-repeat stdout: $(cat "$TMP/run.out")"
+[[ "$(hr_count hr-seq)" -eq 2 ]] || fail "a verified grant must record the second verdict"
+[[ "$(verdict_field hr-seq 1 round | tail -n 1)" == "2" ]] || fail "the second verdict must bind round 2"
+[[ "$(verdict_field hr-seq 1 head_repeat | tail -n 1)" == "hk:doc/hr-seq-grant" ]] || fail "head_repeat not recorded"
+[[ "$(verdict_field hr-seq 1 head_repeat_issuer | tail -n 1)" == "director-1" ]] || fail "head_repeat_issuer not recorded"
+echo "PASS hk1970-hk1964-sequence-records-round-two"
+
+# Used once: the same REF on a later round is refused even when one of its lines matches.
+open_ok hr-seq "$H1"
+grant_doc hr-seq-grant "$(printf 'head-repeat: job=hr-seq head=%s round=2 by=director-1\nhead-repeat: job=hr-seq head=%s round=3 by=director-1' "$H1" "$H1")"
+write_verdict_file "$TMP/hr-seq-third.md" PASS "$H1" 'hr-seq round three'
+hr_verdict hr-seq "$TMP/hr-seq-third.md" hk:doc/hr-seq-grant
+assert_refused "wrk: round verdict: head_repeat_used hk:doc/hr-seq-grant: already recorded on a job.verdict of hr-seq"
+[[ "$(hr_count hr-seq)" -eq 2 ]] || fail "a reused grant wrote a verdict"
+echo "PASS hk1970-reused-grant-refused-even-with-a-matching-line"
+
+# Refused, each with no job.verdict: the grant names the wrong job, head, round or kind,
+# or its shape, issuer or identity is wrong.
+hr_seed hr-refuse
+refuse_grant() { # refuse_grant name body [created_by]: one refused grant, no verdict written
+  grant_doc "$1" "$2" "${3:-director-1}"
+  hr_verdict hr-refuse "$TMP/hr-refuse-pass.md" "hk:doc/$1"
+  assert_refused "$(hr_nogrant hr-refuse "$H1" 2 "hk:doc/$1")"
+  [[ "$(hr_count hr-refuse)" -eq 1 ]] || fail "refused grant $1 wrote a verdict"
+}
+refuse_grant hr-r-other-job "head-repeat: job=hr-other head=$H1 round=2 by=director-1"
+refuse_grant hr-r-other-head "head-repeat: job=hr-refuse head=$H2 round=2 by=director-1"
+refuse_grant hr-r-bound-round "head-repeat: job=hr-refuse head=$H1 round=1 by=director-1"
+refuse_grant hr-r-unopened-round "head-repeat: job=hr-refuse head=$H1 round=3 by=director-1"
+refuse_grant hr-r-upper-sha "head-repeat: job=hr-refuse head=$(printf '%s' "$H1" | tr '[:lower:]' '[:upper:]') round=2 by=director-1"
+refuse_grant hr-r-short-sha "head-repeat: job=hr-refuse head=${H1:0:7} round=2 by=director-1"
+refuse_grant hr-r-padded-round "head-repeat: job=hr-refuse head=$H1 round=02 by=director-1"
+refuse_grant hr-r-outsider "head-repeat: job=hr-refuse head=$H1 round=2 by=someone-else" someone-else
+refuse_grant hr-r-pa-not-parent "head-repeat: job=hr-refuse head=$H1 round=2 by=pa-integrator" pa-integrator
+refuse_grant hr-r-forged "head-repeat: job=hr-refuse head=$H1 round=2 by=director-1" the-builder
+refuse_grant hr-r-void-line "round-void: job=hr-refuse round=2 by=director-1"
+refuse_grant hr-r-extension-line "round-extension: job=hr-refuse extra=1 by=director-1"
+refuse_grant hr-r-waiver-line "join-waiver: job=hr-refuse by=director-1"
+refuse_grant hr-r-mid-line "see head-repeat: job=hr-refuse head=$H1 round=2 by=director-1"
+HR_LINE="head-repeat: job=hr-refuse head=$H1 round=2 by=director-1"
+HR_VARIANTS=(
+  "head-repeat:  job=hr-refuse head=$H1 round=2 by=director-1"
+  "head-repeat: job=hr-refuse  head=$H1 round=2 by=director-1"
+  " $HR_LINE"
+  "$HR_LINE "
+  "$HR_LINE and more"
+  "$(printf 'head-repeat:\tjob=hr-refuse head=%s round=2 by=director-1' "$H1")"
+  "> $HR_LINE"
+  "Head-Repeat: job=hr-refuse head=$H1 round=2 by=director-1"
+)
+n=0
+for variant in "${HR_VARIANTS[@]}"; do
+  n=$((n + 1))
+  refuse_grant "hr-r-space-$n" "$variant"
+done
+[[ "$n" -eq 8 ]] || fail "expected 8 whitespace and case variants, ran $n"
+echo "PASS hk1970-refused-grant-lines-and-shapes"
+
+# Identity comes first: a verdict with the same bytes or the same path is refused under a valid grant.
+hr_seed hr-ident
+grant_doc hr-ident-grant "head-repeat: job=hr-ident head=$H1 round=2 by=director-1"
+cp "$TMP/hr-ident-block.md" "$TMP/hr-ident-copy.md"
+hr_verdict hr-ident "$TMP/hr-ident-copy.md" hk:doc/hr-ident-grant
+assert_refused "wrk: round verdict: verdict content $(file_sha "$TMP/hr-ident-copy.md") already recorded as $(verdict_field hr-ident 0 round | head -n 1)"
+cp "$TMP/hr-ident-pass.md" "$TMP/hr-ident-block.md"
+hr_verdict hr-ident "$TMP/hr-ident-block.md" hk:doc/hr-ident-grant
+assert_refused "wrk: round verdict: verdict path already recorded as $(verdict_field hr-ident 0 round | head -n 1): $(python3 -c 'import os,sys; print(os.path.abspath(sys.argv[1]))' "$TMP/hr-ident-block.md")"
+[[ "$(hr_count hr-ident)" -eq 1 ]] || fail "identity refusals wrote a verdict"
+hr_verdict hr-ident "$TMP/hr-ident-pass.md" hk:doc/hr-ident-grant
+assert_rc 0
+echo "PASS hk1970-identity-refuses-before-any-grant"
+
+# A fresh head needs no grant: the flag is refused before the grant is fetched.
+claim_job hr-fresh
+open_ok hr-fresh "$H3"
+write_verdict_file "$TMP/hr-fresh.md" PASS "$H3" 'fresh head'
+grant_doc hr-fresh-grant "head-repeat: job=hr-fresh head=$H3 round=1 by=director-1"
+hr_verdict hr-fresh "$TMP/hr-fresh.md" hk:doc/hr-fresh-grant
+assert_refused "wrk: round verdict: head_repeat_not_needed: head $H3 has no earlier job.verdict on hr-fresh; drop --head-repeat"
+[[ "$(hr_count hr-fresh)" -eq 0 ]] || fail "a fresh head with the flag wrote a verdict"
+if grep -q 'doc get hr-fresh-grant' "$HK_CALL_LOG"; then fail "a fresh head must refuse before fetching the grant"; fi
+echo "PASS hk1970-fresh-head-needs-no-grant"
+
+# A repeated head with no open round still refuses as DUP_HEAD.
+claim_job hr-noopen
+open_ok hr-noopen "$H1"
+write_verdict_file "$TMP/hr-noopen-block.md" BLOCKER "$H1" 'no open round'
+verdict_ok hr-noopen "$TMP/hr-noopen-block.md"
+write_verdict_file "$TMP/hr-noopen-pass.md" PASS "$H1" 'no open round two'
+grant_doc hr-noopen-grant "head-repeat: job=hr-noopen head=$H1 round=2 by=director-1"
+hr_verdict hr-noopen "$TMP/hr-noopen-pass.md" hk:doc/hr-noopen-grant
+assert_refused "wrk: round verdict: head $H1 already recorded as $(verdict_field hr-noopen 0 round | head -n 1)"
+[[ "$(hr_count hr-noopen)" -eq 1 ]] || fail "a grant with no open round wrote a verdict"
+echo "PASS hk1970-no-open-round-still-refuses-duplicate-head"
+
+# The grant binds the oldest open round on the head (hk 1506 rule), not a newer one.
+hr_seed hr-newer
+open_ok hr-newer "$H1"
+grant_doc hr-newer-late "head-repeat: job=hr-newer head=$H1 round=3 by=director-1"
+hr_verdict hr-newer "$TMP/hr-newer-pass.md" hk:doc/hr-newer-late
+assert_refused "$(hr_nogrant hr-newer "$H1" 2 hk:doc/hr-newer-late)"
+grant_doc hr-newer-oldest "head-repeat: job=hr-newer head=$H1 round=2 by=director-1"
+hr_verdict hr-newer "$TMP/hr-newer-pass.md" hk:doc/hr-newer-oldest
+assert_rc 0
+[[ "$(verdict_field hr-newer 1 round | tail -n 1)" == "2" ]] || fail "the grant must bind the oldest open round on the head"
+echo "PASS hk1970-binds-the-oldest-open-round-on-the-head"
+
+# Other accepted shapes: a task comment by the issuer, a later line, an operator issuer.
+hr_seed hr-task
+grant_task 5201 someone-else "head-repeat: job=hr-task head=$H1 round=2 by=director-1"
+grant_task 5201 director-1 "$(printf 'head-repeat: job=hr-task head=%s round=2 by=director-1' "$H1")"
+hr_verdict hr-task "$TMP/hr-task-pass.md" hk:task/5201
+assert_rc 0
+grep -qxF 'tasks comments 5201' "$HK_CALL_LOG" || fail "a task grant must be fetched with tasks comments"
+echo "PASS hk1970-task-grant-by-server-author-accepted"
+
+hr_seed hr-later
+grant_doc hr-later-grant "$(printf 'reason: the first verdict was a runner fault\nhead-repeat: job=hr-later head=%s round=1 by=director-1\nhead-repeat: job=hr-later head=%s round=2 by=director-1' "$H1" "$H1")"
+hr_verdict hr-later "$TMP/hr-later-pass.md" hk:doc/hr-later-grant
+assert_rc 0
+echo "PASS hk1970-later-grant-line-counts"
+
+hr_seed hr-operator
+grant_doc hr-operator-grant "head-repeat: job=hr-operator head=$H1 round=2 by=operator" operator
+hr_verdict hr-operator "$TMP/hr-operator-pass.md" hk:doc/hr-operator-grant
+assert_rc 0
+[[ "$(verdict_field hr-operator 1 head_repeat_issuer | tail -n 1)" == "operator" ]] || fail "operator issuer not recorded"
+echo "PASS hk1970-operator-grant-accepted"
+
+# pa-integrator grants count only on the server task for this job, as round void does.
+hr_seed hr-pa-ok pa-integrator 7101
+task_record 7101 ParkingArcade hr-pa-ok
+grant_doc hr-pa-ok-grant "head-repeat: job=hr-pa-ok head=$H1 round=2 by=pa-integrator" pa-integrator
+hr_verdict hr-pa-ok "$TMP/hr-pa-ok-pass.md" hk:doc/hr-pa-ok-grant
+assert_rc 0
+grep -qxF 'tasks show 7101' "$HK_CALL_LOG" || fail "the pa-integrator check must read the server task"
+[[ "$(verdict_field hr-pa-ok 1 head_repeat_issuer | tail -n 1)" == "pa-integrator" ]] || fail "pa-integrator issuer not recorded"
+echo "PASS hk1970-pa-integrator-accepted-on-parking-arcade"
+
+hr_seed hr-pa-bad pa-integrator 7102
+task_record 7102 SomethingElse hr-pa-bad
+grant_doc hr-pa-bad-grant "head-repeat: job=hr-pa-bad head=$H1 round=2 by=pa-integrator" pa-integrator
+hr_verdict hr-pa-bad "$TMP/hr-pa-bad-pass.md" hk:doc/hr-pa-bad-grant
+assert_refused "wrk: round verdict --head-repeat: pa-integrator grants count only when the server task for hr-pa-bad is project ParkingArcade with refs.job_id=hr-pa-bad"
+[[ "$(hr_count hr-pa-bad)" -eq 1 ]] || fail "a pa-integrator grant on the wrong project wrote a verdict"
+
+hr_seed hr-pa-notask pa-integrator
+grant_doc hr-pa-notask-grant "head-repeat: job=hr-pa-notask head=$H1 round=2 by=pa-integrator" pa-integrator
+hr_verdict hr-pa-notask "$TMP/hr-pa-notask-pass.md" hk:doc/hr-pa-notask-grant
+assert_refused "wrk: round verdict --head-repeat: pa-integrator grants need the job's hk task on the server; hr-pa-notask records no task_id"
+echo "PASS hk1970-pa-integrator-needs-the-parking-arcade-task"
+
 # ── mutants: each applied to the real anchor, each turns its case RED ──
 python3 - "$WRK" <<'PY'
 import sys
@@ -1596,6 +1786,7 @@ for anchor in (
     'claim_parent="$parent"  # hk2024-claim-facts',
     "if waived:  # hk2024-claim-recheck",
     "and round_head.lower() == vsha):  # hk1506-head-bind",
+    '"$tmp_approval" head-repeat "$bind_round" "$bind_head" || true)"  # hk1970-head-repeat',
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY
@@ -1907,5 +2098,55 @@ run_cmd "$TMP/lateverify-wrk" joined mut-late-red --pr https://example.invalid/p
 assert_refused "wrk: joined: job mut-late-red has zero non-voided recorded rounds"
 [[ "$(kind_count mut-late-red job.joined)" -eq 0 ]] || fail "late-verify mutant wrote job.joined"
 echo "PASS mutant-verify-after-the-refusal-check-goes-red"
+
+# hk 1970 mutants: each applied to the real anchor, each turns its case RED.
+# shellcheck disable=SC2016 # the mutant spec is a literal source span, not an expansion
+printf '%s\n' 'if ! round_approval_fetch "$head_repeat" >"$tmp_approval"; then => if false; then' >"$TMP/spec-hr-nofetch"
+mutant hr-nofetch "$TMP/spec-hr-nofetch"
+hr_seed hr-mut-nofetch
+run_cmd "$TMP/hr-nofetch-wrk" round verdict hr-mut-nofetch --file "$TMP/hr-mut-nofetch-pass.md" --head-repeat hk:doc/hr-mut-made-up
+assert_refused "$(hr_nogrant hr-mut-nofetch "$H1" 2 hk:doc/hr-mut-made-up)"
+echo "PASS mutant-hr-skip-the-fetch-goes-red"
+
+printf '%s\n' 'if digest in digests:  # hk1449-content-sha => if digest in digests and not grant_ref:  # hk1449-content-sha' >"$TMP/spec-hr-content"
+mutant hr-content "$TMP/spec-hr-content"
+hr_seed hr-mut-content
+grant_doc hr-mut-content-grant "head-repeat: job=hr-mut-content head=$H1 round=2 by=director-1"
+cp "$TMP/hr-mut-content-block.md" "$TMP/hr-mut-content-copy.md"
+run_cmd "$TMP/hr-content-wrk" round verdict hr-mut-content --file "$TMP/hr-mut-content-copy.md" --head-repeat hk:doc/hr-mut-content-grant
+assert_rc 0
+[[ "$(hr_count hr-mut-content)" -eq 2 ]] || fail "the content mutant must record the copied bytes"
+echo "PASS mutant-grant-releasing-content-goes-red"
+
+printf '%s\n' 'head_repeat_used = bool(grant_ref) and any( => head_repeat_used = False and any(' >"$TMP/spec-hr-used"
+mutant hr-used "$TMP/spec-hr-used"
+hr_seed hr-mut-used
+grant_doc hr-mut-used-grant "$(printf 'head-repeat: job=hr-mut-used head=%s round=2 by=director-1\nhead-repeat: job=hr-mut-used head=%s round=3 by=director-1' "$H1" "$H1")"
+hr_verdict hr-mut-used "$TMP/hr-mut-used-pass.md" hk:doc/hr-mut-used-grant
+assert_rc 0
+open_ok hr-mut-used "$H1"
+write_verdict_file "$TMP/hr-mut-used-third.md" PASS "$H1" 'mutant round three'
+run_cmd "$TMP/hr-used-wrk" round verdict hr-mut-used --file "$TMP/hr-mut-used-third.md" --head-repeat hk:doc/hr-mut-used-grant
+assert_rc 0
+[[ "$(hr_count hr-mut-used)" -eq 3 ]] || fail "the used-once mutant must record a reused grant"
+echo "PASS mutant-reused-grant-goes-red"
+
+printf '%s\n' 'GRANT = re.compile(r"^head-repeat: job=(\S+) head=([0-9a-f]{40}) round=([1-9][0-9]*) by=(\S+)$") => GRANT = re.compile(r"^head-repeat: job=(\S+) head=([0-9a-f]{7,40}) round=([1-9][0-9]*) by=(\S+)$")' 'if m.group(2) != head_sha or m.group(3) != round_number: => if not head_sha.startswith(m.group(2)) or m.group(3) != round_number:' >"$TMP/spec-hr-prefix"
+mutant hr-prefix "$TMP/spec-hr-prefix"
+hr_seed hr-mut-prefix
+grant_doc hr-mut-prefix-grant "head-repeat: job=hr-mut-prefix head=${H1:0:7} round=2 by=director-1"
+run_cmd "$TMP/hr-prefix-wrk" round verdict hr-mut-prefix --file "$TMP/hr-mut-prefix-pass.md" --head-repeat hk:doc/hr-mut-prefix-grant
+assert_rc 0
+[[ "$(hr_count hr-mut-prefix)" -eq 2 ]] || fail "the prefix mutant must accept a short SHA"
+echo "PASS mutant-short-sha-prefix-goes-red"
+
+printf '%s\n' 'if issuer not in allowed_issuers or issuer != identity: => if issuer not in allowed_issuers or (issuer != identity and grant_kind != "head-repeat"):' >"$TMP/spec-hr-noident"
+mutant hr-noident "$TMP/spec-hr-noident"
+hr_seed hr-mut-noident
+grant_doc hr-mut-noident-grant "head-repeat: job=hr-mut-noident head=$H1 round=2 by=director-1" the-builder
+run_cmd "$TMP/hr-noident-wrk" round verdict hr-mut-noident --file "$TMP/hr-mut-noident-pass.md" --head-repeat hk:doc/hr-mut-noident-grant
+assert_rc 0
+[[ "$(hr_count hr-mut-noident)" -eq 2 ]] || fail "the identity mutant must accept a forged issuer"
+echo "PASS mutant-drop-the-issuer-identity-goes-red"
 
 echo "PASS test-wrk-rounds"

@@ -115,7 +115,8 @@ else: raise SystemExit("unexpected scopefuel command")
             assert out.returncode == 0, out.stderr
 
     def run_spawn(self, *, model="codex-astra", role="tester", ref=REF,
-                  purpose="round-extension", extra=(), environment=None, router=False, launch=False):
+                  purpose="round-extension", extra=(), environment=None, router=False, launch=False,
+                  report=True, remote_preflight=False):
         self.log.unlink(missing_ok=True)
         args = ["-c", str(self.base), "-m", model, "-p", str(self.prompt), "-w", "fixture",
                 "-l", "fixture-tester", "--t", "T3"]
@@ -125,6 +126,8 @@ else: raise SystemExit("unexpected scopefuel command")
             args += ["--task", "1632", "--job", "b1632-sol", "--lane", "fixture-builder", "--parent", "director-1"]
         else:
             args += ["--parent-job", "b1632-sol"]
+            if report:
+                args += ["--report", str(self.base / "jobs/b1632-sol/tester-report.md")]
         if ref is not None:
             args += ["--round-ext", ref]
         if purpose is not None:
@@ -173,7 +176,10 @@ refresh_quota_pool() { :; }
 mock_mcp_prepare() { :; }
 mock_mcp_verify() { :; }
 '''
-        harness += 'spawn_router_cmd --host local "$@"' if router else 'spawn_cmd "$@"'
+        if remote_preflight:
+            harness += 'spillover_resolve_remote_task "$@"; exit 91'
+        else:
+            harness += 'spawn_router_cmd --host local "$@"' if router else 'spawn_cmd "$@"'
         process = subprocess.run(["bash", "-c", harness, "fixture", str(self.lib), *args],
             env={**self.env, **(environment or {})}, capture_output=True, text=True, timeout=60)
         calls = [json.loads(line) for line in self.log.read_text().splitlines()] if self.log.exists() else []
@@ -218,6 +224,69 @@ mock_mcp_verify() { :; }
                     self.assertEqual(len(paths), 2, calls)
                     for args in paths:
                         self.assertEqual(args[args.index("--role") + 1], "counsel")
+
+    def test_remote_preflight_preserves_implicit_counsel_without_report(self):
+        for model, purpose, extra in (
+            ("codex-astra", None, ()),
+            ("codex-astra", "architect", ()),
+            ("fable", None, ("--operator-request", "hk:doc/ordinary/request",
+                              "--requested-by", "operator")),
+        ):
+            with self.subTest(model=model, purpose=purpose):
+                process, calls = self.run_spawn(model=model, role=None, ref=None,
+                    purpose=purpose, extra=extra, report=False, remote_preflight=True)
+                self.assertEqual(process.returncode, 91, process.stderr)
+                self.assertEqual(calls, [])
+        process, _ = self.run_spawn(model="codex-luna", role="worker", ref=None,
+            purpose=None, report=False, remote_preflight=True)
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertIn("requires --report", process.stderr)
+
+    def test_parent_symlink_refuses_before_claim_read(self):
+        parent = self.base / "jobs/b1632-sol"
+        outside = self.base / "outside-parent"
+        parent.rename(outside)
+        parent.symlink_to(outside, target_is_directory=True)
+        for preflight in (False, True):
+            for owner in ((), ("--owner", "desk")):
+                with self.subTest(preflight=preflight, owner=owner):
+                    process, calls = self.run_spawn(remote_preflight=preflight,
+                        extra=(*owner, "--report", str(self.base / "jobs/fixture-tester/report.md")))
+                    self.assertEqual(process.returncode, 2, process.stderr)
+                    self.assertIn("parent job directory must stay in the trusted inbox", process.stderr)
+                    self.assertEqual(calls, [])
+        # A malformed outside claim must not be read before containment either.
+        (outside / "events/00001-job.claim.json").write_text("not JSON")
+        process, calls = self.run_spawn(extra=("--owner", "desk"))
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertIn("parent job directory must stay in the trusted inbox", process.stderr)
+        self.assertEqual(calls, [])
+        parent.unlink()
+        parent.symlink_to(parent, target_is_directory=True)
+        process, calls = self.run_spawn(extra=("--owner", "desk"))
+        self.assertEqual(process.returncode, 2, process.stderr)
+        self.assertIn("parent job directory must stay in the trusted inbox", process.stderr)
+        self.assertEqual(calls, [])
+
+    def test_parent_owner_controls_cannot_reframe_report(self):
+        for preflight in (False, True):
+            with self.subTest(preflight=preflight):
+                process, _ = self.run_spawn(extra=("--owner", "desk"), remote_preflight=preflight)
+                self.assertEqual(process.returncode, 91, process.stderr)
+                for owner in ("desk\n" + str(self.base / "outside.md"), "desk\tbad"):
+                    process, _ = self.run_spawn(extra=("--owner", owner), remote_preflight=preflight)
+                    self.assertEqual(process.returncode, 2, process.stderr)
+                    self.assertIn("--owner", process.stderr)
+
+    def test_parent_report_symlink_control_characters_are_refused(self):
+        alias = self.base / "jobs/b1632-sol/report-alias.md"
+        target = self.base / "jobs/b1632-sol/name\npart.md"
+        alias.symlink_to(target)
+        for preflight in (False, True):
+            with self.subTest(preflight=preflight):
+                process, _ = self.run_spawn(extra=("--report", str(alias)), remote_preflight=preflight)
+                self.assertEqual(process.returncode, 2, process.stderr)
+                self.assertIn("--report", process.stderr)
 
     def test_implicit_round_extension_requires_explicit_role(self):
         for model in ("codex-astra", "fable"):

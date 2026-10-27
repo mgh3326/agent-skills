@@ -189,6 +189,8 @@ takeover_spawn() {
   MODEL=builder-sol LABEL=new-builder spawn_try -- "$@" --role builder --lane new-lane --parent director-1
 }
 
+bash "$ROOT/tests/test-wrk-parent.sh"
+
 echo "== AC1: --task required / usage errors before any side effect =="
 
 # A1: --role builder without --task dies at usage, nothing reached.
@@ -429,7 +431,7 @@ echo "== AC1 inheritance: tester/advisory spawns take the parent task =="
 reset_case d1
 mkparent parent-job-1 9009
 hk_add --id 9009 >/dev/null
-spawn_try -- --parent-job parent-job-1 --job d1-tester
+spawn_try -- --parent-job parent-job-1 --report "$INBOX/parent-job-1/verdict.md" --job d1-tester
 expect_rc 0 "tester spawn inherits via --parent-job"
 claim_payload="$(event_payload d1-tester job.claim)"
 grep -qE '"task_id" *: *9009' <<<"$claim_payload" ||
@@ -471,7 +473,7 @@ echo "PASS d3 ARBITER_JOB pane-env inheritance"
 # D4: parent claim with no task_id refuses to guess.
 reset_case d4
 mkparent parent-job-4
-spawn_try -- --parent-job parent-job-4 --job d4-worker
+spawn_try -- --parent-job parent-job-4 --report "$INBOX/parent-job-4/verdict.md" --job d4-worker
 expect_rc 2 "parent without task_id must not be guessed"
 expect_grep 'no task_id\|--task' "$TMP/stderr.txt" "error must direct to --task"
 no_job_dir d4-worker "no job for an unresolvable task"
@@ -481,7 +483,7 @@ echo "PASS d4 taskless parent job refuses to guess"
 reset_case d5
 mkparent parent-job-5 9012
 hk_add --id 9012 >/dev/null; hk_add --id 9099 >/dev/null
-spawn_try -e HK_TASK_ID=9099 -- --parent-job parent-job-5 --job d5-worker
+spawn_try -e HK_TASK_ID=9099 -- --parent-job parent-job-5 --report "$INBOX/parent-job-5/verdict.md" --job d5-worker
 expect_rc 2 "parent task vs HK_TASK_ID mismatch must refuse"
 expect_grep 'refusing to guess' "$TMP/stderr.txt" "mismatch must fail closed"
 echo "PASS d5 contradicting task sources refuse"
@@ -494,7 +496,7 @@ mkparent parent-job-6 9013
 printf '%s\n' 'not-json{{{' \
   >"$INBOX/parent-job-6/events/00002-job.reclaim.json"
 hk_add --id 9013 >/dev/null
-spawn_try -- --parent-job parent-job-6 --job d6-worker
+spawn_try -- --parent-job parent-job-6 --report "$INBOX/parent-job-6/verdict.md" --job d6-worker
 expect_rc 2 "corrupt newest parent event must refuse"
 expect_grep 'unreadable' "$TMP/stderr.txt" "corrupt newest must be named"
 no_job_dir d6-worker "no job for an unreadable parent event"
@@ -509,7 +511,7 @@ mkparent_reclaim parent-job-7 9014
 printf '%s\n' '{"kind":"job.claim","created_at":"2026-01-01T00:00:00Z","payload":"garbage"}' \
   >"$INBOX/parent-job-7/events/00000-job.claim.json"
 hk_add --id 9014 >/dev/null
-spawn_try -- --parent-job parent-job-7 --job d7-worker
+spawn_try -- --parent-job parent-job-7 --report "$INBOX/parent-job-7/verdict.md" --job d7-worker
 expect_rc 0 "a valid newest event wins over a corrupt older one"
 claim_payload="$(event_payload d7-worker job.claim)"
 grep -qE '"task_id" *: *9014' <<<"$claim_payload" ||
@@ -528,7 +530,7 @@ doc = json.loads(open(p, encoding="utf-8").read())
 doc["payload"]["task_id"] = "oops"
 open(p, "w", encoding="utf-8").write(json.dumps(doc) + "\n")
 PY
-spawn_try -- --parent-job parent-job-8 --task-hk-bypass --job d8-worker
+spawn_try -- --parent-job parent-job-8 --report "$INBOX/parent-job-8/verdict.md" --task-hk-bypass --job d8-worker
 expect_rc 2 "file-only task id must refuse despite bypass"
 expect_grep 'claim mismatch' "$TMP/stderr.txt" "the forged field must be named"
 no_job_dir d8-worker "no job for a malformed inherited task"
@@ -635,7 +637,7 @@ grep -qE '"job_id" *: *"new-job"' <<<"$round_escalate" || fail "round-cap escala
 
 # A tester inheriting from NEW reads the task_id recorded by NEW's arbiter
 # claim and does not change the binding.
-spawn_try -- --role tester --parent-job new-job --job new-job-tester
+spawn_try -- --role tester --parent-job new-job --report "$INBOX/new-job/verdict.md" --job new-job-tester
 expect_rc 0 "tester inheritance from takeover job"
 child_claim="$(event_payload new-job-tester job.claim)"
 grep -qE '"task_id" *: *1' <<<"$child_claim" || fail "tester child must inherit NEW task: $child_claim"

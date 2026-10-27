@@ -9,7 +9,13 @@ truncates — and applies the section-1 mapping rule in order:
   2. changed files, only when the task has a PR ref and --with-files is
      given (`gh pr view <ref> --json files`; the area owning >=60% of
      changed lines wins, skipped and noted when gh is unavailable);
-  3. title keywords from director/area-rules.json (never inline regex);
+  3. title keywords from director/area-rules.json (never inline regex); an
+     entry with a "projects" list applies only to those projects, where ""
+     is the projectless task (hk 2012: fleet terms stay off product repos);
+     a product repo (a project default outside fleet_projects) keeps its
+     default unless the title area is in project_areas for that project,
+     or the title opens with an exact [area] tag naming a known area; a
+     fleet repo's default holds unless the title area is shell-wrk;
   4. the project default from the same file.
 
 Smoke/throwaway titles are excluded before the files stage — the packet
@@ -51,6 +57,7 @@ STATES = ("backlog", "claimed", "in_progress", "verifying", "join",
 LIST_LIMIT = 1000  # the server's accepted maximum
 TITLE_WIDTH = 60
 FILE_RULE_MIN_SHARE = 0.6
+TAG_RE = re.compile(r"\[([^\[\]]+)\]")
 COLUMNS = ("id", "project", "title", "current_area", "proposed_area",
            "source", "rule", "confirm")
 
@@ -123,6 +130,26 @@ def load_rules(path: Path, vocabulary: list[str]) -> dict:
     if unknown:
         die(f"rules file names areas outside the hk vocabulary: "
             f"{sorted(unknown)}")
+    for entry in rules["title_keywords"]:
+        scope = entry.get("projects")
+        if scope is not None and not (
+                isinstance(scope, list)
+                and all(isinstance(p, str) for p in scope)):
+            die(f"rules file holds a bad projects scope: {entry.get('area')}")
+    rules.setdefault("fleet_projects", [])
+    rules.setdefault("project_areas", {})
+    if not (isinstance(rules["fleet_projects"], list)
+            and all(isinstance(p, str) for p in rules["fleet_projects"])):
+        die("rules file holds a bad fleet_projects list")
+    if not (isinstance(rules["project_areas"], dict) and all(
+            isinstance(v, list) and all(isinstance(a, str) for a in v)
+            for v in rules["project_areas"].values())):
+        die("rules file holds a bad project_areas map")
+    named = {a for v in rules["project_areas"].values() for a in v}
+    if named - known:
+        die(f"rules file names specific areas outside the hk vocabulary: "
+            f"{sorted(named - known)}")
+    rules["_areas"] = known
     try:
         rules["_exclude"] = [re.compile(p, re.IGNORECASE)
                              for p in rules["exclude_title_patterns"]]
@@ -206,12 +233,28 @@ def classify(task: dict, rules: dict, with_files: bool, gh: str,
             area, pct = files_area(pr_ref, rules, gh, gh_missing)
             if area:
                 return area, "files", f"files:{pct}%"
+    project = clean(task.get("project"))
+    default = rules["project_defaults"].get(project)
+    # hk 2012 rule 1: a repo default holds unless a title term names an area
+    # it allows: a product repo's own specific areas, or shell-wrk on a
+    # fleet repo.
+    specific = {default} | set(rules["project_areas"].get(project, []))
+    if default and project in rules["fleet_projects"]:
+        specific = {default, "shell-wrk"}
+    # hk 2012 tag rule: an exact leading [area] tag naming a known area
+    # states the area outright and overrides a repo default.
+    tag = TAG_RE.match(title)
+    if default and tag and tag.group(1) in rules["_areas"]:
+        return tag.group(1), "title", f"tag:[{tag.group(1)}]"
     for entry in rules["title_keywords"]:
+        scope = entry.get("projects")
+        if scope is not None and project not in scope:
+            continue
+        if default and entry["area"] not in specific:
+            continue
         for pattern in entry["_re"]:
             if pattern.search(title):
                 return entry["area"], "title", f"title:{pattern.pattern}"
-    project = clean(task.get("project"))
-    default = rules["project_defaults"].get(project)
     if default:
         return default, "project", f"project:{project}"
     return "", "-", "-"
