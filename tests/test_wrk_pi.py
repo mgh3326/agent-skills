@@ -200,12 +200,64 @@ else:
 
     def test_model_proof_failures_close_pane(self):
         for scenario in ("wrong-model", "wrong-thinking", "wrong-provider", "missing",
-                         "echo", "stale", "no-provider"):
+                         "echo", "stale", "prefix-model", "truncated-stats"):
             with self.subTest(scenario=scenario):
                 (self.tmp / "herdr.log").unlink(missing_ok=True)
                 result = self.spawn(WRK_PI_SCENARIO=scenario)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("pi model not proven", result.stderr)
+                self.assertIn("pane close w:p1", self.log())
+                self.assertNotIn("OK pane=", result.stdout)
+
+    def test_real_footer_proves_every_profile_and_effort(self):
+        # Default fixture = real pi 1.4.0 footer: "model • effort", no provider part.
+        for profile, model in PROFILES.items():
+            for effort in ("low", "medium", "high", "xhigh", "max"):
+                with self.subTest(profile=profile, effort=effort):
+                    (self.tmp / "pi-model.log").unlink(missing_ok=True)
+                    result = self.spawn(profile=profile, effort=effort)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("landed=yes", result.stdout)
+                    self.assertEqual(self.log("pi-model.log").strip(), f"{model}:{effort}")
+
+    def test_provider_footer_form_still_proves(self):
+        for profile in PROFILES:
+            with self.subTest(profile=profile):
+                result = self.spawn(profile=profile, effort="xhigh",
+                                    WRK_PI_SCENARIO="provider-form")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+
+    def test_real_footer_shapes_prove(self):
+        # Full 1.4.0 stats prefix with "(auto)", and a branch/session suffix on the cwd row.
+        for profile in PROFILES:
+            for scenario in ("full-stats", "cwd-suffix"):
+                with self.subTest(profile=profile, scenario=scenario):
+                    result = self.spawn(profile=profile, effort="low", WRK_PI_SCENARIO=scenario)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("landed=yes", result.stdout)
+
+    def test_pi_footer_fail_closed_shapes(self):
+        # Invariant: footer row 2 must carry the exact launched model id and
+        # exact effort. Wrong model, wrong effort, prefix-only model ids and
+        # truncated rows all close the pane; nothing else can stand in for them.
+        cases = (
+            ("pi-haiku55", "high", "wrong-model-sonnet"),
+            ("pi-haiku55", "low", "wrong-thinking-high"),
+            ("pi-sonnet55", "high", "wrong-thinking"),
+            ("pi-haiku55", "high", "prefix-model"),
+            ("pi-haiku55", "high", "truncated-stats"),
+            ("pi-sonnet55", "high", "extension-match"),
+        )
+        for profile, effort, scenario in cases:
+            with self.subTest(profile=profile, effort=effort, scenario=scenario):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
+                result = self.spawn(profile=profile, effort=effort, WRK_PI_SCENARIO=scenario)
+                model = PROFILES[profile].split("/", 1)[1]
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("pi model not proven", result.stderr)
+                self.assertIn(f"expected footer '{model} • {effort}' (provider part optional)",
+                              result.stderr)
                 self.assertIn("pane close w:p1", self.log())
                 self.assertNotIn("OK pane=", result.stdout)
 
@@ -389,6 +441,15 @@ class PiMutantTests(unittest.TestCase):
             "stats-row": ('sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)',
                           'sys.exit(0 if any(re.fullmatch(pattern, row) for row in footer) else 1)',
                           "test_footer_boundaries"),
+            # Invariant: the effort in footer row 2 equals PI_THINKING exactly.
+            "effort": ('re.escape(effort) + r"$")', 'r"[a-z]+$")',
+                       "test_pi_footer_fail_closed_shapes"),
+            # Invariant: the model id matches whole, never as a substring or prefix.
+            "model-substring": ('re.escape(model) + r" • "', 'r"\\S*" + re.escape(model) + r"\\S* • "',
+                                "test_pi_footer_fail_closed_shapes"),
+            # Invariant: the optional provider part is exactly the expected provider.
+            "provider-any": ('re.escape(provider) +', 'r"[a-z]+" +',
+                             "test_model_proof_failures_close_pane"),
         }
         for name, (old, new, method) in mutants.items():
             with self.subTest(mutant=name):
