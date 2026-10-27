@@ -19,8 +19,7 @@
   "ci": {
     "mgh3326/agent-skills": {
       ".github/workflows/ci.yml": [
-        "ubuntu-latest",
-        "macos-latest"
+        "ci-ok"
       ]
     },
     "mgh3326/auto_trader": {
@@ -69,11 +68,8 @@
   },
   "ci_execution_steps": {
     "mgh3326/agent-skills": {
-      "macos-latest": [
-        "Bash tests"
-      ],
-      "ubuntu-latest": [
-        "Bash tests"
+      "ci-ok": [
+        "Check required results"
       ]
     },
     "mgh3326/auto_trader": {
@@ -2295,11 +2291,10 @@
   },
   "required_ci_jobs_by_repo": {
     "agent-skills": [
-      "ubuntu-latest",
-      "macos-latest"
+      "ci-ok"
     ]
   },
-  "revision": "2026-10-27.4",
+  "revision": "2026-10-27.5",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
@@ -2331,8 +2326,8 @@
   "schema": 1,
   "sources": {
     ".github/workflows/ci.yml": {
-      "id": "shell-and-bash-tests",
-      "scope": "required CI matrix job names"
+      "id": "ci-ok",
+      "scope": "single required merge-gating check; ci-ok consolidates Ubuntu shards and macos-smoke"
     },
     "advice/2026-09-25/director-throughput-astra": {
       "id": 3243,
