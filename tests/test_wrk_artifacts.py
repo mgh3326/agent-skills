@@ -94,6 +94,44 @@ class ArtifactsContract(unittest.TestCase):
         self.assertIn(str(guarded), report["never_touch"])
         self.assertIn({"path": str(heavy), "bytes": 60 * 1024 * 1024}, report["unclassified"])
 
+    def test_classifier_uses_shared_never_touch_guard_for_every_class(self):
+        job = self.jobs / "guarded-job"
+        (job / "events").mkdir(parents=True)
+        (job / "events/0001.json").write_text("event", encoding="utf-8")
+        (job / "refs/deep").mkdir(parents=True)
+        (job / "refs/deep/held.bin").write_bytes(b"ref")
+        (job / "cache-holder").mkdir()
+        (job / "cache-holder/payload.bin").write_bytes(b"cache")
+        (job / "cache-holder/refs").mkdir()
+        (job / "cache-holder/refs/held.bin").write_bytes(b"held")
+        (job / "report-notes.md").write_text("report", encoding="utf-8")
+        (job / "unity/Proj").mkdir(parents=True)
+        (job / "unity/Proj/run.log").write_text("log", encoding="utf-8")
+        (job / "completion-sentinel.log").write_text("sentinel", encoding="utf-8")
+        (job / "worker.pid").write_text("123", encoding="utf-8")
+        (job / "final-report.txt").write_text("report", encoding="utf-8")
+        os.symlink("refs/deep/held.bin", job / "cache-link")
+        classes = ("record-text", "evidence", "final-build", "cache", "protected", "worktree")
+        self.policy["rows"] = [self.row(cls, glob="**") for cls in classes]
+        self.policy["rows"].insert(3, self.row("intermediate-build", glob="**", keep_newest=1))
+        self.write_policy()
+
+        result = self.run_wrk("artifacts", "classify", "--job", "guarded-job", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        report = json.loads(result.stdout)["jobs"]["guarded-job"]
+        expected = (
+            job / "events", job / "events/0001.json", job / "refs",
+            job / "refs/deep/held.bin", job / "cache-holder", job / "cache-link",
+            job / "report-notes.md", job / "unity/Proj/run.log",
+            job / "completion-sentinel.log", job / "worker.pid", job / "final-report.txt",
+        )
+        for path in expected:
+            self.assertIn(str(path), report["never_touch"])
+        for cls in ("record-text", "evidence", "final-build", "intermediate-build", "cache", "worktree"):
+            paths = {item["path"] for item in report["classes"].get(cls, {}).get("paths", [])}
+            self.assertTrue(paths.isdisjoint(str(path) for path in expected), (cls, paths))
+        self.assertIn("protected", report["classes"])
+
     def test_host_filtering_flat_root_and_job_key(self):
         (self.flat / "one.bin").write_bytes(b"flat")
         (self.jobs / "j1").mkdir()
