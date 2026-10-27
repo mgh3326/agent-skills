@@ -7518,6 +7518,8 @@ sentinel_log() {
 # job_events_scan EVENTS_DIR... — one TSV row per job:
 #   job \t ended \t hub_ended \t terminal_kind \t last_event_age_s \t last_kind
 #       \t completed_n \t owner \t label \t pane \t tab
+# last_event_age_s / last_kind  housekeeping records (job.artifacts_pruned)
+#               are not job activity and never count for either
 # ended         a work-terminal record exists after the newest revive
 # hub_ended     a hub-terminal record exists after the newest revive
 # terminal_kind the newest work-terminal kind ("-" when not ended)
@@ -7535,6 +7537,13 @@ REVIVE = {"job.claim", "job.claimed", "job.reclaim", "job.spawned", "job.repromp
 NEUTRAL = {"job.lost", "job.recovered"}
 if NEUTRAL & (WORK_TERMINAL | HUB_TERMINAL | REVIVE):
     raise SystemExit("neutral event kind is also terminal or revive")
+# Housekeeping records are the fleet's own bookkeeping about a job, not job
+# activity: wrk prune appends job.artifacts_pruned for each removal, and
+# counting it would restart the --heavy-age clock of a job's cache rows and
+# the --stale-age clock of a job that has not ended on every prune.
+HOUSEKEEPING = {"job.artifacts_pruned"}
+if HOUSEKEEPING & (WORK_TERMINAL | HUB_TERMINAL | REVIVE):
+    raise SystemExit("housekeeping event kind is also terminal or revive")
 now = time.time()
 
 
@@ -7565,6 +7574,8 @@ for events in sys.argv[1:]:
         if not isinstance(payload, dict):
             payload = {}
         kind = doc.get("kind") or doc.get("type") or doc.get("event") or ""
+        if kind in HOUSEKEEPING:
+            continue
         # The loop is already in the shared order, so the last readable row is
         # the newest kind; only the raw time is a max for the age field.
         last_t = max(last_t, when)
@@ -13591,7 +13602,8 @@ PY
 }
 
 prune_help() {
-  cat <<'USAGE'
+  local text
+  IFS= read -r -d '' text <<'USAGE' || true
 Usage: wrk prune [--apply] [--stale-age AGE] [--heavy-age AGE]
                  [--job JOB] [--lane LANE] [--policy PATH]
 
@@ -13622,16 +13634,30 @@ Report — and with --apply, remove — what ended or stale jobs leave behind:
         or when an mtime is unreadable
     Other classes — evidence, final-build, record text — are out of scope
     and rejected on load: the artifact-store sweeper uploads them first
-    (design hk:doc designs/b953/artifact-store). A symlinked match is
-    unlinked, never traversed; a match whose real path leaves the job dir
-    is refused; a unity path is skipped while the pa unity lock
-    (/tmp/pa-m1-unity.lock) is held; any path a live process still has open
-    (lsof) is skipped; a job's events dir, any refs dir and the jobs-root
-    asset-store-packs entry are never touched. Every removal prints its
-    class and bytes, appends a job.artifacts_pruned event for a jobs-root
-    match, and logs to <jobs-root>/prune.log for the other roots. An
-    invalid policy (unknown keys, an absolute or .. glob, a glob that
-    leaves the job dir) refuses the whole pass.
+    (design hk:doc designs/b953/artifact-store). A symlinked match inside
+    the job dir is unlinked, never traversed; a match whose real path
+    leaves the job dir is refused; a unity path is skipped while the pa
+    unity lock (/tmp/pa-m1-unity.lock) is held; any path a live process
+    still has open (lsof) is skipped. Every removal prints its class and
+    bytes, appends a job.artifacts_pruned event for a jobs-root match,
+    and logs to <jobs-root>/prune.log for the other roots. An invalid
+    policy (unknown keys, an absolute or .. glob, a glob that leaves the
+    job dir) refuses the whole pass.
+    Never touched, whatever the policy rows say: at any depth under a job
+    dir, a path whose own name or any ancestor name matches one of
+      @NEVER_TOUCH@
+    (names are matched case-insensitively; a job dir of such a name is
+    wholly guarded). A match that is such a path, sits under one, or is a
+    directory holding one (or a link to one, or another refused match) is
+    refused, and a refused match takes no keep_newest slot. A symlink
+    match is held to the same rule and to the job-dir containment: it is
+    checked where it physically sits and at its resolved target, and a
+    link whose either end hits the set or leaves the job dir is refused,
+    not unlinked. A name with a control character cannot be framed in the
+    scan record and is refused (unsafe-path). Under a recursive glob a
+    dropped match that holds a kept match, or sits inside one, stays. A
+    glob with more than 20000 matches in one job dir (a symlink cycle
+    under ** does that) skips the job (scan-failed).
 
 Dry-run is the default and prints one line per item with job id, pid, age,
 pane state and the exact reason it is or is not an orphan. --apply stops
@@ -13655,6 +13681,12 @@ Periodic hook: WRK_PRUNE_ON_SPAWN=1 runs this same --apply pass detached at
 the end of every `wrk spawn`. Off by default; enable only after director-1
 approves. Output appends to <jobs-root>/prune.log.
 USAGE
+  # The never-touch set is one definition (PRUNE_NEVER_TOUCH); the text
+  # above carries a placeholder so help can never drift from the scanner.
+  local set_text
+  set_text="$(printf '%s\n' "$PRUNE_NEVER_TOUCH" | fold -s -w 60 |
+    sed -e 's/ *$//' -e '2,$s/^/      /')"
+  printf '%s' "${text//@NEVER_TOUCH@/$set_text}"
 }
 
 # prune_sentinel_row JOB PID PIDFILE ARGV_PANE ARGV_OWNER STARTED — classify
@@ -13778,6 +13810,16 @@ prune_sentinel_row() {
 # refused. Evidence, final builds and record text are out of scope — the
 # artifact-store sweeper (designs/b953/artifact-store) uploads them first.
 
+# The never-touch set: the ONE definition. The scanner enforces it on every
+# match — file, directory or link — and wrk prune --help prints it. Names,
+# not paths: a hit on a path's own name or on any ancestor name (below the
+# job dir, or the job dir itself) guards the path; fnmatch patterns, matched
+# case-insensitively. Record text (events, reports, briefs, verdicts, state,
+# final reports), run evidence (run.log, meta.txt), liveness (sentinel and
+# pid files) and the asset store are never this pass's to remove, whatever a
+# policy row (runtime data, extended by pa-integrator) globs.
+PRUNE_NEVER_TOUCH='events refs asset-store-packs report*.md brief*.md spawn-brief* verdict*.md run.log meta.txt completion-sentinel.* *.pid state.md final-report*'
+
 # prune_artifact_policy_default — the shipped policy next to this script's
 # real location (a symlinked ~/.local/bin/wrk resolves to the repo clone).
 prune_artifact_policy_default() {
@@ -13791,6 +13833,7 @@ print(os.path.join(os.path.dirname(os.path.dirname(
 # one TSV row per rule: class, root name, resolved absolute root, glob and
 # keep_newest ("" for cache). Any violation prints REFUSE<TAB>reason and
 # exits 3: a broken policy must refuse the whole pass, never be half-applied.
+# Rows print only once every row has passed, so a refusal is that one line.
 prune_artifact_policy_load() {
   python3 - "$1" "$2" <<'PY'
 import json, os, re, sys
@@ -13831,6 +13874,7 @@ for name, rel in roots.items():
 rows = doc["rows"]
 if not isinstance(rows, list):
     refuse("rows must be a list")
+out = []   # printed only after every row passes: a refusal prints nothing else
 for index, row in enumerate(rows):
     if not isinstance(row, dict):
         refuse("row %d is not an object" % index)
@@ -13858,21 +13902,48 @@ for index, row in enumerate(rows):
             refuse("row %d keep_newest must be 1 or 2" % index)
     elif keep is not None:
         refuse("row %d keep_newest is only valid for intermediate-build" % index)
-    print("\t".join((cls, root, resolved[root], pat,
-                     "" if keep is None else str(keep))))
+    out.append("\t".join((cls, root, resolved[root], pat,
+                          "" if keep is None else str(keep))))
+for line in out:
+    print(line)
 PY
 }
 
 # prune_artifact_scan JOBDIR GLOB — one TSV per match:
-#   kind(real|link|outside)  path  newest-mtime-inside(- if unreadable)  bytes
-# A symlink match is "link" (unlink it, never traverse). A non-symlink match
-# whose realpath escapes the job dir — through a symlinked ancestor — is
-# "outside" and must be refused, never removed. The job dir itself can never
-# be a match.
+#   kind  path  newest-mtime-inside(- if unreadable)  bytes
+# A candidate (real, link) is named by its physical seat: its parent resolved,
+# its own name kept, written under JOBDIR with no . component, no symlinked
+# ancestor and no trailing slash. glob returns one entry under several names (a
+# **/./* pattern, a symlinked directory inside the job dir); the pass compares
+# paths as strings, so the scan collapses those names to one record and lets a
+# refusal of any name refuse the seat. A refused record keeps the matched name.
+# kind is one of
+#   real     a file or directory inside the job dir, nothing on it never-touch
+#   link     a symlink match (unlink it, never traverse): the link and its
+#            resolved target are both inside the job dir and hit nothing
+#   outside  the real path (a link: where it sits or where it points) leaves
+#            the job dir — through a symlinked ancestor or a link target
+#   guarded  the path hits PRUNE_NEVER_TOUCH: its own name or any ancestor
+#            name, lexically or physically (a link: where it sits and where
+#            it points), or the job dir itself carries such a name
+#   holds    a directory match whose subtree holds a never-touch name, a link
+#            that points at one, or another refused match (or cannot be
+#            read to prove it does not): removing it would remove it
+#   unsafe   a name with a control character (newline, tab ...): it cannot
+#            be framed in this tab-separated record, so it is refused and
+#            printed escaped; a record must never be forgeable from a name
+# outside, guarded, holds and unsafe are refused, never removed; they print
+# "-" and 0.
+# The never-touch contract lives in this scanner so no policy row — runtime
+# data, extended by pa-integrator — can widen what the pass may delete. The
+# job dir itself can never be a match.
 prune_artifact_scan() {
-  python3 - "$1" "$2" <<'PY'
-import glob, os, sys
+  python3 - "$1" "$2" "$PRUNE_NEVER_TOUCH" <<'PY'
+import fnmatch, glob, itertools, os, sys
 jobdir, pattern = sys.argv[1], sys.argv[2]
+NEVER = [pat.casefold() for pat in sys.argv[3].split()]
+if not NEVER:
+    raise SystemExit(1)   # no set to enforce: fail closed, scan nothing
 try:
     job_real = os.path.realpath(jobdir)
 except OSError:
@@ -13919,28 +13990,164 @@ def newest_mtime(root):
     return newest
 
 
-# A match under the job's events stream, a refs dir, or a root entry named
-# asset-store-packs is on the never-touch list (record text and the asset
-# store are the sweeper's, not this pass's); "guarded" matches are refused.
-jobbase = os.path.basename(job_real)
-for match in sorted(glob.glob(os.path.join(jobdir, pattern), recursive=True)):
+def hits(names):
+    """Any of NAMES matches the never-touch set (case-insensitive)."""
+    return any(fnmatch.fnmatchcase(name.casefold(), pat)
+               for name in names for pat in NEVER)
+
+
+def below(real):
+    """The components of REAL under the job dir; None when REAL is outside."""
+    if real == job_real:
+        return []
+    if real.startswith(job_real + os.sep):
+        return real[len(job_real) + 1:].split(os.sep)
+    return None
+
+
+def guard(match, ends):
+    """The refusal kind for MATCH, or None. ENDS are the physical places it
+    touches: a file or directory, its real path; a link, where it sits and
+    where it points. Files, directories and links all go through here."""
+    if hits(os.path.relpath(match, jobdir).split(os.sep)) or \
+            hits([os.path.basename(job_real)]):
+        return "guarded"
+    inside = [below(end) for end in ends]
+    if any(parts is None for parts in inside):
+        return "outside"
+    if any(hits(parts) for parts in inside):
+        return "guarded"
+    return None
+
+
+def holds_never_touch(root):
+    """A never-touch name anywhere below ROOT, a link below ROOT that points
+    at one, or a subtree that cannot be read to prove there is none. Links
+    are listed and resolved, never traversed; a link out of the job dir only
+    loses the link when ROOT goes, so only a target inside it counts."""
+    unreadable = []
+    for base, dirs, files in os.walk(root, onerror=unreadable.append):
+        if hits(dirs + files):
+            return True
+        for name in dirs + files:
+            full = os.path.join(base, name)
+            if os.path.islink(full):
+                parts = below(os.path.realpath(full))
+                if parts is not None and hits(parts):
+                    return True
+    return bool(unreadable)
+
+
+def seat_of(match):
+    """The physical place MATCH names: its parent resolved, its own name kept
+    (a link is not followed). normpath first, so a trailing slash or a . in the
+    glob result cannot change the answer."""
+    norm = os.path.normpath(match)
+    return os.path.join(os.path.realpath(os.path.dirname(norm)),
+                        os.path.basename(norm))
+
+
+def classify(match):
+    """(kind, seat): real, link, outside, guarded, holds or unsafe; kind is
+    None for the job dir itself."""
+    seat = seat_of(match)
+    if any(ord(ch) < 32 or ord(ch) == 127 for ch in match):
+        return "unsafe", seat
     if os.path.islink(match):
-        kind = "link"
+        # The seat is where the link sits (its ancestors resolved): unlinking
+        # refs/x through a symlinked ancestor unlinks the real refs/x.
+        return guard(match, (seat, os.path.realpath(match))) or "link", seat
+    real = os.path.realpath(match)
+    refused = guard(match, (real,))
+    if refused:
+        return refused, seat
+    if real == job_real:
+        return None, seat
+    if os.path.isdir(match) and holds_never_touch(match):
+        return "holds", seat
+    return "real", seat
+
+
+def named(seat):
+    """SEAT written under JOBDIR (the form the pass compares), or None."""
+    parts = below(seat)
+    return os.path.join(top, *parts) if parts else None
+
+
+REFUSED = ("outside", "guarded", "holds", "unsafe")
+top = os.path.normpath(jobdir)
+found = []
+# glob follows a symlink to a directory under **, so a link cycle inside the job
+# dir (or two links pointing at each other) makes the match list effectively
+# endless. Take at most MAX_MATCHES lazily; a pattern that wide is not a match
+# list worth acting on, and the pass skips the job (scan-failed).
+MAX_MATCHES = 20000
+raw = list(itertools.islice(
+    glob.iglob(os.path.join(jobdir, pattern), recursive=True), MAX_MATCHES + 1))
+if len(raw) > MAX_MATCHES:
+    raise SystemExit(1)
+for match in sorted(raw):
+    # glob("X/**") yields "X/" even when X does not exist; that is no match.
+    if not os.path.lexists(match):
+        continue
+    kind, seat = classify(match)
+    if kind is not None:
+        found.append((match, kind, seat))
+# One physical entry, one verdict: a refusal of any name for a seat refuses the
+# seat (refs/payload and cache/payload may be the same file).
+refused_seats = {seat for _, kind, seat in found if kind in REFUSED}
+# A directory that contains a refused seat cannot be removed whole: the removal
+# would take the refused entry with it. Every physical ancestor, up to the job
+# dir, is held.
+held = set()
+for _, kind, seat in found:
+    if kind in REFUSED:
+        ancestor = os.path.dirname(seat)
+        while ancestor.startswith(job_real + os.sep) and ancestor not in held:
+            held.add(ancestor)
+            ancestor = os.path.dirname(ancestor)
+emitted = set()
+for match, kind, seat in found:
+    if kind == "unsafe":
+        print("unsafe\t%s\t-\t0" % ascii(match)[1:-1])
+    elif kind in ("outside", "guarded"):
+        print("%s\t%s\t-\t0" % (kind, match))
+    elif seat in emitted or (kind in ("real", "link") and seat in refused_seats):
+        continue
     else:
-        try:
-            real = os.path.realpath(match)
-        except OSError:
-            real = ""
-        if real.startswith(job_real + os.sep):
-            rel = real[len(job_real):].split(os.sep)
-            kind = ("guarded" if jobbase == "asset-store-packs" or
-                    rel[1] in ("events", "refs") else "real")
+        emitted.add(seat)
+        path = named(seat)
+        if kind == "real" and seat in held:
+            kind = "holds"
+        if kind == "holds":
+            print("holds\t%s\t-\t0" % path)
         else:
-            kind = "outside"
-    stamp = newest_mtime(match)
-    print("%s\t%s\t%s\t%d" % (kind, match,
-          "-" if stamp is None else str(int(stamp)), tree_size(match)))
+            stamp = newest_mtime(path)
+            print("%s\t%s\t%s\t%d" % (kind, path,
+                  "-" if stamp is None else str(int(stamp)), tree_size(path)))
 PY
+}
+
+# prune_artifact_record_ok JOBDIR KIND PATH MTIME BYTES — the scanner's record,
+# re-checked before anything is done with it: a known kind, an absolute path
+# under JOBDIR, a numeric (or "-") mtime and numeric bytes. A candidate (real,
+# link) is also a normalized path: the scanner names it by its physical seat,
+# so a . or .. component, an empty one or a trailing slash is a forged or broken
+# record. A malformed record fails closed; the removal path never trusts the
+# framing alone. This is the framing layer only: the never-touch set is
+# enforced once, in the scanner.
+prune_artifact_record_ok() {
+  local jobdir="$1" kind="$2" path="$3" mtime="$4" bytes="$5"
+  case "$kind" in
+    real|link) case "$path" in
+                 */./*|*/../*|*//*|*/.|*/..) return 1 ;;
+               esac ;;
+    outside|guarded|holds|unsafe) ;;
+    *) return 1 ;;
+  esac
+  [[ "$path" == "$jobdir"/* ]] || return 1
+  [[ "$mtime" == - || "$mtime" =~ ^[0-9]+$ ]] || return 1
+  [[ "$bytes" =~ ^[0-9]+$ ]]
 }
 
 # prune_artifact_remove PATH — unlink a link or a file, rmtree a real dir.
@@ -14139,15 +14346,17 @@ prune_artifact_pass() {
   work_root="$(dirname "$(dirname "$jobs_root")")"
   parsed="$(prune_artifact_policy_load "$policy" "$work_root")" || rc=$?
   if (( rc != 0 )); then
-    echo "artifact-prune refused: $policy — ${parsed#REFUSE	}"
+    local why="${parsed#REFUSE	}"
+    [[ "$parsed" == REFUSE$'\t'* ]] || why="policy loader failed (rc=$rc)"
+    echo "artifact-prune refused: $policy — $why"
     return 2
   fi
   local jobs_real cls root_name abs_root pattern keep
   jobs_real="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$jobs_root")"
   local job jobdir entry real_root is_jobs reason state
   local scan_out kind match mtime bytes
-  local -a m_kind m_path m_mtime m_bytes todo drop_list
-  local n i k idx poison owner
+  local -a m_kind m_path m_mtime m_bytes todo drop_list kept_list safe_todo is_drop
+  local n i j k idx poison owner held
   while IFS=$'\t' read -r cls root_name abs_root pattern keep; do
     [[ -n "$cls" ]] || continue
     PRUNE_ARTIFACT_ROWS=$(( PRUNE_ARTIFACT_ROWS + 1 ))
@@ -14176,15 +14385,30 @@ prune_artifact_pass() {
       }
       while IFS=$'\t' read -r kind match mtime bytes; do
         [[ -n "$match" ]] || continue
+        prune_artifact_record_ok "$jobdir" "$kind" "$match" "$mtime" "$bytes" || {
+          echo "artifact job=$job class=$cls action=refused reason=malformed-record"
+          continue
+        }
+        # A refused match is reported and is no candidate: it takes no
+        # keep_newest slot, so a never-touch file cannot push the newest real
+        # build out of the keep window.
+        case "$kind" in
+          unsafe)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=unsafe-path"
+            continue ;;
+          outside)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=outside-job-dir"
+            continue ;;
+          guarded)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=never-touch"
+            continue ;;
+          holds)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=holds-never-touch"
+            continue ;;
+        esac
         m_kind+=("$kind") m_path+=("$match")
         m_mtime+=("$mtime") m_bytes+=("$bytes")
         n=$(( n + 1 ))
-        case "$kind" in
-          outside)
-            echo "artifact job=$job class=$cls path=$match action=refused reason=outside-job-dir" ;;
-          guarded)
-            echo "artifact job=$job class=$cls path=$match action=refused reason=never-touch" ;;
-        esac
       done <<<"$scan_out"
       (( n )) || continue
       todo=()
@@ -14219,11 +14443,43 @@ prune_artifact_pass() {
                  done | sort -rn | cut -f2)
         todo=(${drop_list[@]+"${drop_list[@]}"})
       fi
+      # Under a recursive glob the matches nest. A removal takes its whole
+      # subtree, so a dropped match that holds a kept match (an ancestor), sits
+      # inside one, or is the same path stays: the kept match must come through
+      # intact. The scanner names every candidate by its physical seat, so these
+      # string comparisons are exact.
+      is_drop=() kept_list=()
+      for i in ${todo[@]+"${todo[@]}"}; do is_drop[i]=1; done
+      for ((i = 0; i < n; i++)); do
+        [[ "${is_drop[$i]:-0}" == 1 ]] || kept_list+=("$i")
+      done
+      if (( ${#kept_list[@]} && ${#todo[@]} )); then
+        safe_todo=()
+        for i in "${todo[@]}"; do
+          held=0
+          for j in "${kept_list[@]}"; do
+            if [[ "${m_path[$i]}" == "${m_path[$j]}" ||
+                  "${m_path[$j]}" == "${m_path[$i]%/}"/* ||
+                  "${m_path[$i]}" == "${m_path[$j]%/}"/* ]]; then
+              held=1; break
+            fi
+          done
+          if (( held )); then
+            echo "artifact job=$job class=$cls path=${m_path[$i]} action=skipped reason=nested-with-kept-match"
+          else
+            safe_todo+=("$i")
+          fi
+        done
+        todo=(${safe_todo[@]+"${safe_todo[@]}"})
+      fi
       for i in ${todo[@]+"${todo[@]}"}; do
         kind="${m_kind[$i]}"; match="${m_path[$i]}"; bytes="${m_bytes[$i]}"
-        case "$kind" in
-          outside|guarded) continue ;;   # already reported refused above
-        esac
+        # A glob like ** matches a directory and what is inside it; once the
+        # directory went, the inner match is already gone.
+        if [[ ! -e "$match" && ! -L "$match" ]]; then
+          echo "artifact job=$job class=$cls path=$match action=skipped reason=already-gone"
+          continue
+        fi
         if [[ "$match" == */unity/* || "$match" == */unity ]] &&
            prune_artifact_unity_lock_held; then
           echo "artifact job=$job class=$cls path=$match action=skipped reason=unity-lock-held"
