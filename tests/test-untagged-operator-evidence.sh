@@ -58,9 +58,26 @@ KO_OPERATOR = re.compile(r"운영자")
 KO_CLAIM = re.compile(r"확인|승인|보고|컨펌|오케이|전달|\bOK\b", re.I)
 EN_CLAIM = re.compile(
     r"\boperator\b(?!-desk|-request)[^.;\n]{0,30}?"
-    r"\b(?:confirm(?:ed|s)?|approv(?:ed|es|al)|verified|said|told|reported|OK)\b",
+    r"(?P<verb>\b(?:confirm(?:ed|s)?|approv(?:ed|es|al)|verified|said|told|reported|OK)\b)",
     re.I,
 )
+# A claim directly governed by a negation is not a claim (hk 2040 r2: real
+# tester lines denying operator approval were flagged RED). The lists stay
+# small and narrow on purpose:
+#   EN: not, no, never, without, nor, or a word ending in n't — inside the
+#       three words before "operator" or before the matched verb, with no
+#       break in between (a break is . ; : , or the words and, but), so
+#       "not an operator approval" and "without operator approval" clear
+#       while "Not a blocker: the operator approved it." does not.
+#   KO: 없음, 없다, 없이, 않, 아님, 아니 after 운영자 in the same clause (a
+#       clause ends at . ; or a line break) — "운영자 승인 아님" clears.
+EN_NEGATION = re.compile(r"not|no|never|without|nor|\w+n['’]t", re.I)
+EN_BREAK_WORD = re.compile(r"and|but", re.I)
+EN_BREAK_CHAR = re.compile(r"[.;:,]")
+KO_NEGATION = re.compile(r"없음|없다|없이|않|아님|아니")
+KO_CLAUSE_END = re.compile(r"[.;]")
+# Wrapping punctuation that does not break adjacency ("(not an operator …)").
+WORD_WRAP = "\"'()[]{}*_`“”‘’"
 # The two accepted provenance tags (contract block): an operator-desk relay
 # header, or a cited hk:doc key.
 PROVENANCE_TAG = re.compile(r"출처:\s*operator-desk\b|hk:doc[\s/]+[^\s`)]+", re.I)
@@ -118,8 +135,33 @@ def declares_pass(lines: list[str], switches: bool = True) -> bool:
     return False
 
 
+def _en_negated(line: str, pos: int) -> bool:
+    """A negation in the three words before pos, with no break in between."""
+    window = []
+    for token in reversed(line[:pos].split()):
+        if len(window) == 3:
+            break
+        word = token.strip(WORD_WRAP)
+        if EN_BREAK_CHAR.search(token) or EN_BREAK_WORD.fullmatch(word):
+            break
+        window.append(word)
+    return any(EN_NEGATION.fullmatch(word) for word in window)
+
+
+def _ko_operator_claim(line: str) -> bool:
+    if not (KO_OPERATOR.search(line) and KO_CLAIM.search(line)):
+        return False
+    return any(
+        not KO_NEGATION.search(KO_CLAUSE_END.split(line[m.end() :], 1)[0])
+        for m in KO_OPERATOR.finditer(line)
+    )
+
+
 def is_operator_claim(line: str) -> bool:
-    return bool((KO_OPERATOR.search(line) and KO_CLAIM.search(line)) or EN_CLAIM.search(line))
+    for m in EN_CLAIM.finditer(line):
+        if not (_en_negated(line, m.start()) or _en_negated(line, m.start("verb"))):
+            return True
+    return _ko_operator_claim(line)
 
 
 def extract_block(text: str) -> str:
@@ -197,6 +239,29 @@ TAG_ELSEWHERE = """판정: PASS
 - 참고 문서: hk:doc task/2026-09-24/phantom-suggestion-submitted
 - AC3: 운영자 승인 받음
 """
+# Still claims: a negation elsewhere on the line does not clear them when a
+# break (. ; : , or and/but) separates it from "operator"/the verb.
+EN_PLAIN_APPROVAL = """Verdict: PASS
+- Operator approved the merge.
+"""
+KO_PLAIN_CONFIRM = """판정: PASS
+- AC3 확인 근거: 운영자가 확인함
+"""
+EN_SEMICOLON_TAIL = """Verdict: PASS
+- The operator confirmed it; nothing else.
+"""
+EN_COLON_BREAK = """Verdict: PASS
+- Not a blocker: the operator approved it.
+"""
+EN_AND_BREAK = """Verdict: PASS
+- The operator did not object and approved it.
+"""
+EN_COLON_NO = """Verdict: PASS
+- No objection: operator approved.
+"""
+EN_PATH_TOKENS = """Verdict: PASS
+- noted in notes.md, nothing-else: the operator approved it.
+"""
 # The t312 PASS-switch section as it stood before it was voided (trimmed).
 REAL_SWITCH = """# PASS 전환 — 라운드 2 head `9e3f7cb` (2026-09-24)
 
@@ -240,6 +305,13 @@ red_cases = {
     "english": ENGLISH,
     "english-operator-approved": ENGLISH_HYPHEN,
     "tag-on-another-line": TAG_ELSEWHERE,
+    "english-plain-approval": EN_PLAIN_APPROVAL,
+    "korean-plain-confirm": KO_PLAIN_CONFIRM,
+    "english-semicolon-tail": EN_SEMICOLON_TAIL,
+    "english-colon-break": EN_COLON_BREAK,
+    "english-and-break": EN_AND_BREAK,
+    "english-colon-no-objection": EN_COLON_NO,
+    "english-path-tokens": EN_PATH_TOKENS,
 }
 
 HK_TAGGED = """판정: PASS
@@ -306,6 +378,20 @@ ENGLISH_ROLE = """Verdict: PASS
 - `GET /v1/placement/slots`: operator bearer auth (401 unauthenticated; verified against the fixture)
 RISKS: the operator's advertised `relay test` is a stub, so routing/delivery can be reported read-only
 """
+# hk 2040 verdict-r2 real tester lines that DENY operator approval — a
+# negation directly governing the match clears the claim.
+HK2040_DENIAL_BUILDER = """판정: PASS
+- Builder job: b2040-solxh2 (arm-S builder); parent director-1. This is a builder verification request, not an operator approval.
+"""
+HK2040_DENIAL_VERDICT = """판정: PASS
+- No untagged operator phrases were received. This verdict uses no operator confirmation (태그 없는 운영자 문구 수신 없음). The director ruling used is the builder-relayed director-replay-summary-ruling.md, which is a fixed-design interpretation, not an operator approval.
+"""
+EN_WITHOUT_APPROVAL = """Verdict: PASS
+- the exception stayed pending without operator approval
+"""
+KO_DENIAL = """판정: PASS
+- 운영자 승인 아님 — 코드·테스트 근거로 판정
+"""
 green_cases = {
     "real-t312-restored": REAL_RESTORED,
     "english-operator-role": ENGLISH_ROLE,
@@ -317,6 +403,10 @@ green_cases = {
     "rejected": REJECTED,
     "not-pass": NOT_PASS,
     "clean-pass": CLEAN_PASS,
+    "hk2040-denial-builder": HK2040_DENIAL_BUILDER,
+    "hk2040-denial-verdict": HK2040_DENIAL_VERDICT,
+    "english-without-approval": EN_WITHOUT_APPROVAL,
+    "korean-denial": KO_DENIAL,
 }
 
 
@@ -346,6 +436,25 @@ ADJACENT_ONLY = re.compile(
 )
 
 
+def _claim_without_negation(line: str) -> bool:
+    return bool(
+        EN_CLAIM.search(line) or (KO_OPERATOR.search(line) and KO_CLAIM.search(line))
+    )
+
+
+def _claim_unbounded_negation(line: str) -> bool:
+    """Mutant shape: a negation anywhere before the match clears it — no
+    three-word window and no break rule, so ':' or 'and' protect nothing."""
+    for m in EN_CLAIM.finditer(line):
+        if not any(
+            EN_NEGATION.fullmatch(token.strip(WORD_WRAP))
+            for pos in (m.start(), m.start("verb"))
+            for token in line[:pos].split()
+        ):
+            return True
+    return _ko_operator_claim(line)
+
+
 def lint_variant(**overrides):
     return lambda text: untagged_operator_basis(text, **overrides)
 
@@ -365,6 +474,10 @@ mutants = [
     ("switch-detection-removed", lambda: assert_verdict_cases(lint_variant(switches=False))),
     ("adjacent-claim-only", lambda: assert_verdict_cases(
         lint_variant(claim=lambda line: bool(ADJACENT_ONLY.search(line))))),
+    ("negation-check-dropped", lambda: assert_verdict_cases(
+        lint_variant(claim=_claim_without_negation))),
+    ("negation-breaks-ignored", lambda: assert_verdict_cases(
+        lint_variant(claim=_claim_unbounded_negation))),
 ]
 for label, callback in mutants:
     expect_assertion(label, callback)
