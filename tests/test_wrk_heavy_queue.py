@@ -727,7 +727,7 @@ class HeavyQueue(unittest.TestCase):
         response = SimpleNamespace(returncode=0, stdout="  Mon Oct  26 12:00:00 2026  \n")
         with mock.patch.object(subprocess, "run", return_value=response) as run:
             start = ns["process_start"](123)
-            self.assertEqual(start, "macos:" + b"Mon Oct 26 12:00:00 2026".hex())
+            self.assertEqual(start, "macos:" + b"  Mon Oct  26 12:00:00 2026  ".hex())
             self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
             self.assertEqual(run.call_args.args[0], ["ps", "-o", "lstart=", "-p", "123"])
             self.assertEqual(run.call_args.kwargs["timeout"], 2)
@@ -738,6 +738,25 @@ class HeavyQueue(unittest.TestCase):
             self.assertEqual(ns["process_start"](123), "linux:" + boot + ":123456")
         with mock.patch("builtins.open", side_effect=PermissionError("unreadable")):
             self.assertIsNone(ns["process_start"](123))
+
+    def test_macos_same_second_is_alive_different_second_is_dead(self):
+        source = WRK.read_text().split("heavy_cmd() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        tree = ast.parse(source)
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ("alive", "process_start", "owner_alive")]
+        proc_os = SimpleNamespace(kill=mock.Mock(), environ={})
+        ns = dict(os=proc_os, re=re, sys=SimpleNamespace(platform="darwin"), subprocess=subprocess)
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "macOS owner", "exec"), ns)
+        response = SimpleNamespace(returncode=0, stdout="Mon Oct 26 12:00:00 2026\n")
+        with mock.patch.object(subprocess, "run", return_value=response):
+            original = ns["process_start"](123)
+            # ps lstart cannot distinguish same-pid reuse within this second.
+            self.assertEqual(ns["owner_alive"](123, original), (True, "same-process"))
+            response.stdout = "Mon Oct 26 12:00:01 2026\n"
+            self.assertEqual(ns["owner_alive"](123, original), (False, "start-mismatch"))
+            response.stdout = " Mon Oct 26 12:00:00 2026\n"
+            self.assertEqual(ns["owner_alive"](123, original), (False, "start-mismatch"),
+                             "lstart must compare by exact text equality")
 
     def test_signal_guard_rejects_active_signal_mutants(self):
         shell = (ROOT / "tests/test-wrk-heavy-class.sh").read_text()

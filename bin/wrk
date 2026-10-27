@@ -12862,8 +12862,10 @@ def process_start(pid):
                                     env=env, capture_output=True, text=True, timeout=2)
             if result.returncode != 0 or not result.stdout.strip():
                 return None
-            # Pin locale and normalize padding; preserve the complete lstart.
-            value = " ".join(result.stdout.split())
+            # lstart has one-second resolution: a pid reused within the same
+            # second is indistinguishable and reads alive (reservation stays,
+            # fail-safe). Preserve exact text, excluding the trailing newline.
+            value = result.stdout.rstrip("\n")
             return "macos:" + value.encode("utf-8").hex()
         if sys.platform.startswith("linux"):
             with open("/proc/%d/stat" % pid, encoding="utf-8") as f:
