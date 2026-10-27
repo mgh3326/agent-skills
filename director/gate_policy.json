@@ -19,8 +19,7 @@
   "ci": {
     "mgh3326/agent-skills": {
       ".github/workflows/ci.yml": [
-        "ubuntu-latest",
-        "macos-latest"
+        "ci-ok"
       ]
     },
     "mgh3326/auto_trader": {
@@ -69,11 +68,8 @@
   },
   "ci_execution_steps": {
     "mgh3326/agent-skills": {
-      "macos-latest": [
-        "Bash tests"
-      ],
-      "ubuntu-latest": [
-        "Bash tests"
+      "ci-ok": [
+        "Check required results"
       ]
     },
     "mgh3326/auto_trader": {
@@ -155,9 +151,9 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "5d1dca89e8fdad907d515a11f57638cd20bfea070e881027e5a5046501d9ad32",
+    ".github/workflows/ci.yml": "20eedabf6f6903518ede838220c14ce18c04ba00ec12a36e458dfda909d24c89",
     "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
-    "bin/wrk": "d71c9dfe6f3b8c626b0390c46c587c6ff27707fc62c703913cfc98e033bb657e",
+    "bin/wrk": "456cbaa28d080842c57cb43871c1cd73bcba7de3e60fcc0230acd88234995166",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
     "builder/SKILL.md": "116315fcfcff000c4933b62068b128e7bfecf820e7b72f238c1bd8c227722713",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
@@ -2274,8 +2270,7 @@
   },
   "required_ci_jobs_by_repo": {
     "agent-skills": [
-      "ubuntu-latest",
-      "macos-latest"
+      "ci-ok"
     ]
   },
   "revision": "2026-10-20.1",
@@ -2310,8 +2305,8 @@
   "schema": 1,
   "sources": {
     ".github/workflows/ci.yml": {
-      "id": "shell-and-bash-tests",
-      "scope": "required CI matrix job names"
+      "id": "ci-ok",
+      "scope": "single merge-gating CI check; macos-full is scheduled/manual only"
     },
     "advice/2026-09-25/director-throughput-astra": {
       "id": 3243,
