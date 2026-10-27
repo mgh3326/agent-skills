@@ -5629,14 +5629,46 @@ print(json.dumps(out))
 PY
 }
 
-# job_claims_db_map_root ROOT — job_claims_db_map over every job dir in ROOT,
-# for the non-trust scans (reap, prune, lanes-missing) that read whole roots.
+# job_claims_db_map_root ROOT [--jobs CSV] [--include-ended] — best-effort DB
+# claim map for open jobs a non-trust scan can act on. This avoids one arbiter
+# process per historical directory (mbp inboxes can exceed 4k). Targeted prune
+# may pass --jobs; --include-ended includes its selected quota-release job.
 job_claims_db_map_root() {
-  local root="$1" dir
-  local ids=()
-  for dir in "$root"/*/; do
-    [[ -d "$dir" ]] && ids+=("$(basename "$dir")")
+  local root="$1" include_ended=0 jobs_csv="" dir job ended owner
+  shift
+  while (($#)); do
+    case "$1" in
+      --jobs) [[ $# -ge 2 ]] || die "job_claims_db_map_root --jobs requires a CSV"; jobs_csv="$2"; shift 2 ;;
+      --include-ended) include_ended=1; shift ;;
+      *) die "job_claims_db_map_root: unexpected argument '$1'" ;;
+    esac
   done
+  local events=() ids=()
+  if [[ -n "$jobs_csv" ]]; then
+    local -a selected=()
+    IFS=',' read -r -a selected <<<"$jobs_csv"
+    for job in "${selected[@]}"; do
+      [[ -n "$job" && -d "$root/$job" ]] || continue
+      ids+=("$job")
+      events+=("$root/$job/events")
+    done
+    if (( include_ended )); then
+      if ((${#ids[@]})); then job_claims_db_map "${ids[@]}"; else echo "{}"; fi
+      return
+    fi
+  else
+    for dir in "$root"/*/; do
+      [[ -d "$dir" ]] || continue
+      events+=("${dir%/}/events")
+    done
+  fi
+  if ((${#events[@]})); then
+    while IFS=$'\t' read -r job ended _ _ _ _ _ owner _; do
+      [[ -n "$job" ]] || continue
+      (( include_ended )) || [[ "$ended" == 0 && "$owner" != "-" ]] || continue
+      ids+=("$job")
+    done < <(job_events_scan "${events[@]}")
+  fi
   if ((${#ids[@]})); then
     job_claims_db_map "${ids[@]}"
   else
@@ -6437,17 +6469,23 @@ joined_cmd() {
   local metadata owner label pane parent role reason joined_end
   local waiver_issuer="" waiver_grant tmp_waiver task_id tmp_task
   local claim_parent="" claim_task="" claim_version=""
-  # hk 1894: the join gate (end record, rounds, verdict files) and the parent
-  # lane are read from the checked inbox, never from the environment. hk 1899:
-  # a waiver is fetched from handoffkeep, so that guard also judges the binary.
-  # hk 1897: the prefer-DB consult below must come through the guard-selected
-  # arbiter binary, so both branches judge it as well.
-  if [[ -n "$waived" ]]; then wrk_trust_guard hk arbiter; else wrk_trust_guard arbiter; fi
+  # hk 1894: the join gate and parent lane are read from the checked inbox.
+  # hk 1899: only a waived join fetches handoffkeep and selects both canonical
+  # binaries. Ordinary joins keep the historical best-effort route.
+  if [[ -n "$waived" ]]; then wrk_trust_guard hk arbiter; else wrk_trust_guard; fi
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
-  # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
-  # owner/parent, with one warning line on a mismatch (non-trust merge).
-  IFS=$'\t' read -r owner parent <<<"$(job_claim_prefer_db "$job" "$owner" "$parent")"
+  if [[ -n "$waived" ]]; then
+    # A waiver grant is trust-bearing: require the canonical DB row and its
+    # event-file cross-check, then use its parent and task id for verification.
+    local waiver_claim=""
+    waiver_claim="$(job_claim_db_fields "$job")" || exit $?
+    IFS=$'\t' read -r owner parent claim_task <<<"$waiver_claim"
+  else
+    # Without an arbiter selected by the guard, the best-effort DB map is {}
+    # and ordinary joined keeps the checked events-dir values.
+    IFS=$'\t' read -r owner parent <<<"$(job_claim_prefer_db "$job" "$owner" "$parent")"
+  fi
   reason="builder joined PR"
   [[ "$role" == captain ]] && reason="captain joined PR"
   # hk1449-joined-end
@@ -6462,7 +6500,6 @@ joined_cmd() {
     # lane, task_id and the newest claim/reclaim event — so the commit under
     # the events lock can refuse a job released and reclaimed in between.
     claim_parent="$parent"  # hk2024-claim-facts
-    claim_task="$(round_job_task_id "$job" || true)"
     claim_version="$(joined_claim_version "$job")"
     tmp_waiver="$(mktemp)"
     if ! round_approval_fetch "$waived" >"$tmp_waiver"; then
@@ -12857,7 +12894,7 @@ reap_cmd() {
   if [[ "$apply" -eq 1 && -z "$lane" ]]; then
     die "reap --apply requires --lane LANE (a lane-less --apply would close every lane's tabs); run it once per lane"
   fi
-  local grace_s jobs_root candidates
+  local grace_s jobs_root candidates claim_map_args=()
   grace_s="$(parse_duration_s "$grace")" || die "invalid --grace '$grace' (use 600, 600s, 10m, 2h or 1d)"
   jobs_root="$(wrk_jobs_root)"
   if [[ ! -d "$jobs_root" ]]; then
@@ -12867,7 +12904,8 @@ reap_cmd() {
   [[ -x "$HERDR" ]] || die "herdr unavailable: $HERDR"
   # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
   # owner, with one warning line on a mismatch (non-trust merge).
-  candidates="$(WRK_CLAIM_DB="$(job_claims_db_map_root "$jobs_root")" reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
+  [[ -z "$job_filter" ]] || claim_map_args+=(--jobs "$job_filter")
+  candidates="$(WRK_CLAIM_DB="$(job_claims_db_map_root "$jobs_root" "${claim_map_args[@]}")" reap_candidates "$jobs_root" "$lane" "$grace_s" "$include_builders")"
   local tab_counts
   local job owner pane tab age note hub_lane hub_lane_machine lane_role probe class token probe_tab verdict acted=0 release_rc=0
   local -a selected_jobs=()
@@ -13394,7 +13432,13 @@ prune_cmd() {
   PRUNE_SCAN=""
   # hk 1897: a readable arbiter DB claim wins over the events-dir copy for
   # owner, with one warning line on a mismatch (non-trust merge).
-  (( ${#scan_dirs[@]} )) && PRUNE_SCAN="$(job_events_scan --claim-db "$(job_claims_db_map_root "$jobs_root")" "${scan_dirs[@]}")"
+  if (( ${#scan_dirs[@]} )); then
+    if [[ -n "$only_job" ]]; then
+      PRUNE_SCAN="$(job_events_scan --claim-db "$(job_claims_db_map_root "$jobs_root" --jobs "$only_job" --include-ended)" "${scan_dirs[@]}")"
+    else
+      PRUNE_SCAN="$(job_events_scan --claim-db "$(job_claims_db_map_root "$jobs_root")" "${scan_dirs[@]}")"
+    fi
+  fi
 
   local _mode="dry-run" pf job pid jdir
   (( apply )) && _mode="apply"

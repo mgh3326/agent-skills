@@ -1597,6 +1597,52 @@ class RealBinaryCase(unittest.TestCase):
         self.assertEqual([(j["rounds_waived"], j["rounds_waived_issuer"]) for j in joined],
                          [("hk:doc/waiver-jobv", "director-1")])
 
+    def repro_waiver_rejects_forged_parent_without_db_claim(self, wrk):
+        w = self.w
+        job = "waiver-no-db"
+        w.dbclaim("waiver-db-anchor")
+        w.mkjob(w.jobs, job, parent="director-1", task=77, db=False)
+        w.install_canonical_hk({"waiver-" + job: self.waiver_doc(job)})
+        before = tree(w.jobs)
+        out = w.joined(wrk, job, waived="hk:doc/waiver-" + job)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("no arbiter claim row", out.stderr)
+        self.assertEqual(tree(w.jobs), before)
+
+    def test_joined_waiver_rejects_forged_parent_without_db_claim(self):
+        self.repro_waiver_rejects_forged_parent_without_db_claim(self.wrk)
+
+    def test_joined_waiver_rejects_parent_disagreement_with_db(self):
+        w = self.w
+        job = "waiver-parent-mismatch"
+        w.mkjob(w.jobs, job, parent="director-1", task=77)
+        w.rewrite_claim(w.jobs, job, parent_lane="attacker-lane")
+        w.install_canonical_hk({"waiver-" + job: self.waiver_doc(job)})
+        before = tree(w.jobs)
+        out = w.joined(self.wrk, job, waived="hk:doc/waiver-" + job)
+        self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
+        self.assertIn("claim mismatch on parent_lane", out.stderr)
+        self.assertEqual(tree(w.jobs), before)
+
+    def repro_ordinary_join_without_trusted_arbiter(self, wrk):
+        w = self.w
+        job = "ordinary-no-arbiter"
+        events = w.mkjob(w.jobs, job)
+        w.seed_round(w.jobs, job)
+        fake = w.tmp / "untrusted-arbiter"
+        log = w.tmp / "untrusted-arbiter.log"
+        write_exec(fake, '#!/bin/sh\nif [ "$1" = job-get ]; then echo job-get >>"%s"; fi\nexit 0\n' % log)
+        out = w.joined(wrk, job, ARBITER_BIN=fake)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertIn("kind=job.joined", out.stdout)
+        self.assertFalse(log.exists(), "ordinary join must not select the caller's arbiter")
+        record = json.loads(next(events.glob("*-job.joined.json")).read_text())
+        self.assertEqual((record["owner_lane"], record["parent_lane"]),
+                         (job + "-lane", "director-1"))
+
+    def test_ordinary_join_does_not_require_a_trusted_arbiter(self):
+        self.repro_ordinary_join_without_trusted_arbiter(self.wrk)
+
     def test_joined_waiver_uses_the_canonical_handoffkeep_only(self):
         self.repro_joined_waiver_hk_bin_stub(self.wrk)
 
@@ -1606,10 +1652,14 @@ class RealBinaryCase(unittest.TestCase):
     def test_joined_waiver_honours_a_handoffkeep_stub_in_test_mode(self):
         w = self.w
         tbuild = w.tmp / "builder"
-        w.mkjob(tbuild, "jobt")
+        test_env = w.env(test=True, HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "data",
+                         ARBITER_INBOX_ROOT=tbuild, ARBITER_BIN=w.tmp_arbiter())
+        w.dbclaim("jobt", env=test_env)
+        w.rewrite_claim(tbuild, "jobt", pane_id="w:p1", repo=str(w.repo))
         w.stub(w.tmp / "waiver-test-hk", {"*": self.waiver_doc("jobt")})
         out = w.joined(self.wrk, "jobt", test=True, waived="hk:doc/any", ARBITER_INBOX_ROOT=tbuild,
-                       HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "data", HANDOFFKEEP_BIN=w.tmp / "waiver-test-hk")
+                       HOME=w.tmp / "home", XDG_DATA_HOME=w.tmp / "data", ARBITER_BIN=w.tmp_arbiter(),
+                       HANDOFFKEEP_BIN=w.tmp / "waiver-test-hk")
         self.assertEqual(out.returncode, 0, out.stderr)
         warnings = [line for line in out.stderr.splitlines() if "test mode honours" in line]
         self.assertEqual(len(warnings), 1, out.stderr)
@@ -2037,7 +2087,7 @@ class RealBinaryCase(unittest.TestCase):
         lib.write_text(Path(mutant).read_text().rsplit('case "${1:-}" in', 1)[0])
         self.red(self.repro_inherited_guard_state, lib)
 
-    JOINED_GUARD = '  if [[ -n "$waived" ]]; then wrk_trust_guard hk arbiter; else wrk_trust_guard arbiter; fi\n'
+    JOINED_GUARD = '  if [[ -n "$waived" ]]; then wrk_trust_guard hk arbiter; else wrk_trust_guard; fi\n'
 
     def test_mutant_joined_skips_the_guard(self):
         mutant = self.mutant(WRK, self.JOINED_GUARD, ENV_FOLLOWING, "joined")
@@ -2049,8 +2099,25 @@ class RealBinaryCase(unittest.TestCase):
         self.red(self.repro_joined_waiver_hk_bin_stub, mutant)
 
     def test_mutant_joined_waiver_takes_the_plain_guard(self):
-        mutant = self.mutant(WRK, self.JOINED_GUARD, '  wrk_trust_guard\n', "joinedwaiverplain")
+        mutant = self.mutant(WRK, 'if [[ -n "$waived" ]]; then wrk_trust_guard hk arbiter; else wrk_trust_guard; fi',
+                             'if [[ -n "$waived" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi',
+                             "joinedwaiverplain")
         self.red(self.repro_joined_waiver_canonical, mutant)
+
+    def test_mutant_waiver_uses_best_effort_parent(self):
+        old = ('    local waiver_claim=""\n'
+               '    waiver_claim="$(job_claim_db_fields "$job")" || exit $?\n'
+               '    IFS=$\'\\t\' read -r owner parent claim_task <<<"$waiver_claim"\n')
+        new = ('    IFS=$\'\\t\' read -r owner parent <<<"$(job_claim_prefer_db "$job" "$owner" "$parent")"\n')
+        mutant = self.mutant(WRK, old, new, "waiver-best-effort-parent")
+        self.red(self.repro_waiver_rejects_forged_parent_without_db_claim, mutant)
+
+    def test_mutant_ordinary_join_requires_arbiter(self):
+        mutant = self.mutant(WRK, self.JOINED_GUARD,
+                             self.JOINED_GUARD.replace('else wrk_trust_guard;',
+                                                        'else wrk_trust_guard arbiter;'),
+                             "ordinary-join-arbiter")
+        self.red(self.repro_ordinary_join_without_trusted_arbiter, mutant)
 
     def test_mutant_round_audit_skips_the_guard(self):
         mutant = self.mutant(WRK, '  wrk_trust_guard\n  local jobs_root\n', ENV_FOLLOWING + '  local jobs_root\n', "audit")
@@ -2226,6 +2293,7 @@ class ArbiterDbClaimCase(RealBinaryCase):
         db = w.pw_home / ".local" / "share" / "arbiter" / "state.db"
         with contextlib.closing(sqlite3.connect(db)) as con:
             con.execute("UPDATE events SET created_at='2026-01-01T00:00:00+00:00' WHERE job_id='jobsq'")
+            con.commit()
         claim = json.loads(self.arbiter("job-get", "--job", "jobsq", "--json").stdout)["claim"]
         self.assertEqual(claim["kind"], "job.reclaim")
 
@@ -2424,7 +2492,7 @@ class ArbiterDbClaimCase(RealBinaryCase):
         out = w.wrk(self.wrk, "round", "open", "jtak2", "--head", w.heads[3], "--extend", "hk:doc/g")
         self.assertEqual(out.returncode, 2, out.stdout + out.stderr)
 
-    def test_done_and_joined_warn_and_route_on_db_parent(self):
+    def test_done_prefers_db_but_ordinary_join_keeps_event_parent(self):
         w = self.w
         w.mkjob(w.jobs, "jdn")
         w.rewrite_claim(w.jobs, "jdn", parent_lane="mac-dev")
@@ -2445,9 +2513,9 @@ class ArbiterDbClaimCase(RealBinaryCase):
         )
         out = w.joined(self.wrk, "jdn", **env)
         self.assertEqual(out.returncode, 0, out.stderr)
-        self.assertIn("claim mismatch", out.stderr)
+        self.assertNotIn("claim mismatch", out.stderr)
         record = json.loads(next((w.jobs / "jdn" / "events").glob("*-job.joined.json")).read_text())
-        self.assertEqual(record["parent_lane"], "director-1")
+        self.assertEqual(record["parent_lane"], "mac-dev")
 
     def test_helper_fails_closed_on_odd_and_missing(self):
         w = self.w
@@ -2472,10 +2540,9 @@ class ArbiterDbClaimCase(RealBinaryCase):
         self.assertIn("jh2-lane", out.stdout)
         self.assertFalse(log.exists(), "the PATH shim must never run")
 
-    def test_joined_db_read_uses_only_the_guard_selected_binary(self):
-        # hk 1897 B-2: joined is trust-guarded, so its prefer-DB consult must
-        # come from the canonical arbiter — a caller-chosen ARBITER_BIN or a
-        # PATH shim must never supply the identity map.
+    def test_ordinary_join_does_not_select_a_caller_chosen_arbiter(self):
+        # Ordinary joined intentionally does not select the arbiter. The
+        # best-effort map must therefore be empty even when a caller sets it.
         w = self.w
         w.mkjob(w.jobs, "jb2")
         w.rewrite_claim(w.jobs, "jb2", parent_lane="mac-dev")
@@ -2490,24 +2557,65 @@ class ArbiterDbClaimCase(RealBinaryCase):
             encoding="utf-8",
         )
         fake = w.tmp / "fake-arbiter"
-        write_exec(fake, '#!/bin/sh\nprintf \'{"claim":{"owner_lane":"elsewhere",'
-                         '"parent_lane":"pa-integrator","task_id":1}}\'\n')
+        log = w.tmp / "fake-arbiter.log"
+        write_exec(fake, '#!/bin/sh\nif [ "$1" = job-get ]; then echo job-get >>"%s"; fi\nexit 0\n' % log)
         out = w.joined(self.wrk, "jb2", ARBITER_BIN=fake)
-        self.assertEqual(out.returncode, 2)
-        self.assertFalse(list(events.glob("*-job.joined.json")), out.stderr)
-        shim_dir = w.tmp / "shim2"
-        shim_dir.mkdir()
-        log = w.tmp / "shim2.log"
-        write_exec(shim_dir / "arbiter", '#!/bin/sh\necho ran >>"%s"\nprintf \'{"claim":{"owner_lane":"elsewhere","parent_lane":"pa-integrator","task_id":1}}\'\n' % log)
-        out = w.joined(self.wrk, "jb2", ARBITER_BIN=None,
-                       PATH="%s:%s" % (shim_dir, safe_path()))
-        self.assertEqual(out.returncode, 0, out.stderr)
-        # The shim may still run for non-identity housekeeping (quota release,
-        # as on main); what matters is it can never supply the identity map.
-        self.assertNotIn("pa-integrator", out.stderr)
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        self.assertFalse(log.exists(), "ordinary join must not run the untrusted job-get")
         record = json.loads(next(events.glob("*-job.joined.json")).read_text())
-        self.assertEqual(record["parent_lane"], "director-1")
+        self.assertEqual(record["parent_lane"], "mac-dev")
         self.assertEqual(record["owner_lane"], "jb2-lane")
+
+    def repro_claim_map_queries_only_open_jobs(self, wrk):
+        w = self.w
+        root = w.tmp / "large-inbox"
+        root.mkdir()
+        count = 320
+        for index in range(count + 1):
+            job = "open-target" if index == 0 else "closed-%04d" % index
+            events = root / job / "events"
+            events.mkdir(parents=True)
+            claim = {"kind": "job.claim", "job_id": job,
+                     "payload": {"owner_lane": job + "-lane", "parent_lane": "director-1",
+                                 "role": "builder"}, "seq": 1,
+                     "created_at": "2026-10-01T00:00:00Z"}
+            (events / "00001-job.claim.json").write_text(json.dumps(claim) + "\n")
+            if index:
+                terminal = {"kind": "job.completed", "job_id": job, "seq": 2,
+                            "created_at": "2026-10-02T00:00:00Z"}
+                (events / "00002-job.completed.json").write_text(json.dumps(terminal) + "\n")
+        log = w.tmp / "job-get-calls.log"
+        fake = w.tmp / "counting-arbiter"
+        body = ('#!/bin/sh\nprintf "%s\\n" "$3" >>"' + str(log) + '"\n'
+                'printf \'{"claim":{"owner_lane":"%s-lane","parent_lane":"director-1","task_id":null}}\\n\' "$3"\n')
+        write_exec(fake, body)
+        lib_path = w.tmp / "claim-map-lib"
+        lib_path.write_text(Path(wrk).read_text(encoding="utf-8").rsplit('case "${1:-}" in', 1)[0],
+                            encoding="utf-8")
+        command = 'set -euo pipefail; . "$1"; job_claims_db_map_root "$2"'
+        out = w.run(["bash", "-c", command, "_", lib_path, root], w.env(ARBITER_BIN=fake))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        calls = log.read_text().splitlines() if log.exists() else []
+        self.assertEqual(calls, ["open-target"], "only open jobs need DB identity lookups")
+        self.assertEqual(sorted(json.loads(out.stdout)), ["open-target"])
+        log.unlink()
+        command = ('set -euo pipefail; . "$1"; '
+                   'job_claims_db_map_root "$2" --jobs closed-0001 --include-ended')
+        out = w.run(["bash", "-c", command, "_", lib_path, root], w.env(ARBITER_BIN=fake))
+        self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+        calls = log.read_text().splitlines() if log.exists() else []
+        self.assertEqual(calls, ["closed-0001"], "targeted prune should query only its selected job")
+        self.assertEqual(sorted(json.loads(out.stdout)), ["closed-0001"])
+
+    def test_claim_map_only_queries_open_jobs_in_large_inbox(self):
+        self.repro_claim_map_queries_only_open_jobs(self.wrk)
+
+    def test_mutant_claim_map_queries_every_job_directory(self):
+        mutant = self.mutant(WRK,
+                             '      (( include_ended )) || [[ "$ended" == 0 && "$owner" != "-" ]] || continue\n',
+                             '      (( include_ended )) || [[ "$owner" != "-" ]] || continue\n',
+                             "claim-map-all-dirs")
+        self.red(self.repro_claim_map_queries_only_open_jobs, mutant)
 
     # -- mutants, stated as invariants --
 
