@@ -7543,7 +7543,7 @@ round_verdict_cmd() {
       *) die "unknown round verdict option '$1'" ;;
     esac
   done
-  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"
+  [[ -n "$file" ]] || die "round verdict requires an existing --file"
   if [[ -n "$head_repeat" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi
   metadata="$(builder_metadata "$job" trusted)"
   IFS=$'\t' read -r owner label pane parent role <<<"$metadata"
@@ -7566,11 +7566,14 @@ round_verdict_cmd() {
       [[ -z "$head_repeat" ]] ||
         die "round verdict: an O3 job never takes the free --head-repeat ref $head_repeat; a repeated head needs the typed head_repeat grant its round consumed"
       if o3_server_decides; then
+        # hk 1926: the adapter resends a pending verdict from its saved bytes
+        # before it reads the file, and an unreadable file is its unsendable 65.
         o3_call "${o3_args[@]}"
         o3_exit_on_error
         printf '%s\n' "$O3_OUT"
         return 0
       fi
+      [[ -f "$file" ]] || die "round verdict requires an existing --file"
       o2_mode=check
       if [[ "$O3_ROUTE" == shadow ]]; then
         o3_call repeat-permission "$job" --file "$file"
@@ -7580,6 +7583,7 @@ round_verdict_cmd() {
         fi
       fi ;;
   esac
+  [[ -f "$file" ]] || die "round verdict requires an existing --file"
   local events="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}/$job/events"
   local outcome rc=0 run_commit=1 grant_issuer="" bind_head="" bind_round=""
   if [[ -n "$head_repeat" ]]; then
@@ -12345,7 +12349,12 @@ o3_append_refuse() {
     import) typed="wrk o3 central import" ;;
     import_begin) typed="wrk o3 central import-begin" ;;
     import_seal) typed="wrk o3 central import-seal" ;;
-    *) typed="the typed wrk command for the record kind" ;;
+    end|grant|grant_cancel)
+      echo "wrk: o3 cli_usage: o3 append: a raw append is not a mutation route; wrk has no writer for a $kind record in this release; nothing sent" >&2
+      exit 2 ;;
+    *)
+      echo "wrk: o3 cli_usage: o3 append: a raw append is not a mutation route; '$kind' is not a record kind wrk writes; nothing sent" >&2
+      exit 2 ;;
   esac
   echo "wrk: o3 cli_usage: o3 append: a raw append is not a mutation route; use $typed; nothing sent" >&2
   exit 2

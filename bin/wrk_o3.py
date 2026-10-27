@@ -243,11 +243,24 @@ def _need(condition):
         raise CliFail("protocol_invalid")
 
 
+def _shape(check):
+    """A server body of an unexpected type is protocol_invalid, never a traceback."""
+    def checked(*args):
+        try:
+            return check(*args)
+        except (TypeError, AttributeError, KeyError, IndexError, ValueError):
+            raise CliFail("protocol_invalid")
+    checked.__name__ = check.__name__
+    return checked
+
+
+@_shape
 def check_summary(summary, job):
     _need(isinstance(summary, dict) and set(summary) == SUMMARY_KEYS)
     _need(summary["job_id"] == job)
     _need(_int(summary["claim_seq"], 1) and _int(summary["snapshot_seq"], 1))
-    _need(summary["state"] in STATES and summary["cap"] == 3)
+    _need(summary["claim_seq"] <= summary["snapshot_seq"])
+    _need(isinstance(summary["state"], str) and summary["state"] in STATES and _int(summary["cap"]) and summary["cap"] == 3)
     _need(_int(summary["baseline_used"]) and _int(summary["used"]) and _int(summary["next_round_no"], 1))
     _need(isinstance(summary["open_rounds"], list) and all(_int(n, 1) for n in summary["open_rounds"]))
     _need(isinstance(summary["active_grants"], list) and all(_int(n, 1) for n in summary["active_grants"]))
@@ -351,6 +364,7 @@ PAYLOAD_SCHEMA = {
 }
 
 
+@_shape
 def check_payload(kind, payload):
     _need(isinstance(payload, dict) and set(payload) == PAYLOAD_KEYS[kind])
     for field, check in PAYLOAD_SCHEMA[kind].items():
@@ -361,6 +375,7 @@ def check_payload(kind, payload):
         _need(payload["numbering_floor"] >= payload["baseline_used"])
 
 
+@_shape
 def check_record(record, job):
     _need(isinstance(record, dict) and set(record) == RECORD_KEYS)
     _need(record["job_id"] == job and _int(record["seq"], 1) and _int(record["claim_seq"]))
@@ -370,7 +385,13 @@ def check_record(record, job):
         _need(isinstance(record[key], str) and HEX64_RE.match(record[key]) is not None)
     _need(isinstance(record["actor_client_id"], str) and JOB_RE.match(record["actor_client_id"]))
     _need(isinstance(record["imported"], bool) and _datetime(record["received_at"]))
-    _need(record["kind"] in PAYLOAD_KEYS)
+    _need(isinstance(record["kind"], str) and record["kind"] in PAYLOAD_KEYS)
+    # 5: a claim's claim_seq is its own seq; any other record carries the
+    # current claim, which precedes it.
+    if record["kind"] == "claim":
+        _need(record["claim_seq"] == record["seq"])
+    else:
+        _need(1 <= record["claim_seq"] < record["seq"])
     source = record["source"]
     if record["kind"] == "import":
         _need(isinstance(source, dict) and set(source) == {"source_locator", "source_sha256"})
@@ -383,14 +404,20 @@ def check_record(record, job):
     return record
 
 
+@_shape
 def check_write(obj, job):
     _need(set(obj) == {"contract", "created", "record", "summary"} and obj["contract"] == CONTRACT)
     _need(isinstance(obj["created"], bool))
-    check_record(obj["record"], job)
-    check_summary(obj["summary"], job)
+    record = check_record(obj["record"], job)
+    summary = check_summary(obj["summary"], job)
+    # 5: all success bodies refer to the same committed snapshot, and a replay
+    # keeps its original one, so the summary is the one this record committed.
+    _need(summary["store_generation"] == record["store_generation"] and summary["snapshot_seq"] == record["seq"]
+          and summary["tail_hash"] == record["record_hash"] and summary["claim_seq"] == record["claim_seq"])
     return obj
 
 
+@_shape
 def check_job(obj, job):
     _need(set(obj) == {"contract", "claim", "summary"} and obj["contract"] == CONTRACT)
     check_record(obj["claim"], job)
@@ -400,6 +427,7 @@ def check_job(obj, job):
     return obj
 
 
+@_shape
 def check_records(obj, job):
     _need(set(obj) == {"contract", "snapshot_seq", "next_after_seq", "has_more", "records", "summary"})
     _need(obj["contract"] == CONTRACT and _int(obj["snapshot_seq"], 1) and _int(obj["next_after_seq"]))
@@ -410,6 +438,7 @@ def check_records(obj, job):
     return obj
 
 
+@_shape
 def check_capabilities(obj):
     _need(set(obj) == {"contract", "store_generation", "client_id", "policy_sha256", "writes_available"})
     _need(obj["contract"] == CONTRACT and isinstance(obj["writes_available"], bool))
@@ -419,6 +448,7 @@ def check_capabilities(obj):
     return obj
 
 
+@_shape
 def check_content(obj, job, seq):
     _need(set(obj) == {"job_id", "seq", "content_b64", "content_sha256", "size_bytes"})
     _need(obj["job_id"] == job and obj["seq"] == seq and isinstance(obj["content_b64"], str))
@@ -759,8 +789,17 @@ def read_state(job, retained=()):
     claim = records[summary["claim_seq"] - 1] if summary["claim_seq"] <= len(records) else None
     if claim is None or claim["kind"] != "claim":
         raise CliFail("protocol_invalid")
-    if job_obj["summary"]["store_generation"] != summary["store_generation"]:
+    current = job_obj["summary"]
+    if current["store_generation"] != summary["store_generation"]:
         raise CliFail("history_regressed", "generation_regressed")
+    # The job was read first: records at an older snapshot would discard
+    # history this client has already seen, so they are never a decision basis.
+    if current["snapshot_seq"] > snapshot:
+        raise CliFail("history_regressed", "seq_regressed")
+    if records[job_obj["claim"]["seq"] - 1]["record_hash"] != job_obj["claim"]["record_hash"]:
+        raise CliFail("history_regressed", "hash_changed")
+    if current["snapshot_seq"] == snapshot and current != summary:
+        raise CliFail("protocol_invalid")
     state = State(job, claim, summary, records)
     check_history(state, retained)
     return state
@@ -1255,6 +1294,9 @@ def send(store, intent, binary=None):
             history_regression(os.path.dirname(store.dir), store.job, store, "generation_regressed", intent)
         if obj["summary"]["snapshot_seq"] < max(r["seq"] for r in retained):
             history_regression(os.path.dirname(store.dir), store.job, store, "seq_regressed", intent)
+        # A retained seq inside the returned history is compared by record_hash.
+        if any(r["seq"] == record["seq"] and r["record_hash"] != record["record_hash"] for r in retained):
+            history_regression(os.path.dirname(store.dir), store.job, store, "hash_changed", intent)
     intent["state"], intent["receipt"] = "accepted", receipt_of(record)
     try:
         store.save()
@@ -1416,12 +1458,16 @@ def parse_verdict(data):
     return match.group(1), match.group(2).lower()
 
 
-def read_once(path, what):
+def read_once(path, what, unreadable="usage"):
+    """A request body file is read once. unreadable is the code for a file that
+    cannot be read: a verdict or report the request needs is unsendable (65)."""
+    if not path:
+        raise Fail("usage", "the %s path is required" % what)
     try:
         with open(path, "rb") as handle:
             data = handle.read(MAX_CONTENT + 1)
     except OSError as exc:
-        raise Fail("usage", "cannot read the %s (%s)" % (what, exc.strerror or exc))
+        raise Fail(unreadable, "cannot read the %s (%s); nothing sent" % (what, exc.strerror or exc))
     if not data:
         raise Fail("invalid_request", "the %s is empty" % what)
     if len(data) > MAX_CONTENT:
@@ -1801,7 +1847,7 @@ def round_verdict(ctx, job, opts):
 
     def current():
         if not source:
-            data = read_once(path, "verdict file")
+            data = read_once(path, "verdict file", "invalid_request")
             source["data"] = data
             source["verdict"], source["head"] = parse_verdict(data)
         return source["data"], source["verdict"], source["head"]
@@ -1959,6 +2005,10 @@ def audit_job(ctx, job, opts):
     try:
         state = ctx.state(job)
     except CliFail as exc:
+        # 6b: only an unavailable or unusable read may print a stale row; an
+        # authentication or business refusal keeps its own code and exit.
+        if exc.code not in offline_codes():
+            raise Fail(exc.code)
         emit("STALE code=%s" % exc.code)
         return
     if state is None:
@@ -2184,9 +2234,16 @@ def spawn_verify(ctx, job, opts):
 
 # ── completed / joined adapter operations (C2 wires them into done/joined) ───
 
+def report_payload(opts, **fields):
+    """Read the report only when a new request is built: a pending intent is
+    replayed from its saved bytes first, so a lost reply never needs the file."""
+    data = read_once(opts.get("--report"), "report", "invalid_request")
+    return dict(fields, report_b64=b64(data), report_sha256=sha256_hex(data))
+
+
 def completed(ctx, job, opts):
-    data = read_once(opts.get("--report"), "report")
-    payload = {"report_b64": b64(data), "report_sha256": sha256_hex(data)}
+    if not opts.get("--report"):
+        raise Fail("usage", "completed requires --report")
     with Intents(ctx.inbox, job) as store:
         state = cli_guard(lambda: ctx.state(job, store))()
         if state is None:
@@ -2196,7 +2253,8 @@ def completed(ctx, job, opts):
             warn("o3 rounds incomplete for %s (open=%s used=%d); completed is an observation, never a join"
                  % (job, state.summary["open_rounds"], state.summary["used"]))
         outcome = cli_guard(transact)(store, "completed",
-                                      lambda fresh: (fresh.summary["claim_seq"], fresh.snapshot_seq, payload),
+                                      lambda fresh: (fresh.summary["claim_seq"], fresh.snapshot_seq,
+                                                     report_payload(opts)),
                                       state_reader=cli_guard(lambda: ctx.state(job, store)))
     emit("RECEIPT " + json.dumps(receipt_of(outcome.record), sort_keys=True))
 
@@ -2215,16 +2273,16 @@ def joined(ctx, job, opts):
     if opts.get("--rounds-waived"):
         raise Fail("usage", "joined: an O3 job takes only a typed join_waiver grant (--waiver-grant SEQ), never a "
                    "free waiver ref")
-    data = read_once(opts.get("--report"), "report")
-    payload = {"head": head, "pr": pr, "report_b64": b64(data), "report_sha256": sha256_hex(data),
-               "waiver_grant_seq": waiver}
+    if not opts.get("--report"):
+        raise Fail("usage", "joined requires --report")
 
     def build(fresh):
         if fresh is None:
             raise Fail("not_found", "joined: job %s is not enrolled" % job)
         # The waiver's type, head and use are judged by the server (grant_invalid,
         # grant_consumed, zero_rounds), never pre-empted here.
-        return fresh.summary["claim_seq"], fresh.snapshot_seq, payload
+        return fresh.summary["claim_seq"], fresh.snapshot_seq, report_payload(opts, head=head, pr=pr,
+                                                                              waiver_grant_seq=waiver)
     with Intents(ctx.inbox, job) as store:
         outcome = cli_guard(transact)(store, "joined", build, state_reader=cli_guard(lambda: ctx.state(job, store)))
     emit("RECEIPT " + json.dumps(receipt_of(outcome.record), sort_keys=True))

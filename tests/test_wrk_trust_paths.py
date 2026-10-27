@@ -1948,8 +1948,8 @@ class RealBinaryCase(unittest.TestCase):
 
     def test_mutant_round_verdict_skips_the_guard(self):
         # hk 1970: the guard is chosen by --head-repeat (hk or plain); the mutant drops the whole choice.
-        mutant = self.mutant(WRK, '  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"\n  if [[ -n "$head_repeat" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi\n',
-                             '  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"\n' + ENV_FOLLOWING, "verdict")
+        mutant = self.mutant(WRK, '  [[ -n "$file" ]] || die "round verdict requires an existing --file"\n  if [[ -n "$head_repeat" ]]; then wrk_trust_guard hk; else wrk_trust_guard; fi\n',
+                             '  [[ -n "$file" ]] || die "round verdict requires an existing --file"\n' + ENV_FOLLOWING, "verdict")
         self.red(self.repro_inbox_redirect, mutant)
 
     def test_mutant_round_status_skips_the_guard(self):

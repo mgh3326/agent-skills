@@ -1487,6 +1487,8 @@ class RegressedHistoryCase(O3Case):
 
     def test_a_seq_regression_seen_by_a_replay_is_noted_on_that_intent(self):
         w = self.witnessed()
+        # A verdict accepted at seq 3: the regressed reply at seq 2 is below it.
+        self.assertRc(w.run("round", "verdict", "job-a", "--file", w.verdict_file("v1.md", w.heads[0])), 0)
         w.fault("append", "commit_then:transport_indeterminate", kind="round_open")
         self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75)
         key = [i for i in w.intents("job-a") if i["state"] == "pending"][0]["idempotency_key"]
@@ -1504,6 +1506,25 @@ class RegressedHistoryCase(O3Case):
         self.assertEqual(sorted(p.name for p in (w.inbox / "job-a" / "events").iterdir()), events_before)
         others = [i for i in w.intents("job-a") if i["idempotency_key"] != key]
         self.assertTrue(all("history_regressed" not in i for i in others))
+
+    def test_a_replay_at_a_retained_seq_with_another_hash_is_noted_on_that_intent(self):
+        w = self.witnessed()
+        w.fault("append", "commit_then:transport_indeterminate", kind="round_open")
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[1]), 75)
+        key = [i for i in w.intents("job-a") if i["state"] == "pending"][0]["idempotency_key"]
+        local_event(w, "job-a", "00090-job.revoked.json",
+                    {"kind": "job.revoked", "job_id": "job-a", "at": "2030-01-01T00:00:00.000Z"})
+        # The regressed reply sits at seq 2, where the first round_open's receipt is retained.
+        w.fault("append", "regress_seq", kind="round_open")
+        out = w.run("round", "open", "job-a", "--head", w.heads[2])
+        self.assertRc(out, 75, "history_regressed")
+        self.assertIn("job job-a intent %s: local end event 00090-job.revoked.json; the server GET returned "
+                      "hash_changed" % key, out.stderr)
+        intent = [i for i in w.intents("job-a") if i["idempotency_key"] == key][0]
+        self.assertEqual(intent["state"], "pending")
+        # The ruled note results are not_found, generation_regressed and seq_regressed only.
+        self.assertNotIn("history_regressed", intent)
+        self.assertNotIn("RECEIPT", out.stdout)
 
     def test_locally_ended_job_with_no_intent_writes_nothing_and_invents_none(self):
         w = self.witnessed()
@@ -3080,6 +3101,197 @@ class Round1FindingCase(O3Case):
         self.assertEqual(w.appends(), [])
 
 
+def forward_append(w, edit, bindir=BIN):
+    """The canonical CLI forwards the stub, and edit(reply) rewrites a successful
+    append reply before the client sees it."""
+    write_exec(w.hk, """#!/usr/bin/env python3
+import json, subprocess, sys, uuid
+sys.path.insert(0, %r)
+import wrk_o3
+proc = subprocess.run([sys.executable, %r] + sys.argv[1:], input=sys.stdin.buffer.read(), stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE)
+if proc.returncode == 0 and sys.argv[1:3] == ["wrk", "append"]:
+    reply = json.loads(proc.stdout)
+%s
+    sys.stdout.write(json.dumps(reply) + "\\n")
+else:
+    sys.stdout.buffer.write(proc.stdout)
+    sys.stderr.buffer.write(proc.stderr)
+sys.exit(proc.returncode)
+""" % (str(bindir), str(STUB), edit))
+
+
+def scenario_r2b1_reply_across_snapshots(case, bindir=BIN):
+    """A successful round_open reply whose summary is another generation and
+    snapshot than its own record (the record and its hash untouched)."""
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    forward_append(w, '    reply["summary"].update(store_generation=str(uuid.uuid4()), snapshot_seq=1)', bindir)
+    out = w.run("round", "open", "job-a", "--head", w.heads[0])
+    return w, out
+
+
+def scenario_r2b2_records_behind_the_job(case, bindir=BIN):
+    """The job read shows the current end (seq 3); the records read is served at
+    the valid older snapshot 2, before the end."""
+    w = World(case, bindir=bindir)
+    w.mode("required")
+    w.enroll("new-builder", owner="new-lane", tier="T1")
+    w.seed("new-builder", "end", {"end_type": "revoked", "reason_code": "test_end"})
+    write_exec(w.hk, """#!/usr/bin/env python3
+import subprocess, sys
+args = sys.argv[1:]
+if args[:2] == ["wrk", "records"] and "--snapshot-seq" not in args:
+    args += ["--snapshot-seq", "2"]
+proc = subprocess.run([sys.executable, %r] + args, input=sys.stdin.buffer.read(), stdout=subprocess.PIPE,
+                      stderr=subprocess.PIPE)
+sys.stdout.buffer.write(proc.stdout)
+sys.stderr.buffer.write(proc.stderr)
+sys.exit(proc.returncode)
+""" % str(STUB))
+    out = spawn_builder(w)
+    return w, out
+
+
+def scenario_r2s1_public_verdict_replay(case, bindir=BIN):
+    """The public command: the verdict commits, its reply is lost, the file is
+    deleted, and the identical command is repeated."""
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    case.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+    vfile = w.verdict_file("v.md", w.heads[0])
+    w.fault("append", "commit_then:transport_indeterminate", kind="verdict")
+    case.assertRc(w.run("round", "verdict", "job-a", "--file", vfile), 75, "transport_indeterminate")
+    vfile.unlink()
+    before = len(w.appends("verdict"))
+    out = w.run("round", "verdict", "job-a", "--file", vfile)
+    return w, out, before
+
+
+def scenario_r2s1_report_replay(case, kind, bindir=BIN):
+    """completed or joined commits, its reply is lost, the report is deleted,
+    and the identical adapter command is repeated."""
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    report = w.base / "report.md"
+    report.write_text("immutable report\n")
+    args = [kind, "job-a", "--report", report]
+    if kind == "joined":
+        grant = w.grant("job-a", "join_waiver", head=w.heads[0])
+        args += ["--head", w.heads[0], "--pr", "https://example.invalid/pr/1", "--waiver-grant", grant["seq"]]
+    w.fault("append", "commit_then:transport_indeterminate", kind=kind)
+    case.assertRc(w.adapter(*args), 75, "transport_indeterminate")
+    report.unlink()
+    before = len(w.appends(kind))
+    out = w.adapter(*args)
+    return w, out, before
+
+
+def scenario_r2s2_unsendable_verdict(case, bindir=BIN):
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    case.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+    before = len(w.calls())
+    out = w.run("round", "verdict", "job-a", "--file", w.base / "missing.md")
+    return w, out, before
+
+
+def scenario_r2s3_record_kind_not_a_string(case, bindir=BIN):
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    forward_append(w, '    reply["record"]["kind"] = []', bindir)
+    out = w.run("round", "open", "job-a", "--head", w.heads[0])
+    return w, out
+
+
+def scenario_r2s4_audit_unauthorized(case, bindir=BIN):
+    w = World(case, bindir=bindir)
+    w.enforced_builder()
+    case.assertRc(w.run("round", "status", "job-a"), 0)
+    w.fault("job", "error:unauthorized")
+    out = w.run("round", "audit")
+    return w, out
+
+
+class Round2FindingCase(O3Case):
+    def test_b_r2_1_append_reply_across_snapshots_is_protocol_invalid(self):
+        w, out = scenario_r2b1_reply_across_snapshots(self)
+        self.assertRc(out, 75, "protocol_invalid")
+        self.assertEqual(out.stdout, "")
+        self.assertEqual([i["state"] for i in w.intents("job-a") if i["request"]["kind"] == "round_open"],
+                         ["pending"])
+        self.assertEqual(w.events("job-a", "job.round"), [])
+        # Control: the unedited reply is accepted and projected.
+        write_exec(w.hk, "#!/bin/sh\nWRK_TEST_MODE=1 exec python3 '%s' \"$@\"\n" % STUB)
+        self.assertRc(w.run("round", "open", "job-a", "--head", w.heads[0]), 0)
+        self.assertEqual(len(w.events("job-a", "job.round")), 1)
+
+    def test_b_r2_2_records_older_than_the_job_read_never_start_a_pane(self):
+        w, out = scenario_r2b2_records_behind_the_job(self)
+        self.assertRc(out, 75, "history_regressed")
+        self.assertEqual(w.herdr_calls(), [])
+        self.assertEqual(w.events("new-builder", "job.claim"), [])
+        self.assertEqual([r["kind"] for r in w.records("new-builder")], ["claim", "activate", "end"])
+
+    def test_s_r2_1_public_verdict_replay_needs_no_file(self):
+        w, out, before = scenario_r2s1_public_verdict_replay(self)
+        self.assertRc(out, 0)
+        self.assertEqual(len(w.appends("verdict")), before + 1, "one exact-key resend")
+        self.assertEqual([i["state"] for i in w.intents("job-a") if i["request"]["kind"] == "verdict"],
+                         ["accepted"])
+        self.assertEqual(len(w.events("job-a", "job.verdict")), 1)
+
+    def test_s_r2_1_completed_and_joined_replay_need_no_report(self):
+        for kind in ("completed", "joined"):
+            with self.subTest(kind=kind):
+                w, out, before = scenario_r2s1_report_replay(self, kind)
+                self.assertRc(out, 0)
+                self.assertIn("RECEIPT", out.stdout)
+                self.assertEqual(len(w.appends(kind)), before + 1)
+                self.assertEqual([i["state"] for i in w.intents("job-a") if i["request"]["kind"] == kind],
+                                 ["accepted"])
+
+    def test_s_r2_2_unreadable_verdict_file_is_unsendable_65(self):
+        w, out, before = scenario_r2s2_unsendable_verdict(self)
+        self.assertRc(out, 65, "invalid_request")
+        self.assertEqual(w.appends("verdict"), [])
+        self.assertEqual([i for i in w.intents("job-a") if i["request"]["kind"] == "verdict"], [])
+        # A missing --file argument stays a usage error.
+        self.assertRc(w.run("round", "verdict", "job-a"), 2)
+
+    def test_s_r2_3_record_kind_of_the_wrong_type_is_protocol_invalid(self):
+        w, out = scenario_r2s3_record_kind_not_a_string(self)
+        self.assertRc(out, 75, "protocol_invalid")
+        self.assertNotIn("Traceback", out.stderr)
+        self.assertEqual([line for line in out.stderr.splitlines() if not line.startswith("wrk: warning:")],
+                         [line for line in out.stderr.splitlines() if line.startswith("wrk: o3 protocol_invalid: ")])
+        self.assertEqual([i["state"] for i in w.intents("job-a")], ["pending"])
+        self.assertEqual(w.events("job-a", "job.round"), [])
+
+    def test_s_r2_4_audit_keeps_an_unauthorized_refusal(self):
+        w, out = scenario_r2s4_audit_unauthorized(self)
+        self.assertRc(out, 77, "unauthorized")
+        self.assertNotIn("o3-stale", out.stdout)
+        # Control: an unavailable read still prints the labelled stale row.
+        w.fault("job", "error:wrk_unavailable")
+        out = w.run("round", "audit")
+        self.assertRc(out, 0)
+        self.assertIn("o3-stale job=job-a", out.stdout)
+        self.assertIn("label=O2-unverified", out.stdout)
+
+    def test_n_r2_1_raw_append_of_a_kind_with_no_writer_says_so(self):
+        w = self.world()
+        w.enforced_builder()
+        for kind in ("end", "grant", "grant_cancel"):
+            out = w.run("o3", "append", "job-a", "--kind", kind)
+            self.assertRc(out, 2, "cli_usage")
+            self.assertIn("wrk has no writer for a %s record" % kind, out.stderr)
+        out = w.run("o3", "append", "job-a", "--kind", "bogus")
+        self.assertRc(out, 2, "cli_usage")
+        self.assertIn("'bogus' is not a record kind", out.stderr)
+        self.assertEqual(w.intents("job-a"), [])
+
+
 class MutantCase(O3Case):
     def mutant_bin(self, mutations):
         root = Path(os.path.realpath(tempfile.mkdtemp(prefix="o3m-", dir=os.environ.get("TMPDIR") or "/tmp")))
@@ -3312,6 +3524,68 @@ class MutantCase(O3Case):
                                    "    except FileNotFoundError:\n        return None")])
         with self.assertRaises(subprocess.TimeoutExpired):
             scenario_s2_fifo_intents(self, bindir, timeout=10)
+
+    def test_m21_write_reply_snapshot_unbound_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", """    _need(summary["store_generation"] == record["store_generation"] and summary["snapshot_seq"] == record["seq"]
+          and summary["tail_hash"] == record["record_hash"] and summary["claim_seq"] == record["claim_seq"])
+""", "")])
+        w, out = scenario_r2b1_reply_across_snapshots(self, bindir)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertEqual(len(w.events("job-a", "job.round")), 1)
+
+    def test_m22_records_behind_the_job_read_unchecked_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", """    if current["snapshot_seq"] > snapshot:
+        raise CliFail("history_regressed", "seq_regressed")
+""", "")])
+        w, out = scenario_r2b2_records_behind_the_job(self, bindir)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertTrue(w.herdr_calls())
+
+    def test_m23_public_verdict_file_checked_before_routing_goes_red(self):
+        bindir = self.mutant_bin([("wrk", '  [[ -n "$file" ]] || die "round verdict requires an existing --file"\n'
+                                          '  if [[ -n "$head_repeat" ]]',
+                                   '  [[ -n "$file" && -f "$file" ]] || die "round verdict requires an existing --file"\n'
+                                   '  if [[ -n "$head_repeat" ]]')])
+        w, out, before = scenario_r2s1_public_verdict_replay(self, bindir)
+        self.assertEqual(out.returncode, 2)
+        self.assertEqual(len(w.appends("verdict")), before)
+        w, out, before = scenario_r2s2_unsendable_verdict(self, bindir)
+        self.assertEqual(out.returncode, 2)
+
+    def test_m24_report_read_before_the_replay_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", """    if not opts.get("--report"):
+        raise Fail("usage", "completed requires --report")
+""", """    if not opts.get("--report"):
+        raise Fail("usage", "completed requires --report")
+    report_payload(opts)
+""")])
+        w, out, before = scenario_r2s1_report_replay(self, "completed", bindir)
+        self.assertNotEqual(out.returncode, 0)
+        self.assertEqual(len(w.appends("completed")), before)
+
+    def test_m25_unreadable_verdict_file_as_usage_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", 'data = read_once(path, "verdict file", "invalid_request")',
+                                   'data = read_once(path, "verdict file")')])
+        w, out, before = scenario_r2s2_unsendable_verdict(self, bindir)
+        self.assertEqual(out.returncode, 2)
+
+    def test_m26_untyped_record_kind_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", """        except (TypeError, AttributeError, KeyError, IndexError, ValueError):
+            raise CliFail("protocol_invalid")""", """        except ZeroDivisionError:
+            raise CliFail("protocol_invalid")"""),
+                                  ("wrk_o3.py", '    _need(isinstance(record["kind"], str) and record["kind"] in PAYLOAD_KEYS)',
+                                   '    _need(record["kind"] in PAYLOAD_KEYS)')])
+        w, out = scenario_r2s3_record_kind_not_a_string(self, bindir)
+        self.assertIn("Traceback", out.stderr)
+        self.assertNotIn(out.returncode, (0, 75))
+
+    def test_m27_audit_turns_every_refusal_stale_goes_red(self):
+        bindir = self.mutant_bin([("wrk_o3.py", """        if exc.code not in offline_codes():
+            raise Fail(exc.code)
+        emit("STALE code=%s" % exc.code)""", """        emit("STALE code=%s" % exc.code)""")])
+        w, out = scenario_r2s4_audit_unauthorized(self, bindir)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("o3-stale", out.stdout)
 
 
 if __name__ == "__main__":
