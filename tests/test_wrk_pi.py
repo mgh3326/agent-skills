@@ -55,12 +55,17 @@ class PiSpawnTests(unittest.TestCase):
     def hosts(self, content):
         Path(self.env["WRK_HOSTS_CONFIG"]).write_text(content)
 
-    def spawn(self, profile="pi-sonnet55", effort="high", role="worker", **overrides):
+    def spawn(self, profile="pi-sonnet55", effort="high", role="worker",
+              purpose=None, operator_request=None, **overrides):
         env = dict(self.env, SCOPEFUEL_E6_ARM=f"{profile}@{effort or 'high'}")
         env.update(overrides)
         command = [str(self.wrk), "spawn", "--host", "local", "-c", str(self.tmp),
                    "-m", profile, "-p", str(self.brief), "-w", "w", "-l", "pi-fixture",
                    "--role", role, "--task", "2080", "--task-hk-bypass", "--t", "T1"]
+        if purpose is not None:
+            command += ["--purpose", purpose]
+        if operator_request is not None:
+            command += ["--operator-request", operator_request]
         if effort is not None:
             command += ["--effort", effort]
         if role == "builder":
@@ -94,6 +99,34 @@ class PiSpawnTests(unittest.TestCase):
                 self.assertIn("--no-mcp", launch)
                 self.assertIn(f"gate -m pi-sonnet55 --effort {effort}", self.log("gate.log"))
                 self.assertNotIn("send-keys", self.log())
+
+    def test_pi_worker_and_tester_roles_reach_gate(self):
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                (self.tmp / "gate.log").unlink(missing_ok=True)
+                result = self.spawn(profile="pi-haiku55", role=role)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.log("gate.log").splitlines()[0],
+                                 f"gate -m pi-haiku55 --effort high --role {role}")
+
+    def test_pi_builder_role_stays_refused_with_wrk_exit_2_before_admission(self):
+        result = self.spawn(profile="pi-haiku55", role="builder")
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("--role builder rejects 'pi-haiku55'", result.stderr)
+        self.assertIn("hk 2080", result.stderr)
+        self.assertEqual(self.log("gate.log"), "")
+        self.assertFalse((self.tmp / "claims.log").exists())
+        self.assertNotIn("tab create", self.log())
+
+    def test_non_pi_gate_argv_has_no_role(self):
+        for profile, gate_profile in (("sonnet", "sonnet"),
+                                      ("codex-sol", "codex-max")):
+            with self.subTest(profile=profile):
+                (self.tmp / "gate.log").unlink(missing_ok=True)
+                result = self.spawn(profile=profile, effort=None, WRK_SCOPEFUEL_LOG_ROLE="1")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.log("gate.log"),
+                                 f"gate -m {gate_profile}\n{gate_profile}\n")
 
     def test_profiles_and_defaults(self):
         for profile, model in PROFILES.items():
@@ -309,6 +342,14 @@ class PiMutantTests(unittest.TestCase):
     def test_call_site_mutants_are_killed_by_assertions(self):
         source = (ROOT / "bin/wrk").read_text()
         mutants = {
+            "pi-role-omitted": (
+                '  if [[ "$PROFILE_KIND" == pi || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
+                '  if [[ "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
+                "test_pi_worker_and_tester_roles_reach_gate"),
+            "role-all-profiles": (
+                '  if [[ "$PROFILE_KIND" == pi || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
+                '  if [[ "$MODEL" != __never__ ]]; then\n',
+                "test_non_pi_gate_argv_has_no_role"),
             "host": ('  pi_host_precheck\n', '  : # missing host guard\n',
                      "test_host_literal_true_only"),
             "thinking": ('pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING")',
