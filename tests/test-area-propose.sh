@@ -83,8 +83,7 @@ HK2012_TITLES = [
     (124, "시작 점검 메모"),
     (125, "[콘솔] 검색 개선"),
     (126, "콘텐츠 정리 메모"),
-    (127, "[hk 홈 전환] 순서 재정렬"),
-    (128, "홈 화면 정리"),
+    (128, "홈 전환"),
     (129, "pane 전수 조사를 읽기 전용으로"),
     (130, "읽기 쉬운 메모 정리"),
     (140, "scopefuel quota probe timing"),
@@ -239,8 +238,7 @@ want = [
     (124, "", "-"),                       # near-miss: no 시장
     (125, "web-frontend", "title:콘솔"),
     (126, "", "-"),                       # near-miss: no 콘솔
-    (127, "web-frontend", "title:홈 전환"),
-    (128, "", "-"),                       # near-miss: no 홈 전환
+    (128, "", "-"),                       # hk 2100: dropped pattern; 홈 전환 alone must not fire
     (129, "", "-"),                       # 읽기 전용 dropped: too generic (director-1)
     (130, "", "-"),                       # near-miss: no 읽기 전용
     (140, "python", "title:\\bscopefuel\\b"),      # project name on a projectless task
@@ -415,5 +413,77 @@ head -1 "$TMP/propose.tsv" | grep -qx $'id\tproject\ttitle\tcurrent_area\tpropos
   || fail "bad header: $(head -1 "$TMP/propose.tsv")"
 awk -F'\t' 'NR>1 && NF!=8 {exit 1}' "$TMP/propose.tsv" || fail "row column count"
 echo "PASS TSV shape"
+
+echo "== pattern-hits: scoped title census, under-threshold fails (hk 2100) =="
+
+# Dedicated fixture db: one projectless-scoped pattern hits a single title
+# (fixture-rare; its second occurrence sits on a project task and must not
+# count), the other patterns hit at least the default minimum of 3.
+python3 - "$TMP/ph-db.json" <<'PY'
+import json, sys
+db = {"areas": ["web-frontend", "docs"],
+      "tasks": {
+        "1": {"id": 1, "state": "backlog", "project": None,
+              "title": "fixture-alpha panel", "area": None, "refs": {}},
+        "2": {"id": 2, "state": "backlog", "project": None,
+              "title": "fixture-alpha drawer", "area": None, "refs": {}},
+        "3": {"id": 3, "state": "claimed", "project": None,
+              "title": "fixture-alpha header", "area": None, "refs": {}},
+        "4": {"id": 4, "state": "backlog", "project": None,
+              "title": "fixture-rare once", "area": None, "refs": {}},
+        "5": {"id": 5, "state": "backlog", "project": "proj",
+              "title": "fixture-rare on a project task", "area": None,
+              "refs": {}},
+        "6": {"id": 6, "state": "merged", "project": "proj",
+              "title": "fixture-doc note", "area": None, "refs": {}},
+        "7": {"id": 7, "state": "backlog", "project": None,
+              "title": "fixture-doc memo", "area": None, "refs": {}},
+        "8": {"id": 8, "state": "hold", "project": None,
+              "title": "fixture-doc guide", "area": None, "refs": {}},
+      }}
+with open(sys.argv[1], "w", encoding="utf-8") as f:
+    json.dump(db, f)
+PY
+
+python3 - "$TMP/ph-rules.json" "$TMP/ph-rules-ok.json" <<'PY'
+import json, sys
+base = {"comment": "fixture rules",
+        "exclude_title_patterns": [],
+        "file_area_patterns": [],
+        "title_keywords": [
+          {"area": "web-frontend", "projects": [""],
+           "patterns": ["fixture-alpha", "fixture-rare"]},
+          {"area": "docs", "patterns": ["fixture-doc"]}],
+        "project_defaults": {}}
+ok = json.loads(json.dumps(base))
+ok["title_keywords"][0]["patterns"] = ["fixture-alpha"]
+for path, doc in ((sys.argv[1], base), (sys.argv[2], ok)):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f)
+PY
+
+ph() {
+  env HANDOFFKEEP_BIN="$HK" HK_STATE="$TMP/ph-db.json" HK_LOG="$HK_LOG" \
+      "$TOOL" pattern-hits "$@"
+}
+
+: >"$HK_LOG"
+if ph --rules "$TMP/ph-rules.json" >"$TMP/ph.out" 2>"$TMP/ph.err"; then
+  fail "pattern-hits accepted a 1-hit scoped pattern"
+fi
+grep -q 'under-min.*fixture-rare' "$TMP/ph.out" \
+  || fail "under-min pattern not named: $(cat "$TMP/ph.out")"
+# Scope guard: the project copy of fixture-rare must not count.
+grep -q 'hits=1.*fixture-rare' "$TMP/ph.out" \
+  || fail "projects scope not applied: $(cat "$TMP/ph.out")"
+ph --rules "$TMP/ph-rules-ok.json" >"$TMP/ph-ok.out" \
+  || fail "pattern-hits failed with the under-min pattern removed"
+! grep -q 'under-min' "$TMP/ph-ok.out" \
+  || fail "under-min reported on a clean rules file"
+ph --rules "$TMP/ph-rules.json" --min 1 >/dev/null \
+  || fail "--min 1 still refused the 1-hit pattern"
+! grep -q 'call tasks set-area' "$HK_LOG" \
+  || fail "pattern-hits issued a write"
+echo "PASS pattern-hits census + threshold + scope"
 
 echo "ALL TESTS PASSED"

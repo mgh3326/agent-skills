@@ -116,10 +116,21 @@ os.utime(path, (stamp, stamp))
 PY
 }
 
+# ago SECONDS — ISO-8601 UTC instant SECONDS before now. Ended-job fixtures
+# are relative to the real clock so the age they test never drifts.
+ago() {
+  python3 -c '
+import datetime, sys
+moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+    seconds=int(sys.argv[1]))
+print(moment.strftime("%Y-%m-%dT%H:%M:%SZ"))
+' "$1"
+}
+
 # mk_ended_job JOB TASK_ID PANE [MOMENT] — claim(task_id) + spawned + completed,
 # all at MOMENT (default five days ago: past the default --heavy-age 3d).
 mk_ended_job() {
-  local moment="${4:-2026-10-21T00:00:00Z}"
+  local moment="${4:-$(ago 432000)}"
   local ev="$INBOX/$1/events"
   write_event "$ev" "$1" job.claim "$moment" \
     "{\"owner_lane\":\"lane-a\",\"label\":\"lbl\",\"task_id\":$2}"
@@ -172,14 +183,8 @@ os.utime(sys.argv[1], (stamp, stamp))
 PY
 }
 
-ago() { # DAYS — an ISO-8601 UTC moment DAYS days before now (no fixed dates)
-  python3 -c 'import datetime, sys
-now = datetime.datetime.now(datetime.timezone.utc)
-print((now - datetime.timedelta(days=float(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"
-}
-
 set_tree_mtime() { # DIR DAYS — DIR and everything inside it, DAYS days ago
-  python3 - "$1" "$(ago "$2")" <<'PY'
+  python3 - "$1" "$(ago $(( $2 * 86400 )))" <<'PY'
 import datetime, os, sys
 root, moment = sys.argv[1:3]
 stamp = datetime.datetime.fromisoformat(
@@ -413,7 +418,7 @@ echo "PASS ap2e pane-alive"
 # AP2f — inside --heavy-age: terminal record only moments old.
 reset_case ap2f
 hk_task 1 merged
-mk_ended_job ap2f 1 w:p9 "2026-10-26T10:00:00Z"
+mk_ended_job ap2f 1 w:p9 "$(ago 86400)"
 mk_artifact "$INBOX/ap2f/browser-cache"
 policy_min <<'JSON'
 [{"class": "cache", "root": "jobs", "glob": "browser-*"}]
@@ -716,7 +721,7 @@ grep -q "ap7b.*class=cache.*action=removed" <<<"$OUT" ||
 # --heavy-age 1d releases it.
 reset_case ap7c
 hk_task 1 merged
-mk_ended_job ap7c 1 w:p9 "2026-10-24T12:00:00Z"
+mk_ended_job ap7c 1 w:p9 "$(ago 172800)"
 mk_artifact "$INBOX/ap7c/browser-cache"
 policy_min <<'JSON'
 [{"class": "cache", "root": "jobs", "glob": "browser-*"}]
@@ -896,7 +901,7 @@ assert_guard_intact() { # JOB TAG — everything never-touch is still there
 # AP8a — glob *: top-level matches only.
 reset_case ap8a
 hk_task 1 merged
-mk_ended_job ap8a 1 w:p9 "$(ago 5)"
+mk_ended_job ap8a 1 w:p9
 mk_guard_tree ap8a
 policy_min <<'JSON'
 [{"class": "cache", "root": "jobs", "glob": "*"}]
@@ -921,7 +926,7 @@ grep -q "ap8a/outlinkdir.*action=refused reason=outside-job-dir" <<<"$OUT" ||
 # AP8b — glob **: every depth, links under symlinked ancestors included.
 reset_case ap8b
 hk_task 1 merged
-mk_ended_job ap8b 1 w:p9 "$(ago 5)"
+mk_ended_job ap8b 1 w:p9
 mk_guard_tree ap8b
 policy_min <<'JSON'
 [{"class": "cache", "root": "jobs", "glob": "**"},
@@ -959,8 +964,8 @@ for b in b c a; do mk_artifact "$INBOX/ap8c/unity/Proj/out-$b"; done
 set_tree_mtime "$INBOX/ap8c/unity/Proj/out-b" 2
 set_tree_mtime "$INBOX/ap8c/unity/Proj/out-c" 5
 set_tree_mtime "$INBOX/ap8c/unity/Proj/out-a" 9
-touch_mtime "$INBOX/ap8c/unity/Proj/run.log" "$(ago 1)"
-touch_mtime "$INBOX/ap8c/unity/Proj/meta.txt" "$(ago 1)"
+touch_mtime "$INBOX/ap8c/unity/Proj/run.log" "$(ago 86400)"
+touch_mtime "$INBOX/ap8c/unity/Proj/meta.txt" "$(ago 86400)"
 rm -f "$INBOX/ap8c/unity/Proj/cache.bin"
 policy_min <<'JSON'
 [{"class": "intermediate-build", "root": "jobs", "glob": "unity/*/*",
@@ -988,7 +993,7 @@ echo "PASS ap8 never-touch-scanner"
 echo "== AP9: a refusal after a valid row prints only the reason =="
 reset_case ap9
 hk_task 1 merged
-mk_ended_job ap9 1 w:p9 "$(ago 5)"
+mk_ended_job ap9 1 w:p9
 mk_artifact "$INBOX/ap9/browser-cache"
 base_envelope '[{"class":"cache","root":"jobs","glob":"browser-*"},{"class":"evidence","root":"jobs","glob":"e-*"}]' >"$POLICY"
 seq_gone
@@ -1011,7 +1016,7 @@ echo "PASS ap9 refusal-message"
 echo "== AP10: a prune record does not move the job's age =="
 reset_case ap10
 hk_task 1 merged
-mk_ended_job ap10 1 w:p9 "$(ago 5)"
+mk_ended_job ap10 1 w:p9
 # build-b is the newest, build-c was created next, build-a sorts first.
 for b in b c a; do mk_artifact "$INBOX/ap10/build-$b"; done
 set_tree_mtime "$INBOX/ap10/build-b" 1
@@ -1046,7 +1051,7 @@ echo "PASS ap10 prune-record-not-activity"
 echo "== AP11: a file name cannot forge a scan record =="
 reset_case ap11
 hk_task 1 merged
-mk_ended_job ap11 1 w:p9 "$(ago 5)"
+mk_ended_job ap11 1 w:p9
 printf 'must survive\n' >"$INBOX/ap11/report.md"
 printf 'cache\n' >"$INBOX/ap11/"$'spill\nreal\treport.md'
 printf 'cache\n' >"$INBOX/ap11/cache.bin"
@@ -1117,7 +1122,7 @@ mk_live_job ap12c 1 w:p9
 mk_artifact "$INBOX/ap12c/build-A"
 printf 'old\n' >"$INBOX/ap12c/build-A/old.bin"
 set_tree_mtime "$INBOX/ap12c/build-A" 1
-touch_mtime "$INBOX/ap12c/build-A/old.bin" "$(ago 10)"
+touch_mtime "$INBOX/ap12c/build-A/old.bin" "$(ago 864000)"
 policy_min <<'JSON'
 [{"class": "intermediate-build", "root": "jobs", "glob": "**",
   "keep_newest": 1}]
@@ -1136,7 +1141,7 @@ echo "PASS ap12 nested-matches-keep"
 echo "== AP13: a cache dir holding a refused match stays whole =="
 reset_case ap13a
 hk_task 1 merged
-mk_ended_job ap13a 1 w:p9 "$(ago 5)"
+mk_ended_job ap13a 1 w:p9
 printf 'report\n' >"$INBOX/ap13a/report.md"
 OUTSIDE13="$TMP/ap13a-outside"; mkdir -p "$OUTSIDE13"; printf 'out\n' >"$OUTSIDE13/real.bin"
 mkdir -p "$INBOX/ap13a/cache-folder"
@@ -1162,7 +1167,7 @@ grep -q "cache-folder .*action=refused reason=holds-never-touch" <<<"$OUT" ||
 
 reset_case ap13b
 hk_task 1 merged
-mk_ended_job ap13b 1 w:p9 "$(ago 5)"
+mk_ended_job ap13b 1 w:p9
 printf 'report\n' >"$INBOX/ap13b/report.md"
 mkdir -p "$INBOX/ap13b/cache-folder"
 ln -s ../report.md "$INBOX/ap13b/cache-folder/safe-link"
@@ -1287,7 +1292,7 @@ JSON
 case_mut_guard() {
   reset_case mutgd || return 3
   hk_task 1 merged || return 3
-  mk_ended_job mutgd 1 w:p9 "$(ago 5)" || return 3
+  mk_ended_job mutgd 1 w:p9 || return 3
   printf 'report\n' >"$INBOX/mutgd/report.md" || return 3
   mk_artifact "$INBOX/mutgd/browser-cache" || return 3
   policy_min <<'JSON' || return 3
@@ -1302,7 +1307,7 @@ JSON
 case_mut_linkguard() {
   reset_case mutlg || return 3
   hk_task 1 merged || return 3
-  mk_ended_job mutlg 1 w:p9 "$(ago 5)" || return 3
+  mk_ended_job mutlg 1 w:p9 || return 3
   printf 'report\n' >"$INBOX/mutlg/report.md" || return 3
   mkdir -p "$INBOX/mutlg/refs" || return 3
   ln -s ../report.md "$INBOX/mutlg/refs/x" || return 3
@@ -1318,7 +1323,7 @@ JSON
 case_mut_age() {
   reset_case mutag || return 3
   hk_task 1 merged || return 3
-  mk_ended_job mutag 1 w:p9 "$(ago 5)" || return 3
+  mk_ended_job mutag 1 w:p9 || return 3
   local b
   for b in b c a; do mk_artifact "$INBOX/mutag/build-$b" || return 3; done
   set_tree_mtime "$INBOX/mutag/build-b" 1 || return 3
@@ -1342,7 +1347,7 @@ JSON
 case_mut_rows() {
   reset_case mutrw || return 3
   hk_task 1 merged || return 3
-  mk_ended_job mutrw 1 w:p9 "$(ago 5)" || return 3
+  mk_ended_job mutrw 1 w:p9 || return 3
   mk_artifact "$INBOX/mutrw/browser-cache" || return 3
   base_envelope '[{"class":"cache","root":"jobs","glob":"browser-*"},{"class":"evidence","root":"jobs","glob":"e-*"}]' >"$POLICY" || return 3
   seq_gone
@@ -1356,7 +1361,7 @@ case_mut_rows() {
 case_mut_holds() {
   reset_case muthd || return 3
   hk_task 1 merged || return 3
-  mk_ended_job muthd 1 w:p9 "$(ago 5)" || return 3
+  mk_ended_job muthd 1 w:p9 || return 3
   mkdir -p "$INBOX/muthd/unity/Proj" || return 3
   printf 'run\n' >"$INBOX/muthd/unity/Proj/run.log" || return 3
   policy_min <<'JSON' || return 3
@@ -1373,7 +1378,7 @@ JSON
 case_mut_unsafe() {
   reset_case mutun || return 3
   hk_task 1 merged || return 3
-  mk_ended_job mutun 1 w:p9 "$(ago 5)" || return 3
+  mk_ended_job mutun 1 w:p9 || return 3
   printf 'must survive\n' >"$INBOX/mutun/report.md" || return 3
   printf 'cache\n' >"$INBOX/mutun/"$'spill\nreal\treport.md' || return 3
   policy_min <<'JSON' || return 3
@@ -1388,7 +1393,7 @@ JSON
 case_mut_held() {
   reset_case muthl || return 3
   hk_task 1 merged || return 3
-  mk_ended_job muthl 1 w:p9 "$(ago 5)" || return 3
+  mk_ended_job muthl 1 w:p9 || return 3
   local outside="$TMP/muthl-outside"
   mkdir -p "$outside" "$INBOX/muthl/cache-folder" || return 3
   printf 'data\n' >"$INBOX/muthl/cache-folder/data.bin" || return 3
@@ -1420,7 +1425,7 @@ JSON
 case_mut_linkwalk() {
   reset_case mutlw || return 3
   hk_task 1 merged || return 3
-  mk_ended_job mutlw 1 w:p9 "$(ago 5)" || return 3
+  mk_ended_job mutlw 1 w:p9 || return 3
   printf 'report\n' >"$INBOX/mutlw/report.md" || return 3
   mkdir -p "$INBOX/mutlw/cache-folder" || return 3
   ln -s ../report.md "$INBOX/mutlw/cache-folder/safe-link" || return 3
