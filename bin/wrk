@@ -14927,22 +14927,22 @@ PY
 # Print the first applicable keep-class row that matches, contains or is
 # contained by a candidate. The same rule protects cache and build paths.
 prune_artifact_keep_conflict() {
-  python3 - "$1" "$2" "$3" <<'PY'
+  python3 - "$1" "$2" "$3" "$4" <<'PY'
 import glob, os, sys
-jobdir, candidate, rows = sys.argv[1:]
+jobdir, candidate, rows, actual_host = sys.argv[1:]
 candidate = os.path.realpath(candidate)
 for line in rows.splitlines():
     f = line.split("\t")
     if len(f) != 10 or f[0] not in {"record-text", "evidence", "final-build", "protected"}:
         continue
-    cls, _name, root, kind, pattern, _keep, host, job, _mirror, index = f
+    cls, _name, root, kind, pattern, _keep, row_host, job, _mirror, index = f
     if kind == "per-job" and root != os.path.dirname(jobdir):
         continue
     if kind == "flat" and root != jobdir:
         continue
     if job not in ("", "-") and job != os.path.basename(jobdir):
         continue
-    if host not in ("", "-") and host != os.environ.get("WRK_ARTIFACT_HOST", os.environ.get("HOSTNAME", "unknown")):
+    if row_host not in ("", "-") and row_host != actual_host:
         continue
     for keep in glob.glob(os.path.join(jobdir, pattern), recursive=True):
         keep = os.path.realpath(keep)
@@ -15005,7 +15005,7 @@ prune_artifact_pass() {
     echo "artifact-prune: no policy file at $policy — pass skipped"
     return 0
   fi
-  local work_root parsed="" rc=0
+  local work_root parsed="" rc=0 artifact_host="${WRK_ARTIFACT_HOST:-${HOSTNAME:-unknown}}"
   work_root="$(dirname "$(dirname "$jobs_root")")"
   parsed="$(prune_artifact_policy_load "$policy" "$work_root")" || rc=$?
   if (( rc != 0 )); then
@@ -15036,7 +15036,7 @@ prune_artifact_pass() {
     is_jobs=0
     [[ "$real_root" == "$jobs_real" ]] && is_jobs=1
     [[ "$root_kind" == flat ]] && is_jobs=0
-    [[ "$row_host" == "" || "$row_host" == "${WRK_ARTIFACT_HOST:-${HOSTNAME:-unknown}}" ]] || continue
+    [[ "$row_host" == "" || "$row_host" == "$artifact_host" ]] || continue
     [[ -z "$lane" || "$root_kind" == per-job ]] || continue
     if [[ "$root_kind" == flat ]]; then
       artifact_entries=("$abs_root")
@@ -15208,7 +15208,7 @@ prune_artifact_pass() {
           fi
         fi
         local keep_conflict=""
-        keep_conflict="$(prune_artifact_keep_conflict "$jobdir" "$match" "$parsed")" || true
+        keep_conflict="$(prune_artifact_keep_conflict "$jobdir" "$match" "$parsed" "$artifact_host")" || true
         if [[ -n "$keep_conflict" ]]; then
           echo "artifact job=$job class=$cls path=$match action=skipped reason=keep-class-precedence $keep_conflict"
           continue
@@ -15534,6 +15534,9 @@ artifacts_mark_final_cmd() {
     esac
   done
   [[ -n "$by" ]] || die "artifacts mark-final requires --by LANE"
+  if ! ascii_re "$job" '^[A-Za-z0-9._-]+$' || [[ "$job" == . || "$job" == .. ]]; then
+    die "artifacts mark-final: JOB must be a job id"
+  fi
   local jobdir jobs_root target policy work_root parsed is_cache
   jobs_root="$(wrk_jobs_root)"; jobdir="$jobs_root/$job"
   [[ -d "$jobdir" && ! -L "$jobdir" ]] || die "artifacts mark-final: job directory missing or symlinked"

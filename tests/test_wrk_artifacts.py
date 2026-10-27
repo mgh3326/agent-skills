@@ -361,6 +361,51 @@ class ArtifactsContract(unittest.TestCase):
         self.assertNotEqual(refused.returncode, 0)
         self.assertIn("cache path", refused.stderr)
 
+    def test_mark_final_job_id_allowlist_and_mutant_red(self):
+        normal = self.jobs / "normal-job"
+        normal.mkdir()
+        (normal / "release.apk").write_bytes(b"valid job id")
+        accepted = self.run_wrk(
+            "artifacts", "mark-final", "normal-job", "release.apk",
+            "--by", "integrator")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertTrue((normal / "final-build.json").is_file())
+
+        absolute_job = str(self.base / "absolute-job")
+        cases = [
+            ("..", self.jobs.parent),
+            (".", self.jobs),
+            ("a/b", self.jobs / "a/b"),
+            (absolute_job, self.jobs / absolute_job.lstrip(os.sep)),
+            ("", self.jobs),
+        ]
+        for job_id, directory in cases:
+            with self.subTest(job_id=job_id):
+                directory.mkdir(parents=True, exist_ok=True)
+                (directory / "release.apk").write_bytes(b"must not be marked")
+                refused = self.run_wrk(
+                    "artifacts", "mark-final", job_id, "release.apk",
+                    "--by", "integrator")
+                self.assertNotEqual(refused.returncode, 0, refused.stdout)
+                self.assertFalse((directory / "final-build.json").exists())
+                self.assertFalse((directory / "events").exists())
+
+        source = WRK.read_text()
+        old = '''  if ! ascii_re "$job" '^[A-Za-z0-9._-]+$' || [[ "$job" == . || "$job" == .. ]]; then
+    die "artifacts mark-final: JOB must be a job id"
+  fi'''
+        mutated = source.replace(old, "  if False; then\n    die \"artifacts mark-final: JOB must be a job id\"\n  fi")
+        self.assertNotEqual(mutated, source, "job allowlist mutation must match the guard")
+        mutant = self.base / "mutant-no-job-allowlist"
+        mutant.write_text(mutated, encoding="utf-8")
+        mutant.chmod(0o755)
+        result = self.run_wrk(
+            "artifacts", "mark-final", "..", "release.apk", "--by", "integrator",
+            binary=mutant)
+        with self.assertRaises(AssertionError, msg="mutant without JOB allowlist must go RED"):
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+        print("MUTATION RED: mark-final JOB allowlist removed")
+
     def test_prune_keep_precedence_and_mutant_red(self):
         self.policy["rows"] = [
             self.row("intermediate-build", glob="run1-raw/**", keep_newest=1),

@@ -2,6 +2,7 @@
 wrk|bash tests/test-wrk.sh
 suites-a|bash tests/test-wrk-artifacts-move.sh
 suites-a|bash tests/test-wrk-artifacts-routing.sh
+suites-a|bash tests/test-wrk-artifact-prune.sh
 suites-a|bash tests/wrk_spillover.sh
 suites-a|bash tests/test-tester-eligible.sh
 suites-a|bash tests/test-t3-split-rule.sh
@@ -43,6 +44,7 @@ python|python3 -m unittest discover -s tests -p 'test_wrk_fusion_sol_quota.py' -
 python|python3 -m unittest discover -s tests -p 'test_quota_stale_report.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
+python|python3 -m unittest discover -s tests -p 'test_wrk_artifacts.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_pi.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_cmd.py' -v
 python|python3 -m unittest discover -s tests/o3 -p 'test_*.py' -v

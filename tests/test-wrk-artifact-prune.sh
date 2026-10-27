@@ -15,6 +15,9 @@
 # resolve exactly like production.
 set -euo pipefail
 export WRK_TEST_MODE=1
+# Exercise the bash-only HOSTNAME fallback: Bash populates HOSTNAME in each
+# process but does not export it unless explicitly requested.
+export -n HOSTNAME 2>/dev/null || true
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="${WRK_TEST_BIN:-$ROOT/bin/wrk}"
@@ -87,7 +90,7 @@ reset_case() {
 }
 
 prune_run() {
-  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+  env -u WRK_ARTIFACT_HOST HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
     XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
     ${GET_SEQ:+WRK_FIXTURE_GET_SEQUENCE="$GET_SEQ"} \
     ${HK_MODE_VAR:+HK_MODE="$HK_MODE_VAR"} \
@@ -1340,6 +1343,69 @@ bounded 120 bash -c '. "$1"; prune_artifact_scan "$2" "$3"' _ "$SCANNER" "$INBOX
 echo "PASS ap15 bounded-scan"
 
 # ════════════════════════════════════════════════════════════════════════
+# T1 — the keep-conflict helper receives the same host Bash used to filter
+# rows. HOSTNAME is intentionally unexported; WRK_ARTIFACT_HOST is removed
+# from every prune invocation.
+# ════════════════════════════════════════════════════════════════════════
+echo "== T1: host-scoped keep rows reach the conflict helper =="
+
+prepare_host_keep_case() { # JOB KEEP_HOST — eligible ended job and policy
+  local job="$1" keep_host="$2" actual_host="${HOSTNAME:-unknown}"
+  reset_case "$job" || return 1
+  hk_task 1 merged || return 1
+  mk_ended_job "$job" 1 w:p9 || return 1
+  mk_artifact "$INBOX/$job/cache-host" || return 1
+  printf 'keep host record\n' >"$INBOX/$job/cache-host/record.txt" || return 1
+  policy_min <<JSON || return 1
+[
+ {"class":"cache","root":"jobs","glob":"cache-host","host":"$actual_host"},
+ {"class":"record-text","root":"jobs","glob":"cache-host/record.txt","host":"$keep_host"}
+]
+JSON
+  seq_gone || return 1
+}
+
+case_host_same_keep() {
+  local host="${HOSTNAME:-unknown}" out=""
+  prepare_host_keep_case host-same "$host" || return 3
+  out="$(prune_run --apply)" || return 3
+  [[ -f "$INBOX/host-same/cache-host/record.txt" ]] ||
+    assertion_red "same-host record-text row must protect cache contents (host=$host; output=$out)"
+  grep -q 'keep-class-precedence.*class=record-text' <<<"$out" ||
+    assertion_red "same-host keep conflict must be reported (host=$host; output=$out)"
+}
+
+case_host_different_keep() {
+  local host="${HOSTNAME:-unknown}" other="different-${HOSTNAME:-host}" out=""
+  prepare_host_keep_case host-different "$other" || return 3
+  out="$(prune_run --apply)" || return 3
+  [[ ! -e "$INBOX/host-different/cache-host" ]] ||
+    assertion_red "a different-host record-text row must not keep this host's cache (output=$out)"
+  grep -q 'action=removed' <<<"$out" ||
+    assertion_red "matching cache row keeps existing different-host behavior (output=$out)"
+}
+
+case_mut_host_env() {
+  local host="${HOSTNAME:-unknown}" out=""
+  prepare_host_keep_case host-mut-env "$host" || return 3
+  out="$(prune_run --apply)" || return 3
+  [[ -f "$INBOX/host-mut-env/cache-host/record.txt" ]] ||
+    assertion_red "host-scoped keep row must survive a helper that re-reads process environment"
+}
+
+case_mut_host_arg() {
+  local host="${HOSTNAME:-unknown}" out=""
+  prepare_host_keep_case host-mut-arg "$host" || return 3
+  out="$(prune_run --apply)" || return 3
+  [[ -f "$INBOX/host-mut-arg/cache-host/record.txt" ]] ||
+    assertion_red "host-scoped keep row must survive when the host argument is dropped"
+}
+
+case_host_same_keep || fail "T1 same-host keep conflict failed"
+case_host_different_keep || fail "T1 different-host behavior failed"
+echo "PASS T1 host-scoped keep conflict and host mismatch"
+
+# ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants, each applied at its real call site.
 # ════════════════════════════════════════════════════════════════════════
 echo "== MUT: assertion-RED mutants per brief =="
@@ -1744,5 +1810,13 @@ expect_mut_red "entry-not-collapsed-to-one-record" case_mut_alias "kept payload 
 # M17 — the match cap does not fail the scan closed.
 mkmut cap 's/if len(raw) > MAX_MATCHES:/if False:/'
 expect_mut_red "endless-match-list-not-refused" case_mut_cap "symlink cycle under ** must fail the scan closed"
+
+# T1 mutants at the call sites: re-reading process environment in Python, or
+# dropping the resolved host argument from the helper invocation.
+mkmut host-env 's/jobdir, candidate, rows, actual_host = sys.argv\[1:\]/jobdir, candidate, rows, actual_host = sys.argv[1:]; actual_host = os.environ.get("WRK_ARTIFACT_HOST", os.environ.get("HOSTNAME", "unknown"))/'
+expect_mut_red "keep-helper-rereads-HOSTNAME" case_mut_host_env "host-scoped keep row must survive"
+
+mkmut host-arg 's/"\$parsed" "\$artifact_host")/"\$parsed")/'
+expect_mut_red "keep-helper-host-argument-dropped" case_mut_host_arg "host-scoped keep row must survive"
 
 echo "ALL ARTIFACT-PRUNE CONTRACT TESTS PASSED"
