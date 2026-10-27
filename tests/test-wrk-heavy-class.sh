@@ -169,16 +169,18 @@ def check_signal_surface(source):
     imports = re.findall(r"(?m)^import[^\n]*\bsignal\b|^from signal\b", source)
     assert len(imports) == 1, ("signal import must be limited to wait handlers", imports)
     attrs = re.findall(r"\bsignal\.([A-Za-z_][A-Za-z0-9_]*)", source)
-    assert set(attrs) <= {"signal", "SIGHUP", "SIGTERM", "SIG_DFL"}, attrs
+    assert set(attrs) <= {"signal", "SIGHUP", "SIGTERM", "SIG_IGN"}, attrs
     calls = [line.strip() for line in source.splitlines()
-             if re.match(r"\s*signal\.signal\(", line)]
+             if re.search(r"\bsignal\.signal\(", line)]
     expected = [
-        "signal.signal(signal.SIGHUP, wait_signal_handler)",
-        "signal.signal(signal.SIGTERM, wait_signal_handler)",
-        "signal.signal(signal.SIGHUP, signal.SIG_DFL)",
-        "signal.signal(signal.SIGTERM, signal.SIG_DFL)",
+        "previous_hup_handler = signal.signal(signal.SIGHUP, wait_signal_handler)",
+        "previous_term_handler = signal.signal(signal.SIGTERM, wait_signal_handler)",
+        "signal.signal(signal.SIGHUP, signal.SIG_IGN)",
+        "signal.signal(signal.SIGTERM, signal.SIG_IGN)",
+        "signal.signal(signal.SIGHUP, previous_hup_handler)",
+        "signal.signal(signal.SIGTERM, previous_term_handler)",
     ]
-    assert calls == expected, ("only wait-handler registration/reset is allowed", calls)
+    assert calls == expected, ("only wait-handler registration/disposition restore is allowed", calls)
 
 check_signal_surface(half)
 mutant = half.replace(

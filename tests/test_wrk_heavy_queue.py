@@ -401,6 +401,22 @@ class HeavyQueue(unittest.TestCase):
                     self.release("signal-holder-" + str(sig))
                     holder.wait(timeout=5)
 
+    def test_inherited_ignored_signals_are_restored_for_command(self):
+        for sig, name in ((signal.SIGHUP, "HUP"), (signal.SIGTERM, "TERM")):
+            with self.subTest(signal=sig):
+                command = f"kill -{name} $$; echo survived"
+
+                def ignore_signal_in_child(signal_number=sig):
+                    signal.signal(signal_number, signal.SIG_IGN)
+
+                result = subprocess.run(
+                    [str(WRK), "heavy", "--", "sh", "-c", command],
+                    env=self.env, capture_output=True, text=True, timeout=10,
+                    preexec_fn=ignore_signal_in_child, check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("survived", result.stdout,
+                              "heavy changed an inherited SIG_IGN disposition")
+
     def test_lane_defer_guard_is_monotonic_and_never_preempts_holder(self):
         holder = self.start("lane-guard-holder")
         older = self.spawn("stopped-older")
@@ -893,10 +909,17 @@ class HeavyQueue(unittest.TestCase):
                                 'if False:\n')],
              "test_lane_defer_guard_is_monotonic_and_never_preempts_holder",
              "lane waiter did not take a free slot after its defer bound"),
-            ("no-hup-handler", [('    signal.signal(signal.SIGHUP, wait_signal_handler)\n',
-                                  '    pass  # mutant: leave SIGHUP at its default action\n')],
+            ("no-hup-handler", [('    previous_hup_handler = signal.signal(signal.SIGHUP, wait_signal_handler)\n',
+                                  '    previous_hup_handler = signal.signal(signal.SIGHUP, signal.SIG_DFL)\n')],
              "test_wait_signals_remove_own_record_and_exit_with_signal_status",
              ("129", "signal left the waiter's reservation behind")),
+            ("reset-inherited-ignore", [
+                ("    signal.signal(signal.SIGHUP, previous_hup_handler)\n",
+                 "    signal.signal(signal.SIGHUP, signal.SIG_DFL)\n"),
+                ("    signal.signal(signal.SIGTERM, previous_term_handler)\n",
+                 "    signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"),
+            ], "test_inherited_ignored_signals_are_restored_for_command",
+             "heavy changed an inherited SIG_IGN disposition"),
         ]
         for name, changes, case, invariant in mutations:
             with self.subTest(invariant=invariant):

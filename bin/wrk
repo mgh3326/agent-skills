@@ -13911,8 +13911,16 @@ try:
             pass
         raise SystemExit(128 + signum)
 
-    signal.signal(signal.SIGHUP, wait_signal_handler)
-    signal.signal(signal.SIGTERM, wait_signal_handler)
+    # Preserve dispositions inherited by this wrapper. nohup sets SIGHUP to
+    # SIG_IGN; leave that signal ignored while waiting and restore the exact
+    # prior dispositions before starting the command. signal.signal returns
+    # the previous action, so no extra signal API can affect a slot holder.
+    previous_hup_handler = signal.signal(signal.SIGHUP, wait_signal_handler)
+    previous_term_handler = signal.signal(signal.SIGTERM, wait_signal_handler)
+    if previous_hup_handler is signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    if previous_term_handler is signal.SIG_IGN:
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
     publish_record()
     while True:
         try:
@@ -14032,8 +14040,8 @@ try:
         except KeyboardInterrupt:
             fail("interrupted while waiting for load to drop "
                  "-- command not run", 130)
-    signal.signal(signal.SIGHUP, signal.SIG_DFL)
-    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    signal.signal(signal.SIGHUP, previous_hup_handler)
+    signal.signal(signal.SIGTERM, previous_term_handler)
     run_at = time.monotonic()
     try:
         rc = run_command()
