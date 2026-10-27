@@ -750,6 +750,9 @@ mkmut() { # MUT NAME SED-EXPR — build a mutated wrk copy
   if ! { sed "$1" "$WRK" >"$mut" && chmod +x "$mut"; }; then
     fail "mutant build failed: $1"
   fi
+  if cmp -s "$WRK" "$mut"; then
+    fail "mutant did not change its production call site: $1"
+  fi
   MUT="$mut"
 }
 
@@ -832,7 +835,8 @@ expect_mut_red "task_validate removal" case_usage
 mkmut no-precheck 's/^[[:space:]]*hk_task_precheck$/  : hk_task_precheck removed by mutant/'
 expect_mut_red "hk_task_precheck removal" case_hkdown
 
-mkmut no-link 's/^  hk_task_link$/  : hk_task_link removed by mutant/'
+# shellcheck disable=SC2016 # the O3 flag is literal production source text
+mkmut no-link 's/^  hk_task_link$/  : hk_task_link removed by mutant/; s/^  \[\[ "$O3_SPAWN_VERIFIED" -eq 1 \]\] || hk_task_link$/  : hk_task_link removed by mutant/'
 expect_mut_red "hk_task_link removal" case_link
 
 mkmut no-verify 's/raise SystemExit(0 if ok else 1)/raise SystemExit(0)/'
@@ -845,7 +849,8 @@ expect_mut_red "claim task_id arg removal" case_meta
 mkmut no-terminal-check 's/die "takeover refused: old job.*still live; no work-terminal follows its newest revive"/: # terminal guard removed by mutant/'
 expect_mut_red "live old-job terminal check removal" case_takeover_live
 
-mkmut no-rebind-call 's/^  hk_task_takeover_rebind$/  : rebind call removed by mutant/'
+# shellcheck disable=SC2016 # the O3 flag is literal production source text
+mkmut no-rebind-call 's/^  hk_task_takeover_rebind$/  : rebind call removed by mutant/; s/^  \[\[ "$O3_SPAWN_VERIFIED" -eq 1 \]\] || hk_task_takeover_rebind$/  : rebind call removed by mutant/'
 expect_mut_red "refused rebind leaves no pane or partial record" case_takeover_refusal
 
 mkmut no-round-inheritance 's/used += wrk_takeover_rounds(events)/# takeover inheritance removed by mutant/'
