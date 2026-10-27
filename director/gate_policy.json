@@ -157,7 +157,7 @@
   "local_sources": {
     ".github/workflows/ci.yml": "22c09aae80da892cd851a1ee1019c7193fbcabb433550b729906e08e465ccd6a",
     "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
-    "bin/wrk": "db73ce762a459cbae6b39ca25068fe59cb772bc095c96ca03d482524d4bae183",
+    "bin/wrk": "456cbaa28d080842c57cb43871c1cd73bcba7de3e60fcc0230acd88234995166",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
     "builder/SKILL.md": "116315fcfcff000c4933b62068b128e7bfecf820e7b72f238c1bd8c227722713",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
@@ -2280,7 +2280,7 @@
         "max": null
       },
       "launcher": "cmd",
-      "launcher_model_token": "-m deepseek/deepseek-v4.1-flash",
+      "launcher_model_token": "PROFILE_MODEL=deepseek/deepseek-v4.1-flash",
       "model": "deepseek-v4.1-flash",
       "role_status": "unknown",
       "roles": [
