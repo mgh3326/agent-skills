@@ -363,6 +363,13 @@ class ArtifactsContract(unittest.TestCase):
         self.assertTrue(old.exists(), result.stdout)
         self.assertIn("keep-class-precedence", result.stdout)
 
+        classified = self.run_wrk("artifacts", "classify", "--job", "precedence", "--json")
+        self.assertEqual(classified.returncode, 0, classified.stderr)
+        conflict_rows = json.loads(classified.stdout)["jobs"]["precedence"]["conflicts"]
+        changed_conflicts = [row for row in conflict_rows if row["path"].endswith("/run1-raw/changed.txt")]
+        self.assertEqual(len(changed_conflicts), 1, changed_conflicts)
+        self.assertEqual(changed_conflicts[0]["classes"], ["intermediate-build", "record-text"])
+
         source = WRK.read_text()
         mutated = source.replace('if [[ -n "$keep_conflict" ]]; then', "if false; then")
         self.assertNotEqual(mutated, source)

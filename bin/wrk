@@ -14282,7 +14282,8 @@ for job,out in jobs.items():
     out['never_touch']=sorted(set(out['never_touch']))
     out['mirror_required']=sorted(set(out['mirror_required']))
     out['unclassified'].sort(key=lambda x:x['path'])
-    out['conflicts'].sort(key=lambda x:x['path'])
+    conflict_keys={(item['path'],tuple(sorted(set(item['classes'])))) for item in out['conflicts']}
+    out['conflicts']=[{"path":path,"classes":list(classes)} for path,classes in sorted(conflict_keys)]
 result={"host":host,"jobs":jobs}
 if as_json: print(json.dumps(result,sort_keys=True))
 else:
