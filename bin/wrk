@@ -14249,7 +14249,7 @@ for d in docs:
         continue
     try:
         rec = json.loads(d.get("body") or "")
-    except ValueError:
+    except (TypeError, ValueError, RecursionError):
         line("dataset=%s skip reason=bad-record" % key)
         continue
     if not isinstance(rec, dict) or rec.get("schema") != "fleet.artifact.v2":
@@ -14589,9 +14589,10 @@ import json, sys
 key = sys.argv[1]
 try:
     doc = json.loads(sys.stdin.read())
-except ValueError:
+except (ValueError, RecursionError):
     doc = None
-if not isinstance(doc, dict):
+if not isinstance(doc, dict) or not isinstance(doc.get("body"), str) \
+        or not doc.get("body"):
     print(json.dumps({"key": key, "kind": "note", "body": "", "_error": True}))
     raise SystemExit(0)
 print(json.dumps({"key": doc.get("key") or "", "kind": doc.get("kind") or "note",

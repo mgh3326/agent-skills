@@ -920,4 +920,64 @@ have_not "Traceback" || fail "sw19 leaked a traceback: $SWEEP_OUT"
 [[ -f "$JD/evidence/x.png" ]] || fail "sw19 deleted without a readable record"
 echo "PASS sw19-bad-doc-json"
 
+# ─────────────────────────────────────────────────────────────────────────────
+echo "== sw20: a JSON doc get with a non-string body is a fetch failure =="
+reset_case sw20
+write_hosts
+write_policy
+mk_ended_job sw20 231 w:p9
+mk_task 231 merged proj sw20
+JD="$INBOX/sw20"
+mkdir -p "$JD/evidence"
+printf 'x\n' >"$JD/evidence/z.png"
+R="$(mk_row evidence/z.png "$JD/evidence/z.png")"
+mk_record "artifacts/proj/231/sw20" test-host sw20 231 proj "$JD" drive_confirmed "[$R]"
+WRAP="$TMP/badbody-hk"
+cat >"$WRAP" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-} ${2:-}" == "doc get" ]]; then
+  printf '{"key":"%s","kind":"note","body":{"schema":"fleet.artifact.v2"}}\n' "${3:-}"
+  exit 0
+fi
+exec "$WRK_ARTIFACTS_BADBODY_HK" "$@"
+SH
+chmod +x "$WRAP"
+sweep HANDOFFKEEP_BIN="$WRAP" WRK_ARTIFACTS_BADBODY_HK="$HK" --job sw20 --apply
+[[ "$SWEEP_RC" == 0 ]] || fail "sw20 rc=$SWEEP_RC: $SWEEP_OUT"
+have "skip reason=record-fetch-failed" ||
+  fail "sw20 must report record-fetch-failed: $SWEEP_OUT"
+have_not "Traceback" || fail "sw20 leaked a traceback: $SWEEP_OUT"
+[[ -f "$JD/evidence/z.png" ]] || fail "sw20 deleted without a readable record"
+echo "PASS sw20-bad-body-type"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "== sw21: a JSON doc get with no body is a fetch failure =="
+reset_case sw21
+write_hosts
+write_policy
+mk_ended_job sw21 232 w:p9
+mk_task 232 merged proj sw21
+JD="$INBOX/sw21"
+mkdir -p "$JD/evidence"
+printf 'x\n' >"$JD/evidence/z.png"
+R="$(mk_row evidence/z.png "$JD/evidence/z.png")"
+mk_record "artifacts/proj/232/sw21" test-host sw21 232 proj "$JD" drive_confirmed "[$R]"
+WRAP="$TMP/nobody-hk"
+cat >"$WRAP" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-} ${2:-}" == "doc get" ]]; then
+  printf '{"key":"%s","kind":"note"}\n' "${3:-}"
+  exit 0
+fi
+exec "$WRK_ARTIFACTS_NOBODY_HK" "$@"
+SH
+chmod +x "$WRAP"
+sweep HANDOFFKEEP_BIN="$WRAP" WRK_ARTIFACTS_NOBODY_HK="$HK" --job sw21 --apply
+[[ "$SWEEP_RC" == 0 ]] || fail "sw21 rc=$SWEEP_RC: $SWEEP_OUT"
+have "skip reason=record-fetch-failed" ||
+  fail "sw21 must report record-fetch-failed: $SWEEP_OUT"
+have_not "Traceback" || fail "sw21 leaked a traceback: $SWEEP_OUT"
+[[ -f "$JD/evidence/z.png" ]] || fail "sw21 deleted without a readable record"
+echo "PASS sw21-missing-body"
+
 echo "ALL PASS"
