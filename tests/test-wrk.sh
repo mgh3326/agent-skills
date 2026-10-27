@@ -10730,8 +10730,13 @@ assert d["jobs"][0]["state"] == "leased" and d["quota_pool_records"] == [] and d
   orphan_spawn="$(spawn_base codex-luna --job "$job" --t T2 2>&1)"
   orphan_spawn_rc=$?
   set -e
-  TW_TMP="$ARBITER_INBOX_ROOT" tmp_writers_stop || \
-    fail "hk2105 $variant fixture writer did not stop"
+  TW_TMP="$ARBITER_INBOX_ROOT" tmp_writers_stop || {
+    local leftover_pid
+    for leftover_pid in $TW_LEFTOVER_PIDS; do
+      ps -o pid=,ppid=,pgid=,stat=,lstart=,args= -p "$leftover_pid" >&2 2>/dev/null || true
+    done
+    fail "hk2105 $variant fixture writer did not stop:${TW_LEFTOVER_PIDS:-}"
+  }
   [[ "$orphan_spawn_rc" -eq 0 ]] || fail "hk2105 $variant respawn failed: $orphan_spawn"
   grep -q '^OK ' <<<"$orphan_spawn" || fail "hk2105 $variant respawn failed: $orphan_spawn"
   "$ARBITER" job-get --job "$job" --json | python3 -c '
