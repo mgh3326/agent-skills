@@ -303,7 +303,7 @@ run_move() {
 fp_hash() { python3 -c 'import hashlib,sys;print(hashlib.sha256(sys.argv[1].encode()).hexdigest())' "$1"; }
 fp_spec() { printf '%s' "$2" >"$FPBULK_DIR/spec/$(fp_hash "$DEST/$1")"; }
 fp_evict() { printf '%s' "$2" >"$FPBULK_DIR/evict/$(fp_hash "$DEST/$1")"; }
-fp_calls() { [[ -f "$FPBULK_DIR/calls.log" ]] && cat "$FPBULK_DIR/calls.log" || true; }
+fp_calls() { if [[ -f "$FPBULK_DIR/calls.log" ]]; then cat "$FPBULK_DIR/calls.log"; fi; }
 fp_evict_calls() { fp_calls | grep -c '^evict' || true; }
 emit_count() { tr '\0' '\n' <"$PANEWIRE_LOG" | grep -c '^emit$' || true; }
 
