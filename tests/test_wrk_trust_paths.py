@@ -1730,8 +1730,34 @@ class RealBinaryCase(unittest.TestCase):
         self.assertIn('exec 3< <(job_events_scan ', audit)
         self.assertIn('wrk_py - "$jobs_root" "$lane"', audit)
 
+    CALLS = ("wrk_newer_end_record", "wrk_refuse_ended", "wrk_join_blocks", "wrk_joined_refuse_blocks",
+             "wrk_recorded_rounds", "wrk_job_role")
+    # the helpers themselves, and the one advisory caller that stays environment-following
+    ENV_FOLLOWING_CALLERS = ("wrk_refuse_ended", "wrk_joined_refuse_blocks", "wrk_builder_rounds_warning")
+
+    def repro_call_sites_pass_the_checked_root(self, source):
+        """Static contract: no trust-bearing function calls a converted reader without the checked root."""
+        owner, offenders, seen = None, [], 0
+        for number, line in enumerate(source.splitlines(), 1):
+            match = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\) \{", line)
+            if match:
+                owner = match.group(1)
+            if owner is None or owner in self.ENV_FOLLOWING_CALLERS or line.lstrip().startswith("#"):
+                continue
+            for name in self.CALLS:
+                call = re.search(r"\b%s\b[^\n]*" % name, line)
+                if call is None or line.lstrip().startswith(name + "()"):
+                    continue
+                seen += 1
+                if "WRK_TRUST_JOBS_ROOT:?" not in line and '"$jobs_root"' not in line:
+                    offenders.append("%d %s: %s" % (number, owner, line.strip()))
+        self.assertGreaterEqual(seen, 5, "the converted call sites moved; update CALLS")
+        self.assertEqual(offenders, [])
+
     def test_trust_bearing_call_sites_pass_the_checked_root(self):
-        self.repro_audit_uses_checked_root(WRK.read_text(encoding="utf-8"))
+        source = WRK.read_text(encoding="utf-8")
+        self.repro_call_sites_pass_the_checked_root(source)
+        self.repro_audit_uses_checked_root(source)
 
     def test_handoffkeep_is_judged_only_by_operations_that_fetch(self):
         w = self.w
@@ -2028,13 +2054,24 @@ class RealBinaryCase(unittest.TestCase):
             self.red(self.repro_checked_root_contract, lib)
 
     def test_mutant_call_site_drops_the_checked_root(self):
+        for old, new in (
+            ('  wrk_refuse_ended "round open" "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"\n',
+             '  wrk_refuse_ended "round open" "$job"\n'),
+            ('  joined_end="$(wrk_newer_end_record "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"\n',
+             '  joined_end="$(wrk_newer_end_record "$job")"\n'),
+        ):
+            text = mutate(WRK.read_text(encoding="utf-8"), old, new)
+            with self.assertRaises(AssertionError):
+                self.repro_call_sites_pass_the_checked_root(text)
+
         root_mutant = self.mutant(
             WRK,
             '  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"\n',
             '  jobs_root="$(wrk_jobs_root)"\n',
             "auditroot",
         )
-        self.red(self.repro_audit_uses_checked_root, root_mutant)
+        with self.assertRaises(AssertionError):
+            self.repro_audit_uses_checked_root(Path(root_mutant).read_text(encoding="utf-8"))
 
         # The audit's one-pass caller must establish the trusted root before
         # deriving event directories. Removing that guard must break redirect
