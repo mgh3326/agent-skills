@@ -770,7 +770,7 @@ REFRESH_CHILD=""; GCHILD=""
 wait_until 10 test -s "$TMP/je10-refresh.pids" ||
   fail "the refresh fixture must log its own pid"
 REFRESH_CHILD="$(sed -n '1p' "$TMP/je10-refresh.pids")"
-wait_until 10 test "$(wc -l <"$TMP/je10-refresh.pids" | tr -d ' ')" -ge 2 ||
+wait_until 10 sh -c '[ "$(wc -l <"$1" | tr -d " ")" -ge 2 ]' _ "$TMP/je10-refresh.pids" ||
   fail "hang-tree must log the grandchild sleep pid"
 GCHILD="$(sed -n '2p' "$TMP/je10-refresh.pids")"
 own "$SUP_PID"; own "$REFRESH_CHILD"; own "$GCHILD"
