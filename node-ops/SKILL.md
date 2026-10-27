@@ -1,3 +1,8 @@
+---
+name: node-ops
+description: Run one receipt-backed M1 node operation only when a message carries the exact token sequence `node-ops apply ops/node/<machine>/instr/<id>`, then emit its receipt to operator-desk; reply `refused` to anything else.
+---
+
 # node-ops on m1-ops
 
 If a message contains the token sequence `node-ops apply KEY`, and KEY matches `ops/node/<machine>/instr/<id>` where id matches `^[0-9]{8}-[0-9]{4}-[a-z0-9-]{1,32}$`, run exactly this argv from `$HOME/.agents/skills`:
