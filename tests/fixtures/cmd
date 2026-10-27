@@ -47,6 +47,13 @@ tail = "" if scenario == "truncated" else " · taste-1"
 version_line = "# Command Code v1.88.0"
 models_line = f"# models: {shown_display} with {shown_effort} effort{tail}"
 cwd_line = f"# {cwd}"
+if scenario == "home-abbrev":
+    # hk 2174: the real CLI prints its launch cwd with a leading $HOME as "~".
+    home = os.environ["HOME"].rstrip("/")
+    if cwd == home:
+        cwd_line = "# ~"
+    elif cwd.startswith(home + "/"):
+        cwd_line = "# ~" + cwd[len(home):]
 
 if scenario == "transcript-line":
     # Keep this row in the transcript only. The herdr fixture exposes it to
