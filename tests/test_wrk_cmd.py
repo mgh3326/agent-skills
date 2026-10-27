@@ -115,7 +115,9 @@ class CmdSpawnTests(unittest.TestCase):
     def test_host_gate_refuses_unapproved_host_or_missing_opt_in(self):
         self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "m1"\n')
         self.assert_refused_before_admission(self.spawn(), "approved hosts are mbp, desktop, m1b")
-        for value, reason in (("false", "must be literal true"), (None, "must be literal true")):
+        for value, reason in (("false", "must be literal true"),
+                              (None, "must be literal true"),
+                              ('"true"', "bare TOML booleans")):
             with self.subTest(value=value):
                 (self.tmp / "herdr.log").unlink(missing_ok=True)
                 (self.tmp / "gate.log").unlink(missing_ok=True)
