@@ -1342,8 +1342,10 @@ pwd_pattern = (r"(?:" + "|".join(re.escape(p) for p in paths) +
 if not re.fullmatch(pwd_pattern, footer[0]):
     sys.exit(1)
 provider, model = expected.split("/", 1)
-pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(provider) +
-           r"\) " + re.escape(model) + r" • " + re.escape(effort) + r"$")
+# pi 1.4.0 prints "model • effort" with no provider part; the older
+# "(provider) model • effort" form is accepted only for the expected provider.
+pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+(?:\(" + re.escape(provider) +
+           r"\) )?" + re.escape(model) + r" • " + re.escape(effort) + r"$")
 sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
 ' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
@@ -12195,7 +12197,7 @@ print(value if isinstance(value, str) else "")
   round_ext_builder_recheck
   spawn_deliver_brief
   if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then
-    echo "wrk: $MODEL pi model not proven: expected $PROFILE_MODEL:$PI_THINKING" >&2
+    echo "wrk: $MODEL pi model not proven: expected footer '${PROFILE_MODEL#*/} • $PI_THINKING' (provider part optional)" >&2
     spawn_pane_cleanup
     return 1
   fi
