@@ -151,9 +151,9 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "20eedabf6f6903518ede838220c14ce18c04ba00ec12a36e458dfda909d24c89",
+    ".github/workflows/ci.yml": "3a7e9bcc9cfadf16ed00ee8e5f1014ce4fe7965691bae78961a6f5b9f6aa8159",
     "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
-    "bin/wrk": "ccb11602f8919dfd31cc4e6eb5eb4086243040070134cec7e5c091fc10deaaad",
+    "bin/wrk": "c700977866949f3b50d99208f3716620648cb314e3aa711d039bc8601ae0f242",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
     "builder/SKILL.md": "116315fcfcff000c4933b62068b128e7bfecf820e7b72f238c1bd8c227722713",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
@@ -2266,6 +2266,27 @@
       "role_status": "unknown",
       "roles": [],
       "surfaces": []
+    },
+    "cmd-dsflash41": {
+      "default_effort": "high",
+      "family": "deepseek",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null
+      },
+      "launcher": "cmd",
+      "launcher_model_token": "PROFILE_MODEL=deepseek/deepseek-v4.1-flash",
+      "model": "deepseek-v4.1-flash",
+      "role_status": "unknown",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
     }
   },
   "required_ci_jobs_by_repo": {
@@ -2273,7 +2294,7 @@
       "ci-ok"
     ]
   },
-  "revision": "2026-10-20.1",
+  "revision": "2026-10-27.5",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
@@ -2306,7 +2327,7 @@
   "sources": {
     ".github/workflows/ci.yml": {
       "id": "ci-ok",
-      "scope": "single merge-gating CI check; macos-full is scheduled/manual only"
+      "scope": "single required merge-gating check; ci-ok consolidates Ubuntu shards and macos-smoke"
     },
     "advice/2026-09-25/director-throughput-astra": {
       "id": 3243,
