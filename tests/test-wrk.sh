@@ -290,6 +290,12 @@ for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh buil
   builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
 done
+# hk 2043: builder-sol-xhigh is a normal pinned spelling (no E6 marker),
+# builder-luna-high is the luna family's high E6 rung and builder-haiku-medium
+# is the haiku family's medium E6 rung.
+for pinned_profile in builder-sol-xhigh builder-luna-high builder-haiku-medium; do
+  grep -qx "$pinned_profile" <<<"$profiles_out" || fail "wrk profiles lost $pinned_profile"
+done
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
 grep -qx 'codex-astra' <<<"$profiles_out"
@@ -10184,6 +10190,11 @@ launch_profile_case builder-sonnet builder-sonnet-canon 'sonnet@xhigh' --role bu
 launch_profile_case builder-sonnet builder-sonnet-canon-max 'sonnet@max' --role builder --lane builder-sonnet-canon-max-lane --parent parent-lane --effort max
 launch_profile_case builder-sonnet builder-sonnet-canon-high 'sonnet@high' --role builder --lane builder-sonnet-canon-high-lane --parent parent-lane --effort high
 launch_profile_case codex-astra codex-astra-canon 'codex-astra@xhigh'
+# hk 2043: the normal pinned sol spelling records its canonical rung — no E6
+# marker, but the gate judges codex-sol@xhigh (an escalation rung, so the
+# fixture gate takes the operator REF).
+launch_profile_case builder-sol-xhigh builder-sol-xhigh-canon 'codex-sol@xhigh' \
+  --role builder --lane builder-sol-xhigh-lane --parent parent-lane --operator-request hk:task/2043
 # Other pools keep their literal spelling@effort — no other pool's record moves.
 launch_profile_case devin-swe2 devin-launch-literal 'devin-swe2'
 launch_profile_case builder-opus builder-opus-launch-literal 'builder-opus@high' --role builder --lane builder-opus-lane --parent parent-lane
@@ -10968,11 +10979,11 @@ expect_exit 2 spawn_base codex-luna --role worker --lane worker-lane --parent pa
 echo "PASS builder-parent-and-director-lane-guards"
 
 for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
-  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
+  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-xhigh builder-sol-max builder-sol-medium \
   builder-luna-max builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -10999,7 +11010,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -11105,12 +11116,17 @@ sol61_case codex-sol max
 sol61_case codex-max max
 sol61_case builder-sol high --role builder --lane sol61-builder-lane --parent parent-lane
 sol61_case captain-sol high --role builder --lane sol61-captain-lane --parent parent-lane
-# The E6 builder rungs are switched spellings too (builder-sol-max included
-# since hk 1864 opened the max builder seat).
+# The E6 builder rungs are switched spellings too. hk 2043 made
+# builder-sol-max a normal pinned spelling, so it is spawned here with no
+# SCOPEFUEL_E6_ARM marker (its own case is below).
 SCOPEFUEL_E6_ARM=codex-sol@high sol61_case builder-sol-high high --role builder --lane sol61-e6h-lane --parent parent-lane
-SCOPEFUEL_E6_ARM=codex-sol@max sol61_case builder-sol-max max --role builder --lane sol61-e6x-lane --parent parent-lane
+sol61_case builder-sol-max max --role builder --lane sol61-e6x-lane --parent parent-lane
 SCOPEFUEL_E6_ARM=codex-sol@medium sol61_case builder-sol-medium medium --role builder --lane sol61-e6m-lane --parent parent-lane
 SCOPEFUEL_E6_ARM=codex-sol@low sol61_case builder-sol-low low --role builder --lane sol61-e6l-lane --parent parent-lane
+# hk 2043: builder-sol-xhigh is the normal pinned xhigh spelling — same canon
+# model id, xhigh rung, no E6 marker (the S+ escalation row still takes a REF).
+sol61_case builder-sol-xhigh xhigh --role builder --lane sol61-xhigh-lane --parent parent-lane \
+  --operator-request hk:task/2043
 echo "PASS 1026-AC1-switched-spellings-carry-gpt-6.1-sol"
 
 # AC2 — the rollback spellings pin the literal gpt-6-sol even though the fake
@@ -11728,6 +11744,14 @@ e6_builder_case builder-sonnet-medium sonnet     medium '--model sonnet --danger
 e6_builder_case builder-haiku-low    haiku      low    '--model haiku --dangerously-skip-permissions --effort low'
 e6_builder_case builder-luna-low     codex-luna low    '--yolo -m gpt-5.6-luna -c model_reasoning_effort=low'
 e6_builder_case builder-luna-medium  codex-luna medium '--yolo -m gpt-6-luna -c model_reasoning_effort=medium'
+# hk 2043: builder-luna-high is the luna family's high E6 rung — the same pin
+# rule and marker as the low/medium pair (director-1, 2026-10-26, for the
+# r1026luna L-A+ arm).
+e6_builder_case builder-luna-high    codex-luna high   '--yolo -m gpt-6-luna -c model_reasoning_effort=high'
+# hk 2043: builder-haiku-medium is the haiku family's medium E6 rung (the
+# r1026effdown arm B haiku@high vs haiku@medium) on the same pin rule and
+# marker as builder-haiku-low.
+e6_builder_case builder-haiku-medium haiku      medium '--model haiku --dangerously-skip-permissions --effort medium'
 # hk 1863: the five hk 1786 borrow-down and promote-up spellings on the same
 # pin rule. builder-sol-low takes its model id from the codex-sol catalog row
 # (the fixture serves gpt-6.1-sol) and gates at codex-sol@low; the haiku and
@@ -11756,22 +11780,182 @@ grep -q 'policy launch codex-sol effort=low' "$TMP/launch.log" ||
 echo "PASS 704+737+1796+1863 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
 # hk 1864 (operator 2026-10-23): the no-max builder-seat refusal of the
-# 2026-09-26 decision 4088 B is repealed, so the five max-rung builder spellings
-# are admitted with their exact SCOPEFUEL_E6_ARM marker armed and launch at the
-# max rung (the kimi one through the max clone home).
+# 2026-09-26 decision 4088 B is repealed, so the max-rung builder spellings are
+# admitted with their exact SCOPEFUEL_E6_ARM marker armed and launch at the max
+# rung (the kimi one through the max clone home). builder-sol-max left this E6
+# set in hk 2043 (normal pinned spelling — its own case below).
 e6_builder_case builder-sonnet-max   sonnet     max    '--model sonnet --dangerously-skip-permissions --effort max'
-e6_builder_case builder-sol-max      codex-sol  max    '--yolo -m gpt-6.1-sol -c model_reasoning_effort=max'
 e6_builder_case builder-luna-max     codex-luna max    '--yolo -m gpt-6-luna -c model_reasoning_effort=max'
 e6_builder_case builder-kimi-max     kimi-k3    max    '--auto -m kimi-code/k3'
 e6_builder_case builder-haiku-max    haiku      max    '--model haiku --dangerously-skip-permissions --effort max'
-# A non-rung spelling takes an explicit max on a builder seat too:
-# --effort max on builder-sol (default high) is admitted and launches at max.
+# hk 2043 (operator r1026solmax, revision 3): builder-sol-xhigh and
+# builder-sol-max are NORMAL pinned spellings — the rung is pinned exactly like
+# an E6 spelling (catalog and gate consult, model, default effort, different
+# effort refusal) but spawn takes no SCOPEFUEL_E6_ARM marker. builder-sol-max
+# is the S+ gate=default row, so it also takes no --operator-request;
+# builder-sol-xhigh is an escalation rung, so the gate still demands a REF.
+normal_pinned_spawn() {
+  # The brief's case is "SCOPEFUEL_E6_ARM unset", not merely empty: a stale
+  # ambient marker must not be read as an E6 arm.
+  unset SCOPEFUEL_E6_ARM
+  spawn_base "$@"
+}
+normal_pinned_case() {
+  local model="$1" gate="$2" rung="$3" argv_tail="$4"; shift 4
+  local job="np-${model}-job" out rc start
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  set +e
+  out="$(ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    normal_pinned_spawn "$model" --role builder --lane "$model-lane" --parent parent-lane \
+    --job "$job" --t T1 "$@" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] ||
+    fail "$model must be admitted with SCOPEFUEL_E6_ARM unset (rc=$rc): $out"
+  start="$(grep '^agent start ' "$TMP/herdr.log")"
+  [[ "$start" == *" -- $argv_tail" ]] ||
+    fail "$model must launch the exact $rung rung argv: $start"
+  grep -qF "gate -m $gate --effort $rung" "$TMP/scopefuel.log" ||
+    fail "$model must ask the gate about the $rung rung: $(cat "$TMP/scopefuel.log")"
+  python3 - "$E6_INBOX/$job/events" "$gate@$rung" "$model" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert record["payload"]["launch_profile"] == sys.argv[2], (sys.argv[3], record)
+PY
+}
+
+normal_pinned_case builder-sol-xhigh codex-sol xhigh \
+  '--yolo -m gpt-6.1-sol -c model_reasoning_effort=xhigh' --operator-request hk:task/2043
+normal_pinned_case builder-sol-max codex-sol max \
+  '--yolo -m gpt-6.1-sol -c model_reasoning_effort=max'
+
+# hk 2043 item 6: the gate still decides admission. codex-sol@xhigh is an
+# escalation rung at S+, so a bare spawn is refused by the gate (rc 3) and the
+# same spawn with a valid operator REF is admitted (the case above).
 : >"$TMP/herdr.log"
-e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-max-lane --parent parent-lane \
-  --effort max --job e6-builder-sol-effort-max --t T1 2>&1)" ||
-  fail "builder-sol --effort max must be admitted on a builder seat (hk 1864): $e6_max_out"
-[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-6.1-sol -c model_reasoning_effort=max' ]] ||
-  fail "builder-sol --effort max must launch at the max rung: $(cat "$TMP/herdr.log")"
+set +e
+np_esc_out="$(normal_pinned_spawn builder-sol-xhigh --role builder --lane np-xhigh-esc-lane \
+  --parent parent-lane --job np-xhigh-esc --t T1 2>&1)"
+np_esc_rc=$?
+set -e
+[[ "$np_esc_rc" -eq 3 ]] ||
+  fail "builder-sol-xhigh without --operator-request must hit the gate escalation refusal (rc=$np_esc_rc): $np_esc_out"
+grep -q 'escalation' <<<"$np_esc_out" ||
+  fail "builder-sol-xhigh refusal must be the gate's escalation denial: $np_esc_out"
+
+# A stale marker (another rung of the same profile) must not gate or label a
+# normal pinned spelling: the spawn is admitted and the record still reads
+# codex-sol@max — never an E6 arm.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+np_stale_out="$(SCOPEFUEL_E6_ARM=codex-sol@high ARBITER_INBOX_ROOT="$E6_INBOX" \
+  XDG_DATA_HOME="$E6_XDG" spawn_base builder-sol-max --role builder \
+  --lane np-sol-max-stale-lane --parent parent-lane --job np-sol-max-stale --t T1 2>&1)" ||
+  fail "a stale SCOPEFUEL_E6_ARM must not refuse builder-sol-max: $np_stale_out"
+python3 - "$E6_INBOX/np-sol-max-stale/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert record["payload"]["launch_profile"] == "codex-sol@max", record
+PY
+echo "PASS hk 2043 normal pinned sol spellings take no marker, record their canon rung, and stay gate-decided"
+
+# hk 2043 item 4: an unpinned builder spelling whose catalog consult is pinned
+# to one rung refuses a different --effort instead of silently consulting the
+# pin while launching another rung. The line names the matching pinned
+# spelling when the family has one.
+np_mismatch_case() {
+  local model="$1" effort="$2" want="$3"
+  local out rc
+  set +e
+  out="$(normal_pinned_spawn "$model" --role builder --lane "np-mm-$model-lane" \
+    --parent parent-lane --job "np-mm-$model-$effort" --t T1 --effort "$effort" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 2 ]] ||
+    fail "$model --effort $effort must die rc 2 (rc=$rc): $out"
+  grep -qF "$want" <<<"$out" ||
+    fail "$model --effort $effort refusal must name '$want': $out"
+}
+np_mismatch_case builder-sol xhigh 'use builder-sol-xhigh for --effort xhigh'
+np_mismatch_case builder-sol max 'use builder-sol-max for --effort max'
+np_mismatch_case builder-sol medium 'use builder-sol-medium for --effort medium'
+np_mismatch_case builder-sol6 max 'use --effort high'
+np_mismatch_case builder-grok low 'use builder-grok-low for --effort low'
+# builder-sol --effort high is unchanged (no refusal, launches high).
+: >"$TMP/herdr.log"
+normal_pinned_spawn builder-sol --role builder --lane np-sol-high-lane \
+  --parent parent-lane --job np-sol-high --t T1 --effort high >/dev/null
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-6.1-sol -c model_reasoning_effort=high' ]] ||
+  fail "builder-sol --effort high must still launch the high rung: $(cat "$TMP/herdr.log")"
+echo "PASS hk 2043 unpinned builder spellings refuse an off-consult effort and name the pinned spelling"
+
+# Mutants, each applied at the real call site (bin/wrk source), never to the
+# repository file. Every mutant must turn its probe RED.
+np_probe() {  # $1=wrk path, $2=tag, $3=model; extra spawn flags after
+  local wrk="$1" tag="$2" model="$3"; shift 3
+  WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn "$model" --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 "$@" >/dev/null 2>&1 || return 1
+}
+np_marker_required_probe() {  # 0 iff the no-marker spawn is refused
+  local wrk="$1" tag="$2" model="$3"
+  ! WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn "$model" --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 >/dev/null 2>&1
+}
+np_consult_probe() {  # 0 iff builder-sol-xhigh's catalog consult asks xhigh
+  local wrk="$1" tag="$2"
+  : >"$TMP/launch.log"
+  WRK="$wrk" WRK_LAUNCH_LOG="$TMP/launch.log" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" \
+    XDG_DATA_HOME="$TMP/npm-xdg-$tag" normal_pinned_spawn builder-sol-xhigh \
+    --role builder --lane "npm-$tag-lane" --parent parent-lane --job "npm-$tag" \
+    --t T1 --operator-request hk:task/2043 >/dev/null 2>&1 || return 1
+  grep -q 'policy launch codex-sol effort=xhigh' "$TMP/launch.log"
+}
+np_mismatch_probe() {  # 0 iff builder-sol --effort xhigh is refused
+  local wrk="$1" tag="$2"
+  ! WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn builder-sol --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 --effort xhigh >/dev/null 2>&1
+}
+np_probe "$WRK" real-solmax builder-sol-max ||
+  fail "builder-sol-max probe must be admitted on the real wrk"
+np_marker_required_probe "$WRK" real-haikumax builder-haiku-max ||
+  fail "builder-haiku-max probe must be refused without a marker on the real wrk"
+np_consult_probe "$WRK" real-consult ||
+  fail "builder-sol-xhigh probe must consult codex-sol@xhigh on the real wrk"
+np_mismatch_probe "$WRK" real-mismatch ||
+  fail "builder-sol --effort xhigh probe must be refused on the real wrk"
+# Invariant: requiring the marker for builder-sol-max turns the no-marker case
+# RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-marker-required" \
+  'if ! normal_pinned_builder "$MODEL"; then' 'if true; then'
+expect_red "normal-pinned-marker-required" np_probe "$TMP/wrk-np-marker-required" mut-solmax builder-sol-max
+# Invariant: exempting every pinned spelling from the marker turns the
+# builder-haiku-max marker case RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-marker-exempt-all" \
+  'if ! normal_pinned_builder "$MODEL"; then' 'if false; then'
+expect_red "normal-pinned-marker-exempt-all" np_marker_required_probe \
+  "$TMP/wrk-np-marker-exempt-all" mut-haikumax builder-haiku-max
+# Invariant: mapping builder-sol-xhigh's catalog consult to high turns the
+# consult case RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-consult-high" \
+  '    builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;' \
+  '    builder-sol-xhigh) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high ;;
+    builder-sol-high|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;'
+expect_red "normal-pinned-consult-high" np_consult_probe "$TMP/wrk-np-consult-high" mut-consult
+# Invariant: dropping the unpinned-mismatch refusal turns the builder-sol
+# --effort xhigh case RED.
+mut_wrk "$TMP/wrk-np-mismatch-dropped" \
+  '      builder-sol|captain-sol)' '      captain-sol)'
+expect_red "normal-pinned-mismatch-dropped" np_mismatch_probe \
+  "$TMP/wrk-np-mismatch-dropped" mut-mismatch
+echo "PASS hk 2043 normal-pinned and unpinned-mismatch mutants go RED"
+
 # codex `ultra` is the max tier plus subagents — hk 1864 opened max only, so
 # the seat rule still refuses ultra.
 set +e
@@ -12198,9 +12382,9 @@ echo "PASS 748r3 kimi seat rule resolves real TOML, env overlay, and disabled Th
 for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
   builder-sol-high builder-sol-medium \
   builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
-  builder-sonnet-max builder-sol-max builder-luna-max builder-kimi-max builder-haiku-max; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
+  builder-sonnet-max builder-luna-max builder-kimi-max builder-haiku-max; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
@@ -12304,7 +12488,8 @@ grep -q 'SCOPEFUEL_E6_ARM=codex-luna@medium' <<<"$e6_rung_out" ||
 for e6_wr in builder-sol-low:codex-sol@high:codex-sol@low \
   builder-haiku-high:haiku@low:haiku@high builder-haiku-xhigh:haiku@high:haiku@xhigh \
   builder-sonnet-low:sonnet@medium:sonnet@low \
-  builder-haiku-max:haiku@xhigh:haiku@max builder-sol-max:codex-sol@high:codex-sol@max \
+  builder-haiku-max:haiku@xhigh:haiku@max builder-luna-high:codex-luna@medium:codex-luna@high \
+  builder-haiku-medium:haiku@high:haiku@medium \
   builder-sonnet-max:sonnet@xhigh:sonnet@max builder-luna-max:codex-luna@medium:codex-luna@max; do
   IFS=: read -r e6_wr_model e6_wr_marker e6_wr_want <<<"$e6_wr"
   set +e
@@ -12551,7 +12736,7 @@ set -e
 # rung spelled out is the allowed restatement (covered by e6_builder_case).
 for e6_ef in builder-sol-low:codex-sol@low:medium builder-haiku-high:haiku@high:low \
   builder-haiku-xhigh:haiku@xhigh:high builder-haiku-max:haiku@max:xhigh \
-  builder-sonnet-low:sonnet@low:medium; do
+  builder-sonnet-low:sonnet@low:medium builder-haiku-medium:haiku@medium:high; do
   IFS=: read -r e6_ef_model e6_ef_marker e6_ef_off <<<"$e6_ef"
   set +e
   e6_eff_out="$(SCOPEFUEL_E6_ARM="$e6_ef_marker" \
@@ -15835,4 +16020,5 @@ bash "$ROOT/tests/test-shellcheck-capped.sh"
 bash "$ROOT/tests/test-devin-gate-profile.sh"
 # hk 1990: preserve durable operator refs at the actual apply_catalog call site.
 python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
+bash "$ROOT/tests/test-pi-launcher.sh"
 echo 'PASS test-wrk'

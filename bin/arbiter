@@ -59,6 +59,8 @@ HERDR_AGENT_STATUSES = frozenset(("idle", "working", "blocked", "done", "unknown
 HERDR_LIVE_STATUS = "working"
 
 BUSY_TIMEOUT_MS = 10000
+# A claimed job can precede its Herdr pane; absence is not retirement evidence yet.
+ORPHAN_STARTUP_GRACE = dt.timedelta(minutes=10)
 
 # hk 1894: commands whose paths must be canonical (or, in test mode, under a temp
 # root). wrk's trust path calls no arbiter command today; hk 1453 half 2 adds
@@ -787,6 +789,98 @@ def _quota_pool_row(con: sqlite3.Connection, job_id: str, pool: str):
     ).fetchone()
 
 
+def _orphan_state(con: sqlite3.Connection, job_id: str):
+    job = con.execute(
+        "SELECT state FROM jobs WHERE job_id = ?", (job_id,)
+    ).fetchone()
+    leases = con.execute(
+        "SELECT resource, kind FROM leases WHERE job_id = ? ORDER BY resource, kind",
+        (job_id,),
+    ).fetchall()
+    quotas = con.execute(
+        "SELECT pool FROM quota_pool_records WHERE job_id = ? ORDER BY pool",
+        (job_id,),
+    ).fetchall()
+    eligible = bool(job and job[0] == "leased" and not leases and not quotas)  # hk1991-orphan-release
+    return job, leases, quotas, eligible
+
+
+def _job_state_claim_snapshot(con: sqlite3.Connection, job_id: str):
+    job = con.execute("SELECT state FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if job is None:
+        return None
+    claim = con.execute(
+        "SELECT MAX(seq) FROM events WHERE job_id = ? AND kind IN ('job.claim', 'job.reclaim')",
+        (job_id,),
+    ).fetchone()
+    return job[0], claim[0]
+
+
+def _capture_job_state_claim_snapshots() -> dict[str, tuple[str, int | None]]:
+    con = connect_ro()
+    try:
+        con.execute("BEGIN")
+        rows = con.execute(
+            "SELECT j.job_id, j.state, MAX(e.seq)"
+            " FROM jobs AS j LEFT JOIN events AS e ON e.job_id = j.job_id"
+            " AND e.kind IN ('job.claim', 'job.reclaim') GROUP BY j.job_id, j.state"
+        ).fetchall()
+        con.execute("COMMIT")
+        return {job_id: (state, claim_seq) for job_id, state, claim_seq in rows}
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+def _capture_one_job_state_claim_snapshot(job_id: str):
+    con = connect_ro()
+    try:
+        con.execute("BEGIN")
+        snapshot = _job_state_claim_snapshot(con, job_id)
+        con.execute("COMMIT")
+        return snapshot
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    finally:
+        con.close()
+
+
+def _job_claim_snapshot_matches(before, current) -> bool:
+    return before is not None and before == current
+
+
+def _orphan_startup_blocker(
+    con: sqlite3.Connection, job_id: str, moment: dt.datetime
+) -> str | None:
+    rows = con.execute(
+        "SELECT kind, created_at FROM events WHERE job_id = ?"
+        " AND kind IN ('job.claim', 'job.reclaim', 'job.spawned')",
+        (job_id,),
+    ).fetchall()
+    claim_times = []
+    spawn_times = []
+    for kind, created_at in rows:
+        timestamp = parse_iso(created_at)
+        if kind in {"job.claim", "job.reclaim"}:
+            claim_times.append(timestamp)
+        elif kind == "job.spawned":
+            spawn_times.append(timestamp)
+    if not claim_times:
+        return "claim timestamp unavailable; retaining during startup grace"
+    if moment - max(claim_times) < ORPHAN_STARTUP_GRACE:
+        return "latest claim/reclaim is inside the 10-minute startup grace"
+    if spawn_times and moment - max(spawn_times) < ORPHAN_STARTUP_GRACE:
+        return "latest spawn is inside the 10-minute startup grace"
+    return None
+
+
+def _gc_skip(skipped: list[dict[str, object]], job_id: str, reason: str) -> None:
+    skipped.append({"job_id": job_id, "reason": reason})
+
+
 def _archive(con: sqlite3.Connection, row, state: str, moment: dt.datetime) -> bool:
     cur = con.execute(
         "INSERT OR IGNORE INTO lease_history"
@@ -1061,6 +1155,14 @@ def cmd_lease(args: argparse.Namespace) -> dict:
 
 
 def cmd_release(args: argparse.Namespace) -> dict:
+    if args.resource is None:
+        if not args.force or args.kind is not None or args.token is not None:
+            raise ArbiterError(
+                EXIT_USAGE,
+                "--resource may be omitted only for --force --job orphan release",
+            )
+        return _release_orphan_job(args)
+
     con = connect_rw()
     moment = now_dt()
     con.execute("BEGIN IMMEDIATE")
@@ -1306,15 +1408,121 @@ def _matched_agent_statuses(
     return statuses, matched
 
 
+def _release_orphan_job(args: argparse.Namespace) -> dict:
+    # The agent list is a hermetic fixture seam, matching gc. Read it before
+    # BEGIN IMMEDIATE; compare the job snapshot afterward so a reclaim during
+    # the external read cannot be released using stale Herdr evidence.
+    snapshot = _capture_one_job_state_claim_snapshot(args.job)
+    herdr_agents = _herdr_agents(args.herdr_agent_list)
+    con = connect_rw()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        current_snapshot = _job_state_claim_snapshot(con, args.job)
+        if (snapshot is not None or current_snapshot is not None) and not _job_claim_snapshot_matches(
+            snapshot, current_snapshot
+        ):
+            raise ArbiterError(
+                EXIT_FENCING,
+                "orphan release refused: job state or claim sequence changed after Herdr snapshot "
+                f"(job={args.job} before={snapshot} current={current_snapshot})",
+                job_id=args.job,
+            )
+        job, lease_rows, quota_rows, eligible = _orphan_state(con, args.job)
+        if job is None:
+            raise ArbiterError(EXIT_NOT_FOUND, f"job not found: {args.job}", job_id=args.job)
+        moment = now_dt()
+        prior_state = job[0]
+        agent_label = _claim_agent_label(con, args.job)
+        if agent_label is None:
+            raise ArbiterError(
+                EXIT_STORAGE,
+                "orphan release identity reconciliation refused; job.claim has no exact "
+                f"agent_label mapping (unmapped={args.job})",
+            )
+        statuses, matched = _matched_agent_statuses(
+            herdr_agents, job_id=args.job, agent_label=agent_label
+        )
+        blockers = []
+        if prior_state != "leased":
+            blockers.append(f"job state={prior_state} (expected leased)")
+        if "unknown" in statuses:
+            blockers.append(f"agent={agent_label} herdr_status=unknown")
+        elif matched:
+            blockers.append(
+                f"agent={agent_label} herdr_status={','.join(sorted(statuses))} "
+                "(pane exists)"
+            )
+        blockers.extend(f"lease={resource}/{kind}" for resource, kind in lease_rows)
+        blockers.extend(f"quota_pool={pool}" for (pool,) in quota_rows)
+        if not blockers and prior_state == "leased":
+            startup_blocker = _orphan_startup_blocker(con, args.job, moment)
+            if startup_blocker is not None:
+                blockers.append(startup_blocker)
+        if blockers:
+            code = EXIT_STORAGE if "unknown" in statuses else EXIT_FENCING
+            raise ArbiterError(
+                code,
+                f"orphan release refused: job={args.job} leaves " + ", ".join(blockers),
+                job_id=args.job,
+                agent_label=agent_label,
+                herdr_status=sorted(statuses),
+            )
+        if not eligible:
+            raise ArbiterError(
+                EXIT_FENCING,
+                f"orphan release refused: job={args.job} is not an eligible leased orphan",
+                job_id=args.job,
+            )
+        reason = (
+            "job absent from herdr agent list"
+            if not matched
+            else f"herdr agent status={','.join(sorted(statuses))}"
+        )
+        con.execute(
+            "UPDATE jobs SET state = 'released', updated_at = ?"
+            " WHERE job_id = ? AND state = 'leased'",
+            (iso(moment), args.job),
+        )
+        seq = record_event(
+            con,
+            args.job,
+            "job.orphan_release",
+            {
+                "job_id": args.job,
+                "prior_state": prior_state,
+                "agent_label": agent_label,
+                "herdr_status": sorted(statuses),
+                "reason": reason,
+                "forced": True,
+            },
+        )
+        con.execute("COMMIT")
+    except BaseException:
+        con.execute("ROLLBACK")
+        raise
+    return {
+        "ok": True,
+        "job_id": args.job,
+        "prior_state": prior_state,
+        "agent_label": agent_label,
+        "herdr_status": sorted(statuses),
+        "reason": reason,
+        "released_at": iso(moment),
+        "forced": True,
+        "event_seq": seq,
+    }
+
+
 def cmd_gc(args: argparse.Namespace) -> dict:
     # GC always reconciles quota_pool_records against a current Herdr list.
     # ``--herdr-agent-list PATH`` is the hermetic fixture seam; omitting PATH
     # uses the installed HERDR_BIN/`herdr` command.
+    snapshots = _capture_job_state_claim_snapshots()
     herdr_agents = _herdr_agents(args.herdr_agent_list)
     con = connect_rw()
-    moment = now_dt()
     con.execute("BEGIN IMMEDIATE")
     try:
+        moment = now_dt()
         rows = con.execute(
             "SELECT resource, kind, job_id, token, acquired_at, expires_at"
             " FROM leases WHERE kind IN ('path', 'linear_permit')"
@@ -1340,6 +1548,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
         stale_decisions = []
         unresolved_quota_pool = []
         unsafe_quota_pool = []
+        skipped = []
         for row in quota_rows:
             agent_label = _claim_agent_label(con, row[0])
             if agent_label is None:
@@ -1354,8 +1563,6 @@ def cmd_gc(args: argparse.Namespace) -> dict:
             statuses, matched = _matched_agent_statuses(
                 herdr_agents, job_id=row[0], agent_label=agent_label
             )
-            if HERDR_LIVE_STATUS in statuses:
-                continue
             if "unknown" in statuses:
                 unsafe_quota_pool.append(
                     {
@@ -1366,6 +1573,22 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                         "reason": "herdr agent status=unknown is not stale evidence",
                     }
                 )
+                continue
+            if any(status != "unknown" for status in statuses):
+                # Any exact listed agent with a known status owns its pane,
+                # whether it is working, idle, blocked, or done.
+                continue
+            current_snapshot = _job_state_claim_snapshot(con, row[0])
+            if not _job_claim_snapshot_matches(snapshots.get(row[0]), current_snapshot):
+                _gc_skip(
+                    skipped,
+                    row[0],
+                    "job state or claim sequence changed after Herdr snapshot",
+                )
+                continue
+            startup_blocker = _orphan_startup_blocker(con, row[0], moment)
+            if startup_blocker is not None:
+                _gc_skip(skipped, row[0], startup_blocker)
                 continue
             stale_decisions.append((row, agent_label, sorted(statuses), matched))
 
@@ -1386,6 +1609,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
             )
 
         stale_quota_pool = []
+        orphan_candidates = {}
         for row, agent_label, statuses, matched in stale_decisions:
             reason = (
                 "job absent from herdr agent list"
@@ -1420,10 +1644,51 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                     "herdr_status": statuses,
                 }
             )
+            orphan_candidates[row[0]] = (agent_label, statuses, reason)
+
+        orphan_released = []
+        for job_id, (agent_label, statuses, reason) in sorted(orphan_candidates.items()):
+            job, lease_rows, quota_rows, eligible = _orphan_state(con, job_id)
+            if not eligible:
+                continue
+            prior_state = job[0]
+            con.execute(
+                "UPDATE jobs SET state = 'released', updated_at = ?"
+                " WHERE job_id = ? AND state = 'leased'",
+                (iso(moment), job_id),
+            )
+            seq = record_event(
+                con,
+                job_id,
+                "job.orphan_release",
+                {
+                    "job_id": job_id,
+                    "prior_state": prior_state,
+                    "agent_label": agent_label,
+                    "herdr_status": statuses,
+                    "reason": reason,
+                    "forced": False,
+                },
+            )
+            orphan_released.append(
+                {
+                    "job_id": job_id,
+                    "prior_state": prior_state,
+                    "agent_label": agent_label,
+                    "herdr_status": statuses,
+                    "reason": reason,
+                    "event_seq": seq,
+                }
+            )
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
         raise
+    for item in skipped:
+        print(
+            f"{PROG}: gc skipped orphan cleanup: job={item['job_id']} reason={item['reason']}",
+            file=sys.stderr,
+        )
     return {
         "ok": True,
         "checked": len(rows),
@@ -1431,6 +1696,8 @@ def cmd_gc(args: argparse.Namespace) -> dict:
         "transitioned": transitions,
         "retained": len(rows),
         "stale_quota_pool": stale_quota_pool,
+        "orphan_released": orphan_released,
+        "skipped": skipped,
         "unresolved_quota_pool": unresolved_quota_pool,
         "unsafe_quota_pool": unsafe_quota_pool,
         "live_agents": sum(
@@ -1769,9 +2036,13 @@ def build_parser() -> argparse.ArgumentParser:
         "release", parents=[common], help="lease/실행 기록 반납. --force 는 운영자 강제 반납"
     )
     release.add_argument("--job", required=True, help="job id")
-    release.add_argument("--resource", required=True, help="자원 이름")
+    release.add_argument("--resource", help="자원 이름; 생략은 --force orphan release 전용")
     release.add_argument("--token", help="획득 시 발급된 fencing token (배타 lease 일반 반납용)")
     release.add_argument("--kind", choices=KINDS, help="같은 resource 에 kind 가 여럿일 때만 필요")
+    release.add_argument(
+        "--herdr-agent-list",
+        help="orphan release identity fixture (omit to read the installed Herdr list)",
+    )
     release.add_argument(
         "--force",
         action="store_true",
