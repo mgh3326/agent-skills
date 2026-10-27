@@ -1,5 +1,7 @@
 # Suite-level Ubuntu and full-macOS source of truth: shard|command
 wrk|bash tests/test-wrk.sh
+suites-a|bash tests/test-wrk-artifacts-move.sh
+suites-a|bash tests/test-wrk-artifacts-routing.sh
 suites-a|bash tests/wrk_spillover.sh
 suites-a|bash tests/test-tester-eligible.sh
 suites-a|bash tests/test-t3-split-rule.sh
