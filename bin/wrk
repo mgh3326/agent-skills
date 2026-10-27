@@ -10400,7 +10400,10 @@ spawn_router_cmd() {
   # round may still place on that target's own remotes.
   # The explicit local leg (including SSH delegation) must name the pi
   # profile/host/key even when the TOML itself is malformed.
-  if [[ "$requested" == local ]]; then pi_host_precheck "$router_profile"; fi
+  if [[ "$requested" == local ]]; then
+    pi_host_precheck "$router_profile"
+    cmd_host_precheck "$router_profile"
+  fi
   local_spawn_resolve || return
   if [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 && "$requested" == local ]]; then
     echo "wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local" >&2
@@ -10794,11 +10797,15 @@ spawn_router_cmd() {
 #     its own line: '[local] # note', '[ local ]', '["local"]', '[[local]]',
 #     a truncated '[local', or '[local]' with trailing text;
 #   - a second [local] table header;
-#   - inside [local], a second spawn key whatever its value, or a line
-#     starting a would-be spawn key that is not 'spawn = <value>' (bare
-#     'spawn', 'spawn: false', 'spawn == false', a quoted "spawn" key);
-#   - a spawn value other than bare true/false after stripping a trailing
-#     '#' comment and whitespace;
+#   - inside [local], duplicate capability keys (pi_anthropic or
+#     cmd_dsflash41) whatever their value, or any line starting a would-be
+#     spelling that is not a clean assignment; each accepts only bare
+#     true|false booleans;
+#   - a second spawn key whatever its value, or a line starting a would-be
+#     spawn key that is not 'spawn = <value>' (bare 'spawn', 'spawn: false',
+#     'spawn == false', a quoted "spawn" key);
+#   - a capability or spawn value other than bare true/false after stripping
+#     a trailing '#' comment and whitespace;
 #   - any content before the first table header — the root table must be
 #     empty, so 'local.spawn = false', '"local".spawn = false' or
 #     'local = { spawn = false }' there are root keys, not the flag;
@@ -10840,6 +10847,25 @@ pi_host_precheck() {
   fi
 }
 
+# hk 2140 desk gate: Command Code accounts with no configured MCP servers are
+# known only on mbp, desktop and m1b. Require an explicit local capability flag
+# and an execution-host identity in that desk-approved set; caller placement
+# options never grant this capability.
+cmd_host_precheck() {
+  local profile="${1:-${MODEL:-}}" host
+  [[ "$profile" == cmd-dsflash41 ]] || return 0
+  host="$(spillover_value hub machine_id 2>/dev/null || true)"
+  [[ -n "$host" ]] || host="$(hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
+  case "$host" in
+    mbp|desktop|m1b) ;;
+    *) die "$profile refused on host $host: approved hosts are mbp, desktop, m1b (desk 2026-10-27; m1 has MCP servers)" ;;
+  esac
+  if ! local_spawn_scan || [[ "$LOCAL_CMD_DSFLASH41" -ne 1 ]]; then
+    die "$profile refused on host $host: hosts.toml [local] cmd_dsflash41 must be literal true"
+  fi
+}
+
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -10860,13 +10886,14 @@ local_spawn_table_name() {
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
   LOCAL_PI_ANTHROPIC=0
+  LOCAL_CMD_DSFLASH41=0
   LOCAL_HEAVY_LOAD_WAIT=1
   LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SHELL_READY_TIMEOUT_MS=0
   LOCAL_SHELL_READY_TIMEOUT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0 cmd_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -10939,6 +10966,29 @@ local_spawn_scan() {
     # grammar as spawn/heavy_load_wait. Keep this in bash: execution hosts
     # may have Python 3.9 without tomllib (director-1, 2026-10-26).
     case "$line" in
+      cmd_dsflash41[A-Za-z0-9_-]*) ;; # a different bare key
+      cmd_dsflash41* | '"cmd_dsflash41"'* | "'cmd_dsflash41'"*)
+        if [[ "$line" =~ ^cmd_dsflash41[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed cmd_dsflash41 assignment in [local] (expected 'cmd_dsflash41 = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        cmd_seen=$((cmd_seen + 1))
+        if [[ "$cmd_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate cmd_dsflash41 key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) LOCAL_CMD_DSFLASH41=1 ;;
+          false) ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] cmd_dsflash41 accepts only the bare TOML booleans true or false"
+             return "$WRK_EXIT_CONFIG_REFUSED"
+             ;;
+        esac
+        continue ;;
       pi_anthropic[A-Za-z0-9_-]*) ;; # a different bare key
       pi_anthropic* | '"pi_anthropic"'* | "'pi_anthropic'"*)
         if [[ "$line" =~ ^pi_anthropic[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
@@ -12071,6 +12121,7 @@ spawn_cmd() {
   # future aliases too.
   refuse_known_terra_spelling
   pi_host_precheck
+  cmd_host_precheck
   # #1155: several router paths reach spawn_cmd directly (an unclassified
   # spawn, an unreadable arbiter, a hosts.toml-less auto). The flag gate
   # repeats here so no local spawn path runs on a host whose own [local]

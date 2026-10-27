@@ -36,7 +36,7 @@ class CmdSpawnTests(unittest.TestCase):
             directory = self.tmp / key.lower()
             directory.mkdir()
             self.env[key] = str(directory)
-        self.hosts('[local]\n[hub]\nmachine_id = "fixture-host"\n')
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "mbp"\n')
         self.brief = self.tmp / "brief.md"
         self.brief.write_text("fixture prompt\n")
         # Admission tripwire, no detached sentinel or real state DB.
@@ -103,6 +103,25 @@ class CmdSpawnTests(unittest.TestCase):
         self.assertNotIn("agent prompt", log)
         self.assertEqual(self.log("gate.log").splitlines()[0],
                          "gate -m cmd-dsflash41 --effort high --role worker")
+
+    def test_host_gate_allows_only_desk_hosts_with_flag(self):
+        for host in ("mbp", "desktop", "m1b"):
+            with self.subTest(host=host):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
+                self.hosts(f'[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "{host}"\n')
+                result = self.spawn()
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_host_gate_refuses_unapproved_host_or_missing_opt_in(self):
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "m1"\n')
+        self.assert_refused_before_admission(self.spawn(), "approved hosts are mbp, desktop, m1b")
+        for value, reason in (("false", "must be literal true"), (None, "must be literal true")):
+            with self.subTest(value=value):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
+                (self.tmp / "gate.log").unlink(missing_ok=True)
+                flag = "" if value is None else f"cmd_dsflash41 = {value}\n"
+                self.hosts(f'[local]\n{flag}[hub]\nmachine_id = "mbp"\n')
+                self.assert_refused_before_admission(self.spawn(), reason)
 
     def test_effort_mapping(self):
         for effort in ("low", "high", "max"):
