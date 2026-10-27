@@ -1545,29 +1545,42 @@ def cmd_gc(args: argparse.Namespace) -> dict:
             "SELECT job_id, pool, profile, started_at"
             " FROM quota_pool_records ORDER BY job_id, pool"
         ).fetchall()
+        rowless_rows = con.execute(
+            "SELECT j.job_id FROM jobs AS j"
+            " WHERE j.state = 'leased'"
+            " AND NOT EXISTS (SELECT 1 FROM leases AS l WHERE l.job_id = j.job_id)"
+            " AND NOT EXISTS (SELECT 1 FROM quota_pool_records AS q WHERE q.job_id = j.job_id)"
+            " ORDER BY j.job_id"
+        ).fetchall()
         stale_decisions = []
+        rowless_decisions = []
         unresolved_quota_pool = []
         unsafe_quota_pool = []
         skipped = []
-        for row in quota_rows:
-            agent_label = _claim_agent_label(con, row[0])
+        # Process quota-backed and row-less jobs through the same identity,
+        # status, snapshot, and startup-grace guards. A row-less job enters the
+        # release set only when its exact owner is absent from Herdr.
+        orphan_checks = [(row[0], row) for row in quota_rows]
+        orphan_checks.extend((row[0], None) for row in rowless_rows)
+        for job_id, quota_row in orphan_checks:
+            agent_label = _claim_agent_label(con, job_id)
             if agent_label is None:
                 unresolved_quota_pool.append(
                     {
-                        "job_id": row[0],
-                        "pool": row[1],
+                        "job_id": job_id,
+                        "pool": quota_row[1] if quota_row is not None else None,
                         "reason": "job.claim has no exact agent_label mapping",
                     }
                 )
                 continue
             statuses, matched = _matched_agent_statuses(
-                herdr_agents, job_id=row[0], agent_label=agent_label
+                herdr_agents, job_id=job_id, agent_label=agent_label
             )
             if "unknown" in statuses:
                 unsafe_quota_pool.append(
                     {
-                        "job_id": row[0],
-                        "pool": row[1],
+                        "job_id": job_id,
+                        "pool": quota_row[1] if quota_row is not None else None,
                         "agent_label": agent_label,
                         "herdr_status": sorted(statuses),
                         "reason": "herdr agent status=unknown is not stale evidence",
@@ -1578,19 +1591,22 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                 # Any exact listed agent with a known status owns its pane,
                 # whether it is working, idle, blocked, or done.
                 continue
-            current_snapshot = _job_state_claim_snapshot(con, row[0])
-            if not _job_claim_snapshot_matches(snapshots.get(row[0]), current_snapshot):
+            current_snapshot = _job_state_claim_snapshot(con, job_id)
+            if not _job_claim_snapshot_matches(snapshots.get(job_id), current_snapshot):
                 _gc_skip(
                     skipped,
-                    row[0],
+                    job_id,
                     "job state or claim sequence changed after Herdr snapshot",
                 )
                 continue
-            startup_blocker = _orphan_startup_blocker(con, row[0], moment)
+            startup_blocker = _orphan_startup_blocker(con, job_id, moment)
             if startup_blocker is not None:
-                _gc_skip(skipped, row[0], startup_blocker)
+                _gc_skip(skipped, job_id, startup_blocker)
                 continue
-            stale_decisions.append((row, agent_label, sorted(statuses), matched))
+            if quota_row is None:
+                rowless_decisions.append((job_id, agent_label, sorted(statuses), matched))
+            else:
+                stale_decisions.append((quota_row, agent_label, sorted(statuses), matched))
 
         if unresolved_quota_pool or unsafe_quota_pool:
             details = []
@@ -1604,7 +1620,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                 )
             raise ArbiterError(
                 EXIT_STORAGE,
-                "gc identity reconciliation refused; no quota_pool records were deleted"
+                "gc identity reconciliation refused; no quota_pool records or orphan jobs were changed"
                 f" ({'; '.join(details)})",
             )
 
@@ -1645,6 +1661,14 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                 }
             )
             orphan_candidates[row[0]] = (agent_label, statuses, reason)
+
+        for job_id, agent_label, statuses, matched in rowless_decisions:
+            reason = (
+                "job absent from herdr agent list"
+                if not matched
+                else f"herdr agent status={','.join(statuses)}"
+            )
+            orphan_candidates[job_id] = (agent_label, statuses, reason)
 
         orphan_released = []
         for job_id, (agent_label, statuses, reason) in sorted(orphan_candidates.items()):
@@ -1940,6 +1964,7 @@ def render_text(command: str, result: dict) -> str:
         lines = [
             f"checked={result['checked']} expired={result['expired']}"
             f" transitioned={len(result['transitioned'])} retained={result['retained']}"
+            f" orphan_released={len(result.get('orphan_released', []))}"
         ]
         for item in result["transitioned"]:
             lines.append(
@@ -1951,6 +1976,11 @@ def render_text(command: str, result: dict) -> str:
                 f"  job_id={item['job_id']} pool={item['pool']} profile={item['profile']}"
                 f" label={item['agent_label']} status={','.join(item['herdr_status']) or 'absent'}"
                 f" started_at={item['started_at']} -> stale-cleaned"
+            )
+        for item in result.get("orphan_released", []):
+            lines.append(
+                f"  job_id={item['job_id']} label={item['agent_label']}"
+                f" status={','.join(item['herdr_status']) or 'absent'} -> orphan-released"
             )
         for item in result.get("unresolved_quota_pool", []):
             lines.append(
@@ -2056,7 +2086,11 @@ def build_parser() -> argparse.ArgumentParser:
     job_get = sub.add_parser("job-get", parents=[common], help="단건 durable job 수신증 조회(읽기 전용, mode=ro)")
     job_get.add_argument("--job", required=True, help="exact job id")
 
-    gc = sub.add_parser("gc", parents=[common], help="만료 lease 전이 + 명시적 stale 기록 정리")
+    gc = sub.add_parser(
+        "gc",
+        parents=[common],
+        help="만료 lease 전이 + stale quota 정리 + Herdr 부재 row-less job release",
+    )
     gc.add_argument(
         "--herdr-agent-list",
         nargs="?",
