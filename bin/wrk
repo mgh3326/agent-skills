@@ -12051,9 +12051,13 @@ spawn_cmd() {
     fi
     local o3_args=(spawn-check "$JOB_ID" --role "$ROLE" --tier "$JOB_T")
     [[ -z "$TASK_ID" ]] || o3_args+=(--task "$TASK_ID")
-    # Parent owners, explicit or forwarded, cannot pre-empt canonical
-    # verification. Compare the effective owner with O3 before admission.
-    [[ -n "$requested_parent_job" || -z "${BUILDER_LANE:-$requested_owner}" ]] || o3_args+=(--owner "${BUILDER_LANE:-$requested_owner}")
+    # The builder's lane always binds to its canonical claim. Parent owners,
+    # explicit or forwarded, are compared after verification for exit 2.
+    if [[ -n "$BUILDER_LANE" ]]; then
+      o3_args+=(--owner "$BUILDER_LANE")
+    elif [[ -z "$requested_parent_job" && -n "$requested_owner" ]]; then
+      o3_args+=(--owner "$requested_owner")
+    fi
     [[ -z "$PARENT_LANE" ]] || o3_args+=(--parent "$PARENT_LANE")
     [[ -z "$PARENT_JOB" ]] || o3_args+=(--parent-job "$PARENT_JOB")
     [[ -z "$O3_SPAWN_HEAD" ]] || o3_args+=(--head "$O3_SPAWN_HEAD" --repo "$CWD")

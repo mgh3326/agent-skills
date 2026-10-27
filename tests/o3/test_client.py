@@ -1402,6 +1402,60 @@ class SpawnIntegrationTests(Harness):
                     self.assertFalse(client.schema.matches(lanes, {key: None}))
 
 
+class BuilderParentLaneTests(Harness):
+    """dr-2041-1: a parent owner never replaces the builder's own lane."""
+    def spawn_builder(self, mode, lane="b2400-a", parent_owner="b2400-a"):
+        args = SpawnHandshakeTests.spawn_environment(self)
+        args[args.index("--lane") + 1] = lane
+        args[args.index("--report") + 1] = str(self.intent_file().parent / "report.md")
+        args += ["--parent-job", "job-x"]
+        events = self.intent_file("job-x").parent / "events"
+        events.mkdir(parents=True)
+        (events / "00001-job.claim.json").write_text(json.dumps(
+            dict(kind="job.claim", job_id="job-x", owner_lane=parent_owner,
+                 task_id=9999, role="builder", t="T2")))
+        self.mode(mode)
+        self.seed(*({"action": "read"} for _ in range(3)))
+        return self.run_wrk(*args)
+
+    def wrong_lane(self, mode):
+        result = self.spawn_builder(mode, lane="b2400-wrong")
+        self.assertEqual(result.returncode, 73, result.stderr)
+        self.assertIn("claim_conflict", result.stderr)
+        self.assertFalse(any(e["kind"] in ("job.claim", "job.spawned") for e in self.events()))
+        log = self.root / "herdr.log"
+        self.assertFalse(log.exists() and "tab create" in log.read_text())
+        self.assertTrue(all(c["argv"][0] == "wrk" for c in self.calls()))
+
+    def test_required_wrong_builder_lane_with_parent_refuses(self):
+        self.wrong_lane("required")
+
+    def test_shadow_wrong_builder_lane_with_parent_refuses(self):
+        self.wrong_lane("shadow")
+
+    def matching_lane(self, mode):
+        result = self.spawn_builder(mode)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        claim = next(e for e in self.events() if e["kind"] == "job.claim")
+        self.assertEqual(claim.get("payload", claim)["owner_lane"], "b2400-a")
+        self.assertEqual(claim.get("payload", claim)["task_id"], 2400)
+
+    def test_required_matching_builder_lane_with_parent_spawns(self):
+        self.matching_lane("required")
+
+    def test_shadow_matching_builder_lane_with_parent_spawns(self):
+        self.matching_lane("shadow")
+
+    def test_builder_parent_owner_mismatch_keeps_named_exit_two(self):
+        result = self.spawn_builder("required", parent_owner="different-owner")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("different-owner", result.stderr)
+        self.assertIn("b2400-a", result.stderr)
+        self.assertFalse(any(e["kind"] == "job.claim" for e in self.events()))
+        log = self.root / "herdr.log"
+        self.assertFalse(log.exists() and "tab create" in log.read_text())
+
+
 class AuditTests(Harness):
     def local_job(self, job, lane, opened=False, stray=False):
         directory = self.intent_file(job).parent
@@ -2238,6 +2292,10 @@ class MutantTests(Harness):
         adapter_source = ADAPTER.read_text()
         wrk_source = WRK.read_text()
         mutations = [
+            ("drop-builder-lane-under-parent", "wrk",
+             '    if [[ -n "$BUILDER_LANE" ]]; then',
+             '    if [[ -n "$BUILDER_LANE" && -z "$requested_parent_job" ]]; then',
+             "BuilderParentLaneTests"),
             ("owner-only-when-absent", "wrk",
              '    effective_parent_owner="$PARENT_SPAWN_OWNER"',
              '    [[ -n "$requested_owner" ]] || effective_parent_owner="$PARENT_SPAWN_OWNER"',
