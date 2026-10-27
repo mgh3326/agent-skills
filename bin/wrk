@@ -2288,7 +2288,8 @@ quota_gate() {
   [[ -z "${OPERATOR_REQUEST:-}" ]] || gate_args+=(--operator-request "$OPERATOR_REQUEST")
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
-  if [[ "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
+  # hk 2079: E6_WORKER_TESTER_ONLY_PROFILES = PI_CREDIT_MODELS (pi-haiku55/pi-sonnet55/pi-opus55), all PROFILE_KIND=pi; devin-fusion-* are outside the set.
+  if [[ "$PROFILE_KIND" == pi || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
     gate_args+=(--role "$ROLE")
   fi
   local out rc
