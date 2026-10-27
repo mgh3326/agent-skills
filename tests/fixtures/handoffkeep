@@ -24,6 +24,7 @@
 # job is bound (the real server claims exactly once). A same-claimant claim on
 # a task with no job bound is the repair path and succeeds.
 import fcntl
+import hashlib
 import json
 import os
 import sys
@@ -128,8 +129,134 @@ if not STATE:
     die("fixture HK_STATE unset", 2)
 
 
+def doc_cmd(argv):
+    # hk 2094 fixture slice: `doc get KEY`, `doc list --prefix P [--kind K]
+    # [--session S]` and `doc put --key K [--kind K] [--session S] [--job J]
+    # --file F`, backed by HK_STATE's "docs" map. HK_DOC_FAIL names one doc
+    # subcommand ("get", "list" or "put") that always fails rc 1 — the hk
+    # 2094 sweep's record-write failure case. `put` stores the body verbatim
+    # and stamps id/sha256/timestamps like the real server.
+    if not argv:
+        die("doc command requires a verb", 2)
+    cmd, rest = argv[0], argv[1:]
+    if os.environ.get("HK_DOC_FAIL") == cmd:
+        die("injected doc failure")
+
+    if cmd == "get":
+        key = ""
+        doc_id = None
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a == "--id":
+                if i + 1 >= len(rest):
+                    die("flag needs an argument: --id", 2)
+                doc_id = rest[i + 1]
+                i += 2
+            elif a.startswith("-"):
+                die(f"flag provided but not defined: {a.lstrip('-')}", 2)
+            else:
+                if key:
+                    die("doc get accepts one key", 2)
+                key = a
+                i += 1
+        db = load(STATE)
+        docs = db.get("docs", {})
+        if doc_id is not None:
+            found = next((d for d in docs.values()
+                          if str(d.get("id")) == doc_id.lstrip("#")), None)
+            if found is None:
+                die("not_found")
+            print(json.dumps(found, separators=(",", ":")))
+            return
+        if not key:
+            die("doc get requires key", 2)
+        d = docs.get(key)
+        if d is None:
+            die("not_found")
+        print(json.dumps(d, separators=(",", ":")))
+        return
+
+    if cmd == "list":
+        prefix = kind = session = ""
+        i = 0
+        while i < len(rest):
+            a = rest[i]
+            if a in ("--prefix", "--kind", "--session"):
+                if i + 1 >= len(rest):
+                    die(f"flag needs an argument: {a}", 2)
+                if a == "--prefix":
+                    prefix = rest[i + 1]
+                elif a == "--kind":
+                    kind = rest[i + 1]
+                else:
+                    session = rest[i + 1]
+                i += 2
+            else:
+                die(f"flag provided but not defined: {a.lstrip('-')}", 2)
+        docs = [d for k, d in sorted(load(STATE).get("docs", {}).items())
+                if k.startswith(prefix)
+                and (not kind or d.get("kind") == kind)
+                and (not session or d.get("session") == session)]
+        print(json.dumps(docs[:100], separators=(",", ":")))
+        return
+
+    if cmd == "put":
+        values = {}
+        i = 0
+        while i < len(rest):
+            flag = rest[i]
+            if flag not in ("--key", "--kind", "--session", "--job", "--file"):
+                die(f"flag provided but not defined: {flag.lstrip('-')}", 2)
+            if i + 1 >= len(rest):
+                die(f"flag needs an argument: {flag}", 2)
+            values[flag] = rest[i + 1]
+            i += 2
+        if not values.get("--key") or not values.get("--file"):
+            die("required flags --key and --file not set", 2)
+        try:
+            with open(values["--file"], encoding="utf-8") as f:
+                body = f.read()
+        except OSError as exc:
+            die(f"doc put --file unreadable: {exc}", 2)
+        lock_path = STATE + ".lock"
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            db = load(STATE)
+            docs = db.setdefault("docs", {})
+            now = "2026-01-01T00:00:00+00:00"
+            prev = docs.get(values["--key"])
+            ids = [d.get("id", 0) for d in docs.values() if isinstance(d.get("id"), int)]
+            doc = {
+                "id": prev.get("id") if prev else (max(ids) + 1 if ids else 1),
+                "key": values["--key"],
+                "kind": values.get("--kind") or "note",
+                "session": values.get("--session") or "",
+                "job": values.get("--job") or "",
+                "body": body,
+                "sha256": hashlib.sha256(body.encode()).hexdigest(),
+                "created_by": "fixture",
+                "created_at": prev.get("created_at", now) if prev else now,
+                "updated_at": now,
+            }
+            changed = prev is None or prev.get("body") != body or \
+                prev.get("kind") != doc["kind"]
+            docs[values["--key"]] = doc
+            save(STATE, db)
+        print(json.dumps({"document": doc, "changed": changed},
+                         separators=(",", ":")))
+        return
+
+    die(f"unknown doc command {cmd}", 2)
+
+
 def main():
     argv = sys.argv[1:]
+    if len(argv) < 1:
+        die("invalid_context", 2)
+    if argv[0] == "doc":
+        doc_cmd(argv[1:])
+        return
     if len(argv) < 2 or argv[0] != "tasks":
         die("invalid_context", 2)
     cmd = argv[1]
@@ -224,7 +351,7 @@ def main():
     if cmd == "add":
         # Minimal setup helper. --id/--title/--lane plus seed overrides the
         # real CLI lacks (--state/--claimed-by/--job-id) for pre-bound states.
-        title = lane = state = claimed_by = job_id = ""
+        title = lane = state = claimed_by = job_id = project = ""
         tid = None
         i = 2
         while i < len(argv):
@@ -243,6 +370,8 @@ def main():
                 claimed_by = argv[i + 1]
             elif a == "--job-id":
                 job_id = argv[i + 1]
+            elif a == "--project":
+                project = argv[i + 1]
             i += 2
         lock_path = STATE + ".lock"
         with open(lock_path, "w") as lock:
@@ -252,7 +381,7 @@ def main():
             tid = tid or str((max(ids) + 1) if ids else 1)
             t = {
                 "id": int(tid), "lane": lane, "title": title, "kind": "implement",
-                "state": state or "backlog", "priority": 0,
+                "state": state or "backlog", "priority": 0, "project": project,
                 "refs": {"job_id": job_id} if job_id else {},
                 "claimed_by": claimed_by,
                 "created_by": "fixture", "created_at": "2026-01-01T00:00:00+00:00",
