@@ -155,9 +155,9 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "cf352bd05a9920972d90c69075cdce16f7dc70d7ec977bfc77a9c6c6a292b038",
+    ".github/workflows/ci.yml": "e2230e57fc544b82b925910667e1280f0044d3446f6f1c009312fb644a75ac14",
     "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
-    "bin/wrk": "a9f0a5fabd1fdaba97b9f1cc579343befdefb032f5e2af1595760745a1e5b362",
+    "bin/wrk": "9b9020d7522364cfa1c5aede25ee688695405cd373b7d8a6ee08430d73933078",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
     "builder/SKILL.md": "116315fcfcff000c4933b62068b128e7bfecf820e7b72f238c1bd8c227722713",
     "checker/SKILL.md": "cfe8dbd52fe282ba5d7bbb035676f379eeae11c1577d2783f6bff19f5432cb92",
