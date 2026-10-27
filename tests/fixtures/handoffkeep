@@ -135,12 +135,17 @@ def doc_cmd(argv):
     # --file F`, backed by HK_STATE's "docs" map. HK_DOC_FAIL names one doc
     # subcommand ("get", "list" or "put") that always fails rc 1 — the hk
     # 2094 sweep's record-write failure case. `put` stores the body verbatim
-    # and stamps id/sha256/timestamps like the real server.
+    # and stamps id/sha256/timestamps like the real server, but only when the
+    # caller opts in with HK_DOC_PUT_OK=1.
     if not argv:
         die("doc command requires a verb", 2)
     cmd, rest = argv[0], argv[1:]
     if os.environ.get("HK_DOC_FAIL") == cmd:
         die("injected doc failure")
+    # A write changes what the shared suite observes (wrk appends a document
+    # suffix to report_last_line on a successful put), so it stays opt-in.
+    if cmd == "put" and os.environ.get("HK_DOC_PUT_OK") != "1":
+        die("doc put disabled (set HK_DOC_PUT_OK=1)")
 
     if cmd == "get":
         key = ""

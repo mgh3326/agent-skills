@@ -206,7 +206,7 @@ sweep() {
   while [[ "${1:-}" == *=* ]]; do envs+=("$1"); shift; done
   out="$(env ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" \
     HK_STATE="$HK_DB" HANDOFFKEEP_BIN="$HK" HERDR_BIN="$HERDR" \
-    SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
+    HK_DOC_PUT_OK=1 SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
     WRK_HOSTS_CONFIG="$HOSTS" WRK_FIXTURE_LOG="$HERDR_LOG" \
     WRK_FIXTURE_GET_SEQUENCE="$GET_SEQ" \
     HOME="$TMPHOME" TMPDIR="$TMP" "${envs[@]}" \
@@ -484,11 +484,17 @@ SEN_PID=$!
 own "$SEN_PID"
 for _ in $(seq 1 20); do
   kill -0 "$SEN_PID" 2>/dev/null || break
-  [[ -f "$INBOX/sw7-sen/completion-sentinel.log" ]] && break
+  # -s, not -f: the log file is created before the first poll. A non-empty
+  # log proves that poll wrote its line.
+  [[ -s "$INBOX/sw7-sen/completion-sentinel.log" ]] && break
   sleep 0.3
 done
 kill -0 "$SEN_PID" 2>/dev/null ||
   fail "sw7 sentinel exited before the sweep ran"
+# The poll writes the log line, then checks sentinel_job_ended in the same
+# pass. Give that check time to finish before the end record lands, so the
+# sentinel is in its 3600s interval sleep when the sweep looks for it.
+sleep 1
 ARBITER_TEST_NOW="$OLD4" \
   arb event --job sw7-sen --kind job.completed \
   --payload-json '{"owner_lane":"lane-a","label":"lbl"}' >/dev/null
