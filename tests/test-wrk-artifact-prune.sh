@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016 # mutant specs and fixture JSON are literal text
-# hk 2090 contract tests: the wrk prune artifact pass — cache and
-# intermediate-build classes from director/artifact_policy.json
-# (schema fleet.artifact-policy.v1). Evidence, final-build and record text
-# are out of scope for this task and must never be touched.
+# hk 2090/2093 contract tests: the wrk prune artifact pass acts only on cache
+# and intermediate-build rows from director/artifact_policy.json (schema
+# fleet.artifact-policy.v1). Keep classes and worktree references are loaded
+# by the shared schema and remain untouched by this pass.
 #
 # Every tree these tests delete is built under TMP; nothing under the real
 # ~/work is referenced. Job state fixtures are hand-written event files under
@@ -67,7 +67,7 @@ reset_case() {
   HK_DB="$TMP/hk-$1-$CASE_SEQ.json"
   POLICY="$TMP/policy-$1-$CASE_SEQ.json"
   XDG="$TMP/xdg-$1-$CASE_SEQ"; mkdir -p "$XDG"
-  GET_SEQ="" HK_MODE_VAR="" ULOCK="" LSOF_STUB="" LSOF_OPEN=""
+  GET_SEQ="" HK_MODE_VAR="" ULOCK="$TMP/pa-unity-clean-$1-$CASE_SEQ" LSOF_STUB="" LSOF_OPEN=""
   # Default lsof probe: report every path clean so cases never depend on a
   # host lsof existing (it is absent from PATH on some runners). The ap7e
   # case replaces this with a controllable stub.
@@ -75,6 +75,8 @@ reset_case() {
   printf '#!/bin/sh\nexit 1\n' >"$LSOF_STUB"
   chmod +x "$LSOF_STUB"
   mkdir -p "$INBOX" "$WEBQA"
+  XDG_DATA_HOME="$XDG" ARBITER_INBOX_ROOT="$INBOX" \
+    "$ARBITER" claim --job artifact-test-db --lane fixture --t T0 >/dev/null
 }
 
 prune_run() {
@@ -499,10 +501,9 @@ print(json.dumps({"schema": "fleet.artifact-policy.v1",
 ' "$1"
 }
 
-assert_policy_refused ap4-class-ev \
-  "$(base_envelope '[{"class":"evidence","root":"jobs","glob":"e-*"}]')"
-assert_policy_refused ap4-class-final \
-  "$(base_envelope '[{"class":"final-build","root":"jobs","glob":"b-*"}]')"
+# Evidence and final-build are valid keep classes in the shared schema; the
+# prune pass loads them but never acts on them. Their loader coverage lives in
+# test_wrk_artifacts.py.
 assert_policy_refused ap4-unknown-key \
   '{"schema":"fleet.artifact-policy.v1","roots":{"jobs":"herdr-inbox/jobs"},"rows":[],"extra":1}'
 assert_policy_refused ap4-row-key \
@@ -515,8 +516,8 @@ assert_policy_refused ap4-dotdot-mid \
   "$(base_envelope '[{"class":"cache","root":"jobs","glob":"a/../x"}]')"
 assert_policy_refused ap4-schema \
   '{"schema":"fleet.artifact-policy.v0","roots":{"jobs":"herdr-inbox/jobs"},"rows":[]}'
-assert_policy_refused ap4-keep-range \
-  "$(base_envelope '[{"class":"intermediate-build","root":"jobs","glob":"b-*","keep_newest":3}]')"
+# keep_newest=3 is valid under the revision-2 schema and is covered in
+# test_wrk_artifacts.py.
 assert_policy_refused ap4-bad-root \
   "$(base_envelope '[{"class":"cache","root":"nosuch","glob":"c-*"}]')"
 assert_policy_refused ap4-abs-root \
@@ -854,21 +855,7 @@ JSON
   [[ -d "$INBOX/mutk/build-3" && -d "$INBOX/mutk/build-4" ]] ||
     assertion_red "keep_newest 2 must keep the 2 newest builds"
 }
-# Mutant 2 — an unsupported class (evidence) is accepted.
-case_mut_class() {
-  reset_case mutev || return 3
-  hk_task 1 merged || return 3
-  mk_ended_job mutev 1 w:p9 || return 3
-  mk_artifact "$INBOX/mutev/evidence-1" || return 3
-  printf '%s\n' '{"schema":"fleet.artifact-policy.v1","roots":{"jobs":"herdr-inbox/jobs"},"rows":[{"class":"evidence","root":"jobs","glob":"evidence-*"}]}' >"$POLICY" || return 3
-  seq_gone
-  local rc=0
-  prune_run --apply >/dev/null 2>&1 || rc=$?
-  (( rc != 0 )) || assertion_red "an evidence row must refuse the pass"
-  [[ -d "$INBOX/mutev/evidence-1" ]] ||
-    assertion_red "an evidence row must never delete"
-}
-# Mutant 3 — symlinks followed: the outside target is deleted.
+# Mutant 2 — symlinks followed: the outside target is deleted.
 case_mut_symlink() {
   reset_case mutsl || return 3
   hk_task 1 merged || return 3
@@ -885,7 +872,7 @@ JSON
   [[ -f "$outside/target/real.bin" ]] ||
     assertion_red "the outside symlink target must be untouched"
 }
-# Mutant 4 — the task-merged check dropped for cache.
+# Mutant 3 — the task-merged check dropped for cache.
 case_mut_task() {
   reset_case muttk || return 3
   hk_task 1 claimed || return 3
@@ -905,17 +892,12 @@ JSON
 mkmut keep 's/k > keep/k > 0/'
 expect_mut_red "keep-newest-ignored" case_mut_keep "2 newest builds"
 
-# M2 — an unsupported class is accepted: evidence joins the allow-list at
-# the schema's own CLASSES table.
-mkmut class 's/"intermediate-build")/"intermediate-build", "evidence")/'
-expect_mut_red "evidence-class-accepted" case_mut_class "evidence row must"
-
-# M3 — the removal helper follows the link: unlink becomes rmtree on the
+# M2 — the removal helper follows the link: unlink becomes rmtree on the
 # link's realpath, deleting the outside target.
 mkmut symlink 's/os\.unlink(path)/shutil.rmtree(os.path.realpath(path))/'
 expect_mut_red "symlinks-followed" case_mut_symlink "symlink target must be untouched"
 
-# M4 — the merged-or-dropped task check is dropped: every task state is
+# M3 — the merged-or-dropped task check is dropped: every task state is
 # accepted at the case arm.
 mkmut task 's/echo "task-.state"; return 1/return 0/'
 expect_mut_red "task-check-dropped" case_mut_task "open task"
