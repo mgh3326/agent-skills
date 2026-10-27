@@ -1372,17 +1372,27 @@ sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
 # candidate block must not appear in the injected brief (a brief quoting the
 # model line is not the session's own statement). Unknown layouts, a missing
 # banner and truncated rows all fail closed.
+# hk 2174: cmd abbreviates HOME in the cwd row ("# ~/work/x"), so that row is
+# accepted as the absolute launch cwd or as the same cwd with a leading $HOME
+# replaced by "~" — HOME exactly, or HOME followed by "/", never a substring.
 cmd_model_proven() {
   local screen
   screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || return 1
   # shellcheck disable=SC2016
   printf '%s' "$screen" | python3 -c '
 import os, re, sys
-expected_model, effort, cwd, prompt = sys.argv[1:]
+expected_model, effort, cwd, home, prompt = sys.argv[1:]
 def clean(text):
     return [line.rstrip() for line in
             re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).splitlines()]
 lines = clean(sys.stdin.read())
+shown_cwds = {"# " + cwd}
+home = home.rstrip("/")
+if home.startswith("/"):
+    if cwd == home:
+        shown_cwds.add("# ~")
+    elif cwd.startswith(home + "/"):
+        shown_cwds.add("# ~" + cwd[len(home):])
 # Every models row must be the expected one, inside a banner block.
 want = ("# models: " + expected_model + " with " + effort + " effort")
 blocks = 0
@@ -1398,7 +1408,7 @@ for i, line in enumerate(lines):
         sys.exit(1)
     if not re.fullmatch(r"# Command Code v\S+", lines[i - 1]):
         sys.exit(1)
-    if lines[i + 1] != "# " + cwd:
+    if lines[i + 1] not in shown_cwds:
         sys.exit(1)
     blocks += 1
     block_i = i
@@ -1416,7 +1426,7 @@ quoted = re.sub(r"\s+", " ", injected).strip()
 if candidate in quoted:
     sys.exit(1)
 sys.exit(0)
-' "$CMD_SCREEN_MODEL" "$CMD_EFFORT" "$SPAWN_EXPECT_CWD" "$PROMPT"
+' "$CMD_SCREEN_MODEL" "$CMD_EFFORT" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
 
 # hk 2109: the Terra 6.1 model id alone does not prove Codex selected the
