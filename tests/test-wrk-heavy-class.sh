@@ -162,7 +162,7 @@ def check_signal_surface(source):
     kills = re.findall(r"os\.kill\([^)]*\)", source)
     assert kills == ["os.kill(pid, 0)"], ("unexpected os.kill calls", kills)
     forbidden = re.findall(
-        r"os\.killpg\s*\(|\.(?:kill|terminate|send_signal)\s*\(|"
+        r"os\.killpg\s*\(|(?<!os)\.(?:kill|terminate|send_signal)\s*\(|"
         r"signal\.(?:pthread_kill|raise_signal|alarm)\s*\(", source)
     assert not forbidden, ("a signal path can affect a holder", forbidden)
 
@@ -170,7 +170,8 @@ def check_signal_surface(source):
     assert len(imports) == 1, ("signal import must be limited to wait handlers", imports)
     attrs = re.findall(r"\bsignal\.([A-Za-z_][A-Za-z0-9_]*)", source)
     assert set(attrs) <= {"signal", "SIGHUP", "SIGTERM", "SIG_DFL"}, attrs
-    calls = re.findall(r"signal\.signal\([^)]*\)", source)
+    calls = [line.strip() for line in source.splitlines()
+             if re.match(r"\s*signal\.signal\(", line)]
     expected = [
         "signal.signal(signal.SIGHUP, wait_signal_handler)",
         "signal.signal(signal.SIGTERM, wait_signal_handler)",
@@ -693,7 +694,8 @@ echo "PASS mutant-allslots"
 
 # deadci: a dead ci waiter's record still reserves. RED proof: the lane that
 # must run at once caps out behind the dead record.
-mutant deadci 'if lim is None or lim < 1 or not alive(pid):' 'if lim is None or lim < 1:'
+mutant deadci $'        if cls != "ci" or pid <= 0 or pid == os.getpid():\n            continue\n        if lim is None or lim < 1:\n            continue\n        if reservation_owner_alive(pid, start, name) is False:' \
+  $'        if cls != "ci" or pid <= 0 or pid == os.getpid():\n            continue\n        if lim is None or lim < 1:\n            continue\n        if False:'
 new_lock m4
 sleep 0.1 &
 dead=$!
@@ -709,7 +711,7 @@ echo "PASS mutant-deadci"
 # headscan: class= and limit= are read from anywhere in the record, so text
 # inside a command forges a ci waiter. RED proof: the forged old-format
 # record from the s3b test now blocks the lane.
-mutant headscan $'"lane", None\n    toks = text.split(None, 3)[:3]' $'"lane", None\n    toks = text.split()'
+mutant headscan $'    toks = text.split(None, 5)[:5]' $'    toks = text.split()'
 new_lock m5
 sleep 300 &
 forged=$!
