@@ -97,6 +97,7 @@ fixture_exec_line() {
       printf '%s\n' "$text" >"$fixture_foreground_file.cmd-screen"
       read -r -a cmd_args <<<"$text"
       WRK_CMD_CWD="$(cat "$fixture_cwd_file" 2>/dev/null || printf '/tmp')" \
+        WRK_CMD_TRANSCRIPT_FILE="$fixture_cmd_transcript_file" \
         "$(dirname "$0")/cmd" "${cmd_args[@]:1}" >>"$fixture_foreground_file.cmd-screen"
       ;;
   esac
@@ -178,6 +179,10 @@ fixture_get_sequence_step() {
 
 fixture_is_recent_unwrapped_read() {
   [[ " $* " == *" --source recent-unwrapped "* ]]
+}
+
+fixture_is_visible_read() {
+  [[ " $* " == *" --source visible "* ]]
 }
 
 # WRK_FIXTURE_PINFO_SEQUENCE 는 `pane process-info` 응답을 호출 순서대로 적은
@@ -357,7 +362,9 @@ case "${1:-}" in
           exit 1 ;;
         read)
           cat "${WRK_CMD_SCREEN_FILE:-$fixture_foreground_file.cmd-screen}" 2>/dev/null || true
-          [[ ! -f "$fixture_cmd_transcript_file" ]] || cat "$fixture_cmd_transcript_file"
+          if ! fixture_is_visible_read "$@"; then
+            [[ ! -f "$fixture_cmd_transcript_file" ]] || cat "$fixture_cmd_transcript_file"
+          fi
           if ! fixture_is_recent_unwrapped_read "$@" && [[ -f "$fixture_cmd_composer_file" ]]; then
             printf '❯ %s\n' "$(cat "$fixture_cmd_composer_file")"
           fi

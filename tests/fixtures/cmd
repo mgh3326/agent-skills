@@ -49,9 +49,12 @@ models_line = f"# models: {shown_display} with {shown_effort} effort{tail}"
 cwd_line = f"# {cwd}"
 
 if scenario == "transcript-line":
-    # The model text exists on screen but not inside a banner block — a
-    # transcript/scrollback row, never the session's own statement.
-    print(models_line)
+    # Keep this row in the transcript only. The herdr fixture exposes it to
+    # recent reads, but a visible-screen read must not return it.
+    transcript = os.environ.get("WRK_CMD_TRANSCRIPT_FILE")
+    if transcript:
+        with open(transcript, "a", encoding="utf-8") as stream:
+            stream.write(models_line + "\n")
     sys.exit(0)
 
 lines = [

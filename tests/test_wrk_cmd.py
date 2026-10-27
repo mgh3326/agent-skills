@@ -180,6 +180,25 @@ class CmdSpawnTests(unittest.TestCase):
                 self.assertIn("pane close w:p1", self.log())
                 self.assertNotIn("OK pane=", result.stdout)
 
+    def test_visible_read_excludes_transcript_only_model_row(self):
+        run_id = "transcript-only"
+        foreground = Path(self.env["TMPDIR"]) / f"wrk-fixture-fg-{run_id}"
+        foreground.write_text("cmd\n")
+        screen = Path(f"{foreground}.cmd-screen")
+        screen.write_text("cmd -m deepseek/deepseek-v4.1-flash\n")
+        transcript = Path(self.env["TMPDIR"]) / f"wrk-fixture-cmd-transcript-{run_id}"
+        transcript.write_text("# models: deepseek-v4.1-flash-(latest) with high effort · taste-1\n")
+        env = dict(self.env, WRK_RUN_ID=run_id)
+        visible = subprocess.run(
+            [env["HERDR_BIN"], "agent", "read", "w:p1", "--source", "visible"],
+            env=env, text=True, capture_output=True, check=True)
+        recent = subprocess.run(
+            [env["HERDR_BIN"], "agent", "read", "w:p1", "--source", "recent"],
+            env=env, text=True, capture_output=True, check=True)
+        model_row = "# models: deepseek-v4.1-flash-(latest) with high effort"
+        self.assertNotIn(model_row, visible.stdout)
+        self.assertIn(model_row, recent.stdout)
+
     def test_brief_cannot_prove_model(self):
         # A brief that quotes the whole banner block is not the session's own
         # statement: the proof must still refuse even when the real banner is
