@@ -205,14 +205,35 @@ PY
 }
 
 # --t is required by wrk; supply one unless the case under test provides its own.
+track_test_spawn_sentinel() {
+  local job="$1" jobdir="$ARBITER_INBOX_ROOT/$1"
+  local pidfile="$jobdir/completion-sentinel.pid" pid="" attempt
+  [[ -s "$pidfile" ]] || { echo "expected sentinel pidfile for $job" >&2; return 1; }
+  IFS= read -r pid <"$pidfile" || { echo "could not read sentinel pid for $job" >&2; return 1; }
+  [[ "$pid" =~ ^[0123456789]+$ ]] || { echo "malformed sentinel pid for $job" >&2; return 1; }
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    _tw_pid_alive "$pid" || return 0
+    if _tw_sentinel_argv_ok "$pid" "$job" "$jobdir"; then
+      # Fake-clock cases intentionally make the pidfile's started= fail the
+      # production age check. Capture this exact test-owned PID's real start
+      # identity and process group so teardown can reap its detached session.
+      tw_register_pid "$OWNED_PIDS" "$pid"
+      return
+    fi
+    sleep 0.2
+  done
+  echo "sentinel $pid for $job stayed alive without its final argv" >&2
+  return 1
+}
+
 spawn_base() {
   local model="$1"; shift
   local extra=("$@")
+  local spawn_rc=0 session_job="" session_pid="" i
+  local -a spawn_cmd=()
   # The fake clock records started=1000, which correctly fails the real
   # process-start check. In the opt-in cases, the self-recorded session
   # keeps the orphan sentinel owned independently of that pidfile.
-  local -a own_session=()
-  [[ "${TEST_OWN_SESSION:-0}" == 1 ]] && own_session=(tw_own_session)
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
   # #768: every spawn binds an hk task. Mint a fresh fixture task per spawn so
   # owner-mode claims stay claimable; a case that supplies --task/--parent-job
@@ -229,9 +250,12 @@ spawn_base() {
   # Record the effective --task each call carries. spawn_base often runs
   # inside $(...), so a global is lost to the parent shell — a log file is
   # the subshell-safe channel (tail -1 after a call = that call's task).
-  local resolved_task="" i
+  local resolved_task=""
   for ((i = 0; i < ${#extra[@]}; i++)); do
     [[ "${extra[$i]}" == "--task" ]] && resolved_task="${extra[$((i + 1))]}"
+    if [[ "${extra[$i]}" == "--job" && $((i + 1)) -lt ${#extra[@]} ]]; then
+      session_job="${extra[$((i + 1))]}"
+    fi
   done
   [[ -n "$resolved_task" ]] && printf '%s\n' "$resolved_task" >>"$TMP/spawn-task.log"
   # A registered job leaves a detached sentinel behind, and that sentinel keeps
@@ -240,7 +264,7 @@ spawn_base() {
   # once in three runs, between a case's `rm -f "$TMP/herdr.log"` and its
   # `[[ ! -e "$TMP/herdr.log" ]]`, and the suite dies there with no message.
   # Park the probes past the end of the run instead.
-  "${own_session[@]+"${own_session[@]}"}" env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  spawn_cmd=(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_COMPLETION_INTERVAL_S="${WRK_COMPLETION_INTERVAL_S:-3600}" \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
@@ -248,7 +272,24 @@ spawn_base() {
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S="${WRK_REFRESH_TIMEOUT_S:-5}" \
     "${WRK_UNDER_TEST:-$WRK}" spawn \
-    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
+    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}")
+  if [[ "${TEST_OWN_SESSION:-0}" == 1 ]]; then
+    tw_own_session "${spawn_cmd[@]}" &
+    session_pid=$!
+    if wait "$session_pid"; then
+      :
+    else
+      spawn_rc=$?
+    fi
+  elif "${spawn_cmd[@]}"; then
+    :
+  else
+    spawn_rc=$?
+  fi
+  if [[ "${TEST_OWN_SESSION:-0}" == 1 && -n "$session_job" ]]; then
+    track_test_spawn_sentinel "$session_job" || return 1
+  fi
+  return "$spawn_rc"
 }
 
 run_terra_refusal_tests() {
@@ -14333,10 +14374,10 @@ wait_until 15 bash -c "! kill -0 $grace_pid 2>/dev/null" ||
   fail "the sentinel must exit once it has completed a job it had already reported lost"
 wait "$grace_pid" 2>/dev/null || true
 grace_log="$GRACE_INBOX/sentinel-grace/completion-sentinel.log"
-grace_lines="$(awk 'END{print NR}' "$grace_log")"
+grace_lines="$(awk '/ status=/ { n++ } END { print n+0 }' "$grace_log")"
 grace_calls="$(awk 'END{print NR}' "$GRACE_SEQ.calls")"
 [[ "$grace_lines" -eq "$grace_calls" ]] ||
-  fail "completion-sentinel.log must hold exactly one line per decision: $grace_lines lines for $grace_calls observations"
+  fail "completion-sentinel.log must hold exactly one decision per observation: $grace_lines decisions for $grace_calls observations"
 grep -q 'action=lost:herdr_unreachable' "$grace_log" ||
   fail "the decision log must name the lost reason it wrote (action=lost:herdr_unreachable)"
 grep -q 'action=completed' "$grace_log" ||
@@ -14358,8 +14399,8 @@ GONE_EVENTS="$GONE_INBOX/sentinel-gone/events"
 [[ "$(sentinel_lost_reason "$GONE_EVENTS")" == "agent_not_found" ]] ||
   fail "job.lost must carry reason=agent_not_found, got '$(sentinel_lost_reason "$GONE_EVENTS")'"
 gone_log="$GONE_INBOX/sentinel-gone/completion-sentinel.log"
-[[ "$(awk 'END{print NR}' "$gone_log")" -eq 1 ]] ||
-  fail "one observation is one decision is one log line"
+[[ "$(awk '/ status=/ { n++ } END { print n+0 }' "$gone_log")" -eq 1 ]] ||
+  fail "one observation is one decision log entry"
 grep -q 'status=err:agent_not_found transient=0 action=lost:agent_not_found' "$gone_log" ||
   fail "the decision log must show the error code that proved the loss"
 echo "PASS sentinel-agent-not-found-is-immediate-loss"

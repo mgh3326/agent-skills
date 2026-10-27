@@ -8069,6 +8069,33 @@ sentinel_self_exit() {
   exit "$code"
 }
 
+# sentinel_exit_log RC FILE LINE — the watcher always leaves a final record,
+# after its action= observations, so an unexpected shell exit is diagnosable.
+# Bash's EXIT trap reports status zero for an otherwise-unhandled TERM; the
+# signal handlers below turn the common terminating signals into their
+# conventional 128+n exit statuses before this formatter runs.
+sentinel_exit_log() {
+  local code="$1" logfile="$2" line="$3" signal="" signal_number
+  if [[ "$code" =~ ^[0-9]+$ ]] && (( code >= 129 && code <= 255 )); then
+    signal_number=$(( code - 128 ))
+    signal="$(kill -l "$signal_number" 2>/dev/null || true)"
+    [[ "$signal" =~ ^[A-Z][A-Z0-9]*$ ]] || signal=""
+  fi
+  if [[ -n "$signal" ]]; then
+    printf '%s sentinel-exit code=%s line=%s signal=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$code" "$line" "$signal" >>"$logfile" 2>/dev/null || true
+  else
+    printf '%s sentinel-exit code=%s line=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$code" "$line" >>"$logfile" 2>/dev/null || true
+  fi
+}
+
+sentinel_exit_trap() {
+  local code="$1"
+  trap - DEBUG EXIT
+  sentinel_exit_log "$code" "$SENTINEL_EXIT_LOGFILE" "${SENTINEL_LAST_COMMAND_LINE:-0}"
+}
+
 # job_recovered_record JOB OWNER LABEL PANE REASON LOST_DURATION_S
 # One flat job.recovered for the end of a lost episode. Not a terminal and
 # not a revive. Not emitted through panewire, same as job.lost.
@@ -8113,6 +8140,17 @@ sentinel_cmd() {
   jobdir="$(wrk_jobs_root)/$job"
   mkdir -p "$jobdir"
   logfile="$jobdir/completion-sentinel.log"
+  SENTINEL_EXIT_LOGFILE="$logfile"
+  SENTINEL_LAST_COMMAND_LINE=0
+  trap 'sentinel_exit_trap "$?"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
+  # Bash emits a synthetic DEBUG callback while dispatching EXIT (and may
+  # repeat the failed command's callback during errexit); keep only callbacks
+  # that precede a successful command in this function.
+  trap 'if (( $? == 0 && LINENO > 1 )); then SENTINEL_LAST_COMMAND_LINE=$LINENO; fi' DEBUG
   if [[ "$pane_kind" == devin && -n "$observed_rung" ]]; then
     wrk_path="$(python3 - "$0" <<'PY'
 from pathlib import Path
@@ -8384,9 +8422,13 @@ start_completion_sentinel() {
   # prove the pid still belongs to the process it launched — a bare pid is
   # silently recyclable by the kernel.
   if [[ "${#SENTINEL_ENV[@]}" -gt 0 ]]; then
-    ( nohup env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
+    ( nohup python3 -c 'import os, signal, sys; [signal.signal(sig, signal.SIG_DFL) for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+      env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 &
+      printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   else
-    ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
+    ( nohup python3 -c 'import os, signal, sys; [signal.signal(sig, signal.SIG_DFL) for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+      "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 &
+      printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   fi
 }
 
