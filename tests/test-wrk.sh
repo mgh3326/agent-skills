@@ -16015,6 +16015,7 @@ bash "$ROOT/tests/test-shellcheck-capped.sh"
 bash "$ROOT/tests/test-devin-gate-profile.sh"
 # hk 1990: preserve durable operator refs at the actual apply_catalog call site.
 python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
+bash "$ROOT/tests/test-pi-launcher.sh"
 # hk 2054: the tripwire check is the last command before PASS test-wrk — a
 # sub-suite added after it would inherit the shim PATH unchecked. Fail closed
 # unless only blanks, comments and the PASS echo follow the check's fi.
