@@ -892,6 +892,82 @@
         "T2"
       ]
     },
+    "builder-terra61-high": {
+      "default_effort": "high",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "high": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-terra",
+      "model": "gpt-6.1-terra",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-terra61-max": {
+      "default_effort": "max",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "max": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-terra",
+      "model": "gpt-6.1-terra",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-terra61-medium": {
+      "default_effort": "medium",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "medium": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-terra",
+      "model": "gpt-6.1-terra",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
+    "builder-terra61-xhigh": {
+      "default_effort": "xhigh",
+      "family": "openai",
+      "grade_conflict_ref": "spawn-worker:2-2#704 vs scopefuel/policy-launch-snapshot",
+      "grade_status": "conflict",
+      "grades": {
+        "xhigh": null
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-terra",
+      "model": "gpt-6.1-terra",
+      "roles": [
+        "builder"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
+    },
     "builder-terra-high": {
       "default_effort": "high",
       "family": "openai",
@@ -1267,6 +1343,29 @@
       "role_status": "denied",
       "roles": [],
       "surfaces": []
+    },
+    "codex-terra61": {
+      "default_effort": "low",
+      "family": "openai",
+      "grades": {
+        "low": "ungraded",
+        "medium": "ungraded",
+        "high": "ungraded",
+        "xhigh": "ungraded",
+        "max": "ungraded",
+        "ultra": "ungraded"
+      },
+      "launcher": "codex",
+      "launcher_model_token": "PROFILE_MODEL=gpt-6.1-terra",
+      "model": "gpt-6.1-terra",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
     },
     "devin-argon": {
       "default_effort": "",
