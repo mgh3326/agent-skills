@@ -6,6 +6,7 @@ suites-a|bash tests/test-tester-eligible.sh
 suites-a|bash tests/test-t3-split-rule.sh
 suites-a|bash tests/test-prompt-suggestion-off.sh
 suites-a|bash tests/test-wrk-job-end.sh
+suites-a|bash tests/test-worktree-reap.sh
 suites-a|bash tests/test-round-cap.sh
 suites-a|bash tests/test-wrk-rounds.sh
 suites-a|bash tests/test-fleet-rev.sh
