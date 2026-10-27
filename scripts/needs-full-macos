@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -ne 2 ]]; then
+  echo "usage: needs-full-macos BASE HEAD" >&2
+  exit 2
+fi
+
+base="$1"
+head="$2"
+manifest="$(cd "$(dirname "$0")/.." && pwd)/.github/macos-smoke.txt"
+
+tmp="$(mktemp)"
+trap 'rm -f "$tmp"' EXIT
+git diff --name-only --diff-filter=ACDMRTUXB "$base...$head" > "$tmp"
+
+python3 - "$manifest" "$tmp" <<'PY'
+from pathlib import Path
+import sys
+
+manifest = Path(sys.argv[1]).read_text(encoding="utf-8").splitlines()
+changed = set(Path(sys.argv[2]).read_text(encoding="utf-8").splitlines())
+section = ""
+uncovered = set()
+for raw in manifest:
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    if line.startswith("[") and line.endswith("]"):
+        section = line
+        continue
+    if section != "[darwin-sensitive]":
+        continue
+    path, smoke_command, _reason = line.split("|", 2)
+    if smoke_command == "-" and path in changed:
+        uncovered.add(path)
+
+if uncovered:
+    print("yes")
+    for path in sorted(uncovered):
+        print(path)
+else:
+    print("no")
+PY

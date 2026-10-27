@@ -19,8 +19,7 @@
   "ci": {
     "mgh3326/agent-skills": {
       ".github/workflows/ci.yml": [
-        "ubuntu-latest",
-        "macos-latest"
+        "ci-ok"
       ]
     },
     "mgh3326/auto_trader": {
@@ -69,11 +68,33 @@
   },
   "ci_execution_steps": {
     "mgh3326/agent-skills": {
-      "macos-latest": [
-        "Bash tests"
+      "lint": [
+        "ShellCheck"
       ],
-      "ubuntu-latest": [
-        "Bash tests"
+      "changes": [
+        "Classify docs-only changes",
+        "Report Darwin-sensitive coverage"
+      ],
+      "ubuntu (wrk)": [
+        "Run suite shard"
+      ],
+      "ubuntu (suites-a)": [
+        "Run suite shard"
+      ],
+      "ubuntu (suites-b)": [
+        "Run suite shard"
+      ],
+      "ubuntu (python)": [
+        "Run suite shard"
+      ],
+      "macos-smoke": [
+        "Run curated Darwin-sensitive suites"
+      ],
+      "macos-full": [
+        "Run complete suite list"
+      ],
+      "ci-ok": [
+        "Check required results"
       ]
     },
     "mgh3326/auto_trader": {
@@ -155,7 +176,7 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "cf352bd05a9920972d90c69075cdce16f7dc70d7ec977bfc77a9c6c6a292b038",
+    ".github/workflows/ci.yml": "b2a8ad1d2a4a111c7523398b89d4e3f0191b5a3a4aa2269868ce3f181c2bf7a0",
     "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
     "bin/wrk": "0b7528ea7317e4e3d6a5f0e8f5b7e0cce349bcfcdb31324937fd63b272c91060",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
@@ -2310,8 +2331,8 @@
   "schema": 1,
   "sources": {
     ".github/workflows/ci.yml": {
-      "id": "shell-and-bash-tests",
-      "scope": "required CI matrix job names"
+      "id": "ci-ok",
+      "scope": "single merge-gating CI check; macos-full is scheduled/manual only"
     },
     "advice/2026-09-25/director-throughput-astra": {
       "id": 3243,
