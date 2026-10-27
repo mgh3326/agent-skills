@@ -64,6 +64,7 @@ jobs:
             tests/test-wrk-heavy-limit.sh \
             tests/test-wrk-heavy-class.sh \
             tests/test-wrk-task-link.sh \
+            tests/test-wrk-artifacts-move.sh \
             tests/test-wrk-job-end.sh \
             tests/test-fleet-rev.sh \
             tests/test-gate-policy-devin-grades.sh \
@@ -108,6 +109,7 @@ jobs:
           bash tests/test-wrk-heavy-limit.sh
           bash tests/test-wrk-heavy-class.sh
           bash tests/test-wrk-task-link.sh
+          bash tests/test-wrk-artifacts-move.sh
           bash tests/test-wrk-job-end.sh
           bash tests/test-fleet-rev.sh
           bash tests/test-gate-policy-devin-grades.sh
