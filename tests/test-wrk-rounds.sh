@@ -231,7 +231,8 @@ REPORT="$TMP/report.md"
 printf 'builder report\n' >"$REPORT"
 
 # The same assertions run against production and each selection mutant.
-head_bind_case() { # case-name suffix
+head_bind_case() { # case-name suffix [wrk]
+  local WRK="${3:-$WRK}"
   local case_name="$1" job="hb-$1-$2" status head_upper
   claim_job "$job"
   case "$case_name" in
@@ -1224,7 +1225,7 @@ for mutation in nohead newest casefold unbound; do
   esac
   mutant "$mutation" "$TMP/spec-$mutation"
   set +e
-  ( WRK="$TMP/$mutation-wrk"; head_bind_case "$bind_case" "$mutation" ) >"$TMP/mut-$mutation.out" 2>&1
+  ( head_bind_case "$bind_case" "$mutation" "$TMP/$mutation-wrk" ) >"$TMP/mut-$mutation.out" 2>&1
   mut_rc=$?
   set -e
   [[ "$mut_rc" -ne 0 ]] || fail "hk1506 $mutation mutant survived $bind_case"
