@@ -72,6 +72,7 @@ jobs:
             tests/test-codex-project-trust.sh \
             tests/test-area-propose.sh \
             tests/test-ci-suites.sh \
+            tests/test-wrk-artifacts-move.sh \
             tests/needs-full-macos.sh \
             scripts/needs-full-macos \
             tests/fixtures/fleet-rev/fake-ssh \

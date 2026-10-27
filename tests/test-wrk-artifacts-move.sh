@@ -1007,6 +1007,30 @@ assert all(c["evicted"] for c in rec["archive"]["contents"])
 PY
 echo "PASS remote source"
 
+# A newline in a remote filename breaks the line-oriented inventory protocol.
+# The malformed row must stop the run before rsync, evict, manifest or hk put.
+case_remote_newline_name() {
+  reset_case "$1"
+  cat >>"$WRK_HOSTS_CONFIG" <<EOF
+
+[hosts.fh]
+ssh = "fakessh"
+EOF
+  RSRC="$TMP/$CASE/rsrc"; mkdir -p "$RSRC"
+  local newline_file="$RSRC/bad"$'\n'"name.txt"
+  printf 'bad-name-content\n' >"$newline_file"
+  DEST="$DRIVE/mbp/remote-ds"
+  WRK_ARTIFACTS_FREE_BYTES=999999999999 run_move "$RSRC" --dest "$DEST" --apply --source-host fh
+  [[ "$MOVE_RC" -eq 2 ]] || return 1
+  grep -q 'remote inventory incomplete: malformed row' "$ERR" || return 1
+  [[ ! -e "$DRIVE/mbp/remote-ds.manifest.tsv" ]] || return 1
+  [[ ! -e "$(state_path_for mbp remote-ds)" ]] || return 1
+  [[ ! -s "$HK_DIR/argv.log" && -z "$(fp_calls)" ]] || return 1
+  [[ ! -s "$RSYNC_LOG" && "$(fp_evict_calls)" -eq 0 ]] || return 1
+}
+case_remote_newline_name remote-newline || fail "remote newline filename must fail incomplete"
+echo "PASS malformed remote row fails closed"
+
 # low free space: the batch pull is skipped with the reason, nothing moves.
 reset_case lowspace
 cat >>"$WRK_HOSTS_CONFIG" <<EOF
@@ -1099,6 +1123,11 @@ expect_mut_red "remote source is absolutized locally" case_remote_path_guard mut
 
 mkmut remote-missing-root 's/if not os.path.isdir(src): raise SystemExit/if not True: raise SystemExit/'
 expect_mut_red "remote missing directory accepted" case_remote_path_guard mut-remote-missing-root
+
+# Restoring the old lenient parser must let a newline filename through and make
+# the fail-closed remote inventory case go RED.
+mkmut remote-malformed-row-drop 's/die("remote inventory incomplete: malformed row")/continue/'
+expect_mut_red "malformed remote inventory row is silently dropped" case_remote_newline_name mut-remote-malformed-row-drop
 
 # Dropping destination host from the state key makes a successful same-name
 # dataset on the second host look already copied and evicted.

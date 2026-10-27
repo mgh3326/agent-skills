@@ -16725,14 +16725,18 @@ def inventory():
         die("remote inventory over ssh failed rc=%d: %s" % (r.returncode, r.stderr.strip()[:300]))
     for line in r.stdout.splitlines():
         parts = line.rsplit("\t", 2)
-        if len(parts) == 3:
-            try:
-                size = int(parts[1])
-            except ValueError:
-                die("remote inventory returned a malformed row")
-            if not re.fullmatch(r"[0-9a-f]{64}", parts[2]):
-                die("remote inventory returned a malformed sha256")
-            out.append((parts[0], size, parts[2]))
+        if len(parts) != 3:  # hk2097-mut:strict-remote-row
+            die("remote inventory incomplete: malformed row")
+        rel, raw_size, sha = parts
+        rel_parts = rel.split("/")
+        if (not rel or "\t" in rel or rel.startswith("/") or
+                any(p in ("", ".", "..") for p in rel_parts)):
+            die("remote inventory incomplete: malformed relative path")
+        if not re.fullmatch(r"[0-9]+", raw_size):
+            die("remote inventory incomplete: malformed size")
+        if not re.fullmatch(r"[0-9a-f]{64}", sha):
+            die("remote inventory incomplete: malformed sha256")
+        out.append((rel, int(raw_size), sha))
     return out
 
 def fpbulk(mode, paths):
