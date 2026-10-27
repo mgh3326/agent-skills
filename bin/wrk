@@ -13433,18 +13433,36 @@ artifacts_policy_file() {
   return 1
 }
 
-# artifacts_policy_load FILE WORK_ROOT → TSV rows on stdout; rc 2 prints an
-# error line on stderr. Same glob/first-wins rules as artifacts_sweep_job.
+# artifacts_policy_load FILE WORK_ROOT HOST_IDS → TSV rows on stdout; rc 2
+# prints an error line on stderr. Reads both policy shapes: hk 2090's bare
+# string roots and hk 2093's name -> {path, kind}. A row with a host applies
+# only on that host; a row with a job applies only to that job dir. Same
+# glob/first-wins rules as artifacts_sweep_job.
 artifacts_policy_load() {
-  python3 - "$1" "$2" <<'PY'
+  python3 - "$1" "$2" "${3:-}" <<'PY'
 import json, os, sys
 path, work_root = sys.argv[1], os.path.realpath(sys.argv[2])
+host_ids = {h for h in sys.argv[3].split("|") if h}
 try:
     pol = json.load(open(path, encoding="utf-8"))
 except (OSError, ValueError) as e:
     sys.stderr.write("artifacts sweep: cannot read policy %s: %s\n" % (path, e))
     sys.exit(2)
-roots = pol.get("roots") or {}
+raw_roots = pol.get("roots") or {}
+roots = {}
+for name, val in raw_roots.items():
+    if isinstance(val, dict):
+        rpath, kind = val.get("path"), val.get("kind") or "per-job"
+    else:
+        rpath, kind = val, "per-job"
+    if not isinstance(rpath, str) or not rpath:
+        sys.stderr.write("artifacts sweep: policy root %r has no path\n" % name)
+        sys.exit(2)
+    if kind not in ("per-job", "flat"):
+        sys.stderr.write("artifacts sweep: policy root %r has unknown kind %r\n"
+                         % (name, kind))
+        sys.exit(2)
+    roots[name] = (rpath, kind)
 rows = pol.get("rows") or []
 out = []
 for i, row in enumerate(rows):
@@ -13454,14 +13472,23 @@ for i, row in enumerate(rows):
     if not cls or not pat or not rname:
         sys.stderr.write("artifacts sweep: policy row %d needs class+root+glob\n" % i)
         sys.exit(2)
-    rroot = roots.get(rname)
-    if not rroot:
+    if rname not in roots:
         sys.stderr.write("artifacts sweep: policy row %d names unknown root %r\n"
                          % (i, rname))
         sys.exit(2)
-    abs_root = rroot if os.path.isabs(rroot) else os.path.join(work_root, rroot)
+    rpath, kind = roots[rname]
+    rjob = row.get("job") or ""
+    if rjob and kind != "per-job":
+        sys.stderr.write("artifacts sweep: policy row %d has a job on a flat root\n" % i)
+        sys.exit(2)
+    row_host = row.get("host") or ""
+    if row_host and row_host not in host_ids:
+        continue
+    abs_root = rpath if os.path.isabs(rpath) else os.path.join(work_root, rpath)
     upload = "1" if row.get("upload") else "0"
-    out.append("\t".join([cls, rname, os.path.realpath(abs_root), pat, upload]))
+    mirror = "1" if row.get("mirror_required") else "0"
+    out.append("\t".join([cls, rname, os.path.realpath(abs_root), kind, pat,
+                          upload, rjob, mirror]))
 print("\n".join(out))
 PY
 }
@@ -13597,23 +13624,26 @@ for ln in open(policy_path, encoding="utf-8"):
     ln = ln.rstrip("\n")
     if not ln:
         continue
-    cls, rname, abs_root, pat, upload = ln.split("\t")
-    rows.append((cls, rname, abs_root, glob_re(pat), upload == "1"))
-    roots[rname] = abs_root
+    cls, rname, abs_root, kind, pat, upload, rjob, mirror = ln.split("\t")
+    rows.append((cls, rname, abs_root, glob_re(pat), upload == "1", rjob,
+                 mirror == "1"))
+    roots[rname] = (abs_root, kind)
 upload_classes = UPLOAD | {r[0] for r in rows if r[4]}
 # Deepest root first when nested.
-root_order = sorted(roots.items(), key=lambda kv: -len(kv[1]))
+root_order = sorted(roots.items(), key=lambda kv: -len(kv[1][0]))
 
 
 def class_of(rel, root_name):
     parts = rel.split("/")
     cands = ["/".join(parts[:k]) for k in range(len(parts), 0, -1)]
-    for cls, rname, _abs, rx, _u in rows:
+    for cls, rname, _abs, rx, _u, rjob, mirror in rows:
         if rname != root_name:
             continue
+        if rjob and rjob != job:
+            continue
         if any(rx.match(c) for c in cands):
-            return cls
-    return None
+            return cls, mirror
+    return None, False
 
 
 def sha256_of(path):
@@ -13683,9 +13713,13 @@ for d in docs:
         line("dataset=%s skip reason=source-not-dir" % key)
         continue
     base = None
-    for rname, rroot in root_order:
+    for rname, (rroot, rkind) in root_order:
         rr = os.path.realpath(rroot)
         if real_source == rr or real_source.startswith(rr + os.sep):
+            if rkind == "flat":
+                base = rr
+                base_root_name = rname
+                break
             rest = real_source[len(rr):].lstrip(os.sep)
             first = rest.split(os.sep)[0] if rest else ""
             if not first:
@@ -13731,7 +13765,7 @@ for d in docs:
             if crel.split("/")[0] in ("events", "refs"):
                 skipped["guarded"] = skipped.get("guarded", 0) + 1
                 continue
-            cls = class_of(crel, base_root_name)
+            cls, mirror_pol = class_of(crel, base_root_name)
             if cls == "protected":
                 line("dataset=%s path=%s class=%s kept reason=protected-class"
                      % (key, rel, cls))
@@ -13772,8 +13806,8 @@ for d in docs:
                 continue
             allowed = confirmed
             if not allowed and ldel == "uploaded" and cls != "evidence" \
-                    and not row.get("mirror_required") and not mirror_ds \
-                    and row_uploaded(row):
+                    and not mirror_pol and not row.get("mirror_required") \
+                    and not mirror_ds and row_uploaded(row):
                 allowed = True
             if not allowed:
                 line("dataset=%s path=%s class=%s kept reason=not-confirmed"
@@ -13861,14 +13895,14 @@ artifacts_sweep_cmd() {
     drive_confirmed|uploaded) ;;
     *) die "artifacts sweep: hosts.toml [artifacts] local_delete_at='$ldel' is not 'drive_confirmed' or 'uploaded'; refusing to touch any artifact" ;;
   esac
-  local policy_tsv
-  policy_tsv="$(artifacts_policy_load "$policy_file" "$work_root")" ||
-    die "artifacts sweep: policy $policy_file failed validation"
   local hk
   hk="$(hk_bin)"
   [[ -n "$hk" ]] || die "artifacts sweep: handoffkeep binary not found (set HANDOFFKEEP_BIN)"
   local host_ids
   host_ids="$(artifacts_host_ids)"
+  local policy_tsv
+  policy_tsv="$(artifacts_policy_load "$policy_file" "$work_root" "$host_ids")" ||
+    die "artifacts sweep: policy $policy_file failed validation"
 
   local plan_root
   plan_root="$(mktemp -d "${TMPDIR:-/tmp}/wrk-artifacts-sweep.XXXXXX")"

@@ -741,4 +741,59 @@ assert not (json.load(sys.stdin).get("local_deleted")), "wrote local_deleted"' |
   fail "sw14 default mode wrote the record"
 echo "PASS sw14-dry-run-default"
 
+# ─────────────────────────────────────────────────────────────────────────────
+echo "== sw15: object roots, host-scoped and job-scoped rows, policy mirror_required =="
+reset_case sw15
+write_hosts uploaded
+cat >"$POLICY" <<'JSON'
+{
+ "schema": "fleet.artifact-policy.v1",
+ "roots": {
+  "jobs": {"path": "herdr-inbox/jobs", "kind": "per-job"},
+  "webqa": {"path": "webqa-runner/jobs", "kind": "per-job"}
+ },
+ "rows": [
+  {"class": "record-text", "root": "jobs", "glob": "events"},
+  {"class": "record-text", "root": "jobs", "glob": "report*.md"},
+  {"class": "final-build", "root": "jobs", "glob": "otherhost/**", "host": "other-host"},
+  {"class": "final-build", "root": "jobs", "glob": "jobonly/**", "job": "sw15b"},
+  {"class": "final-build", "root": "jobs", "glob": "builds/mirror*", "mirror_required": true},
+  {"class": "final-build", "root": "jobs", "glob": "builds/**"},
+  {"class": "evidence", "root": "jobs", "glob": "evidence/**"}
+ ]
+}
+JSON
+mk_ended_job sw15 115 w:p9
+mk_task 115 merged proj sw15
+JD="$INBOX/sw15"
+mkdir -p "$JD/builds" "$JD/otherhost" "$JD/jobonly"
+printf 'ok\n' >"$JD/builds/ok.bin"
+printf 'mirror\n' >"$JD/builds/mirror.bin"
+printf 'other\n' >"$JD/otherhost/only.bin"
+printf 'jobonly\n' >"$JD/jobonly/only.bin"
+RO="$(mk_row builds/ok.bin "$JD/builds/ok.bin" '{"uploaded_at":"t"}')"
+RM="$(mk_row builds/mirror.bin "$JD/builds/mirror.bin" '{"uploaded_at":"t"}')"
+RX="$(mk_row otherhost/only.bin "$JD/otherhost/only.bin" '{"uploaded_at":"t"}')"
+RJ="$(mk_row jobonly/only.bin "$JD/jobonly/only.bin" '{"uploaded_at":"t"}')"
+mk_record "artifacts/proj/115/sw15" test-host sw15 115 proj "$JD" uploading \
+  "[$RO,$RM,$RX,$RJ]"
+sweep --job sw15 --apply
+[[ "$SWEEP_RC" == 0 ]] || fail "sw15 apply rc=$SWEEP_RC"
+[[ ! -e "$JD/builds/ok.bin" ]] || fail "sw15 object-root final-build not deleted"
+[[ -f "$JD/builds/mirror.bin" ]] || fail "sw15 policy mirror_required deleted early"
+[[ -f "$JD/otherhost/only.bin" ]] || fail "sw15 other-host row applied here"
+[[ -f "$JD/jobonly/only.bin" ]] || fail "sw15 other-job row applied here"
+have "path=builds/mirror.bin class=final-build kept reason=not-confirmed" ||
+  fail "sw15 mirror keep must be reported: $SWEEP_OUT"
+mk_ended_job sw15b 116 w:p9
+mk_task 116 merged proj sw15b
+JB="$INBOX/sw15b"
+mkdir -p "$JB/jobonly"
+printf 'jobonly\n' >"$JB/jobonly/only.bin"
+RB="$(mk_row jobonly/only.bin "$JB/jobonly/only.bin" '{"uploaded_at":"t"}')"
+mk_record "artifacts/proj/116/sw15b" test-host sw15b 116 proj "$JB" uploading "[$RB]"
+sweep --job sw15b --apply
+[[ ! -e "$JB/jobonly/only.bin" ]] || fail "sw15b job-scoped row not applied"
+echo "PASS sw15-policy-scoping"
+
 echo "ALL PASS"
