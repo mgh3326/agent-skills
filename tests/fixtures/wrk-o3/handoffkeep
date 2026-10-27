@@ -1,0 +1,141 @@
+#!/usr/bin/env python3
+"""Scripted, offline O3 transport; records environment key names only."""
+import fcntl
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import uuid
+
+
+def sha(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                     separators=(",", ":")).encode()).hexdigest()
+
+
+def summary(records):
+    claim = [r for r in records if r["kind"] == "claim"][-1]
+    activation = [r for r in records if r["kind"] == "activate"]
+    cutoff = activation[-1]["seq"] if activation else 0
+    seals = [r for r in records if r["kind"] == "import_seal"]
+    baseline = activation[-1]["payload"]["baseline_used"] if activation else 0
+    floor = seals[-1]["payload"]["numbering_floor"] if seals else baseline
+    live = [r for r in records if r["seq"] > cutoff]
+    opened = {r["payload"]["round_no"] for r in live if r["kind"] == "round_open"}
+    voided = {r["payload"]["round_no"] for r in live if r["kind"] == "void"}
+    bound = {r["payload"]["round_no"] for r in live if r["kind"] == "verdict"}
+    verdicts = [r["seq"] for r in records if r["kind"] == "verdict"]
+    state = "active" if any(r["kind"] == "activate" for r in records) else "shadow"
+    if records[-1]["kind"] in ("joined", "end", "import_begin", "import_seal"):
+        state = {"joined": "joined", "end": "ended", "import_begin": "importing", "import_seal": "sealed"}[records[-1]["kind"]]
+    return dict(job_id=claim["job_id"], claim_seq=claim["seq"],
+                snapshot_seq=records[-1]["seq"], state=state, baseline_used=baseline,
+                used=baseline + len(opened - voided), cap=3, next_round_no=max(floor, max(opened, default=0)) + 1,
+                open_rounds=sorted(opened - voided - bound), last_verdict_seq=verdicts[-1] if verdicts else None,
+                active_grants=[], warnings=[], store_generation=claim["store_generation"],
+                tail_hash=records[-1]["record_hash"])
+
+
+def scripted(action, data, argv, stdin):
+    """A response synthesizer, not a server policy implementation."""
+    if argv[1] == "capabilities":
+        return {"stdout": json.dumps(dict(contract="hk1873.v1", store_generation="00000000-0000-4000-8000-ffff00000001",
+                                          client_id="desktop", policy_sha256="a" * 64, writes_available=True)) + "\n"}
+    job = argv[2]
+    initial = data.setdefault("journal", [])
+    records = initial if initial and initial[0]["job_id"] == job else data.setdefault("journals", {}).setdefault(job, [])
+    if argv[1] == "append":
+        opts = dict(zip(argv[3::2], argv[4::2]))
+        kind, key = opts["--kind"], opts["--idempotency-key"]
+        payload = json.loads(stdin)
+        req = dict(kind=kind, expected_seq=int(opts["--expected-seq"]),
+                   claim_seq=int(opts["--claim-seq"]), payload=payload)
+        request_sha = sha(dict(method="POST", path="/v1/wrk/jobs/" + job + "/records", body=req))
+        existing = next((r for r in records if r["idempotency_key"] == key), None) if action != "vector" else None
+        if existing:
+            if existing["request_sha256"] != request_sha:
+                return dict(exit=73, stderr="handoffkeep wrk: idempotency_conflict\n")
+            record, created = existing, False
+        else:
+            if action != "vector" and req["expected_seq"] != len(records):
+                return dict(exit=73, stderr="handoffkeep wrk: sequence_conflict\n")
+            persisted = dict(payload)
+            if kind == "round_open":
+                persisted["round_no"] = summary(records)["next_round_no"]
+            if kind == "activate":
+                persisted.update(mode="enforced", baseline_used=0)
+            if kind == "claim":
+                persisted.update(policy_sha256="a" * 64, created_at="2026-10-26T00:00:00.000001Z")
+            if kind == "import_begin":
+                persisted["shadow_cutoff_seq"] = req["expected_seq"]
+            if kind == "import_seal":
+                persisted.update(shadow_cutoff_seq=1, baseline_used=3, numbering_floor=3)
+            if kind in ("verdict", "completed", "joined", "import"):
+                field = "content_b64" if kind in ("verdict", "import") else "report_b64"
+                raw = base64.b64decode(persisted.pop(field))
+                if kind == "verdict":
+                    persisted["size_bytes"] = len(raw)
+                elif kind in ("completed", "joined"):
+                    persisted["report_size_bytes"] = len(raw)
+                    persisted["warnings" if kind == "completed" else "verdict_seqs"] = []
+            if action == "vector":
+                persisted.update(data["vector_expect"].get("record", {}).get("payload", {}))
+            record = dict(job_id=job, seq=req["expected_seq"] + 1, record_id=str(uuid.uuid4()),
+                          store_generation="00000000-0000-4000-8000-ffff00000001",
+                          kind=kind, claim_seq=req["claim_seq"] or 1,
+                          actor_client_id="desktop", idempotency_key=key,
+                          request_sha256=request_sha, payload=persisted, imported=kind == "import",
+                          source=None, received_at="2026-10-26T00:00:00.000001Z",
+                          previous_hash=records[-1]["record_hash"] if records else "0" * 64)
+            record["record_hash"] = sha(record)
+            records.append(record)
+            created = True
+        if action == "commit_lost":
+            return dict(exit=75, stderr="handoffkeep wrk: transport_indeterminate\n")
+        if action == "vector":
+            observed = dict(job_id=job, claim_seq=record["claim_seq"], snapshot_seq=record["seq"], state="active",
+                            baseline_used=0, used=0, cap=3, next_round_no=1, open_rounds=[], last_verdict_seq=None,
+                            active_grants=[], warnings=[], store_generation=record["store_generation"], tail_hash=record["record_hash"])
+            observed.update(data["vector_expect"].get("summary", {}))
+            body = dict(contract="hk1873.v1", created=data["vector_expect"].get("created", True), record=record, summary=observed)
+        else:
+            body = dict(contract="hk1873.v1", created=created, record=record,
+                        summary=summary(records[:record["seq"]]))
+    elif argv[1] == "job":
+        if not records:
+            return dict(exit=66, stderr="handoffkeep wrk: not_found\n")
+        body = dict(contract="hk1873.v1", claim=[r for r in records if r["kind"] == "claim"][-1], summary=summary(records))
+    elif argv[1] == "records":
+        opts = dict(zip(argv[3::2], argv[4::2]))
+        after = int(opts.get("--after-seq", 0))
+        snapshot = int(opts.get("--snapshot-seq", data.get("initial_snapshot", len(records))))
+        subset = records[after:min(snapshot, after + int(opts.get("--limit", 100)))]
+        end = subset[-1]["seq"] if subset else after
+        body = dict(contract="hk1873.v1", snapshot_seq=snapshot, next_after_seq=end,
+                    has_more=end < snapshot, records=subset, summary=summary(records[:snapshot]))
+    else:
+        raise ValueError("unsupported fixture action")
+    return {"stdout": json.dumps(body) + "\n"}
+
+if os.environ.get("WRK_TEST_MODE") != "1":
+    raise SystemExit("fixture requires WRK_TEST_MODE=1")
+root = Path(tempfile.gettempdir()).resolve()
+script = Path(os.environ["WRK_O3_STUB_SCRIPT"]).resolve()
+if not script.is_relative_to(root):
+    raise SystemExit("fixture script must be under temporary root")
+with script.with_suffix(".lock").open("a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    data = json.loads(script.read_text())
+    call = {"argv": sys.argv[1:], "stdin": sys.stdin.read(),
+            "environment_keys": sorted(os.environ)}
+    data.setdefault("calls", []).append(call)
+    response = data["responses"].pop(0)
+    if "action" in response:
+        response = scripted(response["action"], data, sys.argv[1:], call["stdin"])
+    script.write_text(json.dumps(data))
+sys.stdout.write(response.get("stdout", ""))
+sys.stderr.write(response.get("stderr", ""))
+raise SystemExit(response.get("exit", 0))
