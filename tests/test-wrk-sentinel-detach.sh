@@ -224,9 +224,10 @@ setup_sentinel_job() {
 case_test_mode_optout_is_leak_checked() {
   local lib="$TMPROOT/default-mode-lib.sh"
   local pidfile="$ARBITER_INBOX_ROOT/default-mode/completion-sentinel.pid"
+  local mutant_pidfile="$ARBITER_INBOX_ROOT/mutant-default-mode/completion-sentinel.pid"
   local mutant="$TMPROOT/mutant-wrk-no-sentinel-optout"
   local mutant_lib="$TMPROOT/mutant-no-sentinel-optout-lib.sh"
-  mkdir -p "$(dirname "$pidfile")"
+  mkdir -p "$(dirname "$pidfile")" "$(dirname "$mutant_pidfile")"
   awk 'index($0, "case \"${1:-}\" in") == 1 {exit} {print}' "$WRK" >"$lib"
 
   env -u WRK_TEST_REAL_SENTINEL WRK_TEST_MODE=1 WRK_LIBFILE="$lib" \
@@ -252,16 +253,24 @@ PY
     WRK_COMPLETION_INTERVAL_S=3600 WRK_SENTINEL_TRANSIENT_MAX=100 \
     HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" \
     bash -c '. "$WRK_LIBFILE"; start_completion_sentinel "$@"' \
-      "$mutant" "$pidfile" mutant-default-mode owner label w:p1 "$TMPROOT/report.md" || return 3
-  wait_until 10 test -s "$pidfile" || return 3
+      "$mutant" "$mutant_pidfile" mutant-default-mode owner label w:p1 "$TMPROOT/report.md" || return 3
+  wait_until 10 test -s "$mutant_pidfile" || return 3
   local mutant_rc=0
   WRK_LEAK_ROOT="$TMPROOT" WRK_LEAK_COPY="$mutant" \
     python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py" >"$TMPROOT/mutant-leak.out" 2>&1 || mutant_rc=$?
   [[ "$mutant_rc" -ne 0 ]] && grep -q 'FAIL: test left wrk-related processes alive' "$TMPROOT/mutant-leak.out" || {
     assertion_red 'dropping the test-mode opt-out is caught by the process leak assertion' || return 1
   }
-  tw_kill_pidfile "$pidfile" || return 3
-  wait_until 10 test '!' -e "$pidfile" || return 3
+  local mutant_pid
+  mutant_pid="$(sed -n '1p' "$mutant_pidfile" 2>/dev/null || true)"
+  tw_kill_pidfile "$mutant_pidfile" || return 3
+  [[ "$mutant_pid" =~ ^[0-9]+$ ]] || return 3
+  local mutant_tries=0
+  while _tw_pid_alive "$mutant_pid" && (( mutant_tries < 50 )); do
+    sleep 0.2; (( ++mutant_tries ))
+  done
+  ! _tw_pid_alive "$mutant_pid" || return 3
+  rm -f "$mutant_pidfile"
   echo 'PASS test-mode sentinel opt-out and leak assertion mutant'
 }
 
