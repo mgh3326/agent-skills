@@ -81,7 +81,8 @@ ALL_PROFILES=(
   devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
-  codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
+  codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra codex-terra61
+  builder-terra61-medium builder-terra61-high builder-terra61-xhigh builder-terra61-max
   codex-sol56 codex-luna56 codex-sol6 builder-sol6
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max
   builder-sol-high builder-sol-xhigh builder-sol-max builder-sol-medium builder-luna-max
@@ -140,8 +141,9 @@ profiles_help() {
 Usage: wrk profiles
 
 Print active model profile names, one per line (machine-readable; excludes
-retired agy-* aliases and barred Terra profiles). Terra spellings are still
-recognized so spawn can refuse them with the operator decision.
+retired agy-* aliases and barred Terra profiles). The gpt-6.1-terra profile
+and pinned builder rungs are active; older Terra spellings remain recognized
+so spawn can refuse them with the operator decision.
 Barred: codex-terra, codex-terra-max, codex-med, builder-terra-high,
 builder-terra-xhigh and builder-terra-max — operator 2026-10-12 noterra.
   -h, --help   show this usage
@@ -325,10 +327,12 @@ Options:
                      The devin Argon trial spellings devin-argon, devin-argon-medium and
                      devin-argon-low are likewise worker/tester-only (hk 1620
                      phase 1) — --role builder refuses all three.
-                     All codex-terra, codex-terra-max, codex-med and
-                     builder-terra-* spellings are refused: gpt-5.6-terra is
-                     barred by operator 2026-10-12 noterra; use codex-sol or
-                     codex-luna.
+                     codex-terra61 runs GPT-6.1 Terra (default low; Codex
+                     0.164.0). builder-terra61-medium/high/xhigh/max pin
+                     that rung and require SCOPEFUEL_E6_ARM=codex-terra61@RUNG.
+                     codex-terra, codex-terra-max, codex-med and
+                     builder-terra-* remain refused: gpt-5.6-terra is barred
+                     by operator 2026-10-12 noterra.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      required for --role builder (spawn dies without it).
@@ -651,10 +655,13 @@ claim/record or preparation failure is warned and does not deny the spawn; a
 failed spawn releases a successfully created record. The scopefuel gate remains
 fail-closed, while exclusive arbiter leases retain their own fail-closed rules.
 
-Canonical codex profiles: codex-luna, codex-sol.
+Canonical codex profiles: codex-luna, codex-sol, codex-terra61.
 Existing codex aliases remain valid: codex, codex-luna-hi, codex-luna-max,
-codex-max. codex-terra, codex-terra-max and codex-med resolve for a named
-refusal: gpt-5.6-terra is barred by operator 2026-10-12 noterra.
+codex-max. codex-terra61 runs gpt-6.1-terra (footer display GPT-6.1 Terra,
+default effort low on Codex 0.164.0). builder-terra61-medium/high/xhigh/max pin
+their effort rung and require the matching SCOPEFUEL_E6_ARM marker.
+codex-terra, codex-terra-max and codex-med resolve for a named refusal:
+gpt-5.6-terra is barred by operator 2026-10-12 noterra.
 ROB-591/#1026 (2026-09-30 operator decision): codex-sol/codex-max/codex/
 builder-sol/captain-sol now run gpt-6.1-sol, and codex-luna/codex-luna-hi/
 codex-luna-max run gpt-6-luna. Rollback spellings codex-sol6/builder-sol6 pin
@@ -757,8 +764,10 @@ gate=default row (r1026solmax), so the gate demands no REF; builder-sol-xhigh
 is the S+ escalation row, so the gate still decides admission there. A stale
 marker in the environment is ignored and never recorded: the quota record
 reads the canonical rung (codex-sol@max, codex-sol@xhigh). The
-Terra E6 spellings builder-terra-high, builder-terra-xhigh and builder-terra-max
-are refused by operator 2026-10-12 noterra. For the remaining profiles
+old Terra E6 spellings builder-terra-high, builder-terra-xhigh and
+builder-terra-max are refused by operator 2026-10-12 noterra. The separate
+builder-terra61-medium/high/xhigh/max rows are unmeasured E6 rungs and require
+SCOPEFUEL_E6_ARM=codex-terra61@<effort>. For the remaining profiles
 wrk passes the pinned rung as `scopefuel gate --effort` so the gate judges
 that rung's row, and the marker (forwarded through the environment) is what
 opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
@@ -1336,6 +1345,32 @@ pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(
            r"\) " + re.escape(model) + r" • " + re.escape(effort) + r"$")
 sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
 ' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
+}
+
+# hk 2109: the Terra 6.1 model id alone does not prove Codex selected the
+# intended model. Read only the visible screen and extract the bottom-most
+# Codex status/footer row (the row with the cwd and Context indicator). The
+# brief and transcript are never searched for model text.
+terra61_footer_status() {
+  local screen
+  screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || {
+    printf 'missing\n'
+    return 0
+  }
+  printf '%s' "$screen" | python3 -c '
+import re, sys
+display, effort = sys.argv[1:]
+screen = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", sys.stdin.read())
+rows = [line.rstrip() for line in screen.splitlines()]
+footers = [line.strip() for line in rows
+           if re.search(r"\s·\s.*\s·\sContext\b", line)]
+if not footers:
+    print("missing")
+else:
+    # Only the footer row is evidence; compare its model-and-effort field.
+    observed = footers[-1].split(" · ", 1)[0].strip()
+    print("match" if observed == f"{display} {effort}" else "mismatch")
+' 'GPT-6.1 Terra' "$EFFECTIVE_EFFORT"
 }
 
 # spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not
@@ -2275,7 +2310,8 @@ quota_gate() {
   [[ -z "${OPERATOR_REQUEST:-}" ]] || gate_args+=(--operator-request "$OPERATOR_REQUEST")
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
-  if [[ "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
+  # hk 2079: E6_WORKER_TESTER_ONLY_PROFILES = PI_CREDIT_MODELS (pi-haiku55/pi-sonnet55/pi-opus55), all PROFILE_KIND=pi; devin-fusion-* are outside the set.
+  if [[ "$PROFILE_KIND" == pi || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
     gate_args+=(--role "$ROLE")
   fi
   local out rc
@@ -2712,7 +2748,7 @@ agent_foreground_diagnostics() {
 }
 
 agent_wait_foreground() {
-  local started_at attempts=0 max_attempts info_out info_rc ready
+  local started_at attempts=0 max_attempts info_out info_rc ready terra_status
   started_at="$(date +%s)"
   max_attempts=$(( AGENT_FOREGROUND_TIMEOUT_MS / SHELL_READY_POLL_MS ))
   while :; do
@@ -2759,9 +2795,26 @@ else:
       agent_foreground_diagnostics "pane process-info returned an invalid envelope before brief injection"
       return 1
     fi
-    [[ "$ready" == yes ]] && return 0
+    if [[ "$ready" == yes ]]; then
+      if [[ "$PROFILE_MODEL" != gpt-6.1-terra ]]; then
+        return 0
+      fi
+      terra_status="$(terra61_footer_status)"
+      case "$terra_status" in
+        match) return 0 ;;
+        mismatch)
+          echo "wrk: terra61 model not proven: expected GPT-6.1 Terra $EFFECTIVE_EFFORT" >&2
+          spawn_pane_cleanup
+          return 1 ;;
+      esac
+    fi
     if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= AGENT_FOREGROUND_TIMEOUT_MS )); then
-      agent_foreground_diagnostics "agent not foreground within ${AGENT_FOREGROUND_TIMEOUT_MS}ms (not-foreground x$attempts)"
+      if [[ "$PROFILE_MODEL" == gpt-6.1-terra ]]; then
+        echo "wrk: terra61 model not proven: expected GPT-6.1 Terra $EFFECTIVE_EFFORT" >&2
+        spawn_pane_cleanup
+      else
+        agent_foreground_diagnostics "agent not foreground within ${AGENT_FOREGROUND_TIMEOUT_MS}ms (not-foreground x$attempts)"
+      fi
       return 1
     fi
     sleep_for "$SHELL_READY_POLL_SECONDS"
@@ -3779,6 +3832,8 @@ resolve_catalog_profile() {
     # CATALOG_KEEP_MODEL pins the literal gpt-6-sol: the consult feeds effort
     # and attribution only, never the model id.
     builder-sol6) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high; CATALOG_KEEP_MODEL=1 ;;
+    codex-terra61) CATALOG_PROFILE=codex-terra61; CATALOG_EFFORT_PIN="${EFFORT:-low}" ;;
+    builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max) CATALOG_PROFILE=codex-terra61; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     codex-terra|codex-med) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;
     codex-terra-max) CATALOG_PROFILE=codex-terra-max ;;
     codex-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=medium ;;
@@ -4122,6 +4177,9 @@ resolve_profile() {
       fi
       ;;
 
+    codex-terra61) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-terra; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1 ;;
+    builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max)
+      PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-terra; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
     codex-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
@@ -4336,6 +4394,9 @@ resolve_profile() {
     # NOT the flat codex-luna-max gate profile the worker spellings below use.
     # hk 2043 adds builder-luna-high to the same pin.
     builder-luna-low|builder-luna-high|builder-luna-medium) GATE_PROFILE=codex-luna; GATE_EFFORT_PIN="${MODEL##*-}" ;;
+    codex-terra61) GATE_PROFILE=codex-terra61; GATE_EFFORT_PIN="${EFFORT:-low}" ;;
+    builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max)
+      GATE_PROFILE=codex-terra61; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) GATE_PROFILE=codex-terra; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     # task #527: the gate role-denies astra without an allowed --purpose, so the
     # counsel spawn path defaults it to `architect` (the wrk-side counsel use).
@@ -4373,6 +4434,10 @@ resolve_profile() {
 
   resolve_catalog_profile
   apply_catalog
+  # Resolve catalog overrides before any effort/arm decision, then apply the
+  # model-id bar to every launcher channel. A barred Terra id always gets the
+  # noterra refusal, even when its spelling also needs an E6 marker.
+  refuse_barred_launcher_model
   if [[ "${ROLE:-}" == builder && -n "${ROUND_EXT_REF:-}" ]]; then
     [[ "${ROUND_EXT_CATALOG_VERIFIED:-0}" == 1 ]] ||
       die "--round-ext builder requires readable hk1672/v1 support evidence from scopefuel policy launch (check installed scopefuel version)"
@@ -11928,6 +11993,9 @@ mock_mcp_cleanup() {
 refuse_barred_model_id() {
   local model_id="${1:-}" profile="${2:-$MODEL}"
   case "$model_id" in
+    # The operator lifted noterra only for this exact model id. Its display
+    # name is separately verified from the visible Codex footer after startup.
+    gpt-6.1-terra) return 0 ;;
     # The bar is on the model, not the spelling: any resolved model id carrying
     # a -terra segment refuses, so a future alias or catalog row serving a new
     # terra id (e.g. gpt-9.9-terra) cannot slip past the gpt-5.6-terra literal.
@@ -12068,8 +12136,8 @@ spawn_cmd() {
         die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
         die "--role builder rejects '$MODEL': the devin Argon trial spellings are worker/tester-only — phase 1 is spawn plumbing, no builder seat (hk 1620, operator decision 2026-10-18)" ;;
-      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-luna-high, builder-haiku-medium (hk 2043), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) plus the normal pinned spellings builder-sol-xhigh and builder-sol-max (hk 2043, operator r1026solmax) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23) while builder-sol-max takes no marker (hk 2043); ultra stays refused)" ;;
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-luna-high, builder-haiku-medium (hk 2043), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) plus the normal pinned spellings builder-sol-xhigh and builder-sol-max (hk 2043, operator r1026solmax) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; old Terra spellings codex-terra, codex-terra-max, codex-med and builder-terra-high/xhigh/max remain refused by operator 2026-10-12 noterra; builder-terra61-medium/high/xhigh/max are E6 builder rungs requiring SCOPEFUEL_E6_ARM=codex-terra61@<effort>; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23) while builder-sol-max takes no marker (hk 2043); ultra stays refused)" ;;
     esac
     case "$MODEL" in
       # hk 2043 item 4: every unpinned builder spelling whose catalog consult
@@ -12120,14 +12188,14 @@ spawn_cmd() {
       # the SCOPEFUEL_E6_ARM marker; refusing here too keeps the failure on the
       # same die path the other pinned builders use. hk 2043 adds the normal
       # pinned spellings and the luna-high rung to the same pin.
-      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low)
+      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low)
         [[ -z "$EFFORT" || "$EFFORT" == "${MODEL##*-}" ]] || die "$MODEL is pinned to effort ${MODEL##*-} (#594 E6 rung)"
         ;;
     esac
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
@@ -12153,9 +12221,8 @@ spawn_cmd() {
   fi
 
   resolve_profile
-  # Refuse by the resolved launcher model id, not by the spelling list. Keep
-  # this before gate work, quota/arbiter admission, worktree or pane creation.
-  refuse_barred_launcher_model
+  # resolve_profile applies the resolved model-id bar immediately after the
+  # catalog answer and before effort-arm validation, gate work or admission.
   configure_landing_check "$PROFILE_KIND"
   LANE_ENV=()
   if [[ -n "$LANE" ]]; then
