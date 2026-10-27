@@ -10,15 +10,19 @@ args = sys.argv[1:]
 token = args[args.index("--model") + 1]
 model, thinking = token.rsplit(":", 1)
 provider, model = model.split("/", 1)
-requested_provider, requested_model = provider, model
+requested_model = model
 scenario = os.environ.get("WRK_PI_SCENARIO", "ok")
 if scenario == "missing":
     sys.exit(0)
 if scenario in ("wrong-model", "brief-only", "inside-input", "above-input", "brief-wrong-model",
                 "forged-prompt", "forged-error", "last-border", "extension-match", "inside-wrong-footer"):
     model = "claude-haiku-5-5"
+elif scenario == "wrong-model-sonnet":
+    model = "claude-sonnet-5-5"
 elif scenario == "wrong-thinking":
     thinking = "low"
+elif scenario == "wrong-thinking-high":
+    thinking = "high"
 elif scenario == "wrong-provider":
     provider = "openrouter"
 if os.environ.get("WRK_PI_MODEL_LOG"):
@@ -48,11 +52,23 @@ print(border)
 if scenario in ("inside-input", "above-input"):
     sys.exit(0)
 cwd = os.path.realpath(os.environ["WRK_PI_CWD"])
-print(cwd + "/wrong-cwd" if scenario == "wrong-cwd" else cwd)
-prefix = "" if scenario == "no-provider" else f"({provider}) "
+if scenario == "wrong-cwd":
+    print(cwd + "/wrong-cwd")
+elif scenario == "cwd-suffix":
+    # footer.js may append a git branch and a session name to the cwd row.
+    print(cwd + " (wk/2135-pifooter) • fixture-session")
+else:
+    print(cwd)
+# Default is the real pi 1.4.0 footer: no provider part. provider-form is the
+# older "(provider) model • effort" rendering; wrong-provider uses it too.
+prefix = f"({provider}) " if scenario in ("provider-form", "wrong-provider") else ""
 visible_model = requested_model if scenario == "last-border" else model
+if scenario == "prefix-model":
+    visible_model = model + "0"
 right = f"{prefix}{visible_model} • {thinking}"
-left = "0.0%/200k"
+if scenario == "truncated-stats":
+    right = right[:-len(f" • {thinking}")]
+left = "↑6 ↓92 R5.2k W5.3k CH98.1% $0.001 0.5%/1.0M (auto)" if scenario == "full-stats" else "0.0%/200k"
 print(left + " " * max(2, 80 - len(left) - len(right)) + right)
 if scenario == "last-border":
     # An old matching frame followed by a newer, incomplete editor region.
@@ -62,6 +78,6 @@ elif scenario == "extra-footer":
     print("another widget")
 elif scenario == "extension-match":
     # Extension status is not the model-bearing stats row.
-    print(f"0.0%/200k  ({requested_provider}) {requested_model} • {thinking}")
+    print(f"0.0%/200k  {requested_model} • {thinking}")
 
 PY
