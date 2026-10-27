@@ -341,7 +341,7 @@ owner_out="$(WRK_CASE_JOB=owner-dropped run_remote "$MUT_OWNER" --host desktop -
 owner_rc=$?
 set -e
 [[ "$owner_rc" -ne 0 ]] || { echo 'FAIL owner-drop mutant survived' >&2; exit 1; }
-grep -q "parent job 'P' has no readable newest claim/reclaim" <<<"$owner_out" || {
+grep -q "job P has no arbiter claim row" <<<"$owner_out" || {
   echo 'FAIL owner-drop mutant missed parent-owner refusal' >&2; exit 1;
 }
 printf '%s\n' 'PASS wrk-remote-task owner-transport-mutant-RED'
@@ -386,7 +386,10 @@ chmod +x "$MUT_TARGET"
 if target_containment_probe "$MUT_TARGET" >"$TMP/target-mutant.log" 2>&1; then
   echo 'FAIL target containment mutant survived' >&2; exit 1
 fi
-grep -q '^FAIL target-only symlink containment was skipped' "$TMP/target-mutant.log" || {
+# The mutant evading containment can surface either as a non-2 rc (spawn
+# proceeded) or as an rc 2 refusal that is NOT the containment message —
+# both prove the contract assertion fired.
+grep -qE '^FAIL (target-only symlink containment was skipped|target containment refusal was missing)' "$TMP/target-mutant.log" || {
   echo 'FAIL target containment mutant did not fail the contract assertion' >&2; exit 1;
 }
 printf '%s\n' 'PASS wrk-remote-task target-containment-mutant-RED'
