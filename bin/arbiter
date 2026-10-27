@@ -1065,6 +1065,59 @@ def cmd_release(args: argparse.Namespace) -> dict:
     moment = now_dt()
     con.execute("BEGIN IMMEDIATE")
     try:
+        if args.resource is None:
+            if not args.force or args.kind is not None or args.token is not None:
+                raise ArbiterError(
+                    EXIT_USAGE,
+                    "--resource may be omitted only with --force --job and no --kind/--token",
+                )
+            herdr_agents = _herdr_agents(args.herdr_agent_list)
+            decision = _orphan_release_decision(con, herdr_agents, args.job)
+            if not decision["eligible"]:
+                reason = decision["reason"]
+                if reason == "rows_remain":
+                    raise ArbiterError(
+                        EXIT_FENCING,
+                        f"orphan release refused: job={args.job} still has "
+                        f"leases={decision['leases']} quota_pool={decision['quota_pools']}",
+                    )
+                if reason == "agent_present":
+                    raise ArbiterError(
+                        EXIT_FENCING,
+                        f"orphan release refused: job={args.job} agent is present "
+                        f"with herdr_status={decision['herdr_status']}",
+                    )
+                raise ArbiterError(
+                    EXIT_FENCING,
+                    f"orphan release refused: job={args.job} state={decision['prior_state']}",
+                )
+            con.execute(
+                "UPDATE jobs SET state = 'released', updated_at = ? WHERE job_id = ?",
+                (iso(moment), args.job),
+            )
+            seq = record_event(
+                con,
+                args.job,
+                "job.orphan_release",
+                {
+                    "job_id": args.job,
+                    "prior_state": decision["prior_state"],
+                    "agent_label": decision["agent_label"],
+                    "herdr_status": decision["herdr_status"],
+                    "reason": decision["reason"],
+                    "forced": True,
+                },
+            )
+            con.execute("COMMIT")
+            return {
+                "ok": True,
+                "job_id": args.job,
+                "prior_state": decision["prior_state"],
+                "released_at": iso(moment),
+                "forced": True,
+                "event_seq": seq,
+            }
+
         if args.kind == "quota_pool":
             row = _quota_pool_row(con, args.job, args.resource)
             if row is None:
@@ -1306,6 +1359,66 @@ def _matched_agent_statuses(
     return statuses, matched
 
 
+def _orphan_release_decision(
+    con: sqlite3.Connection, agents: list[dict[str, object]], job_id: str
+) -> dict[str, object]:
+    """Inspect one leased job while the caller holds BEGIN IMMEDIATE."""
+    job = con.execute("SELECT state FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
+    if job is None:
+        raise ArbiterError(EXIT_DENIED, f"job 이 등록되지 않았다: {job_id} — 먼저 claim 하라")
+    state = job[0]
+    if state != "leased":
+        return {
+            "eligible": False, "reason": "state_not_leased", "prior_state": state,
+            "agent_label": None, "herdr_status": [], "leases": [], "quota_pools": [],
+        }
+    leases = [
+        f"{row[0]}/{row[1]}" for row in con.execute(
+            "SELECT resource, kind FROM leases WHERE job_id = ? ORDER BY resource, kind",
+            (job_id,),
+        ).fetchall()
+    ]
+    quota_pools = [
+        row[0] for row in con.execute(
+            "SELECT pool FROM quota_pool_records WHERE job_id = ? ORDER BY pool", (job_id,)
+        ).fetchall()
+    ]
+    if leases or quota_pools:
+        return {
+            "eligible": False, "reason": "rows_remain", "prior_state": state,
+            "agent_label": None, "herdr_status": [], "leases": leases,
+            "quota_pools": quota_pools,
+        }
+    agent_label = _claim_agent_label(con, job_id)
+    if agent_label is None:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            f"gc identity reconciliation refused; job={job_id} has no exact agent_label mapping",
+        )
+    statuses, matched = _matched_agent_statuses(
+        agents, job_id=job_id, agent_label=agent_label
+    )
+    if "unknown" in statuses:
+        raise ArbiterError(
+            EXIT_STORAGE,
+            f"gc identity reconciliation refused; job={job_id} herdr_status=unknown",
+        )
+    # hk1991-orphan-release
+    # A present known agent is live (including idle, done and blocked); only
+    # absence from the exact Herdr identity list proves the owner is gone.
+    if matched:
+        return {
+            "eligible": False, "reason": "agent_present", "prior_state": state,
+            "agent_label": agent_label, "herdr_status": sorted(statuses),
+            "leases": [], "quota_pools": [],
+        }
+    return {
+        "eligible": True, "reason": "agent_absent", "prior_state": state,
+        "agent_label": agent_label, "herdr_status": [], "leases": [],
+        "quota_pools": [],
+    }
+
+
 def cmd_gc(args: argparse.Namespace) -> dict:
     # GC always reconciles quota_pool_records against a current Herdr list.
     # ``--herdr-agent-list PATH`` is the hermetic fixture seam; omitting PATH
@@ -1420,6 +1533,28 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                     "herdr_status": statuses,
                 }
             )
+        orphan_released = []
+        leased_jobs = con.execute(
+            "SELECT job_id FROM jobs WHERE state = 'leased' ORDER BY job_id"
+        ).fetchall()
+        for (job_id,) in leased_jobs:
+            decision = _orphan_release_decision(con, herdr_agents, job_id)
+            if not decision["eligible"]:
+                continue
+            con.execute(
+                "UPDATE jobs SET state = 'released', updated_at = ? WHERE job_id = ?",
+                (iso(moment), job_id),
+            )
+            payload = {
+                "job_id": job_id,
+                "prior_state": decision["prior_state"],
+                "agent_label": decision["agent_label"],
+                "herdr_status": decision["herdr_status"],
+                "reason": decision["reason"],
+                "forced": False,
+            }
+            record_event(con, job_id, "job.orphan_release", payload)
+            orphan_released.append(payload)
         con.execute("COMMIT")
     except BaseException:
         con.execute("ROLLBACK")
@@ -1431,6 +1566,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
         "transitioned": transitions,
         "retained": len(rows),
         "stale_quota_pool": stale_quota_pool,
+        "orphan_released": orphan_released,
         "unresolved_quota_pool": unresolved_quota_pool,
         "unsafe_quota_pool": unsafe_quota_pool,
         "live_agents": sum(
@@ -1769,13 +1905,20 @@ def build_parser() -> argparse.ArgumentParser:
         "release", parents=[common], help="lease/실행 기록 반납. --force 는 운영자 강제 반납"
     )
     release.add_argument("--job", required=True, help="job id")
-    release.add_argument("--resource", required=True, help="자원 이름")
+    release.add_argument("--resource", help="자원 이름 (orphan transition은 --force --job만 사용)")
     release.add_argument("--token", help="획득 시 발급된 fencing token (배타 lease 일반 반납용)")
     release.add_argument("--kind", choices=KINDS, help="같은 resource 에 kind 가 여럿일 때만 필요")
     release.add_argument(
         "--force",
         action="store_true",
         help="fencing token 없이 운영자 강제 반납하고 force event 를 남긴다",
+    )
+    release.add_argument(
+        "--herdr-agent-list",
+        nargs="?",
+        const="",
+        metavar="PATH",
+        help="orphan release용 herdr agent list JSON(생략 시 설치된 herdr 실행)",
     )
 
     status = sub.add_parser("status", parents=[common], help="현황(읽기 전용, mode=ro)")

@@ -704,6 +704,7 @@ for anchor in (
     "    while load_wait:",
     "    if not load_wait and acquired_at >= deadline:",
     '             return "$WRK_EXIT_CONFIG_REFUSED" ;;',
+    "hk1991-owner-alive",
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))
 PY

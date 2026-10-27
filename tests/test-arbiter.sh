@@ -49,6 +49,43 @@ pycheck() {
 jget() { python3 -c 'import json,sys; print(json.load(sys.stdin)[sys.argv[1]])' "$1"; }
 mtime() { python3 -c 'import os,sys; print(os.stat(sys.argv[1]).st_mtime_ns)' "$1"; }
 restore_db() { cp "$TMP/good.db" "$DB"; rm -f "$DB-wal" "$DB-shm"; }
+set_job_leased() {
+  python3 - "$DB" "$1" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("UPDATE jobs SET state = 'leased' WHERE job_id = ?", (sys.argv[2],))
+assert con.total_changes == 1, sys.argv[2]
+con.commit()
+con.close()
+PY
+}
+job_state() {
+  python3 - "$DB" "$1" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+row = con.execute("SELECT state FROM jobs WHERE job_id = ?", (sys.argv[2],)).fetchone()
+assert row, sys.argv[2]
+print(row[0])
+PY
+}
+remove_claim_agent_label() {
+  python3 - "$DB" "$1" <<'PY'
+import json, sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+row = con.execute(
+    "SELECT payload FROM events WHERE job_id = ? AND kind = 'job.claim'", (sys.argv[2],)
+).fetchone()
+assert row, sys.argv[2]
+event = json.loads(row[0])
+event["payload"].pop("agent_label", None)
+con.execute(
+    "UPDATE events SET payload = ? WHERE job_id = ? AND kind = 'job.claim'",
+    (json.dumps(event), sys.argv[2]),
+)
+con.commit()
+con.close()
+PY
+}
 
 # ---------------------------------------------------------------- ⑤ fail-closed
 # DB 없음: bootstrap 이 허용된 claim 을 뺀 모든 경로는 비-0 로 거부한다.
@@ -400,6 +437,26 @@ for stale_job in quota-blocked quota-dead quota-done quota-idle; do
   [[ -f "$ARBITER_INBOX_ROOT/$stale_job/events/00003-quota_pool.stale_cleanup.json" ]] \
     || fail "stale cleanup event artifact missing for $stale_job"
 done
+[[ "$(job_state quota-dead)" == released ]] || fail "absent quota-dead job stayed leased"
+[[ -f "$ARBITER_INBOX_ROOT/quota-dead/events/00004-job.orphan_release.json" ]] \
+  || fail "10-12 orphan release event artifact missing"
+python3 - "$ARBITER_INBOX_ROOT/quota-dead/events/00004-job.orphan_release.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1], encoding="utf-8"))
+assert event["kind"] == "job.orphan_release", event
+assert event["payload"] == {
+    "job_id": "quota-dead", "prior_state": "leased", "agent_label": "quota-dead",
+    "herdr_status": [], "reason": "agent_absent", "forced": False,
+}, event
+PY
+for live_job in quota-idle quota-done quota-blocked; do
+  [[ "$(job_state "$live_job")" == leased ]] ||
+    fail "present $live_job agent was incorrectly orphan-released"
+done
+run claim --reclaim-released --job quota-dead --agent-label quota-dead-retry \
+  --lane live --t T1 --json
+[[ "$RC" -eq 0 ]] || fail "reclaim after orphan gc required --job-dup-ok: $ERR"
+pass "hk1991_gc_orphan_release_10_12: quota cleanup and released transition are atomic, audited, and reclaimable"
 expect_rc 0 release --job quota-live --resource codex --kind quota_pool
 pass "normal quota release and herdr-list stale cleanup leave event evidence"
 
@@ -423,6 +480,106 @@ assert len(d["quota_pool_records"]) == 1, d
 assert d["quota_pool_records"][0]["job_id"] == "quota-unknown", d
 PY
 pass "gc preserves a quota record matched to Herdr's valid unknown status"
+expect_rc 0 release --job quota-unknown --resource codex --kind quota_pool
+
+# A second gc covers leased jobs with no quota row after the cleanup pass.
+# Present idle/done/blocked agents remain live, and an outstanding path lease
+# still prevents release even when its agent is absent.
+for live_status in idle done blocked; do
+  job="orphan-${live_status}"
+  "$ARBITER" claim --job "$job" --agent-label "$job-agent" --lane live --t T1 >/dev/null
+  set_job_leased "$job"
+done
+"$ARBITER" claim --job orphan-path-left --agent-label orphan-path-left-agent \
+  --lane live --t T1 >/dev/null
+expect_rc 0 lease --job orphan-path-left --resource orphan-path --kind path
+printf '%s\n' '{"result":{"agents":[{"name":"pool-a","agent_status":"working"},{"name":"pool-b","agent_status":"working"},{"name":"pool-c","agent_status":"working"},{"name":"pool-d","agent_status":"working"},{"name":"quota-live","agent_status":"working"},{"name":"quota-custom-agent","agent_status":"working"},{"name":"quota-idle","agent_status":"idle"},{"name":"quota-done","agent_status":"done"},{"name":"quota-blocked","agent_status":"blocked"},{"name":"orphan-idle-agent","agent_status":"idle"},{"name":"orphan-done-agent","agent_status":"done"},{"name":"orphan-blocked-agent","agent_status":"blocked"}]}}' >"$TMP/orphan-agents.json"
+expect_rc 0 gc --herdr-agent-list "$TMP/orphan-agents.json"
+for live_status in idle done blocked; do
+  [[ "$(job_state "orphan-${live_status}")" == leased ]] ||
+    fail "present ${live_status} agent without quota was incorrectly released"
+done
+[[ "$(job_state orphan-path-left)" == leased ]] ||
+  fail "orphan gc released a job with a path lease still present"
+pass "hk1991_gc_live_idle_done_blocked_and_lease: known live agents and a remaining lease prevent transition"
+
+"$ARBITER" claim --job orphan-unmapped --agent-label to-be-removed --lane live --t T1 >/dev/null
+set_job_leased orphan-unmapped
+remove_claim_agent_label orphan-unmapped
+run gc --herdr-agent-list "$TMP/orphan-agents.json"
+[[ "$RC" -eq 6 ]] || fail "gc guessed an unmapped orphan agent: rc=$RC $ERR"
+grep -q 'orphan-unmapped' <<<"$ERR" || fail "unmapped gc refusal omitted job: $ERR"
+[[ "$(job_state orphan-unmapped)" == leased ]] || fail "unmapped gc changed job state"
+pass "hk1991_gc_unmapped_agent: an unmapped owner refuses the transaction without a transition"
+
+# Manual orphan release uses the same row and owner checks under its own
+# BEGIN IMMEDIATE transaction and produces the same audit event with forced=true.
+printf '%s\n' '{"result":{"agents":[]}}' >"$TMP/no-agents.json"
+"$ARBITER" claim --job manual-orphan --agent-label manual-orphan-agent --lane live --t T1 >/dev/null
+set_job_leased manual-orphan
+run release --force --job manual-orphan --herdr-agent-list "$TMP/no-agents.json" --json
+[[ "$RC" -eq 0 ]] || fail "manual orphan release failed: $ERR"
+[[ "$(job_state manual-orphan)" == released ]] || fail "manual orphan job stayed leased"
+[[ -f "$ARBITER_INBOX_ROOT/manual-orphan/events/00002-job.orphan_release.json" ]] ||
+  fail "manual orphan event artifact missing"
+python3 - "$ARBITER_INBOX_ROOT/manual-orphan/events/00002-job.orphan_release.json" <<'PY'
+import json, sys
+event = json.load(open(sys.argv[1], encoding="utf-8"))
+assert event["kind"] == "job.orphan_release", event
+assert event["payload"] == {
+    "job_id": "manual-orphan", "prior_state": "leased",
+    "agent_label": "manual-orphan-agent", "herdr_status": [],
+    "reason": "agent_absent", "forced": True,
+}, event
+PY
+expect_rc 0 claim --reclaim-released --job manual-orphan --agent-label manual-retry \
+  --lane live --t T1
+pass "hk1991_release_force_orphan: forced transition uses the shared orphan rule, event and reclaim path"
+
+for live_status in working idle done blocked; do
+  job="manual-live-${live_status}"
+  "$ARBITER" claim --job "$job" --agent-label "$job-agent" --lane live --t T1 >/dev/null
+  set_job_leased "$job"
+  printf '{"result":{"agents":[{"name":"%s-agent","agent_status":"%s"}]}}\n' \
+    "$job" "$live_status" >"$TMP/manual-live.json"
+  run release --force --job "$job" --herdr-agent-list "$TMP/manual-live.json"
+  [[ "$RC" -eq 5 ]] || fail "manual release accepted live $live_status agent: rc=$RC $ERR"
+  grep -qF "$live_status" <<<"$ERR" || fail "live $live_status refusal omitted status: $ERR"
+  [[ "$(job_state "$job")" == leased ]] || fail "manual release changed live $live_status job"
+done
+"$ARBITER" claim --job manual-unknown --agent-label manual-unknown-agent --lane live --t T1 >/dev/null
+set_job_leased manual-unknown
+printf '%s\n' '{"result":{"agents":[{"name":"manual-unknown-agent","agent_status":"unknown"}]}}' >"$TMP/manual-unknown.json"
+expect_rc 6 release --force --job manual-unknown --herdr-agent-list "$TMP/manual-unknown.json"
+grep -q 'unknown' <<<"$ERR" || fail "manual unknown refusal omitted status: $ERR"
+[[ "$(job_state manual-unknown)" == leased ]] || fail "manual release changed unknown job"
+pass "hk1991_release_force_live_unknown: present known states stay live, unknown refuses fail-closed"
+
+"$ARBITER" claim --job manual-unmapped --agent-label manual-unmapped-agent --lane live --t T1 >/dev/null
+set_job_leased manual-unmapped
+remove_claim_agent_label manual-unmapped
+expect_rc 6 release --force --job manual-unmapped --herdr-agent-list "$TMP/no-agents.json"
+grep -q 'manual-unmapped' <<<"$ERR" || fail "manual unmapped refusal omitted job: $ERR"
+[[ "$(job_state manual-unmapped)" == leased ]] || fail "manual unmapped release changed job"
+pass "hk1991_release_force_unmapped: the manual path refuses an unmapped owner"
+
+"$ARBITER" claim --job manual-lease-left --agent-label manual-lease-left-agent \
+  --lane live --t T1 >/dev/null
+expect_rc 0 lease --job manual-lease-left --resource manual-resource --kind path
+run release --force --job manual-lease-left --herdr-agent-list "$TMP/no-agents.json"
+[[ "$RC" -eq 5 ]] || fail "manual orphan release ignored a remaining lease: rc=$RC $ERR"
+grep -q 'manual-resource/path' <<<"$ERR" || fail "remaining lease refusal omitted resource/kind: $ERR"
+[[ "$(job_state manual-lease-left)" == leased ]] || fail "lease-left release changed job"
+
+"$ARBITER" claim --job manual-quota-left --agent-label manual-quota-left-agent \
+  --lane live --t T1 >/dev/null
+expect_rc 0 lease --job manual-quota-left --kind quota_pool --profile codex-max \
+  --gate-output "$TMP/gate.out"
+run release --force --job manual-quota-left --herdr-agent-list "$TMP/no-agents.json"
+[[ "$RC" -eq 5 ]] || fail "manual orphan release ignored a quota row: rc=$RC $ERR"
+grep -q 'codex' <<<"$ERR" || fail "remaining quota refusal omitted pool: $ERR"
+[[ "$(job_state manual-quota-left)" == leased ]] || fail "quota-left release changed job"
+pass "hk1991_release_force_rows_left: lease and quota rows each block manual orphan release with their identity named"
 
 # ------------------------------------------------------------ ⑤ forced release
 "$ARBITER" claim --job force --lane live --t T1 >/dev/null

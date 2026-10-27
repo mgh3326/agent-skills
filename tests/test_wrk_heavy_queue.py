@@ -1,9 +1,11 @@
 """hk 1407: real heavy entry-point tests, using only file-controlled fixtures."""
 
+import base64
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -154,6 +156,272 @@ class HeavyQueue(unittest.TestCase):
         (self.waiters / str(pid)).write_text(
             f"pid={pid} class=lane limit={limit} ticket={ticket} since=x job=- cmd=fixture")
 
+    def plant_start_lane(self, pid, start, ticket="1:1", limit=1):
+        (self.waiters / str(pid)).write_text(
+            f"pid={pid} class=lane limit={limit} ticket={ticket} start={start} since=x job=- cmd=fixture")
+
+    def legacy_reader_fields(self, text):
+        tokens = text.split(None, 3)[:3]
+        pid, cls, limit = -1, "lane", None
+        if tokens and tokens[0].startswith("pid="):
+            try:
+                pid = int(tokens[0][4:])
+            except ValueError:
+                pass
+        for token in tokens[1:]:
+            if token.startswith("class=") and token[6:] in ("ci", "lane"):
+                cls = token[6:]
+            elif token.startswith("limit="):
+                try:
+                    limit = int(token[6:])
+                except ValueError:
+                    pass
+        fields = text.split(None, 4)
+        ticket = None
+        if len(fields) >= 4:
+            match = re.fullmatch(r"ticket=([0-9]{1,20}):([0-9]{1,20})", fields[3])
+            if match:
+                ticket = tuple(map(int, match.groups()))
+        return pid, cls, limit, ticket
+
+    def test_new_waiter_record_has_a_fixed_head_start_identity(self):
+        self.start("identity-holder")
+        self.spawn("identity-waiter")
+        info = self.queued("identity-waiter")
+        self.assertRegex(info, r"^pid=\d+ class=lane limit=1 ticket=\d+:\d+ start=[A-Za-z0-9:_-]+ ")
+
+    def test_macos_identity_uses_exact_ps_lstart_text(self):
+        source = WRK.read_text()
+        identity_body = source.split("def process_start_identity(pid):", 1)[1].split(
+            "owner_identity_unknown_logged = False", 1)[0]
+        self.assertIn('["/bin/ps", "-o", "lstart=", "-p", str(pid)]', identity_body)
+        self.assertNotIn("ctypes", identity_body)
+        self.assertNotIn("proc_pidinfo", identity_body)
+        lstart = "  Mon Oct 26 10:11:12 2026"
+        encoded = base64.urlsafe_b64encode(lstart.encode("utf-8")).decode("ascii").rstrip("=")
+        anchor = "def process_start_identity(pid):\n"
+        injection = (
+            "_identity_test_real_run = subprocess.run\n"
+            "sys.platform = 'darwin'\n"
+            "def _identity_test_ps(argv, **kwargs):\n"
+            "    if argv[:4] == ['/bin/ps', '-o', 'lstart=', '-p']:\n"
+            "        assert kwargs.get('env') == {'LC_ALL': 'C', 'TZ': 'UTC'}\n"
+            f"        return type('PSResult', (), {{'returncode': 0, 'stdout': {lstart + chr(10)!r}}})()\n"
+            "    return _identity_test_real_run(argv, **kwargs)\n"
+            "subprocess.run = _identity_test_ps\n" + anchor)
+        binary = self.instrument("mac-identity-wrk", anchor, injection)
+        self.start("mac-identity-holder", binary=binary)
+        self.spawn("mac-identity-waiter", binary=binary)
+        info = self.queued("mac-identity-waiter")
+        self.assertIn("start=darwin:" + encoded, info)
+
+    def test_legacy_reader_preserves_fields_on_new_record(self):
+        self.start("compat-holder")
+        self.spawn("compat-waiter")
+        info = self.queued("compat-waiter")
+        fields = info.split()
+        expected = (int(fields[0][4:]), fields[1][6:], int(fields[2][6:]),
+                    tuple(map(int, fields[3][7:].split(":"))))
+        self.assertRegex(fields[4], r"start=[A-Za-z0-9:_-]+")
+        self.assertEqual(self.legacy_reader_fields(info), expected)
+
+    def test_start_after_pid_mutant_breaks_legacy_reader(self):
+        self.start("compat-mutant-holder")
+        self.spawn("compat-mutant-waiter")
+        info = self.queued("compat-mutant-waiter")
+        fields = info.split()
+        expected = self.legacy_reader_fields(info)
+        mutant = " ".join(fields[:1] + [fields[4]] + fields[1:4] + fields[5:])
+        self.assertNotEqual(self.legacy_reader_fields(mutant), expected,
+                            "the start-after-pid mutant preserved the base reader fields")
+
+    def test_pid_reuse_mismatch_stops_reserving_and_status_retires_once(self):
+        pid = os.getpid()
+        record = self.waiters / str(pid)
+        self.plant_start_lane(pid, "0" * 64)
+        run = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(run.returncode, 0,
+                         "pid-reuse mismatch reserves nothing: " + run.stderr)
+        status = self.run_wrk("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertFalse(record.exists(), "status retained a record whose pid has a different start identity")
+        rows = [json.loads(line) for line in (self.base / "heavy.log").read_text().splitlines()]
+        retired = [row for row in rows if row.get("kind") == "waiter_retired"
+                   and row.get("record") == str(pid)]
+        self.assertEqual(len(retired), 1, rows)
+        self.assertEqual(retired[0]["reason"], "start-mismatch")
+
+    def test_eperm_identity_states(self):
+        anchor = 'if args[0] == "status":\n'
+        cases = (("matching", "f" * 64, 75),
+                 ("mismatched", "e" * 64, 0),
+                 ("unreadable", None, 75))
+        for case, observed_start, expected_rc in cases:
+            with self.subTest(case=case):
+                pid = os.getpid() + 100000 + len(case)
+                record = self.waiters / str(pid)
+                self.plant_start_lane(pid, "f" * 64)
+                start_expr = "None" if observed_start is None else repr(observed_start)
+                injection = (
+                    f"_eperm_pid = {pid}\n"
+                    "_real_kill = os.kill\n"
+                    "_real_start_identity = process_start_identity\n"
+                    "def _kill_with_eperm(target, sig):\n"
+                    "    if target == _eperm_pid: raise PermissionError(1, 'permission denied')\n"
+                    "    return _real_kill(target, sig)\n"
+                    "def _stub_start_identity(target):\n"
+                    f"    if target == _eperm_pid: return {start_expr}\n"
+                    "    return _real_start_identity(target)\n"
+                    "os.kill = _kill_with_eperm\n"
+                    "process_start_identity = _stub_start_identity\n")
+                binary = self.instrument("eperm-" + case + "-wrk", anchor,
+                                         injection + anchor)
+                result = self.run_wrk("--", "true", binary=binary,
+                                      WRK_HEAVY_WAIT_CAP=".6")
+                self.assertEqual(result.returncode, expected_rc,
+                                 f"EPERM {case} identity state had wrong result: {result.stderr}")
+                if case == "mismatched":
+                    status = self.run_wrk("status", binary=binary)
+                    self.assertFalse(record.exists(), "EPERM with a different start was retained")
+                    rows = [json.loads(line) for line in
+                            (self.base / "heavy.log").read_text().splitlines()]
+                    retired = [row for row in rows if row.get("kind") == "waiter_retired"
+                               and row.get("record") == str(pid)]
+                    self.assertEqual(len(retired), 1, status.stdout + status.stderr)
+                    self.assertEqual(retired[0]["reason"], "start-mismatch")
+                elif case == "unreadable":
+                    self.assertTrue(record.exists(), "unreadable EPERM identity was retired")
+                    rows = [json.loads(line) for line in
+                            (self.base / "heavy.log").read_text().splitlines()]
+                    unknown = [row for row in rows if row.get("kind") == "owner_identity_unknown"]
+                    self.assertEqual(len(unknown), 1, rows)
+
+    def test_unknown_start_identity_keeps_record_and_logs_once(self):
+        pid = os.getpid()
+        record = self.waiters / str(pid)
+        self.plant_start_lane(pid, "f" * 64)
+        anchor = 'if args[0] == "status":\n'
+        binary = self.instrument("unknown-start-wrk", anchor,
+            "process_start_identity = lambda target: None\n" + anchor)
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75, "unknown owner identity stopped reserving")
+        self.assertTrue(record.exists(), "unknown owner identity was retired")
+        rows = [json.loads(line) for line in (self.base / "heavy.log").read_text().splitlines()]
+        unknown = [row for row in rows if row.get("kind") == "owner_identity_unknown"]
+        self.assertEqual(len(unknown), 1, rows)
+        status = self.run_wrk("status", binary=binary)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertTrue(record.exists(), "status retired an owner with unknown identity")
+        rows = [json.loads(line) for line in (self.base / "heavy.log").read_text().splitlines()]
+        unknown = [row for row in rows if row.get("kind") == "owner_identity_unknown"]
+        self.assertEqual(len(unknown), 2, rows)
+
+    def test_unreadable_writer_identity_is_unknown_and_not_retired(self):
+        self.start("unknown-writer-holder")
+        anchor = 'owner_start = process_start_identity(os.getpid()) or "unknown"\n'
+        binary = self.instrument("unknown-writer-wrk", anchor,
+                                 "process_start_identity = lambda pid: None\n" + anchor)
+        self.spawn("unknown-writer-waiter", binary=binary)
+        info = self.queued("unknown-writer-waiter")
+        fields = info.split()
+        self.assertEqual(fields[4], "start=unknown")
+        record = self.waiters / fields[0][4:]
+        status = self.run_wrk("status", binary=binary)
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertTrue(record.exists(), "unreadable writer identity was retired")
+        rows = [json.loads(line) for line in (self.base / "heavy.log").read_text().splitlines()]
+        unknown = [row for row in rows if row.get("kind") == "owner_identity_unknown"
+                   and row.get("record") == record.name]
+        self.assertEqual(len(unknown), 1, rows)
+
+    def test_start_token_in_command_cannot_forge_head_identity(self):
+        pid = os.getpid()
+        (self.waiters / str(pid)).write_text(
+            f"pid={pid} class=lane limit=1 ticket=1:1 since=x job=- cmd=fixture start={'0' * 64}")
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75, "command text forged a fixed-head identity")
+
+    def test_wait_signals_remove_own_record_and_exit_with_signal_status(self):
+        for sig, expected in ((signal.SIGHUP, 129), (signal.SIGTERM, 143)):
+            with self.subTest(signal=sig):
+                holder = self.start("signal-holder-" + str(sig))
+                try:
+                    waiter = self.spawn("signal-waiter-" + str(sig), WRK_HEAVY_WAIT_CAP="10")
+                    info = self.queued("signal-waiter-" + str(sig))
+                    record_pid = re.match(r"pid=(\d+)", info).group(1)
+                    record = self.waiters / record_pid
+                    self.assertTrue(record.exists())
+                    os.kill(int(record_pid), sig)
+                    self.assertEqual(waiter.wait(timeout=5), expected)
+                    self.assertFalse(record.exists(), "signal left the waiter's reservation behind")
+                finally:
+                    self.release("signal-holder-" + str(sig))
+                    holder.wait(timeout=5)
+
+    def test_lane_defer_guard_is_monotonic_and_never_preempts_holder(self):
+        holder = self.start("lane-guard-holder")
+        older = self.spawn("stopped-older")
+        older_info = self.queued("stopped-older")
+        older_pid = int(re.match(r"pid=(\d+)", older_info).group(1))
+        os.kill(older_pid, signal.SIGSTOP)
+        try:
+            binary = self.instrument("wall-step-lane-guard-wrk", "started_at = time.monotonic()",
+                                     "started_at = time.monotonic()\ntime.time = lambda: 10**12")
+            younger = self.spawn("guarded-younger", binary=binary,
+                                 WRK_HEAVY_LANE_DEFER_MAX="1.2", WRK_HEAVY_WAIT_CAP="10")
+            self.queued("guarded-younger")
+            time.sleep(.35)
+            self.assertFalse(self.started("guarded-younger"), "wall-clock jump ended lane deferral early")
+            self.assertIsNone(holder.poll(), "the guard preempted a slot holder")
+            self.release("lane-guard-holder")
+            self.assertEqual(holder.wait(timeout=5), 0)
+            time.sleep(.35)
+            self.assertFalse(self.started("guarded-younger"),
+                             "wall-clock jump or missing guard ended lane deferral early")
+            time.sleep(.8)
+            self.until(lambda: self.started("guarded-younger"),
+                       "lane waiter did not take a free slot after its defer bound")
+            self.release("guarded-younger")
+            self.assertEqual(younger.wait(timeout=5), 0)
+            os.kill(older_pid, signal.SIGCONT)
+            self.until(lambda: self.started("stopped-older"), "resumed older waiter did not finish")
+            self.release("stopped-older")
+            self.assertEqual(older.wait(timeout=5), 0)
+        finally:
+            try:
+                os.kill(older_pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+
+    def test_lane_defer_zero_disables_and_invalid_values_refuse(self):
+        holder = self.start("lane-zero-holder")
+        older = self.spawn("lane-zero-older")
+        older_info = self.queued("lane-zero-older")
+        older_pid = int(re.match(r"pid=(\d+)", older_info).group(1))
+        os.kill(older_pid, signal.SIGSTOP)
+        try:
+            younger = self.spawn("lane-zero-younger", WRK_HEAVY_LANE_DEFER_MAX="0")
+            self.queued("lane-zero-younger")
+            self.release("lane-zero-holder")
+            self.assertEqual(holder.wait(timeout=5), 0)
+            self.until(lambda: self.started("lane-zero-younger"),
+                       "zero did not disable lane deferral")
+            self.release("lane-zero-younger")
+            self.assertEqual(younger.wait(timeout=5), 0)
+            os.kill(older_pid, signal.SIGCONT)
+            self.until(lambda: self.started("lane-zero-older"), "older waiter did not drain")
+            self.release("lane-zero-older")
+            self.assertEqual(older.wait(timeout=5), 0)
+        finally:
+            try:
+                os.kill(older_pid, signal.SIGCONT)
+            except ProcessLookupError:
+                pass
+        for value in ("invalid", "-1", "nan"):
+            with self.subTest(value=value):
+                result = self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX=value)
+                self.assertEqual(result.returncode, 2, result.stderr)
+
     def test_fifo_reserves_only_eligible_slots(self):
         # Our live test pid is a deterministic older lane; it reserves slot 0
         # until the fixture file is removed. Slot 1 must remain available.
@@ -191,12 +459,15 @@ class HeavyQueue(unittest.TestCase):
         # can legitimately let B acquire while this test releases the holder.
         gate = self.base / "b-scan-gate"
         self.files.append(gate)
-        anchor = '            lane_limit = lane_reserved() if hclass == "lane" else 0\n'
+        anchor = '                lane_limit = lane_reserved()\n'
         gated = self.instrument("b-gated-wrk", anchor,
-                                f"            while not os.path.exists({str(gate)!r}):\n"
-                                "                time.sleep(.02)\n" + anchor)
+                                f"                while not os.path.exists({str(gate)!r}):\n"
+                                "                    time.sleep(.02)\n" + anchor)
         b = self.spawn("b", binary=gated)
-        bticket = self.ticket(self.queued("b"))
+        try:
+            bticket = self.ticket(self.queued("b"))
+        except AssertionError as exc:
+            raise AssertionError(str(exc) + ": " + (self.base / "b.out").read_text()) from exc
         a = self.spawn("a-new", key="job-A" if keyed else None, binary=binary)
         aticket = self.ticket(self.queued("a-new"))
         if keyed and not expired:
@@ -321,11 +592,22 @@ class HeavyQueue(unittest.TestCase):
         self.positions.chmod(0o777)
         self.assertEqual(self.run_wrk("--queue-key", "A", "--", "true").returncode, 78)
 
-    def instrument(self, name, old, new):
+    def instrument(self, name, old, new, count=1):
         source = WRK.read_text()
-        self.assertEqual(source.count(old), 1, f"instrumentation anchor changed: {old}")
+        self.assertEqual(source.count(old), count, f"instrumentation anchor changed: {old}")
         binary = self.base / name
-        binary.write_text(source.replace(old, new, 1))
+        binary.write_text(source.replace(old, new, count))
+        binary.chmod(0o755)
+        return binary
+
+    def instrument_many(self, name, changes):
+        source = WRK.read_text()
+        for old, new in changes:
+            self.assertEqual(source.count(old), 1,
+                             f"instrumentation anchor changed: {old}")
+            source = source.replace(old, new, 1)
+        binary = self.base / name
+        binary.write_text(source)
         binary.chmod(0o755)
         return binary
 
@@ -392,13 +674,17 @@ class HeavyQueue(unittest.TestCase):
         # Park exactly after the production lane scan, not for a guessed time.
         gate, scanned = self.base / "gate", self.base / "scanned"
         self.files.append(gate)
-        anchor = '            lane_limit = lane_reserved() if hclass == "lane" else 0\n'
-        binary = self.instrument("scan-wrk", anchor, anchor +
+        anchor = '            for i, sfd in enumerate(slot_fds):\n'
+        binary = self.instrument("scan-wrk", anchor,
                                  f"            open({str(scanned)!r}, 'w').close()\n"
                                  f"            while not os.path.exists({str(gate)!r}):\n"
-                                 "                time.sleep(.02)\n")
+                                 "                time.sleep(.02)\n" + anchor)
         self.spawn("in-flight", binary=binary)
-        self.until(scanned.exists, "pass did not reach the scan barrier")
+        try:
+            self.until(scanned.exists, "pass did not reach the scan barrier")
+        except AssertionError as exc:
+            output = (self.base / "in-flight.out").read_text()
+            raise AssertionError(str(exc) + ": " + output) from exc
         self.plant_lane(os.getpid())
         self.release("holder")
         self.assertEqual(holder.wait(timeout=5), 0)
@@ -411,7 +697,7 @@ class HeavyQueue(unittest.TestCase):
 
     def test_crash_after_position_publish_and_during_publish(self):
         self.start("holder")
-        anchor = '                end_defer("cap")\n                save_position()\n'
+        anchor = '                end_defer("cap")\n                end_lane_defer("cap")\n                save_position()\n'
         binary = self.instrument("crash-after-wrk", anchor, anchor + "                os._exit(75)\n")
         old = self.spawn("crashed", key="A", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
         ticket = self.ticket(self.queued("crashed"))
@@ -514,27 +800,57 @@ class HeavyQueue(unittest.TestCase):
 
     def test_mutants_break_the_named_invariants(self):
         mutations = [
-            ("fifo", 'lane_limit = lane_reserved() if hclass == "lane" else 0',
-             'lane_limit = 0', "test_fifo_reserves_only_eligible_slots",
+            ("fifo", [
+                ('lane_limit = lane_reserved()\n', 'lane_limit = 0\n'),
+            ], "test_fifo_reserves_only_eligible_slots",
              "younger lane overtook a live older ticket"),
-            ("reuse", '            ticket = tuple(record["ticket"])',
-             '            pass  # mutant: discard the saved ticket',
+            ("reuse", [('            ticket = tuple(record["ticket"])',
+                         '            pass  # mutant: discard the saved ticket')],
              "test_position_reused_within_grace", "original ticket was not reused within grace"),
-            ("dead", '        if not alive(pid):\n', '        if False:\n',
+            ("dead", [('        if pid > 0 and live is False:\n', '        if False:\n')],
              "test_dead_and_mixed_version_records_reserve_nothing",
-             "dead or ticketless record reserved a slot"),
+             "status did not clean a dead waiter"),
+            ("no-owner-identity", [
+                ('    if first != start:\n        return False, "start-mismatch"\n',
+                 '    if False:\n        return False, "start-mismatch"\n'),
+                ('    if second != start:\n        return False, "start-mismatch"\n',
+                 '    if False:\n        return False, "start-mismatch"\n'),
+            ],
+             "test_pid_reuse_mismatch_stops_reserving_and_status_retires_once",
+             "pid-reuse mismatch reserves nothing"),
+            ("eperm-dead", [('    except PermissionError:\n        return True, "eperm"\n',
+                             '    except PermissionError:\n        return False, "dead"\n')],
+             "test_eperm_identity_states", "EPERM matching identity state had wrong result",
+            ),
+            ("unknown-dead", [('    if first is None:\n        log_owner_identity_unknown(pid, record, "start-read-unknown")\n        return None, "identity-unknown"\n',
+                                '    if first is None:\n        log_owner_identity_unknown(pid, record, "start-read-unknown")\n        return False, "dead"\n')],
+             "test_unknown_start_identity_keeps_record_and_logs_once",
+             "unknown owner identity stopped reserving"),
+            ("no-lane-bound", [('if lane_defer_total + (now - lane_defer_mark) >= lane_defer_max:\n',
+                                'if False:\n')],
+             "test_lane_defer_guard_is_monotonic_and_never_preempts_holder",
+             "lane waiter did not take a free slot after its defer bound"),
+            ("no-hup-handler", [('    signal.signal(signal.SIGHUP, wait_signal_handler)\n',
+                                  '    pass  # mutant: leave SIGHUP at its default action\n')],
+             "test_wait_signals_remove_own_record_and_exit_with_signal_status",
+             ("129", "signal left the waiter's reservation behind")),
         ]
-        for name, old, new, case, invariant in mutations:
+        for name, changes, case, invariant in mutations:
             with self.subTest(invariant=invariant):
-                binary = self.instrument("mutant-" + name, old, new)
+                binary = self.instrument_many("mutant-" + name, changes)
                 result = subprocess.run(
                     [sys.executable, str(Path(__file__).resolve()), "HeavyQueue." + case],
                     env=dict(self.env, WRK_QUEUE_TEST_BIN=str(binary)),
                     capture_output=True, text=True, timeout=45, check=False)
-                self.assertNotEqual(result.returncode, 0, "mutant survived: " + invariant)
+                self.assertNotEqual(result.returncode, 0,
+                                    "mutant survived: " + repr(invariant))
                 self.assertIn("AssertionError:", result.stderr)
-                self.assertIn(invariant, result.stderr)
-                self.assertNotIn("ERROR:", result.stderr, "a crash is not assertion RED")
+                expected = invariant if isinstance(invariant, tuple) else (invariant,)
+                self.assertTrue(any(item in result.stderr for item in expected),
+                                "mutant did not fail the named assertion: " + repr(expected)
+                                + "\n" + result.stderr[-1800:])
+                self.assertNotIn("ERROR:", result.stderr,
+                                 "a crash is not assertion RED\n" + result.stderr[-1800:])
 
 
 if __name__ == "__main__":

@@ -138,7 +138,7 @@ for line in open(sys.argv[1], encoding="utf-8"):
 PY
 }
 
-# ── static: docs name the class and the guard; no signal path exists ───────
+# ── static: docs name the class and guard; signals only clean this waiter ─
 help_out="$("$WRK" heavy --help)"
 for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 'class=ci|lane' \
   'kind=defer' 'preempt' 'not a lock' 'renamed into place' 'starting up' \
@@ -155,10 +155,43 @@ import re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 start = src.index("heavy_cmd() {")
 half = src[start:src.index('\ncase "${1:-}" in', start)]
-sig = re.findall(r"os\.(?:kill|killpg)\([^)]*\)|\.(?:kill|terminate|send_signal)\(|"
-                 r"import[^\n]*\bsignal\b|from signal\b", half)
-# alive() probes with signal 0; nothing in the heavy path may signal a holder
-assert sig == ["os.kill(pid, 0)"], ("a signal path exists in wrk heavy", sig)
+
+def check_signal_surface(source):
+    # The sole os.kill is alive()'s signal-0 existence probe. Signal handlers
+    # may retire only this waiter's own record while it is still waiting.
+    kills = re.findall(r"os\.kill\([^)]*\)", source)
+    assert kills == ["os.kill(pid, 0)"], ("unexpected os.kill calls", kills)
+    forbidden = re.findall(
+        r"os\.killpg\s*\(|\.(?:kill|terminate|send_signal)\s*\(|"
+        r"signal\.(?:pthread_kill|raise_signal|alarm)\s*\(", source)
+    assert not forbidden, ("a signal path can affect a holder", forbidden)
+
+    imports = re.findall(r"(?m)^import[^\n]*\bsignal\b|^from signal\b", source)
+    assert len(imports) == 1, ("signal import must be limited to wait handlers", imports)
+    attrs = re.findall(r"\bsignal\.([A-Za-z_][A-Za-z0-9_]*)", source)
+    assert set(attrs) <= {"signal", "SIGHUP", "SIGTERM", "SIG_DFL"}, attrs
+    calls = re.findall(r"signal\.signal\([^)]*\)", source)
+    expected = [
+        "signal.signal(signal.SIGHUP, wait_signal_handler)",
+        "signal.signal(signal.SIGTERM, wait_signal_handler)",
+        "signal.signal(signal.SIGHUP, signal.SIG_DFL)",
+        "signal.signal(signal.SIGTERM, signal.SIG_DFL)",
+    ]
+    assert calls == expected, ("only wait-handler registration/reset is allowed", calls)
+
+check_signal_surface(half)
+mutant = half.replace(
+    "signal.signal(signal.SIGTERM, wait_signal_handler)",
+    "signal.signal(signal.SIGTERM, wait_signal_handler)\n"
+    "    signal.raise_signal(signal.SIGTERM)", 1)
+assert mutant != half, "signal-sending mutant anchor disappeared"
+try:
+    check_signal_surface(mutant)
+except AssertionError:
+    pass
+else:
+    raise AssertionError("signal.raise_signal mutant escaped the heavy-class guard")
+
 # the waiter record is published by rename, never by open-then-write in place
 assert "os.replace(record_tmp, me_name" in half, \
     "waiter record is not renamed into place"
@@ -177,7 +210,7 @@ assert "st_nlink == 1" in half, "slot opens must refuse a hardlinked inode"
 # r3: root-owned shared locks (desktop tmpfiles) stay usable
 assert "def owner_trusted" in half, "root-owned shared locks must pass"
 PY
-echo "PASS heavy-class-static-docs-and-no-signal-path"
+echo "PASS heavy-class-static-docs-and-wait-signal-only-path"
 
 # ── invalid class refuses rc 78; lane/empty/ci run; status stays readable ──
 new_lock s1
