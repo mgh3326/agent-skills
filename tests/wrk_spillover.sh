@@ -9,7 +9,7 @@ export WRK_TEST_REAL_SENTINEL=1
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 WRK_COPY="$TMP/wrk"
-cp "$WRK_COPY" "$WRK_COPY"
+cp "${ROOT}/bin/wrk" "$WRK_COPY"
 chmod +x "$WRK_COPY"
 # shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
