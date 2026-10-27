@@ -482,7 +482,7 @@ env ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$XDG" HK_STATE="$HK_DB" \
   "$WRK" sentinel sw7-sen lane-a lbl w:p9 report >/dev/null 2>&1 &
 SEN_PID=$!
 own "$SEN_PID"
-for _ in $(seq 1 20); do
+for _ in $(seq 1 100); do
   kill -0 "$SEN_PID" 2>/dev/null || break
   # -s, not -f: the log file is created before the first poll. A non-empty
   # log proves that poll wrote its line.
@@ -491,6 +491,8 @@ for _ in $(seq 1 20); do
 done
 kill -0 "$SEN_PID" 2>/dev/null ||
   fail "sw7 sentinel exited before the sweep ran"
+[[ -s "$INBOX/sw7-sen/completion-sentinel.log" ]] ||
+  fail "sw7 sentinel did not poll before the sweep ran"
 # The poll writes the log line, then checks sentinel_job_ended in the same
 # pass. Give that check time to finish before the end record lands, so the
 # sentinel is in its 3600s interval sleep when the sweep looks for it.
@@ -801,5 +803,42 @@ mk_record "artifacts/proj/116/sw15b" test-host sw15b 116 proj "$JB" uploading "[
 sweep --job sw15b --apply
 [[ ! -e "$JB/jobonly/only.bin" ]] || fail "sw15b job-scoped row not applied"
 echo "PASS sw15-policy-scoping"
+
+# ─────────────────────────────────────────────────────────────────────────────
+echo "== sw16: a file changed during the record write is kept and unrecorded =="
+reset_case sw16
+write_hosts
+write_policy
+mk_ended_job sw16 117 w:p9
+mk_task 117 merged proj sw16
+JD="$INBOX/sw16"
+mkdir -p "$JD/evidence"
+printf 'original\n' >"$JD/evidence/x.png"
+R="$(mk_row evidence/x.png "$JD/evidence/x.png")"
+K16="artifacts/proj/117/sw16"
+mk_record "$K16" test-host sw16 117 proj "$JD" drive_confirmed "[$R]"
+# The wrapper appends to the planned file during doc put, after the plan-time
+# hash and before the delete-time check.
+WRAP="$TMP/toctou-hk"
+cat >"$WRAP" <<'SH'
+#!/usr/bin/env bash
+if [[ "${1:-} ${2:-}" == "doc put" ]]; then
+  printf 'changed-after-hash\n' >> "$WRK_ARTIFACTS_TOCTOU_TARGET"
+fi
+exec "$WRK_ARTIFACTS_TOCTOU_HK" "$@"
+SH
+chmod +x "$WRAP"
+sweep HANDOFFKEEP_BIN="$WRAP" \
+  WRK_ARTIFACTS_TOCTOU_TARGET="$JD/evidence/x.png" \
+  WRK_ARTIFACTS_TOCTOU_HK="$HK" --job sw16 --apply
+[[ "$SWEEP_RC" == 0 ]] || fail "sw16 apply rc=$SWEEP_RC: $SWEEP_OUT"
+[[ -f "$JD/evidence/x.png" ]] || fail "sw16 deleted a file changed during the put"
+have "path=evidence/x.png class=evidence kept reason=changed-before-delete" ||
+  fail "sw16 must report changed-before-delete: $SWEEP_OUT"
+doc_body "$K16" | python3 -c 'import json,sys
+rows = json.load(sys.stdin).get("local_deleted") or []
+assert not rows, rows' ||
+  fail "sw16 recorded a deleted row for a kept file"
+echo "PASS sw16-toctou-kept"
 
 echo "ALL PASS"

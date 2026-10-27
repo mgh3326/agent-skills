@@ -14557,8 +14557,65 @@ print(json.dumps({"key": doc.get("key") or "", "kind": doc.get("kind") or "note"
   echo "artifact-sweep done jobs=$jobs_n mode=$mode deleted_files=$SWEEP_DELETED_FILES deleted_bytes=$SWEEP_DELETED_BYTES"
 }
 
-# Act on one job's plan dir: doc put the updated record first, then unlink,
-# then rmdir the emptied dirs. Prints action= lines.
+# artifacts_row_matches ABS BYTES SHA — 0 only when the path is still a
+# regular file of that size whose sha256 is SHA. Used at delete time: the
+# plan-time hash is not enough, because a file can change while the record
+# is being written.
+artifacts_row_matches() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import hashlib, os, stat, sys
+path, size, want = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    st = os.lstat(path)
+    size = int(size)
+except (OSError, ValueError):
+    sys.exit(1)
+if not stat.S_ISREG(st.st_mode) or st.st_size != size:
+    sys.exit(1)
+h = hashlib.sha256()
+try:
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+except OSError:
+    sys.exit(1)
+sys.exit(0 if h.hexdigest() == want else 1)
+PY
+}
+
+# artifacts_record_filter BODY_IN BODY_OUT KEPT_TSV — drop from local_deleted
+# every (path, sha256) that KEPT_TSV lists, so a file kept at delete time is
+# not recorded as deleted.
+artifacts_record_filter() {
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+src, dst, kept = sys.argv[1:4]
+try:
+    with open(src, encoding="utf-8") as f:
+        rec = json.load(f)
+except (OSError, ValueError):
+    sys.exit(1)
+drop = set()
+try:
+    with open(kept, encoding="utf-8") as f:
+        for ln in f:
+            parts = ln.rstrip("\n").split("\t")
+            if len(parts) >= 5:
+                drop.add((parts[1], parts[4]))
+except OSError:
+    sys.exit(1)
+rec["local_deleted"] = [
+    r for r in rec.get("local_deleted") or []
+    if not (isinstance(r, dict) and (r.get("path"), r.get("sha256")) in drop)]
+with open(dst, "w", encoding="utf-8") as f:
+    json.dump(rec, f)
+PY
+}
+
+# Act on one job's plan dir: re-verify, doc put the updated record, unlink
+# each file only after a fresh size+sha256 check, then rmdir the emptied
+# dirs. A file that changed after the plan is kept, and any row already put
+# for it is removed with a corrective record. Prints action= lines.
 artifacts_sweep_apply_plan() {
   local job="$1" plan_dir="$2" apply="$3" hk="$4"
   [[ -d "$plan_dir" ]] || return 0
@@ -14567,13 +14624,35 @@ artifacts_sweep_apply_plan() {
     [[ -f "$meta" ]] || continue
     idx="${meta##*/meta-}"
     IFS=$'\t' read -r key kind src recf <"$meta"
+    local plan_file="$plan_dir/plan-$idx.tsv"
+    local verified="$plan_dir/verified-$idx.tsv"
+    local kept0="$plan_dir/kept-$idx.tsv" keptf="$plan_dir/kept-final-$idx.tsv"
+    : >"$verified"; : >"$kept0"; : >"$keptf"
+    local abs rel cls bytes sha
+    # First re-verify immediately before the record write, so a file already
+    # changed since plan time never enters local_deleted.
+    while IFS=$'\t' read -r abs rel cls bytes sha; do
+      [[ -n "$abs" ]] || continue
+      if artifacts_row_matches "$abs" "$bytes" "$sha"; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$abs" "$rel" "$cls" "$bytes" "$sha" >>"$verified"
+      else
+        printf '%s\t%s\t%s\t%s\t%s\n' "$abs" "$rel" "$cls" "$bytes" "$sha" >>"$kept0"
+        echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls kept reason=changed-before-delete"
+      fi
+    done <"$plan_file"
+    local body="$plan_dir/$recf"
+    if [[ "$recf" != "-" && -s "$kept0" ]]; then
+      if artifacts_record_filter "$body" "$plan_dir/$recf.filtered" "$kept0"; then
+        body="$plan_dir/$recf.filtered"
+      fi
+    fi
     if [[ "$recf" != "-" && "$apply" == 1 ]]; then
       put_rc=0
       run_bounded 10 "$hk" doc put --key "$key" --kind "$kind" --job "$job" \
-        --file "$plan_dir/$recf" >/dev/null 2>&1 || put_rc=$?
+        --file "$body" >/dev/null 2>&1 || put_rc=$?
       [[ "$put_rc" == 0 ]] || put_bad+="$idx "
     fi
-    local abs rel cls bytes sha
+    local corrected=0
     while IFS=$'\t' read -r abs rel cls bytes sha; do
       [[ -n "$abs" ]] || continue
       if [[ "$apply" != 1 ]]; then
@@ -14584,6 +14663,14 @@ artifacts_sweep_apply_plan() {
         echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls kept reason=record-write-failed"
         continue
       fi
+      # The delete-time check: a file changed during the record write is
+      # kept, and the row is removed from the record below.
+      if ! artifacts_row_matches "$abs" "$bytes" "$sha"; then
+        printf '%s\t%s\t%s\t%s\t%s\n' "$abs" "$rel" "$cls" "$bytes" "$sha" >>"$keptf"
+        echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls kept reason=changed-before-delete"
+        corrected=1
+        continue
+      fi
       if rm -f "$abs" 2>/dev/null; then
         echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls bytes=$bytes action=deleted"
         SWEEP_DELETED_FILES=$(( SWEEP_DELETED_FILES + 1 ))
@@ -14591,7 +14678,19 @@ artifacts_sweep_apply_plan() {
       else
         echo "artifact-sweep job=$job dataset=$key path=$rel class=$cls kept reason=delete-failed"
       fi
-    done <"$plan_dir/plan-$idx.tsv"
+    done <"$verified"
+    if [[ "$apply" == 1 && "$corrected" == 1 && "$recf" != "-" &&
+          "$put_bad" != *" $idx "* ]]; then
+      if artifacts_record_filter "$body" "$plan_dir/$recf.corrected" "$keptf"; then
+        put_rc=0
+        run_bounded 10 "$hk" doc put --key "$key" --kind "$kind" --job "$job" \
+          --file "$plan_dir/$recf.corrected" >/dev/null 2>&1 || put_rc=$?
+        [[ "$put_rc" == 0 ]] ||
+          echo "artifact-sweep job=$job dataset=$key kept reason=record-correct-failed"
+      else
+        echo "artifact-sweep job=$job dataset=$key kept reason=record-correct-failed"
+      fi
+    fi
     if [[ "$apply" == 1 && "$put_bad" != *" $idx "* && -f "$plan_dir/dirs-$idx" ]]; then
       local drel
       while IFS= read -r drel; do
