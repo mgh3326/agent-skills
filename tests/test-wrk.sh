@@ -16049,11 +16049,6 @@ grep -q 'exit 99' "$TMP/tw-lease.err" "$TMP/tw-lease.out" ||
   fail "hk1439: lease error did not show the tripwire rc 99: $(cat "$TMP/tw-lease.err")"
 cp "$TMP/tripwire.before" "$TRIPWIRE_LOG" # drop only this case's own line
 echo "PASS hk1439 tripwire fires when SCOPEFUEL_BIN is unset"
-if [[ -s "$TRIPWIRE_LOG" ]]; then
-  echo "FAIL: hk1439 real-binary tripwire hit (caller argv):" >&2
-  cat "$TRIPWIRE_LOG" >&2
-  exit 1
-fi
 
 bash "$ROOT/tests/test-shellcheck-capped.sh"
 # hk 1604: devin gate-profile contract. The real-scopefuel smoke stays opt-in
@@ -16062,4 +16057,23 @@ bash "$ROOT/tests/test-devin-gate-profile.sh"
 # hk 1990: preserve durable operator refs at the actual apply_catalog call site.
 python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
 bash "$ROOT/tests/test-pi-launcher.sh"
+# hk 2054: the tripwire check is the last command before PASS test-wrk — a
+# sub-suite added after it would inherit the shim PATH unchecked. Fail closed
+# unless only blanks, comments and the PASS echo follow the check's fi.
+# shellcheck disable=SC2016 # checkline is test-wrk.sh source text, not an expansion
+awk -v checkline='if [[ -s "$TRIPWIRE_LOG" ]]; then' -v want="echo 'PASS test-wrk'" '
+  $0 == checkline { if (seen) dup = 1; in_check = 1; next }
+  in_check && $0 == "fi" { in_check = 0; seen = 1; next }
+  !seen { next }
+  $0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/ { next }
+  $0 != want { bad = 1; next }
+  { got = 1 }
+  END { exit !(seen && got && !bad && !dup) }
+' "$0" ||
+  fail "hk2054: tripwire check is not the last command before PASS test-wrk"
+if [[ -s "$TRIPWIRE_LOG" ]]; then
+  echo "FAIL: hk1439 real-binary tripwire hit (caller argv):" >&2
+  cat "$TRIPWIRE_LOG" >&2
+  exit 1
+fi
 echo 'PASS test-wrk'
