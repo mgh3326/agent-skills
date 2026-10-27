@@ -703,6 +703,7 @@ for anchor in (
     "not 0 < int(m.group(1)) < limit",
     "    while load_wait:",
     "    if not load_wait and acquired_at >= deadline:",
+    "hk1991-owner-alive",
     '             return "$WRK_EXIT_CONFIG_REFUSED" ;;',
 ):
     assert src.count(anchor) == 1, (anchor, src.count(anchor))

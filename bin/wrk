@@ -12772,6 +12772,9 @@ Environment:
   WRK_HEAVY_CI_DEFER_MAX
                         seconds a lane waiter defers to a live ci waiter
                         before it stops (default 1800, 0 = never defer)
+  WRK_HEAVY_LANE_DEFER_MAX
+                        seconds a lane waiter defers to older lane waiters
+                        before it stops (default 1800, 0 = never defer)
   WRK_HEAVY_WAIT_CAP    total wait cap in seconds (default 1200)
   WRK_HEAVY_QUEUE_KEY   durable re-queue key (overridden by --queue-key)
   WRK_HEAVY_REQUEUE_GRACE
@@ -12824,7 +12827,7 @@ heavy_cmd() {
     WRK_HEAVY_LOAD_WAIT_SRC="$heavy_load_wait_src" \
     WRK_HEAVY_LOAD_WAIT_ERR="$heavy_load_wait_err" \
     python3 - "$@" <<'PY'
-import datetime, fcntl, glob, json, math, os, re, socket, stat, subprocess, sys, tempfile, time
+import base64, datetime, fcntl, glob, hashlib, json, math, os, re, signal, socket, stat, subprocess, sys, tempfile, time
 
 EXIT_WAIT_CAP = 75  # EX_TEMPFAIL: transient, worth reporting and retrying later
 EXIT_REFUSED = 78   # EX_CONFIG: this host's configuration forbids the run
@@ -12835,14 +12838,69 @@ def fail(msg, rc):
     raise SystemExit(rc)
 
 
-def alive(pid):
+def alive(pid, identity=False):
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    except OSError:
+    except PermissionError:
         return True
+    except OSError:
+        return None if identity else True
     return True
+
+
+def process_start(pid):
+    """Stable, whitespace-free process birth identity, or None if unreadable."""
+    try:
+        if sys.platform.startswith("linux"):
+            with open("/proc/sys/kernel/random/boot_id", encoding="ascii") as f:
+                boot = f.read().strip()
+            with open("/proc/%d/stat" % pid, encoding="ascii") as f:
+                stat_line = f.read()
+            head, sep, tail = stat_line.rpartition(")")
+            fields = tail.split()
+            if not sep or not head or len(fields) <= 19 or not fields[19].isdigit() or not boot:
+                return None
+            raw = "linux:%s:%s" % (boot, fields[19])
+        elif sys.platform == "darwin":
+            # ps lstart has one-second resolution. A reused pid born in the
+            # same second is indistinguishable and stays alive (fail-safe).
+            result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                                    capture_output=True, timeout=2,
+                                    env=dict(os.environ, LC_ALL="C", LANG="C", TZ="UTC"))
+            if result.returncode or not result.stdout.strip():
+                return None
+            # URL-safe encoding preserves every byte, including whitespace,
+            # so equality of the fixed-head token is exact ps text equality.
+            return "d" + base64.urlsafe_b64encode(result.stdout).decode("ascii").rstrip("=")
+        else:
+            return None
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
+        return None
+
+
+unknown_owner_logged = False
+
+
+def owner_alive(pid, start):
+    global unknown_owner_logged
+    state = alive(pid, identity=start is not None)
+    if state is False:
+        return False, "process no longer exists"
+    if start is None:  # Pre-change records keep the exact old pid-only rule.
+        return state, "legacy pid"
+    current = process_start(pid) if state is True and start != "?" else None
+    if current is None:
+        if not unknown_owner_logged:
+            unknown_owner_logged = True
+            log_event({"kind": "owner_unknown", "owner_pid": pid,
+                       "reason": "process start identity unreadable"})
+        return None, "identity unknown"
+    if current != start:
+        return False, "start identity mismatch"
+    return True, "identity matched"
 
 
 def read_text(path):
@@ -12900,6 +12958,16 @@ def record_ticket(text):
         if all(n > 0 for n in ticket):
             return ticket
     return None
+
+
+def record_start(text):
+    # Preserve the original first four fields so old readers still parse
+    # class, limit and ticket. Only field five is trusted as new metadata.
+    fields = text.split(None, 5)
+    if len(fields) < 5 or not fields[3].startswith("ticket=") or not fields[4].startswith("start="):
+        return None
+    value = fields[4][6:]
+    return value if re.fullmatch(r"(?:[0-9a-f]{64}|d[A-Za-z0-9_-]{1,256})", value) else "?"
 
 
 args = sys.argv[1:]
@@ -13262,9 +13330,12 @@ if args[0] == "status":
         # later fields, or a `pid=` token inside the command text would make
         # a live waiter look dead here (record_head reads the head only).
         pid = record_head(info)[0]
-        if pid > 0 and not alive(pid):
+        state, reason = owner_alive(pid, record_start(info)) if pid > 0 else (None, "invalid pid")
+        if state is False:
             try:
                 os.remove(name, dir_fd=wfd)
+                log_event({"kind": "waiter_retired", "record": name,
+                           "owner_pid": pid, "reason": reason})
             except OSError:
                 pass
             continue
@@ -13333,6 +13404,12 @@ except ValueError:
     defer_max = -1.0
 if not defer_max >= 0:
     fail("WRK_HEAVY_CI_DEFER_MAX is not a non-negative number", 2)
+try:
+    lane_defer_max = float(os.environ.get("WRK_HEAVY_LANE_DEFER_MAX", "1800"))
+except ValueError:
+    lane_defer_max = -1.0
+if not lane_defer_max >= 0:
+    fail("WRK_HEAVY_LANE_DEFER_MAX is not a non-negative number", 2)
 cmd_summary = " ".join(cmd)
 # class and limit stay in the fixed head of the record (record_head): a ci
 # waiter's limit tells a lane waiter which slots that ci waiter could take.
@@ -13390,10 +13467,14 @@ def ci_reserved():
                 continue  # a planted link or fifo is not a record
         except OSError:
             continue
-        pid, cls, lim = record_head(read_waiter_record(waiters_fd, name))
+        text = read_waiter_record(waiters_fd, name)
+        pid, cls, lim = record_head(text)
         if cls != "ci" or pid <= 0 or pid == os.getpid():
             continue
         if lim is None or lim < 1 or not alive(pid):
+            continue
+        start = record_start(text)
+        if start is not None and owner_alive(pid, start)[0] is False:
             continue
         reserved = max(reserved, lim)
     return reserved
@@ -13423,7 +13504,7 @@ def lane_reserved():
             continue
         if older is None or older >= ticket or lim is None or lim < 1:
             continue
-        if not alive(pid):
+        if owner_alive(pid, record_start(text))[0] is False:  # hk1991-owner-alive
             continue
         reserved = max(reserved, lim)
     return reserved
@@ -13564,7 +13645,14 @@ if queue_key is not None:
         else:
             remove_position(positions_fd, position_name(queue_key), st, key=queue_key)
 # Keep the class/limit head byte-compatible for older wrk and CI reservation.
-info = info.replace(" since=", " ticket=%d:%d since=" % ticket, 1)
+own_start = process_start(os.getpid())
+if own_start is None:
+    if not unknown_owner_logged:
+        unknown_owner_logged = True
+        log_event({"kind": "owner_unknown", "owner_pid": os.getpid(),
+                   "reason": "process start identity unreadable"})
+    own_start = "?"
+info = info.replace(" since=", " ticket=%d:%d start=%s since=" % (*ticket, own_start), 1)
 me_name = str(os.getpid())
 held_slot = -1
 acquired_at = None
@@ -13580,6 +13668,9 @@ defer_mark = None
 defer_seen = False   # held back at least once: a defer row is owed
 defer_over = False   # guard fired: no more deferral for the rest of the wait
 defer_logged = False
+lane_defer_total = 0.0
+lane_defer_mark = None
+lane_defer_over = False
 record_tmp = None    # mkstemp path mid-publish; every exit path drops it
 
 
@@ -13710,6 +13801,12 @@ for _sp in slot_paths:
              "with one link owned by uid %d or root)" % (_sp, os.getuid()),
              EXIT_REFUSED)
     slot_fds.append(_fd)
+def wait_signal(signum, _frame):
+    raise SystemExit(128 + signum)
+
+
+old_hup = signal.signal(signal.SIGHUP, wait_signal)
+old_term = signal.signal(signal.SIGTERM, wait_signal)
 try:
     publish_record()
     while True:
@@ -13746,6 +13843,20 @@ try:
             # CI keeps its existing guard and log clock; lane FIFO is a
             # separate reservation and is never waived by spending it.
             lane_limit = lane_reserved() if hclass == "lane" else 0
+            now = time.monotonic()
+            if lane_defer_max == 0 or lane_defer_over:
+                lane_limit = 0
+            elif lane_limit:
+                if lane_defer_mark is None:
+                    lane_defer_mark = now
+                if lane_defer_total + now - lane_defer_mark >= lane_defer_max:
+                    lane_defer_total += now - lane_defer_mark
+                    lane_defer_mark = None
+                    lane_defer_over = True
+                    lane_limit = 0
+            elif lane_defer_mark is not None:
+                lane_defer_total += now - lane_defer_mark
+                lane_defer_mark = None
             for i, sfd in enumerate(slot_fds):
                 if i < reserved:
                     continue
@@ -13812,6 +13923,8 @@ try:
             fail("interrupted while waiting for load to drop "
                  "-- command not run", 130)
     run_at = time.monotonic()
+    signal.signal(signal.SIGHUP, old_hup)
+    signal.signal(signal.SIGTERM, old_term)
     try:
         rc = run_command()
     except SystemExit as e:
@@ -13819,6 +13932,8 @@ try:
         raise
     raise SystemExit(rc)
 finally:
+    signal.signal(signal.SIGHUP, old_hup)
+    signal.signal(signal.SIGTERM, old_term)
     end_defer("exit")
     for leftover in (me_name, record_tmp,
                      ".%d.tmp" % os.getpid()):

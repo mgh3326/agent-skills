@@ -151,14 +151,45 @@ for token in WRK_HEAVY_CLASS WRK_HEAVY_CI_DEFER_MAX 1800 kind=defer \
     fail "spawn-worker/SKILL.md heavy section must mention: $token"
 done
 python3 - "$WRK" <<'PY'
-import re, sys
+import ast, re, sys
 src = open(sys.argv[1], encoding="utf-8").read()
 start = src.index("heavy_cmd() {")
 half = src[start:src.index('\ncase "${1:-}" in', start)]
-sig = re.findall(r"os\.(?:kill|killpg)\([^)]*\)|\.(?:kill|terminate|send_signal)\(|"
-                 r"import[^\n]*\bsignal\b|from signal\b", half)
-# alive() probes with signal 0; nothing in the heavy path may signal a holder
-assert sig == ["os.kill(pid, 0)"], ("a signal path exists in wrk heavy", sig)
+def check_signals(text):
+    sig = re.findall(r"os\.(?:kill|killpg)\([^)]*\)|\.(?:kill|terminate|send_signal)\(", text)
+    assert sig == ["os.kill(pid, 0)"], ("a signal path exists in wrk heavy", sig)
+    python_half = text.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+    tree = ast.parse(python_half)
+    parents = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            assert node.module != "signal", "signal must be imported as a module"
+        if isinstance(node, ast.Import):
+            assert all(alias.name != "signal" or alias.asname is None for alias in node.names)
+        if isinstance(node, ast.Name) and node.id == "signal":
+            parent = parents.get(node)
+            assert isinstance(parent, ast.Attribute) and parent.value is node
+        if not (isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name)
+                and node.value.id == "signal"):
+            continue
+        assert node.attr in ("signal", "SIGHUP", "SIGTERM"), node.attr
+        if node.attr == "signal":
+            call = parents.get(node)
+            assert isinstance(call, ast.Call) and call.func is node
+            assert len(call.args) == 2 and not call.keywords
+            first, handler = call.args
+            assert (isinstance(first, ast.Attribute) and isinstance(first.value, ast.Name)
+                    and first.value.id == "signal" and first.attr in ("SIGHUP", "SIGTERM"))
+            assert isinstance(handler, ast.Name)
+check_signals(half)
+for injected in ("os.kill(pid, 15)", "signal.raise_signal(signal.SIGTERM)"):
+    mutant = half.replace("def alive(pid, identity=False):\n", "def alive(pid, identity=False):\n    " + injected + "\n", 1)
+    try:
+        check_signals(mutant)
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError("signal guard mutant survived: " + injected)
 # the waiter record is published by rename, never by open-then-write in place
 assert "os.replace(record_tmp, me_name" in half, \
     "waiter record is not renamed into place"

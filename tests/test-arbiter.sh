@@ -575,4 +575,5 @@ expect_rc 0 status
 [[ "$before" == "$(mtime "$DB")" ]] || fail "read-only status wrote to a sidecar-less db"
 pass "⑧ status reads a db that has no -wal/-shm sidecar without writing to it"
 
+python3 "$ROOT/tests/test_arbiter_orphan.py"
 echo 'PASS test-arbiter'

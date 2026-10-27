@@ -1,9 +1,12 @@
 """hk 1407: real heavy entry-point tests, using only file-controlled fixtures."""
 
 import json
+import base64
+import hashlib
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
@@ -19,7 +22,7 @@ POLL = threading.Event()
 
 class HeavyQueue(unittest.TestCase):
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="hq-", dir="/tmp")
+        self.tmp = tempfile.TemporaryDirectory(prefix="hq-", dir=os.environ.get("TMPDIR") or "/tmp")
         self.base = Path(self.tmp.name)
         self.procs = []
         self.files = []
@@ -248,6 +251,194 @@ class HeavyQueue(unittest.TestCase):
                          "CI unexpectedly deferred to another CI waiter")
         (self.waiters / "legacy-ci").unlink()
         self.assertEqual(self.run_wrk("--", "true").returncode, 0)
+
+    def plant_identified_lane(self, pid, start):
+        path = self.waiters / ("identified-" + str(pid))
+        path.write_text(f"pid={pid} class=lane limit=1 ticket=1:1 start={start} "
+                        "since=x job=- cmd=fixture")
+        return path
+
+    def log_events(self, kind):
+        path = self.base / "heavy.log"
+        if not path.exists():
+            return []
+        return [row for row in map(json.loads, path.read_text().splitlines())
+                if row.get("kind") == kind]
+
+    def test_reused_pid_does_not_reserve_and_status_audits(self):
+        path = self.plant_identified_lane(os.getpid(), "0" * 64)
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 0, "reused pid reserved a slot")
+        status = self.run_wrk("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertFalse(path.exists(), "status retained the reused pid")
+        rows = self.log_events("waiter_retired")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual((rows[0]["record"], rows[0]["owner_pid"]), (path.name, os.getpid()))
+        self.assertIn("mismatch", rows[0]["reason"])
+
+    def test_identified_ci_respects_identity_and_unknown(self):
+        path = self.waiters / "identified-ci"
+        path.write_text(f"pid={os.getpid()} class=ci limit=1 ticket=1:1 start={'0' * 64} "
+                        "since=x job=- cmd=fixture")
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 0, "reused CI pid reserved a slot")
+        path.write_text(f"pid={os.getpid()} class=ci limit=1 ticket=1:1 start=? "
+                        "since=x job=- cmd=fixture")
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75, "unknown CI owner lost its reservation")
+        self.assertTrue(path.exists())
+
+    def test_new_record_legacy_reader_compatibility(self):
+        self.start("format-holder")
+        self.spawn("format-waiter", WRK_HEAVY_CLASS="ci")
+        info = self.queued("format-waiter")
+        # The exact first-three and fourth-field parsing used at 1a9ded3.
+        head = info.split(None, 3)[:3]
+        pid = int(head[0][4:])
+        cls, limit = "lane", None
+        for token in head[1:]:
+            if token.startswith("class=") and token[6:] in ("ci", "lane"):
+                cls = token[6:]
+            elif token.startswith("limit="):
+                limit = int(token[6:])
+        self.assertEqual((pid, cls, limit), (pid, "ci", 1), "legacy reader lost the fixed head")
+        self.assertTrue((self.waiters / str(pid)).exists())
+        fields = info.split(None, 4)
+        ticket = re.fullmatch(r"ticket=([0-9]{1,20}):([0-9]{1,20})", fields[3])
+        self.assertIsNotNone(ticket, "legacy reader lost the fixed head")
+        self.assertTrue(all(int(part) > 0 for part in ticket.groups()))
+        self.assertEqual(self.ticket(info), tuple(map(int, ticket.groups())))
+        self.assertTrue(fields[4].startswith("start="), "identity must be field five")
+
+    def process_identity(self, pid):
+        if sys.platform.startswith("linux"):
+            boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+            fields = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
+            raw = f"linux:{boot}:{fields[19]}"
+        else:
+            result = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)],
+                                    env=dict(self.env, LC_ALL="C", LANG="C", TZ="UTC"),
+                                    capture_output=True, check=True)
+            return "d" + base64.urlsafe_b64encode(result.stdout).decode("ascii").rstrip("=")
+        return hashlib.sha256(raw.encode()).hexdigest()
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS ps lstart behavior")
+    def test_macos_ps_same_second_and_exact_text(self):
+        fake_bin = self.base / "fake-ps-bin"
+        fake_bin.mkdir()
+        ps_output = self.base / "ps-output"
+        first = b"Tue Oct 27 12:34:56 2026\n"
+        ps_output.write_bytes(first)
+        fake_ps = fake_bin / "ps"
+        fake_ps.write_text("#!/bin/sh\ncat " + str(ps_output) + "\n")
+        fake_ps.chmod(0o755)
+        self.env["PATH"] = str(fake_bin) + os.pathsep + self.env["PATH"]
+        start = "d" + base64.urlsafe_b64encode(first).decode("ascii").rstrip("=")
+        path = self.plant_identified_lane(os.getpid(), start)
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75, "same-second ps identity did not reserve")
+        ps_output.write_bytes(b"Tue Oct 27 12:34:57 2026\n")
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 0, "different-second ps identity reserved")
+        self.assertEqual(self.run_wrk("status").returncode, 0)
+        self.assertFalse(path.exists())
+        path = self.plant_identified_lane(os.getpid(), start)
+        ps_output.write_bytes(b" Tue Oct 27 12:34:56 2026\n")
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6").returncode, 0,
+                         "ps identity comparison normalized whitespace")
+
+    def eperm_binary(self, unreadable=False):
+        binary = self.instrument("eperm-wrk", "        os.kill(pid, 0)\n",
+                                 "        raise PermissionError('fixture EPERM')\n")
+        if unreadable:
+            source = binary.read_text()
+            anchor = "def process_start(pid):\n"
+            self.assertEqual(source.count(anchor), 1)
+            binary.write_text(source.replace(anchor, anchor + "    return None\n", 1))
+        return binary
+
+    def test_eperm_matching_identity_reserves(self):
+        path = self.plant_identified_lane(os.getpid(), self.process_identity(os.getpid()))
+        binary = self.eperm_binary()
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75, "EPERM matching identity did not reserve")
+        self.assertEqual(self.run_wrk("status", binary=binary).returncode, 0)
+        self.assertTrue(path.exists(), "EPERM matching identity was retired")
+
+    def test_eperm_mismatching_identity_does_not_reserve(self):
+        path = self.plant_identified_lane(os.getpid(), "0" * 64)
+        binary = self.eperm_binary()
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 0, "EPERM mismatching identity reserved a slot")
+        self.assertEqual(self.run_wrk("status", binary=binary).returncode, 0)
+        self.assertFalse(path.exists())
+
+    def test_eperm_unreadable_identity_reserves_and_is_not_retired(self):
+        path = self.plant_identified_lane(os.getpid(), self.process_identity(os.getpid()))
+        binary = self.eperm_binary(unreadable=True)
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75, "EPERM unreadable identity did not reserve")
+        self.assertEqual(len(self.log_events("owner_unknown")), 1)
+        self.assertEqual(self.run_wrk("status", binary=binary).returncode, 0)
+        self.assertTrue(path.exists(), "EPERM unreadable identity was retired")
+
+    def test_unreadable_identity_retained_and_logged_once(self):
+        path = self.plant_identified_lane(os.getpid(), "?")
+        result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP="1.2")
+        self.assertEqual(result.returncode, 75, "unknown owner did not reserve a slot")
+        self.assertTrue(path.exists(), "unknown owner was removed")
+        self.assertEqual(len(self.log_events("owner_unknown")), 1)
+        self.assertEqual(self.run_wrk("status").returncode, 0)
+        self.assertTrue(path.exists(), "status retired unknown owner")
+
+    def test_wait_signals_remove_record_and_preserve_holder(self):
+        holder = self.start("signal-holder")
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            with self.subTest(signal=sig):
+                name = "wait-" + str(sig)
+                proc = self.spawn(name)
+                info = self.queued(name)
+                pid = int(info.split()[0].split("=", 1)[1])
+                os.kill(pid, sig)
+                self.assertEqual(proc.wait(timeout=5), 128 + sig)
+                self.assertFalse((self.waiters / str(pid)).exists(), "signal leaked waiter record")
+                self.assertIsNone(holder.poll(), "holder was preempted")
+                self.assertFalse(self.started(name), "signalled waiter ran its command")
+
+    def test_stopped_older_lane_has_monotonic_defer_bound(self):
+        holder = self.start("bound-holder")
+        older = self.spawn("bound-older")
+        info = self.queued("bound-older")
+        pid = int(info.split()[0].split("=", 1)[1])
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            anchor = "position_guard_fd = -1\n"
+            stepped = self.instrument("wall-step-wrk", anchor,
+                                      "time.time = lambda: -1000000000 if time.monotonic() % 2 < 1 else 1000000000\n" + anchor)
+            younger = self.spawn("bound-younger", binary=stepped, WRK_HEAVY_LANE_DEFER_MAX="1.5")
+            self.queued("bound-younger")
+            self.release("bound-holder")
+            self.assertEqual(holder.wait(timeout=5), 0)
+            POLL.wait(.4)
+            self.assertFalse(self.started("bound-younger"), "younger passed before the lane bound")
+            self.until(lambda: self.started("bound-younger"), "younger never passed stopped waiter", timeout=5)
+            self.release("bound-younger")
+            self.assertEqual(younger.wait(timeout=5), 0)
+        finally:
+            os.kill(pid, signal.SIGCONT)
+        self.until(lambda: self.started("bound-older"), "continued waiter never ran")
+        self.release("bound-older")
+        self.assertEqual(older.wait(timeout=5), 0)
+
+    def test_lane_bound_zero_and_invalid(self):
+        self.plant_lane(os.getpid())
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX="0",
+                                      WRK_HEAVY_WAIT_CAP=".6").returncode, 0)
+        for value in ("bad", "-1", "nan"):
+            result = self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX=value,
+                                  WRK_HEAVY_WAIT_CAP=".6")
+            self.assertEqual(result.returncode, 2, f"invalid lane bound accepted: {value}")
 
     def test_status_ticket_order_and_expiry_cleanup(self):
         self.start("holder")
@@ -520,9 +711,28 @@ class HeavyQueue(unittest.TestCase):
             ("reuse", '            ticket = tuple(record["ticket"])',
              '            pass  # mutant: discard the saved ticket',
              "test_position_reused_within_grace", "original ticket was not reused within grace"),
-            ("dead", '        if not alive(pid):\n', '        if False:\n',
+            ("dead", '        if owner_alive(pid, record_start(text))[0] is False:  # hk1991-owner-alive\n',
+             '        if False:\n',
              "test_dead_and_mixed_version_records_reserve_nothing",
              "dead or ticketless record reserved a slot"),
+            ("identity", "    if current != start:\n", "    if False:\n",
+             "test_reused_pid_does_not_reserve_and_status_audits", "reused pid reserved a slot"),
+            ("eperm", "    except PermissionError:\n        return True\n",
+             "    except PermissionError:\n        return False\n",
+             "test_eperm_matching_identity_reserves", "EPERM matching identity did not reserve"),
+            ("unknown", '        return None, "identity unknown"\n',
+             '        return False, "identity unknown"\n',
+             "test_unreadable_identity_retained_and_logged_once", "unknown owner did not reserve a slot"),
+            ("lane-bound", "                if lane_defer_total + now - lane_defer_mark >= lane_defer_max:\n",
+             "                if False:\n", "test_stopped_older_lane_has_monotonic_defer_bound",
+             "younger never passed stopped waiter"),
+            ("hup", "old_hup = signal.signal(signal.SIGHUP, wait_signal)\n",
+             "old_hup = signal.SIG_DFL\n", "test_wait_signals_remove_record_and_preserve_holder",
+             "signal leaked waiter record"),
+            ("old-reader-order",
+             'info = info.replace(" since=", " ticket=%d:%d start=%s since=" % (*ticket, own_start), 1)\n',
+             'info = info.replace("pid=%d " % os.getpid(), "pid=%d start=%s " % (os.getpid(), own_start), 1).replace(" since=", " ticket=%d:%d since=" % ticket, 1)\n',
+             "test_new_record_legacy_reader_compatibility", "legacy reader lost the fixed head"),
         ]
         for name, old, new, case, invariant in mutations:
             with self.subTest(invariant=invariant):
