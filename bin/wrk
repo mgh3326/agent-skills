@@ -13010,7 +13010,9 @@ Report — and with --apply, remove — what ended or stale jobs leave behind:
     link whose either end hits the set or leaves the job dir is refused,
     not unlinked. A name with a control character cannot be framed in the
     scan record and is refused (unsafe-path). Under a recursive glob a
-    dropped match that holds a kept match, or sits inside one, stays.
+    dropped match that holds a kept match, or sits inside one, stays. A
+    glob with more than 20000 matches in one job dir (a symlink cycle
+    under ** does that) skips the job (scan-failed).
 
 Dry-run is the default and prints one line per item with job id, pid, age,
 pane state and the exact reason it is or is not an orphan. --apply stops
@@ -13264,6 +13266,12 @@ PY
 
 # prune_artifact_scan JOBDIR GLOB — one TSV per match:
 #   kind  path  newest-mtime-inside(- if unreadable)  bytes
+# A candidate (real, link) is named by its physical seat: its parent resolved,
+# its own name kept, written under JOBDIR with no . component, no symlinked
+# ancestor and no trailing slash. glob returns one entry under several names (a
+# **/./* pattern, a symlinked directory inside the job dir); the pass compares
+# paths as strings, so the scan collapses those names to one record and lets a
+# refusal of any name refuse the seat. A refused record keeps the matched name.
 # kind is one of
 #   real     a file or directory inside the job dir, nothing on it never-touch
 #   link     a symlink match (unlink it, never traverse): the link and its
@@ -13286,7 +13294,7 @@ PY
 # job dir itself can never be a match.
 prune_artifact_scan() {
   python3 - "$1" "$2" "$PRUNE_NEVER_TOUCH" <<'PY'
-import fnmatch, glob, os, sys
+import fnmatch, glob, itertools, os, sys
 jobdir, pattern = sys.argv[1], sys.argv[2]
 NEVER = [pat.casefold() for pat in sys.argv[3].split()]
 if not NEVER:
@@ -13385,66 +13393,111 @@ def holds_never_touch(root):
     return bool(unreadable)
 
 
+def seat_of(match):
+    """The physical place MATCH names: its parent resolved, its own name kept
+    (a link is not followed). normpath first, so a trailing slash or a . in the
+    glob result cannot change the answer."""
+    norm = os.path.normpath(match)
+    return os.path.join(os.path.realpath(os.path.dirname(norm)),
+                        os.path.basename(norm))
+
+
 def classify(match):
-    """real, link, outside, guarded, holds or unsafe — None for the job dir."""
+    """(kind, seat): real, link, outside, guarded, holds or unsafe; kind is
+    None for the job dir itself."""
+    seat = seat_of(match)
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in match):
-        return "unsafe"
+        return "unsafe", seat
     if os.path.islink(match):
-        # Where the link sits has its ancestors resolved: unlinking refs/x
-        # through a symlinked ancestor unlinks the real refs/x.
-        seat = os.path.join(os.path.realpath(os.path.dirname(match)),
-                            os.path.basename(match))
-        return guard(match, (seat, os.path.realpath(match))) or "link"
+        # The seat is where the link sits (its ancestors resolved): unlinking
+        # refs/x through a symlinked ancestor unlinks the real refs/x.
+        return guard(match, (seat, os.path.realpath(match))) or "link", seat
     real = os.path.realpath(match)
     refused = guard(match, (real,))
     if refused:
-        return refused
+        return refused, seat
     if real == job_real:
-        return None
+        return None, seat
     if os.path.isdir(match) and holds_never_touch(match):
-        return "holds"
-    return "real"
+        return "holds", seat
+    return "real", seat
+
+
+def named(seat):
+    """SEAT written under JOBDIR (the form the pass compares), or None."""
+    parts = below(seat)
+    return os.path.join(top, *parts) if parts else None
 
 
 REFUSED = ("outside", "guarded", "holds", "unsafe")
-found = [(match, classify(match))
-         for match in sorted(glob.glob(os.path.join(jobdir, pattern),
-                                       recursive=True))]
-# A directory match that contains a refused match cannot be removed whole:
-# the removal would take the refused match with it. Every ancestor directory
-# of a refused match, up to the job dir, is held.
 top = os.path.normpath(jobdir)
+found = []
+# glob follows a symlink to a directory under **, so a link cycle inside the job
+# dir (or two links pointing at each other) makes the match list effectively
+# endless. Take at most MAX_MATCHES lazily; a pattern that wide is not a match
+# list worth acting on, and the pass skips the job (scan-failed).
+MAX_MATCHES = 20000
+raw = list(itertools.islice(
+    glob.iglob(os.path.join(jobdir, pattern), recursive=True), MAX_MATCHES + 1))
+if len(raw) > MAX_MATCHES:
+    raise SystemExit(1)
+for match in sorted(raw):
+    # glob("X/**") yields "X/" even when X does not exist; that is no match.
+    if not os.path.lexists(match):
+        continue
+    kind, seat = classify(match)
+    if kind is not None:
+        found.append((match, kind, seat))
+# One physical entry, one verdict: a refusal of any name for a seat refuses the
+# seat (refs/payload and cache/payload may be the same file).
+refused_seats = {seat for _, kind, seat in found if kind in REFUSED}
+# A directory that contains a refused seat cannot be removed whole: the removal
+# would take the refused entry with it. Every physical ancestor, up to the job
+# dir, is held.
 held = set()
-for match, kind in found:
+for _, kind, seat in found:
     if kind in REFUSED:
-        ancestor = os.path.dirname(os.path.normpath(match))
-        while ancestor.startswith(top + os.sep) and ancestor not in held:
+        ancestor = os.path.dirname(seat)
+        while ancestor.startswith(job_real + os.sep) and ancestor not in held:
             held.add(ancestor)
             ancestor = os.path.dirname(ancestor)
-for match, kind in found:
-    if kind is None:
-        continue
-    if kind == "real" and os.path.normpath(match) in held:
-        kind = "holds"
+emitted = set()
+for match, kind, seat in found:
     if kind == "unsafe":
         print("unsafe\t%s\t-\t0" % ascii(match)[1:-1])
-    elif kind in REFUSED:
+    elif kind in ("outside", "guarded"):
         print("%s\t%s\t-\t0" % (kind, match))
+    elif seat in emitted or (kind in ("real", "link") and seat in refused_seats):
+        continue
     else:
-        stamp = newest_mtime(match)
-        print("%s\t%s\t%s\t%d" % (kind, match,
-              "-" if stamp is None else str(int(stamp)), tree_size(match)))
+        emitted.add(seat)
+        path = named(seat)
+        if kind == "real" and seat in held:
+            kind = "holds"
+        if kind == "holds":
+            print("holds\t%s\t-\t0" % path)
+        else:
+            stamp = newest_mtime(path)
+            print("%s\t%s\t%s\t%d" % (kind, path,
+                  "-" if stamp is None else str(int(stamp)), tree_size(path)))
 PY
 }
 
 # prune_artifact_record_ok JOBDIR KIND PATH MTIME BYTES — the scanner's record,
 # re-checked before anything is done with it: a known kind, an absolute path
-# under JOBDIR, a numeric (or "-") mtime and numeric bytes. A malformed record
-# fails closed; the removal path never trusts the framing alone.
+# under JOBDIR, a numeric (or "-") mtime and numeric bytes. A candidate (real,
+# link) is also a normalized path: the scanner names it by its physical seat,
+# so a . or .. component, an empty one or a trailing slash is a forged or broken
+# record. A malformed record fails closed; the removal path never trusts the
+# framing alone. This is the framing layer only: the never-touch set is
+# enforced once, in the scanner.
 prune_artifact_record_ok() {
   local jobdir="$1" kind="$2" path="$3" mtime="$4" bytes="$5"
   case "$kind" in
-    real|link|outside|guarded|holds|unsafe) ;;
+    real|link) case "$path" in
+                 */./*|*/../*|*//*|*/.|*/..) return 1 ;;
+               esac ;;
+    outside|guarded|holds|unsafe) ;;
     *) return 1 ;;
   esac
   [[ "$path" == "$jobdir"/* ]] || return 1
@@ -13746,8 +13799,10 @@ prune_artifact_pass() {
         todo=(${drop_list[@]+"${drop_list[@]}"})
       fi
       # Under a recursive glob the matches nest. A removal takes its whole
-      # subtree, so a dropped match that holds a kept match (an ancestor), or
-      # sits inside one, stays: the kept match must come through intact.
+      # subtree, so a dropped match that holds a kept match (an ancestor), sits
+      # inside one, or is the same path stays: the kept match must come through
+      # intact. The scanner names every candidate by its physical seat, so these
+      # string comparisons are exact.
       is_drop=() kept_list=()
       for i in ${todo[@]+"${todo[@]}"}; do is_drop[i]=1; done
       for ((i = 0; i < n; i++)); do
@@ -13758,7 +13813,8 @@ prune_artifact_pass() {
         for i in "${todo[@]}"; do
           held=0
           for j in "${kept_list[@]}"; do
-            if [[ "${m_path[$j]}" == "${m_path[$i]%/}"/* ||
+            if [[ "${m_path[$i]}" == "${m_path[$j]}" ||
+                  "${m_path[$j]}" == "${m_path[$i]%/}"/* ||
                   "${m_path[$i]}" == "${m_path[$j]%/}"/* ]]; then
               held=1; break
             fi

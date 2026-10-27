@@ -196,6 +196,20 @@ os.utime(root, (stamp, stamp))
 PY
 }
 
+bounded() { # SECONDS CMD... — run CMD in its own process group; rc 124 and the
+  # group killed if it outlives SECONDS (only processes this call started)
+  python3 - "$@" <<'PY'
+import os, signal, subprocess, sys
+proc = subprocess.Popen(sys.argv[2:], start_new_session=True)
+try:
+    sys.exit(proc.wait(timeout=float(sys.argv[1])))
+except subprocess.TimeoutExpired:
+    os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait()
+    sys.exit(124)
+PY
+}
+
 LOCK_PID=""
 hold_lock() { # LOCK_PATH READY_FILE — flock-hold LOCK_PATH until test end
   python3 - "$1" "$2" <<'PY' &
@@ -1186,6 +1200,145 @@ grep -q "cache-folder .*action=refused reason=holds-never-touch" <<<"$OUT" ||
 echo "PASS ap13 refused-descendant-holds-dir"
 
 # ════════════════════════════════════════════════════════════════════════
+# AP14 — hk 2152 round 2 B2: the same entry has several names. glob returns a
+# . component at different depths (**/./*), and a symlinked directory inside the
+# job dir gives every file under it a second name. The pass compares paths as
+# strings, so the scan names each candidate by its physical seat, once.
+# ════════════════════════════════════════════════════════════════════════
+echo "== AP14: one entry, one name =="
+
+link_mtime() { # LINK DAYS — the link itself (not its target), DAYS days ago
+  python3 - "$1" "$(ago $(( $2 * 86400 )))" <<'PY'
+import datetime, os, sys
+stamp = datetime.datetime.fromisoformat(
+    sys.argv[2].replace("Z", "+00:00")).timestamp()
+os.utime(sys.argv[1], (stamp, stamp), follow_symlinks=False)
+PY
+}
+
+# AP14a — **/./*: the kept file sits at .../deeper/./new.bin while the directory
+# that holds it is named .../inner/./deeper; the raw strings share no prefix.
+reset_case ap14a
+hk_task 1 claimed
+mk_live_job ap14a 1 w:p9
+mkdir -p "$INBOX/ap14a/z-new/inner/deeper"
+printf 'new\n' >"$INBOX/ap14a/z-new/inner/deeper/new.bin"
+printf 'old\n' >"$INBOX/ap14a/z-new/inner/deeper/old.bin"
+set_tree_mtime "$INBOX/ap14a/z-new" 10
+touch_mtime "$INBOX/ap14a/z-new/inner/deeper/new.bin" "$(ago 86400)"
+policy_min <<'JSON'
+[{"class": "intermediate-build", "root": "jobs", "glob": "**/./*",
+  "keep_newest": 1}]
+JSON
+OUT="$(prune_run --apply)"
+[[ -f "$INBOX/ap14a/z-new/inner/deeper/new.bin" ]] ||
+  fail "AP14a: the kept file must survive a **/./* glob: $OUT"
+[[ -d "$INBOX/ap14a/z-new/inner/deeper" ]] ||
+  fail "AP14a: the directory holding the kept file must survive: $OUT"
+! grep -q "/\./" <<<"$(grep 'action=\(removed\|skipped\)' <<<"$OUT")" ||
+  fail "AP14a: a candidate must be named by its physical seat, no . component: $OUT"
+
+# AP14b — a symlink to a directory inside the job dir: the kept payload has two
+# names (a-alias/payload.bin sorts before z-real/payload.bin); dropping one
+# name must not unlink the kept file.
+reset_case ap14b
+hk_task 1 claimed
+mk_live_job ap14b 1 w:p9
+mk_artifact "$INBOX/ap14b/z-real"
+mk_artifact "$INBOX/ap14b/old-build"
+ln -s z-real "$INBOX/ap14b/a-alias"
+set_tree_mtime "$INBOX/ap14b/z-real" 1
+set_tree_mtime "$INBOX/ap14b/old-build" 10
+link_mtime "$INBOX/ap14b/a-alias" 10
+policy_min <<'JSON'
+[{"class": "intermediate-build", "root": "jobs", "glob": "**",
+  "keep_newest": 1}]
+JSON
+OUT="$(prune_run --apply)"
+[[ -f "$INBOX/ap14b/z-real/payload.bin" ]] ||
+  fail "AP14b: the kept payload must survive its symlink alias: $OUT"
+[[ ! -e "$INBOX/ap14b/old-build" ]] ||
+  fail "AP14b: the older build still goes: $OUT"
+[[ "$(grep -c 'payload.bin.*action=\(removed\|skipped\)' <<<"$OUT" || true)" -le 2 ]] ||
+  fail "AP14b: one physical file is one record, not one per name: $OUT"
+
+# AP14c — a refusal of any name refuses the entry: refs is a link to a cache
+# directory, so refs/payload.bin and cache/payload.bin are one file.
+reset_case ap14c
+hk_task 1 merged
+mk_ended_job ap14c 1 w:p9
+mk_artifact "$INBOX/ap14c/cache"
+ln -s cache "$INBOX/ap14c/refs"
+policy_min <<'JSON'
+[{"class": "cache", "root": "jobs", "glob": "**"}]
+JSON
+seq_gone
+OUT="$(prune_run --apply)"
+[[ -f "$INBOX/ap14c/cache/payload.bin" ]] ||
+  fail "AP14c: a file also reachable as refs/payload.bin is never-touch: $OUT"
+
+# AP14d — a glob like ghost/** yields "ghost/" although ghost does not exist;
+# that is no match, so it must not poison the row with an unreadable mtime.
+reset_case ap14d
+hk_task 1 claimed
+mk_live_job ap14d 1 w:p9
+mk_artifact "$INBOX/ap14d/build-1"; mk_artifact "$INBOX/ap14d/build-2"
+set_tree_mtime "$INBOX/ap14d/build-1" 10
+set_tree_mtime "$INBOX/ap14d/build-2" 1
+policy_min <<'JSON'
+[{"class": "intermediate-build", "root": "jobs", "glob": "ghost/**",
+  "keep_newest": 1},
+ {"class": "intermediate-build", "root": "jobs", "glob": "build-*",
+  "keep_newest": 1}]
+JSON
+OUT="$(prune_run --apply)"
+! grep -q "mtime-unreadable" <<<"$OUT" ||
+  fail "AP14d: a non-existent glob result must not count as a match: $OUT"
+[[ ! -e "$INBOX/ap14d/build-1" && -d "$INBOX/ap14d/build-2" ]] ||
+  fail "AP14d: the real row still prunes to the newest: $OUT"
+
+# AP14e — the record validator (the framing layer): normalized candidate paths
+# only. Run the function itself, extracted from the script under test.
+VALIDATOR="$TMP/record-ok.sh"
+awk '/^prune_artifact_record_ok\(\)/,/^}$/' "$WRK" >"$VALIDATOR"
+[[ -s "$VALIDATOR" ]] || fail "AP14e: prune_artifact_record_ok not found in $WRK"
+record_rc() { # KIND PATH MTIME BYTES — rc of the validator for jobdir /j
+  # shellcheck source=/dev/null # the function under test, extracted from $WRK
+  ( . "$VALIDATOR"; prune_artifact_record_ok /j "$1" "$2" "$3" "$4" ) >/dev/null 2>&1
+  echo $?
+}
+[[ "$(record_rc real /j/a/b 123 5)" == 0 && "$(record_rc link /j/x 123 5)" == 0 &&
+   "$(record_rc guarded /j/./events - 0)" == 0 ]] ||
+  fail "AP14e: well-formed records must pass (a refused record keeps its matched name)"
+for bad in "real /j/../x 1 1" "real /j/a/./b 1 1" "real /j//a 1 1" \
+           "real /j/a/. 1 1" "real /j/a/.. 1 1" "real /j-sibling/x 1 1" \
+           "real report.md 1 1" "real /j/a abc 1" "real /j/a 1 x" \
+           "link /j/a/./b 1 1" "weird /j/a 1 1" "real /j/a - -1"; do
+  # shellcheck disable=SC2086 # the case word is split into the four fields
+  [[ "$(record_rc $bad)" == 1 ]] || fail "AP14e: record must be rejected: $bad"
+done
+echo "PASS ap14 one-entry-one-name"
+
+# ════════════════════════════════════════════════════════════════════════
+# AP15 — hk 2152 round 2: ** follows a symlink to a directory, so two links that
+# point at each other (or at their parent) make the match list effectively
+# endless. The scan takes a bounded number of matches and fails closed.
+# ════════════════════════════════════════════════════════════════════════
+echo "== AP15: a symlink cycle under ** cannot hang the scan =="
+reset_case ap15
+mkdir -p "$INBOX/ap15/d1" "$INBOX/ap15/d2"
+ln -s .. "$INBOX/ap15/d1/up"; ln -s ../d2 "$INBOX/ap15/d1/d2"
+ln -s .. "$INBOX/ap15/d2/up"; ln -s ../d1 "$INBOX/ap15/d2/d1"
+SCANNER="$TMP/scan-fn.sh"
+{ grep '^PRUNE_NEVER_TOUCH=' "$WRK"; awk '/^prune_artifact_scan\(\)/,/^}$/' "$WRK"; } >"$SCANNER"
+[[ -s "$SCANNER" ]] || fail "AP15: prune_artifact_scan not found in $WRK"
+rc=0
+bounded 120 bash -c '. "$1"; prune_artifact_scan "$2" "$3"' _ "$SCANNER" "$INBOX/ap15" '**' >/dev/null 2>&1 || rc=$?
+[[ "$rc" == 1 ]] ||
+  fail "AP15: a symlink cycle under ** must fail the scan closed, not hang (rc=$rc)"
+echo "PASS ap15 bounded-scan"
+
+# ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants, each applied at its real call site.
 # ════════════════════════════════════════════════════════════════════════
 echo "== MUT: assertion-RED mutants per brief =="
@@ -1438,6 +1591,69 @@ JSON
     assertion_red "a dir holding a link to report.md must not be removed"
 }
 
+# Mutant 14 — hk 2152 round 2: the record validator accepts a . or .. component.
+case_mut_record() {
+  local validator="$TMP/mut-record-ok.sh"
+  awk '/^prune_artifact_record_ok\(\)/,/^}$/' "$WRK" >"$validator" || return 3
+  [[ -s "$validator" ]] || return 3
+  local rc=0
+  # shellcheck source=/dev/null # the function under test, extracted from the mutant
+  ( . "$validator"; prune_artifact_record_ok /j real /j/a/./b 1 1 ) >/dev/null 2>&1 || rc=$?
+  (( rc == 1 )) || assertion_red "the validator must reject a . component in a candidate path"
+}
+# Mutant 15 — hk 2152 round 2: a candidate keeps the glob's spelling of its path
+# instead of its physical seat.
+case_mut_dot() {
+  reset_case mutdt || return 3
+  hk_task 1 claimed || return 3
+  mk_live_job mutdt 1 w:p9 || return 3
+  mkdir -p "$INBOX/mutdt/z-new/inner/deeper" || return 3
+  printf 'new\n' >"$INBOX/mutdt/z-new/inner/deeper/new.bin" || return 3
+  printf 'old\n' >"$INBOX/mutdt/z-new/inner/deeper/old.bin" || return 3
+  set_tree_mtime "$INBOX/mutdt/z-new" 10 || return 3
+  touch_mtime "$INBOX/mutdt/z-new/inner/deeper/new.bin" "$(ago 86400)" || return 3
+  policy_min <<'JSON' || return 3
+[{"class": "intermediate-build", "root": "jobs", "glob": "**/./*",
+  "keep_newest": 1}]
+JSON
+  prune_run --apply >/dev/null 2>&1 || true
+  [[ -f "$INBOX/mutdt/z-new/inner/deeper/new.bin" ]] ||
+    assertion_red "the kept file must survive a **/./* glob"
+}
+# Mutant 16 — hk 2152 round 2: one entry is not collapsed to one record, and a
+# dropped path equal to a kept path is not held. Both layers go.
+case_mut_alias() {
+  reset_case mutal || return 3
+  hk_task 1 claimed || return 3
+  mk_live_job mutal 1 w:p9 || return 3
+  mk_artifact "$INBOX/mutal/z-real" || return 3
+  mk_artifact "$INBOX/mutal/old-build" || return 3
+  ln -s z-real "$INBOX/mutal/a-alias" || return 3
+  set_tree_mtime "$INBOX/mutal/z-real" 1 || return 3
+  set_tree_mtime "$INBOX/mutal/old-build" 10 || return 3
+  link_mtime "$INBOX/mutal/a-alias" 10 || return 3
+  policy_min <<'JSON' || return 3
+[{"class": "intermediate-build", "root": "jobs", "glob": "**",
+  "keep_newest": 1}]
+JSON
+  prune_run --apply >/dev/null 2>&1 || true
+  [[ -f "$INBOX/mutal/z-real/payload.bin" ]] ||
+    assertion_red "the kept payload must survive its symlink alias"
+}
+
+# Mutant 17 — hk 2152 round 2: the scan does not fail closed on an endless match list.
+case_mut_cap() {
+  reset_case mutcp || return 3
+  mkdir -p "$INBOX/mutcp/d1" "$INBOX/mutcp/d2" || return 3
+  ln -s .. "$INBOX/mutcp/d1/up" || return 3; ln -s ../d2 "$INBOX/mutcp/d1/d2" || return 3
+  ln -s .. "$INBOX/mutcp/d2/up" || return 3; ln -s ../d1 "$INBOX/mutcp/d2/d1" || return 3
+  local scanner="$TMP/mut-scan-fn.sh" rc=0
+  { grep '^PRUNE_NEVER_TOUCH=' "$WRK"; awk '/^prune_artifact_scan\(\)/,/^}$/' "$WRK"; } >"$scanner" || return 3
+  [[ -s "$scanner" ]] || return 3
+  bounded 120 bash -c '. "$1"; prune_artifact_scan "$2" "$3"' _ "$scanner" "$INBOX/mutcp" '**' >/dev/null 2>&1 || rc=$?
+  (( rc == 1 )) || assertion_red "a symlink cycle under ** must fail the scan closed"
+}
+
 # M1 — keep_newest ignored: every sorted index is dropped, so the newest
 # builds are deleted too. Call site: the drop-list builder.
 mkmut keep 's/k > keep/k > 0/'
@@ -1488,7 +1704,7 @@ mkmut unsafe 's/if any(ord(ch) < 32 or ord(ch) == 127 for ch in match):/if False
 expect_mut_red "unsafe-name-trusted" case_mut_unsafe "must not forge a record"
 
 # M11 — ancestors of a refused match are no longer held.
-mkmut held 's/if kind == "real" and os.path.normpath(match) in held:/if False:/'
+mkmut held 's/if kind == "real" and seat in held:/if False:/'
 expect_mut_red "refused-descendant-ancestor-removed" case_mut_held "refused link match must not be removed"
 
 # M12 — the nested-with-kept-match filter is dropped from the removal plan.
@@ -1498,5 +1714,22 @@ expect_mut_red "dropped-dir-takes-kept-match" case_mut_nest "must not take the k
 # M13 — the subtree walk stops resolving links that point at the set.
 mkmut linkwalk 's/if parts is not None and hits(parts):/if False:/'
 expect_mut_red "link-to-never-touch-ignored" case_mut_linkwalk "link to report.md must not be removed"
+
+# M14 — the validator's normalized-path check is removed.
+mkmut record 's#\*/\./\*|\*/\.\./\*|\*//\*|\*/\.|\*/\.\.) return 1 ;;#__never__) return 1 ;;#'
+expect_mut_red "validator-accepts-dot-component" case_mut_record "reject a . component"
+
+# M15 — a candidate is named by the glob's spelling, not its physical seat. The
+# pass's validator rejects a . component on its own, so both layers go.
+mkmut dot 's/        path = named(seat)/        path = match/' 's#\*/\./\*|\*/\.\./\*|\*//\*|\*/\.|\*/\.\.) return 1 ;;#__never__) return 1 ;;#'
+expect_mut_red "candidate-keeps-glob-spelling" case_mut_dot "kept file must survive a **/./* glob"
+
+# M16 — one entry stays several records and an equal path is not held.
+mkmut alias 's/    elif seat in emitted or (kind in ("real", "link") and seat in refused_seats):/    elif False:/' 's/"${m_path\[$i\]}" == "${m_path\[$j\]}" ||/-z x ||/'
+expect_mut_red "entry-not-collapsed-to-one-record" case_mut_alias "kept payload must survive its symlink alias"
+
+# M17 — the match cap does not fail the scan closed.
+mkmut cap 's/if len(raw) > MAX_MATCHES:/if False:/'
+expect_mut_red "endless-match-list-not-refused" case_mut_cap "symlink cycle under ** must fail the scan closed"
 
 echo "ALL ARTIFACT-PRUNE CONTRACT TESTS PASSED"
