@@ -341,6 +341,47 @@ class HeavyQueue(unittest.TestCase):
         result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
         self.assertEqual(result.returncode, 75, "command text forged a fixed-head identity")
 
+    def test_legacy_command_tokens_cannot_forge_head_fields(self):
+        records = [
+            "pid=4242 class=lane limit=1 cmd=echo pid=1",
+            "pid=4242 class=lane limit=1 cmd=echo start=forged",
+            "pid=4242 class=lane limit=1 cmd=echo class=ci",
+            "pid=4242 class=lane limit=1 cmd=echo limit=2",
+            "pid=4242 since=x job=- cmd=echo pid=1",
+        ]
+        anchor = "args = sys.argv[1:]\n"
+        injection = (
+            f"records = {records!r}\n"
+            "print(json.dumps([record_head(text) for text in records]))\n"
+            "raise SystemExit(0)\n" + anchor)
+        binary = self.instrument("record-head-probe-wrk", anchor, injection)
+        result = subprocess.run([str(binary), "heavy"], env=self.env,
+                                capture_output=True, text=True, timeout=5, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        observed = [tuple(row) for row in json.loads(result.stdout)]
+        expected = [
+            (4242, None, "lane", 1),
+            (4242, None, "lane", 1),
+            (4242, None, "lane", 1),
+            (4242, None, "lane", 1),
+            (4242, None, "lane", None),
+        ]
+        self.assertEqual(observed, expected,
+                         "legacy command text forged a fixed head value")
+
+    def test_legacy_command_start_cannot_retire_a_live_waiter(self):
+        pid = os.getpid()
+        record = self.waiters / str(pid)
+        record.write_text(
+            f"pid={pid} since=x job=- cmd=echo start=forged")
+        status = self.run_wrk("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertTrue(record.exists(), "legacy command start retired a live waiter")
+        rows = [json.loads(line) for line in (self.base / "heavy.log").read_text().splitlines()]
+        retired = [row for row in rows if row.get("kind") == "waiter_retired"
+                   and row.get("record") == str(pid)]
+        self.assertEqual(retired, [], "legacy command start was logged as owner death")
+
     def test_wait_signals_remove_own_record_and_exit_with_signal_status(self):
         for sig, expected in ((signal.SIGHUP, 129), (signal.SIGTERM, 143)):
             with self.subTest(signal=sig):
@@ -826,6 +867,26 @@ class HeavyQueue(unittest.TestCase):
                                 '    if first is None:\n        log_owner_identity_unknown(pid, record, "start-read-unknown")\n        return False, "dead"\n')],
              "test_unknown_start_identity_keeps_record_and_logs_once",
              "unknown owner identity stopped reserving"),
+            ("legacy-headscan", [
+                ('    if fixed_head and len(toks) > 4 and toks[4].startswith("start="):\n'
+                 '        start = toks[4][6:]\n',
+                 '    for tok in toks:\n'
+                 '        if tok.startswith("pid="):\n'
+                 '            try:\n'
+                 '                pid = int(tok[4:])\n'
+                 '            except ValueError:\n'
+                 '                pass\n'
+                 '        elif tok.startswith("start="):\n'
+                 '            start = tok[6:]\n'
+                 '        elif tok.startswith("class=") and tok[6:] in ("ci", "lane"):\n'
+                 '            cls = tok[6:]\n'
+                 '        elif tok.startswith("limit="):\n'
+                 '            try:\n'
+                 '                lim = int(tok[6:])\n'
+                 '            except ValueError:\n'
+                 '                pass\n'),
+            ], "test_legacy_command_start_cannot_retire_a_live_waiter",
+             "legacy command start retired a live waiter"),
             ("no-lane-bound", [('if lane_defer_total + (now - lane_defer_mark) >= lane_defer_max:\n',
                                 'if False:\n')],
              "test_lane_defer_guard_is_monotonic_and_never_preempts_holder",

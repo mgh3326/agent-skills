@@ -13001,21 +13001,35 @@ def record_head(text):
     # readable by an older wrk. Free-text cmd fields cannot forge head values.
     pid, start, cls, lim = -1, None, "lane", None
     toks = text.split(None, 5)[:5]
-    for tok in toks:
-        if tok.startswith("pid="):
-            try:
-                pid = int(tok[4:])
-            except ValueError:
-                pass
-        elif tok.startswith("start="):
-            start = tok[6:]
-        elif tok.startswith("class=") and tok[6:] in ("ci", "lane"):
-            cls = tok[6:]
-        elif tok.startswith("limit="):
-            try:
-                lim = int(tok[6:])
-            except ValueError:
-                pass
+    pid_ok = bool(toks and toks[0].startswith("pid="))
+    if pid_ok:
+        try:
+            pid = int(toks[0][4:])
+        except ValueError:
+            pid_ok = False
+
+    class_ok = (len(toks) > 1 and toks[1] in ("class=ci", "class=lane"))
+    if class_ok:
+        cls = toks[1][6:]
+
+    limit_ok = False
+    if len(toks) > 2 and toks[2].startswith("limit="):
+        try:
+            lim = int(toks[2][6:])
+            limit_ok = True
+        except ValueError:
+            pass
+
+    # Token five belongs to the new fixed head only when token four is a
+    # valid ticket. Older records have free-text after their earlier fields.
+    ticket_ok = False
+    if len(toks) > 3:
+        match = re.fullmatch(r"ticket=([0-9]{1,20}):([0-9]{1,20})", toks[3])
+        if match:
+            ticket_ok = all(int(value) > 0 for value in match.groups())
+    fixed_head = pid_ok and class_ok and limit_ok and ticket_ok
+    if fixed_head and len(toks) > 4 and toks[4].startswith("start="):
+        start = toks[4][6:]
     return pid, start, cls, lim
 
 
