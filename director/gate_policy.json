@@ -2299,7 +2299,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-27.1",
+  "revision": "2026-10-27.2",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
