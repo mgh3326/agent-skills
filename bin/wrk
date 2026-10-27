@@ -15551,7 +15551,7 @@ artifacts_move_cmd() {
 # the DriveFS freshness guard), evict the Drive-folder copies, and record
 # the dataset in hk as a fleet.artifact.v2 doc. Never deletes a source
 # original: local deletion is the host sweep's job (hk 2094).
-import fnmatch, glob, hashlib, json, os, re, shutil, subprocess, sys, time
+import fnmatch, glob, hashlib, json, os, re, shutil, subprocess, sys, time, uuid
 
 PROG = "wrk artifacts move"
 
@@ -15711,7 +15711,10 @@ SCRATCH_DIR = os.path.expanduser(hosts_value("artifacts", "scratch_dir") or os.p
 FREE_FLOOR = int(art_num("free_floor_bytes", 20 * 1024 ** 3))
 ALERT_LANE = hosts_value("artifacts", "alert_lane") or "director-1"
 
-src = os.path.abspath(os.path.expanduser(src))
+if source_host is None:
+    src = os.path.abspath(os.path.expanduser(src))
+elif not os.path.isabs(src):
+    die("--source-host requires an absolute remote source path: %s" % src)
 drive_folder = os.path.abspath(os.path.expanduser(drive_folder))
 dest = os.path.abspath(os.path.expanduser(dest))
 if source_host is None and not os.path.isdir(src):
@@ -15749,19 +15752,23 @@ REMOTE_INVENTORY = r'''
 import fnmatch, hashlib, json, os, sys
 src, excl = sys.argv[1], json.loads(sys.argv[2])
 def excluded(n): return any(fnmatch.fnmatch(n, p) for p in excl)
+def walk_error(error): raise error
+if not os.path.isdir(src): raise SystemExit("remote source is missing or not a directory: %s" % src)
+mode = os.stat(src).st_mode
+if not os.access(src, os.R_OK | os.X_OK) or not mode & 0o444 or not mode & 0o111:
+    raise SystemExit("remote source is unreadable: %s" % src)
 def sha_of(p):
     h = hashlib.sha256()
     with open(p, "rb") as f:
         for b in iter(lambda: f.read(8 << 20), b""): h.update(b)
     return h.hexdigest()
-for root, dirs, fs in os.walk(src):
+for root, dirs, fs in os.walk(src, onerror=walk_error):
     dirs[:] = sorted(d for d in dirs if not excluded(d) and not os.path.islink(os.path.join(root, d)))
     for f in sorted(fs):
         if excluded(f): continue
         p = os.path.join(root, f)
         if os.path.islink(p) or not os.path.isfile(p): continue
-        try: print("%s\t%d\t%s" % (os.path.relpath(p, src), os.path.getsize(p), sha_of(p)), flush=True)
-        except OSError: pass
+        print("%s\t%d\t%s" % (os.path.relpath(p, src), os.path.getsize(p), sha_of(p)), flush=True)
 '''
 
 def inventory():
@@ -15793,7 +15800,13 @@ def inventory():
     for line in r.stdout.splitlines():
         parts = line.rsplit("\t", 2)
         if len(parts) == 3:
-            out.append((parts[0], int(parts[1]), parts[2]))
+            try:
+                size = int(parts[1])
+            except ValueError:
+                die("remote inventory returned a malformed row")
+            if not re.fullmatch(r"[0-9a-f]{64}", parts[2]):
+                die("remote inventory returned a malformed sha256")
+            out.append((parts[0], size, parts[2]))
     return out
 
 def fpbulk(mode, paths):
@@ -15898,8 +15911,8 @@ def emit_timeout_alert(bno, states, evidence):
     text = ("artifacts.confirm_timeout dataset=%s host=%s batch=%d pending=%d first=%s app_running=%s log_age_s=%d"
             % (name, dest_host, bno, len(pend), pend[0] if pend else "-",
                evidence.get("app_running"), evidence.get("log_age_s")))
-    eid = "artifact-confirm-timeout-%s-%s-%d" % (
-        dest_host, re.sub(r"[^A-Za-z0-9_.-]+", "-", name), bno)
+    eid = "artifact-confirm-timeout-%s-%s-%s-%d" % (
+        dest_host, re.sub(r"[^A-Za-z0-9_.-]+", "-", name), run_id, bno)
     inbox_root = os.path.dirname(os.path.expanduser(
         os.environ.get("ARBITER_INBOX_ROOT") or "~/work/herdr-inbox/jobs"))
     cmd = [os.environ.get("PANEWIRE_BIN", "panewire"), "emit", "--kind", "lane.event",
@@ -15913,6 +15926,9 @@ def emit_timeout_alert(bno, states, evidence):
         return False
 
 inv = inventory()
+if not inv:
+    die("source inventory is empty; refusing to write an empty manifest or done record")
+run_id = uuid.uuid4().hex
 
 def save_json(path, obj):
     tmp = path + ".tmp"
@@ -15980,15 +15996,20 @@ def hk_record_put():
     try:
         r = subprocess.run([hk, "doc", "put", "--key", "artifacts/%s/%s" % (dest_host, name),
                             "--kind", "artifact", "--file", tmp],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True,
+                           timeout=float(os.environ.get("WRK_ARTIFACTS_HK_TIMEOUT_S", "30")))
+    except subprocess.TimeoutExpired:
+        die("hk record write timed out")
+    except OSError as e:
+        die("hk record write failed: %s" % (e.strerror or e.__class__.__name__))
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
     if r.returncode != 0:
-        problems.append("hk record write failed: %s" % r.stderr.strip()[:200])
-        print("%s: hk record write failed: %s" % (PROG, r.stderr.strip()[:200]), file=sys.stderr)
+        detail = " ".join((r.stderr or "").split())[:200]
+        die("hk record write failed (rc=%d)%s" % (r.returncode, ": " + detail if detail else ""))
 
 problems = []
 skipped_confirmed = 0
@@ -16144,9 +16165,10 @@ while i < len(inv):
     paths = [e["dpath"] for e in moved]
     result, states, evidence = confirm_batch(paths)
     if result == "timeout":
-        if str(bno) not in (alerts.get("timeouts") or {}):
+        alert_key = "%s:%d" % (run_id, bno)
+        if alert_key not in (alerts.get("timeouts") or {}):
             if emit_timeout_alert(bno, states, evidence):
-                alerts.setdefault("timeouts", {})[str(bno)] = iso(now())
+                alerts.setdefault("timeouts", {})[alert_key] = iso(now())
                 save_json(alerts_path, alerts)
         pend = sorted(p for p, (s, _) in states.items() if s != "confirmed")
         say("TIMEOUT batch%d pending=%d first=%s — stop, no evict" % (bno, len(pend), pend[:1]))

@@ -111,6 +111,13 @@ D = os.environ["HK_STUB_DIR"]
 argv = sys.argv[1:]
 with open(os.path.join(D, "argv.log"), "a") as f:
     f.write("\0".join(argv) + "\n")
+mode = os.environ.get("HK_STUB_MODE", "ok")
+if mode == "fail":
+    print("stub failure\nsecond line", file=sys.stderr)
+    sys.exit(7)
+if mode == "sleep":
+    import time
+    time.sleep(5)
 if len(argv) >= 2 and argv[0] == "doc" and argv[1] in ("put", "get"):
     opts = {}
     i = 2
@@ -285,6 +292,7 @@ run_move() {
       WRK_SSH_BIN="$SSH" SSH_LOG="$SSH_LOG" SSH_DIR="$SSH_DIR" \
       WRK_RSYNC_BIN="$RSYNC" RSYNC_LOG="$RSYNC_LOG" \
       FPBULK_DIR="$FPBULK_DIR" HK_STUB_DIR="$HK_DIR" \
+      HK_STUB_MODE="${HK_STUB_MODE:-ok}" WRK_ARTIFACTS_HK_TIMEOUT_S="${WRK_ARTIFACTS_HK_TIMEOUT_S:-30}" \
       WRK_ARTIFACTS_FREE_BYTES="$free" \
       "$WRK" artifacts move "$@" >"$OUT" 2>"$ERR"
   else
@@ -293,6 +301,7 @@ run_move() {
       WRK_SSH_BIN="$SSH" SSH_LOG="$SSH_LOG" SSH_DIR="$SSH_DIR" \
       WRK_RSYNC_BIN="$RSYNC" RSYNC_LOG="$RSYNC_LOG" \
       FPBULK_DIR="$FPBULK_DIR" HK_STUB_DIR="$HK_DIR" \
+      HK_STUB_MODE="${HK_STUB_MODE:-ok}" WRK_ARTIFACTS_HK_TIMEOUT_S="${WRK_ARTIFACTS_HK_TIMEOUT_S:-30}" \
       "$WRK" artifacts move "$@" >"$OUT" 2>"$ERR"
   fi
   MOVE_RC=$?
@@ -476,7 +485,7 @@ PY
 case_full full || fail "full-path case"
 echo "PASS full path two+ batches"
 
-# stuck batch: alert once, no evict, run stops, rerun stays silent.
+# stuck batch: alert once per run identity, no evict, both runs stop.
 case_stuck() {
   reset_case "$1"
   write_hosts_toml 1000000 50
@@ -493,10 +502,86 @@ case_stuck() {
   assert_no_file "$DRIVE/mbp/ds.manifest.tsv" || return 1
   run_move "$SRC" --dest "$DEST" --apply
   [[ "$MOVE_RC" -eq 3 ]] || return 1
-  [[ "$(emit_count)" -eq 1 ]] || return 1
+  [[ "$(emit_count)" -eq 2 ]] || return 1
+  python3 - "$PANEWIRE_LOG" <<'PY' || return 1
+import sys
+args = open(sys.argv[1], "rb").read().split(b"\0")
+ids = [args[i + 1].decode() for i, value in enumerate(args[:-1]) if value == b"--event-id"]
+assert len(ids) == 2 and len(set(ids)) == 2, ids
+PY
 }
 case_stuck stuck || fail "stuck case"
 echo "PASS stuck batch"
+
+# A remote source path stays remote: it must be absolute and must exist and
+# be readable on the source host before it can produce an inventory.
+case_remote_path_guard() {
+  reset_case "$1"
+  cat >>"$WRK_HOSTS_CONFIG" <<EOF
+
+[hosts.fh]
+ssh = "fakessh"
+EOF
+  DEST="$DRIVE/mbp/remote-ds"
+  run_move relative/tree --dest "$DEST" --source-host fh --apply
+  [[ "$MOVE_RC" -eq 2 && ! -s "$SSH_LOG" ]] || return 1
+  grep -q 'absolute remote source path' "$ERR" || return 1
+  mkdir -p "$TMP/$CASE/rsrc"
+  run_move "$TMP/$CASE/missing" --dest "$DEST" --source-host fh --apply
+  [[ "$MOVE_RC" -eq 2 ]] || return 1
+  grep -q 'missing or not a directory' "$ERR" || return 1
+  [[ ! -e "$DEST/remote-ds.manifest.tsv" && ! -s "$HK_DIR/argv.log" ]] || return 1
+  run_move "$TMP/$CASE/rsrc" --dest "$DEST" --source-host fh --apply
+  [[ "$MOVE_RC" -eq 2 ]] || return 1
+  grep -q 'inventory is empty' "$ERR" || return 1
+  [[ ! -e "$DEST/remote-ds.manifest.tsv" && ! -s "$HK_DIR/argv.log" ]] || return 1
+  chmod 000 "$TMP/$CASE/rsrc"
+  run_move "$TMP/$CASE/rsrc" --dest "$DEST" --source-host fh --apply
+  chmod 700 "$TMP/$CASE/rsrc"
+  [[ "$MOVE_RC" -eq 2 ]] || return 1
+  grep -q 'remote source is unreadable' "$ERR" || return 1
+}
+case_remote_path_guard remote-guards || fail "remote path guard"
+echo "PASS remote path, existence and readability guards"
+
+# Empty sources are refused before they can write a manifest or an hk done record.
+reset_case empty
+DEST="$DRIVE/mbp/empty"
+run_move "$SRC" --dest "$DEST" --apply
+[[ "$MOVE_RC" -eq 2 ]] || fail "empty: expected rc 2, got $MOVE_RC"
+grep -q 'inventory is empty' "$ERR" || fail "empty: refusal should name the empty inventory"
+assert_no_file "$DRIVE/mbp/empty.manifest.tsv"
+[[ ! -s "$HK_DIR/argv.log" ]] || fail "empty: handoffkeep must not record an empty dataset"
+echo "PASS empty inventory refused"
+
+# handoffkeep subprocess failures are a single clean error line with nonzero status.
+case_hk_failure() {
+  local mode="$1"
+  reset_case "hk-$mode"
+  mk_src a.txt alpha
+  DEST="$DRIVE/mbp/ds"
+  fp_spec a.txt 11
+  if [[ "$mode" == "missing" ]]; then
+    HK="$TMP/$CASE/missing-handoffkeep"
+  else
+    HK_STUB_MODE="$mode"
+    [[ "$mode" == "sleep" ]] && WRK_ARTIFACTS_HK_TIMEOUT_S=0.05
+  fi
+  run_move "$SRC" --dest "$DEST" --apply
+  [[ "$MOVE_RC" -eq 2 ]] || return 1
+  [[ "$(wc -l <"$ERR" | tr -d ' ')" -eq 1 ]] || return 1
+  ! grep -q 'Traceback' "$ERR" || return 1
+  case "$mode" in
+    fail) grep -q 'hk record write failed (rc=7): stub failure second line' "$ERR" || return 1 ;;
+    missing) grep -q 'hk record write failed: ' "$ERR" || return 1 ;;
+    sleep) grep -q 'hk record write timed out' "$ERR" || return 1 ;;
+  esac
+  unset HK_STUB_MODE WRK_ARTIFACTS_HK_TIMEOUT_S
+}
+case_hk_failure fail || fail "handoffkeep nonzero failure"
+case_hk_failure missing || fail "handoffkeep missing binary"
+case_hk_failure sleep || fail "handoffkeep timeout"
+echo "PASS handoffkeep failures are clean and nonzero"
 
 # stale DriveFS log -> unknown, never confirmed, never evicted.
 case_stale() {
@@ -843,6 +928,14 @@ expect_mut_red() { # DESC CASE_FN CASE_NAME
   WRK="$saved"
   echo "PASS mut $desc is assertion-RED"
 }
+
+# Absolutizing SRC_TREE on the local host or accepting a missing remote root
+# must make the new remote guard case go RED at the real call site.
+mkmut remote-local-abspath 's/if source_host is None:/if True:/'
+expect_mut_red "remote source is absolutized locally" case_remote_path_guard mut-remote-local-abspath
+
+mkmut remote-missing-root 's/if not os.path.isdir(src): raise SystemExit/if not True: raise SystemExit/'
+expect_mut_red "remote missing directory accepted" case_remote_path_guard mut-remote-missing-root
 
 # evict without requiring every file confirmed -> stuck case goes RED.
 mkmut evict-unconfirmed 's/all(s == "confirmed" for s, _ in states.values())/True/'
