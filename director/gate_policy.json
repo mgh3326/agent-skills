@@ -155,7 +155,7 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "22c09aae80da892cd851a1ee1019c7193fbcabb433550b729906e08e465ccd6a",
+    ".github/workflows/ci.yml": "3a7e9bcc9cfadf16ed00ee8e5f1014ce4fe7965691bae78961a6f5b9f6aa8159",
     "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
     "bin/wrk": "dbf25e6f35adb2f3261f1eb045379779417ffe1e99f376de6e6c2aac5066a876",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
@@ -2299,7 +2299,7 @@
       "macos-latest"
     ]
   },
-  "revision": "2026-10-27.3",
+  "revision": "2026-10-27.4",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
