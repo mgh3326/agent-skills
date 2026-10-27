@@ -4,9 +4,13 @@ set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
 export WRK_TEST_MODE=1
+export WRK_TEST_REAL_SENTINEL=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
+WRK_COPY="$TMP/wrk"
+cp "$WRK_COPY" "$WRK_COPY"
+chmod +x "$WRK_COPY"
 # shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
 export TW_TMP="$TMP"
@@ -105,7 +109,7 @@ bash "$ROOT/tests/wrk_remote_task.sh"
 
 set +e
 isolation_guard_output="$(
-  (ARBITER_INBOX_ROOT=; run_wrk "$ROOT/bin/wrk") 2>&1
+  (ARBITER_INBOX_ROOT=; run_wrk "$WRK_COPY") 2>&1
 )"
 isolation_guard_rc=$?
 set -e
@@ -163,20 +167,20 @@ assert_no_hub_leak() {
 HUB_SSH_UNSET="$TMP/hub-ssh-unset.toml"
 sed '/^via =/d' "$HUB_CONFIG" >"$HUB_SSH_UNSET"
 : >"$TMP/hub.log"; : >"$TMP/ssh.log"; : >"$TMP/scp.log"
-ssh_unset_out="$(run_hub "$ROOT/bin/wrk" "$HUB_SSH_UNSET" 2>&1)"
+ssh_unset_out="$(run_hub "$WRK_COPY" "$HUB_SSH_UNSET" 2>&1)"
 grep -q '^OK pane=.* host=machine-a ' <<<"$ssh_unset_out"
 [[ -s "$TMP/ssh.log" && -s "$TMP/scp.log" && ! -s "$TMP/hub.log" ]]
 
 HUB_SSH_EXPLICIT="$TMP/hub-ssh-explicit.toml"
 sed 's/^via = "hub"/via = "ssh"/' "$HUB_CONFIG" >"$HUB_SSH_EXPLICIT"
 : >"$TMP/hub.log"; : >"$TMP/ssh.log"; : >"$TMP/scp.log"
-ssh_explicit_out="$(run_hub "$ROOT/bin/wrk" "$HUB_SSH_EXPLICIT" 2>&1)"
+ssh_explicit_out="$(run_hub "$WRK_COPY" "$HUB_SSH_EXPLICIT" 2>&1)"
 grep -q '^OK pane=.* host=machine-a ' <<<"$ssh_explicit_out"
 [[ -s "$TMP/ssh.log" && -s "$TMP/scp.log" && ! -s "$TMP/hub.log" ]]
 
 # A 200 response provides pane and job in the normal remote OK-line shape.
 : >"$TMP/hub.log"; : >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/spillover.log"
-hub_200_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+hub_200_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$WRK_COPY" "$HUB_CONFIG" 2>&1)"
 grep -Eq '^OK pane=pane-a host=machine-a .* status=working landed=yes job=job-a$' <<<"$hub_200_out"
 grep -q '^OK pane=.* host=machine-a ' <<<"$ssh_explicit_out"
 [[ ! -s "$TMP/ssh.log" && ! -s "$TMP/scp.log" ]]
@@ -217,7 +221,7 @@ fi
 printf '%s\n' 'PASS wrk-spillover hub-argv-secret-free leak-detector-red'
 
 # Hub must preserve the remote OK-line's conservative landing result.
-hub_landed_no_out="$(WRK_HUB_SCENARIO=landed_no run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+hub_landed_no_out="$(WRK_HUB_SCENARIO=landed_no run_hub "$WRK_COPY" "$HUB_CONFIG" 2>&1)"
 grep -Eq '^OK pane=pane-a host=machine-a .* status=idle landed=no job=job-a$' <<<"$hub_landed_no_out"
 printf '%s\n' 'PASS wrk-spillover hub-stdout-tail-landing'
 
@@ -225,7 +229,7 @@ printf '%s\n' 'PASS wrk-spillover hub-stdout-tail-landing'
 # outcome — the transport carries no registration-confirmation channel, so
 # the emitted line ends lane=UNREGISTERED rather than omitting lane= (the
 # worker shape) or claiming a lane nobody confirmed.
-hub_builder_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+hub_builder_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$WRK_COPY" "$HUB_CONFIG" \
   -m builder-sol --role builder --lane b-hub --parent director-x --task "$HK_TASK_ID" 2>&1)"
 grep -Eq '^OK pane=pane-a host=machine-a .* status=working landed=yes job=job-a lane=UNREGISTERED$' <<<"$hub_builder_out" ||
   { echo 'FAIL wrk-spillover hub-builder-ok-line-lane-unregistered'; echo "$hub_builder_out"; exit 1; }
@@ -236,7 +240,7 @@ printf '%s\n' 'PASS wrk-spillover hub-builder-ok-line-lane-unregistered'
 # line, exactly like the local and ssh legs. A worker under strict stays
 # rc 0, and a non-strict builder keeps the rc-0 S4 contract above.
 set +e
-hub_strict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+hub_strict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$WRK_COPY" "$HUB_CONFIG" \
   -m builder-sol --role builder --lane b-strict --parent director-x --task "$HK_TASK_ID" 2>&1)"
 hub_strict_rc=$?
 set -e
@@ -246,21 +250,21 @@ grep -Eq '^OK pane=pane-a .* lane=UNREGISTERED$' <<<"$hub_strict_out" ||
   { echo 'FAIL wrk-spillover hub-builder-strict-ok-line'; echo "$hub_strict_out"; exit 1; }
 # The captain alias resolves to the same strict-82 contract.
 set +e
-hub_cap_strict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+hub_cap_strict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$WRK_COPY" "$HUB_CONFIG" \
   -m builder-sol --role captain --lane b-cstrict --parent director-x --task "$HK_TASK_ID" 2>&1)"
 hub_cap_strict_rc=$?
 set -e
 [[ "$hub_cap_strict_rc" -eq 82 && "$hub_cap_strict_out" == *'lane=UNREGISTERED'* ]] ||
   { echo 'FAIL wrk-spillover hub-captain-strict-rc82'; echo "$hub_cap_strict_out rc=$hub_cap_strict_rc"; exit 1; }
 # A worker under strict is untouched: rc 0, no lane= field at all.
-hub_wstrict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+hub_wstrict_out="$(WRK_LANE_STRICT=1 WRK_HUB_SCENARIO=hub200 run_hub "$WRK_COPY" "$HUB_CONFIG" 2>&1)"
 grep -Eq '^OK pane=pane-a .* job=job-a$' <<<"$hub_wstrict_out" ||
   { echo 'FAIL wrk-spillover hub-worker-strict-unchanged'; echo "$hub_wstrict_out"; exit 1; }
 printf '%s\n' 'PASS wrk-spillover hub-builder-strict-82'
 
 # A 504 pending reply polls once under WRK_NO_SLEEP and emits the same result.
 : >"$TMP/hub.log"
-hub_pending_out="$(WRK_HUB_SCENARIO=pending run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+hub_pending_out="$(WRK_HUB_SCENARIO=pending run_hub "$WRK_COPY" "$HUB_CONFIG" 2>&1)"
 grep -Eq '^OK pane=pane-a host=machine-a .* job=job-a$' <<<"$hub_pending_out"
 python3 - "$TMP/hub.log" <<'PY'
 import json, sys
@@ -273,7 +277,7 @@ PY
 # Lost and each documented HTTP error remain terminal, readable, and secret-free.
 : >"$TMP/hub.log"; : >"$TMP/herdr.log"
 set +e
-hub_lost_out="$(WRK_HUB_SCENARIO=lost run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+hub_lost_out="$(WRK_HUB_SCENARIO=lost run_hub "$WRK_COPY" "$HUB_CONFIG" 2>&1)"
 hub_lost_rc=$?
 set -e
 [[ "$hub_lost_rc" -ne 0 ]]
@@ -284,7 +288,7 @@ grep -q 'hub spawn lost' <<<"$hub_lost_out"
 for scenario in hub503 hub401 hub409 hub400; do
   : >"$TMP/hub.log"
   set +e
-  hub_error_out="$(WRK_HUB_SCENARIO="$scenario" run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+  hub_error_out="$(WRK_HUB_SCENARIO="$scenario" run_hub "$WRK_COPY" "$HUB_CONFIG" 2>&1)"
   hub_error_rc=$?
   set -e
   [[ "$hub_error_rc" -ne 0 ]]
@@ -304,7 +308,7 @@ for config_case in "$HUB_NO_CWD" "$TMP/hub-no-operator.toml"; do
   if [[ "$config_case" == *no-operator* ]]; then sed '/^operator_token_env =/d' "$HUB_CONFIG" >"$config_case"; fi
   : >"$TMP/hub.log"; : >"$TMP/herdr.log"
   set +e
-  hub_config_out="$(run_hub "$ROOT/bin/wrk" "$config_case" 2>&1)"
+  hub_config_out="$(run_hub "$WRK_COPY" "$config_case" 2>&1)"
   hub_config_rc=$?
   set -e
   [[ "$hub_config_rc" -ne 0 && ! -s "$TMP/hub.log" && ! -s "$TMP/herdr.log" ]]
@@ -314,7 +318,7 @@ done
 # Mutation checks: each altered boundary makes its matching assertion red while
 # the source file remains byte-for-byte unchanged after the temporary copies.
 HUB_ORIGINAL="$TMP/wrk-hub-original"
-cp "$ROOT/bin/wrk" "$HUB_ORIGINAL"
+cp "$WRK_COPY" "$HUB_ORIGINAL"
 
 mutation_must_change() {
   local name="$1" mutated="$2"
@@ -326,9 +330,9 @@ mutation_must_change() {
 
 source_must_stay_unchanged() {
   local name="$1"
-  if ! cmp -s "$ROOT/bin/wrk" "$HUB_ORIGINAL"; then
+  if ! cmp -s "$WRK_COPY" "$HUB_ORIGINAL"; then
     echo "${name} mutation changed bin/wrk source" >&2
-    diff -u "$HUB_ORIGINAL" "$ROOT/bin/wrk" >&2 || true
+    diff -u "$HUB_ORIGINAL" "$WRK_COPY" >&2 || true
     exit 1
   fi
 }
@@ -336,7 +340,7 @@ source_must_stay_unchanged() {
 # Positive control: the deployed binary itself must reject the forbidden flag.
 : >"$TMP/hub.log"
 set +e
-original_args_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" --job-dup-ok 2>&1)"
+original_args_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$WRK_COPY" "$HUB_CONFIG" --job-dup-ok 2>&1)"
 original_args_rc=$?
 set -e
 [[ "$original_args_rc" -eq 2 && ! -s "$TMP/hub.log" ]] || {
@@ -351,7 +355,7 @@ printf '%s\n' 'PASS wrk-spillover hub-args-baseline'
 # mangled pair never enters the /v1/spawn request args.
 : >"$TMP/hub.log"
 set +e
-hub_swallow_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" \
+hub_swallow_out="$(WRK_HUB_SCENARIO=hub200 run_hub "$WRK_COPY" "$HUB_CONFIG" \
   --operator-request --requested-by 2>&1)"
 hub_swallow_rc=$?
 set -e
@@ -371,7 +375,7 @@ printf '%s\n' 'PASS wrk-spillover hub-args-option-token-value'
 # `wrk spawn` reaching the ssh fixture).
 : >"$TMP/ssh.log"
 set +e
-ssh_swallow_out="$(run_wrk "$ROOT/bin/wrk" --host desktop -w --job swallowed 2>&1)"
+ssh_swallow_out="$(run_wrk "$WRK_COPY" --host desktop -w --job swallowed 2>&1)"
 ssh_swallow_rc=$?
 set -e
 [[ "$ssh_swallow_rc" -eq 2 ]] || {
@@ -389,7 +393,7 @@ grep -q 'requires a value' <<<"$ssh_swallow_out" || {
 printf '%s\n' 'PASS wrk-spillover ssh-args-option-token-value'
 
 MUT_ARGS="$TMP/wrk-hub-args"
-cp "$ROOT/bin/wrk" "$MUT_ARGS"
+cp "$WRK_COPY" "$MUT_ARGS"
 sed -i.bak 's/echo \"wrk: --job-dup-ok is not permitted for a hub spawn\" >&2; return 2/SPILL_HUB_ARGS+=(--job-dup-ok)/' "$MUT_ARGS" || true
 chmod +x "$MUT_ARGS"
 mutation_must_change M1 "$MUT_ARGS"
@@ -409,7 +413,7 @@ PY
 source_must_stay_unchanged M1
 
 MUT_AUTH="$TMP/wrk-hub-auth"
-cp "$ROOT/bin/wrk" "$MUT_AUTH"
+cp "$WRK_COPY" "$MUT_AUTH"
 sed -i.bak 's|--header "@$headers_file"|--header "Content-Type: application/json"|g' "$MUT_AUTH" || true
 chmod +x "$MUT_AUTH"
 mutation_must_change M2 "$MUT_AUTH"
@@ -427,7 +431,7 @@ PY
 source_must_stay_unchanged M2
 
 MUT_CWD="$TMP/wrk-hub-cwd"
-cp "$ROOT/bin/wrk" "$MUT_CWD"
+cp "$WRK_COPY" "$MUT_CWD"
 sed -i.bak '/has no cwd_keys entry/{n;s/return 2/spawn_cmd \"$@\"; return $?/;}' "$MUT_CWD" || true
 chmod +x "$MUT_CWD"
 mutation_must_change M3 "$MUT_CWD"
@@ -441,7 +445,7 @@ WRK_HUB_SCENARIO=hub200 run_hub "$MUT_CWD" "$HUB_NO_CWD" >/dev/null 2>&1 || true
 source_must_stay_unchanged M3
 
 MUT_PENDING="$TMP/wrk-hub-pending"
-cp "$ROOT/bin/wrk" "$MUT_PENDING"
+cp "$WRK_COPY" "$MUT_PENDING"
 sed -i.bak 's|spillover_hub_poll \"$base\".*|spillover_hub_emit_ok \"$host\" \"pending-pane\" \"pending-job\" \"unknown\" \"no\" \"${SPILL_HUB_ARGS[@]}\"|' "$MUT_PENDING" || true
 chmod +x "$MUT_PENDING"
 mutation_must_change M4 "$MUT_PENDING"
@@ -463,7 +467,7 @@ source_must_stay_unchanged M4
 # must turn the strict-82 assertion RED — the mutated copy then answers
 # rc 0 under WRK_LANE_STRICT=1 while still printing the OK line.
 MUT_HSTRICT="$TMP/wrk-hub-strict"
-cp "$ROOT/bin/wrk" "$MUT_HSTRICT"
+cp "$WRK_COPY" "$MUT_HSTRICT"
 sed -i.bak '/^spillover_hub_emit_ok() {/,/^}/s|    return "$WRK_EXIT_LANE_UNREGISTERED"|    :|' "$MUT_HSTRICT" || true
 chmod +x "$MUT_HSTRICT"
 mutation_must_change M5 "$MUT_HSTRICT"
@@ -480,7 +484,7 @@ source_must_stay_unchanged M5
 # task611: cwd_keys shares the prefix rule — a sibling-worktree cwd maps to
 # the derived key <key>.<suffix> instead of failing closed on an exact miss.
 : >"$TMP/hub.log"
-key_prefix_out="$(WRK_HUB_SCENARIO=hub200 WRK_TEST_CWD="$ROOT.v99" run_hub "$ROOT/bin/wrk" "$HUB_CONFIG" 2>&1)"
+key_prefix_out="$(WRK_HUB_SCENARIO=hub200 WRK_TEST_CWD="$ROOT.v99" run_hub "$WRK_COPY" "$HUB_CONFIG" 2>&1)"
 grep -q '^OK pane=pane-a host=machine-a ' <<<"$key_prefix_out"
 python3 - "$TMP/hub.log" <<'PY'
 import json, sys
@@ -519,7 +523,7 @@ printf '%s\n' 'spillover fixture brief' >"$PROMPT"
 
 # Below threshold stays local after the hub is unavailable.
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/wake.log"
-low_out="$(WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=0 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+low_out="$(WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=0 run_wrk "$WRK_COPY" -w local 2>&1)"
 grep -q '^OK pane=w:p1 host=local ' <<<"$low_out"
 grep -q 'source=local-fallback' "$TMP/spillover.log"
 [[ ! -s "$TMP/ssh.log" ]]
@@ -527,18 +531,18 @@ grep -q 'source=local-fallback' "$TMP/spillover.log"
 hosts_out="$(env HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" WRK_TEST_ACTIVE=0 \
   WRK_HOSTS_CONFIG="$CONFIG" WRK_PROC_LOADAVG="$LOAD" WRK_TEST_NCPU=4 \
   WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" WRK_SSH_LOG="$TMP/ssh.log" \
-  "$ROOT/bin/wrk" hosts)"
+  "$WRK_COPY" hosts)"
 grep -q '^desktop[[:space:]]available' <<<"$hosts_out"
 
 # Hub is authoritative: high local pressure remains local when hub says so.
 printf '%s\n' '9.00 0.10 0.10 1/1 1' >"$LOAD"
-hub_local_out="$(WRK_PLACE_SCENARIO=local WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+hub_local_out="$(WRK_PLACE_SCENARIO=local WRK_TEST_ACTIVE=4 run_wrk "$WRK_COPY" -w local 2>&1)"
 grep -q '^OK pane=w:p1 host=local ' <<<"$hub_local_out"
 grep -q 'source=hub' "$TMP/spillover.log"
 
 # Hub failure plus high pressure spills to the first measured remote host.
 : >"$TMP/ssh.log"
-remote_out="$(WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" 2>&1)"
+remote_out="$(WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 run_wrk "$WRK_COPY" 2>&1)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$remote_out"
 grep -q -- 'HERDR_SESSION=worker' "$TMP/ssh.log"
 grep -q -- '/remote/agent-skills' "$TMP/ssh.log"
@@ -546,14 +550,14 @@ grep -q -- ' -w workers' "$TMP/ssh.log"
 
 # An unreachable candidate is skipped and the next configured candidate is used.
 : >"$TMP/ssh.log"
-backup_out="$(WRK_PLACE_SCENARIO=unavailable WRK_SSH_SCENARIO=desktop-down WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" 2>&1)"
+backup_out="$(WRK_PLACE_SCENARIO=unavailable WRK_SSH_SCENARIO=desktop-down WRK_TEST_ACTIVE=4 run_wrk "$WRK_COPY" 2>&1)"
 grep -q '^OK pane=mac-work:p7 host=mac-work ' <<<"$backup_out"
 grep -q 'desktop.*uptime; herdr agent list' "$TMP/ssh.log"
 grep -q 'mac-work.*uptime; herdr agent list' "$TMP/ssh.log"
 
 # A post-probe spawn failure also advances to the next candidate.
 : >"$TMP/ssh.log"
-spawn_failover_out="$(WRK_PLACE_SCENARIO=advance WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3 run_wrk "$ROOT/bin/wrk" 2>&1)"
+spawn_failover_out="$(WRK_PLACE_SCENARIO=advance WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3 run_wrk "$WRK_COPY" 2>&1)"
 grep -q '^OK pane=mac-work:p7 host=mac-work ' <<<"$spawn_failover_out"
 [[ "$(grep '^OK ' <<<"$spawn_failover_out" | grep -o 'host=' | wc -l)" -eq 1 ]]
 backup_probe_count="$(grep -c 'mac-work.*uptime; herdr agent list' "$TMP/ssh.log")"
@@ -566,7 +570,7 @@ grep -q -- '--hub-url https://example.invalid --hub-token-env /tmp/example-token
 # preserving the eligible machine order.  If both remote spawns fail, only the
 # local fallback is emitted, with exactly one host field.
 : >"$TMP/ssh.log"; : >"$TMP/calls"
-verbatim_out="$(WRK_PLACE_SCENARIO=verbatim WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3,6 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+verbatim_out="$(WRK_PLACE_SCENARIO=verbatim WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3,6 run_wrk "$WRK_COPY" -w local 2>&1)"
 grep -qx 'desktop' "$TMP/candidates.log"
 grep -qx 'mac-work' "$TMP/candidates.log"
 [[ "$(grep '^OK ' <<<"$verbatim_out" | grep -o 'host=' | wc -l)" -eq 1 ]]
@@ -575,7 +579,7 @@ grep -q '^OK pane=w:p1 host=local ' <<<"$verbatim_out"
 # A hub-selected remote host without a cwd mapping fails closed; no local pane.
 set_first_cwd_map '{"/not-the-current-cwd"="/remote/missing"}'
 set +e
-unmapped_out="$(WRK_PLACE_SCENARIO=advance WRK_TEST_ACTIVE=0 run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+unmapped_out="$(WRK_PLACE_SCENARIO=advance WRK_TEST_ACTIVE=0 run_wrk "$WRK_COPY" -w local 2>&1)"
 unmapped_rc=$?
 set -e
 [[ "$unmapped_rc" -ne 0 ]]
@@ -585,7 +589,7 @@ grep -q 'host=local' <<<"$unmapped_out" && { echo 'unmapped spill-over unexpecte
 # Restore the mapping and prove --host local overrides hub placement.
 set_first_cwd_map "{\"$ROOT\"=\"/remote/agent-skills\"}"
 : >"$TMP/ssh.log"
-forced_out="$(WRK_PLACE_SCENARIO=advance WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" -w local --host local 2>&1)"
+forced_out="$(WRK_PLACE_SCENARIO=advance WRK_TEST_ACTIVE=4 run_wrk "$WRK_COPY" -w local --host local 2>&1)"
 grep -q '^OK pane=w:p1 host=local ' <<<"$forced_out"
 [[ ! -s "$TMP/ssh.log" ]]
 
@@ -598,9 +602,9 @@ for route in auto local; do
   : >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
   set +e
   if [[ "$route" == auto ]]; then
-    active_out="$(WRK_TEST_JOB="$active_job" WRK_PLACE_SCENARIO=advance run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+    active_out="$(WRK_TEST_JOB="$active_job" WRK_PLACE_SCENARIO=advance run_wrk "$WRK_COPY" -w local 2>&1)"
   else
-    active_out="$(WRK_TEST_JOB="$active_job" WRK_PLACE_SCENARIO=advance run_wrk "$ROOT/bin/wrk" -w local --host local 2>&1)"
+    active_out="$(WRK_TEST_JOB="$active_job" WRK_PLACE_SCENARIO=advance run_wrk "$WRK_COPY" -w local --host local 2>&1)"
   fi
   active_rc=$?
   set -e
@@ -614,7 +618,7 @@ tw_stop_sentinels "$ARBITER_INBOX_ROOT"
 : >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
 XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-lookup-fail --agent-label owner --lane owner --t T1 >/dev/null
 set +e
-lookup_fail_out="$(REAL_ARBITER="$ROOT/bin/arbiter" WRK_TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-proxy" WRK_ARBITER_PROXY_MODE=job-get-fails WRK_TEST_JOB=spillover-lookup-fail WRK_PLACE_SCENARIO=advance run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+lookup_fail_out="$(REAL_ARBITER="$ROOT/bin/arbiter" WRK_TEST_ARBITER_BIN="$ROOT/tests/fixtures/arbiter-proxy" WRK_ARBITER_PROXY_MODE=job-get-fails WRK_TEST_JOB=spillover-lookup-fail WRK_PLACE_SCENARIO=advance run_wrk "$WRK_COPY" -w local 2>&1)"
 lookup_fail_rc=$?
 set -e
 [[ "$lookup_fail_rc" -eq 75 ]] || { echo "ASSERT P5 lookup failure expected exit 75, got $lookup_fail_rc" >&2; exit 1; }
@@ -623,7 +627,7 @@ set -e
 [[ ! -s "$TMP/herdr.log" ]] || { echo 'ASSERT P5 lookup failure reached Herdr' >&2; exit 1; }
 
 : >"$TMP/ssh.log"; : >"$TMP/place.log"; : >"$TMP/herdr.log"
-absent_out="$(WRK_TEST_ARBITER_BIN="$TMP/no-arbiter" WRK_TEST_JOB=spillover-absent WRK_PLACE_SCENARIO=advance run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+absent_out="$(WRK_TEST_ARBITER_BIN="$TMP/no-arbiter" WRK_TEST_JOB=spillover-absent WRK_PLACE_SCENARIO=advance run_wrk "$WRK_COPY" -w local 2>&1)"
 grep -q '^OK pane=w:p1 host=local ' <<<"$absent_out"
 [[ ! -s "$TMP/ssh.log" ]] || { echo 'ASSERT P5 absent arbiter routed remotely' >&2; exit 1; }
 [[ ! -s "$TMP/place.log" ]] || { echo 'ASSERT P5 absent arbiter called hub' >&2; exit 1; }
@@ -634,7 +638,7 @@ grep -q '^OK pane=w:p1 host=local ' <<<"$absent_out"
 for duplicate_rc in 74 75; do
   : >"$TMP/ssh.log"; : >"$TMP/calls"; : >"$TMP/herdr.log"
   set +e
-  duplicate_out="$(WRK_PLACE_SCENARIO=advance WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3 WRK_SSH_FAIL_CODE="$duplicate_rc" run_wrk "$ROOT/bin/wrk" -w local 2>&1)"
+  duplicate_out="$(WRK_PLACE_SCENARIO=advance WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3 WRK_SSH_FAIL_CODE="$duplicate_rc" run_wrk "$WRK_COPY" -w local 2>&1)"
   duplicate_actual_rc=$?
   set -e
   [[ "$duplicate_actual_rc" -eq "$duplicate_rc" ]] || { echo "ASSERT P5 remote duplicate expected exit $duplicate_rc, got $duplicate_actual_rc" >&2; exit 1; }
@@ -646,7 +650,7 @@ done
 # Mutation checks: each altered boundary must make its AC assertion red.
 # M5: restoring remote routing after an unreadable lookup must make the P5
 # assertion red through a genuine remote fixture spawn, not a shell error.
-MUT_LOOKUP="$TMP/wrk-lookup-routes-remote"; cp "$ROOT/bin/wrk" "$MUT_LOOKUP"
+MUT_LOOKUP="$TMP/wrk-lookup-routes-remote"; cp "$WRK_COPY" "$MUT_LOOKUP"
 sed -i.bak '/A router must never use an unavailable placement-admission lookup/,+10 s/^    return "\$rc"$/    :/' "$MUT_LOOKUP"
 : >"$TMP/ssh.log"; : >"$TMP/place.log"
 XDG_DATA_HOME="$TMP/xdg" "$ROOT/bin/arbiter" claim --job spillover-mutant-lookup --agent-label owner --lane owner --t T1 >/dev/null
@@ -655,7 +659,7 @@ if [[ ! -s "$TMP/ssh.log" || ! -s "$TMP/place.log" ]]; then echo 'lookup-routing
 
 # M6: treating 74 as retryable must probe the second candidate, so the exact
 # backup_probe_count=0 assertion above becomes red.
-MUT_DUPLICATE="$TMP/wrk-duplicate-retries"; cp "$ROOT/bin/wrk" "$MUT_DUPLICATE"
+MUT_DUPLICATE="$TMP/wrk-duplicate-retries"; cp "$WRK_COPY" "$MUT_DUPLICATE"
 sed -i.bak 's/2|"\$WRK_EXIT_ACTIVE_JOB_DUPLICATE"|"\$WRK_EXIT_JOB_STATE_UNREADABLE"|"\$WRK_EXIT_LANE_UNREGISTERED")/2)/' "$MUT_DUPLICATE"
 : >"$TMP/ssh.log"; : >"$TMP/calls"
 WRK_PLACE_SCENARIO=advance WRK_SSH_CALL_COUNT_FILE="$TMP/calls" WRK_SSH_FAIL_CALLS=3 WRK_SSH_FAIL_CODE=74 run_wrk "$MUT_DUPLICATE" -w local >/dev/null 2>&1 || true
@@ -702,7 +706,7 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
 # repo root, and the delegated spawn receives the derived remote path.
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"
 create_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$create_out"
 [[ -d "$REMOTE_HOME/remote/repo.v611" ]]
 [[ "$(git -C "$REMOTE_HOME/remote/repo.v611" rev-parse HEAD)" == "$(git -C "$TMP/local/repo.v611" rev-parse HEAD)" ]]
@@ -718,7 +722,7 @@ git -C "$REMOTE_HOME/remote/repo" fetch -q origin feat-612
 git -C "$REMOTE_HOME/remote/repo" worktree add -q -b feat-612 "$REMOTE_HOME/remote/repo.v612" origin/feat-612
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"
 reuse_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v612" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$reuse_out"
 grep -q -- 'TARGET=/remote/repo.v612 sh -s' "$TMP/ssh.log"
 grep -q -- 'BASE=' "$TMP/ssh.log" && { echo 'reuse case unexpectedly ran worktree create' >&2; exit 1; }
@@ -731,7 +735,7 @@ mismatch_sha_before="$(git -C "$REMOTE_HOME/remote/repo.v613" rev-parse HEAD)"
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"; : >"$TMP/herdr.log"
 set +e
 mismatch_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v613" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 mismatch_rc=$?
 set -e
 [[ "$mismatch_rc" -eq 2 ]]
@@ -753,7 +757,7 @@ remote_v616_sha_before="$(git -C "$REMOTE_HOME/remote/repo.v616" rev-parse HEAD)
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"
 set +e
 stale_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v616" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 stale_rc=$?
 set -e
 [[ "$stale_rc" -eq 2 ]]
@@ -774,7 +778,7 @@ git -C "$REMOTE_HOME/remote/repo" worktree add -q "$REMOTE_HOME/remote/repo.v617
 [[ "$(git -C "$TMP/local/repo.v617" rev-parse HEAD)" == "$(git -C "$REMOTE_HOME/remote/repo.v617" rev-parse HEAD)" ]]
 set +e
 brmis_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v617" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 brmis_rc=$?
 set -e
 [[ "$brmis_rc" -eq 2 ]]
@@ -788,7 +792,7 @@ mkdir -p "$REMOTE_HOME/remote/repo.v618"
 : >"$TMP/ssh.log"
 set +e
 notgit_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v618" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 notgit_rc=$?
 set -e
 [[ "$notgit_rc" -eq 2 ]]
@@ -803,7 +807,7 @@ new_branch_wt feat-619 v619
 git -C "$TMP/local/repo.v619" -c user.email=test@example.invalid -c user.name=test commit -q --allow-empty -m ahead
 set +e
 ahead_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v619" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 ahead_rc=$?
 set -e
 [[ "$ahead_rc" -eq 2 ]]
@@ -819,7 +823,7 @@ git -C "$LOCAL_REPO" worktree add -q "$TMP/local/repo.v614" feat-nopush
 : >"$TMP/ssh.log"; : >"$TMP/scp.log"
 set +e
 nopush_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v614" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 nopush_rc=$?
 set -e
 [[ "$nopush_rc" -eq 2 ]]
@@ -839,7 +843,7 @@ git -C "$LOCAL_REPO" worktree add -q --detach "$TMP/local/repo.v615" "$detached_
 : >"$TMP/ssh.log"
 set +e
 detached_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v615" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 detached_rc=$?
 set -e
 [[ "$detached_rc" -eq 2 ]]
@@ -852,7 +856,7 @@ printf '%s\n' 'PASS wrk-spillover remote-worktree-detached-unpushed'
 # the key.
 set +e
 boundary_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="${LOCAL_REPO}foo" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 boundary_rc=$?
 set -e
 [[ "$boundary_rc" -eq 2 ]]
@@ -860,7 +864,7 @@ grep -q 'has no cwd_map entry' <<<"$boundary_out"
 mkdir -p "$TMP/local/repo.v611/subdir"
 set +e
 nested_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611/subdir" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 nested_rc=$?
 set -e
 [[ "$nested_rc" -eq 2 ]]
@@ -876,7 +880,7 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
 mkdir -p "$REMOTE_HOME/remote/long.wt"
 : >"$TMP/ssh.log"
 long_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611.wt" \
-  WRK_TEST_HOSTS_CONFIG="$LONG_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$LONG_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$long_out"
 grep -q -- ' -c /remote/long.wt ' "$TMP/ssh.log"
 grep -q -- '/remote/short' "$TMP/ssh.log" && { echo 'longest-key rule lost to the shorter key' >&2; exit 1; }
@@ -890,7 +894,7 @@ printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
   "cwd_map = {\"$TMP/local/repo.v611\"=\"/remote/long\" \"$LOCAL_REPO\"=\"/remote/short\"}" 'capacity = 3' >"$LONG_FIRST_CONFIG"
 : >"$TMP/ssh.log"
 longfirst_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v611.wt" \
-  WRK_TEST_HOSTS_CONFIG="$LONG_FIRST_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$LONG_FIRST_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$longfirst_out"
 grep -q -- ' -c /remote/long.wt ' "$TMP/ssh.log"
 grep -q -- '/remote/short' "$TMP/ssh.log" && { echo 'key order decided the match, not key length' >&2; exit 1; }
@@ -901,13 +905,13 @@ printf '%s\n' 'PASS wrk-spillover prefix-longest-key-order'
 mkdir -p "$LOCAL_REPO/subdir" "$REMOTE_HOME/remote/repo/subdir"
 : >"$TMP/ssh.log"
 subpath_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$LOCAL_REPO/subdir" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$subpath_out"
 grep -q -- ' -c /remote/repo/subdir ' "$TMP/ssh.log"
 mkdir -p "$LOCAL_REPO/submissing"
 set +e
 submiss_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$LOCAL_REPO/submissing" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 submiss_rc=$?
 set -e
 [[ "$submiss_rc" -eq 2 ]]
@@ -917,7 +921,7 @@ printf '%s\n' 'PASS wrk-spillover prefix-subpath'
 # Exact mappings keep the pass-through contract: no preparation probe runs.
 : >"$TMP/ssh.log"
 exact_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$LOCAL_REPO" \
-  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$ROOT/bin/wrk" -w w1 --host desktop 2>&1)"
+  WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$WRK_COPY" -w w1 --host desktop 2>&1)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$exact_out"
 grep -q -- ' -c /remote/repo ' "$TMP/ssh.log"
 grep -q 'sh -s' "$TMP/ssh.log" && { echo 'exact mapping ran a worktree probe' >&2; exit 1; }
@@ -928,7 +932,7 @@ printf '%s\n' 'PASS wrk-spillover exact-mapping-no-prepare'
 # unreachable.
 : >"$TMP/ssh.log"; : >"$TMP/herdr.log"
 set +e
-explicit_out="$(WRK_SSH_SCENARIO=desktop-spawn-fails run_wrk "$ROOT/bin/wrk" -w local --host desktop 2>&1)"
+explicit_out="$(WRK_SSH_SCENARIO=desktop-spawn-fails run_wrk "$WRK_COPY" -w local --host desktop 2>&1)"
 explicit_rc=$?
 set -e
 [[ "$explicit_rc" -eq 42 ]]
@@ -937,7 +941,7 @@ grep -q 'host=local' <<<"$explicit_out" && { echo 'explicit host spawn failure f
 [[ ! -s "$TMP/herdr.log" ]]
 : >"$TMP/ssh.log"
 set +e
-down_out="$(WRK_SSH_SCENARIO=desktop-down run_wrk "$ROOT/bin/wrk" -w local --host desktop 2>&1)"
+down_out="$(WRK_SSH_SCENARIO=desktop-down run_wrk "$WRK_COPY" -w local --host desktop 2>&1)"
 down_rc=$?
 set -e
 [[ "$down_rc" -ne 0 ]]
@@ -947,7 +951,7 @@ grep -q 'host=local' <<<"$down_out" && { echo 'unreachable explicit host fell ba
 printf '%s\n' 'PASS wrk-spillover explicit-host-no-fallback'
 
 # Mutants: each weakening must turn its matching assertion red.
-MUT_BOUNDARY="$TMP/wrk-prefix-boundary"; cp "$ROOT/bin/wrk" "$MUT_BOUNDARY"
+MUT_BOUNDARY="$TMP/wrk-prefix-boundary"; cp "$WRK_COPY" "$MUT_BOUNDARY"
 sed -i.bak 's/cwd\.startswith(local + "\.")/cwd.startswith(local)/' "$MUT_BOUNDARY"
 chmod +x "$MUT_BOUNDARY"
 grep -qF 'cwd.startswith(local)' "$MUT_BOUNDARY" || { echo 'boundary mutant did not apply' >&2; exit 1; }
@@ -956,7 +960,7 @@ boundary_mut_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="${LOCAL_REPO}fo
   WRK_TEST_HOSTS_CONFIG="$WT_CONFIG" run_wrk "$MUT_BOUNDARY" -w w1 --host desktop 2>&1 || true)"
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$boundary_mut_out" || { echo 'prefix-boundary mutant survived' >&2; exit 1; }
 
-MUT_FALLBACK="$TMP/wrk-explicit-fallback"; cp "$ROOT/bin/wrk" "$MUT_FALLBACK"
+MUT_FALLBACK="$TMP/wrk-explicit-fallback"; cp "$WRK_COPY" "$MUT_FALLBACK"
 sed -i.bak 's/\[\[ "\$requested" != auto \]\]/[[ "$requested" == never ]]/' "$MUT_FALLBACK"
 chmod +x "$MUT_FALLBACK"
 grep -qF '[[ "$requested" == never ]]' "$MUT_FALLBACK" || { echo 'fallback mutant did not apply' >&2; exit 1; }
@@ -965,7 +969,7 @@ fallback_mut_out="$(WRK_SSH_SCENARIO=desktop-spawn-fails run_wrk "$MUT_FALLBACK"
 set -e
 grep -q 'host=local' <<<"$fallback_mut_out" || { echo 'explicit-fallback mutant survived' >&2; exit 1; }
 
-MUT_PREPARE="$TMP/wrk-prepare-skip"; cp "$ROOT/bin/wrk" "$MUT_PREPARE"
+MUT_PREPARE="$TMP/wrk-prepare-skip"; cp "$WRK_COPY" "$MUT_PREPARE"
 sed -i.bak 's/\[\[ "\$kind" == exact \]\] && return 0/return 0/' "$MUT_PREPARE"
 chmod +x "$MUT_PREPARE"
 grep -qF '  return 0' "$MUT_PREPARE" || { echo 'prepare mutant did not apply' >&2; exit 1; }
@@ -975,7 +979,7 @@ grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$prepare_mut_out" || { echo 'pre
 
 # Removing the HEAD half of the EXISTS comparison must turn the stale-head
 # case green — the remote worktree would be silently reused at the old sha.
-MUT_SHA="$TMP/wrk-no-sha-compare"; cp "$ROOT/bin/wrk" "$MUT_SHA"
+MUT_SHA="$TMP/wrk-no-sha-compare"; cp "$WRK_COPY" "$MUT_SHA"
 sed -i.bak 's/ || "\$remote_sha" != "\$sha"//' "$MUT_SHA"
 chmod +x "$MUT_SHA"
 grep -qF '"$remote_branch" != "${branch:-HEAD}" ]]' "$MUT_SHA" || { echo 'sha-compare mutant did not apply' >&2; exit 1; }
@@ -984,3 +988,6 @@ sha_mut_out="$(WRK_FAKE_REMOTE="$REMOTE_HOME" WRK_TEST_CWD="$TMP/local/repo.v616
 grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$sha_mut_out" || { echo 'sha-compare mutant survived' >&2; exit 1; }
 printf '%s\n' 'PASS wrk-spillover task611 mutants-red=4/4'
 )
+
+tmp_writers_stop
+WRK_LEAK_ROOT="$TMP" WRK_LEAK_COPY="$WRK_COPY" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
