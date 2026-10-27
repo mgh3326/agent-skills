@@ -153,7 +153,7 @@
   "local_sources": {
     ".github/workflows/ci.yml": "dd2e2a9baa4e0417605c09c4dbd199da95c3accf92d50b825e2dcc67a436f882",
     "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
-    "bin/wrk": "cdafb2b7deca11d425b450bbc6cdcffe55ff45140e6b20f41eeed1e79f558168",
+    "bin/wrk": "646ce96547a8da51ccf779842384cbedec7e0212bf3adc81d1db8e20c1b74acc",
     "bin/wrk-o3.py": "f6d25856460098f60a19f4ad200c5a8372aafdbd821c11d0cb2835fc194ced6d",
     "bin/wrk-o3-contract.json": "99e78d7e326f598174ee3f3cf47827ce9a32454105b599f0af5c9b65879bc9f4",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
