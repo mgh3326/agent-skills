@@ -4,6 +4,9 @@
 # intermediate-build classes from director/artifact_policy.json
 # (schema fleet.artifact-policy.v1). Evidence, final-build and record text
 # are out of scope for this task and must never be touched.
+# hk 2152 adds the scanner-side never-touch contract (AP8, AP10 help), the
+# policy-refusal message (AP9) and the prune-record age rule (AP10); its
+# moments are relative to now, never fixed dates.
 #
 # Every tree these tests delete is built under TMP; nothing under the real
 # ~/work is referenced. Job state fixtures are hand-written event files under
@@ -163,6 +166,12 @@ stamp = datetime.datetime.fromisoformat(
     sys.argv[2].replace("Z", "+00:00")).timestamp()
 os.utime(sys.argv[1], (stamp, stamp))
 PY
+}
+
+ago() { # DAYS — an ISO-8601 UTC moment DAYS days before now (no fixed dates)
+  python3 -c 'import datetime, sys
+now = datetime.datetime.now(datetime.timezone.utc)
+print((now - datetime.timedelta(days=float(sys.argv[1]))).strftime("%Y-%m-%dT%H:%M:%SZ"))' "$1"
 }
 
 LOCK_PID=""
@@ -524,8 +533,9 @@ assert_policy_refused ap4-abs-root \
 echo "PASS ap4 policy-refusal"
 
 # ════════════════════════════════════════════════════════════════════════
-# AP5 — symlinks: a symlinked match is unlinked, never traversed; a match
-# reached through a symlinked ancestor resolves outside and is refused.
+# AP5 — symlinks: a symlinked match whose target stays inside the job dir is
+# unlinked, never traversed; a link pointing out of the job dir, and a match
+# reached through a symlinked ancestor, resolve outside and are refused.
 # ════════════════════════════════════════════════════════════════════════
 echo "== AP5: symlinks are never followed =="
 reset_case ap5
@@ -534,19 +544,27 @@ mk_ended_job ap5 1 w:p9
 OUTSIDE="$TMP/ap5-outside"; mkdir -p "$OUTSIDE/target"
 printf 'keepme\n' >"$OUTSIDE/target/real.bin"
 ln -s "$OUTSIDE/target" "$INBOX/ap5/cache-link"
+mkdir -p "$INBOX/ap5/inner"; printf 'inner\n' >"$INBOX/ap5/inner/keep.bin"
+ln -s inner "$INBOX/ap5/cache-inlink"
 mk_artifact "$INBOX/ap5/cache-real"
 policy_min <<'JSON'
 [{"class": "cache", "root": "jobs", "glob": "cache-*"}]
 JSON
 seq_gone
 OUT="$(prune_run --apply)"
-[[ ! -L "$INBOX/ap5/cache-link" && ! -e "$INBOX/ap5/cache-link" ]] ||
-  fail "AP5: the symlink match itself must be unlinked"
+[[ -L "$INBOX/ap5/cache-link" ]] ||
+  fail "AP5: a link whose target leaves the job dir must be refused, not unlinked"
+grep -q "cache-link.*action=refused.*outside-job-dir" <<<"$OUT" ||
+  fail "AP5: the outside-pointing link must be reported refused: $OUT"
 [[ -f "$OUTSIDE/target/real.bin" ]] ||
   fail "AP5: the outside target must be untouched"
+[[ ! -L "$INBOX/ap5/cache-inlink" && ! -e "$INBOX/ap5/cache-inlink" ]] ||
+  fail "AP5: a link match pointing inside the job dir must be unlinked"
+[[ -f "$INBOX/ap5/inner/keep.bin" ]] ||
+  fail "AP5: the inside target must be untouched (the link is unlinked, not traversed)"
 [[ ! -e "$INBOX/ap5/cache-real" ]] ||
   fail "AP5: the real cache dir must be removed"
-grep -q "cache-link.*action=removed" <<<"$OUT" ||
+grep -q "cache-inlink.*action=removed" <<<"$OUT" ||
   fail "AP5: unlinking the link prints its removal line: $OUT"
 
 # Match reached THROUGH a symlinked ancestor: the match is a real dir whose
@@ -799,6 +817,205 @@ grep -q "never-touch" <<<"$OUT" ||
 echo "PASS ap7 shipped-rows and guards"
 
 # ════════════════════════════════════════════════════════════════════════
+# AP8 — hk 2152: the never-touch contract is the scanner's, not the policy's.
+# The policy is runtime data (pa-integrator extends it), so a broad glob
+# (*, **, unity/*/*) reaching report.md, brief.md, run.log, meta.txt, a
+# pidfile, a nested refs dir or a link must not delete any of them, while a
+# cache file next to them still goes.
+# ════════════════════════════════════════════════════════════════════════
+echo "== AP8: broad globs never reach the never-touch set =="
+
+NEVER_SET='events refs asset-store-packs report*.md brief*.md spawn-brief* verdict*.md run.log meta.txt completion-sentinel.* *.pid state.md final-report*'
+GUARD_OUT=""
+
+# mk_guard_tree JOB — one name per never-touch pattern at the top level and
+# nested under unity/Proj, a refs dir holding a link, a symlinked ancestor
+# that resolves back into refs, one that leaves the job dir, and real cache
+# payloads beside all of it.
+mk_guard_tree() {
+  local j="$INBOX/$1" f
+  GUARD_OUT="$TMP/guard-outside-$1"
+  for f in report.md report-2.md brief.md brief-2.md spawn-brief-1.txt \
+           verdict-1.md run.log meta.txt worker.pid state.md final-report.md \
+           final-report-2.txt; do
+    printf 'keep-%s\n' "$f" >"$j/$f"
+  done
+  mkdir -p "$j/unity/Proj/refs/deep" "$j/unity/asset-store-packs/p1" "$j/refs"
+  printf 'x\n' >"$j/unity/Proj/refs/x"
+  printf 'y\n' >"$j/unity/Proj/refs/deep/y"
+  printf 'pack\n' >"$j/unity/asset-store-packs/p1/payload.bin"
+  for f in run.log meta.txt completion-sentinel.pid; do
+    printf 'keep-%s\n' "$f" >"$j/unity/Proj/$f"
+  done
+  printf 'cache\n' >"$j/unity/Proj/cache.bin"
+  printf 'ref\n' >"$j/refs/real"
+  ln -s ../report.md "$j/refs/x"        # a link AT a refs path
+  ln -s refs "$j/linkdir"               # linkdir/x IS refs/x, through an ancestor link
+  mkdir -p "$GUARD_OUT"
+  printf 'outside\n' >"$GUARD_OUT/real.bin"
+  ln -s real.bin "$GUARD_OUT/y"
+  ln -s "$GUARD_OUT" "$j/outlinkdir"    # an ancestor link leaving the job dir
+  printf 'cache\n' >"$j/cache.bin"
+  mk_artifact "$j/cachedir"
+}
+
+assert_guard_intact() { # JOB TAG — everything never-touch is still there
+  local j="$INBOX/$1" t="$2" f
+  for f in report.md report-2.md brief.md brief-2.md spawn-brief-1.txt \
+           verdict-1.md run.log meta.txt worker.pid state.md final-report.md \
+           final-report-2.txt refs/real unity/Proj/run.log unity/Proj/meta.txt \
+           unity/Proj/completion-sentinel.pid unity/Proj/refs/x \
+           unity/Proj/refs/deep/y unity/asset-store-packs/p1/payload.bin; do
+    [[ -f "$j/$f" ]] || fail "$t: $f is never-touch and must survive"
+  done
+  [[ -L "$j/refs/x" ]] || fail "$t: the symlink at refs/x must survive"
+  [[ -L "$j/linkdir" && -L "$j/outlinkdir" ]] ||
+    fail "$t: links to refs and out of the job dir must survive"
+  [[ -d "$j/events" ]] || fail "$t: the events dir must survive"
+  [[ -f "$GUARD_OUT/real.bin" && -L "$GUARD_OUT/y" ]] ||
+    fail "$t: the tree behind a symlinked ancestor must be untouched"
+}
+
+# AP8a — glob *: top-level matches only.
+reset_case ap8a
+hk_task 1 merged
+mk_ended_job ap8a 1 w:p9 "$(ago 5)"
+mk_guard_tree ap8a
+policy_min <<'JSON'
+[{"class": "cache", "root": "jobs", "glob": "*"}]
+JSON
+seq_gone
+OUT="$(prune_run --apply)"
+assert_guard_intact ap8a AP8a
+[[ ! -e "$INBOX/ap8a/cache.bin" && ! -e "$INBOX/ap8a/cachedir" ]] ||
+  fail "AP8a: the cache file and dir beside the never-touch set must go: $OUT"
+grep -q "ap8a/cache.bin.*action=removed" <<<"$OUT" ||
+  fail "AP8a: the cache removal must print its line: $OUT"
+[[ -f "$INBOX/ap8a/unity/Proj/cache.bin" ]] ||
+  fail "AP8a: unity holds never-touch names, so a * match on it is refused whole"
+grep -q "ap8a/unity .*action=refused reason=holds-never-touch" <<<"$OUT" ||
+  fail "AP8a: the holding directory must be reported refused: $OUT"
+grep -q "ap8a/report.md.*action=refused reason=never-touch" <<<"$OUT" ||
+  fail "AP8a: the never-touch refusal must be reported: $OUT"
+grep -q "ap8a/outlinkdir.*action=refused reason=outside-job-dir" <<<"$OUT" ||
+  fail "AP8a: the escaping link must be reported refused: $OUT"
+! grep -q "action=failed" <<<"$OUT" || fail "AP8a: no removal may fail: $OUT"
+
+# AP8b — glob **: every depth, links under symlinked ancestors included.
+reset_case ap8b
+hk_task 1 merged
+mk_ended_job ap8b 1 w:p9 "$(ago 5)"
+mk_guard_tree ap8b
+policy_min <<'JSON'
+[{"class": "cache", "root": "jobs", "glob": "**"},
+ {"class": "cache", "root": "jobs", "glob": "linkdir/*"},
+ {"class": "cache", "root": "jobs", "glob": "outlinkdir/*"},
+ {"class": "cache", "root": "jobs", "glob": "refs/*"}]
+JSON
+seq_gone
+OUT="$(prune_run --apply)"
+assert_guard_intact ap8b AP8b
+[[ ! -e "$INBOX/ap8b/cache.bin" && ! -e "$INBOX/ap8b/cachedir" &&
+   ! -e "$INBOX/ap8b/unity/Proj/cache.bin" ]] ||
+  fail "AP8b: every cache file beside the never-touch set must go: $OUT"
+grep -q "ap8b/unity/Proj/cache.bin.*action=removed" <<<"$OUT" ||
+  fail "AP8b: the nested cache file must print its removal: $OUT"
+grep -q "ap8b/linkdir/x action=refused reason=never-touch" <<<"$OUT" ||
+  fail "AP8b: a link under an ancestor link into refs must be refused: $OUT"
+grep -q "ap8b/outlinkdir/y action=refused reason=outside-job-dir" <<<"$OUT" ||
+  fail "AP8b: a link under an ancestor link out of the job dir must be refused: $OUT"
+grep -q "ap8b/refs/x action=refused reason=never-touch" <<<"$OUT" ||
+  fail "AP8b: a link at refs/x must be refused: $OUT"
+! grep -q "action=failed" <<<"$OUT" ||
+  fail "AP8b: a match inside an already-removed dir must be skipped, not fail: $OUT"
+
+# AP8c — intermediate-build unity/*/*: refused matches take no keep slot, so
+# a newest run.log cannot push the newest real build out of the keep window.
+reset_case ap8c
+hk_task 1 claimed
+mk_live_job ap8c 1 w:p9
+mk_guard_tree ap8c
+mk_artifact "$INBOX/ap8c/unity/Proj/out-1"
+mk_artifact "$INBOX/ap8c/unity/Proj/out-2"
+touch_mtime "$INBOX/ap8c/unity/Proj/out-1" "2026-10-20T00:00:00Z"
+touch_mtime "$INBOX/ap8c/unity/Proj/out-2" "2026-10-21T00:00:00Z"
+touch_mtime "$INBOX/ap8c/unity/Proj/run.log" "2026-10-25T00:00:00Z"
+touch_mtime "$INBOX/ap8c/unity/Proj/meta.txt" "2026-10-25T00:00:00Z"
+rm -f "$INBOX/ap8c/unity/Proj/cache.bin"
+policy_min <<'JSON'
+[{"class": "intermediate-build", "root": "jobs", "glob": "unity/*/*",
+  "keep_newest": 1}]
+JSON
+OUT="$(prune_run --apply)"
+assert_guard_intact ap8c AP8c
+[[ -d "$INBOX/ap8c/unity/Proj/out-2" ]] ||
+  fail "AP8c: the newest real build must keep the keep_newest slot: $OUT"
+[[ ! -e "$INBOX/ap8c/unity/Proj/out-1" ]] ||
+  fail "AP8c: the older real build must go: $OUT"
+
+# AP8d — the help text names the exact set.
+reset_case ap8d
+FLAT="$(prune_run --help | tr '\n' ' ' | tr -s ' ')"
+grep -qF -- "$NEVER_SET" <<<"$FLAT" ||
+  fail "AP8d: wrk prune --help must print the exact never-touch set: $NEVER_SET"
+echo "PASS ap8 never-touch-scanner"
+
+# ════════════════════════════════════════════════════════════════════════
+# AP9 — hk 2152: a policy with a valid row and then an invalid one refuses the
+# pass (rc 2) and the message is exactly the reason: the loader prints rows
+# only after every row passed, so no earlier row leaks into the message.
+# ════════════════════════════════════════════════════════════════════════
+echo "== AP9: a refusal after a valid row prints only the reason =="
+reset_case ap9
+hk_task 1 merged
+mk_ended_job ap9 1 w:p9 "$(ago 5)"
+mk_artifact "$INBOX/ap9/browser-cache"
+base_envelope '[{"class":"cache","root":"jobs","glob":"browser-*"},{"class":"evidence","root":"jobs","glob":"e-*"}]' >"$POLICY"
+seq_gone
+rc=0; OUT="$(prune_run --apply)" || rc=$?
+[[ "$rc" == 2 ]] || fail "AP9: a refused policy must exit 2 (rc=$rc): $OUT"
+MSG="$(grep '^artifact-prune refused' <<<"$OUT")"
+[[ "$MSG" == "artifact-prune refused: $POLICY — row 1 class 'evidence' is not yet supported" ]] ||
+  fail "AP9: the message must be exactly the reason, got: $MSG"
+! grep -q "^cache"$'\t' <<<"$OUT" ||
+  fail "AP9: no earlier row text may reach the output: $OUT"
+[[ -d "$INBOX/ap9/browser-cache" ]] || fail "AP9: a refused pass deletes nothing"
+echo "PASS ap9 refusal-message"
+
+# ════════════════════════════════════════════════════════════════════════
+# AP10 — hk 2152: job.artifacts_pruned is housekeeping, not job activity. An
+# intermediate-build prune on an ended job appends one per removal; they must
+# not restart the job's --heavy-age clock, so its cache row still goes at the
+# original age on the next pass.
+# ════════════════════════════════════════════════════════════════════════
+echo "== AP10: a prune record does not move the job's age =="
+reset_case ap10
+hk_task 1 merged
+mk_ended_job ap10 1 w:p9 "$(ago 5)"
+for b in 1 2 3; do
+  mk_artifact "$INBOX/ap10/build-$b"
+  touch_mtime "$INBOX/ap10/build-$b" "2026-10-2${b}T00:00:00Z"
+done
+mk_artifact "$INBOX/ap10/browser-cache"
+policy_min <<'JSON'
+[{"class": "intermediate-build", "root": "jobs", "glob": "build-*",
+  "keep_newest": 1}]
+JSON
+seq_gone
+OUT="$(prune_run --apply)"
+[[ ! -e "$INBOX/ap10/build-1" && ! -e "$INBOX/ap10/build-2" && -d "$INBOX/ap10/build-3" ]] ||
+  fail "AP10: the intermediate-build pass must prune to the newest: $OUT"
+[[ "$(events_named "$INBOX/ap10/events" job.artifacts_pruned)" == 2 ]] ||
+  fail "AP10: each removal must append a job.artifacts_pruned event"
+policy_min <<'JSON'
+[{"class": "cache", "root": "jobs", "glob": "browser-*"}]
+JSON
+OUT="$(prune_run --apply)"   # default --heavy-age 3d; the job ended 5d ago
+[[ ! -e "$INBOX/ap10/browser-cache" ]] ||
+  fail "AP10: the prune record must not restart the heavy-age clock: $OUT"
+echo "PASS ap10 prune-record-not-activity"
+
+# ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants, each applied at its real call site.
 # ════════════════════════════════════════════════════════════════════════
 echo "== MUT: assertion-RED mutants per brief =="
@@ -868,22 +1085,23 @@ case_mut_class() {
   [[ -d "$INBOX/mutev/evidence-1" ]] ||
     assertion_red "an evidence row must never delete"
 }
-# Mutant 3 — symlinks followed: the outside target is deleted.
+# Mutant 3 — symlinks followed: the inside link target is deleted. The link
+# points inside the job dir: an outside-pointing link is refused by the
+# scanner and never reaches the remover.
 case_mut_symlink() {
   reset_case mutsl || return 3
   hk_task 1 merged || return 3
   mk_ended_job mutsl 1 w:p9 || return 3
-  local outside="$TMP/mutsl-outside"
-  mkdir -p "$outside/target" || return 3
-  printf 'keepme\n' >"$outside/target/real.bin" || return 3
-  ln -s "$outside/target" "$INBOX/mutsl/cache-link" || return 3
+  mkdir -p "$INBOX/mutsl/keep" || return 3
+  printf 'keepme\n' >"$INBOX/mutsl/keep/real.bin" || return 3
+  ln -s keep "$INBOX/mutsl/cache-link" || return 3
   policy_min <<'JSON' || return 3
 [{"class": "cache", "root": "jobs", "glob": "cache-*"}]
 JSON
   seq_gone
   prune_run --apply >/dev/null 2>&1 || true
-  [[ -f "$outside/target/real.bin" ]] ||
-    assertion_red "the outside symlink target must be untouched"
+  [[ -f "$INBOX/mutsl/keep/real.bin" ]] ||
+    assertion_red "the symlink target must be untouched"
 }
 # Mutant 4 — the task-merged check dropped for cache.
 case_mut_task() {
@@ -898,6 +1116,91 @@ JSON
   prune_run --apply >/dev/null 2>&1 || true
   [[ -d "$INBOX/muttk/browser-cache" ]] ||
     assertion_red "an open task's cache must stay"
+}
+
+# Mutant 5 — hk 2152: the never-touch check removed from the scanner.
+case_mut_guard() {
+  reset_case mutgd || return 3
+  hk_task 1 merged || return 3
+  mk_ended_job mutgd 1 w:p9 "$(ago 5)" || return 3
+  printf 'report\n' >"$INBOX/mutgd/report.md" || return 3
+  mk_artifact "$INBOX/mutgd/browser-cache" || return 3
+  policy_min <<'JSON' || return 3
+[{"class": "cache", "root": "jobs", "glob": "*"}]
+JSON
+  seq_gone
+  prune_run --apply >/dev/null 2>&1 || true
+  [[ -f "$INBOX/mutgd/report.md" ]] ||
+    assertion_red "a broad glob must not delete report.md"
+}
+# Mutant 6 — hk 2152: links skip the guard and the containment check.
+case_mut_linkguard() {
+  reset_case mutlg || return 3
+  hk_task 1 merged || return 3
+  mk_ended_job mutlg 1 w:p9 "$(ago 5)" || return 3
+  printf 'report\n' >"$INBOX/mutlg/report.md" || return 3
+  mkdir -p "$INBOX/mutlg/refs" || return 3
+  ln -s ../report.md "$INBOX/mutlg/refs/x" || return 3
+  policy_min <<'JSON' || return 3
+[{"class": "cache", "root": "jobs", "glob": "refs/*"}]
+JSON
+  seq_gone
+  prune_run --apply >/dev/null 2>&1 || true
+  [[ -L "$INBOX/mutlg/refs/x" ]] ||
+    assertion_red "the refs/x link must survive"
+}
+# Mutant 7 — hk 2152: job.artifacts_pruned counts as job activity for age.
+case_mut_age() {
+  reset_case mutag || return 3
+  hk_task 1 merged || return 3
+  mk_ended_job mutag 1 w:p9 "$(ago 5)" || return 3
+  local b
+  for b in 1 2 3; do
+    mk_artifact "$INBOX/mutag/build-$b" || return 3
+    touch_mtime "$INBOX/mutag/build-$b" "2026-10-2${b}T00:00:00Z" || return 3
+  done
+  mk_artifact "$INBOX/mutag/browser-cache" || return 3
+  seq_gone
+  policy_min <<'JSON' || return 3
+[{"class": "intermediate-build", "root": "jobs", "glob": "build-*",
+  "keep_newest": 1}]
+JSON
+  prune_run --apply >/dev/null 2>&1 || true
+  policy_min <<'JSON' || return 3
+[{"class": "cache", "root": "jobs", "glob": "browser-*"}]
+JSON
+  prune_run --apply >/dev/null 2>&1 || true
+  [[ ! -e "$INBOX/mutag/browser-cache" ]] ||
+    assertion_red "a prune record must not move the job's age"
+}
+# Mutant 8 — hk 2152: the loader prints each valid row inside its loop.
+case_mut_rows() {
+  reset_case mutrw || return 3
+  hk_task 1 merged || return 3
+  mk_ended_job mutrw 1 w:p9 "$(ago 5)" || return 3
+  mk_artifact "$INBOX/mutrw/browser-cache" || return 3
+  base_envelope '[{"class":"cache","root":"jobs","glob":"browser-*"},{"class":"evidence","root":"jobs","glob":"e-*"}]' >"$POLICY" || return 3
+  seq_gone
+  local out="" msg=""
+  out="$(prune_run --apply 2>&1)" || true
+  msg="$(grep '^artifact-prune refused' <<<"$out" || true)"
+  [[ "$msg" == "artifact-prune refused: $POLICY — row 1 class 'evidence' is not yet supported" ]] ||
+    assertion_red "the refusal message must be exactly the reason"
+}
+# Mutant 9 — hk 2152: a directory match holding a never-touch name is removed.
+case_mut_holds() {
+  reset_case muthd || return 3
+  hk_task 1 merged || return 3
+  mk_ended_job muthd 1 w:p9 "$(ago 5)" || return 3
+  mkdir -p "$INBOX/muthd/unity/Proj" || return 3
+  printf 'run\n' >"$INBOX/muthd/unity/Proj/run.log" || return 3
+  policy_min <<'JSON' || return 3
+[{"class": "cache", "root": "jobs", "glob": "*"}]
+JSON
+  seq_gone
+  prune_run --apply >/dev/null 2>&1 || true
+  [[ -f "$INBOX/muthd/unity/Proj/run.log" ]] ||
+    assertion_red "a directory holding run.log must not be removed"
 }
 
 # M1 — keep_newest ignored: every sorted index is dropped, so the newest
@@ -919,5 +1222,29 @@ expect_mut_red "symlinks-followed" case_mut_symlink "symlink target must be unto
 # accepted at the case arm.
 mkmut task 's/echo "task-.state"; return 1/return 0/'
 expect_mut_red "task-check-dropped" case_mut_task "open task"
+
+# M5 — the never-touch check is removed from the scanner: hits() never hits,
+# so a broad glob deletes report.md.
+mkmut guard 's/    return any(fnmatch.fnmatchcase(name.casefold(), pat)/    return False and any(fnmatch.fnmatchcase(name.casefold(), pat)/'
+expect_mut_red "never-touch-check-removed" case_mut_guard "must not delete report.md"
+
+# M6 — links skip the guard: a link match is classified link without the
+# never-touch and containment check, so the refs/x link is unlinked.
+mkmut linkguard 's/return guard(match, (seat, os.path.realpath(match))) or "link"/return "link"/'
+expect_mut_red "links-skip-guard" case_mut_linkguard "refs/x link must survive"
+
+# M7 — job.artifacts_pruned counts for age: the housekeeping skip in the
+# event scan is dropped, so each prune restarts the heavy-age clock.
+mkmut age 's/if kind in HOUSEKEEPING:/if False:/'
+expect_mut_red "prune-record-counts-for-age" case_mut_age "must not move the job's age"
+
+# M8 — rows print inside the loader's validation loop: the refusal message
+# starts with the earlier valid row.
+mkmut rows 's/out\.append("/print("/'
+expect_mut_red "rows-print-in-loop" case_mut_rows "exactly the reason"
+
+# M9 — a directory match that holds a never-touch name is removed whole.
+mkmut holds 's/if os.path.isdir(match) and holds_never_touch(match):/if False:/'
+expect_mut_red "holds-check-removed" case_mut_holds "holding run.log must not be removed"
 
 echo "ALL ARTIFACT-PRUNE CONTRACT TESTS PASSED"
