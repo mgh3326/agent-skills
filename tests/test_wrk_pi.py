@@ -44,7 +44,9 @@ class PiSpawnTests(unittest.TestCase):
         # Admission tripwire, no detached sentinel or real state DB.
         self.executable(self.tmp / "arbiter", '#!/bin/bash\ncase "$1" in job-get) exit 7 ;; claim|lease) printf "%s\\n" "$*" >>"' +
                         str(self.tmp / "claims.log") + '"; exit 1 ;; esac\nexit 1\n')
-        self.wrk = ROOT / "bin/wrk"
+        self.wrk = self.tmp / "wrk"
+        self.wrk.write_bytes((ROOT / "bin/wrk").read_bytes())
+        self.wrk.chmod(0o755)
         self.wrk_lib = self.tmp / "wrk-lib.sh"
         wrk_source = self.wrk.read_text(encoding="utf-8")
         self.wrk_lib.write_text(wrk_source.split('\ncase "${1:-}" in', 1)[0] + "\n",
@@ -359,6 +361,7 @@ else:
         sentinel_stop_error = None
         try:
             result = self.spawn(ARBITER_BIN=str(ROOT / "bin/arbiter"),
+                                WRK_TEST_REAL_SENTINEL="1",
                                 WRK_COMPLETION_INTERVAL_S="3600")
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             events = Path(self.env["ARBITER_INBOX_ROOT"]) / "pi-fixture/events"
@@ -373,7 +376,7 @@ else:
                 pid = int(pidfile.read_text().splitlines()[0])
                 check = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
                                        capture_output=True, text=True)
-                if "sentinel pi-fixture " in check.stdout and str(ROOT / "bin/wrk") in check.stdout:
+                if "sentinel pi-fixture " in check.stdout and str(self.wrk) in check.stdout:
                     try:
                         stop_env = dict(self.env, WRK_LIBFILE=str(self.wrk_lib))
                         stop = subprocess.run(
@@ -396,6 +399,14 @@ else:
                 self.keep_tmp = True
                 self.temp._finalizer.detach()  # preserve evidence for live writers
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            leak_env = dict(self.env, WRK_LEAK_ROOT=str(self.tmp),
+                            WRK_LEAK_COPY=str(self.wrk))
+            leaks = subprocess.run(
+                [sys.executable, str(ROOT / "tests/lib/assert-no-wrk-leaks.py")],
+                env=leak_env, capture_output=True, text=True, timeout=30)
+            if leaks.returncode:
+                self.keep_tmp = True
+            self.assertEqual(leaks.returncode, 0, leaks.stdout + leaks.stderr)
             if sentinel_stop_error:
                 self.fail(sentinel_stop_error)
 

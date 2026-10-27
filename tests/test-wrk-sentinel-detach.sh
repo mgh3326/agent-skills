@@ -6,6 +6,7 @@ set -euo pipefail
 # append one EXIT record after their action log. Every spawn uses fixture
 # herdr/scopefuel/panewire binaries and every writable path is temporary.
 export WRK_TEST_MODE=1
+export WRK_TEST_REAL_SENTINEL=1
 unset ARBITER_JOB HK_TASK_ID
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -17,6 +18,10 @@ PANEWIRE="$ROOT/tests/fixtures/panewire"
 HANDOFFKEEP="$ROOT/tests/fixtures/handoffkeep"
 BASE_TMPDIR="${TMPDIR:-/tmp}"
 TMPROOT="$(mktemp -d "$BASE_TMPDIR/wrk-sentinel-detach.XXXXXX")"
+WRK_SOURCE="$WRK"
+WRK="$TMPROOT/wrk"
+cp "$WRK_SOURCE" "$WRK"
+chmod +x "$WRK"
 mkdir -p "$TMPROOT"/{tmp,home,xdg-data,xdg-cache,xdg-config,xdg-state,codex,claude}
 chmod 700 "$TMPROOT/tmp"
 export TMPDIR="$TMPROOT/tmp" HOME="$TMPROOT/home" CODEX_HOME="$TMPROOT/codex"
@@ -216,6 +221,50 @@ setup_sentinel_job() {
     --payload-json "{\"owner_lane\":\"lane-$job\",\"label\":\"lbl-$job\",\"pane_id\":\"w:p1\"}" >/dev/null
 }
 
+case_test_mode_optout_is_leak_checked() {
+  local lib="$TMPROOT/default-mode-lib.sh"
+  local pidfile="$ARBITER_INBOX_ROOT/default-mode/completion-sentinel.pid"
+  local mutant="$TMPROOT/mutant-wrk-no-sentinel-optout"
+  local mutant_lib="$TMPROOT/mutant-no-sentinel-optout-lib.sh"
+  mkdir -p "$(dirname "$pidfile")"
+  awk 'index($0, "case \"${1:-}\" in") == 1 {exit} {print}' "$WRK" >"$lib"
+
+  env -u WRK_TEST_REAL_SENTINEL WRK_TEST_MODE=1 WRK_LIBFILE="$lib" \
+    bash -c '. "$WRK_LIBFILE"; start_completion_sentinel "$@"' \
+      "$WRK" "$pidfile" default-mode owner label w:p1 "$TMPROOT/report.md" || return 3
+  [[ ! -e "$pidfile" ]] || {
+    assertion_red 'WRK_TEST_MODE suppresses a sentinel without explicit opt-in' || return 1
+  }
+
+  python3 - "$WRK" "$mutant" <<'PY'
+import pathlib, sys
+source = pathlib.Path(sys.argv[1]).read_text()
+guard = '''  if [[ "${WRK_TEST_MODE:-}" == 1 && "${WRK_TEST_REAL_SENTINEL:-}" != 1 ]]; then
+    return 0
+  fi
+'''
+assert source.count(guard) == 1, "test-mode sentinel opt-out not found exactly once"
+pathlib.Path(sys.argv[2]).write_text(source.replace(guard, "", 1))
+PY
+  chmod +x "$mutant"
+  awk 'index($0, "case \"${1:-}\" in") == 1 {exit} {print}' "$mutant" >"$mutant_lib"
+  env -u WRK_TEST_REAL_SENTINEL WRK_TEST_MODE=1 WRK_LIBFILE="$mutant_lib" \
+    WRK_COMPLETION_INTERVAL_S=3600 WRK_SENTINEL_TRANSIENT_MAX=100 \
+    HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" \
+    bash -c '. "$WRK_LIBFILE"; start_completion_sentinel "$@"' \
+      "$mutant" "$pidfile" mutant-default-mode owner label w:p1 "$TMPROOT/report.md" || return 3
+  wait_until 10 test -s "$pidfile" || return 3
+  local mutant_rc=0
+  WRK_LEAK_ROOT="$TMPROOT" WRK_LEAK_COPY="$mutant" \
+    python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py" >"$TMPROOT/mutant-leak.out" 2>&1 || mutant_rc=$?
+  [[ "$mutant_rc" -ne 0 ]] && grep -q 'FAIL: test left wrk-related processes alive' "$TMPROOT/mutant-leak.out" || {
+    assertion_red 'dropping the test-mode opt-out is caught by the process leak assertion' || return 1
+  }
+  tw_kill_pidfile "$pidfile" || return 3
+  wait_until 10 test '!' -e "$pidfile" || return 3
+  echo 'PASS test-mode sentinel opt-out and leak assertion mutant'
+}
+
 case_exit_normal() {
   local job report log tail_lines exit_line expected_line
   job="hk2096-exit-normal-$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
@@ -348,6 +397,7 @@ python3 -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
 run_case builder-group-kill case_group_survival builder hk2096-builder
 run_case tester-group-kill case_group_survival tester hk2096-tester
 run_case no-env-launch case_no_env_launch_survival
+case_test_mode_optout_is_leak_checked
 run_case normal-exit case_exit_normal
 for signal_name in HUP INT QUIT TERM; do
   run_case "signal-exit-$signal_name" case_exit_signal "$signal_name"
@@ -393,4 +443,6 @@ expect_red 'drop EXIT trap TERM' case_exit_signal \
 expect_red 'drop EXIT trap failure' case_exit_failure \
   'ASSERT-RED: forced failing sentinel command logs a nonzero exit code and command line'
 WRK="$ORIGINAL_WRK"
+tmp_writers_stop
+WRK_LEAK_ROOT="$TMPROOT" WRK_LEAK_COPY="$WRK" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
 echo 'PASS test-wrk-sentinel-detach'

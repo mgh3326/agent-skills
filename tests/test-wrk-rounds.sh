@@ -34,6 +34,7 @@ set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
 export WRK_TEST_MODE=1
+unset WRK_TEST_REAL_SENTINEL
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
@@ -2094,4 +2095,5 @@ assert_rc 0
 [[ "$(hr_count hr-mut-noident)" -eq 2 ]] || fail "the identity mutant must accept a forged issuer"
 echo "PASS mutant-drop-the-issuer-identity-goes-red"
 
+WRK_LEAK_ROOT="$TMP" WRK_LEAK_COPY="$WRK" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
 echo "PASS test-wrk-rounds"

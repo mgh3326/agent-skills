@@ -12,6 +12,7 @@
 # resolve exactly like production.
 set -euo pipefail
 export WRK_TEST_MODE=1
+unset WRK_TEST_REAL_SENTINEL
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="${WRK_TEST_BIN:-$ROOT/bin/wrk}"
@@ -931,4 +932,5 @@ expect_mut_red "symlinks-followed" case_mut_symlink "symlink target must be unto
 mkmut task 's/echo "task-.state"; return 1/return 0/'
 expect_mut_red "task-check-dropped" case_mut_task "open task"
 
+WRK_LEAK_ROOT="$TMP" WRK_LEAK_COPY="$WRK" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
 echo "ALL ARTIFACT-PRUNE CONTRACT TESTS PASSED"
