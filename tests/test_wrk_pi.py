@@ -1,7 +1,6 @@
 """Hermetic pi spawns and assertion mutants at real wrk call sites."""
 import json
 import os
-import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -46,7 +45,10 @@ class PiSpawnTests(unittest.TestCase):
         self.executable(self.tmp / "arbiter", '#!/bin/bash\ncase "$1" in job-get) exit 7 ;; claim|lease) printf "%s\\n" "$*" >>"' +
                         str(self.tmp / "claims.log") + '"; exit 1 ;; esac\nexit 1\n')
         self.wrk = ROOT / "bin/wrk"
-        self.groups = []
+        self.wrk_lib = self.tmp / "wrk-lib.sh"
+        wrk_source = self.wrk.read_text(encoding="utf-8")
+        self.wrk_lib.write_text(wrk_source.split('\ncase "${1:-}" in', 1)[0] + "\n",
+                                encoding="utf-8")
 
     def executable(self, path, content):
         path.write_text(content)
@@ -72,7 +74,6 @@ class PiSpawnTests(unittest.TestCase):
             command += ["--lane", "pi-builder", "--parent", "director-1"]
         process = subprocess.Popen(command, env=env, text=True, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True)
-        self.groups.append(process.pid)
         stdout, stderr = process.communicate(timeout=40)
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
@@ -199,12 +200,64 @@ else:
 
     def test_model_proof_failures_close_pane(self):
         for scenario in ("wrong-model", "wrong-thinking", "wrong-provider", "missing",
-                         "echo", "stale", "no-provider"):
+                         "echo", "stale", "prefix-model", "truncated-stats"):
             with self.subTest(scenario=scenario):
                 (self.tmp / "herdr.log").unlink(missing_ok=True)
                 result = self.spawn(WRK_PI_SCENARIO=scenario)
                 self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn("pi model not proven", result.stderr)
+                self.assertIn("pane close w:p1", self.log())
+                self.assertNotIn("OK pane=", result.stdout)
+
+    def test_real_footer_proves_every_profile_and_effort(self):
+        # Default fixture = real pi 1.4.0 footer: "model • effort", no provider part.
+        for profile, model in PROFILES.items():
+            for effort in ("low", "medium", "high", "xhigh", "max"):
+                with self.subTest(profile=profile, effort=effort):
+                    (self.tmp / "pi-model.log").unlink(missing_ok=True)
+                    result = self.spawn(profile=profile, effort=effort)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("landed=yes", result.stdout)
+                    self.assertEqual(self.log("pi-model.log").strip(), f"{model}:{effort}")
+
+    def test_provider_footer_form_still_proves(self):
+        for profile in PROFILES:
+            with self.subTest(profile=profile):
+                result = self.spawn(profile=profile, effort="xhigh",
+                                    WRK_PI_SCENARIO="provider-form")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+
+    def test_real_footer_shapes_prove(self):
+        # Full 1.4.0 stats prefix with "(auto)", and a branch/session suffix on the cwd row.
+        for profile in PROFILES:
+            for scenario in ("full-stats", "cwd-suffix"):
+                with self.subTest(profile=profile, scenario=scenario):
+                    result = self.spawn(profile=profile, effort="low", WRK_PI_SCENARIO=scenario)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("landed=yes", result.stdout)
+
+    def test_pi_footer_fail_closed_shapes(self):
+        # Invariant: footer row 2 must carry the exact launched model id and
+        # exact effort. Wrong model, wrong effort, prefix-only model ids and
+        # truncated rows all close the pane; nothing else can stand in for them.
+        cases = (
+            ("pi-haiku55", "high", "wrong-model-sonnet"),
+            ("pi-haiku55", "low", "wrong-thinking-high"),
+            ("pi-sonnet55", "high", "wrong-thinking"),
+            ("pi-haiku55", "high", "prefix-model"),
+            ("pi-haiku55", "high", "truncated-stats"),
+            ("pi-sonnet55", "high", "extension-match"),
+        )
+        for profile, effort, scenario in cases:
+            with self.subTest(profile=profile, effort=effort, scenario=scenario):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
+                result = self.spawn(profile=profile, effort=effort, WRK_PI_SCENARIO=scenario)
+                model = PROFILES[profile].split("/", 1)[1]
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("pi model not proven", result.stderr)
+                self.assertIn(f"expected footer '{model} • {effort}' (provider part optional)",
+                              result.stderr)
                 self.assertIn("pane close w:p1", self.log())
                 self.assertNotIn("OK pane=", result.stdout)
 
@@ -303,6 +356,7 @@ else:
         self.assertIn("OK pane=", allowed.stdout)
 
     def test_anthropic_api_quota_record(self):
+        sentinel_stop_error = None
         try:
             result = self.spawn(ARBITER_BIN=str(ROOT / "bin/arbiter"),
                                 WRK_COMPLETION_INTERVAL_S="3600")
@@ -321,11 +375,17 @@ else:
                                        capture_output=True, text=True)
                 if "sentinel pi-fixture " in check.stdout and str(ROOT / "bin/wrk") in check.stdout:
                     try:
-                        group = os.getpgid(pid)
-                        if group in self.groups:
-                            os.killpg(group, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                        stop_env = dict(self.env, WRK_LIBFILE=str(self.wrk_lib))
+                        stop = subprocess.run(
+                            ["bash", "-c", '. "$WRK_LIBFILE"; stop_completion_sentinel "$1" "$2"',
+                             "wrk-test-cleanup", "pi-fixture", str(pid)],
+                            env=stop_env, capture_output=True, text=True, timeout=30)
+                        if stop.returncode:
+                            sentinel_stop_error = (
+                                f"exact-pid sentinel stop failed for {pid}: "
+                                f"{stop.stdout}{stop.stderr}")
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        sentinel_stop_error = f"exact-pid sentinel stop failed for {pid}: {exc}"
             # This test owns every writer under its root. Verify exact pids
             # with the shared library before TemporaryDirectory removes it.
             stopped = subprocess.run(
@@ -336,6 +396,8 @@ else:
                 self.keep_tmp = True
                 self.temp._finalizer.detach()  # preserve evidence for live writers
             self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            if sentinel_stop_error:
+                self.fail(sentinel_stop_error)
 
 
 class PiMutantTests(unittest.TestCase):
@@ -379,6 +441,15 @@ class PiMutantTests(unittest.TestCase):
             "stats-row": ('sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)',
                           'sys.exit(0 if any(re.fullmatch(pattern, row) for row in footer) else 1)',
                           "test_footer_boundaries"),
+            # Invariant: the effort in footer row 2 equals PI_THINKING exactly.
+            "effort": ('re.escape(effort) + r"$")', 'r"[a-z]+$")',
+                       "test_pi_footer_fail_closed_shapes"),
+            # Invariant: the model id matches whole, never as a substring or prefix.
+            "model-substring": ('re.escape(model) + r" • "', 'r"\\S*" + re.escape(model) + r"\\S* • "',
+                                "test_pi_footer_fail_closed_shapes"),
+            # Invariant: the optional provider part is exactly the expected provider.
+            "provider-any": ('re.escape(provider) +', 'r"[a-z]+" +',
+                             "test_model_proof_failures_close_pane"),
         }
         for name, (old, new, method) in mutants.items():
             with self.subTest(mutant=name):

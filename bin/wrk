@@ -171,7 +171,7 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
+Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy|usage> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
@@ -193,6 +193,7 @@ Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|nam
   wrk profiles
   wrk heavy -- <command> [args...]
   wrk heavy status
+  wrk usage [--alert]
 
 Run 'wrk <command> --help' for command-specific usage.
 USAGE
@@ -1341,8 +1342,10 @@ pwd_pattern = (r"(?:" + "|".join(re.escape(p) for p in paths) +
 if not re.fullmatch(pwd_pattern, footer[0]):
     sys.exit(1)
 provider, model = expected.split("/", 1)
-pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(provider) +
-           r"\) " + re.escape(model) + r" • " + re.escape(effort) + r"$")
+# pi 1.4.0 prints "model • effort" with no provider part; the older
+# "(provider) model • effort" form is accepted only for the expected provider.
+pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+(?:\(" + re.escape(provider) +
+           r"\) )?" + re.escape(model) + r" • " + re.escape(effort) + r"$")
 sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
 ' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
@@ -8066,6 +8069,33 @@ sentinel_self_exit() {
   exit "$code"
 }
 
+# sentinel_exit_log RC FILE LINE — the watcher always leaves a final record,
+# after its action= observations, so an unexpected shell exit is diagnosable.
+# Bash's EXIT trap reports status zero for an otherwise-unhandled TERM; the
+# signal handlers below turn the common terminating signals into their
+# conventional 128+n exit statuses before this formatter runs.
+sentinel_exit_log() {
+  local code="$1" logfile="$2" line="$3" signal="" signal_number
+  if [[ "$code" =~ ^[0-9]+$ ]] && (( code >= 129 && code <= 255 )); then
+    signal_number=$(( code - 128 ))
+    signal="$(kill -l "$signal_number" 2>/dev/null || true)"
+    [[ "$signal" =~ ^[A-Z][A-Z0-9]*$ ]] || signal=""
+  fi
+  if [[ -n "$signal" ]]; then
+    printf '%s sentinel-exit code=%s line=%s signal=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$code" "$line" "$signal" >>"$logfile" 2>/dev/null || true
+  else
+    printf '%s sentinel-exit code=%s line=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$code" "$line" >>"$logfile" 2>/dev/null || true
+  fi
+}
+
+sentinel_exit_trap() {
+  local code="$1"
+  trap - DEBUG EXIT
+  sentinel_exit_log "$code" "$SENTINEL_EXIT_LOGFILE" "${SENTINEL_LAST_COMMAND_LINE:-0}"
+}
+
 # job_recovered_record JOB OWNER LABEL PANE REASON LOST_DURATION_S
 # One flat job.recovered for the end of a lost episode. Not a terminal and
 # not a revive. Not emitted through panewire, same as job.lost.
@@ -8110,6 +8140,17 @@ sentinel_cmd() {
   jobdir="$(wrk_jobs_root)/$job"
   mkdir -p "$jobdir"
   logfile="$jobdir/completion-sentinel.log"
+  SENTINEL_EXIT_LOGFILE="$logfile"
+  SENTINEL_LAST_COMMAND_LINE=0
+  trap 'sentinel_exit_trap "$?"' EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 131' QUIT
+  trap 'exit 143' TERM
+  # Bash emits a synthetic DEBUG callback while dispatching EXIT (and may
+  # repeat the failed command's callback during errexit); keep only callbacks
+  # that precede a successful command in this function.
+  trap 'if (( $? == 0 && LINENO > 1 )); then SENTINEL_LAST_COMMAND_LINE=$LINENO; fi' DEBUG
   if [[ "$pane_kind" == devin && -n "$observed_rung" ]]; then
     wrk_path="$(python3 - "$0" <<'PY'
 from pathlib import Path
@@ -8381,9 +8422,13 @@ start_completion_sentinel() {
   # prove the pid still belongs to the process it launched — a bare pid is
   # silently recyclable by the kernel.
   if [[ "${#SENTINEL_ENV[@]}" -gt 0 ]]; then
-    ( nohup env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
+    ( nohup python3 -c 'import os, signal, sys; [signal.signal(sig, signal.SIG_DFL) for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+      env "${SENTINEL_ENV[@]}" "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 &
+      printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   else
-    ( nohup "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 & printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
+    ( nohup python3 -c 'import os, signal, sys; [signal.signal(sig, signal.SIG_DFL) for sig in (signal.SIGHUP, signal.SIGINT, signal.SIGQUIT, signal.SIGTERM)]; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])' \
+      "$0" sentinel "$@" >>"${pidfile%.pid}.log" 2>&1 &
+      printf '%s\nstarted=%s\n' "$!" "$(date +%s)" >"$pidfile" )
   fi
 }
 
@@ -10907,6 +10952,211 @@ hosts_cmd() {
   done
 }
 
+usage_help() {
+  cat <<'USAGE'
+Usage: wrk usage [--alert]
+
+Measure this host's fleet output under ~/work and print per-bucket totals.
+The command is read-only: sizes come from du at one level, no file contents
+are read, and nothing is deleted or moved.
+
+Buckets:
+  jobs        ~/work/herdr-inbox/jobs total, plus the top 5 job dirs by size
+  worktrees   linked worktrees under ~/work — a top-level dir whose .git is
+              a file — with their count and total
+  webqa       ~/work/webqa-runner when present
+  rest        the rest of ~/work (the total minus the buckets above)
+
+With --alert, when the measured total exceeds the threshold — hosts.toml
+[local] fleet_usage_alert_gb, default 100 when absent — one lane.event is
+emitted to director-1 with the host, the totals and the top 5. At most one
+alert per host per 24h; the dedup state is .fleet-usage-alert-<host> under
+the jobs directory. Without --alert the command only prints.
+
+  --alert    emit the director-1 lane event when over threshold
+  -h, --help show this usage
+USAGE
+}
+
+usage_du_kib() {  # DIR — du KiB of DIR; rc 1 when DIR exists but du failed
+  local out rc=0
+  [[ -e "$1" || -L "$1" ]] || { printf '0\n'; return 0; }
+  out="$(du -sk "$1" 2>/dev/null)" || rc=$?
+  if [[ $rc -eq 0 && ${out%%[[:space:]]*} =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "${out%%[[:space:]]*}"
+  else
+    return 1
+  fi
+}
+
+usage_measure() {  # WORK_ROOT — fill the USAGE_* bucket fields
+  local work d name kib rows
+  # Resolve a symlinked work root to its real path so du measures the
+  # target, never the link itself (a link would read near-zero).
+  work="$1"
+  if [[ -e "$work" || -L "$work" ]]; then
+    work="$(cd "$work" 2>/dev/null && pwd -P)" || work="$1"
+  fi
+  USAGE_WORK="$work"
+  USAGE_HOST="${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+  USAGE_JOBS="$work/herdr-inbox/jobs"
+  USAGE_WEBQA="$work/webqa-runner"
+  USAGE_INCOMPLETE=0
+  USAGE_TOTAL_KIB="$(usage_du_kib "$work")" ||
+    { USAGE_INCOMPLETE=1; USAGE_TOTAL_KIB=0; }
+  USAGE_JOBS_KIB="$(usage_du_kib "$USAGE_JOBS")" ||
+    { USAGE_INCOMPLETE=1; USAGE_JOBS_KIB=0; }
+  USAGE_WT_COUNT=0 USAGE_WT_KIB=0
+  USAGE_WEBQA_PRESENT=0 USAGE_WEBQA_KIB=0
+  USAGE_TOP5=""
+  if [[ -d "$USAGE_JOBS" ]]; then
+    # Collect the rows in the parent (not inside a pipe) so a failed du
+    # flags the run incomplete, then sort once and keep the first five
+    # with awk NR<=5 — reading the whole stream, never closing it early
+    # (an early head close would SIGPIPE sort and fail the command under
+    # set -o pipefail).
+    rows=""
+    for d in "$USAGE_JOBS"/*/; do
+      [[ -d "$d" ]] || continue
+      name="${d%/}"; name="${name##*/}"
+      if kib="$(usage_du_kib "$d")"; then
+        rows+="$kib"$'\t'"$name"$'\n'
+      else
+        USAGE_INCOMPLETE=1
+      fi
+    done
+    if [[ -n "$rows" ]]; then
+      USAGE_TOP5="$(printf '%s' "$rows" | sort -rn |
+        awk -F'\t' 'NR<=5{printf "%s%s:%s",(NR>1?",":""),$2,$1}')"
+    fi
+  fi
+  # Linked worktrees: a top-level dir whose .git is a FILE (a gitdir
+  # pointer), never a .git dir — the file type alone decides, no content
+  # is read. herdr-inbox and webqa-runner keep their own buckets.
+  for d in "$work"/*/; do
+    [[ -d "$d" ]] || continue
+    name="${d%/}"; name="${name##*/}"
+    case "$name" in herdr-inbox|webqa-runner) continue ;; esac
+    if [[ -f "$d.git" ]]; then
+      USAGE_WT_COUNT=$((USAGE_WT_COUNT + 1))
+      if kib="$(usage_du_kib "$d")"; then
+        USAGE_WT_KIB=$((USAGE_WT_KIB + kib))
+      else
+        USAGE_INCOMPLETE=1
+      fi
+    fi
+  done
+  if [[ -e "$USAGE_WEBQA" || -L "$USAGE_WEBQA" ]]; then
+    USAGE_WEBQA_PRESENT=1
+    USAGE_WEBQA_KIB="$(usage_du_kib "$USAGE_WEBQA")" ||
+      { USAGE_INCOMPLETE=1; USAGE_WEBQA_KIB=0; }
+  fi
+  USAGE_REST_KIB=$((USAGE_TOTAL_KIB - USAGE_JOBS_KIB - USAGE_WT_KIB - USAGE_WEBQA_KIB))
+  if ((USAGE_REST_KIB < 0)); then USAGE_REST_KIB=0; fi
+  ((USAGE_INCOMPLETE == 0)) ||
+    warn "wrk usage: one or more du measurements failed; totals are incomplete (work=$USAGE_WORK)"
+}
+
+usage_threshold() {  # fill USAGE_THRESHOLD_GB and USAGE_THRESHOLD_SRC
+  local value
+  USAGE_THRESHOLD_GB=100
+  USAGE_THRESHOLD_SRC=default
+  if value="$(spillover_value local fleet_usage_alert_gb 2>/dev/null)"; then
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+      die "$(spillover_config): [local] fleet_usage_alert_gb must be a bare non-negative integer (got '$value')"
+    USAGE_THRESHOLD_GB="$value"
+    USAGE_THRESHOLD_SRC="$(spillover_config) [local] fleet_usage_alert_gb"
+  fi
+}
+
+usage_over_threshold() {
+  awk -v t="$USAGE_TOTAL_KIB" -v g="$USAGE_THRESHOLD_GB" \
+    'BEGIN{exit !(t > g*1048576)}'
+}
+
+usage_report() {
+  printf 'host=%s work_root=%s total_kib=%s total_gib=%s\n' \
+    "$USAGE_HOST" "$USAGE_WORK" "$USAGE_TOTAL_KIB" \
+    "$(awk -v k="$USAGE_TOTAL_KIB" 'BEGIN{printf "%.3f", k/1048576}')"
+  printf 'jobs_root=%s jobs_kib=%s\n' "$USAGE_JOBS" "$USAGE_JOBS_KIB"
+  printf 'jobs_top5=%s\n' "$USAGE_TOP5"
+  printf 'worktrees_count=%s worktrees_kib=%s\n' "$USAGE_WT_COUNT" "$USAGE_WT_KIB"
+  if ((USAGE_WEBQA_PRESENT)); then
+    printf 'webqa_runner_kib=%s\n' "$USAGE_WEBQA_KIB"
+  else
+    printf 'webqa_runner=absent\n'
+  fi
+  printf 'rest_kib=%s\n' "$USAGE_REST_KIB"
+  local over=no complete=yes
+  usage_over_threshold && over=yes
+  ((USAGE_INCOMPLETE == 0)) || complete=no
+  printf 'measurement=%s\n' "$complete"
+  printf 'fleet_usage_alert_gb=%s threshold_src=%s over_threshold=%s\n' \
+    "$USAGE_THRESHOLD_GB" "$USAGE_THRESHOLD_SRC" "$over"
+}
+
+usage_alert_host_key() {
+  printf '%s' "$USAGE_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c 'a-z0-9.-' '-'
+}
+
+usage_alert() {
+  if ((USAGE_INCOMPLETE)); then
+    printf 'alert=skipped reason=incomplete-measurement\n'
+    return 0
+  fi
+  if ! usage_over_threshold; then
+    printf 'alert=under-threshold\n'
+    return 0
+  fi
+  local state now last=""
+  state="$USAGE_JOBS/.fleet-usage-alert-$(usage_alert_host_key)"
+  now="$(date +%s)"
+  if [[ -f "$state" ]]; then
+    last="$(awk 'NR==1{print $1}' "$state" 2>/dev/null || true)"
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < 86400 )); then
+      printf 'alert=dedup state=%s\n' "$state"
+      return 0
+    fi
+  fi
+  local panewire
+  panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
+  if [[ -z "$panewire" ]]; then
+    warn "panewire not found; fleet usage alert not emitted (host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB)"
+    printf 'alert=failed reason=panewire-not-found\n'
+    return 0
+  fi
+  local text
+  text="fleet_usage_alert host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB total_gib=$(awk -v k="$USAGE_TOTAL_KIB" 'BEGIN{printf "%.3f", k/1048576}') jobs_kib=$USAGE_JOBS_KIB worktrees_count=$USAGE_WT_COUNT worktrees_kib=$USAGE_WT_KIB webqa_runner_kib=$USAGE_WEBQA_KIB rest_kib=$USAGE_REST_KIB threshold_gb=$USAGE_THRESHOLD_GB top5=$USAGE_TOP5"
+  if run_bounded 5 "$panewire" emit --kind lane.event --lane director-1 \
+      --event-id "fleet-usage-$(usage_alert_host_key)-$now" \
+      --text "$text" --inbox-root "$(dirname "$USAGE_JOBS")" >/dev/null 2>&1; then
+    mkdir -p "$USAGE_JOBS" 2>/dev/null || true
+    printf '%s\n' "$now" >"$state" 2>/dev/null ||
+      warn "fleet usage alert state could not be written: $state"
+    printf 'alert=emitted lane=director-1 event_id=fleet-usage-%s-%s\n' \
+      "$(usage_alert_host_key)" "$now"
+  else
+    warn "panewire emit failed; fleet usage alert left unstamped (host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB)"
+    printf 'alert=failed reason=emit-rc\n'
+  fi
+}
+
+usage_cmd() {
+  local alert=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) [[ $# -eq 1 ]] || die "unexpected argument '$2'"; usage_help; return 0 ;;
+      --alert) alert=1; shift ;;
+      *) die "unknown usage option '$1'" ;;
+    esac
+  done
+  usage_measure "$HOME/work"
+  usage_threshold
+  usage_report
+  ((alert)) || return 0
+  usage_alert
+}
+
 
 # ---------------------------------------------------------------- hk task link
 # #768 / hk:doc decision/2026-09-27/task-job-linkage item 1: every spawned job
@@ -12194,7 +12444,7 @@ print(value if isinstance(value, str) else "")
   round_ext_builder_recheck
   spawn_deliver_brief
   if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then
-    echo "wrk: $MODEL pi model not proven: expected $PROFILE_MODEL:$PI_THINKING" >&2
+    echo "wrk: $MODEL pi model not proven: expected footer '${PROFILE_MODEL#*/} • $PI_THINKING' (provider part optional)" >&2
     spawn_pane_cleanup
     return 1
   fi
@@ -15497,6 +15747,7 @@ case "${1:-}" in
   profiles) shift; profiles_cmd "$@" ;;
   hosts) shift; hosts_cmd "$@" ;;
   heavy) shift; heavy_cmd "$@" ;;
+  usage) shift; usage_cmd "$@" ;;
   "") usage >&2; exit 2 ;;
   *) die "unknown command '$1' (see 'wrk --help')" ;;
 esac

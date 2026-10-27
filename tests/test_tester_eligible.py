@@ -1011,21 +1011,22 @@ class EligibilityFixtures(unittest.TestCase):
         live_run = {"id": 123, "run_attempt": 1, "event": "pull_request", "head_sha": evidence["head"],
                     "status": "completed", "conclusion": "success", "pull_requests": [
                         {"number": 99, "head": {"sha": evidence["head"]}, "base": {"sha": evidence["base"]}}]}
+        required_jobs = self.policy["required_ci_jobs_by_repo"]["agent-skills"]
         live_jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"}
-                              for name in ("ubuntu-latest", "macos-latest")]}
+                              for name in required_jobs]}
         live_check = common.result("PASS", "CI_ATTEMPT_READ", "task:723")
         with mock.patch.object(eligible, "_current_pr", return_value=common.result("PASS", "PR_REFS_CURRENT", "checker:G2+G4")), \
              mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, live_jobs, live_check)):
             checks = self.check(evidence, "pre-merge")
         self.assertEqual(eligible.overall(checks), "PASS")
         self.assert_case(checks, "report", "PASS", "EXACT_HEAD_PASS")
-        with mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, {"jobs": live_jobs["jobs"][:1]}, live_check)):
+        with mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, {"jobs": []}, live_check)):
             self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_JOB_MISSING")
         missing_run = common.result("UNVERIFIED", "CI_LOOKUP_FAILED", "task:723")
         with mock.patch.object(eligible, "read_ci_attempt", return_value=(None, None, missing_run)):
             self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_LOOKUP_FAILED")
         skipped_jobs = json.loads(json.dumps(live_jobs))
-        skipped_jobs["jobs"][1]["conclusion"] = "skipped"
+        skipped_jobs["jobs"][0]["conclusion"] = "skipped"
         with mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, skipped_jobs, live_check)):
             self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_JOB_SKIPPED")
         stale_run = json.loads(json.dumps(live_run))
@@ -1049,8 +1050,9 @@ class EligibilityFixtures(unittest.TestCase):
                     "head_sha": evidence["head"], "status": "completed", "conclusion": "success",
                     "pull_requests": [{"number": 99, "head": {"sha": evidence["head"]},
                                         "base": {"sha": evidence["base"]}}]}
+        required_jobs = self.policy["required_ci_jobs_by_repo"]["agent-skills"]
         jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"}
-                          for name in ("ubuntu-latest", "macos-latest")]}
+                          for name in required_jobs]}
         lookup = common.result("PASS", "CI_ATTEMPT_READ", "task:723")
         expected = ("UNVERIFIED", "CI_ATTEMPT_MISMATCH")
         with mock.patch.object(eligible, "read_ci_attempt", return_value=(dispatch, jobs, lookup)):

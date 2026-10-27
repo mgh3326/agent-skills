@@ -109,10 +109,21 @@ os.utime(path, (stamp, stamp))
 PY
 }
 
+# ago SECONDS — ISO-8601 UTC instant SECONDS before now. Ended-job fixtures
+# are relative to the real clock so the age they test never drifts.
+ago() {
+  python3 -c '
+import datetime, sys
+moment = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(
+    seconds=int(sys.argv[1]))
+print(moment.strftime("%Y-%m-%dT%H:%M:%SZ"))
+' "$1"
+}
+
 # mk_ended_job JOB TASK_ID PANE [MOMENT] — claim(task_id) + spawned + completed,
 # all at MOMENT (default five days ago: past the default --heavy-age 3d).
 mk_ended_job() {
-  local moment="${4:-2026-10-21T00:00:00Z}"
+  local moment="${4:-$(ago 432000)}"
   local ev="$INBOX/$1/events"
   write_event "$ev" "$1" job.claim "$moment" \
     "{\"owner_lane\":\"lane-a\",\"label\":\"lbl\",\"task_id\":$2}"
@@ -387,7 +398,7 @@ echo "PASS ap2e pane-alive"
 # AP2f — inside --heavy-age: terminal record only moments old.
 reset_case ap2f
 hk_task 1 merged
-mk_ended_job ap2f 1 w:p9 "2026-10-26T10:00:00Z"
+mk_ended_job ap2f 1 w:p9 "$(ago 86400)"
 mk_artifact "$INBOX/ap2f/browser-cache"
 policy_min <<'JSON'
 [{"class": "cache", "root": "jobs", "glob": "browser-*"}]
@@ -681,7 +692,7 @@ grep -q "ap7b.*class=cache.*action=removed" <<<"$OUT" ||
 # --heavy-age 1d releases it.
 reset_case ap7c
 hk_task 1 merged
-mk_ended_job ap7c 1 w:p9 "2026-10-24T12:00:00Z"
+mk_ended_job ap7c 1 w:p9 "$(ago 172800)"
 mk_artifact "$INBOX/ap7c/browser-cache"
 policy_min <<'JSON'
 [{"class": "cache", "root": "jobs", "glob": "browser-*"}]
