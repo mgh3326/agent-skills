@@ -2066,8 +2066,8 @@ class RealBinaryCase(unittest.TestCase):
 
         root_mutant = self.mutant(
             WRK,
-            '  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"\n',
-            '  jobs_root="$(wrk_jobs_root)"\n',
+            '  wrk_trust_guard\n  local jobs_root\n  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"\n',
+            '  wrk_trust_guard\n  local jobs_root\n  jobs_root="$(wrk_jobs_root)"\n',
             "auditroot",
         )
         with self.assertRaises(AssertionError):
