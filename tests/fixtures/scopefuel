@@ -275,7 +275,7 @@ if [[ "${1:-}" != gate ]]; then
   exit 2
 fi
 shift
-profile="" operator_request="" requested_by="" requested_by_seen=0 purpose="" effort=""
+profile="" operator_request="" requested_by="" requested_by_seen=0 purpose="" effort="" role=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -m|--operator-request|--requested-by|--purpose|--effort|--role)
@@ -286,6 +286,7 @@ while [[ $# -gt 0 ]]; do
         --requested-by) requested_by="$2"; requested_by_seen=1 ;;
         --purpose) purpose="$2" ;;
         --effort) effort="$2" ;;
+        --role) role="$2" ;;
       esac
       shift 2 ;;
     *) echo 'fixture scopefuel: unexpected arguments' >&2; exit 2 ;;
@@ -300,8 +301,24 @@ if [[ -n "${WRK_SCOPEFUEL_LOG:-}" ]]; then
   [[ -z "$operator_request" ]] || printf ' --operator-request %s' "$operator_request" >>"$WRK_SCOPEFUEL_LOG"
   [[ "$requested_by_seen" -eq 0 ]] || printf ' --requested-by %s' "$requested_by" >>"$WRK_SCOPEFUEL_LOG"
   [[ -z "$purpose" ]] || printf ' --purpose %s' "$purpose" >>"$WRK_SCOPEFUEL_LOG"
+  if [[ "${WRK_SCOPEFUEL_LOG_ROLE:-0}" == 1 ]]; then
+    [[ -z "$role" ]] || printf ' --role %s' "$role" >>"$WRK_SCOPEFUEL_LOG"
+  else
+    case "$profile" in
+      pi-haiku55|pi-sonnet55|pi-opus55)
+        [[ -z "$role" ]] || printf ' --role %s' "$role" >>"$WRK_SCOPEFUEL_LOG" ;;
+    esac
+  fi
   printf '\n%s\n' "$profile" >>"$WRK_SCOPEFUEL_LOG"
 fi
+# hk 2079: pi credit rungs admit only worker/tester seats.
+case "$profile" in
+  pi-haiku55|pi-sonnet55|pi-opus55)
+    case "$role" in
+      worker|tester) : ;;
+      *) echo "role_restricted: $profile — worker/tester-only" >&2; exit 5 ;;
+    esac ;;
+esac
 # task #527: mirror the real gate's astra role denial — ASTRA_ROLE_PROFILES
 # membership (model identity, not a name substring) plus a purpose whitelist.
 # Role denial runs BEFORE the operator-request checks and exits 5, distinct
