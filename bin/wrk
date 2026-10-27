@@ -171,7 +171,7 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|name-sync|profiles|hosts|heavy> [options]
+Usage: wrk <spawn|done|restore|escalate|joined|round|reap|worktree-reap|lanes-missing|find|name-sync|profiles|hosts|heavy|usage> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
@@ -186,6 +186,7 @@ Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|nam
   wrk round status JOB
   wrk round audit [--lane LANE]
   wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders|--include-captains]
+  wrk worktree-reap [--age 3d] [--apply]
   wrk lanes-missing
   wrk prune [--apply] [--stale-age AGE] [--heavy-age AGE] [--job JOB] [--lane LANE] [--policy PATH]
   wrk find <name-or-label> [--pane-only]
@@ -193,6 +194,7 @@ Usage: wrk <spawn|done|restore|escalate|joined|round|reap|lanes-missing|find|nam
   wrk profiles
   wrk heavy -- <command> [args...]
   wrk heavy status
+  wrk usage [--alert]
 
 Run 'wrk <command> --help' for command-specific usage.
 USAGE
@@ -10999,6 +11001,211 @@ hosts_cmd() {
   done
 }
 
+usage_help() {
+  cat <<'USAGE'
+Usage: wrk usage [--alert]
+
+Measure this host's fleet output under ~/work and print per-bucket totals.
+The command is read-only: sizes come from du at one level, no file contents
+are read, and nothing is deleted or moved.
+
+Buckets:
+  jobs        ~/work/herdr-inbox/jobs total, plus the top 5 job dirs by size
+  worktrees   linked worktrees under ~/work — a top-level dir whose .git is
+              a file — with their count and total
+  webqa       ~/work/webqa-runner when present
+  rest        the rest of ~/work (the total minus the buckets above)
+
+With --alert, when the measured total exceeds the threshold — hosts.toml
+[local] fleet_usage_alert_gb, default 100 when absent — one lane.event is
+emitted to director-1 with the host, the totals and the top 5. At most one
+alert per host per 24h; the dedup state is .fleet-usage-alert-<host> under
+the jobs directory. Without --alert the command only prints.
+
+  --alert    emit the director-1 lane event when over threshold
+  -h, --help show this usage
+USAGE
+}
+
+usage_du_kib() {  # DIR — du KiB of DIR; rc 1 when DIR exists but du failed
+  local out rc=0
+  [[ -e "$1" || -L "$1" ]] || { printf '0\n'; return 0; }
+  out="$(du -sk "$1" 2>/dev/null)" || rc=$?
+  if [[ $rc -eq 0 && ${out%%[[:space:]]*} =~ ^[0-9]+$ ]]; then
+    printf '%s\n' "${out%%[[:space:]]*}"
+  else
+    return 1
+  fi
+}
+
+usage_measure() {  # WORK_ROOT — fill the USAGE_* bucket fields
+  local work d name kib rows
+  # Resolve a symlinked work root to its real path so du measures the
+  # target, never the link itself (a link would read near-zero).
+  work="$1"
+  if [[ -e "$work" || -L "$work" ]]; then
+    work="$(cd "$work" 2>/dev/null && pwd -P)" || work="$1"
+  fi
+  USAGE_WORK="$work"
+  USAGE_HOST="${HOSTNAME:-$(hostname 2>/dev/null || echo unknown)}"
+  USAGE_JOBS="$work/herdr-inbox/jobs"
+  USAGE_WEBQA="$work/webqa-runner"
+  USAGE_INCOMPLETE=0
+  USAGE_TOTAL_KIB="$(usage_du_kib "$work")" ||
+    { USAGE_INCOMPLETE=1; USAGE_TOTAL_KIB=0; }
+  USAGE_JOBS_KIB="$(usage_du_kib "$USAGE_JOBS")" ||
+    { USAGE_INCOMPLETE=1; USAGE_JOBS_KIB=0; }
+  USAGE_WT_COUNT=0 USAGE_WT_KIB=0
+  USAGE_WEBQA_PRESENT=0 USAGE_WEBQA_KIB=0
+  USAGE_TOP5=""
+  if [[ -d "$USAGE_JOBS" ]]; then
+    # Collect the rows in the parent (not inside a pipe) so a failed du
+    # flags the run incomplete, then sort once and keep the first five
+    # with awk NR<=5 — reading the whole stream, never closing it early
+    # (an early head close would SIGPIPE sort and fail the command under
+    # set -o pipefail).
+    rows=""
+    for d in "$USAGE_JOBS"/*/; do
+      [[ -d "$d" ]] || continue
+      name="${d%/}"; name="${name##*/}"
+      if kib="$(usage_du_kib "$d")"; then
+        rows+="$kib"$'\t'"$name"$'\n'
+      else
+        USAGE_INCOMPLETE=1
+      fi
+    done
+    if [[ -n "$rows" ]]; then
+      USAGE_TOP5="$(printf '%s' "$rows" | sort -rn |
+        awk -F'\t' 'NR<=5{printf "%s%s:%s",(NR>1?",":""),$2,$1}')"
+    fi
+  fi
+  # Linked worktrees: a top-level dir whose .git is a FILE (a gitdir
+  # pointer), never a .git dir — the file type alone decides, no content
+  # is read. herdr-inbox and webqa-runner keep their own buckets.
+  for d in "$work"/*/; do
+    [[ -d "$d" ]] || continue
+    name="${d%/}"; name="${name##*/}"
+    case "$name" in herdr-inbox|webqa-runner) continue ;; esac
+    if [[ -f "$d.git" ]]; then
+      USAGE_WT_COUNT=$((USAGE_WT_COUNT + 1))
+      if kib="$(usage_du_kib "$d")"; then
+        USAGE_WT_KIB=$((USAGE_WT_KIB + kib))
+      else
+        USAGE_INCOMPLETE=1
+      fi
+    fi
+  done
+  if [[ -e "$USAGE_WEBQA" || -L "$USAGE_WEBQA" ]]; then
+    USAGE_WEBQA_PRESENT=1
+    USAGE_WEBQA_KIB="$(usage_du_kib "$USAGE_WEBQA")" ||
+      { USAGE_INCOMPLETE=1; USAGE_WEBQA_KIB=0; }
+  fi
+  USAGE_REST_KIB=$((USAGE_TOTAL_KIB - USAGE_JOBS_KIB - USAGE_WT_KIB - USAGE_WEBQA_KIB))
+  if ((USAGE_REST_KIB < 0)); then USAGE_REST_KIB=0; fi
+  ((USAGE_INCOMPLETE == 0)) ||
+    warn "wrk usage: one or more du measurements failed; totals are incomplete (work=$USAGE_WORK)"
+}
+
+usage_threshold() {  # fill USAGE_THRESHOLD_GB and USAGE_THRESHOLD_SRC
+  local value
+  USAGE_THRESHOLD_GB=100
+  USAGE_THRESHOLD_SRC=default
+  if value="$(spillover_value local fleet_usage_alert_gb 2>/dev/null)"; then
+    [[ "$value" =~ ^[0-9]+$ ]] ||
+      die "$(spillover_config): [local] fleet_usage_alert_gb must be a bare non-negative integer (got '$value')"
+    USAGE_THRESHOLD_GB="$value"
+    USAGE_THRESHOLD_SRC="$(spillover_config) [local] fleet_usage_alert_gb"
+  fi
+}
+
+usage_over_threshold() {
+  awk -v t="$USAGE_TOTAL_KIB" -v g="$USAGE_THRESHOLD_GB" \
+    'BEGIN{exit !(t > g*1048576)}'
+}
+
+usage_report() {
+  printf 'host=%s work_root=%s total_kib=%s total_gib=%s\n' \
+    "$USAGE_HOST" "$USAGE_WORK" "$USAGE_TOTAL_KIB" \
+    "$(awk -v k="$USAGE_TOTAL_KIB" 'BEGIN{printf "%.3f", k/1048576}')"
+  printf 'jobs_root=%s jobs_kib=%s\n' "$USAGE_JOBS" "$USAGE_JOBS_KIB"
+  printf 'jobs_top5=%s\n' "$USAGE_TOP5"
+  printf 'worktrees_count=%s worktrees_kib=%s\n' "$USAGE_WT_COUNT" "$USAGE_WT_KIB"
+  if ((USAGE_WEBQA_PRESENT)); then
+    printf 'webqa_runner_kib=%s\n' "$USAGE_WEBQA_KIB"
+  else
+    printf 'webqa_runner=absent\n'
+  fi
+  printf 'rest_kib=%s\n' "$USAGE_REST_KIB"
+  local over=no complete=yes
+  usage_over_threshold && over=yes
+  ((USAGE_INCOMPLETE == 0)) || complete=no
+  printf 'measurement=%s\n' "$complete"
+  printf 'fleet_usage_alert_gb=%s threshold_src=%s over_threshold=%s\n' \
+    "$USAGE_THRESHOLD_GB" "$USAGE_THRESHOLD_SRC" "$over"
+}
+
+usage_alert_host_key() {
+  printf '%s' "$USAGE_HOST" | LC_ALL=C tr '[:upper:]' '[:lower:]' | LC_ALL=C tr -c 'a-z0-9.-' '-'
+}
+
+usage_alert() {
+  if ((USAGE_INCOMPLETE)); then
+    printf 'alert=skipped reason=incomplete-measurement\n'
+    return 0
+  fi
+  if ! usage_over_threshold; then
+    printf 'alert=under-threshold\n'
+    return 0
+  fi
+  local state now last=""
+  state="$USAGE_JOBS/.fleet-usage-alert-$(usage_alert_host_key)"
+  now="$(date +%s)"
+  if [[ -f "$state" ]]; then
+    last="$(awk 'NR==1{print $1}' "$state" 2>/dev/null || true)"
+    if [[ "$last" =~ ^[0-9]+$ ]] && (( now - last < 86400 )); then
+      printf 'alert=dedup state=%s\n' "$state"
+      return 0
+    fi
+  fi
+  local panewire
+  panewire="$(command -v "${PANEWIRE_BIN:-panewire}" 2>/dev/null || true)"
+  if [[ -z "$panewire" ]]; then
+    warn "panewire not found; fleet usage alert not emitted (host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB)"
+    printf 'alert=failed reason=panewire-not-found\n'
+    return 0
+  fi
+  local text
+  text="fleet_usage_alert host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB total_gib=$(awk -v k="$USAGE_TOTAL_KIB" 'BEGIN{printf "%.3f", k/1048576}') jobs_kib=$USAGE_JOBS_KIB worktrees_count=$USAGE_WT_COUNT worktrees_kib=$USAGE_WT_KIB webqa_runner_kib=$USAGE_WEBQA_KIB rest_kib=$USAGE_REST_KIB threshold_gb=$USAGE_THRESHOLD_GB top5=$USAGE_TOP5"
+  if run_bounded 5 "$panewire" emit --kind lane.event --lane director-1 \
+      --event-id "fleet-usage-$(usage_alert_host_key)-$now" \
+      --text "$text" --inbox-root "$(dirname "$USAGE_JOBS")" >/dev/null 2>&1; then
+    mkdir -p "$USAGE_JOBS" 2>/dev/null || true
+    printf '%s\n' "$now" >"$state" 2>/dev/null ||
+      warn "fleet usage alert state could not be written: $state"
+    printf 'alert=emitted lane=director-1 event_id=fleet-usage-%s-%s\n' \
+      "$(usage_alert_host_key)" "$now"
+  else
+    warn "panewire emit failed; fleet usage alert left unstamped (host=$USAGE_HOST total_kib=$USAGE_TOTAL_KIB)"
+    printf 'alert=failed reason=emit-rc\n'
+  fi
+}
+
+usage_cmd() {
+  local alert=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) [[ $# -eq 1 ]] || die "unexpected argument '$2'"; usage_help; return 0 ;;
+      --alert) alert=1; shift ;;
+      *) die "unknown usage option '$1'" ;;
+    esac
+  done
+  usage_measure "$HOME/work"
+  usage_threshold
+  usage_report
+  ((alert)) || return 0
+  usage_alert
+}
+
 
 # ---------------------------------------------------------------- hk task link
 # #768 / hk:doc decision/2026-09-27/task-job-linkage item 1: every spawned job
@@ -12827,6 +13034,401 @@ reap_cmd() {
     echo "reap: closed $acted tab(s)"
   else
     echo "reap: $acted candidate(s) (dry-run; re-run with --apply to close)"
+  fi
+}
+
+worktree_reap_help() {
+  cat <<'USAGE'
+Usage: wrk worktree-reap [--age DURATION] [--apply]
+
+List the git worktrees of the repositories under ~/work and remove the ones
+provably done with: dry-run by default, --apply to remove. A worktree is
+removed only when ALL of these are measured at run time:
+
+  1. It is a linked worktree, never a main checkout (`git worktree list`
+     marks the main one). ~/work/ParkingArcade and
+     ~/work/ParkingArcade.pa-unity are additionally protected by exact path.
+  2. Its task is merged or dropped in handoffkeep, matched through a job
+     receipt or task link that names that worktree as its cwd (a payload
+     cwd/worktree/repo field naming the path exactly). A worktree no such
+     record names is skipped, never guessed from its name.
+  3. `git status --porcelain` is empty, untracked files included.
+  4. 0 unpushed: either HEAD equals the remote branch head from
+     `git ls-remote` (not a local tracking ref), or HEAD is an ancestor of
+     origin/main after a fresh fetch of main. A detached HEAD must satisfy
+     the second test. An unreachable remote keeps the worktree: unpushed
+     cannot be proven.
+  5. No live herdr pane has its cwd inside the worktree, and no live
+     completion sentinel belongs to a job bound to it.
+  6. The merge or drop is older than --age (default 3d).
+
+Removal uses `git worktree remove` only — never --force and never rm. A
+failure skips that worktree and continues. One line per worktree prints the
+reason it is kept, or that it would be / was removed.
+
+Options:
+  --age DURATION   minimum age of the merge or drop (3d, 600, 600s, 10m, 2h)
+  --apply          actually remove; without it the command only lists.
+  -h, --help       show this usage
+USAGE
+}
+
+# worktree_reap_scan ROOT JOBS_ROOT HK AGENTS_FILE SENT_FILE AGE_S NOW PA_MAIN PA_WT
+#
+# One TSV row per listed worktree:
+#   path <TAB> verdict(keep|remove) <TAB> reason <TAB> main <TAB> task <TAB> jobs
+# All conditions are measured inside: the event scan binds worktree paths to
+# jobs only through payload cwd/worktree/repo fields that name the path, the
+# task is read from handoffkeep, and the git checks run bounded. Anything not
+# provable emits keep with the reason instead of guessing.
+worktree_reap_scan() {
+  local root="$1" jobs_root="$2" hk="$3" agents_file="$4" sent_file="$5" age_s="$6" now="$7" pa_main="$8" pa_wt="$9"
+  wrk_py - "$root" "$jobs_root" "$hk" "$agents_file" "$sent_file" "$age_s" "$now" "$pa_main" "$pa_wt" <<'PY'
+import json, os, subprocess, sys
+exec(os.environ["WRK_EVENTS_PY"])
+
+root, jobs_root, hk, agents_file, sent_file, age_s, now_s, pa_main, pa_wt = sys.argv[1:10]
+age_s = int(age_s)
+now = float(now_s)
+env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+
+
+def norm(p):
+    p = os.path.expanduser(p.strip())
+    if not p or not p.startswith("/"):
+        return ""
+    return os.path.realpath(p)
+
+
+protected = set()
+for p in (pa_main, pa_wt):
+    n = norm(p)
+    if n:
+        protected.add(n)
+
+
+def git_out(args, timeout):
+    """(rc, stdout) — rc None when the call could not run or timed out."""
+    try:
+        r = subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                           env=env, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None, ""
+    return r.returncode, r.stdout.decode("utf-8", "replace")
+
+
+def git_rc(args, timeout):
+    try:
+        r = subprocess.run(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                           env=env, timeout=timeout, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.returncode
+
+
+# ── worktree inventory ────────────────────────────────────────────────────
+entries = {}
+try:
+    repo_names = sorted(os.listdir(root))
+except OSError:
+    repo_names = []
+for name in repo_names:
+    rdir = os.path.join(root, name)
+    if not os.path.isdir(rdir):
+        continue
+    rc, out = git_out(["git", "-C", rdir, "worktree", "list", "--porcelain"], 15)
+    if rc != 0:
+        continue
+    rc2, common = git_out(["git", "-C", rdir, "rev-parse", "--path-format=absolute",
+                           "--git-common-dir"], 10)
+    main_path = ""
+    if rc2 == 0:
+        c = common.strip()
+        if os.path.basename(c) == ".git":
+            main_path = os.path.dirname(c)
+    cur = None
+    for line in out.splitlines() + [""]:
+        if line.startswith("worktree "):
+            cur = {"path": line[len("worktree "):], "head": "", "branch": "",
+                   "bare": False, "main": main_path}
+        elif cur is None:
+            continue
+        elif line.startswith("HEAD "):
+            cur["head"] = line[len("HEAD "):]
+        elif line.startswith("branch "):
+            ref = line[len("branch "):]
+            if ref.startswith("refs/heads/"):
+                cur["branch"] = ref[len("refs/heads/"):]
+        elif line.startswith("detached"):
+            cur["branch"] = ""
+        elif line.startswith("bare"):
+            cur["bare"] = True
+        elif line == "" and cur is not None:
+            rp = norm(cur["path"])
+            if rp and rp not in entries:
+                entries[rp] = cur
+            cur = None
+
+# ── job → worktree binding through receipt/task-link payload paths ────────
+# Only receipts and task links may bind a worktree to a task: an unrelated
+# event (note, log, heartbeat …) carrying cwd/task_id must not establish the
+# association.
+BINDING_KINDS = {"job.claim", "job.reclaim", "job.attached", "job.spawned", "job.task_link"}
+bound_jobs = {}
+job_task = {}
+try:
+    job_names = sorted(os.listdir(jobs_root))
+except OSError:
+    job_names = []
+for job in job_names:
+    evdir = os.path.join(jobs_root, job, "events")
+    if not os.path.isdir(evdir):
+        continue
+    paths = set()
+    for _name, document, _mtime in wrk_events_ordered(evdir):
+        if document is None or document.get("kind") not in BINDING_KINDS:
+            continue
+        payload = document.get("payload", document)
+        if not isinstance(payload, dict):
+            continue
+        v = payload.get("task_id")
+        if isinstance(v, (int, str)) and not isinstance(v, bool) and str(v).strip():
+            job_task[job] = str(v).strip()
+        for field in ("cwd", "worktree", "repo"):
+            value = payload.get(field)
+            if isinstance(value, str):
+                n = norm(value)
+                if n:
+                    paths.add(n)
+    for p in paths:
+        bound_jobs.setdefault(p, []).append(job)
+
+# ── handoffkeep task state (read-only) ────────────────────────────────────
+task_state = {}
+
+
+def task_info(tid):
+    if not hk:
+        return None
+    try:
+        r = subprocess.run([hk, "tasks", "show", tid], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, timeout=20, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        t = json.loads(r.stdout.decode("utf-8", "replace"))
+    except ValueError:
+        return None
+    if not isinstance(t, dict) or not isinstance(t.get("state"), str):
+        return None
+    at = None
+    events = t.get("events")
+    if isinstance(events, list):
+        for e in events:
+            if isinstance(e, dict) and e.get("to") in ("merged", "dropped"):
+                m = wrk_event_moment(e.get("at"))
+                if m is not None and (at is None or m > at):
+                    at = m
+    if at is None:
+        at = wrk_event_moment(t.get("updated_at"))
+    return {"state": t["state"], "at": at}
+
+
+# ── live panes and live completion sentinels ──────────────────────────────
+panes_ok = False
+pane_rows = []
+try:
+    with open(agents_file, encoding="utf-8") as fh:
+        doc = json.load(fh)
+    result = doc.get("result", doc) if isinstance(doc, dict) else {}
+    agents = result.get("agents") if isinstance(result, dict) else None
+    if isinstance(agents, list):
+        panes_ok = True
+        for a in agents:
+            if not isinstance(a, dict):
+                panes_ok = False
+                break
+            pid = a.get("pane_id")
+            cw = a.get("cwd")
+            pane_rows.append((pid if isinstance(pid, str) else "",
+                              cw if isinstance(cw, str) else ""))
+except (OSError, ValueError, AttributeError):
+    panes_ok = False
+
+live_sentinels = set()
+sentinels_ok = False
+try:
+    with open(sent_file, encoding="utf-8") as fh:
+        for line in fh:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 2 and parts[1]:
+                live_sentinels.add(parts[1])
+    sentinels_ok = True
+except OSError:
+    sentinels_ok = False
+
+
+# ── verdicts ──────────────────────────────────────────────────────────────
+for rp in sorted(entries):
+    w = entries[rp]
+    path = w["path"]
+    verdict = "keep"
+    reason = ""
+    task = ""
+    jobs = bound_jobs.get(rp, [])
+    while True:
+        if rp in protected:
+            reason = "protected"
+            break
+        if w["bare"]:
+            reason = "bare"
+            break
+        if not os.path.isdir(path):
+            reason = "missing"
+            break
+        if os.path.isdir(os.path.join(path, ".git")):
+            reason = "main-checkout"
+            break
+        tasks = sorted({job_task[j] for j in jobs if job_task.get(j)})
+        if not tasks:
+            reason = "no-task-link"
+            break
+        if len(tasks) > 1:
+            reason = "task-ambiguous"
+            break
+        task = tasks[0]
+        if task not in task_state:
+            task_state[task] = task_info(task)
+        info = task_state[task]
+        if info is None:
+            reason = "task-unverifiable"
+            break
+        if info["state"] not in ("merged", "dropped"):
+            reason = "task-open(state=%s)" % info["state"]
+            break
+        if info["at"] is None:
+            reason = "task-age-unknown"
+            break
+        if info["at"] + age_s > now:
+            reason = "within-age"
+            break
+        rc, out = git_out(["git", "-C", path, "status", "--porcelain"], 15)
+        if rc != 0:
+            reason = "status-failed"
+            break
+        if out.strip():
+            reason = "dirty"
+            break
+        head = w["head"]
+        branch = w["branch"]
+        pushed = False
+        if branch:
+            rc, out = git_out(["git", "-C", path, "ls-remote", "origin", "refs/heads/" + branch], 25)
+            if rc != 0:
+                reason = "remote-unreachable"
+                break
+            fields = out.split()
+            if fields and fields[0] == head:
+                pushed = True
+        if not pushed:
+            rc, _ = git_out(["git", "-C", path, "fetch", "--quiet", "origin", "main"], 60)
+            if rc != 0:
+                reason = "remote-unreachable"
+                break
+            rc = git_rc(["git", "-C", path, "merge-base", "--is-ancestor", head,
+                         "FETCH_HEAD"], 10)
+            if rc != 0:
+                reason = "unpushed"
+                break
+        if not panes_ok:
+            reason = "panes-unknown"
+            break
+        blocked = ""
+        for pane_id, pcwd in pane_rows:
+            if not pcwd:
+                blocked = blocked or "pane-cwd-unknown"
+                continue
+            pnorm = norm(pcwd)
+            if pnorm and (pnorm == rp or pnorm.startswith(rp + os.sep)):
+                blocked = "pane-inside(pane=%s)" % pane_id
+                break
+        if blocked:
+            reason = blocked
+            break
+        if not sentinels_ok:
+            reason = "sentinels-unknown"
+            break
+        bound_live = [j for j in jobs if j in live_sentinels]
+        if bound_live:
+            reason = "sentinel-live(job=%s)" % sorted(bound_live)[0]
+            break
+        verdict = "remove"
+        break
+    # Empty fields emit the "-" placeholder: IFS=tab read collapses
+    # consecutive separators, so a blank column would shift the later ones
+    # (same shape as reap_candidates).
+    print(path, verdict, reason or "-", w["main"] or "-", task or "-",
+          ",".join(jobs) or "-", sep="\t")
+PY
+}
+
+worktree_reap_cmd() {
+  local apply=0 age="3d" age_s
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -h|--help) worktree_reap_help; return 0 ;;
+      --age) [[ $# -ge 2 && -n "$2" ]] || die "--age requires a value"; age="$2"; shift 2 ;;
+      --apply) apply=1; shift ;;
+      -*) die "unknown worktree-reap option '$1'" ;;
+      *) die "unexpected argument '$1'" ;;
+    esac
+  done
+  age_s="$(parse_duration_s "$age")" || die "invalid --age '$age' (use 600, 600s, 10m, 2h or 3d)"
+  wrk_trust_guard hk
+  local root="$HOME/work" jobs_root agents_file sent_file rows removed=0 kept=0
+  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"
+  if [[ ! -d "$root" ]]; then
+    echo "worktree-reap: no work root at $root"
+    return 0
+  fi
+  agents_file="$(mktemp "${TMPDIR:-/tmp}/wrk-wt-agents.XXXXXX")"
+  sent_file="$(mktemp "${TMPDIR:-/tmp}/wrk-wt-sentinels.XXXXXX")"
+  "$HERDR" agent list >"$agents_file" 2>/dev/null || true
+  sentinel_sweep >"$sent_file" 2>/dev/null || true
+  rows="$(worktree_reap_scan "$root" "$jobs_root" "${WRK_TRUST_HK:-}" "$agents_file" "$sent_file" \
+    "$age_s" "$(date +%s)" "$root/ParkingArcade" "$root/ParkingArcade.pa-unity")"
+  local path verdict reason main task jobs
+  while IFS=$'\t' read -r path verdict reason main task jobs; do
+    [[ -n "$path" ]] || continue
+    case "$verdict" in
+      keep)
+        echo "keep $path reason=$reason"
+        kept=$((kept + 1)) ;;
+      remove)
+        [[ "$task" != - ]] || task=""
+        [[ "$jobs" != - ]] || jobs=""
+        [[ "$main" != - ]] || main=""
+        if [[ "$apply" -eq 1 ]]; then
+          if git -C "$main" worktree remove "$path" >/dev/null 2>&1; then
+            echo "removed $path"
+            removed=$((removed + 1))
+          else
+            echo "keep $path reason=remove-failed"
+            kept=$((kept + 1))
+          fi
+        else
+          echo "would-remove $path task=$task job=$jobs"
+          removed=$((removed + 1))
+        fi ;;
+    esac
+  done <<<"$rows"
+  rm -f "$agents_file" "$sent_file"
+  if [[ "$apply" -eq 1 ]]; then
+    echo "worktree-reap: removed $removed, kept $kept"
+  else
+    echo "worktree-reap: $removed candidate(s), $kept kept (dry-run; re-run with --apply to remove)"
   fi
 }
 
@@ -15582,6 +16184,7 @@ case "${1:-}" in
   round) shift; round_cmd "$@" ;;
   sentinel) shift; sentinel_cmd "$@" ;;
   reap) shift; reap_cmd "$@" ;;
+  worktree-reap) shift; worktree_reap_cmd "$@" ;;
   lanes-missing) shift; lanes_missing_cmd "$@" ;;
   prune) shift; prune_cmd "$@" ;;
   find) shift; find_cmd "$@" ;;
@@ -15589,6 +16192,7 @@ case "${1:-}" in
   profiles) shift; profiles_cmd "$@" ;;
   hosts) shift; hosts_cmd "$@" ;;
   heavy) shift; heavy_cmd "$@" ;;
+  usage) shift; usage_cmd "$@" ;;
   "") usage >&2; exit 2 ;;
   *) die "unknown command '$1' (see 'wrk --help')" ;;
 esac
