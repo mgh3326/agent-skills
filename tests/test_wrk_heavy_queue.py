@@ -405,15 +405,16 @@ class HeavyQueue(unittest.TestCase):
         for sig, name in ((signal.SIGHUP, "HUP"), (signal.SIGTERM, "TERM")):
             with self.subTest(signal=sig):
                 command = f"kill -{name} $$; echo survived"
-
-                def ignore_signal_in_child(signal_number=sig):
-                    signal.signal(signal_number, signal.SIG_IGN)
-
-                result = subprocess.run(
-                    [str(WRK), "heavy", "--", "sh", "-c", command],
-                    env=self.env, capture_output=True, text=True, timeout=10,
-                    preexec_fn=ignore_signal_in_child, check=False)
-                self.assertEqual(result.returncode, 0, result.stderr)
+                if sig == signal.SIGHUP:
+                    args = ["nohup", str(WRK), "heavy", "--", "sh", "-c", command]
+                else:
+                    args = ["sh", "-c", 'trap "" TERM; exec "$1" heavy -- sh -c "$2"',
+                            "sh", str(WRK), command]
+                result = subprocess.run(args, env=self.env, capture_output=True,
+                                        text=True, timeout=10, check=False)
+                self.assertEqual(result.returncode, 0,
+                                 "heavy changed an inherited SIG_IGN disposition: "
+                                 + result.stderr)
                 self.assertIn("survived", result.stdout,
                               "heavy changed an inherited SIG_IGN disposition")
 
