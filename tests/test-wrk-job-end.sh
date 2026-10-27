@@ -5030,6 +5030,196 @@ mkmut r39-completed-becomes-watch-expired \
 expect_mut_red "R39 completed must never become watch-expired" case_late_stable_r39 \
   'FAIL: je51m39: the confirmed late report must complete'
 
+# ── hk1892: a sentinel whose job dir is gone leaves quietly ──────────────
+# Rule: at the top of every poll, 2 consecutive polls with the jobdir missing
+# (or the events dir missing after it was seen) end the sentinel with exit 0:
+# no log line, no event, no release, no directory re-created. Interval 1 and
+# a polled sleep child keep every case deterministic.
+
+# gone_new_sleep PID OLD — wait for a sleep child other than OLD (a poll ran
+# and the sentinel went back to sleep) or for the sentinel to be gone.
+gone_new_sleep() {
+  local pid="$1" old="$2" k comm deadline=$(( $(date +%s) + 20 ))
+  while (( $(date +%s) <= deadline )); do
+    pid_gone "$pid" && return 0
+    # One non-blocking scan: sentinel_mid_sleep waits up to 10s for a child,
+    # which a sentinel that just exited would turn into a false timeout.
+    for k in $(pgrep -P "$pid" 2>/dev/null); do
+      comm="$(ps -p "$k" -o comm= 2>/dev/null || true)"
+      [[ "$comm" == *sleep* && "$k" != "$old" ]] && return 0
+    done
+    sleep 0.1
+  done
+  return 1
+}
+
+gone_start() {
+  reset_case "$1" || return 3
+  recovery_arm_stub
+  SENT_INTERVAL=1
+  start_sentinel "$1" w:p1 "$TMP/$1-report.md"
+  sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
+}
+
+gone_no_job_lost() {
+  [[ -z "$(find "$TMP" -path "*$1*" -name '*job.lost*' 2>/dev/null)" ]]
+}
+
+case_gone_root() {
+  local job="$1"
+  gone_start "$job" || return 3
+  rm -rf "$INBOX"
+  if ! wait_until 8 pid_gone "$SENTINEL_PID"; then
+    echo "FAIL: $job: the sentinel must exit once its job root is gone" >&2
+    recovery_stop; return 1
+  fi
+  [[ ! -e "$INBOX" ]] || { echo "FAIL: $job: the removed root was re-created" >&2; recovery_stop; return 1; }
+  gone_no_job_lost "$job" || { echo "FAIL: $job: a job.lost was written" >&2; recovery_stop; return 1; }
+  [[ "$(recovery_release_count)" == 0 ]] || { echo "FAIL: $job: a release ran before the exit" >&2; recovery_stop; return 1; }
+  recovery_stop
+}
+
+case_gone_events() {
+  local job="$1"
+  reset_case "$job" || return 3
+  mkdir -p "$INBOX/$job/events"
+  gone_start_after_reset "$job" || return 3
+  rm -rf "$INBOX/$job/events"
+  if ! wait_until 8 pid_gone "$SENTINEL_PID"; then
+    echo "FAIL: $job: the sentinel must exit once a seen events dir is gone" >&2
+    recovery_stop; return 1
+  fi
+  [[ ! -e "$INBOX/$job/events" ]] || { echo "FAIL: $job: the events dir was re-created" >&2; recovery_stop; return 1; }
+  gone_no_job_lost "$job" || { echo "FAIL: $job: a job.lost was written" >&2; recovery_stop; return 1; }
+  recovery_stop
+}
+
+gone_start_after_reset() {
+  recovery_arm_stub
+  SENT_INTERVAL=1
+  start_sentinel "$1" w:p1 "$TMP/$1-report.md"
+  sentinel_mid_sleep "$SENTINEL_PID" >/dev/null || return 3
+}
+
+case_gone_never_events() {
+  local job="$1"
+  gone_start "$job" || return 3
+  sleep 3.5
+  if ! kill -0 "$SENTINEL_PID" 2>/dev/null; then
+    echo "FAIL: $job: a never-created events dir is not absence; the sentinel must keep running" >&2
+    recovery_stop; return 1
+  fi
+  recovery_stop
+}
+
+case_gone_flap() {
+  local job="$1" c1 lines_before lines_after
+  gone_start "$job" || return 3
+  c1="$(sentinel_mid_sleep "$SENTINEL_PID")" || return 3
+  mv "$INBOX/$job" "$INBOX/$job.away"
+  gone_new_sleep "$SENTINEL_PID" "$c1" || { recovery_stop; return 3; }
+  if pid_gone "$SENTINEL_PID"; then
+    echo "FAIL: $job: one missing poll must not end the sentinel" >&2
+    recovery_stop; return 1
+  fi
+  mv "$INBOX/$job.away" "$INBOX/$job"
+  lines_before="$(wc -l <"$INBOX/$job/completion-sentinel.log" 2>/dev/null | tr -d ' ')"
+  sleep 3.5
+  if ! kill -0 "$SENTINEL_PID" 2>/dev/null; then
+    echo "FAIL: $job: the sentinel must survive a flap" >&2
+    recovery_stop; return 1
+  fi
+  lines_after="$(wc -l <"$INBOX/$job/completion-sentinel.log" 2>/dev/null | tr -d ' ')"
+  (( ${lines_after:-0} > ${lines_before:-0} )) ||
+    { echo "FAIL: $job: the sentinel must keep logging after a flap" >&2; recovery_stop; return 1; }
+  recovery_stop
+}
+
+# case_gone_symlink JOB jobdir|events — a symlink to a live directory replaces
+# the dir: -d follows it, so the sentinel must count it as gone and leave.
+case_gone_symlink() {
+  local job="$1" what="$2" target="$TMP/$1-target"
+  reset_case "$job" || return 3
+  mkdir -p "$INBOX/$job/events"
+  gone_start_after_reset "$job" || return 3
+  mkdir -p "$target"
+  if [[ "$what" == jobdir ]]; then
+    mv "$INBOX/$job" "$target/real" && ln -s "$target/real" "$INBOX/$job"
+  else
+    mv "$INBOX/$job/events" "$target/real" && ln -s "$target/real" "$INBOX/$job/events"
+  fi
+  if ! wait_until 8 pid_gone "$SENTINEL_PID"; then
+    echo "FAIL: $job: a symlink replacing the $what must count as gone" >&2
+    recovery_stop; return 1
+  fi
+  gone_no_job_lost "$job" || { echo "FAIL: $job: a job.lost was written" >&2; recovery_stop; return 1; }
+  # hk 2096's EXIT record must not append through the symlink into the target.
+  if grep -q 'sentinel-exit' "$INBOX/$job/completion-sentinel.log" 2>/dev/null; then
+    echo "FAIL: $job: the exit wrote a log line through the symlink" >&2
+    recovery_stop; return 1
+  fi
+  recovery_stop
+}
+
+echo "== JE54: a sentinel with a gone job dir exits quietly =="
+case_gone_root je54a || fail "JE54 removed root"
+echo "PASS je54 removed-root"
+case_gone_events je54b || fail "JE54 removed events dir"
+echo "PASS je54 removed-events"
+case_gone_never_events je54c || fail "JE54 never-created events dir"
+echo "PASS je54 never-created-events"
+case_gone_flap je54d || fail "JE54 flap"
+echo "PASS je54 flap"
+case_gone_symlink je54e jobdir || fail "JE54 symlinked job dir"
+echo "PASS je54 symlinked-jobdir"
+case_gone_symlink je54f events || fail "JE54 symlinked events dir"
+echo "PASS je54 symlinked-events"
+
+case_gone_root_m40() { case_gone_root je54m40; }
+case_gone_flap_m41() { case_gone_flap je54m41; }
+case_gone_never_events_m42() { case_gone_never_events je54m42; }
+case_gone_root_m43() { case_gone_root je54m43; }
+case_gone_symlink_m44() { case_gone_symlink je54m44 jobdir; }
+case_gone_symlink_m45() { case_gone_symlink je54m45 events; }
+case_gone_symlink_m46() { case_gone_symlink je54m46 jobdir; }
+
+# hk1892 mutants: each load-bearing piece of the rule is pinned to its case.
+mkmut_span r40-no-check \
+  'if [[ ! -d "$jobdir" || -L "$jobdir" || ( -n "$events_seen" && ( ! -d "$jobdir/events" || -L "$jobdir/events" ) ) ]]; then # hk1892-jobdir-gone' \
+  '    if false; then # removed hk1892 check'
+expect_mut_red "R40 the gone check must exist" case_gone_root_m40 \
+  'FAIL: je54m40: the sentinel must exit once its job root is gone'
+
+mkmut r41-exit-on-first-miss \
+  's~(( gone < SENTINEL_GONE_POLLS ))~(( gone < 1 ))~'
+expect_mut_red "R41 one missing poll must not end the sentinel" case_gone_flap_m41 \
+  'FAIL: je54m41: one missing poll must not end the sentinel'
+
+mkmut r42-never-created-is-gone \
+  's~( -n "\$events_seen" \&\& ( ! -d~( ( ! -d~'
+expect_mut_red "R42 a never-created events dir is not absence" case_gone_never_events_m42 \
+  'FAIL: je54m42: a never-created events dir is not absence'
+
+mkmut r43-release-before-exit \
+  's~(( gone < SENTINEL_GONE_POLLS )) || { SENTINEL_EXIT_LOGFILE=/dev/null; sentinel_self_exit "\$job" 0; }~(( gone < SENTINEL_GONE_POLLS )) || { "$ARBITER_BIN" release --job "$job" --resource claude --kind quota_pool; sentinel_self_exit "$job" 0; }~'
+expect_mut_red "R43 no release before the exit" case_gone_root_m43 \
+  'FAIL: je54m43: a release ran before the exit'
+
+mkmut r44-follow-jobdir-symlink \
+  's~ || -L "\$jobdir" ||~ ||~'
+expect_mut_red "R44 a symlinked job dir counts as gone" case_gone_symlink_m44 \
+  'FAIL: je54m44: a symlink replacing the jobdir must count as gone'
+
+mkmut r45-follow-events-symlink \
+  's~ || -L "\$jobdir/events" ) )~ ) )~'
+expect_mut_red "R45 a symlinked events dir counts as gone" case_gone_symlink_m45 \
+  'FAIL: je54m45: a symlink replacing the events must count as gone'
+
+mkmut r46-exit-record-through-symlink \
+  's~{ SENTINEL_EXIT_LOGFILE=/dev/null; sentinel_self_exit~{ sentinel_self_exit~'
+expect_mut_red "R46 the gone exit writes no log line" case_gone_symlink_m46 \
+  'FAIL: je54m46: the exit wrote a log line through the symlink'
+
 # ── hk1933: wrk restore — a same-pane restore after a false loss ──────────
 # The 10-23 false loss was restored by hand: arbiter claim --reclaim-released,
 # then a copy of the newest job.spawned payload written as an event. wrk
