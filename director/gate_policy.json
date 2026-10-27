@@ -68,31 +68,6 @@
   },
   "ci_execution_steps": {
     "mgh3326/agent-skills": {
-      "lint": [
-        "ShellCheck"
-      ],
-      "changes": [
-        "Classify docs-only changes",
-        "Report Darwin-sensitive coverage"
-      ],
-      "ubuntu (wrk)": [
-        "Run suite shard"
-      ],
-      "ubuntu (suites-a)": [
-        "Run suite shard"
-      ],
-      "ubuntu (suites-b)": [
-        "Run suite shard"
-      ],
-      "ubuntu (python)": [
-        "Run suite shard"
-      ],
-      "macos-smoke": [
-        "Run curated Darwin-sensitive suites"
-      ],
-      "macos-full": [
-        "Run complete suite list"
-      ],
       "ci-ok": [
         "Check required results"
       ]
@@ -2295,8 +2270,7 @@
   },
   "required_ci_jobs_by_repo": {
     "agent-skills": [
-      "ubuntu-latest",
-      "macos-latest"
+      "ci-ok"
     ]
   },
   "revision": "2026-10-20.1",
