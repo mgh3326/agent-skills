@@ -708,10 +708,11 @@ WRK_HEAVY_WAIT_CAP=3 "$TMP/deadci-wrk" heavy -- touch "$TMP/m4-ran" >/dev/null 2
   fail "mutant deadci still ignored the dead record (rc=$rc) — liveness assertion is vacuous"
 echo "PASS mutant-deadci"
 
-# headscan: class= and limit= are read from anywhere in the record, so text
-# inside a command forges a ci waiter. RED proof: the forged old-format
-# record from the s3b test now blocks the lane.
-mutant headscan $'    toks = text.split(None, 5)[:5]' $'    toks = text.split()'
+# headscan: class= and limit= must stay in their fixed token positions. RED
+# proof: scanning the full record lets command text forge a ci waiter and
+# block the lane, as in the old s3b shape.
+mutant headscan $'    class_ok = (len(toks) > 1 and toks[1] in ("class=ci", "class=lane"))\n    if class_ok:\n        cls = toks[1][6:]\n\n    limit_ok = False\n    if len(toks) > 2 and toks[2].startswith("limit="):\n        try:\n            lim = int(toks[2][6:])\n            limit_ok = True\n        except ValueError:\n            pass' \
+  $'    class_ok = False\n    limit_ok = False\n    for tok in text.split():\n        if tok.startswith("class=") and tok[6:] in ("ci", "lane"):\n            cls = tok[6:]\n            class_ok = True\n        elif tok.startswith("limit="):\n            try:\n                lim = int(tok[6:])\n                limit_ok = True\n            except ValueError:\n                pass'
 new_lock m5
 sleep 300 &
 forged=$!

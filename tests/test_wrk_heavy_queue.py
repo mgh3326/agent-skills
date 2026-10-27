@@ -349,7 +349,7 @@ class HeavyQueue(unittest.TestCase):
             "pid=4242 class=lane limit=1 cmd=echo limit=2",
             "pid=4242 since=x job=- cmd=echo pid=1",
         ]
-        anchor = "args = sys.argv[1:]\n"
+        anchor = "if not args:\n"
         injection = (
             f"records = {records!r}\n"
             "print(json.dumps([record_head(text) for text in records]))\n"
@@ -377,7 +377,9 @@ class HeavyQueue(unittest.TestCase):
         status = self.run_wrk("status")
         self.assertEqual(status.returncode, 0, status.stderr)
         self.assertTrue(record.exists(), "legacy command start retired a live waiter")
-        rows = [json.loads(line) for line in (self.base / "heavy.log").read_text().splitlines()]
+        log_path = self.base / "heavy.log"
+        rows = [json.loads(line) for line in log_path.read_text().splitlines()] \
+            if log_path.exists() else []
         retired = [row for row in rows if row.get("kind") == "waiter_retired"
                    and row.get("record") == str(pid)]
         self.assertEqual(retired, [], "legacy command start was logged as owner death")
