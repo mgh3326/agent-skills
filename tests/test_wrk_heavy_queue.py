@@ -337,16 +337,16 @@ class HeavyQueue(unittest.TestCase):
         start = "d" + base64.urlsafe_b64encode(first).decode("ascii").rstrip("=")
         path = self.plant_identified_lane(os.getpid(), start)
         result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
-        self.assertEqual(result.returncode, 75, "same-second ps identity did not reserve")
+        self.assertEqual(result.returncode, 75, "same-second start identity did not reserve")
         ps_output.write_bytes(b"Tue Oct 27 12:34:57 2026\n")
         result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
-        self.assertEqual(result.returncode, 0, "different-second ps identity reserved")
+        self.assertEqual(result.returncode, 0, "different-second start identity reserved")
         self.assertEqual(self.run_wrk("status").returncode, 0)
         self.assertFalse(path.exists())
         path = self.plant_identified_lane(os.getpid(), start)
         ps_output.write_bytes(b" Tue Oct 27 12:34:56 2026\n")
         self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6").returncode, 0,
-                         "ps identity comparison normalized whitespace")
+                         "lstart comparison normalized whitespace")
 
     def eperm_binary(self, unreadable=False):
         binary = self.instrument("eperm-wrk", "        os.kill(pid, 0)\n",
