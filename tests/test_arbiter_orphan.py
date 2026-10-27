@@ -111,13 +111,40 @@ class OrphanRelease(unittest.TestCase):
         result = self.run_arb("release", "--force", "--job", "uncertain", expected=None)
         self.assertNotEqual(result.returncode, 0)
 
-    def test_unknown_without_rows_still_refuses(self):
+    def test_unknown_without_rows_does_not_block_independent_cleanup(self):
         self.claim_quota("unknown-empty")
         self.remove_quota("unknown-empty")
+        self.claim_quota("gone-with-unknown")
         self.set_agents([("unknown-empty", "unknown")])
-        self.gc(expected=6)
+        result = json.loads(self.gc().stdout)
         self.assertEqual(self.state("unknown-empty")[0], "leased")
         self.assertEqual(self.events("unknown-empty"), [])
+        state, data = self.state("gone-with-unknown")
+        self.assertEqual(state, "released")
+        self.assertEqual(data["quota_pool_records"], [])
+        self.assertEqual(len(self.events("gone-with-unknown")), 1)
+        self.assertIn("unknown-empty", [item["job_id"] for item in result["unresolved_orphans"]])
+        forced = self.run_arb("release", "--force", "--job", "unknown-empty", expected=None)
+        self.assertNotEqual(forced.returncode, 0)
+        self.assertIn("unknown", forced.stderr.lower())
+
+    def test_unmapped_empty_orphan_does_not_block_independent_cleanup(self):
+        self.claim_quota("legacy-empty")
+        self.remove_quota("legacy-empty")
+        with sqlite3.connect(self.db) as con:
+            con.execute("DELETE FROM events WHERE job_id = ? AND kind = 'job.claim'", ("legacy-empty",))
+        self.claim_quota("gone-with-legacy")
+        result = json.loads(self.gc().stdout)
+        self.assertEqual(self.state("legacy-empty")[0], "leased")
+        self.assertEqual(self.events("legacy-empty"), [])
+        state, data = self.state("gone-with-legacy")
+        self.assertEqual(state, "released")
+        self.assertEqual(data["quota_pool_records"], [])
+        self.assertEqual(len(self.events("gone-with-legacy")), 1)
+        self.assertIn("legacy-empty", [item["job_id"] for item in result["unresolved_orphans"]])
+        forced = self.run_arb("release", "--force", "--job", "legacy-empty", expected=None)
+        self.assertNotEqual(forced.returncode, 0)
+        self.assertIn("mapping", forced.stderr.lower())
 
     def test_unmapped_owner_refuses_without_deleting_quota(self):
         self.claim_quota("unmapped")
@@ -128,6 +155,28 @@ class OrphanRelease(unittest.TestCase):
         self.assertEqual(state, "leased")
         self.assertEqual(len(data["quota_pool_records"]), 1)
         self.assertEqual(self.events("unmapped"), [])
+
+    def test_ambiguous_empty_orphan_does_not_block_independent_cleanup(self):
+        self.claim_quota("ambiguous-empty")
+        self.remove_quota("ambiguous-empty")
+        with sqlite3.connect(self.db) as con:
+            row = con.execute("SELECT payload, created_at FROM events WHERE job_id = ? AND kind = 'job.claim'",
+                              ("ambiguous-empty",)).fetchone()
+            claim = json.loads(row[0])
+            claim["payload"]["agent_label"] = "different-agent"
+            seq = con.execute("SELECT MAX(seq) FROM events WHERE job_id = ?", ("ambiguous-empty",)).fetchone()[0] + 1
+            con.execute("INSERT INTO events (job_id, seq, kind, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                        ("ambiguous-empty", seq, "job.claim", json.dumps(claim), row[1]))
+        self.claim_quota("gone-with-ambiguous")
+        result = json.loads(self.gc().stdout)
+        self.assertEqual(self.state("ambiguous-empty")[0], "leased")
+        self.assertEqual(self.events("ambiguous-empty"), [])
+        state, data = self.state("gone-with-ambiguous")
+        self.assertEqual(state, "released")
+        self.assertEqual(data["quota_pool_records"], [])
+        self.assertIn("ambiguous-empty", [item["job_id"] for item in result["unresolved_orphans"]])
+        forced = self.run_arb("release", "--force", "--job", "ambiguous-empty", expected=None)
+        self.assertNotEqual(forced.returncode, 0)
 
     def test_path_lease_blocks_gc_and_forced_release(self):
         self.claim_quota("lease-left")
@@ -179,16 +228,19 @@ class OrphanRelease(unittest.TestCase):
         mutants = [
             ("gc", [("for job_id, decision in orphan_decisions:\n", "for job_id, decision in []:\n")],
              "test_gc_releases_absent_quota_job_and_reclaim_succeeds"),
-            ("unknown", [('    if "unknown" in statuses:\n        raise ArbiterError(EXIT_STORAGE, f"job {job_id} agent {agent_label} has unknown status")\n',
-                          '    if False:\n        raise ArbiterError(EXIT_STORAGE, f"job {job_id} agent {agent_label} has unknown status")\n'),
+            ("unknown", [('    if "unknown" in statuses:\n        reason = f"job {job_id} agent {agent_label} has unknown status"\n',
+                          '    if False:\n        reason = f"job {job_id} agent {agent_label} has unknown status"\n'),
                          ('    if matched:  # hk1991-orphan-release\n',
                           '    if matched and "unknown" not in statuses:\n')],
-             "test_unknown_without_rows_still_refuses"),
+             "test_unknown_without_rows_does_not_block_independent_cleanup"),
             ("lease", [("    if leases or pools:\n", "    if pools:\n")],
              "test_path_lease_blocks_gc_and_forced_release"),
             ("idle", [('    if matched:  # hk1991-orphan-release\n',
                        '    if matched and "working" in statuses:\n')],
              "test_present_idle_done_blocked_and_working_remain_leased"),
+            ("unmapped-rollback", [('    if agent_label is None:\n        reason = f"job {job_id} has no exact agent_label mapping"\n',
+                                   '    if agent_label is None:\n        reason = f"job {job_id} has no exact agent_label mapping"\n        raise ArbiterError(EXIT_STORAGE, reason)\n')],
+             "test_unmapped_empty_orphan_does_not_block_independent_cleanup"),
         ]
         for name, changes, case in mutants:
             with self.subTest(mutant=name):

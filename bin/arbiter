@@ -1317,7 +1317,7 @@ def _matched_agent_statuses(
     return statuses, matched
 
 
-def _orphan_decision(con, job_id, agents, *, ignored_quota=frozenset(), strict=False):
+def _orphan_decision(con, job_id, agents, *, ignored_quota=frozenset(), strict=False, unresolved=None):
     """Assess under BEGIN IMMEDIATE; absence is the only positive death evidence."""
     row = con.execute("SELECT state FROM jobs WHERE job_id = ?", (job_id,)).fetchone()
     if row is None or row[0] != "leased":
@@ -1332,12 +1332,30 @@ def _orphan_decision(con, job_id, agents, *, ignored_quota=frozenset(), strict=F
             raise ArbiterError(EXIT_FENCING,
                                f"job {job_id} still has lease rows={list(leases)} quota_pool rows={pools}")
         return None
-    agent_label = _claim_agent_label(con, job_id)
+    try:
+        agent_label = _claim_agent_label(con, job_id)
+    except ArbiterError as exc:
+        if strict:
+            raise
+        if unresolved is not None:
+            unresolved.append({"job_id": job_id, "reason": str(exc)})
+        return None
     if agent_label is None:
-        raise ArbiterError(EXIT_STORAGE, f"job {job_id} has no exact agent_label mapping")
+        reason = f"job {job_id} has no exact agent_label mapping"
+        if strict:
+            raise ArbiterError(EXIT_STORAGE, reason)
+        if unresolved is not None:
+            unresolved.append({"job_id": job_id, "reason": reason})
+        return None
     statuses, matched = _matched_agent_statuses(agents, job_id=job_id, agent_label=agent_label)
     if "unknown" in statuses:
-        raise ArbiterError(EXIT_STORAGE, f"job {job_id} agent {agent_label} has unknown status")
+        reason = f"job {job_id} agent {agent_label} has unknown status"
+        if strict:
+            raise ArbiterError(EXIT_STORAGE, reason)
+        if unresolved is not None:
+            unresolved.append({"job_id": job_id, "agent_label": agent_label,
+                               "herdr_status": sorted(statuses), "reason": reason})
+        return None
     if matched:  # hk1991-orphan-release
         if strict:
             raise ArbiterError(EXIT_FENCING,
@@ -1434,12 +1452,15 @@ def cmd_gc(args: argparse.Namespace) -> dict:
                 f" ({'; '.join(details)})",
             )
 
-        # Preflight before writing cleanup artifacts: an unknown/unmapped
-        # otherwise-orphan job must refuse the entire reconciliation.
+        # Refuse release for uncertain empty jobs without letting one block
+        # independent quota cleanup. Quota-row reconciliation above retains
+        # its existing all-or-nothing refusal for unknown or unmapped owners.
         ignored_quota = {(row[0], row[1]) for row, _, _, _ in stale_decisions}
         orphan_decisions = []
+        unresolved_orphans = []
         for (job_id,) in con.execute("SELECT job_id FROM jobs WHERE state = 'leased' ORDER BY job_id"):
-            decision = _orphan_decision(con, job_id, herdr_agents, ignored_quota=ignored_quota)
+            decision = _orphan_decision(con, job_id, herdr_agents, ignored_quota=ignored_quota,
+                                        unresolved=unresolved_orphans)
             if decision is not None:
                 orphan_decisions.append((job_id, decision))
 
@@ -1494,6 +1515,7 @@ def cmd_gc(args: argparse.Namespace) -> dict:
         "retained": len(rows),
         "stale_quota_pool": stale_quota_pool,
         "orphan_released": orphan_released,
+        "unresolved_orphans": unresolved_orphans,
         "unresolved_quota_pool": unresolved_quota_pool,
         "unsafe_quota_pool": unsafe_quota_pool,
         "live_agents": sum(
