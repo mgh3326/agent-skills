@@ -33,6 +33,13 @@ the target means skip (re-runs are idempotent), equal to the recorded
 proposal-time area means write, anything else means the task changed
 since the proposal and the row is refused.
 
+pattern-hits [--min N] (read-only, hk 2100) is a guard against per-title
+rules: it walks the same per-state task list as propose and prints, for
+every title_keywords pattern, how many in-scope tasks' titles it matches
+(the entry's "projects" list is the scope; "" is the projectless task).
+It exits 1 when any scoped pattern matches fewer than N tasks (N 3 by
+default) and names those patterns on the last lines.
+
 The vocabulary always comes from `handoffkeep tasks areas`, never from
 a hard-coded list. Binary overrides for tests: HANDOFFKEEP_BIN, GH_BIN.
 """
@@ -260,16 +267,21 @@ def classify(task: dict, rules: dict, with_files: bool, gh: str,
     return "", "-", "-"
 
 
+def all_tasks(states: str) -> dict[int, dict]:
+    tasks: dict[int, dict] = {}
+    for state in states.split(","):
+        for task in list_state_tasks(state.strip()):
+            if isinstance(task.get("id"), int):
+                tasks[task["id"]] = task
+    return tasks
+
+
 def cmd_propose(args: argparse.Namespace) -> int:
     if args.sample is not None and args.sample < 0:
         die("--sample must be non-negative")
     vocabulary = areas_vocabulary()
     rules = load_rules(args.rules, vocabulary)
-    tasks: dict[int, dict] = {}
-    for state in args.states.split(","):
-        for task in list_state_tasks(state.strip()):
-            if isinstance(task.get("id"), int):
-                tasks[task["id"]] = task
+    tasks = all_tasks(args.states)
     gh = os.environ.get("GH_BIN") or "gh"
     gh_missing: list[bool] = []
     if args.with_files and not shutil.which(gh):
@@ -292,6 +304,30 @@ def cmd_propose(args: argparse.Namespace) -> int:
     out.writerow(COLUMNS)
     out.writerows(rows)
     return 0
+
+
+def cmd_pattern_hits(args: argparse.Namespace) -> int:
+    if args.min < 0:
+        die("--min must be non-negative")
+    rules = load_rules(args.rules, areas_vocabulary())
+    tasks = sorted(all_tasks(args.states).values(),
+                   key=lambda t: t["id"])
+    under: list[tuple[str, int]] = []
+    for entry in rules["title_keywords"]:
+        scope = entry.get("projects")
+        pool = [t for t in tasks
+                if scope is None or clean(t.get("project")) in scope]
+        label = json.dumps(scope) if scope is not None else "*"
+        for pattern, compiled in zip(entry["patterns"], entry["_re"]):
+            hits = sum(1 for t in pool
+                       if compiled.search(clean(t.get("title"))))
+            print(f"hits={hits}\tarea={entry['area']}\tscope={label}"
+                  f"\tpattern={pattern}")
+            if hits < args.min:
+                under.append((pattern, hits))
+    for pattern, hits in under:
+        print(f"under-min\tpattern={pattern}\thits={hits}\tmin={args.min}")
+    return 1 if under else 0
 
 
 def cmd_apply(args: argparse.Namespace) -> int:
@@ -409,12 +445,26 @@ def main() -> int:
     a.add_argument("--file", required=True, help="reviewed proposal TSV")
     a.add_argument("--by", required=True,
                    help="name recorded on each write line")
+    h = sub.add_parser("pattern-hits", help="read-only per-pattern title "
+                       "census; exits 1 when a scoped pattern matches "
+                       "under --min tasks")
+    h.add_argument("--min", type=int, default=3, metavar="N",
+                   help="minimum scoped hits per pattern (default 3)")
+    h.add_argument("--states", default=",".join(STATES),
+                   help="comma-separated hk task states to scan")
+    h.add_argument("--rules", type=Path,
+                   default=Path(__file__).resolve().parents[1]
+                   / "area-rules.json",
+                   help="mapping-rule data file")
     argv = sys.argv[1:]
-    if not argv or argv[0] not in ("propose", "apply", "-h", "--help"):
+    if not argv or argv[0] not in ("propose", "apply", "pattern-hits",
+                                   "-h", "--help"):
         argv = ["propose"] + argv
     args = parser.parse_args(argv)
     if args.mode == "apply":
         return cmd_apply(args)
+    if args.mode == "pattern-hits":
+        return cmd_pattern_hits(args)
     return cmd_propose(args)
 
 

@@ -1,8 +1,8 @@
 {
-  "comment": "hk 1941 (K2): rule data for director/bin/area-propose. Source: hk:doc reports/b953/hk1938-kind-grading-packet, section 1 mapping rule and appendix keyword table. All patterns are regular expressions matched case-insensitively; the first entry in each list wins. Edit the data here, never the tool. hk 2012 (K2 rule tuning): shell-wrk and trading title entries before docs and ops, scoped by a projects list where \"\" is projectless; a product repo keeps its default unless a title names an area in project_areas, and fleet_projects keep the title order; Korean fleet keywords last; tripwire uses a lookbehind because \\b does not split trust_tripwire.",
+  "comment": "hk 1941 (K2): rule data for director/bin/area-propose. Source: hk:doc reports/b953/hk1938-kind-grading-packet, section 1 mapping rule and appendix keyword table. All patterns are regular expressions matched case-insensitively; the first entry in each list wins. Edit the data here, never the tool. hk 2012 (K2 rule tuning): shell-wrk and trading title entries before docs and ops, scoped by a projects list where \"\" is projectless; a product repo keeps its default unless a title names an area in project_areas, and fleet_projects keep the title order; Korean fleet keywords last; tripwire uses a lookbehind because \\b does not split trust_tripwire. hk 2100: the projectless web-frontend pattern 홈 전환 was dropped as a per-title special case (it matched 1 of 2065 tasks; director-1 forbids per-title rules), and the pattern-hits subcommand guards new patterns against that.",
   "fleet_projects": ["agent-skills", "handoffkeep", "panewire", "admiral"],
   "project_areas": {"ParkingArcade": ["blender", "web-qa", "web-frontend"]},
-  "version": 2,
+  "version": 3,
   "exclude_title_patterns": [
     "\\bsmoke\\b",
     "\\bthrowaway\\b"
@@ -36,7 +36,7 @@
     {"area": "go-backend", "projects": [""], "patterns": ["\\bhandoffkeep\\b", "\\bpanewire\\b", "\\badmiral\\b"]},
     {"area": "shell-wrk", "projects": [""], "patterns": ["\\bagent-skills\\b", "\\bbin/wrk\\b"]},
     {"area": "shell-wrk", "projects": [""], "patterns": ["\\bbuilder\\b", "\\bspawn-worker\\b"]},
-    {"area": "web-frontend", "projects": ["", "agent-skills", "handoffkeep", "panewire", "admiral"], "patterns": ["콘솔", "홈 전환"]}
+    {"area": "web-frontend", "projects": ["", "agent-skills", "handoffkeep", "panewire", "admiral"], "patterns": ["콘솔"]}
   ],
   "project_defaults": {
     "ParkingArcade": "unity",

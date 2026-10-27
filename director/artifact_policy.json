@@ -1,0 +1,20 @@
+{
+ "schema": "fleet.artifact-policy.v1",
+ "roots": {
+  "jobs": "herdr-inbox/jobs",
+  "webqa": "webqa-runner/jobs"
+ },
+ "rows": [
+  {
+   "class": "intermediate-build",
+   "root": "jobs",
+   "glob": "unity/*/out",
+   "keep_newest": 2
+  },
+  {
+   "class": "cache",
+   "root": "jobs",
+   "glob": "unity/*/out"
+  }
+ ]
+}
