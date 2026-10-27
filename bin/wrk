@@ -12886,10 +12886,14 @@ def record_start(text):
     # Fixed token five follows ticket: base readers keep all four original offsets.
     # Later cmd text is never identity. Ancient command text can itself
     # occupy token five, so the token-four ticket is required as context.
+    fields = text.split(None, 5)
+    if (len(fields) < 5 or not fields[0].startswith("pid=") or
+            fields[1] not in ("class=ci", "class=lane") or
+            not fields[2].startswith("limit=")):
+        return None
     if record_ticket(text) is None:
         return None
-    fields = text.split(None, 5)
-    return fields[4][6:] if len(fields) >= 5 and fields[4].startswith("start=") else None
+    return fields[4][6:] if fields[4].startswith("start=") else None
 
 
 def owner_alive(pid, start):

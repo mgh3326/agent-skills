@@ -690,6 +690,20 @@ class HeavyQueue(unittest.TestCase):
         self.assertTrue(path.exists(), "ancient command forged start identity and retired a live owner")
         self.assertEqual(self.events("waiter.retired"), [])
 
+    def test_start_requires_complete_fixed_head(self):
+        variants = (
+            f"pid={os.getpid()} since=x cmd=env ticket=1:1 start=forged",
+            f"pid={os.getpid()} class=lane limit=1 since=x start=forged",
+            f"pid={os.getpid()} class=lane cmd=env ticket=1:1 start=forged",
+            f"pid={os.getpid()} cmd=env limit=1 ticket=1:1 start=forged",
+        )
+        for index, info in enumerate(variants):
+            path = self.waiters / ("incomplete-head-" + str(index))
+            path.write_text(info)
+            self.assertEqual(self.run_wrk("status").returncode, 0)
+            self.assertTrue(path.exists(), "incomplete head forged identity and retired a live legacy owner")
+        self.assertEqual(self.events("waiter.retired"), [])
+
     def test_base_reader_accepts_new_record(self):
         # These two unchanged functions are the in-repo 1a9ded3 reader logic:
         # record_head reads exactly three tokens; record_ticket reads token four.
@@ -792,7 +806,11 @@ class HeavyQueue(unittest.TestCase):
     def test_owner_mutants_break_invariants(self):
         mutations = [
             ("legacy-context", "    if record_ticket(text) is None:\n", "    if False:\n",
-             "test_ancient_command_cannot_forge_start_identity", "ancient command forged start identity"),
+             "test_start_requires_complete_fixed_head", "incomplete head forged identity"),
+            ("header-context", '    if (len(fields) < 5 or not fields[0].startswith("pid=") or\n'
+             '            fields[1] not in ("class=ci", "class=lane") or\n'
+             '            not fields[2].startswith("limit=")):\n', '    if False:\n',
+             "test_start_requires_complete_fixed_head", "incomplete head forged identity"),
             ("identity", "    if observed != start:\n", "    if False:\n",
              "test_owner_pid_reuse_retires_and_audits_once", "different process identity reserved capacity"),
             ("eperm-dead", 'return (True, "process-exists") if strict else True',
