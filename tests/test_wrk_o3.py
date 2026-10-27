@@ -2102,7 +2102,7 @@ class SpawnCase(O3Case):
     def spawn_tester(self, w, *extra, job="rev-a", head=None, owner="b2400-a"):
         # A reviewer's launch lane is the subject's canonical owner lane (B2).
         return w.spawn("--role", "tester", "--parent-job", "job-a", "--job", job, "--head", head or w.heads[0],
-                       "--owner", owner,
+                       "--owner", owner, "--report", w.inbox / job / "report.md",
                        *extra, label=job)
 
     def test_reviewer_order_mint_verify_open_then_pane(self):
@@ -2461,7 +2461,7 @@ class RuleCase(O3Case):
             with self.subTest(job):
                 before = len(w.appends("claim"))
                 out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", job, "--head", w.heads[0],
-                              "--owner", "b2400-a", label=job)
+                              "--owner", "b2400-a", "--report", w.inbox / job / "report.md", label=job)
                 # The server answers (stale zero CAS on an existing id gives
                 # sequence_conflict first, else claim_conflict); wrk reports it.
                 self.assertEqual(out.returncode, 73, out.stderr)
@@ -2477,11 +2477,13 @@ class RuleCase(O3Case):
         w.local_claim("job-a")
         w.local_claim("job-missing")
         out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", "rev-a", "--head", w.heads[0],
-                      "--owner", "b2400-a", label="rev-a")
+                      "--owner", "b2400-a", "--report", w.inbox / "rev-a" / "report.md", label="rev-a")
         self.assertRc(out, 77, "host_mismatch")
         self.assertEqual(len(w.appends("claim")), 1)
+        # An explicit owner skips the hk 2042 local parent-claim read, so the
+        # missing subject reaches the server.
         out = w.spawn("--role", "tester", "--parent-job", "job-missing", "--job", "rev-m", "--head", w.heads[0],
-                      label="rev-m")
+                      "--owner", "b2400-a", "--report", w.inbox / "rev-m" / "report.md", label="rev-m")
         self.assertRc(out, 66, "not_found")
         self.assertEqual(len(w.appends("claim")), 1)
         self.assertEqual(w.herdr_calls(), [])
@@ -2815,7 +2817,7 @@ def scenario_b1_assignment_on_another_head(case, bindir=BIN):
     case.assertRc(w.run("o3", "central", "assign", "rev-a", "--as", "director-1", "--target", "job-a", "--round", "1",
                         "--role", "tester"), 0)
     out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", "rev-a", "--head", w.heads[1],
-                  "--owner", "b2400-a", label="rev-a")
+                  "--owner", "b2400-a", "--report", w.inbox / "rev-a" / "report.md", label="rev-a")
     return w, out
 
 
@@ -2829,7 +2831,7 @@ def scenario_b2_local_task_differs(case, bindir=BIN):
     doc["task_id"] = 9999
     claim.write_text(json.dumps(doc) + "\n")
     out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", "rev-a", "--head", w.heads[0],
-                  "--owner", "unrelated-lane", label="rev-a", tier="T0")
+                  "--owner", "unrelated-lane", "--report", w.inbox / "rev-a" / "report.md", label="rev-a", tier="T0")
     return w, out
 
 
@@ -2995,7 +2997,7 @@ class Round1FindingCase(O3Case):
         self.assertEqual(w.events("rev-a", "job.claim"), [])
         # Control: the same assignment on the round's own head attaches and panes.
         out = w.spawn("--role", "tester", "--parent-job", "job-a", "--job", "rev-a", "--head", w.heads[0],
-                      "--owner", "b2400-a", label="rev-a")
+                      "--owner", "b2400-a", "--report", w.inbox / "rev-a" / "report.md", label="rev-a")
         self.assertRc(out, 0)
         self.assertTrue(w.herdr_calls())
 
