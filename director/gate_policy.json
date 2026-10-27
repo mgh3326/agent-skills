@@ -2270,6 +2270,27 @@
       "role_status": "unknown",
       "roles": [],
       "surfaces": []
+    },
+    "cmd-dsflash41": {
+      "default_effort": "high",
+      "family": "deepseek",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null
+      },
+      "launcher": "cmd",
+      "launcher_model_token": "-m deepseek/deepseek-v4.1-flash",
+      "model": "deepseek-v4.1-flash",
+      "role_status": "unknown",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
     }
   },
   "required_ci_jobs_by_repo": {
