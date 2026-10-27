@@ -291,6 +291,8 @@ run_move() {
       WRK_RSYNC_BIN="$RSYNC" RSYNC_LOG="$RSYNC_LOG" \
       FPBULK_DIR="$FPBULK_DIR" HK_STUB_DIR="$HK_DIR" \
       HK_STUB_MODE="${HK_STUB_MODE:-ok}" WRK_ARTIFACTS_HK_TIMEOUT_S="${WRK_ARTIFACTS_HK_TIMEOUT_S:-30}" \
+      PYTHONPATH="${TEST_PYTHONPATH:-}" WRK_TEST_INCOMPLETE_WALK="${TEST_INCOMPLETE_WALK:-}" \
+      WRK_TEST_WALK_ROOT="${TEST_WALK_ROOT:-}" WRK_TEST_UNREADABLE_FILE="${TEST_UNREADABLE_FILE:-}" \
       WRK_ARTIFACTS_FREE_BYTES="$free" \
       "$WRK" artifacts move "$@" >"$OUT" 2>"$ERR"
   else
@@ -300,6 +302,8 @@ run_move() {
       WRK_RSYNC_BIN="$RSYNC" RSYNC_LOG="$RSYNC_LOG" \
       FPBULK_DIR="$FPBULK_DIR" HK_STUB_DIR="$HK_DIR" \
       HK_STUB_MODE="${HK_STUB_MODE:-ok}" WRK_ARTIFACTS_HK_TIMEOUT_S="${WRK_ARTIFACTS_HK_TIMEOUT_S:-30}" \
+      PYTHONPATH="${TEST_PYTHONPATH:-}" WRK_TEST_INCOMPLETE_WALK="${TEST_INCOMPLETE_WALK:-}" \
+      WRK_TEST_WALK_ROOT="${TEST_WALK_ROOT:-}" WRK_TEST_UNREADABLE_FILE="${TEST_UNREADABLE_FILE:-}" \
       "$WRK" artifacts move "$@" >"$OUT" 2>"$ERR"
   fi
   MOVE_RC=$?
@@ -313,6 +317,17 @@ fp_evict() { printf '%s' "$2" >"$FPBULK_DIR/evict/$(fp_hash "$DEST/$1")"; }
 fp_calls() { if [[ -f "$FPBULK_DIR/calls.log" ]]; then cat "$FPBULK_DIR/calls.log"; fi; }
 fp_evict_calls() { fp_calls | grep -c '^evict' || true; }
 emit_count() { tr '\0' '\n' <"$PANEWIRE_LOG" | grep -c '^emit$' || true; }
+dataset_key() {
+  python3 - "$1" "$2" <<'PY'
+from urllib.parse import quote
+import sys
+print(quote(sys.argv[1], safe="") + "!" + quote(sys.argv[2], safe=""))
+PY
+}
+state_path_for() { printf '%s/%s.state.json' "$STATEDIR" "$(dataset_key "$1" "$2")"; }
+alerts_path_for() { printf '%s/%s.alerts.json' "$STATEDIR" "$(dataset_key "$1" "$2")"; }
+log_path_for() { printf '%s/%s.treeup.log' "$STATEDIR" "$(dataset_key "$1" "$2")"; }
+lock_path_for() { printf '%s/%s.lock' "$STATEDIR" "$(dataset_key "$1" "$2")"; }
 
 record_doc() {
   [[ -f "$HK_DIR/docs/artifacts_$1" ]] || fail "no record doc artifacts_$1"
@@ -392,7 +407,7 @@ grep -q 'files=3' "$OUT" || fail "dry: files count missing ($(cat "$OUT"))"
 assert_no_file "$DEST/a.txt"
 [[ -z "$(fp_calls)" ]] || fail "dry: fpbulk must not run"
 [[ ! -s "$HK_DIR/argv.log" ]] || fail "dry: hk must not run"
-[[ -z "$(find "$STATEDIR" -type f 2>/dev/null)" ]] || fail "dry: state dir must stay empty"
+[[ -z "$(find "$STATEDIR" -type f ! -name '*.lock' 2>/dev/null)" ]] || fail "dry: state dir must not contain state, alert or log files"
 echo "PASS dry-run"
 
 # ---------------------------------------------------------------------------
@@ -542,6 +557,143 @@ EOF
 case_remote_path_guard remote-guards || fail "remote path guard"
 echo "PASS remote path, existence and readability guards"
 
+# Local inventory must fail closed when os.walk reports an unreadable subtree.
+# sitecustomize injects the read error only for the mover's source walk, leaving
+# one usable file in place so a missing onerror callback would falsely succeed.
+mkdir -p "$TMP/walk-error-inject"
+cat >"$TMP/walk-error-inject/sitecustomize.py" <<'PY'
+import os
+import builtins
+_walk = os.walk
+def _walk_with_error(top, *args, **kwargs):
+    if os.environ.get("WRK_TEST_INCOMPLETE_WALK") == "1" and top == os.environ.get("WRK_TEST_WALK_ROOT"):
+        callback = kwargs.get("onerror")
+        if callback is not None:
+            callback(PermissionError(13, "permission denied", os.path.join(top, "unreadable-subdir")))
+    yield from _walk(top, *args, **kwargs)
+os.walk = _walk_with_error
+_open = builtins.open
+def _open_with_error(path, *args, **kwargs):
+    if os.environ.get("WRK_TEST_UNREADABLE_FILE") == "1" and os.path.basename(os.fspath(path)) == "denied.txt":
+        raise PermissionError(13, "permission denied", os.fspath(path))
+    return _open(path, *args, **kwargs)
+builtins.open = _open_with_error
+PY
+case_local_walk_incomplete() {
+  reset_case "$1"
+  mk_src good.txt readable
+  mk_src sub/nested.txt readable
+  TEST_PYTHONPATH="$TMP/walk-error-inject" TEST_INCOMPLETE_WALK=1 TEST_WALK_ROOT="$SRC" \
+    run_move "$SRC" --dest "$DRIVE/mbp/ds" --apply
+  [[ "$MOVE_RC" -eq 2 ]] || return 1
+  grep -q 'local inventory incomplete' "$ERR" || return 1
+  [[ ! -e "$DRIVE/mbp/ds.manifest.tsv" && ! -s "$HK_DIR/argv.log" ]] || return 1
+}
+case_local_walk_incomplete local-walk || fail "local incomplete walk case"
+echo "PASS local unreadable inventory fails closed"
+
+reset_case local-file-unreadable
+mk_src sub/denied.txt unreadable
+TEST_PYTHONPATH="$TMP/walk-error-inject" TEST_UNREADABLE_FILE=1 \
+  run_move "$SRC" --dest "$DRIVE/mbp/ds" --apply
+[[ "$MOVE_RC" -eq 2 ]] || fail "local unreadable file: expected refusal"
+grep -q 'local inventory incomplete' "$ERR" || fail "local unreadable file: failure must name incomplete inventory ($(cat "$ERR"))"
+[[ ! -e "$DRIVE/mbp/ds.manifest.tsv" && ! -s "$HK_DIR/argv.log" ]] || fail "local unreadable file: no partial done record"
+echo "PASS local unreadable file fails closed"
+
+# Dataset keys include both destination host and percent-encoded dataset name.
+case_host_scope() {
+  reset_case "$1"
+  mk_src item.txt payload
+  run_move "$SRC" --dest "$DRIVE/hostA/same" --apply
+  [[ "$MOVE_RC" -eq 0 ]] || return 1
+  run_move "$SRC" --dest "$DRIVE/hostB/same" --apply
+  [[ "$MOVE_RC" -eq 0 ]] || return 1
+  local host_a host_b
+  host_a="$(state_path_for hostA same)"
+  host_b="$(state_path_for hostB same)"
+  [[ -f "$host_a" && -f "$host_b" && "$host_a" != "$host_b" ]] || return 1
+  [[ -f "$(log_path_for hostA same)" && -f "$(log_path_for hostB same)" ]] || return 1
+  [[ "$(fp_evict_calls)" -eq 2 ]] || return 1
+}
+case_host_scope host-scope || fail "host-scoped state case"
+echo "PASS state and log keys include destination host"
+
+case_alert_host_scope() {
+  reset_case "$1"
+  mk_src item.txt payload
+  DEST="$DRIVE/hostA/same"
+  fp_spec item.txt 01
+  run_move "$SRC" --dest "$DEST" --apply
+  [[ "$MOVE_RC" -eq 3 ]] || { echo "alert hostA rc=$MOVE_RC err=$(cat "$ERR")" >&2; return 1; }
+  DEST="$DRIVE/hostB/same"
+  fp_spec item.txt 01
+  run_move "$SRC" --dest "$DEST" --apply
+  [[ "$MOVE_RC" -eq 3 ]] || { echo "alert hostB rc=$MOVE_RC err=$(cat "$ERR")" >&2; return 1; }
+  [[ -f "$(alerts_path_for hostA same)" && -f "$(alerts_path_for hostB same)" ]] || { echo "alert paths missing: $(find "$STATEDIR" -type f -print)" >&2; return 1; }
+  [[ "$(alerts_path_for hostA same)" != "$(alerts_path_for hostB same)" ]] || { echo "alert paths collide" >&2; return 1; }
+  [[ "$(lock_path_for hostA same)" != "$(lock_path_for hostB same)" ]] || { echo "lock paths collide" >&2; return 1; }
+  [[ "$(emit_count)" -eq 2 ]] || { echo "emit count $(emit_count)" >&2; return 1; }
+}
+case_alert_host_scope alert-host-scope || fail "host-scoped alert case"
+echo "PASS alert and lock keys include destination host"
+
+case_name_encoding() {
+  reset_case "$1"
+  mk_src item.txt payload
+  run_move "$SRC" --dest "$DRIVE/mbp/a/b" --apply
+  [[ "$MOVE_RC" -eq 0 ]] || return 1
+  run_move "$SRC" --dest "$DRIVE/mbp/a__b" --apply
+  [[ "$MOVE_RC" -eq 0 ]] || return 1
+  local nested flat
+  nested="$(state_path_for mbp a/b)"
+  flat="$(state_path_for mbp a__b)"
+  [[ -f "$nested" && -f "$flat" && "$nested" != "$flat" ]] || return 1
+  [[ -f "$(log_path_for mbp a/b)" && -f "$(log_path_for mbp a__b)" ]] || return 1
+  [[ "$(fp_evict_calls)" -eq 2 ]] || return 1
+}
+case_name_encoding name-encoding || fail "dataset name encoding case"
+echo "PASS slash and double-underscore names stay distinct"
+
+# Old host-less state files are never adopted under a new host-scoped key.
+reset_case legacy-state
+mk_src item.txt payload
+printf '%s\n' '{"item.txt":{"confirmed":true}}' >"$STATEDIR/ds.state.json"
+run_move "$SRC" --dest "$DRIVE/mbp/ds" --apply
+[[ "$MOVE_RC" -eq 2 ]] || fail "legacy: expected explicit refusal"
+grep -q 'legacy unscoped state file' "$ERR" || fail "legacy: refusal must explain the old state file"
+[[ ! -e "$(state_path_for mbp ds)" && ! -s "$HK_DIR/argv.log" ]] || fail "legacy: old state must not be adopted"
+echo "PASS legacy unscoped state refused"
+
+# Two overlapping runs for the same encoded dataset cannot access shared state.
+case_concurrent_lock() {
+  reset_case "$1"
+  mk_src item.txt payload
+  DEST="$DRIVE/mbp/ds"
+  cat >"$TMP/$CASE/slow-first-status" <<'SH'
+if [[ "${CALL:-}" == "1" ]]; then sleep 1; fi
+SH
+  cp "$TMP/$CASE/slow-first-status" "$FPBULK_DIR/on_status"
+  (
+    run_move "$SRC" --dest "$DEST" --apply
+    printf '%s\n' "$MOVE_RC" >"$TMP/$CASE/first.rc"
+  ) &
+  local first_pid=$!
+  local n=0
+  while [[ ! -f "$FPBULK_DIR/status-calls" && "$n" -lt 100 ]]; do sleep 0.05; n=$((n + 1)); done
+  [[ -f "$FPBULK_DIR/status-calls" ]] || { wait "$first_pid" || true; return 1; }
+  local saved_out="$OUT" saved_err="$ERR"
+  OUT="$TMP/$CASE/second.out"; ERR="$TMP/$CASE/second.err"
+  run_move "$SRC" --dest "$DEST" --apply
+  OUT="$saved_out"; ERR="$saved_err"
+  [[ "$MOVE_RC" -eq 2 ]] || { wait "$first_pid" || true; return 1; }
+  grep -q 'already active' "$TMP/$CASE/second.err" || { wait "$first_pid" || true; return 1; }
+  wait "$first_pid" || return 1
+  [[ "$(cat "$TMP/$CASE/first.rc")" -eq 0 ]] || return 1
+}
+case_concurrent_lock concurrent-lock || fail "concurrent run lock case"
+echo "PASS concurrent same-dataset run refused"
+
 # Empty sources are refused before they can write a manifest or an hk done record.
 reset_case empty
 DEST="$DRIVE/mbp/empty"
@@ -626,24 +778,37 @@ case_oneread() {
 case_oneread oneread || fail "one-read case"
 echo "PASS single read not confirmed"
 
-# evict error: reported, file left in place, never retried in a loop.
-reset_case everr
+# evict error is reported without a same-run loop; a later run retries it.
+case_evict_retry() {
+reset_case "$1"
 mk_src a.txt alpha
 DEST="$DRIVE/mbp/ds"
 fp_evict a.txt err
 run_move "$SRC" --dest "$DEST" --apply
-[[ "$MOVE_RC" -eq 4 ]] || fail "everr: expected rc 4, got $MOVE_RC ($(tail -3 "$ERR"))"
-grep -qi 'evict' "$ERR" || fail "everr: evict error must be reported"
-assert_file "$DEST/a.txt"
-[[ "$(fp_evict_calls)" -eq 1 ]] || fail "everr: evict must not retry in a loop"
-python3 - "$HK_DIR/docs/artifacts_mbp_ds" <<'PY'
+[[ "$MOVE_RC" -eq 4 ]] || return 1
+grep -qi 'evict' "$ERR" || return 1
+assert_file "$DEST/a.txt" || return 1
+[[ "$(fp_evict_calls)" -eq 1 ]] || return 1
+python3 - "$HK_DIR/docs/artifacts_mbp_ds" <<'PY' || return 1
 import json, sys
 rec = json.load(open(sys.argv[1]))
 row = [c for c in rec["archive"]["contents"] if c["path"] == "a.txt"][0]
 assert row["evicted"] is False, row
 assert row["uploaded_at"], row
 PY
-echo "PASS evict error"
+fp_evict a.txt ok
+run_move "$SRC" --dest "$DEST" --apply
+[[ "$MOVE_RC" -eq 0 ]] || return 1
+[[ "$(fp_evict_calls)" -eq 2 ]] || return 1
+python3 - "$HK_DIR/docs/artifacts_mbp_ds" <<'PY' || return 1
+import json, sys
+rec = json.load(open(sys.argv[1]))
+row = [c for c in rec["archive"]["contents"] if c["path"] == "a.txt"][0]
+assert row["evicted"] is True, row
+PY
+}
+case_evict_retry everr || fail "evict retry case"
+echo "PASS evict error retried on later run"
 
 # evict ok but the path still reads 11 (evict never took): reported, not evicted.
 reset_case evpost
@@ -720,7 +885,7 @@ case_excl() {
   [[ ! -e "$DEST/sub/.env" ]] || return 1
   [[ -f "$DEST/keep.txt" && -f "$DEST/sub/ok.txt" ]] || return 1
   # excluded names appear nowhere in the record, manifest or state file.
-  python3 - "$HK_DIR/docs/artifacts_mbp_ds" "$DRIVE/mbp/ds.manifest.tsv" "$STATEDIR/ds.state.json" <<'PY' || return 1
+  python3 - "$HK_DIR/docs/artifacts_mbp_ds" "$DRIVE/mbp/ds.manifest.tsv" "$(state_path_for mbp ds)" <<'PY' || return 1
 import sys
 rec = open(sys.argv[1]).read()
 man = open(sys.argv[2]).read()
@@ -750,14 +915,14 @@ case_stateskip() {
   mkdir -p "$DEST"
   printf '%s\n' 'DIFFERENT bytes same length' >"$DEST/same.txt"
   printf '%s\n' 'DIFFERENT bytes same length!' >"$DEST/changed.txt"
-  python3 - "$STATEDIR/ds.state.json" "$SRC" <<'PY'
+  python3 - "$(state_path_for mbp ds)" "$SRC" <<'PY'
 import hashlib, json, sys
 st_path, src = sys.argv[1:3]
 def sha(p):
     return hashlib.sha256(open(p, "rb").read()).hexdigest()
 st = {
-  "same.txt": {"size": len("stable") + 1, "sha256": sha(src + "/same.txt"), "confirmed": True},
-  "changed.txt": {"size": len("newcontent-here") + 1, "sha256": "0" * 64, "confirmed": True},
+  "same.txt": {"size": len("stable") + 1, "sha256": sha(src + "/same.txt"), "confirmed": True, "evicted": True},
+  "changed.txt": {"size": len("newcontent-here") + 1, "sha256": "0" * 64, "confirmed": True, "evicted": True},
 }
 json.dump(st, open(st_path, "w"))
 PY
@@ -934,6 +1099,27 @@ expect_mut_red "remote source is absolutized locally" case_remote_path_guard mut
 
 mkmut remote-missing-root 's/if not os.path.isdir(src): raise SystemExit/if not True: raise SystemExit/'
 expect_mut_red "remote missing directory accepted" case_remote_path_guard mut-remote-missing-root
+
+# Dropping destination host from the state key makes a successful same-name
+# dataset on the second host look already copied and evicted.
+mkmut state-key-no-host 's/quote(dest_host, safe="") + "!" + quote(name, safe="")/quote(name, safe="")/'
+expect_mut_red "destination host removed from dataset key" case_host_scope mut-state-key-no-host
+
+# Legacy slash flattening collides for a/b and a__b.
+mkmut state-key-flat-name 's/quote(dest_host, safe="") + "!" + quote(name, safe="")/quote(dest_host, safe="") + "!" + name.replace("\/", "__")/'
+expect_mut_red "slash and double underscore collide" case_name_encoding mut-state-key-flat-name
+
+# Local inventory must bind onerror at the os.walk call site.
+mkmut local-walk-no-onerror 's/os.walk(src, onerror=local_walk_error)/os.walk(src)/'
+expect_mut_red "local walk error callback removed" case_local_walk_incomplete mut-local-walk-no-onerror
+
+# A second overlapping run must fail while the first owns the per-dataset lock.
+mkmut no-dataset-lock 's/^    fcntl.flock(lock_fd.*hk2097-artifacts-mut:dataset-lock$/    pass/'
+expect_mut_red "dataset lock removed" case_concurrent_lock mut-no-dataset-lock
+
+# A confirmed but un-evicted file must be retried on a later invocation.
+mkmut skip-un-evicted 's/rec.get("confirmed") and rec.get("evicted") and rec.get("size")/rec.get("confirmed") and rec.get("size")/g'
+expect_mut_red "confirmed state skips failed evict forever" case_evict_retry mut-skip-un-evicted
 
 # evict without requiring every file confirmed -> stuck case goes RED.
 mkmut evict-unconfirmed 's/all(s == "confirmed" for s, _ in states.values())/True/'

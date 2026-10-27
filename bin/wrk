@@ -171,7 +171,7 @@ profiles_cmd() {
 
 usage() {
   cat <<'USAGE'
-Usage: wrk <spawn|done|restore|escalate|joined|round|reap|worktree-reap|lanes-missing|find|name-sync|profiles|hosts|heavy|artifacts|usage> [options]
+Usage: wrk <spawn|done|restore|escalate|joined|round|reap|worktree-reap|lanes-missing|find|name-sync|profiles|hosts|heavy|usage|artifacts> [options]
 
   wrk spawn -c CWD -m MODEL -p PROMPT_FILE -w WORKSPACE -l LABEL --t T0..T3
             [-L live|mock] [--effort LEVEL] [--job ID] [--report PATH] [--job-dup-ok] [--landing-strict]
@@ -16195,7 +16195,8 @@ artifacts_move_cmd() {
 # the DriveFS freshness guard), evict the Drive-folder copies, and record
 # the dataset in hk as a fleet.artifact.v2 doc. Never deletes a source
 # original: local deletion is the host sweep's job (hk 2094).
-import fnmatch, glob, hashlib, json, os, re, shlex, shutil, subprocess, sys, time, uuid
+import fcntl, fnmatch, glob, hashlib, json, os, re, shlex, shutil, subprocess, sys, time, uuid
+from urllib.parse import quote
 
 PROG = "wrk artifacts move"
 
@@ -16370,7 +16371,7 @@ parts = rel_dest.split(os.sep)
 if len(parts) < 2:
     die("--dest must be <drive_folder>/<host>/<name>: %s" % dest)
 dest_host, name = parts[0], "/".join(parts[1:])
-flat_name = name.replace("/", "__")
+dataset_key = quote(dest_host, safe="") + "!" + quote(name, safe="")
 
 ssh_bin = os.environ.get("WRK_SSH_BIN", "ssh")
 rsync_bin = os.environ.get("WRK_RSYNC_BIN", "rsync")
@@ -16421,8 +16422,28 @@ def inventory():
     never listed. For a remote source the hashing happens on the remote."""
     out = []
     if not source_host:
-        for r, dirs, fs in os.walk(src):
-            dirs[:] = sorted(d for d in dirs if not excluded(d) and not os.path.islink(os.path.join(r, d)))
+        def local_walk_error(error):
+            die("local inventory incomplete: %s" % error)
+        try:
+            root_mode = os.stat(src).st_mode
+        except OSError as e:
+            die("local inventory incomplete: cannot inspect %s: %s" % (src, e))
+        if not root_mode & 0o444 or not root_mode & 0o111:
+            die("local inventory incomplete: source directory is unreadable: %s" % src)
+        for r, dirs, fs in os.walk(src, onerror=local_walk_error):
+            keep_dirs = []
+            for d in dirs:
+                dp = os.path.join(r, d)
+                if excluded(d) or os.path.islink(dp):
+                    continue
+                try:
+                    dmode = os.stat(dp).st_mode
+                except OSError as e:
+                    die("local inventory incomplete: cannot inspect %s: %s" % (dp, e))
+                if not dmode & 0o444 or not dmode & 0o111:
+                    die("local inventory incomplete: directory is unreadable: %s" % dp)
+                keep_dirs.append(d)
+            dirs[:] = sorted(keep_dirs)
             for f in sorted(fs):
                 if excluded(f):  # hk2097-mut:exclusions
                     continue
@@ -16430,9 +16451,11 @@ def inventory():
                 if os.path.islink(p) or not os.path.isfile(p):
                     continue
                 try:
+                    if not os.stat(p).st_mode & 0o444:
+                        die("local inventory incomplete: file is unreadable: %s" % p)
                     out.append((os.path.relpath(p, src), os.path.getsize(p), sha_of(p)))
-                except OSError:
-                    continue
+                except OSError as e:
+                    die("local inventory incomplete: cannot read %s: %s" % (p, e))
         return out
     try:
         # OpenSSH joins remote-command argv and invokes a remote shell. Quote
@@ -16572,6 +16595,33 @@ def emit_timeout_alert(bno, states, evidence):
     except (OSError, subprocess.TimeoutExpired):
         return False
 
+os.makedirs(STATE_DIR, exist_ok=True)
+state_path = os.path.join(STATE_DIR, dataset_key + ".state.json")
+alerts_path = os.path.join(STATE_DIR, dataset_key + ".alerts.json")
+log_path = os.path.join(STATE_DIR, dataset_key + ".treeup.log")
+lock_path = os.path.join(STATE_DIR, dataset_key + ".lock")
+legacy_flat_name = name.replace("/", "__")
+legacy_paths = [
+    os.path.join(STATE_DIR, legacy_flat_name + ".state.json"),
+    os.path.join(STATE_DIR, legacy_flat_name + ".alerts.json"),
+    os.path.join(STATE_DIR, legacy_flat_name + ".treeup.log"),
+]
+for legacy_path in legacy_paths:
+    if os.path.exists(legacy_path) and legacy_path not in (state_path, alerts_path, log_path):
+        die("legacy unscoped state file exists; refusing to adopt it: %s" % legacy_path)
+
+try:
+    lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # hk2097-artifacts-mut:dataset-lock
+except BlockingIOError:
+    try:
+        os.close(lock_fd)
+    except (OSError, NameError):
+        pass
+    die("dataset run is already active; refusing concurrent run for %s/%s" % (dest_host, name))
+except OSError as e:
+    die("cannot lock dataset %s/%s: %s" % (dest_host, name, e))
+
 inv = inventory()
 if not inv:
     die("source inventory is empty; refusing to write an empty manifest or done record")
@@ -16583,8 +16633,6 @@ def save_json(path, obj):
         json.dump(obj, f)
     os.replace(tmp, path)
 
-state_path = os.path.join(STATE_DIR, flat_name + ".state.json")
-alerts_path = os.path.join(STATE_DIR, flat_name + ".alerts.json")
 try:
     with open(state_path) as f:
         state = json.load(f)
@@ -16635,7 +16683,7 @@ def contents_rows():
 def hk_record_put():
     record["archive"]["contents"] = contents_rows()
     record["archive"]["updated_at"] = iso(now())
-    tmp = os.path.join(STATE_DIR, "." + flat_name + ".record.tmp")
+    tmp = os.path.join(STATE_DIR, "." + dataset_key + ".record.tmp")
     with open(tmp, "w") as f:
         json.dump(record, f, indent=2, sort_keys=True)
         f.write("\n")
@@ -16674,7 +16722,7 @@ if not apply_mode:
             rel, size, sha = inv[i]
             i += 1
             rec = state.get(rel)
-            if isinstance(rec, dict) and rec.get("confirmed") and rec.get("size") == size and rec.get("sha256") == sha:
+            if isinstance(rec, dict) and rec.get("confirmed") and rec.get("evicted") and rec.get("size") == size and rec.get("sha256") == sha:
                 skipped_confirmed += 1
                 continue
             batch.append(rel)
@@ -16694,7 +16742,7 @@ if not apply_mode:
     raise SystemExit(0)
 
 os.makedirs(STATE_DIR, exist_ok=True)
-logf = open(os.path.join(STATE_DIR, flat_name + ".treeup.log"), "a", buffering=1)
+logf = open(log_path, "a", buffering=1)
 def say(m):
     logf.write(time.strftime("%F %T ") + m + "\n")
 
@@ -16706,7 +16754,7 @@ def report(msg):
 say("START %s -> %s files=%d batch=%dB/%df state_entries=%d" %
     (src, dest, len(inv), BATCH_BYTES, BATCH_FILES, len(state)))
 
-scratch_root = os.path.join(SCRATCH_DIR, flat_name)
+scratch_root = os.path.join(SCRATCH_DIR, dataset_key)
 i = 0
 bno = 0
 while i < len(inv):
@@ -16731,7 +16779,7 @@ while i < len(inv):
         else:
             cur_size, cur_sha = inv_size, inv_sha
         rec = state.get(rel)
-        skip = bool(rec) and rec.get("confirmed") and rec.get("size") == cur_size and rec.get("sha256") == cur_sha  # hk2097-mut:state-sha
+        skip = bool(rec) and rec.get("confirmed") and rec.get("evicted") and rec.get("size") == cur_size and rec.get("sha256") == cur_sha  # hk2097-mut:state-sha
         if skip:
             skipped_confirmed += 1
             continue
