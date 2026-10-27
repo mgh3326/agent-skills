@@ -12424,6 +12424,10 @@ for name in repo_names:
             cur = None
 
 # ── job → worktree binding through receipt/task-link payload paths ────────
+# Only receipts and task links may bind a worktree to a task: an unrelated
+# event (note, log, heartbeat …) carrying cwd/task_id must not establish the
+# association.
+BINDING_KINDS = {"job.claim", "job.reclaim", "job.attached", "job.spawned", "job.task_link"}
 bound_jobs = {}
 job_task = {}
 try:
@@ -12436,7 +12440,7 @@ for job in job_names:
         continue
     paths = set()
     for _name, document, _mtime in wrk_events_ordered(evdir):
-        if document is None:
+        if document is None or document.get("kind") not in BINDING_KINDS:
             continue
         payload = document.get("payload", document)
         if not isinstance(payload, dict):

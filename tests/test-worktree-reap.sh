@@ -220,6 +220,18 @@ reap_try
 expect_ok "F"
 expect_line "keep $WT reason=no-task-link" "F unlinked kept"
 
+# Case F2: an unrelated event (job.note) carrying cwd + task_id must NOT bind —
+# only receipts/task-links (job.claim/reclaim/attached/spawned/task_link) may.
+TID=4303; WT="$WORK/repo.f2"
+add_linked f2; seed_task $TID merged "$(iso_ago 400000)" "$JOBP-f2"
+mkdir -p "$INBOX/$JOBP-f2/events"
+cat >"$INBOX/$JOBP-f2/events/00001-job.note.json" <<EOF
+{"created_at":"2026-10-20T00:00:00Z","job_id":"$JOBP-f2","kind":"job.note","payload":{"cwd":"$WT","task_id":$TID,"text":"unrelated note"},"seq":1}
+EOF
+reap_try
+expect_ok "F2"
+expect_line "keep $WT reason=no-task-link" "F2 unrelated event cannot bind"
+
 # Case G: dirty tracked file.
 TID=4108; WT="$WORK/repo.g"
 add_linked g; mkjob "$JOBP-g" "$WT" $TID; seed_task $TID merged "$(iso_ago 400000)" "$JOBP-g"
