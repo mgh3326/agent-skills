@@ -95,7 +95,7 @@ fixture_exec_line() {
     cmd\ *)
       fixture_set_foreground cmd
       printf '%s\n' "$text" >"$fixture_foreground_file.cmd-screen"
-      cmd_args=($text)
+      read -r -a cmd_args <<<"$text"
       WRK_CMD_CWD="$(cat "$fixture_cwd_file" 2>/dev/null || printf '/tmp')" \
         "$(dirname "$0")/cmd" "${cmd_args[@]:1}" >>"$fixture_foreground_file.cmd-screen"
       ;;
