@@ -83,7 +83,9 @@ export XDG_DATA_HOME="$TMP/xdg"
 export XDG_CACHE_HOME="$TMP/xdg-cache"
 export XDG_CONFIG_HOME="$TMP/xdg-config"
 export XDG_STATE_HOME="$TMP/xdg-state"
-mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+export CODEX_HOME="$TMP/codex-home"
+export TMPDIR="$TMP/tmp"
+mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$CODEX_HOME" "$TMPDIR"
 # #951: claude-kind spawns seed folder trust into ${CLAUDE_CONFIG_DIR:-$HOME}/
 # .claude.json — the operator's real config must never be touched by a fixture
 # spawn, so suite HOME is a fixture and ambient CLAUDE_CONFIG_DIR is unset (it
@@ -301,6 +303,12 @@ grep -qx 'kimi-k27' <<<"$profiles_out"
 grep -qx 'kimi-k27-code' <<<"$profiles_out"
 grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-luna-max' <<<"$profiles_out"
+grep -qx 'codex-terra61' <<<"$profiles_out" || fail "wrk profiles lost codex-terra61"
+for terra61_profile in builder-terra61-medium builder-terra61-high \
+  builder-terra61-xhigh builder-terra61-max; do
+  grep -qx "$terra61_profile" <<<"$profiles_out" ||
+    fail "wrk profiles lost $terra61_profile"
+done
 for barred_profile in codex-terra codex-terra-max codex-med \
   builder-terra-high builder-terra-xhigh builder-terra-max; do
   if grep -qx "$barred_profile" <<<"$profiles_out"; then
@@ -375,19 +383,23 @@ TERRA_PROBE_SEQ=0
 terra_refusal_probe() {
   local executable="$1" profile="$2" role_path="$3" case_name="$4"
   local profile_flag="${5:--m}" expected_model="${6:-gpt-5.6-terra}" extra_opt="${7:-}"
-  local root="$TMP/noterra/$case_name" home data cache config state inbox
+  local root="$TMP/noterra/$case_name" home data cache config state inbox cwd
   local out err herdr_log scopefuel_log panewire_log db before_tree after_tree before_hk after_hk task_id job rc=0
   TERRA_PROBE_SEQ=$((TERRA_PROBE_SEQ + 1))
   mkdir -p "$root"; home="$root/home"; data="$root/data"; cache="$root/cache"
   config="$root/config"; state="$root/state"; inbox="$root/inbox/jobs"
-  mkdir -p "$home" "$data" "$cache" "$config" "$state" "$inbox"
+  cwd="$root/cwd"
+  mkdir -p "$home" "$data" "$cache" "$config" "$state" "$inbox" "$cwd"
+  git -C "$cwd" init -q
   out="$root/out"; err="$root/err"; herdr_log="$root/herdr.log"
   scopefuel_log="$root/scopefuel.log"; panewire_log="$root/panewire.log"
   : >"$herdr_log"; : >"$scopefuel_log"; : >"$panewire_log"
-  before_tree="$(git -C "$ROOT" worktree list --porcelain | sha256sum | awk '{print $1}')"
+  # An isolated temporary repo keeps other jobs' worktree churn out of this
+  # no-side-effect assertion while still catching a worktree created here.
+  before_tree="$(git -C "$cwd" worktree list --porcelain | sha256sum | awk '{print $1}')"
   before_hk="$(sha256sum "$HK_STATE" | awk '{print $1}')"
   task_id="$(mint_task)"; job="noterra-$case_name"
-  local args=(spawn -c "$ROOT" "$profile_flag" "$profile" -p "$PROMPT" -w w -l "nr-$TERRA_PROBE_SEQ" --t T1 --job "$job")
+  local args=(spawn -c "$cwd" "$profile_flag" "$profile" -p "$PROMPT" -w w -l "nr-$TERRA_PROBE_SEQ" --t T1 --job "$job")
   case "$role_path" in
     worker) args+=(--role worker --task "$task_id") ;;
     builder) args+=(--role builder --lane "nr-lane-$TERRA_PROBE_SEQ" --parent parent-lane --task "$task_id") ;;
@@ -429,7 +441,7 @@ PY
   grep -q "profile $profile refused: $expected_model is barred" "$err" || { echo "T-A1 missing named refusal: $(<"$err")" >&2; return 1; }
   grep -q 'operator 2026-10-12 noterra; use codex-sol or codex-luna' "$err" || { echo "T-A1 missing decision/replacements: $(<"$err")" >&2; return 1; }
   [[ -z "$(find "$inbox" -type f -print -quit)" ]] || { echo "T-A1 inbox changed for $profile/$role_path" >&2; return 1; }
-  after_tree="$(git -C "$ROOT" worktree list --porcelain | sha256sum | awk '{print $1}')"
+  after_tree="$(git -C "$cwd" worktree list --porcelain | sha256sum | awk '{print $1}')"
   [[ "$before_tree" == "$after_tree" ]] || { echo "T-A1 worktree set changed for $profile/$role_path" >&2; return 1; }
   after_hk="$(sha256sum "$HK_STATE" | awk '{print $1}')"
   [[ "$before_hk" == "$after_hk" ]] || { echo "T-A1 task store changed for $profile/$role_path" >&2; return 1; }
@@ -576,6 +588,252 @@ for allowed_codex in codex-sol codex-luna; do
   grep -q "model=$allowed_codex" <<<"$allowed_out" || fail "T-A3 missing $allowed_codex launch: $allowed_out"
 done
 echo "PASS T-A3: codex-sol and codex-luna remain spawnable"
+
+# hk 2109: every Terra61 spawn proves the model display and effort from the
+# visible footer before the fixture can receive a prompt. All state lives under
+# this suite's temporary root; the Codex binary is still the herdr fixture.
+TERRA61_CASE_SEQ=0
+TERRA61_LAST_ROOT="" TERRA61_LAST_RC=0
+terra61_run_case() {
+  local case_name="$1" profile="$2" role="$3" screen_kind="$4"
+  local screen_effort="$5" prompt_text="$6" launch_effort="${7:-}"
+  local marker="${8:-}" catalog_model="${9:-}" executable="${10:-$WRK}"
+  local root home data cache config state inbox codex_home tmpdir cwd prompt screen job task_id rc
+  local -a args env_overrides
+  TERRA61_CASE_SEQ=$((TERRA61_CASE_SEQ + 1))
+  root="$TMP/terra61/$TERRA61_CASE_SEQ-$case_name"
+  home="$root/home"; data="$root/data"; cache="$root/cache"; config="$root/config"
+  state="$root/state"; inbox="$root/inbox/jobs"; codex_home="$root/codex-home"
+  tmpdir="$root/tmp"; cwd="$root/cwd"; prompt="$root/prompt.md"; screen="$root/screen.txt"
+  mkdir -p "$home" "$data" "$cache" "$config" "$state" "$inbox" \
+    "$codex_home" "$tmpdir" "$cwd"
+  : >"$root/herdr.log" "$root/scopefuel.log" "$root/launch.log" "$root/refresh.log" \
+    "$root/refresh.pids"
+  printf '%s\n' "$prompt_text" >"$prompt"
+  case "$screen_kind" in
+    recorded) screen="$ROOT/tests/fixtures/codex-terra61-footer.txt" ;;
+    footer)
+      printf '› Ask Codex to do anything\n  GPT-6.1 Terra %s · /private/tmp/terra-probe · Context 0%%\n' \
+        "$screen_effort" >"$screen" ;;
+    wrong-model)
+      printf '› Ask Codex to do anything\n  GPT-6-Luna %s · /private/tmp/terra-probe · Context 0%%\n' \
+        "$screen_effort" >"$screen" ;;
+    body-only)
+      printf '› Ask Codex to do anything\n  %s\n' "$prompt_text" >"$screen" ;;
+    no-footer) printf '› Ask Codex to do anything\n' >"$screen" ;;
+    *) fail "unknown Terra61 screen fixture '$screen_kind'" ;;
+  esac
+  job="hk2109-terra61-$TERRA61_CASE_SEQ-$case_name"
+  task_id="$(mint_task)"
+  args=(spawn -c "$cwd" -m "$profile" -p "$prompt" -w w -l "t61-$TERRA61_CASE_SEQ" \
+    --t T2 --job "$job")
+  case "$role" in
+    builder)
+      args+=(--role builder --lane "t61-lane-$TERRA61_CASE_SEQ" --parent parent-lane --task "$task_id") ;;
+    counsel)
+      args+=(--role counsel --task "$task_id" --operator-request hk:doc/decision/2026-09-21/astra-allowed-purposes-approved) ;;
+    *) args+=(--role worker --task "$task_id") ;;
+  esac
+  [[ -z "$launch_effort" ]] || args+=(--effort "$launch_effort")
+  env_overrides=()
+  [[ -z "$marker" ]] || env_overrides+=("SCOPEFUEL_E6_ARM=$marker")
+  [[ -z "$catalog_model" ]] || env_overrides+=("WRK_LAUNCH_MODEL_OVERRIDE=$catalog_model")
+  TERRA61_LAST_ROOT="$root"
+  if env -u SCOPEFUEL_E6_ARM \
+    HOME="$home" XDG_DATA_HOME="$data" XDG_CACHE_HOME="$cache" \
+    XDG_CONFIG_HOME="$config" XDG_STATE_HOME="$state" CODEX_HOME="$codex_home" \
+    TMPDIR="$tmpdir" ARBITER_INBOX_ROOT="$inbox" WRK_TEST_MODE=1 \
+    HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
+    HANDOFFKEEP_BIN="$HANDOFFKEEP_BIN" HK_STATE="$HK_STATE" PANEWIRE_BIN="$PANEWIRE" \
+    WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_TERRA61_SCREEN_FILE="$screen" WRK_FIXTURE_LOG="$root/herdr.log" \
+    WRK_SCOPEFUEL_LOG="$root/scopefuel.log" WRK_LAUNCH_LOG="$root/launch.log" \
+    WRK_REFRESH_LOG="$root/refresh.log" WRK_REFRESH_PID_LOG="$root/refresh.pids" \
+    WRK_REFRESH_TIMEOUT_S=5 "${env_overrides[@]+"${env_overrides[@]}"}" "$executable" "${args[@]}" \
+      >"$root/out" 2>"$root/err"; then
+    TERRA61_LAST_RC=0
+  else
+    TERRA61_LAST_RC=$?
+  fi
+  return 0
+}
+
+terra61_expect_launch() {
+  local case_name="$1" profile="$2" effort="$3" marker="${4:-}"
+  local screen_kind="${5:-footer}" launch_effort="${6:-}" prompt_text="${7:-fixture prompt}"
+  local role=worker
+  [[ "$profile" != builder-terra61-* ]] || role=builder
+  terra61_run_case "$case_name" "$profile" "$role" "$screen_kind" "$effort" \
+    "$prompt_text" "$launch_effort" "$marker"
+  [[ "$TERRA61_LAST_RC" -eq 0 ]] ||
+    fail "$profile must launch at $effort (rc=$TERRA61_LAST_RC): $(<"$TERRA61_LAST_ROOT/err")"
+  grep -q '^OK pane=' "$TERRA61_LAST_ROOT/out" ||
+    fail "$profile did not print an OK receipt: $(<"$TERRA61_LAST_ROOT/out")"
+  grep -q -- "-m gpt-6.1-terra -c model_reasoning_effort=$effort" "$TERRA61_LAST_ROOT/herdr.log" ||
+    fail "$profile launcher argv lost model/effort $effort: $(<"$TERRA61_LAST_ROOT/herdr.log")"
+  grep -qF "policy launch codex-terra61 effort=$effort" "$TERRA61_LAST_ROOT/launch.log" ||
+    fail "$profile catalog lookup did not use codex-terra61@$effort"
+  grep -qF "gate -m codex-terra61 --effort $effort" "$TERRA61_LAST_ROOT/scopefuel.log" ||
+    fail "$profile gate did not judge codex-terra61@$effort"
+  python3 - "$TERRA61_LAST_ROOT" "$effort" <<'PY' || fail "$profile quota row did not record codex-terra61@$effort"
+import json, pathlib, sys
+root, effort = pathlib.Path(sys.argv[1]), sys.argv[2]
+events = [json.loads(p.read_text()) for p in (root / "inbox" / "jobs").glob("*/events/*.json")]
+record = next(e for e in events if e.get("kind") == "quota_pool.record")
+assert record["payload"]["launch_profile"] == f"codex-terra61@{effort}", record
+PY
+  python3 - "$TERRA61_LAST_ROOT/herdr.log" <<'PY' || fail "$profile footer proof did not precede brief injection"
+import pathlib, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+visible = next(i for i, line in enumerate(lines) if "agent read " in line and "--source visible" in line)
+prompt = next(i for i, line in enumerate(lines) if line.startswith("agent prompt "))
+assert visible < prompt, (visible, prompt)
+PY
+}
+
+terra61_expect_proof_refusal() {
+  local case_name="$1" screen_kind="$2" screen_effort="$3" prompt_text="$4"
+  terra61_run_case "$case_name" codex-terra61 worker "$screen_kind" "$screen_effort" \
+    "$prompt_text" "" codex-terra61@low
+  if [[ "$TERRA61_LAST_RC" -eq 0 ]]; then
+    echo "T-P1 $case_name unexpectedly passed model-line proof" >&2
+    return 1
+  fi
+  if ! grep -qF 'terra61 model not proven: expected GPT-6.1 Terra low' "$TERRA61_LAST_ROOT/err"; then
+    echo "T-P1 $case_name failed for a different reason: $(<"$TERRA61_LAST_ROOT/err")" >&2
+    return 1
+  fi
+  if grep -q '^OK pane=' "$TERRA61_LAST_ROOT/out"; then
+    echo "T-P1 $case_name printed an OK line after proof failure" >&2
+    return 1
+  fi
+  if ! grep -q '^pane close ' "$TERRA61_LAST_ROOT/herdr.log"; then
+    echo "T-P1 $case_name did not close its pane" >&2
+    return 1
+  fi
+  python3 - "$TERRA61_LAST_ROOT/data/arbiter/state.db" <<'PY' || fail "$case_name left a quota row after proof failure"
+import pathlib, sqlite3, sys
+db = pathlib.Path(sys.argv[1])
+if db.exists():
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM quota_pool_records").fetchone()[0] == 0
+    finally:
+        con.close()
+PY
+}
+
+terra61_expect_model_barred() {
+  local case_name="$1" profile="$2" role="$3" model_id="$4"
+  local screen_kind="${5:-recorded}" screen_effort="${6:-high}"
+  local marker="${7:-}" executable="${8:-$WRK}"
+  terra61_run_case "$case_name" "$profile" "$role" "$screen_kind" "$screen_effort" \
+    fixture "" "$marker" "$model_id" "$executable"
+  if [[ "$TERRA61_LAST_RC" -eq 0 ]]; then
+    echo "T-A2 $profile unexpectedly admitted barred model $model_id" >&2
+    return 1
+  fi
+  if ! grep -qF "profile $profile refused: $model_id is barred, operator 2026-10-12 noterra" \
+    "$TERRA61_LAST_ROOT/err"; then
+    echo "T-A2 $profile missing noterra refusal for $model_id: $(<"$TERRA61_LAST_ROOT/err")" >&2
+    return 1
+  fi
+  if grep -q '^OK pane=' "$TERRA61_LAST_ROOT/out" || grep -q '^agent start ' "$TERRA61_LAST_ROOT/herdr.log"; then
+    echo "T-A2 $profile printed OK or started a pane for barred model $model_id" >&2
+    return 1
+  fi
+}
+
+# The recorded Codex 0.164.0 high footer passes. The model's own menu set low
+# as the default, and every pinned builder rung uses the exact marker and gate.
+terra61_expect_launch real-footer codex-terra61 high codex-terra61@high recorded high
+terra61_expect_launch default-low codex-terra61 low codex-terra61@low
+terra61_expect_launch explicit-high codex-terra61 high codex-terra61@high footer high
+for rung in medium high xhigh max; do
+  terra61_expect_launch "builder-$rung" "builder-terra61-$rung" "$rung" \
+    "codex-terra61@$rung" footer
+done
+echo "PASS hk 2109: codex-terra61 default/override and four pinned builder rungs resolve catalog, argv and gate effort"
+
+# The exact allowed model id is the only Terra exception. Catalog injection,
+# PROFILE_MODEL_ARG and ARGS -m/--model remain guarded; old aliases stay barred.
+terra61_expect_model_barred catalog-row codex-terra61 worker gpt-5.6-terra ||
+  fail "catalog row returning gpt-5.6-terra must be barred"
+terra61_expect_model_barred profile-model-arg grok-hi worker gpt-5.6-terra ||
+  fail "PROFILE_MODEL_ARG returning gpt-5.6-terra must be barred"
+terra61_expect_model_barred args-model fable counsel gpt-5.6-terra ||
+  fail "ARGS -m/--model returning gpt-5.6-terra must be barred"
+terra_refusal_probe "$WRK" codex-terra worker terra61-old-alias -m gpt-5.6-terra ||
+  fail "old codex-terra alias must remain refused"
+echo "PASS hk 2109: gpt-5.6-terra stays barred through catalog, alias, PROFILE_MODEL_ARG and ARGS model channels"
+
+# A body/brief mention is not a footer. Both wrong model and wrong effort close
+# the pane, print no OK line, and release the quota record. Missing footer is
+# bounded by the existing foreground-ready timeout.
+terra61_expect_proof_refusal wrong-model wrong-model low 'fixture prompt'
+terra61_expect_proof_refusal wrong-effort recorded high 'fixture prompt' || fail "wrong effort must fail footer proof"
+terra61_expect_proof_refusal brief-only body-only low 'GPT-6.1 Terra low appears only in this brief' || fail "brief-only text must not pass footer proof"
+terra61_expect_proof_refusal no-footer no-footer low 'fixture prompt' || fail "missing footer must time out and refuse"
+echo "PASS hk 2109: model-line proof rejects wrong model, wrong effort, brief-only text and missing footer"
+
+# Adversarial mutants must go red for the exact invariant they violate.
+make_terra61_mutant() {
+  local kind="$1" output="$2"
+  python3 - "$WRK" "$output" "$kind" <<'PY'
+from pathlib import Path
+import sys
+src = Path(sys.argv[1]).read_text()
+kind = sys.argv[3]
+if kind == "allow-all-terra":
+    old, new = "gpt-6.1-terra) return 0 ;;", "*-terra*) return 0 ;;"
+elif kind == "skip-proof":
+    old = '      if [[ "$PROFILE_MODEL" != gpt-6.1-terra ]]; then\n        return 0\n      fi\n      terra_status="$(terra61_footer_status)"'
+    new = "      return 0"
+elif kind == "ignore-effort":
+    old, new = 'observed == f"{display} {effort}"', 'observed.startswith(display + " ")'
+else:
+    raise SystemExit(f"unknown mutant {kind}")
+if src.count(old) != 1:
+    raise SystemExit(f"{kind} target is not unique: {src.count(old)}")
+Path(sys.argv[2]).write_text(src.replace(old, new, 1))
+Path(sys.argv[2]).chmod(0o755)
+PY
+}
+T61_ALLOW_MUTANT="$TMP/terra61/allow-all-terra-wrk"
+make_terra61_mutant allow-all-terra "$T61_ALLOW_MUTANT"
+T61_ALLOW_LOG="$TMP/terra61/allow-all-terra-red.log"
+if terra61_expect_model_barred mutant-allow-all codex-terra61 worker gpt-5.6-terra \
+  footer low codex-terra61@low "$T61_ALLOW_MUTANT" \
+  >"$T61_ALLOW_LOG" 2>&1; then fail "allow-all-terra mutant survived"; fi
+expect_probe_red "$T61_ALLOW_LOG" "codex-terra61 unexpectedly admitted barred model gpt-5.6-terra" "allow-all-terra mutant"
+
+# Make the proof-refusal helper run a selected mutant executable.
+terra61_expect_proof_refusal_with() {
+  local executable="$1" case_name="$2" screen_kind="$3" screen_effort="$4"
+  terra61_run_case "$case_name" codex-terra61 worker "$screen_kind" "$screen_effort" \
+    'fixture prompt' "" codex-terra61@low "" "$executable"
+  if [[ "$TERRA61_LAST_RC" -eq 0 ]]; then
+    echo "T-P1 $case_name unexpectedly passed model-line proof" >&2
+    return 1
+  fi
+  if ! grep -qF 'terra61 model not proven: expected GPT-6.1 Terra low' "$TERRA61_LAST_ROOT/err"; then
+    echo "T-P1 $case_name mutant failed for a different reason: $(<"$TERRA61_LAST_ROOT/err")" >&2
+    return 1
+  fi
+}
+T61_SKIP_MUTANT="$TMP/terra61/skip-proof-wrk"
+make_terra61_mutant skip-proof "$T61_SKIP_MUTANT"
+T61_SKIP_LOG="$TMP/terra61/skip-proof-red.log"
+if terra61_expect_proof_refusal_with "$T61_SKIP_MUTANT" mutant-skip-proof wrong-model low \
+  >"$T61_SKIP_LOG" 2>&1; then fail "skip-proof mutant survived"; fi
+expect_probe_red "$T61_SKIP_LOG" "T-P1 mutant-skip-proof unexpectedly passed model-line proof" "skip-proof mutant"
+T61_EFFORT_MUTANT="$TMP/terra61/ignore-effort-wrk"
+make_terra61_mutant ignore-effort "$T61_EFFORT_MUTANT"
+T61_EFFORT_LOG="$TMP/terra61/ignore-effort-red.log"
+if terra61_expect_proof_refusal_with "$T61_EFFORT_MUTANT" mutant-ignore-effort recorded high \
+  >"$T61_EFFORT_LOG" 2>&1; then fail "ignore-effort mutant survived"; fi
+expect_probe_red "$T61_EFFORT_LOG" "T-P1 mutant-ignore-effort unexpectedly passed model-line proof" "ignore-effort mutant"
+echo "PASS hk 2109 mutants: broad Terra allowlist, skipped footer proof and effort-blind proof go RED"
 }
 
 if [[ "${WRK_TEST_ONLY_TERRA:-0}" -eq 1 ]]; then
@@ -11051,7 +11309,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -11060,7 +11318,7 @@ accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|bui
 # inside builder-grok); grok-hi presence covers it, and the literal accept-line
 # pin above guards the list itself. `builder-level` is prose, `captain-NN` is a
 # session name in SKILL.md — neither is a profile.
-builder_tokens() { grep -oE '(builder|captain)-[a-z0-9-]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vxE 'builder-level|captain-[0-9]+' | grep -v '^builder-terra-' | sort -u; }
+builder_tokens() { grep -oE '(builder|captain)-[a-z0-9-]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vxE 'builder-level|captain-[0-9]+' | grep -v '^builder-terra-' | grep -v '^builder-terra61-' | sort -u; }
 accept_set="$(builder_tokens <<<"$accept_line")"
 help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
 help_set="$(builder_tokens <<<"$help_block")"
