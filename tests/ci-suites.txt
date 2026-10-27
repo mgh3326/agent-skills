@@ -43,3 +43,4 @@ python|python3 -m unittest discover -s tests -p 'test_quota_stale_report.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_trust_paths.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_*mcp*.py' -v
 python|python3 -m unittest discover -s tests -p 'test_wrk_pi.py' -v
+python|python3 -m unittest discover -s tests -p 'test_wrk_cmd.py' -v

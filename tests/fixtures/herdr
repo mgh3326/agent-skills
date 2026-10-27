@@ -39,6 +39,15 @@ fixture_rcdone_file="${TMPDIR:-/tmp}/wrk-fixture-rcdone-${WRK_RUN_ID:-standalone
 fixture_env_file="${TMPDIR:-/tmp}/wrk-fixture-env-${WRK_RUN_ID:-standalone}"
 fixture_env() { cat "$fixture_env_file" 2>/dev/null || printf 'full\n'; }
 
+# hk 2140: cmd panes are typed via `pane run` (herdr has no cmd start kind).
+# The modelled cmd state lives in three files: the banner screen the stub
+# printed, the composer text `pane send-text` queued, the submitted transcript
+# `pane send-keys return` flushed, and the detected agent_status.
+fixture_cmd_transcript_file="${TMPDIR:-/tmp}/wrk-fixture-cmd-transcript-${WRK_RUN_ID:-standalone}"
+fixture_cmd_composer_file="${TMPDIR:-/tmp}/wrk-fixture-cmd-composer-${WRK_RUN_ID:-standalone}"
+fixture_cmd_state_file="${TMPDIR:-/tmp}/wrk-fixture-cmd-state-${WRK_RUN_ID:-standalone}"
+fixture_cmd_state() { cat "$fixture_cmd_state_file" 2>/dev/null || printf 'idle\n'; }
+
 # devin-slow-rc keeps sourcing until the ${WRK_FIXTURE_RC_READS:-6}-th
 # `pane read` marks it done (the probe verification polls drive the modelled
 # wall clock — see the read handler); a ctrl+c ends it early — truncated.
@@ -79,6 +88,18 @@ fixture_exec_line() {
     # (e.g. `laude`) runs and fails without foregrounding anything.
     pi\ *|claude\ *|codex\ *|grok\ *|kimi\ *|kiro\ *|opencode\ *|agy\ *)
       fixture_set_foreground "${text%% *}" ;;
+    # hk 2140: `pane run cmd ...` reaches the pane exactly like a manual run —
+    # the typed line echoes, the stub paints its banner under it, and the pane
+    # foreground becomes the cmd TUI (real argv0 command-code; the foreground
+    # check accepts either spelling).
+    cmd\ *)
+      fixture_set_foreground cmd
+      printf '%s\n' "$text" >"$fixture_foreground_file.cmd-screen"
+      read -r -a cmd_args <<<"$text"
+      WRK_CMD_CWD="$(cat "$fixture_cwd_file" 2>/dev/null || printf '/tmp')" \
+        WRK_CMD_TRANSCRIPT_FILE="$fixture_cmd_transcript_file" \
+        "$(dirname "$0")/cmd" "${cmd_args[@]:1}" >>"$fixture_foreground_file.cmd-screen"
+      ;;
   esac
 }
 
@@ -158,6 +179,10 @@ fixture_get_sequence_step() {
 
 fixture_is_recent_unwrapped_read() {
   [[ " $* " == *" --source recent-unwrapped "* ]]
+}
+
+fixture_is_visible_read() {
+  [[ " $* " == *" --source visible "* ]]
 }
 
 # WRK_FIXTURE_PINFO_SEQUENCE 는 `pane process-info` 응답을 호출 순서대로 적은
@@ -309,6 +334,43 @@ fi
 
 case "${1:-}" in
   agent)
+    # hk 2140: a pane whose foreground is cmd is DETECTED, never started —
+    # list/get/wait/rename/read answer for it, but `agent prompt`,
+    # `agent send-keys` and `agent explain` refuse it exactly like the real
+    # herdr does (agent_not_ready / no detected agent label).
+    if [[ "$(fixture_foreground)" == cmd ]]; then
+      case "${2:-}" in
+        list)
+          printf '%s\n' "{\"result\":{\"agents\":[{\"agent\":\"cmd\",\"agent_status\":\"$(fixture_cmd_state)\",\"name\":\"fixture\",\"pane_id\":\"w:p1\",\"tab_id\":\"w:t1\",\"workspace_id\":\"w\"}]}}"
+          exit 0 ;;
+        get)
+          printf '{"id":"cli:agent:get","result":{"agent":{"agent":"cmd","agent_status":"%s","name":"fixture","pane_id":"%s","tab_id":"%s","workspace_id":"w"},"type":"agent_info"}}\n' \
+            "$(fixture_cmd_state)" "${3:-w:p1}" "$(fixture_tab_of_pane "${3:-w:p1}")"
+          exit 0 ;;
+        wait)
+          printf '{"id":"cli:agent:wait","result":{"agent":{"agent":"cmd","agent_status":"%s","name":"fixture","pane_id":"%s","tab_id":"%s","workspace_id":"w"},"type":"agent_info"}}\n' \
+            "$(fixture_cmd_state)" "${3:-w:p1}" "$(fixture_tab_of_pane "${3:-w:p1}")"
+          exit 0 ;;
+        rename)
+          printf '%s\n' '{"result":{"agent_info":{"name":"renamed"}}}'
+          exit 0 ;;
+        prompt|send-keys)
+          printf '{"error":{"code":"agent_not_ready","message":"agent %s is not an active named agent"},"id":"cli:agent:%s"}\n' "${3:-}" "$2" >&2
+          exit 1 ;;
+        explain)
+          printf '{"error":{"code":"agent_explain_unavailable","message":"agent target %s does not have a detected agent label"},"id":"cli:agent:explain"}\n' "${3:-}" >&2
+          exit 1 ;;
+        read)
+          cat "${WRK_CMD_SCREEN_FILE:-$fixture_foreground_file.cmd-screen}" 2>/dev/null || true
+          if ! fixture_is_visible_read "$@"; then
+            [[ ! -f "$fixture_cmd_transcript_file" ]] || cat "$fixture_cmd_transcript_file"
+          fi
+          if ! fixture_is_recent_unwrapped_read "$@" && [[ -f "$fixture_cmd_composer_file" ]]; then
+            printf '❯ %s\n' "$(cat "$fixture_cmd_composer_file")"
+          fi
+          exit 0 ;;
+      esac
+    fi
     case "${2:-}" in
       list)
         case "$scenario" in
@@ -630,7 +692,7 @@ case "${1:-}" in
         fi
         # A fresh tab holds a fresh shell — clear any foreground and screen
         # state a same-PID predecessor run left behind.
-        rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file"
+        rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file" "$fixture_cmd_transcript_file" "$fixture_cmd_composer_file" "$fixture_cmd_state_file" "$fixture_foreground_file.cmd-screen"
         tab_args=("$@")
         for ((i=0; i+1<${#tab_args[@]}; i++)); do
           [[ "${tab_args[i]}" != --cwd ]] || printf '%s\n' "${tab_args[i+1]}" >"$fixture_cwd_file"
@@ -638,7 +700,7 @@ case "${1:-}" in
         printf '%s\n' '{"result":{"tab_id":"w:t1","root_pane":{"pane_id":"w:p1"}}}'
         ;;
       close)
-        rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file"
+        rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file" "$fixture_cmd_transcript_file" "$fixture_cmd_composer_file" "$fixture_cmd_state_file" "$fixture_foreground_file.cmd-screen"
         printf '%s\n' '{"result":{"closed":"'"${3:-}"'"}}'
         ;;
       list)
@@ -806,7 +868,7 @@ case "${1:-}" in
       exit 0
     fi
     if [[ "${2:-}" == close ]]; then
-      rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file"
+      rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file" "$fixture_cmd_transcript_file" "$fixture_cmd_composer_file" "$fixture_cmd_state_file" "$fixture_foreground_file.cmd-screen"
     fi
     if [[ "${2:-}" == read ]]; then
       if [[ "$scenario" == devin-read-fail ]]; then
@@ -883,7 +945,22 @@ case "${1:-}" in
       printf 'fixture pane %s\nACTUAL SCREEN LAST LINE\n' "${3:-unknown}"
       exit 0
     fi
+    if [[ "${2:-}" == send-text ]]; then
+      # hk 2140: `pane send-text <pane> <text>` fills the cmd composer; the
+      # text sits there, un-submitted, until `pane send-keys return`.
+      printf '%s' "${4:-}" >"$fixture_cmd_composer_file"
+      printf '%s\n' '{"result":{}}'
+      exit 0
+    fi
     if [[ "${2:-}" == send-keys ]]; then
+      # hk 2140: a `return` key flushes the cmd composer into the transcript
+      # — the submitted prompt renders as `❯ <text>` and the turn finishes
+      # (fixture state done). An empty composer submits nothing.
+      if [[ " $* " == *" return "* && -f "$fixture_cmd_composer_file" ]]; then
+        printf '❯ %s\n\n' "$(cat "$fixture_cmd_composer_file")" >>"$fixture_cmd_transcript_file"
+        printf 'done\n' >"$fixture_cmd_state_file"
+        rm -f "$fixture_cmd_composer_file"
+      fi
       # ctrl+c during a still-sourcing rc is SIGINT: the rest of the rc never
       # runs, so the environment it would have set last is truncated — but
       # every input line already queued then runs under that truncated env.

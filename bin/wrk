@@ -78,6 +78,7 @@ ALL_PROFILES=(
   devin-fusion-opus55 devin-fusion-sonnet55
   devin-fusion-sol61 devin-fusion-sol61-xhigh
   pi-haiku55 pi-sonnet55 pi-opus55
+  cmd-dsflash41
   devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
@@ -322,6 +323,11 @@ Options:
                      refused before the marker check.
                      pi-* seats have no MCP (--no-mcp) and must not be placed
                      on MCP-needing tasks. Worker/tester only; default effort high.
+                     cmd-dsflash41 is the Command Code CLI profile
+                     (deepseek-v4.1-flash, effort low|high|max, default high).
+                     cmd 1.88.0 has no no-MCP launch flag, so the seat relies on
+                     the cmd accounts carrying no persisted MCP servers.
+                     Worker/tester only; --role builder refuses it.
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
                      builder refuses them pending hk 1382. Fusion-Sol
@@ -1352,6 +1358,67 @@ sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
 ' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
 }
 
+# hk 2140: prove the cmd session's model and effort from the visible screen,
+# never the argv or the transcript. cmd 1.88.0 prints its selection in the
+# welcome banner — the mbp captures show exactly:
+#   # Command Code v1.88.0
+#   # models: deepseek-v4.1-flash-(latest) with high effort · taste-1
+#   # /private/tmp/cmdcap2140
+# A wrong model or a refused effort never reaches the TUI at all (the shell
+# prints the refusal instead), so the banner block is the only place the
+# running session states them. Every `# models:` line on the screen must match
+# (a stale contradicting line is a failure), the line must sit inside the
+# banner block — the version line above, the launch cwd below — and the whole
+# candidate block must not appear in the injected brief (a brief quoting the
+# model line is not the session's own statement). Unknown layouts, a missing
+# banner and truncated rows all fail closed.
+cmd_model_proven() {
+  local screen
+  screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || return 1
+  # shellcheck disable=SC2016
+  printf '%s' "$screen" | python3 -c '
+import os, re, sys
+expected_model, effort, cwd, prompt = sys.argv[1:]
+def clean(text):
+    return [line.rstrip() for line in
+            re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).splitlines()]
+lines = clean(sys.stdin.read())
+# Every models row must be the expected one, inside a banner block.
+want = ("# models: " + expected_model + " with " + effort + " effort")
+blocks = 0
+block_i = -1
+for i, line in enumerate(lines):
+    if not line.startswith("# models: "):
+        continue
+    # Full row, never a truncated one: the effort field is followed by the
+    # ` · <tag>` tail the captures all carry.
+    if not re.fullmatch(re.escape(want) + r" · \S.*", line):
+        sys.exit(1)
+    if i < 1 or i + 1 >= len(lines):
+        sys.exit(1)
+    if not re.fullmatch(r"# Command Code v\S+", lines[i - 1]):
+        sys.exit(1)
+    if lines[i + 1] != "# " + cwd:
+        sys.exit(1)
+    blocks += 1
+    block_i = i
+if blocks != 1:
+    sys.exit(1)
+# The candidate block must not be a copy of the injected brief — same
+# normalized-whitespace comparison pi_model_proven uses.
+try:
+    with open(prompt) as brief:
+        injected = "\n".join(clean(brief.read()))
+except OSError:
+    sys.exit(1)
+candidate = re.sub(r"\s+", " ", "\n".join(lines[block_i - 1:block_i + 2])).strip()
+quoted = re.sub(r"\s+", " ", injected).strip()
+if candidate in quoted:
+    sys.exit(1)
+sys.exit(0)
+' "$CMD_SCREEN_MODEL" "$CMD_EFFORT" "$SPAWN_EXPECT_CWD" "$PROMPT"
+}
+
 # hk 2109: the Terra 6.1 model id alone does not prove Codex selected the
 # intended model. Read only the visible screen and extract the bottom-most
 # Codex status/footer row (the row with the cwd and Context indicator). The
@@ -1378,6 +1445,44 @@ else:
 ' 'GPT-6.1 Terra' "$EFFECTIVE_EFFORT"
 }
 
+# hk 2140: cmd panes cannot be prompted through `agent prompt` or panewire —
+# herdr refuses a detected-but-not-started agent with agent_not_ready (mbp
+# capture). The delivery that works is the one a human uses: `pane send-text`
+# fills the composer (a multi-line brief lands whole, un-submitted) and
+# `pane send-keys return` submits it. After the submit, the same marker/landing
+# corroboration every kind uses judges the result.
+spawn_cmd_prompt() {
+  # $1 is unused; the parameter keeps the call shape parallel to
+  # spawn_panewire_prompt's attempt argument.
+  SPAWN_SUBMIT=unconfirmed
+  SPAWN_PANEWIRE_RC=""
+  SPAWN_PANEWIRE_ERR=""
+  local send_rc keys_rc
+  set +e
+  "$HERDR" pane send-text "$PANE" "$PROMPT_PAYLOAD" >/dev/null 2>&1
+  send_rc=$?
+  set -e
+  if [[ "$send_rc" -ne 0 ]]; then
+    SPAWN_SUBMIT=unsent
+    SPAWN_PANEWIRE_RC="send-text-$send_rc"
+    SPAWN_PANEWIRE_ERR="cmd pane send-text exited $send_rc"
+    return 0
+  fi
+  set +e
+  "$HERDR" pane send-keys "$PANE" return >/dev/null 2>&1
+  keys_rc=$?
+  set -e
+  # A failed submit after a delivered paste is unconfirmed: the text may be
+  # sitting in the composer, so it is never re-sent blindly — only the
+  # confirmed non-landing retry below may inject a second copy.
+  [[ "$keys_rc" -eq 0 ]] || {
+    SPAWN_PANEWIRE_RC="send-keys-$keys_rc"
+    SPAWN_PANEWIRE_ERR="cmd pane send-keys exited $keys_rc"
+    return 0
+  }
+  SPAWN_SUBMIT=accepted
+}
+
 # spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not
 # landed, LANDING_NO_DETAIL.
 spawn_deliver_brief() {
@@ -1389,6 +1494,43 @@ spawn_deliver_brief() {
   PROMPT_PAYLOAD="$(<"$PROMPT")"
   PROMPT_MARKER="$(prompt_marker "$PROMPT")"
   SPAWN_EXPECT_CWD="$(spawn_expect_cwd "$CWD" "$PANE")"
+
+  if [[ "$PROFILE_KIND" == cmd ]]; then
+    SPAWN_VIA=herdr-pane
+    spawn_cmd_prompt 1
+    local first="submit=$SPAWN_SUBMIT"
+    [[ -z "$SPAWN_PANEWIRE_ERR" ]] || first="$first err=\"$SPAWN_PANEWIRE_ERR\""
+    case "$SPAWN_SUBMIT" in
+      unsent)
+        LANDING_NO_DETAIL="phase=initial $first action=landed-no retry=skipped reason=send-text-refused"
+        return 0 ;;
+    esac
+    if landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
+      LANDING=yes
+      return 0
+    fi
+    detail="$(landing_check_detail)"
+    # One re-injection only when the window proved the first copy never
+    # landed — the same rule the panewire lane applies to an accepted submit.
+    if [[ "$LANDING_CHECK_CONFIRMED" -eq 1 && "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]]; then
+      warn "landing window expired; pane=$PANE phase=initial $first $detail action=reinject-once"
+      spawn_cmd_prompt 2
+      local second="submit=$SPAWN_SUBMIT"
+      [[ -z "$SPAWN_PANEWIRE_ERR" ]] || second="$second err=\"$SPAWN_PANEWIRE_ERR\""
+      if [[ "$SPAWN_SUBMIT" != unsent ]] &&
+         landing_check "$PANE" "$PROMPT_MARKER" "$PROFILE_KIND" "$SPAWN_SUBMIT"; then
+        LANDING=retry
+        return 0
+      fi
+      detail="$(landing_check_detail)"
+      LANDING_NO_DETAIL="phase=retry $second $detail action=landed-no"
+      return 0
+    fi
+    retry_skip_reason='non-landing-not-confirmed'
+    [[ "$LANDING_CHECK_AMBIGUOUS" -eq 0 ]] || retry_skip_reason='ambiguous-observation'
+    LANDING_NO_DETAIL="phase=initial $first $detail action=landed-no retry=skipped reason=$retry_skip_reason"
+    return 0
+  fi
 
   spawn_panewire_prompt 1
   spawn_opencode_submit
@@ -2316,7 +2458,9 @@ quota_gate() {
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
   # hk 2079: E6_WORKER_TESTER_ONLY_PROFILES = PI_CREDIT_MODELS (pi-haiku55/pi-sonnet55/pi-opus55), all PROFILE_KIND=pi; devin-fusion-* are outside the set.
-  if [[ "$PROFILE_KIND" == pi || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
+  # hk 2140: cmd-dsflash41 joins the same worker/tester-only set — the gate
+  # hears the seat's role so a non-worker/tester role can be role-denied.
+  if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
     gate_args+=(--role "$ROLE")
   fi
   local out rc
@@ -2740,6 +2884,7 @@ agent_foreground_exes() {
     kiro)     echo "kiro-cli kiro" ;;
     opencode) echo "open-code opencode" ;;
     pi)       echo "pi" ;;
+    cmd)      echo "command-code cmd" ;;
     agy)      echo "antigravity agy" ;;
     *)        echo "$1" ;;
   esac
@@ -2987,7 +3132,7 @@ devin_wait_shell_ready() {
   # `agent start`) types it: `pane run` for devin, `agent start` for every
   # other kind (#1016).
   local start_action=pane\ run
-  [[ "$PROFILE_KIND" == devin ]] || start_action=agent\ start
+  [[ "$PROFILE_KIND" == devin || "$PROFILE_KIND" == cmd ]] || start_action=agent\ start
   max_attempts=$(( START_TIMEOUT / SHELL_READY_POLL_MS ))
   while :; do
     attempts=$(( attempts + 1 ))
@@ -3250,6 +3395,66 @@ devin_start_in_pane() {
     devin_spawn_diagnostics "agent rename exited $rename_rc" 1
     spawn_pane_cleanup
     return "$rename_rc"
+  fi
+}
+
+# hk 2140: Command Code CLI panes. herdr 0.9.1 has no `cmd` start kind, so the
+# pane is launched exactly like a manual run: `pane run` types the argv, the
+# detector picks the pane up as agent=cmd (measured on mbp: agent get reports
+# agent cmd and tracks idle/working/done), the label is registered with
+# `agent rename`, and the bounded idle wait confirms the TUI came up. There is
+# no identity rule for cmd the way devin has welcome_prompt_footer — the
+# model/effort proof is the cmd_model_proven screen check after the brief.
+cmd_start_in_pane() {
+  local run_rc wait_rc rename_rc
+  local started_at remaining_ms
+
+  started_at="$(date +%s)"
+  if ! devin_wait_shell_ready "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
+  set +e
+  "$HERDR" pane run "$PANE" cmd "${ARGS[@]}" >/dev/null
+  run_rc=$?
+  set -e
+  if [[ "$run_rc" -ne 0 ]]; then
+    shell_ready_diagnostics "cmd pane run exited $run_rc"
+    spawn_pane_cleanup
+    return "$run_rc"
+  fi
+
+  if ! devin_wait_detected "$started_at"; then
+    spawn_pane_cleanup
+    return 1
+  fi
+
+  # The label first: `agent wait` accepts a detected pane, but rename is what
+  # registers this spawn's name under it (measured on mbp, hk 2140).
+  set +e
+  "$HERDR" agent rename "$PANE" "$LABEL" >/dev/null
+  rename_rc=$?
+  set -e
+  if [[ "$rename_rc" -ne 0 ]]; then
+    shell_ready_diagnostics "cmd agent rename exited $rename_rc"
+    spawn_pane_cleanup
+    return "$rename_rc"
+  fi
+
+  remaining_ms=$(( START_TIMEOUT - ($(date +%s) - started_at) * 1000 ))
+  if (( remaining_ms <= 0 )); then
+    shell_ready_diagnostics "cmd agent detected after the ${START_TIMEOUT}ms window"
+    spawn_pane_cleanup
+    return 1
+  fi
+  set +e
+  "$HERDR" agent wait "$PANE" --until idle --timeout "$remaining_ms" >/dev/null
+  wait_rc=$?
+  set -e
+  if [[ "$wait_rc" -ne 0 ]]; then
+    shell_ready_diagnostics "cmd idle wait exited $wait_rc"
+    spawn_pane_cleanup
+    return "$wait_rc"
   fi
 }
 
@@ -4064,6 +4269,8 @@ resolve_profile() {
   CATALOG_REFUSED=0
   CATALOG_REFUSE_REASON=""
   GATE_EFFORT_PIN=""
+  CMD_EFFORT=""
+  CMD_SCREEN_MODEL=""
 
   case "$MODEL" in
     # ROB-1191 ⑥: opus/sonnet only — CLI --effort argv (never mutate settings.json).
@@ -4282,6 +4489,13 @@ resolve_profile() {
       PROFILE_ENV=(--env "KIMI_CODE_HOME=$KIMI_CODE_LOW_HOME") ;;
 
     # hk 2080: literal provider/model, like opencode; every seat disables MCP.
+    # hk 2140: Command Code CLI (cmd 1.88.0). PROFILE_MODEL is the literal
+    # -m argument; CMD_SCREEN_MODEL is how the welcome banner displays the
+    # model the session actually selected — the proof compares the screen,
+    # never the argv. herdr has no `cmd` start kind (0.9.1): the pane is
+    # launched with `pane run` and detected, never agent-started.
+    cmd-dsflash41) PROFILE_KIND=cmd; PROFILE_MODEL=deepseek/deepseek-v4.1-flash; CMD_SCREEN_MODEL='deepseek-v4.1-flash-(latest)'; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
+
     pi-haiku55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-haiku-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     pi-sonnet55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-sonnet-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
     pi-opus55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-opus-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
@@ -4373,6 +4587,7 @@ resolve_profile() {
     # pool mapping, the gate answer names the pool.
     devin-fusion-opus55|devin-fusion-sonnet55) GATE_PROFILE="$MODEL" ;;
     pi-haiku55|pi-sonnet55|pi-opus55) GATE_PROFILE="$MODEL" ;;
+    cmd-dsflash41) GATE_PROFILE="$MODEL" ;;
     # hk 1729: Fusion-Sol profiles also gate at their exact catalog rows;
     # scopefuel supplies the codex pool recorded by arbiter.
     devin-fusion-sol61|devin-fusion-sol61-xhigh) GATE_PROFILE="$MODEL" ;;
@@ -4473,6 +4688,19 @@ resolve_profile() {
     GATE_EFFORT_PIN="$PI_THINKING"
   fi
 
+  if [[ "$PROFILE_KIND" == cmd ]]; then
+    # cmd 1.88.0 effort table for deepseek-v4.1-flash, measured on mbp
+    # (hk 2140 capture): `Unknown effort "ultra". Supported: off, low, high,
+    # max.` — wrk low->low, high->high, max->max; medium/xhigh/ultra are
+    # refused here because the model does not accept them, and off is not a
+    # wrk effort.
+    case "$EFFECTIVE_EFFORT" in
+      low|high|max) CMD_EFFORT="$EFFECTIVE_EFFORT" ;;
+      *) die "$MODEL: deepseek-v4.1-flash accepts cmd effort low|high|max only, not '$EFFECTIVE_EFFORT'" ;;
+    esac
+    GATE_EFFORT_PIN="$CMD_EFFORT"
+  fi
+
   # hk 1863 (operator decision on hk 1864, recorded on hk 1863): the
   # 2026-09-26 no-max builder-seat refusal (decision 4088 B) is removed for
   # every model — max is a legal builder rung, so builder-sonnet-max,
@@ -4545,6 +4773,11 @@ resolve_profile() {
 
   case "$PROFILE_KIND" in
     pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING") ;;
+    # hk 2140: cmd 1.88.0 has no no-MCP launch flag and `cmd mcp` only edits
+    # persisted config (forbidden to touch) — director-1 ruling: launch with
+    # no MCP flag; the no-MCP property is the desk-confirmed absence of any
+    # persisted MCP servers on the cmd accounts.
+    cmd) ARGS=(-m "$PROFILE_MODEL" --effort "$CMD_EFFORT" --yolo --skip-onboarding --no-session) ;;
     codex) ARGS=(--yolo -m "$PROFILE_MODEL" -c "model_reasoning_effort=$EFFECTIVE_EFFORT") ;;
     kiro)
       ARGS=(chat --v3 --trust-all-tools --require-mcp-startup)
@@ -10226,7 +10459,10 @@ spawn_router_cmd() {
   # round may still place on that target's own remotes.
   # The explicit local leg (including SSH delegation) must name the pi
   # profile/host/key even when the TOML itself is malformed.
-  if [[ "$requested" == local ]]; then pi_host_precheck "$router_profile"; fi
+  if [[ "$requested" == local ]]; then
+    pi_host_precheck "$router_profile"
+    cmd_host_precheck "$router_profile"
+  fi
   local_spawn_resolve || return
   if [[ "$LOCAL_SPAWN_ALLOWED" -eq 0 && "$requested" == local ]]; then
     echo "wrk: local spawns are disabled on this host ([local] spawn = false); refusing --host local" >&2
@@ -10620,11 +10856,15 @@ spawn_router_cmd() {
 #     its own line: '[local] # note', '[ local ]', '["local"]', '[[local]]',
 #     a truncated '[local', or '[local]' with trailing text;
 #   - a second [local] table header;
-#   - inside [local], a second spawn key whatever its value, or a line
-#     starting a would-be spawn key that is not 'spawn = <value>' (bare
-#     'spawn', 'spawn: false', 'spawn == false', a quoted "spawn" key);
-#   - a spawn value other than bare true/false after stripping a trailing
-#     '#' comment and whitespace;
+#   - inside [local], duplicate capability keys (pi_anthropic or
+#     cmd_dsflash41) whatever their value, or any line starting a would-be
+#     spelling that is not a clean assignment; each accepts only bare
+#     true|false booleans;
+#   - a second spawn key whatever its value, or a line starting a would-be
+#     spawn key that is not 'spawn = <value>' (bare 'spawn', 'spawn: false',
+#     'spawn == false', a quoted "spawn" key);
+#   - a capability or spawn value other than bare true/false after stripping
+#     a trailing '#' comment and whitespace;
 #   - any content before the first table header — the root table must be
 #     empty, so 'local.spawn = false', '"local".spawn = false' or
 #     'local = { spawn = false }' there are root keys, not the flag;
@@ -10666,6 +10906,28 @@ pi_host_precheck() {
   fi
 }
 
+# hk 2140 desk gate: Command Code accounts with no configured MCP servers are
+# known only on mbp, desktop and m1b. Require an explicit local capability flag
+# and an execution-host identity in that desk-approved set; caller placement
+# options never grant this capability.
+cmd_host_precheck() {
+  local profile="${1:-${MODEL:-}}" host
+  [[ "$profile" == cmd-dsflash41 ]] || return 0
+  host="$(spillover_value hub machine_id 2>/dev/null || true)"
+  [[ -n "$host" ]] || host="$(hostname)"
+  host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
+  case "$host" in
+    mbp|desktop|m1b) ;;
+    *) die "$profile refused on host $host: approved hosts are mbp, desktop, m1b (desk 2026-10-27; m1 has MCP servers)" ;;
+  esac
+  if ! local_spawn_scan; then
+    die "$profile refused on host $host: $LOCAL_SPAWN_ERROR"
+  fi
+  if [[ "$LOCAL_CMD_DSFLASH41" -ne 1 ]]; then
+    die "$profile refused on host $host: hosts.toml [local] cmd_dsflash41 must be literal true"
+  fi
+}
+
 local_spawn_table_name() {
   # Canonical name a bracketed line would give its table: trim, drop one
   # bracket layer ('[[x]]' arrives as inner '[x'), then one quoting layer
@@ -10686,13 +10948,14 @@ local_spawn_table_name() {
 local_spawn_scan() {
   LOCAL_SPAWN_ALLOWED=1
   LOCAL_PI_ANTHROPIC=0
+  LOCAL_CMD_DSFLASH41=0
   LOCAL_HEAVY_LOAD_WAIT=1
   LOCAL_HEAVY_LOAD_WAIT_SRC=default
   LOCAL_SHELL_READY_TIMEOUT_MS=0
   LOCAL_SHELL_READY_TIMEOUT_SRC=default
   LOCAL_SPAWN_ERROR=""
   local config line="" current="" inner rest name value
-  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0
+  local n=0 local_seen=0 spawn_seen=0 heavy_load_wait_seen=0 shell_ready_timeout_seen=0 pi_seen=0 cmd_seen=0
   config="$(spillover_config)"
   if [[ ! -e "$config" && ! -L "$config" ]]; then
     # The stat failed: a real ENOENT means no flag, but an unsearchable
@@ -10765,6 +11028,29 @@ local_spawn_scan() {
     # grammar as spawn/heavy_load_wait. Keep this in bash: execution hosts
     # may have Python 3.9 without tomllib (director-1, 2026-10-26).
     case "$line" in
+      cmd_dsflash41[A-Za-z0-9_-]*) ;; # a different bare key
+      cmd_dsflash41* | '"cmd_dsflash41"'* | "'cmd_dsflash41'"*)
+        if [[ "$line" =~ ^cmd_dsflash41[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
+          value="${BASH_REMATCH[1]}"
+        else
+          LOCAL_SPAWN_ERROR="$config line $n: malformed cmd_dsflash41 assignment in [local] (expected 'cmd_dsflash41 = true|false')"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        value="${value%%#*}"
+        value="$(spillover_trim "$value")"
+        cmd_seen=$((cmd_seen + 1))
+        if [[ "$cmd_seen" -gt 1 ]]; then
+          LOCAL_SPAWN_ERROR="$config line $n: duplicate cmd_dsflash41 key in [local]"
+          return "$WRK_EXIT_CONFIG_REFUSED"
+        fi
+        case "$value" in
+          true) LOCAL_CMD_DSFLASH41=1 ;;
+          false) ;;
+          *) LOCAL_SPAWN_ERROR="$config line $n: [local] cmd_dsflash41 accepts only the bare TOML booleans true or false"
+             return "$WRK_EXIT_CONFIG_REFUSED"
+             ;;
+        esac
+        continue ;;
       pi_anthropic[A-Za-z0-9_-]*) ;; # a different bare key
       pi_anthropic* | '"pi_anthropic"'* | "'pi_anthropic'"*)
         if [[ "$line" =~ ^pi_anthropic[[:space:]]*=[[:space:]]*(.*)$ ]] && [[ "${BASH_REMATCH[1]}" != =* ]]; then
@@ -12102,6 +12388,7 @@ spawn_cmd() {
   # future aliases too.
   refuse_known_terra_spelling
   pi_host_precheck
+  cmd_host_precheck
   # #1155: several router paths reach spawn_cmd directly (an unclassified
   # spawn, an unreadable arbiter, a hosts.toml-less auto). The flag gate
   # repeats here so no local spawn path runs on a host whose own [local]
@@ -12162,6 +12449,8 @@ spawn_cmd() {
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
       pi-haiku55|pi-sonnet55|pi-opus55)
         die "--role builder rejects '$MODEL': pi seats are worker/tester-only until reps exist (hk 2080)" ;;
+      cmd-dsflash41)
+        die "--role builder rejects '$MODEL': cmd seats are worker/tester-only until reps exist (hk 2140)" ;;
       devin-fusion-sol61|devin-fusion-sol61-xhigh)
         die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
@@ -12428,6 +12717,8 @@ print(value if isinstance(value, str) else "")
 
   if [[ "$PROFILE_KIND" == devin ]]; then
     devin_start_in_pane
+  elif [[ "$PROFILE_KIND" == cmd ]]; then
+    cmd_start_in_pane
   else
     agent_start_in_pane
   fi
@@ -12458,6 +12749,11 @@ print(value if isinstance(value, str) else "")
   spawn_deliver_brief
   if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then
     echo "wrk: $MODEL pi model not proven: expected footer '${PROFILE_MODEL#*/} • $PI_THINKING' (provider part optional)" >&2
+    spawn_pane_cleanup
+    return 1
+  fi
+  if [[ "$PROFILE_KIND" == cmd ]] && ! cmd_model_proven; then
+    echo "wrk: $MODEL cmd model not proven: expected $CMD_SCREEN_MODEL with $CMD_EFFORT effort" >&2
     spawn_pane_cleanup
     return 1
   fi
