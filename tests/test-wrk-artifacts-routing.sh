@@ -49,7 +49,7 @@ PY
 
 "$WRK" artifacts mark-final route-job final.apk --by fixture >/dev/null || fail "mark-final route failed"
 [[ -f "$ARBITER_INBOX_ROOT/route-job/final-build.json" ]] || fail "mark-final did not write marker"
-rg -q '"kind":"job.final_build_marked"' "$ARBITER_INBOX_ROOT/route-job/events"/*.json || fail "mark-final did not write event"
+grep -q '"kind":"job.final_build_marked"' "$ARBITER_INBOX_ROOT/route-job/events"/*.json || fail "mark-final did not write event"
 
 cat >"$WRK_HOSTS_CONFIG" <<EOF
 [artifacts]
@@ -70,6 +70,6 @@ EOF
 mkdir -p "$TMP/source" "$TMP/drive" "$TMP/drivefs-logs"
 "$WRK" artifacts move "$TMP/source" --dest "$TMP/drive/fixture/dataset" --help \
   >"$TMP/move-help" || fail "move route failed"
-rg -q '^Usage: wrk artifacts move ' "$TMP/move-help" || fail "move subcommand was not reached"
+grep -q '^Usage: wrk artifacts move ' "$TMP/move-help" || fail "move subcommand was not reached"
 
 echo "PASS test-wrk-artifacts-routing"
