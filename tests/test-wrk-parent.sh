@@ -21,7 +21,9 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/wp2042.XXXXXX")"
 if [[ -n "${WRK_UNDER_TEST:-}" ]]; then
   mkdir -p "$TMP/under-test"
   cp "$WRK" "$TMP/under-test/wrk"
+  cp "$ARBITER" "$TMP/under-test/arbiter"
   WRK="$TMP/under-test/wrk"
+  ARBITER="$TMP/under-test/arbiter"
 fi
 # shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
@@ -65,12 +67,32 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 
 # Per-case sandbox roots so claim events and the fixture db never bleed
 # between cases. reset_case NAME rotates them.
-INBOX="" HK_DB="" HK_LOG="" HERDR_LOG=""
+INBOX="" HK_DB="" HK_LOG="" HERDR_LOG="" CASE_XDG=""
 reset_case() {
   INBOX="$TMP/inbox-$1"; HK_DB="$TMP/hk-$1.json"; HK_LOG="$TMP/hk-$1.log"
-  HERDR_LOG="$TMP/herdr-$1.log"
-  mkdir -p "$INBOX"
+  HERDR_LOG="$TMP/herdr-$1.log"; CASE_XDG="$TMP/xdg-$1"
+  mkdir -p "$INBOX" "$CASE_XDG"
   HK_STATE="$HK_DB" "$HK" tasks add --id 1 --title "case task" --lane fixture >/dev/null
+}
+
+# mkparent job task_id owner [reclaim_owner] — mint real arbiter DB rows
+# (claim, plus reclaim when reclaim_owner is given) into the case DB so the
+# trust-path claim reads see the same row the events stream carries.
+mkparent() {
+  local job="$1" task_id="$2" owner="$3" reclaim="${4:-}"
+  ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$CASE_XDG" "$ARBITER" claim \
+    --job "$job" --lane "$owner" --t T1 --role builder --parent-lane director-1 \
+    --agent-label lbl --task-id "$task_id" >/dev/null || fail "mkparent $job claim failed"
+  if [[ -n "$reclaim" ]]; then
+    local res="$TMP/reclaim-res-$job"
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$CASE_XDG" "$ARBITER" lease \
+      --job "$job" --resource "$res" --kind path >/dev/null || fail "mkparent $job lease failed"
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$CASE_XDG" "$ARBITER" release \
+      --job "$job" --resource "$res" --kind path --force >/dev/null || fail "mkparent $job release failed"
+    ARBITER_INBOX_ROOT="$INBOX" XDG_DATA_HOME="$CASE_XDG" "$ARBITER" claim --reclaim-released \
+      --job "$job" --lane "$reclaim" --t T1 --role builder --parent-lane director-1 \
+      --agent-label lbl --task-id "$task_id" >/dev/null || fail "mkparent $job reclaim failed"
+  fi
 }
 
 hk_add() { HK_STATE="$HK_DB" "$HK" tasks add "$@"; }
@@ -104,7 +126,7 @@ spawn_try() {
   # itself a spawned job and would otherwise inherit ARBITER_JOB/HK_TASK_ID.
   env -u ARBITER_JOB -u HK_TASK_ID \
     HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
-    XDG_DATA_HOME="$TMP/xdg-$RANDOM" ARBITER_INBOX_ROOT="$INBOX" \
+    XDG_DATA_HOME="${CASE_XDG:?reset_case did not run}" ARBITER_INBOX_ROOT="$INBOX" \
     HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" HK_MODE="${HK_MODE:-new}" \
     HK_LOG="$HK_LOG" PANEWIRE_BIN="$PANEWIRE" \
     WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 \
@@ -143,11 +165,7 @@ PY
 }
 # hk 2042: a tester completion must route to the newest parent owner.
 reset_case parent-owner
-mkdir -p "$INBOX/parent/events"
-printf '%s\n' '{"kind":"job.claim","payload":{"task_id":1,"owner_lane":"builder-old"}}' \
-  >"$INBOX/parent/events/00001-job.claim.json"
-printf '%s\n' '{"kind":"job.reclaim","payload":{"task_id":1,"owner_lane":"builder-current"}}' \
-  >"$INBOX/parent/events/00002-job.reclaim.json"
+mkparent parent 1 builder-old builder-current
 spawn_try -- --role tester --parent-job parent --job child --report "$INBOX/parent/verdict.md"
 expect_rc 0 "parent-job tester with parent report"
 python3 - "$INBOX/child/completion-sentinel.pid" "$INBOX/parent/verdict.md" <<'LOCAL_PATH'
@@ -245,7 +263,7 @@ echo "PASS hk2042 report refusals and relative report re-root"
 
 spawn_try -e HK_TASK_ID=1 -- --parent-job absent-parent --job no-parent --report "$INBOX/absent-parent/report.md"
 expect_rc 2 "missing parent claim cannot fall back to HK_TASK_ID for ownership"
-expect_grep 'no readable newest claim/reclaim' "$TMP/stderr.txt" "missing claim refusal"
+expect_grep 'has no arbiter claim row' "$TMP/stderr.txt" "missing claim refusal"
 no_job_dir no-parent "missing parent"; no_job_dir absent-parent "missing parent read cannot write"
 no_pane "missing parent"; no_claim "missing parent"
 echo "PASS hk2042 missing parent refuses without writes"
@@ -261,8 +279,8 @@ import sys
 source = Path(sys.argv[1]).read_text()
 kind = sys.argv[3]
 if kind == "owner":
-    old = '        owner = inherited_owner\n'
-    replacement = '        owner = "default"\n'
+    old = '    if not owner:\n        owner = db_owner\n'
+    replacement = '    if not owner:\n        owner = "default"\n'
 elif kind == "required":
     old = '    worker|tester|reviewer) [[ -n "$report" ]] || die "--parent-job $parent requires --report for --role $role" ;; # hk2042-report-required\n'
     replacement = '    worker|tester|reviewer) : ;; # mutant accepts missing report\n'
