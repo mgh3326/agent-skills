@@ -151,9 +151,9 @@
   "effective_at": "2026-10-18T00:00:00Z",
   "expires_at": "2026-10-30T00:00:00Z",
   "local_sources": {
-    ".github/workflows/ci.yml": "dd2e2a9baa4e0417605c09c4dbd199da95c3accf92d50b825e2dcc67a436f882",
+    ".github/workflows/ci.yml": "7c14952d8d04b5ebad6c7f159f0b2d01c94baf9418b8de5a61a0fe2b23fa2568",
     "bin/arbiter": "fe7f2ad034b3a1992d897276db3fab1af47ade8b5c92d725653d13ca9fba64cc",
-    "bin/wrk": "646ce96547a8da51ccf779842384cbedec7e0212bf3adc81d1db8e20c1b74acc",
+    "bin/wrk": "d6f2309ffa1fc0f697e3edc43d8d5b4e8a12f295070d41bb00ca7a5389a1ff0a",
     "bin/wrk-o3.py": "f6d25856460098f60a19f4ad200c5a8372aafdbd821c11d0cb2835fc194ced6d",
     "bin/wrk-o3-contract.json": "99e78d7e326f598174ee3f3cf47827ce9a32454105b599f0af5c9b65879bc9f4",
     "bin/wrk_free_limit_observer.py": "37913c83104953bd8391d149d43fa8aead9e2dc3d47a57ac4eea0ac2766bdc26",
@@ -2268,6 +2268,27 @@
       "role_status": "unknown",
       "roles": [],
       "surfaces": []
+    },
+    "cmd-dsflash41": {
+      "default_effort": "high",
+      "family": "deepseek",
+      "grades": {
+        "high": null,
+        "low": null,
+        "max": null
+      },
+      "launcher": "cmd",
+      "launcher_model_token": "PROFILE_MODEL=deepseek/deepseek-v4.1-flash",
+      "model": "deepseek-v4.1-flash",
+      "role_status": "unknown",
+      "roles": [
+        "worker",
+        "tester"
+      ],
+      "surfaces": [
+        "T1",
+        "T2"
+      ]
     }
   },
   "required_ci_jobs_by_repo": {
@@ -2275,7 +2296,7 @@
       "ci-ok"
     ]
   },
-  "revision": "2026-10-20.1",
+  "revision": "2026-10-27.5",
   "runtime": {
     "mgh3326/auto_trader-operator": [
       {
@@ -2308,7 +2329,7 @@
   "sources": {
     ".github/workflows/ci.yml": {
       "id": "ci-ok",
-      "scope": "single merge-gating CI check; macos-full is scheduled/manual only"
+      "scope": "single required merge-gating check; ci-ok consolidates Ubuntu shards and macos-smoke"
     },
     "advice/2026-09-25/director-throughput-astra": {
       "id": 3243,

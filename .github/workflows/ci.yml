@@ -81,6 +81,7 @@ jobs:
             tests/fixtures/fleet-rev/go \
             tests/fixtures/arbiter-legacy \
             tests/fixtures/arbiter-proxy \
+            tests/fixtures/cmd \
             tests/fixtures/herdr \
             tests/fixtures/panewire \
             tests/fixtures/pi \

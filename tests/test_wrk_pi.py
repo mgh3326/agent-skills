@@ -515,11 +515,11 @@ class PiMutantTests(unittest.TestCase):
         source = (ROOT / "bin/wrk").read_text()
         mutants = {
             "pi-role-omitted": (
-                '  if [[ "$PROFILE_KIND" == pi || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
-                '  if [[ "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
+                '  if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
+                '  if [[ "$PROFILE_KIND" == cmd || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
                 "test_pi_worker_and_tester_roles_reach_gate"),
             "role-all-profiles": (
-                '  if [[ "$PROFILE_KIND" == pi || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
+                '  if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then\n',
                 '  if [[ "$MODEL" != __never__ ]]; then\n',
                 "test_non_pi_gate_argv_has_no_role"),
             "host": ('  pi_host_precheck\n', '  : # missing host guard\n',
@@ -537,10 +537,11 @@ class PiMutantTests(unittest.TestCase):
             "truthy": ('true) LOCAL_PI_ANTHROPIC=1 ;;',
                        'true|false|1|\\\"true\\\") LOCAL_PI_ANTHROPIC=1 ;;',
                        "test_host_literal_true_only"),
-            "quoted-proof": ('if candidate in quoted:', 'if False:',
+            "quoted-proof": ('candidate = re.sub(r"\\s+", " ", "\\n".join(footer[:2])).strip()\nquoted = re.sub(r"\\s+", " ", injected).strip()\nif candidate in quoted:',
+                             'candidate = re.sub(r"\\s+", " ", "\\n".join(footer[:2])).strip()\nquoted = re.sub(r"\\s+", " ", injected).strip()\nif False:',
                              "test_brief_cannot_prove_model"),
-            "old-frame-guard": ('if candidate in quoted:',
-                                'if "\\n".join(lines[tops[-1]:]) in injected:',
+            "old-frame-guard": ('candidate = re.sub(r"\\s+", " ", "\\n".join(footer[:2])).strip()\nquoted = re.sub(r"\\s+", " ", injected).strip()\nif candidate in quoted:',
+                                'candidate = re.sub(r"\\s+", " ", "\\n".join(footer[:2])).strip()\nquoted = re.sub(r"\\s+", " ", injected).strip()\nif "\\n".join(lines[tops[-1]:]) in injected:',
                                 "test_brief_cannot_prove_model"),
             "first-border": ('bottom = bottoms[-1]', 'bottom = bottoms[0]',
                              "test_footer_boundaries"),
