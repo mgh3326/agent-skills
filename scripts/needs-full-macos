@@ -12,7 +12,7 @@ manifest="$(cd "$(dirname "$0")/.." && pwd)/.github/macos-smoke.txt"
 
 tmp="$(mktemp)"
 trap 'rm -f "$tmp"' EXIT
-git diff --name-only --diff-filter=ACDMRTUXB "$base...$head" > "$tmp"
+git diff --no-renames --name-only --diff-filter=ACDMRTUXB "$base...$head" > "$tmp"
 
 python3 - "$manifest" "$tmp" <<'PY'
 from pathlib import Path

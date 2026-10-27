@@ -136,7 +136,7 @@ jobs:
                       baseline = run["head_sha"]
                       break
           except (KeyError, OSError, subprocess.CalledProcessError, json.JSONDecodeError):
-              # API trouble cannot create a docs-only skip; use the complete PR diff.
+              # On API trouble, use the complete PR diff; it can skip only if every changed path is docs-only.
               baseline = None
 
           start = baseline or base_sha
@@ -232,7 +232,7 @@ jobs:
       - name: Run curated Darwin-sensitive suites
         shell: bash
         run: |
-          awk 'BEGIN { section = "" } /^\[/ { section = $0; next } section == "[smoke]" && NF { print }' .github/macos-smoke.txt |
+          awk 'BEGIN { section = "" } /^\[/ { section = $0; next } section == "[smoke]" && NF && $0 !~ /^#/ { print }' .github/macos-smoke.txt |
           while IFS= read -r command; do
             echo "::group::$command"
             bash -c "$command"
