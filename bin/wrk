@@ -1370,6 +1370,7 @@ sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
 cmd_model_proven() {
   local screen
   screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || return 1
+  # shellcheck disable=SC2016
   printf '%s' "$screen" | python3 -c '
 import os, re, sys
 expected_model, effort, cwd, prompt = sys.argv[1:]
