@@ -77,6 +77,8 @@ case_group_survival() {
   local pgid="" sentinel="" started="" log="$jobdir/completion-sentinel.log"
   local count_before=0 lib args=()
   mkdir -p "$jobdir"
+  # hk 2042 containment: a --parent-job report must resolve under the parent or new job dir.
+  report="$(cd "$jobdir" && pwd -P)/report.md"
   export HK_STATE="$hk_state"
 
   if [[ "$role" == builder ]]; then
