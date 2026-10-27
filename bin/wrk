@@ -15551,7 +15551,7 @@ artifacts_move_cmd() {
 # the DriveFS freshness guard), evict the Drive-folder copies, and record
 # the dataset in hk as a fleet.artifact.v2 doc. Never deletes a source
 # original: local deletion is the host sweep's job (hk 2094).
-import fnmatch, glob, hashlib, json, os, re, shutil, subprocess, sys, time, uuid
+import fnmatch, glob, hashlib, json, os, re, shlex, shutil, subprocess, sys, time, uuid
 
 PROG = "wrk artifacts move"
 
@@ -15791,7 +15791,10 @@ def inventory():
                     continue
         return out
     try:
-        r = subprocess.run([ssh_bin, ssh_target, "python3", "-", src, json.dumps(exclude)],
+        # OpenSSH joins remote-command argv and invokes a remote shell. Quote
+        # every argument in that command so paths and JSON stay single args.
+        remote_command = "python3 - %s %s" % (shlex.quote(src), shlex.quote(json.dumps(exclude)))
+        r = subprocess.run([ssh_bin, ssh_target, remote_command],
                            input=REMOTE_INVENTORY, capture_output=True, text=True, timeout=3600)
     except (OSError, subprocess.TimeoutExpired) as e:
         die("remote inventory over ssh failed (%s): %s" % (ssh_target, e))

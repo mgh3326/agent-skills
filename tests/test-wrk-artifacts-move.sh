@@ -161,20 +161,18 @@ SH
   chmod +x "$PANEWIRE"
 }
 
-# ssh stub: serves only the remote-inventory call `ssh <host> python3 - SRC
-# EXCLJSON` — the remote script arrives on stdin and runs locally against SRC
-# (which is a real temp path in this suite). Any other argv fails 255 so a
-# write-capable remote command can never slip through unobserved.
+# ssh stub: serves only the remote-inventory call `ssh <host> <remote command>`.
+# OpenSSH executes that command through a remote shell, so the stub does too;
+# this catches missing shell quoting while keeping every path under $TMP.
 write_ssh_stub() {
   cat >"$SSH" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 printf '%s\0' "$@" >>"$SSH_LOG"; printf '\0' >>"$SSH_LOG"
 args=("$@")
-n=$#
-if [[ " $* " == *" python3 - "* ]]; then
-  cat >"$SSH_DIR/remote-script.py"
-  exec python3 "$SSH_DIR/remote-script.py" "${args[$((n-2))]}" "${args[$((n-1))]}"
+if [[ " ${args[*]} " == *" python3 - "* ]]; then
+  [[ "$#" -eq 2 ]] || { echo "ssh stub: expected one remote command" >&2; exit 2; }
+  exec sh -c "${args[1]}"
 fi
 exit 255
 SH
@@ -817,7 +815,7 @@ cat >>"$WRK_HOSTS_CONFIG" <<EOF
 [hosts.fh]
 ssh = "fakessh"
 EOF
-RSRC="$TMP/$CASE/rsrc"; mkdir -p "$RSRC/sub"
+RSRC="$TMP/$CASE/remote tree's data/rsrc"; mkdir -p "$RSRC/sub"
 printf 'r1\n' >"$RSRC/r1.txt"; printf 'r2\n' >"$RSRC/sub/r2.txt"; printf 'r3\n' >"$RSRC/r3.txt"
 printf 'never\n' >"$RSRC/x_token.txt"
 before_sig="$(tree_sig "$RSRC")"
