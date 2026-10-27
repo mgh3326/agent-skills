@@ -39,7 +39,21 @@ class EligibilityFixtures(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.jobs = Path(self.temp.name) / "jobs"
-        env = mock.patch.dict(os.environ, {"ARBITER_INBOX_ROOT": str(self.jobs)})
+        runtime = Path(self.temp.name) / "runtime"
+        env_values = {
+            "HOME": str(runtime / "home"),
+            "XDG_DATA_HOME": str(runtime / "xdg-data"),
+            "XDG_CACHE_HOME": str(runtime / "xdg-cache"),
+            "XDG_CONFIG_HOME": str(runtime / "xdg-config"),
+            "XDG_STATE_HOME": str(runtime / "xdg-state"),
+            "CODEX_HOME": str(runtime / "codex-home"),
+            "TMPDIR": str(runtime / "tmp"),
+            "ARBITER_INBOX_ROOT": str(self.jobs),
+            "WRK_TEST_MODE": "1",
+        }
+        for value in env_values.values():
+            Path(value).mkdir(parents=True, exist_ok=True)
+        env = mock.patch.dict(os.environ, env_values)
         env.start()
         self.addCleanup(env.stop)
         # Legacy profile/grade fixtures still need resolvable contributor jobs.
@@ -862,8 +876,8 @@ class EligibilityFixtures(unittest.TestCase):
     def test_advertised_aliases_have_explicit_policy_entries(self) -> None:
         names = subprocess.run([str(ROOT / "bin/wrk"), "profiles"], text=True,
                                capture_output=True, check=True).stdout.splitlines()
-        # Terra spellings are refused (operator 2026-10-12 noterra): wrk no longer
-        # advertises them, and the policy keeps each one only as an explicit denial.
+        # The old Terra spellings are refused (operator 2026-10-12 noterra): wrk
+        # no longer advertises them, and the policy keeps each as an explicit denial.
         barred = {"codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",
                   "builder-terra-xhigh", "builder-terra-max"}
         self.assertTrue(barred.isdisjoint(names), sorted(barred & set(names)))
@@ -878,6 +892,21 @@ class EligibilityFixtures(unittest.TestCase):
                                                   actual_effort=spec["default_effort"],
                                                   role=spec["roles"][0])
                 self.assertEqual(check["status"], "PASS", name)
+
+        terra61 = self.policy["profiles"]["codex-terra61"]
+        self.assertEqual((terra61["model"], terra61["family"], terra61["default_effort"]),
+                         ("gpt-6.1-terra", "openai", "low"))
+        self.assertEqual(terra61["grades"], {effort: "ungraded" for effort in
+                                              ("low", "medium", "high", "xhigh", "max", "ultra")})
+        self.assertEqual(terra61["roles"], ["worker", "tester"])
+        self.assertEqual(terra61["surfaces"], ["T1", "T2"])
+        for effort in ("medium", "high", "xhigh", "max"):
+            name = f"builder-terra61-{effort}"
+            spec = self.policy["profiles"][name]
+            self.assertEqual((spec["model"], spec["family"], spec["default_effort"]),
+                             ("gpt-6.1-terra", "openai", effort))
+            self.assertEqual((spec["roles"], spec["grade_status"], spec["grades"]),
+                             (["builder"], "conflict", {effort: None}))
 
     def test_same_family_missing_and_skipped_ci(self) -> None:
         evidence = self.evidence(self.make_head(), required_grade="A+", implementation_grade="A+")
@@ -1186,7 +1215,7 @@ class EligibilityFixtures(unittest.TestCase):
         self.assertEqual({name: check["reason_code"] for name, check in checks.items()
                           if check["status"] not in ("PASS", "N/A")}, {})
 
-    def test_every_terra_profile_is_denied_to_testers(self) -> None:
+    def test_old_terra_spellings_are_denied_to_testers(self) -> None:
         barred = ("codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",
                   "builder-terra-xhigh", "builder-terra-max")
         for alias in barred:
@@ -1200,6 +1229,14 @@ class EligibilityFixtures(unittest.TestCase):
                                        "planned_effort": spec["default_effort"]}
                 checks = self.check(evidence)
                 self.assert_case(checks, "tester", "FAIL", "PROFILE_ROLE_DENIED")
+
+    def test_terra61_builder_rungs_do_not_offer_tester_seats(self) -> None:
+        for effort in ("medium", "high", "xhigh", "max"):
+            alias = f"builder-terra61-{effort}"
+            evidence = self.evidence(self.make_head(f"src/{alias}-tester.py"))
+            evidence["tester"] = {"planned_profile": alias, "planned_effort": effort}
+            checks = self.check(evidence)
+            self.assert_case(checks, "tester", "FAIL", "PROFILE_ROLE_DENIED")
 
     def test_codex_med_grant_mutant_goes_red(self) -> None:
         mutant = json.loads(json.dumps(self.policy))

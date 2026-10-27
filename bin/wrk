@@ -81,7 +81,8 @@ ALL_PROFILES=(
   devin-argon devin-argon-medium devin-argon-low
   builder-ds41 builder-ds41-max
   codex-luna codex-luna-hi codex-luna-max
-  codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra
+  codex codex-sol codex-max builder-sol builder-luna captain-sol codex-astra codex-terra61
+  builder-terra61-medium builder-terra61-high builder-terra61-xhigh builder-terra61-max
   codex-sol56 codex-luna56 codex-sol6 builder-sol6
   builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max
   builder-sol-high builder-sol-xhigh builder-sol-max builder-sol-medium builder-luna-max
@@ -140,8 +141,9 @@ profiles_help() {
 Usage: wrk profiles
 
 Print active model profile names, one per line (machine-readable; excludes
-retired agy-* aliases and barred Terra profiles). Terra spellings are still
-recognized so spawn can refuse them with the operator decision.
+retired agy-* aliases and barred Terra profiles). The gpt-6.1-terra profile
+and pinned builder rungs are active; older Terra spellings remain recognized
+so spawn can refuse them with the operator decision.
 Barred: codex-terra, codex-terra-max, codex-med, builder-terra-high,
 builder-terra-xhigh and builder-terra-max — operator 2026-10-12 noterra.
   -h, --help   show this usage
@@ -186,7 +188,7 @@ Usage: wrk <spawn|done|restore|escalate|joined|round|reap|worktree-reap|lanes-mi
   wrk reap [--lane LANE] [--job JOB[,JOB...]] [--grace 10m] [--apply] [--include-builders|--include-captains]
   wrk worktree-reap [--age 3d] [--apply]
   wrk lanes-missing
-  wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
+  wrk prune [--apply] [--stale-age AGE] [--heavy-age AGE] [--job JOB] [--lane LANE] [--policy PATH]
   wrk find <name-or-label> [--pane-only]
   wrk name-sync [--apply|<label>...]
   wrk profiles
@@ -326,10 +328,12 @@ Options:
                      The devin Argon trial spellings devin-argon, devin-argon-medium and
                      devin-argon-low are likewise worker/tester-only (hk 1620
                      phase 1) — --role builder refuses all three.
-                     All codex-terra, codex-terra-max, codex-med and
-                     builder-terra-* spellings are refused: gpt-5.6-terra is
-                     barred by operator 2026-10-12 noterra; use codex-sol or
-                     codex-luna.
+                     codex-terra61 runs GPT-6.1 Terra (default low; Codex
+                     0.164.0). builder-terra61-medium/high/xhigh/max pin
+                     that rung and require SCOPEFUEL_E6_ARM=codex-terra61@RUNG.
+                     codex-terra, codex-terra-max, codex-med and
+                     builder-terra-* remain refused: gpt-5.6-terra is barred
+                     by operator 2026-10-12 noterra.
   --lane NAME        builder's own lane; recorded as the claim owner_lane.
                      (The execution lane remains -L live|mock.)
   --parent NAME      required for --role builder (spawn dies without it).
@@ -652,10 +656,13 @@ claim/record or preparation failure is warned and does not deny the spawn; a
 failed spawn releases a successfully created record. The scopefuel gate remains
 fail-closed, while exclusive arbiter leases retain their own fail-closed rules.
 
-Canonical codex profiles: codex-luna, codex-sol.
+Canonical codex profiles: codex-luna, codex-sol, codex-terra61.
 Existing codex aliases remain valid: codex, codex-luna-hi, codex-luna-max,
-codex-max. codex-terra, codex-terra-max and codex-med resolve for a named
-refusal: gpt-5.6-terra is barred by operator 2026-10-12 noterra.
+codex-max. codex-terra61 runs gpt-6.1-terra (footer display GPT-6.1 Terra,
+default effort low on Codex 0.164.0). builder-terra61-medium/high/xhigh/max pin
+their effort rung and require the matching SCOPEFUEL_E6_ARM marker.
+codex-terra, codex-terra-max and codex-med resolve for a named refusal:
+gpt-5.6-terra is barred by operator 2026-10-12 noterra.
 ROB-591/#1026 (2026-09-30 operator decision): codex-sol/codex-max/codex/
 builder-sol/captain-sol now run gpt-6.1-sol, and codex-luna/codex-luna-hi/
 codex-luna-max run gpt-6-luna. Rollback spellings codex-sol6/builder-sol6 pin
@@ -758,8 +765,10 @@ gate=default row (r1026solmax), so the gate demands no REF; builder-sol-xhigh
 is the S+ escalation row, so the gate still decides admission there. A stale
 marker in the environment is ignored and never recorded: the quota record
 reads the canonical rung (codex-sol@max, codex-sol@xhigh). The
-Terra E6 spellings builder-terra-high, builder-terra-xhigh and builder-terra-max
-are refused by operator 2026-10-12 noterra. For the remaining profiles
+old Terra E6 spellings builder-terra-high, builder-terra-xhigh and
+builder-terra-max are refused by operator 2026-10-12 noterra. The separate
+builder-terra61-medium/high/xhigh/max rows are unmeasured E6 rungs and require
+SCOPEFUEL_E6_ARM=codex-terra61@<effort>. For the remaining profiles
 wrk passes the pinned rung as `scopefuel gate --effort` so the gate judges
 that rung's row, and the marker (forwarded through the environment) is what
 opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
@@ -1337,6 +1346,32 @@ pattern = (r"^(?=\S).*(?:\d+(?:\.\d+)?%|\?)/\S+(?: \(auto\))?\s+\(" + re.escape(
            r"\) " + re.escape(model) + r" • " + re.escape(effort) + r"$")
 sys.exit(0 if re.fullmatch(pattern, footer[1]) else 1)
 ' "$PROFILE_MODEL" "$PI_THINKING" "$SPAWN_EXPECT_CWD" "$HOME" "$PROMPT"
+}
+
+# hk 2109: the Terra 6.1 model id alone does not prove Codex selected the
+# intended model. Read only the visible screen and extract the bottom-most
+# Codex status/footer row (the row with the cwd and Context indicator). The
+# brief and transcript are never searched for model text.
+terra61_footer_status() {
+  local screen
+  screen="$("$HERDR" agent read "$PANE" --source visible --lines 80 2>/dev/null)" || {
+    printf 'missing\n'
+    return 0
+  }
+  printf '%s' "$screen" | python3 -c '
+import re, sys
+display, effort = sys.argv[1:]
+screen = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", sys.stdin.read())
+rows = [line.rstrip() for line in screen.splitlines()]
+footers = [line.strip() for line in rows
+           if re.search(r"\s·\s.*\s·\sContext\b", line)]
+if not footers:
+    print("missing")
+else:
+    # Only the footer row is evidence; compare its model-and-effort field.
+    observed = footers[-1].split(" · ", 1)[0].strip()
+    print("match" if observed == f"{display} {effort}" else "mismatch")
+' 'GPT-6.1 Terra' "$EFFECTIVE_EFFORT"
 }
 
 # spawn_deliver_brief — sets LANDING (yes|retry|no), SPAWN_VIA and, when not
@@ -2714,7 +2749,7 @@ agent_foreground_diagnostics() {
 }
 
 agent_wait_foreground() {
-  local started_at attempts=0 max_attempts info_out info_rc ready
+  local started_at attempts=0 max_attempts info_out info_rc ready terra_status
   started_at="$(date +%s)"
   max_attempts=$(( AGENT_FOREGROUND_TIMEOUT_MS / SHELL_READY_POLL_MS ))
   while :; do
@@ -2761,9 +2796,26 @@ else:
       agent_foreground_diagnostics "pane process-info returned an invalid envelope before brief injection"
       return 1
     fi
-    [[ "$ready" == yes ]] && return 0
+    if [[ "$ready" == yes ]]; then
+      if [[ "$PROFILE_MODEL" != gpt-6.1-terra ]]; then
+        return 0
+      fi
+      terra_status="$(terra61_footer_status)"
+      case "$terra_status" in
+        match) return 0 ;;
+        mismatch)
+          echo "wrk: terra61 model not proven: expected GPT-6.1 Terra $EFFECTIVE_EFFORT" >&2
+          spawn_pane_cleanup
+          return 1 ;;
+      esac
+    fi
     if (( attempts >= max_attempts || ($(date +%s) - started_at) * 1000 >= AGENT_FOREGROUND_TIMEOUT_MS )); then
-      agent_foreground_diagnostics "agent not foreground within ${AGENT_FOREGROUND_TIMEOUT_MS}ms (not-foreground x$attempts)"
+      if [[ "$PROFILE_MODEL" == gpt-6.1-terra ]]; then
+        echo "wrk: terra61 model not proven: expected GPT-6.1 Terra $EFFECTIVE_EFFORT" >&2
+        spawn_pane_cleanup
+      else
+        agent_foreground_diagnostics "agent not foreground within ${AGENT_FOREGROUND_TIMEOUT_MS}ms (not-foreground x$attempts)"
+      fi
       return 1
     fi
     sleep_for "$SHELL_READY_POLL_SECONDS"
@@ -3781,6 +3833,8 @@ resolve_catalog_profile() {
     # CATALOG_KEEP_MODEL pins the literal gpt-6-sol: the consult feeds effort
     # and attribution only, never the model id.
     builder-sol6) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high; CATALOG_KEEP_MODEL=1 ;;
+    codex-terra61) CATALOG_PROFILE=codex-terra61; CATALOG_EFFORT_PIN="${EFFORT:-low}" ;;
+    builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max) CATALOG_PROFILE=codex-terra61; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;
     codex-terra|codex-med) CATALOG_PROFILE=codex-terra; CATALOG_EFFORT_PIN=medium ;;
     codex-terra-max) CATALOG_PROFILE=codex-terra-max ;;
     codex-luna) CATALOG_PROFILE=codex-luna; CATALOG_EFFORT_PIN=medium ;;
@@ -4124,6 +4178,9 @@ resolve_profile() {
       fi
       ;;
 
+    codex-terra61) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-terra; DEFAULT_EFFORT=low; EFFORT_SUPPORTED=1 ;;
+    builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max)
+      PROFILE_KIND=codex; PROFILE_MODEL=gpt-6.1-terra; DEFAULT_EFFORT="${MODEL##*-}"; EFFORT_SUPPORTED=1 ;;
     codex-terra|codex-med) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
     codex-terra-max) PROFILE_KIND=codex; PROFILE_MODEL=gpt-5.6-terra; DEFAULT_EFFORT=max; EFFORT_SUPPORTED=1 ;;
     codex-luna) PROFILE_KIND=codex; PROFILE_MODEL=gpt-6-luna; DEFAULT_EFFORT=medium; EFFORT_SUPPORTED=1 ;;
@@ -4338,6 +4395,9 @@ resolve_profile() {
     # NOT the flat codex-luna-max gate profile the worker spellings below use.
     # hk 2043 adds builder-luna-high to the same pin.
     builder-luna-low|builder-luna-high|builder-luna-medium) GATE_PROFILE=codex-luna; GATE_EFFORT_PIN="${MODEL##*-}" ;;
+    codex-terra61) GATE_PROFILE=codex-terra61; GATE_EFFORT_PIN="${EFFORT:-low}" ;;
+    builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max)
+      GATE_PROFILE=codex-terra61; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     builder-terra-high|builder-terra-xhigh|builder-terra-max) GATE_PROFILE=codex-terra; GATE_EFFORT_PIN="${MODEL##*-}" ;;
     # task #527: the gate role-denies astra without an allowed --purpose, so the
     # counsel spawn path defaults it to `architect` (the wrk-side counsel use).
@@ -4375,6 +4435,10 @@ resolve_profile() {
 
   resolve_catalog_profile
   apply_catalog
+  # Resolve catalog overrides before any effort/arm decision, then apply the
+  # model-id bar to every launcher channel. A barred Terra id always gets the
+  # noterra refusal, even when its spelling also needs an E6 marker.
+  refuse_barred_launcher_model
   if [[ "${ROLE:-}" == builder && -n "${ROUND_EXT_REF:-}" ]]; then
     [[ "${ROUND_EXT_CATALOG_VERIFIED:-0}" == 1 ]] ||
       die "--round-ext builder requires readable hk1672/v1 support evidence from scopefuel policy launch (check installed scopefuel version)"
@@ -11697,6 +11761,9 @@ mock_mcp_cleanup() {
 refuse_barred_model_id() {
   local model_id="${1:-}" profile="${2:-$MODEL}"
   case "$model_id" in
+    # The operator lifted noterra only for this exact model id. Its display
+    # name is separately verified from the visible Codex footer after startup.
+    gpt-6.1-terra) return 0 ;;
     # The bar is on the model, not the spelling: any resolved model id carrying
     # a -terra segment refuses, so a future alias or catalog row serving a new
     # terra id (e.g. gpt-9.9-terra) cannot slip past the gpt-5.6-terra literal.
@@ -11837,8 +11904,8 @@ spawn_cmd() {
         die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
         die "--role builder rejects '$MODEL': the devin Argon trial spellings are worker/tester-only — phase 1 is spawn plumbing, no builder seat (hk 1620, operator decision 2026-10-18)" ;;
-      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-luna-high, builder-haiku-medium (hk 2043), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) plus the normal pinned spellings builder-sol-xhigh and builder-sol-max (hk 2043, operator r1026solmax) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; Terra spellings refused by operator 2026-10-12 noterra; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23) while builder-sol-max takes no marker (hk 2043); ultra stays refused)" ;;
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-luna-high, builder-haiku-medium (hk 2043), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) plus the normal pinned spellings builder-sol-xhigh and builder-sol-max (hk 2043, operator r1026solmax) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; old Terra spellings codex-terra, codex-terra-max, codex-med and builder-terra-high/xhigh/max remain refused by operator 2026-10-12 noterra; builder-terra61-medium/high/xhigh/max are E6 builder rungs requiring SCOPEFUEL_E6_ARM=codex-terra61@<effort>; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23) while builder-sol-max takes no marker (hk 2043); ultra stays refused)" ;;
     esac
     case "$MODEL" in
       # hk 2043 item 4: every unpinned builder spelling whose catalog consult
@@ -11889,14 +11956,14 @@ spawn_cmd() {
       # the SCOPEFUEL_E6_ARM marker; refusing here too keeps the failure on the
       # same die path the other pinned builders use. hk 2043 adds the normal
       # pinned spellings and the luna-high rung to the same pin.
-      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low)
+      builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|builder-terra-high|builder-terra-xhigh|builder-terra-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low)
         [[ -z "$EFFORT" || "$EFFORT" == "${MODEL##*-}" ]] || die "$MODEL is pinned to effort ${MODEL##*-} (#594 E6 rung)"
         ;;
     esac
   else
     [[ -z "$BUILDER_LANE" && -z "$PARENT_LANE" ]] || die "--lane/--parent require --role builder (legacy alias: captain)"
     case "$MODEL" in
-      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|captain-opus|captain-sol)
+      builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|captain-opus|captain-sol)
         die "builder profiles (legacy captain-* aliases accepted) require --role builder"
         ;;
     esac
@@ -11922,9 +11989,8 @@ spawn_cmd() {
   fi
 
   resolve_profile
-  # Refuse by the resolved launcher model id, not by the spelling list. Keep
-  # this before gate work, quota/arbiter admission, worktree or pane creation.
-  refuse_barred_launcher_model
+  # resolve_profile applies the resolved model-id bar immediately after the
+  # catalog answer and before effort-arm validation, gate work or admission.
   configure_landing_check "$PROFILE_KIND"
   LANE_ENV=()
   if [[ -n "$LANE" ]]; then
@@ -13275,7 +13341,8 @@ PY
 
 prune_help() {
   cat <<'USAGE'
-Usage: wrk prune [--apply] [--stale-age AGE] [--job JOB] [--lane LANE]
+Usage: wrk prune [--apply] [--stale-age AGE] [--heavy-age AGE]
+                 [--job JOB] [--lane LANE] [--policy PATH]
 
 Report — and with --apply, remove — what ended or stale jobs leave behind:
   * orphan completion sentinels (pidfile or a live `wrk sentinel JOB`
@@ -13288,6 +13355,32 @@ Report — and with --apply, remove — what ended or stale jobs leave behind:
   * quota-refresh supervisor leftovers (quota-refresh.pid pointing at a
     dead/reused pid, or a live supervisor past its recorded deadline or
     whose job already ended)
+  * job artifacts per the policy file (schema fleet.artifact-policy.v1;
+    default director/artifact_policy.json next to this wrk, --policy or
+    WRK_ARTIFACT_POLICY overrides): named roots sit relative to the fleet
+    work root and each row names a class, a root and a glob inside a job
+    dir. This pass knows exactly two classes:
+      - cache: deleted only when the job is ended (terminal record after
+        the newest revive), its hk task reads merged or dropped (read-only
+        lookup; any failure keeps the match), no live completion sentinel
+        or pane exists, and the job has been quiet past --heavy-age
+        (default 3d)
+      - intermediate-build: in ANY job state, every match beyond the
+        keep_newest newest (1 or 2, ordered by the newest mtime inside
+        each match) is deleted; nothing is deleted at or below the count
+        or when an mtime is unreadable
+    Other classes — evidence, final-build, record text — are out of scope
+    and rejected on load: the artifact-store sweeper uploads them first
+    (design hk:doc designs/b953/artifact-store). A symlinked match is
+    unlinked, never traversed; a match whose real path leaves the job dir
+    is refused; a unity path is skipped while the pa unity lock
+    (/tmp/pa-m1-unity.lock) is held; any path a live process still has open
+    (lsof) is skipped; a job's events dir, any refs dir and the jobs-root
+    asset-store-packs entry are never touched. Every removal prints its
+    class and bytes, appends a job.artifacts_pruned event for a jobs-root
+    match, and logs to <jobs-root>/prune.log for the other roots. An
+    invalid policy (unknown keys, an absolute or .. glob, a glob that
+    leaves the job dir) refuses the whole pass.
 
 Dry-run is the default and prints one line per item with job id, pid, age,
 pane state and the exact reason it is or is not an orphan. --apply stops
@@ -13297,10 +13390,14 @@ pidfile pointing at an unrelated process only loses the file, never the
 process.
 
 Options:
-  --apply          actually stop orphans / mark stale jobs / reap leftovers
+  --apply          actually stop orphans / mark stale jobs / reap leftovers /
+                   remove artifacts
   --stale-age AGE  stale threshold, e.g. 86400, 12h, 1d (default 24h)
+  --heavy-age AGE  quiet-age gate for cache artifact rows (default 3d)
   --job JOB        restrict every pass to one job id
   --lane LANE      restrict every pass to jobs owned by LANE
+  --policy PATH    artifact policy file (default: director/artifact_policy.json
+                   beside this wrk; env WRK_ARTIFACT_POLICY)
   -h, --help       show this usage
 
 Periodic hook: WRK_PRUNE_ON_SPAWN=1 runs this same --apply pass detached at
@@ -13420,21 +13517,514 @@ prune_sentinel_row() {
   esac
 }
 
+# ── hk 2090: artifact prune pass ─────────────────────────────────────────
+# The artifact pass applies director/artifact_policy.json (schema
+# fleet.artifact-policy.v1): named roots relative to the fleet work root
+# (the jobs root's grandparent — ~/work by default), rows of class "cache"
+# or "intermediate-build", each row a glob relative to a job dir. Anything
+# not proven is skipped; a broken policy refuses the whole pass; a symlink
+# is unlinked, never traversed; a match resolving outside its job dir is
+# refused. Evidence, final builds and record text are out of scope — the
+# artifact-store sweeper (designs/b953/artifact-store) uploads them first.
+
+# prune_artifact_policy_default — the shipped policy next to this script's
+# real location (a symlinked ~/.local/bin/wrk resolves to the repo clone).
+prune_artifact_policy_default() {
+  python3 -c 'import os, sys
+print(os.path.join(os.path.dirname(os.path.dirname(
+    os.path.realpath(sys.argv[1]))), "director", "artifact_policy.json"))' \
+    "${BASH_SOURCE[0]}"
+}
+
+# prune_artifact_policy_load POLICY WORK_ROOT — validate the policy and print
+# one TSV row per rule: class, root name, resolved absolute root, glob and
+# keep_newest ("" for cache). Any violation prints REFUSE<TAB>reason and
+# exits 3: a broken policy must refuse the whole pass, never be half-applied.
+prune_artifact_policy_load() {
+  python3 - "$1" "$2" <<'PY'
+import json, os, re, sys
+path, work_root = sys.argv[1], sys.argv[2]
+CLASSES = ("cache", "intermediate-build")
+ROW_KEYS = {"class", "root", "glob", "keep_newest"}
+NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*\Z")
+
+
+def refuse(msg):
+    print("REFUSE\t" + msg)
+    raise SystemExit(3)
+
+
+try:
+    with open(path, encoding="utf-8") as handle:
+        doc = json.load(handle)
+except (OSError, ValueError) as exc:
+    refuse("policy unreadable: %s" % exc)
+if not isinstance(doc, dict):
+    refuse("policy is not an object")
+if set(doc) != {"schema", "roots", "rows"}:
+    refuse("top-level keys must be exactly schema, roots and rows")
+if doc["schema"] != "fleet.artifact-policy.v1":
+    refuse("unknown schema %r" % (doc["schema"],))
+roots = doc["roots"]
+if not isinstance(roots, dict) or not roots:
+    refuse("roots must be a non-empty object")
+resolved = {}
+for name, rel in roots.items():
+    if not isinstance(name, str) or not NAME_RE.fullmatch(name):
+        refuse("bad root name %r" % (name,))
+    if not isinstance(rel, str) or not rel or os.path.isabs(rel):
+        refuse("root %s must be a relative path" % name)
+    if any(part in ("", ".", "..") for part in rel.split("/")):
+        refuse("root %s path %r is not a clean relative path" % (name, rel))
+    resolved[name] = os.path.normpath(os.path.join(work_root, rel))
+rows = doc["rows"]
+if not isinstance(rows, list):
+    refuse("rows must be a list")
+for index, row in enumerate(rows):
+    if not isinstance(row, dict):
+        refuse("row %d is not an object" % index)
+    unknown = sorted(set(row) - ROW_KEYS)
+    if unknown:
+        refuse("row %d unknown keys %s" % (index, ",".join(unknown)))
+    cls = row.get("class")
+    if cls not in CLASSES:
+        refuse("row %d class %r is not yet supported" % (index, cls))
+    root = row.get("root")
+    if root not in resolved:
+        refuse("row %d names an unknown root %r" % (index, root))
+    pat = row.get("glob")
+    if not isinstance(pat, str) or not pat:
+        refuse("row %d glob must be a non-empty string" % index)
+    if os.path.isabs(pat):
+        refuse("row %d glob %r is absolute" % (index, pat))
+    if any(part in ("", "..") for part in pat.split("/")):
+        refuse("row %d glob %r can leave the job dir" % (index, pat))
+    if os.path.normpath(pat) == ".":
+        refuse("row %d glob %r names the job dir itself" % (index, pat))
+    keep = row.get("keep_newest")
+    if cls == "intermediate-build":
+        if not isinstance(keep, int) or isinstance(keep, bool) or keep not in (1, 2):
+            refuse("row %d keep_newest must be 1 or 2" % index)
+    elif keep is not None:
+        refuse("row %d keep_newest is only valid for intermediate-build" % index)
+    print("\t".join((cls, root, resolved[root], pat,
+                     "" if keep is None else str(keep))))
+PY
+}
+
+# prune_artifact_scan JOBDIR GLOB — one TSV per match:
+#   kind(real|link|outside)  path  newest-mtime-inside(- if unreadable)  bytes
+# A symlink match is "link" (unlink it, never traverse). A non-symlink match
+# whose realpath escapes the job dir — through a symlinked ancestor — is
+# "outside" and must be refused, never removed. The job dir itself can never
+# be a match.
+prune_artifact_scan() {
+  python3 - "$1" "$2" <<'PY'
+import glob, os, sys
+jobdir, pattern = sys.argv[1], sys.argv[2]
+try:
+    job_real = os.path.realpath(jobdir)
+except OSError:
+    raise SystemExit(1)
+
+
+def tree_size(root):
+    try:
+        st = os.lstat(root)
+    except OSError:
+        return 0
+    if not os.path.isdir(root):
+        return st.st_size
+    total = 0
+    for base, dirs, files in os.walk(root):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(base, name)).st_size
+            except OSError:
+                pass
+        for name in dirs:
+            link = os.path.join(base, name)
+            if os.path.islink(link):
+                try:
+                    total += os.lstat(link).st_size
+                except OSError:
+                    pass
+    return total
+
+
+def newest_mtime(root):
+    try:
+        newest = os.lstat(root).st_mtime
+    except OSError:
+        return None
+    if os.path.isdir(root) and not os.path.islink(root):
+        for base, dirs, files in os.walk(root):
+            for name in dirs + files:
+                try:
+                    newest = max(
+                        newest, os.lstat(os.path.join(base, name)).st_mtime)
+                except OSError:
+                    return None
+    return newest
+
+
+# A match under the job's events stream, a refs dir, or a root entry named
+# asset-store-packs is on the never-touch list (record text and the asset
+# store are the sweeper's, not this pass's); "guarded" matches are refused.
+jobbase = os.path.basename(job_real)
+for match in sorted(glob.glob(os.path.join(jobdir, pattern), recursive=True)):
+    if os.path.islink(match):
+        kind = "link"
+    else:
+        try:
+            real = os.path.realpath(match)
+        except OSError:
+            real = ""
+        if real.startswith(job_real + os.sep):
+            rel = real[len(job_real):].split(os.sep)
+            kind = ("guarded" if jobbase == "asset-store-packs" or
+                    rel[1] in ("events", "refs") else "real")
+        else:
+            kind = "outside"
+    stamp = newest_mtime(match)
+    print("%s\t%s\t%s\t%d" % (kind, match,
+          "-" if stamp is None else str(int(stamp)), tree_size(match)))
+PY
+}
+
+# prune_artifact_remove PATH — unlink a link or a file, rmtree a real dir.
+# rmtree never follows symlinks inside the tree; the path itself is re-checked
+# so a last-second swap to a symlink only loses the link.
+prune_artifact_remove() {
+  python3 - "$1" <<'PY'
+import os, shutil, sys
+path = sys.argv[1]
+try:
+    if os.path.islink(path) or not os.path.isdir(path):
+        os.unlink(path)
+    else:
+        shutil.rmtree(path)
+except OSError as exc:
+    print(str(exc), file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+# prune_artifact_unity_lock_held — the pa-integrator unity lock
+# (/tmp/pa-m1-unity.lock, WRK_PRUNE_UNITY_LOCK in tests) is held: flock is
+# probed, never taken. A missing file is not held; an unreadable file cannot
+# be proven free, so it is treated as held.
+prune_artifact_unity_lock_held() {
+  local lock="${WRK_PRUNE_UNITY_LOCK:-/tmp/pa-m1-unity.lock}"
+  [[ -e "$lock" || -L "$lock" ]] || return 1
+  python3 - "$lock" <<'PY'
+import fcntl, os, sys
+try:
+    fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOFOLLOW)
+except OSError:
+    raise SystemExit(0)   # exists but unopenable: cannot prove free — held
+probe = fcntl.LOCK_EX | fcntl.LOCK_NB
+try:
+    fcntl.flock(fd, probe)
+except OSError:
+    raise SystemExit(0)   # EWOULDBLOCK: another process holds it
+raise SystemExit(1)
+PY
+}
+
+# prune_artifact_path_in_use PATH — a live process has PATH open (the path
+# itself, or anything under it when PATH is a dir — lsof +D). rc 1 from lsof
+# means clean; rc 0 or any error (including no lsof or a timeout) means the
+# path cannot be proven free and is treated as in use.
+prune_artifact_path_in_use() {
+  local path="$1" lsof="${WRK_LSOF_BIN:-lsof}" rc=0
+  if ! command -v "$lsof" >/dev/null 2>&1; then
+    if [[ -z "${WRK_LSOF_BIN:-}" && -x /usr/sbin/lsof ]]; then
+      lsof=/usr/sbin/lsof   # macOS keeps lsof outside the usual PATH
+    else
+      return 0              # no probe tool: cannot prove free — in use
+    fi
+  fi
+  if [[ -d "$path" && ! -L "$path" ]]; then
+    run_bounded 60 "$lsof" -nP +D "$path" >/dev/null 2>&1 || rc=$?
+  else
+    run_bounded 15 "$lsof" -nP "$path" >/dev/null 2>&1 || rc=$?
+  fi
+  [[ "$rc" -ne 1 ]]
+}
+
+# prune_artifact_live_sentinel JOB — the pidfile guard plus this run's
+# PRUNE_SWEEP snapshot (same identity rule as job_has_live_completion_sentinel).
+prune_artifact_live_sentinel() {
+  local job="$1" pidfile pid="" started=""
+  pidfile="$(wrk_jobs_root)/$job/completion-sentinel.pid"
+  if [[ -s "$pidfile" ]]; then
+    IFS=$'\t' read -r pid started <<<"$(sentinel_pidfile_fields "$pidfile")"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && sentinel_pid_matches "$pid" "$job" &&
+       sentinel_start_matches "$pid" "$started"; then
+      return 0
+    fi
+  fi
+  awk -F '\t' -v j="$job" '$2==j {found=1} END {exit(found ? 0 : 1)}' <<<"$PRUNE_SWEEP"
+}
+
+# prune_artifact_job_task_id JOB — the newest claim/reclaim task_id under the
+# canonical jobs root; same evidence source as round_job_task_id.
+prune_artifact_job_task_id() {
+  wrk_py - "$(wrk_jobs_root)/$1/events" <<'PY'
+import json, os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+names = [name for name, _, _ in wrk_events_ordered(sys.argv[1])
+         if name.endswith(("claim.json", "reclaim.json"))]
+if not names:
+    raise SystemExit(0)
+try:
+    with open(os.path.join(sys.argv[1], names[-1]), encoding="utf-8") as f:
+        o = json.load(f)
+except (OSError, ValueError):
+    raise SystemExit(1)
+p = o.get("payload", o)
+v = p.get("task_id")
+print(v if isinstance(v, (int, str)) and not isinstance(v, bool) else "")
+PY
+}
+
+# prune_artifact_task_state JOB — the job's hk task state, read-only through
+# `handoffkeep tasks show`, bounded. rc 1 on every failure (no task id, no
+# binary, lookup failure, unreadable record): the caller must skip.
+prune_artifact_task_state() {
+  local job="$1" hk task_id out rc=0
+  hk="${HANDOFFKEEP_BIN:-}"
+  if [[ -z "$hk" || ! -x "$hk" ]]; then
+    hk="$(command -v handoffkeep 2>/dev/null || true)"
+  fi
+  [[ -n "$hk" && -x "$hk" ]] || return 1
+  task_id="$(prune_artifact_job_task_id "$job")" || return 1
+  [[ -n "$task_id" ]] || return 1
+  out="$(run_bounded 10 "$hk" tasks show "$task_id" 2>/dev/null)" || rc=$?
+  [[ "$rc" -eq 0 && -n "$out" ]] || return 1
+  python3 -c 'import json, sys
+try:
+    doc = json.loads(sys.argv[1])
+except ValueError:
+    raise SystemExit(1)
+state = doc.get("state") if isinstance(doc, dict) else None
+print(state if isinstance(state, str) and state else "")' "$out"
+}
+
+# prune_artifact_cache_reason JOB HEAVY_S — silent rc 0 when every cache gate
+# holds for JOB, else print the one-token skip reason and rc 1. Evidence is
+# this run's PRUNE_SCAN/PRUNE_SWEEP snapshots plus a lazy pane probe and hk
+# task read: the job must be ended (terminal after the newest revive), past
+# --heavy-age, free of a live sentinel or pane, and bound to a merged or
+# dropped hk task.
+prune_artifact_cache_reason() {
+  local job="$1" heavy_s="$2" row ended="" age="" pane=""
+  row="$(awk -v j="$job" -F'\t' '$1==j {print; exit}' <<<"$PRUNE_SCAN")"
+  [[ -n "$row" ]] || { echo "no-job-record"; return 1; }
+  IFS=$'\t' read -r _ ended _ _ age _ _ _ _ pane _ <<<"$row"
+  [[ "$ended" == 1 ]] || { echo "not-ended"; return 1; }
+  [[ "$age" =~ ^[0-9]+$ && "$age" -ge "$heavy_s" ]] || { echo "inside-heavy-age"; return 1; }
+  if prune_artifact_live_sentinel "$job"; then
+    echo "live-sentinel"; return 1
+  fi
+  if [[ "$pane" != - ]]; then
+    local probe pclass
+    probe="$(herdr_agent_probe "$pane")"
+    IFS=$'\t' read -r pclass _ <<<"$probe"
+    case "$pclass" in
+      gone) ;;
+      ok) echo "pane-alive"; return 1 ;;
+      *) echo "pane-unverified"; return 1 ;;
+    esac
+  fi
+  local state=""
+  if ! state="$(prune_artifact_task_state "$job" 2>/dev/null)"; then
+    echo "task-lookup-failed"; return 1
+  fi
+  case "$state" in
+    merged|dropped) return 0 ;;
+    "") echo "task-lookup-failed"; return 1 ;;
+    *) echo "task-$state"; return 1 ;;
+  esac
+}
+
+# prune_artifact_record JOB CLASS PATH BYTES IS_JOBS — journal one applied
+# removal: a job.artifacts_pruned event for a jobs-root match, a prune.log
+# line for every other root (a webqa job dir has no events stream).
+prune_artifact_record() {
+  local job="$1" cls="$2" path="$3" bytes="$4" is_jobs="$5"
+  if [[ "$is_jobs" == 1 ]]; then
+    wrk_py - "$(wrk_jobs_root)/$job/events" "$job" "$cls" "$path" "$bytes" <<'PY'
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
+events, job, cls, path, nbytes = sys.argv[1:]
+os.makedirs(events, exist_ok=True)
+lock = wrk_events_locked(events)
+try:
+    record = {"kind": "job.artifacts_pruned", "job_id": job,
+              "class": cls, "path": path, "bytes": int(nbytes)}
+    wrk_event_commit(events, "job.artifacts_pruned", record)
+finally:
+    lock.close()
+PY
+  else
+    printf '%s artifact-pruned job=%s class=%s path=%s bytes=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$job" "$cls" "$path" "$bytes" \
+      >>"$(wrk_jobs_root)/prune.log" 2>/dev/null || true
+  fi
+}
+
+# prune_artifact_pass APPLY HEAVY_S ONLY_JOB LANE POLICY JOBS_ROOT — pass 6 of
+# wrk prune: policy-driven cache and intermediate-build removal.
+prune_artifact_pass() {
+  local apply="$1" heavy_s="$2" only_job="$3" lane="$4" policy="$5" jobs_root="$6"
+  PRUNE_ARTIFACT_ROWS=0 PRUNE_ARTIFACT_REMOVED=0
+  if [[ ! -f "$policy" ]]; then
+    echo "artifact-prune: no policy file at $policy — pass skipped"
+    return 0
+  fi
+  local work_root parsed="" rc=0
+  work_root="$(dirname "$(dirname "$jobs_root")")"
+  parsed="$(prune_artifact_policy_load "$policy" "$work_root")" || rc=$?
+  if (( rc != 0 )); then
+    echo "artifact-prune refused: $policy — ${parsed#REFUSE	}"
+    return 2
+  fi
+  local jobs_real cls root_name abs_root pattern keep
+  jobs_real="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$jobs_root")"
+  local job jobdir entry real_root is_jobs reason state
+  local scan_out kind match mtime bytes
+  local -a m_kind m_path m_mtime m_bytes todo drop_list
+  local n i k idx poison owner
+  while IFS=$'\t' read -r cls root_name abs_root pattern keep; do
+    [[ -n "$cls" ]] || continue
+    PRUNE_ARTIFACT_ROWS=$(( PRUNE_ARTIFACT_ROWS + 1 ))
+    if [[ ! -d "$abs_root" ]]; then
+      echo "artifact row class=$cls root=$root_name skip=yes reason=root-missing path=$abs_root"
+      continue
+    fi
+    real_root="$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$abs_root")"
+    is_jobs=0
+    [[ "$real_root" == "$jobs_real" ]] && is_jobs=1
+    for entry in "$abs_root"/*/; do
+      jobdir="${entry%/}"
+      [[ -e "$jobdir" && -d "$jobdir" ]] || continue
+      [[ -L "$jobdir" ]] && continue   # never traverse a symlinked job dir
+      job="${jobdir##*/}"
+      [[ -z "$only_job" || "$job" == "$only_job" ]] || continue
+      if [[ -n "$lane" ]]; then
+        owner="$(awk -v j="$job" -F'\t' '$1==j {print $8; exit}' <<<"$PRUNE_SCAN")"
+        [[ "$owner" == "$lane" ]] || continue
+      fi
+      m_kind=() m_path=() m_mtime=() m_bytes=()
+      n=0
+      scan_out="$(prune_artifact_scan "$jobdir" "$pattern")" || {
+        echo "artifact job=$job class=$cls skip=yes reason=scan-failed"
+        continue
+      }
+      while IFS=$'\t' read -r kind match mtime bytes; do
+        [[ -n "$match" ]] || continue
+        m_kind+=("$kind") m_path+=("$match")
+        m_mtime+=("$mtime") m_bytes+=("$bytes")
+        n=$(( n + 1 ))
+        case "$kind" in
+          outside)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=outside-job-dir" ;;
+          guarded)
+            echo "artifact job=$job class=$cls path=$match action=refused reason=never-touch" ;;
+        esac
+      done <<<"$scan_out"
+      (( n )) || continue
+      todo=()
+      if [[ "$cls" == cache ]]; then
+        reason="$(prune_artifact_cache_reason "$job" "$heavy_s")" || true
+        if [[ -n "$reason" ]]; then
+          echo "artifact job=$job class=cache skip=yes reason=$reason matches=$n"
+          continue
+        fi
+        for ((i = 0; i < n; i++)); do todo+=("$i"); done
+      else
+        # intermediate-build: keep the keep_newest newest matches, ordered by
+        # the newest mtime inside each; never delete at or below the count,
+        # and never when any match's mtime is unreadable.
+        poison=0
+        for ((i = 0; i < n; i++)); do
+          [[ "${m_mtime[$i]}" =~ ^[0-9]+$ ]] || poison=1
+        done
+        if (( poison )); then
+          echo "artifact job=$job class=$cls skip=yes reason=mtime-unreadable"
+          continue
+        fi
+        (( n > keep )) || continue
+        drop_list=()
+        k=0
+        while IFS= read -r idx; do
+          [[ -n "$idx" ]] || continue
+          k=$(( k + 1 ))
+          (( k > keep )) && drop_list+=("$idx")
+        done < <(for ((i = 0; i < n; i++)); do
+                   printf '%s\t%s\n' "${m_mtime[$i]}" "$i"
+                 done | sort -rn | cut -f2)
+        todo=(${drop_list[@]+"${drop_list[@]}"})
+      fi
+      for i in ${todo[@]+"${todo[@]}"}; do
+        kind="${m_kind[$i]}"; match="${m_path[$i]}"; bytes="${m_bytes[$i]}"
+        case "$kind" in
+          outside|guarded) continue ;;   # already reported refused above
+        esac
+        if [[ "$match" == */unity/* || "$match" == */unity ]] &&
+           prune_artifact_unity_lock_held; then
+          echo "artifact job=$job class=$cls path=$match action=skipped reason=unity-lock-held"
+          continue
+        fi
+        # A symlink is only ever unlinked, so an open target is no reason to
+        # keep it; a real path with a live open handle stays.
+        if [[ "$kind" != link ]] && prune_artifact_path_in_use "$match"; then
+          echo "artifact job=$job class=$cls path=$match action=skipped reason=path-in-use"
+          continue
+        fi
+        if (( apply )); then
+          local rerr="" rrc=0
+          rerr="$(prune_artifact_remove "$match" 2>&1)" || rrc=$?
+          if (( rrc == 0 )); then
+            echo "artifact job=$job class=$cls path=$match bytes=$bytes action=removed"
+            PRUNE_ARTIFACT_REMOVED=$(( PRUNE_ARTIFACT_REMOVED + 1 ))
+            prune_artifact_record "$job" "$cls" "$match" "$bytes" "$is_jobs" ||
+              warn "artifact record write failed (job=$job path=$match)"
+          else
+            echo "artifact job=$job class=$cls path=$match bytes=$bytes action=failed reason=$rerr"
+          fi
+        else
+          echo "artifact job=$job class=$cls path=$match bytes=$bytes action=would-remove"
+        fi
+      done
+    done
+  done <<<"$parsed"
+  return 0
+}
+
 prune_cmd() {
   local apply=0 stale_age="${WRK_PRUNE_STALE_AGE:-24h}" lane="" only_job=""
+  local heavy_age="${WRK_PRUNE_HEAVY_AGE:-3d}"
+  local policy="${WRK_ARTIFACT_POLICY:-}"
+  [[ -n "$policy" ]] || policy="$(prune_artifact_policy_default)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       -h|--help) prune_help; return 0 ;;
       --apply) apply=1; shift ;;
       --stale-age) [[ $# -ge 2 && -n "$2" ]] || die "--stale-age requires a value"; stale_age="$2"; shift 2 ;;
+      --heavy-age) [[ $# -ge 2 && -n "$2" ]] || die "--heavy-age requires a value"; heavy_age="$2"; shift 2 ;;
+      --policy) [[ $# -ge 2 && -n "$2" ]] || die "--policy requires a value"; policy="$2"; shift 2 ;;
       --lane) [[ $# -ge 2 && -n "$2" ]] || die "--lane requires a value"; lane="$2"; shift 2 ;;
       --job) [[ $# -ge 2 && -n "$2" ]] || die "--job requires a value"; only_job="$2"; shift 2 ;;
       -*) die "unknown prune option '$1'" ;;
       *) die "unexpected argument '$1'" ;;
     esac
   done
-  local stale_s jobs_root
+  local stale_s heavy_s jobs_root
   stale_s="$(parse_duration_s "$stale_age")" || die "invalid --stale-age '$stale_age' (use 86400, 24h or 1d)"
+  heavy_s="$(parse_duration_s "$heavy_age")" || die "invalid --heavy-age '$heavy_age' (use 86400, 24h or 2d)"
   jobs_root="$(wrk_jobs_root)"
   if [[ ! -d "$jobs_root" ]]; then
     echo "prune: no job inbox at $jobs_root"
@@ -13665,7 +14255,19 @@ for row in doc.get("quota_pool_records") or []:
     fi
   done < <(find "$jobs_root" -maxdepth 2 -name quota-refresh.pid -type f 2>/dev/null | sort)
 
-  echo "prune: orphans=$PRUNE_ORPHANS stale_jobs=$stale_n quota_release_jobs=$quota_releases refresh_leftovers=$left_n ($_mode)"
+  # Pass 6 — artifact classes (hk 2090): cache and intermediate-build rows
+  # from the artifact policy file. Cache prunes only for a fully cold job —
+  # ended, its hk task merged or dropped, no live sentinel or pane, past
+  # --heavy-age — while intermediate builds keep only their keep_newest
+  # newest in any job state. A refused policy fails the run; a per-path
+  # failure skips and continues.
+  local artifact_rc=0
+  PRUNE_ARTIFACT_ROWS=0 PRUNE_ARTIFACT_REMOVED=0
+  prune_artifact_pass "$apply" "$heavy_s" "$only_job" "$lane" "$policy" "$jobs_root" ||
+    artifact_rc=$?
+
+  echo "prune: orphans=$PRUNE_ORPHANS stale_jobs=$stale_n quota_release_jobs=$quota_releases refresh_leftovers=$left_n artifact_rows=${PRUNE_ARTIFACT_ROWS:-0} artifact_removed=${PRUNE_ARTIFACT_REMOVED:-0} ($_mode)"
+  return "$artifact_rc"
 }
 
 find_cmd() {
