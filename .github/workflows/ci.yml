@@ -218,6 +218,24 @@ jobs:
       - name: Run suite shard
         shell: bash
         run: |
+          if [[ "${{ matrix.shard }}" == python ]]; then
+            CI_PY_TMP="$(mktemp -d /tmp/wrkci.XXXXXX)"
+            mkdir -p "$CI_PY_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
+            export HOME="$CI_PY_TMP/home" XDG_CONFIG_HOME="$CI_PY_TMP/config"
+            export XDG_DATA_HOME="$CI_PY_TMP/data" XDG_CACHE_HOME="$CI_PY_TMP/cache"
+            export XDG_STATE_HOME="$CI_PY_TMP/state" XDG_RUNTIME_DIR="$CI_PY_TMP/runtime"
+            export XDG_CONFIG_DIRS="$CI_PY_TMP/config" XDG_DATA_DIRS="$CI_PY_TMP/data"
+            export CODEX_HOME="$CI_PY_TMP/codex" ARBITER_INBOX_ROOT="$CI_PY_TMP/jobs"
+            export TMPDIR="$CI_PY_TMP" WRK_TEST_MODE=1
+            cleanup_python_shard() {
+              local original_rc=$? cleanup_rc=0
+              . "$GITHUB_WORKSPACE/tests/lib/tmp-writers.sh"
+              TW_TMP="$CI_PY_TMP" ROOT="$GITHUB_WORKSPACE" tmp_writers_stop || cleanup_rc=$?
+              if (( cleanup_rc == 0 )); then rm -rf "$CI_PY_TMP"; else original_rc=$cleanup_rc; fi
+              exit "$original_rc"
+            }
+            trap cleanup_python_shard EXIT
+          fi
           while IFS='|' read -r shard command; do
             [[ -n "$shard" && "$shard" != \#* ]] || continue
             if [[ "$shard" == "${{ matrix.shard }}" ]]; then
@@ -265,6 +283,24 @@ jobs:
         run: |
           while IFS='|' read -r shard command; do
             [[ -n "$shard" && "$shard" != \#* ]] || continue
+            if [[ "$shard" == python && -z "${CI_PY_TMP:-}" ]]; then
+              CI_PY_TMP="$(mktemp -d /tmp/wrkci.XXXXXX)"
+              mkdir -p "$CI_PY_TMP"/{home,config,data,cache,state,runtime,codex,jobs}
+              export HOME="$CI_PY_TMP/home" XDG_CONFIG_HOME="$CI_PY_TMP/config"
+              export XDG_DATA_HOME="$CI_PY_TMP/data" XDG_CACHE_HOME="$CI_PY_TMP/cache"
+              export XDG_STATE_HOME="$CI_PY_TMP/state" XDG_RUNTIME_DIR="$CI_PY_TMP/runtime"
+              export XDG_CONFIG_DIRS="$CI_PY_TMP/config" XDG_DATA_DIRS="$CI_PY_TMP/data"
+              export CODEX_HOME="$CI_PY_TMP/codex" ARBITER_INBOX_ROOT="$CI_PY_TMP/jobs"
+              export TMPDIR="$CI_PY_TMP" WRK_TEST_MODE=1
+              cleanup_python_shard() {
+                local original_rc=$? cleanup_rc=0
+                . "$GITHUB_WORKSPACE/tests/lib/tmp-writers.sh"
+                TW_TMP="$CI_PY_TMP" ROOT="$GITHUB_WORKSPACE" tmp_writers_stop || cleanup_rc=$?
+                if (( cleanup_rc == 0 )); then rm -rf "$CI_PY_TMP"; else original_rc=$cleanup_rc; fi
+              exit "$original_rc"
+              }
+              trap cleanup_python_shard EXIT
+            fi
             echo "::group::$shard: $command"
             bash -c "$command"
             echo '::endgroup::'
