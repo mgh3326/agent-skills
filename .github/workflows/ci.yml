@@ -41,7 +41,6 @@ jobs:
           fi
       - name: ShellCheck
         run: |
-          mapfile -t fixture_scripts < <(find tests/fixtures -maxdepth 1 -type f ! -name '*.json' ! -name 'handoffkeep' -perm -111 -print)
           shellcheck bin/wrk tests/test-wrk.sh tests/wrk_spillover.sh \
             tests/test-openai-independent-gate.sh \
             tests/test-builder-path.sh \
@@ -80,7 +79,17 @@ jobs:
             tests/fixtures/fleet-rev/panewire \
             tests/fixtures/fleet-rev/handoffkeep \
             tests/fixtures/fleet-rev/go \
-            "${fixture_scripts[@]}"
+            tests/fixtures/arbiter-legacy \
+            tests/fixtures/arbiter-proxy \
+            tests/fixtures/herdr \
+            tests/fixtures/panewire \
+            tests/fixtures/pi \
+            tests/fixtures/scopefuel \
+            tests/fixtures/spillover-herdr \
+            tests/fixtures/spillover-hub-curl \
+            tests/fixtures/spillover-panewire \
+            tests/fixtures/spillover-scp \
+            tests/fixtures/spillover-ssh
 
   changes:
     name: changes
