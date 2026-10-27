@@ -5152,6 +5152,11 @@ case_gone_symlink() {
     recovery_stop; return 1
   fi
   gone_no_job_lost "$job" || { echo "FAIL: $job: a job.lost was written" >&2; recovery_stop; return 1; }
+  # hk 2096's EXIT record must not append through the symlink into the target.
+  if grep -q 'sentinel-exit' "$INBOX/$job/completion-sentinel.log" 2>/dev/null; then
+    echo "FAIL: $job: the exit wrote a log line through the symlink" >&2
+    recovery_stop; return 1
+  fi
   recovery_stop
 }
 
@@ -5175,6 +5180,7 @@ case_gone_never_events_m42() { case_gone_never_events je54m42; }
 case_gone_root_m43() { case_gone_root je54m43; }
 case_gone_symlink_m44() { case_gone_symlink je54m44 jobdir; }
 case_gone_symlink_m45() { case_gone_symlink je54m45 events; }
+case_gone_symlink_m46() { case_gone_symlink je54m46 jobdir; }
 
 # hk1892 mutants: each load-bearing piece of the rule is pinned to its case.
 mkmut_span r40-no-check \
@@ -5194,7 +5200,7 @@ expect_mut_red "R42 a never-created events dir is not absence" case_gone_never_e
   'FAIL: je54m42: a never-created events dir is not absence'
 
 mkmut r43-release-before-exit \
-  's~(( gone < SENTINEL_GONE_POLLS )) || sentinel_self_exit "\$job" 0~(( gone < SENTINEL_GONE_POLLS )) || { "$ARBITER_BIN" release --job "$job" --resource claude --kind quota_pool; sentinel_self_exit "$job" 0; }~'
+  's~(( gone < SENTINEL_GONE_POLLS )) || { SENTINEL_EXIT_LOGFILE=/dev/null; sentinel_self_exit "\$job" 0; }~(( gone < SENTINEL_GONE_POLLS )) || { "$ARBITER_BIN" release --job "$job" --resource claude --kind quota_pool; sentinel_self_exit "$job" 0; }~'
 expect_mut_red "R43 no release before the exit" case_gone_root_m43 \
   'FAIL: je54m43: a release ran before the exit'
 
@@ -5207,6 +5213,11 @@ mkmut r45-follow-events-symlink \
   's~ || -L "\$jobdir/events" ) )~ ) )~'
 expect_mut_red "R45 a symlinked events dir counts as gone" case_gone_symlink_m45 \
   'FAIL: je54m45: a symlink replacing the events must count as gone'
+
+mkmut r46-exit-record-through-symlink \
+  's~{ SENTINEL_EXIT_LOGFILE=/dev/null; sentinel_self_exit~{ sentinel_self_exit~'
+expect_mut_red "R46 the gone exit writes no log line" case_gone_symlink_m46 \
+  'FAIL: je54m46: the exit wrote a log line through the symlink'
 
 # ── hk1933: wrk restore — a same-pane restore after a false loss ──────────
 # The 10-23 false loss was restored by hand: arbiter claim --reclaim-released,
