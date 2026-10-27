@@ -682,6 +682,42 @@ class HeavyQueue(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - start, .9)
         self.assertLess(time.monotonic() - start, 4)
 
+    def test_base_reader_accepts_new_record(self):
+        # These two unchanged functions are the in-repo 1a9ded3 reader logic:
+        # record_head reads exactly three tokens; record_ticket reads token four.
+        source = WRK.read_text().split("heavy_cmd() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        tree = ast.parse(source)
+        nodes = [n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ("record_head", "record_ticket")]
+        self.assertEqual(len(nodes), 2)
+        ns = {"re": re}
+        exec(compile(ast.Module(body=nodes, type_ignores=[]), "base readers", "exec"), ns)
+        holder = self.start("base-compatible", WRK_HEAVY_CLASS="ci", WRK_HEAVY_MAX="2")
+        info = self.lock.read_text()
+        pid = int(info.split()[0].split("=")[1])
+        self.assertEqual(ns["record_head"](info), (pid, "ci", 2),
+                         "base reader lost pid, class or limit from new record")
+        self.assertEqual(ns["record_ticket"](info), self.ticket(info),
+                         "base reader lost ticket from new record")
+        self.assertTrue(info.split()[4].startswith("start="), "identity must be token five")
+        self.release("base-compatible")
+        self.assertEqual(holder.wait(timeout=5), 0)
+
+    def test_start_after_pid_mutant_is_assertion_red(self):
+        old = 'info = info.replace(" since=", " ticket=%d:%d start=%s since=" %\n                    (*ticket, process_start(os.getpid()) or "unknown"), 1)'
+        new = ('info = info.replace(" class=", " start=%s class=" %\n'
+               '                    (process_start(os.getpid()) or "unknown"), 1)\n'
+               'info = info.replace(" since=", " ticket=%d:%d since=" % ticket, 1)')
+        binary = self.instrument("start-after-pid", old, new)
+        result = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                 "HeavyQueue.test_base_reader_accepts_new_record"],
+            env=dict(self.env, WRK_QUEUE_TEST_BIN=str(binary)), capture_output=True,
+            text=True, timeout=40, check=False)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("AssertionError:", result.stderr)
+        self.assertIn("base reader lost pid, class or limit", result.stderr)
+        self.assertNotIn("ERROR:", result.stderr)
+
     def test_process_start_platform_methods(self):
         source = WRK.read_text().split("heavy_cmd() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
         tree = ast.parse(source)

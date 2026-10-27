@@ -12881,7 +12881,8 @@ def process_start(pid):
 
 def record_start(text):
     # Preserve pid/class/limit/ticket offsets for mixed-version readers.
-    # Only field five belongs to the new fixed head; cmd text is never identity.
+    # Fixed token five follows ticket: base readers keep all four original offsets.
+    # Later cmd text is never identity.
     fields = text.split(None, 5)
     return fields[4][6:] if len(fields) >= 5 and fields[4].startswith("start=") else None
 
