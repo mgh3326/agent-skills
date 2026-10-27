@@ -1,0 +1,57 @@
+{
+  "comment": "hk 1941 (K2): rule data for director/bin/area-propose. Source: hk:doc reports/b953/hk1938-kind-grading-packet, section 1 mapping rule and appendix keyword table. All patterns are regular expressions matched case-insensitively; the first entry in each list wins. Edit the data here, never the tool. hk 2012 (K2 rule tuning): shell-wrk and trading title entries before docs and ops, scoped by a projects list where \"\" is projectless; a product repo keeps its default unless a title names an area in project_areas, and fleet_projects keep the title order; Korean fleet keywords last; tripwire uses a lookbehind because \\b does not split trust_tripwire. hk 2100: the projectless web-frontend pattern 홈 전환 was dropped as a per-title special case (it matched 1 of 2065 tasks; director-1 forbids per-title rules), and the pattern-hits subcommand guards new patterns against that.",
+  "fleet_projects": ["agent-skills", "handoffkeep", "panewire", "admiral"],
+  "project_areas": {"ParkingArcade": ["blender", "web-qa", "web-frontend"]},
+  "version": 3,
+  "exclude_title_patterns": [
+    "\\bsmoke\\b",
+    "\\bthrowaway\\b"
+  ],
+  "file_area_patterns": [
+    {"area": "blender", "patterns": ["\\.(blend|fbx|glb)$", "(^|/)Tools/blender/"]},
+    {"area": "unity", "patterns": ["(^|/)Assets/.*\\.(cs|unity|prefab|meta)$"]},
+    {"area": "web-qa", "patterns": ["(^|/)Tools/WebQA/", "playwright\\.config"]},
+    {"area": "docs", "patterns": ["(^|/)docs/", "\\.md$", "(^|/)README(\\..*)?$", "(^|/)LICENSE$", "(^|/)CHANGELOG"]},
+    {"area": "web-frontend", "patterns": ["(^|/)web/", "\\.(tsx|jsx|css|html)$"]},
+    {"area": "go-backend", "patterns": ["\\.go$", "(^|/)go\\.(mod|sum)$"]},
+    {"area": "python", "patterns": ["\\.py$", "(^|/)pyproject\\.toml$"]},
+    {"area": "shell-wrk", "patterns": ["\\.sh$", "(^|/)bin/"]},
+    {"area": "ops", "patterns": ["\\.(service|timer)$", "(^|/)deploy/", "(^|/)systemd/"]}
+  ],
+  "title_keywords": [
+    {"area": "blender", "patterns": ["\\bblender\\b", "\\bmeshy\\b", "\\bblockout\\b", "\\bretopo\\b", "\\bglb\\b", "\\blod0\\b", "\\bpart-split\\b", "\\bmodelling\\b", "\\b3d asset\\b", "\\bwheel ends\\b", "\\blamps\\s+v\\d+\\b", "\\bcockpit\\s+v\\d+\\b", "\\bbody\\s+v\\d+\\b", "\\bdetails round\\b", "\\breplica garage\\b", "\\bgarage kit\\b", "\\bexterior details\\b", "\\bvehicle art\\b", "\\breference-led\\b", "\\breference fit\\b", "\\bg90 method\\b", "\\bref-mesh\\b"]},
+    {"area": "web-qa", "patterns": ["\\bweb qa\\b", "\\bwebqa\\b", "\\bweb-play\\b", "\\bplaywright\\b", "\\blayout-check\\b", "\\bmake-bundle\\b"]},
+    {"area": "ui-design", "patterns": ["\\bpenpot\\b", "\\bdesign token\\b", "\\bcanva\\b", "\\bfigma\\b", "\\bds world\\b", "\\bds hud\\b"]},
+    {"area": "image", "patterns": ["\\bimage gen\\b", "\\bicon set\\b", "\\bapp icon\\b", "\\bsprite\\b", "\\btexture maps\\b", "\\bcaptures for design\\b", "\\bhero art\\b"]},
+    {"area": "research", "patterns": ["\\bread-only\\b", "\\bresearch\\b", "\\bconsult\\b", "\\bsurvey\\b", "\\bdesign packet\\b", "\\bmeasurement only\\b", "\\bevaluator\\b", "\\bidentification map\\b"]},
+    {"area": "trading", "projects": ["", "auto_trader", "auto_trader-operator", "robin-prefect-automations", "strategy-lab", "fillwire"], "patterns": ["주문", "종목", "시장"]},
+    {"area": "python", "projects": [""], "patterns": ["\\bscopefuel\\b", "\\bexperiment\\b"]},
+    {"area": "trading", "projects": [""], "patterns": ["\\bauto_trader\\b", "\\brobin-prefect-automations\\b", "\\bstrategy-lab\\b", "\\bfillwire\\b"]},
+    {"area": "unity", "projects": [""], "patterns": ["\\bparkingarcade\\b"]},
+    {"area": "shell-wrk", "projects": ["", "agent-skills"], "patterns": ["\\bwrk\\b", "\\bwrk round\\b", "\\bround cap\\b", "\\btester\\b"]},
+    {"area": "shell-wrk", "projects": ["", "agent-skills", "handoffkeep", "panewire", "admiral"], "patterns": ["\\bsentinel\\b", "\\bworktree\\b", "(?<![a-z])tripwire\\b", "\\barbiter\\b"]},
+    {"area": "docs", "patterns": ["\\bskill\\.md\\b", "\\bplaybook\\b", "\\bdoc only\\b", "\\bdocs only\\b", "\\brelease-doc\\b", "\\bprivacy policy\\b", "\\breadme\\b"]},
+    {"area": "web-frontend", "patterns": ["\\bhk console\\b", "\\bconsole\\b", "/ui/", "\\bdrawer\\b", "\\bvitest\\b", "\\bfrontend\\b", "\\bbrewdial\\b", "\\bturn-timer\\b"]},
+    {"area": "ops", "patterns": ["\\bdeploy\\b", "\\binstall\\b", "\\breboot\\b", "\\brestart\\b", "\\bsystemd\\b", "\\brotation\\b"]},
+    {"area": "go-backend", "projects": [""], "patterns": ["\\bhandoffkeep\\b", "\\bpanewire\\b", "\\badmiral\\b"]},
+    {"area": "shell-wrk", "projects": [""], "patterns": ["\\bagent-skills\\b", "\\bbin/wrk\\b"]},
+    {"area": "shell-wrk", "projects": [""], "patterns": ["\\bbuilder\\b", "\\bspawn-worker\\b"]},
+    {"area": "web-frontend", "projects": ["", "agent-skills", "handoffkeep", "panewire", "admiral"], "patterns": ["콘솔"]}
+  ],
+  "project_defaults": {
+    "ParkingArcade": "unity",
+    "handoffkeep": "go-backend",
+    "panewire": "go-backend",
+    "admiral": "go-backend",
+    "scopefuel": "python",
+    "experiment": "python",
+    "auto_trader": "trading",
+    "auto_trader-operator": "trading",
+    "robin-prefect-automations": "trading",
+    "strategy-lab": "trading",
+    "fillwire": "trading",
+    "agent-skills": "shell-wrk",
+    "brewdial": "web-frontend",
+    "turn-timer": "web-frontend"
+  }
+}

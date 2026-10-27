@@ -1,0 +1,472 @@
+#!/usr/bin/env python3
+"""One-time area backfill proposal tool for hk tasks (hk 1937 K2, b953).
+
+propose (default, read-only) lists every task through `handoffkeep tasks
+list --state S --limit N` — one call per state because the bare list
+truncates — and applies the section-1 mapping rule in order:
+
+  1. an existing task area always wins;
+  2. changed files, only when the task has a PR ref and --with-files is
+     given (`gh pr view <ref> --json files`; the area owning >=60% of
+     changed lines wins, skipped and noted when gh is unavailable);
+  3. title keywords from director/area-rules.json (never inline regex); an
+     entry with a "projects" list applies only to those projects, where ""
+     is the projectless task (hk 2012: fleet terms stay off product repos);
+     a product repo (a project default outside fleet_projects) keeps its
+     default unless the title area is in project_areas for that project,
+     or the title opens with an exact [area] tag naming a known area; a
+     fleet repo's default holds unless the title area is shell-wrk;
+  4. the project default from the same file.
+
+Smoke/throwaway titles are excluded before the files stage — the packet
+excludes them from classification outright. Every task produces a TSV
+row: id, project, title (truncated), current_area, proposed_area,
+source, rule, confirm. Nothing is ever written in propose mode.
+
+apply --file reviewed.tsv --by NAME is the write side, meant to be run
+by director-1 after a person reviews the proposal TSV. Only rows whose
+confirm column is exactly `yes` or a vocabulary value are written; a
+value overrides the proposal. Each write goes through
+`handoffkeep tasks set-area N A --note "area-propose <file sha256
+prefix>"`. The task's live area is re-read before every write: equal to
+the target means skip (re-runs are idempotent), equal to the recorded
+proposal-time area means write, anything else means the task changed
+since the proposal and the row is refused.
+
+pattern-hits [--min N] (read-only, hk 2100) is a guard against per-title
+rules: it walks the same per-state task list as propose and prints, for
+every title_keywords pattern, how many in-scope tasks' titles it matches
+(the entry's "projects" list is the scope; "" is the projectless task).
+It exits 1 when any scoped pattern matches fewer than N tasks (N 3 by
+default) and names those patterns on the last lines.
+
+The vocabulary always comes from `handoffkeep tasks areas`, never from
+a hard-coded list. Binary overrides for tests: HANDOFFKEEP_BIN, GH_BIN.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import io
+import json
+import os
+from pathlib import Path
+import random
+import re
+import shutil
+import subprocess
+import sys
+
+STATES = ("backlog", "claimed", "in_progress", "verifying", "join",
+          "hold", "needs_decision", "merged", "dropped")
+LIST_LIMIT = 1000  # the server's accepted maximum
+TITLE_WIDTH = 60
+FILE_RULE_MIN_SHARE = 0.6
+TAG_RE = re.compile(r"\[([^\[\]]+)\]")
+COLUMNS = ("id", "project", "title", "current_area", "proposed_area",
+           "source", "rule", "confirm")
+
+
+def die(msg: str, rc: int = 2) -> None:
+    print(f"area-propose: {msg}", file=sys.stderr)
+    sys.exit(rc)
+
+
+def note(msg: str) -> None:
+    print(f"area-propose: note: {msg}", file=sys.stderr)
+
+
+def run_json(argv: list[str]) -> dict:
+    try:
+        proc = subprocess.run(argv, text=True, capture_output=True,
+                              timeout=60)
+    except FileNotFoundError:
+        die(f"binary not found: {argv[0]}")
+    except subprocess.TimeoutExpired:
+        die(f"timeout running: {argv[0]}")
+    if proc.returncode != 0:
+        die(f"{' '.join(argv[:2])} failed rc={proc.returncode}: "
+            f"{proc.stderr.strip()}")
+    try:
+        return json.loads(proc.stdout)
+    except ValueError:
+        die(f"{' '.join(argv[:2])} returned non-JSON output")
+
+
+def hk_bin() -> str:
+    return os.environ.get("HANDOFFKEEP_BIN") or "handoffkeep"
+
+
+def areas_vocabulary() -> list[str]:
+    doc = run_json([hk_bin(), "tasks", "areas"])
+    areas = doc.get("areas")
+    if not isinstance(areas, list) or not all(
+            isinstance(a, str) and a for a in areas):
+        die("tasks areas returned no usable vocabulary")
+    return areas
+
+
+def list_state_tasks(state: str) -> list[dict]:
+    doc = run_json([hk_bin(), "tasks", "list", "--state", state,
+                    "--limit", str(LIST_LIMIT)])
+    tasks = doc.get("tasks")
+    if not isinstance(tasks, list):
+        die(f"tasks list --state {state} returned no task list")
+    if len(tasks) >= LIST_LIMIT:
+        note(f"state {state} returned {LIST_LIMIT} rows; output may be "
+             "truncated")
+    return tasks
+
+
+def load_rules(path: Path, vocabulary: list[str]) -> dict:
+    try:
+        rules = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        die(f"rules file unreadable: {path}: {exc}")
+    for key in ("exclude_title_patterns", "file_area_patterns",
+                "title_keywords", "project_defaults"):
+        if key not in rules:
+            die(f"rules file missing {key}: {path}")
+    known = set(vocabulary)
+    used = ({entry.get("area") for entry in rules["file_area_patterns"]}
+            | {entry.get("area") for entry in rules["title_keywords"]}
+            | set(rules["project_defaults"].values()))
+    unknown = used - known
+    if unknown:
+        die(f"rules file names areas outside the hk vocabulary: "
+            f"{sorted(unknown)}")
+    for entry in rules["title_keywords"]:
+        scope = entry.get("projects")
+        if scope is not None and not (
+                isinstance(scope, list)
+                and all(isinstance(p, str) for p in scope)):
+            die(f"rules file holds a bad projects scope: {entry.get('area')}")
+    rules.setdefault("fleet_projects", [])
+    rules.setdefault("project_areas", {})
+    if not (isinstance(rules["fleet_projects"], list)
+            and all(isinstance(p, str) for p in rules["fleet_projects"])):
+        die("rules file holds a bad fleet_projects list")
+    if not (isinstance(rules["project_areas"], dict) and all(
+            isinstance(v, list) and all(isinstance(a, str) for a in v)
+            for v in rules["project_areas"].values())):
+        die("rules file holds a bad project_areas map")
+    named = {a for v in rules["project_areas"].values() for a in v}
+    if named - known:
+        die(f"rules file names specific areas outside the hk vocabulary: "
+            f"{sorted(named - known)}")
+    rules["_areas"] = known
+    try:
+        rules["_exclude"] = [re.compile(p, re.IGNORECASE)
+                             for p in rules["exclude_title_patterns"]]
+        for section in ("file_area_patterns", "title_keywords"):
+            for entry in rules[section]:
+                entry["_re"] = [re.compile(p, re.IGNORECASE)
+                                for p in entry["patterns"]]
+    except re.error as exc:
+        die(f"rules file holds a bad pattern: {exc}")
+    return rules
+
+
+def clean(value: object) -> str:
+    text = "" if value is None else str(value)
+    return re.sub(r"[\t\r\n]+", " ", text).strip()
+
+
+def classify_path(path: str, rules: dict) -> str | None:
+    for entry in rules["file_area_patterns"]:
+        if any(p.search(path) for p in entry["_re"]):
+            return entry["area"]
+    return None
+
+
+def files_area(pr_ref: str, rules: dict, gh: str,
+               gh_missing: list[bool]) -> tuple[str | None, int]:
+    """Return (area, percent) or (None, 0) when the rule cannot fire."""
+    if gh_missing:
+        return None, 0
+    try:
+        proc = subprocess.run([gh, "pr", "view", pr_ref, "--json", "files"],
+                              text=True, capture_output=True, timeout=30)
+    except FileNotFoundError:
+        note("gh unavailable; files rule skipped for all tasks")
+        gh_missing.append(True)
+        return None, 0
+    except subprocess.TimeoutExpired:
+        note(f"gh pr view timed out for {pr_ref}; files rule skipped")
+        return None, 0
+    if proc.returncode != 0:
+        note(f"gh pr view {pr_ref} failed rc={proc.returncode}; "
+             "files rule skipped")
+        return None, 0
+    try:
+        files = json.loads(proc.stdout).get("files") or []
+    except ValueError:
+        note(f"gh pr view {pr_ref} returned non-JSON; files rule skipped")
+        return None, 0
+    per_area: dict[str, int] = {}
+    total = 0
+    for f in files:
+        try:
+            lines = int(f.get("additions") or 0) + int(f.get("deletions") or 0)
+        except (TypeError, ValueError):
+            continue
+        total += lines
+        area = classify_path(str(f.get("path") or ""), rules)
+        if area:
+            per_area[area] = per_area.get(area, 0) + lines
+    if not total or not per_area:
+        return None, 0
+    area, lines = max(per_area.items(), key=lambda kv: kv[1])
+    if lines / total >= FILE_RULE_MIN_SHARE:
+        return area, round(100 * lines / total)
+    return None, 0
+
+
+def classify(task: dict, rules: dict, with_files: bool, gh: str,
+             gh_missing: list[bool]) -> tuple[str, str, str]:
+    """Return (proposed_area, source, rule)."""
+    current = clean(task.get("area"))
+    if current:
+        return current, "existing", "existing"
+    title = clean(task.get("title"))
+    for pattern in rules["_exclude"]:
+        if pattern.search(title):
+            return "", "-", f"excluded:{pattern.pattern}"
+    if with_files:
+        pr_ref = clean((task.get("refs") or {}).get("pr"))
+        if pr_ref:
+            area, pct = files_area(pr_ref, rules, gh, gh_missing)
+            if area:
+                return area, "files", f"files:{pct}%"
+    project = clean(task.get("project"))
+    default = rules["project_defaults"].get(project)
+    # hk 2012 rule 1: a repo default holds unless a title term names an area
+    # it allows: a product repo's own specific areas, or shell-wrk on a
+    # fleet repo.
+    specific = {default} | set(rules["project_areas"].get(project, []))
+    if default and project in rules["fleet_projects"]:
+        specific = {default, "shell-wrk"}
+    # hk 2012 tag rule: an exact leading [area] tag naming a known area
+    # states the area outright and overrides a repo default.
+    tag = TAG_RE.match(title)
+    if default and tag and tag.group(1) in rules["_areas"]:
+        return tag.group(1), "title", f"tag:[{tag.group(1)}]"
+    for entry in rules["title_keywords"]:
+        scope = entry.get("projects")
+        if scope is not None and project not in scope:
+            continue
+        if default and entry["area"] not in specific:
+            continue
+        for pattern in entry["_re"]:
+            if pattern.search(title):
+                return entry["area"], "title", f"title:{pattern.pattern}"
+    if default:
+        return default, "project", f"project:{project}"
+    return "", "-", "-"
+
+
+def all_tasks(states: str) -> dict[int, dict]:
+    tasks: dict[int, dict] = {}
+    for state in states.split(","):
+        for task in list_state_tasks(state.strip()):
+            if isinstance(task.get("id"), int):
+                tasks[task["id"]] = task
+    return tasks
+
+
+def cmd_propose(args: argparse.Namespace) -> int:
+    if args.sample is not None and args.sample < 0:
+        die("--sample must be non-negative")
+    vocabulary = areas_vocabulary()
+    rules = load_rules(args.rules, vocabulary)
+    tasks = all_tasks(args.states)
+    gh = os.environ.get("GH_BIN") or "gh"
+    gh_missing: list[bool] = []
+    if args.with_files and not shutil.which(gh):
+        note("gh unavailable; files rule skipped for all tasks")
+        gh_missing.append(True)
+    rows = []
+    for tid in sorted(tasks):
+        task = tasks[tid]
+        area, source, rule = classify(task, rules, args.with_files,
+                                      gh, gh_missing)
+        rows.append([str(tid), clean(task.get("project")),
+                     clean(task.get("title"))[:TITLE_WIDTH],
+                     clean(task.get("area")), area, source, rule, ""])
+    if args.sample is not None:
+        rng = random.Random(args.seed)
+        keep = sorted(rng.sample(range(len(rows)),
+                                 min(args.sample, len(rows))))
+        rows = [rows[i] for i in keep]
+    out = csv.writer(sys.stdout, delimiter="\t", lineterminator="\n")
+    out.writerow(COLUMNS)
+    out.writerows(rows)
+    return 0
+
+
+def cmd_pattern_hits(args: argparse.Namespace) -> int:
+    if args.min < 0:
+        die("--min must be non-negative")
+    rules = load_rules(args.rules, areas_vocabulary())
+    tasks = sorted(all_tasks(args.states).values(),
+                   key=lambda t: t["id"])
+    under: list[tuple[str, int]] = []
+    for entry in rules["title_keywords"]:
+        scope = entry.get("projects")
+        pool = [t for t in tasks
+                if scope is None or clean(t.get("project")) in scope]
+        label = json.dumps(scope) if scope is not None else "*"
+        for pattern, compiled in zip(entry["patterns"], entry["_re"]):
+            hits = sum(1 for t in pool
+                       if compiled.search(clean(t.get("title"))))
+            print(f"hits={hits}\tarea={entry['area']}\tscope={label}"
+                  f"\tpattern={pattern}")
+            if hits < args.min:
+                under.append((pattern, hits))
+    for pattern, hits in under:
+        print(f"under-min\tpattern={pattern}\thits={hits}\tmin={args.min}")
+    return 1 if under else 0
+
+
+def cmd_apply(args: argparse.Namespace) -> int:
+    if not args.by.strip():
+        die("--by must be a non-empty name")
+    vocabulary = set(areas_vocabulary())
+    try:
+        blob = Path(args.file).read_bytes()
+    except OSError as exc:
+        die(f"review file unreadable: {args.file}: {exc}")
+    digest = hashlib.sha256(blob).hexdigest()[:8]
+    rows = list(csv.reader(io.StringIO(blob.decode("utf-8", "replace")),
+                           delimiter="\t"))
+    if not rows:
+        die("review file is empty")
+    header = [clean(c) for c in rows[0]]
+    if len(set(header)) != len(header):
+        die("review file header has duplicate column names")
+    missing = [c for c in ("id", "current_area", "proposed_area", "confirm")
+               if c not in header]
+    if missing:
+        die(f"review file header missing columns: {missing}")
+    col = {name: header.index(name) for name in header}
+
+    def field(row: list[str], name: str) -> str:
+        return clean(row[col[name]]) if col[name] < len(row) else ""
+
+    wrote = skipped = refused = failed = 0
+    for row in rows[1:]:
+        if not row or all(not clean(c) for c in row):
+            continue
+        tid, recorded = field(row, "id"), field(row, "current_area")
+        confirm, proposed = field(row, "confirm"), field(row, "proposed_area")
+        if not tid.isdigit() or int(tid) < 1:
+            refused += 1
+            note(f"row refused: bad task id {tid!r}")
+            continue
+        if not confirm:
+            skipped += 1
+            continue
+        if confirm == "yes":
+            target = proposed
+            if not target:
+                skipped += 1
+                note(f"task {tid}: confirm=yes but no proposal; skipped")
+                continue
+        elif confirm in vocabulary:
+            target = confirm
+        else:
+            refused += 1
+            note(f"task {tid}: confirm value {confirm!r} is not 'yes' or "
+                 "a vocabulary area; refused")
+            continue
+        if target not in vocabulary:
+            refused += 1
+            note(f"task {tid}: target area {target!r} not in vocabulary; "
+                 "refused")
+            continue
+        try:
+            live = run_json([hk_bin(), "tasks", "show", tid])
+        except SystemExit:
+            refused += 1
+            note(f"task {tid}: re-read failed; refused")
+            continue
+        live_area = clean(live.get("area"))
+        if live_area == target:
+            skipped += 1
+            print(f"skip id={tid} area={target} (already set)")
+            continue
+        if live_area != recorded:
+            refused += 1
+            note(f"task {tid}: area changed since proposal "
+                 f"(recorded={recorded or '-'} live={live_area or '-'}); "
+                 "refused")
+            continue
+        proc = subprocess.run(
+            [hk_bin(), "tasks", "set-area", tid, target,
+             "--note", f"area-propose {digest}"],
+            text=True, capture_output=True, timeout=60)
+        if proc.returncode != 0:
+            failed += 1
+            note(f"task {tid}: set-area failed rc={proc.returncode}: "
+                 f"{proc.stderr.strip()}")
+            continue
+        wrote += 1
+        print(f"wrote id={tid} area={target} by={args.by}")
+    print(f"summary: wrote={wrote} skipped={skipped} refused={refused} "
+          f"failed={failed} by={args.by} file={digest}")
+    return 1 if failed else 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="area-propose",
+        description="Propose hk task areas (read-only) or apply a reviewed "
+                    "proposal file. apply is meant to be run by director-1 "
+                    "after human review; this tool never applies on its "
+                    "own.")
+    sub = parser.add_subparsers(dest="mode")
+    p = sub.add_parser("propose", help="read-only proposal TSV (default)")
+    p.add_argument("--with-files", action="store_true",
+                   help="consult gh pr view files for PR-bearing tasks")
+    p.add_argument("--states", default=",".join(STATES),
+                   help="comma-separated hk task states to scan")
+    p.add_argument("--sample", type=int, metavar="N",
+                   help="print only N randomly chosen proposal rows")
+    p.add_argument("--seed", type=int, default=0,
+                   help="random seed for --sample")
+    p.add_argument("--rules", type=Path,
+                   default=Path(__file__).resolve().parents[1]
+                   / "area-rules.json",
+                   help="mapping-rule data file")
+    a = sub.add_parser("apply", help="write confirmed rows via tasks "
+                       "set-area; director-1 runs this after review")
+    a.add_argument("--file", required=True, help="reviewed proposal TSV")
+    a.add_argument("--by", required=True,
+                   help="name recorded on each write line")
+    h = sub.add_parser("pattern-hits", help="read-only per-pattern title "
+                       "census; exits 1 when a scoped pattern matches "
+                       "under --min tasks")
+    h.add_argument("--min", type=int, default=3, metavar="N",
+                   help="minimum scoped hits per pattern (default 3)")
+    h.add_argument("--states", default=",".join(STATES),
+                   help="comma-separated hk task states to scan")
+    h.add_argument("--rules", type=Path,
+                   default=Path(__file__).resolve().parents[1]
+                   / "area-rules.json",
+                   help="mapping-rule data file")
+    argv = sys.argv[1:]
+    if not argv or argv[0] not in ("propose", "apply", "pattern-hits",
+                                   "-h", "--help"):
+        argv = ["propose"] + argv
+    args = parser.parse_args(argv)
+    if args.mode == "apply":
+        return cmd_apply(args)
+    if args.mode == "pattern-hits":
+        return cmd_pattern_hits(args)
+    return cmd_propose(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

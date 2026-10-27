@@ -5,6 +5,7 @@ set -euo pipefail
 # (fixture 전용 — 프로덕션 매핑은 scopefuel 하나가 소유한다).
 pool_for() {
   case "$1" in
+    pi-haiku55|pi-sonnet55|pi-opus55) echo anthropic-api ;;
     opus|sonnet|fable|haiku) echo claude ;;
     # hk 1604: each devin gate spelling stays in scopefuel's single devin pool.
     # Builder seats are not gate names; wrk asks for the runtime profile.
@@ -47,6 +48,7 @@ catalog_model_for() {
     sonnet|haiku) echo "" ;;
     fable) echo claude-fable-5-1 ;;
     codex-sol) echo gpt-6.1-sol ;;
+    codex-terra61) echo gpt-6.1-terra ;;
     codex-terra|codex-terra-max) echo gpt-5.6-terra ;;
     codex-luna) case "$2" in low) echo gpt-5.6-luna ;; *) echo gpt-6-luna ;; esac ;;
     codex-luna-max) echo gpt-6-luna ;;
@@ -68,6 +70,7 @@ catalog_effort_for() {
     opus|sonnet|kiro-sonnet|kiro-sol|kiro-haiku|cc-qwen38|cc-glm|grok-hi) echo high ;;
     haiku) echo low ;;
     codex-sol|codex-terra-max|codex-luna-max) echo max ;;
+    codex-terra61) echo low ;;
     codex-terra|codex-luna|grok) echo medium ;;
     codex-astra|kiro-opus) echo xhigh ;;
     *) echo "" ;;
@@ -108,7 +111,11 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) shift ;;
-      --operator-request) launch_operator=1; shift ;;
+      --operator-request)
+        launch_operator=1; shift
+        # Match policy launch's optional REF while retaining legacy bare flags.
+        if [[ $# -gt 0 && "${1:-}" != --* ]]; then shift; fi
+        ;;
       --purpose) launch_purpose="${2:-}"; shift 2 ;;
       --role) shift 2 ;; # New seat argument; grant semantics are tested against real scopefuel.
       --effort) launch_effort="${2:-}"; shift 2 ;;
@@ -181,7 +188,7 @@ fi
 if [[ "${1:-}" == --json ]]; then
   json_rc=0
   schema_value=scopefuel.v1
-  providers='[{"id":"claude"},{"id":"devin"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"},{"id":"kimi"}]'
+  providers='[{"id":"anthropic-api"},{"id":"claude"},{"id":"devin"},{"id":"codex"},{"id":"kiro"},{"id":"agy"},{"id":"clinepass"},{"id":"grok"},{"id":"omniroute"},{"id":"kimi"}]'
   case "${WRK_SCOPEFUEL_JSON_MODE:-ok}" in
     broken) echo 'scopefuel: json fetch failed' >&2; exit 7 ;;
     garbage) echo 'not json at all'; exit 0 ;;
@@ -217,6 +224,13 @@ fi
 if [[ "${1:-}" == refresh ]]; then
   pool="${2:-}"
   [[ "${3:-}" == --background ]] || { echo 'fixture scopefuel: refresh requires --background' >&2; exit 2; }
+  # Arm a file-controlled barrier before announcing readiness. Opening the
+  # fifo read/write keeps this fixture from blocking in open, and lets the
+  # test release it without racing a reader that has not opened it yet.
+  if [[ "${WRK_REFRESH_MODE:-ok}" == hold ]]; then
+    exec 7<>"${WRK_REFRESH_RELEASE_FIFO:?fixture release fifo required}"
+    printf '%s\n' "$$" >"${WRK_REFRESH_READY_FILE:?fixture ready file required}"
+  fi
   # Every refresh child names itself to the suite: the pid log is the
   # teardown's exact-pid handle on this process when its supervisor is
   # already gone (the child runs in its own session, so a pgrep -P walk off
@@ -230,6 +244,10 @@ if [[ "${1:-}" == refresh ]]; then
     tw_register_pid "$WRK_REFRESH_PID_LOG" "$$"
   fi
   case "${WRK_REFRESH_MODE:-ok}" in
+    hold)
+      IFS= read -r _ <&7
+      exec 7>&-
+      ;;
     fail)
       echo "fixture scopefuel: refresh failed for pool=$pool" >&2
       exit 23
@@ -259,7 +277,7 @@ if [[ "${1:-}" != gate ]]; then
   exit 2
 fi
 shift
-profile="" operator_request="" requested_by="" requested_by_seen=0 purpose="" effort=""
+profile="" operator_request="" requested_by="" requested_by_seen=0 purpose="" effort="" role=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     -m|--operator-request|--requested-by|--purpose|--effort|--role)
@@ -270,6 +288,7 @@ while [[ $# -gt 0 ]]; do
         --requested-by) requested_by="$2"; requested_by_seen=1 ;;
         --purpose) purpose="$2" ;;
         --effort) effort="$2" ;;
+        --role) role="$2" ;;
       esac
       shift 2 ;;
     *) echo 'fixture scopefuel: unexpected arguments' >&2; exit 2 ;;
@@ -284,8 +303,24 @@ if [[ -n "${WRK_SCOPEFUEL_LOG:-}" ]]; then
   [[ -z "$operator_request" ]] || printf ' --operator-request %s' "$operator_request" >>"$WRK_SCOPEFUEL_LOG"
   [[ "$requested_by_seen" -eq 0 ]] || printf ' --requested-by %s' "$requested_by" >>"$WRK_SCOPEFUEL_LOG"
   [[ -z "$purpose" ]] || printf ' --purpose %s' "$purpose" >>"$WRK_SCOPEFUEL_LOG"
+  if [[ "${WRK_SCOPEFUEL_LOG_ROLE:-0}" == 1 ]]; then
+    [[ -z "$role" ]] || printf ' --role %s' "$role" >>"$WRK_SCOPEFUEL_LOG"
+  else
+    case "$profile" in
+      pi-haiku55|pi-sonnet55|pi-opus55)
+        [[ -z "$role" ]] || printf ' --role %s' "$role" >>"$WRK_SCOPEFUEL_LOG" ;;
+    esac
+  fi
   printf '\n%s\n' "$profile" >>"$WRK_SCOPEFUEL_LOG"
 fi
+# hk 2079: pi credit rungs admit only worker/tester seats.
+case "$profile" in
+  pi-haiku55|pi-sonnet55|pi-opus55)
+    case "$role" in
+      worker|tester) : ;;
+      *) echo "role_restricted: $profile — worker/tester-only" >&2; exit 5 ;;
+    esac ;;
+esac
 # task #527: mirror the real gate's astra role denial — ASTRA_ROLE_PROFILES
 # membership (model identity, not a name substring) plus a purpose whitelist.
 # Role denial runs BEFORE the operator-request checks and exits 5, distinct
@@ -319,6 +354,10 @@ esac
 escalation_rung=0
 case "$profile@$effort" in
   opus@max|sonnet@xhigh) escalation_rung=1 ;;
+  # hk 2043: the canon row codex-sol@xhigh is the S+ escalation rung, so the
+  # normal pinned builder-sol-xhigh spelling is gate-decided (REF required).
+  # codex-sol@max stays a gate=default row (builder-sol-max needs no REF).
+  codex-sol@xhigh) escalation_rung=1 ;;
   opus@low) [[ "${WRK_GATE_738:-0}" == 1 ]] || escalation_rung=1 ;;
 esac
 # task483: the installed scopefuel's fail-closed operator-request refusals,
@@ -375,7 +414,7 @@ fi
 # SCOPEFUEL_E6_ARM=<profile>@<effort> marker — a marker for a different rung
 # does not widen admission (verified against the installed gate).
 case "$profile@$effort" in
-  sonnet@max|codex-sol@high|codex-sol@medium|kimi-k3@high|kimi-k3@max|grok-hi@low|grok-hi@medium|grok-hi@xhigh)
+  sonnet@max|codex-sol@high|codex-sol@medium|kimi-k3@high|kimi-k3@max|grok-hi@low|grok-hi@medium|grok-hi@xhigh|codex-terra61@low|codex-terra61@medium|codex-terra61@high|codex-terra61@xhigh|codex-terra61@max|codex-terra61@ultra)
     if [[ "${SCOPEFUEL_E6_ARM:-}" != "$profile@$effort" ]]; then
       echo "e6_arm_required: $profile@$effort 은 미측정 E6 측정 런그다 (#594) — SCOPEFUEL_E6_ARM=$profile@$effort 표식이 있어야 연다" >&2
       exit 3

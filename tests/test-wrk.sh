@@ -64,11 +64,28 @@ seed_join_round() {
 # ARBITER_BIN points at nothing by default, so every pre-existing case keeps
 # exercising the installation-transition path; the arbiter section below opts in.
 export ARBITER_BIN="$TMP/absent-arbiter"
+# hk 1439: the suite never reaches the real scopefuel through bin/arbiter's PATH
+# fallback (scopefuel_bin). SCOPEFUEL_BIN is suite-wide; per-command overrides stay.
+# Tripwire: scopefuel/devin/kimi shims sit first on PATH, log their argv and exit 99,
+# and the end-of-suite check fails on any logged call. Every PATH edit below only
+# prepends, so the shim dir stays reachable.
+export SCOPEFUEL_BIN="$SCOPEFUEL"
+TRIPWIRE_LOG="$TMP/tripwire.log"; : >"$TRIPWIRE_LOG"
+export TRIPWIRE_LOG
+mkdir -p "$TMP/tripwire-bin"
+for tw_name in scopefuel devin kimi; do
+  printf '%s\n' '#!/bin/sh' \
+    "printf '%s\\n' \"$tw_name \$*\" >>\"\$TRIPWIRE_LOG\"" 'exit 99' >"$TMP/tripwire-bin/$tw_name"
+  chmod +x "$TMP/tripwire-bin/$tw_name"
+done
+export PATH="$TMP/tripwire-bin:$PATH"
 export XDG_DATA_HOME="$TMP/xdg"
 export XDG_CACHE_HOME="$TMP/xdg-cache"
 export XDG_CONFIG_HOME="$TMP/xdg-config"
 export XDG_STATE_HOME="$TMP/xdg-state"
-mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+export CODEX_HOME="$TMP/codex-home"
+export TMPDIR="$TMP/tmp"
+mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$CODEX_HOME" "$TMPDIR"
 # #951: claude-kind spawns seed folder trust into ${CLAUDE_CONFIG_DIR:-$HOME}/
 # .claude.json — the operator's real config must never be touched by a fixture
 # spawn, so suite HOME is a fixture and ambient CLAUDE_CONFIG_DIR is unset (it
@@ -188,14 +205,35 @@ PY
 }
 
 # --t is required by wrk; supply one unless the case under test provides its own.
+track_test_spawn_sentinel() {
+  local job="$1" jobdir="$ARBITER_INBOX_ROOT/$1"
+  local pidfile="$jobdir/completion-sentinel.pid" pid="" attempt
+  [[ -s "$pidfile" ]] || { echo "expected sentinel pidfile for $job" >&2; return 1; }
+  IFS= read -r pid <"$pidfile" || { echo "could not read sentinel pid for $job" >&2; return 1; }
+  [[ "$pid" =~ ^[0123456789]+$ ]] || { echo "malformed sentinel pid for $job" >&2; return 1; }
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    _tw_pid_alive "$pid" || return 0
+    if _tw_sentinel_argv_ok "$pid" "$job" "$jobdir"; then
+      # Fake-clock cases intentionally make the pidfile's started= fail the
+      # production age check. Capture this exact test-owned PID's real start
+      # identity and process group so teardown can reap its detached session.
+      tw_register_pid "$OWNED_PIDS" "$pid"
+      return
+    fi
+    sleep 0.2
+  done
+  echo "sentinel $pid for $job stayed alive without its final argv" >&2
+  return 1
+}
+
 spawn_base() {
   local model="$1"; shift
   local extra=("$@")
+  local spawn_rc=0 session_job="" session_pid="" i
+  local -a spawn_cmd=()
   # The fake clock records started=1000, which correctly fails the real
   # process-start check. In the opt-in cases, the self-recorded session
   # keeps the orphan sentinel owned independently of that pidfile.
-  local -a own_session=()
-  [[ "${TEST_OWN_SESSION:-0}" == 1 ]] && own_session=(tw_own_session)
   case " ${extra[*]-} " in *" --t "*) ;; *) extra+=(--t T1) ;; esac
   # #768: every spawn binds an hk task. Mint a fresh fixture task per spawn so
   # owner-mode claims stay claimable; a case that supplies --task/--parent-job
@@ -212,9 +250,12 @@ spawn_base() {
   # Record the effective --task each call carries. spawn_base often runs
   # inside $(...), so a global is lost to the parent shell — a log file is
   # the subshell-safe channel (tail -1 after a call = that call's task).
-  local resolved_task="" i
+  local resolved_task=""
   for ((i = 0; i < ${#extra[@]}; i++)); do
     [[ "${extra[$i]}" == "--task" ]] && resolved_task="${extra[$((i + 1))]}"
+    if [[ "${extra[$i]}" == "--job" && $((i + 1)) -lt ${#extra[@]} ]]; then
+      session_job="${extra[$((i + 1))]}"
+    fi
   done
   [[ -n "$resolved_task" ]] && printf '%s\n' "$resolved_task" >>"$TMP/spawn-task.log"
   # A registered job leaves a detached sentinel behind, and that sentinel keeps
@@ -223,7 +264,7 @@ spawn_base() {
   # once in three runs, between a case's `rm -f "$TMP/herdr.log"` and its
   # `[[ ! -e "$TMP/herdr.log" ]]`, and the suite dies there with no message.
   # Park the probes past the end of the run instead.
-  "${own_session[@]+"${own_session[@]}"}" env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+  spawn_cmd=(env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
     ARBITER_BIN="${TEST_ARBITER_BIN:-$TMP/absent-arbiter}" \
     WRK_COMPLETION_INTERVAL_S="${WRK_COMPLETION_INTERVAL_S:-3600}" \
     WRK_FIXTURE_SCENARIO="${TEST_FIXTURE_SCENARIO:-spawn}" WRK_FIXTURE_LOG="$TMP/herdr.log" \
@@ -231,7 +272,24 @@ spawn_base() {
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
     WRK_REFRESH_PID_LOG="$TMP/refresh.pids" WRK_REFRESH_TIMEOUT_S="${WRK_REFRESH_TIMEOUT_S:-5}" \
     "${WRK_UNDER_TEST:-$WRK}" spawn \
-    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}"
+    -c "$ROOT" -m "$model" -p "$PROMPT" -w w -l fixture "${extra[@]}")
+  if [[ "${TEST_OWN_SESSION:-0}" == 1 ]]; then
+    tw_own_session "${spawn_cmd[@]}" &
+    session_pid=$!
+    if wait "$session_pid"; then
+      :
+    else
+      spawn_rc=$?
+    fi
+  elif "${spawn_cmd[@]}"; then
+    :
+  else
+    spawn_rc=$?
+  fi
+  if [[ "${TEST_OWN_SESSION:-0}" == 1 && -n "$session_job" ]]; then
+    track_test_spawn_sentinel "$session_job" || return 1
+  fi
+  return "$spawn_rc"
 }
 
 run_terra_refusal_tests() {
@@ -245,6 +303,12 @@ grep -qx 'kimi-k27' <<<"$profiles_out"
 grep -qx 'kimi-k27-code' <<<"$profiles_out"
 grep -qx 'kimi-k3-low' <<<"$profiles_out"
 grep -qx 'codex-luna-max' <<<"$profiles_out"
+grep -qx 'codex-terra61' <<<"$profiles_out" || fail "wrk profiles lost codex-terra61"
+for terra61_profile in builder-terra61-medium builder-terra61-high \
+  builder-terra61-xhigh builder-terra61-max; do
+  grep -qx "$terra61_profile" <<<"$profiles_out" ||
+    fail "wrk profiles lost $terra61_profile"
+done
 for barred_profile in codex-terra codex-terra-max codex-med \
   builder-terra-high builder-terra-xhigh builder-terra-max; do
   if grep -qx "$barred_profile" <<<"$profiles_out"; then
@@ -274,6 +338,12 @@ for e6_profile in builder-opus-low builder-opus-medium builder-sonnet-xhigh buil
   builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
   builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   grep -qx "$e6_profile" <<<"$profiles_out" || fail "wrk profiles lost $e6_profile"
+done
+# hk 2043: builder-sol-xhigh is a normal pinned spelling (no E6 marker),
+# builder-luna-high is the luna family's high E6 rung and builder-haiku-medium
+# is the haiku family's medium E6 rung.
+for pinned_profile in builder-sol-xhigh builder-luna-high builder-haiku-medium; do
+  grep -qx "$pinned_profile" <<<"$profiles_out" || fail "wrk profiles lost $pinned_profile"
 done
 grep -qx 'captain-opus' <<<"$profiles_out"
 grep -qx 'captain-sol' <<<"$profiles_out"
@@ -313,19 +383,23 @@ TERRA_PROBE_SEQ=0
 terra_refusal_probe() {
   local executable="$1" profile="$2" role_path="$3" case_name="$4"
   local profile_flag="${5:--m}" expected_model="${6:-gpt-5.6-terra}" extra_opt="${7:-}"
-  local root="$TMP/noterra/$case_name" home data cache config state inbox
+  local root="$TMP/noterra/$case_name" home data cache config state inbox cwd
   local out err herdr_log scopefuel_log panewire_log db before_tree after_tree before_hk after_hk task_id job rc=0
   TERRA_PROBE_SEQ=$((TERRA_PROBE_SEQ + 1))
   mkdir -p "$root"; home="$root/home"; data="$root/data"; cache="$root/cache"
   config="$root/config"; state="$root/state"; inbox="$root/inbox/jobs"
-  mkdir -p "$home" "$data" "$cache" "$config" "$state" "$inbox"
+  cwd="$root/cwd"
+  mkdir -p "$home" "$data" "$cache" "$config" "$state" "$inbox" "$cwd"
+  git -C "$cwd" init -q
   out="$root/out"; err="$root/err"; herdr_log="$root/herdr.log"
   scopefuel_log="$root/scopefuel.log"; panewire_log="$root/panewire.log"
   : >"$herdr_log"; : >"$scopefuel_log"; : >"$panewire_log"
-  before_tree="$(git -C "$ROOT" worktree list --porcelain | sha256sum | awk '{print $1}')"
+  # An isolated temporary repo keeps other jobs' worktree churn out of this
+  # no-side-effect assertion while still catching a worktree created here.
+  before_tree="$(git -C "$cwd" worktree list --porcelain | sha256sum | awk '{print $1}')"
   before_hk="$(sha256sum "$HK_STATE" | awk '{print $1}')"
   task_id="$(mint_task)"; job="noterra-$case_name"
-  local args=(spawn -c "$ROOT" "$profile_flag" "$profile" -p "$PROMPT" -w w -l "nr-$TERRA_PROBE_SEQ" --t T1 --job "$job")
+  local args=(spawn -c "$cwd" "$profile_flag" "$profile" -p "$PROMPT" -w w -l "nr-$TERRA_PROBE_SEQ" --t T1 --job "$job")
   case "$role_path" in
     worker) args+=(--role worker --task "$task_id") ;;
     builder) args+=(--role builder --lane "nr-lane-$TERRA_PROBE_SEQ" --parent parent-lane --task "$task_id") ;;
@@ -367,7 +441,7 @@ PY
   grep -q "profile $profile refused: $expected_model is barred" "$err" || { echo "T-A1 missing named refusal: $(<"$err")" >&2; return 1; }
   grep -q 'operator 2026-10-12 noterra; use codex-sol or codex-luna' "$err" || { echo "T-A1 missing decision/replacements: $(<"$err")" >&2; return 1; }
   [[ -z "$(find "$inbox" -type f -print -quit)" ]] || { echo "T-A1 inbox changed for $profile/$role_path" >&2; return 1; }
-  after_tree="$(git -C "$ROOT" worktree list --porcelain | sha256sum | awk '{print $1}')"
+  after_tree="$(git -C "$cwd" worktree list --porcelain | sha256sum | awk '{print $1}')"
   [[ "$before_tree" == "$after_tree" ]] || { echo "T-A1 worktree set changed for $profile/$role_path" >&2; return 1; }
   after_hk="$(sha256sum "$HK_STATE" | awk '{print $1}')"
   [[ "$before_hk" == "$after_hk" ]] || { echo "T-A1 task store changed for $profile/$role_path" >&2; return 1; }
@@ -514,6 +588,252 @@ for allowed_codex in codex-sol codex-luna; do
   grep -q "model=$allowed_codex" <<<"$allowed_out" || fail "T-A3 missing $allowed_codex launch: $allowed_out"
 done
 echo "PASS T-A3: codex-sol and codex-luna remain spawnable"
+
+# hk 2109: every Terra61 spawn proves the model display and effort from the
+# visible footer before the fixture can receive a prompt. All state lives under
+# this suite's temporary root; the Codex binary is still the herdr fixture.
+TERRA61_CASE_SEQ=0
+TERRA61_LAST_ROOT="" TERRA61_LAST_RC=0
+terra61_run_case() {
+  local case_name="$1" profile="$2" role="$3" screen_kind="$4"
+  local screen_effort="$5" prompt_text="$6" launch_effort="${7:-}"
+  local marker="${8:-}" catalog_model="${9:-}" executable="${10:-$WRK}"
+  local root home data cache config state inbox codex_home tmpdir cwd prompt screen job task_id rc
+  local -a args env_overrides
+  TERRA61_CASE_SEQ=$((TERRA61_CASE_SEQ + 1))
+  root="$TMP/terra61/$TERRA61_CASE_SEQ-$case_name"
+  home="$root/home"; data="$root/data"; cache="$root/cache"; config="$root/config"
+  state="$root/state"; inbox="$root/inbox/jobs"; codex_home="$root/codex-home"
+  tmpdir="$root/tmp"; cwd="$root/cwd"; prompt="$root/prompt.md"; screen="$root/screen.txt"
+  mkdir -p "$home" "$data" "$cache" "$config" "$state" "$inbox" \
+    "$codex_home" "$tmpdir" "$cwd"
+  : >"$root/herdr.log" "$root/scopefuel.log" "$root/launch.log" "$root/refresh.log" \
+    "$root/refresh.pids"
+  printf '%s\n' "$prompt_text" >"$prompt"
+  case "$screen_kind" in
+    recorded) screen="$ROOT/tests/fixtures/codex-terra61-footer.txt" ;;
+    footer)
+      printf '› Ask Codex to do anything\n  GPT-6.1 Terra %s · /private/tmp/terra-probe · Context 0%%\n' \
+        "$screen_effort" >"$screen" ;;
+    wrong-model)
+      printf '› Ask Codex to do anything\n  GPT-6-Luna %s · /private/tmp/terra-probe · Context 0%%\n' \
+        "$screen_effort" >"$screen" ;;
+    body-only)
+      printf '› Ask Codex to do anything\n  %s\n' "$prompt_text" >"$screen" ;;
+    no-footer) printf '› Ask Codex to do anything\n' >"$screen" ;;
+    *) fail "unknown Terra61 screen fixture '$screen_kind'" ;;
+  esac
+  job="hk2109-terra61-$TERRA61_CASE_SEQ-$case_name"
+  task_id="$(mint_task)"
+  args=(spawn -c "$cwd" -m "$profile" -p "$prompt" -w w -l "t61-$TERRA61_CASE_SEQ" \
+    --t T2 --job "$job")
+  case "$role" in
+    builder)
+      args+=(--role builder --lane "t61-lane-$TERRA61_CASE_SEQ" --parent parent-lane --task "$task_id") ;;
+    counsel)
+      args+=(--role counsel --task "$task_id" --operator-request hk:doc/decision/2026-09-21/astra-allowed-purposes-approved) ;;
+    *) args+=(--role worker --task "$task_id") ;;
+  esac
+  [[ -z "$launch_effort" ]] || args+=(--effort "$launch_effort")
+  env_overrides=()
+  [[ -z "$marker" ]] || env_overrides+=("SCOPEFUEL_E6_ARM=$marker")
+  [[ -z "$catalog_model" ]] || env_overrides+=("WRK_LAUNCH_MODEL_OVERRIDE=$catalog_model")
+  TERRA61_LAST_ROOT="$root"
+  if env -u SCOPEFUEL_E6_ARM \
+    HOME="$home" XDG_DATA_HOME="$data" XDG_CACHE_HOME="$cache" \
+    XDG_CONFIG_HOME="$config" XDG_STATE_HOME="$state" CODEX_HOME="$codex_home" \
+    TMPDIR="$tmpdir" ARBITER_INBOX_ROOT="$inbox" WRK_TEST_MODE=1 \
+    HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" ARBITER_BIN="$ARBITER" \
+    HANDOFFKEEP_BIN="$HANDOFFKEEP_BIN" HK_STATE="$HK_STATE" PANEWIRE_BIN="$PANEWIRE" \
+    WRK_NO_SLEEP=1 WRK_COMPLETION_INTERVAL_S=3600 WRK_FIXTURE_SCENARIO=spawn \
+    WRK_FIXTURE_TERRA61_SCREEN_FILE="$screen" WRK_FIXTURE_LOG="$root/herdr.log" \
+    WRK_SCOPEFUEL_LOG="$root/scopefuel.log" WRK_LAUNCH_LOG="$root/launch.log" \
+    WRK_REFRESH_LOG="$root/refresh.log" WRK_REFRESH_PID_LOG="$root/refresh.pids" \
+    WRK_REFRESH_TIMEOUT_S=5 "${env_overrides[@]+"${env_overrides[@]}"}" "$executable" "${args[@]}" \
+      >"$root/out" 2>"$root/err"; then
+    TERRA61_LAST_RC=0
+  else
+    TERRA61_LAST_RC=$?
+  fi
+  return 0
+}
+
+terra61_expect_launch() {
+  local case_name="$1" profile="$2" effort="$3" marker="${4:-}"
+  local screen_kind="${5:-footer}" launch_effort="${6:-}" prompt_text="${7:-fixture prompt}"
+  local role=worker
+  [[ "$profile" != builder-terra61-* ]] || role=builder
+  terra61_run_case "$case_name" "$profile" "$role" "$screen_kind" "$effort" \
+    "$prompt_text" "$launch_effort" "$marker"
+  [[ "$TERRA61_LAST_RC" -eq 0 ]] ||
+    fail "$profile must launch at $effort (rc=$TERRA61_LAST_RC): $(<"$TERRA61_LAST_ROOT/err")"
+  grep -q '^OK pane=' "$TERRA61_LAST_ROOT/out" ||
+    fail "$profile did not print an OK receipt: $(<"$TERRA61_LAST_ROOT/out")"
+  grep -q -- "-m gpt-6.1-terra -c model_reasoning_effort=$effort" "$TERRA61_LAST_ROOT/herdr.log" ||
+    fail "$profile launcher argv lost model/effort $effort: $(<"$TERRA61_LAST_ROOT/herdr.log")"
+  grep -qF "policy launch codex-terra61 effort=$effort" "$TERRA61_LAST_ROOT/launch.log" ||
+    fail "$profile catalog lookup did not use codex-terra61@$effort"
+  grep -qF "gate -m codex-terra61 --effort $effort" "$TERRA61_LAST_ROOT/scopefuel.log" ||
+    fail "$profile gate did not judge codex-terra61@$effort"
+  python3 - "$TERRA61_LAST_ROOT" "$effort" <<'PY' || fail "$profile quota row did not record codex-terra61@$effort"
+import json, pathlib, sys
+root, effort = pathlib.Path(sys.argv[1]), sys.argv[2]
+events = [json.loads(p.read_text()) for p in (root / "inbox" / "jobs").glob("*/events/*.json")]
+record = next(e for e in events if e.get("kind") == "quota_pool.record")
+assert record["payload"]["launch_profile"] == f"codex-terra61@{effort}", record
+PY
+  python3 - "$TERRA61_LAST_ROOT/herdr.log" <<'PY' || fail "$profile footer proof did not precede brief injection"
+import pathlib, sys
+lines = pathlib.Path(sys.argv[1]).read_text().splitlines()
+visible = next(i for i, line in enumerate(lines) if "agent read " in line and "--source visible" in line)
+prompt = next(i for i, line in enumerate(lines) if line.startswith("agent prompt "))
+assert visible < prompt, (visible, prompt)
+PY
+}
+
+terra61_expect_proof_refusal() {
+  local case_name="$1" screen_kind="$2" screen_effort="$3" prompt_text="$4"
+  terra61_run_case "$case_name" codex-terra61 worker "$screen_kind" "$screen_effort" \
+    "$prompt_text" "" codex-terra61@low
+  if [[ "$TERRA61_LAST_RC" -eq 0 ]]; then
+    echo "T-P1 $case_name unexpectedly passed model-line proof" >&2
+    return 1
+  fi
+  if ! grep -qF 'terra61 model not proven: expected GPT-6.1 Terra low' "$TERRA61_LAST_ROOT/err"; then
+    echo "T-P1 $case_name failed for a different reason: $(<"$TERRA61_LAST_ROOT/err")" >&2
+    return 1
+  fi
+  if grep -q '^OK pane=' "$TERRA61_LAST_ROOT/out"; then
+    echo "T-P1 $case_name printed an OK line after proof failure" >&2
+    return 1
+  fi
+  if ! grep -q '^pane close ' "$TERRA61_LAST_ROOT/herdr.log"; then
+    echo "T-P1 $case_name did not close its pane" >&2
+    return 1
+  fi
+  python3 - "$TERRA61_LAST_ROOT/data/arbiter/state.db" <<'PY' || fail "$case_name left a quota row after proof failure"
+import pathlib, sqlite3, sys
+db = pathlib.Path(sys.argv[1])
+if db.exists():
+    con = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+    try:
+        assert con.execute("SELECT COUNT(*) FROM quota_pool_records").fetchone()[0] == 0
+    finally:
+        con.close()
+PY
+}
+
+terra61_expect_model_barred() {
+  local case_name="$1" profile="$2" role="$3" model_id="$4"
+  local screen_kind="${5:-recorded}" screen_effort="${6:-high}"
+  local marker="${7:-}" executable="${8:-$WRK}"
+  terra61_run_case "$case_name" "$profile" "$role" "$screen_kind" "$screen_effort" \
+    fixture "" "$marker" "$model_id" "$executable"
+  if [[ "$TERRA61_LAST_RC" -eq 0 ]]; then
+    echo "T-A2 $profile unexpectedly admitted barred model $model_id" >&2
+    return 1
+  fi
+  if ! grep -qF "profile $profile refused: $model_id is barred, operator 2026-10-12 noterra" \
+    "$TERRA61_LAST_ROOT/err"; then
+    echo "T-A2 $profile missing noterra refusal for $model_id: $(<"$TERRA61_LAST_ROOT/err")" >&2
+    return 1
+  fi
+  if grep -q '^OK pane=' "$TERRA61_LAST_ROOT/out" || grep -q '^agent start ' "$TERRA61_LAST_ROOT/herdr.log"; then
+    echo "T-A2 $profile printed OK or started a pane for barred model $model_id" >&2
+    return 1
+  fi
+}
+
+# The recorded Codex 0.164.0 high footer passes. The model's own menu set low
+# as the default, and every pinned builder rung uses the exact marker and gate.
+terra61_expect_launch real-footer codex-terra61 high codex-terra61@high recorded high
+terra61_expect_launch default-low codex-terra61 low codex-terra61@low
+terra61_expect_launch explicit-high codex-terra61 high codex-terra61@high footer high
+for rung in medium high xhigh max; do
+  terra61_expect_launch "builder-$rung" "builder-terra61-$rung" "$rung" \
+    "codex-terra61@$rung" footer
+done
+echo "PASS hk 2109: codex-terra61 default/override and four pinned builder rungs resolve catalog, argv and gate effort"
+
+# The exact allowed model id is the only Terra exception. Catalog injection,
+# PROFILE_MODEL_ARG and ARGS -m/--model remain guarded; old aliases stay barred.
+terra61_expect_model_barred catalog-row codex-terra61 worker gpt-5.6-terra ||
+  fail "catalog row returning gpt-5.6-terra must be barred"
+terra61_expect_model_barred profile-model-arg grok-hi worker gpt-5.6-terra ||
+  fail "PROFILE_MODEL_ARG returning gpt-5.6-terra must be barred"
+terra61_expect_model_barred args-model fable counsel gpt-5.6-terra ||
+  fail "ARGS -m/--model returning gpt-5.6-terra must be barred"
+terra_refusal_probe "$WRK" codex-terra worker terra61-old-alias -m gpt-5.6-terra ||
+  fail "old codex-terra alias must remain refused"
+echo "PASS hk 2109: gpt-5.6-terra stays barred through catalog, alias, PROFILE_MODEL_ARG and ARGS model channels"
+
+# A body/brief mention is not a footer. Both wrong model and wrong effort close
+# the pane, print no OK line, and release the quota record. Missing footer is
+# bounded by the existing foreground-ready timeout.
+terra61_expect_proof_refusal wrong-model wrong-model low 'fixture prompt'
+terra61_expect_proof_refusal wrong-effort recorded high 'fixture prompt' || fail "wrong effort must fail footer proof"
+terra61_expect_proof_refusal brief-only body-only low 'GPT-6.1 Terra low appears only in this brief' || fail "brief-only text must not pass footer proof"
+terra61_expect_proof_refusal no-footer no-footer low 'fixture prompt' || fail "missing footer must time out and refuse"
+echo "PASS hk 2109: model-line proof rejects wrong model, wrong effort, brief-only text and missing footer"
+
+# Adversarial mutants must go red for the exact invariant they violate.
+make_terra61_mutant() {
+  local kind="$1" output="$2"
+  python3 - "$WRK" "$output" "$kind" <<'PY'
+from pathlib import Path
+import sys
+src = Path(sys.argv[1]).read_text()
+kind = sys.argv[3]
+if kind == "allow-all-terra":
+    old, new = "gpt-6.1-terra) return 0 ;;", "*-terra*) return 0 ;;"
+elif kind == "skip-proof":
+    old = '      if [[ "$PROFILE_MODEL" != gpt-6.1-terra ]]; then\n        return 0\n      fi\n      terra_status="$(terra61_footer_status)"'
+    new = "      return 0"
+elif kind == "ignore-effort":
+    old, new = 'observed == f"{display} {effort}"', 'observed.startswith(display + " ")'
+else:
+    raise SystemExit(f"unknown mutant {kind}")
+if src.count(old) != 1:
+    raise SystemExit(f"{kind} target is not unique: {src.count(old)}")
+Path(sys.argv[2]).write_text(src.replace(old, new, 1))
+Path(sys.argv[2]).chmod(0o755)
+PY
+}
+T61_ALLOW_MUTANT="$TMP/terra61/allow-all-terra-wrk"
+make_terra61_mutant allow-all-terra "$T61_ALLOW_MUTANT"
+T61_ALLOW_LOG="$TMP/terra61/allow-all-terra-red.log"
+if terra61_expect_model_barred mutant-allow-all codex-terra61 worker gpt-5.6-terra \
+  footer low codex-terra61@low "$T61_ALLOW_MUTANT" \
+  >"$T61_ALLOW_LOG" 2>&1; then fail "allow-all-terra mutant survived"; fi
+expect_probe_red "$T61_ALLOW_LOG" "codex-terra61 unexpectedly admitted barred model gpt-5.6-terra" "allow-all-terra mutant"
+
+# Make the proof-refusal helper run a selected mutant executable.
+terra61_expect_proof_refusal_with() {
+  local executable="$1" case_name="$2" screen_kind="$3" screen_effort="$4"
+  terra61_run_case "$case_name" codex-terra61 worker "$screen_kind" "$screen_effort" \
+    'fixture prompt' "" codex-terra61@low "" "$executable"
+  if [[ "$TERRA61_LAST_RC" -eq 0 ]]; then
+    echo "T-P1 $case_name unexpectedly passed model-line proof" >&2
+    return 1
+  fi
+  if ! grep -qF 'terra61 model not proven: expected GPT-6.1 Terra low' "$TERRA61_LAST_ROOT/err"; then
+    echo "T-P1 $case_name mutant failed for a different reason: $(<"$TERRA61_LAST_ROOT/err")" >&2
+    return 1
+  fi
+}
+T61_SKIP_MUTANT="$TMP/terra61/skip-proof-wrk"
+make_terra61_mutant skip-proof "$T61_SKIP_MUTANT"
+T61_SKIP_LOG="$TMP/terra61/skip-proof-red.log"
+if terra61_expect_proof_refusal_with "$T61_SKIP_MUTANT" mutant-skip-proof wrong-model low \
+  >"$T61_SKIP_LOG" 2>&1; then fail "skip-proof mutant survived"; fi
+expect_probe_red "$T61_SKIP_LOG" "T-P1 mutant-skip-proof unexpectedly passed model-line proof" "skip-proof mutant"
+T61_EFFORT_MUTANT="$TMP/terra61/ignore-effort-wrk"
+make_terra61_mutant ignore-effort "$T61_EFFORT_MUTANT"
+T61_EFFORT_LOG="$TMP/terra61/ignore-effort-red.log"
+if terra61_expect_proof_refusal_with "$T61_EFFORT_MUTANT" mutant-ignore-effort recorded high \
+  >"$T61_EFFORT_LOG" 2>&1; then fail "ignore-effort mutant survived"; fi
+expect_probe_red "$T61_EFFORT_LOG" "T-P1 mutant-ignore-effort unexpectedly passed model-line proof" "ignore-effort mutant"
+echo "PASS hk 2109 mutants: broad Terra allowlist, skipped footer proof and effort-blind proof go RED"
 }
 
 if [[ "${WRK_TEST_ONLY_TERRA:-0}" -eq 1 ]]; then
@@ -7114,6 +7434,303 @@ for shell_err_pair in "start-not-ready:1:agent_not_ready" "start-pane-unavailabl
   if grep -q '^agent prompt ' "$TMP/herdr.log"; then fail "$shell_err_scenario delivered a brief"; fi
 done
 
+# hk 1895: a failed spawn saves the pane's screen into the job dir (mode 0600,
+# never echoed to stdout/stderr), still closes the pane and keeps rc=1.
+T1895_JOBDIR="$TMP/inbox/fixture"
+T1895_SCREEN="$T1895_JOBDIR/spawn-failure-screen.txt"
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_out="$(umask 002; TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_rc=$?
+set -e
+[[ "$t1895_rc" -eq 1 ]] || fail "1895 screen case expected rc=1, got $t1895_rc: $t1895_out"
+[[ -f "$T1895_SCREEN" ]] ||
+  fail "1895 failed spawn left no spawn-failure-screen.txt: $t1895_out"
+grep -q 'fixture welcome screen' "$T1895_SCREEN" ||
+  fail "1895 screen file lost the fixture screen text"
+grep -q 'ACTUAL SCREEN LAST LINE' "$T1895_SCREEN" ||
+  fail "1895 screen file lost the screen tail"
+[[ "$(stat -c %a "$T1895_SCREEN" 2>/dev/null || stat -f %Lp "$T1895_SCREEN")" == 600 ]] ||
+  fail "1895 screen file must be mode 0600 under a loose umask"
+grep -q "wrk: saved failed pane screen to $T1895_SCREEN" <<<"$t1895_out" ||
+  fail "1895 lost the saved-screen line: $t1895_out"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" || fail "1895 must still close the failed pane"
+if grep -q 'fixture welcome screen\|ACTUAL SCREEN LAST LINE' <<<"$t1895_out"; then
+  fail "1895 leaked the pane screen to stdout/stderr"
+fi
+
+# WRK_KEEP_FAILED_PANE=1 captures the same file but leaves the pane up.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_keep_out="$(WRK_KEEP_FAILED_PANE=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_keep_rc=$?
+set -e
+[[ "$t1895_keep_rc" -eq 1 ]] ||
+  fail "1895 keep case expected rc=1, got $t1895_keep_rc: $t1895_keep_out"
+[[ -f "$T1895_SCREEN" ]] ||
+  fail "1895 keep case left no spawn-failure-screen.txt: $t1895_keep_out"
+if grep -q '^pane close ' "$TMP/herdr.log"; then
+  fail "WRK_KEEP_FAILED_PANE=1 still closed the pane"
+fi
+grep -q 'wrk: kept failed pane w:p1 (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close w:p1' <<<"$t1895_keep_out" ||
+  fail "1895 keep case lost the kept-pane line: $t1895_keep_out"
+
+# Any other value behaves as unset: the pane is closed.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_yes_out="$(WRK_KEEP_FAILED_PANE=yes TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_yes_rc=$?
+set -e
+[[ "$t1895_yes_rc" -eq 1 ]] || fail "1895 keep=yes case expected rc=1, got $t1895_yes_rc"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+  fail "WRK_KEEP_FAILED_PANE=yes must behave as unset and close the pane"
+if grep -q 'kept failed pane' <<<"$t1895_yes_out"; then
+  fail "WRK_KEEP_FAILED_PANE=yes must not print the kept-pane line"
+fi
+
+# A pane read that fails is best-effort: rc and the close are unchanged and at
+# most one warn line is printed; the saved-screen line is absent.
+rm -rf "$T1895_JOBDIR"
+: >"$TMP/herdr.log"
+set +e
+t1895_readfail_out="$(WRK_FIXTURE_PANE_READ200_FAIL=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)"
+t1895_readfail_rc=$?
+set -e
+[[ "$t1895_readfail_rc" -eq 1 ]] ||
+  fail "1895 read-fail case expected rc=1, got $t1895_readfail_rc: $t1895_readfail_out"
+grep -qx 'pane close w:p1' "$TMP/herdr.log" ||
+  fail "1895 read-fail case must still close the pane"
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t1895_readfail_out")" -eq 1 ]] ||
+  fail "1895 read-fail case printed more than one warn line: $t1895_readfail_out"
+if grep -q 'saved failed pane screen' <<<"$t1895_readfail_out"; then
+  fail "1895 read-fail case must not claim a saved screen"
+fi
+
+# Two failures of the same job id keep both files, the first untouched.
+T1895_DUP_JOBDIR="$TMP/inbox/t1895-dup"
+rm -rf "$T1895_DUP_JOBDIR"
+for t1895_n in 1 2; do
+  : >"$TMP/herdr.log"
+  set +e
+  TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus --job t1895-dup >/dev/null 2>&1
+  t1895_dup_rc=$?
+  set -e
+  [[ "$t1895_dup_rc" -eq 1 ]] || fail "1895 dup failure $t1895_n expected rc=1, got $t1895_dup_rc"
+done
+[[ -f "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" &&
+   -f "$T1895_DUP_JOBDIR/spawn-failure-screen-2.txt" ]] ||
+  fail "1895 second failure must write spawn-failure-screen-2.txt"
+grep -q 'fixture welcome screen' "$T1895_DUP_JOBDIR/spawn-failure-screen.txt" ||
+  fail "1895 first screen file was overwritten"
+echo "PASS hk1895 failed-pane screen capture and WRK_KEEP_FAILED_PANE"
+
+# ---------------------------------------------------------------------------
+# hk 2011: run_bounded kills a TERM-ignoring child, the failed-pane capture
+# name is exclusive under a race, WRK_KEEP_FAILED_PANE reaches a remote leg,
+# and the kept-pane hint names herdr pane close.
+# ---------------------------------------------------------------------------
+# t2011_term_case FILE — run_bounded 1 on a child that traps TERM and sleeps
+# 30 s, extracted from FILE. Prints "RC ELAPSED_SECONDS". Main holds the whole
+# 30 s; the bound is secs plus the kill grace, so 6 s is a generous ceiling.
+t2011_term_case() {
+  local file="$1" start rc=0
+  start="$SECONDS"
+  # shellcheck disable=SC1090 # FILE is the run_bounded extract from bin/wrk
+  ( . "$file"; run_bounded 1 sh -c 'trap "" TERM; sleep 30' ) >/dev/null 2>&1 || rc=$?
+  printf '%s %s\n' "$rc" "$((SECONDS - start))"
+}
+T2011_RB="$TMP/run-bounded-2011.sh"
+sed -n '/^run_bounded() {/,/^}/p' "$WRK" >"$T2011_RB"
+grep -q '^run_bounded() {' "$T2011_RB" || fail "hk2011: run_bounded is not in bin/wrk"
+read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$T2011_RB")"
+if [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )); then
+  fail "hk2011: run_bounded 1 left a TERM-ignoring child running (rc=$t2011_rc, ${t2011_elapsed}s; bound 1s plus kill grace)"
+fi
+# The same case with only gtimeout on PATH (a shim that execs the real timeout),
+# so the gtimeout branch is the one that runs. macOS has no timeout binary and
+# uses the python fallback, so the case is skipped there.
+if T2011_REAL_TIMEOUT="$(command -v timeout)"; then
+  T2011_GT="$TMP/gtimeout-only"
+  rm -rf "$T2011_GT"
+  mkdir -p "$T2011_GT"
+  printf '#!/bin/sh\nexec "%s" "$@"\n' "$T2011_REAL_TIMEOUT" >"$T2011_GT/gtimeout"
+  chmod +x "$T2011_GT/gtimeout"
+  ln -s "$(command -v sh)" "$T2011_GT/sh"
+  ln -s "$(command -v sleep)" "$T2011_GT/sleep"
+  read -r t2011_rc t2011_elapsed <<<"$(PATH="$T2011_GT" t2011_term_case "$T2011_RB")"
+  if [[ "$t2011_rc" -ne 124 && "$t2011_rc" -ne 137 ]] || (( t2011_elapsed > 6 )); then
+    fail "hk2011: gtimeout path left a TERM-ignoring child running (rc=$t2011_rc, ${t2011_elapsed}s)"
+  fi
+else
+  echo "SKIP hk2011 gtimeout branch: no timeout binary on this host"
+fi
+echo "PASS hk2011 run_bounded bound holds for a TERM-ignoring child"
+
+# t2011_capture_pair JOB WRK — two failed-pane captures of one job. The first
+# parks inside the name-pick window (capture-name seam); the second runs to
+# completion meanwhile. Returns 0 only when both screens survive as two files.
+t2011_capture_pair() {
+  local job="$1" bin="$2" pause dir a_pid a_rc b_rc i
+  pause="$TMP/pause-$job"
+  rm -rf "$pause"
+  mkdir -p "$pause"
+  dir="$TMP/inbox/$job"
+  rm -rf "$dir"
+  set +e
+  WRK_UNDER_TEST="$bin" TEST_FIXTURE_SCENARIO=start-not-ready \
+    WRK_TEST_PAUSE_AT=capture-name WRK_TEST_PAUSE_DIR="$pause" \
+    spawn_base opus --job "$job" --job-dup-ok >"$pause/a.out" 2>&1 &
+  a_pid=$!
+  own "$a_pid"
+  i=0
+  while [[ ! -e "$pause/paused" && "$i" -lt 200 ]]; do
+    sleep 0.1
+    i=$((i + 1))
+  done
+  if [[ ! -e "$pause/paused" ]]; then
+    : >"$pause/release"
+    wait "$a_pid"
+    set -e
+    return 1
+  fi
+  WRK_UNDER_TEST="$bin" TEST_FIXTURE_SCENARIO=start-not-ready \
+    spawn_base opus --job "$job" --job-dup-ok >"$pause/b.out" 2>&1
+  b_rc=$?
+  : >"$pause/release"
+  wait "$a_pid"
+  a_rc=$?
+  set -e
+  [[ "$a_rc" -eq 1 && "$b_rc" -eq 1 ]] || return 1
+  [[ -f "$dir/spawn-failure-screen.txt" && -f "$dir/spawn-failure-screen-2.txt" ]] || return 1
+  grep -q 'fixture welcome screen' "$dir/spawn-failure-screen.txt" || return 1
+  grep -q 'fixture welcome screen' "$dir/spawn-failure-screen-2.txt"
+}
+t2011_capture_pair concurrent-capture "$WRK" ||
+  fail "hk2011: two failed-pane captures of one job collided on spawn-failure-screen.txt"
+echo "PASS hk2011 concurrent failed-pane captures keep two files"
+
+# hk 2011 forwarding: a spill-over spawn carries WRK_KEEP_FAILED_PANE to the
+# remote leg (only when set), next to HERDR_SESSION.
+T2011_FWD="$TMP/fwd-2011"
+rm -rf "$T2011_FWD"
+mkdir -p "$T2011_FWD"
+printf '%s\n' '[local]' 'max_load_ratio = 0.5' 'max_active = 4' '' \
+  '[hub]' 'hub_url = "https://example.invalid"' 'hub_token_env = "/tmp/example-token.env"' 'hub_cf_env = "/tmp/example-cf.env"' '' \
+  '[hosts.desktop]' 'ssh = "desktop"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >"$T2011_FWD/hosts.toml"
+printf '%s\n' '0.20 0.10 0.10 1/1 1' >"$T2011_FWD/loadavg"
+# t2011_fwd_spawn JOB [KEEP] — a spawn that spills to the desktop host.
+t2011_fwd_spawn() {
+  local job="$1" keep="${2:-}" task keep_env=()
+  [[ -z "$keep" ]] || keep_env=(WRK_KEEP_FAILED_PANE="$keep")
+  task="$(mint_task)"
+  : >"$T2011_FWD/ssh.log"
+  env -u WRK_KEEP_FAILED_PANE ${keep_env[@]+"${keep_env[@]}"} \
+    WRK_TEST_MODE=1 ARBITER_INBOX_ROOT="$TMP/inbox" XDG_DATA_HOME="$TMP/xdg" ARBITER_BIN="$ARBITER" \
+    HERDR_BIN="$ROOT/tests/fixtures/spillover-herdr" SCOPEFUEL_BIN="$SCOPEFUEL" \
+    WRK_NO_SLEEP=1 WRK_HOSTS_CONFIG="${T2011_HOSTS:-$T2011_FWD/hosts.toml}" WRK_PROC_LOADAVG="$T2011_FWD/loadavg" \
+    WRK_TEST_NCPU=4 WRK_TEST_THROTTLED=0 WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 \
+    WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$T2011_FWD/herdr.log" WRK_SPILLOVER_LOG="$T2011_FWD/spill.log" \
+    PANEWIRE_BIN="$ROOT/tests/fixtures/spillover-panewire" WRK_SSH_BIN="$ROOT/tests/fixtures/spillover-ssh" \
+    WRK_SCP_BIN="$ROOT/tests/fixtures/spillover-scp" WRK_SSH_LOG="$T2011_FWD/ssh.log" WRK_SCP_LOG="$T2011_FWD/scp.log" \
+    WRK_WAKE_LOG="$T2011_FWD/wake.log" WRK_PLACE_LOG="$T2011_FWD/place.log" \
+    WRK_SPILLOVER_CANDIDATES_LOG="$T2011_FWD/cand.log" WRK_COMPLETION_INTERVAL_S=3600 \
+    "${WRK_UNDER_TEST:-$WRK}" spawn -c "$ROOT" -m codex-luna -p "$PROMPT" -l fixture -w w --t T1 \
+    --job "$job" --task "$task"
+}
+t2011_fwd_spawn fwd-keep 1 >"$T2011_FWD/keep.out" 2>&1 ||
+  fail "hk2011 forward: spill-over spawn failed: $(cat "$T2011_FWD/keep.out")"
+grep -q '^OK pane=desktop:p7 host=desktop ' "$T2011_FWD/keep.out" ||
+  fail "hk2011 forward: spawn did not land on the desktop host: $(cat "$T2011_FWD/keep.out")"
+grep -q 'HERDR_SESSION=worker .*WRK_KEEP_FAILED_PANE=1 wrk spawn' "$T2011_FWD/ssh.log" ||
+  fail "hk2011: WRK_KEEP_FAILED_PANE=1 was not forwarded to the remote leg: $(cat "$T2011_FWD/ssh.log")"
+t2011_fwd_spawn fwd-plain >"$T2011_FWD/plain.out" 2>&1 ||
+  fail "hk2011 forward: unset-variable spawn failed: $(cat "$T2011_FWD/plain.out")"
+if grep -q 'WRK_KEEP_FAILED_PANE' "$T2011_FWD/ssh.log"; then
+  fail "hk2011: an unset WRK_KEEP_FAILED_PANE must not be forwarded: $(cat "$T2011_FWD/ssh.log")"
+fi
+echo "PASS hk2011 WRK_KEEP_FAILED_PANE forwards to the remote leg"
+
+# hk 2011 kept pane: a remote leg that kept its failed pane (WRK_KEEP_FAILED_PANE
+# is forwarded) ends the auto round at that host. The second candidate and the
+# local fallback must never spawn: one pane, one remote spawn leg.
+T2011_TWO="$T2011_FWD/hosts-two.toml"
+cp "$T2011_FWD/hosts.toml" "$T2011_TWO"
+printf '%s\n' '' '[hosts.mac-work]' 'ssh = "mac-work"' 'herdr_session = "worker"' 'workspace = "workers"' \
+  "cwd_map = {\"$ROOT\"=\"/remote/agent-skills\"}" 'capacity = 3' >>"$T2011_TWO"
+set +e
+t2011_kept_out="$(T2011_HOSTS="$T2011_TWO" WRK_SSH_SCENARIO_DESKTOP=remote-die-stderr WRK_REMOTE_RC=1 \
+  WRK_REMOTE_STDERR_LINE='wrk: kept failed pane desktop:p7 (WRK_KEEP_FAILED_PANE=1); close it with herdr pane close desktop:p7' \
+  t2011_fwd_spawn fwd-kept 1 2>&1)"
+t2011_kept_rc=$?
+set -e
+[[ "$t2011_kept_rc" -ne 0 ]] ||
+  fail "hk2011 kept pane: the remote failure must fail the auto spawn: $t2011_kept_out"
+[[ "$(grep -c 'kept failed pane' <<<"$t2011_kept_out")" -eq 1 ]] ||
+  fail "hk2011 kept pane: the kept pane must be printed exactly once: $t2011_kept_out"
+grep -q "left failed pane desktop:p7 open" <<<"$t2011_kept_out" ||
+  fail "hk2011 kept pane: the round must say the pane is still open: $t2011_kept_out"
+[[ "$(grep -c '^OK pane=' <<<"$t2011_kept_out")" -eq 0 ]] ||
+  fail "hk2011 kept pane: no candidate may land a second pane: $t2011_kept_out"
+[[ "$(grep -c 'wrk spawn' "$T2011_FWD/ssh.log")" -eq 1 ]] ||
+  fail "hk2011 kept pane: exactly one remote spawn leg is allowed: $(cat "$T2011_FWD/ssh.log")"
+if grep -q 'mac-work' "$T2011_FWD/ssh.log"; then
+  fail "hk2011 kept pane: the second candidate must not be tried: $(cat "$T2011_FWD/ssh.log")"
+fi
+echo "PASS hk2011 kept remote pane ends the auto round: one pane, no second candidate"
+
+# The kept-pane hint names the pane to close (herdr pane close PANE), never a tab.
+T2011_HINT="$(WRK_KEEP_FAILED_PANE=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)" || true
+grep -q 'close it with herdr pane close w:p1' <<<"$T2011_HINT" ||
+  fail "hk2011: kept-pane hint must name herdr pane close w:p1: $T2011_HINT"
+if grep -q 'herdr tab close' <<<"$T2011_HINT"; then
+  fail "hk2011: kept-pane hint must not name herdr tab close"
+fi
+rm -f "$TMP/herdr.log"
+echo "PASS hk2011 kept-pane hint names herdr pane close"
+
+# Mutants: each must make its named case fail.
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+# nokill needs timeout or gtimeout on PATH: the python fallback kills on its own
+# (SIGKILL), so the mutant cannot differ there and the check is skipped. The
+# extract is the mutant's run_bounded block only; the whole mutant file ends in
+# a dispatcher that exits 2 before run_bounded exists.
+if command -v timeout >/dev/null 2>&1 || command -v gtimeout >/dev/null 2>&1; then
+  devin_trust_mutant nokill '    timeout -k "$kill_grace" "$secs" "$@"' '    timeout "$secs" "$@"'
+  sed -n '/^run_bounded() {/,/^}/p' "$TMP/mut-wrk-nokill" >"$TMP/run-bounded-nokill.sh"
+  [[ -s "$TMP/run-bounded-nokill.sh" ]] ||
+    fail "hk2011 mutant nokill: run_bounded is not in the mutant copy"
+  read -r t2011_rc t2011_elapsed <<<"$(t2011_term_case "$TMP/run-bounded-nokill.sh")"
+  # RED for the right reason: the TERM-ignoring child outlived the bound (rc 124
+  # after the full sleep), not a non-124 rc from a broken extract.
+  if [[ "$t2011_rc" -ne 124 ]] || (( t2011_elapsed <= 6 )); then
+    fail "hk2011 mutant nokill (no -k) must go RED on the timing: rc=$t2011_rc elapsed=${t2011_elapsed}s"
+  fi
+else
+  echo "SKIP hk2011 mutant nokill: no timeout or gtimeout on this host"
+fi
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant nonexcl 'set -C; : >"$screen"' ': >"$screen"'
+t2011_capture_pair mut-nonexcl "$TMP/mut-wrk-nonexcl" &&
+  fail "hk2011 mutant nonexcl (non-exclusive create) must fail the concurrent case"
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant noforward '  [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")' '  :'
+WRK_UNDER_TEST="$TMP/mut-wrk-noforward" t2011_fwd_spawn fwd-mut 1 >/dev/null 2>&1 || true
+grep -q 'HERDR_SESSION=worker .*WRK_KEEP_FAILED_PANE=1 wrk spawn' "$T2011_FWD/ssh.log" &&
+  fail "hk2011 mutant noforward (no forward) must fail the forwarding case"
+# A capture that prints no warning for a failed read must fail the
+# exactly-one-warning assertion above.
+# shellcheck disable=SC2016 # the mutant anchors are bin/wrk source text, not expansions
+devin_trust_mutant nowarn 'warn "failed-pane screen capture failed for pane $PANE"' ': "failed-pane screen capture failed for pane $PANE"'
+t2011_rf_out="$(WRK_UNDER_TEST="$TMP/mut-wrk-nowarn" WRK_FIXTURE_PANE_READ200_FAIL=1 TEST_FIXTURE_SCENARIO=start-not-ready spawn_base opus 2>&1)" || true
+[[ "$(grep -c 'failed-pane screen capture failed' <<<"$t2011_rf_out")" -eq 1 ]] &&
+  fail "hk2011 mutant nowarn (zero warnings) must fail the exactly-one-warning case"
+echo "PASS hk2011 mutants applied"
+
+
 # #609: an accepted `agent start` whose binary never reaches the pane
 # foreground — the m1b shape, zsh answered "command not found: codex" — must
 # not receive a brief. Before any injection wrk polls process-info until a
@@ -9644,34 +10261,92 @@ grep -q 'model=codex-luna' "$TMP/missing.out"
 
 # ROB-1227 D4: refresh is detached, uses the gate-provided pool, and exposes
 # failure/timeout warnings without changing the successful spawn.
+# A total-spawn stopwatch also measures trust/gate/task setup, which made the
+# old 1800ms assertions fail on both main and the heavy-queue head. Instead,
+# hold the refresh fixture at a fifo and observe spawn/refresh events. The
+# shared loose deadline still rejects a gross delay or a missing timeout.
+refresh_bound_s=10
+refresh_start_case() {
+  local name="$1" timeout="$2"
+  refresh_ready="$TMP/refresh-$name.ready"
+  refresh_fifo="$TMP/refresh-$name.release"
+  refresh_done="$TMP/refresh-$name.done"
+  refresh_rc="$TMP/refresh-$name.rc"
+  refresh_out="$TMP/refresh-$name.out"
+  mkfifo "$refresh_fifo"
+  refresh_deadline=$(( SECONDS + refresh_bound_s ))
+  (
+    set +e
+    TEST_OWN_SESSION=0 WRK_REFRESH_MODE=hold WRK_REFRESH_TIMEOUT_S="$timeout" \
+      WRK_REFRESH_READY_FILE="$refresh_ready" WRK_REFRESH_RELEASE_FIFO="$refresh_fifo" \
+      spawn_base codex-luna >"$refresh_out" 2>&1
+    printf '%s\n' "$?" >"$refresh_rc"
+    : >"$refresh_done"
+  ) &
+  refresh_spawn_pid=$!
+  own "$refresh_spawn_pid"
+}
+refresh_wait() {
+  local failure="$1"; shift
+  local remaining=$(( refresh_deadline - SECONDS ))
+  if (( remaining <= 0 )) || ! wait_until "$remaining" "$@"; then
+    fail "D4 $failure (loose ${refresh_bound_s}s bound)"
+  fi
+}
+refresh_spawn_ready() {
+  [[ -s "$refresh_ready" && -e "$refresh_done" ]]
+}
+refresh_child_dead() {
+  ! ps -p "$(cat "$refresh_ready")" -o pid= | grep -q '[0-9]'
+}
+refresh_timeout_finished() {
+  refresh_spawn_ready &&
+    grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' "$refresh_out" &&
+    refresh_child_dead
+}
 : >"$TMP/refresh.log"
-start_ns="$(python3 -c 'import time; print(time.time_ns())')"
-success_out="$(spawn_base codex-luna 2>&1)"
-elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - start_ns) / 1000000 ))"
+refresh_start_case detached 30
+refresh_wait 'spawn did not return while refresh was held' refresh_spawn_ready
+wait "$refresh_spawn_pid"
+[[ "$(cat "$refresh_rc")" -eq 0 ]] || fail 'D4 detached spawn failed'
+success_out="$(cat "$refresh_out")"
 grep -q 'model=codex-luna' <<<"$success_out"
-[[ "$elapsed_ms" -lt 1800 ]]  # 동일 flake 계열 — 위 timeout 케이스와 같은 근거로 완화
-for _ in {1..20}; do
-  grep -q '^refresh codex --background$' "$TMP/refresh.log" && break
-  sleep 0.05
-done
-grep -q '^refresh codex --background$' "$TMP/refresh.log"
+ps -p "$(cat "$refresh_ready")" -o pid= | grep -q '[0-9]' ||
+  fail 'D4 spawn did not return while refresh was held at the fifo'
+[[ ! -s "$TMP/refresh.log" ]] || fail 'D4 held refresh completed before release'
+python3 - "$refresh_fifo" <<'PY'
+import os, sys
+fd = os.open(sys.argv[1], os.O_WRONLY | os.O_NONBLOCK)
+try:
+    os.write(fd, b"\n")
+finally:
+    os.close(fd)
+PY
+refresh_wait 'released refresh did not log its pool/background arguments' \
+  grep -q '^refresh codex --background$' "$TMP/refresh.log"
+refresh_wait 'released refresh child did not exit' refresh_child_dead
+echo 'PASS D4-refresh-detached-until-fixture-release'
 
 failed_out="$(WRK_REFRESH_MODE=fail spawn_base codex-luna 2>&1)"
 grep -q 'scopefuel refresh failed for pool=codex; spawn already succeeded' <<<"$failed_out"
 grep -q 'model=codex-luna' <<<"$failed_out"
 
-timeout_start_ns="$(python3 -c 'import time; print(time.time_ns())')"
 : >"$TMP/refresh.pids"
-timeout_out="$(WRK_REFRESH_MODE=hang WRK_REFRESH_DELAY=2 WRK_REFRESH_TIMEOUT_S=0.2 spawn_base codex-luna 2>&1)"
-timeout_elapsed_ms="$(( ($(python3 -c 'import time; print(time.time_ns())') - timeout_start_ns) / 1000000 ))"
-# 2s hang 을 기다리지 않았음을 증명하면 충분하다 — 1000ms 는 부하 있는 머신에서
-# 오탐(실측 1075ms flake)이라 hang(2000ms) 대비 명확히 짧은 1800ms 로 완화.
-[[ "$timeout_elapsed_ms" -lt 1800 ]]
+: >"$TMP/refresh.log"
+refresh_start_case timeout 0.2
+refresh_wait 'refresh did not time out and reap its unreleased fixture' refresh_timeout_finished
+wait "$refresh_spawn_pid"
+[[ "$(cat "$refresh_rc")" -eq 0 ]] || fail 'D4 timed-out refresh changed spawn success'
+timeout_out="$(cat "$refresh_out")"
 grep -q 'scopefuel refresh timed out for pool=codex; spawn already succeeded' <<<"$timeout_out"
 grep -q 'model=codex-luna' <<<"$timeout_out"
+# No writer ever released this fifo: the supervisor timed out and reaped the
+# blocked fixture, rather than waiting for a chosen sleep duration to finish.
+[[ ! -s "$TMP/refresh.log" ]] || fail 'D4 timed-out fixture passed the unreleased fifo'
 while IFS= read -r refresh_pid; do
   [[ -z "$refresh_pid" ]] || ! ps -p "$refresh_pid" -o pid= | grep -q '[0-9]'
 done <"$TMP/refresh.pids"
+echo 'PASS D4-refresh-timeout-reaps-unreleased-fixture'
 
 cp "$SCOPEFUEL" "$TMP/non-executable-scopefuel"
 chmod -x "$TMP/non-executable-scopefuel"
@@ -9814,6 +10489,11 @@ launch_profile_case builder-sonnet builder-sonnet-canon 'sonnet@xhigh' --role bu
 launch_profile_case builder-sonnet builder-sonnet-canon-max 'sonnet@max' --role builder --lane builder-sonnet-canon-max-lane --parent parent-lane --effort max
 launch_profile_case builder-sonnet builder-sonnet-canon-high 'sonnet@high' --role builder --lane builder-sonnet-canon-high-lane --parent parent-lane --effort high
 launch_profile_case codex-astra codex-astra-canon 'codex-astra@xhigh'
+# hk 2043: the normal pinned sol spelling records its canonical rung — no E6
+# marker, but the gate judges codex-sol@xhigh (an escalation rung, so the
+# fixture gate takes the operator REF).
+launch_profile_case builder-sol-xhigh builder-sol-xhigh-canon 'codex-sol@xhigh' \
+  --role builder --lane builder-sol-xhigh-lane --parent parent-lane --operator-request hk:task/2043
 # Other pools keep their literal spelling@effort — no other pool's record moves.
 launch_profile_case devin-swe2 devin-launch-literal 'devin-swe2'
 launch_profile_case builder-opus builder-opus-launch-literal 'builder-opus@high' --role builder --lane builder-opus-lane --parent parent-lane
@@ -10598,11 +11278,11 @@ expect_exit 2 spawn_base codex-luna --role worker --lane worker-lane --parent pa
 echo "PASS builder-parent-and-director-lane-guards"
 
 for builder_profile in builder-opus captain-opus builder-sol builder-sol6 captain-sol builder-devin builder-grok builder-kimi builder-luna builder-sonnet \
-  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-max builder-sol-medium \
+  builder-opus-low builder-opus-medium builder-sonnet-xhigh builder-sonnet-max builder-sol-high builder-sol-xhigh builder-sol-max builder-sol-medium \
   builder-luna-max builder-kimi-high builder-kimi-max \
   builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-haiku-max builder-sonnet-low; do
   expect_exit 2 spawn_base "$builder_profile" --role worker --job "worker-reject-${builder_profile}"
 done
 echo "PASS worker-rejects-all-builder-profile-aliases"
@@ -10629,7 +11309,7 @@ echo "PASS removed-astra-builder-spellings-hit-tombstone"
 # builder accept list. Fixing only one side must turn this RED (that read-order
 # dependence is what #505 removed). The literal accept-line pin also makes
 # re-adding an astra spelling to the list alone go RED.
-accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-luna-low|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
+accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;' "$ROOT/bin/wrk")"
 [[ -n "$accept_line" ]] || fail "--role builder accept list drifted or was not found"
 [[ "$(wc -l <<<"$accept_line" | tr -d ' ')" == 1 ]] ||
   fail "accept-list pattern is not unique: $accept_line"
@@ -10638,7 +11318,7 @@ accept_line="$(grep -nF 'builder-opus|builder-sol|builder-sol6|builder-devin|bui
 # inside builder-grok); grok-hi presence covers it, and the literal accept-line
 # pin above guards the list itself. `builder-level` is prose, `captain-NN` is a
 # session name in SKILL.md — neither is a profile.
-builder_tokens() { grep -oE '(builder|captain)-[a-z0-9-]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vxE 'builder-level|captain-[0-9]+' | grep -v '^builder-terra-' | sort -u; }
+builder_tokens() { grep -oE '(builder|captain)-[a-z0-9-]+|devin-swe2-medium|devin-swe2-max|devin-swe2|grok-hi|kimi-k3' | grep -vxE 'builder-level|captain-[0-9]+' | grep -v '^builder-terra-' | grep -v '^builder-terra61-' | sort -u; }
 accept_set="$(builder_tokens <<<"$accept_line")"
 help_block="$(sed -n '/--role worker|builder/,/--lane NAME/p' "$ROOT/bin/wrk")"
 help_set="$(builder_tokens <<<"$help_block")"
@@ -10735,12 +11415,17 @@ sol61_case codex-sol max
 sol61_case codex-max max
 sol61_case builder-sol high --role builder --lane sol61-builder-lane --parent parent-lane
 sol61_case captain-sol high --role builder --lane sol61-captain-lane --parent parent-lane
-# The E6 builder rungs are switched spellings too (builder-sol-max included
-# since hk 1864 opened the max builder seat).
+# The E6 builder rungs are switched spellings too. hk 2043 made
+# builder-sol-max a normal pinned spelling, so it is spawned here with no
+# SCOPEFUEL_E6_ARM marker (its own case is below).
 SCOPEFUEL_E6_ARM=codex-sol@high sol61_case builder-sol-high high --role builder --lane sol61-e6h-lane --parent parent-lane
-SCOPEFUEL_E6_ARM=codex-sol@max sol61_case builder-sol-max max --role builder --lane sol61-e6x-lane --parent parent-lane
+sol61_case builder-sol-max max --role builder --lane sol61-e6x-lane --parent parent-lane
 SCOPEFUEL_E6_ARM=codex-sol@medium sol61_case builder-sol-medium medium --role builder --lane sol61-e6m-lane --parent parent-lane
 SCOPEFUEL_E6_ARM=codex-sol@low sol61_case builder-sol-low low --role builder --lane sol61-e6l-lane --parent parent-lane
+# hk 2043: builder-sol-xhigh is the normal pinned xhigh spelling — same canon
+# model id, xhigh rung, no E6 marker (the S+ escalation row still takes a REF).
+sol61_case builder-sol-xhigh xhigh --role builder --lane sol61-xhigh-lane --parent parent-lane \
+  --operator-request hk:task/2043
 echo "PASS 1026-AC1-switched-spellings-carry-gpt-6.1-sol"
 
 # AC2 — the rollback spellings pin the literal gpt-6-sol even though the fake
@@ -11358,6 +12043,14 @@ e6_builder_case builder-sonnet-medium sonnet     medium '--model sonnet --danger
 e6_builder_case builder-haiku-low    haiku      low    '--model haiku --dangerously-skip-permissions --effort low'
 e6_builder_case builder-luna-low     codex-luna low    '--yolo -m gpt-5.6-luna -c model_reasoning_effort=low'
 e6_builder_case builder-luna-medium  codex-luna medium '--yolo -m gpt-6-luna -c model_reasoning_effort=medium'
+# hk 2043: builder-luna-high is the luna family's high E6 rung — the same pin
+# rule and marker as the low/medium pair (director-1, 2026-10-26, for the
+# r1026luna L-A+ arm).
+e6_builder_case builder-luna-high    codex-luna high   '--yolo -m gpt-6-luna -c model_reasoning_effort=high'
+# hk 2043: builder-haiku-medium is the haiku family's medium E6 rung (the
+# r1026effdown arm B haiku@high vs haiku@medium) on the same pin rule and
+# marker as builder-haiku-low.
+e6_builder_case builder-haiku-medium haiku      medium '--model haiku --dangerously-skip-permissions --effort medium'
 # hk 1863: the five hk 1786 borrow-down and promote-up spellings on the same
 # pin rule. builder-sol-low takes its model id from the codex-sol catalog row
 # (the fixture serves gpt-6.1-sol) and gates at codex-sol@low; the haiku and
@@ -11386,22 +12079,182 @@ grep -q 'policy launch codex-sol effort=low' "$TMP/launch.log" ||
 echo "PASS 704+737+1796+1863 E6 builder rungs launch exact argv, gate at their rung, record canonical launch_profile"
 
 # hk 1864 (operator 2026-10-23): the no-max builder-seat refusal of the
-# 2026-09-26 decision 4088 B is repealed, so the five max-rung builder spellings
-# are admitted with their exact SCOPEFUEL_E6_ARM marker armed and launch at the
-# max rung (the kimi one through the max clone home).
+# 2026-09-26 decision 4088 B is repealed, so the max-rung builder spellings are
+# admitted with their exact SCOPEFUEL_E6_ARM marker armed and launch at the max
+# rung (the kimi one through the max clone home). builder-sol-max left this E6
+# set in hk 2043 (normal pinned spelling — its own case below).
 e6_builder_case builder-sonnet-max   sonnet     max    '--model sonnet --dangerously-skip-permissions --effort max'
-e6_builder_case builder-sol-max      codex-sol  max    '--yolo -m gpt-6.1-sol -c model_reasoning_effort=max'
 e6_builder_case builder-luna-max     codex-luna max    '--yolo -m gpt-6-luna -c model_reasoning_effort=max'
 e6_builder_case builder-kimi-max     kimi-k3    max    '--auto -m kimi-code/k3'
 e6_builder_case builder-haiku-max    haiku      max    '--model haiku --dangerously-skip-permissions --effort max'
-# A non-rung spelling takes an explicit max on a builder seat too:
-# --effort max on builder-sol (default high) is admitted and launches at max.
+# hk 2043 (operator r1026solmax, revision 3): builder-sol-xhigh and
+# builder-sol-max are NORMAL pinned spellings — the rung is pinned exactly like
+# an E6 spelling (catalog and gate consult, model, default effort, different
+# effort refusal) but spawn takes no SCOPEFUEL_E6_ARM marker. builder-sol-max
+# is the S+ gate=default row, so it also takes no --operator-request;
+# builder-sol-xhigh is an escalation rung, so the gate still demands a REF.
+normal_pinned_spawn() {
+  # The brief's case is "SCOPEFUEL_E6_ARM unset", not merely empty: a stale
+  # ambient marker must not be read as an E6 arm.
+  unset SCOPEFUEL_E6_ARM
+  spawn_base "$@"
+}
+normal_pinned_case() {
+  local model="$1" gate="$2" rung="$3" argv_tail="$4"; shift 4
+  local job="np-${model}-job" out rc start
+  : >"$TMP/herdr.log" "$TMP/scopefuel.log"
+  set +e
+  out="$(ARBITER_INBOX_ROOT="$E6_INBOX" XDG_DATA_HOME="$E6_XDG" \
+    normal_pinned_spawn "$model" --role builder --lane "$model-lane" --parent parent-lane \
+    --job "$job" --t T1 "$@" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] ||
+    fail "$model must be admitted with SCOPEFUEL_E6_ARM unset (rc=$rc): $out"
+  start="$(grep '^agent start ' "$TMP/herdr.log")"
+  [[ "$start" == *" -- $argv_tail" ]] ||
+    fail "$model must launch the exact $rung rung argv: $start"
+  grep -qF "gate -m $gate --effort $rung" "$TMP/scopefuel.log" ||
+    fail "$model must ask the gate about the $rung rung: $(cat "$TMP/scopefuel.log")"
+  python3 - "$E6_INBOX/$job/events" "$gate@$rung" "$model" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert record["payload"]["launch_profile"] == sys.argv[2], (sys.argv[3], record)
+PY
+}
+
+normal_pinned_case builder-sol-xhigh codex-sol xhigh \
+  '--yolo -m gpt-6.1-sol -c model_reasoning_effort=xhigh' --operator-request hk:task/2043
+normal_pinned_case builder-sol-max codex-sol max \
+  '--yolo -m gpt-6.1-sol -c model_reasoning_effort=max'
+
+# hk 2043 item 6: the gate still decides admission. codex-sol@xhigh is an
+# escalation rung at S+, so a bare spawn is refused by the gate (rc 3) and the
+# same spawn with a valid operator REF is admitted (the case above).
 : >"$TMP/herdr.log"
-e6_max_out="$(spawn_base builder-sol --role builder --lane e6-effort-max-lane --parent parent-lane \
-  --effort max --job e6-builder-sol-effort-max --t T1 2>&1)" ||
-  fail "builder-sol --effort max must be admitted on a builder seat (hk 1864): $e6_max_out"
-[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-6.1-sol -c model_reasoning_effort=max' ]] ||
-  fail "builder-sol --effort max must launch at the max rung: $(cat "$TMP/herdr.log")"
+set +e
+np_esc_out="$(normal_pinned_spawn builder-sol-xhigh --role builder --lane np-xhigh-esc-lane \
+  --parent parent-lane --job np-xhigh-esc --t T1 2>&1)"
+np_esc_rc=$?
+set -e
+[[ "$np_esc_rc" -eq 3 ]] ||
+  fail "builder-sol-xhigh without --operator-request must hit the gate escalation refusal (rc=$np_esc_rc): $np_esc_out"
+grep -q 'escalation' <<<"$np_esc_out" ||
+  fail "builder-sol-xhigh refusal must be the gate's escalation denial: $np_esc_out"
+
+# A stale marker (another rung of the same profile) must not gate or label a
+# normal pinned spelling: the spawn is admitted and the record still reads
+# codex-sol@max — never an E6 arm.
+: >"$TMP/herdr.log" "$TMP/scopefuel.log"
+np_stale_out="$(SCOPEFUEL_E6_ARM=codex-sol@high ARBITER_INBOX_ROOT="$E6_INBOX" \
+  XDG_DATA_HOME="$E6_XDG" spawn_base builder-sol-max --role builder \
+  --lane np-sol-max-stale-lane --parent parent-lane --job np-sol-max-stale --t T1 2>&1)" ||
+  fail "a stale SCOPEFUEL_E6_ARM must not refuse builder-sol-max: $np_stale_out"
+python3 - "$E6_INBOX/np-sol-max-stale/events" <<'PY'
+import json, pathlib, sys
+events = [json.loads(p.read_text()) for p in pathlib.Path(sys.argv[1]).glob("*.json")]
+record = next(e for e in events if e["kind"] == "quota_pool.record")
+assert record["payload"]["launch_profile"] == "codex-sol@max", record
+PY
+echo "PASS hk 2043 normal pinned sol spellings take no marker, record their canon rung, and stay gate-decided"
+
+# hk 2043 item 4: an unpinned builder spelling whose catalog consult is pinned
+# to one rung refuses a different --effort instead of silently consulting the
+# pin while launching another rung. The line names the matching pinned
+# spelling when the family has one.
+np_mismatch_case() {
+  local model="$1" effort="$2" want="$3"
+  local out rc
+  set +e
+  out="$(normal_pinned_spawn "$model" --role builder --lane "np-mm-$model-lane" \
+    --parent parent-lane --job "np-mm-$model-$effort" --t T1 --effort "$effort" 2>&1)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 2 ]] ||
+    fail "$model --effort $effort must die rc 2 (rc=$rc): $out"
+  grep -qF "$want" <<<"$out" ||
+    fail "$model --effort $effort refusal must name '$want': $out"
+}
+np_mismatch_case builder-sol xhigh 'use builder-sol-xhigh for --effort xhigh'
+np_mismatch_case builder-sol max 'use builder-sol-max for --effort max'
+np_mismatch_case builder-sol medium 'use builder-sol-medium for --effort medium'
+np_mismatch_case builder-sol6 max 'use --effort high'
+np_mismatch_case builder-grok low 'use builder-grok-low for --effort low'
+# builder-sol --effort high is unchanged (no refusal, launches high).
+: >"$TMP/herdr.log"
+normal_pinned_spawn builder-sol --role builder --lane np-sol-high-lane \
+  --parent parent-lane --job np-sol-high --t T1 --effort high >/dev/null
+[[ "$(grep '^agent start ' "$TMP/herdr.log")" == *' -- --yolo -m gpt-6.1-sol -c model_reasoning_effort=high' ]] ||
+  fail "builder-sol --effort high must still launch the high rung: $(cat "$TMP/herdr.log")"
+echo "PASS hk 2043 unpinned builder spellings refuse an off-consult effort and name the pinned spelling"
+
+# Mutants, each applied at the real call site (bin/wrk source), never to the
+# repository file. Every mutant must turn its probe RED.
+np_probe() {  # $1=wrk path, $2=tag, $3=model; extra spawn flags after
+  local wrk="$1" tag="$2" model="$3"; shift 3
+  WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn "$model" --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 "$@" >/dev/null 2>&1 || return 1
+}
+np_marker_required_probe() {  # 0 iff the no-marker spawn is refused
+  local wrk="$1" tag="$2" model="$3"
+  ! WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn "$model" --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 >/dev/null 2>&1
+}
+np_consult_probe() {  # 0 iff builder-sol-xhigh's catalog consult asks xhigh
+  local wrk="$1" tag="$2"
+  : >"$TMP/launch.log"
+  WRK="$wrk" WRK_LAUNCH_LOG="$TMP/launch.log" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" \
+    XDG_DATA_HOME="$TMP/npm-xdg-$tag" normal_pinned_spawn builder-sol-xhigh \
+    --role builder --lane "npm-$tag-lane" --parent parent-lane --job "npm-$tag" \
+    --t T1 --operator-request hk:task/2043 >/dev/null 2>&1 || return 1
+  grep -q 'policy launch codex-sol effort=xhigh' "$TMP/launch.log"
+}
+np_mismatch_probe() {  # 0 iff builder-sol --effort xhigh is refused
+  local wrk="$1" tag="$2"
+  ! WRK="$wrk" ARBITER_INBOX_ROOT="$TMP/npm-inbox-$tag" XDG_DATA_HOME="$TMP/npm-xdg-$tag" \
+    normal_pinned_spawn builder-sol --role builder --lane "npm-$tag-lane" \
+    --parent parent-lane --job "npm-$tag" --t T1 --effort xhigh >/dev/null 2>&1
+}
+np_probe "$WRK" real-solmax builder-sol-max ||
+  fail "builder-sol-max probe must be admitted on the real wrk"
+np_marker_required_probe "$WRK" real-haikumax builder-haiku-max ||
+  fail "builder-haiku-max probe must be refused without a marker on the real wrk"
+np_consult_probe "$WRK" real-consult ||
+  fail "builder-sol-xhigh probe must consult codex-sol@xhigh on the real wrk"
+np_mismatch_probe "$WRK" real-mismatch ||
+  fail "builder-sol --effort xhigh probe must be refused on the real wrk"
+# Invariant: requiring the marker for builder-sol-max turns the no-marker case
+# RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-marker-required" \
+  'if ! normal_pinned_builder "$MODEL"; then' 'if true; then'
+expect_red "normal-pinned-marker-required" np_probe "$TMP/wrk-np-marker-required" mut-solmax builder-sol-max
+# Invariant: exempting every pinned spelling from the marker turns the
+# builder-haiku-max marker case RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-marker-exempt-all" \
+  'if ! normal_pinned_builder "$MODEL"; then' 'if false; then'
+expect_red "normal-pinned-marker-exempt-all" np_marker_required_probe \
+  "$TMP/wrk-np-marker-exempt-all" mut-haikumax builder-haiku-max
+# Invariant: mapping builder-sol-xhigh's catalog consult to high turns the
+# consult case RED.
+# shellcheck disable=SC2016 # the patterns are bin/wrk source text, not expansions
+mut_wrk "$TMP/wrk-np-consult-high" \
+  '    builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;' \
+  '    builder-sol-xhigh) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN=high ;;
+    builder-sol-high|builder-sol-max|builder-sol-medium|builder-sol-low) CATALOG_PROFILE=codex-sol; CATALOG_EFFORT_PIN="${MODEL##*-}" ;;'
+expect_red "normal-pinned-consult-high" np_consult_probe "$TMP/wrk-np-consult-high" mut-consult
+# Invariant: dropping the unpinned-mismatch refusal turns the builder-sol
+# --effort xhigh case RED.
+mut_wrk "$TMP/wrk-np-mismatch-dropped" \
+  '      builder-sol|captain-sol)' '      captain-sol)'
+expect_red "normal-pinned-mismatch-dropped" np_mismatch_probe \
+  "$TMP/wrk-np-mismatch-dropped" mut-mismatch
+echo "PASS hk 2043 normal-pinned and unpinned-mismatch mutants go RED"
+
 # codex `ultra` is the max tier plus subagents — hk 1864 opened max only, so
 # the seat rule still refuses ultra.
 set +e
@@ -11828,9 +12681,9 @@ echo "PASS 748r3 kimi seat rule resolves real TOML, env overlay, and disabled Th
 for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
   builder-sol-high builder-sol-medium \
   builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-medium \
-  builder-sol-low builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
-  builder-sonnet-max builder-sol-max builder-luna-max builder-kimi-max builder-haiku-max; do
+  builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
+  builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
+  builder-sonnet-max builder-luna-max builder-kimi-max builder-haiku-max; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
@@ -11934,7 +12787,8 @@ grep -q 'SCOPEFUEL_E6_ARM=codex-luna@medium' <<<"$e6_rung_out" ||
 for e6_wr in builder-sol-low:codex-sol@high:codex-sol@low \
   builder-haiku-high:haiku@low:haiku@high builder-haiku-xhigh:haiku@high:haiku@xhigh \
   builder-sonnet-low:sonnet@medium:sonnet@low \
-  builder-haiku-max:haiku@xhigh:haiku@max builder-sol-max:codex-sol@high:codex-sol@max \
+  builder-haiku-max:haiku@xhigh:haiku@max builder-luna-high:codex-luna@medium:codex-luna@high \
+  builder-haiku-medium:haiku@high:haiku@medium \
   builder-sonnet-max:sonnet@xhigh:sonnet@max builder-luna-max:codex-luna@medium:codex-luna@max; do
   IFS=: read -r e6_wr_model e6_wr_marker e6_wr_want <<<"$e6_wr"
   set +e
@@ -12181,7 +13035,7 @@ set -e
 # rung spelled out is the allowed restatement (covered by e6_builder_case).
 for e6_ef in builder-sol-low:codex-sol@low:medium builder-haiku-high:haiku@high:low \
   builder-haiku-xhigh:haiku@xhigh:high builder-haiku-max:haiku@max:xhigh \
-  builder-sonnet-low:sonnet@low:medium; do
+  builder-sonnet-low:sonnet@low:medium builder-haiku-medium:haiku@medium:high; do
   IFS=: read -r e6_ef_model e6_ef_marker e6_ef_off <<<"$e6_ef"
   set +e
   e6_eff_out="$(SCOPEFUEL_E6_ARM="$e6_ef_marker" \
@@ -13520,10 +14374,10 @@ wait_until 15 bash -c "! kill -0 $grace_pid 2>/dev/null" ||
   fail "the sentinel must exit once it has completed a job it had already reported lost"
 wait "$grace_pid" 2>/dev/null || true
 grace_log="$GRACE_INBOX/sentinel-grace/completion-sentinel.log"
-grace_lines="$(awk 'END{print NR}' "$grace_log")"
+grace_lines="$(awk '/ status=/ { n++ } END { print n+0 }' "$grace_log")"
 grace_calls="$(awk 'END{print NR}' "$GRACE_SEQ.calls")"
 [[ "$grace_lines" -eq "$grace_calls" ]] ||
-  fail "completion-sentinel.log must hold exactly one line per decision: $grace_lines lines for $grace_calls observations"
+  fail "completion-sentinel.log must hold exactly one decision per observation: $grace_lines decisions for $grace_calls observations"
 grep -q 'action=lost:herdr_unreachable' "$grace_log" ||
   fail "the decision log must name the lost reason it wrote (action=lost:herdr_unreachable)"
 grep -q 'action=completed' "$grace_log" ||
@@ -13545,8 +14399,8 @@ GONE_EVENTS="$GONE_INBOX/sentinel-gone/events"
 [[ "$(sentinel_lost_reason "$GONE_EVENTS")" == "agent_not_found" ]] ||
   fail "job.lost must carry reason=agent_not_found, got '$(sentinel_lost_reason "$GONE_EVENTS")'"
 gone_log="$GONE_INBOX/sentinel-gone/completion-sentinel.log"
-[[ "$(awk 'END{print NR}' "$gone_log")" -eq 1 ]] ||
-  fail "one observation is one decision is one log line"
+[[ "$(awk '/ status=/ { n++ } END { print n+0 }' "$gone_log")" -eq 1 ]] ||
+  fail "one observation is one decision log entry"
 grep -q 'status=err:agent_not_found transient=0 action=lost:agent_not_found' "$gone_log" ||
   fail "the decision log must show the error code that proved the loss"
 echo "PASS sentinel-agent-not-found-is-immediate-loss"
@@ -15434,8 +16288,50 @@ else
   echo "PASS hk1137-ascii M1: removing the --lane-defer locale pin goes RED"
 fi
 
+# hk 1439: deliberate check — with SCOPEFUEL_BIN unset, a profile lease falls back
+# to PATH, must hit the tripwire shim (rc 99 via the lease error), then the log is
+# restored to its prior content so the end-of-suite check still means something.
+tw_job=tripwire-deliberate
+"$ARBITER" claim --job "$tw_job" --agent-label fixture --lane fixture --t T1 >/dev/null
+# the gate text must carry a pool so resolve_pool goes on to known_pools (scopefuel --json)
+printf '%s\n' 'profile=codex-luna-max pool=codex' >"$TMP/tw-gate.txt"
+tw_rc=0
+cp "$TRIPWIRE_LOG" "$TMP/tripwire.before"
+( unset SCOPEFUEL_BIN
+  "$ARBITER" lease --job "$tw_job" --kind quota_pool --profile codex-luna-max \
+    --gate-output "$TMP/tw-gate.txt" --json >"$TMP/tw-lease.out" 2>"$TMP/tw-lease.err" ) || tw_rc=$?
+[[ "$tw_rc" -ne 0 ]] || fail "hk1439: lease without SCOPEFUEL_BIN unexpectedly succeeded"
+[[ "$(wc -l <"$TRIPWIRE_LOG")" -gt "$(wc -l <"$TMP/tripwire.before")" ]] ||
+  fail "hk1439: tripwire did not fire for a lease without SCOPEFUEL_BIN: $(cat "$TMP/tw-lease.err")"
+grep -q 'exit 99' "$TMP/tw-lease.err" "$TMP/tw-lease.out" ||
+  fail "hk1439: lease error did not show the tripwire rc 99: $(cat "$TMP/tw-lease.err")"
+cp "$TMP/tripwire.before" "$TRIPWIRE_LOG" # drop only this case's own line
+echo "PASS hk1439 tripwire fires when SCOPEFUEL_BIN is unset"
+
 bash "$ROOT/tests/test-shellcheck-capped.sh"
 # hk 1604: devin gate-profile contract. The real-scopefuel smoke stays opt-in
 # (SCOPEFUEL_SMOKE_REPO), so this CI invocation does not need a checkout.
 bash "$ROOT/tests/test-devin-gate-profile.sh"
+# hk 1990: preserve durable operator refs at the actual apply_catalog call site.
+python3 -m unittest discover -s "$ROOT/tests" -p 'test_wrk_operator_ref.py' -v
+bash "$ROOT/tests/test-pi-launcher.sh"
+# hk 2054: the tripwire check is the last command before PASS test-wrk — a
+# sub-suite added after it would inherit the shim PATH unchecked. Fail closed
+# unless only blanks, comments and the PASS echo follow the check's fi.
+# shellcheck disable=SC2016 # checkline is test-wrk.sh source text, not an expansion
+awk -v checkline='if [[ -s "$TRIPWIRE_LOG" ]]; then' -v want="echo 'PASS test-wrk'" '
+  $0 == checkline { if (seen) dup = 1; in_check = 1; next }
+  in_check && $0 == "fi" { in_check = 0; seen = 1; next }
+  !seen { next }
+  $0 ~ /^[[:space:]]*$/ || $0 ~ /^[[:space:]]*#/ { next }
+  $0 != want { bad = 1; next }
+  { got = 1 }
+  END { exit !(seen && got && !bad && !dup) }
+' "$0" ||
+  fail "hk2054: tripwire check is not the last command before PASS test-wrk"
+if [[ -s "$TRIPWIRE_LOG" ]]; then
+  echo "FAIL: hk1439 real-binary tripwire hit (caller argv):" >&2
+  cat "$TRIPWIRE_LOG" >&2
+  exit 1
+fi
 echo 'PASS test-wrk'

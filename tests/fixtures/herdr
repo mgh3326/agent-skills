@@ -13,6 +13,7 @@ fi
 # `pane run` record the foregrounded kind here; `pane process-info`
 # reports it. Keyed by WRK_RUN_ID (one wrk process = one spawn attempt).
 fixture_foreground_file="${TMPDIR:-/tmp}/wrk-fixture-fg-${WRK_RUN_ID:-standalone}"
+fixture_cwd_file="$fixture_foreground_file.cwd"
 fixture_set_foreground() { printf '%s\n' "$1" >"$fixture_foreground_file"; }
 fixture_foreground() { cat "$fixture_foreground_file" 2>/dev/null || true; }
 
@@ -76,7 +77,7 @@ fixture_exec_line() {
     # line whose first word survived intact is the agent's own command and
     # foregrounds its kind; a line whose first character a pending read ate
     # (e.g. `laude`) runs and fails without foregrounding anything.
-    claude\ *|codex\ *|grok\ *|kimi\ *|kiro\ *|opencode\ *|agy\ *)
+    pi\ *|claude\ *|codex\ *|grok\ *|kimi\ *|kiro\ *|opencode\ *|agy\ *)
       fixture_set_foreground "${text%% *}" ;;
   esac
 }
@@ -393,6 +394,16 @@ case "${1:-}" in
         esac
         ;;
       read)
+        if [[ "$(fixture_foreground)" == codex ]] &&
+          [[ " $* " == *" --source visible "* ]] && ! fixture_prompt_injected &&
+          [[ -n "${WRK_FIXTURE_TERRA61_SCREEN_FILE:-}" ]]; then
+          cat "$WRK_FIXTURE_TERRA61_SCREEN_FILE" 2>/dev/null || true
+          exit 0
+        fi
+        if [[ "$(fixture_foreground)" == pi && " $* " == *" --source visible "* ]]; then
+          cat "$fixture_foreground_file.pi-footer"
+          exit 0
+        fi
         if [[ "$scenario" == landing-observation-fails ]]; then
           echo 'fixture: visible read unavailable' >&2
           exit 9
@@ -557,6 +568,12 @@ case "${1:-}" in
         # echoes onto the modelled screen whether or not it ever executes;
         # only a line that executes foregrounds the agent.
         start_kind="$(sed -n 's/.* --kind \([^ ]*\).*/\1/p' <<<" $*")"
+        if [[ "$start_kind" == pi ]]; then
+          pi_args=("$@")
+          while [[ "${pi_args[0]}" != -- ]]; do pi_args=("${pi_args[@]:1}"); done
+          WRK_PI_CWD="$(cat "$fixture_cwd_file")" \
+            "$(dirname "$0")/pi" "${pi_args[@]:1}" >"$fixture_foreground_file.pi-footer"
+        fi
         start_argv="$*"
         agent_line="$start_kind"
         [[ "$start_argv" == *" -- "* ]] && agent_line="$start_kind ${start_argv##* -- }"
@@ -614,6 +631,10 @@ case "${1:-}" in
         # A fresh tab holds a fresh shell — clear any foreground and screen
         # state a same-PID predecessor run left behind.
         rm -f "$fixture_foreground_file" "$fixture_screen_file" "$fixture_eaten_file" "$fixture_queue_file" "$fixture_rcdone_file" "$fixture_env_file"
+        tab_args=("$@")
+        for ((i=0; i+1<${#tab_args[@]}; i++)); do
+          [[ "${tab_args[i]}" != --cwd ]] || printf '%s\n' "${tab_args[i+1]}" >"$fixture_cwd_file"
+        done
         printf '%s\n' '{"result":{"tab_id":"w:t1","root_pane":{"pane_id":"w:p1"}}}'
         ;;
       close)
@@ -798,6 +819,12 @@ case "${1:-}" in
           printf 'fixture: pane read unavailable\n' >&2
           exit 9
         fi
+      fi
+      # hk 1895: fail only the failed-pane screen capture shape (--lines 200),
+      # never the readiness probe's --lines 60 read.
+      if [[ -n "${WRK_FIXTURE_PANE_READ200_FAIL:-}" && " $* " == *" --lines 200 "* ]]; then
+        printf 'fixture: pane read unavailable\n' >&2
+        exit 9
       fi
       # devin-slow-rc: the modelled rc finishes on the
       # ${WRK_FIXTURE_RC_READS:-6}-th pane read — every input line queued
