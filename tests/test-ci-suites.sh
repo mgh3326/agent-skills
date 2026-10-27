@@ -9,6 +9,9 @@ from pathlib import Path
 import sys
 
 root = Path(sys.argv[1])
+workflow = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+assert workflow.count('"git", "diff", "--name-only", "--no-renames"') == 1, "PR docs-only diff must include rename source paths"
+assert 'git diff --name-only --no-renames "${{ github.event.before }}"' in workflow, "push docs-only diff must include rename source paths"
 manifest = root / "tests/ci-suites.txt"
 manifest_sha256 = hashlib.sha256(manifest.read_bytes()).hexdigest()
 assert manifest_sha256 == "0f86450bc19227c00420319b9f0934ae98f9facd58283c46978040fd5f65214c", "suite list changed; review all shard coverage deliberately"
@@ -60,7 +63,7 @@ for raw in smoke:
         path, command, reason = line.split("|", 2)
         assert reason.strip(), f"missing Darwin sensitivity reason: {path}"
         paths.append(path)
-        assert command == "-" or command in commands, f"smoke coverage is not in CI suites: {command}"
+        assert command == "-" or command in smoke_commands, f"smoke coverage is not run by macos-smoke: {command}"
 
 assert len(smoke_commands) == len(set(smoke_commands)), "duplicate macOS smoke command"
 assert all(command in commands for command in smoke_commands), "every smoke command must exist in today's CI suite list"

@@ -140,14 +140,14 @@ jobs:
               baseline = None
 
           start = baseline or base_sha
-          diff = ["git", "diff", "--name-only", f"{start}...{head_sha}"]
+          diff = ["git", "diff", "--name-only", "--no-renames", f"{start}...{head_sha}"]
           paths = subprocess.check_output(diff, text=True).splitlines()
           with open(changed_file, "w", encoding="utf-8") as handle:
               handle.write("\n".join(paths) + ("\n" if paths else ""))
           print(f"Docs-only comparison baseline: {baseline or base_sha}")
           PY
           elif [[ "$GITHUB_EVENT_NAME" == push && "${{ github.event.before }}" != 0000000000000000000000000000000000000000 ]]; then
-            git diff --name-only "${{ github.event.before }}" "$GITHUB_SHA" > "$RUNNER_TEMP/changed-paths"
+            git diff --name-only --no-renames "${{ github.event.before }}" "$GITHUB_SHA" > "$RUNNER_TEMP/changed-paths"
           else
             : > "$RUNNER_TEMP/changed-paths"
           fi
