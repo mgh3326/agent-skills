@@ -576,3 +576,6 @@ expect_rc 0 status
 pass "⑧ status reads a db that has no -wal/-shm sidecar without writing to it"
 
 echo 'PASS test-arbiter'
+
+# hk1991 orphan-owner contract and assertion mutants use their own temp sqlite.
+python3 "$ROOT/tests/test_arbiter_owner.py"

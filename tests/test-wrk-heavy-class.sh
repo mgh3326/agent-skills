@@ -156,9 +156,40 @@ src = open(sys.argv[1], encoding="utf-8").read()
 start = src.index("heavy_cmd() {")
 half = src[start:src.index('\ncase "${1:-}" in', start)]
 sig = re.findall(r"os\.(?:kill|killpg)\([^)]*\)|\.(?:kill|terminate|send_signal)\(|"
-                 r"import[^\n]*\bsignal\b|from signal\b", half)
-# alive() probes with signal 0; nothing in the heavy path may signal a holder
+                 r"signal\.(?:pthread_kill|raise_signal|alarm)\b", half)
+# alive() probes with signal 0; handler registration never signals a holder.
 assert sig == ["os.kill(pid, 0)"], ("a signal path exists in wrk heavy", sig)
+# director-1 ruling 2: allow only explicit HUP/TERM handler registration.
+import ast
+code = half.split("<<'PY'\n", 1)[1].rsplit("\nPY", 1)[0]
+tree = ast.parse(code)
+parents = {child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)}
+kill_calls = []
+for node in ast.walk(tree):
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+        attr = node.func
+        if attr.attr in ("kill", "killpg", "terminate", "send_signal"):
+            assert isinstance(attr.value, ast.Name) and attr.value.id == "os" and attr.attr == "kill"
+            assert len(node.args) == 2 and not node.keywords
+            assert isinstance(node.args[0], ast.Name) and node.args[0].id == "pid"
+            assert isinstance(node.args[1], ast.Constant) and node.args[1].value == 0
+            kill_calls.append(node)
+    if isinstance(node, ast.ImportFrom):
+        assert node.module != "signal", "from signal bypasses the registration guard"
+    if isinstance(node, ast.Import):
+        assert all(alias.asname is None for alias in node.names if alias.name == "signal")
+    if isinstance(node, ast.Name) and node.id == "signal":
+        parent = parents.get(node)
+        assert isinstance(parent, ast.Attribute) and parent.value is node, "indirect signal use"
+        assert parent.attr in ("signal", "SIGHUP", "SIGTERM"), "forbidden signal attribute"
+        if parent.attr == "signal":
+            call = parents.get(parent)
+            assert isinstance(call, ast.Call) and call.func is parent and len(call.args) == 2
+            first = call.args[0]
+            assert isinstance(first, ast.Attribute) and isinstance(first.value, ast.Name)
+            assert first.value.id == "signal" and first.attr in ("SIGHUP", "SIGTERM")
+            assert not call.keywords, "handler registration must use explicit constants"
+assert len(kill_calls) == 1, "only one process-existence probe is allowed"
 # the waiter record is published by rename, never by open-then-write in place
 assert "os.replace(record_tmp, me_name" in half, \
     "waiter record is not renamed into place"

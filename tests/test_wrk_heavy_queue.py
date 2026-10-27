@@ -1,15 +1,20 @@
 """hk 1407: real heavy entry-point tests, using only file-controlled fixtures."""
 
+import ast
+import io
 import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -43,7 +48,8 @@ class HeavyQueue(unittest.TestCase):
                         WRK_HOSTS_CONFIG=str(self.base / "hosts.toml"),
                         WRK_HEAVY_MAX="1", WRK_HEAVY_CLASS="lane",
                         WRK_HEAVY_CI_DEFER_MAX="1800", WRK_HEAVY_WAIT_CAP="15",
-                        WRK_HEAVY_REQUEUE_GRACE="600")
+                        WRK_HEAVY_REQUEUE_GRACE="600", WRK_HEAVY_LANE_DEFER_MAX="1800",
+                        WRK_TEST_MODE="1")
         (self.base / "hosts.toml").write_text("[local]\nheavy_load_wait = false\n")
         self.fixture = self.base / "fixture.py"
         self.fixture.write_text(
@@ -511,6 +517,239 @@ class HeavyQueue(unittest.TestCase):
         for key, name in (("A", "upper-retry"), ("a", "lower-retry")):
             self.spawn(name, key=key)
             self.assertEqual(self.ticket(self.queued(name)), tickets[key])
+
+    def plant_owner(self, start="forged", cls="lane"):
+        path = self.waiters / "owner"
+        path.write_text(f"pid={os.getpid()} class={cls} limit=1 ticket=1:1 "
+                        f"start={start} since=1900-01-01 job=- cmd=fixture")
+        return path
+
+    def owner_probe(self, name, injection):
+        return self.instrument(name, "def alive(pid, strict=False):\n", injection + "\n\ndef alive(pid, strict=False):\n")
+
+    def events(self, kind):
+        log = self.base / "heavy.log"
+        return [r for r in map(json.loads, log.read_text().splitlines()) if r["kind"] == kind] if log.exists() else []
+
+    def test_owner_pid_reuse_retires_and_audits_once(self):
+        for cls in ("lane", "ci"):
+            path = self.plant_owner(cls=cls)
+            result = self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6")
+            self.assertEqual(result.returncode, 0, "different process identity reserved capacity: " + result.stderr)
+            self.assertTrue(path.exists(), "reservation reader performed status cleanup")
+            self.assertEqual(self.run_wrk("status").returncode, 0)
+            self.assertFalse(path.exists(), "status did not retire mismatched owner")
+            self.run_wrk("status")
+        rows = self.events("waiter.retired")
+        self.assertEqual(len(rows), 2, "retirement must audit exactly once per record")
+        self.assertTrue(all(r["record"] == "owner" and r["owner_pid"] == os.getpid()
+                            and r["reason"] == "start-mismatch" for r in rows))
+
+    def eperm_owner(self, observed, start="fixture", cls="lane"):
+        path = self.plant_owner(start=start, cls=cls)
+        binary = self.owner_probe("eperm-wrk",
+            "_real_kill = os.kill\n"
+            "def _kill_probe(pid, sig):\n"
+            f"    if pid == {os.getpid()} and sig == 0: raise PermissionError(1, 'fixture')\n"
+            "    return _real_kill(pid, sig)\nos.kill = _kill_probe\n")
+        source = binary.read_text()
+        anchor = "def process_start(pid):\n"
+        self.assertEqual(source.count(anchor), 1)
+        binary.write_text(source.replace(anchor, anchor +
+            f"    if pid == {os.getpid()}: return {observed!r}\n", 1))
+        return path, binary
+
+    def test_owner_eperm_matching_retains_reservation(self):
+        for cls in ("lane", "ci"):
+            path, binary = self.eperm_owner("fixture", cls=cls)
+            result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+            self.assertEqual(result.returncode, 75, "EPERM matching identity lost reservation")
+            self.assertEqual(self.run_wrk("status", binary=binary).returncode, 0)
+            self.assertTrue(path.exists(), "EPERM matching owner was retired")
+        self.assertEqual(self.events("waiter.retired"), [])
+        self.assertEqual(self.events("waiter.owner_unknown"), [])
+
+    def test_owner_eperm_mismatch_retires(self):
+        path, binary = self.eperm_owner("different")
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 0, "EPERM mismatching owner reserved capacity")
+        self.assertEqual(self.run_wrk("status", binary=binary).returncode, 0)
+        self.assertFalse(path.exists(), "EPERM mismatching owner was retained")
+        self.assertEqual(self.events("waiter.retired")[0]["reason"], "start-mismatch")
+
+    def test_owner_eperm_unreadable_retains_reservation(self):
+        path, binary = self.eperm_owner(None)
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP=".6")
+        self.assertEqual(result.returncode, 75, "EPERM unreadable identity lost reservation")
+        self.assertEqual(len(self.events("waiter.owner_unknown")), 1)
+        self.assertEqual(self.run_wrk("status", binary=binary).returncode, 0)
+        self.assertTrue(path.exists(), "EPERM unreadable owner was retired")
+        self.assertEqual(self.events("waiter.retired"), [])
+
+    def test_owner_eperm_legacy_retains_reservation(self):
+        path, binary = self.eperm_owner(None)
+        path.write_text(path.read_text().replace(" start=fixture", ""))
+        self.assertEqual(self.run_wrk("--", "true", binary=binary,
+                                     WRK_HEAVY_WAIT_CAP=".6").returncode, 75)
+        self.run_wrk("status", binary=binary)
+        self.assertTrue(path.exists(), "EPERM legacy owner was retired")
+
+    def test_owner_unknown_keeps_record_and_logs_once(self):
+        path = self.plant_owner()
+        binary = self.owner_probe("unknown-wrk",
+            "import builtins\n_real_open = builtins.open\n_real_run = subprocess.run\n"
+            "def _open_probe(path, *args, **kwargs):\n"
+            "    if str(path).startswith('/proc/'): raise PermissionError('fixture')\n"
+            "    return _real_open(path, *args, **kwargs)\n"
+            "def _run_probe(args, *a, **kw):\n"
+            "    if args[0] == 'ps': raise subprocess.TimeoutExpired(args, 2)\n"
+            "    return _real_run(args, *a, **kw)\n"
+            "builtins.open = _open_probe\nsubprocess.run = _run_probe\n")
+        result = self.run_wrk("--", "true", binary=binary, WRK_HEAVY_WAIT_CAP="1.1")
+        self.assertEqual(result.returncode, 75, "unknown identity must retain reservation")
+        self.assertTrue(path.exists())
+        self.assertEqual(len(self.events("waiter.owner_unknown")), 1,
+                         "unreadable identity must log once per run")
+        self.assertEqual(self.run_wrk("status", binary=binary).returncode, 0)
+        self.assertTrue(path.exists(), "unknown owner was deleted")
+        self.assertEqual(self.events("waiter.retired"), [])
+
+    def test_start_identity_is_in_fixed_head_only(self):
+        holder = self.start("identity-holder")
+        text = self.lock.read_text()
+        self.assertRegex(text.split()[4], r"^start=(macos|linux):",
+                         "new owner identity missing from fixed head")
+        self.release("identity-holder")
+        self.assertEqual(holder.wait(timeout=5), 0)
+        self.plant_lane(os.getpid())
+        path = self.waiters / str(os.getpid())
+        path.write_text(path.read_text() + " start=forged")
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_WAIT_CAP=".6").returncode, 75,
+                         "command text forged a process identity")
+        self.run_wrk("status")
+        self.assertTrue(path.exists())
+
+    def test_lane_stopped_waiter_bound_and_no_preemption(self):
+        holder = self.start("bound-holder")
+        older = self.spawn("stopped-older")
+        info = self.queued("stopped-older")
+        pid = int(info.split()[0].split("=")[1])
+        os.kill(pid, signal.SIGSTOP)
+        try:
+            younger = self.spawn("bound-younger", WRK_HEAVY_LANE_DEFER_MAX="2")
+            self.queued("bound-younger")
+            start = time.monotonic()
+            POLL.wait(.6)
+            self.assertFalse(self.started("bound-younger"), "lane guard fired before its bound")
+            self.assertIsNone(holder.poll(), "guard preempted the holder")
+            self.release("bound-holder")
+            self.assertEqual(holder.wait(timeout=5), 0)
+            self.until(lambda: self.started("bound-younger"), "stopped older waiter blocked past lane bound", timeout=5)
+            self.assertGreaterEqual(time.monotonic() - start, 1.5)
+            self.release("bound-younger")
+            self.assertEqual(younger.wait(timeout=5), 0)
+        finally:
+            os.kill(pid, signal.SIGCONT)
+            self.release("stopped-older")
+        self.assertEqual(older.wait(timeout=6), 0)
+
+    def test_wait_signals_cleanup_and_exit_codes(self):
+        self.start("signal-holder")
+        for sig in (signal.SIGHUP, signal.SIGTERM):
+            proc = self.spawn("signal-" + str(sig))
+            info = self.queued("signal-" + str(sig))
+            pid = int(info.split()[0].split("=")[1])
+            os.kill(pid, sig)
+            self.assertEqual(proc.wait(timeout=5), 128 + sig, "wait signal exit status wrong")
+            self.assertFalse((self.waiters / str(pid)).exists(), "wait signal leaked waiter record")
+            self.assertFalse(self.started("signal-" + str(sig)))
+        self.assertFalse(self.started("signal-" + str(signal.SIGTERM)))
+        self.assertFalse(self.started("signal-" + str(signal.SIGHUP)))
+
+    def test_lane_bound_monotonic_and_validation(self):
+        for value in ("bad", "-1", "nan"):
+            self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX=value).returncode, 2,
+                             "invalid lane guard accepted")
+        self.plant_lane(os.getpid())
+        self.assertEqual(self.run_wrk("--", "true", WRK_HEAVY_LANE_DEFER_MAX="0").returncode, 0,
+                         "zero lane guard did not disable deferral")
+        binary = self.instrument("lane-clock", "positions_fd = -1\n",
+                                 "time.time = lambda: -1000000.0\npositions_fd = -1\n")
+        start = time.monotonic()
+        self.assertEqual(self.run_wrk("--", "true", binary=binary,
+                                     WRK_HEAVY_LANE_DEFER_MAX="1").returncode, 0,
+                         "wall clock step broke lane bound")
+        self.assertGreaterEqual(time.monotonic() - start, .9)
+        self.assertLess(time.monotonic() - start, 4)
+
+    def test_process_start_platform_methods(self):
+        source = WRK.read_text().split("heavy_cmd() {", 1)[1].split("<<'PY'\n", 1)[1].split("\nPY\n", 1)[0]
+        tree = ast.parse(source)
+        node = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "process_start")
+        ns = dict(os=os, re=re, sys=SimpleNamespace(platform="darwin"), subprocess=subprocess)
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "heavy identity", "exec"), ns)
+        response = SimpleNamespace(returncode=0, stdout="  Mon Oct  26 12:00:00 2026  \n")
+        with mock.patch.object(subprocess, "run", return_value=response) as run:
+            start = ns["process_start"](123)
+            self.assertEqual(start, "macos:" + b"Mon Oct 26 12:00:00 2026".hex())
+            self.assertEqual(run.call_args.kwargs["env"]["LC_ALL"], "C")
+            self.assertEqual(run.call_args.args[0], ["ps", "-o", "lstart=", "-p", "123"])
+            self.assertEqual(run.call_args.kwargs["timeout"], 2)
+        ns["sys"].platform = "linux"
+        stat = "123 (comm with spaces ) and parens) " + " ".join(["S"] + ["0"] * 18 + ["123456"] + ["0"] * 8)
+        boot = "01234567-89ab-cdef-0123-456789abcdef"
+        with mock.patch("builtins.open", side_effect=lambda path, **kw: io.StringIO(boot if str(path).endswith("boot_id") else stat)):
+            self.assertEqual(ns["process_start"](123), "linux:" + boot + ":123456")
+        with mock.patch("builtins.open", side_effect=PermissionError("unreadable")):
+            self.assertIsNone(ns["process_start"](123))
+
+    def test_signal_guard_rejects_active_signal_mutants(self):
+        shell = (ROOT / "tests/test-wrk-heavy-class.sh").read_text()
+        guard = shell.split("""python3 - "$WRK" <<'PY'\n""", 1)[1].split("\nPY\n", 1)[0]
+        checker = self.base / "signal-guard.py"
+        checker.write_text(guard)
+        source = WRK.read_text()
+        for name, call in (("kill", "os.kill(pid, signal.SIGTERM)"),
+                           ("raise", "signal.raise_signal(signal.SIGTERM)"),
+                           ("pthread", "signal.pthread_kill(1, signal.SIGTERM)"),
+                           ("alarm", "signal.alarm(1)")):
+            with self.subTest(mutant=name):
+                binary = self.base / ("signal-mutant-" + name)
+                binary.write_text(source.replace("def alive(pid, strict=False):\n",
+                    "def alive(pid, strict=False):\n    " + call + "\n", 1))
+                result = subprocess.run([sys.executable, str(checker), str(binary)], env=self.env,
+                                         capture_output=True, text=True, timeout=10, check=False)
+                self.assertEqual(result.returncode, 1, "active signal mutant survived")
+                self.assertIn("AssertionError:", result.stderr)
+                self.assertIn("a signal path exists", result.stderr)
+        result = subprocess.run([sys.executable, str(checker), str(WRK)], env=self.env,
+                                 capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_owner_mutants_break_invariants(self):
+        mutations = [
+            ("identity", "    if observed != start:\n", "    if False:\n",
+             "test_owner_pid_reuse_retires_and_audits_once", "different process identity reserved capacity"),
+            ("eperm-dead", 'return (True, "process-exists") if strict else True',
+             'return (False, "permission-denied") if strict else True',
+             "test_owner_eperm_matching_retains_reservation", "EPERM matching identity lost reservation"),
+            ("unknown", 'return None, "start-unreadable"', 'return False, "start-unreadable"',
+             "test_owner_unknown_keeps_record_and_logs_once", "unknown identity must retain reservation"),
+            ("lane-bound", "    if time.monotonic() - started_at >= lane_defer_max:\n", "    if False:\n",
+             "test_lane_stopped_waiter_bound_and_no_preemption", "stopped older waiter blocked past lane bound"),
+            ("hup", '    wait_signals["hup"] = signal.signal(signal.SIGHUP, wait_signal)\n', '    pass\n',
+             "test_wait_signals_cleanup_and_exit_codes", "wait signal leaked waiter record"),
+        ]
+        for name, old, new, case, invariant in mutations:
+            with self.subTest(invariant=invariant):
+                binary = self.instrument("owner-mutant-" + name, old, new)
+                result = subprocess.run([sys.executable, str(Path(__file__).resolve()), "HeavyQueue." + case],
+                    env=dict(self.env, WRK_QUEUE_TEST_BIN=str(binary)), capture_output=True,
+                    text=True, timeout=60, check=False)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertIn("AssertionError:", result.stderr)
+                self.assertIn(invariant, result.stderr)
+                self.assertNotIn("ERROR:", result.stderr, "a crash is not assertion RED")
 
     def test_mutants_break_the_named_invariants(self):
         mutations = [
