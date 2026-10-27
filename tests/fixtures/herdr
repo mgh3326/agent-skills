@@ -394,6 +394,12 @@ case "${1:-}" in
         esac
         ;;
       read)
+        if [[ "$(fixture_foreground)" == codex ]] &&
+          [[ " $* " == *" --source visible "* ]] && ! fixture_prompt_injected &&
+          [[ -n "${WRK_FIXTURE_TERRA61_SCREEN_FILE:-}" ]]; then
+          cat "$WRK_FIXTURE_TERRA61_SCREEN_FILE" 2>/dev/null || true
+          exit 0
+        fi
         if [[ "$(fixture_foreground)" == pi && " $* " == *" --source visible "* ]]; then
           cat "$fixture_foreground_file.pi-footer"
           exit 0
