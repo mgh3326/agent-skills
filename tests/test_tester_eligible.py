@@ -39,7 +39,21 @@ class EligibilityFixtures(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.jobs = Path(self.temp.name) / "jobs"
-        env = mock.patch.dict(os.environ, {"ARBITER_INBOX_ROOT": str(self.jobs)})
+        runtime = Path(self.temp.name) / "runtime"
+        env_values = {
+            "HOME": str(runtime / "home"),
+            "XDG_DATA_HOME": str(runtime / "xdg-data"),
+            "XDG_CACHE_HOME": str(runtime / "xdg-cache"),
+            "XDG_CONFIG_HOME": str(runtime / "xdg-config"),
+            "XDG_STATE_HOME": str(runtime / "xdg-state"),
+            "CODEX_HOME": str(runtime / "codex-home"),
+            "TMPDIR": str(runtime / "tmp"),
+            "ARBITER_INBOX_ROOT": str(self.jobs),
+            "WRK_TEST_MODE": "1",
+        }
+        for value in env_values.values():
+            Path(value).mkdir(parents=True, exist_ok=True)
+        env = mock.patch.dict(os.environ, env_values)
         env.start()
         self.addCleanup(env.stop)
         # Legacy profile/grade fixtures still need resolvable contributor jobs.
@@ -438,6 +452,20 @@ class EligibilityFixtures(unittest.TestCase):
         checks = self.check(evidence)
         self.assert_case(checks, "independence", "FAIL", "DS41_T3_SOLE_TESTER")
         self.assert_case(checks, "surface_permission", "FAIL", "PROFILE_SURFACE_DENIED")
+
+    def test_pi_tester_is_claude_family_and_unqualified(self) -> None:
+        evidence = self.evidence(self.make_head(), declared_t="T3")
+        evidence["contributors"][0].update(
+            profile="builder-opus", model="claude-opus-5-5", effort="high")
+        evidence["tester"] = {"planned_profile": "pi-opus55", "planned_effort": "high"}
+        spec = self.policy["profiles"]["pi-opus55"]
+        self.assertEqual((spec["family"], spec["roles"], spec["role_status"]),
+                         ("anthropic", [], "unknown"))
+        self.assert_case(self.check(evidence), "tester", "UNVERIFIED", "PROFILE_ROLE_UNKNOWN")
+        # Grant role/grade only in this fixture to reach the independent
+        # family check; production pi roles remain unknown pending reps.
+        spec.update(roles=["tester"], surfaces=["T3"], grades={"high": "S"})
+        self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_T3")
 
     def test_devin_fusion_tester_is_claude_family(self) -> None:
         # hk 1380: the devin fusion spellings carry the Claude family, so a
@@ -848,8 +876,8 @@ class EligibilityFixtures(unittest.TestCase):
     def test_advertised_aliases_have_explicit_policy_entries(self) -> None:
         names = subprocess.run([str(ROOT / "bin/wrk"), "profiles"], text=True,
                                capture_output=True, check=True).stdout.splitlines()
-        # Terra spellings are refused (operator 2026-10-12 noterra): wrk no longer
-        # advertises them, and the policy keeps each one only as an explicit denial.
+        # The old Terra spellings are refused (operator 2026-10-12 noterra): wrk
+        # no longer advertises them, and the policy keeps each as an explicit denial.
         barred = {"codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",
                   "builder-terra-xhigh", "builder-terra-max"}
         self.assertTrue(barred.isdisjoint(names), sorted(barred & set(names)))
@@ -864,6 +892,21 @@ class EligibilityFixtures(unittest.TestCase):
                                                   actual_effort=spec["default_effort"],
                                                   role=spec["roles"][0])
                 self.assertEqual(check["status"], "PASS", name)
+
+        terra61 = self.policy["profiles"]["codex-terra61"]
+        self.assertEqual((terra61["model"], terra61["family"], terra61["default_effort"]),
+                         ("gpt-6.1-terra", "openai", "low"))
+        self.assertEqual(terra61["grades"], {effort: "ungraded" for effort in
+                                              ("low", "medium", "high", "xhigh", "max", "ultra")})
+        self.assertEqual(terra61["roles"], ["worker", "tester"])
+        self.assertEqual(terra61["surfaces"], ["T1", "T2"])
+        for effort in ("medium", "high", "xhigh", "max"):
+            name = f"builder-terra61-{effort}"
+            spec = self.policy["profiles"][name]
+            self.assertEqual((spec["model"], spec["family"], spec["default_effort"]),
+                             ("gpt-6.1-terra", "openai", effort))
+            self.assertEqual((spec["roles"], spec["grade_status"], spec["grades"]),
+                             (["builder"], "conflict", {effort: None}))
 
     def test_same_family_missing_and_skipped_ci(self) -> None:
         evidence = self.evidence(self.make_head(), required_grade="A+", implementation_grade="A+")
@@ -968,21 +1011,22 @@ class EligibilityFixtures(unittest.TestCase):
         live_run = {"id": 123, "run_attempt": 1, "event": "pull_request", "head_sha": evidence["head"],
                     "status": "completed", "conclusion": "success", "pull_requests": [
                         {"number": 99, "head": {"sha": evidence["head"]}, "base": {"sha": evidence["base"]}}]}
+        required_jobs = self.policy["required_ci_jobs_by_repo"]["agent-skills"]
         live_jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"}
-                              for name in ("ubuntu-latest", "macos-latest")]}
+                              for name in required_jobs]}
         live_check = common.result("PASS", "CI_ATTEMPT_READ", "task:723")
         with mock.patch.object(eligible, "_current_pr", return_value=common.result("PASS", "PR_REFS_CURRENT", "checker:G2+G4")), \
              mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, live_jobs, live_check)):
             checks = self.check(evidence, "pre-merge")
         self.assertEqual(eligible.overall(checks), "PASS")
         self.assert_case(checks, "report", "PASS", "EXACT_HEAD_PASS")
-        with mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, {"jobs": live_jobs["jobs"][:1]}, live_check)):
+        with mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, {"jobs": []}, live_check)):
             self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_JOB_MISSING")
         missing_run = common.result("UNVERIFIED", "CI_LOOKUP_FAILED", "task:723")
         with mock.patch.object(eligible, "read_ci_attempt", return_value=(None, None, missing_run)):
             self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_LOOKUP_FAILED")
         skipped_jobs = json.loads(json.dumps(live_jobs))
-        skipped_jobs["jobs"][1]["conclusion"] = "skipped"
+        skipped_jobs["jobs"][0]["conclusion"] = "skipped"
         with mock.patch.object(eligible, "read_ci_attempt", return_value=(live_run, skipped_jobs, live_check)):
             self.assert_case(self.check(evidence, "pre-merge"), "ci_binding", "UNVERIFIED", "CI_JOB_SKIPPED")
         stale_run = json.loads(json.dumps(live_run))
@@ -1006,8 +1050,9 @@ class EligibilityFixtures(unittest.TestCase):
                     "head_sha": evidence["head"], "status": "completed", "conclusion": "success",
                     "pull_requests": [{"number": 99, "head": {"sha": evidence["head"]},
                                         "base": {"sha": evidence["base"]}}]}
+        required_jobs = self.policy["required_ci_jobs_by_repo"]["agent-skills"]
         jobs = {"jobs": [{"name": name, "status": "completed", "conclusion": "success"}
-                          for name in ("ubuntu-latest", "macos-latest")]}
+                          for name in required_jobs]}
         lookup = common.result("PASS", "CI_ATTEMPT_READ", "task:723")
         expected = ("UNVERIFIED", "CI_ATTEMPT_MISMATCH")
         with mock.patch.object(eligible, "read_ci_attempt", return_value=(dispatch, jobs, lookup)):
@@ -1125,7 +1170,8 @@ class EligibilityFixtures(unittest.TestCase):
 
     def test_e6_builder_grades_conflict_and_grok_model_must_match_wrk(self) -> None:
         variants = ("builder-opus-low", "builder-opus-medium", "builder-sonnet-xhigh", "builder-sonnet-max",
-                    "builder-sol-high", "builder-sol-max", "builder-sol-medium", "builder-luna-max",
+                    "builder-sol-high", "builder-sol-medium", "builder-sol-xhigh",
+                    "builder-luna-max", "builder-luna-high", "builder-haiku-medium",
                     "builder-kimi-high", "builder-kimi-max",
                     "builder-grok-low", "builder-grok-medium", "builder-grok-xhigh")
         for alias in variants:
@@ -1143,7 +1189,35 @@ class EligibilityFixtures(unittest.TestCase):
         _, check = common.resolve_profile("codex-sol", changed, actual_effort="max", role="tester")
         self.assertEqual((check["status"], check["reason_code"]), ("UNVERIFIED", "PROFILE_FAMILY_CONFLICT"))
 
-    def test_every_terra_profile_is_denied_to_testers(self) -> None:
+    def test_builder_sol_max_accepts_the_s_plus_t3_task(self) -> None:
+        # hk 2043 item 3: builder-sol-max is the S+ gate=default normal pinned
+        # spelling. Its policy row must cover T3 and carry the placed S+ grade,
+        # or tester-eligible answers contributors UNVERIFIED
+        # PROFILE_GRADE_CONFLICT and never accepts an S+ T3 task built by it.
+        resolved, check = common.resolve_profile(
+            "builder-sol-max", self.policy, actual_effort="max", role="builder")
+        self.assertEqual((check["status"], check["reason_code"]), ("PASS", "PROFILE_RESOLVED"))
+        self.assertEqual(resolved["surfaces"], ["T1", "T2", "T3"])
+        self.assertEqual(resolved["grade"], "S+")
+        evidence = self.evidence(self.make_head("live/guard.py"), declared_t="T3",
+            required_grade="S+", implementation_grade="S+",
+            contributors=[{"profile": "builder-sol-max", "model": "gpt-6.1-sol",
+                           "effort": "max", "role": "builder", "kind": "initial",
+                           "session": "builder-session", "worktree": "/tmp/builder"}],
+            tester={"planned_profile": "opus", "planned_effort": "high"})
+        checks = self.check(evidence)
+        self.assert_case(checks, "tier", "PASS", "T_MEETS_FLOOR")
+        self.assert_case(checks, "contributors", "PASS", "CONTRIBUTOR_UNION_RESOLVED")
+        self.assert_case(checks, "surface_permission", "PASS", "PROFILE_SURFACE_ALLOWED")
+        self.assert_case(checks, "independence", "PASS", "CROSS_FAMILY")
+        self.assert_case(checks, "grade", "PASS", "GRADE_SUFFICIENT")
+        # merge-precheck on a T3 task demands every eligibility check be PASS or
+        # N/A (director/merge_precheck.py ELIGIBILITY_NOT_PASS), so assert that
+        # whole predicate, not just the five checks named above.
+        self.assertEqual({name: check["reason_code"] for name, check in checks.items()
+                          if check["status"] not in ("PASS", "N/A")}, {})
+
+    def test_old_terra_spellings_are_denied_to_testers(self) -> None:
         barred = ("codex-terra", "codex-terra-max", "codex-med", "builder-terra-high",
                   "builder-terra-xhigh", "builder-terra-max")
         for alias in barred:
@@ -1157,6 +1231,14 @@ class EligibilityFixtures(unittest.TestCase):
                                        "planned_effort": spec["default_effort"]}
                 checks = self.check(evidence)
                 self.assert_case(checks, "tester", "FAIL", "PROFILE_ROLE_DENIED")
+
+    def test_terra61_builder_rungs_do_not_offer_tester_seats(self) -> None:
+        for effort in ("medium", "high", "xhigh", "max"):
+            alias = f"builder-terra61-{effort}"
+            evidence = self.evidence(self.make_head(f"src/{alias}-tester.py"))
+            evidence["tester"] = {"planned_profile": alias, "planned_effort": effort}
+            checks = self.check(evidence)
+            self.assert_case(checks, "tester", "FAIL", "PROFILE_ROLE_DENIED")
 
     def test_codex_med_grant_mutant_goes_red(self) -> None:
         mutant = json.loads(json.dumps(self.policy))

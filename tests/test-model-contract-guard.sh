@@ -59,7 +59,9 @@ export XDG_DATA_HOME="$TMP/xdg"
 export XDG_CACHE_HOME="$TMP/xdg-cache"
 export XDG_CONFIG_HOME="$TMP/xdg-config"
 export XDG_STATE_HOME="$TMP/xdg-state"
-mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+export CODEX_HOME="$TMP/codex-home"
+export TMPDIR="$TMP/tmp"
+mkdir -p "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$CODEX_HOME" "$TMPDIR"
 # #951: claude-kind spawns seed folder trust into ${CLAUDE_CONFIG_DIR:-$HOME}/
 # .claude.json — fixture HOME keeps the operator's real config untouched.
 export HOME="$TMP/home"
@@ -94,7 +96,16 @@ CONTRACT_OPUS_MODEL_ID="claude-opus-5-5"
 CONTRACT_FABLE_MODEL_ID="claude-fable-5-1"
 
 spawn_argv() {
-  local model="$1"; shift
+  local model="$1" terra_effort="" terra_arm="" terra_screen="$ROOT/tests/fixtures/codex-terra61-footer.txt"; shift
+  case "$model" in
+    codex-terra61) terra_effort=low; terra_arm=codex-terra61@low ;;
+    builder-terra61-*) terra_effort="${model##*-}"; terra_arm="codex-terra61@$terra_effort" ;;
+  esac
+  if [[ -n "$terra_effort" && "$terra_effort" != high ]]; then
+    terra_screen="$TMP/terra61-$model-footer.txt"
+    printf '› Ask Codex to do anything\n  GPT-6.1 Terra %s · /private/tmp/terra-probe · Context 0%%\n' \
+      "$terra_effort" >"$terra_screen"
+  fi
   # No intermediate array: an empty "extra=("$@")" array expanded with
   # "${extra[@]}" throws "unbound variable" under `set -u` on Bash 3.2
   # (macOS's default /bin/bash) even though the array itself was declared —
@@ -102,6 +113,7 @@ spawn_argv() {
   # alone has no such quirk in any bash version, empty or not.
   : >"$TMP/herdr.log"
   env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 \
+    SCOPEFUEL_E6_ARM="$terra_arm" WRK_FIXTURE_TERRA61_SCREEN_FILE="$terra_screen" \
     WRK_COMPLETION_INTERVAL_S=3600 \
     WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" \
     WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" WRK_REFRESH_LOG="$TMP/refresh.log" \
@@ -136,9 +148,26 @@ for luna_profile in codex-luna codex-luna-hi codex-luna-max; do
 done
 echo "PASS Luna profiles (codex-luna, codex-luna-hi, codex-luna-max) run $CONTRACT_LUNA_MODEL_ID"
 
-# Operator decision 2026-10-12 noterra: the machine-readable list omits barred
-# profiles while help names the refusal, so neither surface offers Terra.
+# hk 2109: the Terra61 base row defaults to low, and each builder row carries
+# its exact marker through the catalog, launcher and gate. A real footer is
+# covered by test-wrk.sh's recorded Codex 0.164.0 screen fixture.
+terra61_argv="$(spawn_argv codex-terra61)"
+grep -qF -- '-m gpt-6.1-terra -c model_reasoning_effort=low' <<<"$terra61_argv" ||
+  fail "codex-terra61 must launch gpt-6.1-terra at default low: $terra61_argv"
+for terra61_rung in medium high xhigh max; do
+  assert_argv_has "builder-terra61-$terra61_rung" \
+    "-m gpt-6.1-terra -c model_reasoning_effort=$terra61_rung" \
+    --role builder --lane guard-lane --parent guard-parent-lane
+done
+echo "PASS Terra61 base and pinned builder profiles launch gpt-6.1-terra at the selected effort"
+
+# Operator decision 2026-10-12 noterra still bars the old Terra spellings; the
+# separately named Terra61 profile is active.
 profiles="$("$WRK" profiles)"
+grep -qx 'codex-terra61' <<<"$profiles" || fail "wrk profiles omits codex-terra61"
+for active in builder-terra61-medium builder-terra61-high builder-terra61-xhigh builder-terra61-max; do
+  grep -qx "$active" <<<"$profiles" || fail "wrk profiles omits $active"
+done
 for barred in codex-terra codex-terra-max codex-med \
   builder-terra-high builder-terra-xhigh builder-terra-max; do
   if grep -qx "$barred" <<<"$profiles"; then
@@ -148,7 +177,7 @@ done
 spawn_help="$("$WRK" spawn --help)"
 grep -q 'operator 2026-10-12 noterra' <<<"$spawn_help" ||
   fail "spawn help omits the Terra refusal decision"
-echo "PASS Terra profiles are absent from wrk listings and named as refused in help"
+echo "PASS old Terra profiles remain barred and the distinct Terra61 profiles are listed"
 
 # --- Grok: generic fallback argv ------------------------------------------
 assert_argv_has grok "-m $CONTRACT_GROK_MODEL_ID"
@@ -408,20 +437,21 @@ echo "PASS a missing scopefuel marks the brief catalog=stale (never a silent fal
 # has to be acknowledged in the same commit.
 WRK_CATALOG_SPELLINGS_SNAPSHOT="$(printf '%s\n' \
   builder-grok builder-grok-low builder-grok-medium builder-grok-xhigh \
-  builder-haiku-high builder-haiku-low builder-haiku-max builder-haiku-xhigh \
-  builder-luna builder-luna-low builder-luna-max builder-luna-medium \
+  builder-haiku-high builder-haiku-low builder-haiku-max builder-haiku-medium builder-haiku-xhigh \
+  builder-luna builder-luna-high builder-luna-low builder-luna-max builder-luna-medium \
   builder-opus builder-opus-low \
   builder-opus-medium builder-sol builder-sol-high builder-sol-max \
-  builder-sol-low builder-sol-medium builder-sol6 builder-sonnet builder-sonnet-low builder-sonnet-max builder-sonnet-medium builder-sonnet-xhigh \
+  builder-sol-xhigh builder-sol-low builder-sol-medium builder-sol6 builder-sonnet builder-sonnet-low builder-sonnet-max builder-sonnet-medium builder-sonnet-xhigh \
+  builder-terra61-high builder-terra61-max builder-terra61-medium builder-terra61-xhigh \
   captain-opus captain-sol \
   cc-glm cc-qwen38 codex codex-astra codex-luna codex-luna-hi codex-luna-max \
-  codex-max codex-sol fable grok grok-hi \
+  codex-max codex-sol codex-terra61 fable grok grok-hi \
   grok-med haiku kiro-cheap kiro-haiku kiro-opus kiro-opus-max kiro-opus-xhigh \
   kiro-sol kiro-sol-max kiro-sol-xhigh kiro-sonnet opus sonnet sonnet-med | sort)"
 
-# Parse resolve_catalog_profile()'s case labels out of the real script. Terra
-# names remain there only as refusal identities; they are not catalog-consuming
-# launch spellings and therefore do not belong in the cross-repo snapshot.
+# Parse resolve_catalog_profile()'s case labels out of the real script. The old
+# Terra spellings remain refusal identities; the distinct Terra61 names are
+# catalog-consuming launch spellings and belong in the cross-repo snapshot.
 WRK_CATALOG_SPELLINGS_ACTUAL="$(awk '
   /^resolve_catalog_profile\(\) \{/ { inside = 1; next }
   inside && /^\}/ { exit }

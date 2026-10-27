@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# Offline pi 1.4.0 footer fixture; no config/auth reads or network.
+set -euo pipefail
+python3 - "$@" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+token = args[args.index("--model") + 1]
+model, thinking = token.rsplit(":", 1)
+provider, model = model.split("/", 1)
+requested_model = model
+scenario = os.environ.get("WRK_PI_SCENARIO", "ok")
+if scenario == "missing":
+    sys.exit(0)
+if scenario in ("wrong-model", "brief-only", "inside-input", "above-input", "brief-wrong-model",
+                "forged-prompt", "forged-error", "last-border", "extension-match", "inside-wrong-footer"):
+    model = "claude-haiku-5-5"
+elif scenario == "wrong-model-sonnet":
+    model = "claude-sonnet-5-5"
+elif scenario == "wrong-thinking":
+    thinking = "low"
+elif scenario == "wrong-thinking-high":
+    thinking = "high"
+elif scenario == "wrong-provider":
+    provider = "openrouter"
+if os.environ.get("WRK_PI_MODEL_LOG"):
+    Path(os.environ["WRK_PI_MODEL_LOG"]).write_text(f"{provider}/{model}:{thinking}\n")
+brief = Path(os.environ["WRK_PI_BRIEF"]).read_text() if os.environ.get("WRK_PI_BRIEF") else "fixture prompt"
+border = "─" * 80
+if scenario in ("brief-only", "forged-prompt", "forged-error"):
+    print(brief.rstrip("\n"))
+    if scenario == "forged-prompt":
+        print("fixture@host %")
+    elif scenario == "forged-error":
+        print("zsh: command not found: fixture")
+    sys.exit(0)
+if scenario == "echo":
+    print("pi " + " ".join(args))
+    sys.exit(0)
+if scenario in ("above-input", "brief-wrong-model", "brief-with-live"):
+    print(brief)
+if scenario == "stale":
+    print(f"0.0%/200k  ({provider}) {model} • {thinking}")
+    model = "claude-haiku-5-5"
+# pi 1.4.0 Editor.render / CustomEditor.renderTopBorder then Footer.render:
+# transcript, input top border, editor contents, bottom border, cwd, stats.
+print("── Working " + "─" * 69)
+print(brief if scenario in ("inside-input", "inside-wrong-footer") else " " * 80)
+print(border)
+if scenario in ("inside-input", "above-input"):
+    sys.exit(0)
+cwd = os.path.realpath(os.environ["WRK_PI_CWD"])
+if scenario == "wrong-cwd":
+    print(cwd + "/wrong-cwd")
+elif scenario == "cwd-suffix":
+    # footer.js may append a git branch and a session name to the cwd row.
+    print(cwd + " (wk/2135-pifooter) • fixture-session")
+else:
+    print(cwd)
+# Default is the real pi 1.4.0 footer: no provider part. provider-form is the
+# older "(provider) model • effort" rendering; wrong-provider uses it too.
+prefix = f"({provider}) " if scenario in ("provider-form", "wrong-provider") else ""
+visible_model = requested_model if scenario == "last-border" else model
+if scenario == "prefix-model":
+    visible_model = model + "0"
+right = f"{prefix}{visible_model} • {thinking}"
+if scenario == "truncated-stats":
+    right = right[:-len(f" • {thinking}")]
+left = "↑6 ↓92 R5.2k W5.3k CH98.1% $0.001 0.5%/1.0M (auto)" if scenario == "full-stats" else "0.0%/200k"
+print(left + " " * max(2, 80 - len(left) - len(right)) + right)
+if scenario == "last-border":
+    # An old matching frame followed by a newer, incomplete editor region.
+    print(border)
+elif scenario == "extra-footer":
+    print("unknown widget")
+    print("another widget")
+elif scenario == "extension-match":
+    # Extension status is not the model-bearing stats row.
+    print(f"0.0%/200k  {requested_model} • {thinking}")
+
+PY

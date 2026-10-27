@@ -691,6 +691,7 @@ PY
 python3 - "$WRK" <<'PY'
 src = open(__import__("sys").argv[1], encoding="utf-8").read()
 for anchor in (
+    "    if pid > 0 and start is not None and owner_alive(pid, start) is False:  # hk1991-owner-alive",
     "if limit == 0:",
     "for i in range(1, limit)]",
     "    heavy_limit=1",
