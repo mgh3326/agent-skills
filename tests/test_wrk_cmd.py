@@ -204,6 +204,34 @@ class CmdSpawnTests(unittest.TestCase):
         self.assert_refused_before_admission(
             self.spawn(role="builder"), "requested grade is unreadable")
 
+    def test_builder_seat_ignores_inherited_requested_grade(self):
+        # hk 2188 T5: under --task-hk-bypass no grade is read, and an
+        # inherited TASK_REQUESTED_GRADE from the caller's env must not
+        # supply one — the seat stays refused.
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", TASK_REQUESTED_GRADE="C"),
+            "requested grade is unreadable")
+
+    def test_builder_seat_survives_warning_only_stderr(self):
+        # hk 2188 T6: a canon answer whose stderr holds only
+        # 'scopefuel: warning:' lines must not kill wrk under pipefail.
+        self.use_hk("A")
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        result = self.spawn(role="builder", task="2188", hk_bypass=False,
+                            WRK_LAUNCH_MODE="warn-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("landed=yes", result.stdout)
+
+    def test_builder_seat_refuses_stale_canon(self):
+        # hk 2188 T1: a builder seat opens only on a fresh canon answer.
+        self.use_hk("A")
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", task="2188", hk_bypass=False,
+                       WRK_LAUNCH_MODE="stale"),
+            "is stale")
+
     def test_builder_seat_title_grade_marker_is_anchored(self):
         # A bare "grade B" earlier in the title must not understate the
         # "(grade S, T2)" marker — the rung's canon grade (A+) does not

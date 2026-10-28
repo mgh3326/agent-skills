@@ -4131,7 +4131,10 @@ pi_cmd_rung_placed() {
     scopefuel="$(command -v "${SCOPEFUEL_BIN:-scopefuel}" 2>/dev/null || true)"
   [[ -n "$scopefuel" && -x "$scopefuel" ]] || return 1
   set +e
-  out="$("$scopefuel" policy launch "$MODEL" --effort "$GATE_EFFORT_PIN" --json 2>/dev/null)"
+  # The seat is named: without --role the canon answers for no seat and
+  # refuses the worker/tester-only credit rows, so the marker would stay
+  # required even on a placed rung.
+  out="$("$scopefuel" policy launch "$MODEL" --effort "$GATE_EFFORT_PIN" --role "${ROLE:-worker}" --json 2>/dev/null)"
   rc=$?
   set -e
   [[ "$rc" -eq 0 && -n "$out" ]] || return 1
@@ -4140,7 +4143,7 @@ import json, sys
 try:
     payload = json.load(sys.stdin)
     catalog = payload.get("catalog")
-    ok = (isinstance(catalog, dict) and "stale" in catalog
+    ok = (isinstance(catalog, dict) and catalog.get("stale") is False
           and payload.get("gate") != "consult_only"
           and not payload.get("e6_arm"))
 except (ValueError, TypeError, AttributeError):
@@ -12563,6 +12566,22 @@ raise SystemExit(0 if ok else 1)' "$LABEL" "$JOB_ID"; then
 # answer, an ungraded rung or an unmarked task grade all stay refused. The
 # quota gate below still judges the seat — this check only decides whether
 # the builder role may reach it.
+# hk 2188: the O3-verified path reads only the grade from the bound task (a
+# read-only `tasks show`); any failure leaves it empty, and the builder seat
+# check then refuses (fail closed). Other seats never need it.
+o3_task_requested_grade() {
+  [[ "$ROLE" == builder && -n "$TASK_ID" ]] || return 0
+  local handoffkeep out rc=0
+  handoffkeep="$(hk_bin)"
+  [[ -n "$handoffkeep" ]] || return 0
+  set +e
+  out="$(hk_cmd "$handoffkeep" tasks show "$TASK_ID" 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || return 0
+  TASK_REQUESTED_GRADE="$(hk_task_grade "$out")"
+}
+
 builder_seat_canon_check() {
   [[ "$ROLE" == builder ]] || return 0
   case "$MODEL" in
@@ -12582,11 +12601,11 @@ builder_seat_canon_check() {
   local out err_file rc=0 reason=""
   err_file="$(mktemp "${TMPDIR:-/tmp}/wrk-seat-canon.XXXXXX")"
   set +e
-  out="$("$SCOPEFUEL" policy launch "$MODEL" --effort "$effort" --json 2>"$err_file")"
+  out="$("$SCOPEFUEL" policy launch "$MODEL" --effort "$effort" --role builder --json 2>"$err_file")"
   rc=$?
   set -e
   if [[ -s "$err_file" ]]; then
-    reason="$(grep -v '^scopefuel: warning:' "$err_file" | tr -s '[:space:]' ' ' | cut -c1-240)"
+    reason="$({ grep -v '^scopefuel: warning:' "$err_file" || true; } | tr -s '[:space:]' ' ' | cut -c1-240)"
   fi
   rm -f "$err_file"
   if [[ "$rc" -eq 3 ]]; then
@@ -12604,6 +12623,9 @@ try:
     catalog = payload.get("catalog")
     if not isinstance(catalog, dict) or "stale" not in catalog:
         print("unreadable")
+        sys.exit(0)
+    if catalog.get("stale") is not False:
+        print("stale")
         sys.exit(0)
     if payload.get("gate") == "consult_only":
         print("consult_only")
@@ -12629,6 +12651,8 @@ except (ValueError, TypeError, AttributeError):
       die "--role builder refuses '$MODEL': canon rung $MODEL@$effort is consult_only — not a builder seat (hk 2188)" ;;
     e6_marker)
       die "--role builder refuses '$MODEL': canon rung $MODEL@$effort is an unmeasured E6 marker — not a builder seat (hk 2188)" ;;
+    stale)
+      die "--role builder refuses '$MODEL': the canon answer for $MODEL@$effort is stale — a builder seat needs a fresh catalog (hk 2188, fail closed; retry after scopefuel refreshes)" ;;
     grade_below:*)
       die "--role builder refuses '$MODEL': canon rung $MODEL@$effort grade ${verdict#grade_below:} does not cover the task's requested grade $TASK_REQUESTED_GRADE (hk 2188)" ;;
     *)
@@ -12713,7 +12737,7 @@ refuse_known_terra_spelling() {
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" REPORT_RELATIVE=0 JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
+  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER="" TASK_REQUESTED_GRADE=""
   O3_SPAWN_VERIFIED=0 O3_SPAWN_HEAD="" O3_EXTENSION_GRANT="" O3_REPEAT_GRANT=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
@@ -12990,7 +13014,9 @@ spawn_cmd() {
   # #768: read-only hk task probe — fail closed before the quota gate measures
   # anything, before any pane, before any hk write. Sets TASK_LINK_STATUS.
   if [[ "$O3_SPAWN_VERIFIED" -eq 1 ]]; then
-    : # Canonical handshake already verified the task/host/lane binding.
+    # Canonical handshake already verified the task/host/lane binding. hk 2188:
+    # neither precheck runs here, so read the requested grade from that task.
+    o3_task_requested_grade
   elif [[ -n "$TAKEOVER_FROM" ]]; then
     hk_task_takeover_precheck
   else

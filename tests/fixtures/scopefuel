@@ -204,6 +204,10 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
     exit 0
   fi
   launch_stale=false
+  if [[ "${WRK_LAUNCH_MODE:-ok}" == warn-only ]]; then
+    # hk 2188 T6: a successful answer whose stderr holds only warning lines.
+    echo 'scopefuel: warning: fixture warning line' >&2
+  fi
   if [[ "${WRK_LAUNCH_MODE:-ok}" == stale ]]; then
     launch_stale=true
     echo 'warning: catalog=stale — resolved from the bundled snapshot, not the server' >&2
