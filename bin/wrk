@@ -15270,7 +15270,7 @@ artifacts_classify_cmd() {
       --job) [[ $# -ge 2 && -n "$2" ]] || die "--job requires a value"; only_job="$2"; shift 2 ;;
       --root) [[ $# -ge 2 && -n "$2" ]] || die "--root requires a value"; only_root="$2"; shift 2 ;;
       --json) as_json=1; shift ;;
-      -h|--help) artifacts_help; return 0 ;;
+      -h|--help) printf '%s\n' 'Usage: wrk artifacts classify [--job JOB] [--root NAME] [--json]'; return 0 ;;
       *) die "artifacts classify: unexpected argument '$1'" ;;
     esac
   done

@@ -19,7 +19,7 @@ description: 판단이 어려운 문제(설계 분기, 검증 판정 불일치, 
 
 - 질의 전 요청자 레인이 hub에 등록되어 있는지 확인한다. 미등록 레인의 emit은 조용히 유실된다
   (근거: 2026-09-14 실사고 — 6건 전량 드롭, 부분 배달 0).
-- **세션 이름 지정 시**: `wrk find <이름>`으로 상존·화면 확인 → 있으면 **relay-handoff의 질의 절차
+- **세션 이름 지정 시**: `wrk find <이름>`으로 상존·화면 확인 → 있으면 **relay-handoff의 질의
   절차**로 질의. 없으면 아래 경로로.
 - **급 지정(기본)**: `scopefuel --recommend S+`로 후보를 뽑는다(모델명을 이 문서에 적지 말 것
   — 정본은 scopefuel).
@@ -54,7 +54,7 @@ panewire emit --kind lane.event --lane <요청자 레인> --event-id <고유id> 
 직접 주입을 함께 포함한다:
 
 ```bash
-herdr agent prompt <pane>
+herdr agent prompt <pane> '[consult-done] <1줄 요지> | <답변 파일 경로>'
 ```
 
 ## 3. 실행 — 자문 pane 스폰 (기본)
@@ -73,7 +73,7 @@ wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<�
   (`wrk reap`, panewire 세션 회수 보고)가 후보로 올리지 않는다. 다 쓴 자문 pane 은 요청자가
   직접 닫는다.
 - 주입·제출검증 = **relay-handoff §3**, pane kind별 통지·대기·착지 확인의 정본과
-  답변 회수 분기는 **relay-handoff §3-1** 및 **relay-handoff references/session-questions.md §3**(답변 파일 계약)를 따른다.
+  답변 회수 분기는 **relay-handoff §3-1** 및 **relay-handoff references/session-questions.md §1**(답변 파일 계약)를 따른다.
 - 자문자는 수신자가 claude pane인 기본 경로에서 답변 파일을 작성한 직후 아래 통지를 반드시 실행한다:
 
   ```bash
@@ -83,7 +83,7 @@ wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<�
   비-claude 수신자용 대체 통지는 그 정본에 따라 아래 직접 주입을 사용한다:
 
   ```bash
-  herdr agent prompt <pane>
+  herdr agent prompt <pane> '[consult-done] <1줄 요지> | <답변 파일 경로>'
   ```
 - 이벤트 수신 또는 비-claude 기한 확인 뒤 파일이 없으면 ①`herdr agent read <target> --lines 40`으로
   답변이 화면에만 있는지 확인 — 있으면 "파일 미작성, 화면 전사본" 명시 ②없으면
@@ -106,7 +106,7 @@ wrk spawn -c <dir> -m <프로필> -p <질문패킷파일> -w <ws> -l consult-<�
 
 ## 4. 회수·기록·채택
 
-- 자문 답변은 `~/work/herdr-inbox/consult-<주제>-answer-<HHMM>.md`로 보존(질의 패킷과 쌍).
+- 자문 답변은 `~/work/herdr-inbox/answer-<질문자>-<주제>-<HHMM>.md`로 보존(질의 패킷과 쌍).
 - 보고: 질문 요지 / 자문처(모델·계열·pane) / 핵심 답변 / 교차 자문 시 일치 여부 / **채택·
   기각과 그 이유는 질의 세션이 별도로 판단해 기록**.
 - 자문 결과로 승인 범위 밖 행동이 필요해지면 → 실행하지 말고 운영자에게 결정 요청.

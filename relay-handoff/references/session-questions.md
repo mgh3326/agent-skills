@@ -23,7 +23,7 @@
   claude 기본 통지와 비-claude 대체 통지를 함께 적는다:
 
   ```bash
-  herdr agent prompt <pane>
+  herdr agent prompt <pane> '[consult-done] <1줄 요지> | <답변 파일 경로>'
   ```
 - 머리에: `(같은 질문이 두 번 보이면 재답변 금지)`.
 
@@ -48,7 +48,7 @@
   비-claude 수신자용 대체 통지는 그 정본에 따라 아래 직접 주입을 사용한다:
 
   ```bash
-  herdr agent prompt <pane>
+  herdr agent prompt <pane> '[consult-done] <1줄 요지> | <답변 파일 경로>'
   ```
 - 이벤트 수신 또는 비-claude 기한 확인 뒤 파일이 없으면 ①`herdr agent read <target> --lines 40`으로
   답변이 화면에만 있는지 확인 — 있으면 "파일 미작성, 화면 전사본" 명시 ②없으면
