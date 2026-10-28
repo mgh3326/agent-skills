@@ -7,7 +7,7 @@ blocking:
     reason: Worktree reap and artifact prune or sweep can delete original files before a revert.
   - paths: ['install.sh', 'installer/**']
     reason: Installation and deploy procedures can replace running tools before a revert.
-  - paths: ['bin/*auth*', 'bin/*token*', 'bin/*trust*']
+  - paths: ['bin/kimi-clone-home', 'bin/rob-lookup', 'bin/wrk-codex-mcp-plan']
     reason: Credential and workspace trust changes can expose access immediately.
   - paths: ['.github/workflows/**']
     reason: Workflow changes can execute privileged automation before a revert.
