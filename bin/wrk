@@ -8618,7 +8618,7 @@ PY
       continue
     fi
     gone=0
-    local now probe class token candidate key action recover_reason rearm_loss log_extra watch_expired
+    local now probe class token candidate key action recover_reason rearm_loss log_extra watch_expired late_sighting
     now="$(date +%s)"
     probe="$(herdr_agent_probe "$pane")"
     IFS=$'\t' read -r class token _ <<<"$probe"
@@ -8628,6 +8628,7 @@ PY
     recover_reason=""
     rearm_loss=""
     watch_expired=""
+    late_sighting=""
     case "$class" in
       gone)
         transient=0
@@ -8701,6 +8702,7 @@ PY
       if [[ "$class" == ok ]]; then # hk1888-watch-expired-live-guard
         if [[ "$action" == pending && -z "$late_pending" ]]; then # hk1959-late-pending
           late_pending=1
+          late_sighting=1 # hk1973-late-once
         else
           watch_expired=1
           [[ -n "$recover_reason" ]] || action="watch-expired"
@@ -8720,7 +8722,7 @@ PY
     if [[ -n "$recover_reason" && "$action" != recovered:* ]]; then
       log_extra="recovered=$recover_reason"
     fi
-    if [[ "$action" == pending && -n "$late_pending" ]]; then
+    if [[ "$action" == pending && -n "$late_sighting" ]]; then # hk1973-late-once
       log_extra="${log_extra:+$log_extra }late=1"
     fi
     if [[ "$action" == watch-expired ]]; then
@@ -10434,6 +10436,7 @@ spillover_remote_spawn() {
   local remote_args=(env "HERDR_SESSION=$session")
   [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
   [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")
+  [[ -n "${SCOPEFUEL_E6_ARM:-}" ]] && remote_args+=("SCOPEFUEL_E6_ARM=$SCOPEFUEL_E6_ARM")
   remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   [[ -z "${SPILL_REMOTE_OWNER:-}" ]] || remote_args+=(--owner "$SPILL_REMOTE_OWNER") # hk2042-ssh-owner
   [[ -z "${SPILL_REMOTE_REPORT_REL:-}" ]] || remote_args+=(--report-relative "$SPILL_REMOTE_REPORT_REL")
@@ -11106,19 +11109,15 @@ pi_host_precheck() {
 }
 
 # hk 2140 desk gate: Command Code accounts with no configured MCP servers are
-# known only on mbp, desktop and m1b. Require an explicit local capability flag
-# and an execution-host identity in that desk-approved set; caller placement
-# options never grant this capability.
+# desk-owned per host. Approval is the desk-owned [local] cmd_dsflash41 = true
+# flag alone; caller placement options and host identities never grant this
+# capability.
 cmd_host_precheck() {
   local profile="${1:-${MODEL:-}}" host
   [[ "$profile" == cmd-dsflash41 ]] || return 0
   host="$(spillover_value hub machine_id 2>/dev/null || true)"
   [[ -n "$host" ]] || host="$(hostname)"
   host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
-  case "$host" in
-    mbp|desktop|m1b) ;;
-    *) die "$profile refused on host $host: approved hosts are mbp, desktop, m1b (desk 2026-10-27; m1 has MCP servers)" ;;
-  esac
   if ! local_spawn_scan; then
     die "$profile refused on host $host: $LOCAL_SPAWN_ERROR"
   fi
