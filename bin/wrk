@@ -111,7 +111,7 @@ ALL_PROFILES=(
 # decision r1026solmax, desk, on hk 1786) and builder-sol-xhigh is the S+
 # escalation row the gate still decides (hk 2043). This is the one place the
 # set is named.
-NORMAL_PINNED_BUILDERS=(builder-sol-xhigh builder-sol-max)
+NORMAL_PINNED_BUILDERS=(builder-sol-xhigh builder-sol-max builder-terra61-high builder-terra61-xhigh builder-terra61-max)
 normal_pinned_builder() {
   local pinned
   for pinned in "${NORMAL_PINNED_BUILDERS[@]}"; do
@@ -352,8 +352,10 @@ Options:
                      devin-argon-low are likewise worker/tester-only (hk 1620
                      phase 1) — --role builder refuses all three.
                      codex-terra61 runs GPT-6.1 Terra (default low; Codex
-                     0.164.0). builder-terra61-medium/high/xhigh/max pin
-                     that rung and require SCOPEFUEL_E6_ARM=codex-terra61@RUNG.
+                     0.164.0). builder-terra61-high/xhigh/max are normal
+                     pinned spellings (canon rows placed 2026-10-28, hk 2218);
+                     builder-terra61-medium still requires
+                     SCOPEFUEL_E6_ARM=codex-terra61@medium.
                      codex-terra, codex-terra-max, codex-med and
                      builder-terra-* remain refused: gpt-5.6-terra is barred
                      by operator 2026-10-12 noterra.
@@ -682,8 +684,8 @@ fail-closed, while exclusive arbiter leases retain their own fail-closed rules.
 Canonical codex profiles: codex-luna, codex-sol, codex-terra61.
 Existing codex aliases remain valid: codex, codex-luna-hi, codex-luna-max,
 codex-max. codex-terra61 runs gpt-6.1-terra (footer display GPT-6.1 Terra,
-default effort low on Codex 0.164.0). builder-terra61-medium/high/xhigh/max pin
-their effort rung and require the matching SCOPEFUEL_E6_ARM marker.
+default effort low on Codex 0.164.0). builder-terra61-high/xhigh/max are normal
+pinned spellings (hk 2218); builder-terra61-medium still requires its marker.
 codex-terra, codex-terra-max and codex-med resolve for a named refusal:
 gpt-5.6-terra is barred by operator 2026-10-12 noterra.
 ROB-591/#1026 (2026-09-30 operator decision): codex-sol/codex-max/codex/
@@ -790,8 +792,9 @@ marker in the environment is ignored and never recorded: the quota record
 reads the canonical rung (codex-sol@max, codex-sol@xhigh). The
 old Terra E6 spellings builder-terra-high, builder-terra-xhigh and
 builder-terra-max are refused by operator 2026-10-12 noterra. The separate
-builder-terra61-medium/high/xhigh/max rows are unmeasured E6 rungs and require
-SCOPEFUEL_E6_ARM=codex-terra61@<effort>. For the remaining profiles
+builder-terra61-high/xhigh/max are normal pinned spellings since hk 2218
+(placed canon rows); builder-terra61-medium stays an E6 rung and requires
+SCOPEFUEL_E6_ARM=codex-terra61@medium. For the remaining profiles
 wrk passes the pinned rung as `scopefuel gate --effort` so the gate judges
 that rung's row, and the marker (forwarded through the environment) is what
 opens the unmeasured C rungs (#692: sonnet@max, codex-sol@high, kimi-k3@high,
@@ -12858,7 +12861,7 @@ spawn_cmd() {
       devin-argon|devin-argon-medium|devin-argon-low)
         die "--role builder rejects '$MODEL': the devin Argon trial spellings are worker/tester-only — phase 1 is spawn plumbing, no builder seat (hk 1620, operator decision 2026-10-18)" ;;
       builder-opus|builder-sol|builder-sol6|builder-devin|builder-devin-medium|builder-devin-max|builder-ds41|builder-ds41-max|builder-grok|builder-kimi|builder-luna|builder-sonnet|builder-opus-low|builder-opus-medium|builder-sonnet-xhigh|builder-sonnet-max|builder-sol-high|builder-sol-xhigh|builder-sol-max|builder-sol-medium|builder-luna-max|builder-kimi-high|builder-kimi-max|builder-grok-low|builder-grok-medium|builder-grok-xhigh|builder-sonnet-medium|builder-haiku-low|builder-haiku-medium|builder-luna-low|builder-luna-high|builder-luna-medium|builder-sol-low|builder-haiku-high|builder-haiku-xhigh|builder-haiku-max|builder-sonnet-low|builder-terra61-medium|builder-terra61-high|builder-terra61-xhigh|builder-terra61-max|devin-swe2|devin-swe2-medium|devin-swe2-max|grok|grok-hi|kimi-k3|captain-opus|captain-sol) ;;
-      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-luna-high, builder-haiku-medium (hk 2043), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) plus the normal pinned spellings builder-sol-xhigh and builder-sol-max (hk 2043, operator r1026solmax) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; old Terra spellings codex-terra, codex-terra-max, codex-med and builder-terra-high/xhigh/max remain refused by operator 2026-10-12 noterra; builder-terra61-medium/high/xhigh/max are E6 builder rungs requiring SCOPEFUEL_E6_ARM=codex-terra61@<effort>; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23) while builder-sol-max takes no marker (hk 2043); ultra stays refused)" ;;
+      *) die "--role builder accepts only builder-opus, builder-sol, builder-sol6 (#1026 rollback), builder-devin, builder-devin-medium, builder-devin-max, builder-ds41, builder-ds41-max, builder-grok, builder-kimi, builder-luna, builder-sonnet or the E6 rungs builder-opus-low, builder-opus-medium, builder-sonnet-xhigh, builder-sonnet-max, builder-sol-high, builder-luna-max, builder-kimi-high, builder-kimi-max (#704), builder-grok-low, builder-grok-medium, builder-grok-xhigh, builder-sol-medium (#737), builder-sonnet-medium, builder-haiku-low, builder-luna-low, builder-luna-medium (#1796), builder-luna-high, builder-haiku-medium (hk 2043), builder-sol-low, builder-haiku-high, builder-haiku-xhigh, builder-haiku-max, builder-sonnet-low (hk 1863) plus the normal pinned spellings builder-sol-xhigh and builder-sol-max (hk 2043, operator r1026solmax) and builder-terra61-high, builder-terra61-xhigh and builder-terra61-max (hk 2218) (pilot worker spellings devin-swe2, devin-swe2-medium, devin-swe2-max, grok/grok-hi, kimi-k3 and legacy captain-* aliases accepted; codex-astra xhigh/fable only with verified --purpose round-extension --round-ext REF bound to explicit --task; builder-astra/captain-astra stay removed; old Terra spellings codex-terra, codex-terra-max, codex-med and builder-terra-high/xhigh/max remain refused by operator 2026-10-12 noterra; builder-terra61-medium is the E6 builder rung requiring SCOPEFUEL_E6_ARM=codex-terra61@medium; the worker codex-luna spellings and devin-glm52/devin-swe17/devin-ds41/devin-ds41-max are worker-only — the ds41 builder path is builder-ds41/builder-ds41-max; devin-fusion-opus55/devin-fusion-sonnet55 are worker/tester-only (fusion builder use is decided after hk 1382); devin-argon/devin-argon-medium/devin-argon-low are worker/tester-only (hk 1620 phase 1, no builder seat); the max-rung E6 spellings are admitted with their exact SCOPEFUEL_E6_ARM marker since hk 1863 removed the builder-seat no-max rule (operator decision hk 1864, 2026-10-23) while builder-sol-max takes no marker (hk 2043); ultra stays refused)" ;;
     esac
     case "$MODEL" in
       # hk 2043 item 4: every unpinned builder spelling whose catalog consult

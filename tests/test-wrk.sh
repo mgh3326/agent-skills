@@ -754,11 +754,34 @@ terra61_expect_model_barred() {
 terra61_expect_launch real-footer codex-terra61 high codex-terra61@high recorded high
 terra61_expect_launch default-low codex-terra61 low codex-terra61@low
 terra61_expect_launch explicit-high codex-terra61 high codex-terra61@high footer high
-for rung in medium high xhigh max; do
-  terra61_expect_launch "builder-$rung" "builder-terra61-$rung" "$rung" \
-    "codex-terra61@$rung" footer
+# hk 2218: medium stays an E6 rung (marker), high and max are normal pinned
+# spellings (no marker), and xhigh is the escalation-labelled rung, admitted
+# with or without an operator REF (the installed gate's behaviour).
+terra61_expect_launch builder-medium builder-terra61-medium medium codex-terra61@medium footer
+for rung in high max; do
+  terra61_expect_launch "builder-$rung" "builder-terra61-$rung" "$rung" "" footer
 done
+terra61_expect_launch builder-xhigh builder-terra61-xhigh xhigh "" footer
 echo "PASS hk 2109: codex-terra61 default/override and four pinned builder rungs resolve catalog, argv and gate effort"
+
+# hk 2218 B1: the deployed contract — the installed gate admits the explicit
+# xhigh rung with no REF (rc 0) and labels it escalation-gated. Whether
+# escalation rungs need a REF is a separate operator decision.
+grep -qF '[rung codex-terra61@xhigh, escalation-gated]' "$TERRA61_LAST_ROOT/out" ||
+  fail "builder-terra61-xhigh must be admitted labelled escalation-gated: $(<"$TERRA61_LAST_ROOT/out")"
+# hk 2218 B2: low and medium are still E6 rungs; without a marker wrk itself
+# refuses them (rc 2) before the gate is asked.
+terra61_run_case worker-low-nomarker codex-terra61 worker footer low "fixture prompt" low
+[[ "$TERRA61_LAST_RC" -eq 2 ]] ||
+  fail "codex-terra61@low without SCOPEFUEL_E6_ARM must die rc 2 (rc=$TERRA61_LAST_RC): $(<"$TERRA61_LAST_ROOT/err")"
+grep -q 'E6 measurement profile' "$TERRA61_LAST_ROOT/err" ||
+  fail "codex-terra61@low refusal must name the E6 marker: $(<"$TERRA61_LAST_ROOT/err")"
+terra61_run_case builder-medium-nomarker builder-terra61-medium builder footer medium "fixture prompt"
+[[ "$TERRA61_LAST_RC" -eq 2 ]] ||
+  fail "builder-terra61-medium without SCOPEFUEL_E6_ARM must die rc 2 (rc=$TERRA61_LAST_RC): $(<"$TERRA61_LAST_ROOT/err")"
+grep -q 'E6 measurement profile' "$TERRA61_LAST_ROOT/err" ||
+  fail "builder-terra61-medium refusal must name the E6 marker: $(<"$TERRA61_LAST_ROOT/err")"
+echo "PASS hk 2218: terra61 xhigh is admitted escalation-gated; low and medium still need the E6 marker"
 
 # The exact allowed model id is the only Terra exception. Catalog injection,
 # PROFILE_MODEL_ARG and ARGS -m/--model remain guarded; old aliases stay barred.
@@ -12778,7 +12801,8 @@ for e6_model in builder-opus-low builder-opus-medium builder-sonnet-xhigh \
   builder-kimi-high builder-grok-low builder-grok-medium builder-grok-xhigh \
   builder-sonnet-medium builder-haiku-low builder-luna-low builder-luna-high builder-luna-medium \
   builder-sol-low builder-haiku-medium builder-haiku-high builder-haiku-xhigh builder-sonnet-low \
-  builder-sonnet-max builder-luna-max builder-kimi-max builder-haiku-max; do
+  builder-sonnet-max builder-luna-max builder-kimi-max builder-haiku-max \
+  builder-terra61-medium; do
   set +e
   e6_missing_out="$(SCOPEFUEL_E6_ARM='' \
     KIMI_CODE_HIGH_HOME="$E6_KIMI_HIGH_HOME" KIMI_CODE_MAX_HOME="$E6_KIMI_MAX_HOME" \
