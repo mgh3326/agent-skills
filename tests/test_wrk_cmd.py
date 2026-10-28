@@ -52,12 +52,14 @@ class CmdSpawnTests(unittest.TestCase):
     def hosts(self, content):
         Path(self.env["WRK_HOSTS_CONFIG"]).write_text(content)
 
-    def use_hk(self, grade="A", task="2188"):
+    def use_hk(self, grade="A", task="2188", title=None):
         # A real fixture handoffkeep so the builder canon check can read the
         # task's requested grade from the title marker.
         state = self.tmp / "hk-state.json"
+        if title is None:
+            title = f"fixture task (grade {grade}, T2; fixture)"
         state.write_text(json.dumps({"tasks": {task: {
-            "id": int(task), "title": f"fixture task (grade {grade}, T2; fixture)",
+            "id": int(task), "title": title,
             "state": "backlog", "claimed_by": "", "refs": {},
             "project": "agent-skills"}}}))
         self.env["HANDOFFKEEP_BIN"] = str(ROOT / "tests/fixtures/handoffkeep")
@@ -200,6 +202,20 @@ class CmdSpawnTests(unittest.TestCase):
         self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
         self.assert_refused_before_admission(
             self.spawn(role="builder"), "requested grade is unreadable")
+
+    def test_builder_seat_title_grade_marker_is_anchored(self):
+        # A bare "grade B" earlier in the title must not understate the
+        # "(grade S, T2)" marker — the rung's canon grade (A+) does not
+        # cover an S task, and disagreeing markers read as unreadable.
+        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "desktop"\n')
+        self.use_hk(title="Downgrade B tests (grade S, T2; fixture)")
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", task="2188", hk_bypass=False),
+            "does not cover the task's requested grade S")
+        self.use_hk(title="one (grade A, T2; x) and another (grade S, T2; y)")
+        self.assert_refused_before_admission(
+            self.spawn(role="builder", task="2188", hk_bypass=False),
+            "requested grade is unreadable")
 
     def test_e6_marker_exact(self):
         self.assert_refused_before_admission(

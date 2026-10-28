@@ -11716,9 +11716,12 @@ except ValueError:
 title = task.get("title")
 if not isinstance(title, str):
     sys.exit(0)
-match = re.search(r"grade\s+([CBAS]\+?)(?![\w+])", title)
-if match:
-    print(match.group(1))
+# The marker is the parenthesized "(grade X, Tn; ...)" form — a bare "grade
+# B" elsewhere in the title (e.g. "downgrade B") must not understate the
+# request. Two disagreeing markers are ambiguous and read as no grade.
+marks = re.findall(r"\(\s*grade\s+([CBAS]\+?)\s*[,;)]", title)
+if marks and len(set(marks)) == 1:
+    print(marks[0])
 '
 }
 
