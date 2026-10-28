@@ -56,6 +56,12 @@ catalog_model_for() {
     codex-luna) case "$2" in low) echo gpt-5.6-luna ;; *) echo gpt-6-luna ;; esac ;;
     codex-luna-max) echo gpt-6-luna ;;
     codex-astra) echo gpt-6-astra ;;
+    # hk 2188: pi/cmd builder seats consult the canon — the rows need real
+    # model ids so the rung table below can answer.
+    pi-haiku55) echo anthropic/claude-haiku-5-5 ;;
+    pi-sonnet55) echo anthropic/claude-sonnet-5-5 ;;
+    pi-opus55) echo anthropic/claude-opus-5-5 ;;
+    cmd-dsflash41) echo deepseek/deepseek-v4.1-flash ;;
     kiro-opus) echo claude-opus-5 ;;
     kiro-sonnet) echo claude-sonnet-5 ;;
     kiro-sol) echo gpt-5.6-sol ;;
@@ -110,7 +116,7 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   esac
   shift 2
   launch_profile="${1:-}"; shift || true
-  launch_effort="" launch_operator=0 launch_purpose=""
+  launch_effort="" launch_operator=0 launch_purpose="" launch_role=""
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --json) shift ;;
@@ -120,7 +126,7 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
         if [[ $# -gt 0 && "${1:-}" != --* ]]; then shift; fi
         ;;
       --purpose) launch_purpose="${2:-}"; shift 2 ;;
-      --role) shift 2 ;; # New seat argument; grant semantics are tested against real scopefuel.
+      --role) launch_role="${2:-}"; shift 2 ;;
       --effort) launch_effort="${2:-}"; shift 2 ;;
       *) echo "fixture scopefuel: unexpected policy launch argument '$1'" >&2; exit 2 ;;
     esac
@@ -155,6 +161,43 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
         exit 3
       fi ;;
   esac
+  # hk 2188: the pi/cmd canon rung table, mirroring `scopefuel bench catalog
+  # list` — E6-marker rungs and consult_only rungs refuse rc 3 exactly like
+  # the installed command; placed rungs answer with their own grade and gate.
+  case "$launch_profile@$launch_effort" in
+    pi-haiku55@low|pi-haiku55@medium|pi-sonnet55@low|cmd-dsflash41@low|cmd-dsflash41@max)
+      echo "error: e6_arm_required: $launch_profile@$launch_effort requires SCOPEFUEL_E6_ARM=$launch_profile@$launch_effort" >&2
+      exit 3 ;;
+    pi-haiku55@xhigh|pi-haiku55@max|pi-sonnet55@medium|pi-sonnet55@max)
+      echo "error: profile '$launch_profile' is consult_only; pass --operator-request" >&2
+      exit 3 ;;
+  esac
+  launch_grade=S+ launch_gate=default
+  case "$launch_profile@$launch_effort" in
+    pi-haiku55@high) launch_grade=B ;;
+    pi-sonnet55@high) launch_grade=A ;;
+    pi-sonnet55@xhigh) launch_grade=A+ ;;
+    pi-opus55@low) launch_grade=S ;;
+    pi-opus55@max) launch_gate=escalation ;;
+    cmd-dsflash41@high) launch_grade=A+ ;;
+  esac
+  # hk 2188 r3 (309-b): the credit rows are seat-aware exactly like the real
+  # canon (scopefuel PR 219): worker/tester/builder seats only, the builder
+  # only on a placed default-gate rung, and a call naming no seat refused.
+  case "$launch_profile" in
+    pi-haiku55|pi-sonnet55|pi-opus55|cmd-dsflash41)
+      case "$launch_role" in
+        worker|tester) : ;;
+        builder)
+          if [[ "$launch_gate" != default ]]; then
+            echo "error: role_restricted: $launch_profile@$launch_effort — worker/tester only" >&2
+            exit 3
+          fi ;;
+        *)
+          echo "error: role_restricted: $launch_profile@$launch_effort — placed credit rung — worker/tester/builder seats only" >&2
+          exit 3 ;;
+      esac ;;
+  esac
   launch_model="$(catalog_model_for "$launch_profile" "$launch_effort")"
   # Lets a test prove the launcher really reads the canon: serve a model id that
   # exists nowhere in bin/wrk and assert the argv carries it.
@@ -166,8 +209,8 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
   if [[ "${WRK_LAUNCH_MODE:-ok}" == route-404 ]]; then
     # scopefuel is current; the *deployment* has no catalog route (production
     # handoffkeep predates it). A working answer from the snapshot, not stale.
-    printf '{"catalog":{"age_s":null,"source":"unsupported","stale":false},"effort":"%s","gate":"default","grade":"S+","model_id":"%s","pool":"%s","profile":"%s"}\n' \
-      "$launch_effort" "$launch_model" "$(pool_for "$launch_profile")" "$launch_profile"
+    printf '{"catalog":{"age_s":null,"source":"unsupported","stale":false},"e6_arm":null,"effort":"%s","gate":"%s","grade":"%s","model_id":"%s","pool":"%s","profile":"%s"}\n' \
+      "$launch_effort" "$launch_gate" "$launch_grade" "$launch_model" "$(pool_for "$launch_profile")" "$launch_profile"
     exit 0
   fi
   if [[ "${WRK_LAUNCH_MODE:-ok}" == no-provenance ]]; then
@@ -178,13 +221,17 @@ if [[ "${1:-}" == policy && "${2:-}" == launch ]]; then
     exit 0
   fi
   launch_stale=false
+  if [[ "${WRK_LAUNCH_MODE:-ok}" == warn-only ]]; then
+    # hk 2188 T6: a successful answer whose stderr holds only warning lines.
+    echo 'scopefuel: warning: fixture warning line' >&2
+  fi
   if [[ "${WRK_LAUNCH_MODE:-ok}" == stale ]]; then
     launch_stale=true
     echo 'warning: catalog=stale — resolved from the bundled snapshot, not the server' >&2
   fi
-  printf '{"catalog":{"age_s":null,"source":"%s","stale":%s},"effort":"%s","gate":"default","grade":"S+","model_id":"%s","pool":"%s","profile":"%s"}\n' \
+  printf '{"catalog":{"age_s":null,"source":"%s","stale":%s},"e6_arm":null,"effort":"%s","gate":"%s","grade":"%s","model_id":"%s","pool":"%s","profile":"%s"}\n' \
     "$([[ "$launch_stale" == true ]] && echo snapshot || echo server)" \
-    "$launch_stale" "$launch_effort" "$launch_model" "$(pool_for "$launch_profile")" "$launch_profile"
+    "$launch_stale" "$launch_effort" "$launch_gate" "$launch_grade" "$launch_model" "$(pool_for "$launch_profile")" "$launch_profile"
   exit 0
 fi
 
@@ -316,12 +363,15 @@ if [[ -n "${WRK_SCOPEFUEL_LOG:-}" ]]; then
   fi
   printf '\n%s\n' "$profile" >>"$WRK_SCOPEFUEL_LOG"
 fi
-# hk 2079: pi credit rungs admit only worker/tester seats.
+# hk 2079/2140: pi and cmd rungs are role-aware — the gate hears the seat's
+# role. hk 2188 lifted the builder refusal: builder seats reach the gate for
+# these profiles too, and the installed gate admits them (wrk's canon rung
+# check is what keeps unmeasured/consult_only rungs out of builder seats).
 case "$profile" in
   pi-haiku55|pi-sonnet55|pi-opus55|cmd-dsflash41)
     case "$role" in
-      worker|tester) : ;;
-      *) echo "role_restricted: $profile — worker/tester-only" >&2; exit 5 ;;
+      worker|tester|builder) : ;;
+      *) echo "role_restricted: $profile — worker/tester/builder seats only" >&2; exit 5 ;;
     esac ;;
 esac
 # task #527: mirror the real gate's astra role denial — ASTRA_ROLE_PROFILES
@@ -417,7 +467,9 @@ fi
 # SCOPEFUEL_E6_ARM=<profile>@<effort> marker — a marker for a different rung
 # does not widen admission (verified against the installed gate).
 case "$profile@$effort" in
-  sonnet@max|codex-sol@high|codex-sol@medium|kimi-k3@high|kimi-k3@max|grok-hi@low|grok-hi@medium|grok-hi@xhigh|codex-terra61@low|codex-terra61@medium|codex-terra61@high|codex-terra61@xhigh|codex-terra61@max|codex-terra61@ultra|cmd-dsflash41@low|cmd-dsflash41@high|cmd-dsflash41@max)
+  # hk 2188: cmd-dsflash41@high is a placed canon row (A+ default) — it left
+  # the unmeasured set; the pi E6 rungs join it per the same catalog.
+  sonnet@max|codex-sol@high|codex-sol@medium|kimi-k3@high|kimi-k3@max|grok-hi@low|grok-hi@medium|grok-hi@xhigh|codex-terra61@low|codex-terra61@medium|codex-terra61@high|codex-terra61@xhigh|codex-terra61@max|codex-terra61@ultra|cmd-dsflash41@low|cmd-dsflash41@max|pi-haiku55@low|pi-haiku55@medium|pi-haiku55@xhigh|pi-haiku55@max|pi-sonnet55@low|pi-sonnet55@medium|pi-sonnet55@max)
     if [[ "${SCOPEFUEL_E6_ARM:-}" != "$profile@$effort" ]]; then
       echo "e6_arm_required: $profile@$effort 은 미측정 E6 측정 런그다 (#594) — SCOPEFUEL_E6_ARM=$profile@$effort 표식이 있어야 연다" >&2
       exit 3
