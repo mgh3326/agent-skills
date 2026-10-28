@@ -5,7 +5,11 @@
 #   (b) the commit status is posted on the resolved target sha, not the dispatch sha
 #   (c) a non-resolving ref is refused
 #   (d) the permissions block is minimal
-# and that two mutants (merge main first; post on the dispatch sha) are RED.
+#   (e) the concurrency group is keyed on the RESOLVED sha plus the suite, never
+#       inputs.ref alone
+# and that mutants (merge main first; post on the dispatch sha; ci-ok for a
+# partial suite; inline inputs.* in a run body; drop the sha from the group
+# key; drop the suite from the group key) are RED.
 set -euo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -23,6 +27,12 @@ ci = (root / ".github/workflows/ci.yml").read_text(encoding="utf-8")
 def top_block(text: str, key: str) -> str:
     match = re.search(rf"(?m)^{key}:\n((?:  .*\n| *#.*\n|\s*\n)*)", text)
     assert match, f"missing top-level block {key!r}"
+    return match.group(1)
+
+
+def job_block(text: str, job: str) -> str:
+    match = re.search(rf"(?ms)^  {job}:\n(.*?)(?=^  \w|\Z)", text)
+    assert match, f"missing job {job!r}"
     return match.group(1)
 
 
@@ -88,9 +98,24 @@ def validate(wf_text: str, ci_text: str) -> None:
         "status job must be gated on resolve success"
     assert "needs: [resolve, ci]" in wf_text
 
-    conc = top_block(wf_text, "concurrency")
-    assert "inputs.ref" in conc, "concurrency group must key on the target ref"
-    assert "cancel-in-progress: true" in conc
+    # Concurrency (hk 2199): the group is keyed on the RESOLVED sha plus the
+    # suite on the ci and status jobs, never on inputs.ref alone. The resolve
+    # job may keep a short per-input group.
+    assert re.search(r"(?m)^concurrency:", wf_text) is None, \
+        "the concurrency group must live on the ci/status jobs, not top level"
+    for job in ("ci", "status"):
+        block = job_block(wf_text, job)
+        group = re.search(r"(?ms)^    concurrency:\n      group: ([^\n]+)", block)
+        assert group, f"{job} job must carry a concurrency group"
+        group = group.group(1)
+        assert "needs.resolve.outputs.sha" in group, \
+            f"{job} concurrency group must key on the resolved sha, got {group!r}"
+        assert "inputs.suite" in group, \
+            f"{job} concurrency group must key on the suite, got {group!r}"
+        assert "inputs.ref" not in group, \
+            f"{job} concurrency group must not key on inputs.ref, got {group!r}"
+        assert re.search(r"(?m)^      cancel-in-progress: true", block), \
+            f"{job} job must keep cancel-in-progress"
 
     assert "uses: ./.github/workflows/ci.yml" in wf_text, \
         "must reuse ci.yml via workflow_call, not copy jobs"
@@ -162,30 +187,29 @@ def validate(wf_text: str, ci_text: str) -> None:
 
 validate(wf, ci)
 
+
+def expect_red(wf_text: str, ci_text: str, name: str) -> None:
+    try:
+        validate(wf_text, ci_text)
+    except AssertionError:
+        return
+    raise AssertionError(f"mutant({name}) went undetected")
+
+
 # Mutant 1: merge main into the checkout -> must be RED.
 mutant_merge = ci.replace(
     "          ref: ${{ inputs.ref }}",
     "          ref: ${{ inputs.ref }}\n      - run: git merge origin/main",
     1,
 )
-try:
-    validate(wf, mutant_merge)
-except AssertionError:
-    pass
-else:
-    raise AssertionError("mutant(merge-main) went undetected")
+expect_red(wf, mutant_merge, "merge-main")
 
 # Mutant 2: post the status on the dispatch sha -> must be RED.
 mutant_status = wf.replace(
     "TARGET_SHA: ${{ needs.resolve.outputs.sha }}",
     "TARGET_SHA: ${{ github.sha }}",
 )
-try:
-    validate(mutant_status, ci)
-except AssertionError:
-    pass
-else:
-    raise AssertionError("mutant(status-on-dispatch-sha) went undetected")
+expect_red(mutant_status, ci, "status-on-dispatch-sha")
 
 # Mutant 3: post context ci-ok for every suite -> must be RED.
 mutant_ctx = re.sub(
@@ -193,26 +217,44 @@ mutant_ctx = re.sub(
     "CONTEXT=ci-ok",
     wf,
 )
-try:
-    validate(mutant_ctx, ci)
-except AssertionError:
-    pass
-else:
-    raise AssertionError("mutant(ci-ok-for-every-suite) went undetected")
+expect_red(mutant_ctx, ci, "ci-ok-for-every-suite")
 
 # Mutant 3b: the check-run name unconditional ci-ok -> must be RED.
 mutant_name = ci.replace(
     "name: ${{ (inputs.suite || 'all') == 'all' && 'ci-ok' || format('ci-ok ({0})', inputs.suite) }}",
     "name: ci-ok",
 )
-try:
-    validate(wf, mutant_name)
-except AssertionError:
-    pass
-else:
-    raise AssertionError("mutant(check-run-always-ci-ok) went undetected")
+expect_red(wf, mutant_name, "check-run-always-ci-ok")
 
-print("structural checks ok (incl. 4 mutants)")
+# Mutant 4: inline inputs.* in a run body -> must be RED.
+mutant_inline = wf.replace(
+    'resolve-ci-ref "$INPUT_REF"',
+    'resolve-ci-ref "${{ inputs.ref }}"',
+)
+expect_red(mutant_inline, ci, "inline-inputs-in-run")
+
+# Mutant 5: drop the sha from the group key -> must be RED.
+mutant_no_sha = wf.replace(
+    "ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
+    "ci-any-ref-${{ inputs.suite }}",
+)
+expect_red(mutant_no_sha, ci, "drop-sha-from-group")
+
+# Mutant 6: drop the suite from the group key -> must be RED.
+mutant_no_suite = wf.replace(
+    "ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
+    "ci-any-ref-${{ needs.resolve.outputs.sha }}",
+)
+expect_red(mutant_no_suite, ci, "drop-suite-from-group")
+
+# Mutant 7: key the group on inputs.ref again -> must be RED.
+mutant_ref_key = wf.replace(
+    "ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}",
+    "ci-any-ref-${{ inputs.ref }}-${{ inputs.suite }}",
+)
+expect_red(mutant_ref_key, ci, "group-on-inputs-ref")
+
+print("structural checks ok (incl. 7 mutants)")
 PY
 
 # --- live-ish harness: resolver + checkout simulation against a fixture repo ---
@@ -278,6 +320,18 @@ for suite in all lint macos-smoke wrk suites-a suites-b python; do
     [[ "$CONTEXT" == "ci-ok-$suite" && "$CONTEXT" != ci-ok ]]
   fi
 done
+
+# (e) group key: eval the workflow's own group template with two shas/suites.
+group_line="$(grep -oF 'ci-any-ref-${{ needs.resolve.outputs.sha }}-${{ inputs.suite }}' "$root/.github/workflows/ci-any-ref.yml" | head -1)"
+[[ -n "$group_line" ]]
+group_key() {  # $1 sha, $2 suite
+  local sha="$1" suite="$2"
+  printf '%s' "${group_line//'${{ needs.resolve.outputs.sha }}'/$sha}" |
+    sed "s/\${{ inputs\.suite }}/$suite/"
+}
+[[ "$(group_key "$SHA_A" all)" == "$(group_key "$SHA_A" all)" ]]       # same sha+suite -> one key
+[[ "$(group_key "$SHA_A" all)" != "$(group_key "$SHA_A" lint)" ]]     # different suite -> different key
+[[ "$(group_key "$SHA_A" all)" != "$(group_key "$SHA_B" all)" ]]      # different sha -> different key
 
 # (b) status target: simulate the status step against the resolved sha.
 TARGET_SHA="$SHA_A"
