@@ -4115,6 +4115,38 @@ resolve_catalog_profile() {
   esac
 }
 
+# hk 2188 (director-1 scope, op-1028-seattask): is this pi-*/cmd-dsflash41
+# rung a placed canon row? Consulted the same way builder_seat_canon_check
+# does — `scopefuel policy launch` at the exact profile@effort rung. rc 0
+# with a catalog-provenance answer means placed (normal pinned rung, no
+# marker); rc 3 is an E6-carrier or consult_only rung and keeps today's
+# marker rule; anything else (unreachable, unreadable) also keeps the
+# marker rule — the rule this relaxes is a refusal, so it fails closed.
+pi_cmd_rung_placed() {
+  [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ]] || return 1
+  local scopefuel="${SCOPEFUEL:-}" out rc=0
+  [[ -n "$scopefuel" ]] ||
+    scopefuel="$(command -v "${SCOPEFUEL_BIN:-scopefuel}" 2>/dev/null || true)"
+  [[ -n "$scopefuel" && -x "$scopefuel" ]] || return 1
+  set +e
+  out="$("$scopefuel" policy launch "$MODEL" --effort "$GATE_EFFORT_PIN" --json 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 && -n "$out" ]] || return 1
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+    catalog = payload.get("catalog")
+    ok = (isinstance(catalog, dict) and "stale" in catalog
+          and payload.get("gate") != "consult_only"
+          and not payload.get("e6_arm"))
+except (ValueError, TypeError, AttributeError):
+    ok = False
+sys.exit(0 if ok else 1)
+'
+}
+
 # apply_catalog
 #
 # Replaces this spelling's model id and default effort with the canonical values
@@ -4783,12 +4815,13 @@ resolve_profile() {
     # environment is ignored; the quota record below still reads
     # GATE_PROFILE@GATE_EFFORT_PIN, never an E6 arm.
     if ! normal_pinned_builder "$MODEL"; then
-      if [[ "$ROLE" == builder && ( "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ) ]]; then
-        # hk 2188: a pi/cmd builder seat is admitted by the canon rung check
-        # (builder_seat_canon_check after the task precheck), not by arming an
-        # E6 marker. The marker rule below stays for worker/tester seats; an
-        # unmeasured rung is refused by the canon check, never armed into a
-        # builder seat.
+      if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ]] && pi_cmd_rung_placed; then
+        # hk 2188 (director-1 scope): a pi/cmd rung whose canon row is placed
+        # is a normal pinned rung, not an E6 sample — the effort pin stays,
+        # no SCOPEFUEL_E6_ARM marker is needed and the rung is not labelled
+        # E6, for worker, tester and builder seats alike. Rungs still E6
+        # carriers or consult_only keep today's marker rule below; a builder
+        # seat on one is refused by builder_seat_canon_check regardless.
         :
       else
       [[ "${SCOPEFUEL_E6_ARM:-}" == "$GATE_PROFILE@$GATE_EFFORT_PIN" ]] ||

@@ -217,9 +217,28 @@ class CmdSpawnTests(unittest.TestCase):
             self.spawn(role="builder", task="2188", hk_bypass=False),
             "requested grade is unreadable")
 
+    def test_placed_rung_needs_no_e6_marker(self):
+        # hk 2188 scope fold-in: cmd-dsflash41@high is a placed canon row, so
+        # worker and tester seats spawn with no SCOPEFUEL_E6_ARM at all —
+        # the rung is not an E6 sample and none is labelled.
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                (self.tmp / "gate.log").unlink(missing_ok=True)
+                result = self.spawn(role=role, arm="")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+                self.assertNotIn("E6", result.stdout)
+                self.assertEqual(self.log("gate.log").splitlines()[0],
+                                 f"gate -m cmd-dsflash41 --effort high --role {role}")
+
     def test_e6_marker_exact(self):
+        # E6-carrier rungs keep the marker rule: cmd@low with a mismatched
+        # arm is refused, and unarmed dies the same way.
         self.assert_refused_before_admission(
-            self.spawn(arm="cmd-dsflash41@low"), "SCOPEFUEL_E6_ARM=cmd-dsflash41@high")
+            self.spawn(effort="low", arm="cmd-dsflash41@max"),
+            "SCOPEFUEL_E6_ARM=cmd-dsflash41@low")
+        self.assert_refused_before_admission(
+            self.spawn(effort="low", arm=""), "SCOPEFUEL_E6_ARM=cmd-dsflash41@low")
 
     def test_default_effort_is_high(self):
         result = self.spawn(effort=None)
@@ -407,6 +426,12 @@ class CmdMutantTests(unittest.TestCase):
                 '      *) die "$MODEL: deepseek-v4.1-flash accepts cmd effort low|high|max only, not \'$EFFECTIVE_EFFORT\'" ;;',
                 '      *) CMD_EFFORT="$EFFECTIVE_EFFORT" ;;',
                 "test_efforts_the_model_refuses"),
+            # hk 2188 scope mutant: restore the marker requirement for
+            # placed pi/cmd rungs — the unarmed worker/tester spawns go RED.
+            "placed-marker": (
+                'if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ]] && pi_cmd_rung_placed; then',
+                'if false; then',
+                "test_placed_rung_needs_no_e6_marker"),
             # hk 2188 mutant: the canon-grade seat check removed — the E6
             # rung refusals must turn RED.
             "builder": (

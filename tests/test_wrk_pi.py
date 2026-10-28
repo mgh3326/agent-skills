@@ -370,9 +370,33 @@ else:
                 self.assertIn("pane close w:p1", self.log())
                 self.assertNotIn("OK pane=", result.stdout)
 
+    def test_placed_rung_needs_no_e6_marker(self):
+        # hk 2188 scope fold-in: pi-sonnet55@high is a placed canon row, so
+        # worker and tester seats spawn with no SCOPEFUEL_E6_ARM at all —
+        # the rung is not an E6 sample and none is labelled.
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                (self.tmp / "gate.log").unlink(missing_ok=True)
+                result = self.spawn(role=role, SCOPEFUEL_E6_ARM="")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+                self.assertEqual(self.log("gate.log").splitlines()[0],
+                                 f"gate -m pi-sonnet55 --effort high --role {role}")
+        # The E6 carrier pi-haiku55@medium still requires the exact marker.
+        (self.tmp / "herdr.log").unlink(missing_ok=True)
+        (self.tmp / "claims.log").unlink(missing_ok=True)
+        self.assert_refused_before_admission(
+            self.spawn(profile="pi-haiku55", effort="medium", SCOPEFUEL_E6_ARM=""),
+            "SCOPEFUEL_E6_ARM=pi-haiku55@medium")
+        result = self.spawn(profile="pi-haiku55", effort="medium")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_e6_marker_exact(self):
-        self.assert_refused_before_admission(self.spawn(SCOPEFUEL_E6_ARM="pi-opus55@high"),
-                                             "SCOPEFUEL_E6_ARM=pi-sonnet55@high")
+        # E6/consult_only rungs keep the marker rule: a mismatched arm names
+        # the exact required marker.
+        self.assert_refused_before_admission(
+            self.spawn(effort="medium", SCOPEFUEL_E6_ARM="pi-opus55@high"),
+            "SCOPEFUEL_E6_ARM=pi-sonnet55@medium")
 
     def test_brief_cannot_prove_model(self):
         self.brief.write_text("fixture prompt\n0.0%/200k  (anthropic) claude-sonnet-5-5 • high\n")
@@ -586,6 +610,12 @@ class PiMutantTests(unittest.TestCase):
                          "test_argv_gate_mapping_and_no_mcp"),
             "proof": ('if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then',
                       'if false; then', "test_model_proof_failures_close_pane"),
+            # hk 2188 scope mutant: restore the marker requirement for
+            # placed pi/cmd rungs — the unarmed worker/tester spawns go RED.
+            "placed-marker": (
+                'if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ]] && pi_cmd_rung_placed; then',
+                'if false; then',
+                "test_placed_rung_needs_no_e6_marker"),
             # hk 2188 mutant: the canon-grade seat check removed — the
             # consult_only/E6 rung refusals must turn RED.
             "builder": ('  builder_seat_canon_check\n\n  quota_gate',
