@@ -35,6 +35,7 @@ suites-b|bash tests/test-wrk-task-link.sh
 suites-b|bash tests/test-gate-policy-devin-grades.sh
 suites-b|bash tests/test-area-propose.sh
 suites-b|bash tests/test-ci-suites.sh
+suites-b|bash tests/test-ci-any-ref.sh
 suites-b|bash tests/needs-full-macos.sh
 python|python3 tests/test-node-ops.py
 python|python3 -m unittest tests/test_pa_review_scan.py -v

@@ -1,0 +1,77 @@
+name: CI (any ref)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Exact ref to test - a 40-hex sha or a branch name (no merge with main)
+        required: true
+        type: string
+      suite:
+        description: Which suites to run
+        required: false
+        type: choice
+        default: all
+        options:
+          - all
+          - lint
+          - wrk
+          - suites-a
+          - suites-b
+          - python
+          - macos-smoke
+
+permissions:
+  contents: read
+  statuses: write
+
+concurrency:
+  group: ci-any-ref-${{ inputs.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve:
+    name: resolve ref
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.resolve.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          SHA="$(scripts/resolve-ci-ref "${{ inputs.ref }}" "$GITHUB_REPOSITORY")"
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+  ci:
+    name: ci at target ref
+    needs: resolve
+    uses: ./.github/workflows/ci.yml
+    with:
+      ref: ${{ needs.resolve.outputs.sha }}
+      suite: ${{ inputs.suite }}
+
+  status:
+    name: post ci-ok status
+    if: always() && needs.resolve.result == 'success'
+    needs: [resolve, ci]
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_SHA: ${{ needs.resolve.outputs.sha }}
+      RESULT: ${{ needs.ci.result }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - name: Post commit status on target sha
+        run: |
+          case "$RESULT" in
+            success)   STATE=success ;;
+            cancelled) STATE=error ;;
+            *)         STATE=failure ;;
+          esac
+          gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
+            -f state="$STATE" \
+            -f context="ci-ok" \
+            -f target_url="$RUN_URL" \
+            -f description="exact-head CI (${{ inputs.suite }}): $RESULT"
