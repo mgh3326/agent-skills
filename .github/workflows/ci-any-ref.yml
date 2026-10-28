@@ -59,6 +59,10 @@ jobs:
 
   status:
     name: post ci-ok status
+    # A completed dispatch posts a COMMIT STATUS named ci-ok on the target sha;
+    # PR CI reports a CHECK RUN named ci-ok. For fixed-base drafts the gate reads
+    # the commit status on the exact head, which only exists for suite=all —
+    # partial suites post ci-ok-<suite> and name their check ci-ok (<suite>).
     if: always() && needs.resolve.result == 'success'
     needs: [resolve, ci]
     runs-on: ubuntu-latest
@@ -66,6 +70,7 @@ jobs:
       GH_TOKEN: ${{ github.token }}
       TARGET_SHA: ${{ needs.resolve.outputs.sha }}
       RESULT: ${{ needs.ci.result }}
+      SUITE: ${{ inputs.suite }}
       RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
     steps:
       - name: Post commit status on target sha
@@ -75,8 +80,10 @@ jobs:
             cancelled) STATE=error ;;
             *)         STATE=failure ;;
           esac
+          # Only a full run earns the gate context; partial suites get ci-ok-<suite>.
+          if [[ "$SUITE" == all ]]; then CONTEXT=ci-ok; else CONTEXT="ci-ok-$SUITE"; fi
           gh api "repos/${GITHUB_REPOSITORY}/statuses/${TARGET_SHA}" \
             -f state="$STATE" \
-            -f context="ci-ok" \
+            -f context="$CONTEXT" \
             -f target_url="$RUN_URL" \
-            -f description="exact-head CI (${{ inputs.suite }}): $RESULT"
+            -f description="exact-head CI ($SUITE): $RESULT"

@@ -102,11 +102,40 @@ def validate(wf_text: str, ci_text: str) -> None:
     assert "statuses/${TARGET_SHA}" in wf_text, "status must post to statuses/<target sha>"
     assert "TARGET_SHA: ${{ needs.resolve.outputs.sha }}" in wf_text
     status_section = wf_text.split("status:", 1)[1]
-    assert 'context="ci-ok"' in status_section, "status context must be ci-ok"
     assert "target_url" in status_section, "status must carry the run URL"
     assert "GITHUB_SHA" not in status_section and "github.sha" not in status_section \
         and "github.event" not in status_section, \
         "status job must not derive its target from github.sha"
+
+    # context: only a full run (suite=all) may post the gate context ci-ok.
+    assert 'context="$CONTEXT"' in status_section, "status must post a computed context"
+    assert re.search(
+        r'if \[\[ "\$SUITE" == all \]\]; then CONTEXT=ci-ok; else CONTEXT="ci-ok-\$SUITE"',
+        status_section,
+    ), "partial suites must post ci-ok-<suite>, never ci-ok"
+    assert 'context="ci-ok"' not in status_section, \
+        "context must not be unconditionally ci-ok"
+
+    # check-run surface: the reused ci-ok job is renamed for partial suites so a
+    # dispatch can never mint a check named exactly 'ci-ok' either.
+    ci_ok_job = re.search(r"(?ms)^  ci-ok:\n(.*?)(?=^  \w|\Z)", ci_text)
+    assert ci_ok_job, "ci.yml must keep the ci-ok job"
+    assert "format('ci-ok ({0})', inputs.suite)" in ci_ok_job.group(1), \
+        "partial suites must name the check 'ci-ok (<suite>)'"
+    assert not re.search(r"(?m)^    name: ci-ok\s*$", ci_ok_job.group(1)), \
+        "the ci-ok job name must be conditional on suite"
+
+    # no ${{ inputs.* }} expansion inside any run: body (template injection).
+    for name, text in (("ci-any-ref.yml", wf_text), ("ci.yml", ci_text)):
+        for match in re.finditer(r"(?m)^([ ]*)run: *([^\n]*)$", text):
+            indent, tail = len(match.group(1)), match.group(2).strip()
+            assert "${{ inputs." not in tail, \
+                f"{name}: inputs.* must reach run bodies via env, not expansion"
+            if tail.startswith(("|", ">")):
+                rest = text[match.end() + 1:]
+                body = re.match(rf"(?: {{{indent + 1},}}[^\n]*\n?)*", rest).group(0)
+                assert "${{ inputs." not in body, \
+                    f"{name}: inputs.* must reach run bodies via env, not expansion"
 
     # ref must reach the runner via env, never expanded into shell text.
     assert "INPUT_REF: ${{ inputs.ref }}" in wf_text
@@ -158,7 +187,32 @@ except AssertionError:
 else:
     raise AssertionError("mutant(status-on-dispatch-sha) went undetected")
 
-print("structural checks ok (incl. 2 mutants)")
+# Mutant 3: post context ci-ok for every suite -> must be RED.
+mutant_ctx = re.sub(
+    r'if \[\[ "\$SUITE" == all \]\]; then CONTEXT=ci-ok; else CONTEXT="ci-ok-\$SUITE"; fi',
+    "CONTEXT=ci-ok",
+    wf,
+)
+try:
+    validate(mutant_ctx, ci)
+except AssertionError:
+    pass
+else:
+    raise AssertionError("mutant(ci-ok-for-every-suite) went undetected")
+
+# Mutant 3b: the check-run name unconditional ci-ok -> must be RED.
+mutant_name = ci.replace(
+    "name: ${{ (inputs.suite || 'all') == 'all' && 'ci-ok' || format('ci-ok ({0})', inputs.suite) }}",
+    "name: ci-ok",
+)
+try:
+    validate(wf, mutant_name)
+except AssertionError:
+    pass
+else:
+    raise AssertionError("mutant(check-run-always-ci-ok) went undetected")
+
+print("structural checks ok (incl. 4 mutants)")
 PY
 
 # --- live-ish harness: resolver + checkout simulation against a fixture repo ---
@@ -211,6 +265,19 @@ git -C "$tmp/co" -c advice.detachedHead=false checkout -q "$SHA_A"
 git -C "$tmp/co" -c advice.detachedHead=false checkout -qb mutant "$SHA_A"
 git -C "$tmp/co" merge -qm mutant "$SHA_B" >/dev/null
 [[ "$(git -C "$tmp/co" rev-parse HEAD)" != "$SHA_A" ]]
+
+# Context by suite: eval the workflow's own CONTEXT selection line.
+# shellcheck disable=SC2016  # single-quoted grep pattern is intentional
+ctx_line="$(grep -oF 'if [[ "$SUITE" == all ]]; then CONTEXT=ci-ok; else CONTEXT="ci-ok-$SUITE"; fi' "$root/.github/workflows/ci-any-ref.yml")"
+[[ -n "$ctx_line" ]]
+for suite in all lint macos-smoke wrk suites-a suites-b python; do
+  CONTEXT="$(SUITE="$suite" bash -c "$ctx_line; printf '%s' \"\$CONTEXT\"")"
+  if [[ "$suite" == all ]]; then
+    [[ "$CONTEXT" == ci-ok ]]
+  else
+    [[ "$CONTEXT" == "ci-ok-$suite" && "$CONTEXT" != ci-ok ]]
+  fi
+done
 
 # (b) status target: simulate the status step against the resolved sha.
 TARGET_SHA="$SHA_A"

@@ -128,8 +128,9 @@ jobs:
       - id: suites
         name: Resolve suite selector
         shell: bash
+        env:
+          SUITE: ${{ inputs.suite || 'all' }}
         run: |
-          SUITE="${{ inputs.suite || 'all' }}"
           case "$SUITE" in
             all)         SHARDS='["wrk","suites-a","suites-b","python"]'; SMOKE=true ;;
             lint)        SHARDS='[]'; SMOKE=false ;;
@@ -216,9 +217,10 @@ jobs:
       - id: macos
         name: Report Darwin-sensitive coverage
         shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.ref || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || inputs.ref || github.sha }}
         run: |
-          HEAD_SHA="${{ inputs.ref || github.sha }}"
-          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before || inputs.ref || github.sha }}"
           RESULT="$(scripts/needs-full-macos "$BASE_SHA" "$HEAD_SHA")"
           printf '%s\n' "$RESULT"
           NEEDS="$(printf '%s\n' "$RESULT" | sed -n '1p')"
@@ -350,7 +352,8 @@ jobs:
           done < tests/ci-suites.txt
 
   ci-ok:
-    name: ci-ok
+    # On dispatches, a partial suite must not mint an exact 'ci-ok' check run.
+    name: ${{ (inputs.suite || 'all') == 'all' && 'ci-ok' || format('ci-ok ({0})', inputs.suite) }}
     if: always()
     needs: [lint, changes, ubuntu, macos-smoke]
     runs-on: ubuntu-latest
