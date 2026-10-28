@@ -37,7 +37,35 @@ def validate(wf_text: str, ci_text: str) -> None:
     perms = top_block(wf_text, "permissions")
     perm_keys = dict(re.findall(r"(?m)^  (\w[\w-]*): (\w+)", perms))
     assert perm_keys == {"contents": "read", "statuses": "write"}, \
-        f"permissions must be exactly contents:read + statuses:write, got {perm_keys}"
+        f"workflow permissions must be exactly contents:read + statuses:write, got {perm_keys}"
+
+    def job_perm_blocks(text: str) -> list[dict]:
+        blocks = []
+        for match in re.finditer(r"(?m)^    permissions:\n((?:      .*\n)+)", text):
+            blocks.append(dict(re.findall(r"(?m)^      (\w[\w-]*): (\w+)", match.group(1))))
+        return blocks
+
+    # Permission ceiling: the callee may only hold a subset of what the calling
+    # job passes down, or the run fails validation at startup.
+    callee_top = dict(re.findall(r"(?m)^  (\w[\w-]*): (\w+)", top_block(ci_text, "permissions")))
+    callee_jobs = job_perm_blocks(ci_text)
+    ci_call = re.search(
+        r"(?m)^  ci:\n(?:    .*\n|      .*\n|        .*\n)*?    uses: \./\.github/workflows/ci\.yml",
+        wf_text,
+    )
+    assert ci_call, "ci job must call ci.yml"
+    caller_grants = dict(re.findall(
+        r"(?m)^      (\w[\w-]*): (\w+)",
+        re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", ci_call.group(0)).group(1),
+    ))
+    for needed in [callee_top, *callee_jobs]:
+        assert needed.keys() <= caller_grants.keys(), \
+            f"callee declares {needed} but the calling job grants only {caller_grants}"
+
+    # Refusal: a failed resolve must skip the status job.
+    status_if = re.search(r"(?ms)^  status:.*?^    if: (.*)$", wf_text)
+    assert status_if and "needs.resolve.result == 'success'" in status_if.group(1), \
+        "status job must be gated on resolve success"
 
     conc = top_block(wf_text, "concurrency")
     assert "inputs.ref" in conc, "concurrency group must key on the target ref"
