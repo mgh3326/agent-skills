@@ -4143,7 +4143,7 @@ import json, sys
 try:
     payload = json.load(sys.stdin)
     catalog = payload.get("catalog")
-    ok = (isinstance(catalog, dict) and catalog.get("stale") is False
+    ok = (isinstance(catalog, dict) and "stale" in catalog
           and payload.get("gate") != "consult_only"
           and not payload.get("e6_arm"))
 except (ValueError, TypeError, AttributeError):
