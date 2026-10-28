@@ -2230,6 +2230,65 @@ late_window_case je53 working-again ||
   fail "JE53 late pending then working must end the watch"
 echo "PASS je53 late-pending-then-working-watch-expires"
 
+# hk 1973: late=1 belongs to the poll that sets late_pending, once per
+# episode — not to every pending poll while the episode flag is up. The one
+# shape that keeps a second post-deadline poll at action=pending is a loss
+# and recovery: the gone poll sets lost, the return poll sets
+# recover_reason, and a report that moved underneath the flap keeps the
+# sighting unconfirmed. That poll still ends the watch, so it must not tag
+# late=1 again.
+late_recovery_case() {
+  local job="$1" events seq report log
+  reset_case "$job" || return 3
+  mk_job "$job" || return 3
+  arb_lease "$job" || return 3
+  [[ "$(quota_rows "$job")" == 1 ]] || return 3
+  events="$INBOX/$job/events"
+  seq="$TMP/$job-$CASE_SEQ.seq"
+  report="$TMP/$job-report.md"
+  log="$INBOX/$job/completion-sentinel.log"
+  printf 'late report\n' >"$report"
+  printf '%s\n' working working working idle not-found idle >"$seq"
+  SENT_INTERVAL=2 LOST_GRACE=3 SENT_TIMEOUT=6 TRANSIENT_MAX=10 \
+    start_sentinel "$job" w:p1 "$report" "$seq"
+  # A new observation key on every poll from here on: the file grows under
+  # the sentinel so the return poll's sighting is not the confirmed key.
+  ( for _ in $(seq 1 300); do
+      kill -0 "$SENTINEL_PID" 2>/dev/null || break
+      printf 'churn\n' >>"$report"
+      sleep 0.3
+    done ) &
+  own "$!"
+  wait_until 30 pid_gone "$SENTINEL_PID" ||
+    recovery_fail "$job: the sentinel must leave once the late pending resolves" || return
+  [[ "$(grep -c 'late=1' "$log" || true)" == 1 ]] ||
+    recovery_fail "$job: the late episode must log exactly one late=1" || return
+  [[ "$(grep -c 'action=pending' "$log" || true)" == 2 ]] ||
+    recovery_fail "$job: the loss poll must sit between two pending polls" || return
+  [[ "$(grep -c 'action=watch-expired' "$log" || true)" == 1 ]] ||
+    recovery_fail "$job: the recovery poll must end the watch exactly once" || return
+  grep -q 'action=watch-expired elapsed=[0-9]*s' "$log" ||
+    recovery_fail "$job: the watch-expired line must carry the elapsed seconds" || return
+  event_count_is "$events" job.lost 1 ||
+    recovery_fail "$job: the single gone poll is exactly one job.lost" || return
+  event_count_is "$events" job.recovered 1 ||
+    recovery_fail "$job: the return poll is exactly one job.recovered" || return
+  recovery_assert_record "$events" agent_not_found 0 ||
+    recovery_fail "$job: job.recovered must name agent_not_found and a duration" || return
+  event_count_is "$events" job.completed 0 ||
+    recovery_fail "$job: an unconfirmed late report must not complete" || return
+  event_count_is "$events" job.revoked 0 ||
+    recovery_fail "$job: watch-expired is not an end record" || return
+  live_quota_still_held "$job" ||
+    recovery_fail "$job: watch-expired must leave the job's quota row in place" || return
+  recovery_stop
+}
+
+echo "== JE55: a late pending, then a loss and recovery on the next poll, tags late=1 once =="
+late_recovery_case je55 ||
+  fail "JE55 late pending across a recovery must tag late=1 once"
+echo "PASS je55 late-pending-across-recovery-tags-late-once"
+
 # ════════════════════════════════════════════════════════════════════════
 # ════════════════════════════════════════════════════════════════════════
 # QR — hk1798: every job end path returns the job's live quota_pool records
@@ -5034,6 +5093,17 @@ mkmut r39-completed-becomes-watch-expired \
   's~( "\$action" == none || "\$action" == pending )~( "$action" == none || "$action" == pending || "$action" == completed )~'
 expect_mut_red "R39 completed must never become watch-expired" case_late_stable_r39 \
   'FAIL: je51m39: the confirmed late report must complete'
+
+# ── hk1973 mutant: the once-per-episode late tag ────────────────────────
+# R47: tagging every pending poll while late_pending is set again writes a
+# second late=1 when the loss/recovery flap keeps the second late poll
+# pending.
+case_late_recovery_r47() { late_recovery_case je55m47; }
+mkmut_span r47-late-tag-every-pending \
+  'if [[ "$action" == pending && -n "$late_sighting" ]]; then # hk1973-late-once' \
+  '    if [[ "$action" == pending && -n "$late_pending" ]]; then # reverted hk1973 once-per-episode late tag'
+expect_mut_red "R47 late=1 is logged only on the sighting poll" case_late_recovery_r47 \
+  'FAIL: je55m47: the late episode must log exactly one late=1'
 
 # ── hk1892: a sentinel whose job dir is gone leaves quietly ──────────────
 # Rule: at the top of every poll, 2 consecutive polls with the jobdir missing

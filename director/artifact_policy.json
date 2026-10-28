@@ -1,10 +1,49 @@
 {
  "schema": "fleet.artifact-policy.v1",
  "roots": {
-  "jobs": "herdr-inbox/jobs",
-  "webqa": "webqa-runner/jobs"
+  "jobs": {
+   "path": "herdr-inbox/jobs",
+   "kind": "per-job"
+  },
+  "webqa-v3": {
+   "path": "webqa-runner/v3",
+   "kind": "flat"
+  },
+  "work": {
+   "path": ".",
+   "kind": "flat"
+  },
+  "jobstore": {
+   "path": "herdr-inbox/jobs",
+   "kind": "flat"
+  }
  },
  "rows": [
+  {
+   "class": "record-text",
+   "root": "jobs",
+   "glob": "events"
+  },
+  {
+   "class": "record-text",
+   "root": "jobs",
+   "glob": "*.md"
+  },
+  {
+   "class": "record-text",
+   "root": "jobs",
+   "glob": "*.txt"
+  },
+  {
+   "class": "record-text",
+   "root": "jobs",
+   "glob": "*.json"
+  },
+  {
+   "class": "record-text",
+   "root": "jobs",
+   "glob": "completion-sentinel.log"
+  },
   {
    "class": "intermediate-build",
    "root": "jobs",
@@ -15,6 +54,156 @@
    "class": "cache",
    "root": "jobs",
    "glob": "unity/*/out"
+  },
+  {
+   "class": "protected",
+   "root": "work",
+   "glob": "ParkingArcade/**"
+  },
+  {
+   "class": "protected",
+   "root": "work",
+   "glob": "ParkingArcade.pa-unity/**"
+  },
+  {
+   "class": "protected",
+   "root": "work",
+   "glob": "rea_test/**"
+  },
+  {
+   "class": "protected",
+   "root": "work",
+   "glob": "parking-ref-analysis*/**"
+  },
+  {
+   "class": "protected",
+   "root": "work",
+   "glob": "auto_trader*/**"
+  },
+  {
+   "class": "protected",
+   "root": "work",
+   "glob": "brewdial*/**"
+  },
+  {
+   "class": "protected",
+   "root": "work",
+   "glob": "tt-*/**"
+  },
+  {
+   "class": "protected",
+   "root": "jobs",
+   "glob": "refs/**"
+  },
+  {
+   "class": "protected",
+   "root": "jobstore",
+   "glob": "asset-store-packs/**"
+  },
+  {
+   "host": "m1b",
+   "class": "intermediate-build",
+   "root": "webqa-v3",
+   "glob": "builds/*",
+   "keep_newest": 3
+  },
+  {
+   "host": "m1b",
+   "class": "worktree",
+   "root": "webqa-v3",
+   "glob": "wt-*"
+  },
+  {
+   "host": "m1b",
+   "class": "cache",
+   "root": "webqa-v3",
+   "glob": "home"
+  },
+  {
+   "host": "m1",
+   "class": "evidence",
+   "root": "jobs",
+   "job": "b1716-op",
+   "glob": "videos/**",
+   "mirror_required": true
+  },
+  {
+   "host": "m1",
+   "class": "evidence",
+   "root": "jobs",
+   "job": "b1716-op",
+   "glob": "c3-raw-1f4e8c1e7b37-RunStills/**",
+   "mirror_required": true
+  },
+  {
+   "host": "m1",
+   "class": "record-text",
+   "root": "jobs",
+   "job": "b1716-op",
+   "glob": "encode-1716op.sh"
+  },
+  {
+   "host": "m1",
+   "class": "record-text",
+   "root": "jobs",
+   "job": "b1716-op",
+   "glob": "encode.log"
+  },
+  {
+   "host": "m1",
+   "class": "cache",
+   "root": "jobs",
+   "job": "b1716-op",
+   "glob": "c[23]-raw-*-RunCircuit"
+  },
+  {
+   "host": "m1",
+   "class": "cache",
+   "root": "jobs",
+   "job": "b1716-op",
+   "glob": "c[23]-raw-*-RunMatchedClips"
+  },
+  {
+   "host": "m1",
+   "class": "cache",
+   "root": "jobs",
+   "job": "b1716-op",
+   "glob": "c2-raw-RunMatchedClips"
+  },
+  {
+   "host": "m1",
+   "class": "record-text",
+   "root": "jobs",
+   "job": "b1716-dv",
+   "glob": "phase-b-2313074543ec/run1-raw/changed.txt"
+  },
+  {
+   "host": "m1",
+   "class": "record-text",
+   "root": "jobs",
+   "job": "b1716-dv",
+   "glob": "phase-b-2313074543ec/run1-raw/evidence/candidate-input-pure.txt"
+  },
+  {
+   "host": "m1",
+   "class": "record-text",
+   "root": "jobs",
+   "job": "b1716-dv",
+   "glob": "phase-b-2313074543ec/run1-raw/evidence/candidate/done.txt"
+  },
+  {
+   "host": "m1",
+   "class": "record-text",
+   "root": "jobs",
+   "job": "b1716-dv",
+   "glob": "phase-b-2313074543ec/run1-raw/evidence/candidate/logs/runlog.txt"
+  },
+  {
+   "host": "m1",
+   "class": "cache",
+   "root": "jobs",
+   "job": "b1716-dv",
+   "glob": "phase-b-2313074543ec/run1-raw/**"
   }
  ]
 }

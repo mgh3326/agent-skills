@@ -548,6 +548,21 @@ grep -q -- 'HERDR_SESSION=worker' "$TMP/ssh.log"
 grep -q -- '/remote/agent-skills' "$TMP/ssh.log"
 grep -q -- ' -w workers' "$TMP/ssh.log"
 
+# hk 2180: a remote spill forwards SCOPEFUEL_E6_ARM verbatim when it is set
+# (marker-gated E6 rungs can then spill) and carries no assignment at all
+# when it is unset.
+: >"$TMP/ssh.log"
+arm_out="$(SCOPEFUEL_E6_ARM='haiku@low' WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$arm_out"
+grep -q -- 'SCOPEFUEL_E6_ARM=haiku@low' "$TMP/ssh.log"
+: >"$TMP/ssh.log"
+unarm_out="$(WRK_PLACE_SCENARIO=unavailable WRK_TEST_ACTIVE=4 run_wrk "$ROOT/bin/wrk" 2>&1)"
+grep -q '^OK pane=desktop:p7 host=desktop ' <<<"$unarm_out"
+if grep -q 'SCOPEFUEL_E6_ARM' "$TMP/ssh.log"; then
+  echo 'ASSERT hk2180 unset SCOPEFUEL_E6_ARM leaked into the remote command' >&2
+  exit 1
+fi
+
 # An unreachable candidate is skipped and the next configured candidate is used.
 : >"$TMP/ssh.log"
 backup_out="$(WRK_PLACE_SCENARIO=unavailable WRK_SSH_SCENARIO=desktop-down WRK_TEST_ACTIVE=4 run_wrk "$WRK_COPY" 2>&1)"

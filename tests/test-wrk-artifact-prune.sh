@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2016 # mutant specs and fixture JSON are literal text
-# hk 2090 contract tests: the wrk prune artifact pass — cache and
-# intermediate-build classes from director/artifact_policy.json
-# (schema fleet.artifact-policy.v1). Evidence, final-build and record text
-# are out of scope for this task and must never be touched.
+# hk 2090/2093 contract tests: the wrk prune artifact pass acts only on cache
+# and intermediate-build rows from director/artifact_policy.json (schema
+# fleet.artifact-policy.v1). Keep classes and worktree references are loaded
+# by the shared schema and remain untouched by this pass.
 # hk 2152 adds the scanner-side never-touch contract (AP8, AP10 help), the
 # policy-refusal message (AP9) and the prune-record age rule (AP10); its
 # moments are relative to now, never fixed dates.
@@ -16,6 +16,9 @@
 set -euo pipefail
 export WRK_TEST_MODE=1
 unset WRK_TEST_REAL_SENTINEL
+# Exercise the bash-only HOSTNAME fallback: Bash populates HOSTNAME in each
+# process but does not export it unless explicitly requested.
+export -n HOSTNAME 2>/dev/null || true
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="${WRK_TEST_BIN:-$ROOT/bin/wrk}"
@@ -83,10 +86,12 @@ reset_case() {
   printf '#!/bin/sh\nexit 1\n' >"$LSOF_STUB"
   chmod +x "$LSOF_STUB"
   mkdir -p "$INBOX" "$WEBQA"
+  XDG_DATA_HOME="$XDG" ARBITER_INBOX_ROOT="$INBOX" \
+    "$ARBITER" claim --job artifact-test-db --lane fixture --t T0 >/dev/null
 }
 
 prune_run() {
-  env HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
+  env -u WRK_ARTIFACT_HOST HERDR_BIN="$HERDR" ARBITER_BIN="$ARBITER" ARBITER_INBOX_ROOT="$INBOX" \
     XDG_DATA_HOME="$XDG" HANDOFFKEEP_BIN="$HK" HK_STATE="$HK_DB" \
     ${GET_SEQ:+WRK_FIXTURE_GET_SEQUENCE="$GET_SEQ"} \
     ${HK_MODE_VAR:+HK_MODE="$HK_MODE_VAR"} \
@@ -545,10 +550,9 @@ print(json.dumps({"schema": "fleet.artifact-policy.v1",
 ' "$1"
 }
 
-assert_policy_refused ap4-class-ev \
-  "$(base_envelope '[{"class":"evidence","root":"jobs","glob":"e-*"}]')"
-assert_policy_refused ap4-class-final \
-  "$(base_envelope '[{"class":"final-build","root":"jobs","glob":"b-*"}]')"
+# Evidence and final-build are valid keep classes in the shared schema; the
+# prune pass loads them but never acts on them. Their loader coverage lives in
+# test_wrk_artifacts.py.
 assert_policy_refused ap4-unknown-key \
   '{"schema":"fleet.artifact-policy.v1","roots":{"jobs":"herdr-inbox/jobs"},"rows":[],"extra":1}'
 assert_policy_refused ap4-row-key \
@@ -561,8 +565,8 @@ assert_policy_refused ap4-dotdot-mid \
   "$(base_envelope '[{"class":"cache","root":"jobs","glob":"a/../x"}]')"
 assert_policy_refused ap4-schema \
   '{"schema":"fleet.artifact-policy.v0","roots":{"jobs":"herdr-inbox/jobs"},"rows":[]}'
-assert_policy_refused ap4-keep-range \
-  "$(base_envelope '[{"class":"intermediate-build","root":"jobs","glob":"b-*","keep_newest":3}]')"
+# keep_newest=3 is valid under the revision-2 schema and is covered in
+# test_wrk_artifacts.py.
 assert_policy_refused ap4-bad-root \
   "$(base_envelope '[{"class":"cache","root":"nosuch","glob":"c-*"}]')"
 assert_policy_refused ap4-abs-root \
@@ -1010,12 +1014,12 @@ reset_case ap9
 hk_task 1 merged
 mk_ended_job ap9 1 w:p9
 mk_artifact "$INBOX/ap9/browser-cache"
-base_envelope '[{"class":"cache","root":"jobs","glob":"browser-*"},{"class":"evidence","root":"jobs","glob":"e-*"}]' >"$POLICY"
+base_envelope '[{"class":"cache","root":"jobs","glob":"browser-*"},{"class":"unknown-class","root":"jobs","glob":"e-*"}]' >"$POLICY"
 seq_gone
 rc=0; OUT="$(prune_run --apply)" || rc=$?
 [[ "$rc" == 2 ]] || fail "AP9: a refused policy must exit 2 (rc=$rc): $OUT"
 MSG="$(grep '^artifact-prune refused' <<<"$OUT")"
-[[ "$MSG" == "artifact-prune refused: $POLICY — row 1 class 'evidence' is not yet supported" ]] ||
+[[ "$MSG" == "artifact-prune refused: $POLICY — row 1 class 'unknown-class' is unknown" ]] ||
   fail "AP9: the message must be exactly the reason, got: $MSG"
 ! grep -q "^cache"$'\t' <<<"$OUT" ||
   fail "AP9: no earlier row text may reach the output: $OUT"
@@ -1340,6 +1344,69 @@ bounded 120 bash -c '. "$1"; prune_artifact_scan "$2" "$3"' _ "$SCANNER" "$INBOX
 echo "PASS ap15 bounded-scan"
 
 # ════════════════════════════════════════════════════════════════════════
+# T1 — the keep-conflict helper receives the same host Bash used to filter
+# rows. HOSTNAME is intentionally unexported; WRK_ARTIFACT_HOST is removed
+# from every prune invocation.
+# ════════════════════════════════════════════════════════════════════════
+echo "== T1: host-scoped keep rows reach the conflict helper =="
+
+prepare_host_keep_case() { # JOB KEEP_HOST — eligible ended job and policy
+  local job="$1" keep_host="$2" actual_host="${HOSTNAME:-unknown}"
+  reset_case "$job" || return 1
+  hk_task 1 merged || return 1
+  mk_ended_job "$job" 1 w:p9 || return 1
+  mk_artifact "$INBOX/$job/cache-host" || return 1
+  printf 'keep host record\n' >"$INBOX/$job/cache-host/record.txt" || return 1
+  policy_min <<JSON || return 1
+[
+ {"class":"cache","root":"jobs","glob":"cache-host","host":"$actual_host"},
+ {"class":"record-text","root":"jobs","glob":"cache-host/record.txt","host":"$keep_host"}
+]
+JSON
+  seq_gone || return 1
+}
+
+case_host_same_keep() {
+  local host="${HOSTNAME:-unknown}" out=""
+  prepare_host_keep_case host-same "$host" || return 3
+  out="$(prune_run --apply)" || return 3
+  [[ -f "$INBOX/host-same/cache-host/record.txt" ]] ||
+    assertion_red "same-host record-text row must protect cache contents (host=$host; output=$out)"
+  grep -q 'keep-class-precedence.*class=record-text' <<<"$out" ||
+    assertion_red "same-host keep conflict must be reported (host=$host; output=$out)"
+}
+
+case_host_different_keep() {
+  local host="${HOSTNAME:-unknown}" other="different-${HOSTNAME:-host}" out=""
+  prepare_host_keep_case host-different "$other" || return 3
+  out="$(prune_run --apply)" || return 3
+  [[ ! -e "$INBOX/host-different/cache-host" ]] ||
+    assertion_red "a different-host record-text row must not keep this host's cache (output=$out)"
+  grep -q 'action=removed' <<<"$out" ||
+    assertion_red "matching cache row keeps existing different-host behavior (output=$out)"
+}
+
+case_mut_host_env() {
+  local host="${HOSTNAME:-unknown}" out=""
+  prepare_host_keep_case host-mut-env "$host" || return 3
+  out="$(prune_run --apply)" || return 3
+  [[ -f "$INBOX/host-mut-env/cache-host/record.txt" ]] ||
+    assertion_red "host-scoped keep row must survive a helper that re-reads process environment"
+}
+
+case_mut_host_arg() {
+  local host="${HOSTNAME:-unknown}" out=""
+  prepare_host_keep_case host-mut-arg "$host" || return 3
+  out="$(prune_run --apply)" || return 3
+  [[ -f "$INBOX/host-mut-arg/cache-host/record.txt" ]] ||
+    assertion_red "host-scoped keep row must survive when the host argument is dropped"
+}
+
+case_host_same_keep || fail "T1 same-host keep conflict failed"
+case_host_different_keep || fail "T1 different-host behavior failed"
+echo "PASS T1 host-scoped keep conflict and host mismatch"
+
+# ════════════════════════════════════════════════════════════════════════
 # MUT — assertion-RED mutants, each applied at its real call site.
 # ════════════════════════════════════════════════════════════════════════
 echo "== MUT: assertion-RED mutants per brief =="
@@ -1368,6 +1435,7 @@ expect_mut_red() {
     fail "MUT $desc: setup failed inside the mutant case"
   fi
   if (( rc == 0 )); then
+    [[ -z "$expected" ]] || printf '%s\n' "$output" >&2
     fail "MUT $desc: mutant stayed GREEN — the assertion does not cover it"
   fi
   if [[ -n "$expected" ]] && ! grep -Fq -- "$expected" <<<"$output"; then
@@ -1395,37 +1463,50 @@ JSON
   [[ -d "$INBOX/mutk/build-3" && -d "$INBOX/mutk/build-4" ]] ||
     assertion_red "keep_newest 2 must keep the 2 newest builds"
 }
-# Mutant 2 — an unsupported class (evidence) is accepted.
+# Mutant 2 — an unknown class is accepted.
 case_mut_class() {
   reset_case mutev || return 3
   hk_task 1 merged || return 3
   mk_ended_job mutev 1 w:p9 || return 3
-  mk_artifact "$INBOX/mutev/evidence-1" || return 3
-  printf '%s\n' '{"schema":"fleet.artifact-policy.v1","roots":{"jobs":"herdr-inbox/jobs"},"rows":[{"class":"evidence","root":"jobs","glob":"evidence-*"}]}' >"$POLICY" || return 3
+  mk_artifact "$INBOX/mutev/unknown-1" || return 3
+  printf '%s\n' '{"schema":"fleet.artifact-policy.v1","roots":{"jobs":"herdr-inbox/jobs"},"rows":[{"class":"unknown-class","root":"jobs","glob":"unknown-*"}]}' >"$POLICY" || return 3
   seq_gone
   local rc=0
   prune_run --apply >/dev/null 2>&1 || rc=$?
-  (( rc != 0 )) || assertion_red "an evidence row must refuse the pass"
-  [[ -d "$INBOX/mutev/evidence-1" ]] ||
-    assertion_red "an evidence row must never delete"
+  (( rc != 0 )) || assertion_red "an unknown class row must refuse the pass"
+  [[ -d "$INBOX/mutev/unknown-1" ]] ||
+    assertion_red "an unknown class row must never delete"
 }
-# Mutant 3 — symlinks followed: the inside link target is deleted. The link
-# points inside the job dir: an outside-pointing link is refused by the
-# scanner and never reaches the remover.
+# Mutant 3 — symlinks followed: the inside file link target is deleted. The
+# outside-pointing link is refused by the scanner and never reaches remover.
 case_mut_symlink() {
   reset_case mutsl || return 3
   hk_task 1 merged || return 3
   mk_ended_job mutsl 1 w:p9 || return 3
   mkdir -p "$INBOX/mutsl/keep" || return 3
   printf 'keepme\n' >"$INBOX/mutsl/keep/real.bin" || return 3
-  ln -s keep "$INBOX/mutsl/cache-link" || return 3
+  ln -s keep/real.bin "$INBOX/mutsl/cache-link" || return 3
+  outside="$TMP/outside-mutsl"
+  mkdir -p "$outside/target" || return 3
+  printf 'outside\n' >"$outside/target/real.bin" || return 3
+  ln -s "$outside/target/real.bin" "$INBOX/mutsl/cache-outside" || return 3
+  python3 - "$INBOX/mutsl/cache-link" "$INBOX/mutsl/cache-outside" <<'PY'
+import datetime, os, sys
+stamp = (datetime.datetime.now(datetime.timezone.utc) -
+         datetime.timedelta(days=5)).timestamp()
+for path in sys.argv[1:]:
+    os.utime(path, (stamp, stamp), follow_symlinks=False)
+PY
   policy_min <<'JSON' || return 3
 [{"class": "cache", "root": "jobs", "glob": "cache-*"}]
 JSON
   seq_gone
-  prune_run --apply >/dev/null 2>&1 || true
+  local output=""
+  output="$(prune_run --apply --heavy-age 1s 2>&1)" || true
   [[ -f "$INBOX/mutsl/keep/real.bin" ]] ||
-    assertion_red "the symlink target must be untouched"
+    { assertion_red "the symlink target must be untouched: $output"; return 1; }
+  [[ -f "$outside/target/real.bin" ]] ||
+    { assertion_red "the outside symlink target must be untouched: $output"; return 1; }
 }
 # Mutant 4 — the task-merged check dropped for cache.
 case_mut_task() {
@@ -1660,14 +1741,12 @@ case_mut_cap() {
 mkmut keep 's/k > keep/k > 0/'
 expect_mut_red "keep-newest-ignored" case_mut_keep "2 newest builds"
 
-# M2 — an unsupported class is accepted: evidence joins the allow-list at
-# the schema's own CLASSES table.
-mkmut class 's/"intermediate-build")/"intermediate-build", "evidence")/'
-expect_mut_red "evidence-class-accepted" case_mut_class "evidence row must"
+# M2 — an unknown policy class is accepted instead of refusing the whole pass.
+mkmut class 's/if cls not in CLASSES:/if False and cls not in CLASSES:/'
+expect_mut_red "unknown-class-accepted" case_mut_class "unknown class row"
 
-# M3 — the removal helper follows the link: unlink becomes rmtree on the
-# link's realpath, deleting the outside target.
-mkmut symlink 's/os\.unlink(path)/shutil.rmtree(os.path.realpath(path))/'
+# M3 — the remover follows the inside file link instead of unlinking the link.
+mkmut symlink 's/os\.unlink(path)/os.remove(os.path.realpath(path))/'
 expect_mut_red "symlinks-followed" case_mut_symlink "symlink target must be untouched"
 
 # M4 — the merged-or-dropped task check is dropped: every task state is
@@ -1732,6 +1811,14 @@ expect_mut_red "entry-not-collapsed-to-one-record" case_mut_alias "kept payload 
 # M17 — the match cap does not fail the scan closed.
 mkmut cap 's/if len(raw) > MAX_MATCHES:/if False:/'
 expect_mut_red "endless-match-list-not-refused" case_mut_cap "symlink cycle under ** must fail the scan closed"
+
+# T1 mutants at the call sites: re-reading process environment in Python, or
+# dropping the resolved host argument from the helper invocation.
+mkmut host-env 's/jobdir, candidate, rows, actual_host = sys.argv\[1:\]/jobdir, candidate, rows, actual_host = sys.argv[1:]; actual_host = os.environ.get("WRK_ARTIFACT_HOST", os.environ.get("HOSTNAME", "unknown"))/'
+expect_mut_red "keep-helper-rereads-HOSTNAME" case_mut_host_env "host-scoped keep row must survive"
+
+mkmut host-arg 's/"\$parsed" "\$artifact_host")/"\$parsed")/'
+expect_mut_red "keep-helper-host-argument-dropped" case_mut_host_arg "host-scoped keep row must survive"
 
 WRK_LEAK_ROOT="$TMP" WRK_LEAK_COPY="$WRK" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
 echo "ALL ARTIFACT-PRUNE CONTRACT TESTS PASSED"

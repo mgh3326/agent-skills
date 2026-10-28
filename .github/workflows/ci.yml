@@ -13,6 +13,18 @@ on:
         required: false
         default: false
         type: boolean
+  workflow_call:
+    inputs:
+      ref:
+        description: Exact ref (sha) to check out; empty means the event default
+        required: false
+        default: ''
+        type: string
+      suite:
+        description: Which suites to run (all, lint, wrk, suites-a, suites-b, python, macos-smoke)
+        required: false
+        default: all
+        type: string
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'schedule') && github.run_id || github.event.pull_request.number || github.ref }}
@@ -29,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - name: Install ShellCheck
         shell: bash
         run: |
@@ -72,9 +86,14 @@ jobs:
             tests/test-codex-project-trust.sh \
             tests/test-area-propose.sh \
             tests/test-ci-suites.sh \
+            tests/test-ci-any-ref.sh \
             tests/test-wrk-artifacts-move.sh \
+            tests/test-wrk-artifacts-routing.sh \
+            tests/test-wrk-artifacts-sweep.sh \
+            tests/test-wrk-artifact-prune.sh \
             tests/needs-full-macos.sh \
             scripts/needs-full-macos \
+            scripts/resolve-ci-ref \
             tests/fixtures/fleet-rev/fake-ssh \
             tests/fixtures/fleet-rev/fake-gh \
             tests/fixtures/fleet-rev/panewire \
@@ -100,10 +119,28 @@ jobs:
       docs_only: ${{ steps.classify.outputs.docs_only }}
       needs_full_macos: ${{ steps.macos.outputs.needs_full_macos }}
       sensitive_paths: ${{ steps.macos.outputs.sensitive_paths }}
+      shards: ${{ steps.suites.outputs.shards }}
+      smoke: ${{ steps.suites.outputs.smoke }}
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           fetch-depth: 0
+      - id: suites
+        name: Resolve suite selector
+        shell: bash
+        env:
+          SUITE: ${{ inputs.suite || 'all' }}
+        run: |
+          case "$SUITE" in
+            all)         SHARDS='["wrk","suites-a","suites-b","python"]'; SMOKE=true ;;
+            lint)        SHARDS='[]'; SMOKE=false ;;
+            macos-smoke) SHARDS='[]'; SMOKE=true ;;
+            wrk|suites-a|suites-b|python) SHARDS="[\"$SUITE\"]"; SMOKE=false ;;
+            *) echo "unknown suite: $SUITE" >&2; exit 1 ;;
+          esac
+          echo "shards=$SHARDS" >> "$GITHUB_OUTPUT"
+          echo "smoke=$SMOKE" >> "$GITHUB_OUTPUT"
       - id: classify
         name: Classify docs-only changes
         shell: bash
@@ -181,9 +218,11 @@ jobs:
       - id: macos
         name: Report Darwin-sensitive coverage
         shell: bash
+        env:
+          HEAD_SHA: ${{ inputs.ref || github.sha }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before || inputs.ref || github.sha }}
         run: |
-          BASE_SHA="${{ github.event.pull_request.base.sha || github.event.before || github.sha }}"
-          RESULT="$(scripts/needs-full-macos "$BASE_SHA" "$GITHUB_SHA")"
+          RESULT="$(scripts/needs-full-macos "$BASE_SHA" "$HEAD_SHA")"
           printf '%s\n' "$RESULT"
           NEEDS="$(printf '%s\n' "$RESULT" | sed -n '1p')"
           PATHS="$(printf '%s\n' "$RESULT" | sed -n '2,$p' | paste -sd, -)"
@@ -203,16 +242,18 @@ jobs:
   ubuntu:
     name: ubuntu (${{ matrix.shard }})
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.shards != '[]'
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
-        shard: [wrk, suites-a, suites-b, python]
+        shard: ${{ fromJSON(needs.changes.outputs.shards) }}
     env:
       SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
@@ -249,12 +290,14 @@ jobs:
   macos-smoke:
     name: macos-smoke
     needs: changes
-    if: needs.changes.outputs.docs_only != 'true'
+    if: needs.changes.outputs.docs_only != 'true' && needs.changes.outputs.smoke == 'true'
     runs-on: macos-latest
     env:
       SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
@@ -276,6 +319,8 @@ jobs:
       SCOPEFUEL_BIN: ${{ github.workspace }}/tests/fixtures/scopefuel
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
       - uses: actions/setup-python@v5
         with:
           python-version: '3.14'
@@ -308,7 +353,8 @@ jobs:
           done < tests/ci-suites.txt
 
   ci-ok:
-    name: ci-ok
+    # On dispatches, a partial suite must not mint an exact 'ci-ok' check run.
+    name: ${{ (inputs.suite || 'all') == 'all' && 'ci-ok' || format('ci-ok ({0})', inputs.suite) }}
     if: always()
     needs: [lint, changes, ubuntu, macos-smoke]
     runs-on: ubuntu-latest
@@ -320,6 +366,7 @@ jobs:
           DOCS_ONLY: ${{ needs.changes.outputs.docs_only }}
           UBUNTU: ${{ needs.ubuntu.result }}
           MACOS_SMOKE: ${{ needs.macos-smoke.result }}
+          SUITE: ${{ inputs.suite || 'all' }}
         run: |
           if [[ "$LINT" != success || "$CHANGES" != success ]]; then
             echo "ci-ok failed: lint=$LINT changes=$CHANGES" >&2
@@ -329,8 +376,21 @@ jobs:
             echo "ci-ok failed: ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE" >&2
             exit 1
           fi
-          if [[ "$DOCS_ONLY" != true && ( "$UBUNTU" != success || "$MACOS_SMOKE" != success ) ]]; then
-            echo "ci-ok failed: unexpected skip ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE docs_only=$DOCS_ONLY" >&2
-            exit 1
+          if [[ "$SUITE" == all ]]; then
+            if [[ "$DOCS_ONLY" != true && ( "$UBUNTU" != success || "$MACOS_SMOKE" != success ) ]]; then
+              echo "ci-ok failed: unexpected skip ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE docs_only=$DOCS_ONLY" >&2
+              exit 1
+            fi
+          else
+            case "$SUITE" in
+              lint) ;;
+              macos-smoke) EXPECTED="$MACOS_SMOKE" ;;
+              wrk|suites-a|suites-b|python) EXPECTED="$UBUNTU" ;;
+              *) echo "ci-ok failed: unknown suite $SUITE" >&2; exit 1 ;;
+            esac
+            if [[ "${EXPECTED:-success}" != success ]]; then
+              echo "ci-ok failed: suite=$SUITE ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE" >&2
+              exit 1
+            fi
           fi
-          echo "ci-ok passed: lint=$LINT changes=$CHANGES docs_only=$DOCS_ONLY ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE"
+          echo "ci-ok passed: lint=$LINT changes=$CHANGES docs_only=$DOCS_ONLY ubuntu=$UBUNTU macos-smoke=$MACOS_SMOKE suite=$SUITE"
