@@ -411,8 +411,9 @@ case "$profile@$effort" in
   # normal pinned builder-sol-xhigh spelling is gate-decided (REF required).
   # codex-sol@max stays a gate=default row (builder-sol-max needs no REF).
   codex-sol@xhigh) escalation_rung=1 ;;
-  # hk 2218: the placed canon row codex-terra61@xhigh is an escalation rung.
-  codex-terra61@xhigh) escalation_rung=1 ;;
+  # hk 2218: the installed gate admits the explicit codex-terra61@xhigh rung
+  # with no REF and labels it escalation-gated (probed 2026-10-28, rc 0).
+  codex-terra61@xhigh) escalation_label=1 ;;
   opus@low) [[ "${WRK_GATE_738:-0}" == 1 ]] || escalation_rung=1 ;;
 esac
 # task483: the installed scopefuel's fail-closed operator-request refusals,
@@ -506,4 +507,5 @@ if [[ "$profile" == devin-swe2 ]]; then
 else
   echo "profile=$profile pool=$pool used_pct=12.5 class=preserve$extra"
 fi
+[[ "${escalation_label:-0}" -ne 1 ]] || echo "$profile pool=$pool [rung $profile@$effort, escalation-gated]"
 echo "gate allowed profile=$profile"

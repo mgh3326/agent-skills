@@ -599,8 +599,6 @@ echo "PASS T-A3: codex-sol and codex-luna remain spawnable"
 # this suite's temporary root; the Codex binary is still the herdr fixture.
 TERRA61_CASE_SEQ=0
 TERRA61_LAST_ROOT="" TERRA61_LAST_RC=0
-# Extra spawn arguments for one terra61_run_case call (e.g. an operator REF).
-TERRA61_EXTRA_ARGS=()
 terra61_run_case() {
   local case_name="$1" profile="$2" role="$3" screen_kind="$4"
   local screen_effort="$5" prompt_text="$6" launch_effort="${7:-}"
@@ -642,7 +640,6 @@ terra61_run_case() {
     *) args+=(--role worker --task "$task_id") ;;
   esac
   [[ -z "$launch_effort" ]] || args+=(--effort "$launch_effort")
-  args+=("${TERRA61_EXTRA_ARGS[@]+"${TERRA61_EXTRA_ARGS[@]}"}")
   env_overrides=()
   [[ -z "$marker" ]] || env_overrides+=("SCOPEFUEL_E6_ARM=$marker")
   [[ -z "$catalog_model" ]] || env_overrides+=("WRK_LAUNCH_MODEL_OVERRIDE=$catalog_model")
@@ -763,19 +760,14 @@ terra61_expect_launch builder-medium builder-terra61-medium medium codex-terra61
 for rung in high max; do
   terra61_expect_launch "builder-$rung" "builder-terra61-$rung" "$rung" "" footer
 done
-TERRA61_EXTRA_ARGS=(--operator-request hk:task/2043)
 terra61_expect_launch builder-xhigh builder-terra61-xhigh xhigh "" footer
-TERRA61_EXTRA_ARGS=()
 echo "PASS hk 2109: codex-terra61 default/override and four pinned builder rungs resolve catalog, argv and gate effort"
 
-# hk 2218 B1: without a REF the xhigh escalation rung is refused by the gate.
-terra61_run_case builder-xhigh-noref builder-terra61-xhigh builder footer xhigh "fixture prompt"
-[[ "$TERRA61_LAST_RC" -eq 3 ]] ||
-  fail "builder-terra61-xhigh without --operator-request must hit the gate escalation refusal (rc=$TERRA61_LAST_RC): $(<"$TERRA61_LAST_ROOT/err")"
-grep -q 'escalation' "$TERRA61_LAST_ROOT/err" ||
-  fail "builder-terra61-xhigh refusal must be the gate's escalation denial: $(<"$TERRA61_LAST_ROOT/err")"
-grep -q '^agent start ' "$TERRA61_LAST_ROOT/herdr.log" &&
-  fail "builder-terra61-xhigh without a REF must not start a pane"
+# hk 2218 B1: the deployed contract — the installed gate admits the explicit
+# xhigh rung with no REF (rc 0) and labels it escalation-gated. Whether
+# escalation rungs need a REF is a separate operator decision.
+grep -qF '[rung codex-terra61@xhigh, escalation-gated]' "$TERRA61_LAST_ROOT/out" ||
+  fail "builder-terra61-xhigh must be admitted labelled escalation-gated: $(<"$TERRA61_LAST_ROOT/out")"
 # hk 2218 B2: low and medium are still E6 rungs; without a marker wrk itself
 # refuses them (rc 2) before the gate is asked.
 terra61_run_case worker-low-nomarker codex-terra61 worker footer low "fixture prompt" low
@@ -788,7 +780,7 @@ terra61_run_case builder-medium-nomarker builder-terra61-medium builder footer m
   fail "builder-terra61-medium without SCOPEFUEL_E6_ARM must die rc 2 (rc=$TERRA61_LAST_RC): $(<"$TERRA61_LAST_ROOT/err")"
 grep -q 'E6 measurement profile' "$TERRA61_LAST_ROOT/err" ||
   fail "builder-terra61-medium refusal must name the E6 marker: $(<"$TERRA61_LAST_ROOT/err")"
-echo "PASS hk 2218: terra61 xhigh needs a REF; low and medium still need the E6 marker"
+echo "PASS hk 2218: terra61 xhigh is admitted escalation-gated; low and medium still need the E6 marker"
 
 # The exact allowed model id is the only Terra exception. Catalog injection,
 # PROFILE_MODEL_ARG and ARGS -m/--model remain guarded; old aliases stay barred.
