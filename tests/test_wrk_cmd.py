@@ -121,19 +121,20 @@ class CmdSpawnTests(unittest.TestCase):
         self.assertEqual(self.log("gate.log").splitlines()[0],
                          "gate -m cmd-dsflash41 --effort high --role worker")
 
-    def test_host_gate_allows_only_desk_hosts_with_flag(self):
-        for host in ("mbp", "desktop", "m1b"):
+    def test_host_gate_allows_any_machine_id_with_flag(self):
+        # hk 2180: approval is the desk-owned [local] flag alone. Real
+        # machine_ids (mac-personal on mbp, mac-dev on m1b, desktop) pass, and
+        # so does an id no approved list ever named — no name list remains.
+        for host in ("mac-personal", "mac-dev", "desktop", "some-new-host"):
             with self.subTest(host=host):
                 (self.tmp / "herdr.log").unlink(missing_ok=True)
                 self.hosts(f'[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "{host}"\n')
                 result = self.spawn()
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_host_gate_refuses_unapproved_host_or_missing_opt_in(self):
-        self.hosts('[local]\ncmd_dsflash41 = true\n[hub]\nmachine_id = "m1"\n')
-        self.assert_refused_before_admission(self.spawn(), "approved hosts are mbp, desktop, m1b")
-        for value, reason in (("false", "must be literal true"),
-                              (None, "must be literal true"),
+    def test_host_gate_refuses_missing_or_malformed_opt_in(self):
+        for value, reason in (("false", "cmd_dsflash41 must be literal true"),
+                              (None, "cmd_dsflash41 must be literal true"),
                               ('"true"', "bare TOML booleans")):
             with self.subTest(value=value):
                 (self.tmp / "herdr.log").unlink(missing_ok=True)
