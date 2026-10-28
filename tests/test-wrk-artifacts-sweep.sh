@@ -980,4 +980,33 @@ have_not "Traceback" || fail "sw21 leaked a traceback: $SWEEP_OUT"
 [[ -f "$JD/evidence/z.png" ]] || fail "sw21 deleted without a readable record"
 echo "PASS sw21-missing-body"
 
+# ─────────────────────────────────────────────────────────────────────────────
+echo "== sw22: a newer undated claim beats an older dated claim =="
+reset_case sw22
+write_hosts
+write_policy
+mk_ended_job sw22 241 w:p9
+mk_task 241 merged proj sw22
+mk_task 242 claimed proj sw22
+# The newer claim has no created_at/at; its file mtime (4.5 days ago) is the
+# shared ordering key. The older claim is dated 5 days ago and names the merged
+# task 241. The sweep must read the newer claim's open task 242 and refuse.
+UND="$(python3 -c 'import time; print(time.time() - 4.5 * 86400)')"
+printf '{"kind":"job.claim","job_id":"sw22","payload":{"task_id":242,"owner_lane":"lane-a","agent_label":"lbl"}}\n' \
+  >"$INBOX/sw22/events/00010-job.claim.json"
+python3 -c 'import os, sys; t=float(sys.argv[2]); os.utime(sys.argv[1], (t, t))' \
+  "$INBOX/sw22/events/00010-job.claim.json" "$UND"
+JD="$INBOX/sw22"
+mkdir -p "$JD/evidence"
+printf 'claim-open\n' >"$JD/evidence/o.png"
+R="$(mk_row evidence/o.png "$JD/evidence/o.png")"
+mk_record "artifacts/proj/241/sw22" test-host sw22 241 proj "$JD" drive_confirmed "[$R]"
+sweep --job sw22 --apply
+[[ "$SWEEP_RC" == 0 ]] || fail "sw22 rc=$SWEEP_RC: $SWEEP_OUT"
+[[ -f "$JD/evidence/o.png" ]] ||
+  fail "sw22 used the older dated claim and deleted: $SWEEP_OUT"
+have "skip reason=task-claimed" ||
+  fail "sw22 must refuse via the newer undated claim's open task: $SWEEP_OUT"
+echo "PASS sw22-newer-undated-claim"
+
 echo "ALL PASS"

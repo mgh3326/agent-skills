@@ -16095,41 +16095,15 @@ artifacts_job_task_id() {
   jr="$(wrk_jobs_root)" || return 0
   [[ -d "$jr/$job" ]] || return 0
   wrk_py - "$jr" "$job" <<'PY'
-import datetime, json, os, sys
+import os, sys
+exec(os.environ["WRK_EVENTS_PY"])
 jobs_root, job = sys.argv[1], sys.argv[2]
 d = os.path.join(jobs_root, job, "events")
-
-
-def claim_key(doc, name):
-    ts = doc.get("created_at") or doc.get("at") or ""
-    when = None
-    if isinstance(ts, str) and ts:
-        try:
-            when = datetime.datetime.fromisoformat(ts.replace("Z", "+00:00"))
-        except ValueError:
-            when = None
-    if when is not None and when.tzinfo is None:
-        when = when.replace(tzinfo=datetime.timezone.utc)
-    seq = doc.get("seq")
-    try:
-        seq = int(seq)
-    except (TypeError, ValueError):
-        seq = -1
-    return (when is not None,
-            when or datetime.datetime.min.replace(tzinfo=datetime.timezone.utc),
-            seq, name)
-
-
 best = ""
-best_key = None
 if os.path.isdir(d):
-    for name in os.listdir(d):
-        if not name.endswith(".json"):
-            continue
-        try:
-            doc = json.load(open(os.path.join(d, name), encoding="utf-8"))
-        except (OSError, ValueError):
-            continue
+    # Shared ordering: event time when dated, file mtime when not, so a
+    # newer undated claim still beats an older dated one.
+    for _name, doc, _mtime in wrk_events_ordered(d):
         if not isinstance(doc, dict):
             continue
         kind = str(doc.get("kind", ""))
@@ -16138,14 +16112,8 @@ if os.path.isdir(d):
         pl = doc.get("payload") if isinstance(doc.get("payload"), dict) else {}
         tid = pl.get("task_id") or doc.get("task_id")
         if isinstance(tid, int) and tid > 0:
-            tid = str(tid)
+            best = str(tid)
         elif isinstance(tid, str) and tid.isdigit():
-            pass
-        else:
-            continue
-        key = claim_key(doc, name)
-        if best_key is None or key > best_key:
-            best_key = key
             best = tid
 print(best)
 PY
