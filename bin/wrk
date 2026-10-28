@@ -8617,7 +8617,7 @@ PY
       continue
     fi
     gone=0
-    local now probe class token candidate key action recover_reason rearm_loss log_extra watch_expired
+    local now probe class token candidate key action recover_reason rearm_loss log_extra watch_expired late_sighting
     now="$(date +%s)"
     probe="$(herdr_agent_probe "$pane")"
     IFS=$'\t' read -r class token _ <<<"$probe"
@@ -8627,6 +8627,7 @@ PY
     recover_reason=""
     rearm_loss=""
     watch_expired=""
+    late_sighting=""
     case "$class" in
       gone)
         transient=0
@@ -8700,6 +8701,7 @@ PY
       if [[ "$class" == ok ]]; then # hk1888-watch-expired-live-guard
         if [[ "$action" == pending && -z "$late_pending" ]]; then # hk1959-late-pending
           late_pending=1
+          late_sighting=1 # hk1973-late-once
         else
           watch_expired=1
           [[ -n "$recover_reason" ]] || action="watch-expired"
@@ -8719,7 +8721,7 @@ PY
     if [[ -n "$recover_reason" && "$action" != recovered:* ]]; then
       log_extra="recovered=$recover_reason"
     fi
-    if [[ "$action" == pending && -n "$late_pending" ]]; then
+    if [[ "$action" == pending && -n "$late_sighting" ]]; then # hk1973-late-once
       log_extra="${log_extra:+$log_extra }late=1"
     fi
     if [[ "$action" == watch-expired ]]; then
