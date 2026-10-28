@@ -8,6 +8,7 @@ set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
 export WRK_TEST_MODE=1
+unset WRK_TEST_REAL_SENTINEL
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="$ROOT/bin/wrk"
@@ -977,4 +978,5 @@ set -e
   fail "mutant hlwpostcap still refused the post-cap admission (rc=$rc): $out — the AC3d assertion is vacuous"
 echo "PASS mutant-hlw-postcap: 'a load-off run never starts after the cap' RED — AC3d 'refuses rc 75' fails (rc=0, command ran)"
 
+WRK_LEAK_ROOT="$TMP" WRK_LEAK_COPY="$WRK" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
 echo 'PASS test-wrk-heavy-limit'

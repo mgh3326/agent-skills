@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -18,6 +19,9 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory(prefix="fusion-sol-quota-")
         self.root = Path(self.tmp.name)
+        self.wrk = self.root / "wrk"
+        self.wrk.write_bytes((ROOT / "bin" / "wrk").read_bytes())
+        self.wrk.chmod(0o755)
         self.home = self.root / "home"
         self.xdg = {name: self.root / name.lower() for name in (
             "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME")}
@@ -59,6 +63,17 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
                 )
             except (OSError, ValueError, IndexError, subprocess.SubprocessError) as exc:
                 raise AssertionError(f"failed to stop fixture sentinel for {job}: {exc}") from exc
+        leak_env = {
+            "PATH": os.defpath,
+            "WRK_LEAK_ROOT": str(self.root),
+            "WRK_LEAK_COPY": str(self.wrk),
+        }
+        leaks = subprocess.run(
+            [sys.executable, str(ROOT / "tests/lib/assert-no-wrk-leaks.py")],
+            env=leak_env, capture_output=True, text=True, timeout=30,
+        )
+        if leaks.returncode:
+            raise AssertionError(leaks.stdout + leaks.stderr)
         self.tmp.cleanup()
 
     def spawn(self, profile: str) -> dict:
@@ -75,6 +90,7 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
             "HK_TASK_ID": "1729",
             "ARBITER_INBOX_ROOT": str(self.inbox),
             "WRK_TEST_MODE": "1",  # hk 1894: arbiter claim honours the temp inbox only in test mode
+            "WRK_TEST_REAL_SENTINEL": "1",  # this suite verifies spawn quota routing with a live watcher
             "ARBITER_BIN": str(ROOT / "bin" / "arbiter"),
             "HANDOFFKEEP_BIN": str(self.root / "missing-handoffkeep-fixture"),
             "SCOPEFUEL_BIN": str(ROOT / "tests" / "fixtures" / "scopefuel"),
@@ -89,7 +105,7 @@ class FusionSolQuotaSpawnTests(unittest.TestCase):
             "WRK_HOSTS_CONFIG": str(self.root / "missing-hosts.toml"),
         }
         command = [
-            str(ROOT / "bin" / "wrk"), "spawn", "-c", str(self.cwd), "-m", profile,
+            str(self.wrk), "spawn", "-c", str(self.cwd), "-m", profile,
             "-p", str(self.brief), "-w", "w1", "-l", f"fixture-{profile}", "--t", "T2",
             "--task", "1729", "--task-hk-bypass", "--job", job,
         ]
