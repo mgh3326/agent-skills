@@ -15,6 +15,7 @@
 # resolve exactly like production.
 set -euo pipefail
 export WRK_TEST_MODE=1
+unset WRK_TEST_REAL_SENTINEL
 # Exercise the bash-only HOSTNAME fallback: Bash populates HOSTNAME in each
 # process but does not export it unless explicitly requested.
 export -n HOSTNAME 2>/dev/null || true
@@ -1819,4 +1820,5 @@ expect_mut_red "keep-helper-rereads-HOSTNAME" case_mut_host_env "host-scoped kee
 mkmut host-arg 's/"\$parsed" "\$artifact_host")/"\$parsed")/'
 expect_mut_red "keep-helper-host-argument-dropped" case_mut_host_arg "host-scoped keep row must survive"
 
+WRK_LEAK_ROOT="$TMP" WRK_LEAK_COPY="$WRK" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
 echo "ALL ARTIFACT-PRUNE CONTRACT TESTS PASSED"

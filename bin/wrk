@@ -8901,6 +8901,12 @@ build_sentinel_env() {
 
 start_completion_sentinel() {
   local pidfile="$1"; shift
+  # Test fixtures exercise spawn and restore paths frequently. A real watcher
+  # is opt-in there so ordinary contract tests cannot leave detached processes
+  # behind; sentinel-behaviour suites set WRK_TEST_REAL_SENTINEL=1 explicitly.
+  if [[ "${WRK_TEST_MODE:-}" == 1 && "${WRK_TEST_REAL_SENTINEL:-}" != 1 ]]; then
+    return 0
+  fi
   local job="${1:-}"
   local requested_owner="${2:-}" requested_pane="${4:-}" existing_pane=""
   mkdir -p "$(dirname "$pidfile")"

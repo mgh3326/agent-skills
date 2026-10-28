@@ -49,7 +49,9 @@ class PiSpawnTests(unittest.TestCase):
         # Admission tripwire, no detached sentinel or real state DB.
         self.executable(self.tmp / "arbiter", '#!/bin/bash\ncase "$1" in job-get) exit 7 ;; claim|lease) printf "%s\\n" "$*" >>"' +
                         str(self.tmp / "claims.log") + '"; exit 1 ;; esac\nexit 1\n')
-        self.wrk = ROOT / "bin/wrk"
+        self.wrk = self.tmp / "wrk"
+        self.wrk.write_bytes((ROOT / "bin/wrk").read_bytes())
+        self.wrk.chmod(0o755)
         # hk2096/9751b80: use the shipped exact-pid stop even when the
         # fixture sentinel has its own session; never kill its process group.
         self.wrk_lib = self.tmp / "wrk-lib.sh"
@@ -499,15 +501,57 @@ else:
         self.assertIn("OK pane=", allowed.stdout)
 
     def test_anthropic_api_quota_record(self):
-        result = self.spawn(ARBITER_BIN=str(ROOT / "bin/arbiter"),
-                            WRK_COMPLETION_INTERVAL_S="3600")
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        events = Path(self.env["ARBITER_INBOX_ROOT"]) / "pi-fixture/events"
-        records = list(events.glob("*-quota_pool.record.json"))
-        self.assertEqual(len(records), 1, result.stdout + result.stderr)
-        payload = json.loads(records[0].read_text())["payload"]
-        self.assertEqual((payload["profile"], payload["launch_profile"], payload["pool"]),
-                         ("pi-sonnet55", "pi-sonnet55@high", "anthropic-api"))
+        sentinel_stop_error = None
+        try:
+            result = self.spawn(ARBITER_BIN=str(ROOT / "bin/arbiter"),
+                                WRK_TEST_REAL_SENTINEL="1",
+                                WRK_COMPLETION_INTERVAL_S="3600")
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            events = Path(self.env["ARBITER_INBOX_ROOT"]) / "pi-fixture/events"
+            records = list(events.glob("*-quota_pool.record.json"))
+            self.assertEqual(len(records), 1, result.stdout + result.stderr)
+            payload = json.loads(records[0].read_text())["payload"]
+            self.assertEqual((payload["profile"], payload["launch_profile"], payload["pool"]),
+                             ("pi-sonnet55", "pi-sonnet55@high", "anthropic-api"))
+        finally:
+            pidfile = Path(self.env["ARBITER_INBOX_ROOT"]) / "pi-fixture/completion-sentinel.pid"
+            if pidfile.exists():
+                pid = int(pidfile.read_text().splitlines()[0])
+                check = subprocess.run(["ps", "-p", str(pid), "-o", "args="],
+                                       capture_output=True, text=True)
+                if "sentinel pi-fixture " in check.stdout and str(self.wrk) in check.stdout:
+                    try:
+                        stop_env = dict(self.env, WRK_LIBFILE=str(self.wrk_lib))
+                        stop = subprocess.run(
+                            ["bash", "-c", '. "$WRK_LIBFILE"; stop_completion_sentinel "$1" "$2"',
+                             "wrk-test-cleanup", "pi-fixture", str(pid)],
+                            env=stop_env, capture_output=True, text=True, timeout=30)
+                        if stop.returncode:
+                            sentinel_stop_error = (
+                                f"exact-pid sentinel stop failed for {pid}: "
+                                f"{stop.stdout}{stop.stderr}")
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        sentinel_stop_error = f"exact-pid sentinel stop failed for {pid}: {exc}"
+            # This test owns every writer under its root. Verify exact pids
+            # with the shared library before TemporaryDirectory removes it.
+            stopped = subprocess.run(
+                ["bash", "-c", '. "$1"; TW_TMP="$2"; tmp_writers_stop; rc=$?; printf "leftovers=%s\\n" "$TW_LEFTOVER_PIDS"; exit "$rc"', "cleanup",
+                 str(ROOT / "tests/lib/tmp-writers.sh"), str(self.tmp)],
+                env=self.env, capture_output=True, text=True, timeout=30)
+            if stopped.returncode:
+                self.keep_tmp = True
+                self.temp._finalizer.detach()  # preserve evidence for live writers
+            self.assertEqual(stopped.returncode, 0, stopped.stdout + stopped.stderr)
+            leak_env = dict(self.env, WRK_LEAK_ROOT=str(self.tmp),
+                            WRK_LEAK_COPY=str(self.wrk))
+            leaks = subprocess.run(
+                [sys.executable, str(ROOT / "tests/lib/assert-no-wrk-leaks.py")],
+                env=leak_env, capture_output=True, text=True, timeout=30)
+            if leaks.returncode:
+                self.keep_tmp = True
+            self.assertEqual(leaks.returncode, 0, leaks.stdout + leaks.stderr)
+            if sentinel_stop_error:
+                self.fail(sentinel_stop_error)
 
 
 class PiCleanupTests(unittest.TestCase):

@@ -1340,6 +1340,7 @@ class SpawnIntegrationTests(Harness):
     def test_records_relative_report_is_rerooted_under_target_inbox(self):
         args = self.reviewer()
         args[args.index("--report"): ] = ["--report-relative", "job-a/verdict.md"]
+        self.env["WRK_TEST_REAL_SENTINEL"] = "1"
         self.mode("required")
         self.seed(*({"action": "accept"} for _ in range(8)))
         result = self.run_wrk(*args)
