@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Offline Command Code 1.88.0 banner fixture; no config/auth reads or network.
+# Prints the welcome-banner block a real `cmd` run paints, with WRK_CMD_*
+# scenario overrides for the failure shapes the proof must reject.
+set -euo pipefail
+python3 - "$@" <<'PY'
+import os
+import sys
+from pathlib import Path
+
+args = sys.argv[1:]
+
+
+def flag(name):
+    return args[args.index(name) + 1] if name in args else ""
+
+
+model = flag("-m")
+effort = flag("--effort")
+scenario = os.environ.get("WRK_CMD_SCENARIO", "ok")
+display = os.environ.get("WRK_CMD_DISPLAY", "deepseek-v4.1-flash-(latest)")
+cwd = os.path.realpath(os.environ["WRK_CMD_CWD"])
+
+if scenario == "missing":
+    sys.exit(0)
+if scenario == "echo":
+    print("cmd " + " ".join(args))
+    sys.exit(0)
+# The real CLI's own refusal for an effort the model does not accept: it never
+# reaches the TUI, so the pane shows only this shell line.
+if scenario == "refused-effort":
+    print(f'Unknown effort "{effort}". Supported: off, low, high, max.')
+    sys.exit(0)
+
+brief = Path(os.environ["WRK_CMD_BRIEF"]).read_text() if os.environ.get("WRK_CMD_BRIEF") else ""
+if scenario == "brief-only":
+    print(brief.rstrip("\n"))
+    sys.exit(0)
+
+shown_effort = effort
+if scenario == "wrong-effort":
+    shown_effort = "low" if effort != "low" else "high"
+shown_display = display
+if scenario == "wrong-model":
+    shown_display = "deepseek-v4-flash-(latest)"
+tail = "" if scenario == "truncated" else " · taste-1"
+version_line = "# Command Code v1.88.0"
+models_line = f"# models: {shown_display} with {shown_effort} effort{tail}"
+cwd_line = f"# {cwd}"
+if scenario == "home-abbrev":
+    # hk 2174: the real CLI prints its launch cwd with a leading $HOME as "~".
+    home = os.environ["HOME"].rstrip("/")
+    if cwd == home:
+        cwd_line = "# ~"
+    elif cwd.startswith(home + "/"):
+        cwd_line = "# ~" + cwd[len(home):]
+
+if scenario == "transcript-line":
+    # Keep this row in the transcript only. The herdr fixture exposes it to
+    # recent reads, but a visible-screen read must not return it.
+    transcript = os.environ.get("WRK_CMD_TRANSCRIPT_FILE")
+    if transcript:
+        with open(transcript, "a", encoding="utf-8") as stream:
+            stream.write(models_line + "\n")
+    sys.exit(0)
+
+lines = [
+    f"Reasoning effort set to {shown_effort} for DeepSeek V4.1 Flash (latest).",
+    "",
+    version_line,
+    models_line,
+    cwd_line,
+]
+if scenario == "wrong-version":
+    lines[2] = "# Command Code nightly"
+if scenario == "wrong-cwd":
+    lines[4] = f"# {cwd}/elsewhere"
+if scenario == "two-blocks":
+    # A stale contradicting banner above the current one — the low session of
+    # the mbp capture shape.
+    lines = ([version_line,
+              "# models: deepseek-v4.1-flash-(latest) with low effort · taste-1",
+              cwd_line] + lines)
+if scenario == "dup-blocks":
+    lines = ([version_line, models_line, cwd_line] + lines)
+print("\n".join(lines))
+PY

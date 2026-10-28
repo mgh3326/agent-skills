@@ -1714,6 +1714,22 @@ class RealBinaryCase(unittest.TestCase):
                     w.env(ARBITER_INBOX_ROOT=w.build))
         self.assertEqual(out.stdout.strip(), "worker", out.stderr)
 
+    def repro_audit_uses_checked_root(self, source):
+        """Static contract for the one-pass audit's trusted root and readers."""
+        start = source.index("round_audit_cmd() {")
+        end = source.index("\nround_cmd() {", start)
+        audit = source[start:end]
+        self.assertIn(
+            '  wrk_trust_guard\n  local jobs_root\n  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"',
+            audit,
+        )
+        self.assertIn(
+            'done < <(find -H "$jobs_root" -mindepth 2 -maxdepth 2 -type d -name events | LC_ALL=C sort)',
+            audit,
+        )
+        self.assertIn('exec 3< <(job_events_scan ', audit)
+        self.assertIn('wrk_py - "$jobs_root" "$lane"', audit)
+
     CALLS = ("wrk_newer_end_record", "wrk_refuse_ended", "wrk_join_blocks", "wrk_joined_refuse_blocks",
              "wrk_recorded_rounds", "wrk_job_role")
     # the helpers themselves, and the one advisory caller that stays environment-following
@@ -1735,11 +1751,13 @@ class RealBinaryCase(unittest.TestCase):
                 seen += 1
                 if "WRK_TRUST_JOBS_ROOT:?" not in line and '"$jobs_root"' not in line:
                     offenders.append("%d %s: %s" % (number, owner, line.strip()))
-        self.assertGreaterEqual(seen, 8, "the converted call sites moved; update CALLS")
+        self.assertGreaterEqual(seen, 5, "the converted call sites moved; update CALLS")
         self.assertEqual(offenders, [])
 
     def test_trust_bearing_call_sites_pass_the_checked_root(self):
-        self.repro_call_sites_pass_the_checked_root(WRK.read_text(encoding="utf-8"))
+        source = WRK.read_text(encoding="utf-8")
+        self.repro_call_sites_pass_the_checked_root(source)
+        self.repro_audit_uses_checked_root(source)
 
     def test_handoffkeep_is_judged_only_by_operations_that_fetch(self):
         w = self.w
@@ -2003,8 +2021,8 @@ class RealBinaryCase(unittest.TestCase):
         self.red(self.repro_audit_redirect, mutant)
 
     def test_mutant_audit_find_does_not_follow_a_symlinked_inbox(self):
-        mutant = self.mutant(WRK, 'done < <(find -H "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)',
-                             'done < <(find "$jobs_root" -mindepth 1 -maxdepth 1 -type d | LC_ALL=C sort)', "auditfind")
+        mutant = self.mutant(WRK, 'done < <(find -H "$jobs_root" -mindepth 2 -maxdepth 2 -type d -name events | LC_ALL=C sort)',
+                             'done < <(find "$jobs_root" -mindepth 2 -maxdepth 2 -type d -name events | LC_ALL=C sort)', "auditfind")
         self.red(self.repro_audit_symlinked_inbox, mutant)
 
     def test_mutant_join_gate_reads_the_environment_root(self):
@@ -2041,9 +2059,30 @@ class RealBinaryCase(unittest.TestCase):
              '  wrk_refuse_ended "round open" "$job"\n'),
             ('  joined_end="$(wrk_newer_end_record "$job" "${WRK_TRUST_JOBS_ROOT:?trust guard did not run}")"\n',
              '  joined_end="$(wrk_newer_end_record "$job")"\n'),
-            ('    role="$(wrk_job_role "$job" "$jobs_root")"\n', '    role="$(wrk_job_role "$job")"\n'),
         ):
-            self.red(self.repro_call_sites_pass_the_checked_root, mutate(WRK.read_text(encoding="utf-8"), old, new))
+            text = mutate(WRK.read_text(encoding="utf-8"), old, new)
+            with self.assertRaises(AssertionError):
+                self.repro_call_sites_pass_the_checked_root(text)
+
+        root_mutant = self.mutant(
+            WRK,
+            '  wrk_trust_guard\n  local jobs_root\n  jobs_root="${WRK_TRUST_JOBS_ROOT:?trust guard did not run}"\n',
+            '  wrk_trust_guard\n  local jobs_root\n  jobs_root="$(wrk_jobs_root)"\n',
+            "auditroot",
+        )
+        with self.assertRaises(AssertionError):
+            self.repro_audit_uses_checked_root(Path(root_mutant).read_text(encoding="utf-8"))
+
+        # The audit's one-pass caller must establish the trusted root before
+        # deriving event directories. Removing that guard must break redirect
+        # refusal before the audit can inspect any jobs.
+        guard_mutant = self.mutant(
+            WRK,
+            '  wrk_trust_guard\n  local jobs_root\n',
+            '  local jobs_root\n',
+            "auditguard",
+        )
+        self.red(self.repro_audit_redirect, guard_mutant)
 
     def test_mutant_task_binding_read_follows_hk_bin(self):
         mutant = self.mutant(WRK, '    wrk_trust_guard hk\n    handoffkeep=""\n    [[ ! -x "$WRK_TRUST_HK" ]] || handoffkeep="$WRK_TRUST_HK"\n',
