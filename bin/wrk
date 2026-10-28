@@ -331,12 +331,18 @@ Options:
                      Under --role builder a resolved ultra rung is still
                      refused before the marker check.
                      pi-* seats have no MCP (--no-mcp) and must not be placed
-                     on MCP-needing tasks. Worker/tester only; default effort high.
+                     on MCP-needing tasks. Default effort high. Since hk 2188
+                     --role builder also accepts a pi spelling where the canon
+                     catalog row for that exact rung (profile@effort) is placed
+                     (not consult_only, not an E6 marker) and its grade covers
+                     the task's requested grade; the gate stays the authority.
                      cmd-dsflash41 is the Command Code CLI profile
                      (deepseek-v4.1-flash, effort low|high|max, default high).
                      cmd 1.88.0 has no no-MCP launch flag, so the seat relies on
                      the cmd accounts carrying no persisted MCP servers.
-                     Worker/tester only; --role builder refuses it.
+                     Builder seats follow the same canon-rung rule as pi-*
+                     (hk 2188) and keep the cmd host restriction (approved
+                     desk hosts only while hk 2180 is open).
                      The devin fusion spellings devin-fusion-opus55 and
                      devin-fusion-sonnet55 are worker/tester-only — --role
                      builder refuses them pending hk 1382. Fusion-Sol
@@ -2477,8 +2483,10 @@ quota_gate() {
   [[ -z "${REQUESTED_BY:-}" ]] || gate_args+=(--requested-by "$REQUESTED_BY")
   [[ -z "${PURPOSE:-}" ]] || gate_args+=(--purpose "$PURPOSE")
   # hk 2079: E6_WORKER_TESTER_ONLY_PROFILES = PI_CREDIT_MODELS (pi-haiku55/pi-sonnet55/pi-opus55), all PROFILE_KIND=pi; devin-fusion-* are outside the set.
-  # hk 2140: cmd-dsflash41 joins the same worker/tester-only set — the gate
-  # hears the seat's role so a non-worker/tester role can be role-denied.
+  # hk 2140: cmd-dsflash41 joins the same role-aware set — the gate hears the
+  # seat's role so a non-worker/tester role can be role-denied. hk 2188:
+  # --role builder now reaches the gate for pi/cmd too (builder_seat_canon_check
+  # admits only placed, grade-covering rungs); the gate stays the authority.
   if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd || "$MODEL" == codex-astra || "$MODEL" == fable ]]; then
     gate_args+=(--role "$ROLE")
   fi
@@ -4110,6 +4118,41 @@ resolve_catalog_profile() {
   esac
 }
 
+# hk 2188 (director-1 scope, op-1028-seattask): is this pi-*/cmd-dsflash41
+# rung a placed canon row? Consulted the same way builder_seat_canon_check
+# does — `scopefuel policy launch` at the exact profile@effort rung. rc 0
+# with a catalog-provenance answer means placed (normal pinned rung, no
+# marker); rc 3 is an E6-carrier or consult_only rung and keeps today's
+# marker rule; anything else (unreachable, unreadable) also keeps the
+# marker rule — the rule this relaxes is a refusal, so it fails closed.
+pi_cmd_rung_placed() {
+  [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ]] || return 1
+  local scopefuel="${SCOPEFUEL:-}" out rc=0
+  [[ -n "$scopefuel" ]] ||
+    scopefuel="$(command -v "${SCOPEFUEL_BIN:-scopefuel}" 2>/dev/null || true)"
+  [[ -n "$scopefuel" && -x "$scopefuel" ]] || return 1
+  set +e
+  # The seat is named: without --role the canon answers for no seat and
+  # refuses the worker/tester-only credit rows, so the marker would stay
+  # required even on a placed rung.
+  out="$("$scopefuel" policy launch "$MODEL" --effort "$GATE_EFFORT_PIN" --role "${ROLE:-worker}" --json 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 && -n "$out" ]] || return 1
+  printf '%s' "$out" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+    catalog = payload.get("catalog")
+    ok = (isinstance(catalog, dict) and "stale" in catalog
+          and payload.get("gate") != "consult_only"
+          and not payload.get("e6_arm"))
+except (ValueError, TypeError, AttributeError):
+    ok = False
+sys.exit(0 if ok else 1)
+'
+}
+
 # apply_catalog
 #
 # Replaces this spelling's model id and default effort with the canonical values
@@ -4513,6 +4556,11 @@ resolve_profile() {
     # model the session actually selected — the proof compares the screen,
     # never the argv. herdr has no `cmd` start kind (0.9.1): the pane is
     # launched with `pane run` and detected, never agent-started.
+    # hk 2188 (tester family rules, unchanged — made explicit): pi-* counts
+    # as the Anthropic family, same as claude/opus/sonnet/haiku, and
+    # cmd-dsflash41 is the DeepSeek family — the same model devin-ds41 and
+    # builder-ds41 run, so a cmd tester and a ds41 builder are same-family,
+    # never cross-family, for the §2-4 separation.
     cmd-dsflash41) PROFILE_KIND=cmd; PROFILE_MODEL=deepseek/deepseek-v4.1-flash; CMD_SCREEN_MODEL='deepseek-v4.1-flash-(latest)'; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
 
     pi-haiku55) PROFILE_KIND=pi; PROFILE_MODEL=anthropic/claude-haiku-5-5; DEFAULT_EFFORT=high; EFFORT_SUPPORTED=1 ;;
@@ -4773,6 +4821,15 @@ resolve_profile() {
     # environment is ignored; the quota record below still reads
     # GATE_PROFILE@GATE_EFFORT_PIN, never an E6 arm.
     if ! normal_pinned_builder "$MODEL"; then
+      if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ]] && pi_cmd_rung_placed; then
+        # hk 2188 (director-1 scope): a pi/cmd rung whose canon row is placed
+        # is a normal pinned rung, not an E6 sample — the effort pin stays,
+        # no SCOPEFUEL_E6_ARM marker is needed and the rung is not labelled
+        # E6, for worker, tester and builder seats alike. Rungs still E6
+        # carriers or consult_only keep today's marker rule below; a builder
+        # seat on one is refused by builder_seat_canon_check regardless.
+        :
+      else
       [[ "${SCOPEFUEL_E6_ARM:-}" == "$GATE_PROFILE@$GATE_EFFORT_PIN" ]] ||
         die "$MODEL is an E6 measurement profile (#594): spawn requires SCOPEFUEL_E6_ARM=$GATE_PROFILE@$GATE_EFFORT_PIN (got '${SCOPEFUEL_E6_ARM:-<unset>}')"
       if [[ "$PROFILE_KIND" == kimi ]]; then
@@ -4786,6 +4843,7 @@ resolve_profile() {
         local_clone_effort="$(kimi_clone_thinking_effort "$KIMI_TRUST_HOME/config.toml")"
         [[ "$local_clone_effort" == "$GATE_EFFORT_PIN" ]] ||
           die "$MODEL needs a $GATE_EFFORT_PIN-effort Kimi clone at $KIMI_TRUST_HOME (found '${local_clone_effort:-<none>}'); refresh it with: bin/kimi-clone-home --effort $GATE_EFFORT_PIN"
+      fi
       fi
     fi
   fi
@@ -11688,6 +11746,33 @@ hk_cmd() {
   run_bounded "$HK_CMD_TIMEOUT" "$bin" "$@"
 }
 
+# hk 2188: the task's requested grade lives in the task title's "(grade X,
+# Tn; ...)" marker — there is no structured grade field on the task record.
+# An absent or malformed marker prints nothing; the builder canon seat
+# check treats an unreadable requested grade as fail-closed.
+hk_task_grade() {
+  printf '%s' "$1" | python3 -c '
+import json, re, sys
+try:
+    task = json.loads(sys.stdin.read())
+except ValueError:
+    sys.exit(0)
+# A list, null or scalar reply is not a task record; print nothing so the
+# caller reaches its own fail-closed refusal instead of a traceback (exit 1).
+if not isinstance(task, dict):
+    sys.exit(0)
+title = task.get("title")
+if not isinstance(title, str):
+    sys.exit(0)
+# The marker is the parenthesized "(grade X, Tn; ...)" form — a bare "grade
+# B" elsewhere in the title (e.g. "downgrade B") must not understate the
+# request. Two disagreeing markers are ambiguous and read as no grade.
+marks = re.findall(r"\(\s*grade\s+([CBAS]\+?)\s*[,;)]", title)
+if marks and len(set(marks)) == 1:
+    print(marks[0])
+'
+}
+
 # Ordinary implicit counsel shapes predate explicit worker-seat restrictions.
 # Round-extension spawns still require the caller to choose an explicit role.
 normalize_implicit_counsel_role() {
@@ -12475,6 +12560,114 @@ raise SystemExit(0 if ok else 1)' "$LABEL" "$JOB_ID"; then
   die "hk task link failed for task $TASK_ID job $JOB_ID (rc=$rc: ${out:0:300}) — spawn refused after landing; pane and quota record are being released. The claim must set claimed_by and refs.job_id in one call; on an hk predating claim+job_id the task may be left claimed without job_id — repair with 'handoffkeep tasks transition $TASK_ID --to in_progress --job-id $JOB_ID'"
 }
 
+# hk 2188: pi-* and cmd-dsflash41 builder seats are admitted by the canon
+# catalog row for the exact rung (profile@effort) — never by a seat list and
+# never by an override flag. The consult reuses `scopefuel policy launch`,
+# the same canon answer apply_catalog and the quota gate already trust, and
+# the seat opens only when the rung's gate is placed (not consult_only, not
+# an unmeasured E6 marker) and its grade covers the task's requested grade
+# (the title marker read at the task precheck). This lifts a blanket
+# refusal, so ambiguity fails closed: an unreachable canon, an unreadable
+# answer, an ungraded rung or an unmarked task grade all stay refused. The
+# quota gate below still judges the seat — this check only decides whether
+# the builder role may reach it.
+# hk 2188 r3 (309-a): the builder seat check reads the requested grade from
+# the bound task itself (read-only `tasks show`), on every spawn path — legacy,
+# takeover and O3-verified alike — so no path can skip it. Any failure leaves
+# it empty and the seat refuses (fail closed).
+task_requested_grade_read() {
+  TASK_REQUESTED_GRADE=""
+  [[ -n "$TASK_ID" ]] || return 0
+  local handoffkeep out rc=0
+  handoffkeep="$(hk_bin)"
+  [[ -n "$handoffkeep" ]] || return 0
+  set +e
+  out="$(hk_cmd "$handoffkeep" tasks show "$TASK_ID" 2>/dev/null)"
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]] || return 0
+  TASK_REQUESTED_GRADE="$(hk_task_grade "$out")"
+}
+
+builder_seat_canon_check() {
+  [[ "$ROLE" == builder ]] || return 0
+  case "$MODEL" in
+    pi-haiku55|pi-sonnet55|pi-opus55|cmd-dsflash41) ;;
+    *) return 0 ;;
+  esac
+  local effort="${EFFECTIVE_EFFORT:-${DEFAULT_EFFORT:-}}"
+  [[ -n "$effort" ]] ||
+    die "internal: builder seat canon check ran before effort resolution"
+  task_requested_grade_read
+  [[ -n "${TASK_REQUESTED_GRADE:-}" ]] ||
+    die "--role builder refuses '$MODEL': the task's requested grade is unreadable — a $MODEL@$effort builder seat opens only on a canon rung whose grade covers it (hk 2188; the task title carries no grade marker or hk was bypassed)"
+  if [[ -z "${SCOPEFUEL:-}" ]]; then
+    SCOPEFUEL="$(command -v "${SCOPEFUEL_BIN:-scopefuel}" 2>/dev/null || true)"
+  fi
+  [[ -n "$SCOPEFUEL" && -x "$SCOPEFUEL" ]] ||
+    die "--role builder refuses '$MODEL': scopefuel is the canon authority and is unavailable (hk 2188)"
+  local out err_file rc=0 reason=""
+  err_file="$(mktemp "${TMPDIR:-/tmp}/wrk-seat-canon.XXXXXX")"
+  set +e
+  out="$("$SCOPEFUEL" policy launch "$MODEL" --effort "$effort" --role builder --json 2>"$err_file")"
+  rc=$?
+  set -e
+  if [[ -s "$err_file" ]]; then
+    reason="$({ grep -v '^scopefuel: warning:' "$err_file" || true; } | tr -s '[:space:]' ' ' | cut -c1-240)"
+  fi
+  rm -f "$err_file"
+  if [[ "$rc" -eq 3 ]]; then
+    die "--role builder refuses '$MODEL': the canon refused rung $MODEL@$effort (${reason:-no reason reported}) — consult_only and unmeasured E6-marker rungs stay worker/tester-only (hk 2188)"
+  fi
+  if [[ "$rc" -ne 0 || -z "$out" ]]; then
+    die "--role builder refuses '$MODEL': the canon catalog could not answer for $MODEL@$effort (rc=$rc${reason:+; $reason}) — a builder seat opens only on a confirmed, grade-covering canon rung (hk 2188, fail closed)"
+  fi
+  local verdict
+  verdict="$(printf '%s' "$out" | python3 -c '
+import json, sys
+GRADES = ("C", "B", "A", "A+", "S", "S+")
+try:
+    payload = json.load(sys.stdin)
+    catalog = payload.get("catalog")
+    if not isinstance(catalog, dict) or "stale" not in catalog:
+        print("unreadable")
+        sys.exit(0)
+    if catalog.get("stale") is not False:
+        print("stale")
+        sys.exit(0)
+    if payload.get("gate") == "consult_only":
+        print("consult_only")
+        sys.exit(0)
+    if payload.get("e6_arm"):
+        print("e6_marker")
+        sys.exit(0)
+    grade = payload.get("grade")
+    required = sys.argv[1]
+    if grade not in GRADES:
+        print("ungraded:%s" % grade)
+        sys.exit(0)
+    if GRADES.index(grade) < GRADES.index(required):
+        print("grade_below:%s<%s" % (grade, required))
+        sys.exit(0)
+    print("ok")
+except (ValueError, TypeError, AttributeError):
+    print("unreadable")
+' "$TASK_REQUESTED_GRADE")"
+  case "$verdict" in
+    ok) return 0 ;;
+    consult_only)
+      die "--role builder refuses '$MODEL': canon rung $MODEL@$effort is consult_only — not a builder seat (hk 2188)" ;;
+    e6_marker)
+      die "--role builder refuses '$MODEL': canon rung $MODEL@$effort is an unmeasured E6 marker — not a builder seat (hk 2188)" ;;
+    stale)
+      die "--role builder refuses '$MODEL': the canon answer for $MODEL@$effort is stale — a builder seat needs a fresh catalog (hk 2188, fail closed; retry after scopefuel refreshes)" ;;
+    grade_below:*)
+      die "--role builder refuses '$MODEL': canon rung $MODEL@$effort grade ${verdict#grade_below:} does not cover the task's requested grade $TASK_REQUESTED_GRADE (hk 2188)" ;;
+    *)
+      die "--role builder refuses '$MODEL': the canon answer for $MODEL@$effort is unreadable or ungraded (hk 2188, fail closed)" ;;
+  esac
+}
+
 
 # #872: this helper is part of this wrk checkout, never a PATH-selected guard.
 # Artifacts live outside the worktree. No guard override or bypass is offered.
@@ -12552,7 +12745,7 @@ refuse_known_terra_spelling() {
 spawn_cmd() {
   [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]] && { spawn_help; return 0; }
   CWD="" MODEL="" PROMPT="" WS="" LABEL="" LANE="" EFFORT="" JOB_ID="" JOB_T="" OWNER="" ROLE="worker" ROLE_EXPLICIT=0 BUILDER_LANE="" PARENT_LANE="" REPORT_PATH="" REPORT_RELATIVE=0 JOB_DUP_OK=0 LANDING_STRICT=0 LANDING_NO_DETAIL="" KEEP=0
-  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER=""
+  OPERATOR_REQUEST="" ROUND_EXT_REF="" REQUESTED_BY="" PURPOSE="" TASK_ID="" PARENT_JOB="" TAKEOVER_FROM="" TAKEOVER_ROUNDS_USED=0 TASK_HK_BYPASS=0 TASK_LINK_MODE="" TASK_INHERITED_FROM="" TASK_LINK_STATUS="" ARBITER_CLAIM_FAILED=0 LANE_DEFER="" TASK_REQUESTED_GRADE=""
   O3_SPAWN_VERIFIED=0 O3_SPAWN_HEAD="" O3_EXTENSION_GRANT="" O3_REPEAT_GRANT=""
   ARBITER_HELD=0 ARBITER_RESOURCE="" ARBITER_PROFILE="" ARBITER_STARTED_AT="" GATE_OUTPUT="" GATE_READY=0 ARBITER_JOB_REGISTERED=0 HUB_QUOTA_GATE_WARNED=0
   TAB_CREATE_JSON="" TAB_ID=""
@@ -12655,10 +12848,11 @@ spawn_cmd() {
       codex-astra|fable) ;; # Paired round-extension flags verified before catalog.
       devin-fusion-opus55|devin-fusion-sonnet55)
         die "--role builder rejects '$MODEL': the devin fusion spellings are worker/tester-only — fusion builder use is decided after hk 1382 (hk 1380, operator decision 2026-10-10)" ;;
-      pi-haiku55|pi-sonnet55|pi-opus55)
-        die "--role builder rejects '$MODEL': pi seats are worker/tester-only until reps exist (hk 2080)" ;;
-      cmd-dsflash41)
-        die "--role builder rejects '$MODEL': cmd seats are worker/tester-only until reps exist (hk 2140)" ;;
+      # hk 2188: pi/cmd builder seats are no longer refused here — the canon
+      # seat check (builder_seat_canon_check, after the task precheck) admits
+      # exactly the rungs whose catalog grade covers the task's requested
+      # grade; consult_only and E6-marker rungs stay refused there.
+      pi-haiku55|pi-sonnet55|pi-opus55|cmd-dsflash41) ;;
       devin-fusion-sol61|devin-fusion-sol61-xhigh)
         die "--role builder rejects '$MODEL': Fusion-Sol is worker/tester-only until the hk 1729 reps are reviewed" ;;
       devin-argon|devin-argon-medium|devin-argon-low)
@@ -12852,6 +13046,10 @@ spawn_cmd() {
 
   # Advisory only (never fails spawn). After -L may have rewritten CWD.
   warn_if_canonical_off_default "$CWD"
+
+  # hk 2188: pi/cmd builder seats consult the canon rung here — after the
+  # task precheck supplied the requested grade, before the quota gate.
+  builder_seat_canon_check
 
   quota_gate
   # The catalog's own refusal, held back so the quota gate could speak first.

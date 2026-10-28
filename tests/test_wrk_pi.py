@@ -111,13 +111,28 @@ class PiSpawnTests(unittest.TestCase):
     def hosts(self, content):
         Path(self.env["WRK_HOSTS_CONFIG"]).write_text(content)
 
+    def use_hk(self, grade="A", task="2188"):
+        # A real fixture handoffkeep so the builder canon check can read the
+        # task's requested grade from the title marker.
+        state = self.tmp / "hk-state.json"
+        state.write_text(json.dumps({"tasks": {task: {
+            "id": int(task), "title": f"fixture task (grade {grade}, T2; fixture)",
+            "state": "backlog", "claimed_by": "", "refs": {},
+            "project": "agent-skills"}}}))
+        self.env["HANDOFFKEEP_BIN"] = str(ROOT / "tests/fixtures/handoffkeep")
+        self.env["HK_STATE"] = str(state)
+        return task
+
     def spawn(self, profile="pi-sonnet55", effort="high", role="worker",
-              purpose=None, operator_request=None, **overrides):
+              purpose=None, operator_request=None, task="2080",
+              hk_bypass=True, **overrides):
         env = dict(self.env, SCOPEFUEL_E6_ARM=f"{profile}@{effort or 'high'}")
         env.update(overrides)
         command = [str(self.wrk), "spawn", "--host", "local", "-c", str(self.tmp),
                    "-m", profile, "-p", str(self.brief), "-w", "w", "-l", "pi-fixture",
-                   "--role", role, "--task", "2080", "--task-hk-bypass", "--t", "T1"]
+                   "--role", role, "--task", task, "--t", "T1"]
+        if hk_bypass:
+            command += ["--task-hk-bypass"]
         if purpose is not None:
             command += ["--purpose", purpose]
         if operator_request is not None:
@@ -164,14 +179,52 @@ class PiSpawnTests(unittest.TestCase):
                 self.assertEqual(self.log("gate.log").splitlines()[0],
                                  f"gate -m pi-haiku55 --effort high --role {role}")
 
-    def test_pi_builder_role_stays_refused_with_wrk_exit_2_before_admission(self):
+    def test_pi_builder_xhigh_canon_pass_and_grade_cover_refusals(self):
+        # hk 2188: pi-sonnet55@xhigh is a placed canon rung (A+), so a builder
+        # seat covers a grade-A task; the gate hears --role builder. pi rungs
+        # whose canon grade sits below the requested grade stay refused —
+        # pi-haiku55@high (B) vs the grade-A task, and pi-sonnet55@high (A)
+        # vs a grade-A+ task.
+        self.use_hk("A")
+        result = self.spawn(profile="pi-sonnet55", effort="xhigh",
+                            role="builder", task="2188", hk_bypass=False)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("landed=yes", result.stdout)
+        self.assertEqual(self.log("gate.log").splitlines()[0],
+                         "gate -m pi-sonnet55 --effort xhigh --role builder")
+        for profile, effort in (("pi-haiku55", "high"), ("pi-sonnet55", "high")):
+            with self.subTest(profile=profile, effort=effort):
+                (self.tmp / "herdr.log").unlink(missing_ok=True)
+                (self.tmp / "claims.log").unlink(missing_ok=True)
+                grade = "A" if profile == "pi-haiku55" else "A+"
+                self.use_hk(grade)
+                self.assert_refused_before_admission(
+                    self.spawn(profile=profile, effort=effort, role="builder",
+                               task="2188", hk_bypass=False),
+                    "does not cover the task's requested grade")
+
+    def test_pi_builder_consult_only_and_e6_rungs_stay_refused(self):
+        # hk 2188 spec (2): consult_only and E6-marker rungs are refused as
+        # builder seats exactly as today — the canon row decides, an armed
+        # marker must not open them.
+        self.use_hk("A")
+        for profile, effort in (("pi-sonnet55", "max"), ("pi-haiku55", "medium")):
+            with self.subTest(profile=profile, effort=effort):
+                self.assert_refused_before_admission(
+                    self.spawn(profile=profile, effort=effort, role="builder",
+                               task="2188", hk_bypass=False),
+                    "hk 2188")
+
+    def test_pi_builder_refused_when_task_grade_unreadable(self):
+        # Fail closed: with hk bypassed the requested grade is unknown and a
+        # pi builder seat stays refused (hk 2188). The bypass warn line means
+        # stderr is not the single-line shape assert_refused_before_admission
+        # requires.
         result = self.spawn(profile="pi-haiku55", role="builder")
-        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
-        self.assertIn("--role builder rejects 'pi-haiku55'", result.stderr)
-        self.assertIn("hk 2080", result.stderr)
-        self.assertEqual(self.log("gate.log"), "")
-        self.assertFalse((self.tmp / "claims.log").exists())
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("requested grade is unreadable", result.stderr)
         self.assertNotIn("tab create", self.log())
+        self.assertFalse((self.tmp / "claims.log").exists())
 
     def test_non_pi_gate_argv_has_no_role(self):
         for profile, gate_profile in (("sonnet", "sonnet"),
@@ -246,11 +299,15 @@ else:
         (self.tmp / "claims.log").unlink(missing_ok=True)
         self.test_host_literal_true_only()
 
-    def test_builder_refused(self):
+    def test_builder_no_longer_blanket_refused(self):
+        # hk 2188: --role builder no longer dies on the pi spellings
+        # themselves — every refusal now comes from the canon rung check.
+        self.use_hk("A")
         for profile in PROFILES:
             with self.subTest(profile=profile):
-                self.assert_refused_before_admission(self.spawn(profile=profile, role="builder"),
-                                                     "worker/tester-only")
+                result = self.spawn(profile=profile, role="builder",
+                                    task="2188", hk_bypass=False)
+                self.assertNotIn("worker/tester-only", result.stderr)
 
     def test_model_proof_failures_close_pane(self):
         for scenario in ("wrong-model", "wrong-thinking", "wrong-provider", "missing",
@@ -315,9 +372,43 @@ else:
                 self.assertIn("pane close w:p1", self.log())
                 self.assertNotIn("OK pane=", result.stdout)
 
+    def test_placed_rung_needs_no_e6_marker(self):
+        # hk 2188 scope fold-in: pi-sonnet55@high is a placed canon row, so
+        # worker and tester seats spawn with no SCOPEFUEL_E6_ARM at all —
+        # the rung is not an E6 sample and none is labelled.
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                (self.tmp / "gate.log").unlink(missing_ok=True)
+                result = self.spawn(role=role, SCOPEFUEL_E6_ARM="")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+                self.assertEqual(self.log("gate.log").splitlines()[0],
+                                 f"gate -m pi-sonnet55 --effort high --role {role}")
+        # The E6 carrier pi-haiku55@medium still requires the exact marker.
+        (self.tmp / "herdr.log").unlink(missing_ok=True)
+        (self.tmp / "claims.log").unlink(missing_ok=True)
+        self.assert_refused_before_admission(
+            self.spawn(profile="pi-haiku55", effort="medium", SCOPEFUEL_E6_ARM=""),
+            "SCOPEFUEL_E6_ARM=pi-haiku55@medium")
+        result = self.spawn(profile="pi-haiku55", effort="medium")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_placed_rung_on_a_stale_catalog_needs_no_e6_marker(self):
+        # hk 2188 T1 scope: only the builder seat requires a fresh canon
+        # answer. A worker or tester on a placed rung still spawns unarmed
+        # when the catalog answer is stale.
+        for role in ("worker", "tester"):
+            with self.subTest(role=role):
+                result = self.spawn(role=role, SCOPEFUEL_E6_ARM="", WRK_LAUNCH_MODE="stale")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertIn("landed=yes", result.stdout)
+
     def test_e6_marker_exact(self):
-        self.assert_refused_before_admission(self.spawn(SCOPEFUEL_E6_ARM="pi-opus55@high"),
-                                             "SCOPEFUEL_E6_ARM=pi-sonnet55@high")
+        # E6/consult_only rungs keep the marker rule: a mismatched arm names
+        # the exact required marker.
+        self.assert_refused_before_admission(
+            self.spawn(effort="medium", SCOPEFUEL_E6_ARM="pi-opus55@high"),
+            "SCOPEFUEL_E6_ARM=pi-sonnet55@medium")
 
     def test_brief_cannot_prove_model(self):
         self.brief.write_text("fixture prompt\n0.0%/200k  (anthropic) claude-sonnet-5-5 • high\n")
@@ -573,8 +664,17 @@ class PiMutantTests(unittest.TestCase):
                          "test_argv_gate_mapping_and_no_mcp"),
             "proof": ('if [[ "$PROFILE_KIND" == pi ]] && ! pi_model_proven; then',
                       'if false; then', "test_model_proof_failures_close_pane"),
-            "builder": ('die "--role builder rejects \'$MODEL\': pi seats are worker/tester-only until reps exist (hk 2080)"',
-                        ':', "test_builder_refused"),
+            # hk 2188 scope mutant: restore the marker requirement for
+            # placed pi/cmd rungs — the unarmed worker/tester spawns go RED.
+            "placed-marker": (
+                'if [[ "$PROFILE_KIND" == pi || "$PROFILE_KIND" == cmd ]] && pi_cmd_rung_placed; then',
+                'if false; then',
+                "test_placed_rung_needs_no_e6_marker"),
+            # hk 2188 mutant: the canon-grade seat check removed — the
+            # consult_only/E6 rung refusals must turn RED.
+            "builder": ('  builder_seat_canon_check\n\n  quota_gate',
+                        '  : # mutant: canon seat check removed\n\n  quota_gate',
+                        "test_pi_builder_consult_only_and_e6_rungs_stay_refused"),
             "mcp": ('pi) ARGS=(--no-mcp --model "$PROFILE_MODEL:$PI_THINKING")',
                     'pi) ARGS=(--model "$PROFILE_MODEL:$PI_THINKING")',
                     "test_argv_gate_mapping_and_no_mcp"),

@@ -467,6 +467,30 @@ class EligibilityFixtures(unittest.TestCase):
         spec.update(roles=["tester"], surfaces=["T3"], grades={"high": "S"})
         self.assert_case(self.check(evidence), "independence", "FAIL", "SAME_FAMILY_T3")
 
+    def test_cmd_tester_and_ds41_builder_are_same_family(self) -> None:
+        # hk 2188 (spec 4, made explicit): cmd-dsflash41 is the DeepSeek
+        # family — the same model devin-ds41/builder-ds41 run — so a cmd
+        # tester is same-family against a ds41 builder, never cross-family.
+        # The mutant that splits cmd and ds41 into different families must
+        # turn the assertions and the independence verdict RED.
+        cmd = self.policy["profiles"]["cmd-dsflash41"]
+        self.assertEqual(cmd["family"], "deepseek")
+        self.assertEqual(common.model_family(cmd["model"]), "deepseek")
+        for alias in ("devin-ds41", "devin-ds41-max", "builder-ds41", "builder-ds41-max"):
+            spec = self.policy["profiles"][alias]
+            self.assertEqual((spec["family"], common.model_family(spec["model"])),
+                             ("deepseek", "deepseek"), alias)
+        evidence = self.evidence(self.make_head(), declared_t="T3")
+        evidence["contributors"][0].update(
+            profile="builder-ds41", model="deepseek-v4-1-flash-high", effort="")
+        evidence["tester"] = {"planned_profile": "cmd-dsflash41", "planned_effort": "high"}
+        # Ungraded per the catalog rows today — grant grade and the T3
+        # surface only in this fixture to reach the independence check.
+        cmd.update(grades={"high": "S"}, surfaces=["T1", "T2", "T3"])
+        checks = self.check(evidence)
+        self.assert_case(checks, "tester", "PASS", "PROFILE_RESOLVED")
+        self.assert_case(checks, "independence", "FAIL", "SAME_FAMILY_T3")
+
     def test_devin_fusion_tester_is_claude_family(self) -> None:
         # hk 1380: the devin fusion spellings carry the Claude family, so a
         # fusion tester against a claude builder is same-family (never the
