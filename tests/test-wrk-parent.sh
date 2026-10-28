@@ -7,6 +7,7 @@ set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
 export WRK_TEST_MODE=1
+export WRK_TEST_REAL_SENTINEL=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="${WRK_UNDER_TEST:-$ROOT/bin/wrk}"
@@ -16,6 +17,12 @@ ARBITER="$ROOT/bin/arbiter"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/wp2042.XXXXXX")"
+if [[ -z "${WRK_UNDER_TEST:-}" ]]; then
+  WRK_SOURCE="$WRK"
+  WRK="$TMP/wrk"
+  cp "$WRK_SOURCE" "$WRK"
+  chmod +x "$WRK"
+fi
 # Keep an injected mutant inside THIS run's root so tmp-writers can prove
 # ownership and stop its sentinels without a teardown failure masking RED.
 if [[ -n "${WRK_UNDER_TEST:-}" ]]; then
@@ -286,4 +293,6 @@ MUT
     echo "PASS hk2042 $mutant mutant assertion RED"
   done
 fi
+tmp_writers_stop
+WRK_LEAK_ROOT="$TMP" WRK_LEAK_COPY="$WRK" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
 echo "PASS hk2042 parent-job completion contract"

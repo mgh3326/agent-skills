@@ -14,6 +14,7 @@ set -euo pipefail
 # hk 1894: trust-bearing wrk and arbiter commands honour this suite's temp-dir overrides
 # (HOME, ARBITER_INBOX_ROOT, XDG_DATA_HOME, HANDOFFKEEP_BIN) only in test mode.
 export WRK_TEST_MODE=1
+export WRK_TEST_REAL_SENTINEL=1
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WRK="${WRK_TEST_BIN:-$ROOT/bin/wrk}"
@@ -23,6 +24,10 @@ ARBITER="${ARBITER_TEST_BIN:-$ROOT/bin/arbiter}"
 PANEWIRE="$ROOT/tests/fixtures/panewire"
 HK="$ROOT/tests/fixtures/handoffkeep"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/wrk-job-end.XXXXXX")"
+WRK_SOURCE="$WRK"
+WRK="$TMP/wrk"
+cp "$WRK_SOURCE" "$WRK"
+chmod +x "$WRK"
 # shellcheck disable=SC1091
 . "$ROOT/tests/lib/tmp-writers.sh"
 export TW_TMP="$TMP"
@@ -6394,4 +6399,6 @@ expect_mut_red "hk1860 row-less recheck in current mode" case_hk1860_rowless_end
   'ASSERT-RED: hk1860 row-less recheck keeps the caller ended-no-sentinel mode'
 
 bash "$ROOT/tests/test-wrk-sentinel-detach.sh"
+tmp_writers_stop
+WRK_LEAK_ROOT="$TMP" WRK_LEAK_COPY="$WRK" python3 "$ROOT/tests/lib/assert-no-wrk-leaks.py"
 echo "PASS test-wrk-job-end: all cases"
