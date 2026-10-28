@@ -10433,6 +10433,7 @@ spillover_remote_spawn() {
   local remote_args=(env "HERDR_SESSION=$session")
   [[ -n "${SPILL_REMOTE_HK_TASK:-}" ]] && remote_args+=("HK_TASK_ID=$SPILL_REMOTE_HK_TASK")
   [[ -n "${WRK_KEEP_FAILED_PANE:-}" ]] && remote_args+=("WRK_KEEP_FAILED_PANE=$WRK_KEEP_FAILED_PANE")
+  [[ -n "${SCOPEFUEL_E6_ARM:-}" ]] && remote_args+=("SCOPEFUEL_E6_ARM=$SCOPEFUEL_E6_ARM")
   remote_args+=(wrk spawn -c "$remote_cwd" -p "$remote_prompt" --host local)
   [[ -z "${SPILL_REMOTE_OWNER:-}" ]] || remote_args+=(--owner "$SPILL_REMOTE_OWNER") # hk2042-ssh-owner
   [[ -z "${SPILL_REMOTE_REPORT_REL:-}" ]] || remote_args+=(--report-relative "$SPILL_REMOTE_REPORT_REL")
@@ -11105,19 +11106,15 @@ pi_host_precheck() {
 }
 
 # hk 2140 desk gate: Command Code accounts with no configured MCP servers are
-# known only on mbp, desktop and m1b. Require an explicit local capability flag
-# and an execution-host identity in that desk-approved set; caller placement
-# options never grant this capability.
+# desk-owned per host. Approval is the desk-owned [local] cmd_dsflash41 = true
+# flag alone; caller placement options and host identities never grant this
+# capability.
 cmd_host_precheck() {
   local profile="${1:-${MODEL:-}}" host
   [[ "$profile" == cmd-dsflash41 ]] || return 0
   host="$(spillover_value hub machine_id 2>/dev/null || true)"
   [[ -n "$host" ]] || host="$(hostname)"
   host="$(printf '%s' "$host" | tr -c 'A-Za-z0-9._-' '_')"
-  case "$host" in
-    mbp|desktop|m1b) ;;
-    *) die "$profile refused on host $host: approved hosts are mbp, desktop, m1b (desk 2026-10-27; m1 has MCP servers)" ;;
-  esac
   if ! local_spawn_scan; then
     die "$profile refused on host $host: $LOCAL_SPAWN_ERROR"
   fi
