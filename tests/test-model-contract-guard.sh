@@ -162,10 +162,12 @@ for terra61_rung in medium high max; do
     "-m gpt-6.1-terra -c model_reasoning_effort=$terra61_rung" \
     --role builder --lane guard-lane --parent guard-parent-lane
 done
-# codex-terra61@xhigh is the A+ escalation rung: unmarked, but gate-decided,
-# so the spawn carries an operator request (hk 2218).
+# codex-terra61@xhigh is the A+ escalation-labelled rung: unmarked, and the
+# installed gate admits it with an optional operator REF or none (hk 2218).
 assert_argv_has builder-terra61-xhigh "-m gpt-6.1-terra -c model_reasoning_effort=xhigh" \
   --role builder --lane guard-lane --parent guard-parent-lane --operator-request hk:task/2218
+assert_argv_has builder-terra61-xhigh "-m gpt-6.1-terra -c model_reasoning_effort=xhigh" \
+  --role builder --lane guard-lane --parent guard-parent-lane
 # builder-terra61-medium has no canon row and still needs its exact marker.
 if env HERDR_BIN="$HERDR" SCOPEFUEL_BIN="$SCOPEFUEL" WRK_NO_SLEEP=1 SCOPEFUEL_E6_ARM= \
   WRK_FIXTURE_SCENARIO=spawn WRK_FIXTURE_LOG="$TMP/herdr.log" WRK_SCOPEFUEL_LOG="$TMP/scopefuel.log" \

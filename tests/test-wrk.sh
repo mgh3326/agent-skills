@@ -755,7 +755,8 @@ terra61_expect_launch real-footer codex-terra61 high codex-terra61@high recorded
 terra61_expect_launch default-low codex-terra61 low codex-terra61@low
 terra61_expect_launch explicit-high codex-terra61 high codex-terra61@high footer high
 # hk 2218: medium stays an E6 rung (marker), high and max are normal pinned
-# spellings (no marker), and xhigh is the escalation rung that needs a REF.
+# spellings (no marker), and xhigh is the escalation-labelled rung, admitted
+# with or without an operator REF (the installed gate's behaviour).
 terra61_expect_launch builder-medium builder-terra61-medium medium codex-terra61@medium footer
 for rung in high max; do
   terra61_expect_launch "builder-$rung" "builder-terra61-$rung" "$rung" "" footer

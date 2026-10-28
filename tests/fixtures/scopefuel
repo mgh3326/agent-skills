@@ -446,7 +446,9 @@ if [[ -n "$operator_request" ]]; then
   # escalation_rung table above) and the consult_only identity (fable) —
   # every other profile@effort is not_applicable, exactly the installed
   # gate's vocabulary.
-  if [[ "$escalation_rung" -ne 1 ]]; then
+  # hk 2218: an escalation-labelled rung (codex-terra61@xhigh) accepts an
+  # optional REF and records it, as the installed gate does (override=false).
+  if [[ "$escalation_rung" -ne 1 && "${escalation_label:-0}" -ne 1 ]]; then
     case "$profile" in
       fable|oc-omni) : ;;
       *)
