@@ -11745,6 +11745,10 @@ try:
     task = json.loads(sys.stdin.read())
 except ValueError:
     sys.exit(0)
+# A list, null or scalar reply is not a task record; print nothing so the
+# caller reaches its own fail-closed refusal instead of a traceback (exit 1).
+if not isinstance(task, dict):
+    sys.exit(0)
 title = task.get("title")
 if not isinstance(title, str):
     sys.exit(0)
